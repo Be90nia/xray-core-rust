@@ -3,8 +3,8 @@
 //! 对应 Go `proxy/wireguard/tun.go` 的 gVisor netstack。Rust 用 [`smoltcp`] 等价：
 //!
 //! - [`WgNetStack`] 持有 smoltcp [`Interface`] + 虚拟 [`VirtualDevice`]（rx/tx FIFO）
-//! - [`VirtualDevice`] 实现 smoltcp `phy::Device` trait，rx 端 = 从 WG tunnel 解出的 IP 包，
-//!   tx 端 = smoltcp 欲发送的 IP 包（待 WG 加密）
+//! - [`VirtualDevice`] 实现 smoltcp `phy::Device` trait，rx 端 = 从 WG tunnel 解出的 IP 包， tx 端
+//!   = smoltcp 欲发送的 IP 包（待 WG 加密）
 //! - 通过 [`WgNetStack::ingest_rx`] 投递解密后的 IP 包
 //! - 通过 [`WgNetStack::drain_tx`] 取出待加密的 IP 包
 //! - 通过 [`WgNetStack::poll`] 驱动 smoltcp 协议栈（处理 TCP/UDP socket 状态）
@@ -16,14 +16,15 @@
 
 use std::collections::VecDeque;
 
-use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::{self, DeviceCapabilities, Medium};
-use smoltcp::socket::tcp;
-use smoltcp::socket::udp;
-use smoltcp::time::Instant;
-use smoltcp::wire::{
-    HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpProtocol, Ipv4Address, Ipv4Packet,
-    Ipv6Address, Ipv6Packet, TcpPacket,
+use smoltcp::{
+    iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet},
+    phy::{self, DeviceCapabilities, Medium},
+    socket::{tcp, udp},
+    time::Instant,
+    wire::{
+        HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpProtocol, Ipv4Address, Ipv4Packet,
+        Ipv6Address, Ipv6Packet, TcpPacket,
+    },
 };
 
 /// smoltcp 协议栈 poll 一次处理的最大 RX 包数。
@@ -86,14 +87,13 @@ impl WgNetStack {
         let has_v6 = local_addrs.iter().any(|c| matches!(c, IpCidr::Ipv6(_)));
         iface.routes_mut().update(|routes| {
             if has_v4 {
-                let _ = routes.push(smoltcp::iface::Route::new_ipv4_gateway(
-                    Ipv4Address::new(0, 0, 0, 0),
-                ));
+                let _ = routes
+                    .push(smoltcp::iface::Route::new_ipv4_gateway(Ipv4Address::new(0, 0, 0, 0)));
             }
             if has_v6 {
-                let _ = routes.push(smoltcp::iface::Route::new_ipv6_gateway(
-                    Ipv6Address::new(0, 0, 0, 0, 0, 0, 0, 0),
-                ));
+                let _ = routes.push(smoltcp::iface::Route::new_ipv6_gateway(Ipv6Address::new(
+                    0, 0, 0, 0, 0, 0, 0, 0,
+                )));
             }
         });
 
@@ -150,8 +150,14 @@ impl WgNetStack {
     /// 创建一个 UDP socket 加入 socket set，返回 handle。
     #[must_use]
     pub fn add_udp_socket(&mut self) -> SocketHandle {
-        let rx_buf = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; UDP_META_SLOTS], vec![0; SOCKET_BUF_SIZE]);
-        let tx_buf = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; UDP_META_SLOTS], vec![0; SOCKET_BUF_SIZE]);
+        let rx_buf = udp::PacketBuffer::new(
+            vec![udp::PacketMetadata::EMPTY; UDP_META_SLOTS],
+            vec![0; SOCKET_BUF_SIZE],
+        );
+        let tx_buf = udp::PacketBuffer::new(
+            vec![udp::PacketMetadata::EMPTY; UDP_META_SLOTS],
+            vec![0; SOCKET_BUF_SIZE],
+        );
         let socket = udp::Socket::new(rx_buf, tx_buf);
         self.sockets.add(socket)
     }
@@ -227,7 +233,7 @@ impl WgNetStack {
             Err(e) => {
                 tracing::warn!(error = %e, "wg lazy tcp listen failed");
                 self.remove_socket(handle);
-            }
+            },
         }
     }
 
@@ -249,11 +255,7 @@ impl WgNetStack {
             // 该 socket 已转为连接 socket，从监听表移除
             self.listening.swap_remove(i);
             match remote {
-                Some(remote) => events.push(TcpAcceptEvent {
-                    handle,
-                    local: Some(local),
-                    remote,
-                }),
+                Some(remote) => events.push(TcpAcceptEvent { handle, local: Some(local), remote }),
                 // Established 却无对端 tuple 理论不可达；防御性回收
                 None => self.remove_socket(handle),
             }
@@ -281,14 +283,14 @@ fn sniff_tcp_syn(pkt: &[u8]) -> Option<(IpAddress, u16)> {
                 return None;
             }
             (IpAddress::Ipv4(v4.dst_addr()), v4.payload())
-        }
+        },
         6 => {
             let v6 = Ipv6Packet::new_checked(pkt).ok()?;
             if v6.next_header() != IpProtocol::Tcp {
                 return None;
             }
             (IpAddress::Ipv6(v6.dst_addr()), v6.payload())
-        }
+        },
         _ => return None,
     };
     let tcp = TcpPacket::new_checked(payload).ok()?;
@@ -331,11 +333,7 @@ pub struct VirtualDevice {
 impl VirtualDevice {
     #[must_use]
     pub fn new(mtu: usize) -> Self {
-        Self {
-            mtu,
-            rx_queue: VecDeque::new(),
-            tx_queue: VecDeque::new(),
-        }
+        Self { mtu, rx_queue: VecDeque::new(), tx_queue: VecDeque::new() }
     }
 }
 
@@ -384,24 +382,26 @@ unsafe impl Send for VirtualDevice {}
 unsafe impl Sync for VirtualDevice {}
 
 impl phy::Device for VirtualDevice {
-    type RxToken<'a> = VirtRxToken where Self: 'a;
-    type TxToken<'a> = VirtTxToken where Self: 'a;
+    type RxToken<'a>
+        = VirtRxToken
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = VirtTxToken
+    where
+        Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         // 取一个 RX 包，同时给一个 TX token（用于立即回包，如 ICMP echo reply）
         self.rx_queue.pop_front().map(|packet| {
-            let tx_token = VirtTxToken {
-                tx_queue_ptr: &mut self.tx_queue as *mut _,
-            };
+            let tx_token = VirtTxToken { tx_queue_ptr: &mut self.tx_queue as *mut _ };
             (VirtRxToken { packet }, tx_token)
         })
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         // 始终允许发送（缓冲在 VecDeque 中）
-        Some(VirtTxToken {
-            tx_queue_ptr: &mut self.tx_queue as *mut _,
-        })
+        Some(VirtTxToken { tx_queue_ptr: &mut self.tx_queue as *mut _ })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -577,7 +577,7 @@ mod tests {
     /// 同 tuple 补位监听就位。
     #[test]
     fn syn_creates_lazy_listen_and_completes_handshake() {
-        use crate::netstack::test_packets::{make_tcp_packet, tcp_seq_number, TCP_ACK, TCP_SYN};
+        use crate::netstack::test_packets::{TCP_ACK, TCP_SYN, make_tcp_packet, tcp_seq_number};
 
         let mut stack = make_stack(); // 本端 10.0.0.2/32
         stack.ingest_rx(make_tcp_packet(
@@ -590,11 +590,8 @@ mod tests {
         stack.poll(Instant::now());
 
         // 监听在 SYN 入栈前建好 → SYN 有归宿，SYN-ACK 已生成
-        let server_seq = stack
-            .drain_tx()
-            .iter()
-            .find_map(|p| tcp_seq_number(p))
-            .expect("SYN-ACK with seq");
+        let server_seq =
+            stack.drain_tx().iter().find_map(|p| tcp_seq_number(p)).expect("SYN-ACK with seq");
 
         stack.ingest_rx(make_tcp_packet(
             ([10, 0, 0, 1], 5555),
@@ -617,7 +614,7 @@ mod tests {
     /// 同 tuple 的 SYN 重传不产生重复监听（幂等）。
     #[test]
     fn syn_retransmit_creates_single_listen() {
-        use crate::netstack::test_packets::{make_tcp_packet, TCP_SYN};
+        use crate::netstack::test_packets::{TCP_SYN, make_tcp_packet};
 
         let mut stack = make_stack();
         let syn = make_tcp_packet(([10, 0, 0, 1], 5555), ([10, 0, 0, 2], 443), TCP_SYN, 1000, 0);
@@ -629,7 +626,7 @@ mod tests {
     /// 非 SYN 的 TCP 包不建监听。
     #[test]
     fn non_syn_tcp_creates_no_listen() {
-        use crate::netstack::test_packets::{make_tcp_packet, TCP_ACK};
+        use crate::netstack::test_packets::{TCP_ACK, make_tcp_packet};
 
         let mut stack = make_stack();
         stack.ingest_rx(make_tcp_packet(

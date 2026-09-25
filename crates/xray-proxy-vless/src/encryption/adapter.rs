@@ -8,10 +8,13 @@
 //!
 //! 地址信息：底层可能不知道（ws/grpc/httpupgrade 包装后丢原始 SocketAddr），
 //! 返回 Ok(None)（与 VisionConn 同样保守，见 encryption/vision_conn.rs:249）。
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    task::{Context, Poll},
+};
+
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use xray_transport::connection::Connection;
 
@@ -51,9 +54,11 @@ impl AsyncWrite for EncConnectionAdapter {
     ) -> Poll<io::Result<usize>> {
         Pin::new(&mut *self.inner).poll_write(cx, buf)
     }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut *self.inner).poll_flush(cx)
     }
+
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut *self.inner).poll_shutdown(cx)
     }
@@ -63,13 +68,16 @@ impl Connection for EncConnectionAdapter {
     fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(None)
     }
+
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(None)
     }
+
     fn close_read(&mut self) -> io::Result<()> {
         // 加密层没有原生 shutdown 读半边的概念；默认 no-op 与 tls 等高层一致。
         Ok(())
     }
+
     fn close_write(&mut self) -> io::Result<()> {
         // 同上；上层若需要 shutdown 请调 AsyncWrite::poll_shutdown。
         Ok(())

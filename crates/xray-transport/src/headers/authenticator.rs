@@ -34,11 +34,11 @@ pub struct HeaderNameValues {
 }
 
 impl HeaderNameValues {
-    pub fn new(name: impl Into<String>, value: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        Self {
-            name: name.into(),
-            value: value.into_iter().map(Into::into).collect(),
-        }
+    pub fn new(
+        name: impl Into<String>,
+        value: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self { name: name.into(), value: value.into_iter().map(Into::into).collect() }
     }
 }
 
@@ -119,9 +119,7 @@ impl ResponseConfig {
     }
 
     pub fn has_header(&self, name: &str) -> bool {
-        self.header
-            .iter()
-            .any(|h| h.name.eq_ignore_ascii_case(name))
+        self.header.iter().any(|h| h.name.eq_ignore_ascii_case(name))
     }
 }
 
@@ -175,10 +173,7 @@ fn chrome_default_request_headers() -> Vec<HeaderNameValues> {
 /// Chrome 浏览器的 5 个默认响应 header 值（对应 Go transport_authenticators.go:128-150）。
 fn chrome_default_response_headers() -> Vec<HeaderNameValues> {
     vec![
-        HeaderNameValues::new(
-            "Content-Type",
-            ["application/octet-stream", "video/mpeg"],
-        ),
+        HeaderNameValues::new("Content-Type", ["application/octet-stream", "video/mpeg"]),
         HeaderNameValues::new("Transfer-Encoding", ["chunked"]),
         HeaderNameValues::new("Connection", ["keep-alive"]),
         HeaderNameValues::new("Pragma", ["no-cache"]),
@@ -190,7 +185,8 @@ fn chrome_default_response_headers() -> Vec<HeaderNameValues> {
 // 取 Go v26.6.1 stable 值（Common-utils.go: CHROME 常量随版本同步）。
 // 精确字面值不参与行为契约，仅在测试中作为 fixture 出现。
 const CHROME_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
-const CHROME_UACH: &str = "\"Chromium\";v=\"130\", \"Google Chrome\";v=\"130\", \"Not?A_Brand\";v=\"99\"";
+const CHROME_UACH: &str =
+    "\"Chromium\";v=\"130\", \"Google Chrome\";v=\"130\", \"Not?A_Brand\";v=\"99\"";
 
 /// 错误：HTTP header 超过 `maxHeaderLength`（DDoS 防护）。
 ///

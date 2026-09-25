@@ -7,28 +7,33 @@
 //! 每个 client（按 clientID 区分）映射到一个稳定的 IPv6 地址（`fd00::clientID`）。
 //! 服务端维护 client_addr → 真实 UDP addr 的映射，使 send_to 能把响应回送到正确客户端。
 
-use std::collections::HashMap;
-use std::io;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    io,
+    net::{IpAddr, Ipv6Addr, SocketAddr},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
-use super::base32::decode_upper;
-use super::dns::{
-    message_from_wire_format, Message, Name, Question, RR, RR_TYPE_A, RR_TYPE_AAAA, RR_TYPE_OPT,
-    RR_TYPE_TXT,
+use super::{
+    UdpIo,
+    base32::decode_upper,
+    dns::{
+        Message, Name, Question, RR, RR_TYPE_A, RR_TYPE_AAAA, RR_TYPE_OPT, RR_TYPE_TXT,
+        message_from_wire_format,
+    },
+    record_transport::{
+        MAX_UDP_PAYLOAD, RESPONSE_TTL, answers_for_payload, max_encoded_payload_for_type,
+        max_encoded_payload_txt,
+    },
+    spec::{DomainSpec, parse_domain_spec},
 };
-use super::record_transport::{
-    answers_for_payload, max_encoded_payload_for_type, max_encoded_payload_txt, MAX_UDP_PAYLOAD,
-    RESPONSE_TTL,
-};
-use super::spec::{parse_domain_spec, DomainSpec};
-use super::UdpIo;
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_QUEUE_CAP: usize = 512;
@@ -89,10 +94,7 @@ pub(crate) struct XdnsConnServer {
 impl XdnsConnServer {
     pub(crate) fn new(inner: Box<dyn UdpIo>, domains: Vec<String>) -> io::Result<Self> {
         if domains.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "empty domains",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty domains"));
         }
         let mut specs = Vec::with_capacity(domains.len());
         for d in &domains {
@@ -103,11 +105,8 @@ impl XdnsConnServer {
 
         let closed = Arc::new(AtomicBool::new(false));
         let inner_arc: Arc<dyn UdpIo> = Arc::from(inner);
-        let state = Arc::new(ServerState {
-            domains: specs,
-            read_tx,
-            clients: Mutex::new(HashMap::new()),
-        });
+        let state =
+            Arc::new(ServerState { domains: specs, read_tx, clients: Mutex::new(HashMap::new()) });
 
         // recv loop：解析 DNS 查询 → 入 read_queue + 记录 client 信息
         {
@@ -123,12 +122,7 @@ impl XdnsConnServer {
             tokio::spawn(clean_loop(state, closed));
         }
 
-        Ok(Self {
-            inner: inner_arc,
-            state,
-            closed,
-            read_rx: Mutex::new(read_rx),
-        })
+        Ok(Self { inner: inner_arc, state, closed, read_rx: Mutex::new(read_rx) })
     }
 }
 
@@ -144,11 +138,7 @@ async fn clean_loop(state: Arc<ServerState>, closed: Arc<AtomicBool>) {
         let to_remove: Vec<String> = map
             .iter()
             .filter_map(|(k, c)| {
-                if now.duration_since(c.last_seen) >= IDLE_TIMEOUT {
-                    Some(k.clone())
-                } else {
-                    None
-                }
+                if now.duration_since(c.last_seen) >= IDLE_TIMEOUT { Some(k.clone()) } else { None }
             })
             .collect();
         for k in to_remove {
@@ -159,11 +149,7 @@ async fn clean_loop(state: Arc<ServerState>, closed: Arc<AtomicBool>) {
 
 /// recv loop：解析 DNS 查询 → 调 responseFor → 解码 payload 包 → 入 read_queue，
 /// 同时记录 client_addr → 真实 addr 的映射。
-async fn recv_loop(
-    state: Arc<ServerState>,
-    inner: Arc<dyn UdpIo>,
-    closed: Arc<AtomicBool>,
-) {
+async fn recv_loop(state: Arc<ServerState>, inner: Arc<dyn UdpIo>, closed: Arc<AtomicBool>) {
     let mut buf = vec![0u8; super::UDP_SIZE];
     loop {
         if closed.load(Ordering::Relaxed) {
@@ -191,20 +177,12 @@ async fn recv_loop(
         let client_addr = client_id_to_addr(client_id);
 
         // 记录 client 信息（即使 clientID 不完整，也保留以备后续 send_to 失败时发 NXDOMAIN）
-        let qtype = query
-            .question
-            .first()
-            .map(|q| q.qtype)
-            .unwrap_or(RR_TYPE_TXT);
+        let qtype = query.question.first().map(|q| q.qtype).unwrap_or(RR_TYPE_TXT);
         {
             let mut map = state.clients.lock().await;
             map.insert(
                 client_addr.to_string(),
-                ClientInfo {
-                    real_addr: addr,
-                    qtype,
-                    last_seen: Instant::now(),
-                },
+                ClientInfo { real_addr: addr, qtype, last_seen: Instant::now() },
             );
         }
 
@@ -212,10 +190,7 @@ async fn recv_loop(
         if copied == 8 {
             let mut reader = rest;
             while let Some(p) = next_packet_server(&mut reader) {
-                let pkt = Packet {
-                    data: p,
-                    addr: client_addr,
-                };
+                let pkt = Packet { data: p, addr: client_addr };
                 let _ = state.read_tx.try_send(pkt);
             }
         }
@@ -228,7 +203,7 @@ async fn recv_loop(
         match modified.wire_format() {
             Ok(out) => {
                 let _ = inner.send_to(&out, addr).await;
-            }
+            },
             Err(_) => continue,
         }
     }
@@ -345,7 +320,7 @@ pub(crate) fn response_for(query: &Message, domains: &[DomainSpec]) -> Option<Me
         None => {
             resp.flags |= super::dns::RCODE_NAME_ERROR;
             return Some(resp);
-        }
+        },
     };
     resp.flags |= 0x0400; // AA=1
 
@@ -356,11 +331,11 @@ pub(crate) fn response_for(query: &Message, domains: &[DomainSpec]) -> Option<Me
 
     // 校验 qtype
     match question.qtype {
-        RR_TYPE_TXT | RR_TYPE_A | RR_TYPE_AAAA => {}
+        RR_TYPE_TXT | RR_TYPE_A | RR_TYPE_AAAA => {},
         _ => {
             resp.flags |= super::dns::RCODE_NAME_ERROR;
             return Some(resp);
-        }
+        },
     }
     if matched.rr_type != 0 && question.qtype != matched.rr_type {
         resp.flags |= super::dns::RCODE_NAME_ERROR;
@@ -392,7 +367,7 @@ pub(crate) fn response_for(query: &Message, domains: &[DomainSpec]) -> Option<Me
 impl UdpIo for XdnsConnServer {
     async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
         if self.closed.load(Ordering::Relaxed) {
-            return Err(io::Error::other( "xdns server closed"));
+            return Err(io::Error::other("xdns server closed"));
         }
 
         let Some(_client_id) = addr_to_client_id(addr) else {
@@ -419,19 +394,10 @@ impl UdpIo for XdnsConnServer {
         }
 
         // 用 domain 第一项作为 question.name
-        let domain_name = self
-            .state
-            .domains
-            .first()
-            .map(|d| d.name.clone())
-            .unwrap_or_default();
+        let domain_name = self.state.domains.first().map(|d| d.name.clone()).unwrap_or_default();
 
         let answer = answers_for_payload(
-            &Question {
-                name: domain_name.clone(),
-                qtype,
-                qclass: super::dns::CLASS_IN,
-            },
+            &Question { name: domain_name.clone(), qtype, qclass: super::dns::CLASS_IN },
             RESPONSE_TTL,
             buf,
         )?;
@@ -439,11 +405,7 @@ impl UdpIo for XdnsConnServer {
         let resp = Message {
             id: 0,
             flags: 0x8000,
-            question: vec![Question {
-                name: domain_name,
-                qtype,
-                qclass: super::dns::CLASS_IN,
-            }],
+            question: vec![Question { name: domain_name, qtype, qclass: super::dns::CLASS_IN }],
             answer,
             authority: vec![],
             additional: vec![RR {
@@ -472,7 +434,7 @@ impl UdpIo for XdnsConnServer {
             rx.recv().await
         };
         let Some(pkt) = pkt else {
-            return Err(io::Error::other( "xdns server closed"));
+            return Err(io::Error::other("xdns server closed"));
         };
         let n = pkt.data.len().min(buf.len());
         buf[..n].copy_from_slice(&pkt.data[..n]);
@@ -517,9 +479,8 @@ mod tests {
     #[test]
     fn next_packet_server_skips_padding() {
         // [padding_count=224+3][3 pad][2][ab][padding=224+1][1 pad][3][cde]
-        let stream: Vec<u8> = vec![
-            224 + 3, 0xaa, 0xbb, 0xcc, 2, b'a', b'b', 224 + 1, 0xdd, 3, b'c', b'd', b'e',
-        ];
+        let stream: Vec<u8> =
+            vec![224 + 3, 0xaa, 0xbb, 0xcc, 2, b'a', b'b', 224 + 1, 0xdd, 3, b'c', b'd', b'e'];
         let mut reader = &stream[..];
         let p1 = next_packet_server(&mut reader).unwrap();
         assert_eq!(p1, b"ab");
@@ -537,16 +498,8 @@ mod tests {
 
     #[test]
     fn response_for_empty_query_returns_formerr() {
-        let query = Message {
-            id: 1,
-            flags: 0,
-            question: vec![],
-            ..Message::default()
-        };
-        let domains = vec![DomainSpec {
-            name: Name::parse("t.example.com").unwrap(),
-            rr_type: 0,
-        }];
+        let query = Message { id: 1, flags: 0, question: vec![], ..Message::default() };
+        let domains = vec![DomainSpec { name: Name::parse("t.example.com").unwrap(), rr_type: 0 }];
         let resp = response_for(&query, &domains).unwrap();
         assert_eq!(resp.flags & 0x000f, RCODE_FORMAT_ERROR);
     }
@@ -563,10 +516,7 @@ mod tests {
             }],
             ..Message::default()
         };
-        let domains = vec![DomainSpec {
-            name: Name::parse("t.example.com").unwrap(),
-            rr_type: 0,
-        }];
+        let domains = vec![DomainSpec { name: Name::parse("t.example.com").unwrap(), rr_type: 0 }];
         assert!(response_for(&query, &domains).is_none());
     }
 
@@ -589,10 +539,7 @@ mod tests {
             }],
             ..Message::default()
         };
-        let domains = vec![DomainSpec {
-            name: Name::parse("t.example.com").unwrap(),
-            rr_type: 0,
-        }];
+        let domains = vec![DomainSpec { name: Name::parse("t.example.com").unwrap(), rr_type: 0 }];
         let resp = response_for(&query, &domains).unwrap();
         assert_eq!(resp.flags & 0x8000, 0x8000); // QR=1
         assert_eq!(resp.flags & 0x0400, 0); // AA=0
@@ -619,10 +566,8 @@ mod tests {
             }],
             ..Message::default()
         };
-        let domains = vec![DomainSpec {
-            name: Name::parse("t.example.com").unwrap(),
-            rr_type: RR_TYPE_A,
-        }];
+        let domains =
+            vec![DomainSpec { name: Name::parse("t.example.com").unwrap(), rr_type: RR_TYPE_A }];
         let resp = response_for(&query, &domains).unwrap();
         assert_eq!(resp.flags & 0x000f, RCODE_NAME_ERROR);
     }
@@ -646,10 +591,7 @@ mod tests {
             }],
             ..Message::default()
         };
-        let domains = vec![DomainSpec {
-            name: Name::parse("t.example.com").unwrap(),
-            rr_type: 0,
-        }];
+        let domains = vec![DomainSpec { name: Name::parse("t.example.com").unwrap(), rr_type: 0 }];
         let resp = response_for(&query, &domains).unwrap();
         assert_eq!(resp.flags & 0x0400, 0x0400); // AA=1
         assert_eq!(resp.flags & 0x000f, RCODE_NOT_IMPLEMENTED);
@@ -674,10 +616,7 @@ mod tests {
             }],
             ..Message::default()
         };
-        let domains = vec![DomainSpec {
-            name: Name::parse("t.example.com").unwrap(),
-            rr_type: 0,
-        }];
+        let domains = vec![DomainSpec { name: Name::parse("t.example.com").unwrap(), rr_type: 0 }];
         let resp = response_for(&query, &domains).unwrap();
         assert_eq!(resp.id, 0x1234);
         assert_eq!(resp.flags & 0x8000, 0x8000); // QR=1
@@ -707,10 +646,7 @@ mod tests {
             }],
             ..Message::default()
         };
-        let domains = vec![DomainSpec {
-            name: Name::parse("t.example.com").unwrap(),
-            rr_type: 0,
-        }];
+        let domains = vec![DomainSpec { name: Name::parse("t.example.com").unwrap(), rr_type: 0 }];
         let resp = response_for(&query, &domains).unwrap();
         assert_eq!(resp.flags & 0x000f, EXTENDED_RCODE_BAD_VERS & 0xf);
     }

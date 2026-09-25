@@ -12,9 +12,11 @@
 //! 3. **lastSeen Unix 秒**：每次 AddIP 更新；ForEach 回调返回 false 停止
 //! 4. **死锁警告**：ForEach 在锁内回调，禁止回调内调用 AddIP / RemoveIP
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicI64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use parking_lot::Mutex;
 use xray_features::stats::OnlineMap as OnlineMapTrait;
@@ -44,10 +46,7 @@ impl OnlineMap {
     /// 新建空映射。对应 Go `NewOnlineMap()`。
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            entries: Mutex::new(HashMap::new()),
-            count: AtomicI64::new(0),
-        }
+        Self { entries: Mutex::new(HashMap::new()), count: AtomicI64::new(0) }
     }
 
     /// 当前 Unix 秒时间戳（与 Go `time.Now().Unix()` 等价）。
@@ -85,17 +84,11 @@ impl OnlineMapTrait for OnlineMap {
             Some(e) => {
                 e.ref_count = e.ref_count.saturating_add(1);
                 e.last_seen = now;
-            }
+            },
             None => {
-                entries.insert(
-                    ip.to_string(),
-                    IpEntry {
-                        ref_count: 1,
-                        last_seen: now,
-                    },
-                );
+                entries.insert(ip.to_string(), IpEntry { ref_count: 1, last_seen: now });
                 self.count.fetch_add(1, Ordering::SeqCst);
-            }
+            },
         }
     }
 
@@ -283,8 +276,7 @@ mod tests {
 
     #[test]
     fn concurrent_add_remove_safe() {
-        use std::sync::Arc;
-        use std::thread;
+        use std::{sync::Arc, thread};
         let m = Arc::new(OnlineMap::new());
         let mut handles = Vec::new();
         for i in 0..8 {

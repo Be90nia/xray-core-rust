@@ -14,9 +14,7 @@ use std::sync::Arc;
 
 use xray_app_dispatcher::default::DialFn;
 use xray_common::net::destination::Destination;
-use xray_transport::connection::Connection;
-use xray_transport::sockopt::SocketOptions;
-use xray_transport::system_dialer::dial_system;
+use xray_transport::{connection::Connection, sockopt::SocketOptions, system_dialer::dial_system};
 
 /// 构造 TUN 的 DialFn 闭包。
 ///
@@ -31,9 +29,8 @@ pub fn make_tun_dial_fn() -> DialFn {
         let dest = dest.clone();
         Box::pin(async move {
             let sockopt = SocketOptions::default();
-            let conn: Box<dyn Connection> = dial_system(&dest, &sockopt)
-                .await
-                .map_err(|e| format!("tun dial: {e}"))?;
+            let conn: Box<dyn Connection> =
+                dial_system(&dest, &sockopt).await.map_err(|e| format!("tun dial: {e}"))?;
             Ok(conn)
         })
     })

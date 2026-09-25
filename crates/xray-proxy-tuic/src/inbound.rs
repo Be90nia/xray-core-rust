@@ -3,25 +3,31 @@
 //! 生产版 inbound：quinn QUIC server → accept bi/uni stream → authenticate → TCP/UDP relay。
 //! 复用 [`crate::server`] 中的协议解析与 relay 逻辑。
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use async_trait::async_trait;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
-use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tokio::{sync::Mutex, task::JoinHandle};
 use uuid::Uuid;
-
 use xray_features::inbound::{InboundError, InboundHandler};
 
-use crate::client::{CongestionControl, apply_congestion_to_transport};
-use crate::error::{Result, TuicError};
-use crate::protocol::command::{type_code, TOKEN_LEN};
-use crate::protocol::{Command, Packet};
-use crate::server::{
-    addr_to_socket_addr, handle_incoming_uni, read_authenticate, read_frame_from_recv,
-    relay_to_tcp, ReplySink, UdpAssocTable,
+use crate::{
+    client::{CongestionControl, apply_congestion_to_transport},
+    error::{Result, TuicError},
+    protocol::{
+        Command, Packet,
+        command::{TOKEN_LEN, type_code},
+    },
+    server::{
+        ReplySink, UdpAssocTable, addr_to_socket_addr, handle_incoming_uni, read_authenticate,
+        read_frame_from_recv, relay_to_tcp,
+    },
 };
 
 /// TUIC inbound 配置。
@@ -59,15 +65,10 @@ struct TlsCert {
 fn gen_self_signed(server_name: &str) -> std::result::Result<TlsCert, rcgen::Error> {
     let mut params = CertificateParams::new(vec![server_name.to_string()])?;
     params.distinguished_name = DistinguishedName::new();
-    params
-        .distinguished_name
-        .push(DnType::CommonName, server_name);
+    params.distinguished_name.push(DnType::CommonName, server_name);
     let key_pair = KeyPair::generate()?;
     let cert = params.self_signed(&key_pair)?;
-    Ok(TlsCert {
-        cert_der: cert.der().to_vec(),
-        key_der: key_pair.serialize_der(),
-    })
+    Ok(TlsCert { cert_der: cert.der().to_vec(), key_der: key_pair.serialize_der() })
 }
 
 /// TUIC 入站 Handler。
@@ -86,7 +87,7 @@ pub struct TuicInboundHandler {
     cert_der: std::sync::Mutex<Option<Vec<u8>>>,
     /// 实际监听端口（start 后有效；listen 配置 0 时由 OS 分配）。
     local_port: std::sync::atomic::AtomicU16,
- }
+}
 
 struct InboundSlot {
     endpoint: Arc<quinn::Endpoint>,
@@ -126,18 +127,17 @@ impl TuicInboundHandler {
     fn build_server_config(&self) -> Result<quinn::ServerConfig> {
         xray_common::ensure_default_crypto_provider();
 
-        let (cert_der, key_der) = if let (Some(c), Some(k)) =
-            (&self.config.cert_der, &self.config.key_der)
-        {
-            (c.clone(), k.clone())
-        } else {
-            let tls = gen_self_signed(&self.config.server_name).map_err(|e| {
-                TuicError::Io(std::io::Error::other(format!("rcgen self-signed failed: {e}")))
-            })?;
-            // 暴露自签证书给 client trust store
-            *self.cert_der.lock().unwrap() = Some(tls.cert_der.clone());
-            (tls.cert_der, tls.key_der)
-        };
+        let (cert_der, key_der) =
+            if let (Some(c), Some(k)) = (&self.config.cert_der, &self.config.key_der) {
+                (c.clone(), k.clone())
+            } else {
+                let tls = gen_self_signed(&self.config.server_name).map_err(|e| {
+                    TuicError::Io(std::io::Error::other(format!("rcgen self-signed failed: {e}")))
+                })?;
+                // 暴露自签证书给 client trust store
+                *self.cert_der.lock().unwrap() = Some(tls.cert_der.clone());
+                (tls.cert_der, tls.key_der)
+            };
 
         let private_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
             rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
@@ -150,7 +150,9 @@ impl TuicInboundHandler {
         server_crypto.alpn_protocols = vec![b"h3".to_vec(), b"tuic".to_vec()];
 
         let quic_server_cfg = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
-            .map_err(|e| TuicError::Io(std::io::Error::other(format!("quinn rustls convert: {e}"))))?;
+            .map_err(|e| {
+                TuicError::Io(std::io::Error::other(format!("quinn rustls convert: {e}")))
+            })?;
 
         let mut transport = quinn::TransportConfig::default();
         transport.datagram_receive_buffer_size(Some(8 * 1024));
@@ -178,12 +180,15 @@ impl InboundHandler for TuicInboundHandler {
             return Err(InboundError::AlreadyStarted(self.tag.clone()));
         }
 
-        let server_cfg = self.build_server_config().map_err(|e| {
-            InboundError::ListenError(format!("tuic server config: {e}"))
-        })?;
+        let server_cfg = self
+            .build_server_config()
+            .map_err(|e| InboundError::ListenError(format!("tuic server config: {e}")))?;
 
-        let std_sock = xray_transport::sockopt::bind_udp_endpoint(self.config.listen, &self.config.sockopt)
-            .map_err(|e| InboundError::ListenError(format!("tuic bind {}: {e}", self.config.listen)))?;
+        let std_sock =
+            xray_transport::sockopt::bind_udp_endpoint(self.config.listen, &self.config.sockopt)
+                .map_err(|e| {
+                    InboundError::ListenError(format!("tuic bind {}: {e}", self.config.listen))
+                })?;
         let endpoint = Arc::new(
             quinn::Endpoint::new(
                 quinn::EndpointConfig::default(),
@@ -196,9 +201,9 @@ impl InboundHandler for TuicInboundHandler {
             })?,
         );
 
-        let local_addr = endpoint.local_addr().map_err(|e| {
-            InboundError::ListenError(format!("tuic local_addr: {e}"))
-        })?;
+        let local_addr = endpoint
+            .local_addr()
+            .map_err(|e| InboundError::ListenError(format!("tuic local_addr: {e}")))?;
 
         self.local_port.store(local_addr.port(), std::sync::atomic::Ordering::SeqCst);
         tracing::info!(
@@ -231,10 +236,7 @@ impl InboundHandler for TuicInboundHandler {
         });
 
         let mut slot = self.slot.lock().await;
-        *slot = Some(InboundSlot {
-            endpoint,
-            _accept_task: accept_task,
-        });
+        *slot = Some(InboundSlot { endpoint, _accept_task: accept_task });
         Ok(())
     }
 
@@ -248,6 +250,7 @@ impl InboundHandler for TuicInboundHandler {
         }
         Ok(())
     }
+
     fn port(&self) -> u16 {
         let p = self.local_port.load(std::sync::atomic::Ordering::SeqCst);
         if p != 0 { p } else { self.config.listen.port() }
@@ -261,29 +264,26 @@ async fn handle_connection(
     dispatch: Option<Arc<dyn xray_app_dispatcher::DispatchHandler>>,
 ) -> Result<()> {
     let conn = incoming.await?;
-        // 生成 expected_token (对齐官方 tuic v5: label=UUID 16字节)
-        let mut expected_token = [0u8; TOKEN_LEN];
-        conn.export_keying_material(&mut expected_token, expected_uuid.as_bytes(), password.as_bytes())
-            .map_err(|_| TuicError::KeyingMaterialExport)?;
+    // 生成 expected_token (对齐官方 tuic v5: label=UUID 16字节)
+    let mut expected_token = [0u8; TOKEN_LEN];
+    conn.export_keying_material(&mut expected_token, expected_uuid.as_bytes(), password.as_bytes())
+        .map_err(|_| TuicError::KeyingMaterialExport)?;
 
     // accept_uni 读 Authenticate（流式分段读——QUIC 流分片安全，票 ieik）
     let mut uni = conn.accept_uni().await?;
     let cmd = read_authenticate(&mut uni).await?;
     match cmd {
-        Command::Authenticate {
-            uuid_bytes,
-            token,
-        } => {
+        Command::Authenticate { uuid_bytes, token } => {
             if uuid_bytes != *expected_uuid.as_bytes() || token != expected_token {
                 conn.close(1u32.into(), b"auth failed");
                 return Err(TuicError::Io(std::io::Error::other("auth failed")));
             }
-        }
+        },
         _ => {
             return Err(TuicError::Io(std::io::Error::other(
                 "first uni stream must be Authenticate",
             )));
-        }
+        },
     }
 
     // accept_bi + accept_uni + read_datagram 三路循环（bd 8hb + 7ry/1ur）：
@@ -328,18 +328,14 @@ async fn handle_connection(
 ///
 /// spec：datagram 承载完整命令帧（VER + TYPE + 负载）；Packet 路由到
 /// assoc 会话并以 datagram 模式回写，Heartbeat 等保活命令忽略。
-fn handle_datagram(
-    dg: &bytes::Bytes,
-    conn: &quinn::Connection,
-    table: &mut UdpAssocTable,
-) {
+fn handle_datagram(dg: &bytes::Bytes, conn: &quinn::Connection, table: &mut UdpAssocTable) {
     let mut cursor = &dg[..];
     match crate::protocol::parse_header(&mut cursor) {
         Ok(t) if t == type_code::PACKET => match Packet::read_payload(&mut cursor) {
             Ok(pkt) => table.handle_packet(pkt, ReplySink::Dgram(conn.clone())),
             Err(e) => tracing::debug!("tuic inbound: datagram packet parse: {e:?}"),
         },
-        Ok(_) => {} // Heartbeat 可走 datagram（spec），保活语义无需处理
+        Ok(_) => {}, // Heartbeat 可走 datagram（spec），保活语义无需处理
         Err(e) => tracing::debug!("tuic inbound: datagram header: {e:?}"),
     }
 }
@@ -359,9 +355,7 @@ async fn handle_bi_frame(
                 // initial_bytes 前置回 Link reader（read 一次读出 Connect+payload 的场景）。
                 if let Some(dest) = tuic_addr_to_destination(&addr) {
                     let link = xray_transport::link::Link::new(
-                        xray_buf::io::new_reader(InitialedReader::new(
-                            initial_bytes, recv_bi,
-                        )),
+                        xray_buf::io::new_reader(InitialedReader::new(initial_bytes, recv_bi)),
                         xray_buf::io::new_writer(send_bi),
                     );
                     tokio::spawn(async move {
@@ -377,19 +371,17 @@ async fn handle_bi_frame(
                     return;
                 };
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        relay_to_tcp(target, send_bi, recv_bi, initial_bytes).await
-                    {
+                    if let Err(e) = relay_to_tcp(target, send_bi, recv_bi, initial_bytes).await {
                         tracing::debug!("tuic relay {target}: {e:?}");
                     }
                 });
             }
-        }
-        Ok((_, _, _)) => {}
+        },
+        Ok((_, _, _)) => {},
         Err(e) => {
             // bi 收到 Packet（TYPE 0x02）等非 Connect 帧落此路径，忽略（spec，票 d1zr）
             tracing::debug!("tuic inbound: bi frame skipped/invalid: {e:?}");
-        }
+        },
     }
 }
 
@@ -401,10 +393,7 @@ struct InitialedReader<R> {
 
 impl<R> InitialedReader<R> {
     fn new(initial: Vec<u8>, inner: R) -> Self {
-        Self {
-            initial: std::io::Cursor::new(initial),
-            inner,
-        }
+        Self { initial: std::io::Cursor::new(initial), inner }
     }
 }
 
@@ -414,7 +403,9 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for InitialedReader<R
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        if !self.initial.get_ref().is_empty() && self.initial.position() < self.initial.get_ref().len() as u64 {
+        if !self.initial.get_ref().is_empty()
+            && self.initial.position() < self.initial.get_ref().len() as u64
+        {
             let unfilled = buf.initialize_unfilled();
             let n = std::io::Read::read(&mut self.initial, unfilled)
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -426,11 +417,12 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for InitialedReader<R
 }
 
 /// TUIC Address → xray Destination（TCP）。支持 Domain（dispatcher 解析 DNS）。
-fn tuic_addr_to_destination(addr: &crate::protocol::Address) -> Option<xray_common::net::destination::Destination> {
-    use xray_common::net::address::Address as XAddress;
-    use xray_common::net::destination::Destination;
-    use xray_common::net::network::Network;
-    use xray_common::net::port::Port;
+fn tuic_addr_to_destination(
+    addr: &crate::protocol::Address,
+) -> Option<xray_common::net::destination::Destination> {
+    use xray_common::net::{
+        address::Address as XAddress, destination::Destination, network::Network, port::Port,
+    };
     let (addr, port) = match addr {
         crate::protocol::Address::Domain(d, p) => (XAddress::Domain(d.clone()), *p),
         crate::protocol::Address::Ipv4(ip, p) => (XAddress::IPv4(*ip), *p),
@@ -442,8 +434,9 @@ fn tuic_addr_to_destination(addr: &crate::protocol::Address) -> Option<xray_comm
 
 #[cfg(test)]
 mod cc_tests {
-    use super::*;
     use uuid::Uuid;
+
+    use super::*;
 
     fn make_handler(cc: Option<CongestionControl>, brutal_up_bps: u64) -> TuicInboundHandler {
         TuicInboundHandler::new(
@@ -498,7 +491,9 @@ mod cc_tests {
     /// 带 CC 配置的 build_server_config 照常构建（e2e 真建链见 server.rs）。
     #[test]
     fn build_server_config_with_cc_builds() {
-        assert!(make_handler(Some(CongestionControl::HysteriaBbr), 0).build_server_config().is_ok());
+        assert!(
+            make_handler(Some(CongestionControl::HysteriaBbr), 0).build_server_config().is_ok()
+        );
         assert!(
             make_handler(Some(CongestionControl::HysteriaBrutal), 10_000_000)
                 .build_server_config()
@@ -506,4 +501,3 @@ mod cc_tests {
         );
     }
 }
-

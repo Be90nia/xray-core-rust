@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use rand::{Rng, SeedableRng};
 
-use super::table::{pack_key, sort4, Layout, Table};
+use super::table::{Layout, Table, pack_key, sort4};
 
 /// 4 元素全排列（24 种），对应 Go `perm4`。
 const PERM4: [[u8; 4]; 24] = [
@@ -52,12 +52,7 @@ impl Codec {
     pub fn new(tables: Vec<Arc<Table>>, p_min: usize, p_max: usize) -> Self {
         let mut rng = rand::rngs::StdRng::seed_from_u64(rand::rng().random());
         let padding_chance = pick_padding_chance(&mut rng, p_min, p_max);
-        Self {
-            tables,
-            rng,
-            padding_chance,
-            table_index: 0,
-        }
+        Self { tables, rng, padding_chance, table_index: 0 }
     }
 
     /// 当前轮转的 table（对应 Go `currentTable`）。
@@ -148,7 +143,7 @@ pub(crate) fn decode_bytes(
                 out.push(decoded);
                 hint_buf.clear();
                 *table_index += 1;
-            }
+            },
             None => return Err("invalid sudoku hint tuple".into()),
         }
     }
@@ -174,12 +169,7 @@ impl PackedEncoder {
         };
         let mut rng = rand::rngs::StdRng::seed_from_u64(rand::rng().random());
         let padding_chance = pick_padding_chance(&mut rng, p_min, p_max);
-        Self {
-            layouts,
-            rng,
-            padding_chance,
-            group_index: 0,
-        }
+        Self { layouts, rng, padding_chance, group_index: 0 }
     }
 
     /// 编码（对应 Go `packedEncoder.encode`）。
@@ -280,9 +270,8 @@ impl PackedDecoder {
                 }
                 continue;
             }
-            let group = layout
-                .decode_group(b)
-                .ok_or_else(|| format!("invalid packed sudoku byte: {b}"))?;
+            let group =
+                layout.decode_group(b).ok_or_else(|| format!("invalid packed sudoku byte: {b}"))?;
             self.group_index += 1;
             self.bit_buf = (self.bit_buf << 6) | u64::from(group);
             self.bit_count += 6;
@@ -334,8 +323,7 @@ fn random_padding(rng: &mut impl Rng, table: &Table) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::table::get_tables;
+    use super::{super::table::get_tables, *};
 
     fn make_tables() -> Vec<Arc<Table>> {
         get_tables("test_codec", "", &[]).unwrap()

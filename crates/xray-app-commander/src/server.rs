@@ -11,18 +11,23 @@
 //! Commander 在 outbound 模式下：listener + handler 成对创建，handler 接收 dispatch
 //! 的连接投递到 listener，gRPC server 从 listener accept。
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
-
-use crate::error::CommanderError;
-use crate::outbound::{CommanderConn, HandlerManager, OutboundListener, OutboundRegistrar};
+use xray_common::{net::destination::Destination, session::Session};
 use xray_features::outbound::{OutboundError, OutboundHandler as XrayOutboundHandler};
-use xray_common::net::destination::Destination;
-use xray_common::session::Session;
+
+use crate::{
+    error::CommanderError,
+    outbound::{CommanderConn, HandlerManager, OutboundListener, OutboundRegistrar},
+};
 
 /// Listener 缓冲容量，对应 Go `make(chan net.Conn, 4)`。
 const LISTENER_BUFFER: usize = 4;
@@ -290,9 +295,7 @@ pub struct OutboundHandlerRegistry {
 impl OutboundHandlerRegistry {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            handlers: Mutex::new(Vec::new()),
-        }
+        Self { handlers: Mutex::new(Vec::new()) }
     }
 
     /// 已注册 handler 数量。
@@ -302,20 +305,12 @@ impl OutboundHandlerRegistry {
 
     /// 列出所有 handler tag（克隆 String，避免持有锁）。
     pub fn list_tags(&self) -> Vec<String> {
-        self.handlers
-            .lock()
-            .iter()
-            .map(|h| h.tag().to_string())
-            .collect()
+        self.handlers.lock().iter().map(|h| h.tag().to_string()).collect()
     }
 
     /// 按 tag 查找 handler。
     pub fn get(&self, tag: &str) -> Option<Arc<dyn XrayOutboundHandler>> {
-        self.handlers
-            .lock()
-            .iter()
-            .find(|h| h.tag() == tag)
-            .cloned()
+        self.handlers.lock().iter().find(|h| h.tag() == tag).cloned()
     }
 }
 
@@ -326,10 +321,7 @@ impl Default for OutboundHandlerRegistry {
 }
 
 impl crate::outbound::HandlerManager for OutboundHandlerRegistry {
-    fn add_handler(
-        &self,
-        handler: Arc<dyn XrayOutboundHandler>,
-    ) -> Result<(), CommanderError> {
+    fn add_handler(&self, handler: Arc<dyn XrayOutboundHandler>) -> Result<(), CommanderError> {
         let tag = handler.tag().to_string();
         let mut handlers = self.handlers.lock();
         if handlers.iter().any(|h| h.tag() == tag) {
@@ -540,9 +532,7 @@ mod tests {
     fn registry_add_duplicate_rejected() {
         let r = OutboundHandlerRegistry::new();
         r.add_handler(Arc::new(StubOutboundHandler::new("a"))).unwrap();
-        let err = r
-            .add_handler(Arc::new(StubOutboundHandler::new("a")))
-            .unwrap_err();
+        let err = r.add_handler(Arc::new(StubOutboundHandler::new("a"))).unwrap_err();
         assert!(matches!(err, CommanderError::OutboundRegisterFailed(_)));
         assert_eq!(r.count(), 1);
     }

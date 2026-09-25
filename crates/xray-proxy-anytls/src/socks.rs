@@ -21,9 +21,9 @@ pub enum SocksAddr {
     /// 域名形式（ATYP=0x03）。
     Domain(String, u16),
     /// IPv4 形式（ATYP=0x01）。
-   Ipv4(SocketAddrV4),
+    Ipv4(SocketAddrV4),
     /// IPv6 形式（ATYP=0x04）。
-   Ipv6(SocketAddrV6),
+    Ipv6(SocketAddrV6),
 }
 
 impl SocksAddr {
@@ -66,17 +66,17 @@ impl SocksAddr {
                 buf.push(len);
                 buf.extend_from_slice(host_bytes);
                 buf.extend_from_slice(&port.to_be_bytes());
-            }
+            },
             Self::Ipv4(addr) => {
                 buf.push(atyp::IPV4);
                 buf.extend_from_slice(&addr.ip().octets());
                 buf.extend_from_slice(&addr.port().to_be_bytes());
-            }
+            },
             Self::Ipv6(addr) => {
                 buf.push(atyp::IPV6);
                 buf.extend_from_slice(&addr.ip().octets());
                 buf.extend_from_slice(&addr.port().to_be_bytes());
-            }
+            },
         }
         Ok(buf)
     }
@@ -97,11 +97,8 @@ impl SocksAddr {
                 let mut ip = [0u8; 4];
                 ip.copy_from_slice(&buf[1..5]);
                 let port = u16::from_be_bytes([buf[5], buf[6]]);
-                Ok((
-                    Self::Ipv4(SocketAddrV4::new(Ipv4Addr::from(ip), port)),
-                    7,
-                ))
-            }
+                Ok((Self::Ipv4(SocketAddrV4::new(Ipv4Addr::from(ip), port)), 7))
+            },
             atyp::DOMAIN => {
                 if buf.len() < 2 {
                     return Err(AnytlsError::InvalidSocksAddr("domain length missing".into()));
@@ -116,7 +113,7 @@ impl SocksAddr {
                     .to_string();
                 let port = u16::from_be_bytes([buf[2 + len], buf[2 + len + 1]]);
                 Ok((Self::Domain(host, port), total))
-            }
+            },
             atyp::IPV6 => {
                 if buf.len() < 1 + 16 + 2 {
                     return Err(AnytlsError::InvalidSocksAddr("ipv6 too short".into()));
@@ -124,11 +121,8 @@ impl SocksAddr {
                 let mut ip = [0u8; 16];
                 ip.copy_from_slice(&buf[1..17]);
                 let port = u16::from_be_bytes([buf[17], buf[18]]);
-                Ok((
-                    Self::Ipv6(SocketAddrV6::new(Ipv6Addr::from(ip), port, 0, 0)),
-                    19,
-                ))
-            }
+                Ok((Self::Ipv6(SocketAddrV6::new(Ipv6Addr::from(ip), port, 0, 0)), 19))
+            },
             other => Err(AnytlsError::InvalidSocksAddr(format!("unknown atyp: {other}"))),
         }
     }
@@ -191,7 +185,7 @@ mod tests {
             SocksAddr::Domain(h, p) => {
                 assert_eq!(h, "example.com");
                 assert_eq!(p, 443);
-            }
+            },
             _ => panic!("expected Domain"),
         }
     }
@@ -227,21 +221,21 @@ mod tests {
             SocksAddr::Domain(h, p) => {
                 assert_eq!(h, "example.com");
                 assert_eq!(p, 443);
-            }
+            },
             _ => panic!(),
         }
         match SocksAddr::parse("127.0.0.1:8080").unwrap() {
             SocksAddr::Ipv4(a) => {
                 assert_eq!(a.ip(), &Ipv4Addr::new(127, 0, 0, 1));
                 assert_eq!(a.port(), 8080);
-            }
+            },
             _ => panic!(),
         }
         match SocksAddr::parse("[::1]:443").unwrap() {
             SocksAddr::Ipv6(a) => {
                 assert_eq!(a.ip(), &Ipv6Addr::LOCALHOST);
                 assert_eq!(a.port(), 443);
-            }
+            },
             _ => panic!(),
         }
     }

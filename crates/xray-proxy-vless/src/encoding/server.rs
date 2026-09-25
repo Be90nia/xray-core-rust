@@ -7,9 +7,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use xray_common::net::address::Address;
 use xray_proto::xray::proxy::vless::encoding::Addons;
 
-use crate::encoding::{decode_header_addons, empty_addons, read_address_port, VlessCommand, VERSION};
-use crate::error::{Result, VlessError};
-use crate::validator::{MemoryUser, Validator};
+use crate::{
+    encoding::{VERSION, VlessCommand, decode_header_addons, empty_addons, read_address_port},
+    error::{Result, VlessError},
+    validator::{MemoryUser, Validator},
+};
 
 /// 解码后的请求头。
 #[derive(Debug, Clone)]
@@ -78,17 +80,11 @@ pub async fn decode_request_header<R: AsyncRead + Unpin>(
         first_buf.drain(0..17);
     } else {
         let mut ver_buf = [0u8; 1];
-        reader
-            .read_exact(&mut ver_buf)
-            .await
-            .map_err(VlessError::Io)?;
+        reader.read_exact(&mut ver_buf).await.map_err(VlessError::Io)?;
         decoded.version = ver_buf[0];
 
         let mut id_buf = [0u8; 16];
-        reader
-            .read_exact(&mut id_buf)
-            .await
-            .map_err(VlessError::Io)?;
+        reader.read_exact(&mut id_buf).await.map_err(VlessError::Io)?;
         decoded.user_id = id_buf;
     }
 
@@ -110,31 +106,26 @@ pub async fn decode_request_header<R: AsyncRead + Unpin>(
 
     // ---- 5. command (1B) ----
     let mut cmd_buf = [0u8; 1];
-    reader
-        .read_exact(&mut cmd_buf)
-        .await
-        .map_err(VlessError::Io)?;
-    let command = VlessCommand::from_u8(cmd_buf[0])
-        .ok_or(VlessError::InvalidRequestCommand(cmd_buf[0]))?;
+    reader.read_exact(&mut cmd_buf).await.map_err(VlessError::Io)?;
+    let command =
+        VlessCommand::from_u8(cmd_buf[0]).ok_or(VlessError::InvalidRequestCommand(cmd_buf[0]))?;
     decoded.command = command;
 
     // ---- 6. 根据 command 决定地址 ----
     match command {
         VlessCommand::Mux => {
-            decoded.address = Some(Address::Domain(
-                VlessCommand::Mux.fixed_domain().unwrap().to_string(),
-            ));
-        }
+            decoded.address =
+                Some(Address::Domain(VlessCommand::Mux.fixed_domain().unwrap().to_string()));
+        },
         VlessCommand::Rvs => {
-            decoded.address = Some(Address::Domain(
-                VlessCommand::Rvs.fixed_domain().unwrap().to_string(),
-            ));
-        }
+            decoded.address =
+                Some(Address::Domain(VlessCommand::Rvs.fixed_domain().unwrap().to_string()));
+        },
         VlessCommand::Tcp | VlessCommand::Udp => {
             let (addr, port) = read_address_port(reader).await?;
             decoded.address = Some(addr);
             decoded.port = Some(port.value());
-        }
+        },
     }
 
     Ok(decoded)
@@ -155,26 +146,26 @@ pub async fn encode_response_header<W: AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::encoding::client::encode_request_header;
-    use crate::encoding::empty_addons;
-    use crate::validator::{MemoryUser, MemoryValidator, Validator};
-    use crate::MemoryAccount;
     use std::io::Cursor;
-    use xray_common::net::address::Address;
-    use xray_common::uuid::UUID;
+
+    use xray_common::{net::address::Address, uuid::UUID};
+
+    use super::*;
+    use crate::{
+        MemoryAccount,
+        encoding::{client::encode_request_header, empty_addons},
+        validator::{MemoryUser, MemoryValidator, Validator},
+    };
 
     fn make_user_and_validator() -> (UUID, MemoryValidator) {
         let uuid = UUID::new();
         let user = MemoryUser {
             level: 0,
             email: "test@example.com".to_string(),
-            account: MemoryAccount::from_proto_account(
-                &xray_proto::xray::proxy::vless::Account {
-                    id: uuid.to_string(),
-                    ..Default::default()
-                },
-            )
+            account: MemoryAccount::from_proto_account(&xray_proto::xray::proxy::vless::Account {
+                id: uuid.to_string(),
+                ..Default::default()
+            })
             .unwrap(),
         };
         let v = MemoryValidator::new();
@@ -190,17 +181,21 @@ mod tests {
         let addr = Address::Domain("www.example.com".to_string());
         let addons = empty_addons();
         encode_request_header(
-            &mut buf, VERSION, &uuid, VlessCommand::Tcp,
-            Some(&addr), Some(443), &addons,
+            &mut buf,
+            VERSION,
+            &uuid,
+            VlessCommand::Tcp,
+            Some(&addr),
+            Some(443),
+            &addons,
         )
         .await
         .unwrap();
 
         let mut cursor = Cursor::new(buf);
         let mut first: Option<Vec<u8>> = None;
-        let decoded = decode_request_header(false, &mut first, &mut cursor, &validator)
-            .await
-            .unwrap();
+        let decoded =
+            decode_request_header(false, &mut first, &mut cursor, &validator).await.unwrap();
 
         assert_eq!(decoded.version, VERSION);
         assert_eq!(decoded.command, VlessCommand::Tcp);
@@ -218,17 +213,21 @@ mod tests {
         let addr = Address::IPv4(std::net::Ipv4Addr::new(8, 8, 8, 8));
         let addons = empty_addons();
         encode_request_header(
-            &mut buf, VERSION, &uuid, VlessCommand::Udp,
-            Some(&addr), Some(53), &addons,
+            &mut buf,
+            VERSION,
+            &uuid,
+            VlessCommand::Udp,
+            Some(&addr),
+            Some(53),
+            &addons,
         )
         .await
         .unwrap();
 
         let mut cursor = Cursor::new(buf);
         let mut first: Option<Vec<u8>> = None;
-        let decoded = decode_request_header(false, &mut first, &mut cursor, &validator)
-            .await
-            .unwrap();
+        let decoded =
+            decode_request_header(false, &mut first, &mut cursor, &validator).await.unwrap();
 
         assert_eq!(decoded.command, VlessCommand::Udp);
         assert_eq!(decoded.port, Some(53));
@@ -243,18 +242,14 @@ mod tests {
 
         let mut buf = Vec::new();
         let addons = empty_addons();
-        encode_request_header(
-            &mut buf, VERSION, &uuid, VlessCommand::Mux,
-            None, None, &addons,
-        )
-        .await
-        .unwrap();
+        encode_request_header(&mut buf, VERSION, &uuid, VlessCommand::Mux, None, None, &addons)
+            .await
+            .unwrap();
 
         let mut cursor = Cursor::new(buf);
         let mut first: Option<Vec<u8>> = None;
-        let decoded = decode_request_header(false, &mut first, &mut cursor, &validator)
-            .await
-            .unwrap();
+        let decoded =
+            decode_request_header(false, &mut first, &mut cursor, &validator).await.unwrap();
 
         assert_eq!(decoded.command, VlessCommand::Mux);
         assert_eq!(decoded.port, None);
@@ -268,18 +263,14 @@ mod tests {
 
         let mut buf = Vec::new();
         let addons = empty_addons();
-        encode_request_header(
-            &mut buf, VERSION, &uuid, VlessCommand::Rvs,
-            None, None, &addons,
-        )
-        .await
-        .unwrap();
+        encode_request_header(&mut buf, VERSION, &uuid, VlessCommand::Rvs, None, None, &addons)
+            .await
+            .unwrap();
 
         let mut cursor = Cursor::new(buf);
         let mut first: Option<Vec<u8>> = None;
-        let decoded = decode_request_header(false, &mut first, &mut cursor, &validator)
-            .await
-            .unwrap();
+        let decoded =
+            decode_request_header(false, &mut first, &mut cursor, &validator).await.unwrap();
 
         assert_eq!(decoded.command, VlessCommand::Rvs);
         let got_addr = decoded.address.unwrap();
@@ -294,8 +285,13 @@ mod tests {
         let addr = Address::Domain("isfb.test".to_string());
         let addons = empty_addons();
         encode_request_header(
-            &mut full_buf, VERSION, &uuid, VlessCommand::Tcp,
-            Some(&addr), Some(80), &addons,
+            &mut full_buf,
+            VERSION,
+            &uuid,
+            VlessCommand::Tcp,
+            Some(&addr),
+            Some(80),
+            &addons,
         )
         .await
         .unwrap();
@@ -304,9 +300,8 @@ mod tests {
         let mut first = Some(full_buf[..17].to_vec());
         let mut cursor = Cursor::new(full_buf[17..].to_vec());
 
-        let decoded = decode_request_header(true, &mut first, &mut cursor, &validator)
-            .await
-            .unwrap();
+        let decoded =
+            decode_request_header(true, &mut first, &mut cursor, &validator).await.unwrap();
 
         assert_eq!(decoded.version, VERSION);
         assert_eq!(decoded.command, VlessCommand::Tcp);
@@ -323,9 +318,8 @@ mod tests {
         let validator = MemoryValidator::new();
         let mut first = Some(vec![0u8; 5]);
         let mut cursor = Cursor::new(Vec::new());
-        let err = decode_request_header(true, &mut first, &mut cursor, &validator)
-            .await
-            .unwrap_err();
+        let err =
+            decode_request_header(true, &mut first, &mut cursor, &validator).await.unwrap_err();
         match err {
             VlessError::Other(msg) => assert!(msg.contains("too short")),
             _ => panic!("unexpected error: {err:?}"),
@@ -337,9 +331,8 @@ mod tests {
         let validator = MemoryValidator::new();
         let mut first = None;
         let mut cursor = Cursor::new(Vec::new());
-        let err = decode_request_header(true, &mut first, &mut cursor, &validator)
-            .await
-            .unwrap_err();
+        let err =
+            decode_request_header(true, &mut first, &mut cursor, &validator).await.unwrap_err();
         match err {
             VlessError::Other(msg) => assert!(msg.contains("None")),
             _ => panic!("unexpected error: {err:?}"),
@@ -356,11 +349,10 @@ mod tests {
 
         let mut cursor = Cursor::new(buf);
         let mut first: Option<Vec<u8>> = None;
-        let err = decode_request_header(false, &mut first, &mut cursor, &validator)
-            .await
-            .unwrap_err();
+        let err =
+            decode_request_header(false, &mut first, &mut cursor, &validator).await.unwrap_err();
         match err {
-            VlessError::InvalidRequestVersion(_) => {}
+            VlessError::InvalidRequestVersion(_) => {},
             _ => panic!("unexpected error: {err:?}"),
         }
     }
@@ -369,14 +361,10 @@ mod tests {
     async fn test_encode_response_round_trip() {
         let mut buf = Vec::new();
         let addons = empty_addons();
-        encode_response_header(&mut buf, VERSION, &addons)
-            .await
-            .unwrap();
+        encode_response_header(&mut buf, VERSION, &addons).await.unwrap();
 
         let mut cursor = Cursor::new(buf);
-        let got = crate::encoding::decode_response_header(&mut cursor, VERSION)
-            .await
-            .unwrap();
+        let got = crate::encoding::decode_response_header(&mut cursor, VERSION).await.unwrap();
         assert_eq!(got.flow, addons.flow);
     }
 }

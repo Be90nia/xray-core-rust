@@ -43,7 +43,7 @@ impl std::fmt::Display for InboundError {
         match self {
             InboundError::AlreadyStarted(tag) => {
                 write!(f, "inbound handler already started: {}", tag)
-            }
+            },
             InboundError::Closed(tag) => write!(f, "inbound handler closed: {}", tag),
             InboundError::ListenError(msg) => write!(f, "inbound listen error: {}", msg),
             InboundError::AcceptError(msg) => write!(f, "inbound accept error: {}", msg),
@@ -97,11 +97,7 @@ mod tests {
 
     impl MockInboundHandler {
         fn new(tag: &str, port: u16) -> Self {
-            Self {
-                tag: tag.to_string(),
-                port,
-                started: std::sync::atomic::AtomicBool::new(false),
-            }
+            Self { tag: tag.to_string(), port, started: std::sync::atomic::AtomicBool::new(false) }
         }
     }
 
@@ -112,18 +108,14 @@ mod tests {
         }
 
         async fn start(&self) -> Result<(), InboundError> {
-            if self
-                .started
-                .swap(true, std::sync::atomic::Ordering::SeqCst)
-            {
+            if self.started.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 return Err(InboundError::AlreadyStarted(self.tag.clone()));
             }
             Ok(())
         }
 
         async fn close(&self) -> Result<(), InboundError> {
-            self.started
-                .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.started.store(false, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
 

@@ -4,10 +4,13 @@
 //! blake3 `DeriveKey` 派生 32 字节密钥 → AES-256-GCM 或 ChaCha20-Poly1305 + 自增 nonce。
 //! nonce 达到全 0xFF（MaxNonce）时调用方应重新派生 AEAD（对应 Go `MaxNonce`）。
 
-use crate::error::{Result, VlessError};
-use aes_gcm::aead::{Aead as AeadCore, AeadInOut, KeyInit, Payload};
-use aes_gcm::Aes256Gcm;
+use aes_gcm::{
+    Aes256Gcm,
+    aead::{Aead as AeadCore, AeadInOut, KeyInit, Payload},
+};
 use chacha20poly1305::ChaCha20Poly1305;
+
+use crate::error::{Result, VlessError};
 
 /// Nonce 字节长度（AES-GCM/ChaCha20-Poly1305 标准 12 字节）。
 pub const NONCE_LEN: usize = 12;
@@ -43,7 +46,8 @@ impl Aead {
         // SAFETY: blake3 derive_key 在算法层面把 context 当字节序列哈希，不执行 UTF-8 语义操作。
         // Go lukechampine blake3 的 DeriveKey 接受任意字节 context（Go string = []byte）。
         // 协议中 context（iv / 密钥哈希 / 密文切片等）可能含任意字节，为 wire 兼容必须按字节处理。
-        // blake3 crate 的 &str 限制是 API 设计选择（鼓励可读 context），底层处理字节，故 unchecked 安全。
+        // blake3 crate 的 &str 限制是 API 设计选择（鼓励可读 context），底层处理字节，故 unchecked
+        // 安全。
         let ctx_str = unsafe { std::str::from_utf8_unchecked(context) };
         let derived = blake3::derive_key(ctx_str, key);
         let kind = if use_aes {
@@ -51,10 +55,7 @@ impl Aead {
         } else {
             AeadKind::ChaCha(ChaCha20Poly1305::new(&derived.into()))
         };
-        Self {
-            kind,
-            nonce: [0u8; NONCE_LEN],
-        }
+        Self { kind, nonce: [0u8; NONCE_LEN] }
     }
 
     /// 当前 nonce（不可变借用）。
@@ -85,7 +86,8 @@ impl Aead {
 
     /// 加密：附加密文到 `dst`。`nonce = None` 时先用内部 nonce（递增后再用，对齐 Go）。
     ///
-    /// 对应 Go `AEAD.Seal(dst, nonce, plaintext, additionalData)`，`nonce=nil` 时先 `IncreaseNonce`。
+    /// 对应 Go `AEAD.Seal(dst, nonce, plaintext, additionalData)`，`nonce=nil` 时先
+    /// `IncreaseNonce`。
     ///
     /// # Errors
     /// 底层 AEAD 加密失败（罕见，多为密钥/nonce 异常）返回 [`VlessError::Other`]。
@@ -101,12 +103,9 @@ impl Aead {
             None => {
                 self.increase_nonce();
                 self.nonce
-            }
+            },
         };
-        let payload = Payload {
-            msg: plaintext,
-            aad,
-        };
+        let payload = Payload { msg: plaintext, aad };
         let ct = match &self.kind {
             AeadKind::Aes(a) => a.encrypt(&used.into(), payload),
             AeadKind::ChaCha(c) => c.encrypt(&used.into(), payload),
@@ -132,12 +131,9 @@ impl Aead {
             None => {
                 self.increase_nonce();
                 self.nonce
-            }
+            },
         };
-        let payload = Payload {
-            msg: ciphertext,
-            aad,
-        };
+        let payload = Payload { msg: ciphertext, aad };
         let pt = match &self.kind {
             AeadKind::Aes(a) => a.decrypt(&used.into(), payload),
             AeadKind::ChaCha(c) => c.decrypt(&used.into(), payload),
@@ -165,7 +161,7 @@ impl Aead {
             None => {
                 self.increase_nonce();
                 self.nonce
-            }
+            },
         };
         let tag = match &self.kind {
             AeadKind::Aes(a) => a.encrypt_inout_detached(&used.into(), aad, buf.into()),
@@ -195,7 +191,7 @@ impl Aead {
             None => {
                 self.increase_nonce();
                 self.nonce
-            }
+            },
         };
         match &self.kind {
             AeadKind::Aes(a) => a.decrypt_in_place(&used.into(), aad, buf),
@@ -300,8 +296,10 @@ mod tests {
     /// 任意字节 context（非 UTF-8）：wire 兼容验证，不应 panic。
     #[test]
     fn non_utf8_context_does_not_panic() {
-        let non_utf8: [u8; 16] = [0xFF, 0xFE, 0x00, 0x01, 0x80, 0xC0, 0xE0, 0xF0,
-                                   0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x12, 0x34, 0x56];
+        let non_utf8: [u8; 16] = [
+            0xFF, 0xFE, 0x00, 0x01, 0x80, 0xC0, 0xE0, 0xF0, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x12,
+            0x34, 0x56,
+        ];
         let mut a = Aead::new(&non_utf8, b"key", true);
         let mut ct = Vec::new();
         a.seal(&mut ct, None, b"compat", b"").unwrap();

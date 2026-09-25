@@ -14,24 +14,25 @@
 
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-
-use xray_common::bitmask::Bitmask;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-use xray_common::protocol::{Command, RequestHeader, ResponseCommand, ResponseHeader, SecurityType};
-use xray_common::uuid::UUID;
-
-use xray_proxy_vmess::account::{cmd_key_of, MemoryAccount};
-use xray_proxy_vmess::encoding::client::ClientSession;
-use xray_proxy_vmess::encoding::server::{ServerSession, SessionHistory};
-use xray_proxy_vmess::validator::{MemoryUser, TimedUserValidator, Validator};
-
-use xray_transport::sockopt::SocketOptions;
-use xray_transport::system_dialer::dial_system;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
+use xray_common::{
+    bitmask::Bitmask,
+    net::{address::Address, destination::Destination, network::Network, port::Port},
+    protocol::{Command, RequestHeader, ResponseCommand, ResponseHeader, SecurityType},
+    uuid::UUID,
+};
+use xray_proxy_vmess::{
+    account::{MemoryAccount, cmd_key_of},
+    encoding::{
+        client::ClientSession,
+        server::{ServerSession, SessionHistory},
+    },
+    validator::{MemoryUser, TimedUserValidator, Validator},
+};
+use xray_transport::{sockopt::SocketOptions, system_dialer::dial_system};
 
 /// 固定 UUID（与 body_roundtrip.rs 一致），避免每次运行随机化导致反重放状态污染。
 fn sample_uuid() -> UUID {
@@ -69,14 +70,10 @@ async fn vmess_proxy_to_echo_target_e2e() {
     let cmd_key = cmd_key_of(&uuid);
     let validator = TimedUserValidator::new();
     let account = MemoryAccount::new(uuid);
-    validator
-        .add(MemoryUser::new("alice@example.com", account))
-        .expect("add user");
+    validator.add(MemoryUser::new("alice@example.com", account)).expect("add user");
 
     // ===== 3. proxy listener =====
-    let proxy_listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind proxy");
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
     let proxy_addr = proxy_listener.local_addr().unwrap();
 
     let validator_arc = Arc::new(validator);
@@ -115,9 +112,8 @@ async fn vmess_proxy_to_echo_target_e2e() {
         let addr = req_header.destination.address().clone();
         let port = req_header.destination.port().value();
         let dest = Destination::new(addr, Port::new(port), Network::TCP);
-        let mut target = dial_system(&dest, &SocketOptions::default())
-            .await
-            .expect("dial echo target");
+        let mut target =
+            dial_system(&dest, &SocketOptions::default()).await.expect("dial echo target");
 
         // 解密请求 body（含 terminator chunk，返回纯明文 payload）
         let plain_body = server
@@ -129,10 +125,7 @@ async fn vmess_proxy_to_echo_target_e2e() {
         target.write_all(&plain_body).await.expect("forward to echo");
         // 读回 echo 响应
         let mut echoed = vec![0u8; plain_body.len()];
-        target
-            .read_exact(&mut echoed)
-            .await
-            .expect("read echo back");
+        target.read_exact(&mut echoed).await.expect("read echo back");
 
         // 加密发回客户端
         server
@@ -159,11 +152,7 @@ async fn vmess_proxy_to_echo_target_e2e() {
         let request_header = RequestHeader::new(
             xray_proxy_vmess::encoding::VERSION,
             Command::Tcp,
-            Destination::new(
-                Address::IPv4(echo_v4),
-                Port::new(echo_addr.port()),
-                Network::TCP,
-            ),
+            Destination::new(Address::IPv4(echo_v4), Port::new(echo_addr.port()), Network::TCP),
             SecurityType::Aes128Gcm,
         );
 
@@ -202,11 +191,7 @@ async fn vmess_proxy_to_echo_target_e2e() {
         &expected_echo[..],
         "client: echo should match sent data through vmess→freedom→echo"
     );
-    assert_eq!(
-        &server_echoed[..],
-        &expected_echo[..],
-        "server: echoed payload should match sent"
-    );
+    assert_eq!(&server_echoed[..], &expected_echo[..], "server: echoed payload should match sent");
 }
 
 /// 5iy：生产路径多 chunk nonce 状态机验证。
@@ -217,8 +202,10 @@ async fn vmess_proxy_to_echo_target_e2e() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn vmess_multichunk_production_roundtrip_e2e() {
     use xray_app_dispatcher::default::{DialBridge, SimpleOhm};
-    use xray_proxy_vmess::dispatcher::{make_vmess_dial_fn, VmessOutboundConfig};
-    use xray_proxy_vmess::inbound::server::serve_vmess;
+    use xray_proxy_vmess::{
+        dispatcher::{VmessOutboundConfig, make_vmess_dial_fn},
+        inbound::server::serve_vmess,
+    };
 
     // echo server
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
@@ -244,24 +231,17 @@ async fn vmess_multichunk_production_roundtrip_e2e() {
     validator
         .add(MemoryUser::new("alice@example.com", MemoryAccount::new(uuid)))
         .expect("add user");
-    let vmess_listener =
-        xray_transport::system_listener::InboundTcpListener::bind(
-            "127.0.0.1:0",
-            SocketOptions::default(),
-        )
-        .await
-        .expect("bind vmess");
+    let vmess_listener = xray_transport::system_listener::InboundTcpListener::bind(
+        "127.0.0.1:0",
+        SocketOptions::default(),
+    )
+    .await
+    .expect("bind vmess");
     let vmess_addr = vmess_listener.local_addr().unwrap();
     let ohm2 = Arc::clone(&ohm);
     let validator2 = Arc::clone(&validator);
     tokio::spawn(async move {
-        let _ = serve_vmess(
-            vmess_listener,
-            ohm2,
-            validator2,
-            None,
-        )
-        .await;
+        let _ = serve_vmess(vmess_listener, ohm2, validator2, None).await;
     });
 
     // 生产 outbound：make_vmess_dial_fn → VmessConn

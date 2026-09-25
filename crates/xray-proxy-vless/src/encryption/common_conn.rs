@@ -8,19 +8,27 @@
 //! 0-RTT：上行 AEAD 构造时给定（context=加密后 ticket）；下行 AEAD 延迟到首次
 //! 读，用 server 首发的 16B 随机数建立（[`CommonConn::new_zero_rtt`]）。
 
-use crate::encryption::aead::{Aead, MAX_NONCE, NONCE_LEN, TAG_LEN};
-use crate::encryption::common::{
-    decode_tls_record_header, write_tls_record_header, TLS_PAYLOAD_MAX, TLS_RECORD_HEADER_LEN,
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll},
 };
-use crate::error::{Result, VlessError};
-use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+use crate::{
+    encryption::{
+        aead::{Aead, MAX_NONCE, NONCE_LEN, TAG_LEN},
+        common::{
+            TLS_PAYLOAD_MAX, TLS_RECORD_HEADER_LEN, decode_tls_record_header,
+            write_tls_record_header,
+        },
+    },
+    error::{Result, VlessError},
+};
 
 /// 单段明文上限（对齐 Go `CommonConn` 的 8192）。
 const MAX_SEGMENT: usize = 8192;
-
 
 /// 加密连接：包装底层 `C`，实现 [`EncryptionConn`]。
 ///
@@ -61,6 +69,7 @@ impl<C> CommonConn<C> {
     pub(crate) fn inner_conn(&self) -> &C {
         &self.conn
     }
+
     pub(crate) fn inner_conn_mut(&mut self) -> &mut C {
         &mut self.conn
     }
@@ -175,17 +184,15 @@ where
                                 )));
                             }
                             this.raw_buf.extend_from_slice(&tmp[..n]);
-                        }
+                        },
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                         Poll::Pending => return Poll::Pending,
                     }
                 }
-                let server_random: [u8; 16] = this.raw_buf
-                    [this.raw_pos..this.raw_pos + 16]
+                let server_random: [u8; 16] = this.raw_buf[this.raw_pos..this.raw_pos + 16]
                     .try_into()
                     .expect("16B server random");
-                this.peer_aead =
-                    Some(Aead::new(&server_random, &this.united_key, this.use_aes));
+                this.peer_aead = Some(Aead::new(&server_random, &this.united_key, this.use_aes));
                 this.raw_pos += 16;
                 if this.raw_pos == this.raw_buf.len() {
                     this.raw_buf.clear();
@@ -235,19 +242,18 @@ where
                             io::ErrorKind::InvalidData,
                             e.to_string(),
                         )));
-                    }
+                    },
                 };
                 let total = TLS_RECORD_HEADER_LEN + len as usize;
                 if avail >= total {
                     // 完整 record：密文||tag 拷入复用的 decrypted 原地解密（零分配），
                     // 消费游标推进替代 drain memmove。
                     this.decrypted.clear();
-                    this.decrypted
-                        .extend_from_slice(&this.raw_buf[base + TLS_RECORD_HEADER_LEN..base + total]);
-                    let peer_aead = this
-                        .peer_aead
-                        .as_mut()
-                        .expect("peer_aead established at loop top");
+                    this.decrypted.extend_from_slice(
+                        &this.raw_buf[base + TLS_RECORD_HEADER_LEN..base + total],
+                    );
+                    let peer_aead =
+                        this.peer_aead.as_mut().expect("peer_aead established at loop top");
                     if let Err(e) = peer_aead.open_in_place(None, &mut this.decrypted, &header) {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -280,7 +286,7 @@ where
                         )));
                     }
                     this.raw_buf.extend_from_slice(&tmp[..n]);
-                }
+                },
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
@@ -318,7 +324,7 @@ where
                             io::ErrorKind::WriteZero,
                             "inner conn accepted 0 bytes",
                         )));
-                    }
+                    },
                     Poll::Ready(Ok(n)) => {
                         let new_sent = sent + n;
                         if new_sent >= this.write_buf.len() {
@@ -330,14 +336,14 @@ where
                         // 上层不再被唤醒 → 剩余字节滞留 → 对端凑不齐 record
                         // → 跨缓冲窗口流式死锁。
                         continue;
-                    }
+                    },
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     // 唯一合法的 Pending 出口：底层本次确实 Pending，
                     // 已用当前 cx 注册 waker。
                     Poll::Pending => {
                         this.write_pending = Some((sent, plain_len));
                         return Poll::Pending;
-                    }
+                    },
                 }
             }
 
@@ -388,9 +394,7 @@ impl<C> super::EncryptionConn for CommonConn<C>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + Sync,
 {
-    fn close(
-        &mut self,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    fn close(&mut self) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
             use tokio::io::AsyncWriteExt;
             self.closed = true;
@@ -402,8 +406,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
 
     /// round-trip：A 写 → 底层 → B 读。
     /// A.aead 与 B.peer_aead 同配置，seal(None)/open(None) nonce 同步递增，互通。

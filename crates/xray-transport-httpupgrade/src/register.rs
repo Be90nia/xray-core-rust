@@ -7,32 +7,30 @@
 //!
 //! ## 调用
 //!
-//! 进程启动时调用一次 [`register_dialer`] 和 [`register_listener`]；幂等——重复注册的 `AlreadyExists` 被忽略。
+//! 进程启动时调用一次 [`register_dialer`] 和 [`register_listener`]；幂等——重复注册的
+//! `AlreadyExists` 被忽略。
 //!
 //! ## 已集成
 //!
 //! 拨号器已完整集成：TCP 拨号 + TLS 包装 + HTTP/1.1 upgrade 握手。
 //! 监听器已集成：TCP bind + PROXY protocol + TLS + HTTP/1.1 握手 + accept loop。
 
-use std::io;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{io, net::SocketAddr, sync::Arc};
 
 use xray_common::net::destination::Destination;
-use xray_transport::connection::Connection;
-use xray_transport::dialer::{
-    StreamSettings, TransportDialFn, register_transport_dialer,
+use xray_transport::{
+    connection::Connection,
+    dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
+    listener_registry::{
+        ConnHandler, TransportListenFn, TransportListener, register_transport_listener,
+    },
+    sockopt::SocketOptions,
 };
-use xray_transport::listener_registry::{
-    ConnHandler, TransportListenFn, TransportListener,
-    register_transport_listener,
-};
-use xray_transport::sockopt::SocketOptions;
 
-use crate::client::HttpUpgradeClient;
-use crate::config::Config;
-use crate::connection::HttpUpgradeConnection;
-use crate::server::HttpUpgradeServer;
+use crate::{
+    client::HttpUpgradeClient, config::Config, connection::HttpUpgradeConnection,
+    server::HttpUpgradeServer,
+};
 /// 注册 HTTPUpgrade transport dialer。
 ///
 /// 协议名注册 `"httpupgrade"`——Go JSON `network` 字段此值映射到 `httpupgradeSettings`。
@@ -89,11 +87,9 @@ async fn listen_httpupgrade(
 
     // Tcpmask（Go httpupgrade/hub.go:145-147：`TcpmaskManager.WrapListener` →
     // 每条 accept conn 过 `WrapConnServer` 再进 handler；空 manager = 恒等）。
-    let tcpmask = Arc::new(
-        xray_transport::finalmask::build_tcpmask_manager_from_json(
-            settings.finalmask_json.as_ref(),
-        )?,
-    );
+    let tcpmask = Arc::new(xray_transport::finalmask::build_tcpmask_manager_from_json(
+        settings.finalmask_json.as_ref(),
+    )?);
 
     // 3. spawn accept loop（XFF 信任名单来自 sockopt.trustedXForwardedFor，
     // Go hub.go:117-121 + 90-94）。
@@ -108,7 +104,7 @@ async fn listen_httpupgrade(
                 Err(e) => {
                     tracing::debug!("HTTPUpgrade accept error: {e}");
                     continue;
-                }
+                },
             };
 
             // PROXY protocol（可选）
@@ -119,7 +115,7 @@ async fn listen_httpupgrade(
                     Err(e) => {
                         tracing::debug!("HTTPUpgrade PROXY protocol parse error: {e}");
                         continue;
-                    }
+                    },
                 }
             }
 
@@ -127,18 +123,17 @@ async fn listen_httpupgrade(
                 Ok(conn) => {
                     // Tcpmask wrap 失败 → 丢弃该 conn 继续（Go tcpListener.Accept 语义）。
                     match xray_transport::finalmask::wrap_conn_server_into_connection(
-                        &tcpmask,
-                        conn,
+                        &tcpmask, conn,
                     ) {
                         Ok(masked) => handler(masked),
                         Err(e) => {
                             tracing::debug!("HTTPUpgrade tcpmask wrap error: {e}");
-                        }
+                        },
                     }
-                }
+                },
                 Err(e) => {
                     tracing::debug!("HTTPUpgrade handshake error: {e}");
-                }
+                },
             }
         }
     });
@@ -157,21 +152,21 @@ async fn do_handshake(
     // （Go hub.go：tls.Server(conn) 后进 upgrade handler）；非 TLS 直连。
     let wrapped: Box<dyn Connection> = match tls_config {
         Some(cfg) => {
-            let tls = xray_tls::utls::server(
-                xray_transport::connection::TcpConnection::new(tcp),
-                cfg,
-            )
-            .await?;
+            let tls =
+                xray_tls::utls::server(xray_transport::connection::TcpConnection::new(tcp), cfg)
+                    .await?;
             Box::new(tls)
-        }
+        },
         None => Box::new(xray_transport::connection::TcpConnection::new(tcp)),
     };
-    let (conn, _leftover) = server
-        .handshake_io(wrapped)
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("HTTPUpgrade handshake: {e}")))?;
-    let final_conn = if conn.remote_addr_override.is_some() { conn }
-        else { HttpUpgradeConnection::with_remote_addr(conn.into_inner(), remote) };
+    let (conn, _leftover) = server.handshake_io(wrapped).await.map_err(|e| {
+        io::Error::new(io::ErrorKind::ConnectionRefused, format!("HTTPUpgrade handshake: {e}"))
+    })?;
+    let final_conn = if conn.remote_addr_override.is_some() {
+        conn
+    } else {
+        HttpUpgradeConnection::with_remote_addr(conn.into_inner(), remote)
+    };
     Ok(Box::new(final_conn) as Box<dyn Connection>)
 }
 
@@ -220,10 +215,7 @@ fn resolve_upgrade_host(
     if !config_host.is_empty() {
         config_host.to_string()
     } else if tls_active {
-        server_name
-            .filter(|s| !s.is_empty())
-            .unwrap_or(dest_address)
-            .to_string()
+        server_name.filter(|s| !s.is_empty()).unwrap_or(dest_address).to_string()
     } else {
         dest_address.to_string()
     }
@@ -303,15 +295,23 @@ async fn dial_httpupgrade(
                     Some(&alpn),
                 )
                 .await
-                .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("TLS handshake failed: {e}")))?;
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        format!("TLS handshake failed: {e}"),
+                    )
+                })?;
                 Box::new(tls_conn) as Box<dyn Connection>
-            }
+            },
             Err(_) => {
-                let tls_conn = xray_tls::utls::client(tcp_conn, &sni, cfg)
-                    .await
-                    .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("TLS handshake failed: {e}")))?;
+                let tls_conn = xray_tls::utls::client(tcp_conn, &sni, cfg).await.map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        format!("TLS handshake failed: {e}"),
+                    )
+                })?;
                 Box::new(tls_conn) as Box<dyn Connection>
-            }
+            },
         }
     } else {
         tcp_conn
@@ -323,16 +323,21 @@ async fn dial_httpupgrade(
 
     let conn: Box<dyn Connection> = if ed > 0 {
         // 0-RTT：延迟读 101 响应，让上层先写 early data
-        let httpupgrade_conn = client
-            .dial_over_io_deferred(upgraded_conn)
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("HTTPUpgrade handshake failed: {e}")))?;
+        let httpupgrade_conn = client.dial_over_io_deferred(upgraded_conn).await.map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("HTTPUpgrade handshake failed: {e}"),
+            )
+        })?;
         Box::new(httpupgrade_conn) as Box<dyn Connection>
     } else {
-        let (httpupgrade_conn, _leftover) = client
-            .dial_over_io(upgraded_conn)
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("HTTPUpgrade handshake failed: {e}")))?;
+        let (httpupgrade_conn, _leftover) =
+            client.dial_over_io(upgraded_conn).await.map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!("HTTPUpgrade handshake failed: {e}"),
+                )
+            })?;
         Box::new(httpupgrade_conn) as Box<dyn Connection>
     };
     // Tcpmask（Go httpupgrade/dialer.go:55-60：`TcpmaskManager.WrapConnClient`）。
@@ -350,7 +355,9 @@ async fn dial_httpupgrade(
 ///
 /// `None` 或非 object 返回 [`Config::default`]。
 fn parse_httpupgrade_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
-    let Some(v) = json else { return Ok(Config::default()); };
+    let Some(v) = json else {
+        return Ok(Config::default());
+    };
     let Some(obj) = v.as_object() else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -358,16 +365,8 @@ fn parse_httpupgrade_config(json: Option<&serde_json::Value>) -> io::Result<Conf
         ));
     };
 
-    let host = obj
-        .get("host")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    let mut path = obj
-        .get("path")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
+    let host = obj.get("host").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let mut path = obj.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string();
     let mut ed = obj.get("ed").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
     // Go `HttpUpgradeConfig.Build`：path 中 `?ed=N` 提取为 ed 并从 path 删除
     // （Go 用户配置层唯一来源；此处优先于直接 ed 字段）。
@@ -376,27 +375,21 @@ fn parse_httpupgrade_config(json: Option<&serde_json::Value>) -> io::Result<Conf
     if let Some(e) = path_ed {
         ed = e;
     }
-    let accept_proxy_protocol = obj
-        .get("acceptProxyProtocol")
-        .and_then(|x| x.as_bool())
-        .unwrap_or(false);
+    let accept_proxy_protocol =
+        obj.get("acceptProxyProtocol").and_then(|x| x.as_bool()).unwrap_or(false);
 
     // header / headers 二选一（proto JSON 用 "header"，用户配置常写 "headers"）。
     let header = parse_headers(obj.get("header"))
         .or_else(|| parse_headers(obj.get("headers")))
         .unwrap_or_default();
 
-    Ok(Config {
-        host,
-        path,
-        header,
-        accept_proxy_protocol,
-        ed,
-    })
+    Ok(Config { host, path, header, accept_proxy_protocol, ed })
 }
 
 /// 把 JSON 子对象解析为 `HashMap<String, String>`。非 object 或缺失返回 `None`。
-fn parse_headers(v: Option<&serde_json::Value>) -> Option<std::collections::HashMap<String, String>> {
+fn parse_headers(
+    v: Option<&serde_json::Value>,
+) -> Option<std::collections::HashMap<String, String>> {
     let obj = v?.as_object()?;
     let mut map = std::collections::HashMap::with_capacity(obj.len());
     for (k, val) in obj {
@@ -407,7 +400,6 @@ fn parse_headers(v: Option<&serde_json::Value>) -> Option<std::collections::Hash
     }
     Some(map)
 }
-
 
 /// 读 `tlsSettings.fingerprint`（空 = 未配置）。Go `tls.GetFingerprint` 的
 /// 前置解析；四个传输出站共用同款语义，与 tcp register 内联实现一致。
@@ -422,8 +414,9 @@ fn fingerprint_name(settings: &StreamSettings) -> &str {
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
     use xray_transport::dialer::get_transport_dialer;
+
+    use super::*;
 
     #[test]
     fn tls_server_config_none_when_security_empty() {
@@ -451,10 +444,9 @@ mod tests {
 
     #[test]
     fn parse_httpupgrade_config_basic_fields() {
-        let v: serde_json::Value = serde_json::from_str(
-            r#"{"host":"h.example.com","path":"/upgrade","ed":2048}"#,
-        )
-        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"host":"h.example.com","path":"/upgrade","ed":2048}"#)
+                .unwrap();
         let cfg = parse_httpupgrade_config(Some(&v)).unwrap();
         assert_eq!(cfg.host, "h.example.com");
         assert_eq!(cfg.path, "/upgrade");
@@ -465,8 +457,7 @@ mod tests {
     /// `path:"/ws?ed=2048"` → ed=2048、path 剥离 query。
     #[test]
     fn parse_httpupgrade_config_path_ed_extraction() {
-        let v: serde_json::Value =
-            serde_json::from_str(r#"{"path":"/ws?ed=2048"}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(r#"{"path":"/ws?ed=2048"}"#).unwrap();
         let cfg = parse_httpupgrade_config(Some(&v)).unwrap();
         assert_eq!(cfg.path, "/ws");
         assert_eq!(cfg.ed, 2048);
@@ -485,8 +476,7 @@ mod tests {
     /// 非法数值：Go `Ed, _ := strconv.Atoi(...)` 忽略错误 → ed=0，但 `ed` 参数仍被删除。
     #[test]
     fn parse_httpupgrade_config_path_ed_invalid_value_zero() {
-        let v: serde_json::Value =
-            serde_json::from_str(r#"{"path":"/ws?ed=abc"}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(r#"{"path":"/ws?ed=abc"}"#).unwrap();
         let cfg = parse_httpupgrade_config(Some(&v)).unwrap();
         assert_eq!(cfg.path, "/ws");
         assert_eq!(cfg.ed, 0);
@@ -495,8 +485,7 @@ mod tests {
     /// 空值：Go `q.Get("ed") != ""` 不成立 → 整体不提取，path 原样保留。
     #[test]
     fn parse_httpupgrade_config_path_empty_ed_value_no_extraction() {
-        let v: serde_json::Value =
-            serde_json::from_str(r#"{"path":"/ws?ed="}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(r#"{"path":"/ws?ed="}"#).unwrap();
         let cfg = parse_httpupgrade_config(Some(&v)).unwrap();
         assert_eq!(cfg.path, "/ws?ed=");
         assert_eq!(cfg.ed, 0);
@@ -522,8 +511,7 @@ mod tests {
 
     #[test]
     fn parse_httpupgrade_config_accepts_header_singular() {
-        let v: serde_json::Value =
-            serde_json::from_str(r#"{"header":{"X-Custom":"v"}}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(r#"{"header":{"X-Custom":"v"}}"#).unwrap();
         let cfg = parse_httpupgrade_config(Some(&v)).unwrap();
         assert_eq!(cfg.header.get("X-Custom").unwrap(), "v");
     }
@@ -531,10 +519,9 @@ mod tests {
     #[test]
     fn parse_httpupgrade_config_header_preferred_over_headers() {
         // 同时给两种 key：header（proto）优先于 headers（用户）。
-        let v: serde_json::Value = serde_json::from_str(
-            r#"{"header":{"K":"from-proto"},"headers":{"K":"from-user"}}"#,
-        )
-        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"header":{"K":"from-proto"},"headers":{"K":"from-user"}}"#)
+                .unwrap();
         let cfg = parse_httpupgrade_config(Some(&v)).unwrap();
         assert_eq!(cfg.header.get("K").unwrap(), "from-proto");
     }
@@ -558,8 +545,7 @@ mod tests {
 
     #[test]
     fn parse_httpupgrade_config_accept_proxy_protocol() {
-        let v: serde_json::Value =
-            serde_json::from_str(r#"{"acceptProxyProtocol":true}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(r#"{"acceptProxyProtocol":true}"#).unwrap();
         let cfg = parse_httpupgrade_config(Some(&v)).unwrap();
         assert!(cfg.accept_proxy_protocol);
     }
@@ -572,10 +558,9 @@ mod tests {
 
     #[tokio::test]
     async fn dial_httpupgrade_connects_to_local_server() {
-        use xray_common::net::address::Address;
-        use xray_common::net::network::Network;
-        use xray_common::net::port::Port;
         use std::net::Ipv4Addr;
+
+        use xray_common::net::{address::Address, network::Network, port::Port};
 
         // 启动本地 TCP listener 模拟 HTTPUpgrade 服务端。
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -619,12 +604,10 @@ mod tests {
     /// （Go `WebsocketHandshakeContext` 语义）。
     #[tokio::test]
     async fn dial_tls_fingerprint_chrome_sends_btls_hello_with_h1_alpn() {
-        use xray_common::net::address::Address;
-        use xray_common::net::network::Network;
-        use xray_common::net::port::Port;
-        use std::net::Ipv4Addr;
+        use std::{net::Ipv4Addr, time::Duration};
+
         use tokio::io::AsyncReadExt;
-        use std::time::Duration;
+        use xray_common::net::{address::Address, network::Network, port::Port};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -674,9 +657,7 @@ mod tests {
         let suites = &hello[c + 2..c + 2 + len];
         assert!(len / 2 >= 12, "chrome hello must carry many ciphers");
         assert!(
-            suites
-                .chunks_exact(2)
-                .any(|s| s[0] == s[1] && (s[0] & 0x0f) == 0x0a),
+            suites.chunks_exact(2).any(|s| s[0] == s[1] && (s[0] & 0x0f) == 0x0a),
             "GREASE cipher absent → not a btls chrome hello"
         );
         let mut h1_wire = vec![0x00, 0x09, 0x08];
@@ -691,12 +672,10 @@ mod tests {
     /// 延迟读解析 101 → 读到服务端 payload。对齐 Go `dialer.go:114-118`（Ed!=0 时不预读响应）。
     #[tokio::test]
     async fn dial_httpupgrade_path_ed_early_data_roundtrip() {
-        use std::time::Duration;
+        use std::{net::Ipv4Addr, time::Duration};
+
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use xray_common::net::address::Address;
-        use xray_common::net::network::Network;
-        use xray_common::net::port::Port;
-        use std::net::Ipv4Addr;
+        use xray_common::net::{address::Address, network::Network, port::Port};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -704,9 +683,9 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut buf = vec![0u8; 4096];
-            // 1. 读完整请求头；path 应已剥离 ?ed=2048。
-            //    early data 可能与请求头同段到达（TCP 合并）——保留 \r\n\r\n 之后的余留，
-            //    与生产端 hub.rs handshake_io 返回 leftover 的做法一致。
+            // 1. 读完整请求头；path 应已剥离 ?ed=2048。 early data 可能与请求头同段到达（TCP
+            //    合并）——保留 \r\n\r\n 之后的余留， 与生产端 hub.rs handshake_io 返回 leftover
+            //    的做法一致。
             let mut req = Vec::new();
             let hdr_end = loop {
                 let n = stream.read(&mut buf).await.unwrap();
@@ -772,12 +751,10 @@ mod tests {
     /// dial 与 hub 双端配置 fragment mask 后 e2e echo 收发。
     #[tokio::test]
     async fn httpupgrade_dial_hub_tcpmask_roundtrip() {
+        use std::{net::Ipv4Addr, time::Duration};
+
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use xray_common::net::address::Address;
-        use xray_common::net::network::Network;
-        use xray_common::net::port::Port;
-        use std::net::Ipv4Addr;
-        use std::time::Duration;
+        use xray_common::net::{address::Address, network::Network, port::Port};
 
         let finalmask = serde_json::json!({
             "tcp": [{"type": "fragment", "settings": {
@@ -803,7 +780,7 @@ mod tests {
                             if conn.write_all(&buf[..n]).await.is_err() {
                                 break;
                             }
-                        }
+                        },
                     }
                 }
             });
@@ -841,12 +818,7 @@ mod tests {
                 .await
                 .expect("echo timeout")
                 .expect("read ok");
-            assert!(
-                n > 0,
-                "echo closed early at {}/{} bytes",
-                got.len(),
-                payload.len()
-            );
+            assert!(n > 0, "echo closed early at {}/{} bytes", got.len(), payload.len());
             got.extend_from_slice(&buf[..n]);
         }
         assert_eq!(&got, payload);
@@ -868,10 +840,7 @@ mod tests {
             "sni.example.com"
         );
         // 无 TLS 配置：Go `tConfig != nil` 不成立，serverName 不参与。
-        assert_eq!(
-            resolve_upgrade_host("", false, Some("sni.example.com"), "1.2.3.4"),
-            "1.2.3.4"
-        );
+        assert_eq!(resolve_upgrade_host("", false, Some("sni.example.com"), "1.2.3.4"), "1.2.3.4");
     }
 
     #[test]
@@ -886,10 +855,8 @@ mod tests {
     #[tokio::test]
     async fn close_rejects_new_connections() {
         use std::time::Duration;
-        let settings = StreamSettings {
-            protocol: "httpupgrade".to_string(),
-            ..StreamSettings::tcp()
-        };
+        let settings =
+            StreamSettings { protocol: "httpupgrade".to_string(), ..StreamSettings::tcp() };
         let handler: ConnHandler = Arc::new(|_| {});
         let listener = listen_httpupgrade(
             "127.0.0.1:0".parse().unwrap(),
@@ -914,7 +881,7 @@ mod tests {
                         "close 后端口仍接受连接（僵尸 listener 未解除）"
                     );
                     tokio::time::sleep(Duration::from_millis(50)).await;
-                }
+                },
             }
         }
     }

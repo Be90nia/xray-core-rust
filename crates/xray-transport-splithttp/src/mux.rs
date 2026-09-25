@@ -8,22 +8,27 @@
 //!
 //! ## Rust 翻译决策
 //!
-//! - Go 的 `XmuxConn` 是 interface（仅 `IsClosed() bool`），Rust 用 trait + generic
-//!   `<C: XmuxConn>` 单态化，避免 `dyn` 的动态分发开销
+//! - Go 的 `XmuxConn` 是 interface（仅 `IsClosed() bool`），Rust 用 trait + generic `<C: XmuxConn>`
+//!   单态化，避免 `dyn` 的动态分发开销
 //! - `atomic.Int32` → `AtomicI32`；`time.Time` zero → `Option<Instant>`（None 表未设置）
 //! - `math.MaxInt32` 表示"无限制"，Rust 直接 `i32::MAX`
 //! - `sync.Mutex` + `[]*XmuxClient` → `Mutex<Vec<Arc<XmuxClient<C>>>>`
 //!
 //! ## 复用判定（`get_xmux_client` 内部 4 分支）
 //!
-//! 1. 清理：移除 `is_closed()` / `left_usage == 0` / `left_requests <= 0` / `unreusable_at` 已过的 client
+//! 1. 清理：移除 `is_closed()` / `left_usage == 0` / `left_requests <= 0` / `unreusable_at` 已过的
+//!    client
 //! 2. 若列表空 → 新建
 //! 3. 若 `connections > 0` 且当前 < connections → 新建（未达上限）
 //! 4. 过滤 `open_usage < concurrency` 的候选；空 → 新建；否则随机选一个并 `left_usage -= 1`
 
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicI32, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use rand::Rng;
 
@@ -100,11 +105,7 @@ impl<C: XmuxConn + 'static> XmuxClient<C> {
     /// 减少一个剩余请求数（不可低于 0）。
     pub fn dec_left_requests(&self) {
         let _ = self.left_requests.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-            if v > 0 {
-                Some(v - 1)
-            } else {
-                None
-            }
+            if v > 0 { Some(v - 1) } else { None }
         });
     }
 
@@ -193,10 +194,7 @@ impl<C: XmuxConn + 'static> XmuxManager<C> {
         }
 
         let arc_client = Arc::new(client);
-        self.xmux_clients
-            .lock()
-            .unwrap()
-            .push(arc_client.clone());
+        self.xmux_clients.lock().unwrap().push(arc_client.clone());
         arc_client
     }
 
@@ -229,11 +227,7 @@ impl<C: XmuxConn + 'static> XmuxManager<C> {
 
         // 4. 按 maxConcurrency 过滤候选；concurrency=0 表示无限制
         let candidates: Vec<Arc<XmuxClient<C>>> = if self.concurrency > 0 {
-            clients
-                .iter()
-                .filter(|c| c.open_usage() < self.concurrency)
-                .cloned()
-                .collect()
+            clients.iter().filter(|c| c.open_usage() < self.concurrency).cloned().collect()
         } else {
             clients.clone()
         };
@@ -261,6 +255,7 @@ impl<C: XmuxConn + 'static> XmuxManager<C> {
 // ===== 切片 v7w9: 进程全局 XmuxManager 池 =====
 
 use std::collections::HashMap;
+
 use parking_lot::Mutex as PMutex;
 
 /// 进程级 `XmuxManager` 缓存——按 string key 缓存 `Arc<XmuxManager<C>>`。
@@ -308,9 +303,9 @@ impl<C: XmuxConn + 'static> Default for ManagerPool<C> {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashSet, sync::atomic::AtomicUsize};
+
     use super::*;
-    use std::collections::HashSet;
-    use std::sync::atomic::AtomicUsize;
 
     /// 测试用 XmuxConn 实现——可手动标记 closed。
     struct FakeConn {
@@ -320,10 +315,7 @@ mod tests {
 
     impl FakeConn {
         fn new(id: usize) -> Self {
-            Self {
-                closed: std::sync::atomic::AtomicBool::new(false),
-                id,
-            }
+            Self { closed: std::sync::atomic::AtomicBool::new(false), id }
         }
 
         fn close(&self) {
@@ -427,9 +419,7 @@ mod tests {
         let cf = closed_flag.clone();
         let manager = XmuxManager::new(XmuxConfig::default(), move || {
             // 每次新建都共享同一个 closed_flag，但本测试只用 1 个 client
-            ClosabledConn {
-                closed: AtomicBool::new(false),
-            }
+            ClosabledConn { closed: AtomicBool::new(false) }
         });
         // 上面闭包里我们没用 closed_flag（每次都是新 false），改写策略：
         let _ = cf;
@@ -549,9 +539,7 @@ mod tests {
         let cc = counter.clone();
         let mk = move || {
             let n = cc.fetch_add(1, Ordering::SeqCst);
-            Arc::new(XmuxManager::new(XmuxConfig::default(), move || {
-                FakeConn::new(n)
-            }))
+            Arc::new(XmuxManager::new(XmuxConfig::default(), move || FakeConn::new(n)))
         };
 
         let m1 = pool.get_or("host:port:cfg", mk);

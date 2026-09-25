@@ -7,15 +7,18 @@
 //!
 //! **业务核心（独立可测）**：
 //! - `Router` 路由器主体（规则匹配 + 负载均衡 + 域名策略 + GeoData 文件加载）
-//! - 9 种 `Condition` 匹配器（Domain/IP/Port/Network/User/InboundTag/Protocol/Attribute/ProcessName）
+//! - 9 种 `Condition`
+//!   匹配器（Domain/IP/Port/Network/User/InboundTag/Protocol/Attribute/ProcessName）
 //! - 4 种 `BalancingStrategy`（Random/RoundRobin/LeastPing/LeastLoad）
 //! - `WeightManager` 权重管理
 //! - `WebhookNotifier` 事件通知（含去重）
 //! - `Override` 平衡器目标覆盖
-//! - `Rule::build_rule(proto, balancers, geo_loader)`：`GeoDataLoader` 接入后 `geosite`/`geoip` rule 变体从 dat 文件加载
+//! - `Rule::build_rule(proto, balancers, geo_loader)`：`GeoDataLoader` 接入后 `geosite`/`geoip`
+//!   rule 变体从 dat 文件加载
 //!
 //! **IO 边界（trait + 占位）**：
-//! - `OutboundHandlerSelector`（Go `outbound.HandlerSelector`）：`select_outbounds` 返回 `NotImplemented`
+//! - `OutboundHandlerSelector`（Go `outbound.HandlerSelector`）：`select_outbounds` 返回
+//!   `NotImplemented`
 //! - `ObservationProvider`（Go `extension.Observatory`）：`get_observation` 返回 `NotImplemented`
 //! - `WebhookNotifier::post`：实际 HTTP POST 留 TODO，事件构造与去重逻辑可独立测试
 //! - `ProcessNameMatcher::find_process`：进程查找留 TODO（依赖 OS-specific sysinfo）
@@ -42,7 +45,9 @@ pub mod strategy_random;
 pub mod webhook;
 pub mod weight;
 
-pub use balancing::{Balancer, BalancingStrategy, MemoryObservationProvider, RoundRobinStrategy, SimpleSelector};
+pub use balancing::{
+    Balancer, BalancingStrategy, MemoryObservationProvider, RoundRobinStrategy, SimpleSelector,
+};
 pub use condition::Condition;
 pub use config::DomainStrategy;
 pub use context::{RoutingContext, RoutingData};

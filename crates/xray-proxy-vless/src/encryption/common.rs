@@ -54,9 +54,7 @@ pub fn decode_tls_record_header(header: &[u8; TLS_RECORD_HEADER_LEN]) -> Result<
         && header[2] == TLS_LEGACY_VERSION_LOW;
     let range_ok = (TLS_PAYLOAD_MIN..=TLS_PAYLOAD_MAX).contains(&len);
     if !prefix_ok || !range_ok {
-        return Err(VlessError::Other(format!(
-            "invalid header: {header:?}"
-        )));
+        return Err(VlessError::Other(format!("invalid header: {header:?}")));
     }
     Ok(len)
 }
@@ -72,9 +70,7 @@ pub fn encode_length_be(out: &mut Vec<u8>, len: u16) {
 /// 字节不足 2 返回 [`VlessError::Other`]。
 pub fn decode_length_be(bytes: &[u8]) -> Result<(&[u8], u16)> {
     if bytes.len() < 2 {
-        return Err(VlessError::Other(
-            "decode_length_be: buffer too short".into(),
-        ));
+        return Err(VlessError::Other("decode_length_be: buffer too short".into()));
     }
     let len = u16::from_be_bytes([bytes[0], bytes[1]]);
     Ok((&bytes[2..], len))
@@ -112,11 +108,10 @@ pub fn parse_padding(padding: &str) -> Result<(Vec<PaddingTriple>, Vec<PaddingTr
             )));
         }
         let parse_part = |s: &str| -> Result<u32> {
-            s.parse::<u32>().map_err(|_| {
-                VlessError::Other(format!("invalid padding number: {s}"))
-            })
+            s.parse::<u32>().map_err(|_| VlessError::Other(format!("invalid padding number: {s}")))
         };
-        let y: PaddingTriple = [parse_part(parts[0])?, parse_part(parts[1])?, parse_part(parts[2])?];
+        let y: PaddingTriple =
+            [parse_part(parts[0])?, parse_part(parts[1])?, parse_part(parts[2])?];
 
         // 第一个三元组最小值约束（Go: y[0]<100 || y[1]<18+17 || y[2]<18+17）
         if i == 0 && (y[0] < 100 || y[1] < 35 || y[2] < 35) {
@@ -134,9 +129,7 @@ pub fn parse_padding(padding: &str) -> Result<(Vec<PaddingTriple>, Vec<PaddingTr
     }
 
     if max_len_total > 18 + 65535 {
-        return Err(VlessError::Other(
-            "total padding length must not be larger than 65553".into(),
-        ));
+        return Err(VlessError::Other("total padding length must not be larger than 65553".into()));
     }
 
     Ok((lens, gaps))
@@ -152,11 +145,7 @@ const DEFAULT_PADDING_GAPS: [PaddingTriple; 1] = [[75, 0, 111]];
 /// Go `crypto.RandBetween` 语义（crypto.go:13-19）：均匀 `[from, to)`；
 /// `to-from ≤ 1` 恒返回 from（Go `rand.Int(to-from)` 上界开区间）。
 fn rand_between<R: rand::Rng>(rng: &mut R, from: u32, to: u32) -> u32 {
-    if to <= from + 1 {
-        from
-    } else {
-        rng.random_range(from..to)
-    }
+    if to <= from + 1 { from } else { rng.random_range(from..to) }
 }
 
 /// 随机 padding 生成（对应 Go `CreatPadding`，common.go:259-280），产出
@@ -180,13 +169,7 @@ pub fn creat_padding<R: rand::Rng>(
     // rng 消耗顺序对齐 Go：先全部 lens，再全部 gaps。
     let seg_lens: Vec<u32> = lens
         .iter()
-        .map(|y| {
-            if y[0] >= rand_between(rng, 0, 100) {
-                rand_between(rng, y[1], y[2])
-            } else {
-                0
-            }
-        })
+        .map(|y| if y[0] >= rand_between(rng, 0, 100) { rand_between(rng, y[1], y[2]) } else { 0 })
         .collect();
     let length = seg_lens.iter().map(|&l| l as usize).sum();
     let seg_gaps: Vec<std::time::Duration> = gaps
@@ -292,7 +275,6 @@ mod tests {
         assert!(gaps.is_empty());
     }
 
-
     #[test]
     fn parse_padding_segment_extra_parts_ignored() {
         // Go 只取 parts[0..3]，多余 part 忽略（对应 Go `len(x) < 3` 检查只跳过不足，不限上限）
@@ -358,7 +340,7 @@ mod tests {
 
     // === creat_padding gaps（Go CreatPadding common.go:259-280）===
 
-    use rand::{rngs::StdRng, SeedableRng};
+    use rand::{SeedableRng, rngs::StdRng};
 
     #[test]
     fn creat_padding_default_lens_yields_default_gaps() {
@@ -384,18 +366,9 @@ mod tests {
     fn creat_padding_gap_prob_and_range() {
         // base=100 恒命中；min==max 时 RandBetween 恒 from → 确定值
         let mut rng = StdRng::seed_from_u64(3);
-        let (_, _, gaps) = creat_padding(
-            &[[100, 111, 1111]],
-            &[[100, 5, 6], [100, 0, 0]],
-            &mut rng,
-        );
-        assert_eq!(
-            gaps,
-            vec![
-                std::time::Duration::from_millis(5),
-                std::time::Duration::ZERO,
-            ]
-        );
+        let (_, _, gaps) =
+            creat_padding(&[[100, 111, 1111]], &[[100, 5, 6], [100, 0, 0]], &mut rng);
+        assert_eq!(gaps, vec![std::time::Duration::from_millis(5), std::time::Duration::ZERO,]);
 
         // base=50：约半数 unhit → ZERO；命中值 ⊆ 10..20ms（宽界统计）
         let mut rng = StdRng::seed_from_u64(4);
@@ -410,9 +383,6 @@ mod tests {
                 zeros += 1;
             }
         }
-        assert!(
-            (300..700).contains(&zeros),
-            "base=50 应约半数 unhit，实际 {zeros}/1000"
-        );
+        assert!((300..700).contains(&zeros), "base=50 应约半数 unhit，实际 {zeros}/1000");
     }
 }

@@ -6,10 +6,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::net::address::Address;
-use crate::net::destination::Destination;
-use crate::net::port::Port;
-use crate::protocol::user::{MemoryUser, User};
+use crate::{
+    net::{address::Address, destination::Destination, port::Port},
+    protocol::user::{MemoryUser, User},
+};
 
 /// 服务器规格，描述目标服务器及其可选用户。
 ///
@@ -25,10 +25,7 @@ impl ServerSpec {
     /// 创建新的服务器规格（无用户）。
     #[must_use]
     pub fn new(destination: Destination) -> Self {
-        Self {
-            destination,
-            user: None,
-        }
+        Self { destination, user: None }
     }
 
     /// 设置用户，返回新的 ServerSpec。
@@ -61,14 +58,8 @@ impl ServerSpec {
     /// 的消费方接入任务，此处置空。
     #[must_use]
     pub fn from_server_endpoint(endpoint: &ServerEndpoint) -> Self {
-        let user = endpoint.user().map(|u| {
-            MemoryUser::new(u.email())
-                .with_level(u.level())
-        });
-        Self {
-            destination: Destination::tcp(endpoint.address().clone(), endpoint.port()),
-            user,
-        }
+        let user = endpoint.user().map(|u| MemoryUser::new(u.email()).with_level(u.level()));
+        Self { destination: Destination::tcp(endpoint.address().clone(), endpoint.port()), user }
     }
 }
 
@@ -87,11 +78,7 @@ impl ServerEndpoint {
     /// 创建新的服务器端点。
     #[must_use]
     pub fn new(address: Address, port: Port) -> Self {
-        Self {
-            address,
-            port,
-            user: None,
-        }
+        Self { address, port, user: None }
     }
 
     /// 设置用户（proto 形式），返回新的 ServerEndpoint。
@@ -128,8 +115,9 @@ impl std::fmt::Display for ServerEndpoint {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::Ipv4Addr;
+
+    use super::*;
 
     fn sample_destination() -> Destination {
         Destination::tcp(Address::ipv4(Ipv4Addr::new(192, 168, 1, 1)), Port::new(443))
@@ -220,10 +208,8 @@ mod tests {
 
     #[test]
     fn test_server_endpoint_display_ipv4() {
-        let endpoint = ServerEndpoint::new(
-            Address::ipv4(Ipv4Addr::new(10, 0, 0, 1)),
-            Port::new(8080),
-        );
+        let endpoint =
+            ServerEndpoint::new(Address::ipv4(Ipv4Addr::new(10, 0, 0, 1)), Port::new(8080));
         assert_eq!(format!("{endpoint}"), "10.0.0.1:8080");
     }
 

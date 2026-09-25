@@ -8,14 +8,22 @@
 //! 对应 Go `transport/pipe.New()`。Rust 用 `tokio::sync::Notify` 翻译 signal.Notifier，
 //! `tokio::sync::watch` 翻译 done.Instance，std `Mutex<Option<Error>>` 翻译 errChan。
 
-use crate::io::{Error, Reader as BufReader, Result, Writer as BufWriter};
-use crate::multi::MultiBuffer;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+
 use tokio::sync::Notify;
+
+use crate::{
+    io::{Error, Reader as BufReader, Result, Writer as BufWriter},
+    multi::MultiBuffer,
+};
 
 /// 计数信号量：signal 累积 permit，wait 消费 permit。
 /// 对应 Go common/signal/notifier.go：notify_one() 在 tokio::sync::Notify 上不累积，
@@ -28,10 +36,7 @@ struct CountingNotify {
 
 impl CountingNotify {
     fn new() -> Self {
-        Self {
-            count: AtomicU64::new(0),
-            notify: Notify::new(),
-        }
+        Self { count: AtomicU64::new(0), notify: Notify::new() }
     }
 
     /// 发一个 signal，计数 +1。多次 signal 会累积。
@@ -72,11 +77,7 @@ pub struct PipeOption {
 }
 impl Default for PipeOption {
     fn default() -> Self {
-        Self {
-            limit: -1,
-            discard_overflow: false,
-            idle_timeout: None,
-        }
+        Self { limit: -1, discard_overflow: false, idle_timeout: None }
     }
 }
 
@@ -197,11 +198,9 @@ impl Reader {
             {
                 let inner = self.0.inner.lock().unwrap();
                 match inner.state {
-                    State::Open => {}
+                    State::Open => {},
                     State::Closed => return Err(Error::Eof),
-                    State::Errord => {
-                        return Err(Error::WriteError("pipe interrupted".into()))
-                    }
+                    State::Errord => return Err(Error::WriteError("pipe interrupted".into())),
                 }
             }
 
@@ -341,22 +340,22 @@ impl Writer {
                             inner.data.merge(m);
                             WriteAction::Done
                         }
-                    }
+                    },
                     State::Closed | State::Errord => WriteAction::Err,
                 }
             };
 
             match action {
                 WriteAction::Done => {
-            self.0.read_signal.signal();
+                    self.0.read_signal.signal();
                     return Ok(());
-                }
+                },
                 WriteAction::Err => {
                     if let Some(mut m) = mb_slot.take() {
                         m.release();
                     }
                     return Err(Error::WriteError("closed pipe".into()));
-                }
+                },
                 WriteAction::Wait => {
                     let shared = self.0.clone();
                     tokio::select! {
@@ -368,7 +367,7 @@ impl Writer {
                             return Err(Error::WriteError("closed pipe".into()));
                         }
                     }
-                }
+                },
             }
         }
     }
@@ -426,9 +425,10 @@ impl BufWriter for Writer {
 
 #[cfg(test)]
 mod tests {
+    use bytes::BytesMut;
+
     use super::*;
     use crate::buffer::Buffer;
-    use bytes::BytesMut;
 
     fn mb(data: &[u8]) -> MultiBuffer {
         MultiBuffer::from_buffer(Buffer::from_bytes(BytesMut::from(data)))
@@ -594,9 +594,7 @@ mod tests {
         // 首次写 11 字节：初始 size=0，0 > 10 false，merge 后 size=11
         w.write_multi_buffer(mb(&[0u8; 11])).await.unwrap();
         // 第二次写应阻塞：11 > 10 true
-        let writer = tokio::spawn(async move {
-            w.write_multi_buffer(mb(&[0u8; 5])).await
-        });
+        let writer = tokio::spawn(async move { w.write_multi_buffer(mb(&[0u8; 5])).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
         // 读取应解除 writer 阻塞
         let data = r.read_multi_buffer().await.unwrap();
@@ -652,9 +650,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_timeout() {
         let (mut r, _w) = new();
-        let result = r
-            .read_multi_buffer_timeout(Duration::from_millis(50))
-            .await;
+        let result = r.read_multi_buffer_timeout(Duration::from_millis(50)).await;
         assert!(matches!(result, Err(Error::TimeoutError)));
     }
 
@@ -662,10 +658,7 @@ mod tests {
     async fn test_read_timeout_succeeds_with_data() {
         let (mut r, mut w) = new();
         w.write_multi_buffer(mb(b"hello")).await.unwrap();
-        let out = r
-            .read_multi_buffer_timeout(Duration::from_secs(1))
-            .await
-            .unwrap();
+        let out = r.read_multi_buffer_timeout(Duration::from_secs(1)).await.unwrap();
         assert_eq!(out.to_vec(), b"hello");
     }
 
@@ -673,10 +666,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_timeout_returns_eof() {
-        let opt = PipeOption {
-            idle_timeout: Some(Duration::from_millis(50)),
-            ..PipeOption::default()
-        };
+        let opt =
+            PipeOption { idle_timeout: Some(Duration::from_millis(50)), ..PipeOption::default() };
         let (mut r, _w) = new_with_option(opt);
         // 不写任何数据，reader 应在 idle_timeout 后返回 EOF
         let result = r.read_multi_buffer().await;
@@ -685,10 +676,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_timeout_resets_on_data() {
-        let opt = PipeOption {
-            idle_timeout: Some(Duration::from_millis(100)),
-            ..PipeOption::default()
-        };
+        let opt =
+            PipeOption { idle_timeout: Some(Duration::from_millis(100)), ..PipeOption::default() };
         let (mut r, mut w) = new_with_option(opt);
         // 写入数据，reader 应立即返回数据（不触发 idle timeout）
         w.write_multi_buffer(mb(b"hello")).await.unwrap();
@@ -770,18 +759,13 @@ mod tests {
     /// 各自释放 mb 不污染 buffered，reader 读到一条完整 "abcd"。
     #[tokio::test]
     async fn test_multi_writer_close_keeps_one_whole_write() {
-        let opt = PipeOption {
-            limit: 0,
-            ..PipeOption::default()
-        };
+        let opt = PipeOption { limit: 0, ..PipeOption::default() };
         let (mut r, w) = new_with_option(opt);
 
         let mut handles = Vec::new();
         for _ in 0..10 {
             let mut w = w.clone();
-            handles.push(tokio::spawn(async move {
-                w.write_multi_buffer(mb(b"abcd")).await
-            }));
+            handles.push(tokio::spawn(async move { w.write_multi_buffer(mb(b"abcd")).await }));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
         w.close().unwrap();

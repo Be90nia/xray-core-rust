@@ -7,10 +7,12 @@
 //! `xray_app_dispatcher::default::DefaultDispatcher::dispatch_tagged`——transport 层
 //! 不依赖 dispatcher，故不在此实现。
 
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -29,24 +31,39 @@ impl<C> TaggedConnection<C> {
 }
 
 impl<C: AsyncRead + Unpin> AsyncRead for TaggedConnection<C> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
 impl<C: AsyncWrite + Unpin> AsyncWrite for TaggedConnection<C> {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
+
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
 impl<C: Connection> Connection for TaggedConnection<C> {
-    fn remote_addr(&self) -> io::Result<Option<SocketAddr>> { self.inner.remote_addr() }
-    fn local_addr(&self) -> io::Result<Option<SocketAddr>> { self.inner.local_addr() }
+    fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+        self.inner.remote_addr()
+    }
+
+    fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+        self.inner.local_addr()
+    }
 }

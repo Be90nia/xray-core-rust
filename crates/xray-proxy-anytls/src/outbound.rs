@@ -12,14 +12,17 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::session::Session;
+use xray_common::{
+    net::{destination::Destination, network::Network},
+    session::Session,
+};
 use xray_features::outbound::{OutboundError, OutboundHandler};
 
-use crate::client::{AnytlsClient, ClientConfig};
-use crate::error::Result;
-use crate::socks::SocksAddr;
+use crate::{
+    client::{AnytlsClient, ClientConfig},
+    error::Result,
+    socks::SocksAddr,
+};
 
 /// AnyTLS 出站 Handler。
 ///
@@ -38,11 +41,7 @@ impl AnytlsOutboundHandler {
     /// - `config`：AnyTLS 客户端配置（server_addr / sni / tls_config 等）
     pub fn new(tag: impl Into<String>, config: ClientConfig) -> Self {
         let client = AnytlsClient::new(config.clone());
-        Self {
-            tag: tag.into(),
-            config,
-            client,
-        }
+        Self { tag: tag.into(), config, client }
     }
 
     /// 配置引用。
@@ -96,24 +95,21 @@ fn dest_to_socks(dest: &Destination) -> Result<SocksAddr> {
         xray_common::net::address::Address::IPv4(ip) => Ok(SocksAddr::ipv4(*ip, port)),
         xray_common::net::address::Address::IPv6(ip) => {
             Ok(SocksAddr::Ipv6(std::net::SocketAddrV6::new(*ip, port, 0, 0)))
-        }
+        },
         xray_common::net::address::Address::Domain(d) => Ok(SocksAddr::domain(d.clone(), port)),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
-    use xray_common::net::address::Address;
-    use xray_common::net::port::Port;
+
+    use xray_common::net::{address::Address, port::Port};
+
+    use super::*;
 
     fn make_dest(network: Network) -> Destination {
-        Destination::new(
-            Address::Domain("example.com".to_string()),
-            Port::new(443),
-            network,
-        )
+        Destination::new(Address::Domain("example.com".to_string()), Port::new(443), network)
     }
 
     use std::sync::Once;
@@ -166,33 +162,32 @@ mod tests {
             SocksAddr::Ipv4(a) => {
                 assert_eq!(a.ip().octets(), [127, 0, 0, 1]);
                 assert_eq!(a.port(), 8080);
-            }
+            },
             _ => panic!("expected Ipv4"),
         }
     }
 
     #[test]
     fn dest_to_socks_domain() {
-        let d = Destination::new(
-            Address::new_domain("example.com"),
-            Port::new(443),
-            Network::TCP,
-        );
+        let d = Destination::new(Address::new_domain("example.com"), Port::new(443), Network::TCP);
         let s = dest_to_socks(&d).unwrap();
         match s {
             SocksAddr::Domain(h, p) => {
                 assert_eq!(h, "example.com");
                 assert_eq!(p, 443);
-            }
+            },
             _ => panic!("expected Domain"),
         }
     }
 
     /// 危险：不验证证书，仅用于测试构造。
     mod dangerous {
-        use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use std::fmt;
+        use std::fmt;
+
+        use rustls::{
+            client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+            pki_types::{CertificateDer, ServerName, UnixTime},
+        };
 
         pub struct NoVerifier;
 

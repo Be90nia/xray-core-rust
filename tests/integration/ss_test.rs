@@ -4,16 +4,19 @@
 //! client 写 IV + 加密首帧(addr+port) + 加密 body →
 //! server read_request 解析 → read_chunk 读 body → 验证数据一致。
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 use xray_common::net::address::Address;
-use xray_proxy_ss::client::Client;
-use xray_proxy_ss::config::{CipherType, MemoryAccount};
-use xray_proxy_ss::protocol::write_address_port_ss;
-use xray_proxy_ss::server::read_request;
-use xray_proxy_ss::validator::{MemoryUser, Validator};
 use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
+use xray_proxy_ss::{
+    client::Client,
+    config::{CipherType, MemoryAccount},
+    protocol::write_address_port_ss,
+    server::read_request,
+    validator::{MemoryUser, Validator},
+};
 
 /// 测试密码。
 const PASSWORD: &str = "test-ss-password";
@@ -23,11 +26,8 @@ const PAYLOAD: &[u8] = b"hello ss integration test!";
 
 /// 用 CipherType 构造 account。
 fn make_account(ct: CipherType) -> MemoryAccount {
-    let p = ProtoAccount {
-        password: PASSWORD.to_string(),
-        cipher_type: ct.as_i32(),
-        iv_check: false,
-    };
+    let p =
+        ProtoAccount { password: PASSWORD.to_string(), cipher_type: ct.as_i32(), iv_check: false };
     MemoryAccount::from_proto(&p).expect("account")
 }
 
@@ -43,9 +43,8 @@ async fn run_ss_e2e(ct: CipherType) {
     let account_clone = account.clone();
     let server_handle = tokio::spawn(async move {
         let (conn, _) = listener.accept().await.unwrap();
-        let (header, mut ss_stream) = read_request(conn, &account_clone, "alice", 0)
-            .await
-            .expect("read_request");
+        let (header, mut ss_stream) =
+            read_request(conn, &account_clone, "alice", 0).await.expect("read_request");
 
         // 读 body chunk
         let body = ss_stream.read_chunk().await.expect("read_chunk").expect("chunk data");
@@ -56,15 +55,9 @@ async fn run_ss_e2e(ct: CipherType) {
     let client = Client::new(account, "127.0.0.1".to_string(), server_port);
     let target_addr = Address::ipv4(std::net::Ipv4Addr::new(1, 2, 3, 4));
     let target_port: u16 = 5678;
-    let mut ss_stream = client
-        .dial_target(&target_addr, target_port)
-        .await
-        .expect("dial_target");
+    let mut ss_stream = client.dial_target(&target_addr, target_port).await.expect("dial_target");
 
-    ss_stream
-        .write_chunk(PAYLOAD)
-        .await
-        .expect("write_chunk");
+    ss_stream.write_chunk(PAYLOAD).await.expect("write_chunk");
     ss_stream.flush().await.expect("flush");
 
     // 关闭写端

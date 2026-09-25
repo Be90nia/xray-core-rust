@@ -24,9 +24,7 @@ impl DeterministicDice {
     ///
     /// 种子为 0 时自动替换为 1（xorshift 不允许 0 状态）。
     pub fn with_seed(seed: u64) -> Self {
-        Self {
-            next: if seed == 0 { 1 } else { seed },
-        }
+        Self { next: if seed == 0 { 1 } else { seed } }
     }
 
     /// 生成下一个随机 u64 值。

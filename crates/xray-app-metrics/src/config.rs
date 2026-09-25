@@ -17,10 +17,7 @@ pub struct MetricsConfig {
 impl MetricsConfig {
     /// 从 prost 生成的 proto message 构造。
     pub fn from_proto(p: &ProtoConfig) -> Self {
-        Self {
-            tag: p.tag.clone(),
-            listen: p.listen.clone(),
-        }
+        Self { tag: p.tag.clone(), listen: p.listen.clone() }
     }
 
     /// 转换为 prost message。
@@ -43,9 +40,6 @@ impl MetricsConfig {
         Ok(())
     }
 }
-
-
-
 
 #[cfg(test)]
 mod tests {
@@ -70,10 +64,7 @@ mod tests {
 
     #[test]
     fn to_proto_roundtrip() {
-        let c = MetricsConfig {
-            tag: "t".into(),
-            listen: "127.0.0.1:1".into(),
-        };
+        let c = MetricsConfig { tag: "t".into(), listen: "127.0.0.1:1".into() };
         let p = c.to_proto();
         assert_eq!(p.tag, "t");
         assert_eq!(p.listen, "127.0.0.1:1");
@@ -82,10 +73,7 @@ mod tests {
 
     #[test]
     fn eq_on_clone() {
-        let c = MetricsConfig {
-            tag: "x".into(),
-            listen: "y".into(),
-        };
+        let c = MetricsConfig { tag: "x".into(), listen: "y".into() };
         assert_eq!(c, c.clone());
     }
 
@@ -112,19 +100,13 @@ mod tests {
 
     #[test]
     fn validate_only_tag_ok() {
-        let c = MetricsConfig {
-            tag: "m".into(),
-            listen: String::new(),
-        };
+        let c = MetricsConfig { tag: "m".into(), listen: String::new() };
         assert!(c.validate().is_ok());
     }
 
     #[test]
     fn validate_only_listen_ok() {
-        let c = MetricsConfig {
-            tag: String::new(),
-            listen: "127.0.0.1:9090".into(),
-        };
+        let c = MetricsConfig { tag: String::new(), listen: "127.0.0.1:9090".into() };
         assert!(c.validate().is_ok());
     }
- }
+}

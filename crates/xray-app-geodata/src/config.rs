@@ -11,10 +11,7 @@ pub struct GeodataAsset {
 
 impl GeodataAsset {
     pub fn from_proto(p: &ProtoAsset) -> Self {
-        Self {
-            url: p.url.clone(),
-            file: p.file.clone(),
-        }
+        Self { url: p.url.clone(), file: p.file.clone() }
     }
 
     pub fn to_proto(&self) -> ProtoAsset {
@@ -74,10 +71,7 @@ mod tests {
 
     #[test]
     fn asset_to_proto_roundtrip() {
-        let a = GeodataAsset {
-            url: "u".into(),
-            file: "f".into(),
-        };
+        let a = GeodataAsset { url: "u".into(), file: "f".into() };
         let p = a.to_proto();
         assert_eq!(GeodataAsset::from_proto(&p), a);
     }
@@ -112,14 +106,8 @@ mod tests {
             cron: "*/5 * * * *".into(),
             outbound: "block".into(),
             assets: vec![
-                GeodataAsset {
-                    url: "u".into(),
-                    file: "f".into(),
-                },
-                GeodataAsset {
-                    url: "u2".into(),
-                    file: "f2".into(),
-                },
+                GeodataAsset { url: "u".into(), file: "f".into() },
+                GeodataAsset { url: "u2".into(), file: "f2".into() },
             ],
         };
         let p = c.to_proto();
@@ -135,11 +123,7 @@ mod tests {
 
     #[test]
     fn config_eq_semantics() {
-        let c1 = GeodataConfig {
-            cron: "x".into(),
-            outbound: "y".into(),
-            assets: vec![],
-        };
+        let c1 = GeodataConfig { cron: "x".into(), outbound: "y".into(), assets: vec![] };
         let c2 = c1.clone();
         assert_eq!(c1, c2);
     }

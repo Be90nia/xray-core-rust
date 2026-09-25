@@ -6,8 +6,10 @@
 //!
 //! 简化实现：不抄 Go 的 unsafe 重叠缓冲优化（性能差距在 4 KiB 量级无显著影响）。
 
-use aes::cipher::{Array, BlockCipherEncrypt, KeyInit};
-use aes::Aes128;
+use aes::{
+    Aes128,
+    cipher::{Array, BlockCipherEncrypt, KeyInit},
+};
 
 /// AES-128 block size（固定 16 字节）。
 pub const BLOCK_SIZE: usize = 16;
@@ -28,10 +30,7 @@ impl Cfb8Enc {
     /// 新建加密器：`key` 和 `iv` 均为 16 字节（MC 中 `iv == key`）。
     #[must_use]
     pub fn new(key: &[u8; BLOCK_SIZE], iv: &[u8; BLOCK_SIZE]) -> Self {
-        Self {
-            cipher: Aes128::new(&Array::from(*key)),
-            iv: *iv,
-        }
+        Self { cipher: Aes128::new(&Array::from(*key)), iv: *iv }
     }
 
     /// 原地加密 `buf`。
@@ -52,10 +51,7 @@ impl Cfb8Dec {
     /// 新建解密器。
     #[must_use]
     pub fn new(key: &[u8; BLOCK_SIZE], iv: &[u8; BLOCK_SIZE]) -> Self {
-        Self {
-            cipher: Aes128::new(&Array::from(*key)),
-            iv: *iv,
-        }
+        Self { cipher: Aes128::new(&Array::from(*key)), iv: *iv }
     }
 
     /// 原地解密 `buf`。

@@ -16,9 +16,11 @@ use std::sync::Arc;
 
 use xray_features::{Feature, FeatureError};
 
-use crate::config::GeodataConfig;
-use crate::downloader::{AssetDownloader, GeodataReloader};
-use crate::instance::{GeodataInstance, Scheduler};
+use crate::{
+    config::GeodataConfig,
+    downloader::{AssetDownloader, GeodataReloader},
+    instance::{GeodataInstance, Scheduler},
+};
 
 /// Geodata app Feature 实现。
 ///
@@ -40,12 +42,7 @@ impl GeodataFeature {
         downloader: Arc<dyn AssetDownloader>,
         reloader: Arc<dyn GeodataReloader>,
     ) -> Self {
-        Self {
-            instance: Arc::new(GeodataInstance::new(config)),
-            scheduler,
-            downloader,
-            reloader,
-        }
+        Self { instance: Arc::new(GeodataInstance::new(config)), scheduler, downloader, reloader }
     }
 
     /// 暴露内部 instance（测试与探针用）。
@@ -70,17 +67,13 @@ impl Feature for GeodataFeature {
         });
         self.instance
             .start_with_callback(self.scheduler.as_ref(), callback)
-            .map_err(|e| FeatureError::StartFailed {
-                name: "geodata",
-                message: e.to_string(),
-            })
+            .map_err(|e| FeatureError::StartFailed { name: "geodata", message: e.to_string() })
     }
 
     fn close(&self) -> xray_features::Result<()> {
-        self.instance.close().map_err(|e| FeatureError::CloseFailed {
-            name: "geodata",
-            message: e.to_string(),
-        })
+        self.instance
+            .close()
+            .map_err(|e| FeatureError::CloseFailed { name: "geodata", message: e.to_string() })
     }
 }
 
@@ -88,14 +81,16 @@ fn _assert_send_sync<T: Send + Sync>() {}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use parking_lot::Mutex;
 
-    use crate::downloader::{AssetDownloader, GeodataReloader};
-    use crate::error::GeodataError;
-    use crate::instance::{ScheduleHandle, Scheduler};
+    use super::*;
+    use crate::{
+        downloader::{AssetDownloader, GeodataReloader},
+        error::GeodataError,
+        instance::{ScheduleHandle, Scheduler},
+    };
 
     /// 捕获最近注册的 cron 回调（仅保留最后一次），允许测试触发。
     pub struct CallbackCapturingScheduler {
@@ -105,10 +100,7 @@ mod tests {
 
     impl CallbackCapturingScheduler {
         pub fn new() -> Arc<Self> {
-            Arc::new(Self {
-                captured: Mutex::new(None),
-                schedule_calls: AtomicUsize::new(0),
-            })
+            Arc::new(Self { captured: Mutex::new(None), schedule_calls: AtomicUsize::new(0) })
         }
     }
 
@@ -134,6 +126,7 @@ mod tests {
         ) -> std::result::Result<(), GeodataError> {
             Ok(())
         }
+
         fn resolve_target(
             &self,
             file: &str,
@@ -199,15 +192,11 @@ mod tests {
         let scheduler: Arc<CallbackCapturingScheduler> = CallbackCapturingScheduler::new();
         let downloader: Arc<dyn AssetDownloader> = Arc::new(DummyDownloader);
         let reload_count = Arc::new(AtomicUsize::new(0));
-        let reloader: Arc<dyn GeodataReloader> = Arc::new(CountingReloader(
-            Arc::clone(&reload_count),
-        ));
+        let reloader: Arc<dyn GeodataReloader> =
+            Arc::new(CountingReloader(Arc::clone(&reload_count)));
 
         let feature = GeodataFeature::new(
-            GeodataConfig {
-                cron: "* * * * *".into(),
-                ..Default::default()
-            },
+            GeodataConfig { cron: "* * * * *".into(), ..Default::default() },
             scheduler.clone() as Arc<dyn Scheduler>,
             downloader,
             reloader,
@@ -224,10 +213,7 @@ mod tests {
         // 闭包类型 `Box<dyn Fn() + Send + Sync>` 不能直接调用 by-value，
         // 但 Option::take 后是 owned Box<dyn Fn>——可直接调用。
         let cb = scheduler.captured.lock().take();
-        assert!(
-            cb.is_some(),
-            "callback must be captured (was `|| {{}}` before fix)"
-        );
+        assert!(cb.is_some(), "callback must be captured (was `|| {{}}` before fix)");
         cb.unwrap()();
 
         assert_eq!(

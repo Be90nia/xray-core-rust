@@ -4,17 +4,22 @@
 
 use std::sync::Arc;
 
-use xray_common::net::network::Network;
-use xray_common::net::port::{MemoryPortList, Port, PortRange};
-use xray_geodata::loader::GeoDataLoader;
-use xray_geodata::matcher::domain::{DomainRule as MatcherDomainRule, DomainType};
-use xray_proto::xray::app::router::RoutingRule;
-use xray_proto::xray::common::net::PortList;
+use xray_common::net::{
+    network::Network,
+    port::{MemoryPortList, Port, PortRange},
+};
+use xray_geodata::{
+    loader::GeoDataLoader,
+    matcher::domain::{DomainRule as MatcherDomainRule, DomainType},
+};
+use xray_proto::xray::{app::router::RoutingRule, common::net::PortList};
 
-use crate::balancing::Balancer;
-use crate::condition::{Condition, ConditionChan, IpMatchAsType, PortMatchAsType, *};
-use crate::error::RouterError;
-use crate::webhook::WebhookNotifier;
+use crate::{
+    balancing::Balancer,
+    condition::{Condition, ConditionChan, IpMatchAsType, PortMatchAsType, *},
+    error::RouterError,
+    webhook::WebhookNotifier,
+};
 
 /// 一条路由规则。
 ///
@@ -46,7 +51,10 @@ impl Rule {
     /// 带 ctx 的选路：balancer 走 `pick_outbound_with_key(ctx_derived_key)`，
     /// 支持 LeastLoadStrategy ConsistentHashing 等需要稳定 affinity 的策略。
     /// 无 ctx key 字段时退化为 `get_tag()`（等同未传 key）。
-    pub fn get_tag_with_ctx(&self, ctx: &dyn crate::context::RoutingContext) -> Result<String, RouterError> {
+    pub fn get_tag_with_ctx(
+        &self,
+        ctx: &dyn crate::context::RoutingContext,
+    ) -> Result<String, RouterError> {
         if let Some(b) = &self.balancer {
             let key = crate::router::ctx_hash_key(ctx);
             return b.pick_outbound_with_key(key);
@@ -61,10 +69,7 @@ impl Rule {
     ///
     /// 对应 Go `Rule.Apply`。
     pub fn apply(&self, ctx: &dyn crate::context::RoutingContext) -> Option<String> {
-        let hit = self
-            .condition
-            .as_ref()
-            .map_or(true, |c| c.apply(ctx));
+        let hit = self.condition.as_ref().map_or(true, |c| c.apply(ctx));
         if !hit {
             return None;
         }
@@ -103,20 +108,14 @@ pub fn build_rule(
                         .cloned()
                         .ok_or_else(|| RouterError::BalancerNotFound(s.clone()))?,
                 );
-            }
+            },
         }
     }
 
     // 构建 webhook（可选）
     let webhook = proto.webhook.as_ref().map(|c| Arc::new(WebhookNotifier::new(c)));
 
-    Ok(Rule {
-        tag,
-        rule_tag: proto.rule_tag.clone(),
-        balancer,
-        condition: Some(cond),
-        webhook,
-    })
+    Ok(Rule { tag, rule_tag: proto.rule_tag.clone(), balancer, condition: Some(cond), webhook })
 }
 
 /// 从 proto `RoutingRule` 构造匹配器链。
@@ -158,24 +157,33 @@ pub fn build_condition(
         chan.add(Box::new(IPMatcherCondition::new(rules, IpMatchAsType::Local)?));
     }
 
-
     // Ports
     if let Some(pl) = proto.port_list.as_ref() {
-        chan.add(Box::new(PortMatcherCondition::new(to_mem_port_list(pl), PortMatchAsType::Target)));
+        chan.add(Box::new(PortMatcherCondition::new(
+            to_mem_port_list(pl),
+            PortMatchAsType::Target,
+        )));
     }
     if let Some(pl) = proto.source_port_list.as_ref() {
-        chan.add(Box::new(PortMatcherCondition::new(to_mem_port_list(pl), PortMatchAsType::Source)));
+        chan.add(Box::new(PortMatcherCondition::new(
+            to_mem_port_list(pl),
+            PortMatchAsType::Source,
+        )));
     }
     if let Some(pl) = proto.local_port_list.as_ref() {
         chan.add(Box::new(PortMatcherCondition::new(to_mem_port_list(pl), PortMatchAsType::Local)));
     }
     if let Some(pl) = proto.vless_route_list.as_ref() {
-        chan.add(Box::new(PortMatcherCondition::new(to_mem_port_list(pl), PortMatchAsType::VlessRoute)));
+        chan.add(Box::new(PortMatcherCondition::new(
+            to_mem_port_list(pl),
+            PortMatchAsType::VlessRoute,
+        )));
     }
 
     // Networks
     if !proto.networks.is_empty() {
-        let nets = proto.networks.iter().filter_map(|&v| proto_network_to_native(v)).collect::<Vec<_>>();
+        let nets =
+            proto.networks.iter().filter_map(|&v| proto_network_to_native(v)).collect::<Vec<_>>();
         if !nets.is_empty() {
             chan.add(Box::new(NetworkMatcherCondition::new(&nets)));
         }
@@ -198,9 +206,10 @@ pub fn build_condition(
 
     // Attributes
     if !proto.attributes.is_empty() {
-        chan.add(Box::new(AttributeMatcherCondition::new(proto.attributes.clone()).map_err(|e| {
-            RouterError::GeodataBuild(e.to_string())
-        })?));
+        chan.add(Box::new(
+            AttributeMatcherCondition::new(proto.attributes.clone())
+                .map_err(|e| RouterError::GeodataBuild(e.to_string()))?,
+        ));
     }
 
     // Process
@@ -219,9 +228,7 @@ fn to_mem_port_list(pl: &PortList) -> MemoryPortList {
     let ranges: Vec<PortRange> = pl
         .range
         .iter()
-        .map(|r| {
-            PortRange::new(Port::new(r.from as u16), Port::new(r.to as u16))
-        })
+        .map(|r| PortRange::new(Port::new(r.from as u16), Port::new(r.to as u16)))
         .collect();
     MemoryPortList::new(ranges)
 }
@@ -252,13 +259,11 @@ fn proto_domain_type_to_matcher(v: i32) -> Option<DomainType> {
     }
 }
 
-/**
- * 将 proto DomainRule 列表解析为 matcher DomainRule 列表。
- *
- * - `custom` 变体：直接转换。
- * - `geosite` 变体：调用 geo_loader.load_site 加载文件中的 GeoSite 条目；
- *   loader 缺失时 warn 并 skip。
- */
+/// 将 proto DomainRule 列表解析为 matcher DomainRule 列表。
+///
+/// - `custom` 变体：直接转换。
+/// - `geosite` 变体：调用 geo_loader.load_site 加载文件中的 GeoSite 条目； loader 缺失时 warn 并
+///   skip。
 fn parse_proto_domain_rules(
     proto_rules: &[xray_proto::xray::common::geodata::DomainRule],
     geo_loader: Option<&GeoDataLoader>,
@@ -272,7 +277,7 @@ fn parse_proto_domain_rules(
                 let Some(dt) = proto_domain_type_to_matcher(d.r#type) else { continue };
                 let idx = (out.len() + 1) as u32;
                 out.push(MatcherDomainRule::new(dt, d.value.clone(), idx));
-            }
+            },
             ProtoDV::Geosite(geosite_rule) => {
                 let Some(loader) = geo_loader else {
                     // hn4i：fail-closed。无 loader → 配置错误，整条规则不能启用。
@@ -285,7 +290,7 @@ fn parse_proto_domain_rules(
                     Ok(rules) => out.extend(rules),
                     Err(e) => return Err(e),
                 }
-            }
+            },
         }
     }
     Ok(out)
@@ -300,11 +305,8 @@ fn load_geosite_to_matcher_rules(
     geosite_rule: &xray_proto::xray::common::geodata::GeoSiteRule,
     loader: &GeoDataLoader,
 ) -> Result<Vec<MatcherDomainRule>, RouterError> {
-    let file = if geosite_rule.file.is_empty() {
-        "geosite.dat"
-    } else {
-        geosite_rule.file.as_str()
-    };
+    let file =
+        if geosite_rule.file.is_empty() { "geosite.dat" } else { geosite_rule.file.as_str() };
     let code = geosite_rule.code.to_uppercase();
     let site = if geosite_rule.attrs.is_empty() {
         loader
@@ -327,12 +329,13 @@ fn load_geosite_to_matcher_rules(
         .collect())
 }
 
-/// 将 proto `IpRule` 列表（`xray.common.geodata`）转换为 xray-geodata 的 `IpRule`（`xray.geodata`）。
+/// 将 proto `IpRule` 列表（`xray.common.geodata`）转换为 xray-geodata 的
+/// `IpRule`（`xray.geodata`）。
 ///
 /// 两个 crate 各自构建 proto，生成同名不同类型。此函数字段级复制。
 /// - `Custom(CidrRule)` 变体：直接转换。
-/// - `Geoip(GeoIPRule)` 变体：调用 geo_loader.load_ip 加载文件中的 GeoIP 条目，
-///   展开 CIDR 列表为多个 Custom 变体；loader 缺失时 warn 并 skip。
+/// - `Geoip(GeoIPRule)` 变体：调用 geo_loader.load_ip 加载文件中的 GeoIP 条目， 展开 CIDR
+///   列表为多个 Custom 变体；loader 缺失时 warn 并 skip。
 fn convert_proto_ip_rules(
     proto_rules: &[xray_proto::xray::common::geodata::IpRule],
     geo_loader: Option<&GeoDataLoader>,
@@ -343,19 +346,16 @@ fn convert_proto_ip_rules(
         let Some(value) = r.value.as_ref() else { continue };
         match value {
             ProtoIV::Custom(c) => {
-                let cidr = c.cidr.as_ref().map(|cc| xray_geodata::pb::Cidr {
-                    ip: cc.ip.clone(),
-                    prefix: cc.prefix,
-                });
+                let cidr = c
+                    .cidr
+                    .as_ref()
+                    .map(|cc| xray_geodata::pb::Cidr { ip: cc.ip.clone(), prefix: cc.prefix });
                 out.push(xray_geodata::pb::IpRule {
                     value: Some(xray_geodata::pb::ip_rule::Value::Custom(
-                        xray_geodata::pb::CidrRule {
-                            cidr,
-                            reverse_match: c.reverse_match,
-                        },
+                        xray_geodata::pb::CidrRule { cidr, reverse_match: c.reverse_match },
                     )),
                 });
-            }
+            },
             ProtoIV::Geoip(geoip_rule) => {
                 let Some(loader) = geo_loader else {
                     // hn4i：fail-closed（同 geosite）。无 loader 必须报错。
@@ -369,9 +369,9 @@ fn convert_proto_ip_rules(
                     Err(e) => {
                         // hn4i：fail-closed（同 geosite）。
                         return Err(e);
-                    }
+                    },
                 }
-            }
+            },
         }
     }
     Ok(out)
@@ -386,11 +386,7 @@ fn load_geoip_to_matcher_rules(
     geoip_rule: &xray_proto::xray::common::geodata::GeoIpRule,
     loader: &GeoDataLoader,
 ) -> Result<Vec<xray_geodata::pb::IpRule>, RouterError> {
-    let file = if geoip_rule.file.is_empty() {
-        "geoip.dat"
-    } else {
-        geoip_rule.file.as_str()
-    };
+    let file = if geoip_rule.file.is_empty() { "geoip.dat" } else { geoip_rule.file.as_str() };
     let code = geoip_rule.code.to_uppercase();
     let geoip = loader
         .load_ip(file, &code)
@@ -401,26 +397,23 @@ fn load_geoip_to_matcher_rules(
         .cidr
         .into_iter()
         .map(|cidr| xray_geodata::pb::IpRule {
-            value: Some(xray_geodata::pb::ip_rule::Value::Custom(
-                xray_geodata::pb::CidrRule {
-                    cidr: Some(xray_geodata::pb::Cidr {
-                        ip: cidr.ip,
-                        prefix: cidr.prefix,
-                    }),
-                    reverse_match: reverse,
-                },
-            )),
+            value: Some(xray_geodata::pb::ip_rule::Value::Custom(xray_geodata::pb::CidrRule {
+                cidr: Some(xray_geodata::pb::Cidr { ip: cidr.ip, prefix: cidr.prefix }),
+                reverse_match: reverse,
+            })),
         })
         .collect())
 }
 
 #[cfg(test)]
 mod tests {
+    use xray_proto::xray::{
+        app::router::RoutingRule,
+        common::geodata::{Domain, DomainRule, domain::Type as DomainType},
+    };
+
     use super::*;
     use crate::context::RoutingData;
-    use xray_proto::xray::app::router::RoutingRule;
-    use xray_proto::xray::common::geodata::{Domain, DomainRule};
-    use xray_proto::xray::common::geodata::domain::Type as DomainType;
 
     fn full_domain(value: &str) -> DomainRule {
         DomainRule {
@@ -482,9 +475,7 @@ mod tests {
     #[test]
     fn test_to_mem_port_list() {
         use xray_proto::xray::common::net::{PortList as PList, PortRange as PRange};
-        let pl = PList {
-            range: vec![PRange { from: 80, to: 80 }, PRange { from: 443, to: 445 }],
-        };
+        let pl = PList { range: vec![PRange { from: 80, to: 80 }, PRange { from: 443, to: 445 }] };
         let mem = to_mem_port_list(&pl);
         assert!(mem.contains(Port::new(80)));
         assert!(mem.contains(Port::new(444)));

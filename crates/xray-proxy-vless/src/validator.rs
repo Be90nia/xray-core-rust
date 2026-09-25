@@ -3,14 +3,15 @@
 //! 维护 UUID → MemoryUser 的索引，支持按 UUID/email 增删查。
 //! `MemoryValidator` 是默认实现，用 `parking_lot::RwLock<HashMap>` 替代 Go `sync.Map`。
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::RwLock;
 use xray_common::uuid::UUID;
 
-use crate::account::MemoryAccount;
-use crate::error::{Result, VlessError};
+use crate::{
+    account::MemoryAccount,
+    error::{Result, VlessError},
+};
 
 /// Validator 接口（对应 Go `vless.Validator` interface）。
 ///
@@ -55,11 +56,7 @@ pub struct MemoryUser {
 impl MemoryUser {
     /// 创建新的 VLESS 内存用户。
     pub fn new(email: impl Into<String>, level: u32, account: MemoryAccount) -> Self {
-        Self {
-            email: email.into(),
-            level,
-            account,
-        }
+        Self { email: email.into(), level, account }
     }
 }
 
@@ -118,9 +115,7 @@ impl Validator for MemoryValidator {
         let key = email.to_lowercase();
         let user = {
             let mut email_guard = self.email_index.write();
-            email_guard
-                .remove(&key)
-                .ok_or_else(|| VlessError::UserNotFound(email.to_string()))?
+            email_guard.remove(&key).ok_or_else(|| VlessError::UserNotFound(email.to_string()))?
         };
         let uuid_key = process_uuid(*user.account.uuid().as_bytes());
         self.uuid_index.write().remove(&uuid_key);
@@ -128,10 +123,7 @@ impl Validator for MemoryValidator {
     }
 
     fn get_by_email(&self, email: &str) -> Option<MemoryUser> {
-        self.email_index
-            .read()
-            .get(&email.to_lowercase())
-            .cloned()
+        self.email_index.read().get(&email.to_lowercase()).cloned()
     }
 
     fn get_all(&self) -> Vec<MemoryUser> {
@@ -154,14 +146,12 @@ pub fn shared_validator() -> Arc<dyn Validator> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use xray_proto::xray::proxy::vless::Account as ProtoAccount;
 
+    use super::*;
+
     fn sample_account(id_str: &str) -> MemoryAccount {
-        let p = ProtoAccount {
-            id: id_str.to_string(),
-            ..Default::default()
-        };
+        let p = ProtoAccount { id: id_str.to_string(), ..Default::default() };
         MemoryAccount::from_proto_account(&p).expect("parse account")
     }
 
@@ -217,7 +207,7 @@ mod tests {
         let v = MemoryValidator::new();
         v.add(sample_user("a@example.com", UUID_A)).expect("add 1");
         match v.add(sample_user("A@Example.com", UUID_B)) {
-            Err(VlessError::UserAlreadyExists(_)) => {}
+            Err(VlessError::UserAlreadyExists(_)) => {},
             other => panic!("expected UserAlreadyExists, got {other:?}"),
         }
     }
@@ -259,7 +249,7 @@ mod tests {
     fn del_empty_email_fails() {
         let v = MemoryValidator::new();
         match v.del("") {
-            Err(VlessError::EmptyEmail) => {}
+            Err(VlessError::EmptyEmail) => {},
             other => panic!("expected EmptyEmail, got {other:?}"),
         }
     }

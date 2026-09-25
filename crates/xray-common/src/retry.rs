@@ -2,8 +2,7 @@
 //!
 //! 对应 Go 版本 `common/retry` 包，提供可配置的重试策略。
 
-use std::future::Future;
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
 /// 重试策略 trait，定义如何计算下次重试间隔。
 pub trait Strategy: Send + Sync {
@@ -64,7 +63,7 @@ where
                     return Err(e);
                 }
                 tokio::time::sleep(interval).await;
-            }
+            },
         }
     }
 }
@@ -90,7 +89,7 @@ where
                 if !interval.is_zero() {
                     tokio::time::sleep(interval).await;
                 }
-            }
+            },
         }
     }
     Err(last_err.expect("max_attempts > 0 guarantees at least one error"))
@@ -102,10 +101,7 @@ mod tests {
 
     #[test]
     fn test_timed_strategy() {
-        let strategy = Timed {
-            interval: Duration::from_millis(100),
-            max_attempts: 3,
-        };
+        let strategy = Timed { interval: Duration::from_millis(100), max_attempts: 3 };
         assert_eq!(strategy.next_interval(0), Duration::from_millis(100));
         assert_eq!(strategy.next_interval(5), Duration::from_millis(100));
     }
@@ -135,10 +131,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retry_success_immediately() {
-        let strategy = Timed {
-            interval: Duration::from_millis(10),
-            max_attempts: 3,
-        };
+        let strategy = Timed { interval: Duration::from_millis(10), max_attempts: 3 };
         let result = retry(&strategy, || async { Ok::<i32, &str>(42) }).await;
         assert_eq!(result, Ok(42));
     }
@@ -148,13 +141,7 @@ mod tests {
         let mut count = 0u32;
         let result = retry_timed(Duration::from_millis(1), 3, || {
             count += 1;
-            async move {
-                if count < 3 {
-                    Err("not yet")
-                } else {
-                    Ok(99)
-                }
-            }
+            async move { if count < 3 { Err("not yet") } else { Ok(99) } }
         })
         .await;
         assert_eq!(result, Ok(99));

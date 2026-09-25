@@ -2,28 +2,30 @@
 //!
 //! 验收（bd 3lm）：
 //! 1. mask 开启（aes128gcm + srtp header 叠加）roundtrip 正常；
-//! 2. 线上字节非裸 KCP——proxy 录制包经同配置 chain decode 成功且 overhead
-//!    精确匹配（28B AEAD + 4B srtp），AEAD tag 验证即密码学证明；
+//! 2. 线上字节非裸 KCP——proxy 录制包经同配置 chain decode 成功且 overhead 精确匹配（28B AEAD + 4B
+//!    srtp），AEAD tag 验证即密码学证明；
 //! 3. mask 关闭 roundtrip 不变（回归），且同 chain decode 裸 KCP 包必失败。
 
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
+use std::{
+    net::{Ipv4Addr, SocketAddr, UdpSocket},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Duration,
+};
 
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-use xray_transport::connection::Connection;
-use xray_transport::dialer::{dial_with_settings, StreamSettings};
-use xray_transport::finalmask::parse_finalmask_udp_chain;
-use xray_transport::listener_registry::{listen_tcp, ConnHandler, TransportListener};
-use xray_transport::sockopt::SocketOptions;
+use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
+use xray_transport::{
+    connection::Connection,
+    dialer::{StreamSettings, dial_with_settings},
+    finalmask::parse_finalmask_udp_chain,
+    listener_registry::{ConnHandler, TransportListener, listen_tcp},
+    sockopt::SocketOptions,
+};
 use xray_transport_kcp::{register_dialer, register_listener};
 
 /// aes128gcm(value) + srtp header 两条 mkcp-legacy 叠加（对齐 Go 多 mask 链）。
@@ -42,9 +44,7 @@ struct RecordingProxy {
 impl RecordingProxy {
     fn start(server: SocketAddr) -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_millis(50)))
-            .unwrap();
+        socket.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         let addr = socket.local_addr().unwrap();
         let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -65,8 +65,8 @@ impl RecordingProxy {
                             client = Some(src);
                             let _ = socket.send_to(&buf[..n], server);
                         }
-                    }
-                    Err(_) => {} // read timeout → 检查 stop 后继续
+                    },
+                    Err(_) => {}, // read timeout → 检查 stop 后继续
                 }
             }
         });
@@ -116,7 +116,7 @@ fn echo_handler() -> ConnHandler {
                         if wr.flush().await.is_err() {
                             break;
                         }
-                    }
+                    },
                 }
             }
         });

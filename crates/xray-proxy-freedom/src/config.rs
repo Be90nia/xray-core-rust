@@ -157,16 +157,21 @@ impl DomainStrategy {
     }
 }
 
-use crate::error::Result;
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::{Arc, LazyLock},
+};
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::{Arc, LazyLock};
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::{MemoryPortList, Port, PortRange};
+use xray_common::net::{
+    address::Address,
+    destination::Destination,
+    network::Network,
+    port::{MemoryPortList, Port, PortRange},
+};
 use xray_geodata::matcher::ip::{HeuristicIPMatcher, IPMatcher};
 use xray_proto::xray::common::geodata::ip_rule;
+
+use crate::error::Result;
 
 /// RuleAction 枚举。对应 proto `RuleAction`。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -283,30 +288,19 @@ impl FinalRuleConfig {
             other => {
                 return Err(crate::error::FreedomError::InvalidConfig(format!(
                     "unknown finalRule action: {other}"
-                )))
-            }
+                )));
+            },
         };
         let networks = v.get("network").map(json_network_list).unwrap_or_default();
         let port_list = v.get("port").and_then(json_port_list);
-        let ip = v
-            .get("ip")
-            .map(json_ip_rules)
-            .unwrap_or_default();
+        let ip = v.get("ip").map(json_ip_rules).unwrap_or_default();
         let block_delay = v.get("blockDelay").and_then(json_int32_range);
-        Ok(Self {
-            action,
-            networks,
-            port_list,
-            ip,
-            block_delay,
-        })
+        Ok(Self { action, networks, port_list, ip, block_delay })
     }
 }
 
 /// 地址字符串 → proto `IpOrDomain` oneof（先试 IPv4，再 IPv6，否则域名）。
-fn address_str_to_ip_or_domain(
-    s: &str,
-) -> xray_proto::xray::common::net::ip_or_domain::Address {
+fn address_str_to_ip_or_domain(s: &str) -> xray_proto::xray::common::net::ip_or_domain::Address {
     use xray_proto::xray::common::net::ip_or_domain::Address as IoD;
     if let Ok(v4) = s.parse::<Ipv4Addr>() {
         IoD::Ip(v4.octets().to_vec())
@@ -320,13 +314,10 @@ fn address_str_to_ip_or_domain(
 /// Go `NetworkList`：`"tcp,udp"` 字符串或字符串数组 → proto `Network` i32 列表。
 fn json_network_list(v: &serde_json::Value) -> Vec<i32> {
     let tokens: Vec<String> = match v {
-        serde_json::Value::String(s) => {
-            s.split(',').map(|t| t.trim().to_string()).collect()
-        }
-        serde_json::Value::Array(a) => a
-            .iter()
-            .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
-            .collect(),
+        serde_json::Value::String(s) => s.split(',').map(|t| t.trim().to_string()).collect(),
+        serde_json::Value::Array(a) => {
+            a.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_string())).collect()
+        },
         _ => Vec::new(),
     };
     tokens
@@ -343,9 +334,7 @@ fn json_network_list(v: &serde_json::Value) -> Vec<i32> {
 /// Go `PortList`：`"443,80-90"` 字符串 / 数字数组 / 混合数组 → proto `PortList`。
 fn json_port_list(v: &serde_json::Value) -> Option<xray_proto::xray::common::net::PortList> {
     let items: Vec<String> = match v {
-        serde_json::Value::String(s) => {
-            s.split(',').map(|t| t.trim().to_string()).collect()
-        }
+        serde_json::Value::String(s) => s.split(',').map(|t| t.trim().to_string()).collect(),
         serde_json::Value::Array(a) => a
             .iter()
             .map(|x| match x {
@@ -377,7 +366,7 @@ fn parse_port_range_str(s: &str) -> Option<(u32, u32)> {
             let from: u32 = a.trim().parse().ok()?;
             let to: u32 = b.trim().parse().ok()?;
             (from <= to).then_some((from, to))
-        }
+        },
         None => s.trim().parse::<u32>().ok().map(|p| (p, p)),
     }
 }
@@ -389,7 +378,7 @@ fn json_ip_rules(v: &serde_json::Value) -> Vec<xray_proto::xray::common::geodata
         serde_json::Value::String(s) => s.split(',').map(|t| t.trim()).collect(),
         serde_json::Value::Array(a) => {
             a.iter().filter_map(|x| x.as_str().map(|s| s.trim())).collect()
-        }
+        },
         _ => return Vec::new(),
     };
     items
@@ -406,18 +395,16 @@ fn json_ip_rules(v: &serde_json::Value) -> Vec<xray_proto::xray::common::geodata
                 (_, p) => p,
             };
             Some(xray_proto::xray::common::geodata::IpRule {
-                value: Some(ip_rule::Value::Custom(
-                    xray_proto::xray::common::geodata::CidrRule {
-                        cidr: Some(xray_proto::xray::common::geodata::Cidr {
-                            ip: match ip {
-                                IpAddr::V4(v4) => v4.octets().to_vec(),
-                                IpAddr::V6(v6) => v6.octets().to_vec(),
-                            },
-                            prefix,
-                        }),
-                        reverse_match: false,
-                    },
-                )),
+                value: Some(ip_rule::Value::Custom(xray_proto::xray::common::geodata::CidrRule {
+                    cidr: Some(xray_proto::xray::common::geodata::Cidr {
+                        ip: match ip {
+                            IpAddr::V4(v4) => v4.octets().to_vec(),
+                            IpAddr::V6(v6) => v6.octets().to_vec(),
+                        },
+                        prefix,
+                    }),
+                    reverse_match: false,
+                })),
             })
         })
         .collect()
@@ -430,19 +417,13 @@ fn json_int32_range(v: &serde_json::Value) -> Option<Range> {
             let (a, b) = s.split_once('-')?;
             let from = a.trim().parse::<i64>().ok()?;
             let to = b.trim().parse::<i64>().ok()?;
-            Some(Range {
-                min: from.max(0) as u64,
-                max: to.max(0) as u64,
-            })
-        }
+            Some(Range { min: from.max(0) as u64, max: to.max(0) as u64 })
+        },
         serde_json::Value::Object(o) => {
             let from = o.get("from").and_then(|x| x.as_i64()).unwrap_or(0);
             let to = o.get("to").and_then(|x| x.as_i64()).unwrap_or(0);
-            Some(Range {
-                min: from.max(0) as u64,
-                max: to.max(0) as u64,
-            })
-        }
+            Some(Range { min: from.max(0) as u64, max: to.max(0) as u64 })
+        },
         _ => None,
     }
 }
@@ -465,9 +446,9 @@ impl Config {
     pub fn from_proto(p: xray_proto::xray::proxy::freedom::Config) -> Result<Self> {
         Ok(Self {
             domain_strategy: p.domain_strategy,
-            destination_override: p.destination_override.map(|d| DestinationOverride {
-                server: d.server,
-            }),
+            destination_override: p
+                .destination_override
+                .map(|d| DestinationOverride { server: d.server }),
             user_level: p.user_level,
             fragment: p.fragment.map(|f| Fragment {
                 packets_from: f.packets_from,
@@ -500,10 +481,7 @@ impl Config {
                     networks: r.networks,
                     port_list: r.port_list,
                     ip: r.ip,
-                    block_delay: r.block_delay.map(|b| Range {
-                        min: b.min,
-                        max: b.max,
-                    }),
+                    block_delay: r.block_delay.map(|b| Range { min: b.min, max: b.max }),
                 })
                 .collect(),
         })
@@ -515,22 +493,18 @@ impl Config {
         xray_proto::xray::proxy::freedom::Config {
             domain_strategy: self.domain_strategy,
             destination_override: self.destination_override.as_ref().map(|d| {
-                xray_proto::xray::proxy::freedom::DestinationOverride {
-                    server: d.server.clone(),
-                }
+                xray_proto::xray::proxy::freedom::DestinationOverride { server: d.server.clone() }
             }),
             user_level: self.user_level,
-            fragment: self.fragment.as_ref().map(|f| {
-                xray_proto::xray::proxy::freedom::Fragment {
-                    packets_from: f.packets_from,
-                    packets_to: f.packets_to,
-                    length_min: f.length_min,
-                    length_max: f.length_max,
-                    interval_min: f.interval_min,
-                    interval_max: f.interval_max,
-                    max_split_min: f.max_split_min,
-                    max_split_max: f.max_split_max,
-                }
+            fragment: self.fragment.as_ref().map(|f| xray_proto::xray::proxy::freedom::Fragment {
+                packets_from: f.packets_from,
+                packets_to: f.packets_to,
+                length_min: f.length_min,
+                length_max: f.length_max,
+                interval_min: f.interval_min,
+                interval_max: f.interval_max,
+                max_split_min: f.max_split_min,
+                max_split_max: f.max_split_max,
             }),
             proxy_protocol: self.proxy_protocol,
             noises: self
@@ -553,11 +527,9 @@ impl Config {
                     networks: r.networks.clone(),
                     port_list: r.port_list.clone(),
                     ip: r.ip.clone(),
-                    block_delay: r.block_delay.map(|b| {
-                        xray_proto::xray::proxy::freedom::Range {
-                            min: b.min,
-                            max: b.max,
-                        }
+                    block_delay: r.block_delay.map(|b| xray_proto::xray::proxy::freedom::Range {
+                        min: b.min,
+                        max: b.max,
                     }),
                 })
                 .collect(),
@@ -744,17 +716,14 @@ fn build_ip_matcher_from_rules(
     let cidrs: Vec<xray_geodata::pb::Cidr> = rules
         .iter()
         .filter_map(|r| match &r.value {
-            Some(ip_rule::Value::Custom(c)) => {
-                c.cidr.as_ref().map(|cidr| xray_geodata::pb::Cidr::new(cidr.ip.clone(), cidr.prefix))
-            }
+            Some(ip_rule::Value::Custom(c)) => c
+                .cidr
+                .as_ref()
+                .map(|cidr| xray_geodata::pb::Cidr::new(cidr.ip.clone(), cidr.prefix)),
             _ => None,
         })
         .collect();
-    if cidrs.is_empty() {
-        None
-    } else {
-        Some(Arc::new(HeuristicIPMatcher::from_cidrs(&cidrs)))
-    }
+    if cidrs.is_empty() { None } else { Some(Arc::new(HeuristicIPMatcher::from_cidrs(&cidrs))) }
 }
 
 /// 缓存的私有 IP matcher（从 [`DEFAULT_BLOCK_PRIVATE_CIDRS`] 构建）。
@@ -776,7 +745,8 @@ pub fn private_ip_matcher() -> Arc<dyn IPMatcher> {
 ///
 /// 对应 Go `getDefaultFinalRule`：
 /// - `"vless-reverse"` → 阻止所有
-/// - `"vless"` / `"vmess"` / `"trojan"` / `"hysteria"` / `"wireguard"` / `"shadowsocks*"` → 阻止私有
+/// - `"vless"` / `"vmess"` / `"trojan"` / `"hysteria"` / `"wireguard"` / `"shadowsocks*"` →
+///   阻止私有
 /// - 其他 → None（不应用默认规则）
 #[must_use]
 pub fn get_default_rule_type(inbound_name: &str) -> Option<DefaultRuleType> {
@@ -784,7 +754,7 @@ pub fn get_default_rule_type(inbound_name: &str) -> Option<DefaultRuleType> {
         "vless-reverse" => Some(DefaultRuleType::BlockAll),
         "vless" | "vmess" | "trojan" | "hysteria" | "wireguard" => {
             Some(DefaultRuleType::BlockPrivate)
-        }
+        },
         other if other.starts_with("shadowsocks") => Some(DefaultRuleType::BlockPrivate),
         _ => None,
     }
@@ -841,8 +811,7 @@ pub fn is_blocked_by_rules(
     default_rule: Option<&FinalRule>,
     dest: &Destination,
 ) -> bool {
-    match_final_rules(rules, default_rule, dest)
-        .is_some_and(|r| r.action == RuleAction::Block)
+    match_final_rules(rules, default_rule, dest).is_some_and(|r| r.action == RuleAction::Block)
 }
 
 /// finalRule Block 预检的域名解析（Go v26.9.9 `Process` :294-329，#6058）。
@@ -869,7 +838,7 @@ pub async fn resolve_ips_for_rules(
                     tracing::debug!(domain, error = %e, "freedom: LookupForIP failed, skip finalRule pre-check");
                     Ok(Vec::new())
                 }
-            }
+            },
         };
     }
     // Go :315-318：系统 resolver（AsIs）；失败记日志、空表继续
@@ -878,7 +847,7 @@ pub async fn resolve_ips_for_rules(
         Err(e) => {
             tracing::debug!(domain, error = %e, "freedom: system resolve failed, skip finalRule pre-check");
             Ok(Vec::new())
-        }
+        },
     }
 }
 
@@ -910,11 +879,7 @@ pub fn apply_destination_override(
             address = new_addr;
         }
     }
-    let port = if server.port != 0 {
-        Port::new(server.port as u16)
-    } else {
-        dest.port()
-    };
+    let port = if server.port != 0 { Port::new(server.port as u16) } else { dest.port() };
     Destination::new(address, port, dest.network())
 }
 
@@ -933,9 +898,7 @@ fn ip_or_domain_to_address(iod: &xray_proto::xray::common::net::IpOrDomain) -> O
     match iod.address.as_ref()? {
         IoD::Ip(bytes) => match bytes.as_slice() {
             [a, b, c, d] => Some(Address::IPv4(Ipv4Addr::new(*a, *b, *c, *d))),
-            b16 => Some(Address::IPv6(Ipv6Addr::from_octets(
-                b16.try_into().ok()?,
-            ))),
+            b16 => Some(Address::IPv6(Ipv6Addr::from_octets(b16.try_into().ok()?))),
         },
         IoD::Domain(d) => Some(Address::Domain(d.clone())),
     }
@@ -944,11 +907,7 @@ fn ip_or_domain_to_address(iod: &xray_proto::xray::common::net::IpOrDomain) -> O
 /// 黑洞：drain 上游输入直到 `block_delay(rule)` 超时，随后关闭下游。
 ///
 /// 对应 Go `Process` blockedDest 分支 :352-366——不拨号，慢速丢弃防探测。
-pub(crate) async fn blackhole_link(
-    link: xray_transport::link::Link,
-    tag: &str,
-    rule: &FinalRule,
-) {
+pub(crate) async fn blackhole_link(link: xray_transport::link::Link, tag: &str, rule: &FinalRule) {
     let delay = block_delay(rule);
     tracing::info!(
         tag = %tag,
@@ -1093,11 +1052,8 @@ mod tests {
 
     #[test]
     fn build_rule_empty_networks_allows_all() {
-        let cfg = FinalRuleConfig {
-            action: RuleAction::Block,
-            networks: vec![],
-            ..Default::default()
-        };
+        let cfg =
+            FinalRuleConfig { action: RuleAction::Block, networks: vec![], ..Default::default() };
         let rule = FinalRule::build(&cfg).unwrap();
         assert!(rule.network.iter().all(|&v| v));
     }
@@ -1151,9 +1107,7 @@ mod tests {
         let rule = FinalRule {
             action: RuleAction::Allow,
             network: ALL_NETWORKS,
-            port: Some(MemoryPortList::new(vec![
-                PortRange::new(Port::new(80), Port::new(80)),
-            ])),
+            port: Some(MemoryPortList::new(vec![PortRange::new(Port::new(80), Port::new(80))])),
             ip: None,
             block_delay: None,
         };
@@ -1217,10 +1171,7 @@ mod tests {
             rule.apply(0, 80, Some("169.254.1.1".parse().unwrap())),
             "169.254.1.1 link-local should be blocked"
         );
-        assert!(
-            rule.apply(0, 80, Some("::1".parse().unwrap())),
-            "::1 should be blocked"
-        );
+        assert!(rule.apply(0, 80, Some("::1".parse().unwrap())), "::1 should be blocked");
     }
 
     #[test]
@@ -1259,10 +1210,7 @@ mod tests {
             networks: vec![],
             ip: vec![IpRule {
                 value: Some(ip_rule::Value::Custom(CidrRule {
-                    cidr: Some(Cidr {
-                        ip: vec![8, 8, 8, 0],
-                        prefix: 24,
-                    }),
+                    cidr: Some(Cidr { ip: vec![8, 8, 8, 0], prefix: 24 }),
                     reverse_match: false,
                 })),
             }],
@@ -1278,22 +1226,10 @@ mod tests {
 
     #[test]
     fn default_rule_for_known_protocols() {
-        assert_eq!(
-            get_default_rule_type("vless-reverse"),
-            Some(DefaultRuleType::BlockAll)
-        );
-        assert_eq!(
-            get_default_rule_type("vless"),
-            Some(DefaultRuleType::BlockPrivate)
-        );
-        assert_eq!(
-            get_default_rule_type("vmess"),
-            Some(DefaultRuleType::BlockPrivate)
-        );
-        assert_eq!(
-            get_default_rule_type("trojan"),
-            Some(DefaultRuleType::BlockPrivate)
-        );
+        assert_eq!(get_default_rule_type("vless-reverse"), Some(DefaultRuleType::BlockAll));
+        assert_eq!(get_default_rule_type("vless"), Some(DefaultRuleType::BlockPrivate));
+        assert_eq!(get_default_rule_type("vmess"), Some(DefaultRuleType::BlockPrivate));
+        assert_eq!(get_default_rule_type("trojan"), Some(DefaultRuleType::BlockPrivate));
         assert_eq!(
             get_default_rule_type("shadowsocks-aes-256-gcm"),
             Some(DefaultRuleType::BlockPrivate)
@@ -1328,10 +1264,7 @@ mod tests {
 
     #[test]
     fn proto_roundtrip_minimal() {
-        let cfg = Config {
-            user_level: 3,
-            ..Default::default()
-        };
+        let cfg = Config { user_level: 3, ..Default::default() };
         let proto = cfg.to_proto();
         let cfg2 = Config::from_proto(proto).unwrap();
         assert_eq!(cfg, cfg2);
@@ -1417,17 +1350,9 @@ mod tests {
         assert_eq!(cfg.networks.len(), 2);
         let rule = FinalRule::build(&cfg).unwrap();
         // 10.x UDP 53 → 命中
-        assert!(rule.apply(
-            network_index(Network::UDP),
-            53,
-            Some("10.1.2.3".parse().unwrap())
-        ));
+        assert!(rule.apply(network_index(Network::UDP), 53, Some("10.1.2.3".parse().unwrap())));
         // 8.8.8.8 → 不在 IP 段 → 不命中
-        assert!(!rule.apply(
-            network_index(Network::UDP),
-            53,
-            Some("8.8.8.8".parse().unwrap())
-        ));
+        assert!(!rule.apply(network_index(Network::UDP), 53, Some("8.8.8.8".parse().unwrap())));
         // 裸 IP → /32；端口不在列表 → 不命中
         assert!(!rule.apply(
             network_index(Network::TCP),

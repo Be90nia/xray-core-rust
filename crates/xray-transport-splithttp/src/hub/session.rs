@@ -9,11 +9,9 @@
 //! 未到达，会话被自动清理；GET 到达后标记 `is_fully_connected`，生命周期与
 //! GET 连接绑定。
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
-use tokio::sync::Mutex;
-use tokio::time::Duration;
+use tokio::{sync::Mutex, time::Duration};
 
 use crate::upload_queue::UploadQueue;
 
@@ -56,9 +54,7 @@ pub struct SessionMap {
 impl SessionMap {
     /// 构造空会话表。
     pub fn new() -> Self {
-        Self {
-            inner: Mutex::new(HashMap::new()),
-        }
+        Self { inner: Mutex::new(HashMap::new()) }
     }
 
     /// 获取已有会话（不创建）。用于 GET 标记 fully_connected。

@@ -8,11 +8,13 @@
 //! CommonConn/VisionConn 修掉的模式），跨窗口背压下 waker 丢失即挂死——
 //! timeout 兜底防止挂死整个测试套件。
 
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio_rustls::rustls::{ClientConfig, ServerConfig};
@@ -30,6 +32,7 @@ where
     fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(None)
     }
+
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(None)
     }
@@ -81,10 +84,7 @@ fn rustls_server_config(cert_der: &[u8], key_der: &[u8]) -> ServerConfig {
     let key = rustls_pki_types::PrivateKeyDer::try_from(key_der.to_vec()).unwrap();
     ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(
-            vec![rustls_pki_types::CertificateDer::from(cert_der.to_vec())],
-            key,
-        )
+        .with_single_cert(vec![rustls_pki_types::CertificateDer::from(cert_der.to_vec())], key)
         .unwrap()
 }
 
@@ -122,9 +122,13 @@ where
             }
         };
         tokio::join!(
-            async { a_w.write_all(payload).await.unwrap(); },
+            async {
+                a_w.write_all(payload).await.unwrap();
+            },
             rx_a,
-            async { b_w.write_all(payload).await.unwrap(); },
+            async {
+                b_w.write_all(payload).await.unwrap();
+            },
             rx_b,
         );
     })
@@ -139,12 +143,8 @@ async fn duplex_rustls_512k_bulk_stress() {
     let (cert_der, key_der) = self_signed_der();
     let sc = rustls_server_config(&cert_der, &key_der);
     let mut roots = tokio_rustls::rustls::RootCertStore::empty();
-    roots
-        .add(rustls_pki_types::CertificateDer::from(cert_der))
-        .unwrap();
-    let cc = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    roots.add(rustls_pki_types::CertificateDer::from(cert_der)).unwrap();
+    let cc = ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
 
     let (a, b) = tokio::io::duplex(64 * 1024);
     let (sa, sb) = tokio::join!(

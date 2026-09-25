@@ -3,17 +3,21 @@
 //! IO 边界 stub：实际 UDP hub bind + TLS server 留 trait 注入。
 //! 核心会话路由逻辑（OnReceive + sessions map）可测。
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::{Arc, Weak};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, Weak},
+};
 
 use parking_lot::Mutex;
 
-use crate::connection::{ConnMetadata, Connection, ConnectionCloser};
-use crate::error::Result;
-use crate::io::PacketReader;
-use crate::output::SegmentWriter;
-use crate::segment::Command;
+use crate::{
+    connection::{ConnMetadata, Connection, ConnectionCloser},
+    error::Result,
+    io::PacketReader,
+    output::SegmentWriter,
+    segment::Command,
+};
 
 /// 会话标识（对应 Go `ConnectionID`）。
 ///
@@ -91,10 +95,7 @@ impl Listener {
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak| Self {
             self_weak: weak.clone(),
-            inner: Mutex::new(ListenerInner {
-                sessions: HashMap::new(),
-                closed: false,
-            }),
+            inner: Mutex::new(ListenerInner { sessions: HashMap::new(), closed: false }),
             hub,
             reader,
             config,
@@ -133,21 +134,13 @@ impl Listener {
                     self.self_weak.clone(),
                 ));
                 let closer = writer.clone();
-                let meta = ConnMetadata {
-                    conv,
-                    local_addr: local,
-                    remote_addr: Some(src),
-                };
-                let new_conn = Arc::new(Connection::new(
-                    meta,
-                    writer,
-                    closer,
-                    Arc::clone(&self.config),
-                ));
+                let meta = ConnMetadata { conv, local_addr: local, remote_addr: Some(src) };
+                let new_conn =
+                    Arc::new(Connection::new(meta, writer, closer, Arc::clone(&self.config)));
                 self.add_conn.add_conn(Arc::clone(&new_conn));
                 inner.sessions.insert(id, Arc::clone(&new_conn));
                 new_conn
-            }
+            },
         };
         drop(inner);
 
@@ -241,10 +234,13 @@ impl ConnectionCloser for ListenerWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::config::default_config;
-    use crate::segment::{CmdOnlySegment, DataSegment, Segment};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::{
+        config::default_config,
+        segment::{CmdOnlySegment, DataSegment, Segment},
+    };
 
     /// Mock hub：预填包队列，写计数。
     struct MockHub {
@@ -261,6 +257,7 @@ mod tests {
                 closed: AtomicUsize::new(0),
             })
         }
+
         fn push(&self, payload: Vec<u8>, src: SocketAddr) {
             self.incoming.lock().push((payload, src));
         }
@@ -270,13 +267,16 @@ mod tests {
         fn receive(&self) -> Option<(Vec<u8>, SocketAddr)> {
             self.incoming.lock().pop()
         }
+
         fn write_to(&self, _payload: &[u8], _dest: SocketAddr) -> std::io::Result<()> {
             self.written.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+
         fn close(&self) {
             self.closed.fetch_add(1, Ordering::SeqCst);
         }
+
         fn local_addr(&self) -> Option<SocketAddr> {
             None
         }
@@ -288,10 +288,7 @@ mod tests {
     }
     impl CountingHandler {
         fn new() -> Arc<Self> {
-            Arc::new(Self {
-                count: AtomicUsize::new(0),
-                conns: Mutex::new(Vec::new()),
-            })
+            Arc::new(Self { count: AtomicUsize::new(0), conns: Mutex::new(Vec::new()) })
         }
     }
     impl ConnHandler for CountingHandler {

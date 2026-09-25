@@ -2,10 +2,7 @@ use std::path::{Path, PathBuf};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
-    let proto_dir: PathBuf = Path::new(&manifest)
-        .join("..")
-        .join("..")
-        .join("protos");
+    let proto_dir: PathBuf = Path::new(&manifest).join("..").join("..").join("protos");
 
     let mut proto_files: Vec<PathBuf> = Vec::new();
     collect_protos(&proto_dir, &mut proto_files)?;
@@ -35,8 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .compile_protos(&proto_paths, &[&proto_dir])?;
     } else {
-        prost_build::Config::new()
-            .compile_protos(&proto_paths, &[&proto_dir])?;
+        prost_build::Config::new().compile_protos(&proto_paths, &[&proto_dir])?;
     }
 
     Ok(())

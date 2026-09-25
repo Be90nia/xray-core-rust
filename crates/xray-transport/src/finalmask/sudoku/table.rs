@@ -12,11 +12,12 @@
 //! 5. 用 password 的 SHA256 作 seed shuffle 288 grids，byte b → grid order[b]
 //! 6. 三种 layout（Entropy/Ascii/Custom）决定 group 如何映射到线上字节
 
-use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::{Arc, OnceLock},
+};
 
-use rand::seq::SliceRandom;
-use rand::SeedableRng;
+use rand::{SeedableRng, seq::SliceRandom};
 use ring::digest;
 
 /// 4×4 数独网格（16 格，值为 1-4）。
@@ -135,11 +136,7 @@ impl EntropyLayout {
     }
 
     fn decode_group(&self, b: u8) -> Option<u8> {
-        if b & 0x90 != 0 {
-            None
-        } else {
-            Some(((b >> 1) & 0x30) | (b & 0x0f))
-        }
+        if b & 0x90 != 0 { None } else { Some(((b >> 1) & 0x30) | (b & 0x0f)) }
     }
 }
 
@@ -162,11 +159,7 @@ impl AsciiLayout {
     fn encode_group(&self, group: u8) -> u8 {
         let b = 0x40 | (group & 0x3f);
         // 0x7f (DEL) 映射为 '\n' 避免线上出现 DEL
-        if b == 0x7f {
-            b'\n'
-        } else {
-            b
-        }
+        if b == 0x7f { b'\n' } else { b }
     }
 
     fn decode_group(&self, b: u8) -> Option<u8> {
@@ -217,7 +210,9 @@ impl CustomLayout {
             for val in 0u8..4 {
                 for pos in 0u8..16 {
                     let group = (val << 4) | pos;
-                    let b = encode_group_with_drop_x(group, &x_bits, &p_bits, &v_bits, x_mask, drop as i8);
+                    let b = encode_group_with_drop_x(
+                        group, &x_bits, &p_bits, &v_bits, x_mask, drop as i8,
+                    );
                     if b.count_ones() >= 5 {
                         padding_set.insert(b);
                     }
@@ -267,7 +262,8 @@ impl CustomLayout {
 
 /// customLayout 的编码核心（对应 Go `encodeGroupWithDropX` 闭包）。
 ///
-/// `drop_x < 0` 表示不丢弃任何 x bit（正常编码）；`drop_x >= 0` 表示丢弃第 `drop_x` 个 x bit（用于生成 padding）。
+/// `drop_x < 0` 表示不丢弃任何 x bit（正常编码）；`drop_x >= 0` 表示丢弃第 `drop_x` 个 x
+/// bit（用于生成 padding）。
 fn encode_group_with_drop_x(
     group: u8,
     x_bits: &[u8],
@@ -451,12 +447,8 @@ fn build_base_patterns() -> Result<Vec<Vec<[u8; 4]>>, String> {
 
 /// 规范化 customTable 模板（对应 Go `normalizeCustomTable`）。
 fn normalize_custom_table(pattern: &str) -> Result<String, String> {
-    let cleaned: String = pattern
-        .trim()
-        .to_lowercase()
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
+    let cleaned: String =
+        pattern.trim().to_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
     if cleaned.len() != 8 {
         return Err(format!("customTable must be 8 chars, got {}", cleaned.len()));
     }
@@ -512,11 +504,8 @@ fn build_table(password: &str, layout: Layout) -> Result<Table, String> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed as u64);
     order.shuffle(&mut rng);
 
-    let mut t = Table {
-        encode: vec![Vec::new(); 256],
-        decode: HashMap::with_capacity(1 << 16),
-        layout,
-    };
+    let mut t =
+        Table { encode: vec![Vec::new(); 256], decode: HashMap::with_capacity(1 << 16), layout };
 
     for b in 0u32..256 {
         let pat_list = &patterns[order[b as usize]];
@@ -579,11 +568,8 @@ fn normalized_custom_patterns(
     let mut seen = std::collections::HashSet::new();
     for raw in raw_patterns {
         let trimmed = raw.trim();
-        let normalized = if trimmed.is_empty() {
-            String::new()
-        } else {
-            normalize_custom_table(trimmed)?
-        };
+        let normalized =
+            if trimmed.is_empty() { String::new() } else { normalize_custom_table(trimmed)? };
         if seen.insert(normalized.clone()) {
             patterns.push(normalized);
         }
@@ -607,11 +593,7 @@ pub(crate) fn get_tables(
     let mode = normalize_ascii(ascii)?;
     let patterns = normalized_custom_patterns(custom_tables, mode)?;
 
-    let key = TableCacheKey {
-        password: password.to_string(),
-        mode,
-        patterns: patterns.clone(),
-    };
+    let key = TableCacheKey { password: password.to_string(), mode, patterns: patterns.clone() };
 
     // 检查缓存
     {

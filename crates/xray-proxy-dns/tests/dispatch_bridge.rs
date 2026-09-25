@@ -13,11 +13,11 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
-use hickory_resolver::proto::op::{Message as HickoryMessage, MessageType, OpCode, ResponseCode};
-use hickory_resolver::proto::rr::rdata::A;
-use hickory_resolver::proto::rr::{RData, Record};
+use hickory_resolver::proto::{
+    op::{Message as HickoryMessage, MessageType, OpCode, ResponseCode},
+    rr::{RData, Record, rdata::A},
+};
 use tokio::net::UdpSocket;
-
 use xray_proxy_dns::{Config, DnsInbound, DnsOutbound, Handler};
 
 fn make_query_bytes(domain: &str, q_type: u16) -> Vec<u8> {
@@ -104,11 +104,7 @@ async fn dns_inbound_without_rules_delegates_to_outbound() {
         if let Some(q) = req.queries.first().cloned() {
             let name = q.name().clone();
             resp.add_query(q);
-            resp.add_answer(Record::from_rdata(
-                name,
-                300,
-                RData::A(A(Ipv4Addr::new(5, 6, 7, 8))),
-            ));
+            resp.add_answer(Record::from_rdata(name, 300, RData::A(A(Ipv4Addr::new(5, 6, 7, 8)))));
         }
         let bytes = resp.to_vec().expect("serialize");
         sock.send_to(&bytes, client).await.expect("send");
@@ -127,11 +123,8 @@ async fn dns_inbound_without_rules_delegates_to_outbound() {
 
     // example.com 不匹配 → Direct → 上游 → 5.6.7.8
     let query = make_query_bytes("example.com", 1);
-    let response = inbound
-        .handle_packet(&query)
-        .await
-        .expect("dispatch")
-        .expect("Direct returns Some");
+    let response =
+        inbound.handle_packet(&query).await.expect("dispatch").expect("Direct returns Some");
     let parsed = HickoryMessage::from_vec(&response).expect("parse");
     let found = parsed.answers.iter().any(|r| match &r.data {
         RData::A(A(ip)) => *ip == Ipv4Addr::new(5, 6, 7, 8),

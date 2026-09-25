@@ -53,14 +53,7 @@ impl Packet {
     /// 构造非分片 Packet（最常见路径）。
     #[must_use]
     pub fn new(assoc_id: u16, pkt_id: u16, addr: Address, data: Bytes) -> Self {
-        Self {
-            assoc_id,
-            pkt_id,
-            frag_total: 1,
-            frag_id: 0,
-            addr,
-            data,
-        }
+        Self { assoc_id, pkt_id, frag_total: 1, frag_id: 0, addr, data }
     }
 
     /// 序列化（不含 VER + TYPE，由调用方先写）。
@@ -116,14 +109,7 @@ impl Packet {
         let mut data = vec![0u8; size];
         buf.copy_to_slice(&mut data);
         // Vec → Bytes 零拷贝（所有权 move，非 copy_from_slice）
-        Ok(Self {
-            assoc_id,
-            pkt_id,
-            frag_total,
-            frag_id,
-            addr,
-            data: Bytes::from(data),
-        })
+        Ok(Self { assoc_id, pkt_id, frag_total, frag_id, addr, data: Bytes::from(data) })
     }
 }
 
@@ -205,10 +191,7 @@ impl FragmentAssembler {
                     data.extend_from_slice(f);
                 }
             }
-            let addr = self
-                .first_addr
-                .take()
-                .unwrap_or(crate::protocol::address::Address::None);
+            let addr = self.first_addr.take().unwrap_or(crate::protocol::address::Address::None);
             let completed = Packet {
                 assoc_id: self.assoc_id,
                 pkt_id: self.pkt_id,
@@ -229,9 +212,10 @@ impl FragmentAssembler {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use super::*;
     use crate::protocol::VERSION;
-    use std::net::Ipv4Addr;
 
     fn roundtrip(pkt: &Packet) {
         // 完整序列化：VER + TYPE + 负载
@@ -363,10 +347,7 @@ mod tests {
         assert_eq!(r.assoc_id, 1);
         assert_eq!(&r.data[..], b"AAABBBCCC");
         // 首片 addr 应保留
-        assert_eq!(
-            r.addr,
-            Address::Ipv4(Ipv4Addr::new(8, 8, 8, 8), 53)
-        );
+        assert_eq!(r.addr, Address::Ipv4(Ipv4Addr::new(8, 8, 8, 8), 53));
     }
 
     #[test]

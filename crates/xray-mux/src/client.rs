@@ -12,23 +12,30 @@
 //! - [`ClientWorkerFactory`]: Worker 工厂 trait
 //! - [`DialingWorkerFactory`]: 拨号式 Worker 工厂
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
-use tokio::sync::{watch, Mutex};
-use tokio::time::Duration;
+use tokio::{
+    sync::{Mutex, watch},
+    time::Duration,
+};
 use tracing::debug;
-use xray_buf::buffer::Buffer;
-use xray_buf::io::{Reader, Writer};
-use xray_buf::multi::MultiBuffer;
-use xray_buf::reader::BufferedReader;
-use xray_buf::writer::BufferedWriter;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
+use xray_buf::{
+    buffer::Buffer,
+    io::{Reader, Writer},
+    multi::MultiBuffer,
+    reader::BufferedReader,
+    writer::BufferedWriter,
+};
+use xray_common::net::{destination::Destination, network::Network};
 
-use crate::frame::{FrameMetadata, SessionStatus, MAX_METADATA_LEN};
-use crate::session::{ClientStrategy, Session, SessionManager, TransferType};
-use crate::writer::{MuxWriter, SharedWriter};
+use crate::{
+    frame::{FrameMetadata, MAX_METADATA_LEN, SessionStatus},
+    session::{ClientStrategy, Session, SessionManager, TransferType},
+    writer::{MuxWriter, SharedWriter},
+};
 
 // ========== 常量 ==========
 
@@ -251,7 +258,7 @@ impl WorkerPicker for IncrementalWorkerPicker {
                     return Some(workers[idx].clone());
                 }
                 None
-            }
+            },
             Err(_) => None,
         }
     }
@@ -366,8 +373,7 @@ impl ClientWorker {
     /// 创建 mux 目标地址（v1.mux.cool:9527）。
     #[must_use]
     pub fn mux_destination() -> Destination {
-        use xray_common::net::address::Address;
-        use xray_common::net::port::Port;
+        use xray_common::net::{address::Address, port::Port};
         Destination::new(
             Address::new_domain(MUX_COOL_ADDRESS),
             Port::new(MUX_COOL_PORT),
@@ -425,7 +431,9 @@ impl ClientWorker {
         let s = Arc::clone(&session);
         let writer_slot = Arc::clone(&self.link_writer);
         let target = dest.clone();
-        tokio::spawn(async move { Self::fetch_input(s, target, writer_slot, global_id, inbound).await });
+        tokio::spawn(
+            async move { Self::fetch_input(s, target, writer_slot, global_id, inbound).await },
+        );
 
         wait_done(session.done_receiver()).await;
         true
@@ -491,15 +499,15 @@ impl ClientWorker {
                     session.add_uplink_bytes(mb.len() as u64);
                 }
                 errored = writer.write(mb).await.is_err();
-            }
+            },
             First::Probe => {
                 errored = writer.write(MultiBuffer::new()).await.is_err();
-            }
+            },
             First::Abort => {
                 // Go fetchInput（client.go:276-279）：首包前读失败（含 EOF）→
                 // hasError=true，End 帧 option=0x02 传播线级异常
                 writer.set_error();
-            }
+            },
         }
 
         if !errored {
@@ -519,7 +527,7 @@ impl ClientWorker {
                             writer.set_error();
                         }
                         break;
-                    }
+                    },
                     None => break,
                 };
                 if mb.is_empty() {
@@ -559,17 +567,17 @@ impl ClientWorker {
 
             match meta.session_status() {
                 // 数据已随帧读出，丢弃即可（Go: Copy(NewStreamReader, Discard)）
-                SessionStatus::KeepAlive | SessionStatus::New => {}
+                SessionStatus::KeepAlive | SessionStatus::New => {},
                 SessionStatus::End => {
                     if let Some(session) = self.session_manager.get(meta.session_id()).await {
                         session.close().await;
                     }
-                }
+                },
                 SessionStatus::Keep => {
                     if self.handle_status_keep(&meta, data).await {
                         break;
                     }
-                }
+                },
             }
         }
         // Go fetchOutput defer: done.Close()
@@ -727,11 +735,7 @@ async fn read_exact_buffer(
             reader.read(&mut spare[..n - off]).await
         };
         if got == 0 {
-            return Err(if off == 0 {
-                String::new()
-            } else {
-                format!("EOF at offset {off}/{n}")
-            });
+            return Err(if off == 0 { String::new() } else { format!("EOF at offset {off}/{n}") });
         }
         dst.advance_write(got);
         off += got;
@@ -768,10 +772,7 @@ impl DialingWorkerFactory {
         underlying: Arc<dyn xray_app_dispatcher::DispatchHandler>,
         strategy: ClientStrategy,
     ) -> Self {
-        Self {
-            strategy,
-            underlying: Arc::new(parking_lot::RwLock::new(Some(underlying))),
-        }
+        Self { strategy, underlying: Arc::new(parking_lot::RwLock::new(Some(underlying))) }
     }
 
     /// 以共享槽创建（延迟注入底层 handler，注册流程 Phase 2 用）。
@@ -785,19 +786,13 @@ impl DialingWorkerFactory {
 impl ClientWorkerFactory for DialingWorkerFactory {
     async fn create(&self) -> Arc<ClientWorker> {
         // Go client.go:139 pipe.WithSizeLimit(64 * 1024) × 2
-        let option = xray_buf::pipe::PipeOption {
-            limit: 64 * 1024,
-            ..Default::default()
-        };
+        let option = xray_buf::pipe::PipeOption { limit: 64 * 1024, ..Default::default() };
         let (uplink_reader, uplink_writer) = xray_buf::pipe::new_with_option(option);
         let (downlink_reader, downlink_writer) = xray_buf::pipe::new_with_option(option);
 
         // Go client.go:143-146 NewClientWorker(Link{downlinkReader, upLinkWriter})
         let worker = ClientWorker::new(
-            Link {
-                reader: Box::new(downlink_reader),
-                writer: Box::new(uplink_writer.clone()),
-            },
+            Link { reader: Box::new(downlink_reader), writer: Box::new(uplink_writer.clone()) },
             self.strategy.clone(),
         );
 
@@ -855,19 +850,15 @@ pub enum ClientError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
     use xray_buf::pipe;
+
+    use super::*;
     /// 回环 carrier 的测试 worker（carrier 管道两端都在 worker 内闭合）。
     fn loop_worker(strategy: ClientStrategy) -> Arc<ClientWorker> {
         let (r, w) = pipe::new();
-        ClientWorker::new(
-            Link {
-                reader: Box::new(r),
-                writer: Box::new(w),
-            },
-            strategy,
-        )
+        ClientWorker::new(Link { reader: Box::new(r), writer: Box::new(w) }, strategy)
     }
 
     /// 空底层 handler（dispatch 立即返回 = carrier 立即断开）。
@@ -877,6 +868,7 @@ mod tests {
         fn tag(&self) -> &str {
             "nop"
         }
+
         fn dispatch(
             &self,
             _dest: &Destination,
@@ -910,10 +902,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_worker_is_closing_with_max_connection() {
-        let strategy = ClientStrategy {
-            max_concurrency: 0,
-            max_connection: 1,
-        };
+        let strategy = ClientStrategy { max_concurrency: 0, max_connection: 1 };
         let worker = loop_worker(strategy);
         assert!(!worker.is_closing()); // count=0 < max_connection=1
     }
@@ -944,10 +933,7 @@ mod tests {
 
     #[test]
     fn test_dialing_worker_factory() {
-        let strategy = ClientStrategy {
-            max_concurrency: 10,
-            max_connection: 5,
-        };
+        let strategy = ClientStrategy { max_concurrency: 10, max_connection: 5 };
         let factory = DialingWorkerFactory::new(Arc::new(NopUnderlying), strategy);
         assert_eq!(factory.strategy.max_concurrency, 10);
     }
@@ -1010,9 +996,7 @@ mod tests {
         async fn create(&self) -> Arc<ClientWorker> {
             self.create_started.notify_waiters();
             self.create_can_finish.notified().await;
-            DialingWorkerFactory::new(Arc::new(NopUnderlying), self.strategy.clone())
-                .create()
-                .await
+            DialingWorkerFactory::new(Arc::new(NopUnderlying), self.strategy.clone()).create().await
         }
     }
 
@@ -1056,10 +1040,7 @@ mod tests {
     #[test]
     fn test_client_error_display() {
         assert_eq!(format!("{}", ClientError::MuxDisabled), "mux is not enabled");
-        assert_eq!(
-            format!("{}", ClientError::NoAvailableWorker),
-            "no available worker"
-        );
+        assert_eq!(format!("{}", ClientError::NoAvailableWorker), "no available worker");
     }
 
     #[test]
@@ -1080,10 +1061,7 @@ mod tests {
     ) -> Vec<u8> {
         let (req_rd, req_wr) = pipe::new();
         let (resp_rd, resp_wr) = pipe::new();
-        let link = Link {
-            reader: Box::new(req_rd),
-            writer: Box::new(resp_wr),
-        };
+        let link = Link { reader: Box::new(req_rd), writer: Box::new(resp_wr) };
         let w = Arc::clone(worker);
         let dest = dest.clone();
         let handle = tokio::spawn(async move { w.dispatch(&dest, link).await });
@@ -1091,9 +1069,7 @@ mod tests {
         let mut req_wr = req_wr;
         let mut resp_rd = resp_rd;
         req_wr
-            .write_multi_buffer(MultiBuffer::from_buffer(Buffer::from_vec(
-                payload.to_vec(),
-            )))
+            .write_multi_buffer(MultiBuffer::from_buffer(Buffer::from_vec(payload.to_vec())))
             .await
             .expect("write request");
 
@@ -1143,16 +1119,13 @@ mod tests {
                                 if w.write_multi_buffer(mb).await.is_err() {
                                     break;
                                 }
-                            }
+                            },
                             Err(_) => break,
                         }
                     }
                     let _ = w.close();
                 });
-                Ok(Link {
-                    reader: Box::new(r_down),
-                    writer: Box::new(w_up),
-                })
+                Ok(Link { reader: Box::new(r_down), writer: Box::new(w_up) })
             }
         }
 
@@ -1169,6 +1142,7 @@ mod tests {
             fn tag(&self) -> &str {
                 "e2e-carrier"
             }
+
             fn dispatch(
                 &self,
                 _dest: &Destination,
@@ -1189,15 +1163,10 @@ mod tests {
 
         let server = Arc::new(ServerWorker::new(Arc::new(EchoDispatcher)));
         let underlying: Arc<dyn xray_app_dispatcher::DispatchHandler> =
-            Arc::new(CarrierHandler {
-                server: Arc::clone(&server),
-            });
+            Arc::new(CarrierHandler { server: Arc::clone(&server) });
 
         // ---- 客户端：factory → picker → worker（单 carrier）----
-        let factory = Arc::new(DialingWorkerFactory::new(
-            underlying,
-            ClientStrategy::default(),
-        ));
+        let factory = Arc::new(DialingWorkerFactory::new(underlying, ClientStrategy::default()));
         let picker = IncrementalWorkerPicker::new(factory);
         let worker = picker.pick_internal().await.expect("worker created");
 
@@ -1246,20 +1215,14 @@ mod tests {
                 .await
                 .expect("write banner");
                 let _ = w.close();
-                Ok(Link {
-                    reader: Box::new(r_down),
-                    writer: Box::new(up_w),
-                })
+                Ok(Link { reader: Box::new(r_down), writer: Box::new(up_w) })
             }
         }
 
         let (c_read, s_write) = pipe::new(); // server → client
         let (s_read, c_write) = pipe::new(); // client → server
         let client = ClientWorker::new(
-            Link {
-                reader: Box::new(c_read),
-                writer: Box::new(c_write),
-            },
+            Link { reader: Box::new(c_read), writer: Box::new(c_write) },
             ClientStrategy::default(),
         );
 
@@ -1292,14 +1255,7 @@ mod tests {
         let w = Arc::clone(&client);
         let d = dest.clone();
         let dispatch_task = tokio::spawn(async move {
-            w.dispatch(
-                &d,
-                Link {
-                    reader: Box::new(req_rd),
-                    writer: Box::new(resp_wr),
-                },
-            )
-            .await
+            w.dispatch(&d, Link { reader: Box::new(req_rd), writer: Box::new(resp_wr) }).await
         });
 
         // 核心断言：客户端零 payload，服务端仍收到 New 并 dispatch
@@ -1338,10 +1294,7 @@ mod tests {
         let _ = input_w.close();
 
         let manager = SessionManager::new();
-        let session = manager
-            .allocate(&ClientStrategy::default())
-            .await
-            .expect("allocate");
+        let session = manager.allocate(&ClientStrategy::default()).await.expect("allocate");
         session.set_input(BufferedReader::new(Box::new(input_r))).await;
 
         let dest = Destination::new(
@@ -1353,13 +1306,11 @@ mod tests {
             .await;
 
         // 对拍 End 帧原始字节：len(2B)=4 + id(2B) + status=0x03 + option=0x02
-        let mb = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            carrier_r.read_multi_buffer(),
-        )
-        .await
-        .expect("End frame within timeout")
-        .expect("read ok");
+        let mb =
+            tokio::time::timeout(std::time::Duration::from_secs(2), carrier_r.read_multi_buffer())
+                .await
+                .expect("End frame within timeout")
+                .expect("read ok");
         let bytes = mb.to_vec();
         assert_eq!(bytes.len(), 6, "End 帧仅元数据：{:02X?}", bytes);
         assert_eq!(&bytes[0..2], &[0x00, 0x04], "meta 长度 4");
@@ -1378,6 +1329,7 @@ mod tests {
         fn tag(&self) -> &str {
             "hanging"
         }
+
         fn dispatch(
             &self,
             _dest: &Destination,
@@ -1414,10 +1366,7 @@ mod tests {
     /// 逐连接拨号（每连接新 TCP+TLS 握手）。
     #[tokio::test]
     async fn is_full_uses_active_sessions_not_cumulative_count() {
-        let strategy = ClientStrategy {
-            max_concurrency: 8,
-            max_connection: 0,
-        };
+        let strategy = ClientStrategy { max_concurrency: 8, max_connection: 0 };
         let worker = loop_worker(strategy.clone());
         for _ in 0..8 {
             let s = worker
@@ -1435,13 +1384,7 @@ mod tests {
         );
         let mut live = Vec::new();
         for _ in 0..8 {
-            live.push(
-                worker
-                    .session_manager()
-                    .allocate(&strategy)
-                    .await
-                    .expect("active slot"),
-            );
+            live.push(worker.session_manager().allocate(&strategy).await.expect("active slot"));
         }
         assert!(worker.is_full(), "8 active sessions → full");
     }
@@ -1450,10 +1393,7 @@ mod tests {
     /// carrier（create 计数恒 1）。旧实现累计 8 后 is_full → 每次新建 carrier。
     #[tokio::test]
     async fn twelve_short_lived_sessions_reuse_single_carrier() {
-        let strategy = ClientStrategy {
-            max_concurrency: 8,
-            max_connection: 0,
-        };
+        let strategy = ClientStrategy { max_concurrency: 8, max_connection: 0 };
         let creates = Arc::new(AtomicUsize::new(0));
         let factory = Arc::new(CountingFactory {
             inner: DialingWorkerFactory::new(Arc::new(HangingUnderlying), strategy.clone()),
@@ -1462,11 +1402,7 @@ mod tests {
         let picker = IncrementalWorkerPicker::new(factory);
         for _ in 0..12 {
             let worker = picker.pick_internal().await.expect("worker available");
-            let s = worker
-                .session_manager()
-                .allocate(&strategy)
-                .await
-                .expect("slot");
+            let s = worker.session_manager().allocate(&strategy).await.expect("slot");
             s.close().await;
         }
         assert_eq!(

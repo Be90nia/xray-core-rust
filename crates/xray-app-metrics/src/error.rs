@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn other_wraps_dynamic_error() {
-        let inner: Box<dyn std::error::Error + Send + Sync> = 
+        let inner: Box<dyn std::error::Error + Send + Sync> =
             Box::new(std::io::Error::new(std::io::ErrorKind::Other, "boom"));
         let e: MetricsError = inner.into();
         assert!(format!("{e}").contains("boom"));

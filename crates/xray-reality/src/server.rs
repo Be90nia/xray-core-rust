@@ -7,13 +7,18 @@
 //! session_id / Random / key_share（TLS 内部字段）。本实现手动解析 TLS record 字节，
 //! 仅提取 REALITY 验证需要的字段，参考 Go `common/protocol/tls/sniff.go::ReadClientHello`。
 
-use crate::error::RealityError;
-use crate::mitm::{build_server_config, generate_reality_ed25519_cert};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_rustls::server::TlsStream;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{TlsAcceptor, server::TlsStream};
+
+use crate::{
+    error::RealityError,
+    mitm::{build_server_config, generate_reality_ed25519_cert},
+};
 
 /// bd tce2：REALITY 握手成功后的 TLS 流（rustls 默认 / btls opt-in）。
 ///
@@ -196,11 +201,11 @@ fn parse_handshake(msg: &[u8]) -> Result<ParsedClientHello<'_>, RealityError> {
                 let (pub_key, mlkem_ok) = parse_key_shares(edata);
                 key_share_x25519 = pub_key;
                 key_share_mlkem768 = mlkem_ok;
-            }
+            },
             // bd frxi：alpn extension（RFC 7301）。畸形项跳过——REALITY 验证
             // 不依赖 alpn，此处只服务探测 key 推导，不必硬错。
             0x0010 if alpn_protocols.is_empty() => alpn_protocols = parse_alpn(edata),
-            _ => {}
+            _ => {},
         }
     }
     Ok(ParsedClientHello {
@@ -257,9 +262,7 @@ fn parse_sni(edata: &[u8]) -> Option<String> {
             return None;
         }
         if name_type == 0 {
-            return std::str::from_utf8(&d[3..3 + name_len])
-                .ok()
-                .map(String::from);
+            return std::str::from_utf8(&d[3..3 + name_len]).ok().map(String::from);
         }
         d = &d[3 + name_len..];
     }
@@ -278,14 +281,13 @@ fn parse_sni(edata: &[u8]) -> Option<String> {
 /// 选择逻辑逐条对齐 Go xtls/reality tls.go:214-231（t2js 修正：此前 sb6g 误
 /// 加「MLKEM 必在 / 顺序颠倒 / 重复 entry 即拒」门禁——Go 源码没有这些拒绝
 /// 分支，Go std crypto/tls 与多数 uTLS 指纹只发独立 X25519，误拒即拒真客户端）：
-/// - 独立 X25519（group 0x001D, 32B）**首选**：任一位置首遇即选中（Go 第一轮
-///   循环 `break`），其余 entry 继续扫 MLKEM；
-/// - X25519MLKEM768（group **0x11EC** = 十进制 4588；历史实现误写 0x4588
-///   ——把十进制当十六进制）取 data 末段 32B **兜底**（Go `peerPub == nil`
-///   才进第二轮），首遇即停；
+/// - 独立 X25519（group 0x001D, 32B）**首选**：任一位置首遇即选中（Go 第一轮 循环 `break`），其余
+///   entry 继续扫 MLKEM；
+/// - X25519MLKEM768（group **0x11EC** = 十进制 4588；历史实现误写 0x4588 ——把十进制当十六进制）取
+///   data 末段 32B **兜底**（Go `peerPub == nil` 才进第二轮），首遇即停；
 /// - 顺序颠倒 / 重复 entry 均无害（两轮各自 first-match-wins）；
-/// - 两类都缺 → `(None, false)`，Go `peerPub != nil` 不成立 → 不做 REALITY
-///   验证，连接 forward fallback。
+/// - 两类都缺 → `(None, false)`，Go `peerPub != nil` 不成立 → 不做 REALITY 验证，连接 forward
+///   fallback。
 fn parse_key_shares(edata: &[u8]) -> (Option<[u8; 32]>, bool) {
     if edata.len() < 2 {
         return (None, false);
@@ -349,11 +351,10 @@ const SESSION_ID_OFFSET_IN_HANDSHAKE: usize = 39;
 /// - `now_unix`: 当前 Unix 时间戳（秒）。
 /// - `max_diff`: 允许的 timestamp 偏差秒数（Go 默认 ±12h = 43200）。
 /// - `allowed_short_ids`: 允许的 short_id 白名单（每个 8 字节）。
-/// - `min_client_ver`/`max_client_ver`：fs0o REALITY 版本门控，字节字典序比较
-///   **解密 payload 前 3 字节 ClientVer**（客户端 Xray 版本，client
-///   `encode_session_id` 写入 `[0..3)`；Go xtls/reality tls.go:259-267
-///   `copy(hs.c.ClientVer[:], plainText)`。Go 端默认 `MinClientVer=[26,3,27]`
-///   即 Xray-core v26.3.27，空切片=不校验）。
+/// - `min_client_ver`/`max_client_ver`：fs0o REALITY 版本门控，字节字典序比较 **解密 payload 前 3
+///   字节 ClientVer**（客户端 Xray 版本，client `encode_session_id` 写入 `[0..3)`；Go xtls/reality
+///   tls.go:259-267 `copy(hs.c.ClientVer[:], plainText)`。Go 端默认 `MinClientVer=[26,3,27]` 即
+///   Xray-core v26.3.27，空切片=不校验）。
 pub fn verify_reality_client_hello(
     parsed: &ParsedClientHello<'_>,
     server_static_private: &[u8; 32],
@@ -363,16 +364,14 @@ pub fn verify_reality_client_hello(
     min_client_ver: &[u8],
     max_client_ver: &[u8],
 ) -> Result<(crate::crypto::SessionPayload, [u8; 32]), RealityError> {
-    // 1. 提取 client X25519 公钥：独立 X25519 entry 首选，缺席时取
-    //    X25519MLKEM768 hybrid 末段（Go tls.go:214-231 两轮首遇扫描；t2js：
-    //    Go 客户端可能只发其一，两类都缺才 NoKeyShareX25519 → forward fallback）
-    let client_pub = parsed
-        .key_share_x25519
-        .ok_or(RealityError::NoKeyShareX25519)?;
+    // 1. 提取 client X25519 公钥：独立 X25519 entry 首选，缺席时取 X25519MLKEM768 hybrid 末段（Go
+    //    tls.go:214-231 两轮首遇扫描；t2js： Go 客户端可能只发其一，两类都缺才 NoKeyShareX25519 →
+    //    forward fallback）
+    let client_pub = parsed.key_share_x25519.ok_or(RealityError::NoKeyShareX25519)?;
 
-    // 2. 构造 zero-session-id handshake message（AES-GCM AAD）
-    //    复用 parsed.handshake_message（record payload，含 handshake type+length header），
-    //    把 session_id 字段替换为全 0，对齐 watfaq client 端编码行为。
+    // 2. 构造 zero-session-id handshake message（AES-GCM AAD） 复用
+    //    parsed.handshake_message（record payload，含 handshake type+length header）， 把
+    //    session_id 字段替换为全 0，对齐 watfaq client 端编码行为。
     let mut aad = parsed.handshake_message.to_vec();
     let sid_end = SESSION_ID_OFFSET_IN_HANDSHAKE + crate::crypto::SESSION_ID_LEN;
     if aad.len() < sid_end {
@@ -384,9 +383,9 @@ pub fn verify_reality_client_hello(
     }
     aad[SESSION_ID_OFFSET_IN_HANDSHAKE..sid_end].fill(0);
 
-    // 3. ECDH(server_priv, client_pub) → auth_key
-    //    X25519 ECDH 对称：ECDH(server_priv, client_pub) == ECDH(client_priv, server_pub)，
-    //    与 client 端 derive_auth_key(client_priv, server_pub, ...) 产出相同 auth_key。
+    // 3. ECDH(server_priv, client_pub) → auth_key X25519 ECDH 对称：ECDH(server_priv, client_pub)
+    //    == ECDH(client_priv, server_pub)， 与 client 端 derive_auth_key(client_priv, server_pub,
+    //    ...) 产出相同 auth_key。
     let auth_key = crate::crypto::derive_auth_key(
         server_static_private,
         &client_pub,
@@ -405,10 +404,10 @@ pub fn verify_reality_client_hello(
     let payload =
         crate::crypto::verify_session_payload(&plaintext, now_unix, max_diff, allowed_short_ids)?;
 
-    // 6. ft0g: 版本门控——对齐 Go xtls/reality tls.go:259-267，比较**解密 payload
-    //    前 3 字节 ClientVer**（客户端 Xray 版本），而非 ClientHello.legacy_version
-    //    （TLS1.3 恒 [0x03,0x03]，读它 = min 配置下全客户端被拒 / max 恒过）。
-    //    字典序：[major, minor, patch]；空切片=无限边界（不限制）。
+    // 6. ft0g: 版本门控——对齐 Go xtls/reality tls.go:259-267，比较**解密 payload 前 3 字节
+    //    ClientVer**（客户端 Xray 版本），而非 ClientHello.legacy_version （TLS1.3 恒
+    //    [0x03,0x03]，读它 = min 配置下全客户端被拒 / max 恒过）。 字典序：[major, minor,
+    //    patch]；空切片=无限边界（不限制）。
     if !min_client_ver.is_empty() && payload.version.as_slice() < min_client_ver {
         return Err(RealityError::ClientVersionTooOld);
     }
@@ -428,16 +427,9 @@ pub enum RealityServerOutcome<C> {
     /// （缺省 Go 默认 32，`reality/common.go:70`）。Go 侧由定制 BoringSSL 在
     /// record 循环消费（`reality/conn.go:830-836`，超限 alert）；btls 路径
     /// 另消费为后握手记录模仿触发条件（bd 26zn，见 [`server_tls_btls`]）。
-    Verified {
-        tls: RealityTlsStream<C>,
-        max_useless_records: u32,
-    },
+    Verified { tls: RealityTlsStream<C>, max_useless_records: u32 },
     /// REALITY 验证失败。调用方可拿回 `conn` + `record` 做 [`fallback_to_dest`]。
-    Invalid {
-        conn: C,
-        record: Vec<u8>,
-        reason: RealityError,
-    },
+    Invalid { conn: C, record: Vec<u8>, reason: RealityError },
 }
 
 /// bd frxi：server_tls 的启动期探测消费上下文。
@@ -480,8 +472,8 @@ struct VerifiedHandshake {
     max_useless_records: u32,
     /// dest 主动发的后握手 type23 记录长度列表（bd 26zn：Go `tls.go:414-416`
     /// `GlobalPostHandshakeRecordsLens.Load(key)` 等价；空 = dest 未主动发
-    /// type23 / 未启用探测 / 查表 miss）。gate 判定保留为未来接线点；发送体
-    /// 已删（方案 B，见 [`server_tls_btls`] 处置记录），gate 命中现仅记日志。
+    /// type23 / 未启用探测 / 查表 miss）。非空 = 发送 gate 命中，逐条发送
+    /// 字节级等价 mirror（bd z32z，见 [`server_tls_btls`] 处置记录）。
     mirror_record_lens: Vec<u32>,
 }
 
@@ -511,10 +503,8 @@ fn verify_and_probe(
         }
     }
 
-    let now_unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0);
+    let now_unix =
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0);
     let (_payload, auth_key) = verify_reality_client_hello(
         &parsed,
         server_private_key,
@@ -538,17 +528,10 @@ fn verify_and_probe(
             // 等价——miss（探测中/未启用）与空列表同判"不发"。
             let lens = ctx.table.record_lens_for_key(&key).unwrap_or_default();
             (tier.unwrap_or_else(|| ctx.fallback.fallback()), lens)
-        }
-        None => (
-            crate::config::MaxUselessRecordsSetting::Disabled.fallback(),
-            Vec::new(),
-        ),
+        },
+        None => (crate::config::MaxUselessRecordsSetting::Disabled.fallback(), Vec::new()),
     };
-    Ok(VerifiedHandshake {
-        auth_key,
-        max_useless_records,
-        mirror_record_lens,
-    })
+    Ok(VerifiedHandshake { auth_key, max_useless_records, mirror_record_lens })
 }
 
 /// REALITY 服务端握手（rustls 默认路径）。
@@ -568,13 +551,12 @@ fn verify_and_probe(
 /// - `server_private_key`：服务端 X25519 静态私钥（对应 client 配置的 `public_key`）
 /// - `allowed_short_ids`：允许的 short_id 白名单
 /// - `max_diff`：允许的 timestamp 偏差秒数（Go 默认 ±12h = 43200）
-/// - `min_client_ver`/`max_client_ver`：fs0o REALITY 版本门控；slice 与解密
-///   payload 前 3 字节 ClientVer 字典序比较（ft0g 对齐 Go tls.go:259-267）。
-///   空切片=无限边界（不限制）。
+/// - `min_client_ver`/`max_client_ver`：fs0o REALITY 版本门控；slice 与解密 payload 前 3 字节
+///   ClientVer 字典序比较（ft0g 对齐 Go tls.go:259-267）。 空切片=无限边界（不限制）。
 /// - `server_names`：SNI 白名单（精确匹配，对齐 Go `xtls/reality` tls.go:211/466
-///   `config.ServerNames[serverName]`：无 SNI 或不在白名单 → 前置失败走
-///   steal-oneself fallback）。空切片 = 门禁用（仅测试用低层 API；生产
-///   parse 层已强制非空白名单，Go transport_security.go:94-96 空 serverNames 拒启）。
+///   `config.ServerNames[serverName]`：无 SNI 或不在白名单 → 前置失败走 steal-oneself
+///   fallback）。空切片 = 门禁用（仅测试用低层 API；生产 parse 层已强制非空白名单，Go
+///   transport_security.go:94-96 空 serverNames 拒启）。
 /// - `probe`：bd frxi 启动期探测消费上下文；`None` = 未启用探测（不查表，
 ///   `Verified.max_useless_records` 恒为配置 fallback / Go 默认 32）。
 ///
@@ -599,9 +581,9 @@ pub async fn server_tls<C>(
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-    let record = read_tls_record(&mut conn).await.map_err(|e| {
-        RealityError::TlsHandshake(format!("read ClientHello: {e}"))
-    })?;
+    let record = read_tls_record(&mut conn)
+        .await
+        .map_err(|e| RealityError::TlsHandshake(format!("read ClientHello: {e}")))?;
     // bd frxi：探测 key 需 sni + alpn，verify 失败路径（Invalid）不查表——
     // Go 侧消费点在 REALITY 握手成功分支内（tls.go:410-437），fallback 连接
     // 走原样转发，无消费。
@@ -618,7 +600,7 @@ where
         Ok(v) => v,
         Err(reason) => {
             return Ok(RealityServerOutcome::Invalid { conn, record, reason });
-        }
+        },
     };
 
     // 3. 成功分支：生成 REALITY HMAC 证书 + TLS 握手
@@ -664,15 +646,16 @@ where
 /// 的后握手记录逐条重放给 REALITY 客户端（使 REALITY 连接与 dest 直连的
 /// 记录序列不可区分）。
 ///
-/// **Rust 侧发送体已删（bd 26zn 方案 B）**：gate 命中（`mirror_record_lens`
-/// 非空，判定结构保留，见 [`verify_and_probe`]）现在只记 debug 日志，不发
-/// 任何记录。原因：标准 `SSL_write` 语义是「明文 + 自动追加 inner
-/// content-type + AEAD tag」，无法构造「剥掉尾部 tag 的空记录」实现字节级
-/// 等价；逐条重放真实 dest 记录需要新的 btls 原语（bd z32z）。此前保守
-/// 实现发 48B 零 padding（wire 70B 单记录），被 REALITY 客户端 TLS 栈当
-/// app data 交付上层泄漏进 VLESS 数据流（VPS 生产实测 curl 3/3 失败）——
-/// 等价原语落地前，静默污染比不发更糟。gate 判定保留为未来接线点 +
-/// 可观测性（本函数内 `tracing::debug!`）。
+/// **Rust 侧 mirror 发送体已恢复（bd z32z，字节级等价）**：gate 命中
+/// （`mirror_record_lens` 非空）逐条发送 Go 同款 mirror 记录——inner
+/// plaintext `[0x17] + 全零`，经 btls 新原语 `SSL_seal_raw_tls13_record`
+/// （inner-plaintext 级 seal，不追加 inner type）产出 wire 字节后直写底层
+/// 流。历史：26zn 方案 B 曾删发送体（标准 `SSL_write` 恒追加 inner type，
+/// 无法构造剥尾空记录；此前保守实现发 48B 零 padding wire 70B，被 REALITY
+/// 客户端 TLS 栈当非空 app data 交付上层泄漏进 VLESS 数据流，VPS 生产实测
+/// curl 3/3 失败）。字节级等价语义：客户端剥尾解出 type=appData + 空载荷，
+/// 被空记录重试路径吞掉（utls conn.go:766-768），对应用层不可见——与 Go
+/// tls.go:417-426 逐字节同构。rustls 路径维持不发（Go 也仅 btls 形态等价）。
 ///
 /// # Errors
 ///
@@ -695,9 +678,9 @@ pub async fn server_tls_btls<C>(
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-    let record = read_tls_record(&mut conn).await.map_err(|e| {
-        RealityError::TlsHandshake(format!("read ClientHello: {e}"))
-    })?;
+    let record = read_tls_record(&mut conn)
+        .await
+        .map_err(|e| RealityError::TlsHandshake(format!("read ClientHello: {e}")))?;
     let verified = match verify_and_probe(
         &record,
         server_private_key,
@@ -711,23 +694,62 @@ where
         Ok(v) => v,
         Err(reason) => {
             return Ok(RealityServerOutcome::Invalid { conn, record, reason });
-        }
+        },
     };
 
     let (cert_der, key_der) = generate_reality_ed25519_cert(&verified.auth_key)?;
     let prefixed = PrefixedReader::new(record, conn);
-    let tls = xray_tls::btls_server::accept(prefixed, &cert_der, &key_der)
+    let mut tls = xray_tls::btls_server::accept(prefixed, &cert_der, &key_der)
         .await
         .map_err(|e| RealityError::TlsHandshake(format!("btls accept: {e}")))?;
 
-    // bd 26zn（方案 B）：发送 gate 判定保留（未来接线点 + 可观测性），
-    // 发送体已删——见函数文档处置记录。
+    // bd z32z：mirror 发送体恢复——字节级等价形态（Go tls.go:417-426 镜像）。
+    // 每条 dest 记录长度 L 构造 inner plaintext = [0x17] + (L-22) 个全零，
+    // 经 inner-plaintext 级 seal（不追加 inner type）产出 wire 字节后直写
+    // 底层流（Go hs.c.write 镜像）。明文剥尾语义 = type appData + 空载荷，
+    // 客户端 TLS 栈按空记录吞掉（utls conn.go:766-768）。seal 共享标准
+    // write_sequence（NST 等握手后记录自然计入），seq 无需手工对齐。
+    // gate 条件 = dest 记录长度列表非空（Go record_detect.go:124-139）。
     if !verified.mirror_record_lens.is_empty() {
-        tracing::debug!(
-            lens = verified.mirror_record_lens.len(),
-            "reality btls: post-handshake mirror suppressed (send path removed, bd 26zn; \
-             byte-level equivalence pending new btls primitive, bd z32z)"
-        );
+        use tokio::io::AsyncWriteExt;
+        use xray_tls::btls_reality::seal_post_handshake_raw_record;
+        // wire 上界 = 5B 头 + 明文 16385 + tag 16 = 16406；分支内堆分配，
+        // gate miss（默认配置）路径零开销。
+        let mut wire = vec![0u8; 5 + 16385 + 16];
+        let mut inner = vec![0u8; 16385];
+        for &record_len in &verified.mirror_record_lens {
+            // 票面边界：len<22 / len>16406 非法，skip+log（Go 侧列表来自
+            // record_detect 采集的合法 dest 记录，防御上游畸形数据）。
+            if !(22..=16406).contains(&record_len) {
+                tracing::debug!(
+                    record_len,
+                    "reality btls: mirror record length out of range, skipped"
+                );
+                continue;
+            }
+            // 21 = 头 5 + tag 16；明文 = [0x17] + (L-22) 个全零（后续轮次
+            // [1..] 恒零无需重置，inner[0] 每轮覆写）。
+            let inner_len = record_len as usize - 21;
+            inner[0] = 0x17;
+            // seal 是同步 FFI：ssl_ptr 的裸指针借用止于本块，不得跨 await
+            //（*mut SSL 非 Send，跨 await 会毒化 tokio::spawn 的 future）。
+            let sealed = {
+                let ssl_ptr = tls.ssl_ptr();
+                match seal_post_handshake_raw_record(ssl_ptr, &inner[..inner_len], &mut wire) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::warn!(error = e, record_len, "reality btls: mirror seal failed");
+                        continue;
+                    },
+                }
+            };
+            // 直写底层流（Go hs.c.write 镜像）。写失败即中止（对端断开形态；
+            // Go 侧忽略写错误，此处保留可观测性，连接交由后续路径自然失败）。
+            if let Err(e) = tls.get_mut().write_all(&wire[..sealed]).await {
+                tracing::warn!(error = %e, record_len, "reality btls: mirror write failed");
+                break;
+            }
+        }
     }
 
     Ok(RealityServerOutcome::Verified {
@@ -743,9 +765,7 @@ const MAX_TLS_RECORD_LEN: usize = 16384;
 ///
 /// 翻译自 Go `common/protocol/tls/sniff.go::ReadClientHello` 的 record 读取部分。
 /// 用于 REALITY 服务端：先读到完整 ClientHello record，再 [`parse_client_hello`] + verify。
-pub async fn read_tls_record<R: AsyncRead + Unpin>(
-    reader: &mut R,
-) -> std::io::Result<Vec<u8>> {
+pub async fn read_tls_record<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<Vec<u8>> {
     use tokio::io::AsyncReadExt;
     let mut header = [0u8; 5];
     reader.read_exact(&mut header).await?;
@@ -801,7 +821,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for PrefixedReader<R> {
             return std::task::Poll::Ready(Ok(()));
         }
         std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
-    }}
+    }
+}
 
 impl<R: AsyncWrite + Unpin> AsyncWrite for PrefixedReader<R> {
     fn poll_write(
@@ -838,7 +859,9 @@ mod tests {
     /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
     fn ensure_crypto_provider() {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+        ONCE.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
     }
 
     #[tokio::test]
@@ -1030,8 +1053,7 @@ mod tests {
         let random = [0x55u8; 32];
         let session_id = [0x77u8; 32];
         let key_share = [0x88u8; 32];
-        let record =
-            build_test_client_hello(&random, &session_id, &key_share, Some("example.com"));
+        let record = build_test_client_hello(&random, &session_id, &key_share, Some("example.com"));
         let parsed = parse_client_hello(&record).unwrap();
         assert_eq!(parsed.random, random);
         assert_eq!(parsed.session_id, session_id);
@@ -1229,8 +1251,9 @@ mod tests {
         short_id: &[u8; 8],
         sni: Option<&str>,
     ) -> Vec<u8> {
-        use crate::crypto::{derive_auth_key, encrypt_session_id};
         use x25519_dalek::{PublicKey, StaticSecret};
+
+        use crate::crypto::{derive_auth_key, encrypt_session_id};
 
         let client_secret = StaticSecret::from(*client_private);
         let client_pub = PublicKey::from(&client_secret);
@@ -1293,7 +1316,8 @@ mod tests {
         );
         let parsed = parse_client_hello(&record).unwrap();
         let (payload, _auth_key) =
-            verify_reality_client_hello(&parsed, &server_priv, now, 43200, &[short_id], &[], &[]).unwrap();
+            verify_reality_client_hello(&parsed, &server_priv, now, 43200, &[short_id], &[], &[])
+                .unwrap();
         assert_eq!(payload.timestamp, now);
         assert_eq!(payload.short_id, short_id);
         assert_eq!(payload.version, [1, 8, 1]);
@@ -1323,16 +1347,9 @@ mod tests {
         // 关键断言：hybrid entry 解析出末尾 X25519 公钥 + MLKEM768 检测命中
         assert!(parsed.key_share_x25519.is_some());
         assert!(parsed.key_share_mlkem768, "hybrid entry must set key_share_mlkem768");
-        let (payload, auth_key) = verify_reality_client_hello(
-            &parsed,
-            &server_priv,
-            now,
-            43200,
-            &[short_id],
-            &[],
-            &[],
-        )
-        .unwrap();
+        let (payload, auth_key) =
+            verify_reality_client_hello(&parsed, &server_priv, now, 43200, &[short_id], &[], &[])
+                .unwrap();
         assert_eq!(payload.timestamp, now);
         assert_eq!(payload.short_id, short_id);
         // auth_key 与纯 X25519 路径派生一致（hybrid 仅扩展 transport layer，
@@ -1370,7 +1387,8 @@ mod tests {
 
         let parsed = parse_client_hello(&record).unwrap();
         assert!(parsed.key_share_x25519.is_none());
-        let err = verify_reality_client_hello(&parsed, &[0u8; 32], 0, 0, &[], &[], &[]).unwrap_err();
+        let err =
+            verify_reality_client_hello(&parsed, &[0u8; 32], 0, 0, &[], &[], &[]).unwrap_err();
         assert!(matches!(err, RealityError::NoKeyShareX25519));
     }
 
@@ -1450,7 +1468,8 @@ mod tests {
         let parsed = parse_client_hello(&record).unwrap();
         assert!(parsed.key_share_x25519.is_some());
         assert!(!parsed.key_share_mlkem768);
-        let err = verify_reality_client_hello(&parsed, &[0u8; 32], 0, 0, &[], &[], &[]).unwrap_err();
+        let err =
+            verify_reality_client_hello(&parsed, &[0u8; 32], 0, 0, &[], &[], &[]).unwrap_err();
         assert!(
             matches!(err, RealityError::SessionIdDecryptFailed),
             "pure X25519 must reach AEAD stage, got {err:?}"
@@ -1563,10 +1582,10 @@ mod tests {
                     matches!(reason, RealityError::SessionIdDecryptFailed),
                     "expected SessionIdDecryptFailed, got {reason:?}"
                 );
-            }
+            },
             Ok(RealityServerOutcome::Verified { .. }) => {
                 panic!("expected Invalid outcome, got Verified")
-            }
+            },
             Err(e) => panic!("expected Invalid outcome, got server error: {e:?}"),
         }
     }
@@ -1585,7 +1604,8 @@ mod tests {
         // 用错误的 server key 验证 → AES-GCM 解密失败
         let wrong_priv = [0x99u8; 32];
         let err =
-            verify_reality_client_hello(&parsed, &wrong_priv, now, 43200, &[short_id], &[], &[]).unwrap_err();
+            verify_reality_client_hello(&parsed, &wrong_priv, now, 43200, &[short_id], &[], &[])
+                .unwrap_err();
         assert!(matches!(err, RealityError::SessionIdDecryptFailed));
     }
 
@@ -1608,9 +1628,15 @@ mod tests {
         let parsed = parse_client_hello(&record).unwrap();
         // server 时间偏离 100000s，max_diff=43200 → 超窗
         let server_now = client_time + 100_000;
-        let err = verify_reality_client_hello(&parsed, &server_priv, server_now, 43200, &[
-            short_id,
-        ], &[], &[])
+        let err = verify_reality_client_hello(
+            &parsed,
+            &server_priv,
+            server_now,
+            43200,
+            &[short_id],
+            &[],
+            &[],
+        )
         .unwrap_err();
     }
 
@@ -1632,9 +1658,16 @@ mod tests {
             None,
         );
         let parsed = parse_client_hello(&record).unwrap();
-        let err =
-            verify_reality_client_hello(&parsed, &server_priv, now, 43200, &server_allowed, &[], &[])
-                .unwrap_err();
+        let err = verify_reality_client_hello(
+            &parsed,
+            &server_priv,
+            now,
+            43200,
+            &server_allowed,
+            &[],
+            &[],
+        )
+        .unwrap_err();
         assert!(matches!(err, RealityError::ShortIdNotAllowed));
     }
 
@@ -1654,7 +1687,13 @@ mod tests {
         let now = 1_700_000_000u32;
         let short_id = [0xaa; 8];
         let record = build_reality_client_hello_with_version(
-            &random, &server_priv, &client_priv, ver, now, &short_id, None,
+            &random,
+            &server_priv,
+            &client_priv,
+            ver,
+            now,
+            &short_id,
+            None,
         );
         let parsed = parse_client_hello(&record).unwrap();
         verify_reality_client_hello(&parsed, &server_priv, now, 43200, &[short_id], min, max)
@@ -1758,7 +1797,7 @@ mod tests {
                     matches!(reason, RealityError::SessionIdDecryptFailed),
                     "expected SessionIdDecryptFailed, got {reason:?}"
                 );
-            }
+            },
             RealityServerOutcome::Verified { .. } => panic!("expected Invalid, got Verified"),
         }
     }
@@ -1772,8 +1811,7 @@ mod tests {
         let random = [0x55u8; 32];
         let session_id = [0x77u8; 32];
         let key_share = [0x88u8; 32];
-        let record =
-            build_test_client_hello(&random, &session_id, &key_share, Some("example.com"));
+        let record = build_test_client_hello(&random, &session_id, &key_share, Some("example.com"));
 
         let (mut client, server) = duplex(4096);
         let server_priv = [0x11u8; 32];
@@ -1789,7 +1827,7 @@ mod tests {
             RealityServerOutcome::Invalid { reason, .. } => match reason {
                 RealityError::InvalidServerName(sni) => {
                     assert_eq!(sni, "example.com");
-                }
+                },
                 other => panic!("expected InvalidServerName, got {other:?}"),
             },
             RealityServerOutcome::Verified { .. } => panic!("expected Invalid, got Verified"),
@@ -1819,10 +1857,7 @@ mod tests {
         assert!(
             matches!(
                 outcome,
-                RealityServerOutcome::Invalid {
-                    reason: RealityError::InvalidServerName(_),
-                    ..
-                }
+                RealityServerOutcome::Invalid { reason: RealityError::InvalidServerName(_), .. }
             ),
             "missing SNI must not pass the whitelist gate"
         );
@@ -1884,11 +1919,11 @@ mod tests {
         let result = server_task.await.unwrap();
         match result {
             // verify 通过 + accept 阶段失败（client 没继续 TLS）
-            Err(RealityError::TlsHandshake(_)) => { /* 成功分支进入标志 */ }
+            Err(RealityError::TlsHandshake(_)) => { /* 成功分支进入标志 */ },
             Ok(RealityServerOutcome::Invalid { reason, .. }) => {
                 panic!("expected verify pass + TLS accept, got Invalid: {reason:?}");
-            }
-            Ok(RealityServerOutcome::Verified { .. }) => { /* 不可能：client 未完成 TLS */ }
+            },
+            Ok(RealityServerOutcome::Verified { .. }) => { /* 不可能：client 未完成 TLS */ },
             Err(e) => panic!("unexpected error: {e:?}"),
         }
     }
@@ -1899,11 +1934,15 @@ mod tests {
     async fn reality_loopback_u_client_with_server_tls() {
         ensure_crypto_provider();
         use std::time::Duration;
+
         use tokio::io::duplex;
         use x25519_dalek::{PublicKey, StaticSecret};
-        use crate::client::{u_client, UConnState};
-        use crate::config::RealityConfig;
         use xray_proto::transport::internet::reality::Config as ProtoConfig;
+
+        use crate::{
+            client::{UConnState, u_client},
+            config::RealityConfig,
+        };
 
         let server_priv_array = [0x11u8; 32];
         let short_id = [0xaa; 8];
@@ -1933,18 +1972,15 @@ mod tests {
         });
 
         // client 端：reality u_client 握手
-        let client_result = tokio::time::timeout(
-            Duration::from_secs(10),
-            u_client(client, state),
-        )
-        .await;
+        let client_result =
+            tokio::time::timeout(Duration::from_secs(10), u_client(client, state)).await;
 
         let server_result = server_task.await.unwrap();
 
         match (client_result, server_result) {
             (Ok(Ok(_tls_stream)), Ok(RealityServerOutcome::Verified { .. })) => {
                 // 完整 REALITY 握手成功！
-            }
+            },
             (Ok(Ok(_)), Ok(_)) => panic!("server unexpected outcome"),
             (Ok(Ok(_)), Err(e)) => panic!("server error: {e:?}"),
             (Ok(Err(e)), _) => panic!("client u_client failed: {e:?}"),
@@ -1965,11 +2001,15 @@ mod tests {
     async fn reality_loopback_watfaq_fallback_fingerprint() {
         ensure_crypto_provider();
         use std::time::Duration;
+
         use tokio::io::duplex;
         use x25519_dalek::{PublicKey, StaticSecret};
-        use crate::client::{u_client, UConnState};
-        use crate::config::RealityConfig;
         use xray_proto::transport::internet::reality::Config as ProtoConfig;
+
+        use crate::{
+            client::{UConnState, u_client},
+            config::RealityConfig,
+        };
 
         let server_priv_array = [0x11u8; 32];
         let short_id = [0xaa; 8];
@@ -2001,7 +2041,7 @@ mod tests {
         match (client_result, server_result) {
             (Ok(Ok(_tls_stream)), Ok(RealityServerOutcome::Verified { .. })) => {
                 // 完整 REALITY 握手成功（watfaq 路径 + 固定模板证书）
-            }
+            },
             (Ok(Ok(_)), Ok(_)) => panic!("server unexpected outcome"),
             (Ok(Ok(_)), Err(e)) => panic!("server error: {e:?}"),
             (Ok(Err(e)), _) => panic!("client u_client failed: {e:?}"),
@@ -2015,19 +2055,22 @@ mod tests {
     /// - `PresetFingerprints`（tls.go:204-217）：chrome/firefox/safari/ios/android/
     ///   edge/360/qq（random 系走 fallback 矩阵）
     /// - `ModernFingerprints`（tls.go:219-232）：hellofirefox_120/148、hellochrome_120/
-    ///   131/133、helloios_13/14、helloedge_106、hellosafari_26_3、hello360_11_0、
-    ///   helloqq_11_1
+    ///   131/133、helloios_13/14、helloedge_106、hellosafari_26_3、hello360_11_0、 helloqq_11_1
     /// - 旧版变体（btls 映射到就近 connector，见 xray-tls btls_client.rs）
     ///
     /// 注：派单提及的 "2345" 在 Go v26.6.1 基准不存在（PresetFingerprints 无此键），
     /// 矩阵按 Go 实际集合执行。
     async fn reality_loopback_with_fingerprint(fp: &str) {
         use std::time::Duration;
+
         use tokio::io::duplex;
         use x25519_dalek::{PublicKey, StaticSecret};
-        use crate::client::{u_client, UConnState};
-        use crate::config::RealityConfig;
         use xray_proto::transport::internet::reality::Config as ProtoConfig;
+
+        use crate::{
+            client::{UConnState, u_client},
+            config::RealityConfig,
+        };
 
         let server_priv_array = [0x11u8; 32];
         let short_id = [0xaa; 8];
@@ -2057,7 +2100,7 @@ mod tests {
         let server_result = server_task.await.unwrap();
 
         match (client_result, server_result) {
-            (Ok(Ok(_tls_stream)), Ok(RealityServerOutcome::Verified { .. })) => {}
+            (Ok(Ok(_tls_stream)), Ok(RealityServerOutcome::Verified { .. })) => {},
             (Ok(Ok(_)), Ok(_)) => panic!("[{fp}] server unexpected outcome"),
             (Ok(Ok(_)), Err(e)) => panic!("[{fp}] server error: {e:?}"),
             (Ok(Err(e)), _) => panic!("[{fp}] client u_client failed: {e:?}"),
@@ -2090,12 +2133,11 @@ mod tests {
     /// btls 浏览器指纹主路径矩阵：preset 8 + modern 11 + 旧版 2 = 21 例。
     ///
     /// **566y 实测分类（2026-09-19，对 21 指纹逐个 loopback 探针）**：
-    /// - PASS（4）：chrome / android / hellochrome_131 / hellochrome_133
-    ///   —— 已摘为上方 active 矩阵 [`reality_fingerprint_matrix_btls_mlkem`]；
-    /// - FAIL（17）：非 MLKEM 模板。服务端按 Go 语义 reject→forward（正确行为），
-    ///   客户端等不到 ServerHello → 10s timeout（edge/360/qq/safari/100/99 系）
-    ///   或 EOF（firefox 系——rustls 服务端对 firefox CH 另有兼容性问题，EOF
-    ///   先于门禁发生，属既有独立问题）。
+    /// - PASS（4）：chrome / android / hellochrome_131 / hellochrome_133 —— 已摘为上方 active 矩阵
+    ///   [`reality_fingerprint_matrix_btls_mlkem`]；
+    /// - FAIL（17）：非 MLKEM 模板。服务端按 Go 语义 reject→forward（正确行为）， 客户端等不到
+    ///   ServerHello → 10s timeout（edge/360/qq/safari/100/99 系） 或 EOF（firefox 系——rustls
+    ///   服务端对 firefox CH 另有兼容性问题，EOF 先于门禁发生，属既有独立问题）。
     ///
     /// **ignore 根因更新**：旧注释声称的"btls transcript mismatch → DECODE_ERROR"
     /// 已不复现（chrome 全链实测通过）；当前保留 ignore 是因为矩阵混合
@@ -2165,13 +2207,29 @@ mod tests {
     fn all_21_fingerprints_resolve() {
         let names = [
             // PresetFingerprints（Go tls.go:204-212）
-            "chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq",
+            "chrome",
+            "firefox",
+            "safari",
+            "ios",
+            "android",
+            "edge",
+            "360",
+            "qq",
             // ModernFingerprints（Go tls.go:221-231）
-            "hellofirefox_120", "hellofirefox_148", "hellochrome_120", "hellochrome_131",
-            "hellochrome_133", "helloios_13", "helloios_14", "helloedge_106",
-            "hellosafari_26_3", "hello360_11_0", "helloqq_11_1",
+            "hellofirefox_120",
+            "hellofirefox_148",
+            "hellochrome_120",
+            "hellochrome_131",
+            "hellochrome_133",
+            "helloios_13",
+            "helloios_14",
+            "helloedge_106",
+            "hellosafari_26_3",
+            "hello360_11_0",
+            "helloqq_11_1",
             // 旧版变体（btls 就近映射）
-            "hellochrome_100", "hellofirefox_99",
+            "hellochrome_100",
+            "hellofirefox_99",
         ];
         assert_eq!(names.len(), 21, "matrix must be 21");
         for name in names {
@@ -2181,12 +2239,14 @@ mod tests {
             let supported = xray_tls::btls_client::fingerprint_supported(&fp);
             assert!(
                 supported
-                    || matches!(fp,
+                    || matches!(
+                        fp,
                         xray_tls::fingerprint::Fingerprint::HelloRandomized
-                        | xray_tls::fingerprint::Fingerprint::HelloRandomizedAlpn
-                        | xray_tls::fingerprint::Fingerprint::HelloRandomizedNoAlpn
-                        | xray_tls::fingerprint::Fingerprint::Randomized
-                        | xray_tls::fingerprint::Fingerprint::RandomizedNoAlpn),
+                            | xray_tls::fingerprint::Fingerprint::HelloRandomizedAlpn
+                            | xray_tls::fingerprint::Fingerprint::HelloRandomizedNoAlpn
+                            | xray_tls::fingerprint::Fingerprint::Randomized
+                            | xray_tls::fingerprint::Fingerprint::RandomizedNoAlpn
+                    ),
                 "{name} ({fp:?}) must be either btls-supported or randomized-fallback"
             );
         }
@@ -2220,11 +2280,7 @@ mod tests {
         let cm_len = body[off] as usize;
         off += 1 + cm_len;
         let old_total = u16::from_be_bytes([body[off], body[off + 1]]) as usize;
-        assert_eq!(
-            off + 2 + old_total,
-            body.len(),
-            "fixture ext_total must be self-consistent"
-        );
+        assert_eq!(off + 2 + old_total, body.len(), "fixture ext_total must be self-consistent");
 
         let mut new_body = body[..off].to_vec();
         new_body.extend_from_slice(&((old_total + ext.len()) as u16).to_be_bytes());
@@ -2247,7 +2303,8 @@ mod tests {
 
     #[test]
     fn parse_client_hello_alpn_protocols() {
-        let base = build_test_client_hello(&[0x55; 32], &[0x77; 32], &[0x88; 32], Some("example.com"));
+        let base =
+            build_test_client_hello(&[0x55; 32], &[0x77; 32], &[0x88; 32], Some("example.com"));
         // 无 alpn extension → 空
         assert!(parse_client_hello(&base).unwrap().alpn_protocols.is_empty());
         // 带 alpn → 按序解析
@@ -2269,10 +2326,7 @@ mod tests {
             fallback: crate::config::MaxUselessRecordsSetting::Disabled,
         };
         assert_eq!(ctx.key_for("s", &[]).alpn, AlpnId::None);
-        assert_eq!(
-            ctx.key_for("s", &["h2".into(), "http/1.1".into()]).alpn,
-            AlpnId::H2
-        );
+        assert_eq!(ctx.key_for("s", &["h2".into(), "http/1.1".into()]).alpn, AlpnId::H2);
         assert_eq!(ctx.key_for("s", &["http/1.1".into()]).alpn, AlpnId::Http11);
     }
 
@@ -2283,12 +2337,16 @@ mod tests {
     async fn server_tls_feeds_probe_result_into_verified() {
         ensure_crypto_provider();
         use std::time::Duration;
+
         use tokio::io::duplex;
         use x25519_dalek::{PublicKey, StaticSecret};
-        use crate::client::{u_client, UConnState};
-        use crate::config::RealityConfig;
-        use crate::probe::{AlpnId, ProbeKey};
         use xray_proto::transport::internet::reality::Config as ProtoConfig;
+
+        use crate::{
+            client::{UConnState, u_client},
+            config::RealityConfig,
+            probe::{AlpnId, ProbeKey},
+        };
 
         let server_priv_array = [0x11u8; 32];
         let short_id = [0xaa; 8];
@@ -2326,34 +2384,20 @@ mod tests {
         let (client, server) = duplex(65536);
         let client = xray_transport::connection::DuplexConnection::new(client);
         let server_task = tokio::spawn(async move {
-            server_tls(
-                server,
-                &server_priv_array,
-                &[short_id],
-                43200,
-                &[],
-                &[],
-                &[],
-                Some(&ctx),
-            )
-            .await
+            server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[], &[], Some(&ctx))
+                .await
         });
         let client_result =
             tokio::time::timeout(Duration::from_secs(10), u_client(client, state)).await;
         let server_result = server_task.await.unwrap();
 
         match (client_result, server_result) {
-            (
-                Ok(Ok(_)),
-                Ok(RealityServerOutcome::Verified {
-                    max_useless_records, ..
-                }),
-            ) => {
+            (Ok(Ok(_)), Ok(RealityServerOutcome::Verified { max_useless_records, .. })) => {
                 assert!(
                     max_useless_records == 16 || max_useless_records == 8,
                     "probe value must come from the table (got {max_useless_records})"
                 );
-            }
+            },
             (Ok(Ok(_)), other) => panic!("server unexpected outcome (see outcome variant)"),
             (Ok(Err(e)), _) => panic!("client u_client failed: {e:?}"),
             (Err(_timeout), _) => panic!("client u_client timeout"),
@@ -2365,11 +2409,15 @@ mod tests {
     async fn server_tls_without_probe_defaults_to_go_max_useless_records() {
         ensure_crypto_provider();
         use std::time::Duration;
+
         use tokio::io::duplex;
         use x25519_dalek::{PublicKey, StaticSecret};
-        use crate::client::{u_client, UConnState};
-        use crate::config::RealityConfig;
         use xray_proto::transport::internet::reality::Config as ProtoConfig;
+
+        use crate::{
+            client::{UConnState, u_client},
+            config::RealityConfig,
+        };
 
         let server_priv_array = [0x11u8; 32];
         let short_id = [0xaa; 8];
@@ -2394,12 +2442,9 @@ mod tests {
         let server_result = server_task.await.unwrap();
 
         match (client_result, server_result) {
-            (
-                Ok(Ok(_)),
-                Ok(RealityServerOutcome::Verified {
-                    max_useless_records, ..
-                }),
-            ) => assert_eq!(max_useless_records, 32),
+            (Ok(Ok(_)), Ok(RealityServerOutcome::Verified { max_useless_records, .. })) => {
+                assert_eq!(max_useless_records, 32)
+            },
             (Ok(Ok(_)), other) => panic!("server unexpected outcome (see outcome variant)"),
             (Ok(Err(e)), _) => panic!("client u_client failed: {e:?}"),
             (Err(_timeout), _) => panic!("client u_client timeout"),
@@ -2408,8 +2453,8 @@ mod tests {
 
     // ===== bd tce2：btls server acceptor =====
 
-    /// wire tap：包装服务端连接，记录全部写出字节（bd 26zn 反向断言用：
-    /// gate 命中也不得有 mirror 记录上 wire）。
+    /// wire tap：包装服务端连接，记录全部写出字节（bd z32z mirror wire
+    /// 形态断言用）。
     struct WireTap<S> {
         inner: S,
         written: std::sync::Arc<parking_lot::Mutex<Vec<u8>>>,
@@ -2436,7 +2481,7 @@ mod tests {
                 std::task::Poll::Ready(Ok(n)) => {
                     this.written.lock().extend_from_slice(&buf[..n]);
                     std::task::Poll::Ready(Ok(n))
-                }
+                },
                 other => other,
             }
         }
@@ -2477,11 +2522,15 @@ mod tests {
     ) {
         ensure_crypto_provider();
         use std::time::Duration;
+
         use tokio::io::duplex;
         use x25519_dalek::{PublicKey, StaticSecret};
-        use crate::client::{u_client, UConnState};
-        use crate::config::RealityConfig;
         use xray_proto::transport::internet::reality::Config as ProtoConfig;
+
+        use crate::{
+            client::{UConnState, u_client},
+            config::RealityConfig,
+        };
 
         let server_priv_array = [0x11u8; 32];
         let short_id = [0xaa; 8];
@@ -2501,28 +2550,24 @@ mod tests {
         let (client, server) = duplex(65536);
         let client = xray_transport::connection::DuplexConnection::new(client);
         let wire = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let server = WireTap {
-            inner: server,
-            written: std::sync::Arc::clone(&wire),
-        };
+        let server = WireTap { inner: server, written: std::sync::Arc::clone(&wire) };
 
         let probe_ctx = probe_tier.map(|tier| {
             let table = crate::probe::ProbeTable::new();
             // chrome 模板 ALPN 档不硬编码——三档全插保证 key 命中。
-            for alpn in [
-                crate::probe::AlpnId::None,
-                crate::probe::AlpnId::Http11,
-                crate::probe::AlpnId::H2,
-            ] {
+            for alpn in
+                [crate::probe::AlpnId::None, crate::probe::AlpnId::Http11, crate::probe::AlpnId::H2]
+            {
                 let key = crate::probe::ProbeKey {
                     dest: "fallback.example:443".to_string(),
                     server_name: "example.com".to_string(),
                     alpn,
                 };
                 table.insert(key.clone(), tier);
-                // mirror gate 输入：非空列表 = 模拟探测确认 dest 主动发 type23
-                //（发送体已删 bd 26zn，此输入现仅驱动 gate 命中日志与反向断言）。
-                table.insert_record_lens(key, vec![70]);
+                // mirror gate 输入：模拟探测采集的 dest 记录长度列表（bd z32z）。
+                // L=70 驱动 mirror 发送；21/99999 两条非法值验证边界 skip
+                // （合法域 [22, 16406]，票面约定）。
+                table.insert_record_lens(key, vec![70, 21, 99999]);
             }
             ProbeContext {
                 table,
@@ -2558,9 +2603,7 @@ mod tests {
 
         let (client_result, server_result, _wire) = btls_reality_loopback(None).await;
         // 服务端 outcome 解构（Verified 且 btls 变体）
-        let RealityServerOutcome::Verified {
-            tls: mut server_tls, ..
-        } = server_result.unwrap()
+        let RealityServerOutcome::Verified { tls: mut server_tls, .. } = server_result.unwrap()
         else {
             panic!("server outcome not Verified");
         };
@@ -2578,20 +2621,39 @@ mod tests {
         assert_eq!(&buf, b"hello btls");
     }
 
-    /// bd 26zn 方案 B：mirror 发送体已删（标准 SSL_write 无法构造剥尾空记录，
-    /// 字节级等价待新 btls 原语，见 bd z32z）。gate 就绪（探测确认 dest 主动
-    /// 发 type23，列表非空）也**不发** mirror。双断言：
-    /// 1. wire 无 mirror——gate 就绪与 gate miss 两次握手在服务端交付（accept
-    ///    返回）时刻的 wire 字节数相等（旧实现 gate 就绪会多一条 70B type23）；
-    /// 2. 客户端首读 = 真实响应（旧实现首读 = 48B 零 padding mirror）。
+    /// 解析连续 TLS 记录序列（tap 里的服务端写出恒为整记录流：每条记录一次
+    /// poll_write，duplex 无合并/分片）。返回 (外层 type, 记录总长) 列表；
+    /// 尾部截断时停在完整记录边界。
+    fn parse_tls_records(wire: &[u8]) -> Vec<(u8, usize)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 5 <= wire.len() {
+            let len = u16::from_be_bytes([wire[i + 3], wire[i + 4]]) as usize;
+            let total = 5 + len;
+            if i + total > wire.len() {
+                break;
+            }
+            out.push((wire[i], total));
+            i += total;
+        }
+        out
+    }
+
+    /// bd z32z：gate 命中（dest 记录长度列表非空）→ 逐条发送字节级等价
+    /// mirror。多断言：
+    /// 1. wire 末条 = mirror 记录（L=70：外层头 `[17 03 03 00 41]` + 65B AEAD 产物，总长 70 —— 与
+    ///    Go mirror-lab 参考输出同构）；
+    /// 2. malformed lens（21<22，99999>16406）被 skip，wire 无对应记录；
+    /// 3. 客户端首读 = 真实响应——mirror 明文 `[0x17]+全零` 被客户端 TLS 栈 剥尾成空 app-data
+    ///    吞掉（26zn 击穿形态回归断言：旧 48B 零 padding 形态下首读会拿到 mirror 载荷）；
+    /// 4. mirror 吞掉后连接完好（双向 roundtrip）；
+    /// 5. gate miss 对照：记录流恰好少一条 70B mirror。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn server_tls_btls_suppresses_post_handshake_mirror() {
+    async fn server_tls_btls_sends_post_handshake_mirror_on_probe_hit() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (client_result, server_result, wire_gate_hit) = btls_reality_loopback(Some(16)).await;
-        let RealityServerOutcome::Verified {
-            tls: mut server_tls, ..
-        } = server_result.unwrap()
+        let RealityServerOutcome::Verified { tls: mut server_tls, .. } = server_result.unwrap()
         else {
             panic!("server outcome not Verified");
         };
@@ -2599,11 +2661,31 @@ mod tests {
             panic!("client u_client failed or timeout");
         };
 
-        // 断言 1（快照在写任何 app data 之前）：gate 命中交付时 wire 上无
-        // mirror 附加字节。
-        let gate_hit_wire_len = wire_gate_hit.lock().len();
+        // 快照在写任何 app data 之前 = 握手记录流 + mirror。
+        let records_hit = parse_tls_records(&wire_gate_hit.lock());
 
-        // 断言 2：服务端发真实响应，客户端首读必须就是它。
+        // 断言 1：wire 末条 = mirror 记录（accept 返回后无其他写出）。
+        let &(mirror_type, mirror_len) =
+            records_hit.last().expect("server wire must end with the mirror record");
+        assert_eq!(mirror_type, 0x17, "mirror record outer type must be application data");
+        assert_eq!(mirror_len, 70, "mirror record total length must equal the dest record length");
+        {
+            let w = wire_gate_hit.lock();
+            let start = w.len() - 70;
+            assert_eq!(
+                &w[start..start + 5],
+                &[0x17, 0x03, 0x03, 0x00, 0x41],
+                "mirror header must be [17 03 03 (L-5)=00 41], Go mirror-lab reference form"
+            );
+        }
+
+        // 断言 2：malformed lens 被 skip，wire 无 21B/99999B 记录。
+        assert!(
+            !records_hit.iter().any(|&(_, n)| n == 21 || n == 99999),
+            "malformed lens must be skipped, not sent"
+        );
+
+        // 断言 3：客户端首读 = 真实响应（mirror 被客户端 TLS 栈吞掉）。
         server_tls.write_all(b"real response").await.unwrap();
         server_tls.flush().await.unwrap();
         let mut buf = [0u8; 13];
@@ -2613,16 +2695,29 @@ mod tests {
             .expect("read real response");
         assert_eq!(
             &buf, b"real response",
-            "client first read must be the real response, not mirror padding"
+            "client first read must be the real response; mirror must be swallowed as an empty record"
         );
 
-        // gate miss 对照：两次握手 wire 字节数必须一致（mirror 若存在 =
-        // gate 命中侧多出 70B 单记录）。
+        // 断言 4：mirror 吞掉后连接完好（双向 roundtrip）。
+        client.write_all(b"ping").await.unwrap();
+        let mut echo = [0u8; 4];
+        server_tls.read_exact(&mut echo).await.unwrap();
+        assert_eq!(&echo, b"ping");
+        server_tls.write_all(&echo).await.unwrap();
+        client.read_exact(&mut echo).await.unwrap();
+        assert_eq!(&echo, b"ping");
+
+        // 断言 5：gate miss 对照——记录流恰好少一条 70B mirror。
         let (_, _, wire_gate_miss) = btls_reality_loopback(None).await;
+        let records_miss = parse_tls_records(&wire_gate_miss.lock());
         assert_eq!(
-            gate_hit_wire_len,
-            wire_gate_miss.lock().len(),
-            "gate hit wire must carry no mirror bytes vs gate miss"
+            records_hit.len() - records_miss.len(),
+            1,
+            "gate hit must carry exactly one extra (mirror) record vs gate miss"
+        );
+        assert!(
+            !records_miss.iter().any(|&(_, n)| n == 70),
+            "gate miss must not carry a 70B mirror record"
         );
     }
 
@@ -2638,10 +2733,11 @@ mod tests {
         match (client_result, server_result) {
             (Ok(Ok(mut client)), Ok(RealityServerOutcome::Verified { .. })) => {
                 let mut buf = [0u8; 48];
-                let r = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf))
-                    .await;
+                let r =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf))
+                        .await;
                 assert!(r.is_err(), "no mirror record must be sent without probe opt-in");
-            }
+            },
             (Ok(Ok(_)), _) => panic!("server outcome not Verified"),
             (Ok(Err(e)), _) => panic!("client u_client failed: {e:?}"),
             (Err(_), _) => panic!("client u_client timeout"),
@@ -2679,7 +2775,7 @@ mod tests {
             RealityServerOutcome::Invalid { record: rec, reason, .. } => {
                 assert_eq!(rec, record, "Invalid outcome 应保留原 record 供 fallback");
                 assert!(matches!(reason, RealityError::SessionIdDecryptFailed));
-            }
+            },
             RealityServerOutcome::Verified { .. } => panic!("expected Invalid, got Verified"),
         }
     }

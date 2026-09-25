@@ -8,8 +8,7 @@
 
 use std::io;
 
-use rand::Rng;
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -115,10 +114,7 @@ pub fn encode_punch_packet(
 }
 
 /// 解码打洞包（对应 Go `DecodePunchPacket`）。
-pub fn decode_punch_packet(
-    packet: &[u8],
-    meta: &PunchMetadata,
-) -> io::Result<PunchPacket> {
+pub fn decode_punch_packet(packet: &[u8], meta: &PunchMetadata) -> io::Result<PunchPacket> {
     if packet.len() < PUNCH_MIN_WIRE_LEN {
         return Err(invalid("packet too short"));
     }
@@ -132,15 +128,12 @@ pub fn decode_punch_packet(
     if plain[..PUNCH_MAGIC.len()] != PUNCH_MAGIC {
         return Err(invalid("bad magic"));
     }
-    let packet_type =
-        PunchPacketType::from_byte(plain[PUNCH_MAGIC.len()]).ok_or_else(|| invalid("unknown packet type"))?;
+    let packet_type = PunchPacketType::from_byte(plain[PUNCH_MAGIC.len()])
+        .ok_or_else(|| invalid("unknown packet type"))?;
     if plain[PUNCH_MAGIC.len() + 1..PUNCH_HEADER_LEN] != nonce[..] {
         return Err(invalid("nonce mismatch"));
     }
-    Ok(PunchPacket {
-        packet_type,
-        padding_length: plain.len() - PUNCH_HEADER_LEN,
-    })
+    Ok(PunchPacket { packet_type, padding_length: plain.len() - PUNCH_HEADER_LEN })
 }
 
 /// 从 [`PunchMetadata`] 提取并校验 `nonce + obfsKey`（对应 Go `decodePunchMetadata`）。
@@ -152,8 +145,7 @@ fn decode_punch_metadata(meta: &PunchMetadata) -> io::Result<(Vec<u8>, Vec<u8>)>
 
 /// 解码 hex 并校验长度（对应 Go `decodeHexSize`）。
 fn decode_hex_size(name: &str, value: &str, size: usize) -> io::Result<Vec<u8>> {
-    let b = hex::decode(value)
-        .map_err(|_| invalid(&format!("invalid {name}")))?;
+    let b = hex::decode(value).map_err(|_| invalid(&format!("invalid {name}")))?;
     if b.len() != size {
         return Err(invalid(&format!("invalid {name} length")));
     }
@@ -181,10 +173,7 @@ fn xor_punch_packet(packet: &mut [u8], obfs_key: &[u8], salt: &[u8]) {
 
 /// 构造 `InvalidData` 错误的助手（前缀与 Go 错误信息一致以便日志对照）。
 fn invalid(msg: &str) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!("invalid punch packet: {msg}"),
-    )
+    io::Error::new(io::ErrorKind::InvalidData, format!("invalid punch packet: {msg}"))
 }
 
 #[cfg(test)]
@@ -204,10 +193,7 @@ mod tests {
         assert!(pkt.len() >= PUNCH_MIN_WIRE_LEN);
         let decoded = decode_punch_packet(&pkt, &meta).unwrap();
         assert_eq!(decoded.packet_type, PunchPacketType::Hello);
-        assert_eq!(
-            decoded.padding_length,
-            pkt.len() - PUNCH_HEADER_LEN - PUNCH_SALT_LEN
-        );
+        assert_eq!(decoded.padding_length, pkt.len() - PUNCH_HEADER_LEN - PUNCH_SALT_LEN);
     }
 
     #[test]
@@ -269,10 +255,7 @@ mod tests {
 
     #[test]
     fn punch_packet_type_from_byte() {
-        assert_eq!(
-            PunchPacketType::from_byte(0x01),
-            Some(PunchPacketType::Hello)
-        );
+        assert_eq!(PunchPacketType::from_byte(0x01), Some(PunchPacketType::Hello));
         assert_eq!(PunchPacketType::from_byte(0x02), Some(PunchPacketType::Ack));
         assert!(PunchPacketType::from_byte(0x00).is_none());
         assert!(PunchPacketType::from_byte(0x03).is_none());

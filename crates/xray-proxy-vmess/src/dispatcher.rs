@@ -14,34 +14,37 @@
 //! [`DialBridge`]: xray_app_dispatcher::default::DialBridge
 //! [`DialFn`]: xray_app_dispatcher::default::DialFn
 
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, ReadHalf, WriteHalf,
 };
 use xray_app_dispatcher::default::DialFn;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-use xray_common::protocol::{request_option, Command, RequestHeader, SecurityType};
-use xray_common::bitmask::Bitmask;
-use crate::encoding::body_chunk::{PlainSizeParser, ShakeSizeParserAdapter, SizeParser};
-use xray_common::uuid::UUID;
+use xray_common::{
+    bitmask::Bitmask,
+    net::{address::Address, destination::Destination, network::Network, port::Port},
+    protocol::{Command, RequestHeader, SecurityType, request_option},
+    uuid::UUID,
+};
 use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead};
-use xray_transport::connection::Connection;
-use xray_transport::sockopt::SocketOptions;
+use xray_transport::{connection::Connection, sockopt::SocketOptions};
 
-use crate::account::MemoryAccount;
-use crate::encoding::client::ClientSession;
-use crate::encoding::server::has_aes_gcm_hardware_support;
-use crate::encoding::{generate_chacha20poly1305_key, ChunkNonceGenerator};
-use crate::encoding::VERSION;
-use crate::error::VmessError;
-
+use crate::{
+    account::MemoryAccount,
+    encoding::{
+        ChunkNonceGenerator, VERSION,
+        body_chunk::{PlainSizeParser, ShakeSizeParserAdapter, SizeParser},
+        client::ClientSession,
+        generate_chacha20poly1305_key,
+        server::has_aes_gcm_hardware_support,
+    },
+    error::VmessError,
+};
 
 /// VMess outbound 配置。
 #[derive(Debug, Clone)]
@@ -62,7 +65,6 @@ pub struct VmessOutboundConfig {
     pub email: String,
 }
 
-
 impl VmessOutboundConfig {
     /// 构造配置（默认 security=Auto）。
     #[must_use]
@@ -77,6 +79,7 @@ impl VmessOutboundConfig {
             email: String::new(),
         }
     }
+
     /// 设置安全类型（builder 风格）。
     #[must_use]
     pub fn with_security(mut self, security: SecurityType) -> Self {
@@ -86,7 +89,10 @@ impl VmessOutboundConfig {
 
     /// 指定 streamSettings（builder 风格）。
     #[must_use]
-    pub fn with_stream_settings(mut self, settings: Option<xray_transport::dialer::StreamSettings>) -> Self {
+    pub fn with_stream_settings(
+        mut self,
+        settings: Option<xray_transport::dialer::StreamSettings>,
+    ) -> Self {
         self.stream_settings = settings;
         self
     }
@@ -107,11 +113,7 @@ impl VmessOutboundConfig {
 
     /// 服务器 Destination（TCP）。
     fn server_destination(&self) -> Destination {
-        Destination::new(
-            self.server_address.clone(),
-            self.server_port,
-            Network::TCP,
-        )
+        Destination::new(self.server_address.clone(), self.server_port, Network::TCP)
     }
 }
 
@@ -130,7 +132,8 @@ fn parse_security(s: &str) -> SecurityType {
 
 /// 解析 VMess outbound settings JSON → VmessOutboundConfig。
 ///
-/// JSON 格式：`{ "vnext": [{ "address": "...", "port": 443, "users": [{ "id": "uuid", "security": "aes-128-gcm" }] }] }`
+/// JSON 格式：`{ "vnext": [{ "address": "...", "port": 443, "users": [{ "id": "uuid", "security":
+/// "aes-128-gcm" }] }] }`
 pub fn parse_vmess_config(data: &[u8]) -> Result<VmessOutboundConfig, String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
     // Go infra/conf/vmess.go:112-134 扁平形式：顶层 address 非空 → 以顶层
@@ -163,9 +166,7 @@ pub fn parse_vmess_config(data: &[u8]) -> Result<VmessOutboundConfig, String> {
     if vnext.len() != 1 {
         return Err(r#"vmess "vnext" should have one and only one member. Multiple endpoints should use multiple VMess outbounds and routing balancer instead"#.into());
     }
-    let first = vnext
-        .first()
-        .ok_or_else(|| "vnext array is empty".to_string())?;
+    let first = vnext.first().ok_or_else(|| "vnext array is empty".to_string())?;
     let address = first
         .get("address")
         .and_then(|v| v.as_str())
@@ -187,10 +188,7 @@ pub fn parse_vmess_config(data: &[u8]) -> Result<VmessOutboundConfig, String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| "missing vnext[0].users[0].id".to_string())?;
     let uuid = UUID::from_str(user_id)?;
-    let security_str = user
-        .get("security")
-        .and_then(|v| v.as_str())
-        .unwrap_or("auto");
+    let security_str = user.get("security").and_then(|v| v.as_str()).unwrap_or("auto");
     let level = user.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let email = user.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
@@ -234,7 +232,8 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>) -> DialFn {
         let target_port = dest.port();
         Box::pin(async move {
             let server_dest = config.server_destination();
-            let sockopt = config.stream_settings.as_ref().map(|s| s.socket_options()).unwrap_or_default();
+            let sockopt =
+                config.stream_settings.as_ref().map(|s| s.socket_options()).unwrap_or_default();
             let mut conn: Box<dyn Connection> = match &config.stream_settings {
                 Some(s) => xray_transport::dialer::dial(&server_dest, s, &sockopt)
                     .await
@@ -244,8 +243,8 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>) -> DialFn {
                     .map_err(|e| format!("vmess dial server (tcp): {e}"))?,
             };
 
-            // 2. 解析 security：Auto → 具体算法（与 server 端 has_aes_gcm_hardware_support 同语义）。
-            //    客户端发送具体 security 字节，服务端直接使用 → 两端 body 算法必一致。
+            // 2. 解析 security：Auto → 具体算法（与 server 端 has_aes_gcm_hardware_support
+            //    同语义）。 客户端发送具体 security 字节，服务端直接使用 → 两端 body 算法必一致。
             let security = resolve_security(config.security)
                 .map_err(|e| format!("vmess resolve security: {e}"))?;
             // 3. 构造请求头（resolved security）+ body option bits。
@@ -254,16 +253,14 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>) -> DialFn {
             // `use_masking` 为 false（Auto 不在 matches 里），缺 Go AEAD 档常态
             // 特征成 DPI 指纹差。Go client：Auto 落地 GCM/ChaCha 必然 0x04+0x08。
             let mut option = Bitmask::new(request_option::CHUNK_STREAM);
-            let use_masking = matches!(
-                security,
-                SecurityType::Aes128Gcm | SecurityType::Chacha20Poly1305
-            );
+            let use_masking =
+                matches!(security, SecurityType::Aes128Gcm | SecurityType::Chacha20Poly1305);
             if use_masking {
                 option.set(request_option::CHUNK_MASKING);
                 option.set(request_option::GLOBAL_PADDING);
             }
-            let account = MemoryAccount::new(config.user_uuid.clone())
-                .with_security(security.clone());
+            let account =
+                MemoryAccount::new(config.user_uuid.clone()).with_security(security.clone());
             let session = ClientSession::new();
             let header = RequestHeader::new(
                 VERSION,
@@ -275,15 +272,11 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>) -> DialFn {
             let sealed = session
                 .encode_request_header(&header, &account.cmd_key())
                 .map_err(|e| format!("vmess encode header: {e}"))?;
-            conn.write_all(&sealed)
-                .await
-                .map_err(|e| format!("vmess write header: {e}"))?;
-            conn.flush()
-                .await
-                .map_err(|e| format!("vmess flush header: {e}"))?;
+            conn.write_all(&sealed).await.map_err(|e| format!("vmess write header: {e}"))?;
+            conn.flush().await.map_err(|e| format!("vmess flush header: {e}"))?;
 
-            // 5. 构造 body 加密状态（request_body_key/iv 加密上行，response_body_key/iv 解密下行）。
-            //    响应头解码移入 down pump（与上行并发）：Go 服务端把响应头缓冲到首块
+            // 5. 构造 body 加密状态（request_body_key/iv 加密上行，response_body_key/iv
+            //    解密下行）。 响应头解码移入 down pump（与上行并发）：Go 服务端把响应头缓冲到首块
             //    下行数据才 flush（SetFlushNext），dial 阶段同步等待会造成双向死锁。
             let (req_cipher, resp_cipher) = build_body_ciphers(security, &session)
                 .map_err(|e| format!("vmess build body cipher: {e}"))?;
@@ -367,10 +360,7 @@ impl VmessConn {
             };
             tokio::join!(up, down);
         });
-        Self {
-            inner: client_io,
-            _pump: pump,
-        }
+        Self { inner: client_io, _pump: pump }
     }
 }
 
@@ -406,6 +396,7 @@ impl Connection for VmessConn {
     fn remote_addr(&self) -> std::io::Result<Option<SocketAddr>> {
         Ok(None)
     }
+
     fn local_addr(&self) -> std::io::Result<Option<SocketAddr>> {
         Ok(None)
     }
@@ -420,7 +411,7 @@ fn resolve_security(s: SecurityType) -> Result<SecurityType, VmessError> {
             } else {
                 Ok(SecurityType::Chacha20Poly1305)
             }
-        }
+        },
         SecurityType::Unknown => Err(VmessError::Other("unknown security type".into())),
         other => Ok(other),
     }
@@ -440,18 +431,21 @@ impl AeadCipher for BodyCipher {
             BodyCipher::Chacha(c) => c.nonce_size(),
         }
     }
+
     fn tag_size(&self) -> usize {
         match self {
             BodyCipher::Aes(c) => c.tag_size(),
             BodyCipher::Chacha(c) => c.tag_size(),
         }
     }
+
     fn key_size(&self) -> usize {
         match self {
             BodyCipher::Aes(c) => c.key_size(),
             BodyCipher::Chacha(c) => c.key_size(),
         }
     }
+
     fn seal(
         &self,
         nonce: &[u8],
@@ -463,6 +457,7 @@ impl AeadCipher for BodyCipher {
             BodyCipher::Chacha(c) => c.seal(nonce, aad, plaintext),
         }
     }
+
     fn open(
         &self,
         nonce: &[u8],
@@ -511,17 +506,15 @@ fn build_body_ciphers(
             let r = BodyCipher::Aes(Aes128Gcm::new(&session.request_body_key)?);
             let s = BodyCipher::Aes(Aes128Gcm::new(&session.response_body_key)?);
             Ok((r, s))
-        }
+        },
         SecurityType::Chacha20Poly1305 => {
             let rk = generate_chacha20poly1305_key(&session.request_body_key);
             let r = BodyCipher::Chacha(ChaCha20Poly1305Aead::new(&rk)?);
             let sk = generate_chacha20poly1305_key(&session.response_body_key);
             let s = BodyCipher::Chacha(ChaCha20Poly1305Aead::new(&sk)?);
             Ok((r, s))
-        }
-        other => Err(VmessError::Other(format!(
-            "unsupported body security: {other:?}"
-        ))),
+        },
+        other => Err(VmessError::Other(format!("unsupported body security: {other:?}"))),
     }
 }
 /// size_field 由 SizeParser 编码——CHUNK_MASKING 时 SHAKE128 掩码）。nonce 跨块自增。
@@ -533,8 +526,7 @@ async fn pump_up<C, R, W>(
     iv: [u8; 16],
     mut size_parser: Box<dyn SizeParser + Send>,
     global_padding: bool,
-)
-where
+) where
     C: AeadCipher + Send,
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -560,11 +552,11 @@ where
                 {
                     break;
                 }
-            }
+            },
             Err(e) => {
                 tracing::debug!(error = %e, "vmess up body plaintext read failed");
                 break;
-            }
+            },
         }
     }
     // 写终止 chunk：seal([]) → 仅 tag 字节，服务端 decode 看到 plaintext 为空即请求 body 结束
@@ -599,11 +591,7 @@ where
 {
     // SHAKE128 流消费顺序：next_padding_len → encode（与 decode 侧对称）
     let sb = size_parser.size_bytes();
-    let padding_size = if global_padding {
-        usize::from(size_parser.next_padding_len())
-    } else {
-        0
-    };
+    let padding_size = if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
     // 零中间 Vec：sealed/padding 追加进复用的 chunk_buf，size_field 前缀
     // 预留后回填，整 chunk 单次 write_all。
     let nonce = nonce_gen.next_ref();
@@ -634,8 +622,7 @@ async fn pump_down<C, R, W>(
     iv: [u8; 16],
     mut size_parser: Box<dyn SizeParser + Send>,
     global_padding: bool,
-)
-where
+) where
     C: AeadCipher + Send,
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -645,11 +632,8 @@ where
     let mut ciphertext = Vec::with_capacity(PUMP_BUF + 96);
     loop {
         // SHAKE128 流消费顺序：next_padding_len → decode（与 encode 侧对称）
-        let padding_size = if global_padding {
-            usize::from(size_parser.next_padding_len())
-        } else {
-            0
-        };
+        let padding_size =
+            if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
         let sb = size_parser.size_bytes();
         size_field.resize(sb, 0);
         if stream_r.read_exact(&mut size_field).await.is_err() {
@@ -671,11 +655,11 @@ where
                 if server_w.write_all(pt).await.is_err() {
                     break;
                 }
-            }
+            },
             Err(e) => {
                 tracing::debug!(error = %e.to_string(), "vmess down body chunk open failed");
                 break;
-            }
+            },
         }
     }
     let _ = server_w.shutdown().await;
@@ -700,7 +684,10 @@ mod tests {
     #[test]
     fn parse_security_mapping() {
         assert!(matches!(super::parse_security("aes-128-gcm"), SecurityType::Aes128Gcm));
-        assert!(matches!(super::parse_security("chacha20-poly1305"), SecurityType::Chacha20Poly1305));
+        assert!(matches!(
+            super::parse_security("chacha20-poly1305"),
+            SecurityType::Chacha20Poly1305
+        ));
         assert!(matches!(super::parse_security("auto"), SecurityType::Auto));
         assert!(matches!(super::parse_security("unknown"), SecurityType::Auto));
     }
@@ -827,10 +814,15 @@ mod tests {
     /// （Go outbound 的 header/body 并发 copy 不存在此问题）。
     #[tokio::test]
     async fn dial_does_not_block_on_response_header_go_set_flush_next_semantics() {
-        use crate::encoding::server::{ServerSession, SessionHistory};
-        use crate::validator::{MemoryUser, TimedUserValidator, Validator};
-        use std::io::{Read, Write};
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::{
+            io::{Read, Write},
+            sync::atomic::{AtomicBool, Ordering},
+        };
+
+        use crate::{
+            encoding::server::{ServerSession, SessionHistory},
+            validator::{MemoryUser, TimedUserValidator, Validator},
+        };
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let server_port = listener.local_addr().unwrap().port();
@@ -842,9 +834,7 @@ mod tests {
             let uuid = UUID::parse("66ad4540-b58c-4ad2-9926-ea63445a9b57").expect("uuid");
             let validator = TimedUserValidator::new();
             let account = MemoryAccount::new(uuid);
-            validator
-                .add(MemoryUser::new("t@example.com", account))
-                .expect("add user");
+            validator.add(MemoryUser::new("t@example.com", account)).expect("add user");
             let history = SessionHistory::new();
             let mut server = ServerSession::new(&validator, &history);
             let (_req, _) = server.decode_request_header(&mut sock).expect("decode header");
@@ -853,9 +843,7 @@ mod tests {
             sock.read_exact(&mut b).expect("read body byte");
             flag.store(true, Ordering::SeqCst);
             let resp = xray_common::protocol::ResponseHeader::new(Command::Tcp);
-            server
-                .encode_response_header(&resp, &mut sock)
-                .expect("encode response header");
+            server.encode_response_header(&resp, &mut sock).expect("encode response header");
             // 保持连接片刻，让 down pump 的 chunk 读取自然等 EOF。
             std::thread::sleep(std::time::Duration::from_millis(200));
         });
@@ -867,11 +855,8 @@ mod tests {
             Port::new(server_port),
         ));
         let dial = make_vmess_dial_fn(Arc::clone(&cfg));
-        let dest = Destination::new(
-            Address::from_ipv4_bytes([127, 0, 0, 1]),
-            Port::new(1),
-            Network::TCP,
-        );
+        let dest =
+            Destination::new(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(1), Network::TCP);
 
         // 修复断言 1：dial 不得阻塞等待响应头（修复前此处 2s 超时 panic）。
         let mut conn = tokio::time::timeout(std::time::Duration::from_secs(2), dial(&dest))
@@ -939,9 +924,11 @@ mod tests {
             self.buf.extend_from_slice(buf);
             Poll::Ready(Ok(buf.len()))
         }
+
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
@@ -972,9 +959,6 @@ mod tests {
             .expect("write chunk");
         }
         assert_eq!(w.writes, 2, "each chunk must be one write_all (old impl: 3)");
-        assert!(
-            chunk_buf.capacity() <= cap,
-            "chunk_buf must be reused without growth"
-        );
+        assert!(chunk_buf.capacity() <= cap, "chunk_buf must be reused without growth");
     }
 }

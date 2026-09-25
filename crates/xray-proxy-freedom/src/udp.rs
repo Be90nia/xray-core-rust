@@ -1,8 +1,8 @@
 //! Freedom UDP relay——XUDP 帧流 ↔ 原始 UDP 数据报。
 //!
 //! 对应 Go `proxy/freedom/freedom.go` 的 UDP 分支：
-//! - **request** 方向：[`xray_xudp::packet::PacketReader`] 从 link.reader 读 XUDP 帧，
-//!   提取 (dest, payload)，通过 [`UdpSocket::send_to`] 发往目标。
+//! - **request** 方向：[`xray_xudp::packet::PacketReader`] 从 link.reader 读 XUDP 帧， 提取 (dest,
+//!   payload)，通过 [`UdpSocket::send_to`] 发往目标。
 //! - **response** 方向：[`UdpSocket::recv_from`] 读回 UDP 响应，用
 //!   [`xray_xudp::packet::PacketWriter`] 封装为 XUDP 帧写回 link.writer。
 //!
@@ -18,18 +18,19 @@
 //! 真实 Xray 对 Keep 帧的 `udp_target` 字段做 per-packet 路由（不同 dest），当前也支持
 //! 但共享同一 socket（NAT 下 per-dest 用同一本地端口）。
 
-use std::collections::HashMap;
-use std::io;
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    io,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
 use tokio::net::UdpSocket;
-
-use xray_buf::io::{Reader, Writer};
-use xray_buf::multi::MultiBuffer;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::port::Port;
+use xray_buf::{
+    io::{Reader, Writer},
+    multi::MultiBuffer,
+};
+use xray_common::net::{address::Address, destination::Destination, port::Port};
 use xray_transport::link::Link;
 use xray_xudp::packet::{PacketError, PacketReader, PacketWriter};
 
@@ -75,8 +76,8 @@ pub async fn relay_with_noises(
 /// 解析目标地址 → 绑定 UDP socket → 双向并发转发 XUDP 帧与 UDP 数据报。
 /// 任一方向结束（EOF / 错误）时整体返回。
 ///
-/// - 请求方向逐包：override 改写帧目标（Go :596-601）→ Block 检查丢包（:634-637）
-///   → 发送；noises 首包前注入，override 端口为 53（DNS）时跳过（:668-674）。
+/// - 请求方向逐包：override 改写帧目标（Go :596-601）→ Block 检查丢包（:634-637） → 发送；noises
+///   首包前注入，override 端口为 53（DNS）时跳过（:668-674）。
 /// - 响应方向逐包：来源 Block 检查丢包（Go `PacketReader` :515-517）。
 pub async fn relay_policy(
     dest: &Destination,
@@ -87,8 +88,11 @@ pub async fn relay_policy(
     let Link { mut reader, mut writer } = link;
 
     // 1. 解析目标地址（override 先于解析，Go :269-279 override 先于 dial）
-    let overridden = crate::config::apply_destination_override(dest, policy.destination_override.as_ref());
-    let default_target = resolve_socket_addr(&overridden, dynamic_udp_strategy(policy.domain_strategy, dest)).await?;
+    let overridden =
+        crate::config::apply_destination_override(dest, policy.destination_override.as_ref());
+    let default_target =
+        resolve_socket_addr(&overridden, dynamic_udp_strategy(policy.domain_strategy, dest))
+            .await?;
 
     // override 端口为 53（DNS）时首包前不注入 noises（Go :668-674：
     // `if w.UDPOverride.Port == 53` 跳过 Noise，保守不干扰 DNS 查询）
@@ -99,10 +103,7 @@ pub async fn relay_policy(
 
     // 2. 绑定 UDP socket：sendThrough 源地址优先（bd 7zc，对齐 Go
     // system_dialer.go:59-84 ListenPacket 绑 srcAddr），否则与目标同族通配。
-    let src_ip = xray_transport::system_dialer::DIAL_SRC
-        .try_with(|v| *v)
-        .ok()
-        .flatten();
+    let src_ip = xray_transport::system_dialer::DIAL_SRC.try_with(|v| *v).ok().flatten();
     let bind_addr = match src_ip {
         Some(ip) => SocketAddr::new(ip, 0),
         None => match default_target {
@@ -123,8 +124,8 @@ pub async fn relay_policy(
         pump_response(&resp_sock, resp_global_id, &mut writer, &resp_policy).await
     });
 
-    // 5. 请求 pump: link.reader → XUDP 帧 → socket.send_to
-    //    noises 在首个真实数据报前注入（对齐 Go NoisePacketWriter 首写触发）
+    // 5. 请求 pump: link.reader → XUDP 帧 → socket.send_to noises 在首个真实数据报前注入（对齐 Go
+    //    NoisePacketWriter 首写触发）
     let mut noises = if noises.is_empty() { None } else { Some(noises.to_vec()) };
     let mut resolved: HashMap<String, IpAddr> = HashMap::new();
     let req_result = pump_request(
@@ -181,8 +182,11 @@ async fn resolve_socket_addr(
                 match xray_transport::system_dialer::lookup_for_ip(domain, strategy, None).await {
                     Ok(ips) if !ips.is_empty() => {
                         use rand::seq::IndexedRandom;
-                        return Ok(SocketAddr::new(*ips.choose(&mut rand::rng()).expect("non-empty"), port));
-                    }
+                        return Ok(SocketAddr::new(
+                            *ips.choose(&mut rand::rng()).expect("non-empty"),
+                            port,
+                        ));
+                    },
                     _ => {
                         // Force* 解析失败硬错（Go :293-295）；Use* 降级系统解析（Go :296-300）
                         if strategy.force_ip() {
@@ -191,7 +195,7 @@ async fn resolve_socket_addr(
                                 format!("force strategy resolve failed for {domain}"),
                             ));
                         }
-                    }
+                    },
                 }
             }
             let lookup = format!("{domain}:{port}");
@@ -199,7 +203,7 @@ async fn resolve_socket_addr(
                 .await?
                 .next()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "DNS resolve failed"))
-        }
+        },
     }
 }
 
@@ -235,19 +239,26 @@ async fn pump_request(
             .await?;
         }
         // 019n：parse_and_send Ok(false) 但 accum 残留 = 协议层终止帧（Go xudp.go EOF）
-        if !accum.is_empty() { return Ok(()); }
+        if !accum.is_empty() {
+            return Ok(());
+        }
         match reader.read_multi_buffer().await {
             Ok(mb) => {
-                if mb.is_empty() { return Ok(()); }
+                if mb.is_empty() {
+                    return Ok(());
+                }
                 // 池化 Buffer 直写：逐 buffer 单拷贝进 accum，免 to_vec 的中间分配+二次拷贝。
                 accum.reserve(mb.len());
                 for buf in mb.iter() {
                     accum.extend_from_slice(buf.bytes());
                 }
                 if accum.len() > ACCUM_MAX_BYTES {
-                    return Err(io::Error::new(io::ErrorKind::OutOfMemory, format!("udp accum exceeded {ACCUM_MAX_BYTES} bytes")));
+                    return Err(io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        format!("udp accum exceeded {ACCUM_MAX_BYTES} bytes"),
+                    ));
                 }
-            }
+            },
             Err(_) => return Ok(()),
         }
     }
@@ -279,11 +290,9 @@ async fn resolve_udp_domain(
             ));
         }
     }
-    tokio::net::lookup_host((domain, port))
-        .await?
-        .next()
-        .map(|sa| sa.ip())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("DNS resolve failed for {domain}")))
+    tokio::net::lookup_host((domain, port)).await?.next().map(|sa| sa.ip()).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("DNS resolve failed for {domain}"))
+    })
 }
 
 /// 从 accum 前端解析一个 XUDP 帧，逐包应用策略后 send_to，返回 true（有进展）。
@@ -322,10 +331,7 @@ async fn parse_and_send(
             let (data, udp_target) = pkt.into_parts();
             // 逐包 override 改写（Go :596-601：地址有效替换 / 端口非 0 替换）
             let mut effective = udp_target.unwrap_or_else(|| {
-                Destination::udp(
-                    default_target.ip().into(),
-                    Port::new(default_target.port()),
-                )
+                Destination::udp(default_target.ip().into(), Port::new(default_target.port()))
             });
             effective = crate::config::apply_destination_override(
                 &effective,
@@ -351,18 +357,18 @@ async fn parse_and_send(
                             Ok(ip) => {
                                 resolved.insert(domain.clone(), ip);
                                 ip
-                            }
+                            },
                             Err(e) => {
                                 // 丢帧继续（Go :627-630 b.Release(); continue；
                                 // Force* 失败同样丢帧——Go :625-628 注释）
                                 tracing::debug!(domain = %domain, "freedom: udp frame dropped, resolve failed: {e}");
                                 return Ok(true);
-                            }
+                            },
                         },
                     };
                     effective = crate::config::destination_with_ip(&effective, ip);
                     SocketAddr::new(ip, effective.port().value())
-                }
+                },
             };
             // finalRule Block 检查在解析后的目标上（bd 6x5o UDP：Go :634-637
             // applyFinalRules 在域名→IP 之后）：命中丢包但不中断流
@@ -384,7 +390,7 @@ async fn parse_and_send(
             }
             sock.send_to(&data, target).await?;
             Ok(true)
-        }
+        },
         Ok(None) => Ok(false), // 流内干净结束，但 accum 可能有残留 → 等更多数据
         Err(PacketError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
         // 019n：协议层终止帧
@@ -405,21 +411,23 @@ async fn send_noises(
         match n.apply_to.as_str() {
             "ipv4" if !is_v4 => continue,
             "ipv6" if is_v4 => continue,
-            _ => {}
+            _ => {},
         }
         // 用户指定 packet 或随机长度噪声（[length_min, length_max) 半开，对齐 Go RandBetween）
         let packet: Vec<u8> = if !n.packet.is_empty() {
             n.packet.clone()
         } else {
-            let mut buf = vec![0u8; crate::fragment::rand_between(n.length_min, n.length_max) as usize];
+            let mut buf =
+                vec![0u8; crate::fragment::rand_between(n.length_min, n.length_max) as usize];
             rand::rng().fill_bytes(&mut buf);
             buf
         };
         sock.send_to(&packet, target).await?;
         if n.delay_min != 0 || n.delay_max != 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(
-                crate::fragment::rand_between(n.delay_min, n.delay_max),
-            ))
+            tokio::time::sleep(std::time::Duration::from_millis(crate::fragment::rand_between(
+                n.delay_min,
+                n.delay_max,
+            )))
             .await;
         }
     }
@@ -491,10 +499,9 @@ fn dest_to_socket_addr(dest: &Destination) -> Option<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
+    use xray_common::net::{address::Address, network::Network, port::Port};
+
     use super::*;
-    use xray_common::net::address::Address;
-    use xray_common::net::network::Network;
-    use xray_common::net::port::Port;
 
     /// 构造 IPv4 UDP Destination。
     fn udp_dest(ip: &str, port: u16) -> Destination {
@@ -514,37 +521,29 @@ mod tests {
                 match echo.recv_from(&mut buf).await {
                     Ok((n, peer)) => {
                         let _ = echo.send_to(&buf[..n], peer).await;
-                    }
+                    },
                     Err(_) => break,
                 }
             }
         });
 
-        // 2. 构造 link（pipe 对）：client 写 XUDP 帧 → freedom relay → UDP server
-        //    freedom relay 回写 XUDP 帧 → client 读
+        // 2. 构造 link（pipe 对）：client 写 XUDP 帧 → freedom relay → UDP server freedom relay
+        //    回写 XUDP 帧 → client 读
         let pipe_opt = xray_buf::pipe::PipeOption::default();
         let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
         let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
-        let link = Link::new(
-            Box::new(up_r) as Box<dyn Reader>,
-            Box::new(dn_w) as Box<dyn Writer>,
-        );
+        let link = Link::new(Box::new(up_r) as Box<dyn Reader>, Box::new(dn_w) as Box<dyn Writer>);
 
         let dest = udp_dest("127.0.0.1", echo_addr.port());
-        let relay_task = tokio::spawn(async move {
-            relay(&dest, link).await
-        });
+        let relay_task = tokio::spawn(async move { relay(&dest, link).await });
 
         // 3. client 写一个 XUDP 帧
         let mut client_writer = Box::new(up_w) as Box<dyn Writer>;
         let global_id: [u8; GLOBAL_ID_LEN] = [1, 2, 3, 4, 5, 6, 7, 8];
         let mut frame = Vec::new();
         {
-            let mut pw = PacketWriter::new(
-                &mut frame,
-                udp_dest("127.0.0.1", echo_addr.port()),
-                global_id,
-            );
+            let mut pw =
+                PacketWriter::new(&mut frame, udp_dest("127.0.0.1", echo_addr.port()), global_id);
             pw.write_packet(b"hello-udp").unwrap();
         }
         let mut mb = MultiBuffer::new();
@@ -571,11 +570,7 @@ mod tests {
         drop(client_writer);
 
         // relay 应正常结束
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            relay_task,
-        )
-        .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), relay_task).await;
 
         echo_task.abort();
     }
@@ -591,7 +586,7 @@ mod tests {
                 match echo.recv_from(&mut buf).await {
                     Ok((n, peer)) => {
                         let _ = echo.send_to(&buf[..n], peer).await;
-                    }
+                    },
                     Err(_) => break,
                 }
             }
@@ -600,10 +595,7 @@ mod tests {
         let pipe_opt = xray_buf::pipe::PipeOption::default();
         let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
         let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
-        let link = Link::new(
-            Box::new(up_r) as Box<dyn Reader>,
-            Box::new(dn_w) as Box<dyn Writer>,
-        );
+        let link = Link::new(Box::new(up_r) as Box<dyn Reader>, Box::new(dn_w) as Box<dyn Writer>);
 
         let dest = udp_dest("127.0.0.1", echo_addr.port());
         let relay_task = tokio::spawn(async move { relay(&dest, link).await });
@@ -636,7 +628,7 @@ mod tests {
             }
             match tokio::time::timeout(remaining, client_reader.read_multi_buffer()).await {
                 Ok(Ok(mb)) if !mb.is_empty() => collected.extend_from_slice(&mb.to_vec()),
-                _ => {}
+                _ => {},
             }
             // 尝试从累积字节解析完整帧
             let mut pr = PacketReader::new(std::io::Cursor::new(&collected[..]));
@@ -662,11 +654,8 @@ mod tests {
 
     #[test]
     fn dest_to_socket_addr_domain_returns_none() {
-        let d = Destination::new(
-            Address::Domain("example.com".into()),
-            Port::new(443),
-            Network::UDP,
-        );
+        let d =
+            Destination::new(Address::Domain("example.com".into()), Port::new(443), Network::UDP);
         assert!(dest_to_socket_addr(&d).is_none());
     }
 
@@ -693,10 +682,7 @@ mod tests {
         let pipe_opt = xray_buf::pipe::PipeOption::default();
         let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
         let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
-        let link = Link::new(
-            Box::new(up_r) as Box<dyn Reader>,
-            Box::new(dn_w) as Box<dyn Writer>,
-        );
+        let link = Link::new(Box::new(up_r) as Box<dyn Reader>, Box::new(dn_w) as Box<dyn Writer>);
         let dest = udp_dest("127.0.0.1", a_port);
         let relay_task = tokio::spawn(async move { relay_policy(&dest, link, &[], &policy).await });
 
@@ -744,10 +730,7 @@ mod tests {
         let pipe_opt = xray_buf::pipe::PipeOption::default();
         let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
         let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
-        let link = Link::new(
-            Box::new(up_r) as Box<dyn Reader>,
-            Box::new(dn_w) as Box<dyn Writer>,
-        );
+        let link = Link::new(Box::new(up_r) as Box<dyn Reader>, Box::new(dn_w) as Box<dyn Writer>);
         let dest = udp_dest("127.0.0.1", echo_port);
         let relay_task = tokio::spawn(async move { relay_policy(&dest, link, &[], &policy).await });
 
@@ -793,14 +776,10 @@ mod tests {
         let pipe_opt = xray_buf::pipe::PipeOption::default();
         let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
         let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
-        let link = Link::new(
-            Box::new(up_r) as Box<dyn Reader>,
-            Box::new(dn_w) as Box<dyn Writer>,
-        );
+        let link = Link::new(Box::new(up_r) as Box<dyn Reader>, Box::new(dn_w) as Box<dyn Writer>);
         let dest = udp_dest("127.0.0.1", 53001);
-        let relay_task = tokio::spawn(async move {
-            relay_policy(&dest, link, &noises, &policy).await
-        });
+        let relay_task =
+            tokio::spawn(async move { relay_policy(&dest, link, &noises, &policy).await });
 
         let mut client_writer = Box::new(up_w) as Box<dyn Writer>;
         let mut frame = Vec::new();
@@ -851,7 +830,7 @@ mod tests {
     /// + per-domain 缓存（同域名只解析一次，Go ResolvedUDPAddr）。
     #[tokio::test]
     async fn udp_domain_frames_resolved_per_frame_with_cache() {
-        use crate::test_support::{install, uninstall, FakeDns, FAKE_DNS_LOCK};
+        use crate::test_support::{FAKE_DNS_LOCK, FakeDns, install, uninstall};
         let _g = FAKE_DNS_LOCK.lock();
         // 同域名第二次解析走缓存；脚本多备几份，若缓存失效会弹出下一份但 seen 计数仍暴露
         let local = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
@@ -880,10 +859,7 @@ mod tests {
         let pipe_opt = xray_buf::pipe::PipeOption::default();
         let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
         let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
-        let link = Link::new(
-            Box::new(up_r) as Box<dyn Reader>,
-            Box::new(dn_w) as Box<dyn Writer>,
-        );
+        let link = Link::new(Box::new(up_r) as Box<dyn Reader>, Box::new(dn_w) as Box<dyn Writer>);
         let dest = udp_dest("127.0.0.1", closed_port);
         let policy = UdpPolicy {
             domain_strategy: xray_transport::sockopt::DomainStrategy::UseIP,
@@ -895,11 +871,9 @@ mod tests {
         let mut client_writer = Box::new(up_w) as Box<dyn Writer>;
         let global_id: [u8; GLOBAL_ID_LEN] = [9; GLOBAL_ID_LEN];
         let mut frames = Vec::new();
-        for (domain, payload) in [
-            ("a.test", &b"one"[..]),
-            ("b.test", &b"two"[..]),
-            ("a.test", &b"three"[..]),
-        ] {
+        for (domain, payload) in
+            [("a.test", &b"one"[..]), ("b.test", &b"two"[..]), ("a.test", &b"three"[..])]
+        {
             let frame_dest = Destination::new(
                 Address::Domain(domain.into()),
                 Port::new(echo_port),
@@ -921,11 +895,7 @@ mod tests {
             vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()],
             "domain frames must be delivered to their own resolved target"
         );
-        assert_eq!(
-            fake.query_count(),
-            2,
-            "a.test resolved once (cache), b.test once"
-        );
+        assert_eq!(fake.query_count(), 2, "a.test resolved once (cache), b.test once");
         assert_eq!(fake.seen()[0].0, "a.test");
         assert_eq!(fake.seen()[1].0, "b.test");
 
@@ -934,4 +904,3 @@ mod tests {
         uninstall();
     }
 }
-

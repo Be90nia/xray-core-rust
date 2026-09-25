@@ -10,8 +10,8 @@
 //! 每收到一帧数据就扣减，直到预算耗尽。
 //!
 //! `Drain` 行为（对应 Go）：
-//! - 预算 > 0：精确读取预算字节；全部读完 → Err（连接过长，疑探测）；
-//!   读取不足 → Err（连接提前关闭）。
+//! - 预算 > 0：精确读取预算字节；全部读完 → Err（连接过长，疑探测）； 读取不足 →
+//!   Err（连接提前关闭）。
 //! - 预算 ≤ 0：Ok（不需要排空）。
 
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -23,7 +23,7 @@ use crate::dice::DeterministicDice;
 /// 排空器 trait，对应 Go `drain.Drainer` interface。
 ///
 /// 使用 `Pin<Box<dyn Future>>` 返回类型而非 `async fn`，确保 dyn-compatible
-///（`&dyn Drainer` 可用）。
+/// （`&dyn Drainer` 可用）。
 pub trait Drainer: Send + Sync {
     /// 接收到 `size` 字节后，扣减排空预算（对应 Go `AcknowledgeReceive`）。
     fn acknowledge_receive(&self, size: usize);
@@ -73,9 +73,7 @@ impl BehaviorSeedLimitedDrainer {
         // Go's dice.Roll uses the global rand source (non-deterministic).
         let rand_drain_rolled = (rand::random::<u64>() % rand_drain_max as u64) as usize;
         let total = drain_foundation + base_drain_size + rand_drain_rolled;
-        Self {
-            drain_size: AtomicI64::new(total as i64),
-        }
+        Self { drain_size: AtomicI64::new(total as i64) }
     }
 
     /// 当前剩余排空预算（测试用）。
@@ -103,9 +101,7 @@ impl Drainer for BehaviorSeedLimitedDrainer {
                 // All bytes read — connection was longer than expected (likely probing).
                 Ok(()) => Err(std::io::Error::other("drained connection")),
                 // Reader closed before drain complete — normal for real connections.
-                Err(e) => Err(std::io::Error::other(format!(
-                    "unable to drain connection: {e}"
-                ))),
+                Err(e) => Err(std::io::Error::other(format!("unable to drain connection: {e}"))),
             }
         })
     }
@@ -168,9 +164,11 @@ pub async fn with_error(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Cursor;
+
     use tokio::io::BufReader;
+
+    use super::*;
 
     fn make_reader(data: &[u8]) -> BufReader<Cursor<&[u8]>> {
         BufReader::new(Cursor::new(data))

@@ -12,8 +12,8 @@
 //!
 //! 实现配置层 + [`config::DnsRule::match_q_type`] / [`config::DnsRule::apply`] 纯函数：
 //! - [`config::Config`] / [`config::DnsRuleConfig`] / [`config::RuleAction`] — 配置层 + prost 双向
-//! - [`config::DnsRule`] — 运行时规则 + qType 匹配 + domain 匹配
-//!   （已接 `xray_geodata` matcher，就地编译 Full/Domain/Substr/Regex）
+//! - [`config::DnsRule`] — 运行时规则 + qType 匹配 + domain 匹配 （已接 `xray_geodata`
+//!   matcher，就地编译 Full/Domain/Substr/Regex）
 //!
 //! 上游转发（依赖 `features::dns::Client`）+ FakeDNS 集成由切片3 承接。
 
@@ -26,8 +26,13 @@ pub mod outbound;
 
 // 顶层 re-export。
 pub use config::{Config, DnsRule, DnsRuleConfig, RuleAction};
-pub use dns_message::{DnsHeader, DnsQuestion, build_dns_response, build_ip_response, parse_dns_query};
+pub use dns_message::{
+    DnsHeader, DnsQuestion, build_dns_response, build_ip_response, parse_dns_query,
+};
 pub use error::{DnsProxyError, Result};
-pub use handler::{Handler, ProcessOutcome, QTYPE_A, QTYPE_AAAA, decode_tcp_dns_message, decide_action, encode_tcp_dns_message};
+pub use handler::{
+    Handler, ProcessOutcome, QTYPE_A, QTYPE_AAAA, decide_action, decode_tcp_dns_message,
+    encode_tcp_dns_message,
+};
 pub use inbound::DnsInbound;
 pub use outbound::{DnsOutbound, forward_tcp_raw, forward_udp_raw, resolve_dest_socket_addr};

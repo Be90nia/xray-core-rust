@@ -6,31 +6,36 @@
 //! - 业务任务（client init / server session）通过 channels 与 dispatcher 通信
 //! - UdpIo::send_to 直接走 raw；UdpIo::recv_from 从 data channel 拉
 
-use std::collections::HashMap;
-use std::io;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    io,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
-use crate::finalmask::realm::http::{self, Client, ConnectRequest};
-use crate::finalmask::realm::punch::{
-    decode_punch_packet, encode_punch_packet, PunchMetadata, PunchPacketType,
+use crate::finalmask::{
+    UDP_SIZE, UdpIo,
+    realm::{
+        http::{self, Client, ConnectRequest},
+        punch::{PunchMetadata, PunchPacketType, decode_punch_packet, encode_punch_packet},
+        stun::{
+            DEFAULT_PUNCH_INTERVAL, DEFAULT_PUNCH_TIMEOUT, DEFAULT_STUN_TIMEOUT, TransactionId,
+            addr_port_strings, build_binding_request, candidate_punch_addrs,
+            expand_symmetric_nat_candidates, is_stun_message, parse_addr_ports,
+            parse_stun_binding_response, resolve_stun_servers,
+        },
+    },
 };
-use crate::finalmask::realm::stun::{
-    addr_port_strings, build_binding_request, candidate_punch_addrs,
-    expand_symmetric_nat_candidates, is_stun_message, parse_addr_ports,
-    parse_stun_binding_response, resolve_stun_servers, TransactionId,
-    DEFAULT_PUNCH_INTERVAL, DEFAULT_PUNCH_TIMEOUT, DEFAULT_STUN_TIMEOUT,
-};
-use crate::finalmask::{UdpIo, UDP_SIZE};
 
 /// UDP 包通道容量（data 通道 + stun 通道 + punch 通道都按此值）。
 const CHANNEL_BUFFER: usize = 64;
-
 
 /// realm 共享配置（对应 Go `realm.Config`）。
 ///
@@ -114,12 +119,7 @@ impl RealmConnClient {
             // init 失败：peer 保持 None；send_to 后续返回 NotConnected
         });
 
-        Ok(Self {
-            raw,
-            data_rx: Mutex::new(data_rx),
-            peer,
-            cancel,
-        })
+        Ok(Self { raw, data_rx: Mutex::new(data_rx), peer, cancel })
     }
 }
 
@@ -128,10 +128,7 @@ impl UdpIo for RealmConnClient {
     async fn send_to(&self, buf: &[u8], _addr: SocketAddr) -> io::Result<usize> {
         // 客户端始终发给已确定的 peer（addr 参数被忽略，与 Go 行为一致）
         let peer = self.peer.get().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotConnected,
-                "realm: peer not yet determined",
-            )
+            io::Error::new(io::ErrorKind::NotConnected, "realm: peer not yet determined")
         })?;
         self.raw.send_to(buf, *peer).await
     }
@@ -148,11 +145,8 @@ impl UdpIo for RealmConnClient {
                 }
                 buf[..data.len()].copy_from_slice(&data);
                 Ok((data.len(), addr))
-            }
-            None => Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "realm: dispatcher closed",
-            )),
+            },
+            None => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "realm: dispatcher closed")),
         }
     }
 
@@ -200,11 +194,7 @@ impl RealmConnServer {
             server_loop(shared_init, stun_rx, config_init, cancel_clone).await;
         });
 
-        Ok(Self {
-            raw,
-            data_rx: Mutex::new(data_rx),
-            cancel,
-        })
+        Ok(Self { raw, data_rx: Mutex::new(data_rx), cancel })
     }
 }
 
@@ -227,11 +217,8 @@ impl UdpIo for RealmConnServer {
                 }
                 buf[..data.len()].copy_from_slice(&data);
                 Ok((data.len(), addr))
-            }
-            None => Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "realm: dispatcher closed",
-            )),
+            },
+            None => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "realm: dispatcher closed")),
         }
     }
 
@@ -275,10 +262,7 @@ async fn dispatcher_loop(shared: Arc<Shared>) {
         let mut matched = false;
         for (meta, tx) in punch_channels.iter() {
             if let Ok(p) = decode_punch_packet(packet, meta) {
-                let _ = tx.try_send(PunchEvent {
-                    addr,
-                    packet_type: p.packet_type,
-                });
+                let _ = tx.try_send(PunchEvent { addr, packet_type: p.packet_type });
                 matched = true;
                 break;
             }
@@ -309,7 +293,7 @@ async fn client_init(
     let local_ip = shared.raw.local_addr().ok().map(|sa| sa.ip());
     let servers = resolve_stun_servers(local_ip, &config.stun_servers);
     if servers.is_empty() {
-        return Err(io::Error::other( "realm: no stun servers"));
+        return Err(io::Error::other("realm: no stun servers"));
     }
 
     // 1. 向所有 STUN 服务器发 Binding Request
@@ -338,34 +322,26 @@ async fn client_init(
         }
     }
     if locals.is_empty() {
-        return Err(io::Error::other( "realm: no stun locals"));
+        return Err(io::Error::other("realm: no stun locals"));
     }
 
     // 3. HTTP Connect 获取 peers
     let meta = http::new_punch_metadata()?;
-    let req = ConnectRequest {
-        addresses: addr_port_strings(&locals),
-        metadata: meta.clone(),
-    };
-    let resp = client.connect(&config.id, &req).await.map_err(|e| {
-        io::Error::other( e.to_string())
-    })?;
+    let req = ConnectRequest { addresses: addr_port_strings(&locals), metadata: meta.clone() };
+    let resp =
+        client.connect(&config.id, &req).await.map_err(|e| io::Error::other(e.to_string()))?;
     let peers = parse_addr_ports(&resp.addresses).unwrap_or_default();
 
     // 4. NAT 端口预测扩展
     let (filtered, mut seen) = candidate_punch_addrs(&locals, &peers);
     let expanded = expand_symmetric_nat_candidates(filtered, &mut seen);
     if expanded.is_empty() {
-        return Err(io::Error::other( "realm: no peers after expansion"));
+        return Err(io::Error::other("realm: no peers after expansion"));
     }
 
     // 5. 注册 punch channel，启动 punch loop
     let (punch_tx, punch_rx) = mpsc::channel(CHANNEL_BUFFER);
-    shared
-        .punch_channels
-        .lock()
-        .await
-        .insert(meta.clone(), punch_tx);
+    shared.punch_channels.lock().await.insert(meta.clone(), punch_tx);
 
     let raw = Arc::clone(&shared.raw);
     let meta_loop = meta.clone();
@@ -393,7 +369,7 @@ async fn client_punch_loop(
                 for p in &peers {
                     let _ = raw.send_to(&packet, *p).await;
                 }
-            }
+            },
             Err(_) => break,
         }
         tokio::select! {
@@ -454,7 +430,7 @@ async fn server_loop(
                 }
                 backoff = (backoff * 2).min(Duration::from_secs(30));
                 continue;
-            }
+            },
         };
         backoff = Duration::from_secs(1);
         let session_id = resp.session_id;
@@ -542,11 +518,7 @@ async fn heartbeat_loop(
             break;
         }
         let req = crate::finalmask::realm::http::HeartbeatRequest::default();
-        if client
-            .heartbeat(&config.id, &session_id, &req)
-            .await
-            .is_err()
-        {
+        if client.heartbeat(&config.id, &session_id, &req).await.is_err() {
             break;
         }
     }
@@ -592,7 +564,6 @@ async fn wait_cancel(cancel: Arc<AtomicBool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn client_constructs_without_stun_servers_returns_error_via_init() {
@@ -607,25 +578,20 @@ mod tests {
             stun_servers: vec![],
             use_tls: false,
         };
-        let raw: Box<dyn UdpIo> = Box::new(
-            tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
-        );
+        let raw: Box<dyn UdpIo> =
+            Box::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let client = RealmConnClient::new(&config, raw).expect("construct");
         // 等待 init task 跑完（无 STUN 服务器应几乎立即失败）
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let err = client
-            .send_to(b"hello", "127.0.0.1:9999".parse().unwrap())
-            .await
-            .unwrap_err();
+        let err = client.send_to(b"hello", "127.0.0.1:9999".parse().unwrap()).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotConnected);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn server_constructs_and_drop_signals_cancel() {
         let config = RealmConfig::default();
-        let raw: Box<dyn UdpIo> = Box::new(
-            tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
-        );
+        let raw: Box<dyn UdpIo> =
+            Box::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let server = RealmConnServer::new(&config, raw).expect("construct");
         // 简单验证：drop 不 panic
         drop(server);

@@ -49,9 +49,7 @@ mod tests {
 
     #[test]
     fn stats_error_display_not_found() {
-        let e = StatsError::NotFound {
-            name: "user>>>traffic".into(),
-        };
+        let e = StatsError::NotFound { name: "user>>>traffic".into() };
         assert_eq!(e.to_string(), "resource `user>>>traffic` not found");
     }
 

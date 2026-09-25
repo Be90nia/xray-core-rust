@@ -197,18 +197,11 @@ mod tests {
 
         let mut accounts = HashMap::new();
         accounts.insert("u".into(), "p".into());
-        let cfg = ServerConfig {
-            auth_type: AuthType::Password,
-            accounts,
-            ..Default::default()
-        };
+        let cfg = ServerConfig { auth_type: AuthType::Password, accounts, ..Default::default() };
         assert!(cfg.requires_auth());
 
         // Password 类型但空 accounts → 不要求认证
-        let cfg = ServerConfig {
-            auth_type: AuthType::Password,
-            ..Default::default()
-        };
+        let cfg = ServerConfig { auth_type: AuthType::Password, ..Default::default() };
         assert!(!cfg.requires_auth());
     }
 

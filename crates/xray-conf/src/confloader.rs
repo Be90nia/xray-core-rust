@@ -3,13 +3,13 @@
 //! 对应 Go `main/confloader/*.go`。提供从文件路径、reader、字符串加载配置的高级 API，
 //! 自动按扩展名识别格式。
 
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
+use std::{fs::File, io::Read, path::Path};
 
-use crate::config::Config;
-use crate::error::{ConfError, Result};
-use crate::vformat::Format;
+use crate::{
+    config::Config,
+    error::{ConfError, Result},
+    vformat::Format,
+};
 
 /// 从文件路径加载配置。
 ///
@@ -18,19 +18,18 @@ use crate::vformat::Format;
 pub fn load_file(path: &Path) -> Result<Config> {
     let format = Format::from_path(path).ok_or_else(|| {
         ConfError::UnsupportedFormat(
-            path.extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("<no extension>")
-                .to_owned(),
+            path.extension().and_then(|e| e.to_str()).unwrap_or("<no extension>").to_owned(),
         )
     })?;
-    let file = File::open(path).map_err(|e| ConfError::Read(format!("open {}: {e}", path.display())))?;
+    let file =
+        File::open(path).map_err(|e| ConfError::Read(format!("open {}: {e}", path.display())))?;
     format.decode(file)
 }
 
 /// 用显式指定的格式从文件加载（忽略扩展名）。
 pub fn load_file_with_format(path: &Path, format: Format) -> Result<Config> {
-    let file = File::open(path).map_err(|e| ConfError::Read(format!("open {}: {e}", path.display())))?;
+    let file =
+        File::open(path).map_err(|e| ConfError::Read(format!("open {}: {e}", path.display())))?;
     format.decode(file)
 }
 
@@ -56,8 +55,9 @@ pub fn load_str_auto_detect(s: &str) -> Result<Config> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write;
+
+    use super::*;
 
     fn temp_dir() -> std::path::PathBuf {
         let base = std::env::temp_dir().join("xray-conf-tests");

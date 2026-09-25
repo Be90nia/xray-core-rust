@@ -4,57 +4,68 @@
 //! 这里实现最小端到端切片：TCP accept → socks5 handshake → SocksAddr → Destination →
 //! `DispatchHandler::dispatch(dest, link)`。
 //!
-//! 不含：sniffing（协议嗅探）、UDP associate、多 inbound 注册管理（由 proxyman::InboundManager 负责）。
+//! 不含：sniffing（协议嗅探）、UDP associate、多 inbound 注册管理（由 proxyman::InboundManager
+//! 负责）。
 
-use std::sync::Arc;
-
-use tokio::net::TcpListener;
-use tokio::net::TcpStream;
-use xray_app_dispatcher::default::SimpleOhm;
-use xray_app_dispatcher::OutboundHandlerManager;
-use xray_buf::io::{new_reader, new_readv_reader, new_writer, Reader, Writer};
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-use std::net::SocketAddr;
-use xray_proxy_socks::protocol::{Host, SocksAddr, decode_udp_packet, encode_udp_packet};
-use xray_proxy_socks::server::{socks_handshake, SocksRequest};
-use xray_proxy_socks::ServerConfig;
-use tokio::io::AsyncReadExt;
-use xray_transport::link::Link;
-use xray_transport::system_listener::InboundTcpListener;
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
-use xray_conf::{BuiltConfig, BuiltInbound};
 // P1-B: vless/trojan inbound 集成
-use std::collections::HashMap;
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+
+use tokio::{
+    io::AsyncReadExt,
+    net::{TcpListener, TcpStream, UdpSocket},
+    task::JoinHandle,
+};
+use tokio_util::sync::CancellationToken;
+use xray_app_dispatcher::{
+    DispatchHandler, OutboundHandlerManager, UdpDispatchSession, default::SimpleOhm,
+};
+use xray_buf::io::{Reader, Writer, new_reader, new_readv_reader, new_writer};
+use xray_common::{
+    net::{address::Address, destination::Destination, network::Network, port::Port},
+    uuid::UUID,
+};
+use xray_conf::{BuiltConfig, BuiltInbound};
+use xray_features::inbound::InboundHandler;
+// zx7: mux inbound 检测
+use xray_mux::client::{MUX_COOL_ADDRESS, MUX_COOL_PORT};
 use xray_proto::xray::proxy::vless::Account as VlessProtoAccount;
-use xray_proxy_trojan::{serve_trojan, MemoryAccount as TrojanMemoryAccount, MemoryUser as TrojanMemoryUser, fallback::{Fallback, FallbackPolicy}};
-use xray_proxy_vless::{serve_vless, MemoryAccount as VlessMemoryAccount, MemoryUser as VlessMemoryUser, MemoryValidator as VlessMemoryValidator, Validator as VlessValidator, VlessInboundOptions};
-use xray_proxy_vmess::{serve_vmess, MemoryAccount as VmessMemoryAccount, MemoryUser as VmessMemoryUser, TimedUserValidator as VmessTimedUserValidator, Validator as VmessValidator, VmessError};
-use xray_common::uuid::UUID;
+use xray_proxy_blackhole::{BlackholeInboundHandler, ResponseConfig as BlackholeResponseConfig};
+use xray_proxy_dns::{Config as DnsConfig, DnsInbound, DnsOutbound, Handler as DnsHandler};
+use xray_proxy_freedom::FreedomInboundHandler;
 // tdy: http + dokodemo inbound 集成
 use xray_proxy_http::ServerConfig as HttpServerConfig;
 use xray_proxy_http::server::{
-    http_server_handshake, extract_request_path, build_forwarded_request, HandshakeResult,
+    HandshakeResult, build_forwarded_request, extract_request_path, http_server_handshake,
 };
-use xray_app_dispatcher::{DispatchHandler, UdpDispatchSession};
-// zx7: mux inbound 检测
-use xray_mux::client::{MUX_COOL_ADDRESS, MUX_COOL_PORT};
-// 补全协议 inbound 注册
-use xray_proxy_ss::{SsInbound, CipherType as SsCipherType};
-use xray_proxy_ss::config::MemoryAccount as SsConfigMemoryAccount;
-use xray_proxy_dns::{DnsInbound, DnsOutbound, Handler as DnsHandler, Config as DnsConfig};
 use xray_proxy_loopback::LoopbackHandler;
+use xray_proxy_socks::{
+    ServerConfig,
+    protocol::{Host, SocksAddr, decode_udp_packet, encode_udp_packet},
+    server::{SocksRequest, socks_handshake},
+};
+use xray_proxy_ss::config::MemoryAccount as SsConfigMemoryAccount;
+// 补全协议 inbound 注册
+use xray_proxy_ss::{CipherType as SsCipherType, SsInbound};
+use xray_proxy_trojan::{
+    MemoryAccount as TrojanMemoryAccount, MemoryUser as TrojanMemoryUser,
+    fallback::{Fallback, FallbackPolicy},
+    serve_trojan,
+};
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
-use xray_proxy_tun::{TunInboundHandler, StackOptions, Tun};
+use xray_proxy_tun::{StackOptions, Tun, TunInboundHandler};
+use xray_proxy_vless::{
+    MemoryAccount as VlessMemoryAccount, MemoryUser as VlessMemoryUser,
+    MemoryValidator as VlessMemoryValidator, Validator as VlessValidator, VlessInboundOptions,
+    serve_vless,
+};
+use xray_proxy_vmess::{
+    MemoryAccount as VmessMemoryAccount, MemoryUser as VmessMemoryUser,
+    TimedUserValidator as VmessTimedUserValidator, Validator as VmessValidator, VmessError,
+    serve_vmess,
+};
 use xray_proxy_wireguard::DeviceConfig;
+use xray_transport::{link::Link, system_listener::InboundTcpListener};
 use xray_transport_hysteria::quinn_adapter::QuinnListenerFactory;
-use xray_features::inbound::InboundHandler;
-use tokio::net::UdpSocket;
-use xray_proxy_blackhole::{BlackholeInboundHandler, ResponseConfig as BlackholeResponseConfig};
-use xray_proxy_freedom::FreedomInboundHandler;
 
 /// SOCKS5 inbound 服务入口。
 ///
@@ -92,23 +103,22 @@ pub async fn serve_socks5(
             Err(e) => {
                 tracing::warn!(error = %e, "socks5 accept failed");
                 continue;
-            }
+            },
         };
 
         let handler = Arc::clone(&handler);
         let config = Arc::clone(&config);
         tokio::spawn(async move {
             if let Err(e) =
-                handle_connection(stream, peer, &config, &handler, handshake_timeout, udp_idle).await
+                handle_connection(stream, peer, &config, &handler, handshake_timeout, udp_idle)
+                    .await
             {
                 // Go proxyman/worker.go:124：连接结束错误统一 LogInfo("connection ends")。
                 tracing::info!(peer = %peer, error = %e, "socks5 connection ended with error");
             }
         });
-
     }
 }
-
 
 /// 入站连接元数据提取（txno④ + txno-splice）。
 ///
@@ -136,12 +146,15 @@ impl InboundConnMeta for TcpStream {
     fn splice_raw_clone(&self) -> Option<TcpStream> {
         xray_transport::connection::dup_tcp_stream(self)
     }
+
     fn inbound_local(&self) -> Option<SocketAddr> {
         self.local_addr().ok()
     }
+
     fn is_raw_inbound(&self) -> bool {
         true
     }
+
     fn into_link_io(self) -> (Box<dyn Reader>, Box<dyn Writer>) {
         let (rd, wr) = self.into_split();
         (new_readv_reader(rd), new_writer(wr))
@@ -151,18 +164,17 @@ impl InboundConnMeta for TcpStream {
 impl InboundConnMeta for Box<dyn xray_transport::connection::Connection> {
     fn splice_raw_clone(&self) -> Option<TcpStream> {
         // Connection::is_raw_tcp 缺省 false：TLS/包装层天然拒绝，与 Go 同
-        if self.is_raw_tcp() {
-            self.raw_tcp_clone()
-        } else {
-            None
-        }
+        if self.is_raw_tcp() { self.raw_tcp_clone() } else { None }
     }
+
     fn inbound_local(&self) -> Option<SocketAddr> {
         self.local_addr().ok().flatten()
     }
+
     fn is_raw_inbound(&self) -> bool {
         self.is_raw_tcp()
     }
+
     fn into_link_io(self) -> (Box<dyn Reader>, Box<dyn Writer>) {
         let (rd, wr) = tokio::io::split(self);
         (new_reader(rd), new_writer(wr))
@@ -198,8 +210,8 @@ where
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "socks handshake timeout",
-                ))
-            }
+                ));
+            },
         }
     };
 
@@ -217,7 +229,7 @@ where
             let _ = stream.read(&mut drop_buf).await;
             relay.abort();
             Ok(())
-        }
+        },
         SocksRequest::TcpConnect(addr) => {
             // 2. SocksAddr → Destination
             let dest = socks_addr_to_destination(&addr, Network::TCP);
@@ -239,10 +251,7 @@ where
                 };
                 xray_app_dispatcher::AccessContext {
                     from: peer.to_string(),
-                    local: stream
-                        .inbound_local()
-                        .map(|a| a.to_string())
-                        .unwrap_or_default(),
+                    local: stream.inbound_local().map(|a| a.to_string()).unwrap_or_default(),
                     conn,
                     can_splice_copy: can,
                     ..Default::default()
@@ -256,13 +265,15 @@ where
             let link = Link::new(reader, writer);
             // 4. dispatch（zx7: mux.cool dest 转给 mux ServerWorker）
             if is_mux_destination(&dest) {
-                tracing::info!("socks: mux.cool destination detected, spawning mux inbound handler");
+                tracing::info!(
+                    "socks: mux.cool destination detected, spawning mux inbound handler"
+                );
                 tokio::spawn(handle_mux_inbound_link(link, Arc::clone(handler), None));
                 return Ok(());
             }
             let _ = handler.dispatch_with_access(&dest, link, access).await;
             Ok(())
-        }
+        },
     }
 }
 
@@ -287,9 +298,7 @@ pub(crate) async fn handle_mux_inbound_link(
     handler: Arc<dyn xray_app_dispatcher::DispatchHandler>,
     allowed_network: Option<Network>,
 ) {
-    use xray_buf::reader::BufferedReader;
-    use xray_buf::writer::BufferedWriter;
-
+    use xray_buf::{reader::BufferedReader, writer::BufferedWriter};
     use xray_mux::worker::{DispatchHandlerAdapter, ServerWorker};
     let adapter = Arc::new(DispatchHandlerAdapter::new(handler));
     let worker = match allowed_network {
@@ -313,7 +322,7 @@ pub(crate) async fn handle_mux_inbound_link(
             Err(e) => {
                 tracing::warn!(error = %e, "mux frame processing error");
                 break;
-            }
+            },
         }
     }
 
@@ -340,10 +349,7 @@ fn destination_to_socks_addr(dest: &Destination) -> SocksAddr {
         Address::IPv6(ip) => Host::Ipv6(*ip),
         Address::Domain(d) => Host::Domain(d.clone()),
     };
-    SocksAddr {
-        host,
-        port: dest.port().value(),
-    }
+    SocksAddr { host, port: dest.port().value() }
 }
 
 /// SOCKS5 UDP ASSOCIATE relay pump。
@@ -437,7 +443,7 @@ async fn serve_mixed(
             Err(e) => {
                 tracing::warn!(error = %e, "mixed accept failed");
                 continue;
-            }
+            },
         };
         let handler = Arc::clone(&handler);
         let socks_cfg = Arc::clone(&socks_cfg);
@@ -450,8 +456,13 @@ async fn serve_mixed(
                 Some(d) => tokio::time::timeout(d, stream.peek(&mut sniff)).await,
                 None => Ok(stream.peek(&mut sniff).await),
             };
-            let n = match read_res { Ok(Ok(n)) => n, _ => return };
-            if n == 0 { return; }
+            let n = match read_res {
+                Ok(Ok(n)) => n,
+                _ => return,
+            };
+            if n == 0 {
+                return;
+            }
             if sniff[0] == 0x05 {
                 // SOCKS5 路径（握手与 sniff/http 段共用同一限时）
                 let hs_fut = socks_handshake(&mut stream, &socks_cfg);
@@ -473,11 +484,11 @@ async fn serve_mixed(
                         } else {
                             let _ = handler.dispatch(&dest, link).await;
                         }
-                    }
+                    },
                     Ok(SocksRequest::UdpAssociate(_, _)) => {
                         // UDP associate 简化:暂不支持(mixed UDP 罕见,跟 socks5 UDP 等价)
                         tracing::debug!("mixed: udp associate not supported in mixed mode");
-                    }
+                    },
                     Err(e) => tracing::debug!(error = %e, "mixed socks handshake failed"),
                 }
             } else if sniff[0].is_ascii_alphabetic() {
@@ -490,7 +501,10 @@ async fn serve_mixed(
                     },
                     None => handshake_fut.await,
                 };
-                let hs = match hs { Ok(v) => v, Err(_) => return };
+                let hs = match hs {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
                 if hs.method != "CONNECT" {
                     handle_plain_http(stream, hs, Arc::clone(&handler)).await;
                 } else {
@@ -511,7 +525,6 @@ async fn serve_mixed(
         });
     }
 }
-
 
 /// HTTP proxy inbound 服务入口。
 ///
@@ -535,7 +548,7 @@ pub async fn serve_http(
             Err(e) => {
                 tracing::warn!(error = %e, "http accept failed");
                 continue;
-            }
+            },
         };
         let handler = Arc::clone(&handler);
         let config = Arc::clone(&config);
@@ -550,7 +563,7 @@ pub async fn serve_http(
                     Err(_) => {
                         tracing::debug!("http handshake timeout, closing connection");
                         return;
-                    }
+                    },
                 },
                 None => handshake_fut.await,
             };
@@ -559,7 +572,7 @@ pub async fn serve_http(
                 Err(e) => {
                     tracing::debug!(error = %e, "http handshake failed");
                     return;
-                }
+                },
             };
             // 2. Plain HTTP proxy（GET/POST 等）
             if hs.method != "CONNECT" {
@@ -592,8 +605,10 @@ async fn handle_plain_http(
     handler: Arc<dyn DispatchHandler>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use xray_buf::io::{Reader as BufReader, Writer as BufWriter};
-    use xray_buf::multi::MultiBuffer;
+    use xray_buf::{
+        io::{Reader as BufReader, Writer as BufWriter},
+        multi::MultiBuffer,
+    };
 
     // 1. 构建转发请求（绝对 URL → 相对 path，移除 hop-by-hop headers）
     let path = extract_request_path(&hs.target);
@@ -603,10 +618,8 @@ async fn handle_plain_http(
     let (up_r, up_w) = xray_buf::pipe::new();
     let (dn_r, dn_w) = xray_buf::pipe::new();
     let dn_w_cleanup = dn_w.clone();
-    let link = Link::new(
-        Box::new(up_r) as Box<dyn BufReader>,
-        Box::new(dn_w) as Box<dyn BufWriter>,
-    );
+    let link =
+        Link::new(Box::new(up_r) as Box<dyn BufReader>, Box::new(dn_w) as Box<dyn BufWriter>);
 
     // 3. dispatch：拨号目标 + bridge（up_r → 目标写，目标读 → dn_w）
     let dest = hs.dest.clone();
@@ -638,7 +651,7 @@ async fn handle_plain_http(
                     if up_w.write_multi_buffer(mb).await.is_err() {
                         break;
                     }
-                }
+                },
             }
         }
         xray_buf::alloc::release(buf);
@@ -657,7 +670,7 @@ async fn handle_plain_http(
                     if client_write.write_all(&data).await.is_err() {
                         break;
                     }
-                }
+                },
                 Err(_) => break,
             }
         }
@@ -706,8 +719,8 @@ fn socketaddr_to_address(addr: SocketAddr) -> Address {
 ///
 /// `follow_redirect=true` 优先级：
 /// 1. `original_dst`（Linux `SO_ORIGINAL_DST`，iptables REDIRECT 透明代理）
-/// 2. TLS 握手 SNI 覆盖 address（port 保持 rewrite 值，缺省 0；Go dokodemo.go:122-132，
-///    仅在未被 original_dst 覆盖时）
+/// 2. TLS 握手 SNI 覆盖 address（port 保持 rewrite 值，缺省 0；Go dokodemo.go:122-132， 仅在未被
+///    original_dst 覆盖时）
 ///
 /// 两者皆缺 → `None`：调用方拒连（对齐 Go dokodemo.go:137
 /// `unable to get destination`）。FollowRedirect 分支**不回落 predefined
@@ -726,18 +739,12 @@ fn resolve_dokodemo_tcp_dest(
 ) -> Option<Destination> {
     if opts.follow_redirect {
         if let Some(orig) = original_dst {
-            return Some(Destination::tcp(
-                socketaddr_to_address(orig),
-                Port::new(orig.port()),
-            ));
+            return Some(Destination::tcp(socketaddr_to_address(orig), Port::new(orig.port())));
         }
         // SNI 覆盖 address；port 基底 = rewrite port（Go：dest.Port 初值不变）。
         if let Some(sni) = tls_sni.filter(|s| !s.is_empty()) {
             let port = opts.dest.as_ref().map_or(0, |d| d.port().value());
-            return Some(Destination::tcp(
-                Address::Domain(sni.to_string()),
-                Port::new(port),
-            ));
+            return Some(Destination::tcp(Address::Domain(sni.to_string()), Port::new(port)));
         }
         // 拿不到原始目标 → 拒连（Go dokodemo.go:137 unable to get destination）。
         return None;
@@ -810,7 +817,7 @@ pub async fn serve_dokodemo(
             Err(e) => {
                 tracing::warn!(error = %e, "dokodemo accept failed");
                 continue;
-            }
+            },
         };
         let handler = Arc::clone(&handler);
         let opts = opts.clone();
@@ -847,33 +854,39 @@ pub async fn serve_dokodemo(
                         // SNI 覆盖：握手完成后的 ClientHello server_name
                         // （rustls ServerConnection::server_name）。
                         let sni = tls_stream.get_ref().1.server_name();
-                        match resolve_dokodemo_tcp_dest(&opts, local_ip, local_port, original_dst, sni)
-                        {
+                        match resolve_dokodemo_tcp_dest(
+                            &opts,
+                            local_ip,
+                            local_port,
+                            original_dst,
+                            sni,
+                        ) {
                             Some(dest) => {
                                 let (read_half, write_half) = tokio::io::split(tls_stream);
                                 let link = Link::new(new_reader(read_half), new_writer(write_half));
                                 let _ = handler.dispatch(&dest, link).await;
-                            }
+                            },
                             None => tracing::warn!(
                                 "dokodemo: no valid destination (followRedirect without original dst/SNI), rejecting connection (Go dokodemo.go:137)"
                             ),
                         }
-                    }
+                    },
                     Ok(Err(e)) => {
                         tracing::warn!(error = %e, "dokodemo TLS accept failed");
-                    }
+                    },
                     Err(_) => {
                         tracing::debug!("dokodemo TLS accept timeout");
-                    }
+                    },
                 }
             } else {
                 match resolve_dokodemo_tcp_dest(&opts, local_ip, local_port, original_dst, None) {
                     Some(dest) => {
-                        // plain TCP（非 TLS 分支）：readv 多缓冲聚合读（bd 2o9l，Go NewReader readv 分支）
+                        // plain TCP（非 TLS 分支）：readv 多缓冲聚合读（bd 2o9l，Go NewReader readv
+                        // 分支）
                         let (read_half, write_half) = stream.into_split();
                         let link = Link::new(new_readv_reader(read_half), new_writer(write_half));
                         let _ = handler.dispatch(&dest, link).await;
-                    }
+                    },
                     None => tracing::warn!(
                         "dokodemo: no valid destination (followRedirect without original dst/SNI), rejecting connection (Go dokodemo.go:137)"
                     ),
@@ -923,8 +936,8 @@ pub async fn serve_dokodemo_udp_on(
 ) -> std::io::Result<()> {
     let local = hub.local_addr().ok();
     let local_port = local.as_ref().map(|a| a.port());
-    let mut dest =
-        dest.unwrap_or_else(|| Destination::udp(loopback_addr(local.map(|a| a.ip())), Port::new(0)));
+    let mut dest = dest
+        .unwrap_or_else(|| Destination::udp(loopback_addr(local.map(|a| a.ip())), Port::new(0)));
     if dest.port().value() == 0 {
         if let Some(lp) = local_port {
             dest = Destination::udp(dest.address().clone(), Port::new(lp));
@@ -998,8 +1011,8 @@ struct PeerSession {
 ///
 /// 响应路径（对齐 Go dokodemo.go:158-176 PacketWriter）：
 /// - 非 TPROXY：响应经监听 socket（hub）回发（Go `SequentialWriter{conn}`）。
-/// - TPROXY（Linux）：响应源为 IP 时经 fakeudp 伪造源地址回发（per 源缓存，
-///   Go `w.conns`）；源伪造不可用时丢弃该响应（Go 同款 LogInfo+continue）。
+/// - TPROXY（Linux）：响应源为 IP 时经 fakeudp 伪造源地址回发（per 源缓存， Go
+///   `w.conns`）；源伪造不可用时丢弃该响应（Go 同款 LogInfo+continue）。
 async fn dokodemo_peer_relay(
     peer: SocketAddr,
     mut rx: tokio::sync::mpsc::Receiver<(Option<Destination>, Vec<u8>)>,
@@ -1077,8 +1090,8 @@ async fn dokodemo_peer_relay(
 /// TPROXY 响应回发 socket：按响应源（IP）取/建 fakeudp 透明 socket。
 ///
 /// - 响应源为 IP：`fakeudp` bind 到该源地址（per 源缓存，Go `w.conns` 同键）。
-/// - 创建失败（需 CAP_NET_ADMIN）或源为域名（无法 bind）：返回 `None`，调用
-///   方丢弃该响应（Go PacketWriter 创建失败 LogInfo+drop 同款降级）。
+/// - 创建失败（需 CAP_NET_ADMIN）或源为域名（无法 bind）：返回 `None`，调用 方丢弃该响应（Go
+///   PacketWriter 创建失败 LogInfo+drop 同款降级）。
 /// mark 恒 0：Rust dokodemo UDP 路径未接 session sockopt mark（Go 缺省 0 同值）。
 #[cfg(target_os = "linux")]
 fn fake_responder(
@@ -1099,11 +1112,11 @@ fn fake_responder(
             let s = Arc::new(s);
             cache.insert(key, Arc::clone(&s));
             Some(s)
-        }
+        },
         Err(e) => {
             tracing::warn!(error = %e, "dokodemo TPROXY fakeudp create failed; response dropped");
             None
-        }
+        },
     }
 }
 
@@ -1180,22 +1193,21 @@ async fn ss_legacy_pipeline<C>(
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     // 首包读超时：静默连接占位防护；transport 分支共用本函数，一并覆盖。
-    let handshake =
-        match tokio::time::timeout(handshake_timeout, ib.handle_conn(stream)).await {
-            Ok(r) => r.map(|(header, ss_stream)| (header.address, header.port, ss_stream)),
-            Err(_) => {
-                tracing::debug!("ss legacy inbound handshake timeout");
-                return;
-            }
-        };
+    let handshake = match tokio::time::timeout(handshake_timeout, ib.handle_conn(stream)).await {
+        Ok(r) => r.map(|(header, ss_stream)| (header.address, header.port, ss_stream)),
+        Err(_) => {
+            tracing::debug!("ss legacy inbound handshake timeout");
+            return;
+        },
+    };
     match handshake {
         Ok((address, port, ss_stream)) => {
             let dest = Destination::new(address, Port::new(port), Network::TCP);
             spawn_ss_pump(ss_stream, dest, handler).await;
-        }
+        },
         Err(e) => {
             tracing::debug!(error = %e, "ss inbound handshake failed");
-        }
+        },
     }
 }
 
@@ -1244,16 +1256,13 @@ pub async fn serve_ss(
                 let handler = Arc::clone(&handler);
                 tokio::spawn(async move {
                     let _ = match flavor {
-                        SsUdpFlavor::Legacy(ib) => {
-                            serve_ss_udp(Arc::new(sock), ib, handler).await
-                        }
+                        SsUdpFlavor::Legacy(ib) => serve_ss_udp(Arc::new(sock), ib, handler).await,
                         SsUdpFlavor::Ss2022 { kind, server_psk, users } => {
-                            serve_ss2022_udp(Arc::new(sock), kind, server_psk, users, handler)
-                                .await
-                        }
+                            serve_ss2022_udp(Arc::new(sock), kind, server_psk, users, handler).await
+                        },
                     };
                 });
-            }
+            },
             Err(e) => tracing::warn!(error = %e, port, "ss udp bind failed, udp relay disabled"),
         }
     }
@@ -1264,7 +1273,7 @@ pub async fn serve_ss(
             Err(e) => {
                 tracing::warn!(error = %e, "ss accept failed");
                 continue;
-            }
+            },
         };
         let handler = Arc::clone(&handler);
         let mode = inbound.clone();
@@ -1272,9 +1281,10 @@ pub async fn serve_ss(
             match mode {
                 SsInboundMode::Legacy(ib) => {
                     ss_legacy_pipeline(ib, handler, stream, handshake_timeout).await;
-                }
+                },
                 SsInboundMode::Ss2022(ib) => {
-                    let handshake = tokio::time::timeout(handshake_timeout, ib.handle_conn(stream)).await;
+                    let handshake =
+                        tokio::time::timeout(handshake_timeout, ib.handle_conn(stream)).await;
                     let handshake = match handshake {
                         Ok(r) => r
                             .map(|resp| (resp.address, resp.port, resp.stream))
@@ -1282,7 +1292,7 @@ pub async fn serve_ss(
                         Err(_) => {
                             tracing::debug!("ss2022 inbound handshake timeout");
                             return;
-                        }
+                        },
                     };
                     if let Ok((address, port, ss_stream)) = handshake {
                         let dest = Destination::new(address, Port::new(port), Network::TCP);
@@ -1290,9 +1300,11 @@ pub async fn serve_ss(
                     } else if let Err(e) = handshake {
                         tracing::debug!(error = %e, "ss inbound handshake failed");
                     }
-                }
+                },
                 SsInboundMode::Ss2022Multi(ib) => {
-                    let handshake = tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, ib.handle_conn(stream)).await;
+                    let handshake =
+                        tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, ib.handle_conn(stream))
+                            .await;
                     let handshake = match handshake {
                         Ok(r) => r
                             .map(|resp| (resp.address, resp.port, resp.stream))
@@ -1300,7 +1312,7 @@ pub async fn serve_ss(
                         Err(_) => {
                             tracing::debug!("ss2022 multi inbound handshake timeout");
                             return;
-                        }
+                        },
                     };
                     if let Ok((address, port, ss_stream)) = handshake {
                         let dest = Destination::new(address, Port::new(port), Network::TCP);
@@ -1308,17 +1320,20 @@ pub async fn serve_ss(
                     } else if let Err(e) = handshake {
                         tracing::debug!(error = %e, "ss inbound handshake failed");
                     }
-                }
+                },
                 SsInboundMode::Ss2022Relay(ib) => {
                     // relay：身份匹配 + 剥 identity header，字节原样桥（无 chunk 解密）
-                    let handshake =
-                        tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, ib.handle_conn_relay(stream)).await;
+                    let handshake = tokio::time::timeout(
+                        DEFAULT_HANDSHAKE_TIMEOUT,
+                        ib.handle_conn_relay(stream),
+                    )
+                    .await;
                     let handshake = match handshake {
                         Ok(v) => v,
                         Err(_) => {
                             tracing::debug!("ss2022 relay inbound handshake timeout");
                             return;
-                        }
+                        },
                     };
                     let Ok((_addr, port, prefix, tcp)) = handshake else {
                         tracing::debug!("ss2022 relay inbound handshake failed");
@@ -1326,12 +1341,9 @@ pub async fn serve_ss(
                     };
                     let dest = Destination::new(_addr, Port::new(port), Network::TCP);
                     let (r, w) = tokio::io::split(tcp);
-                    let link = Link::new(
-                        new_reader(SsRelayReader::new(prefix, r)),
-                        new_writer(w),
-                    );
+                    let link = Link::new(new_reader(SsRelayReader::new(prefix, r)), new_writer(w));
                     let _ = handler.dispatch(&dest, link).await;
-                }
+                },
             }
         });
     }
@@ -1380,7 +1392,10 @@ const SS2022_UDP_SESSION_LIFETIME: std::time::Duration = std::time::Duration::fr
 /// Store/Load 时从表里删 `expires <= now`；`WithUpdateAgeOnGet` 由调用方
 /// 命中时刷新 deadline 表达）。返回清扫后条数。
 fn sweep_expired_ss2022_sessions(
-    server_sessions: &mut HashMap<u64, (Arc<xray_proxy_ss::ss2022::packet::ServerUdpSession2022>, std::time::Instant)>,
+    server_sessions: &mut HashMap<
+        u64,
+        (Arc<xray_proxy_ss::ss2022::packet::ServerUdpSession2022>, std::time::Instant),
+    >,
     now: std::time::Instant,
 ) -> usize {
     server_sessions.retain(|_, (_, deadline)| *deadline > now);
@@ -1409,7 +1424,7 @@ pub async fn serve_ss_udp(
             Err(e) => {
                 tracing::warn!(error = %e, "ss udp recv failed");
                 continue;
-            }
+            },
         };
         // ponytail: 收包时顺带清扫已退出（60s 空闲淘汰）会话的残留 sender；
         // O(clients)/包，海量并发 UDP 客户端时换后台定时清扫
@@ -1419,18 +1434,13 @@ pub async fn serve_ss_udp(
             Err(e) => {
                 tracing::debug!(error = %e, "ss udp decode failed (unknown user?)");
                 continue;
-            }
+            },
         };
         let dest = Destination::new(header.address.clone(), Port::new(header.port), Network::UDP);
         let item = (dest, payload, header.user.account.clone());
         let tx = clients.entry(client).or_insert_with(|| {
             let (tx, rx) = tokio::sync::mpsc::channel(16);
-            tokio::spawn(ss_udp_client_relay(
-                Arc::clone(&udp),
-                client,
-                rx,
-                Arc::clone(&handler),
-            ));
+            tokio::spawn(ss_udp_client_relay(Arc::clone(&udp), client, rx, Arc::clone(&handler)));
             tx
         });
         if tx.send(item).await.is_err() {
@@ -1442,10 +1452,9 @@ pub async fn serve_ss_udp(
 
 /// 单客户端 SS UDP relay（Go 每个 NAT entry 的读写 task）。
 ///
-/// - up：主循环 decode 后的 (dest, payload) → [`UdpDispatchSession::send_packet`]
-///   （首包懒建 dispatch link，域名目标原样透传由 outbound 解析）
-/// - down：`recv_packet` 回包 → 发起用户 account `encode_udp_packet` →
-///   send_to 客户端
+/// - up：主循环 decode 后的 (dest, payload) → [`UdpDispatchSession::send_packet`] （首包懒建
+///   dispatch link，域名目标原样透传由 outbound 解析）
+/// - down：`recv_packet` 回包 → 发起用户 account `encode_udp_packet` → send_to 客户端
 ///
 /// 60s 双向无活动自动退出（Go `CancelAfterInactivity(1min)`）。
 async fn ss_udp_client_relay(
@@ -1518,23 +1527,21 @@ pub async fn serve_ss2022_udp(
     users: Vec<([u8; 16], Vec<u8>)>,
     handler: Arc<dyn DispatchHandler>,
 ) -> std::io::Result<()> {
-    use xray_proxy_ss::ss2022::packet::{server_decode_header, ServerUdpSession2022};
+    use xray_proxy_ss::ss2022::packet::{ServerUdpSession2022, server_decode_header};
 
     tracing::info!(addr = %udp.local_addr()?, "ss2022 udp relay listening");
     let mut buf = vec![0u8; 65_536];
     type Item = (Destination, Vec<u8>, SocketAddr);
     let mut sessions: HashMap<u64, tokio::sync::mpsc::Sender<Item>> = HashMap::new();
-    let mut server_sessions: HashMap<
-        u64,
-        (Arc<ServerUdpSession2022>, std::time::Instant),
-    > = HashMap::new();
+    let mut server_sessions: HashMap<u64, (Arc<ServerUdpSession2022>, std::time::Instant)> =
+        HashMap::new();
     loop {
         let (n, client) = match udp.recv_from(&mut buf).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "ss2022 udp recv failed");
                 continue;
-            }
+            },
         };
         // ponytail: 收包时顺带清扫已退出（60s 空闲淘汰）会话的残留 sender；
         // O(sessions)/包，海量并发 UDP 客户端时换后台定时清扫
@@ -1549,7 +1556,7 @@ pub async fn serve_ss2022_udp(
             Err(e) => {
                 tracing::debug!(error = %e, "ss2022 udp decode header failed (unknown user?)");
                 continue;
-            }
+            },
         };
         let sid = hdr.session_id;
         // 2. 查/建 per-sessionId NAT entry
@@ -1557,11 +1564,11 @@ pub async fn serve_ss2022_udp(
             match ServerUdpSession2022::new(kind, hdr.aead_psk.to_vec(), sid) {
                 Ok(s) => {
                     server_sessions.insert(sid, (Arc::new(s), now + SS2022_UDP_SESSION_LIFETIME));
-                }
+                },
                 Err(e) => {
                     tracing::debug!(error = %e, "ss2022 udp session init failed");
                     continue;
-                }
+                },
             }
         }
         // 命中即刷新存活期（sing WithUpdateAgeOnGet 语义）。
@@ -1571,17 +1578,14 @@ pub async fn serve_ss2022_udp(
         *deadline = now + SS2022_UDP_SESSION_LIFETIME;
         let session = Arc::clone(session);
         // 3. AEAD 解 body + 解析目标（重放/时间戳校验在 decode_body 内）
-        let (address, port, payload) = match session.decode_body(
-            &hdr.hdr,
-            hdr.packet_id,
-            &buf[16 + hdr.eih_len..n],
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!(error = %e, "ss2022 udp decode body failed");
-                continue;
-            }
-        };
+        let (address, port, payload) =
+            match session.decode_body(&hdr.hdr, hdr.packet_id, &buf[16 + hdr.eih_len..n]) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(error = %e, "ss2022 udp decode body failed");
+                    continue;
+                },
+            };
         let dest = Destination::new(address, Port::new(port), Network::UDP);
         // 4. 分发到 relay task（首包懒建）
         let tx = sessions.entry(sid).or_insert_with(|| {
@@ -1605,8 +1609,8 @@ pub async fn serve_ss2022_udp(
 /// 单 client session 的 SS-2022 UDP relay（Go 每个 udpNat entry 的读写 task）。
 ///
 /// - up：主循环 decode 后的 (dest, payload) → [`UdpDispatchSession::send_packet`]
-/// - down：`recv_packet` 回包 → [`ServerUdpSession2022::encode`] →
-///   send_to 客户端（最新源地址，随每包更新）
+/// - down：`recv_packet` 回包 → [`ServerUdpSession2022::encode`] → send_to
+///   客户端（最新源地址，随每包更新）
 ///
 /// 60s 双向无活动自动退出。
 async fn ss2022_udp_client_relay(
@@ -1724,10 +1728,10 @@ pub async fn serve_dns(
                             tracing::debug!(error = %e, "dns tcp conn failed");
                         }
                     });
-                }
+                },
                 Err(e) => {
                     tracing::warn!(error = %e, "dns tcp accept failed");
-                }
+                },
             }
         }
     });
@@ -1793,7 +1797,7 @@ async fn dns_udp_recv_loop(udp: UdpSocket, inbound: Arc<DnsInbound>) {
                     _ => {
                         tracing::warn!(error = %e, "dns udp recvmmsg failed");
                         return;
-                    }
+                    },
                 }
             }
             let n = usize::try_from(n).unwrap_or_default();
@@ -1813,11 +1817,11 @@ async fn dns_udp_recv_loop(udp: UdpSocket, inbound: Arc<DnsInbound>) {
                         if let Err(e) = udp.send_to(&resp, peer).await {
                             tracing::debug!(error = %e, "dns udp send failed");
                         }
-                    }
-                    Ok(None) => {} // Drop: 不响应
+                    },
+                    Ok(None) => {}, // Drop: 不响应
                     Err(e) => {
                         tracing::debug!(error = %e, "dns udp handle_packet failed");
-                    }
+                    },
                 }
             }
             if n < DNS_UDP_RECV_BATCH {
@@ -1839,16 +1843,16 @@ async fn dns_udp_recv_loop(udp: UdpSocket, inbound: Arc<DnsInbound>) {
                         if let Err(e) = udp.send_to(&resp, peer).await {
                             tracing::debug!(error = %e, "dns udp send failed");
                         }
-                    }
-                    Ok(None) => {} // Drop: 不响应
+                    },
+                    Ok(None) => {}, // Drop: 不响应
                     Err(e) => {
                         tracing::debug!(error = %e, "dns udp handle_packet failed");
-                    }
+                    },
                 }
-            }
+            },
             Err(e) => {
                 tracing::warn!(error = %e, "dns udp recv failed");
-            }
+            },
         }
     }
 }
@@ -1885,14 +1889,9 @@ impl DnsUdpRecvBatch {
             vec![[0u8; DNS_UDP_PACKET_BUF]; DNS_UDP_RECV_BATCH].into_boxed_slice();
         let mut addrs: Box<[libc::sockaddr_storage]> =
             vec![unsafe { std::mem::zeroed() }; DNS_UDP_RECV_BATCH].into_boxed_slice();
-        let mut iovs: Box<[libc::iovec]> = vec![
-            libc::iovec {
-                iov_base: std::ptr::null_mut(),
-                iov_len: 0,
-            };
-            DNS_UDP_RECV_BATCH
-        ]
-        .into_boxed_slice();
+        let mut iovs: Box<[libc::iovec]> =
+            vec![libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; DNS_UDP_RECV_BATCH]
+                .into_boxed_slice();
         let mut msgs: Box<[libc::mmsghdr]> =
             vec![unsafe { std::mem::zeroed() }; DNS_UDP_RECV_BATCH].into_boxed_slice();
 
@@ -1905,12 +1904,7 @@ impl DnsUdpRecvBatch {
             msgs[i].msg_hdr.msg_iov = std::ptr::addr_of_mut!(iovs[i]);
             msgs[i].msg_hdr.msg_iovlen = 1;
         }
-        Self {
-            bufs,
-            addrs,
-            iovs,
-            msgs,
-        }
+        Self { bufs, addrs, iovs, msgs }
     }
 }
 
@@ -1925,18 +1919,17 @@ fn sockaddr_storage_to_addr(ss: &libc::sockaddr_storage) -> Option<std::net::Soc
                 std::net::Ipv4Addr::from(u32::from_be(a.sin_addr.s_addr)),
                 u16::from_be(a.sin_port),
             )))
-        }
+        },
         libc::AF_INET6 => {
             // SAFETY: ss_family == AF_INET6 保证布局为 sockaddr_in6。
-            let a =
-                unsafe { &*(ss as *const libc::sockaddr_storage).cast::<libc::sockaddr_in6>() };
+            let a = unsafe { &*(ss as *const libc::sockaddr_storage).cast::<libc::sockaddr_in6>() };
             Some(std::net::SocketAddr::from(std::net::SocketAddrV6::new(
                 std::net::Ipv6Addr::from(a.sin6_addr.s6_addr),
                 u16::from_be(a.sin6_port),
                 a.sin6_flowinfo,
                 a.sin6_scope_id,
             )))
-        }
+        },
         _ => None,
     }
 }
@@ -1966,27 +1959,18 @@ pub async fn spawn_inbounds(
             .as_ref()
             .map(|d| {
                 let snap = Arc::new(ohm.snapshot());
-                let sniff =
-                    crate::wiring::sniffing_request_from_json(ib.sniffing_json.as_ref());
-                let inbound_handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
-                    Arc::new(crate::wiring::InboundDispatchHandler::new(
-                        Arc::clone(d),
-                        sniff,
-                        &ib.tag,
-                    ));
-                snap.set_default(Arc::new(crate::wiring::MuxCarrierHandler::new(
-                    inbound_handler,
-                )));
+                let sniff = crate::wiring::sniffing_request_from_json(ib.sniffing_json.as_ref());
+                let inbound_handler: Arc<dyn xray_app_dispatcher::DispatchHandler> = Arc::new(
+                    crate::wiring::InboundDispatchHandler::new(Arc::clone(d), sniff, &ib.tag),
+                );
+                snap.set_default(Arc::new(crate::wiring::MuxCarrierHandler::new(inbound_handler)));
                 snap
             })
             .unwrap_or_else(|| Arc::clone(&ohm));
         // policy manager（dispatcher 装配时注入，见 start_full_dispatched）：
         // 供 http inbound 按 userLevel 查 handshake 超时等 per-level 策略。
-        let policy = dispatcher
-            .as_ref()
-            .and_then(|d| d.policy_manager.clone());
-        if let Some(handle) =
-            spawn_one_inbound(ib, per_ohm, policy, shutdown_token.clone()).await?
+        let policy = dispatcher.as_ref().and_then(|d| d.policy_manager.clone());
+        if let Some(handle) = spawn_one_inbound(ib, per_ohm, policy, shutdown_token.clone()).await?
         {
             handles.push(handle);
         }
@@ -2038,7 +2022,8 @@ fn build_tls_acceptor(
 /// REALITY inbound 配置（从 `realitySettings` 解析）。
 ///
 /// maxTimeDiff（时间戳容差秒，**0 = 禁用时间窗校验**）。
-/// 来源：Go xtls/reality `tls.go:259` `config.MaxTimeDiff == 0 || time.Since(...).Abs() <= MaxTimeDiff`。
+/// 来源：Go xtls/reality `tls.go:259` `config.MaxTimeDiff == 0 || time.Since(...).Abs() <=
+/// MaxTimeDiff`。
 #[derive(Debug)]
 struct RealityInboundConfig {
     server_private_key: [u8; 32],
@@ -2060,9 +2045,10 @@ struct RealityInboundConfig {
 fn parse_reality_config(
     settings: &xray_transport::dialer::StreamSettings,
 ) -> std::io::Result<RealityInboundConfig> {
-    let json = settings.security_json.as_ref().ok_or_else(|| {
-        std::io::Error::other("reality inbound requires realitySettings")
-    })?;
+    let json = settings
+        .security_json
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("reality inbound requires realitySettings"))?;
     // t38j：serverNames 非空硬错（Go transport_security.go:94-96 `empty "serverNames"`
     // 拒启）；白名单供 server_tls 做 SNI 前置门（xtls/reality tls.go:211）。
     let mut server_names = Vec::new();
@@ -2121,18 +2107,15 @@ fn parse_reality_config(
     // dest/target：int（端口→localhost:port，Go uint16 边界）或字符串 host:port；
     // 缺省 localhost:443（Go conf 层 Dest==nil 跳过整块 target 配置，Rust 无
     // nil 表示——登记差异）。
-    let dest_raw = json
-        .get("target")
-        .or_else(|| json.get("dest"))
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
+    let dest_raw =
+        json.get("target").or_else(|| json.get("dest")).cloned().unwrap_or(serde_json::Value::Null);
     let fallback_dest = match dest_raw.as_u64() {
         Some(port @ 0..=65_535) => format!("localhost:{port}"),
         Some(_) => {
             return Err(std::io::Error::other(
                 "reality: invalid numeric \"target\" (need uint16 port)",
             ));
-        }
+        },
         None => match dest_raw {
             serde_json::Value::String(s) => s,
             serde_json::Value::Null => "localhost:443".to_string(),
@@ -2140,7 +2123,7 @@ fn parse_reality_config(
                 return Err(std::io::Error::other(format!(
                     "reality: invalid \"target\": {dest_raw}"
                 )));
-            }
+            },
         },
     };
 
@@ -2154,12 +2137,12 @@ fn parse_reality_config(
                 return Err(std::io::Error::other(
                     "reality: invalid PROXY protocol version, \"xver\" only accepts 0, 1, 2",
                 ));
-            }
+            },
             None => {
                 return Err(std::io::Error::other(
                     "reality: invalid \"xver\" (need unsigned integer)",
                 ));
-            }
+            },
         },
     };
     // mldsa65Seed：后量子签名未实现（cz5x）。配置在场即显式报错，
@@ -2174,31 +2157,19 @@ fn parse_reality_config(
     }
     // maxTimeDiff：Go 默认 0（禁用），单位毫秒 → 转换为秒传给 verify。
     // 缺省注入 43200（原 Rust 行为）会让 Go 兼容配置（无字段）的客户端被强制±12h 窗。
-    let max_diff_ms = json
-        .get("maxTimeDiff")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0);
+    let max_diff_ms = json.get("maxTimeDiff").and_then(|x| x.as_u64()).unwrap_or(0);
     // 秒级 floor 除法逐字复现 Go 语义（reality tls.go:259
     // `time.Since(ClientTime).Abs() <= MaxTimeDiff`，ClientTime 为 Unix 秒）：
     // |Δt_秒 + 小数部分| ≤ N 毫秒 ⟺ 允许的整秒差恰为 {0..N/1000}（floor），
     // 进位（ceil）会放行 Go 拒绝的 N+1 秒差（wfx8-7 核对结论：floor 正确）。
     // try_from 防 u64→u32 静默回绕（异常巨值按"放行全部整秒差"的上界钳制）。
     let max_diff = u32::try_from(max_diff_ms / 1000).unwrap_or(u32::MAX);
-    let parse_ver = |s: &str| -> Vec<u8> {
-        s.split('.')
-            .filter_map(|p| p.trim().parse::<u8>().ok())
-            .collect()
-    };
-    let min_client_ver = json
-        .get("minClientVer")
-        .and_then(|x| x.as_str())
-        .map(&parse_ver)
-        .unwrap_or_default();
-    let max_client_ver = json
-        .get("maxClientVer")
-        .and_then(|x| x.as_str())
-        .map(&parse_ver)
-        .unwrap_or_default();
+    let parse_ver =
+        |s: &str| -> Vec<u8> { s.split('.').filter_map(|p| p.trim().parse::<u8>().ok()).collect() };
+    let min_client_ver =
+        json.get("minClientVer").and_then(|x| x.as_str()).map(&parse_ver).unwrap_or_default();
+    let max_client_ver =
+        json.get("maxClientVer").and_then(|x| x.as_str()).map(&parse_ver).unwrap_or_default();
 
     Ok(RealityInboundConfig {
         server_private_key: key,
@@ -2215,10 +2186,8 @@ fn parse_reality_config(
         )
         .map_err(std::io::Error::other)?,
         // bd tce2：realitySettings.serverAcceptor（"rustls" 默认 / "btls" opt-in）。
-        server_acceptor: xray_reality::ServerAcceptorSetting::from_json(
-            json.get("serverAcceptor"),
-        )
-        .map_err(std::io::Error::other)?,
+        server_acceptor: xray_reality::ServerAcceptorSetting::from_json(json.get("serverAcceptor"))
+            .map_err(std::io::Error::other)?,
     })
 }
 
@@ -2289,7 +2258,7 @@ async fn serve_reality_vless(
             Err(e) => {
                 tracing::warn!(error = %e, "reality inbound accept failed");
                 continue;
-            }
+            },
         };
         let handler = Arc::clone(&handler);
         let validator = Arc::clone(&validator);
@@ -2305,10 +2274,7 @@ async fn serve_reality_vless(
         let probe_ctx = probe_ctx.clone();
         // bd tce2：serverAcceptor="btls" 走 BoringSSL 握手（含 26zn 后握手记录
         // 模仿消费）；默认 rustls 路径行为不变。
-        let use_btls = matches!(
-            cfg.server_acceptor,
-            xray_reality::ServerAcceptorSetting::Btls
-        );
+        let use_btls = matches!(cfg.server_acceptor, xray_reality::ServerAcceptorSetting::Btls);
         tokio::spawn(async move {
             let outcome = if use_btls {
                 #[cfg(not(target_os = "ios"))]
@@ -2355,10 +2321,7 @@ async fn serve_reality_vless(
                 .await
             };
             match outcome {
-                Ok(RealityServerOutcome::Verified {
-                    tls,
-                    max_useless_records,
-                }) => {
+                Ok(RealityServerOutcome::Verified { tls, max_useless_records }) => {
                     // bd frxi：探测值随连接交付（Go tls.go:436 写 hs.c.MaxUselessRecords
                     // 由定制 BoringSSL record 循环消费；rustls 无 record 层消费点，
                     // mygg 后握手记录模仿落地前仅可观察）。
@@ -2381,15 +2344,15 @@ async fn serve_reality_vless(
                         // Go vless inbound.go:522：拒绝 AtInfo + RemoteAddr。
                         tracing::info!(peer = %peer, error = %e, "reality vless connection ended with error");
                     }
-                }
+                },
                 Ok(RealityServerOutcome::Invalid { conn, record, reason }) => {
                     // 非 REALITY 客户端（如浏览器/探测器）→ 透明转发到 fallback dest
                     tracing::debug!(error = ?reason, dest = %dest, "reality verify failed, fallback");
                     let _ = fallback_to_dest(conn, &record, &dest, peer, local, xver).await;
-                }
+                },
                 Err(e) => {
                     tracing::warn!(error = ?e, "reality tls handshake error");
-                }
+                },
             }
         });
     }
@@ -2404,10 +2367,14 @@ fn is_transport_listener_protocol(protocol: &str) -> bool {
     matches!(
         protocol,
         "ws" | "websocket"
-            | "grpc" | "h2" | "http"
-            | "kcp" | "mkcp"
+            | "grpc"
+            | "h2"
+            | "http"
+            | "kcp"
+            | "mkcp"
             | "httpupgrade"
-            | "splithttp" | "xhttp"
+            | "splithttp"
+            | "xhttp"
     )
 }
 
@@ -2499,7 +2466,9 @@ async fn spawn_one_inbound(
         ));
     }
     // sockopt 数值/类型启动期硬错（Go 解码期语义；tcp/unix 监听分支共用）。
-    xray_transport::dialer::StreamSettings::validate_sockopt_json(ib.stream_settings_json.as_ref())?;
+    xray_transport::dialer::StreamSettings::validate_sockopt_json(
+        ib.stream_settings_json.as_ref(),
+    )?;
 
     let listen = ib.listen.as_deref().unwrap_or("0.0.0.0");
     // vodx：unix 路径监听（Go system_listener.go:118 UnixAddr 分支）走 UDS
@@ -2517,16 +2486,15 @@ async fn spawn_one_inbound(
                 "inbound has no port, skipping"
             );
             return Ok(None);
-        }
+        },
     };
     let addr = format!("{listen}:{port}");
     // e7le：入站 sockopt（streamSettings.sockopt JSON；缺省 tcp_nodelay=true）
     // 统一喂给 InboundTcpListener——此前 9 处裸 bind+accept 无 nodelay，
     // 与 Go net 默认（NoDelay=true）相反，流式下行每 chunk 受 Nagle 拖累。
-    let inbound_sockopts = xray_transport::dialer::StreamSettings::from_json(
-        ib.stream_settings_json.as_ref(),
-    )
-    .socket_options();
+    let inbound_sockopts =
+        xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref())
+            .socket_options();
 
     match ib.entry.kind.as_str() {
         "socks" => {
@@ -2544,7 +2512,7 @@ async fn spawn_one_inbound(
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                 serve_socks5(listener, ohm, config, handshake_timeout, udp_idle).await
             })))
-        }
+        },
         "mixed" => {
             // V2RayN / Go xray mixed 协议 = socks + http 复合 listener。
             // 单 listener peek 首字节嗅探:0x05 → socks;ASCII 字母开头 → http。
@@ -2558,7 +2526,7 @@ async fn spawn_one_inbound(
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                 serve_mixed(listener, ohm, socks_cfg, http_cfg, Some(handshake_timeout)).await
             })))
-        }
+        },
         "vless" => {
             let validator: Arc<dyn VlessValidator> = build_vless_validator(&ib.entry.data)?;
             // ENC decryption（Go inbound.go:104-114 handler.decryption）：settings
@@ -2570,9 +2538,8 @@ async fn spawn_one_inbound(
                 handshake_timeout: Some(handshake_timeout_for(&policy, 0)),
                 ..Default::default()
             };
-            let settings = xray_transport::dialer::StreamSettings::from_json(
-                ib.stream_settings_json.as_ref(),
-            );
+            let settings =
+                xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref());
             // splithttp 入站 AllowedNetwork（Go proxyman inbound.go:177-179）
             if settings.protocol == "splithttp" {
                 options.allowed_network = Some(Network::UDP);
@@ -2586,27 +2553,49 @@ async fn spawn_one_inbound(
                 })?;
                 let fallbacks = build_vless_fallbacks(&ib.entry.data)?;
                 let bind_addr: SocketAddr = addr.parse().map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("parse addr: {e}"),
+                    )
                 })?;
                 tracing::info!(tag = %ib.tag, addr = %addr, network = %settings.protocol, security = %settings.security, users = validator.get_uuid_count(), "vless transport inbound listening");
-                let on_conn: xray_transport::listener_registry::ConnHandler = Arc::new(move |conn| {
-                    let handler = Arc::clone(&handler);
-                    let validator = Arc::clone(&validator);
-                    let fallbacks = fallbacks.clone();
-                    let options = options.clone();
-                    tokio::spawn(async move {
-                        let (peer, local) = transport_conn_addrs(conn.as_ref(), bind_addr);
-                        // TLS 已在 transport hub 内终结，name/alpn 不可得
-                        if let Err(e) = xray_proxy_vless::handle_connection_with_fallback(
-                            conn, &handler, &validator, fallbacks, peer, local,
-                            String::new(), String::new(), Some(options), None,
-                        ).await {
-                            // Go vless inbound.go:522：拒绝 AtInfo + RemoteAddr。
-                            tracing::info!(peer = %peer, error = %e, "vless transport connection ended with error");
-                        }
-                    });
-                });
-                spawn_transport_listener_inbound(&ib.tag, bind_addr, settings, shutdown_token, on_conn).await
+                let on_conn: xray_transport::listener_registry::ConnHandler = Arc::new(
+                    move |conn| {
+                        let handler = Arc::clone(&handler);
+                        let validator = Arc::clone(&validator);
+                        let fallbacks = fallbacks.clone();
+                        let options = options.clone();
+                        tokio::spawn(async move {
+                            let (peer, local) = transport_conn_addrs(conn.as_ref(), bind_addr);
+                            // TLS 已在 transport hub 内终结，name/alpn 不可得
+                            if let Err(e) = xray_proxy_vless::handle_connection_with_fallback(
+                                conn,
+                                &handler,
+                                &validator,
+                                fallbacks,
+                                peer,
+                                local,
+                                String::new(),
+                                String::new(),
+                                Some(options),
+                                None,
+                            )
+                            .await
+                            {
+                                // Go vless inbound.go:522：拒绝 AtInfo + RemoteAddr。
+                                tracing::info!(peer = %peer, error = %e, "vless transport connection ended with error");
+                            }
+                        });
+                    },
+                );
+                spawn_transport_listener_inbound(
+                    &ib.tag,
+                    bind_addr,
+                    settings,
+                    shutdown_token,
+                    on_conn,
+                )
+                .await
             } else {
                 let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone()).await?;
                 if settings.security == "reality" {
@@ -2626,15 +2615,14 @@ async fn spawn_one_inbound(
                     })))
                 }
             }
-        }
+        },
         "trojan" => {
             let users = build_trojan_users(&ib.entry.data)?;
             // Trojan fallback：解析 JSON fallbacks 数组构建决策树
             // （dest 数字/缺失对齐 Go trojan.go:151-198，解析失败即启动失败）
             let fallbacks = build_trojan_fallbacks(&ib.entry.data)?;
-            let settings = xray_transport::dialer::StreamSettings::from_json(
-                ib.stream_settings_json.as_ref(),
-            );
+            let settings =
+                xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref());
             if is_transport_listener_protocol(&settings.protocol) {
                 // transport 分支：listener_registry 承载，TLS 在 hub 内终结。
                 let handler = ohm.get_default_handler().ok_or_else(|| {
@@ -2647,38 +2635,63 @@ async fn spawn_one_inbound(
                     }
                 }
                 let bind_addr: SocketAddr = addr.parse().map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("parse addr: {e}"),
+                    )
                 })?;
                 tracing::info!(tag = %ib.tag, addr = %addr, network = %settings.protocol, security = %settings.security, users = validator.get_key_count(), "trojan transport inbound listening");
                 let hs_timeout = handshake_timeout_for(&policy, 0);
-                let on_conn: xray_transport::listener_registry::ConnHandler = Arc::new(move |conn| {
-                    let validator = Arc::clone(&validator);
-                    let handler = Arc::clone(&handler);
-                    let fb_policy = fallbacks.clone();
-                    tokio::spawn(async move {
-                        let (peer, local) = transport_conn_addrs(conn.as_ref(), bind_addr);
-                        xray_proxy_trojan::serve_trojan_conn(
-                            conn, validator, handler, fb_policy, peer, local,
-                            String::new(), String::new(),
-                            hs_timeout,
-                        ).await;
+                let on_conn: xray_transport::listener_registry::ConnHandler =
+                    Arc::new(move |conn| {
+                        let validator = Arc::clone(&validator);
+                        let handler = Arc::clone(&handler);
+                        let fb_policy = fallbacks.clone();
+                        tokio::spawn(async move {
+                            let (peer, local) = transport_conn_addrs(conn.as_ref(), bind_addr);
+                            xray_proxy_trojan::serve_trojan_conn(
+                                conn,
+                                validator,
+                                handler,
+                                fb_policy,
+                                peer,
+                                local,
+                                String::new(),
+                                String::new(),
+                                hs_timeout,
+                            )
+                            .await;
+                        });
                     });
-                });
-                spawn_transport_listener_inbound(&ib.tag, bind_addr, settings, shutdown_token, on_conn).await
+                spawn_transport_listener_inbound(
+                    &ib.tag,
+                    bind_addr,
+                    settings,
+                    shutdown_token,
+                    on_conn,
+                )
+                .await
             } else {
                 let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
                 let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone()).await?;
                 tracing::info!(tag = %ib.tag, addr = %addr, users = users.len(), tls = tls.is_some(), "trojan inbound listening");
                 Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                    serve_trojan(listener, ohm, users, fallbacks, tls, handshake_timeout_for(&policy, 0)).await
+                    serve_trojan(
+                        listener,
+                        ohm,
+                        users,
+                        fallbacks,
+                        tls,
+                        handshake_timeout_for(&policy, 0),
+                    )
+                    .await
                 })))
             }
-        }
+        },
         "vmess" => {
             let validator = build_vmess_validator(&ib.entry.data)?;
-            let settings = xray_transport::dialer::StreamSettings::from_json(
-                ib.stream_settings_json.as_ref(),
-            );
+            let settings =
+                xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref());
             if is_transport_listener_protocol(&settings.protocol) {
                 // transport 分支：listener_registry 承载，TLS 在 hub 内终结。
                 let handler = ohm.get_default_handler().ok_or_else(|| {
@@ -2688,35 +2701,49 @@ async fn spawn_one_inbound(
                 // transport 层无 TLS 时维持裸 TCP 的 drain 防指纹语义（Go：!isTLS → drain）
                 let is_drain = !settings.is_tls();
                 let bind_addr: SocketAddr = addr.parse().map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("parse addr: {e}"),
+                    )
                 })?;
                 tracing::info!(tag = %ib.tag, addr = %addr, network = %settings.protocol, security = %settings.security, "vmess transport inbound listening");
                 let hs_timeout = handshake_timeout_for(&policy, 0);
-                let on_conn: xray_transport::listener_registry::ConnHandler = Arc::new(move |conn| {
-                    let handler = Arc::clone(&handler);
-                    let validator = Arc::clone(&validator);
-                    let history = Arc::clone(&history);
-                    tokio::spawn(async move {
-                        let (peer, _local) = transport_conn_addrs(conn.as_ref(), bind_addr);
-                        if let Err(e) = xray_proxy_vmess::handle_vmess_connection(
-                            conn, &handler, &validator, &history, is_drain,
-                            hs_timeout,
-                        ).await {
-                            // Go vmess inbound.go:250：拒绝 AtInfo + RemoteAddr。
-                            tracing::info!(peer = %peer, error = %e, "vmess transport connection ended with error");
-                        }
-                    });
-                });
-                spawn_transport_listener_inbound(&ib.tag, bind_addr, settings, shutdown_token, on_conn).await
+                let on_conn: xray_transport::listener_registry::ConnHandler = Arc::new(
+                    move |conn| {
+                        let handler = Arc::clone(&handler);
+                        let validator = Arc::clone(&validator);
+                        let history = Arc::clone(&history);
+                        tokio::spawn(async move {
+                            let (peer, _local) = transport_conn_addrs(conn.as_ref(), bind_addr);
+                            if let Err(e) = xray_proxy_vmess::handle_vmess_connection(
+                                conn, &handler, &validator, &history, is_drain, hs_timeout,
+                            )
+                            .await
+                            {
+                                // Go vmess inbound.go:250：拒绝 AtInfo + RemoteAddr。
+                                tracing::info!(peer = %peer, error = %e, "vmess transport connection ended with error");
+                            }
+                        });
+                    },
+                );
+                spawn_transport_listener_inbound(
+                    &ib.tag,
+                    bind_addr,
+                    settings,
+                    shutdown_token,
+                    on_conn,
+                )
+                .await
             } else {
                 let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
                 let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone()).await?;
                 tracing::info!(tag = %ib.tag, addr = %addr, tls = tls.is_some(), "vmess inbound listening");
                 Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                    serve_vmess(listener, ohm, validator, tls, handshake_timeout_for(&policy, 0)).await
+                    serve_vmess(listener, ohm, validator, tls, handshake_timeout_for(&policy, 0))
+                        .await
                 })))
             }
-        }
+        },
         "http" => {
             let config = parse_http_config(&ib.entry.data)?;
             // userLevel 生效：policy_for_level(UserLevel).timeout.handshake →
@@ -2730,7 +2757,7 @@ async fn spawn_one_inbound(
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                 serve_http(listener, ohm, Arc::new(config), Some(handshake_timeout)).await
             })))
-        }
+        },
         "dokodemo" => {
             let settings = parse_dokodemo_settings(&ib.entry.data)?;
             let dest = settings.dest.clone();
@@ -2765,7 +2792,10 @@ async fn spawn_one_inbound(
             }
             if settings.allow_udp {
                 let bind_addr: SocketAddr = addr.parse().map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("parse addr: {e}"),
+                    )
                 })?;
                 let dispatch = ohm.get_default_handler().ok_or_else(|| {
                     std::io::Error::other(
@@ -2789,19 +2819,19 @@ async fn spawn_one_inbound(
                     "dokodemo: no valid network specified (need tcp and/or udp)",
                 ));
             }
-            // 合并所有 listener handle；token cancel 时 combined 被取消（子 handle 被 drop/abort）。
+            // 合并所有 listener handle；token cancel 时 combined 被取消（子 handle 被
+            // drop/abort）。
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                 for h in handles {
                     let _ = h.await;
                 }
                 Ok(())
             })))
-        }
+        },
         // shadowsocks inbound：SsInbound + serve_ss accept loop
         "shadowsocks" => {
-            let settings = xray_transport::dialer::StreamSettings::from_json(
-                ib.stream_settings_json.as_ref(),
-            );
+            let settings =
+                xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref());
             // transport 分支（grpc/kcp/ws hub 承载）：仅 Legacy 模式接线（2022 模式
             // 的 handle_conn 尚为 TcpStream 特化，保持裸 TCP 回落不回归）。
             if is_transport_listener_protocol(&settings.protocol) {
@@ -2810,18 +2840,29 @@ async fn spawn_one_inbound(
                         std::io::Error::other("no default outbound handler registered")
                     })?;
                     let bind_addr: SocketAddr = addr.parse().map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("parse addr: {e}"),
+                        )
                     })?;
                     tracing::info!(tag = %ib.tag, addr = %addr, network = %settings.protocol, security = %settings.security, "ss transport inbound listening");
-                    let on_conn: xray_transport::listener_registry::ConnHandler = Arc::new(move |conn| {
-                        let ib = Arc::clone(&ss_ib);
-                        let handler = Arc::clone(&handler);
-                        let hs_timeout = handshake_timeout_for(&policy, 0);
-                        tokio::spawn(async move {
-                            ss_legacy_pipeline(ib, handler, conn, hs_timeout).await;
+                    let on_conn: xray_transport::listener_registry::ConnHandler =
+                        Arc::new(move |conn| {
+                            let ib = Arc::clone(&ss_ib);
+                            let handler = Arc::clone(&handler);
+                            let hs_timeout = handshake_timeout_for(&policy, 0);
+                            tokio::spawn(async move {
+                                ss_legacy_pipeline(ib, handler, conn, hs_timeout).await;
+                            });
                         });
-                    });
-                    return spawn_transport_listener_inbound(&ib.tag, bind_addr, settings, shutdown_token, on_conn).await;
+                    return spawn_transport_listener_inbound(
+                        &ib.tag,
+                        bind_addr,
+                        settings,
+                        shutdown_token,
+                        on_conn,
+                    )
+                    .await;
                 }
                 tracing::warn!(tag = %ib.tag, network = %settings.protocol, "ss transport inbound only supports legacy AEAD mode; falling back to raw TCP");
             }
@@ -2831,12 +2872,17 @@ async fn spawn_one_inbound(
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                 serve_ss(listener, ohm, inbound, handshake_timeout_for(&policy, 0)).await
             })))
-        }
+        },
         // hysteria inbound：HysteriaInboundHandler impl InboundHandler（rxw：接 dispatcher）
         "hysteria" | "hysteria2" => {
-            let bind_addr: std::net::SocketAddr = addr.parse()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("parse addr: {e}")))?;
-            let (config, factory) = parse_hysteria_inbound_config(&ib.entry.data, bind_addr, ib.stream_settings_json.as_ref())?;
+            let bind_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("parse addr: {e}"))
+            })?;
+            let (config, factory) = parse_hysteria_inbound_config(
+                &ib.entry.data,
+                bind_addr,
+                ib.stream_settings_json.as_ref(),
+            )?;
             let dispatch = ohm.get_default_handler().ok_or_else(|| {
                 std::io::Error::other("hysteria inbound requires a default outbound handler")
             })?;
@@ -2850,16 +2896,16 @@ async fn spawn_one_inbound(
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                 handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))
             })))
-        }
+        },
         // anytls inbound：AnytlsInboundHandler impl InboundHandler
         "anytls" => {
-            let bind_addr: std::net::SocketAddr = addr.parse()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("parse addr: {e}")))?;
+            let bind_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("parse addr: {e}"))
+            })?;
             let (tls_acceptor, password) = parse_anytls_tls_acceptor(&ib.entry.data)?;
-            let handler = xray_proxy_anytls::AnytlsInboundHandler::new(
-                &ib.tag, bind_addr, tls_acceptor,
-            )
-            .with_password(password);
+            let handler =
+                xray_proxy_anytls::AnytlsInboundHandler::new(&ib.tag, bind_addr, tls_acceptor)
+                    .with_password(password);
             handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))?;
             // start() 是 spawn-后-返回的短方法：slot.server 持 MockServer stop_tx，
             // handler drop → serve_loop 的 sender-dropped 分支退出 → listener 关闭。
@@ -2869,7 +2915,7 @@ async fn spawn_one_inbound(
                 std::future::pending::<()>().await;
                 Ok(())
             })))
-        }
+        },
         // tuic inbound：QUIC listener + auth + Connect → dispatcher/router 分发
         "tuic" => {
             let dispatch = ohm.get_default_handler().ok_or_else(|| {
@@ -2881,7 +2927,30 @@ async fn spawn_one_inbound(
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                 handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))
             })))
-        }
+        },
+        // naive inbound：TLS + h2 CONNECT（naiveproxy 服务端语义，bd 88vp）
+        "naive" => {
+            let bind_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("parse addr: {e}"))
+            })?;
+            let (auth, tls_config) =
+                parse_naive_inbound_settings(&ib.entry.data, ib.stream_settings_json.as_ref())?;
+            let dispatch = ohm.get_default_handler().ok_or_else(|| {
+                std::io::Error::other("naive inbound requires a default outbound handler")
+            })?;
+            let handler = xray_transport_naive::NaiveInboundHandler::new(
+                &ib.tag, bind_addr, tls_config, auth,
+            )
+            .with_dispatch(dispatch);
+            handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))?;
+            // 保活持有（anytls 同款）：handler drop = abort accept loop 关端口，
+            // shutdown 随本 task 被 token cancel 时 abort 生效。
+            Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                let _keep = handler;
+                std::future::pending::<()>().await;
+                Ok(())
+            })))
+        },
         // wireguard inbound：WireguardInboundHandler impl InboundHandler
         "wireguard" => {
             let (config, listen_port) = parse_wireguard_inbound_config(&ib.entry.data)?;
@@ -2889,14 +2958,17 @@ async fn spawn_one_inbound(
                 std::io::Error::other("wireguard inbound requires a default outbound handler")
             })?;
             let handler = xray_proxy_wireguard::WireguardInboundHandler::new(
-                &ib.tag, &config, listen_port, dispatch,
+                &ib.tag,
+                &config,
+                listen_port,
+                dispatch,
             )
             .await
             .map_err(|e| std::io::Error::other(format!("wireguard inbound: {e}")))?;
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                 handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))
             })))
-        }
+        },
         // dns inbound：UDP+TCP listener → handle_packet/handle_conn
         "dns" => {
             let (handler, outbound) = parse_dns_inbound_config(&ib.entry.data, &ib.tag)?;
@@ -2907,39 +2979,46 @@ async fn spawn_one_inbound(
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                 serve_dns(udp, tcp, inbound).await
             })))
-        }
+        },
         // loopback inbound：LoopbackHandler 注册（outbound-only，start/close no-op）
         "loopback" => {
             let inbound_tag = parse_loopback_config(&ib.entry.data)?;
-            let _handler = LoopbackHandler::new(&ib.tag, xray_proto::xray::proxy::loopback::Config { inbound_tag });
+            let _handler = LoopbackHandler::new(
+                &ib.tag,
+                xray_proto::xray::proxy::loopback::Config { inbound_tag },
+            );
             tracing::info!(tag = %ib.tag, "loopback inbound registered (outbound-only)");
             // LoopbackHandler 的 InboundHandler::start 是 no-op，不 spawn task
             Ok(None)
-        }
+        },
         // blackhole inbound：accept 连接后静默关闭/写 403 后关闭
         "blackhole" => {
             let response = parse_blackhole_inbound_response(&ib.entry.data);
             let handler = BlackholeInboundHandler::new(&ib.tag, response, &addr);
-            handler.start().await
+            handler
+                .start()
+                .await
                 .map_err(|e| std::io::Error::other(format!("blackhole inbound: {e}")))?;
             // accept 循环在 start() 内部 spawn，此 task 保持 handler 存活并监听 shutdown。
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                 std::future::pending::<()>().await;
                 Ok(())
             })))
-        }
+        },
         // freedom inbound：accept 连接后 dial 预定义目标并双向转发
         "freedom" => {
             let dest = parse_freedom_inbound_dest(&ib.entry.data)?;
             let handler = FreedomInboundHandler::new(&ib.tag, &addr, dest, Arc::clone(&ohm));
-            handler.start().await
+            handler
+                .start()
+                .await
                 .map_err(|e| std::io::Error::other(format!("freedom inbound: {e}")))?;
             // accept 循环在 start() 内部 spawn，此 task 保持 handler 存活并监听 shutdown。
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                 std::future::pending::<()>().await;
                 Ok(())
             })))
-        }
+        },
         other => {
             tracing::warn!(
                 tag = %ib.tag,
@@ -2947,7 +3026,7 @@ async fn spawn_one_inbound(
                 "inbound protocol not yet supported, skipping"
             );
             Ok(None)
-        }
+        },
     }
 }
 
@@ -2973,7 +3052,7 @@ async fn serve_unix_listener(
             Ok(conn) => on_conn(conn),
             Err(e) => {
                 tracing::warn!(error = %e, "unix inbound accept failed");
-            }
+            },
         }
     }
 }
@@ -3008,7 +3087,7 @@ async fn spawn_unix_inbound(
         ));
     }
     match settings.security.as_str() {
-        "" | "none" => {}
+        "" | "none" => {},
         other => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -3017,12 +3096,11 @@ async fn spawn_unix_inbound(
                     ib.tag
                 ),
             ));
-        }
+        },
     }
     // 协议支持矩阵前置：不支持 UDS 的协议在 bind 前显式报错（fail-fast，
     // 对齐 Go inbound 创建失败即启动失败的语义）。
-    const UDS_SUPPORTED_PROTOCOLS: &[&str] =
-        &["socks", "vless", "vmess", "trojan", "shadowsocks"];
+    const UDS_SUPPORTED_PROTOCOLS: &[&str] = &["socks", "vless", "vmess", "trojan", "shadowsocks"];
     if !UDS_SUPPORTED_PROTOCOLS.contains(&ib.entry.kind.as_str()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -3033,188 +3111,190 @@ async fn spawn_unix_inbound(
         ));
     }
     let listener = listen_unix_system(listen, settings.socket_options()).await?;
-    let handler = ohm.get_default_handler().ok_or_else(|| {
-        std::io::Error::other("no default outbound handler registered")
-    })?;
+    let handler = ohm
+        .get_default_handler()
+        .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
     // UDS 无 SocketAddr；对齐 Go UnixConnWrapper.RemoteAddr 的 0.0.0.0:0。
-    let unspecified =
-        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+    let unspecified = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
 
-    let serve: std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> =
-        match ib.entry.kind.as_str() {
-            "socks" => {
-                let config = Arc::new(parse_socks_server_config(&ib.entry.data)?);
-                let handshake_timeout = Some(handshake_timeout_for(&policy, config.user_level));
-                let udp_idle = policy
-                    .as_ref()
-                    .map(|pm| pm.policy_for_level(config.user_level).timeout.connection_idle)
-                    .unwrap_or(xray_features::policy::TimeoutPolicy::default().connection_idle);
-                Box::pin(serve_unix_listener(listener, {
+    let serve: std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> = match ib
+        .entry
+        .kind
+        .as_str()
+    {
+        "socks" => {
+            let config = Arc::new(parse_socks_server_config(&ib.entry.data)?);
+            let handshake_timeout = Some(handshake_timeout_for(&policy, config.user_level));
+            let udp_idle = policy
+                .as_ref()
+                .map(|pm| pm.policy_for_level(config.user_level).timeout.connection_idle)
+                .unwrap_or(xray_features::policy::TimeoutPolicy::default().connection_idle);
+            Box::pin(serve_unix_listener(listener, {
+                let handler = Arc::clone(&handler);
+                Arc::new(move |conn| {
                     let handler = Arc::clone(&handler);
-                    Arc::new(move |conn| {
-                        let handler = Arc::clone(&handler);
-                        let config = Arc::clone(&config);
-                        tokio::spawn(async move {
-                            let peer =
-                                conn.remote_addr().ok().flatten().unwrap_or(unspecified);
-                            if let Err(e) = handle_connection(
-                                conn,
-                                peer,
-                                &config,
-                                &handler,
-                                handshake_timeout,
-                                udp_idle,
-                            )
-                            .await
-                            {
-                                tracing::info!(
-                                    peer = %peer,
-                                    error = %e,
-                                    "socks5 (uds) connection ended with error"
-                                );
-                            }
-                        });
-                    })
-                }))
-            }
-            "vless" => {
-                let validator: Arc<dyn VlessValidator> = build_vless_validator(&ib.entry.data)?;
-                let decryption = build_vless_decryption(&ib.entry.data)?;
-                let options = VlessInboundOptions {
-                    decryption: decryption.clone(),
-                    ..Default::default()
-                };
-                let fallbacks = build_vless_fallbacks(&ib.entry.data)?;
-                tracing::info!(
-                    tag = %ib.tag,
-                    users = validator.get_uuid_count(),
-                    "vless (uds) inbound listening"
-                );
-                Box::pin(serve_unix_listener(listener, {
+                    let config = Arc::clone(&config);
+                    tokio::spawn(async move {
+                        let peer = conn.remote_addr().ok().flatten().unwrap_or(unspecified);
+                        if let Err(e) = handle_connection(
+                            conn,
+                            peer,
+                            &config,
+                            &handler,
+                            handshake_timeout,
+                            udp_idle,
+                        )
+                        .await
+                        {
+                            tracing::info!(
+                                peer = %peer,
+                                error = %e,
+                                "socks5 (uds) connection ended with error"
+                            );
+                        }
+                    });
+                })
+            }))
+        },
+        "vless" => {
+            let validator: Arc<dyn VlessValidator> = build_vless_validator(&ib.entry.data)?;
+            let decryption = build_vless_decryption(&ib.entry.data)?;
+            let options =
+                VlessInboundOptions { decryption: decryption.clone(), ..Default::default() };
+            let fallbacks = build_vless_fallbacks(&ib.entry.data)?;
+            tracing::info!(
+                tag = %ib.tag,
+                users = validator.get_uuid_count(),
+                "vless (uds) inbound listening"
+            );
+            Box::pin(serve_unix_listener(listener, {
+                let handler = Arc::clone(&handler);
+                Arc::new(move |conn| {
                     let handler = Arc::clone(&handler);
-                    Arc::new(move |conn| {
-                        let handler = Arc::clone(&handler);
-                        let validator = Arc::clone(&validator);
-                        let fallbacks = fallbacks.clone();
-                        let options = options.clone();
-                        tokio::spawn(async move {
-                            let (peer, local) =
-                                transport_conn_addrs(conn.as_ref(), unspecified);
-                            if let Err(e) = xray_proxy_vless::handle_connection_with_fallback(
-                                conn, &handler, &validator, fallbacks, peer, local,
-                                String::new(), String::new(), Some(options), None,
-                            )
-                            .await
-                            {
-                                tracing::info!(
-                                    peer = %peer,
-                                    error = %e,
-                                    "vless (uds) connection ended with error"
-                                );
-                            }
-                        });
-                    })
-                }))
-            }
-            "vmess" => {
-                let validator = build_vmess_validator(&ib.entry.data)?;
-                let history = Arc::new(xray_proxy_vmess::SessionHistory::new());
-                // security 已 gate 为 none → 与裸 TCP 分支同为 drain 语义。
-                let is_drain = !settings.is_tls();
-                tracing::info!(tag = %ib.tag, "vmess (uds) inbound listening");
-                let hs_timeout = handshake_timeout_for(&policy, 0);
-                Box::pin(serve_unix_listener(listener, {
+                    let validator = Arc::clone(&validator);
+                    let fallbacks = fallbacks.clone();
+                    let options = options.clone();
+                    tokio::spawn(async move {
+                        let (peer, local) = transport_conn_addrs(conn.as_ref(), unspecified);
+                        if let Err(e) = xray_proxy_vless::handle_connection_with_fallback(
+                            conn,
+                            &handler,
+                            &validator,
+                            fallbacks,
+                            peer,
+                            local,
+                            String::new(),
+                            String::new(),
+                            Some(options),
+                            None,
+                        )
+                        .await
+                        {
+                            tracing::info!(
+                                peer = %peer,
+                                error = %e,
+                                "vless (uds) connection ended with error"
+                            );
+                        }
+                    });
+                })
+            }))
+        },
+        "vmess" => {
+            let validator = build_vmess_validator(&ib.entry.data)?;
+            let history = Arc::new(xray_proxy_vmess::SessionHistory::new());
+            // security 已 gate 为 none → 与裸 TCP 分支同为 drain 语义。
+            let is_drain = !settings.is_tls();
+            tracing::info!(tag = %ib.tag, "vmess (uds) inbound listening");
+            let hs_timeout = handshake_timeout_for(&policy, 0);
+            Box::pin(serve_unix_listener(listener, {
+                let handler = Arc::clone(&handler);
+                Arc::new(move |conn| {
                     let handler = Arc::clone(&handler);
-                    Arc::new(move |conn| {
-                        let handler = Arc::clone(&handler);
-                        let validator = Arc::clone(&validator);
-                        let history = Arc::clone(&history);
-                        tokio::spawn(async move {
-                            let (peer, _local) =
-                                transport_conn_addrs(conn.as_ref(), unspecified);
-                            if let Err(e) = xray_proxy_vmess::handle_vmess_connection(
-                                conn, &handler, &validator, &history, is_drain,
-                                hs_timeout,
-                            )
-                            .await
-                            {
-                                tracing::info!(
-                                    peer = %peer,
-                                    error = %e,
-                                    "vmess (uds) connection ended with error"
-                                );
-                            }
-                        });
-                    })
-                }))
-            }
-            "trojan" => {
-                let users = build_trojan_users(&ib.entry.data)?;
-                let fallbacks = build_trojan_fallbacks(&ib.entry.data)?;
-                let validator = Arc::new(xray_proxy_trojan::Validator::new());
-                for (_, user) in users {
-                    if let Err(e) = validator.add(user) {
-                        tracing::warn!(
-                            error = %e,
-                            "skip duplicate user during trojan uds inbound init"
-                        );
-                    }
+                    let validator = Arc::clone(&validator);
+                    let history = Arc::clone(&history);
+                    tokio::spawn(async move {
+                        let (peer, _local) = transport_conn_addrs(conn.as_ref(), unspecified);
+                        if let Err(e) = xray_proxy_vmess::handle_vmess_connection(
+                            conn, &handler, &validator, &history, is_drain, hs_timeout,
+                        )
+                        .await
+                        {
+                            tracing::info!(
+                                peer = %peer,
+                                error = %e,
+                                "vmess (uds) connection ended with error"
+                            );
+                        }
+                    });
+                })
+            }))
+        },
+        "trojan" => {
+            let users = build_trojan_users(&ib.entry.data)?;
+            let fallbacks = build_trojan_fallbacks(&ib.entry.data)?;
+            let validator = Arc::new(xray_proxy_trojan::Validator::new());
+            for (_, user) in users {
+                if let Err(e) = validator.add(user) {
+                    tracing::warn!(
+                        error = %e,
+                        "skip duplicate user during trojan uds inbound init"
+                    );
                 }
-                tracing::info!(tag = %ib.tag, "trojan (uds) inbound listening");
-                let hs_timeout = handshake_timeout_for(&policy, 0);
-                Box::pin(serve_unix_listener(listener, {
-                    let handler = Arc::clone(&handler);
-                    Arc::new(move |conn| {
-                        let handler = Arc::clone(&handler);
-                        let validator = Arc::clone(&validator);
-                        let fallbacks = fallbacks.clone();
-                        tokio::spawn(async move {
-                            let (peer, local) =
-                                transport_conn_addrs(conn.as_ref(), unspecified);
-                            xray_proxy_trojan::serve_trojan_conn(
-                                conn, validator, handler, fallbacks, peer, local,
-                                String::new(), String::new(),
-                                hs_timeout,
-                            )
-                            .await;
-                        });
-                    })
-                }))
             }
-            "shadowsocks" => {
-                let inbound = match parse_ss_inbound_config(&ib.entry.data)? {
-                    SsInboundMode::Legacy(ss_ib) => ss_ib,
-                    _ => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Unsupported,
-                            format!(
-                                "uds inbound '{}': ss2022 not supported over unix socket",
-                                ib.tag
-                            ),
-                        ));
-                    }
-                };
-                tracing::info!(tag = %ib.tag, "shadowsocks (uds) inbound listening");
-                Box::pin(serve_unix_listener(listener, {
+            tracing::info!(tag = %ib.tag, "trojan (uds) inbound listening");
+            let hs_timeout = handshake_timeout_for(&policy, 0);
+            Box::pin(serve_unix_listener(listener, {
+                let handler = Arc::clone(&handler);
+                Arc::new(move |conn| {
                     let handler = Arc::clone(&handler);
-                    Arc::new(move |conn| {
-                        let handler = Arc::clone(&handler);
-                        let inbound = Arc::clone(&inbound);
-                        let hs_timeout = handshake_timeout_for(&policy, 0);
-                        tokio::spawn(async move {
-                            ss_legacy_pipeline(inbound, handler, conn, hs_timeout).await;
-                        });
-                    })
-                }))
-            }
-            _ => unreachable!("uds protocol support checked above"),
-        };
+                    let validator = Arc::clone(&validator);
+                    let fallbacks = fallbacks.clone();
+                    tokio::spawn(async move {
+                        let (peer, local) = transport_conn_addrs(conn.as_ref(), unspecified);
+                        xray_proxy_trojan::serve_trojan_conn(
+                            conn,
+                            validator,
+                            handler,
+                            fallbacks,
+                            peer,
+                            local,
+                            String::new(),
+                            String::new(),
+                            hs_timeout,
+                        )
+                        .await;
+                    });
+                })
+            }))
+        },
+        "shadowsocks" => {
+            let inbound = match parse_ss_inbound_config(&ib.entry.data)? {
+                SsInboundMode::Legacy(ss_ib) => ss_ib,
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        format!("uds inbound '{}': ss2022 not supported over unix socket", ib.tag),
+                    ));
+                },
+            };
+            tracing::info!(tag = %ib.tag, "shadowsocks (uds) inbound listening");
+            Box::pin(serve_unix_listener(listener, {
+                let handler = Arc::clone(&handler);
+                Arc::new(move |conn| {
+                    let handler = Arc::clone(&handler);
+                    let inbound = Arc::clone(&inbound);
+                    let hs_timeout = handshake_timeout_for(&policy, 0);
+                    tokio::spawn(async move {
+                        ss_legacy_pipeline(inbound, handler, conn, hs_timeout).await;
+                    });
+                })
+            }))
+        },
+        _ => unreachable!("uds protocol support checked above"),
+    };
 
-    Ok(Some(spawn_inbound_serve(
-        ib.tag.clone(),
-        shutdown_token,
-        serve,
-    )))
+    Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, serve)))
 }
 
 /// 非 unix 平台：unix 路径监听显式 Unsupported（vodx 验收：Windows 断言），
@@ -3230,10 +3310,7 @@ async fn spawn_unix_inbound(
     let _ = (ohm, policy, shutdown_token, listen);
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        format!(
-            "unix socket inbound '{}' is only supported on unix platforms",
-            ib.tag
-        ),
+        format!("unix socket inbound '{}' is only supported on unix platforms", ib.tag),
     ))
 }
 
@@ -3256,11 +3333,7 @@ fn parse_socks_server_config(data: &[u8]) -> std::io::Result<ServerConfig> {
     }
     // accounts 在场则覆盖 users（Go socks.go:54-56 `if v.Accounts != nil`——
     // 与 Go 相反的旧优先级 users→accounts 已修正）。
-    if let Some(users) = v
-        .get("accounts")
-        .or_else(|| v.get("users"))
-        .and_then(|x| x.as_array())
-    {
+    if let Some(users) = v.get("accounts").or_else(|| v.get("users")).and_then(|x| x.as_array()) {
         for u in users {
             let user = u.get("user").and_then(|x| x.as_str()).unwrap_or("");
             let pass = u.get("pass").and_then(|x| x.as_str()).unwrap_or("");
@@ -3291,9 +3364,9 @@ fn parse_socks_server_config(data: &[u8]) -> std::io::Result<ServerConfig> {
     Ok(cfg)
 }
 
-///
 /// JSON 格式：`{"clients":[{"id":"uuid","flow":"","email":""}],"decryption":"none"}`。
-/// 对每个 client 构造最小 `ProtoAccount`（id+flow+encryption=none）→ `MemoryAccount::from_proto_account`。
+/// 对每个 client 构造最小 `ProtoAccount`（id+flow+encryption=none）→
+/// `MemoryAccount::from_proto_account`。
 fn build_vless_validator(data: &[u8]) -> std::io::Result<std::sync::Arc<dyn VlessValidator>> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("vless inbound settings JSON: {e}")))?;
@@ -3310,20 +3383,12 @@ fn build_vless_validator(data: &[u8]) -> std::io::Result<std::sync::Arc<dyn Vles
     let cfg_testseed: Vec<u32> = v
         .get("testseed")
         .and_then(|s| s.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_u64().map(|n| n as u32))
-                .collect::<Vec<u32>>()
-        })
+        .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect::<Vec<u32>>())
         .unwrap_or_default();
     fn user_testseed(c: &serde_json::Value) -> Vec<u32> {
         c.get("testseed")
             .and_then(|s| s.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_u64().map(|n| n as u32))
-                    .collect::<Vec<u32>>()
-            })
+            .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect::<Vec<u32>>())
             .unwrap_or_default()
     }
     if let Some(clients) = v.get("clients").and_then(|c| c.as_array()) {
@@ -3340,7 +3405,7 @@ fn build_vless_validator(data: &[u8]) -> std::io::Result<std::sync::Arc<dyn Vles
                     return Err(std::io::Error::other(format!(
                         "VLESS users: \"flow\" doesn't support \"{f}\" in this version"
                     )));
-                }
+                },
             };
             // user 级 testseed 不足 4 个 → settings 级覆盖（Go vless.go:80-82）。
             let mut testseed = user_testseed(c);
@@ -3375,7 +3440,9 @@ fn build_vless_validator(data: &[u8]) -> std::io::Result<std::sync::Arc<dyn Vles
 fn build_vless_decryption(
     data: &[u8],
 ) -> std::io::Result<Option<std::sync::Arc<xray_proxy_vless::encryption::ServerInstance>>> {
-    use xray_proxy_vless::encryption::{parse_server_decryption, ServerInstance as EncServerInstance};
+    use xray_proxy_vless::encryption::{
+        ServerInstance as EncServerInstance, parse_server_decryption,
+    };
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("vless inbound settings JSON: {e}")))?;
     let raw = v.get("decryption").and_then(|d| d.as_str()).unwrap_or("");
@@ -3403,10 +3470,14 @@ fn build_vless_decryption(
     }
     let mut inst = EncServerInstance::new();
     let key_count = p.keys.len();
-    inst
-        .init(p.keys, p.xor_mode, p.seconds_from, p.seconds_to, &p.padding)
+    inst.init(p.keys, p.xor_mode, p.seconds_from, p.seconds_to, &p.padding)
         .map_err(|e| std::io::Error::other(format!("vless decryption init: {e}")))?;
-    tracing::info!(seconds_from = p.seconds_from, seconds_to = p.seconds_to, keys = key_count, "vless enc decryption enabled");
+    tracing::info!(
+        seconds_from = p.seconds_from,
+        seconds_to = p.seconds_to,
+        keys = key_count,
+        "vless enc decryption enabled"
+    );
     Ok(Some(std::sync::Arc::new(inst)))
 }
 
@@ -3438,17 +3509,15 @@ fn apply_unix_abstract_padding(dest: &str) -> String {
 /// 从 inbound entry.data（JSON）解析 trojan clients → HashMap<key_hash, MemoryUser>。
 ///
 /// JSON 格式：`{"clients":[{"password":"...","email":""}]}` 或 `{"users":[...]}`。
-/// 对每个 client：`MemoryAccount::new(password)`（内部计算 hex(sha224)）→ MemoryUser → key_hash 入表。
+/// 对每个 client：`MemoryAccount::new(password)`（内部计算 hex(sha224)）→ MemoryUser → key_hash
+/// 入表。
 fn build_trojan_users(data: &[u8]) -> std::io::Result<HashMap<String, TrojanMemoryUser>> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("trojan inbound settings JSON: {e}")))?;
     let mut users = HashMap::new();
     // Go infra/conf/trojan.go:124-126：`if c.Clients != nil { c.Users = c.Clients }`
     // — 若 `clients` 字段存在则覆盖 `users`，否则 fall back 到 `users`。
-    let client_list = v
-        .get("clients")
-        .or_else(|| v.get("users"))
-        .and_then(|c| c.as_array());
+    let client_list = v.get("clients").or_else(|| v.get("users")).and_then(|c| c.as_array());
     if let Some(clients) = client_list {
         for c in clients {
             // Trojan Flow 已移除（Go infra/conf/trojan.go:134-136 服务端逐用户检查）。
@@ -3471,10 +3540,10 @@ fn build_trojan_users(data: &[u8]) -> std::io::Result<HashMap<String, TrojanMemo
 ///
 /// dest 形态对齐 Go `infra/conf/trojan.go:151-198`：
 /// - json 数字 N（或纯数字字符串）→ `"localhost:N"`（:154-155 + :188-190）；
-/// - `type` 缺省时按 dest 形态推导（:177-194）：`@`/`/` 前缀 → unix
-///   （`@@` 抽象套接字做 108 字节 NUL padding），`host:port` → tcp；
-/// - dest 缺失/null 且 `type` 也缺省 → 报错（:196-198；不再回退 127.0.0.1:80），
-///   与 Go 一致：fallbacks 配置错误 = inbound 启动失败。
+/// - `type` 缺省时按 dest 形态推导（:177-194）：`@`/`/` 前缀 → unix （`@@` 抽象套接字做 108 字节
+///   NUL padding），`host:port` → tcp；
+/// - dest 缺失/null 且 `type` 也缺省 → 报错（:196-198；不再回退 127.0.0.1:80）， 与 Go
+///   一致：fallbacks 配置错误 = inbound 启动失败。
 fn build_trojan_fallbacks(data: &[u8]) -> std::io::Result<Option<std::sync::Arc<FallbackPolicy>>> {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(data) else {
         return Ok(None);
@@ -3517,11 +3586,7 @@ fn build_trojan_fallbacks(data: &[u8]) -> std::io::Result<Option<std::sync::Arc<
         }
         list.push(Fallback { name, alpn, path, r#type: fb_type, dest, xver });
     }
-    if list.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(FallbackPolicy::from_list(&list)))
-    }
+    if list.is_empty() { Ok(None) } else { Ok(Some(FallbackPolicy::from_list(&list))) }
 }
 
 /// `host:port` 形态判定（Go `net.SplitHostPort` 的轻量版，仅用于 fallback
@@ -3534,22 +3599,18 @@ fn looks_like_host_port(s: &str) -> bool {
                 && !p.is_empty()
                 && p.bytes().all(|b| b.is_ascii_digit())
                 && (!h.contains(':') || h.ends_with(']'))
-        }
+        },
         None => false,
     }
 }
-
-
-
-
 
 /// 从 inbound entry.data（JSON）解析 VLESS `fallbacks` 数组 → FallbackPolicy。
 ///
 /// 对齐 Go `infra/conf/vless.go:170-211`（VLessInboundFallback 消费段）：
 /// - `dest` 数字（uint16 范围）→ `"localhost:N"`；字符串原样；
 /// - `path` 必须为空或以 `/` 开头；
-/// - type 推导（serve-ws-none → serve；`/`/`@` 前缀 → unix；纯数字 →
-///   localhost:N；host:port → tcp）失败（含 dest 缺失）→ 拒启；
+/// - type 推导（serve-ws-none → serve；`/`/`@` 前缀 → unix；纯数字 → localhost:N；host:port →
+///   tcp）失败（含 dest 缺失）→ 拒启；
 /// - `xver` 仅 0/1/2，负数/非整数/越界一律拒启，不钳制；
 /// - unix / serve 目标本构建运行面未实现（恒 TcpStream 拨号）→ 显式拒启。
 ///
@@ -3581,12 +3642,12 @@ fn build_vless_fallbacks(
                     return Err(std::io::Error::other(
                         "VLESS fallbacks: invalid PROXY protocol version, \"xver\" only accepts 0, 1, 2",
                     ));
-                }
+                },
                 None => {
                     return Err(std::io::Error::other(format!(
                         "VLESS fallbacks[{i}]: invalid \"xver\" (need unsigned integer)"
                     )));
-                }
+                },
             },
         };
         // dest（Go vless.go:170-183 json.RawMessage 数字优先）。
@@ -3597,7 +3658,7 @@ fn build_vless_fallbacks(
                     return Err(std::io::Error::other(format!(
                         "VLESS fallbacks[{i}]: invalid numeric \"dest\" (need uint16 port)"
                     )));
-                }
+                },
             },
             Some(serde_json::Value::String(s)) => s.clone(),
             None | Some(serde_json::Value::Null) => String::new(),
@@ -3605,7 +3666,7 @@ fn build_vless_fallbacks(
                 return Err(std::io::Error::other(format!(
                     "VLESS fallbacks[{i}]: invalid \"dest\": {other}"
                 )));
-            }
+            },
         };
         // type 推导（Go vless.go:186-202）；Rust 运行面仅支持 tcp。
         let mut fb_type = fb.get("type").and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -3635,25 +3696,19 @@ fn build_vless_fallbacks(
         }
         policy.add(name, alpn, path, xray_proxy_vless::FallbackDest::new(dest, xver));
     }
-    if policy.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(std::sync::Arc::new(policy)))
-    }
+    if policy.is_empty() { Ok(None) } else { Ok(Some(std::sync::Arc::new(policy))) }
 }
 /// 从 inbound entry.data（JSON）解析 http inbound 配置 → HttpServerConfig。
 ///
 /// JSON 格式：`{"users":[{"user":"u","pass":"p"}],"allowTransparent":true,"userLevel":3}`。
 /// `users`/`accounts` 同义（Go http.go:26-27 两个字段都收），users 优先。
-/// 字段名/零值默认对齐 Go infra/conf/http.go:25-30（Transparent→AllowTransparent、UserLevel→UserLevel）。
+/// 字段名/零值默认对齐 Go
+/// infra/conf/http.go:25-30（Transparent→AllowTransparent、UserLevel→UserLevel）。
 fn parse_http_config(data: &[u8]) -> std::io::Result<HttpServerConfig> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("http inbound settings JSON: {e}")))?;
     let mut config = HttpServerConfig::default();
-    if let Some(accounts) = v
-        .get("users")
-        .or_else(|| v.get("accounts"))
-        .and_then(|c| c.as_array())
+    if let Some(accounts) = v.get("users").or_else(|| v.get("accounts")).and_then(|c| c.as_array())
     {
         for a in accounts {
             let user = a.get("user").and_then(|x| x.as_str()).unwrap_or("");
@@ -3663,14 +3718,8 @@ fn parse_http_config(data: &[u8]) -> std::io::Result<HttpServerConfig> {
             }
         }
     }
-    config.allow_transparent = v
-        .get("allowTransparent")
-        .and_then(|c| c.as_bool())
-        .unwrap_or(false);
-    config.user_level = v
-        .get("userLevel")
-        .and_then(|c| c.as_u64())
-        .unwrap_or(0) as u32;
+    config.allow_transparent = v.get("allowTransparent").and_then(|c| c.as_bool()).unwrap_or(false);
+    config.user_level = v.get("userLevel").and_then(|c| c.as_u64()).unwrap_or(0) as u32;
     Ok(config)
 }
 
@@ -3757,16 +3806,14 @@ fn build_vmess_validator(data: &[u8]) -> std::io::Result<std::sync::Arc<VmessTim
         .map_err(|e| std::io::Error::other(format!("vmess inbound settings JSON: {e}")))?;
     let validator = VmessTimedUserValidator::new();
     // Go VMessDefaultConfig：{"default":{"level":N}}，user 未显式给 level 时的默认值。
-    let default_level = v
-        .get("default")
-        .and_then(|d| d.get("level"))
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0) as u32;
+    let default_level =
+        v.get("default").and_then(|d| d.get("level")).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
     if let Some(clients) = v.get("clients").and_then(|c| c.as_array()) {
         for c in clients {
             let id = c.get("id").and_then(|x| x.as_str()).unwrap_or("");
             let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let level = c.get("level").and_then(|x| x.as_u64()).unwrap_or(u64::from(default_level)) as u32;
+            let level =
+                c.get("level").and_then(|x| x.as_u64()).unwrap_or(u64::from(default_level)) as u32;
             // alterId≠0 = legacy VMess 意图，AEAD-only 实现直接拒绝（数字/字符串都认）。
             let alter_id = c
                 .get("alterId")
@@ -3806,35 +3853,44 @@ fn parse_ss_inbound_config(data: &[u8]) -> std::io::Result<SsInboundMode> {
 
     // Legacy SS AEAD
     use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
-    if let Some(clients) = v
-        .get("users")
-        .or_else(|| v.get("clients"))
-        .and_then(|c| c.as_array())
-    {
+    if let Some(clients) = v.get("users").or_else(|| v.get("clients")).and_then(|c| c.as_array()) {
         let mut users = Vec::new();
         for c in clients {
             let password = c.get("password").and_then(|x| x.as_str()).unwrap_or("");
             let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let c_method = c.get("method").and_then(|x| x.as_str()).unwrap_or("aes-128-gcm");
-            let cipher = ss_cipher_from_str(c_method)
-                .ok_or_else(|| std::io::Error::other(format!("unsupported ss cipher: {c_method}")))?;
-            let proto = ProtoAccount { password: password.to_string(), cipher_type: cipher.as_i32(), iv_check: false };
+            let cipher = ss_cipher_from_str(c_method).ok_or_else(|| {
+                std::io::Error::other(format!("unsupported ss cipher: {c_method}"))
+            })?;
+            let proto = ProtoAccount {
+                password: password.to_string(),
+                cipher_type: cipher.as_i32(),
+                iv_check: false,
+            };
             let account = SsConfigMemoryAccount::from_proto(&proto)
                 .map_err(|e| std::io::Error::other(format!("ss account parse: {e}")))?;
             users.push(xray_proxy_ss::validator::MemoryUser::new(email, account));
         }
         if users.is_empty() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "ss inbound: no users"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ss inbound: no users",
+            ));
         }
         return Ok(SsInboundMode::Legacy(Arc::new(SsInbound::with_users(users))));
     }
 
     // Legacy 单用户
-    let password = v.get("password").and_then(|x| x.as_str())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "ss inbound: missing password"))?;
+    let password = v.get("password").and_then(|x| x.as_str()).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "ss inbound: missing password")
+    })?;
     let cipher = ss_cipher_from_str(method)
         .ok_or_else(|| std::io::Error::other(format!("unsupported ss cipher: {method}")))?;
-    let proto = ProtoAccount { password: password.to_string(), cipher_type: cipher.as_i32(), iv_check: false };
+    let proto = ProtoAccount {
+        password: password.to_string(),
+        cipher_type: cipher.as_i32(),
+        iv_check: false,
+    };
     let account = SsConfigMemoryAccount::from_proto(&proto)
         .map_err(|e| std::io::Error::other(format!("ss account parse: {e}")))?;
     Ok(SsInboundMode::Legacy(Arc::new(SsInbound::new(account, "u@ss.local"))))
@@ -3846,12 +3902,18 @@ fn parse_ss_inbound_config(data: &[u8]) -> std::io::Result<SsInboundMode> {
 /// `destinations[]`（Rust 旧形）或 `users[]`/`clients[]` 首元素带 `address`
 /// （Go 形 relay，:130）→ 中继；数组无 `address` → 多用户；无数组 → 单用户。
 /// `users` 主键，`clients` 旧名回退（:46-47,54-56）。
-fn parse_ss2022_inbound_config(method: &str, v: &serde_json::Value) -> std::io::Result<SsInboundMode> {
-    use xray_proxy_ss::ss2022::{MultiUserInbound, RelayDestination, RelayInbound, Ss2022Inbound, Ss2022User};
-    use xray_proxy_ss::ss2022::key::psk_from_base64;
+fn parse_ss2022_inbound_config(
+    method: &str,
+    v: &serde_json::Value,
+) -> std::io::Result<SsInboundMode> {
+    use xray_proxy_ss::ss2022::{
+        MultiUserInbound, RelayDestination, RelayInbound, Ss2022Inbound, Ss2022User,
+        key::psk_from_base64,
+    };
 
-    let server_psk = v.get("password").and_then(|x| x.as_str())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "ss2022 inbound: missing server PSK"))?;
+    let server_psk = v.get("password").and_then(|x| x.as_str()).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "ss2022 inbound: missing server PSK")
+    })?;
 
     // 中继模式：destinations 数组
     if let Some(dests) = v.get("destinations").and_then(|d| d.as_array()) {
@@ -3873,7 +3935,10 @@ fn parse_ss2022_inbound_config(method: &str, v: &serde_json::Value) -> std::io::
             });
         }
         if destinations.is_empty() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "ss2022 relay: no destinations"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ss2022 relay: no destinations",
+            ));
         }
         let relay = RelayInbound::new(method, server_psk, destinations)
             .map_err(|e| std::io::Error::other(format!("ss2022 relay: {e}")))?;
@@ -3881,18 +3946,14 @@ fn parse_ss2022_inbound_config(method: &str, v: &serde_json::Value) -> std::io::
     }
 
     // users/clients 双读（Go shadowsocks.go:46-47,54-56）
-    let users_arr = v
-        .get("users")
-        .or_else(|| v.get("clients"))
-        .and_then(|c| c.as_array());
+    let users_arr = v.get("users").or_else(|| v.get("clients")).and_then(|c| c.as_array());
 
     // 中继模式（Go 形）：首元素带 address → 按 relay destination 解析
     // （Go shadowsocks.go:130 判定 + :162-175 构建；address/port 主键，
     // server/server_port 为 Rust 旧名回退，不作为判定依据）。
     if let Some(user_list) = users_arr {
-        let go_relay = user_list
-            .first()
-            .is_some_and(|u| u.get("address").and_then(|x| x.as_str()).is_some());
+        let go_relay =
+            user_list.first().is_some_and(|u| u.get("address").and_then(|x| x.as_str()).is_some());
         if go_relay {
             let mut destinations = Vec::new();
             for u in user_list {
@@ -3941,7 +4002,10 @@ fn parse_ss2022_inbound_config(method: &str, v: &serde_json::Value) -> std::io::
             users.push(Ss2022User { email, level, psk });
         }
         if users.is_empty() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "ss2022 multi: no users"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ss2022 multi: no users",
+            ));
         }
         let multi = MultiUserInbound::new(method, server_psk, users)
             .map_err(|e| std::io::Error::other(format!("ss2022 multi: {e}")))?;
@@ -3971,7 +4035,10 @@ fn parse_hysteria_inbound_config(
     data: &[u8],
     bind_addr: std::net::SocketAddr,
     finalmask_json: Option<&serde_json::Value>,
-) -> std::io::Result<(xray_proxy_hysteria::HysteriaConfig, Arc<dyn xray_transport_hysteria::hub::HysteriaListenerFactory>)> {
+) -> std::io::Result<(
+    xray_proxy_hysteria::HysteriaConfig,
+    Arc<dyn xray_transport_hysteria::hub::HysteriaListenerFactory>,
+)> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("hysteria inbound settings JSON: {e}")))?;
     // 强制 version == 2（Go 端 hysteria.go:46-48 行为镜像；缺省 = 2）
@@ -3983,7 +4050,8 @@ fn parse_hysteria_inbound_config(
         }
     }
     let auth = v.get("auth").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let server_name = v.get("server_name").and_then(|x| x.as_str()).unwrap_or("hysteria").to_string();
+    let server_name =
+        v.get("server_name").and_then(|x| x.as_str()).unwrap_or("hysteria").to_string();
     // 真实 quinn server adapter：自签证书（或配置 cert/key PEM），ALPN h3 由 listen() 设置
     xray_common::ensure_default_crypto_provider();
     let server_config = build_hysteria_tls_server_config(&v)?;
@@ -4028,13 +4096,13 @@ fn build_hysteria_tls_server_config(
     v: &serde_json::Value,
 ) -> std::io::Result<rustls::ServerConfig> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    let (cert_der, key_der) = if let (Some(cert_str), Some(key_str)) = (
-        v.get("cert").and_then(|x| x.as_str()),
-        v.get("key").and_then(|x| x.as_str()),
-    ) {
+    let (cert_der, key_der) = if let (Some(cert_str), Some(key_str)) =
+        (v.get("cert").and_then(|x| x.as_str()), v.get("key").and_then(|x| x.as_str()))
+    {
         let mut cert_reader = std::io::BufReader::new(cert_str.as_bytes());
         let cert_pem = rustls_pemfile::certs(&mut cert_reader)
-            .into_iter().next()
+            .into_iter()
+            .next()
             .ok_or_else(|| std::io::Error::other("no cert in PEM"))?
             .map_err(|e| std::io::Error::other(format!("parse cert PEM: {e}")))?;
         let mut key_reader = std::io::BufReader::new(key_str.as_bytes());
@@ -4048,7 +4116,8 @@ fn build_hysteria_tls_server_config(
             .map_err(|e| std::io::Error::other(format!("rcgen keypair: {e}")))?;
         let params = rcgen::CertificateParams::new(vec!["localhost".into()])
             .map_err(|e| std::io::Error::other(format!("rcgen params: {e}")))?;
-        let cert = params.self_signed(&key_pair)
+        let cert = params
+            .self_signed(&key_pair)
             .map_err(|e| std::io::Error::other(format!("rcgen self_signed: {e}")))?;
         (
             CertificateDer::from(cert.der().clone()),
@@ -4076,13 +4145,13 @@ fn parse_anytls_tls_acceptor(
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("anytls inbound settings JSON: {e}")))?;
     // 尝试从配置读证书
-    let (cert_der, key_der) = if let (Some(cert_str), Some(key_str)) = (
-        v.get("cert").and_then(|x| x.as_str()),
-        v.get("key").and_then(|x| x.as_str()),
-    ) {
+    let (cert_der, key_der) = if let (Some(cert_str), Some(key_str)) =
+        (v.get("cert").and_then(|x| x.as_str()), v.get("key").and_then(|x| x.as_str()))
+    {
         let mut cert_reader = std::io::BufReader::new(cert_str.as_bytes());
         let cert_pem = rustls_pemfile::certs(&mut cert_reader)
-            .into_iter().next()
+            .into_iter()
+            .next()
             .ok_or_else(|| std::io::Error::other("no cert in PEM"))?
             .map_err(|e| std::io::Error::other(format!("parse cert PEM: {e}")))?;
         let mut key_reader = std::io::BufReader::new(key_str.as_bytes());
@@ -4097,7 +4166,8 @@ fn parse_anytls_tls_acceptor(
             .map_err(|e| std::io::Error::other(format!("rcgen keypair: {e}")))?;
         let params = rcgen::CertificateParams::new(vec!["localhost".into()])
             .map_err(|e| std::io::Error::other(format!("rcgen params: {e}")))?;
-        let cert = params.self_signed(&key_pair)
+        let cert = params
+            .self_signed(&key_pair)
             .map_err(|e| std::io::Error::other(format!("rcgen self_signed: {e}")))?;
         (
             CertificateDer::from(cert.der().clone()),
@@ -4109,12 +4179,34 @@ fn parse_anytls_tls_acceptor(
         .with_no_client_auth()
         .with_single_cert(vec![cert_der.into()], key_der)
         .map_err(|e| std::io::Error::other(format!("rustls server config: {e}")))?;
-    let password = v
-        .get("password")
-        .and_then(|x| x.as_str())
-        .filter(|s| !s.is_empty())
-        .map(String::from);
+    let password =
+        v.get("password").and_then(|x| x.as_str()).filter(|s| !s.is_empty()).map(String::from);
     Ok((tokio_rustls::TlsAcceptor::from(Arc::new(config)), password))
+}
+
+/// 从 inbound entry.data + streamSettings 解析 naive 入站配置。
+///
+/// settings：`{"users":[{"name":"...","pass":"..."}]}`（sing-box naive 惯例，
+/// interop_ci.py 同款）；TLS 必配（naive 本义是 HTTPS 前置代理）——证书缺失
+/// 回退自签，ALPN 默认含 h2。
+fn parse_naive_inbound_settings(
+    data: &[u8],
+    stream_json: Option<&serde_json::Value>,
+) -> std::io::Result<(xray_transport_naive::NaiveInboundConfig, std::sync::Arc<rustls::ServerConfig>)>
+{
+    let auth = xray_transport_naive::NaiveInboundConfig::from_settings_json(data)?;
+    let settings = xray_transport::dialer::StreamSettings::from_json(stream_json);
+    let tls_config = xray_tls::server_config::build_server_config(
+        &settings.security,
+        settings.security_json.as_ref(),
+    )?
+    .ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("naive inbound requires tls security, got: {}", settings.security),
+        )
+    })?;
+    Ok((auth, tls_config))
 }
 
 /// 从 inbound entry.data（JSON）解析 wireguard inbound 配置。
@@ -4130,7 +4222,10 @@ fn parse_wireguard_inbound_config(data: &[u8]) -> std::io::Result<(DeviceConfig,
         .map_err(|e| std::io::Error::other(format!("wireguard inbound settings JSON: {e}")))?;
     let port = v.get("port").and_then(|x| x.as_u64()).unwrap_or(51820);
     let port = u16::try_from(port).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "wireguard inbound port out of u16 range")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "wireguard inbound port out of u16 range",
+        )
     })?;
     Ok((config, port))
 }
@@ -4139,25 +4234,25 @@ fn parse_wireguard_inbound_config(data: &[u8]) -> std::io::Result<(DeviceConfig,
 ///
 /// JSON 格式：`{"servers":["8.8.8.8:53"]}` 或空对象。
 /// 返回 (Handler, DnsOutbound)。
-fn parse_dns_inbound_config(
-    data: &[u8],
-    tag: &str,
-) -> std::io::Result<(DnsHandler, DnsOutbound)> {
+fn parse_dns_inbound_config(data: &[u8], tag: &str) -> std::io::Result<(DnsHandler, DnsOutbound)> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("dns inbound settings JSON: {e}")))?;
     let handler = DnsHandler::init(&DnsConfig::default());
     // 解析上游 DNS 服务器列表
-    let servers: Vec<(std::net::IpAddr, u16)> = v.get("servers")
+    let servers: Vec<(std::net::IpAddr, u16)> = v
+        .get("servers")
         .and_then(|x| x.as_array())
         .map(|arr| {
-            arr.iter().filter_map(|s| {
-                s.as_str().and_then(|addr| {
-                    let (ip, port) = addr.rsplit_once(':')?;
-                    let ip: std::net::IpAddr = ip.parse().ok()?;
-                    let port: u16 = port.parse().ok()?;
-                    Some((ip, port))
+            arr.iter()
+                .filter_map(|s| {
+                    s.as_str().and_then(|addr| {
+                        let (ip, port) = addr.rsplit_once(':')?;
+                        let ip: std::net::IpAddr = ip.parse().ok()?;
+                        let port: u16 = port.parse().ok()?;
+                        Some((ip, port))
+                    })
                 })
-            }).collect()
+                .collect()
         })
         .unwrap_or_default();
     let outbound = if servers.is_empty() {
@@ -4176,8 +4271,12 @@ fn parse_dns_inbound_config(
 fn parse_loopback_config(data: &[u8]) -> std::io::Result<String> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("loopback inbound settings JSON: {e}")))?;
-    let inbound_tag = v.get("inboundTag").and_then(|x| x.as_str())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "loopback: missing inboundTag"))?
+    let inbound_tag = v
+        .get("inboundTag")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "loopback: missing inboundTag")
+        })?
         .to_string();
     Ok(inbound_tag)
 }
@@ -4196,8 +4295,8 @@ fn parse_tuic_inbound_config(
     let s = parse_tuic_inbound_settings(data, addr)?;
     // QUIC 端点缓冲：streamSettings.sockopt 的 receiveBufferSize/sendBufferSize
     // （缺省 = QUIC 系端点默认 8MB 下限语义，bind_udp_endpoint）。
-    let sockopt = xray_transport::dialer::StreamSettings::from_json(stream_settings_json)
-        .socket_options();
+    let sockopt =
+        xray_transport::dialer::StreamSettings::from_json(stream_settings_json).socket_options();
     let config = xray_proxy_tuic::TuicInboundConfig {
         listen: s.bind_addr,
         server_name: s.server_name,
@@ -4229,15 +4328,18 @@ struct TuicInboundSettings {
 fn parse_tuic_inbound_settings(data: &[u8], addr: &str) -> std::io::Result<TuicInboundSettings> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("tuic inbound settings JSON: {e}")))?;
-    let uuid_str = v.get("uuid").and_then(|x| x.as_str())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "tuic: missing uuid"))?;
+    let uuid_str = v.get("uuid").and_then(|x| x.as_str()).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "tuic: missing uuid")
+    })?;
     let uuid = uuid::Uuid::parse_str(uuid_str)
         .map_err(|e| std::io::Error::other(format!("tuic invalid uuid: {e}")))?;
-    let password = v.get("password").and_then(|x| x.as_str())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "tuic: missing password"))?;
+    let password = v.get("password").and_then(|x| x.as_str()).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "tuic: missing password")
+    })?;
     let server_name = v.get("serverName").and_then(|x| x.as_str()).unwrap_or("tuic").to_string();
-    let bind_addr: std::net::SocketAddr = addr.parse()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("tuic parse addr: {e}")))?;
+    let bind_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("tuic parse addr: {e}"))
+    })?;
     // 票 ieik⑥：certificate/certificateKey（PEM 内容）→ 真实证书；缺省 rcgen 自签
     let cert_der = match v.get("certificate").and_then(|x| x.as_str()) {
         Some(pem) => Some(tuic_pem_first_cert_der(pem)?),
@@ -4288,7 +4390,10 @@ fn tuic_pem_first_cert_der(pem: &str) -> std::io::Result<Vec<u8>> {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "tuic certificate: no cert in PEM")
         })?
         .map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("tuic certificate PEM: {e}"))
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("tuic certificate PEM: {e}"),
+            )
         })?;
     Ok(cert.to_vec())
 }
@@ -4298,11 +4403,17 @@ fn tuic_pem_key_der(pem: &str) -> std::io::Result<Vec<u8>> {
     let mut rd = std::io::BufReader::new(pem.as_bytes());
     rustls_pemfile::private_key(&mut rd)
         .map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("tuic certificateKey PEM: {e}"))
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("tuic certificateKey PEM: {e}"),
+            )
         })?
         .map(|k| k.secret_der().to_vec())
         .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "tuic certificateKey: no key in PEM")
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "tuic certificateKey: no key in PEM",
+            )
         })
 }
 
@@ -4316,10 +4427,21 @@ struct TunPlaceholder;
 
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
 impl Tun for TunPlaceholder {
-    fn start(&self) -> xray_proxy_tun::Result<()> { Ok(()) }
-    fn close(&self) -> xray_proxy_tun::Result<()> { Ok(()) }
-    fn name(&self) -> xray_proxy_tun::Result<String> { Ok("placeholder".into()) }
-    fn index(&self) -> xray_proxy_tun::Result<i32> { Ok(0) }
+    fn start(&self) -> xray_proxy_tun::Result<()> {
+        Ok(())
+    }
+
+    fn close(&self) -> xray_proxy_tun::Result<()> {
+        Ok(())
+    }
+
+    fn name(&self) -> xray_proxy_tun::Result<String> {
+        Ok("placeholder".into())
+    }
+
+    fn index(&self) -> xray_proxy_tun::Result<i32> {
+        Ok(0)
+    }
 }
 
 /// 从 inbound entry.data（JSON）解析 TUN inbound 配置 → StackOptions。
@@ -4344,10 +4466,8 @@ fn parse_blackhole_inbound_response(data: &[u8]) -> BlackholeResponseConfig {
         return BlackholeResponseConfig::None;
     }
     let v: serde_json::Value = serde_json::from_slice(data).unwrap_or_default();
-    let response_type = v.get("response")
-        .and_then(|r| r.get("type"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("none");
+    let response_type =
+        v.get("response").and_then(|r| r.get("type")).and_then(|t| t.as_str()).unwrap_or("none");
     match response_type {
         "http" => BlackholeResponseConfig::Http403,
         _ => BlackholeResponseConfig::None,
@@ -4361,11 +4481,12 @@ fn parse_blackhole_inbound_response(data: &[u8]) -> BlackholeResponseConfig {
 fn parse_freedom_inbound_dest(data: &[u8]) -> std::io::Result<Destination> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("freedom inbound settings JSON: {e}")))?;
-    let address_str = v.get("address").and_then(|x| x.as_str())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "freedom inbound: missing address"))?;
-    let port = v.get("port").and_then(|x| x.as_u64())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "freedom inbound: missing port"))?
-        as u16;
+    let address_str = v.get("address").and_then(|x| x.as_str()).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "freedom inbound: missing address")
+    })?;
+    let port = v.get("port").and_then(|x| x.as_u64()).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "freedom inbound: missing port")
+    })? as u16;
     let address = if let Ok(v4) = address_str.parse::<std::net::Ipv4Addr>() {
         Address::IPv4(v4)
     } else if let Ok(v6) = address_str.parse::<std::net::Ipv6Addr>() {
@@ -4377,9 +4498,11 @@ fn parse_freedom_inbound_dest(data: &[u8]) -> std::io::Result<Destination> {
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::Ipv4Addr;
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
 
     /// bd b8i 对称面：不支持平台（Windows/macOS 等）tun inbound →
     /// `spawn_one_inbound` 返回 Unsupported 硬错误（对齐 Go 不支持平台
@@ -4389,19 +4512,17 @@ mod tests {
     #[tokio::test]
     async fn tun_inbound_rejected_on_unsupported_platform() {
         let ib = BuiltInbound {
-            entry: xray_conf::BuiltEntry {
-                kind: "tun".to_string(),
-                data: b"{}".to_vec(),
-            },
+            entry: xray_conf::BuiltEntry { kind: "tun".to_string(), data: b"{}".to_vec() },
             tag: "tun-in".to_string(),
             port: None,
             listen: None,
             stream_settings_json: None,
             sniffing_json: None,
         };
-        let err = spawn_one_inbound(&ib, Arc::new(SimpleOhm::new()), None, CancellationToken::new())
-            .await
-            .unwrap_err();
+        let err =
+            spawn_one_inbound(&ib, Arc::new(SimpleOhm::new()), None, CancellationToken::new())
+                .await
+                .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "got: {err}");
     }
 
@@ -4413,19 +4534,17 @@ mod tests {
     #[tokio::test]
     async fn unix_listen_path_rejected_on_windows() {
         let ib = BuiltInbound {
-            entry: xray_conf::BuiltEntry {
-                kind: "socks".to_string(),
-                data: b"{}".to_vec(),
-            },
+            entry: xray_conf::BuiltEntry { kind: "socks".to_string(), data: b"{}".to_vec() },
             tag: "uds-win".to_string(),
             port: None,
             listen: Some("/tmp/xray-uds-win.sock".to_string()),
             stream_settings_json: None,
             sniffing_json: None,
         };
-        let err = spawn_one_inbound(&ib, Arc::new(SimpleOhm::new()), None, CancellationToken::new())
-            .await
-            .unwrap_err();
+        let err =
+            spawn_one_inbound(&ib, Arc::new(SimpleOhm::new()), None, CancellationToken::new())
+                .await
+                .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "got: {err}");
     }
 
@@ -4448,7 +4567,7 @@ mod tests {
                         if sock.write_all(&buf[..n]).await.is_err() {
                             break;
                         }
-                    }
+                    },
                 }
             }
         });
@@ -4466,10 +4585,7 @@ mod tests {
             std::env::temp_dir().join(format!("xray-uds-e2e-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock_path);
         let ib = BuiltInbound {
-            entry: xray_conf::BuiltEntry {
-                kind: "socks".to_string(),
-                data: b"{}".to_vec(),
-            },
+            entry: xray_conf::BuiltEntry { kind: "socks".to_string(), data: b"{}".to_vec() },
             tag: "uds-e2e".to_string(),
             port: None,
             listen: Some(sock_path.to_string_lossy().into_owned()),
@@ -4526,8 +4642,6 @@ mod tests {
         assert_eq!(pw, None, "empty password must stay None");
     }
 
-
-
     /// ect：`hysteriaSettings.masquerade` JSON → proxy HysteriaConfig.masq
     /// （Go infra/conf transport_internet.go:498-549 展开路径）。
     #[test]
@@ -4543,7 +4657,7 @@ mod tests {
                 assert_eq!(body, "hi");
                 assert_eq!(headers.get("X-A").unwrap(), "1");
                 assert_eq!(*status_code, 418);
-            }
+            },
             other => panic!("expected String masq, got {other:?}"),
         }
 
@@ -4565,9 +4679,9 @@ mod tests {
     /// rxw：HysteriaTcpDispatch 适配器——mock QUIC stream → dispatch（freedom）→ echo 回环。
     #[tokio::test]
     async fn hysteria_tcp_dispatch_to_freedom_e2e() {
+        use xray_app_dispatcher::default::DialBridge;
         use xray_proxy_freedom::make_freedom_dial_fn;
         use xray_proxy_hysteria::TcpDispatcher as _;
-        use xray_app_dispatcher::default::DialBridge;
         use xray_transport_hysteria::conn::{InterStreamConn, QuicStream};
 
         // duplex-backed mock QUIC stream（读写 halves 独立锁，避免 dispatch 桥双向互锁）
@@ -4579,20 +4693,28 @@ mod tests {
             remote: std::net::SocketAddr,
         }
         impl QuicStream for DuplexQuicStream {
-            fn read<'a>(&'a self, buf: &'a mut [u8])
-                -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<usize>> + Send + 'a>> {
+            fn read<'a>(
+                &'a self,
+                buf: &'a mut [u8],
+            ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<usize>> + Send + 'a>>
+            {
                 Box::pin(async {
                     use tokio::io::AsyncReadExt as _;
                     self.r.lock().await.read(buf).await
                 })
             }
-            fn write<'a>(&'a self, buf: &'a [u8])
-                -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<usize>> + Send + 'a>> {
+
+            fn write<'a>(
+                &'a self,
+                buf: &'a [u8],
+            ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<usize>> + Send + 'a>>
+            {
                 Box::pin(async {
                     use tokio::io::AsyncWriteExt as _;
                     self.w.lock().await.write(buf).await
                 })
             }
+
             // 代 FixBehavior 补：QuicStream trait 新增 poll_write（bd HysteriaConn
             // 零分配路径）后 mock 未跟上。tokio Mutex try_lock 是同步 API，
             // 满足“锁内无 await”的 trait 约束；被占即 Pending。
@@ -4608,12 +4730,20 @@ mod tests {
                 };
                 std::pin::Pin::new(&mut *w).poll_write(cx, buf)
             }
+
             fn cancel_read(&self, _code: u64) {}
+
             fn close(&self) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> {
                 Box::pin(async { Ok(()) })
             }
-            fn local_addr(&self) -> std::net::SocketAddr { self.local }
-            fn remote_addr(&self) -> std::net::SocketAddr { self.remote }
+
+            fn local_addr(&self) -> std::net::SocketAddr {
+                self.local
+            }
+
+            fn remote_addr(&self) -> std::net::SocketAddr {
+                self.remote
+            }
         }
 
         // echo server
@@ -4662,7 +4792,9 @@ mod tests {
         client.write_all(payload).await.unwrap();
         let mut rbuf = vec![0u8; 128];
         let n = tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut rbuf))
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(&rbuf[..n], payload);
         drop(client);
         // 留时间给桥收尾（read EOF → 关闭）
@@ -4673,8 +4805,10 @@ mod tests {
     /// MarkerUdpDispatch 验证真正经 dispatch link，模式同 ss_udp_dispatch_roundtrip）。
     #[tokio::test]
     async fn ss2022_udp_dispatch_roundtrip() {
-        use xray_proxy_ss::ss2022::key::{CipherKind2022, psk_identity};
-        use xray_proxy_ss::ss2022::packet::ClientUdpSession2022;
+        use xray_proxy_ss::ss2022::{
+            key::{CipherKind2022, psk_identity},
+            packet::ClientUdpSession2022,
+        };
 
         // 1. PSK（多用户：server iPSK + user uPSK）+ serve_ss2022_udp
         let ipsk: Vec<u8> = (0..32u8).collect();
@@ -4695,25 +4829,18 @@ mod tests {
         // 2. client：2022 UDP 帧 → relay（目标任意，marker handler 不打真实包）
         let client_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client_sock.connect(relay_addr).await.unwrap();
-        let client = ClientUdpSession2022::new(
-            CipherKind2022::Aes256Gcm,
-            vec![ipsk, upsk],
-        )
-        .unwrap();
-        let frame = client
-            .encode(&Address::IPv4(Ipv4Addr::LOCALHOST), 53, b"ping")
-            .unwrap();
+        let client =
+            ClientUdpSession2022::new(CipherKind2022::Aes256Gcm, vec![ipsk, upsk]).unwrap();
+        let frame = client.encode(&Address::IPv4(Ipv4Addr::LOCALHOST), 53, b"ping").unwrap();
         client_sock.send(&frame).await.unwrap();
 
         // 3. 收回帧并 decode 出标记 payload
         let mut rbuf = vec![0u8; 2048];
-        let n = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            client_sock.recv(&mut rbuf),
-        )
-        .await
-        .expect("response via dispatcher within 5s")
-        .expect("recv");
+        let n =
+            tokio::time::timeout(std::time::Duration::from_secs(5), client_sock.recv(&mut rbuf))
+                .await
+                .expect("response via dispatcher within 5s")
+                .expect("recv");
         let (_addr, _port, data) = client.decode(&rbuf[..n]).unwrap();
         assert_eq!(data, b"ss2022-via-dispatch");
     }
@@ -4722,14 +4849,16 @@ mod tests {
     /// （sing LruCache `expires <= now` 删语义），存活条目保留，空表 no-op。
     #[test]
     fn sweep_expired_ss2022_sessions_drops_only_expired() {
-        use xray_proxy_ss::ss2022::key::CipherKind2022;
-        use xray_proxy_ss::ss2022::packet::ServerUdpSession2022;
+        use xray_proxy_ss::ss2022::{key::CipherKind2022, packet::ServerUdpSession2022};
 
         let mk = |sid: u64| {
-            Arc::new(ServerUdpSession2022::new(CipherKind2022::Aes256Gcm, vec![7u8; 32], sid).unwrap())
+            Arc::new(
+                ServerUdpSession2022::new(CipherKind2022::Aes256Gcm, vec![7u8; 32], sid).unwrap(),
+            )
         };
         let now = std::time::Instant::now();
-        let mut table: HashMap<u64, (Arc<ServerUdpSession2022>, std::time::Instant)> = HashMap::new();
+        let mut table: HashMap<u64, (Arc<ServerUdpSession2022>, std::time::Instant)> =
+            HashMap::new();
         // expired：deadline 恰等于 now（边界，Go `expires <= now` 删）。
         table.insert(1, (mk(1), now));
         // expired：deadline 已过。
@@ -4743,20 +4872,21 @@ mod tests {
         assert!(!table.contains_key(&2), "past-deadline session must be swept");
 
         assert_eq!(sweep_expired_ss2022_sessions(&mut table, now), 1);
-        let mut empty: HashMap<u64, (Arc<ServerUdpSession2022>, std::time::Instant)> = HashMap::new();
+        let mut empty: HashMap<u64, (Arc<ServerUdpSession2022>, std::time::Instant)> =
+            HashMap::new();
         assert_eq!(sweep_expired_ss2022_sessions(&mut empty, now), 0);
     }
-
 
     /// agb：SS-2022 UDP inbound → freedom UDP dispatch → 真 echo 回环 e2e
     /// （FreedomDispatchBridge 的 UDP 分支走 udp::relay，DialBridge 仅 TCP）。
     #[tokio::test]
     async fn ss2022_udp_inbound_dispatch_to_freedom_e2e() {
-        use xray_proxy_freedom::dispatcher::FreedomDispatchBridge;
-        use xray_proxy_freedom::make_freedom_dial_fn;
         use xray_app_dispatcher::default::DialBridge;
-        use xray_proxy_ss::ss2022::key::{CipherKind2022, psk_identity};
-        use xray_proxy_ss::ss2022::packet::ClientUdpSession2022;
+        use xray_proxy_freedom::{dispatcher::FreedomDispatchBridge, make_freedom_dial_fn};
+        use xray_proxy_ss::ss2022::{
+            key::{CipherKind2022, psk_identity},
+            packet::ClientUdpSession2022,
+        };
 
         // 1. UDP echo server
         let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -4779,9 +4909,11 @@ mod tests {
         let users = vec![(psk_identity(&upsk), upsk.clone())];
         let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let relay_addr = relay.local_addr().unwrap();
-        let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> = Arc::new(
-            FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new("freedom", make_freedom_dial_fn()))),
-        );
+        let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
+            Arc::new(FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new(
+                "freedom",
+                make_freedom_dial_fn(),
+            ))));
         tokio::spawn(serve_ss2022_udp(
             Arc::new(relay),
             CipherKind2022::Aes256Gcm,
@@ -4793,26 +4925,19 @@ mod tests {
         // 3. client：2022 UDP 帧 → serve → freedom dispatch → echo → 回帧
         let client_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client_sock.connect(relay_addr).await.unwrap();
-        let client = ClientUdpSession2022::new(
-            CipherKind2022::Aes256Gcm,
-            vec![ipsk, upsk],
-        )
-        .unwrap();
+        let client =
+            ClientUdpSession2022::new(CipherKind2022::Aes256Gcm, vec![ipsk, upsk]).unwrap();
 
         let payload = b"ss2022-udp-dispatch-e2e".to_vec();
-        let frame = client
-            .encode(&Address::IPv4(echo_v4), echo_addr.port(), &payload)
-            .unwrap();
+        let frame = client.encode(&Address::IPv4(echo_v4), echo_addr.port(), &payload).unwrap();
         client_sock.send(&frame).await.unwrap();
 
         let mut rbuf = vec![0u8; 65_535];
-        let n = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            client_sock.recv(&mut rbuf),
-        )
-        .await
-        .expect("recv timeout")
-        .expect("recv");
+        let n =
+            tokio::time::timeout(std::time::Duration::from_secs(5), client_sock.recv(&mut rbuf))
+                .await
+                .expect("recv timeout")
+                .expect("recv");
         let (addr, port, echoed) = client.decode(&rbuf[..n]).unwrap();
         assert_eq!(addr, Address::IPv4(echo_v4));
         assert_eq!(port, echo_addr.port());
@@ -4824,13 +4949,11 @@ mod tests {
     /// 解包 → freedom → echo → 回程全链。
     #[tokio::test]
     async fn ss2022_udp_outbound_inbound_roundtrip_e2e() {
-        use xray_proxy_freedom::dispatcher::FreedomDispatchBridge;
-        use xray_proxy_freedom::make_freedom_dial_fn;
-        use xray_app_dispatcher::default::DialBridge;
-        use xray_proxy_ss::ss2022::key::{CipherKind2022, psk_identity};
         use base64::Engine as _;
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        use tokio::io::AsyncWriteExt as _;
+        use xray_app_dispatcher::default::DialBridge;
+        use xray_proxy_freedom::{dispatcher::FreedomDispatchBridge, make_freedom_dial_fn};
+        use xray_proxy_ss::ss2022::key::{CipherKind2022, psk_identity};
         use xray_xudp::packet::{PacketReader, PacketWriter};
 
         // 1. UDP echo server
@@ -4854,9 +4977,11 @@ mod tests {
         let users = vec![(psk_identity(&upsk), upsk.clone())];
         let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let relay_port = relay.local_addr().unwrap().port();
-        let echo_handler: Arc<dyn xray_app_dispatcher::DispatchHandler> = Arc::new(
-            FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new("freedom", make_freedom_dial_fn()))),
-        );
+        let echo_handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
+            Arc::new(FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new(
+                "freedom",
+                make_freedom_dial_fn(),
+            ))));
         tokio::spawn(serve_ss2022_udp(
             Arc::new(relay),
             CipherKind2022::Aes256Gcm,
@@ -4876,17 +5001,24 @@ mod tests {
         );
         let cfg = std::sync::Arc::new(xray_proxy_ss::parse_ss_config(cfg_json.as_bytes()).unwrap());
         assert!(cfg.ss2022.is_some(), "2022 method should route to ss2022 params");
-        let ss_bridge = Arc::new(DialBridge::new("ss2022-out", xray_proxy_ss::make_ss_dial_fn(cfg)));
+        let ss_bridge =
+            Arc::new(DialBridge::new("ss2022-out", xray_proxy_ss::make_ss_dial_fn(cfg)));
 
         // 4. dispatch link：duplex 承载 XUDP 帧流（模拟 inbound 侧）
         let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let dest = Destination::new(Address::IPv4(echo_v4), Port::new(echo_addr.port()), Network::UDP);
+        let dest =
+            Destination::new(Address::IPv4(echo_v4), Port::new(echo_addr.port()), Network::UDP);
         let (srv_rd, srv_wr) = tokio::io::split(server_io);
         tokio::spawn(async move {
-            ss_bridge.dispatch(&dest, xray_transport::link::Link::new(
-                xray_buf::io::new_reader(srv_rd),
-                xray_buf::io::new_writer(srv_wr),
-            )).await;
+            ss_bridge
+                .dispatch(
+                    &dest,
+                    xray_transport::link::Link::new(
+                        xray_buf::io::new_reader(srv_rd),
+                        xray_buf::io::new_writer(srv_wr),
+                    ),
+                )
+                .await;
         });
 
         // 5. 写 XUDP 帧 → 2022 outbound → inbound 解包 → freedom → echo → 回帧
@@ -4935,7 +5067,8 @@ mod tests {
     /// accounts 别名 + 默认 noauth + 空配置。
     #[test]
     fn parse_socks_server_config_accounts_alias_and_default() {
-        let cfg = parse_socks_server_config(br#"{"accounts":[{"user":"bob","pass":"p2"}]}"#).unwrap();
+        let cfg =
+            parse_socks_server_config(br#"{"accounts":[{"user":"bob","pass":"p2"}]}"#).unwrap();
         assert!(cfg.has_account("bob", "p2"));
         assert_eq!(cfg.auth_type, xray_proxy_socks::config::AuthType::NoAuth);
         assert!(!cfg.udp_enabled);
@@ -4949,11 +5082,7 @@ mod tests {
         use xray_proto::xray::common::net::ip_or_domain::Address as ProtoAddr;
         let cfg = parse_socks_server_config(br#"{"ip":"127.0.0.9","udp":true}"#).unwrap();
         let addr = cfg.address.expect("ip should populate config.address");
-        assert_eq!(
-            addr.address,
-            Some(ProtoAddr::Ip(vec![127, 0, 0, 9])),
-            "ipv4 → 4-byte Ip"
-        );
+        assert_eq!(addr.address, Some(ProtoAddr::Ip(vec![127, 0, 0, 9])), "ipv4 → 4-byte Ip");
         let cfg6 = parse_socks_server_config(br#"{"ip":"::1"}"#).unwrap();
         let addr6 = cfg6.address.expect("ipv6 should populate too");
         assert!(matches!(
@@ -5111,8 +5240,10 @@ mod tests {
     /// 给不出；回包必须能用发起用户 account 解出标记 payload。
     #[tokio::test]
     async fn ss_udp_dispatch_roundtrip() {
-        use xray_proxy_ss::config::MemoryAccount as SsAccount;
-        use xray_proxy_ss::protocol::{decode_udp_packet, encode_udp_packet};
+        use xray_proxy_ss::{
+            config::MemoryAccount as SsAccount,
+            protocol::{decode_udp_packet, encode_udp_packet},
+        };
 
         // 1. SS inbound（单用户 aes-128-gcm）+ serve_ss_udp（dispatch handler）
         let account = SsAccount::from_proto(&xray_proto::xray::proxy::shadowsocks::Account {
@@ -5133,24 +5264,17 @@ mod tests {
 
         // 2. client：encode 一个 UDP 包发给 relay（目标任意，dispatch 标记 handler 不打真实包）
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let packet = encode_udp_packet(
-            &account,
-            &Address::IPv4(Ipv4Addr::LOCALHOST),
-            53,
-            b"ping",
-        )
-        .unwrap();
+        let packet =
+            encode_udp_packet(&account, &Address::IPv4(Ipv4Addr::LOCALHOST), 53, b"ping").unwrap();
         client.send_to(&packet, relay_addr).await.unwrap();
 
         // 3. 收回包并解密（发起用户 account 可解出标记 payload）
         let mut rbuf = vec![0u8; 2048];
-        let (n, _from) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            client.recv_from(&mut rbuf),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let (n, _from) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), client.recv_from(&mut rbuf))
+                .await
+                .unwrap()
+                .unwrap();
         let (_header, data) = decode_udp_packet(ib.validator(), &rbuf[..n]).unwrap();
         assert_eq!(data, b"ss-via-dispatch");
     }
@@ -5160,8 +5284,7 @@ mod tests {
     fn parse_reality_config_full_fields() {
         use base64::Engine as _;
         let key = [7u8; 32];
-        let key_b64 =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
+        let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
         let json = serde_json::json!({
             "privateKey": key_b64,
             "serverNames": ["example.com"],
@@ -5278,11 +5401,11 @@ mod tests {
         use base64::Engine as _;
         let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
         let cases = [
-            serde_json::json!([]),                       // 空数组
-            serde_json::json!(["0123456789abcdef00"]),   // >16 字符
-            serde_json::json!(["abc"]),                  // 奇数长度
-            serde_json::json!(["zz"]),                   // 非法 hex
-            serde_json::json!([42]),                     // 非字符串项
+            serde_json::json!([]),                     // 空数组
+            serde_json::json!(["0123456789abcdef00"]), // >16 字符
+            serde_json::json!(["abc"]),                // 奇数长度
+            serde_json::json!(["zz"]),                 // 非法 hex
+            serde_json::json!([42]),                   // 非字符串项
         ];
         for short_ids in cases {
             let json = serde_json::json!({
@@ -5296,10 +5419,7 @@ mod tests {
                 ..xray_transport::dialer::StreamSettings::tcp()
             };
             let err = parse_reality_config(&settings).unwrap_err();
-            assert!(
-                err.to_string().contains("shortIds"),
-                "expected shortIds error, got: {err}"
-            );
+            assert!(err.to_string().contains("shortIds"), "expected shortIds error, got: {err}");
         }
     }
     use xray_proxy_freedom::make_freedom_dial_fn;
@@ -5321,7 +5441,7 @@ mod tests {
                         if sock.write_all(&buf[..n]).await.is_err() {
                             break;
                         }
-                    }
+                    },
                 }
             }
         });
@@ -5329,31 +5449,36 @@ mod tests {
         // 2. 配置 dispatcher：freedom outbound → SimpleOhm default
         let ohm = Arc::new(SimpleOhm::new());
         let dial_fn = make_freedom_dial_fn();
-        let bridge = std::sync::Arc::new(xray_app_dispatcher::default::DialBridge::new(
-            "freedom",
-            dial_fn,
-        )) as std::sync::Arc<dyn xray_app_dispatcher::DispatchHandler>;
+        let bridge =
+            std::sync::Arc::new(xray_app_dispatcher::default::DialBridge::new("freedom", dial_fn))
+                as std::sync::Arc<dyn xray_app_dispatcher::DispatchHandler>;
         ohm.set_default(bridge);
 
         // 3. 起 SOCKS5 inbound
         let socks_listener = InboundTcpListener::bind(
             "127.0.0.1:0",
             xray_transport::sockopt::SocketOptions::default(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let socks_addr = socks_listener.local_addr().unwrap();
         let config = Arc::new(ServerConfig::default());
         let ohm_clone = Arc::clone(&ohm);
         tokio::spawn(async move {
-            let _ = serve_socks5(socks_listener, ohm_clone, config, None, std::time::Duration::from_secs(300)).await;
+            let _ = serve_socks5(
+                socks_listener,
+                ohm_clone,
+                config,
+                None,
+                std::time::Duration::from_secs(300),
+            )
+            .await;
         });
 
         // 4. SOCKS5 client：连 socks5 → handshake → 请求 echo server → 写数据 → 读 echo
         let mut client = TcpStream::connect(socks_addr).await.unwrap();
         // 握手：版本 5，1 method，no-auth(0)
-        client
-            .write_all(&[0x05, 0x01, 0x00])
-            .await
-            .unwrap();
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
         let mut resp = [0u8; 2];
         client.read_exact(&mut resp).await.unwrap();
         assert_eq!(resp, [0x05, 0x00], "server should select no-auth");
@@ -5405,23 +5530,26 @@ mod tests {
         let (sock, _) = listener.accept().await.unwrap();
         let (mut reader, _writer) = sock.into_link_io();
 
-        let mb = tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_multi_buffer())
-            .await
-            .expect("read timeout")
-            .expect("read ok");
+        let mb =
+            tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_multi_buffer())
+                .await
+                .expect("read timeout")
+                .expect("read ok");
         assert_eq!(mb.len(), 8192, "首读（current=1）单缓冲");
 
-        let mb = tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_multi_buffer())
-            .await
-            .expect("read timeout")
-            .expect("read ok");
+        let mb =
+            tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_multi_buffer())
+                .await
+                .expect("read timeout")
+                .expect("read ok");
         assert_eq!(mb.len(), 16 * 1024, "第二读应单次 readv 聚合 2 缓冲");
         assert_eq!(mb.buffer_count(), 2);
 
-        let mb = tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_multi_buffer())
-            .await
-            .expect("read timeout")
-            .expect("read ok");
+        let mb =
+            tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_multi_buffer())
+                .await
+                .expect("read timeout")
+                .expect("read ok");
         assert!(mb.is_empty(), "对端 shutdown → EOF 空 MultiBuffer");
         client.await.unwrap();
     }
@@ -5445,22 +5573,25 @@ mod tests {
         let (sock, _) = listener.accept().await.unwrap();
         let (mut reader, _writer) = sock.into_link_io();
 
-        let mb = tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_multi_buffer())
-            .await
-            .expect("read timeout")
-            .expect("read ok");
+        let mb =
+            tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_multi_buffer())
+                .await
+                .expect("read timeout")
+                .expect("read ok");
         assert_eq!(mb.to_vec(), b"HEADA", "残片短读：只返回已到达字节");
 
-        let mb = tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_multi_buffer())
-            .await
-            .expect("read timeout")
-            .expect("read ok");
+        let mb =
+            tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_multi_buffer())
+                .await
+                .expect("read timeout")
+                .expect("read ok");
         assert_eq!(mb.to_vec(), b"YLOAD-BYTES", "后续分片按序完整到达");
 
-        let mb = tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_multi_buffer())
-            .await
-            .expect("read timeout")
-            .expect("read ok");
+        let mb =
+            tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_multi_buffer())
+                .await
+                .expect("read timeout")
+                .expect("read ok");
         assert!(mb.is_empty(), "EOF 空 MultiBuffer");
         client.await.unwrap();
     }
@@ -5475,12 +5606,14 @@ mod tests {
             let _ = rustls::crypto::ring::default_provider().install_default();
         });
         use base64::Engine as _;
-        use xray_proxy_vless::encoding::client::{
-            decode_response_header, encode_request_header,
+        use xray_proxy_vless::encoding::{
+            VlessCommand,
+            client::{decode_response_header, encode_request_header},
         };
-        use xray_proxy_vless::encoding::VlessCommand;
-        use xray_transport::dialer::{StreamSettings, dial_with_settings};
-        use xray_transport::sockopt::SocketOptions;
+        use xray_transport::{
+            dialer::{StreamSettings, dial_with_settings},
+            sockopt::SocketOptions,
+        };
 
         // 1. echo server（VLESS 数据目标）
         let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5495,7 +5628,7 @@ mod tests {
                         if sock.write_all(&buf[..n]).await.is_err() {
                             break;
                         }
-                    }
+                    },
                 }
             }
         });
@@ -5514,9 +5647,7 @@ mod tests {
         let mut proto_account = VlessProtoAccount::default();
         proto_account.id = "b831381d-6324-4d53-ad4f-8cda48b30811".to_string();
         let account = VlessMemoryAccount::from_proto_account(&proto_account).unwrap();
-        validator
-            .add(VlessMemoryUser::new("e2e-user", 0, account))
-            .unwrap();
+        validator.add(VlessMemoryUser::new("e2e-user", 0, account)).unwrap();
 
         // 4. serve_reality_vless
         let server_secret = x25519_dalek::StaticSecret::from([0x99u8; 32]);
@@ -5538,7 +5669,9 @@ mod tests {
         let rl = InboundTcpListener::bind(
             "127.0.0.1:0",
             xray_transport::sockopt::SocketOptions::default(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let rl_addr = rl.local_addr().unwrap();
         let ohm_c = Arc::clone(&ohm);
         let val_c = Arc::clone(&validator) as Arc<dyn VlessValidator>;
@@ -5587,10 +5720,7 @@ mod tests {
 
     #[test]
     fn socks_addr_to_destination_ipv4() {
-        let addr = SocksAddr {
-            host: Host::Ipv4(Ipv4Addr::new(1, 2, 3, 4)),
-            port: 8080,
-        };
+        let addr = SocksAddr { host: Host::Ipv4(Ipv4Addr::new(1, 2, 3, 4)), port: 8080 };
         let dest = socks_addr_to_destination(&addr, Network::TCP);
         assert!(dest.is_tcp());
         assert_eq!(dest.port(), Port::new(8080));
@@ -5602,10 +5732,7 @@ mod tests {
 
     #[test]
     fn socks_addr_to_destination_domain() {
-        let addr = SocksAddr {
-            host: Host::Domain("example.com".to_string()),
-            port: 443,
-        };
+        let addr = SocksAddr { host: Host::Domain("example.com".to_string()), port: 443 };
         let dest = socks_addr_to_destination(&addr, Network::TCP);
         assert_eq!(dest.port(), Port::new(443));
         match dest.address() {
@@ -5662,24 +5789,16 @@ mod tests {
 
         // 客户端 → relay socket：SOCKS5 UDP 请求帧（目标仅作路由地址，不打真实包）
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let target = SocksAddr {
-            host: Host::Ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
-            port: 53,
-        };
-        client
-            .send_to(&encode_udp_packet(&target, b"ping"), relay_addr)
-            .await
-            .unwrap();
+        let target = SocksAddr { host: Host::Ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)), port: 53 };
+        client.send_to(&encode_udp_packet(&target, b"ping"), relay_addr).await.unwrap();
 
         // 响应必须是 MarkerUdpDispatch 写回的标记帧（raw 直连路径给不出）
         let mut rbuf = [0u8; 1500];
-        let (n, _) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            client.recv_from(&mut rbuf),
-        )
-        .await
-        .expect("response via dispatcher within 5s")
-        .unwrap();
+        let (n, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), client.recv_from(&mut rbuf))
+                .await
+                .expect("response via dispatcher within 5s")
+                .unwrap();
         let (_src, payload) = decode_udp_packet(&rbuf[..n]).unwrap();
         assert_eq!(payload, b"via-dispatch");
     }
@@ -5693,7 +5812,8 @@ mod tests {
         let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
             Arc::new(MarkerUdpDispatch { marker: b"idle" });
         let task = tokio::spawn(async move {
-            let _ = handle_udp_associate(relay, handler, std::time::Duration::from_millis(150)).await;
+            let _ =
+                handle_udp_associate(relay, handler, std::time::Duration::from_millis(150)).await;
         });
         // 不发任何包：150ms 空闲后 relay 必须退出
         tokio::time::timeout(std::time::Duration::from_secs(3), task)
@@ -5717,6 +5837,7 @@ mod tests {
         fn tag(&self) -> &str {
             "keep-link"
         }
+
         fn dispatch(
             &self,
             _dest: &Destination,
@@ -5736,22 +5857,17 @@ mod tests {
         let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
             Arc::new(KeepLinkDispatch { keepers: Arc::new(parking_lot::Mutex::new(Vec::new())) });
         let task = tokio::spawn(async move {
-            let _ = handle_udp_associate(relay, handler, std::time::Duration::from_millis(150)).await;
+            let _ =
+                handle_udp_associate(relay, handler, std::time::Duration::from_millis(150)).await;
         });
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let target = SocksAddr {
-            host: Host::Ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
-            port: 53,
-        };
+        let target = SocksAddr { host: Host::Ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)), port: 53 };
         let t0 = std::time::Instant::now();
         while t0.elapsed() < std::time::Duration::from_millis(400) {
             let _ = client.send_to(&encode_udp_packet(&target, b"ping"), relay_addr).await;
             tokio::time::sleep(std::time::Duration::from_millis(60)).await;
         }
-        assert!(
-            !task.is_finished(),
-            "active relay must survive beyond one idle window"
-        );
+        assert!(!task.is_finished(), "active relay must survive beyond one idle window");
         // 停发：idle 内退出
         tokio::time::timeout(std::time::Duration::from_secs(3), task)
             .await
@@ -5762,13 +5878,15 @@ mod tests {
     /// b2e：dokodemo UDP inbound 经 dispatcher（固定 dest）。
     #[tokio::test]
     async fn dokodemo_udp_dispatch_roundtrip() {
-        let hub = xray_transport::udp::hub::UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None)
-            .await
-            .unwrap();
+        let hub =
+            xray_transport::udp::hub::UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None)
+                .await
+                .unwrap();
         let local = hub.local_addr().unwrap();
         let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
             Arc::new(MarkerUdpDispatch { marker: b"dokodemo-via-dispatch" });
-        let dest = Destination::udp(Address::IPv4(std::net::Ipv4Addr::new(8, 8, 8, 8)), Port::new(53));
+        let dest =
+            Destination::udp(Address::IPv4(std::net::Ipv4Addr::new(8, 8, 8, 8)), Port::new(53));
         tokio::spawn(async move {
             let _ = serve_dokodemo_udp_on(hub, handler, Some(dest)).await;
         });
@@ -5776,13 +5894,11 @@ mod tests {
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client.send_to(b"ping", local).await.unwrap();
         let mut rbuf = [0u8; 1500];
-        let (n, _) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            client.recv_from(&mut rbuf),
-        )
-        .await
-        .expect("response via dispatcher within 5s")
-        .unwrap();
+        let (n, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), client.recv_from(&mut rbuf))
+                .await
+                .expect("response via dispatcher within 5s")
+                .unwrap();
         assert_eq!(&rbuf[..n], b"dokodemo-via-dispatch");
     }
 
@@ -5821,14 +5937,15 @@ mod tests {
     }
     #[tokio::test]
     async fn dokodemo_udp_per_peer_sessions_no_cross_delivery() {
-        let hub = xray_transport::udp::hub::UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None)
-            .await
-            .unwrap();
+        let hub =
+            xray_transport::udp::hub::UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None)
+                .await
+                .unwrap();
         let local = hub.local_addr().unwrap();
-        let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> = Arc::new(CounterUdpDispatch {
-            counter: std::sync::atomic::AtomicU32::new(0),
-        });
-        let dest = Destination::udp(Address::IPv4(std::net::Ipv4Addr::new(8, 8, 8, 8)), Port::new(53));
+        let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
+            Arc::new(CounterUdpDispatch { counter: std::sync::atomic::AtomicU32::new(0) });
+        let dest =
+            Destination::udp(Address::IPv4(std::net::Ipv4Addr::new(8, 8, 8, 8)), Port::new(53));
         tokio::spawn(async move {
             let _ = serve_dokodemo_udp_on(hub, handler, Some(dest)).await;
         });
@@ -5840,10 +5957,11 @@ mod tests {
 
         async fn recv_marker(sock: &UdpSocket) -> String {
             let mut rbuf = [0u8; 1500];
-            let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(5), sock.recv_from(&mut rbuf))
-                .await
-                .expect("per-peer response within 5s")
-                .unwrap();
+            let (n, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), sock.recv_from(&mut rbuf))
+                    .await
+                    .expect("per-peer response within 5s")
+                    .unwrap();
             String::from_utf8_lossy(&rbuf[..n]).into_owned()
         }
         let (ma, mb) = tokio::join!(recv_marker(&client_a), recv_marker(&client_b));
@@ -5869,10 +5987,8 @@ mod tests {
     #[test]
     fn resolve_dokodemo_port_map_rewrites_host_and_port() {
         let mut opts = tcp_opts();
-        opts.port_map
-            .insert("80".to_string(), "192.168.99.1:9090".to_string());
-        let dest = super::resolve_dokodemo_tcp_dest(&opts, None, Some(80), None, None)
-            .unwrap();
+        opts.port_map.insert("80".to_string(), "192.168.99.1:9090".to_string());
+        let dest = super::resolve_dokodemo_tcp_dest(&opts, None, Some(80), None, None).unwrap();
         assert_eq!(dest.port().value(), 9090);
         match dest.address() {
             Address::IPv4(v4) => assert_eq!(v4.octets(), [192, 168, 99, 1]),
@@ -5884,8 +6000,7 @@ mod tests {
     fn resolve_dokodemo_port_map_port_only_keeps_address() {
         let mut opts = tcp_opts();
         opts.port_map.insert("80".to_string(), ":5353".to_string());
-        let dest = super::resolve_dokodemo_tcp_dest(&opts, None, Some(80), None, None)
-            .unwrap();
+        let dest = super::resolve_dokodemo_tcp_dest(&opts, None, Some(80), None, None).unwrap();
         assert_eq!(dest.port().value(), 5353);
         match dest.address() {
             Address::IPv4(v4) => assert_eq!(v4.octets(), [10, 0, 0, 1]),
@@ -5896,10 +6011,8 @@ mod tests {
     #[test]
     fn resolve_dokodemo_port_map_domain_host() {
         let mut opts = tcp_opts();
-        opts.port_map
-            .insert("80".to_string(), "example.org:".to_string());
-        let dest = super::resolve_dokodemo_tcp_dest(&opts, None, Some(80), None, None)
-            .unwrap();
+        opts.port_map.insert("80".to_string(), "example.org:".to_string());
+        let dest = super::resolve_dokodemo_tcp_dest(&opts, None, Some(80), None, None).unwrap();
         assert_eq!(dest.port().value(), 80);
         match dest.address() {
             Address::Domain(d) => assert_eq!(d, "example.org"),
@@ -5910,10 +6023,8 @@ mod tests {
     #[test]
     fn resolve_dokodemo_port_map_no_match_uses_predefined() {
         let mut opts = tcp_opts();
-        opts.port_map
-            .insert("443".to_string(), "192.168.99.1:9090".to_string());
-        let dest = super::resolve_dokodemo_tcp_dest(&opts, None, Some(80), None, None)
-            .unwrap();
+        opts.port_map.insert("443".to_string(), "192.168.99.1:9090".to_string());
+        let dest = super::resolve_dokodemo_tcp_dest(&opts, None, Some(80), None, None).unwrap();
         assert_eq!(dest.port().value(), 80);
         match dest.address() {
             Address::IPv4(v4) => assert_eq!(v4.octets(), [10, 0, 0, 1]),
@@ -5925,14 +6036,9 @@ mod tests {
     fn resolve_dokodemo_sni_overrides_address_keeps_port() {
         let mut opts = tcp_opts();
         opts.follow_redirect = true;
-        let dest = super::resolve_dokodemo_tcp_dest(
-            &opts,
-            None,
-            Some(80),
-            None,
-            Some("sni.example.com"),
-        )
-        .unwrap();
+        let dest =
+            super::resolve_dokodemo_tcp_dest(&opts, None, Some(80), None, Some("sni.example.com"))
+                .unwrap();
         assert_eq!(dest.port().value(), 80, "SNI 只覆盖 address，port 保持");
         match dest.address() {
             Address::Domain(d) => assert_eq!(d, "sni.example.com"),
@@ -5977,8 +6083,7 @@ mod tests {
         // Go：portMap 分支在 !FollowRedirect 内（互斥）；无 original dst/SNI → 拒连。
         let mut opts = tcp_opts();
         opts.follow_redirect = true;
-        opts.port_map
-            .insert("80".to_string(), "192.168.99.1:9090".to_string());
+        opts.port_map.insert("80".to_string(), "192.168.99.1:9090".to_string());
         assert!(super::resolve_dokodemo_tcp_dest(&opts, None, Some(80), None, None).is_none());
     }
 
@@ -6038,7 +6143,6 @@ mod tests {
         opts.follow_redirect = true;
         assert!(super::resolve_dokodemo_tcp_dest(&opts, None, Some(80), None, None).is_none());
     }
-
 
     #[test]
     fn parse_dokodemo_settings_port_map() {
@@ -6113,33 +6217,30 @@ mod tests {
                 p.timeout.handshake = self.0;
                 p
             }
+
             fn for_system(&self) -> xray_features::policy::SystemStats {
                 xray_features::policy::SystemStats::default()
             }
         }
 
         let ohm = Arc::new(SimpleOhm::new());
-        let bridge = Arc::new(DestCaptureDispatch {
-            dest: parking_lot::Mutex::new(None),
-        }) as Arc<dyn xray_app_dispatcher::DispatchHandler>;
+        let bridge = Arc::new(DestCaptureDispatch { dest: parking_lot::Mutex::new(None) })
+            as Arc<dyn xray_app_dispatcher::DispatchHandler>;
         ohm.set_default(bridge);
 
         let listener = InboundTcpListener::bind(
             "127.0.0.1:0",
             xray_transport::sockopt::SocketOptions::default(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let addr = listener.local_addr().unwrap();
         let mut config = HttpServerConfig::default();
         config.user_level = 3;
         let pm: Arc<dyn xray_features::policy::PolicyManager> =
             Arc::new(FixedHandshakePolicy(std::time::Duration::from_millis(120)));
         let handshake_timeout = Some(pm.policy_for_level(config.user_level).timeout.handshake);
-        tokio::spawn(serve_http(
-            listener,
-            ohm,
-            Arc::new(config),
-            handshake_timeout,
-        ));
+        tokio::spawn(serve_http(listener, ohm, Arc::new(config), handshake_timeout));
 
         // 客户端连接后保持静默：超时到期 → 服务端断开 → 客户端读到 EOF。
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -6152,10 +6253,7 @@ mod tests {
             elapsed >= std::time::Duration::from_millis(100),
             "disconnect should come from timeout, not immediate: {elapsed:?}"
         );
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "timeout too slow: {elapsed:?}"
-        );
+        assert!(elapsed < std::time::Duration::from_secs(2), "timeout too slow: {elapsed:?}");
     }
 
     /// socks 握手限时行为测试：客户端连上后保持静默，handshake_timeout 到期
@@ -6166,15 +6264,16 @@ mod tests {
         use tokio::io::AsyncReadExt;
 
         let ohm = Arc::new(SimpleOhm::new());
-        let bridge = Arc::new(DestCaptureDispatch {
-            dest: parking_lot::Mutex::new(None),
-        }) as Arc<dyn xray_app_dispatcher::DispatchHandler>;
+        let bridge = Arc::new(DestCaptureDispatch { dest: parking_lot::Mutex::new(None) })
+            as Arc<dyn xray_app_dispatcher::DispatchHandler>;
         ohm.set_default(bridge);
 
         let listener = InboundTcpListener::bind(
             "127.0.0.1:0",
             xray_transport::sockopt::SocketOptions::default(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let addr = listener.local_addr().unwrap();
         let config = Arc::new(parse_socks_server_config(b"{}").unwrap());
         tokio::spawn(serve_socks5(
@@ -6196,10 +6295,7 @@ mod tests {
             elapsed >= std::time::Duration::from_millis(100),
             "disconnect should come from timeout, not immediate: {elapsed:?}"
         );
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "timeout too slow: {elapsed:?}"
-        );
+        assert!(elapsed < std::time::Duration::from_secs(2), "timeout too slow: {elapsed:?}");
     }
 
     /// i09 e2e：dokodemo TCP port_map——按监听端口改写 dest（Go dokodemo.go:101-109）。
@@ -6208,24 +6304,22 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let ohm = Arc::new(SimpleOhm::new());
-        let capture = Arc::new(DestCaptureDispatch {
-            dest: parking_lot::Mutex::new(None),
-        });
+        let capture = Arc::new(DestCaptureDispatch { dest: parking_lot::Mutex::new(None) });
         ohm.set_default(capture.clone() as Arc<dyn DispatchHandler>);
 
         let listener = InboundTcpListener::bind(
             "127.0.0.1:0",
             xray_transport::sockopt::SocketOptions::default(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let port = listener.local_addr().unwrap().port();
         let opts = DokodemoTcpOptions {
             dest: Some(Destination::tcp(
                 Address::IPv4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
                 Port::new(80),
             )),
-            port_map: [(port.to_string(), "192.168.99.1:9090".to_string())]
-                .into_iter()
-                .collect(),
+            port_map: [(port.to_string(), "192.168.99.1:9090".to_string())].into_iter().collect(),
             follow_redirect: false,
             tls: None,
         };
@@ -6233,9 +6327,7 @@ mod tests {
             let _ = serve_dokodemo(listener, ohm, opts).await;
         });
 
-        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .unwrap();
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         client.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 2];
         client.read_exact(&mut buf).await.unwrap();
@@ -6255,7 +6347,6 @@ mod tests {
     async fn dokodemo_tls_sni_override_e2e() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-
         static PROVIDER: std::sync::Once = std::sync::Once::new();
         PROVIDER.call_once(|| {
             let _ = rustls::crypto::ring::default_provider().install_default();
@@ -6274,12 +6365,14 @@ mod tests {
             ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
                 Ok(rustls::client::danger::ServerCertVerified::assertion())
             }
+
             fn verify_tls12_signature(
                 &self,
                 message: &[u8],
                 cert: &rustls::pki_types::CertificateDer<'_>,
                 dss: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
                 rustls::crypto::verify_tls12_signature(
                     message,
                     cert,
@@ -6287,12 +6380,14 @@ mod tests {
                     &rustls::crypto::ring::default_provider().signature_verification_algorithms,
                 )
             }
+
             fn verify_tls13_signature(
                 &self,
                 message: &[u8],
                 cert: &rustls::pki_types::CertificateDer<'_>,
                 dss: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
                 rustls::crypto::verify_tls13_signature(
                     message,
                     cert,
@@ -6300,6 +6395,7 @@ mod tests {
                     &rustls::crypto::ring::default_provider().signature_verification_algorithms,
                 )
             }
+
             fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
                 rustls::crypto::ring::default_provider()
                     .signature_verification_algorithms
@@ -6309,27 +6405,24 @@ mod tests {
 
         // 1. 证书 SAN = 期望 SNI 域名
         let key_pair = rcgen::KeyPair::generate().unwrap();
-        let params = rcgen::CertificateParams::new(vec!["sni.example.com".to_string()])
-            .unwrap();
+        let params = rcgen::CertificateParams::new(vec!["sni.example.com".to_string()]).unwrap();
         let cert = params.self_signed(&key_pair).unwrap();
         let stream_settings = serde_json::json!({
             "security": "tls",
             "tlsSettings": { "cert": cert.pem(), "key": key_pair.serialize_pem() }
         });
-        let tls = super::build_tls_acceptor(Some(&stream_settings))
-            .unwrap()
-            .expect("tls acceptor");
+        let tls = super::build_tls_acceptor(Some(&stream_settings)).unwrap().expect("tls acceptor");
 
         // 2. serve_dokodemo：predefined dest 1.2.3.4:80 + follow_redirect（SNI 门控）
         let ohm = Arc::new(SimpleOhm::new());
-        let capture = Arc::new(DestCaptureDispatch {
-            dest: parking_lot::Mutex::new(None),
-        });
+        let capture = Arc::new(DestCaptureDispatch { dest: parking_lot::Mutex::new(None) });
         ohm.set_default(capture.clone() as Arc<dyn DispatchHandler>);
         let listener = InboundTcpListener::bind(
             "127.0.0.1:0",
             xray_transport::sockopt::SocketOptions::default(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let port = listener.local_addr().unwrap().port();
         let opts = DokodemoTcpOptions {
             dest: Some(Destination::tcp(
@@ -6350,12 +6443,9 @@ mod tests {
             .with_custom_certificate_verifier(Arc::new(NoVerify))
             .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
-        let sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .unwrap();
-        let server_name = rustls::pki_types::ServerName::try_from("sni.example.com")
-            .unwrap()
-            .to_owned();
+        let sock = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let server_name =
+            rustls::pki_types::ServerName::try_from("sni.example.com").unwrap().to_owned();
         let mut tls_client = connector.connect(server_name, sock).await.unwrap();
 
         tls_client.write_all(b"ping").await.unwrap();
@@ -6379,14 +6469,14 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let ohm = Arc::new(SimpleOhm::new());
-        let capture = Arc::new(DestCaptureDispatch {
-            dest: parking_lot::Mutex::new(None),
-        });
+        let capture = Arc::new(DestCaptureDispatch { dest: parking_lot::Mutex::new(None) });
         ohm.set_default(capture.clone() as Arc<dyn DispatchHandler>);
         let listener = InboundTcpListener::bind(
             "127.0.0.1:0",
             xray_transport::sockopt::SocketOptions::default(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let port = listener.local_addr().unwrap().port();
         let opts = DokodemoTcpOptions {
             dest: Some(Destination::tcp(
@@ -6401,9 +6491,7 @@ mod tests {
             let _ = serve_dokodemo(listener, ohm, opts).await;
         });
 
-        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .unwrap();
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         client.write_all(b"ping").await.unwrap();
 
         // 直连（无 iptables REDIRECT）：拿不到原始目标 → 拒连——dest 永不 dispatch，
@@ -6435,7 +6523,8 @@ mod tests {
         assert_eq!(VlessValidatorTrait::get_count(&*validator), 2);
         // 用户可被取出（按 UUID lookup）
         let parsed_uuid = xray_common::uuid::UUID::parse(uuid).expect("uuid");
-        let user = VlessValidatorTrait::get(&*validator, &parsed_uuid).expect("user should be registered");
+        let user =
+            VlessValidatorTrait::get(&*validator, &parsed_uuid).expect("user should be registered");
         assert_eq!(user.email, "alice@example.com");
     }
 
@@ -6468,7 +6557,8 @@ mod tests {
         let b = xray_common::uuid::UUID::parse(ub).expect("uuid b");
         assert!(VlessValidatorTrait::get(&*validator, &a).is_some());
         assert!(VlessValidatorTrait::get(&*validator, &b).is_some());
-        let bad = xray_common::uuid::UUID::parse("d342d11e-d424-4583-b36e-524ab1f0afa4").expect("uuid bad");
+        let bad = xray_common::uuid::UUID::parse("d342d11e-d424-4583-b36e-524ab1f0afa4")
+            .expect("uuid bad");
         assert!(VlessValidatorTrait::get(&*validator, &bad).is_none());
     }
 
@@ -6534,7 +6624,8 @@ mod tests {
         // ENC + 无 fallbacks → 合法（初始化成功）。
         assert!(super::build_vless_decryption(enc.as_bytes()).is_ok());
         // ENC + fallbacks 在场 → 拒启。
-        let enc_fb = format!(r#"{{"decryption":"mlkem768x25519plus.native.1000s.{keys}","fallbacks":[]}}"#);
+        let enc_fb =
+            format!(r#"{{"decryption":"mlkem768x25519plus.native.1000s.{keys}","fallbacks":[]}}"#);
         let err = super::build_vless_decryption(enc_fb.as_bytes()).err().expect("must reject");
         assert!(
             err.to_string().contains("can not be used together"),
@@ -6564,7 +6655,9 @@ mod tests {
         use xray_proxy_vless::Validator as VlessValidatorTrait;
         let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
         // 空 client flow + settings.flow=vision → 继承 vision。
-        let json = format!(r#"{{"clients":[{{"id":"{uuid}"}}],"flow":"xtls-rprx-vision","decryption":"none"}}"#);
+        let json = format!(
+            r#"{{"clients":[{{"id":"{uuid}"}}],"flow":"xtls-rprx-vision","decryption":"none"}}"#
+        );
         let validator = super::build_vless_validator(json.as_bytes()).unwrap();
         let u = xray_common::uuid::UUID::parse(uuid).unwrap();
         let user = VlessValidatorTrait::get(&*validator, &u).expect("user registered");
@@ -6618,10 +6711,7 @@ mod tests {
             let json = serde_json::json!({"decryption":"none","fallbacks":[fb]});
             let data = serde_json::to_vec(&json).unwrap();
             let err = super::build_vless_fallbacks(&data).err().expect("must reject");
-            assert!(
-                err.to_string().contains("xver"),
-                "expected xver hard error, got: {err}"
-            );
+            assert!(err.to_string().contains("xver"), "expected xver hard error, got: {err}");
         }
     }
 
@@ -6679,12 +6769,12 @@ mod tests {
     /// 相反。
     #[test]
     fn parse_socks_server_config_accounts_override_users() {
-        let json = br#"{"users":[{"user":"alice","pass":"p1"}],"accounts":[{"user":"bob","pass":"p2"}]}"#;
+        let json =
+            br#"{"users":[{"user":"alice","pass":"p1"}],"accounts":[{"user":"bob","pass":"p2"}]}"#;
         let cfg = super::parse_socks_server_config(json).unwrap();
         assert!(cfg.has_account("bob", "p2"), "accounts must win");
         assert!(!cfg.has_account("alice", "p1"), "users must be overridden");
     }
-
 
     #[test]
     fn build_trojan_users_parses_clients_json() {
@@ -6700,7 +6790,6 @@ mod tests {
         let expected_user = TrojanMemoryUser::new("alice", 0, expected_account);
         assert!(users.contains_key(&expected_user.key_hash()));
     }
-
 
     #[test]
     fn build_trojan_users_with_flow_still_builds() {
@@ -6922,10 +7011,10 @@ mod tests {
         assert!(!cfg.has_account("loser", "lp"), "accounts ignored when users present");
     }
 
-
     #[test]
     fn parse_http_config_transparent_and_user_level() {
-        // 键名/零值默认对齐 Go infra/conf/http.go:28-29（Transparent json:"allowTransparent"、UserLevel json:"userLevel"）。
+        // 键名/零值默认对齐 Go infra/conf/http.go:28-29（Transparent
+        // json:"allowTransparent"、UserLevel json:"userLevel"）。
         let settings = serde_json::json!({
             "allowTransparent": true,
             "userLevel": 7
@@ -7004,7 +7093,8 @@ mod tests {
 
     #[test]
     fn parse_dokodemo_settings_tcp_udp() {
-        let settings = serde_json::json!({ "address": "1.2.3.4", "port": 53, "network": "tcp,udp" });
+        let settings =
+            serde_json::json!({ "address": "1.2.3.4", "port": 53, "network": "tcp,udp" });
         let data = serde_json::to_vec(&settings).unwrap();
         let s = super::parse_dokodemo_settings(&data).unwrap();
         assert!(s.allow_tcp);
@@ -7013,7 +7103,8 @@ mod tests {
 
     #[test]
     fn parse_dokodemo_settings_follow_redirect() {
-        let settings = serde_json::json!({ "address": "1.2.3.4", "port": 80, "followRedirect": true });
+        let settings =
+            serde_json::json!({ "address": "1.2.3.4", "port": 80, "followRedirect": true });
         let data = serde_json::to_vec(&settings).unwrap();
         let s = super::parse_dokodemo_settings(&data).unwrap();
         assert!(s.follow_redirect);
@@ -7052,7 +7143,7 @@ mod tests {
     fn is_mux_destination_rejects_wrong_port() {
         let dest = Destination::new(
             Address::Domain("v1.mux.cool".to_string()),
-            Port::new(80),  // 不是 9527
+            Port::new(80), // 不是 9527
             Network::TCP,
         );
         assert!(!super::is_mux_destination(&dest));
@@ -7087,15 +7178,10 @@ mod tests {
     /// 对称 outbound 侧官方 tuic-client 缺省 bbr）。
     #[test]
     fn parse_tuic_inbound_settings_defaults_official_server() {
-        let s = super::parse_tuic_inbound_settings(
-            tuic_inbound_json("").as_bytes(),
-            "127.0.0.1:8443",
-        )
-        .unwrap();
-        assert_eq!(
-            s.congestion_control,
-            Some(xray_proxy_tuic::CongestionControl::Cubic)
-        );
+        let s =
+            super::parse_tuic_inbound_settings(tuic_inbound_json("").as_bytes(), "127.0.0.1:8443")
+                .unwrap();
+        assert_eq!(s.congestion_control, Some(xray_proxy_tuic::CongestionControl::Cubic));
         assert_eq!(s.brutal_up_bps, 0);
         assert_eq!(s.server_name, "tuic");
     }
@@ -7111,20 +7197,14 @@ mod tests {
     fn parse_tuic_inbound_settings_hysteria_cc_variants() {
         let json = tuic_inbound_json(r#","congestion_control":"hysteria_bbr""#);
         let s = super::parse_tuic_inbound_settings(json.as_bytes(), "127.0.0.1:8443").unwrap();
-        assert_eq!(
-            s.congestion_control,
-            Some(xray_proxy_tuic::CongestionControl::HysteriaBbr)
-        );
+        assert_eq!(s.congestion_control, Some(xray_proxy_tuic::CongestionControl::HysteriaBbr));
         assert_eq!(s.brutal_up_bps, 0);
 
         let json = tuic_inbound_json(
             r#","congestion_control":"hysteria_brutal","brutal_up_bps":10485760"#,
         );
         let s = super::parse_tuic_inbound_settings(json.as_bytes(), "127.0.0.1:8443").unwrap();
-        assert_eq!(
-            s.congestion_control,
-            Some(xray_proxy_tuic::CongestionControl::HysteriaBrutal)
-        );
+        assert_eq!(s.congestion_control, Some(xray_proxy_tuic::CongestionControl::HysteriaBrutal));
         assert_eq!(s.brutal_up_bps, 10_485_760);
 
         // hysteria_brutal 无带宽 → 解析期拒绝（crate 层的 0 回落 BBR 只保护编程构造路径）。
@@ -7133,10 +7213,7 @@ mod tests {
         // 既有三臂不受 brutal_up_bps 影响（配了也忽略）。
         let json = tuic_inbound_json(r#","congestion_control":"bbr","brutal_up_bps":10485760"#);
         let s = super::parse_tuic_inbound_settings(json.as_bytes(), "127.0.0.1:8443").unwrap();
-        assert_eq!(
-            s.congestion_control,
-            Some(xray_proxy_tuic::CongestionControl::Bbr)
-        );
+        assert_eq!(s.congestion_control, Some(xray_proxy_tuic::CongestionControl::Bbr));
     }
 
     /// 票 ieik⑥：certificate/certificateKey PEM → TuicInboundConfig cert/key DER。
@@ -7146,9 +7223,7 @@ mod tests {
         let key_pair = rcgen::KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::new(vec!["tuic.test".to_string()]).unwrap();
         params.distinguished_name = rcgen::DistinguishedName::new();
-        params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, "tuic.test");
+        params.distinguished_name.push(rcgen::DnType::CommonName, "tuic.test");
         let cert = params.self_signed(&key_pair).unwrap();
         let cert_pem = cert.pem();
         let key_pem = key_pair.serialize_pem();

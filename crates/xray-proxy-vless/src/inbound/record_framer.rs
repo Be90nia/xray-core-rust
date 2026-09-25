@@ -23,9 +23,11 @@
 //! 在隧道模式」期间被调用，那些字节必然是合法隧道记录；DIRECT 切换后
 //! VisionConn 不再读本层，裸尾永远不会进入状态机。
 
-use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -47,12 +49,7 @@ pub(crate) struct RecordFramer<S> {
 
 impl<S> RecordFramer<S> {
     pub(crate) fn new(sock: S) -> Self {
-        Self {
-            sock,
-            hdr: [0u8; HEADER_LEN],
-            have: 0,
-            body_remaining: 0,
-        }
+        Self { sock, hdr: [0u8; HEADER_LEN], have: 0, body_remaining: 0 }
     }
 }
 
@@ -70,7 +67,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for RecordFramer<S> {
             // 恒能容纳 ≤5B 的头，无需部分交付回退路径。
             let mut rb = ReadBuf::new(&mut this.hdr[this.have..]);
             match Pin::new(&mut this.sock).poll_read(cx, &mut rb) {
-                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Ok(())) => {},
                 other => return other,
             }
             let n = rb.filled().len();
@@ -95,7 +92,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for RecordFramer<S> {
         let unfilled = buf.initialize_unfilled();
         let mut rb = ReadBuf::new(&mut unfilled[..want]);
         match Pin::new(&mut this.sock).poll_read(cx, &mut rb) {
-            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Ok(())) => {},
             other => return other,
         }
         let n = rb.filled().len();
@@ -126,8 +123,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for RecordFramer<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
 
     /// 构造一条 TLS 记录字节（头 + 体），`typ` 随意（framer 不校验）。
     fn record(typ: u8, body: &[u8]) -> Vec<u8> {

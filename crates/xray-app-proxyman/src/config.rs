@@ -6,12 +6,15 @@
 //! 列表编译成 `domain.Matcher`。Rust 端 `xray-geodata` 暂未暴露等价 API，
 //! 这里保留原始字符串 + 提供匹配 helper（与 P4-3 dispatcher 的 `SniffingRequest` 同模式）。
 
-use crate::error::ProxymanError;
-use ipnet::IpNet;
 use std::net::IpAddr;
-use xray_proto::xray::app::proxyman::SniffingConfig;
-use xray_proto::xray::common::geodata::domain_rule;
-use xray_proto::xray::common::geodata::ip_rule;
+
+use ipnet::IpNet;
+use xray_proto::xray::{
+    app::proxyman::SniffingConfig,
+    common::geodata::{domain_rule, ip_rule},
+};
+
+use crate::error::ProxymanError;
 
 /// 嗅探请求（对应 Go `session.SniffingRequest`）
 ///
@@ -40,8 +43,9 @@ impl SniffingRequest {
     ///
     /// # Errors
     ///
-    /// 当前实现**不返回错误**（与 Go 行为一致：matcher 构建失败才报错，Rust 跳过编译直接保留字符串）。
-    /// 保留 `Result` 签名以匹配 Go 接口风格，便于未来接入真实 matcher 时返回错误。
+    /// 当前实现**不返回错误**（与 Go 行为一致：matcher 构建失败才报错，Rust
+    /// 跳过编译直接保留字符串）。 保留 `Result` 签名以匹配 Go 接口风格，便于未来接入真实
+    /// matcher 时返回错误。
     pub fn from_proto(cfg: Option<&SniffingConfig>) -> Result<Self, ProxymanError> {
         let Some(cfg) = cfg else {
             return Ok(Self::default());
@@ -91,9 +95,7 @@ impl SniffingRequest {
             return false;
         }
         let domain_lower = domain.to_lowercase();
-        self.exclude_for_domain
-            .iter()
-            .any(|excl| domain_lower.contains(&excl.to_lowercase()))
+        self.exclude_for_domain.iter().any(|excl| domain_lower.contains(&excl.to_lowercase()))
     }
 
     /// 判断 IP 是否命中"排除 IP"列表（CIDR contains 判断）。
@@ -103,10 +105,7 @@ impl SniffingRequest {
     pub fn matches_ip_excluded(&self, ip: IpAddr) -> bool {
         self.exclude_for_ip.iter().any(|cidr_str| {
             // ponytail: 解析失败按不匹配处理（保留容错）；性能不是热路径（每次连接 1 次）
-            cidr_str
-                .parse::<IpNet>()
-                .map(|net| net.contains(&ip))
-                .unwrap_or(false)
+            cidr_str.parse::<IpNet>().map(|net| net.contains(&ip)).unwrap_or(false)
         })
     }
 }
@@ -118,12 +117,12 @@ fn cidr_from_proto(bytes: &[u8], prefix: u32) -> Option<IpNet> {
             let mut arr = [0u8; 4];
             arr.copy_from_slice(bytes);
             IpNet::new(IpAddr::V4(arr.into()), u8::try_from(prefix).ok()?).ok()
-        }
+        },
         16 => {
             let mut arr = [0u8; 16];
             arr.copy_from_slice(bytes);
             IpNet::new(IpAddr::V6(arr.into()), u8::try_from(prefix).ok()?).ok()
-        }
+        },
         _ => None,
     }
 }
@@ -141,12 +140,15 @@ pub fn build_sniffing_request(
 
 #[cfg(test)]
 mod tests {
+    use xray_proto::xray::{
+        app::proxyman::SniffingConfig as ProtoSniffingConfig,
+        common::geodata::{
+            Cidr, CidrRule, Domain, DomainRule, IpRule, domain::Type as DomainType,
+            domain_rule::Value as DomainValue, ip_rule::Value as IpValue,
+        },
+    };
+
     use super::*;
-    use xray_proto::xray::app::proxyman::SniffingConfig as ProtoSniffingConfig;
-    use xray_proto::xray::common::geodata::{Domain, DomainRule, IpRule, Cidr, CidrRule};
-    use xray_proto::xray::common::geodata::domain::Type as DomainType;
-    use xray_proto::xray::common::geodata::domain_rule::Value as DomainValue;
-    use xray_proto::xray::common::geodata::ip_rule::Value as IpValue;
 
     #[test]
     fn from_proto_none_returns_default() {
@@ -301,10 +303,7 @@ mod tests {
 
     #[test]
     fn build_sniffing_request_delegates_to_from_proto() {
-        let cfg = ProtoSniffingConfig {
-            enabled: true,
-            ..Default::default()
-        };
+        let cfg = ProtoSniffingConfig { enabled: true, ..Default::default() };
         let req = build_sniffing_request(Some(&cfg)).unwrap();
         assert!(req.enabled);
     }

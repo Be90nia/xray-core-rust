@@ -14,6 +14,7 @@
 //! `XxxType()` 工厂函数。
 
 use std::any::{Any, TypeId};
+
 use thiserror::Error;
 
 /// Feature 注册/生命周期错误。
@@ -46,8 +47,8 @@ pub type Result<T> = std::result::Result<T, FeatureError>;
 ///
 /// # 生命周期
 ///
-/// 1. 通过 [`Instance::add_feature`](../../xray_core/instance/struct.Instance.html#method.add_feature)
-///    注册到 Instance 容器。
+/// 1. 通过 [`Instance::add_feature`](../../xray_core/instance/struct.Instance.html#method.
+///    add_feature) 注册到 Instance 容器。
 /// 2. `Instance::start()` 按注册顺序调用所有 feature 的 `start()`。
 /// 3. `Instance::close()` 按注册逆序调用所有 feature 的 `close()`。
 ///
@@ -96,7 +97,6 @@ pub trait Feature: Any + Send + Sync + 'static {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,6 +111,7 @@ mod tests {
         fn feature_name(&self) -> &'static str {
             self.name
         }
+
         fn start(&self) -> Result<()> {
             Ok(())
         }

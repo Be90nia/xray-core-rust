@@ -11,13 +11,16 @@
 //!
 //! TLS / Udpmask 包装留 follow-up（依赖 uTLS 决策 + xray 自有 udpmask 协议）。
 
-use std::io::{self, ErrorKind};
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    io::{self, ErrorKind},
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
-use crate::dialer::PacketInput;
-use crate::listener::UdpHub;
+use crate::{dialer::PacketInput, listener::UdpHub};
 /// 同步 UDP hub：包装 `UdpSocket` 实现 [`UdpHub`] trait。
 ///
 /// 内部共享底层 socket（`std::net::UdpSocket` 的 send/recv 均为 `&self` 且线程安全，
@@ -51,22 +54,14 @@ impl StdUdpHub {
         let socket = std::net::UdpSocket::bind(addr)?;
         let local = socket.local_addr().ok();
         socket.set_read_timeout(Some(READ_POLL_TIMEOUT))?;
-        Ok(Self {
-            socket: Arc::new(socket),
-            local,
-            closed: Arc::new(AtomicBool::new(false)),
-        })
+        Ok(Self { socket: Arc::new(socket), local, closed: Arc::new(AtomicBool::new(false)) })
     }
 
     /// 从已建立的 socket 构造（用于 dialer 端的 connected UDP socket）。
     pub fn from_socket(socket: std::net::UdpSocket) -> Self {
         let local = socket.local_addr().ok();
         let _ = socket.set_read_timeout(Some(READ_POLL_TIMEOUT));
-        Self {
-            socket: Arc::new(socket),
-            local,
-            closed: Arc::new(AtomicBool::new(false)),
-        }
+        Self { socket: Arc::new(socket), local, closed: Arc::new(AtomicBool::new(false)) }
     }
 
     /// 拿底层 socket 的共享引用（用于构造 [`StdPacketInput`] 复用同一 socket）。
@@ -85,10 +80,7 @@ impl StdUdpHub {
 /// 超时/瞬时错误：重试（对应 Go net 层对 UDP 瞬时错误的容忍；
 /// Windows connected UDP 收到 ICMP port-unreachable 时 recv 返回 ConnectionReset）。
 fn is_transient(e: &io::Error) -> bool {
-    matches!(
-        e.kind(),
-        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::ConnectionReset
-    )
+    matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::ConnectionReset)
 }
 
 impl UdpHub for StdUdpHub {
@@ -126,19 +118,13 @@ impl StdPacketInput {
     /// 从 hub 复用 socket + 关闭标志构造。
     #[must_use]
     pub fn from_hub(hub: &StdUdpHub) -> Self {
-        Self {
-            socket: hub.socket_handle(),
-            closed: hub.closed_flag(),
-        }
+        Self { socket: hub.socket_handle(), closed: hub.closed_flag() }
     }
 
     /// 从已建立的 socket 构造（关闭标志独立）。
     pub fn from_socket(socket: std::net::UdpSocket) -> Self {
         let _ = socket.set_read_timeout(Some(READ_POLL_TIMEOUT));
-        Self {
-            socket: Arc::new(socket),
-            closed: Arc::new(AtomicBool::new(false)),
-        }
+        Self { socket: Arc::new(socket), closed: Arc::new(AtomicBool::new(false)) }
     }
 
     /// 关闭标志句柄（供 closer 共享）。

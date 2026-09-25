@@ -7,11 +7,11 @@
 use std::net::Ipv4Addr;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::port::Port;
-use xray_transport::dialer::{StreamSettings, dial_with_settings};
-use xray_transport::sockopt::SocketOptions;
+use xray_common::net::{address::Address, destination::Destination, port::Port};
+use xray_transport::{
+    dialer::{StreamSettings, dial_with_settings},
+    sockopt::SocketOptions,
+};
 
 /// TCP + http header 出站：dial 后首写应带 "GET / HTTP/1.1" + Chrome UA
 /// request header；对端 response header 应被吞掉，payload 透传。
@@ -61,16 +61,11 @@ async fn tcp_http_header_dial_injects_request_header() {
         header.starts_with("GET / HTTP/1.1\r\n"),
         "request 首行应为 GET / HTTP/1.1，实际 {header:?}"
     );
-    assert!(
-        header.contains("User-Agent: Mozilla/5.0"),
-        "应含默认 Chrome UA，实际 {header:?}"
-    );
+    assert!(header.contains("User-Agent: Mozilla/5.0"), "应含默认 Chrome UA，实际 {header:?}");
     assert_eq!(payload, b"payload-after-header");
 
     // 回 response header + payload：client 应吞 header 拿到 payload（读方向仍开）。
-    sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: x\r\n\r\nreply-body")
-        .await
-        .unwrap();
+    sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: x\r\n\r\nreply-body").await.unwrap();
     let mut buf = [0u8; 10];
     conn.read_exact(&mut buf).await.expect("client read");
     assert_eq!(&buf[..], b"reply-body");

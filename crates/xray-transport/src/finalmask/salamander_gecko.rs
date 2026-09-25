@@ -15,20 +15,23 @@
 //! - 每个 source 地址上限 8 条
 //! - 单条 TTL = 8 秒，后台 GC ticker = 4 秒
 
-use std::collections::HashMap;
-use std::io;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    io,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use rand::{Rng, RngCore};
 use tokio::task::AbortHandle;
 
-use super::salamander::SalamanderObfuscator;
-use super::{UdpIo, Udpmask, UDP_SIZE};
+use super::{UDP_SIZE, UdpIo, Udpmask, salamander::SalamanderObfuscator};
 
 /// Gecko frame header 标志位（首字节高 bit set = 分片帧）。
 const GECKO_FLAG_FRAGMENT: u8 = 0x80;
@@ -80,17 +83,11 @@ pub fn encode_frame(h: &FrameHeader, payload: &[u8], out: &mut [u8]) -> io::Resu
         ));
     }
     if h.chunk_idx >= h.total_chunks {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "gecko: chunk_idx >= total_chunks",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "gecko: chunk_idx >= total_chunks"));
     }
     let needed = GECKO_HEADER_SIZE + h.pad_len as usize + payload.len();
     if out.len() < needed {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "gecko: out buffer truncated",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "gecko: out buffer truncated"));
     }
     out[0] = GECKO_FLAG_FRAGMENT;
     out[1] = h.msg_id;
@@ -110,16 +107,10 @@ pub fn encode_frame(h: &FrameHeader, payload: &[u8], out: &mut [u8]) -> io::Resu
 /// - `InvalidData`：长度不足、flag 位未 set、字段越界。
 pub fn decode_frame(input: &[u8]) -> io::Result<(FrameHeader, usize, usize)> {
     if input.len() < GECKO_HEADER_SIZE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "gecko: frame truncated",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "gecko: frame truncated"));
     }
     if input[0] & GECKO_FLAG_FRAGMENT == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "gecko: not a fragment frame",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "gecko: not a fragment frame"));
     }
     let h = FrameHeader {
         msg_id: input[1],
@@ -136,17 +127,11 @@ pub fn decode_frame(input: &[u8]) -> io::Result<(FrameHeader, usize, usize)> {
         ));
     }
     if h.chunk_idx >= h.total_chunks {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "gecko: chunk_idx >= total_chunks",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "gecko: chunk_idx >= total_chunks"));
     }
     let payload_start = GECKO_HEADER_SIZE + h.pad_len as usize;
     if payload_start > input.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "gecko: padding exceeds frame",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "gecko: padding exceeds frame"));
     }
     Ok((h, payload_start, input.len()))
 }
@@ -289,11 +274,7 @@ impl GeckoConn {
         let msg_id = self.next_msg_id();
         for i in 0..chunks {
             let start = i * chunk_size;
-            let end = if i < chunks - 1 {
-                start + chunk_size
-            } else {
-                p.len()
-            };
+            let end = if i < chunks - 1 { start + chunk_size } else { p.len() };
             let chunk = &p[start..end];
             let pad_len = self.random_pad_len(chunk.len());
             let mut frame = vec![0u8; GECKO_HEADER_SIZE + pad_len + chunk.len()];
@@ -315,7 +296,12 @@ impl GeckoConn {
     /// 接收并处理分片（对应 Go `acceptChunk`）。
     ///
     /// 返回 `Some(reassembled)` 当全部分片到齐，否则 `None`（继续读）。
-    fn accept_chunk(&self, key: &ReassemblyKey, h: &FrameHeader, payload: &[u8]) -> Option<Vec<u8>> {
+    fn accept_chunk(
+        &self,
+        key: &ReassemblyKey,
+        h: &FrameHeader,
+        payload: &[u8],
+    ) -> Option<Vec<u8>> {
         let mut state = self.state.lock();
         // 已存在 → 校验 total 一致；不存在 → 新建（检查 cap）
         let exists = state.reassembly.contains_key(key);
@@ -422,16 +408,13 @@ impl UdpIo for GeckoConn {
                 Ok(v) => v,
                 Err(_) => continue, // malformed，静默丢弃
             };
-            let key = ReassemblyKey {
-                addr: addr.to_string(),
-                msg_id: header.msg_id,
-            };
+            let key = ReassemblyKey { addr: addr.to_string(), msg_id: header.msg_id };
             match self.accept_chunk(&key, &header, &raw[payload_start..payload_end]) {
                 Some(data) => {
                     let len = data.len().min(buf.len());
                     buf[..len].copy_from_slice(&data[..len]);
                     return Ok((len, addr));
-                }
+                },
                 None => continue, // 等待更多分片
             }
         }
@@ -446,7 +429,7 @@ impl UdpIo for GeckoConn {
 // 状态操作 helper（GC task 与 accept_chunk 共用）
 // =============================================================================
 
-/** 删除一条 reassembly 表项（同步更新 per_source 计数）。 */
+/// 删除一条 reassembly 表项（同步更新 per_source 计数）。
 fn drop_entry(state: &mut GeckoState, key: &ReassemblyKey) {
     if state.reassembly.remove(key).is_some() {
         let dec = state.per_source.get_mut(&key.addr);
@@ -459,13 +442,10 @@ fn drop_entry(state: &mut GeckoState, key: &ReassemblyKey) {
     }
 }
 
-/** 全局 cap 触发时驱逐最旧（deadline 最早）的 entry（对应 Go `evictOldestLocked`）。 */
+/// 全局 cap 触发时驱逐最旧（deadline 最早）的 entry（对应 Go `evictOldestLocked`）。
 fn evict_oldest(state: &mut GeckoState) {
-    let oldest_key = state
-        .reassembly
-        .iter()
-        .min_by_key(|(_, e)| e.deadline)
-        .map(|(k, _)| k.clone());
+    let oldest_key =
+        state.reassembly.iter().min_by_key(|(_, e)| e.deadline).map(|(k, _)| k.clone());
     if let Some(k) = oldest_key {
         drop_entry(state, &k);
     }
@@ -501,12 +481,7 @@ mod tests {
     #[test]
     fn encode_decode_frame_roundtrip() {
         let payload = b"hello gecko";
-        let h = FrameHeader {
-            pad_len: 4,
-            msg_id: 7,
-            chunk_idx: 1,
-            total_chunks: 3,
-        };
+        let h = FrameHeader { pad_len: 4, msg_id: 7, chunk_idx: 1, total_chunks: 3 };
         let mut out = vec![0u8; GECKO_HEADER_SIZE + 4 + payload.len()];
         let n = encode_frame(&h, payload, &mut out).unwrap();
         assert_eq!(n, out.len());
@@ -538,12 +513,7 @@ mod tests {
 
     #[test]
     fn encode_frame_rejects_chunk_idx_ge_total() {
-        let h = FrameHeader {
-            pad_len: 0,
-            msg_id: 0,
-            chunk_idx: 3,
-            total_chunks: 3,
-        };
+        let h = FrameHeader { pad_len: 0, msg_id: 0, chunk_idx: 3, total_chunks: 3 };
         let mut out = [0u8; 16];
         assert!(encode_frame(&h, b"x", &mut out).is_err());
     }
@@ -607,9 +577,11 @@ mod tests {
         async fn send_to(&self, _: &[u8], _: SocketAddr) -> io::Result<usize> {
             Ok(0)
         }
+
         async fn recv_from(&self, _: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
             Err(io::Error::new(io::ErrorKind::Other, "mock"))
         }
+
         fn local_addr(&self) -> io::Result<SocketAddr> {
             Err(io::Error::new(io::ErrorKind::Other, "mock"))
         }
@@ -624,25 +596,16 @@ mod tests {
         let server_addr = server.local_addr().unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-        let cfg = GeckoConfig {
-            password: "roundtrip-password".into(),
-            ..Default::default()
-        };
-        let gecko_client: Box<dyn UdpIo> = cfg
-            .wrap_packet_conn_client(Box::new(client), 0, 0)
-            .unwrap();
-        let gecko_server: Box<dyn UdpIo> = cfg
-            .wrap_packet_conn_server(Box::new(server), 0, 0)
-            .unwrap();
+        let cfg = GeckoConfig { password: "roundtrip-password".into(), ..Default::default() };
+        let gecko_client: Box<dyn UdpIo> =
+            cfg.wrap_packet_conn_client(Box::new(client), 0, 0).unwrap();
+        let gecko_server: Box<dyn UdpIo> =
+            cfg.wrap_packet_conn_server(Box::new(server), 0, 0).unwrap();
 
         // QUIC 长头包：首字节 & 0x80 != 0
-        let original: Vec<u8> = std::iter::once(0x80u8)
-            .chain(std::iter::repeat_n(0xAB, 100))
-            .collect();
-        gecko_client
-            .send_to(&original, server_addr)
-            .await
-            .unwrap();
+        let original: Vec<u8> =
+            std::iter::once(0x80u8).chain(std::iter::repeat_n(0xAB, 100)).collect();
+        gecko_client.send_to(&original, server_addr).await.unwrap();
 
         let mut buf = vec![0u8; UDP_SIZE];
         let (n, _) = gecko_server.recv_from(&mut buf).await.unwrap();
@@ -657,23 +620,15 @@ mod tests {
         let server_addr = server.local_addr().unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-        let cfg = GeckoConfig {
-            password: "roundtrip-password".into(),
-            ..Default::default()
-        };
-        let gecko_client: Box<dyn UdpIo> = cfg
-            .wrap_packet_conn_client(Box::new(client), 0, 0)
-            .unwrap();
-        let gecko_server: Box<dyn UdpIo> = cfg
-            .wrap_packet_conn_server(Box::new(server), 0, 0)
-            .unwrap();
+        let cfg = GeckoConfig { password: "roundtrip-password".into(), ..Default::default() };
+        let gecko_client: Box<dyn UdpIo> =
+            cfg.wrap_packet_conn_client(Box::new(client), 0, 0).unwrap();
+        let gecko_server: Box<dyn UdpIo> =
+            cfg.wrap_packet_conn_server(Box::new(server), 0, 0).unwrap();
 
         // QUIC 短头包：首字节 & 0x80 == 0
         let original: Vec<u8> = vec![0x40, 1, 2, 3, 4, 5];
-        gecko_client
-            .send_to(&original, server_addr)
-            .await
-            .unwrap();
+        gecko_client.send_to(&original, server_addr).await.unwrap();
 
         let mut buf = vec![0u8; UDP_SIZE];
         let (n, _) = gecko_server.recv_from(&mut buf).await.unwrap();

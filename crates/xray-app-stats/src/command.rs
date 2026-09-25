@@ -1,31 +1,30 @@
 //! Stats command 服务。
 //!
 //! 对应 Go `app/stats/command/command.go`：
-//! - 7 个 RPC handler 方法（GetStats / GetStatsOnline / GetStatsOnlineIpList /
-//!   GetAllOnlineUsers / GetUsersStats / QueryStats / GetSysStats）
+//! - 7 个 RPC handler 方法（GetStats / GetStatsOnline / GetStatsOnlineIpList / GetAllOnlineUsers /
+//!   GetUsersStats / QueryStats / GetSysStats）
 //! - gRPC server 注册逻辑
 //!
 //! ## Rust 化策略（与 P4-4 proxyman 一致）
 //!
 //! - **不引入 tonic**：定义 [`StatsService`] trait 含 7 个方法
 //! - **[`DefaultStatsService`]** 持有 `Arc<dyn Manager>` 编排业务逻辑
-//! - **gRPC server 注册留 trait + 编排类**：上层 `xray-app-commander` crate
-//!   负责把 `DefaultStatsService` 注册到 tonic gRPC server（依赖 tonic crate）
+//! - **gRPC server 注册留 trait + 编排类**：上层 `xray-app-commander` crate 负责把
+//!   `DefaultStatsService` 注册到 tonic gRPC server（依赖 tonic crate）
 //!
 //! ## SysStats 数据来源
 //!
 //! Go 用 `runtime.ReadMemStats` + `runtime.NumGoroutine`，Rust 等价：
 //! - **uptime**: `Instant::now() - start_time`
 //! - **num_threads (逻辑核心)**: `std::thread::available_parallelism` 纯 std 跨平台
-//! - **mem/sys/mallocs/frees**: sysinfo/jemalloc 未接入（Windows Defender 拦截
-//!   ntapi build script，需用户加 target/ 排除路径后才可引入 sysinfo）；
-//!   需精确数据时通过 [`SysStatsProvider`] trait 注入自定义实现
+//! - **mem/sys/mallocs/frees**: sysinfo/jemalloc 未接入（Windows Defender 拦截 ntapi build
+//!   script，需用户加 target/ 排除路径后才可引入 sysinfo）； 需精确数据时通过 [`SysStatsProvider`]
+//!   trait 注入自定义实现
 //! - **num_gc/pause_total_ns**: Rust 无 GC，恒为 0
 //! - [`DefaultSysStatsProvider`]：num_threads=1（零依赖、零 syscall、轻量级）
 //! - [`StdParallelismSysStatsProvider`]：num_threads=逻辑 CPU 数（纯 std、推荐）
 
-use std::sync::Arc;
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use xray_features::stats::Manager;
 
@@ -148,9 +147,7 @@ pub struct DefaultSysStatsProvider {
 impl DefaultSysStatsProvider {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            start_time: Instant::now(),
-        }
+        Self { start_time: Instant::now() }
     }
 
     /// 显式指定起始时刻（测试用）。
@@ -200,10 +197,7 @@ impl StdParallelismSysStatsProvider {
         let logical_cpus = std::thread::available_parallelism()
             .map(|n| u32::try_from(n.get()).unwrap_or(u32::MAX))
             .unwrap_or(1);
-        Self {
-            start_time: Instant::now(),
-            logical_cpus,
-        }
+        Self { start_time: Instant::now(), logical_cpus }
     }
 
     /// 显式指定起始时刻（测试用）。
@@ -266,10 +260,8 @@ pub trait StatsService: Send + Sync {
     ) -> Result<GetUsersStatsResponse, StatsCommandError>;
 
     /// 按 pattern 模糊查询 counters。对应 Go `QueryStats`。
-    fn query_stats(
-        &self,
-        req: &QueryStatsRequest,
-    ) -> Result<QueryStatsResponse, StatsCommandError>;
+    fn query_stats(&self, req: &QueryStatsRequest)
+    -> Result<QueryStatsResponse, StatsCommandError>;
 
     /// 获取系统统计。对应 Go `GetSysStats`。
     fn get_sys_stats(&self) -> Result<SysStats, StatsCommandError>;
@@ -305,10 +297,7 @@ impl DefaultStatsService {
     /// 新建。对应 Go `NewStatsServer(manager)`。
     #[must_use]
     pub fn new(manager: Arc<dyn Manager>) -> Self {
-        Self {
-            manager,
-            sys_stats: Arc::new(DefaultSysStatsProvider::new()),
-        }
+        Self { manager, sys_stats: Arc::new(DefaultSysStatsProvider::new()) }
     }
 
     /// 显式注入 SysStatsProvider。
@@ -357,17 +346,8 @@ impl StatsService for DefaultStatsService {
             .manager
             .get_counter(&req.name)
             .ok_or_else(|| StatsCommandError::NotFound(req.name.clone()))?;
-        let value = if req.reset {
-            c.set(0)
-        } else {
-            c.value()
-        };
-        Ok(GetStatsResponse {
-            stat: Some(Stat {
-                name: req.name.clone(),
-                value,
-            }),
-        })
+        let value = if req.reset { c.set(0) } else { c.value() };
+        Ok(GetStatsResponse { stat: Some(Stat { name: req.name.clone(), value }) })
     }
 
     fn get_stats_online(
@@ -379,12 +359,7 @@ impl StatsService for DefaultStatsService {
             .get_online_map(&req.name)
             .ok_or_else(|| StatsCommandError::NotFound(req.name.clone()))?;
         let value = i64::try_from(om.count()).unwrap_or(i64::MAX);
-        Ok(GetStatsResponse {
-            stat: Some(Stat {
-                name: req.name.clone(),
-                value,
-            }),
-        })
+        Ok(GetStatsResponse { stat: Some(Stat { name: req.name.clone(), value }) })
     }
 
     fn get_stats_online_ip_list(
@@ -397,22 +372,14 @@ impl StatsService for DefaultStatsService {
             .ok_or_else(|| StatsCommandError::NotFound(req.name.clone()))?;
         let mut ips = Vec::new();
         om.for_each(&mut |ip, last_seen| {
-            ips.push(OnlineIpEntry {
-                ip: ip.to_string(),
-                last_seen,
-            });
+            ips.push(OnlineIpEntry { ip: ip.to_string(), last_seen });
             true
         });
-        Ok(GetStatsOnlineIpListResponse {
-            name: req.name.clone(),
-            ips,
-        })
+        Ok(GetStatsOnlineIpListResponse { name: req.name.clone(), ips })
     }
 
     fn get_all_online_users(&self) -> Result<GetAllOnlineUsersResponse, StatsCommandError> {
-        Ok(GetAllOnlineUsersResponse {
-            users: self.manager.get_all_online_users(),
-        })
+        Ok(GetAllOnlineUsersResponse { users: self.manager.get_all_online_users() })
     }
 
     fn get_users_stats(
@@ -430,15 +397,9 @@ impl StatsService for DefaultStatsService {
             let Some(email) = parse_user_online_map_name(name) else {
                 return true;
             };
-            let mut user = UserStat {
-                email: email.clone(),
-                ..UserStat::default()
-            };
+            let mut user = UserStat { email: email.clone(), ..UserStat::default() };
             om.for_each(&mut |ip, last_seen| {
-                user.ips.push(OnlineIpEntry {
-                    ip: ip.to_string(),
-                    last_seen,
-                });
+                user.ips.push(OnlineIpEntry { ip: ip.to_string(), last_seen });
                 true
             });
             if !user.ips.is_empty() {
@@ -478,10 +439,7 @@ impl StatsService for DefaultStatsService {
         self.manager.visit_counters(&mut |name, c| {
             if name.contains(req.pattern.as_str()) {
                 let value = if req.reset { c.set(0) } else { c.value() };
-                stats.push(Stat {
-                    name: name.to_string(),
-                    value,
-                });
+                stats.push(Stat { name: name.to_string(), value });
             }
             true
         });
@@ -495,9 +453,10 @@ impl StatsService for DefaultStatsService {
 
 #[cfg(test)]
 mod tests {
+    use xray_features::stats::Manager as _;
+
     use super::*;
-    use crate::manager::Manager;
-    use xray_features::stats::Manager as _; // trait method in scope
+    use crate::manager::Manager; // trait method in scope
 
     fn make_service_with_setup<F: FnOnce(&Manager)>(setup: F) -> DefaultStatsService {
         let m = Manager::new();
@@ -517,8 +476,7 @@ mod tests {
 
     #[test]
     fn parse_user_traffic_downlink() {
-        let (email, is_up) =
-            parse_user_traffic_name("user>>>bob>>>traffic>>>downlink").unwrap();
+        let (email, is_up) = parse_user_traffic_name("user>>>bob>>>traffic>>>downlink").unwrap();
         assert_eq!(email, "bob");
         assert!(!is_up);
     }
@@ -566,33 +524,19 @@ mod tests {
             let c = m.register_counter("c").unwrap();
             c.add(50);
         });
-        let resp = svc
-            .get_stats(&GetStatsRequest {
-                name: "c".into(),
-                reset: true,
-            })
-            .unwrap();
+        let resp = svc.get_stats(&GetStatsRequest { name: "c".into(), reset: true }).unwrap();
         // reset 后返回原值
         assert_eq!(resp.stat.unwrap().value, 50);
         // 再次取应是 0
-        let resp2 = svc
-            .get_stats(&GetStatsRequest {
-                name: "c".into(),
-                reset: false,
-            })
-            .unwrap();
+        let resp2 = svc.get_stats(&GetStatsRequest { name: "c".into(), reset: false }).unwrap();
         assert_eq!(resp2.stat.unwrap().value, 0);
     }
 
     #[test]
     fn get_stats_not_found() {
         let svc = make_service_with_setup(|_| {});
-        let err = svc
-            .get_stats(&GetStatsRequest {
-                name: "missing".into(),
-                reset: false,
-            })
-            .unwrap_err();
+        let err =
+            svc.get_stats(&GetStatsRequest { name: "missing".into(), reset: false }).unwrap_err();
         assert!(matches!(err, StatsCommandError::NotFound(_)));
     }
 
@@ -606,10 +550,7 @@ mod tests {
             om.add_ip("10.0.0.2");
         });
         let resp = svc
-            .get_stats_online(&GetStatsRequest {
-                name: "user>>>u>>>ip".into(),
-                reset: false,
-            })
+            .get_stats_online(&GetStatsRequest { name: "user>>>u>>>ip".into(), reset: false })
             .unwrap();
         assert_eq!(resp.stat.unwrap().value, 2);
     }
@@ -617,12 +558,8 @@ mod tests {
     #[test]
     fn get_stats_online_not_found() {
         let svc = make_service_with_setup(|_| {});
-        let err = svc
-            .get_stats_online(&GetStatsRequest {
-                name: "x".into(),
-                reset: false,
-            })
-            .unwrap_err();
+        let err =
+            svc.get_stats_online(&GetStatsRequest { name: "x".into(), reset: false }).unwrap_err();
         assert!(matches!(err, StatsCommandError::NotFound(_)));
     }
 
@@ -636,10 +573,7 @@ mod tests {
             om.add_ip("10.0.0.2");
         });
         let resp = svc
-            .get_stats_online_ip_list(&GetStatsRequest {
-                name: "u".into(),
-                reset: false,
-            })
+            .get_stats_online_ip_list(&GetStatsRequest { name: "u".into(), reset: false })
             .unwrap();
         assert_eq!(resp.name, "u");
         assert_eq!(resp.ips.len(), 2);
@@ -671,16 +605,11 @@ mod tests {
             om.add_ip("10.0.0.1");
             om.add_ip("10.0.0.2");
             // 注册一些 counter，但 include_traffic=false 不查
-            let up = m
-                .register_counter("user>>>alice>>>traffic>>>uplink")
-                .unwrap();
+            let up = m.register_counter("user>>>alice>>>traffic>>>uplink").unwrap();
             up.add(1024);
         });
         let resp = svc
-            .get_users_stats(&GetUsersStatsRequest {
-                include_traffic: false,
-                reset: false,
-            })
+            .get_users_stats(&GetUsersStatsRequest { include_traffic: false, reset: false })
             .unwrap();
         assert_eq!(resp.users.len(), 1);
         let u = &resp.users[0];
@@ -695,20 +624,13 @@ mod tests {
         let svc = make_service_with_setup(|m| {
             let om = m.register_online_map("user>>>bob>>>ip").unwrap();
             om.add_ip("10.0.0.5");
-            let up = m
-                .register_counter("user>>>bob>>>traffic>>>uplink")
-                .unwrap();
+            let up = m.register_counter("user>>>bob>>>traffic>>>uplink").unwrap();
             up.add(100);
-            let down = m
-                .register_counter("user>>>bob>>>traffic>>>downlink")
-                .unwrap();
+            let down = m.register_counter("user>>>bob>>>traffic>>>downlink").unwrap();
             down.add(200);
         });
         let resp = svc
-            .get_users_stats(&GetUsersStatsRequest {
-                include_traffic: true,
-                reset: false,
-            })
+            .get_users_stats(&GetUsersStatsRequest { include_traffic: true, reset: false })
             .unwrap();
         let u = &resp.users[0];
         assert_eq!(u.email, "bob");
@@ -721,26 +643,18 @@ mod tests {
         let svc = make_service_with_setup(|m| {
             let om = m.register_online_map("user>>>c>>>ip").unwrap();
             om.add_ip("1.1.1.1");
-            let up = m
-                .register_counter("user>>>c>>>traffic>>>uplink")
-                .unwrap();
+            let up = m.register_counter("user>>>c>>>traffic>>>uplink").unwrap();
             up.add(999);
         });
         let resp = svc
-            .get_users_stats(&GetUsersStatsRequest {
-                include_traffic: true,
-                reset: true,
-            })
+            .get_users_stats(&GetUsersStatsRequest { include_traffic: true, reset: true })
             .unwrap();
         let u = &resp.users[0];
         assert_eq!(u.uplink, 999, "reset 必须返回重置前的值");
 
         // 再查应该 0
         let resp2 = svc
-            .get_users_stats(&GetUsersStatsRequest {
-                include_traffic: true,
-                reset: false,
-            })
+            .get_users_stats(&GetUsersStatsRequest { include_traffic: true, reset: false })
             .unwrap();
         let u2 = &resp2.users[0];
         assert_eq!(u2.uplink, 0);
@@ -753,10 +667,7 @@ mod tests {
             // 无 add_ip → count=0
         });
         let resp = svc
-            .get_users_stats(&GetUsersStatsRequest {
-                include_traffic: false,
-                reset: false,
-            })
+            .get_users_stats(&GetUsersStatsRequest { include_traffic: false, reset: false })
             .unwrap();
         assert!(resp.users.is_empty());
     }
@@ -771,10 +682,7 @@ mod tests {
             m.register_counter("user>>>b>>>traffic>>>uplink").unwrap();
         });
         let resp = svc
-            .query_stats(&QueryStatsRequest {
-                pattern: "a>>>traffic".into(),
-                reset: false,
-            })
+            .query_stats(&QueryStatsRequest { pattern: "a>>>traffic".into(), reset: false })
             .unwrap();
         assert_eq!(resp.stats.len(), 2);
     }
@@ -785,12 +693,8 @@ mod tests {
             m.register_counter("x").unwrap();
             m.register_counter("y").unwrap();
         });
-        let resp = svc
-            .query_stats(&QueryStatsRequest {
-                pattern: "".into(),
-                reset: false,
-            })
-            .unwrap();
+        let resp =
+            svc.query_stats(&QueryStatsRequest { pattern: "".into(), reset: false }).unwrap();
         assert_eq!(resp.stats.len(), 2);
     }
 
@@ -800,20 +704,12 @@ mod tests {
             let c = m.register_counter("c").unwrap();
             c.add(7);
         });
-        let resp = svc
-            .query_stats(&QueryStatsRequest {
-                pattern: "c".into(),
-                reset: true,
-            })
-            .unwrap();
+        let resp =
+            svc.query_stats(&QueryStatsRequest { pattern: "c".into(), reset: true }).unwrap();
         assert_eq!(resp.stats[0].value, 7);
         // 再查应是 0
-        let resp2 = svc
-            .query_stats(&QueryStatsRequest {
-                pattern: "c".into(),
-                reset: false,
-            })
-            .unwrap();
+        let resp2 =
+            svc.query_stats(&QueryStatsRequest { pattern: "c".into(), reset: false }).unwrap();
         assert_eq!(resp2.stats[0].value, 0);
     }
 
@@ -856,7 +752,8 @@ mod tests {
 
     #[test]
     fn default_stats_service_as_trait_object() {
-        let svc: Arc<dyn StatsService> = Arc::new(DefaultStatsService::new(Arc::new(Manager::new())));
+        let svc: Arc<dyn StatsService> =
+            Arc::new(DefaultStatsService::new(Arc::new(Manager::new())));
         let resp = svc.get_all_online_users().unwrap();
         assert!(resp.users.is_empty());
     }
@@ -872,14 +769,8 @@ mod tests {
 
     #[test]
     fn stat_equality() {
-        let a = Stat {
-            name: "x".into(),
-            value: 10,
-        };
-        let b = Stat {
-            name: "x".into(),
-            value: 10,
-        };
+        let a = Stat { name: "x".into(), value: 10 };
+        let b = Stat { name: "x".into(), value: 10 };
         assert_eq!(a, b);
     }
 
@@ -890,11 +781,7 @@ mod tests {
         struct CustomProvider;
         impl SysStatsProvider for CustomProvider {
             fn snapshot(&self) -> SysStats {
-                SysStats {
-                    uptime_seconds: 999,
-                    num_gc: 5,
-                    ..SysStats::default()
-                }
+                SysStats { uptime_seconds: 999, num_gc: 5, ..SysStats::default() }
             }
         }
         let arc: Arc<dyn SysStatsProvider> = Arc::new(CustomProvider);

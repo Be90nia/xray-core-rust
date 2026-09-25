@@ -6,22 +6,24 @@
 //! 验证 TCP 拨号端到端可用。桥接 `transport::Link`（link.reader/writer ↔ Connection）
 //! 与 Domain DNS 解析留切片3。
 
-use xray_app_proxyman::outbound::proxy_outbound::{OutboundDialer, ProxyOutbound};
-use xray_app_proxyman::error::ProxymanError;
-use xray_transport::bridge::bridge_link_with_stream_full_default;
-use xray_transport::build_proxy_header;
-use xray_transport::link::Link;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use async_trait::async_trait;
-use xray_common::net::destination::Destination;
-use xray_common::session::Session;
-use xray_features::outbound::{OutboundError, OutboundHandler};
-use xray_transport::sockopt::SocketOptions;
-use xray_transport::system_dialer::dial_system;
+use std::{net::SocketAddr, sync::Arc};
 
-use crate::config::{Config, FinalRule, DefaultRuleType, RuleAction, get_default_rule_type};
-use crate::fragment::FragmentConnection;
+use async_trait::async_trait;
+use xray_app_proxyman::{
+    error::ProxymanError,
+    outbound::proxy_outbound::{OutboundDialer, ProxyOutbound},
+};
+use xray_common::{net::destination::Destination, session::Session};
+use xray_features::outbound::{OutboundError, OutboundHandler};
+use xray_transport::{
+    bridge::bridge_link_with_stream_full_default, build_proxy_header, link::Link,
+    sockopt::SocketOptions, system_dialer::dial_system,
+};
+
+use crate::{
+    config::{Config, DefaultRuleType, FinalRule, RuleAction, get_default_rule_type},
+    fragment::FragmentConnection,
+};
 
 /// Freedom 出站 Handler。
 ///
@@ -40,17 +42,9 @@ impl FreedomHandler {
     /// 构造 Freedom Handler，并预构建 final rules。
     #[must_use]
     pub fn new(tag: impl Into<String>, config: Config) -> Self {
-        let final_rules = config
-            .final_rules
-            .iter()
-            .filter_map(|rc| FinalRule::build(rc).ok())
-            .collect();
-        Self {
-            tag: tag.into(),
-            final_rules,
-            default_rule_type: None,
-            config,
-        }
+        let final_rules =
+            config.final_rules.iter().filter_map(|rc| FinalRule::build(rc).ok()).collect();
+        Self { tag: tag.into(), final_rules, default_rule_type: None, config }
     }
 
     /// 显式设置默认规则类型（覆盖 session 推导）。对应 Go `getDefaultFinalRule`
@@ -121,7 +115,6 @@ impl FreedomHandler {
         crate::config::match_final_rules(&self.final_rules, default_rule, dest)
     }
 
-
     /// 黑洞处理：阻塞读取上游数据并丢弃，最多等待 `block_delay`，然后关闭下游。
     ///
     /// 对应 Go `Process` 中 `blockedDest != nil` 分支——不拨号，drain input→Discard，
@@ -190,8 +183,9 @@ impl ProxyOutbound for FreedomHandler {
         link: Link,
         dialer: Arc<dyn OutboundDialer>,
     ) -> Result<(), ProxymanError> {
-        let dest = session.destination()
-            .ok_or_else(|| ProxymanError::Other("freedom: no destination in session".to_string()))?;
+        let dest = session.destination().ok_or_else(|| {
+            ProxymanError::Other("freedom: no destination in session".to_string())
+        })?;
 
         // FinalRule 预检：命中 Block → 黑洞（blockDelay + drain），不拨号
         // （对应 Go matchFinalRule Block 分支）。解析仅服务预检，不改写拨号目标。
@@ -204,29 +198,25 @@ impl ProxyOutbound for FreedomHandler {
         }
 
         // 拨号恒用原始目标（#6058：Go :339 dialer.Dial(destination)，域名由 dialer 解析）。
-        let mut conn = dialer.dial(&dest).await
-            .map_err(|e| ProxymanError::OutboundProcessFailed(format!("freedom dial failed: {e}")))?;
+        let mut conn = dialer.dial(&dest).await.map_err(|e| {
+            ProxymanError::OutboundProcessFailed(format!("freedom dial failed: {e}"))
+        })?;
 
         // PROXY protocol：在拨号连接上写入 PROXY header（v1/v2）。
         // 对应 Go `proxyproto.HeaderProxyFromAddrs(version, srcAddr, dstAddr)`。
         if self.config.proxy_protocol == 1 || self.config.proxy_protocol == 2 {
-            let src = session
-                .source()
-                .and_then(|d| d.address().ip())
-                .map(|ip| SocketAddr::new(ip, 0));
-            let dst = conn
-                .remote_addr()
-                .ok()
-                .flatten();
+            let src =
+                session.source().and_then(|d| d.address().ip()).map(|ip| SocketAddr::new(ip, 0));
+            let dst = conn.remote_addr().ok().flatten();
             if let (Some(src), Some(dst)) = (src, dst) {
                 let header = build_proxy_header(self.config.proxy_protocol as u8, src, dst);
                 if !header.is_empty() {
                     use tokio::io::AsyncWriteExt;
                     if let Err(e) = conn.as_mut().write_all(&header).await {
                         tracing::warn!(tag = %self.tag, error = %e, "freedom: PROXY protocol write failed");
-                        return Err(ProxymanError::OutboundProcessFailed(
-                            format!("PROXY protocol write failed: {e}"),
-                        ));
+                        return Err(ProxymanError::OutboundProcessFailed(format!(
+                            "PROXY protocol write failed: {e}"
+                        )));
                     }
                     tracing::debug!(
                         tag = %self.tag,
@@ -255,15 +245,12 @@ impl ProxyOutbound for FreedomHandler {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
+    use tokio::{io::AsyncWriteExt, net::TcpListener};
+    use xray_common::net::{address::Address, network::Network, port::Port};
+
     use super::*;
-    use xray_common::net::address::Address;
-    use xray_common::net::network::Network;
-    use xray_common::net::port::Port;
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
 
     fn make_ip_dest(ip: &str, port: u16) -> Destination {
         let addr: std::net::IpAddr = ip.parse().unwrap();
@@ -275,11 +262,7 @@ mod tests {
     }
 
     fn make_domain_dest(host: &str, port: u16) -> Destination {
-        Destination::new(
-            Address::Domain(host.to_string()),
-            Port::new(port),
-            Network::TCP,
-        )
+        Destination::new(Address::Domain(host.to_string()), Port::new(port), Network::TCP)
     }
 
     #[test]
@@ -329,7 +312,7 @@ mod tests {
     async fn dial_to_domain_resolves_at_dial_layer_and_dials() {
         // #6058：域名目标 handler 不再预解析，由 dial_system 按 domainStrategy
         // 解析（FakeDns 脚本确定性返回 127.0.0.1）→ 连接本地监听成功。
-        use crate::test_support::{install, uninstall, FakeDns, FAKE_DNS_LOCK};
+        use crate::test_support::{FAKE_DNS_LOCK, FakeDns, install, uninstall};
         let _g = FAKE_DNS_LOCK.lock();
         let fake = FakeDns::ips(vec![vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]]);
         install(&fake);
@@ -347,13 +330,11 @@ mod tests {
         let h = FreedomHandler::new("test", config);
         let dest = make_domain_dest("dualstack.test", addr.port());
         let session = Session::new();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            h.dial(&dest, &session),
-        ).await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), h.dial(&dest, &session)).await;
 
         match result {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {},
             Ok(Err(e)) => panic!("dial via dial-layer resolution failed: {e}"),
             Err(_) => eprintln!("SKIP: dial timed out"),
         }
@@ -368,17 +349,15 @@ mod tests {
         let h = FreedomHandler::new("test", Config::default());
         let dest = make_domain_dest("this-domain-does-not-exist-xyz.invalid", 80);
         let session = Session::new();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            h.dial(&dest, &session),
-        ).await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), h.dial(&dest, &session)).await;
         match result {
-            Ok(Err(_)) => {}
+            Ok(Err(_)) => {},
             Ok(Ok(())) => panic!("expected error for invalid domain"),
             Err(_) => {
                 // DNS 超时也算失败（NXDOMAIN 应该很快返回）
                 eprintln!("SKIP: DNS resolution timed out for invalid domain");
-            }
+            },
         }
     }
 
@@ -416,7 +395,7 @@ mod tests {
     /// #6058 预检：域名经策略解析命中 Block（10.0.0.0/8）→ dial 报阻断，不拨号。
     #[tokio::test]
     async fn dial_blocked_when_domain_resolves_to_blocked_ip() {
-        use crate::test_support::{install, uninstall, FakeDns, FAKE_DNS_LOCK};
+        use crate::test_support::{FAKE_DNS_LOCK, FakeDns, install, uninstall};
         let _g = FAKE_DNS_LOCK.lock();
         let fake = FakeDns::ips(vec![vec![std::net::IpAddr::V4("10.0.0.1".parse().unwrap())]]);
         install(&fake);
@@ -442,7 +421,7 @@ mod tests {
     /// （FakeDns 仅被拨号层查询 1 次），拨号正常（Go :294-295 条件门控）。
     #[tokio::test]
     async fn dial_domain_without_rules_skips_precheck_resolution() {
-        use crate::test_support::{install, uninstall, FakeDns, FAKE_DNS_LOCK};
+        use crate::test_support::{FAKE_DNS_LOCK, FakeDns, install, uninstall};
         let _g = FAKE_DNS_LOCK.lock();
         let fake = FakeDns::ips(vec![vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]]);
         install(&fake);
@@ -460,13 +439,10 @@ mod tests {
         let h = FreedomHandler::new("test", config);
         let dest = make_domain_dest("localhost", addr.port());
         let session = Session::new();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            h.dial(&dest, &session),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), h.dial(&dest, &session)).await;
         match result {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {},
             Ok(Err(e)) => panic!("dial should succeed: {e}"),
             Err(_) => eprintln!("SKIP: dial timed out"),
         }
@@ -483,7 +459,7 @@ mod tests {
     /// 未命中 Block → 拨号照常成功。
     #[tokio::test]
     async fn dial_domain_with_rules_prechecks_then_dials() {
-        use crate::test_support::{install, uninstall, FakeDns, FAKE_DNS_LOCK};
+        use crate::test_support::{FAKE_DNS_LOCK, FakeDns, install, uninstall};
         let _g = FAKE_DNS_LOCK.lock();
         let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
         let fake = FakeDns::ips(vec![vec![ip], vec![ip]]);
@@ -507,13 +483,10 @@ mod tests {
         let h = FreedomHandler::new("test", config);
         let dest = make_domain_dest("localhost", addr.port());
         let session = Session::new();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            h.dial(&dest, &session),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), h.dial(&dest, &session)).await;
         match result {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {},
             Ok(Err(e)) => panic!("dial should succeed: {e}"),
             Err(_) => eprintln!("SKIP: dial timed out"),
         }

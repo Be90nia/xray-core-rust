@@ -5,7 +5,7 @@
 
 use parking_lot::Mutex;
 
-use crate::config::{OutboundStatus, ProbeResult, DEAD_DELAY_MS};
+use crate::config::{DEAD_DELAY_MS, OutboundStatus, ProbeResult};
 
 /// StatusStore：线程安全的 outbound 状态集合。
 pub struct StatusStore {
@@ -14,9 +14,7 @@ pub struct StatusStore {
 
 impl StatusStore {
     pub fn new() -> Self {
-        Self {
-            inner: Mutex::new(Vec::new()),
-        }
+        Self { inner: Mutex::new(Vec::new()) }
     }
 
     /// 当前快照（clone 所有 status）。
@@ -37,10 +35,7 @@ impl StatusStore {
     ///
     /// 对应 Go `findStatusLocationLockHolderOnly`。
     pub fn find_location(&self, outbound_tag: &str) -> Option<usize> {
-        self.inner
-            .lock()
-            .iter()
-            .position(|s| s.outbound_tag == outbound_tag)
+        self.inner.lock().iter().position(|s| s.outbound_tag == outbound_tag)
     }
 
     /// 用 ProbeResult 更新指定 outbound 的 status。
@@ -65,7 +60,7 @@ impl StatusStore {
             None => {
                 g.push(OutboundStatus::default());
                 g.len() - 1
-            }
+            },
         };
 
         let status = &mut g[idx];
@@ -102,19 +97,11 @@ mod tests {
     use super::*;
 
     fn result_alive(delay: i64) -> ProbeResult {
-        ProbeResult {
-            alive: true,
-            delay,
-            last_error_reason: String::new(),
-        }
+        ProbeResult { alive: true, delay, last_error_reason: String::new() }
     }
 
     fn result_dead(reason: &str) -> ProbeResult {
-        ProbeResult {
-            alive: false,
-            delay: 0,
-            last_error_reason: reason.into(),
-        }
+        ProbeResult { alive: false, delay: 0, last_error_reason: reason.into() }
     }
 
     #[test]

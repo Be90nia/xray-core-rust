@@ -4,9 +4,7 @@
 //! - `KeyLogWriterFromConfig`：master key log 文件打开
 //! - `getPathLocked`：从路径集合中选一条（spider 模式 fallback）
 
-use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::path::Path;
+use std::{collections::HashMap, fs::OpenOptions, path::Path};
 
 /// 打开 master key log 文件。
 ///
@@ -22,12 +20,7 @@ pub fn open_key_log_writer<P: AsRef<Path>>(path: P) -> Option<std::fs::File> {
     if s.is_empty() || s == "none" {
         return None;
     }
-    OpenOptions::new()
-        .create(true)
-        .read(true)
-        .append(true)
-        .open(p)
-        .ok()
+    OpenOptions::new().create(true).read(true).append(true).open(p).ok()
 }
 
 /// spider 模式从路径集合中选一条。
@@ -65,8 +58,7 @@ pub fn find_oid_0_0_extension(cert_der: &[u8]) -> Option<(usize, usize)> {
     const OID_0_0: [u8; 3] = [0x06, 0x01, 0x00];
     let mut from = 0usize;
     while from + OID_0_0.len() <= cert_der.len() {
-        let Some(rel) = cert_der[from..].windows(OID_0_0.len()).position(|w| w == OID_0_0)
-        else {
+        let Some(rel) = cert_der[from..].windows(OID_0_0.len()).position(|w| w == OID_0_0) else {
             return None;
         };
         // extnID 之后紧跟 extnValue = OCTET STRING（tag 0x04）
@@ -119,10 +111,8 @@ mod tests {
 
     #[test]
     fn open_key_log_writer_creates_file() {
-        let path = std::env::temp_dir().join(format!(
-            "xray_reality_test_{}.keylog",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("xray_reality_test_{}.keylog", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let f = open_key_log_writer(&path);
         assert!(f.is_some(), "should create file");

@@ -27,7 +27,12 @@ const SO_REUSEPORT: libc::c_int = 0x00000200;
 /// FreeBSD `SO_REUSEPORT_LB`（sys/socket.h，0x10000）。对应 Go `soReUsePortLB`。
 const SO_REUSEPORT_LB: libc::c_int = 0x00010000;
 
-fn setsockopt_int(fd: libc::c_int, level: libc::c_int, optname: libc::c_int, val: libc::c_int) -> io::Result<()> {
+fn setsockopt_int(
+    fd: libc::c_int,
+    level: libc::c_int,
+    optname: libc::c_int,
+    val: libc::c_int,
+) -> io::Result<()> {
     // SAFETY: fd 为有效 socket fd（调用方来自 socket2::Socket::as_raw_fd）；
     // optval 指向栈上 c_int，optlen 与类型一致；内核不保留指针。
     let ret = unsafe {
@@ -39,11 +44,7 @@ fn setsockopt_int(fd: libc::c_int, level: libc::c_int, optname: libc::c_int, val
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         )
     };
-    if ret < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    if ret < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -67,11 +68,7 @@ impl FreebsdSockOpt {
     /// FreeBSD 平台分支（sockopt_freebsd.go:127-223）。
     pub fn apply(&self, fd: i32) -> io::Result<()> {
         if self.tcp_fast_open >= 0 {
-            let tfo = if !self.inbound && self.tcp_fast_open > 0 {
-                1
-            } else {
-                self.tcp_fast_open
-            };
+            let tfo = if !self.inbound && self.tcp_fast_open > 0 { 1 } else { self.tcp_fast_open };
             setsockopt_int(fd, libc::IPPROTO_TCP, TCP_FASTOPEN, tfo)?;
         }
 
@@ -99,11 +96,17 @@ impl FreebsdSockOpt {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::os::fd::AsRawFd;
 
+    use super::*;
+
     fn udp_socket() -> socket2::Socket {
-        socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, Some(socket2::Protocol::UDP)).unwrap()
+        socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap()
     }
 
     /// SO_REUSEPORT_LB→SO_REUSEPORT 回退后的可观测行为：两个 socket 可绑同一地址。
@@ -124,7 +127,12 @@ mod tests {
     /// FreeBSD 回环 TCP socket 上 TCP_FASTOPEN 读写皆支持。
     #[test]
     fn tfo_tri_state_on_tcp_socket() {
-        let tcp = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP)).unwrap();
+        let tcp = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
         // 未配置：跳过（apply 仍 Ok）。
         let unconfigured = FreebsdSockOpt { tcp_fast_open: -1, ..Default::default() };
         assert!(unconfigured.apply(tcp.as_raw_fd()).is_ok());
@@ -134,7 +142,15 @@ mod tests {
         let mut val: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
         // SAFETY: getsockopt 读回栈上 c_int，len 与类型一致。
-        unsafe { libc::getsockopt(tcp.as_raw_fd(), libc::IPPROTO_TCP, TCP_FASTOPEN, &mut val as *mut _ as *mut libc::c_void, &mut len) };
+        unsafe {
+            libc::getsockopt(
+                tcp.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                TCP_FASTOPEN,
+                &mut val as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
         assert_eq!(val, 1, "出站 TFO 应 clamp 为 1（sockopt_freebsd.go:136-138）");
     }
 
@@ -144,8 +160,8 @@ mod tests {
         let opt = FreebsdSockOpt { mark: 0x1234, ..Default::default() };
         let s = udp_socket();
         match opt.apply(s.as_raw_fd()) {
-            Ok(()) => {}
-            Err(e) if e.raw_os_error() == Some(libc::EPERM) => {}
+            Ok(()) => {},
+            Err(e) if e.raw_os_error() == Some(libc::EPERM) => {},
             Err(e) => panic!("set SO_USER_COOKIE failed: {e}"),
         }
     }

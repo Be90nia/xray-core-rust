@@ -150,7 +150,12 @@ mod tests {
         let setter = TestSetter::new();
         let clock: Arc<dyn super::super::bbr::Clock> =
             Arc::new(crate::congestion_swappable::bbr::DefaultClock::new());
-        use_bbr(&setter, clock, crate::congestion_swappable::types::INITIAL_PACKET_SIZE, Profile::Standard);
+        use_bbr(
+            &setter,
+            clock,
+            crate::congestion_swappable::types::INITIAL_PACKET_SIZE,
+            Profile::Standard,
+        );
         assert!(setter.was_set());
     }
 

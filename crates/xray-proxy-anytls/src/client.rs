@@ -12,24 +12,21 @@
 //!
 //! 协议参考：[anytls-go protocol.md](https://github.com/anytls/anytls-go)。
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use anytls::core::{Command, Frame};
-use anytls::proxy::session::{Client as AnytlsClientInner, DEFAULT_SID};
-use anytls::runtime::DefaultPaddingFactory;
-use anytls::{AsyncReadWrite, DialOutFunc};
+use anytls::{
+    AsyncReadWrite, DialOutFunc,
+    core::{Command, Frame},
+    proxy::session::{Client as AnytlsClientInner, DEFAULT_SID},
+    runtime::DefaultPaddingFactory,
+};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio_rustls::TlsConnector;
-
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::port::Port;
+use xray_common::net::{address::Address, destination::Destination, port::Port};
 use xray_transport::sockopt::SocketOptions;
 
-use crate::error::Result;
-use crate::socks::SocksAddr;
+use crate::{error::Result, socks::SocksAddr};
 
 /// `host:port` → Destination：IP 字面量直取，其余按域名（解析下沉 dial_system）。
 /// IPv6 必须用 `[..]:port` 完整括号形态；裸 IPv6（无括号）与单边括号一律
@@ -56,7 +53,7 @@ fn server_destination(server_addr: &str) -> std::io::Result<Destination> {
                 std::io::ErrorKind::InvalidInput,
                 format!("anytls server_addr malformed bracket form: {server_addr}"),
             ));
-        }
+        },
     };
     if host.contains(':') && host.parse::<std::net::Ipv6Addr>().is_err() {
         return Err(std::io::Error::new(
@@ -157,17 +154,12 @@ impl AnytlsClient {
                 let dest = server_destination(&server_addr)?;
                 let tcp = xray_transport::system_dialer::dial_system(&dest, &sockopt).await?;
                 let connector = TlsConnector::from(tls_config);
-                let server_name =
-                    rustls::pki_types::ServerName::try_from(sni.clone())
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                let server_name = rustls::pki_types::ServerName::try_from(sni.clone())
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
                 let mut tls = connector.connect(server_name, tcp).await?;
                 let padding_len = {
                     let factory = padding.read().await;
-                    factory
-                        .generate_record_payload_sizes(0)
-                        .first()
-                        .copied()
-                        .unwrap_or(0) as u16
+                    factory.generate_record_payload_sizes(0).first().copied().unwrap_or(0) as u16
                 };
                 let auth_frame = build_auth_frame(&password_sha256, padding_len);
                 tls.write_all(&auth_frame).await?;
@@ -193,9 +185,7 @@ impl AnytlsClient {
         // 补发 cmdSYN：anytls-rs 0.3.x 单流模式不再自动发 SYN，但 sing-box/anytls-go
         // server 为多路复用语义——须收到 cmdSYN(sid=1) 才打开流，否则 Psh 被静默忽略。
         // 帧序 Settings → SYN → PSH(socks target)，对齐 protocol.md packet 1 定义。
-        stream
-            .write_frame(Frame::new(Command::Syn, DEFAULT_SID))
-            .await?;
+        stream.write_frame(Frame::new(Command::Syn, DEFAULT_SID)).await?;
         // 协议要求：客户端在 stream 首帧写 SOCKS5 格式目标地址
         let socks_bytes = target.encode()?;
         stream.write(&socks_bytes).await?;
@@ -203,10 +193,7 @@ impl AnytlsClient {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
         let pump = tokio::spawn(pump_stream(stream, server_io));
 
-        Ok(AnytlsConn {
-            inner: client_io,
-            _pump: pump,
-        })
+        Ok(AnytlsConn { inner: client_io, _pump: pump })
     }
 
     /// 关闭客户端，回收所有 session 池资源。
@@ -262,10 +249,7 @@ impl AsyncWrite for AnytlsConn {
 /// 双向桥接 anytls `Session` 与 `tokio::io::duplex` 的 server 端。
 ///
 /// 任何一端 EOF 或出错都终止。
-async fn pump_stream(
-    session: Arc<anytls::proxy::session::Session>,
-    server_io: DuplexStream,
-) {
+async fn pump_stream(session: Arc<anytls::proxy::session::Session>, server_io: DuplexStream) {
     let (mut rd, mut wr) = tokio::io::split(server_io);
     let session_clone = session.clone();
     let down = async move {
@@ -278,11 +262,11 @@ async fn pump_stream(
                         tracing::debug!("pump session→duplex write error: {e}");
                         break;
                     }
-                }
+                },
                 Err(e) => {
                     tracing::debug!("pump session→duplex read error: {e}");
                     break;
-                }
+                },
             }
         }
         let _ = wr.shutdown().await;
@@ -297,11 +281,11 @@ async fn pump_stream(
                         tracing::debug!("pump duplex→session write error: {e}");
                         break;
                     }
-                }
+                },
                 Err(e) => {
                     tracing::debug!("pump duplex→session read error: {e}");
                     break;
-                }
+                },
             }
         }
         // 流结束按协议发 FIN + 标记本地半关（anytls-go Pipe 关闭语义）。禁止在此
@@ -309,9 +293,7 @@ async fn pump_stream(
         // TLS read 的 recv_loop），服务端永远不知道流已结束 → 双端 TLS fd 挂死在
         // 活跃 sessions map（s9 压测 fd +5222/min 根因）。会话 fd 的最终释放由
         // 服务端收到 FIN 后关闭底层连接驱动（server.rs finish_session）。
-        let _ = session
-            .write_frame(Frame::new(Command::Fin, DEFAULT_SID))
-            .await;
+        let _ = session.write_frame(Frame::new(Command::Fin, DEFAULT_SID)).await;
         let _ = session.mark_local_stream_closed(DEFAULT_SID).await;
     };
     tokio::join!(down, up);

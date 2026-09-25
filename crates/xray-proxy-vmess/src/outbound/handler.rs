@@ -10,9 +10,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use xray_common::protocol::RequestHeader;
 
-use crate::account::MemoryAccount;
-use crate::encoding::client::ClientSession;
-use crate::error::{Result, VmessError};
+use crate::{
+    account::MemoryAccount,
+    encoding::client::ClientSession,
+    error::{Result, VmessError},
+};
 
 /// Outbound 处理器主入口 trait（对应 Go `outbound.Handler.Process`）。
 ///
@@ -44,7 +46,9 @@ impl OutboundProcessor for NoopOutboundProcessor {
         _header: &RequestHeader,
         _account: &MemoryAccount,
     ) -> Result<()> {
-        Err(VmessError::NotImplemented("outbound process: requires transport::Link + retry + signal chain"))
+        Err(VmessError::NotImplemented(
+            "outbound process: requires transport::Link + retry + signal chain",
+        ))
     }
 }
 
@@ -62,18 +66,12 @@ impl OutboundHandler {
     /// 创建新 handler。
     #[must_use]
     pub fn new(account: MemoryAccount) -> Self {
-        Self {
-            account,
-            processor: Arc::new(NoopOutboundProcessor),
-        }
+        Self { account, processor: Arc::new(NoopOutboundProcessor) }
     }
 
     /// 用自定义 processor 创建。
     #[must_use]
-    pub fn with_processor(
-        account: MemoryAccount,
-        processor: Arc<dyn OutboundProcessor>,
-    ) -> Self {
+    pub fn with_processor(account: MemoryAccount, processor: Arc<dyn OutboundProcessor>) -> Self {
         Self { account, processor }
     }
 
@@ -103,12 +101,13 @@ impl OutboundHandler {
 
 #[cfg(test)]
 mod tests {
+    use xray_common::{
+        net::{address::Address, destination::Destination, port::Port},
+        protocol::{Command, SecurityType},
+        uuid::UUID,
+    };
+
     use super::*;
-    use xray_common::net::address::Address;
-    use xray_common::net::destination::Destination;
-    use xray_common::net::port::Port;
-    use xray_common::protocol::{Command, SecurityType};
-    use xray_common::uuid::UUID;
 
     fn sample_account() -> MemoryAccount {
         MemoryAccount::new(UUID::parse("66ad4540-b58c-4ad2-9926-ea63445a9b57").expect("uuid"))

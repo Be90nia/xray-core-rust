@@ -6,18 +6,22 @@
 //! - `RegisterX` 重名返回 [`ManagerError::AlreadyRegistered`]
 //! - `VisitX` / `GetX` 在读锁内回调
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-
-use parking_lot::RwLock;
-use xray_features::stats::{
-    Channel, Counter, Manager as ManagerTrait, ManagerError, OnlineMap,
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
-use crate::channel::{ChannelConfig, StatsChannel};
-use crate::counter::Counter as StatsCounter;
-use crate::online_map::OnlineMap as StatsOnlineMap;
+use parking_lot::RwLock;
+use xray_features::stats::{Channel, Counter, Manager as ManagerTrait, ManagerError, OnlineMap};
+
+use crate::{
+    channel::{ChannelConfig, StatsChannel},
+    counter::Counter as StatsCounter,
+    online_map::OnlineMap as StatsOnlineMap,
+};
 
 /// 统计管理器实现。对应 Go `app/stats.Manager`。
 pub struct Manager {
@@ -62,7 +66,7 @@ impl Default for Manager {
 impl ManagerTrait for Manager {
     // --- Counter ---
 
-fn register_counter(&self, name: &str) -> Result<Arc<dyn Counter>, ManagerError> {
+    fn register_counter(&self, name: &str) -> Result<Arc<dyn Counter>, ManagerError> {
         let mut counters = self.counters.write();
         if counters.contains_key(name) {
             return Err(ManagerError::AlreadyRegistered {
@@ -105,7 +109,7 @@ fn register_counter(&self, name: &str) -> Result<Arc<dyn Counter>, ManagerError>
 
     // --- OnlineMap ---
 
-fn register_online_map(&self, name: &str) -> Result<Arc<dyn OnlineMap>, ManagerError> {
+    fn register_online_map(&self, name: &str) -> Result<Arc<dyn OnlineMap>, ManagerError> {
         let mut maps = self.online_maps.write();
         if maps.contains_key(name) {
             return Err(ManagerError::AlreadyRegistered {
@@ -148,7 +152,7 @@ fn register_online_map(&self, name: &str) -> Result<Arc<dyn OnlineMap>, ManagerE
 
     // --- Channel ---
 
-fn register_channel(&self, name: &str) -> Result<Arc<dyn Channel>, ManagerError> {
+    fn register_channel(&self, name: &str) -> Result<Arc<dyn Channel>, ManagerError> {
         let mut channels = self.channels.write();
         if channels.contains_key(name) {
             return Err(ManagerError::AlreadyRegistered {
@@ -189,13 +193,7 @@ fn register_channel(&self, name: &str) -> Result<Arc<dyn Channel>, ManagerError>
     fn get_all_online_users(&self) -> Vec<String> {
         let maps = self.online_maps.read();
         maps.iter()
-            .filter_map(|(name, om)| {
-                if om.count() > 0 {
-                    Some(name.clone())
-                } else {
-                    None
-                }
-            })
+            .filter_map(|(name, om)| if om.count() > 0 { Some(name.clone()) } else { None })
             .collect()
     }
 }
@@ -261,7 +259,7 @@ mod tests {
             Err(ManagerError::AlreadyRegistered { kind, name }) => {
                 assert_eq!(kind, "Counter");
                 assert_eq!(name, "x");
-            }
+            },
             Err(e) => panic!("expected AlreadyRegistered, got {e:?}"),
             Ok(_) => panic!("expected Err"),
         }
@@ -355,7 +353,7 @@ mod tests {
         match m.register_online_map("u") {
             Err(ManagerError::AlreadyRegistered { kind, .. }) => {
                 assert_eq!(kind, "OnlineMap");
-            }
+            },
             Err(e) => panic!("expected AlreadyRegistered, got {e:?}"),
             Ok(_) => panic!("expected Err"),
         }
@@ -411,7 +409,7 @@ mod tests {
         match m.register_channel("c") {
             Err(ManagerError::AlreadyRegistered { kind, .. }) => {
                 assert_eq!(kind, "Channel");
-            }
+            },
             Err(e) => panic!("expected AlreadyRegistered, got {e:?}"),
             Ok(_) => panic!("expected Err"),
         }
@@ -472,10 +470,7 @@ mod tests {
         m.close().unwrap();
         assert!(!c.running(), "channel must be closed");
         assert!(m.get_channel("x").is_none(), "channel must be removed");
-        assert!(
-            m.get_online_map("u").is_none(),
-            "online_maps must be cleared"
-        );
+        assert!(m.get_online_map("u").is_none(), "online_maps must be cleared");
     }
 
     #[test]

@@ -6,22 +6,24 @@
 //!
 //! 协议名同时注册 `"splithttp"`（Go 标准）和 `"xhttp"`（用户配置简写）。
 
-use std::io;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{io, net::SocketAddr, sync::Arc};
 
 use xray_common::net::destination::Destination;
-use xray_transport::connection::Connection;
-use xray_transport::dialer::{StreamSettings, TransportDialFn, register_transport_dialer};
-use xray_transport::listener_registry::{TransportListenFn, register_transport_listener};
-use xray_transport::system_dialer::dial_system;
-use xray_transport::sockopt::SocketOptions;
+use xray_transport::{
+    connection::Connection,
+    dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
+    listener_registry::{TransportListenFn, register_transport_listener},
+    sockopt::SocketOptions,
+    system_dialer::dial_system,
+};
 
-use crate::client::{DefaultDialerClient, DialTarget};
-use crate::config::Config;
-use crate::dialer;
-use crate::h3_client::H3Conn;
-use crate::transport::listen_splithttp;
+use crate::{
+    client::{DefaultDialerClient, DialTarget},
+    config::Config,
+    dialer,
+    h3_client::H3Conn,
+    transport::listen_splithttp,
+};
 
 /// 注册 SplitHTTP transport dialer。幂等。
 pub fn register_dialer() -> io::Result<()> {
@@ -96,10 +98,7 @@ async fn dial_splithttp(
         .unwrap_or("");
     let fingerprint = if has_tls && !has_reality && !fp_name.is_empty() {
         Some(xray_tls::fingerprint::get_fingerprint(fp_name).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid fingerprint: {e}"),
-            )
+            io::Error::new(io::ErrorKind::InvalidInput, format!("invalid fingerprint: {e}"))
         })?)
     } else {
         None
@@ -122,7 +121,7 @@ async fn dial_splithttp(
             rustls::ClientConfig::builder()
                 .with_root_certificates(rustls::RootCertStore::empty())
                 .with_no_client_auth()
-        }
+        },
     };
 
     // Determine HTTP version from ALPN (对应 Go `decideHTTPVersion`)。
@@ -143,20 +142,14 @@ async fn dial_splithttp(
         }
         // HTTP/3 over QUIC path（对应 Go `createHTTPClient` 中 `httpVersion=="3"` 分支）。
         // quinn 需要 `SocketAddr`（不做 DNS），域名走 `tokio::net::lookup_host` 解析。
-        let socket_addr = resolve_dest_socket_addr(dest)
-            .await
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("H3 dial: DNS resolve failed for {}", dest.address()),
-                )
-            })?;
+        let socket_addr = resolve_dest_socket_addr(dest).await.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("H3 dial: DNS resolve failed for {}", dest.address()),
+            )
+        })?;
         // SNI: config.host 优先，缺失用 dest 地址（对齐 Go `requestURL.Host` fallback）。
-        let server_name = if !config.host.is_empty() {
-            config.host.as_str()
-        } else {
-            &default_sni
-        };
+        let server_name = if !config.host.is_empty() { config.host.as_str() } else { &default_sni };
         // finalmask.quicParams（对应 Go streamSettings.QuicParams；CC + 窗口字段。
         // 缺省时 connect_with_quic_params 仍默认 BBR——对齐 dialer.go:161-164 PR #5711）。
         let quic_params = xray_transport::memory_settings::parse_quic_params_config(
@@ -177,14 +170,12 @@ async fn dial_splithttp(
                 format!("splithttp H3 connect failed: {e}"),
             )
         })?;
-        dialer::dial_h3(h3_conn, config, scheme, &host, has_reality)
-            .await
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    format!("splithttp H3 dial failed: {e}"),
-                )
-            })?
+        dialer::dial_h3(h3_conn, config, scheme, &host, has_reality).await.map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("splithttp H3 dial failed: {e}"),
+            )
+        })?
     } else {
         // REALITY xhttp: TCP → REALITY TLS handshake (u_client + session_id/auth_key
         // 重写 + cert HMAC) → h2 直握手 stream-one。hyper-rustls 不知道 REALITY,
@@ -200,9 +191,8 @@ async fn dial_splithttp(
             })?;
             let remote_addr = tcp_conn.remote_addr().ok().flatten();
             let local_addr = tcp_conn.local_addr().ok().flatten();
-            let tls_stream = xray_reality::register::handshake_over(tcp_conn, settings)
-                .await
-                .map_err(|e| {
+            let tls_stream =
+                xray_reality::register::handshake_over(tcp_conn, settings).await.map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::ConnectionRefused,
                         format!("splithttp reality handshake: {e}"),
@@ -211,8 +201,9 @@ async fn dial_splithttp(
             let remote = remote_addr.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
             let local = local_addr.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
             // base_uri 必须拼 config.path — 否则 splithttp request URL 是 host/ 而不是 host/path,
-            // 服务端 REALITY handler 找不到 path 返回 404（fix-reality-xhttp-11 子代理 25min 调研结论）。
-            // 用 normalized_path() 自动补前导 / + 加末尾 /，与 dial() 函数 (line 314-318) 对齐。
+            // 服务端 REALITY handler 找不到 path 返回 404（fix-reality-xhttp-11 子代理 25min
+            // 调研结论）。 用 normalized_path() 自动补前导 / + 加末尾 /，与 dial() 函数
+            // (line 314-318) 对齐。
             let base_uri = format!("{scheme}://{host}{path}", path = config.normalized_path());
             let session_id = String::new();
             dialer::dial_reality_stream_one(tls_stream, remote, local, base_uri, session_id, config)
@@ -247,14 +238,12 @@ async fn dial_splithttp(
                 fingerprint,
                 settings.security_json.clone(),
             ));
-            dialer::dial(client, config, scheme, &host, has_reality)
-                .await
-                .map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::ConnectionRefused,
-                        format!("splithttp dial failed: {e}"),
-                    )
-                })?
+            dialer::dial(client, config, scheme, &host, has_reality).await.map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!("splithttp dial failed: {e}"),
+                )
+            })?
         }
     };
 
@@ -278,7 +267,7 @@ async fn resolve_dest_socket_addr(dest: &Destination) -> Option<SocketAddr> {
         xray_common::net::address::Address::IPv6(v6) => Some(SocketAddr::new((*v6).into(), port)),
         xray_common::net::address::Address::Domain(d) => {
             tokio::net::lookup_host((d.as_str(), port)).await.ok()?.next()
-        }
+        },
     }
 }
 
@@ -298,7 +287,7 @@ pub(crate) fn parse_splithttp_config(json: Option<&serde_json::Value>) -> io::Re
                     io::ErrorKind::InvalidData,
                     "splithttpSettings must be a JSON object",
                 ));
-            }
+            },
         },
     };
 
@@ -347,9 +336,7 @@ pub(crate) fn parse_splithttp_config(json: Option<&serde_json::Value>) -> io::Re
     // downloadSettings 是嵌套 StreamConfig：取其中 splithttpSettings 递归解析
     // ponytail: 只取 splithttpSettings 子对象；TLS/security 归 stream 层管，这里不碰。
     let download_settings = obj.get("downloadSettings").and_then(|ds| {
-        ds.get("splithttpSettings")
-            .and_then(|v| parse_splithttp_config(Some(v)).ok())
-            .map(Box::new)
+        ds.get("splithttpSettings").and_then(|v| parse_splithttp_config(Some(v)).ok()).map(Box::new)
     });
 
     Ok(Config {
@@ -431,7 +418,7 @@ pub(crate) fn parse_splithttp_config(json: Option<&serde_json::Value>) -> io::Re
                     io::ErrorKind::InvalidData,
                     "splithttpSettings.sessionIDLength.from must be greater than 0",
                 ));
-            }
+            },
             _ => None,
         },
         no_grpc_header: get_bool("noGRPCHeader"),
@@ -475,7 +462,9 @@ fn parse_range(v: &serde_json::Value) -> Option<crate::config::RangeConfig> {
 }
 
 /// 把 JSON 子对象解析为 `HashMap<String, String>`。非 object 或缺失返回 `None`。
-fn parse_headers(v: Option<&serde_json::Value>) -> Option<std::collections::HashMap<String, String>> {
+fn parse_headers(
+    v: Option<&serde_json::Value>,
+) -> Option<std::collections::HashMap<String, String>> {
     let obj = v?.as_object()?;
     let mut map = std::collections::HashMap::with_capacity(obj.len());
     for (k, val) in obj {
@@ -533,10 +522,8 @@ mod tests {
     /// 用户显式提供 xmux 子字段时不被默认预设覆盖（透传）。
     #[test]
     fn parse_xmux_explicit_value_passes_through() {
-        let v: serde_json::Value = serde_json::from_str(
-            r#"{"xmux":{"maxConnections":{"from":7,"to":9}}}"#,
-        )
-        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"xmux":{"maxConnections":{"from":7,"to":9}}}"#).unwrap();
         let cfg = parse_splithttp_config(Some(&v)).unwrap();
         let xm = cfg.xmux.as_ref().expect("xmux present");
         assert_eq!(xm.max_connections.unwrap().from, 7);
@@ -593,10 +580,9 @@ mod tests {
     #[test]
     fn parse_splithttp_config_session_id_new_keys() {
         // Go v26.7.28 键名：sessionIDPlacement / sessionIDKey。
-        let v: serde_json::Value = serde_json::from_str(
-            r#"{"sessionIDPlacement":"header","sessionIDKey":"X-Sid"}"#,
-        )
-        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"sessionIDPlacement":"header","sessionIDKey":"X-Sid"}"#)
+                .unwrap();
         let cfg = parse_splithttp_config(Some(&v)).unwrap();
         assert_eq!(cfg.session_placement, "header");
         assert_eq!(cfg.session_key, "X-Sid");
@@ -682,8 +668,7 @@ mod tests {
     /// sessionIDTable 预定义名（"HEX"）解析后替换为字面值。
     #[test]
     fn parse_session_id_table_predefined_resolves_to_alphabet() {
-        let v: serde_json::Value =
-            serde_json::from_str(r#"{"sessionIDTable":"HEX"}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(r#"{"sessionIDTable":"HEX"}"#).unwrap();
         let cfg = parse_splithttp_config(Some(&v)).expect("parse ok");
         assert_eq!(cfg.session_id_table, "0123456789ABCDEF");
     }
@@ -754,23 +739,20 @@ mod tests {
     /// sessionIDLength 整数简写解析：from==to。
     #[test]
     fn parse_session_id_length_from_integer() {
-        let v: serde_json::Value =
-            serde_json::from_str(r#"{"sessionIDLength":12}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(r#"{"sessionIDLength":12}"#).unwrap();
         let cfg = parse_splithttp_config(Some(&v)).expect("parse ok");
         let r = cfg.session_id_length.expect("some");
         assert_eq!((r.from, r.to), (12, 12));
     }
 
-
     /// Tcpmask round-trip（o54c，Go splithttp/dialer.go:127-134 + hub.go:547-549）：
     /// 明文 HTTP/1.1 packet-up，dial 与 hub 双端配置 fragment mask 后 e2e echo。
     #[tokio::test]
     async fn splithttp_dial_hub_tcpmask_roundtrip() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use xray_common::net::address::Address;
-        use xray_common::net::network::Network;
-        use xray_common::net::port::Port;
         use std::net::Ipv4Addr;
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use xray_common::net::{address::Address, network::Network, port::Port};
 
         let finalmask = serde_json::json!({
             "tcp": [{"type": "fragment", "settings": {
@@ -796,7 +778,7 @@ mod tests {
                             if conn.write_all(&buf[..n]).await.is_err() {
                                 break;
                             }
-                        }
+                        },
                     }
                 }
             });
@@ -822,13 +804,10 @@ mod tests {
 
         conn.write_all(b"hello-xh-tcpmask").await.expect("write");
         let mut buf = vec![0u8; 64];
-        let n = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            conn.read(&mut buf),
-        )
-        .await
-        .expect("echo timeout")
-        .expect("read ok");
+        let n = tokio::time::timeout(std::time::Duration::from_secs(10), conn.read(&mut buf))
+            .await
+            .expect("echo timeout")
+            .expect("read ok");
         assert_eq!(&buf[..n], b"hello-xh-tcpmask");
     }
 }

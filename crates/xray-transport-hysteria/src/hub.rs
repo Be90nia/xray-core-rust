@@ -188,7 +188,10 @@ fn resolve_masq_file(
         match comp {
             "" | "." => continue,
             ".." => {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "path traversal"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "path traversal",
+                ));
             },
             c => full.push(c),
         }

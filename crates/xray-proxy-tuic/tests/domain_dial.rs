@@ -9,29 +9,23 @@
 
 #![cfg(test)]
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 use uuid::Uuid;
-
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-use xray_proxy_tuic::client::TuicConnectOptions;
-use xray_proxy_tuic::dispatcher::make_dial_fn_lazy;
-use xray_proxy_tuic::server::TuicMockServer;
+use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
+use xray_proxy_tuic::{
+    client::TuicConnectOptions, dispatcher::make_dial_fn_lazy, server::TuicMockServer,
+};
 
 fn make_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.add(cert_der.to_vec().into()).unwrap();
     Arc::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth(),
+        rustls::ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth(),
     )
 }
 
@@ -50,7 +44,7 @@ async fn start_echo_server() -> SocketAddr {
                             if sock.write_all(&buf[..n]).await.is_err() {
                                 break;
                             }
-                        }
+                        },
                     }
                 }
             });
@@ -74,19 +68,12 @@ async fn dial_fn_lazy_resolves_domain_server_addr() {
         .expect("resolve localhost")
         .next()
         .expect("non-empty");
-    let bind_addr: std::net::SocketAddr = if probe.is_ipv4() {
-        "127.0.0.1:0".parse().unwrap()
-    } else {
-        "[::1]:0".parse().unwrap()
-    };
-    let (server, cert_der) = TuicMockServer::bind(
-        bind_addr,
-        "localhost",
-        uuid,
-        password.to_string(),
-    )
-    .await
-    .expect("mock server bind");
+    let bind_addr: std::net::SocketAddr =
+        if probe.is_ipv4() { "127.0.0.1:0".parse().unwrap() } else { "[::1]:0".parse().unwrap() };
+    let (server, cert_der) =
+        TuicMockServer::bind(bind_addr, "localhost", uuid, password.to_string())
+            .await
+            .expect("mock server bind");
     // 故意用域名形式，等价真实节点的域名 address（localhost → 本机回环）
     let server_addr = format!("localhost:{}", server.local_addr().port());
     tokio::spawn(async move {

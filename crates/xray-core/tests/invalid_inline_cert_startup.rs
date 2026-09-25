@@ -50,10 +50,9 @@ async fn invalid_inline_certificates_fail_startup_instead_of_silent_self_signed(
     );
 
     // ===== 2. 对照：证书缺省 → 同一链路走自签回退正常启动 =====
-    let fallback = Config::from_json_str(&config_json(serde_json::json!({})))
-        .expect("config json parses");
+    let fallback =
+        Config::from_json_str(&config_json(serde_json::json!({}))).expect("config json parses");
     let built = fallback.build().expect("config builds");
-    let (_instance, _ohm, _handles) = start_full(&built)
-        .await
-        .expect("absent certificates falls back to self-signed and starts");
+    let (_instance, _ohm, _handles) =
+        start_full(&built).await.expect("absent certificates falls back to self-signed and starts");
 }

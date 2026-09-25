@@ -38,17 +38,13 @@ impl AverageLatency {
     /// 创建零初始值的平均延迟。
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            inner: Mutex::new(AverageLatencyInner { value: 0 }),
-        }
+        Self { inner: Mutex::new(AverageLatencyInner { value: 0 }) }
     }
 
     /// 用初始值创建平均延迟。
     #[must_use]
     pub fn with_value(value: u64) -> Self {
-        Self {
-            inner: Mutex::new(AverageLatencyInner { value }),
-        }
+        Self { inner: Mutex::new(AverageLatencyInner { value }) }
     }
 
     /// 用新采样值更新延迟（加权移动平均）。
@@ -64,9 +60,7 @@ impl AverageLatency {
 
 impl Latency for AverageLatency {
     fn value(&self) -> u64 {
-        self.inner
-            .lock()
-            .map_or(0, |inner| inner.value)
+        self.inner.lock().map_or(0, |inner| inner.value)
     }
 }
 

@@ -5,20 +5,16 @@
 //! - s2 长连接大流量：同链路持续泵随机数据，稳态吞吐衰减曲线
 //! - s3 QUIC 重连循环：hysteria2 0-RTT dial→roundtrip→drop 回环
 //! - s4 混合：mKCP（UDP 路径）短连接 + 长连接叠加
-//! - s5-s12 协议链扩展：vmess+ws / trojan+grpc / ss+tcp / tuic v5 /
-//!   anytls / vless+xhttp(auto) / http 代理 / vmess+xhttp H3（QUIC 承载），
-//!   每场景独立 start_full 双实例，短连接风暴复用 s1 worker 语义
+//! - s5-s12 协议链扩展：vmess+ws / trojan+grpc / ss+tcp / tuic v5 / anytls / vless+xhttp(auto) /
+//!   http 代理 / vmess+xhttp H3（QUIC 承载）， 每场景独立 start_full 双实例，短连接风暴复用 s1
+//!   worker 语义
 //!
 //! 长跑启动命令见 run_stress.ps1 / run_stress.sh（保守/标准/激进三档）。
 
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use xray_stress::quic_loop;
-use xray_stress::report::StatsHandle;
-use xray_stress::sampler::Sampler;
-use xray_stress::scenarios as sc;
-use xray_stress::topology;
+use xray_stress::{quic_loop, report::StatsHandle, sampler::Sampler, scenarios as sc, topology};
 
 #[derive(Parser, Debug)]
 #[command(name = "xray-stress", about = "Xray-core-rust stress harness")]
@@ -115,7 +111,9 @@ async fn run(
             });
         }
         topology::probe_socks_roundtrip(port, echo_port).await?;
-        println!("[xray-stress] reality link ready: socks=127.0.0.1:{port} echo=127.0.0.1:{echo_port}");
+        println!(
+            "[xray-stress] reality link ready: socks=127.0.0.1:{port} echo=127.0.0.1:{echo_port}"
+        );
         Some(port)
     } else {
         None
@@ -194,15 +192,7 @@ async fn run(
         stats.push(h.clone());
         let short = (args.concurrency / 4).max(2);
         let long = (args.s2_conns / 2).max(1);
-        load.spawn(sc::s4_mixed(
-            port,
-            echo_port,
-            short,
-            long,
-            deadline,
-            h,
-            args.s1_delay_ms,
-        ));
+        load.spawn(sc::s4_mixed(port, echo_port, short, long, deadline, h, args.s1_delay_ms));
     }
     for (sc, port) in protocol_links {
         let h = StatsHandle::new(sc.stats_name());
@@ -252,7 +242,10 @@ async fn run(
     // 固有堆积（如 s12 H3 connIdle 300s 窗口）→ RSS 回落/企稳；真泄漏 → 不落。
     // 行标 `__drain__`，由 tools/check_stress_leak.py 判定。
     if args.drain_secs > 0 {
-        println!("[xray-stress] drain window: {}s (idle-connection reclaim observation)", args.drain_secs);
+        println!(
+            "[xray-stress] drain window: {}s (idle-connection reclaim observation)",
+            args.drain_secs
+        );
         let drain_end = Instant::now() + Duration::from_secs(args.drain_secs);
         let load_end = Instant::now();
         let mut tick = tokio::time::interval(interval);
@@ -343,11 +336,7 @@ impl Scenario {
     }
 
     fn stats_name(self) -> &'static str {
-        PROTOCOL_SCENARIOS
-            .iter()
-            .find(|(s, _)| *s == self)
-            .map(|(_, n)| *n)
-            .unwrap_or("unknown")
+        PROTOCOL_SCENARIOS.iter().find(|(s, _)| *s == self).map(|(_, n)| *n).unwrap_or("unknown")
     }
 }
 
@@ -381,7 +370,7 @@ fn parse_scenarios(s: &str) -> anyhow::Result<Vec<Scenario>> {
                     Scenario::S10,
                     Scenario::S11,
                     Scenario::S12,
-                ])
+                ]);
             },
             other => anyhow::bail!("unknown scenario: {other} (expect s1..s12|all)"),
         });

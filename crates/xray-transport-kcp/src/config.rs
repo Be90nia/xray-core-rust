@@ -39,8 +39,7 @@ impl ConfigExt for Config {
     fn get_sending_in_flight_size(&self) -> u32 {
         let mtu = self.mtu.max(1);
         let tti = self.tti.max(1).min(1000);
-        let mut size =
-            self.uplink_capacity * 1024 * 1024 / mtu / (1000 / tti);
+        let mut size = self.uplink_capacity * 1024 * 1024 / mtu / (1000 / tti);
         if size < 8 {
             size = 8;
         }
@@ -54,8 +53,7 @@ impl ConfigExt for Config {
     fn get_receiving_in_flight_size(&self) -> u32 {
         let mtu = self.mtu.max(1);
         let tti = self.tti.max(1).min(1000);
-        let mut size =
-            self.downlink_capacity * 1024 * 1024 / mtu / (1000 / tti);
+        let mut size = self.downlink_capacity * 1024 * 1024 / mtu / (1000 / tti);
         if size < 8 {
             size = 8;
         }

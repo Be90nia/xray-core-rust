@@ -11,27 +11,33 @@
 //! KeepAliveConfig（idle/interval 任一非零即启用）、TcpMptcp（Linux，静默回退）。
 //! 待办：`ListenPacket`（UDP）+ 平台特定 sockopt（SO_REUSEPORT 等）。
 
-use std::future::Future;
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+#[cfg(unix)]
+use std::path::PathBuf;
+use std::{
+    future::Future,
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::{Arc, OnceLock},
+    task::{Context, Poll},
+};
 
 use parking_lot::RwLock;
 use socket2::Socket;
-use tokio::net::TcpListener as TokioTcpListener;
-
-use crate::connection::{Connection, TcpConnection};
-use crate::sockopt::{SocketOptions, apply_inbound_socket_options};
-use crate::listener::Listener;
-#[cfg(unix)]
-use std::path::PathBuf;
-use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(unix)]
 use tokio::net::{UnixListener as TokioUnixListener, UnixStream};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpListener as TokioTcpListener,
+};
+
 #[cfg(unix)]
 use crate::filelocker::FileLocker;
+use crate::{
+    connection::{Connection, TcpConnection},
+    listener::Listener,
+    sockopt::{SocketOptions, apply_inbound_socket_options},
+};
 
 /// fd 级监听控制器。对应 Go `func(network, address string, c syscall.RawConn) error`。
 ///
@@ -82,12 +88,7 @@ impl DefaultListener {
         // （Go system_listener.go:169-172 按 sockopt 包 proxyproto.Listener；
         // tcpSettings 等传输级值由 transport 装配处 OR 进 sockopt 后到达这里）。
         let accept_proxy_protocol = sockopt.accept_proxy_protocol;
-        Ok(Self {
-            inner,
-            sockopt,
-            controllers: Vec::new(),
-            accept_proxy_protocol,
-        })
+        Ok(Self { inner, sockopt, controllers: Vec::new(), accept_proxy_protocol })
     }
 
     /// 预监听（pre-listen）socket 选项判断。
@@ -128,8 +129,12 @@ impl DefaultListener {
             }
             #[cfg(target_os = "macos")]
             if sockopt.reuse_port {
-                crate::sockopt::darwin::DarwinSockOpt { reuse_port: true, inbound: true, ..Default::default() }
-                    .apply(fd)?;
+                crate::sockopt::darwin::DarwinSockOpt {
+                    reuse_port: true,
+                    inbound: true,
+                    ..Default::default()
+                }
+                .apply(fd)?;
             }
         }
         socket.bind(&addr.into())?;
@@ -197,7 +202,10 @@ impl DefaultListener {
     /// Linux：手动创建 socket 并在 bind 前设 `TCP_MPTCP`（内核不支持时记录并
     /// 静默回退普通 TCP，对齐 Go）。其他平台：Go 本身不支持 MPTCP 监听，直接普通绑定。
     #[cfg(not(target_os = "linux"))]
-    async fn bind_mptcp(addr: SocketAddr, _sockopt: &SocketOptions) -> io::Result<TokioTcpListener> {
+    async fn bind_mptcp(
+        addr: SocketAddr,
+        _sockopt: &SocketOptions,
+    ) -> io::Result<TokioTcpListener> {
         TokioTcpListener::bind(addr).await
     }
 
@@ -236,12 +244,7 @@ impl DefaultListener {
     /// 用已绑定的 tokio listener 构造（测试或高级场景用）。
     pub fn from_tokio(inner: TokioTcpListener, sockopt: SocketOptions) -> Self {
         let accept_proxy_protocol = sockopt.accept_proxy_protocol;
-        Self {
-            inner,
-            sockopt,
-            controllers: Vec::new(),
-            accept_proxy_protocol,
-        }
+        Self { inner, sockopt, controllers: Vec::new(), accept_proxy_protocol }
     }
 
     /// 启用/禁用 PROXY protocol 支持。对应 Go `ListenConfig.AcceptProxyProtocol`。
@@ -303,11 +306,11 @@ impl SystemListener for DefaultListener {
                     Ok(Some(real_peer)) => {
                         tracing::debug!(proxy_peer = %real_peer, tcp_peer = %peer, "PROXY protocol resolved");
                         Box::new(ProxiedConnection::new(TcpConnection::new(stream), real_peer))
-                    }
+                    },
                     Ok(None) => {
                         tracing::debug!(tcp_peer = %peer, "PROXY protocol UNKNOWN");
                         Box::new(TcpConnection::new(stream))
-                    }
+                    },
                     Err(e) => return Err(e),
                 }
             } else {
@@ -322,7 +325,6 @@ impl SystemListener for DefaultListener {
         self.inner.local_addr()
     }
 }
-
 
 /// PROXY protocol 连接包装器。
 ///
@@ -399,7 +401,10 @@ pub fn register_listener_controller(ctl: ListenerController) -> io::Result<()> {
 ///
 /// 绑定 `addr`，创建 [`DefaultListener`]，注入全局 fd 控制器。
 /// 返回的 listener 可通过 [`SystemListener`] 或 [`Listener`] trait 使用。
-pub async fn listen_system(addr: SocketAddr, sockopt: SocketOptions) -> io::Result<DefaultListener> {
+pub async fn listen_system(
+    addr: SocketAddr,
+    sockopt: SocketOptions,
+) -> io::Result<DefaultListener> {
     let mut listener = DefaultListener::bind(addr, sockopt).await?;
     // 注入全局控制器（克隆 Arc 引用）。
     for ctl in global_controllers().read().iter() {
@@ -426,10 +431,7 @@ impl InboundTcpListener {
     /// # Errors
     /// bind 失败时返回 `io::Error`。
     pub async fn bind(addr: &str, sockopt: SocketOptions) -> io::Result<Self> {
-        Ok(Self {
-            inner: TokioTcpListener::bind(addr).await?,
-            sockopt,
-        })
+        Ok(Self { inner: TokioTcpListener::bind(addr).await?, sockopt })
     }
 
     /// 监听器本地地址（serve 层日志 / local addr 兜底用）。
@@ -517,6 +519,7 @@ impl Connection for UnixConnection {
     fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(Some(SocketAddr::from(([0, 0, 0, 0], 0))))
     }
+
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(Some(SocketAddr::from(([0, 0, 0, 0], 0))))
     }
@@ -541,8 +544,8 @@ impl UnixListener {
     /// - `/path/to/socket` — 普通路径（FileLocker + 残留文件清理）
     /// - `/path/to/socket,0755` — 路径 + 八进制权限（bind 后 chmod）
     /// - `@name` — Linux abstract socket（无 FileLocker，Go system_listener.go:119）
-    /// - `@@name` — abstract socket + haproxy padding（名字零填充到 108 字节，
-    ///   Go system_listener.go:121-126）
+    /// - `@@name` — abstract socket + haproxy padding（名字零填充到 108 字节， Go
+    ///   system_listener.go:121-126）
     ///
     /// # Errors
     /// FileLocker 获取失败 / bind 失败 / 权限设置失败 / abstract 名超长时返回 `io::Error`。
@@ -552,13 +555,8 @@ impl UnixListener {
             UnixAddrSpec::Abstract(name) => {
                 // abstract socket 在独立命名空间，无锁、无文件、无权限设置。
                 let inner = TokioUnixListener::from_std(bind_abstract_unix(&name)?)?;
-                Ok(Self {
-                    inner,
-                    sockopt,
-                    controllers: Vec::new(),
-                    _locker: None,
-                })
-            }
+                Ok(Self { inner, sockopt, controllers: Vec::new(), _locker: None })
+            },
             #[cfg(not(any(target_os = "linux", target_os = "android")))]
             UnixAddrSpec::Abstract(_) => {
                 // parse_unix_addr 非 Linux/Android 不产出 Abstract（'@' 前缀已报
@@ -567,7 +565,7 @@ impl UnixListener {
                     io::ErrorKind::InvalidInput,
                     "abstract socket (@) is only supported on Linux/Android",
                 ))
-            }
+            },
             UnixAddrSpec::Path(socket_path, perm) => {
                 // normal unix domain socket needs lock
                 let mut lk = FileLocker::new(format!("{}.lock", socket_path.display()));
@@ -584,13 +582,8 @@ impl UnixListener {
                         .map_err(|e| io::Error::other(format!("failed to set permission: {e}")))?;
                 }
 
-                Ok(Self {
-                    inner,
-                    sockopt,
-                    controllers: Vec::new(),
-                    _locker: Some(lk),
-                })
-            }
+                Ok(Self { inner, sockopt, controllers: Vec::new(), _locker: Some(lk) })
+            },
         }
     }
 
@@ -611,7 +604,6 @@ impl SystemListener for UnixListener {
         })
     }
 
-
     fn local_addr(&self) -> io::Result<SocketAddr> {
         // Unix socket 没有 SocketAddr，返回 unspecified（模仿 Go）
         Ok(SocketAddr::from(([0, 0, 0, 0], 0)))
@@ -630,8 +622,8 @@ enum UnixAddrSpec {
 ///
 /// 对应 Go `DefaultListener.Listen` 的 abstract 分支（system_listener.go:119-126）：
 /// - `@name` → `\0name`（abstract 命名空间，Go net 把 `@` 转 `\0`）
-/// - `@@name` → `\0name` + `\0` 填充到 108 字节（`sizeof(sockaddr_un.sun_path)`，
-///   haproxy padding 约定）
+/// - `@@name` → `\0name` + `\0` 填充到 108 字节（`sizeof(sockaddr_un.sun_path)`， haproxy padding
+///   约定）
 /// - 名字部分超过 107 字节 → `None`（对齐 Go net "unix socket name too long"）
 #[cfg(any(target_os = "linux", target_os = "android", test))]
 pub(crate) fn abstract_sockaddr_path(addr: &str) -> Option<Vec<u8>> {
@@ -663,8 +655,8 @@ pub(crate) fn abstract_sockaddr_path(addr: &str) -> Option<Vec<u8>> {
 /// 解析 Unix 地址。
 ///
 /// - Linux/Android：`@`/`@@` 前缀 → [`UnixAddrSpec::Abstract`]（lockfree）
-/// - 其他 unix：`@` 前缀 → `InvalidInput`（Go 端 abstract 仅支持 linux/android；
-///   Go 在 darwin 会把 `@x` 当字面路径走 FileLocker 最终 bind 失败，此处显式报错）
+/// - 其他 unix：`@` 前缀 → `InvalidInput`（Go 端 abstract 仅支持 linux/android； Go 在 darwin 会把
+///   `@x` 当字面路径走 FileLocker 最终 bind 失败，此处显式报错）
 /// - `path` / `path,perm`（八进制） → [`UnixAddrSpec::Path`]
 #[cfg(unix)]
 fn parse_unix_addr(addr: &str) -> io::Result<UnixAddrSpec> {
@@ -725,11 +717,8 @@ fn bind_abstract_unix(name: &[u8]) -> io::Result<std::os::unix::net::UnixListene
         }
         // abstract 地址长度 = sun_family(2) + 实际名字长度（无 '\0' 终止符）。
         let addrlen = std::mem::size_of::<libc::sa_family_t>() + name.len();
-        if libc::bind(
-            fd,
-            (&addr as *const libc::sockaddr_un).cast(),
-            addrlen as libc::socklen_t,
-        ) < 0
+        if libc::bind(fd, (&addr as *const libc::sockaddr_un).cast(), addrlen as libc::socklen_t)
+            < 0
         {
             let e = io::Error::last_os_error();
             libc::close(fd);
@@ -761,15 +750,19 @@ pub async fn listen_unix_system(addr: &str, sockopt: SocketOptions) -> io::Resul
 
 #[cfg(test)]
 mod tests {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+    };
+
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
 
     #[tokio::test]
     async fn default_listener_bind_and_accept() {
-        let listener = DefaultListener::bind("127.0.0.1:0".parse().unwrap(), SocketOptions::default())
-            .await
-            .expect("bind 失败");
+        let listener =
+            DefaultListener::bind("127.0.0.1:0".parse().unwrap(), SocketOptions::default())
+                .await
+                .expect("bind 失败");
         let addr = listener.local_addr().expect("local_addr 失败");
 
         let server = tokio::spawn(async move {
@@ -787,9 +780,10 @@ mod tests {
 
     #[tokio::test]
     async fn default_listener_local_addr() {
-        let listener = DefaultListener::bind("127.0.0.1:0".parse().unwrap(), SocketOptions::default())
-            .await
-            .unwrap();
+        let listener =
+            DefaultListener::bind("127.0.0.1:0".parse().unwrap(), SocketOptions::default())
+                .await
+                .unwrap();
         let addr = listener.local_addr().unwrap();
         assert_eq!(addr.ip().to_string(), "127.0.0.1");
         assert_ne!(addr.port(), 0);
@@ -800,9 +794,7 @@ mod tests {
         // bd e7le：accept 出的连接必须默认 TCP_NODELAY（SocketOptions::default
         // tcp_nodelay=true），helper 层直接断言。
         let listener =
-            InboundTcpListener::bind("127.0.0.1:0", SocketOptions::default())
-                .await
-                .unwrap();
+            InboundTcpListener::bind("127.0.0.1:0", SocketOptions::default()).await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
@@ -813,10 +805,7 @@ mod tests {
         let _client = TcpStream::connect(addr).await.unwrap();
         let stream = server.await.unwrap();
         let sock = Socket::from(stream.into_std().unwrap());
-        assert!(
-            sock.nodelay().unwrap(),
-            "accepted inbound socket should have TCP_NODELAY set"
-        );
+        assert!(sock.nodelay().unwrap(), "accepted inbound socket should have TCP_NODELAY set");
     }
 
     #[tokio::test]
@@ -848,9 +837,8 @@ mod tests {
         let fake_src: SocketAddr = "198.51.100.17:47211".parse().unwrap();
         let mut sockopt = SocketOptions::default();
         sockopt.accept_proxy_protocol = true;
-        let listener = DefaultListener::bind("127.0.0.1:0".parse().unwrap(), sockopt)
-            .await
-            .unwrap();
+        let listener =
+            DefaultListener::bind("127.0.0.1:0".parse().unwrap(), sockopt).await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
@@ -864,10 +852,7 @@ mod tests {
         });
 
         let mut client = TcpStream::connect(addr).await.expect("connect 失败");
-        client
-            .write_all(&build_proxy_header(1, fake_src, addr))
-            .await
-            .unwrap();
+        client.write_all(&build_proxy_header(1, fake_src, addr)).await.unwrap();
         client.write_all(b"PING!").await.unwrap();
         server.await.unwrap();
     }
@@ -879,9 +864,10 @@ mod tests {
     async fn sockopt_accept_proxy_protocol_default_off_keeps_header_in_stream() {
         use crate::proxy_protocol::build_proxy_header;
         let fake_src: SocketAddr = "198.51.100.17:47212".parse().unwrap();
-        let listener = DefaultListener::bind("127.0.0.1:0".parse().unwrap(), SocketOptions::default())
-            .await
-            .unwrap();
+        let listener =
+            DefaultListener::bind("127.0.0.1:0".parse().unwrap(), SocketOptions::default())
+                .await
+                .unwrap();
         let addr = listener.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
@@ -896,10 +882,7 @@ mod tests {
         });
 
         let mut client = TcpStream::connect(addr).await.expect("connect 失败");
-        client
-            .write_all(&build_proxy_header(1, fake_src, addr))
-            .await
-            .unwrap();
+        client.write_all(&build_proxy_header(1, fake_src, addr)).await.unwrap();
         server.await.unwrap();
     }
 
@@ -914,9 +897,8 @@ mod tests {
         }))
         .unwrap();
 
-        let listener = listen_system("127.0.0.1:0".parse().unwrap(), SocketOptions::default())
-            .await
-            .unwrap();
+        let listener =
+            listen_system("127.0.0.1:0".parse().unwrap(), SocketOptions::default()).await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
@@ -975,9 +957,10 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_connections_accepted_sequentially() {
-        let listener = DefaultListener::bind("127.0.0.1:0".parse().unwrap(), SocketOptions::default())
-            .await
-            .unwrap();
+        let listener =
+            DefaultListener::bind("127.0.0.1:0".parse().unwrap(), SocketOptions::default())
+                .await
+                .unwrap();
         let addr = listener.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
@@ -1032,7 +1015,7 @@ mod tests {
             UnixAddrSpec::Path(path, perm) => {
                 assert_eq!(path, PathBuf::from("/tmp/test.sock"));
                 assert!(perm.is_none());
-            }
+            },
             other => panic!("expect Path, got {other:?}"),
         }
     }
@@ -1044,13 +1027,13 @@ mod tests {
             UnixAddrSpec::Path(path, perm) => {
                 assert_eq!(path, PathBuf::from("/tmp/test.sock"));
                 assert_eq!(perm, Some(0o755));
-            }
+            },
             other => panic!("expect Path, got {other:?}"),
         }
     }
 
     /// `@` 前缀：Linux/Android 解析为 Abstract；其他 unix 显式报错
-    ///（Windows 无 unix socket，该分支 cfg 掉，走纯函数测试）。
+    /// （Windows 无 unix socket，该分支 cfg 掉，走纯函数测试）。
     #[cfg(unix)]
     #[test]
     fn parse_unix_addr_abstract() {
@@ -1090,14 +1073,11 @@ mod tests {
     // ===== bd 6tl：abstract socket / KeepAliveConfig / TcpMptcp =====
 
     /// abstract 地址 → sun_path 字节。纯函数，全平台可测
-    ///（Go system_listener.go:119-126）。
+    /// （Go system_listener.go:119-126）。
     #[test]
     fn abstract_sockaddr_path_variants() {
         // @name → \0name
-        assert_eq!(
-            abstract_sockaddr_path("@name").unwrap(),
-            b"\0name".to_vec()
-        );
+        assert_eq!(abstract_sockaddr_path("@name").unwrap(), b"\0name".to_vec());
         // @@name → \0 + name 零填充到 108 字节（haproxy padding）
         let padded = abstract_sockaddr_path("@@name").unwrap();
         assert_eq!(padded.len(), 108);
@@ -1118,14 +1098,11 @@ mod tests {
     }
 
     /// MPTCP 监听：Windows/非 Linux 走不可用分支——静默回退普通 TCP，监听照常工作
-    ///（对齐 Go `SetMultipathTCP` 平台不支持时的行为）；Linux 走 TCP_MPTCP setsockopt
+    /// （对齐 Go `SetMultipathTCP` 平台不支持时的行为）；Linux 走 TCP_MPTCP setsockopt
     /// 路径，内核不支持同样回退。两端均断言端到端可用。
     #[tokio::test]
     async fn mptcp_listener_binds_and_accepts() {
-        let sockopt = SocketOptions {
-            tcp_mptcp: true,
-            ..Default::default()
-        };
+        let sockopt = SocketOptions { tcp_mptcp: true, ..Default::default() };
         let listener = DefaultListener::bind("127.0.0.1:0".parse().unwrap(), sockopt)
             .await
             .expect("tcp_mptcp=true 时 bind 失败（应回退普通 TCP）");
@@ -1158,9 +1135,8 @@ mod tests {
             tcp_keepalive_interval: std::time::Duration::from_secs(30),
             ..Default::default()
         };
-        let mut listener = DefaultListener::bind("127.0.0.1:0".parse().unwrap(), sockopt)
-            .await
-            .unwrap();
+        let mut listener =
+            DefaultListener::bind("127.0.0.1:0".parse().unwrap(), sockopt).await.unwrap();
         listener.add_controller(Arc::new(move |_net, _addr, socket| {
             *hook.lock() = Some(socket.keepalive()?);
             Ok(())
@@ -1188,9 +1164,8 @@ mod tests {
             tcp_keepalive_interval: std::time::Duration::ZERO,
             ..Default::default()
         };
-        let mut listener = DefaultListener::bind("127.0.0.1:0".parse().unwrap(), sockopt)
-            .await
-            .unwrap();
+        let mut listener =
+            DefaultListener::bind("127.0.0.1:0".parse().unwrap(), sockopt).await.unwrap();
         listener.add_controller(Arc::new(move |_net, _addr, socket| {
             *hook.lock() = Some(socket.keepalive()?);
             Ok(())

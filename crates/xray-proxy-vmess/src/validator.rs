@@ -2,11 +2,9 @@
 //!
 //! 对应 Go 版本 `proxy/vmess/validator.go`。
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::{collections::HashMap, sync::Mutex};
 
-use crate::account::MemoryAccount;
-use crate::aead::AuthIDDecoderHolder;
+use crate::{account::MemoryAccount, aead::AuthIDDecoderHolder};
 
 /// 本地 MemoryUser：与 VLESS 同理，不复用 `xray_common::protocol::MemoryUser`
 /// （后者 account 字段是 `Option<TypedMessage>`，无法持 `MemoryAccount`）。
@@ -24,11 +22,7 @@ impl MemoryUser {
     /// 创建新用户。
     #[must_use]
     pub fn new(email: impl Into<String>, account: MemoryAccount) -> Self {
-        Self {
-            email: email.into(),
-            level: 0,
-            account,
-        }
+        Self { email: email.into(), level: 0, account }
     }
 
     /// 设置等级（builder 风格）。
@@ -48,8 +42,7 @@ pub trait Validator: Send + Sync {
     fn remove(&self, email: &str) -> bool;
 
     /// 通过 16B AuthID hash 查找用户。
-    fn get_aead(&self, auth_id_hash: &[u8; 16])
-        -> Result<MemoryUser, crate::error::VmessError>;
+    fn get_aead(&self, auth_id_hash: &[u8; 16]) -> Result<MemoryUser, crate::error::VmessError>;
 
     /// 当前用户数。
     fn count(&self) -> usize;
@@ -158,25 +151,15 @@ impl Validator for TimedUserValidator {
         }
     }
 
-    fn get_aead(
-        &self,
-        auth_id_hash: &[u8; 16],
-    ) -> Result<MemoryUser, crate::error::VmessError> {
-        let cmd_key = self
-            .holder
-            .match_auth_id(auth_id_hash)
-            .map_err(|e| match e {
-                crate::aead::AuthIDMatchError::NotFound => crate::error::VmessError::UserNotFound,
-                crate::aead::AuthIDMatchError::NegativeTime => crate::error::VmessError::NegativeTime,
-                crate::aead::AuthIDMatchError::InvalidTime => crate::error::VmessError::InvalidTime,
-                crate::aead::AuthIDMatchError::Replay => crate::error::VmessError::Replay,
-            })?;
+    fn get_aead(&self, auth_id_hash: &[u8; 16]) -> Result<MemoryUser, crate::error::VmessError> {
+        let cmd_key = self.holder.match_auth_id(auth_id_hash).map_err(|e| match e {
+            crate::aead::AuthIDMatchError::NotFound => crate::error::VmessError::UserNotFound,
+            crate::aead::AuthIDMatchError::NegativeTime => crate::error::VmessError::NegativeTime,
+            crate::aead::AuthIDMatchError::InvalidTime => crate::error::VmessError::InvalidTime,
+            crate::aead::AuthIDMatchError::Replay => crate::error::VmessError::Replay,
+        })?;
         let inner = self.inner.lock().expect("inner poisoned");
-        inner
-            .users
-            .get(&cmd_key)
-            .cloned()
-            .ok_or(crate::error::VmessError::UserNotFound)
+        inner.users.get(&cmd_key).cloned().ok_or(crate::error::VmessError::UserNotFound)
     }
 
     fn count(&self) -> usize {
@@ -197,8 +180,9 @@ impl Validator for TimedUserValidator {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use xray_common::uuid::UUID;
+
+    use super::*;
 
     fn sample_user(email: &str, uuid_suffix: u8) -> MemoryUser {
         let mut uuid_str = String::from("66ad4540-b58c-4ad2-9926-ea63445a9b5");
@@ -295,7 +279,8 @@ mod tests {
         assert!(matches!(err, crate::error::VmessError::UserNotFound));
     }
 
-    /// Go crc64 对拍：向量由 Go 端 `crc64.Update(0, MakeTable(ECMA), hmac_sha256("VMESSBSKDF", id[16]byte]))` 生成。
+    /// Go crc64 对拍：向量由 Go 端 `crc64.Update(0, MakeTable(ECMA), hmac_sha256("VMESSBSKDF",
+    /// id[16]byte]))` 生成。
     #[test]
     fn behavior_seed_matches_go_crc64_ecma() {
         // 单 user：b831381d-...-8cda48b30811 → 0xa0c5c7e50d3ae3a3

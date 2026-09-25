@@ -12,8 +12,10 @@
 //! - `try_donate`：归还/捐献一条连接到池（池满则丢弃）
 //! - `gc_expired`：清理过期连接
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use parking_lot::Mutex;
 
@@ -30,10 +32,7 @@ pub struct PreConnEntry {
 
 impl PreConnEntry {
     fn new(seq: u64) -> Self {
-        Self {
-            created_at: Instant::now(),
-            seq,
-        }
+        Self { created_at: Instant::now(), seq }
     }
 
     /// 是否已过期（`now - created_at > ttl`）。
@@ -54,10 +53,7 @@ pub struct PreConnectConfig {
 
 impl Default for PreConnectConfig {
     fn default() -> Self {
-        Self {
-            count: 0,
-            ttl: Duration::from_secs(30),
-        }
+        Self { count: 0, ttl: Duration::from_secs(30) }
     }
 }
 
@@ -95,10 +91,7 @@ struct PoolInner {
 
 impl Clone for PreConnectPool {
     fn clone(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            inner: Arc::clone(&self.inner),
-        }
+        Self { config: self.config.clone(), inner: Arc::clone(&self.inner) }
     }
 }
 
@@ -239,10 +232,7 @@ mod tests {
 
     #[test]
     fn donate_then_acquire() {
-        let pool = PreConnectPool::new(PreConnectConfig {
-            count: 3,
-            ttl: Duration::from_secs(30),
-        });
+        let pool = PreConnectPool::new(PreConnectConfig { count: 3, ttl: Duration::from_secs(30) });
         assert!(pool.try_donate().unwrap());
         assert!(pool.try_donate().unwrap());
         assert_eq!(pool.len(), 2);
@@ -256,10 +246,7 @@ mod tests {
 
     #[test]
     fn donate_full_rejects() {
-        let pool = PreConnectPool::new(PreConnectConfig {
-            count: 2,
-            ttl: Duration::from_secs(30),
-        });
+        let pool = PreConnectPool::new(PreConnectConfig { count: 2, ttl: Duration::from_secs(30) });
         pool.try_donate().unwrap();
         pool.try_donate().unwrap();
         assert_eq!(pool.len(), 2);
@@ -272,10 +259,7 @@ mod tests {
 
     #[test]
     fn fill_deficit_fills_to_target() {
-        let pool = PreConnectPool::new(PreConnectConfig {
-            count: 5,
-            ttl: Duration::from_secs(30),
-        });
+        let pool = PreConnectPool::new(PreConnectConfig { count: 5, ttl: Duration::from_secs(30) });
         let deficit = pool.fill_deficit();
         assert_eq!(deficit, 5);
         assert_eq!(pool.len(), 5);
@@ -287,10 +271,7 @@ mod tests {
 
     #[test]
     fn fill_deficit_partial() {
-        let pool = PreConnectPool::new(PreConnectConfig {
-            count: 4,
-            ttl: Duration::from_secs(30),
-        });
+        let pool = PreConnectPool::new(PreConnectConfig { count: 4, ttl: Duration::from_secs(30) });
         pool.try_donate().unwrap(); // 1 条
         let deficit = pool.fill_deficit();
         assert_eq!(deficit, 3);
@@ -299,19 +280,14 @@ mod tests {
 
     #[test]
     fn acquire_empty_returns_none() {
-        let pool = PreConnectPool::new(PreConnectConfig {
-            count: 2,
-            ttl: Duration::from_secs(30),
-        });
+        let pool = PreConnectPool::new(PreConnectConfig { count: 2, ttl: Duration::from_secs(30) });
         assert!(pool.try_acquire().is_none());
     }
 
     #[test]
     fn gc_removes_expired() {
-        let pool = PreConnectPool::new(PreConnectConfig {
-            count: 3,
-            ttl: Duration::from_millis(1),
-        });
+        let pool =
+            PreConnectPool::new(PreConnectConfig { count: 3, ttl: Duration::from_millis(1) });
         let _ = pool.fill_deficit();
         assert_eq!(pool.len(), 3);
 
@@ -324,10 +300,7 @@ mod tests {
 
     #[test]
     fn gc_keeps_fresh() {
-        let pool = PreConnectPool::new(PreConnectConfig {
-            count: 3,
-            ttl: Duration::from_secs(30),
-        });
+        let pool = PreConnectPool::new(PreConnectConfig { count: 3, ttl: Duration::from_secs(30) });
         let _ = pool.fill_deficit();
         let cleaned = pool.gc_expired();
         assert_eq!(cleaned, 0);
@@ -336,10 +309,7 @@ mod tests {
 
     #[test]
     fn clone_shares_state() {
-        let pool = PreConnectPool::new(PreConnectConfig {
-            count: 2,
-            ttl: Duration::from_secs(30),
-        });
+        let pool = PreConnectPool::new(PreConnectConfig { count: 2, ttl: Duration::from_secs(30) });
         let pool2 = pool.clone();
         pool.try_donate().unwrap();
         assert_eq!(pool2.len(), 1);
@@ -347,10 +317,7 @@ mod tests {
 
     #[test]
     fn seq_monotonic() {
-        let pool = PreConnectPool::new(PreConnectConfig {
-            count: 3,
-            ttl: Duration::from_secs(30),
-        });
+        let pool = PreConnectPool::new(PreConnectConfig { count: 3, ttl: Duration::from_secs(30) });
         let _ = pool.fill_deficit();
         let e1 = pool.try_acquire().unwrap();
         let e2 = pool.try_acquire().unwrap();

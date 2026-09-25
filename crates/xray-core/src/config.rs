@@ -132,20 +132,14 @@ mod tests {
 
     #[test]
     fn load_unsupported_format_errors() {
-        let src = ConfigSource {
-            name: "x.pb".into(),
-            format: "protobuf".into(),
-        };
+        let src = ConfigSource { name: "x.pb".into(), format: "protobuf".into() };
         let err = load_config(&src).unwrap_err();
         assert!(matches!(err, ConfigLoadError::UnsupportedFormat(_)));
     }
 
     #[test]
     fn load_missing_file_errors() {
-        let src = ConfigSource {
-            name: "/nonexistent/x.json".into(),
-            format: "json".into(),
-        };
+        let src = ConfigSource { name: "/nonexistent/x.json".into(), format: "json".into() };
         let err = load_config(&src).unwrap_err();
         // 实际是 ConfError::Io 包装。
         assert!(matches!(err, ConfigLoadError::Parse(_)));

@@ -14,27 +14,27 @@
 //! - UDP 拨号（tokio UdpSocket + PacketConnWrapper）
 //! - Go dialer.go:253-255 freedom-UDP 动态策略（GetDynamicStrategy，需会话上下文）
 
-use std::future::Future;
-use std::io;
-use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
-use std::sync::{OnceLock, Arc};
+use std::{
+    future::Future,
+    io,
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
+    sync::{Arc, OnceLock},
+};
 
+use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 use socket2::{SockRef, Socket as Socket2};
 use tokio::net::TcpStream;
-
-use xray_common::net::address::Address;
-use xray_common::net::network::Network;
-use xray_common::net::destination::Destination;
-use xray_common::net::port::Port;
-use async_trait::async_trait;
+use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
 use xray_features::dns::{DnsClient, IpOption};
 
-use crate::connection::Connection;
-use crate::sockopt::{
-    AddressPortStrategy, DomainStrategy, HappyEyeballsConfig, SocketOptions,
-    apply_outbound_socket_options,
+use crate::{
+    connection::Connection,
+    sockopt::{
+        AddressPortStrategy, DomainStrategy, HappyEyeballsConfig, SocketOptions,
+        apply_outbound_socket_options,
+    },
 };
 
 /// TCP 拨号超时（与 Go DefaultSystemDialer 一致：16 秒）。
@@ -97,10 +97,10 @@ impl DefaultSystemDialer {
         socket.set_nonblocking(true)?;
         // 发起连接（非阻塞 connect 返回 EINPROGRESS 是正常的）。
         match socket.connect(&dest.into()) {
-            Ok(()) => {}
+            Ok(()) => {},
             Err(ref e) if e.raw_os_error() == Some(libc_error_inprogress()) => {
                 // EINPROGRESS：非阻塞 connect 正在进行中，由 tokio 等待可写。
-            }
+            },
             Err(e) => return Err(e),
         }
         // 转 tokio TcpStream。
@@ -141,13 +141,16 @@ impl SystemDialer for DefaultSystemDialer {
                                 io::ErrorKind::InvalidInput,
                                 format!("unsupported address type for dial: {other:?}"),
                             ));
-                        }
+                        },
                     };
                     let mut socket_addrs = tokio::net::lookup_host((host, port)).await?;
                     socket_addrs.next().ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::NotFound, format!("DNS resolve failed: {host}"))
+                        io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("DNS resolve failed: {host}"),
+                        )
                     })?
-                }
+                },
             };
             let stream = Self::dial_tcp_raw(src, dest_addr, DEFAULT_DIAL_TIMEOUT).await?;
             // 应用 sockopt（TCP_NODELAY + SO_KEEPALIVE）。
@@ -156,8 +159,7 @@ impl SystemDialer for DefaultSystemDialer {
             apply_outbound_socket_options(&socket, sockopt, Some(dest_addr))?;
             // 转回 tokio TcpStream，包装为 Connection。
             let tokio_stream = TcpStream::from_std(socket.into())?;
-            Ok(Box::new(crate::connection::TcpConnection::new(tokio_stream))
-                as Box<dyn Connection>)
+            Ok(Box::new(crate::connection::TcpConnection::new(tokio_stream)) as Box<dyn Connection>)
         })
     }
 }
@@ -251,19 +253,16 @@ fn random_ip_in_cidr(base: IpAddr, prefix: u8) -> Option<IpAddr> {
             let offset = rand::random::<u32>() as u64 % size;
             let ip = (u32::from(v4) & mask) as u64 + offset;
             Some(IpAddr::V4(std::net::Ipv4Addr::from(ip as u32)))
-        }
+        },
         IpAddr::V6(v6) if prefix <= 128 => {
             let shift = 128 - prefix;
             let mask = if shift >= 128 { 0 } else { u128::MAX << shift };
             let network = u128::from(v6) & mask;
             let size: u128 = 1u128.checked_shl(u32::try_from(shift).ok()?).unwrap_or(0);
-            let offset = if size == 0 {
-                rand::random::<u128>()
-            } else {
-                rand::random::<u128>() % size
-            };
+            let offset =
+                if size == 0 { rand::random::<u128>() } else { rand::random::<u128>() % size };
             Some(IpAddr::V6(std::net::Ipv6Addr::from(network + offset)))
-        }
+        },
         _ => None,
     }
 }
@@ -281,13 +280,15 @@ tokio::task_local! {
 /// （pipe + `h.Dispatch`，dialer.go:111-136）。本 crate 不能依赖 dispatcher
 /// （依赖反向），故由 xray-core 启动时注入实现（回调注入 trait 模式）。
 pub type DialerProxyHook = Arc<
-    dyn Fn(&str, &Destination) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Connection>>> + Send>>
+    dyn Fn(
+            &str,
+            &Destination,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Connection>>> + Send>>
         + Send
         + Sync,
 >;
 
-static DIALER_PROXY_HOOK: std::sync::RwLock<Option<DialerProxyHook>> =
-    std::sync::RwLock::new(None);
+static DIALER_PROXY_HOOK: std::sync::RwLock<Option<DialerProxyHook>> = std::sync::RwLock::new(None);
 
 /// 注册全局 DialerProxy 钩子（xray-core `register_outbounds` 调用）。
 pub fn set_dialer_proxy_hook(hook: DialerProxyHook) {
@@ -304,8 +305,7 @@ pub fn clear_dialer_proxy_hook() {
 /// 全局 DNS 客户端。对应 Go dialer.go:82-85 的包级 `dnsClient`（由
 /// `InitSystemDialer(dc dns.Client, ...)` 注入）。回调注入而非直接依赖
 /// xray-app-dns（依赖方向：app-dns → transport，反向成环）。
-static DNS_CLIENT: std::sync::RwLock<Option<Arc<dyn DnsClient>>> =
-    std::sync::RwLock::new(None);
+static DNS_CLIENT: std::sync::RwLock<Option<Arc<dyn DnsClient>>> = std::sync::RwLock::new(None);
 
 /// 注入全局 DNS 客户端。对应 Go `InitSystemDialer` 的 `dnsClient = dc`。
 /// `None` 清除（测试隔离）。
@@ -337,14 +337,19 @@ pub async fn lookup_for_ip(
     };
 
     let v4_enable = (local_addr.is_none() && strategy.prefer_ipv4())
-        || (local_addr.is_some_and(|a| a.is_ipv4()) && (strategy.prefer_ipv4() || strategy.fallback_ipv4()));
+        || (local_addr.is_some_and(|a| a.is_ipv4())
+            && (strategy.prefer_ipv4() || strategy.fallback_ipv4()));
     let v6_enable = (local_addr.is_none() && strategy.prefer_ipv6())
-        || (local_addr.is_some_and(|a| a.is_ipv6()) && (strategy.prefer_ipv6() || strategy.fallback_ipv6()));
+        || (local_addr.is_some_and(|a| a.is_ipv6())
+            && (strategy.prefer_ipv6() || strategy.fallback_ipv6()));
 
     let mut ips: Vec<IpAddr> = Vec::new();
     let mut err: Option<xray_features::dns::DnsError> = None;
     match client
-        .lookup_ip(domain, IpOption { ipv4_enable: v4_enable, ipv6_enable: v6_enable, fake_enable: false })
+        .lookup_ip(
+            domain,
+            IpOption { ipv4_enable: v4_enable, ipv6_enable: v6_enable, fake_enable: false },
+        )
         .await
     {
         Ok((resolved, _ttl)) => ips = resolved,
@@ -354,17 +359,20 @@ pub async fn lookup_for_ip(
     if (ips.is_empty() || err.is_some()) && strategy.has_fallback() && local_addr.is_none() {
         tracing::debug!(domain, ?err, "lookup_for_ip falling back to fallback family");
         match client
-            .lookup_ip(domain, IpOption {
-                ipv4_enable: strategy.fallback_ipv4(),
-                ipv6_enable: strategy.fallback_ipv6(),
-                fake_enable: false,
-            })
+            .lookup_ip(
+                domain,
+                IpOption {
+                    ipv4_enable: strategy.fallback_ipv4(),
+                    ipv6_enable: strategy.fallback_ipv6(),
+                    fake_enable: false,
+                },
+            )
             .await
         {
             Ok((resolved, _ttl)) => {
                 ips = resolved;
                 err = None;
-            }
+            },
             Err(e) => err = Some(e),
         }
     }
@@ -386,11 +394,16 @@ pub async fn lookup_for_ip(
 #[async_trait]
 pub trait SrvTxtResolver: Send + Sync {
     /// SRV 查询 `_service._proto.name`，返回 (target, port) 列表
-    ///（对齐 Go `LookupSRV` 返回的记录切片）。
+    /// （对齐 Go `LookupSRV` 返回的记录切片）。
     ///
     /// # Errors
     /// 系统 resolver 失败（Go：`failed to lookup SRV record`）。
-    async fn lookup_srv(&self, service: &str, proto: &str, name: &str) -> io::Result<Vec<(String, u16)>>;
+    async fn lookup_srv(
+        &self,
+        service: &str,
+        proto: &str,
+        name: &str,
+    ) -> io::Result<Vec<(String, u16)>>;
     /// TXT 查询，返回 TXT 字符串列表（一条记录内多段已拼接，对齐 Go `LookupTXT`）。
     ///
     /// # Errors
@@ -404,20 +417,18 @@ pub struct SystemSrvTxtResolver;
 impl SystemSrvTxtResolver {
     fn resolver() -> io::Result<&'static hickory_resolver::TokioResolver> {
         static RESOLVER: std::sync::LazyLock<Option<hickory_resolver::TokioResolver>> =
-            std::sync::LazyLock::new(|| {
-                match hickory_resolver::TokioResolver::builder_tokio() {
-                    Ok(builder) => match builder.build() {
-                        Ok(r) => Some(r),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "build system DNS resolver failed");
-                            None
-                        }
-                    },
+            std::sync::LazyLock::new(|| match hickory_resolver::TokioResolver::builder_tokio() {
+                Ok(builder) => match builder.build() {
+                    Ok(r) => Some(r),
                     Err(e) => {
-                        tracing::warn!(error = %e, "read system DNS config failed");
+                        tracing::warn!(error = %e, "build system DNS resolver failed");
                         None
-                    }
-                }
+                    },
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "read system DNS config failed");
+                    None
+                },
             });
         RESOLVER.as_ref().ok_or_else(|| io::Error::other("system DNS resolver unavailable"))
     }
@@ -425,7 +436,12 @@ impl SystemSrvTxtResolver {
 
 #[async_trait]
 impl SrvTxtResolver for SystemSrvTxtResolver {
-    async fn lookup_srv(&self, service: &str, proto: &str, name: &str) -> io::Result<Vec<(String, u16)>> {
+    async fn lookup_srv(
+        &self,
+        service: &str,
+        proto: &str,
+        name: &str,
+    ) -> io::Result<Vec<(String, u16)>> {
         use hickory_resolver::proto::rr::{RData, RecordType};
         // Go net.Resolver.LookupSRV 查询 `_service._proto.name`（lookup.go:628）。
         let fqdn = format!("_{service}._{proto}.{name}");
@@ -571,9 +587,9 @@ fn split_host_port(s: &str) -> Option<(String, String)> {
 ///
 /// 1. sendThrough 源地址（`DIAL_SRC`；`dialer_proxy` 非空时不取，dialer.go:233-235）
 /// 2. [`check_address_port_strategy`]：SRV/TXT 记录可能改写目标（bd 5y8）
-/// 3. `domain_strategy` 有策略 + 域名目标 → [`lookup_for_ip`] 预解析（bd 5y8）：
-///    Happy Eyeballs 条件满足时竞争拨号（bd 0ko），否则随机取一 IP 改写目标；
-///    解析失败时 ForceIP 报错、否则保留域名走系统 resolver（dialer.go:251-267）
+/// 3. `domain_strategy` 有策略 + 域名目标 → [`lookup_for_ip`] 预解析（bd 5y8）： Happy Eyeballs
+///    条件满足时竞争拨号（bd 0ko），否则随机取一 IP 改写目标； 解析失败时 ForceIP
+///    报错、否则保留域名走系统 resolver（dialer.go:251-267）
 /// 4. `dialer_proxy` 非空 → 经 [`DIALER_PROXY_HOOK`] 重定向（bd enk，redirect）
 /// 5. effective dialer 直连
 ///
@@ -589,11 +605,7 @@ pub async fn dial_system(
     // （dialer.go:228-235）+ `resolveSrcAddr` 端口 0（system_dialer.go:33-46）。
     // dialer_proxy 非空时不参与（Go dialer.go:233 `len(sockopt.DialerProxy) == 0`）。
     let src = if sockopt.dialer_proxy.is_empty() {
-        DIAL_SRC
-            .try_with(|v| *v)
-            .ok()
-            .flatten()
-            .map(|ip| SocketAddr::new(ip, 0))
+        DIAL_SRC.try_with(|v| *v).ok().flatten().map(|ip| SocketAddr::new(ip, 0))
     } else {
         None
     };
@@ -609,8 +621,8 @@ pub async fn dial_system(
                 "replace destination with SRV/TXT record"
             );
             dest = new_dest;
-        }
-        Ok(None) => {}
+        },
+        Ok(None) => {},
         Err(e) => tracing::warn!(error = %e, "address port strategy lookup failed"),
     }
 
@@ -621,9 +633,8 @@ pub async fn dial_system(
         Arc::clone(&*guard)
     };
 
-    // 2. DomainStrategy 预解析（bd 5y8，Go dialer.go:251-267）。
-    //    ponytail: Go dialer.go:253-255 的 freedom-UDP 动态策略
-    //    （GetDynamicStrategy）需要 session 的 outboundName/OriginalTarget，
+    // 2. DomainStrategy 预解析（bd 5y8，Go dialer.go:251-267）。 ponytail: Go dialer.go:253-255 的
+    //    freedom-UDP 动态策略 （GetDynamicStrategy）需要 session 的 outboundName/OriginalTarget，
     //    dial_system 无会话上下文——留待 freedom 出站层接入。
     if sockopt.domain_strategy.has_strategy() && dest.address().is_domain() {
         let strategy = sockopt.domain_strategy;
@@ -651,7 +662,7 @@ pub async fn dial_system(
                 let ip = ips[rand::random_range(0..ips.len())];
                 dest = Destination::new(Address::from(ip), dest.port(), dest.network());
                 tracing::info!(to = %dest, "replace destination with resolved ip");
-            }
+            },
             Err(e) => {
                 tracing::warn!(domain, error = %e, "failed to resolve ip");
                 if strategy.force_ip() {
@@ -659,17 +670,14 @@ pub async fn dial_system(
                     return Err(e);
                 }
                 // 非 Force：保留域名，走下方 effective dialer 的系统解析。
-            }
+            },
         }
     }
 
-    // 3. DialerProxy（bd enk）：对应 Go dialer.go:270-279——非空时不直连，经指定
-    //    tag 的 outbound handler 拨号（redirect）。可能已带上步骤 2 解析的 IP。
+    // 3. DialerProxy（bd enk）：对应 Go dialer.go:270-279——非空时不直连，经指定 tag 的 outbound
+    //    handler 拨号（redirect）。可能已带上步骤 2 解析的 IP。
     if !sockopt.dialer_proxy.is_empty() {
-        let hook = DIALER_PROXY_HOOK
-            .read()
-            .expect("DIALER_PROXY_HOOK lock poisoned")
-            .clone();
+        let hook = DIALER_PROXY_HOOK.read().expect("DIALER_PROXY_HOOK lock poisoned").clone();
         let Some(hook) = hook else {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -742,10 +750,11 @@ fn libc_error_inprogress() -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use xray_common::net::address::Address;
-    use xray_common::net::port::Port;
     use std::net::Ipv4Addr;
+
+    use xray_common::net::{address::Address, port::Port};
+
+    use super::*;
 
     fn localhost_dest(port: u16) -> Destination {
         Destination::tcp(Address::IPv4(Ipv4Addr::LOCALHOST), Port::new(port))
@@ -777,9 +786,15 @@ mod tests {
         match result {
             Err(err) => {
                 // .invalid 域名 DNS 解析必失败，但错误不应是 InvalidInput（domain rejected）
-                assert_ne!(err.kind(), io::ErrorKind::InvalidInput, "domain should not be rejected");
-            }
-            Ok(conn) => { drop(conn); }
+                assert_ne!(
+                    err.kind(),
+                    io::ErrorKind::InvalidInput,
+                    "domain should not be rejected"
+                );
+            },
+            Ok(conn) => {
+                drop(conn);
+            },
         }
     }
 
@@ -818,10 +833,7 @@ mod tests {
 
     #[test]
     fn destination_to_socket_addr_ipv4() {
-        let dest = Destination::tcp(
-            Address::IPv4(Ipv4Addr::new(1, 2, 3, 4)),
-            Port::new(8080),
-        );
+        let dest = Destination::tcp(Address::IPv4(Ipv4Addr::new(1, 2, 3, 4)), Port::new(8080));
         let addr = destination_to_socket_addr(&dest).unwrap();
         assert_eq!(addr.port(), 8080);
         assert_eq!(addr.ip().to_string(), "1.2.3.4");
@@ -912,9 +924,7 @@ mod tests {
         );
         let sockopt = SocketOptions::default();
         let v4_src: IpAddr = "127.0.0.2".parse().unwrap();
-        let result = DIAL_SRC
-            .scope(Some(v4_src), dial_system(&dest, &sockopt))
-            .await;
+        let result = DIAL_SRC.scope(Some(v4_src), dial_system(&dest, &sockopt)).await;
         assert!(result.is_err(), "v4 源 + v6 目标应拨号失败（对齐 Go）");
     }
 
@@ -938,10 +948,7 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("dialerProxy without hook should fail"),
         };
-        assert!(
-            err.to_string().contains("no outbound manager"),
-            "unexpected error: {err}"
-        );
+        assert!(err.to_string().contains("no outbound manager"), "unexpected error: {err}");
     }
 
     /// dialerProxy 设置 + 钩子 → 连接经钩子建立（tag 透传，Go dialer.go:274-278）。
@@ -993,9 +1000,7 @@ mod tests {
     }
 
     impl FakeDns {
-        fn new(
-            script: Vec<Result<Vec<IpAddr>, xray_features::dns::DnsError>>,
-        ) -> Arc<Self> {
+        fn new(script: Vec<Result<Vec<IpAddr>, xray_features::dns::DnsError>>) -> Arc<Self> {
             Arc::new(Self {
                 seen: parking_lot::Mutex::new(Vec::new()),
                 script: parking_lot::Mutex::new(script),
@@ -1032,7 +1037,7 @@ mod tests {
     }
 
     /// IPOption 计算：UseIP（prefer both）→ v4+v6；UseIPv4v6 → 仅 v4 首查
-    ///（Go dialer.go:92-95）。
+    /// （Go dialer.go:92-95）。
     #[tokio::test]
     async fn lookup_for_ip_ip_option_by_strategy() {
         let _guard = DNS_TEST_LOCK.lock();
@@ -1076,10 +1081,7 @@ mod tests {
         assert_eq!(ips, vec![IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)]);
         assert_eq!(
             fake.seen.lock().as_slice(),
-            &[
-                ("example.com".into(), true, false),
-                ("example.com".into(), false, true),
-            ]
+            &[("example.com".into(), true, false), ("example.com".into(), false, true),]
         );
         set_dns_client(None);
     }
@@ -1106,6 +1108,7 @@ mod tests {
         async fn lookup_srv(&self, _s: &str, _p: &str, _n: &str) -> io::Result<Vec<(String, u16)>> {
             Ok(self.srv.clone())
         }
+
         async fn lookup_txt(&self, _n: &str) -> io::Result<Vec<String>> {
             Ok(self.txt.clone())
         }
@@ -1120,19 +1123,34 @@ mod tests {
     async fn aps_none_and_ip_dest_no_override() {
         let resolver = FakeSrvTxt { srv: vec![], txt: vec![] };
         let dest = Destination::tcp(Address::new_domain("example.com"), Port::new(80));
-        assert!(check_address_port_strategy_with(&resolver, &dest, &aps_sockopt(AddressPortStrategy::None)).await.unwrap().is_none());
+        assert!(
+            check_address_port_strategy_with(
+                &resolver,
+                &dest,
+                &aps_sockopt(AddressPortStrategy::None)
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
 
         let dest = Destination::tcp(Address::from_ipv4_bytes([1, 2, 3, 4]), Port::new(80));
-        assert!(check_address_port_strategy_with(&resolver, &dest, &aps_sockopt(AddressPortStrategy::SrvPortAndAddress)).await.unwrap().is_none());
+        assert!(
+            check_address_port_strategy_with(
+                &resolver,
+                &dest,
+                &aps_sockopt(AddressPortStrategy::SrvPortAndAddress)
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
     }
 
     /// SrvPortAndAddress：端口+地址均覆盖；下划线前缀剥除后查询（dialer.go:178-195）。
     #[tokio::test]
     async fn aps_srv_port_and_address() {
-        let resolver = FakeSrvTxt {
-            srv: vec![("srv.example.com".into(), 8443)],
-            txt: vec![],
-        };
+        let resolver = FakeSrvTxt { srv: vec![("srv.example.com".into(), 8443)], txt: vec![] };
         let dest = Destination::tcp(Address::new_domain("_sip._tcp.example.com"), Port::new(5060));
         let new_dest = check_address_port_strategy_with(
             &resolver,
@@ -1152,10 +1170,14 @@ mod tests {
     async fn aps_srv_port_only_keeps_address() {
         let resolver = FakeSrvTxt { srv: vec![("x.y".into(), 993)], txt: vec![] };
         let dest = Destination::tcp(Address::new_domain("_imaps._tcp.example.com"), Port::new(143));
-        let new_dest = check_address_port_strategy_with(&resolver, &dest, &aps_sockopt(AddressPortStrategy::SrvPortOnly))
-            .await
-            .unwrap()
-            .expect("should override");
+        let new_dest = check_address_port_strategy_with(
+            &resolver,
+            &dest,
+            &aps_sockopt(AddressPortStrategy::SrvPortOnly),
+        )
+        .await
+        .unwrap()
+        .expect("should override");
         assert_eq!(new_dest.port().value(), 993);
         assert_eq!(new_dest.address(), &Address::new_domain("_imaps._tcp.example.com"));
     }
@@ -1165,10 +1187,14 @@ mod tests {
     async fn aps_srv_address_parses_ip() {
         let resolver = FakeSrvTxt { srv: vec![("10.0.0.1".into(), 80)], txt: vec![] };
         let dest = Destination::tcp(Address::new_domain("_a._b.example.com"), Port::new(80));
-        let new_dest = check_address_port_strategy_with(&resolver, &dest, &aps_sockopt(AddressPortStrategy::SrvAddressOnly))
-            .await
-            .unwrap()
-            .unwrap();
+        let new_dest = check_address_port_strategy_with(
+            &resolver,
+            &dest,
+            &aps_sockopt(AddressPortStrategy::SrvAddressOnly),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(new_dest.address(), &Address::from_ipv4_bytes([10, 0, 0, 1]));
         assert_eq!(new_dest.port().value(), 80);
     }
@@ -1178,9 +1204,13 @@ mod tests {
     async fn aps_srv_invalid_format_errors() {
         let resolver = FakeSrvTxt { srv: vec![], txt: vec![] };
         let dest = Destination::tcp(Address::new_domain("example.com"), Port::new(80));
-        let err = check_address_port_strategy_with(&resolver, &dest, &aps_sockopt(AddressPortStrategy::SrvPortOnly))
-            .await
-            .unwrap_err();
+        let err = check_address_port_strategy_with(
+            &resolver,
+            &dest,
+            &aps_sockopt(AddressPortStrategy::SrvPortOnly),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("invalid address format"), "got: {err}");
     }
 
@@ -1190,16 +1220,20 @@ mod tests {
         let resolver = FakeSrvTxt {
             srv: vec![],
             txt: vec![
-                "no-port-host".into(),       // 无冒号 → SplitHostPort 失败
+                "no-port-host".into(),             // 无冒号 → SplitHostPort 失败
                 "bad.example.com:notaport".into(), // 端口非数字 → 跳过
                 "good.example.com:8443".into(),    // 有效
             ],
         };
         let dest = Destination::tcp(Address::new_domain("example.com"), Port::new(80));
-        let new_dest = check_address_port_strategy_with(&resolver, &dest, &aps_sockopt(AddressPortStrategy::TxtPortAndAddress))
-            .await
-            .unwrap()
-            .expect("third record should win");
+        let new_dest = check_address_port_strategy_with(
+            &resolver,
+            &dest,
+            &aps_sockopt(AddressPortStrategy::TxtPortAndAddress),
+        )
+        .await
+        .unwrap()
+        .expect("third record should win");
         assert_eq!(new_dest.port().value(), 8443);
         assert_eq!(new_dest.address(), &Address::new_domain("good.example.com"));
     }
@@ -1210,10 +1244,14 @@ mod tests {
         let resolver = FakeSrvTxt { srv: vec![], txt: vec!["garbage".into()] };
         let dest = Destination::tcp(Address::new_domain("example.com"), Port::new(80));
         assert!(
-            check_address_port_strategy_with(&resolver, &dest, &aps_sockopt(AddressPortStrategy::TxtPortOnly))
-                .await
-                .unwrap()
-                .is_none()
+            check_address_port_strategy_with(
+                &resolver,
+                &dest,
+                &aps_sockopt(AddressPortStrategy::TxtPortOnly)
+            )
+            .await
+            .unwrap()
+            .is_none()
         );
     }
 
@@ -1323,16 +1361,16 @@ impl SystemDialer for DnsResolvingDialer {
                                     format!("DNS lookup returned no addresses for {domain}"),
                                 ))
                             }
-                        }
+                        },
                         Err(e) => {
                             tracing::warn!(target = %domain, error = %e, "DNS lookup failed");
                             Err(io::Error::new(
                                 io::ErrorKind::AddrNotAvailable,
                                 format!("DNS lookup failed for {domain}: {e}"),
                             ))
-                        }
+                        },
                     }
-                }
+                },
                 _ => self.inner.dial(src, destination, sockopt).await,
             }
         })
@@ -1340,12 +1378,12 @@ impl SystemDialer for DnsResolvingDialer {
 }
 
 /// 初始化系统拨号器。对应 Go `InitSystemDialer(dc dns.Client, om outbound.Manager)`
-///（dialer.go:284-287）：
+/// （dialer.go:284-287）：
 ///
-/// - `dns_client`：注入全局 DNS 客户端（`LookupForIP` 数据源）；`None` 时
-///   `LookupForIP` 报 "DNS client not initialized"，域名拨号仍走系统 resolver。
-///   outbound manager（`obm`）等价物 [`DIALER_PROXY_HOOK`](set_dialer_proxy_hook)
-///   由 xray-core `register_outbounds` 单独注入（bd enk）。
+/// - `dns_client`：注入全局 DNS 客户端（`LookupForIP` 数据源）；`None` 时 `LookupForIP` 报 "DNS
+///   client not initialized"，域名拨号仍走系统 resolver。 outbound manager（`obm`）等价物
+///   [`DIALER_PROXY_HOOK`](set_dialer_proxy_hook) 由 xray-core `register_outbounds` 单独注入（bd
+///   enk）。
 /// - effective dialer 替换为 [`DnsResolvingDialer`]（域名兜底解析）。
 pub fn init_system_dialer(dns_client: Option<Arc<dyn DnsClient>>) {
     set_dns_client(dns_client);

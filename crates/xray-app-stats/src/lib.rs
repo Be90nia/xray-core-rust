@@ -11,26 +11,25 @@
 //! ## IO 边界范围（与 P4-4 proxyman 一致策略）
 //!
 //! - **业务核心**：Counter/OnlineMap/Channel/Manager 实现，完全独立可测
-//! - **gRPC server 注册留 trait**：[`command::StatsService`] trait + [`command::DefaultStatsService`]
-//!   编排类，不引入 tonic（由 `xray-app-commander` 注册）
-//! - **SysStatsProvider 注入**：之前误判「Rust 无 runtime.MemStats 等价」，实际可用
-//!   sysinfo crate（被 Windows Defender 拦截未接入）或 jemalloc 实现。
+//! - **gRPC server 注册留 trait**：[`command::StatsService`] trait +
+//!   [`command::DefaultStatsService`] 编排类，不引入 tonic（由 `xray-app-commander` 注册）
+//! - **SysStatsProvider 注入**：之前误判「Rust 无 runtime.MemStats 等价」，实际可用 sysinfo
+//!   crate（被 Windows Defender 拦截未接入）或 jemalloc 实现。
 //!   默认提供两个实现：[`command::DefaultSysStatsProvider`] (num_threads=1) 与
 //!   [`command::StdParallelismSysStatsProvider`] (num_threads=逻辑 CPU 数，纯 std)
 //!
 //! ## 关键决策
 //!
 //! 1. **修正 features/stats.rs**：早期简化版 Counter::add/set 不返回旧值且缺
-//!    OnlineMap/Channel；重写对齐 Go 语义。`xray-app-dispatcher` 的 `Arc<dyn Counter>`
-//!    兼容（add 调用忽略返回值）
-//! 2. **Channel 简化**：去掉 Go publisher mpsc + broadcast goroutine 双层结构，
-//!    `publish` 直接同步遍历订阅者 `try_send`（blocking 模式失败时 spawn 重试 task）。
-//!    等价语义，更少抽象。
-//! 3. **Manager 的 Start/Close 独立暴露**（不在 features::stats::Manager trait 中）：
-//!    Go 通过 features.Feature 嵌入，Rust 端 Manager trait 不含 Start/Close，
-//!    由本 crate Manager 结构体额外提供方法
-//! 4. **ChannelSubscriber 在 features 层定义**：所有 Channel 实现共用同一订阅句柄类型，
-//!    含 `mpsc::Receiver<ChannelMessage>` + ID
+//!    OnlineMap/Channel；重写对齐 Go 语义。`xray-app-dispatcher` 的 `Arc<dyn Counter>` 兼容（add
+//!    调用忽略返回值）
+//! 2. **Channel 简化**：去掉 Go publisher mpsc + broadcast goroutine 双层结构， `publish`
+//!    直接同步遍历订阅者 `try_send`（blocking 模式失败时 spawn 重试 task）。 等价语义，更少抽象。
+//! 3. **Manager 的 Start/Close 独立暴露**（不在 features::stats::Manager trait 中）： Go 通过
+//!    features.Feature 嵌入，Rust 端 Manager trait 不含 Start/Close， 由本 crate Manager
+//!    结构体额外提供方法
+//! 4. **ChannelSubscriber 在 features 层定义**：所有 Channel 实现共用同一订阅句柄类型， 含
+//!    `mpsc::Receiver<ChannelMessage>` + ID
 
 pub mod channel;
 pub mod command;
@@ -42,20 +41,20 @@ pub mod online_map;
 // Re-export 主要公共类型
 pub use channel::{ChannelConfig, StatsChannel};
 pub use command::{
-    DefaultStatsService, DefaultSysStatsProvider, GetAllOnlineUsersResponse, GetStatsRequest,
-    GetStatsResponse, GetStatsOnlineIpListResponse, GetUsersStatsRequest, GetUsersStatsResponse,
-    OnlineIpEntry, QueryStatsRequest, QueryStatsResponse, Stat, StdParallelismSysStatsProvider,
-    StatsCommandError, StatsService, SysStats, SysStatsProvider, UserStat,
+    DefaultStatsService, DefaultSysStatsProvider, GetAllOnlineUsersResponse,
+    GetStatsOnlineIpListResponse, GetStatsRequest, GetStatsResponse, GetUsersStatsRequest,
+    GetUsersStatsResponse, OnlineIpEntry, QueryStatsRequest, QueryStatsResponse, Stat,
+    StatsCommandError, StatsService, StdParallelismSysStatsProvider, SysStats, SysStatsProvider,
+    UserStat,
 };
 pub use counter::Counter;
 pub use error::StatsError;
 pub use manager::Manager;
 pub use online_map::OnlineMap;
-
 // features 层 trait 透出
 pub use xray_features::stats::{
+    Channel, ChannelError, ChannelMessage, ChannelSubscriber, Counter as CounterTrait,
+    Manager as ManagerTrait, ManagerError, NoopManager, OnlineMap as OnlineMapTrait,
     get_or_register_channel, get_or_register_counter, get_or_register_online_map,
-    subscribe_runnable_channel, unsubscribe_closable_channel, Channel, ChannelError,
-    ChannelMessage, ChannelSubscriber, Counter as CounterTrait, Manager as ManagerTrait,
-    ManagerError, NoopManager, OnlineMap as OnlineMapTrait,
+    subscribe_runnable_channel, unsubscribe_closable_channel,
 };

@@ -2,8 +2,7 @@
 //!
 //! 对应 Go 版本 `common/cache` 包，提供 LRU 缓存实现。
 
-use std::collections::HashMap;
-use std::hash::Hash;
+use std::{collections::HashMap, hash::Hash};
 
 /// LRU（最近最少使用）缓存，支持可配置容量。
 ///
@@ -20,11 +19,7 @@ impl<K: Hash + Eq + Clone, V: Clone> LruCache<K, V> {
     ///
     /// 容量为 0 表示不缓存任何条目。
     pub fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            entries: HashMap::new(),
-            order: Vec::new(),
-        }
+        Self { capacity, entries: HashMap::new(), order: Vec::new() }
     }
 
     /// 获取缓存中的值。

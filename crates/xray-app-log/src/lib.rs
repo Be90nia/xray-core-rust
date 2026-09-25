@@ -26,12 +26,12 @@ pub use command::{
     NoopLogServiceRegistrar,
 };
 pub use config::{LogConfig, LogFormat, LogType, SeverityLevel};
-pub use error::{at_error, at_warning, LogError};
+pub use error::{LogError, at_error, at_warning};
+pub use feature::LogFeature;
 pub use instance::{
     AccessMessage, AccessStatus, ConsoleHandler, ConsoleHandlerCreator, DnsLog, DnsStatus,
-    FileHandler, FileHandlerCreator, GeneralMessage, HandlerCreator,
-    HandlerCreatorOptions, HandlerCreatorRegistry, LogEntry, LogHandler, LogInstance,
-    MaskingHandler, NoneHandlerCreator, register_default_creators,
+    FileHandler, FileHandlerCreator, GeneralMessage, HandlerCreator, HandlerCreatorOptions,
+    HandlerCreatorRegistry, LogEntry, LogHandler, LogInstance, MaskingHandler, NoneHandlerCreator,
+    register_default_creators,
 };
 pub use mask::{mask_addresses, parse_mask_address};
-pub use feature::LogFeature;

@@ -6,9 +6,11 @@
 
 use std::sync::Arc;
 
-use crate::config::{BridgeConfig, PortalConfig};
-use crate::error::ReverseError;
-use crate::picker::{PickerWorker, StaticMuxPicker};
+use crate::{
+    config::{BridgeConfig, PortalConfig},
+    error::ReverseError,
+    picker::{PickerWorker, StaticMuxPicker},
+};
 
 /// Bridge factory trait：构造一个 bridge。
 ///
@@ -109,9 +111,9 @@ pub type SharedPortal = Arc<dyn Portal>;
 // 与 `app/reverse/portal.go`（Portal 编排：picker + outbound 注册）。
 // ===========================================================================
 
-use tokio::sync::watch;
 use std::time::Duration;
 
+use tokio::sync::watch;
 use xray_common::net::destination::Destination;
 
 use crate::worker::{BridgeWorker, PortalWorker};
@@ -225,8 +227,7 @@ impl LinkDispatch for DefaultDispatcherAdapter {
         // Go server.go:166-174：reverse 帧内 Source/Local 覆写 ctx inbound——
         // bridge 侧本地出站（路由规则/Access 日志）看到真实客户端源。
         let meta = |d: Option<&Destination>| {
-            d.map(|x| format!("{}:{}", x.address(), x.port().value()))
-                .unwrap_or_default()
+            d.map(|x| format!("{}:{}", x.address(), x.port().value())).unwrap_or_default()
         };
         self.0
             .dispatch_link(
@@ -293,12 +294,8 @@ impl RuntimeBridge {
         workers.lock().retain(|w| w.is_active());
 
         // 快照后逐个 await（parking_lot guard 不可跨 await）
-        let active: Vec<std::sync::Arc<BridgeWorker>> = workers
-            .lock()
-            .iter()
-            .filter(|w| w.is_active())
-            .cloned()
-            .collect();
+        let active: Vec<std::sync::Arc<BridgeWorker>> =
+            workers.lock().iter().filter(|w| w.is_active()).cloned().collect();
         let mut num_connections = 0u32;
         let num_worker = active.len() as u32;
         for w in &active {
@@ -311,7 +308,7 @@ impl RuntimeBridge {
                 Err(e) => {
                     // Go bridge.go:83-86：LogWarning + return nil（不中断 monitor）
                     crate::error::at_warning(&e);
-                }
+                },
             }
         }
         Ok(())
@@ -337,10 +334,7 @@ impl Bridge for RuntimeBridge {
                     _ = tokio::time::sleep(BRIDGE_MONITOR_INTERVAL) => {}
                     _ = wait_stop(&mut stop_rx) => break,
                 }
-                if Self::monitor_step(&dispatcher, &domain, &tag, &workers)
-                    .await
-                    .is_err()
-                {
+                if Self::monitor_step(&dispatcher, &domain, &tag, &workers).await.is_err() {
                     break;
                 }
             }
@@ -377,8 +371,8 @@ impl Bridge for RuntimeBridge {
 ///
 /// 对应 Go `Portal`（portal.go:23-101）：
 /// - `Start`：`ohm.AddHandler(tag, &Outbound{...})`；`Close`：RemoveHandler
-/// - `HandleConnection`（经 [`crate::outbound::PortalOutbound`]）：目标域命中 →
-///   建 ClientWorker+PortalWorker；否则 picker 选 worker dispatch
+/// - `HandleConnection`（经 [`crate::outbound::PortalOutbound`]）：目标域命中 → 建
+///   ClientWorker+PortalWorker；否则 picker 选 worker dispatch
 pub struct RuntimePortal {
     registrar: std::sync::Arc<dyn crate::outbound::OutboundRegistrar>,
     tag: String,
@@ -481,59 +475,32 @@ mod tests {
 
     #[test]
     fn validate_bridge_rejects_empty_tag() {
-        let c = BridgeConfig {
-            tag: "".into(),
-            domain: "d".into(),
-        };
-        assert!(matches!(
-            validate_bridge_config(&c),
-            Err(ReverseError::BridgeTagEmpty)
-        ));
+        let c = BridgeConfig { tag: "".into(), domain: "d".into() };
+        assert!(matches!(validate_bridge_config(&c), Err(ReverseError::BridgeTagEmpty)));
     }
 
     #[test]
     fn validate_bridge_rejects_empty_domain() {
-        let c = BridgeConfig {
-            tag: "t".into(),
-            domain: "".into(),
-        };
-        assert!(matches!(
-            validate_bridge_config(&c),
-            Err(ReverseError::BridgeDomainEmpty)
-        ));
+        let c = BridgeConfig { tag: "t".into(), domain: "".into() };
+        assert!(matches!(validate_bridge_config(&c), Err(ReverseError::BridgeDomainEmpty)));
     }
 
     #[test]
     fn validate_bridge_accepts_valid() {
-        let c = BridgeConfig {
-            tag: "t".into(),
-            domain: "d".into(),
-        };
+        let c = BridgeConfig { tag: "t".into(), domain: "d".into() };
         assert!(validate_bridge_config(&c).is_ok());
     }
 
     #[test]
     fn validate_portal_rejects_empty_tag() {
-        let c = PortalConfig {
-            tag: "".into(),
-            domain: "d".into(),
-        };
-        assert!(matches!(
-            validate_portal_config(&c),
-            Err(ReverseError::PortalTagEmpty)
-        ));
+        let c = PortalConfig { tag: "".into(), domain: "d".into() };
+        assert!(matches!(validate_portal_config(&c), Err(ReverseError::PortalTagEmpty)));
     }
 
     #[test]
     fn validate_portal_rejects_empty_domain() {
-        let c = PortalConfig {
-            tag: "t".into(),
-            domain: "".into(),
-        };
-        assert!(matches!(
-            validate_portal_config(&c),
-            Err(ReverseError::PortalDomainEmpty)
-        ));
+        let c = PortalConfig { tag: "t".into(), domain: "".into() };
+        assert!(matches!(validate_portal_config(&c), Err(ReverseError::PortalDomainEmpty)));
     }
 
     #[test]

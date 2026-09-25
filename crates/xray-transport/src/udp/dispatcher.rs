@@ -10,14 +10,15 @@
 //! Go 的 `Dispatcher` 为每个 (source, destination) 对维护一个 `connEntry`，
 //! 包含出站连接和最后活动时间。无活动的 entry 在 1 分钟后被清理。
 
-use std::collections::HashMap;
-use std::io;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    io,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tokio::{sync::Mutex, task::JoinHandle};
 
 /// UDP NAT 会话超时（对应 Go `udp.Dispatcher.cleanupInterval = 1min`）。
 const UDP_NAT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -49,11 +50,7 @@ pub struct ConnEntry {
 impl ConnEntry {
     /// 创建新的 NAT 会话。
     pub fn new(source: SocketAddr, destination: SocketAddr) -> Self {
-        Self {
-            last_activity: Instant::now(),
-            destination,
-            source,
-        }
+        Self { last_activity: Instant::now(), destination, source }
     }
 
     /// 更新最后活动时间。
@@ -97,8 +94,7 @@ pub struct UdpDispatcher {
 impl UdpDispatcher {
     /// 创建新的 UDP Dispatcher。
     pub fn new() -> Self {
-        let entries: Arc<Mutex<HashMap<NatKey, ConnEntry>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let entries: Arc<Mutex<HashMap<NatKey, ConnEntry>>> = Arc::new(Mutex::new(HashMap::new()));
 
         // 启动清理 task。
         let entries_clone = Arc::clone(&entries);
@@ -106,10 +102,7 @@ impl UdpDispatcher {
             Self::cleanup_loop(entries_clone).await;
         });
 
-        Self {
-            entries,
-            cleanup_handle: Some(handle),
-        }
+        Self { entries, cleanup_handle: Some(handle) }
     }
 
     /// 注册或刷新一个 NAT 会话。
@@ -235,8 +228,9 @@ impl Drop for UdpDispatcher {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tokio::time;
+
+    use super::*;
 
     #[tokio::test]
     async fn register_creates_entry() {

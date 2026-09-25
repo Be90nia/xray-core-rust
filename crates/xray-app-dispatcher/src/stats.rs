@@ -3,8 +3,11 @@
 //! 对应 Go `app/dispatcher/stats.go`。`SizeStatWriter` 在每次写入时累加计数，
 //! `SizeStatReader` 在每次读取时累加计数，用于统计用户上下行流量。
 use std::sync::Arc;
-use xray_buf::io::{Reader, Result as IoResult, Writer};
-use xray_buf::multi::MultiBuffer;
+
+use xray_buf::{
+    io::{Reader, Result as IoResult, Writer},
+    multi::MultiBuffer,
+};
 use xray_features::stats::Counter;
 
 /// 字节计数 Writer 包装
@@ -78,7 +81,8 @@ impl SizeStatReader {
 impl Reader for SizeStatReader {
     fn read_multi_buffer(
         &mut self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = IoResult<MultiBuffer>> + Send + '_>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = IoResult<MultiBuffer>> + Send + '_>>
+    {
         Box::pin(async move {
             let mb = self.reader.read_multi_buffer().await?;
             let n = i64::try_from(mb.len()).unwrap_or(i64::MAX);
@@ -112,10 +116,14 @@ pub fn maybe_wrap_reader(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicI64, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicI64, Ordering},
+    };
+
     use xray_buf::multi::MultiBuffer;
+
+    use super::*;
 
     /// 测试用 Counter（实现 xray_features::stats::Counter）
     #[derive(Debug, Default)]
@@ -127,10 +135,12 @@ mod tests {
         fn value(&self) -> i64 {
             self.value.load(Ordering::SeqCst)
         }
+
         fn add(&self, delta: i64) -> i64 {
             // 对齐 Go 语义：返回旧值（features::stats::Counter trait 修正后）
             self.value.fetch_add(delta, Ordering::SeqCst)
         }
+
         fn set(&self, value: i64) -> i64 {
             // 对齐 Go 语义：返回旧值
             self.value.swap(value, Ordering::SeqCst)
@@ -147,7 +157,8 @@ mod tests {
         fn write_multi_buffer(
             &mut self,
             mb: MultiBuffer,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = IoResult<()>> + Send + '_>> {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = IoResult<()>> + Send + '_>>
+        {
             let _n = mb.len();
             Box::pin(async move {
                 // 只记长度，丢弃 mb
@@ -215,7 +226,8 @@ mod tests {
     impl Reader for FixedReader {
         fn read_multi_buffer(
             &mut self,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = IoResult<MultiBuffer>> + Send + '_>> {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = IoResult<MultiBuffer>> + Send + '_>>
+        {
             let mb = if self.idx < self.data.len() {
                 let mut buf = MultiBuffer::new();
                 buf.merge_bytes(&self.data[self.idx]);
@@ -231,10 +243,7 @@ mod tests {
     #[tokio::test]
     async fn reader_counts_bytes() {
         let counter: Arc<dyn Counter> = Arc::new(TestCounter::default());
-        let reader = Box::new(FixedReader::new(vec![
-            b"hello".to_vec(),
-            b"world".to_vec(),
-        ]));
+        let reader = Box::new(FixedReader::new(vec![b"hello".to_vec(), b"world".to_vec()]));
         let mut sr = SizeStatReader::new(counter.clone(), reader);
 
         let mb1 = sr.read_multi_buffer().await.unwrap();
@@ -285,9 +294,10 @@ mod tests {
         writer.shutdown();
 
         let mut reader = Box::new(r) as Box<dyn xray_buf::io::Reader>;
-        let res = tokio::time::timeout(std::time::Duration::from_secs(2), reader.read_multi_buffer())
-            .await
-            .expect("shutdown not propagated: read hangs");
+        let res =
+            tokio::time::timeout(std::time::Duration::from_secs(2), reader.read_multi_buffer())
+                .await
+                .expect("shutdown not propagated: read hangs");
         assert!(
             matches!(res, Err(xray_buf::io::Error::Eof)),
             "shutdown must propagate through SizeStatWriter, got: {res:?}"

@@ -3,17 +3,15 @@
 //! 翻译自 XTLS/REALITY `handshake_server_tls13.go` 的 `init()` 与 `handshake()`
 //! pickCertificate 块（xray-core v26.6.1 依赖 v0.0.0-20260322-9234c772ba8f）：
 //!
-//! - `init()`：进程启动生成一次 ed25519 密钥 + 极简空证书 `signedCert`
-//!   （`SerialNumber=0`，无 subject/SAN/扩展）；
-//! - 每连接（auth 成功后）：`cert = bytes.Clone(signedCert)`，把
-//!   `HMAC-SHA512(AuthKey, ed25519Pub)` 的 64 字节写入 cert 末尾 64 字节
-//!   （原位覆盖 ed25519 signatureValue）；客户端（reality.go
-//!   `VerifyPeerCertificate`：`h.Write(pub)` 后比对 `certs[0].Signature`）
-//!   重算 HMAC 比对，通过即 Verified；
-//! - 配置 `Mldsa65Key` 时 Go 换用带 3309 字节保留扩展（OID 0.0）的变体模板，
-//!   并把 `HMAC-SHA512(AuthKey, pub‖ClientHello‖ServerHello)` 的 ML-DSA-65
-//!   签名写入 `cert[126:]` 固定偏移——Rust 端已实现
-//!   （[`generate_reality_ed25519_cert_mldsa65`]，偏移动态定位）；生产接线
+//! - `init()`：进程启动生成一次 ed25519 密钥 + 极简空证书 `signedCert` （`SerialNumber=0`，无
+//!   subject/SAN/扩展）；
+//! - 每连接（auth 成功后）：`cert = bytes.Clone(signedCert)`，把 `HMAC-SHA512(AuthKey, ed25519Pub)`
+//!   的 64 字节写入 cert 末尾 64 字节 （原位覆盖 ed25519 signatureValue）；客户端（reality.go
+//!   `VerifyPeerCertificate`：`h.Write(pub)` 后比对 `certs[0].Signature`） 重算 HMAC 比对，通过即
+//!   Verified；
+//! - 配置 `Mldsa65Key` 时 Go 换用带 3309 字节保留扩展（OID 0.0）的变体模板， 并把
+//!   `HMAC-SHA512(AuthKey, pub‖ClientHello‖ServerHello)` 的 ML-DSA-65 签名写入 `cert[126:]`
+//!   固定偏移——Rust 端已实现 （[`generate_reality_ed25519_cert_mldsa65`]，偏移动态定位）；生产接线
 //!   受 rustls 证书选定时机限制，见该函数文档。
 //!
 //! 注意：Go REALITY 服务端**不会**从 dest 获取或重签证书——dest 仅在 auth
@@ -29,9 +27,10 @@
 
 use std::sync::LazyLock;
 
-use crate::error::{RealityError, Result};
 use rustls::ServerConfig;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+use crate::error::{RealityError, Result};
 
 /// ML-DSA-65 签名长度（FIPS 204；Go 预留扩展 `empty[:3309]`）。
 pub const MLDSA65_SIGNATURE_LEN: usize = 3309;
@@ -180,10 +179,8 @@ fn build_dummy_cert() -> Result<DummyCert> {
     // mldsa65 变体模板（Go signedCertMldsa65 等价）：同密钥自签 + 单个
     // OID 0.0 扩展，value 预留 3309B 全零（握手时原位覆盖为 ML-DSA-65 签名）。
     let mut params_mldsa65 = make_params();
-    params_mldsa65.custom_extensions = vec![rcgen::CustomExtension::from_oid_content(
-        &[0, 0],
-        vec![0u8; MLDSA65_SIGNATURE_LEN],
-    )];
+    params_mldsa65.custom_extensions =
+        vec![rcgen::CustomExtension::from_oid_content(&[0, 0], vec![0u8; MLDSA65_SIGNATURE_LEN])];
     let cert_mldsa65 = params_mldsa65
         .self_signed(&key_pair)
         .map_err(|e| RealityError::CertGenerate(format!("rcgen self_signed mldsa65: {e}")))?;
@@ -193,7 +190,9 @@ fn build_dummy_cert() -> Result<DummyCert> {
             assert_eq!(len, MLDSA65_SIGNATURE_LEN, "mldsa65 extension value length");
             off
         })
-        .ok_or_else(|| RealityError::CertGenerate("mldsa65 extension not found in template".into()))?;
+        .ok_or_else(|| {
+            RealityError::CertGenerate("mldsa65 extension not found in template".into())
+        })?;
 
     let public_key_raw: [u8; 32] = key_pair
         .public_key_raw()
@@ -212,10 +211,9 @@ fn build_dummy_cert() -> Result<DummyCert> {
 /// 生成 REALITY Ed25519 证书（Go `handshake()` pickCertificate 块的 Rust 等价）。
 ///
 /// 1. 克隆进程级固定模板 [`DUMMY_CERT`]（Go `bytes.Clone(signedCert)`）
-/// 2. 计算 HMAC-SHA512(auth_key, 模板 ed25519 公钥)
-///    （[`crate::crypto::sign_reality_certificate`]）
-/// 3. 覆盖 cert_der 末尾 64 字节（Go `h.Sum(cert[:len(cert)-64])`——rcgen
-///    Ed25519 cert DER 末尾为 BIT STRING signature，内容恰 64 字节）
+/// 2. 计算 HMAC-SHA512(auth_key, 模板 ed25519 公钥) （[`crate::crypto::sign_reality_certificate`]）
+/// 3. 覆盖 cert_der 末尾 64 字节（Go `h.Sum(cert[:len(cert)-64])`——rcgen Ed25519 cert DER 末尾为
+///    BIT STRING signature，内容恰 64 字节）
 ///
 /// rustls 不校验叶子证书自签（trust anchor 在客户端），只验证
 /// CertificateVerify（标准 TLS 1.3 Ed25519 签名，用模板私钥）。REALITY 客户端
@@ -233,7 +231,6 @@ fn build_dummy_cert() -> Result<DummyCert> {
 ///
 /// - HMAC 计算失败 → [`RealityError::EmptySharedKey`]
 pub fn generate_reality_ed25519_cert(auth_key: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
-
     let dummy = &*DUMMY_CERT;
 
     // Go: h := hmac.New(sha512.New, c.AuthKey); h.Write(ed25519Priv[32:])
@@ -260,10 +257,9 @@ pub fn generate_reality_ed25519_cert(auth_key: &[u8]) -> Result<(Vec<u8>, Vec<u8
 /// # 参数
 ///
 /// - `auth_key`：HKDF-SHA256 派生的认证密钥
-/// - `client_hello_raw`：客户端 ClientHello 完整 handshake message
-///   （type(1)+len(3)+body，对齐 Go `hs.clientHello.original`）
-/// - `server_hello_raw`：服务端 ServerHello 完整 handshake message（对齐 Go
-///   `hs.hello.original`）
+/// - `client_hello_raw`：客户端 ClientHello 完整 handshake message （type(1)+len(3)+body，对齐 Go
+///   `hs.clientHello.original`）
+/// - `server_hello_raw`：服务端 ServerHello 完整 handshake message（对齐 Go `hs.hello.original`）
 /// - `mldsa65_seed`：ML-DSA-65 种子（Go `mldsa65Seed`，32 字节）
 ///
 /// # Errors
@@ -315,7 +311,9 @@ mod tests {
     /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
     fn ensure_crypto_provider() {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+        ONCE.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
     }
 
     #[test]
@@ -361,16 +359,8 @@ mod tests {
         assert_eq!(key1, key2, "dummy cert key must be process-static (Go init)");
         let n = cert1.len();
         assert_eq!(n, cert2.len());
-        assert_eq!(
-            cert1[..n - 64],
-            cert2[..n - 64],
-            "cert template must be static"
-        );
-        assert_ne!(
-            cert1[n - 64..],
-            cert2[n - 64..],
-            "per-connection HMAC tail must differ"
-        );
+        assert_eq!(cert1[..n - 64], cert2[..n - 64], "cert template must be static");
+        assert_ne!(cert1[n - 64..], cert2[n - 64..], "per-connection HMAC tail must differ");
 
         // 相同 auth_key → 逐字节一致（HMAC 确定性）
         let (cert3, _) = generate_reality_ed25519_cert(&[0x42u8; 32]).unwrap();
@@ -401,13 +391,8 @@ mod tests {
     /// 从 cert DER 提取 ed25519 原始公钥（SPKI OID + BIT STRING 头后 32 字节）。
     fn cert_ed25519_pubkey(cert_der: &[u8]) -> [u8; 32] {
         const PAT: [u8; 8] = [0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
-        let pos = cert_der
-            .windows(PAT.len())
-            .position(|w| w == PAT)
-            .expect("ed25519 SPKI present");
-        cert_der[pos + PAT.len()..pos + PAT.len() + 32]
-            .try_into()
-            .unwrap()
+        let pos = cert_der.windows(PAT.len()).position(|w| w == PAT).expect("ed25519 SPKI present");
+        cert_der[pos + PAT.len()..pos + PAT.len() + 32].try_into().unwrap()
     }
 
     /// 端到端重签验证（对应 Go 客户端 reality.go VerifyPeerCertificate 快速路径）：
@@ -426,8 +411,7 @@ mod tests {
 
         // 错误 auth_key（MITM / 非 REALITY 场景）必须失败
         assert!(
-            !crate::crypto::verify_reality_certificate(&[0x99u8; 32], &pub_key, &tail)
-                .unwrap(),
+            !crate::crypto::verify_reality_certificate(&[0x99u8; 32], &pub_key, &tail).unwrap(),
             "wrong auth_key must not verify"
         );
     }
@@ -467,8 +451,7 @@ mod tests {
         let sh_bad = [0x23u8; 90];
         let msg_bad =
             crate::crypto::hmac_reality_message(&auth_key, &pub_key, &ch, &sh_bad).unwrap();
-        let bad =
-            crate::crypto::verify_mldsa65_signature(&pubkey_1952, &msg_bad, sig).unwrap();
+        let bad = crate::crypto::verify_mldsa65_signature(&pubkey_1952, &msg_bad, sig).unwrap();
         assert!(!bad, "tampered ServerHello must fail verification");
     }
 
@@ -501,7 +484,8 @@ mod tests {
 
         // 错误 auth_key 应失败
         let wrong_key = [0x99u8; 32];
-        let invalid = crate::crypto::verify_reality_certificate(&wrong_key, &pub_key, &sig).unwrap();
+        let invalid =
+            crate::crypto::verify_reality_certificate(&wrong_key, &pub_key, &sig).unwrap();
         assert!(!invalid, "HMAC with wrong key should fail");
     }
 }

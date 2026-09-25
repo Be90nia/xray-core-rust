@@ -3,18 +3,13 @@
 //! 用 `hickory_resolver::TokioResolver` 读取系统 DNS 配置
 //! （`/etc/resolv.conf` 或 Windows 注册表），实现 `Server` trait。
 
-use std::future::Future;
-use std::net::IpAddr;
-use std::pin::Pin;
+use std::{future::Future, net::IpAddr, pin::Pin};
 
 use hickory_resolver::TokioResolver;
-
-use crate::config::IpOption;
-use crate::error::DnsError;
-use crate::nameserver::Server;
-
 /// 默认 TTL（Go `dns.DefaultTTL` = 300，features/dns/client.go:37）。
 pub use xray_features::dns::DEFAULT_TTL;
+
+use crate::{config::IpOption, error::DnsError, nameserver::Server};
 
 /// 本地系统 DNS nameserver。对应 Go `LocalNameServer`。
 ///
@@ -69,11 +64,7 @@ impl Server for LocalNameServer {
                 })
                 .collect();
 
-            if ips.is_empty() {
-                Err(DnsError::EmptyResponse)
-            } else {
-                Ok((ips, DEFAULT_TTL))
-            }
+            if ips.is_empty() { Err(DnsError::EmptyResponse) } else { Ok((ips, DEFAULT_TTL)) }
         })
     }
 }
@@ -117,13 +108,13 @@ mod tests {
                 Ok((ips, ttl)) => {
                     assert!(!ips.is_empty());
                     assert_eq!(ttl, DEFAULT_TTL);
-                }
+                },
                 Err(DnsError::EmptyResponse) => {
                     // 极端环境：localhost 被过滤或无记录。
-                }
+                },
                 Err(DnsError::SystemResolve(_)) => {
                     // 网络/DNS 不可用。
-                }
+                },
                 Err(e) => panic!("unexpected error: {e:?}"),
             }
         }
@@ -132,11 +123,7 @@ mod tests {
     #[tokio::test]
     async fn query_ip_filters_by_ip_option() {
         if let Ok(s) = LocalNameServer::new() {
-            let v4_only = IpOption {
-                ipv4_enable: true,
-                ipv6_enable: false,
-                fake_enable: false,
-            };
+            let v4_only = IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false };
             if let Ok((ips, _)) = s.query_ip("localhost.", v4_only).await {
                 assert!(ips.iter().all(|ip| matches!(ip, IpAddr::V4(_))));
             }

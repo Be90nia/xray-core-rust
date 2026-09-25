@@ -3,17 +3,18 @@
 //! 客户端/服务端各自持有一组 `TCPSequence`：握手期按顺序 write/read，
 //! 完成后进入 select! 双向透传。失败时丢弃 pipe（client EOF）。
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::select;
-
-use super::evaluator::{
-    evaluate_expr, evaluate_item_fields, measure_item, sizes_from_vars, EvalContext,
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    select,
 };
-use super::state::StateStore;
-use super::{TCPConfig, TCPItem, TCPSequence};
+
+use super::{
+    TCPConfig, TCPItem, TCPSequence,
+    evaluator::{EvalContext, evaluate_expr, evaluate_item_fields, measure_item, sizes_from_vars},
+    state::StateStore,
+};
 
 /// 写一组 TCP item：按 delay_max 分段 flush，求值累加 → write_all。
 ///
@@ -108,11 +109,7 @@ fn match_item_segment(item: &TCPItem, segment: &[u8], ctx: &mut EvalContext) -> 
 }
 
 /// 客户端握手：先写 clients[i]，再读 servers[j]；剩余 servers 读完后返回。
-async fn client_handshake<RW>(
-    raw: &mut RW,
-    config: &TCPConfig,
-    ctx: &mut EvalContext,
-) -> bool
+async fn client_handshake<RW>(raw: &mut RW, config: &TCPConfig, ctx: &mut EvalContext) -> bool
 where
     RW: AsyncRead + AsyncWrite + Unpin,
 {
@@ -138,11 +135,7 @@ where
 }
 
 /// 服务端握手：先读 clients[i]，失败时写 errors[i]；成功则写 servers[j]。
-async fn server_handshake<RW>(
-    raw: &mut RW,
-    config: &TCPConfig,
-    ctx: &mut EvalContext,
-) -> bool
+async fn server_handshake<RW>(raw: &mut RW, config: &TCPConfig, ctx: &mut EvalContext) -> bool
 where
     RW: AsyncRead + AsyncWrite + Unpin,
 {

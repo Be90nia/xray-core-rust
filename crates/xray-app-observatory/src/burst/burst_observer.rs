@@ -3,42 +3,44 @@
 //! 实装三件套（对齐 Go）：
 //! - `Check`（按需立即探测，对应 Go `healthping.go:148-155`）——
 //!   `proxy/vless/inbound/inbound.go:664-666` 新 worker 注册后调用。
-//! - `start_scheduler`（后台 ticker + 初始快测，对应 Go `healthping.go:91-135`）——
-//!   周期 = `interval × sampling_count`；每 tick `do_check(rounds=sampling_count)`；
-//!   `cancel_pending` 原子 swap 取消上轮未完成的 do_check；tick 末尾 `Cleanup`。
-//! - `create_result` / `get_observation`（对应 Go `burstobserver.go:30-62`）——
-//!   返回 `Vec<OutboundStatus>` 含 6 字段 `health_ping`，`alive = All != Fail`。
+//! - `start_scheduler`（后台 ticker + 初始快测，对应 Go `healthping.go:91-135`）—— 周期 = `interval
+//!   × sampling_count`；每 tick `do_check(rounds=sampling_count)`； `cancel_pending` 原子 swap
+//!   取消上轮未完成的 do_check；tick 末尾 `Cleanup`。
+//! - `create_result` / `get_observation`（对应 Go `burstobserver.go:30-62`）—— 返回
+//!   `Vec<OutboundStatus>` 含 6 字段 `health_ping`，`alive = All != Fail`。
 //!
 //! Rust 此处将 Go 的 `HealthPing` 直接合入 `BurstObserver`（原 Rust 设计已扁平化
 //! Results map，避免双层 Mutex）。scheduler 与 Results 共用 `Mutex` 互斥。
 //!
 //! ## IO 边界
-//! - HTTP probe：`Arc<dyn ProbeExecutor>` 注入（sync trait，对应 Go
-//!   `newPingClient.MeasureDelay`）
-//! - tag 选择：scheduler 启动时注入 `TagSelector` 闭包
-//!   （对齐 Go `outbound.HandlerSelector.Select`）
+//! - HTTP probe：`Arc<dyn ProbeExecutor>` 注入（sync trait，对应 Go `newPingClient.MeasureDelay`）
+//! - tag 选择：scheduler 启动时注入 `TagSelector` 闭包 （对齐 Go
+//!   `outbound.HandlerSelector.Select`）
 //!
 //! 非目标：HTTP method 维度探测（Go `HealthPingSettings.HttpMethod`）、
 //! checkConnectivity（网络断开判定）、真 outbound 拨号。
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicPtr, Ordering},
+    },
+    time::Duration,
+};
 
 use parking_lot::Mutex;
 
 use super::{HealthPingRtts, HealthPingSettings, RTT_FAILED};
-use crate::config::{HealthPingMeasurement, ObservationResult, OutboundStatus};
-use crate::observer::ProbeExecutor;
+use crate::{
+    config::{HealthPingMeasurement, ObservationResult, OutboundStatus},
+    observer::ProbeExecutor,
+};
 
 /// 当前 Unix 时间（纳秒），与 healthping_stats 时间单位一致。
 fn now_unix_nanos() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0)
 }
 
 /// Scheduler 状态：start_scheduler 后填充，stop_scheduler 后清空。
@@ -124,8 +126,7 @@ impl BurstObserver {
 
     /// 查某 tag 最新 RTT 样本：
     /// - 无样本（从未 check 过）→ `None`；
-    /// - 有样本 → 最新写入值（可能是 `RTT_FAILED` 哨兵，用
-    ///   [`super::is_valid_rtt`] 判断有效性）。
+    /// - 有样本 → 最新写入值（可能是 `RTT_FAILED` 哨兵，用 [`super::is_valid_rtt`] 判断有效性）。
     pub fn latest_rtt(&self, tag: &str) -> Option<i64> {
         self.rtts.lock().get(tag)?.latest()
     }
@@ -155,9 +156,7 @@ impl BurstObserver {
             (self.settings.interval * self.settings.sampling_count as i64) as u64,
         );
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        g.replace(SchedulerHandle {
-            shutdown: shutdown_tx,
-        });
+        g.replace(SchedulerHandle { shutdown: shutdown_tx });
         drop(g);
 
         // 初始快测（Go healthping.go:99-107）
@@ -300,8 +299,7 @@ impl BurstObserver {
     /// 遍历 `Results` 表，每条生成 `OutboundStatus`：
     /// - `alive = All != Fail`（Go burstobserver.go:44）
     /// - `delay = average.Milliseconds()`（Go burstobserver.go:45，纳秒→毫秒）
-    /// - `health_ping` 含 All/Fail/Deviation/Average/Max/Min 6 字段
-    ///   （Go burstobserver.go:50-57）
+    /// - `health_ping` 含 All/Fail/Deviation/Average/Max/Min 6 字段 （Go burstobserver.go:50-57）
     /// - `last_seen_time` / `last_try_time` / `last_error_reason` 留默认（Go 端恒为 0/""）
     pub fn create_result(&self) -> Vec<OutboundStatus> {
         let now = now_unix_nanos();
@@ -335,9 +333,7 @@ impl BurstObserver {
 
     /// 全量观测快照（对应 Go `burstobserver.go:30-32 GetObservation`）。
     pub fn get_observation(&self) -> ObservationResult {
-        ObservationResult {
-            status: self.create_result(),
-        }
+        ObservationResult { status: self.create_result() }
     }
 }
 
@@ -353,32 +349,20 @@ impl Drop for BurstObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ProbeResult;
-    use crate::observer::FixedProbeExecutor;
+    use crate::{config::ProbeResult, observer::FixedProbeExecutor};
 
     fn observer_with_interval(sampling_count: i32, interval: i64) -> Arc<BurstObserver> {
-        let settings = HealthPingSettings {
-            interval,
-            sampling_count,
-            ..HealthPingSettings::default()
-        };
+        let settings =
+            HealthPingSettings { interval, sampling_count, ..HealthPingSettings::default() };
         Arc::new(BurstObserver::new(settings))
     }
 
     fn alive(delay: i64) -> ProbeResult {
-        ProbeResult {
-            alive: true,
-            delay,
-            last_error_reason: String::new(),
-        }
+        ProbeResult { alive: true, delay, last_error_reason: String::new() }
     }
 
     fn dead(reason: &str) -> ProbeResult {
-        ProbeResult {
-            alive: false,
-            delay: 0,
-            last_error_reason: reason.into(),
-        }
+        ProbeResult { alive: false, delay: 0, last_error_reason: reason.into() }
     }
 
     #[test]
@@ -530,16 +514,9 @@ mod tests {
         // 对应 Go healthping.go:165-231：每个 (tag, round) 写入一条样本
         let obs = observer_with_interval(3, 60_000_000_000);
         let executor = FixedProbeExecutor::new().with_result("a", alive(100));
-        obs.do_check(
-            &["a".to_string(), "b".to_string()],
-            &executor,
-        );
-        let a_stats = obs
-            .rtts
-            .lock()
-            .get("a")
-            .expect("a should have samples")
-            .statistics(now_unix_nanos());
+        obs.do_check(&["a".to_string(), "b".to_string()], &executor);
+        let a_stats =
+            obs.rtts.lock().get("a").expect("a should have samples").statistics(now_unix_nanos());
         assert_eq!(a_stats.all, 3);
         assert_eq!(a_stats.fail, 0);
     }
@@ -561,10 +538,7 @@ mod tests {
             .with_result("keep-a", alive(10))
             .with_result("keep-b", alive(20))
             .with_result("remove-me", alive(30));
-        obs.check(
-            &["keep-a".into(), "keep-b".into(), "remove-me".into()],
-            &executor,
-        );
+        obs.check(&["keep-a".into(), "keep-b".into(), "remove-me".into()], &executor);
         assert!(obs.latest_rtt("remove-me").is_some());
 
         obs.cleanup(&["keep-a".into(), "keep-b".into()]);
@@ -608,20 +582,14 @@ mod tests {
     #[test]
     fn do_check_probe_runs_outside_rtts_lock() {
         let obs = observer_with_interval(2, 60_000_000_000);
-        let executor = LockAssertingExecutor {
-            observer: obs.clone(),
-            context: "do_check",
-        };
+        let executor = LockAssertingExecutor { observer: obs.clone(), context: "do_check" };
         obs.do_check(&["a".to_string(), "b".to_string()], &executor);
     }
 
     #[test]
     fn check_probe_runs_outside_rtts_lock() {
         let obs = observer_with_interval(2, 60_000_000_000);
-        let executor = LockAssertingExecutor {
-            observer: obs.clone(),
-            context: "check",
-        };
+        let executor = LockAssertingExecutor { observer: obs.clone(), context: "check" };
         obs.check(&["a".to_string()], &executor);
     }
 
@@ -649,17 +617,9 @@ mod tests {
             probes: std::sync::atomic::AtomicUsize::new(0),
         };
         obs.do_check(&["a".to_string()], &executor);
-        assert_eq!(
-            executor.probes.load(Ordering::SeqCst),
-            2,
-            "取消后不再继续探测第 3 轮"
-        );
-        let stats = obs
-            .rtts
-            .lock()
-            .get("a")
-            .expect("已完成轮次的样本应写回")
-            .statistics(now_unix_nanos());
+        assert_eq!(executor.probes.load(Ordering::SeqCst), 2, "取消后不再继续探测第 3 轮");
+        let stats =
+            obs.rtts.lock().get("a").expect("已完成轮次的样本应写回").statistics(now_unix_nanos());
         assert_eq!(stats.all, 2, "已完成轮次的 2 条样本保留");
     }
 }

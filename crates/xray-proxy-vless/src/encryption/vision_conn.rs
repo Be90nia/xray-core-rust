@@ -7,21 +7,28 @@
 //! 切片 2a：padding 模式完整（Continue/End）。
 //! 切片 2b：splice（command=Direct 触发，绕过 Vision padding，仍走底层 conn）。
 
-use crate::encryption::aead::Aead;
-use crate::encryption::common_conn::CommonConn;
-use crate::encryption::vision::{
-    is_complete_record, xtls_filter_tls, xtls_padding, xtls_unpadding, DirectionState,
-    TrafficState, COMMAND_PADDING_CONTINUE, COMMAND_PADDING_DIRECT, COMMAND_PADDING_END,
-    DEFAULT_PADDING_SEED,
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll},
 };
-use rand::rngs::StdRng;
-use rand::SeedableRng;
-use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
+
+use rand::{SeedableRng, rngs::StdRng};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpStream,
+};
 use xray_transport::connection::Connection;
+
+use crate::encryption::{
+    aead::Aead,
+    common_conn::CommonConn,
+    vision::{
+        COMMAND_PADDING_CONTINUE, COMMAND_PADDING_DIRECT, COMMAND_PADDING_END,
+        DEFAULT_PADDING_SEED, DirectionState, TrafficState, is_complete_record, xtls_filter_tls,
+        xtls_padding, xtls_unpadding,
+    },
+};
 
 /// padding 块 content 上限（对齐 Go ReshapeMultiBuffer 的 `Size-21` 拆分上限：
 /// BUF_SIZE(2048) - header(5) - uuid(16) = 2027）。必须与 vision::BUF_SIZE
@@ -191,8 +198,9 @@ where
     /// dial 同步阶段主动发 uuid-only padding 块,后续 chunk 进 vision content。
     /// 对齐 Go outbound VisionWriter mb[0]=nil → XtlsPadding(None, CommandPaddingContinue)。
     pub async fn write_uuid_only_padding(&mut self) -> io::Result<()> {
-        use crate::encryption::vision::{xtls_padding, COMMAND_PADDING_CONTINUE};
         use tokio::io::AsyncWriteExt;
+
+        use crate::encryption::vision::{COMMAND_PADDING_CONTINUE, xtls_padding};
         let padded = xtls_padding(
             None,
             COMMAND_PADDING_CONTINUE,
@@ -205,7 +213,6 @@ where
         Ok(())
     }
 }
-
 
 impl<C> AsyncRead for VisionConn<C>
 where
@@ -231,21 +238,20 @@ where
                 return Poll::Ready(Ok(()));
             }
 
-            // 2. padding 关闭 → 优先裸 TCP 直读；raw 通道不可用（无 TLS 或
-            //    非生产链内层）才退 inner。splice 后读 inner 会把对端在裸 TCP
-            //    上发的明文 TLS records 当外层密文解密 → 永远解不开。
+            // 2. padding 关闭 → 优先裸 TCP 直读；raw 通道不可用（无 TLS 或 非生产链内层）才退
+            //    inner。splice 后读 inner 会把对端在裸 TCP 上发的明文 TLS records 当外层密文解密 →
+            //    永远解不开。
             if !this.downlink_padding {
                 if let Some(raw) = this.raw_fallback.as_mut() {
                     return Pin::new(raw).poll_read(cx, buf);
                 }
                 return Pin::new(&mut this.inner).poll_read(cx, buf);
             }
-            // 3. padding 模式 → CommonConn read + unpadding。临时缓冲提升为
-            //    struct 字段（read_tmp）避免每 poll_read 16KB 栈帧；栈帧不被
-            //    编译器复用 → 握手/首请求期高频 poll_read 时栈占膨胀。
-            //    容量稳态复用：len 不足才补零扩容（仅首次），此前
-            //    clear+resize(16K,0) 每 poll 16KB memset 已免（wfx8-1）。
-            //    有效字节以 rb.filled().len() 为界，旧数据不会被读出。
+            // 3. padding 模式 → CommonConn read + unpadding。临时缓冲提升为 struct
+            //    字段（read_tmp）避免每 poll_read 16KB 栈帧；栈帧不被 编译器复用 →
+            //    握手/首请求期高频 poll_read 时栈占膨胀。 容量稳态复用：len
+            //    不足才补零扩容（仅首次），此前 clear+resize(16K,0) 每 poll 16KB memset
+            //    已免（wfx8-1）。 有效字节以 rb.filled().len() 为界，旧数据不会被读出。
             if this.read_tmp.len() < 16 * 1024 {
                 this.read_tmp.resize(16 * 1024, 0);
             }
@@ -258,8 +264,11 @@ where
                     if n == 0 {
                         return Poll::Ready(Ok(()));
                     }
-                    let mut content =
-                        xtls_unpadding(&this.read_tmp[..n], &mut this.downlink_state, &this.user_uuid);
+                    let mut content = xtls_unpadding(
+                        &this.read_tmp[..n],
+                        &mut this.downlink_state,
+                        &this.user_uuid,
+                    );
                     let cmd = this.downlink_state.current_command;
                     // server 关闭下行 padding：END=只关 padding（继续读 TLS 层），
                     // DIRECT=splice——server 已 UnwrapRawConn，此后在裸 TCP 上
@@ -290,8 +299,8 @@ where
                             // received_plaintext 此刻必空。此后 inner 上的任何额
                             // 外 poll_read 都是对 socket 的一次 recv：把对端已切
                             // 裸流的端到端明文字节拉进 rustls deframer——
-                            // - 完整记录：用隧道密钥解密 → DecryptError → 字节
-                            //   被 TLS 层吞掉（静默数据丢失）；
+                            // - 完整记录：用隧道密钥解密 → DecryptError → 字节 被 TLS
+                            //   层吞掉（静默数据丢失）；
                             // - 半条记录：Pending 滞留 opaque 缓冲，切 raw dup
                             //   后该前缀永久不可达（字节流断裂）。
                             // dbe9f49 的 drain 恰好制造第一种丢失（其 Err 吞掉
@@ -319,13 +328,13 @@ where
                         this.downlink_pending_pos = 0;
                     }
                     // content 空（纯 padding 块）或已存 pending → continue
-                }
+                },
                 Poll::Ready(Err(e)) => {
                     // 结构化观测：TLS 层 fatal（如对端安全层误解 raw 流的
                     // BadRecordMac）是 splice 边界问题的第一现场。
                     tracing::warn!(error = %e, "vision inner read error");
                     return Poll::Ready(Err(e));
-                }
+                },
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -353,7 +362,7 @@ where
                         Poll::Pending => {
                             this.uplink_write_pending = Some((padded, sent, orig_len));
                             return Poll::Pending;
-                        }
+                        },
                     }
                 }
                 match Pin::new(&mut this.inner).poll_write(cx, &padded[sent..]) {
@@ -365,7 +374,7 @@ where
                             io::ErrorKind::WriteZero,
                             "inner conn accepted 0 bytes",
                         )));
-                    }
+                    },
                     Poll::Ready(Ok(n)) => {
                         let new_sent = sent + n;
                         if new_sent >= padded.len() {
@@ -379,22 +388,22 @@ where
                                 Poll::Pending => {
                                     this.uplink_write_pending = Some((padded, new_sent, orig_len));
                                     return Poll::Pending;
-                                }
+                                },
                             }
                         }
                         this.uplink_write_pending = Some((padded, new_sent, orig_len));
                         // 底层 Ready，continue 循环继续写剩余 padded（避免无 wakeup 的 Pending）
-                    }
+                    },
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Pending => {
                         this.uplink_write_pending = Some((padded, sent, orig_len));
                         return Poll::Pending;
-                    }
+                    },
                 }
             }
 
-            // 2. padding 关闭 → 优先裸 TCP 直写（splice 后对端已拆外层 TLS，
-            //    写 inner 会把 caller 的 TLS records 当明文再加密一层）。
+            // 2. padding 关闭 → 优先裸 TCP 直写（splice 后对端已拆外层 TLS， 写 inner 会把 caller
+            //    的 TLS records 当明文再加密一层）。
             if !this.uplink_padding {
                 if let Some(raw) = this.raw_fallback.as_mut() {
                     // raw 起步闸：等对端消费 DIRECT 帧（见 raw_write_gate 注释）。
@@ -469,6 +478,7 @@ where
         }
         Pin::new(&mut this.inner).poll_flush(cx)
     }
+
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         if let Some(raw) = this.raw_fallback.as_mut() {
@@ -491,11 +501,11 @@ where
     /// （common/mod.rs poll_write 的 `(n, true) => Poll::Ready(Ok(n))` 分支）
     /// ——`Ok(len)` 只保证密文进入内部 sendable_tls 缓冲，write_io 撞
     /// WouldBlock 时尾巴仍滞留缓冲。若看到 Ok(len) 就 arm raw：
-    /// - 尾巴滞留时激活后 `poll_flush`/`poll_shutdown` 已改道 raw_fallback，
-    ///   TLS 记录尾巴**永久出不去**——对端 deframer 停在半条记录上永久
-    ///   Pending（双方零 error 静默停摆，macOS Interop #08 r2 实测形态）；
-    /// - 尾巴随后被下一次 inner 写带出时，后续 raw 字节已先上线——线序
-    ///   颠倒，对端把 raw 明文当隧道 TLS 记录解析 → DecryptError 级联。
+    /// - 尾巴滞留时激活后 `poll_flush`/`poll_shutdown` 已改道 raw_fallback， TLS
+    ///   记录尾巴**永久出不去**——对端 deframer 停在半条记录上永久 Pending（双方零 error
+    ///   静默停摆，macOS Interop #08 r2 实测形态）；
+    /// - 尾巴随后被下一次 inner 写带出时，后续 raw 字节已先上线——线序 颠倒，对端把 raw 明文当隧道
+    ///   TLS 记录解析 → DecryptError 级联。
     /// Go 无此坑：crypto/tls.Conn.Write 从不虚报写完。
     fn poll_arm_gate(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if !self.splice_armed {
@@ -505,7 +515,7 @@ where
             Poll::Ready(Ok(())) => {
                 self.arm_splice_raw();
                 Poll::Ready(Ok(()))
-            }
+            },
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
         }
@@ -536,6 +546,7 @@ where
     fn remote_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
         self.inner.remote_addr()
     }
+
     fn local_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
         self.inner.local_addr()
     }
@@ -543,8 +554,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
 
     /// 构造 TCP 回环 socket 对 + 各自的裸克隆件（server splice 测试）。
     async fn make_tcp_pair() -> (
@@ -559,7 +571,6 @@ mod tests {
         let s2 = xray_transport::connection::dup_tcp_stream(&s).unwrap();
         ((c, c2), (s, s2))
     }
-
 
     /// 构造一对互连的 VisionConn（共享相同 AEAD key，模拟 handshake 后状态）。
     fn make_pair() -> (
@@ -584,10 +595,7 @@ mod tests {
             true,
             key.clone(),
         );
-        (
-            VisionConn::new(common_a, uuid.clone()),
-            VisionConn::new(common_b, uuid.clone()),
-        )
+        (VisionConn::new(common_a, uuid.clone()), VisionConn::new(common_b, uuid.clone()))
     }
 
     #[tokio::test]
@@ -713,7 +721,8 @@ mod tests {
         // 3. splice 后明文直写（绕过 padding）
         a.write_all(b"post-splice").await.unwrap();
         a.flush().await.unwrap();
-        // reader b: sh（Continue padding）+ app（Direct padding content）+ post-splice（splice 后直读）
+        // reader b: sh（Continue padding）+ app（Direct padding content）+ post-splice（splice
+        // 后直读）
         let mut buf = vec![0u8; sh.len() + app.len() + 11];
         b.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf[..sh.len()], &sh);
@@ -740,8 +749,12 @@ mod tests {
         let mut buf_a = vec![0u8; total];
         let mut buf_b = vec![0u8; total];
         tokio::join!(
-            async { a.read_exact(&mut buf_a).await.unwrap(); },
-            async { b.read_exact(&mut buf_b).await.unwrap(); }
+            async {
+                a.read_exact(&mut buf_a).await.unwrap();
+            },
+            async {
+                b.read_exact(&mut buf_b).await.unwrap();
+            }
         );
         let mut expected = sh.clone();
         expected.extend_from_slice(&app);
@@ -752,8 +765,10 @@ mod tests {
     /// 内置 timeout 防挂死整个套件；超时打印两侧进度。
     #[tokio::test]
     async fn server_mode_uplink_stream_stress() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
         let (mut a, mut b) = make_pair();
         const TOTAL: usize = 512 * 1024;
         let payload: Vec<u8> = (0u8..=255).cycle().take(TOTAL).collect();
@@ -761,35 +776,32 @@ mod tests {
         let wrote = Arc::new(AtomicUsize::new(0));
         let read = Arc::new(AtomicUsize::new(0));
         let (w, r) = (wrote.clone(), read.clone());
-        let work = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            async {
-                tokio::join!(
-            async move {
-                let mut off = 0;
-                while off < payload.len() {
-                    let n = a.write(&payload[off..]).await.unwrap();
-                    off += n;
-                    w.store(off, Ordering::Relaxed);
-                }
-                a.flush().await.unwrap();
-            },
-            async move {
-                let mut got = vec![0u8; TOTAL];
-                let mut off = 0;
-                while off < TOTAL {
-                    let n = b.read(&mut got[off..]).await.unwrap();
-                    if n == 0 {
-                        panic!("EOF at {off}");
+        let work = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            tokio::join!(
+                async move {
+                    let mut off = 0;
+                    while off < payload.len() {
+                        let n = a.write(&payload[off..]).await.unwrap();
+                        off += n;
+                        w.store(off, Ordering::Relaxed);
                     }
-                    off += n;
-                    r.store(off, Ordering::Relaxed);
+                    a.flush().await.unwrap();
+                },
+                async move {
+                    let mut got = vec![0u8; TOTAL];
+                    let mut off = 0;
+                    while off < TOTAL {
+                        let n = b.read(&mut got[off..]).await.unwrap();
+                        if n == 0 {
+                            panic!("EOF at {off}");
+                        }
+                        off += n;
+                        r.store(off, Ordering::Relaxed);
+                    }
+                    assert_eq!(got, payload_clone);
                 }
-                assert_eq!(got, payload_clone);
-            }
             )
-            }
-        )
+        })
         .await;
         if work.is_err() {
             panic!(
@@ -809,7 +821,13 @@ mod tests {
         let uuid = vec![0xABu8; 16];
         let key = b"united-key".to_vec();
         let mut server = VisionConn::new_server(
-            CommonConn::new(s, Aead::new(b"ctx", &key, true), Aead::new(b"ctx", &key, true), true, key.clone()),
+            CommonConn::new(
+                s,
+                Aead::new(b"ctx", &key, true),
+                Aead::new(b"ctx", &key, true),
+                true,
+                key.clone(),
+            ),
             uuid,
             s2,
         );
@@ -818,7 +836,13 @@ mod tests {
         let app = build_tls_app_data(b"GET / HTTP/1.1\r\n\r\n");
         server.write_all(&app).await.unwrap();
         server.flush().await.unwrap();
-        let mut peer = CommonConn::new(c, Aead::new(b"ctx", &key, true), Aead::new(b"ctx", &key, true), true, key.clone());
+        let mut peer = CommonConn::new(
+            c,
+            Aead::new(b"ctx", &key, true),
+            Aead::new(b"ctx", &key, true),
+            true,
+            key.clone(),
+        );
 
         let frame_len = 16 + 5 + app.len();
         let mut frame = vec![0u8; frame_len];
@@ -842,7 +866,13 @@ mod tests {
         let uuid = vec![0xABu8; 16];
         let key = b"united-key".to_vec();
         let mut server = VisionConn::new_server(
-            CommonConn::new(s, Aead::new(b"ctx", &key, true), Aead::new(b"ctx", &key, true), true, key.clone()),
+            CommonConn::new(
+                s,
+                Aead::new(b"ctx", &key, true),
+                Aead::new(b"ctx", &key, true),
+                true,
+                key.clone(),
+            ),
             uuid.clone(),
             s2,
         );
@@ -856,7 +886,13 @@ mod tests {
             &DEFAULT_PADDING_SEED,
             &mut StdRng::from_os_rng(),
         );
-        let mut client = CommonConn::new(c, Aead::new(b"ctx", &key, true), Aead::new(b"ctx", &key, true), true, key.clone());
+        let mut client = CommonConn::new(
+            c,
+            Aead::new(b"ctx", &key, true),
+            Aead::new(b"ctx", &key, true),
+            true,
+            key.clone(),
+        );
         client.write_all(&padded).await.unwrap();
         client.flush().await.unwrap();
 
@@ -898,7 +934,13 @@ mod tests {
         let (inner, _inner_peer) = tokio::io::duplex(1);
         let key = b"united-key".to_vec();
         let mut server = VisionConn::new_server(
-            CommonConn::new(inner, Aead::new(b"ctx", &key, true), Aead::new(b"ctx", &key, true), true, key.clone()),
+            CommonConn::new(
+                inner,
+                Aead::new(b"ctx", &key, true),
+                Aead::new(b"ctx", &key, true),
+                true,
+                key.clone(),
+            ),
             vec![0xABu8; 16],
             raw_own,
         );
@@ -920,7 +962,7 @@ mod tests {
         assert!(matches!(poll, Poll::Ready(Ok(()))), "shutdown via inner should be ready");
         let mut probe = [0u8; 1];
         match raw_peer.try_read(&mut probe) {
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {},
             Ok(0) => panic!("raw peer saw EOF: shutdown leaked to raw while write in-flight"),
             other => panic!("raw peer unexpectedly readable while write in-flight: {other:?}"),
         }
@@ -933,7 +975,13 @@ mod tests {
         let ((mut c, _c2), (s, s2)) = make_tcp_pair().await;
         let key = b"united-key".to_vec();
         let mut server = VisionConn::new_server(
-            CommonConn::new(s, Aead::new(b"ctx", &key, true), Aead::new(b"ctx", &key, true), true, key.clone()),
+            CommonConn::new(
+                s,
+                Aead::new(b"ctx", &key, true),
+                Aead::new(b"ctx", &key, true),
+                true,
+                key.clone(),
+            ),
             vec![0xABu8; 16],
             s2,
         );
@@ -947,7 +995,13 @@ mod tests {
         assert!(server.raw_fallback.is_some(), "raw activated right after write completes");
         // 其后写全走 raw：对端先用 CommonConn 解密收 DIRECT 帧（dup 克隆
         // 共对端，帧经 inner TLS 层），再切裸 socket 直收 raw 明文
-        let mut peer = CommonConn::new(c, Aead::new(b"ctx", &key, true), Aead::new(b"ctx", &key, true), true, key.clone());
+        let mut peer = CommonConn::new(
+            c,
+            Aead::new(b"ctx", &key, true),
+            Aead::new(b"ctx", &key, true),
+            true,
+            key.clone(),
+        );
         let mut frame = vec![0u8; 16 + 5 + app.len()];
         peer.read_exact(&mut frame).await.unwrap();
         assert_eq!(frame[16], COMMAND_PADDING_DIRECT, "frame went through inner");
@@ -1000,9 +1054,11 @@ mod tests {
         ) -> Poll<io::Result<usize>> {
             Poll::Ready(Ok(buf.len()))
         }
+
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
@@ -1064,10 +1120,7 @@ mod tests {
             .expect("raw downlink bytes must flow after the switch")
             .unwrap();
         assert_eq!(&tail, b"raw-downlink");
-        assert_eq!(
-            rx.inner.reads, 1,
-            "raw-path reads must not touch the inner TLS layer"
-        );
+        assert_eq!(rx.inner.reads, 1, "raw-path reads must not touch the inner TLS layer");
     }
 
     /// 写侧激活闸门实锤（macOS Interop #08 r2 定罪，本轮修复本体）：
@@ -1102,6 +1155,7 @@ mod tests {
             // BufWriter 语义：无条件虚报「全部写完」（尾巴留在内部缓冲）
             Poll::Ready(Ok(buf.len()))
         }
+
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             let this = self.get_mut();
             this.flush_polls += 1;
@@ -1111,6 +1165,7 @@ mod tests {
                 Poll::Ready(Ok(())) // 尾巴落 socket
             }
         }
+
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
@@ -1150,12 +1205,7 @@ mod tests {
             "write completes only after inner flush, got {poll:?}"
         );
         assert!(!client.splice_armed, "armed flag consumed");
-        assert!(
-            client.raw_fallback.is_some(),
-            "raw activates exactly after inner flush completes"
-        );
+        assert!(client.raw_fallback.is_some(), "raw activates exactly after inner flush completes");
         assert_eq!(client.inner.flush_polls, 2, "gate drove exactly two flush polls");
     }
 }
-
-

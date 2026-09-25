@@ -18,22 +18,20 @@
 //! - `xray x25519`（别名 curve25519）/ `wg` / `mldsa65` / `mlkem768` / `vlessenc` — 密钥生成
 
 use clap::{Parser, Subcommand};
-
-use xray_cli::commands::api_args::*;
-use xray_cli::commands::api_exec;
-use xray_cli::commands::keys;
-use xray_cli::commands::tool::{self, ConvertCommand, TlsCommand};
-use xray_cli::error::CliError;
-use xray_cli::run::{self, RunArgs};
-use xray_cli::version;
+use xray_cli::{
+    commands::{
+        api_args::*,
+        api_exec, keys,
+        tool::{self, ConvertCommand, TlsCommand},
+    },
+    error::CliError,
+    run::{self, RunArgs},
+    version,
+};
 
 /// CLI 顶层结构。
 #[derive(Parser, Debug)]
-#[command(
-    name = "xray",
-    version = "26.7.28",
-    about = "Xray is a platform for building proxies."
-)]
+#[command(name = "xray", version = "26.7.28", about = "Xray is a platform for building proxies.")]
 struct Cli {
     /// 子命令。未指定时默认 `run`（v4 兼容）。
     #[command(subcommand)]
@@ -188,7 +186,6 @@ enum Command {
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     // 9tk4：tracing subscriber 不再在此急切初始化（此前固定 EnvFilter "info"
@@ -224,7 +221,7 @@ async fn main() -> std::process::ExitCode {
             } else {
                 std::process::ExitCode::FAILURE
             }
-        }
+        },
     }
 }
 
@@ -264,7 +261,7 @@ async fn execute(command: Command) -> Result<(), CliError> {
         Command::Version => {
             version::print_version();
             Ok(())
-        }
+        },
         Command::Uuid(args) => tool::execute_uuid(&args),
         Command::X25519(args) => keys::execute_x25519(&args),
         Command::Wg(args) => keys::execute_wg(&args),

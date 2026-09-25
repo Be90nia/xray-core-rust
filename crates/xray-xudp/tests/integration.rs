@@ -5,12 +5,11 @@
 
 use std::io::Cursor;
 
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-use xray_xudp::extension::{XudpManager, XudpStatus};
-use xray_xudp::packet::{FrameMetadata, FrameStatus, PacketReader, PacketWriter};
+use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
+use xray_xudp::{
+    extension::{XudpManager, XudpStatus},
+    packet::{FrameMetadata, FrameStatus, PacketReader, PacketWriter},
+};
 
 // ========== 辅助函数 ==========
 
@@ -164,9 +163,7 @@ fn test_multi_frame_mixed_stream() {
     }
 
     // 手动追加一个 KeepAlive 帧
-    FrameMetadata::keep_alive()
-        .write_to(&mut buf)
-        .expect("write keep_alive");
+    FrameMetadata::keep_alive().write_to(&mut buf).expect("write keep_alive");
 
     // 再追加一个数据帧（Keep 类型）
     {
@@ -194,10 +191,7 @@ fn test_multi_frame_mixed_stream() {
 
     // 第三帧：KeepAlive 被自动跳过，直接读到第四帧数据
     let p3 = reader.read_packet().expect("read3").expect("some");
-    assert_eq!(
-        p3.data(), b"after_keepalive",
-        "KeepAlive should be skipped, data should follow"
-    );
+    assert_eq!(p3.data(), b"after_keepalive", "KeepAlive should be skipped, data should follow");
 
     // 流结束
     assert!(reader.read_packet().expect("eof").is_none(), "stream should end");
@@ -260,9 +254,7 @@ fn test_keep_alive_frames_skipped() {
     }
 
     // 穿插 KeepAlive 帧
-    FrameMetadata::keep_alive()
-        .write_to(&mut buf)
-        .expect("insert keep_alive 1");
+    FrameMetadata::keep_alive().write_to(&mut buf).expect("insert keep_alive 1");
 
     // 再写数据帧（Keep 类型）
     {
@@ -273,9 +265,7 @@ fn test_keep_alive_frames_skipped() {
     }
 
     // 又穿插 KeepAlive
-    FrameMetadata::keep_alive()
-        .write_to(&mut buf)
-        .expect("insert keep_alive 2");
+    FrameMetadata::keep_alive().write_to(&mut buf).expect("insert keep_alive 2");
 
     // 最后一个数据帧
     {
@@ -323,10 +313,7 @@ fn test_large_packet_write_read() {
     let pkt = reader.read_packet().expect("read large packet").expect("packet data");
 
     assert_eq!(pkt.data().len(), large_size, "large packet data length should match");
-    assert!(
-        pkt.data().iter().all(|&b| b == 0xAB),
-        "large packet data content should match"
-    );
+    assert!(pkt.data().iter().all(|&b| b == 0xAB), "large packet data content should match");
 }
 
 /// 测试 Go 兼容性：验证 Rust 实现 Write→Read 的字节流与 Go 版兼容
@@ -359,9 +346,5 @@ fn test_go_compatibility_write_read() {
     let buf_bytes = buf_inner.into_inner();
     let (meta, _) = FrameMetadata::from_bytes(&buf_bytes).expect("parse metadata");
     let target = meta.target().expect("target should exist");
-    assert_eq!(
-        target.port().value(),
-        1345,
-        "port should be 1345 (Go: dest[0].UDP.Port == 1345)"
-    );
+    assert_eq!(target.port().value(), 1345, "port should be 1345 (Go: dest[0].UDP.Port == 1345)");
 }

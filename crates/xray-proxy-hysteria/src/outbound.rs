@@ -16,21 +16,20 @@
 //! Connection ↔ Link 桥接送后续切片。目标地址编码由 transport 层 InterStreamConn
 //! 的 client_first 前缀处理。
 
-use std::net::ToSocketAddrs;
-use std::sync::Arc;
+use std::{net::ToSocketAddrs, sync::Arc};
 
 use async_trait::async_trait;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::session::Session;
-use xray_features::outbound::{OutboundError, OutboundHandler};
-use xray_transport_hysteria::dialer::{
-    ClientManager, DialDestination, HysteriaTransport,
+use xray_common::{
+    net::{destination::Destination, network::Network},
+    session::Session,
 };
-use xray_transport_hysteria::proto_config::Config as ProtoConfig;
+use xray_features::outbound::{OutboundError, OutboundHandler};
+use xray_transport_hysteria::{
+    dialer::{ClientManager, DialDestination, HysteriaTransport},
+    proto_config::Config as ProtoConfig,
+};
 
-use crate::config::HysteriaConfig;
-use crate::error::Result;
+use crate::{config::HysteriaConfig, error::Result};
 
 /// Hysteria 出站 Handler。
 ///
@@ -50,18 +49,15 @@ impl HysteriaOutboundHandler {
     /// - `transport`：QUIC + HTTP/3 transport 实现（通常 `QuinnHysteriaTransport`）
     ///
     /// # Errors
-    /// 配置无效（[`HysteriaConfig::validate`]）时返回 [`InvalidConfig`](crate::HysteriaProxyError::InvalidConfig)。
+    /// 配置无效（[`HysteriaConfig::validate`]）时返回
+    /// [`InvalidConfig`](crate::HysteriaProxyError::InvalidConfig)。
     pub fn new(
         tag: impl Into<String>,
         config: HysteriaConfig,
         transport: Arc<dyn HysteriaTransport>,
     ) -> Result<Self> {
         config.validate()?;
-        Ok(Self {
-            tag: tag.into(),
-            config,
-            client_manager: ClientManager::new(transport),
-        })
+        Ok(Self { tag: tag.into(), config, client_manager: ClientManager::new(transport) })
     }
 
     /// 配置引用。
@@ -100,9 +96,7 @@ impl OutboundHandler for HysteriaOutboundHandler {
         let proto_config = Arc::new(self.build_proto_config());
         let quic_params = Arc::clone(&self.config.quic_params);
 
-        let client = self
-            .client_manager
-            .get_or_create(dest, proto_config, quic_params);
+        let client = self.client_manager.get_or_create(dest, proto_config, quic_params);
 
         match destination.network() {
             Network::TCP => {
@@ -115,7 +109,7 @@ impl OutboundHandler for HysteriaOutboundHandler {
                     dest = %destination,
                     "hysteria outbound TCP stream established"
                 );
-            }
+            },
             Network::UDP => {
                 client
                     .udp()
@@ -126,12 +120,12 @@ impl OutboundHandler for HysteriaOutboundHandler {
                     dest = %destination,
                     "hysteria outbound UDP session established"
                 );
-            }
+            },
             Network::Unix => {
                 return Err(OutboundError::ConnectionFailed(
-                    "hysteria does not support Unix socket".into()
+                    "hysteria does not support Unix socket".into(),
                 ));
-            }
+            },
         }
         Ok(())
     }
@@ -157,24 +151,17 @@ fn resolve_server_dest(
         .ok_or_else(|| {
             OutboundError::ConnectionFailed(format!("resolve {server_addr}: no addr"))
         })?;
-    Ok(DialDestination {
-        udp_addr,
-        host: server_name.to_string(),
-    })
+    Ok(DialDestination { udp_addr, host: server_name.to_string() })
 }
 
 #[cfg(test)]
 mod tests {
+    use xray_common::net::{address::Address, port::Port};
+
     use super::*;
-    use xray_common::net::address::Address;
-    use xray_common::net::port::Port;
 
     fn make_dest(network: Network) -> Destination {
-        Destination::new(
-            Address::Domain("example.com".to_string()),
-            Port::new(443),
-            network,
-        )
+        Destination::new(Address::Domain("example.com".to_string()), Port::new(443), network)
     }
 
     #[test]
@@ -201,21 +188,28 @@ mod tests {
             _auth_token: &str,
             _brutal_up_bps: u64,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = std::io::Result<Arc<dyn xray_transport_hysteria::conn::QuicConn>>> + Send>,
+            Box<
+                dyn std::future::Future<
+                        Output = std::io::Result<Arc<dyn xray_transport_hysteria::conn::QuicConn>>,
+                    > + Send,
+            >,
         > {
-            Box::pin(async {
-                Err(std::io::Error::other("noop transport"))
-            })
+            Box::pin(async { Err(std::io::Error::other("noop transport")) })
         }
+
         fn open_stream(
             &self,
             _conn: &Arc<dyn xray_transport_hysteria::conn::QuicConn>,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = std::io::Result<Arc<dyn xray_transport_hysteria::conn::QuicStream>>> + Send>,
+            Box<
+                dyn std::future::Future<
+                        Output = std::io::Result<
+                            Arc<dyn xray_transport_hysteria::conn::QuicStream>,
+                        >,
+                    > + Send,
+            >,
         > {
-            Box::pin(async {
-                Err(std::io::Error::other("noop transport"))
-            })
+            Box::pin(async { Err(std::io::Error::other("noop transport")) })
         }
     }
 

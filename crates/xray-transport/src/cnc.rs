@@ -10,23 +10,27 @@
 //! 间接替代（多一对 pipe + copy 任务）；本类型提供零中间层的直接包装。
 //!
 //! 与 Go 版差异：
-//! - functional options 拆为 builder 方法；`io.Reader`/`io.Writer` 原始流包装
-//!   由 `xray_buf::io::{new_reader, new_writer}` 工厂承担，不重复。
+//! - functional options 拆为 builder 方法；`io.Reader`/`io.Writer` 原始流包装 由
+//!   `xray_buf::io::{new_reader, new_writer}` 工厂承担，不重复。
 //! - `ConnectionOutputMultiUDP` 的 SplitFirstBytes 包边界语义 →
 //!   [`ContentNetworkConnection::with_packet_mode`]。
 //! - 默认地址：Go 返回 0.0.0.0:0；Rust 按现有 `Connection` 约定返回 `Ok(None)`。
 //! - `onClose` 回调无错误返回值（Go 消费方均为无错误语义的 closeSignal/cancel）。
 //! - Drop 自动触发 close（RAII，防泄漏 onClose）。
 
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use xray_buf::io::{Reader, Writer};
-use xray_buf::multi::MultiBuffer;
+use xray_buf::{
+    io::{Reader, Writer},
+    multi::MultiBuffer,
+};
 
 use crate::connection::Connection;
 
@@ -39,13 +43,7 @@ enum ReadState {
     Idle,
     /// 在途 `read_multi_buffer` future（持有 reader）。
     Pending(
-        Pin<
-            Box<
-                dyn Future<
-                        Output = (Box<dyn Reader>, xray_buf::io::Result<MultiBuffer>),
-                    > + Send,
-            >,
-        >,
+        Pin<Box<dyn Future<Output = (Box<dyn Reader>, xray_buf::io::Result<MultiBuffer>)> + Send>>,
     ),
     /// 已读回但未消费完的数据（对应 Go `buf.BufferedReader` 内部缓冲）。
     Buffered(MultiBuffer),
@@ -56,10 +54,9 @@ enum WriteState {
     Idle,
     /// 在途 `write_multi_buffer` future（持有 writer）+ 本批字节数。
     /// Go `Write` 全量语义：一次写完整个 buffer 并返回 `len(b)`。
-    Pending((
-        Pin<Box<dyn Future<Output = (Box<dyn Writer>, xray_buf::io::Result<()>)> + Send>>,
-        usize,
-    )),
+    Pending(
+        (Pin<Box<dyn Future<Output = (Box<dyn Writer>, xray_buf::io::Result<()>)> + Send>>, usize),
+    ),
 }
 
 struct Inner {
@@ -226,28 +223,24 @@ impl AsyncRead for ContentNetworkConnection {
                         return Poll::Ready(Ok(()));
                     }
                     inner.read_state = ReadState::Buffered(mb);
-                }
+                },
                 Poll::Ready((reader, Err(e))) => {
                     inner.reader = Some(reader);
                     inner.read_state = ReadState::Idle;
                     return match e {
                         xray_buf::io::Error::Eof | xray_buf::io::Error::Interrupted => {
                             Poll::Ready(Ok(()))
-                        }
+                        },
                         other => Poll::Ready(Err(io::Error::other(other.to_string()))),
                     };
-                }
+                },
             }
         }
     }
 }
 
 impl AsyncWrite for ContentNetworkConnection {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        b: &[u8],
-    ) -> Poll<io::Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, b: &[u8]) -> Poll<io::Result<usize>> {
         if b.is_empty() {
             return Poll::Ready(Ok(0));
         }
@@ -289,7 +282,7 @@ impl AsyncWrite for ContentNetworkConnection {
                     Ok(()) => Poll::Ready(Ok(len)),
                     Err(e) => Poll::Ready(Err(io::Error::other(e.to_string()))),
                 }
-            }
+            },
         }
     }
 
@@ -316,7 +309,7 @@ impl AsyncWrite for ContentNetworkConnection {
                 inner.writer = Some(writer);
                 inner.write_state = WriteState::Idle;
                 Poll::Ready(res.map_err(|e| io::Error::other(e.to_string())))
-            }
+            },
         }
     }
 
@@ -352,25 +345,23 @@ impl Drop for ContentNetworkConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use xray_buf::buffer::Buffer;
-    use xray_buf::multi::MultiBuffer;
+    use xray_buf::{buffer::Buffer, multi::MultiBuffer};
+
+    use super::*;
 
     /// dispatcher（对端）持有 resp_writer + req_reader；cnc 持有 resp_reader + req_writer。
-    fn make_cnc() -> (
-        ContentNetworkConnection,
-        Box<dyn xray_buf::io::Writer>,
-        Box<dyn xray_buf::io::Reader>,
-    ) {
+    fn make_cnc()
+    -> (ContentNetworkConnection, Box<dyn xray_buf::io::Writer>, Box<dyn xray_buf::io::Reader>)
+    {
         let (resp_reader, resp_writer) = xray_buf::pipe::new();
         let (req_reader, req_writer) = xray_buf::pipe::new();
-        let conn = ContentNetworkConnection::new(
-            Box::new(resp_reader),
-            Box::new(req_writer),
-        );
+        let conn = ContentNetworkConnection::new(Box::new(resp_reader), Box::new(req_writer));
         (conn, Box::new(resp_writer), Box::new(req_reader))
     }
 
@@ -391,11 +382,11 @@ mod tests {
                         return out;
                     }
                     out.extend_from_slice(&mb.to_vec());
-                }
+                },
                 // pipe EOF 表示：Err(Error::Eof)（pipe.rs State::Closed 路径）
                 Err(xray_buf::io::Error::Eof) | Err(xray_buf::io::Error::Interrupted) => {
-                    return out
-                }
+                    return out;
+                },
                 Err(e) => panic!("pipe_read_all: {e}"),
             }
         }
@@ -512,11 +503,8 @@ mod tests {
         // Go ConnectionOutputMultiUDP / SplitFirstBytes：一次 read 只暴露第一个 buffer
         let (resp_reader, mut resp_writer) = xray_buf::pipe::new();
         let (_req_reader, req_writer) = xray_buf::pipe::new();
-        let mut conn = ContentNetworkConnection::new(
-            Box::new(resp_reader),
-            Box::new(req_writer),
-        )
-        .with_packet_mode();
+        let mut conn = ContentNetworkConnection::new(Box::new(resp_reader), Box::new(req_writer))
+            .with_packet_mode();
 
         // 对端一次写入含两个 buffer 的 MultiBuffer（模拟两个 UDP 包）
         let mut mb = MultiBuffer::new();
@@ -537,10 +525,7 @@ mod tests {
         // 对照：stream（默认）模式一次 read 跨 buffer 填满
         let (resp_reader, mut resp_writer) = xray_buf::pipe::new();
         let (_req_reader, req_writer) = xray_buf::pipe::new();
-        let mut conn = ContentNetworkConnection::new(
-            Box::new(resp_reader),
-            Box::new(req_writer),
-        );
+        let mut conn = ContentNetworkConnection::new(Box::new(resp_reader), Box::new(req_writer));
 
         let mut mb = MultiBuffer::new();
         mb.push(Buffer::from_vec(b"packet-one".to_vec()));

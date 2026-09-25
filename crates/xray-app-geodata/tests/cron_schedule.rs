@@ -5,19 +5,20 @@
 //! 注：因 cron 最小粒度 1 分钟（对齐 Go `robfig/cron` 5-field），
 //! 真实 timer 触发测试用 `fire_for_test` 主动驱动 callback，避免 wall-clock 依赖。
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
-use xray_app_geodata::CronScheduler;
-use xray_app_geodata::instance::Scheduler;
+use xray_app_geodata::{CronScheduler, instance::Scheduler};
 
 #[test]
 fn cron_parses_star_form() {
     let sched = CronScheduler::new();
-    let handle = sched
-        .schedule("* * * * *", Box::new(|| {}))
-        .expect("schedule ok");
+    let handle = sched.schedule("* * * * *", Box::new(|| {})).expect("schedule ok");
     handle.cancel();
 }
 
@@ -70,9 +71,7 @@ fn cron_rejects_too_few_fields() {
 #[test]
 fn cron_schedule_handle_cancel_does_not_panic() {
     let sched = CronScheduler::new();
-    let handle = sched
-        .schedule("* * * * *", Box::new(|| {}))
-        .expect("schedule ok");
+    let handle = sched.schedule("* * * * *", Box::new(|| {})).expect("schedule ok");
     handle.cancel();
 }
 
@@ -82,9 +81,12 @@ fn cron_fire_for_test_invokes_callback() {
     let counter = Arc::new(AtomicUsize::new(0));
     let c = Arc::clone(&counter);
     let handle = sched
-        .schedule_for_test("* * * * *", Box::new(move || {
-            c.fetch_add(1, Ordering::SeqCst);
-        }))
+        .schedule_for_test(
+            "* * * * *",
+            Box::new(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            }),
+        )
         .expect("schedule ok");
 
     handle.fire_for_test();
@@ -102,9 +104,12 @@ fn cron_cancel_stops_callback_invocation() {
     let counter = Arc::new(AtomicUsize::new(0));
     let c = Arc::clone(&counter);
     let handle = sched
-        .schedule_for_test("* * * * *", Box::new(move || {
-            c.fetch_add(1, Ordering::SeqCst);
-        }))
+        .schedule_for_test(
+            "* * * * *",
+            Box::new(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            }),
+        )
         .expect("schedule ok");
 
     handle.fire_for_test();
@@ -120,9 +125,12 @@ fn cron_real_timer_thread_does_not_panic_on_cancel() {
     let counter = Arc::new(AtomicUsize::new(0));
     let c = Arc::clone(&counter);
     let handle = sched
-        .schedule("* * * * *", Box::new(move || {
-            c.fetch_add(1, Ordering::SeqCst);
-        }))
+        .schedule(
+            "* * * * *",
+            Box::new(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            }),
+        )
         .expect("schedule ok");
     std::thread::sleep(Duration::from_millis(50));
     handle.cancel();

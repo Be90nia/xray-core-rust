@@ -120,7 +120,9 @@ pub enum RealityError {
     /// 49i9：客户端配了 `mldsa65Verify` 但所选指纹走 watfaq-rustls fallback——
     /// 该栈没有 mldsa65 证书扩展验签钩子，静默跳过 = fail-open。配置期已拒
     /// （register.rs），此变体兜底 `UConnState` 字面构造等绕过路径，防降级为明文验证。
-    #[error("REALITY: mldsa65Verify requires a btls-supported fingerprint (watfaq-rustls fallback path cannot verify mldsa65)")]
+    #[error(
+        "REALITY: mldsa65Verify requires a btls-supported fingerprint (watfaq-rustls fallback path cannot verify mldsa65)"
+    )]
     Mldsa65VerifyNeedsBtlsFingerprint,
 }
 
@@ -138,10 +140,7 @@ mod tests {
             RealityError::FingerprintNotFound.to_string(),
             "REALITY: failed to get fingerprint"
         );
-        assert_eq!(
-            RealityError::EmptySharedKey.to_string(),
-            "REALITY: SharedKey (ECDH) is nil"
-        );
+        assert_eq!(RealityError::EmptySharedKey.to_string(), "REALITY: SharedKey (ECDH) is nil");
         assert_eq!(
             RealityError::InvalidConnection.to_string(),
             "REALITY: processed invalid connection"

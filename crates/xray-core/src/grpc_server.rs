@@ -15,16 +15,15 @@
 //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
 //! serve_grpc("127.0.0.1:8080", |server| {
 //!     server.add_service(stats_server).add_service(router_server)
-//! }).await?;
+//! })
+//! .await?;
 //! # Ok(())
 //! # }
 //! ```
 
-use std::error::Error;
-use std::net::SocketAddr;
+use std::{error::Error, net::SocketAddr};
 
-use tonic::transport::Server;
-use tonic::transport::server::Router;
+use tonic::transport::{Server, server::Router};
 
 /// 启动 gRPC 服务器。
 ///
@@ -41,9 +40,8 @@ pub async fn serve_grpc<F>(addr: &str, register: F) -> Result<(), Box<dyn Error 
 where
     F: FnOnce(Server) -> Router,
 {
-    let socket_addr: SocketAddr = addr
-        .parse()
-        .map_err(|e| format!("invalid gRPC listen address `{addr}`: {e}"))?;
+    let socket_addr: SocketAddr =
+        addr.parse().map_err(|e| format!("invalid gRPC listen address `{addr}`: {e}"))?;
 
     tracing::info!("gRPC server listening on {socket_addr}");
 
@@ -62,13 +60,15 @@ where
 pub fn spawn_grpc<F>(
     addr: &str,
     register: F,
-) -> Result<tokio::task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>>
+) -> Result<
+    tokio::task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>,
+    Box<dyn Error + Send + Sync>,
+>
 where
     F: FnOnce(Server) -> Router + Send + 'static,
 {
-    let socket_addr: SocketAddr = addr
-        .parse()
-        .map_err(|e| format!("invalid gRPC listen address `{addr}`: {e}"))?;
+    let socket_addr: SocketAddr =
+        addr.parse().map_err(|e| format!("invalid gRPC listen address `{addr}`: {e}"))?;
 
     tracing::info!("gRPC server (background) will listen on {socket_addr}");
 

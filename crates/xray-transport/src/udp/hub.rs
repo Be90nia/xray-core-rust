@@ -13,12 +13,12 @@
 //! udpmask wrapping：已接入 `crate::finalmask`——`listen()` 的 `udpmask` 参数
 //! 非 `None` 且非空时经 `WrapPacketConnServer` 包装（对应 Go hub.go:71-77）。
 
-use std::io;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{io, net::SocketAddr, sync::Arc};
 
-use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Notify};
+use tokio::{
+    net::UdpSocket,
+    sync::{Notify, mpsc},
+};
 
 /// UDP 收包缓冲区大小（对应 Go `finalmask.UDPSize = 4096`）。
 const UDP_BUFFER_SIZE: usize = 4096;
@@ -74,10 +74,7 @@ pub struct UdpHubBuilder {
 
 impl Default for UdpHubBuilder {
     fn default() -> Self {
-        Self {
-            capacity: DEFAULT_CACHE_CAPACITY,
-            recv_orig_dest: false,
-        }
+        Self { capacity: DEFAULT_CACHE_CAPACITY, recv_orig_dest: false }
     }
 }
 
@@ -108,8 +105,8 @@ impl UdpHub {
     ///
     /// - `addr`：监听地址
     /// - `options`：配置选项（`Capacity`、`ReceiveOriginalDestination`）
-    /// - `udpmask`：UDP 伪装链（Go hub.go:71-77：`streamSettings.UdpmaskManager != nil`
-    ///   时包装 conn，recv 侧 decode、`send_to` 侧 encode）。`None` / 空 manager =
+    /// - `udpmask`：UDP 伪装链（Go hub.go:71-77：`streamSettings.UdpmaskManager != nil` 时包装
+    ///   conn，recv 侧 decode、`send_to` 侧 encode）。`None` / 空 manager =
     ///   不包装（现有行为不变）。
     ///
     /// # 错误
@@ -131,10 +128,9 @@ impl UdpHub {
         // `hub.conn.(*net.UDPConn)` 断言失败 → udpConn=nil → origDest 不可用）。
         let io: Option<Arc<dyn crate::finalmask::UdpIo>> = match udpmask.as_ref() {
             Some(mgr) if !mgr.udpmasks.is_empty() => {
-                let wrapped =
-                    mgr.wrap_packet_conn_server(Box::new(Arc::clone(&socket)))?;
+                let wrapped = mgr.wrap_packet_conn_server(Box::new(Arc::clone(&socket)))?;
                 Some(Arc::from(wrapped))
-            }
+            },
             _ => None,
         };
         let (tx, rx) = mpsc::channel::<UdpPacket>(builder.capacity);
@@ -154,10 +150,10 @@ impl UdpHub {
             match io {
                 Some(io) => {
                     start_recv_loop_masked(&io, tx, close_notify).await;
-                }
+                },
                 None => {
                     start_recv_loop(&socket, tx, close_notify, recv_orig_dest).await;
-                }
+                },
             }
         });
 
@@ -329,14 +325,11 @@ async fn bind_udp(addr: SocketAddr, recv_orig_dest: bool) -> io::Result<UdpSocke
 
 #[cfg(target_os = "linux")]
 fn bind_udp_tproxy_linux(addr: SocketAddr) -> io::Result<UdpSocket> {
-    use socket2::{Domain, Protocol, Socket, Type};
     use std::os::fd::AsRawFd;
 
-    let domain = if addr.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
-    };
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
     let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
 
     // TPROXY 常与 iptables PREROUTING 在同主机共存，SO_REUSEADDR 避免冲突。
@@ -377,11 +370,7 @@ fn setsockopt_int(
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         )
     };
-    if ret == -1 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    if ret == -1 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 
 /// Linux + `ReceiveOriginalDestination` 时的收包循环：用 `recvmsg` 一次性读取
@@ -393,7 +382,8 @@ async fn start_recv_loop_tproxy_linux(
     close_notify: Arc<Notify>,
 ) {
     use std::mem::MaybeUninit;
-    use socket2::{MsgHdrMut, MaybeUninitSlice, SockRef};
+
+    use socket2::{MaybeUninitSlice, MsgHdrMut, SockRef};
 
     // ancillary 缓冲区：容纳一条 IP_RECVORIGDSTADDR/IPV6_RECVORIGDSTADDR cmsg
     // （sockaddr_in6 最大，CMSG_SPACE 后远小于 64 字节）。
@@ -497,7 +487,6 @@ fn parse_orig_dst_from_cmsg(
 ) -> Option<SocketAddr> {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
-
     let hdr_size = std::mem::size_of::<libc::cmsghdr>();
     if len < hdr_size {
         return None;
@@ -522,10 +511,7 @@ fn parse_orig_dst_from_cmsg(
         let sin = unsafe { &*(data as *const libc::sockaddr_in) };
         // s_addr 按本机序存储，to_ne_bytes 直接得到 [a,b,c,d]。
         let ip = Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
-        Some(SocketAddr::V4(SocketAddrV4::new(
-            ip,
-            u16::from_be(sin.sin_port),
-        )))
+        Some(SocketAddr::V4(SocketAddrV4::new(ip, u16::from_be(sin.sin_port))))
     } else if is_ipv6_origdst_cmsg(chdr) {
         if data_len < std::mem::size_of::<libc::sockaddr_in6>() {
             return None;
@@ -549,8 +535,7 @@ fn parse_orig_dst_from_cmsg(
 // 保留 `register_udp_listener` / `unregister_udp_listener` 向后兼容，
 // 但标记为 deprecated——新代码应使用 `UdpHub::listen()`。
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::{collections::HashMap, sync::Mutex};
 
 static UDP_HUB: std::sync::OnceLock<Mutex<HashMap<SocketAddr, ()>>> = std::sync::OnceLock::new();
 fn udp_hub() -> &'static Mutex<HashMap<SocketAddr, ()>> {
@@ -565,8 +550,10 @@ const MAX_UDP_HUB_ENTRIES: usize = 4096;
 pub fn register_udp_listener(addr: SocketAddr) -> io::Result<()> {
     if let Ok(mut hub) = udp_hub().lock() {
         if hub.len() >= MAX_UDP_HUB_ENTRIES {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                format!("UDP hub registry full ({MAX_UDP_HUB_ENTRIES})")));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("UDP hub registry full ({MAX_UDP_HUB_ENTRIES})"),
+            ));
         }
         hub.insert(addr, ());
     }
@@ -587,9 +574,8 @@ mod tests {
 
     #[tokio::test]
     async fn udp_hub_bind_and_recv() {
-        let hub = UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None)
-            .await
-            .expect("listen 失败");
+        let hub =
+            UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None).await.expect("listen 失败");
         let addr = hub.local_addr().expect("local_addr 失败");
         assert_ne!(addr.port(), 0);
 
@@ -600,13 +586,10 @@ mod tests {
         sender.send_to(b"hello", addr).await.expect("send_to 失败");
 
         // 接收。
-        let packet = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            rx.recv(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
+        let packet = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
 
         assert_eq!(&packet.payload, b"hello");
         assert!(packet.target.is_none());
@@ -614,9 +597,8 @@ mod tests {
 
     #[tokio::test]
     async fn udp_hub_local_addr() {
-        let hub = UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None)
-            .await
-            .expect("listen 失败");
+        let hub =
+            UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None).await.expect("listen 失败");
         let addr = hub.local_addr().expect("local_addr 失败");
         assert_eq!(addr.ip().to_string(), "127.0.0.1");
         assert_ne!(addr.port(), 0);
@@ -624,9 +606,8 @@ mod tests {
 
     #[tokio::test]
     async fn udp_hub_send_to() {
-        let hub = UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None)
-            .await
-            .expect("listen 失败");
+        let hub =
+            UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None).await.expect("listen 失败");
         let hub_addr = hub.local_addr().expect("local_addr 失败");
 
         // 接收端。
@@ -638,13 +619,11 @@ mod tests {
 
         // 接收端验证。
         let mut buf = [0u8; 16];
-        let (n, from) = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            receiver.recv_from(&mut buf),
-        )
-        .await
-        .expect("timeout")
-        .expect("recv_from 失败");
+        let (n, from) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv_from(&mut buf))
+                .await
+                .expect("timeout")
+                .expect("recv_from 失败");
 
         assert_eq!(&buf[..n], b"world");
         assert_eq!(from, hub_addr);
@@ -652,26 +631,21 @@ mod tests {
 
     #[tokio::test]
     async fn udp_hub_close_stops_recv_loop() {
-        let hub = UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None)
-            .await
-            .expect("listen 失败");
+        let hub =
+            UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None).await.expect("listen 失败");
 
         hub.close().expect("close 失败");
 
         // close 后 receive 应该最终返回 None（channel 关闭）。
         let mut rx = hub.receive();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            rx.recv(),
-        )
-        .await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await;
 
         // 可能收到 None（channel 关闭）或 timeout（recv 循环还在等）。
         // 关键是不 panic。
         match result {
-            Ok(None) => {} // channel 已关闭 ✅
-            Ok(Some(_)) => {} // 收到残留包也 OK
-            Err(_) => {} // timeout 也 OK——recv 循环可能在等下一个包
+            Ok(None) => {},    // channel 已关闭 ✅
+            Ok(Some(_)) => {}, // 收到残留包也 OK
+            Err(_) => {},      // timeout 也 OK——recv 循环可能在等下一个包
         }
     }
 
@@ -687,31 +661,24 @@ mod tests {
 
     #[tokio::test]
     async fn udp_hub_multiple_packets() {
-        let hub = UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None)
-            .await
-            .expect("listen 失败");
+        let hub =
+            UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None).await.expect("listen 失败");
         let addr = hub.local_addr().expect("local_addr 失败");
 
         let mut rx = hub.receive();
 
         let sender = UdpSocket::bind("127.0.0.1:0").await.expect("bind sender");
         for i in 0..5u8 {
-            sender
-                .send_to(&[i], addr)
-                .await
-                .expect("send_to 失败");
+            sender.send_to(&[i], addr).await.expect("send_to 失败");
         }
 
         // 接收 5 个包。
         let mut received = Vec::new();
         for _ in 0..5 {
-            let packet = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                rx.recv(),
-            )
-            .await
-            .expect("timeout")
-            .expect("channel closed");
+            let packet = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("timeout")
+                .expect("channel closed");
             received.push(packet.payload);
         }
 
@@ -726,56 +693,39 @@ mod tests {
     async fn udp_hub_listen_with_udpmask_roundtrip() {
         use crate::finalmask::{UdpIo, build_udpmask_manager_from_json};
 
-        let fm: serde_json::Value = serde_json::from_str(
-            r#"{"udp":[{"type":"mkcp-legacy","settings":{}}]}"#,
-        )
-        .unwrap();
+        let fm: serde_json::Value =
+            serde_json::from_str(r#"{"udp":[{"type":"mkcp-legacy","settings":{}}]}"#).unwrap();
         let mgr = build_udpmask_manager_from_json(Some(&fm)).expect("manager");
 
-        let hub = UdpHub::listen(
-            "127.0.0.1:0".parse().unwrap(),
-            &[],
-            Some(mgr),
-        )
-        .await
-        .expect("listen with udpmask 失败");
+        let hub = UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], Some(mgr))
+            .await
+            .expect("listen with udpmask 失败");
         let hub_addr = hub.local_addr().expect("local_addr 失败");
 
         // 客户端：同配置 client 侧 wrap。
         let client_raw = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
         let client_addr = client_raw.local_addr().unwrap();
         let client_mgr = build_udpmask_manager_from_json(Some(&fm)).expect("manager");
-        let client_io: Box<dyn UdpIo> = client_mgr
-            .wrap_packet_conn_client(Box::new(client_raw))
-            .expect("client wrap");
+        let client_io: Box<dyn UdpIo> =
+            client_mgr.wrap_packet_conn_client(Box::new(client_raw)).expect("client wrap");
 
         // 反向：hub.send_to（encode）→ client decode。
-        hub.send_to(b"masked-pong", client_addr)
-            .await
-            .expect("hub send_to");
+        hub.send_to(b"masked-pong", client_addr).await.expect("hub send_to");
         let mut buf = vec![0u8; 1500];
-        let (n, _) = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            client_io.recv_from(&mut buf),
-        )
-        .await
-        .expect("client recv timeout")
-        .expect("client recv ok");
+        let (n, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), client_io.recv_from(&mut buf))
+                .await
+                .expect("client recv timeout")
+                .expect("client recv ok");
         assert_eq!(&buf[..n], b"masked-pong");
 
         // 正向：client（encode）→ hub recv 循环 decode。
-        client_io
-            .send_to(b"masked-ping", hub_addr)
-            .await
-            .expect("client send_to");
+        client_io.send_to(b"masked-ping", hub_addr).await.expect("client send_to");
         let mut rx = hub.receive();
-        let packet = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            rx.recv(),
-        )
-        .await
-        .expect("hub recv timeout")
-        .expect("hub channel closed");
+        let packet = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("hub recv timeout")
+            .expect("hub channel closed");
         assert_eq!(&packet.payload, b"masked-ping");
         assert_eq!(packet.source, client_addr);
         assert!(packet.target.is_none());

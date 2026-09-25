@@ -7,32 +7,32 @@
 //! H3 路径用 transport 层桥接体（`Error = io::Error`）。泛型 bound 只要求
 //! `Data = Bytes` + 错误可转 `BoxError`（`collect` 等消费端需要）。
 
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::Duration;
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use bytes::Bytes;
 use futures_util::TryStreamExt;
 use http::HeaderMap;
-use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full, StreamBody};
-use hyper::body::Frame;
-use hyper::{Method, Request, Response, StatusCode};
+use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
+use hyper::{Method, Request, Response, StatusCode, body::Frame};
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tokio_util::io::ReaderStream;
 
-use crate::config::{
-    Config, PLACEMENT_AUTO, PLACEMENT_BODY, PLACEMENT_COOKIE, PLACEMENT_HEADER,
-    PLACEMENT_QUERY_IN_HEADER,
+use super::{HubConnHandler, ServerConn, ServerConnCloseSignal, SessionMap, meta::extract_meta};
+use crate::{
+    config::{
+        Config, PLACEMENT_AUTO, PLACEMENT_BODY, PLACEMENT_COOKIE, PLACEMENT_HEADER,
+        PLACEMENT_QUERY_IN_HEADER,
+    },
+    upload_queue::Packet,
+    xpadding::{PADDING_METHOD_REPEAT_X, generate_padding, is_padding_valid},
 };
-use crate::upload_queue::Packet;
-use crate::xpadding::{generate_padding, is_padding_valid, PADDING_METHOD_REPEAT_X};
-
-use super::meta::extract_meta;
-use super::{HubConnHandler, ServerConn, ServerConnCloseSignal, SessionMap};
 
 /// 处理器上下文（每个 listener 实例一份，Arc 共享给所有连接）。
 pub struct HandlerContext {
@@ -65,9 +65,7 @@ where
     B: hyper::body::Body<Data = Bytes> + Send + Unpin + BodyExt + 'static,
     B::Error: Send + Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    let cors = ctx
-        .config
-        .write_response_header(req.method().as_str(), req.headers());
+    let cors = ctx.config.write_response_header(req.method().as_str(), req.headers());
     let resp = dispatch_request(req, peer_addr, ctx).await;
     apply_cors_headers(resp, &cors)
 }
@@ -95,24 +93,17 @@ where
     B: hyper::body::Body<Data = Bytes> + Send + Unpin + BodyExt + 'static,
     B::Error: Send + Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    // 1. Host 验证（Go internet.IsValidHTTPHost internet.go:8-16——lowercase +
-    //    剥端口 + 精确匹配；此前双向 contains 是子串匹配可绕过）。
-    //    Host 来源对齐 Go net/http r.Host（r2lq）：h2 请求没有 Host header，
-    //    host 在 :authority 伪头（hyper 挂在 URI authority 上）——旧实现读
-    //    header 恒空串，一切 h2 请求 404；h1 origin-form URI 无 host 部分则
-    //    回落 Host header。URI host 优先与 Go readRequest（URL host 先于
-    //    Host header）一致。
+    // 1. Host 验证（Go internet.IsValidHTTPHost internet.go:8-16——lowercase + 剥端口 +
+    //    精确匹配；此前双向 contains 是子串匹配可绕过）。 Host 来源对齐 Go net/http
+    //    r.Host（r2lq）：h2 请求没有 Host header， host 在 :authority 伪头（hyper 挂在 URI
+    //    authority 上）——旧实现读 header 恒空串，一切 h2 请求 404；h1 origin-form URI 无 host
+    //    部分则 回落 Host header。URI host 优先与 Go readRequest（URL host 先于 Host header）一致。
     if !ctx.host.is_empty() {
         let req_host = req
             .uri()
             .host()
             .map(str::to_string)
-            .or_else(|| {
-                req.headers()
-                    .get("host")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string)
-            })
+            .or_else(|| req.headers().get("host").and_then(|v| v.to_str().ok()).map(str::to_string))
             .unwrap_or_default();
         if !xray_common::protocol::http::is_valid_http_host(&req_host, &ctx.host) {
             return status_response(StatusCode::NOT_FOUND);
@@ -125,8 +116,8 @@ where
         return status_response(StatusCode::NOT_FOUND);
     }
 
-    // 3. 校验通过：Go hub.go:110-131 在 CORS 之后、分发之前注入 X-Padding——
-    //    之后所有响应（OPTIONS 200 / padding 400 / 分发结果）都带。
+    // 3. 校验通过：Go hub.go:110-131 在 CORS 之后、分发之前注入 X-Padding—— 之后所有响应（OPTIONS
+    //    200 / padding 400 / 分发结果）都带。
     let resp = dispatch_validated(req, peer_addr, ctx).await;
     apply_xpadding_to_response(resp, ctx)
 }
@@ -151,22 +142,22 @@ where
     // 4. 提取 session + seq
     let meta = extract_meta(&req, &ctx.config, &ctx.base_path);
 
-    // 5. Padding 提取 + 校验（Go hub.go:141-148 + xpadding.go IsPaddingValid：
-    //    缺失/空/超长一律 400，无豁免分支——H3b 修复）。
+    // 5. Padding 提取 + 校验（Go hub.go:141-148 + xpadding.go IsPaddingValid： 缺失/空/超长一律
+    //    400，无豁免分支——H3b 修复）。
     let padding_value = extract_padding_value(&req, ctx);
     let range = ctx.config.get_normalized_x_padding_bytes();
-    let method =
-        if ctx.config.x_padding_obfs_mode { ctx.config.x_padding_method.as_str() } else { PADDING_METHOD_REPEAT_X };
+    let method = if ctx.config.x_padding_obfs_mode {
+        ctx.config.x_padding_method.as_str()
+    } else {
+        PADDING_METHOD_REPEAT_X
+    };
     if !is_padding_valid(&padding_value, range.from, range.to, method) {
         return status_response(StatusCode::BAD_REQUEST);
     }
     // Go hub.go:217 `obfsPaddingAccepted := h.config.XPaddingObfsMode && paddingValue != ""`
     let obfs_padding_accepted = ctx.config.x_padding_obfs_mode && !padding_value.is_empty();
-    let has_referer = req
-        .headers()
-        .get("Referer")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|s| !s.is_empty());
+    let has_referer =
+        req.headers().get("Referer").and_then(|v| v.to_str().ok()).is_some_and(|s| !s.is_empty());
 
     // 6. 分发
     let is_uplink = match *req.method() {
@@ -176,8 +167,7 @@ where
 
     if is_uplink && !meta.session_id.is_empty() {
         if meta.seq_str.is_empty() {
-            handle_stream_up(req, &meta.session_id, ctx, has_referer, obfs_padding_accepted)
-                .await
+            handle_stream_up(req, &meta.session_id, ctx, has_referer, obfs_padding_accepted).await
         } else {
             handle_packet_up(req, &meta.session_id, &meta.seq_str, ctx).await
         }
@@ -204,7 +194,7 @@ where
             _ => {
                 let url = req.uri().to_string();
                 return extract_query_value(&url, "x_padding");
-            }
+            },
         }
     }
     extract_obfs_padding(req.headers(), req.uri(), ctx.config.as_ref())
@@ -225,8 +215,11 @@ fn apply_xpadding_to_response(
         } else {
             ctx.config.x_padding_placement.as_str()
         };
-        let key =
-            if ctx.config.x_padding_key.is_empty() { "x_padding" } else { ctx.config.x_padding_key.as_str() };
+        let key = if ctx.config.x_padding_key.is_empty() {
+            "x_padding"
+        } else {
+            ctx.config.x_padding_key.as_str()
+        };
         let header = if ctx.config.x_padding_header.is_empty() {
             "Referer"
         } else {
@@ -237,8 +230,11 @@ fn apply_xpadding_to_response(
         // Go hub.go:124-130 非 obfs 固定 header placement + "X-Padding"。
         (PLACEMENT_HEADER, "x_padding", "X-Padding")
     };
-    let method =
-        if ctx.config.x_padding_obfs_mode { ctx.config.x_padding_method.as_str() } else { PADDING_METHOD_REPEAT_X };
+    let method = if ctx.config.x_padding_obfs_mode {
+        ctx.config.x_padding_method.as_str()
+    } else {
+        PADDING_METHOD_REPEAT_X
+    };
     let padding = generate_padding(method, length);
     if length <= 0 || padding.is_empty() {
         return resp;
@@ -249,7 +245,7 @@ fn apply_xpadding_to_response(
             if let (Ok(name), Ok(val)) = (header.parse::<http::HeaderName>(), padding.parse()) {
                 h.insert(name, val);
             }
-        }
+        },
         // Go ApplyXPaddingToHeader queryInHeader 分支：RawURL 服务端未设置 →
         // url.Parse("") 得空 URL → u.RawQuery=key=padding → u.String() = "?key=padding"。
         PLACEMENT_QUERY_IN_HEADER => {
@@ -257,15 +253,15 @@ fn apply_xpadding_to_response(
             if let (Ok(name), Ok(val)) = (header.parse::<http::HeaderName>(), val.parse()) {
                 h.insert(name, val);
             }
-        }
+        },
         PLACEMENT_COOKIE => {
             let val = format!("{key}={padding}; Path=/");
             if let Ok(val) = val.parse() {
                 h.insert(http::header::SET_COOKIE, val);
             }
-        }
+        },
         // query placement：Go 响应侧 switch 无该分支（恒无操作）。
-        _ => {}
+        _ => {},
     }
     resp
 }
@@ -297,9 +293,11 @@ where
     }
 
     let session = ctx.sessions.upsert(session_id, ctx.max_buffered_posts).await;
-    let push =
-        tokio::time::timeout(PACKET_UP_TIMEOUT, session.upload_queue.push(Packet::new(payload, seq)))
-            .await;
+    let push = tokio::time::timeout(
+        PACKET_UP_TIMEOUT,
+        session.upload_queue.push(Packet::new(payload, seq)),
+    )
+    .await;
     if !matches!(push, Ok(Ok(()))) {
         return status_response(StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -362,10 +360,8 @@ where
         .status(StatusCode::OK)
         .body(body)
         .unwrap_or_else(|_| status_response(StatusCode::INTERNAL_SERVER_ERROR));
-    resp.headers_mut()
-        .insert("X-Accel-Buffering", "no".parse().unwrap());
-    resp.headers_mut()
-        .insert("Cache-Control", "no-store".parse().unwrap());
+    resp.headers_mut().insert("X-Accel-Buffering", "no".parse().unwrap());
+    resp.headers_mut().insert("Cache-Control", "no-store".parse().unwrap());
     resp
 }
 
@@ -441,10 +437,7 @@ where
     headers.insert("X-Accel-Buffering", "no".parse().unwrap());
     headers.insert("Cache-Control", "no-store".parse().unwrap());
     if !ctx.config.no_sse_header {
-        headers.insert(
-            "Content-Type",
-            "text/event-stream".parse().unwrap(),
-        );
+        headers.insert("Content-Type", "text/event-stream".parse().unwrap());
     }
     resp.body(body).unwrap()
 }
@@ -452,7 +445,10 @@ where
 // ===== 辅助函数 =====
 
 /// UploadQueue → AsyncWrite（duplex 管道写端）。
-async fn forward_queue_to_writer(queue: Arc<crate::UploadQueue>, mut writer: tokio::io::DuplexStream) {
+async fn forward_queue_to_writer(
+    queue: Arc<crate::UploadQueue>,
+    mut writer: tokio::io::DuplexStream,
+) {
     let mut buf = vec![0u8; 8192];
     loop {
         match queue.read(&mut buf).await {
@@ -461,7 +457,7 @@ async fn forward_queue_to_writer(queue: Arc<crate::UploadQueue>, mut writer: tok
                 if writer.write_all(&buf[..n]).await.is_err() {
                     break;
                 }
-            }
+            },
             Err(_) => break,
         }
     }
@@ -532,11 +528,7 @@ where
         payload.extend_from_slice(&extract_cookie_payload(headers, key));
     }
     if placement == PLACEMENT_AUTO || placement == PLACEMENT_BODY {
-        let bytes = body
-            .collect()
-            .await
-            .map_err(|_| StatusCode::BAD_REQUEST)?
-            .to_bytes();
+        let bytes = body.collect().await.map_err(|_| StatusCode::BAD_REQUEST)?.to_bytes();
         payload.extend_from_slice(&bytes);
     }
 
@@ -557,11 +549,7 @@ fn extract_header_payload(headers: &HeaderMap, key: &str) -> Vec<u8> {
         }
     }
     let encoded = chunks.concat();
-    if encoded.is_empty() {
-        Vec::new()
-    } else {
-        base64url_decode(&encoded).unwrap_or_default()
-    }
+    if encoded.is_empty() { Vec::new() } else { base64url_decode(&encoded).unwrap_or_default() }
 }
 
 /// 从 `{key}_{i}` cookie 序列提取并 base64 解码。
@@ -576,11 +564,7 @@ fn extract_cookie_payload(headers: &HeaderMap, key: &str) -> Vec<u8> {
         chunks.push(val);
     }
     let encoded = chunks.concat();
-    if encoded.is_empty() {
-        Vec::new()
-    } else {
-        base64url_decode(&encoded).unwrap_or_default()
-    }
+    if encoded.is_empty() { Vec::new() } else { base64url_decode(&encoded).unwrap_or_default() }
 }
 
 /// obfs 模式 padding 提取。对应 Go `Config.ExtractXPaddingFromRequest` obfs
@@ -589,7 +573,8 @@ fn extract_cookie_payload(headers: &HeaderMap, key: &str) -> Vec<u8> {
 /// 键名/header 名缺省与客户端构造侧（`build_xpadding_config`）对称。
 fn extract_obfs_padding(headers: &HeaderMap, uri: &http::Uri, cfg: &Config) -> String {
     let key = if cfg.x_padding_key.is_empty() { "x_padding" } else { cfg.x_padding_key.as_str() };
-    let header = if cfg.x_padding_header.is_empty() { "Referer" } else { cfg.x_padding_header.as_str() };
+    let header =
+        if cfg.x_padding_header.is_empty() { "Referer" } else { cfg.x_padding_header.as_str() };
 
     // 1. cookie(key)
     let cookie_val = cookie_get(headers, key);
@@ -700,16 +685,11 @@ fn base64url_decode(s: &str) -> Result<Vec<u8>, ()> {
 
 /// 构造空 body 状态响应。
 fn status_response(status: StatusCode) -> Response<BoxBody<Bytes, io::Error>> {
-    Response::builder()
-        .status(status)
-        .body(empty_body())
-        .unwrap()
+    Response::builder().status(status).body(empty_body()).unwrap()
 }
 
 fn empty_body() -> BoxBody<Bytes, io::Error> {
-    Full::new(Bytes::new())
-        .map_err(|e: std::convert::Infallible| match e {})
-        .boxed()
+    Full::new(Bytes::new()).map_err(|e: std::convert::Infallible| match e {}).boxed()
 }
 
 #[cfg(test)]
@@ -796,7 +776,12 @@ mod tests {
         let cfg = obfs_cfg("", "", "");
         let range = cfg.get_normalized_x_padding_bytes();
         assert!(is_padding_valid(&"X".repeat(200), range.from, range.to, &cfg.x_padding_method));
-        assert!(!is_padding_valid(&"X".repeat(10_000), range.from, range.to, &cfg.x_padding_method));
+        assert!(!is_padding_valid(
+            &"X".repeat(10_000),
+            range.from,
+            range.to,
+            &cfg.x_padding_method
+        ));
         // 空 padding（无值）→ false → 400（Go hub.go:141-148 无条件校验）。
         assert!(!is_padding_valid("", range.from, range.to, &cfg.x_padding_method));
     }
@@ -832,19 +817,13 @@ mod tests {
             extract_query_value("https://example.com/ws?x_padding=XXXX", "x_padding"),
             "XXXX"
         );
-        assert_eq!(
-            extract_query_value("https://example.com/ws?a=1&b=2", "b"),
-            "2"
-        );
+        assert_eq!(extract_query_value("https://example.com/ws?a=1&b=2", "b"), "2");
     }
 
     #[test]
     fn extract_query_value_missing_returns_empty() {
         assert_eq!(extract_query_value("https://example.com/ws", "x_padding"), "");
-        assert_eq!(
-            extract_query_value("https://example.com/ws?other=1", "x_padding"),
-            ""
-        );
+        assert_eq!(extract_query_value("https://example.com/ws?other=1", "x_padding"), "");
     }
 
     #[test]
@@ -882,14 +861,8 @@ mod tests {
         ];
         let merged = apply_cors_headers(resp, &cors);
         assert_eq!(merged.status(), StatusCode::OK);
-        assert_eq!(
-            merged.headers().get("Access-Control-Allow-Origin").unwrap(),
-            "*"
-        );
-        assert_eq!(
-            merged.headers().get("Access-Control-Allow-Methods").unwrap(),
-            "POST"
-        );
+        assert_eq!(merged.headers().get("Access-Control-Allow-Origin").unwrap(), "*");
+        assert_eq!(merged.headers().get("Access-Control-Allow-Methods").unwrap(), "POST");
     }
 
     #[test]
@@ -998,7 +971,9 @@ mod tests {
         let range = ctx.config.get_normalized_x_padding_bytes();
         assert!(
             n >= range.from as usize && n <= range.to as usize,
-            "padding len {n} must be within [{}, {}]", range.from, range.to
+            "padding len {n} must be within [{}, {}]",
+            range.from,
+            range.to
         );
     }
 
@@ -1008,8 +983,12 @@ mod tests {
     async fn h3b_missing_padding_rejected() {
         let ctx = make_ctx("");
         // OPTIONS 在 padding 校验之前放行（Go 同），用 GET 验证 padding 门。
-        let req = Request::builder().method(Method::GET).uri("/x").header("Host", "h")
-            .body(Full::new(Bytes::new())).unwrap();
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/x")
+            .header("Host", "h")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
         let resp = dispatch_request(req, "127.0.0.1:2".parse().unwrap(), &ctx).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "missing padding must be 400");
     }
@@ -1049,16 +1028,9 @@ mod tests {
             sc_max_each_post_bytes: 1024 * 1024,
         };
 
-        let req = Request::builder()
-            .method(Method::GET)
-            .body(Full::new(Bytes::new()))
-            .unwrap();
-        let resp =
-            handle_stream_down(req, "127.0.0.1:2".parse().unwrap(), "sess-ikzy", &ctx).await;
-        assert!(
-            ctx.sessions.get("sess-ikzy").await.is_some(),
-            "GET must register session"
-        );
+        let req = Request::builder().method(Method::GET).body(Full::new(Bytes::new())).unwrap();
+        let resp = handle_stream_down(req, "127.0.0.1:2".parse().unwrap(), "sess-ikzy", &ctx).await;
+        assert!(ctx.sessions.get("sess-ikzy").await.is_some(), "GET must register session");
 
         // 模拟 hyper 终结 GET：drop 响应（body → ReaderStream → GuardedReader → guard）
         drop(resp);

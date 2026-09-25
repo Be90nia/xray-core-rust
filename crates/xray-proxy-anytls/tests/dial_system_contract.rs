@@ -7,23 +7,23 @@
 
 #![cfg(test)]
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use rustls::ClientConfig as RustlsClientConfig;
-use rustls::ServerConfig as RustlsServerConfig;
+use rustls::{ClientConfig as RustlsClientConfig, ServerConfig as RustlsServerConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::TlsAcceptor;
 use xray_features::dns::{DnsClient, DnsError, IpOption};
-use xray_transport::sockopt::{DomainStrategy, SocketOptions};
-use xray_transport::system_dialer::set_dns_client;
-
-use xray_proxy_anytls::client::{AnytlsClient, ClientConfig};
-use xray_proxy_anytls::server::AnytlsMockServer;
-use xray_proxy_anytls::socks::SocksAddr;
+use xray_proxy_anytls::{
+    client::{AnytlsClient, ClientConfig},
+    server::AnytlsMockServer,
+    socks::SocksAddr,
+};
+use xray_transport::{
+    sockopt::{DomainStrategy, SocketOptions},
+    system_dialer::set_dns_client,
+};
 
 /// FakeDns：固定返回 127.0.0.1，记录 (domain, ipv4_enable, ipv6_enable) 供断言。
 #[derive(Clone, Default)]
@@ -38,9 +38,7 @@ impl DnsClient for FakeDns {
         domain: &str,
         option: IpOption,
     ) -> Result<(Vec<std::net::IpAddr>, u32), DnsError> {
-        self.seen
-            .lock()
-            .push((domain.to_string(), option.ipv4_enable, option.ipv6_enable));
+        self.seen.lock().push((domain.to_string(), option.ipv4_enable, option.ipv6_enable));
         Ok((vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)], 300))
     }
 }
@@ -61,7 +59,7 @@ async fn start_echo_server() -> SocketAddr {
                             if sock.write_all(&buf[..n]).await.is_err() {
                                 break;
                             }
-                        }
+                        },
                     }
                 }
             });
@@ -93,11 +91,7 @@ fn make_server_config(san_name: &str) -> (RustlsServerConfig, Vec<u8>) {
 fn make_client_config(server_cert_der: &[u8]) -> Arc<RustlsClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.add(server_cert_der.to_vec().into()).unwrap();
-    Arc::new(
-        RustlsClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth(),
-    )
+    Arc::new(RustlsClientConfig::builder().with_root_certificates(root_store).with_no_client_auth())
 }
 
 /// 主契约：anytls 拨号经 dial_system（FakeDns 命中）+ sockopt.domain_strategy
@@ -149,8 +143,7 @@ async fn dial_routes_through_dial_system_and_carries_sockopt() {
     anytls_server.stop().await;
 
     assert!(
-        seen.iter()
-            .any(|(d, v4, v6)| d == "anytls.test" && *v4 && !*v6),
+        seen.iter().any(|(d, v4, v6)| d == "anytls.test" && *v4 && !*v6),
         "dial must resolve server domain via dial_system DNS with sockopt domain_strategy, seen: {seen:?}"
     );
 }

@@ -1,7 +1,7 @@
 //! `naive+https://` 分享链接解析 + xray outbound settings JSON 解析。
 
 use serde_json::Value;
-use xray_tls::fingerprint::{get_fingerprint, Fingerprint};
+use xray_tls::fingerprint::{Fingerprint, get_fingerprint};
 
 /// naive 出站配置。
 #[derive(Debug, Clone)]
@@ -39,19 +39,16 @@ impl NaiveConfig {
     /// xray outbound settings JSON → [`NaiveConfig`]。
     ///
     /// JSON 格式：
-    /// `{ "server": "...", "port": 443, "sni": "...", "username": "...", "password": "...", "fingerprint": "chrome" }`
+    /// `{ "server": "...", "port": 443, "sni": "...", "username": "...", "password": "...",
+    /// "fingerprint": "chrome" }`
     pub fn from_json(v: &Value) -> Result<Self, String> {
         let server = v.get("server").and_then(Value::as_str).ok_or("missing server")?;
         let port = v.get("port").and_then(Value::as_u64).ok_or("missing port")?;
         let port = u16::try_from(port).map_err(|_| "port out of range")?;
         let username = v.get("username").and_then(Value::as_str).ok_or("missing username")?;
         let password = v.get("password").and_then(Value::as_str).ok_or("missing password")?;
-        let mut config = Self::new(
-            server.to_string(),
-            port,
-            username.to_string(),
-            password.to_string(),
-        );
+        let mut config =
+            Self::new(server.to_string(), port, username.to_string(), password.to_string());
         if let Some(sni) = v.get("sni").and_then(Value::as_str) {
             config.sni = sni.to_string();
         }
@@ -96,36 +93,25 @@ pub fn parse_naive_uri(uri: &str) -> Result<NaiveConfig, String> {
         .strip_prefix("naive+https://")
         .ok_or_else(|| "scheme must be naive+https://".to_string())?;
     let rest = rest.split('#').next().unwrap_or(rest);
-    let (userinfo, hostport) = rest
-        .split_once('@')
-        .ok_or("missing userinfo (user:pass@host:port)")?;
+    let (userinfo, hostport) =
+        rest.split_once('@').ok_or("missing userinfo (user:pass@host:port)")?;
     let (hostport, query) = hostport.split_once('?').unwrap_or((hostport, ""));
-    let (username, password) = userinfo
-        .split_once(':')
-        .ok_or("userinfo must be user:pass")?;
+    let (username, password) = userinfo.split_once(':').ok_or("userinfo must be user:pass")?;
     // hostport：host:port / [::1]:port / host（缺省 443）
     let (host, port) = match hostport.rsplit_once(':') {
-        Some((h, p)) => (
-            h,
-            p.parse::<u16>().map_err(|_| format!("invalid port: {p}"))?,
-        ),
+        Some((h, p)) => (h, p.parse::<u16>().map_err(|_| format!("invalid port: {p}"))?),
         None => (hostport, 443),
     };
     let host = pct_decode(host.trim_start_matches('[').trim_end_matches(']'));
-    let mut config = NaiveConfig::new(
-        host,
-        port,
-        pct_decode(username),
-        pct_decode(password),
-    );
+    let mut config = NaiveConfig::new(host, port, pct_decode(username), pct_decode(password));
     for pair in query.split('&').filter(|s| !s.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         match k {
             "sni" if !v.is_empty() => config.sni = pct_decode(v),
             "security" if !v.is_empty() && !v.eq_ignore_ascii_case("tls") => {
                 return Err(format!("naive only supports security=tls, got {v}"));
-            }
-            _ => {}
+            },
+            _ => {},
         }
     }
     Ok(config)
@@ -149,10 +135,9 @@ mod tests {
 
     #[test]
     fn parse_sni_override_and_fragment() {
-        let c = parse_naive_uri(
-            "naive+https://u%3Ax:p%40ss@host.example:8443?sni=cdn.example#name",
-        )
-        .unwrap();
+        let c =
+            parse_naive_uri("naive+https://u%3Ax:p%40ss@host.example:8443?sni=cdn.example#name")
+                .unwrap();
         assert_eq!(c.username, "u:x");
         assert_eq!(c.password, "p@ss");
         assert_eq!(c.sni, "cdn.example");
@@ -181,8 +166,7 @@ mod tests {
 
     #[test]
     fn from_json_defaults() {
-        let v: Value =
-            serde_json::json!({"server": "s.example", "port": 443, "username": "u", "password": "p"});
+        let v: Value = serde_json::json!({"server": "s.example", "port": 443, "username": "u", "password": "p"});
         let c = NaiveConfig::from_json(&v).unwrap();
         assert_eq!(c.sni, "s.example");
         assert_eq!(c.fingerprint, Fingerprint::HelloChrome133);

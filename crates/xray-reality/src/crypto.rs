@@ -21,14 +21,18 @@
 //! `HandshakeState.Hello.Raw`——标准 rustls 不暴露这些。但算法本身
 //! 是纯密码学运算，可独立提取并测试。
 
-use crate::config::{SHORT_ID_LEN, X25519_KEY_LEN};
-use crate::error::RealityError;
-
-use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Nonce};
+use aes_gcm::{
+    Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit, Payload},
+};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::{Sha256, Sha512};
+
+use crate::{
+    config::{SHORT_ID_LEN, X25519_KEY_LEN},
+    error::RealityError,
+};
 
 /// SessionId 总长度（TLS 1.3 ClientHello 固定 32 字节）。
 pub const SESSION_ID_LEN: usize = 32;
@@ -59,7 +63,8 @@ type HmacSha512 = Hmac<Sha512>;
 /// copy(hello.SessionId[8:], config.ShortId)
 /// ```
 ///
-/// 布局：`[version_x, version_y, version_z, reserved=0, timestamp_be(4), short_id(≤8), zeros(余下)]`
+/// 布局：`[version_x, version_y, version_z, reserved=0, timestamp_be(4), short_id(≤8),
+/// zeros(余下)]`
 ///
 /// `short_id` 超过 8 字节返回 [`RealityError::InvalidShortIdLen`]。
 pub fn encode_session_id(
@@ -68,9 +73,7 @@ pub fn encode_session_id(
     short_id: &[u8],
 ) -> Result<[u8; SESSION_ID_LEN], RealityError> {
     if short_id.len() > SHORT_ID_LEN {
-        return Err(RealityError::InvalidShortIdLen {
-            actual: short_id.len(),
-        });
+        return Err(RealityError::InvalidShortIdLen { actual: short_id.len() });
     }
     let mut session_id = [0u8; SESSION_ID_LEN];
     session_id[0] = version[0];
@@ -103,14 +106,10 @@ pub fn derive_auth_key(
     hello_random_first_20: &[u8],
 ) -> Result<[u8; AUTH_KEY_LEN], RealityError> {
     if ecdhe_private_key.len() != X25519_KEY_LEN {
-        return Err(RealityError::InvalidPrivateKeyLen {
-            actual: ecdhe_private_key.len(),
-        });
+        return Err(RealityError::InvalidPrivateKeyLen { actual: ecdhe_private_key.len() });
     }
     if server_public_key.len() != X25519_KEY_LEN {
-        return Err(RealityError::InvalidPublicKeyLen {
-            actual: server_public_key.len(),
-        });
+        return Err(RealityError::InvalidPublicKeyLen { actual: server_public_key.len() });
     }
     if hello_random_first_20.len() != HKDF_SALT_LEN {
         return Err(RealityError::AuthKeyDeriveFailed);
@@ -127,8 +126,7 @@ pub fn derive_auth_key(
     // HKDF-SHA256: new(salt=hello_random[:20], ikm=shared).expand("REALITY", 32)
     let hk = Hkdf::<Sha256>::new(Some(hello_random_first_20), shared.as_bytes());
     let mut auth_key = [0u8; AUTH_KEY_LEN];
-    hk.expand(HKDF_INFO, &mut auth_key)
-        .map_err(|_| RealityError::AuthKeyDeriveFailed)?;
+    hk.expand(HKDF_INFO, &mut auth_key).map_err(|_| RealityError::AuthKeyDeriveFailed)?;
     Ok(auth_key)
 }
 
@@ -164,21 +162,15 @@ pub fn encrypt_session_id(
         return Err(RealityError::SessionIdEncryptFailed);
     }
 
-    let cipher = Aes256Gcm::new_from_slice(auth_key)
-        .map_err(|_| RealityError::SessionIdEncryptFailed)?;
+    let cipher =
+        Aes256Gcm::new_from_slice(auth_key).map_err(|_| RealityError::SessionIdEncryptFailed)?;
     let mut nonce_arr = [0u8; AEAD_NONCE_LEN];
     nonce_arr.copy_from_slice(nonce_12);
     let nonce = Nonce::from(nonce_arr);
 
     // plaintext = session_id[:16], aad = hello_raw
     let sealed = cipher
-        .encrypt(
-            &nonce,
-            Payload {
-                msg: &session_id[..16],
-                aad: hello_raw,
-            },
-        )
+        .encrypt(&nonce, Payload { msg: &session_id[..16], aad: hello_raw })
         .map_err(|_| RealityError::SessionIdEncryptFailed)?;
 
     // sealed = ciphertext(16) + tag(16) = 32 bytes，覆盖整个 session_id
@@ -214,18 +206,12 @@ pub fn decrypt_session_id(
     {
         return Err(RealityError::SessionIdDecryptFailed);
     }
-    let cipher = Aes256Gcm::new_from_slice(auth_key)
-        .map_err(|_| RealityError::SessionIdDecryptFailed)?;
+    let cipher =
+        Aes256Gcm::new_from_slice(auth_key).map_err(|_| RealityError::SessionIdDecryptFailed)?;
     let mut nonce_arr = [0u8; AEAD_NONCE_LEN];
     nonce_arr.copy_from_slice(nonce_12);
     let plaintext = cipher
-        .decrypt(
-            &Nonce::from(nonce_arr),
-            Payload {
-                msg: sealed_session_id,
-                aad: hello_raw,
-            },
-        )
+        .decrypt(&Nonce::from(nonce_arr), Payload { msg: sealed_session_id, aad: hello_raw })
         .map_err(|_| RealityError::SessionIdDecryptFailed)?;
     if plaintext.len() != 16 {
         return Err(RealityError::SessionIdDecryptFailed);
@@ -264,12 +250,8 @@ pub fn verify_session_payload(
 ) -> Result<SessionPayload, RealityError> {
     let mut version = [0u8; 3];
     version.copy_from_slice(&plaintext_16[0..3]);
-    let timestamp = u32::from_be_bytes([
-        plaintext_16[4],
-        plaintext_16[5],
-        plaintext_16[6],
-        plaintext_16[7],
-    ]);
+    let timestamp =
+        u32::from_be_bytes([plaintext_16[4], plaintext_16[5], plaintext_16[6], plaintext_16[7]]);
     let mut short_id = [0u8; 8];
     short_id.copy_from_slice(&plaintext_16[8..16]);
 
@@ -278,11 +260,7 @@ pub fn verify_session_payload(
     // `max_diff == 0` → 禁用校验（Go `MaxTimeDiff == 0 || ...` 短路语义）。
     // 注意：之前 `diff > 0` 会拒任何非零偏差，与 Go 缺省禁用语义颠倒。
     if max_diff != 0 {
-        let diff = if now_unix >= timestamp {
-            now_unix - timestamp
-        } else {
-            timestamp - now_unix
-        };
+        let diff = if now_unix >= timestamp { now_unix - timestamp } else { timestamp - now_unix };
         if diff > max_diff {
             return Err(RealityError::TimestampOutOfWindow {
                 actual: timestamp,
@@ -297,11 +275,7 @@ pub fn verify_session_payload(
         return Err(RealityError::ShortIdNotAllowed);
     }
 
-    Ok(SessionPayload {
-        version,
-        timestamp,
-        short_id,
-    })
+    Ok(SessionPayload { version, timestamp, short_id })
 }
 
 /// HMAC-SHA512 证书验证（REALITY 服务端自签证书的快速验证路径）。
@@ -336,8 +310,7 @@ pub fn verify_reality_certificate(
     cert_pub_key_ed25519: &[u8],
     cert_signature: &[u8],
 ) -> Result<bool, RealityError> {
-    let mut mac = HmacSha512::new_from_slice(auth_key)
-        .map_err(|_| RealityError::EmptySharedKey)?;
+    let mut mac = HmacSha512::new_from_slice(auth_key).map_err(|_| RealityError::EmptySharedKey)?;
     mac.update(cert_pub_key_ed25519);
     // verify_slice 内部用恒定时间比较，长度/内容不匹配都返 Err
     Ok(mac.verify_slice(cert_signature).is_ok())
@@ -367,8 +340,7 @@ pub fn sign_reality_certificate(
     auth_key: &[u8],
     cert_pub_key_ed25519: &[u8],
 ) -> Result<[u8; 64], RealityError> {
-    let mut mac = HmacSha512::new_from_slice(auth_key)
-        .map_err(|_| RealityError::EmptySharedKey)?;
+    let mut mac = HmacSha512::new_from_slice(auth_key).map_err(|_| RealityError::EmptySharedKey)?;
     mac.update(cert_pub_key_ed25519);
     let result = mac.finalize().into_bytes();
     let mut sig = [0u8; 64];
@@ -398,8 +370,7 @@ pub fn hmac_reality_message(
     client_hello_raw: &[u8],
     server_hello_raw: &[u8],
 ) -> Result<[u8; 64], RealityError> {
-    let mut mac = HmacSha512::new_from_slice(auth_key)
-        .map_err(|_| RealityError::EmptySharedKey)?;
+    let mut mac = HmacSha512::new_from_slice(auth_key).map_err(|_| RealityError::EmptySharedKey)?;
     mac.update(cert_pub_key_ed25519);
     mac.update(client_hello_raw);
     mac.update(server_hello_raw);
@@ -419,9 +390,7 @@ pub fn hmac_reality_message(
 /// - [`RealityError::InvalidMldsa65SeedLen`]：seed 长度 ≠ 32
 pub fn sign_mldsa65_signature(seed: &[u8], message: &[u8]) -> Result<Vec<u8>, RealityError> {
     if seed.len() != MLDSA65_SEED_LEN {
-        return Err(RealityError::InvalidMldsa65SeedLen {
-            actual: seed.len(),
-        });
+        return Err(RealityError::InvalidMldsa65SeedLen { actual: seed.len() });
     }
     use ml_dsa::{EncodedSignature, MlDsa65, Seed, Signer, SigningKey};
     let sk = SigningKey::<MlDsa65>::from_seed(&Seed::from(<[u8; 32]>::try_from(seed).unwrap()));
@@ -454,9 +423,7 @@ pub const MLDSA65_SEED_LEN: usize = 32;
 /// - [`RealityError::InvalidMldsa65SeedLen`]：seed 长度 ≠ 32
 pub fn derive_mldsa65_pubkey(seed: &[u8]) -> Result<Vec<u8>, RealityError> {
     if seed.len() != MLDSA65_SEED_LEN {
-        return Err(RealityError::InvalidMldsa65SeedLen {
-            actual: seed.len(),
-        });
+        return Err(RealityError::InvalidMldsa65SeedLen { actual: seed.len() });
     }
     use ml_dsa::{KeyExport, MlDsa65, Seed, SigningKey};
     let sk = SigningKey::<MlDsa65>::from_seed(&Seed::from(<[u8; 32]>::try_from(seed).unwrap()));
@@ -499,7 +466,9 @@ pub fn verify_mldsa65_signature(
     if signature_3309.len() != MLDSA65_SIG_LEN {
         return Ok(false);
     }
-    use ml_dsa::{EncodedSignature, EncodedVerifyingKey, MlDsa65, Signature, Verifier, VerifyingKey};
+    use ml_dsa::{
+        EncodedSignature, EncodedVerifyingKey, MlDsa65, Signature, Verifier, VerifyingKey,
+    };
 
     // 公钥解码（1952B → VerifyingKey<MlDsa65>）
     let vk_bytes = match EncodedVerifyingKey::<MlDsa65>::try_from(pubkey_1952) {
@@ -528,11 +497,11 @@ fn try_array32(b: &[u8]) -> [u8; 32] {
     arr
 }
 
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use x25519_dalek::{PublicKey, StaticSecret};
+
+    use super::*;
 
     /// 从固定种子确定性生成 X25519 密钥对（测试用，无需 RNG）。
     fn make_keypair(seed: [u8; 32]) -> ([u8; 32], [u8; 32]) {
@@ -568,10 +537,7 @@ mod tests {
     fn encode_session_id_short_id_too_long_errors() {
         let short_id = [0u8; 9];
         let err = encode_session_id([0; 3], 0, &short_id).unwrap_err();
-        assert!(matches!(
-            err,
-            RealityError::InvalidShortIdLen { actual: 9 }
-        ));
+        assert!(matches!(err, RealityError::InvalidShortIdLen { actual: 9 }));
     }
 
     #[test]
@@ -617,10 +583,7 @@ mod tests {
         let server_pub = [0u8; 32];
         let hello_random = [0u8; 20];
         let err = derive_auth_key(&[0u8; 16], &server_pub, &hello_random).unwrap_err();
-        assert!(matches!(
-            err,
-            RealityError::InvalidPrivateKeyLen { actual: 16 }
-        ));
+        assert!(matches!(err, RealityError::InvalidPrivateKeyLen { actual: 16 }));
     }
 
     #[test]
@@ -628,10 +591,7 @@ mod tests {
         let client_priv = [0u8; 32];
         let hello_random = [0u8; 20];
         let err = derive_auth_key(&client_priv, &[0u8; 16], &hello_random).unwrap_err();
-        assert!(matches!(
-            err,
-            RealityError::InvalidPublicKeyLen { actual: 16 }
-        ));
+        assert!(matches!(err, RealityError::InvalidPublicKeyLen { actual: 16 }));
     }
 
     #[test]
@@ -724,8 +684,7 @@ mod tests {
         mac.update(&cert_pub_key);
         let signature = mac.finalize().into_bytes();
 
-        let verified =
-            verify_reality_certificate(&auth_key, &cert_pub_key, &signature).unwrap();
+        let verified = verify_reality_certificate(&auth_key, &cert_pub_key, &signature).unwrap();
         assert!(verified);
     }
 
@@ -735,8 +694,7 @@ mod tests {
         let cert_pub_key = [0xabu8; 32];
         let wrong_sig = [0u8; 64]; // 全 0 签名
 
-        let verified =
-            verify_reality_certificate(&auth_key, &cert_pub_key, &wrong_sig).unwrap();
+        let verified = verify_reality_certificate(&auth_key, &cert_pub_key, &wrong_sig).unwrap();
         assert!(!verified);
     }
 
@@ -751,8 +709,7 @@ mod tests {
         mac.update(&cert_pub_key);
         let signature = mac.finalize().into_bytes();
 
-        let verified =
-            verify_reality_certificate(&auth_key_b, &cert_pub_key, &signature).unwrap();
+        let verified = verify_reality_certificate(&auth_key_b, &cert_pub_key, &signature).unwrap();
         assert!(!verified);
     }
 
@@ -763,8 +720,7 @@ mod tests {
         let cert_pub_key = [0xabu8; 32];
         let short_sig = [0u8; 16];
 
-        let verified =
-            verify_reality_certificate(&auth_key, &cert_pub_key, &short_sig).unwrap();
+        let verified = verify_reality_certificate(&auth_key, &cert_pub_key, &short_sig).unwrap();
         assert!(!verified);
     }
 
@@ -784,10 +740,8 @@ mod tests {
         let mut session_id = encode_session_id([1, 8, 16], 1_700_000_000, &short_id).unwrap();
 
         // 两端独立派生 auth_key（ECDH 对称性 → 结果相同）
-        let client_auth_key =
-            derive_auth_key(&client_priv, &server_pub, &hello_random_20).unwrap();
-        let server_auth_key =
-            derive_auth_key(&server_priv, &client_pub, &hello_random_20).unwrap();
+        let client_auth_key = derive_auth_key(&client_priv, &server_pub, &hello_random_20).unwrap();
+        let server_auth_key = derive_auth_key(&server_priv, &client_pub, &hello_random_20).unwrap();
         assert_eq!(client_auth_key, server_auth_key);
 
         // 客户端：encrypt session_id
@@ -796,19 +750,11 @@ mod tests {
         // 服务端：解密 session_id 验证（解密是 encrypt 的逆操作）
         let cipher = Aes256Gcm::new_from_slice(&server_auth_key).unwrap();
         let nonce = Nonce::from(nonce_12);
-        let decrypted = cipher
-            .decrypt(
-                &nonce,
-                Payload {
-                    msg: &session_id,
-                    aad: hello_raw,
-                },
-            )
-            .unwrap();
+        let decrypted =
+            cipher.decrypt(&nonce, Payload { msg: &session_id, aad: hello_raw }).unwrap();
         assert_eq!(decrypted.len(), 16);
         // decrypted 应对应 encode_session_id 的前 16 字节
-        let expected_sid =
-            encode_session_id([1, 8, 16], 1_700_000_000, &short_id).unwrap();
+        let expected_sid = encode_session_id([1, 8, 16], 1_700_000_000, &short_id).unwrap();
         assert_eq!(&decrypted[..], &expected_sid[..16]);
 
         // 服务端：构造 REALITY 证书并验证
@@ -817,12 +763,8 @@ mod tests {
         mac.update(&cert_pub_key);
         let cert_sig = mac.finalize().into_bytes();
 
-        let verified = verify_reality_certificate(
-            &client_auth_key,
-            &cert_pub_key,
-            &cert_sig,
-        )
-        .unwrap();
+        let verified =
+            verify_reality_certificate(&client_auth_key, &cert_pub_key, &cert_sig).unwrap();
         assert!(verified, "客户端应能验证服务端的 REALITY 证书");
     }
 
@@ -946,8 +888,7 @@ mod tests {
             decrypt_session_id(&server_auth_key, &hello_random[20..32], &session_id, hello_raw)
                 .unwrap();
         let short_ids = vec![[0xaa; 8]];
-        let payload =
-            verify_session_payload(&plaintext, timestamp, 120, &short_ids).unwrap();
+        let payload = verify_session_payload(&plaintext, timestamp, 120, &short_ids).unwrap();
         assert_eq!(payload.short_id, short_id);
     }
 
@@ -1004,8 +945,12 @@ mod tests {
         let sig_bytes = sig.encode();
 
         // 用不同 message 验签 → false（FIPS 204 强不可伪造）
-        let ok = verify_mldsa65_signature(pk_bytes.as_slice(), b"tampered message", sig_bytes.as_slice())
-            .expect("verify should not error");
+        let ok = verify_mldsa65_signature(
+            pk_bytes.as_slice(),
+            b"tampered message",
+            sig_bytes.as_slice(),
+        )
+        .expect("verify should not error");
         assert!(!ok, "wrong message should fail mldsa65 verify");
     }
 

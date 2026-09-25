@@ -2,7 +2,7 @@
 //!
 //! 测量数据拷贝、帧编解码等传输层热路径吞吐量。
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 /// 零拷贝 vs 拷贝对比：测量不同大小数据的内存拷贝开销。
 /// 这是传输层的基础操作，所有协议都涉及数据搬运。
@@ -59,10 +59,5 @@ fn bench_length_header_parse(c: &mut Criterion) {
     });
 }
 
-criterion_group!(
-    benches,
-    bench_memcpy_baseline,
-    bench_vec_extend,
-    bench_length_header_parse,
-);
+criterion_group!(benches, bench_memcpy_baseline, bench_vec_extend, bench_length_header_parse,);
 criterion_main!(benches);

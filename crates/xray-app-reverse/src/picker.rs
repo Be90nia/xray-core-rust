@@ -36,9 +36,7 @@ pub struct StaticMuxPicker<W: PickerWorker> {
 
 impl<W: PickerWorker> StaticMuxPicker<W> {
     pub fn new() -> Self {
-        Self {
-            workers: Mutex::new(Vec::new()),
-        }
+        Self { workers: Mutex::new(Vec::new()) }
     }
 
     /// 添加 worker。
@@ -156,24 +154,22 @@ mod tests {
         fn is_full(&self) -> bool {
             self.full
         }
+
         fn is_closed(&self) -> bool {
             self.closed
         }
+
         fn is_draining(&self) -> bool {
             self.draining
         }
+
         fn active_connections(&self) -> u32 {
             self.conn
         }
     }
 
     fn mk(conn: u32) -> MockWorker {
-        MockWorker {
-            full: false,
-            closed: false,
-            draining: false,
-            conn,
-        }
+        MockWorker { full: false, closed: false, draining: false, conn }
     }
 
     #[test]
@@ -205,12 +201,7 @@ mod tests {
     fn skips_draining_in_pass1() {
         let p: StaticMuxPicker<MockWorker> = StaticMuxPicker::new();
         // worker 0 是 draining 但 conn 最少，pass 1 应跳过
-        p.add_worker(MockWorker {
-            full: false,
-            closed: false,
-            draining: true,
-            conn: 0,
-        });
+        p.add_worker(MockWorker { full: false, closed: false, draining: true, conn: 0 });
         p.add_worker(mk(5));
         let idx = p.pick_available_index().unwrap();
         assert_eq!(idx, 1);
@@ -219,12 +210,7 @@ mod tests {
     #[test]
     fn skips_full_in_pass1() {
         let p: StaticMuxPicker<MockWorker> = StaticMuxPicker::new();
-        p.add_worker(MockWorker {
-            full: true,
-            closed: false,
-            draining: false,
-            conn: 0,
-        });
+        p.add_worker(MockWorker { full: true, closed: false, draining: false, conn: 0 });
         p.add_worker(mk(5));
         let idx = p.pick_available_index().unwrap();
         assert_eq!(idx, 1);
@@ -233,12 +219,7 @@ mod tests {
     #[test]
     fn skips_closed_in_pass1() {
         let p: StaticMuxPicker<MockWorker> = StaticMuxPicker::new();
-        p.add_worker(MockWorker {
-            full: false,
-            closed: true,
-            draining: false,
-            conn: 0,
-        });
+        p.add_worker(MockWorker { full: false, closed: true, draining: false, conn: 0 });
         p.add_worker(mk(5));
         let idx = p.pick_available_index().unwrap();
         assert_eq!(idx, 1);
@@ -248,18 +229,8 @@ mod tests {
     fn pass2_accepts_draining() {
         let p: StaticMuxPicker<MockWorker> = StaticMuxPicker::new();
         // 所有非 closed 都 draining 或 full → pass 2 选 draining 最少 conn
-        p.add_worker(MockWorker {
-            full: true,
-            closed: false,
-            draining: false,
-            conn: 100,
-        });
-        p.add_worker(MockWorker {
-            full: false,
-            closed: false,
-            draining: true,
-            conn: 2,
-        });
+        p.add_worker(MockWorker { full: true, closed: false, draining: false, conn: 100 });
+        p.add_worker(MockWorker { full: false, closed: false, draining: true, conn: 2 });
         let idx = p.pick_available_index().unwrap();
         assert_eq!(idx, 1);
     }
@@ -267,18 +238,8 @@ mod tests {
     #[test]
     fn no_worker_available_when_all_closed_or_full() {
         let p: StaticMuxPicker<MockWorker> = StaticMuxPicker::new();
-        p.add_worker(MockWorker {
-            full: true,
-            closed: false,
-            draining: false,
-            conn: 100,
-        });
-        p.add_worker(MockWorker {
-            full: false,
-            closed: true,
-            draining: false,
-            conn: 0,
-        });
+        p.add_worker(MockWorker { full: true, closed: false, draining: false, conn: 100 });
+        p.add_worker(MockWorker { full: false, closed: true, draining: false, conn: 0 });
         let err = p.pick_available_index().unwrap_err();
         assert!(matches!(err, ReverseError::NoWorkerAvailable));
     }
@@ -287,12 +248,7 @@ mod tests {
     fn cleanup_removes_closed_workers() {
         let p: StaticMuxPicker<MockWorker> = StaticMuxPicker::new();
         p.add_worker(mk(1));
-        p.add_worker(MockWorker {
-            full: false,
-            closed: true,
-            draining: false,
-            conn: 0,
-        });
+        p.add_worker(MockWorker { full: false, closed: true, draining: false, conn: 0 });
         p.add_worker(mk(2));
         assert_eq!(p.len(), 3);
         p.cleanup();
@@ -302,18 +258,8 @@ mod tests {
     #[test]
     fn snapshot_returns_metadata() {
         let p: StaticMuxPicker<MockWorker> = StaticMuxPicker::new();
-        p.add_worker(MockWorker {
-            full: true,
-            closed: false,
-            draining: false,
-            conn: 100,
-        });
-        p.add_worker(MockWorker {
-            full: false,
-            closed: false,
-            draining: true,
-            conn: 3,
-        });
+        p.add_worker(MockWorker { full: true, closed: false, draining: false, conn: 100 });
+        p.add_worker(MockWorker { full: false, closed: false, draining: true, conn: 3 });
         let snap = p.snapshot();
         assert_eq!(snap.len(), 2);
         assert!(snap[0].is_full);

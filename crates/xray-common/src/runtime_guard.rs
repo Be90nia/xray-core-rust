@@ -12,8 +12,8 @@
 //! - `worker_park_count(worker)` — worker 线程 park 次数。`cfg_64bit_metrics!` 下
 //!   **默认可用**（target_has_atomic = "64"），64-bit 平台无条件开放。
 //! - `worker_noop_count(worker)` / `worker_steal_count(worker)` — `cfg_unstable_metrics!`，
-//!   需要构建期 `--cfg tokio_unstable`。本模块通过同名可选字段 + `#[cfg(...)]` 暴露，
-//!   不强制该 flag 存在。
+//!   需要构建期 `--cfg tokio_unstable`。本模块通过同名可选字段 + `#[cfg(...)]` 暴露， 不强制该 flag
+//!   存在。
 //!
 //! ## 验收
 //!
@@ -27,6 +27,7 @@
 #![allow(unexpected_cfgs)]
 
 use std::time::Duration;
+
 use tokio::runtime::Handle;
 
 /// tokio `RuntimeMetrics` 字段快照。
@@ -82,28 +83,16 @@ impl RuntimeMetricsSnapshot {
         let mut s = String::with_capacity(256);
         s.push_str(&format!("runtime_guard_worker_count {}\n", self.worker_count));
         s.push_str(&format!("runtime_guard_alive_tasks {}\n", self.alive_tasks));
-        s.push_str(&format!(
-            "runtime_guard_global_queue_depth {}\n",
-            self.global_queue_depth
-        ));
-        s.push_str(&format!(
-            "runtime_guard_worker_park_count {}\n",
-            self.worker_park_count
-        ));
+        s.push_str(&format!("runtime_guard_global_queue_depth {}\n", self.global_queue_depth));
+        s.push_str(&format!("runtime_guard_worker_park_count {}\n", self.worker_park_count));
         s.push_str(&format!(
             "runtime_guard_worker_busy_duration_seconds {:.6}\n",
             self.worker_busy_duration.as_secs_f64()
         ));
         #[cfg(tokio_unstable)]
         {
-            s.push_str(&format!(
-                "runtime_guard_worker_noop_count {}\n",
-                self.worker_noop_count
-            ));
-            s.push_str(&format!(
-                "runtime_guard_worker_steal_count {}\n",
-                self.worker_steal_count
-            ));
+            s.push_str(&format!("runtime_guard_worker_noop_count {}\n", self.worker_noop_count));
+            s.push_str(&format!("runtime_guard_worker_steal_count {}\n", self.worker_steal_count));
         }
         s
     }
@@ -151,23 +140,27 @@ pub fn log_runtime_snapshot(prefix: &str) {
                 "runtime metrics snapshot: {}",
                 snap.to_prometheus().trim_end()
             );
-        }
+        },
         Err(e) => {
             tracing::warn!(
                 target: "xray_runtime_guard",
                 "log_runtime_snapshot: no current tokio handle ({e})"
             );
-        }
+        },
     }
 }
 
 // ponytail: 若未来加采样任务，这里只断言结构 + 计数增量；不要耦合具体数值。
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
     use tokio::time::{Duration as TokioDuration, sleep};
+
+    use super::*;
 
     /// current_thread runtime 上 sleep 让 worker park 一次；抓两次快照验证
     /// `worker_park_count` 单调递增。

@@ -6,11 +6,13 @@
 //! Rust 版本 ponytail 化：直接用 `AtomicU64` 内联计数，待 `xray-features-stats`
 //! crate 就绪后再考虑是否抽象为 trait。
 
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context, Poll};
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::atomic::{AtomicU64, Ordering},
+    task::{Context, Poll},
+};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -29,11 +31,7 @@ pub struct CounterConnection<C> {
 impl<C: Connection> CounterConnection<C> {
     /// 包装一个连接，计数初始化为 0。
     pub fn new(inner: C) -> Self {
-        Self {
-            inner,
-            read_bytes: AtomicU64::new(0),
-            written_bytes: AtomicU64::new(0),
-        }
+        Self { inner, read_bytes: AtomicU64::new(0), written_bytes: AtomicU64::new(0) }
     }
 
     /// 取回内部连接。
@@ -69,7 +67,7 @@ impl<C: Connection> AsyncRead for CounterConnection<C> {
                     this.read_bytes.fetch_add(delta as u64, Ordering::Relaxed);
                 }
                 Poll::Ready(Ok(()))
-            }
+            },
             other => other,
         }
     }
@@ -88,7 +86,7 @@ impl<C: Connection> AsyncWrite for CounterConnection<C> {
                     this.written_bytes.fetch_add(n as u64, Ordering::Relaxed);
                 }
                 Poll::Ready(Ok(n))
-            }
+            },
             other => other,
         }
     }
@@ -116,10 +114,13 @@ impl<C: Connection> Connection for CounterConnection<C> {
 
 #[cfg(test)]
 mod tests {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+
     use super::*;
     use crate::connection::TcpConnection;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
 
     #[tokio::test]
     async fn read_write_counters_increment() {

@@ -15,21 +15,23 @@
 //! [`DialFn`]: xray_app_dispatcher::default::DialFn
 //! [`Connection`]: xray_transport::connection::Connection
 
-use std::io;
-use std::net::{SocketAddr, SocketAddrV6};
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    io,
+    net::{SocketAddr, SocketAddrV6},
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-
 use xray_app_dispatcher::default::DialFn;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
+use xray_common::net::{address::Address, destination::Destination};
 use xray_transport::connection::Connection;
 
-use crate::client::{AnytlsClient, AnytlsConn};
-use crate::socks::SocksAddr;
+use crate::{
+    client::{AnytlsClient, AnytlsConn},
+    socks::SocksAddr,
+};
 
 /// AnytlsConn + Connection trait 实现。
 ///
@@ -79,6 +81,7 @@ impl Connection for AnytlsConnection {
     fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(None)
     }
+
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(None)
     }
@@ -114,13 +117,10 @@ pub fn make_dial_fn(client: Arc<AnytlsClient>) -> DialFn {
             Ok(s) => s,
             Err(e) => {
                 return Box::pin(async move { Err(e) });
-            }
+            },
         };
         Box::pin(async move {
-            let conn = client
-                .dial(&socks)
-                .await
-                .map_err(|e| format!("anytls dial: {e}"))?;
+            let conn = client.dial(&socks).await.map_err(|e| format!("anytls dial: {e}"))?;
             Ok(Box::new(AnytlsConnection::new(conn)) as Box<dyn Connection>)
         })
     })
@@ -128,10 +128,11 @@ pub fn make_dial_fn(client: Arc<AnytlsClient>) -> DialFn {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::Ipv6Addr;
-    use xray_common::net::network::Network;
-    use xray_common::net::port::Port;
+
+    use xray_common::net::{network::Network, port::Port};
+
+    use super::*;
 
     #[test]
     fn dest_to_socks_ipv4() {
@@ -145,7 +146,7 @@ mod tests {
             SocksAddr::Ipv4(a) => {
                 assert_eq!(a.ip().octets(), [127, 0, 0, 1]);
                 assert_eq!(a.port(), 8080);
-            }
+            },
             _ => panic!("expected Ipv4"),
         }
     }
@@ -162,24 +163,20 @@ mod tests {
             SocksAddr::Ipv6(a) => {
                 assert_eq!(a.ip(), &Ipv6Addr::LOCALHOST);
                 assert_eq!(a.port(), 443);
-            }
+            },
             _ => panic!("expected Ipv6"),
         }
     }
 
     #[test]
     fn dest_to_socks_domain() {
-        let d = Destination::new(
-            Address::new_domain("example.com"),
-            Port::new(443),
-            Network::TCP,
-        );
+        let d = Destination::new(Address::new_domain("example.com"), Port::new(443), Network::TCP);
         let s = dest_to_socks(&d).unwrap();
         match s {
             SocksAddr::Domain(h, p) => {
                 assert_eq!(h, "example.com");
                 assert_eq!(p, 443);
-            }
+            },
             _ => panic!("expected Domain"),
         }
     }

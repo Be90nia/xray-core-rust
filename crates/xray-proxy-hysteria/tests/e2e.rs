@@ -5,30 +5,26 @@
 
 #![cfg(test)]
 
-use std::io::Cursor;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{io::Cursor, net::SocketAddr, sync::Arc, time::Duration};
 
-use xray_common::net::address::Address;
-use xray_common::net::port::Port;
 use tokio::sync::mpsc;
-use xray_transport_hysteria::conn::InterStreamConn;
-use xray_transport_hysteria::dialer::{DialDestination, HysteriaClient, QuicConfig};
-use xray_transport_hysteria::hysteria_transport::QuinnHysteriaTransport;
-use xray_transport_hysteria::proto_config::Config as ProtoConfig;
-use xray_transport_hysteria::quinn_adapter::QuinnListenerFactory;
-use xray_transport_hysteria::hub::{AuthValidator, MasqType};
-use xray_transport_hysteria::HysteriaListenerFactory;
+use xray_common::net::{address::Address, port::Port};
+use xray_transport_hysteria::{
+    HysteriaListenerFactory,
+    conn::InterStreamConn,
+    dialer::{DialDestination, HysteriaClient, QuicConfig},
+    hub::{AuthValidator, MasqType},
+    hysteria_transport::QuinnHysteriaTransport,
+    proto_config::Config as ProtoConfig,
+    quinn_adapter::QuinnListenerFactory,
+};
 
 fn ensure_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-fn self_signed() -> (
-    Vec<rustls_pki_types::CertificateDer<'static>>,
-    rustls_pki_types::PrivateKeyDer<'static>,
-) {
+fn self_signed()
+-> (Vec<rustls_pki_types::CertificateDer<'static>>, rustls_pki_types::PrivateKeyDer<'static>) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert_der = cert.cert.der().clone();
     let key_der = cert.key_pair.serialize_der();
@@ -124,8 +120,8 @@ async fn hysteria_quic_loopback_dial_auth_bidi_roundtrip() {
                             let _ = server_stream.write(&resp).await;
                             let _ = stream_tx.send(addr);
                             return;
-                        }
-                        Err(xray_proxy_hysteria::HysteriaProxyError::ProtocolParse(_)) => {}
+                        },
+                        Err(xray_proxy_hysteria::HysteriaProxyError::ProtocolParse(_)) => {},
                         Err(error) => panic!("invalid hysteria TCP request: {error}"),
                     }
                 }
@@ -150,13 +146,9 @@ async fn hysteria_quic_loopback_dial_auth_bidi_roundtrip() {
         .with_custom_certificate_verifier(Arc::new(NoVerifier))
         .with_no_client_auth();
     let transport = Arc::new(
-        QuinnHysteriaTransport::new(client_tls, "0.0.0.0:0".parse().unwrap())
-            .expect("transport"),
+        QuinnHysteriaTransport::new(client_tls, "0.0.0.0:0".parse().unwrap()).expect("transport"),
     );
-    let dest = DialDestination {
-        udp_addr: server_addr,
-        host: "localhost".into(),
-    };
+    let dest = DialDestination { udp_addr: server_addr, host: "localhost".into() };
 
     // 真实客户端路径：HysteriaClient::tcp 写地址帧，InterStreamConn 自动加 0x401。
     let _client_isc = HysteriaClient::new(
@@ -230,13 +222,9 @@ async fn hysteria_quic_loopback_udp_relay_roundtrip() {
         .with_custom_certificate_verifier(Arc::new(NoVerifier))
         .with_no_client_auth();
     let transport = Arc::new(
-        QuinnHysteriaTransport::new(client_tls, "0.0.0.0:0".parse().unwrap())
-            .expect("transport"),
+        QuinnHysteriaTransport::new(client_tls, "0.0.0.0:0".parse().unwrap()).expect("transport"),
     );
-    let dest = DialDestination {
-        udp_addr: server_addr,
-        host: "localhost".into(),
-    };
+    let dest = DialDestination { udp_addr: server_addr, host: "localhost".into() };
     let client_cfg = {
         // 协议默认（Go RegisterProtocolConfigCreator：udp_idle_timeout=60）起步，
         // prost Config::default() 的 0 在 Go 语义下 = 立即空闲超时

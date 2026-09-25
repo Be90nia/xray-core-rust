@@ -14,8 +14,7 @@ use xray_common::net::address::Address;
 use xray_features::dns::DnsError as FeaturesDnsError;
 use xray_geodata::matcher::domain::{DomainMatcher, DomainRule, MphDomainMatcher};
 
-use crate::config::IpOption;
-use crate::error::DnsError;
+use crate::{config::IpOption, error::DnsError};
 
 /// 一条 hosts 映射记录。对应 Go `Config_HostMapping` proto message。
 ///
@@ -59,10 +58,7 @@ impl StaticHosts {
     /// `mappings` 为空返回空实例（matcher 为 `None`，`Lookup` 始终返回空）。
     pub fn new(mappings: Vec<HostMapping>) -> Result<Self, DnsError> {
         if mappings.is_empty() {
-            return Ok(Self {
-                responses: Vec::new(),
-                matcher: None,
-            });
+            return Ok(Self { responses: Vec::new(), matcher: None });
         }
 
         // 构造响应数组。
@@ -71,14 +67,12 @@ impl StaticHosts {
             let mut reps = Vec::new();
             if !m.proxied_domain.is_empty() {
                 if let Some(rcode_str) = m.proxied_domain.strip_prefix('#') {
-                    let rcode: u16 = rcode_str
-                        .parse()
-                        .map_err(|_| {
-                            DnsError::Features(FeaturesDnsError::Other(format!(
-                                "invalid rcode in proxied_domain: {}",
-                                m.proxied_domain
-                            )))
-                        })?;
+                    let rcode: u16 = rcode_str.parse().map_err(|_| {
+                        DnsError::Features(FeaturesDnsError::Other(format!(
+                            "invalid rcode in proxied_domain: {}",
+                            m.proxied_domain
+                        )))
+                    })?;
                     reps.push(ResponseEntry::RCode(rcode));
                 } else {
                     reps.push(ResponseEntry::Domain(m.proxied_domain.clone()));
@@ -110,28 +104,20 @@ impl StaticHosts {
                 }
             })
             .collect();
-        let matcher: Box<dyn DomainMatcher> = Box::new(
-            MphDomainMatcher::build(&rules).map_err(|e| {
+        let matcher: Box<dyn DomainMatcher> =
+            Box::new(MphDomainMatcher::build(&rules).map_err(|e| {
                 DnsError::Features(FeaturesDnsError::Other(format!(
                     "mph matcher build failed: {e}"
                 )))
-            })?,
-        );
+            })?);
 
-        Ok(Self {
-            responses,
-            matcher: Some(matcher),
-        })
+        Ok(Self { responses, matcher: Some(matcher) })
     }
 
     /// 查询域名。对应 Go `(*StaticHosts).Lookup`（hosts.go:96-116）。
     /// `Some([Address::Domain(_)])` = 域名替换（递归 unwrap 最大 5 次防 A→B→A 环，
     /// 耗尽后返回尾域名，由上层走 nameservers 查询）。
-    pub fn lookup(
-        &self,
-        domain: &str,
-        option: IpOption,
-    ) -> Result<Option<Vec<Address>>, DnsError> {
+    pub fn lookup(&self, domain: &str, option: IpOption) -> Result<Option<Vec<Address>>, DnsError> {
         let Some(m) = &self.matcher else {
             return Ok(None);
         };
@@ -277,14 +263,12 @@ impl AddressExt for Address {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::Ipv4Addr;
 
+    use super::*;
+
     fn mapping_ip(domain: &str, ips: &[&str]) -> HostMapping {
-        let ips: Vec<IpAddr> = ips
-            .iter()
-            .map(|s| s.parse().unwrap())
-            .collect();
+        let ips: Vec<IpAddr> = ips.iter().map(|s| s.parse().unwrap()).collect();
         HostMapping {
             domain: domain.to_string(),
             ips,
@@ -334,11 +318,7 @@ mod tests {
     #[test]
     fn lookup_filters_by_ip_option() {
         let h = StaticHosts::new(vec![mapping_ip("example.com", &["1.2.3.4", "::1"])]).unwrap();
-        let v4_only = IpOption {
-            ipv4_enable: true,
-            ipv6_enable: false,
-            fake_enable: true,
-        };
+        let v4_only = IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: true };
         let out = h.lookup("example.com", v4_only).unwrap().unwrap();
         assert_eq!(out.len(), 1);
         assert!(out[0].is_ipv4());
@@ -369,15 +349,14 @@ mod tests {
         }])
         .unwrap();
         match h.lookup("blocked.com", IpOption::all()) {
-            Err(DnsError::RCodeError(3)) => {}
+            Err(DnsError::RCodeError(3)) => {},
             other => panic!("expected RCodeError(3), got {other:?}"),
         }
     }
 
     #[test]
     fn lookup_keeps_redirect_domain_when_unwrap_fails() {
-        let h =
-            StaticHosts::new(vec![mapping_redirect("alias.com", "unknown.com")]).unwrap();
+        let h = StaticHosts::new(vec![mapping_redirect("alias.com", "unknown.com")]).unwrap();
         let out = h.lookup("alias.com", IpOption::all()).unwrap().unwrap();
         assert_eq!(out.len(), 1);
         match &out[0] {
@@ -448,13 +427,10 @@ mod tests {
         let h = StaticHosts::new(vec![mapping_ip("example.com", &["1.2.3.4"])]).unwrap();
         // 仅 IPv6 启用但条目只有 IPv4 → 过滤后空。返回 `Ok(Some(vec![]))`
         // 是 server 层短路 `EmptyResponse` 的信号（kzmx）。
-        let v6_only = IpOption {
-            ipv4_enable: false,
-            ipv6_enable: true,
-            fake_enable: true,
-        };
+        let v6_only = IpOption { ipv4_enable: false, ipv6_enable: true, fake_enable: true };
         let out = h.lookup("example.com", v6_only).unwrap();
-        let addrs = out.expect("kzmx: matched entry must yield Some, not None (server短路 EmptyResponse)");
+        let addrs =
+            out.expect("kzmx: matched entry must yield Some, not None (server短路 EmptyResponse)");
         assert!(addrs.is_empty(), "kzmx: ipv6-only filter on ipv4-only entry must yield empty vec");
     }
 }

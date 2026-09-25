@@ -2,7 +2,7 @@
 //!
 //! 从 UDP 包字节流读取多个 segment。
 
-use crate::segment::{read_segment, SegmentKind};
+use crate::segment::{SegmentKind, read_segment};
 
 /// 包读取器接口（对应 Go `PacketReader interface`）。
 pub trait PacketReader: Send + Sync {
@@ -32,7 +32,7 @@ impl PacketReader for KCPPacketReader {
                     }
                     result.push(seg);
                     b = &b[consumed..];
-                }
+                },
                 None => break,
             }
         }

@@ -8,8 +8,8 @@
 //!
 //! - **完整可测**（纯算法/协议核心）：
 //!   - `account`：`MemoryAccount` + proto 转换 + `Equals`
-//!   - `aead`：KDF（嵌套 HMAC-SHA256）+ `CreateAuthID`（AES-128 单块）+
-//!     `Seal/Open VMess AEAD Header` + `AuthIDDecoderHolder`（含反重放）
+//!   - `aead`：KDF（嵌套 HMAC-SHA256）+ `CreateAuthID`（AES-128 单块）+ `Seal/Open VMess AEAD
+//!     Header` + `AuthIDDecoderHolder`（含反重放）
 //!   - `validator`：`TimedUserValidator` 整合 AuthIDDecoderHolder + behaviorSeed
 //!   - `encoding::auth`：`Authenticate`（FNV1a）+ `GenerateChacha20Poly1305Key` +
 //!     `GenerateChunkNonce` + `ShakeSizeParser` + `AEADSizeParser`
@@ -24,21 +24,19 @@
 
 pub mod account;
 pub mod aead;
+pub mod dispatcher;
 pub mod encoding;
 pub mod error;
 pub mod inbound;
 pub mod outbound;
 pub mod validator;
-pub mod dispatcher;
-
 
 pub use account::MemoryAccount;
-pub use dispatcher::{make_vmess_dial_fn, parse_vmess_config, VmessOutboundConfig};
-pub use error::{Result, VmessError};
-pub use validator::{MemoryUser, TimedUserValidator, Validator};
-pub use inbound::serve_vmess;
-pub use inbound::server::handle_connection as handle_vmess_connection;
+pub use dispatcher::{VmessOutboundConfig, make_vmess_dial_fn, parse_vmess_config};
 pub use encoding::server::SessionHistory;
+pub use error::{Result, VmessError};
+pub use inbound::{serve_vmess, server::handle_connection as handle_vmess_connection};
+pub use validator::{MemoryUser, TimedUserValidator, Validator};
 
 /// VMess 协议版本号（对应 Go 的 `encoding.Version` 常量）。
 pub const VERSION: u8 = 1;

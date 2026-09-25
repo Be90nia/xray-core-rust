@@ -5,28 +5,30 @@
 //! 2. H3Conn::connect → dial_h3_packet_up：GET 下载 + POST 上传
 //! 3. server 端验证 POST 收到字节数
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
+};
 
 use bytes::{Buf, Bytes};
 use http::{Method, Response, StatusCode};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
-use tokio::io::AsyncReadExt;
-use tokio::net::UdpSocket;
-
-use xray_transport_splithttp::config::{Config, RangeConfig};
-use xray_transport_splithttp::dialer::{build_request_url, dial_h3_packet_up};
-use xray_transport_splithttp::h3_client::H3Conn;
+use tokio::{io::AsyncReadExt, net::UdpSocket};
+use xray_transport_splithttp::{
+    config::{Config, RangeConfig},
+    dialer::{build_request_url, dial_h3_packet_up},
+    h3_client::H3Conn,
+};
 
 /// 生成自签证书（SAN = 127.0.0.1）+ rustls ServerConfig。
 fn make_self_signed_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
-    let params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
-        .expect("rcgen params");
+    let params =
+        rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("rcgen params");
     let key_pair = rcgen::KeyPair::generate().expect("rcgen keypair");
-    let cert = params
-        .self_signed(&key_pair)
-        .expect("rcgen self_signed");
+    let cert = params.self_signed(&key_pair).expect("rcgen self_signed");
     let cert_der = CertificateDer::from(cert.der().to_vec());
     let key_der = PrivateKeyDer::Pkcs8(key_pair.serialize_der().into());
     (cert_der, key_der)
@@ -36,9 +38,7 @@ fn make_self_signed_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>) 
 fn make_client_tls(cert_der: CertificateDer<'static>) -> rustls::ClientConfig {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert_der).expect("add cert to roots");
-    rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth()
+    rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth()
 }
 
 /// 服务端 quinn ServerConfig（自签证书 + ALPN h3）。
@@ -97,10 +97,7 @@ async fn mock_h3_server(
                 tokio::spawn(async move {
                     if method == Method::GET {
                         // 下载流：发送 payload + finish
-                        let resp = Response::builder()
-                            .status(StatusCode::OK)
-                            .body(())
-                            .unwrap();
+                        let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
                         let _ = stream.send_response(resp).await;
                         let _ = stream.send_data(Bytes::from(dl)).await;
                         let _ = stream.finish().await;
@@ -113,10 +110,7 @@ async fn mock_h3_server(
                             stats.bytes_received.fetch_add(len, Ordering::Relaxed);
                         }
                         stats.post_count.fetch_add(1, Ordering::Relaxed);
-                        let resp = Response::builder()
-                            .status(StatusCode::OK)
-                            .body(())
-                            .unwrap();
+                        let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
                         let _ = stream.send_response(resp).await;
                         let _ = stream.finish().await;
                     }
@@ -130,7 +124,9 @@ async fn mock_h3_server(
 async fn dial_h3_packet_up_end_to_end() {
     // 确保 rustls CryptoProvider 在并行测试中只初始化一次
     static CRYPTO_ONCE: std::sync::Once = std::sync::Once::new();
-    CRYPTO_ONCE.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+    CRYPTO_ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 
     // 1. 自签证书 + quinn server
     let (cert_der, key_der) = make_self_signed_cert();
@@ -142,11 +138,8 @@ async fn dial_h3_packet_up_end_to_end() {
 
     let stats = Arc::new(ServerStats::default());
     let download_payload = b"hello-h3-splithttp".to_vec();
-    let server_task = tokio::spawn(mock_h3_server(
-        endpoint.clone(),
-        stats.clone(),
-        download_payload.clone(),
-    ));
+    let server_task =
+        tokio::spawn(mock_h3_server(endpoint.clone(), stats.clone(), download_payload.clone()));
 
     // 2. H3Conn::connect
     let config = Arc::new(Config {
@@ -182,10 +175,7 @@ async fn dial_h3_packet_up_end_to_end() {
 
     // 4. 验证下载内容
     let mut buf = vec![0u8; download_payload.len()];
-    conn.reader
-        .read_exact(&mut buf)
-        .await
-        .expect("read download");
+    conn.reader.read_exact(&mut buf).await.expect("read download");
     assert_eq!(buf, download_payload);
 
     // 5. 上传数据

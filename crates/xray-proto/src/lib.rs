@@ -181,41 +181,74 @@ pub mod xray {
             }
             pub mod finalmask {
                 pub mod fragment {
-                    include!(concat!(env!("OUT_DIR"), "/xray.transport.internet.finalmask.fragment.rs"));
+                    include!(concat!(
+                        env!("OUT_DIR"),
+                        "/xray.transport.internet.finalmask.fragment.rs"
+                    ));
                 }
                 pub mod header {
                     pub mod custom {
-                        include!(concat!(env!("OUT_DIR"), "/xray.transport.internet.finalmask.header.custom.rs"));
+                        include!(concat!(
+                            env!("OUT_DIR"),
+                            "/xray.transport.internet.finalmask.header.custom.rs"
+                        ));
                     }
                 }
                 pub mod mkcp {
                     pub mod aes128gcm {
-                        include!(concat!(env!("OUT_DIR"), "/xray.transport.internet.finalmask.mkcp.aes128gcm.rs"));
+                        include!(concat!(
+                            env!("OUT_DIR"),
+                            "/xray.transport.internet.finalmask.mkcp.aes128gcm.rs"
+                        ));
                     }
                     pub mod header {
-                        include!(concat!(env!("OUT_DIR"), "/xray.transport.internet.finalmask.mkcp.header.rs"));
+                        include!(concat!(
+                            env!("OUT_DIR"),
+                            "/xray.transport.internet.finalmask.mkcp.header.rs"
+                        ));
                     }
                     pub mod original {
-                        include!(concat!(env!("OUT_DIR"), "/xray.transport.internet.finalmask.mkcp.original.rs"));
+                        include!(concat!(
+                            env!("OUT_DIR"),
+                            "/xray.transport.internet.finalmask.mkcp.original.rs"
+                        ));
                     }
                 }
                 pub mod noise {
-                    include!(concat!(env!("OUT_DIR"), "/xray.transport.internet.finalmask.noise.rs"));
+                    include!(concat!(
+                        env!("OUT_DIR"),
+                        "/xray.transport.internet.finalmask.noise.rs"
+                    ));
                 }
                 pub mod realm {
-                    include!(concat!(env!("OUT_DIR"), "/xray.transport.internet.finalmask.realm.rs"));
+                    include!(concat!(
+                        env!("OUT_DIR"),
+                        "/xray.transport.internet.finalmask.realm.rs"
+                    ));
                 }
                 pub mod salamander {
-                    include!(concat!(env!("OUT_DIR"), "/xray.transport.internet.finalmask.salamander.rs"));
+                    include!(concat!(
+                        env!("OUT_DIR"),
+                        "/xray.transport.internet.finalmask.salamander.rs"
+                    ));
                 }
                 pub mod sudoku {
-                    include!(concat!(env!("OUT_DIR"), "/xray.transport.internet.finalmask.sudoku.rs"));
+                    include!(concat!(
+                        env!("OUT_DIR"),
+                        "/xray.transport.internet.finalmask.sudoku.rs"
+                    ));
                 }
                 pub mod xdns {
-                    include!(concat!(env!("OUT_DIR"), "/xray.transport.internet.finalmask.xdns.rs"));
+                    include!(concat!(
+                        env!("OUT_DIR"),
+                        "/xray.transport.internet.finalmask.xdns.rs"
+                    ));
                 }
                 pub mod xicmp {
-                    include!(concat!(env!("OUT_DIR"), "/xray.transport.internet.finalmask.xicmp.rs"));
+                    include!(concat!(
+                        env!("OUT_DIR"),
+                        "/xray.transport.internet.finalmask.xicmp.rs"
+                    ));
                 }
             }
             pub mod httpupgrade {

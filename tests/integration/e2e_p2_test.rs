@@ -7,13 +7,13 @@
 //!
 //! These tests require the full xray-core runtime (libclang/nasm + btls).
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream, UdpSocket},
+};
 use xray_conf::{BuiltConfig, BuiltEntry, BuiltInbound, BuiltOutbound};
 use xray_core::functions::start_full;
 
@@ -65,11 +65,11 @@ async fn start_echo() -> std::net::SocketAddr {
                                     if sock.write_all(&buf[..n]).await.is_err() {
                                         break;
                                     }
-                                }
+                                },
                             }
                         }
                     });
-                }
+                },
                 Err(_) => break,
             }
         }
@@ -85,10 +85,7 @@ async fn pick_free_port() -> u16 {
 
 fn freedom_outbound(tag: &str) -> BuiltOutbound {
     BuiltOutbound {
-        entry: BuiltEntry {
-            kind: "freedom".into(),
-            data: b"{}".to_vec(),
-        },
+        entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
         tag: tag.into(),
         send_through: None,
         stream_settings_json: None,
@@ -100,10 +97,7 @@ fn freedom_outbound(tag: &str) -> BuiltOutbound {
 
 fn socks_inbound(port: u16, tag: &str) -> BuiltInbound {
     BuiltInbound {
-        entry: BuiltEntry {
-            kind: "socks".into(),
-            data: b"{}".to_vec(),
-        },
+        entry: BuiltEntry { kind: "socks".into(), data: b"{}".to_vec() },
         tag: tag.into(),
         port: Some(port),
         listen: Some("127.0.0.1".into()),
@@ -126,7 +120,10 @@ fn vless_inbound(port: u16, tag: &str, uuid: &str) -> BuiltInbound {
     }
 }
 
-fn vless_outbound(upstream_port: u16, stream_settings_json: Option<serde_json::Value>) -> BuiltOutbound {
+fn vless_outbound(
+    upstream_port: u16,
+    stream_settings_json: Option<serde_json::Value>,
+) -> BuiltOutbound {
     BuiltOutbound {
         entry: BuiltEntry {
             kind: "vless".into(),
@@ -152,9 +149,7 @@ async fn socks5_echo(
     target_port: u16,
     payload: &[u8],
 ) -> Result<(), E2eP2Error> {
-    let mut sock = TcpStream::connect(("127.0.0.1", proxy_port))
-        .await
-        .map_err(E2eP2Error::Io)?;
+    let mut sock = TcpStream::connect(("127.0.0.1", proxy_port)).await.map_err(E2eP2Error::Io)?;
     sock.write_all(&[0x05, 0x01, 0x00]).await?;
     let mut greet = [0u8; 2];
     sock.read_exact(&mut greet).await?;
@@ -173,13 +168,8 @@ async fn socks5_echo(
     sock.write_all(payload).await?;
     let mut got = vec![0u8; payload.len()];
     sock.read_exact(&mut got).await?;
-    if &got == payload {
-        Ok(())
-    } else {
-        Err(format!("echo mismatch: got {got:?}").into())
-    }
+    if &got == payload { Ok(()) } else { Err(format!("echo mismatch: got {got:?}").into()) }
 }
-
 
 // ============================================================
 // WireGuard keys helper
@@ -204,12 +194,11 @@ fn wg_keypair(seed: u8) -> (String, String) {
 // Constraints:
 // - WireGuard inbound requires `default outbound handler` registered (= freedom).
 // - WireGuard outbound requires a peer endpoint (the inbound UDP listener).
-// - WireGuard inner payload uses 10.0.0.0/24 — the inner netstack for outbound is
-//   `10.0.0.2/32`, and the inbound listens with `10.0.0.1/32` (matching allowed_ips
-//   of peer).
-// - We do NOT actually exercise data-plane of the WG tunnel because WG handshake +
-//   userspace netstack data flow is non-trivial (ponytail: scope guarded by doc);
-//   we just verify the full BuiltConfig → start_full → listener binds + lifecycle.
+// - WireGuard inner payload uses 10.0.0.0/24 — the inner netstack for outbound is `10.0.0.2/32`,
+//   and the inbound listens with `10.0.0.1/32` (matching allowed_ips of peer).
+// - We do NOT actually exercise data-plane of the WG tunnel because WG handshake + userspace
+//   netstack data flow is non-trivial (ponytail: scope guarded by doc); we just verify the full
+//   BuiltConfig → start_full → listener binds + lifecycle.
 //
 // Assertion strategy (per acceptance: "双空白" = dual blank coverage):
 //   (a) start_full succeeds (no panic, instance running).
@@ -296,9 +285,8 @@ async fn e2e_p2_wireguard_full_chain() {
     tokio::time::sleep(READY_DELAY).await;
 
     // (a) Dokodemo inbound listening: TCP connect succeeds.
-    let _dokodemo_check = TcpStream::connect(("127.0.0.1", dokodemo_port))
-        .await
-        .expect("dokodemo accepts");
+    let _dokodemo_check =
+        TcpStream::connect(("127.0.0.1", dokodemo_port)).await.expect("dokodemo accepts");
 
     // (b) WireGuard inbound 真实握手：boringtun `Tunnel` 构造客户端视角（sec_a, pub_b），
     // 用 dummy IP 包触发 encapsulate 产生 handshake init → UDP sendto 到 wg_port →
@@ -324,9 +312,7 @@ async fn e2e_p2_wireguard_full_chain() {
         pkt.extend_from_slice(payload);
         pkt
     };
-    let init_outputs = client_tunnel
-        .encapsulate(&ip_pkt)
-        .expect("client encapsulate");
+    let init_outputs = client_tunnel.encapsulate(&ip_pkt).expect("client encapsulate");
     // 提取 handshake init bytes
     let mut init_bytes: Option<Vec<u8>> = None;
     for o in &init_outputs {
@@ -340,9 +326,7 @@ async fn e2e_p2_wireguard_full_chain() {
     // 用绑定到任意端口的 UDP socket 发 init 给服务端
     let udp = UdpSocket::bind("127.0.0.1:0").await.expect("udp bind");
     let our_addr = udp.local_addr().expect("udp local_addr");
-    udp.send_to(&init_bytes, ("127.0.0.1", wg_port))
-        .await
-        .expect("send init");
+    udp.send_to(&init_bytes, ("127.0.0.1", wg_port)).await.expect("send init");
 
     // 接收服务端 handshake response（driver worker_loop decapsulate 后 send_wg 回源地址）
     let mut response = vec![0u8; 256];
@@ -353,9 +337,7 @@ async fn e2e_p2_wireguard_full_chain() {
     response.truncate(n);
 
     // 客户端 decapsulate 服务端 response：握手完成
-    let resp_outputs = client_tunnel
-        .decapsulate(&response)
-        .expect("client decapsulate response");
+    let resp_outputs = client_tunnel.decapsulate(&response).expect("client decapsulate response");
     // response 应包含服务端 Output::Network（keepalive 等）或 Output::Ip——任一即可证
     assert!(
         !resp_outputs.is_empty(),
@@ -393,8 +375,7 @@ async fn e2e_p2_wireguard_full_chain() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_p2_tls_utls_pinned() {
-    use xray_tls::certificate::generate_self_signed_cert;
-    use xray_tls::pin::generate_cert_hash;
+    use xray_tls::{certificate::generate_self_signed_cert, pin::generate_cert_hash};
 
     let echo_addr = start_echo().await;
     let vless_port = pick_free_port().await;
@@ -426,9 +407,11 @@ async fn e2e_p2_tls_utls_pinned() {
     .expect("client tls json");
 
     let mut server_cfg = BuiltConfig::default();
-    server_cfg
-        .inbounds
-        .push(vless_inbound(vless_port, "vless-pinned-in", "b831381d-6324-4d53-ad4f-8cda48b30811"));
+    server_cfg.inbounds.push(vless_inbound(
+        vless_port,
+        "vless-pinned-in",
+        "b831381d-6324-4d53-ad4f-8cda48b30811",
+    ));
     server_cfg.outbounds.push(freedom_outbound("direct"));
     server_cfg.inbounds[0].stream_settings_json = Some(server_tls);
 
@@ -437,9 +420,7 @@ async fn e2e_p2_tls_utls_pinned() {
 
     let mut client_cfg = BuiltConfig::default();
     client_cfg.inbounds.push(socks_inbound(socks_port, "socks-in"));
-    client_cfg
-        .outbounds
-        .push(vless_outbound(vless_port, Some(client_tls)));
+    client_cfg.outbounds.push(vless_outbound(vless_port, Some(client_tls)));
 
     let (_ci, _co, ch) = start_full(&client_cfg).await.expect("vless-tls client");
     tokio::time::sleep(READY_DELAY).await;
@@ -506,9 +487,8 @@ async fn e2e_p2_dokodemo_full_chain() {
     tokio::time::sleep(READY_DELAY).await;
 
     // Client → dokodemo (predefined dest = echo) → freedom → echo.
-    let mut client = TcpStream::connect(("127.0.0.1", dokodemo_port))
-        .await
-        .expect("connect dokodemo");
+    let mut client =
+        TcpStream::connect(("127.0.0.1", dokodemo_port)).await.expect("connect dokodemo");
     client.write_all(PAYLOAD).await.expect("write");
     let mut got = vec![0u8; PAYLOAD.len()];
     client.read_exact(&mut got).await.expect("read echo");
@@ -538,19 +518,18 @@ async fn e2e_p2_dokodemo_full_chain() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_p2_dns_core_resolution() {
-    use xray_app_dns::nameserver::Server as _;
+    use xray_app_dns::{
+        DnsService,
+        cache_controller::CacheController,
+        config::IpOption,
+        nameserver::{Server as _, udp::UdpNameServer},
+    };
     use xray_core::Feature as _;
-    use xray_app_dns::DnsService;
-    use xray_app_dns::cache_controller::CacheController;
-    use xray_app_dns::config::IpOption;
-    use xray_app_dns::nameserver::udp::UdpNameServer;
 
     // (1) Mock UDP DNS server: 10.0.0.42 A record for any query.
     let expected_ip = std::net::Ipv4Addr::new(10, 0, 0, 42);
     let dns_port = pick_free_port().await;
-    let dns_sock = UdpSocket::bind(("127.0.0.1", dns_port))
-        .await
-        .expect("dns sock");
+    let dns_sock = UdpSocket::bind(("127.0.0.1", dns_port)).await.expect("dns sock");
     tokio::spawn(async move {
         let mut buf = [0u8; 512];
         loop {
@@ -587,11 +566,7 @@ async fn e2e_p2_dns_core_resolution() {
         Duration::from_secs(5),
         ns.query_ip(
             "dns-e2e.test",
-            IpOption {
-                ipv4_enable: true,
-                ipv6_enable: false,
-                fake_enable: false,
-            },
+            IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },
         ),
     )
     .await
@@ -617,10 +592,7 @@ async fn e2e_p2_dns_core_resolution() {
     .to_string();
 
     let mut core_cfg = BuiltConfig::default();
-    core_cfg.apps.push(BuiltEntry {
-        kind: "dns".into(),
-        data: dns_app_json.into_bytes(),
-    });
+    core_cfg.apps.push(BuiltEntry { kind: "dns".into(), data: dns_app_json.into_bytes() });
     core_cfg.inbounds.push(socks_inbound(socks_port, "socks-in"));
     core_cfg.outbounds.push(freedom_outbound("direct"));
 
@@ -628,9 +600,8 @@ async fn e2e_p2_dns_core_resolution() {
     tokio::time::sleep(READY_DELAY).await;
 
     // Confirm the DNS feature was actually registered via the factory path.
-    let dns_in_instance = _inst
-        .get_feature::<DnsService>()
-        .expect("dns feature registered through core factory");
+    let dns_in_instance =
+        _inst.get_feature::<DnsService>().expect("dns feature registered through core factory");
     assert_eq!(dns_in_instance.feature_name(), "dns");
 
     // Confirm the rest of the stack still serves traffic with dns app installed.

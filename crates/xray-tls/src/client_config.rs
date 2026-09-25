@@ -4,28 +4,32 @@
 //! （client 侧）。已覆盖字段：
 //! - `serverName`（SNI 由调用方传给 `utls::client`，此处仅解析）
 //! - `allowInsecure` / `alpn`
-//! - `minVersion` / `maxVersion` / `cipherSuites` / `curvePreferences`
-//!   （经 [`crate::config::security_params`]，rustls 边界项 warn 后降级）
-//! - `disableSystemRoot` + `certificates[]`：自定义 CA 信任根替代 webpki-roots
-//!   （对应 Go `getCertPool` → `loadSelfCertPool`）
-//! - `pinnedPeerCertSha256`：证书钉扎（对应 Go `RandCarrier.verifyPeerCert` +
-//!   `verifyChain`，见 [`PinnedServerCertVerifier`]）
-//! - `certificates[]` 带 key 条目：客户端身份证书（mTLS 双向握手；Go 无此能力，
-//!   Rust 扩展）
+//! - `minVersion` / `maxVersion` / `cipherSuites` / `curvePreferences` （经
+//!   [`crate::config::security_params`]，rustls 边界项 warn 后降级）
+//! - `disableSystemRoot` + `certificates[]`：自定义 CA 信任根替代 webpki-roots （对应 Go
+//!   `getCertPool` → `loadSelfCertPool`）
+//! - `pinnedPeerCertSha256`：证书钉扎（对应 Go `RandCarrier.verifyPeerCert` + `verifyChain`，见
+//!   [`PinnedServerCertVerifier`]）
+//! - `certificates[]` 带 key 条目：客户端身份证书（mTLS 双向握手；Go 无此能力， Rust 扩展）
 //!
 //! ECH 留待 115 另 issue；`verifyPeerCertByName` 未实现（Go v26 新增，暂无需求）。
 
-use std::io;
-use std::sync::Arc;
+use std::{io, sync::Arc};
 
-use rustls::client::WebPkiServerVerifier;
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
+    client::{
+        WebPkiServerVerifier,
+        danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    },
+};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 
-use crate::certificate::entry_certs_and_key;
-use crate::config::{security_params, verify_chain, VerifyResult};
-use crate::pin::generate_cert_hash;
+use crate::{
+    certificate::entry_certs_and_key,
+    config::{VerifyResult, security_params, verify_chain},
+    pin::generate_cert_hash,
+};
 
 /// 默认 ALPN 协议列表（对齐 Go `NextProto = []string{"h2", "http/1.1"}`）。
 const DEFAULT_ALPN: &[&str] = &["h2", "http/1.1"];
@@ -35,7 +39,8 @@ const DEFAULT_ALPN: &[&str] = &["h2", "http/1.1"];
 /// 对应 Go `ConfigFromStreamSettings` + `GetTLSConfig`。
 ///
 /// # 参数
-/// - `security`：安全层名（`"none"` / `"tls"` / `"reality"`）。非 `"tls"` / `"reality"` 返回 `None`。
+/// - `security`：安全层名（`"none"` / `"tls"` / `"reality"`）。非 `"tls"` / `"reality"` 返回
+///   `None`。
 /// - `security_json`：`tlsSettings` 或 `realitySettings` 的 JSON 值。`None` 用默认值。
 /// - `server_name`：默认 SNI（当 `tlsSettings.serverName` 缺失时使用）。
 ///
@@ -54,18 +59,17 @@ const DEFAULT_ALPN: &[&str] = &["h2", "http/1.1"];
 /// （client 侧）。已覆盖字段：
 /// - `serverName`（SNI 由调用方传给 `utls::client`，此处仅解析）
 /// - `allowInsecure` / `alpn`
-/// - `minVersion` / `maxVersion` / `cipherSuites` / `curvePreferences`
-///   （经 [`crate::config::security_params`]，rustls 边界项 warn 后降级）
-/// - `disableSystemRoot` + `certificates[]`：自定义 CA 信任根替代 webpki-roots
-///   （对应 Go `getCertPool` → `loadSelfCertPool`）
-/// - `pinnedPeerCertSha256`：证书钉扎（对应 Go `RandCarrier.verifyPeerCert` +
-///   `verifyChain`，见 [`PinnedServerCertVerifier`]）
-/// - `certificates[]` 带 key 条目：客户端身份证书（mTLS 双向握手；Go 无此能力，
-///   Rust 扩展）
-/// - `verifyPeerCertByName`（Go v26 新增）：以字符串而非 SNI 主机名做证书验证，
-///   用于 ECH/PSK 等握手阶段 SNI 与真实服务名不一致的场景。
-/// - `masterKeyLog`（Go `tls.Config.KeyLogWriter` 等价）/ `enableSessionResumption`
-///   （Go `SessionTicketsDisabled` 等价）：pwh6 字段族增量。
+/// - `minVersion` / `maxVersion` / `cipherSuites` / `curvePreferences` （经
+///   [`crate::config::security_params`]，rustls 边界项 warn 后降级）
+/// - `disableSystemRoot` + `certificates[]`：自定义 CA 信任根替代 webpki-roots （对应 Go
+///   `getCertPool` → `loadSelfCertPool`）
+/// - `pinnedPeerCertSha256`：证书钉扎（对应 Go `RandCarrier.verifyPeerCert` + `verifyChain`，见
+///   [`PinnedServerCertVerifier`]）
+/// - `certificates[]` 带 key 条目：客户端身份证书（mTLS 双向握手；Go 无此能力， Rust 扩展）
+/// - `verifyPeerCertByName`（Go v26 新增）：以字符串而非 SNI 主机名做证书验证， 用于 ECH/PSK
+///   等握手阶段 SNI 与真实服务名不一致的场景。
+/// - `masterKeyLog`（Go `tls.Config.KeyLogWriter` 等价）/ `enableSessionResumption` （Go
+///   `SessionTicketsDisabled` 等价）：pwh6 字段族增量。
 ///
 /// ECH 留待 115 另 issue。
 pub fn build_client_config(
@@ -93,10 +97,8 @@ pub fn build_client_config(
         .to_string();
 
     // allowInsecure：默认 false。
-    let allow_insecure: bool = obj
-        .and_then(|m| m.get("allowInsecure"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let allow_insecure: bool =
+        obj.and_then(|m| m.get("allowInsecure")).and_then(|v| v.as_bool()).unwrap_or(false);
     // Go infra/conf/transport_internet.go:698-700：allowInsecure 已移除（硬报错）。
     // Rust 保留现行为：warn + 继续跳过证书验证。
     if allow_insecure {
@@ -107,17 +109,21 @@ pub fn build_client_config(
     }
 
     // alpn：数组；缺失用 DEFAULT_ALPN。
-    let alpn_owned: Vec<Vec<u8>> = if let Some(arr) = obj.and_then(|m| m.get("alpn")).and_then(|v| v.as_array()) {
-        arr.iter()
-            .map(|s| {
-                s.as_str()
-                    .map(|x| x.as_bytes().to_vec())
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "alpn array must contain only strings"))
-            })
-            .collect::<io::Result<_>>()?
-    } else {
-        DEFAULT_ALPN.iter().map(|s| s.as_bytes().to_vec()).collect()
-    };
+    let alpn_owned: Vec<Vec<u8>> =
+        if let Some(arr) = obj.and_then(|m| m.get("alpn")).and_then(|v| v.as_array()) {
+            arr.iter()
+                .map(|s| {
+                    s.as_str().map(|x| x.as_bytes().to_vec()).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "alpn array must contain only strings",
+                        )
+                    })
+                })
+                .collect::<io::Result<_>>()?
+        } else {
+            DEFAULT_ALPN.iter().map(|s| s.as_bytes().to_vec()).collect()
+        };
 
     // minVersion/maxVersion/cipherSuites/curvePreferences → provider + 版本列表
     let (provider, versions) = security_params(&json);
@@ -149,7 +155,9 @@ pub fn build_client_config(
     // Rust ECH DoH 查询已接线（ech_doh），但查询连接的 sockopt 应用未实现，
     // 此处识别 + 显式忽略提示。
     if crate::ech::parse_ech_sockopt(&json).is_some()
-        && obj.and_then(|m| m.get("echConfigList")).and_then(|v| v.as_str())
+        && obj
+            .and_then(|m| m.get("echConfigList"))
+            .and_then(|v| v.as_str())
             .is_some_and(|s| s.contains("://"))
     {
         tracing::warn!(
@@ -163,18 +171,13 @@ pub fn build_client_config(
         .map_err(|e| io::Error::other(format!("protocol versions: {e}")))?;
 
     let builder = if allow_insecure {
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+        builder.dangerous().with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
     } else if !pins.is_empty() || !verify_peer_cert_by_name.is_empty() {
         // pwh6: verifyPeerCertByName 与 pinnedPeerCertSha256 互不冲突，可同时配；
         // 任一非空都走 PinnedServerCertVerifier（已实现 verify_chain 逻辑）。
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(PinnedServerCertVerifier::new(
-                pins,
-                verify_peer_cert_by_name,
-            )))
+        builder.dangerous().with_custom_certificate_verifier(Arc::new(
+            PinnedServerCertVerifier::new(pins, verify_peer_cert_by_name),
+        ))
     } else {
         builder.with_root_certificates(verifier_roots(&json)?)
     };
@@ -197,7 +200,7 @@ pub fn build_client_config(
                     cfg.key_log = Arc::new(crate::server_config::KeyLogFileWriter(
                         parking_lot::Mutex::new(file),
                     ));
-                }
+                },
                 Err(e) => tracing::warn!(
                     target: "xray_tls::client_config",
                     error = %e,
@@ -205,11 +208,11 @@ pub fn build_client_config(
                     "failed to open masterKeyLog as file; key log disabled"
                 ),
             }
-        }
+        },
         crate::server_config::MasterKeyLogSetting::EnvFile => {
             cfg.key_log = Arc::new(rustls::KeyLogFile::new());
-        }
-        crate::server_config::MasterKeyLogSetting::Off => {}
+        },
+        crate::server_config::MasterKeyLogSetting::Off => {},
     }
 
     // pwh6: enableSessionResumption=false 走 rustls `Resumption::disabled()`
@@ -274,10 +277,7 @@ pub fn build_server_cert_verifier(
         .unwrap_or("")
         .to_string();
     if !pins.is_empty() || !verify_peer_cert_by_name.is_empty() {
-        return Ok(Some(Arc::new(PinnedServerCertVerifier::new(
-            pins,
-            verify_peer_cert_by_name,
-        ))));
+        return Ok(Some(Arc::new(PinnedServerCertVerifier::new(pins, verify_peer_cert_by_name))));
     }
     let verifier = WebPkiServerVerifier::builder(Arc::new(verifier_roots(&json)?))
         .build()
@@ -340,7 +340,6 @@ fn parse_pinned_hashes(json: &serde_json::Value) -> io::Result<Vec<Vec<u8>>> {
     Ok(pins)
 }
 
-
 /// 客户端身份证书（mTLS）：`certificates[]` 中首个同时含证书与私钥的条目。
 ///
 /// Go 客户端从不发送证书（`GetTLSConfig` 不设 `tls.Config.Certificates`）；
@@ -364,8 +363,8 @@ fn client_identity(
 ///
 /// 语义与 Go 一致：
 /// 1. pin 命中**叶子** → 直接通过（Go `foundLeaf` 即 `return nil`，不查链/有效期/主机名）。
-/// 2. pin 命中链中 **CA** → 以该 CA 为唯一信任根做完整 webpki 验证
-///    （链构建 + 签名 + 有效期 + 主机名，对应 Go foundCA 分支的 `certs[0].Verify`）。
+/// 2. pin 命中链中 **CA** → 以该 CA 为唯一信任根做完整 webpki 验证 （链构建 + 签名 + 有效期 +
+///    主机名，对应 Go foundCA 分支的 `certs[0].Verify`）。
 /// 3. 无命中 → 拒绝（"peer cert is unrecognized"）。
 ///
 /// pwh6: 附加 `verify_peer_cert_by_name`（Go `verifyPeerCertByName` v26 新增）：
@@ -384,10 +383,7 @@ struct PinnedServerCertVerifier {
 
 impl PinnedServerCertVerifier {
     fn new(pins: Vec<Vec<u8>>, verify_peer_cert_by_name: String) -> Self {
-        Self {
-            pins,
-            verify_peer_cert_by_name,
-        }
+        Self { pins, verify_peer_cert_by_name }
     }
 }
 impl ServerCertVerifier for PinnedServerCertVerifier {
@@ -441,7 +437,7 @@ impl ServerCertVerifier for PinnedServerCertVerifier {
                     ocsp_response,
                     now,
                 )
-            }
+            },
             _ => Err(rustls::Error::General(
                 "peer cert is unrecognized (against pinnedPeerCertSha256)".into(),
             )),
@@ -546,8 +542,9 @@ impl ServerCertVerifier for NoCertificateVerification {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rustls::version::{TLS12, TLS13};
+
+    use super::*;
 
     #[test]
     fn client_invalid_inline_cert_errors_instead_of_silent_skip() {
@@ -620,7 +617,8 @@ mod tests {
         install_provider();
         let v: serde_json::Value = serde_json::from_str(r#"{"allowInsecure":true}"#).unwrap();
         let cfg = build_client_config("tls", Some(&v), "example.com").unwrap().unwrap();
-        // dangerous verifier 应该是 NoCertificateVerification；通过 ALPN 仍设置验证 dangerous 路径走通。
+        // dangerous verifier 应该是 NoCertificateVerification；通过 ALPN 仍设置验证 dangerous
+        // 路径走通。
         assert!(!cfg.alpn_protocols.is_empty());
         // 没有公开 API 直接判 verifier 类型，靠 e2e 验证行为。
     }
@@ -653,7 +651,8 @@ mod tests {
         let (_, v) = security_params(&serde_json::json!({"maxVersion": "1.2"}));
         assert_eq!(v, vec![&TLS12]);
         // min 1.3 + max 1.2 → 空 → 回落默认
-        let (_, v) = security_params(&serde_json::json!({"minVersion": "1.3", "maxVersion": "1.2"}));
+        let (_, v) =
+            security_params(&serde_json::json!({"minVersion": "1.3", "maxVersion": "1.2"}));
         assert_eq!(v, vec![&TLS13, &TLS12]);
     }
 
@@ -728,9 +727,11 @@ mod tests {
         assert_eq!(ok.len(), 1);
         assert_eq!(ok[0].len(), 32);
         // 空段跳过；空字符串 / 缺失 → 空 pins
-        assert!(parse_pinned_hashes(&serde_json::json!({"pinnedPeerCertSha256": ""}))
-            .unwrap()
-            .is_empty());
+        assert!(
+            parse_pinned_hashes(&serde_json::json!({"pinnedPeerCertSha256": ""}))
+                .unwrap()
+                .is_empty()
+        );
         assert!(parse_pinned_hashes(&serde_json::json!({})).unwrap().is_empty());
     }
 
@@ -744,7 +745,10 @@ mod tests {
         .unwrap();
         assert_eq!(pins.len(), 2);
         // 冒号（OpenSSL 格式）被剥离
-        let colonized: String = h1.as_str().chars().enumerate()
+        let colonized: String = h1
+            .as_str()
+            .chars()
+            .enumerate()
             .map(|(i, c)| if i % 2 == 0 && i > 0 { format!(":{c}") } else { c.to_string() })
             .collect();
         let pins = parse_pinned_hashes(&serde_json::json!({
@@ -800,8 +804,8 @@ mod tests {
         });
         let id = client_identity(&json).unwrap().unwrap();
         assert_eq!(id.0.len(), 1); // 选中带 key 的第二个条目
-        let none = client_identity(&serde_json::json!({"certificates": [{"certificate": c1}]}))
-            .unwrap();
+        let none =
+            client_identity(&serde_json::json!({"certificates": [{"certificate": c1}]})).unwrap();
         assert!(none.is_none());
     }
 
@@ -839,10 +843,7 @@ mod tests {
 
     /// PEM 首张证书的 SHA-256 hex（钉扎值）。
     fn pem_leaf_hash_hex(pem: &str) -> String {
-        let der = rustls_pemfile::certs(&mut pem.as_bytes())
-            .next()
-            .unwrap()
-            .unwrap();
+        let der = rustls_pemfile::certs(&mut pem.as_bytes()).next().unwrap().unwrap();
         hex::encode(generate_cert_hash(der.as_ref()))
     }
 
@@ -857,25 +858,15 @@ mod tests {
         io::Result<tokio_rustls::server::TlsStream<Duplex>>,
         io::Result<tokio_rustls::client::TlsStream<Duplex>>,
     ) {
-        let sc = crate::server_config::build_server_config("tls", Some(&server_json))
-            .unwrap()
-            .unwrap();
-        let cc = build_client_config("tls", Some(&client_json), sni)
-            .unwrap()
-            .unwrap();
+        let sc =
+            crate::server_config::build_server_config("tls", Some(&server_json)).unwrap().unwrap();
+        let cc = build_client_config("tls", Some(&client_json), sni).unwrap().unwrap();
         let (a, b) = tokio::io::duplex(4096);
-        let accept = async {
-            tokio_rustls::TlsAcceptor::from(sc)
-                .accept(a)
-                .await
-                .map_err(io::Error::other)
-        };
+        let accept =
+            async { tokio_rustls::TlsAcceptor::from(sc).accept(a).await.map_err(io::Error::other) };
         let connect = async {
             let name = ServerName::try_from(sni.to_string()).unwrap();
-            tokio_rustls::TlsConnector::from(cc)
-                .connect(name, b)
-                .await
-                .map_err(io::Error::other)
+            tokio_rustls::TlsConnector::from(cc).connect(name, b).await.map_err(io::Error::other)
         };
         tokio::join!(accept, connect)
     }
@@ -890,10 +881,7 @@ mod tests {
         .await;
         let client = cr.unwrap();
         sr.unwrap();
-        assert_eq!(
-            client.get_ref().1.protocol_version(),
-            Some(rustls::ProtocolVersion::TLSv1_3)
-        );
+        assert_eq!(client.get_ref().1.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_3));
     }
 
     #[tokio::test]
@@ -906,10 +894,7 @@ mod tests {
         .await;
         let client = cr.unwrap();
         sr.unwrap();
-        assert_eq!(
-            client.get_ref().1.protocol_version(),
-            Some(rustls::ProtocolVersion::TLSv1_2)
-        );
+        assert_eq!(client.get_ref().1.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_2));
     }
 
     #[tokio::test]
@@ -969,10 +954,7 @@ mod tests {
         .await;
         let client = cr.expect("custom CA should validate CA-signed server cert");
         sr.unwrap();
-        assert_eq!(
-            client.get_ref().1.protocol_version(),
-            Some(rustls::ProtocolVersion::TLSv1_3)
-        );
+        assert_eq!(client.get_ref().1.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_3));
 
         // 对照：不配 disableSystemRoot（webpki-roots）→ 验证失败
         let (sr2, cr2) = handshake_pair(
@@ -1074,10 +1056,7 @@ mod tests {
         .await;
         let client = cr.expect("mTLS handshake with client cert should succeed");
         let server = sr.expect("server should verify client cert against verify CA");
-        assert_eq!(
-            client.get_ref().1.protocol_version(),
-            Some(rustls::ProtocolVersion::TLSv1_3)
-        );
+        assert_eq!(client.get_ref().1.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_3));
         drop(server);
     }
 
@@ -1130,9 +1109,7 @@ mod tests {
     /// `masterKeyLog=true` 切到 KeyLogFile；`false`（默认）保持 NoKeyLog。
     #[test]
     fn pwh6_client_master_key_log_swaps_key_log() {
-        let cfg_off = build_client_config("tls", None, "example.com")
-            .unwrap()
-            .unwrap();
+        let cfg_off = build_client_config("tls", None, "example.com").unwrap().unwrap();
         let cfg_on = build_client_config(
             "tls",
             Some(&serde_json::json!({ "masterKeyLog": true })),
@@ -1149,10 +1126,8 @@ mod tests {
     /// 文件被创建（bool true 方言仍走 KeyLogFile，见上一个测试）。
     #[test]
     fn pwh6_client_master_key_log_string_path_wires_writer() {
-        let path = std::env::temp_dir().join(format!(
-            "xray_tls_8k4s_client_{}.log",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("xray_tls_8k4s_client_{}.log", std::process::id()));
         let cfg = build_client_config(
             "tls",
             Some(&serde_json::json!({ "masterKeyLog": path.to_string_lossy() })),
@@ -1173,18 +1148,14 @@ mod tests {
             "echConfigList": "https://1.1.1.1/dns-query",
             "echSockopt": { "domainStrategy": "UseIP" }
         });
-        let cfg = build_client_config("tls", Some(&json), "example.com")
-            .unwrap()
-            .unwrap();
+        let cfg = build_client_config("tls", Some(&json), "example.com").unwrap().unwrap();
         assert!(format!("{:?}", &*cfg.key_log).contains("NoKeyLog"));
     }
 
     /// `enableSessionResumption=false` → resumption 切换到 disabled（type_name 变化）。
     #[test]
     fn pwh6_client_disable_session_resumption_swaps_resumption() {
-        let cfg_off = build_client_config("tls", None, "example.com")
-            .unwrap()
-            .unwrap();
+        let cfg_off = build_client_config("tls", None, "example.com").unwrap().unwrap();
         let cfg_on = build_client_config(
             "tls",
             Some(&serde_json::json!({ "enableSessionResumption": false })),

@@ -8,15 +8,14 @@
 //! cargo test -p xray-proxy-vless --test vps_interop -- --ignored --nocapture
 //! ```
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::time::{timeout, Duration};
-
-use xray_common::net::address::Address;
-use xray_common::uuid::UUID;
-use xray_proxy_vless::encoding::client::encode_request_header;
-use xray_proxy_vless::encoding::VlessCommand;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    time::{Duration, timeout},
+};
+use xray_common::{net::address::Address, uuid::UUID};
 use xray_proto::xray::proxy::vless::encoding::Addons;
+use xray_proxy_vless::encoding::{VlessCommand, client::encode_request_header};
 use xray_tls::utls;
 use xray_transport::connection::TcpConnection;
 
@@ -47,17 +46,12 @@ async fn vless_tcp_tls_vps_interop() {
     // 2. TLS handshake
     eprintln!("[2/5] TLS handshake (SNI={sni})");
     let tls_config = utls::default_client_config();
-    let mut tls = utls::client(conn, sni, tls_config)
-        .await
-        .expect("TLS handshake");
+    let mut tls = utls::client(conn, sni, tls_config).await.expect("TLS handshake");
 
     // 3. VLESS request header (encryption=none, flow=xtls-rprx-vision, target=www.google.com:80)
     eprintln!("[3/5] VLESS header (flow=xtls-rprx-vision, target=www.google.com:80)");
     let target_addr = Address::Domain("www.google.com".to_string());
-    let addons = Addons {
-        flow: "xtls-rprx-vision".to_string(),
-        ..Default::default()
-    };
+    let addons = Addons { flow: "xtls-rprx-vision".to_string(), ..Default::default() };
     encode_request_header(
         &mut tls,
         VLESS_VERSION,
@@ -76,13 +70,12 @@ async fn vless_tcp_tls_vps_interop() {
     let uuid_bytes = uuid.as_bytes().to_vec();
     // v50 起 VisionConn 的 AsyncRead/AsyncWrite 带 InnerRawClone bound（splice
     // 直通道用）；Conn 未实现该 bound，经 Box<dyn Connection> 适配。
-    let mut vision =
-        VisionConn::new(Box::new(tls) as Box<dyn xray_transport::connection::Connection>, uuid_bytes);
+    let mut vision = VisionConn::new(
+        Box::new(tls) as Box<dyn xray_transport::connection::Connection>,
+        uuid_bytes,
+    );
     let http_req = b"GET / HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\n\r\n";
-    vision
-        .write_all(http_req)
-        .await
-        .expect("write HTTP via Vision");
+    vision.write_all(http_req).await.expect("write HTTP via Vision");
     vision.flush().await.expect("flush Vision");
 
     // 5. 读 response（VisionConn 自动 unpadding；若服务端 raw 则 passthrough）
@@ -105,12 +98,11 @@ async fn vless_tcp_tls_vps_interop() {
                     eprintln!("⚠️ Non-HTTP response (Vision unpadding may need adjustment)");
                 }
             }
-        }
+        },
         Ok(Err(e)) => eprintln!("⚠️ Read error: {e}"),
         Err(_) => eprintln!("⚠️ Timeout 10s (server may be waiting for more data)"),
     }
 }
-
 
 // ============================================================================
 // VLESS + WS + TLS (encryption=none, no Vision) — CDN 配置
@@ -148,7 +140,8 @@ async fn vless_ws_tls_vps_interop() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let ws_url = format!("wss://{ws_host}{ws_path}");
     let ws_request = ws_url.into_client_request().expect("build WS request");
-    let (mut ws, response) = tokio_tungstenite::client_async(ws_request, tls).await.expect("WS upgrade");
+    let (mut ws, response) =
+        tokio_tungstenite::client_async(ws_request, tls).await.expect("WS upgrade");
     eprintln!("  WS upgrade: {}", response.status());
 
     // 4. VLESS header + HTTP request
@@ -178,12 +171,20 @@ async fn vless_ws_tls_vps_interop() {
         Ok(Some(Ok(msg))) => {
             eprintln!("  Response msg: {:?}", msg);
             match msg {
-                Message::Binary(d) => eprintln!("  Response header: {} bytes {:02x?}", d.len(), &d[..d.len().min(16)]),
-                Message::Close(r) => { eprintln!("⚠️ Server closed: {:?}", r); return; }
+                Message::Binary(d) => {
+                    eprintln!("  Response header: {} bytes {:02x?}", d.len(), &d[..d.len().min(16)])
+                },
+                Message::Close(r) => {
+                    eprintln!("⚠️ Server closed: {:?}", r);
+                    return;
+                },
                 _ => eprintln!("  Other: {:?}", msg),
             }
-        }
-        _ => { eprintln!("⚠️ No response header received"); return; }
+        },
+        _ => {
+            eprintln!("⚠️ No response header received");
+            return;
+        },
     }
 
     // 5b. 发 HTTP GET
@@ -212,15 +213,27 @@ async fn vless_ws_tls_vps_interop() {
                             eprintln!("  First bytes: {:02x?}", &data[..data.len().min(32)]);
                             break;
                         }
-                    }
+                    },
                     Message::Ping(_) | Message::Pong(_) => continue,
-                    Message::Close(r) => { eprintln!("⚠️ Close: {:?}", r); break; }
+                    Message::Close(r) => {
+                        eprintln!("⚠️ Close: {:?}", r);
+                        break;
+                    },
                     _ => continue,
                 }
-            }
-            Ok(Some(Err(e))) => { eprintln!("⚠️ WS error: {e}"); break; }
-            Ok(None) => { eprintln!("⚠️ Stream closed"); break; }
-            Err(_) => { eprintln!("⚠️ Timeout 10s"); break; }
+            },
+            Ok(Some(Err(e))) => {
+                eprintln!("⚠️ WS error: {e}");
+                break;
+            },
+            Ok(None) => {
+                eprintln!("⚠️ Stream closed");
+                break;
+            },
+            Err(_) => {
+                eprintln!("⚠️ Timeout 10s");
+                break;
+            },
         }
     }
 }

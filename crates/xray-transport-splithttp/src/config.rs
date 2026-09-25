@@ -17,10 +17,14 @@
 
 use std::collections::HashMap;
 
-use crate::error::Result;
-
 use rand::Rng;
-use crate::xpadding::{apply_xpadding_to_request_meta, PADDING_METHOD_REPEAT_X, XPaddingConfig, XPaddingPlacement};
+
+use crate::{
+    error::Result,
+    xpadding::{
+        PADDING_METHOD_REPEAT_X, XPaddingConfig, XPaddingPlacement, apply_xpadding_to_request_meta,
+    },
+};
 
 // ===== Placement 常量（对应 Go `common.go`）=====
 
@@ -59,10 +63,7 @@ pub const PREDEFINED_SESSION_ID_TABLE: &[(&str, &str)] = &[
 /// 按预设名查找字符集（区分大小写），未命中返回 `None`。
 #[must_use]
 pub fn lookup_predefined_session_id_table(name: &str) -> Option<&'static str> {
-    PREDEFINED_SESSION_ID_TABLE
-        .iter()
-        .find(|(k, _)| *k == name)
-        .map(|(_, v)| *v)
+    PREDEFINED_SESSION_ID_TABLE.iter().find(|(k, _)| *k == name).map(|(_, v)| *v)
 }
 
 // ===== RangeConfig =====
@@ -246,11 +247,7 @@ impl Config {
     /// 上行 HTTP method。空时默认 `POST`。对应 Go `GetNormalizedUplinkHTTPMethod`。
     #[must_use]
     pub fn normalized_uplink_http_method(&self) -> &str {
-        if self.uplink_http_method.is_empty() {
-            "POST"
-        } else {
-            &self.uplink_http_method
-        }
+        if self.uplink_http_method.is_empty() { "POST" } else { &self.uplink_http_method }
     }
 
     /// 单次 POST 最大字节数范围。None 或 `to=0` 返回默认 `1_000_000..=1_000_000`。
@@ -276,11 +273,7 @@ impl Config {
     /// 最大缓冲 POST 数。0 返回默认 30。对应 Go `GetNormalizedScMaxBufferedPosts`。
     #[must_use]
     pub fn normalized_sc_max_buffered_posts(&self) -> i64 {
-        if self.sc_max_buffered_posts == 0 {
-            30
-        } else {
-            self.sc_max_buffered_posts
-        }
+        if self.sc_max_buffered_posts == 0 { 30 } else { self.sc_max_buffered_posts }
     }
 
     /// stream-up 服务端推送周期（秒）范围。None 或 `to=0` 返回默认 `20..=80`。
@@ -306,14 +299,11 @@ impl Config {
         match self.uplink_chunk_size {
             Some(r) if r.to != 0 => {
                 if r.from < 64 {
-                    RangeConfig {
-                        from: 64,
-                        to: r.to.max(64),
-                    }
+                    RangeConfig { from: 64, to: r.to.max(64) }
                 } else {
                     r
                 }
-            }
+            },
             _ => match self.normalized_uplink_data_placement() {
                 PLACEMENT_COOKIE => RangeConfig { from: 2 * 1024, to: 3 * 1024 },
                 PLACEMENT_HEADER => RangeConfig { from: 3 * 1000, to: 4 * 1000 },
@@ -325,11 +315,7 @@ impl Config {
     /// 服务端最大 header 字节数。≤0 返回默认 8192。
     #[must_use]
     pub fn normalized_server_max_header_bytes(&self) -> i32 {
-        if self.server_max_header_bytes <= 0 {
-            8192
-        } else {
-            self.server_max_header_bytes
-        }
+        if self.server_max_header_bytes <= 0 { 8192 } else { self.server_max_header_bytes }
     }
 
     /// sessionID 字符集：命中预设名（如 `"HEX"`）则替换为字面值，否则返回原字符串。
@@ -385,21 +371,13 @@ impl Config {
     /// session placement。空返回默认 `path`。
     #[must_use]
     pub fn normalized_session_placement(&self) -> &str {
-        if self.session_placement.is_empty() {
-            PLACEMENT_PATH
-        } else {
-            &self.session_placement
-        }
+        if self.session_placement.is_empty() { PLACEMENT_PATH } else { &self.session_placement }
     }
 
     /// seq placement。空返回默认 `path`。
     #[must_use]
     pub fn normalized_seq_placement(&self) -> &str {
-        if self.seq_placement.is_empty() {
-            PLACEMENT_PATH
-        } else {
-            &self.seq_placement
-        }
+        if self.seq_placement.is_empty() { PLACEMENT_PATH } else { &self.seq_placement }
     }
 
     /// 上行数据 placement。空返回默认 `body`。
@@ -457,11 +435,7 @@ impl Config {
     /// 对应 Go `appendToPath`。
     #[must_use]
     pub fn append_to_path(path: &str, value: &str) -> String {
-        if path.ends_with('/') {
-            format!("{path}{value}")
-        } else {
-            format!("{path}/{value}")
-        }
+        if path.ends_with('/') { format!("{path}{value}") } else { format!("{path}/{value}") }
     }
 
     /// 从 prost 生成的 proto Config 构造。
@@ -632,8 +606,9 @@ impl Config {
 
     /// 构造 XPaddingConfig。采样 padding 长度 + 根据 `x_padding_obfs_mode` 选择 placement。
     ///
-    /// `obfs_mode = false`（默认）：placement=queryInHeader, header=Referer, key=x_padding（与切片 A 行为对齐，但 length 由硬编码 0 改为随机）。
-    /// `obfs_mode = true`：placement/key/header 来自 config 字段，空时用默认。
+    /// `obfs_mode = false`（默认）：placement=queryInHeader, header=Referer, key=x_padding（与切片
+    /// A 行为对齐，但 length 由硬编码 0 改为随机）。 `obfs_mode = true`：placement/key/header
+    /// 来自 config 字段，空时用默认。
     #[must_use]
     pub(crate) fn build_xpadding_config(&self, base_uri: &str) -> XPaddingConfig {
         let range = self.get_normalized_x_padding_bytes();
@@ -709,11 +684,11 @@ impl Config {
                 PLACEMENT_QUERY => uri = uri_append_query(&uri, session_key, session_id),
                 PLACEMENT_HEADER => {
                     extra_headers.push((session_key.to_string(), session_id.to_string()));
-                }
+                },
                 PLACEMENT_COOKIE => {
                     extra_cookies.push((session_key.to_string(), session_id.to_string()));
-                }
-                _ => {}
+                },
+                _ => {},
             }
         }
         if !seq_str.is_empty() {
@@ -722,11 +697,11 @@ impl Config {
                 PLACEMENT_QUERY => uri = uri_append_query(&uri, seq_key, seq_str),
                 PLACEMENT_HEADER => {
                     extra_headers.push((seq_key.to_string(), seq_str.to_string()));
-                }
+                },
                 PLACEMENT_COOKIE => {
                     extra_cookies.push((seq_key.to_string(), seq_str.to_string()));
-                }
-                _ => {}
+                },
+                _ => {},
             }
         }
         (uri, extra_headers, extra_cookies)
@@ -765,11 +740,11 @@ impl Config {
             PLACEMENT_HEADER => {
                 headers.extend(self.uplink_payload_chunks(&payload, '-'));
                 None
-            }
+            },
             PLACEMENT_COOKIE => {
                 cookies.extend(self.uplink_payload_chunks(&payload, '_'));
                 None
-            }
+            },
             // 其余值对齐 Go：无 body 无 chunk（FillPacketRequest else 分支只处理
             // header/cookie），payload 不上行。
             _ => None,
@@ -837,13 +812,7 @@ impl Config {
         } else {
             "GET".to_string()
         };
-        let mut meta = RequestMeta {
-            method,
-            uri,
-            headers,
-            cookies: meta_cookies,
-            body,
-        };
+        let mut meta = RequestMeta { method, uri, headers, cookies: meta_cookies, body };
         let xpad = self.build_xpadding_config(base_uri);
         apply_xpadding_to_request_meta(&mut meta, &xpad);
         Ok(meta)
@@ -852,25 +821,19 @@ impl Config {
 
 /// URL query 追加 helper：`uri` 已含 `?` 用 `&` 连接，否则补 `?`。
 pub(crate) fn uri_append_query(uri: &str, key: &str, value: &str) -> String {
-    if uri.contains('?') {
-        format!("{uri}&{key}={value}")
-    } else {
-        format!("{uri}?{key}={value}")
-    }
+    if uri.contains('?') { format!("{uri}&{key}={value}") } else { format!("{uri}?{key}={value}") }
 }
 
 /// 从 `http::HeaderMap` 按名称取值（不区分大小写），缺失返回空串。
 fn header_get(headers: &http::HeaderMap, name: &str) -> String {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_string()
+    headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string()
 }
 
 // ===== proto 转换辅助 =====
 
-fn range_from_proto(r: xray_proto::xray::transport::internet::splithttp::RangeConfig) -> RangeConfig {
+fn range_from_proto(
+    r: xray_proto::xray::transport::internet::splithttp::RangeConfig,
+) -> RangeConfig {
     RangeConfig { from: r.from, to: r.to }
 }
 
@@ -1058,10 +1021,8 @@ mod tests {
 
     #[test]
     fn uplink_chunk_size_explicit_below_64_raised_to_64() {
-        let cfg = Config {
-            uplink_chunk_size: Some(RangeConfig::new(10, 100)),
-            ..Default::default()
-        };
+        let cfg =
+            Config { uplink_chunk_size: Some(RangeConfig::new(10, 100)), ..Default::default() };
         let r = cfg.normalized_uplink_chunk_size();
         assert_eq!((r.from, r.to), (64, 100));
     }
@@ -1245,9 +1206,7 @@ mod tests {
     #[test]
     fn get_request_header_preserves_custom_user_agent() {
         let cfg = Config {
-            headers: [("User-Agent".to_string(), "Chrome/123".to_string())]
-                .into_iter()
-                .collect(),
+            headers: [("User-Agent".to_string(), "Chrome/123".to_string())].into_iter().collect(),
             ..Default::default()
         };
         let headers = cfg.get_request_header();
@@ -1316,11 +1275,7 @@ mod tests {
 
     #[test]
     fn build_packet_request_meta_body_filled() {
-        let cfg = Config {
-            host: "example.com".into(),
-            path: "/ws".into(),
-            ..Default::default()
-        };
+        let cfg = Config { host: "example.com".into(), path: "/ws".into(), ..Default::default() };
         let meta = cfg
             .build_packet_request_meta("https://example.com/ws", "sess", "3", b"payload".to_vec())
             .unwrap();
@@ -1329,13 +1284,18 @@ mod tests {
         assert_eq!(meta.body.as_deref(), Some(&b"payload"[..]));
         // padding length 默认范围 [100, 1000]，采样后注入 Referer 的 x_padding query。
         // 由于长度随机，这里只验证 Referer 存在、url 前缀正确、x_padding 值非空。
-        let referer = meta.headers.iter().find_map(|(k, v)| {
-            if k == "Referer" { Some(v.clone()) } else { None }
-        }).expect("Referer header must exist");
+        let referer = meta
+            .headers
+            .iter()
+            .find_map(|(k, v)| if k == "Referer" { Some(v.clone()) } else { None })
+            .expect("Referer header must exist");
         assert!(referer.starts_with("https://example.com/ws?x_padding="), "referer={referer}");
         let pad_value = referer.strip_prefix("https://example.com/ws?x_padding=").unwrap();
         assert!(!pad_value.is_empty(), "padding value must be non-empty, got empty");
-        assert!(pad_value.chars().all(|c| c == 'X'), "default repeat-x padding should be all X, got {pad_value}");
+        assert!(
+            pad_value.chars().all(|c| c == 'X'),
+            "default repeat-x padding should be all X, got {pad_value}"
+        );
         let ua = meta
             .headers
             .iter()
@@ -1348,9 +1308,7 @@ mod tests {
     #[test]
     fn build_stream_request_meta_get_when_no_body() {
         let cfg = Config::default();
-        let meta = cfg
-            .build_stream_request_meta("https://example.com/ws", "sess", None)
-            .unwrap();
+        let meta = cfg.build_stream_request_meta("https://example.com/ws", "sess", None).unwrap();
         assert_eq!(meta.method, "GET");
         assert!(meta.body.is_none());
         assert!(!meta.headers.iter().any(|(k, _)| k == "Content-Type"));
@@ -1364,10 +1322,7 @@ mod tests {
             .unwrap();
         assert_eq!(meta.method, "POST");
         assert_eq!(meta.body.as_deref(), Some(&b"hello"[..]));
-        assert!(meta
-            .headers
-            .iter()
-            .any(|(k, v)| k == "Content-Type" && v == "application/grpc"));
+        assert!(meta.headers.iter().any(|(k, v)| k == "Content-Type" && v == "application/grpc"));
     }
 
     #[test]
@@ -1383,10 +1338,7 @@ mod tests {
 
     fn assert_header(h: &[(String, String)], name: &str, value: &str) {
         let found = h.iter().find(|(k, _)| k == name);
-        assert!(
-            found.is_some(),
-            "expected header {name} in {h:?}"
-        );
+        assert!(found.is_some(), "expected header {name} in {h:?}");
         assert_eq!(found.unwrap().1, value, "header {name} value mismatch");
     }
 
@@ -1411,10 +1363,7 @@ mod tests {
 
     #[test]
     fn write_response_header_cookie_placement_adds_credentials() {
-        let cfg = Config {
-            session_placement: PLACEMENT_COOKIE.into(),
-            ..Default::default()
-        };
+        let cfg = Config { session_placement: PLACEMENT_COOKIE.into(), ..Default::default() };
         let headers = http::HeaderMap::new();
         let out = cfg.write_response_header("GET", &headers);
         assert_header(&out, "Access-Control-Allow-Credentials", "true");
@@ -1425,10 +1374,7 @@ mod tests {
         let cfg = Config::default();
         let mut headers = http::HeaderMap::new();
         headers.insert("Access-Control-Request-Method", "POST".parse().unwrap());
-        headers.insert(
-            "Access-Control-Request-Headers",
-            "Content-Type".parse().unwrap(),
-        );
+        headers.insert("Access-Control-Request-Headers", "Content-Type".parse().unwrap());
         let out = cfg.write_response_header("OPTIONS", &headers);
         assert_header(&out, "Access-Control-Allow-Methods", "POST");
         assert_header(&out, "Access-Control-Allow-Headers", "Content-Type");
@@ -1479,7 +1425,10 @@ mod tests {
     #[test]
     fn normalized_session_id_length_defaults_to_zero_when_invalid() {
         // None / from<=0 / 缺失都退化为 {0,0}，让 generate_session_id fallback。
-        assert_eq!(Config::default().normalized_session_id_length(), RangeConfig { from: 0, to: 0 });
+        assert_eq!(
+            Config::default().normalized_session_id_length(),
+            RangeConfig { from: 0, to: 0 }
+        );
         let cfg = Config { session_id_length: Some(RangeConfig::new(0, 8)), ..Default::default() };
         assert_eq!(cfg.normalized_session_id_length(), RangeConfig { from: 0, to: 0 });
         let cfg = Config { session_id_length: Some(RangeConfig::new(-5, 8)), ..Default::default() };
@@ -1500,9 +1449,10 @@ mod tests {
 
     #[test]
     fn generate_session_id_custom_table_returns_chars_in_table_with_length() {
-        // 有 table + length>0：每次返回的字符串每个字节必须是 table 成员，且长度 == length_cfg.rand()。
+        // 有 table + length>0：每次返回的字符串每个字节必须是 table 成员，且长度 ==
+        // length_cfg.rand()。
         let cfg = Config {
-            session_id_table: "ABC".into(), // 字面值字符集
+            session_id_table: "ABC".into(),                  // 字面值字符集
             session_id_length: Some(RangeConfig::new(8, 8)), // 固定 length=8
             ..Default::default()
         };
@@ -1533,10 +1483,7 @@ mod tests {
     #[test]
     fn generate_session_id_length_without_table_falls_back_to_uuid() {
         // 只有 length 没有 table → fallback UUID（Go 行为：table=="" 时走 else 分支）。
-        let cfg = Config {
-            session_id_length: Some(RangeConfig::new(8, 8)),
-            ..Default::default()
-        };
+        let cfg = Config { session_id_length: Some(RangeConfig::new(8, 8)), ..Default::default() };
         let id = cfg.generate_session_id();
         assert!(uuid::Uuid::parse_str(&id).is_ok(), "expected UUID, got {id:?}");
     }
@@ -1572,9 +1519,8 @@ mod tests {
             uplink_chunk_size: Some(RangeConfig::new(64, 64)),
             ..Config::default()
         };
-        let meta = cfg
-            .build_packet_request_meta("http://h/p", "sess", "0", payload.clone())
-            .unwrap();
+        let meta =
+            cfg.build_packet_request_meta("http://h/p", "sess", "0", payload.clone()).unwrap();
         assert!(meta.body.is_none(), "header placement → 无 body");
         let mut chunks: Vec<(u32, &str)> = Vec::new();
         for (k, v) in &meta.headers {
@@ -1585,9 +1531,7 @@ mod tests {
         chunks.sort_by_key(|(i, _)| *i);
         assert_eq!(chunks.len(), 2, "128 字符应分 2 块");
         let joined: String = chunks.iter().map(|(_, v)| *v).collect();
-        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(&joined)
-            .unwrap();
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&joined).unwrap();
         assert_eq!(decoded, payload, "分块 join 后 base64 解码还原 payload");
     }
 
@@ -1601,9 +1545,8 @@ mod tests {
             uplink_chunk_size: Some(RangeConfig::new(64, 64)),
             ..Config::default()
         };
-        let meta = cfg
-            .build_packet_request_meta("http://h/p", "sess", "0", payload.clone())
-            .unwrap();
+        let meta =
+            cfg.build_packet_request_meta("http://h/p", "sess", "0", payload.clone()).unwrap();
         assert!(meta.body.is_none(), "cookie placement → 无 body");
         let mut chunks: Vec<(u32, &str)> = Vec::new();
         for (k, v) in &meta.cookies {
@@ -1614,9 +1557,7 @@ mod tests {
         chunks.sort_by_key(|(i, _)| *i);
         assert_eq!(chunks.len(), 2);
         let joined: String = chunks.iter().map(|(_, v)| *v).collect();
-        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(&joined)
-            .unwrap();
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&joined).unwrap();
         assert_eq!(decoded, payload);
     }
 
@@ -1629,9 +1570,8 @@ mod tests {
                 uplink_data_key: "d".into(),
                 ..Config::default()
             };
-            let meta = cfg
-                .build_packet_request_meta("http://h/p", "sess", "0", payload.clone())
-                .unwrap();
+            let meta =
+                cfg.build_packet_request_meta("http://h/p", "sess", "0", payload.clone()).unwrap();
             assert_eq!(meta.body.as_deref(), Some(payload.as_slice()));
             assert!(!meta.headers.iter().any(|(k, _)| k.starts_with("d-")));
             assert!(!meta.cookies.iter().any(|(k, _)| k.starts_with("d_")));

@@ -1,5 +1,4 @@
 //! VMess Go<->Rust interop tests.
-//!
 // Test scenarios:
 // 1. Go VMess server -> Rust VMess client (wire-level protocol compat)
 // 2. Rust VMess server -> Go VMess client (via Go xray SOCKS5 inbound)
@@ -11,23 +10,27 @@ mod interop_helpers;
 
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-
 use interop_helpers::*;
-use xray_app_dispatcher::default::{DialBridge, SimpleOhm};
-use xray_app_dispatcher::DispatchHandler;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::port::Port;
-use xray_common::protocol::{Command, RequestHeader, SecurityType};
-use xray_common::uuid::UUID;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
+use xray_app_dispatcher::{
+    DispatchHandler,
+    default::{DialBridge, SimpleOhm},
+};
+use xray_common::{
+    net::{address::Address, destination::Destination, port::Port},
+    protocol::{Command, RequestHeader, SecurityType},
+    uuid::UUID,
+};
 use xray_proxy_freedom::make_freedom_dial_fn;
-use xray_proxy_vmess::account::MemoryAccount;
-use xray_proxy_vmess::encoding::client::ClientSession;
-use xray_proxy_vmess::encoding::VERSION;
-use xray_proxy_vmess::validator::{MemoryUser, TimedUserValidator, Validator as VmessValidatorTrait};
-use xray_proxy_vmess::serve_vmess;
+use xray_proxy_vmess::{
+    account::MemoryAccount,
+    encoding::{VERSION, client::ClientSession},
+    serve_vmess,
+    validator::{MemoryUser, TimedUserValidator, Validator as VmessValidatorTrait},
+};
 
 // Fixed UUID for interop tests.
 const SAMPLE_UUID: &str = "66ad4540-b58c-4ad2-9926-ea63445a9b57";
@@ -72,9 +75,7 @@ async fn go_vmess_server_rust_client_chacha20poly1305() {
 
 async fn run_go_server_rust_client(security: SecurityType) {
     // Start HTTP echo server as the target
-    let echo_port = spawn_http_echo_server()
-        .await
-        .expect("start http echo server");
+    let echo_port = spawn_http_echo_server().await.expect("start http echo server");
 
     // Configure Go xray: VMess inbound + freedom outbound
     let vmess_port: u16 = 20001;
@@ -82,15 +83,10 @@ async fn run_go_server_rust_client(security: SecurityType) {
         inbounds: vec![vmess_server_inbound(vmess_port, SAMPLE_UUID)],
         outbounds: vec![freedom_outbound()],
     };
-    let config_path = write_config_to_temp(&config, "go-vmess-server")
-        .expect("write config");
+    let config_path = write_config_to_temp(&config, "go-vmess-server").expect("write config");
 
-    let mut go_proc = start_go_xray(&config_path)
-        .await
-        .expect("start Go xray");
-    wait_for_port(vmess_port, 5000)
-        .await
-        .expect("Go VMess port ready");
+    let mut go_proc = start_go_xray(&config_path).await.expect("start Go xray");
+    wait_for_port(vmess_port, 5000).await.expect("Go VMess port ready");
 
     // Rust VMess client: connect to Go server, send request
     let result = rust_vmess_client_connect(vmess_port, security, echo_port).await;
@@ -115,10 +111,7 @@ async fn rust_vmess_client_connect(
     let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{server_port}")).await?;
 
     let client_session = ClientSession::new();
-    let dest = Destination::tcp(
-        Address::ipv4(std::net::Ipv4Addr::LOCALHOST),
-        Port::new(echo_port),
-    );
+    let dest = Destination::tcp(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(echo_port));
     let header = RequestHeader::new(VERSION, Command::Tcp, dest, security);
 
     let sealed_header = client_session
@@ -186,9 +179,7 @@ async fn rust_vmess_server_go_client_chacha20poly1305() {
 
 async fn run_rust_server_go_client(security: SecurityType) {
     // Start HTTP echo server as target
-    let echo_port = spawn_http_echo_server()
-        .await
-        .expect("start http echo server");
+    let echo_port = spawn_http_echo_server().await.expect("start http echo server");
 
     // Start Rust VMess server
     let ohm = make_vmess_ohm();
@@ -227,27 +218,14 @@ async fn run_rust_server_go_client(security: SecurityType) {
             tag: Some("vmess-out".into()),
         }],
     };
-    let config_path = write_config_to_temp(&config, "go-vmess-client")
-        .expect("write config");
+    let config_path = write_config_to_temp(&config, "go-vmess-client").expect("write config");
 
-    let mut go_proc = start_go_xray(&config_path)
-        .await
-        .expect("start Go xray");
-    wait_for_port(socks_port, 5000)
-        .await
-        .expect("Go SOCKS5 port ready");
+    let mut go_proc = start_go_xray(&config_path).await.expect("start Go xray");
+    wait_for_port(socks_port, 5000).await.expect("Go SOCKS5 port ready");
 
     // Send HTTP request through Go SOCKS5 -> Go VMess -> Rust VMess -> freedom -> echo
-    let proxy_addr = format!("127.0.0.1:{socks_port}")
-        .parse()
-        .expect("parse addr");
-    let result = http_get_via_socks5(
-        proxy_addr,
-        "127.0.0.1",
-        echo_port,
-        "/interop",
-    )
-    .await;
+    let proxy_addr = format!("127.0.0.1:{socks_port}").parse().expect("parse addr");
+    let result = http_get_via_socks5(proxy_addr, "127.0.0.1", echo_port, "/interop").await;
 
     // Cleanup
     let _ = go_proc.kill().await;

@@ -11,19 +11,21 @@
 //!
 //! 1. 扫描 `dns.servers[]` —— 含 `fakedns` 地址时视为启用 FakeDNS；
 //! 2. 按 `dns.queryStrategy` 推断 IPv4/IPv6 开关；
-//! 3. 若启用 FakeDNS 且 `cfg.fake_dns` 缺失，则根据 IPv4/6 开关填充默认 IP 池
-//!    （IPv4 = `198.18.0.0/15`，IPv6 = `fc00::/18`，LRU 默认 `32768`，仅 IPv4
-//!    或 IPv6 时 LRU = `65535`）；
-//! 4. 若启用 FakeDNS 但没有任何 inbound 启用 `destOverride: ["fakedns"|"fakedns+others"]`，
-//!    通过 `tracing::warn!` 记录警告（Go 等价物是 `errors.LogWarning(...)`）。
+//! 3. 若启用 FakeDNS 且 `cfg.fake_dns` 缺失，则根据 IPv4/6 开关填充默认 IP 池 （IPv4 =
+//!    `198.18.0.0/15`，IPv6 = `fc00::/18`，LRU 默认 `32768`，仅 IPv4 或 IPv6 时 LRU = `65535`）；
+//! 4. 若启用 FakeDNS 但没有任何 inbound 启用 `destOverride: ["fakedns"|"fakedns+others"]`， 通过
+//!    `tracing::warn!` 记录警告（Go 等价物是 `errors.LogWarning(...)`）。
 //!
 //! 注意：Rust 端 `dns` 字段当前为 `serde_json::Value` 占位（参见 `config.rs`），
 //! 本阶段以尽力解析的方式扫描；将来 `xray-app-dns` 强类型化后可改写。
 use std::sync::Arc;
 
-use crate::config::Config;
-use crate::lint::{register_stage, LintError, LintStage};
 use xray_common::errors::{print_non_removal_deprecated_feature_warning, removed_feature_message};
+
+use crate::{
+    config::Config,
+    lint::{LintError, LintStage, register_stage},
+};
 /// Go 等价物：`func init() { RegisterConfigureFilePostProcessingStage("FakeDNS", ...) }`
 /// 在 `infra/conf` 包初始化时自动执行。
 pub fn register_builtin_stages() {
@@ -50,36 +52,34 @@ impl LintStage for FakeDnsStage {
         }
 
         // 2. 推断 IPv4/IPv6 开关（默认双开）。
-        let (ipv4, ipv6) = match cfg
-            .dns
-            .as_ref()
-            .and_then(|v| v.get("queryStrategy"))
-            .and_then(|v| v.as_str())
-        {
-            Some(s) if s.eq_ignore_ascii_case("useip4")
-                || s.eq_ignore_ascii_case("useipv4")
-                || s.eq_ignore_ascii_case("use_ip4")
-                || s.eq_ignore_ascii_case("use_ipv4")
-                || s.eq_ignore_ascii_case("use_ip_v4")
-                || s.eq_ignore_ascii_case("use-ip4")
-                || s.eq_ignore_ascii_case("use-ipv4")
-                || s.eq_ignore_ascii_case("use-ip-v4") =>
-            {
-                (true, false)
-            }
-            Some(s) if s.eq_ignore_ascii_case("useip6")
-                || s.eq_ignore_ascii_case("useipv6")
-                || s.eq_ignore_ascii_case("use_ip6")
-                || s.eq_ignore_ascii_case("use_ipv6")
-                || s.eq_ignore_ascii_case("use_ip_v6")
-                || s.eq_ignore_ascii_case("use-ip6")
-                || s.eq_ignore_ascii_case("use-ipv6")
-                || s.eq_ignore_ascii_case("use-ip-v6") =>
-            {
-                (false, true)
-            }
-            _ => (true, true),
-        };
+        let (ipv4, ipv6) =
+            match cfg.dns.as_ref().and_then(|v| v.get("queryStrategy")).and_then(|v| v.as_str()) {
+                Some(s)
+                    if s.eq_ignore_ascii_case("useip4")
+                        || s.eq_ignore_ascii_case("useipv4")
+                        || s.eq_ignore_ascii_case("use_ip4")
+                        || s.eq_ignore_ascii_case("use_ipv4")
+                        || s.eq_ignore_ascii_case("use_ip_v4")
+                        || s.eq_ignore_ascii_case("use-ip4")
+                        || s.eq_ignore_ascii_case("use-ipv4")
+                        || s.eq_ignore_ascii_case("use-ip-v4") =>
+                {
+                    (true, false)
+                },
+                Some(s)
+                    if s.eq_ignore_ascii_case("useip6")
+                        || s.eq_ignore_ascii_case("useipv6")
+                        || s.eq_ignore_ascii_case("use_ip6")
+                        || s.eq_ignore_ascii_case("use_ipv6")
+                        || s.eq_ignore_ascii_case("use_ip_v6")
+                        || s.eq_ignore_ascii_case("use-ip6")
+                        || s.eq_ignore_ascii_case("use-ipv6")
+                        || s.eq_ignore_ascii_case("use-ip-v6") =>
+                {
+                    (false, true)
+                },
+                _ => (true, true),
+            };
 
         // 3. FakeDNS 已配置 → 不覆盖；未配置 → 按 IPv4/6 开关填默认池。
         // Go fakedns.go:94-118：双开 = pools[198.18.0.0/15 + fc00::/18] 各
@@ -90,20 +90,16 @@ impl LintStage for FakeDnsStage {
                 ip_pool: Some("198.18.0.0/15".into()),
                 pool_size: Some(32768),
             };
-            let v6 = || FakeDnsPoolElement {
-                ip_pool: Some("fc00::/18".into()),
-                pool_size: Some(32768),
-            };
+            let v6 =
+                || FakeDnsPoolElement { ip_pool: Some("fc00::/18".into()), pool_size: Some(32768) };
             let single = |pool: &str| FakeDnsConfig {
                 ip_pool: Some(pool.into()),
                 pool_size: Some(65535),
                 pools: None,
             };
             cfg.fake_dns = Some(match (ipv4, ipv6) {
-                (true, true) => FakeDnsConfig {
-                    ip_pool: None,
-                    pool_size: None,
-                    pools: Some(vec![v4(), v6()]),
+                (true, true) => {
+                    FakeDnsConfig { ip_pool: None, pool_size: None, pools: Some(vec![v4(), v6()]) }
                 },
                 (false, true) => single("fc00::/18"),
                 (true, false) => single("198.18.0.0/15"),
@@ -116,7 +112,8 @@ impl LintStage for FakeDnsStage {
             ib.sniffing.as_ref().is_some_and(|sn| {
                 sn.enabled
                     && sn.dest_override.0.iter().any(|d| {
-                        d.eq_ignore_ascii_case("fakedns") || d.eq_ignore_ascii_case("fakedns+others")
+                        d.eq_ignore_ascii_case("fakedns")
+                            || d.eq_ignore_ascii_case("fakedns+others")
                     })
             })
         });
@@ -134,16 +131,15 @@ impl LintStage for FakeDnsStage {
 
 /// Build 期校验：捕获三处 Go 硬错 Rust 静默的配置形态（2cq2）。
 ///
-/// 1. `inbounds[].sniffing.destOverride[]` 含未知协议——Go `SniffingConfig.Build`
-///    对每个 protocol 做 `switch`，未知值 `errors.New("unknown protocol: ...")`
-///    启动期硬拒。Rust 已在 wiring.rs 归一化已知别名（https/ssl→tls 等，va51①），
-///    未知值仍由此处硬拒（wiring 归一化对未知值透传保持零行为差）。
-/// 2. `outbounds[].mux.xudpProxyUDP443` 非法值（不在 `{reject, allow, skip}`）—
-///    Go `MuxConfig.Build` 直接返回错误；Rust `Udp443Policy::from_mux` 返回 None
-///    并被 `tracing::warn` 忽略（outbound.rs:516-518），降级为无策略。
-/// 3. `burstObservatory` 启用但 `pingConfig` 缺失——Go `BurstObservatoryConfig.Build`
-///    必拒；Rust `burst_observatory_factory` 把 None 透传给 feature，启动后跑无
-///    配置的观测循环。
+/// 1. `inbounds[].sniffing.destOverride[]` 含未知协议——Go `SniffingConfig.Build` 对每个 protocol 做
+///    `switch`，未知值 `errors.New("unknown protocol: ...")` 启动期硬拒。Rust 已在 wiring.rs
+///    归一化已知别名（https/ssl→tls 等，va51①）， 未知值仍由此处硬拒（wiring
+///    归一化对未知值透传保持零行为差）。
+/// 2. `outbounds[].mux.xudpProxyUDP443` 非法值（不在 `{reject, allow, skip}`）— Go
+///    `MuxConfig.Build` 直接返回错误；Rust `Udp443Policy::from_mux` 返回 None 并被 `tracing::warn`
+///    忽略（outbound.rs:516-518），降级为无策略。
+/// 3. `burstObservatory` 启用但 `pingConfig` 缺失——Go `BurstObservatoryConfig.Build` 必拒；Rust
+///    `burst_observatory_factory` 把 None 透传给 feature，启动后跑无 配置的观测循环。
 ///
 /// 阶段名 `Validation` 与 Go `RegisterConfigureFilePostProcessingStage` 命名风格一致。
 pub struct ValidationStage;
@@ -198,16 +194,26 @@ impl LintStage for ValidationStage {
         }
 
         // 4. 三级严格度硬错（bd 5x41/1c4z，Go v26.9.9 feature_errors.go:9-31）：
-        //    streamSettings.network 已移除/弃用 transport + tlsSettings.allowInsecure
-        //    硬错 + hysteria version != 2 三处硬错。
+        //    streamSettings.network 已移除/弃用 transport + tlsSettings.allowInsecure 硬错 +
+        //    hysteria version != 2 三处硬错。
         for ib in &cfg.inbound_configs {
-            check_hysteria_protocol_version("inbound", &ib.tag, &ib.protocol, ib.settings.as_ref())?;
+            check_hysteria_protocol_version(
+                "inbound",
+                &ib.tag,
+                &ib.protocol,
+                ib.settings.as_ref(),
+            )?;
             if let Some(ss) = ib.stream_settings.as_ref() {
                 check_stream_strictness("inbound", &ib.tag, ss)?;
             }
         }
         for ob in &cfg.outbound_configs {
-            check_hysteria_protocol_version("outbound", &ob.tag, &ob.protocol, ob.settings.as_ref())?;
+            check_hysteria_protocol_version(
+                "outbound",
+                &ob.tag,
+                &ob.protocol,
+                ob.settings.as_ref(),
+            )?;
             if let Some(ss) = ob.stream_settings.as_ref() {
                 check_stream_strictness("outbound", &ob.tag, ss)?;
             }
@@ -243,7 +249,7 @@ fn check_stream_strictness(kind: &str, tag: &str, ss: &serde_json::Value) -> Res
                     "XHTTP stream-one H2 & H3"
                 )
             )));
-        }
+        },
         "grpc" => print_non_removal_deprecated_feature_warning(
             "gRPC transport (with unnecessary costs, etc.)",
             "XHTTP stream-up H2",
@@ -256,15 +262,13 @@ fn check_stream_strictness(kind: &str, tag: &str, ss: &serde_json::Value) -> Res
             "HTTPUpgrade transport (with ALPN http/1.1, etc.)",
             "XHTTP H2 & H3",
         ),
-        _ => {}
+        _ => {},
     }
 
-    // 2) allowInsecure：tls security 下硬错。pinnedPeerCertSha256 /
-    //    verifyPeerCertByName 不受影响（运行时继续支持，Go transport_security.go:364-389）。
-    let is_tls = ss
-        .get("security")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| s.eq_ignore_ascii_case("tls"));
+    // 2) allowInsecure：tls security 下硬错。pinnedPeerCertSha256 / verifyPeerCertByName
+    //    不受影响（运行时继续支持，Go transport_security.go:364-389）。
+    let is_tls =
+        ss.get("security").and_then(|v| v.as_str()).is_some_and(|s| s.eq_ignore_ascii_case("tls"));
     if is_tls
         && ss
             .get("tlsSettings")
@@ -334,12 +338,7 @@ fn dns_servers_use_fakedns(cfg: &Config) -> bool {
         let addr = server
             .as_str()
             .map(str::to_owned)
-            .or_else(|| {
-                server
-                    .get("address")
-                    .and_then(|a| a.as_str())
-                    .map(str::to_owned)
-            });
+            .or_else(|| server.get("address").and_then(|a| a.as_str()).map(str::to_owned));
         if let Some(a) = addr {
             // Go FakeDNSPostProcessingStage 判定：address.Family() == Domain
             // 且 domain == "fakedns"（大小写不敏感）。
@@ -353,11 +352,10 @@ fn dns_servers_use_fakedns(cfg: &Config) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::lint::clear_stages;
-    use crate::lint::tests::TEST_LOCK;
-    use crate::lint::{post_process, registered_stages};
     use serde_json::json;
+
+    use super::*;
+    use crate::lint::{clear_stages, post_process, registered_stages, tests::TEST_LOCK};
 
     #[test]
     fn register_builtin_stages_records_fakedns() {
@@ -365,10 +363,7 @@ mod tests {
         clear_stages();
         register_builtin_stages();
         let names = registered_stages();
-        assert!(
-            names.contains(&"FakeDNS"),
-            "FakeDNS stage should be registered, got {names:?}"
-        );
+        assert!(names.contains(&"FakeDNS"), "FakeDNS stage should be registered, got {names:?}");
     }
 
     #[test]
@@ -630,7 +625,6 @@ mod tests {
         assert!(msg.contains("bogus"), "got: {msg}");
     }
 
-
     #[test]
     fn validation_silent_on_valid_xudp_proxy_udp443() {
         let _g = TEST_LOCK.lock();
@@ -646,11 +640,11 @@ mod tests {
                     ..Default::default()
                 }),
                 ..Default::default()
-             }],
+            }],
             ..Default::default()
-         };
-         post_process(&mut cfg).unwrap();
-     }
+        };
+        post_process(&mut cfg).unwrap();
+    }
 
     #[test]
     fn validation_rejects_burst_missing_ping_config() {
@@ -665,7 +659,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let err = post_process(&mut cfg).expect_err("burstObservatory w/o pingConfig must be rejected");
+        let err =
+            post_process(&mut cfg).expect_err("burstObservatory w/o pingConfig must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("pingConfig"), "got: {msg}");
     }
@@ -678,30 +673,36 @@ mod tests {
         register_builtin_stages();
         // 入站与出站的 streamSettings 都要拒；security 大小写不敏感。
         let cases = [
-            ("inbound", Config {
-                inbound_configs: vec![crate::config::InboundDetourConfig {
-                    protocol: "vless".into(),
-                    tag: "in".into(),
-                    stream_settings: Some(json!({
-                        "network": "tcp", "security": "tls",
-                        "tlsSettings": {"allowInsecure": true}
-                    })),
+            (
+                "inbound",
+                Config {
+                    inbound_configs: vec![crate::config::InboundDetourConfig {
+                        protocol: "vless".into(),
+                        tag: "in".into(),
+                        stream_settings: Some(json!({
+                            "network": "tcp", "security": "tls",
+                            "tlsSettings": {"allowInsecure": true}
+                        })),
+                        ..Default::default()
+                    }],
                     ..Default::default()
-                }],
-                ..Default::default()
-            }),
-            ("outbound", Config {
-                outbound_configs: vec![crate::config::OutboundDetourConfig {
-                    protocol: "vless".into(),
-                    tag: "ob".into(),
-                    stream_settings: Some(json!({
-                        "network": "ws", "security": "TLS",
-                        "tlsSettings": {"allowInsecure": true, "serverName": "x"}
-                    })),
+                },
+            ),
+            (
+                "outbound",
+                Config {
+                    outbound_configs: vec![crate::config::OutboundDetourConfig {
+                        protocol: "vless".into(),
+                        tag: "ob".into(),
+                        stream_settings: Some(json!({
+                            "network": "ws", "security": "TLS",
+                            "tlsSettings": {"allowInsecure": true, "serverName": "x"}
+                        })),
+                        ..Default::default()
+                    }],
                     ..Default::default()
-                }],
-                ..Default::default()
-            }),
+                },
+            ),
         ];
         for (kind, mut cfg) in cases {
             let err = post_process(&mut cfg)
@@ -802,9 +803,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        let err = post_process(&mut cfg)
-            .err()
-            .expect("hysteria client version != 2 must be rejected");
+        let err =
+            post_process(&mut cfg).err().expect("hysteria client version != 2 must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("version"), "got: {msg}");
         assert!(msg.contains("version != 2"), "got: {msg}");
@@ -857,9 +857,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        let err = post_process(&mut cfg)
-            .err()
-            .expect("hysteria server version != 2 must be rejected");
+        let err =
+            post_process(&mut cfg).err().expect("hysteria server version != 2 must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("version"), "got: {msg}");
     }
@@ -882,9 +881,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        let err = post_process(&mut cfg)
-            .err()
-            .expect("hysteriaSettings version != 2 must be rejected");
+        let err =
+            post_process(&mut cfg).err().expect("hysteriaSettings version != 2 must be rejected");
         assert!(err.to_string().contains("version"), "got: {err}");
         // version=2 正例。
         cfg.inbound_configs[0].stream_settings = Some(json!({

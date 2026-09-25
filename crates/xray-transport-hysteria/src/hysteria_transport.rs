@@ -14,13 +14,19 @@
 //! 参考：librarian 调研 hyproxy/hysteria 1.x 协议 + Xray Go
 //! `transport/internet/hysteria/dialer.go`。
 
-use std::{io, net::SocketAddr, pin::Pin, sync::{Arc, LazyLock}};
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::{Arc, LazyLock},
+};
 
 use quinn::{
     ClientConfig as QuinnClientConfig, Connection as QuinnConnection, Endpoint,
     crypto::rustls::QuicClientConfig,
 };
-use rustls::client::{ClientSessionStore, ClientSessionMemoryCache};
+use rustls::client::{ClientSessionMemoryCache, ClientSessionStore};
+
 use crate::salamander_socket::UdpObfs;
 
 /// 进程级 hysteria client TLS 会话缓存，容量 128 对齐 Go `globalSessionCache`
@@ -77,8 +83,10 @@ impl QuinnHysteriaTransport {
         // （store=NoClientSessionStorage），此处尊重禁用不覆盖——该 transport 恒走 1-RTT。
         // Debug 字符串检测与 xray-tls client_config.rs 测试先例同款（Resumption 无 pub 字段）。
         if !format!("{:?}", tls_config.resumption).contains("NoClientSessionStorage") {
-            tls_config.resumption =
-                rustls::client::Resumption::store(Arc::clone(&GLOBAL_CLIENT_SESSION_STORE) as Arc<dyn ClientSessionStore>);
+            tls_config.resumption = rustls::client::Resumption::store(Arc::clone(
+                &GLOBAL_CLIENT_SESSION_STORE,
+            )
+                as Arc<dyn ClientSessionStore>);
         }
         let quic = QuicClientConfig::try_from(Arc::new(tls_config))
             .map_err(|e| io::Error::other(format!("quinn QuicClientConfig: {e}")))?;
@@ -99,10 +107,7 @@ impl QuinnHysteriaTransport {
 
     /// 注入 QUIC 端点 socket 选项（UDP 缓冲调谐；builder 风格）。
     #[must_use]
-    pub fn with_sockopt(
-        mut self,
-        sockopt: xray_transport::sockopt::SocketOptions,
-    ) -> Self {
+    pub fn with_sockopt(mut self, sockopt: xray_transport::sockopt::SocketOptions) -> Self {
         self.sockopt = sockopt;
         self
     }
@@ -146,11 +151,11 @@ impl HysteriaTransport for QuinnHysteriaTransport {
             };
             endpoint.set_default_client_config(client_config);
 
-            // 2. QUIC 拨号（Go dialer.go:154 `tr.DialEarly` parity）：store 有会话票据时
-            //    into_0rtt 立即返回连接，h3 auth 在 0-RTT 中发出（省 1-RTT）；首连/禁用
-            //    resumption 时 Err → 正常等 1-RTT。0-RTT 被服务端拒绝时 auth 流报
-            //    ZeroRttRejected，dial 失败交上层重连——与 Go quic-go Err0RTTRejected →
-            //    dial 返回 err → clientManager 重连同型，不加额外重试。
+            // 2. QUIC 拨号（Go dialer.go:154 `tr.DialEarly` parity）：store 有会话票据时 into_0rtt
+            //    立即返回连接，h3 auth 在 0-RTT 中发出（省 1-RTT）；首连/禁用 resumption 时 Err →
+            //    正常等 1-RTT。0-RTT 被服务端拒绝时 auth 流报 ZeroRttRejected，dial
+            //    失败交上层重连——与 Go quic-go Err0RTTRejected → dial 返回 err → clientManager
+            //    重连同型，不加额外重试。
             let connecting = endpoint
                 .connect(dest_addr, &host)
                 .map_err(|e| io::Error::other(format!("quinn connect initiate: {e}")))?;
@@ -159,9 +164,9 @@ impl HysteriaTransport for QuinnHysteriaTransport {
                     tracing::debug!("hysteria dialing with 0-RTT attempt");
                     conn
                 },
-                Err(connecting) => connecting
-                    .await
-                    .map_err(|e| io::Error::other(format!("quinn connect: {e}")))?,
+                Err(connecting) => {
+                    connecting.await.map_err(|e| io::Error::other(format!("quinn connect: {e}")))?
+                },
             };
 
             // 3. h3 client 发 POST /auth，返回保活项（driver + SendRequest）防止 h3 关闭 QUIC
@@ -356,8 +361,8 @@ mod tests {
 
     /// 0-RTT 测试共用：自签证书 + QuinnListenerFactory server（auth="test-secret"）。
     /// 返回 (server_addr, listener, client_trust_anchors)；listener 须保活至断言结束。
-    async fn spawn_auth_server(
-    ) -> io::Result<(SocketAddr, Arc<dyn crate::hub::HysteriaQuicListener>, rustls::RootCertStore)>
+    async fn spawn_auth_server()
+    -> io::Result<(SocketAddr, Arc<dyn crate::hub::HysteriaQuicListener>, rustls::RootCertStore)>
     {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert_der = cert.cert.der().clone();
@@ -415,9 +420,8 @@ mod tests {
         ensure_crypto_provider();
         let (addr, _listener, trust) = spawn_auth_server().await.unwrap();
 
-        let client_tls = rustls::ClientConfig::builder()
-            .with_root_certificates(trust)
-            .with_no_client_auth();
+        let client_tls =
+            rustls::ClientConfig::builder().with_root_certificates(trust).with_no_client_auth();
         // xray_tls 对 enableSessionResumption=false 的等价形态：Resumption::disabled()
         let client_tls = {
             let mut c = client_tls;
@@ -447,9 +451,8 @@ mod tests {
         let dest = DialDestination { udp_addr: addr, host: "localhost".into() };
         let qc = crate::dialer::QuicConfig::default_for_hysteria();
 
-        let client_tls = rustls::ClientConfig::builder()
-            .with_root_certificates(trust)
-            .with_no_client_auth();
+        let client_tls =
+            rustls::ClientConfig::builder().with_root_certificates(trust).with_no_client_auth();
         let transport = Arc::new(
             QuinnHysteriaTransport::new(client_tls, "0.0.0.0:0".parse().unwrap())
                 .expect("transport"),

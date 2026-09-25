@@ -3,8 +3,8 @@
 //! 对应 Go `proxy/tun/stack.go` 的 gVisor netstack。Rust 用 [`smoltcp`] 等价：
 //!
 //! - [`TunNetStack`] 持有 smoltcp [`Interface`] + 虚拟 [`VirtualDevice`]（rx/tx FIFO）
-//! - [`VirtualDevice`] 实现 smoltcp `phy::Device` trait，rx 端 = TUN 设备读出的 IP 包，
-//!   tx 端 = smoltcp 欲发送的 IP 包（直接写回 TUN 设备）
+//! - [`VirtualDevice`] 实现 smoltcp `phy::Device` trait，rx 端 = TUN 设备读出的 IP 包， tx 端 =
+//!   smoltcp 欲发送的 IP 包（直接写回 TUN 设备）
 //! - 通过 [`TunNetStack::ingest_rx`] 投递 TUN 读出的 IP 包
 //! - 通过 [`TunNetStack::drain_tx`] 取出 smoltcp 要发的 IP 包
 //! - 通过 [`TunNetStack::poll`] 驱动 smoltcp 协议栈（处理 TCP/UDP socket 状态）
@@ -16,15 +16,15 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::{self, DeviceCapabilities, Medium};
-use smoltcp::socket::icmp;
-use smoltcp::socket::tcp;
-use smoltcp::socket::udp;
-use smoltcp::time::Instant;
-use smoltcp::wire::{
-    HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv4Packet, Ipv4Repr,
-    Ipv6Address, Ipv6Packet, Ipv6Repr, IpProtocol, UdpPacket, UdpRepr,
+use smoltcp::{
+    iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet},
+    phy::{self, DeviceCapabilities, Medium},
+    socket::{icmp, tcp, udp},
+    time::Instant,
+    wire::{
+        HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpProtocol, Ipv4Address, Ipv4Packet,
+        Ipv4Repr, Ipv6Address, Ipv6Packet, Ipv6Repr, UdpPacket, UdpRepr,
+    },
 };
 
 /// smoltcp 协议栈 poll 一次处理的最大 RX 包数。
@@ -101,14 +101,14 @@ impl TunNetStack {
         });
         iface.set_any_ip(true);
 
-let mut stack = Self {
-iface,
-device,
-// ponytail: SocketSet 用 Vec 作 backing storage，'static bound 由 alloc 满足
+        let mut stack = Self {
+            iface,
+            device,
+            // ponytail: SocketSet 用 Vec 作 backing storage，'static bound 由 alloc 满足
             sockets: SocketSet::new(Vec::new()),
             icmp_handle: SocketHandle::default(),
             tcp_listens: HashMap::new(),
-};
+        };
 
         // 自动创建 ICMP socket 并绑定到 ident 0——smoltcp 收到 ICMP echo request 时
         // 通过 ICMP socket 传递到上层（对应 Go stackGVisor 的 handleICMPEchoPacket）。
@@ -320,9 +320,7 @@ device,
         port: u16,
     ) -> Result<(), crate::error::TunError> {
         let socket = self.sockets.get_mut::<udp::Socket<'static>>(handle);
-        socket
-            .bind(port)
-            .map_err(|e| crate::error::TunError::UdpBindFailed(format!("{e:?}")))
+        socket.bind(port).map_err(|e| crate::error::TunError::UdpBindFailed(format!("{e:?}")))
     }
 
     /// 检查所有惰性 listen socket 是否有新连接已 accept（票 ipb5）。
@@ -349,11 +347,7 @@ device,
             };
             // accept 完成：从 listen 缓存摘除（同 dst 的下一个 SYN 会重建 listen）
             self.tcp_listens.retain(|_, h| *h != handle);
-            events.push(TcpAcceptEvent {
-                handle,
-                local,
-                remote,
-            });
+            events.push(TcpAcceptEvent { handle, local, remote });
         }
         events
     }
@@ -389,7 +383,7 @@ device,
                     local_port,
                     payload: buf,
                 })
-            }
+            },
             Err(_) => None,
         }
     }
@@ -418,7 +412,6 @@ device,
         &mut self.iface
     }
 }
-
 
 // ===== 事件检测：poll 后检查 socket 状态变化 =====
 
@@ -476,11 +469,7 @@ pub struct VirtualDevice {
 impl VirtualDevice {
     #[must_use]
     pub fn new(mtu: usize) -> Self {
-        Self {
-            mtu,
-            rx_queue: VecDeque::new(),
-            tx_queue: VecDeque::new(),
-        }
+        Self { mtu, rx_queue: VecDeque::new(), tx_queue: VecDeque::new() }
     }
 }
 
@@ -529,24 +518,26 @@ unsafe impl Send for VirtualDevice {}
 unsafe impl Sync for VirtualDevice {}
 
 impl phy::Device for VirtualDevice {
-    type RxToken<'a> = VirtRxToken where Self: 'a;
-    type TxToken<'a> = VirtTxToken where Self: 'a;
+    type RxToken<'a>
+        = VirtRxToken
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = VirtTxToken
+    where
+        Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         // 取一个 RX 包，同时给一个 TX token（用于立即回包，如 ICMP echo reply）
         self.rx_queue.pop_front().map(|packet| {
-            let tx_token = VirtTxToken {
-                tx_queue_ptr: &mut self.tx_queue as *mut _,
-            };
+            let tx_token = VirtTxToken { tx_queue_ptr: &mut self.tx_queue as *mut _ };
             (VirtRxToken { packet }, tx_token)
         })
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         // 始终允许发送（缓冲在 VecDeque 中）
-        Some(VirtTxToken {
-            tx_queue_ptr: &mut self.tx_queue as *mut _,
-        })
+        Some(VirtTxToken { tx_queue_ptr: &mut self.tx_queue as *mut _ })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -590,7 +581,7 @@ pub struct UdpPacketMeta {
 ///
 /// smoltcp 0.12 的 `udp::Socket::bind` 禁止 port 0（`BindError::Unaddressable`，
 /// `socket/udp.rs:222`），且 `accepts` 严格匹配 `endpoint.port == dst_port`
-///（`iface/interface/udp.rs:481`）——无法"接收任意端口的 UDP"。TUN 的语义是
+/// （`iface/interface/udp.rs:481`）——无法"接收任意端口的 UDP"。TUN 的语义是
 /// 截获所有进站 UDP，必须在 IP 层解析。
 ///
 /// TCP 的同款限制（`listen(0)==Err(Unaddressable)`）由 [`parse_tcp_syn_dst`] +
@@ -609,7 +600,8 @@ pub fn parse_udp_packet(pkt: &[u8]) -> Option<(UdpPacketMeta, &[u8])> {
     match version {
         4 => {
             let packet = Ipv4Packet::new_checked(pkt).ok()?;
-            let repr = Ipv4Repr::parse(&packet, &smoltcp::phy::ChecksumCapabilities::ignored()).ok()?;
+            let repr =
+                Ipv4Repr::parse(&packet, &smoltcp::phy::ChecksumCapabilities::ignored()).ok()?;
             if repr.next_header != IpProtocol::Udp {
                 return None;
             }
@@ -631,7 +623,7 @@ pub fn parse_udp_packet(pkt: &[u8]) -> Option<(UdpPacketMeta, &[u8])> {
                 dst: IpEndpoint::new(IpAddress::Ipv4(repr.dst_addr), udp_repr.dst_port),
             };
             Some((meta, udp_pkt.payload()))
-        }
+        },
         6 => {
             let packet = Ipv6Packet::new_checked(pkt).ok()?;
             let repr = Ipv6Repr::parse(&packet).ok()?;
@@ -656,7 +648,7 @@ pub fn parse_udp_packet(pkt: &[u8]) -> Option<(UdpPacketMeta, &[u8])> {
                 dst: IpEndpoint::new(IpAddress::Ipv6(repr.dst_addr), udp_repr.dst_port),
             };
             Some((meta, udp_pkt.payload()))
-        }
+        },
         _ => None,
     }
 }
@@ -681,20 +673,27 @@ pub fn parse_tcp_syn_dst(pkt: &[u8]) -> Option<IpEndpoint> {
     match version {
         4 => {
             let packet = Ipv4Packet::new_checked(pkt).ok()?;
-            let repr = Ipv4Repr::parse(&packet, &smoltcp::phy::ChecksumCapabilities::ignored()).ok()?;
+            let repr =
+                Ipv4Repr::parse(&packet, &smoltcp::phy::ChecksumCapabilities::ignored()).ok()?;
             if repr.next_header != IpProtocol::Tcp {
                 return None;
             }
-            parse_syn_dst_from_tcp_header(&pkt[packet.header_len() as usize..], repr.dst_addr.into())
-        }
+            parse_syn_dst_from_tcp_header(
+                &pkt[packet.header_len() as usize..],
+                repr.dst_addr.into(),
+            )
+        },
         6 => {
             let packet = Ipv6Packet::new_checked(pkt).ok()?;
             let repr = Ipv6Repr::parse(&packet).ok()?;
             if repr.next_header != IpProtocol::Tcp {
                 return None;
             }
-            parse_syn_dst_from_tcp_header(&pkt[packet.header_len() as usize..], repr.dst_addr.into())
-        }
+            parse_syn_dst_from_tcp_header(
+                &pkt[packet.header_len() as usize..],
+                repr.dst_addr.into(),
+            )
+        },
         _ => None,
     }
 }
@@ -714,7 +713,6 @@ fn parse_syn_dst_from_tcp_header(tcp: &[u8], dst_addr: IpAddress) -> Option<IpEn
     let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
     Some(IpEndpoint::new(dst_addr, dst_port))
 }
-
 
 /// 构造 UDP 响应 IP 包（IPv4/IPv6，src/dst 已交换）。
 ///
@@ -757,7 +755,7 @@ pub fn build_udp_response(
                 &smoltcp::phy::ChecksumCapabilities::ignored(),
             );
             buf
-        }
+        },
         (IpAddress::Ipv6(s6), IpAddress::Ipv6(d6)) => {
             let udp_repr = UdpRepr { src_port, dst_port };
             let ip_repr = Ipv6Repr {
@@ -780,7 +778,7 @@ pub fn build_udp_response(
                 &smoltcp::phy::ChecksumCapabilities::ignored(),
             );
             buf
-        }
+        },
         _ => panic!("build_udp_response: src/dst IP family mismatch"),
     }
 }
@@ -954,7 +952,13 @@ mod tests {
 
     // ===== parse_udp_packet / build_udp_response（bd 9wc） =====
 
-    fn make_ipv4_udp_packet(src_ip: [u8; 4], src_port: u16, dst_ip: [u8; 4], dst_port: u16, payload: &[u8]) -> Vec<u8> {
+    fn make_ipv4_udp_packet(
+        src_ip: [u8; 4],
+        src_port: u16,
+        dst_ip: [u8; 4],
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
         // IPv4 header (20) + UDP header (8) + payload
         let total = 20 + 8 + payload.len();
         let mut pkt = vec![0u8; total];
@@ -1017,7 +1021,13 @@ mod tests {
         let (req_meta, req_payload) = parse_udp_packet(&req).expect("parse req");
         assert_eq!(req_payload, b"dns-query");
 
-        let reply = build_udp_response(req_meta.dst.addr, req_meta.dst.port, req_meta.src.addr, req_meta.src.port, req_payload);
+        let reply = build_udp_response(
+            req_meta.dst.addr,
+            req_meta.dst.port,
+            req_meta.src.addr,
+            req_meta.src.port,
+            req_payload,
+        );
         let (resp_meta, resp_payload) = parse_udp_packet(&reply).expect("parse resp");
         // 响应的 src 应是请求的 dst；响应的 dst 应是请求的 src
         assert_eq!(resp_meta.src.addr, req_meta.dst.addr);
@@ -1032,7 +1042,8 @@ mod tests {
         // 构造 IPv6 + UDP 包（简化版：只用 Ipv6Repr emit 路径）
         let s6 = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
         let d6 = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
-        let reply = build_udp_response(IpAddress::Ipv6(s6), 53, IpAddress::Ipv6(d6), 33333, b"v6-payload");
+        let reply =
+            build_udp_response(IpAddress::Ipv6(s6), 53, IpAddress::Ipv6(d6), 33333, b"v6-payload");
         assert!(reply[0] >> 4 == 6, "not IPv6");
         let (meta, payload) = parse_udp_packet(&reply).expect("parse v6 reply");
         assert_eq!(meta.src.addr, IpAddress::Ipv6(s6));
@@ -1046,8 +1057,13 @@ mod tests {
 
     /// 构造测试用 IPv4+TCP 包（无校验和——VirtualDevice caps 全 ignored）。
     fn make_ipv4_tcp_packet(
-        src_ip: [u8; 4], src_port: u16, dst_ip: [u8; 4], dst_port: u16,
-        seq: u32, ack: u32, flags: u8,
+        src_ip: [u8; 4],
+        src_port: u16,
+        dst_ip: [u8; 4],
+        dst_port: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
     ) -> Vec<u8> {
         let total = 20 + 20;
         let mut pkt = vec![0u8; total];
@@ -1070,7 +1086,11 @@ mod tests {
 
     /// 构造测试用 IPv6+TCP 包（无扩展头）。
     fn make_ipv6_tcp_packet(
-        src: Ipv6Address, src_port: u16, dst: Ipv6Address, dst_port: u16, flags: u8,
+        src: Ipv6Address,
+        src_port: u16,
+        dst: Ipv6Address,
+        dst_port: u16,
+        flags: u8,
     ) -> Vec<u8> {
         let mut pkt = vec![0u8; 40 + 20];
         pkt[0] = 0x60; // version 6
@@ -1090,8 +1110,13 @@ mod tests {
     #[test]
     fn parse_tcp_syn_dst_ipv4_extracts_dst() {
         let pkt = make_ipv4_tcp_packet(
-            [10, 0, 0, 2], 40000, [93, 184, 216, 34], 443,
-            1000, 0, 0x02, // SYN
+            [10, 0, 0, 2],
+            40000,
+            [93, 184, 216, 34],
+            443,
+            1000,
+            0,
+            0x02, // SYN
         );
         let dst = parse_tcp_syn_dst(&pkt).expect("parse SYN");
         assert_eq!(dst.addr, IpAddress::Ipv4(Ipv4Address::new(93, 184, 216, 34)));
@@ -1113,7 +1138,8 @@ mod tests {
         // 纯 ACK（0x10）与 SYN-ACK（0x12）都不触发注册
         let ack = make_ipv4_tcp_packet([10, 0, 0, 2], 40000, [1, 2, 3, 4], 443, 1001, 2000, 0x10);
         assert!(parse_tcp_syn_dst(&ack).is_none());
-        let synack = make_ipv4_tcp_packet([10, 0, 0, 2], 40000, [1, 2, 3, 4], 443, 1000, 2000, 0x12);
+        let synack =
+            make_ipv4_tcp_packet([10, 0, 0, 2], 40000, [1, 2, 3, 4], 443, 1000, 2000, 0x12);
         assert!(parse_tcp_syn_dst(&synack).is_none());
     }
 
@@ -1131,4 +1157,3 @@ mod tests {
         assert!(parse_tcp_syn_dst(&pkt).is_none());
     }
 }
-

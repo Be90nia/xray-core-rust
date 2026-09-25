@@ -17,25 +17,29 @@
 //! 通过 [`crate::pool::QuinnConnectionPool`] 复用 QUIC 连接，避免每次 dial 新建 endpoint。
 //! 连接池 key = (server_addr, server_name, alpn)。
 
-use crate::pool::{MultiplexedConnection, PoolKey, QuinnConnectionPool, ReconnectingConnection};
-use crate::udp::TuicUdpAssoc;
-use std::net::SocketAddr;
-use std::net::ToSocketAddrs;
-use std::sync::Arc;
+use std::{
+    net::{SocketAddr, ToSocketAddrs},
+    sync::Arc,
+};
 
 use bytes::{BufMut, BytesMut};
 use uuid::Uuid;
 
-use crate::error::{Result, TuicError};
-use crate::protocol::address::Address;
-use crate::protocol::command::TOKEN_LEN;
-use crate::protocol::command::type_code;
-use crate::udp::UniRespRouter;
+use crate::{
+    error::{Result, TuicError},
+    pool::{MultiplexedConnection, PoolKey, QuinnConnectionPool, ReconnectingConnection},
+    protocol::{
+        address::Address,
+        command::{TOKEN_LEN, type_code},
+    },
+    udp::{TuicUdpAssoc, UniRespRouter},
+};
 
 /// 拥塞控制算法（官方 tuic-client `congestion_control`）。
 ///
 /// `Bbr`/`Cubic`/`NewReno` 为 quinn 内建实现；`HysteriaBbr`/`HysteriaBrutal`
-/// 为 hysteria 翻译版算法（s8ti），经共享 [`HysteriaCCSlot`](xray_transport_quic::congestion_swappable::HysteriaCCSlot)
+/// 为 hysteria 翻译版算法（s8ti），经共享
+/// [`HysteriaCCSlot`](xray_transport_quic::congestion_swappable::HysteriaCCSlot)
 /// 通道预装 TransportConfig，建链即生效。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CongestionControl {
@@ -203,16 +207,13 @@ impl TuicClient {
         options: TuicConnectOptions,
         pool: QuinnConnectionPool,
     ) -> Result<Self> {
-        let server_addr = server.to_socket_addrs()?.next().ok_or_else(|| {
-            std::io::Error::other("to_socket_addrs returned empty")
-        })?;
+        let server_addr = server
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| std::io::Error::other("to_socket_addrs returned empty"))?;
 
         // 构造连接池 key
-        let key = PoolKey::new(
-            server_addr,
-            server_name,
-            &rustls_config.alpn_protocols,
-        );
+        let key = PoolKey::new(server_addr, server_name, &rustls_config.alpn_protocols);
 
         // 构造重连包装
         let reconnect = ReconnectingConnection::new(pool.clone(), key.clone());
@@ -251,10 +252,7 @@ impl TuicClient {
             .map_err(|_| TuicError::KeyingMaterialExport)?;
         // open uni stream → write Authenticate
         let mut uni = pooled.conn.open_uni().await?;
-        let cmd = crate::protocol::Command::Authenticate {
-            uuid_bytes: *uuid.as_bytes(),
-            token,
-        };
+        let cmd = crate::protocol::Command::Authenticate { uuid_bytes: *uuid.as_bytes(), token };
         let mut buf = BytesMut::with_capacity(cmd.encoded_len());
         cmd.write_to(&mut buf);
         uni.write_all(&buf).await?;
@@ -266,14 +264,7 @@ impl TuicClient {
         // 按 (assoc_id, pkt_id) 配对给等待中的请求（TUIC v5 SPEC uni-stream 模型）
         let router = UniRespRouter::spawn(multiplexed.pooled.conn.clone());
 
-        Ok(Self {
-            multiplexed,
-            pool,
-            key,
-            uuid,
-            password: password.to_string(),
-            router,
-        })
+        Ok(Self { multiplexed, pool, key, uuid, password: password.to_string(), router })
     }
 
     /// 内部：新建 QUIC 连接（无池复用路径）。
@@ -293,12 +284,9 @@ impl TuicClient {
         let rustls_config = Arc::new(rustls_config);
 
         let quinn_client_cfg = quinn::ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(rustls_config)
-                .map_err(|e| {
-                    TuicError::Io(std::io::Error::other(format!(
-                        "quinn rustls client convert: {e}"
-                    )))
-                })?,
+            quinn::crypto::rustls::QuicClientConfig::try_from(rustls_config).map_err(|e| {
+                TuicError::Io(std::io::Error::other(format!("quinn rustls client convert: {e}")))
+            })?,
         ));
         let mut transport = quinn::TransportConfig::default();
         transport.datagram_receive_buffer_size(Some(8 * 1024));
@@ -326,9 +314,7 @@ impl TuicClient {
 
         let conn = endpoint
             .connect(server_addr, server_name)
-            .map_err(|e| {
-                TuicError::Io(std::io::Error::other(format!("quinn connect: {e}")))
-            })?
+            .map_err(|e| TuicError::Io(std::io::Error::other(format!("quinn connect: {e}"))))?
             .await?;
 
         Ok(conn)
@@ -394,11 +380,7 @@ impl TuicClient {
     /// 或 [`TuicUdpAssoc::send_recv_native`]（native datagram 模式）收发 UDP 包。
     #[must_use]
     pub fn dial_udp(&self, assoc_id: u16) -> TuicUdpAssoc {
-        TuicUdpAssoc::new(
-            self.multiplexed.pooled.conn.clone(),
-            assoc_id,
-            self.router.clone(),
-        )
+        TuicUdpAssoc::new(self.multiplexed.pooled.conn.clone(), assoc_id, self.router.clone())
     }
 
     /// 发送 QUIC DATAGRAM（native UDP 模式）。
@@ -423,13 +405,12 @@ pub(crate) fn resolve_first(addr: impl ToSocketAddrs) -> Result<SocketAddr> {
 
 /// 把 CC 配置预装进 TransportConfig（s8ti）。
 ///
-/// - `Bbr`/`Cubic`/`NewReno`：quinn 内建工厂直装（与 s8ti 前行为逐字节一致：
-///   bbr → BBR、cubic → CUBIC、new_reno 显式降级 CUBIC 不静默——票 ieik），
-///   返回 `None`；
+/// - `Bbr`/`Cubic`/`NewReno`：quinn 内建工厂直装（与 s8ti 前行为逐字节一致： bbr → BBR、cubic →
+///   CUBIC、new_reno 显式降级 CUBIC 不静默——票 ieik）， 返回 `None`；
 /// - `HysteriaBbr`/`HysteriaBrutal`：装可热切换共享槽
-///   [`HysteriaCCSlot`](xray_transport_quic::congestion_swappable::HysteriaCCSlot)
-///   并预载算法——TUIC 协议无 Hysteria-CC-RX/TX 协商头，无 auth 后热切换事件，
-///   建链前预载即最终算法；返回 `Some(slot)` 供测试/遥测探针。
+///   [`HysteriaCCSlot`](xray_transport_quic::congestion_swappable::HysteriaCCSlot) 并预载算法——TUIC
+///   协议无 Hysteria-CC-RX/TX 协商头，无 auth 后热切换事件， 建链前预载即最终算法；返回
+///   `Some(slot)` 供测试/遥测探针。
 ///
 /// Brutal 带宽 `brutal_up_bps` 未配置（0）时回落 BBR，对齐 hysteria
 /// `min(up, down)=0` 时选 BBR 的协商语义。Brutal 窗口 = 2×bps×rtt：
@@ -450,26 +431,26 @@ pub(crate) fn apply_congestion_to_transport(
                 quinn_proto::congestion::BbrConfig::default(),
             ));
             None
-        }
+        },
         CongestionControl::Cubic => {
             transport.congestion_controller_factory(Arc::new(
                 quinn_proto::congestion::CubicConfig::default(),
             ));
             None
-        }
+        },
         CongestionControl::NewReno => {
             tracing::warn!("tuic: quinn has no NewReno, falling back to CUBIC");
             transport.congestion_controller_factory(Arc::new(
                 quinn_proto::congestion::CubicConfig::default(),
             ));
             None
-        }
+        },
         // —— s8ti：hysteria 翻译版算法经共享槽预装 ——
         CongestionControl::HysteriaBbr => {
             let slot = cc::install_swappable_cc(transport);
             cc::apply_bbr(&slot, cc::bbr::Profile::Standard);
             Some(slot)
-        }
+        },
         CongestionControl::HysteriaBrutal => {
             let slot = cc::install_swappable_cc(transport);
             if brutal_up_bps == 0 {
@@ -479,15 +460,15 @@ pub(crate) fn apply_congestion_to_transport(
                 cc::apply_brutal(&slot, brutal_up_bps, false);
             }
             Some(slot)
-        }
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
 
+    use super::*;
 
     /// 官方 tuic-client 默认值：congestion_control=bbr、udp_relay_mode=native、heartbeat=3s。
     /// 依据 Itsusinn/tuic（官方实现后继）crates/tuic-client/src/config.rs Relay 默认。
@@ -517,7 +498,10 @@ mod tests {
 
     #[test]
     fn congestion_control_from_name_hysteria_variants() {
-        assert_eq!(CongestionControl::from_name("hysteria_bbr"), Some(CongestionControl::HysteriaBbr));
+        assert_eq!(
+            CongestionControl::from_name("hysteria_bbr"),
+            Some(CongestionControl::HysteriaBbr)
+        );
         assert_eq!(
             CongestionControl::from_name("HYSTERIA_BRUTAL"),
             Some(CongestionControl::HysteriaBrutal)

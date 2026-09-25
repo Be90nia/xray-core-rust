@@ -3,6 +3,7 @@
 //! 对应 Go 版本 `common/net/address.go`，定义 IPv4/IPv6/域名地址类型。
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
 use serde::{Deserialize, Serialize};
 
 /// 网络地址：IPv4、IPv6 或域名。

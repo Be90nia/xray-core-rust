@@ -15,24 +15,32 @@
 //! | `users.Store/Delete`（key=Pub） | `users: Vec<WgUser>` 按 public_key 幂等 upsert |
 //! | `RemoveUser` 查无此 email → 静默 `nil` | [`WgUserRegistry::remove_user`] 返回 `Ok(())` |
 
-use std::net::IpAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use xray_app_proxyman::inbound::{InboundHandler as ProxyInboundHandler, PinFuture};
-use xray_proto::xray::app::proxyman::ReceiverConfig;
+use std::{
+    net::IpAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+};
 
 use parking_lot::Mutex as ParkMutex;
-
-use xray_app_proxyman::command::{
-    InboundHandlerWithUserManager, MemoryUser as ProxyMemoryUser, UserManager as ProxyUserManager,
-};
-use xray_app_proxyman::error::ProxymanError;
-
-use crate::config::{DeviceConfig, PeerConfig};
-use crate::driver::WgDriver;
-use crate::error::{Result, WgError};
-use crate::peer::shared_peer;
 use xray_app_dispatcher::default::DialFn;
+use xray_app_proxyman::{
+    command::{
+        InboundHandlerWithUserManager, MemoryUser as ProxyMemoryUser,
+        UserManager as ProxyUserManager,
+    },
+    error::ProxymanError,
+    inbound::{InboundHandler as ProxyInboundHandler, PinFuture},
+};
+use xray_proto::xray::app::proxyman::ReceiverConfig;
+
+use crate::{
+    config::{DeviceConfig, PeerConfig},
+    driver::WgDriver,
+    error::{Result, WgError},
+    peer::shared_peer,
+};
 
 /// driver 句柄槽（与 [`crate::inbound::WireguardInboundHandler::driver`] 同一 Arc）。
 pub type DriverSlot = Arc<ParkMutex<Option<Arc<WgDriver>>>>;
@@ -83,8 +91,8 @@ impl WgUserRegistry {
 
     /// 添加 / 更新动态 peer 用户（对应 Go `Server.AddUser`，server.go:137-165）。
     ///
-    /// - 同公钥再次添加 = 幂等替换（Go `IpcSet replace_allowed_ips=true` +
-    ///   `users.Store`）：更新 allowed_ips/psk/keepalive/email，会话原位重建。
+    /// - 同公钥再次添加 = 幂等替换（Go `IpcSet replace_allowed_ips=true` + `users.Store`）：更新
+    ///   allowed_ips/psk/keepalive/email，会话原位重建。
     /// - 与本端公钥相同 → "invalid public key"。
     /// - 会话构造失败（非法公钥/PSK hex）在此报错，不改动现有表。
     ///
@@ -107,24 +115,12 @@ impl WgUserRegistry {
             .ok_or_else(|| WgError::Driver("too early: device not initialized".into()))?;
         let index = self.next_index.fetch_add(1, Ordering::Relaxed);
         let session = shared_peer(&self.device, &peer, index)?;
-        let cidrs = peer
-            .allowed_ips
-            .iter()
-            .filter_map(|s| s.parse().ok())
-            .collect();
+        let cidrs = peer.allowed_ips.iter().filter_map(|s| s.parse().ok()).collect();
         driver.add_peer(Arc::clone(&session), cidrs);
-        let user = WgUser {
-            email: email.into(),
-            level,
-            peer,
-            session,
-        };
+        let user = WgUser { email: email.into(), level, peer, session };
         let pub_hex = user.peer.public_key.clone();
         let mut users = self.users.lock();
-        match users
-            .iter()
-            .position(|u| u.peer.public_key.eq_ignore_ascii_case(&pub_hex))
-        {
+        match users.iter().position(|u| u.peer.public_key.eq_ignore_ascii_case(&pub_hex)) {
             Some(i) => users[i] = user,
             None => users.push(user),
         }
@@ -144,19 +140,13 @@ impl WgUserRegistry {
             .lock()
             .clone()
             .ok_or_else(|| WgError::Driver("too early: device not initialized".into()))?;
-        let target = self
-            .users
-            .lock()
-            .iter()
-            .find(|u| u.email == email)
-            .map(|u| u.peer.public_key.clone());
+        let target =
+            self.users.lock().iter().find(|u| u.email == email).map(|u| u.peer.public_key.clone());
         let Some(pub_hex) = target else {
             return Ok(());
         };
         driver.remove_peer(&pub_hex);
-        self.users
-            .lock()
-            .retain(|u| !u.peer.public_key.eq_ignore_ascii_case(&pub_hex));
+        self.users.lock().retain(|u| !u.peer.public_key.eq_ignore_ascii_case(&pub_hex));
         Ok(())
     }
 
@@ -170,13 +160,17 @@ impl WgUserRegistry {
     #[must_use]
     pub fn get_user_by_addr(&self, addr: IpAddr) -> Option<WgUser> {
         let dest = to_smoltcp_addr(addr);
-        self.users.lock().iter().find(|u| {
-            u.peer
-                .allowed_ips
-                .iter()
-                .filter_map(|s| s.parse::<smoltcp::wire::IpCidr>().ok())
-                .any(|cidr| cidr.contains_addr(&dest))
-        }).cloned()
+        self.users
+            .lock()
+            .iter()
+            .find(|u| {
+                u.peer
+                    .allowed_ips
+                    .iter()
+                    .filter_map(|s| s.parse::<smoltcp::wire::IpCidr>().ok())
+                    .any(|cidr| cidr.contains_addr(&dest))
+            })
+            .cloned()
     }
 
     /// 全部用户快照。
@@ -197,10 +191,10 @@ fn to_smoltcp_addr(addr: IpAddr) -> smoltcp::wire::IpAddress {
     match addr {
         IpAddr::V4(v4) => {
             smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_octets(v4.octets()))
-        }
+        },
         IpAddr::V6(v6) => {
             smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from_octets(v6.octets()))
-        }
+        },
     }
 }
 
@@ -241,7 +235,8 @@ impl ProxyUserManager for WgUserRegistry {
 }
 
 /// proxyman 入站 handler 适配——委托到 xray-features [`crate::inbound::WireguardInboundHandler`]
-/// 的同步 [`crate::inbound::WireguardInboundHandler::do_start`] / [`do_close`](crate::inbound::WireguardInboundHandler::do_close)。
+/// 的同步 [`crate::inbound::WireguardInboundHandler::do_start`] /
+/// [`do_close`](crate::inbound::WireguardInboundHandler::do_close)。
 impl ProxyInboundHandler for crate::inbound::WireguardInboundHandler {
     fn tag(&self) -> &str {
         <Self as xray_features::inbound::InboundHandler>::tag(self)
@@ -276,13 +271,12 @@ impl InboundHandlerWithUserManager for crate::inbound::WireguardInboundHandler {
 }
 
 mod tests {
+    use xray_common::net::{
+        address::Address, destination::Destination, network::Network, port::Port,
+    };
+
     use super::*;
-    use crate::driver::WgTransport;
-    use crate::peer::SharedPeer;
-    use xray_common::net::address::Address;
-    use xray_common::net::destination::Destination;
-    use xray_common::net::network::Network;
-    use xray_common::net::port::Port;
+    use crate::{driver::WgTransport, peer::SharedPeer};
 
     fn make_keypair(seed: u8) -> (String, String) {
         use boringtun::x25519::{PublicKey, StaticSecret};
@@ -293,16 +287,18 @@ mod tests {
 
     /// Dialed 假传输 driver（不跑 main_loop，无需真实 socket）。
     fn test_driver(device: &DeviceConfig, static_pub: &str) -> DriverSlot {
-        let peer: SharedPeer =
-            shared_peer(device, &PeerConfig { public_key: static_pub.into(), ..Default::default() }, 0)
-                .expect("static peer");
+        let peer: SharedPeer = shared_peer(
+            device,
+            &PeerConfig { public_key: static_pub.into(), ..Default::default() },
+            0,
+        )
+        .expect("static peer");
         let dest = Destination::new(
             Address::from_ipv4_bytes([203, 0, 113, 1]),
             Port::new(51820),
             Network::UDP,
         );
-        let dialer: DialFn =
-            Arc::new(|_| Box::pin(async { Err("unused".to_string()) }));
+        let dialer: DialFn = Arc::new(|_| Box::pin(async { Err("unused".to_string()) }));
         let ns = Arc::new(tokio::sync::Mutex::new(crate::netstack::WgNetStack::new(
             &[smoltcp::wire::IpCidr::new(
                 smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(10, 0, 0, 1)),
@@ -338,9 +334,7 @@ mod tests {
     #[test]
     fn add_user_hot_plugs_peer_and_is_queryable() {
         let (registry, _pub_s, _pub_static, pub_dyn) = make_registry();
-        registry
-            .add_user("alice@x.com", 2, peer_cfg(pub_dyn.clone(), "10.0.2.0/24"))
-            .expect("add");
+        registry.add_user("alice@x.com", 2, peer_cfg(pub_dyn.clone(), "10.0.2.0/24")).expect("add");
         assert_eq!(registry.users_count(), 1);
         // 已注入 driver peer 表（静态 1 + 动态 1）
         assert_eq!(registry.driver.lock().as_ref().expect("driver").peer_count(), 2);
@@ -358,7 +352,9 @@ mod tests {
         // Go IpcSet replace_allowed_ips=true + users.Store：同 pub 覆盖（含 email）
         let (registry, _pub_s, _pub_static, pub_dyn) = make_registry();
         registry.add_user("old@x.com", 0, peer_cfg(pub_dyn.clone(), "10.0.2.0/24")).expect("add");
-        registry.add_user("new@x.com", 5, peer_cfg(pub_dyn.to_uppercase(), "10.0.9.0/24")).expect("re-add");
+        registry
+            .add_user("new@x.com", 5, peer_cfg(pub_dyn.to_uppercase(), "10.0.9.0/24"))
+            .expect("re-add");
         assert_eq!(registry.users_count(), 1, "同公钥幂等替换");
         let u = registry.get_user("new@x.com").expect("replaced email");
         assert_eq!(u.level, 5);
@@ -378,7 +374,8 @@ mod tests {
     #[test]
     fn add_user_invalid_public_key_hex_rejected_without_table_change() {
         let (registry, _pub_s, _pub_static, _pub_dyn) = make_registry();
-        let err = registry.add_user("bad@x.com", 0, peer_cfg("zz".into(), "10.0.2.0/24")).unwrap_err();
+        let err =
+            registry.add_user("bad@x.com", 0, peer_cfg("zz".into(), "10.0.2.0/24")).unwrap_err();
         assert!(err.to_string().contains("public_key"), "got: {err}");
         assert_eq!(registry.users_count(), 0, "失败不改动现有表");
     }
@@ -391,7 +388,8 @@ mod tests {
         let device = DeviceConfig { secret_key: sec_s, ..Default::default() };
         let empty_slot: DriverSlot = Arc::new(ParkMutex::new(None));
         let registry = WgUserRegistry::new(device, empty_slot).expect("registry");
-        let err = registry.add_user("a@x.com", 0, peer_cfg(pub_dyn.clone(), "10.0.2.0/24")).unwrap_err();
+        let err =
+            registry.add_user("a@x.com", 0, peer_cfg(pub_dyn.clone(), "10.0.2.0/24")).unwrap_err();
         assert!(err.to_string().contains("too early"), "got: {err}");
         let err = registry.remove_user("a@x.com").unwrap_err();
         assert!(err.to_string().contains("too early"), "got: {err}");
@@ -422,8 +420,11 @@ mod tests {
     fn proxyman_add_user_requires_account_payload() {
         // Rust proxyman MemoryUser 无 account 载荷——对应 Go ToMemoryUser 解码失败
         let (registry, _pub_s, _pub_static, _pub_dyn) = make_registry();
-        let err = ProxyUserManager::add_user(&registry, ProxyMemoryUser { email: "a@x.com".into(), level: 0 })
-            .expect_err("无公钥不可构造 WG peer");
+        let err = ProxyUserManager::add_user(
+            &registry,
+            ProxyMemoryUser { email: "a@x.com".into(), level: 0 },
+        )
+        .expect_err("无公钥不可构造 WG peer");
         assert!(matches!(err, ProxymanError::UserParse(_)), "got: {err}");
     }
 

@@ -109,17 +109,17 @@ impl PaddingDecoder {
                     self.payload_remaining = usize::from(buf[pos]);
                     pos += 1;
                     self.state = ReadState::Len2;
-                }
+                },
                 ReadState::Len2 => {
                     self.payload_remaining = self.payload_remaining * 256 + usize::from(buf[pos]);
                     pos += 1;
                     self.state = ReadState::Pad1;
-                }
+                },
                 ReadState::Pad1 => {
                     self.padding_remaining = usize::from(buf[pos]);
                     pos += 1;
                     self.state = ReadState::Payload;
-                }
+                },
                 ReadState::Payload => {
                     let take = self.payload_remaining.min(buf.len() - pos);
                     out.extend_from_slice(&buf[pos..pos + take]);
@@ -128,7 +128,7 @@ impl PaddingDecoder {
                     if self.payload_remaining == 0 {
                         self.state = ReadState::Padding;
                     }
-                }
+                },
                 ReadState::Padding => {
                     let take = self.padding_remaining.min(buf.len() - pos);
                     pos += take;
@@ -140,7 +140,7 @@ impl PaddingDecoder {
                             break;
                         }
                     }
-                }
+                },
             }
         }
         buf.drain(..pos);
@@ -155,10 +155,7 @@ mod tests {
     #[test]
     fn padding_header_charset_and_layout() {
         // naiveproxy g_nonindex_codes：前 16 随机符号 + 'X' 填充
-        assert_eq!(
-            std::str::from_utf8(&NONINDEX_CODES[..16]).unwrap(),
-            r##"!"#$&'()*+,;<>?@"##
-        );
+        assert_eq!(std::str::from_utf8(&NONINDEX_CODES[..16]).unwrap(), r##"!"#$&'()*+,;<>?@"##);
         // seed 0x0003_0201 逐 nibble（LSB 先）：1,0,2,0 → codes[1],[0],[2],[0]
         assert_eq!(padding_header(4, 0x0003_0201), "\"!#!");
         // seed = 1：首字节 codes[1]，其余 codes[0]；第 17 字节起填 'X'

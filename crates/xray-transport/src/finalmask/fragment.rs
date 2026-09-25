@@ -3,11 +3,12 @@
 //! 在 TCP 写入时把首包（TLS ClientHello）拆成多个小片段+延迟，绕过基于首包特征的 DPI。
 //! 读方向透明透传。
 
-use std::io;
-use std::time::Duration;
+use std::{io, time::Duration};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::select;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    select,
+};
 
 use super::{AsyncIo, Tcpmask, UDP_SIZE};
 
@@ -60,20 +61,14 @@ impl FragmentConfig {
 }
 
 impl Tcpmask for FragmentConfig {
-    fn wrap_conn_client(
-        &self,
-        raw: Box<dyn AsyncIo>,
-    ) -> io::Result<Box<dyn AsyncIo>> {
+    fn wrap_conn_client(&self, raw: Box<dyn AsyncIo>) -> io::Result<Box<dyn AsyncIo>> {
         let (client, server) = tokio::io::duplex(UDP_SIZE * 2);
         let config = self.clone();
         tokio::spawn(fragment_bridge(raw, server, config, false));
         Ok(Box::new(client))
     }
 
-    fn wrap_conn_server(
-        &self,
-        raw: Box<dyn AsyncIo>,
-    ) -> io::Result<Box<dyn AsyncIo>> {
+    fn wrap_conn_server(&self, raw: Box<dyn AsyncIo>) -> io::Result<Box<dyn AsyncIo>> {
         let (client, server) = tokio::io::duplex(UDP_SIZE * 2);
         let config = self.clone();
         tokio::spawn(fragment_bridge(raw, server, config, true));
@@ -249,20 +244,11 @@ mod tests {
 
     #[test]
     fn merge_tls_hello_only_when_single_zero_delay() {
-        let c = FragmentConfig {
-            delays_max: vec![0],
-            ..Default::default()
-        };
+        let c = FragmentConfig { delays_max: vec![0], ..Default::default() };
         assert!(c.merge_tls_hello());
-        let c2 = FragmentConfig {
-            delays_max: vec![0, 10],
-            ..Default::default()
-        };
+        let c2 = FragmentConfig { delays_max: vec![0, 10], ..Default::default() };
         assert!(!c2.merge_tls_hello());
-        let c3 = FragmentConfig {
-            delays_max: vec![5],
-            ..Default::default()
-        };
+        let c3 = FragmentConfig { delays_max: vec![5], ..Default::default() };
         assert!(!c3.merge_tls_hello());
     }
 
@@ -270,11 +256,7 @@ mod tests {
     async fn passthrough_when_not_tls_hello() {
         // 非 ClientHello 数据应原样写入
         let (mut tx, mut rx) = tokio::io::duplex(1024);
-        let config = FragmentConfig {
-            packets_from: 0,
-            packets_to: 1,
-            ..Default::default()
-        };
+        let config = FragmentConfig { packets_from: 0, packets_to: 1, ..Default::default() };
         let data = b"GET / HTTP/1.1\r\n";
         let n = write_fragmented(&mut tx, data, &config, 1).await.unwrap();
         assert_eq!(n, data.len());
@@ -287,11 +269,7 @@ mod tests {
     #[tokio::test]
     async fn passthrough_outside_packet_range() {
         let (mut tx, mut rx) = tokio::io::duplex(1024);
-        let config = FragmentConfig {
-            packets_from: 5,
-            packets_to: 10,
-            ..Default::default()
-        };
+        let config = FragmentConfig { packets_from: 5, packets_to: 10, ..Default::default() };
         let data = b"hello";
         // count=1 在 [5,10] 之外，应直通
         let n = write_fragmented(&mut tx, data, &config, 1).await.unwrap();

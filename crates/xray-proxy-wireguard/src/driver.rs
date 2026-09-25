@@ -15,40 +15,39 @@
 //!
 //! task 拓扑（Go netBindClient 形态，bind.go:79-192）：
 //! - 读 task：transport 收原始 WG 数据报（reserved 清零）→ readQueue（mpsc）
-//! - N 个 worker task：readQueue → Tunnel.decapsulate → netstack.ingest_rx
-//!   （N = `num_workers`，<=0 时 CPU 数——Go `Open` 的 N 个 receive func）
-//! - 定时器 task：Tunnel.update_timers + netstack.drain_tx → Tunnel.encapsulate
-//!   → transport 发送（每 100ms）
+//! - N 个 worker task：readQueue → Tunnel.decapsulate → netstack.ingest_rx （N = `num_workers`，<=0
+//!   时 CPU 数——Go `Open` 的 N 个 receive func）
+//! - 定时器 task：Tunnel.update_timers + netstack.drain_tx → Tunnel.encapsulate → transport
+//!   发送（每 100ms）
 //!
 //! ## 注意
 //!
 //! - Tunnel 是同步的（`&mut self`），用 [`parking_lot::Mutex`] 保护
 //! - smoltcp Interface 不 Sync，整个 [`WgNetStack`] 也在 Mutex 内
-//! - worker 并行消费 readQueue；decapsulate 在 peer tunnel 锁上串行（与 Go
-//!   wireguard-go 单 goroutine 解密等价），ingest/poll 可与其它 worker 的
-//!   recv 重叠
+//! - worker 并行消费 readQueue；decapsulate 在 peer tunnel 锁上串行（与 Go wireguard-go 单
+//!   goroutine 解密等价），ingest/poll 可与其它 worker 的 recv 重叠
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use parking_lot::{Mutex, RwLock};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
-use tokio::time::interval;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::UdpSocket,
+    sync::{Mutex as AsyncMutex, mpsc, watch},
+    time::interval,
+};
 use xray_app_dispatcher::default::DialFn;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
+use xray_common::net::{address::Address, destination::Destination};
 use xray_transport::connection::Connection;
 use xray_xudp::packet::{PacketReader, PacketWriter};
 
-use crate::dispatcher::{apply_reserved, clear_reserved};
-use crate::error::{Result, WgError};
-use crate::netstack::WgNetStack;
-use crate::peer::SharedPeer;
-use crate::tunnel::Output;
+use crate::{
+    dispatcher::{apply_reserved, clear_reserved},
+    error::{Result, WgError},
+    netstack::WgNetStack,
+    peer::SharedPeer,
+    tunnel::Output,
+};
 
 /// 定时器驱动间隔（boringtun 推荐 ~100ms）。
 const TIMER_INTERVAL: Duration = Duration::from_millis(100);
@@ -65,9 +64,7 @@ type WgDatagram = (Vec<u8>, SocketAddr);
 /// Go bind.go:94-100 `Open` 的 worker 数语义：<=0 → CPU 数；仍 <=0 → 1。
 fn effective_workers(num_workers: i32) -> usize {
     let workers = if num_workers <= 0 {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(0)
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
     } else {
         num_workers as usize
     };
@@ -142,8 +139,7 @@ impl DialedUdp {
         }
         let mut frame = Vec::with_capacity(wg.len() + 64);
         let mut pw = PacketWriter::new(&mut frame, self.dest.clone(), [0u8; 8]);
-        pw.write_packet(wg)
-            .map_err(|e| format!("wg dialed xudp frame: {e}"))?;
+        pw.write_packet(wg).map_err(|e| format!("wg dialed xudp frame: {e}"))?;
         let res = match guard.as_mut() {
             Some(w) => w.write_all(&frame).await,
             None => unreachable!("connect() filled writer"),
@@ -188,7 +184,7 @@ impl DialedUdp {
                         Err(_) => {
                             acc.clear(); // 坏帧：丢弃重同步
                             None
-                        }
+                        },
                     }
                 };
                 let Some((consumed, pkt)) = frame else { break };
@@ -210,7 +206,7 @@ async fn wait_shutdown(shut: &mut Option<watch::Receiver<bool>>) {
     match shut {
         Some(rx) => {
             let _ = rx.changed().await;
-        }
+        },
         None => std::future::pending::<()>().await,
     }
 }
@@ -264,7 +260,11 @@ pub struct WgDriver {
 
 impl WgDriver {
     /// 构造单 peer driver（client/outbound 模式）。
-    pub fn new(peer: SharedPeer, sock: Arc<UdpSocket>, netstack: Arc<AsyncMutex<WgNetStack>>) -> Self {
+    pub fn new(
+        peer: SharedPeer,
+        sock: Arc<UdpSocket>,
+        netstack: Arc<AsyncMutex<WgNetStack>>,
+    ) -> Self {
         Self::new_multi(vec![peer], vec![vec![]], sock, netstack)
     }
 
@@ -325,19 +325,15 @@ impl WgDriver {
     pub fn add_peer(&self, peer: SharedPeer, cidrs: Vec<smoltcp::wire::IpCidr>) {
         let pub_hex = peer.public_key_hex().to_string();
         let mut table = self.peer_table.write();
-        match table
-            .peers
-            .iter()
-            .position(|p| p.public_key_hex().eq_ignore_ascii_case(&pub_hex))
-        {
+        match table.peers.iter().position(|p| p.public_key_hex().eq_ignore_ascii_case(&pub_hex)) {
             Some(i) => {
                 table.peers[i] = peer;
                 table.allowed_cidrs[i] = cidrs;
-            }
+            },
             None => {
                 table.peers.push(peer);
                 table.allowed_cidrs.push(cidrs);
-            }
+            },
         }
         drop(table);
         self.addr_route.lock().clear();
@@ -393,12 +389,12 @@ impl WgDriver {
         match &self.transport {
             WgTransport::Direct(sock) => {
                 let _ = sock.send_to(wg, target).await;
-            }
+            },
             WgTransport::Dialed(d) => {
                 if let Err(e) = Arc::clone(d).send(wg).await {
                     tracing::warn!(error = %e, "wg dialed send failed");
                 }
-            }
+            },
         }
     }
 
@@ -419,10 +415,7 @@ impl WgDriver {
         // 伪源 UDP 包不得搅动 roaming 路由（bd 250w）。
         let table = self.peer_table.read();
         if table.peers.len() == 1 {
-            let outs = table
-                .peers[0]
-                .with_tunnel(|t| t.decapsulate(data))
-                .ok()?;
+            let outs = table.peers[0].with_tunnel(|t| t.decapsulate(data)).ok()?;
             table.peers[0].set_endpoint(src);
             *self.remote.lock() = Some(src);
             return Some((0, outs));
@@ -465,9 +458,9 @@ impl WgDriver {
             return 0;
         }
         let dest = match ip_pkt.first() {
-            Some(&b) if b >> 4 == 4 && ip_pkt.len() >= 20 => {
-                smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(ip_pkt[16], ip_pkt[17], ip_pkt[18], ip_pkt[19]))
-            }
+            Some(&b) if b >> 4 == 4 && ip_pkt.len() >= 20 => smoltcp::wire::IpAddress::Ipv4(
+                smoltcp::wire::Ipv4Address::new(ip_pkt[16], ip_pkt[17], ip_pkt[18], ip_pkt[19]),
+            ),
             Some(&b) if b >> 4 == 6 && ip_pkt.len() >= 40 => {
                 let mut o = [0u8; 16];
                 o.copy_from_slice(&ip_pkt[24..40]);
@@ -481,7 +474,7 @@ impl WgDriver {
                     u16::from_be_bytes([o[12], o[13]]),
                     u16::from_be_bytes([o[14], o[15]]),
                 ))
-            }
+            },
             _ => return 0,
         };
         for (idx, cidrs) in self.peer_table.read().allowed_cidrs.iter().enumerate() {
@@ -493,7 +486,6 @@ impl WgDriver {
         }
         0 // fallback
     }
-
 
     /// 启动 driver。返回 JoinHandle——调用方可丢弃以停止。
     ///
@@ -510,8 +502,8 @@ impl WgDriver {
     ///
     /// - Direct 传输：spawn 单读 task（`recv_from` → readQueue）
     /// - Dialed 传输：读 task 由首次拨号时 spawn（`DialedUdp::connect`）
-    /// - N 个 worker 并行消费 readQueue（Go `Open` 返回的 N 个 receive func，
-    ///   N = `num_workers`，<=0 → CPU 数）
+    /// - N 个 worker 并行消费 readQueue（Go `Open` 返回的 N 个 receive func， N =
+    ///   `num_workers`，<=0 → CPU 数）
     /// - 本 task 跑定时器循环：update_timers + keepalive + drain_tx → encapsulate
     ///
     /// main_loop future 被 drop（inbound select! 取消）时经 Drop guard 广播
@@ -544,7 +536,7 @@ impl WgDriver {
                 tokio::spawn(async move {
                     direct_read_loop(sock, tx, &mut shut).await;
                 });
-            }
+            },
             WgTransport::Dialed(d) => d.set_shutdown(shut_rx.clone()),
         }
 
@@ -591,7 +583,8 @@ impl WgDriver {
                 if let Some(interval_secs) = keepalive_interval {
                     if last_keepalive.elapsed().as_secs() >= u64::from(interval_secs) {
                         last_keepalive = std::time::Instant::now();
-                        let ka_outputs = self.peer(0).map(|p| p.with_tunnel(|t| t.encapsulate(&[])));
+                        let ka_outputs =
+                            self.peer(0).map(|p| p.with_tunnel(|t| t.encapsulate(&[])));
                         if let Some(Ok(outs)) = ka_outputs {
                             let remote = *self.remote.lock();
                             if let Some(r) = remote {
@@ -610,7 +603,9 @@ impl WgDriver {
                 stack.poll(smoltcp::time::Instant::now());
                 stack.drain_tx()
             };
-            if tx_pkts.is_empty() { continue; }
+            if tx_pkts.is_empty() {
+                continue;
+            }
             for pkt in &tx_pkts {
                 let peer_idx = self.route_outgoing(pkt);
                 let encrypted = {
@@ -637,10 +632,10 @@ impl WgDriver {
                                 self.send_wg(&mut wg, ep).await;
                             }
                         }
-                    }
+                    },
                     Err(e) => {
                         tracing::warn!(error = %e, "wg encapsulate failed");
-                    }
+                    },
                 }
             }
         }
@@ -673,11 +668,12 @@ impl WgDriver {
                 match out {
                     Output::Ip(ip) => stack.ingest_rx(ip),
                     Output::Network(mut wg) => {
-                        let target = if self.is_multi() { peer_endpoint } else { *self.remote.lock() };
+                        let target =
+                            if self.is_multi() { peer_endpoint } else { *self.remote.lock() };
                         if let Some(t) = target {
                             self.send_wg(&mut wg, t).await;
                         }
-                    }
+                    },
                 }
             }
             stack.poll(smoltcp::time::Instant::now());
@@ -703,9 +699,11 @@ async fn direct_read_loop(
                 tracing::error!(error = %e, "wg udp recv error");
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
-            }
+            },
         };
-        if n == 0 { continue; }
+        if n == 0 {
+            continue;
+        }
         // Warp 下行可能带非零 reserved——清零后再入队（Go bind.go:145-149）
         let mut pkt = buf[..n].to_vec();
         clear_reserved(&mut pkt);
@@ -719,19 +717,19 @@ async fn direct_read_loop(
 ///
 /// `bind_addr` 形如 `"0.0.0.0:0"`（client 随机端口）或 `"0.0.0.0:51820"`（server 固定端口）。
 pub async fn bind_udp_socket(bind_addr: &str) -> Result<Arc<UdpSocket>> {
-    let sock = UdpSocket::bind(bind_addr)
-        .await
-        .map_err(|e| WgError::Io(e))?;
+    let sock = UdpSocket::bind(bind_addr).await.map_err(|e| WgError::Io(e))?;
     Ok(Arc::new(sock))
 }
 
 #[cfg(test)]
 mod tests {
+    use xray_common::net::{network::Network, port::Port};
+
     use super::*;
-    use crate::config::{DeviceConfig, PeerConfig};
-    use crate::peer::shared_peer;
-    use xray_common::net::network::Network;
-    use xray_common::net::port::Port;
+    use crate::{
+        config::{DeviceConfig, PeerConfig},
+        peer::shared_peer,
+    };
 
     fn make_keypair(seed: u8) -> (String, String) {
         use boringtun::x25519::{PublicKey, StaticSecret};
@@ -760,7 +758,12 @@ mod tests {
         );
         let dialer: DialFn = Arc::new(|_| Box::pin(async { Err("unused".to_string()) }));
         let ns = Arc::new(AsyncMutex::new(WgNetStack::new(&[v4_cidr(10, 0, 0, 1)], 1420)));
-        WgDriver::with_transport(peers, cidrs, WgTransport::Dialed(Arc::new(DialedUdp::new(dialer, dest))), ns)
+        WgDriver::with_transport(
+            peers,
+            cidrs,
+            WgTransport::Dialed(Arc::new(DialedUdp::new(dialer, dest))),
+            ns,
+        )
     }
 
     fn cidr_24(o1: u8, o2: u8, o3: u8) -> smoltcp::wire::IpCidr {
@@ -778,7 +781,11 @@ mod tests {
         let device = DeviceConfig { secret_key: sec_s, ..Default::default() };
         let static_peer = shared_peer(
             &device,
-            &PeerConfig { public_key: pub_a, allowed_ips: vec!["10.0.1.0/24".into()], ..Default::default() },
+            &PeerConfig {
+                public_key: pub_a,
+                allowed_ips: vec!["10.0.1.0/24".into()],
+                ..Default::default()
+            },
             0,
         )
         .expect("static peer");
@@ -789,7 +796,11 @@ mod tests {
         // AddUser：动态追加（Go dev.IpcSet add），is_multi 即时翻转
         let dyn_session = shared_peer(
             &device,
-            &PeerConfig { public_key: pub_b.clone(), allowed_ips: vec!["10.0.2.0/24".into()], ..Default::default() },
+            &PeerConfig {
+                public_key: pub_b.clone(),
+                allowed_ips: vec!["10.0.2.0/24".into()],
+                ..Default::default()
+            },
             1,
         )
         .expect("dyn peer");
@@ -811,7 +822,11 @@ mod tests {
         let device = DeviceConfig { secret_key: sec_s, ..Default::default() };
         let p1 = shared_peer(
             &device,
-            &PeerConfig { public_key: pub_a.clone(), allowed_ips: vec!["10.0.1.0/24".into()], ..Default::default() },
+            &PeerConfig {
+                public_key: pub_a.clone(),
+                allowed_ips: vec!["10.0.1.0/24".into()],
+                ..Default::default()
+            },
             0,
         )
         .expect("p1");
@@ -819,13 +834,21 @@ mod tests {
 
         let p2 = shared_peer(
             &device,
-            &PeerConfig { public_key: pub_a.to_uppercase(), allowed_ips: vec!["10.0.9.0/24".into()], ..Default::default() },
+            &PeerConfig {
+                public_key: pub_a.to_uppercase(),
+                allowed_ips: vec!["10.0.9.0/24".into()],
+                ..Default::default()
+            },
             1,
         )
         .expect("p2");
         driver.add_peer(p2, vec![cidr_24(10, 0, 9)]);
         assert_eq!(driver.peer_count(), 1, "同公钥（忽略大小写）原位替换不追加");
-        assert_eq!(driver.peer(0).expect("peer").public_key_hex(), &pub_a.to_uppercase(), "会话已替换");
+        assert_eq!(
+            driver.peer(0).expect("peer").public_key_hex(),
+            &pub_a.to_uppercase(),
+            "会话已替换"
+        );
     }
 
     #[test]
@@ -839,9 +862,7 @@ mod tests {
     }
 
     /// mock system dialer：捕获 dest，返回 duplex Connection（一次性）。
-    fn mock_dialer(
-        seen: Arc<Mutex<Option<Destination>>>,
-    ) -> (DialFn, tokio::io::DuplexStream) {
+    fn mock_dialer(seen: Arc<Mutex<Option<Destination>>>) -> (DialFn, tokio::io::DuplexStream) {
         let (client, server) = tokio::io::duplex(64 * 1024);
         let slot: Arc<AsyncMutex<Option<tokio::io::DuplexStream>>> =
             Arc::new(AsyncMutex::new(Some(client)));
@@ -850,9 +871,8 @@ mod tests {
             let slot = Arc::clone(&slot);
             Box::pin(async move {
                 match slot.lock().await.take() {
-                    Some(c) => Ok(Box::new(
-                        xray_transport::connection::DuplexConnection::new(c),
-                    ) as Box<dyn Connection>),
+                    Some(c) => Ok(Box::new(xray_transport::connection::DuplexConnection::new(c))
+                        as Box<dyn Connection>),
                     None => Err("unexpected second dial".to_string()),
                 }
             })
@@ -926,9 +946,8 @@ mod tests {
             shared_peer(&server_cfg, &PeerConfig { public_key: pub_c, ..Default::default() }, 0)
                 .expect("server peer");
         let server_ns = Arc::new(AsyncMutex::new(WgNetStack::new(&[v4_cidr(10, 0, 0, 1)], 1420)));
-        let server = Arc::new(
-            WgDriver::new(server_peer, server_sock, server_ns).with_num_workers(2),
-        );
+        let server =
+            Arc::new(WgDriver::new(server_peer, server_sock, server_ns).with_num_workers(2));
         tokio::spawn(Arc::clone(&server).main_loop());
 
         let client_cfg = DeviceConfig {
@@ -944,9 +963,8 @@ mod tests {
         let client_peer = shared_peer(&client_cfg, &client_cfg.peers[0], 0).expect("client peer");
         let client_sock = bind_udp_socket("127.0.0.1:0").await.expect("client bind");
         let client_ns = Arc::new(AsyncMutex::new(WgNetStack::new(&[v4_cidr(10, 0, 0, 2)], 1420)));
-        let client = Arc::new(
-            WgDriver::new(client_peer, client_sock, client_ns).with_num_workers(2),
-        );
+        let client =
+            Arc::new(WgDriver::new(client_peer, client_sock, client_ns).with_num_workers(2));
         client.set_remote(server_addr);
         tokio::spawn(Arc::clone(&client).main_loop());
 
@@ -960,7 +978,9 @@ mod tests {
                 let _ = sock.send_slice(
                     b"go",
                     smoltcp::wire::IpEndpoint::new(
-                        smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(10, 0, 0, 1)),
+                        smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(
+                            10, 0, 0, 1,
+                        )),
                         53,
                     ),
                 );
@@ -991,12 +1011,8 @@ mod tests {
         let (sec_c, pub_c) = make_keypair(0x11);
         let (sec_s, pub_s) = make_keypair(0x22);
         let device = DeviceConfig { secret_key: sec_s, ..Default::default() };
-        let peer = shared_peer(
-            &device,
-            &PeerConfig { public_key: pub_c, ..Default::default() },
-            0,
-        )
-        .expect("peer");
+        let peer = shared_peer(&device, &PeerConfig { public_key: pub_c, ..Default::default() }, 0)
+            .expect("peer");
         let driver = make_multi_driver(vec![peer], vec![vec![]]);
 
         let src: std::net::SocketAddr = "198.51.100.9:51820".parse().expect("addr");
@@ -1023,15 +1039,9 @@ mod tests {
                 _ => None,
             })
             .expect("handshake init packet");
-        let (idx, _) = driver
-            .decapsulate_incoming(&init, src)
-            .expect("valid init decapsulates");
+        let (idx, _) = driver.decapsulate_incoming(&init, src).expect("valid init decapsulates");
         assert_eq!(idx, 0);
-        assert_eq!(
-            driver.peer(0).unwrap().endpoint(),
-            Some(src),
-            "解密验证成功后绑定 endpoint"
-        );
+        assert_eq!(driver.peer(0).unwrap().endpoint(), Some(src), "解密验证成功后绑定 endpoint");
         assert_eq!(*driver.remote.lock(), Some(src));
     }
 
@@ -1041,18 +1051,10 @@ mod tests {
         let (sec_s, pub_a) = make_keypair(0x11);
         let (_, pub_b) = make_keypair(0x33);
         let device = DeviceConfig { secret_key: sec_s, ..Default::default() };
-        let pa = shared_peer(
-            &device,
-            &PeerConfig { public_key: pub_a, ..Default::default() },
-            0,
-        )
-        .expect("peer a");
-        let pb = shared_peer(
-            &device,
-            &PeerConfig { public_key: pub_b, ..Default::default() },
-            1,
-        )
-        .expect("peer b");
+        let pa = shared_peer(&device, &PeerConfig { public_key: pub_a, ..Default::default() }, 0)
+            .expect("peer a");
+        let pb = shared_peer(&device, &PeerConfig { public_key: pub_b, ..Default::default() }, 1)
+            .expect("peer b");
         let driver = make_multi_driver(vec![pa, pb], vec![vec![], vec![]]);
         let bogus: std::net::SocketAddr = "198.51.100.9:4444".parse().expect("addr");
         let junk = vec![0xFFu8; 64];
@@ -1071,17 +1073,26 @@ mod tests {
         let device = DeviceConfig { secret_key: sec_s, ..Default::default() };
         let pa = shared_peer(
             &device,
-            &PeerConfig { public_key: pub_a, allowed_ips: vec!["10.0.1.0/24".into()], ..Default::default() },
+            &PeerConfig {
+                public_key: pub_a,
+                allowed_ips: vec!["10.0.1.0/24".into()],
+                ..Default::default()
+            },
             0,
         )
         .expect("peer a");
         let pb = shared_peer(
             &device,
-            &PeerConfig { public_key: pub_b, allowed_ips: vec!["10.0.2.0/24".into()], ..Default::default() },
+            &PeerConfig {
+                public_key: pub_b,
+                allowed_ips: vec!["10.0.2.0/24".into()],
+                ..Default::default()
+            },
             1,
         )
         .expect("peer b");
-        let driver = make_multi_driver(vec![pa, pb], vec![vec![cidr_24(10, 0, 1)], vec![cidr_24(10, 0, 2)]]);
+        let driver =
+            make_multi_driver(vec![pa, pb], vec![vec![cidr_24(10, 0, 1)], vec![cidr_24(10, 0, 2)]]);
 
         // 下行 IPv4 包：dst 10.0.1.7 → peer0；dst 10.0.2.9 → peer1
         let pkt_for_a = make_ipv4_probe([10, 0, 1, 7]);
@@ -1098,4 +1109,3 @@ mod tests {
         pkt
     }
 }
-

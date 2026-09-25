@@ -9,10 +9,13 @@
 //! - Tier 2: 32KB  (32768 bytes)
 //! - Tier 3: 128KB (131072 bytes)
 
+use std::{
+    cell::RefCell,
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+};
+
 use bytes::BytesMut;
 use parking_lot::Mutex;
-use std::cell::RefCell;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// 默认缓冲区大小 (8KB)，对应 Go 的 `buf.Size`。
 pub const DEFAULT_SIZE: usize = 8192;
@@ -50,9 +53,7 @@ struct Shard {
 
 impl Shard {
     const fn new() -> Self {
-        Self {
-            tiers: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
-        }
+        Self { tiers: [Vec::new(), Vec::new(), Vec::new(), Vec::new()] }
     }
 }
 

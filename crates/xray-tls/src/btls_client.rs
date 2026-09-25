@@ -19,21 +19,23 @@
 //! 清单外指纹返回 `InvalidData` 硬错（不再静默回退标准 rustls）：配置了
 //! 指纹说明用户在意 ClientHello 伪装，静默降级等于伪装失效。
 
-use std::future::Future;
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    future::Future,
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use btls::ssl::{KeyShare, SslConnector, SslMethod, SslRef};
+use rustls::client::danger::ServerCertVerifier;
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_btls::SslStream as TokioSslStream;
 use tracing::debug;
 use xray_transport::connection::Connection;
 
-use rustls::client::danger::ServerCertVerifier;
-use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use crate::fingerprint::Fingerprint;
 
 // ============================================================
@@ -152,23 +154,16 @@ fn chrome_133_connector_alpn(alpn: &'static [u8]) -> io::Result<SslConnector> {
     let mut builder =
         SslConnector::builder(SslMethod::tls()).map_err(|e| io::Error::other(e.to_string()))?;
 
-    builder
-        .set_cipher_list(CHROME_133_CIPHER_LIST)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    builder
-        .set_sigalgs_list(CHROME_133_SIGALGS)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    builder
-        .set_curves_list(CHROME_133_CURVES)
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_cipher_list(CHROME_133_CIPHER_LIST).map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_sigalgs_list(CHROME_133_SIGALGS).map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_curves_list(CHROME_133_CURVES).map_err(|e| io::Error::other(e.to_string()))?;
     if !alpn.is_empty() {
-        builder
-            .set_alpn_protos(alpn)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        builder.set_alpn_protos(alpn).map_err(|e| io::Error::other(e.to_string()))?;
     }
     builder.set_grease_enabled(true);
     builder.set_permute_extensions(true);
-    builder.set_extension_permutation(&chrome_133_ext_perm())
+    builder
+        .set_extension_permutation(&chrome_133_ext_perm())
         .map_err(|e| io::Error::other(e.to_string()))?;
     builder.set_record_size_limit(0x4001);
     builder
@@ -236,21 +231,14 @@ fn chrome_131_connector() -> io::Result<SslConnector> {
     let mut builder =
         SslConnector::builder(SslMethod::tls()).map_err(|e| io::Error::other(e.to_string()))?;
 
-    builder
-        .set_cipher_list(CHROME_131_CIPHER_LIST)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    builder
-        .set_sigalgs_list(CHROME_131_SIGALGS)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    builder
-        .set_curves_list(CHROME_131_CURVES)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    builder
-        .set_alpn_protos(CHROME_131_ALPN)
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_cipher_list(CHROME_131_CIPHER_LIST).map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_sigalgs_list(CHROME_131_SIGALGS).map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_curves_list(CHROME_131_CURVES).map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_alpn_protos(CHROME_131_ALPN).map_err(|e| io::Error::other(e.to_string()))?;
     builder.set_grease_enabled(true);
     builder.set_permute_extensions(true);
-    builder.set_extension_permutation(&chrome_131_ext_perm())
+    builder
+        .set_extension_permutation(&chrome_131_ext_perm())
         .map_err(|e| io::Error::other(e.to_string()))?;
     // Chrome 131 无 record_size_limit / delegated_credentials
 
@@ -385,18 +373,13 @@ fn firefox_148_connector() -> io::Result<SslConnector> {
     builder
         .set_cipher_list(FIREFOX_148_CIPHER_LIST)
         .map_err(|e| io::Error::other(e.to_string()))?;
-    builder
-        .set_sigalgs_list(FIREFOX_148_SIGALGS)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    builder
-        .set_curves_list(FIREFOX_148_CURVES)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    builder
-        .set_alpn_protos(FIREFOX_148_ALPN)
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_sigalgs_list(FIREFOX_148_SIGALGS).map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_curves_list(FIREFOX_148_CURVES).map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_alpn_protos(FIREFOX_148_ALPN).map_err(|e| io::Error::other(e.to_string()))?;
     builder.set_grease_enabled(true);
     builder.set_permute_extensions(true);
-    builder.set_extension_permutation(&firefox_148_ext_perm())
+    builder
+        .set_extension_permutation(&firefox_148_ext_perm())
         .map_err(|e| io::Error::other(e.to_string()))?;
     // Firefox 不使用 record_size_limit / delegated_credentials
 
@@ -443,18 +426,13 @@ fn firefox_120_connector() -> io::Result<SslConnector> {
     builder
         .set_cipher_list(FIREFOX_120_CIPHER_LIST)
         .map_err(|e| io::Error::other(e.to_string()))?;
-    builder
-        .set_sigalgs_list(FIREFOX_120_SIGALGS)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    builder
-        .set_curves_list(FIREFOX_120_CURVES)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    builder
-        .set_alpn_protos(FIREFOX_120_ALPN)
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_sigalgs_list(FIREFOX_120_SIGALGS).map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_curves_list(FIREFOX_120_CURVES).map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_alpn_protos(FIREFOX_120_ALPN).map_err(|e| io::Error::other(e.to_string()))?;
     builder.set_grease_enabled(true);
     builder.set_permute_extensions(true);
-    builder.set_extension_permutation(&firefox_120_ext_perm())
+    builder
+        .set_extension_permutation(&firefox_120_ext_perm())
         .map_err(|e| io::Error::other(e.to_string()))?;
     // Firefox 不使用 record_size_limit / delegated_credentials
 
@@ -505,8 +483,7 @@ const SAFARI_26_3_SIGALGS: &str = concat!(
     "rsa_pkcs1_sha384:",
     "ecdsa_secp521r1_sha512:",
     "rsa_pkcs1_sha512:",
-    "ed25519"
-    // BoringSSL 不支持: rsa_pkcs1_sha1, ecdsa_sha1, ed448, rsa_pss_pss_*
+    "ed25519" // BoringSSL 不支持: rsa_pkcs1_sha1, ecdsa_sha1, ed448, rsa_pss_pss_*
 );
 
 /// Safari 26.3 supported groups：X25519, P-256, P-384, P-521。
@@ -534,18 +511,13 @@ fn safari_26_3_connector() -> io::Result<SslConnector> {
     builder
         .set_cipher_list(SAFARI_26_3_CIPHER_LIST)
         .map_err(|e| io::Error::other(e.to_string()))?;
-    builder
-        .set_sigalgs_list(SAFARI_26_3_SIGALGS)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    builder
-        .set_curves_list(SAFARI_26_3_CURVES)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    builder
-        .set_alpn_protos(SAFARI_26_3_ALPN)
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_sigalgs_list(SAFARI_26_3_SIGALGS).map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_curves_list(SAFARI_26_3_CURVES).map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_alpn_protos(SAFARI_26_3_ALPN).map_err(|e| io::Error::other(e.to_string()))?;
     builder.set_grease_enabled(true);
     builder.set_permute_extensions(true);
-    builder.set_extension_permutation(&safari_26_3_ext_perm())
+    builder
+        .set_extension_permutation(&safari_26_3_ext_perm())
         .map_err(|e| io::Error::other(e.to_string()))?;
     // Safari 不使用 record_size_limit / delegated_credentials
 
@@ -648,21 +620,14 @@ fn edge_106_connector() -> io::Result<SslConnector> {
     let mut builder =
         SslConnector::builder(SslMethod::tls()).map_err(|e| io::Error::other(e.to_string()))?;
 
-    builder
-        .set_cipher_list(EDGE_106_CIPHER_LIST)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    builder
-        .set_sigalgs_list(EDGE_106_SIGALGS)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    builder
-        .set_curves_list(EDGE_106_CURVES)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    builder
-        .set_alpn_protos(EDGE_106_ALPN)
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_cipher_list(EDGE_106_CIPHER_LIST).map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_sigalgs_list(EDGE_106_SIGALGS).map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_curves_list(EDGE_106_CURVES).map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_alpn_protos(EDGE_106_ALPN).map_err(|e| io::Error::other(e.to_string()))?;
     builder.set_grease_enabled(true);
     builder.set_permute_extensions(true);
-    builder.set_extension_permutation(&edge_106_ext_perm())
+    builder
+        .set_extension_permutation(&edge_106_ext_perm())
         .map_err(|e| io::Error::other(e.to_string()))?;
     // Edge 106 无 record_size_limit / delegated_credentials / ECH
 
@@ -729,15 +694,12 @@ fn qihoo_360_11_0_connector() -> io::Result<SslConnector> {
     builder
         .set_sigalgs_list(QIHOO_360_11_0_SIGALGS)
         .map_err(|e| io::Error::other(e.to_string()))?;
-    builder
-        .set_curves_list(QIHOO_360_11_0_CURVES)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    builder
-        .set_alpn_protos(QIHOO_360_11_0_ALPN)
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_curves_list(QIHOO_360_11_0_CURVES).map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_alpn_protos(QIHOO_360_11_0_ALPN).map_err(|e| io::Error::other(e.to_string()))?;
     builder.set_grease_enabled(true);
     builder.set_permute_extensions(true);
-    builder.set_extension_permutation(&qihoo_360_11_0_ext_perm())
+    builder
+        .set_extension_permutation(&qihoo_360_11_0_ext_perm())
         .map_err(|e| io::Error::other(e.to_string()))?;
     // 360 无 record_size_limit / delegated_credentials / ECH / ALPS
 
@@ -823,21 +785,14 @@ fn qq_11_1_connector() -> io::Result<SslConnector> {
     let mut builder =
         SslConnector::builder(SslMethod::tls()).map_err(|e| io::Error::other(e.to_string()))?;
 
-    builder
-        .set_cipher_list(QQ_11_1_CIPHER_LIST)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    builder
-        .set_sigalgs_list(QQ_11_1_SIGALGS)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    builder
-        .set_curves_list(QQ_11_1_CURVES)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    builder
-        .set_alpn_protos(QQ_11_1_ALPN)
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_cipher_list(QQ_11_1_CIPHER_LIST).map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_sigalgs_list(QQ_11_1_SIGALGS).map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_curves_list(QQ_11_1_CURVES).map_err(|e| io::Error::other(e.to_string()))?;
+    builder.set_alpn_protos(QQ_11_1_ALPN).map_err(|e| io::Error::other(e.to_string()))?;
     builder.set_grease_enabled(true);
     builder.set_permute_extensions(true);
-    builder.set_extension_permutation(&qq_11_1_ext_perm())
+    builder
+        .set_extension_permutation(&qq_11_1_ext_perm())
         .map_err(|e| io::Error::other(e.to_string()))?;
     // QQ 无 record_size_limit / delegated_credentials / ECH
 
@@ -858,149 +813,167 @@ pub(crate) fn connector_for_fingerprint(fp: &Fingerprint) -> Option<io::Result<F
                 key_shares: CHROME_133_KEY_SHARES,
                 alps: CHROME_133_ALPS,
             }))
-        }
-        Fingerprint::HelloChrome131 => {
-            Some(chrome_131_connector().map(|c| FingerprintConfig {
-                connector: c,
-                key_shares: CHROME_131_KEY_SHARES,
-                alps: CHROME_131_ALPS,
-            }))
-        }
-        Fingerprint::HelloChrome120 => {
-            Some(chrome_120_connector().map(|c| FingerprintConfig {
-                connector: c,
-                key_shares: CHROME_120_KEY_SHARES,
-                alps: CHROME_120_ALPS,
-            }))
-        }
+        },
+        Fingerprint::HelloChrome131 => Some(chrome_131_connector().map(|c| FingerprintConfig {
+            connector: c,
+            key_shares: CHROME_131_KEY_SHARES,
+            alps: CHROME_131_ALPS,
+        })),
+        Fingerprint::HelloChrome120 => Some(chrome_120_connector().map(|c| FingerprintConfig {
+            connector: c,
+            key_shares: CHROME_120_KEY_SHARES,
+            alps: CHROME_120_ALPS,
+        })),
         Fingerprint::Firefox | Fingerprint::HelloFirefox148 => {
             Some(firefox_148_connector().map(|c| FingerprintConfig {
                 connector: c,
                 key_shares: FIREFOX_148_KEY_SHARES,
                 alps: FIREFOX_148_ALPS,
             }))
-        }
-        Fingerprint::HelloFirefox120 => {
-            Some(firefox_120_connector().map(|c| FingerprintConfig {
-                connector: c,
-                key_shares: FIREFOX_120_KEY_SHARES,
-                alps: FIREFOX_120_ALPS,
-            }))
-        }
+        },
+        Fingerprint::HelloFirefox120 => Some(firefox_120_connector().map(|c| FingerprintConfig {
+            connector: c,
+            key_shares: FIREFOX_120_KEY_SHARES,
+            alps: FIREFOX_120_ALPS,
+        })),
         Fingerprint::Safari | Fingerprint::HelloSafari26_3 => {
             Some(safari_26_3_connector().map(|c| FingerprintConfig {
                 connector: c,
                 key_shares: SAFARI_26_3_KEY_SHARES,
                 alps: SAFARI_26_3_ALPS,
             }))
-        }
-        Fingerprint::HelloIos13 => {
-            Some(safari_26_3_connector().map(|c| FingerprintConfig {
-                connector: c,
-                key_shares: IOS_13_KEY_SHARES,
-                alps: IOS_13_ALPS,
-            }))
-        }
-        Fingerprint::Ios | Fingerprint::HelloIos14 => {
-            Some(safari_26_3_connector().map(|c| FingerprintConfig {
-                connector: c,
-                key_shares: IOS_14_KEY_SHARES,
-                alps: IOS_14_ALPS,
-            }))
-        }
-        Fingerprint::Edge | Fingerprint::HelloEdge106 => {
-            Some(edge_106_connector().map(|c| FingerprintConfig {
-                connector: c,
-                key_shares: EDGE_106_KEY_SHARES,
-                alps: EDGE_106_ALPS,
-            }))
-        }
+        },
+        Fingerprint::HelloIos13 => Some(safari_26_3_connector().map(|c| FingerprintConfig {
+            connector: c,
+            key_shares: IOS_13_KEY_SHARES,
+            alps: IOS_13_ALPS,
+        })),
+        Fingerprint::Ios | Fingerprint::HelloIos14 => Some(safari_26_3_connector().map(|c| {
+            FingerprintConfig { connector: c, key_shares: IOS_14_KEY_SHARES, alps: IOS_14_ALPS }
+        })),
+        Fingerprint::Edge | Fingerprint::HelloEdge106 => Some(edge_106_connector().map(|c| {
+            FingerprintConfig { connector: c, key_shares: EDGE_106_KEY_SHARES, alps: EDGE_106_ALPS }
+        })),
         Fingerprint::Qihoo360 | Fingerprint::Hello360_11_0 => {
             Some(qihoo_360_11_0_connector().map(|c| FingerprintConfig {
                 connector: c,
                 key_shares: QIHOO_360_11_0_KEY_SHARES,
                 alps: QIHOO_360_11_0_ALPS,
             }))
-        }
-        Fingerprint::Qq | Fingerprint::HelloQq_11_1 => {
+        },
+        Fingerprint::Qq | Fingerprint::HelloQq_11_1 => Some(qq_11_1_connector().map(|c| {
+            FingerprintConfig { connector: c, key_shares: QQ_11_1_KEY_SHARES, alps: QQ_11_1_ALPS }
+        })),
+        // Old Chrome variants → Chrome 120 (oldest implemented)
+        Fingerprint::HelloChromeAuto
+        | Fingerprint::HelloChrome58
+        | Fingerprint::HelloChrome62
+        | Fingerprint::HelloChrome70
+        | Fingerprint::HelloChrome72
+        | Fingerprint::HelloChrome83
+        | Fingerprint::HelloChrome87
+        | Fingerprint::HelloChrome96
+        | Fingerprint::HelloChrome100
+        | Fingerprint::HelloChrome102
+        | Fingerprint::HelloChrome106Shuffle
+        | Fingerprint::HelloChrome100Psk
+        | Fingerprint::HelloChrome112PskShuf
+        | Fingerprint::HelloChrome114PaddingPskShuf
+        | Fingerprint::HelloChrome115Pq
+        | Fingerprint::HelloChrome115PqPsk
+        | Fingerprint::HelloChrome120Pq => {
+            tracing::warn!(target: "xray_tls::fingerprint", "old Chrome fingerprint {:?} falling back to Chrome 120", fp);
+            Some(chrome_120_connector().map(|c| FingerprintConfig {
+                connector: c,
+                key_shares: CHROME_120_KEY_SHARES,
+                alps: CHROME_120_ALPS,
+            }))
+        },
+        // Old Firefox variants → Firefox 120
+        Fingerprint::HelloFirefoxAuto
+        | Fingerprint::HelloFirefox55
+        | Fingerprint::HelloFirefox56
+        | Fingerprint::HelloFirefox63
+        | Fingerprint::HelloFirefox65
+        | Fingerprint::HelloFirefox99
+        | Fingerprint::HelloFirefox102
+        | Fingerprint::HelloFirefox105 => {
+            tracing::warn!(target: "xray_tls::fingerprint", "old Firefox fingerprint {:?} falling back to Firefox 120", fp);
+            Some(firefox_120_connector().map(|c| FingerprintConfig {
+                connector: c,
+                key_shares: FIREFOX_120_KEY_SHARES,
+                alps: FIREFOX_120_ALPS,
+            }))
+        },
+        // Old iOS/Safari variants → iOS 13
+        Fingerprint::HelloIosAuto
+        | Fingerprint::HelloIos11_1
+        | Fingerprint::HelloIos12_1
+        | Fingerprint::HelloSafari16_0
+        | Fingerprint::HelloSafariAuto => {
+            tracing::warn!(target: "xray_tls::fingerprint", "old iOS/Safari fingerprint {:?} falling back to Safari 26.3", fp);
+            Some(safari_26_3_connector().map(|c| FingerprintConfig {
+                connector: c,
+                key_shares: IOS_13_KEY_SHARES,
+                alps: IOS_13_ALPS,
+            }))
+        },
+        // Old Edge variants → Edge 106
+        Fingerprint::HelloEdge85 | Fingerprint::HelloEdgeAuto => {
+            tracing::warn!(target: "xray_tls::fingerprint", "old Edge fingerprint {:?} falling back to Edge 106", fp);
+            Some(edge_106_connector().map(|c| FingerprintConfig {
+                connector: c,
+                key_shares: EDGE_106_KEY_SHARES,
+                alps: EDGE_106_ALPS,
+            }))
+        },
+        // Old 360/QQ variants → existing
+        Fingerprint::Hello360Auto | Fingerprint::Hello360_7_5 => {
+            tracing::warn!(target: "xray_tls::fingerprint", "old 360 fingerprint {:?} falling back to 360 11.0", fp);
+            Some(qihoo_360_11_0_connector().map(|c| FingerprintConfig {
+                connector: c,
+                key_shares: QIHOO_360_11_0_KEY_SHARES,
+                alps: QIHOO_360_11_0_ALPS,
+            }))
+        },
+        Fingerprint::HelloQqAuto => {
+            tracing::warn!(target: "xray_tls::fingerprint", "old QQ fingerprint {:?} falling back to QQ 11.1", fp);
             Some(qq_11_1_connector().map(|c| FingerprintConfig {
                 connector: c,
                 key_shares: QQ_11_1_KEY_SHARES,
                 alps: QQ_11_1_ALPS,
             }))
-        }
-        // Old Chrome variants → Chrome 120 (oldest implemented)
-        Fingerprint::HelloChromeAuto | Fingerprint::HelloChrome58 | Fingerprint::HelloChrome62
-        | Fingerprint::HelloChrome70 | Fingerprint::HelloChrome72 | Fingerprint::HelloChrome83
-        | Fingerprint::HelloChrome87 | Fingerprint::HelloChrome96 | Fingerprint::HelloChrome100
-        | Fingerprint::HelloChrome102 | Fingerprint::HelloChrome106Shuffle
-        | Fingerprint::HelloChrome100Psk | Fingerprint::HelloChrome112PskShuf
-        | Fingerprint::HelloChrome114PaddingPskShuf | Fingerprint::HelloChrome115Pq
-        | Fingerprint::HelloChrome115PqPsk | Fingerprint::HelloChrome120Pq => {
-            tracing::warn!(target: "xray_tls::fingerprint", "old Chrome fingerprint {:?} falling back to Chrome 120", fp);
-            Some(chrome_120_connector().map(|c| FingerprintConfig {
-                connector: c, key_shares: CHROME_120_KEY_SHARES, alps: CHROME_120_ALPS,
-            }))
-        }
-        // Old Firefox variants → Firefox 120
-        Fingerprint::HelloFirefoxAuto | Fingerprint::HelloFirefox55 | Fingerprint::HelloFirefox56
-        | Fingerprint::HelloFirefox63 | Fingerprint::HelloFirefox65 | Fingerprint::HelloFirefox99
-        | Fingerprint::HelloFirefox102 | Fingerprint::HelloFirefox105 => {
-            tracing::warn!(target: "xray_tls::fingerprint", "old Firefox fingerprint {:?} falling back to Firefox 120", fp);
-            Some(firefox_120_connector().map(|c| FingerprintConfig {
-                connector: c, key_shares: FIREFOX_120_KEY_SHARES, alps: FIREFOX_120_ALPS,
-            }))
-        }
-        // Old iOS/Safari variants → iOS 13
-        Fingerprint::HelloIosAuto | Fingerprint::HelloIos11_1 | Fingerprint::HelloIos12_1
-        | Fingerprint::HelloSafari16_0 | Fingerprint::HelloSafariAuto => {
-            tracing::warn!(target: "xray_tls::fingerprint", "old iOS/Safari fingerprint {:?} falling back to Safari 26.3", fp);
-            Some(safari_26_3_connector().map(|c| FingerprintConfig {
-                connector: c, key_shares: IOS_13_KEY_SHARES, alps: IOS_13_ALPS,
-            }))
-        }
-        // Old Edge variants → Edge 106
-        Fingerprint::HelloEdge85 | Fingerprint::HelloEdgeAuto => {
-            tracing::warn!(target: "xray_tls::fingerprint", "old Edge fingerprint {:?} falling back to Edge 106", fp);
-            Some(edge_106_connector().map(|c| FingerprintConfig {
-                connector: c, key_shares: EDGE_106_KEY_SHARES, alps: EDGE_106_ALPS,
-            }))
-        }
-        // Old 360/QQ variants → existing
-        Fingerprint::Hello360Auto | Fingerprint::Hello360_7_5 => {
-            tracing::warn!(target: "xray_tls::fingerprint", "old 360 fingerprint {:?} falling back to 360 11.0", fp);
-            Some(qihoo_360_11_0_connector().map(|c| FingerprintConfig {
-                connector: c, key_shares: QIHOO_360_11_0_KEY_SHARES, alps: QIHOO_360_11_0_ALPS,
-            }))
-        }
-        Fingerprint::HelloQqAuto => {
-            tracing::warn!(target: "xray_tls::fingerprint", "old QQ fingerprint {:?} falling back to QQ 11.1", fp);
-            Some(qq_11_1_connector().map(|c| FingerprintConfig {
-                connector: c, key_shares: QQ_11_1_KEY_SHARES, alps: QQ_11_1_ALPS,
-            }))
-        }
+        },
         // Android → Chrome (Android WebView ≈ Chrome)
         Fingerprint::Android | Fingerprint::HelloAndroid11OkHttp => {
             tracing::warn!(target: "xray_tls::fingerprint", "Android fingerprint {:?} falling back to Chrome 133", fp);
             Some(chrome_133_connector().map(|c| FingerprintConfig {
-                connector: c, key_shares: CHROME_133_KEY_SHARES, alps: CHROME_133_ALPS,
+                connector: c,
+                key_shares: CHROME_133_KEY_SHARES,
+                alps: CHROME_133_ALPS,
             }))
-        }
+        },
         // Golang → Chrome 120 (Go stdlib has no uTLS fingerprint)
         Fingerprint::HelloGolang => {
             tracing::warn!(target: "xray_tls::fingerprint", "Golang fingerprint falling back to Chrome 120");
             Some(chrome_120_connector().map(|c| FingerprintConfig {
-                connector: c, key_shares: CHROME_120_KEY_SHARES, alps: CHROME_120_ALPS,
+                connector: c,
+                key_shares: CHROME_120_KEY_SHARES,
+                alps: CHROME_120_ALPS,
             }))
-        }
+        },
         // Random → Chrome 133 (most common modern browser)
-        Fingerprint::Random | Fingerprint::Randomized | Fingerprint::HelloRandomized
+        Fingerprint::Random
+        | Fingerprint::Randomized
+        | Fingerprint::HelloRandomized
         | Fingerprint::HelloRandomizedAlpn => {
             tracing::debug!(target: "xray_tls::fingerprint", "Random fingerprint → Chrome 133");
             Some(chrome_133_connector().map(|c| FingerprintConfig {
-                connector: c, key_shares: CHROME_133_KEY_SHARES, alps: CHROME_133_ALPS,
+                connector: c,
+                key_shares: CHROME_133_KEY_SHARES,
+                alps: CHROME_133_ALPS,
             }))
-        }
+        },
         // RandomizedNoALPN：uTLS 随机化指纹的无 ALPN 变体。btls 无法复刻
         // uTLS 的 cipher/扩展顺序随机化，就近映射到无 ALPN 的 Chrome 133
         // 配置（ALPS 依赖 ALPN 协商，随之一并置空）。
@@ -1010,14 +983,14 @@ pub(crate) fn connector_for_fingerprint(fp: &Fingerprint) -> Option<io::Result<F
                 key_shares: CHROME_133_KEY_SHARES,
                 alps: b"",
             }))
-        }
+        },
         // UniformRandom：uTLS 均匀权重随机化（Go xray 未收录该预设名，Rust
         // 端按 uTLS 库补全）。btls 无逐字段均匀随机化能力，就近映射 Chrome 133。
-        Fingerprint::UniformRandom => {
-            Some(chrome_133_connector().map(|c| FingerprintConfig {
-                connector: c, key_shares: CHROME_133_KEY_SHARES, alps: CHROME_133_ALPS,
-            }))
-        }
+        Fingerprint::UniformRandom => Some(chrome_133_connector().map(|c| FingerprintConfig {
+            connector: c,
+            key_shares: CHROME_133_KEY_SHARES,
+            alps: CHROME_133_ALPS,
+        })),
         // 清单外指纹：硬错 InvalidData。配置了指纹说明用户在意 ClientHello
         // 伪装，静默回退标准 rustls 等于伪装失效（批3 裁决：显式失败）。
         _ => Some(Err(io::Error::new(
@@ -1048,13 +1021,12 @@ impl<S: Connection + Unpin> BtlsConn<S> {
     /// 创建 btls uTLS 连接（完成握手）。
     ///
     /// # 参数
-    /// - `verifier`：rustls 服务端证书验证器。`Some(v)` 时握手成功后对 btls
-    ///   拿到的 peer 证书链做**回接验证**（链 + 主机名，对齐 Go uTLS 非
-    ///   `InsecureSkipVerify` 时的完整验证，tls.go `copyConfig`）；`None` =
-    ///   跳过（`allowInsecure=true` 等价）。`allowInsecure`/pinned/vcn 语义由
-    ///   调用方传入的 verifier 编码（`build_client_config` 产物直接取
-    ///   `ClientConfig.verifier`）。REALITY 路径（`from_parts`）自管 HMAC，
-    ///   不经此参数。
+    /// - `verifier`：rustls 服务端证书验证器。`Some(v)` 时握手成功后对 btls 拿到的 peer
+    ///   证书链做**回接验证**（链 + 主机名，对齐 Go uTLS 非 `InsecureSkipVerify`
+    ///   时的完整验证，tls.go `copyConfig`）；`None` = 跳过（`allowInsecure=true`
+    ///   等价）。`allowInsecure`/pinned/vcn 语义由 调用方传入的 verifier
+    ///   编码（`build_client_config` 产物直接取 `ClientConfig.verifier`）。REALITY
+    ///   路径（`from_parts`）自管 HMAC， 不经此参数。
     pub async fn connect(
         stream: S,
         server_name: &str,
@@ -1062,7 +1034,8 @@ impl<S: Connection + Unpin> BtlsConn<S> {
         ech_config_list: Option<&str>,
         verifier: Option<Arc<dyn ServerCertVerifier>>,
     ) -> io::Result<Self> {
-        Self::connect_with_alpn(stream, server_name, fingerprint, ech_config_list, verifier, None).await
+        Self::connect_with_alpn(stream, server_name, fingerprint, ech_config_list, verifier, None)
+            .await
     }
 
     /// [`connect`] 的 ALPN 覆盖版（ws/httpupgrade 出站接线用，md5i）。
@@ -1088,18 +1061,15 @@ impl<S: Connection + Unpin> BtlsConn<S> {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "fingerprint not supported by btls",
-                ))
-            }
+                ));
+            },
         };
 
-        let mut cfg = fp_config.connector
-            .configure()
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let mut cfg =
+            fp_config.connector.configure().map_err(|e| io::Error::other(e.to_string()))?;
         cfg.set_verify_hostname(false);
 
-        let mut ssl = cfg
-            .into_ssl(server_name)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let mut ssl = cfg.into_ssl(server_name).map_err(|e| io::Error::other(e.to_string()))?;
 
         // per-connection 配置：key shares 和 ALPS 按指纹不同
         ssl.set_client_key_shares(fp_config.key_shares)
@@ -1111,13 +1081,11 @@ impl<S: Connection + Unpin> BtlsConn<S> {
         // ALPN 覆盖（md5i ws/httpupgrade）：SSL_set_alpn_protos 覆盖连接器
         // 模板的 ALPN（BoringSSL per-SSL 优先于 per-CTX）。指纹其余形态不变。
         if let Some(alpn) = alpn_wire {
-            ssl.set_alpn_protos(alpn)
-                .map_err(|e| io::Error::other(e.to_string()))?;
+            ssl.set_alpn_protos(alpn).map_err(|e| io::Error::other(e.to_string()))?;
         }
         // ECH（加密 ClientHello）：握手前设置 config list
         if let Some(list) = ech_config_list {
-            ssl.apply_ech(&[], list)
-                .map_err(|e| io::Error::other(e.to_string()))?;
+            ssl.apply_ech(&[], list).map_err(|e| io::Error::other(e.to_string()))?;
         }
         debug!(
             target: "xray_tls::btls",
@@ -1126,12 +1094,15 @@ impl<S: Connection + Unpin> BtlsConn<S> {
             ech = ech_config_list.is_some(),
             "btls uTLS 握手开始"
         );
-        let tls_stream = TokioSslStream::new(ssl, stream)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let tls_stream =
+            TokioSslStream::new(ssl, stream).map_err(|e| io::Error::other(e.to_string()))?;
 
         // 异步握手（tokio_btls SslStream::connect 需要 Pin<&mut Self>）
         let mut pinned = Box::pin(tls_stream);
-        pinned.as_mut().connect().await
+        pinned
+            .as_mut()
+            .connect()
+            .await
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e.to_string()))?;
 
         // 回接验证：btls 全程 set_verify(NONE)（保 ClientHello 指纹不被
@@ -1147,12 +1118,9 @@ impl<S: Connection + Unpin> BtlsConn<S> {
             "btls uTLS 握手完成"
         );
 
-        Ok(Self {
-            stream: pinned,
-            fingerprint,
-            server_name: server_name.to_string(),
-        })
+        Ok(Self { stream: pinned, fingerprint, server_name: server_name.to_string() })
     }
+
     /// 从已握手 stream 组装（[`crate::btls_reality::connect_reality`] 用）。
     pub(crate) fn from_parts(
         stream: Pin<Box<TokioSslStream<S>>>,
@@ -1172,19 +1140,23 @@ fn verify_peer_certs(
     server_name: &str,
     verifier: &dyn ServerCertVerifier,
 ) -> io::Result<()> {
-    let chain = ssl
-        .peer_cert_chain()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "btls: server sent no certificate"))?;
+    let chain = ssl.peer_cert_chain().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "btls: server sent no certificate")
+    })?;
     let mut ders: Vec<CertificateDer<'static>> = Vec::with_capacity(chain.len());
     for cert in chain.iter() {
         let der = cert.to_der().map_err(|e| io::Error::other(e.to_string()))?;
         ders.push(CertificateDer::from(der));
     }
     let Some((end_entity, intermediates)) = ders.split_first() else {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "btls: empty peer certificate chain"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "btls: empty peer certificate chain",
+        ));
     };
-    let name: ServerName<'static> = ServerName::try_from(server_name.to_string())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid server name: {e}")))?;
+    let name: ServerName<'static> = ServerName::try_from(server_name.to_string()).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidInput, format!("invalid server name: {e}"))
+    })?;
     verifier
         .verify_server_cert(end_entity, intermediates, &name, &[], UnixTime::now())
         .map_err(|e| {
@@ -1266,7 +1238,9 @@ impl<S: Connection + Unpin> ConnInterface for BtlsConn<S> {
         Box::pin(async { Ok(()) })
     }
 
-    fn handshake_server_name<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
+    fn handshake_server_name<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
         let name = self.server_name.clone();
         Box::pin(async move { name })
     }
@@ -1292,16 +1266,34 @@ mod tests {
     #[test]
     fn fingerprint_list_fully_supported_by_btls() {
         let mut names = vec![
-            "chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq",
-            "random", "randomized", "randomizednoalpn", "uniformrandom",
-            "hellofirefox_120", "hellofirefox_148", "hellochrome_120",
-            "hellochrome_131", "hellochrome_133", "helloios_13", "helloios_14",
-            "helloedge_106", "hellosafari_26_3", "hello360_11_0", "helloqq_11_1",
+            "chrome",
+            "firefox",
+            "safari",
+            "ios",
+            "android",
+            "edge",
+            "360",
+            "qq",
+            "random",
+            "randomized",
+            "randomizednoalpn",
+            "uniformrandom",
+            "hellofirefox_120",
+            "hellofirefox_148",
+            "hellochrome_120",
+            "hellochrome_131",
+            "hellochrome_133",
+            "helloios_13",
+            "helloios_14",
+            "helloedge_106",
+            "hellosafari_26_3",
+            "hello360_11_0",
+            "helloqq_11_1",
         ];
         for name in names.drain(..) {
             let fp = get_fingerprint(name).unwrap_or_else(|e| panic!("{name}: {e}"));
-            let r = connector_for_fingerprint(&fp)
-                .unwrap_or_else(|| panic!("{name}: no connector"));
+            let r =
+                connector_for_fingerprint(&fp).unwrap_or_else(|| panic!("{name}: no connector"));
             assert!(r.is_ok(), "{name} ({fp:?}) must build a connector: {:?}", r.err());
             assert!(super::fingerprint_supported(&fp), "{name} must be supported");
         }
@@ -1326,14 +1318,10 @@ mod tests {
     #[test]
     fn randomized_no_alpn_skips_alps() {
         let fp = Fingerprint::RandomizedNoAlpn;
-        let cfg = connector_for_fingerprint(&fp)
-            .expect("Some")
-            .expect("Ok");
+        let cfg = connector_for_fingerprint(&fp).expect("Some").expect("Ok");
         assert!(cfg.alps.is_empty());
         // 有 ALPN 变体对照：Chrome 133 携带 h2 ALPS
-        let with = connector_for_fingerprint(&Fingerprint::Chrome)
-            .expect("Some")
-            .expect("Ok");
+        let with = connector_for_fingerprint(&Fingerprint::Chrome).expect("Some").expect("Ok");
         assert!(!with.alps.is_empty());
     }
 }

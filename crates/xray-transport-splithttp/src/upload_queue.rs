@@ -19,10 +19,9 @@
 //! 只保留 Payload + Seq。Reader 流式优化留 follow-up（依赖 xray_buf::Reader
 //! trait 适配）。
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::{cmp::Reverse, collections::BinaryHeap};
 
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::error::{Result, SplitHttpError};
 
@@ -49,7 +48,7 @@ struct BySeq(Reverse<u64>, Packet);
 
 impl PartialEq for BySeq {
     fn eq(&self, other: &Self) -> bool {
-        self.0 .0 == other.0 .0
+        self.0.0 == other.0.0
     }
 }
 impl Eq for BySeq {}
@@ -116,10 +115,7 @@ impl UploadQueue {
     /// # Errors
     /// - [`SplitHttpError::QueueClosed`]：队列已关闭（push 在 close 后调用）
     pub async fn push(&self, packet: Packet) -> Result<()> {
-        self.push_tx
-            .send(packet)
-            .await
-            .map_err(|_| SplitHttpError::QueueClosed)?;
+        self.push_tx.send(packet).await.map_err(|_| SplitHttpError::QueueClosed)?;
         self.notify.notify_one();
         Ok(())
     }
@@ -180,7 +176,7 @@ impl UploadQueue {
             {
                 let mut inner = self.inner.lock().await;
                 if let Some(by_seq) = inner.heap.peek() {
-                    if by_seq.0 .0 == inner.next_seq {
+                    if by_seq.0.0 == inner.next_seq {
                         // 命中 nextSeq，pop 出来
                         let packet = inner.heap.pop().unwrap().1;
                         drop(inner);
@@ -209,7 +205,7 @@ impl UploadQueue {
                     None => {
                         // 已 close：heap 没匹配 packet → gap（客户端漏发）返 EOF
                         return Ok(0);
-                    }
+                    },
                     Some(rx) => {
                         // 持锁 await 会有死锁风险，先 try_recv 非阻塞
                         match rx.try_recv() {
@@ -237,7 +233,7 @@ impl UploadQueue {
                                 }
                                 drop(inner);
                                 continue;
-                            }
+                            },
                             Err(mpsc::error::TryRecvError::Empty) => {
                                 if closed {
                                     drop(inner);
@@ -246,14 +242,14 @@ impl UploadQueue {
                                 drop(inner);
                                 self.notify.notified().await;
                                 continue;
-                            }
+                            },
                             Err(mpsc::error::TryRecvError::Disconnected) => {
                                 inner.pushed = None;
                                 drop(inner);
                                 continue;
-                            }
+                            },
                         }
-                    }
+                    },
                 }
             }
         }
@@ -374,7 +370,7 @@ mod tests {
             SplitHttpError::PacketQueueTooLarge { max, current } => {
                 assert_eq!(max, 2);
                 assert!(current > 2);
-            }
+            },
             other => panic!("expected PacketQueueTooLarge, got {other:?}"),
         }
     }

@@ -18,35 +18,26 @@
 //! - [`SubstrMatcher`] - 子串包含匹配
 //! - [`RegexMatcher`] - 正则表达式匹配
 
-pub mod matchers;
+pub mod any_linear;
+pub mod index_linear;
+pub mod index_mph;
 pub mod matcher_groups;
 pub mod matcher_sets;
-pub mod value_mph;
+pub mod matchers;
 pub mod value_linear;
-pub mod index_mph;
-pub mod index_linear;
-pub mod any_linear;
+pub mod value_mph;
 
-pub use matchers::{
-    DomainMatcher, FullMatcher, RegexMatcher, SubstrMatcher,
-};
-
-pub use matcher_groups::{
-    ACMatcherGroup, ACMatcherGroupError, DomainMatcherGroup,
-    FullMatcherGroup, MPHMatcherGroup, MPHMatcherGroupError,
-    SimpleMatcherGroup, SubstrMatcherGroup,
-};
-
-pub use matcher_sets::{
-    DomainMatcherSet, FullMatcherSet, SimpleMatcherSet,
-    SubstrMatcherSet,
-};
-
-pub use value_mph::MphValueMatcher;
-pub use value_linear::LinearValueMatcher;
-pub use index_mph::MphIndexMatcher;
-pub use index_linear::LinearIndexMatcher;
 pub use any_linear::LinearAnyMatcher;
+pub use index_linear::LinearIndexMatcher;
+pub use index_mph::MphIndexMatcher;
+pub use matcher_groups::{
+    ACMatcherGroup, ACMatcherGroupError, DomainMatcherGroup, FullMatcherGroup, MPHMatcherGroup,
+    MPHMatcherGroupError, SimpleMatcherGroup, SubstrMatcherGroup,
+};
+pub use matcher_sets::{DomainMatcherSet, FullMatcherSet, SimpleMatcherSet, SubstrMatcherSet};
+pub use matchers::{DomainMatcher, FullMatcher, RegexMatcher, SubstrMatcher};
+pub use value_linear::LinearValueMatcher;
+pub use value_mph::MphValueMatcher;
 
 /// 匹配器类型枚举。
 ///
@@ -72,24 +63,15 @@ impl MatcherType {
     ///
     /// - 正则表达式编译失败时返回错误
     /// - 未知匹配器类型时返回错误
-    pub fn new_matcher(
-        self,
-        pattern: &str,
-    ) -> Result<Box<dyn Matcher>, MatcherError> {
+    pub fn new_matcher(self, pattern: &str) -> Result<Box<dyn Matcher>, MatcherError> {
         match self {
-            MatcherType::Full => {
-                Ok(Box::new(FullMatcher::new(pattern)))
-            }
-            MatcherType::Domain => {
-                Ok(Box::new(DomainMatcher::new(pattern)))
-            }
-            MatcherType::Substr => {
-                Ok(Box::new(SubstrMatcher::new(pattern)))
-            }
+            MatcherType::Full => Ok(Box::new(FullMatcher::new(pattern))),
+            MatcherType::Domain => Ok(Box::new(DomainMatcher::new(pattern))),
+            MatcherType::Substr => Ok(Box::new(SubstrMatcher::new(pattern))),
             MatcherType::Regex => {
                 let matcher = RegexMatcher::new(pattern)?;
                 Ok(Box::new(matcher))
-            }
+            },
         }
     }
 }
@@ -259,6 +241,6 @@ pub fn composite_matches_reverse(matches: &[Vec<u32>]) -> Vec<u32> {
     matches.iter().rev().flatten().cloned().collect()
 }
 
+pub mod attributes;
 pub mod domain;
 pub mod ip;
-pub mod attributes;

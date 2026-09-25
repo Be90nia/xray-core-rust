@@ -4,9 +4,10 @@
 //! Pattern: SOCKS5 inbound (client side) + protocol outbound (over chosen transport)
 //! + protocol inbound (server side) + freedom outbound → echo.
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
 use xray_conf::{BuiltConfig, BuiltEntry, BuiltInbound, BuiltOutbound};
 use xray_core::functions::start_full;
 
@@ -45,11 +46,11 @@ async fn start_echo() -> std::net::SocketAddr {
                                     if sock.write_all(&buf[..n]).await.is_err() {
                                         break;
                                     }
-                                }
+                                },
                             }
                         }
                     });
-                }
+                },
                 Err(_) => break,
             }
         }
@@ -65,9 +66,7 @@ async fn pick_free_port() -> u16 {
 }
 
 async fn socks5_echo_round_trip(proxy_port: u16, echo_port: u16, payload: &[u8]) {
-    let mut sock = TcpStream::connect(("127.0.0.1", proxy_port))
-        .await
-        .expect("connect socks");
+    let mut sock = TcpStream::connect(("127.0.0.1", proxy_port)).await.expect("connect socks");
     sock.write_all(&[0x05, 0x01, 0x00]).await.expect("socks greet");
     let mut greet = [0u8; 2];
     sock.read_exact(&mut greet).await.expect("socks greet resp");
@@ -155,10 +154,7 @@ fn vmess_outbound(upstream_port: u16, stream_settings_json: serde_json::Value) -
 
 fn freedom_outbound() -> BuiltOutbound {
     BuiltOutbound {
-        entry: BuiltEntry {
-            kind: "freedom".into(),
-            data: b"{}".to_vec(),
-        },
+        entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
         tag: "direct".into(),
         send_through: None,
         stream_settings_json: None,
@@ -170,10 +166,7 @@ fn freedom_outbound() -> BuiltOutbound {
 
 fn socks_inbound(port: u16) -> BuiltInbound {
     BuiltInbound {
-        entry: BuiltEntry {
-            kind: "socks".into(),
-            data: vec![],
-        },
+        entry: BuiltEntry { kind: "socks".into(), data: vec![] },
         tag: "socks-in".into(),
         port: Some(port),
         listen: Some("127.0.0.1".into()),
@@ -205,9 +198,7 @@ async fn websocket_transport_via_vless_e2e() {
 
     let mut client_cfg = BuiltConfig::default();
     client_cfg.inbounds.push(socks_inbound(socks_port));
-    client_cfg
-        .outbounds
-        .push(vless_outbound(vless_port, ws_settings));
+    client_cfg.outbounds.push(vless_outbound(vless_port, ws_settings));
 
     let (_ci, _co, ch) = start_full(&client_cfg).await.expect("vless-ws client");
     tokio::time::sleep(READY_DELAY).await;
@@ -242,9 +233,7 @@ async fn grpc_transport_via_vless_e2e() {
 
     let mut client_cfg = BuiltConfig::default();
     client_cfg.inbounds.push(socks_inbound(socks_port));
-    client_cfg
-        .outbounds
-        .push(vless_outbound(vless_port, grpc_settings));
+    client_cfg.outbounds.push(vless_outbound(vless_port, grpc_settings));
 
     let (_ci, _co, ch) = start_full(&client_cfg).await.expect("vless-grpc client");
     tokio::time::sleep(TRANSPORT_WARMUP).await;
@@ -277,9 +266,7 @@ async fn kcp_transport_via_vless_e2e() {
 
     let mut client_cfg = BuiltConfig::default();
     client_cfg.inbounds.push(socks_inbound(socks_port));
-    client_cfg
-        .outbounds
-        .push(vless_outbound(vless_port, kcp_settings));
+    client_cfg.outbounds.push(vless_outbound(vless_port, kcp_settings));
 
     let (_ci, _co, ch) = start_full(&client_cfg).await.expect("vless-kcp client");
     tokio::time::sleep(TRANSPORT_WARMUP).await;
@@ -311,9 +298,7 @@ async fn tls_transport_via_vmess_e2e() {
     .unwrap();
 
     let mut server_cfg = BuiltConfig::default();
-    server_cfg
-        .inbounds
-        .push(vmess_inbound(vmess_port, "vmess-tls-in"));
+    server_cfg.inbounds.push(vmess_inbound(vmess_port, "vmess-tls-in"));
     server_cfg.outbounds.push(freedom_outbound());
     server_cfg.inbounds[0].stream_settings_json = Some(server_tls);
 
@@ -322,9 +307,7 @@ async fn tls_transport_via_vmess_e2e() {
 
     let mut client_cfg = BuiltConfig::default();
     client_cfg.inbounds.push(socks_inbound(socks_port));
-    client_cfg
-        .outbounds
-        .push(vmess_outbound(vmess_port, client_tls));
+    client_cfg.outbounds.push(vmess_outbound(vmess_port, client_tls));
 
     let (_ci, _co, ch) = start_full(&client_cfg).await.expect("vmess-tls client");
     tokio::time::sleep(READY_DELAY).await;
@@ -379,9 +362,7 @@ async fn reality_transport_via_vless_e2e() {
     .unwrap();
 
     let mut server_cfg = BuiltConfig::default();
-    server_cfg
-        .inbounds
-        .push(vless_inbound(vless_port, "vless-reality-in"));
+    server_cfg.inbounds.push(vless_inbound(vless_port, "vless-reality-in"));
     server_cfg.outbounds.push(freedom_outbound());
     server_cfg.inbounds[0].stream_settings_json = Some(server_reality);
 
@@ -390,9 +371,7 @@ async fn reality_transport_via_vless_e2e() {
 
     let mut client_cfg = BuiltConfig::default();
     client_cfg.inbounds.push(socks_inbound(socks_port));
-    client_cfg
-        .outbounds
-        .push(vless_outbound(vless_port, client_reality));
+    client_cfg.outbounds.push(vless_outbound(vless_port, client_reality));
 
     let (_ci, _co, ch) = start_full(&client_cfg).await.expect("vless-reality client");
     tokio::time::sleep(TRANSPORT_WARMUP).await;

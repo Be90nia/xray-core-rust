@@ -3,14 +3,16 @@
 //! CSV 追加（崩了可续，`run_id` 列区分 run），checkpoint 默认每 6h 覆盖写
 //! `summary-latest.md`（中间态 summary，崩了也有近时快照可看）。
 
-use std::io::Write as _;
-use std::path::Path;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{
+    io::Write as _,
+    path::Path,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use tokio::runtime::Handle;
 use xray_common::runtime_guard::RuntimeMetricsSnapshot;
 
-use crate::report::{render_summary, StatsHandle};
+use crate::report::{StatsHandle, render_summary};
 
 /// 一条场景快照行（含全局进程行共用的公共列）。
 struct SampleRow {
@@ -77,7 +79,12 @@ impl Sampler {
     /// 采样一次并追加 CSV。`elapsed` 为本次 run 已进行秒数。
     /// `drain=true` 时行标签写 `__drain__`（负载已停、基础设施保留的观察窗），
     /// 且不入 `samples_rss`——负载期泄漏判定不得被 drain 回落稀释。
-    pub fn sample_once(&mut self, elapsed: f64, interval: Duration, drain: bool) -> std::io::Result<()> {
+    pub fn sample_once(
+        &mut self,
+        elapsed: f64,
+        interval: Duration,
+        drain: bool,
+    ) -> std::io::Result<()> {
         let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let (rss_mb, fd_count) = sample_process();
         let rt = RuntimeMetricsSnapshot::capture(&Handle::current());
@@ -89,11 +96,7 @@ impl Sampler {
         let mut agg_bytes = 0u64;
         for h in &self.stats {
             let snap = h.snapshot();
-            let prev = self
-                .prev_bytes
-                .iter()
-                .find(|(n, _)| *n == snap.name)
-                .map(|(_, b)| *b);
+            let prev = self.prev_bytes.iter().find(|(n, _)| *n == snap.name).map(|(_, b)| *b);
             let window = interval.as_secs_f64().max(1e-6);
             let total = snap.bytes_tx + snap.bytes_rx;
             let bps = prev.map_or(0.0, |p| (total.saturating_sub(p)) as f64 / window);
@@ -117,7 +120,8 @@ impl Sampler {
                 busy_s: 0.0,
             });
         }
-        self.samples_throughput.push((elapsed, agg_bytes as f64 / interval.as_secs_f64().max(1e-6)));
+        self.samples_throughput
+            .push((elapsed, agg_bytes as f64 / interval.as_secs_f64().max(1e-6)));
         rows.push(SampleRow {
             ts,
             scenario: if drain { "__drain__".into() } else { "__proc__".into() },

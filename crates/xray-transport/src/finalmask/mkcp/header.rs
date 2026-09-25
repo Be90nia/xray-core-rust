@@ -11,8 +11,7 @@
 //! 但 [`UdpIo::send_to`] 是 `&self`，故用 `parking_lot::Mutex` 包装 header，
 //! 锁 guard 在构造完 packet 后立即释放，不跨 await。
 
-use std::io;
-use std::net::SocketAddr;
+use std::{io, net::SocketAddr};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -93,6 +92,7 @@ impl Header for DnsHeader {
     fn size(&self) -> usize {
         self.template.len()
     }
+
     fn serialize(&mut self, b: &mut [u8]) {
         let n = self.template.len().min(b.len());
         b[..n].copy_from_slice(&self.template[..n]);
@@ -115,16 +115,10 @@ fn pack_domain_name(name: &str, out: &mut [u8]) -> io::Result<usize> {
     let mut off = 0usize;
     for label in trimmed.split('.') {
         if label.len() >= 0x40 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "dns: label too long (>=64)",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "dns: label too long (>=64)"));
         }
         if off + 1 + label.len() > out.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "dns: buffer too small",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "dns: buffer too small"));
         }
         out[off] = label.len() as u8;
         out[off + 1..off + 1 + label.len()].copy_from_slice(label.as_bytes());
@@ -149,11 +143,7 @@ impl DtlsHeader {
     /// 创建 DTLS 头（初始 sequence=0, length=0）。
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            epoch: 0,
-            length: 0,
-            sequence: 0,
-        }
+        Self { epoch: 0, length: 0, sequence: 0 }
     }
 }
 
@@ -203,10 +193,7 @@ pub struct SrtpHeader {
 impl SrtpHeader {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            header: 0,
-            number: 0,
-        }
+        Self { header: 0, number: 0 }
     }
 }
 
@@ -220,6 +207,7 @@ impl Header for SrtpHeader {
     fn size(&self) -> usize {
         4
     }
+
     fn serialize(&mut self, b: &mut [u8]) {
         self.number = self.number.wrapping_add(1);
         b[..2].copy_from_slice(&self.header.to_be_bytes());
@@ -241,11 +229,7 @@ pub struct UtpHeader {
 impl UtpHeader {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            header: 0,
-            extension: 0,
-            connection_id: 0,
-        }
+        Self { header: 0, extension: 0, connection_id: 0 }
     }
 }
 
@@ -259,6 +243,7 @@ impl Header for UtpHeader {
     fn size(&self) -> usize {
         4
     }
+
     fn serialize(&mut self, b: &mut [u8]) {
         b[..2].copy_from_slice(&self.connection_id.to_be_bytes());
         b[2] = self.header;
@@ -292,6 +277,7 @@ impl Header for WechatHeader {
     fn size(&self) -> usize {
         13
     }
+
     fn serialize(&mut self, b: &mut [u8]) {
         self.sn = self.sn.wrapping_add(1);
         b[0] = 0xa1;
@@ -318,6 +304,7 @@ impl Header for WireguardHeader {
     fn size(&self) -> usize {
         4
     }
+
     fn serialize(&mut self, b: &mut [u8]) {
         b[0] = 0x04;
         b[1] = 0x00;
@@ -343,19 +330,13 @@ impl HeaderConfig {
     /// 从 HeaderId 创建配置（无 domain，仅 DNS 模式需要 domain）。
     #[must_use]
     pub fn from_id(id: HeaderId) -> Self {
-        Self {
-            id,
-            domain: String::new(),
-        }
+        Self { id, domain: String::new() }
     }
 }
 
 impl Default for HeaderConfig {
     fn default() -> Self {
-        Self {
-            id: HeaderId::Wireguard,
-            domain: String::new(),
-        }
+        Self { id: HeaderId::Wireguard, domain: String::new() }
     }
 }
 
@@ -378,10 +359,7 @@ impl Udpmask for HeaderConfig {
         _level_count: usize,
     ) -> io::Result<Box<dyn UdpIo>> {
         let header = build_header(self)?;
-        Ok(Box::new(HeaderConn {
-            inner: raw,
-            header: Mutex::new(header),
-        }))
+        Ok(Box::new(HeaderConn { inner: raw, header: Mutex::new(header) }))
     }
 
     fn wrap_packet_conn_server(
@@ -408,9 +386,7 @@ impl HeaderCodec {
     /// # Errors
     /// - `InvalidInput`：DNS 域名 label 过长等。
     pub fn new(cfg: &HeaderConfig) -> io::Result<Self> {
-        Ok(Self {
-            header: Mutex::new(build_header(cfg)?),
-        })
+        Ok(Self { header: Mutex::new(build_header(cfg)?) })
     }
 }
 
@@ -614,10 +590,7 @@ mod tests {
             (HeaderId::Wireguard, ""),
         ];
         for (id, domain) in cases {
-            let cfg = HeaderConfig {
-                id,
-                domain: domain.to_string(),
-            };
+            let cfg = HeaderConfig { id, domain: domain.to_string() };
             let h = build_header(&cfg);
             assert!(h.is_ok(), "failed to build {id:?}");
         }

@@ -18,12 +18,16 @@
 //!
 //! `close` drop 内部队列 sender（worker `recv` 返回 None 退出）+ 清空订阅。
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
-use xray_features::stats::{Channel as ChannelTrait, ChannelError, ChannelMessage, ChannelSubscriber};
+use xray_features::stats::{
+    Channel as ChannelTrait, ChannelError, ChannelMessage, ChannelSubscriber,
+};
 
 use crate::error::log_warning;
 
@@ -43,11 +47,7 @@ impl Default for ChannelConfig {
     /// 默认配置：与 Go `Manager.RegisterChannel` 内联值一致
     /// （`BufferSize: 64, Blocking: false`）。
     fn default() -> Self {
-        Self {
-            blocking: false,
-            subscriber_limit: 0,
-            buffer_size: 64,
-        }
+        Self { blocking: false, subscriber_limit: 0, buffer_size: 64 }
     }
 }
 
@@ -113,9 +113,8 @@ impl StatsChannel {
         rt.spawn(async move {
             // 锁不跨 await：每条消息先快照订阅者列表再逐个投递。
             while let Some(msg) = rx.recv().await {
-                let subs: Vec<mpsc::Sender<ChannelMessage>> = {
-                    subscribers.lock().iter().map(|(_, tx)| tx.clone()).collect()
-                };
+                let subs: Vec<mpsc::Sender<ChannelMessage>> =
+                    { subscribers.lock().iter().map(|(_, tx)| tx.clone()).collect() };
                 for tx in subs {
                     if blocking {
                         let _ = tx.send(Arc::clone(&msg)).await;
@@ -221,8 +220,9 @@ impl std::fmt::Debug for StatsChannel {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use xray_features::stats::ChannelMessage;
+
+    use super::*;
 
     fn make_msg<T: 'static + Send + Sync>(v: T) -> ChannelMessage {
         Arc::new(v)
@@ -238,10 +238,7 @@ mod tests {
 
     #[test]
     fn config_effective_buffer_min_one() {
-        let c = ChannelConfig {
-            buffer_size: 0,
-            ..ChannelConfig::default()
-        };
+        let c = ChannelConfig { buffer_size: 0, ..ChannelConfig::default() };
         assert_eq!(c.effective_buffer(), 1);
     }
 
@@ -303,10 +300,8 @@ mod tests {
 
     #[test]
     fn subscriber_limit_enforced() {
-        let c = StatsChannel::new(ChannelConfig {
-            subscriber_limit: 2,
-            ..ChannelConfig::default()
-        });
+        let c =
+            StatsChannel::new(ChannelConfig { subscriber_limit: 2, ..ChannelConfig::default() });
         c.start().unwrap();
         let _a = c.subscribe().unwrap();
         let _b = c.subscribe().unwrap();
@@ -359,10 +354,7 @@ mod tests {
         let mut s2 = c.subscribe().unwrap();
 
         // 用 tokio runtime 测试 async recv
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         rt.block_on(async {
             c.publish(make_msg(42_u32));
             let m1 = s1.recv().await.expect("s1 got msg");
@@ -379,10 +371,7 @@ mod tests {
         let mut s = c.subscribe().unwrap();
         c.close().unwrap();
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         rt.block_on(async {
             let m = s.recv().await;
             assert!(m.is_none(), "subscriber must get None after close");
@@ -408,10 +397,7 @@ mod tests {
         c.start().unwrap();
         let mut s = c.subscribe().unwrap();
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         rt.block_on(async {
             c.publish(make_msg("hello".to_string()));
             let msg: String = s.recv_as::<String>().await.expect("got string");
@@ -460,10 +446,7 @@ mod tests {
         c.start().unwrap();
         let mut sub = c.subscribe().unwrap();
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         rt.block_on(async {
             for i in 0..1000_u32 {
                 c.publish(make_msg(i));
@@ -481,10 +464,7 @@ mod tests {
                 }
             }
             assert!(got >= 1, "at least the buffered messages must be delivered");
-            assert!(
-                got <= 5,
-                "bounded fan-out must not pile up 1000 messages, got {got}"
-            );
+            assert!(got <= 5, "bounded fan-out must not pile up 1000 messages, got {got}");
         });
     }
 
@@ -500,10 +480,7 @@ mod tests {
         // 重启后恢复投递（worker 由 runtime 内的 publish 惰性重建）
         c.start().unwrap();
         let mut sub = c.subscribe().unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         rt.block_on(async {
             c.publish(make_msg(7_u32));
             let m = tokio::time::timeout(std::time::Duration::from_millis(500), sub.recv())
@@ -512,5 +489,4 @@ mod tests {
             assert_eq!(m.unwrap().downcast_ref::<u32>(), Some(&7));
         });
     }
-
 }

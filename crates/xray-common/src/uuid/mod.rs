@@ -49,8 +49,8 @@ impl UUID {
     /// 解析 UUID 字符串（Go `ParseString` 完整语义）。
     ///
     /// - 标准格式（32-36 字符，带/不带连字符）：直接解析。
-    /// - 1-30 字节非 UUID 文本：SHA1(零UUID || text)[:16] 派生 UUIDv5
-    ///   （VLESS/VMess 自定义用户 ID 路径，`uuid -i` 同源）。
+    /// - 1-30 字节非 UUID 文本：SHA1(零UUID || text)[:16] 派生 UUIDv5 （VLESS/VMess 自定义用户 ID
+    ///   路径，`uuid -i` 同源）。
     /// - 空或 >30 字节且非标准格式：`None`。
     pub fn parse(input: &str) -> Option<Self> {
         let s = input.trim();
@@ -62,7 +62,8 @@ impl UUID {
             }
             return Some(Self(bytes));
         }
-        // Go uuid.go:71-82：短文本 → SHA1(zero_uuid || text)[:16]，设 v5 version + RFC4122 variant。
+        // Go uuid.go:71-82：短文本 → SHA1(zero_uuid || text)[:16]，设 v5 version + RFC4122
+        // variant。
         let text = s.as_bytes();
         if text.is_empty() || text.len() > 30 {
             return None;
@@ -97,11 +98,22 @@ impl fmt::Display for UUID {
         write!(
             f,
             "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            b[0], b[1], b[2], b[3],
-            b[4], b[5],
-            b[6], b[7],
-            b[8], b[9],
-            b[10], b[11], b[12], b[13], b[14], b[15]
+            b[0],
+            b[1],
+            b[2],
+            b[3],
+            b[4],
+            b[5],
+            b[6],
+            b[7],
+            b[8],
+            b[9],
+            b[10],
+            b[11],
+            b[12],
+            b[13],
+            b[14],
+            b[15]
         )
     }
 }
@@ -144,8 +156,8 @@ mod tests {
     #[test]
     fn test_from_bytes_roundtrip() {
         let bytes = [
-            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
-            0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10,
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54,
+            0x32, 0x10,
         ];
         let uuid = UUID::from_bytes(bytes);
         assert_eq!(*uuid.as_bytes(), bytes);
@@ -154,7 +166,8 @@ mod tests {
 
     #[test]
     fn test_parse_with_hyphens() {
-        let uuid = UUID::parse("01234567-89ab-cdef-fedc-ba9876543210").expect("parse should succeed");
+        let uuid =
+            UUID::parse("01234567-89ab-cdef-fedc-ba9876543210").expect("parse should succeed");
         assert_eq!(uuid.as_bytes()[0], 0x01);
         assert_eq!(uuid.as_bytes()[15], 0x10);
     }
@@ -191,8 +204,8 @@ mod tests {
     #[test]
     fn test_display_format() {
         let bytes = [
-            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
-            0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10,
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54,
+            0x32, 0x10,
         ];
         let uuid = UUID::from_bytes(bytes);
         assert_eq!(format!("{uuid}"), "01234567-89ab-cdef-fedc-ba9876543210");
@@ -235,8 +248,8 @@ mod tests {
         let uuid = UUID::parse("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
         let key = uuid.cmd_key();
         let expected: [u8; 16] = [
-            0x9d, 0xf8, 0x64, 0x02, 0x87, 0x43, 0xe4, 0x38,
-            0x75, 0x5a, 0x32, 0x29, 0x53, 0x47, 0x52, 0x66,
+            0x9d, 0xf8, 0x64, 0x02, 0x87, 0x43, 0xe4, 0x38, 0x75, 0x5a, 0x32, 0x29, 0x53, 0x47,
+            0x52, 0x66,
         ];
         assert_eq!(key, expected, "cmd_key must match md5(uuid_string) for Go interop");
     }
@@ -251,8 +264,8 @@ mod tests {
     #[test]
     fn test_equality() {
         let bytes = [
-            0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44,
-            0x55, 0x66, 0x77, 0x88, 0x99, 0x00, 0xFF, 0xEE,
+            0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00,
+            0xFF, 0xEE,
         ];
         let a = UUID::from_bytes(bytes);
         let b = UUID::from_bytes(bytes);

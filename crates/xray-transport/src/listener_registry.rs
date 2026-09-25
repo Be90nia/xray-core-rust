@@ -6,17 +6,17 @@
 //! 每个 transport 协议（tcp/tls/websocket/grpc/httpupgrade/splithttp/reality/kcp/hysteria）
 //! 在启动时注册自己的 `TransportListenFn`。上层监听时按 `StreamSettings.protocol` 查找。
 
-use std::future::Future;
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::{
+    future::Future,
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::{Arc, OnceLock},
+};
 
 use parking_lot::RwLock;
 
-use crate::connection::Connection;
-use crate::dialer::StreamSettings;
-use crate::sockopt::SocketOptions;
+use crate::{connection::Connection, dialer::StreamSettings, sockopt::SocketOptions};
 
 // ===== ConnHandler =====
 
@@ -50,10 +50,10 @@ pub trait TransportListener: Send + Sync {
 /// 调用方负责 spawn accept loop（在 `TransportListenFn` 实现内部）。
 pub type TransportListenFn = Arc<
     dyn Fn(
-            SocketAddr,          // bind address
-            StreamSettings,       // protocol + security config (owned, avoids lifetime issues)
-            SocketOptions,        // socket options (owned, avoids lifetime issues)
-            ConnHandler,          // new-connection callback
+            SocketAddr,     // bind address
+            StreamSettings, // protocol + security config (owned, avoids lifetime issues)
+            SocketOptions,  // socket options (owned, avoids lifetime issues)
+            ConnHandler,    // new-connection callback
         ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn TransportListener>>> + Send>>
         + Send
         + Sync,
@@ -62,8 +62,9 @@ pub type TransportListenFn = Arc<
 // ===== 全局注册表 =====
 
 /// Transport listener 全局注册表。对应 Go `transportListenerCache`。
-static TRANSPORT_LISTENER_CACHE: OnceLock<RwLock<std::collections::HashMap<String, TransportListenFn>>> =
-    OnceLock::new();
+static TRANSPORT_LISTENER_CACHE: OnceLock<
+    RwLock<std::collections::HashMap<String, TransportListenFn>>,
+> = OnceLock::new();
 
 fn cache() -> &'static RwLock<std::collections::HashMap<String, TransportListenFn>> {
     TRANSPORT_LISTENER_CACHE.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
@@ -76,10 +77,7 @@ const MAX_LISTENER_ENTRIES: usize = 256;
 ///
 /// 同名协议重复注册返回 `AlreadyExists` 错误。
 /// 协议名大小写敏感（Go 端用 lowercase）。
-pub fn register_transport_listener(
-    protocol: &str,
-    listen_fn: TransportListenFn,
-) -> io::Result<()> {
+pub fn register_transport_listener(protocol: &str, listen_fn: TransportListenFn) -> io::Result<()> {
     let mut cache = cache().write();
     if cache.contains_key(protocol) {
         return Err(io::Error::new(
@@ -150,7 +148,8 @@ mod tests {
 
     #[test]
     fn duplicate_registration_returns_error() {
-        let listen_fn: TransportListenFn = Arc::new(|_, _, _, _| Box::pin(async { unreachable!() }));
+        let listen_fn: TransportListenFn =
+            Arc::new(|_, _, _, _| Box::pin(async { unreachable!() }));
         let _ = register_transport_listener("test-dup-listener", listen_fn.clone());
         let result = register_transport_listener("test-dup-listener", listen_fn);
         assert!(result.is_err());

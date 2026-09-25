@@ -13,13 +13,10 @@
 use std::sync::Arc;
 
 use xray_app_dispatcher::default::DialFn;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_transport::connection::Connection;
-use xray_transport::connection::TcpConnection;
+use xray_common::net::{address::Address, destination::Destination};
+use xray_transport::connection::{Connection, TcpConnection};
 
-use crate::client::SocksClient;
-use crate::protocol::SocksAddr;
+use crate::{client::SocksClient, protocol::SocksAddr};
 
 /// 构造 [`DialBridge`] 用的 [`DialFn`] 闭包。
 ///
@@ -36,10 +33,7 @@ pub fn make_dial_fn(client: Arc<SocksClient>) -> DialFn {
         let client = Arc::clone(&client);
         let socks = dest_to_socks(dest);
         Box::pin(async move {
-            let stream = client
-                .dial(&socks)
-                .await
-                .map_err(|e| format!("socks dial: {e}"))?;
+            let stream = client.dial(&socks).await.map_err(|e| format!("socks dial: {e}"))?;
             Ok(Box::new(TcpConnection::new(stream)) as Box<dyn Connection>)
         })
     })
@@ -57,10 +51,11 @@ fn dest_to_socks(dest: &Destination) -> SocksAddr {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::Ipv6Addr;
-    use xray_common::net::network::Network;
-    use xray_common::net::port::Port;
+
+    use xray_common::net::{network::Network, port::Port};
+
+    use super::*;
 
     #[test]
     fn dest_to_socks_ipv4() {
@@ -73,7 +68,7 @@ mod tests {
         match s.host {
             crate::protocol::Host::Ipv4(ip) => {
                 assert_eq!(ip.octets(), [127, 0, 0, 1]);
-            }
+            },
             _ => panic!("expected Ipv4"),
         }
         assert_eq!(s.port, 8080);
@@ -90,7 +85,7 @@ mod tests {
         match s.host {
             crate::protocol::Host::Ipv6(ip) => {
                 assert_eq!(ip, Ipv6Addr::LOCALHOST);
-            }
+            },
             _ => panic!("expected Ipv6"),
         }
         assert_eq!(s.port, 443);
@@ -98,16 +93,12 @@ mod tests {
 
     #[test]
     fn dest_to_socks_domain() {
-        let d = Destination::new(
-            Address::new_domain("example.com"),
-            Port::new(443),
-            Network::TCP,
-        );
+        let d = Destination::new(Address::new_domain("example.com"), Port::new(443), Network::TCP);
         let s = dest_to_socks(&d);
         match s.host {
             crate::protocol::Host::Domain(d) => {
                 assert_eq!(d, "example.com");
-            }
+            },
             _ => panic!("expected Domain"),
         }
         assert_eq!(s.port, 443);
@@ -116,11 +107,12 @@ mod tests {
     /// e2e：DialFn 闭包→ SocksClient dial → 通过 mock socks server 转 echo → 读回。
     #[tokio::test]
     async fn make_dial_fn_e2e_through_mock_socks_server() {
-        use crate::client::ClientConfig;
-        use crate::config::ServerConfig;
-        use crate::server::socks5_server_handshake;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        use crate::{client::ClientConfig, config::ServerConfig, server::socks5_server_handshake};
 
         // 启动 echo socks server
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -129,7 +121,8 @@ mod tests {
             loop {
                 if let Ok((mut sock, _)) = listener.accept().await {
                     tokio::spawn(async move {
-                        let _target = socks5_server_handshake(&mut sock, &ServerConfig::default()).await;
+                        let _target =
+                            socks5_server_handshake(&mut sock, &ServerConfig::default()).await;
                         // echo
                         let mut buf = [0u8; 256];
                         loop {
@@ -139,7 +132,7 @@ mod tests {
                                     if sock.write_all(&buf[..n]).await.is_err() {
                                         break;
                                     }
-                                }
+                                },
                             }
                         }
                         let _ = sock;
@@ -151,9 +144,7 @@ mod tests {
         });
 
         // 构造 DialFn
-        let client = Arc::new(SocksClient::new(ClientConfig::new_noauth(
-            server_addr.to_string(),
-        )));
+        let client = Arc::new(SocksClient::new(ClientConfig::new_noauth(server_addr.to_string())));
         let dial_fn = make_dial_fn(client);
 
         // 调用 DialFn 拨到一个 dummy target（mock 不真连）

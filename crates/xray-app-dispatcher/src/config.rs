@@ -4,7 +4,9 @@
 //! （`SessionConfig` 仅保留字段，`Config` 仅含 settings），保留类型骨架
 //! 以便后续接入。
 
-use xray_proto::xray::app::dispatcher::{Config as ProtoConfig, SessionConfig as ProtoSessionConfig};
+use xray_proto::xray::app::dispatcher::{
+    Config as ProtoConfig, SessionConfig as ProtoSessionConfig,
+};
 
 /// 分发器会话配置（保留字段，当前空）。
 ///
@@ -38,20 +40,12 @@ pub struct Config {
 impl Config {
     /// 从 proto 转换。
     pub fn from_proto(p: &ProtoConfig) -> Self {
-        Self {
-            settings: p
-                .settings
-                .as_ref()
-                .map(SessionConfig::from_proto)
-                .unwrap_or_default(),
-        }
+        Self { settings: p.settings.as_ref().map(SessionConfig::from_proto).unwrap_or_default() }
     }
 
     /// 转回 proto。
     pub fn to_proto(&self) -> ProtoConfig {
-        ProtoConfig {
-            settings: Some(self.settings.to_proto()),
-        }
+        ProtoConfig { settings: Some(self.settings.to_proto()) }
     }
 }
 

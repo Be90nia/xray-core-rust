@@ -6,14 +6,11 @@
 //! SSE 解析逻辑（`parse_sse_event_from_lines`）与 `reqwest::Response` 解耦，
 //! 测试可直接喂入合成字节验证。
 
-use std::io;
-use std::time::Duration;
+use std::{io, time::Duration};
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::finalmask::realm::punch::{
-    PunchMetadata, PUNCH_NONCE_SIZE, PUNCH_OBFS_KEY_SIZE,
-};
+use crate::finalmask::realm::punch::{PUNCH_NONCE_SIZE, PUNCH_OBFS_KEY_SIZE, PunchMetadata};
 
 /// Error body 最大读取字节数（防 OOM，对应 Go `maxErrorBodySize`）。
 const MAX_ERROR_BODY_SIZE: usize = 64 * 1024;
@@ -133,19 +130,12 @@ pub fn new_client(
         builder = builder.https_only(false);
     }
     let http = builder.build().map_err(io::Error::other)?;
-    Ok(Client {
-        base_url: format!("{scheme}://{host}:{port}"),
-        token: token.to_string(),
-        http,
-    })
+    Ok(Client { base_url: format!("{scheme}://{host}:{port}"), token: token.to_string(), http })
 }
 
 /// 生成随机 `nonce + obfs`（对应 Go `NewPunchMetadata`）。
 pub fn new_punch_metadata() -> io::Result<PunchMetadata> {
-    Ok(PunchMetadata::new(
-        rand_hex(PUNCH_NONCE_SIZE)?,
-        rand_hex(PUNCH_OBFS_KEY_SIZE)?,
-    ))
+    Ok(PunchMetadata::new(rand_hex(PUNCH_NONCE_SIZE)?, rand_hex(PUNCH_OBFS_KEY_SIZE)?))
 }
 
 /// 生成 `size` 字节随机数据并以 hex 返回（对应 Go `randHex`）。
@@ -160,11 +150,8 @@ pub fn rand_hex(size: usize) -> io::Result<String> {
 /// 结果以 `/` 起首。
 #[must_use]
 pub fn join_url_path(parts: &[&str]) -> String {
-    let joined: Vec<&str> = parts
-        .iter()
-        .map(|p| p.trim_matches('/'))
-        .filter(|p| !p.is_empty())
-        .collect();
+    let joined: Vec<&str> =
+        parts.iter().map(|p| p.trim_matches('/')).filter(|p| !p.is_empty()).collect();
     format!("/{}", joined.join("/"))
 }
 
@@ -184,11 +171,7 @@ fn url_encode_path_segment(s: &str) -> String {
 impl Client {
     fn endpoint(&self, realm_id: &str, sub_path: &str) -> String {
         let escaped = url_encode_path_segment(realm_id);
-        format!(
-            "{}{}",
-            self.base_url,
-            join_url_path(&["v1", &escaped, sub_path])
-        )
+        format!("{}{}", self.base_url, join_url_path(&["v1", &escaped, sub_path]))
     }
 
     /// POST /v1/:realm_id
@@ -201,9 +184,7 @@ impl Client {
         struct Body<'a> {
             addresses: &'a [String],
         }
-        let body = Body {
-            addresses: &addresses,
-        };
+        let body = Body { addresses: &addresses };
         self.do_json(
             reqwest::Method::POST,
             realm_id,
@@ -329,15 +310,10 @@ impl Client {
         if resp.status() != expected {
             return Err(decode_status_error(resp).await);
         }
-        resp.json::<Out>()
-            .await
-            .map_err(|e| StatusError {
-                status_code: 0,
-                response: ErrorResponse {
-                    error: "decode".into(),
-                    message: e.to_string(),
-                },
-            })
+        resp.json::<Out>().await.map_err(|e| StatusError {
+            status_code: 0,
+            response: ErrorResponse { error: "decode".into(), message: e.to_string() },
+        })
     }
 
     async fn do_json_unit<In>(
@@ -380,10 +356,7 @@ pub async fn decode_status_error(resp: reqwest::Response) -> StatusError {
         Err(_) => Vec::new(),
     };
     let response: ErrorResponse = serde_json::from_slice(&bytes).unwrap_or_default();
-    StatusError {
-        status_code,
-        response,
-    }
+    StatusError { status_code, response }
 }
 
 /// SSE 事件流（对应 Go `EventStream`）。
@@ -394,10 +367,7 @@ pub struct EventStream {
 
 impl EventStream {
     fn new(response: reqwest::Response) -> Self {
-        Self {
-            response,
-            buf: Vec::with_capacity(4096),
-        }
+        Self { response, buf: Vec::with_capacity(4096) }
     }
 
     /// 关闭底层响应体。
@@ -426,10 +396,10 @@ impl EventStream {
                     let last = last.trim_end_matches('\r');
                     let _ = last;
                     return Ok(None);
-                }
+                },
                 Err(e) => {
-                    return Err(io::Error::other( e));
-                }
+                    return Err(io::Error::other(e));
+                },
             }
         }
     }
@@ -443,10 +413,7 @@ struct SseState {
 
 impl SseState {
     const fn default() -> Self {
-        Self {
-            event_name: String::new(),
-            data: String::new(),
-        }
+        Self { event_name: String::new(), data: String::new() }
     }
 }
 
@@ -454,10 +421,7 @@ impl SseState {
 ///
 /// 仅暴露给 [`EventStream::next_event`]，但实际逻辑通过
 /// [`parse_sse_event_from_lines`] 包装后用于测试。
-fn process_sse_line(
-    line: &str,
-    state: &mut SseState,
-) -> io::Result<Option<PunchEvent>> {
+fn process_sse_line(line: &str, state: &mut SseState) -> io::Result<Option<PunchEvent>> {
     if line.is_empty() {
         // 事件边界
         if state.event_name == "punch" && !state.data.is_empty() {
@@ -484,8 +448,8 @@ fn process_sse_line(
                     state.data.push('\n');
                 }
                 state.data.push_str(value);
-            }
-            _ => {}
+            },
+            _ => {},
         }
     }
     Ok(None)
@@ -515,10 +479,7 @@ pub fn parse_sse_event_from_lines(lines: &[&str]) -> io::Result<Option<PunchEven
 fn reqwest_err_to_status(e: reqwest::Error) -> StatusError {
     StatusError {
         status_code: 0,
-        response: ErrorResponse {
-            error: "transport".into(),
-            message: e.to_string(),
-        },
+        response: ErrorResponse { error: "transport".into(), message: e.to_string() },
     }
 }
 
@@ -528,10 +489,7 @@ mod tests {
 
     #[test]
     fn join_url_path_trims_slashes() {
-        assert_eq!(
-            join_url_path(&["/v1/", "/realm", "events"]),
-            "/v1/realm/events"
-        );
+        assert_eq!(join_url_path(&["/v1/", "/realm", "events"]), "/v1/realm/events");
         assert_eq!(join_url_path(&["", "v1", ""]), "/v1");
         assert_eq!(join_url_path(&[]), "/");
     }
@@ -603,20 +561,14 @@ mod tests {
     fn status_error_display_formats() {
         let with_body = StatusError {
             status_code: 401,
-            response: ErrorResponse {
-                error: "unauthorized".into(),
-                message: "bad token".into(),
-            },
+            response: ErrorResponse { error: "unauthorized".into(), message: "bad token".into() },
         };
         let s = format!("{with_body}");
         assert!(s.contains("401"));
         assert!(s.contains("unauthorized"));
         assert!(s.contains("bad token"));
 
-        let no_body = StatusError {
-            status_code: 500,
-            response: ErrorResponse::default(),
-        };
+        let no_body = StatusError { status_code: 500, response: ErrorResponse::default() };
         let s2 = format!("{no_body}");
         assert_eq!(s2, "realm server returned 500");
     }

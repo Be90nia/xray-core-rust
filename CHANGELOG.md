@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- naive 入站实现（88vp 收口）：rustls+hyper h2 CONNECT 隧道（404 fallback/407 恒定时间认证/padding 协商），extra 套件加回 naive；顺带根因修复 outbound PaddingWriter Pending 重入重复发送真 bug
+- 互操作矩阵交叉方向扩满：Go→Rust 与 Rust→Go 各 6→12 协议（+splithttp/grpc/reality/hysteria2/anytls/tuic），CI 默认 37→54 测，既有用例零改动
+- REALITY mirror 字节级等价（z32z）：新 BoringSSL 原语 `SSL_seal_raw_tls13_record`（inner-plaintext 级 seal，不追加 inner type）经 vendor 注入脚本 → xray-tls 封装（iOS 门控）→ gate 接线恢复发送体，wire 形态与 Go tls.go:417-426 逐字段同构
+- readv 热路径 criterion 基准（并发形态吞吐）+ use_readv 闸门收敛单一事实源
+
+### Changed
+
+- 全库 rustfmt 新规则重排（CI stable 工具链升级致 Format job 全库违规，一次性对齐，零语义）
+- CI 修复：runner 镜像不再预装 protoc——clippy/build(三平台)/test/docs/fuzz 五 job 补装
+
 - fuzz 基建：cargo-fuzz 三靶（kcp segment / ss2022 packet / vless inbound 解码）+ CI fuzz job（workflow_dispatch 触发，nightly + ASAN 30s/靶 smoke，不阻塞主干）
 - 压测泄漏门禁：`tools/check_stress_leak.py` 斜率判定（fd/RSS 超阈 fail，drain 回落豁免固有 idle 堆积）+ stress 场景 `--drain-secs` 阶段接入 `stress.yml`
 - 项目 README 真实化（架构/协议/构建/CI 全文档）+ `CHANGELOG.md` 建立

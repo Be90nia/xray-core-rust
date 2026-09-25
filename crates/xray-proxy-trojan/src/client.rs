@@ -13,15 +13,17 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
-use xray_app_proxyman::error::ProxymanError;
-use xray_app_proxyman::outbound::proxy_outbound::{OutboundDialer, ProxyOutbound};
-use xray_common::net::network::Network as XrayNetwork;
-use xray_common::session::Session;
-use xray_transport::bridge::bridge_link_with_stream_full_default;
-use xray_transport::link::Link;
+use xray_app_proxyman::{
+    error::ProxymanError,
+    outbound::proxy_outbound::{OutboundDialer, ProxyOutbound},
+};
+use xray_common::{net::network::Network as XrayNetwork, session::Session};
+use xray_transport::{bridge::bridge_link_with_stream_full_default, link::Link};
 
-use crate::config::MemoryAccount;
-use crate::protocol::{write_request_header, Network as TrojanNetwork};
+use crate::{
+    config::MemoryAccount,
+    protocol::{Network as TrojanNetwork, write_request_header},
+};
 /// Trojan 出站客户端。
 ///
 /// 持有账户信息，实现 [`ProxyOutbound`] trait。
@@ -54,9 +56,10 @@ impl ProxyOutbound for TrojanClient {
             .ok_or_else(|| ProxymanError::Other("trojan: no destination in session".to_string()))?;
 
         // 1. 拨号到 Trojan 服务器（Go client.go:62 — retry.ExponentialBackoff(5, 100)）
-        let mut server_conn = xray_transport::retry::exponential_backoff(5, 100, || dialer.dial(&dest))
-            .await
-            .map_err(|e| ProxymanError::Other(format!("trojan dial server: {e}")))?;
+        let mut server_conn =
+            xray_transport::retry::exponential_backoff(5, 100, || dialer.dial(&dest))
+                .await
+                .map_err(|e| ProxymanError::Other(format!("trojan dial server: {e}")))?;
 
         // 2. 构造 Trojan 请求头
         let network = match dest.network() {
@@ -97,10 +100,9 @@ impl ProxyOutbound for TrojanClient {
 
 #[cfg(test)]
 mod tests {
+    use xray_common::net::{address::Address, destination::Destination, port::Port};
+
     use super::*;
-    use xray_common::net::address::Address;
-    use xray_common::net::destination::Destination;
-    use xray_common::net::port::Port;
 
     #[test]
     fn trojan_client_new_stores_account() {
@@ -119,7 +121,8 @@ mod tests {
         );
 
         let mut header = Vec::new();
-        write_request_header(&mut header, &account, TrojanNetwork::Tcp, dest.address(), 80).unwrap();
+        write_request_header(&mut header, &account, TrojanNetwork::Tcp, dest.address(), 80)
+            .unwrap();
 
         // 验证 header 格式：56字节key + CRLF + cmd + addr + CRLF
         assert!(header.len() > 56 + 2 + 1 + 1 + 2 + 2, "header too short: {}", header.len());
@@ -137,7 +140,8 @@ mod tests {
         );
 
         let mut header = Vec::new();
-        write_request_header(&mut header, &account, TrojanNetwork::Udp, dest.address(), 53).unwrap();
+        write_request_header(&mut header, &account, TrojanNetwork::Udp, dest.address(), 53)
+            .unwrap();
 
         assert_eq!(header[58], 3, "COMMAND_UDP byte");
     }

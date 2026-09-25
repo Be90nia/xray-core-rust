@@ -6,20 +6,19 @@
 //! TCPRequest/TCPResponse → 数据回显 → drop → 重连）。会话票据 store 是 crate 级
 //! 全局静态，二次连接起 0-RTT 生效——这正是本场景要压的 quinn 连接回环。
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Instant;
+use std::{net::SocketAddr, sync::Arc, time::Instant};
 
-use xray_common::net::address::Address;
-use xray_common::net::port::Port;
+use xray_common::net::{address::Address, port::Port};
 use xray_proxy_hysteria::protocol::{read_tcp_request, write_tcp_response};
-use xray_transport_hysteria::conn::InterStreamConn;
-use xray_transport_hysteria::dialer::{DialDestination, HysteriaClient};
-use xray_transport_hysteria::hysteria_transport::QuinnHysteriaTransport;
-use xray_transport_hysteria::hub::{AuthValidator, MasqType};
-use xray_transport_hysteria::proto_config::Config as ProtoConfig;
-use xray_transport_hysteria::quinn_adapter::QuinnListenerFactory;
-use xray_transport_hysteria::HysteriaListenerFactory;
+use xray_transport_hysteria::{
+    HysteriaListenerFactory,
+    conn::InterStreamConn,
+    dialer::{DialDestination, HysteriaClient},
+    hub::{AuthValidator, MasqType},
+    hysteria_transport::QuinnHysteriaTransport,
+    proto_config::Config as ProtoConfig,
+    quinn_adapter::QuinnListenerFactory,
+};
 
 use crate::report::StatsHandle;
 
@@ -28,10 +27,7 @@ const S3_PAYLOAD_LEN: usize = 8 * 1024;
 
 /// PEM → DER（自签证书场景，无链无加密段；rcgen 产物为单段 PKCS#8）。
 pub(crate) fn pem_to_der(pem: &str) -> anyhow::Result<Vec<u8>> {
-    let body: String = pem
-        .lines()
-        .filter(|l| !l.starts_with("-----"))
-        .collect();
+    let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD
         .decode(body.trim())
@@ -40,8 +36,7 @@ pub(crate) fn pem_to_der(pem: &str) -> anyhow::Result<Vec<u8>> {
 
 /// S3 服务端：QUIC listener + TCPRequest 解析 + echo 回调。
 pub async fn start_quic_echo_server() -> anyhow::Result<SocketAddr> {
-    let (cert_pem, key_pem) =
-        xray_tls::certificate::generate_self_signed_cert(&["localhost"])?;
+    let (cert_pem, key_pem) = xray_tls::certificate::generate_self_signed_cert(&["localhost"])?;
     let cert_der = pem_to_der(&cert_pem)?;
     let key_der = pem_to_der(&key_pem)?;
     let server_tls = rustls::ServerConfig::builder()
@@ -154,8 +149,7 @@ pub async fn s3_quic_reconnect_loop(
             ..xray_proto::xray::transport::internet::hysteria::Config::default()
         })
     };
-    let quic_params =
-        Arc::new(xray_proto::xray::transport::internet::QuicParams::default());
+    let quic_params = Arc::new(xray_proto::xray::transport::internet::QuicParams::default());
     let payload = vec![0xABu8; S3_PAYLOAD_LEN];
 
     while Instant::now() < deadline {
@@ -185,9 +179,7 @@ async fn roundtrip_once(
     client: &HysteriaClient,
     payload: &[u8],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let isc = client
-        .tcp(&Address::new_domain("127.0.0.1"), Port::new(8080))
-        .await?;
+    let isc = client.tcp(&Address::new_domain("127.0.0.1"), Port::new(8080)).await?;
     isc.write(payload).await?;
     let mut got = vec![0u8; payload.len()];
     let mut filled = 0;

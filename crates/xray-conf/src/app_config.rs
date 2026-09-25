@@ -240,7 +240,7 @@ pub struct ApiConfig {
     /// gRPC 监听地址（如 `"127.0.0.1:8080"` / `":8080"`）。
     ///
     /// 对应 Go proto `xray.app.commander.Config.Listen`。为空时走 outbound 模式
-    ///（通过 OutboundHandler 接收 API 连接，需 transport 全链路）。
+    /// （通过 OutboundHandler 接收 API 连接，需 transport 全链路）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub listen: Option<String>,
     /// 启用的 API 服务列表。
@@ -265,7 +265,7 @@ pub struct FakeDnsPoolElement {
 }
 
 /// FakeDNS 配置。对应 Go `FakeDNSConfig`：单池对象或池数组二选一
-///（Go `UnmarshalJSON`：先试单池，失败试数组；`MarshalJSON` 反向）。
+/// （Go `UnmarshalJSON`：先试单池，失败试数组；`MarshalJSON` 反向）。
 #[derive(Debug, Default, Clone)]
 pub struct FakeDnsConfig {
     /// 单池形态字段（Go `pool`）。
@@ -282,11 +282,8 @@ impl Serialize for FakeDnsConfig {
         if let Some(pools) = &self.pools {
             return pools.serialize(serializer);
         }
-        FakeDnsPoolElement {
-            ip_pool: self.ip_pool.clone(),
-            pool_size: self.pool_size,
-        }
-        .serialize(serializer)
+        FakeDnsPoolElement { ip_pool: self.ip_pool.clone(), pool_size: self.pool_size }
+            .serialize(serializer)
     }
 }
 
@@ -300,16 +297,8 @@ impl<'de> Deserialize<'de> for FakeDnsConfig {
             Multi(Vec<FakeDnsPoolElement>),
         }
         match Repr::deserialize(deserializer)? {
-            Repr::Single(e) => Ok(Self {
-                ip_pool: e.ip_pool,
-                pool_size: e.pool_size,
-                pools: None,
-            }),
-            Repr::Multi(v) => Ok(Self {
-                ip_pool: None,
-                pool_size: None,
-                pools: Some(v),
-            }),
+            Repr::Single(e) => Ok(Self { ip_pool: e.ip_pool, pool_size: e.pool_size, pools: None }),
+            Repr::Multi(v) => Ok(Self { ip_pool: None, pool_size: None, pools: Some(v) }),
         }
     }
 }
@@ -375,9 +364,10 @@ mod tests {
     /// 序列化输出 Go 键。
     #[test]
     fn observatory_probe_url_dual_read_and_go_serialization() {
-        let go: ObservatoryConfig =
-            serde_json::from_value(serde_json::json!({"probeURL": "https://x/204", "probeInterval": "1m"}))
-                .unwrap();
+        let go: ObservatoryConfig = serde_json::from_value(
+            serde_json::json!({"probeURL": "https://x/204", "probeInterval": "1m"}),
+        )
+        .unwrap();
         assert_eq!(go.probe_url.as_deref(), Some("https://x/204"));
         assert_eq!(go.probe_interval.as_deref(), Some("1m"));
         let legacy: ObservatoryConfig =
@@ -419,7 +409,10 @@ mod tests {
             "subjectSelector": ["proxy", "warp"], "enableConcurrency": true
         }))
         .unwrap();
-        assert_eq!(go.subject_selector.as_deref(), Some(&["proxy".to_string(), "warp".to_string()][..]));
+        assert_eq!(
+            go.subject_selector.as_deref(),
+            Some(&["proxy".to_string(), "warp".to_string()][..])
+        );
         assert_eq!(go.enable_concurrency, Some(true));
         // 单值方言兜底：Go 数组键缺失时回落 subjectOutbound
         let legacy: ObservatoryConfig = serde_json::from_value(serde_json::json!({
@@ -442,10 +435,7 @@ mod tests {
             "subjectSelector": ["a", "b"], "pingConfig": {"destination": "https://x"}
         }))
         .unwrap();
-        assert_eq!(
-            go.subject_selector.as_deref(),
-            Some(&["a".to_string(), "b".to_string()][..])
-        );
+        assert_eq!(go.subject_selector.as_deref(), Some(&["a".to_string(), "b".to_string()][..]));
     }
 
     /// fakeDns：Go 键 ipPool/poolSize 生效 + 旧键兼容 + 序列化输出 Go 键。
@@ -507,8 +497,7 @@ mod tests {
     fn version_config_min_max_shape() {
         // Go 形态 {"min": "...", "max": "..."} 双读正确。
         let c: VersionConfig =
-            serde_json::from_value(serde_json::json!({"min": "1.8.0", "max": "26.9.9"}))
-                .unwrap();
+            serde_json::from_value(serde_json::json!({"min": "1.8.0", "max": "26.9.9"})).unwrap();
         assert_eq!(c.min.as_deref(), Some("1.8.0"));
         assert_eq!(c.max.as_deref(), Some("26.9.9"));
         // 只给 min / 只给 max 都应通过。

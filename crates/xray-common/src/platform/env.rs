@@ -2,8 +2,10 @@
 //!
 //! 对应 Go 版本 `platform.NewEnvFlag`，提供环境变量读取和类型转换。
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, OnceLock};
+use std::sync::{
+    LazyLock, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 /// 环境标志，首次访问时从环境变量读取值并缓存。
 ///
@@ -24,11 +26,7 @@ impl EnvFlag {
     pub fn new(name: impl Into<String>) -> Self {
         let name = name.into();
         let alt_name = name.to_uppercase().replace('.', "_");
-        Self {
-            name,
-            alt_name,
-            value: OnceLock::new(),
-        }
+        Self { name, alt_name, value: OnceLock::new() }
     }
 
     /// 获取标志值，首次访问时从环境变量读取。
@@ -40,11 +38,7 @@ impl EnvFlag {
                 std::env::var(&self.name)
                     .ok()
                     .filter(|v| !v.is_empty())
-                    .or_else(|| {
-                        std::env::var(&self.alt_name)
-                            .ok()
-                            .filter(|v| !v.is_empty())
-                    })
+                    .or_else(|| std::env::var(&self.alt_name).ok().filter(|v| !v.is_empty()))
             })
             .as_deref()
     }
@@ -66,18 +60,15 @@ impl EnvFlag {
 }
 /// `xray.buf.readv`（alt `XRAY_BUF_READV`）— readv 聚合读闸门。
 ///
-/// 对齐 Go `readv_reader.go:153-163`（与 freedom splice 同形三态）：
-/// 未设置 / `"auto"` / `"enable"` → 启用；其余禁用。
+/// 对齐 Go `platform.UseReadV`（common/platform/platform.go:16）等价入口。
 ///
-/// 当前无生产调用方——readv 闸门实际在 `xray-buf::readv::use_readv`
-/// （xray-buf 不依赖 xray-common，走本地实现）；本 binding 保留 Go
-/// `platform.UseReadV`（common/platform/platform.go:16）等价入口。
+/// 单一事实源收敛：判定逻辑（env 解析 + 三态 + AtomicBool 缓存）全仓只在
+/// `xray-buf::readv`（xray-common 依赖 xray-buf，直接转发）；本 fn 是消费点
+/// 别名，热路径一次 atomic load。环境变更走 `xray_buf::readv::reload_env_settings`
+/// 刷新（对齐 Go reloadEnvSettings）。
 #[must_use]
 pub fn use_readv() -> bool {
-    let raw = std::env::var_os("xray.buf.readv")
-        .or_else(|| std::env::var_os("XRAY_BUF_READV"))
-        .map(|v| v.to_string_lossy().into_owned());
-    parse_enabled_env(raw.as_deref())
+    xray_buf::readv::use_readv()
 }
 
 /// `xray.buf.splice`（alt `XRAY_BUF_SPLICE`）— freedom splice(2) zero-copy 闸门。
@@ -222,6 +213,58 @@ mod tests {
     fn test_use_readv_returns_bool() {
         // 只验证函数可调用且返回布尔值
         let _val = use_readv();
+    }
+
+    /// 单一事实源收敛：xray-common 的 `use_readv` 是 `xray_buf::readv` 闸门的
+    /// 转发别名，开/关两态 + 缓存语义必须贯穿转发链。env 是进程全局，串行化
+    /// （惯例同上方 SPLICE_ENV_LOCK）。
+    static READV_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    #[test]
+    fn use_readv_forwards_to_xray_buf_gate() {
+        let _g = READV_ENV_LOCK.lock();
+
+        const NAME: &str = "xray.buf.readv";
+        const ALT: &str = "XRAY_BUF_READV";
+        let saved_name = std::env::var_os(NAME);
+        let saved_alt = std::env::var_os(ALT);
+        struct Restore(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.0.take() {
+                        Some(v) => std::env::set_var(NAME, v),
+                        None => std::env::remove_var(NAME),
+                    }
+                    match self.1.take() {
+                        Some(v) => std::env::set_var(ALT, v),
+                        None => std::env::remove_var(ALT),
+                    }
+                }
+                // 按恢复后的 env 重解析，不把测试态泄漏给后续测试
+                xray_buf::readv::reload_env_settings();
+            }
+        }
+        unsafe {
+            std::env::remove_var(NAME);
+            std::env::remove_var(ALT);
+        }
+        let _restore = Restore(saved_name, saved_alt);
+
+        // ① 未设置 → Go 缺省开（readv_reader.go defaultFlagValue，经转发链）
+        xray_buf::readv::reload_env_settings();
+        assert!(use_readv(), "未设置应启用（Go 缺省，经转发链）");
+
+        // ② 关态：非法值禁用（转发别名与 xray-buf 本地读同源）
+        unsafe { std::env::set_var(NAME, "disable") };
+        xray_buf::readv::reload_env_settings();
+        assert!(!use_readv(), "disable 应经转发链禁用");
+
+        // ③ 缓存语义贯穿转发链：env 变更不 reload 不得翻转
+        unsafe { std::env::set_var(NAME, "enable") };
+        assert!(!use_readv(), "不 reload 不应翻转（缓存生效）");
+        xray_buf::readv::reload_env_settings();
+        assert!(use_readv(), "reload 后应翻转");
     }
 
     // -------- 7 新 EnvFlag bindings --------

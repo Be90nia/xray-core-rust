@@ -7,11 +7,11 @@ pub mod body_chunk;
 pub mod client;
 pub mod server;
 
-
 use md5::Md5;
-use sha3::digest::{ExtendableOutput, Update, XofReader};
-use sha3::Shake128;
-
+use sha3::{
+    Shake128,
+    digest::{ExtendableOutput, Update, XofReader},
+};
 
 // ============================================================================
 // 常量
@@ -96,11 +96,7 @@ impl ChunkNonceGenerator {
     pub fn new(nonce: &[u8], nonce_size: usize) -> Self {
         let mut buffer = vec![0u8; nonce.len()];
         buffer.copy_from_slice(nonce);
-        Self {
-            buffer,
-            nonce_size,
-            count: 0,
-        }
+        Self { buffer, nonce_size, count: 0 }
     }
 
     /// 生成下一个 nonce（自增 count）。
@@ -147,9 +143,7 @@ impl ShakeSizeParser {
     pub fn new(nonce: &[u8]) -> Self {
         let mut shake = Shake128::default();
         Update::update(&mut shake, nonce);
-        Self {
-            reader: Box::new(shake.finalize_xof()),
-        }
+        Self { reader: Box::new(shake.finalize_xof()) }
     }
 
     /// 长度字段的字节数（恒为 2）。
@@ -194,7 +188,6 @@ impl ShakeSizeParser {
         64
     }
 }
-
 
 // ============================================================================
 // PlainChunkSizeParser（对应 Go `crypto.PlainChunkSizeParser`）
@@ -249,18 +242,18 @@ pub fn write_address_port(
         xray_common::net::address::Address::IPv4(v4) => {
             out.push(addr_type::IPV4);
             out.extend_from_slice(&v4.octets());
-        }
+        },
         xray_common::net::address::Address::Domain(domain) => {
             out.push(addr_type::DOMAIN);
             let bytes = domain.as_bytes();
             let len = u8::try_from(bytes.len()).unwrap_or(255);
             out.push(len);
             out.extend_from_slice(&bytes[..len as usize]);
-        }
+        },
         xray_common::net::address::Address::IPv6(v6) => {
             out.push(addr_type::IPV6);
             out.extend_from_slice(&v6.octets());
-        }
+        },
     }
 }
 
@@ -283,11 +276,8 @@ pub fn read_address_port(
             }
             let mut ip = [0u8; 4];
             ip.copy_from_slice(&buf[addr_start..addr_start + 4]);
-            (
-                xray_common::net::address::Address::IPv4(std::net::Ipv4Addr::from(ip)),
-                4,
-            )
-        }
+            (xray_common::net::address::Address::IPv4(std::net::Ipv4Addr::from(ip)), 4)
+        },
         addr_type::DOMAIN => {
             if buf.len() < addr_start + 1 {
                 return Err(crate::error::VmessError::InsufficientLength);
@@ -298,22 +288,16 @@ pub fn read_address_port(
             }
             let domain = String::from_utf8(buf[addr_start + 1..addr_start + 1 + len].to_vec())
                 .map_err(|_| crate::error::VmessError::InvalidRemoteAddress)?;
-            (
-                xray_common::net::address::Address::Domain(domain),
-                1 + len,
-            )
-        }
+            (xray_common::net::address::Address::Domain(domain), 1 + len)
+        },
         addr_type::IPV6 => {
             if buf.len() < addr_start + 16 {
                 return Err(crate::error::VmessError::InsufficientLength);
             }
             let mut ip = [0u8; 16];
             ip.copy_from_slice(&buf[addr_start..addr_start + 16]);
-            (
-                xray_common::net::address::Address::IPv6(std::net::Ipv6Addr::from(ip)),
-                16,
-            )
-        }
+            (xray_common::net::address::Address::IPv6(std::net::Ipv6Addr::from(ip)), 16)
+        },
         _ => return Err(crate::error::VmessError::InvalidRemoteAddress),
     };
     Ok((addr, port, addr_start + consumed))
@@ -434,7 +418,6 @@ mod tests {
             assert!(pad < 64);
         }
     }
-
 
     #[test]
     fn write_address_port_ipv4() {

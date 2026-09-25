@@ -3,11 +3,9 @@
 //! 这些类型对应 Go `infra/conf/common.go` 与 `infra/conf/xray.go` 中的 JSON 反序列化类型。
 //! 关注点是「从配置文件解析」，运行时转换（→ `xray_common::net::Address`）留给后续 Build 阶段。
 
-use serde::de::Error as _;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::borrow::Cow;
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 // =========================================================================
 // Address —— 配置层地址字符串
@@ -147,10 +145,7 @@ impl PortList {
 
     /// 端口数（范围按两端闭区间计数）。
     pub fn port_count(&self) -> usize {
-        self.0
-            .iter()
-            .map(|r| (r.end as usize).saturating_sub(r.start as usize) + 1)
-            .sum()
+        self.0.iter().map(|r| (r.end as usize).saturating_sub(r.start as usize) + 1).sum()
     }
 
     /// 端口是否命中任一范围。
@@ -161,7 +156,6 @@ impl PortList {
 
 impl<'de> Deserialize<'de> for PortList {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-
         // 支持 number / string / array 混合输入。
         #[derive(Deserialize)]
         #[serde(untagged)]
@@ -184,12 +178,14 @@ impl<'de> Deserialize<'de> for PortList {
                         let expanded = expand_env(part);
                         let part = expanded.as_ref();
                         if let Some((a, b)) = part.split_once('-') {
-                            let start: u16 = a.trim().parse().map_err(|e| {
-                                E::custom(format!("invalid port start {a:?}: {e}"))
-                            })?;
-                            let end: u16 = b.trim().parse().map_err(|e| {
-                                E::custom(format!("invalid port end {b:?}: {e}"))
-                            })?;
+                            let start: u16 = a
+                                .trim()
+                                .parse()
+                                .map_err(|e| E::custom(format!("invalid port start {a:?}: {e}")))?;
+                            let end: u16 = b
+                                .trim()
+                                .parse()
+                                .map_err(|e| E::custom(format!("invalid port end {b:?}: {e}")))?;
                             if start > end {
                                 return Err(E::custom(format!(
                                     "port range start {start} > end {end}"
@@ -197,18 +193,18 @@ impl<'de> Deserialize<'de> for PortList {
                             }
                             ranges.push(PortRange { start, end });
                         } else {
-                            let n: u16 = part.parse().map_err(|e| {
-                                E::custom(format!("invalid port {part:?}: {e}"))
-                            })?;
+                            let n: u16 = part
+                                .parse()
+                                .map_err(|e| E::custom(format!("invalid port {part:?}: {e}")))?;
                             ranges.push(PortRange::single(n));
                         }
                     }
-                }
+                },
                 Raw::Array(items) => {
                     for item in items {
                         push_one::<E>(ranges, item)?;
                     }
-                }
+                },
             }
             Ok(())
         }
@@ -310,22 +306,14 @@ impl<'de> Deserialize<'de> for Int32Range {
         let mut range = match Raw::deserialize(d) {
             Ok(Raw::Str(s)) => {
                 let (left, right) = parse_range_string(&s).map_err(D::Error::custom)?;
-                Int32Range {
-                    left,
-                    right,
-                    ..Default::default()
-                }
-            }
-            Ok(Raw::Int(i)) => Int32Range {
-                left: i,
-                right: i,
-                ..Default::default()
+                Int32Range { left, right, ..Default::default() }
             },
+            Ok(Raw::Int(i)) => Int32Range { left: i, right: i, ..Default::default() },
             Err(_) => {
                 return Err(D::Error::custom(
                     "Invalid integer range, expected either string of form \"1-2\" or plain integer.",
                 ));
-            }
+            },
         };
         range.ensure_order();
         Ok(range)
@@ -349,8 +337,7 @@ pub fn parse_range_string(s: &str) -> Result<(i32, i32), String> {
         split_from_second_dash(s)
             .and_then(|(l, r)| Some((l.parse::<i32>().ok()?, r.parse::<i32>().ok()?)))
     } else {
-        s.split_once('-')
-            .and_then(|(l, r)| Some((l.parse::<i32>().ok()?, r.parse::<i32>().ok()?)))
+        s.split_once('-').and_then(|(l, r)| Some((l.parse::<i32>().ok()?, r.parse::<i32>().ok()?)))
     };
     parsed.ok_or_else(|| format!("invalid range string: {s}"))
 }
@@ -392,7 +379,6 @@ impl StringList {
 
 impl<'de> Deserialize<'de> for StringList {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Raw {
@@ -492,11 +478,11 @@ impl<'de> Deserialize<'de> for NetworkList {
             Raw::Single(s) => {
                 let items = s.split(',').filter_map(|p| parse_one(p)).collect();
                 Ok(NetworkList(items))
-            }
+            },
             Raw::Multi(v) => {
                 let items = v.iter().filter_map(|s| parse_one(s)).collect();
                 Ok(NetworkList(items))
-            }
+            },
         }
     }
 }
@@ -559,11 +545,7 @@ mod tests {
         let p: PortList = serde_json::from_str(r#""80,443,8080""#).unwrap();
         assert_eq!(
             p.0,
-            vec![
-                PortRange::single(80),
-                PortRange::single(443),
-                PortRange::single(8080),
-            ]
+            vec![PortRange::single(80), PortRange::single(443), PortRange::single(8080),]
         );
     }
 
@@ -712,10 +694,7 @@ mod tests {
     #[test]
     fn int32range_invalid_inputs() {
         for json in [r#""abc""#, "1.5", r#""1-""#, "true", r#""1-2-3""#] {
-            assert!(
-                serde_json::from_str::<Int32Range>(json).is_err(),
-                "should reject {json}"
-            );
+            assert!(serde_json::from_str::<Int32Range>(json).is_err(), "should reject {json}");
         }
     }
 
@@ -751,10 +730,7 @@ mod tests {
     fn portlist_serialize_multiple_as_comma_string() {
         // Go：多 range → "80,443,1000-2000"。
         let p: PortList = serde_json::from_str(r#"[80, "443", "1000-2000"]"#).unwrap();
-        assert_eq!(
-            serde_json::to_string(&p).unwrap(),
-            r#""80,443,1000-2000""#
-        );
+        assert_eq!(serde_json::to_string(&p).unwrap(), r#""80,443,1000-2000""#);
     }
 
     #[test]

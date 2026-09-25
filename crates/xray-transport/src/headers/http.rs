@@ -3,11 +3,11 @@
 //! 对应 Go `transport/internet/headers/http/`。
 //!
 //! 三个核心：
-//! - [`HeaderReader`]：从字节流读出 HTTP header 边界（按 `\r\n\r\n` 切分），
-//!   可选校验首行 URI 是否在期待列表中。
+//! - [`HeaderReader`]：从字节流读出 HTTP header 边界（按 `\r\n\r\n` 切分）， 可选校验首行 URI
+//!   是否在期待列表中。
 //! - [`HeaderWriter`]：把预构造的 header 字节一次性写出。
-//! - [`HttpAuthenticator`]：`HeaderAuthenticator` 的 HTTP 实现，持有
-//!   `HeaderConfig`，按 default fallback（Chrome UA）或用户自定义生成字节。
+//! - [`HttpAuthenticator`]：`HeaderAuthenticator` 的 HTTP 实现，持有 `HeaderConfig`，按 default
+//!   fallback（Chrome UA）或用户自定义生成字节。
 //!
 //! ## 与 4t8 边界
 //!
@@ -16,8 +16,8 @@
 // 把 reader/writer 串成异步包装。Rust 端异步包装是单独任务。
 
 use super::authenticator::{
-    pick_string, HeaderAuthenticator, HeaderConfig, HeaderError, HeaderNameValues,
-    RequestConfig, ResponseConfig, MAX_HEADER_LENGTH,
+    HeaderAuthenticator, HeaderConfig, HeaderError, HeaderNameValues, MAX_HEADER_LENGTH,
+    RequestConfig, ResponseConfig, pick_string,
 };
 
 /// HTTP header 终结符。
@@ -50,7 +50,11 @@ impl HeaderReader {
     /// - `Ok(None)`：还需更多字节。
     /// - `Err(TooLong)`：超出 [`MAX_HEADER_LENGTH`] 上限。
     /// - `Err(PathMismatch)`：URI 不在期待列表（当 `expected_uris` 非空时）。
-    pub fn feed(&mut self, chunk: &[u8], expected_uris: &[String]) -> Result<Option<Vec<u8>>, HeaderError> {
+    pub fn feed(
+        &mut self,
+        chunk: &[u8],
+        expected_uris: &[String],
+    ) -> Result<Option<Vec<u8>>, HeaderError> {
         if self.done {
             return Ok(None);
         }
@@ -77,7 +81,7 @@ impl HeaderReader {
                 self.buffered.clear();
                 self.done = true;
                 Ok(Some(body_bytes))
-            }
+            },
             None => Ok(None),
         }
     }
@@ -148,7 +152,6 @@ impl HeaderWriter {
 // `client_header()` 拼出 "METHOD URI HTTP/x.y\r\nheader\r\n...\r\n\r\n"，
 // `server_header()` 拼出 "HTTP/x.y STATUS REASON\r\nheader\r\n...\r\n\r\n"，
 // `expected_request_uris()` 返回 `config.request.uri`（用于服务端校验）。
-///
 /// 注意：本类型 **不** 走 `Conn` 包装层（那是 4t8 范围）；trait 输出的是字节，
 // 由 4t8 的连接层装配进 tokio `AsyncRead+AsyncWrite`。
 #[derive(Debug, Clone)]
@@ -188,11 +191,7 @@ impl HeaderAuthenticator for HttpAuthenticator {
     }
 
     fn expected_request_uris(&self) -> Vec<String> {
-        self.config
-            .request
-            .as_ref()
-            .map(|r| r.uri.clone())
-            .unwrap_or_default()
+        self.config.request.as_ref().map(|r| r.uri.clone()).unwrap_or_default()
     }
 }
 
@@ -254,8 +253,6 @@ pub fn render_response(resp: &ResponseConfig) -> Vec<u8> {
     out.push_str(CRLF);
     out.into_bytes()
 }
-
-
 
 /// 默认 400 Bad Request 响应（对应 Go resp.go:resp400）。
 pub fn default_resp_400() -> ResponseConfig {
@@ -345,10 +342,7 @@ mod tests {
     fn http_authenticator_trait_renders_via_config() {
         // 直接构造与 Go TestRequestHeader 完全相同的 RequestConfig
         let req = chrome_request();
-        let cfg = HeaderConfig {
-            request: Some(req),
-            response: None,
-        };
+        let cfg = HeaderConfig { request: Some(req), response: None };
         let auth = HttpAuthenticator::new(cfg);
         let header = auth.client_header();
         let s = std::str::from_utf8(&header).unwrap();

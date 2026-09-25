@@ -207,8 +207,9 @@ impl LinuxSockOpt {
         // TCP_CONGESTION = 13，内核会验证算法名称是否为已加载的拥塞控制模块。
         // algo.as_ptr() 指向有效的 UTF-8 字节序列，不含 NUL（Rust String 保证），
         // 但内核要求 NUL 终止，因此需要构造 CStr。
-        let c_algo = std::ffi::CString::new(algo)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "tcp_congestion contains null byte"))?;
+        let c_algo = std::ffi::CString::new(algo).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "tcp_congestion contains null byte")
+        })?;
         unsafe {
             let ret = libc::setsockopt(
                 fd,
@@ -258,7 +259,9 @@ impl LinuxSockOpt {
         // SAFETY: if_indextoname 将接口索引转为接口名，写入调用方提供的缓冲区。
         // 缓冲区大小 IFNAMSIZ=16 足够存放任何接口名。
         let mut buf = [0u8; libc::IFNAMSIZ];
-        let ptr = unsafe { libc::if_indextoname(self.bind_if_index, buf.as_mut_ptr() as *mut libc::c_char) };
+        let ptr = unsafe {
+            libc::if_indextoname(self.bind_if_index, buf.as_mut_ptr() as *mut libc::c_char)
+        };
         if ptr.is_null() {
             return Err(io::Error::last_os_error());
         }

@@ -14,9 +14,10 @@
 
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
 use xray_proxy_trojan::hex_sha224;
 use xray_tls::utls;
 use xray_transport::connection::TcpConnection;
@@ -28,10 +29,8 @@ use xray_transport::connection::TcpConnection;
 #[ignore]
 async fn trojan_tcp_tls_vps_interop() {
     let host = std::env::var("VPS_HOST").unwrap_or_else(|_| "sg.yzswgroup.top".into());
-    let port: u16 = std::env::var("VPS_PORT")
-        .unwrap_or_else(|_| "39237".into())
-        .parse()
-        .expect("valid port");
+    let port: u16 =
+        std::env::var("VPS_PORT").unwrap_or_else(|_| "39237".into()).parse().expect("valid port");
     let password =
         std::env::var("VPS_PASS").unwrap_or_else(|_| "a0832f31-62c1-4197-ac85-2634e38ab700".into());
     let sni = std::env::var("VPS_SNI").unwrap_or_else(|_| "sg.yzswgroup.top".into());
@@ -44,9 +43,7 @@ async fn trojan_tcp_tls_vps_interop() {
 
     eprintln!("[2/5] TLS handshake (SNI={sni})");
     let tls_config = utls::default_client_config();
-    let mut tls = utls::client(conn, &sni, tls_config)
-        .await
-        .expect("TLS handshake failed");
+    let mut tls = utls::client(conn, &sni, tls_config).await.expect("TLS handshake failed");
 
     eprintln!("[3/5] Trojan header (target=1.1.1.1:80)");
     let key_hex = hex_sha224(&password);
@@ -86,10 +83,8 @@ async fn trojan_tcp_tls_vps_interop() {
 #[ignore]
 async fn trojan_vps_dns_through_tunnel() {
     let host = std::env::var("VPS_HOST").unwrap_or_else(|_| "sg.yzswgroup.top".into());
-    let port: u16 = std::env::var("VPS_PORT")
-        .unwrap_or_else(|_| "39237".into())
-        .parse()
-        .expect("valid port");
+    let port: u16 =
+        std::env::var("VPS_PORT").unwrap_or_else(|_| "39237".into()).parse().expect("valid port");
     let password =
         std::env::var("VPS_PASS").unwrap_or_else(|_| "a0832f31-62c1-4197-ac85-2634e38ab700".into());
     let sni = std::env::var("VPS_SNI").unwrap_or_else(|_| "sg.yzswgroup.top".into());
@@ -98,9 +93,7 @@ async fn trojan_vps_dns_through_tunnel() {
     let tcp = TcpStream::connect(&addr).await.expect("TCP connect");
     let conn = TcpConnection::new(tcp);
     let tls_config = utls::default_client_config();
-    let mut tls = utls::client(conn, &sni, tls_config)
-        .await
-        .expect("TLS handshake");
+    let mut tls = utls::client(conn, &sni, tls_config).await.expect("TLS handshake");
 
     // Trojan header → target = 1.1.1.1:53 (DNS over TCP)
     let key_hex = hex_sha224(&password);
@@ -124,9 +117,7 @@ async fn trojan_vps_dns_through_tunnel() {
         0x00, 0x00, // authority: 0
         0x00, 0x00, // additional: 0
         // QNAME: example.com
-        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
-        3, b'c', b'o', b'm',
-        0, // root label
+        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0, // root label
         0x00, 0x01, // QTYPE: A
         0x00, 0x01, // QCLASS: IN
     ];
@@ -148,7 +139,6 @@ async fn trojan_vps_dns_through_tunnel() {
     assert!(answer_count > 0, "expected at least 1 DNS answer, got {answer_count}");
     eprintln!("✅ DNS through Trojan tunnel: {answer_count} answers received");
 }
-
 
 // ============================================================================
 // Trojan + WS + TLS — CDN 配置
@@ -184,7 +174,8 @@ async fn trojan_ws_tls_vps_interop() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let ws_url = format!("wss://{ws_host}{ws_path}");
     let ws_request = ws_url.into_client_request().expect("build WS request");
-    let (mut ws, response) = tokio_tungstenite::client_async(ws_request, tls).await.expect("WS upgrade");
+    let (mut ws, response) =
+        tokio_tungstenite::client_async(ws_request, tls).await.expect("WS upgrade");
     eprintln!("  WS upgrade: {}", response.status());
 
     // 4. Trojan header + HTTP request
@@ -222,15 +213,27 @@ async fn trojan_ws_tls_vps_interop() {
                         }
                         eprintln!("  First bytes: {:02x?}", &data[..data.len().min(32)]);
                         // 继续读直到 HTTP response
-                    }
+                    },
                     Message::Ping(_) | Message::Pong(_) => continue,
-                    Message::Close(r) => { eprintln!("⚠️ Server closed: {:?}", r); break; }
+                    Message::Close(r) => {
+                        eprintln!("⚠️ Server closed: {:?}", r);
+                        break;
+                    },
                     _ => continue,
                 }
-            }
-            Ok(Some(Err(e))) => { eprintln!("⚠️ WS error: {e}"); break; }
-            Ok(None) => { eprintln!("⚠️ Stream closed"); break; }
-            Err(_) => { eprintln!("⚠️ Timeout 10s"); break; }
+            },
+            Ok(Some(Err(e))) => {
+                eprintln!("⚠️ WS error: {e}");
+                break;
+            },
+            Ok(None) => {
+                eprintln!("⚠️ Stream closed");
+                break;
+            },
+            Err(_) => {
+                eprintln!("⚠️ Timeout 10s");
+                break;
+            },
         }
     }
 }

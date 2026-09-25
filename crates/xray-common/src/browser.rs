@@ -18,10 +18,7 @@ use rand::Rng;
 /// pub：httpupgrade `build_upgrade_request` 对 Connection/Upgrade 用同样的
 /// Set 语义（Go `req.Header.Set`，dialer.go:100-101）。
 pub fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
-    if let Some(slot) = headers
-        .iter_mut()
-        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-    {
+    if let Some(slot) = headers.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
         slot.1 = value.to_string();
     } else {
         headers.push((name.to_string(), value.to_string()));
@@ -29,10 +26,7 @@ pub fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) 
 }
 
 fn get_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.as_str())
+    headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
 }
 
 /// UTC 当天秒数 → epoch 天数（对齐 Go `time.Now().Unix() / 86400`）。
@@ -111,9 +105,8 @@ pub fn curl_version() -> String {
 /// Safari 版本字符串（对齐 Go `SafariVersion`；索引钳位避免 Go 潜在越界）。
 #[must_use]
 pub fn safari_version() -> String {
-    const SAFARI_MINOR_MAP: [i64; 25] = [
-        0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5, 5, 5, 6, 6, 6, 6,
-    ];
+    const SAFARI_MINOR_MAP: [i64; 25] =
+        [0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5, 5, 5, 6, 6, 6, 6];
     let now_secs: i64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -132,18 +125,10 @@ pub fn safari_version() -> String {
 
 // ===== Chromium 品牌 GREASE（对齐 Go clientHint* 常量）=====
 
-const CLIENT_HINT_GREASE_NA: [&str; 11] = [
-    " ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_",
-];
+const CLIENT_HINT_GREASE_NA: [&str; 11] = [" ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_"];
 const CLIENT_HINT_VERSION_NA: [&str; 3] = ["8", "99", "24"];
-const CLIENT_HINT_SHUFFLE3: [[usize; 3]; 6] = [
-    [0, 1, 2],
-    [0, 2, 1],
-    [1, 0, 2],
-    [1, 2, 0],
-    [2, 0, 1],
-    [2, 1, 0],
-];
+const CLIENT_HINT_SHUFFLE3: [[usize; 3]; 6] =
+    [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
 const CLIENT_HINT_SHUFFLE4: [[usize; 4]; 24] = [
     [0, 1, 2, 3],
     [0, 1, 3, 2],
@@ -190,7 +175,7 @@ fn get_ungreased_ch_ua(major_version: i64, fork_name: &str) -> Vec<String> {
     match fork_name {
         "chrome" => base.push(format!("\"Google Chrome\";v=\"{major_version}\"")),
         "edge" => base.push(format!("\"Microsoft Edge\";v=\"{major_version}\"")),
-        _ => {}
+        _ => {},
     }
     base
 }
@@ -204,7 +189,7 @@ fn get_greased_ch_ua(major_version: i64, fork_name: &str) -> String {
             v[0] = ungreased[1].clone();
             v[1] = ungreased[0].clone();
             v
-        }
+        },
         3 => {
             let order = CLIENT_HINT_SHUFFLE3[(major_version % 6) as usize];
             let mut v = vec![String::new(); 3];
@@ -212,7 +197,7 @@ fn get_greased_ch_ua(major_version: i64, fork_name: &str) -> String {
                 v[*e] = ungreased[i].clone();
             }
             v
-        }
+        },
         _ => {
             let order = CLIENT_HINT_SHUFFLE4[(major_version % 24) as usize];
             let mut v = vec![String::new(); 4];
@@ -220,7 +205,7 @@ fn get_greased_ch_ua(major_version: i64, fork_name: &str) -> String {
                 v[*e] = ungreased[i].clone();
             }
             v
-        }
+        },
     };
     shuffled.join(", ")
 }
@@ -236,20 +221,28 @@ pub fn build_user_agent(browser: &str) -> String {
     match browser {
         "chrome" => {
             let v = chrome_version();
-            format!("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{v}.0.0.0 Safari/537.36")
-        }
+            format!(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{v}.0.0.0 Safari/537.36"
+            )
+        },
         "edge" => {
             let v = chrome_version();
-            format!("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{v}.0.0.0 Safari/537.36 Edg/{v}.0.0.0")
-        }
+            format!(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{v}.0.0.0 Safari/537.36 Edg/{v}.0.0.0"
+            )
+        },
         "firefox" => {
             let v = firefox_version();
-            format!("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{v}.0) Gecko/20100101 Firefox/{v}.0")
-        }
+            format!(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{v}.0) Gecko/20100101 Firefox/{v}.0"
+            )
+        },
         "safari" => {
             let v = safari_version();
-            format!("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/{v} Safari/605.1.15")
-        }
+            format!(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/{v} Safari/605.1.15"
+            )
+        },
         "curl" => format!("curl/{}", curl_version()),
         _ => String::new(),
     }
@@ -271,40 +264,36 @@ pub fn apply_masqueraded_headers(
             let v = chrome_version();
             ch_major = v;
             let fork = if browser == "chrome" { "chrome" } else { "edge" };
-            set_header(
-                headers,
-                "Sec-CH-UA",
-                &get_greased_ch_ua(v, fork),
-            );
+            set_header(headers, "Sec-CH-UA", &get_greased_ch_ua(v, fork));
             set_header(headers, "Sec-CH-UA-Mobile", "?0");
             set_header(headers, "Sec-CH-UA-Platform", "\"Windows\"");
             set_header(headers, "DNT", "1");
             set_header(headers, "User-Agent", &build_user_agent(browser));
             set_header(headers, "Accept-Language", "en-US,en;q=0.9");
-        }
+        },
         "firefox" => {
             set_header(headers, "User-Agent", &build_user_agent("firefox"));
             set_header(headers, "DNT", "1");
             set_header(headers, "Accept-Language", "en-US,en;q=0.5");
             ch_major = 0;
-        }
+        },
         "safari" => {
             set_header(headers, "User-Agent", &build_user_agent("safari"));
             set_header(headers, "Accept-Language", "en-US,en;q=0.9");
             ch_major = 0;
-        }
+        },
         "golang" => {
             // 暴露 Go net/http 默认 UA：删除 User-Agent。
             headers.retain(|(k, _)| !k.eq_ignore_ascii_case("User-Agent"));
             return;
-        }
+        },
         "curl" => {
             set_header(headers, "User-Agent", &build_user_agent("curl"));
             return;
-        }
+        },
         _ => {
             ch_major = 0;
-        }
+        },
     }
     let _ = ch_major;
 
@@ -399,7 +388,7 @@ pub fn try_default_headers_with(headers: &mut Vec<(String, String)>, variant: &s
             "edge" => apply_masqueraded_headers(headers, "edge", variant),
             "curl" => apply_masqueraded_headers(headers, "curl", variant),
             "golang" => apply_masqueraded_headers(headers, "golang", variant),
-            _ => {}
+            _ => {},
         }
     }
 }

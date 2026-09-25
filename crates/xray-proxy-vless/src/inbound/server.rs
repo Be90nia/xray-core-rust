@@ -8,38 +8,41 @@
 //! 支持命令分派：
 //! - TCP：核心路径（Vision 包装 + dispatch）
 //! - UDP：长度前缀包 ↔ UdpDispatchSession 桥接（XUDP 帧约定）
-//! - Mux：按请求目的地原样 dispatch（`v1.mux.cool`），mux carrier 拦截在生产
-//!   dispatcher 装饰器（Go proxyman always.go 语义，见 xray-core wiring）
+//! - Mux：按请求目的地原样 dispatch（`v1.mux.cool`），mux carrier 拦截在生产 dispatcher 装饰器（Go
+//!   proxyman always.go 语义，见 xray-core wiring）
 //! - Rvs：Portal 反向代理，启用 feature 时查 reverse_registry 派发
 //!
 //! 对应 Go 语义：
 //! - TCP：`inbound.go::Process` → `dispatch.DispatchLink(ctx, dest, link)`
 //! - UDP：同上，dest.Network = UDP + link 包 LengthPacketReader/Writer 包装
-//! - Mux：`inbound.go:633 dispatch.DispatchLink(request.Destination())`（按目的地
-//!   原样 dispatch；carrier 拦截在 dispatcher 装饰器，对应 Go mux.Server）
-//! - Rvs：`inbound.go:625-630` → `Reverse.NewMux`（本批次仅注册表查找 + 转发，完整 worker 在其他 issue）
+//! - Mux：`inbound.go:633 dispatch.DispatchLink(request.Destination())`（按目的地 原样
+//!   dispatch；carrier 拦截在 dispatcher 装饰器，对应 Go mux.Server）
+//! - Rvs：`inbound.go:625-630` → `Reverse.NewMux`（本批次仅注册表查找 + 转发，完整 worker 在其他
+//!   issue）
 
 use std::sync::Arc;
 
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpListener, TcpStream};
-use xray_app_dispatcher::default::SimpleOhm;
-use xray_app_dispatcher::OutboundHandlerManager;
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::{TcpListener, TcpStream},
+};
+use xray_app_dispatcher::{OutboundHandlerManager, default::SimpleOhm};
 use xray_buf::io::{new_reader, new_writer};
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-use xray_transport::link::Link;
-use xray_transport::system_listener::InboundTcpListener;
+use xray_common::net::{destination::Destination, network::Network, port::Port};
+use xray_transport::{link::Link, system_listener::InboundTcpListener};
 
-use crate::encoding::server::{decode_request_header, encode_response_header};
-use crate::encoding::{empty_addons, VERSION};
-use crate::encryption::vision_conn::VisionConn;
-use crate::validator::Validator;
+use crate::{
+    encoding::{
+        VERSION, empty_addons,
+        server::{decode_request_header, encode_response_header},
+    },
+    encryption::vision_conn::VisionConn,
+    validator::Validator,
+};
 /// VLESS inbound 协议族接入选项（feature flags）。
 /// 对应 Go `proxy/vless/inbound/inbound.go::Handler` 的可选特性：
-/// - `enable_reverse`：是否由本 inbound 接管 `command=Rvs`（Portal 反向代理）。
-///   `false` 时维持 warn+close。
+/// - `enable_reverse`：是否由本 inbound 接管 `command=Rvs`（Portal 反向代理）。 `false` 时维持
+///   warn+close。
 /// - `reverse_registry`：启用 Reverse 时必填；Portal 注册表（domain → PortalConfig）。
 ///
 /// 默认全 false（`Default::default()`），与既有行为一致（warn 跳过非 TCP 命令）。
@@ -75,8 +78,8 @@ pub struct VlessInboundOptions {
 ///
 /// 绑定 `listener` 监听，每个连接 spawn 独立 task：
 /// 1. `decode_request_header` 解析 VLESS 请求头（含 UUID 校验）
-/// 2. 按 `command` 分派：TCP → dispatch；UDP → UDP relay；Mux → mux 识别；
-///    Rvs → reverse registry 查找
+/// 2. 按 `command` 分派：TCP → dispatch；UDP → UDP relay；Mux → mux 识别； Rvs → reverse registry
+///    查找
 /// 3. 非 TCP 路径：发送响应头后再进入对应 relay
 /// 4. `tokio::io::split` → `Link` → `ohm` default handler `dispatch(dest, link)`
 ///
@@ -114,7 +117,7 @@ pub async fn serve_vless(
             Err(e) => {
                 tracing::warn!(error = %e, "vless accept failed");
                 continue;
-            }
+            },
         };
 
         let handler = Arc::clone(&handler);
@@ -133,9 +136,7 @@ pub async fn serve_vless(
                 // 或半记录滞留，字节不可恢复 → Linux CI 确定性挂）。framer 按
                 // 记录边界限长读，裸尾留在内核缓冲，raw_tcp 克隆（dup 共享
                 // 内核缓冲游标）切 DIRECT 后天然读到完整裸流。
-                match acc
-                    .accept_with(super::record_framer::RecordFramer::new(stream), |_| ())
-                    .await
+                match acc.accept_with(super::record_framer::RecordFramer::new(stream), |_| ()).await
                 {
                     Ok(tls_stream) => {
                         let conn = tls_stream.get_ref().1;
@@ -155,16 +156,24 @@ pub async fn serve_vless(
                             options, raw_tcp,
                         )
                         .await
-                    }
+                    },
                     Err(e) => {
                         tracing::warn!(error = %e, "vless TLS accept failed");
                         return;
-                    }
+                    },
                 }
             } else {
                 handle_connection_with_fallback(
-                    stream, &handler, &validator, fallbacks, peer, local, String::new(), String::new(),
-                    options, None,
+                    stream,
+                    &handler,
+                    &validator,
+                    fallbacks,
+                    peer,
+                    local,
+                    String::new(),
+                    String::new(),
+                    options,
+                    None,
                 )
                 .await
             };
@@ -176,7 +185,6 @@ pub async fn serve_vless(
     }
 }
 
-
 /// 前缀已读字节的 reader：先吐 `initial`，再透传内层流（与 tuic inbound 同模式）。
 struct InitialedReader<R> {
     initial: std::io::Cursor<Vec<u8>>,
@@ -185,10 +193,7 @@ struct InitialedReader<R> {
 
 impl<R> InitialedReader<R> {
     fn new(initial: Vec<u8>, inner: R) -> Self {
-        Self {
-            initial: std::io::Cursor::new(initial),
-            inner,
-        }
+        Self { initial: std::io::Cursor::new(initial), inner }
     }
 
     fn into_parts(self) -> (Vec<u8>, R) {
@@ -258,27 +263,21 @@ where
     // 连接先跑 ML-KEM-768/X25519 握手（1-RTT 或 0-RTT ticket）再进 VLESS 编码层。
     // decryption 与 fallbacks 在 Go conf 层互斥（vless.go:157-159），故握手置于
     // fallback 预读之前。
-    let stream: std::pin::Pin<Box<dyn ErasedConn>> = match options.as_ref().and_then(|o| o.decryption.clone()) {
-        Some(dec) => Box::pin(
-            dec.handshake(stream)
-                .await
-                .map_err(|e| {
-                    tracing::info!(error = %e, "vless enc handshake failed");
-                    std::io::Error::other(format!("vless enc handshake: {e}"))
-                })?,
-        ),
-        None => Box::pin(stream),
-    };
+    let stream: std::pin::Pin<Box<dyn ErasedConn>> =
+        match options.as_ref().and_then(|o| o.decryption.clone()) {
+            Some(dec) => Box::pin(dec.handshake(stream).await.map_err(|e| {
+                tracing::info!(error = %e, "vless enc handshake failed");
+                std::io::Error::other(format!("vless enc handshake: {e}"))
+            })?),
+            None => Box::pin(stream),
+        };
 
     // 握手限时（Go inbound.go:281-284：SetReadDeadline(policy 或 SessionDefault
     // 60s) 在 ENC 握手之后、首包读之前设置；deadline 覆盖首包预读 + decode 总
     // 时长，decode 成功或 fallback 时解除）。sm80④：优先用装配层注入的 policy
     // 握手超时；未注入时维持 crate 兜底（同 handshake_timeout_for 无 policy 分支）。
     let handshake_deadline = tokio::time::Instant::now()
-        + options
-            .as_ref()
-            .and_then(|o| o.handshake_timeout)
-            .unwrap_or_else(handshake_timeout);
+        + options.as_ref().and_then(|o| o.handshake_timeout).unwrap_or_else(handshake_timeout);
 
     // 无 fallback 策略：维持原直连路径（不做 first 预读；deadline 由
     // handle_connection 内部建立，语义同上）
@@ -303,8 +302,8 @@ where
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "vless handshake read timeout",
-                ))
-            }
+                ));
+            },
         };
         if read == 0 {
             return Ok(()); // 客户端未发数据即关闭
@@ -337,7 +336,7 @@ where
                     &tls_alpn,
                 )
                 .await;
-            }
+            },
         };
         // per-user stats 上下文（Go inbound.go Process 认证后 ctx 带 user）：
         // from=客户端源地址，email/level=认证用户。local=入站本地地址
@@ -377,9 +376,7 @@ where
 {
     let path = crate::inbound::handler::extract_path_from_first_bytes(first).unwrap_or("");
     let Some(fb) = policy.find_with_fallback(tls_name, tls_alpn, path) else {
-        return Err(std::io::Error::other(
-            "vless decode failed and no fallback matched",
-        ));
+        return Err(std::io::Error::other("vless decode failed and no fallback matched"));
     };
     tracing::debug!(dest = %fb.dest, xver = fb.xver, name = tls_name, alpn = tls_alpn, path, "vless fallback");
     let mut conn = tokio::io::join(read_half, write_half);
@@ -451,9 +448,10 @@ fn vision_uuid_bytes(
     if decoded.addons.flow != crate::FLOW_XRV {
         return Ok(None);
     }
-    let user = decoded.user.as_ref().ok_or_else(|| {
-        std::io::Error::other("vless vision: decoded request carries no user")
-    })?;
+    let user = decoded
+        .user
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("vless vision: decoded request carries no user"))?;
     Ok(Some(user.account.id.uuid().as_bytes().to_vec()))
 }
 
@@ -461,8 +459,8 @@ fn vision_uuid_bytes(
 ///
 /// - TCP：响应头 → vision 包装（可选） → split → dispatch
 /// - UDP：响应头 → [`handle_udp_relay`] 长度前缀包循环 → UdpDispatchSession 桥接
-/// - Mux：响应头 → [`handle_mux_relay`] 按请求目的地 dispatch（mux carrier
-///   拦截在 dispatcher 装饰器）
+/// - Mux：响应头 → [`handle_mux_relay`] 按请求目的地 dispatch（mux carrier 拦截在 dispatcher
+///   装饰器）
 /// - Rvs：响应头 → [`handle_reverse_relay`] 反向代理派发
 async fn finish_vless_dispatch<R, W>(
     reader: R,
@@ -508,16 +506,12 @@ where
     match decoded.command {
         VlessCommand::Tcp => {
             finish_tcp_dispatch(reader, write_half, &decoded, handler, raw_tcp, &access).await
-        }
-        VlessCommand::Udp => {
-            handle_udp_relay(reader, write_half, &decoded, handler).await
-        }
-        VlessCommand::Mux => {
-            handle_mux_relay(reader, write_half, &decoded, handler, &access).await
-        }
+        },
+        VlessCommand::Udp => handle_udp_relay(reader, write_half, &decoded, handler).await,
+        VlessCommand::Mux => handle_mux_relay(reader, write_half, &decoded, handler, &access).await,
         VlessCommand::Rvs => {
             handle_reverse_relay(reader, write_half, &decoded, handler, options.as_ref()).await
-        }
+        },
     }
 }
 
@@ -548,10 +542,7 @@ where
     // → 重新 split；非 vision 同样 join+split（零开销适配器，统一类型）。
     // testseed：服务端用**本端账号**的 padding 参数（对应 Go EncodeBodyAddons →
     // NewVisionWriter(account.Testseed)——下行 seed 取服务端账户配置，不上 wire）。
-    let seed: &[u32] = decoded
-        .user
-        .as_ref()
-        .map_or(&[][..], |u| u.account.testseed.as_slice());
+    let seed: &[u32] = decoded.user.as_ref().map_or(&[][..], |u| u.account.testseed.as_slice());
     let stream: Box<dyn VlessStream> = match (vision_uuid, raw_tcp) {
         (Some(uuid), Some(raw)) => Box::new(
             VisionConn::new_server(tokio::io::join(reader, write_half), uuid, raw)
@@ -591,9 +582,7 @@ where
         .address
         .clone()
         .ok_or_else(|| std::io::Error::other("vless UDP: missing address"))?;
-    let port = decoded
-        .port
-        .ok_or_else(|| std::io::Error::other("vless UDP: missing port"))?;
+    let port = decoded.port.ok_or_else(|| std::io::Error::other("vless UDP: missing port"))?;
     let udp_dest = Destination::new(address, Port::new(port), Network::UDP);
 
     let mut session = xray_app_dispatcher::UdpDispatchSession::new(handler.clone());
@@ -606,10 +595,10 @@ where
             {
                 // 客户端关闭 TCP：正常退出（与 Go UDP relay 行为一致）
                 return Ok(());
-            }
+            },
             Err(e) => {
                 return Err(std::io::Error::other(format!("vless UDP read: {e}")));
-            }
+            },
         };
 
         if let Err(e) = session.send_packet(&udp_dest, &payload).await {
@@ -622,8 +611,8 @@ where
                 if let Err(e) = write_length_packet(&mut writer, &resp).await {
                     return Err(std::io::Error::other(format!("vless UDP write: {e}")));
                 }
-            }
-            Ok(None) => return Ok(()),     // outbound 关闭
+            },
+            Ok(None) => return Ok(()), // outbound 关闭
             Err(e) => return Err(std::io::Error::other(format!("vless UDP recv: {e}"))),
         }
     }
@@ -688,42 +677,37 @@ where
         return Ok(());
     }
 
-    let registry = opts
-        .and_then(|o| o.reverse_registry.as_ref())
-        .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "vless Reverse enabled but no registry configured")
-        })?;
-    let ohm: Arc<SimpleOhm> = opts
-        .and_then(|o| o.reverse_ohm.clone())
-        .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "vless Reverse enabled but no reverse_ohm configured")
-        })?;
+    let registry = opts.and_then(|o| o.reverse_registry.as_ref()).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "vless Reverse enabled but no registry configured",
+        )
+    })?;
+    let ohm: Arc<SimpleOhm> = opts.and_then(|o| o.reverse_ohm.clone()).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "vless Reverse enabled but no reverse_ohm configured",
+        )
+    })?;
 
     // 按 account.Reverse.Tag 路由（Go `proxy/vless/inbound/inbound.go:198-216`）：
     // 每个 VLESS 账户的 Reverse 字段携带目标 Portal 的 tag；inbound 用它从
     // registry 查 PortalConfig（domain 等），再经 ohm 拿到 PortalOutbound handler
     // 派发子会话。**禁止 fallback 到首条**——多账户各自路由独立 portal，
     // 否则跨账户流量会全部汇聚到第一个 portal（与 Go 语义偏离）。
-    let user = decoded.user.as_ref().ok_or_else(|| {
-        std::io::Error::other("vless Reverse: no user attached to request")
-    })?;
+    let user = decoded
+        .user
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("vless Reverse: no user attached to request"))?;
     let reverse_cfg = user.account.reverse.as_ref().ok_or_else(|| {
-        std::io::Error::other(format!(
-            "vless Reverse: user {} has no reverse config",
-            user.email
-        ))
+        std::io::Error::other(format!("vless Reverse: user {} has no reverse config", user.email))
     })?;
     let portal_tag = reverse_cfg.tag.clone();
     if portal_tag.is_empty() {
-        return Err(std::io::Error::other(
-            "vless Reverse: empty reverse.tag on user account",
-        ));
+        return Err(std::io::Error::other("vless Reverse: empty reverse.tag on user account"));
     }
     let portal_cfg = registry.get_reverse(&portal_tag).map_err(|e| {
-        std::io::Error::other(format!(
-            "vless Reverse get_reverse(tag={}): {}",
-            portal_tag, e
-        ))
+        std::io::Error::other(format!("vless Reverse get_reverse(tag={}): {}", portal_tag, e))
     })?;
 
     let portal_handler = ohm.get_handler(&portal_cfg.tag).ok_or_else(|| {
@@ -761,10 +745,7 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
     // 握手限时（Go inbound.go:281-284：decode 前 SetReadDeadline(policy 或
     // SessionDefault 60s)，覆盖整个 decode 阶段；sm80④ 起装配层可注入）。
     let handshake_deadline = tokio::time::Instant::now()
-        + options
-            .as_ref()
-            .and_then(|o| o.handshake_timeout)
-            .unwrap_or_else(handshake_timeout);
+        + options.as_ref().and_then(|o| o.handshake_timeout).unwrap_or_else(handshake_timeout);
 
     // 1. decode VLESS request header（isfb=false，全部从 stream 读）
     let mut first: Option<Vec<u8>> = None;
@@ -773,9 +754,7 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
         decode_request_header(false, &mut first, &mut stream, validator.as_ref()),
     )
     .await
-    .map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::TimedOut, "vless handshake read timeout")
-    })?
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "vless handshake read timeout"))?
     .map_err(|e| std::io::Error::other(format!("vless decode: {e}")))?;
 
     // 2. 按 command 分派：拆 reader/writer 后交 finish_vless_dispatch。
@@ -788,32 +767,29 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
         ..Default::default()
     };
     let (read_half, write_half) = tokio::io::split(stream);
-    finish_vless_dispatch(
-        read_half,
-        write_half,
-        decoded,
-        handler,
-        options,
-        raw_tcp,
-        access,
-    )
-    .await
+    finish_vless_dispatch(read_half, write_half, decoded, handler, options, raw_tcp, access).await
 }
 
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::encoding::VlessCommand;
-    use crate::encoding::client::{decode_response_header, encode_request_header};
-    use crate::validator::{MemoryUser, MemoryValidator};
-    use crate::MemoryAccount;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
     use xray_app_dispatcher::default::DialBridge;
-    use xray_common::net::address::Address;
-    use xray_common::uuid::UUID;
+    use xray_common::{net::address::Address, uuid::UUID};
     use xray_proxy_freedom::make_freedom_dial_fn;
+
+    use super::*;
+    use crate::{
+        MemoryAccount,
+        encoding::{
+            VlessCommand,
+            client::{decode_response_header, encode_request_header},
+        },
+        validator::{MemoryUser, MemoryValidator},
+    };
 
     /// 构造测试用 validator + 已注册用户的 UUID。
     fn make_validator_with_user() -> (UUID, Arc<dyn Validator>) {
@@ -826,14 +802,12 @@ mod tests {
         let user = MemoryUser {
             level: 0,
             email: "test@example.com".to_string(),
-            account: MemoryAccount::from_proto_account(
-                &xray_proto::xray::proxy::vless::Account {
-                    id: uuid.to_string(),
-                    flow: flow.to_string(),
-                    testseed: testseed.to_vec(),
-                    ..Default::default()
-                },
-            )
+            account: MemoryAccount::from_proto_account(&xray_proto::xray::proxy::vless::Account {
+                id: uuid.to_string(),
+                flow: flow.to_string(),
+                testseed: testseed.to_vec(),
+                ..Default::default()
+            })
             .unwrap(),
         };
         let v = MemoryValidator::new();
@@ -857,7 +831,7 @@ mod tests {
                         if sock.write_all(&buf[..n]).await.is_err() {
                             break;
                         }
-                    }
+                    },
                 }
             }
         });
@@ -874,7 +848,9 @@ mod tests {
         let vless_listener = InboundTcpListener::bind(
             "127.0.0.1:0",
             xray_transport::sockopt::SocketOptions::default(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let vless_addr = vless_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
@@ -883,9 +859,7 @@ mod tests {
         });
 
         // 4. VLESS client：connect → encode request → decode response → echo round-trip
-        let mut client = tokio::net::TcpStream::connect(vless_addr)
-            .await
-            .unwrap();
+        let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
         let addons = empty_addons();
         let dest_addr = Address::from_ipv4_bytes([127, 0, 0, 1]);
         encode_request_header(
@@ -901,9 +875,7 @@ mod tests {
         .unwrap();
 
         // 读响应头（version + addons），客户端消费后才能发数据
-        let _resp_addons = decode_response_header(&mut client, VERSION)
-            .await
-            .unwrap();
+        let _resp_addons = decode_response_header(&mut client, VERSION).await.unwrap();
 
         // 5. 发数据 + 读 echo
         let payload = b"hello vless proxy!";
@@ -926,7 +898,9 @@ mod tests {
         let vless_listener = InboundTcpListener::bind(
             "127.0.0.1:0",
             xray_transport::sockopt::SocketOptions::default(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let vless_addr = vless_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
@@ -936,9 +910,7 @@ mod tests {
 
         // client 用一个随机的（未注册的）UUID
         let unknown_uuid = UUID::new();
-        let mut client = tokio::net::TcpStream::connect(vless_addr)
-            .await
-            .unwrap();
+        let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
         let addons = empty_addons();
         let dest_addr = Address::from_ipv4_bytes([127, 0, 0, 1]);
         encode_request_header(
@@ -957,9 +929,9 @@ mod tests {
         let mut buf = [0u8; 16];
         let result = client.read(&mut buf).await;
         match result {
-            Ok(0) => {} // clean EOF
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionAborted => {}
+            Ok(0) => {}, // clean EOF
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {},
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionAborted => {},
             other => panic!("expected EOF or connection reset, got {other:?}"),
         }
     }
@@ -984,7 +956,7 @@ mod tests {
                                 if sock.write_all(&buf[..n]).await.is_err() {
                                     break;
                                 }
-                            }
+                            },
                         }
                     }
                 });
@@ -992,19 +964,18 @@ mod tests {
         });
 
         // 2 个无 email 用户（模拟生产 settings.clients 无 email 字段）
-        let ids = [
-            "b831381d-6324-4d53-ad4f-8cda48b30811",
-            "66ad4540-b58c-4ad2-9926-ea63445a9b57",
-        ];
+        let ids = ["b831381d-6324-4d53-ad4f-8cda48b30811", "66ad4540-b58c-4ad2-9926-ea63445a9b57"];
         let v = MemoryValidator::new();
         for id in ids {
             let user = MemoryUser {
                 level: 0,
                 email: String::new(),
-                account: MemoryAccount::from_proto_account(&xray_proto::xray::proxy::vless::Account {
-                    id: id.to_string(),
-                    ..Default::default()
-                })
+                account: MemoryAccount::from_proto_account(
+                    &xray_proto::xray::proxy::vless::Account {
+                        id: id.to_string(),
+                        ..Default::default()
+                    },
+                )
                 .unwrap(),
             };
             v.add(user).unwrap();
@@ -1013,14 +984,14 @@ mod tests {
         let validator: Arc<dyn Validator> = Arc::new(v);
 
         let ohm = Arc::new(SimpleOhm::new());
-        ohm.set_default(
-            Arc::new(DialBridge::new("freedom", make_freedom_dial_fn()))
-                as Arc<dyn xray_app_dispatcher::DispatchHandler>,
-        );
+        ohm.set_default(Arc::new(DialBridge::new("freedom", make_freedom_dial_fn()))
+            as Arc<dyn xray_app_dispatcher::DispatchHandler>);
         let vless_listener = InboundTcpListener::bind(
             "127.0.0.1:0",
             xray_transport::sockopt::SocketOptions::default(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let vless_addr = vless_listener.local_addr().unwrap();
         tokio::spawn(async move {
             let _ = serve_vless(vless_listener, ohm, validator, None, None, None).await;
@@ -1066,11 +1037,12 @@ mod tests {
         .unwrap();
         let mut buf = [0u8; 16];
         match client.read(&mut buf).await {
-            Ok(0) => {}
-            Err(e) if matches!(
-                e.kind(),
-                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
-            ) => {}
+            Ok(0) => {},
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) => {},
             other => panic!("expected auth rejection, got {other:?}"),
         }
     }
@@ -1091,7 +1063,7 @@ mod tests {
                         if sock.write_all(&buf[..n]).await.is_err() {
                             break;
                         }
-                    }
+                    },
                 }
             }
         });
@@ -1103,7 +1075,9 @@ mod tests {
         let vless_listener = InboundTcpListener::bind(
             "127.0.0.1:0",
             xray_transport::sockopt::SocketOptions::default(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let vless_addr = vless_listener.local_addr().unwrap();
         tokio::spawn(async move {
             let _ = serve_vless(
@@ -1112,10 +1086,7 @@ mod tests {
                 validator,
                 None,
                 None,
-                Some(VlessInboundOptions {
-                    outer_tls13,
-                    ..Default::default()
-                }),
+                Some(VlessInboundOptions { outer_tls13, ..Default::default() }),
             )
             .await;
         });
@@ -1127,8 +1098,9 @@ mod tests {
     /// [padding_len(2 BE)][content]` 帧。未包装 → 裸 echo 内容 → fail/超时。
     #[tokio::test]
     async fn vless_inbound_pads_downlink_when_flow_xrv() {
+        use tokio::time::{Duration, timeout};
+
         use crate::encryption::vision::COMMAND_PADDING_CONTINUE;
-        use tokio::time::{timeout, Duration};
         let (vless_addr, echo_port, uuid) =
             spawn_vless_proxy_with_echo(true, crate::FLOW_XRV, &[]).await;
 
@@ -1158,22 +1130,19 @@ mod tests {
             .await
             .expect("downlink must be a vision padding frame")
             .unwrap();
-        assert_eq!(
-            &wire[..16],
-            uuid.as_bytes(),
-            "first downlink block must start with user uuid"
-        );
+        assert_eq!(&wire[..16], uuid.as_bytes(), "first downlink block must start with user uuid");
         assert_eq!(wire[16], COMMAND_PADDING_CONTINUE, "data frame command");
         assert_eq!(&wire[17..19], &[0, 4], "content_len BE");
         assert_eq!(&wire[21..25], b"ping");
     }
 
     /// e2e：make_dial_fn(flow=XRV) ↔ serve_vless 全链路 Vision padding 对拉
-    ///（outbound 与 inbound 双端包装，padding 收发互解）。
+    /// （outbound 与 inbound 双端包装，padding 收发互解）。
     #[tokio::test]
     async fn vless_vision_e2e_client_and_server_roundtrip() {
-        use crate::dispatcher::{make_dial_fn, VlessOutboundConfig};
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
+
+        use crate::dispatcher::{VlessOutboundConfig, make_dial_fn};
         let (vless_addr, echo_port, uuid) =
             spawn_vless_proxy_with_echo(true, crate::FLOW_XRV, &[]).await;
 
@@ -1201,20 +1170,19 @@ mod tests {
     }
 
     /// 8i4c：testseed 有无 × 双端组合 e2e。testseed 是**本地 padding 参数**
-    ///（Go EncodeBodyAddons → NewVisionWriter(account.Testseed)，不上 wire、
+    /// （Go EncodeBodyAddons → NewVisionWriter(account.Testseed)，不上 wire、
     /// 无协商）——任意组合下 wire 帧格式不变，双向 echo 都必须照常成功。
     #[tokio::test]
     async fn vless_testseed_combinations_e2e_wire_unchanged() {
-        use crate::dispatcher::{make_dial_fn, VlessOutboundConfig};
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
+
+        use crate::dispatcher::{VlessOutboundConfig, make_dial_fn};
 
         const SEED: &[u32] = &[7, 8, 9, 10];
         // (client_seed, server_seed)：同 seed / 仅客户端 / 仅服务端（全无为既有 e2e 覆盖）。
-        for (client_seed, server_seed, label) in [
-            (SEED, SEED, "both"),
-            (SEED, &[][..], "client-only"),
-            (&[][..], SEED, "server-only"),
-        ] {
+        for (client_seed, server_seed, label) in
+            [(SEED, SEED, "both"), (SEED, &[][..], "client-only"), (&[][..], SEED, "server-only")]
+        {
             let (vless_addr, echo_port, uuid) =
                 spawn_vless_proxy_with_echo(true, crate::FLOW_XRV, server_seed).await;
             let cfg = Arc::new(
@@ -1247,8 +1215,9 @@ mod tests {
     /// 交付）照常走请求头 + echo；全链路 roundtrip 不受预连接影响。
     #[tokio::test]
     async fn vless_testpre_preconnect_e2e_roundtrip() {
-        use crate::dispatcher::{make_dial_fn, VlessOutboundConfig};
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
+
+        use crate::dispatcher::{VlessOutboundConfig, make_dial_fn};
 
         // 多连接 echo（testpre worker 会预拨 + 补货，单 accept 不够）。
         let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1264,7 +1233,7 @@ mod tests {
                                 if sock.write_all(&buf[..n]).await.is_err() {
                                     break;
                                 }
-                            }
+                            },
                         }
                     }
                 });
@@ -1322,8 +1291,9 @@ mod tests {
     /// 回归：flow 为空时 make_dial_fn 返回裸连接（无 Vision 包装），链路照常。
     #[tokio::test]
     async fn vless_no_flow_e2e_make_dial_fn_roundtrip() {
-        use crate::dispatcher::{make_dial_fn, VlessOutboundConfig};
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
+
+        use crate::dispatcher::{VlessOutboundConfig, make_dial_fn};
         let (vless_addr, echo_port, uuid) = spawn_vless_proxy_with_echo(true, "", &[]).await;
 
         let cfg = Arc::new(VlessOutboundConfig::new(
@@ -1339,10 +1309,7 @@ mod tests {
         conn.write_all(payload).await.unwrap();
         conn.flush().await.unwrap();
         let mut got = vec![0u8; payload.len()];
-        timeout(Duration::from_secs(10), conn.read_exact(&mut got))
-            .await
-            .unwrap()
-            .unwrap();
+        timeout(Duration::from_secs(10), conn.read_exact(&mut got)).await.unwrap().unwrap();
     }
     /// UDP echo 模拟 DispatchHandler：读首帧 XUDP，回写一帧（payload 相同）。
     ///
@@ -1355,9 +1322,7 @@ mod tests {
 
     impl UdpEchoHandler {
         fn new() -> Self {
-            Self {
-                captured: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
-            }
+            Self { captured: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())) }
         }
     }
 
@@ -1373,7 +1338,6 @@ mod tests {
         ) -> xray_app_dispatcher::default::PinFuture<()> {
             let captured = std::sync::Arc::clone(&self.captured);
             Box::pin(async move {
-
                 use xray_xudp::packet::{FrameMetadata, PacketReader};
                 let mut reader = link.reader;
                 let mut writer = link.writer;
@@ -1409,7 +1373,7 @@ mod tests {
                                     return;
                                 }
                                 accum.drain(..consumed);
-                            }
+                            },
                             _ => break,
                         }
                     }
@@ -1433,7 +1397,9 @@ mod tests {
         let vless_listener = InboundTcpListener::bind(
             "127.0.0.1:0",
             xray_transport::sockopt::SocketOptions::default(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let vless_addr = vless_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
@@ -1441,8 +1407,8 @@ mod tests {
             let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None, None, None).await;
         });
 
-        // 3. VLESS client：connect → encode UDP request → decode response →
-        //    发送 1 个长度前缀 UDP 包 → 期望收到 1 个长度前缀回包（payload = 原值）
+        // 3. VLESS client：connect → encode UDP request → decode response → 发送 1 个长度前缀 UDP
+        //    包 → 期望收到 1 个长度前缀回包（payload = 原值）
         let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
         let addons = empty_addons();
         // VLESS UDP command：dest = 任意 UDP 目标（这里用 127.0.0.1:53 占位）
@@ -1468,26 +1434,16 @@ mod tests {
 
         // 5. 读取长度前缀回包
         let mut len_buf = [0u8; 2];
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            client.read_exact(&mut len_buf),
-        )
-        .await
-        .expect("echo should arrive within 5s")
-        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut len_buf))
+            .await
+            .expect("echo should arrive within 5s")
+            .unwrap();
         let resp_len = u16::from_be_bytes(len_buf) as usize;
         let mut resp = vec![0u8; resp_len];
         client.read_exact(&mut resp).await.unwrap();
-        assert_eq!(
-            &resp, payload,
-            "UDP echo payload should round-trip via UdpDispatchSession"
-        );
+        assert_eq!(&resp, payload, "UDP echo payload should round-trip via UdpDispatchSession");
         // 6. 验证 mock handler 收到了包
-        assert_eq!(
-            captured.lock().len(),
-            1,
-            "mock UDP echo handler should have captured 1 packet"
-        );
+        assert_eq!(captured.lock().len(), 1, "mock UDP echo handler should have captured 1 packet");
         assert_eq!(&captured.lock()[0], payload);
     }
 
@@ -1495,7 +1451,8 @@ mod tests {
     #[derive(Debug)]
     struct CaptureDispatchHandler {
         called: std::sync::Arc<parking_lot::Mutex<u32>>,
-        dest_seen: std::sync::Arc<parking_lot::Mutex<Option<xray_common::net::destination::Destination>>>,
+        dest_seen:
+            std::sync::Arc<parking_lot::Mutex<Option<xray_common::net::destination::Destination>>>,
     }
 
     impl CaptureDispatchHandler {
@@ -1511,6 +1468,7 @@ mod tests {
         fn tag(&self) -> &str {
             "capture"
         }
+
         fn dispatch(
             &self,
             dest: &xray_common::net::destination::Destination,
@@ -1552,8 +1510,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         // 服务端以超时错误退出
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
         assert!(result.is_ok(), "server should exit after handshake timeout");
         let joined = result.unwrap();
         assert!(
@@ -1591,6 +1548,7 @@ mod tests {
         fn tag(&self) -> &str {
             "mux-capture"
         }
+
         fn dispatch(
             &self,
             dest: &xray_common::net::destination::Destination,
@@ -1613,7 +1571,7 @@ mod tests {
                             if !bytes.is_empty() {
                                 break bytes;
                             }
-                        }
+                        },
                         Err(_) => break Vec::new(),
                     }
                 };
@@ -1635,8 +1593,7 @@ mod tests {
         let called = std::sync::Arc::clone(&capture.called);
         let dest_seen = std::sync::Arc::clone(&capture.dest_seen);
         let payload = std::sync::Arc::clone(&capture.payload);
-        let capture_for_ohm: Arc<dyn xray_app_dispatcher::DispatchHandler> =
-            capture.clone();
+        let capture_for_ohm: Arc<dyn xray_app_dispatcher::DispatchHandler> = capture.clone();
         let ohm = Arc::new(SimpleOhm::new());
         ohm.set_default(capture_for_ohm);
 
@@ -1644,15 +1601,14 @@ mod tests {
         let vless_listener = InboundTcpListener::bind(
             "127.0.0.1:0",
             xray_transport::sockopt::SocketOptions::default(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let vless_addr = vless_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
         tokio::spawn(async move {
-            let _ = serve_vless(
-                vless_listener, ohm_clone, validator_clone, None, None, None,
-            )
-            .await;
+            let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None, None, None).await;
         });
 
         // 真实 mux New 帧：new session 1 → TCP 127.0.0.1:8080
@@ -1670,7 +1626,13 @@ mod tests {
         // client：Mux command（无 addr/port，decode 补 v1.mux.cool）→ 响应头 → New 帧
         let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
         encode_request_header(
-            &mut client, VERSION, &uuid, VlessCommand::Mux, None, None, &empty_addons(),
+            &mut client,
+            VERSION,
+            &uuid,
+            VlessCommand::Mux,
+            None,
+            None,
+            &empty_addons(),
         )
         .await
         .unwrap();
@@ -1697,11 +1659,7 @@ mod tests {
             "Mux dest should be v1.mux.cool"
         );
         assert_eq!(dest.port().value(), 0, "Mux command carries no port");
-        assert_eq!(
-            &*payload.lock(),
-            new_frame,
-            "New frame bytes must pass through verbatim"
-        );
+        assert_eq!(&*payload.lock(), new_frame, "New frame bytes must pass through verbatim");
     }
 
     /// VLESS Rvs command + enable_reverse=false：维持原 warn+close 行为，
@@ -1718,7 +1676,9 @@ mod tests {
         let vless_listener = InboundTcpListener::bind(
             "127.0.0.1:0",
             xray_transport::sockopt::SocketOptions::default(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let vless_addr = vless_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
@@ -1732,26 +1692,26 @@ mod tests {
             allowed_network: None,
         };
         tokio::spawn(async move {
-            let _ = serve_vless(
-                vless_listener, ohm_clone, validator_clone, None, None, Some(opts),
-            )
-            .await;
+            let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None, None, Some(opts))
+                .await;
         });
 
         let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
         encode_request_header(
-            &mut client, VERSION, &uuid, VlessCommand::Rvs, None, None, &empty_addons(),
+            &mut client,
+            VERSION,
+            &uuid,
+            VlessCommand::Rvs,
+            None,
+            None,
+            &empty_addons(),
         )
         .await
         .unwrap();
         // 应该收到响应头 + 关闭
         let _resp = decode_response_header(&mut client, VERSION).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        assert_eq!(
-            *called.lock(),
-            0,
-            "Rvs with enable_reverse=false should NOT trigger dispatch"
-        );
+        assert_eq!(*called.lock(), 0, "Rvs with enable_reverse=false should NOT trigger dispatch");
     }
 
     /// VLESS Rvs command + enable_reverse=true + 注册表存在：不再 warn 占位，
@@ -1773,7 +1733,9 @@ mod tests {
         let vless_listener = InboundTcpListener::bind(
             "127.0.0.1:0",
             xray_transport::sockopt::SocketOptions::default(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let vless_addr = vless_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
@@ -1796,15 +1758,19 @@ mod tests {
             allowed_network: None,
         };
         tokio::spawn(async move {
-            let _ = serve_vless(
-                vless_listener, ohm_clone, validator_clone, None, None, Some(opts),
-            )
-            .await;
+            let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None, None, Some(opts))
+                .await;
         });
 
         let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
         encode_request_header(
-            &mut client, VERSION, &uuid, VlessCommand::Rvs, None, None, &empty_addons(),
+            &mut client,
+            VERSION,
+            &uuid,
+            VlessCommand::Rvs,
+            None,
+            None,
+            &empty_addons(),
         )
         .await
         .unwrap();
@@ -1812,24 +1778,26 @@ mod tests {
         // 当前 Reverse 是 stub：仅做注册表查找，不触发 dispatch。
         // 验证：响应头已发 + 客户端能正常关闭（不挂住）。
         let mut buf = [0u8; 1];
-        let r = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            client.read(&mut buf),
-        )
-        .await;
+        let r = tokio::time::timeout(std::time::Duration::from_millis(500), client.read(&mut buf))
+            .await;
         // 期望：客户端收到 EOF（Ok(0)）或读超时
         match r {
-            Ok(Ok(0)) => {} // clean EOF
-            Ok(Ok(_)) => {} // 也接受（可能写了别的）
-            Err(_) => {}    // timeout：也行
-            Ok(Err(_)) => {}
+            Ok(Ok(0)) => {}, // clean EOF
+            Ok(Ok(_)) => {}, // 也接受（可能写了别的）
+            Err(_) => {},    // timeout：也行
+            Ok(Err(_)) => {},
         }
     }
 
     // ==== lwep：Go inbound.go:552-598 flow 五臂契约（恶意输入必拒）====
 
     /// 恶意 flow 公共断言：服务端校验失败必须断连且不发响应头（客户端读到 EOF）。
-    async fn assert_flow_rejected(flow: &str, command: VlessCommand, outer_tls13: bool, account_flow: &str) {
+    async fn assert_flow_rejected(
+        flow: &str,
+        command: VlessCommand,
+        outer_tls13: bool,
+        account_flow: &str,
+    ) {
         let (vless_addr, _echo_port, uuid) =
             spawn_vless_proxy_with_echo(outer_tls13, account_flow, &[]).await;
         let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
@@ -1852,9 +1820,13 @@ mod tests {
             .await
             .expect("server must close promptly on invalid flow")
         {
-            Ok(0) => {}
+            Ok(0) => {},
             Ok(n) => panic!("server sent unexpected bytes before closing: {n} bytes"),
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) => {},
             Err(e) => panic!("unexpected io error: {e}"),
         }
     }
@@ -1885,13 +1857,16 @@ mod tests {
             .await
             .expect("server must close promptly on unknown flow")
         {
-            Ok(0) => {}
+            Ok(0) => {},
             Ok(n) => panic!("server sent unexpected bytes before closing: {n} bytes"),
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) => {},
             Err(e) => panic!("unexpected io error: {e}"),
         }
     }
-
 
     /// 臂（Go inbound.go:557-558）：XRV + UDP 命令拒。
     #[tokio::test]

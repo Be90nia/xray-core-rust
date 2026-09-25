@@ -7,15 +7,14 @@
 //! - **Linux/macOS/FreeBSD**：`build_async()` 真机创建设备（需 root/CAP_NET_ADMIN）
 //! - **Windows**：动态加载 `wintun.dll`，未安装则 `build_async()` 返 `DeviceCreateFailed`
 
-use tun_rs::AsyncDevice;
-use tun_rs::DeviceBuilder;
-use tun_rs::Layer;
-
+use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
 #[cfg(target_os = "linux")]
 use tun_rs::{GROTable, VIRTIO_NET_HDR_LEN};
 
-use crate::config::Tun;
-use crate::error::{Result, TunError};
+use crate::{
+    config::Tun,
+    error::{Result, TunError},
+};
 
 /// vnet_hdr 垫头缓冲 free list（票 0qef）：每包垫头 `Vec` 从池里取、发完回收，
 /// 消除热路径每包一次 `vec![0u8; header + len]` 堆分配。
@@ -37,10 +36,7 @@ mod hdr_free_list {
 
     impl HdrFreeList {
         pub(super) fn new(header_len: usize) -> Self {
-            Self {
-                header_len,
-                free: Vec::new(),
-            }
+            Self { header_len, free: Vec::new() }
         }
 
         /// 取一缓冲写入 `pkt`：前 `header_len` 字节 vnet 头占位（全零）+ 包数据。
@@ -114,9 +110,7 @@ impl TunDevice {
             name: name_str,
             mtu,
             #[cfg(target_os = "linux")]
-            send_free: parking_lot::Mutex::new(hdr_free_list::HdrFreeList::new(
-                VIRTIO_NET_HDR_LEN,
-            )),
+            send_free: parking_lot::Mutex::new(hdr_free_list::HdrFreeList::new(VIRTIO_NET_HDR_LEN)),
         })
     }
 
@@ -151,10 +145,7 @@ impl TunDevice {
             // 两分支语义（与 send_batch 同路径）。
             let mut pkt = [self.send_free.lock().pack(buf)];
             let mut gro = GROTable::default();
-            let sent = self
-                .dev
-                .send_multiple(&mut gro, &mut pkt, VIRTIO_NET_HDR_LEN)
-                .await;
+            let sent = self.dev.send_multiple(&mut gro, &mut pkt, VIRTIO_NET_HDR_LEN).await;
             self.send_free.lock().recycle(pkt);
             sent
         }
@@ -215,10 +206,7 @@ impl TunDevice {
         // offset=VIRTIO_NET_HDR_LEN 在 vnet 开/关两个分支下语义均正确。
         // ponytail: GROTable 每批现造（3 个小 Vec 分配），profile 说贵再复用
         let mut gro = GROTable::default();
-        let sent = self
-            .dev
-            .send_multiple(&mut gro, &mut bufs, VIRTIO_NET_HDR_LEN)
-            .await;
+        let sent = self.dev.send_multiple(&mut gro, &mut bufs, VIRTIO_NET_HDR_LEN).await;
         self.send_free.lock().recycle(bufs);
         sent
     }
@@ -274,15 +262,12 @@ mod tests {
                 // CI/无权限环境——跳过而不失败（Go 端同样可能在 build_async 处失败）
                 eprintln!("SKIP: TUN create failed (likely no permission): {e}");
                 return;
-            }
+            },
         };
 
         // Tun trait 元数据（对应 Go tun_windows.go:207-221）
         let name = dev.name().expect("name");
-        assert!(
-            !name.is_empty(),
-            "device name should be non-empty (Go: tun_windows.go:212-213)"
-        );
+        assert!(!name.is_empty(), "device name should be non-empty (Go: tun_windows.go:212-213)");
         let idx = dev.index().expect("index");
         assert!(idx >= 0, "device index should be non-negative (Go: tun_windows.go:220)");
         dev.start().expect("start");
@@ -311,7 +296,7 @@ mod tests {
             Err(e) => {
                 eprintln!("SKIP: TUN create failed (likely no permission): {e}");
                 return;
-            }
+            },
         };
 
         // 构造最小 IPv4 包（20 字节，version=4, IHL=5, total_length=20）
@@ -342,7 +327,8 @@ mod tests {
             "write should accept the whole packet (Linux vnet_hdr adds header bytes)"
         );
 
-        // try_recv 非阻塞：空队列时 WouldBlock（对应 Go tun_windows.go:253-256 windows.ERROR_NO_MORE_ITEMS）
+        // try_recv 非阻塞：空队列时 WouldBlock（对应 Go tun_windows.go:253-256
+        // windows.ERROR_NO_MORE_ITEMS）
         let mut buf = vec![0u8; 1500];
         match dev.try_recv(&mut buf) {
             // 如果有回流（罕见，需路由配置），验证 magic byte；
@@ -351,16 +337,16 @@ mod tests {
             Ok(n) => {
                 assert_eq!(buf[0] >> 4, 4, "received packet must be IPv4 (version 4)");
                 assert!(n >= 20, "minimum IPv4 header is 20 bytes, got {n}");
-            }
+            },
             #[cfg(target_os = "linux")]
-            Ok(_) => {}
+            Ok(_) => {},
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // 期望路径：无路由 → 内核不发回流包
-            }
+            },
             Err(e) => {
                 // 其他错误（如 ERROR_OPERATION_ABORTED）也算设备 I/O 已工作
                 eprintln!("try_recv returned non-fatal error: {e}");
-            }
+            },
         }
 
         dev.close().expect("close");
@@ -392,7 +378,7 @@ mod trait_tests {
 /// 平台无关（HdrFreeList 不依赖 tun_rs），Windows 本地可跑。
 #[cfg(test)]
 mod free_list_tests {
-    use super::hdr_free_list::{HdrFreeList, HDR_FREE_MAX};
+    use super::hdr_free_list::{HDR_FREE_MAX, HdrFreeList};
 
     const HDR: usize = 12; // == Linux VIRTIO_NET_HDR_LEN，平台无关测试用字面值
 
@@ -413,11 +399,7 @@ mod free_list_tests {
         let ptr1 = b1.as_ptr();
         fl.recycle([b1]);
         let b2 = fl.pack(&[2u8; 100]);
-        assert_eq!(
-            b2.as_ptr(),
-            ptr1,
-            "回收缓冲必须被复用（同指针 = 零新堆分配）"
-        );
+        assert_eq!(b2.as_ptr(), ptr1, "回收缓冲必须被复用（同指针 = 零新堆分配）");
         assert_eq!(b2.len(), HDR + 100);
     }
 
@@ -432,11 +414,7 @@ mod free_list_tests {
         let dropped_ptr = dropped.as_ptr();
         fl.recycle([dropped]);
         let b = fl.pack(&[1u8; 64]);
-        assert_ne!(
-            b.as_ptr(),
-            dropped_ptr,
-            "池满后回收必须被丢弃，不得复用"
-        );
+        assert_ne!(b.as_ptr(), dropped_ptr, "池满后回收必须被丢弃，不得复用");
     }
 
     #[test]

@@ -43,11 +43,7 @@ pub const DEFAULT_PADDING_SEED: [u32; 4] = [900, 500, 900, 256];
 /// 账号的 seed，两侧独立无需协商。
 #[must_use]
 pub fn normalize_padding_seed(seed: &[u32]) -> [u32; 4] {
-    if seed.len() < 4 {
-        DEFAULT_PADDING_SEED
-    } else {
-        [seed[0], seed[1], seed[2], seed[3]]
-    }
+    if seed.len() < 4 { DEFAULT_PADDING_SEED } else { [seed[0], seed[1], seed[2], seed[3]] }
 }
 
 /// TLS 1.3 cipher suite 名称查询（对齐 Go `Tls13CipherSuiteDic`）。
@@ -139,12 +135,13 @@ impl TrafficState {
 
 /// Vision padding 编码（对齐 Go `XtlsPadding`）。
 ///
-/// 输出格式：`[user_uuid(16, 仅首块)][command(1)][content_len(2 BE)][padding_len(2 BE)][content][padding]`。
-/// `user_uuid` 被消费后置 `None`（Go `writeOnceUserUUID` 语义）。
+/// 输出格式：`[user_uuid(16, 仅首块)][command(1)][content_len(2 BE)][padding_len(2
+/// BE)][content][padding]`。 `user_uuid` 被消费后置 `None`（Go `writeOnceUserUUID` 语义）。
 ///
 /// # 参数
 /// - `content`：明文内容（`None` 表示纯 padding keepalive）
-/// - `command`：Vision command（[`COMMAND_PADDING_CONTINUE`]/[`COMMAND_PADDING_END`]/[`COMMAND_PADDING_DIRECT`]）
+/// - `command`：Vision
+///   command（[`COMMAND_PADDING_CONTINUE`]/[`COMMAND_PADDING_END`]/[`COMMAND_PADDING_DIRECT`]）
 /// - `user_uuid`：首块写入后置 `None`
 /// - `long_padding`：是否生成长 padding（隐藏 VLESS header）
 /// - `seed`：padding 长度种子 `[短阈值, 长上限, 长基准, 短上限]`
@@ -228,21 +225,17 @@ pub fn xtls_unpadding(buf: &[u8], state: &mut DirectionState, user_uuid: &[u8]) 
                 3 => state.remaining_content |= data as i32,
                 2 => state.remaining_padding = (data as i32) << 8,
                 1 => state.remaining_padding |= data as i32,
-                _ => {}
+                _ => {},
             }
             state.remaining_command -= 1;
         } else if state.remaining_content > 0 {
-            let len = state
-                .remaining_content
-                .min((buf.len() - pos) as i32) as usize;
+            let len = state.remaining_content.min((buf.len() - pos) as i32) as usize;
             out.extend_from_slice(&buf[pos..pos + len]);
             pos += len;
             state.remaining_content -= len as i32;
         } else {
             // remaining_padding > 0
-            let len = state
-                .remaining_padding
-                .min((buf.len() - pos) as i32) as usize;
+            let len = state.remaining_padding.min((buf.len() - pos) as i32) as usize;
             pos += len;
             state.remaining_padding -= len as i32;
         }
@@ -290,7 +283,9 @@ pub fn xtls_filter_tls(buffers: &[&[u8]], state: &mut TrafficState) {
         }
         let starts = &b[..6];
 
-        if starts.starts_with(&TLS_SERVER_HANDSHAKE_START) && starts[5] == TLS_HANDSHAKE_TYPE_SERVER_HELLO {
+        if starts.starts_with(&TLS_SERVER_HANDSHAKE_START)
+            && starts[5] == TLS_HANDSHAKE_TYPE_SERVER_HELLO
+        {
             state.remaining_server_hello = ((starts[3] as i32) << 8 | starts[4] as i32) + 5;
             state.is_tls12_or_above = true;
             state.is_tls = true;
@@ -301,7 +296,9 @@ pub fn xtls_filter_tls(buffers: &[&[u8]], state: &mut TrafficState) {
                     state.cipher = ((b[cipher_off] as u16) << 8) | b[cipher_off + 1] as u16;
                 }
             }
-        } else if starts.starts_with(&TLS_CLIENT_HANDSHAKE_START) && starts[5] == TLS_HANDSHAKE_TYPE_CLIENT_HELLO {
+        } else if starts.starts_with(&TLS_CLIENT_HANDSHAKE_START)
+            && starts[5] == TLS_HANDSHAKE_TYPE_CLIENT_HELLO
+        {
             state.is_tls = true;
         }
 
@@ -501,10 +498,9 @@ pub fn can_splice_copy(state: &TrafficState, port: u16, is_udp: bool) -> SpliceD
 
 #[cfg(test)]
 mod tests {
+    use rand::{SeedableRng, rng, rngs::StdRng};
+
     use super::*;
-    use rand::rng;
-    use rand::rngs::StdRng;
-    use rand::SeedableRng;
 
     #[test]
     fn padding_basic_format_with_uuid() {
@@ -643,7 +639,6 @@ mod tests {
         assert_eq!(out, raw);
     }
 
-
     #[test]
     fn filter_tls_detects_tls13_server_hello() {
         // 构造最小 TLS 1.3 ServerHello record
@@ -748,14 +743,8 @@ mod tests {
 
     #[test]
     fn classify_udp443_non_udp443() {
-        assert_eq!(
-            classify_udp443_packet(&[0xC0], 80, true),
-            PKT_TYPE_NOT_UDP443
-        );
-        assert_eq!(
-            classify_udp443_packet(&[0xC0], 443, false),
-            PKT_TYPE_NOT_UDP443
-        );
+        assert_eq!(classify_udp443_packet(&[0xC0], 80, true), PKT_TYPE_NOT_UDP443);
+        assert_eq!(classify_udp443_packet(&[0xC0], 443, false), PKT_TYPE_NOT_UDP443);
     }
 
     #[test]
@@ -763,38 +752,26 @@ mod tests {
         // QUIC Initial Long Header: 0b11_00_0000 = 0xC0
         // header form=1, fixed=1, long=1, type=00(Initial)
         let pkt = [0xC0u8, 0x00, 0x00, 0x00, 0x01]; // version + packet
-        assert_eq!(
-            classify_udp443_packet(&pkt, 443, true),
-            PKT_TYPE_UDP443_INITIAL
-        );
+        assert_eq!(classify_udp443_packet(&pkt, 443, true), PKT_TYPE_UDP443_INITIAL);
     }
 
     #[test]
     fn classify_udp443_quic_handshake_not_initial() {
         // QUIC Handshake Long Header: 0b11_10_0000 = 0xE0 (type=10)
         let pkt = [0xE0u8, 0x00];
-        assert_eq!(
-            classify_udp443_packet(&pkt, 443, true),
-            PKT_TYPE_UDP443_OTHER
-        );
+        assert_eq!(classify_udp443_packet(&pkt, 443, true), PKT_TYPE_UDP443_OTHER);
     }
 
     #[test]
     fn classify_udp443_short_header() {
         // Short Header: 0b01_000000 = 0x40 (header form=0)
         let pkt = [0x40u8, 0x00];
-        assert_eq!(
-            classify_udp443_packet(&pkt, 443, true),
-            PKT_TYPE_UDP443_OTHER
-        );
+        assert_eq!(classify_udp443_packet(&pkt, 443, true), PKT_TYPE_UDP443_OTHER);
     }
 
     #[test]
     fn classify_udp443_empty_buf() {
-        assert_eq!(
-            classify_udp443_packet(&[], 443, true),
-            PKT_TYPE_UDP443_OTHER
-        );
+        assert_eq!(classify_udp443_packet(&[], 443, true), PKT_TYPE_UDP443_OTHER);
     }
 
     #[test]
@@ -818,10 +795,7 @@ mod tests {
     #[test]
     fn can_splice_no_xtls() {
         let state = TrafficState::new(vec![0u8; 16]);
-        assert_eq!(
-            can_splice_copy(&state, 443, false),
-            SpliceDecision::NoSplice
-        );
+        assert_eq!(can_splice_copy(&state, 443, false), SpliceDecision::NoSplice);
     }
 
     #[test]
@@ -829,10 +803,7 @@ mod tests {
         let mut state = TrafficState::new(vec![0u8; 16]);
         state.enable_xtls = true;
         state.number_of_packet_to_filter = 3; // 仍在过滤窗口内
-        assert_eq!(
-            can_splice_copy(&state, 443, false),
-            SpliceDecision::Pending
-        );
+        assert_eq!(can_splice_copy(&state, 443, false), SpliceDecision::Pending);
     }
 
     #[test]
@@ -840,10 +811,7 @@ mod tests {
         let mut state = TrafficState::new(vec![0u8; 16]);
         state.enable_xtls = true;
         state.number_of_packet_to_filter = 0; // 过滤窗口已耗尽
-        assert_eq!(
-            can_splice_copy(&state, 443, false),
-            SpliceDecision::Splice
-        );
+        assert_eq!(can_splice_copy(&state, 443, false), SpliceDecision::Splice);
     }
 
     #[test]
@@ -852,10 +820,7 @@ mod tests {
         state.enable_xtls = true;
         state.number_of_packet_to_filter = 0;
         // udp443 走独立路径，can_splice_copy 返回 NoSplice
-        assert_eq!(
-            can_splice_copy(&state, 443, true),
-            SpliceDecision::NoSplice
-        );
+        assert_eq!(can_splice_copy(&state, 443, true), SpliceDecision::NoSplice);
     }
 
     #[test]

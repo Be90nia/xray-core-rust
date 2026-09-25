@@ -19,9 +19,11 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use xray_common::net::destination::Destination;
 
-use crate::config::{Config, DnsRule, RuleAction};
-use crate::dns_message::{build_dns_response, parse_dns_query, DnsQuestion};
-use crate::error::{DnsProxyError, Result};
+use crate::{
+    config::{Config, DnsRule, RuleAction},
+    dns_message::{DnsQuestion, build_dns_response, parse_dns_query},
+    error::{DnsProxyError, Result},
+};
 /// DNS 代理 Handler。对应 Go `proxy/dns/dns.go::Handler` struct。
 #[derive(Debug, Clone)]
 pub struct Handler {
@@ -46,12 +48,8 @@ pub struct RewriteOverrides {
 }
 
 /// prost Endpoint → 字段级覆盖（Go `rewriteServer.AsDestination()` 的覆盖语义）。
-fn prost_endpoint_to_overrides(
-    ep: &xray_proto::xray::common::net::Endpoint,
-) -> RewriteOverrides {
-    use xray_common::net::address::Address;
-    use xray_common::net::network::Network;
-    use xray_common::net::port::Port;
+fn prost_endpoint_to_overrides(ep: &xray_proto::xray::common::net::Endpoint) -> RewriteOverrides {
+    use xray_common::net::{address::Address, network::Network, port::Port};
 
     let network = xray_proto::xray::common::net::Network::try_from(ep.network)
         .ok()
@@ -60,24 +58,22 @@ fn prost_endpoint_to_overrides(
             xray_proto::xray::common::net::Network::Tcp => Network::TCP,
             _ => Network::UDP,
         });
-    let address = ep.address.as_ref().and_then(|iod| iod.address.as_ref()).map(
-        |a| match a {
-            xray_proto::xray::common::net::ip_or_domain::Address::Ip(bytes) => {
-                if bytes.len() == 4 {
-                    let mut b = [0u8; 4];
-                    b.copy_from_slice(bytes);
-                    Address::IPv4(std::net::Ipv4Addr::from(b))
-                } else {
-                    let mut b = [0u8; 16];
-                    b.copy_from_slice(&bytes[..16.min(bytes.len())]);
-                    Address::IPv6(std::net::Ipv6Addr::from(b))
-                }
-            }
-            xray_proto::xray::common::net::ip_or_domain::Address::Domain(d) => {
-                Address::Domain(d.clone())
+    let address = ep.address.as_ref().and_then(|iod| iod.address.as_ref()).map(|a| match a {
+        xray_proto::xray::common::net::ip_or_domain::Address::Ip(bytes) => {
+            if bytes.len() == 4 {
+                let mut b = [0u8; 4];
+                b.copy_from_slice(bytes);
+                Address::IPv4(std::net::Ipv4Addr::from(b))
+            } else {
+                let mut b = [0u8; 16];
+                b.copy_from_slice(&bytes[..16.min(bytes.len())]);
+                Address::IPv6(std::net::Ipv6Addr::from(b))
             }
         },
-    );
+        xray_proto::xray::common::net::ip_or_domain::Address::Domain(d) => {
+            Address::Domain(d.clone())
+        },
+    });
     let port = u16::try_from(ep.port).ok().filter(|p| *p != 0).map(Port::new);
     RewriteOverrides { network, address, port }
 }
@@ -89,16 +85,9 @@ impl Handler {
     /// `DnsDispatchBridge` 持有 DnsService），超时用固定值。
     pub fn init(config: &Config) -> Self {
         let rules: Vec<DnsRule> = config.rule.iter().map(DnsRule::from_config).collect();
-        let rewrite = config
-            .rewrite_server
-            .as_ref()
-            .map(prost_endpoint_to_overrides)
-            .unwrap_or_default();
-        Self {
-            rules,
-            rewrite,
-            timeout: Duration::from_secs(5),
-        }
+        let rewrite =
+            config.rewrite_server.as_ref().map(prost_endpoint_to_overrides).unwrap_or_default();
+        Self { rules, rewrite, timeout: Duration::from_secs(5) }
     }
 
     /// 查找首个匹配的规则，返回 `(action, rCode)`。
@@ -153,8 +142,8 @@ impl Handler {
     /// # Errors
     /// - [`DnsProxyError::QueryParseFailed`]：`query` 不是合法 DNS 消息。
     pub async fn process(&self, query: &[u8]) -> Result<ProcessOutcome> {
-        let (header, question) = parse_dns_query(query)
-            .map_err(|e| DnsProxyError::QueryParseFailed(e.to_string()))?;
+        let (header, question) =
+            parse_dns_query(query).map_err(|e| DnsProxyError::QueryParseFailed(e.to_string()))?;
         let (action, r_code) = self.match_rules(question.q_type, &question.name);
         let outcome = match action {
             RuleAction::Drop => ProcessOutcome::Drop,
@@ -167,10 +156,8 @@ impl Handler {
                         response: build_dns_response(&header, &question, r_code as u8),
                     }
                 }
-            }
-            RuleAction::Direct => ProcessOutcome::Forward {
-                query: query.to_vec(),
             },
+            RuleAction::Direct => ProcessOutcome::Forward { query: query.to_vec() },
             RuleAction::Hijack => {
                 // Go：非 A/AAAA 劫持 → rejectNonIPQuery（按规则 rCode 拒绝）。
                 if question.q_type != QTYPE_A && question.q_type != QTYPE_AAAA {
@@ -182,11 +169,9 @@ impl Handler {
                         }
                     }
                 } else {
-                    ProcessOutcome::Hijack {
-                        query: query.to_vec(),
-                    }
+                    ProcessOutcome::Hijack { query: query.to_vec() }
                 }
-            }
+            },
         };
         Ok(outcome)
     }
@@ -196,7 +181,6 @@ impl Handler {
 pub const QTYPE_A: u16 = 1;
 /// AAAA 记录类型（RFC 3596）。
 pub const QTYPE_AAAA: u16 = 28;
-
 
 // ---------------------------------------------------------------------------
 // DNS over TCP 长度前缀帧（RFC 1035 §4.2.2）
@@ -278,7 +262,6 @@ mod tests {
         assert_eq!(h.rule_count(), 1);
     }
 
-
     #[test]
     fn match_rules_qtype_drop_aaaa() {
         let cfg = Config {
@@ -352,13 +335,9 @@ mod tests {
     /// rewriteServer 三字段独立覆盖（Go dns.go:166-174）。
     #[test]
     fn rewrite_dest_overrides_fields_independently() {
-        use xray_common::net::address::Address;
-        use xray_common::net::port::Port;
+        use xray_common::net::{address::Address, port::Port};
 
-        let base = Destination::udp(
-            Address::IPv4("8.8.8.8".parse().unwrap()),
-            Port::new(53),
-        );
+        let base = Destination::udp(Address::IPv4("8.8.8.8".parse().unwrap()), Port::new(53));
 
         // 未配置 → 原样。
         let h = Handler::init(&Config::default());
@@ -386,11 +365,9 @@ mod tests {
             rewrite_server: Some(xray_proto::xray::common::net::Endpoint {
                 network: 2, // TCP（xray.common.net.Network.TCP = 2）
                 address: Some(xray_proto::xray::common::net::IpOrDomain {
-                    address: Some(
-                        xray_proto::xray::common::net::ip_or_domain::Address::Domain(
-                            "dns.example.com".into(),
-                        ),
-                    ),
+                    address: Some(xray_proto::xray::common::net::ip_or_domain::Address::Domain(
+                        "dns.example.com".into(),
+                    )),
                 }),
                 port: 853,
             }),
@@ -400,10 +377,7 @@ mod tests {
         let d = h.rewrite_dest(&base);
         assert!(d.is_tcp());
         assert_eq!(d.port().value(), 853);
-        assert_eq!(
-            *d.address(),
-            Address::Domain("dns.example.com".into())
-        );
+        assert_eq!(*d.address(), Address::Domain("dns.example.com".into()));
     }
     #[test]
     fn decide_action_uses_match_rules() {
@@ -416,11 +390,7 @@ mod tests {
             ..Default::default()
         };
         let h = Handler::init(&cfg);
-        let q = DnsQuestion {
-            name: "example.com".into(),
-            q_type: 1,
-            q_class: 1,
-        };
+        let q = DnsQuestion { name: "example.com".into(), q_type: 1, q_class: 1 };
         assert_eq!(decide_action(&h, &q), RuleAction::Drop);
     }
 
@@ -475,7 +445,7 @@ mod tests {
                     crate::dns_message::parse_dns_query(&response).expect("parse resp");
                 assert!(header.is_response());
                 assert_eq!(header.rcode(), 5);
-            }
+            },
             _ => panic!("expected Respond, got {outcome:?}"),
         }
 
@@ -495,7 +465,7 @@ mod tests {
                 let (header, _) =
                     crate::dns_message::parse_dns_query(&response).expect("parse resp");
                 assert_eq!(header.rcode(), 0);
-            }
+            },
             _ => panic!("expected Respond, got {outcome:?}"),
         }
     }
@@ -541,7 +511,7 @@ mod tests {
                     crate::dns_message::parse_dns_query(&response).expect("parse resp");
                 assert!(header.is_response());
                 assert_eq!(header.rcode(), 0);
-            }
+            },
             _ => panic!("expected Respond, got {outcome:?}"),
         }
     }
@@ -585,7 +555,7 @@ mod tests {
                 let (header, _) =
                     crate::dns_message::parse_dns_query(&response).expect("parse resp");
                 assert_eq!(header.rcode(), 5);
-            }
+            },
             _ => panic!("expected Respond, got {outcome:?}"),
         }
     }

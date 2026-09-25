@@ -11,19 +11,17 @@
 //! 切片3 待办：dispatch to outbound handler + `follow_redirect`（SO_ORIGINAL_DST）+
 //! port_map 端口映射 + TCP/UDP 双栈 + Unix socket 支持。
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use async_trait::async_trait;
-use tokio::net::TcpListener;
-use tokio::sync::Mutex;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::port::Port;
+use tokio::{net::TcpListener, sync::Mutex};
+use xray_common::net::{address::Address, destination::Destination, port::Port};
 use xray_features::inbound::{InboundError, InboundHandler};
 
-use crate::config::{Config, Network, PredefinedAddress};
-use crate::error::Result;
+use crate::{
+    config::{Config, Network, PredefinedAddress},
+    error::Result,
+};
 
 /// Dokodemo-door 入站服务端。对应 Go `DokodemoDoor`。
 ///
@@ -53,11 +51,7 @@ impl DokodemoServer {
     /// 构造服务端实例。不立即监听——监听在 [`InboundHandler::start`] 时触发。
     #[must_use]
     pub fn new(tag: impl Into<String>, config: Config) -> Self {
-        Self {
-            tag: tag.into(),
-            config,
-            listener: Arc::new(Mutex::new(None)),
-        }
+        Self { tag: tag.into(), config, listener: Arc::new(Mutex::new(None)) }
     }
 
     /// 构造目标 Destination。对应 Go `Process` 中 dest 构造逻辑。
@@ -128,11 +122,7 @@ impl DokodemoServer {
         }
 
         let port = Port::new(port_val);
-        Some(if is_udp {
-            Destination::udp(address, port)
-        } else {
-            Destination::tcp(address, port)
-        })
+        Some(if is_udp { Destination::udp(address, port) } else { Destination::tcp(address, port) })
     }
 
     /// 构造 TCP 目标（兼容旧调用方）。等价于 `build_destination_ex(fd, None, false)`。
@@ -165,9 +155,8 @@ impl InboundHandler for DokodemoServer {
         // 切片2 固定绑定 127.0.0.1:0（端口由 OS 分配），与 socks/trojan/http 切片2 一致。
         // 切片3 从 config 读取 bind 地址。
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|e| InboundError::ListenError(e.to_string()))?;
+        let listener =
+            TcpListener::bind(addr).await.map_err(|e| InboundError::ListenError(e.to_string()))?;
         *guard = Some(listener);
         tracing::info!(tag = %self.tag, "dokodemo inbound started");
 
@@ -204,18 +193,18 @@ impl InboundHandler for DokodemoServer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::Ipv4Addr;
-    use tokio::io::AsyncReadExt;
-    use tokio::net::TcpStream;
-    use xray_proto::xray::common::net::ip_or_domain::Address as ProtoAddress;
-    use xray_proto::xray::common::net::IpOrDomain as ProtoIpOrDomain;
+
+    use tokio::{io::AsyncReadExt, net::TcpStream};
+    use xray_proto::xray::common::net::{
+        IpOrDomain as ProtoIpOrDomain, ip_or_domain::Address as ProtoAddress,
+    };
+
+    use super::*;
 
     fn make_ipv4_config(ip: [u8; 4], port: u32) -> Config {
         Config {
-            rewrite_address: Some(ProtoIpOrDomain {
-                address: Some(ProtoAddress::Ip(ip.to_vec())),
-            }),
+            rewrite_address: Some(ProtoIpOrDomain { address: Some(ProtoAddress::Ip(ip.to_vec())) }),
             rewrite_port: port,
             allowed_networks: vec![Network::Tcp],
             ..Default::default()
@@ -280,11 +269,6 @@ mod tests {
         assert!(!server.is_network_allowed(Network::Udp));
     }
 
-
-
-
-
-
     #[test]
     fn tag_returns_constructor_tag() {
         let server = DokodemoServer::new("my-tag", Config::default());
@@ -315,7 +299,9 @@ mod tests {
         let dest = server.build_destination(None).unwrap();
         assert_eq!(dest.port().value(), 443);
         match dest.address() {
-            Address::IPv6(v6) => assert_eq!(v6.octets(), [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            Address::IPv6(v6) => {
+                assert_eq!(v6.octets(), [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+            },
             other => panic!("expected IPv6, got {other:?}"),
         }
     }
@@ -379,15 +365,11 @@ mod tests {
                 address: Some(ProtoAddress::Ip(vec![10, 0, 0, 1])),
             }),
             rewrite_port: 80,
-            port_map: [("80".to_string(), "192.168.99.1:9090".to_string())]
-                .into_iter()
-                .collect(),
+            port_map: [("80".to_string(), "192.168.99.1:9090".to_string())].into_iter().collect(),
             ..Default::default()
         };
         let server = DokodemoServer::new("test", cfg);
-        let dest = server
-            .build_destination_ex(None, Some(80), false)
-            .expect("dest should exist");
+        let dest = server.build_destination_ex(None, Some(80), false).expect("dest should exist");
         assert_eq!(dest.port().value(), 9090);
         match dest.address() {
             Address::IPv4(v4) => assert_eq!(v4.octets(), [192, 168, 99, 1]),
@@ -402,15 +384,11 @@ mod tests {
                 address: Some(ProtoAddress::Ip(vec![10, 0, 0, 1])),
             }),
             rewrite_port: 80,
-            port_map: [("443".to_string(), "192.168.99.1:9090".to_string())]
-                .into_iter()
-                .collect(),
+            port_map: [("443".to_string(), "192.168.99.1:9090".to_string())].into_iter().collect(),
             ..Default::default()
         };
         let server = DokodemoServer::new("test", cfg);
-        let dest = server
-            .build_destination_ex(None, Some(80), false)
-            .expect("dest should exist");
+        let dest = server.build_destination_ex(None, Some(80), false).expect("dest should exist");
         // port 80 not in port_map → use predefined
         assert_eq!(dest.port().value(), 80);
     }
@@ -422,15 +400,11 @@ mod tests {
                 address: Some(ProtoAddress::Ip(vec![10, 0, 0, 1])),
             }),
             rewrite_port: 53,
-            port_map: [("53".to_string(), ":5353".to_string())]
-                .into_iter()
-                .collect(),
+            port_map: [("53".to_string(), ":5353".to_string())].into_iter().collect(),
             ..Default::default()
         };
         let server = DokodemoServer::new("test", cfg);
-        let dest = server
-            .build_udp_destination(Some(53))
-            .expect("dest should exist");
+        let dest = server.build_udp_destination(Some(53)).expect("dest should exist");
         assert!(dest.is_udp());
         assert_eq!(dest.port().value(), 5353);
     }

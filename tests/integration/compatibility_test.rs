@@ -4,18 +4,24 @@
 //! - 相同输入 → 相同输出（编解码确定性）
 //! - 跨语言可交互的关键数据格式一致
 
-use xray_common::uuid::UUID;
-use xray_proxy_trojan::config::{hex_sha224, MemoryAccount as TrojanAccount};
-use xray_proxy_trojan::protocol::{write_request_header, COMMAND_TCP};
+use xray_common::{
+    net::{
+        address::{Address, Address as VmAddr},
+        destination::Destination,
+        port::Port,
+    },
+    protocol::{Command, SecurityType},
+    uuid::UUID,
+};
 use xray_proxy_ss::protocol::{read_address_port_ss, write_address_port_ss};
-use xray_common::net::address::Address;
-use xray_proxy_vmess::account::cmd_key_of;
-use xray_proxy_vmess::encoding::client::ClientSession;
-use xray_proxy_vmess::encoding::VERSION;
-use xray_common::protocol::{Command, SecurityType};
-use xray_common::net::destination::Destination;
-use xray_common::net::address::Address as VmAddr;
-use xray_common::net::port::Port;
+use xray_proxy_trojan::{
+    config::{MemoryAccount as TrojanAccount, hex_sha224},
+    protocol::{COMMAND_TCP, write_request_header},
+};
+use xray_proxy_vmess::{
+    account::cmd_key_of,
+    encoding::{VERSION, client::ClientSession},
+};
 
 /// Trojan SHA224 hash 与 Go 一致性验证。
 ///
@@ -24,11 +30,7 @@ use xray_common::net::port::Port;
 #[test]
 fn trojan_sha224_compatible_with_go() {
     let hex = hex_sha224("password");
-    assert_eq!(
-        hex.len(),
-        56,
-        "SHA224 hex 编码应为 56 字节（Go 兼容）"
-    );
+    assert_eq!(hex.len(), 56, "SHA224 hex 编码应为 56 字节（Go 兼容）");
 
     // 验证两次调用产生相同结果（确定性）
     let hex2 = hex_sha224("password");
@@ -119,14 +121,8 @@ fn vmess_request_header_deterministic() {
     let cmd_key = cmd_key_of(&uuid);
 
     // 构造两个相同的请求头
-    let dest1 = Destination::tcp(
-        VmAddr::ipv4(std::net::Ipv4Addr::LOCALHOST),
-        Port::new(80),
-    );
-    let dest2 = Destination::tcp(
-        VmAddr::ipv4(std::net::Ipv4Addr::LOCALHOST),
-        Port::new(80),
-    );
+    let dest1 = Destination::tcp(VmAddr::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(80));
+    let dest2 = Destination::tcp(VmAddr::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(80));
 
     let session1 = ClientSession::new();
     let session2 = ClientSession::new();
@@ -144,12 +140,8 @@ fn vmess_request_header_deterministic() {
         SecurityType::Aes128Gcm,
     );
 
-    let sealed1 = session1
-        .encode_request_header(&header1, &cmd_key)
-        .expect("encode1");
-    let sealed2 = session2
-        .encode_request_header(&header2, &cmd_key)
-        .expect("encode2");
+    let sealed1 = session1.encode_request_header(&header1, &cmd_key).expect("encode1");
+    let sealed2 = session2.encode_request_header(&header2, &cmd_key).expect("encode2");
 
     // 注意：sealed header 包含随机 padding/nonce，长度可能不同
     assert!(!sealed1.is_empty(), "编码后应非空");

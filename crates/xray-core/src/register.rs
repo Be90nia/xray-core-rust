@@ -7,8 +7,7 @@
 //! （返回 `FeatureError::StartFailed` 提示 "not yet implemented"）。
 //! 待各 crate 切片完成后，替换为真实 factory。
 
-use std::path::PathBuf;
- use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use xray_features::{Feature, FeatureError, FeatureFactory, registry};
 
@@ -186,11 +185,10 @@ const PROXY_OUTBOUND_KINDS: &[&str] = &[
 
 /// TUN 平台感知 factory（bd b8i）。
 ///
-/// - Linux/Android/FreeBSD：stub factory（"not yet implemented"）——真实
-///   inbound/outbound 构建不经 registry（`spawn_one_inbound` /
-///   `try_build_handler` 直连 `xray-proxy-tun`）。
-/// - 其他平台（Windows/macOS 等）：明确 platform 错误。registry 消费方
-///   （instance.rs）对 StartFailed 是 warn+跳过，非致命。
+/// - Linux/Android/FreeBSD：stub factory（"not yet implemented"）——真实 inbound/outbound 构建不经
+///   registry（`spawn_one_inbound` / `try_build_handler` 直连 `xray-proxy-tun`）。
+/// - 其他平台（Windows/macOS 等）：明确 platform 错误。registry 消费方 （instance.rs）对
+///   StartFailed 是 warn+跳过，非致命。
 fn tun_factory(kind: &'static str) -> FeatureFactory {
     if cfg!(any(target_os = "linux", target_os = "android", target_os = "freebsd")) {
         stub_factory(kind)
@@ -222,8 +220,8 @@ fn stub_factory(kind: &'static str) -> FeatureFactory {
 /// [`xray_app_log::LogConfig`] → [`LogFeature`]。
 ///
 /// 对应 Go `infra/conf.LogConfig.Build()`（log.go:26-64）语义：
-/// - `access`/`error`：`"none"` → LogType::None；非空 → File + path；缺省 → Console
-///   （注意：Go 在 log 块存在时 access 默认 Console，与无 log 块的
+/// - `access`/`error`：`"none"` → LogType::None；非空 → File + path；缺省 → Console （注意：Go 在
+///   log 块存在时 access 默认 Console，与无 log 块的
 ///   `DefaultLogConfig`（access=None）不同，此处保持一致）
 /// - `loglevel`：debug/info/error 映射级别，`none` 双双关闭，缺省 Warning
 /// - `dnsLog`/`maskAddress` 直传；`format`（Rust 扩展）`"json"` → Json
@@ -256,16 +254,16 @@ fn build_log_config(v: &xray_conf::app_config::LogConfig) -> xray_app_log::LogCo
         Some(p) if !p.is_empty() => {
             config.access_log_path = p.to_string();
             config.access_log_type = LogType::File;
-        }
-        _ => {}
+        },
+        _ => {},
     }
     match v.error.as_deref() {
         Some("none") => config.error_log_type = LogType::None,
         Some(p) if !p.is_empty() => {
             config.error_log_path = p.to_string();
             config.error_log_type = LogType::File;
-        }
-        _ => {}
+        },
+        _ => {},
     }
 
     match v.loglevel.as_deref().map(str::to_lowercase).as_deref() {
@@ -275,16 +273,12 @@ fn build_log_config(v: &xray_conf::app_config::LogConfig) -> xray_app_log::LogCo
         Some("none") => {
             config.error_log_type = LogType::None;
             config.access_log_type = LogType::None;
-        }
+        },
         _ => config.error_log_level = SeverityLevel::Warning,
     }
 
     config.mask_address = v.mask_address.clone().unwrap_or_default();
-    config.format = v
-        .format
-        .as_deref()
-        .map(LogFormat::parse)
-        .unwrap_or(LogFormat::Console);
+    config.format = v.format.as_deref().map(LogFormat::parse).unwrap_or(LogFormat::Console);
     config
 }
 
@@ -298,15 +292,11 @@ fn build_log_config(v: &xray_conf::app_config::LogConfig) -> xray_app_log::LogCo
 fn dns_factory() -> FeatureFactory {
     Arc::new(|data: &[u8]| {
         let cfg: xray_app_dns::DnsAppConfig = serde_json::from_slice(data).map_err(|e| {
-            FeatureError::StartFailed {
-                name: "dns",
-                message: format!("invalid dns config: {e}"),
-            }
+            FeatureError::StartFailed { name: "dns", message: format!("invalid dns config: {e}") }
         })?;
-        let svc = cfg.build().map_err(|e| FeatureError::StartFailed {
-            name: "dns",
-            message: e.to_string(),
-        })?;
+        let svc = cfg
+            .build()
+            .map_err(|e| FeatureError::StartFailed { name: "dns", message: e.to_string() })?;
         let dns = xray_app_dns::DnsService::new(svc);
         Ok(Arc::new(dns) as Arc<dyn Feature>)
     })
@@ -343,7 +333,11 @@ fn policy_factory() -> FeatureFactory {
                 // 启动可见性：打印该 level 生效的 per-connection 缓冲（字节；-1=无限）。
                 // 未配置 buffer_size 的 level 走 xray-features env 缺省语义
                 // （`default_buffer_connection_from_env`，对齐 Go -17 哨兵/分架构默认）。
-                tracing::info!(level = lv, connection = buf.connection, "policy: per-connection buffer size");
+                tracing::info!(
+                    level = lv,
+                    connection = buf.connection,
+                    "policy: per-connection buffer size"
+                );
             }
             proto.level.insert(lv, level_policy);
         }
@@ -410,10 +404,8 @@ fn burst_observatory_factory() -> FeatureFactory {
             .unwrap_or_default();
         let ping_config = json_cfg.ping_config.as_ref();
 
-        let feature = xray_app_observatory::BurstObservatoryFeature::new(
-            subject_selector,
-            ping_config,
-        );
+        let feature =
+            xray_app_observatory::BurstObservatoryFeature::new(subject_selector, ping_config);
         Ok(Arc::new(feature) as Arc<dyn Feature>)
     })
 }
@@ -452,7 +444,7 @@ fn metrics_factory() -> FeatureFactory {
 fn policy_level_to_proto(
     pl: &xray_conf::app_config::PolicyLevel,
 ) -> xray_proto::xray::app::policy::Policy {
-    use xray_proto::xray::app::policy::{policy, Policy, Second};
+    use xray_proto::xray::app::policy::{Policy, Second, policy};
 
     let mut p = Policy::default();
     p.timeout = Some(policy::Timeout {
@@ -487,7 +479,7 @@ fn policy_level_to_proto(
 fn policy_system_to_proto(
     sys: &xray_conf::app_config::PolicySystem,
 ) -> xray_proto::xray::app::policy::SystemPolicy {
-    use xray_proto::xray::app::policy::{system_policy, SystemPolicy};
+    use xray_proto::xray::app::policy::{SystemPolicy, system_policy};
     SystemPolicy {
         stats: Some(system_policy::Stats {
             inbound_uplink: sys.stats_inbound_uplink.unwrap_or(false),
@@ -510,7 +502,7 @@ fn parse_go_duration_ms(s: &str) -> Option<i64> {
     let split_pos = s.bytes().rposition(|b| !b.is_ascii_alphabetic())?;
     let (num_part, unit) = (&s[..=split_pos], &s[split_pos + 1..]);
     let num: f64 = num_part.parse().ok()?;
-     let ms = match unit {
+    let ms = match unit {
         "ms" => num,
         "s" => num * 1_000.0,
         "m" => num * 60_000.0,
@@ -526,15 +518,13 @@ fn parse_go_duration_ms(s: &str) -> Option<i64> {
 /// stats 是真实 [`AppStatsFeature`]（包 `xray_app_stats::Manager`，计数器可注册/查询）。
 /// policy 走 [`policy_factory`]，dns 走 [`dns_factory`]。
 fn default_feature_factory(kind: &'static str) -> FeatureFactory {
-    Arc::new(move |_data: &[u8]| {
-        match kind {
-            "routing" => Ok(Arc::new(xray_features::routing::DefaultRouterFeature) as Arc<dyn Feature>),
-            "stats" => Ok(Arc::new(AppStatsFeature::new()) as Arc<dyn Feature>),
-            _ => Err(FeatureError::StartFailed {
-                name: kind,
-                message: format!("{kind}: no Default*Feature available"),
-            }),
-        }
+    Arc::new(move |_data: &[u8]| match kind {
+        "routing" => Ok(Arc::new(xray_features::routing::DefaultRouterFeature) as Arc<dyn Feature>),
+        "stats" => Ok(Arc::new(AppStatsFeature::new()) as Arc<dyn Feature>),
+        _ => Err(FeatureError::StartFailed {
+            name: kind,
+            message: format!("{kind}: no Default*Feature available"),
+        }),
     })
 }
 
@@ -574,10 +564,7 @@ fn reverse_factory() -> FeatureFactory {
     use prost::Message as _;
     Arc::new(|data: &[u8]| {
         let proto = xray_proto::xray::app::reverse::Config::decode(data).map_err(|e| {
-            FeatureError::StartFailed {
-                name: "reverse",
-                message: format!("config decode: {e}"),
-            }
+            FeatureError::StartFailed { name: "reverse", message: format!("config decode: {e}") }
         })?;
         let feature = xray_app_reverse::ReverseFeature::new(
             xray_app_reverse::ReverseConfig::from_proto(&proto),
@@ -599,39 +586,70 @@ impl xray_features::Feature for AppStatsFeature {
 }
 
 impl xray_features::stats::Manager for AppStatsFeature {
-    fn register_counter(&self, name: &str) -> Result<std::sync::Arc<dyn xray_features::stats::Counter>, xray_features::stats::ManagerError> {
+    fn register_counter(
+        &self,
+        name: &str,
+    ) -> Result<std::sync::Arc<dyn xray_features::stats::Counter>, xray_features::stats::ManagerError>
+    {
         self.manager.register_counter(name)
     }
+
     fn unregister_counter(&self, name: &str) {
         self.manager.unregister_counter(name)
     }
+
     fn get_counter(&self, name: &str) -> Option<std::sync::Arc<dyn xray_features::stats::Counter>> {
         self.manager.get_counter(name)
     }
+
     fn visit_counters(&self, f: &mut dyn FnMut(&str, &dyn xray_features::stats::Counter) -> bool) {
         self.manager.visit_counters(f)
     }
-    fn register_online_map(&self, name: &str) -> Result<std::sync::Arc<dyn xray_features::stats::OnlineMap>, xray_features::stats::ManagerError> {
+
+    fn register_online_map(
+        &self,
+        name: &str,
+    ) -> Result<
+        std::sync::Arc<dyn xray_features::stats::OnlineMap>,
+        xray_features::stats::ManagerError,
+    > {
         self.manager.register_online_map(name)
     }
+
     fn unregister_online_map(&self, name: &str) {
         self.manager.unregister_online_map(name)
     }
-    fn get_online_map(&self, name: &str) -> Option<std::sync::Arc<dyn xray_features::stats::OnlineMap>> {
+
+    fn get_online_map(
+        &self,
+        name: &str,
+    ) -> Option<std::sync::Arc<dyn xray_features::stats::OnlineMap>> {
         self.manager.get_online_map(name)
     }
-    fn visit_online_maps(&self, f: &mut dyn FnMut(&str, &dyn xray_features::stats::OnlineMap) -> bool) {
+
+    fn visit_online_maps(
+        &self,
+        f: &mut dyn FnMut(&str, &dyn xray_features::stats::OnlineMap) -> bool,
+    ) {
         self.manager.visit_online_maps(f)
     }
-    fn register_channel(&self, name: &str) -> Result<std::sync::Arc<dyn xray_features::stats::Channel>, xray_features::stats::ManagerError> {
+
+    fn register_channel(
+        &self,
+        name: &str,
+    ) -> Result<std::sync::Arc<dyn xray_features::stats::Channel>, xray_features::stats::ManagerError>
+    {
         self.manager.register_channel(name)
     }
+
     fn unregister_channel(&self, name: &str) {
         self.manager.unregister_channel(name)
     }
+
     fn get_channel(&self, name: &str) -> Option<std::sync::Arc<dyn xray_features::stats::Channel>> {
         self.manager.get_channel(name)
     }
+
     fn get_all_online_users(&self) -> Vec<String> {
         self.manager.get_all_online_users()
     }
@@ -661,7 +679,7 @@ impl xray_app_metrics::StatsCollector for AppStatsFeature {
             match parts[3] {
                 "uplink" => entry.uplink = value,
                 "downlink" => entry.downlink = value,
-                _ => {}
+                _ => {},
             }
             true
         });
@@ -678,7 +696,7 @@ impl xray_app_metrics::StatsCollector for AppStatsFeature {
 /// `Feature::start` 按声明集门控实际 gRPC 暴露面（bd dnw3）。
 fn commander_factory() -> FeatureFactory {
     use xray_app_commander::{
-        api_services, DeclaredServiceMarker, HandlerServiceMarker, ReflectionService,
+        DeclaredServiceMarker, HandlerServiceMarker, ReflectionService, api_services,
     };
     Arc::new(|data: &[u8]| {
         let cfg: xray_conf::app_config::ApiConfig =
@@ -695,34 +713,33 @@ fn commander_factory() -> FeatureFactory {
         if let Some(services) = &cfg.services {
             for svc in services {
                 // Go api.go:29-42：strings.ToLower 后六分支匹配。
-                let marker: Option<std::sync::Arc<dyn xray_app_commander::Service>> =
-                    match svc.to_ascii_lowercase().as_str() {
-                        "reflectionservice" => Some(std::sync::Arc::new(
-                            ReflectionService::new(),
-                        )),
-                        "handlerservice" => {
-                            Some(std::sync::Arc::new(HandlerServiceMarker))
-                        }
-                        "loggerservice" => Some(std::sync::Arc::new(
-                            DeclaredServiceMarker::new("LoggerService", api_services::LOGGER),
-                        )),
-                        "statsservice" => Some(std::sync::Arc::new(
-                            DeclaredServiceMarker::new("StatsService", api_services::STATS),
-                        )),
-                        "observatoryservice" => Some(std::sync::Arc::new(
-                            DeclaredServiceMarker::new(
-                                "ObservatoryService",
-                                api_services::OBSERVATORY,
-                            ),
-                        )),
-                        "routingservice" => Some(std::sync::Arc::new(
-                            DeclaredServiceMarker::new("RoutingService", api_services::ROUTING),
-                        )),
-                        other => {
-                            tracing::warn!(service = %other, "commander: unknown api service, ignored");
-                            None
-                        }
-                    };
+                let marker: Option<std::sync::Arc<dyn xray_app_commander::Service>> = match svc
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "reflectionservice" => Some(std::sync::Arc::new(ReflectionService::new())),
+                    "handlerservice" => Some(std::sync::Arc::new(HandlerServiceMarker)),
+                    "loggerservice" => Some(std::sync::Arc::new(DeclaredServiceMarker::new(
+                        "LoggerService",
+                        api_services::LOGGER,
+                    ))),
+                    "statsservice" => Some(std::sync::Arc::new(DeclaredServiceMarker::new(
+                        "StatsService",
+                        api_services::STATS,
+                    ))),
+                    "observatoryservice" => Some(std::sync::Arc::new(DeclaredServiceMarker::new(
+                        "ObservatoryService",
+                        api_services::OBSERVATORY,
+                    ))),
+                    "routingservice" => Some(std::sync::Arc::new(DeclaredServiceMarker::new(
+                        "RoutingService",
+                        api_services::ROUTING,
+                    ))),
+                    other => {
+                        tracing::warn!(service = %other, "commander: unknown api service, ignored");
+                        None
+                    },
+                };
                 if let Some(m) = marker {
                     commander.add_service(m);
                 }
@@ -737,7 +754,7 @@ fn commander_factory() -> FeatureFactory {
 ///
 /// 对应 Go `app/dns/fakedns` 的 `init()` + `New(ctx, config)`：配置层永远
 /// 产出 `FakeDnsPoolMulti`（单池 = 一元素池），查询语义 = 扇出全部池
-///（`IsIPInIPPool` any / `GetFakeIPForDomain` concat / 反查 first-match，
+/// （`IsIPInIPPool` any / `GetFakeIPForDomain` concat / 反查 first-match，
 /// Go fake.go:141-182，bd qigp）。
 fn fake_dns_factory() -> FeatureFactory {
     Arc::new(|data: &[u8]| {
@@ -760,16 +777,15 @@ fn fake_dns_factory() -> FeatureFactory {
 fn build_fake_dns_holder(
     cfg: &xray_conf::app_config::FakeDnsConfig,
 ) -> Result<Arc<xray_app_dns::fakedns::HolderMulti>, FeatureError> {
-    let element_to_pool = |e: &xray_conf::app_config::FakeDnsPoolElement| {
-        xray_app_dns::fakedns::FakeDnsPool {
+    let element_to_pool =
+        |e: &xray_conf::app_config::FakeDnsPoolElement| xray_app_dns::fakedns::FakeDnsPool {
             ip_pool: e
                 .ip_pool
                 .clone()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "240.0.0.0/4".to_string()),
             lru_size: u64::from(e.pool_size.unwrap_or(65535)),
-        }
-    };
+        };
     let pools: Vec<xray_app_dns::fakedns::FakeDnsPool> = if let Some(pools) = &cfg.pools {
         pools.iter().map(element_to_pool).collect()
     } else {
@@ -783,12 +799,11 @@ fn build_fake_dns_holder(
             lru_size: u64::from(cfg.pool_size.unwrap_or(65535)),
         }]
     };
-    let multi = xray_app_dns::fakedns::HolderMulti::new(pools).map_err(|e| {
-        FeatureError::StartFailed {
+    let multi =
+        xray_app_dns::fakedns::HolderMulti::new(pools).map_err(|e| FeatureError::StartFailed {
             name: "fakeDns",
             message: format!("initialize fake dns pools: {e}"),
-        }
-    })?;
+        })?;
     Ok(Arc::new(multi))
 }
 
@@ -935,12 +950,8 @@ fn version_factory() -> FeatureFactory {
     Arc::new(|data: &[u8]| {
         let json_cfg: xray_conf::app_config::VersionConfig =
             serde_json::from_slice(data).unwrap_or_default();
-        let core_version = format!(
-            "{}.{}.{}",
-            crate::VERSION_X,
-            crate::VERSION_Y,
-            crate::VERSION_Z
-        );
+        let core_version =
+            format!("{}.{}.{}", crate::VERSION_X, crate::VERSION_Y, crate::VERSION_Z);
         let feature = xray_app_version::version::VersionFeature::new(
             core_version,
             json_cfg.min,
@@ -1002,7 +1013,7 @@ mod tests {
             Err(FeatureError::StartFailed { name, message }) => {
                 assert_eq!(name, "policy");
                 message
-            }
+            },
             Err(_) => panic!("expected StartFailed, got other error variant"),
             Ok(_) => panic!("expected StartFailed, got Ok"),
         }
@@ -1012,11 +1023,8 @@ mod tests {
     fn register_all_features_makes_all_kinds_findable() {
         register_all_features();
 
-        for &kind in APP_KINDS
-            .iter()
-            .chain(PROXY_INBOUND_KINDS)
-            .chain(TUN_KINDS)
-            .chain(PROXY_OUTBOUND_KINDS)
+        for &kind in
+            APP_KINDS.iter().chain(PROXY_INBOUND_KINDS).chain(TUN_KINDS).chain(PROXY_OUTBOUND_KINDS)
         {
             // stub factory 应能被找到（不再返回 NotFound）
             let result = registry::create_feature(kind, b"{}");
@@ -1095,8 +1103,7 @@ mod tests {
     fn geodata_factory_returns_real_feature_not_simple_noop() {
         register_all_features();
 
-        let feat = registry::create_feature("geodata", b"{}")
-            .expect("geodata config should build");
+        let feat = registry::create_feature("geodata", b"{}").expect("geodata config should build");
         assert_eq!(
             feat.feature_name(),
             "geodata",
@@ -1135,10 +1142,7 @@ mod tests {
         let json: xray_conf::app_config::GeodataConfig =
             serde_json::from_str(r#"{"cron":"not a cron"}"#).expect("json should parse");
         let err = map_geodata_config(json).expect_err("invalid cron must fail");
-        assert!(
-            err.to_string().contains("invalid geodata cron"),
-            "unexpected error: {err}"
-        );
+        assert!(err.to_string().contains("invalid geodata cron"), "unexpected error: {err}");
     }
 
     /// 资产校验对齐 Go GeodataAssetConfig.Build()：url 必须 https+host，
@@ -1219,23 +1223,14 @@ mod tests {
         use xray_features::stats::Manager as _;
 
         let mgr = AppStatsFeature::new();
-        mgr.register_counter("inbound>>>socks-in>>>traffic>>>uplink")
-            .expect("register")
-            .add(111);
-        mgr.register_counter("inbound>>>socks-in>>>traffic>>>downlink")
-            .expect("register")
-            .add(222);
-        mgr.register_counter("outbound>>>direct>>>traffic>>>uplink")
-            .expect("register")
-            .add(7);
-        mgr.register_counter("user>>>a@b>>>traffic>>>downlink")
-            .expect("register")
-            .add(9);
+        mgr.register_counter("inbound>>>socks-in>>>traffic>>>uplink").expect("register").add(111);
+        mgr.register_counter("inbound>>>socks-in>>>traffic>>>downlink").expect("register").add(222);
+        mgr.register_counter("outbound>>>direct>>>traffic>>>uplink").expect("register").add(7);
+        mgr.register_counter("user>>>a@b>>>traffic>>>downlink").expect("register").add(9);
         // len<4 与未知类型/方向：跳过。
         mgr.register_counter("short>>>name").expect("register");
         mgr.register_counter("bogus>>>x>>>traffic>>>uplink").expect("register");
-        mgr.register_counter("inbound>>>socks-in>>>traffic>>>sideways")
-            .expect("register");
+        mgr.register_counter("inbound>>>socks-in>>>traffic>>>sideways").expect("register");
 
         let snap = mgr.collect();
         assert_eq!(snap.inbound["socks-in"].uplink, 111);
@@ -1266,10 +1261,7 @@ mod tests {
         assert!(!ips.is_empty(), "engine should allocate fake IPs");
         let ip = ips[0];
         assert!(engine.is_ip_in_pool(ip));
-        assert_eq!(
-            engine.get_domain_from_fake_dns(ip).as_deref(),
-            Some("example.com")
-        );
+        assert_eq!(engine.get_domain_from_fake_dns(ip).as_deref(), Some("example.com"));
     }
 
     /// bd 9vu4 验收：fakeDns factory 把引擎注册进共享槽，DNS 侧
@@ -1295,10 +1287,7 @@ mod tests {
             xray_app_dns::nameserver::NameServerConfig::default(),
         )
         .expect("fakedns server should build");
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let (ips, _) = rt.block_on(async {
             server
                 .query_ip("example.com", xray_app_dns::config::IpOption::all())
@@ -1319,9 +1308,8 @@ mod tests {
 
         // 引擎身份一致：共享槽里的就是 feature 持有的那个。
         let any: Arc<dyn std::any::Any + Send + Sync> = feat;
-        let typed = any
-            .downcast::<FakeDnsFeature>()
-            .expect("feature should downcast to FakeDnsFeature");
+        let typed =
+            any.downcast::<FakeDnsFeature>().expect("feature should downcast to FakeDnsFeature");
         assert!(Arc::ptr_eq(&typed.engine(), &shared), "engine identity must match");
 
         xray_app_dns::fakedns::set_shared_multi(None);
@@ -1418,8 +1406,8 @@ mod tests {
             "probe_url": "https://example.com/generate_204",
             "probe_interval": "30s"
         }"#;
-        let feat = registry::create_feature("observatory", json)
-            .expect("observatory config should build");
+        let feat =
+            registry::create_feature("observatory", json).expect("observatory config should build");
         assert_eq!(feat.feature_name(), "observatory");
     }
 
@@ -1427,24 +1415,20 @@ mod tests {
     /// factory 落进 ObservatoryConfig；单值方言 `subjectOutbound` 兜底。
     #[test]
     fn observatory_factory_parses_go_subject_selector_and_concurrency() {
-        use std::sync::Arc as StdArc;
-        use std::any::Any;
+        use std::{any::Any, sync::Arc as StdArc};
         register_all_features();
         let json = br#"{
             "subjectSelector": ["proxy", "warp"],
             "enableConcurrency": true,
             "probeInterval": "30s"
         }"#;
-        let feat = registry::create_feature("observatory", json)
-            .expect("observatory config should build");
+        let feat =
+            registry::create_feature("observatory", json).expect("observatory config should build");
         let any_arc: StdArc<dyn Any + Send + Sync> = feat;
         let f = StdArc::downcast::<xray_app_observatory::ObservatoryFeature>(any_arc)
             .expect("feature is ObservatoryFeature");
         let cfg = f.observer().config();
-        assert_eq!(
-            cfg.subject_selector,
-            vec!["proxy".to_string(), "warp".to_string()]
-        );
+        assert_eq!(cfg.subject_selector, vec!["proxy".to_string(), "warp".to_string()]);
         assert!(cfg.enable_concurrency);
         assert_eq!(cfg.probe_interval, 30_000);
 
@@ -1454,17 +1438,13 @@ mod tests {
         let any_arc2: StdArc<dyn Any + Send + Sync> = feat2;
         let f2 = StdArc::downcast::<xray_app_observatory::ObservatoryFeature>(any_arc2)
             .expect("feature is ObservatoryFeature");
-        assert_eq!(
-            f2.observer().config().subject_selector,
-            vec!["p1".to_string()]
-        );
+        assert_eq!(f2.observer().config().subject_selector, vec!["p1".to_string()]);
         assert!(!f2.observer().config().enable_concurrency);
     }
     /// bd z9ma：burst factory 同样消费 Go `subjectSelector` 数组（单值方言兜底）。
     #[test]
     fn burst_factory_parses_go_subject_selector() {
-        use std::sync::Arc as StdArc;
-        use std::any::Any;
+        use std::{any::Any, sync::Arc as StdArc};
         register_all_features();
         let json = br#"{
             "subjectSelector": ["a", "b"],
@@ -1479,7 +1459,10 @@ mod tests {
         // 直接断言内部列表不可行（私有字段），以 start 行为收口。
         let err = f.start().expect_err("without executor injection start must fail");
         assert!(
-            matches!(err, xray_features::FeatureError::StartFailed { name: "burstObservatory", .. }),
+            matches!(
+                err,
+                xray_features::FeatureError::StartFailed { name: "burstObservatory", .. }
+            ),
             "non-empty selector must reach executor check, got: {err:?}"
         );
     }
@@ -1490,10 +1473,9 @@ mod tests {
     #[test]
     fn observatory_factory_does_not_inject_io_at_construction() {
         register_all_features();
-        let json =
-            br#"{"subject_outbound": "proxy1", "probe_interval": "30s"}"#;
-        let feat = registry::create_feature("observatory", json)
-            .expect("observatory config should build");
+        let json = br#"{"subject_outbound": "proxy1", "probe_interval": "30s"}"#;
+        let feat =
+            registry::create_feature("observatory", json).expect("observatory config should build");
         // factory 仅构造 ObservatoryFeature，IO 在 init_dependencies 阶段注入。
         // start 阶段（无 IO + subject_selector 非空）必返 StartFailed。
         let err = feat.start().expect_err("start must fail without IO injection");
@@ -1508,13 +1490,14 @@ mod tests {
     #[tokio::test]
     async fn observatory_init_dependencies_wires_io_then_start_succeeds() {
         use std::sync::Arc;
+
         use xray_features::{DepBag, OutboundTagSelector};
 
         register_all_features();
         let json =
             br#"{"subject_outbound": "node1", "probe_url": "http://127.0.0.1:1/", "probe_interval": "60s"}"#;
-        let feat = registry::create_feature("observatory", json)
-            .expect("observatory config should build");
+        let feat =
+            registry::create_feature("observatory", json).expect("observatory config should build");
 
         // 构造一个简单 backend——返回固定 tag 列表。
         struct EchoBackend;
@@ -1545,8 +1528,7 @@ mod tests {
     fn metrics_factory_parses_config() {
         register_all_features();
         let json = br#"{"listen": "127.0.0.1:9100"}"#;
-        let feat =
-            registry::create_feature("metrics", json).expect("metrics config should build");
+        let feat = registry::create_feature("metrics", json).expect("metrics config should build");
         assert_eq!(feat.feature_name(), "metrics");
     }
 
@@ -1591,8 +1573,7 @@ mod tests {
     fn log_factory_defaults_when_log_block_present() {
         use xray_app_log::{LogFormat, LogType, SeverityLevel};
 
-        let json_cfg: xray_conf::app_config::LogConfig =
-            serde_json::from_slice(b"{}").unwrap();
+        let json_cfg: xray_conf::app_config::LogConfig = serde_json::from_slice(b"{}").unwrap();
         let cfg = build_log_config(&json_cfg);
         assert_eq!(cfg.access_log_type, LogType::Console);
         assert_eq!(cfg.error_log_type, LogType::Console);

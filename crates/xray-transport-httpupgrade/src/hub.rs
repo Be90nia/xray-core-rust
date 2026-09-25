@@ -8,11 +8,15 @@
 //! `build_upgrade_response`），不涉及实际网络 IO。`keepAccepting` 循环、
 //! TLS 包装、PROXY protocol 解析留切片2。
 
-use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+};
 
-use crate::config::Config;
-use crate::error::{HttpUpgradeError, Result};
+use crate::{
+    config::Config,
+    error::{HttpUpgradeError, Result},
+};
 
 /// 服务端解析后的请求摘要。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,14 +38,14 @@ pub struct UpgradeRequest {
 ///
 /// 对应 Go `hub.go::server.upgrade`（请求部分）+ host/path 校验。
 pub fn parse_upgrade_request(bytes: &[u8], config: &Config) -> Result<UpgradeRequest> {
-    let sep = find_header_end(bytes)
-        .ok_or_else(|| HttpUpgradeError::InvalidHttpFormat("missing \\r\\n\\r\\n terminator".into()))?;
+    let sep = find_header_end(bytes).ok_or_else(|| {
+        HttpUpgradeError::InvalidHttpFormat("missing \\r\\n\\r\\n terminator".into())
+    })?;
     let head = std::str::from_utf8(&bytes[..sep])
         .map_err(|e| HttpUpgradeError::InvalidHttpFormat(format!("non-utf8 request: {e}")))?;
     let mut lines = head.split("\r\n");
-    let request_line = lines
-        .next()
-        .ok_or_else(|| HttpUpgradeError::InvalidHttpFormat("empty request".into()))?;
+    let request_line =
+        lines.next().ok_or_else(|| HttpUpgradeError::InvalidHttpFormat("empty request".into()))?;
     // 请求行 "GET <path> HTTP/1.1"
     let req_parts: Vec<&str> = request_line.splitn(3, ' ').collect();
     if req_parts.len() != 3 {
@@ -96,17 +100,10 @@ pub fn parse_upgrade_request(bytes: &[u8], config: &Config) -> Result<UpgradeReq
     }
 
     // 解析 X-Forwarded-For。
-    let forwarded_for = headers
-        .get("x-forwarded-for")
-        .map(|v| parse_x_forwarded_for(v))
-        .unwrap_or_default();
+    let forwarded_for =
+        headers.get("x-forwarded-for").map(|v| parse_x_forwarded_for(v)).unwrap_or_default();
 
-    Ok(UpgradeRequest {
-        path,
-        host,
-        headers,
-        forwarded_for,
-    })
+    Ok(UpgradeRequest { path, host, headers, forwarded_for })
 }
 
 /// 构造 101 Switching Protocols 响应字节流。对应 Go `hub.go::server.upgrade`
@@ -128,11 +125,7 @@ pub fn build_upgrade_response() -> Vec<u8> {
 ///
 /// 对应 Go `common/protocol/http.ParseXForwardedFor`。
 pub fn parse_x_forwarded_for(value: &str) -> Vec<IpAddr> {
-    value
-        .split(',')
-        .map(|s| s.trim())
-        .filter_map(|s| s.parse::<IpAddr>().ok())
-        .collect()
+    value.split(',').map(|s| s.trim()).filter_map(|s| s.parse::<IpAddr>().ok()).collect()
 }
 
 /// 按信任门控从请求头提取 `X-Forwarded-For` 覆盖源地址。对应 Go
@@ -157,10 +150,7 @@ pub fn apply_trusted_x_forwarded_for(
     };
     // 首段 + trim（Go value[:idx] 后 ParseAddress 对首尾非 alnum 串 TrimSpace）。
     let first = value.split(',').next().unwrap_or(value).trim();
-    if trusted
-        .iter()
-        .any(|t| headers.contains_key(t.to_ascii_lowercase().as_str()))
-    {
+    if trusted.iter().any(|t| headers.contains_key(t.to_ascii_lowercase().as_str())) {
         return first.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, 0));
     }
     if trusted.is_empty() {
@@ -197,11 +187,7 @@ mod tests {
     use super::*;
 
     fn make_config(host: &str, path: &str) -> Config {
-        Config {
-            host: host.into(),
-            path: path.into(),
-            ..Default::default()
-        }
+        Config { host: host.into(), path: path.into(), ..Default::default() }
     }
 
     fn make_request(host: &str, path: &str) -> Vec<u8> {
@@ -222,10 +208,7 @@ mod tests {
         let req = parse_upgrade_request(&bytes, &cfg).unwrap();
         assert_eq!(req.path, "/ws");
         assert_eq!(req.host, "example.com");
-        assert_eq!(
-            req.headers.get("connection").map(String::as_str),
-            Some("Upgrade")
-        );
+        assert_eq!(req.headers.get("connection").map(String::as_str), Some("Upgrade"));
         assert!(req.forwarded_for.is_empty());
     }
 

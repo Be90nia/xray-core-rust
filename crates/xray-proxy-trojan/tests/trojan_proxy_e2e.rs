@@ -4,21 +4,21 @@
 
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-use xray_proxy_trojan::hex_sha224;
-use xray_proxy_trojan::config::MemoryAccount;
-use xray_proxy_trojan::server::trojan_server_handshake;
-use xray_proxy_trojan::validator::{MemoryUser, Validator};
-use xray_transport::bridge::bridge_connections;
-use xray_transport::connection::TcpConnection;
-use xray_transport::sockopt::SocketOptions;
-use xray_transport::system_dialer::dial_system;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
+use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
+use xray_proxy_trojan::{
+    config::MemoryAccount,
+    hex_sha224,
+    server::trojan_server_handshake,
+    validator::{MemoryUser, Validator},
+};
+use xray_transport::{
+    bridge::bridge_connections, connection::TcpConnection, sockopt::SocketOptions,
+    system_dialer::dial_system,
+};
 
 /// Trojan 代理 → freedom → echo 端到端验证。
 #[tokio::test]
@@ -49,22 +49,20 @@ async fn trojan_proxy_to_echo_target_e2e() {
     let validator_clone = Arc::clone(&validator);
     tokio::spawn(async move {
         let (mut client_stream, _) = proxy_listener.accept().await.unwrap();
-        let (network, addr, port, _user) =
-            trojan_server_handshake(
-                &mut client_stream,
-                &validator_clone,
-                xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT,
-            )
-                .await
-                .expect("handshake");
+        let (network, addr, port, _user) = trojan_server_handshake(
+            &mut client_stream,
+            &validator_clone,
+            xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT,
+        )
+        .await
+        .expect("handshake");
         let dest_network = match network {
             xray_proxy_trojan::Network::Tcp => Network::TCP,
             xray_proxy_trojan::Network::Udp => Network::UDP,
         };
         let destination = Destination::new(addr, Port::new(port), dest_network);
-        let target_conn = dial_system(&destination, &SocketOptions::default())
-            .await
-            .expect("dial target");
+        let target_conn =
+            dial_system(&destination, &SocketOptions::default()).await.expect("dial target");
         let client_conn: Box<dyn xray_transport::connection::Connection> =
             Box::new(TcpConnection::new(client_stream));
         let _ = bridge_connections(client_conn, target_conn).await;
@@ -153,7 +151,6 @@ async fn trojan_invalid_user_rejected_e2e() {
     let _ = client.read(&mut buf).await;
 }
 
-
 /// Trojan v2 草案（0x02 前缀 + md5(password)）代理 → freedom → echo 端到端验证。
 ///
 /// wire format：`[0x02][16B md5][ATYP][addr][port BE]`，payload 紧随（无尾 CRLF）。
@@ -194,9 +191,8 @@ async fn trojan_v2_proxy_to_echo_target_e2e() {
         // v2 草案仅 TCP CONNECT 语义
         assert_eq!(network, xray_proxy_trojan::Network::Tcp);
         let destination = Destination::new(addr, Port::new(port), Network::TCP);
-        let target_conn = dial_system(&destination, &SocketOptions::default())
-            .await
-            .expect("dial target");
+        let target_conn =
+            dial_system(&destination, &SocketOptions::default()).await.expect("dial target");
         let client_conn: Box<dyn xray_transport::connection::Connection> =
             Box::new(TcpConnection::new(client_stream));
         let _ = bridge_connections(client_conn, target_conn).await;

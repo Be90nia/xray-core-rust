@@ -19,8 +19,8 @@
 //! # 切片1 范围
 //!
 //! 提供**字节切片版**的帧编解码（独立可测试，对应 Go `protocol_test.go` 的 roundtrip）。
-//! 切片2 待办：包装成 `tokio::io::AsyncRead/AsyncWrite` 的 ConnReader/ConnWriter/PacketReader/PacketWriter，
-//! 接入 `transport::Link` 与 `internet::Dialer`。
+//! 切片2 待办：包装成 `tokio::io::AsyncRead/AsyncWrite` 的
+//! ConnReader/ConnWriter/PacketReader/PacketWriter， 接入 `transport::Link` 与 `internet::Dialer`。
 //!
 //! # trojan v2 草案（前向兼容接入）
 //!
@@ -42,8 +42,10 @@
 
 use xray_common::net::address::Address;
 
-use crate::config::MemoryAccount;
-use crate::error::{Result, TrojanError};
+use crate::{
+    config::MemoryAccount,
+    error::{Result, TrojanError},
+};
 
 // ============================================================================
 // 常量
@@ -81,11 +83,7 @@ impl Network {
 
     /// 从 Trojan 命令字节构造（未知值视为 TCP，与 Go 行为一致）。
     pub fn from_command(cmd: u8) -> Self {
-        if cmd == COMMAND_UDP {
-            Network::Udp
-        } else {
-            Network::Tcp
-        }
+        if cmd == COMMAND_UDP { Network::Udp } else { Network::Tcp }
     }
 }
 
@@ -114,7 +112,7 @@ pub fn write_address_port(out: &mut Vec<u8>, addr: &Address, port: u16) -> Resul
         Address::IPv4(v4) => {
             out.push(addr_type::IPV4);
             out.extend_from_slice(&v4.octets());
-        }
+        },
         Address::Domain(domain) => {
             let bytes = domain.as_bytes();
             let Ok(len) = u8::try_from(bytes.len()) else {
@@ -126,11 +124,11 @@ pub fn write_address_port(out: &mut Vec<u8>, addr: &Address, port: u16) -> Resul
             out.push(addr_type::DOMAIN);
             out.push(len);
             out.extend_from_slice(bytes);
-        }
+        },
         Address::IPv6(v6) => {
             out.push(addr_type::IPV6);
             out.extend_from_slice(&v6.octets());
-        }
+        },
     }
     out.extend_from_slice(&port.to_be_bytes());
     Ok(())
@@ -155,7 +153,7 @@ pub fn read_address_port(buf: &[u8]) -> Result<(Address, u16, usize)> {
             let mut ip = [0u8; 4];
             ip.copy_from_slice(&buf[pos..pos + 4]);
             (Address::IPv4(std::net::Ipv4Addr::from(ip)), 4)
-        }
+        },
         addr_type::DOMAIN => {
             if buf.len() < pos + 1 {
                 return Err(TrojanError::InsufficientData(pos + 1, buf.len()));
@@ -168,7 +166,7 @@ pub fn read_address_port(buf: &[u8]) -> Result<(Address, u16, usize)> {
             let domain = String::from_utf8(buf[pos..pos + len].to_vec())
                 .map_err(|_| TrojanError::InvalidRemoteAddress)?;
             (Address::Domain(domain), len)
-        }
+        },
         addr_type::IPV6 => {
             if buf.len() < pos + 16 {
                 return Err(TrojanError::InsufficientData(pos + 16, buf.len()));
@@ -176,7 +174,7 @@ pub fn read_address_port(buf: &[u8]) -> Result<(Address, u16, usize)> {
             let mut ip = [0u8; 16];
             ip.copy_from_slice(&buf[pos..pos + 16]);
             (Address::IPv6(std::net::Ipv6Addr::from(ip)), 16)
-        }
+        },
         _ => return Err(TrojanError::InvalidRemoteAddress),
     };
     pos += consumed;
@@ -283,26 +281,20 @@ pub fn parse_request_header(buf: &[u8]) -> Result<(Network, Address, u16, usize)
 
     // 2. 读 CRLF
     if buf.len() < pos + 2 {
-        return Err(TrojanError::ReadCrlf(format!(
-            "need 2 bytes at {pos}, have {}",
-            buf.len()
-        )));
+        return Err(TrojanError::ReadCrlf(format!("need 2 bytes at {pos}, have {}", buf.len())));
     }
     pos += 2;
 
     // 3. 读 1 字节 command
     if buf.len() < pos + 1 {
-        return Err(TrojanError::ReadCommand(format!(
-            "need 1 byte at {pos}, have {}",
-            buf.len()
-        )));
+        return Err(TrojanError::ReadCommand(format!("need 1 byte at {pos}, have {}", buf.len())));
     }
     let network = Network::from_command(buf[pos]);
     pos += 1;
 
     // 4. 读 addr+port
-    let (addr, port, addr_consumed) = read_address_port(&buf[pos..])
-        .map_err(|e| TrojanError::ReadAddressPort(e.to_string()))?;
+    let (addr, port, addr_consumed) =
+        read_address_port(&buf[pos..]).map_err(|e| TrojanError::ReadAddressPort(e.to_string()))?;
     pos += addr_consumed;
 
     // 5. 读结尾 CRLF
@@ -354,8 +346,8 @@ pub fn write_udp_packet(
 /// - [`TrojanError::InsufficientData`]：数据不足。
 pub fn parse_udp_packet(buf: &[u8]) -> Result<(Address, u16, &[u8], usize)> {
     // 1. 读 addr+port
-    let (addr, port, addr_consumed) = read_address_port(buf)
-        .map_err(|e| TrojanError::ReadAddressPort(e.to_string()))?;
+    let (addr, port, addr_consumed) =
+        read_address_port(buf).map_err(|e| TrojanError::ReadAddressPort(e.to_string()))?;
     let mut pos = addr_consumed;
 
     // 2. 读 2 字节 length（BE）
@@ -373,10 +365,7 @@ pub fn parse_udp_packet(buf: &[u8]) -> Result<(Address, u16, &[u8], usize)> {
 
     // 3. 读 CRLF
     if buf.len() < pos + 2 {
-        return Err(TrojanError::ReadCrlf(format!(
-            "need 2 bytes at {pos}, have {}",
-            buf.len()
-        )));
+        return Err(TrojanError::ReadCrlf(format!("need 2 bytes at {pos}, have {}", buf.len())));
     }
     pos += 2;
 
@@ -433,9 +422,10 @@ pub fn parse_udp_packet_stream(buf: &[u8]) -> Result<Option<(Address, u16, &[u8]
 
 #[cfg(test)]
 mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
     use super::*;
     use crate::config::MemoryAccount;
-    use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn account() -> MemoryAccount {
         MemoryAccount::new("password")
@@ -489,10 +479,7 @@ mod tests {
 
     #[test]
     fn test_read_address_unknown_type() {
-        assert!(matches!(
-            read_address_port(&[0x99]),
-            Err(TrojanError::InvalidRemoteAddress)
-        ));
+        assert!(matches!(read_address_port(&[0x99]), Err(TrojanError::InvalidRemoteAddress)));
     }
 
     /// iq1o⑩ 回归：域名 > 255 字节必须硬错（对齐 Go `writeAddress` 的
@@ -617,10 +604,7 @@ mod tests {
         buf.extend_from_slice(&oversize.to_be_bytes());
         buf.extend_from_slice(&CRLF);
         buf.extend_from_slice(&[0u8; MAX_LENGTH + 1]);
-        assert!(matches!(
-            parse_udp_packet(&buf),
-            Err(TrojanError::OversizePayload(_, _))
-        ));
+        assert!(matches!(parse_udp_packet(&buf), Err(TrojanError::OversizePayload(_, _))));
     }
 
     #[test]
@@ -630,10 +614,7 @@ mod tests {
         let mut buf = Vec::new();
         write_udp_packet(&mut buf, &addr, 1234, b"hello world").expect("encode");
         buf.truncate(buf.len() - 3); // 截掉最后 3 字节 payload
-        assert!(matches!(
-            parse_udp_packet(&buf),
-            Err(TrojanError::ReadPayload(_))
-        ));
+        assert!(matches!(parse_udp_packet(&buf), Err(TrojanError::ReadPayload(_))));
     }
 
     #[test]
@@ -709,10 +690,7 @@ mod tests {
         for first in [0x00u8, 0xFF, b'3', b'a'] {
             let buf = [first, 0u8, 1, 127, 0, 0, 1, 0, 80];
             assert!(
-                matches!(
-                    parse_request_header_v2(&buf),
-                    Err(TrojanError::InvalidVersionPrefix(_))
-                ),
+                matches!(parse_request_header_v2(&buf), Err(TrojanError::InvalidVersionPrefix(_))),
                 "prefix {first:#04x} must be rejected"
             );
         }
@@ -720,16 +698,10 @@ mod tests {
 
     #[test]
     fn test_v2_parse_insufficient_data() {
-        assert!(matches!(
-            parse_request_header_v2(&[]),
-            Err(TrojanError::InsufficientData(1, 0))
-        ));
+        assert!(matches!(parse_request_header_v2(&[]), Err(TrojanError::InsufficientData(1, 0))));
         // 版本字节在但 16B md5 不足
         let buf = [0x02u8, 0xAA, 0xBB];
-        assert!(matches!(
-            parse_request_header_v2(&buf),
-            Err(TrojanError::InsufficientData(17, 3))
-        ));
+        assert!(matches!(parse_request_header_v2(&buf), Err(TrojanError::InsufficientData(17, 3))));
     }
 
     #[test]

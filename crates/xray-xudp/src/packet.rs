@@ -15,11 +15,10 @@
 use std::io::{self, Read, Write};
 
 use xray_buf::buffer::Buffer;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-use xray_common::protocol::address_parser::{AddressParser, AddressSerializer};
+use xray_common::{
+    net::{address::Address, destination::Destination, network::Network, port::Port},
+    protocol::address_parser::{AddressParser, AddressSerializer},
+};
 
 const STATUS_NEW: u8 = 1;
 const STATUS_KEEP: u8 = 2;
@@ -115,12 +114,7 @@ impl FrameMetadata {
     /// 创建 KeepAlive 帧元数据（保活，无载荷）
     #[must_use]
     pub fn keep_alive() -> Self {
-        Self {
-            status: FrameStatus::KeepAlive,
-            has_data: false,
-            target: None,
-            global_id: None,
-        }
+        Self { status: FrameStatus::KeepAlive, has_data: false, target: None, global_id: None }
     }
 
     /// 返回帧状态
@@ -213,21 +207,13 @@ impl FrameMetadata {
 
         let body = &data[2..2 + body_len];
         let status_byte = body[2];
-        let status = FrameStatus::from_byte(status_byte)
-            .ok_or(PacketError::InvalidStatus(status_byte))?;
+        let status =
+            FrameStatus::from_byte(status_byte).ok_or(PacketError::InvalidStatus(status_byte))?;
         let has_data = (body[3] & OPT_DATA) != 0;
 
         let (target, global_id) = parse_body_target(body, status)?;
 
-        Ok((
-            Self {
-                status,
-                has_data,
-                target,
-                global_id,
-            },
-            2 + body_len,
-        ))
+        Ok((Self { status, has_data, target, global_id }, 2 + body_len))
     }
 
     /// 从实现 `Read` 的源读取帧元数据
@@ -243,18 +229,13 @@ impl FrameMetadata {
         r.read_exact(&mut body)?;
 
         let status_byte = body[2];
-        let status = FrameStatus::from_byte(status_byte)
-            .ok_or(PacketError::InvalidStatus(status_byte))?;
+        let status =
+            FrameStatus::from_byte(status_byte).ok_or(PacketError::InvalidStatus(status_byte))?;
         let has_data = (body[3] & OPT_DATA) != 0;
 
         let (target, global_id) = parse_body_target(&body, status)?;
 
-        Ok(Self {
-            status,
-            has_data,
-            target,
-            global_id,
-        })
+        Ok(Self { status, has_data, target, global_id })
     }
 }
 
@@ -271,10 +252,8 @@ fn parse_body_target(
         FrameStatus::New => {
             if off < body.len() && body[off] == NETWORK_UDP {
                 off += 1;
-                let (port, addr, consumed) =
-                    AddressParser::parse_port_address(&body[off..]).ok_or_else(|| {
-                        PacketError::AddressParseFailed("New frame".into())
-                    })?;
+                let (port, addr, consumed) = AddressParser::parse_port_address(&body[off..])
+                    .ok_or_else(|| PacketError::AddressParseFailed("New frame".into()))?;
                 target = Some(Destination::udp(addr, port));
                 off += consumed;
 
@@ -284,18 +263,16 @@ fn parse_body_target(
                     global_id = Some(gid);
                 }
             }
-        }
+        },
         FrameStatus::Keep => {
             if off < body.len() && body[off] == NETWORK_UDP {
                 off += 1;
-                let (port, addr, _consumed) =
-                    AddressParser::parse_port_address(&body[off..]).ok_or_else(|| {
-                        PacketError::AddressParseFailed("Keep frame".into())
-                    })?;
+                let (port, addr, _consumed) = AddressParser::parse_port_address(&body[off..])
+                    .ok_or_else(|| PacketError::AddressParseFailed("Keep frame".into()))?;
                 target = Some(Destination::udp(addr, port));
             }
-        }
-        FrameStatus::KeepAlive => {}
+        },
+        FrameStatus::KeepAlive => {},
     }
 
     Ok((target, global_id))
@@ -315,12 +292,7 @@ impl<W: Write> PacketWriter<W> {
     /// 创建写入器
     #[must_use]
     pub fn new(writer: W, dest: Destination, global_id: [u8; GLOBAL_ID_LEN]) -> Self {
-        Self {
-            writer,
-            dest,
-            global_id,
-            new_sent: false,
-        }
+        Self { writer, dest, global_id, new_sent: false }
     }
 
     /// 写入一个数据包
@@ -333,19 +305,14 @@ impl<W: Write> PacketWriter<W> {
 
         if !self.new_sent && self.dest.network() == Network::UDP {
             self.new_sent = true;
-            FrameMetadata::new_udp(
-                self.dest.address().clone(),
-                self.dest.port(),
-                self.global_id,
-            )
-            .write_to(&mut self.writer)?;
+            FrameMetadata::new_udp(self.dest.address().clone(), self.dest.port(), self.global_id)
+                .write_to(&mut self.writer)?;
         } else {
             FrameMetadata::keep_udp(self.dest.address().clone(), self.dest.port())
                 .write_to(&mut self.writer)?;
         }
 
-        self.writer
-            .write_all(&(data.len() as u16).to_be_bytes())?;
+        self.writer.write_all(&(data.len() as u16).to_be_bytes())?;
         self.writer.write_all(data)?;
         Ok(())
     }
@@ -364,19 +331,14 @@ impl<W: Write> PacketWriter<W> {
 
         if !self.new_sent && self.dest.network() == Network::UDP {
             self.new_sent = true;
-            FrameMetadata::new_udp(
-                self.dest.address().clone(),
-                self.dest.port(),
-                self.global_id,
-            )
-            .write_to(&mut self.writer)?;
+            FrameMetadata::new_udp(self.dest.address().clone(), self.dest.port(), self.global_id)
+                .write_to(&mut self.writer)?;
         } else {
             FrameMetadata::keep_udp(udp.address().clone(), udp.port())
                 .write_to(&mut self.writer)?;
         }
 
-        self.writer
-            .write_all(&(data.len() as u16).to_be_bytes())?;
+        self.writer.write_all(&(data.len() as u16).to_be_bytes())?;
         self.writer.write_all(data)?;
         Ok(())
     }
@@ -436,8 +398,8 @@ impl<R: Read> PacketReader<R> {
             let meta = match FrameMetadata::read_from(&mut self.reader) {
                 Ok(m) => m,
                 Err(PacketError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    return Ok(None)
-                }
+                    return Ok(None);
+                },
                 Err(e) => return Err(e),
             };
 
@@ -472,8 +434,9 @@ impl<R: Read> PacketReader<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Cursor;
+
+    use super::*;
 
     /// 辅助：构造 IPv4 Destination
     fn ipv4_dest(ip: &str, port: u16) -> Destination {
@@ -514,11 +477,7 @@ mod tests {
     #[test]
     fn test_metadata_roundtrip_ipv4() {
         let dest = ipv4_dest("127.0.0.1", 1234);
-        let meta = FrameMetadata::new_udp(
-            dest.address().clone(),
-            dest.port(),
-            test_global_id(),
-        );
+        let meta = FrameMetadata::new_udp(dest.address().clone(), dest.port(), test_global_id());
         let bytes = meta.to_bytes();
         let (parsed, consumed) = FrameMetadata::from_bytes(&bytes).expect("parse");
 
@@ -533,11 +492,7 @@ mod tests {
     #[test]
     fn test_metadata_roundtrip_ipv6() {
         let dest = ipv6_dest("::1", 5678);
-        let meta = FrameMetadata::new_udp(
-            dest.address().clone(),
-            dest.port(),
-            test_global_id(),
-        );
+        let meta = FrameMetadata::new_udp(dest.address().clone(), dest.port(), test_global_id());
         let bytes = meta.to_bytes();
         let (parsed, consumed) = FrameMetadata::from_bytes(&bytes).expect("parse");
 
@@ -551,10 +506,7 @@ mod tests {
     #[test]
     fn test_metadata_roundtrip_domain() {
         let dest = domain_dest("example.com", 443);
-        let meta = FrameMetadata::keep_udp(
-            dest.address().clone(),
-            dest.port(),
-        );
+        let meta = FrameMetadata::keep_udp(dest.address().clone(), dest.port());
         let bytes = meta.to_bytes();
         let (parsed, consumed) = FrameMetadata::from_bytes(&bytes).expect("parse");
 
@@ -705,7 +657,11 @@ mod tests {
 
         let mut reader = PacketReader::new(Cursor::new(buf));
         let pkt = reader.read_packet().expect("read").expect("some");
-        assert_eq!(pkt.data().len(), MAX_DATA_LEN, "7526 通过；7527 静默跳过（Go continue 同语义）");
+        assert_eq!(
+            pkt.data().len(),
+            MAX_DATA_LEN,
+            "7526 通过；7527 静默跳过（Go continue 同语义）"
+        );
         assert!(reader.read_packet().expect("eof").is_none());
     }
 
@@ -735,4 +691,3 @@ mod tests {
         assert!(result.is_none());
     }
 }
-

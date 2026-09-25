@@ -2,14 +2,22 @@
 //!
 //! 对应 Go 版本 `common/buf/reader.go`，提供 SingleReader、PacketReader 和 BufferedReader。
 
-use crate::buffer::Buffer;
-use crate::io::{self, Reader, Result, Writer};
-use crate::multi::MultiBuffer;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
 use tokio::io::{AsyncRead, AsyncReadExt};
+
+use crate::{
+    buffer::Buffer,
+    io::{self, Reader, Result, Writer},
+    multi::MultiBuffer,
+};
 
 // ========== SingleReader ==========
 
@@ -24,9 +32,7 @@ pub struct SingleReader {
 impl SingleReader {
     /// 创建新的 SingleReader
     pub fn new(r: impl AsyncRead + Unpin + Send + 'static) -> Self {
-        Self {
-            inner: Box::new(r),
-        }
+        Self { inner: Box::new(r) }
     }
 }
 
@@ -41,16 +47,16 @@ impl Reader for SingleReader {
                 Ok(0) => {
                     buf.release();
                     Ok(MultiBuffer::new())
-                }
+                },
                 Ok(n) => {
                     buf.advance_write(n);
                     tracing::trace!(bytes = n, "SingleReader 读取");
                     Ok(MultiBuffer::from_buffer(buf))
-                }
+                },
                 Err(e) => {
                     buf.release();
                     Err(io::classify_io_error(e, true))
-                }
+                },
             }
         })
     }
@@ -69,9 +75,7 @@ pub struct PacketReader {
 impl PacketReader {
     /// 创建新的 PacketReader
     pub fn new(r: impl AsyncRead + Unpin + Send + 'static) -> Self {
-        Self {
-            inner: Box::new(r),
-        }
+        Self { inner: Box::new(r) }
     }
 }
 
@@ -89,7 +93,7 @@ impl Reader for PacketReader {
                     Ok(0) => {
                         buf.release();
                         return Ok(MultiBuffer::new());
-                    }
+                    },
                     Ok(n) => {
                         if n == 0 {
                             buf.release();
@@ -98,11 +102,11 @@ impl Reader for PacketReader {
                         buf.advance_write(n);
                         tracing::trace!(bytes = n, "PacketReader 读取");
                         return Ok(MultiBuffer::from_buffer(buf));
-                    }
+                    },
                     Err(e) => {
                         buf.release();
                         return Err(io::classify_io_error(e, true));
-                    }
+                    },
                 }
             }
 
@@ -126,11 +130,7 @@ pub struct BufferedReader {
 impl BufferedReader {
     /// 创建新的 BufferedReader
     pub fn new(reader: Box<dyn Reader>) -> Self {
-        Self {
-            reader,
-            buffer: MultiBuffer::new(),
-            interrupted: Arc::new(AtomicBool::new(false)),
-        }
+        Self { reader, buffer: MultiBuffer::new(), interrupted: Arc::new(AtomicBool::new(false)) }
     }
 
     /// 从内部缓存读取数据到 dst
@@ -152,7 +152,7 @@ impl BufferedReader {
                 }
                 self.buffer.merge(mb);
                 self.buffer.read_to(dst)
-            }
+            },
             Err(_) => 0,
         }
     }
@@ -241,9 +241,10 @@ impl Reader for BufferedReader {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
     use crate::io::new_reader;
-    use std::io::Cursor;
 
     fn make_cursor_reader(data: &[u8]) -> Box<dyn Reader> {
         new_reader(Cursor::new(data.to_vec()))

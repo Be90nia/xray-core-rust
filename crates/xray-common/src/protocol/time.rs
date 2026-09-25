@@ -50,12 +50,7 @@ impl std::fmt::Display for Timestamp {
 /// 对应 Go 版本的 `NowTime()`。
 #[must_use]
 pub fn now_time() -> Timestamp {
-    Timestamp(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0),
-    )
+    Timestamp(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0))
 }
 
 /// 时间戳生成器。

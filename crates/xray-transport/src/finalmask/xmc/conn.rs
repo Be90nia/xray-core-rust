@@ -12,15 +12,19 @@
 use std::io;
 
 use rand::RngCore;
-use rsa::pkcs1::DecodeRsaPrivateKey;
-use rsa::pkcs8::DecodePublicKey;
-use rsa::pkcs1v15::Pkcs1v15Encrypt;
-use rsa::{RsaPrivateKey, RsaPublicKey};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::select;
+use rsa::{
+    RsaPrivateKey, RsaPublicKey, pkcs1::DecodeRsaPrivateKey, pkcs1v15::Pkcs1v15Encrypt,
+    pkcs8::DecodePublicKey,
+};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    select,
+};
 
-use super::cfb8::{Cfb8Dec, Cfb8Enc};
-use super::protocol;
+use super::{
+    cfb8::{Cfb8Dec, Cfb8Enc},
+    protocol,
+};
 
 /// 共享密钥长度（AES-128 key，同时也是 IV）。
 pub const SHARED_SECRET_SIZE: usize = 16;
@@ -31,7 +35,7 @@ const PACKET_DATA_MAX: i32 = 32 * 1024;
 
 /// 由 username 生成 OfflinePlayer UUID（对应 Go `generateOfflineUUID`，v3 layout）。
 fn offline_uuid(username: &str) -> [u8; 16] {
-    use ring::digest::{digest, SHA256};
+    use ring::digest::{SHA256, digest};
     let seed = format!("OfflinePlayer:{username}");
     let h = digest(&SHA256, seed.as_bytes());
     let mut uuid = [0u8; 16];
@@ -55,10 +59,7 @@ async fn read_varint_async<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<i32> {
         }
         position += 7;
     }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        "xmc varint too large",
-    ))
+    Err(io::Error::new(io::ErrorKind::InvalidData, "xmc varint too large"))
 }
 
 /// 异步读完整 packet：返回 `(packet_id, payload)`。
@@ -109,8 +110,9 @@ pub(super) async fn client_handshake<RW>(
 where
     RW: AsyncRead + AsyncWrite + Unpin,
 {
-    let rsa_public_key = RsaPublicKey::from_public_key_der(rsa_public_key_der)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parse rsa public key: {e}")))?;
+    let rsa_public_key = RsaPublicKey::from_public_key_der(rsa_public_key_der).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("parse rsa public key: {e}"))
+    })?;
 
     // 1. Handshake (0x00)
     let mut p = Vec::new();
@@ -142,10 +144,7 @@ where
     // shouldAuthenticate 字段客户端不使用，跳过
 
     if server_public_key != rsa_public_key_der {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "server public key mismatch",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "server public key mismatch"));
     }
 
     // 4. 生成 sharedSecret + RSA 加密
@@ -156,13 +155,13 @@ where
     let mut rng = rsa::rand_core::OsRng;
     let enc_shared = rsa_public_key
         .encrypt(&mut rng, scheme, &shared_secret)
-        .map_err(|e| io::Error::other( format!("rsa encrypt shared: {e}")))?;
+        .map_err(|e| io::Error::other(format!("rsa encrypt shared: {e}")))?;
 
     let mut verify_with_pw = verify_token.clone();
     verify_with_pw.extend_from_slice(password.as_bytes());
     let enc_verify = rsa_public_key
         .encrypt(&mut rng, Pkcs1v15Encrypt, &verify_with_pw)
-        .map_err(|e| io::Error::other( format!("rsa encrypt verify: {e}")))?;
+        .map_err(|e| io::Error::other(format!("rsa encrypt verify: {e}")))?;
 
     // 5. 写 Encryption Response (0x01)
     let mut p = Vec::new();
@@ -183,16 +182,14 @@ pub(super) async fn server_handshake<RW>(
 where
     RW: AsyncRead + AsyncWrite + Unpin,
 {
-    let rsa_private_key = RsaPrivateKey::from_pkcs1_der(rsa_private_key_der)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parse rsa private key: {e}")))?;
+    let rsa_private_key = RsaPrivateKey::from_pkcs1_der(rsa_private_key_der).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("parse rsa private key: {e}"))
+    })?;
 
     // 1. 读 Handshake (0x00)
     let (packet_id, data) = read_packet_async(raw).await?;
     if packet_id != 0x00 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "bad handshake packet id",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad handshake packet id"));
     }
     let mut cursor = std::io::Cursor::new(data);
     let _proto = protocol::read_varint(&mut cursor)?;
@@ -209,10 +206,7 @@ where
     // 2. 读 Login Start (0x00)
     let (packet_id, data) = read_packet_async(raw).await?;
     if packet_id != 0x00 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "bad login start packet id",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad login start packet id"));
     }
     let mut cursor = std::io::Cursor::new(data);
     let _username = protocol::read_string(&mut cursor)?;
@@ -244,23 +238,21 @@ where
     // 5. RSA 解密
     let shared_secret = rsa_private_key
         .decrypt(Pkcs1v15Encrypt, &enc_shared)
-        .map_err(|e| io::Error::other( format!("rsa decrypt shared: {e}")))?;
+        .map_err(|e| io::Error::other(format!("rsa decrypt shared: {e}")))?;
     let decrypted_verify = rsa_private_key
         .decrypt(Pkcs1v15Encrypt, &enc_verify)
-        .map_err(|e| io::Error::other( format!("rsa decrypt verify: {e}")))?;
+        .map_err(|e| io::Error::other(format!("rsa decrypt verify: {e}")))?;
 
     // 6. 校验 verifyToken 前 4 字节
     if decrypted_verify.len() < 4 || decrypted_verify[..4] != verify_token {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "verify token mismatch",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "verify token mismatch"));
     }
 
     // 7. 校验 password
     let received_pw = &decrypted_verify[4..];
     if received_pw != password.as_bytes() {
-        let reason = r#"{"type":"translatable","translate":"multiplayer.disconnect.authservers_down"}"#;
+        let reason =
+            r#"{"type":"translatable","translate":"multiplayer.disconnect.authservers_down"}"#;
         let _ = write_disconnect_async(raw, reason).await;
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad password"));
     }
@@ -332,14 +324,8 @@ pub(super) async fn tcp_bridge(
         // Rust 暂未实现 Login Acknowledged packet——此处 first_turn_prefix_length
         // 传 0（对应 Go `loginAcknowledgedLength`）。Go v26.7.28 的 Login Ack 在
         // 26.7.x 系列还会跟随 padding 一并完善，本次同步只覆盖 padding 调度部分。
-        if let Err(_) = super::padding::run_padding_schedule(
-            &mut r,
-            &mut w,
-            is_client,
-            0,
-            &schedule,
-        )
-        .await
+        if let Err(_) =
+            super::padding::run_padding_schedule(&mut r, &mut w, is_client, 0, &schedule).await
         {
             return;
         }

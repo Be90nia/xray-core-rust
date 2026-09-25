@@ -6,26 +6,22 @@ pub mod env;
 pub mod filesystem;
 pub mod splice;
 
-use std::sync::LazyLock;
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::LazyLock};
 
 use self::env::EnvFlag;
 
 /// Go `platform.ConfigLocation`。
-static CONFIG_LOCATION: LazyLock<EnvFlag> =
-    LazyLock::new(|| EnvFlag::new("xray.location.config"));
+static CONFIG_LOCATION: LazyLock<EnvFlag> = LazyLock::new(|| EnvFlag::new("xray.location.config"));
 
 /// Go `platform.ConfdirLocation`。
 static CONFDIR_LOCATION: LazyLock<EnvFlag> =
     LazyLock::new(|| EnvFlag::new("xray.location.confdir"));
 
 /// Go `platform.AssetLocation`。
-static ASSET_LOCATION: LazyLock<EnvFlag> =
-    LazyLock::new(|| EnvFlag::new("xray.location.asset"));
+static ASSET_LOCATION: LazyLock<EnvFlag> = LazyLock::new(|| EnvFlag::new("xray.location.asset"));
 
 /// Go `platform.CertLocation`。
-static CERT_LOCATION: LazyLock<EnvFlag> =
-    LazyLock::new(|| EnvFlag::new("xray.location.cert"));
+static CERT_LOCATION: LazyLock<EnvFlag> = LazyLock::new(|| EnvFlag::new("xray.location.cert"));
 
 /// Go `getExecutableDir`：可执行文件所在目录，取不到时空串。
 fn executable_dir() -> PathBuf {
@@ -40,9 +36,7 @@ fn executable_dir() -> PathBuf {
 /// `xray.location.config`（或 `XRAY_LOCATION_CONFIG`）目录下的 `config.json`，
 /// 未设置时回退可执行文件同目录。
 pub fn get_configuration_path() -> PathBuf {
-    let dir = CONFIG_LOCATION
-        .get_value()
-        .map_or_else(executable_dir, PathBuf::from);
+    let dir = CONFIG_LOCATION.get_value().map_or_else(executable_dir, PathBuf::from);
     dir.join("config.json")
 }
 
@@ -54,26 +48,20 @@ pub fn get_confdir_path() -> Option<PathBuf> {
 /// 资源目录（Go `GetAssetLocation` 的目录部分）：`xray.location.asset`
 /// 未设置时回退可执行文件同目录。
 pub fn get_resource_path() -> PathBuf {
-    ASSET_LOCATION
-        .get_value()
-        .map_or_else(executable_dir, PathBuf::from)
+    ASSET_LOCATION.get_value().map_or_else(executable_dir, PathBuf::from)
 }
 
 /// 证书目录（Go `GetCertLocation` 的目录部分）：`xray.location.cert`
 /// 未设置时回退可执行文件同目录。
 pub fn get_cert_path() -> PathBuf {
-    CERT_LOCATION
-        .get_value()
-        .map_or_else(executable_dir, PathBuf::from)
+    CERT_LOCATION.get_value().map_or_else(executable_dir, PathBuf::from)
 }
 
 /// 资源文件完整路径（Go `GetAssetLocation(file)`，windows.go:13）：资源目录 + `file`。
 ///
 /// 与 Go 一致地每次调用现读环境变量（Go 每次 `NewEnvFlag(...)` 新建、不缓存）。
 fn asset_env_dir() -> PathBuf {
-    EnvFlag::new("xray.location.asset")
-        .get_value()
-        .map_or_else(executable_dir, PathBuf::from)
+    EnvFlag::new("xray.location.asset").get_value().map_or_else(executable_dir, PathBuf::from)
 }
 
 /// 资源文件完整路径（Go `GetAssetLocation(file)`）。
@@ -128,10 +116,7 @@ mod tests {
     #[test]
     fn configuration_path_defaults_to_exe_dir_config_json() {
         // env 未设置时回退 exe 目录（测试环境 current_exe 是测试二进制目录）
-        assert_eq!(
-            get_configuration_path(),
-            executable_dir().join("config.json")
-        );
+        assert_eq!(get_configuration_path(), executable_dir().join("config.json"));
     }
 
     #[test]
@@ -146,8 +131,7 @@ mod tests {
 
     #[test]
     fn strict_json_defaults_false() {
-        if std::env::var("xray.json.strict").is_err()
-            && std::env::var("XRAY_JSON_STRICT").is_err()
+        if std::env::var("xray.json.strict").is_err() && std::env::var("XRAY_JSON_STRICT").is_err()
         {
             assert!(!use_strict_json());
         }

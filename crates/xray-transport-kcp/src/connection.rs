@@ -12,26 +12,32 @@
 //! Read/Write 提供**同步**简化版（不等待窗口/数据，短写或返回 0），上层 adapter
 //! 包装成 AsyncRead/AsyncWrite。
 
-use std::pin::Pin;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicI32, AtomicU32, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
-use crate::config::Config;
-use crate::error::{KcpError, Result};
-use crate::output::SegmentWriter;
-use crate::receiving::ReceivingWorker;
-use crate::round_trip::RoundTripInfo;
-use crate::segment::{
-    CmdOnlySegment, Command, Segment, SegmentKind, SegmentOption,
-    DATA_SEGMENT_OVERHEAD, SEGMENT_OPTION_CLOSE,
+use crate::{
+    config::Config,
+    error::{KcpError, Result},
+    output::SegmentWriter,
+    receiving::ReceivingWorker,
+    round_trip::RoundTripInfo,
+    segment::{
+        CmdOnlySegment, Command, DATA_SEGMENT_OVERHEAD, SEGMENT_OPTION_CLOSE, Segment, SegmentKind,
+        SegmentOption,
+    },
+    sending::SendingWorker,
+    state::State,
+    updater::{TokioUpdater, Updater},
 };
-use crate::sending::SendingWorker;
-use crate::state::State;
-use crate::updater::{TokioUpdater, Updater};
 
 /// IO 边界 trait：关闭底层连接（对应 Go `io.Closer`）。
 pub trait ConnectionCloser: Send + Sync {
@@ -61,11 +67,7 @@ pub struct ConnMetadata {
 impl ConnMetadata {
     #[must_use]
     pub fn new(conv: u16) -> Self {
-        Self {
-            conv,
-            local_addr: None,
-            remote_addr: None,
-        }
+        Self { conv, local_addr: None, remote_addr: None }
     }
 }
 
@@ -159,8 +161,12 @@ impl Connection {
         let rtt = Arc::new(RoundTripInfo::new(tti));
 
         let sending_worker = SendingWorker::new(conv, rtt.clone(), config.clone());
-        let receiving_worker =
-            ReceivingWorker::new(rtt.clone(), config.clone(), conv, mss as usize + DATA_SEGMENT_OVERHEAD);
+        let receiving_worker = ReceivingWorker::new(
+            rtt.clone(),
+            config.clone(),
+            conv,
+            mss as usize + DATA_SEGMENT_OVERHEAD,
+        );
 
         let inner = Arc::new(ConnectionInner {
             meta,
@@ -191,9 +197,11 @@ impl Connection {
                         let Some(i) = w.upgrade() else {
                             return false;
                         };
-                        let state = State::from_i32(i.state.load(Ordering::SeqCst)).unwrap_or(State::Terminated);
+                        let state = State::from_i32(i.state.load(Ordering::SeqCst))
+                            .unwrap_or(State::Terminated);
                         !state.is(&[State::Terminating, State::Terminated])
-                            && (i.sending_worker.update_necessary() || i.receiving_worker.update_necessary())
+                            && (i.sending_worker.update_necessary()
+                                || i.receiving_worker.update_necessary())
                     }
                 },
                 {
@@ -202,7 +210,8 @@ impl Connection {
                         let Some(i) = w.upgrade() else {
                             return true;
                         };
-                        let state = State::from_i32(i.state.load(Ordering::SeqCst)).unwrap_or(State::Terminated);
+                        let state = State::from_i32(i.state.load(Ordering::SeqCst))
+                            .unwrap_or(State::Terminated);
                         state.is(&[State::Terminating, State::Terminated])
                     }
                 },
@@ -224,7 +233,8 @@ impl Connection {
                         let Some(i) = w.upgrade() else {
                             return false;
                         };
-                        let state = State::from_i32(i.state.load(Ordering::SeqCst)).unwrap_or(State::Terminated);
+                        let state = State::from_i32(i.state.load(Ordering::SeqCst))
+                            .unwrap_or(State::Terminated);
                         state != State::Terminated
                     }
                 },
@@ -248,11 +258,7 @@ impl Connection {
             (None, None)
         };
 
-        Self {
-            inner,
-            data_updater,
-            ping_updater,
-        }
+        Self { inner, data_updater, ping_updater }
     }
 
     /// 当前状态（对应 Go `Connection.State`）。
@@ -279,11 +285,11 @@ impl Connection {
                 self.inner.receiving_worker.close_read();
                 self.inner.sending_worker.close_write();
                 self.set_ping_interval(Duration::from_secs(1));
-            }
+            },
             State::PeerTerminating => {
                 self.inner.sending_worker.close_write();
                 self.set_ping_interval(Duration::from_secs(1));
-            }
+            },
             State::Terminated => {
                 self.inner.receiving_worker.close_read();
                 self.inner.sending_worker.close_write();
@@ -291,8 +297,8 @@ impl Connection {
                 self.wake_data_updater();
                 self.wake_ping_updater();
                 self.terminate();
-            }
-            State::Active => {}
+            },
+            State::Active => {},
         }
     }
 
@@ -308,19 +314,19 @@ impl Connection {
         match self.state() {
             State::ReadyToClose | State::Terminating | State::Terminated => {
                 Err(KcpError::ClosedConnection)
-            }
+            },
             State::Active => {
                 self.set_state(State::ReadyToClose);
                 Ok(())
-            }
+            },
             State::PeerClosed => {
                 self.set_state(State::Terminating);
                 Ok(())
-            }
+            },
             State::PeerTerminating => {
                 self.set_state(State::Terminated);
                 Ok(())
-            }
+            },
         }
     }
 
@@ -346,7 +352,7 @@ impl Connection {
         match self.state() {
             State::ReadyToClose => self.set_state(State::Terminating),
             State::Active => self.set_state(State::PeerClosed),
-            _ => {}
+            _ => {},
         }
     }
 
@@ -369,17 +375,15 @@ impl Connection {
                         self.inner.data_input.notify_one();
                     }
                     self.wake_data_updater();
-                }
+                },
                 SegmentKind::Ack(ack) => {
                     let opt = ack.option;
                     let rto = self.inner.round_trip.timeout();
                     self.handle_option(opt);
-                    self.inner
-                        .sending_worker
-                        .process_ack_segment(current, ack, rto);
+                    self.inner.sending_worker.process_ack_segment(current, ack, rto);
                     self.inner.data_output.notify_one();
                     self.wake_data_updater();
-                }
+                },
                 SegmentKind::Cmd(cmd) => {
                     let opt = cmd.option;
                     let cmd_command = cmd.command();
@@ -391,10 +395,10 @@ impl Connection {
                         match self.state() {
                             State::Active | State::PeerClosed => {
                                 self.set_state(State::PeerTerminating);
-                            }
+                            },
                             State::ReadyToClose => self.set_state(State::Terminating),
                             State::Terminating => self.set_state(State::Terminated),
-                            _ => {}
+                            _ => {},
                         }
                     }
                     if opt == SEGMENT_OPTION_CLOSE || cmd_command == Command::Terminate {
@@ -402,11 +406,9 @@ impl Connection {
                         self.inner.data_output.notify_one();
                     }
                     self.inner.sending_worker.process_receiving_next(receiving_next);
-                    self.inner
-                        .receiving_worker
-                        .process_sending_next(sending_next);
+                    self.inner.receiving_worker.process_sending_next(sending_next);
                     self.inner.round_trip.update_peer_rto(peer_rto, current);
-                }
+                },
             }
         }
     }
@@ -425,7 +427,8 @@ impl Connection {
             return;
         }
         if state == State::Active
-            && current.wrapping_sub(inner.last_incoming_time.load(Ordering::SeqCst)) >= STALE_TIMEOUT_MS
+            && current.wrapping_sub(inner.last_incoming_time.load(Ordering::SeqCst))
+                >= STALE_TIMEOUT_MS
         {
             // 模拟 Go `c.Close()`：仅推进状态机（不调 close() 避免重复 notify）
             inner.data_input.notify_one();
@@ -494,9 +497,7 @@ impl Connection {
         for ack in acks {
             let _ = inner.output.write_segment(&ack);
         }
-        let _ = inner
-            .sending_worker
-            .flush_with_writer(current, &*inner.output, state);
+        let _ = inner.sending_worker.flush_with_writer(current, &*inner.output, state);
 
         if current.wrapping_sub(inner.last_ping_time.load(Ordering::SeqCst)) >= PING_INTERVAL_MS {
             Self::ping_inner(inner, current, Command::Ping);
@@ -528,10 +529,7 @@ impl Connection {
     ///
     /// 返回读取字节数（0 表示暂无数据）。状态终态返回 `Err(ClosedConnection)`。
     pub fn read(&self, b: &mut [u8]) -> Result<usize> {
-        if self
-            .state()
-            .is(&[State::ReadyToClose, State::Terminating, State::Terminated])
-        {
+        if self.state().is(&[State::ReadyToClose, State::Terminating, State::Terminated]) {
             return Err(KcpError::ClosedConnection);
         }
         let n = self.inner.receiving_worker.read(b);
@@ -650,7 +648,11 @@ impl KcpConn {
     /// 构造。
     #[must_use]
     pub fn new(inner: Arc<Connection>) -> Self {
-        Self { inner, read_state: parking_lot::Mutex::new(None), write_state: parking_lot::Mutex::new(None) }
+        Self {
+            inner,
+            read_state: parking_lot::Mutex::new(None),
+            write_state: parking_lot::Mutex::new(None),
+        }
     }
 
     /// 内部引用。
@@ -682,14 +684,12 @@ impl tokio::io::AsyncRead for KcpConn {
         let mut tmp = vec![0u8; buf.remaining()];
         loop {
             match self.inner.read(&mut tmp) {
-                Ok(0) => {}
+                Ok(0) => {},
                 Ok(n) => {
                     buf.put_slice(&tmp[..n]);
                     return std::task::Poll::Ready(Ok(()));
-                }
-                Err(e) => {
-                    return std::task::Poll::Ready(Err(std::io::Error::other(e.to_string())))
-                }
+                },
+                Err(e) => return std::task::Poll::Ready(Err(std::io::Error::other(e.to_string()))),
             }
 
             let mut state = self.read_state.lock();
@@ -719,11 +719,9 @@ impl tokio::io::AsyncWrite for KcpConn {
         // data_output、不持有 buf 副本，唤醒后用本次 poll 的 buf 重写。
         loop {
             match self.inner.write(buf) {
-                Ok(0) => {}
+                Ok(0) => {},
                 Ok(n) => return std::task::Poll::Ready(Ok(n)),
-                Err(e) => {
-                    return std::task::Poll::Ready(Err(std::io::Error::other(e.to_string())))
-                }
+                Err(e) => return std::task::Poll::Ready(Err(std::io::Error::other(e.to_string()))),
             }
 
             let mut state = self.write_state.lock();
@@ -773,11 +771,15 @@ impl xray_transport::connection::Connection for KcpConn {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::config::default_config;
-    use crate::segment::{AckSegment, DataSegment, Segment};
-    use parking_lot::Mutex as PMutex;
     use std::sync::atomic::AtomicUsize;
+
+    use parking_lot::Mutex as PMutex;
+
+    use super::*;
+    use crate::{
+        config::default_config,
+        segment::{AckSegment, DataSegment, Segment},
+    };
 
     /// 收集所有写入的 segment（测试用 SegmentWriter）。
     struct CollectWriter {
@@ -786,13 +788,13 @@ mod tests {
 
     impl CollectWriter {
         fn new() -> Arc<Self> {
-            Arc::new(Self {
-                segments: PMutex::new(Vec::new()),
-            })
+            Arc::new(Self { segments: PMutex::new(Vec::new()) })
         }
+
         fn take(&self) -> Vec<SegmentKind> {
             self.segments.lock().drain(..).collect()
         }
+
         fn count(&self) -> usize {
             self.segments.lock().len()
         }
@@ -946,7 +948,7 @@ mod tests {
             SegmentKind::Cmd(c) => {
                 assert_eq!(c.conv, 7);
                 assert_eq!(c.cmd, Command::Ping);
-            }
+            },
             other => panic!("expected Cmd, got {other:?}"),
         }
     }
@@ -973,10 +975,7 @@ mod tests {
     fn read_returns_error_when_terminating() {
         let (conn, _) = make_connection(1);
         conn.set_state(State::Terminating);
-        assert!(matches!(
-            conn.read(&mut [0u8; 10]),
-            Err(KcpError::ClosedConnection)
-        ));
+        assert!(matches!(conn.read(&mut [0u8; 10]), Err(KcpError::ClosedConnection)));
     }
 
     #[test]
@@ -1050,12 +1049,7 @@ mod tests {
         let closer = Arc::new(CountingCloser(closer_calls.clone()));
         let writer = CollectWriter::new();
         let config = Arc::new(default_config());
-        let conn = Connection::new_without_updater(
-            ConnMetadata::new(1),
-            writer,
-            closer,
-            config,
-        );
+        let conn = Connection::new_without_updater(ConnMetadata::new(1), writer, closer, config);
         conn.terminate();
         assert_eq!(closer_calls.load(Ordering::SeqCst), 1);
         conn.terminate();
@@ -1073,19 +1067,10 @@ mod tests {
         let closer = Arc::new(CountingCloser(closer_calls.clone()));
         let writer = CollectWriter::new();
         let config = Arc::new(default_config());
-        let conn = Connection::new_without_updater(
-            ConnMetadata::new(1),
-            writer,
-            closer,
-            config,
-        );
+        let conn = Connection::new_without_updater(ConnMetadata::new(1), writer, closer, config);
         conn.set_state(State::Terminated);
         assert_eq!(conn.state(), State::Terminated);
-        assert_eq!(
-            closer_calls.load(Ordering::SeqCst),
-            1,
-            "terminate should close closer"
-        );
+        assert_eq!(closer_calls.load(Ordering::SeqCst), 1, "terminate should close closer");
     }
 
     // ===== cached future 参数捕获 bug（bd Xray-core-rust-0mp）=====
@@ -1152,10 +1137,7 @@ mod tests {
                 k.read(&mut small).await.expect("read small")
             };
             assert!(n > 0, "read returned 0 (received={received}/{total})");
-            assert!(
-                received + n <= total,
-                "read more than injected: {received} + {n} > {total}"
-            );
+            assert!(received + n <= total, "read more than injected: {received} + {n} > {total}");
             received += n;
             use_big = !use_big;
         }
@@ -1204,12 +1186,18 @@ mod tests {
         let (conn, _) = make_connection(1);
         conn.close().unwrap();
         // 修复前：notify_waiters 在无 waiter 时执行 → permit 不存在 → 永久挂起
-        tokio::time::timeout(std::time::Duration::from_millis(500), conn.inner.data_input.notified())
-            .await
-            .expect("close must leave a wakeup permit on data_input (notify_one)");
-        tokio::time::timeout(std::time::Duration::from_millis(500), conn.inner.data_output.notified())
-            .await
-            .expect("close must leave a wakeup permit on data_output");
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            conn.inner.data_input.notified(),
+        )
+        .await
+        .expect("close must leave a wakeup permit on data_input (notify_one)");
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            conn.inner.data_output.notified(),
+        )
+        .await
+        .expect("close must leave a wakeup permit on data_output");
     }
 
     /// 票 eapf 验收：并发 close 竞态下挂起读必须及时醒来返回 ClosedConnection，
@@ -1227,12 +1215,9 @@ mod tests {
         // 先让 reader 挂起（waiter 注册完毕），close 再到
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         conn.close().unwrap();
-        let res = tokio::time::timeout(std::time::Duration::from_millis(300), reader)
-            .await
-            .expect("pending reader must wake promptly after close, not hang until next transition");
-        assert!(
-            res.expect("join").is_err(),
-            "read must fail with closed connection after close"
+        let res = tokio::time::timeout(std::time::Duration::from_millis(300), reader).await.expect(
+            "pending reader must wake promptly after close, not hang until next transition",
         );
+        assert!(res.expect("join").is_err(), "read must fail with closed connection after close");
     }
 }

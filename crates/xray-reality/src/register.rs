@@ -12,22 +12,28 @@
 //! 3. 调 [`u_client`] 做 REALITY TLS handshake（watfaq-rustls 内部派生 session_id/auth_key）
 //! 4. 包装返回的 `TlsStream` 为 [`RealityConnection`]（impl [`Connection`])
 
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
-use crate::client::RealityTlsStream;
-
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpStream,
+};
 use xray_common::net::destination::Destination;
-use xray_transport::connection::Connection;
-use xray_transport::dialer::{StreamSettings, TransportDialFn, register_transport_dialer};
+use xray_transport::{
+    connection::Connection,
+    dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
+};
 
-use crate::client::{u_client, UConnState};
-use crate::config::RealityConfig;
+use crate::{
+    client::{RealityTlsStream, UConnState, u_client},
+    config::RealityConfig,
+};
 
 /// 注册 REALITY transport dialer。幂等。
 pub fn register_dialer() -> io::Result<()> {
@@ -40,7 +46,10 @@ pub fn register_dialer() -> io::Result<()> {
     Ok(())
 }
 
-async fn dial_reality(dest: &Destination, settings: &StreamSettings) -> io::Result<Box<dyn Connection>> {
+async fn dial_reality(
+    dest: &Destination,
+    settings: &StreamSettings,
+) -> io::Result<Box<dyn Connection>> {
     let config = parse_reality_config(settings.security_json.as_ref())?;
     let state = UConnState::new(config).map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -114,14 +123,12 @@ fn parse_reality_config(json: Option<&serde_json::Value>) -> io::Result<RealityC
     // password 非空时覆盖 publicKey）；缺省报错文案对齐 Go 用 "password" 字样。
     let public_key_b64 = match obj.get("password").and_then(|v| v.as_str()) {
         Some(p) if !p.is_empty() => p,
-        _ => obj.get("publicKey").and_then(|v| v.as_str()).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "reality: empty password")
-        })?,
+        _ => obj
+            .get("publicKey")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "reality: empty password"))?,
     };
-    let fingerprint = obj
-        .get("fingerprint")
-        .and_then(|v| v.as_str())
-        .unwrap_or("chrome");
+    let fingerprint = obj.get("fingerprint").and_then(|v| v.as_str()).unwrap_or("chrome");
     let short_id_str = obj.get("shortId").and_then(|v| v.as_str()).unwrap_or("");
 
     let public_key = base64_url_decode(public_key_b64).ok_or_else(|| {
@@ -137,20 +144,14 @@ fn parse_reality_config(json: Option<&serde_json::Value>) -> io::Result<RealityC
     if public_key.len() != crate::config::X25519_KEY_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "reality: invalid publicKey: need 32B X25519 key, got {}B",
-                public_key.len()
-            ),
+            format!("reality: invalid publicKey: need 32B X25519 key, got {}B", public_key.len()),
         ));
     }
     let short_id = if short_id_str.is_empty() {
         Vec::new()
     } else {
         hex::decode(short_id_str).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("reality: invalid shortId hex: {e}"),
-            )
+            io::Error::new(io::ErrorKind::InvalidData, format!("reality: invalid shortId hex: {e}"))
         })?
     };
     // 257w：mldsa65Verify 配置期校验（Go transport_security.go:209-213，
@@ -166,11 +167,14 @@ fn parse_reality_config(json: Option<&serde_json::Value>) -> io::Result<RealityC
             if der.len() != 1952 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("reality: invalid mldsa65Verify: need 1952B public key, got {}B", der.len()),
+                    format!(
+                        "reality: invalid mldsa65Verify: need 1952B public key, got {}B",
+                        der.len()
+                    ),
                 ));
             }
             der
-        }
+        },
         _ => Vec::new(),
     };
     // 49i9：mldsa65Verify 只有 btls 主路径能验签（BtlsRealityHooks 捕获
@@ -198,7 +202,8 @@ fn parse_reality_config(json: Option<&serde_json::Value>) -> io::Result<RealityC
     // 默认 "/"；必须以 '/' 开头；query 参数 p/c/t/i/r（单值或 a-b 区间）写入
     // spider_y[10] 对应槽位（解析失败取 0 对齐 Go `_, _ :=`），消费后从 query 剔除。
     // Go transport_security.go:214-242：空串同缺失归一 "/"（uriclient.py 产物 spiderX=""）。
-    let spider_x_raw = obj.get("spiderX").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("/");
+    let spider_x_raw =
+        obj.get("spiderX").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("/");
     if !spider_x_raw.starts_with('/') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -249,18 +254,14 @@ fn parse_spider_x(raw: &str) -> (String, Vec<i64>) {
                 let hi = parts.next().map(|s| s.parse::<i64>().unwrap_or(0)).unwrap_or(lo);
                 spider_y[slot] = lo;
                 spider_y[slot + 1] = hi;
-            }
+            },
             _ => kept.push(pair),
         }
     }
-    let spider_x = if kept.is_empty() {
-        path.to_string()
-    } else {
-        format!("{path}?{}", kept.join("&"))
-    };
+    let spider_x =
+        if kept.is_empty() { path.to_string() } else { format!("{path}?{}", kept.join("&")) };
     (spider_x, spider_y)
 }
-
 
 /// base64 RawURL 解码（无 padding，兼容 std 变体）。对应 Go `base64.RawURLEncoding.DecodeString`。
 fn base64_url_decode(s: &str) -> Option<Vec<u8>> {
@@ -308,9 +309,11 @@ impl<S: Connection> AsyncWrite for RealityConnection<S> {
     ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
+
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
@@ -320,9 +323,11 @@ impl<S: Connection> Connection for RealityConnection<S> {
     fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(self.remote_addr)
     }
+
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(self.local_addr)
     }
+
     fn raw_tcp_clone(&self) -> Option<TcpStream> {
         // 穿透到 REALITY TLS 流继续克隆裸 TCP（vision splice 用）。
         self.inner.raw_tcp_clone()
@@ -331,8 +336,9 @@ impl<S: Connection> Connection for RealityConnection<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use base64::Engine as _;
+
+    use super::*;
 
     #[test]
     fn register_dialer_is_idempotent() {
@@ -356,10 +362,9 @@ mod tests {
     #[test]
     fn parse_reality_config_invalid_public_key_returns_err() {
         // 非 base64 字符串
-        let v: serde_json::Value = serde_json::from_str(
-            r#"{"serverName":"example.com","publicKey":"!!!not-base64!!!"}"#,
-        )
-        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"serverName":"example.com","publicKey":"!!!not-base64!!!"}"#)
+                .unwrap();
         let r = parse_reality_config(Some(&v));
         assert!(r.is_err());
     }
@@ -470,10 +475,7 @@ mod tests {
             "publicKey": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 31]),
         });
         let err = parse_reality_config(Some(&json)).unwrap_err();
-        assert!(
-            err.to_string().contains("need 32B X25519 key, got 31B"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("need 32B X25519 key, got 31B"), "got: {err}");
         // 33B → 拒
         let json = serde_json::json!({
             "serverName": "a.com",

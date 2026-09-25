@@ -3,12 +3,11 @@
 //! 把 btls 指纹伪装握手（[`crate::btls_client`]）与 REALITY 协议注入
 //! （session_id AEAD 加密 + 证书 HMAC 验证）组合起来：
 //!
-//! - **指纹层**：BoringSSL 原生浏览器 ClientHello（Chrome/Firefox/Safari/...，
-//!   cipher 顺序/扩展/GREASE 均由 BoringSSL 生成，DPI 无法区分）。
-//! - **REALITY 层**：在 ClientHello 计入 transcript 前（BoringSSL
-//!   `ssl_add_message_cbb` 回调）改写 session_id 字段（32 字节等长替换）；
-//!   握手完成后回调证书验证（对应 Go `reality.UClient` 的 `hello.SessionId`
-//!   注入 + `VerifyPeerCertificate`）。
+//! - **指纹层**：BoringSSL 原生浏览器 ClientHello（Chrome/Firefox/Safari/...， cipher
+//!   顺序/扩展/GREASE 均由 BoringSSL 生成，DPI 无法区分）。
+//! - **REALITY 层**：在 ClientHello 计入 transcript 前（BoringSSL `ssl_add_message_cbb` 回调）改写
+//!   session_id 字段（32 字节等长替换）； 握手完成后回调证书验证（对应 Go `reality.UClient` 的
+//!   `hello.SessionId` 注入 + `VerifyPeerCertificate`）。
 //!
 //! 对应 Go 语义（`transport/internet/reality/reality.go:133-177`）：
 //! `tls.GetFingerprint` → `utls.UClient`（浏览器指纹握手）→ `BuildHandshakeState`
@@ -26,7 +25,9 @@
 unsafe extern "C" {
     fn SSL_get_x25519_key_share_private(ssl: *mut btls_sys::SSL, out: *mut u8) -> i32;
     fn SSL_set_reality_rewrite_cb(
-        cb: Option<unsafe extern "C" fn(ssl: *mut btls_sys::SSL, msg: *mut u8, msg_len: usize) -> i32>,
+        cb: Option<
+            unsafe extern "C" fn(ssl: *mut btls_sys::SSL, msg: *mut u8, msg_len: usize) -> i32,
+        >,
     );
     fn SSL_set_reality_server_hello_cb(
         cb: Option<
@@ -35,11 +36,13 @@ unsafe extern "C" {
     );
 }
 
-use std::collections::HashMap;
-use std::io;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    collections::HashMap,
+    io,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use btls::ssl::SslRef;
 use foreign_types::ForeignTypeRef;
@@ -47,8 +50,10 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_btls::SslStream as TokioSslStream;
 use xray_transport::connection::Connection;
 
-use crate::btls_client::{connector_for_fingerprint, BtlsConn};
-use crate::fingerprint::Fingerprint;
+use crate::{
+    btls_client::{BtlsConn, connector_for_fingerprint},
+    fingerprint::Fingerprint,
+};
 
 /// REALITY 客户端钩子：btls 握手的关键时点回调。
 ///
@@ -70,14 +75,8 @@ pub trait RealityHooks: Send + Sync {
     /// 调用（SSL_set_reality_rewrite_cb 全局回调）。`msg` = 完整 handshake
     /// message（type(1)+len(3)+body，无 record 头）。BIO 层改写会让 transcript
     /// 与线上 bytes 不一致 → 握手密钥全部错乱（BAD_DECRYPT），必须在此改写。
-    fn rewrite_client_hello_msg(
-        &self,
-        ssl_ptr: RealitySslPtr,
-        msg: &mut [u8],
-    ) -> io::Result<()> {
-        Err(io::Error::other(
-            "REALITY: rewrite_client_hello_msg not implemented",
-        ))
+    fn rewrite_client_hello_msg(&self, ssl_ptr: RealitySslPtr, msg: &mut [u8]) -> io::Result<()> {
+        Err(io::Error::other("REALITY: rewrite_client_hello_msg not implemented"))
     }
 
     /// ServerHello 入站捕获：由 BoringSSL `ssl_reality_server_hello_maybe`
@@ -96,7 +95,6 @@ pub trait RealityHooks: Send + Sync {
     fn verify_handshake(&self, _ssl: &SslRef) -> io::Result<()> {
         Ok(())
     }
-
 }
 
 /// 导出当前 SSL 的 X25519 key share 私钥（32 字节 raw，裸指针版）。
@@ -137,13 +135,63 @@ pub fn send_post_handshake_record(
         return Err("null ssl or empty payload");
     }
     // SAFETY: ssl 指针由调用方保证指向存活 SSL；payload 为调用方持有的只读缓冲。
-    let ok = unsafe {
-        btls_sys::SSL_send_post_handshake_record(ssl, payload.as_ptr(), payload.len())
-    };
+    let ok =
+        unsafe { btls_sys::SSL_send_post_handshake_record(ssl, payload.as_ptr(), payload.len()) };
     if ok == 1 {
         Ok(())
     } else {
-        Err("SSL_send_post_handshake_record rejected (handshake incomplete or payload exceeds single record)")
+        Err(
+            "SSL_send_post_handshake_record rejected (handshake incomplete or payload exceeds single record)",
+        )
+    }
+}
+
+/// bd z32z：REALITY mirror 字节级等价原语（`SSL_seal_raw_tls13_record`
+/// 安全封装，BoringSSL patch 由 `tools/inject_btls_post_handshake.py` 注入，
+/// 与 [`send_post_handshake_record`] 同族）。
+///
+/// 以当前 write key 将 `inner`——**完整 AEAD 输入明文（含 inner content
+/// type），不追加任何字节**——seal 为单条 TLS 1.3 type-23 记录，wire 字节
+/// （5B 头 ‖ 密文 ‖ tag）写入 `out`，返回 wire 长度。AAD/nonce/写序号与
+/// 标准写路径共享（`write_sequence` 成功即递增，NST 等握手后记录自然计入）。
+/// 不触碰 BIO——发送由宿主把 `out` 直写底层流（Go `hs.c.write` 镜像，
+/// `xray-reality::server` 消费）。
+///
+/// Go mirror 形态（tls.go:417-426）：`inner = [0x17] + (len-22) 个全零`，
+/// 客户端 TLS1.3 剥尾语义解出 type=appData + 空载荷，被空记录重试路径吞掉。
+///
+/// iOS 门控同 [`send_post_handshake_record`]（预生成 bindings 无此符号）。
+#[cfg(not(target_os = "ios"))]
+pub fn seal_post_handshake_raw_record(
+    ssl: *mut btls_sys::SSL,
+    inner: &[u8],
+    out: &mut [u8],
+) -> Result<usize, &'static str> {
+    if ssl.is_null() || inner.is_empty() {
+        return Err("null ssl or empty inner plaintext");
+    }
+    if out.len() < inner.len() + 21 {
+        // wire 上界 = 5B 头 + inner + 16B tag；不足即拒，FFI 侧 BUFFER_TOO_SMALL 同义。
+        return Err("out buffer too small for a single TLS 1.3 record");
+    }
+    let mut out_len: usize = 0;
+    // SAFETY: ssl 指针由调用方保证指向存活 SSL；inner/out 为调用方持有的合法缓冲。
+    let ok = unsafe {
+        btls_sys::SSL_seal_raw_tls13_record(
+            ssl,
+            inner.as_ptr(),
+            inner.len(),
+            out.as_mut_ptr(),
+            out.len(),
+            &mut out_len,
+        )
+    };
+    if ok == 1 {
+        Ok(out_len)
+    } else {
+        Err(
+            "SSL_seal_raw_tls13_record rejected (handshake incomplete, non-TLS1.3, or length out of bound)",
+        )
     }
 }
 
@@ -162,10 +210,7 @@ extern "C" fn reality_rewrite_trampoline(
     msg: *mut u8,
     msg_len: usize,
 ) -> i32 {
-    let hooks = REALITY_HOOKS
-        .lock()
-        .as_ref()
-        .and_then(|m| m.get(&(ssl as usize)).cloned());
+    let hooks = REALITY_HOOKS.lock().as_ref().and_then(|m| m.get(&(ssl as usize)).cloned());
     let Some(hooks) = hooks else { return 1 };
     // SAFETY: msg/len 由 BoringSSL 在 ssl_add_message_cbb 内提供，握手窗口内有效。
     let buf = unsafe { std::slice::from_raw_parts_mut(msg, msg_len) };
@@ -180,10 +225,7 @@ extern "C" fn reality_server_hello_trampoline(
     msg: *const u8,
     msg_len: usize,
 ) -> i32 {
-    let hooks = REALITY_HOOKS
-        .lock()
-        .as_ref()
-        .and_then(|m| m.get(&(ssl as usize)).cloned());
+    let hooks = REALITY_HOOKS.lock().as_ref().and_then(|m| m.get(&(ssl as usize)).cloned());
     let Some(hooks) = hooks else { return 1 };
     // SAFETY: msg/len 由 BoringSSL 在 ServerHello 处理路径内提供，握手窗口内
     // 有效；本回调只读（捕获不改写）。
@@ -194,7 +236,6 @@ extern "C" fn reality_server_hello_trampoline(
     }
 }
 
-
 /// 注册 per-SSL hooks 并安装全局 trampoline（幂等）。
 pub fn register_reality_hooks(ssl_key: usize, hooks: Arc<dyn RealityHooks>) {
     TRAMPOLINE_INSTALLED.call_once(|| unsafe {
@@ -203,10 +244,7 @@ pub fn register_reality_hooks(ssl_key: usize, hooks: Arc<dyn RealityHooks>) {
     SERVER_HELLO_TRAMPOLINE_INSTALLED.call_once(|| unsafe {
         SSL_set_reality_server_hello_cb(Some(reality_server_hello_trampoline));
     });
-    REALITY_HOOKS
-        .lock()
-        .get_or_insert_with(HashMap::new)
-        .insert(ssl_key, hooks);
+    REALITY_HOOKS.lock().get_or_insert_with(HashMap::new).insert(ssl_key, hooks);
 }
 
 /// 注销 per-SSL hooks（握手结束/失败后调用）。
@@ -215,7 +253,6 @@ pub fn unregister_reality_hooks(ssl_key: usize) {
         m.remove(&ssl_key);
     }
 }
-
 
 /// per-SSL hooks 的 RAII guard：构造即注册，drop 时 compare-and-remove。
 ///
@@ -239,10 +276,7 @@ impl Drop for RealityHooksGuard {
     fn drop(&mut self) {
         let mut table = REALITY_HOOKS.lock();
         if let Some(map) = table.as_mut() {
-            if map
-                .get(&self.ssl_key)
-                .is_some_and(|h| Arc::ptr_eq(h, &self.hooks))
-            {
+            if map.get(&self.ssl_key).is_some_and(|h| Arc::ptr_eq(h, &self.hooks)) {
                 map.remove(&self.ssl_key);
             }
         }
@@ -291,14 +325,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for HelloRewriteStream<S> {
     }
 }
 
-
 impl<S: Connection + Unpin> Connection for HelloRewriteStream<S> {
     fn remote_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
         self.inner.remote_addr()
     }
+
     fn local_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
         self.inner.local_addr()
     }
+
     fn raw_tcp_clone(&self) -> Option<tokio::net::TcpStream> {
         // BIO 拦截层只在握手窗口起作用，连接建立后穿透内层克隆裸 TCP。
         self.inner.raw_tcp_clone()
@@ -331,8 +366,7 @@ where
     let mut ssl = cfg.into_ssl(server_name).map_err(|e| io::Error::other(e.to_string()))?;
 
     // per-connection 指纹参数（与 BtlsConn::connect 一致）
-    ssl.set_client_key_shares(fp_config.key_shares)
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    ssl.set_client_key_shares(fp_config.key_shares).map_err(|e| io::Error::other(e.to_string()))?;
     if !fp_config.alps.is_empty() {
         ssl.add_application_settings(fp_config.alps)
             .map_err(|e| io::Error::other(e.to_string()))?;
@@ -348,8 +382,8 @@ where
     let hooks_guard = RealityHooksGuard::register(ssl_key, &hooks);
     let rewrite_stream = HelloRewriteStream { inner: stream };
 
-    let tls_stream = TokioSslStream::new(ssl, rewrite_stream)
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    let tls_stream =
+        TokioSslStream::new(ssl, rewrite_stream).map_err(|e| io::Error::other(e.to_string()))?;
 
     let mut pinned = Box::pin(tls_stream);
     let connect_result = pinned.as_mut().connect().await;
@@ -411,10 +445,12 @@ mod tests {
         fn rewrite_client_hello(&self, _ssl: &SslRef, _record: &mut [u8]) -> io::Result<()> {
             Ok(())
         }
+
         fn rewrite_client_hello_msg(&self, _ssl: RealitySslPtr, _msg: &mut [u8]) -> io::Result<()> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
+
         fn on_server_hello(&self, msg: &[u8]) -> io::Result<()> {
             self.sh_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             *self.sh_last.lock() = msg.to_vec();
@@ -423,18 +459,11 @@ mod tests {
     }
 
     fn registered_hooks(ssl_key: usize) -> Option<Arc<dyn RealityHooks>> {
-        REALITY_HOOKS
-            .lock()
-            .as_ref()
-            .and_then(|m| m.get(&ssl_key))
-            .cloned()
+        REALITY_HOOKS.lock().as_ref().and_then(|m| m.get(&ssl_key)).cloned()
     }
 
     fn registry_contains(hooks: &Arc<dyn RealityHooks>) -> bool {
-        REALITY_HOOKS
-            .lock()
-            .as_ref()
-            .is_some_and(|m| m.values().any(|h| Arc::ptr_eq(h, hooks)))
+        REALITY_HOOKS.lock().as_ref().is_some_and(|m| m.values().any(|h| Arc::ptr_eq(h, hooks)))
     }
 
     /// guard 生命周期 = 注册表条目生命周期（`TokioSslStream::new` 失败
@@ -469,7 +498,8 @@ mod tests {
     fn trampoline_dispatches_only_to_registered_hooks() {
         let key = 0xcccc_usize;
         let probe = Arc::new(ProbeHooks::default());
-        let guard = RealityHooksGuard::register(key, &(Arc::clone(&probe) as Arc<dyn RealityHooks>));
+        let guard =
+            RealityHooksGuard::register(key, &(Arc::clone(&probe) as Arc<dyn RealityHooks>));
         let ssl = key as RealitySslPtr;
         let mut msg = [1u8; 8];
         assert_eq!(reality_rewrite_trampoline(ssl, msg.as_mut_ptr(), msg.len()), 1);
@@ -485,21 +515,16 @@ mod tests {
     fn server_hello_trampoline_dispatches_and_captures() {
         let key = 0xdddd_usize;
         let probe = Arc::new(ProbeHooks::default());
-        let guard = RealityHooksGuard::register(key, &(Arc::clone(&probe) as Arc<dyn RealityHooks>));
+        let guard =
+            RealityHooksGuard::register(key, &(Arc::clone(&probe) as Arc<dyn RealityHooks>));
         let ssl = key as RealitySslPtr;
         // 模拟 ServerHello handshake message：type=2 + len(3)=4 + body
         let sh = [2u8, 0, 0, 4, 0xaa, 0xbb, 0xcc, 0xdd];
-        assert_eq!(
-            reality_server_hello_trampoline(ssl, sh.as_ptr(), sh.len()),
-            1
-        );
+        assert_eq!(reality_server_hello_trampoline(ssl, sh.as_ptr(), sh.len()), 1);
         assert_eq!(probe.sh_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(*probe.sh_last.lock(), sh);
         drop(guard);
-        assert_eq!(
-            reality_server_hello_trampoline(ssl, sh.as_ptr(), sh.len()),
-            1
-        );
+        assert_eq!(reality_server_hello_trampoline(ssl, sh.as_ptr(), sh.len()), 1);
         assert_eq!(probe.sh_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -534,5 +559,31 @@ mod tests {
         assert_eq!(rc, 0, "null ssl must be rejected by the injected primitive");
         // 安全封装层同步拒收（空 payload 快路径）
         assert!(send_post_handshake_record(std::ptr::null_mut(), &[]).is_err());
+    }
+
+    /// bd z32z：mirror seal 原语 null/malformed 拒绝（FFI 层 + 封装层）。
+    #[test]
+    #[cfg(not(target_os = "ios"))]
+    fn mirror_seal_primitive_rejects_null_and_malformed_input() {
+        // FFI 层：null ssl 必须被注入原语拒绝（bindgen 绑定与符号真实可链接）。
+        let mut out = [0u8; 64];
+        let mut out_len = 0usize;
+        let rc = unsafe {
+            btls_sys::SSL_seal_raw_tls13_record(
+                std::ptr::null_mut(),
+                b"\x17".as_ptr(),
+                1,
+                out.as_mut_ptr(),
+                out.len(),
+                &mut out_len,
+            )
+        };
+        assert_eq!(rc, 0, "null ssl must be rejected by the injected primitive");
+
+        // 封装层：空 inner / out 不足在调用 FFI 前拒收。
+        assert!(seal_post_handshake_raw_record(std::ptr::null_mut(), &[], &mut out).is_err());
+        let inner = [0x17u8; 10];
+        let mut small = [0u8; 8];
+        assert!(seal_post_handshake_raw_record(std::ptr::null_mut(), &inner, &mut small).is_err());
     }
 }

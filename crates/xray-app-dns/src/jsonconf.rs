@@ -7,27 +7,28 @@
 //!
 //! ## bd mcpo 后的形态
 //!
-//! - nameserver `address` 接受域名（如 `"https://dns.google"`）：不再启动期
-//!   bootstrap 钉死 IP。经路由出站时由路由系统/outbound 解析；直连兜底每查询
-//!   经 `dial::HostResolver` 现解析（上游地址变更后新查询用新 IP）。
-//! - nameserver 构造失败（未知 scheme 等）→ `build` 返回错误（Go NewClient
-//!   失败 → 实例启动失败语义），不再跳过。
-//! - EDNS0 `clientIp` 经 `new_server_with_config` 全量透传到 Server 构造
-//!   （4ah3 接通；`new_server` 薄包装保留默认字段行为）。
+//! - nameserver `address` 接受域名（如 `"https://dns.google"`）：不再启动期 bootstrap 钉死
+//!   IP。经路由出站时由路由系统/outbound 解析；直连兜底每查询 经 `dial::HostResolver`
+//!   现解析（上游地址变更后新查询用新 IP）。
+//! - nameserver 构造失败（未知 scheme 等）→ `build` 返回错误（Go NewClient 失败 →
+//!   实例启动失败语义），不再跳过。
+//! - EDNS0 `clientIp` 经 `new_server_with_config` 全量透传到 Server 构造 （4ah3 接通；`new_server`
+//!   薄包装保留默认字段行为）。
 
-use std::collections::HashMap;
-use std::net::IpAddr;
-use std::sync::Arc;
+use std::{collections::HashMap, net::IpAddr, sync::Arc};
 
 use serde::Deserialize;
+use xray_geodata::matcher::domain::{DomainRule as MatcherDomainRule, MphDomainMatcher};
 
-use crate::config::{IpOption, QueryStrategy, generate_random_tag, ip_option_from_strategy, validate_client_ip_len};
-use crate::error::DnsError;
-use crate::hosts::{HostMapping, StaticHosts};
-use crate::nameserver::{Client, NameServerConfig, new_server_with_config};
-use crate::server::{DnsServiceConfig, DomainMatcherInfo};
-use xray_geodata::matcher::domain::{
-    DomainRule as MatcherDomainRule, MphDomainMatcher,
+use crate::{
+    config::{
+        IpOption, QueryStrategy, generate_random_tag, ip_option_from_strategy,
+        validate_client_ip_len,
+    },
+    error::DnsError,
+    hosts::{HostMapping, StaticHosts},
+    nameserver::{Client, NameServerConfig, new_server_with_config},
+    server::{DnsServiceConfig, DomainMatcherInfo},
 };
 
 /// 顶层 DNS app JSON 配置。对应 Go `infra/conf.DNSConfig`。
@@ -180,7 +181,10 @@ impl DnsAppConfig {
             let client_idx = clients.len() as u16;
             clients.push(Arc::new(c));
             // localhost server 优先本地域（Go localTLDsAndDotlessDomainsRules）。
-            let push_rule = |dt, value: &str, infos: &mut Vec<DomainMatcherInfo>, rules: &mut Vec<MatcherDomainRule>| {
+            let push_rule = |dt,
+                             value: &str,
+                             infos: &mut Vec<DomainMatcherInfo>,
+                             rules: &mut Vec<MatcherDomainRule>| {
                 infos.push(DomainMatcherInfo { client_idx, domain_rule: value.to_string() });
                 rules.push(MatcherDomainRule::new(dt, value, rules.len() as u32));
             };
@@ -199,15 +203,8 @@ impl DnsAppConfig {
                     )))
                 })?;
                 for (dt, v) in entries {
-                    matcher_infos.push(DomainMatcherInfo {
-                        client_idx,
-                        domain_rule: s.clone(),
-                    });
-                    all_rules.push(MatcherDomainRule::new(
-                        dt,
-                        v,
-                        all_rules.len() as u32,
-                    ));
+                    matcher_infos.push(DomainMatcherInfo { client_idx, domain_rule: s.clone() });
+                    all_rules.push(MatcherDomainRule::new(dt, v, all_rules.len() as u32));
                 }
             }
         }
@@ -223,7 +220,7 @@ impl DnsAppConfig {
                         base_ip_option,
                         server,
                     )?));
-                }
+                },
                 // Go NewLocalNameServer 不会失败；Rust 系统 resolver 配置不可读时
                 // 保持空 clients（查询时返回 EmptyResponse）而非阻断整个 feature。
                 Err(e) => tracing::warn!(error = %e, "dns: default localhost client unavailable"),
@@ -237,7 +234,7 @@ impl DnsAppConfig {
                 Err(e) => {
                     tracing::warn!(error = %e, "dns: domain matcher build failed, fallback only");
                     None
-                }
+                },
             }
         };
 
@@ -273,20 +270,23 @@ impl DnsAppConfig {
 ///
 /// 别名表完整对齐 Go `resolveQueryStrategy`（infra/conf/dns.go:381-394）：
 /// - `UseIP`：useip / use_ip / use-ip
-/// - `UseIPv4`：useip4 / useipv4 / use_ip4 / use_ipv4 / use_ip_v4 / use-ip4 /
-///   use-ipv4 / use-ip-v4
-/// - `UseIPv6`：useip6 / useipv6 / use_ip6 / use_ipv6 / use_ip_v6 / use-ip6 /
-///   use-ipv6 / use-ip-v6
+/// - `UseIPv4`：useip4 / useipv4 / use_ip4 / use_ipv4 / use_ip_v4 / use-ip4 / use-ipv4 / use-ip-v4
+/// - `UseIPv6`：useip6 / useipv6 / use_ip6 / use_ipv6 / use_ip_v6 / use-ip6 / use-ipv6 / use-ip-v6
 /// - `UseSys`：usesys / usesystem / use_sys / use_system / use-sys / use-system
 /// `Lookup` 不在 Go 别名表内——保留为未知。
 fn parse_query_strategy(s: Option<&str>) -> QueryStrategy {
     match s.map(str::to_ascii_lowercase).as_deref() {
-        Some("useip4" | "useipv4" | "use_ip4" | "use_ipv4" | "use_ip_v4"
-            | "use-ip4" | "use-ipv4" | "use-ip-v4") => QueryStrategy::UseIp4,
-        Some("useip6" | "useipv6" | "use_ip6" | "use_ipv6" | "use_ip_v6"
-            | "use-ip6" | "use-ipv6" | "use-ip-v6") => QueryStrategy::UseIp6,
-        Some("usesys" | "usesystem" | "use_sys" | "use_system"
-            | "use-sys" | "use-system") => QueryStrategy::UseSys,
+        Some(
+            "useip4" | "useipv4" | "use_ip4" | "use_ipv4" | "use_ip_v4" | "use-ip4" | "use-ipv4"
+            | "use-ip-v4",
+        ) => QueryStrategy::UseIp4,
+        Some(
+            "useip6" | "useipv6" | "use_ip6" | "use_ipv6" | "use_ip_v6" | "use-ip6" | "use-ipv6"
+            | "use-ip-v6",
+        ) => QueryStrategy::UseIp6,
+        Some("usesys" | "usesystem" | "use_sys" | "use_system" | "use-sys" | "use-system") => {
+            QueryStrategy::UseSys
+        },
         Some("useip" | "use_ip" | "use-ip") => QueryStrategy::UseIp,
         _ => QueryStrategy::UseIp,
     }
@@ -306,7 +306,7 @@ fn parse_client_ip(s: Option<&str>) -> Result<Vec<u8>, DnsError> {
                 IpAddr::V4(v4) => v4.octets().to_vec(),
                 IpAddr::V6(v6) => v6.octets().to_vec(),
             })
-        }
+        },
     }
 }
 
@@ -362,8 +362,7 @@ fn build_client(
     // expectedIPs 为空时回填 expectIPs（Go dns.go:94-96，policy key 同读回填值）。
     // Go infra/conf/dns.go:98-116："*" 哨兵剥离并推导 actPrior/actUnprior
     // （此前 "*" 不剥离，混合列表变硬过滤且优先/降级语义丢失）。
-    let (expected_entries, star_prior) =
-        strip_star_sentinel(effective_expected_ips(ns));
+    let (expected_entries, star_prior) = strip_star_sentinel(effective_expected_ips(ns));
     let (unexpected_entries, star_unprior) =
         strip_star_sentinel(ns.unexpected_ips.as_deref().unwrap_or(&[]));
     let expected_ip_rules = parse_ns_ip_rules(&expected_entries, datadir)?;
@@ -403,11 +402,7 @@ fn build_client(
 fn effective_expected_ips(ns: &NameServerJson) -> &[String] {
     const EMPTY: &[String] = &[];
     let expected = ns.expected_ips.as_deref().unwrap_or(EMPTY);
-    if expected.is_empty() {
-        ns.expect_ips.as_deref().unwrap_or(EMPTY)
-    } else {
-        expected
-    }
+    if expected.is_empty() { ns.expect_ips.as_deref().unwrap_or(EMPTY) } else { expected }
 }
 
 /// Go infra/conf/dns.go:98-116：列表中 `"*"` 哨兵剥离，返回（剥离后列表, 是否含 *）。
@@ -454,7 +449,7 @@ fn policy_key(ns: &NameServerJson) -> String {
             sb.push_str("client=");
             sb.push_str(&canon);
             sb.push('|');
-        }
+        },
         None => sb.push_str("client=none|"),
     }
     sb.push_str(if ns.skip_fallback { "skip=1|" } else { "skip=0|" });
@@ -479,8 +474,8 @@ fn resolve_asset_dir() -> std::path::PathBuf {
 }
 
 /// 本地域 TLD + 无点域名规则（Go `localTLDsAndDotlessDomainsRules`，app/dns/config.go）。
-fn local_tlds_and_dotless_rules()
--> Vec<(xray_geodata::matcher::domain::DomainType, &'static str)> {
+fn local_tlds_and_dotless_rules() -> Vec<(xray_geodata::matcher::domain::DomainType, &'static str)>
+{
     use xray_geodata::matcher::domain::DomainType;
     vec![
         (DomainType::Regex, "^[^.]+$"),
@@ -505,8 +500,7 @@ fn parse_domain_rule_entries(
     datadir: &std::path::Path,
     loader: &xray_geodata::loader::GeoDataLoader,
 ) -> Result<Vec<(xray_geodata::matcher::domain::DomainType, String)>, DnsError> {
-    use xray_geodata::matcher::domain::DomainType;
-    use xray_geodata::pb::domain_rule::Value as DV;
+    use xray_geodata::{matcher::domain::DomainType, pb::domain_rule::Value as DV};
 
     let pb_rule = xray_geodata::rule_parser::parse_domain_rule(s, default_type, datadir)
         .map_err(|e| DnsError::Features(xray_features::dns::DnsError::Other(e.to_string())))?;
@@ -524,19 +518,15 @@ fn parse_domain_rule_entries(
         DV::Custom(d) => Ok(vec![(to_matcher_type(d.r#type)?, d.value)]),
         DV::Geosite(g) => {
             let file = if g.file.is_empty() { "geosite.dat" } else { &g.file };
-            let site = loader
-                .load_site_with_attrs(file, &g.code, &g.attrs)
-                .map_err(|e| {
-                    DnsError::Features(xray_features::dns::DnsError::Other(e.to_string()))
-                })?;
+            let site = loader.load_site_with_attrs(file, &g.code, &g.attrs).map_err(|e| {
+                DnsError::Features(xray_features::dns::DnsError::Other(e.to_string()))
+            })?;
             Ok(site
                 .domain
                 .into_iter()
-                .filter_map(|d| {
-                    Some((to_matcher_type(d.r#type).ok()?, d.value))
-                })
+                .filter_map(|d| Some((to_matcher_type(d.r#type).ok()?, d.value)))
                 .collect())
-        }
+        },
     }
 }
 
@@ -567,15 +557,11 @@ fn parse_ns_ip_rules(
 
     let mut out = Vec::with_capacity(rules.len());
     for s in rules {
-        let r = xray_geodata::rule_parser::parse_ip_rules(
-            &[s.clone()],
-            datadir,
-        )
-        .map_err(|e| {
-            DnsError::Features(xray_features::dns::DnsError::Other(e.to_string()))
-        })?;
+        let r = xray_geodata::rule_parser::parse_ip_rules(&[s.clone()], datadir)
+            .map_err(|e| DnsError::Features(xray_features::dns::DnsError::Other(e.to_string())))?;
         for rule in r {
-            // geoip 条目展开为 Custom CIDR 列表（build_optimized_ip_matcher 的 geoip 分支为空 stub）。
+            // geoip 条目展开为 Custom CIDR 列表（build_optimized_ip_matcher 的 geoip 分支为空
+            // stub）。
             if let Some(IV::Geoip(g)) = rule.value.as_ref() {
                 let file = if g.file.is_empty() { "geoip.dat" } else { &g.file };
                 let loader = xray_geodata::loader::GeoDataLoader::new(datadir.to_path_buf());
@@ -634,7 +620,6 @@ fn parse_hosts(
     Ok(mappings)
 }
 
-
 /// 解析单个 host value：返回 (IP 列表, 域名重定向)。两者互斥（非 IP 串视为重定向）。
 fn parse_host_value(v: &serde_json::Value) -> (Vec<IpAddr>, String) {
     match v {
@@ -651,7 +636,7 @@ fn parse_host_value(v: &serde_json::Value) -> (Vec<IpAddr>, String) {
                 }
             }
             (ips, String::new())
-        }
+        },
         _ => (Vec::new(), String::new()),
     }
 }
@@ -861,17 +846,9 @@ mod tests {
         }"#;
         let ns: NameServerJson = serde_json::from_str(json).unwrap();
         let datadir = std::path::Path::new("");
-        let client: Client = build_client(
-            &ns,
-            &[],
-            crate::config::IpOption::all(),
-            datadir,
-            0,
-            false,
-            false,
-            0,
-        )
-        .unwrap();
+        let client: Client =
+            build_client(&ns, &[], crate::config::IpOption::all(), datadir, 0, false, false, 0)
+                .unwrap();
 
         // Client 公开字段。
         assert_eq!(client.policy_id, 7);
@@ -916,10 +893,7 @@ mod tests {
 
         // per-NS 显式 false 覆盖全局 true。
         let overridden = mk(r#"{ "address": "1.1.1.1", "serveStale": false }"#);
-        assert!(
-            !overridden.server.is_serve_stale(),
-            "per-NS serveStale=false 应覆盖全局 true"
-        );
+        assert!(!overridden.server.is_serve_stale(), "per-NS serveStale=false 应覆盖全局 true");
     }
 
     /// disableCache 全局→per-NS 合并（Go app/dns/dns.go:127-130）：全局缺省
@@ -944,17 +918,11 @@ mod tests {
 
         // 无 per-NS 配置 → 继承全局 disableCache=true。
         let inherited = mk(r#"{ "address": "1.1.1.1" }"#);
-        assert!(
-            inherited.server.is_disable_cache(),
-            "无 per-NS 配置应继承全局 disableCache"
-        );
+        assert!(inherited.server.is_disable_cache(), "无 per-NS 配置应继承全局 disableCache");
 
         // per-NS 显式 false 覆盖全局 true。
         let overridden = mk(r#"{ "address": "1.1.1.1", "disableCache": false }"#);
-        assert!(
-            !overridden.server.is_disable_cache(),
-            "per-NS disableCache=false 应覆盖全局 true"
-        );
+        assert!(!overridden.server.is_disable_cache(), "per-NS disableCache=false 应覆盖全局 true");
     }
 
     /// 8kha：构建 DNS 配置并返回各 client 的 policy_id（按 servers 顺序）。
@@ -1042,8 +1010,8 @@ mod tests {
     // （infra/conf/dns.go:381-394）。覆盖 useip/ipv4/ipv6/sys 全部分隔形式。
     #[test]
     fn query_strategy_aliases_match_go_resolve_query_strategy() {
-        use crate::config::QueryStrategy;
         use super::parse_query_strategy;
+        use crate::config::QueryStrategy;
         assert_eq!(parse_query_strategy(Some("UseIp")), QueryStrategy::UseIp);
         assert_eq!(parse_query_strategy(Some("use_ip")), QueryStrategy::UseIp);
         assert_eq!(parse_query_strategy(Some("use-ip")), QueryStrategy::UseIp);

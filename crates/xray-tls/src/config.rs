@@ -48,7 +48,7 @@ pub enum CurveId {
 ///
 /// # 示例
 /// ```
-/// use xray_tls::config::{parse_curve_name, CurveId};
+/// use xray_tls::config::{CurveId, parse_curve_name};
 /// assert_eq!(parse_curve_name("curvep256"), Some(CurveId::P256));
 /// assert_eq!(parse_curve_name("X25519"), Some(CurveId::X25519));
 /// assert_eq!(parse_curve_name("unknown"), None);
@@ -108,10 +108,10 @@ pub enum VerifyResult {
 /// 对应 Go `verifyChain(certs, pinnedPeerCertSha256)`。
 ///
 /// # 算法
-/// 1. 计算叶子证书（`certs[0]`）的 SHA-256，与 pinned hashes 在恒等时间内比对。
-///    命中 → 返回 `(FoundLeaf, None)`。
-/// 2. 遍历中间证书（`certs[1..]`），命中任一 pinned hash 且该证书 `is_ca=true` 时
-///    返回 `(FoundCa, Some(cert_index))`。
+/// 1. 计算叶子证书（`certs[0]`）的 SHA-256，与 pinned hashes 在恒等时间内比对。 命中 → 返回
+///    `(FoundLeaf, None)`。
+/// 2. 遍历中间证书（`certs[1..]`），命中任一 pinned hash 且该证书 `is_ca=true` 时 返回 `(FoundCa,
+///    Some(cert_index))`。
 /// 3. 未命中返回 `(CertNotFound, None)`。
 ///
 /// # 参数
@@ -144,11 +144,7 @@ pub fn verify_chain(
     }
 
     // 中间证书匹配（需同时是 CA）
-    for (idx, (hash, is_ca)) in cert_hashes[1..]
-        .iter()
-        .zip(cert_is_ca[1..].iter())
-        .enumerate()
-    {
+    for (idx, (hash, is_ca)) in cert_hashes[1..].iter().zip(cert_is_ca[1..].iter()).enumerate() {
         // 注意：原始索引 = idx + 1（跳过叶子）
         let original_idx = idx + 1;
         if !*is_ca {
@@ -245,9 +241,10 @@ pub struct RandCarrier {
 
 use std::sync::Arc as StdArc;
 
-use rustls::SupportedCipherSuite;
-use rustls::SupportedProtocolVersion;
-use rustls::version::{TLS12, TLS13};
+use rustls::{
+    SupportedCipherSuite, SupportedProtocolVersion,
+    version::{TLS12, TLS13},
+};
 
 /// Go `tls.CipherSuites()` 套件名 → rustls ring provider suite。
 ///
@@ -262,22 +259,22 @@ fn go_cipher_suite(name: &str) -> Option<SupportedCipherSuite> {
         "TLS_CHACHA20_POLY1305_SHA256" => ring_suites::TLS13_CHACHA20_POLY1305_SHA256,
         "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" => {
             ring_suites::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
-        }
+        },
         "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => {
             ring_suites::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
-        }
+        },
         "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256" => {
             ring_suites::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
-        }
+        },
         "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => {
             ring_suites::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
-        }
+        },
         "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => {
             ring_suites::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
-        }
+        },
         "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" => {
             ring_suites::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
-        }
+        },
         _ => return None,
     })
 }
@@ -313,7 +310,7 @@ fn json_string_list(json: &serde_json::Value, key: &str) -> Vec<String> {
         Some(serde_json::Value::String(s)) => vec![s.clone()],
         Some(serde_json::Value::Array(items)) => {
             items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()
-        }
+        },
         _ => Vec::new(),
     }
 }
@@ -323,10 +320,10 @@ fn json_string_list(json: &serde_json::Value, key: &str) -> Vec<String> {
 ///
 /// 对应 Go `GetTLSConfig` L418-458。rustls 能力边界（一律 tracing warn，不 panic、
 /// 不静默假装生效、不硬塞）：
-/// - **TLS 1.0/1.1**：rustls 已移除（仅 1.2/1.3）→ Unsupported warn；
-///   minVersion 钳到 1.2，maxVersion < 1.2 时无可用版本 → 回落默认 [1.3, 1.2]。
-/// - **curvep521 / x25519mlkem768 / secp256r1mlkem768 / secp384r1mlkem1024**：
-///   ring provider 无对应 kx 组（aws-lc 才有）→ Unsupported warn 跳过。
+/// - **TLS 1.0/1.1**：rustls 已移除（仅 1.2/1.3）→ Unsupported warn； minVersion 钳到
+///   1.2，maxVersion < 1.2 时无可用版本 → 回落默认 [1.3, 1.2]。
+/// - **curvep521 / x25519mlkem768 / secp256r1mlkem768 / secp384r1mlkem1024**： ring provider 无对应
+///   kx 组（aws-lc 才有）→ Unsupported warn 跳过。
 /// - **CBC / 非 ECDHE / RSA 密钥交换套件名**：rustls 永不支持 → warn 跳过。
 /// - 名字全不可用导致过滤结果为空 → 保留 provider 默认并 warn。
 ///
@@ -345,8 +342,11 @@ pub(crate) fn security_params(
                 match go_cipher_suite(name) {
                     Some(s) => suites.push(s),
                     None => {
-                        tracing::warn!(suite = name, "cipherSuites entry unsupported by rustls, skipped")
-                    }
+                        tracing::warn!(
+                            suite = name,
+                            "cipherSuites entry unsupported by rustls, skipped"
+                        )
+                    },
                 }
             }
             if suites.is_empty() {
@@ -367,10 +367,13 @@ pub(crate) fn security_params(
                     if !wanted.contains(&group) {
                         wanted.push(group);
                     }
-                }
+                },
                 Some(None) => {
-                    tracing::warn!(curve = curve.as_str(), "curve unsupported by rustls ring provider, skipped")
-                }
+                    tracing::warn!(
+                        curve = curve.as_str(),
+                        "curve unsupported by rustls ring provider, skipped"
+                    )
+                },
                 None => tracing::warn!(curve = curve.as_str(), "unsupported curve name, skipped"),
             }
         }
@@ -390,7 +393,7 @@ pub(crate) fn security_params(
         Some(10) | Some(11) => {
             tracing::warn!("TLS 1.0/1.1 unsupported by rustls, clamping minVersion to 1.2");
             12
-        }
+        },
         Some(v) => v,
         None => 12,
     };
@@ -426,18 +429,9 @@ mod tests {
         assert_eq!(parse_curve_name("curvep384"), Some(CurveId::P384));
         assert_eq!(parse_curve_name("curvep521"), Some(CurveId::P521));
         assert_eq!(parse_curve_name("x25519"), Some(CurveId::X25519));
-        assert_eq!(
-            parse_curve_name("x25519mlkem768"),
-            Some(CurveId::X25519Mlkem768)
-        );
-        assert_eq!(
-            parse_curve_name("secp256r1mlkem768"),
-            Some(CurveId::SecP256r1Mlkem768)
-        );
-        assert_eq!(
-            parse_curve_name("secp384r1mlkem1024"),
-            Some(CurveId::SecP384r1Mlkem1024)
-        );
+        assert_eq!(parse_curve_name("x25519mlkem768"), Some(CurveId::X25519Mlkem768));
+        assert_eq!(parse_curve_name("secp256r1mlkem768"), Some(CurveId::SecP256r1Mlkem768));
+        assert_eq!(parse_curve_name("secp384r1mlkem1024"), Some(CurveId::SecP384r1Mlkem1024));
     }
 
     #[test]
@@ -494,11 +488,7 @@ mod tests {
         let root = hash_of(b"root");
         let pinned = vec![intermediate.clone()];
         // is_ca: leaf=false, intermediate=true, root=true
-        let result = verify_chain(
-            &[leaf, intermediate, root],
-            &[false, true, true],
-            &pinned,
-        );
+        let result = verify_chain(&[leaf, intermediate, root], &[false, true, true], &pinned);
         // 中间证书 index=1
         assert_eq!(result, (VerifyResult::FoundCa, Some(1)));
     }

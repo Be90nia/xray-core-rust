@@ -10,9 +10,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::encoding::server::{ServerSession, SessionHistory};
-use crate::error::{Result, VmessError};
-use crate::validator::{MemoryUser, TimedUserValidator};
+use crate::{
+    encoding::server::{ServerSession, SessionHistory},
+    error::{Result, VmessError},
+    validator::{MemoryUser, TimedUserValidator},
+};
 
 /// Inbound 处理器主入口 trait（对应 Go `inbound.Handler.Process`）。
 ///
@@ -42,7 +44,9 @@ impl InboundProcessor for NoopInboundProcessor {
         _conn_reader: &mut (dyn AsyncRead + Unpin + Send),
         _conn_writer: &mut (dyn AsyncWrite + Unpin + Send),
     ) -> Result<()> {
-        Err(VmessError::NotImplemented("inbound process: requires transport::Link + dispatcher chain"))
+        Err(VmessError::NotImplemented(
+            "inbound process: requires transport::Link + dispatcher chain",
+        ))
     }
 }
 
@@ -61,15 +65,8 @@ pub struct InboundHandler {
 impl InboundHandler {
     /// 创建新 handler。
     #[must_use]
-    pub fn new(
-        validator: Arc<TimedUserValidator>,
-        session_history: Arc<SessionHistory>,
-    ) -> Self {
-        Self {
-            validator,
-            session_history,
-            processor: Arc::new(NoopInboundProcessor),
-        }
+    pub fn new(validator: Arc<TimedUserValidator>, session_history: Arc<SessionHistory>) -> Self {
+        Self { validator, session_history, processor: Arc::new(NoopInboundProcessor) }
     }
 
     /// 用自定义 processor 创建。
@@ -79,11 +76,7 @@ impl InboundHandler {
         session_history: Arc<SessionHistory>,
         processor: Arc<dyn InboundProcessor>,
     ) -> Self {
-        Self {
-            validator,
-            session_history,
-            processor,
-        }
+        Self { validator, session_history, processor }
     }
 
     /// 处理入站连接（异步）。
@@ -104,7 +97,10 @@ impl InboundHandler {
     /// # Errors
     ///
     /// 参见 [`ServerSession::decode_request_header_async`](crate::encoding::server::ServerSession::decode_request_header_async)。
-    pub async fn decode_request_header<R>(&self, reader: &mut R) -> Result<(xray_common::protocol::RequestHeader, MemoryUser)>
+    pub async fn decode_request_header<R>(
+        &self,
+        reader: &mut R,
+    ) -> Result<(xray_common::protocol::RequestHeader, MemoryUser)>
     where
         R: AsyncRead + Unpin,
     {

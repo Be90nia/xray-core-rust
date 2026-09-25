@@ -6,14 +6,17 @@
 
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 use xray_common::net::address::Address;
-use xray_proxy_trojan::config::MemoryAccount;
-use xray_proxy_trojan::protocol::{write_request_header, COMMAND_TCP, CRLF};
-use xray_proxy_trojan::server::trojan_server_handshake;
-use xray_proxy_trojan::validator::{MemoryUser, Validator};
+use xray_proxy_trojan::{
+    config::MemoryAccount,
+    protocol::{COMMAND_TCP, CRLF, write_request_header},
+    server::trojan_server_handshake,
+    validator::{MemoryUser, Validator},
+};
 
 /// 测试密码。
 const PASSWORD: &str = "test-password-123";

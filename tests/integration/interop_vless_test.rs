@@ -1,5 +1,4 @@
 //! VLESS Go<->Rust interop tests.
-//!
 // Test scenarios:
 // 1. Go VLESS server -> Rust VLESS client (wire-level protocol compat)
 // 2. Rust VLESS server -> Go VLESS client (via Go xray SOCKS5 inbound)
@@ -11,21 +10,27 @@ mod interop_helpers;
 
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-
 use interop_helpers::*;
-use xray_app_dispatcher::default::{DialBridge, SimpleOhm};
-use xray_app_dispatcher::DispatchHandler;
-use xray_common::net::address::Address;
-use xray_common::protocol::ID;
-use xray_common::uuid::UUID;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
+use xray_app_dispatcher::{
+    DispatchHandler,
+    default::{DialBridge, SimpleOhm},
+};
+use xray_common::{net::address::Address, protocol::ID, uuid::UUID};
 use xray_proxy_freedom::make_freedom_dial_fn;
-use xray_proxy_vless::account::MemoryAccount as VlessAccount;
-use xray_proxy_vless::encoding::client::{decode_response_header, encode_request_header};
-use xray_proxy_vless::encoding::{empty_addons, VlessCommand, VERSION};
-use xray_proxy_vless::validator::{MemoryUser as VlessUser, MemoryValidator, Validator as VlessValidatorTrait};
-use xray_proxy_vless::serve_vless;
+use xray_proxy_vless::{
+    account::MemoryAccount as VlessAccount,
+    encoding::{
+        VERSION, VlessCommand,
+        client::{decode_response_header, encode_request_header},
+        empty_addons,
+    },
+    serve_vless,
+    validator::{MemoryUser as VlessUser, MemoryValidator, Validator as VlessValidatorTrait},
+};
 
 // Fixed UUID for interop tests.
 const SAMPLE_UUID: &str = "a3482e88-686a-4a58-8126-99c9214826d7";
@@ -68,9 +73,7 @@ fn make_vless_validator() -> (Arc<MemoryValidator>, UUID) {
 #[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
 async fn go_vless_server_rust_client() {
     // Start HTTP echo server as target
-    let echo_port = spawn_http_echo_server()
-        .await
-        .expect("start http echo server");
+    let echo_port = spawn_http_echo_server().await.expect("start http echo server");
 
     // Configure Go xray: VLESS inbound + freedom outbound
     let vless_port: u16 = 20021;
@@ -78,15 +81,10 @@ async fn go_vless_server_rust_client() {
         inbounds: vec![vless_server_inbound(vless_port, SAMPLE_UUID)],
         outbounds: vec![freedom_outbound()],
     };
-    let config_path = write_config_to_temp(&config, "go-vless-server")
-        .expect("write config");
+    let config_path = write_config_to_temp(&config, "go-vless-server").expect("write config");
 
-    let mut go_proc = start_go_xray(&config_path)
-        .await
-        .expect("start Go xray");
-    wait_for_port(vless_port, 5000)
-        .await
-        .expect("Go VLESS port ready");
+    let mut go_proc = start_go_xray(&config_path).await.expect("start Go xray");
+    wait_for_port(vless_port, 5000).await.expect("Go VLESS port ready");
 
     // Rust VLESS client: connect to Go server, send data
     let result = rust_vless_client_connect(vless_port, echo_port).await;
@@ -99,10 +97,7 @@ async fn go_vless_server_rust_client() {
 }
 
 /// Rust VLESS client connects to Go VLESS server, sends HTTP request.
-async fn rust_vless_client_connect(
-    server_port: u16,
-    echo_port: u16,
-) -> std::io::Result<()> {
+async fn rust_vless_client_connect(server_port: u16, echo_port: u16) -> std::io::Result<()> {
     let uuid = UUID::parse(SAMPLE_UUID).ok_or_else(|| std::io::Error::other("invalid UUID"))?;
 
     let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{server_port}")).await?;
@@ -155,7 +150,7 @@ async fn rust_vless_client_connect(
                     break;
                 }
                 return Err(e);
-            }
+            },
         }
     }
 
@@ -175,9 +170,7 @@ async fn rust_vless_client_connect(
 #[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
 async fn rust_vless_server_go_client() {
     // Start HTTP echo server as target
-    let echo_port = spawn_http_echo_server()
-        .await
-        .expect("start http echo server");
+    let echo_port = spawn_http_echo_server().await.expect("start http echo server");
 
     // Start Rust VLESS server
     let ohm = make_vless_ohm();
@@ -196,27 +189,14 @@ async fn rust_vless_server_go_client() {
         inbounds: vec![socks5_inbound(socks_port)],
         outbounds: vec![vless_outbound(rust_vless_port, SAMPLE_UUID)],
     };
-    let config_path = write_config_to_temp(&config, "go-vless-client")
-        .expect("write config");
+    let config_path = write_config_to_temp(&config, "go-vless-client").expect("write config");
 
-    let mut go_proc = start_go_xray(&config_path)
-        .await
-        .expect("start Go xray");
-    wait_for_port(socks_port, 5000)
-        .await
-        .expect("Go SOCKS5 port ready");
+    let mut go_proc = start_go_xray(&config_path).await.expect("start Go xray");
+    wait_for_port(socks_port, 5000).await.expect("Go SOCKS5 port ready");
 
     // Send HTTP request through Go SOCKS5 -> Go VLESS -> Rust VLESS -> freedom -> echo
-    let proxy_addr = format!("127.0.0.1:{socks_port}")
-        .parse()
-        .expect("parse addr");
-    let result = http_get_via_socks5(
-        proxy_addr,
-        "127.0.0.1",
-        echo_port,
-        "/interop",
-    )
-    .await;
+    let proxy_addr = format!("127.0.0.1:{socks_port}").parse().expect("parse addr");
+    let result = http_get_via_socks5(proxy_addr, "127.0.0.1", echo_port, "/interop").await;
 
     // Cleanup
     let _ = go_proc.kill().await;

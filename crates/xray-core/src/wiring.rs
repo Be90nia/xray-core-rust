@@ -11,35 +11,37 @@
 //! router 端 `get_vless_route() -> Port`。适配时用 `Port::new(0)` 占位
 //! （VLESS 路由 ID 当前 dispatcher 路径未填充）。
 
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
+use std::{future::Future, net::IpAddr, path::Path, pin::Pin, sync::Arc};
 
-use xray_app_dispatcher::default::{
-    AccessContext, DefaultDispatcher, DispatcherContext, ExcludeDomainMatcher,
-    ExcludeIpMatcher, Route as DispRoute, RoutingContext as DispRoutingContext,
-    RoutingRouter, SimpleOhm, SniffingRequest,
+use xray_app_dispatcher::{
+    DispatchHandler, DispatcherError,
+    default::{
+        AccessContext, DefaultDispatcher, DispatcherContext, ExcludeDomainMatcher,
+        ExcludeIpMatcher, Route as DispRoute, RoutingContext as DispRoutingContext, RoutingRouter,
+        SimpleOhm, SniffingRequest,
+    },
+    maybe_wrap_reader, maybe_wrap_writer,
 };
-use xray_app_dispatcher::{maybe_wrap_reader, maybe_wrap_writer, DispatchHandler, DispatcherError};
+use xray_app_router::{
+    Router,
+    balancing::{NotImplementedSelector, ObservationProvider, OutboundHandlerSelector},
+    context::RoutingData as RouterRoutingData,
+    error::RouterError,
+};
+use xray_common::net::{address::Address, destination::Destination, port::Port};
+use xray_geodata::{
+    loader::GeoDataLoader,
+    matcher::{
+        AnyMatcher, LinearAnyMatcher,
+        domain::{self as geodata_domain, parse_domain as parse_geodata_domain},
+        ip::{GeneralMultiIPMatcher, HeuristicIPMatcher, IPMatcher as GeoIpMatcher},
+    },
+    pb::{domain_rule::Value as DomainRuleValue, ip_rule::Value as IpRuleValue},
+    rule_parser::{parse_domain_rule, parse_ip_rules},
+};
 use xray_mux::client::MUX_COOL_ADDRESS;
 use xray_proto::xray::common::geodata::CidrRule;
-use xray_app_router::balancing::{NotImplementedSelector, ObservationProvider, OutboundHandlerSelector};
-use xray_app_router::context::RoutingData as RouterRoutingData;
-use xray_app_router::error::RouterError;
-use xray_app_router::Router;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::port::Port;
 use xray_transport::link::Link;
-use std::net::IpAddr;
-use std::path::Path;
-use xray_geodata::loader::GeoDataLoader;
-use xray_geodata::matcher::domain::{self as geodata_domain, parse_domain as parse_geodata_domain};
-use xray_geodata::matcher::ip::{GeneralMultiIPMatcher, HeuristicIPMatcher, IPMatcher as GeoIpMatcher};
-use xray_geodata::matcher::{AnyMatcher, LinearAnyMatcher};
-use xray_geodata::pb::domain_rule::Value as DomainRuleValue;
-use xray_geodata::pb::ip_rule::Value as IpRuleValue;
-use xray_geodata::rule_parser::{parse_domain_rule, parse_ip_rules};
 
 use crate::router::DispatchRouter;
 
@@ -67,9 +69,7 @@ impl RouterAdapter {
 
 impl std::fmt::Debug for RouterAdapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RouterAdapter")
-            .field("rules", &self.router.list_rules())
-            .finish()
+        f.debug_struct("RouterAdapter").field("rules", &self.router.list_rules()).finish()
     }
 }
 
@@ -101,11 +101,11 @@ fn bridge_context(ctx: &dyn DispRoutingContext) -> RouterRoutingData {
             Some(ip) => {
                 data.target_ips = vec![ip];
                 data.target_domain.clear();
-            }
+            },
             None => {
                 data.target_domain = rt.address().as_domain().unwrap_or("").to_string();
                 data.target_ips.clear();
-            }
+            },
         }
         data.target_port = rt.port();
     }
@@ -123,16 +123,12 @@ fn map_router_err(e: RouterError) -> DispatcherError {
     }
 }
 impl RoutingRouter for RouterAdapter {
-    fn pick_route(
-        &self,
-        ctx: &dyn DispRoutingContext,
-    ) -> Result<DispRoute, DispatcherError> {
+    fn pick_route(&self, ctx: &dyn DispRoutingContext) -> Result<DispRoute, DispatcherError> {
         let data = bridge_context(ctx);
         match self.router.pick_route(&data) {
-            Ok(route) => Ok(DispRoute {
-                outbound_tag: route.outbound_tag,
-                rule_tag: route.rule_tag,
-            }),
+            Ok(route) => {
+                Ok(DispRoute { outbound_tag: route.outbound_tag, rule_tag: route.rule_tag })
+            },
             Err(e) => Err(map_router_err(e)),
         }
     }
@@ -143,14 +139,14 @@ impl RoutingRouter for RouterAdapter {
     fn pick_route_resolved<'a>(
         &'a self,
         ctx: &'a dyn DispRoutingContext,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<DispRoute, DispatcherError>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<DispRoute, DispatcherError>> + Send + 'a>>
+    {
         Box::pin(async move {
             let mut data = bridge_context(ctx);
             match self.router.pick_route_resolved(&mut data).await {
-                Ok(route) => Ok(DispRoute {
-                    outbound_tag: route.outbound_tag,
-                    rule_tag: route.rule_tag,
-                }),
+                Ok(route) => {
+                    Ok(DispRoute { outbound_tag: route.outbound_tag, rule_tag: route.rule_tag })
+                },
                 Err(e) => Err(map_router_err(e)),
             }
         })
@@ -190,9 +186,8 @@ impl DispatchRouter for RouterAdapter {
 
 /// 从 `Destination` 构造 router 端 `RoutingData`（仅目标地址/端口/网络）。
 fn dest_to_routing_data(dest: &Destination) -> RouterRoutingData {
-    let mut data = RouterRoutingData::new()
-        .with_target_port(dest.port())
-        .with_network(dest.network());
+    let mut data =
+        RouterRoutingData::new().with_target_port(dest.port()).with_network(dest.network());
     match dest.address() {
         Address::IPv4(ip) => data = data.with_target_ip(std::net::IpAddr::V4(*ip)),
         Address::IPv6(ip) => data = data.with_target_ip(std::net::IpAddr::V6(*ip)),
@@ -246,7 +241,8 @@ impl RoutingRouter for DispatchRouterBridge {
     fn pick_route_resolved<'a>(
         &'a self,
         ctx: &'a dyn DispRoutingContext,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<DispRoute, DispatcherError>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<DispRoute, DispatcherError>> + Send + 'a>>
+    {
         Box::pin(async move {
             let dest = ctx_target_dest(ctx);
             match self.inner.pick_outbound_tag_resolved(&dest).await {
@@ -274,13 +270,9 @@ pub fn sniffing_request_from_json(v: Option<&serde_json::Value>) -> SniffingRequ
 
 /// 同 [`sniffing_request_from_json`]，geodata 资产目录显式给定
 /// （geoip:/geosite: 展开用；测试注入）。
-fn sniffing_request_from_json_in(
-    v: Option<&serde_json::Value>,
-    datadir: &Path,
-) -> SniffingRequest {
-    let Some(cfg) = v
-        .cloned()
-        .and_then(|v| serde_json::from_value::<xray_conf::SniffingConfig>(v).ok())
+fn sniffing_request_from_json_in(v: Option<&serde_json::Value>, datadir: &Path) -> SniffingRequest {
+    let Some(cfg) =
+        v.cloned().and_then(|v| serde_json::from_value::<xray_conf::SniffingConfig>(v).ok())
     else {
         return SniffingRequest::default();
     };
@@ -330,12 +322,8 @@ fn add_proto_domain(
     let Some(dt) = proto_domain_type_to_matcher(d.r#type) else {
         return Err(format!("unknown domain type {}", d.r#type));
     };
-    let m = parse_geodata_domain(&geodata_domain::DomainRule::new(
-        dt,
-        d.value.clone(),
-        rule_id,
-    ))
-    .map_err(|e| e.to_string())?;
+    let m = parse_geodata_domain(&geodata_domain::DomainRule::new(dt, d.value.clone(), rule_id))
+        .map_err(|e| e.to_string())?;
     any.add(m);
     Ok(())
 }
@@ -362,7 +350,7 @@ fn build_domain_excluder(rules: &[String], datadir: &Path) -> Option<Arc<Exclude
                 tracing::warn!(target: "xray_core",
                     "sniffing domainsExcluded {raw:?} 解析失败，跳过: {e}");
                 continue;
-            }
+            },
         };
         match rule.value {
             Some(DomainRuleValue::Custom(d)) => match add_proto_domain(&mut any, added + 1, &d) {
@@ -383,7 +371,7 @@ fn build_domain_excluder(rules: &[String], datadir: &Path) -> Option<Arc<Exclude
                             "sniffing domainsExcluded {raw:?} 加载 {}:{} 失败，跳过: {e}",
                             gs.file, gs.code);
                         continue;
-                    }
+                    },
                 };
                 for d in &site.domain {
                     match add_proto_domain(&mut any, added + 1, d) {
@@ -392,8 +380,8 @@ fn build_domain_excluder(rules: &[String], datadir: &Path) -> Option<Arc<Exclude
                             "sniffing geosite {}:{} 条目编译失败，跳过: {e}", gs.file, gs.code),
                     }
                 }
-            }
-            None => {}
+            },
+            None => {},
         }
     }
     if added == 0 {
@@ -422,7 +410,7 @@ fn build_ip_excluder(rules: &[String], datadir: &Path) -> Option<Arc<ExcludeIpMa
                 tracing::warn!(target: "xray_core",
                     "sniffing ipsExcluded {raw:?} 解析失败，跳过: {e}");
                 continue;
-            }
+            },
         };
         match rule.value {
             Some(IpRuleValue::Custom(cr)) => {
@@ -433,7 +421,7 @@ fn build_ip_excluder(rules: &[String], datadir: &Path) -> Option<Arc<ExcludeIpMa
                     }
                     matchers.push(Box::new(m));
                 }
-            }
+            },
             Some(IpRuleValue::Geoip(gr)) => match loader.load_ip(&gr.file, &gr.code) {
                 Ok(geoip) => {
                     let mut m = HeuristicIPMatcher::from_cidrs(&geoip.cidr);
@@ -441,12 +429,12 @@ fn build_ip_excluder(rules: &[String], datadir: &Path) -> Option<Arc<ExcludeIpMa
                         m.set_reverse(true);
                     }
                     matchers.push(Box::new(m));
-                }
+                },
                 Err(e) => tracing::warn!(target: "xray_core",
                     "sniffing ipsExcluded {raw:?} 加载 {}:{} 失败，跳过: {e}",
                     gr.file, gr.code),
             },
-            None => {}
+            None => {},
         }
     }
     if matchers.is_empty() {
@@ -504,9 +492,7 @@ fn is_mux_carrier(dest: &Destination) -> bool {
 
 impl std::fmt::Debug for MuxCarrierHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MuxCarrierHandler")
-            .field("tag", &self.inner.tag())
-            .finish()
+        f.debug_struct("MuxCarrierHandler").field("tag", &self.inner.tag()).finish()
     }
 }
 
@@ -537,8 +523,8 @@ impl DispatchHandler for MuxCarrierHandler {
 ///
 /// 对应 Go inbound → `dispatcher.Dispatch` 入口。每个 inbound 一个实例：
 /// - 持该 inbound 的 sniffing 配置（首包嗅探 + dest 覆盖 + 回灌在 dispatch_link 内）
-/// - 包 inbound counter（`inbound>>>{tag}>>>traffic>>>{uplink,downlink}`）：
-///   uplink = inbound 写（link.writer），downlink = inbound 读（link.reader）
+/// - 包 inbound counter（`inbound>>>{tag}>>>traffic>>>{uplink,downlink}`）： uplink = inbound
+///   写（link.writer），downlink = inbound 读（link.reader）
 pub struct InboundDispatchHandler {
     dispatcher: Arc<DefaultDispatcher>,
     sniff: SniffingRequest,
@@ -548,11 +534,7 @@ pub struct InboundDispatchHandler {
 impl InboundDispatchHandler {
     #[must_use]
     pub fn new(dispatcher: Arc<DefaultDispatcher>, sniff: SniffingRequest, tag: &str) -> Self {
-        Self {
-            dispatcher,
-            sniff,
-            tag: tag.to_string(),
-        }
+        Self { dispatcher, sniff, tag: tag.to_string() }
     }
 
     /// 懒注册并取该 inbound 的方向 counter。
@@ -560,17 +542,12 @@ impl InboundDispatchHandler {
     /// sm80①：受 `ForSystem().Stats.Inbound{Uplink,Downlink}` 门控（Go
     /// proxyman/inbound/always.go:26,34——tag 计数与 per-user 计数的门不同，
     /// 后者才用 `ForLevel().Stats.User*`）。门关时不懒注册，默认全 false 不计数。
-    fn inbound_counter(
-        &self,
-        direction: &str,
-    ) -> Option<Arc<dyn xray_features::stats::Counter>> {
+    fn inbound_counter(&self, direction: &str) -> Option<Arc<dyn xray_features::stats::Counter>> {
         let sys = self
             .dispatcher
             .policy_manager
             .as_ref()
-            .map_or_else(xray_features::policy::SystemStats::default, |pm| {
-                pm.for_system()
-            });
+            .map_or_else(xray_features::policy::SystemStats::default, |pm| pm.for_system());
         let enabled = match direction {
             "uplink" => sys.inbound_uplink,
             "downlink" => sys.inbound_downlink,
@@ -611,10 +588,7 @@ impl DispatchHandler for InboundDispatchHandler {
         // UDP relay（socks/dokodemo/ss）无协议层 access（from/email 留空），
         // 但 inbound_tag 必须补齐——否则 router 的 inboundTag 规则永不命中
         // （Go UDP dispatch 的 ctx 同样携带 inbound 信息）。
-        let access = AccessContext {
-            inbound_tag: self.tag.clone(),
-            ..Default::default()
-        };
+        let access = AccessContext { inbound_tag: self.tag.clone(), ..Default::default() };
         self.dispatch_internal(dest, link, Some(access))
     }
 
@@ -626,10 +600,7 @@ impl DispatchHandler for InboundDispatchHandler {
         link: Link,
         access: AccessContext,
     ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
-        let access = AccessContext {
-            inbound_tag: self.tag.clone(),
-            ..access
-        };
+        let access = AccessContext { inbound_tag: self.tag.clone(), ..access };
         self.dispatch_internal(dest, link, Some(access))
     }
 }
@@ -656,12 +627,9 @@ impl InboundDispatchHandler {
         let reader = maybe_wrap_reader(self.inbound_counter("uplink"), link.reader);
         let writer = maybe_wrap_writer(self.inbound_counter("downlink"), link.writer);
         let link = Link::new(reader, writer);
-        // dispatch_link 内部 spawn（sniffing → routing → access log → outbound counter → handler），
-        // 此处仅同步返回。
-        if let Err(e) = self
-            .dispatcher
-            .dispatch_link(dest, link, &self.sniff, access, None)
-        {
+        // dispatch_link 内部 spawn（sniffing → routing → access log → outbound counter →
+        // handler）， 此处仅同步返回。
+        if let Err(e) = self.dispatcher.dispatch_link(dest, link, &self.sniff, access, None) {
             tracing::warn!(tag = %self.tag, error = %e, "dispatch_link failed");
         }
         Box::pin(std::future::ready(()))
@@ -761,9 +729,7 @@ fn build_adapter(
     ohm: Arc<dyn OutboundHandlerSelector>,
     observer: Option<Arc<dyn ObservationProvider>>,
 ) -> Result<Arc<RouterAdapter>, WiringError> {
-    let geo_loader = Some(Arc::new(xray_geodata::loader::GeoDataLoader::new(
-        resolve_asset_dir(),
-    )));
+    let geo_loader = Some(Arc::new(xray_geodata::loader::GeoDataLoader::new(resolve_asset_dir())));
     let router = Router::init(&config, ohm, observer, geo_loader)
         .map_err(|e| WiringError::RouterInit(e.to_string()))?;
     Ok(Arc::new(RouterAdapter::new(router)))
@@ -794,11 +760,10 @@ fn parse_routing_json_to_proto_in(
     datadir: &std::path::Path,
 ) -> Result<xray_proto::xray::app::router::Config, WiringError> {
     use prost::Message;
-    use xray_proto::xray::app::router::routing_rule::TargetTag;
-    use xray_proto::xray::app::router::{BalancingRule, RoutingRule};
-    use xray_proto::xray::common::geodata::{Domain, DomainRule};
-    use xray_proto::xray::common::geodata::domain::Type as DT;
-    use xray_proto::xray::common::geodata::domain_rule::Value as DV;
+    use xray_proto::xray::{
+        app::router::{BalancingRule, RoutingRule, routing_rule::TargetTag},
+        common::geodata::{Domain, DomainRule, domain::Type as DT, domain_rule::Value as DV},
+    };
 
     let v: serde_json::Value =
         serde_json::from_slice(json).map_err(|e| WiringError::JsonParse(e.to_string()))?;
@@ -851,9 +816,7 @@ fn parse_routing_json_to_proto_in(
                     xray_geodata::geosite::DomainType::Substr,
                     datadir,
                 )
-                .map_err(|e| {
-                    WiringError::JsonParse(format!("routing rule domain '{d}': {e}"))
-                })?;
+                .map_err(|e| WiringError::JsonParse(format!("routing rule domain '{d}': {e}")))?;
                 domains.push(geodata_domain_rule_to_proto(pb_rule));
             }
             for d in json_str_iter(r.get("domainSuffix")) {
@@ -888,11 +851,9 @@ fn parse_routing_json_to_proto_in(
             // `!` 反向）。解析失败硬错——旧实现 geoip:/非法 CIDR 静默跳过（安全
             // 屏蔽规则失效的根因）。
             let mut ips = Vec::new();
-            for p in xray_geodata::rule_parser::parse_ip_rules(
-                &json_string_list(r.get("ip")),
-                datadir,
-            )
-            .map_err(|e| WiringError::JsonParse(format!("routing rule ip: {e}")))?
+            for p in
+                xray_geodata::rule_parser::parse_ip_rules(&json_string_list(r.get("ip")), datadir)
+                    .map_err(|e| WiringError::JsonParse(format!("routing rule ip: {e}")))?
             {
                 ips.push(geodata_ip_rule_to_proto(p));
             }
@@ -919,7 +880,6 @@ fn parse_routing_json_to_proto_in(
             {
                 local_ips.push(geodata_ip_rule_to_proto(p));
             }
-
 
             cfg.rule.push(RoutingRule {
                 target_tag,
@@ -951,9 +911,11 @@ fn parse_routing_json_to_proto_in(
                 local_os: json_string_list(r.get("localOS")),
                 // 对齐 Go router.go:147 json 键 `attrs`（`attributes` 仅作
                 // Rust 旧方言别名保留）。
-                attributes: parse_attributes(
-                    if r.get("attrs").is_some() { r.get("attrs") } else { r.get("attributes") },
-                ),
+                attributes: parse_attributes(if r.get("attrs").is_some() {
+                    r.get("attrs")
+                } else {
+                    r.get("attributes")
+                }),
                 // 对齐 Go router.go:264-270：webhook → WebhookConfig。
                 webhook: r.get("webhook").and_then(parse_webhook_config),
                 ..Default::default()
@@ -984,19 +946,19 @@ fn parse_routing_json_to_proto_in(
                         }
                     });
                     (ty, settings)
-                }
+                },
                 _ => (String::new(), None),
             };
             // Go router.go:35-41：ToLower；""→random；仅 4 个合法值，未知拒启。
             strategy = strategy.to_ascii_lowercase();
             match strategy.as_str() {
                 "" => strategy = "random".to_string(),
-                "random" | "leastload" | "leastping" | "roundrobin" => {}
+                "random" | "leastload" | "leastping" | "roundrobin" => {},
                 other => {
                     return Err(WiringError::JsonParse(format!(
                         "unknown balancing strategy: {other}"
                     )));
-                }
+                },
             }
             let selectors = json_string_list(b.get("selector"));
             if selectors.is_empty() {
@@ -1036,25 +998,24 @@ fn parse_routing_json_to_proto_in(
             let url = rs.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let format = rs.get("format").and_then(|x| x.as_str()).unwrap_or("json");
             let (rs_type, rs_format) = match (r#type, format) {
-                ("file", "json") | ("", "json") if !path.is_empty() => (
-                    xray_app_router::RuleSetType::File,
-                    xray_app_router::RuleSetFormat::Json,
-                ),
+                ("file", "json") | ("", "json") if !path.is_empty() => {
+                    (xray_app_router::RuleSetType::File, xray_app_router::RuleSetFormat::Json)
+                },
                 ("file", _) => {
                     return Err(WiringError::JsonParse(format!(
                         "ruleSet '{tag}': unsupported format '{format}', only 'json' is implemented"
                     )));
-                }
+                },
                 ("remote", _) | ("", _) if !url.is_empty() => {
                     return Err(WiringError::JsonParse(format!(
                         "ruleSet '{tag}': remote rule_set download is not implemented (set type='file' and provide path)"
                     )));
-                }
+                },
                 (other, _) => {
                     return Err(WiringError::JsonParse(format!(
                         "ruleSet '{tag}': unknown type '{other}', must be 'file' (path) or omit + provide path"
                     )));
-                }
+                },
             };
             let cfg_rs = xray_app_router::RuleSetConfig {
                 tag: tag.clone(),
@@ -1098,17 +1059,16 @@ fn parse_port_list(
         range: conf
             .0
             .iter()
-            .map(|r| ProtoPortRange {
-                from: u32::from(r.start),
-                to: u32::from(r.end),
-            })
+            .map(|r| ProtoPortRange { from: u32::from(r.start), to: u32::from(r.end) })
             .collect(),
     }))
 }
 
 /// `webhook` 字段 → proto `WebhookConfig`（对齐 Go router.go:126-130/264-270：
 /// `{url, deduplication, headers}`，url 为空则不构建）。
-fn parse_webhook_config(v: &serde_json::Value) -> Option<xray_proto::xray::app::router::WebhookConfig> {
+fn parse_webhook_config(
+    v: &serde_json::Value,
+) -> Option<xray_proto::xray::app::router::WebhookConfig> {
     let obj = v.as_object()?;
     let url = obj.get("url").and_then(|x| x.as_str()).unwrap_or("");
     if url.is_empty() {
@@ -1145,7 +1105,8 @@ fn parse_webhook_config(v: &serde_json::Value) -> Option<xray_proto::xray::app::
 /// 路径对称。
 fn parse_networks(v: Option<&serde_json::Value>) -> Result<Vec<i32>, String> {
     use xray_proto::xray::common::net::Network;
-    json_str_tokens(v).into_iter()
+    json_str_tokens(v)
+        .into_iter()
         .map(|s| match s.to_ascii_lowercase().as_str() {
             "tcp" => Ok(Network::Tcp as i32),
             "udp" => Ok(Network::Udp as i32),
@@ -1161,9 +1122,7 @@ fn json_string_list(v: Option<&serde_json::Value>) -> Vec<String> {
 }
 
 /// attributes 对象 → `map<string,string>`；非字符串值以 JSON 文本表示。
-fn parse_attributes(
-    v: Option<&serde_json::Value>,
-) -> std::collections::HashMap<String, String> {
+fn parse_attributes(v: Option<&serde_json::Value>) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     let Some(obj) = v.and_then(|x| x.as_object()) else {
         return map;
@@ -1232,10 +1191,9 @@ fn geodata_ip_rule_to_proto(
             reverse_match: g.reverse_match,
         }),
         GV::Custom(c) => PV::Custom(xray_proto::xray::common::geodata::CidrRule {
-            cidr: c.cidr.map(|cc| xray_proto::xray::common::geodata::Cidr {
-                ip: cc.ip,
-                prefix: cc.prefix,
-            }),
+            cidr: c
+                .cidr
+                .map(|cc| xray_proto::xray::common::geodata::Cidr { ip: cc.ip, prefix: cc.prefix }),
             reverse_match: c.reverse_match,
         }),
     });
@@ -1285,24 +1243,20 @@ fn geodata_domain_rule_to_proto(
 /// `baselines`/`maxRTT` 接受 Go duration 字符串（`"400ms"`）或纳秒数字——
 /// 此前只认 `as_i64`，Go 文档式配置整体静默丢弃（cb0q）。
 /// 编码失败 → `None`（消费端走默认，避免 hard-error 阻断整个 balancer）。
-fn leastload_settings_to_typed_message(v: &serde_json::Value) -> Option<xray_proto::xray::common::serial::TypedMessage> {
+fn leastload_settings_to_typed_message(
+    v: &serde_json::Value,
+) -> Option<xray_proto::xray::common::serial::TypedMessage> {
     use prost::Message;
     use xray_proto::xray::app::router::{StrategyLeastLoadConfig, StrategyWeight};
     let obj = v.as_object()?;
     let mut cfg = StrategyLeastLoadConfig::default();
     if let Some(arr) = obj.get("baselines").and_then(|x| x.as_array()) {
         // Go router_strategy.go:92-98：非正值跳过。
-        cfg.baselines = arr
-            .iter()
-            .filter_map(parse_duration_ns)
-            .filter(|&ns| ns > 0)
-            .collect();
+        cfg.baselines = arr.iter().filter_map(parse_duration_ns).filter(|&ns| ns > 0).collect();
     }
     // Go json 键 `expected`（router_strategy.go:39）；`expectedNodes` 为兼容别名。
-    if let Some(n) = obj
-        .get("expected")
-        .or_else(|| obj.get("expectedNodes"))
-        .and_then(|x| x.as_i64())
+    if let Some(n) =
+        obj.get("expected").or_else(|| obj.get("expectedNodes")).and_then(|x| x.as_i64())
     {
         // Go router_strategy.go:85-87：负值归 0。
         cfg.expected = n.clamp(0, i32::MAX as i64) as i32;
@@ -1416,6 +1370,7 @@ mod tests {
         fn tag(&self) -> &str {
             &self.0
         }
+
         fn dispatch(
             &self,
             _dest: &Destination,
@@ -1442,11 +1397,8 @@ mod tests {
         use xray_common::net::network::Network;
         let r = Router::empty(Arc::new(NotImplementedSelector), None);
         let adapter = RouterAdapter::new(r);
-        let dest = Destination::new(
-            Address::Domain("test".to_string()),
-            Port::new(80),
-            Network::TCP,
-        );
+        let dest =
+            Destination::new(Address::Domain("test".to_string()), Port::new(80), Network::TCP);
         assert!(adapter.pick_outbound_tag(&dest).is_none());
     }
 
@@ -1463,11 +1415,8 @@ mod tests {
         let json = br#"{"rules":[{"outboundTag":"proxy","domain":["example.com"]}]}"#;
         let adapter = build_router_adapter_from_json(json).expect("build adapter");
         use xray_common::net::network::Network;
-        let dest = Destination::new(
-            Address::Domain("example.com".into()),
-            Port::new(443),
-            Network::TCP,
-        );
+        let dest =
+            Destination::new(Address::Domain("example.com".into()), Port::new(443), Network::TCP);
         assert_eq!(adapter.pick_outbound_tag(&dest).as_deref(), Some("proxy"));
     }
 
@@ -1505,8 +1454,11 @@ mod tests {
         assert_eq!(rule.local_ip.len(), 1, "localIP must parse");
         assert!(rule.local_port_list.is_some(), "localPort must parse");
         assert!(rule.vless_route_list.is_some(), "vlessRoute must parse");
-        assert_eq!(rule.attributes.get("env").map(String::as_str), Some("prod"),
-            "attrs 键必须被识别");
+        assert_eq!(
+            rule.attributes.get("env").map(String::as_str),
+            Some("prod"),
+            "attrs 键必须被识别"
+        );
         let wh = rule.webhook.as_ref().expect("webhook must build");
         assert_eq!(wh.url, "http://127.0.0.1:9911/hook");
         assert_eq!(wh.deduplication, 3);
@@ -1531,10 +1483,10 @@ mod tests {
 
     #[test]
     fn parse_routing_json_covers_all_rule_fields() {
-        use xray_proto::xray::app::router::config::DomainStrategy;
-        use xray_proto::xray::app::router::routing_rule::TargetTag;
-        use xray_proto::xray::common::geodata::domain::Type as DT;
-        use xray_proto::xray::common::geodata::domain_rule::Value as DV;
+        use xray_proto::xray::{
+            app::router::{config::DomainStrategy, routing_rule::TargetTag},
+            common::geodata::{domain::Type as DT, domain_rule::Value as DV},
+        };
 
         let json = br#"{
             "domainStrategy": "IpOnDemand",
@@ -1621,10 +1573,7 @@ mod tests {
         let cfg = parse_routing_json_to_proto(json.as_bytes()).expect("parse");
         assert_eq!(cfg.rule[0].local_os, vec![os.to_string()]);
         let cond = xray_app_router::rule::build_condition(&cfg.rule[0], None).unwrap();
-        assert!(
-            cond.apply(&xray_app_router::context::RoutingData::new()),
-            "本机 OS {os} 必须命中"
-        );
+        assert!(cond.apply(&xray_app_router::context::RoutingData::new()), "本机 OS {os} 必须命中");
 
         // 他 OS 名：规则仍合法（Go BuildCondition 同样构造恒假 matcher，配置可启动，
         // 仅规则永不命中）——不做编译期剔除。
@@ -1662,15 +1611,15 @@ mod tests {
         assert_eq!(br.strategy, "leastload");
         let ts = br.strategy_settings.as_ref().expect("strategy_settings must be Some");
         assert_eq!(ts.r#type, "xray.app.router.StrategyLeastLoadConfig");
-        let cfg_decoded = xray_proto::xray::app::router::StrategyLeastLoadConfig::decode(ts.value.as_slice())
-            .expect("decode");
+        let cfg_decoded =
+            xray_proto::xray::app::router::StrategyLeastLoadConfig::decode(ts.value.as_slice())
+                .expect("decode");
         assert_eq!(cfg_decoded.baselines, vec![100, 200, 300]);
         assert_eq!(cfg_decoded.expected, 2);
         assert_eq!(cfg_decoded.max_rtt, 500);
         assert_eq!(cfg_decoded.costs.len(), 2);
         assert_eq!(cfg_decoded.costs[0].r#match, "a");
         assert!((cfg_decoded.costs[0].value - 1.5).abs() < 1e-5);
-
     }
 
     #[test]
@@ -1692,11 +1641,15 @@ mod tests {
         }"#;
         let cfg = parse_routing_json_to_proto(json).expect("parse");
         let ts = cfg.balancing_rule[0].strategy_settings.as_ref().expect("settings");
-        let decoded = xray_proto::xray::app::router::StrategyLeastLoadConfig::decode(ts.value.as_slice())
-            .expect("decode");
+        let decoded =
+            xray_proto::xray::app::router::StrategyLeastLoadConfig::decode(ts.value.as_slice())
+                .expect("decode");
         assert_eq!(decoded.expected, 6, "官方 expected 键必须生效");
-        assert_eq!(decoded.baselines, vec![400_000_000, 1_000_000_000],
-            "duration 字符串必须转纳秒");
+        assert_eq!(
+            decoded.baselines,
+            vec![400_000_000, 1_000_000_000],
+            "duration 字符串必须转纳秒"
+        );
         assert_eq!(decoded.max_rtt, 1_000_000_000);
         // Go router_strategy.go:81-83：tolerance clamp 到 1。
         assert!((decoded.tolerance - 1.0).abs() < 1e-5, "tolerance 必须 clamp 到 [0,1]");
@@ -1719,18 +1672,12 @@ mod tests {
         use xray_common::net::network::Network;
         let json = br#"{"rules":[{"outboundTag":"proxy","port":"443"}]}"#;
         let adapter = build_router_adapter_from_json(json).expect("build adapter");
-        let hit = Destination::new(
-            Address::Domain("anywhere.com".into()),
-            Port::new(443),
-            Network::TCP,
-        );
+        let hit =
+            Destination::new(Address::Domain("anywhere.com".into()), Port::new(443), Network::TCP);
         assert_eq!(adapter.pick_outbound_tag(&hit).as_deref(), Some("proxy"));
         // 不命中端口 → 不路由
-        let miss = Destination::new(
-            Address::Domain("anywhere.com".into()),
-            Port::new(8080),
-            Network::TCP,
-        );
+        let miss =
+            Destination::new(Address::Domain("anywhere.com".into()), Port::new(8080), Network::TCP);
         assert!(adapter.pick_outbound_tag(&miss).is_none());
     }
 
@@ -1739,17 +1686,11 @@ mod tests {
         use xray_common::net::network::Network;
         let json = br#"{"rules":[{"outboundTag":"udp-out","network":"udp"}]}"#;
         let adapter = build_router_adapter_from_json(json).expect("build adapter");
-        let udp_dest = Destination::new(
-            Address::Domain("anywhere.com".into()),
-            Port::new(53),
-            Network::UDP,
-        );
+        let udp_dest =
+            Destination::new(Address::Domain("anywhere.com".into()), Port::new(53), Network::UDP);
         assert_eq!(adapter.pick_outbound_tag(&udp_dest).as_deref(), Some("udp-out"));
-        let tcp_dest = Destination::new(
-            Address::Domain("anywhere.com".into()),
-            Port::new(53),
-            Network::TCP,
-        );
+        let tcp_dest =
+            Destination::new(Address::Domain("anywhere.com".into()), Port::new(53), Network::TCP);
         assert!(adapter.pick_outbound_tag(&tcp_dest).is_none());
     }
 
@@ -1778,10 +1719,7 @@ mod tests {
             _option: xray_features::dns::IpOption,
         ) -> Result<(Vec<std::net::IpAddr>, u32), xray_features::dns::DnsError> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok((
-                vec![std::net::IpAddr::V4("1.2.3.4".parse().expect("ip"))],
-                60,
-            ))
+            Ok((vec![std::net::IpAddr::V4("1.2.3.4".parse().expect("ip"))], 60))
         }
     }
 
@@ -1814,7 +1752,8 @@ mod tests {
 
     #[tokio::test]
     async fn resolved_asis_skips_dns() {
-        let json = br#"{"domainStrategy":"AsIs","rules":[{"outboundTag":"blocked","ip":["1.2.3.0/24"]}]}"#;
+        let json =
+            br#"{"domainStrategy":"AsIs","rules":[{"outboundTag":"blocked","ip":["1.2.3.0/24"]}]}"#;
         let adapter = build_router_adapter_from_json(json).expect("build adapter");
         let dns = std::sync::Arc::new(CountingDns::new());
         adapter.set_dns_client(dns.clone());
@@ -1875,10 +1814,7 @@ mod tests {
         // selector 返回空时才落 default——这里候选非空。
         for _ in 0..20 {
             let tag = adapter.pick_outbound_tag(&dest).expect("pick");
-            assert!(
-                tag == "proxy-a" || tag == "proxy-b",
-                "unexpected tag {tag}"
-            );
+            assert!(tag == "proxy-a" || tag == "proxy-b", "unexpected tag {tag}");
         }
     }
 
@@ -1898,8 +1834,8 @@ mod tests {
                 Ok(self.0.clone())
             }
         }
-        let obs: Arc<dyn ObservationProvider> = Arc::new(InlineObs(
-            xray_proto::xray::core::app::observatory::ObservationResult {
+        let obs: Arc<dyn ObservationProvider> =
+            Arc::new(InlineObs(xray_proto::xray::core::app::observatory::ObservationResult {
                 status: vec![
                     xray_proto::xray::core::app::observatory::OutboundStatus {
                         outbound_tag: "a".into(),
@@ -1920,8 +1856,7 @@ mod tests {
                         ..Default::default()
                     },
                 ],
-            },
-        ));
+            }));
 
         let json = br#"{
             "balancers":[{"tag":"bl","selector":["a","b","c"],"strategy":"leastping"}],
@@ -2012,8 +1947,7 @@ mod tests {
     /// CIDR/geoip:/ext-ip:/`!` 反向，以及 Rust 别名键兼容。
     #[test]
     fn parse_routing_json_go_prefix_forms() {
-        use xray_proto::xray::common::geodata::domain_rule::Value as DV;
-        use xray_proto::xray::common::geodata::ip_rule::Value as IV;
+        use xray_proto::xray::common::geodata::{domain_rule::Value as DV, ip_rule::Value as IV};
 
         let dir = temp_asset_dir("prefix-forms");
         std::fs::write(dir.join("geoip.dat"), make_geoip_dat()).unwrap();
@@ -2055,7 +1989,7 @@ mod tests {
             Some(DV::Geosite(g)) => {
                 assert_eq!(g.file, "geosite.dat");
                 assert_eq!(g.code, "CN", "geosite code 转大写");
-            }
+            },
             _ => panic!("domain[4] expected geosite reference"),
         }
         assert_eq!(custom(5).r#type, 0, "无前缀 → Substr（Go 默认）");
@@ -2071,7 +2005,7 @@ mod tests {
                 assert_eq!(g.file, "geoip.dat");
                 assert_eq!(g.code, "PRIVATE");
                 assert!(!g.reverse_match);
-            }
+            },
             _ => panic!("ip[0] expected geoip reference"),
         }
         match rule.ip[1].value.as_ref() {
@@ -2080,7 +2014,7 @@ mod tests {
                 assert_eq!(cidr.ip, vec![10, 0, 0, 0]);
                 assert_eq!(cidr.prefix, 8);
                 assert!(!c.reverse_match);
-            }
+            },
             _ => panic!("ip[1] expected custom CIDR"),
         }
         match rule.ip[2].value.as_ref() {
@@ -2094,7 +2028,7 @@ mod tests {
             Some(IV::Custom(c)) => {
                 assert_eq!(c.cidr.as_ref().expect("cidr").prefix, 16);
                 assert!(c.reverse_match, "! 前缀 → reverse_match");
-            }
+            },
             _ => panic!("source expected custom CIDR"),
         }
     }
@@ -2153,17 +2087,15 @@ mod tests {
     #[test]
     fn parse_port_list_invalid_rejected_valid_ok() {
         // 非法：字符串 "abc" / 对象形态。
-        for bad in [
-            serde_json::json!("abc"),
-            serde_json::json!({"port": 80}),
-        ] {
+        for bad in [serde_json::json!("abc"), serde_json::json!({"port": 80})] {
             let err = super::parse_port_list(Some(&bad)).err().expect("must reject");
             assert!(matches!(err, WiringError::JsonParse(_)), "{err:?}");
         }
         // 合法：数字 / "80,443-53" 混合 / 缺失与 null → None。
         assert!(super::parse_port_list(None).unwrap().is_none());
         assert!(super::parse_port_list(Some(&serde_json::Value::Null)).unwrap().is_none());
-        let ok = super::parse_port_list(Some(&serde_json::json!("80,443"))).unwrap().expect("ports");
+        let ok =
+            super::parse_port_list(Some(&serde_json::json!("80,443"))).unwrap().expect("ports");
         assert_eq!(ok.range.len(), 2);
     }
 
@@ -2181,12 +2113,10 @@ mod tests {
         .expect("empty tag must reject");
         assert!(err.to_string().contains("empty balancer tag"), "{err:?}");
         // 空 selector 列表。
-        let err = parse_routing_json_to_proto_in(
-            br#"{"balancers":[{"tag":"bl","selector":[]}]}"#,
-            &dir,
-        )
-        .err()
-        .expect("empty selector must reject");
+        let err =
+            parse_routing_json_to_proto_in(br#"{"balancers":[{"tag":"bl","selector":[]}]}"#, &dir)
+                .err()
+                .expect("empty selector must reject");
         assert!(err.to_string().contains("empty selector list"), "{err:?}");
         // 未知 strategy。
         let err = parse_routing_json_to_proto_in(
@@ -2217,10 +2147,7 @@ mod tests {
         )
         .err()
         .expect("must reject");
-        assert!(
-            err.to_string().contains("domain entry is not a string"),
-            "{err:?}"
-        );
+        assert!(err.to_string().contains("domain entry is not a string"), "{err:?}");
     }
 
     /// 补票①：inboundTag / protocol 空串条目过滤（Go condition.go:207-215 /
@@ -2245,25 +2172,17 @@ mod tests {
     /// 硬错路径对称。
     #[test]
     fn parse_routing_json_unknown_network_token_hard_error() {
-        let err = build_router_adapter_from_json(
-            br#"{"rules":[{"outboundTag":"b","network":"tpc"}]}"#,
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("unknown network token 'tpc'"),
-            "unexpected error: {err}"
-        );
+        let err =
+            build_router_adapter_from_json(br#"{"rules":[{"outboundTag":"b","network":"tpc"}]}"#)
+                .unwrap_err();
+        assert!(err.to_string().contains("unknown network token 'tpc'"), "unexpected error: {err}");
 
         // 正常 token（大小写混合、逗号串）不受影响。
         use xray_proto::xray::common::net::Network;
-        let cfg = parse_routing_json_to_proto(
-            br#"{"rules":[{"outboundTag":"b","network":"TCP,udp"}]}"#,
-        )
-        .expect("valid tokens must pass");
-        assert_eq!(
-            cfg.rule[0].networks,
-            vec![Network::Tcp as i32, Network::Udp as i32]
-        );
+        let cfg =
+            parse_routing_json_to_proto(br#"{"rules":[{"outboundTag":"b","network":"TCP,udp"}]}"#)
+                .expect("valid tokens must pass");
+        assert_eq!(cfg.rule[0].networks, vec![Network::Tcp as i32, Network::Udp as i32]);
     }
 
     // ---- sniffing_request_from_json（bd fv1g：domainsExcluded/ipsExcluded typed matcher）----
@@ -2383,6 +2302,7 @@ mod tests {
             fn policy_for_level(&self, _level: u32) -> xray_features::policy::Policy {
                 xray_features::policy::Policy::default()
             }
+
             fn for_system(&self) -> xray_features::policy::SystemStats {
                 xray_features::policy::SystemStats {
                     inbound_uplink: true,
@@ -2397,8 +2317,14 @@ mod tests {
         d.stats = Some(stats);
         // 默认（无 pm）：两方向都不注册
         let h = InboundDispatchHandler::new(Arc::new(d), SniffingRequest::default(), "gated-in");
-        assert!(h.inbound_counter("uplink").is_none(), "default: inbound counter must be gated off");
-        assert!(h.inbound_counter("downlink").is_none(), "default: inbound counter must be gated off");
+        assert!(
+            h.inbound_counter("uplink").is_none(),
+            "default: inbound counter must be gated off"
+        );
+        assert!(
+            h.inbound_counter("downlink").is_none(),
+            "default: inbound counter must be gated off"
+        );
 
         // 开启 inbound 两门：按方向注册
         let stats = Arc::new(xray_app_stats::Manager::new_running());
@@ -2407,6 +2333,9 @@ mod tests {
         d.set_policy_manager(Arc::new(InboundOnPm));
         let h = InboundDispatchHandler::new(Arc::new(d), SniffingRequest::default(), "gated-in");
         assert!(h.inbound_counter("uplink").is_some(), "inbound_uplink on: counter must register");
-        assert!(h.inbound_counter("downlink").is_some(), "inbound_downlink on: counter must register");
+        assert!(
+            h.inbound_counter("downlink").is_some(),
+            "inbound_downlink on: counter must register"
+        );
     }
 }

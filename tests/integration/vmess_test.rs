@@ -10,23 +10,26 @@
 
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-
-use xray_app_dispatcher::default::{DialBridge, SimpleOhm};
-use xray_app_dispatcher::DispatchHandler;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::port::Port;
-use xray_common::protocol::{Command, RequestHeader, SecurityType, request_option};
-use xray_common::uuid::UUID;
-
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
+use xray_app_dispatcher::{
+    DispatchHandler,
+    default::{DialBridge, SimpleOhm},
+};
+use xray_common::{
+    net::{address::Address, destination::Destination, port::Port},
+    protocol::{Command, RequestHeader, SecurityType, request_option},
+    uuid::UUID,
+};
 use xray_proxy_freedom::make_freedom_dial_fn;
-use xray_proxy_vmess::account::{cmd_key_of, MemoryAccount};
-use xray_proxy_vmess::encoding::client::ClientSession;
-use xray_proxy_vmess::encoding::VERSION;
-use xray_proxy_vmess::validator::{MemoryUser, TimedUserValidator, Validator};
-use xray_proxy_vmess::serve_vmess;
+use xray_proxy_vmess::{
+    account::{MemoryAccount, cmd_key_of},
+    encoding::{VERSION, client::ClientSession},
+    serve_vmess,
+    validator::{MemoryUser, TimedUserValidator, Validator},
+};
 
 /// 固定 UUID（避免反重放状态污染）。
 const SAMPLE_UUID_STR: &str = "66ad4540-b58c-4ad2-9926-ea63445a9b57";
@@ -68,7 +71,7 @@ async fn spawn_echo_server() -> u16 {
                     if sock.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
-                }
+                },
             }
         }
     });
@@ -94,19 +97,13 @@ async fn run_vmess_e2e(security: SecurityType) {
     });
 
     // 4. VMess client：connect → encode header → decode response header → echo round-trip
-    let mut client = tokio::net::TcpStream::connect(vmess_addr)
-        .await
-        .unwrap();
+    let mut client = tokio::net::TcpStream::connect(vmess_addr).await.unwrap();
     let client_session = ClientSession::new();
-    let dest = Destination::tcp(
-        Address::ipv4(std::net::Ipv4Addr::LOCALHOST),
-        Port::new(echo_port),
-    );
+    let dest = Destination::tcp(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(echo_port));
     let header = RequestHeader::new(VERSION, Command::Tcp, dest, security);
 
-    let sealed_header = client_session
-        .encode_request_header(&header, &cmd_key)
-        .expect("encode header");
+    let sealed_header =
+        client_session.encode_request_header(&header, &cmd_key).expect("encode header");
     client.write_all(&sealed_header).await.unwrap();
 
     // 读响应头（客户端收到后才能开始 body 流）
@@ -160,28 +157,22 @@ async fn vmess_rejects_unknown_user() {
     // client 用未注册的随机 UUID
     let unknown_uuid = UUID::new();
     let cmd_key = cmd_key_of(&unknown_uuid);
-    let mut client = tokio::net::TcpStream::connect(vmess_addr)
-        .await
-        .unwrap();
+    let mut client = tokio::net::TcpStream::connect(vmess_addr).await.unwrap();
 
     let client_session = ClientSession::new();
-    let dest = Destination::tcp(
-        Address::ipv4(std::net::Ipv4Addr::LOCALHOST),
-        Port::new(80),
-    );
+    let dest = Destination::tcp(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(80));
     let header = RequestHeader::new(VERSION, Command::Tcp, dest, SecurityType::Aes128Gcm);
-    let sealed_header = client_session
-        .encode_request_header(&header, &cmd_key)
-        .expect("encode header");
+    let sealed_header =
+        client_session.encode_request_header(&header, &cmd_key).expect("encode header");
     client.write_all(&sealed_header).await.unwrap();
 
     // server 因 UserNotFound 关闭 → client 读响应得到 EOF 或 reset
     let mut buf = [0u8; 16];
     let result = client.read(&mut buf).await;
     match result {
-        Ok(0) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionAborted => {}
+        Ok(0) => {},
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {},
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionAborted => {},
         other => panic!("期望 EOF 或连接重置，得到 {other:?}"),
     }
 }
@@ -203,19 +194,13 @@ async fn vmess_e2e_aes128gcm_large_payload() {
         let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None).await;
     });
 
-    let mut client = tokio::net::TcpStream::connect(vmess_addr)
-        .await
-        .unwrap();
+    let mut client = tokio::net::TcpStream::connect(vmess_addr).await.unwrap();
     let client_session = ClientSession::new();
-    let dest = Destination::tcp(
-        Address::ipv4(std::net::Ipv4Addr::LOCALHOST),
-        Port::new(echo_port),
-    );
+    let dest = Destination::tcp(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(echo_port));
     let header = RequestHeader::new(VERSION, Command::Tcp, dest, SecurityType::Aes128Gcm);
 
-    let sealed_header = client_session
-        .encode_request_header(&header, &cmd_key)
-        .expect("encode header");
+    let sealed_header =
+        client_session.encode_request_header(&header, &cmd_key).expect("encode header");
     client.write_all(&sealed_header).await.unwrap();
 
     let _resp = client_session
@@ -233,13 +218,13 @@ async fn vmess_e2e_aes128gcm_large_payload() {
         .await
         .expect("decode response body");
     assert_eq!(
-        response, large_payload,
+        response,
+        large_payload,
         "大负载 echo 回环失败: 收到 {} 字节, 期望 {} 字节",
         response.len(),
         large_payload.len()
     );
 }
-
 
 /// VMess `request_option::AUTHENTICATED_LENGTH` 端到端：客户端 header 置该位 →
 /// 服务端按 KDF16(auth_len) 派生 16B key，size parser 走 AEAD 加密长度字段（18B）。
@@ -268,16 +253,12 @@ async fn vmess_e2e_authenticated_length() {
     // 客户端：connect + encode header with AUTHENTICATED_LENGTH
     let mut client = tokio::net::TcpStream::connect(vmess_addr).await.unwrap();
     let client_session = ClientSession::new();
-    let dest = Destination::tcp(
-        Address::ipv4(std::net::Ipv4Addr::LOCALHOST),
-        Port::new(echo_port),
-    );
+    let dest = Destination::tcp(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(echo_port));
     let mut header = RequestHeader::new(VERSION, Command::Tcp, dest, SecurityType::Aes128Gcm);
     header.option.set(request_option::AUTHENTICATED_LENGTH);
 
-    let sealed_header = client_session
-        .encode_request_header(&header, &cmd_key)
-        .expect("encode header");
+    let sealed_header =
+        client_session.encode_request_header(&header, &cmd_key).expect("encode header");
     client.write_all(&sealed_header).await.unwrap();
 
     let _resp = client_session
@@ -305,14 +286,17 @@ async fn vmess_e2e_authenticated_length() {
 ///
 /// 对应 Go `proxy/vmess/outbound/outbound.go:91-93`：dest.address=v1.mux.cool → RequestCommandMux，
 /// mux 客户端（server.go）在 v1.mux.cool 上多路复用子会话。
-/// 本测试复用 `xray-mux` 单 carrier e2e 模式（client.rs `e2e_two_concurrent_sessions_over_single_carrier`）。
+/// 本测试复用 `xray-mux` 单 carrier e2e 模式（client.rs
+/// `e2e_two_concurrent_sessions_over_single_carrier`）。
 #[tokio::test]
 async fn vmess_over_mux_tcp_e2e() {
     use xray_buf::pipe;
     use xray_common::net::network::Network;
-    use xray_mux::client::{ClientWorker, DialingWorkerFactory, IncrementalWorkerPicker};
-    use xray_mux::session::ClientStrategy;
-    use xray_mux::worker::{DispatchError, Dispatcher, ServerWorker};
+    use xray_mux::{
+        client::{ClientWorker, DialingWorkerFactory, IncrementalWorkerPicker},
+        session::ClientStrategy,
+        worker::{DispatchError, Dispatcher, ServerWorker},
+    };
 
     // ---- 1. TCP echo server ----
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -327,7 +311,7 @@ async fn vmess_over_mux_tcp_e2e() {
                     if sock.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
-                }
+                },
             }
         }
     });
@@ -377,38 +361,28 @@ async fn vmess_over_mux_tcp_e2e() {
                             if wr.write_multi_buffer(mb).await.is_err() {
                                 break;
                             }
-                        }
+                        },
                         Err(_) => break,
                     }
                 }
                 let _ = wr.close();
             });
-            Ok(xray_mux::client::Link {
-                reader: Box::new(r_down),
-                writer: Box::new(w_up),
-            })
+            Ok(xray_mux::client::Link { reader: Box::new(r_down), writer: Box::new(w_up) })
         }
     }
 
     let mux_server = Arc::new(ServerWorker::new(Arc::new(EchoDispatcher)));
     let mux_server_for_handler = Arc::clone(&mux_server);
-    let underlying: Arc<dyn DispatchHandler> = Arc::new(MuxCarrierHandler {
-        server: mux_server_for_handler,
-    });
+    let underlying: Arc<dyn DispatchHandler> =
+        Arc::new(MuxCarrierHandler { server: mux_server_for_handler });
 
     // ---- 3. mux client：factory + picker + single carrier ----
-    let factory = Arc::new(DialingWorkerFactory::new(
-        underlying,
-        ClientStrategy::default(),
-    ));
+    let factory = Arc::new(DialingWorkerFactory::new(underlying, ClientStrategy::default()));
     let picker = IncrementalWorkerPicker::new(factory);
     let worker: Arc<ClientWorker> = picker.pick_internal().await.expect("worker created");
 
-    let mux_dest = Destination::new(
-        Address::new_domain("echo.internal"),
-        Port::new(80),
-        Network::TCP,
-    );
+    let mux_dest =
+        Destination::new(Address::new_domain("echo.internal"), Port::new(80), Network::TCP);
 
     // ---- 4. 双并发子会话 → 验证 mux 多路复用 ----
     let w1 = Arc::clone(&worker);
@@ -426,7 +400,6 @@ async fn vmess_over_mux_tcp_e2e() {
         2,
         "two mux sessions multiplexed over one TCP carrier"
     );
-
 }
 
 /// VMess over Mux UDP 端到端：mux UDP TransferType::Packet 路径单 packet roundtrip。
@@ -441,11 +414,13 @@ async fn vmess_over_mux_tcp_e2e() {
 async fn vmess_over_mux_udp_e2e() {
     // 验证 mux-cool 协议识别地址常量（xray-mux/client.rs:36）
     assert_eq!(
-        xray_mux::client::MUX_COOL_ADDRESS, "v1.mux.cool",
+        xray_mux::client::MUX_COOL_ADDRESS,
+        "v1.mux.cool",
         "Mux 协议识别地址必须为 v1.mux.cool（Go common/mux/client.go）"
     );
     assert_eq!(
-        xray_mux::client::MUX_COOL_PORT, 9527,
+        xray_mux::client::MUX_COOL_PORT,
+        9527,
         "Mux 协议端口必须为 9527（Go common/mux/client.go）"
     );
 
@@ -465,18 +440,12 @@ async fn vmess_over_mux_udp_e2e() {
         ) -> Result<xray_mux::client::Link, xray_mux::worker::DispatchError> {
             use xray_buf::pipe;
             let (r, w) = pipe::new();
-            Ok(xray_mux::client::Link {
-                reader: Box::new(r),
-                writer: Box::new(w),
-            })
+            Ok(xray_mux::client::Link { reader: Box::new(r), writer: Box::new(w) })
         }
     }
     let _server = ServerWorker::new(Arc::new(AnyDispatcher));
     // 构造 UDP dest，dispatch 应按 Network::UDP → TransferType::Packet 路由
-    let udp_dest = Destination::udp(
-        Address::ipv4(std::net::Ipv4Addr::LOCALHOST),
-        Port::new(9999),
-    );
+    let udp_dest = Destination::udp(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(9999));
     assert_eq!(udp_dest.network(), Network::UDP);
     assert!(udp_dest.is_udp());
     assert!(!udp_dest.is_tcp());
@@ -490,15 +459,11 @@ async fn run_mux_echo_session(
     dest: Destination,
     payload: &[u8],
 ) -> Vec<u8> {
-    use xray_buf::multi::MultiBuffer;
-    use xray_buf::pipe;
+    use xray_buf::{multi::MultiBuffer, pipe};
 
     let (req_rd, req_wr) = pipe::new();
     let (resp_rd, resp_wr) = pipe::new();
-    let link = xray_mux::client::Link {
-        reader: Box::new(req_rd),
-        writer: Box::new(resp_wr),
-    };
+    let link = xray_mux::client::Link { reader: Box::new(req_rd), writer: Box::new(resp_wr) };
     let handle = tokio::spawn(async move { worker.dispatch(&dest, link).await });
 
     let mut req_wr = req_wr;
@@ -520,10 +485,7 @@ async fn run_mux_echo_session(
     }
 
     let _ = req_wr.close();
-    assert!(
-        handle.await.expect("dispatch task join"),
-        "worker.dispatch should accept the session"
-    );
+    assert!(handle.await.expect("dispatch task join"), "worker.dispatch should accept the session");
     got
 }
 
@@ -551,8 +513,7 @@ impl DispatchHandler for MuxCarrierHandler {
     ) -> xray_app_dispatcher::default::PinFuture<()> {
         let server = Arc::clone(&self.server);
         Box::pin(async move {
-            use xray_buf::io::Writer as _;
-            use xray_buf::reader::BufferedReader;
+            use xray_buf::{io::Writer as _, reader::BufferedReader};
             let mut reader = BufferedReader::new(link.reader);
             let writer: Arc<tokio::sync::Mutex<Option<Box<dyn xray_buf::io::Writer>>>> =
                 Arc::new(tokio::sync::Mutex::new(Some(link.writer)));

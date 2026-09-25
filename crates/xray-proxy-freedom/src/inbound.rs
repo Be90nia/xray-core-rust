@@ -8,13 +8,14 @@
 //! Accept TCP 连接后，用预定义目标地址通过 dispatcher 拨号目标，双向 copy 数据。
 //! 语义类似 dokodemo-door + freedom outbound 的组合。
 
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU16, Ordering},
+};
 
 use async_trait::async_trait;
 use tokio::net::TcpListener;
-use xray_app_dispatcher::default::SimpleOhm;
-use xray_app_dispatcher::OutboundHandlerManager;
+use xray_app_dispatcher::{OutboundHandlerManager, default::SimpleOhm};
 use xray_common::net::destination::Destination;
 use xray_features::inbound::{InboundError, InboundHandler};
 
@@ -68,18 +69,16 @@ impl InboundHandler for FreedomInboundHandler {
             Some(h) => h,
             None => {
                 self.started.store(false, Ordering::SeqCst);
-                return Err(InboundError::ListenError("no default outbound handler registered".into()));
-            }
+                return Err(InboundError::ListenError(
+                    "no default outbound handler registered".into(),
+                ));
+            },
         };
-        let listener = TcpListener::bind(&self.listen_addr)
-            .await
-            .map_err(|e| {
-                self.started.store(false, Ordering::SeqCst);
-                InboundError::ListenError(e.to_string())
-            })?;
-        let port = listener.local_addr()
-            .map(|a| a.port())
-            .unwrap_or(0);
+        let listener = TcpListener::bind(&self.listen_addr).await.map_err(|e| {
+            self.started.store(false, Ordering::SeqCst);
+            InboundError::ListenError(e.to_string())
+        })?;
+        let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
         self.cached_port.store(port, Ordering::SeqCst);
         let dest = self.dest.clone();
         let tag = self.tag.clone();
@@ -91,7 +90,7 @@ impl InboundHandler for FreedomInboundHandler {
                     Err(e) => {
                         tracing::warn!(tag = %tag, error = %e, "freedom inbound accept failed");
                         continue;
-                    }
+                    },
                 };
                 let handler = Arc::clone(&handler);
                 let dest = dest.clone();
@@ -125,10 +124,9 @@ impl InboundHandler for FreedomInboundHandler {
 
 #[cfg(test)]
 mod tests {
+    use xray_common::net::{address::Address, network::Network, port::Port};
+
     use super::*;
-    use xray_common::net::address::Address;
-    use xray_common::net::network::Network;
-    use xray_common::net::port::Port;
 
     fn dummy_dest() -> Destination {
         Destination::new(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(0), Network::TCP)

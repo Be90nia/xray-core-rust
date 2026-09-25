@@ -14,13 +14,13 @@
 //! 切片2 待办：`client.go`（HTTP CONNECT 请求构造 + Proxy-Authorization）+
 //! `server.go`（HTTP 请求解析 + 认证 + CONNECT 隧道建立 + 透明代理）。
 
+pub mod client;
 pub mod config;
 pub mod error;
-pub mod client;
 pub mod server;
 
 // 顶层 re-export。
+pub use client::{HttpOutboundConfig, make_http_dial_fn, parse_http_config};
 pub use config::{Account, ClientConfig, Header, ServerConfig};
 pub use error::{HttpProxyError, Result};
 pub use server::HttpServer;
-pub use client::{HttpOutboundConfig, make_http_dial_fn, parse_http_config};

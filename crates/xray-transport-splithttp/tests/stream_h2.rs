@@ -4,25 +4,31 @@
 //! 必须走 H2 全双工。本测试用 mock H2 server（自签 TLS + ALPN h2 + hyper h2）
 //! 覆盖两个 stream 模式。
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
-use hyper::server::conn::http2;
-use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::{
+    Method, Request, Response, StatusCode, body::Incoming, server::conn::http2, service::service_fn,
+};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 use tokio_rustls::TlsAcceptor;
-
-use xray_transport_splithttp::client::{DefaultDialerClient, DialTarget};
-use xray_transport_splithttp::config::Config;
-use xray_transport_splithttp::dialer::{build_request_url, dial_stream_one, dial_stream_up};
+use xray_transport_splithttp::{
+    client::{DefaultDialerClient, DialTarget},
+    config::Config,
+    dialer::{build_request_url, dial_stream_one, dial_stream_up},
+};
 
 fn make_self_signed_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
     let params =
@@ -51,9 +57,7 @@ fn make_client_tls(cert: CertificateDer<'static>) -> rustls::ClientConfig {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert).expect("add cert");
     // ponytail: 不预设 ALPN, hyper-rustls HttpsConnectorBuilder 自动设置 (预设会 panic)
-    rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth()
+    rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth()
 }
 
 #[derive(Default)]
@@ -103,32 +107,28 @@ async fn mock_h2_splithttp_server(
                                 .unwrap(),
                         )
                     } else if method == Method::POST {
-                        // 上传流：spawn drain body (避免与 client streaming upload 互锁) + 立即返 200
+                        // 上传流：spawn drain body (避免与 client streaming upload 互锁) + 立即返
+                        // 200
                         let (_, body) = req.into_parts();
                         tokio::spawn(async move {
-                            let collected = body.collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+                            let collected =
+                                body.collect().await.map(|b| b.to_bytes()).unwrap_or_default();
                             stats.post_bytes.fetch_add(collected.len(), Ordering::Relaxed);
                             stats.post_count.fetch_add(1, Ordering::Relaxed);
                         });
-                        Ok(
-                            Response::builder()
-                                .status(StatusCode::OK)
-                                .body(Full::new(Bytes::new()))
-                                .unwrap(),
-                        )
+                        Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Full::new(Bytes::new()))
+                            .unwrap())
                     } else {
-                        Ok(
-                            Response::builder()
-                                .status(StatusCode::METHOD_NOT_ALLOWED)
-                                .body(Full::new(Bytes::new()))
-                                .unwrap(),
-                        )
+                        Ok(Response::builder()
+                            .status(StatusCode::METHOD_NOT_ALLOWED)
+                            .body(Full::new(Bytes::new()))
+                            .unwrap())
                     }
                 }
             });
-            let _ = http2::Builder::new(TokioExecutor::new())
-                .serve_connection(io, svc)
-                .await;
+            let _ = http2::Builder::new(TokioExecutor::new()).serve_connection(io, svc).await;
         });
     }
 }
@@ -137,7 +137,9 @@ async fn mock_h2_splithttp_server(
 async fn dial_stream_up_via_h2_mock_server() {
     // 确保 rustls CryptoProvider 在并行测试中只初始化一次
     static CRYPTO_ONCE: std::sync::Once = std::sync::Once::new();
-    CRYPTO_ONCE.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+    CRYPTO_ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 
     // 1. 自签证书 + H2 server
     let (cert_der, key_der) = make_self_signed_cert();
@@ -162,7 +164,17 @@ async fn dial_stream_up_via_h2_mock_server() {
         ..Default::default()
     });
     let client_tls = make_client_tls(cert_der);
-    let client = Arc::new(DefaultDialerClient::new(config.clone(), client_tls.into(), DialTarget { host: server_addr.ip().to_string(), port: server_addr.port(), sni: String::new() }, None, None));
+    let client = Arc::new(DefaultDialerClient::new(
+        config.clone(),
+        client_tls.into(),
+        DialTarget {
+            host: server_addr.ip().to_string(),
+            port: server_addr.port(),
+            sni: String::new(),
+        },
+        None,
+        None,
+    ));
 
     // 3. dial_stream_up
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -172,24 +184,16 @@ async fn dial_stream_up_via_h2_mock_server() {
         &config.normalized_path(),
         &config.normalized_query(),
     );
-    let mut conn = dial_stream_up(client, base_uri, session_id)
-        .await
-        .expect("dial_stream_up");
+    let mut conn = dial_stream_up(client, base_uri, session_id).await.expect("dial_stream_up");
 
     // 4. 验证下载内容
     let mut buf = vec![0u8; download_payload.len()];
-    conn.reader
-        .read_exact(&mut buf)
-        .await
-        .expect("read download");
+    conn.reader.read_exact(&mut buf).await.expect("read download");
     assert_eq!(buf, download_payload);
 
     // 5. 上传数据
     let upload_data = b"stream-up-upload-payload-h2";
-    conn.writer
-        .write_all(upload_data)
-        .await
-        .expect("write upload");
+    conn.writer.write_all(upload_data).await.expect("write upload");
     conn.writer.shutdown().await.expect("close writer");
 
     // 给 server 时间处理 POST
@@ -214,7 +218,9 @@ async fn dial_stream_up_via_h2_mock_server() {
 async fn dial_stream_one_via_h2_mock_server() {
     // 确保 rustls CryptoProvider 在并行测试中只初始化一次
     static CRYPTO_ONCE2: std::sync::Once = std::sync::Once::new();
-    CRYPTO_ONCE2.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+    CRYPTO_ONCE2.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 
     // 1. 自签证书 + H2 server（POST 返 download_payload）
     let (cert_der, key_der) = make_self_signed_cert();
@@ -258,9 +264,7 @@ async fn dial_stream_one_via_h2_mock_server() {
                         )
                     }
                 });
-                let _ = http2::Builder::new(TokioExecutor::new())
-                    .serve_connection(io, svc)
-                    .await;
+                let _ = http2::Builder::new(TokioExecutor::new()).serve_connection(io, svc).await;
             });
         }
     });
@@ -272,7 +276,17 @@ async fn dial_stream_one_via_h2_mock_server() {
         ..Default::default()
     });
     let client_tls = make_client_tls(cert_der);
-    let client = Arc::new(DefaultDialerClient::new(config.clone(), client_tls.into(), DialTarget { host: server_addr.ip().to_string(), port: server_addr.port(), sni: String::new() }, None, None));
+    let client = Arc::new(DefaultDialerClient::new(
+        config.clone(),
+        client_tls.into(),
+        DialTarget {
+            host: server_addr.ip().to_string(),
+            port: server_addr.port(),
+            sni: String::new(),
+        },
+        None,
+        None,
+    ));
 
     // 3. dial_stream_one
     let session_id = String::new(); // stream-one session_id 空
@@ -282,9 +296,7 @@ async fn dial_stream_one_via_h2_mock_server() {
         &config.normalized_path(),
         &config.normalized_query(),
     );
-    let mut conn = dial_stream_one(client, base_uri, session_id)
-        .await
-        .expect("dial_stream_one");
+    let mut conn = dial_stream_one(client, base_uri, session_id).await.expect("dial_stream_one");
 
     // 4. 验证下载（server 在 POST 上返 download_payload）
     let mut buf = vec![0u8; download_payload.len()];

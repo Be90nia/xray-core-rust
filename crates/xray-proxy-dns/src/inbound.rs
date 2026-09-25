@@ -10,13 +10,14 @@
 //! - TCP：dispatcher accept 连接 → 调 [`DnsInbound::handle_conn`]
 
 use async_trait::async_trait;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
+use tokio::{io::AsyncWriteExt, net::TcpStream};
 use xray_features::inbound::{InboundError, InboundHandler};
 
-use crate::error::{DnsProxyError, Result};
-use crate::handler::{decode_tcp_dns_message, encode_tcp_dns_message, Handler, ProcessOutcome};
-use crate::outbound::DnsOutbound;
+use crate::{
+    error::{DnsProxyError, Result},
+    handler::{Handler, ProcessOutcome, decode_tcp_dns_message, encode_tcp_dns_message},
+    outbound::DnsOutbound,
+};
 
 /// DNS inbound——持有规则 [`Handler`] + 上游 [`DnsOutbound`]。
 ///
@@ -34,11 +35,7 @@ pub struct DnsInbound {
 impl DnsInbound {
     /// 创建 DNS inbound。
     pub fn new(tag: impl Into<String>, handler: Handler, outbound: DnsOutbound) -> Self {
-        Self {
-            tag: tag.into(),
-            handler,
-            outbound,
-        }
+        Self { tag: tag.into(), handler, outbound }
     }
 
     /// 处理 UDP DNS 包：返回响应字节（`None` 表示 Drop，不响应）。
@@ -63,7 +60,7 @@ impl DnsInbound {
                 // EOF = 客户端关闭，正常退出
                 Err(DnsProxyError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                     return Ok(());
-                }
+                },
                 Err(e) => return Err(e),
             };
             let outcome = self.handler.process(&query).await?;
@@ -77,10 +74,7 @@ impl DnsInbound {
 }
 
 /// 将 Handler 决策结果路由到 outbound，返回最终响应字节（None=Drop）。
-async fn route_outcome(
-    outbound: &DnsOutbound,
-    outcome: ProcessOutcome,
-) -> Result<Option<Vec<u8>>> {
+async fn route_outcome(outbound: &DnsOutbound, outcome: ProcessOutcome) -> Result<Option<Vec<u8>>> {
     match outcome {
         ProcessOutcome::Drop => Ok(None),
         ProcessOutcome::Respond { response } => Ok(Some(response)),
@@ -88,7 +82,7 @@ async fn route_outcome(
         ProcessOutcome::Forward { query } | ProcessOutcome::Hijack { query } => {
             let resp = outbound.process(&query).await?;
             Ok(Some(resp))
-        }
+        },
     }
 }
 
@@ -116,9 +110,10 @@ impl InboundHandler for DnsInbound {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use super::*;
     use crate::config::{Config, DnsRuleConfig, RuleAction};
-    use std::net::Ipv4Addr;
 
     /// 构造最小 DNS A 查询消息（handler.rs tests 中同款）。
     fn make_query_bytes(domain: &str, q_type: u16) -> Vec<u8> {
@@ -140,10 +135,7 @@ mod tests {
     }
 
     fn make_inbound_with_rules(rules: Vec<DnsRuleConfig>) -> DnsInbound {
-        let cfg = Config {
-            rule: rules,
-            ..Default::default()
-        };
+        let cfg = Config { rule: rules, ..Default::default() };
         let handler = Handler::init(&cfg);
         let outbound = DnsOutbound::new_with_servers(
             "test-dns",
@@ -173,11 +165,8 @@ mod tests {
             ..Default::default()
         }]);
         let query = make_query_bytes("example.com", 1);
-        let resp = inbound
-            .handle_packet(&query)
-            .await
-            .expect("process")
-        .expect("Return 应返回 Some");
+        let resp =
+            inbound.handle_packet(&query).await.expect("process").expect("Return 应返回 Some");
         // Go rejectNonIPQuery：rCode 未配置 → 0（不再硬编码 REFUSED）。
         let (header, _) = crate::dns_message::parse_dns_query(&resp).expect("parse resp");
         assert!(header.is_response());
@@ -202,12 +191,12 @@ mod tests {
     /// → 验证响应包含 A 记录 1.2.3.4。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn inbound_forward_to_outbound_returns_upstream_response() {
-        use hickory_resolver::proto::op::{
-            Message as HickoryMessage, MessageType, OpCode, ResponseCode,
-        };
-        use hickory_resolver::proto::rr::rdata::A;
-        use hickory_resolver::proto::rr::{RData, Record};
         use std::net::{IpAddr, Ipv4Addr};
+
+        use hickory_resolver::proto::{
+            op::{Message as HickoryMessage, MessageType, OpCode, ResponseCode},
+            rr::{RData, Record, rdata::A},
+        };
         use tokio::net::UdpSocket;
 
         // 1. 启动 mock UDP DNS server——收到 A 查询返回 1.2.3.4
@@ -222,11 +211,7 @@ mod tests {
             if let Some(q) = req.queries.first().cloned() {
                 let name = q.name().clone();
                 resp.add_query(q);
-                let record = Record::from_rdata(
-                    name,
-                    300,
-                    RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
-                );
+                let record = Record::from_rdata(name, 300, RData::A(A(Ipv4Addr::new(1, 2, 3, 4))));
                 resp.add_answer(record);
             }
             let bytes = resp.to_vec().expect("serialize");
@@ -248,24 +233,13 @@ mod tests {
         let query = make_query_bytes("example.com", 1);
 
         // 5. 通过 inbound 处理（Direct → outbound → mock → 响应）
-        let response = inbound
-            .handle_packet(&query)
-            .await
-            .expect("process")
-            .expect("Direct 动作应返回 Some");
+        let response =
+            inbound.handle_packet(&query).await.expect("process").expect("Direct 动作应返回 Some");
 
         // 6. 验证响应——用 hickory 解析（比 parse_dns_query 更完整）
         let parsed = HickoryMessage::from_vec(&response).expect("parse resp");
-        assert_eq!(
-            parsed.message_type,
-            MessageType::Response,
-            "应为响应"
-        );
-        assert_eq!(
-            parsed.response_code,
-            ResponseCode::NoError,
-            "RCODE 应为 NOERROR"
-        );
+        assert_eq!(parsed.message_type, MessageType::Response, "应为响应");
+        assert_eq!(parsed.response_code, ResponseCode::NoError, "RCODE 应为 NOERROR");
         // 验证 answer 含 A 1.2.3.4
         let found = parsed.answers.iter().any(|r| match &r.data {
             RData::A(A(ip)) => *ip == Ipv4Addr::new(1, 2, 3, 4),

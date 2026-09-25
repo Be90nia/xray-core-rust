@@ -13,13 +13,15 @@
 //! 教训，Mobile Gates d0348c0）；server 路径整体 opt-in + cfg 门控双保险，
 //! iOS 下零功能损失（默认 acceptor 仍为 rustls）。
 
-use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
+use foreign_types::{ForeignType as _, ForeignTypeRef as _};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_btls::SslStream as TokioSslStream;
-use foreign_types::{ForeignType as _, ForeignTypeRef as _};
 
 /// btls 服务端流：握手完成后的 TLS 连接（`tokio_btls::SslStream` 的
 /// `Pin<Box<..>>` newtype，集成方式与 [`crate::btls_client::BtlsConn`] 一致）。
@@ -35,6 +37,24 @@ impl<S> BtlsServerStream<S> {
     #[must_use]
     pub fn ssl(&self) -> &btls::ssl::SslRef {
         self.stream.ssl()
+    }
+
+    /// 当前连接的 SSL 裸指针（SSL 级 FFI 原语消费，如 mirror seal；
+    /// 生命周期同 `self`）。
+    #[must_use]
+    pub fn ssl_ptr(&self) -> *mut btls_sys::SSL {
+        self.stream.ssl().as_ptr()
+    }
+}
+
+impl<S: Unpin> BtlsServerStream<S> {
+    /// 底层流的可变引用（**绕过 TLS 记录层直写 wire 字节**，bd z32z）。
+    ///
+    /// REALITY mirror 发送专用：`SSL_seal_raw_tls13_record` 产出的裸 wire
+    /// 记录由此通道写出（Go `hs.c.write` 镜像）。除该场景外禁用——
+    /// 直写未加密字节会破坏 SSL 会话（btls `get_mut` 警告语义）。
+    pub fn get_mut(&mut self) -> &mut S {
+        self.stream.get_mut()
     }
 }
 
@@ -82,8 +102,8 @@ fn normalize_ed25519_pkcs8(key_der: &[u8]) -> Vec<u8> {
             let mut out = Vec::with_capacity(48);
             // 标准 46B PrivateKeyInfo：30 2e { version 0, id-Ed25519, OCTET STRING(34){ seed } }
             out.extend_from_slice(&[
-                0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04,
-                0x22, 0x04, 0x20,
+                0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+                0x04, 0x20,
             ]);
             out.extend_from_slice(seed);
             return out;
@@ -104,21 +124,15 @@ pub fn build_server_ssl_context(
     key_der: &[u8],
 ) -> Result<btls::ssl::SslContext, String> {
     use btls::ssl::{SslContextBuilder, SslMethod};
-    let cert = btls::x509::X509::from_der(cert_der)
-        .map_err(|e| format!("btls server: cert der: {e}"))?;
+    let cert =
+        btls::x509::X509::from_der(cert_der).map_err(|e| format!("btls server: cert der: {e}"))?;
     let key = btls::pkey::PKey::private_key_from_der(&normalize_ed25519_pkcs8(key_der))
         .map_err(|e| format!("btls server: private key der: {e}"))?;
     let mut builder = SslContextBuilder::new(SslMethod::tls())
         .map_err(|e| format!("btls server: ssl ctx: {e}"))?;
-    builder
-        .set_certificate(&cert)
-        .map_err(|e| format!("btls server: set cert: {e}"))?;
-    builder
-        .set_private_key(&key)
-        .map_err(|e| format!("btls server: set key: {e}"))?;
-    builder
-        .check_private_key()
-        .map_err(|e| format!("btls server: cert/key mismatch: {e}"))?;
+    builder.set_certificate(&cert).map_err(|e| format!("btls server: set cert: {e}"))?;
+    builder.set_private_key(&key).map_err(|e| format!("btls server: set key: {e}"))?;
+    builder.check_private_key().map_err(|e| format!("btls server: cert/key mismatch: {e}"))?;
     Ok(builder.build())
 }
 
@@ -146,7 +160,8 @@ where
     // 服务端角色（btls 只在同步 SslStreamBuilder 上暴露此步，tokio 路径需
     // 在握手前直接设置）。
     unsafe { btls_sys::SSL_set_accept_state(ssl.as_ptr()) };
-    let tls_stream = TokioSslStream::new(ssl, stream).map_err(|e| io::Error::other(e.to_string()))?;
+    let tls_stream =
+        TokioSslStream::new(ssl, stream).map_err(|e| io::Error::other(e.to_string()))?;
     let mut pinned = Box::pin(tls_stream);
     pinned
         .as_mut()
@@ -196,11 +211,7 @@ mod tests {
         ssl.set_verify(btls::ssl::SslVerifyMode::NONE);
         let tls_stream = TokioSslStream::new(ssl, client_io).unwrap();
         let mut client = Box::pin(tls_stream);
-        client
-            .as_mut()
-            .connect()
-            .await
-            .expect("client handshake");
+        client.as_mut().connect().await.expect("client handshake");
 
         client.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 4];

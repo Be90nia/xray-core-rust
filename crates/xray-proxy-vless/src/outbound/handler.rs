@@ -16,10 +16,12 @@
 use xray_common::net::{address::Address, port::Port};
 use xray_proto::xray::proxy::vless::encoding::Addons;
 
-use crate::account::MemoryAccount;
-use crate::encoding::{empty_addons, VlessCommand};
-use crate::error::{Result, VlessError};
-use crate::validator::MemoryUser;
+use crate::{
+    account::MemoryAccount,
+    encoding::{VlessCommand, empty_addons},
+    error::{Result, VlessError},
+    validator::MemoryUser,
+};
 
 /// 出站处理器配置（对应 Go 的 `Handler`）。
 #[derive(Debug, Clone)]
@@ -38,12 +40,7 @@ impl Handler {
     /// 构造新 handler。
     #[must_use]
     pub fn new(user: MemoryUser) -> Self {
-        Self {
-            user,
-            destination: None,
-            flow: crate::FLOW_NONE.to_string(),
-            reverse: false,
-        }
+        Self { user, destination: None, flow: crate::FLOW_NONE.to_string(), reverse: false }
     }
 
     /// 链式设置目标地址。
@@ -121,13 +118,7 @@ impl Handler {
             )));
         }
 
-        Ok(RequestParts {
-            command,
-            address: addr,
-            port,
-            addons,
-            account: &self.user.account,
-        })
+        Ok(RequestParts { command, address: addr, port, addons, account: &self.user.account })
     }
 }
 
@@ -177,31 +168,30 @@ impl OutboundProcessor for StubProcessor {
         _link: xray_transport::link::Link,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async {
-            Err(VlessError::NotImplemented(
-                "outbound Process requires full transport stack".into(),
-            ))
+            Err(VlessError::NotImplemented("outbound Process requires full transport stack".into()))
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use xray_common::{
+        net::{address::Address, port::Port},
+        uuid::UUID,
+    };
+
     use super::*;
     use crate::MemoryAccount;
-    use xray_common::net::{address::Address, port::Port};
-    use xray_common::uuid::UUID;
 
     fn sample_user() -> MemoryUser {
         let uuid = UUID::new();
         MemoryUser {
             level: 0,
             email: "u@test".to_string(),
-            account: MemoryAccount::from_proto_account(
-                &xray_proto::xray::proxy::vless::Account {
-                    id: uuid.to_string(),
-                    ..Default::default()
-                },
-            )
+            account: MemoryAccount::from_proto_account(&xray_proto::xray::proxy::vless::Account {
+                id: uuid.to_string(),
+                ..Default::default()
+            })
             .unwrap(),
         }
     }
@@ -256,5 +246,4 @@ mod tests {
         assert_eq!(parts.address, None);
         assert_eq!(parts.port, None);
     }
-
 }

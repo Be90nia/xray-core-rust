@@ -5,12 +5,12 @@
 //! ## 字段
 //!
 //! | 字段 | 用途 |
-//!|------|------|
-//!| `host` | HTTP `Host` header 值（缺省用 dest 地址） |
-//!| `path` | URL 路径（自动补 `/` 前缀） |
-//!| `header` | 自定义额外 header（key→value） |
-//!| `accept_proxy_protocol` | 服务端是否接受 PROXY protocol（切片2） |
-//!| `ed` | Early Data 长度（0=立即读取响应，非 0=延迟读，用于 0-RTT） |
+//! |------|------|
+//! | `host` | HTTP `Host` header 值（缺省用 dest 地址） |
+//! | `path` | URL 路径（自动补 `/` 前缀） |
+//! | `header` | 自定义额外 header（key→value） |
+//! | `accept_proxy_protocol` | 服务端是否接受 PROXY protocol（切片2） |
+//! | `ed` | Early Data 长度（0=立即读取响应，非 0=延迟读，用于 0-RTT） |
 //!
 //! ## 与 Go 差异
 //!
@@ -54,7 +54,9 @@ impl Config {
     }
 
     /// 从 prost 生成的 proto Config 构造。对应 Go 反序列化路径。
-    pub fn from_proto(p: xray_proto::xray::transport::internet::httpupgrade::Config) -> Result<Self> {
+    pub fn from_proto(
+        p: xray_proto::xray::transport::internet::httpupgrade::Config,
+    ) -> Result<Self> {
         Ok(Self {
             host: p.host,
             path: p.path,
@@ -95,11 +97,11 @@ impl Config {
 ///
 /// 语义逐条对齐：
 /// - **提取门**：首个 `ed` query 值为非空字符串才提取（`?ed=`、`?ed` 或首值空 → 整体不动）。
-/// - **数值**：`strconv.Atoi` 语法错误 → 0（溢出时 Go 返回钳制值且错误被忽略）；
-///   `uint32(Ed)` 截断低 32 位，负数回绕。
+/// - **数值**：`strconv.Atoi` 语法错误 → 0（溢出时 Go 返回钳制值且错误被忽略）； `uint32(Ed)`
+///   截断低 32 位，负数回绕。
 /// - **删除**：提取触发时删除**全部** `ed` 参数（即使 Atoi 失败）。
-/// - **重编码**：剩余参数按 Go `Values.Encode()`——键稳定排序、`QueryEscape`
-///   （空格→`+`、保留 `[A-Za-z0-9-_.~]`）、恒为 `k=v`；剩余为空则整个 query 连 `?` 移除。
+/// - **重编码**：剩余参数按 Go `Values.Encode()`——键稳定排序、`QueryEscape` （空格→`+`、保留
+///   `[A-Za-z0-9-_.~]`）、恒为 `k=v`；剩余为空则整个 query 连 `?` 移除。
 /// - **fragment**：`#` 后内容不参与解析，结果原样回接。
 /// - **解析失败**：path 部分含非法 `%` 转义时 Go `url.Parse` 报错 → 整体跳过提取。
 ///
@@ -143,10 +145,8 @@ pub(crate) fn extract_ed_from_path(path: &str) -> (String, Option<u32>) {
     let mut out = base.to_string();
     if !pairs.is_empty() {
         pairs.sort_by(|a, b| a.0.cmp(&b.0)); // 稳定排序：同键多值保持插入序
-        let encoded: Vec<String> = pairs
-            .iter()
-            .map(|(k, v)| format!("{}={}", query_escape(k), query_escape(v)))
-            .collect();
+        let encoded: Vec<String> =
+            pairs.iter().map(|(k, v)| format!("{}={}", query_escape(k), query_escape(v))).collect();
         out.push('?');
         out.push_str(&encoded.join("&"));
     }
@@ -187,7 +187,7 @@ fn query_unescape(s: &str) -> Option<String> {
             b'+' => {
                 out.push(b' ');
                 i += 1;
-            }
+            },
             b'%' => {
                 if i + 2 >= b.len() {
                     return None;
@@ -196,11 +196,11 @@ fn query_unescape(s: &str) -> Option<String> {
                 let lo = hex_val(b[i + 2])?;
                 out.push(hi << 4 | lo);
                 i += 3;
-            }
+            },
             c => {
                 out.push(c);
                 i += 1;
-            }
+            },
         }
     }
     Some(String::from_utf8_lossy(&out).into_owned())
@@ -213,7 +213,7 @@ fn query_escape(s: &str) -> String {
         match c {
             b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(c as char)
-            }
+            },
             b' ' => out.push('+'),
             _ => out.push_str(&format!("%{c:02X}")),
         }
@@ -258,19 +258,13 @@ mod tests {
 
     #[test]
     fn normalized_path_no_leading_slash_prepended() {
-        let cfg = Config {
-            path: "ws".into(),
-            ..Default::default()
-        };
+        let cfg = Config { path: "ws".into(), ..Default::default() };
         assert_eq!(cfg.normalized_path(), "/ws");
     }
 
     #[test]
     fn normalized_path_already_valid_passthrough() {
-        let cfg = Config {
-            path: "/api/ws".into(),
-            ..Default::default()
-        };
+        let cfg = Config { path: "/api/ws".into(), ..Default::default() };
         assert_eq!(cfg.normalized_path(), "/api/ws");
     }
 
@@ -321,14 +315,8 @@ mod tests {
         // 负数：uint32 回绕
         assert_eq!(f("/ws?ed=-1"), ("/ws".to_string(), Some(4294967295)));
         // 溢出钳制（Atoi ErrRange 的值被采用）：正 → MaxInt64 → 0xFFFFFFFF；负 → MinInt64 → 0
-        assert_eq!(
-            f("/ws?ed=99999999999999999999"),
-            ("/ws".to_string(), Some(4294967295))
-        );
-        assert_eq!(
-            f("/ws?ed=-99999999999999999999"),
-            ("/ws".to_string(), Some(0))
-        );
+        assert_eq!(f("/ws?ed=99999999999999999999"), ("/ws".to_string(), Some(4294967295)));
+        assert_eq!(f("/ws?ed=-99999999999999999999"), ("/ws".to_string(), Some(0)));
         // 在 i64 内但超 u32：截断低 32 位
         assert_eq!(f("/ws?ed=4294967297"), ("/ws".to_string(), Some(1)));
         // "+" 在 query unescape 中变空格 → Atoi 失败；"%2B" 解码为 "+" → Atoi 成功

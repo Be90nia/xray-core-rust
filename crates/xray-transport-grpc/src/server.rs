@@ -9,8 +9,9 @@
 //! 转而暴露 `handle_incoming_stream(stream)` 让 dispatcher 在 transport 层
 //! 完成 HTTP/2 解码后注入已建立的 `HunkStream`。
 
-use crate::encoding::{HunkReaderWriter, HunkStream, MultiHunkReaderWriter};
 use xray_transport::link::Link;
+
+use crate::encoding::{HunkReaderWriter, HunkStream, MultiHunkReaderWriter};
 
 /// gRPC 服务端配置（用于注册 Tun/TunMulti 服务名）。
 #[derive(Debug, Clone)]
@@ -71,30 +72,36 @@ impl GrpcServer {
 
 #[cfg(test)]
 mod tests {
+    use std::{future::Future, pin::Pin};
+
     use super::*;
     use crate::config::Config;
-    use std::future::Future;
-    use std::pin::Pin;
 
     struct DummyStream;
     impl HunkStream for DummyStream {
-        fn recv_hunk(&mut self) -> Pin<Box<dyn Future<Output = crate::error::Result<Vec<u8>>> + Send + '_>> {
+        fn recv_hunk(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = crate::error::Result<Vec<u8>>> + Send + '_>> {
             Box::pin(async { Ok(Vec::new()) })
         }
-        fn send_hunk(&mut self, _data: Vec<u8>) -> Pin<Box<dyn Future<Output = crate::error::Result<()>> + Send + '_>> {
+
+        fn send_hunk(
+            &mut self,
+            _data: Vec<u8>,
+        ) -> Pin<Box<dyn Future<Output = crate::error::Result<()>> + Send + '_>> {
             Box::pin(async { Ok(()) })
         }
-        fn close_send(&mut self) -> Pin<Box<dyn Future<Output = crate::error::Result<()>> + Send + '_>> {
+
+        fn close_send(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = crate::error::Result<()>> + Send + '_>> {
             Box::pin(async { Ok(()) })
         }
     }
 
     #[test]
     fn from_config_traditional() {
-        let cfg = Config {
-            service_name: "GunService".into(),
-            ..Default::default()
-        };
+        let cfg = Config { service_name: "GunService".into(), ..Default::default() };
         let server = GrpcServer::from_config(&cfg);
         assert_eq!(server.service_name, "GunService");
         assert_eq!(server.tun_stream_name, "Tun");

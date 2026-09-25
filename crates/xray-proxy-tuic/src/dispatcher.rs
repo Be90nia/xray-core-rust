@@ -14,22 +14,24 @@
 //! [`DialFn`]: xray_app_dispatcher::default::DialFn
 //! [`Connection`]: xray_transport::connection::Connection
 
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::Duration;
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
-
 use xray_app_dispatcher::default::DialFn;
-use xray_common::net::address::Address as XrayAddress;
-use xray_common::net::destination::Destination;
+use xray_common::net::{address::Address as XrayAddress, destination::Destination};
 use xray_transport::connection::Connection;
 
-use crate::client::{TuicClient, TuicConn};
-use crate::protocol::Address;
+use crate::{
+    client::{TuicClient, TuicConn},
+    protocol::Address,
+};
 
 /// TUIC duplex 缓冲（与 anytls 一致：64 KiB）。
 const DUPLEX_BUF_SIZE: usize = 64 * 1024;
@@ -74,6 +76,7 @@ impl Connection for TuicConnection {
     fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(None)
     }
+
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(None)
     }
@@ -108,7 +111,7 @@ pub fn make_dial_fn(client: Arc<TuicClient>) -> DialFn {
             Ok(a) => a,
             Err(e) => {
                 return Box::pin(async move { Err(e) });
-            }
+            },
         };
         Box::pin(async move {
             let conn = tokio::time::timeout(Duration::from_secs(30), client.dial(addr))
@@ -157,7 +160,7 @@ pub fn make_dial_fn_lazy(
             Ok(a) => a,
             Err(e) => {
                 return Box::pin(async move { Err(e) });
-            }
+            },
         };
         Box::pin(async move {
             // lazy init TuicClient（含 QUIC 连接 + 认证），后续复用；init 即挂周期心跳。
@@ -179,19 +182,21 @@ pub fn make_dial_fn_lazy(
                     Ok::<Arc<TuicClient>, String>(c)
                 })
                 .await
-                .inspect_err(|e| tracing::warn!(server = %server_addr_log, "tuic client init failed: {e}"))?;
-            let conn = match tokio::time::timeout(Duration::from_secs(30), c.dial(addr.clone())).await
-            {
-                Ok(Ok(conn)) => conn,
-                Ok(Err(e)) => {
-                    tracing::warn!(target = ?addr, "tuic dial failed: {e}");
-                    return Err(format!("tuic dial: {e}"));
-                }
-                Err(_) => {
-                    tracing::warn!(target = ?addr, "tuic dial timed out");
-                    return Err("tuic dial: timed out".to_string());
-                }
-            };
+                .inspect_err(
+                    |e| tracing::warn!(server = %server_addr_log, "tuic client init failed: {e}"),
+                )?;
+            let conn =
+                match tokio::time::timeout(Duration::from_secs(30), c.dial(addr.clone())).await {
+                    Ok(Ok(conn)) => conn,
+                    Ok(Err(e)) => {
+                        tracing::warn!(target = ?addr, "tuic dial failed: {e}");
+                        return Err(format!("tuic dial: {e}"));
+                    },
+                    Err(_) => {
+                        tracing::warn!(target = ?addr, "tuic dial timed out");
+                        return Err("tuic dial: timed out".to_string());
+                    },
+                };
             Ok(Box::new(TuicConnection::from_conn(conn)) as Box<dyn Connection>)
         })
     })
@@ -205,10 +210,7 @@ impl TuicConnection {
     fn from_conn(conn: TuicConn) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
         let pump = tokio::spawn(pump_streams(conn.send, conn.recv, server_io));
-        Self {
-            inner: client_io,
-            _pump: pump,
-        }
+        Self { inner: client_io, _pump: pump }
     }
 }
 
@@ -234,11 +236,11 @@ async fn pump_streams(
                         tracing::debug!("tuic pump up send error: {e}");
                         break;
                     }
-                }
+                },
                 Err(e) => {
                     tracing::debug!("tuic pump up read error: {e}");
                     break;
-                }
+                },
             }
         }
         // 通知 TUIC server：客户端写方向已关闭
@@ -258,12 +260,12 @@ async fn pump_streams(
                         tracing::debug!("tuic pump down write error: {e}");
                         break;
                     }
-                }
+                },
                 Ok(None) => break, // stream ended
                 Err(e) => {
                     tracing::debug!("tuic pump down read error: {e}");
                     break;
-                }
+                },
             }
         }
         // 通知 duplex client：TUIC server 读方向已结束
@@ -275,11 +277,11 @@ async fn pump_streams(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use xray_common::net::network::Network;
-    use xray_common::net::port::Port;
-
     use std::net::Ipv6Addr;
+
+    use xray_common::net::{network::Network, port::Port};
+
+    use super::*;
 
     #[test]
     fn dest_to_tuic_ipv4() {
@@ -293,7 +295,7 @@ mod tests {
             Address::Ipv4(ip, p) => {
                 assert_eq!(ip.octets(), [127, 0, 0, 1]);
                 assert_eq!(p, 8080);
-            }
+            },
             _ => panic!("expected Ipv4"),
         }
     }
@@ -310,24 +312,21 @@ mod tests {
             Address::Ipv6(ip, p) => {
                 assert_eq!(ip, Ipv6Addr::LOCALHOST);
                 assert_eq!(p, 443);
-            }
+            },
             _ => panic!("expected Ipv6"),
         }
     }
 
     #[test]
     fn dest_to_tuic_domain() {
-        let d = Destination::new(
-            XrayAddress::new_domain("example.com"),
-            Port::new(443),
-            Network::TCP,
-        );
+        let d =
+            Destination::new(XrayAddress::new_domain("example.com"), Port::new(443), Network::TCP);
         let a = dest_to_tuic_address(&d).unwrap();
         match a {
             Address::Domain(s, p) => {
                 assert_eq!(s, "example.com");
                 assert_eq!(p, 443);
-            }
+            },
             _ => panic!("expected Domain"),
         }
     }

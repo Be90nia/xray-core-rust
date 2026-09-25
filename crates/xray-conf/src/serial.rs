@@ -33,9 +33,11 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::built::BuiltConfig;
-use crate::config::Config;
-use crate::error::{ConfError, Result};
+use crate::{
+    built::BuiltConfig,
+    config::Config,
+    error::{ConfError, Result},
+};
 
 impl Config {
     /// 用另一份配置覆盖当前配置。对应 Go `infra/conf.Config.Override`
@@ -44,8 +46,8 @@ impl Config {
     /// 语义：
     /// - 所有标量块字段（log/routing/dns/.../transport）：`Some` 才覆盖。
     /// - inbound：按 tag 命中则替换，否则**追加到尾部**。
-    /// - outbound：按 tag 命中则替换；未命中时若 `source` 文件名（小写）包含
-    ///   `"tail"` 则追加到尾部，否则**前插到头部**（xray.go:478-496）。
+    /// - outbound：按 tag 命中则替换；未命中时若 `source` 文件名（小写）包含 `"tail"`
+    ///   则追加到尾部，否则**前插到头部**（xray.go:478-496）。
     ///
     /// `source` 仅用于 outbound 前插/追加判定与日志，对应 Go 的 `fn` 参数。
     pub fn override_with(&mut self, other: Config, source: &str) {
@@ -95,9 +97,7 @@ impl Config {
 
         // env：key 级合并而非整体替换（xray.go:452-457 EnvConfig.Override）。
         if let Some(oenv) = other.env {
-            self.env
-                .get_or_insert_with(std::collections::HashMap::new)
-                .extend(oenv);
+            self.env.get_or_insert_with(std::collections::HashMap::new).extend(oenv);
         }
 
         // inbound：tag 命中替换，否则追加（xray.go:462-474）。
@@ -110,14 +110,14 @@ impl Config {
                             "[{}] updated inbound with tag: {}", source, ib.tag
                         );
                         self.inbound_configs[idx] = ib;
-                    }
+                    },
                     None => {
                         tracing::info!(
                             target: "xray_conf",
                             "[{}] appended inbound with tag: {}", source, ib.tag
                         );
                         self.inbound_configs.push(ib);
-                    }
+                    },
                 }
             }
         }
@@ -135,7 +135,7 @@ impl Config {
                             "[{}] updated outbound with tag: {}", source, ob.tag
                         );
                         self.outbound_configs[idx] = ob;
-                    }
+                    },
                     None => {
                         if is_tail {
                             tracing::info!(
@@ -150,7 +150,7 @@ impl Config {
                             );
                             prepends.push(ob);
                         }
-                    }
+                    },
                 }
             }
             if !prepends.is_empty() {
@@ -173,10 +173,8 @@ impl Config {
         let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
         let mut serializer = serde_json::Serializer::with_formatter(&mut buf, formatter);
         serde::Serialize::serialize(self, &mut serializer)?;
-        let mut out = String::from_utf8(buf).map_err(|e| ConfError::Build {
-            what: "config",
-            message: e.to_string(),
-        })?;
+        let mut out = String::from_utf8(buf)
+            .map_err(|e| ConfError::Build { what: "config", message: e.to_string() })?;
         out.push('\n');
         Ok(out)
     }
@@ -196,7 +194,7 @@ pub fn merge_configs(paths: &[std::path::PathBuf]) -> Result<Config> {
             Some(mut base) => {
                 base.override_with(cfg, &path.display().to_string());
                 merged = Some(base);
-            }
+            },
         }
     }
     merged.ok_or_else(|| ConfError::Read("no config files to merge".into()))
@@ -216,10 +214,11 @@ pub fn build_config(paths: &[std::path::PathBuf]) -> Result<BuiltConfig> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::{io::Write, path::PathBuf};
+
     use serde_json::json;
-    use std::io::Write;
-    use std::path::PathBuf;
+
+    use super::*;
 
     fn write_temp(name: &str, content: &str) -> PathBuf {
         let base = std::env::temp_dir().join("xray-conf-serial-tests");
@@ -242,20 +241,14 @@ mod tests {
             r#"{ "routing": {"domainStrategy": "AsIs"}, "dns": {"servers": ["1.1.1.1"]} }"#,
         )
         .unwrap();
-        let other = Config::from_json_str(r#"{ "routing": {"domainStrategy": "IPIfNonMatch"} }"#)
-            .unwrap();
+        let other =
+            Config::from_json_str(r#"{ "routing": {"domainStrategy": "IPIfNonMatch"} }"#).unwrap();
 
         base.override_with(other, "second.json");
 
-        assert_eq!(
-            base.routing.as_ref().unwrap()["domainStrategy"],
-            json!("IPIfNonMatch")
-        );
+        assert_eq!(base.routing.as_ref().unwrap()["domainStrategy"], json!("IPIfNonMatch"));
         // dns 为 None → 保留原值。
-        assert_eq!(
-            base.dns.as_ref().unwrap()["servers"],
-            json!(["1.1.1.1"])
-        );
+        assert_eq!(base.dns.as_ref().unwrap()["servers"], json!(["1.1.1.1"]));
     }
 
     #[test]
@@ -280,10 +273,7 @@ mod tests {
         let tags: Vec<&str> = base.inbound_configs.iter().map(|i| i.tag.as_str()).collect();
         assert_eq!(tags, vec!["a", "b", "c"]);
         // b 被替换为 port 2000。
-        assert_eq!(
-            serde_json::to_value(&base.inbound_configs[1].port).unwrap(),
-            json!(2000)
-        );
+        assert_eq!(serde_json::to_value(&base.inbound_configs[1].port).unwrap(), json!(2000));
     }
 
     #[test]
@@ -306,10 +296,9 @@ mod tests {
         assert_eq!(tags, vec!["proxy", "direct"]);
 
         // tail 文件：未命中 tag → 追加。
-        let tail = Config::from_json_str(
-            r#"{ "outbounds": [{ "protocol": "http", "tag": "tail-ob" }] }"#,
-        )
-        .unwrap();
+        let tail =
+            Config::from_json_str(r#"{ "outbounds": [{ "protocol": "http", "tag": "tail-ob" }] }"#)
+                .unwrap();
         base.override_with(tail, "99_zz_tail.json");
         let tags: Vec<&str> = base.outbound_configs.iter().map(|o| o.tag.as_str()).collect();
         assert_eq!(tags, vec!["proxy", "direct", "tail-ob"]);
@@ -332,19 +321,13 @@ mod tests {
         let mut base = Config::from_json_str(r#"{ "env": { "A": "1" } }"#).unwrap();
         let other = Config::from_json_str("{}").unwrap();
         base.override_with(other, "third.json");
-        assert_eq!(
-            base.env.as_ref().unwrap().get("A").map(String::as_str),
-            Some("1")
-        );
+        assert_eq!(base.env.as_ref().unwrap().get("A").map(String::as_str), Some("1"));
 
         // base 无 env、override 有：采用 override。
         let mut base = Config::from_json_str("{}").unwrap();
         let other = Config::from_json_str(r#"{ "env": { "D": "5" } }"#).unwrap();
         base.override_with(other, "fourth.json");
-        assert_eq!(
-            base.env.as_ref().unwrap().get("D").map(String::as_str),
-            Some("5")
-        );
+        assert_eq!(base.env.as_ref().unwrap().get("D").map(String::as_str), Some("5"));
     }
 
     // ----- to_json_value / to_json_string -----
@@ -466,10 +449,7 @@ mod tests {
         cleanup(&p2);
 
         // 标量字段被第二个文件覆盖。
-        assert_eq!(
-            merged.log.as_ref().unwrap().loglevel.as_deref(),
-            Some("warning")
-        );
+        assert_eq!(merged.log.as_ref().unwrap().loglevel.as_deref(), Some("warning"));
         // inbound 保留；outbound 前插 proxy。
         assert_eq!(merged.inbound_count(), 1);
         let tags: Vec<&str> = merged.outbound_configs.iter().map(|o| o.tag.as_str()).collect();

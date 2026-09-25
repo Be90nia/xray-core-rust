@@ -9,25 +9,35 @@
 
 use std::sync::Arc;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
-use tokio::net::TcpListener;
-use xray_app_dispatcher::default::SimpleOhm;
-use xray_app_dispatcher::{DispatchHandler, OutboundHandlerManager, UdpDispatchSession};
-use xray_buf::io::{new_reader, new_writer};
-use xray_common::protocol::{Command, ResponseCommand, ResponseHeader, SecurityType};
-use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead};
-use xray_transport::link::Link;
-use xray_transport::system_listener::InboundTcpListener;
-use xray_common::net::destination::Destination;
-
-use crate::encoding::server::{ServerSession, SessionHistory};
-use crate::encoding::{generate_chacha20poly1305_key, ChunkNonceGenerator};
-use crate::encoding::body_chunk::{
-    PlainSizeParser, ShakeSizeParserAdapter, SizeParser, make_authenticated_length_size_parser,
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf},
+    net::TcpListener,
 };
-use crate::request_option;
-use crate::error::VmessError;
-use crate::validator::TimedUserValidator;
+use xray_app_dispatcher::{
+    DispatchHandler, OutboundHandlerManager, UdpDispatchSession, default::SimpleOhm,
+};
+use xray_buf::io::{new_reader, new_writer};
+use xray_common::{
+    net::destination::Destination,
+    protocol::{Command, ResponseCommand, ResponseHeader, SecurityType},
+};
+use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead};
+use xray_transport::{link::Link, system_listener::InboundTcpListener};
+
+use crate::{
+    encoding::{
+        ChunkNonceGenerator,
+        body_chunk::{
+            PlainSizeParser, ShakeSizeParserAdapter, SizeParser,
+            make_authenticated_length_size_parser,
+        },
+        generate_chacha20poly1305_key,
+        server::{ServerSession, SessionHistory},
+    },
+    error::VmessError,
+    request_option,
+    validator::TimedUserValidator,
+};
 /// Duplex 缓冲大小（与 chunk payload 上限 8 KiB 对齐，留足一个 chunk 余量）。
 const DUPLEX_BUF: usize = 16_384;
 
@@ -119,8 +129,8 @@ const PUMP_BUF: usize = 8192;
 /// 1. `decode_request_header_async` 解析 VMess 请求头（含 AuthID + AEAD 解密 + 反重放）
 /// 2. TCP 命令的 address+port → `Destination`；UDP/Mux warn 跳过
 /// 3. `encode_response_header_async` 发送响应头（客户端收到后开始 body 流）
-/// 4. body chunk pump：duplex 桥接，客户端→server 方向解密 chunks 为明文交给 dispatch，
-///    dispatch 回的明文按 chunk 格式加密发回客户端
+/// 4. body chunk pump：duplex 桥接，客户端→server 方向解密 chunks 为明文交给 dispatch， dispatch
+///    回的明文按 chunk 格式加密发回客户端
 ///
 /// # 参数
 /// - `listener`：已绑定的 TCP listener
@@ -159,9 +169,8 @@ pub async fn serve_vmess(
             Err(e) => {
                 tracing::warn!(error = %e, "vmess accept failed");
                 continue;
-            }
+            },
         };
-
 
         let handler = Arc::clone(&handler);
         let validator = Arc::clone(&validator);
@@ -170,12 +179,26 @@ pub async fn serve_vmess(
         tokio::spawn(async move {
             let result = if let Some(acc) = tls {
                 match acc.accept(stream).await {
-                    Ok(tls_stream) => handle_connection(tls_stream, &handler, &validator, &history, false, handshake_timeout).await,
-                    Err(e) => { tracing::warn!(error = %e, "vmess TLS accept failed"); return; }
+                    Ok(tls_stream) => {
+                        handle_connection(
+                            tls_stream,
+                            &handler,
+                            &validator,
+                            &history,
+                            false,
+                            handshake_timeout,
+                        )
+                        .await
+                    },
+                    Err(e) => {
+                        tracing::warn!(error = %e, "vmess TLS accept failed");
+                        return;
+                    },
                 }
             } else {
                 // Go：裸 TCP/Unix 连接认证失败时 drain 防时序指纹；TLS 连接不 drain
-                handle_connection(stream, &handler, &validator, &history, true, handshake_timeout).await
+                handle_connection(stream, &handler, &validator, &history, true, handshake_timeout)
+                    .await
             };
             if let Err(e) = result {
                 // Go vmess inbound.go:250：拒绝 AtInfo + RemoteAddr。
@@ -208,11 +231,10 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
     .await
     {
         Ok(r) => r,
-        Err(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "vmess handshake read timeout",
-        )
-        .into()),
+        Err(_) => {
+            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "vmess handshake read timeout")
+                .into())
+        },
     };
     let (header, _user) = match decoded {
         Ok(v) => v,
@@ -222,8 +244,12 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
             let err = std::io::Error::other(format!("vmess decode header: {e}"));
             if is_drain {
                 use xray_common::drain::{BehaviorSeedLimitedDrainer, Drainer as _};
-                let drainer =
-                    BehaviorSeedLimitedDrainer::new(crate::validator::Validator::behavior_seed(validator.as_ref()) as i64, 16 + 38, 3266, 64);
+                let drainer = BehaviorSeedLimitedDrainer::new(
+                    crate::validator::Validator::behavior_seed(validator.as_ref()) as i64,
+                    16 + 38,
+                    3266,
+                    64,
+                );
                 // Go server.go:137 drainConnection 恒 acknowledge buffer.Len()=16
                 //（auth_id）；解密失败分支（server.go:167-169）另 acknowledge
                 // OpenVMessAEADHeader 回传的 AEAD 层精确 bytesRead（73fr：原先
@@ -234,10 +260,11 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
                 }
                 // drain 受同一 handshake deadline 限制（Go SetReadDeadline 覆盖
                 // decode+drain 总时长；原硬编码 4s 偏离 policy 缺省 60s）
-                let _ = tokio::time::timeout_at(handshake_deadline, drainer.drain(&mut stream_r)).await;
+                let _ =
+                    tokio::time::timeout_at(handshake_deadline, drainer.drain(&mut stream_r)).await;
             }
             return Err(err);
-        }
+        },
     };
 
     // 2. TCP/UDP 走完整数据路径；Mux 暂 warn 跳过（zx7 在 xray-core 层另行处理）。
@@ -248,32 +275,40 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
 
     // 3. 构造 SizeParser（支持 AUTHENTICATED_LENGTH / CHUNK_MASKING / Plain 三条路径）
     let req_key = session.request_body_key;
-    let req_size_parser: Box<dyn SizeParser + Send> = if header
-        .option
-        .has(request_option::AUTHENTICATED_LENGTH)
-    {
-        match make_authenticated_length_size_parser(&req_key, &session.request_body_iv, header.security) {
-            Ok(sp) => Box::new(sp),
-            Err(e) => return Err(std::io::Error::other(format!("vmess auth_len size parser: {e}"))),
-        }
-    } else if header.option.has(request_option::CHUNK_MASKING) {
-        Box::new(ShakeSizeParserAdapter::new(&session.request_body_iv))
-    } else {
-        Box::new(PlainSizeParser)
-    };
-    let resp_size_parser: Box<dyn SizeParser + Send> = if header
-        .option
-        .has(request_option::AUTHENTICATED_LENGTH)
-    {
-        match make_authenticated_length_size_parser(&req_key, &session.request_body_iv, header.security) {
-            Ok(sp) => Box::new(sp),
-            Err(e) => return Err(std::io::Error::other(format!("vmess auth_len size parser: {e}"))),
-        }
-    } else if header.option.has(request_option::CHUNK_MASKING) {
-        Box::new(ShakeSizeParserAdapter::new(&session.response_body_iv))
-    } else {
-        Box::new(PlainSizeParser)
-    };
+    let req_size_parser: Box<dyn SizeParser + Send> =
+        if header.option.has(request_option::AUTHENTICATED_LENGTH) {
+            match make_authenticated_length_size_parser(
+                &req_key,
+                &session.request_body_iv,
+                header.security,
+            ) {
+                Ok(sp) => Box::new(sp),
+                Err(e) => {
+                    return Err(std::io::Error::other(format!("vmess auth_len size parser: {e}")));
+                },
+            }
+        } else if header.option.has(request_option::CHUNK_MASKING) {
+            Box::new(ShakeSizeParserAdapter::new(&session.request_body_iv))
+        } else {
+            Box::new(PlainSizeParser)
+        };
+    let resp_size_parser: Box<dyn SizeParser + Send> =
+        if header.option.has(request_option::AUTHENTICATED_LENGTH) {
+            match make_authenticated_length_size_parser(
+                &req_key,
+                &session.request_body_iv,
+                header.security,
+            ) {
+                Ok(sp) => Box::new(sp),
+                Err(e) => {
+                    return Err(std::io::Error::other(format!("vmess auth_len size parser: {e}")));
+                },
+            }
+        } else if header.option.has(request_option::CHUNK_MASKING) {
+            Box::new(ShakeSizeParserAdapter::new(&session.response_body_iv))
+        } else {
+            Box::new(PlainSizeParser)
+        };
     let global_padding = header.option.has(request_option::GLOBAL_PADDING);
     let no_termination = header.option.has(request_option::NO_TERMINATION_SIGNAL);
 
@@ -302,7 +337,7 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
             let s = Aes128Gcm::new(&session.response_body_key)
                 .map_err(|e| std::io::Error::other(format!("vmess aes128 resp key: {e}")))?;
             (BodyCipher::Aes(r), BodyCipher::Aes(s))
-        }
+        },
         SecurityType::Chacha20Poly1305 => {
             let rk = generate_chacha20poly1305_key(&session.request_body_key);
             let r = ChaCha20Poly1305Aead::new(&rk)
@@ -311,22 +346,28 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
             let s = ChaCha20Poly1305Aead::new(&sk)
                 .map_err(|e| std::io::Error::other(format!("vmess chacha resp key: {e}")))?;
             (BodyCipher::Chacha(r), BodyCipher::Chacha(s))
-        }
-
+        },
 
         other => {
-            return Err(std::io::Error::other(format!(
-                "vmess unsupported security: {other:?}"
-            )));
-        }
+            return Err(std::io::Error::other(format!("vmess unsupported security: {other:?}")));
+        },
     };
 
     // 7. TCP：duplex pump + dispatch；UDP：chunk 即 packet（Go 非 cone 语义）
     if header.command == Command::Udp {
         return pump_udp_session(
-            stream_r, stream_w, &dest, Arc::clone(handler),
-            req_cipher, resp_cipher, req_iv, resp_iv,
-            req_size_parser, resp_size_parser, global_padding, no_termination,
+            stream_r,
+            stream_w,
+            &dest,
+            Arc::clone(handler),
+            req_cipher,
+            resp_cipher,
+            req_iv,
+            resp_iv,
+            req_size_parser,
+            resp_size_parser,
+            global_padding,
+            no_termination,
         )
         .await;
     }
@@ -336,15 +377,23 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
     let (client_r, client_w) = tokio::io::split(client_io);
     let link = Link::new(new_reader(client_r), new_writer(client_w));
 
-    let pump_a = pump_request_body(stream_r, server_w, req_cipher, req_iv, req_size_parser, global_padding);
-    let pump_b = pump_response_body(server_r, stream_w, resp_cipher, resp_iv, resp_size_parser, global_padding, no_termination);
+    let pump_a =
+        pump_request_body(stream_r, server_w, req_cipher, req_iv, req_size_parser, global_padding);
+    let pump_b = pump_response_body(
+        server_r,
+        stream_w,
+        resp_cipher,
+        resp_iv,
+        resp_size_parser,
+        global_padding,
+        no_termination,
+    );
     let dispatch_fut = handler.dispatch(&dest, link);
 
     // 三路并发：pump_a / pump_b / dispatch，全部完成后返回
     let _ = tokio::join!(pump_a, pump_b, dispatch_fut);
     Ok(())
 }
-///
 /// chunk 格式：`[size_field][AEAD ciphertext][padding]`。
 /// size_field 长度由 `size_parser.size_bytes()` 决定（Plain/Shake=2, AEAD=18）。
 /// 终止 chunk = `seal([])` → 解密后 plaintext 为空即终止信号。
@@ -365,11 +414,8 @@ async fn pump_request_body<C, R>(
     let mut ciphertext = Vec::with_capacity(PUMP_BUF + 96);
     loop {
         // SHAKE128 流同步：先 next_padding_len 再 decode（与 body_chunk decode 一致）。
-        let padding_size = if global_padding {
-            usize::from(size_parser.next_padding_len())
-        } else {
-            0
-        };
+        let padding_size =
+            if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
         let sb = size_parser.size_bytes();
         size_field.resize(sb, 0);
         if stream_r.read_exact(&mut size_field).await.is_err() {
@@ -391,14 +437,14 @@ async fn pump_request_body<C, R>(
                 if server_w.write_all(pt).await.is_err() {
                     break;
                 }
-            }
+            },
             Err(e) => {
                 tracing::debug!(
                     error = %e.to_string(),
                     "vmess request body chunk open failed"
                 );
                 break;
-            }
+            },
         }
     }
     // shutdown 写半边，让 dispatch reader 看到 EOF（标记请求 body 结束）
@@ -429,11 +475,8 @@ async fn pump_response_body<C, W>(
             Ok(0) => break,
             Ok(n) => {
                 // SHAKE128 流消费顺序：next_padding_len → encode（与 decode 侧对称）
-                let padding_size = if global_padding {
-                    usize::from(size_parser.next_padding_len())
-                } else {
-                    0
-                };
+                let padding_size =
+                    if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
                 let sb = size_parser.size_bytes();
                 let nonce = nonce_gen.next_ref();
                 chunk_buf.clear();
@@ -456,14 +499,14 @@ async fn pump_response_body<C, W>(
                 if stream_w.write_all(&chunk_buf).await.is_err() {
                     break;
                 }
-            }
+            },
             Err(e) => {
                 tracing::debug!(
                     error = %e,
                     "vmess response body plaintext read failed"
                 );
                 break;
-            }
+            },
         }
     }
     // 写终止 chunk：seal([]) → 仅 tag 字节，客户端 decode 看到 plaintext 为空即返回
@@ -498,11 +541,7 @@ async fn write_udp_chunk<W: AsyncWrite + Unpin>(
     chunk_buf: &mut Vec<u8>,
 ) -> std::io::Result<()> {
     // SHAKE128 流消费顺序：next_padding_len → encode（与 decode 侧对称）
-    let padding_size = if global_padding {
-        usize::from(sp.next_padding_len())
-    } else {
-        0
-    };
+    let padding_size = if global_padding { usize::from(sp.next_padding_len()) } else { 0 };
     let nonce = nonce_gen.next_ref();
     let sb = sp.size_bytes();
     chunk_buf.clear();
@@ -559,11 +598,8 @@ where
         let mut ciphertext = Vec::with_capacity(PUMP_BUF + 96);
         loop {
             // padding → size → ciphertext → open
-            let padding_size = if global_padding {
-                usize::from(req_sp.next_padding_len())
-            } else {
-                0
-            };
+            let padding_size =
+                if global_padding { usize::from(req_sp.next_padding_len()) } else { 0 };
             let sb = req_sp.size_bytes();
             size_field.resize(sb, 0);
             if stream_r.read_exact(&mut size_field).await.is_err() {
@@ -592,7 +628,7 @@ where
                         break; // relay 已退出
                     }
                     ciphertext = Vec::with_capacity(PUMP_BUF + 96);
-                }
+                },
                 Err(_) => break,
             }
         }
@@ -611,9 +647,7 @@ where
         let mut up_done = false;
         loop {
             let incoming = if up_done {
-                tokio::time::timeout(UP_DONE_IDLE, session.recv_packet())
-                    .await
-                    .unwrap_or(Ok(None)) // 收尾窗口超时 → 会话结束
+                tokio::time::timeout(UP_DONE_IDLE, session.recv_packet()).await.unwrap_or(Ok(None)) // 收尾窗口超时 → 会话结束
             } else {
                 tokio::select! {
                     pkt = up_rx.recv() => {
@@ -678,19 +712,21 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::account::MemoryAccount;
-    use crate::encoding::client::ClientSession;
-    use crate::encoding::VERSION;
-    use crate::validator::{MemoryUser, Validator};
     use tokio::net::TcpListener;
     use xray_app_dispatcher::default::DialBridge;
-    use xray_common::net::address::Address;
-    use xray_common::net::destination::Destination;
-    use xray_common::net::port::Port;
-    use xray_common::protocol::RequestHeader;
-    use xray_common::uuid::UUID;
-    use xray_proxy_freedom::{make_freedom_dial_fn, FreedomDispatchBridge};
+    use xray_common::{
+        net::{address::Address, destination::Destination, port::Port},
+        protocol::RequestHeader,
+        uuid::UUID,
+    };
+    use xray_proxy_freedom::{FreedomDispatchBridge, make_freedom_dial_fn};
+
+    use super::*;
+    use crate::{
+        account::MemoryAccount,
+        encoding::{VERSION, client::ClientSession},
+        validator::{MemoryUser, Validator},
+    };
 
     const SAMPLE_UUID_STR: &str = "66ad4540-b58c-4ad2-9926-ea63445a9b57";
 
@@ -719,7 +755,7 @@ mod tests {
                         if sock.write_all(&buf[..n]).await.is_err() {
                             break;
                         }
-                    }
+                    },
                 }
             }
         });
@@ -732,8 +768,8 @@ mod tests {
         // 与生产 wiring（xray-core/src/outbound.rs）一致：
         // TCP 走 DialBridge，UDP 走 FreedomDispatchBridge → freedom udp::relay。
         let tcp_bridge = Arc::new(DialBridge::new("freedom", make_freedom_dial_fn()));
-        let bridge = Arc::new(FreedomDispatchBridge::from_bridge(tcp_bridge))
-            as Arc<dyn DispatchHandler>;
+        let bridge =
+            Arc::new(FreedomDispatchBridge::from_bridge(tcp_bridge)) as Arc<dyn DispatchHandler>;
         ohm.set_default(bridge);
         ohm
     }
@@ -751,28 +787,32 @@ mod tests {
         let vmess_listener = InboundTcpListener::bind(
             "127.0.0.1:0",
             xray_transport::sockopt::SocketOptions::default(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let vmess_addr = vmess_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
         tokio::spawn(async move {
-            let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await;
+            let _ = serve_vmess(
+                vmess_listener,
+                ohm_clone,
+                validator_clone,
+                None,
+                xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT,
+            )
+            .await;
         });
 
         // 4. VMess client：connect → encode header → decode response header → echo round-trip
-        let mut client = tokio::net::TcpStream::connect(vmess_addr)
-            .await
-            .unwrap();
+        let mut client = tokio::net::TcpStream::connect(vmess_addr).await.unwrap();
         let client_session = ClientSession::new();
-        let dest = Destination::tcp(
-            Address::ipv4(std::net::Ipv4Addr::LOCALHOST),
-            Port::new(echo_port),
-        );
+        let dest =
+            Destination::tcp(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(echo_port));
         let header = RequestHeader::new(VERSION, Command::Tcp, dest, security);
 
-        let sealed_header = client_session
-            .encode_request_header(&header, &cmd_key)
-            .expect("encode header");
+        let sealed_header =
+            client_session.encode_request_header(&header, &cmd_key).expect("encode header");
         client.write_all(&sealed_header).await.unwrap();
 
         // 读响应头（客户端收到后才能开始 body 流）
@@ -793,10 +833,7 @@ mod tests {
             .decode_response_body_async(&header, &mut client)
             .await
             .expect("decode response body");
-        assert_eq!(
-            response, payload,
-            "should receive echo through vmess proxy ({security:?})"
-        );
+        assert_eq!(response, payload, "should receive echo through vmess proxy ({security:?})");
     }
 
     #[tokio::test]
@@ -821,44 +858,42 @@ mod tests {
         let vmess_listener = InboundTcpListener::bind(
             "127.0.0.1:0",
             xray_transport::sockopt::SocketOptions::default(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let vmess_addr = vmess_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
         tokio::spawn(async move {
-            let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await;
+            let _ = serve_vmess(
+                vmess_listener,
+                ohm_clone,
+                validator_clone,
+                None,
+                xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT,
+            )
+            .await;
         });
 
         // client 用未注册的随机 UUID
         let unknown_uuid = UUID::new();
         let cmd_key = crate::account::cmd_key_of(&unknown_uuid);
-        let mut client = tokio::net::TcpStream::connect(vmess_addr)
-            .await
-            .unwrap();
+        let mut client = tokio::net::TcpStream::connect(vmess_addr).await.unwrap();
 
         let client_session = ClientSession::new();
-        let dest = Destination::tcp(
-            Address::ipv4(std::net::Ipv4Addr::LOCALHOST),
-            Port::new(80),
-        );
-        let header = RequestHeader::new(
-            VERSION,
-            Command::Tcp,
-            dest,
-            SecurityType::Aes128Gcm,
-        );
-        let sealed_header = client_session
-            .encode_request_header(&header, &cmd_key)
-            .expect("encode header");
+        let dest = Destination::tcp(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(80));
+        let header = RequestHeader::new(VERSION, Command::Tcp, dest, SecurityType::Aes128Gcm);
+        let sealed_header =
+            client_session.encode_request_header(&header, &cmd_key).expect("encode header");
         client.write_all(&sealed_header).await.unwrap();
 
         // server 因 UserNotFound 关闭 → client 读响应得到 EOF 或 reset
         let mut buf = [0u8; 16];
         let result = client.read(&mut buf).await;
         match result {
-            Ok(0) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionAborted => {}
+            Ok(0) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {},
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionAborted => {},
             other => panic!("expected EOF or connection reset, got {other:?}"),
         }
     }
@@ -884,12 +919,21 @@ mod tests {
         let vmess_listener = InboundTcpListener::bind(
             "127.0.0.1:0",
             xray_transport::sockopt::SocketOptions::default(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let vmess_addr = vmess_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
         tokio::spawn(async move {
-            let _ = serve_vmess(vmess_listener, ohm_clone, validator_clone, None, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await;
+            let _ = serve_vmess(
+                vmess_listener,
+                ohm_clone,
+                validator_clone,
+                None,
+                xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT,
+            )
+            .await;
         });
 
         // 3. client：UDP command header 指向 echo
@@ -901,9 +945,8 @@ mod tests {
         );
         let header = RequestHeader::new(VERSION, Command::Udp, dest, SecurityType::Aes128Gcm);
 
-        let sealed_header = client_session
-            .encode_request_header(&header, &cmd_key)
-            .expect("encode header");
+        let sealed_header =
+            client_session.encode_request_header(&header, &cmd_key).expect("encode header");
         client.write_all(&sealed_header).await.unwrap();
         let _resp = client_session
             .decode_response_header_async(&mut client)
@@ -938,7 +981,15 @@ mod tests {
         // 对端只写 8 字节（不足 16B auth_id）后沉默 → decode 在 60s deadline 终止
         let (mut client, server) = tokio::io::duplex(64);
         let server_task = tokio::spawn(async move {
-            handle_connection(server, &handler, &validator, &history, true, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT).await
+            handle_connection(
+                server,
+                &handler,
+                &validator,
+                &history,
+                true,
+                xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT,
+            )
+            .await
         });
         client.write_all(&[0u8; 8]).await.unwrap();
 

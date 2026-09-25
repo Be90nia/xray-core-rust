@@ -20,10 +20,7 @@ impl StatsCollector for FixedStats {
         let mut s = StatsSnapshot::default();
         s.inbound.insert(
             "test_in".to_string(),
-            xray_app_metrics::TrafficCount {
-                uplink: 42,
-                downlink: 7,
-            },
+            xray_app_metrics::TrafficCount { uplink: 42, downlink: 7 },
         );
         s
     }
@@ -40,12 +37,8 @@ fn pick_port() -> std::net::SocketAddr {
 /// 微型 HTTP/1.1 GET 客户端：发送请求、读至 EOF，返回完整响应。
 async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut stream = tokio::net::TcpStream::connect(addr)
-        .await
-        .expect("connect");
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-    );
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).await.expect("write");
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await.expect("read");
@@ -71,31 +64,17 @@ async fn settle() {
 #[tokio::test]
 async fn feature_start_listens_on_configured_addr_and_serves_metrics() {
     let addr = pick_port();
-    let cfg = xray_app_metrics::MetricsConfig {
-        tag: "metrics_out".into(),
-        listen: addr.to_string(),
-    };
+    let cfg =
+        xray_app_metrics::MetricsConfig { tag: "metrics_out".into(), listen: addr.to_string() };
     let feature = MetricsFeature::new(cfg).with_stats_collector(Arc::new(FixedStats));
 
     feature.start().expect("start ok");
 
     let resp = http_get(addr, "/metrics").await;
-    assert!(
-        resp.starts_with("HTTP/1.1 200 OK"),
-        "expected 200 OK, got: {resp}"
-    );
-    assert!(
-        resp.contains("text/plain; version=0.0.4"),
-        "missing Prometheus content-type: {resp}"
-    );
-    assert!(
-        resp.contains("# HELP xray_traffic_bytes"),
-        "missing HELP line: {resp}"
-    );
-    assert!(
-        resp.contains("# TYPE xray_traffic_bytes counter"),
-        "missing TYPE line: {resp}"
-    );
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "expected 200 OK, got: {resp}");
+    assert!(resp.contains("text/plain; version=0.0.4"), "missing Prometheus content-type: {resp}");
+    assert!(resp.contains("# HELP xray_traffic_bytes"), "missing HELP line: {resp}");
+    assert!(resp.contains("# TYPE xray_traffic_bytes counter"), "missing TYPE line: {resp}");
     assert!(
         resp.contains(r#"xray_traffic_bytes{type="inbound",tag="test_in",direction="uplink"} 42"#),
         "missing uplink sample: {resp}"
@@ -111,10 +90,7 @@ async fn feature_start_listens_on_configured_addr_and_serves_metrics() {
 #[tokio::test]
 async fn feature_close_stops_http_listener() {
     let addr = pick_port();
-    let cfg = xray_app_metrics::MetricsConfig {
-        tag: "t".into(),
-        listen: addr.to_string(),
-    };
+    let cfg = xray_app_metrics::MetricsConfig { tag: "t".into(), listen: addr.to_string() };
     let feature = MetricsFeature::new(cfg);
     feature.start().expect("start ok");
     // 先确认启动后能连。
@@ -124,18 +100,12 @@ async fn feature_close_stops_http_listener() {
     settle().await;
 
     // close 后端口不再接收连接。
-    assert!(
-        !try_connect(addr).await,
-        "should not connect after close"
-    );
+    assert!(!try_connect(addr).await, "should not connect after close");
 }
 
 #[tokio::test]
 async fn feature_start_without_listen_is_ok() {
-    let cfg = xray_app_metrics::MetricsConfig {
-        tag: "t".into(),
-        listen: String::new(),
-    };
+    let cfg = xray_app_metrics::MetricsConfig { tag: "t".into(), listen: String::new() };
     let feature = MetricsFeature::new(cfg);
     feature.start().expect("start ok");
     feature.close().expect("close ok");
@@ -144,10 +114,7 @@ async fn feature_start_without_listen_is_ok() {
 #[tokio::test]
 async fn feature_start_is_idempotent() {
     let addr = pick_port();
-    let cfg = xray_app_metrics::MetricsConfig {
-        tag: "idem".into(),
-        listen: addr.to_string(),
-    };
+    let cfg = xray_app_metrics::MetricsConfig { tag: "idem".into(), listen: addr.to_string() };
     let feature = MetricsFeature::new(cfg);
     feature.start().expect("first start ok");
     feature.start().expect("second start ok (no error)");
@@ -170,10 +137,7 @@ async fn feature_serves_metrics_with_injected_obs_collector() {
     }
 
     let addr = pick_port();
-    let cfg = xray_app_metrics::MetricsConfig {
-        tag: "t".into(),
-        listen: addr.to_string(),
-    };
+    let cfg = xray_app_metrics::MetricsConfig { tag: "t".into(), listen: addr.to_string() };
     let feature = MetricsFeature::new(cfg).with_obs_collector(Arc::new(WithObs));
     feature.start().expect("start ok");
 

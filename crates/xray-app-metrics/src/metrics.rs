@@ -9,14 +9,15 @@
 //! 本 crate 只保留纯业务：counter name 解析、stats 快照结构、observation 快照结构、
 //! 启动编排顺序。
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::Mutex;
 
-use crate::config::MetricsConfig;
-use crate::error::{at_error, at_warning, MetricsError};
-use crate::outbound::{Outbound, OutboundListener};
+use crate::{
+    config::MetricsConfig,
+    error::{MetricsError, at_error, at_warning},
+    outbound::{Outbound, OutboundListener},
+};
 
 /// 流量上下行计数。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -95,7 +96,7 @@ where
         match direction {
             "uplink" => entry.uplink += value,
             "downlink" => entry.downlink += value,
-            _ => {}
+            _ => {},
         }
     }
     out
@@ -152,6 +153,7 @@ impl MetricsHttpServer for NoopHttpServer {
     ) -> Result<(), MetricsError> {
         Ok(())
     }
+
     fn serve_outbound(
         &self,
         _outbound: Arc<Outbound>,
@@ -170,14 +172,13 @@ pub struct RecordingOutboundRegistrar {
 
 impl RecordingOutboundRegistrar {
     pub fn new() -> Self {
-        Self {
-            last_remove: Mutex::new(None),
-            last_add: Mutex::new(None),
-        }
+        Self { last_remove: Mutex::new(None), last_add: Mutex::new(None) }
     }
+
     pub fn last_removed_tag(&self) -> Option<String> {
         self.last_remove.lock().clone()
     }
+
     pub fn last_added_tag(&self) -> Option<String> {
         self.last_add.lock().clone()
     }
@@ -194,6 +195,7 @@ impl OutboundRegistrar for RecordingOutboundRegistrar {
         *self.last_remove.lock() = Some(tag.to_string());
         Ok(())
     }
+
     fn add(&self, outbound: Arc<Outbound>) -> Result<(), MetricsError> {
         *self.last_add.lock() = Some(outbound.tag().to_string());
         Ok(())
@@ -211,10 +213,7 @@ pub struct MetricsHandler {
 
 impl MetricsHandler {
     pub fn new(config: MetricsConfig) -> Self {
-        Self {
-            config,
-            outbound: Mutex::new(None),
-        }
+        Self { config, outbound: Mutex::new(None) }
     }
 
     pub fn config(&self) -> &MetricsConfig {
@@ -258,12 +257,10 @@ impl MetricsHandler {
             )));
         }
 
-        outbound_registrar
-            .add(outbound.clone())
-            .map_err(|e| {
-                at_error(&e);
-                e
-            })?;
+        outbound_registrar.add(outbound.clone()).map_err(|e| {
+            at_error(&e);
+            e
+        })?;
 
         *self.outbound.lock() = Some(outbound);
         Ok(())
@@ -359,11 +356,10 @@ fn escape_value(s: &str) -> String {
 /// 不使用 hyper/axum 以避免额外依赖（ponytail ladder rung 4：tokio 已提供所需原语）。
 ///
 /// ## 行为
-/// - `start_http_listen`: 绑定 `listen` 地址，spawn accept loop，
-///   每个 conn task 解析请求行后返回 `200 OK` + Prometheus 文本。
-///   仅处理 `GET /metrics`；其他路径返回 `404 Not Found`。
-/// - `serve_outbound`: 当前 stub（仅 log），真实实现需等 dispatcher 切片3
-///   把 OutboundListener.accept 桥接到 tokio task。
+/// - `start_http_listen`: 绑定 `listen` 地址，spawn accept loop， 每个 conn task 解析请求行后返回
+///   `200 OK` + Prometheus 文本。 仅处理 `GET /metrics`；其他路径返回 `404 Not Found`。
+/// - `serve_outbound`: 当前 stub（仅 log），真实实现需等 dispatcher 切片3 把
+///   OutboundListener.accept 桥接到 tokio task。
 ///
 /// ## 优雅关闭
 /// `TokioHttpServer::shutdown()` 通过 Notify 唤醒所有 task，等待 5s 超时。
@@ -414,7 +410,8 @@ impl MetricsHttpServer for TokioHttpServer {
         obs: Option<Arc<dyn ObservationCollector>>,
     ) -> Result<(), MetricsError> {
         // trait 是 sync，但 tokio::TcpListener::bind 是 async。
-        // 用 std::net::TcpListener::bind (sync) + set_nonblocking + tokio::net::TcpListener::from_std 转换。
+        // 用 std::net::TcpListener::bind (sync) + set_nonblocking +
+        // tokio::net::TcpListener::from_std 转换。
         let std_listener = std::net::TcpListener::bind(listen)
             .map_err(|e| MetricsError::ListenInvalid(format!("bind {listen}: {e}")))?;
         std_listener
@@ -503,10 +500,7 @@ async fn serve_one(
             Ok(n) => &buf[..n],
         },
     };
-    let request_line = body
-        .split(|&b| b == b'\n')
-        .next()
-        .unwrap_or(&[]);
+    let request_line = body.split(|&b| b == b'\n').next().unwrap_or(&[]);
     let is_metrics = request_line.starts_with(b"GET /metrics ");
     let response = if is_metrics {
         let snapshot = stats.collect();
@@ -539,11 +533,10 @@ async fn serve_boxed_conn(
         Err(_) => {
             tracing::warn!(target: "xray_app_metrics", "serve_boxed_conn: unsupported conn type, expected TcpStream");
             return;
-        }
+        },
     };
     serve_one(stream, stats, obs, shutdown).await;
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -710,10 +703,7 @@ mod tests {
 
     #[test]
     fn metrics_handler_exposes_config() {
-        let cfg = MetricsConfig {
-            tag: "metrics_out".into(),
-            listen: "127.0.0.1:9090".into(),
-        };
+        let cfg = MetricsConfig { tag: "metrics_out".into(), listen: "127.0.0.1:9090".into() };
         let h = MetricsHandler::new(cfg.clone());
         assert_eq!(h.config().tag, "metrics_out");
         assert_eq!(h.config().listen, "127.0.0.1:9090");
@@ -721,10 +711,7 @@ mod tests {
 
     #[test]
     fn metrics_handler_start_registers_outbound() {
-        let cfg = MetricsConfig {
-            tag: "m".into(),
-            listen: "".into(),
-        };
+        let cfg = MetricsConfig { tag: "m".into(), listen: "".into() };
         let h = MetricsHandler::new(cfg);
         let http = NoopHttpServer;
         let stats: Arc<dyn StatsCollector> = Arc::new(ConstStats(0));
@@ -742,10 +729,7 @@ mod tests {
     fn metrics_handler_start_with_listen_calls_http_listen() {
         // 使用计数 registrar 验证 start_http_listen 被调用过：通过 NoopHttpServer 总返回 Ok
         // 这里仅验证带 listen 的 start 流程不报错
-        let cfg = MetricsConfig {
-            tag: "m".into(),
-            listen: "127.0.0.1:0".into(),
-        };
+        let cfg = MetricsConfig { tag: "m".into(), listen: "127.0.0.1:0".into() };
         let h = MetricsHandler::new(cfg);
         let http = NoopHttpServer;
         let stats: Arc<dyn StatsCollector> = Arc::new(ConstStats(0));
@@ -756,10 +740,7 @@ mod tests {
 
     #[test]
     fn metrics_handler_close_releases_outbound() {
-        let cfg = MetricsConfig {
-            tag: "m".into(),
-            listen: "".into(),
-        };
+        let cfg = MetricsConfig { tag: "m".into(), listen: "".into() };
         let h = MetricsHandler::new(cfg);
         let http = NoopHttpServer;
         let stats: Arc<dyn StatsCollector> = Arc::new(ConstStats(0));
@@ -788,13 +769,7 @@ mod tests {
     #[test]
     fn stats_snapshot_eq() {
         let mut s1 = StatsSnapshot::default();
-        s1.inbound.insert(
-            "a".into(),
-            TrafficCount {
-                uplink: 1,
-                downlink: 2,
-            },
-        );
+        s1.inbound.insert("a".into(), TrafficCount { uplink: 1, downlink: 2 });
         let s2 = s1.clone();
         assert_eq!(s1, s2);
     }
@@ -826,17 +801,15 @@ mod tests {
     #[test]
     fn format_prometheus_includes_nonzero_entries() {
         let mut stats = StatsSnapshot::default();
-        stats.inbound.insert(
-            "tag_a".into(),
-            TrafficCount { uplink: 100, downlink: 0 },
-        );
-        stats.outbound.insert(
-            "out_x".into(),
-            TrafficCount { uplink: 0, downlink: 200 },
-        );
+        stats.inbound.insert("tag_a".into(), TrafficCount { uplink: 100, downlink: 0 });
+        stats.outbound.insert("out_x".into(), TrafficCount { uplink: 0, downlink: 200 });
         let out = format_prometheus(&stats, None);
-        assert!(out.contains("xray_traffic_bytes{type=\"inbound\",tag=\"tag_a\",direction=\"uplink\"} 100"));
-        assert!(out.contains("xray_traffic_bytes{type=\"outbound\",tag=\"out_x\",direction=\"downlink\"} 200"));
+        assert!(out.contains(
+            "xray_traffic_bytes{type=\"inbound\",tag=\"tag_a\",direction=\"uplink\"} 100"
+        ));
+        assert!(out.contains(
+            "xray_traffic_bytes{type=\"outbound\",tag=\"out_x\",direction=\"downlink\"} 200"
+        ));
         // uplink=0 / downlink=0 不输出
         assert!(!out.contains("direction=\"downlink\"} 0\n"));
     }
@@ -844,10 +817,7 @@ mod tests {
     #[test]
     fn format_prometheus_escapes_special_chars_in_tag() {
         let mut stats = StatsSnapshot::default();
-        stats.user.insert(
-            "a\"b\\c\n".into(),
-            TrafficCount { uplink: 1, downlink: 0 },
-        );
+        stats.user.insert("a\"b\\c\n".into(), TrafficCount { uplink: 1, downlink: 0 });
         let out = format_prometheus(&stats, None);
         // 转义后应为 a\\\"b\\\\c\\n（前后会包双引号）
         assert!(out.contains("tag=\"a\\\"b\\\\c\\n\""));
@@ -884,19 +854,16 @@ mod tests {
         drop(probe);
 
         let server = TokioHttpServer::new();
-        server
-            .start_http_listen(&addr.to_string(), Arc::new(ConstStats(1)), None)
-            .unwrap();
+        server.start_http_listen(&addr.to_string(), Arc::new(ConstStats(1)), None).unwrap();
 
         // 千次抓取（票验收口径）
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         for _ in 0..1000 {
             let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
-            s.write_all(b"GET /metrics HTTP/1.1\r\nHost: t\r\n\r\n")
-                .await
-                .unwrap();
+            s.write_all(b"GET /metrics HTTP/1.1\r\nHost: t\r\n\r\n").await.unwrap();
             let mut buf = Vec::new();
-            let read = tokio::time::timeout(std::time::Duration::from_secs(5), s.read_to_end(&mut buf));
+            let read =
+                tokio::time::timeout(std::time::Duration::from_secs(5), s.read_to_end(&mut buf));
             assert!(read.await.is_ok(), "scrape response must complete");
             assert!(buf.starts_with(b"HTTP/1.1 200 OK"), "scrape must succeed");
         }

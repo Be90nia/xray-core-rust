@@ -2,8 +2,10 @@
 //!
 //! 测量 AEAD 加密/解密吞吐量，对应 Go xray-core 的 crypto 热路径。
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use xray_crypto::aead::{AeadCipher, Aes128Gcm, Aes256Gcm, ChaCha20Poly1305Aead, XChaCha20Poly1305Aead};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use xray_crypto::aead::{
+    AeadCipher, Aes128Gcm, Aes256Gcm, ChaCha20Poly1305Aead, XChaCha20Poly1305Aead,
+};
 
 fn bench_aes128_gcm_seal(c: &mut Criterion) {
     let key = [0x42u8; 16];

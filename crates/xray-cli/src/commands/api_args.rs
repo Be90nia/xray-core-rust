@@ -32,11 +32,7 @@ pub struct ApiSharedArgs {
 
 impl Default for ApiSharedArgs {
     fn default() -> Self {
-        Self {
-            server: "127.0.0.1:8080".to_string(),
-            timeout: 3,
-            json: false,
-        }
+        Self { server: "127.0.0.1:8080".to_string(), timeout: 3, json: false }
     }
 }
 

@@ -33,10 +33,7 @@ impl<C> HttpUpgradeConnection<C> {
     /// 构造 wrapper。
     #[must_use]
     pub fn new(inner: C, remote_addr: Option<SocketAddr>) -> Self {
-        Self {
-            inner,
-            remote_addr_override: remote_addr,
-        }
+        Self { inner, remote_addr_override: remote_addr }
     }
 
     /// 拆出内层连接。
@@ -44,16 +41,13 @@ impl<C> HttpUpgradeConnection<C> {
     pub fn into_inner(self) -> C {
         self.inner
     }
+
     /// 构造 wrapper，指定 remote_addr。
     #[must_use]
     pub fn with_remote_addr(inner: C, remote_addr: SocketAddr) -> Self {
-        Self {
-            inner,
-            remote_addr_override: Some(remote_addr),
-        }
+        Self { inner, remote_addr_override: Some(remote_addr) }
     }
 }
-
 
 impl<C: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for HttpUpgradeConnection<C> {
     fn poll_read(
@@ -74,16 +68,24 @@ impl<C: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for HttpUpgradeConn
         std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
-    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
-impl<C: xray_transport::connection::Connection + Unpin> xray_transport::connection::Connection for HttpUpgradeConnection<C> {
+impl<C: xray_transport::connection::Connection + Unpin> xray_transport::connection::Connection
+    for HttpUpgradeConnection<C>
+{
     fn remote_addr(&self) -> std::io::Result<Option<SocketAddr>> {
         if let Some(addr) = self.remote_addr_override {
             Ok(Some(addr))
@@ -99,8 +101,9 @@ impl<C: xray_transport::connection::Connection + Unpin> xray_transport::connecti
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::{Ipv4Addr, SocketAddrV4};
+
+    use super::*;
 
     #[test]
     fn construction_preserves_inner() {

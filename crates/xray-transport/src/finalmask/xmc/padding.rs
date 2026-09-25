@@ -6,17 +6,14 @@
 //!
 //! 设计要点：
 //! - 每个 turn 一段连续字节流，由 VarInt 长度前缀 + body 组成。
-//! - 调度方向（client→server / server→client）由调用方的 `is_client` 与
-//!   `turn.direction` 共同决定；`run_padding_schedule` 据此选择读或写。
-//! - 多 chunk 写入时按 chunk 间 `chunk_delay` 切分；首个 chunk 与 header
-//!   一同立即 flush（与 Go 行为一致）。
-//! - 异步包装 `tokio::time::sleep`；测试可注入 fake sleeper 直接
-//!   `futures::future::pending()` 跳过延时。
+//! - 调度方向（client→server / server→client）由调用方的 `is_client` 与 `turn.direction`
+//!   共同决定；`run_padding_schedule` 据此选择读或写。
+//! - 多 chunk 写入时按 chunk 间 `chunk_delay` 切分；首个 chunk 与 header 一同立即 flush（与 Go
+//!   行为一致）。
+//! - 异步包装 `tokio::time::sleep`；测试可注入 fake sleeper 直接 `futures::future::pending()`
+//!   跳过延时。
 
-use std::future::Future;
-use std::io;
-use std::pin::Pin;
-use std::time::Duration;
+use std::{future::Future, io, pin::Pin, time::Duration};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -45,16 +42,11 @@ pub struct PaddingDelayRange {
 }
 
 impl PaddingDelayRange {
-    pub const ZERO: PaddingDelayRange = PaddingDelayRange {
-        min: Duration::ZERO,
-        max: Duration::ZERO,
-    };
+    pub const ZERO: PaddingDelayRange =
+        PaddingDelayRange { min: Duration::ZERO, max: Duration::ZERO };
 
     pub fn from_millis(min: u64, max: u64) -> Self {
-        Self {
-            min: Duration::from_millis(min),
-            max: Duration::from_millis(max),
-        }
+        Self { min: Duration::from_millis(min), max: Duration::from_millis(max) }
     }
 }
 
@@ -152,7 +144,10 @@ fn variant_length(variant: &PaddingVariant) -> i32 {
 
 fn turn_bounds(turn: &PaddingTurn) -> Result<(i32, i32), io::Error> {
     if turn.variants.is_empty() {
-        if turn.min_length < 1 || turn.max_length < turn.min_length || turn.max_length > MAX_PADDING_TURN_LENGTH {
+        if turn.min_length < 1
+            || turn.max_length < turn.min_length
+            || turn.max_length > MAX_PADDING_TURN_LENGTH
+        {
             return Err(io_err(format!(
                 "invalid length range: {}-{}",
                 turn.min_length, turn.max_length
@@ -178,9 +173,7 @@ fn turn_bounds(turn: &PaddingTurn) -> Result<(i32, i32), io::Error> {
         }
         for (j, chunk) in variant.chunks.iter().enumerate() {
             if *chunk < 1 || *chunk > MAX_PADDING_CHUNK_LENGTH {
-                return Err(io_err(format!(
-                    "variant {i} chunk {j} has invalid length: {chunk}"
-                )));
+                return Err(io_err(format!("variant {i} chunk {j} has invalid length: {chunk}")));
             }
             if !variant.delays.is_empty() {
                 validate_delay_range(variant.delays[j], &format!("variant {i} chunk {j}"))?;
@@ -205,9 +198,7 @@ fn turn_accepts_length(turn: &PaddingTurn, length: i32) -> bool {
     if turn.variants.is_empty() {
         return length >= turn.min_length && length <= turn.max_length;
     }
-    turn.variants
-        .iter()
-        .any(|v| variant_length(v) == length)
+    turn.variants.iter().any(|v| variant_length(v) == length)
 }
 
 fn default_chunks(record_length: i32, chunk_length: i32) -> Vec<i32> {
@@ -238,9 +229,7 @@ fn trim_padding_prefix(
         first_chunk += 1;
     }
     if remaining_prefix != 0 || first_chunk == variant.chunks.len() {
-        return Err(io_err(format!(
-            "prefix length {prefix_length} leaves no padding record"
-        )));
+        return Err(io_err(format!("prefix length {prefix_length} leaves no padding record")));
     }
     let chunks: Vec<i32> = variant.chunks[first_chunk..].to_vec();
     let mut delays = vec![PaddingDelayRange::ZERO; chunks.len()];
@@ -304,9 +293,7 @@ pub fn validate_padding_schedule(
         if turn.direction != PaddingDirection::ClientToServer
             && turn.direction != PaddingDirection::ServerToClient
         {
-            return Err(io_err(format!(
-                "padding turn {i} has invalid direction"
-            )));
+            return Err(io_err(format!("padding turn {i} has invalid direction")));
         }
         validate_delay_range(turn.start_delay, &format!("turn {i} start"))?;
         validate_delay_range(turn.chunk_delay, &format!("turn {i} chunk"))?;
@@ -392,10 +379,7 @@ where
         }
         position += 7;
     }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        "xmc padding varint too large",
-    ))
+    Err(io::Error::new(io::ErrorKind::InvalidData, "xmc padding varint too large"))
 }
 
 async fn read_padding_turn<R>(
@@ -410,9 +394,7 @@ where
     let header_length = protocol::varint_size(encoded_length) as i32;
     let record_length = encoded_length;
     if record_length < header_length || record_length > MAX_PADDING_TURN_LENGTH {
-        return Err(io_err(format!(
-            "invalid padding record length: {record_length}"
-        )));
+        return Err(io_err(format!("invalid padding record length: {record_length}")));
     }
     let total_length = prefix_length + record_length;
     if !turn_accepts_length(turn, total_length) {
@@ -477,8 +459,7 @@ where
     if chunks[0] < header_length as i32 {
         return Err(io_err(format!(
             "first padding chunk {} is shorter than header {}",
-            chunks[0],
-            header_length
+            chunks[0], header_length
         )));
     }
     let max_chunk_length = chunks.iter().copied().max().unwrap_or(0);
@@ -499,9 +480,7 @@ where
         }
     }
     if written != record_length {
-        return Err(io_err(format!(
-            "padding chunks total {written}, want {record_length}"
-        )));
+        return Err(io_err(format!("padding chunks total {written}, want {record_length}")));
     }
     Ok(())
 }
@@ -576,11 +555,7 @@ mod tests {
 
     #[test]
     fn reject_negative_prefix() {
-        let turn = PaddingTurn {
-            min_length: 100,
-            max_length: 200,
-            ..PaddingTurn::default()
-        };
+        let turn = PaddingTurn { min_length: 100, max_length: 200, ..PaddingTurn::default() };
         assert!(validate_padding_schedule(&[turn], -1).is_err());
     }
 

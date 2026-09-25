@@ -3,17 +3,21 @@
 //! 对应 Go `app/log/log.go` 的 `Instance` + `Handle` 分发，
 //! 与 `app/log/log_creator.go` 的全局 `handlerCreatorMap`。
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    fs::{File, OpenOptions},
+    io::Write,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::config::{LogConfig, LogFormat, LogType, SeverityLevel};
-use crate::error::{at_error, at_warning, LogError};
-use crate::mask::mask_addresses;
+use crate::{
+    config::{LogConfig, LogFormat, LogType, SeverityLevel},
+    error::{LogError, at_error, at_warning},
+    mask::mask_addresses,
+};
 
 /// Access 日志状态：accepted / rejected。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,10 +52,7 @@ impl AccessMessage {
     /// （common/log/access.go:32-59）：
     /// `from {From} {status} {To}[ [{Detour}]][ {Reason}][ email: {Email}]`
     pub fn format(&self) -> String {
-        let st = self
-            .status
-            .map(|s| s.as_str())
-            .unwrap_or("unknown");
+        let st = self.status.map(|s| s.as_str()).unwrap_or("unknown");
         let mut s = format!("from {} {} {}", self.from, st, self.to);
         if !self.detour.is_empty() {
             s.push_str(&format!(" [{}]", self.detour));
@@ -243,7 +244,6 @@ pub struct HandlerCreatorOptions {
     pub format: LogFormat,
 }
 
-
 /// LogHandler trait：实际写日志的处理器（file/console/none）。
 ///
 /// 对应 Go `log.Handler` interface。
@@ -251,11 +251,13 @@ pub trait LogHandler: Send + Sync {
     fn handle(&self, entry: &LogEntry);
 }
 
-
 /// Handler 工厂函数 trait。
 pub trait HandlerCreator: Send + Sync {
-    fn create(&self, log_type: LogType, options: &HandlerCreatorOptions)
-        -> Result<Option<Arc<dyn LogHandler>>, LogError>;
+    fn create(
+        &self,
+        log_type: LogType,
+        options: &HandlerCreatorOptions,
+    ) -> Result<Option<Arc<dyn LogHandler>>, LogError>;
 }
 
 /// 全局 handler creator 注册表。
@@ -267,9 +269,7 @@ pub struct HandlerCreatorRegistry {
 
 impl HandlerCreatorRegistry {
     pub fn new() -> Self {
-        Self {
-            inner: RwLock::new(HashMap::new()),
-        }
+        Self { inner: RwLock::new(HashMap::new()) }
     }
 
     /// 注册 creator；若已存在则返回 DuplicateHandlerCreator。
@@ -341,10 +341,10 @@ impl LogHandler for ConsoleHandler {
             },
             LogEntry::Access(_) => {
                 tracing::info!(target: "xray.access", "{}", entry.format_with(self.format))
-            }
+            },
             LogEntry::Dns(_) => {
                 tracing::info!(target: "xray.dns", "{}", entry.format_with(self.format))
-            }
+            },
         }
     }
 }
@@ -358,9 +358,7 @@ impl HandlerCreator for ConsoleHandlerCreator {
         _log_type: LogType,
         options: &HandlerCreatorOptions,
     ) -> Result<Option<Arc<dyn LogHandler>>, LogError> {
-        Ok(Some(Arc::new(ConsoleHandler {
-            format: options.format,
-        })))
+        Ok(Some(Arc::new(ConsoleHandler { format: options.format })))
     }
 }
 
@@ -388,10 +386,7 @@ impl FileHandler {
         Self {
             path,
             format: LogFormat::Console,
-            inner: Mutex::new(FileHandleState {
-                file: None,
-                open_inode: 0,
-            }),
+            inner: Mutex::new(FileHandleState { file: None, open_inode: 0 }),
         }
     }
 
@@ -406,26 +401,16 @@ impl FileHandler {
 
     /// 带输出格式构造。
     pub fn with_format(path: String, format: LogFormat) -> Self {
-        Self {
-            path,
-            format,
-            inner: Mutex::new(FileHandleState {
-                file: None,
-                open_inode: 0,
-            }),
-        }
+        Self { path, format, inner: Mutex::new(FileHandleState { file: None, open_inode: 0 }) }
     }
 }
-
 
 /// Go `log.Ldate|Ltime|Lmicroseconds` 前缀（common/log/logger.go:147/157/176
 /// 三处输出均带）：`2006/01/02 15:04:05.000000 `。
 ///
 /// std 无本地时区 API，用 UTC——事件排序/审计用途与 Go 本地时区等价。
 fn log_timestamp_prefix() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = now.as_secs();
     let micros = now.subsec_micros();
     let (h, m, s) = ((secs / 3600) % 24, (secs % 3600) / 60, secs % 60);
@@ -448,33 +433,30 @@ fn inode_of(md: &std::fs::Metadata) -> u64 {
     md.ino()
 }
 
- impl LogHandler for FileHandler {
-     #[cfg(unix)]
+impl LogHandler for FileHandler {
+    #[cfg(unix)]
     fn handle(&self, entry: &LogEntry) {
         // 4d7t：对齐 Go fileLogWriter（common/log/logger.go:176）——Console 行带
         // 日期时间前缀（access.log 无时间戳则事件排序/审计不可用）。Json 行保持
         // 纯 JSON（Rust 扩展格式，机器可读优先）。
         let line = self.timestamped_line(entry);
-         let mut state = self.inner.lock();
-         let path = std::path::Path::new(&self.path);
-         let current_inode = std::fs::metadata(path).map(|m| inode_of(&m)).unwrap_or(0);
-         if state.file.is_none() || state.open_inode != current_inode {
-             let f = OpenOptions::new()
-                 .create(true)
-                 .append(true)
-                 .open(&self.path);
-             match f {
-                 Ok(file) => {
-                     state.file = Some(file);
-                     state.open_inode = current_inode;
-                 }
-                 Err(_) => return,
-             }
-         }
-         if let Some(f) = state.file.as_mut() {
-             let _ = writeln!(f, "{line}");
-         }
-     }
+        let mut state = self.inner.lock();
+        let path = std::path::Path::new(&self.path);
+        let current_inode = std::fs::metadata(path).map(|m| inode_of(&m)).unwrap_or(0);
+        if state.file.is_none() || state.open_inode != current_inode {
+            let f = OpenOptions::new().create(true).append(true).open(&self.path);
+            match f {
+                Ok(file) => {
+                    state.file = Some(file);
+                    state.open_inode = current_inode;
+                },
+                Err(_) => return,
+            }
+        }
+        if let Some(f) = state.file.as_mut() {
+            let _ = writeln!(f, "{line}");
+        }
+    }
 
     #[cfg(not(unix))]
     fn handle(&self, entry: &LogEntry) {
@@ -484,16 +466,11 @@ fn inode_of(md: &std::fs::Metadata) -> u64 {
         // 1) 用 GetFileInformationByHandle 比 ByHandleFileInformation.nFileIndexHigh/Low
         // 2) 引入 winapi/windows-sys 依赖,FOkens 代价大，保留现状。
         let line = self.timestamped_line(entry);
-        if let Ok(mut f) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&self.path) {
             let _ = writeln!(f, "{line}");
         }
     }
 }
-
 
 /// File handler creator。
 pub struct FileHandlerCreator;
@@ -509,10 +486,7 @@ impl HandlerCreator for FileHandlerCreator {
                 "file log handler requires a non-empty path".into(),
             ));
         }
-        Ok(Some(Arc::new(FileHandler::with_format(
-            options.path.clone(),
-            options.format,
-        ))))
+        Ok(Some(Arc::new(FileHandler::with_format(options.path.clone(), options.format))))
     }
 }
 
@@ -645,10 +619,8 @@ impl LogInstance {
         match registry.create(self.config.access_log_type, &access_opts) {
             Ok(h) => g.access_logger = h.map(|h| self.wrap_with_mask(h)),
             Err(e) => {
-                at_warning(&LogError::HandlerCreate(format!(
-                    "access logger init failed: {e}"
-                )));
-            }
+                at_warning(&LogError::HandlerCreate(format!("access logger init failed: {e}")));
+            },
         }
 
         let error_opts = HandlerCreatorOptions {
@@ -658,10 +630,8 @@ impl LogInstance {
         match registry.create(self.config.error_log_type, &error_opts) {
             Ok(h) => g.error_logger = h.map(|h| self.wrap_with_mask(h)),
             Err(e) => {
-                at_warning(&LogError::HandlerCreate(format!(
-                    "error logger init failed: {e}"
-                )));
-            }
+                at_warning(&LogError::HandlerCreate(format!("error logger init failed: {e}")));
+            },
         }
 
         g.active = true;
@@ -707,21 +677,21 @@ impl LogInstance {
                 if let Some(h) = &g.access_logger {
                     h.handle(entry);
                 }
-            }
+            },
             LogEntry::Dns(_) => {
                 if self.config.enable_dns_log {
                     if let Some(h) = &g.access_logger {
                         h.handle(entry);
                     }
                 }
-            }
+            },
             LogEntry::General(m) => {
                 if m.severity <= self.config.error_log_level {
                     if let Some(h) = &g.error_logger {
                         h.handle(entry);
                     }
                 }
-            }
+            },
         }
     }
 
@@ -737,8 +707,9 @@ impl LogInstance {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Mutex;
+
+    use super::*;
 
     /// 测试用 LogHandler：把 entry format 后追加到共享 Vec。
     struct CapturingHandler {
@@ -747,10 +718,9 @@ mod tests {
 
     impl CapturingHandler {
         fn new() -> Arc<Self> {
-            Arc::new(Self {
-                recorded: Mutex::new(Vec::new()),
-            })
+            Arc::new(Self { recorded: Mutex::new(Vec::new()) })
         }
+
         fn snapshot(&self) -> Vec<String> {
             self.recorded.lock().unwrap().clone()
         }
@@ -777,15 +747,8 @@ mod tests {
 
     fn registry_with_console(handler: Arc<dyn LogHandler>) -> HandlerCreatorRegistry {
         let r = HandlerCreatorRegistry::new();
-        r.register(
-            LogType::Console,
-            Arc::new(FixedCreator {
-                handler: handler.clone(),
-            }),
-        )
-        .unwrap();
-        r.register(LogType::File, Arc::new(FixedCreator { handler }))
-            .unwrap();
+        r.register(LogType::Console, Arc::new(FixedCreator { handler: handler.clone() })).unwrap();
+        r.register(LogType::File, Arc::new(FixedCreator { handler })).unwrap();
         r
     }
 
@@ -807,7 +770,10 @@ mod tests {
             status: Some(AccessStatus::Accepted),
             reason: "ok".into(),
         };
-        assert_eq!(m.format(), "from 1.1.1.1:1234 accepted tcp:2.2.2.2:443 [socks-in >> direct] ok email: u@e");
+        assert_eq!(
+            m.format(),
+            "from 1.1.1.1:1234 accepted tcp:2.2.2.2:443 [socks-in >> direct] ok email: u@e"
+        );
 
         // 空字段逐段省略
         let m = AccessMessage {
@@ -950,10 +916,7 @@ mod tests {
         }));
 
         let after = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            after.contains("after-rotate"),
-            "new entry must land in new file: {after}"
-        );
+        assert!(after.contains("after-rotate"), "new entry must land in new file: {after}");
         let rotated_content = std::fs::read_to_string(&rotated).unwrap();
         assert!(
             !rotated_content.contains("after-rotate"),
@@ -963,7 +926,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&rotated);
     }
-
 
     #[test]
     fn dns_format_contains_fields() {
@@ -1059,10 +1021,7 @@ mod tests {
 
     #[test]
     fn general_format_contains_severity_and_content() {
-        let m = GeneralMessage {
-            severity: SeverityLevel::Warning,
-            content: "watch out".into(),
-        };
+        let m = GeneralMessage { severity: SeverityLevel::Warning, content: "watch out".into() };
         let s = m.format();
         assert!(s.contains("watch out"));
     }
@@ -1084,23 +1043,15 @@ mod tests {
     fn registry_register_then_create() {
         let h = CapturingHandler::new();
         let r = registry_with_console(h);
-        let created = r
-            .create(LogType::Console, &HandlerCreatorOptions::default())
-            .unwrap();
+        let created = r.create(LogType::Console, &HandlerCreatorOptions::default()).unwrap();
         assert!(created.is_some());
     }
 
     #[test]
     fn registry_duplicate_register_rejected() {
         let r = HandlerCreatorRegistry::new();
-        r.register(
-            LogType::Console,
-            Arc::new(NoneHandlerCreator),
-        )
-        .unwrap();
-        let err = r
-            .register(LogType::Console, Arc::new(NoneHandlerCreator))
-            .unwrap_err();
+        r.register(LogType::Console, Arc::new(NoneHandlerCreator)).unwrap();
+        let err = r.register(LogType::Console, Arc::new(NoneHandlerCreator)).unwrap_err();
         assert!(matches!(err, LogError::DuplicateHandlerCreator(LogType::Console)));
     }
 
@@ -1117,11 +1068,8 @@ mod tests {
     #[test]
     fn none_creator_returns_none_handler() {
         let r = HandlerCreatorRegistry::new();
-        r.register(LogType::None, Arc::new(NoneHandlerCreator))
-            .unwrap();
-        let h = r
-            .create(LogType::None, &HandlerCreatorOptions::default())
-            .unwrap();
+        r.register(LogType::None, Arc::new(NoneHandlerCreator)).unwrap();
+        let h = r.create(LogType::None, &HandlerCreatorOptions::default()).unwrap();
         assert!(h.is_none());
     }
 
@@ -1130,10 +1078,8 @@ mod tests {
         let cfg = LogConfig::default();
         let inst = LogInstance::new(cfg).unwrap();
         let r = HandlerCreatorRegistry::new();
-        r.register(LogType::Console, Arc::new(NoneHandlerCreator))
-            .unwrap();
-        r.register(LogType::None, Arc::new(NoneHandlerCreator))
-            .unwrap();
+        r.register(LogType::Console, Arc::new(NoneHandlerCreator)).unwrap();
+        r.register(LogType::None, Arc::new(NoneHandlerCreator)).unwrap();
         assert!(!inst.is_active());
         inst.start(&r).unwrap();
         assert!(inst.is_active());
@@ -1144,10 +1090,8 @@ mod tests {
         let cfg = LogConfig::default();
         let inst = LogInstance::new(cfg).unwrap();
         let r = HandlerCreatorRegistry::new();
-        r.register(LogType::Console, Arc::new(NoneHandlerCreator))
-            .unwrap();
-        r.register(LogType::None, Arc::new(NoneHandlerCreator))
-            .unwrap();
+        r.register(LogType::Console, Arc::new(NoneHandlerCreator)).unwrap();
+        r.register(LogType::None, Arc::new(NoneHandlerCreator)).unwrap();
         inst.start(&r).unwrap();
         inst.start(&r).unwrap();
         assert!(inst.is_active());
@@ -1158,10 +1102,8 @@ mod tests {
         let cfg = LogConfig::default();
         let inst = LogInstance::new(cfg).unwrap();
         let r = HandlerCreatorRegistry::new();
-        r.register(LogType::Console, Arc::new(NoneHandlerCreator))
-            .unwrap();
-        r.register(LogType::None, Arc::new(NoneHandlerCreator))
-            .unwrap();
+        r.register(LogType::Console, Arc::new(NoneHandlerCreator)).unwrap();
+        r.register(LogType::None, Arc::new(NoneHandlerCreator)).unwrap();
         inst.start(&r).unwrap();
         inst.close();
         assert!(!inst.is_active());
@@ -1194,18 +1136,15 @@ mod tests {
 
         // 自定义 registry 直接返回 capturing handler
         let r = HandlerCreatorRegistry::new();
-        r.register(LogType::Console, Arc::new(FixedCreator { handler: h }))
-            .unwrap();
+        r.register(LogType::Console, Arc::new(FixedCreator { handler: h })).unwrap();
 
         let mut cfg = LogConfig::default();
         cfg.access_log_type = LogType::Console;
         let inst = LogInstance::new(cfg).unwrap();
         inst.start(&r).unwrap();
 
-        let entry = LogEntry::Access(AccessMessage {
-            from: "1.1.1.1".into(),
-            ..Default::default()
-        });
+        let entry =
+            LogEntry::Access(AccessMessage { from: "1.1.1.1".into(), ..Default::default() });
         inst.handle(&entry);
         let s = snap.snapshot();
         assert_eq!(s.len(), 1);
@@ -1217,18 +1156,14 @@ mod tests {
         let h = CapturingHandler::new();
         let snap = h.clone();
         let r = HandlerCreatorRegistry::new();
-        r.register(LogType::Console, Arc::new(FixedCreator { handler: h }))
-            .unwrap();
+        r.register(LogType::Console, Arc::new(FixedCreator { handler: h })).unwrap();
 
         let mut cfg = LogConfig::default();
         cfg.access_log_type = LogType::Console;
         cfg.enable_dns_log = false;
         let inst = LogInstance::new(cfg).unwrap();
         inst.start(&r).unwrap();
-        inst.handle(&LogEntry::Dns(DnsLog {
-            query: "q".into(),
-            ..Default::default()
-        }));
+        inst.handle(&LogEntry::Dns(DnsLog { query: "q".into(), ..Default::default() }));
         assert!(snap.snapshot().is_empty());
     }
 
@@ -1237,18 +1172,14 @@ mod tests {
         let h = CapturingHandler::new();
         let snap = h.clone();
         let r = HandlerCreatorRegistry::new();
-        r.register(LogType::Console, Arc::new(FixedCreator { handler: h }))
-            .unwrap();
+        r.register(LogType::Console, Arc::new(FixedCreator { handler: h })).unwrap();
 
         let mut cfg = LogConfig::default();
         cfg.access_log_type = LogType::Console;
         cfg.enable_dns_log = true;
         let inst = LogInstance::new(cfg).unwrap();
         inst.start(&r).unwrap();
-        inst.handle(&LogEntry::Dns(DnsLog {
-            query: "Q".into(),
-            ..Default::default()
-        }));
+        inst.handle(&LogEntry::Dns(DnsLog { query: "Q".into(), ..Default::default() }));
         assert_eq!(snap.snapshot().len(), 1);
     }
 
@@ -1257,8 +1188,7 @@ mod tests {
         let h = CapturingHandler::new();
         let snap = h.clone();
         let r = HandlerCreatorRegistry::new();
-        r.register(LogType::Console, Arc::new(FixedCreator { handler: h }))
-            .unwrap();
+        r.register(LogType::Console, Arc::new(FixedCreator { handler: h })).unwrap();
 
         let mut cfg = LogConfig::default();
         cfg.error_log_type = LogType::Console;
@@ -1278,8 +1208,7 @@ mod tests {
         let h = CapturingHandler::new();
         let snap = h.clone();
         let r = HandlerCreatorRegistry::new();
-        r.register(LogType::Console, Arc::new(FixedCreator { handler: h }))
-            .unwrap();
+        r.register(LogType::Console, Arc::new(FixedCreator { handler: h })).unwrap();
 
         let mut cfg = LogConfig::default();
         cfg.error_log_type = LogType::Console;
@@ -1325,10 +1254,8 @@ mod tests {
     fn restart_close_then_start() {
         let h = CapturingHandler::new();
         let r = HandlerCreatorRegistry::new();
-        r.register(LogType::Console, Arc::new(FixedCreator { handler: h }))
-            .unwrap();
-        r.register(LogType::None, Arc::new(NoneHandlerCreator))
-            .unwrap();
+        r.register(LogType::Console, Arc::new(FixedCreator { handler: h })).unwrap();
+        r.register(LogType::None, Arc::new(NoneHandlerCreator)).unwrap();
         let cfg = LogConfig::default();
         let inst = LogInstance::new(cfg).unwrap();
         inst.start(&r).unwrap();

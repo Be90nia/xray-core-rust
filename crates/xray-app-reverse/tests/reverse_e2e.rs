@@ -13,23 +13,20 @@
 
 #![cfg(test)]
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tokio_util::compat::FuturesAsyncReadCompatExt as _;
-use tokio_util::compat::TokioAsyncReadCompatExt as _;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
+use tokio_util::compat::{FuturesAsyncReadCompatExt as _, TokioAsyncReadCompatExt as _};
 use xray_app_dispatcher::default::{DefaultDispatcher, DialBridge, SimpleOhm};
-use xray_buf::io::{Reader as _, Writer as _};
-use xray_buf::multi::MultiBuffer;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-
 use xray_app_reverse::{DefaultDispatcherAdapter, LinkDispatch, YamuxBridge};
+use xray_buf::{
+    io::{Reader as _, Writer as _},
+    multi::MultiBuffer,
+};
+use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
 
 async fn start_echo_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -48,7 +45,7 @@ async fn start_echo_server() -> SocketAddr {
                             if sock.write_all(&buf[..n]).await.is_err() {
                                 break;
                             }
-                        }
+                        },
                     }
                 }
             });
@@ -66,10 +63,10 @@ async fn reverse_dispatcher_to_dialbridge_to_echo_roundtrip() {
 
     // 2. 装配 dispatcher：freedom DialBridge
     let ohm = Arc::new(SimpleOhm::new());
-    ohm.set_default(Arc::new(DialBridge::new(
-        "freedom",
-        xray_proxy_freedom::make_freedom_dial_fn(),
-    )) as Arc<dyn xray_app_dispatcher::DispatchHandler>);
+    ohm.set_default(
+        Arc::new(DialBridge::new("freedom", xray_proxy_freedom::make_freedom_dial_fn()))
+            as Arc<dyn xray_app_dispatcher::DispatchHandler>,
+    );
 
     let dispatcher = Arc::new({
         let mut d = DefaultDispatcher::new();
@@ -88,29 +85,20 @@ async fn reverse_dispatcher_to_dialbridge_to_echo_roundtrip() {
         Port::new(echo_addr.port()),
         Network::TCP,
     );
-    let mut inbound = dispatcher
-        .dispatch(&dest, &SniffingRequest::default(), None, None)
-        .expect("dispatch");
+    let mut inbound =
+        dispatcher.dispatch(&dest, &SniffingRequest::default(), None, None).expect("dispatch");
 
     let mut mb = xray_buf::multi::MultiBuffer::new();
     mb.merge_bytes(b"hello reverse");
-    inbound
-        .writer
-        .write_multi_buffer(mb)
-        .await
-        .expect("write");
+    inbound.writer.write_multi_buffer(mb).await.expect("write");
 
-    let resp = tokio::time::timeout(
-        Duration::from_secs(3),
-        inbound.reader.read_multi_buffer(),
-    )
-    .await
-    .expect("timeout")
-    .expect("read");
+    let resp = tokio::time::timeout(Duration::from_secs(3), inbound.reader.read_multi_buffer())
+        .await
+        .expect("timeout")
+        .expect("read");
     let body = resp.to_vec();
     assert!(
-        body.windows(b"hello reverse".len())
-            .any(|w| w == b"hello reverse"),
+        body.windows(b"hello reverse".len()).any(|w| w == b"hello reverse"),
         "echo should round-trip; body={body:?}",
     );
     drop(inbound);
@@ -118,8 +106,8 @@ async fn reverse_dispatcher_to_dialbridge_to_echo_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reverse_yamux_bridge_to_portal_echo_full_chain() {
-    // 1. yamux server 模拟 portal：接受一条 tcp，建 yamux server session，
-    //    对收到的 stream 直接 echo。
+    // 1. yamux server 模拟 portal：接受一条 tcp，建 yamux server session， 对收到的 stream 直接
+    //    echo。
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let portal_addr = listener.local_addr().unwrap();
     let portal_task = tokio::spawn(async move {
@@ -127,11 +115,8 @@ async fn reverse_yamux_bridge_to_portal_echo_full_chain() {
             Ok(v) => v,
             Err(_) => return,
         };
-        let mut conn = yamux::Connection::new(
-            tcp.compat(),
-            yamux::Config::default(),
-            yamux::Mode::Server,
-        );
+        let mut conn =
+            yamux::Connection::new(tcp.compat(), yamux::Config::default(), yamux::Mode::Server);
         loop {
             let stream = match std::future::poll_fn(|cx| conn.poll_next_inbound(cx)).await {
                 Some(Ok(s)) => s,
@@ -147,7 +132,7 @@ async fn reverse_yamux_bridge_to_portal_echo_full_chain() {
                             if stream.write_all(&buf[..n]).await.is_err() {
                                 break;
                             }
-                        }
+                        },
                     }
                 }
             });
@@ -155,8 +140,7 @@ async fn reverse_yamux_bridge_to_portal_echo_full_chain() {
     });
 
     // 2. yamux bridge client：连 portal，开子流，写读
-    let bridge =
-        Arc::new(YamuxBridge::connect(portal_addr.to_string()).await.expect("connect"));
+    let bridge = Arc::new(YamuxBridge::connect(portal_addr.to_string()).await.expect("connect"));
     let mut stream = bridge.open_stream().await.expect("open stream");
     stream.write_all(b"yamux-echo").await.expect("write");
     let mut buf = [0u8; 10];
@@ -192,10 +176,11 @@ async fn reverse_portal_dispatch_carries_source_local_to_bridge() {
     use xray_app_reverse::{
         BridgeWorker, LinkDispatch, PortalOutbound, PortalWorker, ReverseError, StaticMuxPicker,
     };
-    use xray_buf::io::Writer as _;
-    use xray_buf::pipe;
-    use xray_mux::client::{ClientWorker, Link as MuxLink};
-    use xray_mux::session::ClientStrategy;
+    use xray_buf::{io::Writer as _, pipe};
+    use xray_mux::{
+        client::{ClientWorker, Link as MuxLink},
+        session::ClientStrategy,
+    };
     use xray_transport::link::Link as TransportLink;
 
     const DOMAIN: &str = "portal.example.com";
@@ -215,10 +200,7 @@ async fn reverse_portal_dispatch_carries_source_local_to_bridge() {
             _dest: &Destination,
             _inbound_tag: Option<&str>,
         ) -> Result<TransportLink, ReverseError> {
-            self.carrier
-                .lock()
-                .take()
-                .ok_or(ReverseError::NoWorkerAvailable)
+            self.carrier.lock().take().ok_or(ReverseError::NoWorkerAvailable)
         }
 
         async fn dispatch_link(
@@ -239,8 +221,7 @@ async fn reverse_portal_dispatch_carries_source_local_to_bridge() {
             local: Option<&Destination>,
         ) -> Result<(), ReverseError> {
             let fmt = |d: Option<&Destination>| {
-                d.map(|x| format!("{}:{}", x.address(), x.port().value()))
-                    .unwrap_or_default()
+                d.map(|x| format!("{}:{}", x.address(), x.port().value())).unwrap_or_default()
             };
             self.inbound.lock().push((fmt(source), fmt(local)));
             Ok(())
@@ -252,10 +233,7 @@ async fn reverse_portal_dispatch_carries_source_local_to_bridge() {
     let (c_read, s_write) = pipe::new();
     let (s_read, c_write) = pipe::new();
     let client = ClientWorker::new(
-        MuxLink {
-            reader: Box::new(c_read),
-            writer: Box::new(c_write),
-        },
+        MuxLink { reader: Box::new(c_read), writer: Box::new(c_write) },
         ClientStrategy::default(),
     );
     let picker: Arc<StaticMuxPicker<Arc<PortalWorker>>> = Arc::new(StaticMuxPicker::new());
@@ -266,14 +244,10 @@ async fn reverse_portal_dispatch_carries_source_local_to_bridge() {
     // ---- bridge 侧：BridgeWorker 挂 carrier 另一半 ----
     let recorder = Arc::new(RecordingDispatch {
         inbound: StdMutex::new(Vec::new()),
-        carrier: StdMutex::new(Some(TransportLink::new(
-            Box::new(s_read),
-            Box::new(s_write),
-        ))),
+        carrier: StdMutex::new(Some(TransportLink::new(Box::new(s_read), Box::new(s_write)))),
     });
-    let _bridge = BridgeWorker::new(DOMAIN, "bridge-tag", recorder.clone())
-        .await
-        .expect("bridge worker");
+    let _bridge =
+        BridgeWorker::new(DOMAIN, "bridge-tag", recorder.clone()).await.expect("bridge worker");
 
     // ---- 用户连接：access 带 from/local，经 portal 派发进 carrier ----
     let user_dest = Destination::new(
@@ -289,11 +263,7 @@ async fn reverse_portal_dispatch_carries_source_local_to_bridge() {
         ..Default::default()
     };
     portal
-        .handle_connection(
-            &user_dest,
-            TransportLink::new(Box::new(u_r), Box::new(resp_w)),
-            &access,
-        )
+        .handle_connection(&user_dest, TransportLink::new(Box::new(u_r), Box::new(resp_w)), &access)
         .await
         .expect("portal handle_connection");
 
@@ -308,8 +278,7 @@ async fn reverse_portal_dispatch_carries_source_local_to_bridge() {
     let got = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let snapshot = recorder.inbound.lock().clone();
-            if let Some(entry) =
-                snapshot.into_iter().find(|(s, l)| !s.is_empty() && !l.is_empty())
+            if let Some(entry) = snapshot.into_iter().find(|(s, l)| !s.is_empty() && !l.is_empty())
             {
                 return entry;
             }
@@ -318,13 +287,7 @@ async fn reverse_portal_dispatch_carries_source_local_to_bridge() {
     })
     .await
     .expect("bridge side must receive source/local within timeout");
-    assert_eq!(
-        got,
-        (
-            "203.0.113.7:5555".to_string(),
-            "198.51.100.1:443".to_string()
-        )
-    );
+    assert_eq!(got, ("203.0.113.7:5555".to_string(), "198.51.100.1:443".to_string()));
 
     let _ = resp_r;
 }

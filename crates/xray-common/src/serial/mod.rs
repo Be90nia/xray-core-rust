@@ -16,10 +16,7 @@ pub struct TypedMessage {
 impl TypedMessage {
     /// 创建新的 TypedMessage。
     pub fn new(type_url: impl Into<String>, value: Vec<u8>) -> Self {
-        Self {
-            type_url: type_url.into(),
-            value,
-        }
+        Self { type_url: type_url.into(), value }
     }
 
     /// 返回类型 URL。

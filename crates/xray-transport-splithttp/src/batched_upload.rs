@@ -15,12 +15,12 @@
 //!
 //! # 简化（vs Go）
 //!
-//! - **无 httptrace WroteRequest 背压**：直接 await POST 完成 = 隐式背压
-//!   （hyper 已 queue body 后才返回；H3 send_data+finish 必须 await 否则 stream 乱序）。
-//! - **无 LeftRequests 动态换连接**：本切片聚焦批量；xmux 换连接在
-//!   `dial_packet_up_with_xmux` 中独立接线。
-//! - **scMinPostsIntervalMs 固定值**：Go `rand()` 区间在本切片用 `from` 单一值，
-//!   范围采样 caller 可在外面做。
+//! - **无 httptrace WroteRequest 背压**：直接 await POST 完成 = 隐式背压 （hyper 已 queue body
+//!   后才返回；H3 send_data+finish 必须 await 否则 stream 乱序）。
+//! - **无 LeftRequests 动态换连接**：本切片聚焦批量；xmux 换连接在 `dial_packet_up_with_xmux`
+//!   中独立接线。
+//! - **scMinPostsIntervalMs 固定值**：Go `rand()` 区间在本切片用 `from` 单一值， 范围采样 caller
+//!   可在外面做。
 //!
 //! # Future trait
 //!
@@ -54,20 +54,20 @@ where
     let mut posts: usize = 0;
 
     loop {
-        // 1. 把 pipe 数据尽可能搬进 `pending` 直到 ≥ max_post_bytes 或 EOF。
-        //    单次 read 取 scratch.size() bytes；循环直到 pending 满了或 read=0。
+        // 1. 把 pipe 数据尽可能搬进 `pending` 直到 ≥ max_post_bytes 或 EOF。 单次 read 取
+        //    scratch.size() bytes；循环直到 pending 满了或 read=0。
         let mut eof_seen = false;
         while pending.len() < max_post_bytes {
             match reader.read(&mut scratch).await {
                 Ok(0) => {
                     eof_seen = true;
                     break;
-                }
+                },
                 Ok(n) => pending.extend_from_slice(&scratch[..n]),
                 Err(e) => {
                     debug!(target: "splithttp", error = %e, "upload pipe read failed");
                     return posts;
-                }
+                },
             }
         }
 
@@ -101,11 +101,15 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use tokio::io::AsyncWriteExt;
+
     use super::*;
     use crate::error::SplitHttpError;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-    use tokio::io::AsyncWriteExt;
 
     /// 1 个 writer 写 1 个 100 KiB 流（拆成 32 KiB POST × 4 应正好）。
     #[tokio::test]

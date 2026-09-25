@@ -17,17 +17,20 @@
 use std::sync::Arc;
 
 use thiserror::Error;
-
-use crate::Instance;
+use xray_app_dispatcher::{
+    DefaultDispatcher, OutboundHandlerManager,
+    default::{SimpleOhm, SniffingRequest},
+};
 use xray_features::FeatureError;
-
-use crate::inbound::spawn_inbounds;
-use crate::outbound::register_outbounds;
-use crate::router::DispatchRouter;
-use crate::register::{register_all_features, register_all_transports};
-use xray_app_dispatcher::default::{SimpleOhm, SniffingRequest};
-use xray_app_dispatcher::{DefaultDispatcher, OutboundHandlerManager};
 use xray_transport::link::Link;
+
+use crate::{
+    Instance,
+    inbound::spawn_inbounds,
+    outbound::register_outbounds,
+    register::{register_all_features, register_all_transports},
+    router::DispatchRouter,
+};
 
 /// AccessLogSink → LogInstance 桥（bd 4uu）。
 ///
@@ -50,13 +53,7 @@ impl xray_features::OutboundTagSelector for OhmTagSelector {
         if prefixes.is_empty() {
             return all;
         }
-        all.into_iter()
-            .filter(|tag| {
-                prefixes
-                    .iter()
-                    .any(|p| tag.starts_with(p.as_str()))
-            })
-            .collect()
+        all.into_iter().filter(|tag| prefixes.iter().any(|p| tag.starts_with(p.as_str()))).collect()
     }
 }
 
@@ -102,8 +99,8 @@ impl From<FeatureError> for CoreFunctionError {
     fn from(e: FeatureError) -> Self {
         // 语义：
         // - CloseFailed: 仅 start() 后才可能发生 → InstanceStart
-        // - 其他（含 StartFailed）：factory 构造期也可能发生 → InstanceInit
-        //   (factory 常用 StartFailed 作为通用错误码)
+        // - 其他（含 StartFailed）：factory 构造期也可能发生 → InstanceInit (factory 常用
+        //   StartFailed 作为通用错误码)
         match e {
             FeatureError::CloseFailed { .. } => CoreFunctionError::InstanceStart(e.to_string()),
             _ => CoreFunctionError::InstanceInit(e.to_string()),
@@ -123,7 +120,9 @@ impl From<xray_conf::ConfError> for CoreFunctionError {
 ///
 /// 对应 Go `core.New(config)` + `instance.Start()` 组合。**不阻塞**：调用方需自行管理
 /// instance 生命周期（如等待信号、监听关闭事件）。
-pub fn start_from_built(built: &xray_conf::BuiltConfig) -> Result<Arc<Instance>, CoreFunctionError> {
+pub fn start_from_built(
+    built: &xray_conf::BuiltConfig,
+) -> Result<Arc<Instance>, CoreFunctionError> {
     register_all_features();
     register_all_transports();
     let mut instance = Instance::new_from_built(built)?;
@@ -195,24 +194,19 @@ async fn start_full_dispatched(
             Some(a) => {
                 // 观测器：observatory app 存在时桥接（leastping/leastload 观测数据源，
                 // Go RequireFeatures(observatory) 等价）。
-                let observer: Option<
-                    Arc<dyn xray_app_router::balancing::ObservationProvider>,
-                > = instance
-                    .get_feature::<xray_app_observatory::ObservatoryFeature>()
-                    .map(|f| {
-                        Arc::new(crate::wiring::ObservatoryProviderBridge(f)) as Arc<_>
-                    });
+                let observer: Option<Arc<dyn xray_app_router::balancing::ObservationProvider>> =
+                    instance
+                        .get_feature::<xray_app_observatory::ObservatoryFeature>()
+                        .map(|f| Arc::new(crate::wiring::ObservatoryProviderBridge(f)) as Arc<_>);
                 match crate::wiring::build_router_adapter_from_json_with_ohm(
-                    &a.data,
-                    &ohm,
-                    observer,
+                    &a.data, &ohm, observer,
                 ) {
                     Ok(adapter) => {
                         let routing = Arc::clone(&adapter)
                             as Arc<dyn xray_app_dispatcher::default::RoutingRouter>;
                         let dns_side = Arc::clone(&adapter) as Arc<dyn DispatchRouter>;
                         (Some(routing), Some(dns_side))
-                    }
+                    },
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
@@ -221,17 +215,18 @@ async fn start_full_dispatched(
                         match crate::router::PatternRouter::from_json(&a.data) {
                             Ok(r) => {
                                 let r: Arc<dyn DispatchRouter> = Arc::new(r);
-                                let bridge = Arc::new(
-                                    crate::wiring::DispatchRouterBridge::new(Arc::clone(&r)),
-                                ) as Arc<dyn xray_app_dispatcher::default::RoutingRouter>;
+                                let bridge = Arc::new(crate::wiring::DispatchRouterBridge::new(
+                                    Arc::clone(&r),
+                                ))
+                                    as Arc<dyn xray_app_dispatcher::default::RoutingRouter>;
                                 let dns_side = Arc::clone(&r) as Arc<dyn DispatchRouter>;
                                 (Some(bridge), Some(dns_side))
-                            }
+                            },
                             Err(_) => (None, None),
                         }
-                    }
+                    },
                 }
-            }
+            },
             None => (None, None),
         }
     };
@@ -241,7 +236,8 @@ async fn start_full_dispatched(
     if let Some(r) = dns_router.as_ref() {
         if let Some(dns) = instance.get_feature::<xray_app_dns::DnsService>() {
             r.set_dns_client(Arc::clone(&dns) as Arc<dyn xray_features::dns::DnsClient>);
-        } else if let Some(local) = instance.get_feature::<xray_features::dns::DefaultDnsFeature>() {
+        } else if let Some(local) = instance.get_feature::<xray_features::dns::DefaultDnsFeature>()
+        {
             // Go 装配链：无 dns app 时 router 经 RequireFeatures 拿到
             // essentialFeatures 注册的 localdns 默认 client（core/xray.go:213）。
             r.set_dns_client(Arc::clone(&local) as Arc<dyn xray_features::dns::DnsClient>);
@@ -262,7 +258,8 @@ async fn start_full_dispatched(
     // 出站查 level 0；freedom 按 settings.userLevel 查档位（outbound.rs 内）。
     let pm_opt = instance.get_feature::<xray_app_policy::PolicyFeature>();
     if let Some(pm) = pm_opt.as_ref() {
-        dispatcher.set_policy_manager(Arc::clone(pm) as Arc<dyn xray_features::policy::PolicyManager>);
+        dispatcher
+            .set_policy_manager(Arc::clone(pm) as Arc<dyn xray_features::policy::PolicyManager>);
     }
     let policy_manager: Option<&dyn xray_features::policy::PolicyManager> =
         pm_opt.as_ref().map(|p| &**p as &dyn xray_features::policy::PolicyManager);
@@ -294,9 +291,8 @@ async fn start_full_dispatched(
         instance.add_feature(Arc::new(feature));
     }
     if let Some(log_feature) = instance.get_feature::<xray_app_log::LogFeature>() {
-        dispatcher.access_sink = Some(Arc::new(LogInstanceSink(Arc::clone(
-            log_feature.instance(),
-        ))));
+        dispatcher.access_sink =
+            Some(Arc::new(LogInstanceSink(Arc::clone(log_feature.instance()))));
     }
     let dispatcher = Arc::new(dispatcher);
 
@@ -314,9 +310,8 @@ async fn start_full_dispatched(
     // 生产装配持 init 完成的 DefaultDispatcher 构造 sink；loopback outbound 命中
     // 路由后经 dispatch_link 回注 inboundTag 对应入站。此前恒传 None = 任何命中
     // loopback 的连接在 handler 侧静默 drop（黑洞）。
-    let loopback_sink: Arc<dyn xray_proxy_loopback::LoopbackSink> = Arc::new(
-        crate::outbound::DispatcherLoopbackSink::new(Arc::clone(&dispatcher)),
-    );
+    let loopback_sink: Arc<dyn xray_proxy_loopback::LoopbackSink> =
+        Arc::new(crate::outbound::DispatcherLoopbackSink::new(Arc::clone(&dispatcher)));
     // DNS service 同步注入出站（bd bqm）：targetStrategy 域名解析经此生效
     // （对应 Go 全局 internet.dnsClient 由 app/dns 初始化）。
     register_outbounds(
@@ -333,11 +328,10 @@ async fn start_full_dispatched(
     // balancer 消费即误判节点死活。先于 bag2 注入：feature 的"已 set_io 跳过"
     // 保护使兜底不覆盖真 executor。
     {
-        let obs_selector: Arc<dyn xray_app_observatory::OutboundSelector> = Arc::new(
-            xray_app_observatory::RealOutboundSelector::with_selector(Arc::new(
+        let obs_selector: Arc<dyn xray_app_observatory::OutboundSelector> =
+            Arc::new(xray_app_observatory::RealOutboundSelector::with_selector(Arc::new(
                 OhmTagSelector(Arc::clone(&ohm)),
-            )),
-        );
+            )));
         if let Some(f) = instance.get_feature::<xray_app_observatory::ObservatoryFeature>() {
             let executor = xray_app_observatory::RealOutboundProbeExecutor::from_config(
                 f.observer().config(),
@@ -345,8 +339,7 @@ async fn start_full_dispatched(
             );
             f.set_io(obs_selector, Arc::new(executor));
         }
-        if let Some(bf) = instance.get_feature::<xray_app_observatory::BurstObservatoryFeature>()
-        {
+        if let Some(bf) = instance.get_feature::<xray_app_observatory::BurstObservatoryFeature>() {
             let s = bf.observer().settings();
             let timeout_ms = (s.timeout / 1_000_000).max(1) as u64;
             let executor = xray_app_observatory::RealOutboundProbeExecutor::new(
@@ -420,8 +413,9 @@ impl xray_app_dns::dial::QueryDialer for DispatcherDnsDialer {
     fn dial_tcp(
         &self,
         dest: &xray_common::net::destination::Destination,
-    ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<xray_app_dns::dial::DnsStream>> + Send + '_>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = std::io::Result<xray_app_dns::dial::DnsStream>> + Send + '_>,
+    > {
         // Go nameserver_tcp.go:43-47 / dohnameserver.go:68：dispatcher.Dispatch
         // 完整路由链（无 forced tag，无 sniffing——DNS 查询目标即真实目标）。
         let dispatcher = Arc::clone(&self.dispatcher);
@@ -440,16 +434,19 @@ impl xray_app_dns::dial::QueryDialer for DispatcherDnsDialer {
         &self,
         dest: &xray_common::net::destination::Destination,
     ) -> std::pin::Pin<
-        Box<dyn Future<Output = std::io::Result<Box<dyn xray_app_dns::dial::UdpPacketSession>>> + Send + '_>,
+        Box<
+            dyn Future<Output = std::io::Result<Box<dyn xray_app_dns::dial::UdpPacketSession>>>
+                + Send
+                + '_,
+        >,
     > {
         // Go nameserver_udp.go:134 udpServer.Dispatch 包粒度语义：raw DNS 包
         // 经 UdpDispatchSession 装 XUDP 帧 → dispatch_link 路由 → outbound
         // （freedom 等）拆帧发出。
-        let session = xray_app_dispatcher::UdpDispatchSession::new(Arc::new(
-            DispatcherLinkHandler {
+        let session =
+            xray_app_dispatcher::UdpDispatchSession::new(Arc::new(DispatcherLinkHandler {
                 dispatcher: Arc::clone(&self.dispatcher),
-            },
-        ));
+            }));
         Box::pin(async move {
             Ok(Box::new(DnsUdpSessionAdapter { session })
                 as Box<dyn xray_app_dns::dial::UdpPacketSession>)
@@ -479,13 +476,7 @@ impl xray_app_dispatcher::DispatchHandler for DispatcherLinkHandler {
         dest: &xray_common::net::destination::Destination,
         link: xray_transport::link::Link,
     ) -> xray_app_dispatcher::default::PinFuture<()> {
-        let r = self.dispatcher.dispatch_link(
-            dest,
-            link,
-            &SniffingRequest::default(),
-            None,
-            None,
-        );
+        let r = self.dispatcher.dispatch_link(dest, link, &SniffingRequest::default(), None, None);
         Box::pin(async move {
             if let Err(e) = r {
                 tracing::warn!(tag = "dns", error = %e, "dns udp dispatch link failed");
@@ -517,9 +508,7 @@ impl xray_app_dns::dial::UdpPacketSession for DnsUdpSessionAdapter {
         &mut self,
     ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<Option<Vec<u8>>>> + Send + '_>> {
         let session = &mut self.session;
-        Box::pin(async move {
-            Ok(session.recv_packet().await?.map(|(_, payload)| payload))
-        })
+        Box::pin(async move { Ok(session.recv_packet().await?.map(|(_, payload)| payload)) })
     }
 }
 
@@ -557,15 +546,20 @@ pub fn start_instance(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc as StdArc;
+    use std::sync::{
+        Arc as StdArc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+    use xray_app_dispatcher::OutboundHandlerManager;
+    use xray_conf::{BuiltConfig, BuiltEntry, BuiltInbound, BuiltOutbound};
     use xray_features::{Feature, FeatureError, FeatureFactory, registry};
 
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
-    use xray_conf::{BuiltConfig, BuiltEntry, BuiltInbound, BuiltOutbound};
-    use xray_app_dispatcher::OutboundHandlerManager;
+    use super::*;
 
     /// 集成链路测试的 freedom settings：显式 allow 全放行。
     ///
@@ -601,6 +595,7 @@ mod tests {
         fn feature_name(&self) -> &'static str {
             "SharedCounterFeature"
         }
+
         fn start(&self) -> Result<(), FeatureError> {
             self.counter.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -651,9 +646,8 @@ mod tests {
         let counter = StdArc::new(AtomicUsize::new(0));
         let counter_for_factory = counter.clone();
         let factory: FeatureFactory = Arc::new(move |_data: &[u8]| {
-            Ok(Arc::new(SharedCounterFeature {
-                counter: counter_for_factory.clone(),
-            }) as Arc<dyn Feature>)
+            Ok(Arc::new(SharedCounterFeature { counter: counter_for_factory.clone() })
+                as Arc<dyn Feature>)
         });
         let _ = registry::register_feature("xray.test.shared_counter", factory);
 
@@ -664,11 +658,7 @@ mod tests {
         });
         let inst = start_from_built(&built).expect("registered feature should start");
         assert_eq!(inst.feature_count(), 5); // 4 defaults + 1 test app
-        assert_eq!(
-            counter.load(Ordering::SeqCst),
-            1,
-            "feature.start should be called once"
-        );
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "feature.start should be called once");
     }
 
     #[test]
@@ -704,6 +694,7 @@ mod tests {
             fn feature_name(&self) -> &'static str {
                 self.tag
             }
+
             fn start(&self) -> Result<(), FeatureError> {
                 self.order.lock().push(self.tag.to_string());
                 Ok(())
@@ -714,19 +705,15 @@ mod tests {
         let _ = registry::register_feature(
             "xray.test.ordered.first",
             Arc::new(move |_data| {
-                Ok(Arc::new(OrderedFeature {
-                    tag: "first",
-                    order: order1.clone(),
-                }) as Arc<dyn Feature>)
+                Ok(Arc::new(OrderedFeature { tag: "first", order: order1.clone() })
+                    as Arc<dyn Feature>)
             }),
         );
         let _ = registry::register_feature(
             "xray.test.ordered.second",
             Arc::new(move |_data| {
-                Ok(Arc::new(OrderedFeature {
-                    tag: "second",
-                    order: order2.clone(),
-                }) as Arc<dyn Feature>)
+                Ok(Arc::new(OrderedFeature { tag: "second", order: order2.clone() })
+                    as Arc<dyn Feature>)
             }),
         );
 
@@ -762,7 +749,7 @@ mod tests {
                         if sock.write_all(&buf[..n]).await.is_err() {
                             break;
                         }
-                    }
+                    },
                 }
             }
         });
@@ -775,10 +762,7 @@ mod tests {
         // 3. 构建 BuiltConfig: socks inbound + freedom outbound
         let mut built = BuiltConfig::default();
         built.inbounds.push(BuiltInbound {
-            entry: BuiltEntry {
-                kind: "socks".into(),
-                data: vec![],
-            },
+            entry: BuiltEntry { kind: "socks".into(), data: vec![] },
             tag: "socks-in".into(),
             port: Some(socks_port),
             listen: Some("127.0.0.1".into()),
@@ -786,10 +770,7 @@ mod tests {
             sniffing_json: None,
         });
         built.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry {
-                kind: "freedom".into(),
-                data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec(),
-            },
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(),
             send_through: None,
             stream_settings_json: None,
@@ -799,13 +780,9 @@ mod tests {
         });
 
         // 4. start_full
-        let (inst, ohm, handles) =
-            start_full(&built).await.expect("start_full should succeed");
+        let (inst, ohm, handles) = start_full(&built).await.expect("start_full should succeed");
         assert!(inst.is_running(), "instance should be running");
-        assert!(
-            ohm.get_default_handler().is_some(),
-            "freedom should be default handler"
-        );
+        assert!(ohm.get_default_handler().is_some(), "freedom should be default handler");
 
         // 5. 等 listener 就绪
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -847,6 +824,147 @@ mod tests {
         }
     }
 
+    /// naive 双栈 e2e（bd 88vp 收口）：client 实例（socks 入站 + naive 出站）
+    /// → server 实例（naive 入站 + freedom 出站）→ echo。
+    ///
+    /// 全链真实 TLS（自签证书 + pinnedPeerCertSha256 钉扎）+ h2 CONNECT +
+    /// Basic auth + padding 帧化；SOCKS5 客户端逐字节断言回传。
+    #[tokio::test]
+    async fn naive_inbound_to_naive_outbound_two_stack_e2e() {
+        // 1. echo server
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = echo_listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16_384];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    },
+                }
+            }
+        });
+
+        // 2. 自签证书 + pin（pinnedPeerCertSha256 双向统一，interop_ci 同款）
+        let (cert_pem, key_pem) =
+            xray_tls::certificate::generate_self_signed_cert(&["localhost"]).unwrap();
+        let cert_entry = serde_json::json!({ "certificate": cert_pem, "key": key_pem });
+        let (certs, _) = xray_tls::certificate::entry_certs_and_key(&cert_entry).unwrap();
+        let pin = xray_tls::pin::generate_cert_hash_hex(certs[0].as_ref());
+
+        // 3. 空闲端口
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let naive_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        // 4. server 实例：naive 入站（TLS from streamSettings）+ freedom 出站
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry {
+                kind: "naive".into(),
+                data: br#"{"users":[{"name":"user","pass":"pass"}]}"#.to_vec(),
+            },
+            tag: "naive-in".into(),
+            port: Some(naive_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: Some(serde_json::json!({
+                "network": "tcp",
+                "security": "tls",
+                "tlsSettings": {
+                    "certificates": [{ "certificate": cert_pem, "key": key_pem }]
+                }
+            })),
+            sniffing_json: None,
+        });
+        server_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
+            tag: "direct".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
+        });
+
+        // 5. client 实例：socks 入站 + naive 出站
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "socks".into(), data: vec![] },
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        client_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry {
+                kind: "naive".into(),
+                data: serde_json::json!({
+                    "server": "127.0.0.1",
+                    "port": naive_port,
+                    "sni": "localhost",
+                    "username": "user",
+                    "password": "pass",
+                    "fingerprint": "chrome",
+                    "pinnedPeerCertSha256": pin
+                })
+                .to_string()
+                .into_bytes(),
+            },
+            tag: "naive-out".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
+        });
+
+        // 6. 双实例启动
+        let (_server_inst, _server_ohm, mut handles) =
+            start_full(&server_cfg).await.expect("server start_full");
+        let (_client_inst, _client_ohm, client_handles) =
+            start_full(&client_cfg).await.expect("client start_full");
+        handles.extend(client_handles);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // 7. SOCKS5 客户端经全链 echo（payload 跨多个 h2 DATA 帧 + padding 帧）
+        let mut client =
+            TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.expect("connect socks");
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x05, 0x00], "socks no-auth");
+
+        let ipv4 = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
+        let mut req = vec![0x05, 0x01, 0x00, 0x01];
+        req.extend_from_slice(&ipv4);
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        client.write_all(&req).await.unwrap();
+        let mut connect_resp = [0u8; 10];
+        client.read_exact(&mut connect_resp).await.unwrap();
+        assert_eq!(connect_resp[1], 0x00, "CONNECT via naive chain should succeed");
+
+        let payload: Vec<u8> = (0..12_345u32).map(|i| (i % 251) as u8).collect();
+        client.write_all(&payload).await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        client.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, payload, "echo through naive two-stack chain must be byte-for-byte");
+
+        for h in handles {
+            h.abort();
+        }
+    }
+
     /// splice 生产激活 e2e（txno-splice 收口）：双 start_full 全栈链——
     /// client 实例（socks 入站 + socks 出站）→ server 实例（socks 入站 +
     /// freedom 出站）→ echo。server 侧 DialBridge 准入四件套（平台 + env +
@@ -857,8 +975,8 @@ mod tests {
     /// 真实判定分叉（同输入：socks 裸入站 can=1/raw、freedom 裸出站）：
     /// - 准入（Linux/Android 且 env 开，缺省开）：echo 完整 + 期间
     ///   [`xray_app_dispatcher::SPLICE_ADMISSIONS`] 增量 ≥1；
-    /// - 未准入（Windows/macOS 或 env 关）：echo 仍必须完整（回退泵全链
-    ///   可用），增量 ==0（未准入不得计入激活）。
+    /// - 未准入（Windows/macOS 或 env 关）：echo 仍必须完整（回退泵全链 可用），增量
+    ///   ==0（未准入不得计入激活）。
     #[tokio::test]
     async fn integration_splice_admitted_two_stack_echo() {
         use xray_app_dispatcher::SPLICE_ADMISSIONS;
@@ -877,7 +995,7 @@ mod tests {
                         if sock.write_all(&buf[..n]).await.is_err() {
                             break;
                         }
-                    }
+                    },
                 }
             }
         });
@@ -890,8 +1008,8 @@ mod tests {
         let client_socks_port = probe.local_addr().unwrap().port();
         drop(probe);
 
-        // 3. server 实例：socks 入站（裸 TCP → can=1 + raw dup）+ freedom 出站
-        //    （splice 准入点在本实例 DialBridge，xray-core outbound.rs:735 唯一置位）
+        // 3. server 实例：socks 入站（裸 TCP → can=1 + raw dup）+ freedom 出站 （splice
+        //    准入点在本实例 DialBridge，xray-core outbound.rs:735 唯一置位）
         let mut server_cfg = BuiltConfig::default();
         server_cfg.inbounds.push(BuiltInbound {
             entry: BuiltEntry { kind: "socks".into(), data: vec![] },
@@ -902,10 +1020,7 @@ mod tests {
             sniffing_json: None,
         });
         server_cfg.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry {
-                kind: "freedom".into(),
-                data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec(),
-            },
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(),
             send_through: None,
             stream_settings_json: None,
@@ -915,8 +1030,8 @@ mod tests {
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("server start_full");
 
-        // 4. client 实例：socks 入站 + socks 出站（非 freedom → 不置
-        //    splice_outbound，本实例准入恒 false，不污染激活计数）
+        // 4. client 实例：socks 入站 + socks 出站（非 freedom → 不置 splice_outbound，本实例准入恒
+        //    false，不污染激活计数）
         let mut client_cfg = BuiltConfig::default();
         client_cfg.inbounds.push(BuiltInbound {
             entry: BuiltEntry { kind: "socks".into(), data: vec![] },
@@ -998,10 +1113,7 @@ mod tests {
         // 7. 激活分叉断言
         let admissions = SPLICE_ADMISSIONS.load(Ordering::Relaxed) - admissions_before;
         if expected_admitted {
-            assert!(
-                admissions >= 1,
-                "splice 准入成立但激活计数未增（增量 {admissions}）"
-            );
+            assert!(admissions >= 1, "splice 准入成立但激活计数未增（增量 {admissions}）");
         } else {
             assert_eq!(admissions, 0, "未准入不得计入 splice 激活");
         }
@@ -1027,14 +1139,14 @@ mod tests {
                         if sock.write_all(&buf[..n]).await.is_err() {
                             break;
                         }
-                    }
+                    },
                 }
             }
         });
 
         // 2. access log 临时文件
-        let access_path = std::env::temp_dir()
-            .join(format!("xray-access-e2e-{}.log", std::process::id()));
+        let access_path =
+            std::env::temp_dir().join(format!("xray-access-e2e-{}.log", std::process::id()));
         let _ = std::fs::remove_file(&access_path);
 
         // 3. 找空闲端口给 socks inbound
@@ -1053,10 +1165,7 @@ mod tests {
             .unwrap(),
         });
         built.inbounds.push(BuiltInbound {
-            entry: BuiltEntry {
-                kind: "socks".into(),
-                data: vec![],
-            },
+            entry: BuiltEntry { kind: "socks".into(), data: vec![] },
             tag: "socks-in".into(),
             port: Some(socks_port),
             listen: Some("127.0.0.1".into()),
@@ -1064,10 +1173,7 @@ mod tests {
             sniffing_json: None,
         });
         built.outbounds.push(BuiltOutbound {
-            entry: BuiltEntry {
-                kind: "freedom".into(),
-                data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec(),
-            },
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(),
             send_through: None,
             stream_settings_json: None,
@@ -1189,28 +1295,43 @@ mod tests {
             loop {
                 match sock.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => { if sock.write_all(&buf[..n]).await.is_err() { break; } }
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    },
                 }
             }
         });
 
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let vmess_port = probe.local_addr().unwrap().port(); drop(probe);
+        let vmess_port = probe.local_addr().unwrap().port();
+        drop(probe);
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let socks_port = probe.local_addr().unwrap().port(); drop(probe);
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
 
         // 2. server: VMess inbound + Freedom outbound
         let mut server_cfg = BuiltConfig::default();
         server_cfg.inbounds.push(BuiltInbound {
-            entry: BuiltEntry { kind: "vmess".into(),
-                data: br#"{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}"#.to_vec() },
-            tag: "vmess-in".into(), port: Some(vmess_port), listen: Some("127.0.0.1".into()),
-            stream_settings_json: None, sniffing_json: None,
+            entry: BuiltEntry {
+                kind: "vmess".into(),
+                data: br#"{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}"#.to_vec(),
+            },
+            tag: "vmess-in".into(),
+            port: Some(vmess_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
         });
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
-            tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            tag: "direct".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("vmess server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1219,8 +1340,11 @@ mod tests {
         let mut client_cfg = BuiltConfig::default();
         client_cfg.inbounds.push(BuiltInbound {
             entry: BuiltEntry { kind: "socks".into(), data: vec![] },
-            tag: "socks-in".into(), port: Some(socks_port), listen: Some("127.0.0.1".into()),
-            stream_settings_json: None, sniffing_json: None,
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
         });
         client_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "vmess".into(),
@@ -1234,24 +1358,34 @@ mod tests {
         // 4. SOCKS5 → VMess → echo
         let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.unwrap();
         client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-        let mut resp = [0u8; 2]; client.read_exact(&mut resp).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
         assert_eq!(resp, [0x05, 0x00]);
-        let ip = match echo_addr.ip() { std::net::IpAddr::V4(v) => v.octets(), _ => unreachable!() };
+        let ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
         let mut req = vec![0x05, 0x01, 0x00, 0x01];
-        req.extend_from_slice(&ip); req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        req.extend_from_slice(&ip);
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
         client.write_all(&req).await.unwrap();
-        let mut cr = [0u8; 10]; client.read_exact(&mut cr).await.unwrap();
+        let mut cr = [0u8; 10];
+        client.read_exact(&mut cr).await.unwrap();
         assert_eq!(cr[1], 0x00, "VMess CONNECT");
 
         let payload = b"hello vmess chain!";
         client.write_all(payload).await.unwrap();
         let mut got = vec![0u8; payload.len()];
-        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got)).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got))
+            .await
+        {
             Ok(Ok(_)) => assert_eq!(&got, payload, "echo through VMess"),
             Ok(Err(e)) => panic!("VMess read error: {e}"),
             Err(_) => panic!("timeout: VMess chain may need further work"),
         }
-        for h in sh.iter().chain(ch.iter()) { h.abort(); }
+        for h in sh.iter().chain(ch.iter()) {
+            h.abort();
+        }
     }
 
     /// SOCKS5 → VLESS → Freedom → echo 全链路
@@ -1265,15 +1399,21 @@ mod tests {
             loop {
                 match sock.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => { if sock.write_all(&buf[..n]).await.is_err() { break; } }
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    },
                 }
             }
         });
 
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let vless_port = probe.local_addr().unwrap().port(); drop(probe);
+        let vless_port = probe.local_addr().unwrap().port();
+        drop(probe);
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let socks_port = probe.local_addr().unwrap().port(); drop(probe);
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
 
         let mut server_cfg = BuiltConfig::default();
         server_cfg.inbounds.push(BuiltInbound {
@@ -1284,8 +1424,12 @@ mod tests {
         });
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
-            tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            tag: "direct".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("vless server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1293,8 +1437,11 @@ mod tests {
         let mut client_cfg = BuiltConfig::default();
         client_cfg.inbounds.push(BuiltInbound {
             entry: BuiltEntry { kind: "socks".into(), data: vec![] },
-            tag: "socks-in".into(), port: Some(socks_port), listen: Some("127.0.0.1".into()),
-            stream_settings_json: None, sniffing_json: None,
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
         });
         client_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "vless".into(),
@@ -1307,24 +1454,34 @@ mod tests {
 
         let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.unwrap();
         client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-        let mut resp = [0u8; 2]; client.read_exact(&mut resp).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
         assert_eq!(resp, [0x05, 0x00]);
-        let ip = match echo_addr.ip() { std::net::IpAddr::V4(v) => v.octets(), _ => unreachable!() };
+        let ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
         let mut req = vec![0x05, 0x01, 0x00, 0x01];
-        req.extend_from_slice(&ip); req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        req.extend_from_slice(&ip);
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
         client.write_all(&req).await.unwrap();
-        let mut cr = [0u8; 10]; client.read_exact(&mut cr).await.unwrap();
+        let mut cr = [0u8; 10];
+        client.read_exact(&mut cr).await.unwrap();
         assert_eq!(cr[1], 0x00, "VLESS CONNECT");
 
         let payload = b"hello vless chain!";
         client.write_all(payload).await.unwrap();
         let mut got = vec![0u8; payload.len()];
-        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got)).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got))
+            .await
+        {
             Ok(Ok(_)) => assert_eq!(&got, payload, "echo through VLESS"),
             Ok(Err(e)) => panic!("VLESS read error: {e}"),
             Err(_) => panic!("timeout: VLESS chain may need further work"),
         }
-        for h in sh.iter().chain(ch.iter()) { h.abort(); }
+        for h in sh.iter().chain(ch.iter()) {
+            h.abort();
+        }
     }
 
     /// SOCKS5 → Trojan → Freedom → echo 全链路
@@ -1338,27 +1495,42 @@ mod tests {
             loop {
                 match sock.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => { if sock.write_all(&buf[..n]).await.is_err() { break; } }
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    },
                 }
             }
         });
 
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let trojan_port = probe.local_addr().unwrap().port(); drop(probe);
+        let trojan_port = probe.local_addr().unwrap().port();
+        drop(probe);
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let socks_port = probe.local_addr().unwrap().port(); drop(probe);
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
 
         let mut server_cfg = BuiltConfig::default();
         server_cfg.inbounds.push(BuiltInbound {
-            entry: BuiltEntry { kind: "trojan".into(),
-                data: br#"{"clients":[{"password":"test-pass-12345"}]}"#.to_vec() },
-            tag: "trojan-in".into(), port: Some(trojan_port), listen: Some("127.0.0.1".into()),
-            stream_settings_json: None, sniffing_json: None,
+            entry: BuiltEntry {
+                kind: "trojan".into(),
+                data: br#"{"clients":[{"password":"test-pass-12345"}]}"#.to_vec(),
+            },
+            tag: "trojan-in".into(),
+            port: Some(trojan_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
         });
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
-            tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            tag: "direct".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("trojan server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1366,8 +1538,11 @@ mod tests {
         let mut client_cfg = BuiltConfig::default();
         client_cfg.inbounds.push(BuiltInbound {
             entry: BuiltEntry { kind: "socks".into(), data: vec![] },
-            tag: "socks-in".into(), port: Some(socks_port), listen: Some("127.0.0.1".into()),
-            stream_settings_json: None, sniffing_json: None,
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
         });
         client_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "trojan".into(),
@@ -1380,24 +1555,34 @@ mod tests {
 
         let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.unwrap();
         client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-        let mut resp = [0u8; 2]; client.read_exact(&mut resp).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
         assert_eq!(resp, [0x05, 0x00]);
-        let ip = match echo_addr.ip() { std::net::IpAddr::V4(v) => v.octets(), _ => unreachable!() };
+        let ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
         let mut req = vec![0x05, 0x01, 0x00, 0x01];
-        req.extend_from_slice(&ip); req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        req.extend_from_slice(&ip);
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
         client.write_all(&req).await.unwrap();
-        let mut cr = [0u8; 10]; client.read_exact(&mut cr).await.unwrap();
+        let mut cr = [0u8; 10];
+        client.read_exact(&mut cr).await.unwrap();
         assert_eq!(cr[1], 0x00, "Trojan CONNECT");
 
         let payload = b"hello trojan chain!";
         client.write_all(payload).await.unwrap();
         let mut got = vec![0u8; payload.len()];
-        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got)).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got))
+            .await
+        {
             Ok(Ok(_)) => assert_eq!(&got, payload, "echo through Trojan"),
             Ok(Err(e)) => panic!("Trojan read error: {e}"),
             Err(_) => panic!("timeout: Trojan chain may need further work"),
         }
-        for h in sh.iter().chain(ch.iter()) { h.abort(); }
+        for h in sh.iter().chain(ch.iter()) {
+            h.abort();
+        }
     }
 
     /// 传输矩阵：VLESS over WebSocket → Freedom → echo
@@ -1411,15 +1596,21 @@ mod tests {
             loop {
                 match sock.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => { if sock.write_all(&buf[..n]).await.is_err() { break; } }
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    },
                 }
             }
         });
 
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let vless_port = probe.local_addr().unwrap().port(); drop(probe);
+        let vless_port = probe.local_addr().unwrap().port();
+        drop(probe);
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let socks_port = probe.local_addr().unwrap().port(); drop(probe);
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
 
         let ws_settings = r#"{"network":"ws","security":"none","wsSettings":{"path":"/vless"}}"#;
 
@@ -1433,8 +1624,12 @@ mod tests {
         });
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
-            tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            tag: "direct".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("vless-ws server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1443,8 +1638,11 @@ mod tests {
         let mut client_cfg = BuiltConfig::default();
         client_cfg.inbounds.push(BuiltInbound {
             entry: BuiltEntry { kind: "socks".into(), data: vec![] },
-            tag: "socks-in".into(), port: Some(socks_port), listen: Some("127.0.0.1".into()),
-            stream_settings_json: None, sniffing_json: None,
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
         });
         client_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "vless".into(),
@@ -1459,24 +1657,34 @@ mod tests {
         // SOCKS5 → VLESS/WS → echo
         let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.unwrap();
         client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-        let mut resp = [0u8; 2]; client.read_exact(&mut resp).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
         assert_eq!(resp, [0x05, 0x00]);
-        let ip = match echo_addr.ip() { std::net::IpAddr::V4(v) => v.octets(), _ => unreachable!() };
+        let ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
         let mut req = vec![0x05, 0x01, 0x00, 0x01];
-        req.extend_from_slice(&ip); req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        req.extend_from_slice(&ip);
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
         client.write_all(&req).await.unwrap();
-        let mut cr = [0u8; 10]; client.read_exact(&mut cr).await.unwrap();
+        let mut cr = [0u8; 10];
+        client.read_exact(&mut cr).await.unwrap();
         assert_eq!(cr[1], 0x00, "VLESS/WS CONNECT");
 
         let payload = b"hello vless over ws!";
         client.write_all(payload).await.unwrap();
         let mut got = vec![0u8; payload.len()];
-        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got)).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got))
+            .await
+        {
             Ok(Ok(_)) => assert_eq!(&got, payload, "echo through VLESS/WS"),
             Ok(Err(e)) => panic!("VLESS/WS read error: {e}"),
             Err(_) => panic!("timeout: VLESS/WS transport may need further work"),
         }
-        for h in sh.iter().chain(ch.iter()) { h.abort(); }
+        for h in sh.iter().chain(ch.iter()) {
+            h.abort();
+        }
     }
 
     /// 路由分发测试：多 outbound + 域名规则 → 正确 outbound 被选中
@@ -1495,9 +1703,16 @@ mod tests {
             let (mut sock, _) = ea_listener.accept().await.unwrap();
             ea_tag.store(1, Ordering::SeqCst);
             sock.write_all(b"SERVER_A").await.unwrap();
-            let mut buf = [0u8; 1024]; loop {
-                match sock.read(&mut buf).await { Ok(0)|Err(_) => break,
-                    Ok(n) => { if sock.write_all(&buf[..n]).await.is_err() { break; } } }
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    },
+                }
             }
         });
 
@@ -1509,27 +1724,42 @@ mod tests {
             let (mut sock, _) = eb_listener.accept().await.unwrap();
             eb_tag.store(1, Ordering::SeqCst);
             sock.write_all(b"SERVER_B").await.unwrap();
-            let mut buf = [0u8; 1024]; loop {
-                match sock.read(&mut buf).await { Ok(0)|Err(_) => break,
-                    Ok(n) => { if sock.write_all(&buf[..n]).await.is_err() { break; } } }
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    },
+                }
             }
         });
 
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let socks_port = probe.local_addr().unwrap().port(); drop(probe);
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
 
         // 单实例：SOCKS inbound + 2 个 Freedom outbound (A, B) + 路由规则
         let mut cfg = BuiltConfig::default();
         cfg.inbounds.push(BuiltInbound {
             entry: BuiltEntry { kind: "socks".into(), data: vec![] },
-            tag: "socks-in".into(), port: Some(socks_port), listen: Some("127.0.0.1".into()),
-            stream_settings_json: None, sniffing_json: None,
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
         });
         // outbound A: freedom (默认)
         cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
-            tag: "default".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            tag: "default".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         // routing config: IP 规则 → 127.0.0.0/8 走默认（验证 routing 不崩溃）
         // 注：完整路由测试需要 RouterAdapter + domain sniffing，此处验证 routing JSON 不破坏启动
@@ -1545,25 +1775,35 @@ mod tests {
         // SOCKS5 → echo A (通过默认 outbound)
         let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.unwrap();
         client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-        let mut resp = [0u8; 2]; client.read_exact(&mut resp).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
         assert_eq!(resp, [0x05, 0x00]);
-        let ip = match ea_addr.ip() { std::net::IpAddr::V4(v) => v.octets(), _ => unreachable!() };
+        let ip = match ea_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
         let mut req = vec![0x05, 0x01, 0x00, 0x01];
-        req.extend_from_slice(&ip); req.extend_from_slice(&ea_addr.port().to_be_bytes());
+        req.extend_from_slice(&ip);
+        req.extend_from_slice(&ea_addr.port().to_be_bytes());
         client.write_all(&req).await.unwrap();
-        let mut cr = [0u8; 10]; client.read_exact(&mut cr).await.unwrap();
+        let mut cr = [0u8; 10];
+        client.read_exact(&mut cr).await.unwrap();
         assert_eq!(cr[1], 0x00, "routing CONNECT");
 
         // 验证数据通过
         let payload = b"routing test!";
         client.write_all(payload).await.unwrap();
         let mut got = vec![0u8; payload.len()];
-        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got)).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got))
+            .await
+        {
             Ok(Ok(_)) => {}, // echo 回环成功即路由正常
             Ok(Err(e)) => panic!("routing read error: {e}"),
             Err(_) => panic!("timeout: routing dispatch may need further work"),
         }
-        for h in handles.iter() { h.abort(); }
+        for h in handles.iter() {
+            h.abort();
+        }
     }
 
     /// TLS 端到端测试：SOCKS5 → VLESS+TLS → Freedom → echo
@@ -1582,21 +1822,30 @@ mod tests {
             loop {
                 match sock.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => { if sock.write_all(&buf[..n]).await.is_err() { break; } }
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    },
                 }
             }
         });
 
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let vless_port = probe.local_addr().unwrap().port(); drop(probe);
+        let vless_port = probe.local_addr().unwrap().port();
+        drop(probe);
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let socks_port = probe.local_addr().unwrap().port(); drop(probe);
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
 
         // server streamSettings: TLS with inline cert
-        let server_tls = format!(r#"{{"network":"tcp","security":"tls","tlsSettings":{{"certificates":[{{"certificate":[{:?}],"key":[{:?}]}}]}}}}"#, cert_pem, key_pem);
+        let server_tls = format!(
+            r#"{{"network":"tcp","security":"tls","tlsSettings":{{"certificates":[{{"certificate":[{:?}],"key":[{:?}]}}]}}}}"#,
+            cert_pem, key_pem
+        );
         // client streamSettings: TLS with allowInsecure
         let client_tls = r#"{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true,"serverName":"localhost"}}"#;
-    
+
         // 2. server: VLESS+TLS inbound + Freedom outbound
         let mut server_cfg = BuiltConfig::default();
         server_cfg.inbounds.push(BuiltInbound {
@@ -1607,8 +1856,12 @@ mod tests {
         });
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
-            tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            tag: "direct".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("vless-tls server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1617,8 +1870,11 @@ mod tests {
         let mut client_cfg = BuiltConfig::default();
         client_cfg.inbounds.push(BuiltInbound {
             entry: BuiltEntry { kind: "socks".into(), data: vec![] },
-            tag: "socks-in".into(), port: Some(socks_port), listen: Some("127.0.0.1".into()),
-            stream_settings_json: None, sniffing_json: None,
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
         });
         client_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "vless".into(),
@@ -1633,24 +1889,34 @@ mod tests {
         // 4. SOCKS5 → VLESS+TLS → echo
         let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.unwrap();
         client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-        let mut resp = [0u8; 2]; client.read_exact(&mut resp).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
         assert_eq!(resp, [0x05, 0x00]);
-        let ip = match echo_addr.ip() { std::net::IpAddr::V4(v) => v.octets(), _ => unreachable!() };
+        let ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
         let mut req = vec![0x05, 0x01, 0x00, 0x01];
-        req.extend_from_slice(&ip); req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        req.extend_from_slice(&ip);
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
         client.write_all(&req).await.unwrap();
-        let mut cr = [0u8; 10]; client.read_exact(&mut cr).await.unwrap();
+        let mut cr = [0u8; 10];
+        client.read_exact(&mut cr).await.unwrap();
         assert_eq!(cr[1], 0x00, "VLESS+TLS CONNECT");
 
         let payload = b"hello vless over tls!";
         client.write_all(payload).await.unwrap();
         let mut got = vec![0u8; payload.len()];
-        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got)).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got))
+            .await
+        {
             Ok(Ok(_)) => assert_eq!(&got, payload, "echo through VLESS+TLS"),
             Ok(Err(e)) => panic!("VLESS+TLS read error: {e}"),
             Err(_) => panic!("timeout: VLESS+TLS may need TLS listener wiring"),
         }
-        for h in sh.iter().chain(ch.iter()) { h.abort(); }
+        for h in sh.iter().chain(ch.iter()) {
+            h.abort();
+        }
     }
 
     /// VLESS+Vision+TLS 端到端（server splice 接线）：SOCKS5 → VLESS(flow=XRV)+TLS
@@ -1670,17 +1936,26 @@ mod tests {
             loop {
                 match sock.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => { if sock.write_all(&buf[..n]).await.is_err() { break; } }
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    },
                 }
             }
         });
 
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let vless_port = probe.local_addr().unwrap().port(); drop(probe);
+        let vless_port = probe.local_addr().unwrap().port();
+        drop(probe);
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let socks_port = probe.local_addr().unwrap().port(); drop(probe);
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
 
-        let server_tls = format!(r#"{{"network":"tcp","security":"tls","tlsSettings":{{"certificates":[{{"certificate":[{:?}],"key":[{:?}]}}]}}}}"#, cert_pem, key_pem);
+        let server_tls = format!(
+            r#"{{"network":"tcp","security":"tls","tlsSettings":{{"certificates":[{{"certificate":[{:?}],"key":[{:?}]}}]}}}}"#,
+            cert_pem, key_pem
+        );
         let client_tls = r#"{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true,"serverName":"localhost"}}"#;
 
         let mut server_cfg = BuiltConfig::default();
@@ -1692,8 +1967,12 @@ mod tests {
         });
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
-            tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            tag: "direct".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("vision server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1701,8 +1980,11 @@ mod tests {
         let mut client_cfg = BuiltConfig::default();
         client_cfg.inbounds.push(BuiltInbound {
             entry: BuiltEntry { kind: "socks".into(), data: vec![] },
-            tag: "socks-in".into(), port: Some(socks_port), listen: Some("127.0.0.1".into()),
-            stream_settings_json: None, sniffing_json: None,
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
         });
         client_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "vless".into(),
@@ -1716,13 +1998,19 @@ mod tests {
 
         let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.unwrap();
         client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-        let mut resp = [0u8; 2]; client.read_exact(&mut resp).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
         assert_eq!(resp, [0x05, 0x00]);
-        let ip = match echo_addr.ip() { std::net::IpAddr::V4(v) => v.octets(), _ => unreachable!() };
+        let ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
         let mut req = vec![0x05, 0x01, 0x00, 0x01];
-        req.extend_from_slice(&ip); req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        req.extend_from_slice(&ip);
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
         client.write_all(&req).await.unwrap();
-        let mut cr = [0u8; 10]; client.read_exact(&mut cr).await.unwrap();
+        let mut cr = [0u8; 10];
+        client.read_exact(&mut cr).await.unwrap();
         assert_eq!(cr[1], 0x00, "VLESS+Vision+TLS CONNECT");
 
         // 阶段1：伪 ClientHello record（触发双端 xtls_filter_tls enable_xtls）
@@ -1764,7 +2052,9 @@ mod tests {
             .unwrap();
         up.await.unwrap();
         assert_eq!(got, payload, "512KB integrity through VLESS+Vision+TLS");
-        for h in sh.iter().chain(ch.iter()) { h.abort(); }
+        for h in sh.iter().chain(ch.iter()) {
+            h.abort();
+        }
     }
 
     /// 8i4c：双 start_full 全栈链 + testseed 配置流转。server clients 带
@@ -1784,17 +2074,26 @@ mod tests {
             loop {
                 match sock.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => { if sock.write_all(&buf[..n]).await.is_err() { break; } }
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    },
                 }
             }
         });
 
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let vless_port = probe.local_addr().unwrap().port(); drop(probe);
+        let vless_port = probe.local_addr().unwrap().port();
+        drop(probe);
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let socks_port = probe.local_addr().unwrap().port(); drop(probe);
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
 
-        let server_tls = format!(r#"{{"network":"tcp","security":"tls","tlsSettings":{{"certificates":[{{"certificate":[{:?}],"key":[{:?}]}}]}}}}"#, cert_pem, key_pem);
+        let server_tls = format!(
+            r#"{{"network":"tcp","security":"tls","tlsSettings":{{"certificates":[{{"certificate":[{:?}],"key":[{:?}]}}]}}}}"#,
+            cert_pem, key_pem
+        );
         let client_tls = r#"{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true,"serverName":"localhost"}}"#;
 
         // server：clients[].testseed = [7,8,9,10]（下行 padding 参数）。
@@ -1807,8 +2106,12 @@ mod tests {
         });
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
-            tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            tag: "direct".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("seed server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1817,8 +2120,11 @@ mod tests {
         let mut client_cfg = BuiltConfig::default();
         client_cfg.inbounds.push(BuiltInbound {
             entry: BuiltEntry { kind: "socks".into(), data: vec![] },
-            tag: "socks-in".into(), port: Some(socks_port), listen: Some("127.0.0.1".into()),
-            stream_settings_json: None, sniffing_json: None,
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
         });
         client_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "vless".into(),
@@ -1832,13 +2138,19 @@ mod tests {
 
         let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.unwrap();
         client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-        let mut resp = [0u8; 2]; client.read_exact(&mut resp).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
         assert_eq!(resp, [0x05, 0x00]);
-        let ip = match echo_addr.ip() { std::net::IpAddr::V4(v) => v.octets(), _ => unreachable!() };
+        let ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
         let mut req = vec![0x05, 0x01, 0x00, 0x01];
-        req.extend_from_slice(&ip); req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        req.extend_from_slice(&ip);
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
         client.write_all(&req).await.unwrap();
-        let mut cr = [0u8; 10]; client.read_exact(&mut cr).await.unwrap();
+        let mut cr = [0u8; 10];
+        client.read_exact(&mut cr).await.unwrap();
         assert_eq!(cr[1], 0x00, "testseed chain CONNECT");
 
         // 伪 ClientHello 触发双端 filter（vision 链路标准驱动形态）+ 64KB 完整性。
@@ -1870,7 +2182,9 @@ mod tests {
             .unwrap();
         up.await.unwrap();
         assert_eq!(got, payload, "64KB integrity through testseed-configured chain");
-        for h in sh.iter().chain(ch.iter()) { h.abort(); }
+        for h in sh.iter().chain(ch.iter()) {
+            h.abort();
+        }
     }
 
     /// [三层组合最小复现·实验I] VisionConn(padding) ↔ xray-tls rustls ↔ 真 TCP
@@ -1916,7 +2230,7 @@ mod tests {
                             if tx.send(buf[..n].to_vec()).await.is_err() {
                                 break;
                             }
-                        }
+                        },
                     }
                 }
             };
@@ -2002,7 +2316,7 @@ mod tests {
                             if tx.send(buf[..n].to_vec()).await.is_err() {
                                 break;
                             }
-                        }
+                        },
                     }
                 }
             };
@@ -2074,7 +2388,7 @@ mod tests {
                             if tx.send(buf[..n].to_vec()).await.is_err() {
                                 break;
                             }
-                        }
+                        },
                     }
                 }
             };
@@ -2145,7 +2459,7 @@ mod tests {
                             if tx.send(buf[..n].to_vec()).await.is_err() {
                                 break;
                             }
-                        }
+                        },
                     }
                 }
             };
@@ -2186,7 +2500,8 @@ mod tests {
         server.abort();
     }
 
-    /// Trojan+TLS 端到端：SOCKS5 → Trojan+TLS → Freedom → echo（验证 8m1 修复：streamSettings TLS 注入）
+    /// Trojan+TLS 端到端：SOCKS5 → Trojan+TLS → Freedom → echo（验证 8m1 修复：streamSettings TLS
+    /// 注入）
     #[tokio::test]
     async fn integration_trojan_over_tls_to_echo() {
         let (cert_pem, key_pem) = xray_tls::certificate::generate_self_signed_cert(&["localhost"])
@@ -2199,29 +2514,47 @@ mod tests {
             loop {
                 match sock.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => { if sock.write_all(&buf[..n]).await.is_err() { break; } }
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    },
                 }
             }
         });
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let trojan_port = probe.local_addr().unwrap().port(); drop(probe);
+        let trojan_port = probe.local_addr().unwrap().port();
+        drop(probe);
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let socks_port = probe.local_addr().unwrap().port(); drop(probe);
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
 
-        let server_tls = format!(r#"{{"network":"tcp","security":"tls","tlsSettings":{{"certificates":[{{"certificate":[{:?}],"key":[{:?}]}}]}}}}"#, cert_pem, key_pem);
+        let server_tls = format!(
+            r#"{{"network":"tcp","security":"tls","tlsSettings":{{"certificates":[{{"certificate":[{:?}],"key":[{:?}]}}]}}}}"#,
+            cert_pem, key_pem
+        );
         let client_tls = r#"{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true,"serverName":"localhost"}}"#;
 
         let mut server_cfg = BuiltConfig::default();
         server_cfg.inbounds.push(BuiltInbound {
-            entry: BuiltEntry { kind: "trojan".into(),
-                data: br#"{"clients":[{"password":"test-pass-12345"}]}"#.to_vec() },
-            tag: "trojan-tls-in".into(), port: Some(trojan_port), listen: Some("127.0.0.1".into()),
-            stream_settings_json: Some(serde_json::from_str(&server_tls).unwrap()), sniffing_json: None,
+            entry: BuiltEntry {
+                kind: "trojan".into(),
+                data: br#"{"clients":[{"password":"test-pass-12345"}]}"#.to_vec(),
+            },
+            tag: "trojan-tls-in".into(),
+            port: Some(trojan_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: Some(serde_json::from_str(&server_tls).unwrap()),
+            sniffing_json: None,
         });
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
-            tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            tag: "direct".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("trojan-tls server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -2229,8 +2562,11 @@ mod tests {
         let mut client_cfg = BuiltConfig::default();
         client_cfg.inbounds.push(BuiltInbound {
             entry: BuiltEntry { kind: "socks".into(), data: vec![] },
-            tag: "socks-in".into(), port: Some(socks_port), listen: Some("127.0.0.1".into()),
-            stream_settings_json: None, sniffing_json: None,
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
         });
         client_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "trojan".into(),
@@ -2244,24 +2580,34 @@ mod tests {
 
         let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.unwrap();
         client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-        let mut resp = [0u8; 2]; client.read_exact(&mut resp).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
         assert_eq!(resp, [0x05, 0x00]);
-        let ip = match echo_addr.ip() { std::net::IpAddr::V4(v) => v.octets(), _ => unreachable!() };
+        let ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
         let mut req = vec![0x05, 0x01, 0x00, 0x01];
-        req.extend_from_slice(&ip); req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        req.extend_from_slice(&ip);
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
         client.write_all(&req).await.unwrap();
-        let mut cr = [0u8; 10]; client.read_exact(&mut cr).await.unwrap();
+        let mut cr = [0u8; 10];
+        client.read_exact(&mut cr).await.unwrap();
         assert_eq!(cr[1], 0x00, "Trojan+TLS CONNECT");
 
         let payload = b"hello trojan over tls!";
         client.write_all(payload).await.unwrap();
         let mut got = vec![0u8; payload.len()];
-        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got)).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got))
+            .await
+        {
             Ok(Ok(_)) => assert_eq!(&got, payload, "echo through Trojan+TLS"),
             Ok(Err(e)) => panic!("Trojan+TLS read error: {e}"),
             Err(_) => panic!("timeout: Trojan+TLS inbound may ignore streamSettings TLS"),
         }
-        for h in sh.iter().chain(ch.iter()) { h.abort(); }
+        for h in sh.iter().chain(ch.iter()) {
+            h.abort();
+        }
     }
 
     /// VMess+TLS 端到端：SOCKS5 → VMess+TLS → Freedom → echo（验证 vmess inbound TLS 接线）
@@ -2277,29 +2623,47 @@ mod tests {
             loop {
                 match sock.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => { if sock.write_all(&buf[..n]).await.is_err() { break; } }
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    },
                 }
             }
         });
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let vmess_port = probe.local_addr().unwrap().port(); drop(probe);
+        let vmess_port = probe.local_addr().unwrap().port();
+        drop(probe);
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let socks_port = probe.local_addr().unwrap().port(); drop(probe);
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
 
-        let server_tls = format!(r#"{{"network":"tcp","security":"tls","tlsSettings":{{"certificates":[{{"certificate":[{:?}],"key":[{:?}]}}]}}}}"#, cert_pem, key_pem);
+        let server_tls = format!(
+            r#"{{"network":"tcp","security":"tls","tlsSettings":{{"certificates":[{{"certificate":[{:?}],"key":[{:?}]}}]}}}}"#,
+            cert_pem, key_pem
+        );
         let client_tls = r#"{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true,"serverName":"localhost"}}"#;
 
         let mut server_cfg = BuiltConfig::default();
         server_cfg.inbounds.push(BuiltInbound {
-            entry: BuiltEntry { kind: "vmess".into(),
-                data: br#"{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}"#.to_vec() },
-            tag: "vmess-tls-in".into(), port: Some(vmess_port), listen: Some("127.0.0.1".into()),
-            stream_settings_json: Some(serde_json::from_str(&server_tls).unwrap()), sniffing_json: None,
+            entry: BuiltEntry {
+                kind: "vmess".into(),
+                data: br#"{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}"#.to_vec(),
+            },
+            tag: "vmess-tls-in".into(),
+            port: Some(vmess_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: Some(serde_json::from_str(&server_tls).unwrap()),
+            sniffing_json: None,
         });
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
-            tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            tag: "direct".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("vmess-tls server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -2307,8 +2671,11 @@ mod tests {
         let mut client_cfg = BuiltConfig::default();
         client_cfg.inbounds.push(BuiltInbound {
             entry: BuiltEntry { kind: "socks".into(), data: vec![] },
-            tag: "socks-in".into(), port: Some(socks_port), listen: Some("127.0.0.1".into()),
-            stream_settings_json: None, sniffing_json: None,
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
         });
         client_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "vmess".into(),
@@ -2322,27 +2689,38 @@ mod tests {
 
         let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.unwrap();
         client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-        let mut resp = [0u8; 2]; client.read_exact(&mut resp).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
         assert_eq!(resp, [0x05, 0x00]);
-        let ip = match echo_addr.ip() { std::net::IpAddr::V4(v) => v.octets(), _ => unreachable!() };
+        let ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
         let mut req = vec![0x05, 0x01, 0x00, 0x01];
-        req.extend_from_slice(&ip); req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        req.extend_from_slice(&ip);
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
         client.write_all(&req).await.unwrap();
-        let mut cr = [0u8; 10]; client.read_exact(&mut cr).await.unwrap();
+        let mut cr = [0u8; 10];
+        client.read_exact(&mut cr).await.unwrap();
         assert_eq!(cr[1], 0x00, "VMess+TLS CONNECT");
 
         let payload = b"hello vmess over tls!";
         client.write_all(payload).await.unwrap();
         let mut got = vec![0u8; payload.len()];
-        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got)).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got))
+            .await
+        {
             Ok(Ok(_)) => assert_eq!(&got, payload, "echo through VMess+TLS"),
             Ok(Err(e)) => panic!("VMess+TLS read error: {e}"),
             Err(_) => panic!("timeout: VMess+TLS inbound may ignore streamSettings TLS"),
         }
-        for h in sh.iter().chain(ch.iter()) { h.abort(); }
+        for h in sh.iter().chain(ch.iter()) {
+            h.abort();
+        }
     }
 
-    /// Trojan+TLS+fallbacks：非 Trojan 流量（handshake 失败）→ fallback dest 收到原始字节（bd cvi）。
+    /// Trojan+TLS+fallbacks：非 Trojan 流量（handshake 失败）→ fallback dest 收到原始字节（bd
+    /// cvi）。
     #[tokio::test]
     async fn integration_trojan_tls_fallback_routes_failed_handshake() {
         let (cert_pem, key_pem) = xray_tls::certificate::generate_self_signed_cert(&["localhost"])
@@ -2360,9 +2738,13 @@ mod tests {
         });
 
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let trojan_port = probe.local_addr().unwrap().port(); drop(probe);
+        let trojan_port = probe.local_addr().unwrap().port();
+        drop(probe);
 
-        let server_tls = format!(r#"{{"network":"tcp","security":"tls","tlsSettings":{{"certificates":[{{"certificate":[{:?}],"key":[{:?}]}}]}}}}"#, cert_pem, key_pem);
+        let server_tls = format!(
+            r#"{{"network":"tcp","security":"tls","tlsSettings":{{"certificates":[{{"certificate":[{:?}],"key":[{:?}]}}]}}}}"#,
+            cert_pem, key_pem
+        );
 
         let mut server_cfg = BuiltConfig::default();
         server_cfg.inbounds.push(BuiltInbound {
@@ -2375,15 +2757,21 @@ mod tests {
         });
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
-            tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            tag: "direct".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("trojan-fb server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // 非 Trojan 客户端：TLS 连接发 HTTP → fallback dest 收到原始字节
         static PROVIDER: std::sync::Once = std::sync::Once::new();
-        PROVIDER.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+        PROVIDER.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
         let cfg = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(std::sync::Arc::new(NoVerify))
@@ -2394,13 +2782,17 @@ mod tests {
         tls.write_all(b"GET /path/to/target HTTP/1.1\r\nHost: localhost.example.longdomain.com\r\nUser-Agent: fallback-test\r\n\r\n").await.unwrap();
         let mut got = vec![0u8; 64];
         let n = tokio::time::timeout(std::time::Duration::from_secs(5), tls.read(&mut got))
-            .await.expect("fallback echo timeout").unwrap();
+            .await
+            .expect("fallback echo timeout")
+            .unwrap();
         assert!(got[..n].starts_with(b"GET /"), "fallback dest should echo original bytes");
 
         let fb_bytes = fb_task.await.unwrap();
         assert!(fb_bytes.starts_with(b"GET /"), "fallback echo got {fb_bytes:?}");
 
-        for h in sh.iter() { h.abort(); }
+        for h in sh.iter() {
+            h.abort();
+        }
     }
 
     /// SOCKS5 → SOCKS-outbound → SOCKS-inbound → Freedom → echo（验证 socks outbound 双向桥接）
@@ -2415,26 +2807,39 @@ mod tests {
             loop {
                 match sock.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => { if sock.write_all(&buf[..n]).await.is_err() { break; } }
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    },
                 }
             }
         });
 
-        // 1. server: SOCKS inbound + Freedom outbound。
-        //    端口探测存在 TOCTOU：bind(:0)→drop→InstanceStart 之间并行测试
-        //    可能抢占同端口（os error 98，run 35218583839 ubuntu 实测）——
-        //    EADDRINUSE 时换端口重试。
+        // 1. server: SOCKS inbound + Freedom outbound。 端口探测存在
+        //    TOCTOU：bind(:0)→drop→InstanceStart 之间并行测试 可能抢占同端口（os error 98，run
+        //    35218583839 ubuntu 实测）—— EADDRINUSE 时换端口重试。
         let (socks_server_port, sh) = start_full_retrying_eaddrinuse(|port| {
             let mut server_cfg = BuiltConfig::default();
             server_cfg.inbounds.push(BuiltInbound {
                 entry: BuiltEntry { kind: "socks".into(), data: vec![] },
-                tag: "socks-in".into(), port: Some(port), listen: Some("127.0.0.1".into()),
-                stream_settings_json: None, sniffing_json: None,
+                tag: "socks-in".into(),
+                port: Some(port),
+                listen: Some("127.0.0.1".into()),
+                stream_settings_json: None,
+                sniffing_json: None,
             });
             server_cfg.outbounds.push(BuiltOutbound {
-                entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
-                tag: "direct".into(), send_through: None, stream_settings_json: None,
-                proxy_settings_json: None, mux_json: None, target_strategy: None,
+                entry: BuiltEntry {
+                    kind: "freedom".into(),
+                    data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec(),
+                },
+                tag: "direct".into(),
+                send_through: None,
+                stream_settings_json: None,
+                proxy_settings_json: None,
+                mux_json: None,
+                target_strategy: None,
             });
             server_cfg
         })
@@ -2446,14 +2851,26 @@ mod tests {
             let mut client_cfg = BuiltConfig::default();
             client_cfg.inbounds.push(BuiltInbound {
                 entry: BuiltEntry { kind: "socks".into(), data: vec![] },
-                tag: "socks-in".into(), port: Some(port), listen: Some("127.0.0.1".into()),
-                stream_settings_json: None, sniffing_json: None,
+                tag: "socks-in".into(),
+                port: Some(port),
+                listen: Some("127.0.0.1".into()),
+                stream_settings_json: None,
+                sniffing_json: None,
             });
             client_cfg.outbounds.push(BuiltOutbound {
-                entry: BuiltEntry { kind: "socks".into(),
-                    data: format!(r#"{{"servers":[{{"address":"127.0.0.1","port":{socks_server_port}}}]}}"#).into_bytes() },
-                tag: "proxy".into(), send_through: None, stream_settings_json: None,
-                proxy_settings_json: None, mux_json: None, target_strategy: None,
+                entry: BuiltEntry {
+                    kind: "socks".into(),
+                    data: format!(
+                        r#"{{"servers":[{{"address":"127.0.0.1","port":{socks_server_port}}}]}}"#
+                    )
+                    .into_bytes(),
+                },
+                tag: "proxy".into(),
+                send_through: None,
+                stream_settings_json: None,
+                proxy_settings_json: None,
+                mux_json: None,
+                target_strategy: None,
             });
             client_cfg
         })
@@ -2461,26 +2878,37 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // 3. SOCKS5 → socks_client → socks_server → freedom → echo
-        let mut client = TcpStream::connect(format!("127.0.0.1:{socks_client_port}")).await.unwrap();
+        let mut client =
+            TcpStream::connect(format!("127.0.0.1:{socks_client_port}")).await.unwrap();
         client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-        let mut resp = [0u8; 2]; client.read_exact(&mut resp).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
         assert_eq!(resp, [0x05, 0x00]);
-        let ip = match echo_addr.ip() { std::net::IpAddr::V4(v) => v.octets(), _ => unreachable!() };
+        let ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
         let mut req = vec![0x05, 0x01, 0x00, 0x01];
-        req.extend_from_slice(&ip); req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        req.extend_from_slice(&ip);
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
         client.write_all(&req).await.unwrap();
-        let mut cr = [0u8; 10]; client.read_exact(&mut cr).await.unwrap();
+        let mut cr = [0u8; 10];
+        client.read_exact(&mut cr).await.unwrap();
         assert_eq!(cr[1], 0x00, "socks outbound CONNECT");
 
         let payload = b"hello socks outbound!";
         client.write_all(payload).await.unwrap();
         let mut got = vec![0u8; payload.len()];
-        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got)).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got))
+            .await
+        {
             Ok(Ok(_)) => assert_eq!(&got, payload, "echo through socks outbound"),
             Ok(Err(e)) => panic!("socks outbound read error: {e}"),
             Err(_) => panic!("timeout: socks outbound bridge may need further work"),
         }
-        for h in sh.iter().chain(ch.iter()) { h.abort(); }
+        for h in sh.iter().chain(ch.iter()) {
+            h.abort();
+        }
     }
 
     /// SOCKS5 → Shadowsocks → Freedom → echo 全链路
@@ -2494,27 +2922,42 @@ mod tests {
             loop {
                 match sock.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => { if sock.write_all(&buf[..n]).await.is_err() { break; } }
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    },
                 }
             }
         });
 
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let ss_port = probe.local_addr().unwrap().port(); drop(probe);
+        let ss_port = probe.local_addr().unwrap().port();
+        drop(probe);
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let socks_port = probe.local_addr().unwrap().port(); drop(probe);
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
 
         let mut server_cfg = BuiltConfig::default();
         server_cfg.inbounds.push(BuiltInbound {
-            entry: BuiltEntry { kind: "shadowsocks".into(),
-                data: br#"{"clients":[{"password":"test-pass","method":"aes-256-gcm"}]}"#.to_vec() },
-            tag: "ss-in".into(), port: Some(ss_port), listen: Some("127.0.0.1".into()),
-            stream_settings_json: None, sniffing_json: None,
+            entry: BuiltEntry {
+                kind: "shadowsocks".into(),
+                data: br#"{"clients":[{"password":"test-pass","method":"aes-256-gcm"}]}"#.to_vec(),
+            },
+            tag: "ss-in".into(),
+            port: Some(ss_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
         });
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
-            tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            tag: "direct".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("ss server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -2522,8 +2965,11 @@ mod tests {
         let mut client_cfg = BuiltConfig::default();
         client_cfg.inbounds.push(BuiltInbound {
             entry: BuiltEntry { kind: "socks".into(), data: vec![] },
-            tag: "socks-in".into(), port: Some(socks_port), listen: Some("127.0.0.1".into()),
-            stream_settings_json: None, sniffing_json: None,
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
         });
         client_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "shadowsocks".into(),
@@ -2536,24 +2982,34 @@ mod tests {
 
         let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.unwrap();
         client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-        let mut resp = [0u8; 2]; client.read_exact(&mut resp).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
         assert_eq!(resp, [0x05, 0x00]);
-        let ip = match echo_addr.ip() { std::net::IpAddr::V4(v) => v.octets(), _ => unreachable!() };
+        let ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
         let mut req = vec![0x05, 0x01, 0x00, 0x01];
-        req.extend_from_slice(&ip); req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        req.extend_from_slice(&ip);
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
         client.write_all(&req).await.unwrap();
-        let mut cr = [0u8; 10]; client.read_exact(&mut cr).await.unwrap();
+        let mut cr = [0u8; 10];
+        client.read_exact(&mut cr).await.unwrap();
         assert_eq!(cr[1], 0x00, "Shadowsocks CONNECT");
 
         let payload = b"hello ss chain!";
         client.write_all(payload).await.unwrap();
         let mut got = vec![0u8; payload.len()];
-        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got)).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got))
+            .await
+        {
             Ok(Ok(_)) => assert_eq!(&got, payload, "echo through Shadowsocks"),
             Ok(Err(e)) => panic!("SS read error: {e}"),
             Err(_) => panic!("timeout: SS chain may need further work"),
         }
-        for h in sh.iter().chain(ch.iter()) { h.abort(); }
+        for h in sh.iter().chain(ch.iter()) {
+            h.abort();
+        }
     }
 
     /// VLESS+TLS+fallbacks：真 VLESS 客户端正常代理；非 VLESS（HTTPS 浏览器式）流量
@@ -2583,17 +3039,26 @@ mod tests {
             loop {
                 match sock.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => { if sock.write_all(&buf[..n]).await.is_err() { break; } }
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    },
                 }
             }
         });
 
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let vless_port = probe.local_addr().unwrap().port(); drop(probe);
+        let vless_port = probe.local_addr().unwrap().port();
+        drop(probe);
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let socks_port = probe.local_addr().unwrap().port(); drop(probe);
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
 
-        let server_tls = format!(r#"{{"network":"tcp","security":"tls","tlsSettings":{{"certificates":[{{"certificate":[{:?}],"key":[{:?}]}}]}}}}"#, cert_pem, key_pem);
+        let server_tls = format!(
+            r#"{{"network":"tcp","security":"tls","tlsSettings":{{"certificates":[{{"certificate":[{:?}],"key":[{:?}]}}]}}}}"#,
+            cert_pem, key_pem
+        );
         let client_tls = r#"{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true,"serverName":"localhost"}}"#;
 
         let mut server_cfg = BuiltConfig::default();
@@ -2607,8 +3072,12 @@ mod tests {
         });
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
-            tag: "direct".into(), send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            tag: "direct".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("vless-fb server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -2617,8 +3086,11 @@ mod tests {
         let mut client_cfg = BuiltConfig::default();
         client_cfg.inbounds.push(BuiltInbound {
             entry: BuiltEntry { kind: "socks".into(), data: vec![] },
-            tag: "socks-in".into(), port: Some(socks_port), listen: Some("127.0.0.1".into()),
-            stream_settings_json: None, sniffing_json: None,
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
         });
         client_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "vless".into(),
@@ -2632,25 +3104,35 @@ mod tests {
 
         let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.unwrap();
         client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-        let mut resp = [0u8; 2]; client.read_exact(&mut resp).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
         assert_eq!(resp, [0x05, 0x00]);
-        let ip = match echo_addr.ip() { std::net::IpAddr::V4(v) => v.octets(), _ => unreachable!() };
+        let ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
         let mut req = vec![0x05, 0x01, 0x00, 0x01];
-        req.extend_from_slice(&ip); req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        req.extend_from_slice(&ip);
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
         client.write_all(&req).await.unwrap();
-        let mut cr = [0u8; 10]; client.read_exact(&mut cr).await.unwrap();
+        let mut cr = [0u8; 10];
+        client.read_exact(&mut cr).await.unwrap();
         assert_eq!(cr[1], 0x00, "VLESS+TLS CONNECT with fallbacks configured");
         let payload = b"hello vless with fallback!";
         client.write_all(payload).await.unwrap();
         let mut got = vec![0u8; payload.len()];
         tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got))
-            .await.expect("vless echo timeout").unwrap();
+            .await
+            .expect("vless echo timeout")
+            .unwrap();
         assert_eq!(&got, payload);
 
         // B. 非 VLESS 客户端：TLS 连接发 HTTP 请求 → fallback dest 收到原始字节
         //    （用 rustls 客户端绕过证书校验）
         static PROVIDER: std::sync::Once = std::sync::Once::new();
-        PROVIDER.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+        PROVIDER.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
         let mut roots = rustls::RootCertStore::empty();
         let _ = &mut roots;
         let cfg = rustls::ClientConfig::builder()
@@ -2658,19 +3140,27 @@ mod tests {
             .with_custom_certificate_verifier(std::sync::Arc::new(NoVerify))
             .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(cfg));
-        let tls_sock = tokio::net::TcpStream::connect(format!("127.0.0.1:{vless_port}")).await.unwrap();
+        let tls_sock =
+            tokio::net::TcpStream::connect(format!("127.0.0.1:{vless_port}")).await.unwrap();
         let mut tls = connector.connect("localhost".try_into().unwrap(), tls_sock).await.unwrap();
         tls.write_all(b"GET /web HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
         let mut fb_got = vec![0u8; 64];
         let n = tokio::time::timeout(std::time::Duration::from_secs(5), tls.read(&mut fb_got))
-            .await.expect("fallback echo timeout").unwrap();
-        assert!(fb_got[..n].starts_with(b"GET /web"), "fallback dest should receive original HTTP bytes");
+            .await
+            .expect("fallback echo timeout")
+            .unwrap();
+        assert!(
+            fb_got[..n].starts_with(b"GET /web"),
+            "fallback dest should receive original HTTP bytes"
+        );
 
         // fallback echo 收到的也应是同一请求
         let fb_bytes = fb_task.await.unwrap();
         assert!(fb_bytes.starts_with(b"GET /web"), "fallback echo server got {fb_bytes:?}");
 
-        for h in sh.iter().chain(ch.iter()) { h.abort(); }
+        for h in sh.iter().chain(ch.iter()) {
+            h.abort();
+        }
     }
 
     /// 构造带 SNI 的最小 TLS ClientHello（满足 dispatcher TlsSniffer 的
@@ -2710,7 +3200,6 @@ mod tests {
         rec
     }
 
-
     /// fake 上游 SOCKS5 server：记录首个 CONNECT 目标地址（域名或 IP 字面），
     /// 回 CONNECT 成功后丢弃后续流量。返回 (监听端口, 目标记录槽)。
     async fn spawn_fake_socks_upstream() -> (u16, Arc<parking_lot::Mutex<Option<String>>>) {
@@ -2743,28 +3232,26 @@ mod tests {
                     let mut a = [0u8; 4];
                     sock.read_exact(&mut a).await.unwrap();
                     std::net::Ipv4Addr::from(a).to_string()
-                }
+                },
                 0x03 => {
                     let mut l = [0u8; 1];
                     sock.read_exact(&mut l).await.unwrap();
                     let mut d = vec![0u8; l[0] as usize];
                     sock.read_exact(&mut d).await.unwrap();
                     String::from_utf8(d).unwrap()
-                }
+                },
                 _ => String::new(),
             };
             let mut p = [0u8; 2];
             sock.read_exact(&mut p).await.unwrap();
             *t.lock() = Some(addr);
             // 回 CONNECT 成功，之后丢弃流量
-            sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                .await
-                .unwrap();
+            sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.unwrap();
             let mut buf = [0u8; 1024];
             loop {
                 match sock.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => {}
+                    Ok(_) => {},
                 }
             }
         });
@@ -2797,20 +3284,24 @@ mod tests {
         cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(), // i=0 → default
-            send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry {
                 kind: "socks".into(),
-                data: format!(
-                    r#"{{"servers":[{{"address":"127.0.0.1","port":{up_port}}}]}}"#
-                )
-                .into_bytes(),
+                data: format!(r#"{{"servers":[{{"address":"127.0.0.1","port":{up_port}}}]}}"#)
+                    .into_bytes(),
             },
             tag: "via-sni".into(),
-            send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         cfg.apps.push(BuiltEntry {
             kind: "routing".into(),
@@ -2822,9 +3313,8 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // 3. SOCKS5 CONNECT 1.2.3.4:443（任意不可达 IP；若嗅探失败会拨该 IP）
-        let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}"))
-            .await
-            .expect("connect socks");
+        let mut client =
+            TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.expect("connect socks");
         client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
         let mut resp = [0u8; 2];
         client.read_exact(&mut resp).await.unwrap();
@@ -2838,10 +3328,7 @@ mod tests {
         assert_eq!(cr[1], 0x00, "CONNECT should succeed");
 
         // 4. 发 TLS ClientHello（SNI = www.sniff-test.example）
-        client
-            .write_all(&build_client_hello_with_sni("www.sniff-test.example"))
-            .await
-            .unwrap();
+        client.write_all(&build_client_hello_with_sni("www.sniff-test.example")).await.unwrap();
 
         // 5. 等 fake 上游记录 CONNECT 目标
         for _ in 0..100 {
@@ -2870,9 +3357,9 @@ mod tests {
         // 1. fake 上游 SOCKS5 server
         let (up_port, target) = spawn_fake_socks_upstream().await;
 
-        // 2. geoip.dat（PRIVATE 条目）写入路由构建实际读取的资产目录。
-        //    get_resource_path 与 build_adapter 同源（同一缓存值）；文件已存在时
-        //    不覆盖，尊重环境真实 geoip 资产（v2fly geoip.dat 自带 private）。
+        // 2. geoip.dat（PRIVATE 条目）写入路由构建实际读取的资产目录。 get_resource_path 与
+        //    build_adapter 同源（同一缓存值）；文件已存在时 不覆盖，尊重环境真实 geoip 资产（v2fly
+        //    geoip.dat 自带 private）。
         let asset_dir = xray_common::platform::get_resource_path();
         std::fs::create_dir_all(&asset_dir).expect("create asset dir");
         let geoip_path = asset_dir.join("geoip.dat");
@@ -2888,11 +3375,8 @@ mod tests {
                 ],
                 reverse_match: false,
             };
-            std::fs::write(
-                &geoip_path,
-                GeoIpList { entry: vec![private] }.encode_to_vec(),
-            )
-            .expect("write test geoip.dat");
+            std::fs::write(&geoip_path, GeoIpList { entry: vec![private] }.encode_to_vec())
+                .expect("write test geoip.dat");
         }
 
         // 3. 配置：socks inbound + freedom default + blackhole + tagged socks + routing
@@ -2912,8 +3396,11 @@ mod tests {
         cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(), // i=0 → default
-            send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry {
@@ -2921,20 +3408,24 @@ mod tests {
                 data: br#"{"response":{"type":"http"}}"#.to_vec(),
             },
             tag: "block".into(),
-            send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry {
                 kind: "socks".into(),
-                data: format!(
-                    r#"{{"servers":[{{"address":"127.0.0.1","port":{up_port}}}]}}"#
-                )
-                .into_bytes(),
+                data: format!(r#"{{"servers":[{{"address":"127.0.0.1","port":{up_port}}}]}}"#)
+                    .into_bytes(),
             },
             tag: "via-up".into(),
-            send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         cfg.apps.push(BuiltEntry {
             kind: "routing".into(),
@@ -2942,7 +3433,8 @@ mod tests {
                 {"type":"field","ip":["geoip:private"],"outboundTag":"block"},
                 {"type":"field","ip":["10.0.0.0/8"],"outboundTag":"via-up"},
                 {"type":"field","ip":["203.0.113.0/24"],"outboundTag":"via-up"}
-            ]}"#.to_vec(),
+            ]}"#
+            .to_vec(),
         });
 
         // wiring 层直连二分：同一 JSON 经 build_router_adapter 后 IP dest 应
@@ -2960,15 +3452,13 @@ mod tests {
             "wiring 层：10.0.0.1 应命中 geoip:private → block"
         );
 
-
         let (inst, _, handles) = start_full(&cfg).await.expect("geoip routing start");
         assert!(inst.is_running());
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // 4. 对照组：公网 TEST-NET-3 目标 → 第三条 CIDR 规则 → via-up，路由栈通
-        let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}"))
-            .await
-            .expect("connect socks");
+        let mut client =
+            TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.expect("connect socks");
         client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
         let mut resp = [0u8; 2];
         client.read_exact(&mut resp).await.unwrap();
@@ -2992,8 +3482,8 @@ mod tests {
             "CIDR 规则应把 203.0.113.7 路由到上游"
         );
 
-        // 5. 私网目标 → geoip:private → block（blackhole http403）。判别器：
-        //    geoip 规则若失效，10.0.0.1 会落 10.0.0.0/8 CIDR 规则到上游。
+        // 5. 私网目标 → geoip:private → block（blackhole http403）。判别器： geoip
+        //    规则若失效，10.0.0.1 会落 10.0.0.0/8 CIDR 规则到上游。
         let mut blocked_client = TcpStream::connect(format!("127.0.0.1:{socks_port}"))
             .await
             .expect("connect socks (blocked)");
@@ -3012,11 +3502,9 @@ mod tests {
         // 收到 "HTTP/1.1 403"；放行场景（via-up 丢流量 / freedom 直连）永远无 403。
         let mut probe = [0u8; 256];
         let mut got_403 = false;
-        if let Ok(r) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            blocked_client.read(&mut probe),
-        )
-        .await
+        if let Ok(r) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), blocked_client.read(&mut probe))
+                .await
         {
             let body = String::from_utf8_lossy(&probe[..r.unwrap_or(0)]);
             got_403 = body.contains("403") || body.contains("Forbidden");
@@ -3053,7 +3541,7 @@ mod tests {
                         if sock.write_all(&buf[..n]).await.is_err() {
                             break;
                         }
-                    }
+                    },
                 }
             }
         });
@@ -3081,17 +3569,19 @@ mod tests {
         cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(),
-            send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
 
         let (inst, _, handles) = start_full(&cfg).await.expect("stats config start");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // 3. 走一轮 echo
-        let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}"))
-            .await
-            .expect("connect socks");
+        let mut client =
+            TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.expect("connect socks");
         client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
         let mut resp = [0u8; 2];
         client.read_exact(&mut resp).await.unwrap();
@@ -3125,14 +3615,10 @@ mod tests {
             "outbound>>>direct>>>traffic>>>uplink",
             "outbound>>>direct>>>traffic>>>downlink",
         ] {
-            let c = stats.get_counter(name).unwrap_or_else(|| {
-                panic!("counter {name} should be lazily registered")
-            });
-            assert!(
-                c.value() > 0,
-                "counter {name} should be positive, got {}",
-                c.value()
-            );
+            let c = stats
+                .get_counter(name)
+                .unwrap_or_else(|| panic!("counter {name} should be lazily registered"));
+            assert!(c.value() > 0, "counter {name} should be positive, got {}", c.value());
         }
         for h in handles.iter() {
             h.abort();
@@ -3159,13 +3645,9 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // 2. 经 AppStatsFeature 注册并累计一个 counter。
-        let stats = inst
-            .get_feature::<crate::register::AppStatsFeature>()
-            .expect("stats feature injected");
-        stats
-            .register_counter("inbound>>>m-in>>>traffic>>>uplink")
-            .expect("register")
-            .add(777);
+        let stats =
+            inst.get_feature::<crate::register::AppStatsFeature>().expect("stats feature injected");
+        stats.register_counter("inbound>>>m-in>>>traffic>>>uplink").expect("register").add(777);
 
         // 3. GET /metrics 必须看到 777（EmptyStats 只输出 HELP/TYPE 头）。
         let mut resp = TcpStream::connect(format!("127.0.0.1:{metrics_port}"))
@@ -3180,11 +3662,9 @@ mod tests {
             .expect("read metrics body within timeout")
             .unwrap();
         let text = String::from_utf8_lossy(&body);
-        let hit = text.contains("xray_traffic_bytes{type=\"inbound\",tag=\"m-in\",direction=\"uplink\"} 777");
-        assert!(
-            hit,
-            "/metrics must expose real stats counter, got: {text}"
-        );
+        let hit = text
+            .contains("xray_traffic_bytes{type=\"inbound\",tag=\"m-in\",direction=\"uplink\"} 777");
+        assert!(hit, "/metrics must expose real stats counter, got: {text}");
         // 关停 metrics HTTP server（accept task 随 close 退出，否则测试进程
         // 退出阶段被挂起任务拖住）。
         if let Some(mf) = inst.get_feature::<xray_app_metrics::MetricsFeature>() {
@@ -3194,7 +3674,6 @@ mod tests {
             h.abort();
         }
     }
-
 
     /// 测试用：跳过证书校验的 verifier。
     #[derive(Debug)]
@@ -3210,24 +3689,39 @@ mod tests {
         ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
             Ok(rustls::client::danger::ServerCertVerified::assertion())
         }
+
         fn verify_tls12_signature(
             &self,
             message: &[u8],
             cert: &rustls::pki_types::CertificateDer<'_>,
             dss: &rustls::DigitallySignedStruct,
         ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            rustls::crypto::verify_tls12_signature(message, cert, dss, &rustls::crypto::ring::default_provider().signature_verification_algorithms)
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            )
         }
+
         fn verify_tls13_signature(
             &self,
             message: &[u8],
             cert: &rustls::pki_types::CertificateDer<'_>,
             dss: &rustls::DigitallySignedStruct,
         ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            rustls::crypto::verify_tls13_signature(message, cert, dss, &rustls::crypto::ring::default_provider().signature_verification_algorithms)
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            )
         }
+
         fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
         }
     }
 
@@ -3259,7 +3753,7 @@ mod tests {
                 match echo.recv_from(&mut buf).await {
                     Ok((n, peer)) => {
                         let _ = echo.send_to(&buf[..n], peer).await;
-                    }
+                    },
                     Err(_) => break,
                 }
             }
@@ -3286,8 +3780,11 @@ mod tests {
         cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(),
-            send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
 
         let (_, _, handles) = start_full(&cfg).await.expect("socks+freedom start");
@@ -3305,20 +3802,15 @@ mod tests {
 
         // UDP ASSOCIATE request: DST.ADDR/PORT = 0.0.0.0:0（客户端不在乎绑哪，
         // 仅靠 TCP control connection 关联；reply 的 BND.ADDR/PORT 才是真 relay）
-        tcp.write_all(&[
-            0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0,
-        ])
-        .await
-        .unwrap();
+        tcp.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.unwrap();
         let mut assoc_reply = [0u8; 10];
         tcp.read_exact(&mut assoc_reply).await.unwrap();
         assert_eq!(assoc_reply[0], 0x05, "UDP ASSOC reply VER");
         assert_eq!(assoc_reply[1], 0x00, "UDP ASSOC reply REP=success");
         assert_eq!(assoc_reply[2], 0x00, "RSV");
         assert_eq!(assoc_reply[3], 0x01, "ATYP=IPv4");
-        let relay_ip = std::net::Ipv4Addr::new(
-            assoc_reply[4], assoc_reply[5], assoc_reply[6], assoc_reply[7],
-        );
+        let relay_ip =
+            std::net::Ipv4Addr::new(assoc_reply[4], assoc_reply[5], assoc_reply[6], assoc_reply[7]);
         let relay_port = u16::from_be_bytes([assoc_reply[8], assoc_reply[9]]);
         assert_eq!(relay_ip, std::net::Ipv4Addr::new(127, 0, 0, 1));
         assert!(relay_port > 0, "relay port should be assigned, got {relay_port}");
@@ -3339,10 +3831,7 @@ mod tests {
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
             relay_port,
         );
-        client_udp
-            .send_to(&pkt, relay)
-            .await
-            .expect("send udp packet to relay");
+        client_udp.send_to(&pkt, relay).await.expect("send udp packet to relay");
 
         // 6. 等回包（自由客户端地址）
         let mut resp_buf = vec![0u8; 65535];
@@ -3385,7 +3874,7 @@ mod tests {
                 match echo.recv_from(&mut buf).await {
                     Ok((n, peer)) => {
                         let _ = echo.send_to(&buf[..n], peer).await;
-                    }
+                    },
                     Err(_) => break,
                 }
             }
@@ -3396,7 +3885,8 @@ mod tests {
         let socks_port = probe.local_addr().unwrap().port();
         drop(probe);
 
-        // 3. BuiltConfig: socks inbound (UDP enabled) + 2 outbounds (default=blackhole, out=freedom)
+        // 3. BuiltConfig: socks inbound (UDP enabled) + 2 outbounds (default=blackhole,
+        //    out=freedom)
         //    + routing app: inboundTag=socks-in → out (覆盖 default blackhole)
         let mut cfg = BuiltConfig::default();
         cfg.inbounds.push(BuiltInbound {
@@ -3413,14 +3903,20 @@ mod tests {
         cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "blackhole".into(), data: b"{}".to_vec() },
             tag: "default".into(),
-            send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "out".into(),
-            send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         cfg.apps.push(BuiltEntry {
             kind: "routing".into(),
@@ -3438,9 +3934,7 @@ mod tests {
         let mut method_resp = [0u8; 2];
         tcp.read_exact(&mut method_resp).await.unwrap();
         assert_eq!(method_resp, [0x05, 0x00]);
-        tcp.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-            .await
-            .unwrap();
+        tcp.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.unwrap();
         let mut assoc_reply = [0u8; 10];
         tcp.read_exact(&mut assoc_reply).await.unwrap();
         assert_eq!(assoc_reply[1], 0x00, "UDP ASSOC REP=success");
@@ -3464,8 +3958,8 @@ mod tests {
         );
         client_udp.send_to(&pkt, relay).await.expect("send routed udp");
 
-        // 6. 期望回包（route 命中 out=freedom → echo → 回包）；若 router 错配 default=blackhole
-        //    则 5s 内收不到任何回包 → timeout 失败
+        // 6. 期望回包（route 命中 out=freedom → echo → 回包）；若 router 错配 default=blackhole 则
+        //    5s 内收不到任何回包 → timeout 失败
         let mut resp_buf = vec![0u8; 65535];
         let (n, _peer) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -3495,12 +3989,15 @@ mod tests {
     /// 后 `send_to` 客户端，全程 payload 字节一致。
     #[tokio::test]
     async fn integration_ss_udp_relay_to_echo() {
-        use xray_common::net::address::Address;
-        use xray_proxy_ss::config::{CipherType, MemoryAccount};
-        use xray_proxy_ss::protocol::{decode_udp_packet, encode_udp_packet};
-        use xray_proxy_ss::validator::{MemoryUser, Validator};
-        use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
         use std::net::Ipv4Addr;
+
+        use xray_common::net::address::Address;
+        use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
+        use xray_proxy_ss::{
+            config::{CipherType, MemoryAccount},
+            protocol::{decode_udp_packet, encode_udp_packet},
+            validator::{MemoryUser, Validator},
+        };
 
         // 1. UDP echo server
         let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -3509,7 +4006,9 @@ mod tests {
             let mut buf = vec![0u8; 65535];
             loop {
                 match echo.recv_from(&mut buf).await {
-                    Ok((n, peer)) => { let _ = echo.send_to(&buf[..n], peer).await; }
+                    Ok((n, peer)) => {
+                        let _ = echo.send_to(&buf[..n], peer).await;
+                    },
                     Err(_) => break,
                 }
             }
@@ -3536,8 +4035,11 @@ mod tests {
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(),
-            send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("ss+freedom start");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -3549,7 +4051,8 @@ mod tests {
             password: "test-pass".to_string(),
             cipher_type: CipherType::Aes256Gcm.as_i32(),
             iv_check: false,
-        }).expect("from_proto");
+        })
+        .expect("from_proto");
         let encoded = encode_udp_packet(
             &account,
             &Address::ipv4(match echo_addr.ip() {
@@ -3558,22 +4061,18 @@ mod tests {
             }),
             echo_addr.port(),
             payload,
-        ).expect("encode udp packet");
-        let relay = std::net::SocketAddr::new(
-            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
-            ss_port,
-        );
+        )
+        .expect("encode udp packet");
+        let relay = std::net::SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), ss_port);
         client.send_to(&encoded, relay).await.expect("send to ss udp");
 
         // 5. 等回包（SS server 用同一 account 重新 encode → 客户端 decode 验证）
         let mut resp = vec![0u8; 65535];
-        let (n, _peer) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            client.recv_from(&mut resp),
-        )
-        .await
-        .expect("timeout waiting for ss udp echo")
-        .expect("recv ss udp echo");
+        let (n, _peer) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), client.recv_from(&mut resp))
+                .await
+                .expect("timeout waiting for ss udp echo")
+                .expect("recv ss udp echo");
 
         let validator = Validator::new();
         validator.add(MemoryUser::new("u@ss.local", account.clone())).expect("add user");
@@ -3587,7 +4086,9 @@ mod tests {
         assert_eq!(body, payload, "echo payload roundtrip");
 
         drop(client);
-        for h in sh.iter() { h.abort(); }
+        for h in sh.iter() {
+            h.abort();
+        }
         echo_task.abort();
     }
 
@@ -3615,8 +4116,8 @@ mod tests {
             }
         });
 
-        // 2. carrier 计数 forwarder：client mux worker → server socks 的每条
-        //    TCP 连接在此过路计数（复用断言的观测点）
+        // 2. carrier 计数 forwarder：client mux worker → server socks 的每条 TCP
+        //    连接在此过路计数（复用断言的观测点）
         let fwd_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let fwd_port = fwd_listener.local_addr().unwrap().port();
         let carrier_count = Arc::new(AtomicUsize::new(0));
@@ -3628,7 +4129,9 @@ mod tests {
             loop {
                 let Ok((mut down, _)) = fwd_listener.accept().await else { break };
                 count.fetch_add(1, Ordering::SeqCst);
-                let Ok(mut up) = TcpStream::connect(("127.0.0.1", server_port)).await else { break };
+                let Ok(mut up) = TcpStream::connect(("127.0.0.1", server_port)).await else {
+                    break;
+                };
                 let _ = tokio::io::copy_bidirectional(&mut down, &mut up).await;
             }
         });
@@ -3646,8 +4149,11 @@ mod tests {
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(),
-            send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("socks server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -3672,7 +4178,8 @@ mod tests {
                     .into_bytes(),
             },
             tag: "proxy".into(),
-            send_through: None, stream_settings_json: None,
+            send_through: None,
+            stream_settings_json: None,
             proxy_settings_json: None,
             mux_json: Some(serde_json::json!({"enabled": true, "concurrency": 8})),
             target_strategy: None,
@@ -3680,8 +4187,8 @@ mod tests {
         let (_ci, _co, ch) = start_full(&client_cfg).await.expect("socks+mux client");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // 5. 3 个并发客户端连接 → mux 出站（首个 dispatch bootstrap worker，
-        //    pick_internal 持锁跨 create，后续全部复用同一 worker/carrier）
+        // 5. 3 个并发客户端连接 → mux 出站（首个 dispatch bootstrap worker， pick_internal 持锁跨
+        //    create，后续全部复用同一 worker/carrier）
         let echo_ip = match echo_addr.ip() {
             std::net::IpAddr::V4(v) => v.octets(),
             _ => unreachable!(),
@@ -3749,8 +4256,8 @@ mod tests {
             }
         });
 
-        // 2. carrier 计数 forwarder：client mux worker → server vless 的每条
-        //    TCP 连接在此过路计数（复用断言的观测点）
+        // 2. carrier 计数 forwarder：client mux worker → server vless 的每条 TCP
+        //    连接在此过路计数（复用断言的观测点）
         let fwd_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let fwd_port = fwd_listener.local_addr().unwrap().port();
         let carrier_count = Arc::new(AtomicUsize::new(0));
@@ -3762,7 +4269,9 @@ mod tests {
             loop {
                 let Ok((mut down, _)) = fwd_listener.accept().await else { break };
                 count.fetch_add(1, Ordering::SeqCst);
-                let Ok(mut up) = TcpStream::connect(("127.0.0.1", server_port)).await else { break };
+                let Ok(mut up) = TcpStream::connect(("127.0.0.1", server_port)).await else {
+                    break;
+                };
                 let _ = tokio::io::copy_bidirectional(&mut down, &mut up).await;
             }
         });
@@ -3778,8 +4287,11 @@ mod tests {
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(),
-            send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("vless server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -3811,8 +4323,8 @@ mod tests {
         let (_ci, _co, ch) = start_full(&client_cfg).await.expect("socks+vless+mux client");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // 5. 3 个并发客户端连接 → mux 出站（首个 dispatch bootstrap worker，
-        //    后续全部复用同一 worker/carrier）
+        // 5. 3 个并发客户端连接 → mux 出站（首个 dispatch bootstrap worker， 后续全部复用同一
+        //    worker/carrier）
         let echo_ip = match echo_addr.ip() {
             std::net::IpAddr::V4(v) => v.octets(),
             _ => unreachable!(),
@@ -3873,7 +4385,9 @@ mod tests {
             let mut buf = vec![0u8; 65535];
             loop {
                 match echo.recv_from(&mut buf).await {
-                    Ok((n, peer)) => { let _ = echo.send_to(&buf[..n], peer).await; }
+                    Ok((n, peer)) => {
+                        let _ = echo.send_to(&buf[..n], peer).await;
+                    },
                     Err(_) => break,
                 }
             }
@@ -3900,8 +4414,11 @@ mod tests {
         server_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "direct".into(),
-            send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         let (_si, _so, sh) = start_full(&server_cfg).await.expect("socks server");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -3909,7 +4426,10 @@ mod tests {
         // 4. 客户端：socks inbound（udp:true）+ socks outbound（出站级 mux.enabled）
         let mut client_cfg = BuiltConfig::default();
         client_cfg.inbounds.push(BuiltInbound {
-            entry: BuiltEntry { kind: "socks".into(), data: br#"{"auth":"noauth","udp":true}"#.to_vec() },
+            entry: BuiltEntry {
+                kind: "socks".into(),
+                data: br#"{"auth":"noauth","udp":true}"#.to_vec(),
+            },
             tag: "socks-in".into(),
             port: Some(client_port),
             listen: Some("127.0.0.1".into()),
@@ -3919,12 +4439,12 @@ mod tests {
         client_cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry {
                 kind: "socks".into(),
-                data: format!(
-                    r#"{{"servers":[{{"address":"127.0.0.1","port":{server_port}}}]}}"#
-                ).into_bytes(),
+                data: format!(r#"{{"servers":[{{"address":"127.0.0.1","port":{server_port}}}]}}"#)
+                    .into_bytes(),
             },
             tag: "proxy".into(),
-            send_through: None, stream_settings_json: None,
+            send_through: None,
+            stream_settings_json: None,
             proxy_settings_json: None,
             mux_json: Some(serde_json::json!({"enabled": true, "concurrency": 8})),
             target_strategy: None,
@@ -3933,9 +4453,8 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // 5. socks5 TCP control → NoAuth → UDP ASSOCIATE
-        let mut tcp = TcpStream::connect(("127.0.0.1", client_port))
-            .await
-            .expect("connect socks control");
+        let mut tcp =
+            TcpStream::connect(("127.0.0.1", client_port)).await.expect("connect socks control");
         tcp.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
         let mut m = [0u8; 2];
         tcp.read_exact(&mut m).await.unwrap();
@@ -3958,10 +4477,7 @@ mod tests {
         pkt.extend_from_slice(&ip);
         pkt.extend_from_slice(&echo_addr.port().to_be_bytes());
         pkt.extend_from_slice(payload);
-        client_udp
-            .send_to(&pkt, ("127.0.0.1", relay_port))
-            .await
-            .expect("send udp via socks");
+        client_udp.send_to(&pkt, ("127.0.0.1", relay_port)).await.expect("send udp via socks");
 
         let mut resp = vec![0u8; 65535];
         let (n, _) = tokio::time::timeout(
@@ -4003,7 +4519,7 @@ mod tests {
                         if sock.write_all(&buf[..n]).await.is_err() {
                             break;
                         }
-                    }
+                    },
                 }
             }
         });
@@ -4020,7 +4536,10 @@ mod tests {
         let mut cfg = BuiltConfig::default();
         for (tag, port) in [("in-echo", first_port), ("in-main", main_port)] {
             cfg.inbounds.push(BuiltInbound {
-                entry: BuiltEntry { kind: "dokodemo".into(), data: dokodemo_dest.clone().into_bytes() },
+                entry: BuiltEntry {
+                    kind: "dokodemo".into(),
+                    data: dokodemo_dest.clone().into_bytes(),
+                },
                 tag: tag.into(),
                 port: Some(port),
                 listen: Some("127.0.0.1".into()),
@@ -4034,8 +4553,11 @@ mod tests {
         cfg.outbounds.push(BuiltOutbound {
             entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
             tag: "default".into(),
-            send_through: None, stream_settings_json: None,
-            proxy_settings_json: None, mux_json: None, target_strategy: None,
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
         });
         // loopback outbound：回注 in-main；sniffing routeOnly（Go loopback.go:56-62 透传）。
         cfg.outbounds.push(BuiltOutbound {
@@ -4061,7 +4583,9 @@ mod tests {
         let payload = b"loopback reinject!";
         client.write_all(payload).await.unwrap();
         let mut got = vec![0u8; payload.len()];
-        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got)).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got))
+            .await
+        {
             Ok(Ok(_)) => assert_eq!(got, payload, "loopback must reinject to in-main inbound"),
             Ok(Err(e)) => panic!("loopback reinject read error: {e}"),
             Err(_) => panic!("timeout: loopback reinject dropped (production sink not wired?)"),

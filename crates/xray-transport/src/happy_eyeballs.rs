@@ -5,30 +5,33 @@
 //!
 //! ## Go 语义（接入条件见 `system_dialer::dial_system`）
 //!
-//! - `sort_ips`：v4/v6 按 `interleave`（同族连续 N 个再切换）交错排序，
-//!   优先族先行（Go `sortIPs`，happy_eyeballs.go:101-157）
-//! - 第一个地址立即启动，后续每 `try_delay_ms` 启动一个，最多
-//!   `max_concurrent_try` 个并发；某次尝试失败后立即补充下一个
-//!   （Go happy_eyeballs.go:71-73 `timer.Reset(0)`）
+//! - `sort_ips`：v4/v6 按 `interleave`（同族连续 N 个再切换）交错排序， 优先族先行（Go
+//!   `sortIPs`，happy_eyeballs.go:101-157）
+//! - 第一个地址立即启动，后续每 `try_delay_ms` 启动一个，最多 `max_concurrent_try`
+//!   个并发；某次尝试失败后立即补充下一个 （Go happy_eyeballs.go:71-73 `timer.Reset(0)`）
 //! - 首个成功的连接胜出；后到的成功连接直接关闭
-//! - 每次尝试走完整 [`SystemDialer::dial`]（保留 sockopt / src 绑定，
-//!   Go `tcpTryDial` happy_eyeballs.go:159-176）
+//! - 每次尝试走完整 [`SystemDialer::dial`]（保留 sockopt / src 绑定， Go `tcpTryDial`
+//!   happy_eyeballs.go:159-176）
 
-use std::io;
-use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::task::JoinSet;
-use tokio::time::{Instant, Sleep};
+use std::{
+    io,
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::port::Port;
+use tokio::{
+    task::JoinSet,
+    time::{Instant, Sleep},
+};
+use xray_common::net::{address::Address, destination::Destination, port::Port};
 
-use crate::connection::Connection;
-use crate::sockopt::{HappyEyeballsConfig, SocketOptions};
-use crate::system_dialer::SystemDialer;
+use crate::{
+    connection::Connection,
+    sockopt::{HappyEyeballsConfig, SocketOptions},
+    system_dialer::SystemDialer,
+};
 
 /// Happy Eyeballs 竞争拨号（Go `TcpRaceDial`）。
 ///
@@ -64,11 +67,10 @@ pub async fn tcp_race_dial(
 
 /// 按地址交错列表竞争拨号：先成功的 wins。
 ///
-/// - 第 0 个立即启动；之后每 `try_delay` 启动一个，直到耗尽或达到
-///   `max_concurrent` 个在飞
+/// - 第 0 个立即启动；之后每 `try_delay` 启动一个，直到耗尽或达到 `max_concurrent` 个在飞
 /// - 失败立即补充下一个（对齐 Go `timer.Reset(0)`）
-/// - winner 出现即 abort 全部在飞尝试（对齐 Go happy_eyeballs.go:56 `cancel()`），
-///   后到的成功连接随 task abort 直接关闭
+/// - winner 出现即 abort 全部在飞尝试（对齐 Go happy_eyeballs.go:56 `cancel()`）， 后到的成功连接随
+///   task abort 直接关闭
 ///
 /// `make_attempt(idx)` 返回第 `idx` 个地址的拨号 future（被 spawn，需 `'static`）。
 async fn race_dial<T, F, Fut>(
@@ -220,8 +222,9 @@ pub(crate) fn sort_ips(ips: &[IpAddr], prioritize_ipv6: bool, interleave: u32) -
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Instant as StdInstant;
+
+    use super::*;
 
     fn v4(n: u8) -> IpAddr {
         IpAddr::from([192, 0, 2, n])
@@ -273,11 +276,8 @@ mod tests {
     async fn race_slow_v6_fast_v4_picks_v4() {
         let addrs = [addr(v6(1), 80), addr(v4(1), 80)];
         let start = StdInstant::now();
-        let winner: io::Result<String> = race_dial(
-            &addrs,
-            Duration::from_millis(50),
-            2,
-            |idx: usize| async move {
+        let winner: io::Result<String> =
+            race_dial(&addrs, Duration::from_millis(50), 2, |idx: usize| async move {
                 if idx == 0 {
                     tokio::time::sleep(Duration::from_millis(300)).await;
                     Err(io::Error::new(io::ErrorKind::TimedOut, "v6 too slow"))
@@ -285,9 +285,8 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                     Ok("v4".to_string())
                 }
-            },
-        )
-        .await;
+            })
+            .await;
         assert_eq!(winner.expect("v4 should win"), "v4");
         assert!(start.elapsed() < Duration::from_millis(250), "should not wait for slow v6");
     }
@@ -296,11 +295,8 @@ mod tests {
     #[tokio::test]
     async fn race_fast_v6_beats_slow_v4() {
         let addrs = [addr(v6(1), 80), addr(v4(1), 80)];
-        let winner: io::Result<String> = race_dial(
-            &addrs,
-            Duration::from_millis(50),
-            2,
-            |idx: usize| async move {
+        let winner: io::Result<String> =
+            race_dial(&addrs, Duration::from_millis(50), 2, |idx: usize| async move {
                 if idx == 0 {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                     Ok("v6".to_string())
@@ -308,9 +304,8 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(300)).await;
                     Ok("v4".to_string())
                 }
-            },
-        )
-        .await;
+            })
+            .await;
         assert_eq!(winner.expect("v6 should win"), "v6");
     }
 
@@ -318,15 +313,11 @@ mod tests {
     #[tokio::test]
     async fn race_all_fail_returns_error() {
         let addrs = [addr(v6(1), 80), addr(v4(1), 80)];
-        let result: io::Result<String> = race_dial(
-            &addrs,
-            Duration::from_millis(10),
-            2,
-            |idx: usize| async move {
+        let result: io::Result<String> =
+            race_dial(&addrs, Duration::from_millis(10), 2, |idx: usize| async move {
                 Err(io::Error::new(io::ErrorKind::ConnectionRefused, format!("fail {idx}")))
-            },
-        )
-        .await;
+            })
+            .await;
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionRefused);
     }
 
@@ -358,8 +349,10 @@ mod tests {
     /// 证明竞争拨号经 SystemDialer 走通真实 TCP 且失败补充有效。
     #[tokio::test]
     async fn tcp_race_dial_connects_v4_when_v6_refused() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
 
         // v4 listener；v6 同端口无 listener → ::1 connect 立即 refused。
         // prioritize_ipv6=true 让 v6 先试（必 refused）→ 动态补充 v4（必成功），
@@ -390,16 +383,10 @@ mod tests {
             IpAddr::from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]), // ::1
             IpAddr::from([127, 0, 0, 1]),
         ];
-        let mut conn = tcp_race_dial(
-            dialer,
-            None,
-            &ips,
-            Port::new(port),
-            &SocketOptions::default(),
-            &cfg,
-        )
-        .await
-        .expect("race dial should fall back to v4 after v6 refused");
+        let mut conn =
+            tcp_race_dial(dialer, None, &ips, Port::new(port), &SocketOptions::default(), &cfg)
+                .await
+                .expect("race dial should fall back to v4 after v6 refused");
         conn.write_all(b"hey").await.unwrap();
         let mut buf = [0u8; 3];
         conn.read_exact(&mut buf).await.unwrap();

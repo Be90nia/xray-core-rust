@@ -5,8 +5,8 @@
 //! ## 当前实现范围
 //!
 //! 业务核心（独立可测）：
-//! - [`OutboundHandlerEntry`] — Go `Handler struct`：配置载体（tag / sender / proxy_type_url /
-//!   mux 启用 / xudp 启用 / UDP 443 策略 / 流量计数器）
+//! - [`OutboundHandlerEntry`] — Go `Handler struct`：配置载体（tag / sender / proxy_type_url / mux
+//!   启用 / xudp 启用 / UDP 443 策略 / 流量计数器）
 //! - [`parse_random_ip`] — Go `ParseRandomIP`：CIDR 子网内随机 IP（纯函数）
 //! - [`get_uo_t_connection`] — Go `getUoTConnection`：UoT (UDP over TCP) 连接
 //!
@@ -14,26 +14,30 @@
 //! - `dispatch` — 依赖 `transport.Link` + 代理 + mux + xudp + DNS LookupForIP
 //! - `dial` — 依赖 transport Dialer + TLS Client + UoT
 
-use crate::error::ProxymanError;
-use crate::inbound::PinFuture;
+use std::{io, net::IpAddr, sync::Arc};
 
-use crate::outbound::proxy_outbound::{OutboundDialer, ProxyOutbound};
-use crate::outbound::OutboundHandler;
-use crate::stats::{Counter, StatsProvider, outbound_downlink_name, outbound_uplink_name};
 use async_trait::async_trait;
 use ipnet::IpNet;
 use rand::Rng;
-use std::io;
-use std::net::IpAddr;
-use std::sync::Arc;
 use tokio::net::UdpSocket;
-use xray_common::net::destination::Destination;
-use xray_common::session::Session;
+use xray_common::{net::destination::Destination, session::Session};
 use xray_proto::xray::app::proxyman::{MultiplexingConfig, SenderConfig};
-use xray_transport::connection::Connection;
-use xray_transport::dialer::{StreamSettings, dial};
-use xray_transport::link::Link;
-use xray_transport::sockopt::SocketOptions;
+use xray_transport::{
+    connection::Connection,
+    dialer::{StreamSettings, dial},
+    link::Link,
+    sockopt::SocketOptions,
+};
+
+use crate::{
+    error::ProxymanError,
+    inbound::PinFuture,
+    outbound::{
+        OutboundHandler,
+        proxy_outbound::{OutboundDialer, ProxyOutbound},
+    },
+    stats::{Counter, StatsProvider, outbound_downlink_name, outbound_uplink_name},
+};
 
 // ── UoT 常量 ──────────────────────────────────────────────────
 
@@ -109,19 +113,13 @@ impl MuxState {
             return None;
         }
         let concurrency = if cfg.concurrency < 0 {
-            return Some(Self {
-                enabled: false,
-                concurrency: 0,
-            });
+            return Some(Self { enabled: false, concurrency: 0 });
         } else if cfg.concurrency == 0 {
             8
         } else {
             u32::try_from(cfg.concurrency).unwrap_or(8)
         };
-        Some(Self {
-            enabled: true,
-            concurrency,
-        })
+        Some(Self { enabled: true, concurrency })
     }
 }
 
@@ -182,14 +180,15 @@ impl OutboundHandlerEntry {
         stats: Option<&dyn StatsProvider>,
     ) -> Self {
         let tag_str: String = tag.into();
-        let (mux, xudp, udp443) = match sender_config.as_ref().and_then(|s| s.multiplex_settings.as_ref()) {
-            Some(m) => (
-                MuxState::from_proto(Some(m)).unwrap_or_default(),
-                Self::xudp_state_from_proto(m),
-                Udp443Policy::from_proto_str(&m.xudp_proxy_udp443),
-            ),
-            None => (MuxState::default(), None, Udp443Policy::default()),
-        };
+        let (mux, xudp, udp443) =
+            match sender_config.as_ref().and_then(|s| s.multiplex_settings.as_ref()) {
+                Some(m) => (
+                    MuxState::from_proto(Some(m)).unwrap_or_default(),
+                    Self::xudp_state_from_proto(m),
+                    Udp443Policy::from_proto_str(&m.xudp_proxy_udp443),
+                ),
+                None => (MuxState::default(), None, Udp443Policy::default()),
+            };
         let (up, down) = match stats {
             Some(p) if !tag_str.is_empty() => (
                 p.get_counter(&outbound_uplink_name(&tag_str)),
@@ -214,13 +213,11 @@ impl OutboundHandlerEntry {
         }
     }
 
-    /// xudp 状态（Go 语义：xudp_concurrency < 0 disabled，== 0 不创建 xudp ClientManager，> 0 启用）
+    /// xudp 状态（Go 语义：xudp_concurrency < 0 disabled，== 0 不创建 xudp ClientManager，> 0
+    /// 启用）
     fn xudp_state_from_proto(m: &MultiplexingConfig) -> Option<MuxState> {
         if m.xudp_concurrency < 0 {
-            return Some(MuxState {
-                enabled: false,
-                concurrency: 0,
-            });
+            return Some(MuxState { enabled: false, concurrency: 0 });
         }
         if m.xudp_concurrency == 0 {
             // Go: h.xudp = nil
@@ -348,11 +345,7 @@ impl OutboundHandler for OutboundHandlerEntry {
     }
 
     fn sender_type_url(&self) -> Option<&str> {
-        if self.sender_config.is_some() {
-            Some("xray.app.proxyman.SenderConfig")
-        } else {
-            None
-        }
+        if self.sender_config.is_some() { Some("xray.app.proxyman.SenderConfig") } else { None }
     }
 
     fn proxy_type_url(&self) -> &str {
@@ -396,11 +389,12 @@ impl OutboundHandler for OutboundHandlerEntry {
                     }
                     result?;
                     Ok(())
-                }
+                },
                 None => Err(ProxymanError::Other("no proxy configured".to_string())),
             }
         })
     }
+
     fn dial(&self, dest: &Destination) -> PinFuture<io::Result<Box<dyn Connection>>> {
         let settings = self.stream_settings.clone();
         let sockopt = self.socket_options.clone();
@@ -423,20 +417,25 @@ impl OutboundHandler for OutboundHandlerEntry {
 
                         // spawn 双向桥接：proxy_stream ↔ chained_conn
                         tokio::spawn(async move {
-                            let _ = tokio::io::copy_bidirectional(&mut proxy_stream, &mut chained_conn).await;
+                            let _ =
+                                tokio::io::copy_bidirectional(&mut proxy_stream, &mut chained_conn)
+                                    .await;
                         });
 
-                        let conn: Box<dyn xray_transport::connection::Connection> =
-                            Box::new(xray_transport::connection::DuplexConnection::new(client_stream));
+                        let conn: Box<dyn xray_transport::connection::Connection> = Box::new(
+                            xray_transport::connection::DuplexConnection::new(client_stream),
+                        );
                         return Ok(conn);
-                    }
+                    },
                     _ => {
                         // proxy chain tag configured but manager/handler missing
                         return Err(io::Error::new(
                             io::ErrorKind::NotConnected,
-                            format!("chained proxy to tag '{tag}' has no outbound manager or handler"),
+                            format!(
+                                "chained proxy to tag '{tag}' has no outbound manager or handler"
+                            ),
                         ));
-                    }
+                    },
                 }
             }
 
@@ -551,15 +550,17 @@ fn submit_outbound_error_to_originator(session: &Session, error: &ProxymanError)
 }
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
     use super::*;
     use crate::stats::NoopStatsProvider;
-    use std::sync::atomic::{AtomicI64, Ordering};
 
     struct TestCounter(AtomicI64);
     impl Counter for TestCounter {
         fn value(&self) -> i64 {
             self.0.load(Ordering::SeqCst)
         }
+
         fn add(&self, d: i64) -> i64 {
             self.0.fetch_add(d, Ordering::SeqCst) + d
         }
@@ -572,22 +573,10 @@ mod tests {
 
     #[test]
     fn udp443_from_proto_str_all_variants() {
-        assert!(matches!(
-            Udp443Policy::from_proto_str("reject"),
-            Udp443Policy::Reject
-        ));
-        assert!(matches!(
-            Udp443Policy::from_proto_str("allow"),
-            Udp443Policy::Allow
-        ));
-        assert!(matches!(
-            Udp443Policy::from_proto_str("skip"),
-            Udp443Policy::Skip
-        ));
-        assert!(matches!(
-            Udp443Policy::from_proto_str("garbage"),
-            Udp443Policy::Reject
-        ));
+        assert!(matches!(Udp443Policy::from_proto_str("reject"), Udp443Policy::Reject));
+        assert!(matches!(Udp443Policy::from_proto_str("allow"), Udp443Policy::Allow));
+        assert!(matches!(Udp443Policy::from_proto_str("skip"), Udp443Policy::Skip));
+        assert!(matches!(Udp443Policy::from_proto_str("garbage"), Udp443Policy::Reject));
         assert!(matches!(Udp443Policy::from_proto_str(""), Udp443Policy::Reject));
     }
 
@@ -780,12 +769,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_no_proxy_returns_other_error() {
-        let entry = OutboundHandlerEntry::new(
-            "test".to_string(),
-            None,
-            "vless".to_string(),
-            None,
-        );
+        let entry = OutboundHandlerEntry::new("test".to_string(), None, "vless".to_string(), None);
         let session = Session::default();
         let (r, w) = xray_buf::pipe::new();
         let link = Link::new(Box::new(r), Box::new(w));
@@ -797,12 +781,7 @@ mod tests {
 
     #[tokio::test]
     async fn dial_no_chain_dials_directly_unreachable() {
-        let entry = OutboundHandlerEntry::new(
-            "test".to_string(),
-            None,
-            "vless".to_string(),
-            None,
-        );
+        let entry = OutboundHandlerEntry::new("test".to_string(), None, "vless".to_string(), None);
         let dest = Destination::tcp(
             xray_common::net::address::Address::Domain("unreachable.invalid".to_string()),
             1u16.into(),
@@ -813,12 +792,8 @@ mod tests {
 
     #[tokio::test]
     async fn dial_with_proxy_chain_tag_returns_unsupported() {
-        let mut entry = OutboundHandlerEntry::new(
-            "test".to_string(),
-            None,
-            "vless".to_string(),
-            None,
-        );
+        let mut entry =
+            OutboundHandlerEntry::new("test".to_string(), None, "vless".to_string(), None);
         entry.set_proxy_chain_tag(Some("upstream".to_string()));
         let dest = Destination::tcp(
             xray_common::net::address::Address::Domain("example.com".to_string()),
@@ -830,19 +805,14 @@ mod tests {
             Err(e) => {
                 // ponytail: Unsupported kind is unstable; check message instead
                 assert!(e.to_string().contains("chained proxy"), "unexpected error: {e}");
-            }
+            },
             Ok(_) => panic!("expected error"),
         }
     }
 
     #[test]
     fn entry_new_fields_default_values() {
-        let entry = OutboundHandlerEntry::new(
-            "test".to_string(),
-            None,
-            "vless".to_string(),
-            None,
-        );
+        let entry = OutboundHandlerEntry::new("test".to_string(), None, "vless".to_string(), None);
         assert!(entry.proxy.is_none());
         assert_eq!(entry.stream_settings.protocol, "tcp");
         assert!(entry.proxy_chain_tag.is_none());
@@ -851,12 +821,8 @@ mod tests {
 
     #[test]
     fn entry_set_proxy_and_stream_settings() {
-        let mut entry = OutboundHandlerEntry::new(
-            "test".to_string(),
-            None,
-            "vless".to_string(),
-            None,
-        );
+        let mut entry =
+            OutboundHandlerEntry::new("test".to_string(), None, "vless".to_string(), None);
         assert!(entry.proxy.is_none());
         entry.set_stream_settings(StreamSettings {
             protocol: "ws".to_string(),

@@ -15,33 +15,37 @@
 //! 对应 Go `tcp.NewForwarder(r.CreateEndpoint() → handler.HandleConnection)`。
 //! 中继模式与 `xray-proxy-tun/src/inbound.rs::TunTcpRelay` 一致。
 
-use async_trait::async_trait;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
+use async_trait::async_trait;
 use parking_lot::Mutex as ParkMutex;
-use smoltcp::iface::SocketHandle;
-use smoltcp::wire::IpEndpoint;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex as AsyncMutex;
-use tokio::task::JoinHandle;
-use tokio::time::interval;
+use smoltcp::{iface::SocketHandle, wire::IpEndpoint};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::Mutex as AsyncMutex,
+    task::JoinHandle,
+    time::interval,
+};
 use xray_app_dispatcher::{AccessContext, DispatchHandler};
 use xray_buf::io::{new_reader, new_writer};
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
+use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
 use xray_features::inbound::{InboundError, InboundHandler};
 use xray_transport::link::Link;
 
-use crate::config::DeviceConfig;
-use crate::driver::{bind_udp_socket, WgDriver};
-use crate::error::Result;
-use crate::netstack::WgNetStack;
-use crate::peer::shared_peer;
-use crate::users::{DriverSlot, WgUserRegistry};
+use crate::{
+    config::DeviceConfig,
+    driver::{WgDriver, bind_udp_socket},
+    error::Result,
+    netstack::WgNetStack,
+    peer::shared_peer,
+    users::{DriverSlot, WgUserRegistry},
+};
 
 /// duplex 缓冲大小。
 const DUPLEX_BUF: usize = 64 * 1024;
@@ -97,11 +101,8 @@ impl WireguardInboundHandler {
         let mut allowed_cidrs = Vec::with_capacity(config.peers.len());
         for (i, peer_cfg) in config.peers.iter().enumerate() {
             peers.push(shared_peer(config, peer_cfg, i as u32)?);
-            let cidrs: Vec<smoltcp::wire::IpCidr> = peer_cfg
-                .allowed_ips
-                .iter()
-                .filter_map(|s| s.parse().ok())
-                .collect();
+            let cidrs: Vec<smoltcp::wire::IpCidr> =
+                peer_cfg.allowed_ips.iter().filter_map(|s| s.parse().ok()).collect();
             allowed_cidrs.push(cidrs);
         }
 
@@ -158,11 +159,8 @@ impl WireguardInboundHandler {
         if self.started.swap(true, Ordering::SeqCst) {
             return Err(InboundError::AlreadyStarted(self.tag.clone()));
         }
-        let driver = self
-            .driver
-            .lock()
-            .clone()
-            .ok_or_else(|| InboundError::Closed(self.tag.clone()))?;
+        let driver =
+            self.driver.lock().clone().ok_or_else(|| InboundError::Closed(self.tag.clone()))?;
 
         let netstack = Arc::clone(&self.netstack);
         let registry = Arc::clone(&self.registry);
@@ -224,8 +222,12 @@ fn parse_local_cidrs(config: &DeviceConfig) -> Result<Vec<smoltcp::wire::IpCidr>
         .map(|addr| {
             let cidr_prefix = if addr.is_ipv4() { 32 } else { 128 };
             let smoltcp_addr = match addr {
-                std::net::IpAddr::V4(v4) => smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_octets(v4.octets())),
-                std::net::IpAddr::V6(v6) => smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from_octets(v6.octets())),
+                std::net::IpAddr::V4(v4) => smoltcp::wire::IpAddress::Ipv4(
+                    smoltcp::wire::Ipv4Address::from_octets(v4.octets()),
+                ),
+                std::net::IpAddr::V6(v6) => smoltcp::wire::IpAddress::Ipv6(
+                    smoltcp::wire::Ipv6Address::from_octets(v6.octets()),
+                ),
             };
             Ok(smoltcp::wire::IpCidr::new(smoltcp_addr, cidr_prefix))
         })
@@ -262,7 +264,7 @@ async fn wg_accept_loop(
                     );
                     stack.remove_socket(event.handle);
                     continue;
-                }
+                },
             };
 
             // 创建两路 duplex 桥接 smoltcp socket ↔ Link
@@ -316,12 +318,8 @@ async fn wg_accept_loop(
 fn ip_endpoint_to_destination(local: &Option<IpEndpoint>) -> Option<Destination> {
     let ep = local.as_ref()?;
     let address = match ep.addr {
-        smoltcp::wire::IpAddress::Ipv4(v4) => {
-            Address::IPv4(std::net::Ipv4Addr::from(v4.octets()))
-        }
-        smoltcp::wire::IpAddress::Ipv6(v6) => {
-            Address::IPv6(std::net::Ipv6Addr::from(v6.octets()))
-        }
+        smoltcp::wire::IpAddress::Ipv4(v4) => Address::IPv4(std::net::Ipv4Addr::from(v4.octets())),
+        smoltcp::wire::IpAddress::Ipv6(v6) => Address::IPv6(std::net::Ipv6Addr::from(v6.octets())),
     };
     Some(Destination::new(address, Port::new(ep.port), Network::TCP))
 }
@@ -421,13 +419,12 @@ impl WgTcpRelay {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::sync::atomic::AtomicU32;
-    use crate::config::PeerConfig;
-    use crate::driver::WgDriver;
+    use std::{future::Future, pin::Pin, sync::atomic::AtomicU32};
+
     use xray_buf::multi::MultiBuffer;
+
+    use super::*;
+    use crate::{config::PeerConfig, driver::WgDriver};
 
     fn make_keypair(seed: u8) -> (String, String) {
         use boringtun::x25519::{PublicKey, StaticSecret};
@@ -452,7 +449,10 @@ mod tests {
     }
 
     impl DispatchHandler for CountingDispatch {
-        fn tag(&self) -> &str { &self.tag }
+        fn tag(&self) -> &str {
+            &self.tag
+        }
+
         fn dispatch(
             &self,
             _dest: &Destination,
@@ -486,10 +486,7 @@ mod tests {
         DeviceConfig {
             secret_key: sec,
             endpoint: vec!["10.0.0.1/32".into()],
-            peers: vec![PeerConfig {
-                public_key: pub_,
-                ..Default::default()
-            }],
+            peers: vec![PeerConfig { public_key: pub_, ..Default::default() }],
             ..Default::default()
         }
     }
@@ -515,10 +512,7 @@ mod tests {
         // bd 7v0k③：peers 空允许启动（Go 官方空配置 + API 建户），旧实现拒绝
         let (dispatch, _) = make_dispatch();
         let (sec, _) = make_keypair(0x77);
-        let cfg = DeviceConfig {
-            secret_key: sec,
-            ..Default::default()
-        };
+        let cfg = DeviceConfig { secret_key: sec, ..Default::default() };
         let result = WireguardInboundHandler::new("test", &cfg, 0, dispatch).await;
         let handler = result.expect("empty peers must construct (Go empty config + API 建户)");
         assert_eq!(handler.user_registry().users_count(), 0);
@@ -530,7 +524,8 @@ mod tests {
         let cfg = make_config(0x88);
         let port = free_port().await;
 
-        let h = WireguardInboundHandler::new("test", &cfg, port, dispatch).await.expect("construct");
+        let h =
+            WireguardInboundHandler::new("test", &cfg, port, dispatch).await.expect("construct");
         assert_eq!(h.port(), port);
         assert_eq!(h.tag(), "test");
 
@@ -598,6 +593,7 @@ mod tests {
         fn tag(&self) -> &str {
             &self.tag
         }
+
         fn dispatch_with_access(
             &self,
             dest: &Destination,
@@ -607,6 +603,7 @@ mod tests {
             self.access_seen.lock().push(access);
             self.dispatch(dest, link)
         }
+
         fn dispatch(
             &self,
             dest: &Destination,
@@ -633,9 +630,12 @@ mod tests {
     /// accept loop 接线：SYN 驱动惰性建听 → 三次握手 → drain → dispatch 被调用。
     #[tokio::test]
     async fn accept_loop_lazy_listen_dispatches_syn() {
-        use crate::netstack::test_packets::{make_tcp_packet, tcp_seq_number, TCP_ACK, TCP_SYN};
-        use smoltcp::time::Instant;
-        use smoltcp::wire::{IpCidr, IpAddress, Ipv4Address};
+        use smoltcp::{
+            time::Instant,
+            wire::{IpAddress, IpCidr, Ipv4Address},
+        };
+
+        use crate::netstack::test_packets::{TCP_ACK, TCP_SYN, make_tcp_packet, tcp_seq_number};
 
         let local = IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)), 24);
         let netstack: Arc<AsyncMutex<WgNetStack>> =
@@ -647,7 +647,13 @@ mod tests {
         // 隧道内 client 10.0.0.2:5555 → server 10.0.0.1:80 的 SYN
         {
             let mut stack = netstack.lock().await;
-            stack.ingest_rx(make_tcp_packet(([10, 0, 0, 2], 5555), ([10, 0, 0, 1], 80), TCP_SYN, 1000, 0));
+            stack.ingest_rx(make_tcp_packet(
+                ([10, 0, 0, 2], 5555),
+                ([10, 0, 0, 1], 80),
+                TCP_SYN,
+                1000,
+                0,
+            ));
             stack.poll(Instant::now());
         }
 
@@ -689,9 +695,12 @@ mod tests {
     /// boringtun Rust↔Rust 全隧道（真 noise 握手 + 真加密 IP 包）替代。
     #[tokio::test]
     async fn tunnel_tcp_end_to_end_echoes() {
-        use smoltcp::time::Instant;
-        use smoltcp::wire::{IpCidr, IpAddress, Ipv4Address};
         use std::net::SocketAddr;
+
+        use smoltcp::{
+            time::Instant,
+            wire::{IpAddress, IpCidr, Ipv4Address},
+        };
 
         const TUNNEL_TCP_PORT: u16 = 8080;
         let (sec_c, pub_c) = make_keypair(0x11);
@@ -754,12 +763,8 @@ mod tests {
         let handle = {
             let mut s = client_ns.lock().await;
             let h = s.add_tcp_socket();
-            s.tcp_connect(
-                h,
-                IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)),
-                TUNNEL_TCP_PORT,
-            )
-            .expect("tcp connect");
+            s.tcp_connect(h, IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)), TUNNEL_TCP_PORT)
+                .expect("tcp connect");
             h
         };
 
@@ -806,14 +811,9 @@ mod tests {
         let ctx = acc.last().expect("dispatch_with_access captured");
         assert_eq!(ctx.email, "u@wg", "user email 挂接");
         assert_eq!(ctx.level, 3, "user level 挂接");
-        assert!(
-            ctx.from.starts_with("10.0.0.2"),
-            "from = 隧道内源地址，got {}",
-            ctx.from
-        );
+        assert!(ctx.from.starts_with("10.0.0.2"), "from = 隧道内源地址，got {}", ctx.from);
         assert_eq!(ctx.inbound_tag, "", "inbound_tag 由生产入口填充");
 
         server.close().await.expect("server close");
     }
 }
-

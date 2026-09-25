@@ -7,12 +7,10 @@ use thiserror::Error;
 pub enum HttpUpgradeError {
     /// 客户端：服务端响应不是 `101 Switching Protocols`，或缺少必需的
     /// `Upgrade: websocket` / `Connection: upgrade` header。
-    #[error("unrecognized reply from server: status={status}, upgrade={upgrade:?}, connection={connection:?}")]
-    UnrecognizedReply {
-        status: String,
-        upgrade: String,
-        connection: String,
-    },
+    #[error(
+        "unrecognized reply from server: status={status}, upgrade={upgrade:?}, connection={connection:?}"
+    )]
+    UnrecognizedReply { status: String, upgrade: String, connection: String },
 
     /// 服务端：请求缺少必需的 `Upgrade: websocket` / `Connection: upgrade` header。
     #[error("unrecognized request: connection={connection:?}, upgrade={upgrade:?}")]

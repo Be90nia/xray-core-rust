@@ -18,13 +18,7 @@ struct ConstStats;
 impl StatsCollector for ConstStats {
     fn collect(&self) -> StatsSnapshot {
         let mut snap = StatsSnapshot::default();
-        snap.inbound.insert(
-            "e2e_in".into(),
-            TrafficCount {
-                uplink: 1234,
-                downlink: 5678,
-            },
-        );
+        snap.inbound.insert("e2e_in".into(), TrafficCount { uplink: 1234, downlink: 5678 });
         snap
     }
 }
@@ -54,9 +48,7 @@ async fn get_metrics_returns_prometheus_exposition_format() {
     let server = TokioHttpServer::new();
     let stats: Arc<dyn StatsCollector> = Arc::new(ConstStats);
 
-    server
-        .start_http_listen(&addr.to_string(), stats, None)
-        .expect("start_http_listen");
+    server.start_http_listen(&addr.to_string(), stats, None).expect("start_http_listen");
 
     // 给 accept loop 一点时间进入 select!（实际 race window 极小）
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -78,8 +70,14 @@ async fn get_metrics_returns_prometheus_exposition_format() {
     assert!(resp.contains("# HELP xray_traffic_bytes"));
     assert!(resp.contains("# TYPE xray_traffic_bytes counter"));
     // 实际指标行（标签顺序与 format_prometheus 实现一致）
-    assert!(resp.contains("xray_traffic_bytes{type=\"inbound\",tag=\"e2e_in\",direction=\"uplink\"} 1234"));
-    assert!(resp.contains("xray_traffic_bytes{type=\"inbound\",tag=\"e2e_in\",direction=\"downlink\"} 5678"));
+    assert!(
+        resp.contains(
+            "xray_traffic_bytes{type=\"inbound\",tag=\"e2e_in\",direction=\"uplink\"} 1234"
+        )
+    );
+    assert!(resp.contains(
+        "xray_traffic_bytes{type=\"inbound\",tag=\"e2e_in\",direction=\"downlink\"} 5678"
+    ));
 
     server.shutdown().await;
 }
@@ -90,9 +88,7 @@ async fn get_unknown_path_returns_404() {
     let server = TokioHttpServer::new();
     let stats: Arc<dyn StatsCollector> = Arc::new(ConstStats);
 
-    server
-        .start_http_listen(&addr.to_string(), stats, None)
-        .expect("start_http_listen");
+    server.start_http_listen(&addr.to_string(), stats, None).expect("start_http_listen");
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let resp = http_get(addr, "/nope").await;
@@ -129,9 +125,7 @@ async fn get_metrics_includes_observation_when_collector_provided() {
     let stats: Arc<dyn StatsCollector> = Arc::new(WithObs);
     let obs: Arc<dyn xray_app_metrics::ObservationCollector> = Arc::new(WithObs);
 
-    server
-        .start_http_listen(&addr.to_string(), stats, Some(obs))
-        .expect("start_http_listen");
+    server.start_http_listen(&addr.to_string(), stats, Some(obs)).expect("start_http_listen");
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let resp = http_get(addr, "/metrics").await;

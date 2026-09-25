@@ -3,16 +3,17 @@
 //! 接收侧负责：缓存乱序到达的 DataSegment，按 `next_number` 顺序读出；
 //! 收集待确认的 (number, timestamp) 对，flush 时批量打包成 AckSegment。
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::Mutex;
 use xray_buf::multi::MultiBuffer;
 
-use crate::config::{Config, ConfigExt};
-use crate::round_trip::RoundTripInfo;
-use crate::segment::{AckSegment, DataSegment, Segment, SEGMENT_OPTION_CLOSE};
-use crate::state::State;
+use crate::{
+    config::{Config, ConfigExt},
+    round_trip::RoundTripInfo,
+    segment::{AckSegment, DataSegment, SEGMENT_OPTION_CLOSE, Segment},
+    state::State,
+};
 
 // ============== ReceivingWindow ==============
 
@@ -25,9 +26,7 @@ pub struct ReceivingWindow {
 
 impl ReceivingWindow {
     pub fn new() -> Self {
-        Self {
-            cache: HashMap::new(),
-        }
+        Self { cache: HashMap::new() }
     }
 
     /// 尝试插入 `id -> value`。
@@ -361,11 +360,7 @@ impl ReceivingWorker {
         let window_size = inner.window_size;
         let mut segments = inner.acklist.flush(current, rto);
 
-        let option = if state == State::ReadyToClose {
-            SEGMENT_OPTION_CLOSE
-        } else {
-            0
-        };
+        let option = if state == State::ReadyToClose { SEGMENT_OPTION_CLOSE } else { 0 };
         for seg in &mut segments {
             seg.conv = self.conv;
             seg.option = option;
@@ -391,8 +386,7 @@ impl ReceivingWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::default_config;
-    use crate::round_trip::RoundTripInfo;
+    use crate::{config::default_config, round_trip::RoundTripInfo};
 
     fn make_worker(next_number: u32, window_size: u32) -> ReceivingWorker {
         let config = Arc::new(default_config());
@@ -563,7 +557,9 @@ mod tests {
         assert_eq!(out1[0].number_list, vec![1]);
 
         // 第二次 flush:1 仍 throttle,加 200 个新数字（next_flush=0 < current 全部立即 flush）
-        for i in 2..=201u32 { a.add(i, 100); }
+        for i in 2..=201u32 {
+            a.add(i, 100);
+        }
         let out2 = a.flush(1050, 200);
         // 200 立即 flush:128 满→push seg1,剩 72;candidates 补 1→seg2=73;push
         assert_eq!(out2.len(), 2);

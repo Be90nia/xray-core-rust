@@ -1,5 +1,4 @@
 //! Shadowsocks Go->Rust interop tests.
-//!
 // Test scenarios:
 // 1. Go SS server -> Rust SS client (wire-level protocol compat, multiple ciphers)
 // 2. Go SS server -> Rust SS client via Go xray SOCKS5 proxy
@@ -12,14 +11,15 @@
 
 mod interop_helpers;
 
-use tokio::io::AsyncWriteExt;
-
 use interop_helpers::*;
+use tokio::io::AsyncWriteExt;
 use xray_common::net::address::Address;
-use xray_proxy_ss::client::Client;
-use xray_proxy_ss::config::{CipherType, MemoryAccount as SsAccount};
-use xray_proxy_ss::server::read_request;
 use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
+use xray_proxy_ss::{
+    client::Client,
+    config::{CipherType, MemoryAccount as SsAccount},
+    server::read_request,
+};
 
 // Test password.
 const PASSWORD: &str = "interop-ss-password";
@@ -30,11 +30,8 @@ const PAYLOAD: &[u8] = b"hello ss interop test!";
 // -- Helper: construct SS account --
 
 fn make_ss_account(ct: CipherType) -> SsAccount {
-    let p = ProtoAccount {
-        password: PASSWORD.to_string(),
-        cipher_type: ct.as_i32(),
-        iv_check: false,
-    };
+    let p =
+        ProtoAccount { password: PASSWORD.to_string(), cipher_type: ct.as_i32(), iv_check: false };
     SsAccount::from_proto(&p).expect("account from proto")
 }
 
@@ -50,7 +47,8 @@ async fn go_ss_server_rust_client_aes128gcm() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
 async fn go_ss_server_rust_client_chacha20poly1305() {
-    run_go_ss_server_rust_client(CipherType::ChaCha20Poly1305, "chacha20-ietf-poly1305", 20071).await;
+    run_go_ss_server_rust_client(CipherType::ChaCha20Poly1305, "chacha20-ietf-poly1305", 20071)
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -59,30 +57,19 @@ async fn go_ss_server_rust_client_aes256gcm() {
     run_go_ss_server_rust_client(CipherType::Aes256Gcm, "aes-256-gcm", 20081).await;
 }
 
-async fn run_go_ss_server_rust_client(
-    ct: CipherType,
-    go_method: &str,
-    ss_port: u16,
-) {
+async fn run_go_ss_server_rust_client(ct: CipherType, go_method: &str, ss_port: u16) {
     // Start echo server as target
-    let echo_port = spawn_echo_server()
-        .await
-        .expect("start echo server");
+    let echo_port = spawn_echo_server().await.expect("start echo server");
 
     // Configure Go xray: SS inbound + freedom outbound
     let config = XrayConfig {
         inbounds: vec![ss_server_inbound(ss_port, PASSWORD, go_method)],
         outbounds: vec![freedom_outbound()],
     };
-    let config_path = write_config_to_temp(&config, "go-ss-server")
-        .expect("write config");
+    let config_path = write_config_to_temp(&config, "go-ss-server").expect("write config");
 
-    let mut go_proc = start_go_xray(&config_path)
-        .await
-        .expect("start Go xray");
-    wait_for_port(ss_port, 5000)
-        .await
-        .expect("Go SS port ready");
+    let mut go_proc = start_go_xray(&config_path).await.expect("start Go xray");
+    wait_for_port(ss_port, 5000).await.expect("Go SS port ready");
 
     // Rust SS client: connect to Go server, send data, verify echo
     let result = rust_ss_client_connect(ct, ss_port, echo_port).await;
@@ -109,10 +96,7 @@ async fn rust_ss_client_connect(
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     // Send payload through SS tunnel
-    ss_stream
-        .write_chunk(PAYLOAD)
-        .await
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    ss_stream.write_chunk(PAYLOAD).await.map_err(|e| std::io::Error::other(e.to_string()))?;
     ss_stream.flush().await.map_err(|e| std::io::Error::other(e.to_string()))?;
 
     // Read echo response
@@ -156,19 +140,13 @@ async fn rust_ss_server_reads_go_client_request() {
     let client = Client::new(account, "127.0.0.1".to_string(), ss_port);
     let target_addr = Address::ipv4(std::net::Ipv4Addr::new(1, 2, 3, 4));
     let target_port: u16 = 5678;
-    let mut ss_stream = client
-        .dial_target(&target_addr, target_port)
-        .await
-        .expect("dial_target");
+    let mut ss_stream = client.dial_target(&target_addr, target_port).await.expect("dial_target");
     ss_stream.write_chunk(PAYLOAD).await.expect("write_chunk");
     ss_stream.flush().await.expect("flush");
     ss_stream.shutdown().await.ok();
 
     // Verify server parsed the request correctly
-    let (header, _body) = server_handle
-        .await
-        .expect("server task")
-        .expect("read_request");
+    let (header, _body) = server_handle.await.expect("server task").expect("read_request");
 
     // Header fields verification (body verification covered in e2e test above)
     assert_eq!(header.address, target_addr, "address mismatch");
@@ -185,9 +163,7 @@ async fn rust_ss_server_reads_go_client_request() {
 #[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
 async fn go_ss_proxy_rust_client_aes128gcm_http() {
     // Start HTTP echo server as target
-    let echo_port = spawn_http_echo_server()
-        .await
-        .expect("start http echo server");
+    let echo_port = spawn_http_echo_server().await.expect("start http echo server");
 
     // Configure Go xray: SS inbound + freedom outbound
     let ss_port: u16 = 20091;
@@ -195,15 +171,10 @@ async fn go_ss_proxy_rust_client_aes128gcm_http() {
         inbounds: vec![ss_server_inbound(ss_port, PASSWORD, "aes-128-gcm")],
         outbounds: vec![freedom_outbound()],
     };
-    let config_path = write_config_to_temp(&config, "go-ss-proxy")
-        .expect("write config");
+    let config_path = write_config_to_temp(&config, "go-ss-proxy").expect("write config");
 
-    let mut go_proc = start_go_xray(&config_path)
-        .await
-        .expect("start Go xray");
-    wait_for_port(ss_port, 5000)
-        .await
-        .expect("Go SS port ready");
+    let mut go_proc = start_go_xray(&config_path).await.expect("start Go xray");
+    wait_for_port(ss_port, 5000).await.expect("Go SS port ready");
 
     // Rust SS client: connect, send HTTP, verify
     let account = make_ss_account(CipherType::Aes128Gcm);
@@ -239,7 +210,7 @@ async fn go_ss_proxy_rust_client_aes128gcm_http() {
                         break;
                     }
                     return Err(std::io::Error::other(e.to_string()));
-                }
+                },
             }
             // Stop after getting enough data
             if total.len() > 100 {

@@ -3,13 +3,17 @@
 //! IO 边界 stub：实际 UDP/TLS/Udpmask 留 trait 注入。
 //! 核心逻辑（globalConv 原子递增 + fetchInput 分发）可测。
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{
+    Arc, LazyLock,
+    atomic::{AtomicU32, Ordering},
+};
 
-use crate::connection::{ConnMetadata, Connection, ConnectionCloser};
-use crate::error::{KcpError, Result};
-use crate::io::PacketReader;
-use crate::output::SegmentWriter;
+use crate::{
+    connection::{ConnMetadata, Connection, ConnectionCloser},
+    error::{KcpError, Result},
+    io::PacketReader,
+    output::SegmentWriter,
+};
 
 /// 全局 conversation ID（对应 Go `globalConv`）。
 ///
@@ -59,11 +63,7 @@ pub trait KcpDialerFactory: Send + Sync {
 ///
 /// 循环调用直到 `input.read_packet()` 返回 None。
 /// 生产模式应在独立 task/spawn 中调用。
-pub fn fetch_input(
-    input: &mut dyn PacketInput,
-    reader: &dyn PacketReader,
-    conn: &Connection,
-) {
+pub fn fetch_input(input: &mut dyn PacketInput, reader: &dyn PacketReader, conn: &Connection) {
     while let Some(payload) = input.read_packet() {
         let segments = reader.read(&payload);
         if !segments.is_empty() {
@@ -126,8 +126,7 @@ mod tests {
 
     #[test]
     fn fetch_input_dispatches_segments_to_connection() {
-        use crate::config::default_config;
-        use crate::connection::NoopCloser;
+        use crate::{config::default_config, connection::NoopCloser};
 
         struct Sink;
         impl SegmentWriter for Sink {

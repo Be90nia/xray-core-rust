@@ -11,17 +11,25 @@
 //!
 //! ## Manager
 //!
-//! [`UdpmaskManager`] / [`TcpmaskManager`] 按逆序链式应用多个伪装模块（对应 Go `slices.Backward`）。
+//! [`UdpmaskManager`] / [`TcpmaskManager`] 按逆序链式应用多个伪装模块（对应 Go
+//! `slices.Backward`）。
+
+use std::{
+    io,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use async_trait::async_trait;
-use std::io;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    sync::mpsc,
+    task::JoinHandle,
+};
 
 pub mod custom;
 pub mod fragment;
@@ -65,9 +73,11 @@ impl UdpIo for tokio::net::UdpSocket {
     async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
         tokio::net::UdpSocket::send_to(self, buf, addr).await
     }
+
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         tokio::net::UdpSocket::recv_from(self, buf).await
     }
+
     fn local_addr(&self) -> io::Result<SocketAddr> {
         tokio::net::UdpSocket::local_addr(self)
     }
@@ -80,9 +90,11 @@ impl UdpIo for std::sync::Arc<tokio::net::UdpSocket> {
     async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
         tokio::net::UdpSocket::send_to(self.as_ref(), buf, addr).await
     }
+
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         tokio::net::UdpSocket::recv_from(self.as_ref(), buf).await
     }
+
     fn local_addr(&self) -> io::Result<SocketAddr> {
         tokio::net::UdpSocket::local_addr(self.as_ref())
     }
@@ -215,6 +227,7 @@ impl AsyncWrite for ConnAsAsyncIo {
         let this = unsafe { self.map_unchecked_mut(|s| &mut s.0) };
         AsyncWrite::poll_write(this, cx, buf)
     }
+
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -222,6 +235,7 @@ impl AsyncWrite for ConnAsAsyncIo {
         let this = unsafe { self.map_unchecked_mut(|s| &mut s.0) };
         AsyncWrite::poll_flush(this, cx)
     }
+
     fn poll_shutdown(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -322,11 +336,7 @@ fn apply_tcpmasks(
     is_client: bool,
 ) -> io::Result<Box<dyn AsyncIo>> {
     for mask in masks.iter().rev() {
-        raw = if is_client {
-            mask.wrap_conn_client(raw)?
-        } else {
-            mask.wrap_conn_server(raw)?
-        };
+        raw = if is_client { mask.wrap_conn_client(raw)? } else { mask.wrap_conn_server(raw)? };
     }
     Ok(raw)
 }
@@ -355,6 +365,7 @@ impl AsyncWrite for AsyncIoConn {
         let this = unsafe { self.map_unchecked_mut(|s| &mut s.0) };
         AsyncWrite::poll_write(this, cx, buf)
     }
+
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -362,6 +373,7 @@ impl AsyncWrite for AsyncIoConn {
         let this = unsafe { self.map_unchecked_mut(|s| &mut s.0) };
         AsyncWrite::poll_flush(this, cx)
     }
+
     fn poll_shutdown(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -375,6 +387,7 @@ impl crate::connection::Connection for AsyncIoConn {
     fn remote_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
         Ok(None)
     }
+
     fn local_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
         Ok(None)
     }
@@ -389,7 +402,8 @@ impl crate::connection::Connection for AsyncIoConn {
 /// `Ready(Ok(n))`，**不感知** send 错误——UDP 写错误由 socket 层的 NAT/ICMP
 /// 反馈呈现，对应用语义不阻挡（与 Go `net.PacketConn.WriteTo` 同）。
 ///
-/// ponytail: stop 信号缺失——driver task 一直运行直到 socket recv_from 出错（典型的是 socket drop 后内核报 error）。Drop 时 abort JoinHandle 立即取消。
+/// ponytail: stop 信号缺失——driver task 一直运行直到 socket recv_from 出错（典型的是 socket drop
+/// 后内核报 error）。Drop 时 abort JoinHandle 立即取消。
 struct PacketIoConn {
     /// 共享底层 socket。`UdpSocket` 是 Sync 通过内核，clone Arc 多 reader OK。
     inner: Arc<dyn UdpIo>,
@@ -416,9 +430,10 @@ struct PacketIoConn {
 
 impl PacketIoConn {
     fn new(inner: Box<dyn UdpIo>, remote_addr: SocketAddr) -> Self {
-        // Box→Arc 必须走标准库 `From<Box<T>> for Arc<T>`（值 move 进带 {strong,weak} 计数头的新分配）。
-        // 此前 Box::into_raw + Arc::from_raw 是 UB：Box 分配没有计数头，Arc::clone 在分配外
-        // fetch_add、drop 按错误 layout dealloc → STATUS_HEAP_CORRUPTION(0xc0000374)。
+        // Box→Arc 必须走标准库 `From<Box<T>> for Arc<T>`（值 move 进带 {strong,weak}
+        // 计数头的新分配）。 此前 Box::into_raw + Arc::from_raw 是 UB：Box
+        // 分配没有计数头，Arc::clone 在分配外 fetch_add、drop 按错误 layout dealloc →
+        // STATUS_HEAP_CORRUPTION(0xc0000374)。
         let inner: Arc<dyn UdpIo> = inner.into();
         let (pkt_tx, pkt_rx) = mpsc::channel::<Vec<u8>>(PACKET_QUEUE_CAP);
         let (snd_tx, mut snd_rx) = mpsc::channel::<Vec<u8>>(PACKET_QUEUE_CAP);
@@ -432,14 +447,17 @@ impl PacketIoConn {
                     Ok((n, _src)) => {
                         // 有界队列：读端消费不过来时丢新包（UDP 语义），计数可观测
                         match pkt_tx.try_send(buf[..n].to_vec()) {
-                            Ok(()) => {}
+                            Ok(()) => {},
                             Err(mpsc::error::TrySendError::Full(_)) => {
                                 let total = dropped_driver.fetch_add(1, Ordering::Relaxed) + 1;
-                                tracing::debug!(dropped = total, "PacketIoConn recv queue full, packet dropped");
-                            }
+                                tracing::debug!(
+                                    dropped = total,
+                                    "PacketIoConn recv queue full, packet dropped"
+                                );
+                            },
                             Err(mpsc::error::TrySendError::Closed(_)) => break, // 读端已 drop
                         }
-                    }
+                    },
                     Err(_) => break,
                 }
             }
@@ -513,11 +531,11 @@ impl AsyncRead for PacketIoConn {
                     *self.leftover.lock() = pkt[n..].to_vec();
                 }
                 std::task::Poll::Ready(Ok(()))
-            }
+            },
             std::task::Poll::Ready(None) => {
                 *rx = None;
                 std::task::Poll::Ready(Ok(()))
-            }
+            },
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
@@ -535,14 +553,14 @@ impl AsyncWrite for PacketIoConn {
         // 队列关闭仅在 conn 已半亡（worker 被 abort）时发生，包静默丢弃与原
         // spawn-丢包语义一致。
         match self.tx.try_send(buf.to_vec()) {
-            Ok(()) => {}
+            Ok(()) => {},
             Err(mpsc::error::TrySendError::Full(_)) => {
                 let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
                 tracing::debug!(dropped = total, "PacketIoConn send queue full, packet dropped");
-            }
+            },
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 tracing::debug!("PacketIoConn send queue closed, packet dropped");
-            }
+            },
         }
         std::task::Poll::Ready(Ok(n))
     }
@@ -570,6 +588,7 @@ impl crate::connection::Connection for PacketIoConn {
             Ok(Some(self.remote_addr))
         }
     }
+
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         self.inner.local_addr().map(Some)
     }
@@ -620,17 +639,16 @@ pub fn build_udpmask_manager(config: &FinalmaskConfig) -> io::Result<UdpmaskMana
     match config.security {
         SecurityMode::Original => {
             masks.push(Box::new(mkcp::original::OriginalConfig));
-        }
+        },
         SecurityMode::Aes128Gcm => {
             masks.push(Box::new(mkcp::aes128gcm::Aes128GcmConfig {
                 password: config.password.clone(),
             }));
-        }
+        },
         SecurityMode::Salamander => {
-            masks.push(Box::new(salamander::SalamanderConfig {
-                password: config.password.clone(),
-            }));
-        }
+            masks
+                .push(Box::new(salamander::SalamanderConfig { password: config.password.clone() }));
+        },
     }
 
     // 2. Header mask (optional, wraps security layer)
@@ -668,7 +686,9 @@ pub fn build_udpmask_manager_from_json(
     json: Option<&serde_json::Value>,
 ) -> io::Result<UdpmaskManager> {
     let mut masks: Vec<Box<dyn Udpmask>> = Vec::new();
-    let Some(v) = json else { return Ok(UdpmaskManager::new(masks)); };
+    let Some(v) = json else {
+        return Ok(UdpmaskManager::new(masks));
+    };
     let Some(arr) = v.get("udp").and_then(|x| x.as_array()) else {
         return Ok(UdpmaskManager::new(masks));
     };
@@ -704,12 +724,8 @@ fn build_udpmask_entry(entry: &serde_json::Value) -> io::Result<Box<dyn Udpmask>
         "realm" => build_realm_config(&settings).map(|c| Box::new(c) as Box<dyn Udpmask>),
         "header-custom" => {
             let (udp, udp_standalone) = build_custom_udp(&settings)?;
-            Ok(Box::new(custom::Config {
-                udp,
-                udp_standalone,
-                ..custom::Config::default()
-            }))
-        }
+            Ok(Box::new(custom::Config { udp, udp_standalone, ..custom::Config::default() }))
+        },
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("finalmask: unsupported udp mask type {other:?}"),
@@ -723,10 +739,7 @@ fn build_udpmask_entry(entry: &serde_json::Value) -> io::Result<Box<dyn Udpmask>
 /// `header` 空 + `password`/`value` 非空 → `Aes128GcmConfig{ password }`。
 /// `header` 非空（dns/dtls/srtp/utp/wechat/wireguard）→ `HeaderConfig::from_id(...)`。
 fn build_mkcp_legacy_udpmask(settings: &serde_json::Value) -> io::Result<Box<dyn Udpmask>> {
-    let header = settings
-        .get("header")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let header = settings.get("header").and_then(|v| v.as_str()).unwrap_or("");
     let password = settings
         .get("password")
         .or_else(|| settings.get("value"))
@@ -752,15 +765,13 @@ fn build_mkcp_legacy_udpmask(settings: &serde_json::Value) -> io::Result<Box<dyn
                     io::ErrorKind::InvalidInput,
                     format!("finalmask: invalid header {header:?}"),
                 ));
-            }
+            },
         };
         let cfg = mkcp::header::HeaderConfig { id, domain };
         return Ok(Box::new(cfg));
     }
     if !password.is_empty() {
-        return Ok(Box::new(mkcp::aes128gcm::Aes128GcmConfig {
-            password: password.to_string(),
-        }));
+        return Ok(Box::new(mkcp::aes128gcm::Aes128GcmConfig { password: password.to_string() }));
     }
     Ok(Box::new(mkcp::original::OriginalConfig))
 }
@@ -780,7 +791,9 @@ pub fn build_tcpmask_manager_from_json(
     json: Option<&serde_json::Value>,
 ) -> io::Result<TcpmaskManager> {
     let mut masks: Vec<Box<dyn Tcpmask>> = Vec::new();
-    let Some(v) = json else { return Ok(TcpmaskManager::new(masks)); };
+    let Some(v) = json else {
+        return Ok(TcpmaskManager::new(masks));
+    };
     let Some(arr) = v.get("tcp").and_then(|x| x.as_array()) else {
         return Ok(TcpmaskManager::new(masks));
     };
@@ -804,10 +817,8 @@ fn build_tcpmask_entry(entry: &serde_json::Value) -> io::Result<Box<dyn Tcpmask>
         "sudoku" => Ok(Box::new(build_sudoku_config(&settings))),
         "xmc" => build_xmc_config(&settings).map(|c| Box::new(c) as Box<dyn Tcpmask>),
         "header-custom" => build_custom_tcp(&settings).map(|tcp| {
-            Box::new(custom::Config {
-                tcp: Some(tcp),
-                ..custom::Config::default()
-            }) as Box<dyn Tcpmask>
+            Box::new(custom::Config { tcp: Some(tcp), ..custom::Config::default() })
+                as Box<dyn Tcpmask>
         }),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -848,11 +859,12 @@ fn json_range(v: &serde_json::Value, key: &str) -> io::Result<(i64, i64)> {
             let from = o.get("from").and_then(|x| x.as_i64()).unwrap_or(0);
             let to = o.get("to").and_then(|x| x.as_i64()).unwrap_or(0);
             Ok((from.min(to), from.max(to)))
-        }
+        },
         Some(serde_json::Value::Number(n)) => {
-            let x = n.as_i64().ok_or_else(|| mask_err(format!("invalid integer range for {key:?}")))?;
+            let x =
+                n.as_i64().ok_or_else(|| mask_err(format!("invalid integer range for {key:?}")))?;
             Ok((x, x))
-        }
+        },
         Some(serde_json::Value::String(s)) => parse_range_string(s),
         None | Some(serde_json::Value::Null) => Ok((0, 0)),
         Some(_) => Err(mask_err(format!("invalid range for {key:?}"))),
@@ -871,11 +883,11 @@ fn parse_range_string(s: &str) -> io::Result<(i64, i64)> {
         None => {
             let x: i64 = s.parse().map_err(|_| invalid())?;
             return Ok((x, x));
-        }
+        },
         Some((l, r)) => {
             let l = if body.len() < s.len() { format!("-{l}") } else { l.to_string() };
             (l, r.to_string())
-        }
+        },
     };
     let lo: i64 = first.parse().map_err(|_| invalid())?;
     let hi: i64 = second.parse().map_err(|_| invalid())?;
@@ -919,7 +931,7 @@ fn parse_byte_slice(raw: Option<&serde_json::Value>, typ: &str) -> io::Result<Ve
             base64::engine::general_purpose::STANDARD
                 .decode(raw.and_then(|x| x.as_str()).unwrap_or(""))
                 .map_err(|e| mask_err(format!("invalid base64 packet: {e}")))
-        }
+        },
         _ => Err(mask_err(format!("unknown type {typ:?}"))),
     }
 }
@@ -929,11 +941,7 @@ fn validate_var_name(name: &str) -> io::Result<()> {
     let ok = name.is_empty()
         || (name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
             && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
-    if ok {
-        Ok(())
-    } else {
-        Err(mask_err(format!("invalid variable name {name:?}")))
-    }
+    if ok { Ok(()) } else { Err(mask_err(format!("invalid variable name {name:?}"))) }
 }
 
 /// Go `validateCustomItemSpec`：packet/rand/reuse/transform 至多一种；全空时不得有 capture。
@@ -998,10 +1006,7 @@ fn parse_expr_arg(v: &serde_json::Value) -> io::Result<custom::ExprArg> {
         return Ok(custom::ExprArg::Bytes(parse_byte_slice(bytes_raw, json_str(v, "type"))?));
     }
     if has_u64 {
-        let n = v
-            .get("u64")
-            .and_then(|x| x.as_u64())
-            .ok_or_else(|| mask_err("invalid u64 arg"))?;
+        let n = v.get("u64").and_then(|x| x.as_u64()).ok_or_else(|| mask_err("invalid u64 arg"))?;
         return Ok(custom::ExprArg::U64(n));
     }
     if !reuse.is_empty() {
@@ -1101,7 +1106,7 @@ fn build_custom_udp(
 ) -> io::Result<(Option<custom::UDPConfig>, Option<custom::UDPConfig>)> {
     let mode = json_str(settings, "mode");
     match mode {
-        "" | "prefix" | "standalone" => {}
+        "" | "prefix" | "standalone" => {},
         other => return Err(mask_err(format!("unknown udp mode {other:?}"))),
     }
     let read_items = |key: &str| -> io::Result<Vec<custom::UDPItem>> {
@@ -1110,15 +1115,8 @@ fn build_custom_udp(
             Some(items) => items.iter().map(parse_custom_udp_item).collect(),
         }
     };
-    let cfg = custom::UDPConfig {
-        client: read_items("client")?,
-        server: read_items("server")?,
-    };
-    Ok(if mode == "standalone" {
-        (None, Some(cfg))
-    } else {
-        (Some(cfg), None)
-    })
+    let cfg = custom::UDPConfig { client: read_items("client")?, server: read_items("server")? };
+    Ok(if mode == "standalone" { (None, Some(cfg)) } else { (Some(cfg), None) })
 }
 
 /// Go `NoiseMask.Build` → `noise::NoiseConfig`。
@@ -1144,11 +1142,7 @@ fn build_noise_config(settings: &serde_json::Value) -> io::Result<noise::NoiseCo
             delay_max,
         });
     }
-    Ok(noise::NoiseConfig {
-        reset_min,
-        reset_max,
-        items,
-    })
+    Ok(noise::NoiseConfig { reset_min, reset_max, items })
 }
 
 /// Go `Sudoku.Build` → `sudoku::SudokuConfig`（新驼峰键优先，legacy 下划线键兜底）。
@@ -1166,27 +1160,15 @@ fn build_sudoku_config(settings: &serde_json::Value) -> sudoku::SudokuConfig {
         },
         custom_tables: {
             let t = json_str_vec(settings, "customTables");
-            if t.is_empty() {
-                json_str_vec(settings, "custom_tables")
-            } else {
-                t
-            }
+            if t.is_empty() { json_str_vec(settings, "custom_tables") } else { t }
         },
         padding_min: {
             let p = json_i64(settings, "paddingMin").max(0) as u32;
-            if p == 0 {
-                json_i64(settings, "padding_min").max(0) as u32
-            } else {
-                p
-            }
+            if p == 0 { json_i64(settings, "padding_min").max(0) as u32 } else { p }
         },
         padding_max: {
             let p = json_i64(settings, "paddingMax").max(0) as u32;
-            if p == 0 {
-                json_i64(settings, "padding_max").max(0) as u32
-            } else {
-                p
-            }
+            if p == 0 { json_i64(settings, "padding_max").max(0) as u32 } else { p }
         },
     }
 }
@@ -1218,19 +1200,15 @@ fn build_xicmp_config(settings: &serde_json::Value) -> io::Result<xicmp::XicmpCo
         ip.parse::<std::net::IpAddr>()
             .map_err(|e| mask_err(format!("xicmp: invalid ip {ip:?}: {e}")))?;
     }
-    Ok(xicmp::XicmpConfig {
-        ips,
-        dgram: json_bool(settings, "dgram"),
-    })
+    Ok(xicmp::XicmpConfig { ips, dgram: json_bool(settings, "dgram") })
 }
 
 /// Go `Realm.Build` → `realm::Config`（URL 形如 `realm://token@host:port/id`；
 /// scheme `realm`→https、`realm+http`→http；Rust 端 TLS 细节由 `use_tls` 简化承载）。
 fn build_realm_config(settings: &serde_json::Value) -> io::Result<realm::Config> {
     let url = json_str(settings, "url");
-    let (raw_scheme, rest) = url
-        .split_once("://")
-        .ok_or_else(|| mask_err(format!("realm: invalid url {url:?}")))?;
+    let (raw_scheme, rest) =
+        url.split_once("://").ok_or_else(|| mask_err(format!("realm: invalid url {url:?}")))?;
     let scheme = match raw_scheme {
         "realm" => "https",
         "realm+http" => "http",
@@ -1285,9 +1263,8 @@ fn build_realm_config(settings: &serde_json::Value) -> io::Result<realm::Config>
 /// `[v6]:port` / `host:port` / `host`（port 可缺省，调用方按需校验）。
 fn split_host_port(s: &str) -> io::Result<(String, Option<String>)> {
     if let Some(rest) = s.strip_prefix('[') {
-        let (host, tail) = rest
-            .split_once(']')
-            .ok_or_else(|| mask_err(format!("missing ']' in {s:?}")))?;
+        let (host, tail) =
+            rest.split_once(']').ok_or_else(|| mask_err(format!("missing ']' in {s:?}")))?;
         return Ok((host.to_string(), tail.strip_prefix(':').map(str::to_string)));
     }
     Ok(match s.rsplit_once(':') {
@@ -1339,24 +1316,19 @@ fn build_xmc_config(settings: &serde_json::Value) -> io::Result<xmc::Config> {
         let valid = (3..=16).contains(&username.len())
             && username.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
         if !valid {
-            return Err(mask_err(format!(
-                "invalid minecraft profile username: {username:?}"
-            )));
+            return Err(mask_err(format!("invalid minecraft profile username: {username:?}")));
         }
         json_str(p, "uuid")
             .parse::<uuid::Uuid>()
             .map_err(|e| mask_err(format!("invalid minecraft profile UUID: {e}")))?;
         if json_str(p, "texturesValue").is_empty() || json_str(p, "texturesSignature").is_empty() {
-            return Err(mask_err(format!(
-                "incomplete minecraft profile textures: {username:?}"
-            )));
+            return Err(mask_err(format!("incomplete minecraft profile textures: {username:?}")));
         }
         usernames.push(username.to_string());
     }
     let private_key = xmc::derivation::derive_rsa_key(password)
         .map_err(|e| mask_err(format!("derive minecraft rsa key: {e}")))?;
-    use rsa::pkcs1::EncodeRsaPrivateKey;
-    use rsa::pkcs8::EncodePublicKey;
+    use rsa::{pkcs1::EncodeRsaPrivateKey, pkcs8::EncodePublicKey};
     let rsa_private_key = private_key
         .to_pkcs1_der()
         .map_err(|e| mask_err(format!("marshal minecraft rsa private key: {e}")))?
@@ -1393,11 +1365,11 @@ fn build_fragment_config(settings: &serde_json::Value) -> io::Result<fragment::F
                 let from = o.get("from").and_then(|x| x.as_i64()).unwrap_or(0);
                 let to = o.get("to").and_then(|x| x.as_i64()).unwrap_or(from);
                 (from, to)
-            }
+            },
             Some(serde_json::Value::Number(n)) => {
                 let x = n.as_i64().unwrap_or(0);
                 (x, x)
-            }
+            },
             _ => (0, 0),
         }
     }
@@ -1498,8 +1470,8 @@ impl CodecChain {
 ///
 /// - `header` 空 + `value` 空 → original（XOR 链 + FNV1a）
 /// - `header` 空 + `value` 非空 → aes128gcm（password = `value`）
-/// - `header` = dns/dtls/srtp/utp/wechat/wireguard → 协议头伪装
-///   （dns 的 domain = `value`，默认 `www.baidu.com`）
+/// - `header` = dns/dtls/srtp/utp/wechat/wireguard → 协议头伪装 （dns 的 domain = `value`，默认
+///   `www.baidu.com`）
 ///
 /// 其余 type 报错（不静默丢配置）。`None` / 无 `udp` 数组 / 空数组 → `Ok(None)`
 /// （无 mask，行为不变）。
@@ -1530,7 +1502,7 @@ pub fn parse_finalmask_udp_chain(
                         "finalmask: unsupported udp mask type {other:?} (supported: mkcp-legacy)"
                     ),
                 ));
-            }
+            },
         }
     }
     Ok(Some(CodecChain::new(codecs)))
@@ -1553,11 +1525,7 @@ fn build_mkcp_legacy_codec(settings: &serde_json::Value) -> io::Result<Arc<dyn P
     let cfg = match header.to_ascii_lowercase().as_str() {
         "dns" => HeaderConfig {
             id: HeaderId::Dns,
-            domain: if value.is_empty() {
-                "www.baidu.com".to_string()
-            } else {
-                value.to_string()
-            },
+            domain: if value.is_empty() { "www.baidu.com".to_string() } else { value.to_string() },
         },
         "dtls" => HeaderConfig::from_id(HeaderId::Dtls),
         "srtp" => HeaderConfig::from_id(HeaderId::Srtp),
@@ -1569,7 +1537,7 @@ fn build_mkcp_legacy_codec(settings: &serde_json::Value) -> io::Result<Arc<dyn P
                 io::ErrorKind::InvalidInput,
                 format!("finalmask: invalid header {other:?}"),
             ));
-        }
+        },
     };
     Ok(Arc::new(mkcp::header::HeaderCodec::new(&cfg)?))
 }
@@ -1660,10 +1628,11 @@ mod tests {
     #[test]
     fn parse_chain_mkcp_original() {
         // Go MkcpLegacy.Build：header 空 + value 空 → original
-        let chain =
-            parse_finalmask_udp_chain(Some(&fm(r#"{"udp":[{"type":"mkcp-legacy","settings":{}}]}"#)))
-                .unwrap()
-                .unwrap();
+        let chain = parse_finalmask_udp_chain(Some(&fm(
+            r#"{"udp":[{"type":"mkcp-legacy","settings":{}}]}"#,
+        )))
+        .unwrap()
+        .unwrap();
         assert_eq!(chain.len(), 1);
         let enc = chain.encode(b"kcp-pkt").unwrap();
         // original overhead = 6（4B FNV + 2B len）
@@ -1703,13 +1672,7 @@ mod tests {
 
     #[test]
     fn parse_chain_all_header_kinds() {
-        for (name, id) in [
-            ("dtls", 1),
-            ("srtp", 2),
-            ("utp", 3),
-            ("wechat", 4),
-            ("wireguard", 5),
-        ] {
+        for (name, id) in [("dtls", 1), ("srtp", 2), ("utp", 3), ("wechat", 4), ("wireguard", 5)] {
             let chain = parse_finalmask_udp_chain(Some(&fm(&format!(
                 r#"{{"udp":[{{"type":"mkcp-legacy","settings":{{"header":"{name}"}}}}]}}"#
             ))))
@@ -1723,12 +1686,10 @@ mod tests {
     #[test]
     fn parse_chain_stacked_masks() {
         // 两条 mkcp-legacy 叠加：aes128gcm + srtp（对齐 Go 多 mask 链）
-        let chain = parse_finalmask_udp_chain(Some(&fm(
-            r#"{"udp":[
+        let chain = parse_finalmask_udp_chain(Some(&fm(r#"{"udp":[
                 {"type":"mkcp-legacy","settings":{"value":"pw"}},
                 {"type":"mkcp-legacy","settings":{"header":"srtp"}}
-            ]}"#,
-        )))
+            ]}"#)))
         .unwrap()
         .unwrap();
         assert_eq!(chain.len(), 2);
@@ -1780,10 +1741,8 @@ mod tests {
             .expect("tokio runtime");
         rt.block_on(async {
             use tokio::net::UdpSocket;
-            let fm: serde_json::Value = serde_json::from_str(
-                r#"{"udp":[{"type":"mkcp-legacy","settings":{}}]}"#,
-            )
-            .unwrap();
+            let fm: serde_json::Value =
+                serde_json::from_str(r#"{"udp":[{"type":"mkcp-legacy","settings":{}}]}"#).unwrap();
             let mgr = build_udpmask_manager_from_json(Some(&fm)).expect("manager");
             assert_eq!(mgr.udpmasks.len(), 1);
 
@@ -1833,8 +1792,10 @@ mod tests {
             .build()
             .expect("tokio runtime");
         rt.block_on(async {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            use tokio::net::UdpSocket;
+            use tokio::{
+                io::{AsyncReadExt, AsyncWriteExt},
+                net::UdpSocket,
+            };
             let fm: serde_json::Value = serde_json::from_str(
                 r#"{"udp":[{"type":"mkcp-legacy","settings":{"value":"hello-udp-pass"}}]}"#,
             )
@@ -1865,10 +1826,7 @@ mod tests {
                 .expect("wrap_packet_conn_client_into_connection");
             assert_eq!(client_conn.remote_addr().unwrap(), Some(server_addr));
 
-            client_conn
-                .write_all(b"client-connection-payload")
-                .await
-                .expect("client write");
+            client_conn.write_all(b"client-connection-payload").await.expect("client write");
 
             let mut read_buf = vec![0u8; 256];
             let n = tokio::time::timeout(
@@ -1894,6 +1852,7 @@ mod tests {
         async fn send_to(&self, buf: &[u8], _addr: SocketAddr) -> io::Result<usize> {
             Ok(buf.len())
         }
+
         async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
             if !self.delivered.swap(true, std::sync::atomic::Ordering::AcqRel) {
                 let n = self.packet.len().min(buf.len());
@@ -1903,6 +1862,7 @@ mod tests {
                 Err(io::Error::new(io::ErrorKind::BrokenPipe, "mock closed"))
             }
         }
+
         fn local_addr(&self) -> io::Result<SocketAddr> {
             Ok(self.addr)
         }
@@ -1924,11 +1884,9 @@ mod tests {
                 addr: "127.0.0.1:9000".parse().unwrap(),
                 delivered: std::sync::atomic::AtomicBool::new(false),
             });
-            let mut conn = wrap_packet_conn_client_into_connection(
-                udpio,
-                "127.0.0.1:9000".parse().unwrap(),
-            )
-            .expect("wrap");
+            let mut conn =
+                wrap_packet_conn_client_into_connection(udpio, "127.0.0.1:9000".parse().unwrap())
+                    .expect("wrap");
 
             // 10 字节小缓冲分 10 次读：100 字节必须全部按序到达
             let mut got = Vec::new();
@@ -1949,11 +1907,9 @@ mod tests {
 
     #[test]
     fn parse_json_noise_config_fields() {
-        let settings = fm(
-            r#"{"reset":{"from":2,"to":5},
+        let settings = fm(r#"{"reset":{"from":2,"to":5},
                 "noise":[{"rand":{"from":10,"to":20},"delay":3},
-                         {"packet":[1,2,3]}]}"#,
-        );
+                         {"packet":[1,2,3]}]}"#);
         let cfg = build_noise_config(&settings).unwrap();
         assert_eq!((cfg.reset_min, cfg.reset_max), (2, 5));
         assert_eq!(cfg.items.len(), 2);
@@ -1968,10 +1924,8 @@ mod tests {
 
     #[test]
     fn parse_json_sudoku_config_fields() {
-        let cfg = build_sudoku_config(&fm(
-            r#"{"password":"pw","ascii":"prefer_ascii",
-                "customTable":"xxppvvvv","paddingMax":80}"#,
-        ));
+        let cfg = build_sudoku_config(&fm(r#"{"password":"pw","ascii":"prefer_ascii",
+                "customTable":"xxppvvvv","paddingMax":80}"#));
         assert_eq!(cfg.password, "pw");
         assert_eq!(cfg.ascii, "prefer_ascii");
         assert_eq!(cfg.custom_table, "xxppvvvv");
@@ -2003,8 +1957,8 @@ mod tests {
 
     #[test]
     fn parse_json_xicmp_config_fields() {
-        let cfg = build_xicmp_config(&fm(r#"{"ips":["2001:db8::1","10.0.0.1"],"dgram":true}"#))
-            .unwrap();
+        let cfg =
+            build_xicmp_config(&fm(r#"{"ips":["2001:db8::1","10.0.0.1"],"dgram":true}"#)).unwrap();
         assert_eq!(cfg.ips, vec!["2001:db8::1".to_string(), "10.0.0.1".to_string()]);
         assert!(cfg.dgram);
         assert!(build_xicmp_config(&fm(r#"{"ips":["not-an-ip"]}"#)).is_err());
@@ -2036,11 +1990,9 @@ mod tests {
 
     #[test]
     fn parse_json_xmc_config_fields() {
-        let cfg = build_xmc_config(&fm(
-            r#"{"hostname":"mc.example.com","password":"mc-pass",
+        let cfg = build_xmc_config(&fm(r#"{"hostname":"mc.example.com","password":"mc-pass",
                 "profiles":[{"username":"steve_1","uuid":"069a79f4-44e9-4726-a5be-fca90e38aaf5",
-                             "texturesValue":"v","texturesSignature":"s"}]}"#,
-        ))
+                             "texturesValue":"v","texturesSignature":"s"}]}"#))
         .unwrap();
         assert_eq!(cfg.usernames, vec!["steve_1".to_string()]);
         assert_eq!(cfg.password, "mc-pass");
@@ -2061,14 +2013,12 @@ mod tests {
 
     #[test]
     fn parse_json_custom_tcp_config() {
-        let cfg = build_custom_tcp(&fm(
-            r#"{"clients":[
+        let cfg = build_custom_tcp(&fm(r#"{"clients":[
                   [{"delay":{"from":1,"to":2},"packet":[1,2],"capture":"hello"},
                    {"reuse":"hello"},
                    {"packet":"aabb","type":"hex"}]
                 ],
-                "servers":[[{"transform":{"op":"concat","args":[{"bytes":[170]}]}}]]}"#,
-        ))
+                "servers":[[{"transform":{"op":"concat","args":[{"bytes":[170]}]}}]]}"#))
         .unwrap();
         assert_eq!(cfg.clients.len(), 1);
         let seq = &cfg.clients[0].sequence;
@@ -2086,7 +2036,9 @@ mod tests {
         // 两种 kind 并存报错（对齐 Go exactly one item kind）
         assert!(build_custom_tcp(&fm(r#"{"clients":[[{"rand":1,"reuse":"v"}]]}"#)).is_err());
         // 非法变量名报错
-        assert!(build_custom_tcp(&fm(r#"{"clients":[[{"packet":[1],"capture":"9bad"}]]}"#)).is_err());
+        assert!(
+            build_custom_tcp(&fm(r#"{"clients":[[{"packet":[1],"capture":"9bad"}]]}"#)).is_err()
+        );
     }
 
     #[test]
@@ -2111,31 +2063,27 @@ mod tests {
 
     #[test]
     fn build_udpmask_entry_wires_all_types() {
-        let json = fm(
-            r#"{"udp":[
+        let json = fm(r#"{"udp":[
                 {"type":"noise","settings":{"reset":{"from":1,"to":2}}},
                 {"type":"sudoku","settings":{"password":"p"}},
                 {"type":"xdns","settings":{"resolvers":["t.example.com+udp://1.1.1.1:53"]}},
                 {"type":"xicmp","settings":{"ips":["10.0.0.1"]}},
                 {"type":"realm","settings":{"url":"realm://t@h.example.com/i","stunServers":["s.example.com:3478"]}},
                 {"type":"header-custom","settings":{"client":[]}}
-            ]}"#,
-        );
+            ]}"#);
         let mgr = build_udpmask_manager_from_json(Some(&json)).unwrap();
         assert_eq!(mgr.udpmasks.len(), 6);
     }
 
     #[test]
     fn build_tcpmask_entry_wires_all_types() {
-        let json = fm(
-            r#"{"tcp":[
+        let json = fm(r#"{"tcp":[
                 {"type":"fragment","settings":{}},
                 {"type":"sudoku","settings":{"password":"p"}},
                 {"type":"xmc","settings":{"password":"mc-pass","hostname":"h",
                     "profiles":[{"username":"steve_1","uuid":"069a79f4-44e9-4726-a5be-fca90e38aaf5","texturesValue":"v","texturesSignature":"s"}]}},
                 {"type":"header-custom","settings":{"clients":[]}}
-            ]}"#,
-        );
+            ]}"#);
         let mgr = build_tcpmask_manager_from_json(Some(&json)).unwrap();
         assert_eq!(mgr.tcpmasks.len(), 4);
     }
@@ -2161,8 +2109,10 @@ mod tests {
     /// 时，持续 poll_write 不得无界堆积，超出容量的包必须被丢弃并计数。
     #[tokio::test]
     async fn packet_io_conn_bounded_send_queue_drops_when_send_to_blocked() {
-        use std::sync::atomic::AtomicUsize;
-        use std::task::{Context, Poll, Waker};
+        use std::{
+            sync::atomic::AtomicUsize,
+            task::{Context, Poll, Waker},
+        };
 
         struct BlockedUdpIo {
             received: Arc<AtomicUsize>,
@@ -2174,9 +2124,11 @@ mod tests {
                 // 模拟对端黑洞：worker 卡死在首个 send_to 上，队列因此填满
                 std::future::pending::<io::Result<usize>>().await
             }
+
             async fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
                 std::future::pending().await
             }
+
             fn local_addr(&self) -> io::Result<SocketAddr> {
                 Ok("127.0.0.1:0".parse().unwrap())
             }

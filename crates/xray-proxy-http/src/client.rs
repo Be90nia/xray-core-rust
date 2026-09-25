@@ -10,13 +10,12 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use xray_app_dispatcher::default::DialFn;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-use xray_transport::connection::Connection;
-use xray_transport::dialer::{dial, StreamSettings};
-use xray_transport::sockopt::SocketOptions;
+use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
+use xray_transport::{
+    connection::Connection,
+    dialer::{StreamSettings, dial},
+    sockopt::SocketOptions,
+};
 
 use crate::config::Account;
 /// HTTP outbound 配置。
@@ -39,13 +38,7 @@ impl HttpOutboundConfig {
     /// 构造配置（无认证，raw TCP）。
     #[must_use]
     pub fn new(server_address: Address, server_port: Port) -> Self {
-        Self {
-            server_address,
-            server_port,
-            auth: None,
-            stream_settings: None,
-            headers: Vec::new(),
-        }
+        Self { server_address, server_port, auth: None, stream_settings: None, headers: Vec::new() }
     }
 
     /// 设置认证（builder 风格）。
@@ -72,16 +65,15 @@ impl HttpOutboundConfig {
 
 /// 解析 HTTP outbound settings JSON → HttpOutboundConfig。
 ///
-/// JSON 格式：`{ "servers": [{ "address": "...", "port": 8080, "users": [{ "user": "u", "pass": "p" }] }] }`
+/// JSON 格式：`{ "servers": [{ "address": "...", "port": 8080, "users": [{ "user": "u", "pass": "p"
+/// }] }] }`
 pub fn parse_http_config(data: &[u8]) -> Result<HttpOutboundConfig, String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
     let servers = v
         .get("servers")
         .and_then(|v| v.as_array())
         .ok_or_else(|| "missing servers array".to_string())?;
-    let first = servers
-        .first()
-        .ok_or_else(|| "servers array is empty".to_string())?;
+    let first = servers.first().ok_or_else(|| "servers array is empty".to_string())?;
     let address = first
         .get("address")
         .and_then(|v| v.as_str())
@@ -92,19 +84,13 @@ pub fn parse_http_config(data: &[u8]) -> Result<HttpOutboundConfig, String> {
         .ok_or_else(|| "missing servers[0].port".to_string())?;
     let port = u16::try_from(port).map_err(|_| "port out of range")?;
     // users[0] 可选
-    let auth = first
-        .get("users")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|u| {
+    let auth =
+        first.get("users").and_then(|v| v.as_array()).and_then(|arr| arr.first()).and_then(|u| {
             let user = u.get("user")?.as_str()?.to_string();
             let pass = u.get("pass")?.as_str()?.to_string();
             Some(Account::new(user, pass))
         });
-    let mut config = HttpOutboundConfig::new(
-        Address::Domain(address.to_string()),
-        Port::new(port),
-    );
+    let mut config = HttpOutboundConfig::new(Address::Domain(address.to_string()), Port::new(port));
     if let Some(a) = auth {
         config = config.with_auth(a);
     }
@@ -138,22 +124,19 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
         let target_port = dest.port().value();
         Box::pin(async move {
             // 拨号到上游 HTTP 代理
-            use xray_common::net::address::Address;
-            use xray_common::net::destination::Destination;
-            use xray_common::net::network::Network;
-            use xray_common::net::port::Port;
+            use xray_common::net::{
+                address::Address, destination::Destination, network::Network, port::Port,
+            };
             let server_addr = match &config.server_address {
                 Address::Domain(d) => d.clone(),
                 Address::IPv4(ip) => ip.to_string(),
                 Address::IPv6(ip) => ip.to_string(),
             };
             let server_port = config.server_port.value();
-            let server_dest = Destination::new(
-                config.server_address.clone(),
-                config.server_port,
-                Network::TCP,
-            );
-            let sockopt = config.stream_settings.as_ref().map(|s| s.socket_options()).unwrap_or_default();
+            let server_dest =
+                Destination::new(config.server_address.clone(), config.server_port, Network::TCP);
+            let sockopt =
+                config.stream_settings.as_ref().map(|s| s.socket_options()).unwrap_or_default();
             let mut conn: Box<dyn Connection> = match &config.stream_settings {
                 Some(s) => dial(&server_dest, s, &sockopt)
                     .await
@@ -163,7 +146,6 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
                     .map_err(|e| format!("http dial proxy (tcp): {e}"))?,
             };
             drop(server_addr);
-
 
             // 2. 构造 CONNECT 请求
             let host_port = format!("{target_host}:{target_port}");
@@ -192,9 +174,7 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
             conn.write_all(request.as_bytes())
                 .await
                 .map_err(|e| format!("http write CONNECT: {e}"))?;
-            conn.flush()
-                .await
-                .map_err(|e| format!("http flush CONNECT: {e}"))?;
+            conn.flush().await.map_err(|e| format!("http flush CONNECT: {e}"))?;
 
             // 4. 读响应头（直到空行 `\r\n\r\n`）
             let mut buf = vec![0u8; 4096];
@@ -213,7 +193,7 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
                             "http CONNECT proxy read response header failed"
                         );
                         return Err(format!("http read response: {e}"));
-                    }
+                    },
                 };
                 if n == 0 {
                     // z9n4：代理在响应前 EOF（连接 reset / 401 challenge 等场景）。
@@ -228,7 +208,11 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
                 total += n;
                 // 检查是否收到完整响应头（`\r\n\r\n`）
                 for i in 0..total.saturating_sub(3) {
-                    if buf[i] == b'\r' && buf[i + 1] == b'\n' && buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
+                    if buf[i] == b'\r'
+                        && buf[i + 1] == b'\n'
+                        && buf[i + 2] == b'\r'
+                        && buf[i + 3] == b'\n'
+                    {
                         found_end = true;
                         break;
                     }
@@ -240,10 +224,8 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
                 .position(|w| w == b"\r\n\r\n")
                 .map(|p| p + 4)
                 .unwrap_or(total);
-            let first_line_end = buf[..header_end]
-                .iter()
-                .position(|&b| b == b'\r')
-                .unwrap_or(header_end);
+            let first_line_end =
+                buf[..header_end].iter().position(|&b| b == b'\r').unwrap_or(header_end);
             let first_line = std::str::from_utf8(&buf[..first_line_end])
                 .map_err(|e| format!("http response not UTF-8: {e}"))?;
             // 6a5v：状态码必须**严格等于 200**（第二字段），而非 contains("200")。
@@ -293,20 +275,17 @@ mod tests {
 
     #[test]
     fn config_construction() {
-        let cfg = HttpOutboundConfig::new(
-            Address::new_domain("proxy.example.com"),
-            Port::new(8080),
-        );
+        let cfg =
+            HttpOutboundConfig::new(Address::new_domain("proxy.example.com"), Port::new(8080));
         assert_eq!(cfg.server_port.value(), 8080);
         assert!(cfg.auth.is_none());
     }
 
     #[test]
     fn config_with_auth() {
-        let cfg = HttpOutboundConfig::new(
-            Address::new_domain("proxy.example.com"),
-            Port::new(8080),
-        ).with_auth(Account::new("user", "pass"));
+        let cfg =
+            HttpOutboundConfig::new(Address::new_domain("proxy.example.com"), Port::new(8080))
+                .with_auth(Account::new("user", "pass"));
         assert!(cfg.auth.is_some());
         assert_eq!(cfg.auth.as_ref().map(|a| &a.username), Some(&"user".to_string()));
     }
@@ -383,9 +362,7 @@ mod tests {
                     break;
                 }
             }
-            sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
-                .await
-                .unwrap();
+            sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
             String::from_utf8(req).unwrap()
         });
 

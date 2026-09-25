@@ -26,20 +26,25 @@ pub mod handler;
 pub mod meta;
 pub mod session;
 
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
+
 pub use meta::RequestMetaInfo;
 pub use session::{HttpSession, SessionMap};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpListener as TokioTcpListener,
+};
 
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpListener as TokioTcpListener;
-
-use crate::config::Config;
-use crate::error::{Result, SplitHttpError};
+use crate::{
+    config::Config,
+    error::{Result, SplitHttpError},
+};
 
 /// 服务端连接：reader（上行数据）+ writer（下行数据）+ 地址元数据。
 ///
@@ -70,8 +75,7 @@ impl ServerConnCloseSignal {
 
     /// 触发关闭（幂等）：唤醒所有等待中的 poll_read。
     pub fn close(&self) {
-        self.flag
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.flag.store(true, std::sync::atomic::Ordering::Release);
         self.notify.notify_waiters();
     }
 
@@ -160,9 +164,8 @@ impl HubListener {
         let tcp_listener = TokioTcpListener::bind(addr)
             .await
             .map_err(|e| SplitHttpError::ListenFailed(e.to_string()))?;
-        let local_addr = tcp_listener
-            .local_addr()
-            .map_err(|e| SplitHttpError::ListenFailed(e.to_string()))?;
+        let local_addr =
+            tcp_listener.local_addr().map_err(|e| SplitHttpError::ListenFailed(e.to_string()))?;
         Ok(Self {
             config,
             tcp_listener,
@@ -190,10 +193,7 @@ impl HubListener {
             sessions: Arc::clone(&self.sessions),
             conn_handler: Arc::clone(&self.conn_handler),
             max_buffered_posts: self.config.normalized_sc_max_buffered_posts() as usize,
-            sc_max_each_post_bytes: self
-                .config
-                .normalized_sc_max_each_post_bytes()
-                .to as usize,
+            sc_max_each_post_bytes: self.config.normalized_sc_max_each_post_bytes().to as usize,
         });
         loop {
             let (stream, peer_addr) = match self.tcp_listener.accept().await {
@@ -213,7 +213,9 @@ impl HubListener {
                     }
                 });
                 // 自动协商 H1/H2：H2 preface 检测，回退到 H1
-                let builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+                let builder = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                );
                 let _ = builder.serve_connection(io, svc).await;
             });
         }

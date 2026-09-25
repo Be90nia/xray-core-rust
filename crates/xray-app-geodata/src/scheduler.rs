@@ -7,13 +7,19 @@
 //! ponytail: 不引入 `tokio-cron-scheduler` / `cron` crate。
 //! ponytail: cron 最小粒度 1 分钟（对齐 Go robfig/cron 5-field 默认）。
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
-use crate::error::GeodataError;
-use crate::instance::{ScheduleHandle, Scheduler};
+use crate::{
+    error::GeodataError,
+    instance::{ScheduleHandle, Scheduler},
+};
 
 /// Cron 调度器实例。
 ///
@@ -42,9 +48,7 @@ impl CronScheduler {
             }
             t += Duration::from_secs(60);
         }
-        Err(GeodataError::InvalidCron(format!(
-            "{expr}: no fire within 1 year"
-        )))
+        Err(GeodataError::InvalidCron(format!("{expr}: no fire within 1 year")))
     }
 
     /// 校验 cron 表达式（只解析，不计算触发时间）。
@@ -115,10 +119,7 @@ impl CronScheduler {
             }
         });
 
-        Ok(TestScheduleHandle {
-            cancelled,
-            callback: cb,
-        })
+        Ok(TestScheduleHandle { cancelled, callback: cb })
     }
 }
 
@@ -176,9 +177,7 @@ fn compute_next_fire(sched: &CronSchedule) -> Result<Duration, GeodataError> {
         }
         t += Duration::from_secs(60);
     }
-    Err(GeodataError::InvalidCron(
-        "no fire within 1 year".into(),
-    ))
+    Err(GeodataError::InvalidCron("no fire within 1 year".into()))
 }
 
 fn current_minute_floor() -> SystemTime {
@@ -244,10 +243,7 @@ struct Field {
 
 impl Field {
     fn new(lo: u32, hi: u32) -> Self {
-        Self {
-            lo,
-            values: vec![false; (hi - lo + 1) as usize],
-        }
+        Self { lo, values: vec![false; (hi - lo + 1) as usize] }
     }
 
     fn index(&self, v: u32) -> Option<usize> {
@@ -281,10 +277,7 @@ fn parse_cron(expr: &str) -> Result<CronSchedule, GeodataError> {
     }
     let parts: Vec<&str> = expr.split_whitespace().collect();
     if parts.len() != 5 {
-        return Err(GeodataError::InvalidCron(format!(
-            "expected 5 fields, got {}",
-            parts.len()
-        )));
+        return Err(GeodataError::InvalidCron(format!("expected 5 fields, got {}", parts.len())));
     }
 
     let minute = parse_field(parts[0], 0, 59)?;
@@ -293,13 +286,7 @@ fn parse_cron(expr: &str) -> Result<CronSchedule, GeodataError> {
     let month = parse_field(parts[3], 1, 12)?;
     let weekday = parse_field(parts[4], 0, 6)?;
 
-    Ok(CronSchedule {
-        minute,
-        hour,
-        day,
-        month,
-        weekday,
-    })
+    Ok(CronSchedule { minute, hour, day, month, weekday })
 }
 
 fn parse_field(s: &str, lo: u32, hi: u32) -> Result<Field, GeodataError> {
@@ -339,9 +326,7 @@ fn parse_field(s: &str, lo: u32, hi: u32) -> Result<Field, GeodataError> {
                     .parse()
                     .map_err(|_| GeodataError::InvalidCron(format!("bad range end: {b_s}")))?;
                 if a < lo || b > hi || a > b {
-                    return Err(GeodataError::InvalidCron(format!(
-                        "bad range {a}-{b}"
-                    )));
+                    return Err(GeodataError::InvalidCron(format!("bad range {a}-{b}")));
                 }
                 for v in a..=b {
                     field.set(v);

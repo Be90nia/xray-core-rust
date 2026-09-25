@@ -82,11 +82,7 @@ impl DnsError {
     /// `uint16(err) == 0` 区分（见 `app/dns/hosts.go:84`）。
     #[must_use]
     pub fn from_rcode(rcode: u16) -> Self {
-        if rcode == 0 {
-            Self::EmptyResponse
-        } else {
-            Self::RCodeError(rcode)
-        }
+        if rcode == 0 { Self::EmptyResponse } else { Self::RCodeError(rcode) }
     }
 }
 
@@ -95,11 +91,7 @@ impl DnsError {
     /// 返回错误携带的 RCode（仅 `RCodeError` 变体返回 `Some`）。
     #[must_use]
     pub fn rcode(&self) -> Option<u16> {
-        if let Self::RCodeError(code) = self {
-            Some(*code)
-        } else {
-            None
-        }
+        if let Self::RCodeError(code) = self { Some(*code) } else { None }
     }
 }
 
@@ -131,7 +123,7 @@ mod tests {
     #[test]
     fn from_rcode_nonzero_is_rcode_error() {
         match DnsError::from_rcode(3) {
-            DnsError::RCodeError(3) => {}
+            DnsError::RCodeError(3) => {},
             other => panic!("expected RCodeError(3), got {other:?}"),
         }
     }
@@ -154,10 +146,7 @@ mod tests {
     fn display_messages_match_go_style() {
         assert_eq!(DnsError::RecordNotFound.to_string(), "record not found");
         assert_eq!(DnsError::EmptyResponse.to_string(), "empty response");
-        assert_eq!(
-            DnsError::InvalidQueryStrategy(99).to_string(),
-            "unexpected query strategy: 99"
-        );
+        assert_eq!(DnsError::InvalidQueryStrategy(99).to_string(), "unexpected query strategy: 99");
         assert_eq!(
             DnsError::InvalidClientIpLength(7).to_string(),
             "unexpected client ip length: 7"

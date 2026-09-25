@@ -17,13 +17,10 @@
 use std::sync::{Arc, Mutex};
 
 use super::{
-    DomainMatcher as DomainMatcherImpl, FullMatcher, Matcher,
-    MatcherGroup, MatcherSet, MatcherType,
+    DomainMatcher as DomainMatcherImpl, FullMatcher, Matcher, MatcherError, MatcherGroup,
+    MatcherSet, MatcherType,
+    matcher_groups::{MPHMatcherGroup, SimpleMatcherGroup},
 };
-use super::matcher_groups::{
-    MPHMatcherGroup, SimpleMatcherGroup,
-};
-use super::MatcherError;
 use crate::weak_cache::WeakCacheMap;
 
 /// 域名规则类型。
@@ -102,11 +99,7 @@ impl DomainRule {
     /// 创建新的域名规则。
     #[must_use]
     pub fn new(domain_type: DomainType, value: impl Into<String>, rule_id: u32) -> Self {
-        Self {
-            domain_type,
-            value: value.into(),
-            rule_id,
-        }
+        Self { domain_type, value: value.into(), rule_id }
     }
 
     /// 创建精确全匹配规则。
@@ -155,25 +148,13 @@ impl std::fmt::Display for DomainRule {
 /// - 正则表达式编译失败时返回 `MatcherError::RegexCompile`
 pub fn parse_domain(rule: &DomainRule) -> Result<Box<dyn Matcher>, MatcherError> {
     match rule.domain_type {
-        DomainType::Full => {
-            Ok(Box::new(FullMatcher::new(
-                rule.value.to_lowercase(),
-            )))
-        }
-        DomainType::Domain => {
-            Ok(Box::new(DomainMatcherImpl::new(
-                rule.value.to_lowercase(),
-            )))
-        }
-        DomainType::Substr => {
-            Ok(Box::new(super::SubstrMatcher::new(
-                rule.value.to_lowercase(),
-            )))
-        }
+        DomainType::Full => Ok(Box::new(FullMatcher::new(rule.value.to_lowercase()))),
+        DomainType::Domain => Ok(Box::new(DomainMatcherImpl::new(rule.value.to_lowercase()))),
+        DomainType::Substr => Ok(Box::new(super::SubstrMatcher::new(rule.value.to_lowercase()))),
         DomainType::Regex => {
             let matcher = super::RegexMatcher::new(&rule.value)?;
             Ok(Box::new(matcher))
-        }
+        },
     }
 }
 
@@ -226,27 +207,19 @@ impl MphDomainMatcher {
         for rule in rules {
             match rule.domain_type {
                 DomainType::Full => {
-                    mph.add_full_matcher(
-                        &rule.value.to_lowercase(),
-                        rule.rule_id,
-                    );
-                }
+                    mph.add_full_matcher(&rule.value.to_lowercase(), rule.rule_id);
+                },
                 DomainType::Domain => {
-                    mph.add_domain_matcher(
-                        &rule.value.to_lowercase(),
-                        rule.rule_id,
-                    );
-                }
+                    mph.add_domain_matcher(&rule.value.to_lowercase(), rule.rule_id);
+                },
                 DomainType::Substr => {
-                    let matcher = super::SubstrMatcher::new(
-                        rule.value.to_lowercase(),
-                    );
+                    let matcher = super::SubstrMatcher::new(rule.value.to_lowercase());
                     simple.add(Box::new(matcher), rule.rule_id);
-                }
+                },
                 DomainType::Regex => {
                     let matcher = super::RegexMatcher::new(&rule.value)?;
                     simple.add(Box::new(matcher), rule.rule_id);
-                }
+                },
             }
         }
 
@@ -272,9 +245,7 @@ impl DomainMatcher for MphDomainMatcher {
 
 impl std::fmt::Debug for MphDomainMatcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MphDomainMatcher")
-            .field("mph_built", &self.mph.is_built())
-            .finish()
+        f.debug_struct("MphDomainMatcher").field("mph_built", &self.mph.is_built()).finish()
     }
 }
 
@@ -310,11 +281,7 @@ impl CompactDomainMatcher {
         matchers: Vec<Box<dyn MatcherSet>>,
         values: Vec<u32>,
     ) -> Self {
-        Self {
-            custom,
-            matchers,
-            values,
-        }
+        Self { custom, matchers, values }
     }
 
     /// 返回 geosite 关联的值列表。
@@ -361,10 +328,7 @@ impl std::fmt::Debug for CompactDomainMatcher {
 /// 对应 Go 版本 `DomainMatcherFactory`，根据规则列表构建匹配器。
 pub trait DomainMatcherFactory: Send + Sync {
     /// 构建域名匹配器。
-    fn build_matcher(
-        &self,
-        rules: &[DomainRule],
-    ) -> Result<Box<dyn DomainMatcher>, MatcherError>;
+    fn build_matcher(&self, rules: &[DomainRule]) -> Result<Box<dyn DomainMatcher>, MatcherError>;
 }
 
 // ===== MphDomainMatcherFactory =====
@@ -400,22 +364,16 @@ impl Default for MphDomainMatcherFactory {
 
 impl std::fmt::Debug for MphDomainMatcherFactory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MphDomainMatcherFactory")
-            .field("cached", &self.shared.len())
-            .finish()
+        f.debug_struct("MphDomainMatcherFactory").field("cached", &self.shared.len()).finish()
     }
 }
 
 impl DomainMatcherFactory for MphDomainMatcherFactory {
-    fn build_matcher(
-        &self,
-        rules: &[DomainRule],
-    ) -> Result<Box<dyn DomainMatcher>, MatcherError> {
+    fn build_matcher(&self, rules: &[DomainRule]) -> Result<Box<dyn DomainMatcher>, MatcherError> {
         let key = build_domain_rules_key(rules);
         // 先构造 matcher（可能失败），再包装成 Arc 存入缓存。
         let matcher = MphDomainMatcher::build(rules)?;
-        let arc: Arc<MphDomainMatcher> =
-            self.shared.get_or_insert_with(key, || Arc::new(matcher));
+        let arc: Arc<MphDomainMatcher> = self.shared.get_or_insert_with(key, || Arc::new(matcher));
         Ok(Box::new(ArcCloneMatcher(arc)))
     }
 }
@@ -450,17 +408,12 @@ impl Default for CompactDomainMatcherFactory {
 
 impl std::fmt::Debug for CompactDomainMatcherFactory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CompactDomainMatcherFactory")
-            .field("cached", &self.shared.len())
-            .finish()
+        f.debug_struct("CompactDomainMatcherFactory").field("cached", &self.shared.len()).finish()
     }
 }
 
 impl DomainMatcherFactory for CompactDomainMatcherFactory {
-    fn build_matcher(
-        &self,
-        rules: &[DomainRule],
-    ) -> Result<Box<dyn DomainMatcher>, MatcherError> {
+    fn build_matcher(&self, rules: &[DomainRule]) -> Result<Box<dyn DomainMatcher>, MatcherError> {
         let key = build_domain_rules_key(rules);
         // 闭包不能直接用 `?`（返回类型固定 Arc），先构造再插入。
         let matcher = build_compact_inner(rules)?;
@@ -501,10 +454,7 @@ impl DynamicDomainMatcher {
     /// 创建新的动态域名匹配器。
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            state: std::sync::RwLock::new(None),
-            rules: Mutex::new(Vec::new()),
-        }
+        Self { state: std::sync::RwLock::new(None), rules: Mutex::new(Vec::new()) }
     }
 
     /// 设置规则并重建匹配器。
@@ -552,9 +502,7 @@ impl DomainMatcher for DynamicDomainMatcher {
 impl std::fmt::Debug for DynamicDomainMatcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let has_state = self.state.read().unwrap().is_some();
-        f.debug_struct("DynamicDomainMatcher")
-            .field("has_state", &has_state)
-            .finish()
+        f.debug_struct("DynamicDomainMatcher").field("has_state", &has_state).finish()
     }
 }
 
@@ -571,10 +519,7 @@ pub struct DomainRegistry {
 impl DomainRegistry {
     /// 创建新的域名匹配器注册表。
     pub fn new(factory: Box<dyn DomainMatcherFactory>) -> Self {
-        Self {
-            factory,
-            matchers: Mutex::new(Vec::new()),
-        }
+        Self { factory, matchers: Mutex::new(Vec::new()) }
     }
 
     /// 添加规则并创建新的动态匹配器。
@@ -596,10 +541,7 @@ impl DomainRegistry {
         let guard = self.matchers.lock().unwrap();
         if idx < guard.len() {
             drop(guard);
-            Some(DomainRegistryGuard {
-                registry: self,
-                index: idx,
-            })
+            Some(DomainRegistryGuard { registry: self, index: idx })
         } else {
             None
         }
@@ -620,10 +562,7 @@ impl DomainRegistry {
     /// 用新规则重建所有匹配器（原子热切换）。
     ///
     /// 对应 Go `DomainRegistry.Reload`：每个 entry 用 new_rules 重建。
-    pub fn reload_with(
-        &self,
-        new_rules: Vec<DomainRule>,
-    ) -> Result<(), MatcherError> {
+    pub fn reload_with(&self, new_rules: Vec<DomainRule>) -> Result<(), MatcherError> {
         let factory = self.factory.as_ref();
         // 拷出 matcher 引用，避免长持锁。
         let matchers: Vec<Arc<DynamicDomainMatcher>> = {
@@ -638,13 +577,9 @@ impl DomainRegistry {
     }
 }
 
-
-
 impl std::fmt::Debug for DomainRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DomainRegistry")
-            .field("matcher_count", &self.len())
-            .finish()
+        f.debug_struct("DomainRegistry").field("matcher_count", &self.len()).finish()
     }
 }
 
@@ -668,7 +603,6 @@ impl<'a> DomainRegistryGuard<'a> {
         let guard = self.registry.matchers.lock().unwrap();
         guard[self.index].match_any(input)
     }
-
 }
 
 /// 全局域名注册表实例。
@@ -676,9 +610,7 @@ impl<'a> DomainRegistryGuard<'a> {
 /// 对应 Go `commongeodata.DomainReg`。Routing 层在 reload 时通过此处
 /// 触达所有已注册的域名 matcher。如需 per-instance registry，优先本地 `new()`。
 pub static DOMAIN_REG: std::sync::LazyLock<DomainRegistry> =
-    std::sync::LazyLock::new(|| {
-        DomainRegistry::new(Box::new(MphDomainMatcherFactory::new()))
-    });
+    std::sync::LazyLock::new(|| DomainRegistry::new(Box::new(MphDomainMatcherFactory::new())));
 // ===== 工厂辅助：WeakCacheMap 缓存键 + Arc→Box 包装 =====
 
 /// 由 [`DomainRule`] 列表派生稳定的字符串缓存键。
@@ -721,6 +653,7 @@ impl<T: DomainMatcher + Send + Sync + 'static> DomainMatcher for ArcCloneMatcher
     fn match_domain(&self, input: &str) -> Vec<u32> {
         self.0.match_domain(input)
     }
+
     fn match_any(&self, input: &str) -> bool {
         self.0.match_any(input)
     }
@@ -880,19 +813,11 @@ mod tests {
         struct TestValueMatcher;
         impl ValueMatcher for TestValueMatcher {
             fn match_str(&self, input: &str) -> Vec<u32> {
-                if input == "example.com" {
-                    vec![1]
-                } else {
-                    vec![]
-                }
+                if input == "example.com" { vec![1] } else { vec![] }
             }
         }
 
-        let matcher = CompactDomainMatcher::new(
-            Box::new(TestValueMatcher),
-            vec![],
-            vec![],
-        );
+        let matcher = CompactDomainMatcher::new(Box::new(TestValueMatcher), vec![], vec![]);
         assert_eq!(matcher.match_domain("example.com"), vec![1u32]);
         assert!(matcher.match_any("example.com"));
         assert!(!matcher.match_any("other.com"));
@@ -930,10 +855,7 @@ mod tests {
     #[test]
     fn test_mph_factory_build() {
         let factory = MphDomainMatcherFactory::new();
-        let rules = vec![
-            DomainRule::full("example.com", 1),
-            DomainRule::domain("test.org", 2),
-        ];
+        let rules = vec![DomainRule::full("example.com", 1), DomainRule::domain("test.org", 2)];
         let matcher = factory.build_matcher(&rules).unwrap();
         assert!(matcher.match_any("example.com"));
         assert!(matcher.match_any("sub.test.org"));
@@ -942,10 +864,7 @@ mod tests {
     #[test]
     fn test_compact_factory_build() {
         let factory = CompactDomainMatcherFactory::new();
-        let rules = vec![
-            DomainRule::full("example.com", 1),
-            DomainRule::domain("test.org", 2),
-        ];
+        let rules = vec![DomainRule::full("example.com", 1), DomainRule::domain("test.org", 2)];
         let matcher = factory.build_matcher(&rules).unwrap();
         assert!(matcher.match_any("example.com"));
         assert!(matcher.match_any("sub.test.org"));
@@ -973,9 +892,7 @@ mod tests {
     #[test]
     fn test_dynamic_matcher_update() {
         let dm = DynamicDomainMatcher::new();
-        let matcher = MphDomainMatcher::build(&[
-            DomainRule::domain("test.org", 5),
-        ]).unwrap();
+        let matcher = MphDomainMatcher::build(&[DomainRule::domain("test.org", 5)]).unwrap();
         dm.update(Box::new(matcher));
         assert!(dm.match_any("sub.test.org"));
         assert_eq!(dm.match_domain("sub.test.org"), vec![5u32]);
@@ -986,9 +903,7 @@ mod tests {
     #[test]
     fn test_domain_registry_add_and_match() {
         let registry = DomainRegistry::new(Box::new(MphDomainMatcherFactory::new()));
-        let _idx = registry.add_rules(vec![
-            DomainRule::full("example.com", 1),
-        ]).unwrap();
+        let _idx = registry.add_rules(vec![DomainRule::full("example.com", 1)]).unwrap();
         assert_eq!(registry.len(), 1);
 
         let guard = registry.get_matcher(0).unwrap();

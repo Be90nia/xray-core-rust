@@ -14,26 +14,25 @@
 //! 替换 `tls_acceptor.accept(tcp)` 为 `reality::u_client(tcp, state)` 即可。
 //! 架构路径（hyper h2 handshake）与普通 TLS 完全一致。
 
-use tokio::io::AsyncReadExt;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use http_body_util::Full;
-use hyper::body::Incoming;
-use hyper::server::conn::http2;
-use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode};
+use hyper::{
+    Request, Response, StatusCode, body::Incoming, server::conn::http2, service::service_fn,
+};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
-use tokio::net::TcpListener;
+use tokio::{io::AsyncReadExt, net::TcpListener};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
-
-use xray_transport_splithttp::config::Config;
-use xray_transport_splithttp::dialer::{build_request_url, dial_reality_stream_one};
+use xray_transport_splithttp::{
+    config::Config,
+    dialer::{build_request_url, dial_reality_stream_one},
+};
 
 fn make_self_signed_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
-    let params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("rcgen params");
+    let params =
+        rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("rcgen params");
     let key_pair = rcgen::KeyPair::generate().expect("rcgen keypair");
     let cert = params.self_signed(&key_pair).expect("rcgen self_signed");
     let cert_der = CertificateDer::from(cert.der().to_vec());
@@ -41,7 +40,10 @@ fn make_self_signed_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>) 
     (cert_der, key_der)
 }
 
-fn make_server_tls(cert: CertificateDer<'static>, key: PrivateKeyDer<'static>) -> rustls::ServerConfig {
+fn make_server_tls(
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+) -> rustls::ServerConfig {
     let mut cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)
@@ -53,18 +55,14 @@ fn make_server_tls(cert: CertificateDer<'static>, key: PrivateKeyDer<'static>) -
 fn make_client_tls(cert: CertificateDer<'static>) -> rustls::ClientConfig {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert).expect("add cert");
-    let mut cfg = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let mut cfg =
+        rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
     cfg.alpn_protocols = vec![b"h2".to_vec()];
     cfg
 }
 
 /// Echo h2 server：POST body 内容回写为响应。
-async fn echo_h2_server(
-    listener: TcpListener,
-    tls_acceptor: TlsAcceptor,
-) {
+async fn echo_h2_server(listener: TcpListener, tls_acceptor: TlsAcceptor) {
     loop {
         let (tcp, _) = match listener.accept().await {
             Ok(c) => c,
@@ -87,19 +85,18 @@ async fn echo_h2_server(
                         .unwrap(),
                 )
             });
-            let _ = http2::Builder::new(TokioExecutor::new())
-                .serve_connection(io, svc)
-                .await;
+            let _ = http2::Builder::new(TokioExecutor::new()).serve_connection(io, svc).await;
         });
     }
 }
-
 
 #[tokio::test]
 async fn dial_reality_stream_one_via_direct_h2_handshake() {
     // 确保 rustls CryptoProvider 在并行测试中只初始化一次
     static CRYPTO_ONCE: std::sync::Once = std::sync::Once::new();
-    CRYPTO_ONCE.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+    CRYPTO_ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 
     // 1. 自签证书 + h2 server
     let (cert_der, key_der) = make_self_signed_cert();
@@ -113,16 +110,11 @@ async fn dial_reality_stream_one_via_direct_h2_handshake() {
     // 2. 客户端 TCP + TLS
     let client_tls = make_client_tls(cert_der);
     let connector = TlsConnector::from(Arc::new(client_tls));
-    let tcp = tokio::net::TcpStream::connect(server_addr)
-        .await
-        .expect("tcp connect");
+    let tcp = tokio::net::TcpStream::connect(server_addr).await.expect("tcp connect");
     let local_addr = tcp.local_addr().expect("local addr");
-    let server_name = rustls_pki_types::ServerName::try_from("127.0.0.1".to_string())
-        .expect("server name");
-    let tls_stream = connector
-        .connect(server_name, tcp)
-        .await
-        .expect("tls handshake");
+    let server_name =
+        rustls_pki_types::ServerName::try_from("127.0.0.1".to_string()).expect("server name");
+    let tls_stream = connector.connect(server_name, tcp).await.expect("tls handshake");
 
     // 3. dial_reality_stream_one
     let config = Arc::new(Config {

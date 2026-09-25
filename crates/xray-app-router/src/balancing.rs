@@ -9,8 +9,10 @@
 //! - 当前 stub 返回 `Err(NotHandlerSelector)` / `Err(ObservationUnavailable)`，
 //!   上层接入时提供真实实现。
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU32, Ordering},
+};
 
 use parking_lot::RwLock;
 use xray_proto::xray::core::app::observatory::ObservationResult;
@@ -105,12 +107,7 @@ impl RoundRobinStrategy {
         ohm: Arc<dyn OutboundHandlerSelector>,
         observer: Option<Arc<dyn ObservationProvider>>,
     ) -> Self {
-        Self {
-            selectors,
-            ohm,
-            observer,
-            index: AtomicU32::new(0),
-        }
+        Self { selectors, ohm, observer, index: AtomicU32::new(0) }
     }
 
     /// 过滤出 alive 出站。
@@ -138,7 +135,7 @@ impl RoundRobinStrategy {
                     .iter()
                     .find(|s| s.outbound_tag == ***t)
                     .map(|s| s.alive) // 找到 → 按 alive 判定
-                    .unwrap_or(true)  // 未找到 → alive（Go 默认）
+                    .unwrap_or(true) // 未找到 → alive（Go 默认）
             })
             .cloned()
             .collect();
@@ -237,7 +234,7 @@ impl Balancer {
                     tracing::warn!(fallback = %self.fallback_tag, "balancer fallback");
                     Ok(self.fallback_tag.clone())
                 }
-            }
+            },
         }
     }
 
@@ -290,9 +287,7 @@ impl SimpleSelector {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        Self {
-            tags: RwLock::new(iter.into_iter().map(Into::into).collect()),
-        }
+        Self { tags: RwLock::new(iter.into_iter().map(Into::into).collect()) }
     }
 
     /// 运行时添加 tag。
@@ -337,10 +332,7 @@ impl MemoryObservationProvider {
 
 impl ObservationProvider for MemoryObservationProvider {
     fn get_observation(&self) -> Result<ObservationResult, RouterError> {
-        self.result
-            .read()
-            .clone()
-            .ok_or(RouterError::Other("no observation available".into()))
+        self.result.read().clone().ok_or(RouterError::Other("no observation available".into()))
     }
 }
 
@@ -463,12 +455,8 @@ mod tests {
 
     #[test]
     fn test_balancer_empty_no_fallback_errors() {
-        let b = Balancer::new(
-            vec![],
-            Arc::new(EmptyStrategy),
-            Arc::new(NotImplementedSelector),
-            "",
-        );
+        let b =
+            Balancer::new(vec![], Arc::new(EmptyStrategy), Arc::new(NotImplementedSelector), "");
         assert!(matches!(b.pick_outbound(), Err(RouterError::EmptyBalancerResult)));
     }
 
@@ -506,14 +494,13 @@ mod tests {
     #[test]
     fn test_roundrobin_unfound_candidate_considered_alive() {
         use xray_proto::xray::core::app::observatory::{ObservationResult, OutboundStatus};
+
         use crate::balancing::ObservationProvider;
 
         struct ObsWithTag(Option<OutboundStatus>);
         impl ObservationProvider for ObsWithTag {
             fn get_observation(&self) -> Result<ObservationResult, RouterError> {
-                Ok(ObservationResult {
-                    status: self.0.clone().into_iter().collect(),
-                })
+                Ok(ObservationResult { status: self.0.clone().into_iter().collect() })
             }
         }
 
@@ -531,16 +518,11 @@ mod tests {
             Arc::new(SimpleSelector::from_tags(["proxy-a", "proxy-b"]));
         // 用 select_outbounds 实际能匹配上的前缀（SimpleSelector 用 contains
         // 完全等值匹配，所以 selectors 必须是完整的 tag 字符串）。
-        let s = RoundRobinStrategy::new(
-            vec!["proxy-a".into(), "proxy-b".into()],
-            ohm,
-            Some(obs),
-        );
+        let s = RoundRobinStrategy::new(vec!["proxy-a".into(), "proxy-b".into()], ohm, Some(obs));
         // 两次 pick 都应拿到 alive 候选（包括 "proxy-b"），不能掉。
         let r1 = s.pick_outbound().unwrap();
         let r2 = s.pick_outbound().unwrap();
         assert!(r1 == "proxy-a" || r1 == "proxy-b");
         assert!(r2 == "proxy-a" || r2 == "proxy-b");
     }
-
 }

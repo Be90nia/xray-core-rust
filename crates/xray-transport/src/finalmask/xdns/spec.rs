@@ -40,7 +40,7 @@ pub fn parse_domain_spec(s: &str, default_method: &str) -> io::Result<DomainSpec
             } else {
                 (s, default_method, true)
             }
-        }
+        },
     };
 
     if domain_part.is_empty() {
@@ -49,11 +49,7 @@ pub fn parse_domain_spec(s: &str, default_method: &str) -> io::Result<DomainSpec
 
     let name = Name::parse(domain_part)?;
 
-    let rr_type = if has_method {
-        rr_type_from_method(method)?
-    } else {
-        0
-    };
+    let rr_type = if has_method { rr_type_from_method(method)? } else { 0 };
 
     Ok(DomainSpec { name, rr_type })
 }

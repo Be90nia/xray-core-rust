@@ -5,8 +5,10 @@
 
 use std::net::IpAddr;
 
-use crate::config::DeviceConfig;
-use crate::error::{Result, WgError};
+use crate::{
+    config::DeviceConfig,
+    error::{Result, WgError},
+};
 
 /// `parseEndpoints` 的返回：解析后的 endpoint 列表 + 双栈标志。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,9 +23,8 @@ pub struct ParsedEndpoints {
 
 /// 每个元素可以是：
 /// - 纯 IP（如 `"10.0.0.1"`）—— 直接 parse
-/// - CIDR（如 `"10.0.0.1/24"`）—— 收敛为地址本体（Go client.go:88-97
-///   `netip.ParsePrefix` 宽容接受任意合法掩码后取 `prefix.Addr()`；掩码仅做
-///   范围校验 v4 0..=32 / v6 0..=128，bd 7v0k②）
+/// - CIDR（如 `"10.0.0.1/24"`）—— 收敛为地址本体（Go client.go:88-97 `netip.ParsePrefix`
+///   宽容接受任意合法掩码后取 `prefix.Addr()`；掩码仅做 范围校验 v4 0..=32 / v6 0..=128，bd 7v0k②）
 pub fn parse_endpoints(config: &DeviceConfig) -> Result<ParsedEndpoints> {
     let mut addrs = Vec::with_capacity(config.endpoint.len());
     let mut has_v4 = false;
@@ -35,12 +36,10 @@ pub fn parse_endpoints(config: &DeviceConfig) -> Result<ParsedEndpoints> {
             let (addr_str, prefix_str) = str_addr
                 .split_once('/')
                 .ok_or_else(|| WgError::InvalidEndpoint(str_addr.clone()))?;
-            let addr: IpAddr = addr_str
-                .parse()
-                .map_err(|_| WgError::InvalidEndpoint(str_addr.clone()))?;
-            let prefix_len: u32 = prefix_str
-                .parse()
-                .map_err(|_| WgError::InvalidEndpoint(str_addr.clone()))?;
+            let addr: IpAddr =
+                addr_str.parse().map_err(|_| WgError::InvalidEndpoint(str_addr.clone()))?;
+            let prefix_len: u32 =
+                prefix_str.parse().map_err(|_| WgError::InvalidEndpoint(str_addr.clone()))?;
             // 掩码范围校验（wg-quick 习惯写法 10.0.0.2/24 收敛为地址本体）
             let max_bits = if addr.is_ipv4() { 32 } else { 128 };
             if prefix_len > max_bits {
@@ -48,9 +47,7 @@ pub fn parse_endpoints(config: &DeviceConfig) -> Result<ParsedEndpoints> {
             }
             addr
         } else {
-            str_addr
-                .parse::<IpAddr>()
-                .map_err(|_| WgError::InvalidEndpoint(str_addr.clone()))?
+            str_addr.parse::<IpAddr>().map_err(|_| WgError::InvalidEndpoint(str_addr.clone()))?
         };
         if addr.is_ipv4() {
             has_v4 = true;
@@ -60,11 +57,7 @@ pub fn parse_endpoints(config: &DeviceConfig) -> Result<ParsedEndpoints> {
         addrs.push(addr);
     }
 
-    Ok(ParsedEndpoints {
-        addrs,
-        has_v4,
-        has_v6,
-    })
+    Ok(ParsedEndpoints { addrs, has_v4, has_v6 })
 }
 
 /// 服务端 listen_port 占位常量（与 Go 一致，实际端口由 Xray listener 控制）。
@@ -95,10 +88,7 @@ pub fn create_ipc_request(config: &DeviceConfig) -> String {
 
     if !config.is_client {
         // 服务端：占位 listen_port，实际监听由 Xray listener 处理。
-        out.push_str(&format!(
-            "listen_port={}\n",
-            SERVER_LISTEN_PORT_PLACEHOLDER
-        ));
+        out.push_str(&format!("listen_port={}\n", SERVER_LISTEN_PORT_PLACEHOLDER));
     }
 
     for peer in &config.peers {
@@ -127,10 +117,7 @@ pub fn create_ipc_request(config: &DeviceConfig) -> String {
         }
 
         if peer.keep_alive != 0 {
-            out.push_str(&format!(
-                "persistent_keepalive_interval={}\n",
-                peer.keep_alive
-            ));
+            out.push_str(&format!("persistent_keepalive_interval={}\n", peer.keep_alive));
         }
     }
 
@@ -139,9 +126,10 @@ pub fn create_ipc_request(config: &DeviceConfig) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
     use super::*;
     use crate::config::PeerConfig;
-    use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn make_config(endpoints: &[&str]) -> DeviceConfig {
         DeviceConfig {
@@ -157,10 +145,7 @@ mod tests {
         let cfg = make_config(&["10.0.0.1"]);
         let parsed = parse_endpoints(&cfg).unwrap();
         assert_eq!(parsed.addrs.len(), 1);
-        assert_eq!(
-            parsed.addrs[0],
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
-        );
+        assert_eq!(parsed.addrs[0], IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         assert!(parsed.has_v4);
         assert!(!parsed.has_v6);
     }
@@ -170,10 +155,7 @@ mod tests {
         let cfg = make_config(&["fd00::1"]);
         let parsed = parse_endpoints(&cfg).unwrap();
         assert_eq!(parsed.addrs.len(), 1);
-        assert_eq!(
-            parsed.addrs[0],
-            IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1))
-        );
+        assert_eq!(parsed.addrs[0], IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)));
         assert!(!parsed.has_v4);
         assert!(parsed.has_v6);
     }
@@ -183,10 +165,7 @@ mod tests {
         let cfg = make_config(&["10.0.0.1/32"]);
         let parsed = parse_endpoints(&cfg).unwrap();
         assert!(parsed.has_v4);
-        assert_eq!(
-            parsed.addrs[0],
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
-        );
+        assert_eq!(parsed.addrs[0], IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
     }
 
     #[test]
@@ -202,10 +181,7 @@ mod tests {
         let cfg = make_config(&["10.0.0.2/24", "fd00::1/64"]);
         let parsed = parse_endpoints(&cfg).unwrap();
         assert_eq!(parsed.addrs[0], IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
-        assert_eq!(
-            parsed.addrs[1],
-            IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1))
-        );
+        assert_eq!(parsed.addrs[1], IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)));
         assert!(parsed.has_v4);
         assert!(parsed.has_v6);
     }
@@ -262,11 +238,8 @@ mod tests {
 
     #[test]
     fn ipc_request_server_has_listen_port() {
-        let cfg = DeviceConfig {
-            secret_key: "abcd".repeat(16),
-            is_client: false,
-            ..Default::default()
-        };
+        let cfg =
+            DeviceConfig { secret_key: "abcd".repeat(16), is_client: false, ..Default::default() };
         let ipc = create_ipc_request(&cfg);
         assert!(ipc.contains("listen_port=1337"));
     }
@@ -302,7 +275,7 @@ mod tests {
             secret_key: "ab".repeat(16),
             is_client: true,
             peers: vec![PeerConfig {
-                public_key: String::new(),    // 空，跳过
+                public_key: String::new(),     // 空，跳过
                 pre_shared_key: String::new(), // 空，跳过
                 endpoint: String::new(),       // 空，跳过
                 keep_alive: 0,                 // 0，跳过
@@ -347,17 +320,11 @@ mod tests {
     #[test]
     fn ipc_request_format_key_value_newline() {
         // 每行必须是 key=value\n 格式
-        let cfg = DeviceConfig {
-            secret_key: "abcd".repeat(16),
-            is_client: true,
-            ..Default::default()
-        };
+        let cfg =
+            DeviceConfig { secret_key: "abcd".repeat(16), is_client: true, ..Default::default() };
         let ipc = create_ipc_request(&cfg);
         for line in ipc.lines() {
-            assert!(
-                line.contains('='),
-                "line without '=': {line:?}"
-            );
+            assert!(line.contains('='), "line without '=': {line:?}");
         }
     }
 

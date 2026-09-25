@@ -36,10 +36,7 @@ pub fn read_varint<R: Read>(r: &mut R) -> io::Result<i32> {
         }
         position += 7;
     }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        "xmc varint too large",
-    ))
+    Err(io::Error::new(io::ErrorKind::InvalidData, "xmc varint too large"))
 }
 
 /// 写 Minecraft VarInt。

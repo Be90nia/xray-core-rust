@@ -2,8 +2,8 @@
 //!
 //! ## 实现
 //!
-//! - `tokio::net::UdpSocket` 直连远端 DNS 服务器（不走 Xray dispatcher，
-//!   dispatcher 接入留 follow-up）。
+//! - `tokio::net::UdpSocket` 直连远端 DNS 服务器（不走 Xray dispatcher， dispatcher 接入留
+//!   follow-up）。
 //! - DNS wire format 由 `hickory-proto` 处理（覆盖 A/AAAA/MX/TXT/EDNS0）。
 //! - 自动接入 cache（实现 `CachedNameserver`，由 `cached::query_ip` 统一调度）。
 //! - truncated 响应自动 TCP 重试（RFC 7766 §5）。
@@ -13,28 +13,31 @@
 //! - 走 Xray routing/dispatcher 出口（直接用 tokio socket）
 //! - 请求去重 singleflight（CacheController 层面已部分缓解）
 
-use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    future::Future,
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use hickory_proto::rr::RecordType;
-use tokio::net::UdpSocket;
-use tokio::time::timeout;
+use tokio::{net::UdpSocket, time::timeout};
+use xray_common::net::{address::Address, destination::Destination, port::Port};
 
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::port::Port;
-
-use crate::cache_controller::CacheController;
-use crate::config::IpOption;
-use crate::dnscommon::{
-    build_dns_query, parse_dns_response, parsed_to_ip_record, AtomicReqIdGen, IpRecord, ReqIdGen,
+use crate::{
+    cache_controller::CacheController,
+    config::IpOption,
+    dnscommon::{
+        AtomicReqIdGen, IpRecord, ReqIdGen, build_dns_query, parse_dns_response,
+        parsed_to_ip_record,
+    },
+    error::DnsError,
+    nameserver::{
+        NameServerConfig, Server,
+        cached::{CachedNameserver, QueryOutcome, query_ip},
+    },
 };
-use crate::error::DnsError;
-use crate::nameserver::cached::{query_ip, CachedNameserver, QueryOutcome};
-use crate::nameserver::{NameServerConfig, Server};
 
 /// UDP DNS 查询缓冲区大小（Go 默认 4096；hickory 推荐 1232 + EDNS0）。
 const UDP_RECV_BUF: usize = 4096;
@@ -131,11 +134,7 @@ impl UdpNameServer {
     }
 
     /// 发送单次 DNS 查询并等待响应。
-    async fn query_once(
-        &self,
-        fqdn: &str,
-        record_type: RecordType,
-    ) -> Result<IpRecord, DnsError> {
+    async fn query_once(&self, fqdn: &str, record_type: RecordType) -> Result<IpRecord, DnsError> {
         let req_id = self.id_gen.next_id();
         let wire = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
 
@@ -192,10 +191,7 @@ impl UdpNameServer {
         let n = timeout(self.query_timeout, sock.recv(&mut buf))
             .await
             .map_err(|_| {
-                DnsError::WireFormat(format!(
-                    "udp recv timeout after {:?}",
-                    self.query_timeout
-                ))
+                DnsError::WireFormat(format!("udp recv timeout after {:?}", self.query_timeout))
             })?
             .map_err(|e| DnsError::WireFormat(format!("udp recv: {e}")))?;
 
@@ -324,21 +320,21 @@ impl Server for Arc<UdpNameServer> {
 /// 构造 UDP nameserver。对应 Go `NewClassicNameServer`。
 ///
 /// 入参：服务端地址（IP + 端口）+ 缓存配置 + EDNS0 client IP。
-pub fn new_classic_name_server(
-    ns: &NameServerConfig,
-) -> Result<Box<dyn Server>, DnsError> {
+pub fn new_classic_name_server(ns: &NameServerConfig) -> Result<Box<dyn Server>, DnsError> {
     UdpNameServer::from_config(ns)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{io, net::Ipv4Addr, str::FromStr};
+
+    use hickory_proto::{
+        op::{Message, MessageType, OpCode, Query},
+        rr::{Name, RData, Record, RecordType},
+    };
+
     use super::*;
     use crate::config::IpOption;
-    use hickory_proto::op::{Message, MessageType, OpCode, Query};
-    use hickory_proto::rr::{Name, RData, Record, RecordType};
-    use std::io;
-    use std::net::Ipv4Addr;
-    use std::str::FromStr;
 
     /// 共享 dialer 槽是进程级全局：涉 dialer 的测试须串行。
     static DIALER_SLOT_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
@@ -352,7 +348,8 @@ mod tests {
         let mut msg = Message::new(req_id, MessageType::Response, OpCode::Query);
         msg.add_query(Query::query(name.clone(), RecordType::A));
         for ip in ips {
-            let rec = Record::from_rdata(name.clone(), ttl, RData::A(hickory_proto::rr::rdata::A(ip)));
+            let rec =
+                Record::from_rdata(name.clone(), ttl, RData::A(hickory_proto::rr::rdata::A(ip)));
             msg.add_answer(rec);
         }
         msg.to_vec().unwrap()
@@ -380,7 +377,8 @@ mod tests {
     #[tokio::test]
     async fn query_once_returns_parsed_a_record() {
         let _slot = DIALER_SLOT_LOCK.lock();
-        let (addr, _h) = spawn_mock_udp_server("example.com.", vec![Ipv4Addr::new(1, 2, 3, 4)], 60).await;
+        let (addr, _h) =
+            spawn_mock_udp_server("example.com.", vec![Ipv4Addr::new(1, 2, 3, 4)], 60).await;
 
         let ns = UdpNameServer::new(
             udp_dest(addr),
@@ -408,11 +406,10 @@ mod tests {
             Arc::new(crate::dial::SystemHostResolver),
         );
         let outcome = ns
-            .send_query("x.com.", IpOption {
-                ipv4_enable: true,
-                ipv6_enable: false,
-                fake_enable: false,
-            })
+            .send_query(
+                "x.com.",
+                IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },
+            )
             .await;
         assert!(outcome.rec_v4.is_some());
         assert!(outcome.rec_v6.is_none());
@@ -436,11 +433,10 @@ mod tests {
             Arc::new(crate::dial::SystemHostResolver),
         );
         let outcome = ns
-            .send_query("y.com.", IpOption {
-                ipv4_enable: true,
-                ipv6_enable: false,
-                fake_enable: false,
-            })
+            .send_query(
+                "y.com.",
+                IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },
+            )
             .await;
         assert!(outcome.rec_v4.is_none());
         assert_eq!(outcome.errors.len(), 1);
@@ -490,16 +486,17 @@ mod tests {
             &self,
             _dest: &Destination,
         ) -> Pin<Box<dyn Future<Output = io::Result<crate::dial::DnsStream>> + Send + '_>> {
-            Box::pin(async {
-                Err(io::Error::new(io::ErrorKind::Unsupported, "udp test dialer"))
-            })
+            Box::pin(async { Err(io::Error::new(io::ErrorKind::Unsupported, "udp test dialer")) })
         }
 
         fn dial_udp(
             &self,
             dest: &Destination,
-        ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn crate::dial::UdpPacketSession>>> + Send + '_>>
-        {
+        ) -> Pin<
+            Box<
+                dyn Future<Output = io::Result<Box<dyn crate::dial::UdpPacketSession>>> + Send + '_,
+            >,
+        > {
             self.recorded.lock().push(dest.clone());
             let dest = dest.clone();
             Box::pin(async move {
@@ -544,7 +541,8 @@ mod tests {
     #[tokio::test]
     async fn udp_query_routes_through_dialer() {
         let _slot = DIALER_SLOT_LOCK.lock();
-        let (addr, _h) = spawn_mock_udp_server("routed.com.", vec![Ipv4Addr::new(10, 0, 0, 8)], 60).await;
+        let (addr, _h) =
+            spawn_mock_udp_server("routed.com.", vec![Ipv4Addr::new(10, 0, 0, 8)], 60).await;
 
         let dialer = Arc::new(RecordingUdpDialer::default());
         crate::dial::set_shared_dialer(Some(dialer.clone()));

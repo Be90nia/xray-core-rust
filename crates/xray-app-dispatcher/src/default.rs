@@ -11,19 +11,16 @@
 //!
 //! IO 边界（trait + NotImplemented 占位）：
 //! - [`RoutingRouter`] / [`OutboundHandlerManager`] / [`DispatchHandler`] trait
-//! - [`DefaultDispatcher::dispatch`] / [`DefaultDispatcher::dispatch_link`] — 依赖 pipe/transport 全链路
+//! - [`DefaultDispatcher::dispatch`] / [`DefaultDispatcher::dispatch_link`] — 依赖 pipe/transport
+//!   全链路
 //! - [`CachedReader`] — 依赖 `pipe.Reader`，主体留 TODO
 
-use crate::error::DispatcherError;
-use crate::sniffer::SniffResult;
-use std::collections::HashMap;
-use std::fmt::Debug;
-use std::future::Future;
-use std::net::IpAddr;
+use std::{collections::HashMap, fmt::Debug, future::Future, net::IpAddr, pin::Pin, sync::Arc};
+
 use xray_buf::multi::MultiBuffer;
-use std::pin::Pin;
-use std::sync::Arc;
 use xray_common::net::destination::Destination;
+
+use crate::{error::DispatcherError, sniffer::SniffResult};
 
 // ========== UDP443 策略（bd g35） ==========
 
@@ -61,12 +58,11 @@ impl Udp443Policy {
             other => {
                 tracing::warn!(value = %other, r#"unknown "xudpProxyUDP443", ignoring"#);
                 None
-            }
+            },
         }
     }
 }
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
+use xray_common::net::{network::Network, port::Port};
 
 // ========== RoutingContext ==========
 
@@ -166,31 +162,38 @@ impl DispatcherContext {
         self.target_domain = d.into();
         self
     }
+
     pub fn with_target_port(mut self, p: Port) -> Self {
         self.target_port = p;
         self
     }
+
     pub fn with_network(mut self, n: Network) -> Self {
         self.network = n;
         self
     }
+
     pub fn with_source_ips(mut self, ips: Vec<IpAddr>) -> Self {
         self.source_ips = ips;
         self
     }
+
     /// c10t：设置源端口。源端口解析来自 AccessContext.from `ip:port` 字段。
     pub fn with_source_port(mut self, p: Port) -> Self {
         self.source_port = p;
         self
     }
+
     pub fn with_inbound_tag(mut self, t: impl Into<String>) -> Self {
         self.inbound_tag = t.into();
         self
     }
+
     pub fn with_user(mut self, u: impl Into<String>) -> Self {
         self.user = u.into();
         self
     }
+
     pub fn with_protocol(mut self, p: impl Into<String>) -> Self {
         self.protocol = p.into();
         self
@@ -201,45 +204,59 @@ impl RoutingContext for DispatcherContext {
     fn get_target_ips(&self) -> &[IpAddr] {
         &self.target_ips
     }
+
     fn get_target_domain(&self) -> &str {
         &self.target_domain
     }
+
     fn get_target_port(&self) -> Port {
         self.target_port
     }
+
     fn get_source_ips(&self) -> &[IpAddr] {
         &self.source_ips
     }
+
     fn get_source_port(&self) -> Port {
         self.source_port
     }
+
     fn get_local_ips(&self) -> &[IpAddr] {
         &self.local_ips
     }
+
     fn get_local_port(&self) -> Port {
         self.local_port
     }
+
     fn get_vless_route(&self) -> &str {
         &self.vless_route
     }
+
     fn get_network(&self) -> Network {
         self.network
     }
+
     fn get_user(&self) -> &str {
         &self.user
     }
+
     fn get_attributes(&self) -> &HashMap<String, String> {
         &self.attributes
     }
+
     fn get_inbound_tag(&self) -> &str {
         &self.inbound_tag
     }
+
     fn get_protocol(&self) -> &str {
         &self.protocol
     }
+
     fn get_skip_dns_resolve(&self) -> bool {
         self.skip_dns_resolve
     }
+
     fn get_route_target(&self) -> Option<&xray_common::net::destination::Destination> {
         self.route_target.as_ref()
     }
@@ -259,10 +276,7 @@ pub struct Route {
 impl Route {
     #[must_use]
     pub fn new(outbound_tag: impl Into<String>) -> Self {
-        Self {
-            outbound_tag: outbound_tag.into(),
-            rule_tag: String::new(),
-        }
+        Self { outbound_tag: outbound_tag.into(), rule_tag: String::new() }
     }
 
     pub fn get_outbound_tag(&self) -> &str {
@@ -454,10 +468,7 @@ impl Debug for SniffingRequest {
         f.debug_struct("SniffingRequest")
             .field("enabled", &self.enabled)
             .field("metadata_only", &self.metadata_only)
-            .field(
-                "override_destination_for_protocol",
-                &self.override_destination_for_protocol,
-            )
+            .field("override_destination_for_protocol", &self.override_destination_for_protocol)
             .field("exclude_for_domain", &self.exclude_for_domain.is_some())
             .field("exclude_for_ip", &self.exclude_for_ip.is_some())
             .field("route_only", &self.route_only)
@@ -473,23 +484,21 @@ impl Debug for SniffingRequest {
 /// 1. domain 为空 → false
 /// 2. domain 命中 exclude_for_domain（config 层编译的 typed matcher）→ false
 /// 3. dest 是 IP 且命中 exclude_for_ip → false
-/// 4. 对每个配置协议 p：
-///    a. protocol 前缀互含（任一侧）→ true
-///    b. bk8l：p == "fakedns" 且原 dest IP 在 fake 池（映射可能丢失）且协议非
-///       bittorrent → true（"Using sniffer ... since the fake DNS missed"）
-///    c. bk8l：result 是 DNSThenOthers（fakedns+others），其原始协议是 p 的
-///       前缀子集（`SnifferIsProtoSubsetOf`）→ true
+/// 4. 对每个配置协议 p： a. protocol 前缀互含（任一侧）→ true b. bk8l：p == "fakedns" 且原 dest IP
+///    在 fake 池（映射可能丢失）且协议非 bittorrent → true（"Using sniffer ... since the fake DNS
+///    missed"） c. bk8l：result 是 DNSThenOthers（fakedns+others），其原始协议是 p 的
+///    前缀子集（`SnifferIsProtoSubsetOf`）→ true
 ///
 /// # 参数
 /// - `result`: 嗅探结果
 /// - `request`: 嗅探请求配置
 /// - `dest_address`: 原目的地地址（用于 exclude_for_ip 判断）
-/// - `protocol_for_domain`: 若 result 是 CompositeSniffResult，传 `Some(protocol_for_domain_result)`；
-///   否则传 `None`，使用 `result.protocol()`
+/// - `protocol_for_domain`: 若 result 是 CompositeSniffResult，传
+///   `Some(protocol_for_domain_result)`； 否则传 `None`，使用 `result.protocol()`
 /// - `dest_ip_in_fake_pool`: 原目的地 IP 是否落在 FakeDNS 池区间（由调用方经
 ///   `FakeDnsEngine::is_ip_in_ip_pool` 判定后传入；Go 在本函数内查 fdns）
-/// - `protocol_subset_of`: DNSThenOthersSniffResult 的原始协议名（Go
-///   `IsProtoSubsetOf` 的 type-assert 等价；非该结果类型传 `None`）
+/// - `protocol_subset_of`: DNSThenOthersSniffResult 的原始协议名（Go `IsProtoSubsetOf` 的
+///   type-assert 等价；非该结果类型传 `None`）
 pub fn should_override(
     result: &dyn SniffResult,
     request: &SniffingRequest,
@@ -589,8 +598,7 @@ async fn sniff_connection(
     // shouldOverride 评估（fakedns 拨号必须跟域名 → route_only 传 false）。
     if req.metadata_only {
         if !metadata_domain.is_empty() {
-            let meta_result =
-                crate::fakednssniffer::FakeDnsSniffResult::new(&metadata_domain);
+            let meta_result = crate::fakednssniffer::FakeDnsSniffResult::new(&metadata_domain);
             let dest_ip = dest.address().ip();
             if should_override(
                 &meta_result,
@@ -600,8 +608,7 @@ async fn sniff_connection(
                 fakedns_ip_in_pool,
                 None,
             ) {
-                let (new_dest, route_target) =
-                    override_dest(dest, &metadata_domain, false)?;
+                let (new_dest, route_target) = override_dest(dest, &metadata_domain, false)?;
                 return Ok((new_dest, Some(metadata_protocol), route_target));
             }
         }
@@ -621,19 +628,15 @@ async fn sniff_connection(
         loop {
             let caching_started = std::time::Instant::now();
             let read_fut = async {
-                if first_read {
-                    cr.read_first().await.map(|_| true)
-                } else {
-                    cr.read_more().await
-                }
+                if first_read { cr.read_first().await.map(|_| true) } else { cr.read_more().await }
             };
             match tokio::time::timeout(cache_deadline, read_fut).await {
-                Ok(Ok(true)) => {}
+                Ok(Ok(true)) => {},
                 Ok(Ok(false)) => {
                     break Err(DispatcherError::Io(
                         "sniffing: stream ended before protocol identified".into(),
                     ));
-                }
+                },
                 Ok(Err(e)) => break Err(e),
                 Err(_) => break Err(DispatcherError::SniffingTimeout),
             }
@@ -647,7 +650,7 @@ async fn sniff_connection(
                 match sniffer.sniff(&payload, network) {
                     Ok(result) => break Ok(result),
                     Err(DispatcherError::NoClue) => total_attempt += 1,
-                    Err(DispatcherError::NeedMoreData) => {}
+                    Err(DispatcherError::NeedMoreData) => {},
                     Err(e) => break Err(e),
                 }
             }
@@ -664,7 +667,8 @@ async fn sniff_connection(
                 // 两者都有 → CompositeSniffResult 语义
                 // protocol_for_domain 用 metadata 侧的 protocol
                 let composite = crate::sniffer::CompositeSniffResult::new(
-                    Box::new(crate::fakednssniffer::FakeDnsSniffResult::new(&metadata_domain)) as Box<dyn SniffResult>,
+                    Box::new(crate::fakednssniffer::FakeDnsSniffResult::new(&metadata_domain))
+                        as Box<dyn SniffResult>,
                     content,
                 );
                 if should_override(
@@ -677,8 +681,7 @@ async fn sniff_connection(
                 ) {
                     // fakedns 路径（Go default.go:311 判 protocol != "fakedns" 才走
                     // RouteOnly）：拨号必须跟域名（fake IP 不可直连）→ 按 false 传。
-                    let (new_dest, route_target) =
-                        override_dest(dest, &metadata_domain, false)?;
+                    let (new_dest, route_target) = override_dest(dest, &metadata_domain, false)?;
                     return Ok((new_dest, Some(metadata_protocol), route_target));
                 }
             } else if fakedns_ip_in_pool {
@@ -691,25 +694,19 @@ async fn sniff_connection(
                 );
                 if should_override(&wrapped, req, dest_ip, None, true, Some(content.protocol())) {
                     // Go DispatchLink：isFakeIP（池内）时即使 routeOnly 也拨号跟域名
-                    let (new_dest, route_target) =
-                        override_dest(dest, wrapped.domain(), false)?;
-                    return Ok((
-                        new_dest,
-                        Some(wrapped.protocol().to_string()),
-                        route_target,
-                    ));
+                    let (new_dest, route_target) = override_dest(dest, wrapped.domain(), false)?;
+                    return Ok((new_dest, Some(wrapped.protocol().to_string()), route_target));
                 }
             } else {
                 // 仅 content 结果
                 if should_override(content.as_ref(), req, dest_ip, None, false, None) {
                     let proto = content.protocol().to_string();
                     let domain = content.domain().to_string();
-                    let (new_dest, route_target) =
-                        override_dest(dest, &domain, req.route_only)?;
+                    let (new_dest, route_target) = override_dest(dest, &domain, req.route_only)?;
                     return Ok((new_dest, Some(proto), route_target));
                 }
             }
-        }
+        },
         Err(_) => {
             // content sniff 失败，仅用 metadata
             if !metadata_domain.is_empty() {
@@ -722,12 +719,11 @@ async fn sniff_connection(
                     fakedns_ip_in_pool,
                     None,
                 ) {
-                    let (new_dest, route_target) =
-                        override_dest(dest, &metadata_domain, false)?;
+                    let (new_dest, route_target) = override_dest(dest, &metadata_domain, false)?;
                     return Ok((new_dest, Some(metadata_protocol.clone()), route_target));
                 }
             }
-        }
+        },
     }
 
     Ok((dest.clone(), None, None))
@@ -751,9 +747,8 @@ fn override_dest(
     DispatcherError,
 > {
     let new_addr = xray_common::net::address::Address::new_domain(domain.to_string());
-    let domain_dest = xray_common::net::destination::Destination::new(
-        new_addr, dest.port(), dest.network(),
-    );
+    let domain_dest =
+        xray_common::net::destination::Destination::new(new_addr, dest.port(), dest.network());
     if route_only {
         tracing::debug!(domain = %domain, "sniffed (route_only, dest unchanged, route target set)");
         return Ok((dest.clone(), Some(domain_dest)));
@@ -769,9 +764,8 @@ fn build_routing_context(
     dest: &xray_common::net::destination::Destination,
     sniffed_protocol: Option<&str>,
 ) -> DispatcherContext {
-    let mut ctx = DispatcherContext::new()
-        .with_target_port(dest.port())
-        .with_network(dest.network());
+    let mut ctx =
+        DispatcherContext::new().with_target_port(dest.port()).with_network(dest.network());
 
     // 地址
     match dest.address().ip() {
@@ -805,9 +799,7 @@ fn get_or_register_counter_opt(
     stats: Option<&Arc<dyn xray_features::stats::Manager>>,
     name: &str,
 ) -> Option<Arc<dyn xray_features::stats::Counter>> {
-    stats.and_then(|m| {
-        xray_features::stats::get_or_register_counter(m.as_ref(), name).ok()
-    })
+    stats.and_then(|m| xray_features::stats::get_or_register_counter(m.as_ref(), name).ok())
 }
 
 /// 从 access.from（`SocketAddr` 字符串形态）提取主机部分。
@@ -1011,49 +1003,47 @@ impl DefaultDispatcher {
         let sys = self
             .policy_manager
             .as_ref()
-            .map_or_else(xray_features::policy::SystemStats::default, |pm| {
-                pm.for_system()
-            });
+            .map_or_else(xray_features::policy::SystemStats::default, |pm| pm.for_system());
         let inbound_uplink = if sys.inbound_uplink {
-             inbound_tag.and_then(|tag| {
-                 get_or_register_counter_opt(
-                     self.stats.as_ref(),
-                     &format!("inbound>>>{tag}>>>traffic>>>uplink"),
-                 )
-             })
-         } else {
-             None
-         };
+            inbound_tag.and_then(|tag| {
+                get_or_register_counter_opt(
+                    self.stats.as_ref(),
+                    &format!("inbound>>>{tag}>>>traffic>>>uplink"),
+                )
+            })
+        } else {
+            None
+        };
         let inbound_downlink = if sys.inbound_downlink {
-             inbound_tag.and_then(|tag| {
-                 get_or_register_counter_opt(
-                     self.stats.as_ref(),
-                     &format!("inbound>>>{tag}>>>traffic>>>downlink"),
-                 )
-             })
-         } else {
-             None
-         };
+            inbound_tag.and_then(|tag| {
+                get_or_register_counter_opt(
+                    self.stats.as_ref(),
+                    &format!("inbound>>>{tag}>>>traffic>>>downlink"),
+                )
+            })
+        } else {
+            None
+        };
         let outbound_uplink = if sys.outbound_uplink {
-             outbound_tag.and_then(|tag| {
-                 get_or_register_counter_opt(
-                     self.stats.as_ref(),
-                     &format!("outbound>>>{tag}>>>traffic>>>uplink"),
-                 )
-             })
-         } else {
-             None
-         };
+            outbound_tag.and_then(|tag| {
+                get_or_register_counter_opt(
+                    self.stats.as_ref(),
+                    &format!("outbound>>>{tag}>>>traffic>>>uplink"),
+                )
+            })
+        } else {
+            None
+        };
         let outbound_downlink = if sys.outbound_downlink {
-             outbound_tag.and_then(|tag| {
-                 get_or_register_counter_opt(
-                     self.stats.as_ref(),
-                     &format!("outbound>>>{tag}>>>traffic>>>downlink"),
-                 )
-             })
-         } else {
-             None
-         };
+            outbound_tag.and_then(|tag| {
+                get_or_register_counter_opt(
+                    self.stats.as_ref(),
+                    &format!("outbound>>>{tag}>>>traffic>>>downlink"),
+                )
+            })
+        } else {
+            None
+        };
 
         // 包装 link 端的 writer/reader
         // inbound 端：写上行（uplink）+ 读下行（downlink）
@@ -1106,13 +1096,7 @@ impl DefaultDispatcher {
         // outbound counter 由 dispatch_link 尾段按命中 handler tag 懒注册。
         let inbound = xray_transport::link::Link::new(Box::new(dn_r), Box::new(up_w));
         let outbound = xray_transport::link::Link::new(Box::new(up_r), Box::new(dn_w));
-        self.dispatch_link(
-            destination,
-            outbound,
-            &SniffingRequest::default(),
-            None,
-            Some(tag),
-        )?;
+        self.dispatch_link(destination, outbound, &SniffingRequest::default(), None, Some(tag))?;
         Ok(inbound)
     }
 
@@ -1122,8 +1106,8 @@ impl DefaultDispatcher {
     ///
     /// 流程（对应 Go `routedDispatch`）：
     /// 1. 若 sniffing 启用：用 CachedReader 包装 outbound reader，读首包 → sniff → 可能覆盖 dest
-    /// 2. `forced_tag` 非空：按 tag 直取 handler，无效即 Err，不回退默认
-    ///    （Go default.go:443-454 "platform initialized detour"，tag 不存在直接丢弃不落默认出站）
+    /// 2. `forced_tag` 非空：按 tag 直取 handler，无效即 Err，不回退默认 （Go default.go:443-454
+    ///    "platform initialized detour"，tag 不存在直接丢弃不落默认出站）
     /// 3. 若有 router：用 RoutingContext 调 router.pick_route() 选出站 handler
     /// 4. 无 router 或路由失败：用默认 handler
     /// 5. 记 access log（Accepted，含 detour 组合；对应 Go default.go:488-502）
@@ -1150,9 +1134,7 @@ impl DefaultDispatcher {
         if !forced_tag.as_deref().unwrap_or_default().is_empty()
             && ohm.get_handler(forced_tag.as_deref().unwrap_or_default()).is_none()
         {
-            return Err(DispatcherError::HandlerNotFound(
-                forced_tag.unwrap_or_default(),
-            ));
+            return Err(DispatcherError::HandlerNotFound(forced_tag.unwrap_or_default()));
         }
 
         // 预检查：如果没有 router 也没有 default handler，直接报错
@@ -1160,7 +1142,7 @@ impl DefaultDispatcher {
         if forced_tag.as_deref().unwrap_or_default().is_empty()
             && self.router.is_none()
             && ohm.get_default_handler().is_none()
-            // 无路由可用 → Rejected（Go 仅 errors log；rejected 记录为 assignment 要求的扩展）
+        // 无路由可用 → Rejected（Go 仅 errors log；rejected 记录为 assignment 要求的扩展）
         {
             if let (Some(sink), Some(ctx)) = (&self.access_sink, access) {
                 sink.record_access(&AccessLogEntry {
@@ -1190,22 +1172,16 @@ impl DefaultDispatcher {
         let policy = self
             .policy_manager
             .as_ref()
-            .map_or(self.default_policy.clone(), |pm| {
-                pm.policy_for_level(user_level)
-            });
+            .map_or(self.default_policy.clone(), |pm| pm.policy_for_level(user_level));
         // per-user stats 上下文（Go getLink default.go:161-185）：email 非空才挂接。
         let user_email = access.as_ref().map_or(String::new(), |a| a.email.clone());
-        let user_host = access
-            .as_ref()
-            .map_or(String::new(), |a| source_host(&a.from).to_string());
+        let user_host = access.as_ref().map_or(String::new(), |a| source_host(&a.from).to_string());
         // sm80①：outbound tag counter 门控（Go proxyman/outbound/handler.go:39,47
         // ForSystem().Stats.Outbound{Uplink,Downlink}），spawn 前取快照进 async。
         let sys_stats = self
             .policy_manager
             .as_ref()
-            .map_or_else(xray_features::policy::SystemStats::default, |pm| {
-                pm.for_system()
-            });
+            .map_or_else(xray_features::policy::SystemStats::default, |pm| pm.for_system());
         let policy_stats = policy.stats.clone();
         let outbound_reader = outbound.reader;
         let outbound_writer = outbound.writer;
@@ -1213,14 +1189,12 @@ impl DefaultDispatcher {
             // ---- Phase 1: Sniffing ----
             let mut cr = CachedReader::with_inner(outbound_reader);
             let (final_dest, sniffed_protocol, route_target) = if sniff_req.enabled {
-                match sniff_connection(
-                    &mut cr, &dest, &sniff_req, fdns.as_deref(),
-                ).await {
+                match sniff_connection(&mut cr, &dest, &sniff_req, fdns.as_deref()).await {
                     Ok((d, proto, rt)) => (d, proto, rt),
                     Err(e) => {
                         tracing::debug!(dest = %dest, error = %e, "sniffing failed, using original dest");
                         (dest.clone(), None, None)
-                    }
+                    },
                 }
             } else {
                 (dest.clone(), None, None)
@@ -1232,14 +1206,14 @@ impl DefaultDispatcher {
                     Some(h) => {
                         tracing::debug!(tag = %tag, "taking platform initialized detour for [%final_dest]");
                         (Some(h), false)
-                    }
+                    },
                     None => {
                         // Go DO NOT CHANGE 注释：指定 tag 不存在时不得落到默认出站
                         tracing::error!(tag = %tag, "non existing tag for platform initialized detour");
                         outbound_writer.shutdown();
                         // outbound_reader 随 drop 关闭上行
                         return;
-                    }
+                    },
                 }
             }
             // ---- Phase 2: Routing（resolved：domainStrategy DNS 解析路径） ----
@@ -1279,7 +1253,7 @@ impl DefaultDispatcher {
                             outbound_writer.shutdown();
                             // outbound_reader 随 drop 关闭上行
                             return;
-                        }
+                        },
                     },
                     Err(_) => (ohm.get_default_handler(), false),
                 }
@@ -1387,10 +1361,7 @@ impl DefaultDispatcher {
                     if let Some(om) = &om {
                         om.add_ip(&user_host);
                     }
-                    Some(OnlineIpGuard {
-                        om,
-                        ip: user_host,
-                    })
+                    Some(OnlineIpGuard { om, ip: user_host })
                 } else {
                     None
                 }
@@ -1403,39 +1374,37 @@ impl DefaultDispatcher {
             if final_dest.network() == Network::UDP && final_dest.port().value() == 443 {
                 match udp443_policies.get(handler.tag()) {
                     Some(Udp443Policy::Reject) => {
-                        // Go: test(errors.New("XUDP rejected UDP/443 traffic").AtInfo()) → Interrupt 双向
+                        // Go: test(errors.New("XUDP rejected UDP/443 traffic").AtInfo()) →
+                        // Interrupt 双向
                         tracing::info!(tag = %out_tag, "XUDP rejected UDP/443 traffic");
                         writer.shutdown(); // 关闭下行 → inbound reader EOF
                         return; // reader 随 drop 关闭上行
-                    }
+                    },
                     // skip（Go goto out 直发）/ allow（xudp dispatch，mbc/nww 接入前等价直发）
-                    Some(_) | None => {}
+                    Some(_) | None => {},
                 }
             }
 
             // ---- EndpointOverride（bd g35，Go handler.go:206-209） ----
             // UDP 且 sniffing 将 OriginalTarget 改写为 Target 时，改写 XUDP 帧携带的
             // 逐包地址：上行 original→override，下行 override→original。
-            let (reader, writer) = if final_dest.network() == Network::UDP
-                && final_dest.address() != dest.address()
-            {
-                let original = dest.address().clone();
-                let target = final_dest.address().clone();
-                (
-                    Box::new(crate::endpoint_override::EndpointOverrideReader::new(
-                        reader,
-                        original.clone(),
-                        target.clone(),
-                    )) as Box<dyn xray_buf::io::Reader>,
-                    Box::new(crate::endpoint_override::EndpointOverrideWriter::new(
-                        writer,
-                        target,
-                        original,
-                    )) as Box<dyn xray_buf::io::Writer>,
-                )
-            } else {
-                (reader, writer)
-            };
+            let (reader, writer) =
+                if final_dest.network() == Network::UDP && final_dest.address() != dest.address() {
+                    let original = dest.address().clone();
+                    let target = final_dest.address().clone();
+                    (
+                        Box::new(crate::endpoint_override::EndpointOverrideReader::new(
+                            reader,
+                            original.clone(),
+                            target.clone(),
+                        )) as Box<dyn xray_buf::io::Reader>,
+                        Box::new(crate::endpoint_override::EndpointOverrideWriter::new(
+                            writer, target, original,
+                        )) as Box<dyn xray_buf::io::Writer>,
+                    )
+                } else {
+                    (reader, writer)
+                };
             let final_link = xray_transport::link::Link::new(reader, writer);
 
             // splice 下行出站计数器随 access 抵达 splice 泵（Go proxy.go:762
@@ -1445,7 +1414,8 @@ impl DefaultDispatcher {
             if let Some(a) = access.as_mut() {
                 a.splice_down_out = out_dn.clone();
             }
-            let fut = handler.dispatch_with_access(&final_dest, final_link, access.unwrap_or_default());
+            let fut =
+                handler.dispatch_with_access(&final_dest, final_link, access.unwrap_or_default());
             let _ = fut.await;
         };
 
@@ -1487,19 +1457,13 @@ impl CachedReader {
     /// 创建空 cached reader。
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            inner: None,
-            cache: None,
-        }
+        Self { inner: None, cache: None }
     }
 
     /// 用 inner reader 构造。
     #[must_use]
     pub fn with_inner(r: Box<dyn xray_buf::io::Reader>) -> Self {
-        Self {
-            inner: Some(r),
-            cache: None,
-        }
+        Self { inner: Some(r), cache: None }
     }
 
     /// 设置内部 reader。
@@ -1519,12 +1483,14 @@ impl CachedReader {
         if self.cache.is_some() {
             return Ok(());
         }
-        let inner = self.inner.as_mut().ok_or_else(|| {
-            DispatcherError::Io("cached reader: no inner reader".into())
-        })?;
-        let mb = inner.read_multi_buffer().await.map_err(|e| {
-            DispatcherError::Io(format!("cached reader read_first: {e}"))
-        })?;
+        let inner = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| DispatcherError::Io("cached reader: no inner reader".into()))?;
+        let mb = inner
+            .read_multi_buffer()
+            .await
+            .map_err(|e| DispatcherError::Io(format!("cached reader read_first: {e}")))?;
         if !mb.is_empty() {
             self.cache = Some(mb);
         }
@@ -1537,12 +1503,14 @@ impl CachedReader {
     /// 200ms×2 次重试预算，等客户端 ClientHello 后续分段到达。仅追加（不清空首包
     /// 缓存）；cache 为空等价单次 read（不视作首包保护，由调用方自决）。
     pub async fn read_more(&mut self) -> Result<bool, DispatcherError> {
-        let inner = self.inner.as_mut().ok_or_else(|| {
-            DispatcherError::Io("cached reader: no inner reader".into())
-        })?;
-        let mb = inner.read_multi_buffer().await.map_err(|e| {
-            DispatcherError::Io(format!("cached reader read_more: {e}"))
-        })?;
+        let inner = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| DispatcherError::Io("cached reader: no inner reader".into()))?;
+        let mb = inner
+            .read_multi_buffer()
+            .await
+            .map_err(|e| DispatcherError::Io(format!("cached reader read_more: {e}")))?;
         if mb.is_empty() {
             return Ok(false);
         }
@@ -1582,15 +1550,19 @@ impl xray_buf::io::Reader for CachedReader {
 
 // ========== DialBridge：通用 Dial→Bridge adapter ==========
 
-use xray_transport::bridge::{
-    bridge_link_with_link, bridge_link_with_link_default, bridge_link_with_stream_full,
-    bridge_link_with_stream_full_default,
+use xray_transport::{
+    bridge::{
+        bridge_link_with_link, bridge_link_with_link_default, bridge_link_with_stream_full,
+        bridge_link_with_stream_full_default,
+    },
+    connection::Connection,
 };
-use xray_transport::connection::Connection;
 
 /// 拨号闭包类型：dest → Box<dyn Connection>
 pub type DialFn = Arc<
-    dyn Fn(&xray_common::net::destination::Destination) -> PinFuture<Result<Box<dyn Connection>, String>>
+    dyn Fn(
+            &xray_common::net::destination::Destination,
+        ) -> PinFuture<Result<Box<dyn Connection>, String>>
         + Send
         + Sync,
 >;
@@ -1704,8 +1676,7 @@ impl DialBridge {
     /// 日志的可观测对应物；并发 dispatch 下为最后完成者，测试/诊断用）。
     #[must_use]
     pub fn splice_admitted(&self) -> bool {
-        self.splice_admitted
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.splice_admitted.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 标记本桥为 splice 出站（Go `ob.CanSpliceCopy = 1`，freedom.go:260）。
@@ -1713,8 +1684,7 @@ impl DialBridge {
     /// 仅 freedom 装配调用（xray-core outbound.rs freedom 分支）。用 `&self`
     /// 因为 handler 注册后才能到达协议分支。
     pub fn set_splice_outbound(&self, enabled: bool) {
-        self.splice_outbound
-            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self.splice_outbound.store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 注入 per-dispatch 桥接 policy（bd 4-6：bridge 数据面超时接 policy）。
@@ -1725,11 +1695,7 @@ impl DialBridge {
 
     /// 取当前 policy（无显式设置时用 default）。
     fn current_policy(&self) -> xray_features::policy::TimeoutPolicy {
-        self.policy
-            .read()
-            .expect("DialBridge policy lock poisoned")
-            .clone()
-            .unwrap_or_default()
+        self.policy.read().expect("DialBridge policy lock poisoned").clone().unwrap_or_default()
     }
 
     /// 设置代理链 tag 和出站管理器。
@@ -1793,8 +1759,7 @@ impl DispatchHandler for DialBridge {
         let tag = self.tag.clone();
         let dest = dest.clone();
         let policy = self.current_policy();
-        let splice_out =
-            self.splice_outbound.load(std::sync::atomic::Ordering::Relaxed);
+        let splice_out = self.splice_outbound.load(std::sync::atomic::Ordering::Relaxed);
         let splice_admitted = Arc::clone(&self.splice_admitted);
         Box::pin(async move {
             match dial(&dest).await {
@@ -1804,9 +1769,7 @@ impl DispatchHandler for DialBridge {
                     // [`INBOUND_SPLICE`] 抵达，出站信号 = splice_out（freedom
                     // 装配唯一置位点）。判定跨平台照跑（Windows 由平台闸门
                     // 恒 false），准入了才走零拷贝泵，其余一律回退既有桥。
-                    let inbound = INBOUND_SPLICE
-                        .try_with(Clone::clone)
-                        .unwrap_or_default();
+                    let inbound = INBOUND_SPLICE.try_with(Clone::clone).unwrap_or_default();
                     let admitted = splice_out
                         && xray_common::platform::splice::bridge_splice_admission(
                             inbound.can_splice_copy,
@@ -1828,8 +1791,12 @@ impl DispatchHandler for DialBridge {
                     #[cfg(any(target_os = "linux", target_os = "android"))]
                     if admitted {
                         if let Some(inbound_raw) = inbound.raw {
-                            if let Err(e) = xray_transport::bridge::bridge_link_with_stream_downlink_splice(
-                                    link, remote, inbound_raw, &policy,
+                            if let Err(e) =
+                                xray_transport::bridge::bridge_link_with_stream_downlink_splice(
+                                    link,
+                                    remote,
+                                    inbound_raw,
+                                    &policy,
                                     (inbound.down_out.clone(), inbound.down_in.clone()),
                                 )
                                 .await
@@ -1843,10 +1810,10 @@ impl DispatchHandler for DialBridge {
                     if let Err(e) = bridge_link_with_stream_full(link, remote, &policy).await {
                         tracing::warn!(tag = %tag, "bridge ended: {e}");
                     }
-                }
+                },
                 Err(e) => {
                     tracing::error!(tag = %tag, "dial failed: {e}");
-                }
+                },
             }
         })
     }
@@ -1974,12 +1941,7 @@ impl SimpleOhm {
         let Some(_old) = self.tagged.write().unwrap().remove(tag) else {
             return false;
         };
-        let default_matches = self
-            .default
-            .read()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|h| h.tag() == tag);
+        let default_matches = self.default.read().unwrap().as_ref().is_some_and(|h| h.tag() == tag);
         if default_matches {
             *self.default.write().unwrap() = None;
         }
@@ -2016,9 +1978,10 @@ impl OutboundHandlerManager for SimpleOhm {
 
 #[cfg(test)]
 mod tests {
+    use xray_common::net::network::Network;
+
     use super::*;
     use crate::sniffer::SniffResult;
-    use xray_common::net::network::Network;
 
     /// sm80① 测试 mock：`for_system` 四门全开（tag counter 门控路径）。
     #[derive(Debug)]
@@ -2027,6 +1990,7 @@ mod tests {
         fn policy_for_level(&self, _level: u32) -> xray_features::policy::Policy {
             xray_features::policy::Policy::default()
         }
+
         fn for_system(&self) -> xray_features::policy::SystemStats {
             xray_features::policy::SystemStats {
                 inbound_uplink: true,
@@ -2045,6 +2009,7 @@ mod tests {
         fn policy_for_level(&self, _level: u32) -> xray_features::policy::Policy {
             xray_features::policy::Policy::default()
         }
+
         fn for_system(&self) -> xray_features::policy::SystemStats {
             xray_features::policy::SystemStats {
                 outbound_uplink: true,
@@ -2065,6 +2030,7 @@ mod tests {
         fn protocol(&self) -> &str {
             self.protocol
         }
+
         fn domain(&self) -> &str {
             self.domain
         }
@@ -2204,9 +2170,9 @@ mod tests {
         // fv1g：CIDR 型 IP 排除；命中 → 不覆盖，未命中 → 正常覆盖
         let r = make_sniff("http", "example.com");
         let req = SniffingRequest {
-            exclude_for_ip: Some(Arc::new(|addr: IpAddr| {
-                matches!(addr, IpAddr::V4(v4) if v4.octets()[0] == 10)
-            })),
+            exclude_for_ip: Some(Arc::new(
+                |addr: IpAddr| matches!(addr, IpAddr::V4(v4) if v4.octets()[0] == 10),
+            )),
             override_destination_for_protocol: vec!["http".to_string()],
             ..Default::default()
         };
@@ -2248,10 +2214,7 @@ mod tests {
     /// 命中 destOverride=["tls"]（SnifferIsProtoSubsetOf 落地）
     #[test]
     fn override_proto_subset_of_original_hits() {
-        let wrapped = crate::fakednssniffer::DnsThenOthersSniffResult::new(
-            "example.com",
-            "tls",
-        );
+        let wrapped = crate::fakednssniffer::DnsThenOthersSniffResult::new("example.com", "tls");
         let req = SniffingRequest {
             override_destination_for_protocol: vec!["tls".to_string()],
             ..Default::default()
@@ -2307,11 +2270,15 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_creates_pipe_pair_and_spawns_outbound_handler() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        use std::sync::Arc as StdArc;
-        use std::time::Duration;
-        use xray_common::net::address::Address;
-        use xray_common::net::destination::Destination;
+        use std::{
+            sync::{
+                Arc as StdArc,
+                atomic::{AtomicU32, Ordering},
+            },
+            time::Duration,
+        };
+
+        use xray_common::net::{address::Address, destination::Destination};
 
         // Mock DispatchHandler：递增 counter 证明 spawn 触发
         #[derive(Debug)]
@@ -2322,7 +2289,12 @@ mod tests {
             fn tag(&self) -> &str {
                 "mock"
             }
-            fn dispatch(&self, _dest: &xray_common::net::destination::Destination, _link: xray_transport::link::Link) -> PinFuture<()> {
+
+            fn dispatch(
+                &self,
+                _dest: &xray_common::net::destination::Destination,
+                _link: xray_transport::link::Link,
+            ) -> PinFuture<()> {
                 let c = self.called.clone();
                 Box::pin(async move {
                     c.fetch_add(1, Ordering::SeqCst);
@@ -2338,15 +2310,14 @@ mod tests {
             fn get_handler(&self, _tag: &str) -> Option<Arc<dyn DispatchHandler>> {
                 None
             }
+
             fn get_default_handler(&self) -> Option<Arc<dyn DispatchHandler>> {
                 Some(self.handler.clone())
             }
         }
 
         let called = StdArc::new(AtomicU32::new(0));
-        let handler = StdArc::new(MockHandler {
-            called: called.clone(),
-        });
+        let handler = StdArc::new(MockHandler { called: called.clone() });
         let ohm: Arc<dyn OutboundHandlerManager> = Arc::new(MockOhm { handler });
         let mut d = DefaultDispatcher::new();
         d.ohm = Some(ohm);
@@ -2375,8 +2346,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_errors_when_no_ohm() {
-        use xray_common::net::address::Address;
-        use xray_common::net::destination::Destination;
+        use xray_common::net::{address::Address, destination::Destination};
         let d = DefaultDispatcher::new(); // 无 ohm
         let dest = Destination::new(
             Address::new_domain("example.com".to_string()),
@@ -2389,8 +2359,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_errors_when_no_default_handler() {
-        use xray_common::net::address::Address;
-        use xray_common::net::destination::Destination;
+        use xray_common::net::{address::Address, destination::Destination};
 
         #[derive(Debug)]
         struct EmptyOhm;
@@ -2398,6 +2367,7 @@ mod tests {
             fn get_handler(&self, _tag: &str) -> Option<Arc<dyn DispatchHandler>> {
                 None
             }
+
             fn get_default_handler(&self) -> Option<Arc<dyn DispatchHandler>> {
                 None
             }
@@ -2416,14 +2386,17 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_e2e_dial_bridge_to_echo_server() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::{TcpListener, TcpStream};
-        use xray_buf::io::{Reader, Writer};
-        use xray_buf::multi::MultiBuffer;
-        use xray_common::net::address::Address;
-        use xray_common::net::destination::Destination;
-        use xray_common::net::network::Network;
-        use xray_common::net::port::Port;
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::{TcpListener, TcpStream},
+        };
+        use xray_buf::{
+            io::{Reader, Writer},
+            multi::MultiBuffer,
+        };
+        use xray_common::net::{
+            address::Address, destination::Destination, network::Network, port::Port,
+        };
         use xray_transport::connection::TcpConnection;
 
         // 1. echo server
@@ -2437,7 +2410,7 @@ mod tests {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         let _ = sock.write_all(&buf[..n]).await;
-                    }
+                    },
                 }
             }
         });
@@ -2476,13 +2449,10 @@ mod tests {
         mb.merge_bytes(b"e2e dispatch bridge");
         w.write_multi_buffer(mb).await.unwrap();
 
-        let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            r.read_multi_buffer(),
-        )
-        .await
-        .expect("timeout waiting for echo response")
-        .unwrap();
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
+            .await
+            .expect("timeout waiting for echo response")
+            .unwrap();
 
         assert_eq!(resp.to_vec(), b"e2e dispatch bridge");
         w.shutdown(); // 关闭触发 bridge 结束
@@ -2493,8 +2463,10 @@ mod tests {
     /// 孤儿在 bridge 释放后仍被唤醒跑到 done=true → 红。
     #[tokio::test]
     async fn chained_dispatch_task_dies_with_bridge() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::Duration;
+        use std::{
+            sync::atomic::{AtomicBool, Ordering},
+            time::Duration,
+        };
 
         #[derive(Debug)]
         struct HangingHandler {
@@ -2506,6 +2478,7 @@ mod tests {
             fn tag(&self) -> &str {
                 "hanging-chain"
             }
+
             fn dispatch(
                 &self,
                 _dest: &Destination,
@@ -2538,11 +2511,8 @@ mod tests {
         let bridge = Arc::new(DialBridge::new("bridge-under-test", dial));
         bridge.set_proxy_chain("hanging-chain", Arc::new(ohm));
 
-        let dest = Destination::new(
-            Address::from_ipv4_bytes([127, 0, 0, 1]),
-            Port::new(1),
-            Network::TCP,
-        );
+        let dest =
+            Destination::new(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(1), Network::TCP);
         let (up_r, _up_w) = xray_buf::pipe::new();
         let (_dn_r, dn_w) = xray_buf::pipe::new();
         let link = xray_transport::link::Link::new(
@@ -2590,9 +2560,9 @@ mod tests {
     #[tokio::test]
     async fn dispatch_link_routes_resolved_and_counts_outbound_traffic() {
         use std::future::Future;
+
         use xray_buf::multi::MultiBuffer;
-        use xray_common::net::address::Address;
-        use xray_common::net::destination::Destination;
+        use xray_common::net::{address::Address, destination::Destination};
 
         /// 一次性 echo handler：记录 dispatch 到的 dest domain，读一段回写后关闭。
         #[derive(Debug)]
@@ -2604,6 +2574,7 @@ mod tests {
             fn tag(&self) -> &str {
                 self.tag
             }
+
             fn dispatch(
                 &self,
                 dest: &Destination,
@@ -2632,10 +2603,12 @@ mod tests {
             fn pick_route(&self, _ctx: &dyn RoutingContext) -> Result<Route, DispatcherError> {
                 Ok(Route::new("should-not"))
             }
+
             fn pick_route_resolved<'a>(
                 &'a self,
                 _ctx: &'a dyn RoutingContext,
-            ) -> Pin<Box<dyn Future<Output = Result<Route, DispatcherError>> + Send + 'a>> {
+            ) -> Pin<Box<dyn Future<Output = Result<Route, DispatcherError>> + Send + 'a>>
+            {
                 Box::pin(async move { Ok(Route::new("tag-out")) })
             }
         }
@@ -2708,8 +2681,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_link_counts_per_user_traffic_and_online_ip() {
         use xray_buf::multi::MultiBuffer;
-        use xray_common::net::address::Address;
-        use xray_common::net::destination::Destination;
+        use xray_common::net::{address::Address, destination::Destination};
 
         /// 一次性 echo handler：读一段回写后关闭。
         #[derive(Debug)]
@@ -2718,6 +2690,7 @@ mod tests {
             fn tag(&self) -> &str {
                 "echo"
             }
+
             fn dispatch(
                 &self,
                 _dest: &Destination,
@@ -2811,8 +2784,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_link_skips_per_user_stats_when_policy_off() {
         use xray_buf::multi::MultiBuffer;
-        use xray_common::net::address::Address;
-        use xray_common::net::destination::Destination;
+        use xray_common::net::{address::Address, destination::Destination};
 
         #[derive(Debug)]
         struct EchoOnce;
@@ -2820,6 +2792,7 @@ mod tests {
             fn tag(&self) -> &str {
                 "echo"
             }
+
             fn dispatch(
                 &self,
                 _dest: &Destination,
@@ -2891,8 +2864,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_link_tag_counters_default_off_until_for_system_enabled() {
         use xray_buf::multi::MultiBuffer;
-        use xray_common::net::address::Address;
-        use xray_common::net::destination::Destination;
+        use xray_common::net::{address::Address, destination::Destination};
 
         #[derive(Debug)]
         struct EchoOnce;
@@ -2900,6 +2872,7 @@ mod tests {
             fn tag(&self) -> &str {
                 "echo"
             }
+
             fn dispatch(
                 &self,
                 _dest: &Destination,
@@ -2936,10 +2909,11 @@ mod tests {
             mb.merge_bytes(b"tag counter probe");
             w.write_multi_buffer(mb).await.unwrap();
             let mut r: Box<dyn xray_buf::io::Reader> = Box::new(dn_r);
-            let resp = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
-                .await
-                .expect("timeout waiting echo")
-                .unwrap();
+            let resp =
+                tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
+                    .await
+                    .expect("timeout waiting echo")
+                    .unwrap();
             assert_eq!(resp.to_vec(), b"tag counter probe");
         }
 
@@ -2986,20 +2960,17 @@ mod tests {
     #[tokio::test]
     async fn dispatch_tagged_routes_to_tag_handler_with_echo() {
         use xray_buf::multi::MultiBuffer;
-        use xray_common::net::address::Address;
-        use xray_common::net::destination::Destination;
+        use xray_common::net::{address::Address, destination::Destination};
 
         let alpha_called = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let ohm = SimpleOhm::new();
-        ohm.add(
-            "alpha",
-            Arc::new(TaggedEchoHandler::new("alpha", alpha_called.clone())),
-        );
+        ohm.add("alpha", Arc::new(TaggedEchoHandler::new("alpha", alpha_called.clone())));
         ohm.add(
             "beta",
-            Arc::new(TaggedEchoHandler::new("beta", std::sync::Arc::new(
-                std::sync::atomic::AtomicU32::new(0),
-            ))),
+            Arc::new(TaggedEchoHandler::new(
+                "beta",
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )),
         );
         let mut d = DefaultDispatcher::new();
         d.ohm = Some(Arc::new(ohm));
@@ -3009,9 +2980,7 @@ mod tests {
             Port::new(443),
             Network::TCP,
         );
-        let link = d
-            .dispatch_tagged(&dest, "beta")
-            .expect("dispatch_tagged should route to beta");
+        let link = d.dispatch_tagged(&dest, "beta").expect("dispatch_tagged should route to beta");
 
         let mut w = link.writer;
         let mut r = link.reader;
@@ -3036,15 +3005,11 @@ mod tests {
     /// （Go default.go:449-454 + DO NOT CHANGE 注释语义）。
     #[tokio::test]
     async fn dispatch_tagged_missing_tag_errors_without_fallback() {
-        use xray_common::net::address::Address;
-        use xray_common::net::destination::Destination;
+        use xray_common::net::{address::Address, destination::Destination};
 
         let default_called = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let ohm = SimpleOhm::new();
-        ohm.set_default(Arc::new(TaggedEchoHandler::new(
-            "default-out",
-            default_called.clone(),
-        )));
+        ohm.set_default(Arc::new(TaggedEchoHandler::new("default-out", default_called.clone())));
         let mut d = DefaultDispatcher::new();
         d.ohm = Some(Arc::new(ohm));
 
@@ -3068,14 +3033,14 @@ mod tests {
     /// tagged.Dialer 拨指定出站的场景）：real 拨向 echo server，decoy 在册不被触碰。
     #[tokio::test]
     async fn dispatch_tagged_e2e_dial_bridge_to_echo_server() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::{TcpListener, TcpStream};
-        use xray_buf::io::Writer;
-        use xray_buf::multi::MultiBuffer;
-        use xray_common::net::address::Address;
-        use xray_common::net::destination::Destination;
-        use xray_common::net::network::Network;
-        use xray_common::net::port::Port;
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::{TcpListener, TcpStream},
+        };
+        use xray_buf::{io::Writer, multi::MultiBuffer};
+        use xray_common::net::{
+            address::Address, destination::Destination, network::Network, port::Port,
+        };
         use xray_transport::connection::TcpConnection;
 
         // 1. echo server
@@ -3089,7 +3054,7 @@ mod tests {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         let _ = sock.write_all(&buf[..n]).await;
-                    }
+                    },
                 }
             }
         });
@@ -3106,10 +3071,7 @@ mod tests {
         let decoy_called = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let ohm = SimpleOhm::new();
         ohm.add("real-out", Arc::new(DialBridge::new("real-out", dial)));
-        ohm.add(
-            "decoy-out",
-            Arc::new(TaggedEchoHandler::new("decoy-out", decoy_called.clone())),
-        );
+        ohm.add("decoy-out", Arc::new(TaggedEchoHandler::new("decoy-out", decoy_called.clone())));
         let mut d = DefaultDispatcher::new();
         d.ohm = Some(Arc::new(ohm));
 
@@ -3119,9 +3081,7 @@ mod tests {
             Port::new(echo_port),
             Network::TCP,
         );
-        let link = d
-            .dispatch_tagged(&dest, "real-out")
-            .expect("dispatch_tagged to real-out");
+        let link = d.dispatch_tagged(&dest, "real-out").expect("dispatch_tagged to real-out");
         let mut w = link.writer;
         let mut r = link.reader;
         let mut mb = MultiBuffer::new();
@@ -3156,6 +3116,7 @@ mod tests {
         fn tag(&self) -> &str {
             self.tag
         }
+
         fn dispatch(
             &self,
             _dest: &xray_common::net::destination::Destination,
@@ -3200,6 +3161,7 @@ mod tests {
         fn tag(&self) -> &str {
             "udp-out"
         }
+
         fn dispatch(
             &self,
             _dest: &xray_common::net::destination::Destination,
@@ -3222,10 +3184,7 @@ mod tests {
 
     fn udp443_dispatcher(
         policy: Option<Udp443Policy>,
-    ) -> (
-        DefaultDispatcher,
-        std::sync::Arc<std::sync::atomic::AtomicU32>,
-    ) {
+    ) -> (DefaultDispatcher, std::sync::Arc<std::sync::atomic::AtomicU32>) {
         let called = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let ohm = SimpleOhm::new();
         ohm.set_default(std::sync::Arc::new(CountingEchoHandler {
@@ -3255,12 +3214,9 @@ mod tests {
 
         // 下行被关闭：inbound reader 收到 EOF（pipe 约定 Err(Eof)）
         let mut r = inbound.reader;
-        let res = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            r.read_multi_buffer(),
-        )
-        .await
-        .expect("timeout waiting EOF");
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
+            .await
+            .expect("timeout waiting EOF");
         assert!(
             matches!(res, Err(xray_buf::io::Error::Eof)),
             "reject should close downlink, got: {res:?}"
@@ -3274,8 +3230,10 @@ mod tests {
 
     #[tokio::test]
     async fn udp443_skip_dispatches_udp_443_direct() {
-        use xray_buf::io::{Reader, Writer};
-        use xray_buf::multi::MultiBuffer;
+        use xray_buf::{
+            io::{Reader, Writer},
+            multi::MultiBuffer,
+        };
         let (d, called) = udp443_dispatcher(Some(Udp443Policy::Skip));
 
         let inbound = d
@@ -3288,13 +3246,10 @@ mod tests {
         mb.merge_bytes(b"quic-ish");
         w.write_multi_buffer(mb).await.expect("write uplink");
 
-        let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            r.read_multi_buffer(),
-        )
-        .await
-        .expect("timeout waiting echo")
-        .expect("read ok");
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
+            .await
+            .expect("timeout waiting echo")
+            .expect("read ok");
         assert_eq!(resp.to_vec(), b"quic-ish");
         assert_eq!(
             called.load(std::sync::atomic::Ordering::SeqCst),
@@ -3340,6 +3295,7 @@ mod tests {
         fn tag(&self) -> &str {
             "frame-out"
         }
+
         fn dispatch(
             &self,
             dest: &xray_common::net::destination::Destination,
@@ -3360,7 +3316,8 @@ mod tests {
                         }
                         acc.extend_from_slice(&mb.to_vec());
                     }
-                    let mut pr = xray_xudp::packet::PacketReader::new(std::io::Cursor::new(&acc[..]));
+                    let mut pr =
+                        xray_xudp::packet::PacketReader::new(std::io::Cursor::new(&acc[..]));
                     if let Ok(Some(pkt)) = pr.read_packet() {
                         break pkt;
                     }
@@ -3369,11 +3326,8 @@ mod tests {
                 *seen.lock() = target.map(|t| t.address().clone());
                 // 回写帧：target = 改写后 dest（模拟 outbound 从改写目标收包）
                 let mut frame = Vec::new();
-                let mut pw = xray_xudp::packet::PacketWriter::new(
-                    &mut frame,
-                    dest.clone(),
-                    [0xAA; 8],
-                );
+                let mut pw =
+                    xray_xudp::packet::PacketWriter::new(&mut frame, dest.clone(), [0xAA; 8]);
                 let _ = pw.write_packet(&data);
                 drop(pw);
                 let mut mb = xray_buf::multi::MultiBuffer::new();
@@ -3386,15 +3340,15 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_link_udp_endpoint_override_rewrites_xudp_frames() {
-        use xray_buf::io::{Reader as _, Writer as _};
-        use xray_buf::multi::MultiBuffer;
+        use xray_buf::{
+            io::{Reader as _, Writer as _},
+            multi::MultiBuffer,
+        };
         use xray_common::net::address::Address;
 
         let ohm = SimpleOhm::new();
         let seen_target = Arc::new(parking_lot::Mutex::new(None));
-        ohm.set_default(Arc::new(FrameEchoHandler {
-            seen_target: Arc::clone(&seen_target),
-        }));
+        ohm.set_default(Arc::new(FrameEchoHandler { seen_target: Arc::clone(&seen_target) }));
         let mut d = DefaultDispatcher::new();
         d.ohm = Some(Arc::new(ohm));
         d.fdns = Some(Arc::new(FixedFakeDns));
@@ -3411,9 +3365,7 @@ mod tests {
             Port::new(53),
             Network::UDP,
         );
-        let inbound = d
-            .dispatch(&dest, &sniff, None, None)
-            .expect("dispatch returns inbound Link");
+        let inbound = d.dispatch(&dest, &sniff, None, None).expect("dispatch returns inbound Link");
         let mut w = inbound.writer;
         let mut r = inbound.reader;
 
@@ -3434,12 +3386,10 @@ mod tests {
         // 读回包（下行帧来源应被改回原始 IP）
         let mut acc = Vec::new();
         let pkt = loop {
-            let resp = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                r.read_multi_buffer(),
-            )
-            .await
-            .expect("timeout reading downlink");
+            let resp =
+                tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
+                    .await
+                    .expect("timeout reading downlink");
             match resp {
                 Ok(mb) if !mb.is_empty() => acc.extend_from_slice(&mb.to_vec()),
                 _ => panic!("downlink closed before frame"),
@@ -3468,8 +3418,10 @@ mod tests {
 
     #[tokio::test]
     async fn udp443_no_policy_flows_untouched() {
-        use xray_buf::io::{Reader, Writer};
-        use xray_buf::multi::MultiBuffer;
+        use xray_buf::{
+            io::{Reader, Writer},
+            multi::MultiBuffer,
+        };
         let (d, called) = udp443_dispatcher(None);
 
         let inbound = d
@@ -3482,13 +3434,10 @@ mod tests {
         mb.merge_bytes(b"quic");
         w.write_multi_buffer(mb).await.expect("write uplink");
 
-        let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            r.read_multi_buffer(),
-        )
-        .await
-        .expect("timeout waiting echo")
-        .expect("read ok");
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
+            .await
+            .expect("timeout waiting echo")
+            .expect("read ok");
         assert_eq!(resp.to_vec(), b"quic");
         assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -3516,23 +3465,19 @@ mod tests {
         fn tag(&self) -> &str {
             &self.tag
         }
+
         fn dispatch(
             &self,
             _dest: &Destination,
             _link: xray_transport::link::Link,
         ) -> PinFuture<()> {
-            self.signal
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.signal.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(std::future::pending())
         }
     }
 
     fn access_dest() -> Destination {
-        Destination::new(
-            Address::from_ipv4_bytes([127, 0, 0, 1]),
-            Port::new(8080),
-            Network::TCP,
-        )
+        Destination::new(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(8080), Network::TCP)
     }
 
     #[tokio::test]
@@ -3661,7 +3606,8 @@ mod tests {
             allowed_network: None,
             ..Default::default()
         };
-        let res = d.dispatch_link(&access_dest(), link, &SniffingRequest::default(), Some(access), None);
+        let res =
+            d.dispatch_link(&access_dest(), link, &SniffingRequest::default(), Some(access), None);
         assert!(res.is_err(), "no handler should be a sync error");
 
         let entries = sink.0.lock().clone();
@@ -3718,6 +3664,7 @@ mod tests {
         fn tag(&self) -> &str {
             self.tag
         }
+
         fn dispatch(
             &self,
             dest: &xray_common::net::destination::Destination,
@@ -3751,6 +3698,7 @@ mod tests {
                 Ok(Route::new("ip-tag"))
             }
         }
+
         fn pick_route_resolved<'a>(
             &'a self,
             ctx: &'a dyn RoutingContext,
@@ -3763,8 +3711,7 @@ mod tests {
     /// 对应 Go default.go:311-315。
     #[tokio::test]
     async fn dispatch_link_route_only_routes_by_sniffed_domain_dials_original_dest() {
-        use xray_buf::io::Writer as _;
-        use xray_buf::multi::MultiBuffer;
+        use xray_buf::{io::Writer as _, multi::MultiBuffer};
         use xray_common::net::address::Address;
 
         let ohm = SimpleOhm::new();
@@ -3800,12 +3747,12 @@ mod tests {
         payload.extend_from_slice(&(hello.len() as u16).to_be_bytes());
         payload.extend_from_slice(&hello);
 
-        let (up_r, mut up_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let (up_r, mut up_w) =
+            xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
         let (dn_r, dn_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
         let outbound = xray_transport::link::Link::new(Box::new(up_r), Box::new(dn_w));
 
-        d.dispatch_link(&dest, outbound, &sniff, None, None)
-            .expect("dispatch_link ok");
+        d.dispatch_link(&dest, outbound, &sniff, None, None).expect("dispatch_link ok");
 
         // 发 ClientHello（嗅探读首包）
         let mut mb = MultiBuffer::new();
@@ -3839,8 +3786,7 @@ mod tests {
     /// TLS ClientHello 不触发改写，target 保持原 IP 且 metadata 通道为空。
     #[tokio::test]
     async fn sniff_metadata_only_true_skips_payload_and_keeps_target() {
-        use xray_buf::io::Writer as _;
-        use xray_buf::multi::MultiBuffer;
+        use xray_buf::{io::Writer as _, multi::MultiBuffer};
         use xray_common::net::address::Address;
 
         let mut payload = vec![0x16, 0x03, 0x01];
@@ -3868,9 +3814,7 @@ mod tests {
         );
 
         let (final_dest, proto, route_target) =
-            sniff_connection(&mut cr, &dest, &req, None)
-                .await
-                .expect("sniff ok");
+            sniff_connection(&mut cr, &dest, &req, None).await.expect("sniff ok");
 
         assert_eq!(
             final_dest.address().ip(),
@@ -3879,18 +3823,14 @@ mod tests {
         );
         assert!(proto.is_none(), "no metadata domain without fakedns");
         assert!(route_target.is_none());
-        assert!(
-            cr.cached_bytes().is_empty(),
-            "payload must not be read under metadataOnly"
-        );
+        assert!(cr.cached_bytes().is_empty(), "payload must not be read under metadataOnly");
     }
 
     /// 对照（Go default.go:390-424）：metadataOnly=false 行为不变——TLS payload
     /// 嗅探命中 SNI 并按 destOverride 改写 target。
     #[tokio::test]
     async fn sniff_metadata_only_false_still_rewrites_target() {
-        use xray_buf::io::Writer as _;
-        use xray_buf::multi::MultiBuffer;
+        use xray_buf::{io::Writer as _, multi::MultiBuffer};
         use xray_common::net::address::Address;
 
         let mut payload = vec![0x16, 0x03, 0x01];
@@ -3917,9 +3857,7 @@ mod tests {
         );
 
         let (final_dest, proto, route_target) =
-            sniff_connection(&mut cr, &dest, &req, None)
-                .await
-                .expect("sniff ok");
+            sniff_connection(&mut cr, &dest, &req, None).await.expect("sniff ok");
 
         assert_eq!(
             final_dest.address().as_domain(),
@@ -3934,8 +3872,7 @@ mod tests {
     /// 时 fakedns 反查命中（元数据）仍参与改写——元数据可用，内容嗅探跳过。
     #[tokio::test]
     async fn sniff_metadata_only_true_fakedns_hit_applies_metadata() {
-        use xray_buf::io::Writer as _;
-        use xray_buf::multi::MultiBuffer;
+        use xray_buf::{io::Writer as _, multi::MultiBuffer};
         use xray_common::net::address::Address;
 
         let mut payload = vec![0x16, 0x03, 0x01];
@@ -3963,9 +3900,7 @@ mod tests {
         );
 
         let (final_dest, proto, route_target) =
-            sniff_connection(&mut cr, &dest, &req, Some(&FixedFakeDns))
-                .await
-                .expect("sniff ok");
+            sniff_connection(&mut cr, &dest, &req, Some(&FixedFakeDns)).await.expect("sniff ok");
 
         assert_eq!(
             final_dest.address().as_domain(),
@@ -3985,8 +3920,7 @@ mod tests {
     /// （旧实现首轮即放弃按原 IP 路由）。
     #[tokio::test]
     async fn sniff_http_host_in_second_segment_retries() {
-        use xray_buf::io::Writer as _;
-        use xray_buf::multi::MultiBuffer;
+        use xray_buf::{io::Writer as _, multi::MultiBuffer};
         use xray_common::net::address::Address;
 
         let (r, mut w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
@@ -4035,7 +3969,11 @@ mod tests {
                 &mut self,
             ) -> Pin<Box<dyn Future<Output = Result<MultiBuffer, xray_buf::io::Error>> + Send + '_>>
             {
-                Box::pin(async { loop { tokio::time::sleep(std::time::Duration::from_secs(3600)).await; } })
+                Box::pin(async {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    }
+                })
             }
         }
 
@@ -4076,8 +4014,7 @@ mod tests {
     /// 拨号改写跟域名（不向失效假 IP 黑洞），route_only 不生效。
     #[tokio::test]
     async fn sniff_fake_ip_pool_without_mapping_wraps_fakedns_others() {
-        use xray_buf::io::Writer as _;
-        use xray_buf::multi::MultiBuffer;
+        use xray_buf::{io::Writer as _, multi::MultiBuffer};
         use xray_common::net::address::Address;
 
         let mut payload = vec![0x16, 0x03, 0x01];
@@ -4104,14 +4041,8 @@ mod tests {
             Network::TCP,
         );
 
-        let (final_dest, proto, route_target) = sniff_connection(
-            &mut cr,
-            &dest,
-            &req,
-            Some(&PoolOnlyFakeDns),
-        )
-        .await
-        .expect("sniff ok");
+        let (final_dest, proto, route_target) =
+            sniff_connection(&mut cr, &dest, &req, Some(&PoolOnlyFakeDns)).await.expect("sniff ok");
 
         assert_eq!(
             final_dest.address().as_domain(),
@@ -4132,10 +4063,12 @@ mod tests {
             fn pick_route(&self, _ctx: &dyn RoutingContext) -> Result<Route, DispatcherError> {
                 Ok(Route::new("missing-tag"))
             }
+
             fn pick_route_resolved<'a>(
                 &'a self,
                 _ctx: &'a dyn RoutingContext,
-            ) -> Pin<Box<dyn Future<Output = Result<Route, DispatcherError>> + Send + 'a>> {
+            ) -> Pin<Box<dyn Future<Output = Result<Route, DispatcherError>> + Send + 'a>>
+            {
                 Box::pin(async move { Ok(Route::new("missing-tag")) })
             }
         }
@@ -4162,12 +4095,15 @@ mod tests {
         d.dispatch_link(&dest, outbound, &SniffingRequest::default(), None, None)
             .expect("dispatch_link ok");
         let mut r: Box<dyn xray_buf::io::Reader> = Box::new(dn_r);
-        let eof = match tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer()).await {
-            Err(_) => panic!("timeout waiting EOF"),
-            Ok(Err(_)) => true, // writer shutdown → 管道 EOF
+        let eof =
+            match tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
+                .await
+            {
+                Err(_) => panic!("timeout waiting EOF"),
+                Ok(Err(_)) => true, // writer shutdown → 管道 EOF
 
-            Ok(Ok(mb)) => mb.is_empty(),
-        };
+                Ok(Ok(mb)) => mb.is_empty(),
+            };
         assert!(eof, "downlink should be EOF after missing-tag shutdown");
 
         // 默认出站不得被触发
@@ -4204,18 +4140,17 @@ mod tests {
         let (stats, d) = build_oz1t_dispatcher(true);
         let payload = b"with-overhead-12345";
         let (up_w, mut dn_r) = drive_oz1t_traffic(&d, "gated2.example.com", payload).await;
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
-            .await
-            .expect("timeout")
-            .unwrap();
+        let resp =
+            tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
+                .await
+                .expect("timeout")
+                .unwrap();
         drop(up_w);
         assert_eq!(resp.to_vec(), payload);
-        let up = stats
-            .get_counter("outbound>>>tag-out>>>traffic>>>uplink")
-            .expect("uplink counter");
-        let dn = stats
-            .get_counter("outbound>>>tag-out>>>traffic>>>downlink")
-            .expect("downlink counter");
+        let up =
+            stats.get_counter("outbound>>>tag-out>>>traffic>>>uplink").expect("uplink counter");
+        let dn =
+            stats.get_counter("outbound>>>tag-out>>>traffic>>>downlink").expect("downlink counter");
         assert!(up.value() >= payload.len() as i64, "uplink {} >= payload len", up.value());
         assert!(dn.value() >= payload.len() as i64, "downlink {} >= payload len", dn.value());
     }
@@ -4223,10 +4158,7 @@ mod tests {
     /// oz1t 共享测试装置：构造带 EchoHandler + ResolvedRouter 的 dispatcher，
     /// `gate_on=true` 时经 ForSystem 门开启 tag counter（sm80①：per-tag 计数
     /// 门 = ForSystem().Stats，原 oz1t 直改 default_policy.user_* 是错误的门）。
-    fn build_oz1t_dispatcher(gate_on: bool) -> (
-        Arc<xray_app_stats::Manager>,
-        DefaultDispatcher,
-    ) {
+    fn build_oz1t_dispatcher(gate_on: bool) -> (Arc<xray_app_stats::Manager>, DefaultDispatcher) {
         use std::pin::Pin;
 
         #[derive(Debug)]
@@ -4237,6 +4169,7 @@ mod tests {
             fn tag(&self) -> &str {
                 self.tag
             }
+
             fn dispatch(
                 &self,
                 _dest: &Destination,
@@ -4261,10 +4194,12 @@ mod tests {
             fn pick_route(&self, _ctx: &dyn RoutingContext) -> Result<Route, DispatcherError> {
                 Ok(Route::new("tag-out"))
             }
+
             fn pick_route_resolved<'a>(
                 &'a self,
                 _ctx: &'a dyn RoutingContext,
-            ) -> Pin<Box<dyn Future<Output = Result<Route, DispatcherError>> + Send + 'a>> {
+            ) -> Pin<Box<dyn Future<Output = Result<Route, DispatcherError>> + Send + 'a>>
+            {
                 Box::pin(async move { Ok(Route::new("tag-out")) })
             }
         }
@@ -4287,10 +4222,7 @@ mod tests {
         d: &DefaultDispatcher,
         domain: &str,
         payload: &[u8],
-    ) -> (
-        Box<dyn xray_buf::io::Writer>,
-        Box<dyn xray_buf::io::Reader>,
-    ) {
+    ) -> (Box<dyn xray_buf::io::Writer>, Box<dyn xray_buf::io::Reader>) {
         let (up_r, up_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
         let (dn_r, dn_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
         let outbound = xray_transport::link::Link::new(Box::new(up_r), Box::new(dn_w));
@@ -4315,9 +4247,7 @@ mod tests {
     /// 证明装配层 `policy_for_level(level).timeout` 注入真实生效。
     #[tokio::test]
     async fn dial_bridge_with_policy_drives_conn_idle() {
-        use xray_common::net::address::Address;
-        use xray_common::net::destination::Destination;
-        use xray_common::net::port::Port;
+        use xray_common::net::{address::Address, destination::Destination, port::Port};
 
         // dial 返回静默 duplex server 端；client 端 forget 保活防 EOF 提前结束。
         let dial: DialFn = Arc::new(move |_dest: &Destination| {
@@ -4336,10 +4266,8 @@ mod tests {
         policy.downlink_only = std::time::Duration::from_millis(100);
         bridge.with_policy(policy);
 
-        let (up_r, up_w) =
-            xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
-        let (dn_r, dn_w) =
-            xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let (up_r, up_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let (dn_r, dn_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
         drop(up_w); // 上行无数据：conn_idle 从 bridge 启动起计
         drop(dn_r);
         let link = xray_transport::link::Link::new(
@@ -4367,12 +4295,11 @@ mod tests {
     /// `INBOUND_SPLICE` scope（freedom `PROXY_PROTO_SRC` 同模式），出站为真裸
     /// TCP。断言随 [`xray_common::platform::splice::splice_allowed`] 的真实
     /// 判定分叉：
-    /// - **准入了**（Linux/Android 且 env 开——缺省不设即开，容器床跑法）：
-    ///   下行零拷贝直达入站 raw fd——**绕过 link.writer 正是 splice 的语义**
-    ///   （Go responseDone 直写 inbound.Conn）——echo 必须从入站 raw conn 读到，
-    ///   且 `splice_admitted()==true`；
-    /// - **未准入**（Windows/macOS 平台闸门，或 env 未开）：回退既有泵，
-    ///   echo 经 link.writer 流通，`splice_admitted()==false`。
+    /// - **准入了**（Linux/Android 且 env 开——缺省不设即开，容器床跑法）： 下行零拷贝直达入站 raw
+    ///   fd——**绕过 link.writer 正是 splice 的语义** （Go responseDone 直写 inbound.Conn）——echo
+    ///   必须从入站 raw conn 读到， 且 `splice_admitted()==true`；
+    /// - **未准入**（Windows/macOS 平台闸门，或 env 未开）：回退既有泵， echo 经 link.writer
+    ///   流通，`splice_admitted()==false`。
     ///
     /// 激活路径跑法（容器床）：env 不设（三态缺省开）或 `XRAY_BUF_SPLICE=enable
     /// cargo test -p xray-app-dispatcher --lib dialbridge`。注意 `=1` 是
@@ -4380,6 +4307,7 @@ mod tests {
     #[tokio::test]
     async fn dialbridge_splice_gated_falls_back_and_flows() {
         use std::net::SocketAddr;
+
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // echo server（出站目标）
@@ -4404,9 +4332,8 @@ mod tests {
         // dial → 真裸 TCP（outbound_raw = true，信号面全绿）
         let dial: DialFn = Arc::new(move |_dest: &Destination| {
             Box::pin(async move {
-                let stream = tokio::net::TcpStream::connect(echo_addr)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let stream =
+                    tokio::net::TcpStream::connect(echo_addr).await.map_err(|e| e.to_string())?;
                 Ok(Box::new(xray_transport::connection::TcpConnection::new(stream))
                     as Box<dyn Connection>)
             })
@@ -4417,9 +4344,7 @@ mod tests {
         let mut in_raw = tokio::net::TcpStream::connect(echo_addr).await.unwrap();
         let meta = InboundSpliceMeta {
             can_splice_copy: xray_common::platform::splice::CAN_SPLICE_COPY_YES,
-            raw: Some(Arc::new(
-                xray_transport::connection::dup_tcp_stream(&in_raw).unwrap(),
-            )),
+            raw: Some(Arc::new(xray_transport::connection::dup_tcp_stream(&in_raw).unwrap())),
             ..Default::default()
         };
         // Go freedom.go:260 唯一置 1 点（xray-core outbound.rs freedom 分支同款）
@@ -4471,10 +4396,13 @@ mod tests {
         if admitted {
             // splice 激活：下行直达入站 raw fd（绕过 link.writer）
             let mut echo_buf = [0u8; 11];
-            tokio::time::timeout(std::time::Duration::from_secs(5), in_raw.read_exact(&mut echo_buf))
-                .await
-                .expect("splice 下行必须在超时内抵达入站 raw conn")
-                .expect("read raw");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                in_raw.read_exact(&mut echo_buf),
+            )
+            .await
+            .expect("splice 下行必须在超时内抵达入站 raw conn")
+            .expect("read raw");
             assert_eq!(&echo_buf, b"ping-splice", "splice 路径下行必须直达入站 raw conn");
             // link.writer 方向不得再收到数据（splice 绕行语义）
             let mut dn_r = dn_r;
@@ -4487,13 +4415,11 @@ mod tests {
         } else {
             // 回退泵：echo 经 link.writer 双向流通
             let mut dn_r = dn_r;
-            let resp = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                dn_r.read_multi_buffer(),
-            )
-            .await
-            .expect("echo within timeout")
-            .expect("read ok");
+            let resp =
+                tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
+                    .await
+                    .expect("echo within timeout")
+                    .expect("read ok");
             let mut out = Vec::new();
             for b in resp.iter() {
                 out.extend_from_slice(b.bytes());
@@ -4506,5 +4432,3 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), dispatch_task).await;
     }
 }
-
-

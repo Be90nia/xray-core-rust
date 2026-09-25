@@ -123,10 +123,7 @@ impl Config {
 
     /// 是否使用了已废弃的全局 transport 字段（Build 时用于触发迁移错误）。
     pub fn uses_deprecated_transport(&self) -> bool {
-        self.transport
-            .as_ref()
-            .map(|m| !m.is_empty())
-            .unwrap_or(false)
+        self.transport.as_ref().map(|m| !m.is_empty()).unwrap_or(false)
     }
 }
 
@@ -317,10 +314,7 @@ mod tests {
         let cfg = Config::from_json_str(MINIMAL_CONFIG).unwrap();
         let inbound = cfg.find_inbound("vless-in").expect("inbound exists");
         assert_eq!(inbound.protocol, "vless");
-        assert_eq!(
-            inbound.port.as_ref().unwrap().0,
-            vec![crate::common::PortRange::single(443)]
-        );
+        assert_eq!(inbound.port.as_ref().unwrap().0, vec![crate::common::PortRange::single(443)]);
         assert_eq!(inbound.listen.as_ref().unwrap().as_str(), "0.0.0.0");
         assert!(inbound.settings.is_some());
         assert!(inbound.stream_settings.is_some());
@@ -397,10 +391,8 @@ mod tests {
     #[test]
     fn env_parses_from_json() {
         // Go EnvConfig = map[string]string（xray.go:383），顶层 json tag "env"（:396）。
-        let cfg = Config::from_json_str(
-            r#"{ "env": { "XRAY_ENV_A": "1", "XRAY_ENV_B": "x y" } }"#,
-        )
-        .unwrap();
+        let cfg = Config::from_json_str(r#"{ "env": { "XRAY_ENV_A": "1", "XRAY_ENV_B": "x y" } }"#)
+            .unwrap();
         let env = cfg.env.expect("env must parse");
         assert_eq!(env.get("XRAY_ENV_A").map(String::as_str), Some("1"));
         assert_eq!(env.get("XRAY_ENV_B").map(String::as_str), Some("x y"));

@@ -66,9 +66,7 @@ impl OutboundStatus {
             last_seen_time: p.last_seen_time,
             last_try_time: p.last_try_time,
             health_ping: if p.health_ping.is_some() {
-                Some(HealthPingMeasurement::from_proto(
-                    p.health_ping.as_ref().unwrap(),
-                ))
+                Some(HealthPingMeasurement::from_proto(p.health_ping.as_ref().unwrap()))
             } else {
                 None
             },
@@ -98,9 +96,7 @@ pub struct ObservationResult {
 
 impl ObservationResult {
     pub fn from_proto(p: &ProtoObservationResult) -> Self {
-        Self {
-            status: p.status.iter().map(OutboundStatus::from_proto).collect(),
-        }
+        Self { status: p.status.iter().map(OutboundStatus::from_proto).collect() }
     }
 
     pub fn to_proto(&self) -> ProtoObservationResult {
@@ -120,11 +116,7 @@ pub struct ProbeResult {
 
 impl ProbeResult {
     pub fn from_proto(p: &ProtoProbeResult) -> Self {
-        Self {
-            alive: p.alive,
-            delay: p.delay,
-            last_error_reason: p.last_error_reason.clone(),
-        }
+        Self { alive: p.alive, delay: p.delay, last_error_reason: p.last_error_reason.clone() }
     }
 
     pub fn to_proto(&self) -> ProtoProbeResult {
@@ -186,20 +178,12 @@ impl ObservatoryConfig {
 
     /// 解析后的 probe URL（空则用默认）。
     pub fn effective_probe_url(&self) -> &str {
-        if self.probe_url.is_empty() {
-            DEFAULT_PROBE_URL
-        } else {
-            &self.probe_url
-        }
+        if self.probe_url.is_empty() { DEFAULT_PROBE_URL } else { &self.probe_url }
     }
 
     /// 解析后的 probe interval（0 则用默认）。
     pub fn effective_probe_interval_ms(&self) -> i64 {
-        if self.probe_interval == 0 {
-            DEFAULT_PROBE_INTERVAL_MS
-        } else {
-            self.probe_interval
-        }
+        if self.probe_interval == 0 { DEFAULT_PROBE_INTERVAL_MS } else { self.probe_interval }
     }
 }
 
@@ -293,11 +277,7 @@ mod tests {
 
     #[test]
     fn probe_result_proto_roundtrip() {
-        let r = ProbeResult {
-            alive: true,
-            delay: 50,
-            last_error_reason: String::new(),
-        };
+        let r = ProbeResult { alive: true, delay: 50, last_error_reason: String::new() };
         let p = r.to_proto();
         assert_eq!(ProbeResult::from_proto(&p), r);
     }
@@ -331,10 +311,7 @@ mod tests {
 
     #[test]
     fn config_effective_probe_url_custom() {
-        let c = ObservatoryConfig {
-            probe_url: "https://custom.test".into(),
-            ..Default::default()
-        };
+        let c = ObservatoryConfig { probe_url: "https://custom.test".into(), ..Default::default() };
         assert_eq!(c.effective_probe_url(), "https://custom.test");
     }
 
@@ -346,10 +323,7 @@ mod tests {
 
     #[test]
     fn config_effective_probe_interval_custom() {
-        let c = ObservatoryConfig {
-            probe_interval: 30_000,
-            ..Default::default()
-        };
+        let c = ObservatoryConfig { probe_interval: 30_000, ..Default::default() };
         assert_eq!(c.effective_probe_interval_ms(), 30_000);
     }
 

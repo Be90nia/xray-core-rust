@@ -23,8 +23,7 @@
 //! outbound relay EOF 退出）。若后续出现长生命周期无控制连接的 UDP 入站
 //! （tun/fakeDNS），再补 idle deadline。
 
-use std::io;
-use std::sync::Arc;
+use std::{io, sync::Arc};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use xray_buf::io::{new_reader, new_writer};
@@ -70,10 +69,7 @@ impl UdpDispatchSession {
     /// 创建会话。`dispatcher` 为生产路由 handler 或任意支持 UDP 目标的
     /// [`DispatchHandler`]（outbound 侧须按 XUDP 帧约定消费 link，如 freedom）。
     pub fn new(dispatcher: Arc<dyn DispatchHandler>) -> Self {
-        Self {
-            dispatcher,
-            inner: None,
-        }
+        Self { dispatcher, inner: None }
     }
 
     /// 发送一个 UDP 数据报。
@@ -117,7 +113,7 @@ impl UdpDispatchSession {
             None => {
                 std::future::pending::<()>().await;
                 unreachable!()
-            }
+            },
         };
         loop {
             if !inner.accum.is_empty() {
@@ -131,9 +127,9 @@ impl UdpDispatchSession {
                         let (data, target) = pkt.into_parts();
                         let source = target.unwrap_or_else(|| inner.dest.clone());
                         return Ok(Some((source, data)));
-                    }
-                    Ok(None) => {} // 帧不完整，等更多数据
-                    Err(PacketError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {}
+                    },
+                    Ok(None) => {}, // 帧不完整，等更多数据
+                    Err(PacketError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {},
                     Err(e) => {
                         // qyn8：协议解析错误先 drain 已消费的坏帧字节再报错。
                         // 解析错误发生时 cursor 至少消费了 2B 长度头，不 drain
@@ -142,7 +138,7 @@ impl UdpDispatchSession {
                         // 此路径（resp.read 的 io Err 由下方 `?` 直接传播）。
                         inner.accum.drain(..consumed);
                         return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
-                    }
+                    },
                 }
             }
             let mut buf = [0u8; MAX_DATAGRAM];
@@ -179,10 +175,9 @@ impl UdpDispatchSession {
 mod tests {
     use std::net::Ipv4Addr;
 
-    use super::*;
-    use xray_common::net::address::Address;
-    use xray_common::net::port::Port;
+    use xray_common::net::{address::Address, port::Port};
 
+    use super::*;
 
     /// Echo handler：读首帧 → 验证 target → 回写一帧（来源 = 请求 target）。
     struct EchoHandler;
@@ -219,11 +214,8 @@ mod tests {
                 let echo_from = target.unwrap_or(dest);
                 // 回写一帧（来源 = 请求目标）
                 let mut frame = Vec::new();
-                let meta = FrameMetadata::new_udp(
-                    echo_from.address().clone(),
-                    echo_from.port(),
-                    [0u8; 8],
-                );
+                let meta =
+                    FrameMetadata::new_udp(echo_from.address().clone(), echo_from.port(), [0u8; 8]);
                 meta.write_to(&mut frame).unwrap();
                 frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
                 frame.extend_from_slice(&data);
@@ -244,16 +236,10 @@ mod tests {
     async fn send_recv_roundtrip() {
         let mut session = UdpDispatchSession::new(Arc::new(EchoHandler));
         let dest = udp_dest([8, 8, 4, 4], 53);
-        session
-            .send_packet(&dest, b"dns-query")
-            .await
-            .expect("send failed");
+        session.send_packet(&dest, b"dns-query").await.expect("send failed");
 
-        let (source, payload) = session
-            .recv_packet()
-            .await
-            .expect("recv failed")
-            .expect("session ended");
+        let (source, payload) =
+            session.recv_packet().await.expect("recv failed").expect("session ended");
         assert_eq!(payload, b"dns-query");
         assert_eq!(source, dest, "echo source should carry per-packet target");
     }
@@ -267,11 +253,8 @@ mod tests {
             fn tag(&self) -> &str {
                 "capture"
             }
-            fn dispatch(
-                &self,
-                _dest: &Destination,
-                link: Link,
-            ) -> crate::default::PinFuture<()> {
+
+            fn dispatch(&self, _dest: &Destination, link: Link) -> crate::default::PinFuture<()> {
                 let captured = std::sync::Arc::clone(&self.0);
                 Box::pin(async move {
                     use xray_buf::io::{Reader, Writer};
@@ -310,7 +293,7 @@ mod tests {
                                         }
                                     }
                                     accum.drain(..consumed);
-                                }
+                                },
                                 _ => break,
                             }
                         }
@@ -341,8 +324,8 @@ mod tests {
     async fn recv_before_send_pends() {
         // 未建立 link 时 recv_packet 挂起（不 panic、不返回）
         let mut session = UdpDispatchSession::new(Arc::new(EchoHandler));
-        let r = tokio::time::timeout(std::time::Duration::from_millis(50), session.recv_packet())
-            .await;
+        let r =
+            tokio::time::timeout(std::time::Duration::from_millis(50), session.recv_packet()).await;
         assert!(r.is_err(), "recv before send must pend");
     }
 

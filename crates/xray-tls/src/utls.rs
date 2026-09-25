@@ -8,8 +8,8 @@
 //! 走标准 [`rustls`] 0.23 + [`tokio_rustls`] 0.26：
 //! - [`client`]：标准客户端握手，返回 [`Conn`]
 //! - [`server`]：标准服务端握手，返回 [`ServerConn`]
-//! - [`u_client`]：btls（BoringSSL）真实浏览器指纹握手，返回携带 `Fingerprint`
-//!   标记的 [`UConn`]；清单外指纹硬错（不静默回退）。ALPN 覆盖变体见
+//! - [`u_client`]：btls（BoringSSL）真实浏览器指纹握手，返回携带 `Fingerprint` 标记的
+//!   [`UConn`]；清单外指纹硬错（不静默回退）。ALPN 覆盖变体见
 //!   [`u_client_with_alpn`]（ws/httpupgrade WebsocketHandshakeContext 语义）
 //!
 //! 工厂函数 async——握手在工厂内部完成；返回的 Conn/UConn 已是已握手连接。
@@ -21,19 +21,23 @@
 //! 与 [`ConnInterface`]（握手相关 API）。AsyncRead + AsyncWrite 由 forward 到
 //! `tokio_rustls::TlsStream<S>` 自动获得。
 
-use std::future::Future;
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{ready, Context, Poll};
+use std::{
+    future::Future,
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll, ready},
+};
 
 use rustls_pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio_rustls::client::TlsStream as ClientTlsStream;
-use tokio_rustls::rustls::{ClientConfig, ServerConfig};
-use tokio_rustls::server::TlsStream as ServerTlsStream;
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_rustls::{
+    TlsAcceptor, TlsConnector,
+    client::TlsStream as ClientTlsStream,
+    rustls::{ClientConfig, ServerConfig},
+    server::TlsStream as ServerTlsStream,
+};
 use tracing::debug;
 use xray_transport::connection::Connection;
 
@@ -62,14 +66,11 @@ pub trait ConnInterface: Connection {
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>>;
 
     /// 握手并返回 ServerName（SNI）。握手失败返回空字符串。
-    fn handshake_server_name<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>>;
+    fn handshake_server_name<'a>(&'a mut self)
+    -> Pin<Box<dyn Future<Output = String> + Send + 'a>>;
 
     /// 返回 ALPN 协商出的协议名（如 `"h2"`/`"http/1.1"`）。未协商返回空字符串。
-    fn negotiated_protocol<'a>(
-        &'a self,
-    ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>>;
+    fn negotiated_protocol<'a>(&'a self) -> Pin<Box<dyn Future<Output = String> + Send + 'a>>;
 }
 
 // ============================================================
@@ -130,13 +131,12 @@ impl<S: Connection + Unpin> AsyncRead for Conn<S> {
         if self.dirty {
             match Pin::new(&mut self.inner).poll_flush(cx) {
                 Poll::Ready(Ok(())) => self.dirty = false,
-                Poll::Pending | Poll::Ready(Err(_)) => {}
+                Poll::Pending | Poll::Ready(Err(_)) => {},
             }
         }
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
-
 
 impl<S: Connection + Unpin> AsyncWrite for Conn<S> {
     fn poll_write(
@@ -264,7 +264,7 @@ impl<S: Connection + Unpin> AsyncRead for ServerConn<S> {
         if self.dirty {
             match Pin::new(&mut self.inner).poll_flush(cx) {
                 Poll::Ready(Ok(())) => self.dirty = false,
-                Poll::Pending | Poll::Ready(Err(_)) => {}
+                Poll::Pending | Poll::Ready(Err(_)) => {},
             }
         }
         Pin::new(&mut self.inner).poll_read(cx, buf)
@@ -415,7 +415,6 @@ impl<S: Connection + Unpin> Connection for UConn<S> {
     }
 }
 
-
 impl<S: Connection + Unpin> ConnInterface for UConn<S> {
     fn handshake<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>> {
         match &mut self.inner {
@@ -470,8 +469,10 @@ where
     S: Connection + Unpin,
 {
     let connector = TlsConnector::from(config);
-    let server: ServerName<'static> = ServerName::try_from(server_name.to_string())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid server name: {e}")))?;
+    let server: ServerName<'static> =
+        ServerName::try_from(server_name.to_string()).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("invalid server name: {e}"))
+        })?;
     let tls_stream = connector.connect(server, stream).await?;
     Ok(Conn { inner: tls_stream, server_name: server_name.to_string(), dirty: false })
 }
@@ -479,10 +480,7 @@ where
 /// 创建标准 rustls TLS 服务端连接（完成握手）。
 ///
 /// 对应 Go `tls.Server(c, config)` + `HandshakeContext`。
-pub async fn server<S>(
-    stream: S,
-    config: Arc<ServerConfig>,
-) -> io::Result<ServerConn<S>>
+pub async fn server<S>(stream: S, config: Arc<ServerConfig>) -> io::Result<ServerConn<S>>
 where
     S: Connection + Unpin,
 {
@@ -508,7 +506,16 @@ pub async fn u_client<S>(
 where
     S: Connection + Unpin,
 {
-    u_client_with_alpn(stream, server_name, config, fingerprint, ech_config_list, security_json, None).await
+    u_client_with_alpn(
+        stream,
+        server_name,
+        config,
+        fingerprint,
+        ech_config_list,
+        security_json,
+        None,
+    )
+    .await
 }
 
 /// [`u_client`] 的 ALPN 覆盖版（ws/httpupgrade 出站接线用，md5i）。
@@ -547,16 +554,17 @@ where
                         use base64::Engine as _;
                         match crate::ech_doh::query_ech_config(list, server_name, None).await {
                             Ok(bytes) => {
-                                ech_resolved = base64::engine::general_purpose::STANDARD.encode(bytes);
+                                ech_resolved =
+                                    base64::engine::general_purpose::STANDARD.encode(bytes);
                                 Some(ech_resolved.as_str())
-                            }
+                            },
                             Err(e) => {
                                 debug!(target: "xray_tls::utls", error = %e,
                                     "ECH DoH query failed; falling back to invalid config (connection will fail)");
                                 Some(list)
-                            }
+                            },
                         }
-                    }
+                    },
                     other => other,
                 };
                 match crate::btls_client::BtlsConn::connect_with_alpn(
@@ -573,19 +581,19 @@ where
                 {
                     Ok(btls_conn) => {
                         return Ok(UConn { inner: UConnInner::Btls(btls_conn), fingerprint });
-                    }
+                    },
                     Err(e) => {
                         debug!(target: "xray_tls::utls", ?fingerprint, error = %e, "btls 握手失败, fallback 到 rustls");
                         // fallback: 重新建立 TCP 连接已不可能（stream 被 consume），返回错误
                         return Err(e);
-                    }
+                    },
                 }
-            }
+            },
             Err(e) => {
                 // 清单外指纹（InvalidData）等 connector 构建失败：硬错。
                 // 配置了指纹却静默回退标准 rustls 等于伪装失效（批3 裁决）。
                 return Err(e);
-            }
+            },
         }
     }
     // rustls fallback：无 ECH 能力（rustls 无该 feature），配置了 ECH 时 warn。
@@ -600,7 +608,6 @@ where
     let inner = client(stream, server_name, config).await?;
     Ok(UConn { inner: UConnInner::Rustls(inner), fingerprint })
 }
-
 
 /// ALPN 协议列表 → openssl wire 格式（每项前缀单字节长度）。
 fn encode_alpn_wire(protocols: &[Vec<u8>]) -> Vec<u8> {
@@ -623,11 +630,7 @@ pub fn websocket_handshake_alpn(security_json: Option<&serde_json::Value>) -> Ve
     let user: Option<Vec<Vec<u8>>> = security_json
         .and_then(|j| j.get("alpn"))
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|s| s.as_str().map(|x| x.as_bytes().to_vec()))
-                .collect()
-        });
+        .map(|arr| arr.iter().filter_map(|s| s.as_str().map(|x| x.as_bytes().to_vec())).collect());
     let h2_h1 = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     match user {
         Some(a) if a == h2_h1 => a,
@@ -644,11 +647,7 @@ pub fn default_client_config() -> Arc<ClientConfig> {
     xray_common::ensure_default_crypto_provider();
     let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    Arc::new(
-        ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth(),
-    )
+    Arc::new(ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth())
 }
 
 // ============================================================
@@ -657,9 +656,10 @@ pub fn default_client_config() -> Arc<ClientConfig> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use xray_transport::connection::TcpConnection;
+
+    use super::*;
 
     /// 测试用 TLS server：自签证书 + 单条消息回显。
     async fn spawn_test_server(msg: &'static [u8]) -> (std::net::SocketAddr, Vec<u8>) {
@@ -675,10 +675,7 @@ mod tests {
         let key = rustls_pki_types::PrivateKeyDer::try_from(key_der).unwrap();
         let server_config = ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(
-                vec![rustls_pki_types::CertificateDer::from(cert_der.clone())],
-                key,
-            )
+            .with_single_cert(vec![rustls_pki_types::CertificateDer::from(cert_der.clone())], key)
             .unwrap();
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
 
@@ -707,14 +704,8 @@ mod tests {
     fn trusted_config(cert_der: Vec<u8>) -> Arc<ClientConfig> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
-        root_store
-            .add(rustls_pki_types::CertificateDer::from(cert_der))
-            .unwrap();
-        Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
-        )
+        root_store.add(rustls_pki_types::CertificateDer::from(cert_der)).unwrap();
+        Arc::new(ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth())
     }
 
     #[tokio::test]
@@ -723,7 +714,8 @@ mod tests {
         let config = trusted_config(cert_der);
 
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut conn = client(TcpConnection::new(tcp), "localhost", config).await.expect("handshake ok");
+        let mut conn =
+            client(TcpConnection::new(tcp), "localhost", config).await.expect("handshake ok");
 
         let mut buf = Vec::new();
         conn.read_to_end(&mut buf).await.expect("read ok");
@@ -764,10 +756,7 @@ mod tests {
     #[test]
     fn websocket_handshake_alpn_forces_h1_unless_h2_camouflage() {
         // 未配置 → 强制 http/1.1（WithNextProto 缺省）
-        assert_eq!(
-            websocket_handshake_alpn(None),
-            vec![b"http/1.1".to_vec()]
-        );
+        assert_eq!(websocket_handshake_alpn(None), vec![b"http/1.1".to_vec()]);
         assert_eq!(
             websocket_handshake_alpn(Some(&serde_json::json!({}))),
             vec![b"http/1.1".to_vec()]
@@ -787,10 +776,7 @@ mod tests {
     /// md5i：encode_alpn_wire —— openssl wire 格式（每项单字节长度前缀）。
     #[test]
     fn encode_alpn_wire_prepends_lengths() {
-        assert_eq!(
-            encode_alpn_wire(&[b"http/1.1".to_vec()]),
-            b"\x08http/1.1".to_vec()
-        );
+        assert_eq!(encode_alpn_wire(&[b"http/1.1".to_vec()]), b"\x08http/1.1".to_vec());
         assert_eq!(
             encode_alpn_wire(&[b"h2".to_vec(), b"http/1.1".to_vec()]),
             b"\x02h2\x08http/1.1".to_vec()
@@ -851,10 +837,7 @@ mod tests {
 
         // 验证 ALPN 协商
         let alpn = conn.negotiated_protocol().await;
-        assert!(
-            alpn == "h2" || alpn == "http/1.1",
-            "ALPN 应为 h2 或 http/1.1，实际: {alpn}"
-        );
+        assert!(alpn == "h2" || alpn == "http/1.1", "ALPN 应为 h2 或 http/1.1，实际: {alpn}");
 
         // 验证 server_name 存储
         let sni = conn.handshake_server_name().await;
@@ -884,11 +867,11 @@ mod tests {
                 let mut buf = Vec::new();
                 conn.read_to_end(&mut buf).await.expect("read ok");
                 assert_eq!(buf, b"btls-self-signed\n");
-            }
+            },
             Err(e) => {
                 eprintln!("btls 自签证书握手失败: {e}");
                 // 不 panic——此测试用于诊断，记录失败即可
-            }
+            },
         }
     }
 
@@ -934,7 +917,7 @@ mod tests {
                         errors.push(format!("{fp_name} → {server}: TCP 失败: {e}"));
                         fail += 1;
                         continue;
-                    }
+                    },
                 };
 
                 match crate::btls_client::BtlsConn::connect(
@@ -954,11 +937,11 @@ mod tests {
                             errors.push(format!("{fp_name} → {server}: ALPN 异常: {alpn}"));
                             fail += 1;
                         }
-                    }
+                    },
                     Err(e) => {
                         errors.push(format!("{fp_name} → {server}: 握手失败: {e}"));
                         fail += 1;
-                    }
+                    },
                 }
             }
         }
@@ -969,10 +952,7 @@ mod tests {
                 eprintln!("  {e}");
             }
         }
-        assert_eq!(
-            fail, 0,
-            "{fail} 个指纹握手失败（{ok} 成功），见上方详情"
-        );
+        assert_eq!(fail, 0, "{fail} 个指纹握手失败（{ok} 成功），见上方详情");
     }
     // ============================================================
     // btls 回接证书验证（pz6c）：指纹路径不得等价 InsecureSkipVerify=true

@@ -9,14 +9,11 @@
 //! [`DialFn`]: xray_app_dispatcher::default::DialFn
 //! [`Connection`]: xray_transport::connection::Connection
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::{collections::HashMap, net::SocketAddr};
 
 use xray_app_dispatcher::default::DialFn;
 use xray_common::net::destination::Destination;
-use xray_transport::connection::Connection;
-use xray_transport::sockopt::SocketOptions;
-use xray_transport::system_dialer::dial_system;
+use xray_transport::{connection::Connection, sockopt::SocketOptions, system_dialer::dial_system};
 
 use crate::config::Config;
 
@@ -53,8 +50,7 @@ pub fn make_dial_fn_with_sockopt(config: Config, dialer_proxy: String) -> DialFn
     let proxy_protocol = config.proxy_protocol;
     // freedom DomainStrategy 与 transport sockopt 的 proto i32 值域一致
     // （Go 两者同源自 config.proto，转换后写入 SocketConfig.DomainStrategy 进拨号层）
-    let domain_strategy =
-        xray_transport::sockopt::DomainStrategy::from_i32(config.domain_strategy);
+    let domain_strategy = xray_transport::sockopt::DomainStrategy::from_i32(config.domain_strategy);
     Arc::new(move |dest: &Destination| {
         let dest = dest.clone();
         let fragment = fragment.clone();
@@ -64,11 +60,8 @@ pub fn make_dial_fn_with_sockopt(config: Config, dialer_proxy: String) -> DialFn
             // destinationOverride 改写（Go :269-279；isValidAddress 排除 AnyIP）
             let dial_dest =
                 crate::config::apply_destination_override(&dest, destination_override.as_ref());
-            let sockopt = SocketOptions {
-                domain_strategy,
-                dialer_proxy,
-                ..SocketOptions::default()
-            };
+            let sockopt =
+                SocketOptions { domain_strategy, dialer_proxy, ..SocketOptions::default() };
             // Go :281 retry.ExponentialBackoff(5, 100)：dial 瞬时失败指数退避重试
             let conn: Box<dyn Connection> =
                 xray_transport::retry::exponential_backoff(5, 100, || {
@@ -130,9 +123,10 @@ async fn write_proxy_protocol_header(
 
 use std::sync::Arc;
 
-use xray_app_dispatcher::DispatchHandler;
-use xray_app_dispatcher::default::{DialBridge, PinFuture};
-
+use xray_app_dispatcher::{
+    DispatchHandler,
+    default::{DialBridge, PinFuture},
+};
 use xray_common::net::network::Network;
 use xray_transport::link::Link;
 
@@ -240,7 +234,6 @@ impl FreedomDispatchBridge {
         self.domain_strategy = strategy;
         self
     }
-
 }
 impl std::fmt::Debug for FreedomDispatchBridge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -254,10 +247,7 @@ impl std::fmt::Debug for FreedomDispatchBridge {
 
 impl FreedomDispatchBridge {
     /// 组装 UDP relay 策略（Go `Process` 的 UDPOverride + defaultRule 形态）。
-    fn udp_policy(
-        &self,
-        default_rule: Option<crate::config::FinalRule>,
-    ) -> crate::udp::UdpPolicy {
+    fn udp_policy(&self, default_rule: Option<crate::config::FinalRule>) -> crate::udp::UdpPolicy {
         crate::udp::UdpPolicy {
             destination_override: self.destination_override.clone(),
             final_rules: self.final_rules.clone(),
@@ -305,9 +295,12 @@ impl DispatchHandler for FreedomDispatchBridge {
                 let result = match send_through.as_ref().and_then(|s| s.resolve()) {
                     Some(ip) => {
                         xray_transport::system_dialer::DIAL_SRC
-                            .scope(Some(ip), crate::udp::relay_policy(&dest, link, &noises, &policy))
+                            .scope(
+                                Some(ip),
+                                crate::udp::relay_policy(&dest, link, &noises, &policy),
+                            )
                             .await
-                    }
+                    },
                     None => crate::udp::relay_policy(&dest, link, &noises, &policy).await,
                 };
                 if let Err(e) = result {
@@ -343,8 +336,7 @@ impl DispatchHandler for FreedomDispatchBridge {
                         .await
                         {
                             Ok(ips) => ips.iter().find_map(|ip| {
-                                let ip_dest =
-                                    crate::config::destination_with_ip(&check_dest, *ip);
+                                let ip_dest = crate::config::destination_with_ip(&check_dest, *ip);
                                 crate::config::match_final_rules(
                                     &final_rules,
                                     default_rule.as_ref(),
@@ -361,7 +353,7 @@ impl DispatchHandler for FreedomDispatchBridge {
                                 );
                                 link.writer.shutdown();
                                 return;
-                            }
+                            },
                         }
                     } else {
                         None
@@ -392,10 +384,8 @@ impl DispatchHandler for FreedomDispatchBridge {
                 PROXY_PROTO_SRC
                     .scope(
                         src,
-                        xray_app_dispatcher::INBOUND_SPLICE.scope(
-                            splice_meta,
-                            tcp.dispatch(&check_dest, link),
-                        ),
+                        xray_app_dispatcher::INBOUND_SPLICE
+                            .scope(splice_meta, tcp.dispatch(&check_dest, link)),
                     )
                     .await;
             })
@@ -405,15 +395,18 @@ impl DispatchHandler for FreedomDispatchBridge {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
     use xray_app_dispatcher::default::{DefaultDispatcher, DialBridge, SimpleOhm, SniffingRequest};
-    use xray_buf::io::{Reader, Writer};
-    use xray_buf::multi::MultiBuffer;
-    use xray_common::net::address::Address;
-    use xray_common::net::network::Network;
-    use xray_common::net::port::Port;
+    use xray_buf::{
+        io::{Reader, Writer},
+        multi::MultiBuffer,
+    };
+    use xray_common::net::{address::Address, network::Network, port::Port};
+
+    use super::*;
 
     #[tokio::test]
     async fn dispatcher_e2e_freedom_to_echo() {
@@ -430,7 +423,7 @@ mod tests {
                         if sock.write_all(&buf[..n]).await.is_err() {
                             break;
                         }
-                    }
+                    },
                 }
             }
         });
@@ -458,13 +451,10 @@ mod tests {
         mb.merge_bytes(payload);
         w.write_multi_buffer(mb).await.unwrap();
 
-        let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            r.read_multi_buffer(),
-        )
-        .await
-        .expect("timeout")
-        .unwrap();
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(10), r.read_multi_buffer())
+            .await
+            .expect("timeout")
+            .unwrap();
 
         assert_eq!(resp.to_vec(), payload);
         w.shutdown();
@@ -486,7 +476,7 @@ mod tests {
                 match echo.recv_from(&mut buf).await {
                     Ok((n, peer)) => {
                         let _ = echo.send_to(&buf[..n], peer).await;
-                    }
+                    },
                     Err(_) => break,
                 }
             }
@@ -521,12 +511,9 @@ mod tests {
         mb.merge_bytes(&frame);
         w.write_multi_buffer(mb).await.unwrap();
 
-        let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            r.read_multi_buffer(),
-        )
-        .await
-        .expect("timeout reading udp echo");
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(10), r.read_multi_buffer())
+            .await
+            .expect("timeout reading udp echo");
 
         // 读错误（EOF）也算失败——必须拿到回帧
         let resp = resp.expect("read ok");
@@ -544,6 +531,7 @@ mod tests {
     #[tokio::test]
     async fn dispatcher_e2e_freedom_udp_send_through_binds_source() {
         use std::net::IpAddr;
+
         use tokio::net::UdpSocket;
         use xray_transport::system_dialer::SendThroughSpec;
         use xray_xudp::packet::PacketWriter;
@@ -562,7 +550,7 @@ mod tests {
                             *recorder.lock() = Some(peer.ip());
                         }
                         let _ = echo.send_to(&buf[..n], peer).await;
-                    }
+                    },
                     Err(_) => break,
                 }
             }
@@ -640,7 +628,7 @@ mod tests {
                         if sock.write_all(&buf[..n]).await.is_err() {
                             break;
                         }
-                    }
+                    },
                 }
             }
             all
@@ -687,13 +675,10 @@ mod tests {
         w.write_multi_buffer(mb).await.unwrap();
 
         // 回程透传：echo 回来的字节 == 服务端收到的字节
-        let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            r.read_multi_buffer(),
-        )
-        .await
-        .expect("timeout")
-        .expect("read ok");
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(10), r.read_multi_buffer())
+            .await
+            .expect("timeout")
+            .expect("read ok");
 
         w.shutdown();
         let received = server.await.unwrap();
@@ -787,7 +772,7 @@ mod tests {
                             if sock.write_all(&buf[..n]).await.is_err() {
                                 break;
                             }
-                        }
+                        },
                     }
                 }
             }
@@ -854,13 +839,11 @@ mod tests {
             let mut mb = MultiBuffer::new();
             mb.merge_bytes(b"echo-me");
             up_w.write_multi_buffer(mb).await.unwrap();
-            let resp = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                dn_r.read_multi_buffer(),
-            )
-            .await
-            .expect("timeout")
-            .expect("read ok");
+            let resp =
+                tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
+                    .await
+                    .expect("timeout")
+                    .expect("read ok");
             assert_eq!(resp.to_vec(), b"echo-me");
             up_w.shutdown();
             task.abort();
@@ -906,10 +889,7 @@ mod tests {
         });
 
         // proxyProtocol=1 进 dial_fn（生产 parse_freedom_config 路径等价）
-        let config = Config {
-            proxy_protocol: 1,
-            ..Default::default()
-        };
+        let config = Config { proxy_protocol: 1, ..Default::default() };
         let bridge = FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new(
             "freedom-out",
             make_dial_fn_with_config(config),
@@ -935,9 +915,7 @@ mod tests {
 
         // 等服务端确认 header 已读完 → 再写 payload（payload 经 bridge → conn
         // → 服务端 read_exact 收齐）。
-        header_ready_rx
-            .await
-            .expect("server did not signal PROXY header ready");
+        header_ready_rx.await.expect("server did not signal PROXY header ready");
         let mut w = Box::new(up_w) as Box<dyn Writer>;
         let mut mb = MultiBuffer::new();
         mb.merge_bytes(b"payload-after-header");
@@ -958,7 +936,7 @@ mod tests {
     /// LookupForIP 预解析，双栈应答下仅查询 IPv4（Go freedom.go:282-296）。
     #[tokio::test]
     async fn dial_fn_useipv4_resolves_only_ipv4() {
-        use crate::test_support::{install, uninstall, FakeDns, FAKE_DNS_LOCK};
+        use crate::test_support::{FAKE_DNS_LOCK, FakeDns, install, uninstall};
         let _g = FAKE_DNS_LOCK.lock();
         let fake = FakeDns::ips(vec![vec![
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
@@ -999,12 +977,11 @@ mod tests {
     /// 被 Block 规则黑洞（不拨号），对齐 Go shouldResolveDomainBeforeFinalRules。
     #[tokio::test]
     async fn domain_resolving_to_private_ip_blocked() {
-        use crate::test_support::{install, uninstall, FakeDns, FAKE_DNS_LOCK};
         use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::test_support::{FAKE_DNS_LOCK, FakeDns, install, uninstall};
         let _g = FAKE_DNS_LOCK.lock();
-        let fake = FakeDns::ips(vec![vec![std::net::IpAddr::V4(
-            "10.0.0.1".parse().unwrap(),
-        )]]);
+        let fake = FakeDns::ips(vec![vec![std::net::IpAddr::V4("10.0.0.1".parse().unwrap())]]);
         install(&fake);
 
         let listener = std::sync::Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
@@ -1111,7 +1088,7 @@ mod tests {
     /// （mock dialer 捕获），预检解析发生（FakeDns 1 次）但不改写拨号目标。
     #[tokio::test]
     async fn tcp_domain_dest_dials_original_domain_when_not_blocked() {
-        use crate::test_support::{install, uninstall, FakeDns, FAKE_DNS_LOCK};
+        use crate::test_support::{FAKE_DNS_LOCK, FakeDns, install, uninstall};
         let _g = FAKE_DNS_LOCK.lock();
         let fake = FakeDns::ips(vec![vec![std::net::IpAddr::V4("93.184.216.34".parse().unwrap())]]);
         install(&fake);
@@ -1132,19 +1109,14 @@ mod tests {
             &serde_json::json!({"action": "allow", "port": "53"}),
         )
         .unwrap();
-        let bridge = FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new(
-            "freedom-out",
-            dial,
-        )))
-        // 策略路径让预检解析走 FakeDns（AsIs 走系统 resolver，FakeDns 不可见）
-        .with_domain_strategy(crate::config::DomainStrategy::UseIP as i32)
-        .with_final_rules(vec![crate::config::FinalRule::build(&rule).unwrap()]);
+        let bridge =
+            FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new("freedom-out", dial)))
+                // 策略路径让预检解析走 FakeDns（AsIs 走系统 resolver，FakeDns 不可见）
+                .with_domain_strategy(crate::config::DomainStrategy::UseIP as i32)
+                .with_final_rules(vec![crate::config::FinalRule::build(&rule).unwrap()]);
 
-        let dest = Destination::new(
-            Address::Domain("example.test".into()),
-            Port::new(8080),
-            Network::TCP,
-        );
+        let dest =
+            Destination::new(Address::Domain("example.test".into()), Port::new(8080), Network::TCP);
         let pipe_opt = xray_buf::pipe::PipeOption::default();
         let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
         let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
@@ -1174,7 +1146,7 @@ mod tests {
     /// （FakeDns 0 次），拨号目标保持域名（Go :294-295 条件门控）。
     #[tokio::test]
     async fn tcp_domain_dest_without_rules_skips_precheck_resolution() {
-        use crate::test_support::{install, uninstall, FakeDns, FAKE_DNS_LOCK};
+        use crate::test_support::{FAKE_DNS_LOCK, FakeDns, install, uninstall};
         let _g = FAKE_DNS_LOCK.lock();
         let fake = FakeDns::ips(vec![]);
         install(&fake);
@@ -1191,16 +1163,11 @@ mod tests {
             })
         });
         // 无 final_rules、无 inbound_rules → 无预检（Go :294-295）
-        let bridge = FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new(
-            "freedom-out",
-            dial,
-        )));
+        let bridge =
+            FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new("freedom-out", dial)));
 
-        let dest = Destination::new(
-            Address::Domain("noregex.test".into()),
-            Port::new(9090),
-            Network::TCP,
-        );
+        let dest =
+            Destination::new(Address::Domain("noregex.test".into()), Port::new(9090), Network::TCP);
         let pipe_opt = xray_buf::pipe::PipeOption::default();
         let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
         let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);

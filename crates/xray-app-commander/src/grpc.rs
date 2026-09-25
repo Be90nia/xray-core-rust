@@ -6,67 +6,62 @@
 //!
 //! ## 范围
 //!
-//! - **HandlerService**：注入 [`OutboundRuntime`]（bd ze3，生产 SimpleOhm）时
-//!   add/remove/list outbound 操作真实 outbound manager；未注入时退回内部
+//! - **HandlerService**：注入 [`OutboundRuntime`]（bd ze3，生产 SimpleOhm）时 add/remove/list
+//!   outbound 操作真实 outbound manager；未注入时退回内部
 //!   [`OutboundHandlerRegistry`](crate::server::OutboundHandlerRegistry)（stub handler）。
 //!   其余方法（inbound / alter / users）返回 `UNIMPLEMENTED`。
-//! - **LoggerService**：委托领域 `xray_app_log::command::LogService`
-//!   （`DefaultLogService` → `LogInstance::restart`）。
+//! - **LoggerService**：委托领域 `xray_app_log::command::LogService` （`DefaultLogService` →
+//!   `LogInstance::restart`）。
 //! - **StatsService**：委托领域 `xray_app_stats::command::StatsService`，proto ↔ domain 翻译。
-//! - **RoutingService**：委托领域 `xray_app_router::command::RoutingService`；
-//!   TestRoute 支持 FieldSelectors 投影，GetBalancerInfo 返回 override/principle，
-//!   SubscribeRoutingStats 订阅 routingStats channel（未注入时按 Go 生产形态报
-//!   "Routing statistics not enabled."）。
+//! - **RoutingService**：委托领域 `xray_app_router::command::RoutingService`； TestRoute 支持
+//!   FieldSelectors 投影，GetBalancerInfo 返回 override/principle， SubscribeRoutingStats 订阅
+//!   routingStats channel（未注入时按 Go 生产形态报 "Routing statistics not enabled."）。
 //! - **ObservatoryService**：委托领域 `xray_app_observatory::command::ObservatoryService`。
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
+use std::{collections::HashMap, net::SocketAddr, pin::Pin, sync::Arc};
+
 use async_trait::async_trait;
 use prost::Message as _;
-use tonic::transport::Server;
-use tonic::{Request, Response, Status};
-
-use xray_proto::xray::app::proxyman::command::handler_service_server::{
-    HandlerService, HandlerServiceServer,
-};
-use xray_proto::xray::app::proxyman::command::{
-    AddInboundRequest, AddInboundResponse, AddOutboundRequest, AddOutboundResponse,
-    AlterInboundRequest, AlterInboundResponse, AlterOutboundRequest, AlterOutboundResponse,
-    GetInboundUserRequest, GetInboundUserResponse, GetInboundUsersCountResponse,
-    ListInboundsRequest, ListInboundsResponse, ListOutboundsRequest, ListOutboundsResponse,
-    RemoveInboundRequest, RemoveInboundResponse, RemoveOutboundRequest, RemoveOutboundResponse,
-};
-use xray_proto::xray::app::log::command::logger_service_server::{
-    LoggerService as ProtoLoggerService, LoggerServiceServer,
-};
-use xray_proto::xray::app::log::command::{RestartLoggerRequest, RestartLoggerResponse};
-use xray_proto::xray::core::OutboundHandlerConfig;
-
-// --- stats command gRPC ---
-use xray_proto::xray::app::stats::command as pstats;
-use xray_proto::xray::app::stats::command::stats_service_server::{
-    StatsService as ProtoStatsService, StatsServiceServer,
-};
-
+use tonic::{Request, Response, Status, transport::Server};
+use xray_app_stats::Channel as StatsChannelOps;
+use xray_common::net::port::Port;
 // --- router command gRPC ---
 use xray_proto::xray::app::router::command as prouter;
-use xray_proto::xray::app::router::command::routing_service_server::{
-    RoutingService as ProtoRoutingService, RoutingServiceServer,
-};
-
+// --- stats command gRPC ---
+use xray_proto::xray::app::stats::command as pstats;
 // --- observatory command gRPC ---
 use xray_proto::xray::core::app::observatory::command as pobs;
-use xray_proto::xray::core::app::observatory::command::observatory_service_server::{
-    ObservatoryService as ProtoObservatoryService, ObservatoryServiceServer,
+use xray_proto::xray::{
+    app::{
+        log::command::{
+            RestartLoggerRequest, RestartLoggerResponse,
+            logger_service_server::{LoggerService as ProtoLoggerService, LoggerServiceServer},
+        },
+        proxyman::command::{
+            AddInboundRequest, AddInboundResponse, AddOutboundRequest, AddOutboundResponse,
+            AlterInboundRequest, AlterInboundResponse, AlterOutboundRequest, AlterOutboundResponse,
+            GetInboundUserRequest, GetInboundUserResponse, GetInboundUsersCountResponse,
+            ListInboundsRequest, ListInboundsResponse, ListOutboundsRequest, ListOutboundsResponse,
+            RemoveInboundRequest, RemoveInboundResponse, RemoveOutboundRequest,
+            RemoveOutboundResponse,
+            handler_service_server::{HandlerService, HandlerServiceServer},
+        },
+        router::command::routing_service_server::{
+            RoutingService as ProtoRoutingService, RoutingServiceServer,
+        },
+        stats::command::stats_service_server::{
+            StatsService as ProtoStatsService, StatsServiceServer,
+        },
+    },
+    core::{
+        OutboundHandlerConfig,
+        app::observatory::command::observatory_service_server::{
+            ObservatoryService as ProtoObservatoryService, ObservatoryServiceServer,
+        },
+    },
 };
 
-use xray_common::net::port::Port;
-
-use crate::outbound::HandlerManager;
-use crate::server::OutboundHandlerRegistry;
-use xray_app_stats::Channel as StatsChannelOps;
+use crate::{outbound::HandlerManager, server::OutboundHandlerRegistry};
 
 /// HandlerService 的 outbound 运行时注入 trait（bd ze3）。
 ///
@@ -92,8 +87,8 @@ pub trait OutboundRuntime: Send + Sync {
 /// HandlerService gRPC 实现。
 ///
 /// 三级后端，优先级从高到低：
-/// 1. **proxyman 领域 service**（[`xray_app_proxyman::command::HandlerService`]，
-///    对应 Go `handlerServer` 的 ihm/ohm 双 manager）——全部 10 op 可用；
+/// 1. **proxyman 领域 service**（[`xray_app_proxyman::command::HandlerService`]， 对应 Go
+///    `handlerServer` 的 ihm/ohm 双 manager）——全部 10 op 可用；
 /// 2. [`OutboundRuntime`]（bd ze3，SimpleOhm）——仅 outbound add/remove/list；
 /// 3. 内部 [`OutboundHandlerRegistry`]（stub）。
 ///
@@ -135,7 +130,7 @@ fn proxyman_status(e: xray_app_proxyman::ProxymanError) -> Status {
     match e {
         E::HandlerNotFound(_) | E::OutboundHandlerNotFound(_) | E::NoClue => {
             Status::not_found(e.to_string())
-        }
+        },
         E::ExistingTag(_) => Status::already_exists(e.to_string()),
         E::UnknownOperation
         | E::NotInboundOperation
@@ -160,15 +155,13 @@ impl HandlerService for HandlerServiceImpl {
         // 优先级 1：proxyman 领域 service（Go handlerServer.AddOutbound，
         // command.go:165-170 —— core.AddOutboundHandler）
         if let Some(svc) = &self.proxyman {
-            let resp = svc
-                .add_outbound(request.into_inner())
-                .map_err(proxyman_status)?;
+            let resp = svc.add_outbound(request.into_inner()).map_err(proxyman_status)?;
             return Ok(Response::new(resp));
         }
         let req = request.into_inner();
-        let cfg = req.outbound.ok_or_else(|| {
-            Status::invalid_argument("AddOutboundRequest.outbound is required")
-        })?;
+        let cfg = req
+            .outbound
+            .ok_or_else(|| Status::invalid_argument("AddOutboundRequest.outbound is required"))?;
         let tag = cfg.tag.to_string();
         if tag.is_empty() {
             return Err(Status::invalid_argument("outbound.tag is required"));
@@ -187,10 +180,10 @@ impl HandlerService for HandlerServiceImpl {
             // 优先级 3：stub handler（无真实拨号能力，tag 维度 add/remove/list）。
             None => {
                 let handler = crate::outbound::StubOutboundHandler::new(tag.clone());
-                self.registry.add_handler(Arc::new(handler)).map_err(|e| {
-                    Status::already_exists(format!("add outbound `{tag}`: {e}"))
-                })?;
-            }
+                self.registry
+                    .add_handler(Arc::new(handler))
+                    .map_err(|e| Status::already_exists(format!("add outbound `{tag}`: {e}")))?;
+            },
         }
         tracing::info!(tag = %tag, "commander: outbound added via gRPC");
         Ok(Response::new(AddOutboundResponse {}))
@@ -202,9 +195,7 @@ impl HandlerService for HandlerServiceImpl {
     ) -> Result<Response<RemoveOutboundResponse>, Status> {
         // proxyman 领域 service（Go command.go:172-174 —— ohm.RemoveHandler）
         if let Some(svc) = &self.proxyman {
-            let resp = svc
-                .remove_outbound(request.into_inner())
-                .map_err(proxyman_status)?;
+            let resp = svc.remove_outbound(request.into_inner()).map_err(proxyman_status)?;
             return Ok(Response::new(resp));
         }
         let tag = request.into_inner().tag.to_string();
@@ -216,10 +207,10 @@ impl HandlerService for HandlerServiceImpl {
                 .remove_outbound(&tag)
                 .map_err(|e| Status::not_found(format!("remove outbound `{tag}`: {e}")))?,
             None => {
-                self.registry.remove_handler(&tag).map_err(|e| {
-                    Status::not_found(format!("remove outbound `{tag}`: {e}"))
-                })?;
-            }
+                self.registry
+                    .remove_handler(&tag)
+                    .map_err(|e| Status::not_found(format!("remove outbound `{tag}`: {e}")))?;
+            },
         }
         tracing::info!(tag = %tag, "commander: outbound removed via gRPC");
         Ok(Response::new(RemoveOutboundResponse {}))
@@ -231,9 +222,7 @@ impl HandlerService for HandlerServiceImpl {
     ) -> Result<Response<ListOutboundsResponse>, Status> {
         // proxyman 领域 service（Go command.go:188-205 —— ohm.ListHandlers）
         if let Some(svc) = &self.proxyman {
-            let resp = svc
-                .list_outbounds(request.into_inner())
-                .map_err(proxyman_status)?;
+            let resp = svc.list_outbounds(request.into_inner()).map_err(proxyman_status)?;
             return Ok(Response::new(resp));
         }
         let tags = match self.runtime.as_ref() {
@@ -264,9 +253,7 @@ impl HandlerService for HandlerServiceImpl {
                 "AddInbound requires proxyman HandlerService (not injected)",
             ));
         };
-        let resp = svc
-            .add_inbound(request.into_inner())
-            .map_err(proxyman_status)?;
+        let resp = svc.add_inbound(request.into_inner()).map_err(proxyman_status)?;
         Ok(Response::new(resp))
     }
 
@@ -279,9 +266,7 @@ impl HandlerService for HandlerServiceImpl {
                 "RemoveInbound requires proxyman HandlerService (not injected)",
             ));
         };
-        let resp = svc
-            .remove_inbound(request.into_inner())
-            .map_err(proxyman_status)?;
+        let resp = svc.remove_inbound(request.into_inner()).map_err(proxyman_status)?;
         Ok(Response::new(resp))
     }
 
@@ -294,9 +279,7 @@ impl HandlerService for HandlerServiceImpl {
                 "AlterInbound requires proxyman HandlerService (not injected)",
             ));
         };
-        let resp = svc
-            .alter_inbound(request.into_inner())
-            .map_err(proxyman_status)?;
+        let resp = svc.alter_inbound(request.into_inner()).map_err(proxyman_status)?;
         Ok(Response::new(resp))
     }
 
@@ -309,9 +292,7 @@ impl HandlerService for HandlerServiceImpl {
                 "ListInbounds requires proxyman HandlerService (not injected)",
             ));
         };
-        let resp = svc
-            .list_inbounds(request.into_inner())
-            .map_err(proxyman_status)?;
+        let resp = svc.list_inbounds(request.into_inner()).map_err(proxyman_status)?;
         Ok(Response::new(resp))
     }
 
@@ -324,9 +305,7 @@ impl HandlerService for HandlerServiceImpl {
                 "GetInboundUsers requires proxyman HandlerService (not injected)",
             ));
         };
-        let resp = svc
-            .get_inbound_users(request.into_inner())
-            .map_err(proxyman_status)?;
+        let resp = svc.get_inbound_users(request.into_inner()).map_err(proxyman_status)?;
         Ok(Response::new(resp))
     }
 
@@ -339,9 +318,7 @@ impl HandlerService for HandlerServiceImpl {
                 "GetInboundUsersCount requires proxyman HandlerService (not injected)",
             ));
         };
-        let resp = svc
-            .get_inbound_users_count(request.into_inner())
-            .map_err(proxyman_status)?;
+        let resp = svc.get_inbound_users_count(request.into_inner()).map_err(proxyman_status)?;
         Ok(Response::new(resp))
     }
 
@@ -354,9 +331,7 @@ impl HandlerService for HandlerServiceImpl {
                 "AlterOutbound requires proxyman HandlerService (not injected)",
             ));
         };
-        let resp = svc
-            .alter_outbound(request.into_inner())
-            .map_err(proxyman_status)?;
+        let resp = svc.alter_outbound(request.into_inner()).map_err(proxyman_status)?;
         Ok(Response::new(resp))
     }
 }
@@ -437,9 +412,7 @@ impl ProtoStatsService for StatsServiceImpl {
         };
         let resp = self.service.get_stats(&dreq).map_err(stats_status)?;
         Ok(Response::new(pstats::GetStatsResponse {
-            stat: resp
-                .stat
-                .map(|s| pstats::Stat { name: s.name, value: s.value }),
+            stat: resp.stat.map(|s| pstats::Stat { name: s.name, value: s.value }),
         }))
     }
 
@@ -454,9 +427,7 @@ impl ProtoStatsService for StatsServiceImpl {
         };
         let resp = self.service.get_stats_online(&dreq).map_err(stats_status)?;
         Ok(Response::new(pstats::GetStatsResponse {
-            stat: resp
-                .stat
-                .map(|s| pstats::Stat { name: s.name, value: s.value }),
+            stat: resp.stat.map(|s| pstats::Stat { name: s.name, value: s.value }),
         }))
     }
 
@@ -507,31 +478,20 @@ impl ProtoStatsService for StatsServiceImpl {
             name: req.name.to_string(),
             reset: req.reset,
         };
-        let resp = self
-            .service
-            .get_stats_online_ip_list(&dreq)
-            .map_err(stats_status)?;
+        let resp = self.service.get_stats_online_ip_list(&dreq).map_err(stats_status)?;
         let mut ips = HashMap::new();
         for e in resp.ips {
             ips.insert(e.ip, e.last_seen);
         }
-        Ok(Response::new(pstats::GetStatsOnlineIpListResponse {
-            name: resp.name,
-            ips,
-        }))
+        Ok(Response::new(pstats::GetStatsOnlineIpListResponse { name: resp.name, ips }))
     }
 
     async fn get_all_online_users(
         &self,
         _request: Request<pstats::GetAllOnlineUsersRequest>,
     ) -> Result<Response<pstats::GetAllOnlineUsersResponse>, Status> {
-        let resp = self
-            .service
-            .get_all_online_users()
-            .map_err(stats_status)?;
-        Ok(Response::new(pstats::GetAllOnlineUsersResponse {
-            users: resp.users,
-        }))
+        let resp = self.service.get_all_online_users().map_err(stats_status)?;
+        Ok(Response::new(pstats::GetAllOnlineUsersResponse { users: resp.users }))
     }
 
     async fn get_users_stats(
@@ -543,10 +503,7 @@ impl ProtoStatsService for StatsServiceImpl {
             include_traffic: req.include_traffic,
             reset: req.reset,
         };
-        let resp = self
-            .service
-            .get_users_stats(&dreq)
-            .map_err(stats_status)?;
+        let resp = self.service.get_users_stats(&dreq).map_err(stats_status)?;
         let users = resp
             .users
             .into_iter()
@@ -557,10 +514,7 @@ impl ProtoStatsService for StatsServiceImpl {
                     .into_iter()
                     .map(|e| pstats::OnlineIpEntry { ip: e.ip, last_seen: e.last_seen })
                     .collect(),
-                traffic: Some(pstats::TrafficUserStat {
-                    uplink: u.uplink,
-                    downlink: u.downlink,
-                }),
+                traffic: Some(pstats::TrafficUserStat { uplink: u.uplink, downlink: u.downlink }),
             })
             .collect();
         Ok(Response::new(pstats::GetUsersStatsResponse { users }))
@@ -602,19 +556,18 @@ impl RoutingServiceImpl {
 fn router_status(e: xray_app_router::error::RouterError) -> Status {
     use xray_app_router::error::RouterError;
     match e {
-        RouterError::BalancerNotFound(_)
-        | RouterError::TagNotFound
-        | RouterError::EmptyTagName => Status::not_found(e.to_string()),
+        RouterError::BalancerNotFound(_) | RouterError::TagNotFound | RouterError::EmptyTagName => {
+            Status::not_found(e.to_string())
+        },
         _ => Status::internal(e.to_string()),
     }
 }
 
 #[async_trait]
 impl ProtoRoutingService for RoutingServiceImpl {
-    type SubscribeRoutingStatsStream =
-        tonic::codegen::tokio_stream::wrappers::ReceiverStream<
-            std::result::Result<prouter::RoutingContext, Status>,
-        >;
+    type SubscribeRoutingStatsStream = tonic::codegen::tokio_stream::wrappers::ReceiverStream<
+        std::result::Result<prouter::RoutingContext, Status>,
+    >;
 
     /// Go routingServer.SubscribeRoutingStats（command.go:107-135）：
     /// 订阅 routingStats channel，逐条投影 FieldSelectors 后流式下发。
@@ -630,29 +583,24 @@ impl ProtoRoutingService for RoutingServiceImpl {
         let mut sub = stats
             .subscribe()
             .map_err(|e| Status::internal(format!("subscribe routing stats: {e}")))?;
-        let (tx, rx) = tokio::sync::mpsc::channel::<
-            std::result::Result<prouter::RoutingContext, Status>,
-        >(16);
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<std::result::Result<prouter::RoutingContext, Status>>(16);
         // 发布契约：channel 消息为 Arc<xray_proto RoutingContext>（Go 端为
         // routing.Route；本仓路由发布方尚未接线，此处固定消息类型）。
         tokio::spawn(async move {
             while let Some(msg) = sub.recv().await {
                 let Some(rc) = msg.downcast_ref::<prouter::RoutingContext>() else {
-                    let _ = tx
-                        .send(Err(Status::unknown("Upstream sent malformed statistics.")))
-                        .await;
+                    let _ =
+                        tx.send(Err(Status::unknown("Upstream sent malformed statistics."))).await;
                     return;
                 };
-                let out =
-                    project_routing_context(&selectors, rc, Some(&rc.outbound_tag));
+                let out = project_routing_context(&selectors, rc, Some(&rc.outbound_tag));
                 if tx.send(Ok(out)).await.is_err() {
                     break;
                 }
             }
         });
-        Ok(Response::new(
-            tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(rx),
-        ))
+        Ok(Response::new(tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 
     async fn test_route(
@@ -686,10 +634,7 @@ impl ProtoRoutingService for RoutingServiceImpl {
         // Go routingServer.GetBalancerInfo（command.go:21-47）：override 错误上抛，
         // principle 错误仅记日志（字段留空）。
         let tag = request.into_inner().tag;
-        let override_target = self
-            .service
-            .get_override_target(&tag)
-            .map_err(router_status)?;
+        let override_target = self.service.get_override_target(&tag).map_err(router_status)?;
         let mut balancer = prouter::BalancerMsg {
             r#override: Some(prouter::OverrideInfo { target: override_target }),
             principle_target: None,
@@ -697,12 +642,10 @@ impl ProtoRoutingService for RoutingServiceImpl {
         match self.service.get_principle_target(&tag) {
             Ok(tags) => {
                 balancer.principle_target = Some(prouter::PrincipleTargetInfo { tag: tags });
-            }
+            },
             Err(e) => tracing::info!(error = %e, "unable to obtain principle target"),
         }
-        Ok(Response::new(prouter::GetBalancerInfoResponse {
-            balancer: Some(balancer),
-        }))
+        Ok(Response::new(prouter::GetBalancerInfoResponse { balancer: Some(balancer) }))
     }
 
     async fn override_balancer_target(
@@ -725,18 +668,16 @@ impl ProtoRoutingService for RoutingServiceImpl {
         // shouldAppend=false 的前插语义由 Router::add_rule 的 append 实现吸收
         //（domain 层当前仅 append，ponytail 注记）。
         let req = request.into_inner();
-        let tm = req.config.ok_or_else(|| {
-            Status::invalid_argument("AddRuleRequest.config is required")
-        })?;
+        let tm = req
+            .config
+            .ok_or_else(|| Status::invalid_argument("AddRuleRequest.config is required"))?;
         let rule = xray_proto::xray::app::router::RoutingRule::decode(tm.value.as_slice())
             .map_err(|e| Status::invalid_argument(format!("decode RoutingRule: {e}")))?;
         let rule_tag = rule.rule_tag.clone();
         if rule_tag.is_empty() {
             return Err(Status::invalid_argument("RoutingRule.rule_tag is required"));
         }
-        self.service
-            .add_rule(rule_tag, rule)
-            .map_err(router_status)?;
+        self.service.add_rule(rule_tag, rule).map_err(router_status)?;
         Ok(Response::new(prouter::AddRuleResponse {}))
     }
 
@@ -756,10 +697,7 @@ impl ProtoRoutingService for RoutingServiceImpl {
         let rules = self.service.list_rule().map_err(router_status)?;
         let rules = rules
             .into_iter()
-            .map(|t| prouter::ListRuleItem {
-                tag: String::new(),
-                rule_tag: t,
-            })
+            .map(|t| prouter::ListRuleItem { tag: String::new(), rule_tag: t })
             .collect();
         Ok(Response::new(prouter::ListRuleResponse { rules }))
     }
@@ -780,9 +718,7 @@ pub struct ObservatoryServiceImpl {
 
 impl ObservatoryServiceImpl {
     #[must_use]
-    pub fn new(
-        service: Arc<dyn xray_app_observatory::command::ObservatoryService>,
-    ) -> Self {
+    pub fn new(service: Arc<dyn xray_app_observatory::command::ObservatoryService>) -> Self {
         Self { service }
     }
 }
@@ -802,13 +738,8 @@ impl ProtoObservatoryService for ObservatoryServiceImpl {
         &self,
         _request: Request<pobs::GetOutboundStatusRequest>,
     ) -> Result<Response<pobs::GetOutboundStatusResponse>, Status> {
-        let result = self
-            .service
-            .get_outbound_status()
-            .map_err(observatory_status)?;
-        Ok(Response::new(pobs::GetOutboundStatusResponse {
-            status: Some(result.to_proto()),
-        }))
+        let result = self.service.get_outbound_status().map_err(observatory_status)?;
+        Ok(Response::new(pobs::GetOutboundStatusResponse { status: Some(result.to_proto()) }))
     }
 }
 
@@ -830,7 +761,9 @@ fn port_to_u16(raw: u32) -> Port {
     Port::new(raw as u16)
 }
 
-fn proto_routing_context_to_data(p: &prouter::RoutingContext) -> xray_app_router::context::RoutingData {
+fn proto_routing_context_to_data(
+    p: &prouter::RoutingContext,
+) -> xray_app_router::context::RoutingData {
     use xray_app_router::context::RoutingData;
     use xray_common::net::network::Network;
 
@@ -840,11 +773,11 @@ fn proto_routing_context_to_data(p: &prouter::RoutingContext) -> xray_app_router
                 4 => {
                     let a: [u8; 4] = b.as_slice().try_into().ok()?;
                     Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(a)))
-                }
+                },
                 16 => {
                     let a: [u8; 16] = b.as_slice().try_into().ok()?;
                     Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(a)))
-                }
+                },
                 _ => None,
             })
             .collect()
@@ -883,8 +816,9 @@ fn project_routing_context(
     ctx: &prouter::RoutingContext,
     outbound_tag: Option<&str>,
 ) -> prouter::RoutingContext {
-    let want =
-        |field: &str| selectors.is_empty() || selectors.iter().any(|s| field.starts_with(s.as_str()));
+    let want = |field: &str| {
+        selectors.is_empty() || selectors.iter().any(|s| field.starts_with(s.as_str()))
+    };
     let mut m = prouter::RoutingContext::default();
     if want("inbound") {
         m.inbound_tag = ctx.inbound_tag.clone();
@@ -948,14 +882,11 @@ pub(crate) enum ListenSpec {
 /// - `/path` 或 `@name` 前缀 → UnixAddr；
 /// - 其余 → TCP（`:port` 简写补 `0.0.0.0`）。
 pub(crate) fn parse_listen_addr(addr: &str) -> Result<SocketAddr, String> {
-    let normalized = if addr.starts_with(':') {
-        format!("0.0.0.0{addr}")
-    } else {
-        addr.to_string()
-    };
-    normalized.parse::<SocketAddr>().map_err(|e| {
-        format!("invalid listen address `{addr}` (normalized `{normalized}`): {e}")
-    })
+    let normalized =
+        if addr.starts_with(':') { format!("0.0.0.0{addr}") } else { addr.to_string() };
+    normalized
+        .parse::<SocketAddr>()
+        .map_err(|e| format!("invalid listen address `{addr}` (normalized `{normalized}`): {e}"))
 }
 
 pub(crate) fn parse_listen_spec(addr: &str) -> Result<ListenSpec, String> {
@@ -975,10 +906,7 @@ pub(crate) struct ListenerIncoming {
 
 impl ListenerIncoming {
     pub(crate) fn new(listener: Arc<crate::server::OutboundListenerImpl>) -> Self {
-        Self {
-            listener,
-            accept: None,
-        }
+        Self { listener, accept: None }
     }
 }
 
@@ -996,7 +924,7 @@ impl futures::Stream for ListenerIncoming {
                     std::task::Poll::Ready(Some(conn)) => {
                         self.accept = None;
                         return std::task::Poll::Ready(Some(Ok(CommanderStream(conn))));
-                    }
+                    },
                     // listener 关闭：终止 stream（serve 循环退出）。
                     std::task::Poll::Ready(None) => return std::task::Poll::Ready(None),
                     std::task::Poll::Pending => return std::task::Poll::Pending,
@@ -1047,6 +975,7 @@ impl tokio::io::AsyncWrite for CommanderStream {
 
 impl tonic::transport::server::Connected for CommanderStream {
     type ConnectInfo = ();
+
     fn connect_info(&self) -> Self::ConnectInfo {}
 }
 
@@ -1084,9 +1013,8 @@ pub(crate) fn build_router(
     server = server.add_optional_service(
         logger.map(|svc| LoggerServiceServer::new(LoggerServiceImpl::new(svc))),
     );
-    server = server.add_optional_service(
-        stats.map(|svc| StatsServiceServer::new(StatsServiceImpl::new(svc))),
-    );
+    server = server
+        .add_optional_service(stats.map(|svc| StatsServiceServer::new(StatsServiceImpl::new(svc))));
     server = server.add_optional_service(
         routing.map(|svc| RoutingServiceServer::new(RoutingServiceImpl::new(svc))),
     );
@@ -1150,10 +1078,7 @@ mod tests {
     async fn stats_get_stats_not_found() {
         let svc = StatsServiceImpl::new(stats_backend());
         let resp = svc
-            .get_stats(Request::new(pstats::GetStatsRequest {
-                name: "nope".into(),
-                reset: false,
-            }))
+            .get_stats(Request::new(pstats::GetStatsRequest { name: "nope".into(), reset: false }))
             .await;
         assert!(resp.is_err());
         let err = resp.unwrap_err();
@@ -1177,11 +1102,8 @@ mod tests {
     #[tokio::test]
     async fn stats_get_sys_stats_maps_fields() {
         let svc = StatsServiceImpl::new(stats_backend());
-        let resp = svc
-            .get_sys_stats(Request::new(pstats::SysStatsRequest {}))
-            .await
-            .unwrap()
-            .into_inner();
+        let resp =
+            svc.get_sys_stats(Request::new(pstats::SysStatsRequest {})).await.unwrap().into_inner();
         assert_eq!(resp.num_gc, 0);
         assert_eq!(resp.pause_total_ns, 0);
         // uptime 非零（DefaultSysStatsProvider 填启动后秒数）。
@@ -1190,26 +1112,19 @@ mod tests {
 
     #[tokio::test]
     async fn routing_without_router_returns_internal() {
-        let svc = RoutingServiceImpl::new(Arc::new(
-            xray_app_router::command::RoutingService::new(),
-        ));
-        let resp = svc
-            .list_rule(Request::new(prouter::ListRuleRequest {}))
-            .await;
+        let svc =
+            RoutingServiceImpl::new(Arc::new(xray_app_router::command::RoutingService::new()));
+        let resp = svc.list_rule(Request::new(prouter::ListRuleRequest {})).await;
         assert!(resp.is_err());
         assert_eq!(resp.unwrap_err().code(), tonic::Code::Internal);
     }
 
     #[tokio::test]
     async fn routing_remove_rule_empty_tag() {
-        let svc = RoutingServiceImpl::new(Arc::new(
-            xray_app_router::command::RoutingService::new(),
-        ));
-        let resp = svc
-            .remove_rule(Request::new(prouter::RemoveRuleRequest {
-                rule_tag: "".into(),
-            }))
-            .await;
+        let svc =
+            RoutingServiceImpl::new(Arc::new(xray_app_router::command::RoutingService::new()));
+        let resp =
+            svc.remove_rule(Request::new(prouter::RemoveRuleRequest { rule_tag: "".into() })).await;
         assert!(resp.is_err());
     }
 
@@ -1217,15 +1132,12 @@ mod tests {
     async fn routing_subscribe_without_channel_unknown() {
         // Go 生产装配 NewRoutingServer(router, nil)（command.go:145）→
         // "Routing statistics not enabled."（command.go:108-110）。
-        let svc = RoutingServiceImpl::new(Arc::new(
-            xray_app_router::command::RoutingService::new(),
-        ));
+        let svc =
+            RoutingServiceImpl::new(Arc::new(xray_app_router::command::RoutingService::new()));
         let resp = svc
-            .subscribe_routing_stats(Request::new(
-                prouter::SubscribeRoutingStatsRequest {
-                    field_selectors: vec![],
-                },
-            ))
+            .subscribe_routing_stats(Request::new(prouter::SubscribeRoutingStatsRequest {
+                field_selectors: vec![],
+            }))
             .await;
         let err = resp.unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unknown);
@@ -1247,8 +1159,7 @@ mod tests {
             }
         }
 
-        let router =
-            xray_app_router::router::Router::empty(Arc::new(NopSelector), None);
+        let router = xray_app_router::router::Router::empty(Arc::new(NopSelector), None);
         let ch = Arc::new(xray_app_stats::StatsChannel::with_defaults());
         ch.start().unwrap();
         let svc = RoutingServiceImpl::new(Arc::new(
@@ -1257,11 +1168,9 @@ mod tests {
         .with_routing_stats(ch.clone());
 
         let mut stream = svc
-            .subscribe_routing_stats(Request::new(
-                prouter::SubscribeRoutingStatsRequest {
-                    field_selectors: vec!["outbound".into()],
-                },
-            ))
+            .subscribe_routing_stats(Request::new(prouter::SubscribeRoutingStatsRequest {
+                field_selectors: vec!["outbound".into()],
+            }))
             .await
             .unwrap()
             .into_inner();
@@ -1304,13 +1213,9 @@ mod tests {
             outbound_selector: vec!["out-".into()],
             ..Default::default()
         });
-        let router = xray_app_router::router::Router::init(
-            &config,
-            Arc::new(NopSelector),
-            None,
-            None,
-        )
-        .unwrap();
+        let router =
+            xray_app_router::router::Router::init(&config, Arc::new(NopSelector), None, None)
+                .unwrap();
         let svc = RoutingServiceImpl::new(Arc::new(
             xray_app_router::command::RoutingService::with_router(router),
         ));
@@ -1332,10 +1237,7 @@ mod tests {
         let bal = resp.balancer.expect("balancer present");
         assert_eq!(bal.r#override.expect("override").target, "out-direct");
         // NopSelector 原样返回 selectors → principle target = selector 列表
-        assert_eq!(
-            bal.principle_target.expect("principle").tag,
-            vec!["out-".to_string()]
-        );
+        assert_eq!(bal.principle_target.expect("principle").tag, vec!["out-".to_string()]);
 
         // 未知 tag → NotFound（Go errors.New("cannot find tag")）
         let err = svc
@@ -1350,9 +1252,8 @@ mod tests {
     #[tokio::test]
     async fn routing_test_route_applies_field_selectors() {
         use prost::Message as _;
-        use xray_proto::xray::app::router::RoutingRule;
-        use xray_proto::xray::common::serial::TypedMessage;
         use xray_app_router::balancing::OutboundHandlerSelector;
+        use xray_proto::xray::{app::router::RoutingRule, common::serial::TypedMessage};
 
         struct NopSelector;
         impl OutboundHandlerSelector for NopSelector {
@@ -1364,8 +1265,7 @@ mod tests {
             }
         }
 
-        let router =
-            xray_app_router::router::Router::empty(Arc::new(NopSelector), None);
+        let router = xray_app_router::router::Router::empty(Arc::new(NopSelector), None);
         let svc = RoutingServiceImpl::new(Arc::new(
             xray_app_router::command::RoutingService::with_router(router),
         ));
@@ -1373,9 +1273,8 @@ mod tests {
         let mut rule = RoutingRule::default();
         rule.rule_tag = "rule-1".into();
         rule.networks = vec![2]; // TCP
-        rule.target_tag = Some(xray_proto::xray::app::router::routing_rule::TargetTag::Tag(
-            "direct".into(),
-        ));
+        rule.target_tag =
+            Some(xray_proto::xray::app::router::routing_rule::TargetTag::Tag("direct".into()));
         svc.add_rule(Request::new(prouter::AddRuleRequest {
             config: Some(TypedMessage {
                 r#type: "xray.app.router.RoutingRule".into(),
@@ -1453,14 +1352,17 @@ mod tests {
     /// proxyman 域 mock：inbound provider + user manager（Go handlerServer 依赖）。
     mod proxyman_mocks {
         use std::sync::Arc;
-        use xray_app_proxyman::command::{
-            DefaultHandlerService, HandlerFactory, InboundHandlerProvider, InboundOperation,
-            InboundRegistrar, InboundRemover, MemoryUser, OperationDecoder, UserManager,
-            InboundHandlerWithUserManager,
-        };
-        use xray_app_proxyman::error::ProxymanError;
-        use xray_app_proxyman::inbound::InboundHandler;
+
         use parking_lot::Mutex;
+        use xray_app_proxyman::{
+            command::{
+                DefaultHandlerService, HandlerFactory, InboundHandlerProvider,
+                InboundHandlerWithUserManager, InboundOperation, InboundRegistrar, InboundRemover,
+                MemoryUser, OperationDecoder, UserManager,
+            },
+            error::ProxymanError,
+            inbound::InboundHandler,
+        };
         use xray_proto::xray::common::protocol::User as ProtoUser;
 
         pub struct MockUm {
@@ -1471,6 +1373,7 @@ mod tests {
                 self.users.lock().push(user);
                 Ok(())
             }
+
             fn remove_user(&self, email: &str) -> Result<(), ProxymanError> {
                 let mut u = self.users.lock();
                 let before = u.len();
@@ -1480,12 +1383,15 @@ mod tests {
                 }
                 Ok(())
             }
+
             fn get_user(&self, email: &str) -> Option<MemoryUser> {
                 self.users.lock().iter().find(|u| u.email == email).cloned()
             }
+
             fn list_users(&self) -> Vec<MemoryUser> {
                 self.users.lock().clone()
             }
+
             fn users_count(&self) -> usize {
                 self.users.lock().len()
             }
@@ -1499,15 +1405,21 @@ mod tests {
             fn tag(&self) -> &str {
                 &self.tag
             }
+
             fn start(&self) -> futures::future::BoxFuture<'static, Result<(), ProxymanError>> {
                 Box::pin(async { Ok(()) })
             }
+
             fn close(&self) -> futures::future::BoxFuture<'static, Result<(), ProxymanError>> {
                 Box::pin(async { Ok(()) })
             }
-            fn receiver_settings(&self) -> Option<&xray_proto::xray::app::proxyman::ReceiverConfig> {
+
+            fn receiver_settings(
+                &self,
+            ) -> Option<&xray_proto::xray::app::proxyman::ReceiverConfig> {
                 None
             }
+
             fn proxy_type_url(&self) -> &str {
                 "mock"
             }
@@ -1540,6 +1452,7 @@ mod tests {
                     None
                 }
             }
+
             fn get_inbound(&self, tag: &str) -> Option<Arc<dyn InboundHandler>> {
                 if tag == self.handler.tag {
                     Some(Arc::clone(&self.handler) as Arc<dyn InboundHandler>)
@@ -1547,6 +1460,7 @@ mod tests {
                     None
                 }
             }
+
             fn list_inbound_tags(&self) -> Vec<(String, Option<String>, String)> {
                 self.state
                     .inbound_tags
@@ -1594,25 +1508,25 @@ mod tests {
                     "AddUserOperation" => {
                         let p = AddUserOperation::decode(value)
                             .map_err(|e| ProxymanError::UserParse(e.to_string()))?;
-                        Ok(Box::new(
-                            xray_app_proxyman::command::AddUserOperation::from_proto(&p),
-                        ))
-                    }
+                        Ok(Box::new(xray_app_proxyman::command::AddUserOperation::from_proto(&p)))
+                    },
                     "RemoveUserOperation" => {
                         let p = RemoveUserOperation::decode(value)
                             .map_err(|e| ProxymanError::UserParse(e.to_string()))?;
-                        Ok(Box::new(
-                            xray_app_proxyman::command::RemoveUserOperation::from_proto(&p),
-                        ))
-                    }
+                        Ok(Box::new(xray_app_proxyman::command::RemoveUserOperation::from_proto(
+                            &p,
+                        )))
+                    },
                     _ => Err(ProxymanError::UnknownOperation),
                 }
             }
+
             fn decode_outbound_op(
                 &self,
                 _type_url: &str,
                 _value: &[u8],
-            ) -> Result<Box<dyn xray_app_proxyman::command::OutboundOperation>, ProxymanError> {
+            ) -> Result<Box<dyn xray_app_proxyman::command::OutboundOperation>, ProxymanError>
+            {
                 Err(ProxymanError::UnknownOperation)
             }
         }
@@ -1628,26 +1542,22 @@ mod tests {
                     um: Arc::new(MockUm { users: Mutex::new(Vec::new()) }),
                 }))
             }
+
             fn create_outbound(
                 &self,
                 _config: &xray_proto::xray::core::OutboundHandlerConfig,
-            ) -> Result<Arc<dyn xray_app_proxyman::outbound::OutboundHandler>, ProxymanError> {
+            ) -> Result<Arc<dyn xray_app_proxyman::outbound::OutboundHandler>, ProxymanError>
+            {
                 Err(ProxymanError::NotOutboundProxy)
             }
         }
 
-        pub fn make_service() -> (
-            Arc<DefaultHandlerService>,
-            Arc<MockState>,
-            Arc<MockUm>,
-        ) {
+        pub fn make_service() -> (Arc<DefaultHandlerService>, Arc<MockState>, Arc<MockUm>) {
             let state = Arc::new(MockState::default());
             let um = Arc::new(MockUm { users: Mutex::new(Vec::new()) });
             state.inbound_tags.lock().push("vmess-in".into());
-            let handler = Arc::new(MockInboundHandler {
-                tag: "vmess-in".into(),
-                um: Arc::clone(&um),
-            });
+            let handler =
+                Arc::new(MockInboundHandler { tag: "vmess-in".into(), um: Arc::clone(&um) });
             let svc = Arc::new(DefaultHandlerService {
                 inbound_provider: Some(Arc::new(MockProvider {
                     state: Arc::clone(&state),
@@ -1665,10 +1575,7 @@ mod tests {
         }
 
         pub fn proto_user(email: &str) -> ProtoUser {
-            ProtoUser {
-                email: email.to_string(),
-                ..Default::default()
-            }
+            ProtoUser { email: email.to_string(), ..Default::default() }
         }
     }
 
@@ -1676,8 +1583,9 @@ mod tests {
     async fn handler_service_delegates_inbound_ops() {
         use proxyman_mocks::make_service;
         let (svc, _state, um) = make_service();
-        let impl_ = HandlerServiceImpl::new(Arc::new(crate::server::OutboundHandlerRegistry::new()))
-            .with_proxyman_service(svc);
+        let impl_ =
+            HandlerServiceImpl::new(Arc::new(crate::server::OutboundHandlerRegistry::new()))
+                .with_proxyman_service(svc);
 
         // GetInboundUsers：空 email → 全量（Go command.go:125-147）
         um.users.lock().push(xray_app_proxyman::command::MemoryUser {
@@ -1749,19 +1657,18 @@ mod tests {
     async fn handler_service_alter_inbound_add_remove_user() {
         use prost::Message as _;
         use proxyman_mocks::{make_service, proto_user};
-        use xray_proto::xray::app::proxyman::command::{
-            AddUserOperation, AlterInboundRequest, RemoveUserOperation,
+        use xray_proto::xray::{
+            app::proxyman::command::{AddUserOperation, AlterInboundRequest, RemoveUserOperation},
+            common::serial::TypedMessage,
         };
-        use xray_proto::xray::common::serial::TypedMessage;
 
         let (svc, _state, um) = make_service();
-        let impl_ = HandlerServiceImpl::new(Arc::new(crate::server::OutboundHandlerRegistry::new()))
-            .with_proxyman_service(svc);
+        let impl_ =
+            HandlerServiceImpl::new(Arc::new(crate::server::OutboundHandlerRegistry::new()))
+                .with_proxyman_service(svc);
 
         // AddUserOperation（Go command.go:37-52）
-        let op = AddUserOperation {
-            user: Some(proto_user("new@x.com")),
-        };
+        let op = AddUserOperation { user: Some(proto_user("new@x.com")) };
         impl_
             .alter_inbound(Request::new(AlterInboundRequest {
                 tag: "vmess-in".into(),
@@ -1775,9 +1682,7 @@ mod tests {
         assert_eq!(um.users.lock().len(), 1);
 
         // RemoveUserOperation（Go command.go:54-65）
-        let op = RemoveUserOperation {
-            email: "new@x.com".into(),
-        };
+        let op = RemoveUserOperation { email: "new@x.com".into() };
         impl_
             .alter_inbound(Request::new(AlterInboundRequest {
                 tag: "vmess-in".into(),
@@ -1822,9 +1727,8 @@ mod tests {
 
     #[tokio::test]
     async fn routing_test_route_without_context_invalid_argument() {
-        let svc = RoutingServiceImpl::new(Arc::new(
-            xray_app_router::command::RoutingService::new(),
-        ));
+        let svc =
+            RoutingServiceImpl::new(Arc::new(xray_app_router::command::RoutingService::new()));
         let resp = svc
             .test_route(Request::new(prouter::TestRouteRequest {
                 routing_context: None,
@@ -1839,9 +1743,8 @@ mod tests {
     #[tokio::test]
     async fn routing_add_rule_decodes_typed_message() {
         use prost::Message as _;
-        use xray_proto::xray::app::router::RoutingRule;
-        use xray_proto::xray::common::serial::TypedMessage;
         use xray_app_router::balancing::OutboundHandlerSelector;
+        use xray_proto::xray::{app::router::RoutingRule, common::serial::TypedMessage};
 
         struct NopSelector;
         impl OutboundHandlerSelector for NopSelector {
@@ -1861,9 +1764,8 @@ mod tests {
         let mut rule = RoutingRule::default();
         rule.rule_tag = "rule-1".into();
         rule.networks = vec![2]; // TCP（proto Network: TCP=2），保证有有效匹配字段
-        rule.target_tag = Some(xray_proto::xray::app::router::routing_rule::TargetTag::Tag(
-            "direct".into(),
-        ));
+        rule.target_tag =
+            Some(xray_proto::xray::app::router::routing_rule::TargetTag::Tag("direct".into()));
         svc.add_rule(Request::new(prouter::AddRuleRequest {
             config: Some(TypedMessage {
                 r#type: "xray.app.router.RoutingRule".into(),
@@ -1875,11 +1777,8 @@ mod tests {
         .unwrap();
 
         // ListRule 可见新增规则 tag
-        let resp = svc
-            .list_rule(Request::new(prouter::ListRuleRequest {}))
-            .await
-            .unwrap()
-            .into_inner();
+        let resp =
+            svc.list_rule(Request::new(prouter::ListRuleRequest {})).await.unwrap().into_inner();
         assert!(resp.rules.iter().any(|r| r.rule_tag == "rule-1"));
 
         // 空 rule_tag → InvalidArgument

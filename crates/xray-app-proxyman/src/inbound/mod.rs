@@ -18,16 +18,24 @@
 
 pub mod worker;
 
-use crate::config::SniffingRequest;
-use crate::error::ProxymanError;
-use crate::stats::{Counter, StatsProvider, inbound_downlink_name, inbound_uplink_name};
+use std::{
+    collections::HashMap,
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
 use parking_lot::RwLock;
-use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use xray_proto::xray::app::proxyman::ReceiverConfig;
+
+use crate::{
+    config::SniffingRequest,
+    error::ProxymanError,
+    stats::{Counter, StatsProvider, inbound_downlink_name, inbound_uplink_name},
+};
 
 /// Boxed future 别名（手写风格，不依赖 `async_trait`）
 pub type PinFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
@@ -82,10 +90,7 @@ impl InboundManager {
     /// 创建空管理器（对应 Go `New(ctx, *InboundConfig) (*Manager, error)`）
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            state: RwLock::new(ManagerState::default()),
-            running: AtomicBool::new(false),
-        }
+        Self { state: RwLock::new(ManagerState::default()), running: AtomicBool::new(false) }
     }
 
     /// 添加 handler（对应 Go `AddHandler(ctx, handler) error`）
@@ -144,7 +149,7 @@ impl InboundManager {
                 // Go 行为：关闭 handler 再移除
                 let _ = h.close().await;
                 Ok(())
-            }
+            },
             None => Err(ProxymanError::NoClue),
         }
     }
@@ -152,7 +157,8 @@ impl InboundManager {
     /// 列出所有 handler（对应 Go `ListHandlers(ctx) []Handler`）
     pub fn list_handlers(&self) -> Vec<Arc<dyn InboundHandler>> {
         let state = self.state.read();
-        let mut out: Vec<Arc<dyn InboundHandler>> = Vec::with_capacity(state.untagged.len() + state.tagged.len());
+        let mut out: Vec<Arc<dyn InboundHandler>> =
+            Vec::with_capacity(state.untagged.len() + state.tagged.len());
         out.extend(state.untagged.iter().cloned());
         out.extend(state.tagged.values().cloned());
         out
@@ -191,11 +197,7 @@ impl InboundManager {
                 errs.push(e.to_string());
             }
         }
-        if errs.is_empty() {
-            Ok(())
-        } else {
-            Err(ProxymanError::CloseAllFailed(errs.join("; ")))
-        }
+        if errs.is_empty() { Ok(()) } else { Err(ProxymanError::CloseAllFailed(errs.join("; "))) }
     }
 
     /// 当前是否运行中
@@ -393,17 +395,21 @@ mod tests {
         fn tag(&self) -> &str {
             &self.tag
         }
+
         fn start(&self) -> PinFuture<Result<(), ProxymanError>> {
             self.started.store(true, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
         }
+
         fn close(&self) -> PinFuture<Result<(), ProxymanError>> {
             self.closed.store(true, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
         }
+
         fn receiver_settings(&self) -> Option<&ReceiverConfig> {
             None
         }
+
         fn proxy_type_url(&self) -> &str {
             &self.type_url
         }
@@ -539,13 +545,8 @@ mod tests {
 
     #[tokio::test]
     async fn always_on_handler_start_close_are_noop_ok() {
-        let h = AlwaysOnInboundHandler::new(
-            "t",
-            None,
-            "xray.test",
-            SniffingRequest::default(),
-            None,
-        );
+        let h =
+            AlwaysOnInboundHandler::new("t", None, "xray.test", SniffingRequest::default(), None);
         assert!(h.start().await.is_ok());
         assert!(h.close().await.is_ok());
     }

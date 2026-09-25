@@ -3,11 +3,9 @@
 //! 对应 Go `main/confloader` 中按扩展名/内容识别格式的逻辑。
 //! 提供三种格式（JSON/YAML/TOML）的统一入口。
 
-use std::path::Path;
-use std::io::Read;
+use std::{io::Read, path::Path};
 
-use crate::config::Config;
-use crate::error::Result;
+use crate::{config::Config, error::Result};
 
 /// 支持的配置文件格式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,9 +35,7 @@ impl Format {
 
     /// 按路径扩展名识别。
     pub fn from_path(path: &Path) -> Option<Self> {
-        path.extension()
-            .and_then(|e| e.to_str())
-            .and_then(Self::from_extension)
+        path.extension().and_then(|e| e.to_str()).and_then(Self::from_extension)
     }
 
     /// 按内容首字节粗略识别（魔数探测）。

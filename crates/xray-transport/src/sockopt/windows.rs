@@ -3,18 +3,18 @@
 //! 对应 Go `transport/internet/sockopt_windows.go`。
 //!
 //! 实现 Windows 特定的 socket 选项：
-//! - TCP_FASTOPEN（Winsock 值 15；Go :16-32 是真实实现而非 no-op，Win10 1607+
-//!   才支持 per-socket TFO，老系统 setsockopt 返回 WSAENOPROTOOPT 由调用方处理）
-//! - IP_UNICAST_IF / IPV6_UNICAST_IF（出站接口绑定，Go :35-66；v4 值必须
-//!   network byte order——Go :46-48 的 BigEndian 往返坑，见 [`unicast_if_v4_value`]）
+//! - TCP_FASTOPEN（Winsock 值 15；Go :16-32 是真实实现而非 no-op，Win10 1607+ 才支持 per-socket
+//!   TFO，老系统 setsockopt 返回 WSAENOPROTOOPT 由调用方处理）
+//! - IP_UNICAST_IF / IPV6_UNICAST_IF（出站接口绑定，Go :35-66；v4 值必须 network byte order——Go
+//!   :46-48 的 BigEndian 往返坑，见 [`unicast_if_v4_value`]）
 //!
 //! 对齐 Go stub（sockopt_windows.go:184-190）：Windows `setReuseAddr`/`setReusePort`
 //! 为 no-op（SO_EXCLUSIVEADDRUSE 语义下 Windows 默认行为已等价）。
 //!
 //! 已由通用层（mod.rs，socket2）覆盖、此处不重复实现：
 //! - V6Only → `Socket::set_only_v6`（IPV6_V6ONLY，Go inbound :139-143）
-//! - keepalive → `set_keepalive_config`（Go Windows 仅 SO_KEEPALIVE 开关 :73-81；
-//!   socket2 `SIO_KEEPALIVE_VALS` 物化更完整）
+//! - keepalive → `set_keepalive_config`（Go Windows 仅 SO_KEEPALIVE 开关 :73-81； socket2
+//!   `SIO_KEEPALIVE_VALS` 物化更完整）
 //!
 //! CustomSockopt：由通用层 mod.rs 的 `apply_custom_sockopt` 应用
 //! （int 类型全支持；str 类型报错不支持，Go :113 "Str type does not supported
@@ -47,11 +47,7 @@ pub(crate) fn setsockopt_int(s: usize, level: i32, optname: i32, val: i32) -> io
     // SAFETY: s 为有效 SOCKET 句柄（调用方来自 socket2::Socket::as_raw_socket）；
     // optval 指向栈上 i32，optlen 与类型一致；winsock 同步返回，不保留指针。
     let ret = unsafe { setsockopt(s, level, optname, &val, std::mem::size_of::<i32>() as i32) };
-    if ret != 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    if ret != 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 
 /// Go sockopt_windows.go:184-186：Windows setReuseAddr 为 no-op。
@@ -99,7 +95,12 @@ impl WindowsSockOpt {
         if self.bind_if_index > 0 {
             if self.is_ipv4 {
                 // Go :46-51：IP_UNICAST_IF 的值必须 network byte order。
-                setsockopt_int(s, IPPROTO_IP, IP_UNICAST_IF, unicast_if_v4_value(self.bind_if_index) as i32)?;
+                setsockopt_int(
+                    s,
+                    IPPROTO_IP,
+                    IP_UNICAST_IF,
+                    unicast_if_v4_value(self.bind_if_index) as i32,
+                )?;
             } else {
                 // Go :58-60：IPV6_UNICAST_IF 直接用 host order 索引。
                 setsockopt_int(s, IPPROTO_IPV6, IPV6_UNICAST_IF, self.bind_if_index as i32)?;
@@ -112,8 +113,9 @@ impl WindowsSockOpt {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::os::windows::io::AsRawSocket;
+
+    use super::*;
 
     /// Win10 <1607 无 per-socket TFO，setsockopt 返回 WSAENOPROTOOPT（10042）；
     /// 按能力门控跳过（Go 语义会向上传播错误，生产调用方决定）。
@@ -140,8 +142,8 @@ mod tests {
         let opt = WindowsSockOpt { tcp_fast_open: 5, ..Default::default() };
         let sock = new_socket(socket2::Type::STREAM, socket2::Protocol::TCP);
         match opt.apply(sock.as_raw_socket()) {
-            Ok(()) => {}
-            Err(e) if e.raw_os_error() == Some(WSAENOPROTOOPT) => {} // pre-1607 门控跳过
+            Ok(()) => {},
+            Err(e) if e.raw_os_error() == Some(WSAENOPROTOOPT) => {}, // pre-1607 门控跳过
             Err(e) => panic!("set TCP_FASTOPEN failed: {e}"),
         }
     }
@@ -152,8 +154,8 @@ mod tests {
         let opt = WindowsSockOpt { tcp_fast_open: 0, ..Default::default() };
         let sock = new_socket(socket2::Type::STREAM, socket2::Protocol::TCP);
         match opt.apply(sock.as_raw_socket()) {
-            Ok(()) => {}
-            Err(e) if e.raw_os_error() == Some(WSAENOPROTOOPT) => {}
+            Ok(()) => {},
+            Err(e) if e.raw_os_error() == Some(WSAENOPROTOOPT) => {},
             Err(e) => panic!("set TCP_FASTOPEN=0 failed: {e}"),
         }
     }
@@ -180,8 +182,8 @@ mod tests {
         let opt = WindowsSockOpt { bind_if_index: 1, is_ipv4: true, ..Default::default() };
         let sock = new_socket(socket2::Type::DGRAM, socket2::Protocol::UDP);
         match opt.apply(sock.as_raw_socket()) {
-            Ok(()) => {}
-            Err(e) if matches!(e.raw_os_error(), Some(WSAEINVAL) | Some(WSAEADDRNOTAVAIL)) => {}
+            Ok(()) => {},
+            Err(e) if matches!(e.raw_os_error(), Some(WSAEINVAL) | Some(WSAEADDRNOTAVAIL)) => {},
             Err(e) => panic!("set IP_UNICAST_IF failed: {e}"),
         }
     }

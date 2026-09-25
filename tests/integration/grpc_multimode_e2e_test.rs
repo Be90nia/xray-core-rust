@@ -11,9 +11,10 @@
 //!
 //! All tests `#[ignore]` — run with `cargo test --test integration_grpc_multimode -- --ignored`.
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
 use xray_conf::{BuiltConfig, BuiltEntry, BuiltInbound, BuiltOutbound};
 use xray_core::functions::start_full;
 
@@ -36,11 +37,11 @@ async fn start_echo() -> std::net::SocketAddr {
                                     if sock.write_all(&buf[..n]).await.is_err() {
                                         break;
                                     }
-                                }
+                                },
                             }
                         }
                     });
-                }
+                },
                 Err(_) => break,
             }
         }
@@ -56,9 +57,7 @@ async fn pick_free_port() -> u16 {
 }
 
 async fn socks5_echo_round_trip(proxy_port: u16, echo_port: u16, payload: &[u8]) {
-    let mut sock = TcpStream::connect(("127.0.0.1", proxy_port))
-        .await
-        .expect("connect socks");
+    let mut sock = TcpStream::connect(("127.0.0.1", proxy_port)).await.expect("connect socks");
     sock.write_all(&[0x05, 0x01, 0x00]).await.expect("socks greet");
     let mut greet = [0u8; 2];
     sock.read_exact(&mut greet).await.expect("socks greet resp");
@@ -114,10 +113,7 @@ fn vless_outbound(upstream_port: u16, stream_settings_json: serde_json::Value) -
 
 fn freedom_outbound() -> BuiltOutbound {
     BuiltOutbound {
-        entry: BuiltEntry {
-            kind: "freedom".into(),
-            data: b"{}".to_vec(),
-        },
+        entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
         tag: "direct".into(),
         send_through: None,
         stream_settings_json: None,
@@ -129,10 +125,7 @@ fn freedom_outbound() -> BuiltOutbound {
 
 fn socks_inbound(port: u16) -> BuiltInbound {
     BuiltInbound {
-        entry: BuiltEntry {
-            kind: "socks".into(),
-            data: vec![],
-        },
+        entry: BuiltEntry { kind: "socks".into(), data: vec![] },
         tag: "socks-in".into(),
         port: Some(port),
         listen: Some("127.0.0.1".into()),
@@ -156,9 +149,7 @@ async fn run_grpc_e2e(grpc_settings: serde_json::Value, payload: &[u8]) {
 
     let mut client_cfg = BuiltConfig::default();
     client_cfg.inbounds.push(socks_inbound(socks_port));
-    client_cfg
-        .outbounds
-        .push(vless_outbound(vless_port, grpc_settings));
+    client_cfg.outbounds.push(vless_outbound(vless_port, grpc_settings));
 
     let (_ci, _co, ch) = start_full(&client_cfg).await.expect("vless-grpc client");
     tokio::time::sleep(TRANSPORT_WARMUP).await;

@@ -4,58 +4,66 @@
 //!
 //! # 切片 A-D 范围
 //!
-//! - [`DefaultDialerClient`]：基于 `hyper-util legacy Client` + `hyper-rustls`，
-//!   自动 ALPN 协商 h2 / h1.1
-//! - [`DefaultDialerClient::open_stream`]：GET 下载流（stream-down）/ POST 一次性 body
-//!   （packet-up 的 GET 下载、stream-down 模式）
+//! - [`DefaultDialerClient`]：基于 `hyper-util legacy Client` + `hyper-rustls`， 自动 ALPN 协商 h2
+//!   / h1.1
+//! - [`DefaultDialerClient::open_stream`]：GET 下载流（stream-down）/ POST 一次性 body （packet-up
+//!   的 GET 下载、stream-down 模式）
 //! - [`DefaultDialerClient::post_packet`]：POST 单个分包（packet-up），等 200 OK
-//! - [`DefaultDialerClient::open_stream_uploading`]：POST streaming body
-//!   （stream-up / stream-one，支持全双工流式上传）
+//! - [`DefaultDialerClient::open_stream_uploading`]：POST streaming body （stream-up /
+//!   stream-one，支持全双工流式上传）
 //! - 内部 [`Self::build_request`] / [`Self::build_request_with_body`]：把
 //!   [`crate::config::RequestMeta`] + 任意 body 转换为 `hyper::Request<ReqBody>`
 //!
 //! # 不实现（留后续切片）
 //!
 //! - `WaitReadCloser` 异步等待机制（Go 用来同步 GotConn 与响应到达）→ GET 分支以
-//!   [`Self::open_stream`] 的 lazy reader 等价实现（同步 await 响应头会在 Go 26.9.9
-//!   hub `SetFlushNext` 语义下与上传侧形成环形死锁，见 `spawn_h2_lazy_reader`）。
+//!   [`Self::open_stream`] 的 lazy reader 等价实现（同步 await 响应头会在 Go 26.9.9 hub
+//!   `SetFlushNext` 语义下与上传侧形成环形死锁，见 `spawn_h2_lazy_reader`）。
 //! - `browser_dialer` 路径 → 切片 b7f 独立任务
 //! - HTTP/3 / QUIC → 切片 G（可选）
 //! - xmux 多路复用 → 切片 E
 
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::Duration;
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use bytes::Bytes;
 use futures_util::{Future, Stream, TryStreamExt};
-use http::request::Request;
-use http::{Method, StatusCode, Uri};
+use http::{Method, StatusCode, Uri, request::Request};
+use http_body_util::{BodyDataStream, BodyExt, Full, StreamBody, combinators::BoxBody};
 use hyper::body::Frame;
-use http_body_util::{BodyDataStream, BodyExt, Full, StreamBody};
-use http_body_util::combinators::BoxBody;
-use hyper_rustls::{FixedServerNameResolver, HttpsConnector, HttpsConnectorBuilder, MaybeHttpsStream};
-use hyper_util::client::legacy::connect::{Connected, Connection as HttpConnection, HttpInfo};
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use rustls::ClientConfig as RustlsClientConfig;
-use rustls::pki_types::ServerName;
-use tokio::io::AsyncRead as AsyncReadTrait;
-use tokio::sync::mpsc;
+use hyper_rustls::{
+    FixedServerNameResolver, HttpsConnector, HttpsConnectorBuilder, MaybeHttpsStream,
+};
+use hyper_util::{
+    client::legacy::{
+        Client,
+        connect::{Connected, Connection as HttpConnection, HttpInfo},
+    },
+    rt::{TokioExecutor, TokioIo, TokioTimer},
+};
+use rustls::{ClientConfig as RustlsClientConfig, pki_types::ServerName};
+use tokio::{io::AsyncRead as AsyncReadTrait, sync::mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::StreamReader;
-use tracing::debug;
 use tower_service::Service as TowerService;
+use tracing::debug;
 pub use xray_tls::fingerprint::Fingerprint;
 use xray_tls::utls::{ConnInterface, UConn};
 use xray_transport::connection::TcpConnection;
 
-use crate::config::{Config, RequestMeta};
-use crate::error::{Result, SplitHttpError};
+use crate::{
+    config::{Config, RequestMeta},
+    error::{Result, SplitHttpError},
+};
 
 /// 拨号目标——Go `splithttp/dialer.go::dialContext` 语义：TCP 恒拨出站 `dest`
 /// （`internet.DialSystem(ctxInner, dest, ...)`），URL authority（`config.host`）
@@ -90,9 +98,9 @@ pub struct DestTcpConnector {
 }
 
 impl TowerService<Uri> for DestTcpConnector {
-    type Response = DestTcpStream;
     type Error = io::Error;
     type Future = Pin<Box<dyn Future<Output = io::Result<DestTcpStream>> + Send>>;
+    type Response = DestTcpStream;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         std::task::Poll::Ready(Ok(()))
@@ -124,12 +132,18 @@ impl hyper::rt::Read for DestTcpStream {
 }
 
 impl hyper::rt::Write for DestTcpStream {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
     }
+
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().0).poll_flush(cx)
     }
+
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
     }
@@ -157,15 +171,15 @@ pub type CloseSignal = tokio::sync::oneshot::Receiver<()>;
 /// hyper-util legacy Client 类型别名。
 ///
 /// packet-up 用 `Full<Bytes>`（一次性 body）；stream-up/stream-one 用 `StreamBody`
-///（流式上传）。两者都 box 成 [`ReqBody`]。
+/// （流式上传）。两者都 box 成 [`ReqBody`]。
 pub type HyperClient = Client<SplitConnector, ReqBody>;
 
 /// 出站 connector（[`TowerService`] for `Uri`）。
 ///
 /// - [`SplitConnector::Rustls`]：hyper-rustls 现有路径（fingerprint 空），TCP 由
 ///   [`DestTcpConnector`] 恒拨 dest，TLS 由 hyper-rustls 完成。
-/// - [`SplitConnector::Btls`]：fingerprint 非空，TCP 后用 `xray_tls::utls::u_client`
-///   完成 btls 真实浏览器指纹握手（对应 Go splithttp `dialContext` 的 `tls.UClient`）。
+/// - [`SplitConnector::Btls`]：fingerprint 非空，TCP 后用 `xray_tls::utls::u_client` 完成 btls
+///   真实浏览器指纹握手（对应 Go splithttp `dialContext` 的 `tls.UClient`）。
 #[derive(Clone)]
 pub enum SplitConnector {
     Rustls(HttpsConnector<DestTcpConnector>),
@@ -183,15 +197,16 @@ pub struct BtlsDial {
     pub config: Arc<RustlsClientConfig>,
     pub fingerprint: Fingerprint,
     /// `tlsSettings` 原文（pz6c）：btls 指纹握手后回接证书验证用
-    /// （allowInsecure/pinned/vcn 语义，见 `xray_tls::client_config::build_server_cert_verifier`）。
+    /// （allowInsecure/pinned/vcn 语义，见
+    /// `xray_tls::client_config::build_server_cert_verifier`）。
     pub security_json: Option<serde_json::Value>,
 }
 
 /// [`SplitConnector`] 的统一 response 流。满足 hyper-util legacy Client 的
 /// Connect bound：`hyper::rt::Read/Write` + legacy `Connection` + Unpin + Send。
 ///
-/// - Rustls 分支原生 `MaybeHttpsStream` 自带 rt traits（转发保留 `connected()`
-///   的 ALPN/HttpInfo 元数据）。
+/// - Rustls 分支原生 `MaybeHttpsStream` 自带 rt traits（转发保留 `connected()` 的 ALPN/HttpInfo
+///   元数据）。
 /// - Btls 分支 `UConn` 只实现 tokio traits，用 `TokioIo` 桥接。
 pub enum SplitStream {
     Rustls(MaybeHttpsStream<DestTcpStream>),
@@ -203,9 +218,10 @@ pub enum SplitStream {
 }
 
 impl TowerService<Uri> for SplitConnector {
-    type Response = SplitStream;
     type Error = Box<dyn std::error::Error + Send + Sync>;
-    type Future = Pin<Box<dyn Future<Output = std::result::Result<SplitStream, Self::Error>> + Send>>;
+    type Future =
+        Pin<Box<dyn Future<Output = std::result::Result<SplitStream, Self::Error>> + Send>>;
+    type Response = SplitStream;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
         match self {
@@ -219,7 +235,7 @@ impl TowerService<Uri> for SplitConnector {
             SplitConnector::Rustls(c) => {
                 let fut = c.call(uri);
                 Box::pin(async move { Ok(SplitStream::Rustls(fut.await?)) })
-            }
+            },
             SplitConnector::Btls(dial) => {
                 let dial = dial.clone();
                 Box::pin(async move {
@@ -240,7 +256,7 @@ impl TowerService<Uri> for SplitConnector {
                     let alpn_h2 = ConnInterface::negotiated_protocol(&conn).await == "h2";
                     Ok(SplitStream::Btls { io: TokioIo::new(conn), alpn_h2 })
                 })
-            }
+            },
         }
     }
 }
@@ -291,12 +307,8 @@ impl HttpConnection for SplitStream {
             SplitStream::Rustls(s) => s.connected(),
             SplitStream::Btls { alpn_h2, .. } => {
                 let connected = Connected::new();
-                if *alpn_h2 {
-                    connected.negotiated_h2()
-                } else {
-                    connected
-                }
-            }
+                if *alpn_h2 { connected.negotiated_h2() } else { connected }
+            },
         }
     }
 }
@@ -380,9 +392,8 @@ impl DefaultDialerClient {
             // clear 只在 rustls 分支：btls 分支的 config 原样传给 u_client
             // （清单外指纹回退 rustls 时保留 alpn）。
             tls_config.alpn_protocols.clear();
-            let mut builder = HttpsConnectorBuilder::new()
-                .with_tls_config(tls_config)
-                .https_or_http();
+            let mut builder =
+                HttpsConnectorBuilder::new().with_tls_config(tls_config).https_or_http();
             // TLS SNI 用 tlsSettings.serverName（不参与 TCP 寻址——TCP 恒拨 dest，
             // 见 [`DestTcpConnector`] 文档）。
             if let Ok(sn) = ServerName::try_from(sni) {
@@ -400,11 +411,7 @@ impl DefaultDialerClient {
             .pool_timer(TokioTimer::new())
             .pool_idle_timeout(Some(Duration::from_secs(90)))
             .build(connector);
-        Self {
-            config,
-            client,
-            closed: Arc::new(AtomicBool::new(false)),
-        }
+        Self { config, client, closed: Arc::new(AtomicBool::new(false)) }
     }
 
     /// 连接是否已关闭。
@@ -427,13 +434,14 @@ impl DefaultDialerClient {
     ///
     /// [`Self::build_request`] 用 `Full<Bytes>` body 调用此函数；
     /// [`Self::open_stream_uploading`] 用 `StreamBody` body 调用此函数。
-    pub(crate) fn build_request_with_body(meta: RequestMeta, body: ReqBody) -> Result<Request<ReqBody>> {
+    pub(crate) fn build_request_with_body(
+        meta: RequestMeta,
+        body: ReqBody,
+    ) -> Result<Request<ReqBody>> {
         let method = Method::from_bytes(meta.method.as_bytes())
             .map_err(|e| SplitHttpError::InvalidUrl(format!("method {e}")))?;
-        let uri: Uri = meta
-            .uri
-            .parse()
-            .map_err(|e| SplitHttpError::InvalidUrl(format!("uri {e}")))?;
+        let uri: Uri =
+            meta.uri.parse().map_err(|e| SplitHttpError::InvalidUrl(format!("uri {e}")))?;
 
         // h2/2 协议层禁止 Host 作为常规 header——它由 :authority 伪头承载。
         // hyper-util client.rs:300 会按 URI authority 自动补 Host，与 config.host
@@ -448,17 +456,11 @@ impl DefaultDialerClient {
             builder = builder.header(name.as_str(), value.as_str());
         }
         if !meta.cookies.is_empty() {
-            let cookie_str = meta
-                .cookies
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join("; ");
+            let cookie_str =
+                meta.cookies.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("; ");
             builder = builder.header("Cookie", cookie_str.as_str());
         }
-        builder
-            .body(body)
-            .map_err(|e| SplitHttpError::InvalidUrl(format!("body {e}")))
+        builder.body(body).map_err(|e| SplitHttpError::InvalidUrl(format!("body {e}")))
     }
 
     /// 打开 stream（stream-down / 一次性 POST body）。
@@ -472,13 +474,13 @@ impl DefaultDialerClient {
     ///
     /// GET 分支（`body = None`）**发出即返回**（lazy reader，对齐 Go gotConn+
     /// `WaitReadCloser` 语义）；`remote/local_addr` 仅 POST 分支可得 `HttpInfo`
-    ///（GotConn 等价物），GET 分支恒为 `0.0.0.0:0` 占位（不致命，仅日志用）。
+    /// （GotConn 等价物），GET 分支恒为 `0.0.0.0:0` 占位（不致命，仅日志用）。
     ///
     /// # Errors
-    /// - [`SplitHttpError::Hyper`]：拨号 / TLS / HTTP 协议错误（POST 分支同步报；
-    ///   GET 分支读端以 EOF/`io::Error` 呈现）
-    /// - [`SplitHttpError::BadStatus`]：非 200 响应（仅 POST 分支；GET 分支非 200
-    ///   记日志 + 读端 EOF，对齐 Go `"unexpected status"` 分支）
+    /// - [`SplitHttpError::Hyper`]：拨号 / TLS / HTTP 协议错误（POST 分支同步报； GET 分支读端以
+    ///   EOF/`io::Error` 呈现）
+    /// - [`SplitHttpError::BadStatus`]：非 200 响应（仅 POST 分支；GET 分支非 200 记日志 + 读端
+    ///   EOF，对齐 Go `"unexpected status"` 分支）
     pub async fn open_stream(
         &self,
         base_uri: &str,
@@ -487,9 +489,7 @@ impl DefaultDialerClient {
         close: Option<CloseSignal>,
     ) -> Result<(Box<dyn AsyncReadTrait + Send + Unpin>, SocketAddr, SocketAddr)> {
         let is_get = body.is_none();
-        let meta = self
-            .config
-            .build_stream_request_meta(base_uri, session_id, body)?;
+        let meta = self.config.build_stream_request_meta(base_uri, session_id, body)?;
         let req = Self::build_request(meta)?;
 
         if is_get {
@@ -497,8 +497,7 @@ impl DefaultDialerClient {
             // 把 GET 响应头缓冲到首块下行数据，而下行数据依赖上传侧到达；
             // packet-up/stream-up 的 POST 上传任务在 GET 返回后才 spawn——旧实现
             // 同步 `request().await` 等响应头会环形死锁，dial 挂到外层超时。
-            let reader =
-                spawn_h2_lazy_reader(self.closed.clone(), self.client.clone(), req, close);
+            let reader = spawn_h2_lazy_reader(self.closed.clone(), self.client.clone(), req, close);
             let placeholder = SocketAddr::from(([0, 0, 0, 0], 0));
             return Ok((reader, placeholder, placeholder));
         }
@@ -540,7 +539,8 @@ impl DefaultDialerClient {
     ///   配合独立的 GET 下载流（调用方另行 [`Self::open_stream`]`(body=None)` 拿下载流）。
     /// - `upload_only = false` → stream-one：POST streaming body 并等响应流（全双工）。
     ///
-    /// 对应 Go `DefaultDialerClient.OpenStream(ctx, url, sessionId, body, uploadOnly)` 的 POST 分支。
+    /// 对应 Go `DefaultDialerClient.OpenStream(ctx, url, sessionId, body, uploadOnly)` 的 POST
+    /// 分支。
     ///
     /// # Errors
     /// - [`SplitHttpError::Hyper`]：拨号 / TLS / HTTP 协议错误
@@ -551,18 +551,13 @@ impl DefaultDialerClient {
         session_id: &str,
         body_stream: S,
         upload_only: bool,
-    ) -> Result<(
-        Option<BodyDataStream<hyper::body::Incoming>>,
-        SocketAddr,
-        SocketAddr,
-    )>
+    ) -> Result<(Option<BodyDataStream<hyper::body::Incoming>>, SocketAddr, SocketAddr)>
     where
         S: Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static,
     {
         // 1. 构造 RequestMeta（body 用空 Vec 占位走 POST 分支，实际 body 由 StreamBody 提供）
-        let mut meta = self
-            .config
-            .build_stream_request_meta(base_uri, session_id, Some(Vec::new()))?;
+        let mut meta =
+            self.config.build_stream_request_meta(base_uri, session_id, Some(Vec::new()))?;
         // body 不在 RequestMeta，清空（避免 Vec 与 BoxBody 语义混淆）
         meta.body = None;
 
@@ -638,32 +633,28 @@ impl DefaultDialerClient {
         seq_str: &str,
         payload: Vec<u8>,
     ) -> Result<()> {
-        let meta = self
-            .config
-            .build_packet_request_meta(base_uri, session_id, seq_str, payload)?;
+        let meta = self.config.build_packet_request_meta(base_uri, session_id, seq_str, payload)?;
         match self.client.request(Self::build_request(meta.clone())?).await {
             Ok(resp) => return Self::post_packet_finish(resp).await,
             Err(e) if is_packet_replayable(&e) => {
                 debug!(target: "splithttp", error = %e, seq = seq_str, "packet-up request failed on connection level, replaying once (GetBody)");
-            }
+            },
             Err(e) => {
                 self.closed.store(true, Ordering::Relaxed);
                 return Err(SplitHttpError::Hyper(e.to_string()));
-            }
+            },
         }
         match self.client.request(Self::build_request(meta)?).await {
             Ok(resp) => Self::post_packet_finish(resp).await,
             Err(e) => {
                 self.closed.store(true, Ordering::Relaxed);
                 Err(SplitHttpError::Hyper(e.to_string()))
-            }
+            },
         }
     }
 
     /// packet-up 响应收尾：drain body + 200 校验。
-    async fn post_packet_finish(
-        resp: http::Response<hyper::body::Incoming>,
-    ) -> Result<()> {
+    async fn post_packet_finish(resp: http::Response<hyper::body::Incoming>) -> Result<()> {
         let status = resp.status();
         // drain body（hyper-util 要求消费 body 释放连接回 pool）
         #[allow(unused_must_use)]
@@ -850,7 +841,8 @@ mod tests {
     }
     // ── dffc7ada：packet-up GetBody 重放（mock h2+TLS，断言重放调用）──
 
-    fn self_signed_cert() -> (rustls_pki_types::CertificateDer<'static>, rustls_pki_types::PrivateKeyDer<'static>) {
+    fn self_signed_cert()
+    -> (rustls_pki_types::CertificateDer<'static>, rustls_pki_types::PrivateKeyDer<'static>) {
         let params =
             rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("rcgen params");
         let key_pair = rcgen::KeyPair::generate().expect("rcgen keypair");
@@ -876,9 +868,7 @@ mod tests {
     fn client_tls(cert: rustls_pki_types::CertificateDer<'static>) -> RustlsClientConfig {
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert).expect("add cert");
-        RustlsClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth()
+        RustlsClientConfig::builder().with_root_certificates(roots).with_no_client_auth()
     }
 
     /// 响应收尾：驱动连接把帧刷出。直接 drop Connection 会未 flush 即断 TLS，
@@ -889,8 +879,7 @@ mod tests {
             bytes::Bytes,
         >,
     ) {
-        let _ =
-            tokio::time::timeout(std::time::Duration::from_millis(300), conn.accept()).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(300), conn.accept()).await;
     }
 
     /// h2 mock（单连接两流）：流 1 回 REFUSED_STREAM（Go `canRetryError`
@@ -915,10 +904,7 @@ mod tests {
             respond.send_reset(h2::Reason::REFUSED_STREAM);
             // 保活等待重放流（同连接流 2）→ 200。
             if let Some(Ok((_req2, mut respond2))) = conn.accept().await {
-                let resp = http::Response::builder()
-                    .status(StatusCode::OK)
-                    .body(())
-                    .unwrap();
+                let resp = http::Response::builder().status(StatusCode::OK).body(()).unwrap();
                 let _ = respond2.send_response(resp, true);
                 drain_h2_conn(&mut conn).await;
                 return;
@@ -1017,10 +1003,8 @@ mod tests {
                     .body(())
                     .unwrap();
                 let _ = respond.send_response(resp, true);
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_millis(300),
-                    conn.accept(),
-                ).await;
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(300), conn.accept())
+                    .await;
             }
         });
 

@@ -68,9 +68,7 @@ mod tests {
 
     #[test]
     fn unimplemented_display_contains_what() {
-        let e = CliError::Unimplemented {
-            what: "full New(config) initialization",
-        };
+        let e = CliError::Unimplemented { what: "full New(config) initialization" };
         assert!(format!("{e}").contains("New(config)"));
     }
 

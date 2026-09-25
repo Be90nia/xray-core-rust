@@ -21,19 +21,23 @@
 //!
 //! quinn 需要 `SocketAddr`（不做 DNS）；若 dest 是域名，用 `tokio::net::lookup_host` 解析。
 
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use xray_common::net::destination::Destination;
-use xray_transport::connection::Connection;
-use xray_transport::dialer::StreamSettings;
-use xray_transport::listener_registry::{ConnHandler, TransportListener};
-use xray_transport::sockopt::SocketOptions;
+use xray_transport::{
+    connection::Connection,
+    dialer::StreamSettings,
+    listener_registry::{ConnHandler, TransportListener},
+    sockopt::SocketOptions,
+};
 
 /// 主动拨号 QUIC 连接。对应 Go `quic::Dial`。
 ///
@@ -64,13 +68,17 @@ pub async fn dial(
     let addr_str = format!("{}:{}", dest.address(), dest.port().value());
     let socket_addr = tokio::time::timeout(dial_timeout, tokio::net::lookup_host(&addr_str))
         .await
-        .map_err(|_| io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("quic DNS lookup timeout for {addr_str}"),
-        ))?
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("quic DNS lookup timeout for {addr_str}"),
+            )
+        })?
         .map_err(|e| io::Error::other(format!("quic DNS resolution: {e}")))?
         .next()
-        .ok_or_else(|| io::Error::other(format!("DNS resolution returned no addr for {addr_str}")))?;
+        .ok_or_else(|| {
+            io::Error::other(format!("DNS resolution returned no addr for {addr_str}"))
+        })?;
 
     // 3. QUIC 特有配置（congestion 等）。
     let qc = crate::config::QuicConfig::from_json(settings.transport_json.as_ref())?;
@@ -83,22 +91,20 @@ pub async fn dial(
     // 4. Endpoint + connect（外层 timeout 覆盖 DNS+握手+鉴权整段）。
     // GSO 默认开（quinn-udp 构造期探测 UDP_SEGMENT，内核不支持自动回退单段）；
     // disableGSO=true 时经 NoGsoSocket 钳单段（见 udp_gso 模块 doc）。
-    let endpoint = crate::udp_gso::make_endpoint(
-        None,
-        "0.0.0.0:0".parse().unwrap(),
-        qc.disable_gso,
-        sockopt,
-    )
-    .map_err(|e| io::Error::other(format!("quinn bind: {e}")))?;
+    let endpoint =
+        crate::udp_gso::make_endpoint(None, "0.0.0.0:0".parse().unwrap(), qc.disable_gso, sockopt)
+            .map_err(|e| io::Error::other(format!("quinn bind: {e}")))?;
     let connecting = endpoint
         .connect_with(client_config, socket_addr, &sni)
         .map_err(|e| io::Error::other(format!("quinn connect initiate: {e}")))?;
     let conn = tokio::time::timeout(dial_timeout, connecting)
         .await
-        .map_err(|_| io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("quic handshake timeout after {dial_timeout:?}"),
-        ))?
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("quic handshake timeout after {dial_timeout:?}"),
+            )
+        })?
         .map_err(|e| io::Error::other(format!("quinn handshake: {e}")))?;
 
     let local = endpoint.local_addr().ok();
@@ -157,7 +163,8 @@ pub async fn listen(
                 };
                 let local = conn.local_ip().map(|ip| SocketAddr::new(ip, 0));
                 let remote = conn.remote_address();
-                // 每个 QUIC 连接上接受任意数量的 bi-stream，每个 stream 都作为独立 Connection 上报。
+                // 每个 QUIC 连接上接受任意数量的 bi-stream，每个 stream 都作为独立 Connection
+                // 上报。
                 while let Ok((send, recv)) = conn.accept_bi().await {
                     let c = QuicConn::new(send, recv, local, Some(remote), ());
                     h(Box::new(c));
@@ -166,10 +173,7 @@ pub async fn listen(
         }
     });
 
-    Ok(Box::new(QuicListener {
-        local,
-        endpoint: listener_endpoint,
-    }))
+    Ok(Box::new(QuicListener { local, endpoint: listener_endpoint }))
 }
 
 /// quinn (SendStream, RecvStream) + tokio DuplexStream 桥接的 Connection。
@@ -211,9 +215,7 @@ impl<E: Send + Sync + Unpin> QuicConn<E> {
                         let _ = send.finish();
                         break;
                     }
-                    send.write_chunk(buf.split().freeze())
-                        .await
-                        .map_err(io_err)?;
+                    send.write_chunk(buf.split().freeze()).await.map_err(io_err)?;
                 }
                 Ok::<_, io::Error>(())
             };
@@ -231,12 +233,7 @@ impl<E: Send + Sync + Unpin> QuicConn<E> {
             };
             let _ = tokio::try_join!(s, r);
         });
-        Self {
-            inner: client,
-            _extra: extra,
-            local,
-            remote,
-        }
+        Self { inner: client, _extra: extra, local, remote }
     }
 }
 
@@ -258,9 +255,11 @@ impl<E: Send + Sync + Unpin> AsyncWrite for QuicConn<E> {
     ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
+
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
@@ -270,6 +269,7 @@ impl<E: Send + Sync + Unpin> Connection for QuicConn<E> {
     fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(self.remote)
     }
+
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(self.local)
     }
@@ -289,6 +289,7 @@ impl TransportListener for QuicListener {
         self.endpoint.close(quinn::VarInt::from_u32(0), b"listener closed");
         Ok(())
     }
+
     fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.local)
     }
@@ -319,9 +320,7 @@ mod tests {
         .unwrap()
         .expect("client tls config");
         let mut transport = quinn::TransportConfig::default();
-        transport.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
-            1_000,
-        ))));
+        transport.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(1_000))));
         let mut quic_cfg = quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap(),
         ));
@@ -342,9 +341,10 @@ mod tests {
             ..Default::default()
         };
         let handler: ConnHandler = Arc::new(|_| {});
-        let listener = listen("127.0.0.1:0".parse().unwrap(), &settings, &Default::default(), handler)
-            .await
-            .expect("listen");
+        let listener =
+            listen("127.0.0.1:0".parse().unwrap(), &settings, &Default::default(), handler)
+                .await
+                .expect("listen");
         let addr = listener.local_addr().unwrap();
 
         // close 前连通（证明服务活着，排除假阳性）。
@@ -373,7 +373,7 @@ mod tests {
                             if conn.write_all(&buf[..n]).await.is_err() {
                                 break;
                             }
-                        }
+                        },
                     }
                 }
             });
@@ -392,9 +392,10 @@ mod tests {
             transport_json: Some(serde_json::json!({ "disableGSO": disable_gso })),
             ..Default::default()
         };
-        let listener = listen("127.0.0.1:0".parse().unwrap(), &settings, &Default::default(), echo_handler())
-            .await
-            .expect("listen");
+        let listener =
+            listen("127.0.0.1:0".parse().unwrap(), &settings, &Default::default(), echo_handler())
+                .await
+                .expect("listen");
         let addr = listener.local_addr().unwrap();
 
         let ep = quinn_client_connect(addr);

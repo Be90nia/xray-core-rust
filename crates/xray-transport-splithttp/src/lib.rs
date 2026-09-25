@@ -27,31 +27,29 @@
 //! `ExtractMetaFromRequest`（`hub::meta::extract_meta`）+
 //! 实际 HTTP 拨号（H1/H2 + H3）+ SSE 流 + upload_queue + xmux 连接池骨架。
 
-pub mod config;
-pub mod error;
+pub mod batched_upload;
 pub mod browser_client;
 pub mod client;
+pub mod config;
 pub mod connection;
 pub mod dialer;
+pub mod error;
 pub mod h1_conn;
 pub mod h3_client;
 pub mod hub;
 pub mod mux;
-pub mod batched_upload;
+pub mod register;
+pub mod transport;
 pub mod upload_queue;
 pub mod xpadding;
-pub mod transport;
-pub mod register;
 
 // 顶层 re-export。
 pub use config::{Config, RangeConfig, XmuxConfig};
-pub use error::{Result, SplitHttpError};
-pub use upload_queue::{Packet, UploadQueue};
 // Placement 常量顶层 re-export，方便下游直接 `use xray_transport_splithttp::PLACEMENT_PATH`。
 pub use config::{
-    PLACEMENT_AUTO, PLACEMENT_BODY, PLACEMENT_COOKIE, PLACEMENT_HEADER,
-    PLACEMENT_PATH, PLACEMENT_QUERY, PLACEMENT_QUERY_IN_HEADER,
+    PLACEMENT_AUTO, PLACEMENT_BODY, PLACEMENT_COOKIE, PLACEMENT_HEADER, PLACEMENT_PATH,
+    PLACEMENT_QUERY, PLACEMENT_QUERY_IN_HEADER,
 };
-
-pub use register::register_dialer;
-pub use register::register_listener;
+pub use error::{Result, SplitHttpError};
+pub use register::{register_dialer, register_listener};
+pub use upload_queue::{Packet, UploadQueue};

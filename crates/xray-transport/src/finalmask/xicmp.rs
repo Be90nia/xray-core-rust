@@ -4,10 +4,10 @@
 //!
 //! ## 协议
 //!
-//! - client：在 ICMP echo request 的 data 前缀 8 字节 clientID（随机），
-//!   后接 payload。server 用 clientID 构造虚拟 IPv6 地址作为 PacketConn addr。
-//! - server：收到 echo request 后记录 (clientID → src addr/id/seq)，
-//!   回复时用记录的 id/seq 构造 echo reply。
+//! - client：在 ICMP echo request 的 data 前缀 8 字节 clientID（随机）， 后接 payload。server 用
+//!   clientID 构造虚拟 IPv6 地址作为 PacketConn addr。
+//! - server：收到 echo request 后记录 (clientID → src addr/id/seq)， 回复时用记录的 id/seq 构造
+//!   echo reply。
 //!
 //! ## 范围
 //!
@@ -18,20 +18,23 @@
 //!
 //! raw socket 收发（需 CAP_NET_RAW / root）留给集成层，本模块不依赖平台特权。
 
-use std::collections::{HashMap, VecDeque};
-use std::io;
-use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    collections::{HashMap, VecDeque},
+    io,
+    net::{Ipv6Addr, SocketAddr, SocketAddrV6},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use rand::RngCore;
-use tokio::sync::{mpsc, Mutex as TokioMutex};
-use tokio::task::JoinHandle;
+use tokio::{
+    sync::{Mutex as TokioMutex, mpsc},
+    task::JoinHandle,
+};
 
-
-use super::{UdpIo, Udpmask, UDP_SIZE};
+use super::{UDP_SIZE, UdpIo, Udpmask};
 
 /// ICMP Echo Request type（IPv4）。
 const ICMP_ECHO_V4: u8 = 8;
@@ -69,13 +72,7 @@ pub struct IcmpEcho {
 impl IcmpEcho {
     /// 构造 echo request/reply（checksum=0，待 fill_checksum）。
     pub fn new(icmp_type: u8, id: u16, seq: u16) -> Self {
-        Self {
-            icmp_type,
-            code: 0,
-            checksum: 0,
-            id,
-            seq,
-        }
+        Self { icmp_type, code: 0, checksum: 0, id, seq }
     }
 
     /// 是否为 IPv4 echo（request 或 reply）。
@@ -167,7 +164,7 @@ pub fn addr_to_client_id(addr: &SocketAddr) -> Option<[u8; 8]> {
             let mut id = [0u8; 8];
             id.copy_from_slice(&octets[8..16]);
             Some(id)
-        }
+        },
         SocketAddr::V4(_) => None,
     }
 }
@@ -295,11 +292,7 @@ impl XicmpPassthroughConn {
             mode: XicmpMode::Client,
             raw,
             shared: TokioMutex::new(XicmpShared { rx }),
-            client_state: Some(Mutex::new(XicmpClientState {
-                client_id,
-                id,
-                seq: 1,
-            })),
+            client_state: Some(Mutex::new(XicmpClientState { client_id, id, seq: 1 })),
             server_state: None,
             closed: Mutex::new(false),
             recv_task: Mutex::new(Some(task)),
@@ -315,16 +308,12 @@ impl XicmpPassthroughConn {
             raw,
             shared: TokioMutex::new(XicmpShared { rx }),
             client_state: None,
-            server_state: Some(Mutex::new(XicmpServerState {
-                rec: HashMap::new(),
-            })),
+            server_state: Some(Mutex::new(XicmpServerState { rec: HashMap::new() })),
             closed: Mutex::new(false),
             recv_task: Mutex::new(Some(task)),
         }
     }
-
 }
-
 
 /// spawn 后台 recv 任务：循环 `raw.recv()` → type-filter → 投 bounded channel。
 ///
@@ -370,7 +359,6 @@ impl Drop for XicmpPassthroughConn {
 }
 
 impl XicmpPassthroughConn {
-
     fn is_closed(&self) -> bool {
         *self.closed.lock()
     }
@@ -413,7 +401,12 @@ impl XicmpPassthroughConn {
                 let mut sh = self.shared.lock().await;
                 match sh.rx.recv().await {
                     Some(p) => p,
-                    None => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "xicmp recv closed")),
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "xicmp recv closed",
+                        ));
+                    },
                 }
             };
             let (rid, rseq, rdata) = match parse_echo_packet(&pkt) {
@@ -466,7 +459,7 @@ impl XicmpPassthroughConn {
                 Some(r) => {
                     r.last = now;
                     (r.id, r.seq, true /* is_v4 由包决定 */)
-                }
+                },
                 None => return Ok(0), // Go: log + drop
             }
         };
@@ -477,7 +470,8 @@ impl XicmpPassthroughConn {
         Ok(payload.len())
     }
 
-    /// server recv_from：parse echo request → 剥 8B clientID → 记录 rec → 返回 (payload, virtual_v6_addr)
+    /// server recv_from：parse echo request → 剥 8B clientID → 记录 rec → 返回 (payload,
+    /// virtual_v6_addr)
     async fn server_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let state_arc = self
             .server_state
@@ -488,7 +482,12 @@ impl XicmpPassthroughConn {
                 let mut sh = self.shared.lock().await;
                 match sh.rx.recv().await {
                     Some(p) => p,
-                    None => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "xicmp recv closed")),
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "xicmp recv closed",
+                        ));
+                    },
                 }
             };
             let (id, seq, rdata) = match parse_echo_packet(&pkt) {
@@ -505,10 +504,8 @@ impl XicmpPassthroughConn {
             let vaddr = client_id_to_addr(client_id);
             {
                 let mut s = state_arc.lock();
-                s.rec.insert(
-                    vaddr.to_string(),
-                    XicmpServerRecord { id, seq, last: Instant::now() },
-                );
+                s.rec
+                    .insert(vaddr.to_string(), XicmpServerRecord { id, seq, last: Instant::now() });
             }
             let n = payload.len().min(buf.len());
             buf[..n].copy_from_slice(&payload[..n]);
@@ -528,6 +525,7 @@ impl UdpIo for XicmpPassthroughConn {
             XicmpMode::Server => self.server_send_to(buf, &addr).await,
         }
     }
+
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         if self.is_closed() {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "xicmp closed"));
@@ -537,6 +535,7 @@ impl UdpIo for XicmpPassthroughConn {
             XicmpMode::Server => self.server_recv_from(buf).await,
         }
     }
+
     fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)))
     }
@@ -588,11 +587,12 @@ fn xicmp_open_server(cfg: &XicmpConfig) -> io::Result<Box<dyn UdpIo>> {
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
-    use super::*;
     use std::os::unix::io::AsRawFd;
 
     use socket2::{Domain, Protocol, Socket, Type};
     use tokio::io::unix::AsyncFd;
+
+    use super::*;
 
     /// Linux SOCK_RAW + IPPROTO_ICMP wrapper（占位）。
     ///
@@ -608,7 +608,8 @@ mod linux_impl {
         /// 打开 IPv4 ICMP raw socket（`ip4:icmp`）。需 CAP_NET_RAW 或 root。
         pub fn open_v4() -> io::Result<Self> {
             // socket2 0.5 的 Type::RAW 被 `all` feature 门控；From<c_int> 无门控，等价。
-            let sock = Socket::new(Domain::IPV4, Type::from(libc::SOCK_RAW), Some(Protocol::ICMPV4))?;
+            let sock =
+                Socket::new(Domain::IPV4, Type::from(libc::SOCK_RAW), Some(Protocol::ICMPV4))?;
             sock.set_nonblocking(true)?;
             let fd = AsyncFd::new(sock)?;
             Ok(Self { _fd: fd })
@@ -616,7 +617,8 @@ mod linux_impl {
 
         /// 打开 IPv6 ICMPv6 raw socket（`ip6:ipv6-icmp`）。
         pub fn open_v6() -> io::Result<Self> {
-            let sock = Socket::new(Domain::IPV6, Type::from(libc::SOCK_RAW), Some(Protocol::ICMPV6))?;
+            let sock =
+                Socket::new(Domain::IPV6, Type::from(libc::SOCK_RAW), Some(Protocol::ICMPV6))?;
             sock.set_nonblocking(true)?;
             let fd = AsyncFd::new(sock)?;
             Ok(Self { _fd: fd })
@@ -632,6 +634,7 @@ mod linux_impl {
                  use MockIcmpRawSocket in unit tests",
             ))
         }
+
         async fn recv(&self) -> io::Result<Vec<u8>> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -683,11 +686,7 @@ pub fn build_client_packet(
 ///
 /// 用记录的 client id/seq 构造 echo reply。
 pub fn build_server_reply(id: u16, seq: u16, payload: &[u8], is_v4: bool) -> Vec<u8> {
-    let icmp_type = if is_v4 {
-        ICMP_ECHO_REPLY_V4
-    } else {
-        ICMP_ECHO_REPLY_V6
-    };
+    let icmp_type = if is_v4 { ICMP_ECHO_REPLY_V4 } else { ICMP_ECHO_REPLY_V6 };
     marshal_echo(icmp_type, id, seq, payload)
 }
 
@@ -781,7 +780,7 @@ mod tests {
                 assert_eq!(octets[0], 0xfd);
                 assert_eq!(octets[1], 0x00);
                 assert_eq!(&octets[8..16], &[0xff; 8]);
-            }
+            },
             _ => panic!("expected V6"),
         }
     }
@@ -849,9 +848,11 @@ mod tests {
             async fn send_to(&self, _buf: &[u8], _addr: SocketAddr) -> io::Result<usize> {
                 Ok(0)
             }
+
             async fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
                 Ok((0, "127.0.0.1:0".parse().unwrap()))
             }
+
             fn local_addr(&self) -> io::Result<SocketAddr> {
                 Ok("127.0.0.1:0".parse().unwrap())
             }
@@ -871,9 +872,11 @@ mod tests {
             async fn send_to(&self, _buf: &[u8], _addr: SocketAddr) -> io::Result<usize> {
                 Ok(0)
             }
+
             async fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
                 Ok((0, "127.0.0.1:0".parse().unwrap()))
             }
+
             fn local_addr(&self) -> io::Result<SocketAddr> {
                 Ok("127.0.0.1:0".parse().unwrap())
             }
@@ -882,7 +885,6 @@ mod tests {
         // level=0（最外层）应透传成功
         let result = config.wrap_packet_conn_client(raw, 0, 2);
     }
-
 
     /// mock raw ICMP socket：记录 send 字节、预设 recv 队列。
     /// 用于单测跑通 XicmpPassthroughConn 的 send_to/recv_from 全链路。
@@ -913,6 +915,7 @@ mod tests {
             self.sent.lock().push(packet.to_vec());
             Ok(())
         }
+
         async fn recv(&self) -> io::Result<Vec<u8>> {
             // 模拟生产 raw socket 的语义：阻塞到有包。空队列 → 短 sleep 重试。
             // 对应 Linux 实现：AsyncFd readable().await + libc::read 阻塞。
@@ -1024,7 +1027,6 @@ mod tests {
         assert_eq!(&buf[..n], &real_data[..]);
     }
 
-
     #[tokio::test]
     async fn passthrough_server_recv_from_records_client_id_and_returns_virtual_addr() {
         // server 收到 echo request：剥 8B clientID，记录到 rec，
@@ -1078,7 +1080,7 @@ mod tests {
         let pkt = &sent[0];
         assert_eq!(pkt[0], ICMP_ECHO_REPLY_V4);
         assert_eq!(u16::from_be_bytes([pkt[4], pkt[5]]), 0x7777); // id 来自 rec
-        assert_eq!(u16::from_be_bytes([pkt[6], pkt[7]]), 9);     // seq 来自 rec
+        assert_eq!(u16::from_be_bytes([pkt[6], pkt[7]]), 9); // seq 来自 rec
         assert_eq!(&pkt[8..], reply_payload);
     }
 
@@ -1103,7 +1105,8 @@ mod tests {
         // 此测试在 Windows 编译时跑；在 Linux/macOS 编译时被 cfg 跳过。
         if cfg!(target_os = "windows") {
             let config = XicmpConfig::default();
-            let raw: Box<dyn UdpIo> = Box::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let raw: Box<dyn UdpIo> =
+                Box::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
             let err = config.wrap_packet_conn_client(raw, 0, 1).err().expect("must err on windows");
             assert_eq!(err.kind(), io::ErrorKind::Unsupported);
         } else {

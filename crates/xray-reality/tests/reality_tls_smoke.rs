@@ -19,9 +19,11 @@ use std::time::Duration;
 use tokio::io::duplex;
 use x25519_dalek::{PublicKey, StaticSecret};
 use xray_proto::transport::internet::reality::Config as ProtoConfig;
-use xray_reality::client::{u_client, UConnState};
-use xray_reality::server::{RealityServerOutcome, server_tls};
-use xray_reality::RealityConfig;
+use xray_reality::{
+    RealityConfig,
+    client::{UConnState, u_client},
+    server::{RealityServerOutcome, server_tls},
+};
 
 #[tokio::test]
 async fn reality_server_tls_with_u_client_handshake_succeeds() {
@@ -54,7 +56,7 @@ async fn reality_server_tls_with_u_client_handshake_succeeds() {
     let server_result = server_task.await.unwrap();
 
     match (client_result, server_result) {
-        (Ok(Ok(_tls_stream)), Ok(RealityServerOutcome::Verified { .. })) => {}
+        (Ok(Ok(_tls_stream)), Ok(RealityServerOutcome::Verified { .. })) => {},
         (Ok(Ok(_)), _) => panic!("server unexpected outcome"),
         (Ok(Err(e)), _) => panic!("client u_client failed: {e:?}"),
         (Err(_timeout), _) => panic!("client u_client timeout"),

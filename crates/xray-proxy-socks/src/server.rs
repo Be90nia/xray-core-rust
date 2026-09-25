@@ -6,26 +6,30 @@
 //!
 //! 对应 Go `proxy/socks/server.go` 的 `Server.handshake5` + `Server.Process`（连接处理部分）。
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    sync::Mutex,
+    task::JoinHandle,
+};
 use tracing::{info, warn};
-
 use xray_features::inbound::{InboundError, InboundHandler};
 
-use crate::config::{AuthType, ServerConfig};
-use crate::error::{Result, SocksError};
-use crate::protocol::{
-    ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, AUTH_NOT_REQUIRED, AUTH_NO_MATCHING_METHOD,
-    AUTH_PASSWORD, CMD_TCP_CONNECT, CMD_UDP_ASSOCIATE, SOCKS4_REQUEST_GRANTED,
-    SOCKS4_REQUEST_REJECTED, SOCKS4_VERSION, SOCKS5_VERSION,
-    STATUS_CMD_NOT_SUPPORT, STATUS_SUCCESS,
-    Host, SocksAddr, parse_address_port,
+use crate::{
+    config::{AuthType, ServerConfig},
+    error::{Result, SocksError},
+    protocol::{
+        ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, AUTH_NO_MATCHING_METHOD, AUTH_NOT_REQUIRED,
+        AUTH_PASSWORD, CMD_TCP_CONNECT, CMD_UDP_ASSOCIATE, Host, SOCKS4_REQUEST_GRANTED,
+        SOCKS4_REQUEST_REJECTED, SOCKS4_VERSION, SOCKS5_VERSION, STATUS_CMD_NOT_SUPPORT,
+        STATUS_SUCCESS, SocksAddr, parse_address_port,
+    },
 };
 
 /// SOCKS5 请求结果。区分 TCP CONNECT 和 UDP ASSOCIATE。
@@ -40,11 +44,12 @@ impl std::fmt::Debug for SocksRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SocksRequest::TcpConnect(addr) => f.debug_tuple("TcpConnect").field(addr).finish(),
-            SocksRequest::UdpAssociate(addr, _) => f.debug_tuple("UdpAssociate").field(addr).field(&"<UdpSocket>").finish(),
+            SocksRequest::UdpAssociate(addr, _) => {
+                f.debug_tuple("UdpAssociate").field(addr).field(&"<UdpSocket>").finish()
+            },
         }
     }
 }
-
 
 /// SOCKS 服务端。切片2：listen + accept + handshake + 日志。
 ///
@@ -59,16 +64,14 @@ pub struct SocksServer {
 impl SocksServer {
     /// 构造 SOCKS 服务端。`addr` 是监听地址（如 `"127.0.0.1:1080"`）。
     pub fn new(tag: impl Into<String>, config: ServerConfig) -> Self {
-        Self {
-            tag: tag.into(),
-            config,
-            slot: Mutex::new(None),
-        }
+        Self { tag: tag.into(), config, slot: Mutex::new(None) }
     }
 
     /// 获取监听端口（start 后有效，否则返回 0）。
     pub async fn bound_port(&self) -> u16 {
-        self.slot.lock().await
+        self.slot
+            .lock()
+            .await
             .as_ref()
             .and_then(|(l, _)| l.local_addr().ok())
             .map(|a| a.port())
@@ -117,17 +120,17 @@ impl InboundHandler for SocksServer {
                                         "SOCKS5 handshake succeeded"
                                     );
                                     // 切片3: dispatch to outbound handler
-                                }
+                                },
                                 Err(e) => {
                                     warn!(tag = %tag, peer = %peer, error = %e, "handshake failed");
-                                }
+                                },
                             }
                         });
-                    }
+                    },
                     Err(e) => {
                         warn!(tag = %tag, error = %e, "accept failed");
                         break;
-                    }
+                    },
                 }
             }
         });
@@ -154,7 +157,10 @@ impl InboundHandler for SocksServer {
 
 /// SOCKS5 服务端握手（读 VER+NMETHODS 起始）。保留为独立可用入口，
 /// 兼容既有调用方与单测；内部委托 [`socks5_handshake_from_methods`]。
-pub async fn socks5_server_handshake<RW>(stream: &mut RW, config: &ServerConfig) -> Result<SocksRequest>
+pub async fn socks5_server_handshake<RW>(
+    stream: &mut RW,
+    config: &ServerConfig,
+) -> Result<SocksRequest>
 where
     RW: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -184,11 +190,9 @@ where
             let mut nm = [0u8; 1];
             stream.read_exact(&mut nm).await?;
             socks5_handshake_from_methods(stream, nm[0] as usize, config).await
-        }
+        },
         SOCKS4_VERSION => socks4_handshake(stream, config).await,
-        v => Err(SocksError::HandshakeFailed(format!(
-            "unsupported SOCKS version: {v}"
-        ))),
+        v => Err(SocksError::HandshakeFailed(format!("unsupported SOCKS version: {v}"))),
     }
 }
 
@@ -251,11 +255,12 @@ where
     let (addr, _consumed) = parse_address_port_from_stream(stream, atyp).await?;
 
     if cmd == CMD_UDP_ASSOCIATE {
-        // UDP ASSOCIATE: bind UDP relay socket——配置 address 时绑定该 IP（Go protocol.go:199-205），
-        // 未配置回退 127.0.0.1（既有默认行为不变）；BND.ADDR 回 relay 实际地址
+        // UDP ASSOCIATE: bind UDP relay socket——配置 address 时绑定该 IP（Go
+        // protocol.go:199-205）， 未配置回退 127.0.0.1（既有默认行为不变）；BND.ADDR 回
+        // relay 实际地址
         let bind_ip = config_address_ip(config);
-        let relay_socket = tokio::net::UdpSocket::bind((bind_ip, 0)).await
-            .map_err(SocksError::Io)?;
+        let relay_socket =
+            tokio::net::UdpSocket::bind((bind_ip, 0)).await.map_err(SocksError::Io)?;
         let relay_addr = relay_socket.local_addr().map_err(SocksError::Io)?;
 
         // 回复 [VER=5, REP=0, RSV=0, ATYP, BND.ADDR, BND.PORT]
@@ -266,23 +271,36 @@ where
                 reply.extend_from_slice(&v6.ip().octets());
                 reply.extend_from_slice(&v6.port().to_be_bytes());
                 stream.write_all(&reply).await?;
-                return Ok(SocksRequest::UdpAssociate(SocksAddr::from_socket_addr(relay_addr), relay_socket));
-            }
+                return Ok(SocksRequest::UdpAssociate(
+                    SocksAddr::from_socket_addr(relay_addr),
+                    relay_socket,
+                ));
+            },
         };
         let port_bytes = relay_addr.port().to_be_bytes();
-        stream.write_all(&[
-            SOCKS5_VERSION, STATUS_SUCCESS, 0x00, ATYP_IPV4,
-            octets[0], octets[1], octets[2], octets[3],
-            port_bytes[0], port_bytes[1],
-        ]).await?;
+        stream
+            .write_all(&[
+                SOCKS5_VERSION,
+                STATUS_SUCCESS,
+                0x00,
+                ATYP_IPV4,
+                octets[0],
+                octets[1],
+                octets[2],
+                octets[3],
+                port_bytes[0],
+                port_bytes[1],
+            ])
+            .await?;
 
-        return Ok(SocksRequest::UdpAssociate(SocksAddr::from_socket_addr(relay_addr), relay_socket));
+        return Ok(SocksRequest::UdpAssociate(
+            SocksAddr::from_socket_addr(relay_addr),
+            relay_socket,
+        ));
     }
 
     // TCP CONNECT: 回复成功 [VER=5, REP=0, RSV=0, ATYP=1, 0.0.0.0, 0]
-    stream
-        .write_all(&[SOCKS5_VERSION, STATUS_SUCCESS, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
-        .await?;
+    stream.write_all(&[SOCKS5_VERSION, STATUS_SUCCESS, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0]).await?;
 
     Ok(SocksRequest::TcpConnect(addr))
 }
@@ -309,9 +327,7 @@ fn proto_bytes_to_ip(bytes: &[u8]) -> Option<IpAddr> {
     if let Ok([a, b, c, d]) = <[u8; 4]>::try_from(bytes) {
         return Some(IpAddr::V4(Ipv4Addr::new(a, b, c, d)));
     }
-    <[u8; 16]>::try_from(bytes)
-        .ok()
-        .map(|o| IpAddr::V6(o.into()))
+    <[u8; 16]>::try_from(bytes).ok().map(|o| IpAddr::V6(o.into()))
 }
 
 /// SOCKS4/4a 服务端握手。VER(=0x04) 已由 [`socks_handshake`] 读取，本函数从 CMD 起始。
@@ -333,7 +349,6 @@ pub async fn socks4_handshake<RW>(stream: &mut RW, config: &ServerConfig) -> Res
 where
     RW: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-
     // Go protocol.go:53-56：配置密码认证时 SOCKS4 整体拒绝——其 USERID 无法承载 RFC 1929 认证
     if config.auth_type == AuthType::Password {
         let _ = stream.write_all(&[0x00, SOCKS4_REQUEST_REJECTED, 0, 0, 0, 0, 0, 0]).await;
@@ -406,15 +421,16 @@ fn select_method(client_methods: &[u8], config: &ServerConfig) -> (u8, bool) {
             } else {
                 (AUTH_NO_MATCHING_METHOD, false)
             }
-        }
+        },
         AuthType::Password => {
-            // 严格拒绝（Go protocol.go:109-118）：配置密码认证时仅接受 0x02，不回退 0x00——回退即认证绕过
+            // 严格拒绝（Go protocol.go:109-118）：配置密码认证时仅接受 0x02，不回退
+            // 0x00——回退即认证绕过
             if client_methods.contains(&AUTH_PASSWORD) {
                 (AUTH_PASSWORD, true)
             } else {
                 (AUTH_NO_MATCHING_METHOD, false)
             }
-        }
+        },
     }
 }
 
@@ -427,10 +443,7 @@ where
     let mut auth_header = [0u8; 2];
     stream.read_exact(&mut auth_header).await?;
     if auth_header[0] != 0x01 {
-        return Err(SocksError::AuthFailed(format!(
-            "invalid auth version: {}",
-            auth_header[0]
-        )));
+        return Err(SocksError::AuthFailed(format!("invalid auth version: {}", auth_header[0])));
     }
     let ulen = auth_header[1] as usize;
     let mut username = vec![0u8; ulen];
@@ -461,10 +474,7 @@ where
 /// 从流中按 ATYP 读取剩余地址 + 端口字节，然后用 parse_address_port 解析。
 ///
 /// 这是 parse_address_port 的流式版本——先按 ATYP 确定剩余字节数，再读取 + 解析。
-async fn parse_address_port_from_stream<RW>(
-    stream: &mut RW,
-    atyp: u8,
-) -> Result<(SocksAddr, usize)>
+async fn parse_address_port_from_stream<RW>(stream: &mut RW, atyp: u8) -> Result<(SocksAddr, usize)>
 where
     RW: AsyncReadExt + Unpin,
 {
@@ -474,7 +484,7 @@ where
             buf.extend_from_slice(&[0u8; 6]); // 4 IP + 2 port
             stream.read_exact(&mut buf[1..]).await?;
             parse_address_port(&buf)
-        }
+        },
         ATYP_DOMAIN => {
             let mut len_buf = [0u8; 1];
             stream.read_exact(&mut len_buf).await?;
@@ -483,23 +493,26 @@ where
             buf.extend_from_slice(&vec![0u8; dlen + 2]); // domain + 2 port
             stream.read_exact(&mut buf[2..]).await?;
             parse_address_port(&buf)
-        }
+        },
         ATYP_IPV6 => {
             let mut buf = vec![atyp];
             buf.extend_from_slice(&[0u8; 18]); // 16 IP + 2 port
             stream.read_exact(&mut buf[1..]).await?;
             parse_address_port(&buf)
-        }
+        },
         _ => Err(SocksError::InvalidFrame(format!("unknown ATYP: {atyp}"))),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+
     use super::*;
     use crate::config::ServerConfig;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
 
     /// 模拟 SOCKS5 客户端发送 NoAuth handshake + CONNECT 请求。
     async fn socks5_client_noauth_connect(stream: &mut TcpStream, dest: &str) -> Result<()> {
@@ -565,7 +578,7 @@ mod tests {
         match &socks_addr.host {
             crate::protocol::Host::Ipv4(ip) => {
                 assert_eq!(ip.octets(), [1, 2, 3, 4]);
-            }
+            },
             _ => panic!("expected IPv4"),
         }
         assert_eq!(socks_addr.port, 80);
@@ -583,9 +596,7 @@ mod tests {
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
-        socks5_client_noauth_connect(&mut client, "example.com:443")
-            .await
-            .unwrap();
+        socks5_client_noauth_connect(&mut client, "example.com:443").await.unwrap();
 
         let result = server.await.unwrap();
         assert!(result.is_ok());
@@ -596,7 +607,7 @@ mod tests {
         match &socks_addr.host {
             crate::protocol::Host::Domain(d) => {
                 assert_eq!(d, "example.com");
-            }
+            },
             _ => panic!("expected Domain"),
         }
         assert_eq!(socks_addr.port, 443);
@@ -639,9 +650,7 @@ mod tests {
         client.read_exact(&mut resp).await.unwrap();
         // 发 BIND 请求 (CMD=2)
         client
-            .write_all(&[
-                SOCKS5_VERSION, 0x02, 0x00, ATYP_IPV4, 1, 2, 3, 4, 0, 80,
-            ])
+            .write_all(&[SOCKS5_VERSION, 0x02, 0x00, ATYP_IPV4, 1, 2, 3, 4, 0, 80])
             .await
             .unwrap();
 
@@ -651,10 +660,7 @@ mod tests {
 
     #[tokio::test]
     async fn select_method_noauth_when_server_noauth() {
-        let config = ServerConfig {
-            auth_type: AuthType::NoAuth,
-            ..Default::default()
-        };
+        let config = ServerConfig { auth_type: AuthType::NoAuth, ..Default::default() };
         let (method, needs_auth) = select_method(&[AUTH_NOT_REQUIRED], &config);
         assert_eq!(method, AUTH_NOT_REQUIRED);
         assert!(!needs_auth);
@@ -662,20 +668,14 @@ mod tests {
 
     #[tokio::test]
     async fn select_method_no_match_when_client_only_password_server_noauth() {
-        let config = ServerConfig {
-            auth_type: AuthType::NoAuth,
-            ..Default::default()
-        };
+        let config = ServerConfig { auth_type: AuthType::NoAuth, ..Default::default() };
         let (method, _) = select_method(&[AUTH_PASSWORD], &config);
         assert_eq!(method, AUTH_NO_MATCHING_METHOD);
     }
 
     #[tokio::test]
     async fn select_method_password_when_both_support() {
-        let config = ServerConfig {
-            auth_type: AuthType::Password,
-            ..Default::default()
-        };
+        let config = ServerConfig { auth_type: AuthType::Password, ..Default::default() };
         let (method, needs_auth) = select_method(&[AUTH_NOT_REQUIRED, AUTH_PASSWORD], &config);
         assert_eq!(method, AUTH_PASSWORD);
         assert!(needs_auth);
@@ -698,15 +698,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let addr = format!("127.0.0.1:{port}");
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            TcpStream::connect(&addr),
-        )
-        .await;
+        let result = tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(&addr)).await;
         // 连接应失败（connection refused）——listener 已关闭
         match result {
             Ok(Ok(_)) => panic!("listener should be closed after close()"),
-            Ok(Err(_)) | Err(_) => {}
+            Ok(Err(_)) | Err(_) => {},
         }
     }
 
@@ -730,9 +726,7 @@ mod tests {
         assert_eq!(resp[1], AUTH_NOT_REQUIRED);
         // Send UDP ASSOCIATE request (CMD=0x03, DST=0.0.0.0:0)
         client
-            .write_all(&[
-                SOCKS5_VERSION, CMD_UDP_ASSOCIATE, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0,
-            ])
+            .write_all(&[SOCKS5_VERSION, CMD_UDP_ASSOCIATE, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
             .await
             .unwrap();
         // Read reply: [VER=5, REP, RSV, ATYP, BND.ADDR, BND.PORT]
@@ -752,22 +746,20 @@ mod tests {
         assert!(result.is_ok());
         match result.unwrap() {
             SocksRequest::UdpAssociate(relay_addr, socket) => {
-                assert_eq!(relay_addr.host, crate::protocol::Host::Ipv4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+                assert_eq!(
+                    relay_addr.host,
+                    crate::protocol::Host::Ipv4(std::net::Ipv4Addr::new(127, 0, 0, 1))
+                );
                 assert_eq!(relay_addr.port, relay_port);
                 // Socket should be bound and usable
                 assert!(socket.local_addr().is_ok());
-            }
+            },
             other => panic!("expected UdpAssociate, got {other:?}"),
         }
     }
 
     /// 构造一个最小 SOCKS4 CONNECT 请求（无 USERID）发送到 stream。
-    async fn socks4_client_connect(
-        stream: &mut TcpStream,
-        ip: [u8; 4],
-        port: u16,
-        userid: &str,
-    ) {
+    async fn socks4_client_connect(stream: &mut TcpStream, ip: [u8; 4], port: u16, userid: &str) {
         let mut req = vec![SOCKS4_VERSION, CMD_TCP_CONNECT];
         req.extend_from_slice(&port.to_be_bytes());
         req.extend_from_slice(&ip);
@@ -886,10 +878,7 @@ mod tests {
 
     #[tokio::test]
     async fn select_method_rejects_noauth_when_password_configured() {
-        let config = ServerConfig {
-            auth_type: AuthType::Password,
-            ..Default::default()
-        };
+        let config = ServerConfig { auth_type: AuthType::Password, ..Default::default() };
         let (method, needs_auth) = select_method(&[AUTH_NOT_REQUIRED], &config);
         assert_eq!(method, AUTH_NO_MATCHING_METHOD);
         assert!(!needs_auth);
@@ -914,7 +903,10 @@ mod tests {
         let mut resp = [0u8; 2];
         client.read_exact(&mut resp).await.unwrap();
         assert_eq!(resp[0], SOCKS5_VERSION);
-        assert_eq!(resp[1], AUTH_NO_MATCHING_METHOD, "0x00 must be rejected when password auth configured");
+        assert_eq!(
+            resp[1], AUTH_NO_MATCHING_METHOD,
+            "0x00 must be rejected when password auth configured"
+        );
 
         let result = server.await.unwrap();
         assert!(result.is_err(), "handshake must fail for NoAuth-only client");
@@ -944,7 +936,10 @@ mod tests {
         let mut auth_resp = [0u8; 2];
         client.read_exact(&mut auth_resp).await.unwrap();
         assert_eq!(auth_resp, [0x01, 0x00]);
-        client.write_all(&[SOCKS5_VERSION, CMD_TCP_CONNECT, 0x00, ATYP_IPV4, 1, 2, 3, 4, 0, 80]).await.unwrap();
+        client
+            .write_all(&[SOCKS5_VERSION, CMD_TCP_CONNECT, 0x00, ATYP_IPV4, 1, 2, 3, 4, 0, 80])
+            .await
+            .unwrap();
         let mut reply = [0u8; 10];
         client.read_exact(&mut reply).await.unwrap();
         assert_eq!(reply[1], STATUS_SUCCESS);
@@ -999,10 +994,16 @@ mod tests {
         client.write_all(&[SOCKS5_VERSION, 1, AUTH_NOT_REQUIRED]).await.unwrap();
         let mut resp = [0u8; 2];
         client.read_exact(&mut resp).await.unwrap();
-        client.write_all(&[SOCKS5_VERSION, CMD_UDP_ASSOCIATE, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0]).await.unwrap();
+        client
+            .write_all(&[SOCKS5_VERSION, CMD_UDP_ASSOCIATE, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
         let mut reply = [0u8; 10];
         client.read_exact(&mut reply).await.unwrap();
-        assert_eq!(reply[1], STATUS_CMD_NOT_SUPPORT, "ASSOCIATE must get CMD_NOT_SUPPORTED when udp disabled");
+        assert_eq!(
+            reply[1], STATUS_CMD_NOT_SUPPORT,
+            "ASSOCIATE must get CMD_NOT_SUPPORTED when udp disabled"
+        );
 
         let result = server.await.unwrap();
         assert!(result.is_err());
@@ -1039,7 +1040,10 @@ mod tests {
         client.write_all(&[SOCKS5_VERSION, 1, AUTH_NOT_REQUIRED]).await.unwrap();
         let mut resp = [0u8; 2];
         client.read_exact(&mut resp).await.unwrap();
-        client.write_all(&[SOCKS5_VERSION, CMD_UDP_ASSOCIATE, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0]).await.unwrap();
+        client
+            .write_all(&[SOCKS5_VERSION, CMD_UDP_ASSOCIATE, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
         let mut reply = [0u8; 10];
         client.read_exact(&mut reply).await.unwrap();
         assert_eq!(reply[1], STATUS_SUCCESS);
@@ -1053,7 +1057,7 @@ mod tests {
                     socket.local_addr().unwrap().ip(),
                     std::net::IpAddr::V4(std::net::Ipv4Addr::from(configured))
                 );
-            }
+            },
             other => panic!("expected UdpAssociate, got {other:?}"),
         }
     }

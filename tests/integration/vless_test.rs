@@ -9,21 +9,30 @@
 
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-
-use xray_app_dispatcher::default::{DialBridge, SimpleOhm};
-use xray_app_dispatcher::DispatchHandler;
-use xray_common::net::address::Address;
-use xray_common::net::port::Port;
-use xray_common::protocol::ID;
-use xray_common::uuid::UUID;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
+use xray_app_dispatcher::{
+    DispatchHandler,
+    default::{DialBridge, SimpleOhm},
+};
+use xray_common::{
+    net::{address::Address, port::Port},
+    protocol::ID,
+    uuid::UUID,
+};
 use xray_proxy_freedom::make_freedom_dial_fn;
-use xray_proxy_vless::account::MemoryAccount;
-use xray_proxy_vless::encoding::client::{decode_response_header, encode_request_header};
-use xray_proxy_vless::encoding::{empty_addons, VlessCommand, VERSION};
-use xray_proxy_vless::validator::{MemoryUser, MemoryValidator, Validator};
-use xray_proxy_vless::serve_vless;
+use xray_proxy_vless::{
+    account::MemoryAccount,
+    encoding::{
+        VERSION, VlessCommand,
+        client::{decode_response_header, encode_request_header},
+        empty_addons,
+    },
+    serve_vless,
+    validator::{MemoryUser, MemoryValidator, Validator},
+};
 
 /// 固定 UUID。
 const SAMPLE_UUID_STR: &str = "a3482e88-686a-4a58-8126-99c9214826d7";
@@ -74,7 +83,7 @@ async fn spawn_echo_server() -> u16 {
                     if sock.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
-                }
+                },
             }
         }
     });
@@ -100,9 +109,7 @@ async fn run_vless_e2e() {
     });
 
     // 4. VLESS client：connect → encode header → decode response → echo round-trip
-    let mut client = tokio::net::TcpStream::connect(vless_addr)
-        .await
-        .unwrap();
+    let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
 
     let addons = empty_addons();
     encode_request_header(
@@ -118,9 +125,8 @@ async fn run_vless_e2e() {
     .expect("encode header");
 
     // 读响应头
-    let _resp_addons = decode_response_header(&mut client, VERSION)
-        .await
-        .expect("decode response header");
+    let _resp_addons =
+        decode_response_header(&mut client, VERSION).await.expect("decode response header");
 
     // 发 payload
     client.write_all(PAYLOAD).await.unwrap();
@@ -128,11 +134,7 @@ async fn run_vless_e2e() {
     // 读 echo 回环
     let mut buf = vec![0u8; PAYLOAD.len() + 16];
     let n = client.read(&mut buf).await.expect("read response");
-    assert_eq!(
-        &buf[..n], PAYLOAD,
-        "echo 回环失败: 收到 {:?}, 期望 {:?}",
-        &buf[..n], PAYLOAD
-    );
+    assert_eq!(&buf[..n], PAYLOAD, "echo 回环失败: 收到 {:?}, 期望 {:?}", &buf[..n], PAYLOAD);
 }
 
 /// VLESS TCP 端到端测试。
@@ -156,9 +158,7 @@ async fn vless_rejects_unknown_user() {
 
     // client 用未注册的随机 UUID
     let unknown_uuid = UUID::new();
-    let mut client = tokio::net::TcpStream::connect(vless_addr)
-        .await
-        .unwrap();
+    let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
 
     let addons = empty_addons();
     encode_request_header(
@@ -177,9 +177,9 @@ async fn vless_rejects_unknown_user() {
     let mut buf = [0u8; 16];
     let result = client.read(&mut buf).await;
     match result {
-        Ok(0) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionAborted => {}
+        Ok(0) => {},
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {},
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionAborted => {},
         other => panic!("期望 EOF 或连接重置，得到 {other:?}"),
     }
 }

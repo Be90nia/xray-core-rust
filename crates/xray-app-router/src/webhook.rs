@@ -11,18 +11,24 @@
 //!   - `@abstract-name` / `@@padded`     → 同上（Linux/Android 抽象命名空间）
 //! - 事件构造、去重逻辑独立可测
 
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashSet,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
-use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::{client::TlsConnector, rustls::ClientConfig};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
+use tokio_rustls::{
+    client::TlsConnector,
+    rustls::{ClientConfig, pki_types::ServerName},
+};
 use xray_proto::xray::app::router::WebhookConfig;
 
 use crate::error::RouterError;
@@ -44,7 +50,6 @@ pub(crate) enum WebhookTarget {
     /// `/abs/path[:/url-path]` 或 `@abstract[:/url-path]` 或 `@@padded[:/url-path]`
     UnixSocket { socket_path: String, http_path: String },
 }
-
 
 /// Webhook 事件。
 ///
@@ -112,10 +117,7 @@ impl WebhookNotifier {
             url: config.url.clone(),
             headers: config.headers.clone(),
             dedup_window,
-            seen: Mutex::new(Seen {
-                keys: HashSet::new(),
-                timestamps: Vec::new(),
-            }),
+            seen: Mutex::new(Seen { keys: HashSet::new(), timestamps: Vec::new() }),
             closed: Mutex::new(false),
         }
     }
@@ -136,8 +138,7 @@ impl WebhookNotifier {
         if self.is_duplicate(event) {
             return Ok(false);
         }
-        let body = serde_json::to_value(event)
-            .map_err(|e| RouterError::Webhook(e.to_string()))?;
+        let body = serde_json::to_value(event).map_err(|e| RouterError::Webhook(e.to_string()))?;
         self.post(&body)?;
         Ok(true)
     }
@@ -163,8 +164,8 @@ impl WebhookNotifier {
     /// 通过 `tokio::net::TcpStream` 手写 HTTP POST，不依赖 reqwest/hyper。
     /// 返回 2xx 视为成功，其余视为失败。
     fn post(&self, body: &serde_json::Value) -> Result<(), RouterError> {
-        let body_str = serde_json::to_string(body)
-            .map_err(|e| RouterError::Webhook(e.to_string()))?;
+        let body_str =
+            serde_json::to_string(body).map_err(|e| RouterError::Webhook(e.to_string()))?;
 
         let result = tokio::runtime::Handle::try_current()
             .map(|handle| handle.block_on(async { self.post_async(&body_str).await }))
@@ -177,7 +178,11 @@ impl WebhookNotifier {
                             .build()
                             .map_err(|e| RouterError::Webhook(e.to_string()))?;
                         rt.block_on(async { self.post_async(&body_str).await })
-                    }).join().unwrap_or_else(|e| Err(RouterError::Webhook(format!("thread panicked: {e:?}"))))
+                    })
+                    .join()
+                    .unwrap_or_else(|e| {
+                        Err(RouterError::Webhook(format!("thread panicked: {e:?}")))
+                    })
                 })
             });
 
@@ -195,14 +200,19 @@ impl WebhookNotifier {
         if url.is_empty() {
             return Err(RouterError::Webhook("empty webhook url".to_string()));
         }
-        let target = parse_webhook_target(url)
-            .map_err(|e| RouterError::Webhook(e))?;
+        let target = parse_webhook_target(url).map_err(|e| RouterError::Webhook(e))?;
         let timeout = Duration::from_millis(DEFAULT_TIMEOUT_MS);
 
         let request = match &target {
-            WebhookTarget::Http { host, path, .. } => build_request(host, "http", path, body, &self.headers),
-            WebhookTarget::Https { host, path, .. } => build_request(host, "https", path, body, &self.headers),
-            WebhookTarget::UnixSocket { http_path, .. } => build_request("localhost", "http", http_path, body, &self.headers),
+            WebhookTarget::Http { host, path, .. } => {
+                build_request(host, "http", path, body, &self.headers)
+            },
+            WebhookTarget::Https { host, path, .. } => {
+                build_request(host, "https", path, body, &self.headers)
+            },
+            WebhookTarget::UnixSocket { http_path, .. } => {
+                build_request("localhost", "http", http_path, body, &self.headers)
+            },
         };
 
         // 连接 + 写 + 读 + 解析响应
@@ -210,7 +220,7 @@ impl WebhookNotifier {
             WebhookTarget::Http { host, port, .. } => {
                 let mut s = tcp_connect(&host, port, timeout).await?;
                 http_handshake(&mut s, request.as_bytes(), timeout).await?
-            }
+            },
             WebhookTarget::Https { host, port, .. } => {
                 let s = tcp_connect(&host, port, timeout).await?;
                 let connector = tls_connector()?;
@@ -221,7 +231,7 @@ impl WebhookNotifier {
                     .map_err(|e| RouterError::Webhook(format!("tls handshake timeout: {e}")))?
                     .map_err(|e| RouterError::Webhook(format!("tls handshake failed: {e}")))?;
                 http_handshake(&mut tls, request.as_bytes(), timeout).await?
-            }
+            },
             #[cfg(unix)]
             WebhookTarget::UnixSocket { socket_path, .. } => {
                 let mut s = tokio::time::timeout(timeout, UnixStream::connect(&socket_path))
@@ -229,13 +239,13 @@ impl WebhookNotifier {
                     .map_err(|e| RouterError::Webhook(format!("unix connect timeout: {e}")))?
                     .map_err(|e| RouterError::Webhook(format!("unix connect failed: {e}")))?;
                 http_handshake(&mut s, request.as_bytes(), timeout).await?
-            }
+            },
             #[cfg(not(unix))]
             WebhookTarget::UnixSocket { .. } => {
                 return Err(RouterError::Webhook(
                     "unix socket webhook is not supported on this platform".to_string(),
                 ));
-            }
+            },
         };
 
         if (200..300).contains(&status) {
@@ -245,7 +255,6 @@ impl WebhookNotifier {
             Err(RouterError::Webhook(format!("webhook returned status {status}")))
         }
     }
-
 
     /// 关闭。后续 fire 返回 Ok(false)。
     pub fn close(&self) {
@@ -284,8 +293,8 @@ const DEFAULT_HTTP_PORT: u16 = 80;
 /// 三种合法形式（对齐 Go `utils.SplitHTTPUnixURL`）：
 /// - `http://host[:port][/path]`  → [`WebhookTarget::Http`]
 /// - `https://host[:port][/path]` → [`WebhookTarget::Https`]
-/// - 绝对路径或抽象 socket（`/abs/path` `@abs` `@@padded`），
-///   可附 `:/url-path` 改 HTTP 请求路径 → [`WebhookTarget::UnixSocket`]
+/// - 绝对路径或抽象 socket（`/abs/path` `@abs` `@@padded`）， 可附 `:/url-path` 改 HTTP 请求路径 →
+///   [`WebhookTarget::UnixSocket`]
 fn parse_webhook_target(url: &str) -> Result<WebhookTarget, String> {
     if url.starts_with("http://") {
         parse_httpish(url, "http://", DEFAULT_HTTP_PORT)
@@ -319,11 +328,9 @@ fn parse_httpish(url: &str, scheme: &str, default_port: u16) -> Result<WebhookTa
     };
     let (host, port) = match host_port.rfind(':') {
         Some(i) => {
-            let port: u16 = host_port[i + 1..]
-                .parse()
-                .map_err(|e| format!("invalid port: {e}"))?;
+            let port: u16 = host_port[i + 1..].parse().map_err(|e| format!("invalid port: {e}"))?;
             (&host_port[..i], port)
-        }
+        },
         None => (host_port, default_port),
     };
     if host.is_empty() {
@@ -338,7 +345,13 @@ fn parse_httpish(url: &str, scheme: &str, default_port: u16) -> Result<WebhookTa
 }
 
 /// 构造 HTTP/1.1 POST 报文（含 `Host` / `Content-Type` / `Content-Length` / 自定义 headers）。
-fn build_request(host: &str, scheme: &str, path: &str, body: &str, headers: &std::collections::HashMap<String, String>) -> String {
+fn build_request(
+    host: &str,
+    scheme: &str,
+    path: &str,
+    body: &str,
+    headers: &std::collections::HashMap<String, String>,
+) -> String {
     let mut s = format!("POST {path} HTTP/1.1\r\n");
     s.push_str(&format!("Host: {host}\r\n"));
     if scheme == "https" {
@@ -377,18 +390,18 @@ fn tls_connector() -> Result<TlsConnector, RouterError> {
         xray_common::ensure_default_crypto_provider();
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let cfg = ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let cfg = ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
         Ok(TlsConnector::from(Arc::new(cfg)))
     });
-    CONNECTOR
-        .clone()
-        .map_err(|e| RouterError::Webhook(format!("tls config init failed: {e}")))
+    CONNECTOR.clone().map_err(|e| RouterError::Webhook(format!("tls config init failed: {e}")))
 }
 
 /// 对 plaintext stream 发 POST + 读响应头，解析 HTTP 状态码。
-async fn http_handshake<S>(stream: &mut S, body: &[u8], timeout: Duration) -> Result<u16, RouterError>
+async fn http_handshake<S>(
+    stream: &mut S,
+    body: &[u8],
+    timeout: Duration,
+) -> Result<u16, RouterError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -489,11 +502,7 @@ mod tests {
         let t = parse_webhook_target("http://example.com:9090/hook").unwrap();
         assert_eq!(
             t,
-            WebhookTarget::Http {
-                host: "example.com".into(),
-                port: 9090,
-                path: "/hook".into(),
-            }
+            WebhookTarget::Http { host: "example.com".into(), port: 9090, path: "/hook".into() }
         );
     }
 
@@ -505,7 +514,7 @@ mod tests {
                 assert_eq!(host, "example.com");
                 assert_eq!(port, 80);
                 assert_eq!(path, "/hook");
-            }
+            },
             _ => panic!("expected Http"),
         }
     }
@@ -518,7 +527,7 @@ mod tests {
                 assert_eq!(host, "x.com");
                 assert_eq!(port, 8443);
                 assert_eq!(path, "/api");
-            }
+            },
             _ => panic!("expected Https"),
         }
     }
@@ -530,7 +539,7 @@ mod tests {
             WebhookTarget::Https { port, path, .. } => {
                 assert_eq!(port, 443);
                 assert_eq!(path, "/");
-            }
+            },
             _ => panic!("expected Https"),
         }
     }
@@ -542,7 +551,7 @@ mod tests {
             WebhookTarget::UnixSocket { socket_path, http_path } => {
                 assert_eq!(socket_path, "/var/run/webhook.sock");
                 assert_eq!(http_path, "/hook");
-            }
+            },
             _ => panic!("expected UnixSocket"),
         }
     }
@@ -554,7 +563,7 @@ mod tests {
             WebhookTarget::UnixSocket { socket_path, http_path } => {
                 assert_eq!(socket_path, "/tmp/web.sock");
                 assert_eq!(http_path, "/");
-            }
+            },
             _ => panic!("expected UnixSocket"),
         }
     }
@@ -566,7 +575,7 @@ mod tests {
             WebhookTarget::UnixSocket { socket_path, http_path } => {
                 assert_eq!(socket_path, "@abstract-name");
                 assert_eq!(http_path, "/api");
-            }
+            },
             _ => panic!("expected UnixSocket"),
         }
     }

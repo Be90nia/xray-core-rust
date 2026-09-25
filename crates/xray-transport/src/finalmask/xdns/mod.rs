@@ -22,12 +22,11 @@ pub(crate) mod record_transport;
 mod server;
 pub(crate) mod spec;
 
-use std::io;
-use std::time::Duration;
-
-use super::{UdpIo, Udpmask};
+use std::{io, time::Duration};
 
 pub use spec::DomainSpec;
+
+use super::{UdpIo, Udpmask};
 
 /// client.rs 中用到的常量（顶层暴露便于子模块共享）。
 pub(crate) const POLL_LIMIT: usize = 16;

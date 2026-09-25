@@ -91,10 +91,7 @@ mod tests {
 
     #[test]
     fn display_download_failed() {
-        let e = GeodataError::DownloadFailed {
-            url: "http://x".into(),
-            reason: "timeout".into(),
-        };
+        let e = GeodataError::DownloadFailed { url: "http://x".into(), reason: "timeout".into() };
         let s = format!("{e}");
         assert!(s.contains("http://x"));
         assert!(s.contains("timeout"));
@@ -138,10 +135,7 @@ mod tests {
 
     #[test]
     fn display_temp_file_create() {
-        let e = GeodataError::TempFileCreate {
-            target: "x".into(),
-            reason: "denied".into(),
-        };
+        let e = GeodataError::TempFileCreate { target: "x".into(), reason: "denied".into() };
         let s = format!("{e}");
         assert!(s.contains("x"));
         assert!(s.contains("denied"));
@@ -161,10 +155,7 @@ mod tests {
 
     #[test]
     fn display_remove_failed() {
-        let e = GeodataError::RemoveFailed {
-            path: "p".into(),
-            reason: "busy".into(),
-        };
+        let e = GeodataError::RemoveFailed { path: "p".into(), reason: "busy".into() };
         let s = format!("{e}");
         assert!(s.contains("p"));
     }

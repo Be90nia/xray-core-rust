@@ -75,11 +75,7 @@ impl DarwinSockOpt {
     /// 设置 TCP_FASTOPEN。macOS 使用位标志而非 Linux 的 backlog 值。
     /// 对应 Go `unix.SetsockoptInt(fd, IPPROTO_TCP, TCP_FASTOPEN, val)`。
     fn set_tcp_fastopen(&self, fd: i32) -> io::Result<()> {
-        let val = if self.inbound {
-            TCP_FASTOPEN_SERVER
-        } else {
-            TCP_FASTOPEN_CLIENT
-        };
+        let val = if self.inbound { TCP_FASTOPEN_SERVER } else { TCP_FASTOPEN_CLIENT };
         // SAFETY: setsockopt 对已验证的 fd 设置整数选项。
         // macOS TCP_FASTOPEN = 0x06，值使用 client/server 位标志。
         // 内核验证参数合法性，无效值返回 errno。

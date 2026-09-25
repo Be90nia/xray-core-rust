@@ -7,8 +7,7 @@
 
 use std::sync::Arc;
 
-use crate::errors::Error;
-use crate::serial::TypedMessage;
+use crate::{errors::Error, serial::TypedMessage};
 
 /// 用户身份，用于认证。
 ///
@@ -104,13 +103,15 @@ mod tests {
         fn equals(&self, other: &dyn Account) -> bool {
             other.as_any().is::<OtherAccount>()
         }
+
         fn to_proto(&self) -> TypedMessage {
             TypedMessage::new("type.googleapis.com/test.other", vec![])
         }
+
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
-}
+    }
 
     #[test]
     fn test_equals_same_type_and_value() {

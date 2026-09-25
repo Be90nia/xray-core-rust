@@ -16,26 +16,22 @@
 
 #![cfg(test)]
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use rustls::ClientConfig as RustlsClientConfig;
-use rustls::ServerConfig as RustlsServerConfig;
+use rustls::{ClientConfig as RustlsClientConfig, ServerConfig as RustlsServerConfig};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-
-use xray_app_dispatcher::default::{DefaultDispatcher, DialBridge, SimpleOhm};
-use xray_app_dispatcher::default::SniffingRequest;
-use xray_buf::io::{Reader, Writer};
-use xray_buf::multi::MultiBuffer;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-use xray_proxy_anytls::client::{AnytlsClient, ClientConfig};
-use xray_proxy_anytls::dispatcher::make_dial_fn;
-use xray_proxy_anytls::server::AnytlsMockServer;
+use xray_app_dispatcher::default::{DefaultDispatcher, DialBridge, SimpleOhm, SniffingRequest};
+use xray_buf::{
+    io::{Reader, Writer},
+    multi::MultiBuffer,
+};
+use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
+use xray_proxy_anytls::{
+    client::{AnytlsClient, ClientConfig},
+    dispatcher::make_dial_fn,
+    server::AnytlsMockServer,
+};
 
 /// 起简单 echo TCP server。
 async fn start_echo_server() -> SocketAddr {
@@ -56,7 +52,7 @@ async fn start_echo_server() -> SocketAddr {
                             if sock.write_all(&buf[..n]).await.is_err() {
                                 break;
                             }
-                        }
+                        },
                     }
                 }
             });
@@ -86,11 +82,7 @@ fn make_server_config() -> (RustlsServerConfig, Vec<u8>) {
 fn make_client_config(server_cert_der: &[u8]) -> Arc<RustlsClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.add(server_cert_der.to_vec().into()).unwrap();
-    Arc::new(
-        RustlsClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth(),
-    )
+    Arc::new(RustlsClientConfig::builder().with_root_certificates(root_store).with_no_client_auth())
 }
 
 #[tokio::test]
@@ -103,9 +95,8 @@ async fn dispatcher_e2e_anytls_loopback_echo() {
     // 2. anytls mock server
     let (server_config, cert_der) = make_server_config();
     let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
-    let anytls_server = AnytlsMockServer::start("127.0.0.1:0".parse().unwrap(), tls_acceptor, None)
-        .await
-        .unwrap();
+    let anytls_server =
+        AnytlsMockServer::start("127.0.0.1:0".parse().unwrap(), tls_acceptor, None).await.unwrap();
     let anytls_addr = anytls_server.local_addr;
 
     // 3. anytls client
@@ -119,10 +110,7 @@ async fn dispatcher_e2e_anytls_loopback_echo() {
 
     // 4. dispatcher + DialBridge(AnytlsClient)
     let ohm = SimpleOhm::new();
-    ohm.set_default(Arc::new(DialBridge::new(
-        "anytls-out",
-        make_dial_fn(Arc::clone(&client)),
-    )));
+    ohm.set_default(Arc::new(DialBridge::new("anytls-out", make_dial_fn(Arc::clone(&client)))));
     let mut dispatcher = DefaultDispatcher::new();
     dispatcher.ohm = Some(Arc::new(ohm));
 
@@ -169,9 +157,8 @@ async fn dispatcher_e2e_anytls_loopback_large_payload() {
     let echo_addr = start_echo_server().await;
     let (server_config, cert_der) = make_server_config();
     let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
-    let anytls_server = AnytlsMockServer::start("127.0.0.1:0".parse().unwrap(), tls_acceptor, None)
-        .await
-        .unwrap();
+    let anytls_server =
+        AnytlsMockServer::start("127.0.0.1:0".parse().unwrap(), tls_acceptor, None).await.unwrap();
     let anytls_addr = anytls_server.local_addr;
 
     let client_config = ClientConfig::new(

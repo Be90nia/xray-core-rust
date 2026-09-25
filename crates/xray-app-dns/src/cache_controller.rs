@@ -3,19 +3,23 @@
 //! ## 范围
 //!
 //! - 缓存数据结构 + cleanup 逻辑 + 内存收缩策略：完整翻译。
-//! - `pubsub.Service` / `singleflight.Group`：Rust 端用 `tokio::sync::broadcast` +
-//!   `Mutex<HashMap>` 简化模拟；真实订阅/去重逻辑见 `nameserver/cached.rs`。
+//! - `pubsub.Service` / `singleflight.Group`：Rust 端用 `tokio::sync::broadcast` + `Mutex<HashMap>`
+//!   简化模拟；真实订阅/去重逻辑见 `nameserver/cached.rs`。
 //! - `task.Periodic`：用 `tokio::time::interval` + `tokio::spawn`，在 `start_cleanup_task` 启动。
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
-use crate::config::IpOption;
-use crate::dnscommon::{IpRecord, Record};
+use crate::{
+    config::IpOption,
+    dnscommon::{IpRecord, Record},
+};
 
 /// 触发空表重建的最小历史峰值（Go `minSizeForEmptyRebuild = 512`）。
 pub const MIN_SIZE_FOR_EMPTY_REBUILD: usize = 512;
@@ -45,7 +49,9 @@ pub struct CacheController {
     high_watermark: RwLock<usize>,
     /// 广播通道发送端（响应到达时发 `CacheEvent`）。
     pub tx: broadcast::Sender<CacheEvent>,
-    pub single_flight: tokio::sync::Mutex<HashMap<(String, bool, bool), broadcast::Sender<crate::nameserver::cached::QueryOutcome>>>,
+    pub single_flight: tokio::sync::Mutex<
+        HashMap<(String, bool, bool), broadcast::Sender<crate::nameserver::cached::QueryOutcome>>,
+    >,
 }
 
 /// 广播事件。对应 Go `pubsub` 中的 `*IPRecord` 消息。
@@ -112,17 +118,15 @@ impl CacheController {
         self.ips.read().get(fqdn).cloned()
     }
 
-/// 写入 / 合并记录。对应 Go `addIoResult` / `setRecord`。
-///
-/// `is_v4=true` 更新 A 记录，`false` 更新 AAAA。
-pub fn upsert(&self, fqdn: &str, is_v4: bool, record: IpRecord) {
+    /// 写入 / 合并记录。对应 Go `addIoResult` / `setRecord`。
+    ///
+    /// `is_v4=true` 更新 A 记录，`false` 更新 AAAA。
+    pub fn upsert(&self, fqdn: &str, is_v4: bool, record: IpRecord) {
         if self.disable_cache {
             return;
         }
         let mut ips = self.ips.write();
-        let entry = ips
-            .entry(fqdn.to_string())
-            .or_insert_with(|| Arc::new(Record::default()));
+        let entry = ips.entry(fqdn.to_string()).or_insert_with(|| Arc::new(Record::default()));
         // Arc::make_mut：如独占则就地修改，否则 COW。
         let entry_mut = Arc::make_mut(entry);
         if is_v4 {
@@ -145,10 +149,7 @@ pub fn upsert(&self, fqdn: &str, is_v4: bool, record: IpRecord) {
         let mut keys = Vec::with_capacity(ips.len() / 4);
         for (domain, rec) in ips.iter() {
             let a_expired = rec.a.as_ref().is_some_and(|r| r.expire < effective_now);
-            let aaaa_expired = rec
-                .aaaa
-                .as_ref()
-                .is_some_and(|r| r.expire < effective_now);
+            let aaaa_expired = rec.aaaa.as_ref().is_some_and(|r| r.expire < effective_now);
             if a_expired || aaaa_expired {
                 keys.push(domain.clone());
             }
@@ -173,14 +174,8 @@ pub fn upsert(&self, fqdn: &str, is_v4: bool, record: IpRecord) {
             let Some(rec) = ips.get_mut(domain) else {
                 continue;
             };
-            let a_expired = rec
-                .a
-                .as_ref()
-                .is_some_and(|r| r.expire < effective_now);
-            let aaaa_expired = rec
-                .aaaa
-                .as_ref()
-                .is_some_and(|r| r.expire < effective_now);
+            let a_expired = rec.a.as_ref().is_some_and(|r| r.expire < effective_now);
+            let aaaa_expired = rec.aaaa.as_ref().is_some_and(|r| r.expire < effective_now);
             // 通过 Arc::make_mut 以避免 clone 整个 HashMap。
             // （此处 `ips.get_mut` 已返回 &mut Arc<Record>，但修 Arc 内容需要 make_mut。）
             if a_expired || aaaa_expired {
@@ -298,12 +293,12 @@ pub fn upsert(&self, fqdn: &str, is_v4: bool, record: IpRecord) {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
     use super::*;
     use crate::dnscommon::ip_record;
-    use std::net::{IpAddr, Ipv4Addr};
 
     fn make_ctrl() -> CacheController {
         CacheController::new("test", false, false, 0, 0)
@@ -321,7 +316,8 @@ mod tests {
     fn upsert_then_find_returns_record() {
         let c = make_ctrl();
         let now = Instant::now();
-        let rec = ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(60), 0, now);
+        let rec =
+            ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(60), 0, now);
         c.upsert("example.com.", true, rec);
         assert_eq!(c.len(), 1);
         let r = c.find_records("example.com.").unwrap();
@@ -333,8 +329,15 @@ mod tests {
     fn upsert_separate_v4_v6_into_same_entry() {
         let c = make_ctrl();
         let now = Instant::now();
-        let rec4 = ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(60), 0, now);
-        let rec6 = ip_record(2, vec![IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)], Duration::from_secs(60), 0, now);
+        let rec4 =
+            ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(60), 0, now);
+        let rec6 = ip_record(
+            2,
+            vec![IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)],
+            Duration::from_secs(60),
+            0,
+            now,
+        );
         c.upsert("x.com.", true, rec4);
         c.upsert("x.com.", false, rec6);
         let r = c.find_records("x.com.").unwrap();
@@ -346,8 +349,15 @@ mod tests {
     fn collect_expired_keys_returns_only_expired() {
         let c = make_ctrl();
         let now = Instant::now();
-        let expired = ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(0), 0, now);
-        let live = ip_record(2, vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))], Duration::from_secs(120), 0, now);
+        let expired =
+            ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(0), 0, now);
+        let live = ip_record(
+            2,
+            vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))],
+            Duration::from_secs(120),
+            0,
+            now,
+        );
         c.upsert("gone.com.", true, expired);
         c.upsert("live.com.", true, live);
         // 让 expired 真正过期。
@@ -361,7 +371,8 @@ mod tests {
     fn run_cleanup_removes_expired_and_returns_cleaned() {
         let c = make_ctrl();
         let now = Instant::now();
-        let expired = ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(0), 0, now);
+        let expired =
+            ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(0), 0, now);
         c.upsert("gone.com.", true, expired);
         let later = now + Duration::from_secs(1);
         let (cleaned, _) = c.run_cleanup(later);
@@ -373,7 +384,8 @@ mod tests {
     fn run_cleanup_returns_false_when_nothing_expired() {
         let c = make_ctrl();
         let now = Instant::now();
-        let live = ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(120), 0, now);
+        let live =
+            ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(120), 0, now);
         c.upsert("live.com.", true, live);
         let (cleaned, _) = c.run_cleanup(now);
         assert!(!cleaned);
@@ -383,7 +395,8 @@ mod tests {
     fn cleanup_high_watermark_tracks_peak() {
         let c = make_ctrl();
         let now = Instant::now();
-        let live = ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(120), 0, now);
+        let live =
+            ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(120), 0, now);
         c.upsert("a.com.", true, live.clone());
         c.upsert("b.com.", true, live.clone());
         c.upsert("c.com.", true, live);
@@ -399,13 +412,13 @@ mod tests {
         assert_eq!(c.serve_expired_ttl_secs, -30);
         // effective_now 应当 now + 30s（Go: now.Add(-30s) 后与 expire 比较）。
         let now = Instant::now();
-        let expired_under_normal = ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(10), 0, now);
+        let expired_under_normal =
+            ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(10), 0, now);
         c.upsert("gone.com.", true, expired_under_normal);
         // 正常情况 (now+10s) 已过期；但 serve_stale 加 30s，所以不应被认为过期。
         let later = now + Duration::from_secs(20);
         let keys = c.collect_expired_keys(later);
         assert!(keys.is_empty(), "expected no expired keys due to serve_stale grace");
-
     }
 
     /// 对应 Go `cache_controller.go:255-258`：`disableCache=true` 时
@@ -415,7 +428,8 @@ mod tests {
     fn upsert_no_op_when_disable_cache() {
         let c = CacheController::new("test", true, false, 0, 0);
         let now = Instant::now();
-        let rec = ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(60), 0, now);
+        let rec =
+            ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(60), 0, now);
         c.upsert("example.com.", true, rec);
         assert_eq!(c.len(), 0, "disable_cache upsert must be no-op");
         assert!(c.find_records("example.com.").is_none());
@@ -425,9 +439,16 @@ mod tests {
     async fn cleanup_task_removes_expired_entries() {
         let c = Arc::new(CacheController::new("test", false, false, 0, 0));
         let now = Instant::now();
-        let expired = ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(0), 0, now);
+        let expired =
+            ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(0), 0, now);
         c.upsert("gone.com.", true, expired);
-        let live = ip_record(2, vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))], Duration::from_secs(120), 0, now);
+        let live = ip_record(
+            2,
+            vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))],
+            Duration::from_secs(120),
+            0,
+            now,
+        );
         c.upsert("live.com.", true, live);
 
         // 生产接线验证：start_cleanup_task 周期执行 run_cleanup。

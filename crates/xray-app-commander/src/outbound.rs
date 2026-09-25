@@ -6,17 +6,17 @@
 //!
 //! ## Rust 化策略
 //!
-//! - **不引入 transport::Link / cnc.Connection**：依赖 transport 全链路 +
-//!   xray_buf 多缓冲 IO，当前阶段留 trait 定义 + stub struct
-//! - **OutboundListener trait 含 sync API**：`accept` 返回 `Option<Conn>`（同步），
-//!   因为 Go 的 net.Listener.Accept 也是阻塞 sync；Rust 端实际异步化由 trait
-//!   实现决定（可包 `tokio::sync::mpsc::Receiver` + block_on）
-//! - **Conn 类型留 type parameter stub**：避免引入 transport::Link，用 `Box<dyn AsyncRead + AsyncWrite + Send + Unpin>` 作为最简抽象；trait 不依赖具体 crate
+//! - **不引入 transport::Link / cnc.Connection**：依赖 transport 全链路 + xray_buf 多缓冲
+//!   IO，当前阶段留 trait 定义 + stub struct
+//! - **OutboundListener trait 含 sync API**：`accept` 返回 `Option<Conn>`（同步）， 因为 Go 的
+//!   net.Listener.Accept 也是阻塞 sync；Rust 端实际异步化由 trait 实现决定（可包
+//!   `tokio::sync::mpsc::Receiver` + block_on）
+//! - **Conn 类型留 type parameter stub**：避免引入 transport::Link，用 `Box<dyn AsyncRead +
+//!   AsyncWrite + Send + Unpin>` 作为最简抽象；trait 不依赖具体 crate
 //! - **OutboundHandler 统一为 xray-features 版本**：不再本地定义，直接 re-export
 //!   `xray_features::outbound::OutboundHandler`，保持与全项目一致。
 
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -45,7 +45,9 @@ pub trait OutboundListener: Send + Sync {
     ///
     /// 对应 Go `(*OutboundListener).Accept() (net.Conn, error)`。
     /// Rust 化：异步化（Go 是 sync 阻塞 + select done）。
-    fn accept(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<CommanderConn>> + Send + '_>>;
+    fn accept(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<CommanderConn>> + Send + '_>>;
 
     /// 关闭 listener，丢弃所有缓冲的连接。
     /// 对应 Go `(*OutboundListener).Close() error`。
@@ -115,9 +117,8 @@ impl StubOutboundHandler {
     }
 }
 
+use xray_common::{net::destination::Destination, session::Session};
 use xray_features::outbound::OutboundError;
-use xray_common::net::destination::Destination;
-use xray_common::session::Session;
 
 #[async_trait::async_trait]
 impl xray_features::outbound::OutboundHandler for StubOutboundHandler {
@@ -170,8 +171,9 @@ impl StubOutboundHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use xray_features::outbound::OutboundHandler as _;
+
+    use super::*;
 
     #[test]
     fn stub_handler_tag() {
@@ -233,10 +235,9 @@ mod tests {
     }
     impl MockRegistrar {
         fn new() -> Self {
-            Self {
-                handlers: parking_lot::Mutex::new(Vec::new()),
-            }
+            Self { handlers: parking_lot::Mutex::new(Vec::new()) }
         }
+
         fn count(&self) -> usize {
             self.handlers.lock().len()
         }
@@ -249,6 +250,7 @@ mod tests {
             self.handlers.lock().push(handler);
             Ok(())
         }
+
         fn remove_handler(&self, tag: &str) -> Result<(), CommanderError> {
             let mut handlers = self.handlers.lock();
             let before = handlers.len();

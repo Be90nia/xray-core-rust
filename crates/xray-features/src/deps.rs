@@ -2,18 +2,18 @@
 //!
 //! 对应 Go `core.New` 里 `RequireFeatures(callback)` 反射 DI：Go 通过 reflect
 //! 扫描回调参数类型 + `features` 列表匹配注入；Rust 走显式 [`DepBag`]，
-//! Instance 在所有 feature 注册完成后调用 [`Feature::init_dependencies`](crate::Feature::init_dependencies)
-//! 传同一个 bag，feature 自取所需依赖。
+//! Instance 在所有 feature 注册完成后调用
+//! [`Feature::init_dependencies`](crate::Feature::init_dependencies) 传同一个 bag，feature
+//! 自取所需依赖。
 //!
 //! # 设计权衡
 //!
 //! - **不存 `Arc<dyn Any>`** —— `feature_typed` 已经做了这件事；DepBag 只放
 //!   "运行时共享基础设施"（outbound.Manager 的 selector 视图、dispatcher 等）。
-//! - **字段语义为"已就绪"** —— `outbound_selector` 为 `Some` 表示 outbound.Manager
-//!   已实例化且 `select_by_prefix` 可用；`None` 表示当前阶段 proxyman 未就绪，
-//!   调用方应 fail-fast 或降级。
-//! - **可扩展** —— 后续 dispatcher / dns_client / policy manager 同样按
-//!   `Option<Arc<dyn ...>>` 模式追加字段，feature 按需访问。
+//! - **字段语义为"已就绪"** —— `outbound_selector` 为 `Some` 表示 outbound.Manager 已实例化且
+//!   `select_by_prefix` 可用；`None` 表示当前阶段 proxyman 未就绪， 调用方应 fail-fast 或降级。
+//! - **可扩展** —— 后续 dispatcher / dns_client / policy manager 同样按 `Option<Arc<dyn ...>>`
+//!   模式追加字段，feature 按需访问。
 
 use std::sync::Arc;
 
@@ -31,8 +31,8 @@ pub trait OutboundTagSelector: Send + Sync {
 ///
 /// # 当前字段
 ///
-/// - `outbound_selector`：可选的 outbound tag 查询后端。proxyman 尚未装配时为
-///   `None`，依赖此依赖的 feature 必须按 no-op 或 fail-fast 处理。
+/// - `outbound_selector`：可选的 outbound tag 查询后端。proxyman 尚未装配时为 `None`，依赖此依赖的
+///   feature 必须按 no-op 或 fail-fast 处理。
 #[derive(Default, Clone)]
 pub struct DepBag {
     /// outbound tag 列表查询后端（`None` 表示 proxyman 切片未装配）。

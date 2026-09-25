@@ -3,30 +3,33 @@
 //! 对应 Go `app/observatory/observer.go` 的 `Observer` struct + background loop。
 //! 实际 HTTP probe + dispatcher dial 全部留 trait 注入，避免绑定 hyper/reqwest。
 
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use parking_lot::Mutex;
-
-use crate::config::{ObservationResult, ObservatoryConfig, ProbeResult};
-use crate::error::{at_error, ObservatoryError};
-use crate::status::StatusStore;
 // 4d7t：plain observatory 的 GET 语义不再从 burst healthping 借常量——
 // 两套判定口径在此分离（见 HttpProbeExecutor::check_status）。
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
-use std::time::{Duration, Instant};
-
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::TcpStream;
-use tokio::sync::watch;
+use parking_lot::Mutex;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
+    net::TcpStream,
+    sync::watch,
+};
 use xray_app_dispatcher::DefaultDispatcher;
-use xray_buf::io::{Reader as BufReader, Writer as BufWriter};
-use xray_buf::multi::MultiBuffer;
-use xray_transport::connection::Connection;
-use xray_transport::link::Link;
-use std::pin::Pin;
+use xray_buf::{
+    io::{Reader as BufReader, Writer as BufWriter},
+    multi::MultiBuffer,
+};
+use xray_transport::{connection::Connection, link::Link};
 
-use std::task::{Context, Poll};
+use crate::{
+    config::{ObservationResult, ObservatoryConfig, ProbeResult},
+    error::{ObservatoryError, at_error},
+    status::StatusStore,
+};
 
 /// OutboundSelector trait：返回受观察的 outbound tag 列表。
 ///
@@ -44,10 +47,7 @@ pub trait ProbeExecutor: Send + Sync {
 
 /// 当前 Unix 时间（秒），用于 status 时间戳。
 pub fn now_unix_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
 /// 对给定 tag 集合探测一轮（阻塞调用线程直到全部完成），返回是否任一存活。
@@ -127,10 +127,7 @@ impl Observer {
         Self {
             config,
             status: Arc::new(StatusStore::new()),
-            state: Mutex::new(ObserverState {
-                started: false,
-                cancel_tx: None,
-            }),
+            state: Mutex::new(ObserverState { started: false, cancel_tx: None }),
         }
     }
 
@@ -196,19 +193,16 @@ impl Observer {
                         });
                         // tags 非空且无一存活才算失败轮（空列表按正常间隔）
                         !tags_empty && !any_alive
-                    }
+                    },
                     Err(e) => {
                         at_error(&e);
                         true
-                    }
+                    },
                 };
 
-                fail_streak = if round_failed {
-                    fail_streak.saturating_add(1)
-                } else {
-                    0
-                };
-                let delay = Duration::from_millis(interval_ms * backoff_multiplier(fail_streak) as u64);
+                fail_streak = if round_failed { fail_streak.saturating_add(1) } else { 0 };
+                let delay =
+                    Duration::from_millis(interval_ms * backoff_multiplier(fail_streak) as u64);
                 tokio::select! {
                     // biased：cancel 恒优先——否则 cancel 与 sleep 同时 ready 时
                     // select 随机选 sleep 分支会多 probe 一轮（close 语义破坏）。
@@ -285,9 +279,7 @@ impl Observer {
 
     /// 返回当前观测快照。
     pub fn get_observation(&self) -> ObservationResult {
-        ObservationResult {
-            status: self.status.snapshot(),
-        }
+        ObservationResult { status: self.status.snapshot() }
     }
 
     /// 清理已移除的 outbound。
@@ -320,9 +312,7 @@ pub struct FixedProbeExecutor {
 
 impl FixedProbeExecutor {
     pub fn new() -> Self {
-        Self {
-            results: std::collections::HashMap::new(),
-        }
+        Self { results: std::collections::HashMap::new() }
     }
 
     pub fn with_result(mut self, tag: impl Into<String>, result: ProbeResult) -> Self {
@@ -339,14 +329,11 @@ impl Default for FixedProbeExecutor {
 
 impl ProbeExecutor for FixedProbeExecutor {
     fn probe(&self, tag: &str) -> ProbeResult {
-        self.results
-            .get(tag)
-            .cloned()
-            .unwrap_or_else(|| ProbeResult {
-                alive: false,
-                delay: 0,
-                last_error_reason: format!("no fixture for {tag}"),
-            })
+        self.results.get(tag).cloned().unwrap_or_else(|| ProbeResult {
+            alive: false,
+            delay: 0,
+            last_error_reason: format!("no fixture for {tag}"),
+        })
     }
 }
 
@@ -360,10 +347,7 @@ pub(crate) struct CountingProbeExecutor {
 #[cfg(test)]
 impl CountingProbeExecutor {
     pub(crate) fn new(alive: bool) -> Self {
-        Self {
-            count: std::sync::atomic::AtomicUsize::new(0),
-            alive,
-        }
+        Self { count: std::sync::atomic::AtomicUsize::new(0), alive }
     }
 
     pub(crate) fn count(&self) -> usize {
@@ -454,11 +438,7 @@ mod tests {
     async fn start_spawns_probe_loop_writes_samples() {
         let o = Observer::new(fast_cfg());
         let executor = Arc::new(CountingProbeExecutor::new(true));
-        o.start(
-            Arc::new(NoopOutboundSelector::new(vec!["a".into()])),
-            executor.clone(),
-        )
-        .unwrap();
+        o.start(Arc::new(NoopOutboundSelector::new(vec!["a".into()])), executor.clone()).unwrap();
         tokio::time::sleep(Duration::from_millis(250)).await;
         assert!(
             executor.count() >= 2,
@@ -473,21 +453,13 @@ mod tests {
     async fn close_cancels_probe_loop() {
         let o = Observer::new(fast_cfg());
         let executor = Arc::new(CountingProbeExecutor::new(true));
-        o.start(
-            Arc::new(NoopOutboundSelector::new(vec!["a".into()])),
-            executor.clone(),
-        )
-        .unwrap();
+        o.start(Arc::new(NoopOutboundSelector::new(vec!["a".into()])), executor.clone()).unwrap();
         tokio::time::sleep(Duration::from_millis(120)).await;
         assert!(executor.count() >= 1);
         o.close().unwrap();
         let frozen = executor.count();
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(
-            executor.count(),
-            frozen,
-            "probe loop must stop after close"
-        );
+        assert_eq!(executor.count(), frozen, "probe loop must stop after close");
     }
 
     #[test]
@@ -513,19 +485,11 @@ mod tests {
         let executor = FixedProbeExecutor::new()
             .with_result(
                 "a",
-                ProbeResult {
-                    alive: true,
-                    delay: 50,
-                    last_error_reason: String::new(),
-                },
+                ProbeResult { alive: true, delay: 50, last_error_reason: String::new() },
             )
             .with_result(
                 "b",
-                ProbeResult {
-                    alive: false,
-                    delay: 0,
-                    last_error_reason: "timeout".into(),
-                },
+                ProbeResult { alive: false, delay: 0, last_error_reason: "timeout".into() },
             );
         let count = o.probe_all(&selector, &executor).unwrap();
         assert_eq!(count, 2);
@@ -544,11 +508,7 @@ mod tests {
         let o = Observer::new(cfg_with_selector(&["a"]));
         let executor = FixedProbeExecutor::new().with_result(
             "a",
-            ProbeResult {
-                alive: true,
-                delay: 10,
-                last_error_reason: String::new(),
-            },
+            ProbeResult { alive: true, delay: 10, last_error_reason: String::new() },
         );
         o.probe_one("a", &executor);
         let obs = o.get_observation();
@@ -617,11 +577,7 @@ mod tests {
         // 通过 store 直接更新（绕过 observer.probe_all）
         store.update_with_probe_result(
             "direct",
-            &ProbeResult {
-                alive: true,
-                delay: 1,
-                last_error_reason: String::new(),
-            },
+            &ProbeResult { alive: true, delay: 1, last_error_reason: String::new() },
             100,
         );
         let obs = o.get_observation();
@@ -634,6 +590,7 @@ mod tests {
     #[test]
     fn real_outbound_selector_with_selector_bridges_backend() {
         use std::sync::Arc;
+
         use xray_features::OutboundTagSelector;
 
         struct FixedBackend(Vec<String>);
@@ -654,8 +611,10 @@ mod tests {
     /// 探测读响应 + 写入请求路径都走真实 TCP（不依赖 mock）。
     #[tokio::test]
     async fn http_probe_executor_runs_against_echo_server() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -664,19 +623,13 @@ mod tests {
             let mut buf = [0u8; 512];
             let n = sock.read(&mut buf).await.unwrap();
             // 任何 HTTP/1.1 请求 → 返 200 即可。
-            sock.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
-            )
-            .await
-            .unwrap();
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                .await
+                .unwrap();
             let _ = n;
         });
 
-        let exec = HttpProbeExecutor::new(
-            format!("http://{addr}/"),
-            "GET".to_string(),
-            5_000,
-        );
+        let exec = HttpProbeExecutor::new(format!("http://{addr}/"), "GET".to_string(), 5_000);
         let result = tokio::task::spawn_blocking(move || exec.probe("test-tag"))
             .await
             .expect("spawn_blocking should not panic");
@@ -699,27 +652,12 @@ mod tests {
         let exec = FixedProbeExecutor::new()
             .with_result(
                 "a",
-                ProbeResult {
-                    alive: true,
-                    delay: 10,
-                    last_error_reason: String::new(),
-                },
+                ProbeResult { alive: true, delay: 10, last_error_reason: String::new() },
             )
-            .with_result(
-                "b",
-                ProbeResult {
-                    alive: false,
-                    delay: 0,
-                    last_error_reason: "x".into(),
-                },
-            )
+            .with_result("b", ProbeResult { alive: false, delay: 0, last_error_reason: "x".into() })
             .with_result(
                 "c",
-                ProbeResult {
-                    alive: true,
-                    delay: 30,
-                    last_error_reason: String::new(),
-                },
+                ProbeResult { alive: true, delay: 30, last_error_reason: String::new() },
             );
         let tags = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         o.probe_tags(&tags, &exec);
@@ -747,24 +685,13 @@ mod tests {
         let exec = FixedProbeExecutor::new()
             .with_result(
                 "x",
-                ProbeResult {
-                    alive: true,
-                    delay: 5,
-                    last_error_reason: String::new(),
-                },
+                ProbeResult { alive: true, delay: 5, last_error_reason: String::new() },
             )
             .with_result(
                 "y",
-                ProbeResult {
-                    alive: true,
-                    delay: 7,
-                    last_error_reason: String::new(),
-                },
+                ProbeResult { alive: true, delay: 7, last_error_reason: String::new() },
             );
-        o.probe_tags(
-            &["x".to_string(), "y".to_string()],
-            &exec,
-        );
+        o.probe_tags(&["x".to_string(), "y".to_string()], &exec);
         let obs = o.get_observation();
         assert_eq!(obs.status.len(), 2);
     }
@@ -772,10 +699,7 @@ mod tests {
     /// qyo6：空 tags 时 EnableConcurrency 分支不退化、不 panic。
     #[test]
     fn probe_tags_empty_tags_noop() {
-        let cfg = ObservatoryConfig {
-            enable_concurrency: true,
-            ..Default::default()
-        };
+        let cfg = ObservatoryConfig { enable_concurrency: true, ..Default::default() };
         let o = Observer::new(cfg);
         let exec = FixedProbeExecutor::new();
         o.probe_tags(&[], &exec);
@@ -786,10 +710,8 @@ mod tests {
     #[test]
     fn real_outbound_probe_missing_handler_returns_dead() {
         let dispatcher = Arc::new(DefaultDispatcher::new());
-        let exec = RealOutboundProbeExecutor::from_config(
-            &ObservatoryConfig::default(),
-            dispatcher,
-        );
+        let exec =
+            RealOutboundProbeExecutor::from_config(&ObservatoryConfig::default(), dispatcher);
         let r = exec.probe("unknown-tag");
         assert!(!r.alive);
         assert!(r.last_error_reason.contains("unknown-tag"), "got: {}", r.last_error_reason);
@@ -810,8 +732,10 @@ mod tests {
     /// executor，所有 tag 探测结果 = 本机直连状况完全相同。
     #[test]
     fn real_outbound_probe_two_tags_diverge() {
-        use xray_app_dispatcher::default::{DialBridge, DialFn, SimpleOhm};
-        use xray_app_dispatcher::Config as DispConfig;
+        use xray_app_dispatcher::{
+            Config as DispConfig,
+            default::{DialBridge, DialFn, SimpleOhm},
+        };
         use xray_transport::connection::TcpConnection;
 
         // mock HTTP 目标：accept 后写死 204 状态行。
@@ -834,9 +758,8 @@ mod tests {
         let good: DialFn = Arc::new(move |_dest| {
             let target = format!("127.0.0.1:{mock_port}");
             Box::pin(async move {
-                let tcp = tokio::net::TcpStream::connect(&target)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let tcp =
+                    tokio::net::TcpStream::connect(&target).await.map_err(|e| e.to_string())?;
                 Ok(Box::new(TcpConnection::new(tcp)) as Box<dyn Connection>)
             })
         });
@@ -850,11 +773,13 @@ mod tests {
         let ohm = Arc::new(SimpleOhm::new());
         ohm.add(
             "good",
-            Arc::new(DialBridge::new("good", good)) as Arc<dyn xray_app_dispatcher::DispatchHandler>,
+            Arc::new(DialBridge::new("good", good))
+                as Arc<dyn xray_app_dispatcher::DispatchHandler>,
         );
         ohm.add(
             "dead",
-            Arc::new(DialBridge::new("dead", dead)) as Arc<dyn xray_app_dispatcher::DispatchHandler>,
+            Arc::new(DialBridge::new("dead", dead))
+                as Arc<dyn xray_app_dispatcher::DispatchHandler>,
         );
 
         let mut dispatcher = DefaultDispatcher::new();
@@ -871,7 +796,8 @@ mod tests {
             ..Default::default()
         };
         // 短预算：dead 路径要等 read timeout，5s 太拖。
-        let exec = RealOutboundProbeExecutor::new(Arc::new(dispatcher), cfg.probe_url.clone(), "GET", 500);
+        let exec =
+            RealOutboundProbeExecutor::new(Arc::new(dispatcher), cfg.probe_url.clone(), "GET", 500);
 
         let good_r = exec.probe("good");
         assert!(good_r.alive, "good outbound must be alive, got: {:?}", good_r);
@@ -890,8 +816,10 @@ mod tests {
     /// 建连延迟，此类目标被误报 alive。
     #[test]
     fn tls_probe_rejects_syn_ack_only_target() {
-        use xray_app_dispatcher::default::{DialBridge, DialFn, SimpleOhm};
-        use xray_app_dispatcher::Config as DispConfig;
+        use xray_app_dispatcher::{
+            Config as DispConfig,
+            default::{DialBridge, DialFn, SimpleOhm},
+        };
         use xray_transport::connection::TcpConnection;
 
         // accept 后立即 drop：TLS 握手读端 EOF → 必败。
@@ -906,9 +834,8 @@ mod tests {
         let dial: DialFn = Arc::new(move |_dest| {
             let target = format!("127.0.0.1:{mock_port}");
             Box::pin(async move {
-                let tcp = tokio::net::TcpStream::connect(&target)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let tcp =
+                    tokio::net::TcpStream::connect(&target).await.map_err(|e| e.to_string())?;
                 Ok(Box::new(TcpConnection::new(tcp)) as Box<dyn Connection>)
             })
         });
@@ -947,8 +874,7 @@ mod tests {
 ///
 /// - [`Self::new`]：直接持有 `Arc<dyn OutboundSelector>`（已实现的 trait object），
 ///   适用于观测器内部嵌套场景。
-/// - [`Self::with_selector`]：接受任意实现了
-///   [`xray_features::OutboundTagSelector`] 的后端（典型为
+/// - [`Self::with_selector`]：接受任意实现了 [`xray_features::OutboundTagSelector`] 的后端（典型为
 ///   `xray-app-proxyman::OutboundManager`），无 proxyman 直接依赖，
 ///   避免循环依赖（xray-app-observatory 已被 proxyman 间接引用）。
 pub struct RealOutboundSelector {
@@ -968,16 +894,11 @@ impl RealOutboundSelector {
     pub fn with_selector(backend: Arc<dyn xray_features::OutboundTagSelector>) -> Self {
         struct BackendAdapter(Arc<dyn xray_features::OutboundTagSelector>);
         impl OutboundSelector for BackendAdapter {
-            fn select(
-                &self,
-                subject_selector: &[String],
-            ) -> Result<Vec<String>, ObservatoryError> {
+            fn select(&self, subject_selector: &[String]) -> Result<Vec<String>, ObservatoryError> {
                 Ok(self.0.select_by_prefix(subject_selector))
             }
         }
-        Self {
-            manager: Arc::new(BackendAdapter(backend)),
-        }
+        Self { manager: Arc::new(BackendAdapter(backend)) }
     }
 }
 
@@ -989,11 +910,11 @@ impl OutboundSelector for RealOutboundSelector {
 /// 基于 tokio::net::TcpStream 的 HTTP ProbeExecutor。
 ///
 /// 两套语义（4d7t 分离）：
-/// - **plain observatory**（`from_config`）：GET + 收到合法 HTTP 状态行即
-///   alive——对齐 Go `observer.go:175-186`（仅请求失败判 dead，**不查状态码**；
-///   CDN 对 HEAD/非 2xx 返回 405/403 时节点仍应判活）。
-/// - **burst healthping**（`new`）：沿用配置的 method + 200-399 判 alive
-///   （Go `healthping.go:175-179`）。
+/// - **plain observatory**（`from_config`）：GET + 收到合法 HTTP 状态行即 alive——对齐 Go
+///   `observer.go:175-186`（仅请求失败判 dead，**不查状态码**； CDN 对 HEAD/非 2xx 返回 405/403
+///   时节点仍应判活）。
+/// - **burst healthping**（`new`）：沿用配置的 method + 200-399 判 alive （Go
+///   `healthping.go:175-179`）。
 pub struct HttpProbeExecutor {
     /// 探测目标 URL（如 https://www.google.com/generate_204）
     url: String,
@@ -1008,12 +929,7 @@ pub struct HttpProbeExecutor {
 
 impl HttpProbeExecutor {
     pub fn new(url: impl Into<String>, method: impl Into<String>, timeout_ms: u64) -> Self {
-        Self {
-            url: url.into(),
-            method: method.into(),
-            timeout_ms,
-            check_status: true,
-        }
+        Self { url: url.into(), method: method.into(), timeout_ms, check_status: true }
     }
 
     /// 从 ObservatoryConfig 构造（plain observatory 语义）。
@@ -1049,16 +965,10 @@ impl ProbeExecutor for HttpProbeExecutor {
             .unwrap_or_else(|e| Err(format!("thread panicked: {e:?}")))
         });
         match result {
-            Ok(delay_ms) => ProbeResult {
-                alive: true,
-                delay: delay_ms,
-                last_error_reason: String::new(),
+            Ok(delay_ms) => {
+                ProbeResult { alive: true, delay: delay_ms, last_error_reason: String::new() }
             },
-            Err(reason) => ProbeResult {
-                alive: false,
-                delay: 0,
-                last_error_reason: reason,
-            },
+            Err(reason) => ProbeResult { alive: false, delay: 0, last_error_reason: reason },
         }
     }
 }
@@ -1074,7 +984,8 @@ impl HttpProbeExecutor {
         let addr = format!("{host}:{port}");
         let start = Instant::now();
         // Go http.Client.Timeout 口径：connect+TLS+GET 共享一个总预算。
-        let deadline = tokio::time::Instant::from_std(start) + Duration::from_millis(self.timeout_ms);
+        let deadline =
+            tokio::time::Instant::from_std(start) + Duration::from_millis(self.timeout_ms);
 
         let stream = tokio::time::timeout_at(deadline, TcpStream::connect(&addr))
             .await
@@ -1146,8 +1057,9 @@ where
     }
 
     // 3oad/4d7t：状态行解析 + 口径分离见 parse_http_status_code。
-    let status_code = parse_http_status_code(&response)
-        .ok_or_else(|| format!("malformed status line: {}", response.lines().next().unwrap_or("")))?;
+    let status_code = parse_http_status_code(&response).ok_or_else(|| {
+        format!("malformed status line: {}", response.lines().next().unwrap_or(""))
+    })?;
     if check_status && !(200..400).contains(&status_code) {
         return Err(format!("http status {status_code}"));
     }
@@ -1183,7 +1095,11 @@ struct LinkConnIo {
 struct ReaderSlot {
     inner: Option<Box<dyn BufReader>>,
     fut: Option<
-        Pin<Box<dyn Future<Output = (Box<dyn BufReader>, xray_buf::io::Result<MultiBuffer>)> + Send>>,
+        Pin<
+            Box<
+                dyn Future<Output = (Box<dyn BufReader>, xray_buf::io::Result<MultiBuffer>)> + Send,
+            >,
+        >,
     >,
     pending: Vec<u8>,
 }
@@ -1222,17 +1138,17 @@ impl AsyncRead for ReaderSlot {
                                     return Poll::Ready(Ok(()));
                                 }
                                 continue;
-                            }
+                            },
                             // pipe 写端关闭以 Err(Eof) 表达（xray-buf 约定）
                             // → 映射为 tokio 0 字节 EOF。
                             Err(xray_buf::io::Error::Eof) => {
                                 return Poll::Ready(Ok(()));
-                            }
+                            },
                             Err(e) => {
                                 return Poll::Ready(Err(std::io::Error::other(e.to_string())));
-                            }
+                            },
                         }
-                    }
+                    },
                     Poll::Pending => return Poll::Pending,
                 }
             }
@@ -1272,7 +1188,7 @@ impl AsyncWrite for WriterSlot {
                             Ok(()) => Poll::Ready(Ok(buf.len())),
                             Err(e) => Poll::Ready(Err(std::io::Error::other(e.to_string()))),
                         }
-                    }
+                    },
                     Poll::Pending => Poll::Pending,
                 };
             }
@@ -1288,10 +1204,7 @@ impl AsyncWrite for WriterSlot {
         }
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let Some(fut) = self.fut.as_mut() else {
             return Poll::Ready(Ok(()));
         };
@@ -1300,7 +1213,7 @@ impl AsyncWrite for WriterSlot {
                 self.fut = None;
                 self.inner = Some(inner);
                 res.map_err(|e| std::io::Error::other(e.to_string())).into()
-            }
+            },
             Poll::Pending => Poll::Pending,
         }
     }
@@ -1314,15 +1227,8 @@ impl LinkConn {
     fn new(link: Link) -> Self {
         Self {
             inner: parking_lot::Mutex::new(LinkConnIo {
-                reader: ReaderSlot {
-                    inner: Some(link.reader),
-                    fut: None,
-                    pending: Vec::new(),
-                },
-                writer: WriterSlot {
-                    inner: Some(link.writer),
-                    fut: None,
-                },
+                reader: ReaderSlot { inner: Some(link.reader), fut: None, pending: Vec::new() },
+                writer: WriterSlot { inner: Some(link.writer), fut: None },
             }),
         }
     }
@@ -1349,18 +1255,12 @@ impl AsyncWrite for LinkConn {
         Pin::new(&mut io.writer).poll_write(cx, buf)
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let mut io = self.inner.lock();
         Pin::new(&mut io.writer).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         self.poll_flush(cx)
     }
 }
@@ -1378,10 +1278,9 @@ impl Connection for LinkConn {
 /// 经指定 outbound（dispatcher forced-tag dispatch，不经路由）拨号到探测
 /// URL 并完成完整 HTTP(S) GET 的 [`ProbeExecutor`]。
 ///
-/// - tag 未注册 → dispatch 同步 Err → dead（对齐 Go default.go:443-454
-///   "tag 不存在直接丢弃链路"）。
-/// - https 目标 → rustls 完整握手（webpki-roots），TLS 层故障判 dead——
-///   修复此前"443 SYN-ACK 即 alive"的误报。
+/// - tag 未注册 → dispatch 同步 Err → dead（对齐 Go default.go:443-454 "tag 不存在直接丢弃链路"）。
+/// - https 目标 → rustls 完整握手（webpki-roots），TLS 层故障判 dead—— 修复此前"443 SYN-ACK 即
+///   alive"的误报。
 /// - alive 判定 = 收到合法 HTTP 状态行（Go observer.go:175-186，不查状态码）。
 pub struct RealOutboundProbeExecutor {
     dispatcher: Arc<DefaultDispatcher>,
@@ -1412,24 +1311,14 @@ impl RealOutboundProbeExecutor {
         method: impl Into<String>,
         timeout_ms: u64,
     ) -> Self {
-        Self {
-            dispatcher,
-            probe_url: probe_url.into(),
-            method: method.into(),
-            timeout_ms,
-        }
+        Self { dispatcher, probe_url: probe_url.into(), method: method.into(), timeout_ms }
     }
 
     /// 从 `ObservatoryConfig` + 生产 dispatcher 构造（plain observatory 语义：
     /// GET、默认 5s，对齐 Go observer.go:163 Client.Timeout）。
     #[must_use]
     pub fn from_config(config: &ObservatoryConfig, dispatcher: Arc<DefaultDispatcher>) -> Self {
-        Self::new(
-            dispatcher,
-            config.effective_probe_url(),
-            "GET",
-            5_000,
-        )
+        Self::new(dispatcher, config.effective_probe_url(), "GET", 5_000)
     }
 }
 
@@ -1451,7 +1340,7 @@ impl ProbeExecutor for RealOutboundProbeExecutor {
                     delay: 0,
                     last_error_reason: format!("parse probe url: {e}"),
                 };
-            }
+            },
         };
 
         let addr = match host.parse::<std::net::IpAddr>() {
@@ -1473,16 +1362,12 @@ impl ProbeExecutor for RealOutboundProbeExecutor {
         // runtime；Handle::current 在 blocking 线程池不可用）。
         std::thread::scope(|s| {
             s.spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build();
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
                 let Ok(rt) = rt else {
                     return ProbeResult {
                         alive: false,
                         delay: 0,
-                        last_error_reason: format!(
-                            "outbound '{tag}': probe runtime build failed"
-                        ),
+                        last_error_reason: format!("outbound '{tag}': probe runtime build failed"),
                     };
                 };
                 rt.block_on(async move {
@@ -1497,11 +1382,9 @@ impl ProbeExecutor for RealOutboundProbeExecutor {
                             return ProbeResult {
                                 alive: false,
                                 delay: 0,
-                                last_error_reason: format!(
-                                    "outbound '{tag}' dispatch failed: {e}"
-                                ),
+                                last_error_reason: format!("outbound '{tag}' dispatch failed: {e}"),
                             };
-                        }
+                        },
                     };
 
                     let mut conn = LinkConn::new(link);
@@ -1519,9 +1402,8 @@ impl ProbeExecutor for RealOutboundProbeExecutor {
                         .and_then(|r| r.map_err(|e| format!("tls handshake failed: {e}")));
                         match tls_res {
                             Ok(mut tls) => {
-                                http_probe_io(&mut tls, &method, url, &host, deadline, false)
-                                    .await
-                            }
+                                http_probe_io(&mut tls, &method, url, &host, deadline, false).await
+                            },
                             Err(reason) => Err(reason),
                         }
                     } else {
@@ -1536,9 +1418,7 @@ impl ProbeExecutor for RealOutboundProbeExecutor {
                         Err(reason) => ProbeResult {
                             alive: false,
                             delay: 0,
-                            last_error_reason: format!(
-                                "outbound '{tag}' probe failed: {reason}"
-                            ),
+                            last_error_reason: format!("outbound '{tag}' probe failed: {reason}"),
                         },
                     }
                 })
@@ -1552,7 +1432,6 @@ impl ProbeExecutor for RealOutboundProbeExecutor {
         })
     }
 }
-
 
 /// 从 URL 解析 host、port、是否使用 TLS。
 ///
@@ -1574,17 +1453,13 @@ fn parse_url_host_port(url: &str) -> Result<(String, u16, bool), String> {
     let use_tls = scheme.eq_ignore_ascii_case("https");
 
     // 提取 host:port
-    let host_port = if let Some(pos) = rest.find('/') {
-        &rest[..pos]
-    } else {
-        rest
-    };
+    let host_port = if let Some(pos) = rest.find('/') { &rest[..pos] } else { rest };
 
     let (host, port) = if let Some(pos) = host_port.rfind(':') {
         let host = &host_port[..pos];
         let port_str = &host_port[pos + 1..];
-        let port = port_str.parse::<u16>()
-            .map_err(|e| format!("invalid port '{port_str}': {e}"))?;
+        let port =
+            port_str.parse::<u16>().map_err(|e| format!("invalid port '{port_str}': {e}"))?;
         (host.to_string(), port)
     } else {
         let default_port = if use_tls { 443 } else { 80 };
@@ -1643,9 +1518,10 @@ mod status_code_tests {
 
 #[cfg(test)]
 mod link_conn_tests {
-    use super::LinkConn;
     use xray_buf::pipe;
     use xray_transport::link::Link;
+
+    use super::LinkConn;
 
     /// LinkConn 状态机核心契约：写经 writer 槽位透传，读经 reader 槽位透传，
     /// EOF（pipe 写端关闭）读出 0 字节。
@@ -1678,5 +1554,4 @@ mod link_conn_tests {
         conn.read_to_end(&mut buf).await.unwrap();
         assert!(buf.starts_with(b"HTTP/1.1 204"), "got: {:?}", buf);
     }
-
 }

@@ -8,24 +8,27 @@
 //! 普通 HTTP 代理（`handlePlainHTTP`）+ keep-alive 循环 + 100 Continue + dispatch
 //! 留切片3（依赖 dispatcher + outbound manager）。
 
-use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    sync::Mutex,
+    task::JoinHandle,
+};
 use tracing::{info, warn};
-
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::port::Port;
+use xray_common::net::{address::Address, destination::Destination, port::Port};
 use xray_features::inbound::{InboundError, InboundHandler};
 
-use crate::config::ServerConfig;
-use crate::error::{HttpProxyError, Result};
+use crate::{
+    config::ServerConfig,
+    error::{HttpProxyError, Result},
+};
 
 /// HTTP 握手结果——包含解析出的目标、方法、请求行 target 和 headers。
 ///
@@ -114,11 +117,7 @@ impl HttpServer {
     /// 构造 HTTP 代理服务端。
     #[must_use]
     pub fn new(tag: impl Into<String>, config: ServerConfig) -> Self {
-        Self {
-            tag: tag.into(),
-            config,
-            slot: Mutex::new(None),
-        }
+        Self { tag: tag.into(), config, slot: Mutex::new(None) }
     }
 }
 
@@ -162,7 +161,7 @@ impl InboundHandler for HttpServer {
                                         "HTTP proxy handshake succeeded"
                                     );
                                     // 切片3: dispatch to outbound handler
-                                }
+                                },
                                 Err(e) => {
                                     warn!(
                                         tag = %tag,
@@ -170,14 +169,14 @@ impl InboundHandler for HttpServer {
                                         error = %e,
                                         "HTTP proxy handshake failed"
                                     );
-                                }
+                                },
                             }
                         });
-                    }
+                    },
                     Err(e) => {
                         warn!(tag = %tag, error = %e, "accept failed");
                         break;
-                    }
+                    },
                 }
             }
         });
@@ -203,7 +202,8 @@ impl InboundHandler for HttpServer {
 /// HTTP proxy 服务端握手。解析请求行 + 认证 + 解析目标。
 ///
 /// 返回 [`HandshakeResult`]（含 dest、method、target、headers）。
-/// CONNECT → 回 `200 Connection established`；非 CONNECT → 不回响应（由调用方处理 plain HTTP 转发）。
+/// CONNECT → 回 `200 Connection established`；非 CONNECT → 不回响应（由调用方处理 plain HTTP
+/// 转发）。
 ///
 /// ## 流程
 ///
@@ -294,20 +294,12 @@ where
         ));
     }
 
-
     // 5. 回 200（CONNECT）
     if method == "CONNECT" {
-        stream
-            .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
-            .await?;
+        stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await?;
     }
 
-    Ok(HandshakeResult {
-        dest,
-        method,
-        target,
-        headers,
-    })
+    Ok(HandshakeResult { dest, method, target, headers })
 }
 
 /// 单行（请求行/头部行）字节上限。Go `http.ReadRequest` 对请求行+headers 共享
@@ -374,7 +366,7 @@ fn parse_host_port(host_port: &str, default_port: u16) -> Result<Destination> {
                 Ok(port) => (h, port),
                 Err(_) => (host_port, default_port),
             }
-        }
+        },
         None => (host_port, default_port),
     };
 
@@ -405,18 +397,14 @@ fn parse_basic_auth(header_value: &str) -> Option<(String, String)> {
     let decoded = base64_decode(rest)?;
     let decoded_str = String::from_utf8(decoded).ok()?;
     let sep = decoded_str.find(':')?;
-    Some((
-        decoded_str[..sep].to_string(),
-        decoded_str[sep + 1..].to_string(),
-    ))
+    Some((decoded_str[..sep].to_string(), decoded_str[sep + 1..].to_string()))
 }
 
 /// 手写 base64 解码（标准编码，含 padding）。对应 Go `base64.StdEncoding.DecodeString`。
 ///
 /// 避免 crate 级 base64 依赖（ponytail：15 行手写 < 加 Cargo.toml 依赖）。
 fn base64_decode(input: &str) -> Option<Vec<u8>> {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let input = input.trim_end_matches('=');
     let mut out = Vec::with_capacity(input.len() * 3 / 4);
     let mut buf = 0u32;
@@ -434,14 +422,17 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+
     use super::*;
     use crate::config::Account;
-    use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
 
     // ===== base64 / parse_host_port 纯函数测试 =====
 
@@ -483,7 +474,8 @@ mod tests {
 
     // ===== TCP 端到端 handshake 测试 =====
 
-    /// 简化 helper：bind TCP listener, client 发请求字节, server 跑 handshake, 返回 (response_str, result)
+    /// 简化 helper：bind TCP listener, client 发请求字节, server 跑 handshake, 返回 (response_str,
+    /// result)
     async fn tcp_handshake(
         request: &[u8],
         config: ServerConfig,
@@ -524,7 +516,8 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_connect_valid_auth_200() {
-        let req = b"CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n";
+        let req =
+            b"CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n";
         let mut cfg = ServerConfig::default();
         cfg.accounts.insert("user".into(), "pass".into());
         let (resp, result) = tcp_handshake(req, cfg).await;
@@ -732,14 +725,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let addr = format!("127.0.0.1:{port}");
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            TcpStream::connect(&addr),
-        )
-        .await;
+        let result = tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(&addr)).await;
         match result {
             Ok(Ok(_)) => panic!("listener should be closed after close()"),
-            Ok(Err(_)) | Err(_) => {}
+            Ok(Err(_)) | Err(_) => {},
         }
     }
 }

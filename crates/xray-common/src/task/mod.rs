@@ -2,8 +2,7 @@
 //!
 //! 对应 Go 版本 `common/task` 包，提供周期性任务执行器。
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use crate::errors::Error;
 
@@ -18,10 +17,7 @@ pub struct Periodic {
 impl Periodic {
     /// 创建新的周期性任务，指定执行间隔。
     pub fn new(interval: Duration) -> Self {
-        Self {
-            interval,
-            running: Arc::new(std::sync::Mutex::new(false)),
-        }
+        Self { interval, running: Arc::new(std::sync::Mutex::new(false)) }
     }
 
     /// 启动周期性任务，传入任务回调函数。
@@ -37,7 +33,8 @@ impl Periodic {
         F: Fn() -> Result<(), Error> + Send + Sync + 'static,
     {
         {
-            let mut running = self.running.lock().map_err(|_| Error::new("running lock poisoned"))?;
+            let mut running =
+                self.running.lock().map_err(|_| Error::new("running lock poisoned"))?;
             if *running {
                 return Err(Error::new("periodic task is already running"));
             }
@@ -60,13 +57,13 @@ impl Periodic {
                 }
 
                 match task() {
-                    Ok(()) => {}
+                    Ok(()) => {},
                     Err(_) => {
                         if let Ok(mut r) = running.lock() {
                             *r = false;
                         }
                         break;
-                    }
+                    },
                 }
 
                 tokio::time::sleep(interval).await;
@@ -139,8 +136,7 @@ where
         return Ok(());
     }
     // 用 Arc<Mutex<Option<Error>>> 共享首个错误。
-    let first_err: Arc<parking_lot::Mutex<Option<Error>>> =
-        Arc::new(parking_lot::Mutex::new(None));
+    let first_err: Arc<parking_lot::Mutex<Option<Error>>> = Arc::new(parking_lot::Mutex::new(None));
 
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(tasks.len());
@@ -161,11 +157,7 @@ where
     });
 
     let mut slot = first_err.lock();
-    if slot.is_some() {
-        Err(slot.take().expect("checked"))
-    } else {
-        Ok(())
-    }
+    if slot.is_some() { Err(slot.take().expect("checked")) } else { Ok(()) }
 }
 
 /// 并行调用 `f(0..n-1)`，按可用 CPU 数分块。
@@ -180,14 +172,9 @@ where
     if n == 0 {
         return Ok(());
     }
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(16)
-        .min(n);
+    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(16).min(n);
     let chunk = (n + workers - 1) / workers;
-    let first_err: Arc<parking_lot::Mutex<Option<Error>>> =
-        Arc::new(parking_lot::Mutex::new(None));
+    let first_err: Arc<parking_lot::Mutex<Option<Error>>> = Arc::new(parking_lot::Mutex::new(None));
     // 多 worker 共享同一 f。
     let f = std::sync::Arc::new(f);
 
@@ -218,18 +205,19 @@ where
     });
 
     let mut slot = first_err.lock();
-    if slot.is_some() {
-        Err(slot.take().expect("checked"))
-    } else {
-        Ok(())
-    }
+    if slot.is_some() { Err(slot.take().expect("checked")) } else { Ok(()) }
 }
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-    use std::time::Duration;
 
     #[test]
     fn test_periodic_new() {
@@ -279,10 +267,12 @@ mod tests {
         // 第二次启动应返回错误
         let counter2 = Arc::new(AtomicUsize::new(0));
         let counter2_clone = counter2.clone();
-        let result = periodic.start(move || {
-            counter2_clone.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }).await;
+        let result = periodic
+            .start(move || {
+                counter2_clone.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
 
         assert!(result.is_err());
         periodic.stop();
@@ -317,9 +307,10 @@ mod tests {
         periodic.stop();
         assert!(!periodic.is_running());
     }
-    use super::{Run, OnSuccess, ParallelForN, Close, Closable};
-    use crate::errors::Error;
     use parking_lot::Mutex;
+
+    use super::{Closable, Close, OnSuccess, ParallelForN, Run};
+    use crate::errors::Error;
 
     #[test]
     fn test_run_empty() {
@@ -431,13 +422,8 @@ mod tests {
 
     #[test]
     fn test_parallel_for_n_error() {
-        let result = ParallelForN(1000, |i| {
-            if i == 42 {
-                Err(Error::new("boom at 42"))
-            } else {
-                Ok(())
-            }
-        });
+        let result =
+            ParallelForN(1000, |i| if i == 42 { Err(Error::new("boom at 42")) } else { Ok(()) });
         assert!(result.is_err());
     }
 

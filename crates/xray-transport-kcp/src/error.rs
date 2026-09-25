@@ -47,10 +47,7 @@ mod tests {
     fn display_messages_match_go() {
         assert_eq!(KcpError::IoTimeout.to_string(), "Read/Write timeout");
         assert_eq!(KcpError::ClosedListener.to_string(), "Listener closed");
-        assert_eq!(
-            KcpError::ClosedConnection.to_string(),
-            "Connection closed"
-        );
+        assert_eq!(KcpError::ClosedConnection.to_string(), "Connection closed");
     }
 
     #[test]

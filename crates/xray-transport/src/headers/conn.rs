@@ -1,9 +1,8 @@
 //! # Header 连接包装 + 装配（4t8）
 //!
 //! 对应 Go `transport/internet/headers/http/http.go:159-308`：
-//! - `Conn`（http.go:159-236）→ [`HeaderConn`]：异步连接包装——
-//!   读侧首次读消费对端 header（可选校验 URI），写侧首写注入己方 header，
-//!   shutdown 前若响应未发且请求无效则写 400/404 错误响应。
+//! - `Conn`（http.go:159-236）→ [`HeaderConn`]：异步连接包装—— 读侧首次读消费对端 header（可选校验
+//!   URI），写侧首写注入己方 header， shutdown 前若响应未发且请求无效则写 400/404 错误响应。
 //! - `Authenticator.Client(conn)`（http.go:284-298）→ [`HeaderConn::client`]
 //! - `Authenticator.Server(conn)`（http.go:300-308）→ [`HeaderConn::server`]
 //!
@@ -18,20 +17,26 @@
 //! noop 兜底：`type:"none"` / 无 `header` 字段 → 返回 `None` 不包装
 //! （Go `noop.NoOpConnectionHeader.Client/Server` 直接返回原 conn，noop.go:25-31）。
 
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::connection::Connection;
-use crate::headers::authenticator::{
-    HeaderAuthenticator, HeaderConfig, HeaderError, RequestConfig, ResponseConfig,
-};
-use crate::headers::http::{
-    default_resp_400, default_resp_404, render_response, HeaderReader, HttpAuthenticator,
+use crate::{
+    connection::Connection,
+    headers::{
+        authenticator::{
+            HeaderAuthenticator, HeaderConfig, HeaderError, RequestConfig, ResponseConfig,
+        },
+        http::{
+            HeaderReader, HttpAuthenticator, default_resp_400, default_resp_404, render_response,
+        },
+    },
 };
 
 /// Header 包装连接。对应 Go `http.Conn`（http.go:159-236）。
@@ -62,9 +67,7 @@ impl<C> HeaderConn<C> {
     /// - 关闭时不写错误响应（三个 error writer 均 NoOp）。
     pub fn client(inner: C, auth: &HttpAuthenticator) -> Self {
         let (has_request, has_response) = (auth.request().is_some(), auth.response().is_some());
-        let header = has_response
-            .then(|| auth.client_header())
-            .filter(|h| !h.is_empty());
+        let header = has_response.then(|| auth.client_header()).filter(|h| !h.is_empty());
         Self {
             inner,
             reader: has_request.then(HeaderReader::new),
@@ -80,8 +83,8 @@ impl<C> HeaderConn<C> {
     /// 服务端包装。对应 Go `Authenticator.Server`（http.go:300-308）：
     /// - 读侧总是消费 client 的 request header；`config.request` 存在时校验 URI；
     /// - 写侧首写注入 response header；
-    /// - 关闭时若响应未发：PathMismatch → 404，其余 → 400
-    ///   （Go `errorMismatchWriter=resp404` / `errorWriter=errorTooLongWriter=resp400`）。
+    /// - 关闭时若响应未发：PathMismatch → 404，其余 → 400 （Go `errorMismatchWriter=resp404` /
+    ///   `errorWriter=errorTooLongWriter=resp400`）。
     pub fn server(inner: C, auth: &HttpAuthenticator) -> Self {
         let header = auth.server_header();
         Self {
@@ -100,9 +103,11 @@ impl<C> HeaderConn<C> {
 impl<C: Connection + Unpin> AsyncRead for HeaderConn<C> {
     /// 对应 Go `Conn.Read`（http.go:182-203）：one-time 读对端 header，
     /// 回放其后 payload，之后透传。
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>)
-        -> Poll<io::Result<()>>
-    {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
         // 1. 回放 header 后的 payload（Go readBuffer）。
@@ -146,17 +151,17 @@ impl<C: Connection + Unpin> AsyncRead for HeaderConn<C> {
                                     this.replay = Some(body[n..].to_vec());
                                 }
                                 return Poll::Ready(Ok(()));
-                            }
+                            },
                             Ok(None) => {
                                 buf.clear(); // 字节已被 reader 消费，等下一轮。
-                            }
+                            },
                             Err(e) => {
                                 this.err_reason = Some(e.clone());
                                 this.reader = None;
                                 return Poll::Ready(Err(to_io_err(&e)));
-                            }
+                            },
                         }
-                    }
+                    },
                 }
             }
         }
@@ -168,9 +173,11 @@ impl<C: Connection + Unpin> AsyncRead for HeaderConn<C> {
 
 impl<C: Connection + Unpin> AsyncWrite for HeaderConn<C> {
     /// 对应 Go `Conn.Write`（http.go:206-216）：首写先发完 header 前缀再发 payload。
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8])
-        -> Poll<io::Result<usize>>
-    {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         if let Some((hdr, off)) = &mut this.prefix {
             while *off < hdr.len() {
@@ -181,8 +188,8 @@ impl<C: Connection + Unpin> AsyncWrite for HeaderConn<C> {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::WriteZero,
                             "header prefix write zero",
-                        )))
-                    }
+                        )));
+                    },
                     Poll::Ready(Ok(n)) => *off += n,
                 }
             }
@@ -216,8 +223,8 @@ impl<C: Connection + Unpin> AsyncWrite for HeaderConn<C> {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::WriteZero,
                             "close error-response write zero",
-                        )))
-                    }
+                        )));
+                    },
                     Poll::Ready(Ok(n)) => *off += n,
                 }
             }
@@ -231,12 +238,15 @@ impl<C: Connection> Connection for HeaderConn<C> {
     fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
         self.inner.remote_addr()
     }
+
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         self.inner.local_addr()
     }
+
     fn close_read(&mut self) -> io::Result<()> {
         self.inner.close_read()
     }
+
     fn close_write(&mut self) -> io::Result<()> {
         self.inner.close_write()
     }
@@ -252,12 +262,14 @@ fn to_io_err(e: &HeaderError) -> io::Error {
 
 // ===== 装配 =====
 
-/// 出站装配：`Box<dyn Connection>` → client 包装（Go `tcp/dialer.go:114` `conn = auth.Client(conn)`）。
+/// 出站装配：`Box<dyn Connection>` → client 包装（Go `tcp/dialer.go:114` `conn =
+/// auth.Client(conn)`）。
 pub fn wrap_client(conn: Box<dyn Connection>, auth: &HttpAuthenticator) -> Box<dyn Connection> {
     Box::new(HeaderConn::client(conn, auth))
 }
 
-/// 入站装配：`Box<dyn Connection>` → server 包装（Go `tcp/hub.go:126` `conn = v.authConfig.Server(conn)`）。
+/// 入站装配：`Box<dyn Connection>` → server 包装（Go `tcp/hub.go:126` `conn =
+/// v.authConfig.Server(conn)`）。
 pub fn wrap_server(conn: Box<dyn Connection>, auth: &HttpAuthenticator) -> Box<dyn Connection> {
     Box::new(HeaderConn::server(conn, auth))
 }
@@ -289,9 +301,10 @@ pub fn auth_from_json(
     }
 }
 
-/// `header` JSON → [`HeaderConfig`]。对应 Go `conf.Authenticator.Build`（transport_authenticators.go:193-208）：
-/// request/response 均以 Chrome 默认起步，JSON 字段**覆盖式**合并
-/// （Go 语义：`headers` 给了就整体替换默认 12/5 个，非逐项合并）。
+/// `header` JSON → [`HeaderConfig`]。对应 Go
+/// `conf.Authenticator.Build`（transport_authenticators.go:193-208）： request/response 均以 Chrome
+/// 默认起步，JSON 字段**覆盖式**合并 （Go 语义：`headers` 给了就整体替换默认 12/5
+/// 个，非逐项合并）。
 fn build_header_config(header: &serde_json::Value) -> io::Result<HeaderConfig> {
     let mut request = RequestConfig::chrome_default();
     if let Some(rj) = header.get("request").filter(|v| v.is_object()) {
@@ -301,10 +314,7 @@ fn build_header_config(header: &serde_json::Value) -> io::Result<HeaderConfig> {
     if let Some(rj) = header.get("response").filter(|v| v.is_object()) {
         apply_response_overrides(&mut response, rj)?;
     }
-    Ok(HeaderConfig {
-        request: Some(request),
-        response: Some(response),
-    })
+    Ok(HeaderConfig { request: Some(request), response: Some(response) })
 }
 
 /// Go `AuthenticatorRequest.Build` 覆盖逻辑（transport_authenticators.go:90-115）。
@@ -329,10 +339,7 @@ fn apply_request_overrides(req: &mut RequestConfig, json: &serde_json::Value) ->
 }
 
 /// Go `AuthenticatorResponse.Build` 覆盖逻辑（transport_authenticators.go:153-183）。
-fn apply_response_overrides(
-    resp: &mut ResponseConfig,
-    json: &serde_json::Value,
-) -> io::Result<()> {
+fn apply_response_overrides(resp: &mut ResponseConfig, json: &serde_json::Value) -> io::Result<()> {
     if let Some(v) = json.get("version").and_then(serde_json::Value::as_str) {
         if !v.is_empty() {
             resp.version = Some(v.to_string());
@@ -381,20 +388,19 @@ fn apply_header_map_override(
 fn string_list(v: Option<&serde_json::Value>) -> Option<Vec<String>> {
     match v? {
         serde_json::Value::String(s) => Some(vec![s.clone()]),
-        serde_json::Value::Array(a) => Some(
-            a.iter()
-                .filter_map(|x| x.as_str().map(str::to_string))
-                .collect(),
-        ),
+        serde_json::Value::Array(a) => {
+            Some(a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        },
         _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
     use crate::connection::DuplexConnection;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// 构造一对 (client 侧, server 侧) Connection 用于回环测试。
     fn duplex_pair() -> (DuplexConnection, DuplexConnection) {
@@ -420,17 +426,11 @@ mod tests {
         client.write_all(b"ping").await.expect("client write");
         // 流语义（Go http_test 用 io.ReadFull）：单次 read 不保证全量。
         let mut buf = [0u8; 4];
-        server
-            .read_exact(&mut buf)
-            .await
-            .expect("server read（吞 request header）");
+        server.read_exact(&mut buf).await.expect("server read（吞 request header）");
         assert_eq!(&buf, b"ping");
 
         server.write_all(b"pong").await.expect("server write（注入 response header）");
-        client
-            .read_exact(&mut buf)
-            .await
-            .expect("client read（吞 response header）");
+        client.read_exact(&mut buf).await.expect("client read（吞 response header）");
         assert_eq!(&buf, b"pong");
     }
 
@@ -450,10 +450,7 @@ mod tests {
 
         let mut buf = [0u8; 16];
         let err = server.read(&mut buf).await.expect_err("path 不匹配应报错");
-        assert!(
-            err.to_string().contains("mismatch"),
-            "错误应为 mismatch，实际 {err}"
-        );
+        assert!(err.to_string().contains("mismatch"), "错误应为 mismatch，实际 {err}");
 
         // shutdown 应写 404 再关。
         server.shutdown().await.expect("shutdown");
@@ -517,15 +514,11 @@ mod tests {
     fn auth_json_none_and_missing() {
         assert!(auth_from_json(None).unwrap().is_none(), "无 transport_json");
         assert!(
-            auth_from_json(Some(&serde_json::json!({"tcpSettings": {}})))
-                .unwrap()
-                .is_none(),
+            auth_from_json(Some(&serde_json::json!({"tcpSettings": {}}))).unwrap().is_none(),
             "无 header 字段"
         );
         assert!(
-            auth_from_json(Some(&serde_json::json!({"header": null})))
-                .unwrap()
-                .is_none(),
+            auth_from_json(Some(&serde_json::json!({"header": null}))).unwrap().is_none(),
             "header null"
         );
         assert!(
@@ -575,10 +568,7 @@ mod tests {
 
         let server = auth.server_header();
         let text = String::from_utf8_lossy(&server);
-        assert!(
-            text.starts_with("HTTP/1.1 204 No Content\r\n"),
-            "响应首行应 204，实际 {text:?}"
-        );
+        assert!(text.starts_with("HTTP/1.1 204 No Content\r\n"), "响应首行应 204，实际 {text:?}");
         assert_eq!(auth.expected_request_uris(), vec!["/upload", "/submit"]);
     }
 

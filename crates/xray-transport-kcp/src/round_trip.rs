@@ -71,11 +71,7 @@ impl RoundTripInfo {
             state.variation = rtt / 2;
         } else {
             // delta := |srtt - rtt|（u32 wrap-safe）
-            let delta = if state.srtt > rtt {
-                state.srtt - rtt
-            } else {
-                rtt - state.srtt
-            };
+            let delta = if state.srtt > rtt { state.srtt - rtt } else { rtt - state.srtt };
             state.variation = (3 * state.variation + delta) / 4;
             state.srtt = (7 * state.srtt + rtt) / 8;
             if state.srtt < state.min_rtt {

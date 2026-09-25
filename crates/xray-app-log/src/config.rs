@@ -1,8 +1,9 @@
 //! xray-app-log 配置 + LogType/SeverityLevel 枚举。
 
-use xray_proto::xray::app::log::Config as ProtoConfig;
-use xray_proto::xray::app::log::LogType as ProtoLogType;
-use xray_proto::xray::common::log::Severity as ProtoSeverity;
+use xray_proto::xray::{
+    app::log::{Config as ProtoConfig, LogType as ProtoLogType},
+    common::log::Severity as ProtoSeverity,
+};
 
 use crate::error::LogError;
 
@@ -131,11 +132,7 @@ pub enum LogFormat {
 impl LogFormat {
     /// 从配置字符串解析：`"json"` → Json，其余（含空）→ Console。
     pub fn parse(s: &str) -> Self {
-        if s.eq_ignore_ascii_case("json") {
-            Self::Json
-        } else {
-            Self::Console
-        }
+        if s.eq_ignore_ascii_case("json") { Self::Json } else { Self::Console }
     }
 }
 
@@ -231,14 +228,8 @@ mod tests {
 
     #[test]
     fn severity_from_proto_i32() {
-        assert_eq!(
-            SeverityLevel::from_proto_i32(0).unwrap(),
-            SeverityLevel::Unknown
-        );
-        assert_eq!(
-            SeverityLevel::from_proto_i32(4).unwrap(),
-            SeverityLevel::Debug
-        );
+        assert_eq!(SeverityLevel::from_proto_i32(0).unwrap(), SeverityLevel::Unknown);
+        assert_eq!(SeverityLevel::from_proto_i32(4).unwrap(), SeverityLevel::Debug);
         assert!(SeverityLevel::from_proto_i32(7).is_err());
     }
 

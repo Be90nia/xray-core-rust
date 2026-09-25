@@ -747,10 +747,9 @@ mod tests {
                 }
             });
         });
-        let listener =
-            listen_ws("127.0.0.1:0".parse().unwrap(), &settings, &handler, Vec::new())
-                .await
-                .expect("listen_ws");
+        let listener = listen_ws("127.0.0.1:0".parse().unwrap(), &settings, &handler, Vec::new())
+            .await
+            .expect("listen_ws");
         let addr = listener.local_addr().expect("local_addr");
 
         let dest = Destination::new(
@@ -774,12 +773,7 @@ mod tests {
                 .await
                 .expect("echo timeout")
                 .expect("read ok");
-            assert!(
-                n > 0,
-                "echo closed early at {}/{} bytes",
-                got.len(),
-                payload.len()
-            );
+            assert!(n > 0, "echo closed early at {}/{} bytes", got.len(), payload.len());
             got.extend_from_slice(&buf[..n]);
         }
         assert_eq!(&got, payload);
@@ -791,10 +785,9 @@ mod tests {
     async fn close_rejects_new_connections() {
         let settings = StreamSettings { protocol: "websocket".into(), ..Default::default() };
         let handler: ConnHandler = Arc::new(|_| {});
-        let listener =
-            listen_ws("127.0.0.1:0".parse().unwrap(), &settings, &handler, Vec::new())
-                .await
-                .expect("listen_ws");
+        let listener = listen_ws("127.0.0.1:0".parse().unwrap(), &settings, &handler, Vec::new())
+            .await
+            .expect("listen_ws");
         let addr = listener.local_addr().expect("local_addr");
 
         listener.close().expect("close");

@@ -12,13 +12,8 @@
 use std::sync::Arc;
 
 use xray_app_dispatcher::default::DialFn;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-use xray_transport::connection::Connection;
-use xray_transport::sockopt::SocketOptions;
-use xray_transport::system_dialer::dial_system;
+use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
+use xray_transport::{connection::Connection, sockopt::SocketOptions, system_dialer::dial_system};
 
 use crate::config::{Config, PredefinedAddress};
 
@@ -58,11 +53,7 @@ impl DokodemoOutboundConfig {
         } else {
             Network::UDP
         };
-        Some(Self {
-            address,
-            port: Port::new(port),
-            network,
-        })
+        Some(Self { address, port: Port::new(port), network })
     }
 
     /// 直接从地址/端口/网络类型构造。
@@ -78,11 +69,7 @@ impl DokodemoOutboundConfig {
                  (Go parity — Unix dial via this outbound is not implemented)"
             );
         }
-        Self {
-            address,
-            port,
-            network,
-        }
+        Self { address, port, network }
     }
 
     /// 返回目标 Destination。
@@ -110,9 +97,8 @@ pub fn make_dokodemo_dial_fn(config: DokodemoOutboundConfig) -> DialFn {
         let target = config.destination();
         Box::pin(async move {
             let sockopt = SocketOptions::default();
-            let conn: Box<dyn Connection> = dial_system(&target, &sockopt)
-                .await
-                .map_err(|e| format!("dokodemo dial: {e}"))?;
+            let conn: Box<dyn Connection> =
+                dial_system(&target, &sockopt).await.map_err(|e| format!("dokodemo dial: {e}"))?;
             Ok(conn)
         })
     })
@@ -120,15 +106,15 @@ pub fn make_dokodemo_dial_fn(config: DokodemoOutboundConfig) -> DialFn {
 
 #[cfg(test)]
 mod tests {
+    use xray_proto::xray::common::net::{
+        IpOrDomain as ProtoIpOrDomain, ip_or_domain::Address as ProtoAddress,
+    };
+
     use super::*;
-    use xray_proto::xray::common::net::ip_or_domain::Address as ProtoAddress;
-    use xray_proto::xray::common::net::IpOrDomain as ProtoIpOrDomain;
 
     fn make_ipv4_config(ip: [u8; 4], port: u32) -> Config {
         Config {
-            rewrite_address: Some(ProtoIpOrDomain {
-                address: Some(ProtoAddress::Ip(ip.to_vec())),
-            }),
+            rewrite_address: Some(ProtoIpOrDomain { address: Some(ProtoAddress::Ip(ip.to_vec())) }),
             rewrite_port: port,
             allowed_networks: vec![crate::config::Network::Tcp],
             ..Default::default()

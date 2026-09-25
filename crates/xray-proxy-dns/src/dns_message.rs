@@ -97,18 +97,9 @@ pub fn parse_dns_query(bytes: &[u8]) -> Result<(DnsHeader, DnsQuestion)> {
     let an_count = u16::from_be_bytes([bytes[6], bytes[7]]);
     let ns_count = u16::from_be_bytes([bytes[8], bytes[9]]);
     let ar_count = u16::from_be_bytes([bytes[10], bytes[11]]);
-    let header = DnsHeader {
-        id,
-        flags,
-        qd_count,
-        an_count,
-        ns_count,
-        ar_count,
-    };
+    let header = DnsHeader { id, flags, qd_count, an_count, ns_count, ar_count };
     if qd_count == 0 {
-        return Err(DnsProxyError::InvalidConfig(
-            "DNS message has no question (QDCOUNT=0)".into(),
-        ));
+        return Err(DnsProxyError::InvalidConfig("DNS message has no question (QDCOUNT=0)".into()));
     }
     let (name, offset) = parse_qname(bytes, 12)?;
     if offset + 4 > bytes.len() {
@@ -118,14 +109,7 @@ pub fn parse_dns_query(bytes: &[u8]) -> Result<(DnsHeader, DnsQuestion)> {
     }
     let q_type = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
     let q_class = u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]);
-    Ok((
-        header,
-        DnsQuestion {
-            name,
-            q_type,
-            q_class,
-        },
-    ))
+    Ok((header, DnsQuestion { name, q_type, q_class }))
 }
 
 /// 解析 QNAME 为可读 domain 字符串。
@@ -157,9 +141,7 @@ fn parse_qname(bytes: &[u8], mut offset: usize) -> Result<(String, usize)> {
             ));
         }
         if len > 63 {
-            return Err(DnsProxyError::InvalidConfig(format!(
-                "QNAME label too long: {len} > 63"
-            )));
+            return Err(DnsProxyError::InvalidConfig(format!("QNAME label too long: {len} > 63")));
         }
         offset += 1;
         if offset + len > bytes.len() {
@@ -173,9 +155,7 @@ fn parse_qname(bytes: &[u8], mut offset: usize) -> Result<(String, usize)> {
         offset += len;
         hops += 1;
         if hops > 127 {
-            return Err(DnsProxyError::InvalidConfig(
-                "QNAME too many labels: > 127".into(),
-            ));
+            return Err(DnsProxyError::InvalidConfig("QNAME too many labels: > 127".into()));
         }
     }
     Ok((labels.join("."), offset))
@@ -276,11 +256,11 @@ pub fn build_ip_response(
             std::net::IpAddr::V4(v4) => {
                 buf.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH=4
                 buf.extend_from_slice(&v4.octets());
-            }
+            },
             std::net::IpAddr::V6(v6) => {
                 buf.extend_from_slice(&16u16.to_be_bytes()); // RDLENGTH=16
                 buf.extend_from_slice(&v6.octets());
-            }
+            },
         }
     }
     buf
@@ -400,7 +380,7 @@ mod tests {
             0x01, 0x00, // flags
             0x00, 0x01, // QDCOUNT
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // counts
-            64, // label length = 64 > 63
+            64,   // label length = 64 > 63
         ];
         bytes.extend_from_slice(&[b'a'; 64]); // label bytes
         bytes.push(0); // QNAME 终止
@@ -497,10 +477,8 @@ mod tests {
     fn build_ip_response_with_a_records() {
         let query = make_dns_a_query("example.com");
         let (header, question) = parse_dns_query(&query).unwrap();
-        let ips: Vec<std::net::IpAddr> = vec![
-            "1.2.3.4".parse().unwrap(),
-            "5.6.7.8".parse().unwrap(),
-        ];
+        let ips: Vec<std::net::IpAddr> =
+            vec!["1.2.3.4".parse().unwrap(), "5.6.7.8".parse().unwrap()];
         let resp = build_ip_response(&header, &question, &ips, 300);
         // 验证响应可解析
         let (resp_header, resp_question) = parse_dns_query(&resp).unwrap();
@@ -511,7 +489,8 @@ mod tests {
         // 验证 A 记录数据（手动检查 RDATA）
         // Answer section 在 Question section 之后
         let qname_end = 12 + "example.com".len() + 2 + 4; // header + qname + qtype + qclass
-        // 第一个 A 记录：压缩指针(2B) + TYPE(2B) + CLASS(2B) + TTL(4B) + RDLENGTH(2B) + RDATA(4B) = 16B
+        // 第一个 A 记录：压缩指针(2B) + TYPE(2B) + CLASS(2B) + TTL(4B) + RDLENGTH(2B) + RDATA(4B) =
+        // 16B
         let rec1_start = qname_end;
         assert_eq!(resp[rec1_start], 0xC0); // 压缩指针
         assert_eq!(resp[rec1_start + 2..rec1_start + 4], [0, 1]); // TYPE=A
@@ -529,9 +508,7 @@ mod tests {
         let qtype_offset = query.len() - 4;
         query[qtype_offset..qtype_offset + 2].copy_from_slice(&28u16.to_be_bytes());
         let (header, question) = parse_dns_query(&query).unwrap();
-        let ips: Vec<std::net::IpAddr> = vec![
-            "::1".parse().unwrap(),
-        ];
+        let ips: Vec<std::net::IpAddr> = vec!["::1".parse().unwrap()];
         let resp = build_ip_response(&header, &question, &ips, 60);
         let (resp_header, _) = parse_dns_query(&resp).unwrap();
         assert_eq!(resp_header.an_count, 1);

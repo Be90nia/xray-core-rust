@@ -32,10 +32,7 @@ pub const TOKEN_LEN: usize = 32;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Authenticate（仅切片1 用于客户端发送）。
-    Authenticate {
-        uuid_bytes: [u8; 16],
-        token: [u8; TOKEN_LEN],
-    },
+    Authenticate { uuid_bytes: [u8; 16], token: [u8; TOKEN_LEN] },
     /// Connect（TCP relay 切片1 核心）。
     Connect(Address),
     /// Dissociate（关闭 UDP 关联，预留）。
@@ -66,10 +63,10 @@ impl Command {
             Self::Authenticate { uuid_bytes, token } => {
                 buf.put_slice(uuid_bytes);
                 buf.put_slice(token);
-            }
+            },
             Self::Connect(addr) => addr.write_to(buf),
             Self::Dissociate { assoc_id } => buf.put_u16(*assoc_id),
-            Self::Heartbeat => {}
+            Self::Heartbeat => {},
         }
     }
 
@@ -102,19 +99,17 @@ impl Command {
                 let mut token = [0u8; TOKEN_LEN];
                 buf.copy_to_slice(&mut token);
                 Ok(Self::Authenticate { uuid_bytes, token })
-            }
+            },
             type_code::CONNECT => {
                 let addr = Address::read_from(buf)?;
                 Ok(Self::Connect(addr))
-            }
+            },
             type_code::DISSOCIATE => {
                 if buf.remaining() < 2 {
                     return Err(TuicError::UnexpectedEof("dissociate assoc_id"));
                 }
-                Ok(Self::Dissociate {
-                    assoc_id: buf.get_u16(),
-                })
-            }
+                Ok(Self::Dissociate { assoc_id: buf.get_u16() })
+            },
             type_code::HEARTBEAT => Ok(Self::Heartbeat),
             other => Err(TuicError::UnknownCommandType(other)),
         }
@@ -137,9 +132,10 @@ pub fn parse_header<B: Buf>(buf: &mut B) -> Result<u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use super::*;
     use crate::protocol::address::Address;
-    use std::net::Ipv4Addr;
 
     fn roundtrip(cmd: &Command) {
         let mut buf = Vec::with_capacity(cmd.encoded_len());
@@ -153,10 +149,7 @@ mod tests {
 
     #[test]
     fn authenticate_roundtrip() {
-        let cmd = Command::Authenticate {
-            uuid_bytes: [0xab; 16],
-            token: [0xcd; TOKEN_LEN],
-        };
+        let cmd = Command::Authenticate { uuid_bytes: [0xab; 16], token: [0xcd; TOKEN_LEN] };
         roundtrip(&cmd);
     }
 

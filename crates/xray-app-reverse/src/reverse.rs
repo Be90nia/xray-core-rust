@@ -2,9 +2,11 @@
 //!
 //! 对应 Go `app/reverse/reverse.go` 的 `Reverse` struct。
 
-use crate::bridge::{Bridge, BridgeFactory, Portal, PortalFactory};
-use crate::config::ReverseConfig;
-use crate::error::{at_error, at_warning, ReverseError};
+use crate::{
+    bridge::{Bridge, BridgeFactory, Portal, PortalFactory},
+    config::ReverseConfig,
+    error::{ReverseError, at_error, at_warning},
+};
 
 /// Reverse：根编排类。
 ///
@@ -18,11 +20,7 @@ pub struct Reverse<B, P> {
 
 impl<B: Bridge, P: Portal> Reverse<B, P> {
     pub fn new(config: ReverseConfig) -> Self {
-        Self {
-            config,
-            bridges: Vec::new(),
-            portals: Vec::new(),
-        }
+        Self { config, bridges: Vec::new(), portals: Vec::new() }
     }
 
     pub fn config(&self) -> &ReverseConfig {
@@ -110,13 +108,17 @@ impl<B: Bridge, P: Portal> Reverse<B, P> {
 // [`ReverseFeature::set_deps`] 注入（对应 Go core.RequireFeatures）后 start。
 // ===========================================================================
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use xray_features::{Feature, FeatureError};
 
-use crate::bridge::{LinkDispatch, RuntimeBridge, RuntimePortal};
-use crate::outbound::OutboundRegistrar;
+use crate::{
+    bridge::{LinkDispatch, RuntimeBridge, RuntimePortal},
+    outbound::OutboundRegistrar,
+};
 
 /// Reverse 运行时依赖（对应 Go `core.RequireFeatures(routing.Dispatcher, outbound.Manager)`）。
 #[derive(Clone)]
@@ -175,10 +177,7 @@ impl ReverseFeature {
         dispatcher: Arc<dyn LinkDispatch>,
         registrar: Arc<dyn OutboundRegistrar>,
     ) {
-        *self.deps.write() = Some(ReverseDeps {
-            dispatcher,
-            registrar,
-        });
+        *self.deps.write() = Some(ReverseDeps { dispatcher, registrar });
     }
 
     pub fn config(&self) -> &ReverseConfig {
@@ -209,10 +208,7 @@ impl Feature for ReverseFeature {
         }
         let mut reverse = Reverse::new(self.config.clone());
         reverse
-            .init(
-                &RuntimeBridgeFactory(deps.dispatcher),
-                &RuntimePortalFactory(deps.registrar),
-            )
+            .init(&RuntimeBridgeFactory(deps.dispatcher), &RuntimePortalFactory(deps.registrar))
             .map_err(err)?;
         reverse.start().map_err(err)?;
         *self.inner.write() = Some(reverse);
@@ -233,11 +229,15 @@ impl Feature for ReverseFeature {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::bridge::{validate_bridge_config, validate_portal_config};
-    use crate::config::{BridgeConfig, PortalConfig};
-    use parking_lot::Mutex;
     use std::sync::Arc;
+
+    use parking_lot::Mutex;
+
+    use super::*;
+    use crate::{
+        bridge::{validate_bridge_config, validate_portal_config},
+        config::{BridgeConfig, PortalConfig},
+    };
 
     struct StubBridge {
         tag: String,
@@ -251,16 +251,20 @@ mod tests {
             *self.started.lock() = true;
             Ok(())
         }
+
         fn close(&self) -> Result<(), ReverseError> {
             *self.closed.lock() = true;
             Ok(())
         }
+
         fn worker_count(&self) -> usize {
             0
         }
+
         fn tag(&self) -> &str {
             &self.tag
         }
+
         fn domain(&self) -> &str {
             &self.domain
         }
@@ -278,13 +282,16 @@ mod tests {
             *self.started.lock() = true;
             Ok(())
         }
+
         fn close(&self) -> Result<(), ReverseError> {
             *self.closed.lock() = true;
             Ok(())
         }
+
         fn tag(&self) -> &str {
             &self.tag
         }
+
         fn domain(&self) -> &str {
             &self.domain
         }
@@ -293,6 +300,7 @@ mod tests {
     struct StubBridgeFactory;
     impl BridgeFactory for StubBridgeFactory {
         type Bridge = StubBridge;
+
         fn create(&self, cfg: &BridgeConfig) -> Result<StubBridge, ReverseError> {
             validate_bridge_config(cfg)?;
             Ok(StubBridge {
@@ -307,6 +315,7 @@ mod tests {
     struct StubPortalFactory;
     impl PortalFactory for StubPortalFactory {
         type Portal = StubPortal;
+
         fn create(&self, cfg: &PortalConfig) -> Result<StubPortal, ReverseError> {
             validate_portal_config(cfg)?;
             Ok(StubPortal {
@@ -320,14 +329,8 @@ mod tests {
 
     fn sample_config() -> ReverseConfig {
         ReverseConfig {
-            bridges: vec![BridgeConfig {
-                tag: "b1".into(),
-                domain: "b.example.com".into(),
-            }],
-            portals: vec![PortalConfig {
-                tag: "p1".into(),
-                domain: "p.example.com".into(),
-            }],
+            bridges: vec![BridgeConfig { tag: "b1".into(), domain: "b.example.com".into() }],
+            portals: vec![PortalConfig { tag: "p1".into(), domain: "p.example.com".into() }],
         }
     }
 
@@ -349,10 +352,7 @@ mod tests {
     #[test]
     fn init_invalid_bridge_returns_err() {
         let cfg = ReverseConfig {
-            bridges: vec![BridgeConfig {
-                tag: "".into(),
-                domain: "d".into(),
-            }],
+            bridges: vec![BridgeConfig { tag: "".into(), domain: "d".into() }],
             portals: vec![],
         };
         let mut r = Reverse::new(cfg);
@@ -364,10 +364,7 @@ mod tests {
     fn init_invalid_portal_returns_err() {
         let cfg = ReverseConfig {
             bridges: vec![],
-            portals: vec![PortalConfig {
-                tag: "t".into(),
-                domain: "".into(),
-            }],
+            portals: vec![PortalConfig { tag: "t".into(), domain: "".into() }],
         };
         let mut r = Reverse::new(cfg);
         let err = r.init(&StubBridgeFactory, &StubPortalFactory).unwrap_err();
@@ -405,15 +402,19 @@ mod tests {
             fn start(&self) -> Result<(), ReverseError> {
                 Ok(())
             }
+
             fn close(&self) -> Result<(), ReverseError> {
                 Err(ReverseError::WorkerStopped)
             }
+
             fn worker_count(&self) -> usize {
                 0
             }
+
             fn tag(&self) -> &str {
                 "fail"
             }
+
             fn domain(&self) -> &str {
                 "fail"
             }
@@ -422,6 +423,7 @@ mod tests {
         struct FailingBridgeFactory;
         impl BridgeFactory for FailingBridgeFactory {
             type Bridge = FailingBridge;
+
             fn create(&self, cfg: &BridgeConfig) -> Result<FailingBridge, ReverseError> {
                 validate_bridge_config(cfg)?;
                 Ok(FailingBridge)
@@ -429,10 +431,7 @@ mod tests {
         }
 
         let cfg = ReverseConfig {
-            bridges: vec![BridgeConfig {
-                tag: "f".into(),
-                domain: "f".into(),
-            }],
+            bridges: vec![BridgeConfig { tag: "f".into(), domain: "f".into() }],
             portals: vec![],
         };
         let mut r: Reverse<FailingBridge, StubPortal> = Reverse::new(cfg);
@@ -456,12 +455,15 @@ mod tests {
 
 #[cfg(test)]
 mod feature_tests {
-    use super::*;
-    use crate::bridge::LinkDispatch;
-    use crate::config::{BridgeConfig, PortalConfig};
-    use crate::outbound::StubOutboundRegistrar;
     use xray_buf::pipe;
     use xray_common::net::destination::Destination;
+
+    use super::*;
+    use crate::{
+        bridge::LinkDispatch,
+        config::{BridgeConfig, PortalConfig},
+        outbound::StubOutboundRegistrar,
+    };
 
     #[derive(Default)]
     struct MockLinkDispatch;
@@ -489,14 +491,8 @@ mod feature_tests {
 
     fn sample_config() -> ReverseConfig {
         ReverseConfig {
-            bridges: vec![BridgeConfig {
-                tag: "bridge".into(),
-                domain: "t.example.com".into(),
-            }],
-            portals: vec![PortalConfig {
-                tag: "portal".into(),
-                domain: "t.example.com".into(),
-            }],
+            bridges: vec![BridgeConfig { tag: "bridge".into(), domain: "t.example.com".into() }],
+            portals: vec![PortalConfig { tag: "portal".into(), domain: "t.example.com".into() }],
         }
     }
 
@@ -533,10 +529,7 @@ mod feature_tests {
     async fn feature_invalid_config_propagates() {
         let registrar = Arc::new(StubOutboundRegistrar::new());
         let feature = ReverseFeature::new(ReverseConfig {
-            bridges: vec![BridgeConfig {
-                tag: String::new(),
-                domain: "d".into(),
-            }],
+            bridges: vec![BridgeConfig { tag: String::new(), domain: "d".into() }],
             portals: vec![],
         });
         feature.set_deps(

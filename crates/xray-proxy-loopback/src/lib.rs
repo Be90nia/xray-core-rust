@@ -10,18 +10,16 @@
 //! 这些类型在 Rust 端尚未实现。等 `xray-app-dispatcher` 提供等价 Dispatcher trait
 //! 与 `xray-transport` 提供等价 Link 后，在 [`Loopback`] 之上加一层 adapter 即可接入。
 
-use std::fmt::Debug;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
+use std::{fmt::Debug, future::Future, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
 use thiserror::Error;
 use xray_app_dispatcher::default::{DispatchHandler, SniffingRequest};
-use xray_common::net::destination::Destination;
-use xray_common::session::Session;
-use xray_features::inbound::{InboundError, InboundHandler};
-use xray_features::outbound::{OutboundError, OutboundHandler};
+use xray_common::{net::destination::Destination, session::Session};
+use xray_features::{
+    inbound::{InboundError, InboundHandler},
+    outbound::{OutboundError, OutboundHandler},
+};
 use xray_proto::xray::proxy::loopback::Config;
 
 /// Loopback 错误。
@@ -78,11 +76,7 @@ impl Loopback {
     ///
     /// 调用方应在调用未来的 `process` 之前先用此方法验证目标。
     pub fn validate_target(target_specified: bool) -> Result<(), LoopbackError> {
-        if target_specified {
-            Ok(())
-        } else {
-            Err(LoopbackError::TargetNotSpecified)
-        }
+        if target_specified { Ok(()) } else { Err(LoopbackError::TargetNotSpecified) }
     }
 }
 
@@ -228,7 +222,7 @@ impl DispatchHandler for LoopbackHandler {
                     {
                         tracing::warn!(inbound_tag = %inbound_tag, error = %e, "loopback dispatch failed");
                     }
-                }
+                },
                 None => {
                     // 装配缺失（生产 xray-core functions.rs 应注入 DispatcherLoopbackSink）；
                     // 连接无处可去，显式 error 防静默黑洞（票 rdcc）。
@@ -237,7 +231,7 @@ impl DispatchHandler for LoopbackHandler {
                         "loopback outbound dispatched without sink: dropping connection (assembly missing DispatcherLoopbackSink)"
                     );
                     drop(link);
-                }
+                },
             }
         })
     }
@@ -278,12 +272,10 @@ impl OutboundHandler for LoopbackHandler {
                     self.sniffing.clone(),
                     link,
                 )
-                    .await
-                    .map_err(|e| OutboundError::ConnectionFailed(e.to_string()))
-            }
-            None => Err(OutboundError::ConnectionFailed(
-                "loopback sink not injected".to_string(),
-            )),
+                .await
+                .map_err(|e| OutboundError::ConnectionFailed(e.to_string()))
+            },
+            None => Err(OutboundError::ConnectionFailed("loopback sink not injected".to_string())),
         }
     }
 
@@ -324,11 +316,11 @@ impl InboundHandler for LoopbackHandler {
 
 #[cfg(test)]
 mod tests {
+    use xray_common::net::{
+        address::Address as XrayAddress, destination::Destination, network::Network, port::Port,
+    };
+
     use super::*;
-    use xray_common::net::address::Address as XrayAddress;
-    use xray_common::net::destination::Destination;
-    use xray_common::net::network::Network;
-    use xray_common::net::port::Port;
 
     /// 测试用占位 Destination（loopback 不依赖 dest 内容）。
     fn dummy_dest() -> Destination {
@@ -336,9 +328,7 @@ mod tests {
     }
 
     fn cfg(tag: &str) -> Config {
-        Config {
-            inbound_tag: tag.to_string(),
-        }
+        Config { inbound_tag: tag.to_string() }
     }
 
     #[test]
@@ -367,7 +357,7 @@ mod tests {
     #[test]
     fn validate_target_rejects_unspecified() {
         match Loopback::validate_target(false) {
-            Err(LoopbackError::TargetNotSpecified) => {}
+            Err(LoopbackError::TargetNotSpecified) => {},
             other => panic!("expected TargetNotSpecified, got {other:?}"),
         }
     }
@@ -382,9 +372,7 @@ mod tests {
     #[test]
     fn loopback_with_empty_tag() {
         // 配置允许空 tag（构造时不校验，由调用方负责）
-        let l = Loopback::new(Config {
-            inbound_tag: String::new(),
-        });
+        let l = Loopback::new(Config { inbound_tag: String::new() });
         assert_eq!(l.inbound_tag(), "");
     }
 
@@ -476,18 +464,14 @@ mod tests {
         // 默认构造：sniffing disabled 透传（Go loopback.go:56-62 未配置 = 零值）。
         let sink = SniffCaptureSink::default();
         let enabled = sink.enabled.clone();
-        let h = LoopbackHandler::with_inbound_tag("lb", "in")
-            .with_sink(std::sync::Arc::new(sink));
+        let h = LoopbackHandler::with_inbound_tag("lb", "in").with_sink(std::sync::Arc::new(sink));
         h.dispatch(&dummy_dest(), pipe_link()).await;
         assert_eq!(enabled.lock().clone(), [false]);
 
         // with_sniffing_request：配置的请求透传给 sink（Go loopback.go:34）。
         let sink = SniffCaptureSink::default();
         let enabled = sink.enabled.clone();
-        let req = SniffingRequest {
-            enabled: true,
-            ..Default::default()
-        };
+        let req = SniffingRequest { enabled: true, ..Default::default() };
         let h = LoopbackHandler::with_inbound_tag("lb", "in")
             .with_sniffing_request(req)
             .with_sink(std::sync::Arc::new(sink));
@@ -498,9 +482,7 @@ mod tests {
     #[tokio::test]
     async fn handler_dispatch_with_sink_invokes_dispatch_loopback() {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let sink = std::sync::Arc::new(MockSink {
-            calls: calls.clone(),
-        });
+        let sink = std::sync::Arc::new(MockSink { calls: calls.clone() });
         let h = LoopbackHandler::with_inbound_tag("lb", "target-in").with_sink(sink);
         let link = pipe_link();
         h.dispatch(&dummy_dest(), link).await;
@@ -511,9 +493,7 @@ mod tests {
     #[tokio::test]
     async fn handler_dispatch_multiple_calls_accumulate_in_sink() {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let sink = std::sync::Arc::new(MockSink {
-            calls: calls.clone(),
-        });
+        let sink = std::sync::Arc::new(MockSink { calls: calls.clone() });
         let h = LoopbackHandler::with_inbound_tag("lb", "in").with_sink(sink);
         for _ in 0..3 {
             h.dispatch(&dummy_dest(), pipe_link()).await;
@@ -536,9 +516,7 @@ mod tests {
     #[tokio::test]
     async fn outbound_dial_with_sink_succeeds() {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let sink = std::sync::Arc::new(MockSink {
-            calls: calls.clone(),
-        });
+        let sink = std::sync::Arc::new(MockSink { calls: calls.clone() });
         let h = LoopbackHandler::with_inbound_tag("lb", "target-in").with_sink(sink);
         let dest = dummy_dest();
         let session = Session::new();

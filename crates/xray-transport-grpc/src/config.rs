@@ -22,9 +22,9 @@
 //!   - 例如 `"/A/B/Tun|TunMulti"` → service=`"A/B"`，tun=`"Tun"`，multi=`"TunMulti"`
 //!   - 客户端 `|` 分割前段，服务端 `|` 分割后段（multi 用第二段）
 
-use crate::error::Result;
 use std::io;
 
+use crate::error::Result;
 
 /// gRPC 配置。对应 proto `xray.transport.internet.grpc.encoding.Config`。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -63,7 +63,9 @@ pub struct Config {
 ///
 /// `None` 或非 object 返回 [`Config::default`]。
 pub(crate) fn parse_grpc_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
-    let Some(v) = json else { return Ok(Config::default()); };
+    let Some(v) = json else {
+        return Ok(Config::default());
+    };
     let Some(obj) = v.as_object() else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -74,23 +76,13 @@ pub(crate) fn parse_grpc_config(json: Option<&serde_json::Value>) -> io::Result<
     // 字段名双写法：Go infra/conf/grpc.go 用 snake_case（idle_timeout 等 5 个），
     // proto3 JSON / 客户端配置常用 camelCase。两种都接受。
     let get_str = |camel: &str, snake: &str| {
-        obj.get(camel)
-            .or_else(|| obj.get(snake))
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string()
+        obj.get(camel).or_else(|| obj.get(snake)).and_then(|x| x.as_str()).unwrap_or("").to_string()
     };
     let get_bool = |camel: &str, snake: &str| {
-        obj.get(camel)
-            .or_else(|| obj.get(snake))
-            .and_then(|x| x.as_bool())
-            .unwrap_or(false)
+        obj.get(camel).or_else(|| obj.get(snake)).and_then(|x| x.as_bool()).unwrap_or(false)
     };
     let get_i32 = |camel: &str, snake: &str| {
-        obj.get(camel)
-            .or_else(|| obj.get(snake))
-            .and_then(|x| x.as_i64())
-            .unwrap_or(0) as i32
+        obj.get(camel).or_else(|| obj.get(snake)).and_then(|x| x.as_i64()).unwrap_or(0) as i32
     };
 
     Ok(Config {
@@ -129,11 +121,7 @@ impl Config {
         if raw_service.is_empty() {
             return String::new();
         }
-        raw_service
-            .split('/')
-            .map(path_escape)
-            .collect::<Vec<_>>()
-            .join("/")
+        raw_service.split('/').map(path_escape).collect::<Vec<_>>().join("/")
     }
 
     /// 解析 `service_name` 末段为 Tun stream 名（已 [`path_escape`]）。
@@ -302,109 +290,73 @@ mod tests {
 
     #[test]
     fn service_name_traditional_format() {
-        let cfg = Config {
-            service_name: "GunService".into(),
-            ..Default::default()
-        };
+        let cfg = Config { service_name: "GunService".into(), ..Default::default() };
         assert_eq!(cfg.service_name(), "GunService");
     }
 
     #[test]
     fn service_name_traditional_with_special_chars() {
-        let cfg = Config {
-            service_name: "Gun Service".into(),
-            ..Default::default()
-        };
+        let cfg = Config { service_name: "Gun Service".into(), ..Default::default() };
         assert_eq!(cfg.service_name(), "Gun%20Service");
     }
 
     #[test]
     fn service_name_custom_path_single_segment() {
-        let cfg = Config {
-            service_name: "/A/Tun".into(),
-            ..Default::default()
-        };
+        let cfg = Config { service_name: "/A/Tun".into(), ..Default::default() };
         assert_eq!(cfg.service_name(), "A");
     }
 
     #[test]
     fn service_name_custom_path_multi_segment() {
-        let cfg = Config {
-            service_name: "/A/B/Tun".into(),
-            ..Default::default()
-        };
+        let cfg = Config { service_name: "/A/B/Tun".into(), ..Default::default() };
         assert_eq!(cfg.service_name(), "A/B");
     }
 
     #[test]
     fn service_name_custom_path_with_escape() {
-        let cfg = Config {
-            service_name: "/A B/Tun".into(),
-            ..Default::default()
-        };
+        let cfg = Config { service_name: "/A B/Tun".into(), ..Default::default() };
         assert_eq!(cfg.service_name(), "A%20B");
     }
 
     #[test]
     fn tun_stream_name_traditional_returns_constant() {
-        let cfg = Config {
-            service_name: "GunService".into(),
-            ..Default::default()
-        };
+        let cfg = Config { service_name: "GunService".into(), ..Default::default() };
         assert_eq!(cfg.tun_stream_name(), "Tun");
     }
 
     #[test]
     fn tun_stream_name_custom_path() {
-        let cfg = Config {
-            service_name: "/A/B/Tun".into(),
-            ..Default::default()
-        };
+        let cfg = Config { service_name: "/A/B/Tun".into(), ..Default::default() };
         assert_eq!(cfg.tun_stream_name(), "Tun");
     }
 
     #[test]
     fn tun_stream_name_custom_with_pipe() {
-        let cfg = Config {
-            service_name: "/A/B/Tun|TunMulti".into(),
-            ..Default::default()
-        };
+        let cfg = Config { service_name: "/A/B/Tun|TunMulti".into(), ..Default::default() };
         assert_eq!(cfg.tun_stream_name(), "Tun");
     }
 
     #[test]
     fn tun_stream_name_custom_renamed() {
-        let cfg = Config {
-            service_name: "/A/B/MyTun".into(),
-            ..Default::default()
-        };
+        let cfg = Config { service_name: "/A/B/MyTun".into(), ..Default::default() };
         assert_eq!(cfg.tun_stream_name(), "MyTun");
     }
 
     #[test]
     fn tun_multi_stream_name_traditional_returns_constant() {
-        let cfg = Config {
-            service_name: "GunService".into(),
-            ..Default::default()
-        };
+        let cfg = Config { service_name: "GunService".into(), ..Default::default() };
         assert_eq!(cfg.tun_multi_stream_name(), "TunMulti");
     }
 
     #[test]
     fn tun_multi_stream_name_custom_with_pipe_server_side() {
-        let cfg = Config {
-            service_name: "/A/B/Tun|TunMulti".into(),
-            ..Default::default()
-        };
+        let cfg = Config { service_name: "/A/B/Tun|TunMulti".into(), ..Default::default() };
         assert_eq!(cfg.tun_multi_stream_name(), "TunMulti");
     }
 
     #[test]
     fn tun_multi_stream_name_custom_single_part() {
-        let cfg = Config {
-            service_name: "/A/B/MyMulti".into(),
-            ..Default::default()
-        };
+        let cfg = Config { service_name: "/A/B/MyMulti".into(), ..Default::default() };
         assert_eq!(cfg.tun_multi_stream_name(), "MyMulti");
     }
 
@@ -436,11 +388,8 @@ mod tests {
 
     #[test]
     fn typical_gun_config() {
-        let cfg = Config {
-            service_name: "GunService".into(),
-            multi_mode: true,
-            ..Default::default()
-        };
+        let cfg =
+            Config { service_name: "GunService".into(), multi_mode: true, ..Default::default() };
         assert_eq!(cfg.service_name(), "GunService");
         assert_eq!(cfg.tun_stream_name(), "Tun");
         assert_eq!(cfg.tun_multi_stream_name(), "TunMulti");
@@ -448,10 +397,7 @@ mod tests {
 
     #[test]
     fn custom_path_config_full() {
-        let cfg_server = Config {
-            service_name: "/A/B/Tun|TunMulti".into(),
-            ..Default::default()
-        };
+        let cfg_server = Config { service_name: "/A/B/Tun|TunMulti".into(), ..Default::default() };
         assert_eq!(cfg_server.service_name(), "A/B");
         assert_eq!(cfg_server.tun_stream_name(), "Tun");
         assert_eq!(cfg_server.tun_multi_stream_name(), "TunMulti");

@@ -14,7 +14,7 @@ pub use feature_errors::{
     print_deprecated_feature_warning, print_non_removal_deprecated_feature_warning,
     print_removed_feature_error, removed_feature_message, warn_removed_feature,
 };
-pub use multi_error::{all_equal, combine, MultiError};
+pub use multi_error::{MultiError, all_equal, combine};
 
 /// Xray 错误类型，包含上下文、严重级别和因果链。
 ///
@@ -128,7 +128,7 @@ impl Error {
                 } else {
                     inner_err
                 }
-            }
+            },
             None => self,
         }
     }
@@ -163,10 +163,10 @@ impl fmt::Display for Error {
         match &self.prefix {
             Some(prefix) => {
                 write!(f, "[{}] {}", prefix, self.message)?;
-            }
+            },
             None => {
                 write!(f, "{}", self.message)?;
-            }
+            },
         }
         if let Some(inner) = &self.inner {
             write!(f, " > {}", inner)?;
@@ -177,9 +177,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.inner
-            .as_ref()
-            .map(|b| b.as_ref() as &(dyn std::error::Error + 'static))
+        self.inner.as_ref().map(|b| b.as_ref() as &(dyn std::error::Error + 'static))
     }
 }
 
@@ -231,10 +229,8 @@ mod tests {
 
     #[test]
     fn test_with_inner() {
-        let err = Error::new("outer").with_inner(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "pipe broke",
-        ));
+        let err = Error::new("outer")
+            .with_inner(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe broke"));
         assert!(err.inner().is_some());
         let display = format!("{}", err);
         assert!(display.contains("outer"));
@@ -266,10 +262,8 @@ mod tests {
 
     #[test]
     fn test_source() {
-        let err = Error::new("outer").with_inner(std::io::Error::new(
-            std::io::ErrorKind::ConnectionRefused,
-            "refused",
-        ));
+        let err = Error::new("outer")
+            .with_inner(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"));
         let source = std::error::Error::source(&err);
         assert!(source.is_some());
     }
@@ -293,10 +287,8 @@ mod tests {
 
     #[test]
     fn test_cause_with_non_error_inner() {
-        let err = Error::new("wrapper").with_inner(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "eof",
-        ));
+        let err = Error::new("wrapper")
+            .with_inner(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof"));
         let cause_msg = err.cause().to_string();
         assert!(cause_msg.contains("eof"));
     }

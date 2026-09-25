@@ -66,10 +66,7 @@ impl State {
     /// StateTerminating, StateTerminated)` 的判定。
     #[must_use]
     pub fn is_locally_closed(self) -> bool {
-        matches!(
-            self,
-            Self::ReadyToClose | Self::Terminating | Self::Terminated
-        )
+        matches!(self, Self::ReadyToClose | Self::Terminating | Self::Terminated)
     }
 
     /// 是否已彻底结束（最终态）。

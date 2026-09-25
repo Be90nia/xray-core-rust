@@ -2,13 +2,11 @@
 //!
 //! 对应 Go 版本 `common/log` 包，提供日志级别、消息类型、处理器接口和全局注册表。
 //! 带通道缓冲的通用 Logger 见 [`general_logger`]。
-//!
 
-
-
-use std::fmt;
-use std::sync::Arc;
-use std::sync::RwLock;
+use std::{
+    fmt,
+    sync::{Arc, RwLock},
+};
 
 /// 日志严重级别。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -49,10 +47,7 @@ pub struct Message {
 impl Message {
     /// 创建新的日志消息。
     pub fn new(severity: Severity, content: impl Into<String>) -> Self {
-        Self {
-            severity,
-            content: content.into(),
-        }
+        Self { severity, content: content.into() }
     }
 }
 
@@ -74,10 +69,7 @@ pub struct Record {
 impl Record {
     /// 从消息创建新记录，时间戳为当前时间。
     pub fn new(message: Message) -> Self {
-        Self {
-            message,
-            timestamp: std::time::SystemTime::now(),
-        }
+        Self { message, timestamp: std::time::SystemTime::now() }
     }
 }
 
@@ -137,14 +129,14 @@ fn clear_handlers() {
     }
 }
 
-
 /// 带通道缓冲的通用 Logger，对应 Go `common/log/logger.go::generalLogger`。
 pub mod general_logger;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Mutex;
+
+    use super::*;
 
     #[test]
     fn test_severity_ordering() {
@@ -191,9 +183,7 @@ mod tests {
 
     impl TestHandler {
         fn new() -> Self {
-            Self {
-                messages: Mutex::new(Vec::new()),
-            }
+            Self { messages: Mutex::new(Vec::new()) }
         }
 
         fn messages(&self) -> Vec<Message> {

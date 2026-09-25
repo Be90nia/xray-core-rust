@@ -10,6 +10,7 @@
 //! 实现 [`xray_features::stats::Counter`] trait。
 
 use std::sync::atomic::{AtomicI64, Ordering};
+
 use xray_features::stats::Counter as CounterTrait;
 
 /// 原子计数器实现。
@@ -24,17 +25,13 @@ impl Counter {
     /// 新建零值计数器。对应 Go `new(Counter)`。
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            value: AtomicI64::new(0),
-        }
+        Self { value: AtomicI64::new(0) }
     }
 
     /// 从指定初值新建（测试 / 重启用）。
     #[must_use]
     pub fn with_initial(value: i64) -> Self {
-        Self {
-            value: AtomicI64::new(value),
-        }
+        Self { value: AtomicI64::new(value) }
     }
 }
 
@@ -64,9 +61,9 @@ impl CounterTrait for Counter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
 
+    use super::*;
 
     #[test]
     fn new_starts_at_zero() {
@@ -138,8 +135,7 @@ mod tests {
     #[test]
     fn add_concurrent_safe() {
         // 并发 add 不丢数据（验证 SeqCst 顺序）
-        use std::sync::Arc;
-        use std::thread;
+        use std::{sync::Arc, thread};
         let c = Arc::new(Counter::new());
         let mut handles = Vec::new();
         for _ in 0..8 {

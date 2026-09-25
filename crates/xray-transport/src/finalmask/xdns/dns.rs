@@ -3,8 +3,10 @@
 //! RFC 1035 实现：Name 压缩指针解析、Message 完整结构、TXT RData 编解码。
 //! 字节级匹配 Go 版本（包括错误返回语义、压缩指针上限等）。
 
-use std::collections::HashMap;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::{
+    collections::HashMap,
+    io::{self, Read, Seek, SeekFrom},
+};
 
 // ============================================================================
 // 常量（对应 Go dns.go 中的 const 块）
@@ -127,9 +129,7 @@ fn eq_ascii_ci(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter()
-        .zip(b)
-        .all(|(x, y)| x.eq_ignore_ascii_case(y))
+    a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
 // ============================================================================
@@ -271,13 +271,7 @@ fn read_rr<R: Read + Seek>(r: &mut R) -> io::Result<RR> {
     let rd_length = u16::from_be_bytes(rd_len_buf) as usize;
     let mut data = vec![0u8; rd_length];
     r.read_exact(&mut data)?;
-    Ok(RR {
-        name,
-        rtype,
-        rclass,
-        ttl,
-        data,
-    })
+    Ok(RR { name, rtype, rclass, ttl, data })
 }
 
 /// 读取 Name，支持压缩指针（0xC0 前缀）。
@@ -308,7 +302,7 @@ pub(crate) fn read_name<R: Read + Seek>(r: &mut R) -> io::Result<Name> {
                 let mut label = vec![0u8; length];
                 r.read_exact(&mut label)?;
                 labels.push(label);
-            }
+            },
             0xc0 => {
                 // 压缩指针
                 let mut lower = [0u8; 1];
@@ -325,10 +319,10 @@ pub(crate) fn read_name<R: Read + Seek>(r: &mut R) -> io::Result<Name> {
                     return Err(invalid_data("too many compression pointers"));
                 }
                 r.seek(SeekFrom::Start(u64::from(offset)))?;
-            }
+            },
             _ => {
                 return Err(invalid_data("reserved label type"));
-            }
+            },
         }
     }
 
@@ -355,10 +349,7 @@ pub(crate) struct MessageBuilder {
 
 impl MessageBuilder {
     pub(crate) fn new() -> Self {
-        Self {
-            w: Vec::new(),
-            name_cache: HashMap::new(),
-        }
+        Self { w: Vec::new(), name_cache: HashMap::new() }
     }
 
     pub(crate) fn bytes(&self) -> Vec<u8> {
@@ -401,8 +392,8 @@ impl MessageBuilder {
         self.w.extend_from_slice(&rr.rtype.to_be_bytes());
         self.w.extend_from_slice(&rr.rclass.to_be_bytes());
         self.w.extend_from_slice(&rr.ttl.to_be_bytes());
-        let rd_length = u16::try_from(rr.data.len())
-            .map_err(|_| invalid_data("integer overflow"))?;
+        let rd_length =
+            u16::try_from(rr.data.len()).map_err(|_| invalid_data("integer overflow"))?;
         self.w.extend_from_slice(&rd_length.to_be_bytes());
         self.w.extend_from_slice(&rr.data);
         Ok(())
@@ -414,8 +405,7 @@ impl MessageBuilder {
         self.w.extend_from_slice(&m.id.to_be_bytes());
         self.w.extend_from_slice(&m.flags.to_be_bytes());
         for count in [m.question.len(), m.answer.len(), m.authority.len(), m.additional.len()] {
-            let c16 = u16::try_from(count)
-                .map_err(|_| invalid_data("integer overflow"))?;
+            let c16 = u16::try_from(count).map_err(|_| invalid_data("integer overflow"))?;
             self.w.extend_from_slice(&c16.to_be_bytes());
         }
         // Question

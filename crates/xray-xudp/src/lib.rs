@@ -1,4 +1,4 @@
-﻿//! XUDP 协议实现
+//! XUDP 协议实现
 //!
 //! 对应 Go 版本 common/xudp 包，提供 XUDP GlobalID 生成与配置管理。
 //!
@@ -19,8 +19,7 @@ pub mod packet;
 
 use std::sync::OnceLock;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use blake3::Hasher;
 use rand::RngCore;
 use xray_common::net::network::Network;
@@ -64,34 +63,31 @@ impl XudpConfig {
     /// 从环境变量加载配置。
     ///
     /// - XUDP_LOG: 设为 "1" / "true" / "yes" / "on"（不区分大小写）时启用日志
-    /// - XUDP_BASE_KEY: Base64 URL-safe 无填充编码的 32 字节密钥；
-    ///   未设置或无效时使用随机密钥
+    /// - XUDP_BASE_KEY: Base64 URL-safe 无填充编码的 32 字节密钥； 未设置或无效时使用随机密钥
     #[must_use]
     pub fn from_env() -> Self {
         let log = parse_env_bool(ENV_XUDP_LOG);
 
         let base_key = match std::env::var(ENV_XUDP_BASE_KEY) {
-            Ok(raw) if !raw.is_empty() => {
-                match URL_SAFE_NO_PAD.decode(&raw) {
-                    Ok(bytes) if bytes.len() == BASE_KEY_LEN => {
-                        let mut key = [0u8; BASE_KEY_LEN];
-                        key.copy_from_slice(&bytes);
-                        key
-                    }
-                    Ok(bytes) => {
-                        tracing::warn!(
-                            "XUDP_BASE_KEY: invalid length {}, expected {} bytes",
-                            bytes.len(),
-                            BASE_KEY_LEN
-                        );
-                        random_base_key()
-                    }
-                    Err(e) => {
-                        tracing::warn!("XUDP_BASE_KEY: base64 decode failed: {e}");
-                        random_base_key()
-                    }
-                }
-            }
+            Ok(raw) if !raw.is_empty() => match URL_SAFE_NO_PAD.decode(&raw) {
+                Ok(bytes) if bytes.len() == BASE_KEY_LEN => {
+                    let mut key = [0u8; BASE_KEY_LEN];
+                    key.copy_from_slice(&bytes);
+                    key
+                },
+                Ok(bytes) => {
+                    tracing::warn!(
+                        "XUDP_BASE_KEY: invalid length {}, expected {} bytes",
+                        bytes.len(),
+                        BASE_KEY_LEN
+                    );
+                    random_base_key()
+                },
+                Err(e) => {
+                    tracing::warn!("XUDP_BASE_KEY: base64 decode failed: {e}");
+                    random_base_key()
+                },
+            },
             _ => random_base_key(),
         };
 
@@ -179,11 +175,7 @@ fn compute_global_id(
     output.copy_from_slice(&hasher.finalize().as_bytes()[..GLOBAL_ID_LEN]);
 
     if log {
-        tracing::info!(
-            "XUDP inbound.Source.String(): {}\tglobalID: {:?}",
-            input.source,
-            output
-        );
+        tracing::info!("XUDP inbound.Source.String(): {}\tglobalID: {:?}", input.source, output);
     }
 
     output
@@ -201,10 +193,7 @@ fn random_base_key() -> [u8; BASE_KEY_LEN] {
 /// 解析布尔型环境变量（"1" / "true" / "yes" / "on" → true）
 fn parse_env_bool(name: &str) -> bool {
     match std::env::var(name) {
-        Ok(v) => matches!(
-            v.to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        ),
+        Ok(v) => matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
         Err(_) => false,
     }
 }
@@ -251,17 +240,14 @@ mod tests {
 
     #[test]
     fn test_parse_env_bool_unset() {
-        assert!(
-            !parse_env_bool("XUDP_TEST_BOOL_UNSET_12345"),
-            "unset env should be false"
-        );
+        assert!(!parse_env_bool("XUDP_TEST_BOOL_UNSET_12345"), "unset env should be false");
     }
 
     #[test]
     fn test_base64_roundtrip() {
         let key: [u8; 32] = [
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
-            19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 30, 31, 32,
         ];
         let encoded = URL_SAFE_NO_PAD.encode(key);
         let decoded = URL_SAFE_NO_PAD.decode(&encoded).expect("decode");
@@ -294,10 +280,7 @@ mod tests {
         };
         let key = [0u8; BASE_KEY_LEN];
         let id = compute_global_id(&input, &key, false);
-        assert_eq!(
-            id, [0u8; GLOBAL_ID_LEN],
-            "should be zeros when source is not UDP"
-        );
+        assert_eq!(id, [0u8; GLOBAL_ID_LEN], "should be zeros when source is not UDP");
     }
 
     #[test]
@@ -309,10 +292,7 @@ mod tests {
         };
         let key = [1u8; BASE_KEY_LEN];
         let id = compute_global_id(&input, &key, false);
-        assert_ne!(
-            id, [0u8; GLOBAL_ID_LEN],
-            "should be non-zero for valid UDP cone input"
-        );
+        assert_ne!(id, [0u8; GLOBAL_ID_LEN], "should be non-zero for valid UDP cone input");
     }
 
     #[test]
@@ -343,10 +323,7 @@ mod tests {
         let key = [3u8; BASE_KEY_LEN];
         let id_a = compute_global_id(&input_a, &key, false);
         let id_b = compute_global_id(&input_b, &key, false);
-        assert_ne!(
-            id_a, id_b,
-            "different sources should produce different GlobalIDs"
-        );
+        assert_ne!(id_a, id_b, "different sources should produce different GlobalIDs");
     }
 
     #[test]
@@ -360,10 +337,7 @@ mod tests {
         let key_b = [2u8; BASE_KEY_LEN];
         let id_a = compute_global_id(&input, &key_a, false);
         let id_b = compute_global_id(&input, &key_b, false);
-        assert_ne!(
-            id_a, id_b,
-            "different base_keys should produce different GlobalIDs"
-        );
+        assert_ne!(id_a, id_b, "different base_keys should produce different GlobalIDs");
     }
 
     #[test]

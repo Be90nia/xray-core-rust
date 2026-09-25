@@ -26,10 +26,7 @@ impl Account {
     /// 构造账户。
     #[must_use]
     pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
-        Self {
-            username: username.into(),
-            password: password.into(),
-        }
+        Self { username: username.into(), password: password.into() }
     }
 
     /// 比较两个账户是否相同（仅按 `username` 判断，与 Go `Equals` 一致）。
@@ -57,15 +54,13 @@ impl ServerConfig {
     /// 校验用户名/密码是否匹配已注册账户。
     ///
     /// 对应 Go `ServerConfig.HasAccount`。`accounts` 为空时返回 `false`
-    ///（与 Go 一致：空 map 拒绝所有认证，需走匿名路径）。
+    /// （与 Go 一致：空 map 拒绝所有认证，需走匿名路径）。
     #[must_use]
     pub fn has_account(&self, username: &str, password: &str) -> bool {
         if self.accounts.is_empty() {
             return false;
         }
-        self.accounts
-            .get(username)
-            .is_some_and(|p| p == password)
+        self.accounts.get(username).is_some_and(|p| p == password)
     }
 
     /// 是否需要认证（`accounts` 非空）。
@@ -102,10 +97,7 @@ pub struct ClientConfig {
 impl Account {
     /// 从 prost `Account` 构造。
     pub fn from_proto(p: xray_proto::xray::proxy::http::Account) -> Result<Self> {
-        Ok(Self {
-            username: p.username,
-            password: p.password,
-        })
+        Ok(Self { username: p.username, password: p.password })
     }
 
     /// 转换为 prost `Account`。
@@ -144,14 +136,7 @@ impl ClientConfig {
     pub fn from_proto(p: xray_proto::xray::proxy::http::ClientConfig) -> Result<Self> {
         Ok(Self {
             server: p.server,
-            headers: p
-                .header
-                .into_iter()
-                .map(|h| Header {
-                    key: h.key,
-                    value: h.value,
-                })
-                .collect(),
+            headers: p.header.into_iter().map(|h| Header { key: h.key, value: h.value }).collect(),
         })
     }
 
@@ -201,10 +186,7 @@ mod tests {
     fn server_has_account_matches() {
         let mut accounts = HashMap::new();
         accounts.insert("alice".into(), "pass123".into());
-        let cfg = ServerConfig {
-            accounts,
-            ..Default::default()
-        };
+        let cfg = ServerConfig { accounts, ..Default::default() };
         assert!(cfg.has_account("alice", "pass123"));
     }
 
@@ -212,10 +194,7 @@ mod tests {
     fn server_has_account_wrong_password_rejected() {
         let mut accounts = HashMap::new();
         accounts.insert("alice".into(), "pass123".into());
-        let cfg = ServerConfig {
-            accounts,
-            ..Default::default()
-        };
+        let cfg = ServerConfig { accounts, ..Default::default() };
         assert!(!cfg.has_account("alice", "wrong"));
     }
 
@@ -223,10 +202,7 @@ mod tests {
     fn server_has_account_unknown_user_rejected() {
         let mut accounts = HashMap::new();
         accounts.insert("alice".into(), "pass".into());
-        let cfg = ServerConfig {
-            accounts,
-            ..Default::default()
-        };
+        let cfg = ServerConfig { accounts, ..Default::default() };
         assert!(!cfg.has_account("bob", "pass"));
     }
 
@@ -241,10 +217,7 @@ mod tests {
     fn server_requires_auth_when_accounts_non_empty() {
         let mut accounts = HashMap::new();
         accounts.insert("u".into(), "p".into());
-        let cfg = ServerConfig {
-            accounts,
-            ..Default::default()
-        };
+        let cfg = ServerConfig { accounts, ..Default::default() };
         assert!(cfg.requires_auth());
 
         let cfg_empty = ServerConfig::default();
@@ -255,11 +228,7 @@ mod tests {
     fn server_config_proto_roundtrip() {
         let mut accounts = HashMap::new();
         accounts.insert("u".into(), "p".into());
-        let cfg = ServerConfig {
-            accounts,
-            allow_transparent: true,
-            user_level: 5,
-        };
+        let cfg = ServerConfig { accounts, allow_transparent: true, user_level: 5 };
         let p = cfg.to_proto();
         let cfg2 = ServerConfig::from_proto(p).unwrap();
         assert_eq!(cfg, cfg2);
@@ -280,14 +249,8 @@ mod tests {
         let cfg = ClientConfig {
             server: None,
             headers: vec![
-                Header {
-                    key: "X-Custom".into(),
-                    value: "v1".into(),
-                },
-                Header {
-                    key: "X-Auth".into(),
-                    value: "token".into(),
-                },
+                Header { key: "X-Custom".into(), value: "v1".into() },
+                Header { key: "X-Auth".into(), value: "token".into() },
             ],
         };
         let p = cfg.to_proto();

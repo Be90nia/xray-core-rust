@@ -3,11 +3,11 @@
 //! 对应 Go 版本 `common/buf` 的 io.go，定义异步 Reader/Writer trait、
 //! 错误类型和工厂函数。所有 IO 操作均为异步，基于 tokio AsyncRead/AsyncWrite。
 
-use crate::multi::MultiBuffer;
-use std::future::Future;
-use std::pin::Pin;
-use std::time::Duration;
+use std::{future::Future, pin::Pin, time::Duration};
+
 use tokio::io::{AsyncRead, AsyncWrite};
+
+use crate::multi::MultiBuffer;
 
 // ========== 错误类型 ==========
 
@@ -57,11 +57,7 @@ pub fn classify_io_error(err: std::io::Error, is_read: bool) -> Error {
     if err.kind() == std::io::ErrorKind::Interrupted {
         return Error::Interrupted;
     }
-    if is_read {
-        Error::ReadError(err.to_string())
-    } else {
-        Error::WriteError(err.to_string())
-    }
+    if is_read { Error::ReadError(err.to_string()) } else { Error::WriteError(err.to_string()) }
 }
 
 // ========== Result 类型 ==========

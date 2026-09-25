@@ -4,14 +4,15 @@
 //! `RegisterTransportDialer("tcp", Dial)`。建立裸 TCP 连接后按
 //! `streamSettings.security` 包装 TLS / REALITY（对齐 Go `Dial` line 36-102）。
 
-use std::io;
-use std::sync::Arc;
+use std::{io, sync::Arc};
 
 use xray_common::net::destination::Destination;
 use xray_tls::client_config::build_client_config;
-use xray_transport::connection::Connection;
-use xray_transport::dialer::{StreamSettings, TransportDialFn, register_transport_dialer};
-use xray_transport::sockopt::SocketOptions;
+use xray_transport::{
+    connection::Connection,
+    dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
+    sockopt::SocketOptions,
+};
 
 /// 注册 TCP transport dialer（`"tcp"` / `"raw"`）。
 ///
@@ -83,7 +84,8 @@ async fn wrap_security(
     // security=tls：有 fingerprint 或 ECH 用 u_client（btls 真实指纹），否则标准 rustls。
     let default_sni = dest.address().to_string();
     let sni = resolve_sni(settings, &default_sni);
-    let config = build_client_config(&settings.security, settings.security_json.as_ref(), &default_sni)?;
+    let config =
+        build_client_config(&settings.security, settings.security_json.as_ref(), &default_sni)?;
     match config {
         Some(cfg) => {
             // 解析 fingerprint 字段（对齐 Go tls.ConfigFromStreamSettings → GetFingerprint）。
@@ -101,8 +103,15 @@ async fn wrap_security(
             if !fp_name.is_empty() {
                 let fp = xray_tls::fingerprint::get_fingerprint(fp_name)
                     .map_err(|e| io::Error::other(format!("invalid fingerprint: {e}")))?;
-                let tls_conn =
-                    xray_tls::utls::u_client(conn, &sni, cfg, fp, ech, settings.security_json.as_ref()).await?;
+                let tls_conn = xray_tls::utls::u_client(
+                    conn,
+                    &sni,
+                    cfg,
+                    fp,
+                    ech,
+                    settings.security_json.as_ref(),
+                )
+                .await?;
                 Ok(Box::new(tls_conn))
             } else if ech.is_some() {
                 // Go 端 ECH 不依赖 fingerprint（stdlib 原生）；Rust 端 ECH 仅 btls 可用，
@@ -125,7 +134,7 @@ async fn wrap_security(
                 let tls_conn = xray_tls::utls::client(conn, &sni, cfg).await?;
                 Ok(Box::new(tls_conn))
             }
-        }
+        },
         None => Ok(conn),
     }
 }

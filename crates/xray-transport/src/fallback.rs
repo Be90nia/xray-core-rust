@@ -27,10 +27,10 @@ fn encode_proxy_v1(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
     match (src, dst) {
         (SocketAddr::V4(s), SocketAddr::V4(d)) => {
             format!("PROXY TCP4 {} {} {} {}\r\n", s.ip(), d.ip(), s.port(), d.port()).into_bytes()
-        }
+        },
         (SocketAddr::V6(s), SocketAddr::V6(d)) => {
             format!("PROXY TCP6 {} {} {} {}\r\n", s.ip(), d.ip(), s.port(), d.port()).into_bytes()
-        }
+        },
         // 地址族不匹配（极少见）→ UNKNOWN
         _ => b"PROXY UNKNOWN\r\n".to_vec(),
     }
@@ -50,7 +50,7 @@ fn encode_proxy_v2(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
             buf.extend_from_slice(&d.ip().octets());
             buf.extend_from_slice(&s.port().to_be_bytes());
             buf.extend_from_slice(&d.port().to_be_bytes());
-        }
+        },
         (SocketAddr::V6(s), SocketAddr::V6(d)) => {
             // 0x21=v2+PROXY, 0x21=AF_INET6+STREAM, 0x0024=36 字节 addr
             buf.extend_from_slice(&[0x21, 0x21, 0x00, 0x24]);
@@ -58,7 +58,7 @@ fn encode_proxy_v2(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
             buf.extend_from_slice(&d.ip().octets());
             buf.extend_from_slice(&s.port().to_be_bytes());
             buf.extend_from_slice(&d.port().to_be_bytes());
-        }
+        },
         // 地址族不匹配 → v2+LOCAL+UNSPEC+UNSPEC+0（不传递地址信息）
         _ => buf.extend_from_slice(&[0x20, 0x00, 0x00, 0x00]),
     }
@@ -83,10 +83,13 @@ pub async fn fallback_to_dest<RW>(
 where
     RW: AsyncRead + AsyncWrite + Unpin,
 {
-    use tokio::io::{AsyncWriteExt, copy_bidirectional};
-    use tokio::net::TcpStream;
+    use tokio::{
+        io::{AsyncWriteExt, copy_bidirectional},
+        net::TcpStream,
+    };
 
-    // Go trojan server.go:455 / vless inbound.go:420 — fallback 拨号 retry.ExponentialBackoff(5, 100)
+    // Go trojan server.go:455 / vless inbound.go:420 — fallback 拨号 retry.ExponentialBackoff(5,
+    // 100)
     let mut dest_conn = crate::retry::exponential_backoff(5, 100, || TcpStream::connect(dest))
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -188,7 +191,7 @@ mod tests {
                         if s.write_all(&buf[..n]).await.is_err() {
                             break;
                         }
-                    }
+                    },
                 }
             }
         });

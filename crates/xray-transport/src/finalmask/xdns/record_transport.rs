@@ -5,13 +5,15 @@
 //! - TXT：1 条记录，RDATA 是 `<length><bytes>` 串联（≤255 字节/段）。
 //! - A / AAAA：N 条记录（≤256），每条 4/16 字节，前 2 字节 = (idx, n)。
 
-use std::io;
-use std::sync::OnceLock;
+use std::{io, sync::OnceLock};
 
-use super::dns::{
-    decode_rdata_txt, encode_rdata_txt, Name, Question, RR, RR_TYPE_A, RR_TYPE_AAAA, RR_TYPE_TXT,
+use super::{
+    dns::{
+        Name, Question, RR, RR_TYPE_A, RR_TYPE_AAAA, RR_TYPE_TXT, decode_rdata_txt,
+        encode_rdata_txt,
+    },
+    spec::DomainSpec,
 };
-use super::spec::DomainSpec;
 
 /// A/AAAA 记录的 payload header 大小（idx + n 两字节）。
 const IP_RECORD_HEADER_SIZE: usize = 2;
@@ -97,11 +99,7 @@ fn ip_answers_for_payload(question: &Question, ttl: u32, payload: &[u8]) -> io::
     if chunk_size == 0 || rr_data_size == 0 {
         return Err(invalid_data("unsupported ip rr type"));
     }
-    let num_records = if payload.is_empty() {
-        1
-    } else {
-        payload.len().div_ceil(chunk_size)
-    };
+    let num_records = if payload.is_empty() { 1 } else { payload.len().div_ceil(chunk_size) };
     if num_records > 256 {
         return Err(invalid_data("payload too large for ip rr type"));
     }
@@ -137,7 +135,7 @@ pub fn decode_response_payload(answers: &[RR]) -> Option<Vec<u8>> {
                 return None;
             }
             decode_rdata_txt(&first.data).ok()
-        }
+        },
         RR_TYPE_A | RR_TYPE_AAAA => decode_ip_answer_payload(answers, first.rtype),
         _ => None,
     }
@@ -217,10 +215,7 @@ pub fn compute_max_encoded_payload_for_type(limit: usize, rr_type: u16) -> usize
 
     let resp = super::server::response_for(
         &query,
-        &[DomainSpec {
-            name: Name { labels: vec![vec![]] },
-            rr_type: 0,
-        }],
+        &[DomainSpec { name: Name { labels: vec![vec![]] }, rr_type: 0 }],
     );
     let mut resp = match resp {
         Some(r) => r,
@@ -241,14 +236,14 @@ pub fn compute_max_encoded_payload_for_type(limit: usize, rr_type: u16) -> usize
             Err(_) => {
                 high = mid;
                 continue;
-            }
+            },
         };
         let buf = match resp.wire_format() {
             Ok(b) => b,
             Err(_) => {
                 high = mid;
                 continue;
-            }
+            },
         };
         if buf.len() <= limit {
             low = mid;

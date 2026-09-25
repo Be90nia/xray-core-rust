@@ -62,10 +62,10 @@ impl Tcpmask for Config {
 
 #[cfg(test)]
 mod tests {
-    use rsa::pkcs1::EncodeRsaPrivateKey;
-    use rsa::pkcs8::EncodePublicKey;
-    use super::*;
+    use rsa::{pkcs1::EncodeRsaPrivateKey, pkcs8::EncodePublicKey};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
 
     /// 单向：client → server（握手 + CFB8 加密）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -74,11 +74,8 @@ mod tests {
         let private_key = derivation::derive_rsa_key(password).expect("derive rsa key");
         let private_der = private_key.to_pkcs1_der().expect("to_pkcs1_der").as_bytes().to_vec();
         let public_key = <rsa::RsaPublicKey as From<&rsa::RsaPrivateKey>>::from(&private_key);
-        let public_der = public_key
-            .to_public_key_der()
-            .expect("to_public_key_der")
-            .as_bytes()
-            .to_vec();
+        let public_der =
+            public_key.to_public_key_der().expect("to_public_key_der").as_bytes().to_vec();
 
         let config = Config {
             usernames: vec!["test_user".into()],
@@ -119,11 +116,8 @@ mod tests {
         let private_key = derivation::derive_rsa_key(password).expect("derive rsa key");
         let private_der = private_key.to_pkcs1_der().expect("to_pkcs1_der").as_bytes().to_vec();
         let public_key = <rsa::RsaPublicKey as From<&rsa::RsaPrivateKey>>::from(&private_key);
-        let public_der = public_key
-            .to_public_key_der()
-            .expect("to_public_key_der")
-            .as_bytes()
-            .to_vec();
+        let public_der =
+            public_key.to_public_key_der().expect("to_public_key_der").as_bytes().to_vec();
 
         let config = Config {
             usernames: vec!["test_user".into()],
@@ -200,7 +194,8 @@ mod tests {
         // 握手失败后 client bridge 可能收到 server 写的 disconnect packet（明文），
         // 被 client bridge 错误解密成垃圾。重要的是：sw 写的明文不会原样到达 client。
         assert_ne!(
-            got, b"data that should not arrive".to_vec(),
+            got,
+            b"data that should not arrive".to_vec(),
             "plaintext should not pass through on handshake failure"
         );
     }

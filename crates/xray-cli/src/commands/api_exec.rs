@@ -8,30 +8,30 @@
 
 use std::io::Read;
 
-
 use tonic::Request;
-
-use xray_proto::xray::app::log::command::RestartLoggerRequest;
-use xray_proto::xray::app::proxyman::command::{
-    AddInboundRequest, AddOutboundRequest, AddUserOperation, AlterInboundRequest,
-    GetInboundUserRequest, ListInboundsRequest, ListOutboundsRequest, RemoveInboundRequest,
-    RemoveOutboundRequest, RemoveUserOperation,
+use xray_proto::xray::{
+    app::{
+        log::command::RestartLoggerRequest,
+        proxyman::command::{
+            AddInboundRequest, AddOutboundRequest, AddUserOperation, AlterInboundRequest,
+            GetInboundUserRequest, ListInboundsRequest, ListOutboundsRequest, RemoveInboundRequest,
+            RemoveOutboundRequest, RemoveUserOperation,
+        },
+        router::command::{
+            AddRuleRequest, GetBalancerInfoRequest, GetBalancerInfoResponse, ListRuleRequest,
+            OverrideBalancerTargetRequest, RemoveRuleRequest,
+        },
+        stats::command::{
+            GetAllOnlineUsersRequest, GetStatsOnlineIpListResponse, GetStatsRequest,
+            GetUsersStatsRequest, GetUsersStatsResponse, QueryStatsRequest, SysStatsRequest,
+        },
+    },
+    common::serial::TypedMessage,
+    core::{InboundHandlerConfig, OutboundHandlerConfig},
 };
-use xray_proto::xray::app::router::command::{
-    AddRuleRequest, GetBalancerInfoRequest, GetBalancerInfoResponse, ListRuleRequest,
-    OverrideBalancerTargetRequest, RemoveRuleRequest,
-};
-use xray_proto::xray::app::stats::command::{
-    GetAllOnlineUsersRequest, GetStatsOnlineIpListResponse, GetStatsRequest,
-    GetUsersStatsRequest, GetUsersStatsResponse, QueryStatsRequest, SysStatsRequest,
-};
-use xray_proto::xray::common::serial::TypedMessage;
-use xray_proto::xray::core::{InboundHandlerConfig, OutboundHandlerConfig};
-
-use crate::commands::api_client::ApiClient;
-use crate::error::CliError;
 
 use super::api_args::*;
+use crate::{commands::api_client::ApiClient, error::CliError};
 
 /// 读取配置参数（文件路径、`stdin:`、或 HTTP URL）。
 fn load_config(arg: &str) -> Result<Vec<u8>, CliError> {
@@ -42,7 +42,8 @@ fn load_config(arg: &str) -> Result<Vec<u8>, CliError> {
             .map_err(|e| CliError::InvalidArgument(format!("failed to read stdin: {e}")))?;
         Ok(buf)
     } else {
-        std::fs::read(arg).map_err(|e| CliError::InvalidArgument(format!("failed to read {arg}: {e}")))
+        std::fs::read(arg)
+            .map_err(|e| CliError::InvalidArgument(format!("failed to read {arg}: {e}")))
     }
 }
 
@@ -56,10 +57,8 @@ pub(crate) fn build_inbound_configs(
     let config: serde_json::Value = serde_json::from_slice(json_data)
         .map_err(|e| CliError::InvalidArgument(format!("failed to parse JSON config: {e}")))?;
 
-    let inbounds = config
-        .get("inbounds")
-        .or_else(|| config.get("inbound"))
-        .and_then(|v| v.as_array());
+    let inbounds =
+        config.get("inbounds").or_else(|| config.get("inbound")).and_then(|v| v.as_array());
 
     let Some(inbounds) = inbounds else {
         return Err(CliError::InvalidArgument("no inbounds found in config".into()));
@@ -78,10 +77,18 @@ pub(crate) fn build_inbound_configs(
             "xray.app.proxyman.ReceiverConfig",
             Some(&serde_json::Value::Object({
                 let mut map = serde_json::Map::new();
-                if let Some(v) = ib.get("port") { map.insert("port".into(), v.clone()); }
-                if let Some(v) = ib.get("listen") { map.insert("listen".into(), v.clone()); }
-                if let Some(v) = ib.get("streamSettings") { map.insert("streamSettings".into(), v.clone()); }
-                if let Some(v) = ib.get("sniffing") { map.insert("sniffing".into(), v.clone()); }
+                if let Some(v) = ib.get("port") {
+                    map.insert("port".into(), v.clone());
+                }
+                if let Some(v) = ib.get("listen") {
+                    map.insert("listen".into(), v.clone());
+                }
+                if let Some(v) = ib.get("streamSettings") {
+                    map.insert("streamSettings".into(), v.clone());
+                }
+                if let Some(v) = ib.get("sniffing") {
+                    map.insert("sniffing".into(), v.clone());
+                }
                 map
             })),
         );
@@ -103,10 +110,8 @@ pub(crate) fn build_outbound_configs(
     let config: serde_json::Value = serde_json::from_slice(json_data)
         .map_err(|e| CliError::InvalidArgument(format!("failed to parse JSON config: {e}")))?;
 
-    let outbounds = config
-        .get("outbounds")
-        .or_else(|| config.get("outbound"))
-        .and_then(|v| v.as_array());
+    let outbounds =
+        config.get("outbounds").or_else(|| config.get("outbound")).and_then(|v| v.as_array());
 
     let Some(outbounds) = outbounds else {
         return Err(CliError::InvalidArgument("no outbounds found in config".into()));
@@ -122,8 +127,12 @@ pub(crate) fn build_outbound_configs(
             "xray.app.proxyman.SenderConfig",
             Some(&serde_json::Value::Object({
                 let mut map = serde_json::Map::new();
-                if let Some(v) = ob.get("sendThrough") { map.insert("sendThrough".into(), v.clone()); }
-                if let Some(v) = ob.get("streamSettings") { map.insert("streamSettings".into(), v.clone()); }
+                if let Some(v) = ob.get("sendThrough") {
+                    map.insert("sendThrough".into(), v.clone());
+                }
+                if let Some(v) = ob.get("streamSettings") {
+                    map.insert("streamSettings".into(), v.clone());
+                }
                 map
             })),
         );
@@ -140,7 +149,7 @@ pub(crate) fn build_outbound_configs(
     Ok(result)
 }
 
- /// 构建 TypedMessage：type_url 为协议名对应的全限定类型，value 为 JSON 编码。
+/// 构建 TypedMessage：type_url 为协议名对应的全限定类型，value 为 JSON 编码。
 ///
 /// 协议名 → Go 注册类型名（conf 注 reflect，已用 v26.9.9 `convert pb` golden
 /// 实测）：`dokodemo-door` 的包名是 `dokodemo`；其余协议名与包名一致。
@@ -153,15 +162,10 @@ fn go_proxy_type_url(protocol: &str) -> String {
 }
 
 fn build_typed_message(type_name: &str, settings: Option<&serde_json::Value>) -> TypedMessage {
-    let type_url = if type_name.contains('.') {
-        type_name.to_string()
-    } else {
-        go_proxy_type_url(type_name)
-    };
+    let type_url =
+        if type_name.contains('.') { type_name.to_string() } else { go_proxy_type_url(type_name) };
 
-    let value = settings
-        .map(|v| serde_json::to_vec(v).unwrap_or_default())
-        .unwrap_or_default();
+    let value = settings.map(|v| serde_json::to_vec(v).unwrap_or_default()).unwrap_or_default();
 
     TypedMessage { r#type: type_url, value }
 }
@@ -171,9 +175,9 @@ fn build_rule_typed_message(json_data: &[u8]) -> Result<TypedMessage, CliError> 
     let config: serde_json::Value = serde_json::from_slice(json_data)
         .map_err(|e| CliError::InvalidArgument(format!("failed to parse JSON config: {e}")))?;
 
-    let routing = config.get("routing").ok_or_else(|| {
-        CliError::InvalidArgument("config did not have \"routing\" field".into())
-    })?;
+    let routing = config
+        .get("routing")
+        .ok_or_else(|| CliError::InvalidArgument("config did not have \"routing\" field".into()))?;
 
     Ok(TypedMessage {
         r#type: "xray.app.router.RoutingConfig".to_string(),
@@ -217,10 +221,7 @@ fn online_ip_list_json(resp: &GetStatsOnlineIpListResponse) -> serde_json::Value
         root.insert("name".into(), serde_json::Value::String(resp.name.clone()));
     }
     if !resp.ips.is_empty() {
-        root.insert(
-            "ips".into(),
-            serde_json::to_value(&resp.ips).unwrap_or_default(),
-        );
+        root.insert("ips".into(), serde_json::to_value(&resp.ips).unwrap_or_default());
     }
     serde_json::Value::Object(root)
 }
@@ -237,7 +238,8 @@ fn users_stats_json(resp: &GetUsersStatsResponse) -> serde_json::Value {
                 m.insert(
                     "ips".into(),
                     serde_json::Value::Array(
-                        u.ips.iter()
+                        u.ips
+                            .iter()
                             .map(|e| serde_json::json!({ "ip": e.ip, "lastSeen": e.last_seen }))
                             .collect(),
                     ),
@@ -286,10 +288,9 @@ pub async fn execute_add_inbound(args: &AddInboundArgs) -> Result<(), CliError> 
     for ib in inbounds {
         let tag = ib.tag.clone();
         let req = Request::new(AddInboundRequest { inbound: Some(ib) });
-        handler
-            .add_inbound(req)
-            .await
-            .map_err(|e| CliError::ApiRequestFailed(format!("failed to add inbound '{tag}': {e}")))?;
+        handler.add_inbound(req).await.map_err(|e| {
+            CliError::ApiRequestFailed(format!("failed to add inbound '{tag}': {e}"))
+        })?;
         println!("added inbound: {tag}");
     }
 
@@ -322,10 +323,9 @@ pub async fn execute_add_outbound(args: &AddOutboundArgs) -> Result<(), CliError
     for ob in outbounds {
         let tag = ob.tag.clone();
         let req = Request::new(AddOutboundRequest { outbound: Some(ob) });
-        handler
-            .add_outbound(req)
-            .await
-            .map_err(|e| CliError::ApiRequestFailed(format!("failed to add outbound '{tag}': {e}")))?;
+        handler.add_outbound(req).await.map_err(|e| {
+            CliError::ApiRequestFailed(format!("failed to add outbound '{tag}': {e}"))
+        })?;
         println!("added outbound: {tag}");
     }
 
@@ -355,10 +355,7 @@ pub async fn execute_add_rule(args: &AddRuleArgs) -> Result<(), CliError> {
     let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
     let mut routing = client.routing_client();
 
-    let req = Request::new(AddRuleRequest {
-        config: Some(config),
-        should_append: args.append,
-    });
+    let req = Request::new(AddRuleRequest { config: Some(config), should_append: args.append });
     routing
         .add_rule(req)
         .await
@@ -374,13 +371,10 @@ pub async fn execute_remove_rule(args: &RemoveRuleArgs) -> Result<(), CliError> 
     let mut routing = client.routing_client();
 
     for rule_tag in &args.rule_tags {
-        let req = Request::new(RemoveRuleRequest {
-            rule_tag: rule_tag.clone(),
-        });
-        routing
-            .remove_rule(req)
-            .await
-            .map_err(|e| CliError::ApiRequestFailed(format!("failed to remove rule '{rule_tag}': {e}")))?;
+        let req = Request::new(RemoveRuleRequest { rule_tag: rule_tag.clone() });
+        routing.remove_rule(req).await.map_err(|e| {
+            CliError::ApiRequestFailed(format!("failed to remove rule '{rule_tag}': {e}"))
+        })?;
         println!("removed rule: {rule_tag}");
     }
 
@@ -392,10 +386,7 @@ pub async fn execute_stats(args: &StatsArgs) -> Result<(), CliError> {
     let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
     let mut stats = client.stats_client();
 
-    let req = Request::new(GetStatsRequest {
-        name: args.name.clone(),
-        reset: args.reset,
-    });
+    let req = Request::new(GetStatsRequest { name: args.name.clone(), reset: args.reset });
     let resp = stats
         .get_stats(req)
         .await
@@ -410,10 +401,7 @@ pub async fn execute_stats_query(args: &StatsQueryArgs) -> Result<(), CliError> 
     let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
     let mut stats = client.stats_client();
 
-    let req = Request::new(QueryStatsRequest {
-        pattern: args.pattern.clone(),
-        reset: args.reset,
-    });
+    let req = Request::new(QueryStatsRequest { pattern: args.pattern.clone(), reset: args.reset });
     let resp = stats
         .query_stats(req)
         .await
@@ -431,9 +419,7 @@ pub async fn execute_list_inbounds(args: &ListInboundsArgs) -> Result<(), CliErr
     let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
     let mut handler = client.handler_client();
 
-    let req = Request::new(ListInboundsRequest {
-        is_only_tags: args.only_tags,
-    });
+    let req = Request::new(ListInboundsRequest { is_only_tags: args.only_tags });
     let resp = handler
         .list_inbounds(req)
         .await
@@ -534,18 +520,16 @@ pub async fn execute_add_user(args: &AddUserArgs) -> Result<(), CliError> {
                 r#type: "xray.app.proxyman.command.AddUserOperation".to_string(),
                 value: prost::Message::encode_to_vec(&op),
             };
-            let req = Request::new(AlterInboundRequest {
-                tag: tag.clone(),
-                operation: Some(typed),
-            });
+            let req =
+                Request::new(AlterInboundRequest { tag: tag.clone(), operation: Some(typed) });
             match handler.alter_inbound(req).await {
                 Ok(_) => {
                     println!("add user: ok");
                     success += 1;
-                }
+                },
                 Err(e) => {
                     println!("add user error: {e}");
-                }
+                },
             }
         }
     }
@@ -570,10 +554,8 @@ pub async fn execute_remove_user(args: &RemoveUserArgs) -> Result<(), CliError> 
             r#type: "xray.app.proxyman.command.RemoveUserOperation".to_string(),
             value: prost::Message::encode_to_vec(&op),
         };
-        let req = Request::new(AlterInboundRequest {
-            tag: args.tag.clone(),
-            operation: Some(typed),
-        });
+        let req =
+            Request::new(AlterInboundRequest { tag: args.tag.clone(), operation: Some(typed) });
         match handler.alter_inbound(req).await {
             Ok(_) => success += 1,
             Err(e) => println!("remove user error: {e}"),
@@ -588,10 +570,8 @@ pub async fn execute_inbound_user(args: &InboundUserArgs) -> Result<(), CliError
     let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
     let mut handler = client.handler_client();
 
-    let req = Request::new(GetInboundUserRequest {
-        tag: args.tag.clone(),
-        email: args.email.clone(),
-    });
+    let req =
+        Request::new(GetInboundUserRequest { tag: args.tag.clone(), email: args.email.clone() });
     let resp = handler
         .get_inbound_users(req)
         .await
@@ -606,14 +586,10 @@ pub async fn execute_inbound_user_count(args: &InboundUserCountArgs) -> Result<(
     let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
     let mut handler = client.handler_client();
 
-    let req = Request::new(GetInboundUserRequest {
-        tag: args.tag.clone(),
-        email: String::new(),
-    });
-    let resp = handler
-        .get_inbound_users_count(req)
-        .await
-        .map_err(|e| CliError::ApiRequestFailed(format!("failed to get inbound user count: {e}")))?;
+    let req = Request::new(GetInboundUserRequest { tag: args.tag.clone(), email: String::new() });
+    let resp = handler.get_inbound_users_count(req).await.map_err(|e| {
+        CliError::ApiRequestFailed(format!("failed to get inbound user count: {e}"))
+    })?;
 
     print_response(&resp.into_inner(), args.api.json);
     Ok(())
@@ -624,22 +600,18 @@ pub async fn execute_balancer_info(args: &BalancerInfoArgs) -> Result<(), CliErr
     let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
     let mut routing = client.routing_client();
 
-    let req = Request::new(GetBalancerInfoRequest {
-        tag: args.balancer.clone(),
-    });
+    let req = Request::new(GetBalancerInfoRequest { tag: args.balancer.clone() });
     let resp = routing
         .get_balancer_info(req)
         .await
         .map_err(|e| CliError::ApiRequestFailed(format!("failed to get balancer info: {e}")))?
         .into_inner();
- 
+
     // Go balancer_info.go:56-61：--json 消费 → 纯 JSON；缺省 → 表格。
     if args.api.json {
         print_json_value(&balancer_info_json(&resp));
     } else {
-        show_balancer_info_table(
-            &resp.balancer.unwrap_or_default(),
-        );
+        show_balancer_info_table(&resp.balancer.unwrap_or_default());
     }
     Ok(())
 }
@@ -655,10 +627,8 @@ pub async fn execute_balancer_override(args: &BalancerOverrideArgs) -> Result<()
     let mut routing = client.routing_client();
 
     let target = if args.remove { String::new() } else { args.target.clone() };
-    let req = Request::new(OverrideBalancerTargetRequest {
-        balancer_tag: args.balancer.clone(),
-        target,
-    });
+    let req =
+        Request::new(OverrideBalancerTargetRequest { balancer_tag: args.balancer.clone(), target });
     routing
         .override_balancer_target(req)
         .await
@@ -688,18 +658,13 @@ pub async fn execute_source_ip_block(args: &SourceIpBlockArgs) -> Result<(), Cli
     });
 
     let config = serde_json::to_vec(&routing_json).unwrap_or_default();
-    let typed = TypedMessage {
-        r#type: "xray.app.router.RoutingConfig".to_string(),
-        value: config,
-    };
+    let typed = TypedMessage { r#type: "xray.app.router.RoutingConfig".to_string(), value: config };
 
     let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
     let mut routing = client.routing_client();
 
     if args.reset {
-        let rm_req = Request::new(RemoveRuleRequest {
-            rule_tag: args.rule_tag.clone(),
-        });
+        let rm_req = Request::new(RemoveRuleRequest { rule_tag: args.rule_tag.clone() });
         let rm_resp = routing
             .remove_rule(rm_req)
             .await
@@ -707,10 +672,7 @@ pub async fn execute_source_ip_block(args: &SourceIpBlockArgs) -> Result<(), Cli
         print_response(&rm_resp.into_inner(), args.api.json);
     }
 
-    let req = Request::new(AddRuleRequest {
-        config: Some(typed),
-        should_append: true,
-    });
+    let req = Request::new(AddRuleRequest { config: Some(typed), should_append: true });
     let resp = routing
         .add_rule(req)
         .await
@@ -726,10 +688,7 @@ pub async fn execute_stats_online(args: &StatsOnlineArgs) -> Result<(), CliError
     let mut stats = client.stats_client();
 
     let stat_name = format!("user>>>{}>>>online", args.email);
-    let req = Request::new(GetStatsRequest {
-        name: stat_name,
-        reset: false,
-    });
+    let req = Request::new(GetStatsRequest { name: stat_name, reset: false });
     let resp = stats
         .get_stats_online(req)
         .await
@@ -746,9 +705,7 @@ pub async fn execute_online_ip_list(args: &OnlineIpListArgs) -> Result<(), CliEr
 
     if args.all {
         if args.email.is_some() {
-            return Err(CliError::InvalidArgument(
-                "-all and -email are mutually exclusive".into(),
-            ));
+            return Err(CliError::InvalidArgument("-all and -email are mutually exclusive".into()));
         }
         let req = Request::new(GetUsersStatsRequest {
             include_traffic: args.include_traffic,
@@ -766,16 +723,10 @@ pub async fn execute_online_ip_list(args: &OnlineIpListArgs) -> Result<(), CliEr
             .as_deref()
             .ok_or_else(|| CliError::InvalidArgument("either -all or -email required".into()))?;
         let stat_name = format!("user>>>{email}>>>online");
-        let req = Request::new(GetStatsRequest {
-            name: stat_name,
-            reset: false,
-        });
-        let resp = stats
-            .get_stats_online_ip_list(req)
-            .await
-            .map_err(|e| {
-                CliError::ApiRequestFailed(format!("failed to get online ip list: {e}"))
-            })?;
+        let req = Request::new(GetStatsRequest { name: stat_name, reset: false });
+        let resp = stats.get_stats_online_ip_list(req).await.map_err(|e| {
+            CliError::ApiRequestFailed(format!("failed to get online ip list: {e}"))
+        })?;
         // Go stats_online_ip_list.go:76-85：-email 分支恒 showJSONResponse。
         print_json_value(&online_ip_list_json(&resp.into_inner()));
     }
@@ -805,7 +756,9 @@ pub async fn execute_online_users(args: &OnlineUsersArgs) -> Result<(), CliError
 ///
 /// 对应 Go `extractInboundUsers` + 各协议的 `Build()`：支持 vmess / vless / trojan / ss /
 /// ss2022。每个用户构造 proto `User { level, email, account: TypedMessage }`。
-fn extract_users_from_inbound(ib: &InboundHandlerConfig) -> Vec<xray_proto::xray::common::protocol::User> {
+fn extract_users_from_inbound(
+    ib: &InboundHandlerConfig,
+) -> Vec<xray_proto::xray::common::protocol::User> {
     let Some(proxy) = &ib.proxy_settings else { return Vec::new() };
     // proxy.value 是 settings JSON 编码字节；根据 protocol 字段决定字段路径。
     let settings: serde_json::Value = match serde_json::from_slice(&proxy.value) {
@@ -831,20 +784,11 @@ fn extract_users_from_inbound(ib: &InboundHandlerConfig) -> Vec<xray_proto::xray
             continue;
         };
         for entry in arr {
-            let email = entry
-                .get("email")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let level = entry
-                .get("level")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
+            let email = entry.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let level = entry.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let account_json = serde_json::to_vec(entry).unwrap_or_default();
-            let account = TypedMessage {
-                r#type: format!("xray.proxy.{proto}.Account"),
-                value: account_json,
-            };
+            let account =
+                TypedMessage { r#type: format!("xray.proxy.{proto}.Account"), value: account_json };
             users.push(xray_proto::xray::common::protocol::User {
                 level,
                 email,
@@ -860,7 +804,10 @@ fn extract_users_from_inbound(ib: &InboundHandlerConfig) -> Vec<xray_proto::xray
 mod tests {
     use super::*;
 
-    fn inbound_with_settings(proto: &str, settings_json: serde_json::Value) -> InboundHandlerConfig {
+    fn inbound_with_settings(
+        proto: &str,
+        settings_json: serde_json::Value,
+    ) -> InboundHandlerConfig {
         let value = serde_json::to_vec(&settings_json).unwrap();
         InboundHandlerConfig {
             tag: "vless-in".into(),
@@ -926,11 +873,8 @@ mod tests {
 
     #[test]
     fn extract_missing_proxy_settings_returns_empty() {
-        let ib = InboundHandlerConfig {
-            tag: "x".into(),
-            receiver_settings: None,
-            proxy_settings: None,
-        };
+        let ib =
+            InboundHandlerConfig { tag: "x".into(), receiver_settings: None, proxy_settings: None };
         assert!(extract_users_from_inbound(&ib).is_empty());
     }
 
@@ -956,23 +900,15 @@ mod tests {
         };
         let resp = GetBalancerInfoResponse {
             balancer: Some(BalancerMsg {
-                r#override: Some(OverrideInfo {
-                    target: "out-direct".into(),
-                }),
+                r#override: Some(OverrideInfo { target: "out-direct".into() }),
                 principle_target: Some(PrincipleTargetInfo {
                     tag: vec!["out-a".into(), "out-b".into()],
                 }),
             }),
         };
         let v = balancer_info_json(&resp);
-        assert_eq!(
-            v["balancer"]["override"]["target"],
-            serde_json::json!("out-direct")
-        );
-        assert_eq!(
-            v["balancer"]["principleTarget"]["tag"],
-            serde_json::json!(["out-a", "out-b"])
-        );
+        assert_eq!(v["balancer"]["override"]["target"], serde_json::json!("out-direct"));
+        assert_eq!(v["balancer"]["principleTarget"]["tag"], serde_json::json!(["out-a", "out-b"]));
     }
 
     #[test]
@@ -985,10 +921,7 @@ mod tests {
     fn online_ip_list_json_maps_ips_table() {
         let mut ips = std::collections::HashMap::new();
         ips.insert("1.2.3.4".to_string(), 1700000000i64);
-        let resp = GetStatsOnlineIpListResponse {
-            name: "user>>>a@x>>>online".into(),
-            ips,
-        };
+        let resp = GetStatsOnlineIpListResponse { name: "user>>>a@x>>>online".into(), ips };
         let v = online_ip_list_json(&resp);
         assert_eq!(v["name"], serde_json::json!("user>>>a@x>>>online"));
         assert_eq!(v["ips"]["1.2.3.4"], serde_json::json!(1700000000i64));

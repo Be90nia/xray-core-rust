@@ -57,10 +57,7 @@ mod tests {
     fn deterministic_same_input_same_hash() {
         let der = b"hello cert";
         assert_eq!(generate_cert_hash(der), generate_cert_hash(der));
-        assert_eq!(
-            generate_cert_hash_hex(der),
-            generate_cert_hash_hex(der)
-        );
+        assert_eq!(generate_cert_hash_hex(der), generate_cert_hash_hex(der));
     }
 
     #[test]

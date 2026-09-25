@@ -2,8 +2,7 @@
 //!
 //! 全部纯函数，单元测试锚定行为。
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 /// 每场景累计计数（原子，由场景 worker 更新、采样器快照）。
 #[derive(Debug, Default, Clone)]
@@ -131,11 +130,8 @@ pub fn judge_leak(samples: &[(f64, f64)], threshold_pct_per_h: f64) -> Option<Le
     let first_mb = samples[0].1;
     let last_mb = samples[n - 1].1;
     let peak_mb = samples.iter().map(|s| s.1).fold(f64::MIN, f64::max);
-    let slope_pct_per_h = if baseline_mb > 0.0 {
-        slope_mb_per_h / baseline_mb * 100.0
-    } else {
-        f64::INFINITY
-    };
+    let slope_pct_per_h =
+        if baseline_mb > 0.0 { slope_mb_per_h / baseline_mb * 100.0 } else { f64::INFINITY };
     Some(LeakVerdict {
         slope_mb_per_h,
         slope_pct_per_h,
@@ -173,11 +169,7 @@ pub fn render_summary(
 ) -> String {
     let mut md = String::with_capacity(4096);
     md.push_str(&format!("# xray-stress summary — run `{run_id}`\n\n"));
-    md.push_str(&format!(
-        "- duration: {}s\n- finished: {}\n\n",
-        duration.as_secs(),
-        unix_now()
-    ));
+    md.push_str(&format!("- duration: {}s\n- finished: {}\n\n", duration.as_secs(), unix_now()));
 
     // 内存判定
     md.push_str("## 内存（进程 RSS）\n\n");
@@ -212,14 +204,12 @@ pub fn render_summary(
 
     // 场景表
     md.push_str("## 场景计数\n\n");
-    md.push_str("| scenario | conn_ok | conn_fail | tx_bytes | rx_bytes | p50_ms | p95_ms | p99_ms |\n");
+    md.push_str(
+        "| scenario | conn_ok | conn_fail | tx_bytes | rx_bytes | p50_ms | p95_ms | p99_ms |\n",
+    );
     md.push_str("|---|---|---|---|---|---|---|---|\n");
     for s in scenarios {
-        let (p50, p95, p99) = (
-            s.percentile(0.50),
-            s.percentile(0.95),
-            s.percentile(0.99),
-        );
+        let (p50, p95, p99) = (s.percentile(0.50), s.percentile(0.95), s.percentile(0.99));
         let fmt = |v: Option<f64>| v.map_or("-".into(), |x| format!("{x:.1}"));
         md.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
@@ -301,7 +291,8 @@ mod tests {
     #[test]
     fn leak_suspect_above_threshold() {
         // 基线 100MB，每小时涨 10MB = 10%/h > 5%/h → SUSPECT
-        let s: Vec<(f64, f64)> = (0..10).map(|i| (i as f64 * 3600.0, 100.0 + i as f64 * 10.0)).collect();
+        let s: Vec<(f64, f64)> =
+            (0..10).map(|i| (i as f64 * 3600.0, 100.0 + i as f64 * 10.0)).collect();
         let v = judge_leak(&s, 5.0).unwrap();
         assert!(v.suspect, "slope_pct={}", v.slope_pct_per_h);
         assert!(approx(v.peak_mb, 190.0, 1e-9));
@@ -311,7 +302,8 @@ mod tests {
     #[test]
     fn leak_clean_below_threshold() {
         // 稳态 100MB，斜率 0 → 非 SUSPECT
-        let s: Vec<(f64, f64)> = (0..10).map(|i| (i as f64 * 3600.0, 100.0 + (i % 2) as f64)).collect();
+        let s: Vec<(f64, f64)> =
+            (0..10).map(|i| (i as f64 * 3600.0, 100.0 + (i % 2) as f64)).collect();
         let v = judge_leak(&s, 5.0).unwrap();
         assert!(!v.suspect);
     }

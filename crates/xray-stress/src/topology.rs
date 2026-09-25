@@ -68,10 +68,11 @@ pub async fn start_echo() -> std::net::SocketAddr {
                 // EMFILE/ECONNABORTED 等瞬时 accept 错误必须退避重试而非退出：
                 // 退出即 listener 永久死亡→该场景所有连接 refused 风暴（run 35587906510 实锤：
                 // 双平台风暴场景各 fail 12.6-15 万全源于此），且失败循环连带内存增长
-                Err(e) if e.kind() == tokio::io::ErrorKind::OutOfMemory
-                    || e.kind() == tokio::io::ErrorKind::ConnectionAborted
-                    || e.raw_os_error() == Some(24 /*EMFILE*/)
-                    || e.raw_os_error() == Some(23 /*EMFILE variant*/) =>
+                Err(e)
+                    if e.kind() == tokio::io::ErrorKind::OutOfMemory
+                        || e.kind() == tokio::io::ErrorKind::ConnectionAborted
+                        || e.raw_os_error() == Some(24 /* EMFILE */)
+                        || e.raw_os_error() == Some(23 /* EMFILE variant */) =>
                 {
                     tracing::warn!("echo accept transient error, backing off: {e}");
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -95,10 +96,7 @@ fn reality_keypair() -> (String, String) {
     let secret = StaticSecret::from(priv_bytes);
     let public = PublicKey::from(&secret);
     let b64 = base64::engine::general_purpose::STANDARD;
-    (
-        b64.encode(priv_bytes),
-        b64.encode(public.as_bytes()),
-    )
+    (b64.encode(priv_bytes), b64.encode(public.as_bytes()))
 }
 
 fn built_inbound(kind: &str, data: Vec<u8>, tag: &str, port: u16) -> BuiltInbound {
@@ -112,7 +110,12 @@ fn built_inbound(kind: &str, data: Vec<u8>, tag: &str, port: u16) -> BuiltInboun
     }
 }
 
-fn built_outbound(kind: &str, data: Vec<u8>, tag: &str, stream: serde_json::Value) -> BuiltOutbound {
+fn built_outbound(
+    kind: &str,
+    data: Vec<u8>,
+    tag: &str,
+    stream: serde_json::Value,
+) -> BuiltOutbound {
     BuiltOutbound {
         entry: BuiltEntry { kind: kind.into(), data },
         tag: tag.into(),
@@ -192,8 +195,10 @@ pub async fn start_reality_link(
     client_cfg.inbounds.push(socks_inbound(socks_port));
     client_cfg.outbounds.push(vless_outbound(vless_port, client_reality));
 
-    let (_si, _so, sh) = start_full(&server_cfg).await.map_err(|e| anyhow::anyhow!("reality server: {e}"))?;
-    let (_ci, _co, ch) = start_full(&client_cfg).await.map_err(|e| anyhow::anyhow!("reality client: {e}"))?;
+    let (_si, _so, sh) =
+        start_full(&server_cfg).await.map_err(|e| anyhow::anyhow!("reality server: {e}"))?;
+    let (_ci, _co, ch) =
+        start_full(&client_cfg).await.map_err(|e| anyhow::anyhow!("reality client: {e}"))?;
     tokio::time::sleep(READY_WARMUP).await;
     Ok((socks_port, sh, ch))
 }
@@ -217,8 +222,10 @@ pub async fn start_kcp_link(
     client_cfg.inbounds.push(socks_inbound(socks_port));
     client_cfg.outbounds.push(vless_outbound(vless_port, kcp));
 
-    let (_si, _so, sh) = start_full(&server_cfg).await.map_err(|e| anyhow::anyhow!("kcp server: {e}"))?;
-    let (_ci, _co, ch) = start_full(&client_cfg).await.map_err(|e| anyhow::anyhow!("kcp client: {e}"))?;
+    let (_si, _so, sh) =
+        start_full(&server_cfg).await.map_err(|e| anyhow::anyhow!("kcp server: {e}"))?;
+    let (_ci, _co, ch) =
+        start_full(&client_cfg).await.map_err(|e| anyhow::anyhow!("kcp client: {e}"))?;
     tokio::time::sleep(READY_WARMUP).await;
     Ok((socks_port, sh, ch))
 }
@@ -275,11 +282,7 @@ pub async fn socks_roundtrip(
 // 实现为 vmess + splithttp ALPN=h3（QUIC 承载）。
 
 /// 双实例拓扑句柄：(client socks 端口, server 任务句柄, client 任务句柄)。
-pub type LinkHandles = (
-    u16,
-    Vec<tokio::task::JoinHandle<()>>,
-    Vec<tokio::task::JoinHandle<()>>,
-);
+pub type LinkHandles = (u16, Vec<tokio::task::JoinHandle<()>>, Vec<tokio::task::JoinHandle<()>>);
 
 const STRESS_TROJAN_PASSWORD: &str = "stress-trojan-pass";
 const STRESS_SS_PASSWORD: &str = "stress-ss-pass";
@@ -393,10 +396,7 @@ fn http_inbound(port: u16, tag: &str) -> BuiltInbound {
 fn http_outbound(upstream_port: u16) -> BuiltOutbound {
     built_outbound(
         "http",
-        format!(
-            r#"{{"servers":[{{"address":"127.0.0.1","port":{upstream_port}}}]}}"#
-        )
-        .into_bytes(),
+        format!(r#"{{"servers":[{{"address":"127.0.0.1","port":{upstream_port}}}]}}"#).into_bytes(),
         "proxy",
         serde_json::json!({"network":"tcp","security":"none"}),
     )
@@ -454,12 +454,10 @@ async fn start_dual(
     client_cfg.inbounds.push(socks_inbound(socks_port));
     client_cfg.outbounds.push(client_out);
 
-    let (_si, _so, sh) = start_full(&server_cfg)
-        .await
-        .map_err(|e| anyhow::anyhow!("{link} server: {e}"))?;
-    let (_ci, _co, ch) = start_full(&client_cfg)
-        .await
-        .map_err(|e| anyhow::anyhow!("{link} client: {e}"))?;
+    let (_si, _so, sh) =
+        start_full(&server_cfg).await.map_err(|e| anyhow::anyhow!("{link} server: {e}"))?;
+    let (_ci, _co, ch) =
+        start_full(&client_cfg).await.map_err(|e| anyhow::anyhow!("{link} client: {e}"))?;
     tokio::time::sleep(READY_WARMUP).await;
     Ok((socks_port, sh, ch))
 }
@@ -567,9 +565,8 @@ pub async fn start_anytls_link(_echo_port: u16) -> anyhow::Result<LinkHandles> {
     let mut client_cfg = BuiltConfig::default();
     client_cfg.inbounds.push(socks_inbound(socks_port));
     client_cfg.outbounds.push(anytls_outbound(proto_port));
-    let (_ci, _co, ch) = start_full(&client_cfg)
-        .await
-        .map_err(|e| anyhow::anyhow!("anytls client: {e}"))?;
+    let (_ci, _co, ch) =
+        start_full(&client_cfg).await.map_err(|e| anyhow::anyhow!("anytls client: {e}"))?;
     tokio::time::sleep(READY_WARMUP).await;
     Ok((socks_port, vec![keep], ch))
 }
@@ -655,8 +652,7 @@ mod tests {
     /// s7 模板：ss 双端 aes-256-gcm + 同密码。
     #[test]
     fn ss_template_fields() {
-        let iv: serde_json::Value =
-            serde_json::from_slice(&ss_inbound(1, "t").entry.data).unwrap();
+        let iv: serde_json::Value = serde_json::from_slice(&ss_inbound(1, "t").entry.data).unwrap();
         assert_eq!(iv["clients"][0]["method"], "aes-256-gcm");
         let out = ss_outbound(34567, serde_json::json!({"network":"tcp","security":"none"}));
         let ov: serde_json::Value = serde_json::from_slice(&out.entry.data).unwrap();
@@ -719,9 +715,11 @@ mod tests {
         assert_eq!(server["network"], "splithttp");
         assert_eq!(server["security"], "tls");
         assert_eq!(server["tlsSettings"]["alpn"], serde_json::json!(["h3"]));
-        assert!(server["tlsSettings"]["certificates"][0]["certificate"]
-            .as_array()
-            .is_some_and(|a| !a.is_empty()));
+        assert!(
+            server["tlsSettings"]["certificates"][0]["certificate"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty())
+        );
         assert_eq!(client["tlsSettings"]["alpn"], serde_json::json!(["h3"]));
         assert_eq!(client["tlsSettings"]["allowInsecure"], true);
         assert_eq!(client["splithttpSettings"]["mode"], "auto");

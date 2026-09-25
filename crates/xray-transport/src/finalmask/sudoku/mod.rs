@@ -12,17 +12,17 @@
 mod codec;
 mod table;
 
-use std::io;
-use std::sync::Arc;
+use std::{io, sync::Arc};
 
 use async_trait::async_trait;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::select;
-
-use super::{AsyncIo, Tcpmask, Udpmask, UdpIo, UDP_SIZE};
 use codec::{Codec, PackedDecoder, PackedEncoder, decode_bytes};
-use table::{get_tables, Layout};
+use table::{Layout, get_tables};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    select,
+};
 
+use super::{AsyncIo, Tcpmask, UDP_SIZE, UdpIo, Udpmask};
 
 /// Sudoku 配置（对应 Go `sudoku.Config` protobuf）。
 #[derive(Debug, Clone, Default)]
@@ -45,11 +45,7 @@ pub struct SudokuConfig {
 fn normalized_padding(config: &SudokuConfig) -> (usize, usize) {
     let p_min = (config.padding_min as usize).min(100);
     let p_max_raw = config.padding_max as usize;
-    let p_max = if p_max_raw < p_min {
-        p_min
-    } else {
-        p_max_raw.min(100)
-    };
+    let p_max = if p_max_raw < p_min { p_min } else { p_max_raw.min(100) };
     (p_min, p_max)
 }
 
@@ -189,13 +185,13 @@ struct SudokuUdpConn {
 }
 
 impl SudokuUdpConn {
-    fn new(inner: Box<dyn UdpIo>, tables: Vec<Arc<table::Table>>, p_min: usize, p_max: usize) -> Self {
-        Self {
-            inner,
-            tables,
-            p_min,
-            p_max,
-        }
+    fn new(
+        inner: Box<dyn UdpIo>,
+        tables: Vec<Arc<table::Table>>,
+        p_min: usize,
+        p_max: usize,
+    ) -> Self {
+        Self { inner, tables, p_min, p_max }
     }
 }
 
@@ -204,9 +200,8 @@ impl UdpIo for SudokuUdpConn {
     async fn send_to(&self, buf: &[u8], addr: std::net::SocketAddr) -> io::Result<usize> {
         // UDP 编码每个 datagram 都从头开始（Go conn_udp.go 同语义）
         let mut codec = Codec::new(self.tables.clone(), self.p_min, self.p_max);
-        let encoded = codec
-            .encode(buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let encoded =
+            codec.encode(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         // 编码失败时静默 drop（Go 同样返回 0, nil）
         self.inner.send_to(&encoded, addr).await
     }
@@ -231,7 +226,7 @@ impl UdpIo for SudokuUdpConn {
                     }
                     buf[..decoded.len()].copy_from_slice(&decoded);
                     return Ok((decoded.len(), addr));
-                }
+                },
                 Err(_) => continue, // 解码错误，drop packet
             }
         }
@@ -244,29 +239,19 @@ impl UdpIo for SudokuUdpConn {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tokio::io::AsyncWriteExt;
 
+    use super::*;
+
     fn sample_config() -> SudokuConfig {
-        SudokuConfig {
-            password: "integration_test".into(),
-            ..Default::default()
-        }
+        SudokuConfig { password: "integration_test".into(), ..Default::default() }
     }
 
     #[test]
     fn normalized_padding_clamps() {
-        let c = SudokuConfig {
-            padding_min: 150,
-            padding_max: 200,
-            ..Default::default()
-        };
+        let c = SudokuConfig { padding_min: 150, padding_max: 200, ..Default::default() };
         assert_eq!(normalized_padding(&c), (100, 100));
-        let c = SudokuConfig {
-            padding_min: 50,
-            padding_max: 30,
-            ..Default::default()
-        };
+        let c = SudokuConfig { padding_min: 50, padding_max: 30, ..Default::default() };
         assert_eq!(normalized_padding(&c), (50, 50));
     }
 
@@ -280,9 +265,7 @@ mod tests {
         let addr_b: SocketAddr = b.local_addr().unwrap();
 
         let config = sample_config();
-        let wrapped_a: Box<dyn UdpIo> = config
-            .wrap_packet_conn_client(Box::new(a), 0, 0)
-            .unwrap();
+        let wrapped_a: Box<dyn UdpIo> = config.wrap_packet_conn_client(Box::new(a), 0, 0).unwrap();
 
         // 用裸 socket b 接收编码后的包
         let payload = b"hello sudoku udp";
@@ -308,12 +291,8 @@ mod tests {
         let addr_b = b.local_addr().unwrap();
 
         let config = sample_config();
-        let wrapped_a: Box<dyn UdpIo> = config
-            .wrap_packet_conn_client(Box::new(a), 0, 0)
-            .unwrap();
-        let wrapped_b: Box<dyn UdpIo> = config
-            .wrap_packet_conn_server(Box::new(b), 0, 0)
-            .unwrap();
+        let wrapped_a: Box<dyn UdpIo> = config.wrap_packet_conn_client(Box::new(a), 0, 0).unwrap();
+        let wrapped_b: Box<dyn UdpIo> = config.wrap_packet_conn_server(Box::new(b), 0, 0).unwrap();
 
         let payload = b"pair roundtrip sudoku";
         wrapped_a.send_to(payload, addr_b).await.unwrap();
@@ -329,8 +308,10 @@ mod tests {
         let (client_raw, server_raw) = tokio::io::duplex(UDP_SIZE * 4);
 
         let config = sample_config();
-        let wrapped_client: Box<dyn AsyncIo> = config.wrap_conn_client(Box::new(client_raw)).unwrap();
-        let wrapped_server: Box<dyn AsyncIo> = config.wrap_conn_server(Box::new(server_raw)).unwrap();
+        let wrapped_client: Box<dyn AsyncIo> =
+            config.wrap_conn_client(Box::new(client_raw)).unwrap();
+        let wrapped_server: Box<dyn AsyncIo> =
+            config.wrap_conn_server(Box::new(server_raw)).unwrap();
 
         use tokio::io::split;
         let (_cr, mut cw) = split(wrapped_client);
@@ -355,8 +336,10 @@ mod tests {
         let (client_raw, server_raw) = tokio::io::duplex(UDP_SIZE * 4);
 
         let config = sample_config();
-        let wrapped_client: Box<dyn AsyncIo> = config.wrap_conn_client(Box::new(client_raw)).unwrap();
-        let wrapped_server: Box<dyn AsyncIo> = config.wrap_conn_server(Box::new(server_raw)).unwrap();
+        let wrapped_client: Box<dyn AsyncIo> =
+            config.wrap_conn_client(Box::new(client_raw)).unwrap();
+        let wrapped_server: Box<dyn AsyncIo> =
+            config.wrap_conn_server(Box::new(server_raw)).unwrap();
 
         use tokio::io::split;
         let (mut cr, _cw) = split(wrapped_client);

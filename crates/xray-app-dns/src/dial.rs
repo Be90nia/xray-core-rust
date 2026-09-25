@@ -7,26 +7,29 @@
 //! 本 crate 定义 [`QueryDialer`] trait + 进程级共享槽，装配层（xray-core
 //! functions.rs）在 dispatcher init 完成后注入。
 //!
-//! - 未注入（直连兜底）：nameserver 行为与既往一致（IP 直连；域名走
-//!   [`HostResolver`] 每查询现解析——弃启动期钉死 IP）。
-//! - 已注入：TCP/DoH/DoT 查询经 [`QueryDialer::dial_tcp`]（Link 流），
-//!   UDP-classic 经 [`QueryDialer::dial_udp`]（数据报会话，XUDP 帧约定）。
-//! - DoQ（`quic://`）：Go `nameserver_quic.go` 无 dispatcher 接线（仅
-//!   `quic+local` 直连形态），维持直连。
+//! - 未注入（直连兜底）：nameserver 行为与既往一致（IP 直连；域名走 [`HostResolver`]
+//!   每查询现解析——弃启动期钉死 IP）。
+//! - 已注入：TCP/DoH/DoT 查询经 [`QueryDialer::dial_tcp`]（Link 流）， UDP-classic 经
+//!   [`QueryDialer::dial_udp`]（数据报会话，XUDP 帧约定）。
+//! - DoQ（`quic://`）：Go `nameserver_quic.go` 无 dispatcher 接线（仅 `quic+local`
+//!   直连形态），维持直连。
 
-use std::future::Future;
-use std::io;
-use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::Duration;
+use std::{
+    future::Future,
+    io,
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use parking_lot::RwLock;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-
-use xray_buf::io::{Reader as MbReader, Writer as MbWriter};
-use xray_buf::multi::MultiBuffer;
+use xray_buf::{
+    io::{Reader as MbReader, Writer as MbWriter},
+    multi::MultiBuffer,
+};
 use xray_common::net::destination::Destination;
 use xray_transport::connection::Connection;
 
@@ -57,10 +60,15 @@ impl HostResolver for SystemHostResolver {
                 .map_err(|e| io::Error::other(format!("resolver builder: {e}")))?
                 .build()
                 .map_err(|e| io::Error::other(format!("resolver build: {e}")))?;
-            let lookup = tokio::time::timeout(Duration::from_secs(4), resolver.lookup_ip(format!("{host}.")))
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("resolve {host} timeout")))?
-                .map_err(|e| io::Error::other(format!("resolve {host}: {e}")))?;
+            let lookup = tokio::time::timeout(
+                Duration::from_secs(4),
+                resolver.lookup_ip(format!("{host}.")),
+            )
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, format!("resolve {host} timeout"))
+            })?
+            .map_err(|e| io::Error::other(format!("resolve {host}: {e}")))?;
             Ok(lookup.iter().collect())
         })
     }
@@ -124,11 +132,7 @@ pub struct LinkStream {
 
 impl LinkStream {
     pub fn new(reader: Box<dyn MbReader>, writer: Box<dyn MbWriter>) -> Self {
-        Self {
-            reader,
-            pending: MultiBuffer::new(),
-            writer,
-        }
+        Self { reader, pending: MultiBuffer::new(), writer }
     }
 }
 
@@ -161,12 +165,12 @@ impl AsyncRead for LinkStream {
                         return Poll::Ready(Ok(()));
                     }
                     this.pending.merge(mb);
-                }
+                },
                 // pipe 关闭/idle 超时（Error::Eof）→ 流 EOF。
                 Poll::Ready(Err(xray_buf::io::Error::Eof)) => return Poll::Ready(Ok(())),
                 Poll::Ready(Err(e)) => {
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e.to_string())))
-                }
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e.to_string())));
+                },
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -193,10 +197,10 @@ impl AsyncWrite for LinkStream {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
             Poll::Ready(Err(xray_buf::io::Error::Eof)) => {
                 Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "link closed")))
-            }
+            },
             Poll::Ready(Err(e)) => {
                 Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e.to_string())))
-            }
+            },
             Poll::Pending => Poll::Pending,
         }
     }
@@ -293,12 +297,13 @@ pub(crate) async fn connect_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use xray_common::net::address::Address;
-    use xray_common::net::port::Port;
+    use xray_common::net::{address::Address, port::Port};
     use xray_transport::link::Link;
+
+    use super::*;
 
     /// 共享 dialer 槽是进程级全局：涉槽测试须串行（udp.rs DIALER_SLOT_LOCK 同款）。
     static DIALER_SLOT_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
@@ -317,6 +322,7 @@ mod tests {
                 Err(io::Error::other("dialer invoked"))
             })
         }
+
         fn dial_udp(
             &self,
             _dest: &Destination,

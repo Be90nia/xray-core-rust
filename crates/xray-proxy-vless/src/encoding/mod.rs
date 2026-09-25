@@ -117,18 +117,13 @@ pub mod addr_type {
 /// 重新导出 proto 生成的 [`Addons`]，避免上层重复路径。
 pub type EncAddons = Addons;
 
-/**
- * 工厂函数：返回一个空的 [`Addons`]（`flow=""`, `seed=[]`）。
- *
- * 因为 `Addons` 是 proto 生成的外部类型，不能在 vless crate 内部 impl `Default`
- * （orphan rule），所以提供工厂函数作为替代。
- */
+/// 工厂函数：返回一个空的 [`Addons`]（`flow=""`, `seed=[]`）。
+///
+/// 因为 `Addons` 是 proto 生成的外部类型，不能在 vless crate 内部 impl `Default`
+/// （orphan rule），所以提供工厂函数作为替代。
 #[must_use]
 pub fn empty_addons() -> Addons {
-    Addons {
-        flow: String::new(),
-        seed: Vec::new(),
-    }
+    Addons { flow: String::new(), seed: Vec::new() }
 }
 
 /// 把地址 + 端口按 VLESS 格式写入 `out`（2B BE port + 1B type + data）。
@@ -140,7 +135,7 @@ pub fn write_address_port(out: &mut Vec<u8>, address: &Address, port: u16) {
         Address::IPv4(v4) => {
             out.push(addr_type::IPV4);
             out.extend_from_slice(&v4.octets());
-        }
+        },
         Address::Domain(domain) => {
             out.push(addr_type::DOMAIN);
             let bytes = domain.as_bytes();
@@ -148,51 +143,41 @@ pub fn write_address_port(out: &mut Vec<u8>, address: &Address, port: u16) {
             let len = u8::try_from(bytes.len()).unwrap_or(255);
             out.push(len);
             out.extend_from_slice(&bytes[..len as usize]);
-        }
+        },
         Address::IPv6(v6) => {
             out.push(addr_type::IPV6);
             out.extend_from_slice(&v6.octets());
-        }
+        },
     }
 }
 
 /// 从 `reader` 读取地址 + 端口。
 pub async fn read_address_port<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(Address, Port)> {
     let mut port_buf = [0u8; 2];
-    reader
-        .read_exact(&mut port_buf)
-        .await
-        .map_err(|e| VlessError::Io(e))?;
+    reader.read_exact(&mut port_buf).await.map_err(|e| VlessError::Io(e))?;
     let port = u16::from_be_bytes(port_buf);
 
     let mut type_buf = [0u8; 1];
-    reader
-        .read_exact(&mut type_buf)
-        .await
-        .map_err(VlessError::Io)?;
+    reader.read_exact(&mut type_buf).await.map_err(VlessError::Io)?;
     let addr = match type_buf[0] {
         addr_type::IPV4 => {
             let mut buf = [0u8; 4];
             reader.read_exact(&mut buf).await.map_err(VlessError::Io)?;
             Address::IPv4(std::net::Ipv4Addr::from(buf))
-        }
+        },
         addr_type::DOMAIN => {
             let mut len_buf = [0u8; 1];
-            reader
-                .read_exact(&mut len_buf)
-                .await
-                .map_err(VlessError::Io)?;
+            reader.read_exact(&mut len_buf).await.map_err(VlessError::Io)?;
             let mut buf = vec![0u8; len_buf[0] as usize];
             reader.read_exact(&mut buf).await.map_err(VlessError::Io)?;
-            let domain = String::from_utf8(buf)
-                .map_err(|_| VlessError::InvalidRequestAddress)?;
+            let domain = String::from_utf8(buf).map_err(|_| VlessError::InvalidRequestAddress)?;
             Address::Domain(domain)
-        }
+        },
         addr_type::IPV6 => {
             let mut buf = [0u8; 16];
             reader.read_exact(&mut buf).await.map_err(VlessError::Io)?;
             Address::IPv6(std::net::Ipv6Addr::from(buf))
-        }
+        },
         _ => return Err(VlessError::InvalidRequestAddress),
     };
     Ok((addr, Port::new(port)))
@@ -205,8 +190,8 @@ pub async fn read_address_port<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(
 pub fn encode_header_addons(out: &mut Vec<u8>, addons: &Addons) -> Result<()> {
     if addons.flow == crate::FLOW_XRV {
         let bytes = addons.encode_to_vec();
-        let len = u8::try_from(bytes.len())
-            .map_err(|_| VlessError::Other("addons too long".into()))?;
+        let len =
+            u8::try_from(bytes.len()).map_err(|_| VlessError::Other("addons too long".into()))?;
         out.push(len);
         out.extend_from_slice(&bytes);
     } else {
@@ -218,17 +203,14 @@ pub fn encode_header_addons(out: &mut Vec<u8>, addons: &Addons) -> Result<()> {
 /// 从 `reader` 解码 `Addons`。
 pub async fn decode_header_addons<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Addons> {
     let mut len_buf = [0u8; 1];
-    reader
-        .read_exact(&mut len_buf)
-        .await
-        .map_err(VlessError::Io)?;
+    reader.read_exact(&mut len_buf).await.map_err(VlessError::Io)?;
     if len_buf[0] == 0 {
         return Ok(empty_addons());
     }
     let mut buf = vec![0u8; len_buf[0] as usize];
     reader.read_exact(&mut buf).await.map_err(VlessError::Io)?;
-    let addons = Addons::decode(&*buf)
-        .map_err(|e| VlessError::Other(format!("unmarshal addons: {e}")))?;
+    let addons =
+        Addons::decode(&*buf).map_err(|e| VlessError::Other(format!("unmarshal addons: {e}")))?;
     Ok(addons)
 }
 
@@ -241,10 +223,7 @@ pub async fn encode_response_header<W: AsyncWrite + Unpin>(
     let mut buf = Vec::with_capacity(16);
     buf.push(version);
     encode_header_addons(&mut buf, response_addons)?;
-    writer
-        .write_all(&buf)
-        .await
-        .map_err(VlessError::Io)?;
+    writer.write_all(&buf).await.map_err(VlessError::Io)?;
     Ok(())
 }
 
@@ -254,10 +233,7 @@ pub async fn decode_response_header<R: AsyncRead + Unpin>(
     expected_version: u8,
 ) -> Result<Addons> {
     let mut ver_buf = [0u8; 1];
-    reader
-        .read_exact(&mut ver_buf)
-        .await
-        .map_err(VlessError::Io)?;
+    reader.read_exact(&mut ver_buf).await.map_err(VlessError::Io)?;
     if ver_buf[0] != expected_version {
         return Err(VlessError::UnexpectedResponseVersion {
             expected: expected_version,
@@ -280,14 +256,8 @@ pub async fn write_length_packet<W: AsyncWrite + Unpin>(
 ) -> Result<()> {
     let len = u16::try_from(payload.len())
         .map_err(|_| VlessError::Other("packet too long for u16 length prefix".into()))?;
-    writer
-        .write_all(&len.to_be_bytes())
-        .await
-        .map_err(VlessError::Io)?;
-    writer
-        .write_all(payload)
-        .await
-        .map_err(VlessError::Io)?;
+    writer.write_all(&len.to_be_bytes()).await.map_err(VlessError::Io)?;
+    writer.write_all(payload).await.map_err(VlessError::Io)?;
     Ok(())
 }
 
@@ -297,16 +267,10 @@ pub async fn write_length_packet<W: AsyncWrite + Unpin>(
 /// `Err(VlessError::Io(UnexpectedEof))`，由调用方决定是否吞掉。
 pub async fn read_length_packet<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 2];
-    reader
-        .read_exact(&mut len_buf)
-        .await
-        .map_err(VlessError::Io)?;
+    reader.read_exact(&mut len_buf).await.map_err(VlessError::Io)?;
     let len = u16::from_be_bytes(len_buf) as usize;
     let mut payload = vec![0u8; len];
-    reader
-        .read_exact(&mut payload)
-        .await
-        .map_err(VlessError::Io)?;
+    reader.read_exact(&mut payload).await.map_err(VlessError::Io)?;
     Ok(payload)
 }
 
@@ -334,8 +298,9 @@ pub async fn write_multi_length_packets<W: AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Cursor;
+
+    use super::*;
 
     fn sample_address_ipv4() -> Address {
         Address::IPv4(std::net::Ipv4Addr::new(192, 168, 1, 1))
@@ -362,13 +327,9 @@ mod tests {
         let mut cursor = Cursor::new(buf);
         // 这里用同步 helper 测，避免 tokio runtime
         // read_address_port 是 async，借助 block_on
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let (got_addr, got_port) = rt.block_on(async move {
-            read_address_port(&mut cursor).await.unwrap()
-        });
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (got_addr, got_port) =
+            rt.block_on(async move { read_address_port(&mut cursor).await.unwrap() });
         assert_eq!(got_port.value(), 443);
         assert!(got_addr.is_ipv4());
         assert_eq!(got_addr.ipv4_bytes(), Some([192, 168, 1, 1]));
@@ -383,13 +344,9 @@ mod tests {
         assert_eq!(buf.len(), expected_len);
 
         let mut cursor = Cursor::new(buf);
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let (got_addr, got_port) = rt.block_on(async move {
-            read_address_port(&mut cursor).await.unwrap()
-        });
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (got_addr, got_port) =
+            rt.block_on(async move { read_address_port(&mut cursor).await.unwrap() });
         assert_eq!(got_port.value(), 8080);
         assert!(got_addr.is_domain());
         assert_eq!(got_addr.as_domain(), Some("www.example.com"));
@@ -404,16 +361,12 @@ mod tests {
         assert_eq!(buf.len(), 19);
 
         let mut cursor = Cursor::new(buf);
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let (got_addr, got_port) = rt.block_on(async move {
-            read_address_port(&mut cursor).await.unwrap()
-        });
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (got_addr, got_port) =
+            rt.block_on(async move { read_address_port(&mut cursor).await.unwrap() });
         assert_eq!(got_port.value(), 443);
         assert!(got_addr.is_ipv6());
-        assert_eq!(got_addr.ipv6_bytes(), Some([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]));
+        assert_eq!(got_addr.ipv6_bytes(), Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]));
     }
 
     #[test]
@@ -429,10 +382,7 @@ mod tests {
     fn test_encode_header_addons_xrv() {
         // XRV flow：写 [1B len][proto bytes]
         let mut buf = Vec::new();
-        let addons = Addons {
-            flow: crate::FLOW_XRV.to_string(),
-            seed: Vec::new(),
-        };
+        let addons = Addons { flow: crate::FLOW_XRV.to_string(), seed: Vec::new() };
         encode_header_addons(&mut buf, &addons).unwrap();
         assert!(!buf.is_empty());
         // buf[0] = len of marshaled Addons
@@ -451,10 +401,7 @@ mod tests {
     #[tokio::test]
     async fn test_decode_header_addons_xrv_round_trip() {
         let mut encoded = Vec::new();
-        let original = Addons {
-            flow: crate::FLOW_XRV.to_string(),
-            seed: b"seed-data".to_vec(),
-        };
+        let original = Addons { flow: crate::FLOW_XRV.to_string(), seed: b"seed-data".to_vec() };
         encode_header_addons(&mut encoded, &original).unwrap();
 
         let mut cursor = Cursor::new(encoded);
@@ -479,16 +426,14 @@ mod tests {
     #[tokio::test]
     async fn test_decode_response_header_version_mismatch() {
         let mut buf = Vec::new();
-        encode_response_header(&mut buf, 1u8, &empty_addons())
-            .await
-            .unwrap();
+        encode_response_header(&mut buf, 1u8, &empty_addons()).await.unwrap();
         let mut cursor = Cursor::new(buf);
         let err = decode_response_header(&mut cursor, 0u8).await.unwrap_err();
         match err {
             VlessError::UnexpectedResponseVersion { expected, actual } => {
                 assert_eq!(expected, 0);
                 assert_eq!(actual, 1);
-            }
+            },
             _ => panic!("unexpected error: {err:?}"),
         }
     }
@@ -511,9 +456,7 @@ mod tests {
     async fn test_multi_length_packets() {
         let mut buf = Vec::new();
         let packets: Vec<&[u8]> = vec![b"aaa", b"bbbb", b""];
-        write_multi_length_packets(&mut buf, &packets, 8192)
-            .await
-            .unwrap();
+        write_multi_length_packets(&mut buf, &packets, 8192).await.unwrap();
         let mut cursor = Cursor::new(buf);
         // 空包应被跳过
         let p1 = read_length_packet(&mut cursor).await.unwrap();
@@ -529,9 +472,7 @@ mod tests {
         let small = b"ok";
         let packets: Vec<&[u8]> = vec![&big, small];
         // max_packet_size = 5 → big(10+2=12) 被跳过，small(2+2=4) 通过
-        write_multi_length_packets(&mut buf, &packets, 5)
-            .await
-            .unwrap();
+        write_multi_length_packets(&mut buf, &packets, 5).await.unwrap();
         let mut cursor = Cursor::new(buf);
         let got = read_length_packet(&mut cursor).await.unwrap();
         assert_eq!(got, small);

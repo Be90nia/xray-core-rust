@@ -17,11 +17,14 @@
 //! 解决方案：[`MutexReader`] 包装 reader 使其 `Sync`，通过 [`SplitConn::into_sync_reader`]
 //! 转换后满足 `Connection` bound。
 
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Mutex;
-use std::task::{Context, Poll};
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Mutex,
+    task::{Context, Poll},
+};
+
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// SplitHTTP 客户端连接（reader/writer + addr 元数据）。
@@ -48,13 +51,7 @@ impl<R, W> SplitConn<R, W> {
     /// 构造新 `SplitConn`。
     #[must_use]
     pub fn new(reader: R, writer: W, remote: SocketAddr, local: SocketAddr) -> Self {
-        Self {
-            reader,
-            writer,
-            remote_addr: remote,
-            local_addr: local,
-            on_close: Mutex::new(None),
-        }
+        Self { reader, writer, remote_addr: remote, local_addr: local, on_close: Mutex::new(None) }
     }
 
     /// 设置关闭回调（ [`Drop`] 时调用一次）。对应 Go `splitConn.onClose` 字段。
@@ -121,10 +118,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> AsyncWrite for SplitConn<R, W>
         Pin::new(&mut self.writer).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.writer).poll_shutdown(cx)
     }
 }
@@ -141,8 +135,9 @@ impl<R, W> Drop for SplitConn<R, W> {
 
 /// Wrapper that makes any `AsyncRead + Send` also `Sync` via `Mutex`.
 ///
-/// Used to make [`SplitConn`]`<R, W>` satisfy [`Connection`](xray_transport::connection::Connection)'s
-/// `Sync` bound when `R` is `Box<dyn AsyncRead + Send + Unpin>` (which is `!Sync`).
+/// Used to make [`SplitConn`]`<R, W>` satisfy
+/// [`Connection`](xray_transport::connection::Connection)'s `Sync` bound when `R` is `Box<dyn
+/// AsyncRead + Send + Unpin>` (which is `!Sync`).
 ///
 /// `Mutex<T: Send>` is `Send + Sync`, so `MutexReader<R: Send>` is `Send + Sync`.
 /// `Mutex<T: Unpin>` is `Unpin`, so `MutexReader<R: Unpin>` is `Unpin`.
@@ -173,12 +168,13 @@ impl<R: AsyncRead + Unpin + Send> AsyncRead for MutexReader<R> {
 
 // ===== Connection impl for Sync-compatible SplitConn =====
 
-impl<R: AsyncRead + Send + Sync + Unpin, W: AsyncWrite + Send + Sync + Unpin> xray_transport::connection::Connection
-    for SplitConn<R, W>
+impl<R: AsyncRead + Send + Sync + Unpin, W: AsyncWrite + Send + Sync + Unpin>
+    xray_transport::connection::Connection for SplitConn<R, W>
 {
     fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(Some(self.remote_addr))
     }
+
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(Some(self.local_addr))
     }
@@ -186,10 +182,14 @@ impl<R: AsyncRead + Send + Sync + Unpin, W: AsyncWrite + Send + Sync + Unpin> xr
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+    use super::*;
 
     #[tokio::test]
     async fn split_conn_read_write_through() {
@@ -217,12 +217,8 @@ mod tests {
         let c2 = counter.clone();
         let (client, _server) = duplex(64);
         let (r, w) = tokio::io::split(client);
-        let conn = SplitConn::new(
-            r,
-            w,
-            "1.2.3.4:80".parse().unwrap(),
-            "127.0.0.1:1234".parse().unwrap(),
-        );
+        let conn =
+            SplitConn::new(r, w, "1.2.3.4:80".parse().unwrap(), "127.0.0.1:1234".parse().unwrap());
         conn.set_on_close(move || {
             c2.fetch_add(1, Ordering::Relaxed);
         });
@@ -236,12 +232,8 @@ mod tests {
         let c2 = counter.clone();
         let (client, _server) = duplex(64);
         let (r, w) = tokio::io::split(client);
-        let conn = SplitConn::new(
-            r,
-            w,
-            "1.2.3.4:80".parse().unwrap(),
-            "127.0.0.1:1234".parse().unwrap(),
-        );
+        let conn =
+            SplitConn::new(r, w, "1.2.3.4:80".parse().unwrap(), "127.0.0.1:1234".parse().unwrap());
         conn.set_on_close(move || {
             c2.fetch_add(1, Ordering::Relaxed);
         });

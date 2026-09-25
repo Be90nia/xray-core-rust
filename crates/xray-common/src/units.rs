@@ -2,8 +2,7 @@
 //!
 //! 对应 Go 版本 `common/units` 包，提供字节大小的格式化和转换。
 
-use std::fmt;
-use std::str::FromStr;
+use std::{fmt, str::FromStr};
 
 const KB: u64 = 1024;
 const MB: u64 = 1024 * KB;
@@ -80,9 +79,7 @@ impl FromStr for ByteSize {
         }
 
         // 分离数字和单位后缀
-        let num_end = s
-            .find(|c: char| !c.is_ascii_digit() && c != '.')
-            .unwrap_or(s.len());
+        let num_end = s.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(s.len());
         let num_str = &s[..num_end];
         let unit_str = s[num_end..].trim().to_uppercase();
 

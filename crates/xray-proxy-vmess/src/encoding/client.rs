@@ -8,24 +8,36 @@
 //! - **完整**：`encode_request_body` / `decode_response_header` / `decode_response_body`
 //!   （AES-128-GCM + ChaCha20-Poly1305 + PlainChunkSizeParser 路径）
 //! - **留 follow-up**：AuthenticatedLength option + ShakeSizeParser（ChunkMasking）+ async 化
-use std::net::{Ipv4Addr, Ipv6Addr};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    net::{Ipv4Addr, Ipv6Addr},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use sha2::{Digest, Sha256};
-
-use xray_common::bitmask::Bitmask;
-use xray_common::net::address::Address;
-use xray_common::protocol::{Command, RequestHeader, ResponseCommand, ResponseHeader, SecurityType, SwitchAccountCommand};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use xray_common::{
+    bitmask::Bitmask,
+    net::address::Address,
+    protocol::{
+        Command, RequestHeader, ResponseCommand, ResponseHeader, SecurityType, SwitchAccountCommand,
+    },
+};
 use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
-
-use crate::aead::{self, consts, SealHeaderError};
-use crate::request_option;
-use crate::encoding::body_chunk::{self, ChunkNonceAdapter, PlainSizeParser, ShakeSizeParserAdapter, SizeParser, make_authenticated_length_size_parser};
-use crate::encoding::{authenticate, generate_chacha20poly1305_key, write_address_port, ChunkNonceGenerator};
-use crate::error::{Result, VmessError};
-use crate::VmessCommand;
+use crate::{
+    VmessCommand,
+    aead::{self, SealHeaderError, consts},
+    encoding::{
+        ChunkNonceGenerator, authenticate,
+        body_chunk::{
+            self, ChunkNonceAdapter, PlainSizeParser, ShakeSizeParserAdapter, SizeParser,
+            make_authenticated_length_size_parser,
+        },
+        generate_chacha20poly1305_key, write_address_port,
+    },
+    error::{Result, VmessError},
+    request_option,
+};
 
 /// VMess 客户端会话（对应 Go `ClientSession`）。
 ///
@@ -77,7 +89,8 @@ impl ClientSession {
     ///
     /// # 算法
     ///
-    /// 1. 构造 38B base buffer：`[Ver=1 | requestBodyIV | requestBodyKey | respHeader | option | sec/pad | reserved | cmd]`
+    /// 1. 构造 38B base buffer：`[Ver=1 | requestBodyIV | requestBodyKey | respHeader | option |
+    ///    sec/pad | reserved | cmd]`
     /// 2. 若 cmd ≠ Mux，追加地址 + 端口
     /// 3. 追加 padding（随机长度，最多 16B）
     /// 4. 追加 FNV1a 校验和（4B BE）
@@ -114,8 +127,7 @@ impl ClientSession {
         let mut pad_buf = [0u8; 1];
         rand::rng().fill_bytes(&mut pad_buf);
         let padding_len = (pad_buf[0] as usize) % 16;
-        let security_byte = (u8::try_from(padding_len << 4).unwrap_or(0))
-            | header.security.as_u8();
+        let security_byte = (u8::try_from(padding_len << 4).unwrap_or(0)) | header.security.as_u8();
         buffer.push(security_byte);
 
         // 1B reserved
@@ -144,17 +156,14 @@ impl ClientSession {
         buffer.extend_from_slice(&auth.to_be_bytes());
 
         // AEAD seal
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        aead::seal_vmess_aead_header(cmd_key, &buffer, now)
-            .map_err(|e| match e {
-                SealHeaderError::InvalidKeyLength(n) => {
-                    VmessError::Other(format!("cmd_key length mismatch: {n}"))
-                }
-                SealHeaderError::Crypto(c) => VmessError::Crypto(c),
-            })
+        let now =
+            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        aead::seal_vmess_aead_header(cmd_key, &buffer, now).map_err(|e| match e {
+            SealHeaderError::InvalidKeyLength(n) => {
+                VmessError::Other(format!("cmd_key length mismatch: {n}"))
+            },
+            SealHeaderError::Crypto(c) => VmessError::Crypto(c),
+        })
     }
 
     /// 编码请求 body：把明文 data 加密为 chunk 流写入 writer。
@@ -185,23 +194,36 @@ impl ClientSession {
             SecurityType::Chacha20Poly1305 => {
                 let key = generate_chacha20poly1305_key(&self.request_body_key);
                 Box::new(ChaCha20Poly1305Aead::new(&key)?)
-            }
+            },
             other => {
                 return Err(VmessError::Other(format!(
                     "encode_request_body: unsupported security {:?}",
                     other
-                )))
-            }
+                )));
+            },
         };
         let mut nonce_gen = ChunkNonceAdapter::new(&self.request_body_iv, 12);
-        let mut size_parser: Box<dyn SizeParser> = if request.option.has(request_option::AUTHENTICATED_LENGTH) {
-            Box::new(make_authenticated_length_size_parser(&self.request_body_key, &self.request_body_iv, request.security)?)
-        } else if request.option.has(request_option::CHUNK_MASKING) {
-            Box::new(ShakeSizeParserAdapter::new(&self.request_body_iv))
-        } else {
-            Box::new(PlainSizeParser)
-        };
-        body_chunk::encode_chunk_stream(writer, data, cipher.as_ref(), &mut nonce_gen, size_parser.as_mut(), request.option.has(request_option::GLOBAL_PADDING), request.option.has(request_option::NO_TERMINATION_SIGNAL))?;
+        let mut size_parser: Box<dyn SizeParser> =
+            if request.option.has(request_option::AUTHENTICATED_LENGTH) {
+                Box::new(make_authenticated_length_size_parser(
+                    &self.request_body_key,
+                    &self.request_body_iv,
+                    request.security,
+                )?)
+            } else if request.option.has(request_option::CHUNK_MASKING) {
+                Box::new(ShakeSizeParserAdapter::new(&self.request_body_iv))
+            } else {
+                Box::new(PlainSizeParser)
+            };
+        body_chunk::encode_chunk_stream(
+            writer,
+            data,
+            cipher.as_ref(),
+            &mut nonce_gen,
+            size_parser.as_mut(),
+            request.option.has(request_option::GLOBAL_PADDING),
+            request.option.has(request_option::NO_TERMINATION_SIGNAL),
+        )?;
         Ok(())
     }
 
@@ -243,8 +265,10 @@ impl ClientSession {
         let payload_len = u16::from_be_bytes([decrypted_len_bytes[0], decrypted_len_bytes[1]]);
 
         // 3. 派生 payload key/IV
-        let payload_key = aead::kdf16(&self.response_body_key, &[consts::AEAD_RESP_HEADER_PAYLOAD_KEY]);
-        let payload_iv_full = aead::kdf(&self.response_body_iv, &[consts::AEAD_RESP_HEADER_PAYLOAD_IV]);
+        let payload_key =
+            aead::kdf16(&self.response_body_key, &[consts::AEAD_RESP_HEADER_PAYLOAD_KEY]);
+        let payload_iv_full =
+            aead::kdf(&self.response_body_iv, &[consts::AEAD_RESP_HEADER_PAYLOAD_IV]);
         let payload_nonce = &payload_iv_full[..12];
         let payload_cipher = Aes128Gcm::new(&payload_key)?;
 
@@ -269,11 +293,7 @@ impl ClientSession {
         let option = Bitmask::new(payload[1]);
         // payload[2] = cmd_id, payload[3] = data_len
         let response_command = Self::parse_response_command(&payload[2..])?;
-        Ok(ResponseHeader {
-            command: Command::Tcp,
-            option,
-            response_command,
-        })
+        Ok(ResponseHeader { command: Command::Tcp, option, response_command })
     }
 
     /// 解析 VMess 响应命令。
@@ -295,8 +315,9 @@ impl ClientSession {
         )))?;
         match cmd_id {
             0x01 => {
-                // SwitchAccount: [1B addr_type][addr][2B port][1B alterID_count][1B security][N*4B alterIDs]
-                // ponytail: 仅解析 detour_tag（host+port），alterID 机制已废弃
+                // SwitchAccount: [1B addr_type][addr][2B port][1B alterID_count][1B security][N*4B
+                // alterIDs] ponytail: 仅解析 detour_tag（host+port），alterID
+                // 机制已废弃
                 if data.is_empty() {
                     return Ok(ResponseCommand::None);
                 }
@@ -304,38 +325,44 @@ impl ClientSession {
                 let (host, consumed) = match addr_type {
                     0x01 => {
                         // IPv4: 4B
-                        if data.len() < 5 { return Ok(ResponseCommand::None); }
+                        if data.len() < 5 {
+                            return Ok(ResponseCommand::None);
+                        }
                         let ip = <[u8; 4]>::try_from(&data[1..5]).unwrap();
                         (Some(Address::IPv4(Ipv4Addr::from(ip))), 5)
-                    }
+                    },
                     0x03 => {
                         // Domain: 1B len + domain
-                        if data.len() < 2 { return Ok(ResponseCommand::None); }
+                        if data.len() < 2 {
+                            return Ok(ResponseCommand::None);
+                        }
                         let domain_len = data[1] as usize;
-                        if data.len() < 2 + domain_len { return Ok(ResponseCommand::None); }
+                        if data.len() < 2 + domain_len {
+                            return Ok(ResponseCommand::None);
+                        }
                         let domain = String::from_utf8_lossy(&data[2..2 + domain_len]).to_string();
                         (Some(Address::Domain(domain)), 2 + domain_len)
-                    }
+                    },
                     0x04 => {
                         // IPv6: 16B
-                        if data.len() < 17 { return Ok(ResponseCommand::None); }
+                        if data.len() < 17 {
+                            return Ok(ResponseCommand::None);
+                        }
                         let ip = <[u8; 16]>::try_from(&data[1..17]).unwrap();
                         (Some(Address::IPv6(Ipv6Addr::from(ip))), 17)
-                    }
+                    },
                     _ => (None, 1),
                 };
                 let port = if data.len() >= consumed + 2 {
                     u16::from_be_bytes([data[consumed], data[consumed + 1]])
-                } else { 0 };
+                } else {
+                    0
+                };
                 // detour_tag: 在 Go 中由 DetourConfig 提供，不在 wire 格式中
                 // wire 格式的 host:port 用于直接连接，detour_tag 由服务端配置注入
                 let detour_tag = None;
-                Ok(ResponseCommand::SwitchAccount(SwitchAccountCommand {
-                    host,
-                    port,
-                    detour_tag,
-                }))
-            }
+                Ok(ResponseCommand::SwitchAccount(SwitchAccountCommand { host, port, detour_tag }))
+            },
             _ => Ok(ResponseCommand::None),
         }
     }
@@ -367,32 +394,43 @@ impl ClientSession {
             SecurityType::Chacha20Poly1305 => {
                 let key = generate_chacha20poly1305_key(&self.response_body_key);
                 Box::new(ChaCha20Poly1305Aead::new(&key)?)
-            }
-
+            },
 
             other => {
                 return Err(VmessError::Other(format!(
                     "decode_response_body: unsupported security {:?}",
                     other
-                )))
-            }
+                )));
+            },
         };
         let mut nonce_gen = ChunkNonceAdapter::new(&self.response_body_iv, 12);
-        let mut size_parser: Box<dyn SizeParser> = if request.option.has(request_option::AUTHENTICATED_LENGTH) {
-            // AuthenticatedLength 始终用 request_body_key/iv（Go 端双向一致）
-            Box::new(make_authenticated_length_size_parser(&self.request_body_key, &self.request_body_iv, request.security)?)
-        } else if request.option.has(request_option::CHUNK_MASKING) {
-            Box::new(ShakeSizeParserAdapter::new(&self.response_body_iv))
-        } else {
-            Box::new(PlainSizeParser)
-        };
-        let plaintext = body_chunk::decode_chunk_stream(reader, cipher.as_ref(), &mut nonce_gen, size_parser.as_mut(), request.option.has(request_option::GLOBAL_PADDING))?;
+        let mut size_parser: Box<dyn SizeParser> =
+            if request.option.has(request_option::AUTHENTICATED_LENGTH) {
+                // AuthenticatedLength 始终用 request_body_key/iv（Go 端双向一致）
+                Box::new(make_authenticated_length_size_parser(
+                    &self.request_body_key,
+                    &self.request_body_iv,
+                    request.security,
+                )?)
+            } else if request.option.has(request_option::CHUNK_MASKING) {
+                Box::new(ShakeSizeParserAdapter::new(&self.response_body_iv))
+            } else {
+                Box::new(PlainSizeParser)
+            };
+        let plaintext = body_chunk::decode_chunk_stream(
+            reader,
+            cipher.as_ref(),
+            &mut nonce_gen,
+            size_parser.as_mut(),
+            request.option.has(request_option::GLOBAL_PADDING),
+        )?;
         Ok(plaintext)
     }
 
     /// 构造 chunk nonce 生成器（对应 Go `GenerateChunkNonce(iv, nonce_size)`）。
     ///
-    /// 用 `request_body_iv` 初始化，nonce 大小由 AEAD 算法决定（AES-GCM=12，ChaCha20-Poly1305=12）。
+    /// 用 `request_body_iv` 初始化，nonce 大小由 AEAD
+    /// 算法决定（AES-GCM=12，ChaCha20-Poly1305=12）。
     #[must_use]
     pub fn chunk_nonce_generator(&self, nonce_size: usize) -> ChunkNonceGenerator {
         ChunkNonceGenerator::new(&self.request_body_iv, nonce_size)
@@ -421,25 +459,38 @@ impl ClientSession {
             SecurityType::Chacha20Poly1305 => {
                 let key = generate_chacha20poly1305_key(&self.request_body_key);
                 Box::new(ChaCha20Poly1305Aead::new(&key)?)
-            }
-
+            },
 
             other => {
                 return Err(VmessError::Other(format!(
                     "encode_request_body_async: unsupported security {:?}",
                     other
-                )))
-            }
+                )));
+            },
         };
         let mut nonce_gen = ChunkNonceAdapter::new(&self.request_body_iv, 12);
-        let mut size_parser: Box<dyn SizeParser> = if request.option.has(request_option::AUTHENTICATED_LENGTH) {
-            Box::new(make_authenticated_length_size_parser(&self.request_body_key, &self.request_body_iv, request.security)?)
-        } else if request.option.has(request_option::CHUNK_MASKING) {
-            Box::new(ShakeSizeParserAdapter::new(&self.request_body_iv))
-        } else {
-            Box::new(PlainSizeParser)
-        };
-        body_chunk::encode_chunk_stream_async(writer, data, cipher.as_ref(), &mut nonce_gen, size_parser.as_mut(), request.option.has(request_option::GLOBAL_PADDING), request.option.has(request_option::NO_TERMINATION_SIGNAL)).await?;
+        let mut size_parser: Box<dyn SizeParser> =
+            if request.option.has(request_option::AUTHENTICATED_LENGTH) {
+                Box::new(make_authenticated_length_size_parser(
+                    &self.request_body_key,
+                    &self.request_body_iv,
+                    request.security,
+                )?)
+            } else if request.option.has(request_option::CHUNK_MASKING) {
+                Box::new(ShakeSizeParserAdapter::new(&self.request_body_iv))
+            } else {
+                Box::new(PlainSizeParser)
+            };
+        body_chunk::encode_chunk_stream_async(
+            writer,
+            data,
+            cipher.as_ref(),
+            &mut nonce_gen,
+            size_parser.as_mut(),
+            request.option.has(request_option::GLOBAL_PADDING),
+            request.option.has(request_option::NO_TERMINATION_SIGNAL),
+        )
+        .await?;
         Ok(())
     }
 
@@ -470,8 +521,10 @@ impl ClientSession {
         }
         let payload_len = u16::from_be_bytes([decrypted_len_bytes[0], decrypted_len_bytes[1]]);
 
-        let payload_key = aead::kdf16(&self.response_body_key, &[consts::AEAD_RESP_HEADER_PAYLOAD_KEY]);
-        let payload_iv_full = aead::kdf(&self.response_body_iv, &[consts::AEAD_RESP_HEADER_PAYLOAD_IV]);
+        let payload_key =
+            aead::kdf16(&self.response_body_key, &[consts::AEAD_RESP_HEADER_PAYLOAD_KEY]);
+        let payload_iv_full =
+            aead::kdf(&self.response_body_iv, &[consts::AEAD_RESP_HEADER_PAYLOAD_IV]);
         let payload_nonce = &payload_iv_full[..12];
         let payload_cipher = Aes128Gcm::new(&payload_key)?;
 
@@ -492,11 +545,7 @@ impl ClientSession {
         }
         let option = Bitmask::new(payload[1]);
         let response_command = Self::parse_response_command(&payload[2..])?;
-        Ok(ResponseHeader {
-            command: Command::Tcp,
-            option,
-            response_command,
-        })
+        Ok(ResponseHeader { command: Command::Tcp, option, response_command })
     }
 
     /// 解码响应 body（async 版）。
@@ -517,25 +566,36 @@ impl ClientSession {
             SecurityType::Chacha20Poly1305 => {
                 let key = generate_chacha20poly1305_key(&self.response_body_key);
                 Box::new(ChaCha20Poly1305Aead::new(&key)?)
-            }
-
+            },
 
             other => {
                 return Err(VmessError::Other(format!(
                     "decode_response_body_async: unsupported security {:?}",
                     other
-                )))
-            }
+                )));
+            },
         };
         let mut nonce_gen = ChunkNonceAdapter::new(&self.response_body_iv, 12);
-        let mut size_parser: Box<dyn SizeParser> = if request.option.has(request_option::AUTHENTICATED_LENGTH) {
-            Box::new(make_authenticated_length_size_parser(&self.request_body_key, &self.request_body_iv, request.security)?)
-        } else if request.option.has(request_option::CHUNK_MASKING) {
-            Box::new(ShakeSizeParserAdapter::new(&self.response_body_iv))
-        } else {
-            Box::new(PlainSizeParser)
-        };
-        let plaintext = body_chunk::decode_chunk_stream_async(reader, cipher.as_ref(), &mut nonce_gen, size_parser.as_mut(), request.option.has(request_option::GLOBAL_PADDING)).await?;
+        let mut size_parser: Box<dyn SizeParser> =
+            if request.option.has(request_option::AUTHENTICATED_LENGTH) {
+                Box::new(make_authenticated_length_size_parser(
+                    &self.request_body_key,
+                    &self.request_body_iv,
+                    request.security,
+                )?)
+            } else if request.option.has(request_option::CHUNK_MASKING) {
+                Box::new(ShakeSizeParserAdapter::new(&self.response_body_iv))
+            } else {
+                Box::new(PlainSizeParser)
+            };
+        let plaintext = body_chunk::decode_chunk_stream_async(
+            reader,
+            cipher.as_ref(),
+            &mut nonce_gen,
+            size_parser.as_mut(),
+            request.option.has(request_option::GLOBAL_PADDING),
+        )
+        .await?;
         Ok(plaintext)
     }
 }
@@ -548,13 +608,14 @@ impl Default for ClientSession {
 
 #[cfg(test)]
 mod tests {
+    use xray_common::{
+        net::{address::Address, destination::Destination, port::Port},
+        protocol::{Command, SecurityType},
+        uuid::UUID,
+    };
+
     use super::*;
     use crate::validator::Validator;
-    use xray_common::net::address::Address;
-    use xray_common::net::destination::Destination;
-    use xray_common::net::port::Port;
-    use xray_common::protocol::{Command, SecurityType};
-    use xray_common::uuid::UUID;
 
     fn sample_cmd_key() -> [u8; 16] {
         let uuid = UUID::parse("66ad4540-b58c-4ad2-9926-ea63445a9b57").expect("uuid");
@@ -562,7 +623,8 @@ mod tests {
     }
 
     fn sample_request_header_tcp() -> RequestHeader {
-        let dest = Destination::tcp(Address::ipv4(std::net::Ipv4Addr::new(1, 2, 3, 4)), Port::new(80));
+        let dest =
+            Destination::tcp(Address::ipv4(std::net::Ipv4Addr::new(1, 2, 3, 4)), Port::new(80));
         RequestHeader::new(crate::encoding::VERSION, Command::Tcp, dest, SecurityType::Aes128Gcm)
     }
 
@@ -630,10 +692,7 @@ mod tests {
     #[test]
     fn encode_request_header_mux_skips_address() {
         let session = ClientSession::new();
-        let dest = Destination::tcp(
-            Address::Domain("v1.mux.cool".to_string()),
-            Port::new(0),
-        );
+        let dest = Destination::tcp(Address::Domain("v1.mux.cool".to_string()), Port::new(0));
         let header = RequestHeader::new(
             crate::encoding::VERSION,
             Command::Mux,
@@ -665,9 +724,12 @@ mod tests {
     #[test]
     fn decode_response_header_roundtrip_with_server_encode() {
         // 客户端 decode_response_header ↔ 服务端 encode_response_header 往返
-        use crate::encoding::server::{ServerSession, SessionHistory};
-        use crate::validator::{MemoryUser, TimedUserValidator};
         use xray_common::protocol::ResponseHeader;
+
+        use crate::{
+            encoding::server::{ServerSession, SessionHistory},
+            validator::{MemoryUser, TimedUserValidator},
+        };
 
         let validator = TimedUserValidator::new();
         let history = SessionHistory::new();
@@ -684,7 +746,11 @@ mod tests {
         // 手动同步 server.response_header（否则 encode 写的字节 ≠ client 期望）
         server.response_header = client_session.response_header;
 
-        let resp_header = ResponseHeader { command: Command::Tcp, option: Bitmask::new(0), response_command: ResponseCommand::None };
+        let resp_header = ResponseHeader {
+            command: Command::Tcp,
+            option: Bitmask::new(0),
+            response_command: ResponseCommand::None,
+        };
         let mut buf: Vec<u8> = Vec::new();
         server.encode_response_header(&resp_header, &mut buf).expect("server encode");
 
@@ -696,8 +762,10 @@ mod tests {
     #[test]
     fn decode_response_body_roundtrip_with_server_encode() {
         // 客户端 decode_response_body ↔ 服务端 encode_response_body 往返
-        use crate::encoding::server::{ServerSession, SessionHistory};
-        use crate::validator::{MemoryUser, TimedUserValidator};
+        use crate::{
+            encoding::server::{ServerSession, SessionHistory},
+            validator::{MemoryUser, TimedUserValidator},
+        };
 
         let validator = TimedUserValidator::new();
         let history = SessionHistory::new();
@@ -720,7 +788,8 @@ mod tests {
         server.encode_response_body(&header, payload, &mut buf).expect("server encode");
 
         let mut reader = &buf[..];
-        let decoded = client_session.decode_response_body(&header, &mut reader).expect("client decode");
+        let decoded =
+            client_session.decode_response_body(&header, &mut reader).expect("client decode");
         assert_eq!(decoded, payload);
     }
 

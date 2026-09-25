@@ -2,8 +2,7 @@
 //!
 //! 防止多实例绑定同一个 UDS 路径。Unix 用 flock 排他锁，Windows no-op。
 
-use std::io;
-use std::path::PathBuf;
+use std::{io, path::PathBuf};
 
 /// UDS 访问锁。对应 Go `FileLocker`。
 pub struct FileLocker {
@@ -74,10 +73,7 @@ mod tests {
     #[test]
     fn file_locker_acquire_release_roundtrip() {
         let dir = std::env::temp_dir();
-        let lock_path = dir.join(format!(
-            "xray_test_flock_{}.lock",
-            std::process::id()
-        ));
+        let lock_path = dir.join(format!("xray_test_flock_{}.lock", std::process::id()));
         // 清理可能残留的旧文件
         let _ = std::fs::remove_file(&lock_path);
 
@@ -95,10 +91,7 @@ mod tests {
     #[test]
     fn file_locker_drop_auto_releases() {
         let dir = std::env::temp_dir();
-        let lock_path = dir.join(format!(
-            "xray_test_flock_drop_{}.lock",
-            std::process::id()
-        ));
+        let lock_path = dir.join(format!("xray_test_flock_drop_{}.lock", std::process::id()));
         let _ = std::fs::remove_file(&lock_path);
 
         {
@@ -113,10 +106,7 @@ mod tests {
     #[test]
     fn file_locker_second_acquire_blocks_or_fails() {
         let dir = std::env::temp_dir();
-        let lock_path = dir.join(format!(
-            "xray_test_flock_excl_{}.lock",
-            std::process::id()
-        ));
+        let lock_path = dir.join(format!("xray_test_flock_excl_{}.lock", std::process::id()));
         let _ = std::fs::remove_file(&lock_path);
 
         let mut locker1 = FileLocker::new(&lock_path);
@@ -129,10 +119,7 @@ mod tests {
         use std::os::unix::io::AsRawFd;
         // SAFETY: file2 fd 有效。
         let ret = unsafe { libc::flock(file2.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        assert!(
-            ret != 0,
-            "第二次非阻塞 flock 应失败（已被 locker1 持有）"
-        );
+        assert!(ret != 0, "第二次非阻塞 flock 应失败（已被 locker1 持有）");
 
         locker1.release();
     }

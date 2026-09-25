@@ -12,8 +12,10 @@
 //! - [`ACMatcherGroup`] - Aho-Corasick 自动机多模式匹配
 //! - [`MPHMatcherGroup`] - 最小完美哈希查找
 
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
+};
 
 use aho_corasick::AhoCorasick;
 
@@ -34,19 +36,14 @@ impl FullMatcherGroup {
     /// 创建新的精确全匹配器组。
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            matchers: HashMap::new(),
-        }
+        Self { matchers: HashMap::new() }
     }
 
     /// 添加精确匹配规则。
     ///
     /// 同一模式可添加多个值，按添加顺序保留。
     pub fn add(&mut self, matcher: FullMatcher, value: u32) {
-        self.matchers
-            .entry(matcher.pattern().to_owned())
-            .or_default()
-            .push(value);
+        self.matchers.entry(matcher.pattern().to_owned()).or_default().push(value);
     }
 }
 
@@ -90,9 +87,7 @@ impl DomainMatcherGroup {
     /// 创建新的域名后缀匹配器组。
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            root: DomainTrieNode::default(),
-        }
+        Self { root: DomainTrieNode::default() }
     }
 
     /// 添加域名匹配规则。
@@ -102,10 +97,7 @@ impl DomainMatcherGroup {
         let labels: Vec<&str> = matcher.pattern().split('.').rev().collect();
         let mut node = &mut self.root;
         for label in &labels {
-            node = node
-                .children
-                .entry((*label).to_owned())
-                .or_default();
+            node = node.children.entry((*label).to_owned()).or_default();
         }
         node.values.push(value);
     }
@@ -131,7 +123,7 @@ impl MatcherGroup for DomainMatcherGroup {
                     if !node.values.is_empty() {
                         matches.push(node.values.clone());
                     }
-                }
+                },
                 None => break,
             }
         }
@@ -158,7 +150,7 @@ impl MatcherGroup for DomainMatcherGroup {
                     if !node.values.is_empty() {
                         return true;
                     }
-                }
+                },
                 None => return false,
             }
         }
@@ -186,9 +178,7 @@ impl SimpleMatcherGroup {
     /// 创建新的简单匹配器组。
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
+        Self { entries: Vec::new() }
     }
 
     /// 添加任意类型的匹配器。
@@ -205,25 +195,17 @@ impl Default for SimpleMatcherGroup {
 
 impl MatcherGroup for SimpleMatcherGroup {
     fn match_str(&self, input: &str) -> Vec<u32> {
-        self.entries
-            .iter()
-            .filter(|e| e.matcher.match_str(input))
-            .map(|e| e.value)
-            .collect()
+        self.entries.iter().filter(|e| e.matcher.match_str(input)).map(|e| e.value).collect()
     }
 
     fn match_any(&self, input: &str) -> bool {
-        self.entries
-            .iter()
-            .any(|e| e.matcher.match_str(input))
+        self.entries.iter().any(|e| e.matcher.match_str(input))
     }
 }
 
 impl std::fmt::Debug for SimpleMatcherGroup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SimpleMatcherGroup")
-            .field("count", &self.entries.len())
-            .finish()
+        f.debug_struct("SimpleMatcherGroup").field("count", &self.entries.len()).finish()
     }
 }
 
@@ -251,17 +233,12 @@ impl SubstrMatcherGroup {
     /// 创建新的子串匹配器组。
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
+        Self { entries: Vec::new() }
     }
 
     /// 添加子串匹配规则。
     pub fn add(&mut self, pattern: impl Into<String>, value: u32) {
-        self.entries.push(SubstrMatcherEntry {
-            pattern: pattern.into(),
-            value,
-        });
+        self.entries.push(SubstrMatcherEntry { pattern: pattern.into(), value });
     }
 }
 
@@ -283,9 +260,7 @@ impl MatcherGroup for SubstrMatcherGroup {
     }
 
     fn match_any(&self, input: &str) -> bool {
-        self.entries
-            .iter()
-            .any(|e| input.contains(&e.pattern))
+        self.entries.iter().any(|e| input.contains(&e.pattern))
     }
 }
 
@@ -322,11 +297,7 @@ impl ACMatcherGroup {
     /// 创建新的 AC 自动机匹配器组。
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            patterns: Vec::new(),
-            entries: Vec::new(),
-            ac: None,
-        }
+        Self { patterns: Vec::new(), entries: Vec::new(), ac: None }
     }
 
     /// 添加匹配规则。
@@ -384,7 +355,9 @@ pub enum ACMatcherGroupError {
     BuildFailed(String),
 
     /// 自动机未构建
-    #[error("AC\u{81ea}\u{52a8}\u{673a}\u{672a}\u{6784}\u{5efa}\u{ff0c}\u{8bf7}\u{5148}\u{8c03}\u{7528} build()")]
+    #[error(
+        "AC\u{81ea}\u{52a8}\u{673a}\u{672a}\u{6784}\u{5efa}\u{ff0c}\u{8bf7}\u{5148}\u{8c03}\u{7528} build()"
+    )]
     NotBuilt,
 }
 
@@ -412,23 +385,21 @@ impl MatcherGroup for ACMatcherGroup {
                     if input == self.patterns[idx] {
                         full_matches.push((end_pos, entry.value));
                     }
-                }
+                },
                 ACMatchKind::Domain => {
                     let pattern = &self.patterns[idx];
                     if input == pattern {
                         domain_matches.push((end_pos, entry.value));
                     } else if input.ends_with(pattern) {
                         let prefix_pos = input.len() - pattern.len();
-                        if prefix_pos > 0
-                            && input.as_bytes()[prefix_pos - 1] == b'.'
-                        {
+                        if prefix_pos > 0 && input.as_bytes()[prefix_pos - 1] == b'.' {
                             domain_matches.push((end_pos, entry.value));
                         }
                     }
-                }
+                },
                 ACMatchKind::Substr => {
                     substr_matches.push((end_pos, entry.value));
-                }
+                },
             }
         }
 
@@ -467,7 +438,7 @@ impl MatcherGroup for ACMatcherGroup {
                     if input == self.patterns[idx] {
                         return true;
                     }
-                }
+                },
                 ACMatchKind::Domain => {
                     let pattern = &self.patterns[idx];
                     if input == pattern {
@@ -475,16 +446,14 @@ impl MatcherGroup for ACMatcherGroup {
                     }
                     if input.ends_with(pattern) {
                         let prefix_pos = input.len() - pattern.len();
-                        if prefix_pos > 0
-                            && input.as_bytes()[prefix_pos - 1] == b'.'
-                        {
+                        if prefix_pos > 0 && input.as_bytes()[prefix_pos - 1] == b'.' {
                             return true;
                         }
                     }
-                }
+                },
                 ACMatchKind::Substr => {
                     return true;
-                }
+                },
             }
         }
         false
@@ -566,8 +535,7 @@ fn next_pow2(v: usize) -> usize {
 /// # 算法
 ///
 /// 1. **Level 0**: 按 Rabin-Karp 滚动哈希分桶
-/// 2. **Level 1**: 每个桶内使用带种子的哈希函数，通过
-///    Hash-Displace-Compress 算法找到无冲突的种子
+/// 2. **Level 1**: 每个桶内使用带种子的哈希函数，通过 Hash-Displace-Compress 算法找到无冲突的种子
 /// 3. **查询**: 两级哈希定位 + 字符串验证
 ///
 /// # 参考
@@ -591,11 +559,15 @@ pub enum MPHMatcherGroupError {
     BuildFailed(String),
 
     /// 哈希表未构建
-    #[error("MPH\u{54c8}\u{5e0c}\u{8868}\u{672a}\u{6784}\u{5efa}\u{ff0c}\u{8bf7}\u{5148}\u{8c03}\u{7528} build()")]
+    #[error(
+        "MPH\u{54c8}\u{5e0c}\u{8868}\u{672a}\u{6784}\u{5efa}\u{ff0c}\u{8bf7}\u{5148}\u{8c03}\u{7528} build()"
+    )]
     NotBuilt,
 
     /// 规则为空
-    #[error("\u{6ca1}\u{6709}\u{6dfb}\u{52a0}\u{4efb}\u{4f55}\u{89c4}\u{5219}\u{ff0c}\u{65e0}\u{6cd5}\u{6784}\u{5efa} MPH \u{54c8}\u{5e0c}\u{8868}")]
+    #[error(
+        "\u{6ca1}\u{6709}\u{6dfb}\u{52a0}\u{4efb}\u{4f55}\u{89c4}\u{5219}\u{ff0c}\u{65e0}\u{6cd5}\u{6784}\u{5efa} MPH \u{54c8}\u{5e0c}\u{8868}"
+    )]
     Empty,
 }
 
@@ -662,20 +634,17 @@ impl MPHMatcherGroup {
             Some(info) => {
                 info.matchers[type_idx].push(value);
                 info.rolling_hash
-            }
+            },
             None => {
                 let rh = rolling_hash(suffix_hash, pattern);
                 self.rules.push(full_pattern.clone());
                 self.values.push(Vec::new());
 
-                let mut info = MphRuleInfo {
-                    rolling_hash: rh,
-                    matchers: [Vec::new(), Vec::new()],
-                };
+                let mut info = MphRuleInfo { rolling_hash: rh, matchers: [Vec::new(), Vec::new()] };
                 info.matchers[type_idx].push(value);
                 rule_infos.insert(full_pattern, info);
                 rh
-            }
+            },
         }
     }
 
@@ -688,14 +657,9 @@ impl MPHMatcherGroup {
     ///
     /// - 没有添加任何规则时返回 `Empty` 错误
     pub fn build(&mut self) -> Result<(), MPHMatcherGroupError> {
-        let rule_infos = self
-            .rule_infos
-            .take()
-            .ok_or_else(|| {
-                MPHMatcherGroupError::BuildFailed(
-                    "rule_infos \u{5df2}\u{88ab}\u{6d88}\u{8d39}".into(),
-                )
-            })?;
+        let rule_infos = self.rule_infos.take().ok_or_else(|| {
+            MPHMatcherGroupError::BuildFailed("rule_infos \u{5df2}\u{88ab}\u{6d88}\u{8d39}".into())
+        })?;
 
         let rule_count = rule_infos.len();
         if rule_count == 0 {
@@ -748,8 +712,8 @@ impl MPHMatcherGroup {
 
             while hashed_bucket.len() != bucket.len() {
                 for &rule_idx in bucket {
-                    let mem_hash = seeded_hash(seed, &self.rules[rule_idx as usize])
-                        & self.level1_mask;
+                    let mem_hash =
+                        seeded_hash(seed, &self.rules[rule_idx as usize]) & self.level1_mask;
                     let mem_hash_usize = mem_hash as usize;
 
                     if occupied[mem_hash_usize] {
@@ -787,11 +751,7 @@ impl MPHMatcherGroup {
         if rule_idx as usize >= self.rules.len() {
             return 0;
         }
-        if self.rules[rule_idx as usize] == input {
-            rule_idx
-        } else {
-            0
-        }
+        if self.rules[rule_idx as usize] == input { rule_idx } else { 0 }
     }
 
     /// 检查哈希表是否已构建。
@@ -819,9 +779,7 @@ impl MatcherGroup for MPHMatcherGroup {
 
         let bytes = input_lower.as_bytes();
         for i in (0..bytes.len()).rev() {
-            hash = hash
-                .wrapping_mul(PRIME_RK)
-                .wrapping_add(u32::from(bytes[i]));
+            hash = hash.wrapping_mul(PRIME_RK).wrapping_add(u32::from(bytes[i]));
             if bytes[i] == b'.' {
                 let mph_idx = self.lookup(hash, &input_lower[i..]);
                 if mph_idx != 0 {
@@ -850,9 +808,7 @@ impl MatcherGroup for MPHMatcherGroup {
 
         let bytes = input_lower.as_bytes();
         for i in (0..bytes.len()).rev() {
-            hash = hash
-                .wrapping_mul(PRIME_RK)
-                .wrapping_add(u32::from(bytes[i]));
+            hash = hash.wrapping_mul(PRIME_RK).wrapping_add(u32::from(bytes[i]));
             if bytes[i] == b'.' && self.lookup(hash, &input_lower[i..]) != 0 {
                 return true;
             }
@@ -943,7 +899,7 @@ mod tests_mph {
         let result = group.build();
         assert!(result.is_err());
         match result {
-            Err(MPHMatcherGroupError::Empty) => {}
+            Err(MPHMatcherGroupError::Empty) => {},
             _ => panic!("\u{671f}\u{671b} Empty \u{9519}\u{8bef}"),
         }
     }

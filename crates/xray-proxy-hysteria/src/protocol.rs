@@ -50,7 +50,7 @@ pub fn read_varint<R: Read>(r: &mut R) -> io::Result<u64> {
                 val = (val << 8) | u64::from(b);
             }
             Ok(val)
-        }
+        },
     }
 }
 
@@ -177,16 +177,14 @@ pub fn read_tcp_response<R: Read>(r: &mut R) -> Result<(bool, String), HysteriaP
     } else {
         String::new()
     };
-    let padding_len = read_varint(r).map_err(|e| {
-        HysteriaProxyError::ProtocolParse(format!("tcp response padding len: {e}"))
-    })?;
+    let padding_len = read_varint(r)
+        .map_err(|e| HysteriaProxyError::ProtocolParse(format!("tcp response padding len: {e}")))?;
     if padding_len > MAX_PADDING_LENGTH {
         return Err(HysteriaProxyError::ProtocolParse("invalid padding length".into()));
     }
     if padding_len > 0 {
-        discard_exact(r, padding_len).map_err(|e| {
-            HysteriaProxyError::ProtocolParse(format!("tcp response padding: {e}"))
-        })?;
+        discard_exact(r, padding_len)
+            .map_err(|e| HysteriaProxyError::ProtocolParse(format!("tcp response padding: {e}")))?;
     }
     Ok((status[0] == 0, msg))
 }
@@ -197,8 +195,8 @@ pub fn write_tcp_response<W: Write>(w: &mut W, ok: bool, msg: &str) -> io::Resul
     let msg_bytes = msg.as_bytes();
     let msg_len = msg_bytes.len();
     let padding_len = padding.len();
-    let sz = 1 + varint_len(msg_len as u64) + msg_len
-        + varint_len(padding_len as u64) + padding_len;
+    let sz =
+        1 + varint_len(msg_len as u64) + msg_len + varint_len(padding_len as u64) + padding_len;
     let mut buf = vec![0u8; sz];
     buf[0] = if ok { 0 } else { 1 };
     let mut i = 1 + write_varint(&mut buf[1..], msg_len as u64);
@@ -290,14 +288,7 @@ impl UdpMessage {
         let addr = String::from_utf8(rest[..addr_len as usize].to_vec())
             .map_err(|e| HysteriaProxyError::ProtocolParse(format!("udp msg addr utf8: {e}")))?;
         let data = rest[addr_len as usize..].to_vec();
-        Ok(Self {
-            session_id,
-            packet_id,
-            frag_id,
-            frag_count,
-            addr,
-            data,
-        })
+        Ok(Self { session_id, packet_id, frag_id, frag_count, addr, data })
     }
 }
 
@@ -352,12 +343,7 @@ impl Defragger {
     /// 构造空重组器。
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            pkt_id: 0,
-            frags: Vec::new(),
-            count: 0,
-            data_size: 0,
-        }
+        Self { pkt_id: 0, frags: Vec::new(), count: 0, data_size: 0 }
     }
 
     /// 投入一个分片，若所有分片齐备返回完整消息。
