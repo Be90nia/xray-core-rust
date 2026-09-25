@@ -156,7 +156,13 @@ async fn pick_free_port() -> Result<u16, E2eError> {
 /// Build a freedom outbound (default, dials directly to echo server).
 fn freedom_outbound(tag: &str) -> BuiltOutbound {
     BuiltOutbound {
-        entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+        // vmess/vless/trojan inbound 默认规则 BlockPrivate（Go getDefaultFinalRule）
+        // 封 127.0.0.0/8——loopback echo 必须显式 finalRules allow（同 lib 测试
+        // FREEDOM_ALLOW_ALL_SETTINGS / xray-stress topology 逃生门先例）。
+        entry: BuiltEntry {
+            kind: "freedom".into(),
+            data: br#"{"finalRules":[{"action":"allow","network":"tcp,udp","ip":["127.0.0.0/8","::1/128"]}]}"#.to_vec(),
+        },
         tag: tag.into(),
         send_through: None,
         stream_settings_json: None,
