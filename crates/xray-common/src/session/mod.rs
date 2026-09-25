@@ -3,22 +3,19 @@
 //! 对应 Go 版本 `common/session` 包，定义会话 ID、入站/出站信息、
 //! 内容类型和套接字选项等元数据。
 
-use std::collections::HashMap;
-use std::io;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
+
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::net::destination::Destination;
-use crate::net::network::Network;
-use crate::net::port::Port;
-use crate::protocol::user::User;
-use crate::signal::ActivityTimer;
-use crate::uuid::UUID;
+use crate::{
+    net::{destination::Destination, network::Network, port::Port},
+    protocol::user::User,
+    signal::ActivityTimer,
+    uuid::UUID,
+};
 pub mod context;
 
 pub use context::{FullHandler, SessionDispatcher, TrackedRequestErrorFeedback};
-
 
 // ========== SessionConn (type-erased raw conn for splice copy) ==========
 
@@ -111,7 +108,6 @@ impl SniffingRequest {
     }
 }
 
-
 /// 会话 ID，基于 UUID。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ID(UUID);
@@ -178,7 +174,8 @@ pub struct Inbound {
     pub vless_route: Option<Port>,
     /// 用于 splice copy 的原始连接（Go `Conn net.Conn`，session.go:52-53）。
     pub conn: Option<Arc<dyn SessionConn>>,
-    /// 用于 splice copy 的入站 buf copier 计时器（Go `Timer *signal.ActivityTimer`，session.go:54-55）。
+    /// 用于 splice copy 的入站 buf copier 计时器（Go `Timer
+    /// *signal.ActivityTimer`，session.go:54-55）。
     pub timer: Option<Arc<ActivityTimer>>,
     /// splice copy 决策标志（Go `CanSpliceCopy int`，1=可，2=处理后可行，3=不可）。
     pub can_splice_copy: i32,
@@ -215,7 +212,7 @@ impl Clone for Inbound {
             gateway: self.gateway.clone(),
             user: self.user.clone(),
             vless_route: self.vless_route,
-            conn: self.conn.clone(), // Arc<dyn ...>: Clone by Arc bump
+            conn: self.conn.clone(),   // Arc<dyn ...>: Clone by Arc bump
             timer: self.timer.clone(), // Arc<ActivityTimer>: Clone by Arc bump
             can_splice_copy: self.can_splice_copy,
         }
@@ -270,6 +267,7 @@ impl Inbound {
         self.user = Some(user);
         self
     }
+
     /// 设置名称（builder 模式）。
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
@@ -466,7 +464,8 @@ pub struct Content {
     pub attributes: HashMap<String, String>,
     /// 嗅探请求（Go `SniffingRequest SniffingRequest`，session.go:95）。
     pub sniffing_request: SniffingRequest,
-    /// DNS 模块标记，跳过本会话的 DNS 解析防 DOH 循环（Go `SkipDNSResolve bool`，session.go:100-101）。
+    /// DNS 模块标记，跳过本会话的 DNS 解析防 DOH 循环（Go `SkipDNSResolve
+    /// bool`，session.go:100-101）。
     pub skip_dns_resolve: bool,
 }
 
@@ -552,12 +551,7 @@ pub struct Sockopt {
 impl Sockopt {
     /// 创建新的套接字选项。
     pub fn new() -> Self {
-        Self {
-            mark: None,
-            tos: None,
-            tcp_fast_open: false,
-            tcp_keep_alive_interval: None,
-        }
+        Self { mark: None, tos: None, tcp_fast_open: false, tcp_keep_alive_interval: None }
     }
 
     /// 设置 TCP 标记（builder 模式）。
@@ -628,7 +622,6 @@ pub struct Session {
     pub error_tracker: Option<Arc<dyn TrackedRequestErrorFeedback>>,
 }
 
-
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Session")
@@ -644,11 +637,13 @@ impl std::fmt::Debug for Session {
             .field("mitm_server_name", &self.mitm_server_name)
             .field("dispatcher", &self.dispatcher.as_ref().map(|_| "<Arc<dyn SessionDispatcher>>"))
             .field("full_handler", &self.full_handler.as_ref().map(|_| "<Arc<dyn FullHandler>>"))
-            .field("error_tracker", &self.error_tracker.as_ref().map(|_| "<Arc<dyn TrackedRequestErrorFeedback>>"))
+            .field(
+                "error_tracker",
+                &self.error_tracker.as_ref().map(|_| "<Arc<dyn TrackedRequestErrorFeedback>>"),
+            )
             .finish()
     }
 }
-
 
 impl Clone for Session {
     fn clone(&self) -> Self {
@@ -669,7 +664,6 @@ impl Clone for Session {
         }
     }
 }
-
 
 impl Session {
     /// 创建新的会话。
@@ -735,10 +729,7 @@ impl Session {
     /// 优先返回 `outbound.destination_override`（如果设置了），
     /// 否则返回 `inbound.destination`。
     pub fn destination(&self) -> Option<&Destination> {
-        self.outbound
-            .destination_override
-            .as_ref()
-            .or(self.inbound.destination.as_ref())
+        self.outbound.destination_override.as_ref().or(self.inbound.destination.as_ref())
     }
 
     /// 获取连接来源地址（对应 Go session.Source）。
@@ -766,7 +757,6 @@ impl Session {
     pub fn original_target(&self) -> Option<&Destination> {
         self.outbound.original_target.as_ref()
     }
-
 }
 
 impl Default for Session {
@@ -777,12 +767,10 @@ impl Default for Session {
 
 #[cfg(test)]
 mod tests {
+    use std::{net::Ipv4Addr, sync::Arc, time::Duration};
+
     use super::*;
-    use crate::net::address::Address;
-    use crate::net::port::Port;
-    use std::net::Ipv4Addr;
-    use std::sync::Arc;
-    use std::time::Duration;
+    use crate::net::{address::Address, port::Port};
 
     // ---- ID 测试 ----
 
@@ -864,10 +852,7 @@ mod tests {
 
     #[test]
     fn test_outbound_with_destination_override() {
-        let dest = Destination::tcp(
-            Address::ipv4(Ipv4Addr::new(127, 0, 0, 1)),
-            Port::new(8080),
-        );
+        let dest = Destination::tcp(Address::ipv4(Ipv4Addr::new(127, 0, 0, 1)), Port::new(8080));
         let outbound = Outbound::new().with_destination_override(dest.clone());
         assert_eq!(outbound.destination_override, Some(dest));
     }
@@ -897,7 +882,6 @@ mod tests {
         let content = Content::default();
         assert!(content.protocol.is_none());
     }
-
 
     // ---- Sockopt 测试 ----
 
@@ -1048,12 +1032,14 @@ mod tests {
         ) -> std::task::Poll<std::io::Result<usize>> {
             std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
         }
+
         fn poll_flush(
             mut self: std::pin::Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<std::io::Result<()>> {
             std::pin::Pin::new(&mut self.0).poll_flush(cx)
         }
+
         fn poll_shutdown(
             mut self: std::pin::Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
@@ -1083,14 +1069,8 @@ mod tests {
         assert_eq!(inbound.name.as_deref(), Some("vless-in"));
         assert_eq!(inbound.local, Some(local));
         assert_eq!(inbound.vless_route, Some(Port::new(0x1234)));
-        assert!(Arc::ptr_eq(
-            inbound.conn.as_ref().unwrap(),
-            &conn,
-        ));
-        assert!(Arc::ptr_eq(
-            inbound.timer.as_ref().unwrap(),
-            &timer,
-        ));
+        assert!(Arc::ptr_eq(inbound.conn.as_ref().unwrap(), &conn,));
+        assert!(Arc::ptr_eq(inbound.timer.as_ref().unwrap(), &timer,));
         assert_eq!(inbound.can_splice_copy, 2);
 
         // 默认可 clone（含 Arc<dyn SessionConn>）
@@ -1182,9 +1162,7 @@ mod tests {
                     .with_can_splice_copy(1),
             )
             .with_content(
-                Content::new()
-                    .with_sniffing_request(sniff.clone())
-                    .with_skip_dns_resolve(true),
+                Content::new().with_sniffing_request(sniff.clone()).with_skip_dns_resolve(true),
             );
 
         // Inbound 6 字段

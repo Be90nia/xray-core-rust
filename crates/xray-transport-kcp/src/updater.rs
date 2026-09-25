@@ -2,22 +2,26 @@
 //!
 //! Go 的 `Updater` 用 `signal.Notifier + time.Ticker + goroutine` 实现按需唤醒：
 //!
-//! - `WakeUp()`：spawn 一个 goroutine 跑 `run()`（用 semaphore.Instance 保证
-//!   同一时刻只有一个 goroutine 在跑）。
-//! - `run()`：若 `shouldTerminate()` 直接退出；否则 `time.NewTicker(interval)`，
-//!   循环 `updateFunc()` 直到 `shouldContinue()` 为 false。
+//! - `WakeUp()`：spawn 一个 goroutine 跑 `run()`（用 semaphore.Instance 保证 同一时刻只有一个
+//!   goroutine 在跑）。
+//! - `run()`：若 `shouldTerminate()` 直接退出；否则 `time.NewTicker(interval)`， 循环
+//!   `updateFunc()` 直到 `shouldContinue()` 为 false。
 //! - `interval` 字段是 `int64`，可用 `atomic.StoreInt64` 实时改。
 //!
 //! Rust 等价：trait + Tokio 实现 + Noop 实现。
 //!
 //! - [`Updater`] trait：`wake_up` / `set_interval` / `interval`。
-//! - [`TokioUpdater`]：用 `tokio::sync::Notify + tokio::spawn` 实现真实 wakeup。
-//!   单实例运行通过 `AtomicBool` running flag 保证。
+//! - [`TokioUpdater`]：用 `tokio::sync::Notify + tokio::spawn` 实现真实 wakeup。 单实例运行通过
+//!   `AtomicBool` running flag 保证。
 //! - [`NoopUpdater`]：测试用，不调度（直接丢弃 wake_up）。
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -71,11 +75,7 @@ impl TokioUpdater {
     /// `tokio::runtime::Handle::try_current()` 检查后再 spawn。
     fn try_spawn(self: &Arc<Self>) {
         // CAS：保证只有一个 task 同时运行
-        if self
-            .running
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
+        if self.running.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
             return;
         }
 
@@ -183,8 +183,9 @@ impl Updater for NoopUpdater {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::AtomicU32;
+
+    use super::*;
 
     #[test]
     fn noop_updater_records_wake_calls() {

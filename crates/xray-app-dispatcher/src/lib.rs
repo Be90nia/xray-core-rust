@@ -18,17 +18,17 @@
 //!
 //! ## 关键决策（详见 docs/translation-conventions.md §10）
 //!
-//! 1. 不实现 `xray_features::routing::Router`：API 简化（`(dest, session) -> tag`），
-//!    Go 的 `routing.Context` 含 source IP/user/protocol 等丰富字段。crate 内部定义
-//!    独立 `RoutingContext` trait 保持语义
+//! 1. 不实现 `xray_features::routing::Router`：API 简化（`(dest, session) -> tag`）， Go 的
+//!    `routing.Context` 含 source IP/user/protocol 等丰富字段。crate 内部定义 独立 `RoutingContext`
+//!    trait 保持语义
 //! 2. 协议嗅探器（HTTP/TLS/BitTorrent/QUIC/UTP）全 trait + NotImplemented stub
 //! 3. 不直接依赖 xray-app-dns / xray-app-router，避免循环依赖，trait 在本 crate 定义
 
 pub mod config;
 pub mod default;
+pub mod endpoint_override;
 pub mod error;
 pub mod fakednssniffer;
-pub mod endpoint_override;
 pub mod sniffer;
 pub mod stats;
 pub mod udp_session;
@@ -36,16 +36,16 @@ pub mod udp_session;
 pub use config::{Config, SessionConfig};
 pub use default::{
     AccessContext, AccessLogEntry, AccessLogSink, CachedReader, DefaultDispatcher, DialBridge,
-    DispatchHandler, DispatcherContext, InboundSpliceMeta, INBOUND_SPLICE,
-    OutboundHandlerManager, RoutingContext, RoutingRouter, SimpleOhm, SPLICE_ADMISSIONS,
+    DispatchHandler, DispatcherContext, INBOUND_SPLICE, InboundSpliceMeta, OutboundHandlerManager,
+    RoutingContext, RoutingRouter, SPLICE_ADMISSIONS, SimpleOhm,
 };
 pub use error::DispatcherError;
-pub use udp_session::UdpDispatchSession;
 pub use fakednssniffer::{
     DnsThenOthersSniffResult, FakeDnsEngine, FakeDnsSniffResult, FakeDnsSnifferFactory,
 };
 pub use sniffer::{
     CompositeSniffResult, ProtocolSniffer, SniffError, SniffResult, Sniffer,
-    SnifferResultComposite, SnifferIsProtoSubsetOf,
+    SnifferIsProtoSubsetOf, SnifferResultComposite,
 };
 pub use stats::{SizeStatReader, SizeStatWriter, maybe_wrap_reader, maybe_wrap_writer};
+pub use udp_session::UdpDispatchSession;

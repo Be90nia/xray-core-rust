@@ -9,12 +9,12 @@
 //! Go 用 `JSONConfigLoader` 注册制 + `json.RawMessage` 处理协议特定 settings。
 //! Rust 利用 serde derive + [`serde_json::Value`] 占位，大幅简化代码：
 //!
-//! - **enum 替代注册制**：协议分发未来用 `#[serde(tag = "protocol", content = "settings")]`
-//!   tagged enum，无需 `RegisterCreator` map。
-//! - **serde derive 替代手写 UnmarshalJSON**：PortList 的 `number/string/array` 多态
-//!   通过自定义 `Deserialize` impl 表达，集中在一处。
-//! - **切片策略**：当前协议 settings 用 [`serde_json::Value`] 占位，
-//!   待各 `xray-proxy-*` crate 完成后逐步替换为强类型字段。
+//! - **enum 替代注册制**：协议分发未来用 `#[serde(tag = "protocol", content = "settings")]` tagged
+//!   enum，无需 `RegisterCreator` map。
+//! - **serde derive 替代手写 UnmarshalJSON**：PortList 的 `number/string/array` 多态 通过自定义
+//!   `Deserialize` impl 表达，集中在一处。
+//! - **切片策略**：当前协议 settings 用 [`serde_json::Value`] 占位， 待各 `xray-proxy-*` crate
+//!   完成后逐步替换为强类型字段。
 //!
 //! ## 快速上手
 //!
@@ -28,8 +28,8 @@
 pub mod app_config;
 pub mod built;
 pub mod common;
-pub mod confloader;
 pub mod config;
+pub mod confloader;
 pub mod error;
 pub use error::ConfError;
 pub mod init;
@@ -42,14 +42,16 @@ pub mod toml_config;
 pub mod vformat;
 pub mod yaml;
 pub use built::{BuiltConfig, BuiltEntry, BuiltInbound, BuiltOutbound};
- pub use common::{Address, Int32Range, Network, NetworkList, PortList, PortRange, StringList, User};
- pub use config::{Config, InboundDetourConfig, MuxConfig, OutboundDetourConfig, SniffingConfig};
-pub use protocols::{
-    dispatch_inbound_settings, dispatch_outbound_settings, InboundSettings, OutboundSettings,
+pub use common::{
+    Address, Int32Range, Network, NetworkList, PortList, PortRange, StringList, User,
 };
-pub use serial::{build_config, merge_config_from_files, merge_configs};
- pub use confloader::{
+pub use config::{Config, InboundDetourConfig, MuxConfig, OutboundDetourConfig, SniffingConfig};
+pub use confloader::{
     load_file, load_file_with_format, load_reader, load_str, load_str_auto_detect,
 };
 pub use outbound_security::validate_outbound_transport_security;
+pub use protocols::{
+    InboundSettings, OutboundSettings, dispatch_inbound_settings, dispatch_outbound_settings,
+};
+pub use serial::{build_config, merge_config_from_files, merge_configs};
 pub use vformat::Format;

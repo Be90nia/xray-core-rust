@@ -8,8 +8,7 @@
 //! 实际握手走 uTLS 等价品（Rust 端待生态成熟或自研后再接，
 //! 见 [`crate::client`] / [`crate::server`] 占位）。
 
-use std::collections::HashMap;
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use crate::error::RealityError;
 
@@ -129,8 +128,8 @@ pub struct RealityConfig {
     /// Go 无此配置面（`hub.go:79` 无条件探测，结果走进程内
     /// `GlobalMaxCSSMsgCount`）；Rust 探测需向 dest 发起真实出站连接，
     /// opt-in 更稳。语义：
-    /// - [`MaxUselessRecordsSetting::Disabled`]（缺省）：不探测，消费侧用
-    ///   Go 默认 32（`reality/common.go:70` maxUselessRecords）。
+    /// - [`MaxUselessRecordsSetting::Disabled`]（缺省）：不探测，消费侧用 Go 默认
+    ///   32（`reality/common.go:70` maxUselessRecords）。
     /// - [`MaxUselessRecordsSetting::Probe`]<n>：listener 启动时 spawn
     ///   [`crate::probe::detect_max_useless_records`] 写 [`crate::probe::ProbeTable`]；
     ///   握手期查表，miss 时 fallback 到 n（JSON `true` ≡ `Probe(32)`）。
@@ -226,7 +225,7 @@ impl MaxUselessRecordsSetting {
                 u32::try_from(raw)
                     .map(|x| if x == 0 { Self::Disabled } else { Self::Probe(x) })
                     .map_err(|_| format!("reality: maxUselessRecords {raw} exceeds u32"))
-            }
+            },
             other => Err(format!(
                 "reality: invalid maxUselessRecords {other} (need bool or non-negative integer)"
             )),
@@ -270,9 +269,7 @@ impl RealityConfig {
             // Go: (*[32]byte)(c.Mldsa65Seed) —— 长度 != 32 直接 panic，
             // Rust 端在配置期报错（等价的失败时机，更友好的失败方式）。
             if p.mldsa65_seed.len() != MLDSA65_SEED_LEN {
-                return Err(RealityError::InvalidMldsa65SeedLen {
-                    actual: p.mldsa65_seed.len(),
-                });
+                return Err(RealityError::InvalidMldsa65SeedLen { actual: p.mldsa65_seed.len() });
             }
             cfg.mldsa65_seed = Some(p.mldsa65_seed.clone());
             // tvky (REALITY 10.0)：派生 ML-DSA-65 公钥并填充 `mldsa65_key`
@@ -317,9 +314,7 @@ impl RealityConfig {
             MaxUselessRecordsSetting::Disabled
         } else {
             MaxUselessRecordsSetting::Probe(u32::try_from(p.max_useless_records).map_err(|_| {
-                RealityError::InvalidMaxUselessRecords {
-                    value: p.max_useless_records,
-                }
+                RealityError::InvalidMaxUselessRecords { value: p.max_useless_records }
             })?)
         };
 
@@ -331,9 +326,7 @@ impl RealityConfig {
     /// 用于 [`crate::client::u_client`] 在握手前预检，避免半完成握手再失败。
     pub fn validate_client(&self) -> Result<(), RealityError> {
         if self.public_key.len() != X25519_KEY_LEN {
-            return Err(RealityError::InvalidPublicKeyLen {
-                actual: self.public_key.len(),
-            });
+            return Err(RealityError::InvalidPublicKeyLen { actual: self.public_key.len() });
         }
         if self.fingerprint.is_empty() {
             return Err(RealityError::FingerprintNotFound);
@@ -344,9 +337,7 @@ impl RealityConfig {
     /// 校验服务端必备字段（private_key 长度）。
     pub fn validate_server(&self) -> Result<(), RealityError> {
         if self.private_key.len() != X25519_KEY_LEN {
-            return Err(RealityError::InvalidPrivateKeyLen {
-                actual: self.private_key.len(),
-            });
+            return Err(RealityError::InvalidPrivateKeyLen { actual: self.private_key.len() });
         }
         Ok(())
     }
@@ -356,8 +347,8 @@ impl RealityConfig {
 ///
 /// 三态 JSON 表达（`realitySettings.serverAcceptor`）：
 /// - 缺失 / `null` / `"rustls"` → [`ServerAcceptorSetting::Rustls`]（默认，现行为）
-/// - `"btls"` → [`ServerAcceptorSetting::Btls`]（BoringSSL server acceptor，opt-in；
-///   iOS 构建下配置即硬错——该平台无注入 FFI，bd mygg 教训）
+/// - `"btls"` → [`ServerAcceptorSetting::Btls`]（BoringSSL server acceptor，opt-in； iOS
+///   构建下配置即硬错——该平台无注入 FFI，bd mygg 教训）
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ServerAcceptorSetting {
     /// rustls acceptor（默认）。
@@ -383,9 +374,10 @@ impl ServerAcceptorSetting {
                 #[cfg(not(target_os = "ios"))]
                 "btls" => Ok(Self::Btls),
                 #[cfg(target_os = "ios")]
-                "btls" => Err(
-                    "reality: serverAcceptor=\"btls\" is not available on iOS builds".to_string(),
-                ),
+                "btls" => {
+                    Err("reality: serverAcceptor=\"btls\" is not available on iOS builds"
+                        .to_string())
+                },
                 other => Err(format!(
                     "reality: invalid serverAcceptor {other:?} (need \"rustls\" or \"btls\")"
                 )),
@@ -399,8 +391,11 @@ impl ServerAcceptorSetting {
 
 #[cfg(test)]
 mod tests {
+    use xray_proto::transport::internet::reality::{
+        Config as ProtoConfig, LimitFallback as ProtoLimitFallback,
+    };
+
     use super::*;
-    use xray_proto::transport::internet::reality::{Config as ProtoConfig, LimitFallback as ProtoLimitFallback};
 
     fn proto_fixture() -> ProtoConfig {
         ProtoConfig {
@@ -472,10 +467,7 @@ mod tests {
         let mut p = proto_fixture();
         p.short_ids = vec![vec![0u8; 7]]; // 长度错
         let err = RealityConfig::from_proto(&p).unwrap_err();
-        assert!(matches!(
-            err,
-            RealityError::InvalidShortIdLen { actual: 7 }
-        ));
+        assert!(matches!(err, RealityError::InvalidShortIdLen { actual: 7 }));
     }
 
     #[test]
@@ -502,10 +494,7 @@ mod tests {
         let mut p = proto_fixture();
         p.mldsa65_seed = vec![0xaa; 31];
         let err = RealityConfig::from_proto(&p).unwrap_err();
-        assert!(matches!(
-            err,
-            RealityError::InvalidMldsa65SeedLen { actual: 31 }
-        ));
+        assert!(matches!(err, RealityError::InvalidMldsa65SeedLen { actual: 31 }));
     }
 
     /// 客户端字段 mldsa65_verify（proto field 25）透传。
@@ -530,10 +519,7 @@ mod tests {
         p.public_key = vec![0u8; 31];
         let cfg = RealityConfig::from_proto(&p).unwrap();
         let err = cfg.validate_client().unwrap_err();
-        assert!(matches!(
-            err,
-            RealityError::InvalidPublicKeyLen { actual: 31 }
-        ));
+        assert!(matches!(err, RealityError::InvalidPublicKeyLen { actual: 31 }));
     }
 
     #[test]
@@ -557,19 +543,13 @@ mod tests {
         p.private_key = vec![0u8; 16];
         let cfg = RealityConfig::from_proto(&p).unwrap();
         let err = cfg.validate_server().unwrap_err();
-        assert!(matches!(
-            err,
-            RealityError::InvalidPrivateKeyLen { actual: 16 }
-        ));
+        assert!(matches!(err, RealityError::InvalidPrivateKeyLen { actual: 16 }));
     }
 
     #[test]
     fn short_id_from_slice_wrong_len() {
         let err = ShortId::from_slice(&[0u8; 7]).unwrap_err();
-        assert!(matches!(
-            err,
-            RealityError::InvalidShortIdLen { actual: 7 }
-        ));
+        assert!(matches!(err, RealityError::InvalidShortIdLen { actual: 7 }));
     }
 
     #[test]
@@ -624,10 +604,7 @@ mod tests {
         let mut p = proto_fixture();
         p.max_useless_records = u64::from(u32::MAX) + 1;
         let err = RealityConfig::from_proto(&p).unwrap_err();
-        assert!(matches!(
-            err,
-            RealityError::InvalidMaxUselessRecords { value: _ }
-        ));
+        assert!(matches!(err, RealityError::InvalidMaxUselessRecords { value: _ }));
     }
 
     #[test]
@@ -664,13 +641,11 @@ mod tests {
     /// bd tce2：realitySettings.serverAcceptor 三态解析。
     #[test]
     fn from_json_server_acceptor_three_states() {
-        use super::ServerAcceptorSetting;
         use serde_json::json;
+
+        use super::ServerAcceptorSetting;
         // 缺省（键缺失）/ null：默认 rustls
-        assert_eq!(
-            ServerAcceptorSetting::from_json(None).unwrap(),
-            ServerAcceptorSetting::Rustls
-        );
+        assert_eq!(ServerAcceptorSetting::from_json(None).unwrap(), ServerAcceptorSetting::Rustls);
         assert_eq!(
             ServerAcceptorSetting::from_json(Some(&serde_json::Value::Null)).unwrap(),
             ServerAcceptorSetting::Rustls

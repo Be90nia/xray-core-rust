@@ -1,27 +1,29 @@
 //! mKCP transport dialer + listener 注册。
 //!
 //! dialer: 完整拨号流程——解析配置 → UDP socket → KcpDialerFactory → Connection → KcpConn。
-//! listener: 完整监听流程——StdUdpHub bind → Listener → spawn UDP recv loop → bridge → upstream ConnHandler.
+//! listener: 完整监听流程——StdUdpHub bind → Listener → spawn UDP recv loop → bridge → upstream
+//! ConnHandler.
 
-use std::io;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{io, net::SocketAddr, sync::Arc};
 
-use xray_transport::dialer::{StreamSettings, TransportDialFn, register_transport_dialer};
-use xray_transport::listener_registry::{
-    ConnHandler, TransportListener, TransportListenFn, register_transport_listener,
+use xray_transport::{
+    dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
+    finalmask::{CodecChain, parse_finalmask_udp_chain},
+    listener_registry::{
+        ConnHandler, TransportListenFn, TransportListener, register_transport_listener,
+    },
 };
 
-use crate::config::{Config, default_config};
-use crate::listener::{ConnHandler as KcpConnHandler, Listener, UdpHub};
-use crate::connection::{ConnMetadata, Connection, ConnectionCloser, KcpConn};
-use crate::dialer::{KcpDialerFactory, PacketInput, next_conv};
-use crate::io::{KCPPacketReader, PacketReader as _};
-use crate::output::{RetryableWriter, SegmentWriter, SimpleSegmentWriter};
-use xray_transport::finalmask::{parse_finalmask_udp_chain, CodecChain};
-
-use crate::udp_hub::{MaskedPacketInput, MaskedUdpHub, StdPacketInput, StdUdpHub};
-use crate::PROTOCOL_NAME;
+use crate::{
+    PROTOCOL_NAME,
+    config::{Config, default_config},
+    connection::{ConnMetadata, Connection, ConnectionCloser, KcpConn},
+    dialer::{KcpDialerFactory, PacketInput, next_conv},
+    io::{KCPPacketReader, PacketReader as _},
+    listener::{ConnHandler as KcpConnHandler, Listener, UdpHub},
+    output::{RetryableWriter, SegmentWriter, SimpleSegmentWriter},
+    udp_hub::{MaskedPacketInput, MaskedUdpHub, StdPacketInput, StdUdpHub},
+};
 
 /// 注册 mKCP transport dialer。
 ///
@@ -74,10 +76,10 @@ async fn listen_kcp(
     handler: ConnHandler,
 ) -> io::Result<Box<dyn TransportListener>> {
     // 1. 解析 kcpSettings JSON + finalmask 伪装链
-     let config = parse_kcp_config(settings.transport_json.as_ref())?;
+    let config = parse_kcp_config(settings.transport_json.as_ref())?;
     let chain = parse_finalmask_udp_chain(settings.finalmask_json.as_ref())?;
- 
-     // 2. 绑定 UDP socket
+
+    // 2. 绑定 UDP socket
     // mask 开启时包装 hub（对应 Go udp.Hub 建立时 WrapPacketConnServer，udp/hub.go:71-72）
     let hub: Arc<dyn UdpHub> = {
         let raw = Arc::new(StdUdpHub::bind(addr)?);
@@ -86,9 +88,9 @@ async fn listen_kcp(
             None => raw,
         }
     };
-     let local = hub
-         .local_addr()
-         .ok_or_else(|| io::Error::other("kcp listener: local_addr unavailable after bind"))?;
+    let local = hub
+        .local_addr()
+        .ok_or_else(|| io::Error::other("kcp listener: local_addr unavailable after bind"))?;
     // 3. packet reader + bridge handler（KCP ConnHandler → upstream xray_transport::ConnHandler）
     let reader = Arc::new(KCPPacketReader::new());
     let bridge: Arc<dyn KcpConnHandler> = Arc::new(UpstreamConnBridge(handler));
@@ -98,9 +100,7 @@ async fn listen_kcp(
 
     // 5. spawn UDP recv loop（阻塞读 hub，分发到 KCP sessions）
     let listener_clone = Arc::clone(&listener);
-    tokio::task::spawn_blocking(move || {
-        while listener_clone.handle_one_packet() {}
-    });
+    tokio::task::spawn_blocking(move || while listener_clone.handle_one_packet() {});
 
     Ok(Box::new(KcpTransportListener { listener, local }))
 }
@@ -124,9 +124,7 @@ struct KcpTransportListener {
 
 impl TransportListener for KcpTransportListener {
     fn close(&self) -> io::Result<()> {
-        self.listener
-            .close()
-            .map_err(|e| io::Error::other(e.to_string()))
+        self.listener.close().map_err(|e| io::Error::other(e.to_string()))
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -173,19 +171,13 @@ async fn dial_kcp(
     };
 
     // 6. 创建 KCP Connection
-    let conn = Arc::new(Connection::new(
-        meta,
-        segment_writer,
-        closer,
-        Arc::new(config),
-    ));
+    let conn = Arc::new(Connection::new(meta, segment_writer, closer, Arc::new(config)));
 
-    // 7. spawn fetch_input 循环（后台读 UDP 包并分发到 Connection）。
-    //    铁律：阻塞读 packet_input 期间绝不持有 conn 强引用。若持 Arc 等待，
-    //    Connection 的最后一个强引用在循环自己手里 → ConnectionInner::drop
-    //    永不发生 → closer 置 closed 标志永不触发 → read_packet 永不返回
-    //    （自持挂死；Runtime::drop 等待 blocking task = 测试/进程挂死）。
-    //    正确形态：先 read_packet 阻塞读，读到包后再 upgrade 分发。
+    // 7. spawn fetch_input 循环（后台读 UDP 包并分发到 Connection）。 铁律：阻塞读 packet_input
+    //    期间绝不持有 conn 强引用。若持 Arc 等待， Connection 的最后一个强引用在循环自己手里 →
+    //    ConnectionInner::drop 永不发生 → closer 置 closed 标志永不触发 → read_packet 永不返回
+    //    （自持挂死；Runtime::drop 等待 blocking task = 测试/进程挂死）。 正确形态：先 read_packet
+    //    阻塞读，读到包后再 upgrade 分发。
     let conn_weak = Arc::downgrade(&conn);
     let reader = KCPPacketReader::new();
     tokio::task::spawn_blocking(move || {
@@ -220,7 +212,9 @@ async fn dial_kcp(
 /// tslk：对齐 Go 硬校验——mtu<21 / tti<10||>1000 / cwndMultiplier<1 /
 /// maxSendingWindow<mtu / 任意字段为负数 全部启动期报错（之前静默回绕为 u32 大值）。
 fn parse_kcp_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
-    let Some(v) = json else { return Ok(default_config()); };
+    let Some(v) = json else {
+        return Ok(default_config());
+    };
     let Some(obj) = v.as_object() else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -327,10 +321,7 @@ fn parse_kcp_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
     // Go `transport_method.go:562-573` 四条硬校验。错误措辞逐字对齐，便于运维
     // 直接照抄 Go 日志排除。
     if config.mtu < 21 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Mtu must be at least 21",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Mtu must be at least 21"));
     }
     if config.tti < 10 || config.tti > 5000 {
         return Err(io::Error::new(
@@ -346,10 +337,7 @@ fn parse_kcp_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
     }
     // Go `GetSendingBufferSize() == MaxSendingWindow / Mtu`，==0 即报错。
     if config.max_sending_window / config.mtu == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "MaxSendingWindow must be >= Mtu",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "MaxSendingWindow must be >= Mtu"));
     }
 
     Ok(config)
@@ -430,13 +418,11 @@ impl KcpDialerFactory for StdKcpDialerFactory {
         };
 
         // 创建 SegmentWriter（通过 hub 写 UDP 包到目标；mask 开启时 encode）
-        let writer = UdpSegmentWriter {
-            hub,
-            chain: self.chain.clone(),
-        };
+        let writer = UdpSegmentWriter { hub, chain: self.chain.clone() };
         // k3kh：套 RetryableWriter（5×100ms 重试）对齐 Go `NewRetryableWriter`。
         // 同步 sleep：上层在 KCP worker 同步 flush 上下文调用，等价 Go retry.Timed 语义。
-        let segment_writer: Arc<dyn SegmentWriter> = Arc::new(RetryableWriter::new(Arc::new(SimpleSegmentWriter::new(writer))));
+        let segment_writer: Arc<dyn SegmentWriter> =
+            Arc::new(RetryableWriter::new(Arc::new(SimpleSegmentWriter::new(writer))));
 
         // 创建 Closer（共享 hub 关闭标志：conn drop → 置位 → 阻塞读退出）
         let closer: Arc<dyn ConnectionCloser> = Arc::new(StdUdpCloser { closed: closed_flag });
@@ -532,8 +518,7 @@ mod tests {
     fn parse_kcp_config_rejects_removed_header() {
         // Go v26 KCPConfig.Build：header/seed 已移除（PrintRemovedFeatureError，
         // transport_internet.go:67，header/seed 合并为单一文案）
-        let v: serde_json::Value =
-            serde_json::from_str(r#"{"header":{"type":"srtp"}}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(r#"{"header":{"type":"srtp"}}"#).unwrap();
         let err = match parse_kcp_config(Some(&v)) {
             Err(e) => e,
             Ok(_) => panic!("expected removed-feature error for header"),
@@ -628,57 +613,41 @@ mod tests {
     #[test]
     fn tslk_rejects_cwnd_multiplier_negative() {
         let msg = err_msg(r#"{"cwndMultiplier":-3}"#);
-        assert!(
-            msg.contains("cwndMultiplier must be non-negative"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("cwndMultiplier must be non-negative"), "got: {msg}");
     }
 
     #[test]
     fn tslk_rejects_max_sending_window_smaller_than_mtu() {
         // Go :571 — GetSendingBufferSize == 0 (即 MaxSendingWindow < Mtu)
         let msg = err_msg(r#"{"mtu":1400,"maxSendingWindow":1399}"#);
-        assert!(
-            msg.contains("MaxSendingWindow must be >= Mtu"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("MaxSendingWindow must be >= Mtu"), "got: {msg}");
     }
 
     #[test]
     fn tslk_rejects_negative_uplink_capacity() {
         let msg = err_msg(r#"{"uplinkCapacity":-1}"#);
-        assert!(
-            msg.contains("uplinkCapacity must be non-negative"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("uplinkCapacity must be non-negative"), "got: {msg}");
     }
 
     #[test]
     fn tslk_rejects_negative_downlink_capacity() {
         let msg = err_msg(r#"{"downlinkCapacity":-1}"#);
-        assert!(
-            msg.contains("downlinkCapacity must be non-negative"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("downlinkCapacity must be non-negative"), "got: {msg}");
     }
 
     #[test]
     fn tslk_rejects_negative_max_sending_window() {
         let msg = err_msg(r#"{"maxSendingWindow":-1}"#);
-        assert!(
-            msg.contains("maxSendingWindow must be non-negative"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("maxSendingWindow must be non-negative"), "got: {msg}");
     }
 
     #[test]
     fn tslk_accepts_minimal_valid_kcp_settings() {
         // 边界：mtu=21, tti=10, cwndMultiplier=1, maxSendingWindow=21。
         // MaxSendingWindow/Mtu = 21/21 = 1 ≠ 0 通过。
-        let v: serde_json::Value = serde_json::from_str(
-            r#"{"mtu":21,"tti":10,"cwndMultiplier":1,"maxSendingWindow":21}"#,
-        )
-        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"mtu":21,"tti":10,"cwndMultiplier":1,"maxSendingWindow":21}"#)
+                .unwrap();
         let cfg = parse_kcp_config(Some(&v)).expect("minimal valid kcp settings");
         assert_eq!(cfg.mtu, 21);
         assert_eq!(cfg.tti, 10);
@@ -697,9 +666,7 @@ mod tests {
     /// IP 字面量地址走快路径（不调 lookup_host）。
     #[tokio::test]
     async fn ejom_resolve_ipv4_literal_skips_dns() {
-        use xray_common::net::address::Address;
-        use xray_common::net::destination::Destination;
-        use xray_common::net::port::Port;
+        use xray_common::net::{address::Address, destination::Destination, port::Port};
         let dest = Destination::tcp(
             Address::IPv4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
             Port::new(14550),
@@ -712,13 +679,8 @@ mod tests {
     /// localhost 域名经 `tokio::net::lookup_host` 异步解析（环回 127.0.0.1 或 ::1）。
     #[tokio::test]
     async fn ejom_resolve_localhost_via_async_dns() {
-        use xray_common::net::address::Address;
-        use xray_common::net::destination::Destination;
-        use xray_common::net::port::Port;
-        let dest = Destination::tcp(
-            Address::Domain("localhost".to_string()),
-            Port::new(8080),
-        );
+        use xray_common::net::{address::Address, destination::Destination, port::Port};
+        let dest = Destination::tcp(Address::Domain("localhost".to_string()), Port::new(8080));
         let addr = resolve_dest_to_socket_addr(&dest).await.expect("resolve ok");
         // 接受 IPv4 或 IPv6 环回（系统 hosts 文件决定）
         assert!(addr.ip().is_loopback(), "got non-loopback {addr}");
@@ -728,16 +690,11 @@ mod tests {
     /// 未知域名解析失败 → 返回 io::Error。
     #[tokio::test]
     async fn ejom_resolve_unknown_domain_returns_err() {
-        use xray_common::net::address::Address;
-        use xray_common::net::destination::Destination;
-        use xray_common::net::port::Port;
+        use xray_common::net::{address::Address, destination::Destination, port::Port};
         // RFC 6761 保留 TLD，规定解析必须失败
-        let dest = Destination::tcp(
-            Address::Domain("nonexistent.invalid".to_string()),
-            Port::new(1),
-        );
+        let dest =
+            Destination::tcp(Address::Domain("nonexistent.invalid".to_string()), Port::new(1));
         let res = resolve_dest_to_socket_addr(&dest).await;
         assert!(res.is_err(), "invalid TLD must fail to resolve");
     }
-
 }

@@ -1,33 +1,39 @@
 //! gRPC transport: h2 client/server tunnel.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{Context, Poll},
+};
 
 use bytes::Bytes;
-use h2::client;
-use h2::server;
+use h2::{client, server};
 use http::Request;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::TcpStream;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
+    net::TcpStream,
+};
 use xray_common::net::destination::Destination;
-use xray_transport::connection::Connection;
-use xray_transport::dialer::StreamSettings;
-use xray_transport::listener_registry::{ConnHandler, TransportListener};
+use xray_transport::{
+    connection::Connection,
+    dialer::StreamSettings,
+    listener_registry::{ConnHandler, TransportListener},
+};
 
 use crate::config::Config;
 
 /// gRPC :authority 判定（Go dial.go:147-153，票 0tnw）。
 ///
 /// 三级回退：一级 `grpcSettings.Authority`；二级只看 tlsConfig 的 serverName
-///（Go `tlsConfig != nil` 即 security==tls——reality 下 tlsConfig 为 nil，
+/// （Go `tlsConfig != nil` 即 security==tls——reality 下 tlsConfig 为 nil，
 /// reality serverName 不进 authority）；三级非 reality 且目标为域名。
 /// 全空时 Go `grpc.WithAuthority("")` 由 grpc-go 回退 endpoint host:port
-///（JoinHostPort 语义，IPv6 加方括号）。
+/// （JoinHostPort 语义，IPv6 加方括号）。
 fn grpc_authority(cfg_authority: &str, settings: &StreamSettings, dest: &Destination) -> String {
     let server_name = settings
         .security_json
@@ -56,17 +62,17 @@ fn grpc_authority(cfg_authority: &str, settings: &StreamSettings, dest: &Destina
     }
 }
 
-pub async fn dial(dest: &Destination, settings: &StreamSettings) -> io::Result<Box<dyn Connection>> {
+pub async fn dial(
+    dest: &Destination,
+    settings: &StreamSettings,
+) -> io::Result<Box<dyn Connection>> {
     let addr = format!("{}:{}", dest.address(), dest.port().value());
     // r7a9：拨号外层 timeout 包装。Go xray-core system_dialer 用 DefaultSystemDialer
     // 16s 超时；这里与 system_dialer::DEFAULT_DIAL_TIMEOUT 对齐（与 hysteria/quic 拨号同源）。
     // 域名前置（CDN 后端）下 IP 直连极快；DNS hang/路由黑洞下裸 connect 永不返回。
-    let tcp = tokio::time::timeout(
-        std::time::Duration::from_secs(16),
-        TcpStream::connect(&addr),
-    )
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "grpc dial timeout"))??;
+    let tcp = tokio::time::timeout(std::time::Duration::from_secs(16), TcpStream::connect(&addr))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "grpc dial timeout"))??;
     tcp.set_nodelay(true).ok();
     let cfg = parse_config(settings)?;
     // gRPC path：`/{service}/{stream}`（Go grpc URI 契约；无前导 '/' 的裸服务名
@@ -89,8 +95,11 @@ pub async fn dial(dest: &Destination, settings: &StreamSettings) -> io::Result<B
     let conn = if !settings.security.is_empty() && settings.security != "none" {
         let sni = if server_name.is_empty() { dest.address().to_string() } else { server_name };
         let tls_cfg = xray_tls::client_config::build_client_config(
-            &settings.security, settings.security_json.as_ref(), &sni,
-        )?.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "TLS config None"))?;
+            &settings.security,
+            settings.security_json.as_ref(),
+            &sni,
+        )?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "TLS config None"))?;
         // Go dial.go:138-145：fingerprint 配置时走 tls.UClient（btls 真实
         // 浏览器 ClientHello），否则标准 TLS 客户端。
         let fp_name = settings
@@ -105,7 +114,18 @@ pub async fn dial(dest: &Destination, settings: &StreamSettings) -> io::Result<B
             let fp = xray_tls::fingerprint::get_fingerprint(fp_name).map_err(|e| {
                 io::Error::new(io::ErrorKind::InvalidInput, format!("invalid fingerprint: {e}"))
             })?;
-            Box::new(xray_tls::utls::u_client(tcp_conn, &sni, tls_cfg, fp, None, settings.security_json.as_ref()).await.map_err(io_err)?)
+            Box::new(
+                xray_tls::utls::u_client(
+                    tcp_conn,
+                    &sni,
+                    tls_cfg,
+                    fp,
+                    None,
+                    settings.security_json.as_ref(),
+                )
+                .await
+                .map_err(io_err)?,
+            )
         } else {
             Box::new(xray_tls::utls::client(tcp_conn, &sni, tls_cfg).await.map_err(io_err)?)
         };
@@ -125,7 +145,9 @@ async fn dial_h2<T>(
     user_agent: Option<&str>,
     cfg: &Config,
 ) -> io::Result<Box<dyn Connection>>
-where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {
+where
+    T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
     // Go dial.go:174-176：initialWindowsSize → SETTINGS_INITIAL_WINDOW_SIZE。
     let mut builder = client::Builder::new();
     if cfg.initial_windows_size > 0 {
@@ -135,10 +157,7 @@ where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {
     // Go dial.go:166-172 keepalive：idle_timeout 周期发 PING，health_check_timeout
     // 内未回 PONG 视为死链断连。h2 无内置 keepalive，用 ping_pong 手动泵驱动；
     // permit_without_stream（无活跃流也 ping）h2 无法感知活跃流数，按恒保活处理。
-    let (ka_idle, ka_timeout) = (
-        cfg.idle_timeout,
-        cfg.health_check_timeout,
-    );
+    let (ka_idle, ka_timeout) = (cfg.idle_timeout, cfg.health_check_timeout);
     // 连接驱动/保活泵 task：句柄存入返回的 DuplexConn（conn-kill guard），
     // 调用方 drop 连接时 abort 本 task → h2_conn 驱动 future drop → h2 连接
     // 关闭 → TCP fd 释放。否则恒保活/驱动挂起使每条 roundtrip 连接的 fd
@@ -158,7 +177,8 @@ where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {
         // http2_client.go:269-270 `if kp.Timeout == 0 { kp.Timeout = 20s }`——
         // Timeout==0 是"用默认 20s"而非"立即超时"。此前 0 映射 timeout(0s)
         // 使只配 idleTimeout 的连接每周期被首条 ping 确定性杀死。
-        let pong_timeout = std::time::Duration::from_secs(if ka_timeout > 0 { ka_timeout as u64 } else { 20 });
+        let pong_timeout =
+            std::time::Duration::from_secs(if ka_timeout > 0 { ka_timeout as u64 } else { 20 });
         let mut tick = tokio::time::interval(period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await; // 首跳立即返回
@@ -188,8 +208,10 @@ where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {
             .map_err(io_err)?
     };
     let mut rb = Request::builder()
-        .method("POST").uri(uri)
-        .header("content-type", "application/grpc").header("te", "trailers");
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/grpc")
+        .header("te", "trailers");
     if let Some(ua) = user_agent {
         rb = rb.header("user-agent", ua);
     }
@@ -207,18 +229,21 @@ where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {
     tokio::spawn(async move {
         let (mut rd, mut wr) = tokio::io::split(server);
         let up = async {
-            let mut buf = vec![0u8; 32*1024];
+            let mut buf = vec![0u8; 32 * 1024];
             loop {
                 let n = rd.read(&mut buf).await?;
-                if n==0 { let _=send_stream.send_data(Bytes::new(),true); break; }
+                if n == 0 {
+                    let _ = send_stream.send_data(Bytes::new(), true);
+                    break;
+                }
                 let frame = if multi_mode {
                     crate::encoding::encode_multi_hunk_frame(&[&buf[..n]])
                 } else {
                     crate::encoding::encode_hunk_frame(&buf[..n])
                 };
-                send_stream.send_data(Bytes::from(frame),false).map_err(io_err)?;
+                send_stream.send_data(Bytes::from(frame), false).map_err(io_err)?;
             }
-            Ok::<_,io::Error>(())
+            Ok::<_, io::Error>(())
         };
         let down = async {
             // 9d7a：响应头校验。Go grpc-go client 行为：非 200 → errMalformedHeader；
@@ -231,22 +256,21 @@ where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {
                     format!("grpc: server returned non-200 status: {}", resp.status()),
                 ));
             }
-            let resp_ct = resp
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
+            let resp_ct =
+                resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
             if !resp_ct.starts_with("application/grpc") {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("grpc: malformed response: missing or wrong content-type (got {resp_ct:?})"),
+                    format!(
+                        "grpc: malformed response: missing or wrong content-type (got {resp_ct:?})"
+                    ),
                 ));
             }
             let mut recv_stream = resp.into_body();
             let mut acc: Vec<u8> = Vec::new();
-            while let Some(d)=recv_stream.data().await {
-                let d=d.map_err(io_err)?;
-                let _=recv_stream.flow_control().release_capacity(d.len());
+            while let Some(d) = recv_stream.data().await {
+                let d = d.map_err(io_err)?;
+                let _ = recv_stream.flow_control().release_capacity(d.len());
                 acc.extend_from_slice(&d);
                 loop {
                     let frame = if multi_mode {
@@ -259,13 +283,15 @@ where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {
                     match frame {
                         Some((used, datas)) => {
                             acc.drain(..used);
-                            for data in datas { wr.write_all(&data).await?; }
-                        }
+                            for data in datas {
+                                wr.write_all(&data).await?;
+                            }
+                        },
                         None => break,
                     }
                 }
             }
-            Ok::<_,io::Error>(())
+            Ok::<_, io::Error>(())
         };
         // 任一闭包错误 → 通知 outer DuplexConn：read 返回错误而不是空。
         // SendStream 与 RecvStream 也应关闭（drop 时由 h2 自动 RST_STREAM）。
@@ -276,27 +302,44 @@ where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {
     });
     // 9d7a 后置（4tap 落地）：down/up 闭包错误经 cancel_tx 送达 DuplexConn
     // 持有的 cancel_rx，poll_read 优先返回错误——不再降级为干净 EOF。
-    Ok(Box::new(DuplexConn { inner: client, cancel_rx: Some(cancel_rx), remote: None, _conn_kill: Some(conn_driver_task) }))
+    Ok(Box::new(DuplexConn {
+        inner: client,
+        cancel_rx: Some(cancel_rx),
+        remote: None,
+        _conn_kill: Some(conn_driver_task),
+    }))
 }
-pub async fn listen(addr: SocketAddr, settings: &StreamSettings, handler: ConnHandler, trusted: Vec<String>) -> io::Result<Box<dyn TransportListener>> {
+pub async fn listen(
+    addr: SocketAddr,
+    settings: &StreamSettings,
+    handler: ConnHandler,
+    trusted: Vec<String>,
+) -> io::Result<Box<dyn TransportListener>> {
     let cfg = parse_config(settings)?;
     // serviceName 校验（Go gRPC 框架按注册 path 路由，未知 method 404）：
     // 非空 serviceName → 请求 path 必须等于 normalize_grpc_path，否则 404；
     // 空 serviceName 保持现状全放行（兼容既有部署）。
-    let expected_path = if cfg.service_name.is_empty() { None } else { Some(normalize_grpc_path(&cfg)) };
+    let expected_path =
+        if cfg.service_name.is_empty() { None } else { Some(normalize_grpc_path(&cfg)) };
     let multi_mode = cfg.multi_mode;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     let tls_cfg = if !settings.security.is_empty() && settings.security != "none" {
-        Some(xray_tls::server_config::build_server_config(&settings.security, settings.security_json.as_ref())?.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "TLS server config None"))?)
-    } else { None };
+        Some(
+            xray_tls::server_config::build_server_config(
+                &settings.security,
+                settings.security_json.as_ref(),
+            )?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "TLS server config None"))?,
+        )
+    } else {
+        None
+    };
     // Tcpmask（Go grpc/hub.go:123-125：`TcpmaskManager.WrapListener` → 每条
     // accept conn 过 `WrapConnServer`；空 manager = 恒等）。
-    let tcpmask = Arc::new(
-        xray_transport::finalmask::build_tcpmask_manager_from_json(
-            settings.finalmask_json.as_ref(),
-        )?,
-    );
+    let tcpmask = Arc::new(xray_transport::finalmask::build_tcpmask_manager_from_json(
+        settings.finalmask_json.as_ref(),
+    )?);
     // ijk1：GrpcListener close 真正停 accept 循环；共享 AtomicBool 给 spawned task。
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
@@ -316,21 +359,26 @@ pub async fn listen(addr: SocketAddr, settings: &StreamSettings, handler: ConnHa
     let trusted_for_task = Arc::new(trusted);
     tokio::spawn(async move {
         loop {
-            // 关闭：跳出循环 → spawned task 结束 → listener drop → 端口释放（Go hub.go:62-64 Close→Stop 语义）
-            if shutdown_clone.load(Ordering::Relaxed) { break; }
+            // 关闭：跳出循环 → spawned task 结束 → listener drop → 端口释放（Go hub.go:62-64
+            // Close→Stop 语义）
+            if shutdown_clone.load(Ordering::Relaxed) {
+                break;
+            }
             let (tcp, peer) = match listener_for_task.accept().await {
                 Ok(v) => v,
                 Err(e) => {
                     // ijk1：EMFILE/临时错误退避后重试，无条件 continue=EMFILE 时活锁烧 CPU。
-                    // Go xray-core listener.Accept 内部循环对 EMFILE 短暂 backoff；这里用 100ms 兜底。
-                    if matches!(e.kind(), io::ErrorKind::OutOfMemory | io::ErrorKind::ResourceBusy) {
+                    // Go xray-core listener.Accept 内部循环对 EMFILE 短暂 backoff；这里用 100ms
+                    // 兜底。
+                    if matches!(e.kind(), io::ErrorKind::OutOfMemory | io::ErrorKind::ResourceBusy)
+                    {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     } else {
                         tracing::debug!("gRPC accept error: {e}");
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
                     continue;
-                }
+                },
             };
             tcp.set_nodelay(true).ok();
             let h = handler.clone();
@@ -343,18 +391,32 @@ pub async fn listen(addr: SocketAddr, settings: &StreamSettings, handler: ConnHa
                 if let Some(tc) = tls {
                     let acc = tokio_rustls::TlsAcceptor::from(tc);
                     match acc.accept(tcp).await {
-                        Ok(c) => accept_h2(c, h, m, ep, mm, peer, &tr, ka_time, ka_timeout, keepalive_enabled).await,
-                        Err(_) => {}
+                        Ok(c) => {
+                            accept_h2(
+                                c,
+                                h,
+                                m,
+                                ep,
+                                mm,
+                                peer,
+                                &tr,
+                                ka_time,
+                                ka_timeout,
+                                keepalive_enabled,
+                            )
+                            .await
+                        },
+                        Err(_) => {},
                     }
                 } else {
-                    accept_h2(tcp, h, m, ep, mm, peer, &tr, ka_time, ka_timeout, keepalive_enabled).await;
+                    accept_h2(tcp, h, m, ep, mm, peer, &tr, ka_time, ka_timeout, keepalive_enabled)
+                        .await;
                 }
             });
         }
     });
     Ok(Box::new(GrpcListener { local, listener, shutdown }))
 }
-
 
 async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
     conn: T,
@@ -368,13 +430,17 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
     ka_timeout: u64,
     keepalive_enabled: bool,
 ) {
-    let mut h2_srv = match server::handshake(conn).await { Ok(s)=>s, Err(_)=>return };
+    let mut h2_srv = match server::handshake(conn).await {
+        Ok(s) => s,
+        Err(_) => return,
+    };
     // H13：server keepalive ping（Go hub.go:86-93 ServerParameters → grpc-go
     // http2_server 每 Time 无活动发 ping、Timeout 内无 pong 断连）。
     if keepalive_enabled {
         if let Some(mut pinger) = h2_srv.ping_pong() {
             tokio::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(ka_time.max(1)));
+                let mut tick =
+                    tokio::time::interval(std::time::Duration::from_secs(ka_time.max(1)));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 tick.tick().await; // 首跳立即返回
                 loop {
@@ -382,27 +448,30 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
                     if tokio::time::timeout(
                         std::time::Duration::from_secs(ka_timeout.max(1)),
                         pinger.ping(h2::Ping::opaque()),
-                    ).await.is_err() {
+                    )
+                    .await
+                    .is_err()
+                    {
                         break; // PONG 超时 → task 退出（PingPong drop，连接由 accept 循环终结）
                     }
                 }
             });
         }
     }
-    while let Some(r)=h2_srv.accept().await {
-        let (req,mut respond) = match r { Ok(v)=>v, Err(_)=>continue };
-        if req.method()!="POST" {
-            let r=http::Response::builder().status(404).body(()).unwrap();
-            let _=respond.send_response(r,true); continue;
+    while let Some(r) = h2_srv.accept().await {
+        let (req, mut respond) = match r {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if req.method() != "POST" {
+            let r = http::Response::builder().status(404).body(()).unwrap();
+            let _ = respond.send_response(r, true);
+            continue;
         }
         // lv34：gRPC 客户端必须发 application/grpc（gRPC wire spec §Content-Type），
         // 否则 Go hub.go:104 直接 415 Unimplemented。
         // 缺此校验=任意 content-type 一律 200，主动探测面与 Go 可区分。
-        let req_ct = req
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+        let req_ct = req.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
         if !req_ct.starts_with("application/grpc") {
             let r = http::Response::builder().status(415).body(()).unwrap();
             let _ = respond.send_response(r, true);
@@ -416,20 +485,26 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
                 // H13：未知路径回 gRPC Trailers-Only 响应（:status 200 +
                 // grpc-status 12 Unimplemented），对齐 grpc-go WriteStatus
                 // 语义——此前裸 404 与合法 gRPC 探测可区分。
-                let r = http::Response::builder().status(200)
+                let r = http::Response::builder()
+                    .status(200)
                     .header("content-type", "application/grpc")
                     .header("grpc-status", "12")
                     .header("grpc-message", "unknown service")
-                    .body(()).unwrap();
-                let _ = respond.send_response(r,true);
+                    .body(())
+                    .unwrap();
+                let _ = respond.send_response(r, true);
                 continue;
             }
         }
         let mut recv_body = req.into_body();
         let mut send_resp = match respond.send_response(
-            http::Response::builder().status(200)
-                // Go grpc-go 校验响应 content-type（缺失报 "malformed header: missing HTTP content-type"）
-                .header("content-type", "application/grpc").body(()).unwrap(),
+            http::Response::builder()
+                .status(200)
+                // Go grpc-go 校验响应 content-type（缺失报 "malformed header: missing HTTP
+                // content-type"）
+                .header("content-type", "application/grpc")
+                .body(())
+                .unwrap(),
             false,
         ) {
             Ok(s) => s,
@@ -438,7 +513,7 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
         let (client, server) = tokio::io::duplex(64 * 1024);
         let h2 = handler.clone();
         tokio::spawn(async move {
-            let (mut rd,mut wr)=tokio::io::split(server);
+            let (mut rd, mut wr) = tokio::io::split(server);
             // Go grpc-gun server 语义对称（参考 dial_h2）：下行 DATA 必须是
             // gRPC length-prefix 帧（裸字节被 Go client grpc 库当帧头误读）；
             // multiMode 走 TunMulti RPC：每帧 MultiHunk（Go hub.go:40
@@ -450,16 +525,62 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
             // （SendStream::send_data 文档："先 poll_capacity 再写 DATA frame"），
             // 返回 Result<(), Error> 而非 Future；慢接收端下库内部自动挂起 task
             // 等 WINDOW_UPDATE。无需 Rust 端加 .await。
-            let s=async{let mut buf=vec![0u8;32*1024];loop{let n=rd.read(&mut buf).await?;if n==0{let _=send_resp.send_data(Bytes::new(),true);break;}let frame=if multi_mode{crate::encoding::encode_multi_hunk_frame(&[&buf[..n]])}else{crate::encoding::encode_hunk_frame(&buf[..n])};send_resp.send_data(Bytes::from(frame),false).map_err(io_err)?;}Ok::<_,io::Error>(())};
-            let r=async{let mut acc:Vec<u8>=Vec::new();while let Some(d)=recv_body.data().await{let d=d.map_err(io_err)?;let _=recv_body.flow_control().release_capacity(d.len());acc.extend_from_slice(&d);loop{let frame=if multi_mode{crate::encoding::decode_multi_hunk_frame(&acc,None).map_err(io_err)?}else{crate::encoding::decode_hunk_frame(&acc,None).map_err(io_err)?.map(|(u,data)|(u,vec![data]))};match frame{Some((used,datas))=>{acc.drain(..used);for data in datas{wr.write_all(&data).await?;}}None=>break,}}}Ok::<_,io::Error>(())};
-            let _=tokio::try_join!(s,r);
+            let s = async {
+                let mut buf = vec![0u8; 32 * 1024];
+                loop {
+                    let n = rd.read(&mut buf).await?;
+                    if n == 0 {
+                        let _ = send_resp.send_data(Bytes::new(), true);
+                        break;
+                    }
+                    let frame = if multi_mode {
+                        crate::encoding::encode_multi_hunk_frame(&[&buf[..n]])
+                    } else {
+                        crate::encoding::encode_hunk_frame(&buf[..n])
+                    };
+                    send_resp.send_data(Bytes::from(frame), false).map_err(io_err)?;
+                }
+                Ok::<_, io::Error>(())
+            };
+            let r = async {
+                let mut acc: Vec<u8> = Vec::new();
+                while let Some(d) = recv_body.data().await {
+                    let d = d.map_err(io_err)?;
+                    let _ = recv_body.flow_control().release_capacity(d.len());
+                    acc.extend_from_slice(&d);
+                    loop {
+                        let frame = if multi_mode {
+                            crate::encoding::decode_multi_hunk_frame(&acc, None).map_err(io_err)?
+                        } else {
+                            crate::encoding::decode_hunk_frame(&acc, None)
+                                .map_err(io_err)?
+                                .map(|(u, data)| (u, vec![data]))
+                        };
+                        match frame {
+                            Some((used, datas)) => {
+                                acc.drain(..used);
+                                for data in datas {
+                                    wr.write_all(&data).await?;
+                                }
+                            },
+                            None => break,
+                        }
+                    }
+                }
+                Ok::<_, io::Error>(())
+            };
+            let _ = tokio::try_join!(s, r);
         });
         let conn: Box<dyn Connection> = match tcpmask.as_ref() {
             Some(m) => match xray_transport::finalmask::wrap_conn_server_into_connection(
-                m, Box::new(DuplexConn::with_remote(client, remote_addr)),
+                m,
+                Box::new(DuplexConn::with_remote(client, remote_addr)),
             ) {
                 Ok(c) => c,
-                Err(e) => { tracing::debug!("grpc tcpmask wrap failed: {e}"); continue; }
+                Err(e) => {
+                    tracing::debug!("grpc tcpmask wrap failed: {e}");
+                    continue;
+                },
             },
             None => Box::new(DuplexConn::with_remote(client, remote_addr)),
         };
@@ -471,8 +592,14 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
 /// `encoding/remoteaddr.go:13-40`：XFF 存在非空且名单中任一 header 在请求中
 /// 出现时，采纳首段 IP（端口 0 对齐 Go `TCPAddr{IP, 0}`）；否则保持真实
 /// peer 地址。默认（名单空）永不采纳。
-fn extract_trusted_remote(headers: &http::HeaderMap, peer: SocketAddr, trusted: &[String]) -> SocketAddr {
-    let Some(val) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()).filter(|v| !v.is_empty()) else {
+fn extract_trusted_remote(
+    headers: &http::HeaderMap,
+    peer: SocketAddr,
+    trusted: &[String],
+) -> SocketAddr {
+    let Some(val) =
+        headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()).filter(|v| !v.is_empty())
+    else {
         return peer;
     };
     if trusted.iter().any(|t| headers.contains_key(t.as_str())) {
@@ -487,10 +614,12 @@ fn extract_trusted_remote(headers: &http::HeaderMap, peer: SocketAddr, trusted: 
     peer
 }
 
-fn parse_config(s:&StreamSettings)->io::Result<Config>{
+fn parse_config(s: &StreamSettings) -> io::Result<Config> {
     crate::config::parse_grpc_config(s.transport_json.as_ref())
 }
-fn io_err<E:std::fmt::Display>(e:E)->io::Error{io::Error::new(io::ErrorKind::Other,e.to_string())}
+fn io_err<E: std::fmt::Display>(e: E) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, e.to_string())
+}
 
 struct DuplexConn {
     inner: tokio::io::DuplexStream,
@@ -517,8 +646,12 @@ impl DuplexConn {
         Self { inner, cancel_rx: None, remote: Some(remote), _conn_kill: None }
     }
 }
-impl AsyncRead for DuplexConn{
-    fn poll_read(mut self:Pin<&mut Self>,cx:&mut Context<'_>,buf:&mut ReadBuf<'_>)->Poll<io::Result<()>>{
+impl AsyncRead for DuplexConn {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         // 4tap：错误优先于 inner 读。泵错误（cancel_rx Ready(Ok(e))）→ Err；
         // Ready(Err(_)) = sender drop 且无错误 = 泵正常结束（干净 EOF），走 inner。
         if let Some(rx) = self.cancel_rx.as_mut() {
@@ -526,20 +659,40 @@ impl AsyncRead for DuplexConn{
                 Poll::Ready(Ok(e)) => {
                     self.cancel_rx = None;
                     return Poll::Ready(Err(e));
-                }
+                },
                 Poll::Ready(Err(_)) => self.cancel_rx = None,
-                Poll::Pending => {}
+                Poll::Pending => {},
             }
         }
-        Pin::new(&mut self.inner).poll_read(cx,buf)
+        Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
-impl AsyncWrite for DuplexConn{
-    fn poll_write(mut self:Pin<&mut Self>,cx:&mut Context<'_>,buf:&[u8])->Poll<io::Result<usize>>{Pin::new(&mut self.inner).poll_write(cx,buf)}
-    fn poll_flush(mut self:Pin<&mut Self>,cx:&mut Context<'_>)->Poll<io::Result<()>>{Pin::new(&mut self.inner).poll_flush(cx)}
-    fn poll_shutdown(mut self:Pin<&mut Self>,cx:&mut Context<'_>)->Poll<io::Result<()>>{Pin::new(&mut self.inner).poll_shutdown(cx)}
+impl AsyncWrite for DuplexConn {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
-impl Connection for DuplexConn{fn remote_addr(&self)->io::Result<Option<SocketAddr>>{Ok(self.remote)}fn local_addr(&self)->io::Result<Option<SocketAddr>>{Ok(None)}}
+impl Connection for DuplexConn {
+    fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+        Ok(self.remote)
+    }
+
+    fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+        Ok(None)
+    }
+}
 
 struct GrpcListener {
     local: SocketAddr,
@@ -554,11 +707,14 @@ impl xray_transport::listener_registry::TransportListener for GrpcListener {
     fn close(&self) -> io::Result<()> {
         // 1. 通知 spawned accept 循环退出（i++; e=true; break;）。
         self.shutdown.store(true, Ordering::Relaxed);
-        // 2. drop listener Arc：spawned task 持有一份，主句柄 drop 后计数归零 → listener drop → 端口释放。
-        //    （Go hub.go:62-64 Close→Stop 等价语义）
+        // 2. drop listener Arc：spawned task 持有一份，主句柄 drop 后计数归零 → listener drop →
+        //    端口释放。 （Go hub.go:62-64 Close→Stop 等价语义）
         Ok(())
     }
-    fn local_addr(&self) -> io::Result<SocketAddr> { Ok(self.local) }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.local)
+    }
 }
 
 /// gRPC 路径规整：`/{service}/{stream}`（Go `TunCustomName` 等价）。
@@ -604,8 +760,9 @@ fn resolve_user_agent(ua: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
+
+    use super::*;
     fn cfg_single(name: &str) -> Config {
         let mut c = Config::default();
         c.service_name = name.to_string();
@@ -669,7 +826,8 @@ mod tests {
         cfg.initial_windows_size = 65535;
         let dialer = tokio::spawn(async move {
             let tcp = TcpStream::connect(addr).await.unwrap();
-            dial_h2(tcp, "/GunService/Tun", "auth.example.com", "http", Some("custom/1.0"), &cfg).await
+            dial_h2(tcp, "/GunService/Tun", "auth.example.com", "http", Some("custom/1.0"), &cfg)
+                .await
         });
         let (server_tcp, _) = listener.accept().await.unwrap();
         let mut h2s = server::handshake(server_tcp).await.unwrap();
@@ -678,9 +836,15 @@ mod tests {
         assert_eq!(req.uri().host(), Some("auth.example.com"));
         assert_eq!(req.uri().scheme_str(), Some("http"));
         assert_eq!(req.uri().path(), "/GunService/Tun");
-        assert_eq!(req.headers().get("user-agent").map(|v| v.to_str().unwrap()), Some("custom/1.0"));
-        let resp = http::Response::builder().status(200)
-            .header("content-type", "application/grpc").body(()).unwrap();
+        assert_eq!(
+            req.headers().get("user-agent").map(|v| v.to_str().unwrap()),
+            Some("custom/1.0")
+        );
+        let resp = http::Response::builder()
+            .status(200)
+            .header("content-type", "application/grpc")
+            .body(())
+            .unwrap();
         let mut sr = respond.send_response(resp, false).unwrap();
         sr.send_data(Bytes::new(), true).ok();
         assert!(dialer.await.unwrap().is_ok());
@@ -703,20 +867,18 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let cfg = Config::default();
         // 启动 dial 但 server 立即关闭——dial 不会 panic（down 闭包在 background 处理）。
-        let r = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            async {
-                let tcp = TcpStream::connect(addr).await.unwrap();
-                let d = tokio::spawn(async move { dial_h2(tcp, "/svc/Tun", "", "http", None, &cfg).await });
-                let (server_tcp, _) = listener.accept().await.unwrap();
-                drop(server_tcp); // 立即关 server
-                d.await.unwrap()
-            }
-        ).await;
+        let r = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let d =
+                tokio::spawn(async move { dial_h2(tcp, "/svc/Tun", "", "http", None, &cfg).await });
+            let (server_tcp, _) = listener.accept().await.unwrap();
+            drop(server_tcp); // 立即关 server
+            d.await.unwrap()
+        })
+        .await;
         // dial 路径不 panic 即可（Ok 或 Err 都行——server 立即断导致 handshake fail）
         let _ = r;
     }
-
 
     /// 4tap 回归：down 闭包错误（非 200 响应头校验失败）必须以 Err 从
     /// DuplexConn::read 浮出，而非干净 EOF（数据截断伪装正常关闭）。
@@ -736,8 +898,11 @@ mod tests {
         // 否则 client 侧 resp_fut 永远 Pending → down 闭包错误不产生。
         tokio::spawn(async move {
             // CF challenge 页形态：404 + text/html → down 闭包 content-type 校验失败
-            let resp = http::Response::builder().status(404)
-                .header("content-type", "text/html").body(()).unwrap();
+            let resp = http::Response::builder()
+                .status(404)
+                .header("content-type", "text/html")
+                .body(())
+                .unwrap();
             if respond.send_response(resp, true).is_ok() {
                 // 持续 accept 驱动连接，把 HEADERS 刷到线上
                 while let Some(Ok(_)) = h2s.accept().await {}
@@ -750,10 +915,7 @@ mod tests {
             .await
             .expect("read must not hang");
         let err = r.expect_err("read must return Err, not Ok(0)");
-        assert!(
-            err.to_string().contains("non-200"),
-            "unexpected error: {err}"
-        );
+        assert!(err.to_string().contains("non-200"), "unexpected error: {err}");
     }
 
     #[tokio::test]
@@ -772,22 +934,32 @@ mod tests {
         let connect = async || {
             let tcp = TcpStream::connect(addr).await.unwrap();
             let (mut send_req, conn) = client::handshake(tcp).await.unwrap();
-            tokio::spawn(async move { let _ = conn.await; });
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
             send_req
         };
 
         // 正确 path → 200（进入 gun 泵）。
         let mut send_req = connect().await;
-        let req = Request::builder().method("POST").uri("/MySvc/Tun")
-            .header("content-type", "application/grpc").body(()).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/MySvc/Tun")
+            .header("content-type", "application/grpc")
+            .body(())
+            .unwrap();
         let (resp, _stream) = send_req.send_request(req, true).unwrap();
         assert_eq!(resp.await.unwrap().status(), 200);
 
         // 错误 path → 200 + grpc-status:12（Trailers-Only，对齐 Go hub.go:88-92
         // 未知 method 返回 Unimplemented 而非 HTTP 404）。
         let mut send_req = connect().await;
-        let req = Request::builder().method("POST").uri("/Other/Tun")
-            .header("content-type", "application/grpc").body(()).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/Other/Tun")
+            .header("content-type", "application/grpc")
+            .body(())
+            .unwrap();
         let (resp, _stream) = send_req.send_request(req, true).unwrap();
         let resp = resp.await.unwrap();
         assert_eq!(resp.status(), 200);
@@ -809,9 +981,15 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let tcp = TcpStream::connect(addr).await.unwrap();
         let (mut send_req, conn) = client::handshake(tcp).await.unwrap();
-        tokio::spawn(async move { let _ = conn.await; });
-        let req = Request::builder().method("POST").uri("/Anything/Goes")
-            .header("content-type", "application/grpc").body(()).unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/Anything/Goes")
+            .header("content-type", "application/grpc")
+            .body(())
+            .unwrap();
         let (resp, _stream) = send_req.send_request(req, true).unwrap();
         assert_eq!(resp.await.unwrap().status(), 200);
     }
@@ -841,20 +1019,24 @@ mod tests {
                 crate::encoding::decode_multi_hunk_frame(&d, None).unwrap().unwrap();
             assert_eq!(used, d.len());
             assert_eq!(datas, vec![b"ping".to_vec()]);
-            let resp = http::Response::builder().status(200)
-                .header("content-type", "application/grpc").body(()).unwrap();
+            let resp = http::Response::builder()
+                .status(200)
+                .header("content-type", "application/grpc")
+                .body(())
+                .unwrap();
             let mut sr = respond.send_response(resp, false).unwrap();
             // 回多元素 MultiHunk 帧
             let frame = crate::encoding::encode_multi_hunk_frame(&[b"first", b"second"]);
             sr.send_data(Bytes::from(frame), true).ok();
             // 驱动 h2 server 连接直到客户端关闭——task 提前结束会 drop h2s
             // 发 GOAWAY，把 client 侧还没消费的 DATA 帧掐死（EOF 竞速）。
-            while let Some(r) = h2s.accept().await { let _ = r; }
+            while let Some(r) = h2s.accept().await {
+                let _ = r;
+            }
         });
 
         let tcp = TcpStream::connect(addr).await.unwrap();
-        let mut conn =
-            dial_h2(tcp, "/GunService/TunMulti", "", "http", None, &cfg).await.unwrap();
+        let mut conn = dial_h2(tcp, "/GunService/TunMulti", "", "http", None, &cfg).await.unwrap();
         conn.write_all(b"ping").await.unwrap();
         // 读侧自然等待 server 收到上行并回帧（慢 runner 上固定 sleep 不是
         // 同步手段；预算放宽到 5s 防 flake）。
@@ -896,23 +1078,29 @@ mod tests {
 
         let tcp = TcpStream::connect(addr).await.unwrap();
         let (mut send_req, conn) = client::handshake(tcp).await.unwrap();
-        tokio::spawn(async move { let _ = conn.await; });
-        let req = Request::builder().method("POST").uri("/MySvc/TunMulti")
-            .header("content-type", "application/grpc").body(()).unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/MySvc/TunMulti")
+            .header("content-type", "application/grpc")
+            .body(())
+            .unwrap();
         let (resp_fut, mut stream) = send_req.send_request(req, false).unwrap();
-        tokio::spawn(async move { let _ = resp_fut.await; });
+        tokio::spawn(async move {
+            let _ = resp_fut.await;
+        });
         stream
             .send_data(
-                Bytes::from(crate::encoding::encode_multi_hunk_frame(&[b"alpha", b"beta", b"gamma"])),
+                Bytes::from(crate::encoding::encode_multi_hunk_frame(&[
+                    b"alpha", b"beta", b"gamma",
+                ])),
                 true,
             )
             .unwrap();
 
-        let _ = tokio::time::timeout(
-            Duration::from_secs(2),
-            rx.wait_for(|v| !v.is_empty()),
-        )
-        .await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), rx.wait_for(|v| !v.is_empty())).await;
         let got = rx.borrow().clone();
         assert_eq!(got, b"alphabetagamma", "multi-element MultiHunk must not truncate");
     }
@@ -921,10 +1109,10 @@ mod tests {
     fn grpc_authority_three_level_fallback() {
         // 0tnw（Go dial.go:147-153）：二级只认 tlsConfig（reality 下为 nil，
         // serverName 不进 authority）；全空 → grpc-go 回退 endpoint host:port。
-        use xray_common::net::address::Address;
-        use xray_common::net::port::Port;
+        use xray_common::net::{address::Address, port::Port};
         let domain = Destination::tcp(Address::new_domain("example.com"), Port::new(443));
-        let ip = Destination::tcp(Address::ipv4(std::net::Ipv4Addr::new(1, 2, 3, 4)), Port::new(8443));
+        let ip =
+            Destination::tcp(Address::ipv4(std::net::Ipv4Addr::new(1, 2, 3, 4)), Port::new(8443));
 
         // 一级：显式 authority 恒优先
         let tls = StreamSettings { security: "tls".into(), ..StreamSettings::tcp() };

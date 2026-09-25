@@ -26,10 +26,10 @@
 //!
 //! 实际 HTTP/2 + TLS 拨号/监听留 follow-up（依赖 tonic/h2 决策，由
 //! `k9t reality-s2` 等 TLS 切片解锁后统一接入）。
+pub mod client;
 pub mod config;
 pub mod encoding;
 pub mod error;
-pub mod client;
 pub mod server;
 pub mod transport;
 
@@ -38,7 +38,7 @@ pub mod register;
 
 // 顶层 re-export。
 pub use config::Config;
-pub use error::{GrpcError, Result};
 pub use encoding::CompressionEncoding;
+pub use error::{GrpcError, Result};
 #[cfg(feature = "register")]
 pub use register::{register_dialer, register_listener};

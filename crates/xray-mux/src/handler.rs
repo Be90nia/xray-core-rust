@@ -5,23 +5,30 @@
 //!
 //! # 模块结构
 //!
-//! - [`MuxOutboundHandler`] — mux 出站：包装底层 outbound，dial 时通过
-//!   [`IncrementalWorkerPicker`] 调度 worker + 分配 session
+//! - [`MuxOutboundHandler`] — mux 出站：包装底层 outbound，dial 时通过 [`IncrementalWorkerPicker`]
+//!   调度 worker + 分配 session
 //! - [`MuxInboundHandler`] — mux 入站：接收 mux 连接并解复用
 //! - [`MuxHandlerFactory`] — 统一工厂入口
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use async_trait::async_trait;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::session::Session;
-use xray_features::inbound::{InboundError, InboundHandler};
-use xray_features::outbound::{OutboundError, OutboundHandler};
+use xray_common::{
+    net::{destination::Destination, network::Network},
+    session::Session,
+};
+use xray_features::{
+    inbound::{InboundError, InboundHandler},
+    outbound::{OutboundError, OutboundHandler},
+};
 
-use crate::client::{DialingWorkerFactory, IncrementalWorkerPicker, MUX_COOL_PORT};
-use crate::session::ClientStrategy;
+use crate::{
+    client::{DialingWorkerFactory, IncrementalWorkerPicker, MUX_COOL_PORT},
+    session::ClientStrategy,
+};
 
 /// mux handler 的 proxy 类型 URL（注册标识）
 pub const MUX_PROXY_TYPE_URL: &str = "xray.mux";
@@ -38,6 +45,7 @@ impl xray_app_dispatcher::DispatchHandler for PendingUnderlying {
     fn tag(&self) -> &str {
         "mux-pending"
     }
+
     fn dispatch(
         &self,
         _dest: &Destination,
@@ -75,21 +83,10 @@ impl MuxOutboundHandler {
         underlying: Arc<dyn OutboundHandler>,
     ) -> Self {
         let effective = if concurrency == 0 { 8 } else { concurrency };
-        let strategy = ClientStrategy {
-            max_concurrency: effective,
-            max_connection: 0,
-        };
-        let factory = Arc::new(DialingWorkerFactory::new(
-            Arc::new(PendingUnderlying),
-            strategy,
-        ));
+        let strategy = ClientStrategy { max_concurrency: effective, max_connection: 0 };
+        let factory = Arc::new(DialingWorkerFactory::new(Arc::new(PendingUnderlying), strategy));
         let picker = Arc::new(IncrementalWorkerPicker::new(factory));
-        Self {
-            tag: tag.into(),
-            enabled: true,
-            picker,
-            underlying,
-        }
+        Self { tag: tag.into(), enabled: true, picker, underlying }
     }
 
     /// 引用内部 Worker 选择器（供外部观察 worker 状态）。
@@ -135,10 +132,13 @@ impl OutboundHandler for MuxOutboundHandler {
             ));
         }
 
-        // pick_internal 是 async 路径，会按需创建 worker（ClientManager.dispatch 的 sync 路径无法 bootstrap）
-        let worker = self.picker.pick_internal().await.ok_or_else(|| {
-            OutboundError::ConnectionFailed("mux no available worker".into())
-        })?;
+        // pick_internal 是 async 路径，会按需创建 worker（ClientManager.dispatch 的 sync 路径无法
+        // bootstrap）
+        let worker = self
+            .picker
+            .pick_internal()
+            .await
+            .ok_or_else(|| OutboundError::ConnectionFailed("mux no available worker".into()))?;
 
         let _mux_session = worker.allocate_session().await.ok_or_else(|| {
             OutboundError::ConnectionFailed("mux session allocation failed (worker full)".into())
@@ -176,11 +176,7 @@ impl MuxInboundHandler {
     /// 创建 mux 入站 handler。
     #[must_use]
     pub fn new(tag: impl Into<String>, port: u16) -> Self {
-        Self {
-            tag: tag.into(),
-            port,
-            started: AtomicBool::new(false),
-        }
+        Self { tag: tag.into(), port, started: AtomicBool::new(false) }
     }
 }
 
@@ -232,12 +228,11 @@ impl MuxHandlerFactory {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
+    use xray_common::net::{address::Address, port::Port};
+
     use super::*;
-    use xray_common::net::address::Address;
-    use xray_common::net::port::Port;
 
     /// 测试用底层 outbound stub：can_handle 返回固定值。
     struct StubOutbound {
@@ -250,35 +245,26 @@ mod tests {
         fn tag(&self) -> &str {
             &self.tag
         }
+
         async fn dial(&self, _: &Destination, _: &Session) -> Result<(), OutboundError> {
             Ok(())
         }
+
         fn can_handle(&self, _: &Destination) -> bool {
             self.handleable
         }
     }
 
     fn make_tcp_dest() -> Destination {
-        Destination::new(
-            Address::IPv4("127.0.0.1".parse().unwrap()),
-            Port::new(443),
-            Network::TCP,
-        )
+        Destination::new(Address::IPv4("127.0.0.1".parse().unwrap()), Port::new(443), Network::TCP)
     }
 
     fn make_udp_dest() -> Destination {
-        Destination::new(
-            Address::IPv4("127.0.0.1".parse().unwrap()),
-            Port::new(443),
-            Network::UDP,
-        )
+        Destination::new(Address::IPv4("127.0.0.1".parse().unwrap()), Port::new(443), Network::UDP)
     }
 
     fn make_handler(tag: &str) -> MuxOutboundHandler {
-        let underlying = Arc::new(StubOutbound {
-            tag: "stub".into(),
-            handleable: true,
-        });
+        let underlying = Arc::new(StubOutbound { tag: "stub".into(), handleable: true });
         MuxOutboundHandler::new(tag, 8, underlying)
     }
 
@@ -304,10 +290,7 @@ mod tests {
 
     #[test]
     fn outbound_cannot_handle_when_underlying_rejects() {
-        let underlying = Arc::new(StubOutbound {
-            tag: "stub".into(),
-            handleable: false,
-        });
+        let underlying = Arc::new(StubOutbound { tag: "stub".into(), handleable: false });
         let h = MuxOutboundHandler::new("t", 8, underlying);
         assert!(!h.can_handle(&make_tcp_dest()));
     }
@@ -331,15 +314,12 @@ mod tests {
 
     #[tokio::test]
     async fn outbound_dial_fails_when_underlying_cannot_handle() {
-        let underlying = Arc::new(StubOutbound {
-            tag: "stub".into(),
-            handleable: false,
-        });
+        let underlying = Arc::new(StubOutbound { tag: "stub".into(), handleable: false });
         let h = MuxOutboundHandler::new("t", 8, underlying);
         let result = h.dial(&make_tcp_dest(), &Session::new()).await;
         assert!(result.is_err());
         match result.unwrap_err() {
-            OutboundError::NoOutbound(_) => {}
+            OutboundError::NoOutbound(_) => {},
             other => panic!("expected NoOutbound, got {other:?}"),
         }
     }
@@ -385,10 +365,7 @@ mod tests {
 
     #[test]
     fn factory_create_outbound() {
-        let underlying = Arc::new(StubOutbound {
-            tag: "stub".into(),
-            handleable: true,
-        });
+        let underlying = Arc::new(StubOutbound { tag: "stub".into(), handleable: true });
         let h = MuxHandlerFactory::create_outbound("factory_out", 16, underlying);
         assert_eq!(h.tag(), "factory_out");
         assert!(h.is_enabled());

@@ -11,8 +11,7 @@
 //! 本模块是纯逻辑 + 线程安全状态（`Arc<RwLock<HashMap>>`），不含 IO。
 //! 实际连接桥接由 dispatcher 注入。
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::RwLock;
 
@@ -37,10 +36,7 @@ impl PortalConfig {
     /// 用 tag 创建，domain 默认 `v1.rvs.cool`。
     #[must_use]
     pub fn new(tag: impl Into<String>) -> Self {
-        Self {
-            tag: tag.into(),
-            domain: crate::RVS_DOMAIN.to_string(),
-        }
+        Self { tag: tag.into(), domain: crate::RVS_DOMAIN.to_string() }
     }
 
     /// 链式设置 domain。

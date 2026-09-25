@@ -28,10 +28,7 @@ impl Cidr {
         if prefix > 32 {
             return None;
         }
-        Some(Self {
-            ip: addr.to_vec(),
-            prefix,
-        })
+        Some(Self { ip: addr.to_vec(), prefix })
     }
 
     /// Creates a CIDR representing an IPv6 address.
@@ -41,10 +38,7 @@ impl Cidr {
         if prefix > 128 {
             return None;
         }
-        Some(Self {
-            ip: addr.to_vec(),
-            prefix,
-        })
+        Some(Self { ip: addr.to_vec(), prefix })
     }
 
     /// Returns `true` if the IP bytes are 4 bytes long (IPv4).
@@ -71,11 +65,7 @@ impl GeoIp {
     /// assert_eq!(geo.code, "CN");
     /// ```
     pub fn new(code: &str) -> Self {
-        Self {
-            code: code.to_string(),
-            cidr: Vec::new(),
-            reverse_match: false,
-        }
+        Self { code: code.to_string(), cidr: Vec::new(), reverse_match: false }
     }
 
     /// Adds a CIDR entry and returns `self` for chaining.
@@ -84,8 +74,7 @@ impl GeoIp {
     ///
     /// ```
     /// use xray_geodata::pb::{Cidr, GeoIp};
-    /// let geo = GeoIp::new("US")
-    ///     .with_cidr(Cidr::new(vec![10, 0, 0, 0], 8));
+    /// let geo = GeoIp::new("US").with_cidr(Cidr::new(vec![10, 0, 0, 0], 8));
     /// assert_eq!(geo.cidr.len(), 1);
     /// ```
     pub fn with_cidr(mut self, cidr: Cidr) -> Self {
@@ -105,9 +94,7 @@ impl GeoIp {
 impl GeoIpList {
     /// Creates an empty GeoIP list.
     pub fn new() -> Self {
-        Self {
-            entry: Vec::new(),
-        }
+        Self { entry: Vec::new() }
     }
 
     /// Adds a GeoIP entry and returns `self` for chaining.
@@ -119,9 +106,7 @@ impl GeoIpList {
     /// Looks up a GeoIP entry by country code (case-insensitive).
     pub fn find_by_code(&self, code: &str) -> Option<&GeoIp> {
         let code_upper = code.to_uppercase();
-        self.entry
-            .iter()
-            .find(|e| e.code.to_uppercase() == code_upper)
+        self.entry.iter().find(|e| e.code.to_uppercase() == code_upper)
     }
 }
 
@@ -207,17 +192,13 @@ mod tests {
 
     #[test]
     fn geoip_list_with_entry() {
-        let list = GeoIpList::new()
-            .with_entry(GeoIp::new("CN"))
-            .with_entry(GeoIp::new("US"));
+        let list = GeoIpList::new().with_entry(GeoIp::new("CN")).with_entry(GeoIp::new("US"));
         assert_eq!(list.entry.len(), 2);
     }
 
     #[test]
     fn geoip_list_find_by_code() {
-        let list = GeoIpList::new()
-            .with_entry(GeoIp::new("CN"))
-            .with_entry(GeoIp::new("US"));
+        let list = GeoIpList::new().with_entry(GeoIp::new("CN")).with_entry(GeoIp::new("US"));
         assert!(list.find_by_code("cn").is_some());
         assert!(list.find_by_code("US").is_some());
         assert!(list.find_by_code("JP").is_none());
@@ -232,8 +213,7 @@ mod tests {
             .with_reverse_match(false);
 
         let bytes = prost::Message::encode_to_vec(&original);
-        let decoded: GeoIp =
-            prost::Message::decode(bytes.as_slice()).unwrap();
+        let decoded: GeoIp = prost::Message::decode(bytes.as_slice()).unwrap();
         assert_eq!(decoded.code, "CN");
         assert_eq!(decoded.cidr.len(), 1);
         assert_eq!(decoded.cidr[0].ip, vec![192, 168, 0, 0]);
@@ -244,18 +224,11 @@ mod tests {
     #[test]
     fn geoip_list_roundtrip() {
         let original = GeoIpList::new()
-            .with_entry(
-                GeoIp::new("CN")
-                    .with_cidr(Cidr::new(vec![10, 0, 0, 0], 8)),
-            )
-            .with_entry(
-                GeoIp::new("US")
-                    .with_cidr(Cidr::new(vec![172, 16, 0, 0], 12)),
-            );
+            .with_entry(GeoIp::new("CN").with_cidr(Cidr::new(vec![10, 0, 0, 0], 8)))
+            .with_entry(GeoIp::new("US").with_cidr(Cidr::new(vec![172, 16, 0, 0], 12)));
 
         let bytes = prost::Message::encode_to_vec(&original);
-        let decoded: GeoIpList =
-            prost::Message::decode(bytes.as_slice()).unwrap();
+        let decoded: GeoIpList = prost::Message::decode(bytes.as_slice()).unwrap();
         assert_eq!(decoded.entry.len(), 2);
         assert_eq!(decoded.entry[0].code, "CN");
         assert_eq!(decoded.entry[1].code, "US");

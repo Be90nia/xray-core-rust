@@ -5,8 +5,7 @@ use std::sync::Arc;
 use xray_app_dispatcher::default::{DialFn, PinFuture};
 use xray_common::net::destination::Destination;
 
-use crate::dial::dial_naive;
-use crate::uri::NaiveConfig;
+use crate::{dial::dial_naive, uri::NaiveConfig};
 
 /// 构造 naive 拨号闭包：`dest`（最终目标）→ 经 naive 隧道建立的连接。
 pub fn make_naive_dial_fn(config: NaiveConfig) -> DialFn {

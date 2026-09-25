@@ -40,20 +40,14 @@ pub struct Control {
 
 impl Default for Control {
     fn default() -> Self {
-        Self {
-            state: ControlState::Active,
-            random: Vec::new(),
-        }
+        Self { state: ControlState::Active, random: Vec::new() }
     }
 }
 
 impl Control {
     /// 从 prost Control 构造。
     pub fn from_proto(p: &ProtoControl) -> Result<Self, ReverseError> {
-        Ok(Self {
-            state: ControlState::from_proto_i32(p.state)?,
-            random: p.random.clone(),
-        })
+        Ok(Self { state: ControlState::from_proto_i32(p.state)?, random: p.random.clone() })
     }
 
     /// 转 prost Control。
@@ -85,10 +79,7 @@ pub struct BridgeConfig {
 
 impl BridgeConfig {
     pub fn from_proto(p: &ProtoBridgeConfig) -> Self {
-        Self {
-            tag: p.tag.clone(),
-            domain: p.domain.clone(),
-        }
+        Self { tag: p.tag.clone(), domain: p.domain.clone() }
     }
 
     pub fn to_proto(&self) -> ProtoBridgeConfig {
@@ -108,10 +99,7 @@ pub struct PortalConfig {
 
 impl PortalConfig {
     pub fn from_proto(p: &ProtoPortalConfig) -> Self {
-        Self {
-            tag: p.tag.clone(),
-            domain: p.domain.clone(),
-        }
+        Self { tag: p.tag.clone(), domain: p.domain.clone() }
     }
 
     pub fn to_proto(&self) -> ProtoPortalConfig {
@@ -205,20 +193,14 @@ mod tests {
 
     #[test]
     fn bridge_config_proto_roundtrip() {
-        let bc = BridgeConfig {
-            tag: "b1".into(),
-            domain: "example.com".into(),
-        };
+        let bc = BridgeConfig { tag: "b1".into(), domain: "example.com".into() };
         let p = bc.to_proto();
         assert_eq!(BridgeConfig::from_proto(&p), bc);
     }
 
     #[test]
     fn portal_config_proto_roundtrip() {
-        let pc = PortalConfig {
-            tag: "p1".into(),
-            domain: "portal.example.com".into(),
-        };
+        let pc = PortalConfig { tag: "p1".into(), domain: "portal.example.com".into() };
         let p = pc.to_proto();
         assert_eq!(PortalConfig::from_proto(&p), pc);
     }
@@ -226,19 +208,10 @@ mod tests {
     #[test]
     fn reverse_config_proto_roundtrip() {
         let rc = ReverseConfig {
-            bridges: vec![BridgeConfig {
-                tag: "b".into(),
-                domain: "d".into(),
-            }],
+            bridges: vec![BridgeConfig { tag: "b".into(), domain: "d".into() }],
             portals: vec![
-                PortalConfig {
-                    tag: "p1".into(),
-                    domain: "d1".into(),
-                },
-                PortalConfig {
-                    tag: "p2".into(),
-                    domain: "d2".into(),
-                },
+                PortalConfig { tag: "p1".into(), domain: "d1".into() },
+                PortalConfig { tag: "p2".into(), domain: "d2".into() },
             ],
         };
         let p = rc.to_proto();

@@ -3,25 +3,29 @@
 //! 验证 VLESS 协议完整链路（无加密层，FLOW_NONE 模式）：
 //! 客户端 encode_request_header → 服务端 decode_request_header → dial → bridge → echo。
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-use xray_common::uuid::UUID;
-use xray_proxy_vless::encoding::client::encode_request_header;
-use xray_proxy_vless::encoding::server::{decode_request_header, encode_response_header};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
+use xray_common::{
+    net::{address::Address, destination::Destination, network::Network, port::Port},
+    uuid::UUID,
+};
 use xray_proto::xray::proxy::vless::encoding::Addons;
-use xray_proxy_vless::encoding::VlessCommand;
-use xray_proxy_vless::Validator;
-use xray_proxy_vless::account::MemoryAccount;
-use xray_proxy_vless::validator::MemoryValidator;
-use xray_transport::bridge::bridge_connections;
-use xray_transport::connection::TcpConnection;
-use xray_transport::sockopt::SocketOptions;
-use xray_transport::system_dialer::dial_system;
+use xray_proxy_vless::{
+    Validator,
+    account::MemoryAccount,
+    encoding::{
+        VlessCommand,
+        client::encode_request_header,
+        server::{decode_request_header, encode_response_header},
+    },
+    validator::MemoryValidator,
+};
+use xray_transport::{
+    bridge::bridge_connections, connection::TcpConnection, sockopt::SocketOptions,
+    system_dialer::dial_system,
+};
 
 /// VLESS 协议版本（对应 Go `encoding` 包常量）。
 const VLESS_VERSION: u8 = 0;
@@ -65,14 +69,10 @@ async fn vless_proxy_to_echo_target_e2e() {
         let (mut client_stream, _) = proxy_listener.accept().await.unwrap();
 
         // 解码 VLESS 请求头
-        let decoded = decode_request_header(
-            false,
-            &mut None,
-            &mut client_stream,
-            &*validator_clone,
-        )
-        .await
-        .expect("decode request header");
+        let decoded =
+            decode_request_header(false, &mut None, &mut client_stream, &*validator_clone)
+                .await
+                .expect("decode request header");
 
         // 发送 VLESS 响应头
         let addons = Addons::default();
@@ -84,9 +84,7 @@ async fn vless_proxy_to_echo_target_e2e() {
         let addr = decoded.address.expect("address");
         let port = decoded.port.expect("port");
         let dest = Destination::new(addr, Port::new(port), Network::TCP);
-        let target_conn = dial_system(&dest, &SocketOptions::default())
-            .await
-            .expect("dial target");
+        let target_conn = dial_system(&dest, &SocketOptions::default()).await.expect("dial target");
 
         // 桥接 client ↔ target
         let client_conn: Box<dyn xray_transport::connection::Connection> =
@@ -165,7 +163,8 @@ async fn vless_invalid_uuid_rejected_e2e() {
     let validator_clone = std::sync::Arc::clone(&validator);
     tokio::spawn(async move {
         let (mut client_stream, _) = proxy_listener.accept().await.unwrap();
-        let result = decode_request_header(false, &mut None, &mut client_stream, &*validator_clone).await;
+        let result =
+            decode_request_header(false, &mut None, &mut client_stream, &*validator_clone).await;
         assert!(result.is_err(), "decode should fail with unknown UUID");
     });
 

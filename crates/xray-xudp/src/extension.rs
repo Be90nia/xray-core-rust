@@ -2,9 +2,11 @@
 //!
 //! Provides XUDP session management and Mux extension types.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 /// XUDP session status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,9 +84,7 @@ pub struct XudpManager {
 impl XudpManager {
     /// Create a new XUDP manager.
     pub fn new() -> Self {
-        Self {
-            sessions: Mutex::new(HashMap::new()),
-        }
+        Self { sessions: Mutex::new(HashMap::new()) }
     }
 
     /// Get or create an XUDP session for the given Global ID.

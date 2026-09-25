@@ -1,13 +1,10 @@
-﻿//! 监听器抽象：服务端 IO 边界。
+//! 监听器抽象：服务端 IO 边界。
 //!
 //! 对应 Go `transport/internet/system_listener.go` 的 `DefaultListener`。
 //! 仅翻译 IO 边界 trait，平台特定细节（TCP keepalive、Unix socket + FileLocker、
 //! proxyproto、socket2 syscall.RawConn）留待具体传输实现 crate 处理。
 
-use std::future::Future;
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
+use std::{future::Future, io, net::SocketAddr, pin::Pin};
 
 use tokio::net::TcpListener as TokioTcpListener;
 
@@ -71,15 +68,17 @@ impl Listener for TcpListenerConn {
 
 #[cfg(test)]
 mod tests {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+    };
+
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
 
     #[tokio::test]
     async fn tcp_listener_bind_and_accept() {
-        let listener = TcpListenerConn::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .expect("bind 失败");
+        let listener =
+            TcpListenerConn::bind("127.0.0.1:0".parse().unwrap()).await.expect("bind 失败");
         let bound = listener.local_addr().expect("local_addr 失败");
 
         let server = tokio::spawn(async move {
@@ -90,10 +89,7 @@ mod tests {
 
         let mut client = TcpStream::connect(bound).await.expect("connect 失败");
         let mut buf = [0u8; 4];
-        client
-            .read_exact(&mut buf)
-            .await
-            .expect("客户端读取失败");
+        client.read_exact(&mut buf).await.expect("客户端读取失败");
         assert_eq!(&buf, b"pong");
 
         server.await.expect("server task panic");
@@ -101,9 +97,8 @@ mod tests {
 
     #[tokio::test]
     async fn local_addr_returns_bound_port() {
-        let listener = TcpListenerConn::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .expect("bind 失败");
+        let listener =
+            TcpListenerConn::bind("127.0.0.1:0".parse().unwrap()).await.expect("bind 失败");
         let addr = listener.local_addr().expect("local_addr 失败");
         assert_eq!(addr.ip().to_string(), "127.0.0.1");
         // 端口由 OS 分配，必须非 0（bind(:0) 后会被填入实际端口）
@@ -114,9 +109,8 @@ mod tests {
     async fn accept_returns_dyn_connection_usable_as_async_io() {
         // 验证 accept 产出的 Box<dyn Connection> 可被当作 AsyncRead+AsyncWrite 使用，
         // 证明 tokio blanket impl 经 Connection supertrait 自动可用。
-        let listener = TcpListenerConn::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .expect("bind 失败");
+        let listener =
+            TcpListenerConn::bind("127.0.0.1:0".parse().unwrap()).await.expect("bind 失败");
         let bound = listener.local_addr().expect("local_addr 失败");
 
         let server = tokio::spawn(async move {

@@ -8,9 +8,9 @@
 //! - IPv6:  type(3) + 16 bytes
 //! - Port:  2 bytes big-endian
 
-use crate::net::address::Address;
-use crate::net::port::Port;
 use xray_buf::buffer::Buffer;
+
+use crate::net::{address::Address, port::Port};
 
 /// 地址类型标识符。
 const ADDR_TYPE_IPV4: u8 = 1;
@@ -45,18 +45,18 @@ impl AddressSerializer {
             Address::IPv4(v4) => {
                 buf.write_byte(ADDR_TYPE_IPV4);
                 buf.write_from(&v4.octets());
-            }
+            },
             Address::Domain(domain) => {
                 buf.write_byte(ADDR_TYPE_DOMAIN);
                 let domain_bytes = domain.as_bytes();
                 let len = domain_bytes.len() as u8;
                 buf.write_byte(len);
                 buf.write_from(domain_bytes);
-            }
+            },
             Address::IPv6(v6) => {
                 buf.write_byte(ADDR_TYPE_IPV6);
                 buf.write_from(&v6.octets());
-            }
+            },
         }
     }
 }
@@ -81,7 +81,7 @@ impl AddressParser {
                 let mut octets = [0u8; 4];
                 octets.copy_from_slice(&data[1..5]);
                 Some((Address::from_ipv4_bytes(octets), 5))
-            }
+            },
             ADDR_TYPE_DOMAIN => {
                 if data.len() < 2 {
                     return None;
@@ -92,7 +92,7 @@ impl AddressParser {
                 }
                 let domain_str = std::str::from_utf8(&data[2..2 + domain_len]).ok()?;
                 Some((Address::new_domain(domain_str), 2 + domain_len))
-            }
+            },
             ADDR_TYPE_IPV6 => {
                 if data.len() < 1 + 16 {
                     return None;
@@ -100,7 +100,7 @@ impl AddressParser {
                 let mut octets = [0u8; 16];
                 octets.copy_from_slice(&data[1..17]);
                 Some((Address::from_ipv6_bytes(octets), 17))
-            }
+            },
             _ => None,
         }
     }
@@ -137,8 +137,9 @@ impl AddressParser {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use super::*;
 
     #[test]
     fn test_write_read_ipv4() {

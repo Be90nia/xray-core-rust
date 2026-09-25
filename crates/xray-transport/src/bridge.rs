@@ -17,10 +17,9 @@ use std::io;
 use tokio::io::{AsyncRead, AsyncWrite};
 use xray_features::policy::TimeoutPolicy;
 
-use crate::connection::Connection;
 #[cfg(test)]
 use crate::connection::DuplexConnection;
-use crate::link::Link;
+use crate::{connection::Connection, link::Link};
 
 /// 双向桥接两个 [`Connection`]。
 ///
@@ -43,10 +42,7 @@ use crate::link::Link;
 ///
 /// ponytail: 池化读循环（8KB `xray_buf::alloc`）替代 `tokio::io::copy` 的
 /// 内部 8KB Vec，连接结束后回池——避免长连接/大流量时反复 alloc 大块堆。
-pub async fn bridge_connections(
-    a: Box<dyn Connection>,
-    b: Box<dyn Connection>,
-) -> io::Result<()> {
+pub async fn bridge_connections(a: Box<dyn Connection>, b: Box<dyn Connection>) -> io::Result<()> {
     // Go `CanSpliceCopy` 零值 0（session.go:75-77）＝信号未挂出，永入回退泵——
     // 既有调用方行为跨平台零变化；只有 freedom 出站 TCP 场景显式传
     // `(1, &[1])`（freedom.go:260 唯一置 1 点）。
@@ -97,7 +93,7 @@ pub async fn bridge_connections_with_splice(
                 Err(e) => {
                     xray_buf::alloc::release(buf);
                     return Err(e);
-                }
+                },
             };
             if n == 0 {
                 break;
@@ -151,8 +147,10 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use xray_buf::io::{Reader, Writer};
-    use xray_buf::multi::MultiBuffer;
+    use xray_buf::{
+        io::{Reader, Writer},
+        multi::MultiBuffer,
+    };
 
     let Link { mut reader, mut writer } = link;
     let (mut s_read, mut s_write) = tokio::io::split(stream);
@@ -186,7 +184,7 @@ where
                 Err(e) => {
                     xray_buf::alloc::release(buf);
                     return Err(e);
-                }
+                },
             };
             if n == 0 {
                 break;
@@ -235,7 +233,7 @@ where
                     Some(b) => {
                         slices[n] = io::IoSlice::new(b.bytes());
                         n += 1;
-                    }
+                    },
                     None => break,
                 }
             }
@@ -267,11 +265,11 @@ where
     Ok(())
 }
 
-
 /// 双向桥接 dispatcher [`Link`] 与 AsyncRead+AsyncWrite stream。
 ///
-/// 与 [`bridge_link_with_stream`] 区别：两个方向独立运行到都完成，任一方向 EOF/出错不会取消另一方向。
-/// 适配 VMess 这种请求方向提前 EOF（body chunk 终止符）但响应方向仍需续传的场景。
+/// 与 [`bridge_link_with_stream`] 区别：两个方向独立运行到都完成，任一方向
+/// EOF/出错不会取消另一方向。 适配 VMess 这种请求方向提前 EOF（body chunk
+/// 终止符）但响应方向仍需续传的场景。
 ///
 /// **8sum 解耦（方案 A）**：每方向 reader（只读）与 writer（只写）拆为独立
 /// async block，经 bounded mpsc（64 条 MultiBuffer ≈ 512KiB，对齐 Go
@@ -293,9 +291,8 @@ pub async fn bridge_link_with_stream_full<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Connection + 'static,
 {
-    use tokio::io::AsyncWriteExt;
-    use tokio::time::timeout;
-    use xray_buf::io::{new_reader, Reader, Writer};
+    use tokio::{io::AsyncWriteExt, time::timeout};
+    use xray_buf::io::{Reader, Writer, new_reader};
 
     let conn_idle = policy.connection_idle;
     let uplink_only = policy.uplink_only;
@@ -358,7 +355,7 @@ where
                     if up_tx.send(mb).await.is_err() {
                         break;
                     }
-                }
+                },
                 _ => break,
             }
         }
@@ -406,7 +403,7 @@ where
                     if down_tx.send(mb).await.is_err() {
                         break;
                     }
-                }
+                },
                 _ => break, // EOF / 读错误
             }
         }
@@ -427,8 +424,7 @@ where
     };
 
     // join! 语义：四块被并发轮询（读等待不阻塞写推进），全部完成后返回。
-    let (up_r, up_w, down_r, down_w) =
-        tokio::join!(up_reader, up_writer, down_reader, down_writer);
+    let (up_r, up_w, down_r, down_w) = tokio::join!(up_reader, up_writer, down_reader, down_writer);
     up_r.and(up_w).and(down_r).and(down_w)
 }
 
@@ -467,6 +463,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Connection,
 {
     use std::sync::Arc;
+
     use tokio::io::AsyncWriteExt;
     use xray_buf::io::{Reader, Writer};
 
@@ -512,7 +509,7 @@ where
                     if write_all_mb(&mut s_write, &mb).await.is_err() {
                         break;
                     }
-                }
+                },
                 _ => break,
             }
         }
@@ -529,10 +526,7 @@ where
         // 经 splice_copy_counted 每 chunk 实时回填两级 downlink 计数器
         // （readCounter=出站 / writeCounter=入站），否则 Linux splice 路径
         // per-tag 流量统计恒 0（CI 首跑实证）。
-        let counters = match (
-            down_counters.0.as_deref(),
-            down_counters.1.as_deref(),
-        ) {
+        let counters = match (down_counters.0.as_deref(), down_counters.1.as_deref()) {
             (Some(o), Some(i)) => Some((o, i)),
             _ => None,
         };
@@ -608,7 +602,7 @@ pub async fn bridge_link_with_link(
                     if b_writer.write_multi_buffer(mb).await.is_err() {
                         break;
                     }
-                }
+                },
                 _ => break,
             }
         }
@@ -647,7 +641,7 @@ pub async fn bridge_link_with_link(
                     if a_writer.write_multi_buffer(mb).await.is_err() {
                         break;
                     }
-                }
+                },
                 _ => break,
             }
         }
@@ -668,21 +662,23 @@ pub async fn bridge_link_with_link_default(link_a: Link, link_b: Link) -> io::Re
 
 #[cfg(test)]
 mod tests {
+    use std::{net::SocketAddr, pin::Pin, task::Poll};
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+
     use super::*;
     use crate::connection::TcpConnection;
-    use std::net::SocketAddr;
-    use std::pin::Pin;
-    use std::task::Poll;
-    use tokio::net::{TcpListener, TcpStream};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// 创建两对 loopback TCP 连接：(client_a ↔ server_a) 和 (client_b ↔ server_b)。
     /// bridge(server_a, server_b) 后：
     /// - client_a 发的数据 → server_a 读 → bridge → server_b 写 → client_b 读
     /// - client_b 发的数据 → server_b 读 → bridge → server_a 写 → client_a 读
     async fn setup_two_pairs() -> (
-        TcpStream, // client_a
-        TcpStream, // client_b
+        TcpStream,           // client_a
+        TcpStream,           // client_b
         Box<dyn Connection>, // server_a (传入 bridge)
         Box<dyn Connection>, // server_b (传入 bridge)
     ) {
@@ -709,9 +705,7 @@ mod tests {
         let (mut client_a, mut client_b, server_a, server_b) = setup_two_pairs().await;
 
         // 启动 bridge
-        let bridge = tokio::spawn(async move {
-            bridge_connections(server_a, server_b).await
-        });
+        let bridge = tokio::spawn(async move { bridge_connections(server_a, server_b).await });
 
         // client_a → bridge → client_b
         client_a.write_all(b"hello from A").await.unwrap();
@@ -737,9 +731,7 @@ mod tests {
     async fn bridge_returns_on_either_side_eof() {
         let (mut client_a, _client_b, server_a, server_b) = setup_two_pairs().await;
 
-        let bridge = tokio::spawn(async move {
-            bridge_connections(server_a, server_b).await
-        });
+        let bridge = tokio::spawn(async move { bridge_connections(server_a, server_b).await });
 
         // client_a 发数据后关闭
         client_a.write_all(b"final").await.unwrap();
@@ -817,12 +809,14 @@ mod tests {
             ) -> std::task::Poll<io::Result<usize>> {
                 std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
             }
+
             fn poll_flush(
                 mut self: std::pin::Pin<&mut Self>,
                 cx: &mut std::task::Context<'_>,
             ) -> std::task::Poll<io::Result<()>> {
                 std::pin::Pin::new(&mut self.0).poll_flush(cx)
             }
+
             fn poll_shutdown(
                 mut self: std::pin::Pin<&mut Self>,
                 cx: &mut std::task::Context<'_>,
@@ -834,6 +828,7 @@ mod tests {
             fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
                 Ok(Some(self.0.peer_addr()?))
             }
+
             fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
                 Ok(Some(self.0.local_addr()?))
             }
@@ -848,10 +843,10 @@ mod tests {
 
         let lsn_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut client_b = TcpStream::connect(lsn_b.local_addr().unwrap()).await.unwrap();
-        let bare_b: Box<dyn Connection> = Box::new(TcpConnection::new(lsn_b.accept().await.unwrap().0));
+        let bare_b: Box<dyn Connection> =
+            Box::new(TcpConnection::new(lsn_b.accept().await.unwrap().0));
 
-        let bridge =
-            tokio::spawn(bridge_connections_with_splice(wrapped_a, bare_b, 1, &[1]));
+        let bridge = tokio::spawn(bridge_connections_with_splice(wrapped_a, bare_b, 1, &[1]));
 
         client_a.write_all(b"fallback").await.unwrap();
         let mut buf = [0u8; 8];
@@ -868,10 +863,10 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let (client, server) = tokio::join!(
-            async { TcpStream::connect(addr).await.unwrap() },
-            async { listener.accept().await.unwrap().0 },
-        );
+        let (client, server) =
+            tokio::join!(async { TcpStream::connect(addr).await.unwrap() }, async {
+                listener.accept().await.unwrap().0
+            },);
 
         let mut client = client;
         let server: Box<dyn Connection> = Box::new(TcpConnection::new(server));
@@ -889,10 +884,13 @@ mod tests {
     #[tokio::test]
     async fn bridge_link_uplink_only() {
         // 最小上行测试：pipe.Writer 写 → bridge up reader 读 → duplex server 端收
-        use crate::link::Link;
         use tokio::io::AsyncReadExt;
-        use xray_buf::io::{Reader, Writer};
-        use xray_buf::multi::MultiBuffer;
+        use xray_buf::{
+            io::{Reader, Writer},
+            multi::MultiBuffer,
+        };
+
+        use crate::link::Link;
 
         let (mut server, client) = tokio::io::duplex(8192);
         let (up_r, up_w) = xray_buf::pipe::new();
@@ -918,9 +916,10 @@ mod tests {
     #[tokio::test]
     async fn bridge_link_downlink_only() {
         // 最小下行测试：duplex server 端写 → bridge down reader 读 → pipe.Reader 收
-        use crate::link::Link;
         use tokio::io::AsyncWriteExt;
         use xray_buf::io::{Reader, Writer};
+
+        use crate::link::Link;
 
         let (mut server, client) = tokio::io::duplex(8192);
         // dn pipe：bridge 写下行数据到这里，主线程从 dn_r 读
@@ -945,9 +944,12 @@ mod tests {
 
     #[tokio::test]
     async fn bridge_stream_full_halfclose_linger_then_close() {
+        use xray_buf::{
+            io::{Reader, Writer},
+            multi::MultiBuffer,
+        };
+
         use crate::link::Link;
-        use xray_buf::io::{Reader, Writer};
-        use xray_buf::multi::MultiBuffer;
 
         let (up_r, up_w) = xray_buf::pipe::new();
         let (dn_r, dn_w) = xray_buf::pipe::new();
@@ -987,8 +989,9 @@ mod tests {
 
     #[tokio::test]
     async fn bridge_stream_full_halfclose_timeout_disconnects() {
-        use crate::link::Link;
         use xray_buf::io::Writer;
+
+        use crate::link::Link;
 
         let (up_r, up_w) = xray_buf::pipe::new();
         let (dn_r, dn_w) = xray_buf::pipe::new();
@@ -1009,10 +1012,7 @@ mod tests {
             start.elapsed() >= std::time::Duration::from_millis(900),
             "half-close window should elapse before disconnect"
         );
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(5),
-            "should not hang forever"
-        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "should not hang forever");
         let _ = dn_r;
     }
 
@@ -1023,9 +1023,11 @@ mod tests {
     /// 而非被忽略/被默认常量覆盖。
     #[tokio::test]
     async fn bridge_stream_full_uses_injected_connection_idle() {
-        use crate::link::Link;
-        use xray_features::policy::TimeoutPolicy;
         use std::time::Duration;
+
+        use xray_features::policy::TimeoutPolicy;
+
+        use crate::link::Link;
 
         let (up_r, up_w) = xray_buf::pipe::new();
         let (dn_r, dn_w) = xray_buf::pipe::new();
@@ -1066,9 +1068,12 @@ mod tests {
     /// 反复 alloc 8KB Vec。但行为正确性必须验证（防止 alloc/release 配对错误）。
     #[tokio::test]
     async fn bridge_connections_bidirectional_pooled_8kb() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::{TcpListener, TcpStream},
+        };
+
         use crate::connection::TcpConnection;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::{TcpListener, TcpStream};
 
         // 两对 loopback：(client_a ↔ server_a), (client_b ↔ server_b)
         let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1098,10 +1103,7 @@ mod tests {
         });
         let mut recv_buf = vec![0u8; payload_for_read.len()];
         client_b.read_exact(&mut recv_buf).await.unwrap();
-        assert_eq!(
-            recv_buf, payload_for_read,
-            "pooled bridge must not lose/corrupt bytes"
-        );
+        assert_eq!(recv_buf, payload_for_read, "pooled bridge must not lose/corrupt bytes");
         writer.await.unwrap();
         // 读端 drop → bridge 一方向 EOF → 整体退出
         drop(client_b);
@@ -1120,9 +1122,12 @@ mod tests {
     /// 写 duplex 的锁步里永远读不到上游 EOF，dn_r 5s 内等不到关闭。
     #[tokio::test]
     async fn bridge_stream_full_uplink_survives_slow_remote() {
+        use xray_buf::{
+            io::{Reader, Writer},
+            multi::MultiBuffer,
+        };
+
         use crate::link::Link;
-        use xray_buf::io::{Reader, Writer};
-        use xray_buf::multi::MultiBuffer;
 
         let (up_r, mut up_w) = xray_buf::pipe::new();
         let (dn_r, dn_w) = xray_buf::pipe::new();
@@ -1164,10 +1169,11 @@ mod tests {
     /// 整体退出——绝不 shutdown 对向（写错 shutdown link.writer = 下行永久断）。
     #[tokio::test]
     async fn bridge_stream_full_up_write_err_keeps_downlink() {
-        use crate::link::Link;
-        use std::pin::Pin;
-        use std::task::Poll;
+        use std::{pin::Pin, task::Poll};
+
         use xray_buf::io::{Reader, Writer};
+
+        use crate::link::Link;
 
         /// 写半恒错的 mock：读半转发真 duplex（下行数据源）。
         struct UpWriteErrConn(tokio::io::DuplexStream);
@@ -1186,17 +1192,16 @@ mod tests {
                 _cx: &mut std::task::Context<'_>,
                 _buf: &[u8],
             ) -> Poll<io::Result<usize>> {
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "transient write err",
-                )))
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "transient write err")))
             }
+
             fn poll_flush(
                 self: Pin<&mut Self>,
                 _cx: &mut std::task::Context<'_>,
             ) -> Poll<io::Result<()>> {
                 Poll::Ready(Ok(()))
             }
+
             fn poll_shutdown(
                 self: Pin<&mut Self>,
                 _cx: &mut std::task::Context<'_>,
@@ -1208,6 +1213,7 @@ mod tests {
             fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
                 Ok(None)
             }
+
             fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
                 Ok(None)
             }
@@ -1252,10 +1258,14 @@ mod tests {
     /// 照常送达 stream，桥有限时间退出。
     #[tokio::test]
     async fn bridge_stream_full_down_write_err_keeps_uplink() {
-        use crate::link::Link;
         use std::pin::Pin;
-        use xray_buf::io::{Error as BufError, Result as BufResult, Writer};
-        use xray_buf::multi::MultiBuffer;
+
+        use xray_buf::{
+            io::{Error as BufError, Result as BufResult, Writer},
+            multi::MultiBuffer,
+        };
+
+        use crate::link::Link;
 
         /// 写恒错的 mock link.writer。
         struct ErrLinkWriter;
@@ -1264,9 +1274,7 @@ mod tests {
                 &mut self,
                 _mb: MultiBuffer,
             ) -> Pin<Box<dyn Future<Output = BufResult<()>> + Send + '_>> {
-                Box::pin(async {
-                    Err(BufError::WriteError("link writer broken".into()))
-                })
+                Box::pin(async { Err(BufError::WriteError("link writer broken".into())) })
             }
         }
 
@@ -1313,8 +1321,11 @@ mod tests {
     /// 1 次 `poll_write_vectored`（生产经 tokio WriteHalf 透传到 TCP writev）。
     #[tokio::test]
     async fn write_all_mb_vectored_batch_write() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
         use parking_lot::Mutex;
 
         struct VectoredMock {
@@ -1330,6 +1341,7 @@ mod tests {
                 self.sink.lock().extend_from_slice(buf);
                 Poll::Ready(Ok(buf.len()))
             }
+
             fn poll_write_vectored(
                 self: Pin<&mut Self>,
                 _cx: &mut std::task::Context<'_>,
@@ -1344,15 +1356,18 @@ mod tests {
                 }
                 Poll::Ready(Ok(total))
             }
+
             fn is_write_vectored(&self) -> bool {
                 true
             }
+
             fn poll_flush(
                 self: Pin<&mut Self>,
                 _cx: &mut std::task::Context<'_>,
             ) -> Poll<io::Result<()>> {
                 Poll::Ready(Ok(()))
             }
+
             fn poll_shutdown(
                 self: Pin<&mut Self>,
                 _cx: &mut std::task::Context<'_>,
@@ -1363,7 +1378,8 @@ mod tests {
 
         let sink = Arc::new(Mutex::new(Vec::new()));
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut s_write = VectoredMock { sink: Arc::clone(&sink), vectored_calls: Arc::clone(&calls) };
+        let mut s_write =
+            VectoredMock { sink: Arc::clone(&sink), vectored_calls: Arc::clone(&calls) };
         assert!(s_write.is_write_vectored());
 
         let mb = xray_buf::multi::MultiBuffer::from_buffers(vec![
@@ -1385,8 +1401,11 @@ mod tests {
     /// 字节序不变。
     #[tokio::test]
     async fn write_all_mb_non_vectored_fallback_per_buffer() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
         use parking_lot::Mutex;
 
         struct NonVectoredMock {
@@ -1403,12 +1422,14 @@ mod tests {
                 self.sink.lock().extend_from_slice(buf);
                 Poll::Ready(Ok(buf.len()))
             }
+
             fn poll_flush(
                 self: Pin<&mut Self>,
                 _cx: &mut std::task::Context<'_>,
             ) -> Poll<io::Result<()>> {
                 Poll::Ready(Ok(()))
             }
+
             fn poll_shutdown(
                 self: Pin<&mut Self>,
                 _cx: &mut std::task::Context<'_>,
@@ -1444,8 +1465,11 @@ mod tests {
     /// vectored 聚合在生产接线不退化为逐段写。
     #[tokio::test]
     async fn write_all_mb_via_split_writehalf_forwards_vectored() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
         use parking_lot::Mutex;
 
         struct VectoredMock {
@@ -1461,6 +1485,7 @@ mod tests {
                 self.sink.lock().extend_from_slice(buf);
                 Poll::Ready(Ok(buf.len()))
             }
+
             fn poll_write_vectored(
                 self: Pin<&mut Self>,
                 _cx: &mut std::task::Context<'_>,
@@ -1475,15 +1500,18 @@ mod tests {
                 }
                 Poll::Ready(Ok(total))
             }
+
             fn is_write_vectored(&self) -> bool {
                 true
             }
+
             fn poll_flush(
                 self: Pin<&mut Self>,
                 _cx: &mut std::task::Context<'_>,
             ) -> Poll<io::Result<()>> {
                 Poll::Ready(Ok(()))
             }
+
             fn poll_shutdown(
                 self: Pin<&mut Self>,
                 _cx: &mut std::task::Context<'_>,
@@ -1524,5 +1552,4 @@ mod tests {
             "vectored aggregation must survive the split(WriteHalf) indirection"
         );
     }
-
 }

@@ -6,8 +6,11 @@
 //! 2. start 后动态追加 handler（验证 add 不 panic）
 //! 3. remove 后 handler_count 减少 + default handler 清除
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU32, Ordering},
+};
+
 use xray_app_proxyman::{
     InboundHandler, InboundManager, OutboundHandler, OutboundManager, PinFuture, ProxymanError,
 };
@@ -22,13 +25,12 @@ struct CountingInHandler {
 }
 
 impl CountingInHandler {
-    fn new(tag: impl Into<String>, start_count: Arc<AtomicU32>, close_count: Arc<AtomicU32>) -> Self {
-        Self {
-            tag: tag.into(),
-            start_count,
-            close_count,
-            started: AtomicBool::new(false),
-        }
+    fn new(
+        tag: impl Into<String>,
+        start_count: Arc<AtomicU32>,
+        close_count: Arc<AtomicU32>,
+    ) -> Self {
+        Self { tag: tag.into(), start_count, close_count, started: AtomicBool::new(false) }
     }
 }
 
@@ -36,19 +38,23 @@ impl InboundHandler for CountingInHandler {
     fn tag(&self) -> &str {
         &self.tag
     }
+
     fn start(&self) -> PinFuture<Result<(), ProxymanError>> {
         self.start_count.fetch_add(1, Ordering::SeqCst);
         self.started.store(true, Ordering::SeqCst);
         Box::pin(async { Ok(()) })
     }
+
     fn close(&self) -> PinFuture<Result<(), ProxymanError>> {
         self.close_count.fetch_add(1, Ordering::SeqCst);
         self.started.store(false, Ordering::SeqCst);
         Box::pin(async { Ok(()) })
     }
+
     fn receiver_settings(&self) -> Option<&xray_proto::xray::app::proxyman::ReceiverConfig> {
         None
     }
+
     fn proxy_type_url(&self) -> &str {
         "xray.test.counting_in"
     }
@@ -61,12 +67,12 @@ struct CountingOutHandler {
 }
 
 impl CountingOutHandler {
-    fn new(tag: impl Into<String>, start_count: Arc<AtomicU32>, close_count: Arc<AtomicU32>) -> Self {
-        Self {
-            tag: tag.into(),
-            start_count,
-            close_count,
-        }
+    fn new(
+        tag: impl Into<String>,
+        start_count: Arc<AtomicU32>,
+        close_count: Arc<AtomicU32>,
+    ) -> Self {
+        Self { tag: tag.into(), start_count, close_count }
     }
 }
 
@@ -74,20 +80,25 @@ impl OutboundHandler for CountingOutHandler {
     fn tag(&self) -> &str {
         &self.tag
     }
+
     fn start(&self) -> PinFuture<Result<(), ProxymanError>> {
         self.start_count.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(()) })
     }
+
     fn close(&self) -> PinFuture<Result<(), ProxymanError>> {
         self.close_count.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(()) })
     }
+
     fn sender_type_url(&self) -> Option<&str> {
         None
     }
+
     fn proxy_type_url(&self) -> &str {
         "xray.test.counting_out"
     }
+
     fn dispatch(
         &self,
         _session: xray_common::session::Session,
@@ -95,11 +106,14 @@ impl OutboundHandler for CountingOutHandler {
     ) -> PinFuture<Result<(), ProxymanError>> {
         Box::pin(async { Err(ProxymanError::Other("test stub: no dispatch".into())) })
     }
+
     fn dial(
         &self,
         _dest: &xray_common::net::destination::Destination,
     ) -> PinFuture<std::io::Result<Box<dyn xray_transport::connection::Connection>>> {
-        Box::pin(async { Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "test stub: no dial")) })
+        Box::pin(async {
+            Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "test stub: no dial"))
+        })
     }
 }
 

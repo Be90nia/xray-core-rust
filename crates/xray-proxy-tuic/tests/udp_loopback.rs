@@ -11,17 +11,17 @@
 
 #![cfg(test)]
 
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use tokio::net::UdpSocket;
 use uuid::Uuid;
-
-use xray_proxy_tuic::client::TuicClient;
-use xray_proxy_tuic::protocol::Address;
-use xray_proxy_tuic::server::TuicMockServer;
-use xray_proxy_tuic::pool::QuinnConnectionPool;
+use xray_proxy_tuic::{
+    client::TuicClient, pool::QuinnConnectionPool, protocol::Address, server::TuicMockServer,
+};
 
 /// 启动简单 UDP echo server：收到什么就回什么。
 async fn start_udp_echo_server() -> SocketAddr {
@@ -35,7 +35,7 @@ async fn start_udp_echo_server() -> SocketAddr {
                     if sock.send_to(&buf[..n], peer).await.is_err() {
                         break;
                     }
-                }
+                },
                 Err(_) => break,
             }
         }
@@ -48,9 +48,7 @@ fn make_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.add(cert_der.to_vec().into()).expect("add cert");
     Arc::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth(),
+        rustls::ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth(),
     )
 }
 
@@ -81,7 +79,14 @@ async fn udp_loopback_echo_works() {
     let client_cfg = make_client_config(&cert_der);
     let client = tokio::time::timeout(
         Duration::from_secs(10),
-        TuicClient::connect(server_addr, "localhost", uuid, password, client_cfg, QuinnConnectionPool::new()),
+        TuicClient::connect(
+            server_addr,
+            "localhost",
+            uuid,
+            password,
+            client_cfg,
+            QuinnConnectionPool::new(),
+        ),
     )
     .await
     .expect("connect timed out")
@@ -93,13 +98,11 @@ async fn udp_loopback_echo_works() {
 
     let target = Address::Ipv4(Ipv4Addr::new(127, 0, 0, 1), echo_addr.port());
     let payload = b"hello tuic udp!";
-    let resp = tokio::time::timeout(
-        Duration::from_secs(15),
-        assoc.send_recv(target, payload, None),
-    )
-    .await
-    .expect("udp send_recv timed out")
-    .expect("udp send_recv failed");
+    let resp =
+        tokio::time::timeout(Duration::from_secs(15), assoc.send_recv(target, payload, None))
+            .await
+            .expect("udp send_recv timed out")
+            .expect("udp send_recv failed");
 
     assert_eq!(resp, payload);
 
@@ -130,7 +133,14 @@ async fn udp_loopback_multiple_packets() {
     let client_cfg = make_client_config(&cert_der);
     let client = tokio::time::timeout(
         Duration::from_secs(10),
-        TuicClient::connect(server_addr, "localhost", uuid, password, client_cfg, QuinnConnectionPool::new()),
+        TuicClient::connect(
+            server_addr,
+            "localhost",
+            uuid,
+            password,
+            client_cfg,
+            QuinnConnectionPool::new(),
+        ),
     )
     .await
     .expect("connect timed out")

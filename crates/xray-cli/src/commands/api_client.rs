@@ -29,35 +29,52 @@ impl ApiClient {
             .timeout(Duration::from_secs(timeout_secs))
             .connect_timeout(Duration::from_secs(timeout_secs));
 
-        let channel = endpoint
-            .connect()
-            .await
-            .map_err(|e| CliError::ApiConnectionFailed(format!("failed to connect to {addr}: {e}")))?;
+        let channel = endpoint.connect().await.map_err(|e| {
+            CliError::ApiConnectionFailed(format!("failed to connect to {addr}: {e}"))
+        })?;
 
-        Ok(Self {
-            channel,
-            timeout: Duration::from_secs(timeout_secs),
-        })
+        Ok(Self { channel, timeout: Duration::from_secs(timeout_secs) })
     }
 
     /// 创建 HandlerService client（proxyman command）。
-    pub fn handler_client(&self) -> xray_proto::xray::app::proxyman::command::handler_service_client::HandlerServiceClient<Channel> {
-        xray_proto::xray::app::proxyman::command::handler_service_client::HandlerServiceClient::new(self.channel.clone())
+    pub fn handler_client(
+        &self,
+    ) -> xray_proto::xray::app::proxyman::command::handler_service_client::HandlerServiceClient<
+        Channel,
+    > {
+        xray_proto::xray::app::proxyman::command::handler_service_client::HandlerServiceClient::new(
+            self.channel.clone(),
+        )
     }
 
     /// 创建 StatsService client（stats command）。
-    pub fn stats_client(&self) -> xray_proto::xray::app::stats::command::stats_service_client::StatsServiceClient<Channel> {
-        xray_proto::xray::app::stats::command::stats_service_client::StatsServiceClient::new(self.channel.clone())
+    pub fn stats_client(
+        &self,
+    ) -> xray_proto::xray::app::stats::command::stats_service_client::StatsServiceClient<Channel>
+    {
+        xray_proto::xray::app::stats::command::stats_service_client::StatsServiceClient::new(
+            self.channel.clone(),
+        )
     }
 
     /// 创建 RoutingService client（router command）。
-    pub fn routing_client(&self) -> xray_proto::xray::app::router::command::routing_service_client::RoutingServiceClient<Channel> {
-        xray_proto::xray::app::router::command::routing_service_client::RoutingServiceClient::new(self.channel.clone())
+    pub fn routing_client(
+        &self,
+    ) -> xray_proto::xray::app::router::command::routing_service_client::RoutingServiceClient<Channel>
+    {
+        xray_proto::xray::app::router::command::routing_service_client::RoutingServiceClient::new(
+            self.channel.clone(),
+        )
     }
 
     /// 创建 LoggerService client（log command：restart-logger）。
-    pub fn logger_client(&self) -> xray_proto::xray::app::log::command::logger_service_client::LoggerServiceClient<Channel> {
-        xray_proto::xray::app::log::command::logger_service_client::LoggerServiceClient::new(self.channel.clone())
+    pub fn logger_client(
+        &self,
+    ) -> xray_proto::xray::app::log::command::logger_service_client::LoggerServiceClient<Channel>
+    {
+        xray_proto::xray::app::log::command::logger_service_client::LoggerServiceClient::new(
+            self.channel.clone(),
+        )
     }
 
     /// 返回请求超时时长。

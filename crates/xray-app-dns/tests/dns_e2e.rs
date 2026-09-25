@@ -5,24 +5,37 @@
 //! - cache 第二次查询命中（不再走网络）
 //! - EDNS0 client_ip 选项正确附加（通过 query bytes 验证）
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use hickory_proto::op::{Message, MessageType, OpCode, Query};
-use hickory_proto::rr::{Name, RData, Record, RecordType};
-use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsOption};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, UdpSocket};
-
-use xray_app_dns::cache_controller::CacheController;
-use xray_app_dns::config::IpOption;
-use xray_app_dns::nameserver::Server;
-use xray_app_dns::nameserver::tcp::TcpNameServer;
-use xray_app_dns::nameserver::udp::UdpNameServer;
+use hickory_proto::{
+    op::{Message, MessageType, OpCode, Query},
+    rr::{
+        Name, RData, Record, RecordType,
+        rdata::opt::{ClientSubnet, EdnsOption},
+    },
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, UdpSocket},
+};
+use xray_app_dns::{
+    cache_controller::CacheController,
+    config::IpOption,
+    nameserver::{Server, tcp::TcpNameServer, udp::UdpNameServer},
+};
 
 /// 构造 A 或 AAAA 响应。req_id 由 query bytes echo。
-fn make_response(req_id: u16, fqdn: &str, record_type: RecordType, ips: Vec<IpAddr>, ttl: u32) -> Vec<u8> {
+fn make_response(
+    req_id: u16,
+    fqdn: &str,
+    record_type: RecordType,
+    ips: Vec<IpAddr>,
+    ttl: u32,
+) -> Vec<u8> {
     let name = Name::parse(fqdn, None).unwrap();
     let mut msg = Message::new(req_id, MessageType::Response, OpCode::Query);
     msg.add_query(Query::query(name.clone(), record_type));
@@ -59,11 +72,11 @@ async fn spawn_udp_echo_server(
             RecordType::A => {
                 let ips: Vec<IpAddr> = v4_ips.iter().map(|ip| IpAddr::V4(*ip)).collect();
                 make_response(query_msg.metadata.id, &fqdn, RecordType::A, ips, ttl)
-            }
+            },
             RecordType::AAAA => {
                 let ips: Vec<IpAddr> = v6_ips.iter().map(|ip| IpAddr::V6(*ip)).collect();
                 make_response(query_msg.metadata.id, &fqdn, RecordType::AAAA, ips, ttl)
-            }
+            },
             _ => unreachable!(),
         };
         sock.send_to(&resp, peer).await.unwrap();
@@ -73,7 +86,8 @@ async fn spawn_udp_echo_server(
 
 #[tokio::test]
 async fn udp_query_returns_correct_a_record() {
-    let captured: Arc<parking_lot::Mutex<Option<Vec<u8>>>> = Arc::new(parking_lot::Mutex::new(None));
+    let captured: Arc<parking_lot::Mutex<Option<Vec<u8>>>> =
+        Arc::new(parking_lot::Mutex::new(None));
     let addr = spawn_udp_echo_server(
         "example.com.".to_string(),
         vec![Ipv4Addr::new(93, 184, 216, 34)],
@@ -93,11 +107,7 @@ async fn udp_query_returns_correct_a_record() {
     let (ips, ttl) = ns
         .query_ip(
             "example.com",
-            IpOption {
-                ipv4_enable: true,
-                ipv6_enable: false,
-                fake_enable: false,
-            },
+            IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },
         )
         .await
         .unwrap();
@@ -109,7 +119,8 @@ async fn udp_query_returns_correct_a_record() {
 #[tokio::test]
 async fn udp_query_cache_hit_on_second_call() {
     // 不 disable_cache → 第二次查询应命中缓存。
-    let captured: Arc<parking_lot::Mutex<Option<Vec<u8>>>> = Arc::new(parking_lot::Mutex::new(None));
+    let captured: Arc<parking_lot::Mutex<Option<Vec<u8>>>> =
+        Arc::new(parking_lot::Mutex::new(None));
     let addr = spawn_udp_echo_server(
         "cached.example.".to_string(),
         vec![Ipv4Addr::new(1, 1, 1, 1)],
@@ -130,11 +141,7 @@ async fn udp_query_cache_hit_on_second_call() {
     let (ips1, ttl1) = ns
         .query_ip(
             "cached.example",
-            IpOption {
-                ipv4_enable: true,
-                ipv6_enable: false,
-                fake_enable: false,
-            },
+            IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },
         )
         .await
         .unwrap();
@@ -152,11 +159,7 @@ async fn udp_query_cache_hit_on_second_call() {
     let (ips2, ttl2) = ns
         .query_ip(
             "cached.example",
-            IpOption {
-                ipv4_enable: true,
-                ipv6_enable: false,
-                fake_enable: false,
-            },
+            IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },
         )
         .await
         .unwrap();
@@ -168,7 +171,8 @@ async fn udp_query_cache_hit_on_second_call() {
 
 #[tokio::test]
 async fn udp_query_with_edns0_client_ip_attaches_subnet() {
-    let captured: Arc<parking_lot::Mutex<Option<Vec<u8>>>> = Arc::new(parking_lot::Mutex::new(None));
+    let captured: Arc<parking_lot::Mutex<Option<Vec<u8>>>> =
+        Arc::new(parking_lot::Mutex::new(None));
     let addr = spawn_udp_echo_server(
         "subnet.example.".to_string(),
         vec![Ipv4Addr::new(2, 2, 2, 2)],
@@ -189,11 +193,7 @@ async fn udp_query_with_edns0_client_ip_attaches_subnet() {
     let _ = ns
         .query_ip(
             "subnet.example",
-            IpOption {
-                ipv4_enable: true,
-                ipv6_enable: false,
-                fake_enable: false,
-            },
+            IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },
         )
         .await
         .unwrap();
@@ -202,9 +202,8 @@ async fn udp_query_with_edns0_client_ip_attaches_subnet() {
     let query_msg = Message::from_vec(&query_bytes).unwrap();
     // 验证 EDNS0 存在 + 包含 Subnet option。
     let edns = query_msg.edns.as_ref().expect("edns present");
-    let has_subnet = edns.options().as_ref().iter().any(|(code, opt)| {
-        matches!(opt, EdnsOption::Subnet(_))
-    });
+    let has_subnet =
+        edns.options().as_ref().iter().any(|(code, opt)| matches!(opt, EdnsOption::Subnet(_)));
     assert!(has_subnet, "edns0 subnet option must be present");
 
     // 进一步验证 Subnet 内容。
@@ -246,11 +245,7 @@ async fn tcp_query_returns_a_record() {
     let (ips, _ttl) = ns
         .query_ip(
             "tcp.example",
-            IpOption {
-                ipv4_enable: true,
-                ipv6_enable: false,
-                fake_enable: false,
-            },
+            IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },
         )
         .await
         .unwrap();
@@ -260,16 +255,11 @@ async fn tcp_query_returns_a_record() {
 
 #[tokio::test]
 async fn udp_query_aaaa_record() {
-    let captured: Arc<parking_lot::Mutex<Option<Vec<u8>>>> = Arc::new(parking_lot::Mutex::new(None));
+    let captured: Arc<parking_lot::Mutex<Option<Vec<u8>>>> =
+        Arc::new(parking_lot::Mutex::new(None));
     let v6 = Ipv6Addr::LOCALHOST;
-    let addr = spawn_udp_echo_server(
-        "v6.example.".to_string(),
-        vec![],
-        vec![v6],
-        60,
-        captured,
-    )
-    .await;
+    let addr =
+        spawn_udp_echo_server("v6.example.".to_string(), vec![], vec![v6], 60, captured).await;
 
     let ns = UdpNameServer::new(
         addr,
@@ -280,11 +270,7 @@ async fn udp_query_aaaa_record() {
     let (ips, _ttl) = ns
         .query_ip(
             "v6.example",
-            IpOption {
-                ipv4_enable: false,
-                ipv6_enable: true,
-                fake_enable: false,
-            },
+            IpOption { ipv4_enable: false, ipv6_enable: true, fake_enable: false },
         )
         .await
         .unwrap();
@@ -295,7 +281,8 @@ async fn udp_query_aaaa_record() {
 #[tokio::test]
 async fn server_trait_object_dispatch() {
     // 验证 UdpNameServer 可作 Box<dyn Server> 用。
-    let captured: Arc<parking_lot::Mutex<Option<Vec<u8>>>> = Arc::new(parking_lot::Mutex::new(None));
+    let captured: Arc<parking_lot::Mutex<Option<Vec<u8>>>> =
+        Arc::new(parking_lot::Mutex::new(None));
     let addr = spawn_udp_echo_server(
         "trait.example.".to_string(),
         vec![Ipv4Addr::new(4, 4, 4, 4)],

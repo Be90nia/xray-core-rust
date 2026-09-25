@@ -2,11 +2,10 @@
 //!
 //! 对应 Go `transport/internet/config.go`。全局传输配置注册表。
 
-use std::collections::HashMap;
-use std::io;
-use std::sync::Mutex;
+use std::{collections::HashMap, io, sync::Mutex};
 
-static TRANSPORT_CONFIG: std::sync::OnceLock<Mutex<HashMap<String, serde_json::Value>>> = std::sync::OnceLock::new();
+static TRANSPORT_CONFIG: std::sync::OnceLock<Mutex<HashMap<String, serde_json::Value>>> =
+    std::sync::OnceLock::new();
 
 /// 全局配置注册表最大条目数。超出返回 CapacityExceeded 错误。
 const MAX_CONFIG_ENTRIES: usize = 256;
@@ -33,21 +32,20 @@ pub fn get_transport_config(tag: &str) -> Option<serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::LazyLock;
 
+    use super::*;
+
     /// 全局 map 的测试间互斥（并行 clear/register 竞争曾致 flaky）。
-    static TEST_LOCK: LazyLock<parking_lot::Mutex<()>> = LazyLock::new(|| parking_lot::Mutex::new(()));
+    static TEST_LOCK: LazyLock<parking_lot::Mutex<()>> =
+        LazyLock::new(|| parking_lot::Mutex::new(()));
 
     #[test]
     fn register_and_get() {
         let _g = TEST_LOCK.lock();
         transport_config().lock().unwrap().clear();
         register_transport_config("test-tgg", serde_json::json!({"k":"v"})).unwrap();
-        assert_eq!(
-            get_transport_config("test-tgg").unwrap(),
-            serde_json::json!({"k":"v"})
-        );
+        assert_eq!(get_transport_config("test-tgg").unwrap(), serde_json::json!({"k":"v"}));
     }
 
     #[test]

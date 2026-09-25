@@ -7,8 +7,8 @@
 //!
 //! 以下行为通过 trait 注入实现，本 crate 不绑定具体 HTTP/gRPC/RPC 栈：
 //! - TCP 监听 + http.Serve：[`MetricsHttpServer`] trait
-//! - expvar.Publish("stats") / expvar.Publish("observatory")：通过
-//!   [`StatsCollector`] / [`ObservationCollector`] 暴露快照数据
+//! - expvar.Publish("stats") / expvar.Publish("observatory")：通过 [`StatsCollector`] /
+//!   [`ObservationCollector`] 暴露快照数据
 //! - outbound.Manager.AddHandler/RemoveHandler：[`OutboundRegistrar`] trait
 //! - transport.Link → Conn 的转换：上层负责构造 [`BoxedConn`] 投递到 [`Outbound::dispatch`]
 //!
@@ -24,11 +24,11 @@ pub mod metrics;
 pub mod outbound;
 
 pub use config::MetricsConfig;
-pub use error::{at_error, at_warning, MetricsError};
-pub use metrics::{
-    aggregate_counters, format_prometheus, parse_counter_name, MetricsHandler,
-    MetricsHttpServer, NoopHttpServer, ObservationCollector, ObservationEntry,
-    ObservationSnapshot, OutboundRegistrar, RecordingOutboundRegistrar, StatsCollector,
-    StatsSnapshot, TokioHttpServer, TrafficCount,
-};
+pub use error::{MetricsError, at_error, at_warning};
 pub use feature::MetricsFeature;
+pub use metrics::{
+    MetricsHandler, MetricsHttpServer, NoopHttpServer, ObservationCollector, ObservationEntry,
+    ObservationSnapshot, OutboundRegistrar, RecordingOutboundRegistrar, StatsCollector,
+    StatsSnapshot, TokioHttpServer, TrafficCount, aggregate_counters, format_prometheus,
+    parse_counter_name,
+};

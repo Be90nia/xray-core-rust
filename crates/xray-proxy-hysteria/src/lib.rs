@@ -30,18 +30,18 @@
 //! - **切片3（待办）**：HysteriaOutbound impl xray_features::OutboundHandler（桥接层）
 
 pub mod config;
+pub mod dispatcher;
 pub mod error;
 pub mod inbound;
 pub mod outbound;
 pub mod protocol;
-pub mod dispatcher;
 
 pub use config::{
-    ClientConfig, HysteriaConfig, HysteriaInboundConfig, HysteriaUser, MultiUserValidator,
-    ServerConfig, HYSTERIA_ACCOUNT_TYPE_URL,
+    ClientConfig, HYSTERIA_ACCOUNT_TYPE_URL, HysteriaConfig, HysteriaInboundConfig, HysteriaUser,
+    MultiUserValidator, ServerConfig,
 };
+pub use dispatcher::make_hysteria_dial_fn;
 pub use error::{HysteriaProxyError, Result};
 pub use inbound::{HysteriaInboundHandler, StaticAuthValidator, TcpDispatcher};
 pub use outbound::HysteriaOutboundHandler;
 pub use protocol::{Defragger, UdpMessage};
-pub use dispatcher::make_hysteria_dial_fn;

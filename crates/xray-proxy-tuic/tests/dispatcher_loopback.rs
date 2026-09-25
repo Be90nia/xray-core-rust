@@ -13,25 +13,26 @@
 
 #![cfg(test)]
 
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 use uuid::Uuid;
-
 use xray_app_dispatcher::default::{DefaultDispatcher, DialBridge, SimpleOhm, SniffingRequest};
-use xray_buf::io::{Reader, Writer};
-use xray_buf::multi::MultiBuffer;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-use xray_proxy_tuic::client::TuicClient;
-use xray_proxy_tuic::dispatcher::make_dial_fn;
-use xray_proxy_tuic::server::TuicMockServer;
-use xray_proxy_tuic::pool::QuinnConnectionPool;
+use xray_buf::{
+    io::{Reader, Writer},
+    multi::MultiBuffer,
+};
+use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
+use xray_proxy_tuic::{
+    client::TuicClient, dispatcher::make_dial_fn, pool::QuinnConnectionPool, server::TuicMockServer,
+};
 
 async fn start_echo_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -50,7 +51,7 @@ async fn start_echo_server() -> SocketAddr {
                             if sock.write_all(&buf[..n]).await.is_err() {
                                 break;
                             }
-                        }
+                        },
                     }
                 }
             });
@@ -63,9 +64,7 @@ fn make_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.add(cert_der.to_vec().into()).unwrap();
     Arc::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth(),
+        rustls::ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth(),
     )
 }
 
@@ -96,7 +95,14 @@ async fn dispatcher_e2e_tuic_loopback_echo() {
     let client_cfg = make_client_config(&cert_der);
     let client_inner = tokio::time::timeout(
         Duration::from_secs(15),
-        TuicClient::connect(server_addr, "localhost", uuid, password, client_cfg, QuinnConnectionPool::new()),
+        TuicClient::connect(
+            server_addr,
+            "localhost",
+            uuid,
+            password,
+            client_cfg,
+            QuinnConnectionPool::new(),
+        ),
     )
     .await
     .expect("connect timed out")
@@ -105,10 +111,7 @@ async fn dispatcher_e2e_tuic_loopback_echo() {
 
     // 4. dispatcher + DialBridge(TuicClient)
     let ohm = SimpleOhm::new();
-    ohm.set_default(Arc::new(DialBridge::new(
-        "tuic-out",
-        make_dial_fn(Arc::clone(&client)),
-    )));
+    ohm.set_default(Arc::new(DialBridge::new("tuic-out", make_dial_fn(Arc::clone(&client)))));
     let mut dispatcher = DefaultDispatcher::new();
     dispatcher.ohm = Some(Arc::new(ohm));
 

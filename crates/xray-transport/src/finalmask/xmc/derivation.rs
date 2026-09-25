@@ -29,11 +29,7 @@ struct Sha256Stream {
 
 impl Sha256Stream {
     fn new(seed: Vec<u8>) -> Self {
-        Self {
-            seed,
-            counter: 0,
-            buf: Vec::new(),
-        }
+        Self { seed, counter: 0, buf: Vec::new() }
     }
 
     /// 取出恰好 `n` 字节；不足则按 SHA256 计数器扩展。
@@ -132,16 +128,8 @@ fn derive_prime(stream: &mut Sha256Stream) -> BigUint {
 /// 在内部构造失败（理论不应发生）时返回错误。
 pub fn derive_rsa_key(password: &str) -> Result<RsaPrivateKey, &'static str> {
     let seed = password.as_bytes().to_vec();
-    let p_seed: Vec<u8> = seed
-        .iter()
-        .copied()
-        .chain(b"-p-prime".iter().copied())
-        .collect();
-    let q_seed: Vec<u8> = seed
-        .iter()
-        .copied()
-        .chain(b"-q-prime".iter().copied())
-        .collect();
+    let p_seed: Vec<u8> = seed.iter().copied().chain(b"-p-prime".iter().copied()).collect();
+    let q_seed: Vec<u8> = seed.iter().copied().chain(b"-q-prime".iter().copied()).collect();
 
     let mut p_stream = Sha256Stream::new(p_seed);
     let mut q_stream = Sha256Stream::new(q_seed);
@@ -165,6 +153,7 @@ pub fn derive_rsa_key(password: &str) -> Result<RsaPrivateKey, &'static str> {
 #[cfg(test)]
 mod tests {
     use rsa::traits::{PrivateKeyParts, PublicKeyParts};
+
     use super::*;
 
     /// 同 password 必须派生出相同私钥。
@@ -196,14 +185,12 @@ mod tests {
     /// 派生出的私钥应能解密自己公钥加密的数据（PKCS1v15 round-trip）。
     #[test]
     fn rsa_encrypt_decrypt_roundtrip() {
-        use rsa::pkcs1v15::Pkcs1v15Encrypt;
-        use rsa::RsaPublicKey;
+        use rsa::{RsaPublicKey, pkcs1v15::Pkcs1v15Encrypt};
         let key = derive_rsa_key("roundtrip-test").expect("derive");
         let public = RsaPublicKey::from(&key);
         let msg = b"xmc derivation roundtrip";
-        let ciphertext = public
-            .encrypt(&mut rsa::rand_core::OsRng, Pkcs1v15Encrypt, msg)
-            .expect("enc");
+        let ciphertext =
+            public.encrypt(&mut rsa::rand_core::OsRng, Pkcs1v15Encrypt, msg).expect("enc");
         let plaintext = key.decrypt(Pkcs1v15Encrypt, &ciphertext).expect("dec");
         assert_eq!(&plaintext, msg);
     }

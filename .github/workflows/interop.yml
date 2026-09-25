@@ -18,7 +18,7 @@ jobs:
   interop:
     name: Interop (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 60  # 交叉方向扩满 12+12 (+12 测), 防 macOS 45min 边缘超时 (R 战役实证)
     strategy:
       fail-fast: false
       matrix:
@@ -81,7 +81,7 @@ jobs:
           chmod +x tools/xray-go/xray
           tools/xray-go/xray version
 
-      - name: Interop tests (Rust<->Rust 12 + Go->Rust 6 + Rust->Go 6 + 13 新协议套件)
+      - name: Interop tests (Rust<->Rust 12 + Go->Rust 12 + Rust->Go 12 + extra 18 = 54, Go 不支持的方向 runtime 探测自动跳过)
         run: python3 dist/interop_ci.py --rust target/release/xray --go tools/xray-go/xray
 
       - name: Upload logs on failure

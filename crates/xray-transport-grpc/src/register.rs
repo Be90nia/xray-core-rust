@@ -7,7 +7,8 @@
 //!
 //! ## 调用
 //!
-//! 进程启动时调用一次 [`register_dialer`] 和 [`register_listener`]；幂等——重复注册的 `AlreadyExists` 被忽略。
+//! 进程启动时调用一次 [`register_dialer`] 和 [`register_listener`]；幂等——重复注册的
+//! `AlreadyExists` 被忽略。
 //!
 //! 对应 Go `transport/internet/grpc/dialer.go::dialgRPC` + `init()` 中的
 //! `internet.RegisterTransportDialer(protocolName, Dial(...))`。
@@ -22,21 +23,16 @@
 //! h2/tonic 集成（见 crate `lib.rs` 切片边界文档）。dialer 闭包在解析配置
 //! 后返回 `Unsupported` 错误，确保注册结构正确但不假装能建立连接。
 
-use std::io;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{io, net::SocketAddr, sync::Arc};
 
 use xray_common::net::destination::Destination;
-use xray_transport::connection::Connection;
-use xray_transport::dialer::{
-    StreamSettings, TransportDialFn, register_transport_dialer,
+use xray_transport::{
+    connection::Connection,
+    dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
+    listener_registry::{
+        ConnHandler, TransportListenFn, TransportListener, register_transport_listener,
+    },
 };
-use xray_transport::listener_registry::{
-    ConnHandler, TransportListenFn, TransportListener,
-    register_transport_listener,
-};
-
-
 
 /// 注册 gRPC transport dialer。
 ///
@@ -84,7 +80,12 @@ pub fn register_listener() -> io::Result<()> {
 ///
 /// 当前返回 `Unsupported`：HTTP/2 server 监听依赖 h2/tonic 集成。
 /// 配置解析已执行，确保错误前的路径可测。
-async fn listen_grpc(addr: SocketAddr, settings: &StreamSettings, handler: ConnHandler, trusted: Vec<String>) -> io::Result<Box<dyn TransportListener>> {
+async fn listen_grpc(
+    addr: SocketAddr,
+    settings: &StreamSettings,
+    handler: ConnHandler,
+    trusted: Vec<String>,
+) -> io::Result<Box<dyn TransportListener>> {
     crate::transport::listen(addr, settings, handler, trusted).await
 }
 
@@ -92,16 +93,19 @@ async fn listen_grpc(addr: SocketAddr, settings: &StreamSettings, handler: ConnH
 ///
 /// 当前返回 `Unsupported`：HTTP/2 + TLS 拨号依赖 h2/tonic 集成（见 crate 文档）。
 /// 配置解析与 TLS 构建已执行，确保错误前的路径可测。
-async fn dial_grpc(dest: &Destination, settings: &StreamSettings) -> io::Result<Box<dyn Connection>> {
+async fn dial_grpc(
+    dest: &Destination,
+    settings: &StreamSettings,
+) -> io::Result<Box<dyn Connection>> {
     crate::transport::dial(dest, settings).await
 }
 
-
 #[cfg(test)]
 mod tests {
+    use xray_transport::dialer::get_transport_dialer;
+
     use super::*;
     use crate::config::parse_grpc_config;
-    use xray_transport::dialer::get_transport_dialer;
 
     #[test]
     fn parse_grpc_config_none_returns_default() {
@@ -127,10 +131,9 @@ mod tests {
 
     #[test]
     fn parse_grpc_config_custom_path_service_name() {
-        let v: serde_json::Value = serde_json::from_str(
-            r#"{"serviceName":"/A/B/Tun|TunMulti","multiMode":true}"#,
-        )
-        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"serviceName":"/A/B/Tun|TunMulti","multiMode":true}"#)
+                .unwrap();
         let cfg = parse_grpc_config(Some(&v)).unwrap();
         assert_eq!(cfg.service_name, "/A/B/Tun|TunMulti");
         assert!(cfg.multi_mode);
@@ -151,8 +154,7 @@ mod tests {
 
     #[test]
     fn parse_grpc_config_permit_without_stream() {
-        let v: serde_json::Value =
-            serde_json::from_str(r#"{"permitWithoutStream":true}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(r#"{"permitWithoutStream":true}"#).unwrap();
         let cfg = parse_grpc_config(Some(&v)).unwrap();
         assert!(cfg.permit_without_stream);
     }
@@ -195,11 +197,11 @@ mod tests {
     async fn dial_grpc_attempts_connection() {
         // gRPC dialer 现在尝试 h2 连接（不再返回 Unsupported）。
         // 连接 localhost:443 应失败（无监听）但不返回 Unsupported。
-        use xray_common::net::address::Address;
-        use xray_common::net::destination::Destination;
-        use xray_common::net::network::Network;
-        use xray_common::net::port::Port;
         use std::net::Ipv4Addr;
+
+        use xray_common::net::{
+            address::Address, destination::Destination, network::Network, port::Port,
+        };
 
         let dest = Destination::new(
             Address::IPv4(Ipv4Addr::LOCALHOST),
@@ -214,10 +216,7 @@ mod tests {
         let result = dial_grpc(&dest, &settings).await;
         assert!(result.is_err(), "should fail (no h2 server at localhost:1)");
         let err = result.err().unwrap();
-        assert!(
-            err.kind() != io::ErrorKind::Unsupported,
-            "should not be Unsupported anymore"
-        );
+        assert!(err.kind() != io::ErrorKind::Unsupported, "should not be Unsupported anymore");
     }
 
     #[test]
@@ -245,11 +244,10 @@ mod tests {
     /// dial 与 hub 双端配置 fragment mask 后 e2e echo 收发。
     #[tokio::test]
     async fn grpc_dial_hub_tcpmask_roundtrip() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use xray_common::net::address::Address;
-        use xray_common::net::network::Network;
-        use xray_common::net::port::Port;
         use std::net::Ipv4Addr;
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use xray_common::net::{address::Address, network::Network, port::Port};
 
         let finalmask = serde_json::json!({
             "tcp": [{"type": "fragment", "settings": {
@@ -275,7 +273,7 @@ mod tests {
                             if conn.write_all(&buf[..n]).await.is_err() {
                                 break;
                             }
-                        }
+                        },
                     }
                 }
             });
@@ -294,13 +292,10 @@ mod tests {
 
         conn.write_all(b"hello-grpc-tcpmask").await.expect("write");
         let mut buf = vec![0u8; 64];
-        let n = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            conn.read(&mut buf),
-        )
-        .await
-        .expect("echo timeout")
-        .expect("read ok");
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), conn.read(&mut buf))
+            .await
+            .expect("echo timeout")
+            .expect("read ok");
     }
     // ===== multi-mode / TLS spec tests (jghj: 8yn) =====
     //
@@ -391,10 +386,7 @@ mod tests {
     fn register_dialer_lookup_all_three_names() {
         register_dialer().unwrap();
         for name in ["grpc", "h2", "http"] {
-            assert!(
-                get_transport_dialer(name).is_some(),
-                "{name} dialer must be registered"
-            );
+            assert!(get_transport_dialer(name).is_some(), "{name} dialer must be registered");
         }
     }
 

@@ -11,14 +11,18 @@
 //! `.0` 即 ECH config list 字节。
 //!
 //! # 边界
-//! - 只解 Answer 区第一条匹配 fqdn 的 HTTPS RR；多 RR 取首个（对齐 Go
-//!   `for _, answer := range respMsg.Answer` 取首个 ECH）。
-//! - 解析失败的 RR 跳过（Go 等价物是 return error，但 Rust API 难精确还原
-//!   这一段 hickory-proto 错误——下游 caller 按 wire 校验再做）。
+//! - 只解 Answer 区第一条匹配 fqdn 的 HTTPS RR；多 RR 取首个（对齐 Go `for _, answer := range
+//!   respMsg.Answer` 取首个 ECH）。
+//! - 解析失败的 RR 跳过（Go 等价物是 return error，但 Rust API 难精确还原 这一段 hickory-proto
+//!   错误——下游 caller 按 wire 校验再做）。
 
-use hickory_proto::op::Message;
-use hickory_proto::rr::rdata::svcb::{SvcParamKey, SvcParamValue};
-use hickory_proto::rr::{RData, RecordType};
+use hickory_proto::{
+    op::Message,
+    rr::{
+        RData, RecordType,
+        rdata::svcb::{SvcParamKey, SvcParamValue},
+    },
+};
 
 use crate::error::TlsError;
 
@@ -45,10 +49,7 @@ use crate::error::TlsError;
 /// # 返回
 /// 首个 ECHConfigList 字节（ECH config 列表，与 `set_ech_config_list` 入参同构）。
 /// `Err(TlsError::NoEchConfig)` 表示无有效 ECH RR（Go 等价物）。
-pub fn extract_ech_from_dns_response(
-    wire: &[u8],
-    fqdn: &str,
-) -> Result<Vec<u8>, TlsError> {
+pub fn extract_ech_from_dns_response(wire: &[u8], fqdn: &str) -> Result<Vec<u8>, TlsError> {
     extract_ech_and_ttl_from_dns_response(wire, fqdn).map(|(config, _ttl)| config)
 }
 
@@ -58,17 +59,12 @@ pub fn extract_ech_and_ttl_from_dns_response(
     wire: &[u8],
     fqdn: &str,
 ) -> Result<(Vec<u8>, u32), TlsError> {
-    let msg = Message::from_vec(wire).map_err(|e| {
-        TlsError::EchApply(format!("unpack dns response: {e}"))
-    })?;
+    let msg = Message::from_vec(wire)
+        .map_err(|e| TlsError::EchApply(format!("unpack dns response: {e}")))?;
 
     // Go: dns.Fqdn(domain) 加尾点；hickory-proto 内部 Name::from_ascii 规范化。
     // 比较时用原始 fqdn（也可能已带尾点）+ 加尾点两种形态兜底。
-    let fqdn_dot = if fqdn.ends_with('.') {
-        fqdn.to_string()
-    } else {
-        format!("{fqdn}.")
-    };
+    let fqdn_dot = if fqdn.ends_with('.') { fqdn.to_string() } else { format!("{fqdn}.") };
 
     for rec in &msg.answers {
         if rec.record_type() != RecordType::HTTPS {
@@ -103,8 +99,10 @@ pub fn extract_ech_and_ttl_from_dns_response(
 /// + value bytes）按 RFC 9460 手解，TargetName 复用 hickory 公开的
 /// `BinDecodable for Name`。ECH 的 SvcParamKey=5（IANA 注册表）。
 pub fn extract_ech_from_https_rdata(rdata: &[u8]) -> Result<Vec<u8>, TlsError> {
-    use hickory_proto::rr::Name;
-    use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
+    use hickory_proto::{
+        rr::Name,
+        serialize::binary::{BinDecodable, BinDecoder},
+    };
 
     let ech_key = u16::from(SvcParamKey::EchConfigList);
     let mut decoder = BinDecoder::new(rdata);
@@ -112,8 +110,7 @@ pub fn extract_ech_from_https_rdata(rdata: &[u8]) -> Result<Vec<u8>, TlsError> {
         .read_u16()
         .map_err(|e| TlsError::EchApply(format!("decode svc priority: {e}")))?
         .unverified(/* 仅排序用，提取场景跳过 */);
-    Name::read(&mut decoder)
-        .map_err(|e| TlsError::EchApply(format!("decode target name: {e}")))?;
+    Name::read(&mut decoder).map_err(|e| TlsError::EchApply(format!("decode target name: {e}")))?;
     while decoder.peek().is_some() {
         let key = decoder
             .read_u16()
@@ -136,12 +133,19 @@ pub fn extract_ech_from_https_rdata(rdata: &[u8]) -> Result<Vec<u8>, TlsError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use base64::Engine as _;
-    use hickory_proto::op::{MessageType, OpCode};
-    use hickory_proto::rr::rdata::svcb::{EchConfigList, SVCB};
-    use hickory_proto::rr::rdata::HTTPS;
-    use hickory_proto::rr::{Name, Record};
+    use hickory_proto::{
+        op::{MessageType, OpCode},
+        rr::{
+            Name, Record,
+            rdata::{
+                HTTPS,
+                svcb::{EchConfigList, SVCB},
+            },
+        },
+    };
+
+    use super::*;
 
     /// 真实字节向量：RFC 9460 §2.2 SVCB/HTTPS RDATA 手工构造——
     /// `priority=1 (00 01) + target "." (00) + param ech key=5 (00 05) len=2 (00 02) value 01 02`。
@@ -240,10 +244,7 @@ mod tests {
         let svcb = SVCB::new(
             1,
             Name::from_ascii(".").unwrap(),
-            vec![(
-                SvcParamKey::Alpn,
-                SvcParamValue::Alpn(Alpn(vec!["h2".into()])),
-            )],
+            vec![(SvcParamKey::Alpn, SvcParamValue::Alpn(Alpn(vec!["h2".into()])))],
         );
         let record = Record::from_rdata(owner, 60, RData::HTTPS(HTTPS(svcb)));
         let mut msg = Message::new(2, MessageType::Response, OpCode::Query);
@@ -257,8 +258,7 @@ mod tests {
     #[test]
     fn extract_ech_malformed_wire_errors() {
         // 4 字节垃圾
-        let err = extract_ech_from_dns_response(&[0xde, 0xad, 0xbe, 0xef], "x.com")
-            .unwrap_err();
+        let err = extract_ech_from_dns_response(&[0xde, 0xad, 0xbe, 0xef], "x.com").unwrap_err();
         // unpack 失败或无 record；具体错误形态不限
         assert!(matches!(err, TlsError::EchApply(_)) || matches!(err, TlsError::NoEchConfig));
     }

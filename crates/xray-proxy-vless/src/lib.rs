@@ -25,11 +25,16 @@ pub mod outbound;
 pub mod validator;
 
 pub use account::{MemoryAccount, Reverse};
+pub use dispatcher::{VlessOutboundConfig, make_dial_fn as make_vless_dial_fn};
 pub use error::VlessError;
+pub use inbound::{
+    handler::{FallbackDest, FallbackPolicy},
+    server::{
+        VlessInboundOptions, handle_connection as handle_vless_connection,
+        handle_connection_with_fallback, serve_vless,
+    },
+};
 pub use validator::{MemoryUser, MemoryValidator, Validator};
-pub use dispatcher::{make_dial_fn as make_vless_dial_fn, VlessOutboundConfig};
-pub use inbound::server::{handle_connection as handle_vless_connection, handle_connection_with_fallback, serve_vless, VlessInboundOptions};
-pub use inbound::handler::{FallbackDest, FallbackPolicy};
 
 /// Flow 常量（对应 Go 的 `vless.None` / `vless.XRV`）。
 pub const FLOW_NONE: &str = "none";
@@ -42,5 +47,7 @@ pub const RVS_DOMAIN: &str = "v1.rvs.cool";
 
 // 反向代理 + 预连接公共导出（bridge/portal 注册与监控）
 pub use inbound::reverse::{PortalConfig, ReverseRegistry};
-pub use outbound::preconnect::{PreConnectConfig, PreConnectPool};
-pub use outbound::reverse::{ReverseConnState, ReverseMonitor};
+pub use outbound::{
+    preconnect::{PreConnectConfig, PreConnectPool},
+    reverse::{ReverseConnState, ReverseMonitor},
+};

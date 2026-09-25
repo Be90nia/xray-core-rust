@@ -5,22 +5,26 @@
 //! ## 范围
 //!
 //! - 缓存命中检测 + 调度逻辑：完整翻译。
-//! - `pubsub` / `singleflight`：用 `tokio::sync::broadcast` 与简化的 per-key
-//!   `Mutex<HashMap>` 模拟，业务语义保留（避免重复查询、等待首个响应）。
+//! - `pubsub` / `singleflight`：用 `tokio::sync::broadcast` 与简化的 per-key `Mutex<HashMap>`
+//!   模拟，业务语义保留（避免重复查询、等待首个响应）。
 //!
 //! CachedNameserver 是内部 trait，调用方用具体类型或泛型 `T:`，故用 `async fn` 而非
 //! 手写 boxed future（与上层 `Server` trait 风格不同）。
 
-use std::net::IpAddr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    net::IpAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use tokio::sync::broadcast;
 
-use crate::cache_controller::CacheController;
-use crate::config::IpOption;
-use crate::dnscommon::{merge_records, IpRecord};
-use crate::error::DnsError;
+use crate::{
+    cache_controller::CacheController,
+    config::IpOption,
+    dnscommon::{IpRecord, merge_records},
+    error::DnsError,
+};
 
 /// singleflight 等待者的兜底超时。领导者底层查询各自带 per-query timeout
 /// （默认 4s），此处取同量级值，防领导者异常挂起时等待者被无限拖住。
@@ -87,21 +91,17 @@ pub struct QueryOutcome {
 /// singleflight 仅 clone rec_v4/rec_v6，errors 不复制（诊断用途）。
 impl Clone for QueryOutcome {
     fn clone(&self) -> Self {
-        Self {
-            rec_v4: self.rec_v4.clone(),
-            rec_v6: self.rec_v6.clone(),
-            errors: Vec::new(),
-        }
+        Self { rec_v4: self.rec_v4.clone(), rec_v6: self.rec_v6.clone(), errors: Vec::new() }
     }
 }
 
 /// 缓存入口查询。对应 Go `queryIP(ctx, s, domain, option)`。
 ///
-/// 1. 若缓存启用且命中：返回 `(ips, ttl, Ok)`；过期且 `serveStale` 时走
-///    stale 优化路径（Go nameserver_cached.go:31-41：秒回旧 IP + `go pull` 续期）。
+/// 1. 若缓存启用且命中：返回 `(ips, ttl, Ok)`；过期且 `serveStale` 时走 stale 优化路径（Go
+///    nameserver_cached.go:31-41：秒回旧 IP + `go pull` 续期）。
 /// 2. 否则调用 `fetch`（singleflight + pubsub）执行实际查询。
-/// 3. 持有 `Arc<S>`（`'static`）：stale 路径需把服务器共享给后台 `pull` 任务
-///    （Go 的 interface 值天然可共享；Rust 须显式 Arc）。
+/// 3. 持有 `Arc<S>`（`'static`）：stale 路径需把服务器共享给后台 `pull` 任务 （Go 的 interface
+///    值天然可共享；Rust 须显式 Arc）。
 pub async fn query_ip<S: CachedNameserver + 'static>(
     server: Arc<S>,
     domain: &str,
@@ -129,8 +129,7 @@ pub async fn query_ip<S: CachedNameserver + 'static>(
                 // 过期可服务：Go merge 对过期记录返回 `(ips, ttl<=0, nil)`——
                 // serveStale 时秒回旧 IP 并后台刷新。
                 if cache.serve_stale
-                    && (cache.serve_expired_ttl_secs == 0
-                        || cache.serve_expired_ttl_secs < ttl)
+                    && (cache.serve_expired_ttl_secs == 0 || cache.serve_expired_ttl_secs < ttl)
                 {
                     if let Some((sips, _)) = stale_result(&rec, option, now) {
                         pull(server, fqdn_owned.to_string(), option);
@@ -183,7 +182,7 @@ fn raw_ttl_seconds(expire: Instant, now: Instant) -> i32 {
         None => {
             let overdue = now - expire;
             -(overdue.as_secs_f64().ceil() as i32)
-        }
+        },
     }
 }
 
@@ -223,11 +222,8 @@ pub async fn fetch<S: CachedNameserver>(
             let (tx, _) = broadcast::channel(1);
             sf.insert(sf_key.clone(), tx.clone());
             drop(sf);
-            let _guard = SfLeaderGuard {
-                sf: &cache.single_flight,
-                key: sf_key.clone(),
-                tx: tx.clone(),
-            };
+            let _guard =
+                SfLeaderGuard { sf: &cache.single_flight, key: sf_key.clone(), tx: tx.clone() };
 
             let outcome = server.send_query(fqdn, option).await;
 
@@ -258,12 +254,8 @@ pub async fn fetch<S: CachedNameserver>(
         cache.upsert(fqdn, false, rec);
     }
 
-    let (ips, ttl, err) = merge_records(
-        option,
-        outcome.rec_v4.as_ref(),
-        outcome.rec_v6.as_ref(),
-        now,
-    );
+    let (ips, ttl, err) =
+        merge_records(option, outcome.rec_v4.as_ref(), outcome.rec_v6.as_ref(), now);
     if let Some(e) = err {
         return Err(e);
     }
@@ -277,11 +269,7 @@ pub async fn fetch<S: CachedNameserver>(
 /// 后续 pull 合并为等待者，不重复打上游）。
 ///
 /// ponytail: 用 `tokio::spawn` fire-and-forget。
-pub fn pull<S: CachedNameserver + 'static>(
-    server: Arc<S>,
-    fqdn: String,
-    option: IpOption,
-) {
+pub fn pull<S: CachedNameserver + 'static>(server: Arc<S>, fqdn: String, option: IpOption) {
     tokio::spawn(async move {
         let _ = tokio::time::timeout(PULL_TIMEOUT, fetch(server.as_ref(), &fqdn, option)).await;
     });
@@ -300,16 +288,18 @@ pub fn pull<S: CachedNameserver + 'static>(
 ///     }
 /// }
 /// ```
-pub fn subscribe(cache: &CacheController) -> broadcast::Receiver<crate::cache_controller::CacheEvent> {
+pub fn subscribe(
+    cache: &CacheController,
+) -> broadcast::Receiver<crate::cache_controller::CacheEvent> {
     cache.subscribe()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{net::Ipv4Addr, time::Duration};
+
     use super::*;
     use crate::dnscommon::ip_record;
-    use std::net::Ipv4Addr;
-    use std::time::Duration;
 
     struct StubServer {
         cache: Arc<CacheController>,
@@ -347,11 +337,7 @@ mod tests {
     #[tokio::test]
     async fn query_ip_falls_through_to_send_query_on_cache_miss() {
         let cache = Arc::new(CacheController::new("test", false, false, 0, 0));
-        let server = StubServer {
-            cache,
-            rec_v4: Some(v4_record(60)),
-            rec_v6: None,
-        };
+        let server = StubServer { cache, rec_v4: Some(v4_record(60)), rec_v6: None };
         let (ips, ttl) = query_ip(Arc::new(server), "example.com", v4_only_option()).await.unwrap();
         assert_eq!(ips.len(), 1);
         assert_eq!(ttl, 60);
@@ -379,12 +365,9 @@ mod tests {
         let cache = Arc::new(CacheController::new("test", true, false, 0, 0));
         cache.upsert("example.com.", true, v4_record(60));
 
-        let server = StubServer {
-            cache,
-            rec_v4: Some(v4_record(60)),
-            rec_v6: None,
-        };
-        let (ips, _ttl) = query_ip(Arc::new(server), "example.com", v4_only_option()).await.unwrap();
+        let server = StubServer { cache, rec_v4: Some(v4_record(60)), rec_v6: None };
+        let (ips, _ttl) =
+            query_ip(Arc::new(server), "example.com", v4_only_option()).await.unwrap();
         assert_eq!(ips.len(), 1); // 来自 send_query 而非缓存
     }
 
@@ -399,6 +382,7 @@ mod tests {
             fn cache_controller(&self) -> &CacheController {
                 &self.cache
             }
+
             async fn send_query(&self, _fqdn: &str, _option: IpOption) -> QueryOutcome {
                 self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 // 留出并发窗口，让重复 pull 进入 singleflight 等待者路径。
@@ -464,13 +448,10 @@ mod tests {
         );
         cache.upsert("example.com.", true, expired);
 
-        let server = StubServer {
-            cache,
-            rec_v4: Some(v4_record(60)),
-            rec_v6: None,
-        };
+        let server = StubServer { cache, rec_v4: Some(v4_record(60)), rec_v6: None };
         // Go: serveExpiredTTL(-60) < ttl(-120) 不成立 → 不走 stale，fetch 返回 1.2.3.4。
-        let (ips, _ttl) = query_ip(Arc::new(server), "example.com", v4_only_option()).await.unwrap();
+        let (ips, _ttl) =
+            query_ip(Arc::new(server), "example.com", v4_only_option()).await.unwrap();
         assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
     }
 
@@ -479,8 +460,9 @@ mod tests {
     /// 负缓存每次完整上游 RTT（Go nameserver_cached.go:27-32 TTL 内零查询）。
     #[tokio::test]
     async fn negative_cache_hit_within_ttl_skips_upstream() {
-        use crate::dnscommon::rcode;
         use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::dnscommon::rcode;
 
         struct CountingServer {
             cache: Arc<CacheController>,
@@ -490,6 +472,7 @@ mod tests {
             fn cache_controller(&self) -> &CacheController {
                 &self.cache
             }
+
             async fn send_query(&self, _fqdn: &str, _option: IpOption) -> QueryOutcome {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 QueryOutcome { rec_v4: Some(v4_record(60)), rec_v6: None, errors: Vec::new() }
@@ -501,13 +484,8 @@ mod tests {
         let neg = ip_record(1, vec![], Duration::from_secs(60), rcode::NX_DOMAIN, Instant::now());
         cache.upsert("neg.example.com.", true, neg);
 
-        let server = Arc::new(CountingServer {
-            cache: cache.clone(),
-            calls: AtomicUsize::new(0),
-        });
-        let err = query_ip(server.clone(), "neg.example.com", v4_only_option())
-            .await
-            .unwrap_err();
+        let server = Arc::new(CountingServer { cache: cache.clone(), calls: AtomicUsize::new(0) });
+        let err = query_ip(server.clone(), "neg.example.com", v4_only_option()).await.unwrap_err();
         assert!(matches!(err, DnsError::RCodeError(3)), "应直接返回负缓存 rcode 错误");
         assert_eq!(server.calls.load(Ordering::SeqCst), 0, "TTL 内负缓存命中不得打上游");
     }
@@ -523,8 +501,13 @@ mod tests {
             fn cache_controller(&self) -> &CacheController {
                 &self.cache
             }
+
             async fn send_query(&self, _fqdn: &str, _option: IpOption) -> QueryOutcome {
-                QueryOutcome { rec_v4: None, rec_v6: None, errors: vec![DnsError::SystemResolve("upstream timeout".into())] }
+                QueryOutcome {
+                    rec_v4: None,
+                    rec_v6: None,
+                    errors: vec![DnsError::SystemResolve("upstream timeout".into())],
+                }
             }
         }
 
@@ -541,11 +524,7 @@ mod tests {
     async fn fetch_broadcasts_event_to_cache_subscribers() {
         let cache = Arc::new(CacheController::new("test", false, false, 0, 0));
         let mut rx = cache.subscribe();
-        let server = StubServer {
-            cache: cache.clone(),
-            rec_v4: Some(v4_record(60)),
-            rec_v6: None,
-        };
+        let server = StubServer { cache: cache.clone(), rec_v4: Some(v4_record(60)), rec_v6: None };
         let (ips, _) = fetch(&server, "example.com.", v4_only_option()).await.unwrap();
         assert_eq!(ips.len(), 1);
 
@@ -554,7 +533,7 @@ mod tests {
             crate::cache_controller::CacheEvent::Record { domain, is_v4, .. } => {
                 assert_eq!(domain, "example.com.");
                 assert!(is_v4);
-            }
+            },
         }
     }
 
@@ -580,10 +559,7 @@ mod tests {
     #[tokio::test]
     async fn singleflight_leader_abort_does_not_leak_and_key_recovers() {
         let cache = Arc::new(CacheController::new("test", false, false, 0, 0));
-        let server = Arc::new(HangServer {
-            cache,
-            hang: std::sync::atomic::AtomicBool::new(true),
-        });
+        let server = Arc::new(HangServer { cache, hang: std::sync::atomic::AtomicBool::new(true) });
 
         // 领导者：进入 fetch 后停在挂起的 send_query 上。
         let leader = tokio::spawn({
@@ -634,6 +610,7 @@ mod tests {
             fn cache_controller(&self) -> &CacheController {
                 &self.cache
             }
+
             async fn send_query(&self, _fqdn: &str, _option: IpOption) -> QueryOutcome {
                 self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 // 留出并发窗口让第二个请求进入等待者路径。
@@ -643,10 +620,8 @@ mod tests {
         }
 
         let cache = Arc::new(CacheController::new("test", false, false, 0, 0));
-        let server = Arc::new(CountingServer {
-            cache,
-            calls: std::sync::atomic::AtomicUsize::new(0),
-        });
+        let server =
+            Arc::new(CountingServer { cache, calls: std::sync::atomic::AtomicUsize::new(0) });
         let f1 = tokio::spawn({
             let server = server.clone();
             async move { fetch(&*server, "dup.com.", v4_only_option()).await }
@@ -679,6 +654,7 @@ mod tests {
             fn cache_controller(&self) -> &CacheController {
                 &self.cache
             }
+
             async fn send_query(&self, _fqdn: &str, _option: IpOption) -> QueryOutcome {
                 self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 QueryOutcome {
@@ -717,9 +693,7 @@ mod tests {
         );
 
         // 旧记录未被清除/覆盖；第二次查询依旧乐观返回旧值（查询驱动重试）。
-        let rec = cache
-            .find_records("example.com.")
-            .expect("刷新失败必须保留旧记录");
+        let rec = cache.find_records("example.com.").expect("刷新失败必须保留旧记录");
         assert_eq!(
             rec.a.as_ref().unwrap().ips,
             vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))],
@@ -743,11 +717,7 @@ mod tests {
         );
         cache.upsert("example.com.", true, expired);
 
-        let server = StubServer {
-            cache,
-            rec_v4: Some(v4_record(60)),
-            rec_v6: None,
-        };
+        let server = StubServer { cache, rec_v4: Some(v4_record(60)), rec_v6: None };
         let (ips, ttl) = query_ip(Arc::new(server), "example.com", v4_only_option()).await.unwrap();
         assert_eq!(
             ips,

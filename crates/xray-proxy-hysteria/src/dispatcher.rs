@@ -3,30 +3,32 @@
 //! 把 [`HysteriaClient`]（QUIC stream）接入 dispatcher 的 [`DialBridge`]：
 //! [`make_dial_fn`] 闭包内部 dial → `HysteriaClient::tcp()` → pump 桥接到 duplex。
 
-use std::io;
-use std::net::{SocketAddr, ToSocketAddrs};
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
-use tokio::sync::OnceCell;
-
-use xray_app_dispatcher::default::DialFn;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-use xray_transport::connection::Connection;
-use xray_transport_hysteria::conn::{InterConn, InterStreamConn};
-use xray_transport_hysteria::dialer::{
-    ClientManager, DialDestination, HysteriaTransport,
+use std::{
+    io,
+    net::{SocketAddr, ToSocketAddrs},
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
 };
-use xray_transport_hysteria::proto_config::Config as ProtoConfig;
+
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf},
+    sync::OnceCell,
+};
+use xray_app_dispatcher::default::DialFn;
+use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
+use xray_transport::connection::Connection;
+use xray_transport_hysteria::{
+    conn::{InterConn, InterStreamConn},
+    dialer::{ClientManager, DialDestination, HysteriaTransport},
+    proto_config::Config as ProtoConfig,
+};
 use xray_xudp::packet::{PacketError, PacketReader, PacketWriter};
 
-use crate::config::HysteriaConfig;
-use crate::protocol::{Defragger, UdpMessage};
+use crate::{
+    config::HysteriaConfig,
+    protocol::{Defragger, UdpMessage},
+};
 
 /// Hysteria duplex 缓冲（与 tuic 一致：64 KiB）。
 const DUPLEX_BUF_SIZE: usize = 64 * 1024;
@@ -80,6 +82,7 @@ impl Connection for HysteriaConnection {
     fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(None)
     }
+
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(None)
     }
@@ -90,10 +93,7 @@ impl HysteriaConnection {
     fn from_stream(stream: Arc<InterStreamConn>) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
         let pump = tokio::spawn(pump_hysteria_stream(stream, server_io));
-        Self {
-            inner: client_io,
-            _pump: pump,
-        }
+        Self { inner: client_io, _pump: pump }
     }
 }
 
@@ -102,17 +102,11 @@ impl HysteriaConnection {
     fn from_udp(conn: Arc<InterConn>, default_dest: Destination) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
         let pump = tokio::spawn(pump_hysteria_udp(conn, server_io, default_dest));
-        Self {
-            inner: client_io,
-            _pump: pump,
-        }
+        Self { inner: client_io, _pump: pump }
     }
 }
 
-async fn pump_hysteria_stream(
-    stream: Arc<InterStreamConn>,
-    server_io: DuplexStream,
-    ) {
+async fn pump_hysteria_stream(stream: Arc<InterStreamConn>, server_io: DuplexStream) {
     let (mut rd, mut wr) = tokio::io::split(server_io);
     let stream_down = Arc::clone(&stream);
 
@@ -127,11 +121,11 @@ async fn pump_hysteria_stream(
                         tracing::debug!("hysteria pump up write error: {e}");
                         break;
                     }
-                }
+                },
                 Err(e) => {
                     tracing::debug!("hysteria pump up read error: {e}");
                     break;
-                }
+                },
             }
         }
         let _ = stream.close().await;
@@ -148,11 +142,11 @@ async fn pump_hysteria_stream(
                         tracing::debug!("hysteria pump down write error: {e}");
                         break;
                     }
-                }
+                },
                 Err(e) => {
                     tracing::debug!("hysteria pump down read error: {e}");
                     break;
-                }
+                },
             }
         }
         let _ = wr.shutdown().await;
@@ -163,10 +157,10 @@ async fn pump_hysteria_stream(
 
 /// XUDP 帧 ↔ hysteria UdpMessage 双向桥（对应 Go `Client.Process` UDP 分支）。
 ///
-/// - up：duplex 字节流内的 XUDP 帧 → [`PacketReader`] 拆帧 → [`UdpMessage`]
-///   （frag 0/1，per-packet target 或 default dest）→ [`InterConn::write`]。
-/// - down：[`InterConn::read`] → [`UdpMessage::parse`] → [`Defragger`] →
-///   回包来源 addr → XUDP 帧写回 duplex。
+/// - up：duplex 字节流内的 XUDP 帧 → [`PacketReader`] 拆帧 → [`UdpMessage`] （frag 0/1，per-packet
+///   target 或 default dest）→ [`InterConn::write`]。
+/// - down：[`InterConn::read`] → [`UdpMessage::parse`] → [`Defragger`] → 回包来源 addr → XUDP
+///   帧写回 duplex。
 async fn pump_hysteria_udp(
     conn: Arc<InterConn>,
     server_io: DuplexStream,
@@ -189,7 +183,7 @@ async fn pump_hysteria_udp(
                     Err(e) => {
                         tracing::debug!("hysteria udp up forward error: {e}");
                         return;
-                    }
+                    },
                 }
             }
             match rd.read(&mut buf).await {
@@ -198,7 +192,7 @@ async fn pump_hysteria_udp(
                 Err(e) => {
                     tracing::debug!("hysteria udp up read error: {e}");
                     return;
-                }
+                },
             }
         }
     };
@@ -215,7 +209,7 @@ async fn pump_hysteria_udp(
                 Err(e) => {
                     tracing::debug!("hysteria udp down read error: {e}");
                     break;
-                }
+                },
             };
             if n == 0 {
                 break;
@@ -278,10 +272,8 @@ async fn parse_and_forward(
         Ok(Some(pkt)) => {
             accum.drain(..consumed);
             let (data, udp_target) = pkt.into_parts();
-            let addr = udp_target
-                .as_ref()
-                .map(dest_net_addr)
-                .unwrap_or_else(|| default_addr.to_string());
+            let addr =
+                udp_target.as_ref().map(dest_net_addr).unwrap_or_else(|| default_addr.to_string());
             let msg = UdpMessage {
                 session_id: 0, // 真实 id 由 InterConn::write 信封注入
                 packet_id: 0,
@@ -296,7 +288,7 @@ async fn parse_and_forward(
                 tracing::debug!("hysteria udp up forward error: {e}");
             }
             Ok(true)
-        }
+        },
         Ok(None) => Ok(false), // 流内干净结束，但 accum 可能有残留 → 等更多数据
         Err(PacketError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
         Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
@@ -311,10 +303,7 @@ pub(crate) const MAX_DATAGRAM_PAYLOAD: usize = 1200 - 4 - 9;
 
 /// 序列化 UdpMessage 并经 InterConn 写出；超 MTU 时自动分片。
 /// 写入 body 已剥 4B session_id 字段（InterConn::write 注入真实 id 信封）。
-pub(crate) async fn write_udp_message(
-    conn: &Arc<InterConn>,
-    msg: &UdpMessage,
-) -> io::Result<()> {
+pub(crate) async fn write_udp_message(conn: &Arc<InterConn>, msg: &UdpMessage) -> io::Result<()> {
     let frags = if msg.size() > MAX_DATAGRAM_PAYLOAD {
         crate::protocol::frag_udp_message(msg, MAX_DATAGRAM_PAYLOAD)
     } else {
@@ -342,10 +331,7 @@ pub(crate) fn dest_net_addr(dest: &Destination) -> String {
 pub(crate) fn parse_udp_source(addr: &str) -> Option<Destination> {
     let (host, port) = addr.rsplit_once(':')?;
     let port = Port::new(port.parse::<u16>().ok()?);
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
+    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
     let address = host
         .parse::<std::net::IpAddr>()
         .map(Address::from)
@@ -380,11 +366,8 @@ pub fn make_hysteria_dial_fn(
 
         Box::pin(async move {
             // lazy init ClientManager（首次 dial 时构造）
-            let manager = client_manager
-                .get_or_init(|| async {
-                    ClientManager::new(transport)
-                })
-                .await;
+            let manager =
+                client_manager.get_or_init(|| async { ClientManager::new(transport) }).await;
 
             // resolve server address from config
             let server_addr_str = &config.server_addr;
@@ -396,10 +379,7 @@ pub fn make_hysteria_dial_fn(
                 .map_err(|e| format!("hysteria server resolve: {e}"))?
                 .next()
                 .ok_or_else(|| "hysteria server resolve: empty result".to_string())?;
-            let dial_dest = DialDestination {
-                udp_addr,
-                host: server_name.clone(),
-            };
+            let dial_dest = DialDestination { udp_addr, host: server_name.clone() };
 
             let proto_config = Arc::new(ProtoConfig {
                 auth: config.auth.clone(),
@@ -416,30 +396,28 @@ pub fn make_hysteria_dial_fn(
                 Network::TCP => {
                     let result = client.tcp(dest.address(), dest.port()).await;
                     match result {
-                        Ok(stream) => {
-                            Ok(Box::new(HysteriaConnection::from_stream(stream)) as Box<dyn Connection>)
-                        }
+                        Ok(stream) => Ok(Box::new(HysteriaConnection::from_stream(stream))
+                            as Box<dyn Connection>),
                         Err(e) => {
                             tracing::warn!(server = %server_addr_str, target = ?dest.address(), "hysteria tcp dial failed: {e}");
                             Err(format!("hysteria tcp dial: {e}"))
-                        }
+                        },
                     }
-                }
+                },
                 Network::UDP => {
                     let result = client.udp().await;
                     match result {
-                        Ok(conn) => {
-                            Ok(Box::new(HysteriaConnection::from_udp(conn, dest)) as Box<dyn Connection>)
-                        }
+                        Ok(conn) => Ok(Box::new(HysteriaConnection::from_udp(conn, dest))
+                            as Box<dyn Connection>),
                         Err(e) => {
                             tracing::warn!(server = %server_addr_str, "hysteria udp dial failed: {e}");
                             Err(format!("hysteria udp dial: {e}"))
-                        }
+                        },
                     }
-                }
+                },
                 Network::Unix => {
                     Err("hysteria outbound does not support unix network in dial_fn".to_string())
-                }
+                },
             }
         })
     })
@@ -447,24 +425,24 @@ pub fn make_hysteria_dial_fn(
 
 #[cfg(test)]
 mod tests {
-    use std::pin::Pin;
-    use std::sync::Arc;
-
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::sync::mpsc;
+    use std::{pin::Pin, sync::Arc};
 
     use bytes::Bytes;
-
-    use xray_common::net::address::Address;
-    use xray_common::net::destination::Destination;
-    use xray_common::net::network::Network;
-    use xray_common::net::port::Port;
-    use crate::protocol::UdpMessage;
-    use xray_transport_hysteria::conn::QuicConn;
-    use xray_transport_hysteria::dialer::{DialDestination, HysteriaTransport, QuicConfig};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        sync::mpsc,
+    };
+    use xray_common::net::{
+        address::Address, destination::Destination, network::Network, port::Port,
+    };
+    use xray_transport_hysteria::{
+        conn::QuicConn,
+        dialer::{DialDestination, HysteriaTransport, QuicConfig},
+    };
     use xray_xudp::packet::{PacketReader, PacketWriter};
 
     use super::*;
+    use crate::protocol::UdpMessage;
 
     /// 回声 mock QUIC conn——扮演 hysteria server。
     ///
@@ -542,17 +520,12 @@ mod tests {
             })
         }
 
-        fn receive_datagram(
-            &self,
-        ) -> Pin<Box<dyn Future<Output = std::io::Result<Bytes>> + Send>> {
+        fn receive_datagram(&self) -> Pin<Box<dyn Future<Output = std::io::Result<Bytes>> + Send>> {
             let rx = Arc::clone(&self.rx);
             Box::pin(async move {
-                rx.lock()
-                    .await
-                    .recv()
-                    .await
-                    .map(Bytes::from)
-                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "mock closed"))
+                rx.lock().await.recv().await.map(Bytes::from).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "mock closed")
+                })
             })
         }
 
@@ -586,8 +559,15 @@ mod tests {
         fn open_stream(
             &self,
             _conn: &Arc<dyn QuicConn>,
-        ) -> Pin<Box<dyn Future<Output = std::io::Result<Arc<dyn xray_transport_hysteria::conn::QuicStream>>> + Send>>
-        {
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = std::io::Result<
+                            Arc<dyn xray_transport_hysteria::conn::QuicStream>,
+                        >,
+                    > + Send,
+            >,
+        > {
             Box::pin(async { Err(std::io::Error::other("mock: udp-only transport")) })
         }
     }
@@ -665,10 +645,8 @@ mod tests {
             _auth_token: &str,
             _brutal_down_bps: u64,
         ) -> Pin<Box<dyn Future<Output = std::io::Result<Arc<dyn QuicConn>>> + Send>> {
-            *self.captured.lock() = Some(DialDestination {
-                udp_addr: dest.udp_addr,
-                host: dest.host.clone(),
-            });
+            *self.captured.lock() =
+                Some(DialDestination { udp_addr: dest.udp_addr, host: dest.host.clone() });
             let conn = Arc::clone(&self.conn) as Arc<dyn QuicConn>;
             Box::pin(async move { Ok(conn) })
         }
@@ -676,8 +654,15 @@ mod tests {
         fn open_stream(
             &self,
             _conn: &Arc<dyn QuicConn>,
-        ) -> Pin<Box<dyn Future<Output = std::io::Result<Arc<dyn xray_transport_hysteria::conn::QuicStream>>> + Send>>
-        {
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = std::io::Result<
+                            Arc<dyn xray_transport_hysteria::conn::QuicStream>,
+                        >,
+                    > + Send,
+            >,
+        > {
             Box::pin(async { Err(std::io::Error::other("mock: udp-only transport")) })
         }
     }
@@ -688,14 +673,10 @@ mod tests {
     async fn domain_server_addr_resolved_before_dial() {
         let (mock_conn, _seen) = MockEchoConn::new();
         let captured: Arc<parking_lot::Mutex<Option<DialDestination>>> = Arc::default();
-        let transport = CaptureTransport {
-            conn: mock_conn,
-            captured: Arc::clone(&captured),
-        };
+        let transport = CaptureTransport { conn: mock_conn, captured: Arc::clone(&captured) };
         // 生产路径 outbound.rs: HysteriaConfig::new(addr, auth).with_server_name(sni)
         let dial = make_hysteria_dial_fn(
-            HysteriaConfig::new("localhost:443", "auth-token")
-                .with_server_name("sg.example.top"),
+            HysteriaConfig::new("localhost:443", "auth-token").with_server_name("sg.example.top"),
             Arc::new(transport),
         );
 
@@ -706,11 +687,14 @@ mod tests {
         let d = captured.lock().take().expect("transport should have been dialed");
         // localhost 在 Windows hosts 先解析 ::1，Linux/部分环境为 127.0.0.1——
         // 断言"解析为 loopback IP:443"而非特定 v4 地址
-        assert!(d.udp_addr.ip().is_loopback(), "localhost should resolve to loopback, got {}", d.udp_addr);
+        assert!(
+            d.udp_addr.ip().is_loopback(),
+            "localhost should resolve to loopback, got {}",
+            d.udp_addr
+        );
         assert_eq!(d.udp_addr.port(), 443);
         assert_eq!(d.host, "sg.example.top");
     }
-
 
     #[test]
     fn parse_udp_source_handles_domain_ip_and_ipv6() {

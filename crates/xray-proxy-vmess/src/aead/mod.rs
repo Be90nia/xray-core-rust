@@ -8,15 +8,18 @@
 //! - **OpenVMessAEADHeader**：服务端解密 AEAD 请求头
 //! - **AuthIDDecoderHolder**：服务端多用户认证 + 反重放
 
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    sync::Mutex,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use aes::cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyInit};
-use aes::Aes128;
+use aes::{
+    Aes128,
+    cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray},
+};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-
 use xray_common::antireplay::{MapFilter, ReplayFilter};
 use xray_crypto::aead::{AeadCipher, Aes128Gcm};
 type HmacSha256 = Hmac<Sha256>;
@@ -89,7 +92,10 @@ fn compute_pads(key: &[u8]) -> ([u8; HMAC_BLOCK_LEN], [u8; HMAC_BLOCK_LEN]) {
         ikey[..32].copy_from_slice(&h);
         okey[..32].copy_from_slice(&h);
         return {
-            for i in 0..HMAC_BLOCK_LEN { ikey[i] ^= 0x36; okey[i] ^= 0x5c; }
+            for i in 0..HMAC_BLOCK_LEN {
+                ikey[i] ^= 0x36;
+                okey[i] ^= 0x5c;
+            }
             (ikey, okey)
         };
     } else {
@@ -97,7 +103,10 @@ fn compute_pads(key: &[u8]) -> ([u8; HMAC_BLOCK_LEN], [u8; HMAC_BLOCK_LEN]) {
     };
     ikey[..k.len()].copy_from_slice(k);
     okey[..k.len()].copy_from_slice(k);
-    for i in 0..HMAC_BLOCK_LEN { ikey[i] ^= 0x36; okey[i] ^= 0x5c; }
+    for i in 0..HMAC_BLOCK_LEN {
+        ikey[i] ^= 0x36;
+        okey[i] ^= 0x5c;
+    }
     (ikey, okey)
 }
 
@@ -162,7 +171,7 @@ pub fn kdf_paths(key: &[u8], paths: &[&[u8]]) -> Vec<u8> {
         n => {
             tracing::warn!("VMess KDF: truncating {n} path segments to 3");
             l3(paths[0], paths[1], paths[2], key).to_vec()
-        }
+        },
     }
 }
 
@@ -308,19 +317,11 @@ pub fn seal_vmess_aead_header(
     // 加密 payload
     let payload_key = kdf16_paths(
         cmd_key,
-        &[
-            consts::VMESS_HEADER_PAYLOAD_AEAD_KEY.as_bytes(),
-            &path_segments[0],
-            &path_segments[1],
-        ],
+        &[consts::VMESS_HEADER_PAYLOAD_AEAD_KEY.as_bytes(), &path_segments[0], &path_segments[1]],
     );
     let payload_iv_full = kdf_paths(
         cmd_key,
-        &[
-            consts::VMESS_HEADER_PAYLOAD_AEAD_IV.as_bytes(),
-            &path_segments[0],
-            &path_segments[1],
-        ],
+        &[consts::VMESS_HEADER_PAYLOAD_AEAD_IV.as_bytes(), &path_segments[0], &path_segments[1]],
     );
     let payload_nonce = &payload_iv_full[..12];
     let payload_cipher = Aes128Gcm::new(&payload_key)?;
@@ -401,22 +402,18 @@ pub fn open_vmess_aead_header<R: std::io::Read>(
     // 解密 length（aad = authID）
     let len_key = kdf16_paths(
         cmd_key,
-        &[
-            consts::VMESS_HEADER_PAYLOAD_LENGTH_AEAD_KEY.as_bytes(),
-            auth_id,
-            &nonce,
-        ],
+        &[consts::VMESS_HEADER_PAYLOAD_LENGTH_AEAD_KEY.as_bytes(), auth_id, &nonce],
     );
     let len_iv_full = kdf_paths(
         cmd_key,
-        &[
-            consts::VMESS_HEADER_PAYLOAD_LENGTH_AEAD_IV.as_bytes(),
-            auth_id,
-            &nonce,
-        ],
+        &[consts::VMESS_HEADER_PAYLOAD_LENGTH_AEAD_IV.as_bytes(), auth_id, &nonce],
     );
     let len_nonce = &len_iv_full[..12];
-    let len_cipher = Aes128Gcm::new(&len_key).map_err(|e| OpenHeaderError::Crypto { msg: e.to_string(), should_drain: true, bytes_read })?;
+    let len_cipher = Aes128Gcm::new(&len_key).map_err(|e| OpenHeaderError::Crypto {
+        msg: e.to_string(),
+        should_drain: true,
+        bytes_read,
+    })?;
     let decrypted_len_bytes = match len_cipher.open(len_nonce, auth_id, &encrypted_len) {
         Ok(v) => v,
         Err(e) => {
@@ -425,7 +422,7 @@ pub fn open_vmess_aead_header<R: std::io::Read>(
                 should_drain: true,
                 bytes_read,
             });
-        }
+        },
     };
     let length = u16::from_be_bytes([decrypted_len_bytes[0], decrypted_len_bytes[1]]);
 
@@ -435,24 +432,16 @@ pub fn open_vmess_aead_header<R: std::io::Read>(
     bytes_read += encrypted_payload.len();
 
     // 解密 payload（aad = authID）
-    let payload_key = kdf16_paths(
-        cmd_key,
-        &[
-            consts::VMESS_HEADER_PAYLOAD_AEAD_KEY.as_bytes(),
-            auth_id,
-            &nonce,
-        ],
-    );
-    let payload_iv_full = kdf_paths(
-        cmd_key,
-        &[
-            consts::VMESS_HEADER_PAYLOAD_AEAD_IV.as_bytes(),
-            auth_id,
-            &nonce,
-        ],
-    );
+    let payload_key =
+        kdf16_paths(cmd_key, &[consts::VMESS_HEADER_PAYLOAD_AEAD_KEY.as_bytes(), auth_id, &nonce]);
+    let payload_iv_full =
+        kdf_paths(cmd_key, &[consts::VMESS_HEADER_PAYLOAD_AEAD_IV.as_bytes(), auth_id, &nonce]);
     let payload_nonce = &payload_iv_full[..12];
-    let payload_cipher = Aes128Gcm::new(&payload_key).map_err(|e| OpenHeaderError::Crypto { msg: e.to_string(), should_drain: true, bytes_read })?;
+    let payload_cipher = Aes128Gcm::new(&payload_key).map_err(|e| OpenHeaderError::Crypto {
+        msg: e.to_string(),
+        should_drain: true,
+        bytes_read,
+    })?;
     let payload = match payload_cipher.open(payload_nonce, auth_id, &encrypted_payload) {
         Ok(v) => v,
         Err(e) => {
@@ -463,14 +452,10 @@ pub fn open_vmess_aead_header<R: std::io::Read>(
                 should_drain: true,
                 bytes_read,
             });
-        }
+        },
     };
 
-    Ok(OpenHeaderResult {
-        payload,
-        should_drain: false,
-        bytes_read,
-    })
+    Ok(OpenHeaderResult { payload, should_drain: false, bytes_read })
 }
 
 // ============================================================================
@@ -540,18 +525,12 @@ impl AuthIDDecoderHolder {
     /// 创建空 holder。
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            items: Mutex::new(HashMap::new()),
-            replay_filter: Mutex::new(MapFilter::new(120)),
-        }
+        Self { items: Mutex::new(HashMap::new()), replay_filter: Mutex::new(MapFilter::new(120)) }
     }
 
     /// 添加用户（key = cmdKey）。
     pub fn add_user(&self, key: [u8; 16]) {
-        self.items
-            .lock()
-            .expect("items poisoned")
-            .insert(key, AuthIDDecoderItem::new(key));
+        self.items.lock().expect("items poisoned").insert(key, AuthIDDecoderItem::new(key));
     }
 
     /// 移除用户。
@@ -615,8 +594,9 @@ impl Default for AuthIDDecoderHolder {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use xray_common::uuid::UUID;
+
+    use super::*;
 
     fn sample_cmd_key() -> [u8; 16] {
         let uuid = UUID::parse("66ad4540-b58c-4ad2-9926-ea63445a9b57").expect("uuid");
@@ -624,10 +604,7 @@ mod tests {
     }
 
     fn now_unix() -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
     }
 
     // === KDF 测试 ===
@@ -679,38 +656,58 @@ mod tests {
         assert_eq!(out.len(), 32);
     }
 
-
     fn hex_to_bytes(s: &str) -> Vec<u8> {
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i+2], 16).unwrap()).collect()
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
     }
 
     #[test]
     fn kdf_go_compat_known_vectors() {
         // Go 参考值: KDF16("Demo Key for Auth ID Test", "Demo Path for Auth ID Test")
         let go_vec1 = kdf16(b"Demo Key for Auth ID Test", &["Demo Path for Auth ID Test"]);
-        assert_eq!(&go_vec1[..], hex_to_bytes("66e41ad47fa745fbfd1e97325e93dbf4"),
-            "KDF16 mismatch with Go reference (simple path)");
+        assert_eq!(
+            &go_vec1[..],
+            hex_to_bytes("66e41ad47fa745fbfd1e97325e93dbf4"),
+            "KDF16 mismatch with Go reference (simple path)"
+        );
 
         // Go 参考值: KDF16(0x00*16, "AES Auth ID Encryption")
         let go_vec2 = kdf16(&[0u8; 16], &["AES Auth ID Encryption"]);
-        assert_eq!(&go_vec2[..], hex_to_bytes("2114985832a5bad7b65a0f72c3c73329"),
-            "KDF16 mismatch with Go reference (zero key)");
+        assert_eq!(
+            &go_vec2[..],
+            hex_to_bytes("2114985832a5bad7b65a0f72c3c73329"),
+            "KDF16 mismatch with Go reference (zero key)"
+        );
 
         // Go L3 参考值: KDF16(key, "VMess Header AEAD Key_Length", authID_0*16, nonce_0*8)
         let l3_key = kdf16_paths(
             b"Demo Key for Auth ID Test",
             &[b"VMess Header AEAD Key_Length", &[0u8; 16][..], &[0u8; 8][..]],
         );
-        assert_eq!(&l3_key[..], hex_to_bytes("4f78a9bb23d8386f79ca39db0dccf0db"),
-            "L3 KDF16 mismatch: {:02x?}", l3_key);
+        assert_eq!(
+            &l3_key[..],
+            hex_to_bytes("4f78a9bb23d8386f79ca39db0dccf0db"),
+            "L3 KDF16 mismatch: {:02x?}",
+            l3_key
+        );
 
         // Go L3 with non-zero authID/nonce
         let l3_key2 = kdf16_paths(
             b"Demo Key for Auth ID Test",
-            &[b"VMess Header AEAD Key_Length", &[0x01u8,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10][..], &[0xAAu8,0xBB,0xCC,0xDD,0xEE,0xFF,0x00,0x11][..]],
+            &[
+                b"VMess Header AEAD Key_Length",
+                &[
+                    0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+                    0x0e, 0x0f, 0x10,
+                ][..],
+                &[0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11][..],
+            ],
         );
-        assert_eq!(&l3_key2[..], hex_to_bytes("b31ccb5a152bcc9759e76d0ced86fe4d"),
-            "L3 KDF16 mismatch (nonzero): {:02x?}", l3_key2);
+        assert_eq!(
+            &l3_key2[..],
+            hex_to_bytes("b31ccb5a152bcc9759e76d0ced86fe4d"),
+            "L3 KDF16 mismatch (nonzero): {:02x?}",
+            l3_key2
+        );
     }
 
     // === CreateAuthID 测试 ===
@@ -894,13 +891,7 @@ mod tests {
         auth_id.copy_from_slice(&sealed[..16]);
         let mut reader = &sealed[16..];
         let err = open_vmess_aead_header(&wrong_key, &auth_id, &mut reader).unwrap_err();
-        assert!(matches!(
-            err,
-            OpenHeaderError::Crypto {
-                should_drain: true,
-                ..
-            }
-        ));
+        assert!(matches!(err, OpenHeaderError::Crypto { should_drain: true, .. }));
     }
 
     #[test]

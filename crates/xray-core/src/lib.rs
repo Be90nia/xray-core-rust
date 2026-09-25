@@ -11,8 +11,8 @@
 //!
 //! ## 与 Go 差异
 //!
-//! - **DI**：Go 用 `reflect.TypeOf(callback).NumIn()` 扫描回调参数注入 features。
-//!   Rust 不自然，改用显式 `instance.get_feature::<T>()` API（编译期类型安全）。
+//! - **DI**：Go 用 `reflect.TypeOf(callback).NumIn()` 扫描回调参数注入 features。 Rust
+//!   不自然，改用显式 `instance.get_feature::<T>()` API（编译期类型安全）。
 //! - **Context**：Go 用 `context.Context` 携带 `*Instance`。Rust 用 [`tokio::task_local`]
 //!   线程局部变量 + 显式 `Arc<Instance>` 参数双轨制。
 //! - **Feature 标识**：Go 用占位指针 `Type() interface{}`。Rust 用 [`TypeId`](std::any::TypeId)。
@@ -21,7 +21,8 @@
 //!
 //! ```no_run
 //! use std::sync::Arc;
-//! use xray_core::{Instance, Feature};
+//!
+//! use xray_core::{Feature, Instance};
 //! use xray_features::Feature as _;
 //!
 //! struct MyFeature;
@@ -35,25 +36,22 @@
 //! ```
 
 pub mod config;
-pub mod grpc_server;
 pub mod context;
 pub mod functions;
+pub mod grpc_server;
+pub mod inbound;
 pub mod instance;
 pub mod outbound;
 pub mod register;
 pub mod router;
-pub mod inbound;
-pub mod wiring;
 pub mod version;
+pub mod wiring;
 
 // 顶层 re-export：常用类型直接从 crate 根访问。
+pub use functions::{CoreFunctionError, start_from_built, start_full, start_instance};
 pub use instance::Instance;
-pub use version::{version, version_statement, VERSION_X, VERSION_Y, VERSION_Z};
-
+pub use register::{register_all_features, register_all_transports};
+pub use version::{VERSION_X, VERSION_Y, VERSION_Z, version, version_statement};
 // 从 xray-features re-export Feature trait，让下游无需直接依赖 xray-features
 // 即可定义自己的 Feature 实现。
 pub use xray_features::{Feature, FeatureError};
-
-pub use functions::{start_from_built, start_full, start_instance, CoreFunctionError};
-pub use register::register_all_features;
-pub use register::register_all_transports;

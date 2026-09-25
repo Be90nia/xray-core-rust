@@ -11,45 +11,28 @@ fn xray_bin() -> String {
 
 #[test]
 fn cli_version_outputs_version_string() {
-    let output = Command::new(xray_bin())
-        .arg("version")
-        .output()
-        .expect("failed to run xray version");
+    let output =
+        Command::new(xray_bin()).arg("version").output().expect("failed to run xray version");
     assert!(output.status.success(), "xray version should exit 0");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Xray"), "output should contain 'Xray': {stdout}");
-    assert!(
-        stdout.contains("26."),
-        "output should contain version 26.x: {stdout}"
-    );
+    assert!(stdout.contains("26."), "output should contain version 26.x: {stdout}");
 }
 
 #[test]
 fn cli_uuid_outputs_valid_uuid_v4() {
-    let output = Command::new(xray_bin())
-        .arg("uuid")
-        .output()
-        .expect("failed to run xray uuid");
+    let output = Command::new(xray_bin()).arg("uuid").output().expect("failed to run xray uuid");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let parsed = uuid::Uuid::parse_str(&stdout);
-    assert!(
-        parsed.is_ok(),
-        "xray uuid output should be a valid UUID: '{stdout}'"
-    );
-    assert_eq!(
-        parsed.unwrap().get_version(),
-        Some(uuid::Version::Random),
-        "should be UUID v4"
-    );
+    assert!(parsed.is_ok(), "xray uuid output should be a valid UUID: '{stdout}'");
+    assert_eq!(parsed.unwrap().get_version(), Some(uuid::Version::Random), "should be UUID v4");
 }
 
 #[test]
 fn cli_help_lists_all_subcommands() {
-    let output = Command::new(xray_bin())
-        .arg("--help")
-        .output()
-        .expect("failed to run xray --help");
+    let output =
+        Command::new(xray_bin()).arg("--help").output().expect("failed to run xray --help");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     for cmd in [
@@ -64,10 +47,7 @@ fn cli_help_lists_all_subcommands() {
         "mlkem768",
         "vlessenc",
     ] {
-        assert!(
-            stdout.contains(cmd),
-            "help should list '{cmd}' command: {stdout}"
-        );
+        assert!(stdout.contains(cmd), "help should list '{cmd}' command: {stdout}");
     }
 }
 
@@ -90,17 +70,12 @@ fn cli_x25519_from_private_key_matches_go() {
 /// `xray curve25519` 别名与 `x25519` 同实现（随机模式输出三行）。
 #[test]
 fn cli_curve25519_alias_outputs_key_pair() {
-    let output = Command::new(xray_bin())
-        .arg("curve25519")
-        .output()
-        .expect("failed to run xray curve25519");
+    let output =
+        Command::new(xray_bin()).arg("curve25519").output().expect("failed to run xray curve25519");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     for prefix in ["PrivateKey: ", "Password (PublicKey): ", "Hash32: "] {
-        assert!(
-            stdout.contains(prefix),
-            "curve25519 output should contain '{prefix}': {stdout}"
-        );
+        assert!(stdout.contains(prefix), "curve25519 output should contain '{prefix}': {stdout}");
     }
 }
 
@@ -132,10 +107,7 @@ fn cli_mldsa65_from_seed_matches_go() {
         .expect("failed to run xray mldsa65 -i");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let verify = stdout
-        .lines()
-        .find(|l| l.starts_with("Verify: "))
-        .expect("Verify line");
+    let verify = stdout.lines().find(|l| l.starts_with("Verify: ")).expect("Verify line");
     assert_eq!(verify.len(), 8 + 2603, "ML-DSA-65 verify key: 1952B → 2603 b64 chars");
     assert!(
         verify.starts_with("Verify: SGg9kZeOMes93biwRzSC0riKX2JZSf2PWKVh5pa9TCfQ"),
@@ -156,10 +128,7 @@ fn cli_mlkem768_from_seed_matches_go() {
         .expect("failed to run xray mlkem768 -i");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let client = stdout
-        .lines()
-        .find(|l| l.starts_with("Client: "))
-        .expect("Client line");
+    let client = stdout.lines().find(|l| l.starts_with("Client: ")).expect("Client line");
     assert_eq!(client.len(), 8 + 1579, "ML-KEM-768 ek: 1184B → 1579 b64 chars");
     assert!(
         client.starts_with("Client: KYqhDUI8jdoGnQK8WebN8DoJa4s9pMq5uAykoUkHZyz"),
@@ -174,10 +143,8 @@ fn cli_mlkem768_from_seed_matches_go() {
 /// `xray vlessenc`：9 行固定格式（X25519 对 + ML-KEM-768 对）。
 #[test]
 fn cli_vlessenc_outputs_config_pair() {
-    let output = Command::new(xray_bin())
-        .arg("vlessenc")
-        .output()
-        .expect("failed to run xray vlessenc");
+    let output =
+        Command::new(xray_bin()).arg("vlessenc").output().expect("failed to run xray vlessenc");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     for needle in [
@@ -187,10 +154,7 @@ fn cli_vlessenc_outputs_config_pair() {
         "\"encryption\": \"mlkem768x25519plus.native.0rtt.",
         "Authentication: ML-KEM-768, Post-Quantum",
     ] {
-        assert!(
-            stdout.contains(needle),
-            "vlessenc output should contain '{needle}': {stdout}"
-        );
+        assert!(stdout.contains(needle), "vlessenc output should contain '{needle}': {stdout}");
     }
 }
 

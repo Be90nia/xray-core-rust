@@ -5,13 +5,15 @@
 //! `transport/internet/quic/hub.go::init()` 中的
 //! `internet.RegisterTransportListener(protocolName, Listen(...))`。
 //!
-//! 协议名 `"quic"`（对应 `xray_transport::dialer::protocol_settings_key("quic")` → `"quicSettings"`）。
+//! 协议名 `"quic"`（对应 `xray_transport::dialer::protocol_settings_key("quic")` →
+//! `"quicSettings"`）。
 
-use std::io;
-use std::sync::Arc;
+use std::{io, sync::Arc};
 
-use xray_transport::dialer::{TransportDialFn, register_transport_dialer};
-use xray_transport::listener_registry::{TransportListenFn, register_transport_listener};
+use xray_transport::{
+    dialer::{TransportDialFn, register_transport_dialer},
+    listener_registry::{TransportListenFn, register_transport_listener},
+};
 
 /// 注册 QUIC transport dialer。
 ///
@@ -43,8 +45,9 @@ pub fn register_listener() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use xray_transport::dialer::get_transport_dialer;
+
+    use super::*;
 
     #[test]
     fn register_dialer_registers_quic() {

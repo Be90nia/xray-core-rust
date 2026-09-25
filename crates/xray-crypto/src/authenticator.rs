@@ -1,4 +1,4 @@
-﻿//! Authenticator trait and implementations.
+//! Authenticator trait and implementations.
 //!
 //! 对应 Go 版本 `common/crypto/auth.go`，定义认证加密接口和 AEAD 实现。
 //!
@@ -8,8 +8,9 @@
 //! - [`AEADAuthenticator`] — 基于 AeadCipher 的实现
 //! - [`BytesGenerator`] — 字节生成器（nonce/aad 生成）
 
-use crate::aead::{AeadCipher, CryptoError};
 use std::sync::Mutex;
+
+use crate::aead::{AeadCipher, CryptoError};
 
 // ========== BytesGenerator ==========
 
@@ -98,11 +99,7 @@ impl<A: AeadCipher + Send + Sync> AEADAuthenticator<A> {
         nonce_generator: BytesGenerator,
         additional_data_generator: Option<BytesGenerator>,
     ) -> Self {
-        Self {
-            cipher,
-            nonce_generator,
-            additional_data_generator,
-        }
+        Self { cipher, nonce_generator, additional_data_generator }
     }
 }
 
@@ -123,11 +120,7 @@ impl<A: AeadCipher + Send + Sync> Authenticator for AEADAuthenticator<A> {
                 actual: iv.len(),
             });
         }
-        let aad = self
-            .additional_data_generator
-            .as_ref()
-            .map(|g| g())
-            .unwrap_or_default();
+        let aad = self.additional_data_generator.as_ref().map(|g| g()).unwrap_or_default();
         self.cipher.open(&iv, &aad, ciphertext)
     }
 
@@ -139,11 +132,7 @@ impl<A: AeadCipher + Send + Sync> Authenticator for AEADAuthenticator<A> {
                 actual: iv.len(),
             });
         }
-        let aad = self
-            .additional_data_generator
-            .as_ref()
-            .map(|g| g())
-            .unwrap_or_default();
+        let aad = self.additional_data_generator.as_ref().map(|g| g()).unwrap_or_default();
         self.cipher.seal(&iv, &aad, plaintext)
     }
 }
@@ -164,11 +153,7 @@ impl DynamicAEADAuthenticator {
         nonce_generator: BytesGenerator,
         additional_data_generator: Option<BytesGenerator>,
     ) -> Self {
-        Self {
-            cipher,
-            nonce_generator,
-            additional_data_generator,
-        }
+        Self { cipher, nonce_generator, additional_data_generator }
     }
 }
 
@@ -185,16 +170,9 @@ impl Authenticator for DynamicAEADAuthenticator {
         let iv = (self.nonce_generator)();
         let expected = self.cipher.nonce_size();
         if iv.len() != expected {
-            return Err(CryptoError::InvalidNonceLength {
-                expected,
-                actual: iv.len(),
-            });
+            return Err(CryptoError::InvalidNonceLength { expected, actual: iv.len() });
         }
-        let aad = self
-            .additional_data_generator
-            .as_ref()
-            .map(|g| g())
-            .unwrap_or_default();
+        let aad = self.additional_data_generator.as_ref().map(|g| g()).unwrap_or_default();
         self.cipher.open(&iv, &aad, ciphertext)
     }
 
@@ -202,16 +180,9 @@ impl Authenticator for DynamicAEADAuthenticator {
         let iv = (self.nonce_generator)();
         let expected = self.cipher.nonce_size();
         if iv.len() != expected {
-            return Err(CryptoError::InvalidNonceLength {
-                expected,
-                actual: iv.len(),
-            });
+            return Err(CryptoError::InvalidNonceLength { expected, actual: iv.len() });
         }
-        let aad = self
-            .additional_data_generator
-            .as_ref()
-            .map(|g| g())
-            .unwrap_or_default();
+        let aad = self.additional_data_generator.as_ref().map(|g| g()).unwrap_or_default();
         self.cipher.seal(&iv, &aad, plaintext)
     }
 }
@@ -339,10 +310,7 @@ mod tests {
         let c = Aes128Gcm::new(&[0u8; 16]).unwrap();
         let auth = AEADAuthenticator::new(c, generate_static_bytes(vec![0u8; 8]), None);
         let r = auth.seal(&mut [], b"test");
-        assert!(matches!(
-            r,
-            Err(CryptoError::InvalidNonceLength { expected: 12, actual: 8 })
-        ));
+        assert!(matches!(r, Err(CryptoError::InvalidNonceLength { expected: 12, actual: 8 })));
     }
 
     #[test]
@@ -381,11 +349,9 @@ mod tests {
 
     #[test]
     fn test_dynamic_auth_roundtrip() {
-        let c1: Box<dyn AeadCipher + Send + Sync> =
-            Box::new(Aes128Gcm::new(&[0u8; 16]).unwrap());
+        let c1: Box<dyn AeadCipher + Send + Sync> = Box::new(Aes128Gcm::new(&[0u8; 16]).unwrap());
         let auth_s = DynamicAEADAuthenticator::new(c1, generate_static_bytes(vec![0u8; 12]), None);
-        let c2: Box<dyn AeadCipher + Send + Sync> =
-            Box::new(Aes128Gcm::new(&[0u8; 16]).unwrap());
+        let c2: Box<dyn AeadCipher + Send + Sync> = Box::new(Aes128Gcm::new(&[0u8; 16]).unwrap());
         let auth_o = DynamicAEADAuthenticator::new(c2, generate_static_bytes(vec![0u8; 12]), None);
         let sealed = auth_s.seal(&mut [], b"dynamic").unwrap();
         let opened = auth_o.open(&mut [], &sealed).unwrap();

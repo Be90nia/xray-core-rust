@@ -5,39 +5,42 @@
 //! 每个 worker 持有一个 transport listener（TCP/UDP/Unix），accept 后构造
 //! `Session` 并调用 `ProxyInbound::process()` 交给具体代理协议处理。
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::Mutex;
-use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicI64, Ordering},
+    },
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use parking_lot::RwLock;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{mpsc, Notify};
-use tokio::task::JoinHandle;
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    sync::{Notify, mpsc},
+    task::JoinHandle,
+};
 use tracing::{info, warn};
-
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-use xray_common::session::{Inbound, Outbound, Session};
-use xray_features::stats::Counter;
+use xray_common::{
+    net::{address::Address, destination::Destination, network::Network, port::Port},
+    session::{Inbound, Outbound, Session},
+    signal::ActivityTimer,
+};
+use xray_features::{policy::DEFAULT_CONN_IDLE_TIMEOUT, stats::Counter};
 use xray_mux::worker::Dispatcher;
-use xray_transport::connection::Connection;
-use xray_transport::dialer::StreamSettings;
-use xray_transport::listener_registry::{ConnHandler, TransportListener, listen_tcp};
-use xray_transport::sockopt::SocketOptions;
-use xray_transport::udp::hub::{Capacity, HubOption, UdpHub, UdpPacket};
-use xray_common::signal::ActivityTimer;
-use xray_features::policy::DEFAULT_CONN_IDLE_TIMEOUT;
+use xray_transport::{
+    connection::Connection,
+    dialer::StreamSettings,
+    listener_registry::{ConnHandler, TransportListener, listen_tcp},
+    sockopt::SocketOptions,
+    udp::hub::{Capacity, HubOption, UdpHub, UdpPacket},
+};
 
-use crate::config::SniffingRequest;
-use crate::error::ProxymanError;
+use crate::{config::SniffingRequest, error::ProxymanError};
 
 // ===== ProxyInbound trait =====
 
@@ -115,8 +118,8 @@ impl UdpSession {
     ///
     /// Go `udpConn` 双 channel 同构（worker.go）：
     /// - 入方向：hub 收包 `push_inbound` 写入，proxy 经 `recv()` 消费；
-    /// - 出方向：proxy `write_packet` 写入，**返回的 Receiver** 由 worker
-    ///   响应泵消费后 `hub.send_to(source)` 回包（Go `for p := range conn.writing`）。
+    /// - 出方向：proxy `write_packet` 写入，**返回的 Receiver** 由 worker 响应泵消费后
+    ///   `hub.send_to(source)` 回包（Go `for p := range conn.writing`）。
     ///
     /// 修复（audit ojcy）：旧实现 `(tx, _rx)` 将消费端随 new 返回即丢弃，
     /// write_packet 恒失败且无人可达——收发端就此全断。
@@ -301,21 +304,13 @@ impl TcpWorker {
         let proxy = Arc::clone(&self.proxy);
         let dispatcher = Arc::clone(&self.dispatcher);
 
-        let inbound = Inbound::new()
-            .with_tag(&tag)
-            .with_network(Network::TCP);
+        let inbound = Inbound::new().with_tag(&tag).with_network(Network::TCP);
 
-        let gateway = Destination::new(
-            Address::from(address.ip()),
-            Port::new(port),
-            Network::TCP,
-        );
+        let gateway = Destination::new(Address::from(address.ip()), Port::new(port), Network::TCP);
 
         let session = Session::new()
             .with_inbound(inbound)
-            .with_outbound(
-                Outbound::new().with_destination_override(gateway),
-            );
+            .with_outbound(Outbound::new().with_destination_override(gateway));
 
         // 不活动计时器（Go CancelAfterInactivity）：Arc 共享——run 循环 task
         // 与 IO 装饰器同时持引用，读写路径经装饰器持续 update_activity。
@@ -331,10 +326,8 @@ impl TcpWorker {
 
         // IO 活动装饰器：每次读/写就绪即重置空闲窗口（Go 代理 IO 循环 Update）。
         // proxy 是黑盒 trait，活动信号在 Connection 层拦截——有 IO 即有活动。
-        let tracked: Box<dyn Connection> = Box::new(ActivityTrackingConn {
-            inner: conn,
-            timer: activity_timer,
-        });
+        let tracked: Box<dyn Connection> =
+            Box::new(ActivityTrackingConn { inner: conn, timer: activity_timer });
         // bd mvsc：task 挂 worker 生命周期信号（同构响应泵 close_notify 先例），
         // worker close 唤醒后连接 task 随 select 退出——无孤儿。
         let close_notify = Arc::clone(&self.close_notify);
@@ -441,19 +434,12 @@ impl Worker for TcpWorker {
             this.on_conn(conn);
         });
 
-        let listener = listen_tcp(
-            self.address,
-            self.stream_settings.clone(),
-            self.sockopt.clone(),
-            handler,
-        )
-        .await
-        .map_err(|e| ProxymanError::ListenSocketFailed(e.to_string()))?;
+        let listener =
+            listen_tcp(self.address, self.stream_settings.clone(), self.sockopt.clone(), handler)
+                .await
+                .map_err(|e| ProxymanError::ListenSocketFailed(e.to_string()))?;
 
-        let actual_port = listener
-            .local_addr()
-            .map(|a| a.port())
-            .unwrap_or(self.port);
+        let actual_port = listener.local_addr().map(|a| a.port()).unwrap_or(self.port);
 
         info!(
             tag = %self.tag,
@@ -476,11 +462,7 @@ impl Worker for TcpWorker {
         self.closed.store(true, Ordering::SeqCst);
         self.close_notify.notify_waiters();
 
-        let listener = self
-            .listener
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        let listener = self.listener.lock().unwrap_or_else(|e| e.into_inner()).take();
 
         if let Some(l) = listener {
             l.close().map_err(|e| ProxymanError::CloseAllFailed(e.to_string()))?;
@@ -494,7 +476,6 @@ impl Worker for TcpWorker {
         self.port
     }
 }
-
 
 // ===== UdpWorker =====
 
@@ -594,9 +575,7 @@ impl UdpWorker {
         session.push_inbound(packet.payload.clone());
 
         // 注册 session
-        self.active_sessions
-            .write()
-            .insert(source, Arc::clone(&session));
+        self.active_sessions.write().insert(source, Arc::clone(&session));
 
         // spawn proxy.process()
         let tag = self.tag.clone();
@@ -605,21 +584,13 @@ impl UdpWorker {
         let proxy = Arc::clone(&self.proxy);
         let dispatcher = Arc::clone(&self.dispatcher);
 
-        let inbound = Inbound::new()
-            .with_tag(&tag)
-            .with_network(Network::UDP);
+        let inbound = Inbound::new().with_tag(&tag).with_network(Network::UDP);
 
-        let gateway = Destination::new(
-            Address::from(address.ip()),
-            Port::new(port),
-            Network::UDP,
-        );
+        let gateway = Destination::new(Address::from(address.ip()), Port::new(port), Network::UDP);
 
         let session_ctx = Session::new()
             .with_inbound(inbound)
-            .with_outbound(
-                Outbound::new().with_destination_override(gateway),
-            );
+            .with_outbound(Outbound::new().with_destination_override(gateway));
 
         let pump_session = Arc::clone(&session);
         // bd mvsc：process task 挂 close_notify，worker close 时随 select 退出
@@ -640,12 +611,7 @@ impl UdpWorker {
 
         // 响应泵（Go worker.go `for p := range conn.writing { hub.WriteTo }`）：
         // proxy write_packet → 本循环 → hub.send_to(session.source) 回客户端。
-        let hub = self
-            .hub
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .map(Arc::clone);
+        let hub = self.hub.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(Arc::clone);
         if let Some(hub) = hub {
             let close_notify = Arc::clone(&self.close_notify);
             tokio::spawn(async move {
@@ -705,10 +671,7 @@ impl Worker for UdpWorker {
             .await
             .map_err(|e| ProxymanError::ListenSocketFailed(e.to_string()))?;
 
-        let actual_port = hub
-            .local_addr()
-            .map(|a| a.port())
-            .unwrap_or(self.port);
+        let actual_port = hub.local_addr().map(|a| a.port()).unwrap_or(self.port);
 
         info!(
             tag = %self.tag,
@@ -774,30 +737,18 @@ impl Worker for UdpWorker {
         self.close_notify.notify_waiters();
 
         // Close hub
-        let hub = self
-            .hub
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        let hub = self.hub.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(h) = hub {
             h.close().map_err(|e| ProxymanError::CloseAllFailed(e.to_string()))?;
         }
 
         // Abort handles
-        let recv = self
-            .recv_handle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        let recv = self.recv_handle.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(h) = recv {
             h.abort();
         }
 
-        let cleanup = self
-            .cleanup_handle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        let cleanup = self.cleanup_handle.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(h) = cleanup {
             h.abort();
         }
@@ -816,7 +767,6 @@ impl Worker for UdpWorker {
         self.port
     }
 }
-
 
 // ===== DsWorker =====
 
@@ -840,10 +790,7 @@ impl std::fmt::Debug for DsWorker {
 impl DsWorker {
     /// 构造 Unix domain socket worker。
     pub fn new(tag: impl Into<String>) -> Self {
-        Self {
-            tag: tag.into(),
-            closed: AtomicBool::new(false),
-        }
+        Self { tag: tag.into(), closed: AtomicBool::new(false) }
     }
 }
 
@@ -851,9 +798,7 @@ impl DsWorker {
 impl Worker for DsWorker {
     async fn start(self: Arc<Self>) -> Result<(), ProxymanError> {
         // ponytail: Unix domain socket not yet supported, stub
-        Err(ProxymanError::ListenSocketFailed(
-            "Unix domain socket not yet supported".to_string(),
-        ))
+        Err(ProxymanError::ListenSocketFailed("Unix domain socket not yet supported".to_string()))
     }
 
     async fn close(&self) -> Result<(), ProxymanError> {
@@ -1001,7 +946,7 @@ mod tests {
         match result {
             Err(ProxymanError::ListenSocketFailed(msg)) => {
                 assert!(msg.contains("Unix domain socket"));
-            }
+            },
             Err(e) => panic!("expected ListenSocketFailed, got: {e}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
@@ -1237,10 +1182,7 @@ mod tests {
         }
     }
 
-    fn tcp_worker_for_test(
-        proxy: Arc<dyn ProxyInbound>,
-        tag: &str,
-    ) -> Arc<TcpWorker> {
+    fn tcp_worker_for_test(proxy: Arc<dyn ProxyInbound>, tag: &str) -> Arc<TcpWorker> {
         Arc::new(TcpWorker::new(
             "127.0.0.1:0".parse().unwrap(),
             0,
@@ -1256,10 +1198,7 @@ mod tests {
         ))
     }
 
-    fn udp_worker_for_test(
-        proxy: Arc<dyn ProxyInbound>,
-        tag: &str,
-    ) -> Arc<UdpWorker> {
+    fn udp_worker_for_test(proxy: Arc<dyn ProxyInbound>, tag: &str) -> Arc<UdpWorker> {
         Arc::new(UdpWorker::new(
             proxy,
             "127.0.0.1:0".parse().unwrap(),
@@ -1282,10 +1221,8 @@ mod tests {
         let _ = xray_transport::tcp::register_tcp_transport();
 
         let hits = Arc::new(AtomicUsize::new(0));
-        let worker = tcp_worker_for_test(
-            Arc::new(HitProxy { hits: Arc::clone(&hits) }),
-            "tcp-accept-test",
-        );
+        let worker =
+            tcp_worker_for_test(Arc::new(HitProxy { hits: Arc::clone(&hits) }), "tcp-accept-test");
 
         // 旧实现 trait start 为 unreachable!——start 即 panic；且 hub 不 spawn
         // accept loop——bind 后永不 accept。此测试同时覆盖两条修复。
@@ -1301,9 +1238,7 @@ mod tests {
         };
 
         let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
-        tokio::io::AsyncWriteExt::write_all(&mut client, b"ping")
-            .await
-            .expect("write");
+        tokio::io::AsyncWriteExt::write_all(&mut client, b"ping").await.expect("write");
 
         tokio::time::timeout(Duration::from_secs(2), async {
             while hits.load(Ordering::SeqCst) == 0 {
@@ -1319,19 +1254,13 @@ mod tests {
     #[tokio::test]
     async fn udp_worker_start_delivers_and_replies() {
         let (got_tx, mut got_rx) = mpsc::channel::<Vec<u8>>(8);
-        let worker = udp_worker_for_test(
-            Arc::new(UdpEchoProxy { got: got_tx }),
-            "udp-e2e",
-        );
+        let worker = udp_worker_for_test(Arc::new(UdpEchoProxy { got: got_tx }), "udp-e2e");
 
         Arc::clone(&worker).start().await.expect("udp worker start");
 
         let hub_addr = {
             let hub = worker.hub.lock().unwrap_or_else(|e| e.into_inner());
-            hub.as_ref()
-                .expect("hub stored after start")
-                .local_addr()
-                .expect("local_addr")
+            hub.as_ref().expect("hub stored after start").local_addr().expect("local_addr")
         };
 
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind");
@@ -1359,16 +1288,11 @@ mod tests {
     #[tokio::test]
     async fn tcp_worker_idle_conn_cancelled_without_io() {
         let (started_tx, mut started_rx) = mpsc::channel::<()>(1);
-        let worker = tcp_worker_for_test(
-            Arc::new(HangingProxy { started: started_tx }),
-            "idle-test",
-        );
+        let worker =
+            tcp_worker_for_test(Arc::new(HangingProxy { started: started_tx }), "idle-test");
 
         let (_client, server) = tokio::io::duplex(64);
-        let handle = worker.spawn_conn(
-            Box::new(DuplexConn(server)),
-            Duration::from_millis(150),
-        );
+        let handle = worker.spawn_conn(Box::new(DuplexConn(server)), Duration::from_millis(150));
 
         started_rx.recv().await.expect("proxy never started");
 
@@ -1386,10 +1310,7 @@ mod tests {
         let worker = tcp_worker_for_test(Arc::new(EchoIoProxy), "active-test");
         let (mut client, server) = tokio::io::duplex(64);
 
-        let handle = worker.spawn_conn(
-            Box::new(DuplexConn(server)),
-            Duration::from_millis(100),
-        );
+        let handle = worker.spawn_conn(Box::new(DuplexConn(server)), Duration::from_millis(100));
 
         // 每 50ms 一轮 echo ×4 = 200ms+，两倍于 100ms 空闲窗口：
         // 装饰器在读写路径持续 update_activity → 计时器永不到期。
@@ -1397,9 +1318,7 @@ mod tests {
         for i in 0..4 {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let msg = [b'x'; 8];
-            tokio::io::AsyncWriteExt::write_all(&mut client, &msg)
-                .await
-                .expect("write");
+            tokio::io::AsyncWriteExt::write_all(&mut client, &msg).await.expect("write");
             let mut echo = [0u8; 8];
             tokio::io::AsyncReadExt::read_exact(&mut client, &mut echo)
                 .await
@@ -1407,10 +1326,7 @@ mod tests {
             assert_eq!(&echo, &msg, "echo #{i}");
         }
 
-        assert!(
-            !handle.is_finished(),
-            "active connection killed despite continuous IO"
-        );
+        assert!(!handle.is_finished(), "active connection killed despite continuous IO");
 
         drop(client); // EOF → proxy 退出 → 连接任务结束
         tokio::time::timeout(Duration::from_secs(2), handle)
@@ -1455,10 +1371,7 @@ mod tests {
         let (started_tx, mut started_rx) = mpsc::channel::<()>(1);
         let probe = Arc::new(AtomicBool::new(false));
         let worker = tcp_worker_for_test(
-            Arc::new(ProbeHangingProxy {
-                started: started_tx,
-                probe: Arc::clone(&probe),
-            }),
+            Arc::new(ProbeHangingProxy { started: started_tx, probe: Arc::clone(&probe) }),
             "tcp-close-abort",
         );
         let (_client, server) = tokio::io::duplex(64);
@@ -1479,10 +1392,7 @@ mod tests {
         let (started_tx, mut started_rx) = mpsc::channel::<()>(1);
         let probe = Arc::new(AtomicBool::new(false));
         let worker = udp_worker_for_test(
-            Arc::new(ProbeHangingProxy {
-                started: started_tx,
-                probe: Arc::clone(&probe),
-            }),
+            Arc::new(ProbeHangingProxy { started: started_tx, probe: Arc::clone(&probe) }),
             "udp-close-abort",
         );
         let packet = UdpPacket {

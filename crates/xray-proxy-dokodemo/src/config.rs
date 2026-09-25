@@ -17,12 +17,12 @@
 //! 网络类型校验（[`Config::allows_network`]）。Handler/Process/fakeudp 留切片2
 //! （依赖 transport/session/policy + Linux SO_ORIGINAL_DST syscall）。
 
-use std::collections::HashMap;
-use std::net::IpAddr;
+use std::{collections::HashMap, net::IpAddr};
 
-use xray_proto::xray::common::net::ip_or_domain::Address as ProtoAddress;
-use xray_proto::xray::common::net::IpOrDomain as ProtoIpOrDomain;
-use xray_proto::xray::proxy::dokodemo::Config as ProtoConfig;
+use xray_proto::xray::{
+    common::net::{IpOrDomain as ProtoIpOrDomain, ip_or_domain::Address as ProtoAddress},
+    proxy::dokodemo::Config as ProtoConfig,
+};
 
 use crate::error::Result;
 
@@ -63,7 +63,6 @@ impl Network {
     pub fn to_proto_value(self) -> i32 {
         self as i32
     }
-
 }
 
 /// Dokodemo 配置。对应 proto `xray.proxy.dokodemo.Config`。
@@ -100,11 +99,11 @@ impl Config {
                         let mut arr = [0u8; 16];
                         arr.copy_from_slice(bytes);
                         IpAddr::from(arr)
-                    }
+                    },
                     _ => return None,
                 };
                 Some(PredefinedAddress::Ip(ip))
-            }
+            },
             ProtoAddress::Domain(s) => Some(PredefinedAddress::Domain(s.clone())),
         }
     }
@@ -167,7 +166,9 @@ impl Config {
         ProtoConfig {
             allowed_networks: self
                 .allowed_networks
-                .iter().copied().map(Network::to_proto_value)
+                .iter()
+                .copied()
+                .map(Network::to_proto_value)
                 .collect(),
             rewrite_address: self.rewrite_address.clone(),
             rewrite_port: self.rewrite_port,
@@ -180,19 +181,16 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use xray_proto::xray::common::net::ip_or_domain::Address as ProtoAddress;
 
+    use super::*;
+
     fn make_ip_or_domain_ip(bytes: &[u8]) -> ProtoIpOrDomain {
-        ProtoIpOrDomain {
-            address: Some(ProtoAddress::Ip(bytes.to_vec())),
-        }
+        ProtoIpOrDomain { address: Some(ProtoAddress::Ip(bytes.to_vec())) }
     }
 
     fn make_ip_or_domain_domain(s: &str) -> ProtoIpOrDomain {
-        ProtoIpOrDomain {
-            address: Some(ProtoAddress::Domain(s.to_string())),
-        }
+        ProtoIpOrDomain { address: Some(ProtoAddress::Domain(s.to_string())) }
     }
 
     // ===== Network =====
@@ -226,7 +224,7 @@ mod tests {
         match cfg.predefined_address() {
             Some(PredefinedAddress::Ip(IpAddr::V4(v4))) => {
                 assert_eq!(v4.octets(), [192, 168, 1, 1]);
-            }
+            },
             other => panic!("expected IPv4, got {other:?}"),
         }
     }
@@ -242,7 +240,7 @@ mod tests {
         match cfg.predefined_address() {
             Some(PredefinedAddress::Ip(IpAddr::V6(v6))) => {
                 assert_eq!(v6.segments()[0], 0xfd00);
-            }
+            },
             other => panic!("expected IPv6, got {other:?}"),
         }
     }
@@ -279,10 +277,7 @@ mod tests {
 
     #[test]
     fn allows_network_specific_list() {
-        let cfg = Config {
-            allowed_networks: vec![Network::Tcp],
-            ..Default::default()
-        };
+        let cfg = Config { allowed_networks: vec![Network::Tcp], ..Default::default() };
         assert!(cfg.allows_network(Network::Tcp));
         assert!(!cfg.allows_network(Network::Udp));
     }
@@ -291,11 +286,7 @@ mod tests {
 
     #[test]
     fn proto_roundtrip_minimal() {
-        let cfg = Config {
-            follow_redirect: true,
-            user_level: 5,
-            ..Default::default()
-        };
+        let cfg = Config { follow_redirect: true, user_level: 5, ..Default::default() };
         let proto = cfg.to_proto();
         let cfg2 = Config::from_proto(proto).unwrap();
         assert_eq!(cfg, cfg2);
@@ -325,10 +316,7 @@ mod tests {
 
     fn make_port_map_cfg(entries: &[(&str, &str)]) -> Config {
         Config {
-            port_map: entries
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
+            port_map: entries.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             ..Default::default()
         }
     }

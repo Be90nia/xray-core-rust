@@ -3,10 +3,12 @@
 //! 对应 Go `app/geodata/download.go` 的 stage/swap/tx/clean 类型与函数。
 //! 业务核心可独立测试（在临时目录中跑完整流程）。
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
-use crate::error::{at_error, at_warning, GeodataError};
+use crate::error::{GeodataError, at_error, at_warning};
 
 /// Stage：一次下载暂存（target 是最终路径，temp 是临时文件路径）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,12 +135,7 @@ fn tempfile_in(dir: &Path, prefix: &str) -> Result<(fs::File, PathBuf), GeodataE
         let pid = std::process::id();
         let name = format!("{safe_prefix}{pid}{nanos}");
         let path = dir.join(&name);
-        match fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
+        match fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path) {
             Ok(f) => return Ok((f, path)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
@@ -146,7 +143,7 @@ fn tempfile_in(dir: &Path, prefix: &str) -> Result<(fs::File, PathBuf), GeodataE
                     target: dir.to_string_lossy().into_owned(),
                     reason: e.to_string(),
                 });
-            }
+            },
         }
     }
     Err(GeodataError::TempFileCreate {
@@ -177,25 +174,22 @@ pub fn backup_file(target: &Path) -> Result<PathBuf, GeodataError> {
 pub fn swap_one(stage: &Stage) -> Result<Swap, GeodataError> {
     let backup = backup_file(&stage.target)?;
 
-    let mut swap = Swap {
-        target: stage.target.clone(),
-        backup: backup.clone(),
-        had_original: false,
-    };
+    let mut swap =
+        Swap { target: stage.target.clone(), backup: backup.clone(), had_original: false };
 
     match fs::rename(&stage.target, &backup) {
         Ok(()) => swap.had_original = true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // target 原本不存在，删除 backup 空文件名占位
             let _ = fs::remove_file(&backup);
-        }
+        },
         Err(e) => {
             return Err(GeodataError::RenameFailed {
                 from: stage.target.to_string_lossy().into_owned(),
                 to: backup.to_string_lossy().into_owned(),
                 reason: e.to_string(),
             });
-        }
+        },
     }
 
     if let Err(e) = fs::rename(&stage.temp, &stage.target) {
@@ -236,7 +230,7 @@ pub fn swap_all(stages: &[Stage]) -> Result<Tx, GeodataError> {
                     }
                 }
                 return Err(e);
-            }
+            },
         }
     }
     Ok(tx)
@@ -307,10 +301,7 @@ mod tests {
         base.push(format!(
             "xray-geodata-test-{}-{}-{name}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         fs::create_dir_all(&base).unwrap();
         base
@@ -355,10 +346,7 @@ mod tests {
         write_file(&target, "old");
         write_file(&temp, "new");
 
-        let stage = Stage {
-            target: target.clone(),
-            temp: temp.clone(),
-        };
+        let stage = Stage { target: target.clone(), temp: temp.clone() };
         let swap = swap_one(&stage).unwrap();
 
         assert!(swap.had_original);
@@ -375,10 +363,7 @@ mod tests {
         let temp = dir.join("data.dat.new");
         write_file(&temp, "new");
 
-        let stage = Stage {
-            target: target.clone(),
-            temp,
-        };
+        let stage = Stage { target: target.clone(), temp };
         let swap = swap_one(&stage).unwrap();
 
         assert!(!swap.had_original);
@@ -395,10 +380,7 @@ mod tests {
         write_file(&target, "old");
         write_file(&temp, "new");
 
-        let stage = Stage {
-            target: target.clone(),
-            temp,
-        };
+        let stage = Stage { target: target.clone(), temp };
         let mut tx = Tx::new();
         tx.push(swap_one(&stage).unwrap());
 
@@ -419,10 +401,7 @@ mod tests {
         write_file(&target, "original");
         write_file(&temp, "new");
 
-        let stage = Stage {
-            target: target.clone(),
-            temp,
-        };
+        let stage = Stage { target: target.clone(), temp };
         let mut tx = Tx::new();
         tx.push(swap_one(&stage).unwrap());
 
@@ -442,10 +421,7 @@ mod tests {
         let temp = dir.join("a.dat.new");
         write_file(&temp, "new");
 
-        let stage = Stage {
-            target: target.clone(),
-            temp,
-        };
+        let stage = Stage { target: target.clone(), temp };
         let mut tx = Tx::new();
         tx.push(swap_one(&stage).unwrap());
         assert!(target.exists());
@@ -459,14 +435,8 @@ mod tests {
     #[test]
     fn swap_all_succeeds_for_multiple() {
         let dir = unique_dir("swap_all_multi");
-        let s1 = Stage {
-            target: dir.join("a.dat"),
-            temp: dir.join("a.dat.new"),
-        };
-        let s2 = Stage {
-            target: dir.join("b.dat"),
-            temp: dir.join("b.dat.new"),
-        };
+        let s1 = Stage { target: dir.join("a.dat"), temp: dir.join("a.dat.new") };
+        let s2 = Stage { target: dir.join("b.dat"), temp: dir.join("b.dat.new") };
         write_file(&s1.temp, "a");
         write_file(&s2.temp, "b");
 
@@ -487,14 +457,8 @@ mod tests {
         write_file(&t2, "x");
 
         let stages = vec![
-            Stage {
-                target: dir.join("x1"),
-                temp: t1,
-            },
-            Stage {
-                target: dir.join("x2"),
-                temp: t2,
-            },
+            Stage { target: dir.join("x1"), temp: t1 },
+            Stage { target: dir.join("x2"), temp: t2 },
         ];
         clean(&stages);
         assert!(!dir.join("t1.tmp").exists());
@@ -506,10 +470,7 @@ mod tests {
     #[test]
     fn clean_tolerates_missing_files() {
         let dir = unique_dir("clean_missing");
-        let stages = vec![Stage {
-            target: dir.join("x"),
-            temp: dir.join("never_existed"),
-        }];
+        let stages = vec![Stage { target: dir.join("x"), temp: dir.join("never_existed") }];
         clean(&stages); // no panic
         let _ = fs::remove_dir_all(&dir);
     }
@@ -553,10 +514,7 @@ mod tests {
 
     #[test]
     fn stage_eq() {
-        let s1 = Stage {
-            target: PathBuf::from("/a"),
-            temp: PathBuf::from("/a.tmp"),
-        };
+        let s1 = Stage { target: PathBuf::from("/a"), temp: PathBuf::from("/a.tmp") };
         let s2 = s1.clone();
         assert_eq!(s1, s2);
     }

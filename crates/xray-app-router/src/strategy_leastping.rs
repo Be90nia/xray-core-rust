@@ -10,10 +10,12 @@
 
 use std::sync::Arc;
 
-use crate::balancing::{BalancingStrategy, ObservationProvider};
-use crate::error::RouterError;
 use xray_proto::xray::core::app::observatory::OutboundStatus;
 
+use crate::{
+    balancing::{BalancingStrategy, ObservationProvider},
+    error::RouterError,
+};
 
 /// 最小延迟负载均衡策略。
 /// 有效 RTT：优先 health_ping.average（多测量均值），回退 delay。
@@ -25,7 +27,8 @@ pub struct LeastPingStrategy {
     observer: Arc<dyn ObservationProvider>,
     /// ga1k：候选 outbound tag 列表（来自 `BalancingRule.outbound_selector`）。
     /// 必须过滤——否则观测结果中的其他出站（甚至 direct 等未注册 tag）都会被选中。
-    /// 与 Go `LeastPingStrategy.PickOutbound(strings []string)` 的 `outboundsList.contains(v.OutboundTag)` 一致。
+    /// 与 Go `LeastPingStrategy.PickOutbound(strings []string)` 的
+    /// `outboundsList.contains(v.OutboundTag)` 一致。
     candidates: Vec<String>,
 }
 
@@ -34,7 +37,8 @@ impl LeastPingStrategy {
     ///
     /// `candidates` 为该 balancer 的候选 tag 列表（来自 `BalancingRule.outbound_selector`）。
     /// Go 端 `PickOutbound(strings []string)` 把列表作为参数传入；Rust 端 trait
-    /// `pick_outbound()` 无参数，故在构造时注入。空 `candidates` = 不限制（fallback 到原始全观测遍历）。
+    /// `pick_outbound()` 无参数，故在构造时注入。空 `candidates` = 不限制（fallback
+    /// 到原始全观测遍历）。
     pub fn new(observer: Arc<dyn ObservationProvider>, candidates: Vec<String>) -> Self {
         Self { observer, candidates }
     }
@@ -48,7 +52,8 @@ impl BalancingStrategy for LeastPingStrategy {
         for s in &obs.status {
             // ga1k：必须在候选集中（Go `outboundsList.contains(v.OutboundTag)`），
             // 候选为空 = 不限制（兼容旧调用方）。
-            if !self.candidates.is_empty() && !self.candidates.iter().any(|c| c == &s.outbound_tag) {
+            if !self.candidates.is_empty() && !self.candidates.iter().any(|c| c == &s.outbound_tag)
+            {
                 continue;
             }
             // 仅考虑 alive 且有有效 delay（>0）
@@ -70,9 +75,12 @@ impl BalancingStrategy for LeastPingStrategy {
 
 #[cfg(test)]
 mod tests {
+    use xray_proto::xray::core::app::observatory::{
+        HealthPingMeasurementResult, ObservationResult, OutboundStatus,
+    };
+
     use super::*;
     use crate::balancing::NotImplementedSelector;
-    use xray_proto::xray::core::app::observatory::{HealthPingMeasurementResult, ObservationResult, OutboundStatus};
 
     struct FixedObs(ObservationResult);
     impl ObservationProvider for FixedObs {
@@ -96,11 +104,7 @@ mod tests {
     #[test]
     fn test_picks_least_delay() {
         let obs = ObservationResult {
-            status: vec![
-                status("a", true, 100),
-                status("b", true, 50),
-                status("c", true, 200),
-            ],
+            status: vec![status("a", true, 100), status("b", true, 50), status("c", true, 200)],
         };
         let s = LeastPingStrategy::new(Arc::new(FixedObs(obs)), vec![]);
         assert_eq!(s.pick_outbound().unwrap(), "b");
@@ -131,21 +135,16 @@ mod tests {
         // b: delay=100 but health_ping.average=80  → effective RTT=80
         // b should win because avg(80) < avg(200)
         let obs = ObservationResult {
-            status: vec![
-                status_with_hp("a", true, 50, 200),
-                status_with_hp("b", true, 100, 80),
-            ],
+            status: vec![status_with_hp("a", true, 50, 200), status_with_hp("b", true, 100, 80)],
         };
         let s = LeastPingStrategy::new(Arc::new(FixedObs(obs)), vec![]);
         assert_eq!(s.pick_outbound().unwrap(), "b");
     }
 
-
     #[test]
     fn test_skips_dead() {
-        let obs = ObservationResult {
-            status: vec![status("a", false, 10), status("b", true, 100)],
-        };
+        let obs =
+            ObservationResult { status: vec![status("a", false, 10), status("b", true, 100)] };
         let s = LeastPingStrategy::new(Arc::new(FixedObs(obs)), vec![]);
         assert_eq!(s.pick_outbound().unwrap(), "b");
     }
@@ -179,9 +178,7 @@ mod tests {
     #[test]
     fn test_candidates_empty_falls_back_to_all() {
         // 向后兼容：候选为空 = 不限制（等价 Go 端无 selector 时的旧行为）。
-        let obs = ObservationResult {
-            status: vec![status("a", true, 50), status("b", true, 100)],
-        };
+        let obs = ObservationResult { status: vec![status("a", true, 50), status("b", true, 100)] };
         let s = LeastPingStrategy::new(Arc::new(FixedObs(obs)), vec![]);
         assert_eq!(s.pick_outbound().unwrap(), "a");
     }

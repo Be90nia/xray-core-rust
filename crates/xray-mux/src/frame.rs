@@ -23,12 +23,12 @@
 use std::io::{self, Read, Write};
 
 use xray_buf::buffer::Buffer;
-use xray_common::bitmask::Bitmask;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::protocol::address_parser::{AddressParser, AddressSerializer};
-use xray_common::serial;
+use xray_common::{
+    bitmask::Bitmask,
+    net::{address::Address, destination::Destination, network::Network},
+    protocol::address_parser::{AddressParser, AddressSerializer},
+    serial,
+};
 
 // ========== 协议常量 ==========
 
@@ -217,8 +217,9 @@ fn write_target_to_vec(buf: &mut Vec<u8>, target: &Destination) -> Result<(), Mu
     // Go 写帧直接编码 network string（无 panic 路径）；Unix 目标在 Rust 侧
     // 无法编码为线格式单字节，显式拒绝而非 panic（远程可达：Unix 入站目标
     // 经 mux 转发即触发）。
-    let net = TargetNetwork::from_network(target.network())
-        .ok_or_else(|| MuxError::Io(format!("unsupported mux target network: {:?}", target.network())))?;
+    let net = TargetNetwork::from_network(target.network()).ok_or_else(|| {
+        MuxError::Io(format!("unsupported mux target network: {:?}", target.network()))
+    })?;
     buf.push(net.to_byte());
 
     // 按地址实际线格式精确预分配，杜绝 Buffer 截断：
@@ -228,12 +229,10 @@ fn write_target_to_vec(buf: &mut Vec<u8>, target: &Destination) -> Result<(), Mu
         Address::IPv6(_) => 16,
         Address::Domain(d) => {
             if d.len() > 255 {
-                return Err(MuxError::MetadataTooLong(
-                    4 + 3 + d.len(),
-                ));
+                return Err(MuxError::MetadataTooLong(4 + 3 + d.len()));
             }
             1 + d.len()
-        }
+        },
     };
     let mut addr_buf = Buffer::with_capacity(2 + 1 + addr_wire_len);
     AddressSerializer::write_port_address(&mut addr_buf, target.port(), target.address());
@@ -246,14 +245,11 @@ fn write_target_to_vec(buf: &mut Vec<u8>, target: &Destination) -> Result<(), Mu
 /// 返回 `(Destination, consumed_bytes)`。
 fn read_target(data: &[u8]) -> Result<(Destination, usize), MuxError> {
     if data.is_empty() {
-        return Err(MuxError::InsufficientData {
-            expected: 1,
-            actual: 0,
-        });
+        return Err(MuxError::InsufficientData { expected: 1, actual: 0 });
     }
 
-    let net = TargetNetwork::from_byte(data[0])
-        .ok_or_else(|| MuxError::InvalidTargetNetwork(data[0]))?;
+    let net =
+        TargetNetwork::from_byte(data[0]).ok_or_else(|| MuxError::InvalidTargetNetwork(data[0]))?;
     let network = net.to_network();
 
     // PortThenAddress 格式：port(2B) + address(variable)
@@ -332,11 +328,7 @@ pub struct FrameMetadata {
 impl FrameMetadata {
     /// 创建新的帧元数据。
     #[must_use]
-    pub fn new(
-        session_id: u16,
-        session_status: SessionStatus,
-        option: Bitmask,
-    ) -> Self {
+    pub fn new(session_id: u16, session_status: SessionStatus, option: Bitmask) -> Self {
         Self {
             session_id,
             session_status,
@@ -489,9 +481,7 @@ impl FrameMetadata {
     /// 是否为 UDP 目标。
     #[must_use]
     pub fn is_udp_target(&self) -> bool {
-        self.target
-            .as_ref()
-            .is_some_and(|t| t.network() == Network::UDP)
+        self.target.as_ref().is_some_and(|t| t.network() == Network::UDP)
     }
 
     // ========== 序列化 ==========
@@ -577,27 +567,19 @@ impl FrameMetadata {
         read_source_and_local: bool,
     ) -> Result<(Self, usize), MuxError> {
         if data.len() < 2 {
-            return Err(MuxError::InsufficientData {
-                expected: 2,
-                actual: data.len(),
-            });
+            return Err(MuxError::InsufficientData { expected: 2, actual: data.len() });
         }
 
         let meta_len = serial::read_uint16(data)
-            .ok_or_else(|| MuxError::InsufficientData {
-                expected: 2,
-                actual: data.len().min(2),
-            })? as usize;
+            .ok_or_else(|| MuxError::InsufficientData { expected: 2, actual: data.len().min(2) })?
+            as usize;
 
         if meta_len > MAX_METADATA_LEN {
             return Err(MuxError::MetadataTooLong(meta_len));
         }
 
         if data.len() < 2 + meta_len {
-            return Err(MuxError::InsufficientData {
-                expected: 2 + meta_len,
-                actual: data.len(),
-            });
+            return Err(MuxError::InsufficientData { expected: 2 + meta_len, actual: data.len() });
         }
 
         let body = &data[2..2 + meta_len];
@@ -627,10 +609,7 @@ impl FrameMetadata {
     /// 解析帧体（不含 length 前缀）。
     fn parse_body(body: &[u8], read_source_and_local: bool) -> Result<Self, MuxError> {
         if body.len() < 4 {
-            return Err(MuxError::InsufficientData {
-                expected: 4,
-                actual: body.len(),
-            });
+            return Err(MuxError::InsufficientData { expected: 4, actual: body.len() });
         }
 
         // session_id (2B)
@@ -668,10 +647,7 @@ impl FrameMetadata {
                 return Ok(meta);
             }
             // 解析 GlobalID（New + Data + UDP + 剩余>=8）
-            if meta.has_data()
-                && meta.is_udp_target()
-                && body.len().saturating_sub(offset) >= 8
-            {
+            if meta.has_data() && meta.is_udp_target() && body.len().saturating_sub(offset) >= 8 {
                 let mut gid = [0u8; 8];
                 gid.copy_from_slice(&body[offset..offset + 8]);
                 meta.global_id = Some(gid);
@@ -691,22 +667,21 @@ impl FrameMetadata {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::Cursor,
+        net::{Ipv4Addr, Ipv6Addr},
+    };
+
+    use xray_common::net::{address::Address, port::Port};
+
     use super::*;
-    use std::io::Cursor;
-    use std::net::{Ipv4Addr, Ipv6Addr};
-    use xray_common::net::address::Address;
-    use xray_common::net::port::Port;
 
     // ========== 枚举测试 ==========
 
     #[test]
     fn test_session_status_roundtrip() {
-        let values = [
-            SessionStatus::New,
-            SessionStatus::Keep,
-            SessionStatus::End,
-            SessionStatus::KeepAlive,
-        ];
+        let values =
+            [SessionStatus::New, SessionStatus::Keep, SessionStatus::End, SessionStatus::KeepAlive];
         for status in values {
             assert_eq!(SessionStatus::from_byte(status.to_byte()), Some(status));
         }
@@ -750,15 +725,12 @@ mod tests {
 
     #[test]
     fn test_new_tcp_frame_roundtrip() {
-        let target = Destination::tcp(
-            Address::ipv4(Ipv4Addr::new(192, 168, 1, 1)),
-            Port::new(443),
-        );
+        let target = Destination::tcp(Address::ipv4(Ipv4Addr::new(192, 168, 1, 1)), Port::new(443));
         let meta = FrameMetadata::new_session(42, target);
 
         let bytes = meta.to_bytes().unwrap();
-        let (parsed, consumed) = FrameMetadata::read_from_bytes(&bytes)
-            .expect("parse should succeed");
+        let (parsed, consumed) =
+            FrameMetadata::read_from_bytes(&bytes).expect("parse should succeed");
 
         assert_eq!(consumed, bytes.len());
         assert_eq!(parsed.session_id(), 42);
@@ -773,15 +745,12 @@ mod tests {
 
     #[test]
     fn test_new_udp_frame_roundtrip() {
-        let target = Destination::udp(
-            Address::new_domain("dns.server"),
-            Port::new(53),
-        );
+        let target = Destination::udp(Address::new_domain("dns.server"), Port::new(53));
         let meta = FrameMetadata::new_session(100, target);
 
         let bytes = meta.to_bytes().unwrap();
-        let (parsed, consumed) = FrameMetadata::read_from_bytes(&bytes)
-            .expect("parse should succeed");
+        let (parsed, consumed) =
+            FrameMetadata::read_from_bytes(&bytes).expect("parse should succeed");
 
         assert_eq!(consumed, bytes.len());
         assert_eq!(parsed.session_id(), 100);
@@ -794,17 +763,13 @@ mod tests {
 
     #[test]
     fn test_new_udp_frame_with_global_id_roundtrip() {
-        let target = Destination::udp(
-            Address::ipv4(Ipv4Addr::new(8, 8, 8, 8)),
-            Port::new(53),
-        );
+        let target = Destination::udp(Address::ipv4(Ipv4Addr::new(8, 8, 8, 8)), Port::new(53));
         let mut meta = FrameMetadata::new_session(7, target);
         let gid = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
         meta.set_global_id(gid);
 
         let bytes = meta.to_bytes().unwrap();
-        let (parsed, _) = FrameMetadata::read_from_bytes(&bytes)
-            .expect("parse should succeed");
+        let (parsed, _) = FrameMetadata::read_from_bytes(&bytes).expect("parse should succeed");
 
         assert!(parsed.is_udp_target());
         assert!(parsed.global_id().is_some());
@@ -842,8 +807,8 @@ mod tests {
         assert_eq!(&bytes[23..25], &[0x04, 0x38]); // 1080
         assert_eq!(&bytes[25..30], &[0x01, 127, 0, 0, 1]);
 
-        let (parsed, consumed) = FrameMetadata::read_from_bytes_with_source(&bytes)
-            .expect("parse should succeed");
+        let (parsed, consumed) =
+            FrameMetadata::read_from_bytes_with_source(&bytes).expect("parse should succeed");
         assert_eq!(consumed, bytes.len());
         assert_eq!(parsed.source(), Some(&source));
         assert_eq!(parsed.local(), Some(&local));
@@ -861,8 +826,8 @@ mod tests {
     fn test_reverse_new_frame_without_source_variants() {
         let meta = FrameMetadata::new(1, SessionStatus::New, Bitmask::default());
         let bytes = meta.to_bytes().unwrap();
-        let (parsed, _) = FrameMetadata::read_from_bytes_with_source(&bytes)
-            .expect("parse should succeed");
+        let (parsed, _) =
+            FrameMetadata::read_from_bytes_with_source(&bytes).expect("parse should succeed");
         assert!(parsed.source().is_none());
 
         let meta = FrameMetadata::new_session(
@@ -873,8 +838,8 @@ mod tests {
         bytes.push(0x00); // padding
         let len = u16::from_be_bytes([bytes[0], bytes[1]]) + 1;
         bytes[0..2].copy_from_slice(&len.to_be_bytes());
-        let (parsed, consumed) = FrameMetadata::read_from_bytes_with_source(&bytes)
-            .expect("parse should succeed");
+        let (parsed, consumed) =
+            FrameMetadata::read_from_bytes_with_source(&bytes).expect("parse should succeed");
         assert_eq!(consumed, bytes.len());
         assert!(parsed.source().is_none());
     }
@@ -884,8 +849,8 @@ mod tests {
         let meta = FrameMetadata::end_session(42);
 
         let bytes = meta.to_bytes().unwrap();
-        let (parsed, consumed) = FrameMetadata::read_from_bytes(&bytes)
-            .expect("parse should succeed");
+        let (parsed, consumed) =
+            FrameMetadata::read_from_bytes(&bytes).expect("parse should succeed");
 
         assert_eq!(consumed, bytes.len());
         assert_eq!(parsed.session_id(), 42);
@@ -899,8 +864,7 @@ mod tests {
         let meta = FrameMetadata::keep_alive(999);
 
         let bytes = meta.to_bytes().unwrap();
-        let (parsed, _) = FrameMetadata::read_from_bytes(&bytes)
-            .expect("parse should succeed");
+        let (parsed, _) = FrameMetadata::read_from_bytes(&bytes).expect("parse should succeed");
 
         assert_eq!(parsed.session_id(), 999);
         assert_eq!(parsed.session_status(), SessionStatus::KeepAlive);
@@ -909,15 +873,11 @@ mod tests {
 
     #[test]
     fn test_keep_udp_target_roundtrip() {
-        let target = Destination::udp(
-            Address::new_domain("example.com"),
-            Port::new(8080),
-        );
+        let target = Destination::udp(Address::new_domain("example.com"), Port::new(8080));
         let meta = FrameMetadata::keep_with_udp_target(55, target);
 
         let bytes = meta.to_bytes().unwrap();
-        let (parsed, _) = FrameMetadata::read_from_bytes(&bytes)
-            .expect("parse should succeed");
+        let (parsed, _) = FrameMetadata::read_from_bytes(&bytes).expect("parse should succeed");
 
         assert_eq!(parsed.session_status(), SessionStatus::Keep);
         assert!(parsed.target().is_some());
@@ -953,8 +913,7 @@ mod tests {
     fn test_max_session_id() {
         let meta = FrameMetadata::end_session(u16::MAX);
         let bytes = meta.to_bytes().unwrap();
-        let (parsed, _) = FrameMetadata::read_from_bytes(&bytes)
-            .expect("parse should succeed");
+        let (parsed, _) = FrameMetadata::read_from_bytes(&bytes).expect("parse should succeed");
         assert_eq!(parsed.session_id(), u16::MAX);
     }
 
@@ -966,8 +925,7 @@ mod tests {
         assert!(!meta.has_data());
 
         let bytes = meta.to_bytes().unwrap();
-        let (parsed, _) = FrameMetadata::read_from_bytes(&bytes)
-            .expect("parse should succeed");
+        let (parsed, _) = FrameMetadata::read_from_bytes(&bytes).expect("parse should succeed");
         assert!(parsed.has_error());
         assert!(!parsed.has_data());
     }
@@ -1018,10 +976,7 @@ mod tests {
 
     #[test]
     fn test_wire_format_new_tcp_ipv4() {
-        let target = Destination::tcp(
-            Address::ipv4(Ipv4Addr::new(127, 0, 0, 1)),
-            Port::new(80),
-        );
+        let target = Destination::tcp(Address::ipv4(Ipv4Addr::new(127, 0, 0, 1)), Port::new(80));
         let meta = FrameMetadata::new_session(1, target);
         let bytes = meta.to_bytes().unwrap();
 
@@ -1066,10 +1021,7 @@ mod tests {
         );
         meta.set_inbound(source, local);
         let err = meta.to_bytes().expect_err("oversized meta must error");
-        assert!(
-            matches!(err, MuxError::MetadataTooLong(_)),
-            "unexpected error: {err}"
-        );
+        assert!(matches!(err, MuxError::MetadataTooLong(_)), "unexpected error: {err}");
     }
 
     /// 各段合法（≤255B）但帧总量 >512：对齐 Go 读侧 512 硬顶，

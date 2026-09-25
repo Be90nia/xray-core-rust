@@ -11,29 +11,29 @@
 //!
 //! 因此本模块职责收敛为两件事：
 //!
-//! 1. **禁用开关**：`disableGSO`（Go `QuicParams.disableGSO` parity，默认
-//!    false = 启用）。启用路径 = 现状默认路径，零改动。
+//! 1. **禁用开关**：`disableGSO`（Go `QuicParams.disableGSO` parity，默认 false = 启用）。启用路径
+//!    = 现状默认路径，零改动。
 //! 2. **禁用接线**：quinn 的 tokio socket 实现是私有类型，唯一公共注入点是
 //!    `Runtime::wrap_udp_socket → Arc<dyn AsyncUdpSocket>` +
-//!    `Endpoint::new_with_abstract_socket`。[`NoGsoSocket`] 薄包装把
-//!    `max_transmit_segments()` 钳到 1（quinn 发送端因此不产生多段
-//!    Transmit → 不打 UDP_SEGMENT cmsg = 关发送 GSO），其余全部转发。
-//!    接收侧 GRO（`max_receive_segments`）不受影响，与 quic-go
-//!    `DisableGSO` 只关发送的语义一致。
+//!    `Endpoint::new_with_abstract_socket`。[`NoGsoSocket`] 薄包装把 `max_transmit_segments()` 钳到
+//!    1（quinn 发送端因此不产生多段 Transmit → 不打 UDP_SEGMENT cmsg = 关发送 GSO），其余全部转发。
+//!    接收侧 GRO（`max_receive_segments`）不受影响，与 quic-go `DisableGSO` 只关发送的语义一致。
 //!
 //! 分段安全：多段打包/stride 递进全部由 quinn/quinn-udp 内部处理，本模块
 //! 不碰 Transmit 内容；包装为全平台无 cfg 分叉（非 Linux 平台该值本就为 1，
 //! 包装无副作用）。
 
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
-use quinn::udp::{RecvMeta, Transmit};
 use quinn::{
     AsyncUdpSocket, Endpoint, EndpointConfig, Runtime, ServerConfig, TokioRuntime, UdpPoller,
+    udp::{RecvMeta, Transmit},
 };
 
 /// 禁用发送 GSO 的 socket 薄包装：`max_transmit_segments()` 恒 1，其余全转发。
@@ -130,10 +130,7 @@ mod tests {
         // 其余能力转发不丢：GRO 接收段数与分片语义与底层一致。
         assert_eq!(wrapped.max_receive_segments(), inner.max_receive_segments());
         assert_eq!(wrapped.may_fragment(), inner.may_fragment());
-        assert_eq!(
-            wrapped.local_addr().unwrap(),
-            inner.local_addr().unwrap(),
-        );
+        assert_eq!(wrapped.local_addr().unwrap(), inner.local_addr().unwrap(),);
     }
 
     /// Linux GSO 默认启用实证：现代内核（≥4.18）探测应报 >1 段。
@@ -153,7 +150,8 @@ mod tests {
     /// quinn-udp windows.rs，无 UDP_SEGMENT 概念，包装无副作用）。
     #[tokio::test]
     async fn make_endpoint_disabled_gso_binds() {
-        let ep = make_endpoint(None, "127.0.0.1:0".parse().unwrap(), true, &Default::default()).unwrap();
+        let ep =
+            make_endpoint(None, "127.0.0.1:0".parse().unwrap(), true, &Default::default()).unwrap();
         let addr = ep.local_addr().unwrap();
         assert!(addr.port() > 0);
     }

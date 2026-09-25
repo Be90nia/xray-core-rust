@@ -6,10 +6,12 @@
 //!
 //! 同时复刻 Go 的 NAT 端口预测算法（symmetric NAT 候选扩展）。
 
-use std::collections::HashMap;
-use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
+    time::Duration,
+};
 
 use rand::RngCore;
 
@@ -77,14 +79,9 @@ pub fn is_stun_message(packet: &[u8]) -> bool {
 /// 解析 STUN Binding Response（对应 Go `parseSTUNBindingResponse`）。
 ///
 /// 返回 `(transaction_id, mapped_addr)`，优先 XOR-MAPPED-ADDRESS，其次 MAPPED-ADDRESS。
-pub fn parse_stun_binding_response(
-    packet: &[u8],
-) -> io::Result<(TransactionId, SocketAddr)> {
+pub fn parse_stun_binding_response(packet: &[u8]) -> io::Result<(TransactionId, SocketAddr)> {
     if packet.len() < STUN_HEADER_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "STUN packet too short",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "STUN packet too short"));
     }
     let msg_type = u16::from_be_bytes([packet[0], packet[1]]);
     if msg_type != STUN_BINDING_SUCCESS {
@@ -95,19 +92,13 @@ pub fn parse_stun_binding_response(
     }
     let cookie = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
     if cookie != STUN_MAGIC_COOKIE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "bad STUN magic cookie",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad STUN magic cookie"));
     }
     let mut tx_id = [0u8; STUN_TRANSACTION_ID_SIZE];
     tx_id.copy_from_slice(&packet[8..STUN_HEADER_LEN]);
     let body_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
     if packet.len() < STUN_HEADER_LEN + body_len {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "STUN body length exceeds packet",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "STUN body length exceeds packet"));
     }
     let body = &packet[STUN_HEADER_LEN..STUN_HEADER_LEN + body_len];
     if let Some(addr) = find_attr(body, STUN_ATTR_XOR_MAPPED_ADDRESS, Some(&tx_id))? {
@@ -116,10 +107,7 @@ pub fn parse_stun_binding_response(
     if let Some(addr) = find_attr(body, STUN_ATTR_MAPPED_ADDRESS, None)? {
         return Ok((tx_id, addr));
     }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        "STUN mapped address not found",
-    ))
+    Err(io::Error::new(io::ErrorKind::InvalidData, "STUN mapped address not found"))
 }
 
 /// 在属性 body 中查找指定类型并解码地址。
@@ -140,9 +128,12 @@ fn find_attr(
         if attr_type == target {
             let val = &body[val_start..val_end];
             let addr = if attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS {
-                decode_xor_mapped_address(val, tx_id.ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "missing transaction id")
-                })?)?
+                decode_xor_mapped_address(
+                    val,
+                    tx_id.ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "missing transaction id")
+                    })?,
+                )?
             } else {
                 decode_mapped_address(val)?
             };
@@ -170,7 +161,7 @@ fn decode_mapped_address(val: &[u8]) -> io::Result<SocketAddr> {
             let mut octets = [0u8; 4];
             octets.copy_from_slice(&ip_bytes[..4]);
             IpAddr::V4(Ipv4Addr::from(octets))
-        }
+        },
         0x02 => {
             if ip_bytes.len() < 16 {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "bad ipv6"));
@@ -178,7 +169,7 @@ fn decode_mapped_address(val: &[u8]) -> io::Result<SocketAddr> {
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&ip_bytes[..16]);
             IpAddr::V6(Ipv6Addr::from(octets))
-        }
+        },
         _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "bad address family")),
     };
     Ok(SocketAddr::new(ip, port))
@@ -189,10 +180,7 @@ fn decode_mapped_address(val: &[u8]) -> io::Result<SocketAddr> {
 /// - port XOR 高 16 位 cookie
 /// - IPv4 XOR 整个 cookie（4 字节）
 /// - IPv6 XOR cookie(4) + transaction_id(12) = 16 字节
-fn decode_xor_mapped_address(
-    val: &[u8],
-    tx_id: &TransactionId,
-) -> io::Result<SocketAddr> {
+fn decode_xor_mapped_address(val: &[u8], tx_id: &TransactionId) -> io::Result<SocketAddr> {
     if val.len() < 4 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad xor mapped address"));
     }
@@ -211,7 +199,7 @@ fn decode_xor_mapped_address(
                 octets[i] = b ^ key[i];
             }
             IpAddr::V4(Ipv4Addr::from(octets))
-        }
+        },
         0x02 => {
             if ip_bytes.len() < 16 {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "bad ipv6"));
@@ -224,7 +212,7 @@ fn decode_xor_mapped_address(
                 octets[i] = b ^ key[i];
             }
             IpAddr::V6(Ipv6Addr::from(octets))
-        }
+        },
         _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "bad address family")),
     };
     Ok(SocketAddr::new(ip, port))
@@ -370,9 +358,8 @@ pub fn parse_addr_ports(addrs: &[String]) -> io::Result<Vec<SocketAddr>> {
     addrs
         .iter()
         .map(|s| {
-            s.parse::<SocketAddr>().map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, e.to_string())
-            })
+            s.parse::<SocketAddr>()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
         })
         .collect()
 }
@@ -461,10 +448,8 @@ mod tests {
     #[test]
     fn candidate_filter_by_family() {
         let locals: Vec<SocketAddr> = vec!["127.0.0.1:1000".parse().unwrap()];
-        let peers: Vec<SocketAddr> = vec![
-            "1.1.1.1:5000".parse().unwrap(),
-            "[::1]:5000".parse().unwrap(),
-        ];
+        let peers: Vec<SocketAddr> =
+            vec!["1.1.1.1:5000".parse().unwrap(), "[::1]:5000".parse().unwrap()];
         let (cands, _seen) = candidate_punch_addrs(&locals, &peers);
         assert_eq!(cands.len(), 1);
         assert!(cands[0].is_ipv4());
@@ -473,10 +458,8 @@ mod tests {
     #[test]
     fn candidate_dedup_peers() {
         let locals: Vec<SocketAddr> = vec!["127.0.0.1:1000".parse().unwrap()];
-        let peers: Vec<SocketAddr> = vec![
-            "1.1.1.1:5000".parse().unwrap(),
-            "1.1.1.1:5000".parse().unwrap(),
-        ];
+        let peers: Vec<SocketAddr> =
+            vec!["1.1.1.1:5000".parse().unwrap(), "1.1.1.1:5000".parse().unwrap()];
         let (cands, _seen) = candidate_punch_addrs(&locals, &peers);
         assert_eq!(cands.len(), 1);
     }
@@ -484,10 +467,8 @@ mod tests {
     #[test]
     fn expand_symmetric_nat_adds_predictable_ports() {
         // 两观察端口 30000, 30002 — gap=2 ≤ 4，predictable
-        let initial: Vec<SocketAddr> = vec![
-            "1.2.3.4:30000".parse().unwrap(),
-            "1.2.3.4:30002".parse().unwrap(),
-        ];
+        let initial: Vec<SocketAddr> =
+            vec!["1.2.3.4:30000".parse().unwrap(), "1.2.3.4:30002".parse().unwrap()];
         let (_, mut seen) = candidate_punch_addrs(&[], &initial);
         seen.clear();
         seen.insert(initial[0]);
@@ -502,10 +483,8 @@ mod tests {
     #[test]
     fn expand_unpredictable_unchanged() {
         // gap = 100 > 4，不应扩展
-        let initial: Vec<SocketAddr> = vec![
-            "1.2.3.4:30000".parse().unwrap(),
-            "1.2.3.4:30100".parse().unwrap(),
-        ];
+        let initial: Vec<SocketAddr> =
+            vec!["1.2.3.4:30000".parse().unwrap(), "1.2.3.4:30100".parse().unwrap()];
         let (_, mut seen) = candidate_punch_addrs(&[], &initial);
         seen.clear();
         seen.insert(initial[0]);
@@ -516,10 +495,8 @@ mod tests {
 
     #[test]
     fn addr_port_strings_roundtrip() {
-        let addrs: Vec<SocketAddr> = vec![
-            "1.2.3.4:5678".parse().unwrap(),
-            "[::1]:9999".parse().unwrap(),
-        ];
+        let addrs: Vec<SocketAddr> =
+            vec!["1.2.3.4:5678".parse().unwrap(), "[::1]:9999".parse().unwrap()];
         let strings = addr_port_strings(&addrs);
         let parsed = parse_addr_ports(&strings).unwrap();
         assert_eq!(parsed, addrs);

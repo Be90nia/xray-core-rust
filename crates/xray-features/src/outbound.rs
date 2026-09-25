@@ -3,8 +3,7 @@
 //! Corresponds to Go's `features/outbound` package.
 
 use async_trait::async_trait;
-use xray_common::net::destination::Destination;
-use xray_common::session::Session;
+use xray_common::{net::destination::Destination, session::Session};
 
 /// Feature type identifier for Outbound.
 pub const FEATURE_OUTBOUND: &str = "outbound";
@@ -18,11 +17,8 @@ pub trait OutboundHandler: Send + Sync {
     fn tag(&self) -> &str;
 
     /// Proxy a connection to the given destination.
-    async fn dial(
-        &self,
-        destination: &Destination,
-        session: &Session,
-    ) -> Result<(), OutboundError>;
+    async fn dial(&self, destination: &Destination, session: &Session)
+    -> Result<(), OutboundError>;
 
     /// Check if this handler can handle the given destination.
     fn can_handle(&self, destination: &Destination) -> bool;
@@ -44,10 +40,10 @@ impl std::fmt::Display for OutboundError {
         match self {
             OutboundError::NoOutbound(dest) => {
                 write!(f, "no available outbound for destination: {}", dest)
-            }
+            },
             OutboundError::ConnectionFailed(msg) => {
                 write!(f, "outbound connection failed: {}", msg)
-            }
+            },
             OutboundError::Timeout(msg) => write!(f, "outbound timeout: {}", msg),
         }
     }
@@ -57,10 +53,9 @@ impl std::error::Error for OutboundError {}
 
 #[cfg(test)]
 mod tests {
+    use xray_common::net::{address::Address, network::Network, port::Port};
+
     use super::*;
-    use xray_common::net::address::Address;
-    use xray_common::net::network::Network;
-    use xray_common::net::port::Port;
 
     #[test]
     fn test_feature_outbound_constant() {
@@ -96,9 +91,7 @@ mod tests {
 
     impl MockOutboundHandler {
         fn new(tag: &str) -> Self {
-            Self {
-                tag: tag.to_string(),
-            }
+            Self { tag: tag.to_string() }
         }
     }
 

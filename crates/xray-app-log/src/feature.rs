@@ -7,9 +7,11 @@ use std::sync::Arc;
 
 use xray_features::{Feature, FeatureError, Result};
 
-use crate::command::DefaultLogService;
-use crate::config::LogConfig;
-use crate::instance::{register_default_creators, HandlerCreatorRegistry, LogInstance};
+use crate::{
+    command::DefaultLogService,
+    config::LogConfig,
+    instance::{HandlerCreatorRegistry, LogInstance, register_default_creators},
+};
 
 /// Log app Feature 实现。
 ///
@@ -27,15 +29,9 @@ impl LogFeature {
         let registry = Arc::new(HandlerCreatorRegistry::new());
         let instance = Arc::new(
             LogInstance::new(config)
-                .map_err(|e| FeatureError::StartFailed {
-                    name: "log",
-                    message: e.to_string(),
-                })?,
+                .map_err(|e| FeatureError::StartFailed { name: "log", message: e.to_string() })?,
         );
-        Ok(Self {
-            instance,
-            registry,
-        })
+        Ok(Self { instance, registry })
     }
 
     /// 获取 LogInstance 引用。
@@ -60,14 +56,11 @@ impl Feature for LogFeature {
     }
 
     fn start(&self) -> Result<()> {
-        register_default_creators(&self.registry).map_err(|e| FeatureError::StartFailed {
-            name: "log",
-            message: e.to_string(),
-        })?;
-        self.instance.start(&self.registry).map_err(|e| FeatureError::StartFailed {
-            name: "log",
-            message: e.to_string(),
-        })
+        register_default_creators(&self.registry)
+            .map_err(|e| FeatureError::StartFailed { name: "log", message: e.to_string() })?;
+        self.instance
+            .start(&self.registry)
+            .map_err(|e| FeatureError::StartFailed { name: "log", message: e.to_string() })
     }
 
     fn close(&self) -> Result<()> {
@@ -79,9 +72,7 @@ impl Feature for LogFeature {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::LogService;
-    use crate::config::LogType;
-    use crate::instance::HandlerCreatorOptions;
+    use crate::{command::LogService, config::LogType, instance::HandlerCreatorOptions};
 
     #[test]
     fn log_feature_start_registers_creators_and_starts_instance() {

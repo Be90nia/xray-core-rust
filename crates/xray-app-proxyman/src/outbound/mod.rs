@@ -11,22 +11,27 @@
 //! - [`OutboundManager::select_by_prefix`] — Go `Select(selectors) []string`
 //!
 //! 简化：
-//! - Go `tagsCache *sync.Map` 用于并发 add/remove/select 时缓存 Select 结果。
-//!   Rust 端用 `parking_lot::RwLock` 互斥访问 tagged map，无需 cache。
-//!   若并发吞吐出现瓶颈，可改用 `ArcSwap<HashMap>` 优化。
+//! - Go `tagsCache *sync.Map` 用于并发 add/remove/select 时缓存 Select 结果。 Rust 端用
+//!   `parking_lot::RwLock` 互斥访问 tagged map，无需 cache。 若并发吞吐出现瓶颈，可改用
+//!   `ArcSwap<HashMap>` 优化。
 
 pub mod handler;
 pub mod proxy_outbound;
 pub mod uot;
 
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
 pub use handler::{OutboundHandlerEntry, UotVersion, parse_random_ip};
-pub use proxy_outbound::{OutboundDialer, ProxyOutbound};
-use crate::error::ProxymanError;
-use crate::inbound::PinFuture;
 use parking_lot::RwLock;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+pub use proxy_outbound::{OutboundDialer, ProxyOutbound};
+
+use crate::{error::ProxymanError, inbound::PinFuture};
 
 /// 出站 handler trait（对应 Go `features/outbound.Handler`）
 ///
@@ -53,12 +58,19 @@ pub trait OutboundHandler: Send + Sync {
     ///
     /// 将 `link` 中的出站数据通过此 handler 的代理处理器发送。
     /// 如果未配置代理处理器，返回 [`ProxymanError::Other`]。
-    fn dispatch(&self, session: xray_common::session::Session, link: xray_transport::link::Link) -> PinFuture<Result<(), ProxymanError>>;
+    fn dispatch(
+        &self,
+        session: xray_common::session::Session,
+        link: xray_transport::link::Link,
+    ) -> PinFuture<Result<(), ProxymanError>>;
 
     /// 向目标地址拨号（对应 Go `Handler.Dial(ctx, dest)`）。
     ///
     /// 如果配置了代理链 tag，通过 chained handler 拨号；否则直接拨号。
-    fn dial(&self, dest: &xray_common::net::destination::Destination) -> PinFuture<std::io::Result<Box<dyn xray_transport::connection::Connection>>>;
+    fn dial(
+        &self,
+        dest: &xray_common::net::destination::Destination,
+    ) -> PinFuture<std::io::Result<Box<dyn xray_transport::connection::Connection>>>;
 }
 
 /// 出站管理器（对应 Go `app/proxyman/outbound.Manager`）
@@ -90,10 +102,7 @@ impl OutboundManager {
     /// 创建空管理器（对应 Go `New(ctx, *OutboundConfig) (*Manager, error)`）
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            state: RwLock::new(ManagerState::default()),
-            running: AtomicBool::new(false),
-        }
+        Self { state: RwLock::new(ManagerState::default()), running: AtomicBool::new(false) }
     }
 
     /// 取默认 handler（对应 Go `GetDefaultHandler() Handler`）
@@ -205,11 +214,7 @@ impl OutboundManager {
                 errs.push(e.to_string());
             }
         }
-        if errs.is_empty() {
-            Ok(())
-        } else {
-            Err(ProxymanError::CloseAllFailed(errs.join("; ")))
-        }
+        if errs.is_empty() { Ok(()) } else { Err(ProxymanError::CloseAllFailed(errs.join("; "))) }
     }
 
     /// 当前是否运行中
@@ -250,9 +255,11 @@ mod tests {
                 closed: AtomicBool::new(false),
             }
         }
+
         fn is_started(&self) -> bool {
             self.started.load(Ordering::SeqCst)
         }
+
         fn is_closed(&self) -> bool {
             self.closed.load(Ordering::SeqCst)
         }
@@ -262,24 +269,37 @@ mod tests {
         fn tag(&self) -> &str {
             &self.tag
         }
+
         fn start(&self) -> PinFuture<Result<(), ProxymanError>> {
             self.started.store(true, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
         }
+
         fn close(&self) -> PinFuture<Result<(), ProxymanError>> {
             self.closed.store(true, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
         }
+
         fn sender_type_url(&self) -> Option<&str> {
             None
         }
+
         fn proxy_type_url(&self) -> &str {
             &self.type_url
         }
-        fn dispatch(&self, _session: xray_common::session::Session, _link: xray_transport::link::Link) -> PinFuture<Result<(), ProxymanError>> {
+
+        fn dispatch(
+            &self,
+            _session: xray_common::session::Session,
+            _link: xray_transport::link::Link,
+        ) -> PinFuture<Result<(), ProxymanError>> {
             Box::pin(async { Ok(()) })
         }
-        fn dial(&self, _dest: &xray_common::net::destination::Destination) -> PinFuture<std::io::Result<Box<dyn xray_transport::connection::Connection>>> {
+
+        fn dial(
+            &self,
+            _dest: &xray_common::net::destination::Destination,
+        ) -> PinFuture<std::io::Result<Box<dyn xray_transport::connection::Connection>>> {
             Box::pin(async {
                 Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "stub dial"))
             })
@@ -314,7 +334,7 @@ mod tests {
         match m.add_handler(mk("dup")) {
             Err(ProxymanError::ExistingTag(t)) => assert_eq!(t, "dup"),
             Err(e) => panic!("expected ExistingTag, got: {e}"),
-    Ok(_) => panic!("expected error, got Ok"),
+            Ok(_) => panic!("expected error, got Ok"),
         }
     }
 
@@ -358,7 +378,7 @@ mod tests {
         match m.remove_handler("") {
             Err(ProxymanError::NoClue) => (),
             Err(e) => panic!("expected NoClue, got: {e}"),
-    Ok(_) => panic!("expected error, got Ok"),
+            Ok(_) => panic!("expected error, got Ok"),
         }
     }
 

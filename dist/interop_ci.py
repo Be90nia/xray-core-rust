@@ -2,15 +2,15 @@
 """CI 互通测试 (跨平台): dist/interop_matrix.py 的 POSIX 移植, 本地脚本零改动.
 
 - suite rust:        Rust client<->Rust server, 6 协议 x 2 轮 = 12 测
-- suite go:          Go client -> Rust server (官方 xray-core release 二进制), 默认 6 协议
-- suite rust_to_go:  Rust client -> Go server 反向 (26zn 战役暴露盲区补缺), 默认 6 协议
-- suite extra:       新协议 (splithttp/grpc/reality 必交 + hysteria2/anytls/tuic/naive 尽力),
+- suite go:          Go client -> Rust server (官方 xray-core release 二进制), 默认 12 协议
+- suite rust_to_go:  Rust client -> Go server 反向 (26zn 战役暴露盲区补缺), 默认 12 协议
+- suite extra:       新协议 (splithttp/grpc/reality + hysteria2/anytls/tuic/naive),
                      每协议 3 方向 (Rust<->Rust + Go->Rust + Rust->Go) = 3N 测;
                      Go 基线不支持的 proto 自动跳过 cross 方向, 仅 Rust<->Rust 保留.
 
-默认套件 = rust + go + rust_to_go + extra = 18 现有 + 6 反向 + 13 新协议 = 37 测
-(local 26.7.28 Go: hysteria2/anytls/tuic/naive 不支持, 跳过 8 个 cross 方向)
-( CI 26.9.9 Go: 可能全通, runtime 探测自动跳过)
+默认套件 = rust + go + rust_to_go + extra = 12+12+12+21 = 57 测 (Go 26.9.9 全支持口径;
+干跑按满矩阵列清单, 实跑由 runtime 探测门控自动跳过 Go 不支持的方向)
+(local 26.7.28 Go: hysteria2/anytls/tuic/naive 不支持, 实跑自动跳过相应 cross 方向)
 TLS 双向统一 pinnedPeerCertSha256 (bd 5x41: allowInsecure 配置期硬错), 证书由 openssl 现场生成.
 REALITY 配置需 Python `cryptography` 包 (X25519 keypair); CI workflow 已装.
 
@@ -34,18 +34,22 @@ UUID = 'b831381d-6324-4d53-ad4f-8cda48b30811'
 TPW = 'test-pass-12345'
 SS22_KEY = base64.b64encode(b'0123456789abcdef').decode()  # 16B for 2022-blake3-aes-128-gcm
 PROTOS = ['vmess', 'vless_vision_tls', 'trojan_tls', 'vless_ws', 'ss', 'ss2022']
-# Go 交叉：6 协议全 Go->Rust 双向校验。vless_vision_tls 曾因 rustls 贪婪 recv
-# 合流裸尾致 Linux 确定性挂（bd jeu9），RecordFramer 记录对齐读修复后 VPS 连续
-# 5 次 PASS（2026-09-20）恢复进默认列表；--go-protos <list> 仍可缩减。
-GO_CROSS_PROTOS = PROTOS
+# 交叉套件新协议段：与 extra 套件共用 build_x/run_x_one（配置已随 extra 的 cross
+# 方向在 CI 双平台验证）。naive 不加（bd 88vp: Rust 无 naive inbound）。
+CROSS_X_PROTOS = ['splithttp', 'grpc', 'reality', 'hysteria2', 'anytls', 'tuic']
+# Go 交叉：Go->Rust 校验（6 基础 + 6 新协议 = 12）。vless_vision_tls 曾因 rustls 贪婪
+# recv 合流裸尾致 Linux 确定性挂（bd jeu9），RecordFramer 记录对齐读修复后 VPS 连续
+# 5 次 PASS（2026-09-20）恢复进默认列表；--cross-protos <list> 仍可缩减。
+GO_CROSS_PROTOS = PROTOS + CROSS_X_PROTOS
 # Rust 客户端连 Go 服务端反向：补 26zn 战役暴露盲区（只测了 Rust→Rust 与 Go→Rust，
-# 缺 Rust→Go 方向验证）。同一组 6 协议复用 build() —— Go 与 Rust 服务端读同份配置。
-RUST_TO_GO_PROTOS = PROTOS
-# 新协议套件：splithttp/grpc/reality 三件必交付，hysteria2/anytls/tuic 尽力。
-# naive 摘出默认套件（bd 88vp）：Rust 无 naive inbound（xray-transport-naive
-# outbound-only），si 起不来必挂；inbound 实现后经 --extra-protos naive 加回。
+# 缺 Rust→Go 方向验证）。基础 6 协议复用 build()，新协议段复用 build_x()。
+RUST_TO_GO_PROTOS = PROTOS + CROSS_X_PROTOS
+# 新协议套件：splithttp/grpc/reality 三件必交付，hysteria2/anytls/tuic/naive。
+# naive 已加回（bd 88vp 收口：xray-transport-naive inbound 已实现——rustls TLS +
+# h2 CONNECT + Basic auth + padding，naiveproxy 服务端语义；Go 基线无 naive，
+# 实跑 runtime 探测自动跳过 cross 方向，仅 Rust<->Rust）。
 # 每个 proto 各跑 Rust↔Rust + Go→Rust + Rust→Go 三方向 = 3 测。
-EXTRA_PROTOS = ['splithttp', 'grpc', 'reality', 'hysteria2', 'anytls', 'tuic']
+EXTRA_PROTOS = ['splithttp', 'grpc', 'reality', 'hysteria2', 'anytls', 'tuic', 'naive']
 BASE_PORT = 18100
 IS_WIN = os.name == 'nt'
 EXE = '.exe' if IS_WIN else ''
@@ -602,7 +606,7 @@ def _probe_go_supports_xproto(go_bin, work):
 def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ap = argparse.ArgumentParser(description='跨平台互通矩阵: Rust<->Rust 12 测 + Go 双向 + 新协议'
-                                '\n默认套件 rust,go,rust_to_go,extra = 18 现有 + 6 反向 + 3xN 新协议.'
+                                '\n默认套件 rust,go,rust_to_go,extra = 12+12+12+18 = 54 测 (Go 全支持口径).'
                                 '\n--suites 可缩减子集; --cross-protos 控制两个 Go 交叉方向协议列表.'
                                 '\n（--go-protos 为 deprecated alias）')
     ap.add_argument('--rust', default=None, help='Rust 二进制路径 (默认探测 target/release/xray)')
@@ -615,7 +619,7 @@ def main():
     ap.add_argument('--go-protos', default=None,
                     help='deprecated alias for --cross-protos (兼容旧 CI 调用)')
     ap.add_argument('--extra-protos', default=','.join(EXTRA_PROTOS),
-                    help='新协议套件协议列表 (默认 splithttp,grpc,reality,hysteria2,anytls,tuic,naive)')
+                    help='新协议套件协议列表 (默认 splithttp,grpc,reality,hysteria2,anytls,tuic)')
     ap.add_argument('--dry-run', action='store_true', help='只生成证书与配置, 不起进程')
     args = ap.parse_args()
     # 兼容旧 flag: --go-protos 覆盖 --cross-protos
@@ -647,39 +651,61 @@ def main():
     suites = args.suites.split(',')
     cross_protos = [p for p in args.cross_protos.split(',') if p]
     extra_protos = [p for p in args.extra_protos.split(',') if p]
+    go_ok = go and os.path.isfile(go)
+    # Go 基线新协议支持探测: 交叉套件与 extra 套件共用一次结果; dry-run 不起进程,
+    # 按全支持列满矩阵清单 (实跑由探测门控收敛).
+    need_probe = go_ok and (
+        ('extra' in suites)
+        or (('go' in suites or 'rust_to_go' in suites)
+            and any(p in EXTRA_PROTOS for p in cross_protos)))
+    if args.dry_run:
+        go_supports = {p: True for p in EXTRA_PROTOS}
+    elif need_probe:
+        go_supports = _probe_go_supports_xproto(go, work)
+        skipped = [p for p, ok in go_supports.items() if not ok]
+        if skipped:
+            print('!! Go 不支持新协议 (相关 cross 方向跳过): %s' % skipped, flush=True)
+    else:
+        go_supports = {}
     plan = []  # (tag, proto, server_bin, client_bin, is_xproto)
     if 'rust' in suites:
         for rnd in (1, 2):  # 同配双轮: 6x2=12, 兼作真机 flake 检测
             for p in PROTOS:
                 plan.append(('Rust/Rust r%d' % rnd, p, rust, rust, False))
     if 'go' in suites:
-        if go and os.path.isfile(go):
+        if go_ok:
             for p in cross_protos:
+                if p in EXTRA_PROTOS:
+                    continue  # 新协议段统一追加在 plan 尾部 (既有序位/端口零改动)
                 plan.append(('Go/Rust', p, rust, go, False))  # server=Rust, client=Go
         else:
             print('!! 跳过 Go 交叉: 未找到 Go 基线 (--go)', flush=True)
     # 阶段 1 补盲区：Rust 客户端连 Go 服务端反向 (26zn 战役暴露)
     if 'rust_to_go' in suites:
-        if go and os.path.isfile(go):
+        if go_ok:
             for p in RUST_TO_GO_PROTOS:
+                if p in EXTRA_PROTOS:
+                    continue  # 同上, 尾部追加
                 plan.append(('Rust/Go', p, go, rust, False))  # server=Go, client=Rust
         else:
             print('!! 跳过 Rust->Go 反向: 未找到 Go 基线 (--go)', flush=True)
     # 阶段 2 新协议套件：每协议 3 测 (Rust<->Rust + Go->Rust + Rust->Go)
     if 'extra' in suites:
-        go_ok = go and os.path.isfile(go)
-        go_supports = {}
-        if go_ok:
-            # 探测每协议是否被 Go 基线支持; 失败时仅 Rust<->Rust, cross 方向静默跳过
-            go_supports = _probe_go_supports_xproto(go, work)
-            skipped = [p for p, ok in go_supports.items() if not ok]
-            if skipped:
-                print('!! Go 不支持新协议 (cross 方向跳过, Rust<->Rust 保留): %s' % skipped, flush=True)
         for xp in extra_protos:
             plan.append(('%s/Rust' % xp, xp, rust, rust, True))  # Rust<->Rust
             if go_ok and go_supports.get(xp, False):
                 plan.append(('Go/Rust %s' % xp, xp, rust, go, True))  # Go->Rust
                 plan.append(('Rust/Go %s' % xp, xp, go, rust, True))  # Rust->Go
+    # 交叉套件新协议段 (每方向 6 基础 + 6 新 = 12): 走 build_x/run_x_one, 配置形态与
+    # extra 套件 cross 方向一致 (CI 双平台已验证). Go 基线不支持则跳过 (同 extra 语义).
+    if go_ok and ('go' in suites or 'rust_to_go' in suites):
+        for p in CROSS_X_PROTOS:
+            if not go_supports.get(p):
+                continue
+            if 'go' in suites and p in cross_protos:
+                plan.append(('Go/Rust', p, rust, go, True))
+            if 'rust_to_go' in suites and p in RUST_TO_GO_PROTOS:
+                plan.append(('Rust/Go', p, go, rust, True))
 
     print('== 互通 CI: rust=%s go=%s work=%s dry=%s suites=%s ==' % (
         rust, go, work, args.dry_run, args.suites), flush=True)

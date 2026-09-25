@@ -9,12 +9,15 @@
 
 use dashmap::DashMap;
 use prost::Message as _;
-use xray_proto::xray::common::protocol::User as ProtoUser;
-use xray_proto::xray::common::serial::TypedMessage;
-use xray_proto::xray::proxy::trojan::Account as ProtoAccount;
+use xray_proto::xray::{
+    common::{protocol::User as ProtoUser, serial::TypedMessage},
+    proxy::trojan::Account as ProtoAccount,
+};
 
-use crate::config::{hex_string, MemoryAccount, ACCOUNT_TYPE_URL};
-use crate::error::{Result, TrojanError};
+use crate::{
+    config::{ACCOUNT_TYPE_URL, MemoryAccount, hex_string},
+    error::{Result, TrojanError},
+};
 
 /// Trojan 运行时用户（账户 + 元数据），对应 Go `protocol.MemoryUser`（Trojan 用法子集）。
 #[derive(Debug, Clone, PartialEq)]
@@ -30,11 +33,7 @@ pub struct MemoryUser {
 impl MemoryUser {
     /// 构造新用户。
     pub fn new(email: impl Into<String>, level: u32, account: MemoryAccount) -> Self {
-        Self {
-            email: email.into(),
-            level,
-            account,
-        }
+        Self { email: email.into(), level, account }
     }
 
     /// 计算 hex(key) 索引字符串（用作 Validator 内部 `users` map 的 key）。
@@ -75,7 +74,6 @@ impl MemoryUser {
     }
 }
 
-
 /// Trojan 用户验证器：维护 email、hex(key)、md5(key) 三索引。
 ///
 /// 对应 Go `proxy/trojan/validator.go::Validator`（Go 仅前两者；
@@ -112,8 +110,7 @@ impl Validator {
         }
         let key_hash = user.key_hash();
         self.users.insert(key_hash, user.clone());
-        self.md5_users
-            .insert(crate::config::md5_key(&user.account.password), user);
+        self.md5_users.insert(crate::config::md5_key(&user.account.password), user);
         Ok(())
     }
 
@@ -134,8 +131,7 @@ impl Validator {
             .remove(&email_lower)
             .ok_or_else(|| TrojanError::UserNotFoundByEmail(email.into()))?;
         self.users.remove(&user.key_hash());
-        self.md5_users
-            .remove(&crate::config::md5_key(&user.account.password));
+        self.md5_users.remove(&crate::config::md5_key(&user.account.password));
         Ok(())
     }
 
@@ -152,10 +148,7 @@ impl Validator {
 
     /// 列出所有用户，对应 Go `Validator.GetAll`。
     pub fn get_all(&self) -> Vec<MemoryUser> {
-        self.email
-            .iter()
-            .map(|r| r.value().clone())
-            .collect::<Vec<_>>()
+        self.email.iter().map(|r| r.value().clone()).collect::<Vec<_>>()
     }
 
     /// 返回用户总数，对应 Go `Validator.GetCount`。
@@ -181,7 +174,6 @@ impl Validator {
     pub fn get_by_md5(&self, key: &[u8; 16]) -> Option<MemoryUser> {
         self.md5_users.get(key).map(|r| r.clone())
     }
-
 }
 
 #[cfg(test)]
@@ -265,19 +257,13 @@ mod tests {
     #[test]
     fn test_del_empty_email_fails() {
         let v = Validator::new();
-        assert!(matches!(
-            v.del(""),
-            Err(TrojanError::EmptyEmail)
-        ));
+        assert!(matches!(v.del(""), Err(TrojanError::EmptyEmail)));
     }
 
     #[test]
     fn test_del_not_found() {
         let v = Validator::new();
-        assert!(matches!(
-            v.del("ghost@x.com"),
-            Err(TrojanError::UserNotFoundByEmail(_))
-        ));
+        assert!(matches!(v.del("ghost@x.com"), Err(TrojanError::UserNotFoundByEmail(_))));
     }
 
     #[test]
@@ -300,8 +286,7 @@ mod tests {
     #[test]
     fn test_concurrent_add_del() {
         // dashmap 保证并发安全（与 Go sync.Map 等价）
-        use std::sync::Arc;
-        use std::thread;
+        use std::{sync::Arc, thread};
 
         let v = Arc::new(Validator::new());
         let mut handles = Vec::new();

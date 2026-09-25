@@ -18,9 +18,10 @@
 
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
 use xray_conf::{BuiltConfig, BuiltEntry, BuiltInbound, BuiltOutbound};
 use xray_core::functions::start_full;
 
@@ -52,7 +53,7 @@ async fn spawn_echo_server() -> u16 {
                             if sock.write_all(&buf[..n]).await.is_err() {
                                 return;
                             }
-                        }
+                        },
                     }
                 }
             });
@@ -64,10 +65,7 @@ async fn spawn_echo_server() -> u16 {
 /// Build a freedom outbound (default destination handler).
 fn freedom_outbound(tag: &str) -> BuiltOutbound {
     BuiltOutbound {
-        entry: BuiltEntry {
-            kind: "freedom".into(),
-            data: b"{}".to_vec(),
-        },
+        entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
         tag: tag.into(),
         send_through: None,
         stream_settings_json: None,
@@ -89,10 +87,7 @@ fn dokodemo_tcp_inbound(port: u16, target_addr: &str, target_port: u16) -> Built
     .to_string()
     .into_bytes();
     BuiltInbound {
-        entry: BuiltEntry {
-            kind: "dokodemo".into(),
-            data,
-        },
+        entry: BuiltEntry { kind: "dokodemo".into(), data },
         tag: "dokodemo-in".into(),
         port: Some(port),
         listen: Some("127.0.0.1".into()),
@@ -123,29 +118,19 @@ async fn passive_connection_dokodemo_to_echo() {
     let dokodemo_port = pick_free_port().await;
 
     let mut built = BuiltConfig::default();
-    built.inbounds.push(dokodemo_tcp_inbound(
-        dokodemo_port,
-        "127.0.0.1",
-        echo_port,
-    ));
+    built.inbounds.push(dokodemo_tcp_inbound(dokodemo_port, "127.0.0.1", echo_port));
     built.outbounds.push(freedom_outbound("direct"));
 
     // 3. start_full 启 xray-core
-    let (instance, _ohm, handles) = start_full(&built)
-        .await
-        .expect("start_full");
-    assert!(
-        instance.is_running(),
-        "instance must be running after start_full"
-    );
+    let (instance, _ohm, handles) = start_full(&built).await.expect("start_full");
+    assert!(instance.is_running(), "instance must be running after start_full");
 
     // 4. 等 listener 就绪
     wait_ready(dokodemo_port).await;
 
     // 5. 客户端 dial → echo 回环
-    let mut client = TcpStream::connect(("127.0.0.1", dokodemo_port))
-        .await
-        .expect("connect dokodemo");
+    let mut client =
+        TcpStream::connect(("127.0.0.1", dokodemo_port)).await.expect("connect dokodemo");
 
     let payload = b"hello passive connection test!";
     client.write_all(payload).await.expect("write");

@@ -10,13 +10,14 @@
 //! - [`CryptionReader`] — 解密读取器：从 BufferedReader 读取密文并解密
 //! - [`CryptionWriter`] — 加密写入器：加密明文后写入 Writer
 
-use crate::aead::{
-    AesCfbDecryptor, AesCfbEncryptor, AesCtrStream, ChaCha20Stream, CryptoError,
+use xray_buf::{
+    buffer::Buffer,
+    io::{self, Writer},
+    multi::MultiBuffer,
+    reader::BufferedReader,
 };
-use xray_buf::io::{self, Writer};
-use xray_buf::reader::BufferedReader;
-use xray_buf::multi::MultiBuffer;
-use xray_buf::buffer::Buffer;
+
+use crate::aead::{AesCfbDecryptor, AesCfbEncryptor, AesCtrStream, ChaCha20Stream, CryptoError};
 
 // ========== StreamCipher trait ==========
 
@@ -77,10 +78,7 @@ impl<'a> CryptionReader<'a> {
     /// 创建新的加密流读取器。
     ///
     /// 对应 Go 的 `NewCryptionReader(stream, reader)`。
-    pub fn new(
-        stream: Box<dyn StreamCipher>,
-        reader: &'a mut BufferedReader,
-    ) -> Self {
+    pub fn new(stream: Box<dyn StreamCipher>, reader: &'a mut BufferedReader) -> Self {
         Self { stream, reader }
     }
 
@@ -103,10 +101,7 @@ impl<'a> CryptionReader<'a> {
     /// 读取并解密最多 `size` 字节，返回 MultiBuffer。
     ///
     /// 对应 Go 中通过 BufferedReader 读取后解密的组合操作。
-    pub async fn read_at_most(
-        &mut self,
-        size: usize,
-    ) -> io::Result<MultiBuffer> {
+    pub async fn read_at_most(&mut self, size: usize) -> io::Result<MultiBuffer> {
         let mb = self.reader.read_at_most(size).await?;
         if mb.is_empty() {
             return Ok(mb);
@@ -137,10 +132,7 @@ impl CryptionWriter {
     /// 创建新的加密流写入器。
     ///
     /// 对应 Go 的 `NewCryptionWriter(stream, writer)`。
-    pub fn new(
-        stream: Box<dyn StreamCipher>,
-        writer: Box<dyn Writer>,
-    ) -> Self {
+    pub fn new(stream: Box<dyn StreamCipher>, writer: Box<dyn Writer>) -> Self {
         Self { stream, writer }
     }
 
@@ -172,10 +164,7 @@ impl CryptionWriter {
     /// # 错误
     ///
     /// 底层写入失败时返回 `io::Error::WriteError`。
-    pub async fn write_multi_buffer(
-        &mut self,
-        mut mb: MultiBuffer,
-    ) -> io::Result<()> {
+    pub async fn write_multi_buffer(&mut self, mut mb: MultiBuffer) -> io::Result<()> {
         for buf in mb.iter_mut() {
             let data = buf.as_mut();
             if !data.is_empty() {
@@ -190,9 +179,7 @@ impl Writer for CryptionWriter {
     fn write_multi_buffer(
         &mut self,
         mb: MultiBuffer,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = io::Result<()>> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + '_>> {
         Box::pin(async move { self.write_multi_buffer(mb).await })
     }
 }
@@ -213,23 +200,19 @@ pub enum CryptionError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::aead::{
-        AesCfbDecryptor, AesCfbEncryptor, AesCtrStream, ChaCha20Stream,
-    };
     use std::io::Cursor;
-    use xray_buf::io::new_reader;
-    use xray_buf::buffer::Buffer;
+
+    use xray_buf::{buffer::Buffer, io::new_reader};
+
+    use super::*;
+    use crate::aead::{AesCfbDecryptor, AesCfbEncryptor, AesCtrStream, ChaCha20Stream};
 
     fn make_buffered_reader(data: &[u8]) -> BufferedReader {
         let reader = new_reader(Cursor::new(data.to_vec()));
         BufferedReader::new(reader)
     }
 
-    fn direct_encrypt(
-        encryptor: &mut AesCfbEncryptor,
-        plaintext: &[u8],
-    ) -> Vec<u8> {
+    fn direct_encrypt(encryptor: &mut AesCfbEncryptor, plaintext: &[u8]) -> Vec<u8> {
         let mut data = plaintext.to_vec();
         encryptor.encrypt(&mut data);
         data
@@ -323,10 +306,7 @@ mod tests {
         let mut reader = make_buffered_reader(&ciphertext);
         let mut cr = CryptionReader::new(Box::new(decryptor), &mut reader);
 
-        let mb = cr
-            .read_at_most(5)
-            .await
-            .expect("read_at_most should succeed");
+        let mb = cr.read_at_most(5).await.expect("read_at_most should succeed");
         assert_eq!(mb.len(), 5);
         assert_eq!(mb.to_vec(), b"hello");
     }
@@ -399,9 +379,7 @@ mod tests {
         mb.push(Buffer::from_vec(b"hello ".to_vec()));
         mb.push(Buffer::from_vec(b"multi buffer".to_vec()));
 
-        cw.write_multi_buffer(mb)
-            .await
-            .expect("write_multi_buffer should succeed");
+        cw.write_multi_buffer(mb).await.expect("write_multi_buffer should succeed");
     }
 
     #[tokio::test]
@@ -414,11 +392,8 @@ mod tests {
         let writer = xray_buf::io::new_writer(buffer);
         let mut cw = CryptionWriter::new(Box::new(encryptor), writer);
 
-        let mb =
-            MultiBuffer::from_buffer(Buffer::from_vec(b"writer trait test".to_vec()));
-        cw.write_multi_buffer(mb)
-            .await
-            .expect("write via Writer trait should succeed");
+        let mb = MultiBuffer::from_buffer(Buffer::from_vec(b"writer trait test".to_vec()));
+        cw.write_multi_buffer(mb).await.expect("write via Writer trait should succeed");
     }
 
     // ---------- Writer→Reader 端到端 Roundtrip 测试 ----------

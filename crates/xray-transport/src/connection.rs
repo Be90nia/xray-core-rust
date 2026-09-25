@@ -20,12 +20,17 @@
 //!
 //! 不在本会话范围：TLS / WebSocket / KCP 等 Connection 实现，留待各传输协议 crate。
 
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    task::{Context, Poll},
+};
+
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpStream,
+};
 
 /// 网络连接抽象。
 ///
@@ -84,8 +89,8 @@ pub trait Connection: AsyncRead + AsyncWrite + Send + Sync + Unpin {
     ///
     /// # 参数
     ///
-    /// - `bufs`：各缓冲的可写区（TCP 实现经 `xray_buf::readv` 的零分配
-    ///   IovecBatch 栈数组路径构建）。
+    /// - `bufs`：各缓冲的可写区（TCP 实现经 `xray_buf::readv` 的零分配 IovecBatch
+    ///   栈数组路径构建）。
     fn poll_read_multi(
         &mut self,
         cx: &mut Context<'_>,
@@ -103,8 +108,6 @@ pub trait Connection: AsyncRead + AsyncWrite + Send + Sync + Unpin {
         Poll::Ready(Ok(rb.filled().len()))
     }
 }
-
-
 
 /// 复制 `tokio::net::TcpStream` 底层 socket 为独立 handle（vision splice 用）。
 ///
@@ -132,7 +135,8 @@ pub fn dup_tcp_stream(stream: &TcpStream) -> Option<TcpStream> {
         // SAFETY: raw handle 由 stream 持有且调用期间有效；视图被
         // ManuallyDrop 包裹不会关闭它，克隆出的 handle 独立拥有新句柄。
         let raw = stream.as_raw_socket();
-        let view = std::mem::ManuallyDrop::new(unsafe { std::net::TcpStream::from_raw_socket(raw) });
+        let view =
+            std::mem::ManuallyDrop::new(unsafe { std::net::TcpStream::from_raw_socket(raw) });
         let cloned = view.try_clone().ok()?;
         TcpStream::from_std(cloned).ok()
     }
@@ -158,6 +162,7 @@ impl TcpConnection {
     pub fn new(stream: TcpStream) -> Self {
         Self { inner: stream }
     }
+
     /// 拆出底层 `TcpStream`。
     #[must_use]
     pub fn into_inner(self) -> TcpStream {
@@ -226,12 +231,15 @@ impl Connection for TcpConnection {
     fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(Some(self.inner.peer_addr()?))
     }
+
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(Some(self.inner.local_addr()?))
     }
+
     fn raw_tcp_clone(&self) -> Option<TcpStream> {
         dup_tcp_stream(&self.inner)
     }
+
     /// 真 scatter-gather 读（bd 2o9l，Go ReadVReader rawConn 分支的 Rust 等价）：
     /// readiness + `try_read_vectored`。`WouldBlock` 时 readiness 已被 tokio 消费，
     /// 重新 poll_read_ready 注册 waker，不空转。
@@ -249,11 +257,13 @@ impl Connection for TcpConnection {
             }
         }
     }
+
     /// 裸 TCP 连接保持 splice 准入信号（fb0e7ba 引入；fc9050c 误删致 Linux
     /// splice 准入 outbound_raw 恒 false——此处恢复）。
     fn is_raw_tcp(&self) -> bool {
         true
     }
+
     fn close_read(&mut self) -> io::Result<()> {
         #[cfg(unix)]
         {
@@ -268,6 +278,7 @@ impl Connection for TcpConnection {
         self.winsock_shutdown(std::net::Shutdown::Read)?;
         Ok(())
     }
+
     fn close_write(&mut self) -> io::Result<()> {
         #[cfg(unix)]
         {
@@ -284,7 +295,6 @@ impl Connection for TcpConnection {
     }
 }
 
-///
 /// 包装 `tokio::net::UnixStream`，提供 `Connection` 实现。供 splithttp unix
 /// listener 把 accepted UnixStream 经 tcpmask 包装后再下传（Go
 /// `splithttp/hub.go:547-549` 的 WrapListener 语义）。
@@ -350,9 +360,11 @@ impl Connection for UnixConnection {
         // UnixStream 无标准 SocketAddr；返回 None。
         Ok(None)
     }
+
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(None)
     }
+
     fn close_read(&mut self) -> io::Result<()> {
         use std::os::unix::io::AsRawFd;
         let ret = unsafe { libc::shutdown(self.inner.as_raw_fd(), libc::SHUT_RD) };
@@ -361,6 +373,7 @@ impl Connection for UnixConnection {
         }
         Ok(())
     }
+
     fn close_write(&mut self) -> io::Result<()> {
         use std::os::unix::io::AsRawFd;
         let ret = unsafe { libc::shutdown(self.inner.as_raw_fd(), libc::SHUT_WR) };
@@ -415,6 +428,7 @@ impl Connection for DuplexConnection {
     fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(None)
     }
+
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(None)
     }
@@ -510,8 +524,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for PrefixedReader<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
 
     #[tokio::test]
     async fn tcp_connection_addrs_populated() {
@@ -622,18 +637,14 @@ mod tests {
         let mut late = [0u8; 4];
         match tokio::time::timeout(Duration::from_secs(5), client.read(&mut late)).await {
             Err(_) => panic!("close_read: neither EOF nor error — half-close is a silent no-op"),
-            Ok(Ok(0)) => {} // unix SHUT_RD → EOF
+            Ok(Ok(0)) => {}, // unix SHUT_RD → EOF
             Ok(Ok(n)) => {
                 panic!("close_read: still read {n} bytes of new peer data: {:?}", &late[..n])
-            }
+            },
             Ok(Err(e)) => {
                 // Windows SD_RECEIVE → WSAESHUTDOWN；非 WouldBlock 即真实半关闭。
-                assert_ne!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock,
-                    "unexpected WouldBlock: {e}"
-                );
-            }
+                assert_ne!(e.kind(), std::io::ErrorKind::WouldBlock, "unexpected WouldBlock: {e}");
+            },
         }
     }
 }

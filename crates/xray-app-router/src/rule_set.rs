@@ -19,7 +19,7 @@
 //! ## 用法
 //!
 //! ```no_run
-//! use xray_app_router::rule_set::{RuleSetConfig, RuleSetRegistry, RuleSetType, RuleSetFormat};
+//! use xray_app_router::rule_set::{RuleSetConfig, RuleSetFormat, RuleSetRegistry, RuleSetType};
 //!
 //! let cfg = RuleSetConfig {
 //!     tag: "geosite".into(),
@@ -33,8 +33,7 @@
 //! let domains = registry.get_domains("geosite").unwrap();
 //! ```
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use parking_lot::RwLock;
 
@@ -90,9 +89,7 @@ impl RuleSetRegistry {
     /// 仅 `File` + `Json` 格式实现；`Remote` 返回 `Err`。
     pub fn load(&self, cfg: &RuleSetConfig) -> Result<(), RouterError> {
         if cfg.rule_set_type == RuleSetType::Remote {
-            return Err(RouterError::Other(
-                "remote rule_set download not implemented".into(),
-            ));
+            return Err(RouterError::Other("remote rule_set download not implemented".into()));
         }
 
         let loaded = load_json_rule_set(Path::new(&cfg.path))?;
@@ -128,11 +125,7 @@ impl RuleSetRegistry {
 
     /// 检查域名是否在 rule_set 中。
     pub fn contains_domain(&self, tag: &str, domain: &str) -> bool {
-        self.sets
-            .read()
-            .get(tag)
-            .map(|s| s.domains.iter().any(|d| d == domain))
-            .unwrap_or(false)
+        self.sets.read().get(tag).map(|s| s.domains.iter().any(|d| d == domain)).unwrap_or(false)
     }
 }
 
@@ -142,20 +135,15 @@ impl RuleSetRegistry {
 /// 1. xray 原生格式：`{ "domain": ["a.com", "b.com"], "ip": ["1.2.3.0/24"] }`
 /// 2. 简单列表格式：`["a.com", "b.com"]`（全部视为域名）
 fn load_json_rule_set(path: &Path) -> Result<LoadedRuleSet, RouterError> {
-    let content = std::fs::read_to_string(path).map_err(|e| {
-        RouterError::Other(format!("failed to read rule_set file {:?}: {e}", path))
-    })?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| RouterError::Other(format!("failed to read rule_set file {:?}: {e}", path)))?;
 
     let trimmed = content.trim();
     if trimmed.starts_with('[') {
         // 简单列表格式
-        let domains: Vec<String> = serde_json::from_str(&content).map_err(|e| {
-            RouterError::Other(format!("failed to parse rule_set JSON array: {e}"))
-        })?;
-        return Ok(LoadedRuleSet {
-            domains,
-            ips: Vec::new(),
-        });
+        let domains: Vec<String> = serde_json::from_str(&content)
+            .map_err(|e| RouterError::Other(format!("failed to parse rule_set JSON array: {e}")))?;
+        return Ok(LoadedRuleSet { domains, ips: Vec::new() });
     }
 
     // xray 原生格式
@@ -165,21 +153,13 @@ fn load_json_rule_set(path: &Path) -> Result<LoadedRuleSet, RouterError> {
     let domains = v
         .get("domain")
         .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|d| d.as_str().map(String::from))
-                .collect()
-        })
+        .map(|arr| arr.iter().filter_map(|d| d.as_str().map(String::from)).collect())
         .unwrap_or_default();
 
     let ips = v
         .get("ip")
         .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|d| d.as_str().map(String::from))
-                .collect()
-        })
+        .map(|arr| arr.iter().filter_map(|d| d.as_str().map(String::from)).collect())
         .unwrap_or_default();
 
     Ok(LoadedRuleSet { domains, ips })
@@ -187,8 +167,9 @@ fn load_json_rule_set(path: &Path) -> Result<LoadedRuleSet, RouterError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write;
+
+    use super::*;
 
     fn write_temp_json(content: &str, name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join("xray_router_test");

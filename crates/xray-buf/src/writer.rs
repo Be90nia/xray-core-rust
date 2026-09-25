@@ -2,13 +2,19 @@
 //!
 //! 对应 Go 版本 `common/buf/writer.go`，提供 SequentialWriter、BufferedWriter 和 Discard。
 
-use crate::buffer::Buffer;
-use crate::io::{self, Result, Writer};
-use crate::multi::MultiBuffer;
-use std::future::{Future, poll_fn};
-use std::io::IoSlice;
-use std::pin::Pin;
+use std::{
+    future::{Future, poll_fn},
+    io::IoSlice,
+    pin::Pin,
+};
+
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+
+use crate::{
+    buffer::Buffer,
+    io::{self, Result, Writer},
+    multi::MultiBuffer,
+};
 
 // ========== SequentialWriter ==========
 
@@ -23,9 +29,7 @@ pub struct SequentialWriter {
 impl SequentialWriter {
     /// 创建新的 SequentialWriter
     pub fn new(w: impl AsyncWrite + Unpin + Send + 'static) -> Self {
-        Self {
-            inner: Box::new(w),
-        }
+        Self { inner: Box::new(w) }
     }
 
     /// 消费写入器，返回底层 AsyncWrite
@@ -66,9 +70,7 @@ async fn write_sequential<W: AsyncWrite + Unpin + ?Sized>(
         if data.is_empty() {
             continue;
         }
-        w.write_all(data)
-            .await
-            .map_err(|e| io::classify_io_error(e, false))?;
+        w.write_all(data).await.map_err(|e| io::classify_io_error(e, false))?;
     }
     Ok(())
 }
@@ -129,12 +131,7 @@ impl BufferedWriter {
     ///
     /// 默认为缓冲模式（buffered = true）。
     pub fn new(writer: Box<dyn Writer>) -> Self {
-        Self {
-            writer,
-            buffer: None,
-            buffered: true,
-            flush_next: false,
-        }
+        Self { writer, buffer: None, buffered: true, flush_next: false }
     }
 
     /// 写入单个 Buffer
@@ -262,6 +259,7 @@ impl DiscardBytes {
 #[cfg(test)]
 mod tests {
     use std::task::{Context, Poll};
+
     use super::*;
 
     #[tokio::test]
@@ -391,7 +389,11 @@ mod tests {
         fn new(chunk: Option<usize>) -> (Self, Self) {
             let data = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let writer_mock = Self { data: std::sync::Arc::clone(&data), chunk, vectored_calls: std::sync::Arc::clone(&calls) };
+            let writer_mock = Self {
+                data: std::sync::Arc::clone(&data),
+                chunk,
+                vectored_calls: std::sync::Arc::clone(&calls),
+            };
             let probe = Self { data, chunk, vectored_calls: calls };
             (writer_mock, probe)
         }
@@ -457,11 +459,7 @@ mod tests {
             b"aaabbbcc".as_slice(),
             "聚合写必须保序拼接全部块"
         );
-        assert_eq!(
-            probe.vectored_calls.load(Relaxed),
-            1,
-            "3 块应单次 poll_write_vectored 写出"
-        );
+        assert_eq!(probe.vectored_calls.load(Relaxed), 1, "3 块应单次 poll_write_vectored 写出");
     }
 
     #[tokio::test]

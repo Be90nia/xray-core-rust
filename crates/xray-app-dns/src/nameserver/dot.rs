@@ -1,4 +1,5 @@
-//! DoT (DNS over TLS) nameserver。对应 Go `app/dns/nameserver_tls.go`（隐含在 nameserver.go 的 TLS 分支）。
+//! DoT (DNS over TLS) nameserver。对应 Go `app/dns/nameserver_tls.go`（隐含在 nameserver.go 的 TLS
+//! 分支）。
 //!
 //! ## 实现
 //!
@@ -13,33 +14,39 @@
 //! - 走 Xray routing/dispatcher 出口（直接用 tokio socket + xray_tls）
 //! - 长连接复用（每次查询都新连接；ponytail：连接池可后续加）
 
-use std::future::Future;
-use std::io;
-use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    future::Future,
+    io,
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use hickory_proto::rr::RecordType;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    time::timeout,
+};
 use tokio_rustls::rustls::ClientConfig;
-
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::port::Port;
+use xray_common::net::{address::Address, destination::Destination, port::Port};
 use xray_tls::utls::client as tls_client;
 use xray_transport::connection::TcpConnection;
 
-use crate::cache_controller::CacheController;
-use crate::config::IpOption;
-use crate::dnscommon::{
-    build_dns_query, parse_dns_response, parsed_to_ip_record, AtomicReqIdGen, IpRecord, ReqIdGen,
+use crate::{
+    cache_controller::CacheController,
+    config::IpOption,
+    dnscommon::{
+        AtomicReqIdGen, IpRecord, ReqIdGen, build_dns_query, parse_dns_response,
+        parsed_to_ip_record,
+    },
+    error::DnsError,
+    nameserver::{
+        NameServerConfig, Server,
+        cached::{CachedNameserver, QueryOutcome, query_ip},
+    },
 };
-use crate::error::DnsError;
-use crate::nameserver::cached::{query_ip, CachedNameserver, QueryOutcome};
-use crate::nameserver::{NameServerConfig, Server};
 
 /// DoT 单次响应最大字节数（与 TCP 一致）。
 const DOT_RECV_MAX: usize = 65535;
@@ -64,7 +71,9 @@ pub struct DotNameServer {
     /// 请求 ID 生成器。
     id_gen: AtomicReqIdGen,
     /// 连接池：复用 TLS 连接（流形态：直连 TcpConnection 或经路由 Link 流）。
-    conn: tokio::sync::Mutex<Option<xray_tls::utls::Conn<Box<dyn xray_transport::connection::Connection>>>>,
+    conn: tokio::sync::Mutex<
+        Option<xray_tls::utls::Conn<Box<dyn xray_transport::connection::Connection>>>,
+    >,
     /// 域名解析器（直连兜底路径）。
     resolver: Arc<dyn crate::dial::HostResolver>,
     /// `+local`：强制直连（绕过共享 dialer，Go Local mode nil dispatcher）。
@@ -147,11 +156,7 @@ impl DotNameServer {
         .await?;
         let tls = timeout(
             self.query_timeout,
-            tls_client(
-                stream,
-                &self.server_name,
-                Arc::clone(&self.tls_config),
-            ),
+            tls_client(stream, &self.server_name, Arc::clone(&self.tls_config)),
         )
         .await
         .map_err(|_| DnsError::WireFormat("dot tls handshake timeout".to_string()))?
@@ -170,17 +175,20 @@ impl DotNameServer {
     ) -> Result<IpRecord, DnsError> {
         // 写长度前缀 + payload。
         timeout(self.query_timeout, stream.write_all(len_be))
-            .await.map_err(|_| DnsError::WireFormat("dot write len timeout".to_string()))?
+            .await
+            .map_err(|_| DnsError::WireFormat("dot write len timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("dot write len: {e}")))?;
         timeout(self.query_timeout, stream.write_all(payload))
-            .await.map_err(|_| DnsError::WireFormat("dot write payload timeout".to_string()))?
+            .await
+            .map_err(|_| DnsError::WireFormat("dot write payload timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("dot write payload: {e}")))?;
         stream.flush().await.map_err(io_to_dns)?;
 
         // 读 2 字节长度前缀。
         let mut len_buf = [0u8; 2];
         timeout(self.query_timeout, stream.read_exact(&mut len_buf))
-            .await.map_err(|_| DnsError::WireFormat("dot read len timeout".to_string()))?
+            .await
+            .map_err(|_| DnsError::WireFormat("dot read len timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("dot read len: {e}")))?;
         let resp_len = usize::from(u16::from_be_bytes(len_buf));
         if resp_len == 0 || resp_len > DOT_RECV_MAX {
@@ -190,7 +198,8 @@ impl DotNameServer {
         // 读响应 payload。
         let mut buf = vec![0u8; resp_len];
         timeout(self.query_timeout, stream.read_exact(&mut buf))
-            .await.map_err(|_| DnsError::WireFormat("dot read payload timeout".to_string()))?
+            .await
+            .map_err(|_| DnsError::WireFormat("dot read payload timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("dot read payload: {e}")))?;
 
         let now = Instant::now();
@@ -199,11 +208,7 @@ impl DotNameServer {
     }
 
     /// 发送单次 DNS 查询（DoT），等待响应。连接池复用 TLS 连接，失败时重试一次。
-    async fn query_once(
-        &self,
-        fqdn: &str,
-        record_type: RecordType,
-    ) -> Result<IpRecord, DnsError> {
+    async fn query_once(&self, fqdn: &str, record_type: RecordType) -> Result<IpRecord, DnsError> {
         let req_id = self.id_gen.next_id();
         let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
         let len_be = u16::try_from(payload.len())
@@ -216,15 +221,19 @@ impl DotNameServer {
         }
 
         // 尝试在已有连接上查询，失败则丢弃重连。
-        match self.try_query(conn_guard.as_mut().unwrap(), &len_be, &payload, req_id, record_type).await {
+        match self
+            .try_query(conn_guard.as_mut().unwrap(), &len_be, &payload, req_id, record_type)
+            .await
+        {
             Ok(result) => Ok(result),
             Err(e) => {
                 // 首查失败静默重连不可观测（iq1o）：记录首查错误再重试。
                 tracing::debug!(error = %e, "DoT query on pooled connection failed, reconnecting");
                 *conn_guard = None;
                 *conn_guard = Some(self.connect_tls().await?);
-                self.try_query(conn_guard.as_mut().unwrap(), &len_be, &payload, req_id, record_type).await
-            }
+                self.try_query(conn_guard.as_mut().unwrap(), &len_be, &payload, req_id, record_type)
+                    .await
+            },
         }
     }
 }
@@ -291,15 +300,18 @@ pub fn new_dot_name_server(
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
+    use hickory_proto::{
+        op::{Message, MessageType, OpCode, Query},
+        rr::{Name, RData, Record, RecordType},
+    };
+    use tokio::net::TcpListener;
+    use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
+    use xray_transport::connection::TcpConnection;
+
     use super::*;
     use crate::config::IpOption;
-    use hickory_proto::op::{Message, MessageType, OpCode, Query};
-    use hickory_proto::rr::{Name, RData, Record, RecordType};
-    use std::net::Ipv4Addr;
-    use tokio::net::TcpListener;
-    use tokio_rustls::rustls::ServerConfig;
-    use tokio_rustls::TlsAcceptor;
-    use xray_transport::connection::TcpConnection;
 
     fn ip_dest(addr: SocketAddr) -> Destination {
         Destination::tcp(Address::from(addr.ip()), Port::new(addr.port()))
@@ -308,7 +320,9 @@ mod tests {
     /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
     fn ensure_crypto_provider() {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| { let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default(); });
+        ONCE.call_once(|| {
+            let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        });
     }
 
     fn make_a_response(req_id: u16, fqdn: &str, ips: Vec<Ipv4Addr>, ttl: u32) -> Vec<u8> {
@@ -316,7 +330,8 @@ mod tests {
         let mut msg = Message::new(req_id, MessageType::Response, OpCode::Query);
         msg.add_query(Query::query(name.clone(), RecordType::A));
         for ip in ips {
-            let rec = Record::from_rdata(name.clone(), ttl, RData::A(hickory_proto::rr::rdata::A(ip)));
+            let rec =
+                Record::from_rdata(name.clone(), ttl, RData::A(hickory_proto::rr::rdata::A(ip)));
             msg.add_answer(rec);
         }
         msg.to_vec().unwrap()
@@ -327,15 +342,10 @@ mod tests {
         fqdn: &str,
         ips: Vec<Ipv4Addr>,
         ttl: u32,
-    ) -> (
-        SocketAddr,
-        Arc<ClientConfig>,
-        tokio::task::JoinHandle<()>,
-    ) {
+    ) -> (SocketAddr, Arc<ClientConfig>, tokio::task::JoinHandle<()>) {
         ensure_crypto_provider();
         // rcgen 自签证书（SAN: localhost）。
-        let cert_params =
-            rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         let key_pair = rcgen::KeyPair::generate().unwrap();
         let cert = cert_params.self_signed(&key_pair).unwrap();
         let cert_der = cert.der().to_vec();
@@ -346,9 +356,7 @@ mod tests {
         let server_config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(
-                vec![tokio_rustls::rustls::pki_types::CertificateDer::from(
-                    cert_der.clone(),
-                )],
+                vec![tokio_rustls::rustls::pki_types::CertificateDer::from(cert_der.clone())],
                 key,
             )
             .unwrap();
@@ -372,12 +380,7 @@ mod tests {
 
             // 用 query ID 构造响应。
             let query_msg = Message::from_vec(&buf).unwrap();
-            let resp = make_a_response(
-                query_msg.metadata.id,
-                &fqdn_owned,
-                ips.clone(),
-                ttl,
-            );
+            let resp = make_a_response(query_msg.metadata.id, &fqdn_owned, ips.clone(), ttl);
 
             // 回写 2B 长度 + response。
             let len = u16::try_from(resp.len()).unwrap().to_be_bytes();
@@ -388,15 +391,9 @@ mod tests {
 
         // 信任自签证书的 client config。
         let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
-        root_store
-            .add(tokio_rustls::rustls::pki_types::CertificateDer::from(
-                cert_der,
-            ))
-            .unwrap();
+        root_store.add(tokio_rustls::rustls::pki_types::CertificateDer::from(cert_der)).unwrap();
         let client_config = Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
+            ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth(),
         );
 
         (addr, client_config, handle)
@@ -437,11 +434,7 @@ mod tests {
         let outcome = ns
             .send_query(
                 "z.com.",
-                IpOption {
-                    ipv4_enable: true,
-                    ipv6_enable: false,
-                    fake_enable: false,
-                },
+                IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },
             )
             .await;
         assert!(outcome.rec_v4.is_some());
@@ -457,21 +450,14 @@ mod tests {
         // 不 spawn accept，connect 成功但 TLS 握手必失败。
 
         // 用信任 localhost 的 config（自签）。
-        let cert_params =
-            rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         let key_pair = rcgen::KeyPair::generate().unwrap();
         let cert = cert_params.self_signed(&key_pair).unwrap();
         let cert_der = cert.der().to_vec();
         let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
-        root_store
-            .add(tokio_rustls::rustls::pki_types::CertificateDer::from(
-                cert_der,
-            ))
-            .unwrap();
+        root_store.add(tokio_rustls::rustls::pki_types::CertificateDer::from(cert_der)).unwrap();
         let tls_config = Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
+            ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth(),
         );
 
         let ns = DotNameServer::new(
@@ -485,11 +471,7 @@ mod tests {
         let outcome = ns
             .send_query(
                 "bad.com.",
-                IpOption {
-                    ipv4_enable: true,
-                    ipv6_enable: false,
-                    fake_enable: false,
-                },
+                IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },
             )
             .await;
         // TLS 握手失败或超时。

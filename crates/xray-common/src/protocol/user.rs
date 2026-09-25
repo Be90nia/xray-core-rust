@@ -10,9 +10,8 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use crate::protocol::account::Account;
-use crate::serial::TypedMessage;
 
+use crate::{protocol::account::Account, serial::TypedMessage};
 
 /// 协议用户（proto 镜像），携带账户的原始序列化形式、邮箱和权限等级。
 ///
@@ -29,11 +28,7 @@ impl User {
     /// 创建新用户，默认无账户、权限等级 0。
     #[must_use]
     pub fn new(email: impl Into<String>) -> Self {
-        Self {
-            account: None,
-            email: email.into(),
-            level: 0,
-        }
+        Self { account: None, email: email.into(), level: 0 }
     }
 
     /// 设置账户（序列化形式），返回新的 User。
@@ -85,11 +80,7 @@ impl MemoryUser {
     /// 创建新的内存用户，无账户、权限等级 0。
     #[must_use]
     pub fn new(email: impl Into<String>) -> Self {
-        Self {
-            account: None,
-            email: email.into(),
-            level: 0,
-        }
+        Self { account: None, email: email.into(), level: 0 }
     }
 
     /// 设置运行时账户，返回新的 MemoryUser。
@@ -168,14 +159,13 @@ mod tests {
 
     impl Account for TestAccount {
         fn equals(&self, other: &dyn Account) -> bool {
-            other
-                .as_any()
-                .downcast_ref::<TestAccount>()
-                .is_some_and(|o| o.id == self.id)
+            other.as_any().downcast_ref::<TestAccount>().is_some_and(|o| o.id == self.id)
         }
+
         fn to_proto(&self) -> TypedMessage {
             TypedMessage::new("type.googleapis.com/test.Account", self.id.to_be_bytes().to_vec())
         }
+
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }

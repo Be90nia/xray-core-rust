@@ -8,25 +8,24 @@
 //! - `Client` 结构体 + `new_client` 构造逻辑：完整翻译。
 //! - `new_server` 工厂：占位（依赖 transport / routing / DoH/QUIC 客户端等 IO 边界）。
 
-use std::future::Future;
-use std::net::IpAddr;
-use std::pin::Pin;
-use std::time::Duration;
+use std::{future::Future, net::IpAddr, pin::Pin, time::Duration};
 
 use xray_common::net::address::Address;
 use xray_tls::utls;
 
-use crate::config::{IpOption, QueryStrategy, resolve_ip_option_override};
-use crate::error::DnsError;
+use crate::{
+    config::{IpOption, QueryStrategy, resolve_ip_option_override},
+    error::DnsError,
+};
 
-pub mod udp;
-pub mod tcp;
-pub mod dot;
-pub mod doh;
-pub mod quic;
-pub mod local;
-pub mod fakedns;
 pub mod cached;
+pub mod doh;
+pub mod dot;
+pub mod fakedns;
+pub mod local;
+pub mod quic;
+pub mod tcp;
+pub mod udp;
 
 /// DNS 名称服务器接口。对应 Go `Server` interface。
 ///
@@ -185,11 +184,7 @@ impl Client {
             skip_fallback: ns.skip_fallback,
             // Go dns.go:89-92/142-145：tag 空 → `xray.system.<uuid>`（全局唯一，
             // 防用户配置碰撞后 IsOwnLink 误判环）；此前恒 "default"。
-            tag: if ns.tag.is_empty() {
-                crate::config::generate_random_tag()
-            } else {
-                ns.tag
-            },
+            tag: if ns.tag.is_empty() { crate::config::generate_random_tag() } else { ns.tag },
             timeout,
             final_query: ns.final_query,
             ip_option,
@@ -401,13 +396,16 @@ fn parse_dns_url_host(input: &str, default_port: u16) -> Result<(Address, u16, S
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
+
+    use super::*;
 
     /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
     fn ensure_crypto_provider() {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| { let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default(); });
+        ONCE.call_once(|| {
+            let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        });
     }
 
     /// 测试用 Server：固定返回指定 IP + TTL。
@@ -430,7 +428,8 @@ mod tests {
             &'a self,
             _domain: &'a str,
             _option: IpOption,
-        ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>>
+        {
             let ips = self.ips.clone();
             let ttl = self.ttl;
             Box::pin(async move { Ok((ips, ttl)) })
@@ -498,13 +497,9 @@ mod tests {
         ns.query_strategy = Some(QueryStrategy::UseIp6);
         let server: Box<dyn Server> =
             Box::new(StaticServer { name: "test".to_string(), ips: Vec::new(), ttl: 0 });
-        let base = IpOption {
-            ipv4_enable: true,
-            ipv6_enable: false,
-            fake_enable: false,
-        };
+        let base = IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false };
         match Client::new(ns, base, server) {
-            Err(DnsError::NoQueryStrategy(_)) => {}
+            Err(DnsError::NoQueryStrategy(_)) => {},
             Err(e) => panic!("expected NoQueryStrategy, got error: {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
@@ -565,11 +560,9 @@ mod tests {
     /// bd mcpo：域名 NS 接受（运行期解析，弃启动期钉死）。
     #[test]
     fn new_server_accepts_domain_name() {
-        let (server, cfg) = new_server_with_config(
-            "tls://dns.example.com",
-            NameServerConfig::default(),
-        )
-        .expect("domain nameserver should build");
+        let (server, cfg) =
+            new_server_with_config("tls://dns.example.com", NameServerConfig::default())
+                .expect("domain nameserver should build");
         assert!(cfg.address.as_domain().is_some());
         assert_eq!(cfg.port, 853);
         assert_eq!(server.name(), "DoT:dns.example.com:853");

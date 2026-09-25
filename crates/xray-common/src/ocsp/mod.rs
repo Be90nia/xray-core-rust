@@ -125,9 +125,7 @@ pub enum OcspError {
 /// # 注意
 /// 当前为占位实现，完整 OCSP 需要证书解析功能。
 pub fn get_ocsp_for_file(_path: &Path) -> Result<Option<OcspResponse>, OcspError> {
-    Err(OcspError::NotSupported(
-        "OCSP certificate parsing is not yet implemented".into(),
-    ))
+    Err(OcspError::NotSupported("OCSP certificate parsing is not yet implemented".into()))
 }
 
 /// 从证书字节获取 OCSP stapling 响应。
@@ -139,9 +137,7 @@ pub fn get_ocsp_for_file(_path: &Path) -> Result<Option<OcspResponse>, OcspError
 /// 使用 `ocsp-stapler` crate 自动获取并装订 OCSP 响应。
 /// 本函数为兼容性保留，建议直接使用 `xray_tls::ocsp_stapling`。
 pub fn get_ocsp_stapling(_cert_der: &[u8]) -> Result<Option<OcspResponse>, OcspError> {
-    Err(OcspError::NotSupported(
-        "use xray_tls::ocsp_stapling instead".into(),
-    ))
+    Err(OcspError::NotSupported("use xray_tls::ocsp_stapling instead".into()))
 }
 
 /// 从证书 DER 字节获取 OCSP 响应。
@@ -151,9 +147,7 @@ pub fn get_ocsp_stapling(_cert_der: &[u8]) -> Result<Option<OcspResponse>, OcspE
 /// # 注意
 /// 当前为占位实现。
 pub fn get_ocsp_for_cert(_cert_der: &[u8]) -> Result<Option<OcspResponse>, OcspError> {
-    Err(OcspError::NotSupported(
-        "OCSP for certificate is not yet implemented".into(),
-    ))
+    Err(OcspError::NotSupported("OCSP for certificate is not yet implemented".into()))
 }
 
 #[cfg(test)]

@@ -3,8 +3,8 @@
 //! Corresponds to Go's `features/routing` package.
 
 use async_trait::async_trait;
-use xray_common::net::destination::Destination;
-use xray_common::session::Session;
+use xray_common::{net::destination::Destination, session::Session};
+
 use crate::Feature;
 
 /// Feature type identifier for Router.
@@ -62,10 +62,9 @@ impl Feature for DefaultRouterFeature {
 
 #[cfg(test)]
 mod tests {
+    use xray_common::net::{address::Address, network::Network, port::Port};
+
     use super::*;
-    use xray_common::net::address::Address;
-    use xray_common::net::network::Network;
-    use xray_common::net::port::Port;
 
     #[test]
     fn test_feature_router_constant() {
@@ -99,10 +98,7 @@ mod tests {
             _destination: &Destination,
             _session: &Session,
         ) -> Result<String, RoutingError> {
-            self.tags
-                .first()
-                .cloned()
-                .ok_or_else(|| RoutingError::NoRoute("no tags".to_string()))
+            self.tags.first().cloned().ok_or_else(|| RoutingError::NoRoute("no tags".to_string()))
         }
 
         fn has_rule_for(&self, _destination: &Destination) -> bool {
@@ -116,9 +112,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_router_pick_route() {
-        let router = MockRouter {
-            tags: vec!["direct".to_string()],
-        };
+        let router = MockRouter { tags: vec!["direct".to_string()] };
         let dest = Destination::new(
             Address::Domain("example.com".to_string()),
             Port::new(443),
@@ -144,9 +138,7 @@ mod tests {
 
     #[test]
     fn test_mock_router_has_rule() {
-        let router = MockRouter {
-            tags: vec!["proxy".to_string()],
-        };
+        let router = MockRouter { tags: vec!["proxy".to_string()] };
         let dest = Destination::new(
             Address::Domain("example.com".to_string()),
             Port::new(443),
@@ -157,9 +149,7 @@ mod tests {
 
     #[test]
     fn test_mock_router_outbound_tags() {
-        let router = MockRouter {
-            tags: vec!["direct".to_string(), "proxy".to_string()],
-        };
+        let router = MockRouter { tags: vec!["direct".to_string(), "proxy".to_string()] };
         assert_eq!(router.outbound_tags(), vec!["direct", "proxy"]);
     }
 }

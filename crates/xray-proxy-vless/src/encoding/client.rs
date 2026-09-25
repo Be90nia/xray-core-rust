@@ -3,16 +3,20 @@
 //! 对应 Go 版本 `proxy/vless/encoding/encoding.go` 中的 `EncodeRequestHeader`
 //! 和 `DecodeResponseHeader`。
 
-use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll},
+};
+
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
-use xray_common::net::address::Address;
-use xray_common::uuid::UUID;
+use xray_common::{net::address::Address, uuid::UUID};
 use xray_proto::xray::proxy::vless::encoding::Addons;
 
-use crate::encoding::{encode_header_addons, write_address_port, VlessCommand};
-use crate::error::{Result, VlessError};
+use crate::{
+    encoding::{VlessCommand, encode_header_addons, write_address_port},
+    error::{Result, VlessError},
+};
 
 /// 编码并发送请求头到 `writer`。
 ///
@@ -37,9 +41,7 @@ pub async fn encode_request_header<W: AsyncWrite + Unpin>(
         }
     } else if address.is_some() || port.is_some() {
         // Mux/Rvs 携带固定域名，调用方不应传 address+port
-        return Err(VlessError::Other(
-            "Mux/Rvs command should not carry address/port".into(),
-        ));
+        return Err(VlessError::Other("Mux/Rvs command should not carry address/port".into()));
     }
 
     let mut buf = Vec::with_capacity(64);
@@ -97,13 +99,7 @@ impl<C> ResponseHeaderReader<C> {
     /// 包装 `inner`，在首次读时消费并校验 `[version][addon_len][addons]`。
     #[must_use]
     pub fn new(inner: C, expected_version: u8) -> Self {
-        Self {
-            inner,
-            expected_version,
-            head: Vec::with_capacity(8),
-            head_pos: 0,
-            done: false,
-        }
+        Self { inner, expected_version, head: Vec::with_capacity(8), head_pos: 0, done: false }
     }
 
     /// 从 `inner` 读到 `head` 至少 `want` 字节。EOF/错误透传。
@@ -129,7 +125,7 @@ impl<C> ResponseHeaderReader<C> {
                         )));
                     }
                     head.extend_from_slice(&rb.filled()[..n]);
-                }
+                },
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
@@ -150,9 +146,7 @@ where
         let this = self.get_mut();
         if !this.done {
             // 头部至少 2 字节（version + addon_len）
-            if let Poll::Ready(Err(e)) =
-                Self::fill_head(&mut this.inner, cx, &mut this.head, 2)
-            {
+            if let Poll::Ready(Err(e)) = Self::fill_head(&mut this.inner, cx, &mut this.head, 2) {
                 return Poll::Ready(Err(e));
             }
             if this.head.len() < 2 {
@@ -162,15 +156,10 @@ where
             }
             let addon_len = this.head[1] as usize;
             if addon_len > 0 {
-                match Self::fill_head(
-                    &mut this.inner,
-                    cx,
-                    &mut this.head,
-                    2 + addon_len,
-                ) {
+                match Self::fill_head(&mut this.inner, cx, &mut this.head, 2 + addon_len) {
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Ok(())) => {},
                 }
             }
             if this.head[0] != this.expected_version {
@@ -224,9 +213,11 @@ where
     fn remote_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
         self.inner.remote_addr()
     }
+
     fn local_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
         self.inner.local_addr()
     }
+
     fn raw_tcp_clone(&self) -> Option<tokio::net::TcpStream> {
         // vision splice：穿透响应头缓冲层克隆裸 TCP（装箱后经 dyn 分发到达这里）。
         self.inner.raw_tcp_clone()
@@ -250,15 +241,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::encoding::server::decode_request_header;
-    use crate::encoding::VERSION;
-    use crate::encoding::empty_addons;
-    use crate::validator::{MemoryUser, MemoryValidator, Validator};
-    use crate::MemoryAccount;
     use std::io::Cursor;
-    use xray_common::net::address::Address;
-    use xray_common::uuid::UUID;
+
+    use xray_common::{net::address::Address, uuid::UUID};
+
+    use super::*;
+    use crate::{
+        MemoryAccount,
+        encoding::{VERSION, empty_addons, server::decode_request_header},
+        validator::{MemoryUser, MemoryValidator, Validator},
+    };
 
     fn make_user_and_validator() -> (UUID, MemoryValidator) {
         let uuid = UUID::new();
@@ -266,10 +258,9 @@ mod tests {
             level: 0,
             email: "test@example.com".to_string(),
             account: MemoryAccount::from_proto_account(&xray_proto::xray::proxy::vless::Account {
-                    id: uuid.to_string(),
-                    ..Default::default()
-                },
-            )
+                id: uuid.to_string(),
+                ..Default::default()
+            })
             .unwrap(),
         };
         let v = MemoryValidator::new();
@@ -299,9 +290,8 @@ mod tests {
 
         let mut cursor = Cursor::new(buf);
         let mut first: Option<Vec<u8>> = None;
-        let decoded = decode_request_header(false, &mut first, &mut cursor, &validator)
-            .await
-            .unwrap();
+        let decoded =
+            decode_request_header(false, &mut first, &mut cursor, &validator).await.unwrap();
 
         assert_eq!(decoded.version, VERSION);
         assert_eq!(decoded.command, VlessCommand::Tcp);
@@ -318,23 +308,14 @@ mod tests {
 
         let mut buf = Vec::new();
         let addons = empty_addons();
-        encode_request_header(
-            &mut buf,
-            VERSION,
-            &uuid,
-            VlessCommand::Mux,
-            None,
-            None,
-            &addons,
-        )
-        .await
-        .unwrap();
+        encode_request_header(&mut buf, VERSION, &uuid, VlessCommand::Mux, None, None, &addons)
+            .await
+            .unwrap();
 
         let mut cursor = Cursor::new(buf);
         let mut first: Option<Vec<u8>> = None;
-        let decoded = decode_request_header(false, &mut first, &mut cursor, &validator)
-            .await
-            .unwrap();
+        let decoded =
+            decode_request_header(false, &mut first, &mut cursor, &validator).await.unwrap();
 
         assert_eq!(decoded.command, VlessCommand::Mux);
         let got_addr = decoded.address.expect("mux address should be set");
@@ -355,11 +336,10 @@ mod tests {
 
         let mut cursor = Cursor::new(buf);
         let mut first: Option<Vec<u8>> = None;
-        let err = decode_request_header(false, &mut first, &mut cursor, &validator)
-            .await
-            .unwrap_err();
+        let err =
+            decode_request_header(false, &mut first, &mut cursor, &validator).await.unwrap_err();
         match err {
-            VlessError::InvalidRequestCommand(_) => {}
+            VlessError::InvalidRequestCommand(_) => {},
             _ => panic!("unexpected error: {err:?}"),
         }
     }
@@ -386,11 +366,10 @@ mod tests {
         let validator = MemoryValidator::new(); // 空
         let mut cursor = Cursor::new(buf);
         let mut first: Option<Vec<u8>> = None;
-        let err = decode_request_header(false, &mut first, &mut cursor, &validator)
-            .await
-            .unwrap_err();
+        let err =
+            decode_request_header(false, &mut first, &mut cursor, &validator).await.unwrap_err();
         match err {
-            VlessError::UserNotFound(_) => {}
+            VlessError::UserNotFound(_) => {},
             _ => panic!("unexpected error: {err:?}"),
         }
     }
@@ -399,9 +378,7 @@ mod tests {
     async fn test_encode_response_header_round_trip() {
         let mut buf = Vec::new();
         let addons = empty_addons();
-        crate::encoding::encode_response_header(&mut buf, VERSION, &addons)
-            .await
-            .unwrap();
+        crate::encoding::encode_response_header(&mut buf, VERSION, &addons).await.unwrap();
 
         let mut cursor = Cursor::new(buf);
         let got = decode_response_header(&mut cursor, VERSION).await.unwrap();

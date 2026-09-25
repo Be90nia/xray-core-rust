@@ -34,12 +34,7 @@ impl Buffer {
     /// 对应 Go 的 `New()` 构造函数。
     pub fn new() -> Self {
         let inner = alloc::alloc(alloc::DEFAULT_SIZE);
-        Self {
-            inner,
-            start: 0,
-            end: 0,
-            udp: None,
-        }
+        Self { inner, start: 0, end: 0, udp: None }
     }
 
     /// 分配指定大小的缓冲区（直接分配，不经过池）。
@@ -48,12 +43,7 @@ impl Buffer {
     /// 如需池化分配，使用 [`Buffer::new()`]。
     pub fn with_capacity(size: usize) -> Self {
         let inner = BytesMut::with_capacity(size);
-        Self {
-            inner,
-            start: 0,
-            end: 0,
-            udp: None,
-        }
+        Self { inner, start: 0, end: 0, udp: None }
     }
 
     /// 从外部数据构造缓冲区（非池化管理）。
@@ -63,12 +53,7 @@ impl Buffer {
     pub fn from_bytes(data: impl Into<BytesMut>) -> Self {
         let inner = data.into();
         let end = inner.len();
-        Self {
-            inner,
-            start: 0,
-            end,
-            udp: None,
-        }
+        Self { inner, start: 0, end, udp: None }
     }
 
     /// 从 Vec 构造缓冲区。
@@ -76,12 +61,7 @@ impl Buffer {
         let len = data.len();
         let mut inner = BytesMut::with_capacity(len);
         inner.extend_from_slice(&data);
-        Self {
-            inner,
-            start: 0,
-            end: len,
-            udp: None,
-        }
+        Self { inner, start: 0, end: len, udp: None }
     }
 
     // ========== 读操作 ==========
@@ -116,11 +96,7 @@ impl Buffer {
     /// 如果 `index >= len()` 会 panic。
     #[inline]
     pub fn byte(&self, index: usize) -> u8 {
-        assert!(
-            index < self.len(),
-            "byte index {index} 超过未读数据长度 {}",
-            self.len()
-        );
+        assert!(index < self.len(), "byte index {index} 超过未读数据长度 {}", self.len());
         self.inner[self.start + index]
     }
 
@@ -132,11 +108,7 @@ impl Buffer {
     /// 如果 `index >= len()` 会 panic。
     #[inline]
     pub fn set_byte(&mut self, index: usize, value: u8) {
-        assert!(
-            index < self.len(),
-            "set_byte index {index} 超过未读数据长度 {}",
-            self.len()
-        );
+        assert!(index < self.len(), "set_byte index {index} 超过未读数据长度 {}", self.len());
         self.inner[self.start + index] = value;
     }
 
@@ -146,11 +118,7 @@ impl Buffer {
     /// # Panics
     /// 如果 n 超过未读数据长度会 panic。
     pub fn advance(&mut self, n: usize) {
-        assert!(
-            n <= self.len(),
-            "advance {n} 超过未读数据长度 {}",
-            self.len()
-        );
+        assert!(n <= self.len(), "advance {n} 超过未读数据长度 {}", self.len());
         self.start += n;
     }
 
@@ -342,42 +310,24 @@ impl Buffer {
     /// # Panics
     /// 如果 n 超过未读数据长度会 panic。
     pub fn split_to(&mut self, n: usize) -> Buffer {
-        assert!(
-            n <= self.len(),
-            "split_to {n} 超过未读数据长度 {}",
-            self.len()
-        );
+        assert!(n <= self.len(), "split_to {n} 超过未读数据长度 {}", self.len());
         let split_end = self.start + n;
         let mut new_inner = BytesMut::with_capacity(n);
         new_inner.extend_from_slice(&self.inner[self.start..split_end]);
         self.start = split_end;
-        Buffer {
-            inner: new_inner,
-            start: 0,
-            end: n,
-            udp: None,
-        }
+        Buffer { inner: new_inner, start: 0, end: n, udp: None }
     }
 
     /// 在 n 字节处分割，保留后段，返回前段。
     ///
     /// 原缓冲区保留第 n 字节之后的数据。
     pub fn split_off(&mut self, n: usize) -> Buffer {
-        assert!(
-            n <= self.len(),
-            "split_off {n} 超过未读数据长度 {}",
-            self.len()
-        );
+        assert!(n <= self.len(), "split_off {n} 超过未读数据长度 {}", self.len());
         let split_end = self.start + n;
         let mut new_inner = BytesMut::with_capacity(n);
         new_inner.extend_from_slice(&self.inner[self.start..split_end]);
         self.start = split_end;
-        Buffer {
-            inner: new_inner,
-            start: 0,
-            end: n,
-            udp: None,
-        }
+        Buffer { inner: new_inner, start: 0, end: n, udp: None }
     }
 
     /// 消费缓冲区，返回 `Bytes`（零拷贝冻结）。

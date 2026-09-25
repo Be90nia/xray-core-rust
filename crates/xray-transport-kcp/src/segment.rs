@@ -91,8 +91,7 @@ pub trait Segment: Send {
     fn serialize(&self, buf: &mut [u8]);
 
     /// 从 `body` 解析（公共头已剥除）。返回 `(valid, consumed)`。
-    fn parse(&mut self, conv: u16, cmd: Command, opt: SegmentOption, body: &[u8])
-        -> (bool, usize);
+    fn parse(&mut self, conv: u16, cmd: Command, opt: SegmentOption, body: &[u8]) -> (bool, usize);
 }
 
 // ============== DataSegment ==============
@@ -244,10 +243,7 @@ impl AckSegment {
     #[must_use]
     pub fn new(limit: usize) -> Self {
         let clamped = limit.clamp(1, ACK_NUMBER_LIMIT);
-        Self {
-            limit: clamped,
-            ..Self::default()
-        }
+        Self { limit: clamped, ..Self::default() }
     }
 
     /// 追加一个 number（对应 Go `PutNumber`）。
@@ -332,8 +328,7 @@ impl Segment for AckSegment {
         self.number_list.reserve(count);
         for i in 0..count {
             let off = 13 + i * 4;
-            self.number_list
-                .push(u32::from_be_bytes(body[off..off + 4].try_into().unwrap()));
+            self.number_list.push(u32::from_be_bytes(body[off..off + 4].try_into().unwrap()));
         }
         (true, 13 + count * 4)
     }
@@ -404,13 +399,7 @@ impl Segment for CmdOnlySegment {
         buf[12..16].copy_from_slice(&self.peer_rto.to_be_bytes());
     }
 
-    fn parse(
-        &mut self,
-        conv: u16,
-        cmd: Command,
-        opt: SegmentOption,
-        body: &[u8],
-    ) -> (bool, usize) {
+    fn parse(&mut self, conv: u16, cmd: Command, opt: SegmentOption, body: &[u8]) -> (bool, usize) {
         self.conv = conv;
         self.cmd = cmd;
         self.option = opt;
@@ -526,7 +515,7 @@ mod tests {
                 assert_eq!(s.number, 4);
                 assert_eq!(s.sending_next, 5);
                 assert_eq!(s.payload.as_ref().unwrap().bytes(), b"abcd");
-            }
+            },
             other => panic!("expected Data, got {other:?}"),
         }
     }
@@ -549,7 +538,7 @@ mod tests {
         match parsed {
             SegmentKind::Data(s) => {
                 assert_eq!(s.payload.as_ref().unwrap().bytes(), b"a");
-            }
+            },
             other => panic!("expected Data, got {other:?}"),
         }
     }
@@ -576,7 +565,7 @@ mod tests {
                 assert_eq!(s.receiving_next, 3);
                 assert_eq!(s.timestamp, 10);
                 assert_eq!(s.number_list, vec![1, 3, 5, 7, 9]);
-            }
+            },
             other => panic!("expected Ack, got {other:?}"),
         }
     }
@@ -606,7 +595,7 @@ mod tests {
                 assert_eq!(s.sending_next, 11);
                 assert_eq!(s.receiving_next, 13);
                 assert_eq!(s.peer_rto, 15);
-            }
+            },
             other => panic!("expected Cmd, got {other:?}"),
         }
     }
@@ -626,7 +615,7 @@ mod tests {
             SegmentKind::Cmd(s) => {
                 assert_eq!(s.conv, 42);
                 assert_eq!(s.cmd, Command::Terminate);
-            }
+            },
             other => panic!("expected Cmd, got {other:?}"),
         }
     }
@@ -636,10 +625,7 @@ mod tests {
         assert_eq!(AckSegment::new(0).limit, 1);
         assert_eq!(AckSegment::new(1).limit, 1);
         assert_eq!(AckSegment::new(ACK_NUMBER_LIMIT).limit, ACK_NUMBER_LIMIT);
-        assert_eq!(
-            AckSegment::new(ACK_NUMBER_LIMIT + 100).limit,
-            ACK_NUMBER_LIMIT
-        );
+        assert_eq!(AckSegment::new(ACK_NUMBER_LIMIT + 100).limit, ACK_NUMBER_LIMIT);
     }
 
     #[test]
@@ -755,7 +741,7 @@ mod tests {
         match parsed {
             SegmentKind::Data(s) => {
                 assert!(s.payload.as_ref().unwrap().is_empty());
-            }
+            },
             other => panic!("expected Data, got {other:?}"),
         }
     }

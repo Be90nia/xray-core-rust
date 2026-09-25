@@ -3,16 +3,17 @@
 //! 对应 Go `app/dns/dnscommon.go`。
 //!
 //! **跳过范围**（IO 边界，依赖 DNS 协议层）：
-//! - `genEDNS0Options`、`buildReqMsgs`：依赖 Go `golang.org/x/net/dns/dnsmessage`
-//!   的 `Message`/`Question`/`OPTResource`/`Header`/`Resource`。Rust 生态等价品
+//! - `genEDNS0Options`、`buildReqMsgs`：依赖 Go `golang.org/x/net/dns/dnsmessage` 的
+//!   `Message`/`Question`/`OPTResource`/`Header`/`Resource`。Rust 生态等价品
 //!   （`hickory-proto`）引入后可实现；此处保留 `DnsMessage` 类型别名与占位 trait，
 //!   保证调用方签名稳定。
 
-use std::net::IpAddr;
-use std::time::{Duration, Instant};
+use std::{
+    net::IpAddr,
+    time::{Duration, Instant},
+};
 
-use crate::config::IpOption;
-use crate::error::DnsError;
+use crate::{config::IpOption, error::DnsError};
 
 /// DNS 标准返回码。对应 Go `dnsmessage.RCode`（u16 宽度足以覆盖实际值）。
 pub type RCode = u16;
@@ -49,11 +50,7 @@ pub trait DnsMessage: Send + Sync {
 /// 对应 Go `app/dns/dnscommon.go::Fqdn`。
 #[must_use]
 pub fn fqdn(domain: &str) -> String {
-    if domain.ends_with('.') {
-        domain.to_string()
-    } else {
-        format!("{domain}.")
-    }
+    if domain.ends_with('.') { domain.to_string() } else { format!("{domain}.") }
 }
 
 /// 可缓存的 IP 记录。对应 Go `IPRecord`。
@@ -110,13 +107,14 @@ impl IpRecord {
 
 /// 构造带 TTL 的 `IpRecord`。
 #[must_use]
-pub fn ip_record(req_id: u16, ips: Vec<IpAddr>, ttl: Duration, rcode: RCode, now: Instant) -> IpRecord {
-    IpRecord {
-        req_id,
-        ips,
-        expire: now + ttl,
-        rcode,
-    }
+pub fn ip_record(
+    req_id: u16,
+    ips: Vec<IpAddr>,
+    ttl: Duration,
+    rcode: RCode,
+    now: Instant,
+) -> IpRecord {
+    IpRecord { req_id, ips, expire: now + ttl, rcode }
 }
 
 /// 同时缓存 A/AAAA 记录。对应 Go `record` struct。
@@ -166,7 +164,7 @@ pub fn raw_ttl_seconds(expire: Instant, now: Instant) -> i32 {
         None => {
             let overdue = now - expire;
             -(overdue.as_secs_f64().ceil() as i32)
-        }
+        },
     }
 }
 
@@ -218,15 +216,19 @@ pub fn merge_records(
     match errs.len() {
         0 => (Vec::new(), r_ttl, None),
         // Go：双家族同类失败 → 返回该错误（errors.Is 相等）。
-        _ if errs.iter().skip(1).all(|e| std::mem::discriminant(e) == std::mem::discriminant(&errs[0])) => {
+        _ if errs
+            .iter()
+            .skip(1)
+            .all(|e| std::mem::discriminant(e) == std::mem::discriminant(&errs[0])) =>
+        {
             (Vec::new(), r_ttl, errs.into_iter().next())
-        }
+        },
         // 异类 → 聚合（Go errors.Combine；SystemResolve 承载聚合报文，
         // 与 server.rs merge_query_errors 同款）。
         _ => {
             let combined = errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
             (Vec::new(), r_ttl, Some(DnsError::SystemResolve(combined)))
-        }
+        },
     }
 }
 
@@ -235,10 +237,15 @@ pub fn merge_records(
 // 提供 build_dns_query / parse_dns_response / AtomicReqIdGen，供 udp/tcp nameserver
 // 直接调用。避免在多个 nameserver 文件里重复实现。
 
-use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::{Name, RData, RecordType};
-use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsOption};
 use std::sync::atomic::{AtomicU16, Ordering};
+
+use hickory_proto::{
+    op::{Edns, Message, MessageType, OpCode, Query, ResponseCode},
+    rr::{
+        Name, RData, RecordType,
+        rdata::opt::{ClientSubnet, EdnsOption},
+    },
+};
 
 /// 将 ResponseCode 转为项目 RCode (u16)。
 ///
@@ -285,11 +292,7 @@ pub fn build_dns_query(
             std::net::IpAddr::V6(std::net::Ipv6Addr::from(b))
         };
         let source_prefix: u8 = if client_ip.len() == 4 { 24 } else { 96 };
-        edns.options_mut().insert(EdnsOption::Subnet(ClientSubnet::new(
-            addr,
-            source_prefix,
-            0,
-        )));
+        edns.options_mut().insert(EdnsOption::Subnet(ClientSubnet::new(addr, source_prefix, 0)));
         msg.set_edns(edns);
     }
 
@@ -350,23 +353,17 @@ pub fn parse_dns_response(
         match &rec.data {
             RData::A(a) => {
                 ips.push(IpAddr::V4(a.0));
-            }
+            },
             RData::AAAA(aaaa) => {
                 ips.push(IpAddr::V6(aaaa.0));
-            }
+            },
             _ => continue,
         }
     }
 
     let ttl_secs = min_ttl.unwrap_or(0);
 
-    Ok(ParsedResponse {
-        req_id: expected_req_id,
-        ips,
-        ttl_secs,
-        rcode,
-        truncated,
-    })
+    Ok(ParsedResponse { req_id: expected_req_id, ips, ttl_secs, rcode, truncated })
 }
 
 /// 将 ParsedResponse 转为 IpRecord。
@@ -409,8 +406,9 @@ impl ReqIdGen for AtomicReqIdGen {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::Ipv4Addr;
+
+    use super::*;
 
     #[test]
     fn fqdn_appends_dot_if_missing() {
@@ -441,28 +439,19 @@ mod tests {
             expire: Instant::now() - Duration::from_secs(1),
             rcode: rcode::NO_ERROR,
         };
-        assert!(matches!(
-            expired.get_ips(Instant::now()),
-            Err(DnsError::RecordNotFound)
-        ));
+        assert!(matches!(expired.get_ips(Instant::now()), Err(DnsError::RecordNotFound)));
     }
 
     #[test]
     fn ip_record_get_ips_with_rcode() {
         let r = rec(1, vec![], 60, rcode::NX_DOMAIN);
-        assert!(matches!(
-            r.get_ips(Instant::now()),
-            Err(DnsError::RCodeError(3))
-        ));
+        assert!(matches!(r.get_ips(Instant::now()), Err(DnsError::RCodeError(3))));
     }
 
     #[test]
     fn ip_record_get_ips_empty_when_no_rcode() {
         let r = rec(1, vec![], 60, rcode::NO_ERROR);
-        assert!(matches!(
-            r.get_ips(Instant::now()),
-            Err(DnsError::EmptyResponse)
-        ));
+        assert!(matches!(r.get_ips(Instant::now()), Err(DnsError::EmptyResponse)));
     }
 
     #[test]
@@ -540,8 +529,10 @@ mod tests {
 
     /// 构造 DNS 响应字节（hickory builder）。
     fn build_response(req_id: u16, answers: Vec<(RecordType, u32, Option<IpAddr>)>) -> Vec<u8> {
-        use hickory_proto::rr::Record;
-        use hickory_proto::rr::rdata::{A, AAAA};
+        use hickory_proto::rr::{
+            Record,
+            rdata::{A, AAAA},
+        };
         let mut msg = Message::new(req_id, MessageType::Response, OpCode::Query);
         for (rtype, ttl, ip) in answers {
             let Some(ip) = ip else { continue };

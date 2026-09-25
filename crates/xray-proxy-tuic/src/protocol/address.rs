@@ -44,6 +44,7 @@ impl Address {
             Self::Domain(_, p) | Self::Ipv4(_, p) | Self::Ipv6(_, p) => *p,
         }
     }
+
     #[must_use]
     pub fn host(&self) -> String {
         match self {
@@ -64,7 +65,7 @@ impl Address {
             Self::None => {
                 buf.put_u8(ATYP_NONE);
                 buf.put_u16(0);
-            }
+            },
             Self::Domain(name, port) => {
                 let bytes = name.as_bytes();
                 // 域名长度以单字节表示（与 tuic-core 一致），最长 255。
@@ -77,17 +78,17 @@ impl Address {
                 buf.put_u8(bytes.len() as u8);
                 buf.put_slice(bytes);
                 buf.put_u16(*port);
-            }
+            },
             Self::Ipv4(addr, port) => {
                 buf.put_u8(ATYP_IPV4);
                 buf.put_slice(&addr.octets());
                 buf.put_u16(*port);
-            }
+            },
             Self::Ipv6(addr, port) => {
                 buf.put_u8(ATYP_IPV6);
                 buf.put_slice(&addr.octets());
                 buf.put_u16(*port);
-            }
+            },
         }
     }
 
@@ -112,7 +113,7 @@ impl Address {
             ATYP_NONE => {
                 let _port = buf.get_u16();
                 Ok(Self::None)
-            }
+            },
             ATYP_DOMAIN => {
                 if buf.remaining() < 1 {
                     return Err(TuicError::UnexpectedEof("domain length"));
@@ -127,7 +128,7 @@ impl Address {
                     .map_err(|_| TuicError::InvalidAddress("domain not utf-8"))?;
                 let port = buf.get_u16();
                 Ok(Self::Domain(name, port))
-            }
+            },
             ATYP_IPV4 => {
                 if buf.remaining() < 4 + 2 {
                     return Err(TuicError::UnexpectedEof("ipv4 body+port"));
@@ -136,7 +137,7 @@ impl Address {
                 buf.copy_to_slice(&mut octets);
                 let port = buf.get_u16();
                 Ok(Self::Ipv4(Ipv4Addr::from(octets), port))
-            }
+            },
             ATYP_IPV6 => {
                 if buf.remaining() < 16 + 2 {
                     return Err(TuicError::UnexpectedEof("ipv6 body+port"));
@@ -145,7 +146,7 @@ impl Address {
                 buf.copy_to_slice(&mut octets);
                 let port = buf.get_u16();
                 Ok(Self::Ipv6(Ipv6Addr::from(octets), port))
-            }
+            },
             _ => Err(TuicError::InvalidAddress("unknown atyp")),
         }
     }

@@ -4,41 +4,40 @@
 //! 1. TCP 连接服务器
 //! 2. btls uTLS 握手（证书不验证——鉴权全在 `Proxy-Authorization`）
 //! 3. hyper h2 客户端握手（ALPN h2 由 Chrome 指纹协商）
-//! 4. CONNECT authority-form 请求 + `padding`/`padding-type-request`/
-//!    `Proxy-Authorization: Basic` 头
+//! 4. CONNECT authority-form 请求 + `padding`/`padding-type-request`/ `Proxy-Authorization: Basic`
+//!    头
 //! 5. 200 响应含 `padding` 头 → 双向首 8 帧帧化，否则直通
 //!
 //! 隧道上下行经 hyper 的 CONNECT-upgrade（`OnUpgrade`）交付：h2 层收到 200
 //! 后把 h2 流的收发两端打包成 `Upgraded`（hyper 不支持 CONNECT 请求体——
 //! 请求 body 会被直接丢弃，上行数据必须写 `Upgraded`）。
 
-use std::io;
-use std::pin::Pin;
+use std::{
+    io,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::{Context, Poll, ready},
+};
 
-use std::sync::{Arc, Mutex};
-use std::task::{ready, Context, Poll};
-
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine;
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use bytes::Bytes;
-use http::header::HeaderValue;
-use http::{Method, StatusCode};
-use http_body_util::Empty;
-use hyper::client::conn::http2;
-use hyper::upgrade::{OnUpgrade, Upgraded};
+use http::{Method, StatusCode, header::HeaderValue};
+use hyper::{
+    client::conn::http2,
+    upgrade::{OnUpgrade, Upgraded},
+};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
+use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
 use xray_tls::btls_client::BtlsConn;
-use xray_transport::connection::Connection;
-use xray_transport::sockopt::SocketOptions;
-use xray_transport::system_dialer::dial_system;
+use xray_transport::{connection::Connection, sockopt::SocketOptions, system_dialer::dial_system};
 
-use crate::padding::{encode_frame, random_padding_header, random_padding_size, PaddingDecoder, FIRST_PADDINGS};
-use crate::uri::NaiveConfig;
+use crate::{
+    padding::{
+        FIRST_PADDINGS, PaddingDecoder, encode_frame, random_padding_header, random_padding_size,
+    },
+    uri::NaiveConfig,
+};
 
 /// Chrome 桌面 UA（对齐 naiveproxy 默认 extra headers 场景）。
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
@@ -94,15 +93,10 @@ pub async fn dial_naive(
 
     let authority = format!("{target_host}:{target_port}");
     let req = build_connect_request(&authority, config)?;
-    let resp = sender
-        .send_request(req)
-        .await
-        .map_err(|e| format!("naive CONNECT {authority}: {e}"))?;
+    let resp =
+        sender.send_request(req).await.map_err(|e| format!("naive CONNECT {authority}: {e}"))?;
     if resp.status() != StatusCode::OK {
-        return Err(format!(
-            "naive CONNECT {authority}: HTTP {}",
-            resp.status().as_u16()
-        ));
+        return Err(format!("naive CONNECT {authority}: HTTP {}", resp.status().as_u16()));
     }
     // 响应含 padding 头 → 服务端支持 kVariant1，双向首 8 帧帧化
     let padded = resp.headers().contains_key("padding");
@@ -122,9 +116,8 @@ pub async fn dial_naive(
         let _ = driver.await;
     });
 
-    let upgraded = on_upgrade
-        .await
-        .map_err(|e| format!("naive CONNECT {authority}: upgrade failed: {e}"))?;
+    let upgraded =
+        on_upgrade.await.map_err(|e| format!("naive CONNECT {authority}: upgrade failed: {e}"))?;
     let (rd, wr) = tokio::io::split(UpgradeConn(Arc::new(Mutex::new(TokioIo::new(upgraded)))));
     let tunnel = NaiveConn {
         reader: PaddingReader::new(rd, padded),
@@ -134,15 +127,31 @@ pub async fn dial_naive(
     Ok(Box::new(tunnel))
 }
 
-/// 构造 CONNECT 请求（authority-form + naive padding/auth 头；body 为空——
-/// hyper 的 h2 CONNECT 不支持请求体，上行数据在 upgrade 后写 `Upgraded`）。
+/// 永不出数据也不结束的 CONNECT 请求 body。
+///
+/// h2 CONNECT 隧道流在隧道关闭前不得 END_STREAM（RFC 9113 §8.5）——
+/// `Empty` body 会让 hyper 在 HEADERS 上置 END_STREAM，服务端 request body
+/// 立即 EOF、上行断链。上行数据走 `Upgraded`（`dial_naive` 注释所述）。
+struct NeverEndingBody;
+
+impl hyper::body::Body for NeverEndingBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        Poll::Pending
+    }
+}
+
 fn build_connect_request(
     authority: &str,
     config: &NaiveConfig,
-) -> Result<http::Request<Empty<Bytes>>, String> {
-    let auth: http::uri::Authority = authority
-        .parse()
-        .map_err(|e| format!("naive authority {authority}: {e}"))?;
+) -> Result<http::Request<NeverEndingBody>, String> {
+    let auth: http::uri::Authority =
+        authority.parse().map_err(|e| format!("naive authority {authority}: {e}"))?;
     let uri = http::Uri::builder()
         .authority(auth)
         .build()
@@ -159,7 +168,7 @@ fn build_connect_request(
         .header("padding-type-request", HeaderValue::from_static("1"))
         .header(http::header::PROXY_AUTHORIZATION, proxy_auth)
         .header(http::header::USER_AGENT, HeaderValue::from_static(USER_AGENT))
-        .body(Empty::<Bytes>::new())
+        .body(NeverEndingBody)
         .map_err(|e| format!("naive build request: {e}"))
 }
 
@@ -279,7 +288,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for PaddingReader<R> {
                             this.done = true;
                         }
                     }
-                }
+                },
             }
         }
     }
@@ -300,6 +309,8 @@ pub struct PaddingWriter<W> {
     frame: Vec<u8>,
     frame_pos: usize,
     user_len: usize,
+    /// 当前帧尚未排空完成（`poll_write` Pending 重入时不得重新编码）。
+    frame_pending: bool,
 }
 
 impl<W: AsyncWrite + Unpin> PaddingWriter<W> {
@@ -310,12 +321,14 @@ impl<W: AsyncWrite + Unpin> PaddingWriter<W> {
             frame: Vec::new(),
             frame_pos: 0,
             user_len: 0,
+            frame_pending: false,
         }
     }
 
     fn drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while self.frame_pos < self.frame.len() {
-            let n = ready!(Pin::new(&mut self.inner).poll_write(cx, &self.frame[self.frame_pos..]))?;
+            let n =
+                ready!(Pin::new(&mut self.inner).poll_write(cx, &self.frame[self.frame_pos..]))?;
             if n == 0 {
                 return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
             }
@@ -335,15 +348,22 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for PaddingWriter<W> {
         if this.frames_written >= FIRST_PADDINGS {
             return Pin::new(&mut this.inner).poll_write(cx, buf);
         }
-        // 排空上一帧（short write 恢复）
-        ready!(this.drain(cx))?;
+        if this.frame_pending {
+            // tokio 重入契约：上次 Pending 时本 buf 的帧还没写完——继续排空，
+            // 排完即本次 write 成功。重新 encode 会把 payload 发两遍。
+            ready!(this.drain(cx))?;
+            this.frame_pending = false;
+            return Poll::Ready(Ok(this.user_len));
+        }
         let padding = random_padding_size(buf.len());
         let (frame, consumed) = encode_frame(buf, padding);
         this.frame = frame;
         this.frame_pos = 0;
         this.user_len = consumed;
         this.frames_written += 1;
+        this.frame_pending = true;
         ready!(this.drain(cx))?;
+        this.frame_pending = false;
         Poll::Ready(Ok(this.user_len))
     }
 
@@ -364,6 +384,12 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for PaddingWriter<W> {
 pub struct NaiveConn<R, W> {
     reader: PaddingReader<R>,
     writer: PaddingWriter<W>,
+}
+impl<R, W> NaiveConn<R, W> {
+    /// 从 padding reader/writer 组合（入站 mock 直连路径复用）。
+    pub fn new(reader: PaddingReader<R>, writer: PaddingWriter<W>) -> Self {
+        Self { reader, writer }
+    }
 }
 impl<R: AsyncRead + Unpin, W: Unpin> AsyncRead for NaiveConn<R, W> {
     fn poll_read(
@@ -408,6 +434,7 @@ where
 #[cfg(test)]
 mod tests {
     use tokio::io::duplex;
+
     use super::*;
 
     /// 双工回环：PaddingWriter 写 12 块（8 帧 + 4 直通）→ PaddingReader 读回逐字节一致。
@@ -416,9 +443,8 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (client, server) = duplex(64 * 1024);
-        let chunks: Vec<Vec<u8>> = (0..12)
-            .map(|i| vec![b'a' + i; 700 + (i as usize) * 13])
-            .collect();
+        let chunks: Vec<Vec<u8>> =
+            (0..12).map(|i| vec![b'a' + i; 700 + (i as usize) * 13]).collect();
         let expected: Vec<u8> = chunks.concat();
 
         let writer_task = tokio::spawn(async move {

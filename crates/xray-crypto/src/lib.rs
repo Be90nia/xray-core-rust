@@ -98,10 +98,7 @@ mod tests {
     fn rand_between_result_in_range() {
         for _ in 0..1000 {
             let val = rand_between(10, 20);
-            assert!(
-                (10..20).contains(&val),
-                "rand_between(10, 20) = {val}, not in [10, 20)"
-            );
+            assert!((10..20).contains(&val), "rand_between(10, 20) = {val}, not in [10, 20)");
         }
     }
 
@@ -109,10 +106,7 @@ mod tests {
     fn rand_between_swapped_bounds() {
         for _ in 0..1000 {
             let val = rand_between(20, 10);
-            assert!(
-                (10..20).contains(&val),
-                "rand_between(20, 10) = {val}, not in [10, 20)"
-            );
+            assert!((10..20).contains(&val), "rand_between(20, 10) = {val}, not in [10, 20)");
         }
     }
 
@@ -131,10 +125,7 @@ mod tests {
     fn rand_between_cross_zero_range() {
         for _ in 0..1000 {
             let val = rand_between(-50, 50);
-            assert!(
-                (-50..50).contains(&val),
-                "rand_between(-50, 50) = {val}, not in [-50, 50)"
-            );
+            assert!((-50..50).contains(&val), "rand_between(-50, 50) = {val}, not in [-50, 50)");
         }
     }
 
@@ -142,10 +133,7 @@ mod tests {
     fn rand_between_full_i64_range() {
         // Edge case: near i64 boundaries
         let val = rand_between(i64::MIN, i64::MIN + 10);
-        assert!(
-            (i64::MIN..i64::MIN + 10).contains(&val),
-            "rand_between(MIN, MIN+10) = {val}"
-        );
+        assert!((i64::MIN..i64::MIN + 10).contains(&val), "rand_between(MIN, MIN+10) = {val}");
     }
 
     #[test]
@@ -153,10 +141,7 @@ mod tests {
         let mut buf = [0u8; 256];
         rand_bytes_between(&mut buf, 10, 20);
         for &b in &buf {
-            assert!(
-                (10..=20).contains(&b),
-                "byte {b} not in [10, 20]"
-            );
+            assert!((10..=20).contains(&b), "byte {b} not in [10, 20]");
         }
     }
 
@@ -165,10 +150,7 @@ mod tests {
         let mut buf = [0u8; 128];
         rand_bytes_between(&mut buf, 20, 10);
         for &b in &buf {
-            assert!(
-                (10..=20).contains(&b),
-                "byte {b} not in [10, 20]"
-            );
+            assert!((10..=20).contains(&b), "byte {b} not in [10, 20]");
         }
     }
 

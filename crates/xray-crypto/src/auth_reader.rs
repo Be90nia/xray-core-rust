@@ -3,14 +3,19 @@
 //! Implements AuthenticationReader from Go's common/crypto/auth.go,
 //! providing AEAD-based authenticated decryption reading.
 
-use crate::aead::CryptoError;
-use crate::authenticator::Authenticator;
-use crate::chunk::{ChunkSizeDecoder, PaddingLengthGenerator};
-use xray_buf::buffer::Buffer;
-use xray_buf::io::{self, Reader};
-use xray_buf::multi::MultiBuffer;
-use xray_buf::reader::BufferedReader;
+use xray_buf::{
+    buffer::Buffer,
+    io::{self, Reader},
+    multi::MultiBuffer,
+    reader::BufferedReader,
+};
 use xray_common::protocol::TransferType;
+
+use crate::{
+    aead::CryptoError,
+    authenticator::Authenticator,
+    chunk::{ChunkSizeDecoder, PaddingLengthGenerator},
+};
 
 const DEFAULT_SIZE: usize = 8192;
 const MAX_CHUNK_COUNT: usize = 16;
@@ -23,11 +28,15 @@ enum ReadInternalError {
 }
 
 impl From<CryptoError> for ReadInternalError {
-    fn from(e: CryptoError) -> Self { ReadInternalError::Crypto(e) }
+    fn from(e: CryptoError) -> Self {
+        ReadInternalError::Crypto(e)
+    }
 }
 
 impl From<io::Error> for ReadInternalError {
-    fn from(e: io::Error) -> Self { ReadInternalError::Io(e) }
+    fn from(e: io::Error) -> Self {
+        ReadInternalError::Io(e)
+    }
 }
 
 pub struct AuthenticationReader<'a> {
@@ -55,10 +64,17 @@ impl<'a> AuthenticationReader<'a> {
     ) -> Self {
         let sb = size_decoder.size_bytes() as usize;
         Self {
-            auth, reader, size_decoder, transfer_type, padding,
+            auth,
+            reader,
+            size_decoder,
+            transfer_type,
+            padding,
             size_bytes: vec![0u8; sb],
-            cached_size: 0, cached_padding: 0,
-            has_size: false, done: false, pending_data: Vec::new(),
+            cached_size: 0,
+            cached_padding: 0,
+            has_size: false,
+            done: false,
+            pending_data: Vec::new(),
         }
     }
 
@@ -80,14 +96,19 @@ impl<'a> AuthenticationReader<'a> {
             }
             offset += n;
         }
-        let size = self.size_decoder
+        let size = self
+            .size_decoder
             .decode(&self.size_bytes[..total])
             .map_err(ReadInternalError::Crypto)?;
         let padding = self.padding.next_padding_len();
         Ok((size, padding))
     }
 
-    async fn read_buffer(&mut self, size: usize, padding: usize) -> Result<Buffer, ReadInternalError> {
+    async fn read_buffer(
+        &mut self,
+        size: usize,
+        padding: usize,
+    ) -> Result<Buffer, ReadInternalError> {
         let mut data = Vec::with_capacity(size);
         if !self.pending_data.is_empty() {
             let take = self.pending_data.len().min(size);
@@ -106,8 +127,8 @@ impl<'a> AuthenticationReader<'a> {
             data.extend_from_slice(&buf[..n]);
         }
         let ciphertext_len = size - padding;
-        let decrypted = self.auth.open(&mut [], &data[..ciphertext_len])
-            .map_err(ReadInternalError::Crypto)?;
+        let decrypted =
+            self.auth.open(&mut [], &data[..ciphertext_len]).map_err(ReadInternalError::Crypto)?;
         Ok(Buffer::from_vec(decrypted))
     }
 
@@ -117,7 +138,9 @@ impl<'a> AuthenticationReader<'a> {
             let take = self.pending_data.len().min(size);
             data.extend_from_slice(&self.pending_data[..take]);
             self.pending_data.drain(..take);
-            if data.len() == size { return Ok(data); }
+            if data.len() == size {
+                return Ok(data);
+            }
         }
         while data.len() < size {
             let remaining = size - data.len();
@@ -133,8 +156,14 @@ impl<'a> AuthenticationReader<'a> {
         Ok(data)
     }
 
-    async fn read_internal(&mut self, soft: bool, mb: &mut MultiBuffer) -> Result<(), ReadInternalError> {
-        if self.done { return Err(ReadInternalError::Eof); }
+    async fn read_internal(
+        &mut self,
+        soft: bool,
+        mb: &mut MultiBuffer,
+    ) -> Result<(), ReadInternalError> {
+        if self.done {
+            return Err(ReadInternalError::Eof);
+        }
         let (size, padding) = self.read_size().await?;
         let overhead = self.auth.overhead() as u16;
         if size == overhead + padding {
@@ -155,7 +184,9 @@ impl<'a> AuthenticationReader<'a> {
                         return Err(ReadInternalError::Soft);
                     }
                     let ciphertext_len = size_usize - padding_usize;
-                    let decrypted = self.auth.open(&mut [], &chunk_data[..ciphertext_len])
+                    let decrypted = self
+                        .auth
+                        .open(&mut [], &chunk_data[..ciphertext_len])
                         .map_err(ReadInternalError::Crypto)?;
                     if size_usize <= DEFAULT_SIZE {
                         mb.push(Buffer::from_vec(decrypted));
@@ -163,14 +194,16 @@ impl<'a> AuthenticationReader<'a> {
                         mb.merge_bytes(&decrypted);
                     }
                     return Ok(());
-                }
+                },
                 Err(io::Error::Eof) | Err(io::Error::Interrupted) => {
                     self.cached_size = size;
                     self.cached_padding = padding;
                     self.has_size = true;
                     return Err(ReadInternalError::Soft);
-                }
-                Err(e) => { return Err(ReadInternalError::Io(e)); }
+                },
+                Err(e) => {
+                    return Err(ReadInternalError::Io(e));
+                },
             }
         }
         if size_usize <= DEFAULT_SIZE {
@@ -179,7 +212,9 @@ impl<'a> AuthenticationReader<'a> {
         } else {
             let data = self.read_exact_with_pending(size_usize).await?;
             let ciphertext_len = size_usize - padding_usize;
-            let decrypted = self.auth.open(&mut [], &data[..ciphertext_len])
+            let decrypted = self
+                .auth
+                .open(&mut [], &data[..ciphertext_len])
                 .map_err(ReadInternalError::Crypto)?;
             mb.merge_bytes(&decrypted);
         }
@@ -189,62 +224,79 @@ impl<'a> AuthenticationReader<'a> {
     pub async fn read_multi_buffer(&mut self) -> io::Result<MultiBuffer> {
         let mut mb = MultiBuffer::new();
         match self.read_internal(false, &mut mb).await {
-            Ok(()) => {}
+            Ok(()) => {},
             Err(ReadInternalError::Soft) => {
-                if mb.is_empty() { return Err(io::Error::Eof); }
+                if mb.is_empty() {
+                    return Err(io::Error::Eof);
+                }
                 return Ok(mb);
-            }
-            Err(ReadInternalError::Eof) => { return Err(io::Error::Eof); }
+            },
+            Err(ReadInternalError::Eof) => {
+                return Err(io::Error::Eof);
+            },
             Err(ReadInternalError::Crypto(e)) => {
                 return Err(io::Error::ReadError(format!("crypto error: {e}")));
-            }
-            Err(ReadInternalError::Io(e)) => { return Err(e); }
+            },
+            Err(ReadInternalError::Io(e)) => {
+                return Err(e);
+            },
         }
         for _ in 1..MAX_CHUNK_COUNT {
             match self.read_internal(true, &mut mb).await {
-                Ok(()) => {}
+                Ok(()) => {},
                 Err(ReadInternalError::Soft) => break,
                 Err(ReadInternalError::Eof) => break,
                 Err(ReadInternalError::Crypto(e)) => {
                     return Err(io::Error::ReadError(format!("crypto error: {e}")));
-                }
-                Err(ReadInternalError::Io(e)) => { return Err(e); }
+                },
+                Err(ReadInternalError::Io(e)) => {
+                    return Err(e);
+                },
             }
         }
         Ok(mb)
     }
 }
 
-
 #[cfg(test)]
 mod tests {
+    use std::{future::Future, pin::Pin};
+
     use super::*;
-    use crate::authenticator::{generate_aead_nonce_with_size, AEADAuthenticator};
-    use crate::aead::Aes128Gcm;
-    use crate::chunk::{NoPadding, PlainChunkSizeParser, ShufflePadding};
-    use std::future::Future;
-    use std::pin::Pin;
+    use crate::{
+        aead::Aes128Gcm,
+        authenticator::{AEADAuthenticator, generate_aead_nonce_with_size},
+        chunk::{NoPadding, PlainChunkSizeParser, ShufflePadding},
+    };
 
     fn make_auth_pair() -> (Box<dyn Authenticator>, Box<dyn Authenticator>) {
         let cipher_s = Aes128Gcm::new(&[0u8; 16]).unwrap();
-        let auth_s: Box<dyn Authenticator> = Box::new(AEADAuthenticator::new(
-            cipher_s, generate_aead_nonce_with_size(12), None,
-        ));
+        let auth_s: Box<dyn Authenticator> =
+            Box::new(AEADAuthenticator::new(cipher_s, generate_aead_nonce_with_size(12), None));
         let cipher_o = Aes128Gcm::new(&[0u8; 16]).unwrap();
-        let auth_o: Box<dyn Authenticator> = Box::new(AEADAuthenticator::new(
-            cipher_o, generate_aead_nonce_with_size(12), None,
-        ));
+        let auth_o: Box<dyn Authenticator> =
+            Box::new(AEADAuthenticator::new(cipher_o, generate_aead_nonce_with_size(12), None));
         (auth_s, auth_o)
     }
 
-    struct VecWriter { data: Vec<u8> }
-    impl VecWriter { fn new() -> Self { Self { data: Vec::new() } } }
+    struct VecWriter {
+        data: Vec<u8>,
+    }
+    impl VecWriter {
+        fn new() -> Self {
+            Self { data: Vec::new() }
+        }
+    }
 
     impl io::Writer for VecWriter {
-        fn write_multi_buffer(&mut self, mb: MultiBuffer)
-            -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+        fn write_multi_buffer(
+            &mut self,
+            mb: MultiBuffer,
+        ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
             Box::pin(async move {
-                for buf in mb.into_buffers() { self.data.extend_from_slice(buf.bytes()); }
+                for buf in mb.into_buffers() {
+                    self.data.extend_from_slice(buf.bytes());
+                }
                 Ok(())
             })
         }
@@ -254,29 +306,39 @@ mod tests {
         let mut vw = VecWriter::new();
         {
             let mut aw = crate::auth_writer::AuthenticationWriter::new(
-                auth, &mut vw,
+                auth,
+                &mut vw,
                 Box::new(PlainChunkSizeParser),
-                TransferType::Stream, Box::new(NoPadding),
+                TransferType::Stream,
+                Box::new(NoPadding),
             );
             let mut mb = MultiBuffer::new();
-            for chunk in chunks { mb.push(Buffer::from_vec(chunk.to_vec())); }
+            for chunk in chunks {
+                mb.push(Buffer::from_vec(chunk.to_vec()));
+            }
             aw.write_multi_buffer(mb).await.unwrap();
         }
         vw.data
     }
 
     async fn encrypt_stream_with_padding(
-        auth: Box<dyn Authenticator>, chunks: &[&[u8]], padding: Box<dyn PaddingLengthGenerator>,
+        auth: Box<dyn Authenticator>,
+        chunks: &[&[u8]],
+        padding: Box<dyn PaddingLengthGenerator>,
     ) -> Vec<u8> {
         let mut vw = VecWriter::new();
         {
             let mut aw = crate::auth_writer::AuthenticationWriter::new(
-                auth, &mut vw,
+                auth,
+                &mut vw,
                 Box::new(PlainChunkSizeParser),
-                TransferType::Stream, padding,
+                TransferType::Stream,
+                padding,
             );
             let mut mb = MultiBuffer::new();
-            for chunk in chunks { mb.push(Buffer::from_vec(chunk.to_vec())); }
+            for chunk in chunks {
+                mb.push(Buffer::from_vec(chunk.to_vec()));
+            }
             aw.write_multi_buffer(mb).await.unwrap();
         }
         vw.data
@@ -286,12 +348,16 @@ mod tests {
         let mut vw = VecWriter::new();
         {
             let mut aw = crate::auth_writer::AuthenticationWriter::new(
-                auth, &mut vw,
+                auth,
+                &mut vw,
                 Box::new(PlainChunkSizeParser),
-                TransferType::Packet, Box::new(NoPadding),
+                TransferType::Packet,
+                Box::new(NoPadding),
             );
             let mut mb = MultiBuffer::new();
-            for chunk in chunks { mb.push(Buffer::from_vec(chunk.to_vec())); }
+            for chunk in chunks {
+                mb.push(Buffer::from_vec(chunk.to_vec()));
+            }
             aw.write_multi_buffer(mb).await.unwrap();
         }
         vw.data
@@ -304,11 +370,11 @@ mod tests {
     }
 
     fn make_auth_reader<'a>(
-        auth: Box<dyn Authenticator>, br: &'a mut BufferedReader, tt: TransferType,
+        auth: Box<dyn Authenticator>,
+        br: &'a mut BufferedReader,
+        tt: TransferType,
     ) -> AuthenticationReader<'a> {
-        AuthenticationReader::new(
-            auth, Box::new(PlainChunkSizeParser), br, tt, Box::new(NoPadding),
-        )
+        AuthenticationReader::new(auth, Box::new(PlainChunkSizeParser), br, tt, Box::new(NoPadding))
     }
 
     // Test 1: read single chunk
@@ -403,13 +469,15 @@ mod tests {
     #[tokio::test]
     async fn test_read_with_padding() {
         let (auth_s, auth_o) = make_auth_pair();
-        let encrypted = encrypt_stream_with_padding(
-            auth_s, &[b"padded data"], Box::new(NoPadding),
-        ).await;
+        let encrypted =
+            encrypt_stream_with_padding(auth_s, &[b"padded data"], Box::new(NoPadding)).await;
         let mut br = make_reader(encrypted);
         let mut ar = AuthenticationReader::new(
-            auth_o, Box::new(PlainChunkSizeParser), &mut br,
-            TransferType::Stream, Box::new(NoPadding),
+            auth_o,
+            Box::new(PlainChunkSizeParser),
+            &mut br,
+            TransferType::Stream,
+            Box::new(NoPadding),
         );
         let mb = ar.read_multi_buffer().await.unwrap();
         assert_eq!(mb.to_vec(), b"padded data");

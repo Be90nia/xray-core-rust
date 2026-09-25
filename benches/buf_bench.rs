@@ -2,13 +2,11 @@
 //!
 //! 测量 xray-buf 核心操作吞吐量，对比 Go 版本 buf.Buffer 性能。
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use xray_buf::buffer::Buffer;
 
 fn bench_buffer_alloc(c: &mut Criterion) {
-    c.bench_function("buffer_new_8k", |b| {
-        b.iter(|| Buffer::new())
-    });
+    c.bench_function("buffer_new_8k", |b| b.iter(|| Buffer::new()));
 }
 
 fn bench_buffer_write(c: &mut Criterion) {

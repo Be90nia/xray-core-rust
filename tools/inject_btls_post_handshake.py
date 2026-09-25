@@ -100,6 +100,110 @@ int SSL_send_post_handshake_record(SSL *ssl, const uint8_t *payload,
 SOURCES_CMAKE_ANCHOR = "  ssl/ssl_privkey.cc\n"
 SOURCES_CMAKE_LINE = "  ssl/ssl_post_handshake.cc\n"
 
+# bd z32z：声明块（插在 mygg 声明块尾部之后）
+MIRROR_SEAL_H_ANCHOR = "                                                  size_t payload_len);\n"
+MIRROR_SEAL_H_DECL = """
+// bd z32z: SSL_seal_raw_tls13_record seals |inner_len| bytes from |inner| —
+// the complete AEAD input plaintext, including the inner content type, with
+// nothing appended — as exactly one TLS 1.3 type-23 record under the current
+// write key, writing the wire bytes (5-byte header || ciphertext || tag) to
+// |out| (capacity |out_cap|, bytes written to |*out_len|). AAD, nonce
+// derivation and the write sequence counter are shared with the standard
+// write path (nonce = static write IV XOR seq_be64, AAD = the record header,
+// sequence incremented on success). The BIO is untouched: the caller
+// transmits the record itself, mirroring Go xtls/reality tls.go:417-426
+// (raw aead.Seal followed by hs.c.write). It fails if the handshake is not
+// complete, the negotiated protocol is below TLS 1.3, or |inner_len| exceeds
+// SSL3_RT_MAX_PLAIN_LENGTH + 1 (the largest single-record mirror plaintext).
+// Returns one on success and zero on error.
+OPENSSL_EXPORT int SSL_seal_raw_tls13_record(SSL *ssl, const uint8_t *inner,
+                                             size_t inner_len, uint8_t *out,
+                                             size_t out_cap, size_t *out_len);
+"""
+
+# bd z32z：实现（追加到 ssl_post_handshake.cc 文件尾；include 与 do_seal_record
+# 同款骨架，差异仅在明文不追加 inner type——|inner| 已是完整 AEAD 输入）
+MIRROR_SEAL_CC_APPEND = r"""
+
+// bd z32z: injected by tools/inject_btls_post_handshake.py — REALITY
+// byte-level-equivalent mirror primitive. Do not edit in place; re-run the
+// injector.
+using namespace bssl;  // SSLAEADContext/ssl_protocol_version/Span 等（同
+                       // tls_record.cc C 导出函数段形态）
+int SSL_seal_raw_tls13_record(SSL *ssl, const uint8_t *inner,
+                              size_t inner_len, uint8_t *out, size_t out_cap,
+                              size_t *out_len) {
+  if (ssl == nullptr || inner == nullptr || out == nullptr ||
+      out_len == nullptr || inner_len == 0) {
+    OPENSSL_PUT_ERROR(SSL, ERR_R_PASSED_NULL_PARAMETER);
+    return 0;
+  }
+  if (SSL_in_init(ssl)) {
+    OPENSSL_PUT_ERROR(SSL, SSL_R_HANDSHAKE_NOT_COMPLETE);
+    return 0;
+  }
+
+  SSLAEADContext *aead = ssl->s3->aead_write_ctx.get();
+  if (aead->is_null_cipher() || ssl_protocol_version(ssl) < TLS1_3_VERSION) {
+    OPENSSL_PUT_ERROR(SSL, SSL_R_WRONG_SSL_VERSION);
+    return 0;
+  }
+
+  // Single-record bound: |inner| is content + inner type, so the largest
+  // Go-equivalent mirror plaintext is SSL3_RT_MAX_PLAIN_LENGTH + 1 bytes
+  // (wire 16406 = 5 + 16385 + 16).
+  if (inner_len > SSL3_RT_MAX_PLAIN_LENGTH + 1) {
+    OPENSSL_PUT_ERROR(SSL, SSL_R_DATA_LENGTH_TOO_LONG);
+    return 0;
+  }
+
+  size_t suffix_len = 0;
+  if (!aead->SuffixLen(&suffix_len, inner_len, 0)) {
+    OPENSSL_PUT_ERROR(SSL, SSL_R_RECORD_TOO_LARGE);
+    return 0;
+  }
+  const size_t wire_len = SSL3_RT_HEADER_LENGTH + inner_len + suffix_len;
+  if (wire_len > out_cap) {
+    OPENSSL_PUT_ERROR(SSL, SSL_R_BUFFER_TOO_SMALL);
+    return 0;
+  }
+  assert(!buffers_alias(inner, inner_len, out, wire_len));
+
+  // Same overflow guard as do_seal_record: never wrap write_sequence.
+  if (ssl->s3->write_sequence + 1 == 0) {
+    OPENSSL_PUT_ERROR(SSL, ERR_R_OVERFLOW);
+    return 0;
+  }
+
+  // Record version (tls_record_version is static in tls_record.cc; inline the
+  // same mapping): TLS 1.3 freezes the record version at TLS 1.2, versionless
+  // connections use TLS 1.0, previous versions use the version itself.
+  uint16_t record_version = ssl_protocol_version(ssl) >= TLS1_3_VERSION
+                                ? TLS1_2_VERSION
+                                : (ssl->s3->version == 0 ? TLS1_VERSION
+                                                         : ssl->s3->version);
+  out[0] = SSL3_RT_APPLICATION_DATA;
+  out[1] = record_version >> 8;
+  out[2] = record_version & 0xff;
+  const size_t ciphertext_len = inner_len + suffix_len;
+  out[3] = static_cast<uint8_t>(ciphertext_len >> 8);
+  out[4] = static_cast<uint8_t>(ciphertext_len & 0xff);
+
+  // SSLAEADContext::Seal appends nothing: |inner| is sealed as-is (unlike
+  // do_seal_record, which passes the inner content type via extra_in).
+  size_t sealed_len = 0;
+  if (!aead->Seal(out + SSL3_RT_HEADER_LENGTH, &sealed_len,
+                  out_cap - SSL3_RT_HEADER_LENGTH, out[0], record_version,
+                  ssl->s3->write_sequence, Span(out, SSL3_RT_HEADER_LENGTH),
+                  inner, inner_len)) {
+    return 0;
+  }
+  ssl->s3->write_sequence++;
+  *out_len = SSL3_RT_HEADER_LENGTH + sealed_len;
+  return 1;
+}
+"""
+
 
 def inject(boringssl: Path) -> int:
     """执行三处注入；返回实际落盘的改动数（幂等跳过不计）。"""
@@ -151,6 +255,27 @@ def inject(boringssl: Path) -> int:
         sources.write_text(text, encoding="utf-8", newline="\n")
         changed += 1
         print(f"injected: {sources}")
+
+    # 4 (bd z32z). ssl/ssl_post_handshake.cc 追加 mirror seal 原语实现
+    cc_text = cc_path.read_text(encoding="utf-8")
+    if "SSL_seal_raw_tls13_record" in cc_text:
+        print("mirror-seal already present: ssl_post_handshake.cc (skip)")
+    else:
+        cc_path.write_text(cc_text + MIRROR_SEAL_CC_APPEND, encoding="utf-8", newline="\n")
+        changed += 1
+        print(f"injected: {cc_path} (mirror-seal impl)")
+
+    # 5 (bd z32z). include/openssl/ssl.h 追加 mirror seal 声明
+    text = ssl_h.read_text(encoding="utf-8")
+    if "SSL_seal_raw_tls13_record" in text:
+        print("mirror-seal already present: ssl.h decl (skip)")
+    else:
+        if MIRROR_SEAL_H_ANCHOR not in text:
+            raise SystemExit(f"anchor not found in ssl.h: {MIRROR_SEAL_H_ANCHOR!r}")
+        idx = text.find(MIRROR_SEAL_H_ANCHOR) + len(MIRROR_SEAL_H_ANCHOR)
+        ssl_h.write_text(text[:idx] + MIRROR_SEAL_H_DECL + text[idx:], encoding="utf-8", newline="\n")
+        changed += 1
+        print(f"injected: {ssl_h} (mirror-seal decl)")
 
     return changed
 

@@ -6,9 +6,11 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::config::GeodataConfig;
-use crate::downloader::{AssetDownloader, GeodataReloader, reload_with_update};
-use crate::error::{at_error, at_warning, GeodataError};
+use crate::{
+    config::GeodataConfig,
+    downloader::{AssetDownloader, GeodataReloader, reload_with_update},
+    error::{GeodataError, at_error, at_warning},
+};
 
 /// Scheduler trait：把 cron 表达式 + 回调注册到调度器，返回可取消的 handle。
 ///
@@ -30,9 +32,7 @@ pub struct ScheduleHandle {
 impl ScheduleHandle {
     /// 构造调度句柄，传入 cancel 闭包。
     pub fn new(cancel: impl FnOnce() + Send + 'static) -> Self {
-        Self {
-            cancel: Box::new(cancel),
-        }
+        Self { cancel: Box::new(cancel) }
     }
 
     /// 取消调度。
@@ -56,8 +56,8 @@ impl Scheduler for NoopScheduler {
 /// GeodataInstance：geodata crate 的主编排类。
 ///
 /// 持有 config + downloader + reloader，编排：
-///   - `start_with_callback()`：通过 scheduler 注册 cron 调度，
-///     传入的闭包是 cron 触发时**真正执行**的代码（不是占位的 `|| {}`）。
+///   - `start_with_callback()`：通过 scheduler 注册 cron 调度， 传入的闭包是 cron
+///     触发时**真正执行**的代码（不是占位的 `|| {}`）。
 ///   - `execute()`：手动触发一次 reload（cron 调度的回调内会调用此方法）
 ///   - `close()`：取消调度
 pub struct GeodataInstance {
@@ -72,13 +72,7 @@ struct InstanceState {
 
 impl GeodataInstance {
     pub fn new(config: GeodataConfig) -> Self {
-        Self {
-            config,
-            state: Mutex::new(InstanceState {
-                running: false,
-                handle: None,
-            }),
-        }
+        Self { config, state: Mutex::new(InstanceState { running: false, handle: None }) }
     }
 
     pub fn config(&self) -> &GeodataConfig {
@@ -146,21 +140,23 @@ impl GeodataInstance {
     }
 
     /// 仅 reload（不下载，与 Go `reload()` 等价）。
-    pub fn reload_only<R: GeodataReloader + ?Sized>(&self, reloader: &R) -> Result<(), GeodataError> {
+    pub fn reload_only<R: GeodataReloader + ?Sized>(
+        &self,
+        reloader: &R,
+    ) -> Result<(), GeodataError> {
         reloader.reload()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
 
     fn counting_scheduler() -> (Arc<CountingScheduler>, Arc<AtomicUsize>) {
         let counter = Arc::new(AtomicUsize::new(0));
-        let s = Arc::new(CountingScheduler {
-            counter: counter.clone(),
-        });
+        let s = Arc::new(CountingScheduler { counter: counter.clone() });
         (s, counter)
     }
 
@@ -192,10 +188,7 @@ mod tests {
 
     #[test]
     fn instance_with_cron_schedules_once() {
-        let cfg = GeodataConfig {
-            cron: "0 0 * * *".into(),
-            ..Default::default()
-        };
+        let cfg = GeodataConfig { cron: "0 0 * * *".into(), ..Default::default() };
         let inst = GeodataInstance::new(cfg);
         let (s, c) = counting_scheduler();
         inst.start_with_callback(&*s, Box::new(|| {})).unwrap();
@@ -209,9 +202,7 @@ mod tests {
         let inst = GeodataInstance::new(cfg);
         let (s, _) = counting_scheduler();
         inst.start_with_callback(&*s, Box::new(|| {})).unwrap();
-        let err = inst
-            .start_with_callback(&*s, Box::new(|| {}))
-            .unwrap_err();
+        let err = inst.start_with_callback(&*s, Box::new(|| {})).unwrap_err();
         assert!(matches!(err, GeodataError::AlreadyRunning));
         inst.close().unwrap();
     }
@@ -236,10 +227,7 @@ mod tests {
 
     #[test]
     fn instance_restart_after_close() {
-        let cfg = GeodataConfig {
-            cron: "*".into(),
-            ..Default::default()
-        };
+        let cfg = GeodataConfig { cron: "*".into(), ..Default::default() };
         let inst = GeodataInstance::new(cfg);
         let (s, _) = counting_scheduler();
         inst.start_with_callback(&*s, Box::new(|| {})).unwrap();
@@ -260,14 +248,11 @@ mod tests {
         dir: std::path::PathBuf,
     }
     impl AssetDownloader for RecordingDownloader {
-        fn download_to(
-            &self,
-            _url: &str,
-            temp: &std::path::Path,
-        ) -> Result<(), GeodataError> {
+        fn download_to(&self, _url: &str, temp: &std::path::Path) -> Result<(), GeodataError> {
             std::fs::write(temp, b"x").unwrap();
             Ok(())
         }
+
         fn resolve_target(&self, file: &str) -> Result<std::path::PathBuf, GeodataError> {
             Ok(self.dir.join(file))
         }

@@ -1,5 +1,4 @@
 //! Trojan Go<->Rust interop tests.
-//!
 // Test scenarios:
 // 1. Go Trojan server -> Rust Trojan client (wire-level protocol compat)
 // 2. Rust Trojan server -> Go Trojan client (via Go xray SOCKS5 inbound)
@@ -12,22 +11,26 @@
 
 mod interop_helpers;
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use std::{collections::HashMap, sync::Arc};
 
 use interop_helpers::*;
-use xray_app_dispatcher::default::{DialBridge, SimpleOhm};
-use xray_app_dispatcher::DispatchHandler;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
+use xray_app_dispatcher::{
+    DispatchHandler,
+    default::{DialBridge, SimpleOhm},
+};
 use xray_common::net::address::Address;
 use xray_proxy_freedom::make_freedom_dial_fn;
-use xray_proxy_trojan::config::MemoryAccount as TrojanAccount;
-use xray_proxy_trojan::protocol::{write_request_header, Network as TrojanNetwork};
-use xray_proxy_trojan::server::trojan_server_handshake;
-use xray_proxy_trojan::validator::{MemoryUser as TrojanUser, Validator as TrojanValidator};
-use xray_proxy_trojan::serve_trojan;
+use xray_proxy_trojan::{
+    config::MemoryAccount as TrojanAccount,
+    protocol::{Network as TrojanNetwork, write_request_header},
+    serve_trojan,
+    server::trojan_server_handshake,
+    validator::{MemoryUser as TrojanUser, Validator as TrojanValidator},
+};
 
 // Test password.
 const PASSWORD: &str = "interop-trojan-password";
@@ -65,9 +68,7 @@ fn make_trojan_users() -> HashMap<String, TrojanUser> {
 #[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
 async fn go_trojan_server_rust_client_handshake() {
     // Start HTTP echo server as target
-    let echo_port = spawn_http_echo_server()
-        .await
-        .expect("start http echo server");
+    let echo_port = spawn_http_echo_server().await.expect("start http echo server");
 
     // Configure Go xray: Trojan inbound (plain TCP) + freedom outbound
     let trojan_port: u16 = 20041;
@@ -75,15 +76,10 @@ async fn go_trojan_server_rust_client_handshake() {
         inbounds: vec![trojan_server_inbound(trojan_port, PASSWORD)],
         outbounds: vec![freedom_outbound()],
     };
-    let config_path = write_config_to_temp(&config, "go-trojan-server")
-        .expect("write config");
+    let config_path = write_config_to_temp(&config, "go-trojan-server").expect("write config");
 
-    let mut go_proc = start_go_xray(&config_path)
-        .await
-        .expect("start Go xray");
-    wait_for_port(trojan_port, 5000)
-        .await
-        .expect("Go Trojan port ready");
+    let mut go_proc = start_go_xray(&config_path).await.expect("start Go xray");
+    wait_for_port(trojan_port, 5000).await.expect("Go Trojan port ready");
 
     // Rust Trojan client: connect to Go server, send handshake
     let result = rust_trojan_client_connect(trojan_port, echo_port).await;
@@ -96,23 +92,14 @@ async fn go_trojan_server_rust_client_handshake() {
 }
 
 /// Rust Trojan client connects to Go Trojan server, sends handshake + data.
-async fn rust_trojan_client_connect(
-    server_port: u16,
-    echo_port: u16,
-) -> std::io::Result<()> {
+async fn rust_trojan_client_connect(server_port: u16, echo_port: u16) -> std::io::Result<()> {
     let account = TrojanAccount::new(PASSWORD);
     let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{server_port}")).await?;
 
     // Write Trojan request header
     let dest_addr = Address::ipv4(std::net::Ipv4Addr::LOCALHOST);
     let mut header_buf = Vec::new();
-    write_request_header(
-        &mut header_buf,
-        &account,
-        TrojanNetwork::Tcp,
-        &dest_addr,
-        echo_port,
-    );
+    write_request_header(&mut header_buf, &account, TrojanNetwork::Tcp, &dest_addr, echo_port);
     client.write_all(&header_buf).await?;
     client.flush().await?;
 
@@ -135,7 +122,7 @@ async fn rust_trojan_client_connect(
                     break;
                 }
                 return Err(e);
-            }
+            },
         }
     }
 
@@ -155,9 +142,7 @@ async fn rust_trojan_client_connect(
 #[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
 async fn rust_trojan_server_go_client() {
     // Start HTTP echo server as target
-    let echo_port = spawn_http_echo_server()
-        .await
-        .expect("start http echo server");
+    let echo_port = spawn_http_echo_server().await.expect("start http echo server");
 
     // Start Rust Trojan server
     let ohm = make_trojan_ohm();
@@ -175,27 +160,14 @@ async fn rust_trojan_server_go_client() {
         inbounds: vec![socks5_inbound(socks_port)],
         outbounds: vec![trojan_outbound(rust_trojan_port, PASSWORD)],
     };
-    let config_path = write_config_to_temp(&config, "go-trojan-client")
-        .expect("write config");
+    let config_path = write_config_to_temp(&config, "go-trojan-client").expect("write config");
 
-    let mut go_proc = start_go_xray(&config_path)
-        .await
-        .expect("start Go xray");
-    wait_for_port(socks_port, 5000)
-        .await
-        .expect("Go SOCKS5 port ready");
+    let mut go_proc = start_go_xray(&config_path).await.expect("start Go xray");
+    wait_for_port(socks_port, 5000).await.expect("Go SOCKS5 port ready");
 
     // Send HTTP request through Go SOCKS5 -> Go Trojan -> Rust Trojan -> freedom -> echo
-    let proxy_addr = format!("127.0.0.1:{socks_port}")
-        .parse()
-        .expect("parse addr");
-    let result = http_get_via_socks5(
-        proxy_addr,
-        "127.0.0.1",
-        echo_port,
-        "/interop",
-    )
-    .await;
+    let proxy_addr = format!("127.0.0.1:{socks_port}").parse().expect("parse addr");
+    let result = http_get_via_socks5(proxy_addr, "127.0.0.1", echo_port, "/interop").await;
 
     // Cleanup
     let _ = go_proc.kill().await;
@@ -231,13 +203,7 @@ async fn rust_trojan_server_go_client_handshake_only() {
 
     let dest_addr = Address::ipv4(std::net::Ipv4Addr::LOCALHOST);
     let mut header_buf = Vec::new();
-    write_request_header(
-        &mut header_buf,
-        &account,
-        TrojanNetwork::Tcp,
-        &dest_addr,
-        8080,
-    );
+    write_request_header(&mut header_buf, &account, TrojanNetwork::Tcp, &dest_addr, 8080);
     client.write_all(&header_buf).await.expect("write header");
     client.flush().await.expect("flush");
 

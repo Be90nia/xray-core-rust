@@ -20,14 +20,15 @@ pub mod udp;
 pub(crate) mod test_support;
 
 pub use config::{
-    Config, DestinationOverride, DomainStrategy, FinalRule, FinalRuleConfig, Fragment, Noise, Range,
-    RuleAction, ALL_NETWORKS, DEFAULT_BLOCK_PRIVATE_CIDRS, DefaultRuleType,
+    ALL_NETWORKS, Config, DEFAULT_BLOCK_PRIVATE_CIDRS, DefaultRuleType, DestinationOverride,
+    DomainStrategy, FinalRule, FinalRuleConfig, Fragment, Noise, Range, RuleAction,
     get_default_rule_type,
+};
+pub use dispatcher::{
+    FreedomDispatchBridge, make_dial_fn as make_freedom_dial_fn,
+    make_dial_fn_with_config as make_freedom_dial_fn_with_config,
+    make_dial_fn_with_sockopt as make_freedom_dial_fn_with_sockopt,
 };
 pub use error::{FreedomError, Result};
 pub use handler::FreedomHandler;
-pub use dispatcher::FreedomDispatchBridge;
-pub use dispatcher::make_dial_fn as make_freedom_dial_fn;
-pub use dispatcher::make_dial_fn_with_config as make_freedom_dial_fn_with_config;
-pub use dispatcher::make_dial_fn_with_sockopt as make_freedom_dial_fn_with_sockopt;
 pub use inbound::FreedomInboundHandler;

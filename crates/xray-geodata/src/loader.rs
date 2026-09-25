@@ -18,9 +18,7 @@ pub enum LoaderError {
 
     /// 未找到指定代码的条目
     #[error("未找到代码: {code}")]
-    NotFound {
-        code: String,
-    },
+    NotFound { code: String },
 
     /// Protobuf 解码错误
     #[error("protobuf 解码错误: {0}")]
@@ -88,12 +86,10 @@ pub fn find<R: Read + Seek>(
         // 读取 tag byte
         let mut tag_buf = [0u8; 1];
         match reader.read_exact(&mut tag_buf) {
-            Ok(()) => {}
+            Ok(()) => {},
             Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                return Err(LoaderError::NotFound {
-                    code: code.to_string(),
-                });
-            }
+                return Err(LoaderError::NotFound { code: code.to_string() });
+            },
             Err(e) => return Err(LoaderError::Io(e)),
         }
 
@@ -115,9 +111,8 @@ pub fn find<R: Read + Seek>(
         // prefix[0] 是 code 字段的 tag byte
         // prefix[1] 是 code 字符串的长度
         // prefix[2..] 是 code 字符串内容
-        let matched = prefix.len() > 1
-            && prefix[1] as usize == code_len
-            && prefix[2..] == code_bytes[..];
+        let matched =
+            prefix.len() > 1 && prefix[1] as usize == code_len && prefix[2..] == code_bytes[..];
 
         let remain_len = body_len - prefix_len;
 
@@ -185,11 +180,7 @@ impl GeoDataLoader {
     /// 检查 dat 文件中是否存在指定代码的条目。
     ///
     /// 对应 Go 版本 `checkFile`。
-    pub fn check_file(
-        &self,
-        filename: &str,
-        code: &str,
-    ) -> Result<(), LoaderError> {
+    pub fn check_file(&self, filename: &str, code: &str) -> Result<(), LoaderError> {
         let path = self.datadir.join(filename);
         let mut file = std::fs::File::open(&path)?;
         find(&mut file, code, false)?;
@@ -199,11 +190,7 @@ impl GeoDataLoader {
     /// 加载 dat 文件中指定代码的条目原始字节。
     ///
     /// 对应 Go 版本 `loadFile`。
-    pub fn load_file(
-        &self,
-        filename: &str,
-        code: &str,
-    ) -> Result<Vec<u8>, LoaderError> {
+    pub fn load_file(&self, filename: &str, code: &str) -> Result<Vec<u8>, LoaderError> {
         let path = self.datadir.join(filename);
         let mut file = std::fs::File::open(&path)?;
         find(&mut file, code, true)
@@ -212,11 +199,7 @@ impl GeoDataLoader {
     /// 加载 GeoIP 条目。
     ///
     /// 对应 Go 版本 `loadIP`，从 dat 文件中查找并解码 GeoIP。
-    pub fn load_ip(
-        &self,
-        filename: &str,
-        code: &str,
-    ) -> Result<GeoIp, LoaderError> {
+    pub fn load_ip(&self, filename: &str, code: &str) -> Result<GeoIp, LoaderError> {
         let bytes = self.load_file(filename, code)?;
         let geo_ip = prost::Message::decode(bytes.as_slice())?;
         Ok(geo_ip)
@@ -225,11 +208,7 @@ impl GeoDataLoader {
     /// 加载 GeoSite 条目。
     ///
     /// 对应 Go 版本 `loadSite`，从 dat 文件中查找并解码 GeoSite。
-    pub fn load_site(
-        &self,
-        filename: &str,
-        code: &str,
-    ) -> Result<GeoSite, LoaderError> {
+    pub fn load_site(&self, filename: &str, code: &str) -> Result<GeoSite, LoaderError> {
         let bytes = self.load_file(filename, code)?;
         let geo_site = prost::Message::decode(bytes.as_slice())?;
         Ok(geo_site)
@@ -300,11 +279,8 @@ impl AllAttrsMatcher {
     ///
     /// 对应 Go 版本 `NewAllAttrsMatcher`。
     pub fn new(attrs: &str) -> Self {
-        let matchers = attrs
-            .split('@')
-            .filter(|s| !s.is_empty())
-            .map(|s| HasAttrMatcher::new(s))
-            .collect();
+        let matchers =
+            attrs.split('@').filter(|s| !s.is_empty()).map(|s| HasAttrMatcher::new(s)).collect();
         Self { matchers }
     }
 }
@@ -320,10 +296,7 @@ impl AttributeMatcher for AllAttrsMatcher {
 /// 从内存中的 protobuf 字节查找并解码 GeoIP。
 ///
 /// 不需要文件系统，直接在内存中操作。
-pub fn find_geo_ip(
-    data: &[u8],
-    code: &str,
-) -> Result<GeoIp, LoaderError> {
+pub fn find_geo_ip(data: &[u8], code: &str) -> Result<GeoIp, LoaderError> {
     let mut cursor = io::Cursor::new(data);
     let bytes = find(&mut cursor, code, true)?;
     let geo_ip = prost::Message::decode(bytes.as_slice())?;
@@ -331,10 +304,7 @@ pub fn find_geo_ip(
 }
 
 /// 从内存中的 protobuf 字节查找并解码 GeoSite。
-pub fn find_geo_site(
-    data: &[u8],
-    code: &str,
-) -> Result<GeoSite, LoaderError> {
+pub fn find_geo_site(data: &[u8], code: &str) -> Result<GeoSite, LoaderError> {
     let mut cursor = io::Cursor::new(data);
     let bytes = find(&mut cursor, code, true)?;
     let geo_site = prost::Message::decode(bytes.as_slice())?;
@@ -354,8 +324,10 @@ pub fn check_code(data: &[u8], code: &str) -> Result<bool, LoaderError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geosite::DomainAttribute;
-    use crate::pb::{Cidr, GeoIpList, GeoSiteList};
+    use crate::{
+        geosite::DomainAttribute,
+        pb::{Cidr, GeoIpList, GeoSiteList},
+    };
 
     // ── varint 编解码测试 ────────────────────────────────────
 
@@ -396,8 +368,7 @@ mod tests {
             .with_cidr(Cidr::new(vec![192, 168, 0, 0], 16));
         let list = GeoIpList::new()
             .with_entry(geo_ip)
-            .with_entry(GeoIp::new("US")
-                .with_cidr(Cidr::new(vec![172, 16, 0, 0], 12)));
+            .with_entry(GeoIp::new("US").with_cidr(Cidr::new(vec![172, 16, 0, 0], 12)));
 
         let data = prost::Message::encode_to_vec(&list);
         let result = find_geo_ip(&data, "CN").unwrap();
@@ -412,8 +383,7 @@ mod tests {
             .with_domain(Domain::domain("qq"));
         let list = GeoSiteList::new()
             .with_entry(geo_site)
-            .with_entry(GeoSite::new("US")
-                .with_domain(Domain::full("google.com")));
+            .with_entry(GeoSite::new("US").with_domain(Domain::full("google.com")));
 
         let data = prost::Message::encode_to_vec(&list);
         let result = find_geo_site(&data, "US").unwrap();
@@ -423,8 +393,7 @@ mod tests {
 
     #[test]
     fn find_code_not_found() {
-        let list = GeoIpList::new()
-            .with_entry(GeoIp::new("CN"));
+        let list = GeoIpList::new().with_entry(GeoIp::new("CN"));
 
         let data = prost::Message::encode_to_vec(&list);
         let result = check_code(&data, "JP");
@@ -433,8 +402,7 @@ mod tests {
 
     #[test]
     fn check_code_exists() {
-        let list = GeoIpList::new()
-            .with_entry(GeoIp::new("CN"));
+        let list = GeoIpList::new().with_entry(GeoIp::new("CN"));
 
         let data = prost::Message::encode_to_vec(&list);
         let result = check_code(&data, "CN");

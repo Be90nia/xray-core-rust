@@ -1,19 +1,21 @@
-﻿//! Mux 帧数据写入器
+//! Mux 帧数据写入器
 //!
 //! 实现 MuxWriter 用于写入 Mux 协议帧数据
 
-use std::pin::Pin;
-use std::sync::Arc;
+use std::{pin::Pin, sync::Arc};
 
-use xray_buf::buffer::Buffer;
-use xray_buf::multi::MultiBuffer;
-use xray_buf::writer::BufferedWriter;
-use xray_buf::io::{self as buf_io, Writer};
-use xray_common::bitmask::Bitmask;
-use xray_common::net::destination::Destination;
+use xray_buf::{
+    buffer::Buffer,
+    io::{self as buf_io, Writer},
+    multi::MultiBuffer,
+    writer::BufferedWriter,
+};
+use xray_common::{bitmask::Bitmask, net::destination::Destination};
 
-use crate::frame::{FrameMetadata, MuxError, SessionStatus, OPTION_DATA, OPTION_ERROR};
-use crate::session::TransferType;
+use crate::{
+    frame::{FrameMetadata, MuxError, OPTION_DATA, OPTION_ERROR, SessionStatus},
+    session::TransferType,
+};
 
 /// 流式传输分块大小 (8KB)
 const STREAM_CHUNK_SIZE: usize = 8 * 1024;
@@ -125,17 +127,13 @@ impl MuxWriter {
     async fn write_meta_only(&mut self) -> Result<(), MuxError> {
         let meta = self.get_next_frame_meta();
         let mut vec = Vec::new();
-        meta.write_to(&mut vec)
-            .map_err(|e| MuxError::Io(format!("meta: {:?}", e)))?;
+        meta.write_to(&mut vec).map_err(|e| MuxError::Io(format!("meta: {:?}", e)))?;
         let mb = MultiBuffer::from_buffer(Buffer::from_vec(vec));
         self.writer
             .write_multi_buffer_impl(mb)
             .await
             .map_err(|e| MuxError::Io(format!("write: {:?}", e)))?;
-        self.writer
-            .flush()
-            .await
-            .map_err(|e| MuxError::Io(format!("flush: {:?}", e)))
+        self.writer.flush().await.map_err(|e| MuxError::Io(format!("flush: {:?}", e)))
     }
 
     /// 写入元数据+数据帧；写入后 flush（详见 [`Self::write_meta_only`]）。
@@ -143,10 +141,7 @@ impl MuxWriter {
         let mut meta = self.get_next_frame_meta();
         meta.set_option(OPTION_DATA);
         write_meta_with_frame(&mut self.writer, meta, data).await?;
-        self.writer
-            .flush()
-            .await
-            .map_err(|e| MuxError::Io(format!("flush: {:?}", e)))
+        self.writer.flush().await.map_err(|e| MuxError::Io(format!("flush: {:?}", e)))
     }
 
     /// 写入 MultiBuffer 数据
@@ -163,7 +158,7 @@ impl MuxWriter {
                         let mut c = MultiBuffer::new();
                         c.push(b);
                         c
-                    }
+                    },
                     None => break,
                 }
             };
@@ -180,31 +175,31 @@ impl MuxWriter {
         }
         let meta = FrameMetadata::new(self.id, SessionStatus::End, option);
         let mut vec = Vec::new();
-        meta.write_to(&mut vec)
-            .map_err(|e| MuxError::Io(format!("close meta: {:?}", e)))?;
+        meta.write_to(&mut vec).map_err(|e| MuxError::Io(format!("close meta: {:?}", e)))?;
         let mb = MultiBuffer::from_buffer(Buffer::from_vec(vec));
         self.writer
             .write_multi_buffer_impl(mb)
             .await
             .map_err(|e| MuxError::Io(format!("close write: {:?}", e)))?;
-        self.writer
-            .flush()
-            .await
-            .map_err(|e| MuxError::Io(format!("close flush: {:?}", e)))
+        self.writer.flush().await.map_err(|e| MuxError::Io(format!("close flush: {:?}", e)))
     }
 
     pub fn set_error(&mut self) {
         self.has_error = true;
     }
+
     pub fn id(&self) -> u16 {
         self.id
     }
+
     pub fn transfer_type(&self) -> TransferType {
         self.transfer_type
     }
+
     pub fn is_followup(&self) -> bool {
         self.followup
     }
+
     pub fn has_error(&self) -> bool {
         self.has_error
     }
@@ -220,30 +215,29 @@ async fn write_meta_with_frame(
     // 直序进池化 Buffer（wfx8-3，对齐 Go FrameMetadata.WriteTo(buf.Buffer) 直写
     // 形态）：免每数据帧一次 Vec 分配 + Buffer::from_vec 的二次拷贝。to_bytes
     // 内部的既有分配不在本票范围。
-    let meta_bytes = meta
-        .to_bytes()
-        .map_err(|e| MuxError::Io(format!("meta: {:?}", e)))?;
+    let meta_bytes = meta.to_bytes().map_err(|e| MuxError::Io(format!("meta: {:?}", e)))?;
     let mut frame = Buffer::new();
     {
         let spare = frame.writable_bytes();
         let n = meta_bytes.len() + 2;
-        assert!(
-            n <= spare.len(),
-            "mux meta + length exceeds buffer writable capacity"
-        );
+        assert!(n <= spare.len(), "mux meta + length exceeds buffer writable capacity");
         spare[..meta_bytes.len()].copy_from_slice(&meta_bytes);
         spare[meta_bytes.len()..n].copy_from_slice(&data_len.to_be_bytes());
         frame.advance_write(n);
     }
     let mut mb = MultiBuffer::with_capacity(data.buffer_count() + 1);
     mb.push(frame);
-    for buf in data.into_buffers() { mb.push(buf); }
-    writer.write_multi_buffer_impl(mb).await
-        .map_err(|e| MuxError::Io(format!("write: {:?}", e)))
+    for buf in data.into_buffers() {
+        mb.push(buf);
+    }
+    writer.write_multi_buffer_impl(mb).await.map_err(|e| MuxError::Io(format!("write: {:?}", e)))
 }
 
 impl Writer for MuxWriter {
-    fn write_multi_buffer<'a>(&'a mut self, mb: MultiBuffer) -> Pin<Box<dyn std::future::Future<Output = buf_io::Result<()>> + Send + 'a>> {
+    fn write_multi_buffer<'a>(
+        &'a mut self,
+        mb: MultiBuffer,
+    ) -> Pin<Box<dyn std::future::Future<Output = buf_io::Result<()>> + Send + 'a>> {
         Box::pin(async move {
             self.write(mb).await.map_err(|e| match e {
                 MuxError::Io(msg) => buf_io::Error::WriteError(msg),
@@ -279,9 +273,7 @@ impl Writer for SharedWriter {
             let mut guard = self.inner.lock().await;
             match guard.as_mut() {
                 Some(w) => w.write_multi_buffer(mb).await,
-                None => Err(buf_io::Error::WriteError(
-                    "mux carrier writer closed".to_string(),
-                )),
+                None => Err(buf_io::Error::WriteError("mux carrier writer closed".to_string())),
             }
         })
     }
@@ -289,12 +281,12 @@ impl Writer for SharedWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Cursor;
+
     use xray_buf::io::new_writer;
-    use xray_common::net::address::Address;
-    use xray_common::net::network::Network;
-    use xray_common::net::port::Port;
+    use xray_common::net::{address::Address, network::Network, port::Port};
+
+    use super::*;
 
     fn make_tcp_dest() -> Destination {
         Destination::tcp(Address::Domain("127.0.0.1".to_string()), Port::new(80))

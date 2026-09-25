@@ -4,8 +4,7 @@
 //! `bridge.go` 的 `BridgeWorker.IsActive` 状态判断。
 //! 实际 IO（pipe 读写、timer、mux client）由后续 Phase 接入。
 
-use crate::config::ControlState;
-use crate::error::ReverseError;
+use crate::{config::ControlState, error::ReverseError};
 
 /// Portal worker 进入 drain 状态的总连接数阈值。
 /// 对应 Go `portal.go` 的 `w.client.TotalConnections() > 256`。
@@ -68,18 +67,9 @@ pub fn portal_heartbeat_decision(
     let should_drain = state.total_connections > DRAIN_THRESHOLD;
     let new_counter = (state.counter + 1) % HEARTBEAT_COUNTER_MOD;
     let should_send = should_drain || new_counter == 1;
-    let control_state = if should_drain {
-        ControlState::Drain
-    } else {
-        ControlState::Active
-    };
+    let control_state = if should_drain { ControlState::Drain } else { ControlState::Active };
 
-    Ok(HeartbeatDecision {
-        should_drain,
-        should_send,
-        new_counter,
-        control_state,
-    })
+    Ok(HeartbeatDecision { should_drain, should_send, new_counter, control_state })
 }
 
 /// Bridge worker 是否活跃（对应 Go `BridgeWorker.IsActive`）。
@@ -98,28 +88,35 @@ pub fn bridge_worker_is_active(state: ControlState, worker_closed: bool) -> bool
 // 上方纯决策函数保留为实体的决策核。
 // ===========================================================================
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU8, Ordering},
+    },
+    time::Duration,
+};
 
 use parking_lot::{Mutex, RwLock};
 use prost::Message as _;
-use xray_buf::io::{Reader as IoReader, Writer as IoWriter};
-use xray_buf::multi::MultiBuffer;
-use xray_buf::pipe::{self, PipeOption};
-use xray_buf::reader::BufferedReader;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-use xray_mux::client::{ClientWorker, Link as MuxLink};
-use xray_mux::worker::ServerWorker;
+use xray_buf::{
+    io::{Reader as IoReader, Writer as IoWriter},
+    multi::MultiBuffer,
+    pipe::{self, PipeOption},
+    reader::BufferedReader,
+};
+use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
+use xray_mux::{
+    client::{ClientWorker, Link as MuxLink},
+    worker::ServerWorker,
+};
 use xray_proto::xray::app::reverse::Control as ProtoControl;
 use xray_transport::link::Link as TransportLink;
 
-use crate::bridge::LinkDispatch;
-use crate::config::{Control, INTERNAL_DOMAIN};
-use crate::timer::InactivityTimer;
+use crate::{
+    bridge::LinkDispatch,
+    config::{Control, INTERNAL_DOMAIN},
+    timer::InactivityTimer,
+};
 
 /// Portal worker 心跳间隔（Go `portal.go:262` Interval: 2s）。
 pub const PORTAL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
@@ -137,10 +134,7 @@ pub const BRIDGE_DRAIN_WINDOW: Duration = Duration::from_secs(24 * 3600);
 const PIPE_LIMIT: i64 = 16 * 1024;
 
 fn control_pipe_option() -> PipeOption {
-    PipeOption {
-        limit: PIPE_LIMIT,
-        ..PipeOption::default()
-    }
+    PipeOption { limit: PIPE_LIMIT, ..PipeOption::default() }
 }
 
 /// 内部控制连接目标（Go `portal.go:241`：`UDPDestination(DomainAddress("reverse"), 0)`）。
@@ -151,18 +145,14 @@ fn control_pipe_option() -> PipeOption {
 /// 已随 mux server 修复（worker.rs `handle_xudp_new` data 转发 + 首帧
 /// 即时送达）移除。
 pub fn internal_control_destination() -> Destination {
-    Destination::new(
-        Address::new_domain(INTERNAL_DOMAIN.to_string()),
-        Port::new(0),
-        Network::UDP,
-    )
+    Destination::new(Address::new_domain(INTERNAL_DOMAIN.to_string()), Port::new(0), Network::UDP)
 }
 
 /// 对应 Go `PortalWorker`（portal.go:224-308）：
 /// - 构造：两对 16KiB pipe + 控制连接 dispatch（内部 UDP dest）+ 24h 不活动 timer
 /// - 心跳：`Periodic{Interval: 2s}`，`proto.Marshal` + `MergeBytes` 写 Control
-/// - drain（total connections > [`DRAIN_THRESHOLD`]）：发 `Control_DRAIN` 后
-///   close writer / interrupt reader / 置空 writer
+/// - drain（total connections > [`DRAIN_THRESHOLD`]）：发 `Control_DRAIN` 后 close writer /
+///   interrupt reader / 置空 writer
 pub struct PortalWorker {
     client: Arc<ClientWorker>,
     /// 控制流上行写端（portal → bridge）。drain 后置 None（Go `w.writer = nil`）。
@@ -190,14 +180,7 @@ impl PortalWorker {
         let dest = internal_control_destination();
         let c = Arc::clone(&client);
         tokio::spawn(async move {
-            c.dispatch(
-                &dest,
-                MuxLink {
-                    reader: Box::new(up_r),
-                    writer: Box::new(dn_w),
-                },
-            )
-            .await;
+            c.dispatch(&dest, MuxLink { reader: Box::new(up_r), writer: Box::new(dn_w) }).await;
         });
 
         let timer_client = Arc::clone(&client);
@@ -312,8 +295,8 @@ impl crate::picker::PickerWorker for PortalWorker {
 /// Bridge 侧 worker：一条反向 carrier 上的 mux 服务端 + 控制流状态机。
 ///
 /// 对应 Go `BridgeWorker`（bridge.go:101-235）：
-/// - 构造：真实 dispatcher dispatch `domain:0/TCP`（注入 inbound tag）得 carrier
-///   → `mux.NewServerWorker(self, carrier)` → 60s 不活动 timer（terminate = worker.Close）
+/// - 构造：真实 dispatcher dispatch `domain:0/TCP`（注入 inbound tag）得 carrier →
+///   `mux.NewServerWorker(self, carrier)` → 60s 不活动 timer（terminate = worker.Close）
 /// - `handleInternalConn`：读 Control proto → state 转换
 /// - `dispatch`（mux Dispatcher）：内部域走控制 pipe，其余转真实 dispatcher（注入 tag）
 pub struct BridgeWorker {
@@ -341,12 +324,9 @@ impl xray_mux::worker::Dispatcher for WeakBridgeDispatcher {
         &self,
         dest: Destination,
     ) -> Result<MuxLink, xray_mux::worker::DispatchError> {
-        let me = self
-            .0
-            .upgrade()
-            .ok_or_else(|| {
-                xray_mux::worker::DispatchError::NoRoute("bridge worker dropped".to_string())
-            })?;
+        let me = self.0.upgrade().ok_or_else(|| {
+            xray_mux::worker::DispatchError::NoRoute("bridge worker dropped".to_string())
+        })?;
         me.as_ref().dispatch(dest).await
     }
 
@@ -356,12 +336,9 @@ impl xray_mux::worker::Dispatcher for WeakBridgeDispatcher {
         source: Option<Destination>,
         local: Option<Destination>,
     ) -> Result<MuxLink, xray_mux::worker::DispatchError> {
-        let me = self
-            .0
-            .upgrade()
-            .ok_or_else(|| {
-                xray_mux::worker::DispatchError::NoRoute("bridge worker dropped".to_string())
-            })?;
+        let me = self.0.upgrade().ok_or_else(|| {
+            xray_mux::worker::DispatchError::NoRoute("bridge worker dropped".to_string())
+        })?;
         me.as_ref().dispatch_inbound(dest, source, local).await
     }
 }
@@ -375,11 +352,8 @@ impl BridgeWorker {
         tag: &str,
         dispatcher: Arc<dyn LinkDispatch>,
     ) -> Result<Arc<Self>, ReverseError> {
-        let dest = Destination::new(
-            Address::new_domain(domain.to_string()),
-            Port::new(0),
-            Network::TCP,
-        );
+        let dest =
+            Destination::new(Address::new_domain(domain.to_string()), Port::new(0), Network::TCP);
         let carrier = dispatcher.dispatch(&dest, Some(tag)).await?;
 
         let me = Arc::new(Self {
@@ -467,8 +441,8 @@ impl BridgeWorker {
     /// 控制流读取循环：Control proto → state 转换。
     ///
     /// 对应 Go `BridgeWorker.handleInternalConn`（bridge.go:165-196）：
-    /// - 读错（EOF/interrupt）：Closed → `SetTimeout(0)`（立即终止）；
-    ///   否则 `SetTimeout(24h)`（drain 存活窗口）
+    /// - 读错（EOF/interrupt）：Closed → `SetTimeout(0)`（立即终止）； 否则
+    ///   `SetTimeout(24h)`（drain 存活窗口）
     /// - proto 解析失败：log + `SetTimeout(0)` + return
     /// - 每次成功读：`Timer.Update()`；state 变化即覆写
     pub(crate) async fn handle_internal_conn(me: Arc<Self>, mut reader: Box<dyn IoReader>) {
@@ -483,7 +457,7 @@ impl BridgeWorker {
                         }
                     }
                     return;
-                }
+                },
                 Ok(mb) => mb,
             };
             if let Some(t) = me.timer.read().clone() {
@@ -507,7 +481,7 @@ impl BridgeWorker {
                             t.set_timeout(Duration::ZERO);
                         }
                         return;
-                    }
+                    },
                 }
             }
         }
@@ -523,15 +497,10 @@ impl BridgeWorker {
     ) -> Result<(), ReverseError> {
         if !crate::bridge::is_internal_domain(dest.address().as_domain()) {
             let tag = self.tag.clone();
-            return self
-                .dispatcher
-                .dispatch_link(dest, link, Some(tag.as_str()))
-                .await;
+            return self.dispatcher.dispatch_link(dest, link, Some(tag.as_str())).await;
         }
         let Some(me) = self.arc() else {
-            return Err(ReverseError::CreateBridgeWorker(
-                "bridge worker not initialized".into(),
-            ));
+            return Err(ReverseError::CreateBridgeWorker("bridge worker not initialized".into()));
         };
         Self::handle_internal_conn(me, link.reader).await;
         Ok(())
@@ -554,13 +523,8 @@ impl xray_mux::worker::Dispatcher for BridgeWorker {
                 .dispatcher
                 .dispatch(&dest, Some(tag.as_str()))
                 .await
-                .map(|l| MuxLink {
-                    reader: l.reader,
-                    writer: l.writer,
-                })
-                .map_err(|e| {
-                    xray_mux::worker::DispatchError::ConnectionFailed(e.to_string())
-                });
+                .map(|l| MuxLink { reader: l.reader, writer: l.writer })
+                .map_err(|e| xray_mux::worker::DispatchError::ConnectionFailed(e.to_string()));
         }
 
         let Some(me) = self.arc() else {
@@ -577,11 +541,9 @@ impl xray_mux::worker::Dispatcher for BridgeWorker {
             Self::handle_internal_conn(me, Box::new(dn_r)).await;
             drop(up_w);
         });
-        Ok(MuxLink {
-            reader: Box::new(up_r),
-            writer: Box::new(dn_w),
-        })
+        Ok(MuxLink { reader: Box::new(up_r), writer: Box::new(dn_w) })
     }
+
     /// Reverse-mux 带帧内 source/local 的 dispatch（txno④；Go server.go:166-174
     /// 覆写 ctx inbound 后 Dispatch 等价）。管道对自建（与
     /// [`xray_mux::worker::DispatchHandlerAdapter`] 同拓扑）：
@@ -620,10 +582,7 @@ impl xray_mux::worker::Dispatcher for BridgeWorker {
                 );
             }
         });
-        Ok(MuxLink {
-            reader: Box::new(read_a),
-            writer: Box::new(write_b),
-        })
+        Ok(MuxLink { reader: Box::new(read_a), writer: Box::new(write_b) })
     }
 }
 
@@ -631,7 +590,13 @@ impl xray_mux::worker::Dispatcher for BridgeWorker {
 mod tests {
     use super::*;
 
-    fn state(closed: bool, draining: bool, writer: bool, conn: u32, counter: u8) -> PortalWorkerState {
+    fn state(
+        closed: bool,
+        draining: bool,
+        writer: bool,
+        conn: u32,
+        counter: u8,
+    ) -> PortalWorkerState {
         PortalWorkerState {
             closed,
             already_draining: draining,
@@ -678,7 +643,8 @@ mod tests {
 
     #[test]
     fn heartbeat_above_threshold_drains() {
-        let d = portal_heartbeat_decision(&state(false, false, true, DRAIN_THRESHOLD + 1, 0)).unwrap();
+        let d =
+            portal_heartbeat_decision(&state(false, false, true, DRAIN_THRESHOLD + 1, 0)).unwrap();
         assert!(d.should_drain);
         assert_eq!(d.control_state, ControlState::Drain);
     }
@@ -713,7 +679,8 @@ mod tests {
     #[test]
     fn heartbeat_drain_always_sends() {
         // Even if counter is not 1, drain forces send
-        let d = portal_heartbeat_decision(&state(false, false, true, DRAIN_THRESHOLD + 1, 1)).unwrap();
+        let d =
+            portal_heartbeat_decision(&state(false, false, true, DRAIN_THRESHOLD + 1, 1)).unwrap();
         assert!(d.should_drain);
         assert!(d.should_send);
     }
@@ -774,17 +741,13 @@ mod tests {
 
 #[cfg(test)]
 mod entity_tests {
-    use super::*;
-    use crate::bridge::LinkDispatch;
-    use crate::config::ControlState;
     use parking_lot::Mutex;
-    use xray_buf::io::Writer as _;
-    use xray_buf::pipe;
-    use xray_common::net::address::Address;
-    use xray_common::net::port::Port;
-    use xray_mux::client::ClientWorker;
-    use xray_mux::worker::Dispatcher as _;
-    use xray_mux::session::ClientStrategy;
+    use xray_buf::{io::Writer as _, pipe};
+    use xray_common::net::{address::Address, port::Port};
+    use xray_mux::{client::ClientWorker, session::ClientStrategy, worker::Dispatcher as _};
+
+    use super::*;
+    use crate::{bridge::LinkDispatch, config::ControlState};
 
     /// 记录 (dest, inbound_tag) 的 mock 真实 dispatcher。
     #[derive(Default)]
@@ -799,9 +762,7 @@ mod entity_tests {
             dest: &Destination,
             inbound_tag: Option<&str>,
         ) -> Result<xray_transport::link::Link, ReverseError> {
-            self.calls
-                .lock()
-                .push((dest.clone(), inbound_tag.map(str::to_string)));
+            self.calls.lock().push((dest.clone(), inbound_tag.map(str::to_string)));
             let (r, w) = pipe::new();
             Ok(xray_transport::link::Link::new(Box::new(r), Box::new(w)))
         }
@@ -812,9 +773,7 @@ mod entity_tests {
             _link: xray_transport::link::Link,
             inbound_tag: Option<&str>,
         ) -> Result<(), ReverseError> {
-            self.calls
-                .lock()
-                .push((dest.clone(), inbound_tag.map(str::to_string)));
+            self.calls.lock().push((dest.clone(), inbound_tag.map(str::to_string)));
             Ok(())
         }
     }
@@ -837,10 +796,7 @@ mod entity_tests {
             let (pay_r, pay_w) = pipe::new();
             self.keepers.lock().push(ret_w);
             let _ = self.tx.send((dest.clone(), pay_r));
-            Ok(MuxLink {
-                reader: Box::new(ret_r),
-                writer: Box::new(pay_w),
-            })
+            Ok(MuxLink { reader: Box::new(ret_r), writer: Box::new(pay_w) })
         }
     }
 
@@ -864,21 +820,18 @@ mod entity_tests {
         let (c_read, s_write) = pipe::new(); // server → client
         let (s_read, c_write) = pipe::new(); // client → server
         let client = ClientWorker::new(
-            MuxLink {
-                reader: Box::new(c_read),
-                writer: Box::new(c_write),
-            },
+            MuxLink { reader: Box::new(c_read), writer: Box::new(c_write) },
             ClientStrategy::default(),
         );
         let worker = PortalWorker::new(client).expect("portal worker");
 
-        let server = std::sync::Arc::new(ServerWorker::new(std::sync::Arc::new(
-            CaptureDispatcher {
+        let server = std::sync::Arc::new(
+            ServerWorker::new(std::sync::Arc::new(CaptureDispatcher {
                 tx,
                 keepers: std::sync::Arc::new(Mutex::new(Vec::new())),
-            },
-        ))
-        .with_read_source_and_local());
+            }))
+            .with_read_source_and_local(),
+        );
         let mut reader = xray_buf::reader::BufferedReader::new(Box::new(s_read));
         let link_writer: std::sync::Arc<tokio::sync::Mutex<Option<Box<dyn IoWriter>>>> =
             std::sync::Arc::new(tokio::sync::Mutex::new(Some(Box::new(s_write))));
@@ -903,11 +856,10 @@ mod entity_tests {
         // 第一个心跳（≤2s 触发 + 帧传播）：dispatch 内部域 dest + Control(ACTIVE)。
         // bd 6z8：回归 Go portal.go:241 的 UDP dest（mux server 已转发 New 帧内联
         // data，Packet 会话直写无滞留）。
-        let (dest, mut pay_r) =
-            tokio::time::timeout(std::time::Duration::from_secs(8), rx.recv())
-                .await
-                .expect("control conn dispatched")
-                .expect("channel open");
+        let (dest, mut pay_r) = tokio::time::timeout(std::time::Duration::from_secs(8), rx.recv())
+            .await
+            .expect("control conn dispatched")
+            .expect("channel open");
         assert_eq!(dest.address().as_domain(), Some("reverse"));
         assert_eq!(dest.port().value(), 0);
         assert_eq!(dest.network(), Network::UDP);
@@ -932,11 +884,10 @@ mod entity_tests {
         let worker = spawn_portal_topology(tx).await;
 
         // 第一个心跳：New 帧（内联 ACTIVE Control）+ 持有 control session 下行读端
-        let (_dest, mut pay) =
-            tokio::time::timeout(std::time::Duration::from_secs(8), rx.recv())
-                .await
-                .expect("first control")
-                .expect("channel open");
+        let (_dest, mut pay) = tokio::time::timeout(std::time::Duration::from_secs(8), rx.recv())
+            .await
+            .expect("first control")
+            .expect("channel open");
         let first = read_control(&mut pay).await;
         assert_eq!(first.state, ControlState::Active.as_i32());
 

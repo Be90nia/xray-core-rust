@@ -17,13 +17,13 @@
 //! - [`config::Tun`] / [`config::Stack`] trait — 设备与协议栈抽象
 //!
 //! 切片2 待办：`InterfaceUpdater`（网络接口动态查找）+ 平台 TUN 设备实现
-//!（Linux/Windows/macOS/FreeBSD/Android/iOS）+ gVisor/smoltcp netstack 集成 +
+//! （Linux/Windows/macOS/FreeBSD/Android/iOS）+ gVisor/smoltcp netstack 集成 +
 //! TCP/UDP/ICMP 包处理 + UDP fullcone NAT。
 
 pub mod config;
 pub mod error;
-pub mod netstack;
 pub mod inbound;
+pub mod netstack;
 pub mod outbound;
 // TUN 设备实现按平台门控：windows/macos/linux/bsd 走 tun_rs 真实现，
 // android/ios 走 stub（移动端由宿主 App 注入流量，见 device_stub.rs）。
@@ -38,7 +38,7 @@ pub mod device;
 // 顶层 re-export。
 pub use config::{Stack, StackOptions, Tun, score};
 pub use device::TunDevice;
+pub use error::{Result, TunError};
 pub use inbound::TunInboundHandler;
 pub use netstack::{TcpAcceptEvent, TunNetStack, UdpRecvEvent};
-pub use error::{Result, TunError};
 pub use outbound::make_tun_dial_fn;

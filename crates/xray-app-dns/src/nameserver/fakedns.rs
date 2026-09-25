@@ -2,15 +2,16 @@
 //!
 //! 对应 Go `app/dns/nameserver_fakedns.go`。
 
-use std::future::Future;
-use std::net::IpAddr;
-use std::pin::Pin;
+use std::{future::Future, net::IpAddr, pin::Pin};
 
-use crate::config::{to_net_ip, IpOption};
-use crate::error::DnsError;
-use crate::fakedns::{Holder, HolderMulti};
-use crate::nameserver::Server;
 use xray_common::net::address::Address;
+
+use crate::{
+    config::{IpOption, to_net_ip},
+    error::DnsError,
+    fakedns::{Holder, HolderMulti},
+    nameserver::Server,
+};
 
 /// FakeDNS 引擎抽象。对应 Go `features/dns.FakeDNSEngine` 接口。
 ///
@@ -33,12 +34,15 @@ impl FakeDnsEngine for Holder {
     fn get_fake_ip_for_domain(&self, domain: &str) -> Vec<IpAddr> {
         Holder::get_fake_ip_for_domain(self, domain)
     }
+
     fn get_fake_ip_for_domain_3(&self, domain: &str, ipv4: bool, ipv6: bool) -> Vec<IpAddr> {
         Holder::get_fake_ip_for_domain_3(self, domain, ipv4, ipv6)
     }
+
     fn get_domain_from_fake_dns(&self, ip: IpAddr) -> Option<String> {
         Holder::get_domain_from_fake_dns(self, ip)
     }
+
     fn is_ip_in_pool(&self, ip: IpAddr) -> bool {
         Holder::is_ip_in_pool(self, ip)
     }
@@ -48,12 +52,15 @@ impl FakeDnsEngine for HolderMulti {
     fn get_fake_ip_for_domain(&self, domain: &str) -> Vec<IpAddr> {
         HolderMulti::get_fake_ip_for_domain(self, domain)
     }
+
     fn get_fake_ip_for_domain_3(&self, domain: &str, ipv4: bool, ipv6: bool) -> Vec<IpAddr> {
         HolderMulti::get_fake_ip_for_domain_3(self, domain, ipv4, ipv6)
     }
+
     fn get_domain_from_fake_dns(&self, ip: IpAddr) -> Option<String> {
         HolderMulti::get_domain_from_fake_dns(self, ip)
     }
+
     fn is_ip_in_pool(&self, ip: IpAddr) -> bool {
         HolderMulti::is_ip_in_pool(self, ip)
     }
@@ -137,11 +144,8 @@ impl<E: FakeDnsEngine> Server for FakeDnsServer<E> {
         let engine = &self.engine;
         Box::pin(async move {
             // 优先用 _3 方法（支持 v4/v6 过滤，对应 Go FakeDNSEngineRev0 探测）。
-            let raw = engine.get_fake_ip_for_domain_3(
-                domain,
-                option.ipv4_enable,
-                option.ipv6_enable,
-            );
+            let raw =
+                engine.get_fake_ip_for_domain_3(domain, option.ipv4_enable, option.ipv6_enable);
             let addresses: Vec<Address> = raw
                 .into_iter()
                 .map(|ip| match ip {
@@ -161,9 +165,10 @@ impl<E: FakeDnsEngine> Server for FakeDnsServer<E> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use super::*;
     use crate::fakedns::FakeDnsPool;
-    use std::net::Ipv4Addr;
 
     #[test]
     fn name_and_cache_flag_match_go() {
@@ -186,14 +191,10 @@ mod tests {
     async fn query_ip_filters_by_ip_option() {
         let holder = Holder::new_default().unwrap();
         let s = FakeDnsServer::new(holder);
-        let v6_only = IpOption {
-            ipv4_enable: false,
-            ipv6_enable: true,
-            fake_enable: false,
-        };
+        let v6_only = IpOption { ipv4_enable: false, ipv6_enable: true, fake_enable: false };
         // holder 是 v4 池，v6 查询应返回空响应。
         match s.query_ip("example.com", v6_only).await {
-            Err(DnsError::EmptyResponse) => {}
+            Err(DnsError::EmptyResponse) => {},
             other => panic!("expected EmptyResponse, got {other:?}"),
         }
     }

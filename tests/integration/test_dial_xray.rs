@@ -29,20 +29,22 @@
 
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 use xray_app_dispatcher::OutboundHandlerManager;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::port::Port;
-use xray_common::protocol::{Command, RequestHeader, SecurityType};
-use xray_common::uuid::UUID;
+use xray_common::{
+    net::{address::Address, destination::Destination, port::Port},
+    protocol::{Command, RequestHeader, SecurityType},
+    uuid::UUID,
+};
 use xray_conf::{BuiltConfig, BuiltEntry, BuiltInbound, BuiltOutbound};
 use xray_core::functions::start_full;
-use xray_proxy_vmess::account::cmd_key_of;
-use xray_proxy_vmess::encoding::client::ClientSession as VmessClientSession;
-use xray_proxy_vmess::encoding::VERSION as VMESS_VERSION;
+use xray_proxy_vmess::{
+    account::cmd_key_of,
+    encoding::{VERSION as VMESS_VERSION, client::ClientSession as VmessClientSession},
+};
 
 const VMESS_UUID_STR: &str = "9c8e4a2b-6f1d-4e0b-a5d8-7c9e2f3b8a01";
 
@@ -71,7 +73,7 @@ async fn spawn_echo_server() -> u16 {
                             if sock.write_all(&buf[..n]).await.is_err() {
                                 return;
                             }
-                        }
+                        },
                     }
                 }
             });
@@ -90,10 +92,7 @@ fn vmess_inbound_settings(uuid: &str, email: &str) -> Vec<u8> {
 
 fn freedom_outbound(tag: &str) -> BuiltOutbound {
     BuiltOutbound {
-        entry: BuiltEntry {
-            kind: "freedom".into(),
-            data: b"{}".to_vec(),
-        },
+        entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
         tag: tag.into(),
         send_through: None,
         stream_settings_json: None,
@@ -117,10 +116,7 @@ fn vmess_outbound(server_addr: &str, server_port: u16, uuid: &str) -> BuiltOutbo
         }]
     });
     BuiltOutbound {
-        entry: BuiltEntry {
-            kind: "vmess".into(),
-            data: serde_json::to_vec(&v).unwrap(),
-        },
+        entry: BuiltEntry { kind: "vmess".into(), data: serde_json::to_vec(&v).unwrap() },
         tag: "proxy-via-vmess".into(),
         send_through: None,
         stream_settings_json: None,
@@ -132,10 +128,7 @@ fn vmess_outbound(server_addr: &str, server_port: u16, uuid: &str) -> BuiltOutbo
 
 async fn wait_ready(port: u16) {
     for _ in 0..50 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
-        {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -149,8 +142,8 @@ async fn wait_ready(port: u16) {
 /// 1. server 端 `is_running()` = true；server SimpleOhm 含 "direct" outbound
 /// 2. client 端 `is_running()` = true；client SimpleOhm 含 "proxy-via-vmess"
 /// 3. server 端 SimpleOhm `get_default_handler()` 可用
-/// 4. VMess protocol roundtrip via direct outbound (intra-instance dispatch)
-///    走 dispatcher + freedom default outbound — 验证 dispatcher→default outbound 链。
+/// 4. VMess protocol roundtrip via direct outbound (intra-instance dispatch) 走 dispatcher +
+///    freedom default outbound — 验证 dispatcher→default outbound 链。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dial_xray_two_instance_smoke() {
     let _ = UUID::parse(VMESS_UUID_STR).expect("uuid parse");
@@ -174,13 +167,9 @@ async fn dial_xray_two_instance_smoke() {
         outbounds: vec![freedom_outbound("direct")],
         apps: vec![],
     };
-    let (server_instance, server_ohm, server_handles) = start_full(&server_built)
-        .await
-        .expect("start_full server");
-    assert!(
-        server_instance.is_running(),
-        "server instance must be running"
-    );
+    let (server_instance, server_ohm, server_handles) =
+        start_full(&server_built).await.expect("start_full server");
+    assert!(server_instance.is_running(), "server instance must be running");
     assert!(
         server_ohm.get_handler("direct").is_some(),
         "server SimpleOhm must register `direct` freedom outbound"
@@ -198,13 +187,9 @@ async fn dial_xray_two_instance_smoke() {
         outbounds: vec![vmess_outbound("127.0.0.1", server_port, VMESS_UUID_STR)],
         apps: vec![],
     };
-    let (client_instance, client_ohm, client_handles) = start_full(&client_built)
-        .await
-        .expect("start_full client");
-    assert!(
-        client_instance.is_running(),
-        "client instance must be running"
-    );
+    let (client_instance, client_ohm, client_handles) =
+        start_full(&client_built).await.expect("start_full client");
+    assert!(client_instance.is_running(), "client instance must be running");
     assert!(
         client_ohm.get_handler("proxy-via-vmess").is_some(),
         "client SimpleOhm must register VMess outbound"
@@ -214,26 +199,16 @@ async fn dial_xray_two_instance_smoke() {
     // 验证 server 端 dispatcher→default outbound 链 OK（dokodemo 不参与，
     // 直接 VMess client → server inbound → freedom → echo）。
     use tokio::net::TcpStream;
-    let mut client = TcpStream::connect(("127.0.0.1", server_port))
-        .await
-        .expect("connect server vmess inbound");
+    let mut client =
+        TcpStream::connect(("127.0.0.1", server_port)).await.expect("connect server vmess inbound");
     let session = VmessClientSession::new();
-    let dest = Destination::tcp(
-        Address::ipv4(std::net::Ipv4Addr::LOCALHOST),
-        Port::new(echo_port),
-    );
+    let dest = Destination::tcp(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(echo_port));
     let uuid = UUID::parse(VMESS_UUID_STR).expect("uuid");
-    let header =
-        RequestHeader::new(VMESS_VERSION, Command::Tcp, dest, SecurityType::Aes128Gcm);
+    let header = RequestHeader::new(VMESS_VERSION, Command::Tcp, dest, SecurityType::Aes128Gcm);
     let cmd_key = cmd_key_of(&uuid);
-    let sealed = session
-        .encode_request_header(&header, &cmd_key)
-        .expect("vmess encode header");
+    let sealed = session.encode_request_header(&header, &cmd_key).expect("vmess encode header");
     client.write_all(&sealed).await.expect("write vmess header");
-    session
-        .decode_response_header_async(&mut client)
-        .await
-        .expect("vmess decode resp header");
+    session.decode_response_header_async(&mut client).await.expect("vmess decode resp header");
 
     // 写 PAYLOAD + 读 echo（VMess body 必须走 session 编解码，同 e2e_vmess_proxy 模式；
     // 之前裸写 plaintext 导致服务端解密垃圾、echo 永不返回）
@@ -243,10 +218,7 @@ async fn dial_xray_two_instance_smoke() {
         .await
         .expect("vmess encode body");
     let response = tokio::time::timeout(Duration::from_secs(5), async {
-        session
-            .decode_response_body_async(&header, &mut client)
-            .await
-            .expect("vmess decode body")
+        session.decode_response_body_async(&header, &mut client).await.expect("vmess decode body")
     })
     .await
     .expect("echo roundtrip must complete in 5s");

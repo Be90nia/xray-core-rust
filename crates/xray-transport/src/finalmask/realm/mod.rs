@@ -27,8 +27,7 @@ pub use punch::{PunchMetadata, PunchPacket, PunchPacketType};
 pub use stun::{
     addr_port_strings, build_binding_request, candidate_punch_addrs,
     expand_symmetric_nat_candidates, is_stun_message, parse_addr_ports,
-    parse_stun_binding_response, predictable_port_group,
-    resolve_stun_servers, unique_sorted_ports,
+    parse_stun_binding_response, predictable_port_group, resolve_stun_servers, unique_sorted_ports,
 };
 
 /// Realm 配置（对应 Go `realm.Config` protobuf）。

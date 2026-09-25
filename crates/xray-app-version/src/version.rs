@@ -156,7 +156,7 @@ pub fn compare_versions(v1: &str, v2: &str) -> Result<i8, VersionError> {
         match n1.cmp(&n2) {
             std::cmp::Ordering::Less => return Ok(-1),
             std::cmp::Ordering::Greater => return Ok(1),
-            std::cmp::Ordering::Equal => {}
+            std::cmp::Ordering::Equal => {},
         }
     }
     Ok(0)
@@ -167,11 +167,7 @@ mod tests {
     use super::*;
 
     fn cfg(core: &str, min: &str, max: &str) -> Config {
-        Config {
-            core_version: core.into(),
-            min_version: min.into(),
-            max_version: max.into(),
-        }
+        Config { core_version: core.into(), min_version: min.into(), max_version: max.into() }
     }
 
     // ---- compare_versions ----

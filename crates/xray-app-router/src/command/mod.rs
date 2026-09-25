@@ -11,8 +11,7 @@
 
 use std::sync::Arc;
 
-use crate::error::RouterError;
-use crate::router::Router;
+use crate::{error::RouterError, router::Router};
 
 /// gRPC RoutingService 管理 RPC。
 ///
@@ -69,11 +68,7 @@ impl RoutingService {
     }
 
     /// 覆盖平衡器目标。委托 [`Router::override_balancer`]。
-    pub fn override_balancer_target(
-        &self,
-        tag: &str,
-        target: &str,
-    ) -> Result<(), RouterError> {
+    pub fn override_balancer_target(&self, tag: &str, target: &str) -> Result<(), RouterError> {
         self.router()?.override_balancer(tag, target)
     }
 
@@ -118,10 +113,7 @@ impl RoutingService {
     /// 过滤后的 outbound 列表（顺序由 strategy 决定；当前实现直接走 selectors 顺序，
     /// 与 Go `RoundRobinStrategy.GetPrincipleTarget(strings) []string { return strings }`
     /// 的 Round-Robin 行为等价）。
-    pub fn get_principle_target(
-        &self,
-        balancer_tag: &str,
-    ) -> Result<Vec<String>, RouterError> {
+    pub fn get_principle_target(&self, balancer_tag: &str) -> Result<Vec<String>, RouterError> {
         let router = self.router()?;
         let balancer = router
             .get_balancer(balancer_tag)
@@ -132,7 +124,6 @@ impl RoutingService {
             .select_outbounds(&tags)
             .map_err(|e| RouterError::Other(format!("select_outbounds: {e}")))
     }
-
 }
 #[cfg(test)]
 mod tests {
@@ -165,8 +156,10 @@ mod tests {
 
     #[test]
     fn test_route_without_matching_rule_returns_no_clue() {
-        use crate::balancing::{NotImplementedSelector, OutboundHandlerSelector};
-        use crate::context::RoutingData;
+        use crate::{
+            balancing::{NotImplementedSelector, OutboundHandlerSelector},
+            context::RoutingData,
+        };
         let ohm: Arc<dyn OutboundHandlerSelector> = Arc::new(NotImplementedSelector);
         let router = Router::empty(ohm, None);
         let s = RoutingService::with_router(router);
@@ -178,23 +171,22 @@ mod tests {
     /// add_rule: 接受 RoutingRule proto，注册后 list_rule 可见。
     #[test]
     fn add_rule_then_list_rule_contains_tag() {
+        use xray_proto::xray::{
+            app::router::{RoutingRule, routing_rule::TargetTag},
+            common::geodata::{Domain, DomainRule, domain::Type as DomainType},
+        };
+
         use crate::balancing::{NotImplementedSelector, OutboundHandlerSelector};
-        use xray_proto::xray::app::router::routing_rule::TargetTag;
-        use xray_proto::xray::app::router::RoutingRule;
-        use xray_proto::xray::common::geodata::domain::Type as DomainType;
-        use xray_proto::xray::common::geodata::{Domain, DomainRule};
         let ohm: Arc<dyn OutboundHandlerSelector> = Arc::new(NotImplementedSelector);
         let router = Router::empty(ohm, None);
         let s = RoutingService::with_router(router);
         let mut proto = RoutingRule::default();
         proto.domain = vec![DomainRule {
-            value: Some(xray_proto::xray::common::geodata::domain_rule::Value::Custom(
-                Domain {
-                    r#type: DomainType::Full as i32,
-                    value: "example.com".into(),
-                    attribute: vec![],
-                },
-            )),
+            value: Some(xray_proto::xray::common::geodata::domain_rule::Value::Custom(Domain {
+                r#type: DomainType::Full as i32,
+                value: "example.com".into(),
+                attribute: vec![],
+            })),
         }];
         proto.target_tag = Some(TargetTag::Tag("out-A".into()));
         s.add_rule("rule-1".to_string(), proto).expect("add_rule");
@@ -211,5 +203,4 @@ mod tests {
         let s = RoutingService::with_router(router);
         assert!(s.get_principle_target("missing").is_err());
     }
-
 }

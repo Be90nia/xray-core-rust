@@ -2,23 +2,25 @@
 //!
 //! 翻译自 Go `transport/internet/splithttp/dialer.go` 的 `Dial` 函数。
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use futures_util::TryStreamExt;
 use http::StatusCode;
 use hyper::client::conn::http2;
 use hyper_util::rt::TokioExecutor;
-use tokio::io::{AsyncRead as AsyncReadTrait, AsyncReadExt, AsyncWrite as AsyncWriteTrait, DuplexStream};
+use tokio::io::{
+    AsyncRead as AsyncReadTrait, AsyncReadExt, AsyncWrite as AsyncWriteTrait, DuplexStream,
+};
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::debug;
 
-use crate::client::{DefaultDialerClient, DialTarget, ReqBody, hyper_err_to_io, make_stream_body};
-use crate::config::{Config, RangeConfig};
-use crate::connection::SplitConn;
-use crate::error::{Result, SplitHttpError};
-use crate::h3_client::H3Conn;
+use crate::{
+    client::{DefaultDialerClient, DialTarget, ReqBody, hyper_err_to_io, make_stream_body},
+    config::{Config, RangeConfig},
+    connection::SplitConn,
+    error::{Result, SplitHttpError},
+    h3_client::H3Conn,
+};
 
 /// 统一上传连接类型（packet-up / stream-up / stream-one mode 共用）。
 ///
@@ -27,7 +29,6 @@ use crate::h3_client::H3Conn;
 ///
 /// 用 `Box<dyn AsyncRead + Send + Unpin>` 避免复杂的具体类型名。
 pub type PacketUpConn = SplitConn<Box<dyn AsyncReadTrait + Send + Unpin>, DuplexStream>;
-
 
 /// packet-up mode 端到端拨号。
 ///
@@ -40,12 +41,11 @@ pub type PacketUpConn = SplitConn<Box<dyn AsyncReadTrait + Send + Unpin>, Duplex
 ///
 /// # 简化点（vs Go 原版）
 ///
-/// - **不做 batching**：每次 POST = 一次 `pipe.read()` 的内容（Go 用 `MultiBuffer`
-///   合并多个 `Write` 为单 POST，本切片保留单 read → 单 POST 的 1:1 映射）。
-///   后续切片 E（xmux）一起优化。
+/// - **不做 batching**：每次 POST = 一次 `pipe.read()` 的内容（Go 用 `MultiBuffer` 合并多个 `Write`
+///   为单 POST，本切片保留单 read → 单 POST 的 1:1 映射）。 后续切片 E（xmux）一起优化。
 /// - **不做 sc_min_posts_interval_ms 真随机**：固定 sleep 该值（Go 是范围随机）。
-/// - **不做 upload_writer 大小限制**：直接 read pipe（Go 用 `pipe.WithSizeLimit`
-///   强制 maxUploadSize 上限）。maxUploadSize 仅作为 POST 切片阈值。
+/// - **不做 upload_writer 大小限制**：直接 read pipe（Go 用 `pipe.WithSizeLimit` 强制 maxUploadSize
+///   上限）。maxUploadSize 仅作为 POST 切片阈值。
 ///
 /// # 参数
 ///
@@ -66,9 +66,8 @@ pub async fn dial_packet_up(
     // 处理（h1 关 TCP / h2 RST_STREAM），服务端据此清理会话与桥接链（Go
     // `splitConn.onClose` 语义）。缺失此传播 = 服务端全链永挂（bd s10 fd 泄漏）。
     let (close_tx, close_rx) = tokio::sync::oneshot::channel();
-    let (download_reader, remote, local) = client
-        .open_stream(&base_uri, &session_id, None, Some(close_rx))
-        .await?;
+    let (download_reader, remote, local) =
+        client.open_stream(&base_uri, &session_id, None, Some(close_rx)).await?;
 
     // 2. 创建上传 pipe（buffer 略大于 max_post 以吸收短期 burst）
     let pipe_buf = sc_max_each_post_bytes.saturating_mul(2).max(8192);
@@ -88,7 +87,7 @@ pub async fn dial_packet_up(
                 Err(e) => {
                     debug!(target: "splithttp", error = %e, "upload pipe read failed");
                     break;
-                }
+                },
             };
             let payload = read_buf[..n].to_vec();
             let seq_str = seq.to_string();
@@ -123,7 +122,6 @@ pub async fn dial_packet_up(
     Ok(conn)
 }
 
-
 /// stream-up mode 拨号：POST streaming body 上传 + 独立 GET 下载。
 ///
 /// 翻译自 Go `dialer.go::Dial` 的 stream-up 分支：
@@ -149,15 +147,13 @@ pub async fn dial_stream_up(
     let upload_stream = ReaderStream::new(pipe_server);
 
     // 2. POST upload（不等响应）
-    let (_, remote, local) = client
-        .open_stream_uploading(&base_uri, &session_id, upload_stream, true)
-        .await?;
+    let (_, remote, local) =
+        client.open_stream_uploading(&base_uri, &session_id, upload_stream, true).await?;
 
     // 3. 独立 GET 下载流（close 信号同 dial_packet_up——断连传播终止 GET）
     let (close_tx, close_rx) = tokio::sync::oneshot::channel();
-    let (download_reader, _, _) = client
-        .open_stream(&base_uri, &session_id, None, Some(close_rx))
-        .await?;
+    let (download_reader, _, _) =
+        client.open_stream(&base_uri, &session_id, None, Some(close_rx)).await?;
 
     let mut conn = SplitConn::new(download_reader, pipe_client, remote, local);
     conn.set_on_close(move || {
@@ -190,9 +186,8 @@ pub async fn dial_stream_one(
     let (pipe_client, pipe_server) = tokio::io::duplex(8192);
     let upload_stream = ReaderStream::new(pipe_server);
 
-    let (response_opt, remote, local) = client
-        .open_stream_uploading(&base_uri, &session_id, upload_stream, false)
-        .await?;
+    let (response_opt, remote, local) =
+        client.open_stream_uploading(&base_uri, &session_id, upload_stream, false).await?;
     let response_body = response_opt.ok_or_else(|| {
         crate::error::SplitHttpError::Hyper(
             "stream-one upload_only=false must return response stream".into(),
@@ -251,11 +246,7 @@ pub fn resolve_mode(
 ) -> String {
     if configured_mode.is_empty() || configured_mode == "auto" {
         if has_reality {
-            if has_download_settings {
-                "stream-up".to_string()
-            } else {
-                "stream-one".to_string()
-            }
+            if has_download_settings { "stream-up".to_string() } else { "stream-one".to_string() }
         } else {
             "packet-up".to_string()
         }
@@ -284,17 +275,16 @@ pub fn build_request_url(scheme: &str, host: &str, path: &str, query: &str) -> S
 ///
 /// # 简化点（vs Go 原版）
 ///
-/// - **REALITY 注入**：通过 `DefaultDialerClient::new(config, tls_config)` 构造时
-///   注入 `tls_config`（REALITY 用 watfaq-rustls `with_reality()` patch 注入）。Go
-///   在 `dialContext` 闭包里 `reality.UClient(conn, ...)` 包装 TCP conn；Rust 因
-///   hyper-rustls 自管 TLS 握手，REALITY 注入点移到 `RustlsClientConfig` 构造阶段。
-///   留 VPS REALITY 切片 F2 实际接入验证。
-/// - **DownloadSettings**：当前 `has_download_settings=false` 固定（stream-up via
-///   DownloadSettings 是 splithttp 高级特性，留切片 F2 接入）。
-/// - **浏览器拨号器**：Go `browser_dialer.HasBrowserDialer()` 分支未实现
-///   （ponytail: YAGNI，浏览器 JS dialer 与 Rust 客户端场景不匹配）。
-/// - **H3**：本函数仅走 H1/H2。HTTP/3 由 [`dial_h3`] 处理，`register.rs::dial_splithttp`
-///   根据 ALPN（`h3`）分发到 [`dial_h3`]（quinn + h3 crate 链）。
+/// - **REALITY 注入**：通过 `DefaultDialerClient::new(config, tls_config)` 构造时 注入
+///   `tls_config`（REALITY 用 watfaq-rustls `with_reality()` patch 注入）。Go 在 `dialContext`
+///   闭包里 `reality.UClient(conn, ...)` 包装 TCP conn；Rust 因 hyper-rustls 自管 TLS 握手，REALITY
+///   注入点移到 `RustlsClientConfig` 构造阶段。 留 VPS REALITY 切片 F2 实际接入验证。
+/// - **DownloadSettings**：当前 `has_download_settings=false` 固定（stream-up via DownloadSettings
+///   是 splithttp 高级特性，留切片 F2 接入）。
+/// - **浏览器拨号器**：Go `browser_dialer.HasBrowserDialer()` 分支未实现 （ponytail: YAGNI，浏览器
+///   JS dialer 与 Rust 客户端场景不匹配）。
+/// - **H3**：本函数仅走 H1/H2。HTTP/3 由 [`dial_h3`] 处理，`register.rs::dial_splithttp` 根据
+///   ALPN（`h3`）分发到 [`dial_h3`]（quinn + h3 crate 链）。
 ///
 /// # 参数
 ///
@@ -317,17 +307,10 @@ pub async fn dial(
 ) -> Result<PacketUpConn> {
     let has_download_settings = config.download_settings.is_some();
     let mode = resolve_mode(&config.mode, has_reality, has_download_settings);
-    let session_id = if mode == "stream-one" {
-        String::new()
-    } else {
-        config.generate_session_id()
-    };
-    let base_uri = build_request_url(
-        scheme,
-        host,
-        &config.normalized_path(),
-        &config.normalized_query(),
-    );
+    let session_id =
+        if mode == "stream-one" { String::new() } else { config.generate_session_id() };
+    let base_uri =
+        build_request_url(scheme, host, &config.normalized_path(), &config.normalized_query());
     debug!(target: "splithttp", %mode, %base_uri, "dial dispatch");
 
     match mode.as_str() {
@@ -336,20 +319,12 @@ pub async fn dial(
             let sc_min = config.normalized_sc_min_posts_interval_ms();
             // H11：Go dialer.go:464 maxUploadSize 每连接 rand() 采样一次
             // （此前恒取 from——自定义 range 下性能坍塌 + 定长流量指纹）。
-            dial_packet_up(
-                client,
-                base_uri,
-                session_id,
-                sc_max.rand().max(1) as usize,
-                sc_min,
-            )
-            .await
-        }
+            dial_packet_up(client, base_uri, session_id, sc_max.rand().max(1) as usize, sc_min)
+                .await
+        },
         "stream-up" => dial_stream_up(client, base_uri, session_id).await,
         "stream-one" => dial_stream_one(client, base_uri, session_id).await,
-        other => Err(SplitHttpError::InvalidUrl(format!(
-            "unknown splithttp mode: {other}"
-        ))),
+        other => Err(SplitHttpError::InvalidUrl(format!("unknown splithttp mode: {other}"))),
     }
 }
 
@@ -372,9 +347,8 @@ pub async fn dial_h3_packet_up(
 ) -> Result<PacketUpConn> {
     // 1. GET 下载流（close 信号 + 连接级关闭见下方 on_close 注释）。
     let (close_tx, close_rx) = tokio::sync::oneshot::channel();
-    let (download_reader, remote, local) = client
-        .open_stream(&base_uri, &session_id, None, Some(close_rx))
-        .await?;
+    let (download_reader, remote, local) =
+        client.open_stream(&base_uri, &session_id, None, Some(close_rx)).await?;
 
     // 2. 创建上传 pipe
     let pipe_buf = sc_max_each_post_bytes.saturating_mul(2).max(8192);
@@ -395,7 +369,7 @@ pub async fn dial_h3_packet_up(
                 Err(e) => {
                     debug!(target: "splithttp-h3", error = %e, "upload pipe read failed");
                     break;
-                }
+                },
             };
             let payload = read_buf[..n].to_vec();
             let seq_str = seq.to_string();
@@ -447,15 +421,13 @@ pub async fn dial_h3_stream_up(
     let upload_stream = ReaderStream::new(pipe_server);
 
     // 2. POST upload（upload_only=true）
-    let (_, remote, local) = client
-        .open_stream_uploading(&base_uri, &session_id, upload_stream, true)
-        .await?;
+    let (_, remote, local) =
+        client.open_stream_uploading(&base_uri, &session_id, upload_stream, true).await?;
 
     // 3. 独立 GET 下载（close 信号同 dial_h3_packet_up——断连传播 + 连接级关闭）
     let (close_tx, close_rx) = tokio::sync::oneshot::channel();
-    let (download_reader, _, _) = client
-        .open_stream(&base_uri, &session_id, None, Some(close_rx))
-        .await?;
+    let (download_reader, _, _) =
+        client.open_stream(&base_uri, &session_id, None, Some(close_rx)).await?;
 
     let mut conn = SplitConn::new(download_reader, pipe_client, remote, local);
     let h3_for_close = Arc::clone(&client);
@@ -483,9 +455,8 @@ pub async fn dial_h3_stream_one(
     let upload_stream = ReaderStream::new(pipe_server);
 
     // 2. POST upload + GET download（upload_only=false）
-    let (dl_opt, remote, local) = client
-        .open_stream_uploading(&base_uri, &session_id, upload_stream, false)
-        .await?;
+    let (dl_opt, remote, local) =
+        client.open_stream_uploading(&base_uri, &session_id, upload_stream, false).await?;
     let download_reader = dl_opt.ok_or_else(|| {
         SplitHttpError::Hyper("h3 stream-one upload_only=false must return download stream".into())
     })?;
@@ -513,17 +484,10 @@ pub async fn dial_h3(
     has_reality: bool,
 ) -> Result<PacketUpConn> {
     let mode = resolve_mode(&config.mode, has_reality, false);
-    let session_id = if mode == "stream-one" {
-        String::new()
-    } else {
-        config.generate_session_id()
-    };
-    let base_uri = build_request_url(
-        scheme,
-        host,
-        &config.normalized_path(),
-        &config.normalized_query(),
-    );
+    let session_id =
+        if mode == "stream-one" { String::new() } else { config.generate_session_id() };
+    let base_uri =
+        build_request_url(scheme, host, &config.normalized_path(), &config.normalized_query());
 
     debug!(target: "splithttp-h3", %mode, %base_uri, "dial_h3 dispatch");
 
@@ -532,20 +496,12 @@ pub async fn dial_h3(
             let sc_max = config.normalized_sc_max_each_post_bytes();
             let sc_min = config.normalized_sc_min_posts_interval_ms();
             // H11：同 dial_packet_up——每连接 rand() 采样。
-            dial_h3_packet_up(
-                client,
-                base_uri,
-                session_id,
-                sc_max.rand().max(1) as usize,
-                sc_min,
-            )
-            .await
-        }
+            dial_h3_packet_up(client, base_uri, session_id, sc_max.rand().max(1) as usize, sc_min)
+                .await
+        },
         "stream-up" => dial_h3_stream_up(client, base_uri, session_id).await,
         "stream-one" => dial_h3_stream_one(client, base_uri, session_id).await,
-        other => Err(SplitHttpError::InvalidUrl(format!(
-            "unknown splithttp mode (h3): {other}"
-        ))),
+        other => Err(SplitHttpError::InvalidUrl(format!("unknown splithttp mode (h3): {other}"))),
     }
 }
 
@@ -641,7 +597,9 @@ mod tests {
     /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
     fn ensure_crypto_provider() {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+        ONCE.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
     }
 
     // ===== decide_http_version =====
@@ -650,10 +608,7 @@ mod tests {
     fn decide_http_version_reality_forces_h2() {
         assert_eq!(decide_http_version(true, true, &[]), "2");
         // REALITY 优先于一切，即使配置了 h3 ALPN 也强制 h2
-        assert_eq!(
-            decide_http_version(true, true, &["h3".to_string()]),
-            "2"
-        );
+        assert_eq!(decide_http_version(true, true, &["h3".to_string()]), "2");
     }
 
     #[test]
@@ -663,26 +618,17 @@ mod tests {
 
     #[test]
     fn decide_http_version_alpn_http_1_1() {
-        assert_eq!(
-            decide_http_version(true, false, &["http/1.1".to_string()]),
-            "1.1"
-        );
+        assert_eq!(decide_http_version(true, false, &["http/1.1".to_string()]), "1.1");
     }
 
     #[test]
     fn decide_http_version_alpn_h3() {
-        assert_eq!(
-            decide_http_version(true, false, &["h3".to_string()]),
-            "3"
-        );
+        assert_eq!(decide_http_version(true, false, &["h3".to_string()]), "3");
     }
 
     #[test]
     fn decide_http_version_alpn_unknown_falls_back_to_h2() {
-        assert_eq!(
-            decide_http_version(true, false, &["h2".to_string()]),
-            "2"
-        );
+        assert_eq!(decide_http_version(true, false, &["h2".to_string()]), "2");
     }
 
     #[test]
@@ -732,10 +678,7 @@ mod tests {
 
     #[test]
     fn build_request_url_with_query() {
-        assert_eq!(
-            build_request_url("http", "h", "/p/", "k=v"),
-            "http://h/p/?k=v"
-        );
+        assert_eq!(build_request_url("http", "h", "/p/", "k=v"), "http://h/p/?k=v");
     }
 
     // ===== dial() 未知 mode 错误路径（不发起网络） =====
@@ -743,10 +686,7 @@ mod tests {
     #[tokio::test]
     async fn dial_unknown_mode_returns_error() {
         ensure_crypto_provider();
-        let config = Arc::new(Config {
-            mode: "unknown-mode".into(),
-            ..Default::default()
-        });
+        let config = Arc::new(Config { mode: "unknown-mode".into(), ..Default::default() });
         let tls = rustls::ClientConfig::builder()
             .with_root_certificates(rustls::RootCertStore::empty())
             .with_no_client_auth();
@@ -762,7 +702,9 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("unknown mode should fail, got Ok"),
         };
-        assert!(matches!(err, SplitHttpError::InvalidUrl(m) if m.contains("unknown splithttp mode")));
+        assert!(
+            matches!(err, SplitHttpError::InvalidUrl(m) if m.contains("unknown splithttp mode"))
+        );
     }
 
     // ===== dial_h3() 未知 mode 错误路径（不发起网络） =====
@@ -770,10 +712,7 @@ mod tests {
     #[tokio::test]
     async fn dial_h3_unknown_mode_returns_error() {
         ensure_crypto_provider();
-        let config = Arc::new(Config {
-            mode: "unknown-mode".into(),
-            ..Default::default()
-        });
+        let config = Arc::new(Config { mode: "unknown-mode".into(), ..Default::default() });
         // 构造一个不连接真实服务器的 H3Conn stub：直接测 dispatch 逻辑，
         // 因 unknown mode 在 resolve_mode 之后立即返回 Err，不会触达网络。
         // 但 dial_h3 第一参是已连接的 H3Conn，无法简单 stub。
@@ -852,14 +791,8 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             use futures_util::StreamExt;
-            let mut conn = h2::server::handshake(server_io)
-                .await
-                .expect("server h2 handshake");
-            let (request, mut respond) = conn
-                .accept()
-                .await
-                .expect("accept")
-                .expect("request");
+            let mut conn = h2::server::handshake(server_io).await.expect("server h2 handshake");
+            let (request, mut respond) = conn.accept().await.expect("accept").expect("request");
             let headers_at = std::time::Instant::now();
             // 驱动 server Connection：flush 响应帧 / 接收 DATA（h2 的帧收发只在
             // Connection::accept poll 时推进；不 spawn 此循环 200 帧滞留 → 客户端
@@ -876,26 +809,18 @@ mod tests {
             // Go xray requestHandler 语义：POST 一到先回 200 响应头，下行流随后。
             // （真实服务端若等首包才回 200，dial 会与首包写入形成死锁——#11 实测
             // Go 服务端先回 200。）
-            let resp = http::Response::builder()
-                .status(200)
-                .body(())
-                .expect("response build");
-            let mut send = respond
-                .send_response(resp, false)
-                .expect("send_response");
+            let resp = http::Response::builder().status(200).body(()).expect("response build");
+            let mut send = respond.send_response(resp, false).expect("send_response");
 
-            let _chunk = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                request.into_body().next(),
-            )
-            .await
-            .expect("DATA timeout (server not woken — fix broken)")
-            .expect("stream ended before DATA")
-            .expect("DATA read error");
+            let _chunk =
+                tokio::time::timeout(std::time::Duration::from_secs(2), request.into_body().next())
+                    .await
+                    .expect("DATA timeout (server not woken — fix broken)")
+                    .expect("stream ended before DATA")
+                    .expect("DATA read error");
             let data_at = std::time::Instant::now();
             let gap = data_at.duration_since(headers_at);
-            send.send_data(bytes::Bytes::from_static(b"hello"), true)
-                .expect("send_data");
+            send.send_data(bytes::Bytes::from_static(b"hello"), true).expect("send_data");
 
             // 让 conn driver 跑一会（Connection 不 impl Future，手动 spawn 一个 driver）
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;

@@ -7,16 +7,14 @@
 //! Rust 翻译保留纯业务：缓冲区容量管理、关闭状态、Conn 的 trait object 类型擦除。
 //! IO 边界（transport::Link → Conn 的转换、http.Serve 的实际运行）由上层注入。
 
-use std::any::Any;
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::{any::Any, collections::VecDeque, sync::Arc};
+
 use async_trait::async_trait;
 use parking_lot::{Condvar, Mutex};
-use xray_common::net::destination::Destination;
-use xray_common::session::Session;
+use xray_common::{net::destination::Destination, session::Session};
 use xray_features::outbound::{OutboundError, OutboundHandler};
 
-use crate::error::{at_warning, MetricsError};
+use crate::error::{MetricsError, at_warning};
 
 /// 内部 Conn 容器：用 `Box<dyn Any + Send>` 类型擦除，让 listener 不绑定具体连接类型。
 ///
@@ -45,10 +43,7 @@ pub struct OutboundListener {
 
 impl Clone for OutboundListener {
     fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-            cv: self.cv.clone(),
-        }
+        Self { inner: self.inner.clone(), cv: self.cv.clone() }
     }
 }
 
@@ -146,11 +141,7 @@ pub struct Outbound {
 
 impl Outbound {
     pub fn new(tag: impl Into<String>, listener: OutboundListener) -> Self {
-        Self {
-            tag: tag.into(),
-            listener,
-            closed: Mutex::new(false),
-        }
+        Self { tag: tag.into(), listener, closed: Mutex::new(false) }
     }
 
     /// Tag。
@@ -165,10 +156,7 @@ impl Outbound {
 
     /// 克隆 listener（Arc 语义，用于跨 task 共享）。
     pub fn listener_clone(&self) -> OutboundListener {
-        OutboundListener {
-            inner: self.listener.inner.clone(),
-            cv: self.listener.cv.clone(),
-        }
+        OutboundListener { inner: self.listener.inner.clone(), cv: self.listener.cv.clone() }
     }
 
     /// 把一个 conn 投递到 listener；关闭后丢弃并记录 warning。
@@ -226,9 +214,7 @@ impl OutboundHandler for Outbound {
         // 调用方需先把 Link 包装为 BoxedConn，再调 dispatch()。
         // 此处仅检查关闭状态，实际 dispatch 由调用方显式完成（与 Go 版一致）。
         if *self.closed.lock() {
-            return Err(OutboundError::ConnectionFailed(
-                "metrics outbound closed".to_string(),
-            ));
+            return Err(OutboundError::ConnectionFailed("metrics outbound closed".to_string()));
         }
         Ok(())
     }
@@ -241,8 +227,9 @@ impl OutboundHandler for Outbound {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
+
+    use super::*;
 
     fn boxed(v: i32) -> BoxedConn {
         Box::new(v)

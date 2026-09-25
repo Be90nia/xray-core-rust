@@ -13,31 +13,34 @@
 //! - `Availability`：alive + RTT baselines + `costs` 加权（对应 Go `selectLeastLoad`）。
 //! - `Adaptive`：滑动窗口 EMA 平滑 RTT-Deviation-Cost，session 内收敛到稳定分数，
 //!   未启用在线调参（per-task 非目标）。
-//! - `ConsistentHashing`：ring hash + 虚拟节点（虚拟节点数 = `vnodes`，默认 64）。
-//!   hash key 由调用方经 `pick_outbound_with_key` 提供；走 trait 默认
-//!   `pick_outbound` 时退化为以 `(ns timestamp, candidates)` 派生 key，
-//!   跨会话亲和仅在显式 key 路径可用。
+//! - `ConsistentHashing`：ring hash + 虚拟节点（虚拟节点数 = `vnodes`，默认 64）。 hash key
+//!   由调用方经 `pick_outbound_with_key` 提供；走 trait 默认 `pick_outbound` 时退化为以 `(ns
+//!   timestamp, candidates)` 派生 key， 跨会话亲和仅在显式 key 路径可用。
 //!
 //! ## IO 边界
 //!
 //! - `observer` 必须提供
 //! - `ohm` 必须提供，用于过滤无延迟数据的节点
 
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 use parking_lot::Mutex;
 use rand::seq::IndexedRandom;
-
-use crate::balancing::{BalancingStrategy, ObservationProvider, OutboundHandlerSelector};
-use crate::error::RouterError;
-use crate::weight::WeightManager;
 #[cfg(test)]
 use xray_proto::xray::core::app::observatory::ObservationResult;
-use xray_proto::xray::core::app::observatory::OutboundStatus;
-use xray_proto::xray::app::router::StrategyLeastLoadConfig;
+use xray_proto::xray::{
+    app::router::StrategyLeastLoadConfig, core::app::observatory::OutboundStatus,
+};
 
+use crate::{
+    balancing::{BalancingStrategy, ObservationProvider, OutboundHandlerSelector},
+    error::RouterError,
+    weight::WeightManager,
+};
 
 /// Go `node`：健康检查结果的最小拷贝（ms 值，与 baselines/maxRTT 同单位比较）。
 #[derive(Debug, Clone)]
@@ -75,7 +78,6 @@ fn rtt_deviation_cost(costs: Option<&WeightManager>, tag: &str, value: i64) -> f
     (value as f64) * w.sqrt().max(0.0)
 }
 
-
 /// Baseline 模式枚举。Go 不暴露此枚举；扩展为 Rust-only 三种策略变体。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BaselineMode {
@@ -92,7 +94,6 @@ impl Default for BaselineMode {
         BaselineMode::Availability
     }
 }
-
 
 /// 最小负载负载均衡策略。
 pub struct LeastLoadStrategy {
@@ -155,7 +156,7 @@ impl LeastLoadStrategy {
             BaselineMode::ConsistentHashing => {
                 // 初始环为空；首次 `pick_outbound_with_key` 时根据可见候选建环。
                 Some(HashRing::empty(vnodes, hash_key_seed.unwrap_or(0)))
-            }
+            },
             _ => None,
         };
         Ok(Self {
@@ -318,10 +319,7 @@ impl LeastLoadStrategy {
         let mut state = self.ema_state.lock();
         let mut best: Option<(String, f64)> = None;
         for node in nodes {
-            let prev = state
-                .get(&node.tag)
-                .copied()
-                .unwrap_or(node.rtt_deviation_cost);
+            let prev = state.get(&node.tag).copied().unwrap_or(node.rtt_deviation_cost);
             let new_score =
                 self.ema_alpha * node.rtt_deviation_cost + (1.0 - self.ema_alpha) * prev;
             state.insert(node.tag.clone(), new_score);
@@ -352,7 +350,6 @@ impl LeastLoadStrategy {
         *c
     }
 }
-
 
 /// 一致性哈希环：每个真实 tag 派生 N 个虚拟节点 → u64 hash 升序排列。
 #[derive(Debug, Clone)]
@@ -396,11 +393,11 @@ impl HashRing {
 }
 
 fn hash64(s: &str) -> u64 {
-    let mut h: std::collections::hash_map::DefaultHasher = std::collections::hash_map::DefaultHasher::new();
+    let mut h: std::collections::hash_map::DefaultHasher =
+        std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut h);
     h.finish()
 }
-
 
 impl BalancingStrategy for LeastLoadStrategy {
     fn pick_outbound(&self) -> Result<String, RouterError> {
@@ -411,7 +408,7 @@ impl BalancingStrategy for LeastLoadStrategy {
             BaselineMode::ConsistentHashing => {
                 let key = self.next_default_key();
                 self.select_consistent_hashing(&nodes, key)
-            }
+            },
         };
         match picked {
             Some(tag) => Ok(tag),
@@ -433,12 +430,12 @@ impl BalancingStrategy for LeastLoadStrategy {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
+    use xray_proto::xray::core::app::observatory::OutboundStatus;
+
     use super::*;
     use crate::balancing::NotImplementedSelector;
-    use xray_proto::xray::core::app::observatory::OutboundStatus;
 
     struct FixedSelector(Vec<String>);
     impl OutboundHandlerSelector for FixedSelector {
@@ -466,24 +463,19 @@ mod tests {
         }
     }
 
-    fn cfg(baselines: Vec<i64>, expected: i32, max_rtt: i64, tolerance: f32) -> StrategyLeastLoadConfig {
-        StrategyLeastLoadConfig {
-            costs: vec![],
-            baselines,
-            expected,
-            max_rtt,
-            tolerance,
-        }
+    fn cfg(
+        baselines: Vec<i64>,
+        expected: i32,
+        max_rtt: i64,
+        tolerance: f32,
+    ) -> StrategyLeastLoadConfig {
+        StrategyLeastLoadConfig { costs: vec![], baselines, expected, max_rtt, tolerance }
     }
 
     #[test]
     fn test_picks_least_load_single_node() {
         let obs = ObservationResult {
-            status: vec![
-                status("a", true, 100),
-                status("b", true, 50),
-                status("c", true, 200),
-            ],
+            status: vec![status("a", true, 100), status("b", true, 50), status("c", true, 200)],
         };
         let s = LeastLoadStrategy::new(
             &cfg(vec![], 1, 0, 0.0),
@@ -497,9 +489,7 @@ mod tests {
 
     #[test]
     fn test_skips_unselected() {
-        let obs = ObservationResult {
-            status: vec![status("a", true, 10), status("b", true, 100)],
-        };
+        let obs = ObservationResult { status: vec![status("a", true, 10), status("b", true, 100)] };
         let s = LeastLoadStrategy::new(
             &cfg(vec![], 1, 0, 0.0),
             vec![],
@@ -512,9 +502,8 @@ mod tests {
 
     #[test]
     fn test_max_rtt_filter() {
-        let obs = ObservationResult {
-            status: vec![status("a", true, 1000), status("b", true, 50)],
-        };
+        let obs =
+            ObservationResult { status: vec![status("a", true, 1000), status("b", true, 50)] };
         let s = LeastLoadStrategy::new(
             &cfg(vec![], 1, 100, 0.0),
             vec![],
@@ -544,11 +533,7 @@ mod tests {
     fn test_adaptive_first_pick_initializes_ema() {
         // 首次调用：无历史 EMA 状态 → 用当前 RTT 直接选最小。
         let obs = ObservationResult {
-            status: vec![
-                status("a", true, 200),
-                status("b", true, 50),
-                status("c", true, 100),
-            ],
+            status: vec![status("a", true, 200), status("b", true, 50), status("c", true, 100)],
         };
         let s = LeastLoadStrategy::adaptive(
             &cfg(vec![], 1, 0, 0.0),
@@ -566,14 +551,10 @@ mod tests {
         // 验证 EMA 实际对 cost 序列收敛。
         let observations = vec![
             // 第一次 pick：b 最低。
-            ObservationResult {
-                status: vec![status("a", true, 200), status("b", true, 50)],
-            },
+            ObservationResult { status: vec![status("a", true, 200), status("b", true, 50)] },
             // 第二次 pick：两个 cost 翻转 → EMA 平滑使 "先前赢的 b" 的状态被攻击，
             // 但由于 alpha=0.3，b 仍以历史优势胜出。
-            ObservationResult {
-                status: vec![status("a", true, 50), status("b", true, 200)],
-            },
+            ObservationResult { status: vec![status("a", true, 50), status("b", true, 200)] },
         ];
         let obs_iter = Mutex::new(observations.into_iter());
         struct StepObs(Mutex<std::vec::IntoIter<ObservationResult>>);
@@ -659,8 +640,13 @@ mod tests {
 
     /// 带 health ping 的 status 构造（Go observatory.OutboundStatus）。
     fn ping_status(
-        tag: &str, alive: bool, delay: i64,
-        average: i64, deviation: i64, all: i64, fail: i64,
+        tag: &str,
+        alive: bool,
+        delay: i64,
+        average: i64,
+        deviation: i64,
+        all: i64,
+        fail: i64,
     ) -> OutboundStatus {
         OutboundStatus {
             alive,
@@ -669,13 +655,15 @@ mod tests {
             outbound_tag: tag.into(),
             last_seen_time: 0,
             last_try_time: 0,
-            health_ping: Some(xray_proto::xray::core::app::observatory::HealthPingMeasurementResult {
-                all,
-                fail,
-                deviation,
-                average,
-                ..Default::default()
-            }),
+            health_ping: Some(
+                xray_proto::xray::core::app::observatory::HealthPingMeasurementResult {
+                    all,
+                    fail,
+                    deviation,
+                    average,
+                    ..Default::default()
+                },
+            ),
         }
     }
 
@@ -749,11 +737,7 @@ mod tests {
     #[test]
     fn test_expected_gt_available_returns_all() {
         let obs = ObservationResult {
-            status: vec![
-                status("a", true, 50),
-                status("b", true, 100),
-                status("c", true, 200),
-            ],
+            status: vec![status("a", true, 50), status("b", true, 100), status("c", true, 200)],
         };
         let s = LeastLoadStrategy::new(
             &cfg(vec![], 5, 0, 0.0),
@@ -823,9 +807,7 @@ mod tests {
 
     #[test]
     fn test_consistent_hashing_default_pick_increments_key() {
-        let obs = ObservationResult {
-            status: vec![status("a", true, 50), status("b", true, 50)],
-        };
+        let obs = ObservationResult { status: vec![status("a", true, 50), status("b", true, 50)] };
         let s = LeastLoadStrategy::consistent_hashing(
             &cfg(vec![], 1, 0, 0.0),
             vec![],
@@ -841,5 +823,7 @@ mod tests {
 
     // 防 dead_code 警告
     #[test]
-    fn test_dummy_use_selector() { let _ = NotImplementedSelector; }
+    fn test_dummy_use_selector() {
+        let _ = NotImplementedSelector;
+    }
 }

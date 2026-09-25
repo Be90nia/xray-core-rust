@@ -3,9 +3,7 @@
 //! 17 个操作符 + 类型定义 + measure（求大小）+ metadata 加载。
 //! TCP / UDP 共用此引擎。
 
-use std::collections::HashMap;
-use std::io;
-use std::net::SocketAddr;
+use std::{collections::HashMap, io, net::SocketAddr};
 
 use crate::finalmask::custom::UDPItem;
 
@@ -58,8 +56,7 @@ impl EvalValue {
 
     /// 转为 u64（类型不符报错）。
     pub fn as_u64(&self) -> io::Result<u64> {
-        self.u64
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "expr value is not u64"))
+        self.u64.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "expr value is not u64"))
     }
 }
 
@@ -104,10 +101,7 @@ pub(crate) fn evaluate_item_fields(
         packet.to_vec()
     } else if !var_name.is_empty() {
         ctx.vars.get(var_name).cloned().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown variable: {var_name}"),
-            )
+            io::Error::new(io::ErrorKind::InvalidData, format!("unknown variable: {var_name}"))
         })?
     } else if let Some(expr) = expr {
         evaluate_expr(expr, ctx)?.as_bytes()?
@@ -136,10 +130,7 @@ pub(crate) fn measure_item(
         packet.len()
     } else if !var_name.is_empty() {
         *sizes.get(var_name).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown variable: {var_name}"),
-            )
+            io::Error::new(io::ErrorKind::InvalidData, format!("unknown variable: {var_name}"))
         })?
     } else if let Some(expr) = expr {
         measure_expr(expr, sizes)?
@@ -163,7 +154,7 @@ pub(crate) fn evaluate_expr(expr: &Expr, ctx: &mut EvalContext) -> io::Result<Ev
                 out.extend_from_slice(&v.as_bytes()?);
             }
             Ok(EvalValue::from_bytes(out))
-        }
+        },
         "slice" => evaluate_slice(&expr.args, ctx),
         "xor16" => evaluate_xor(&expr.args, 0xFFFF, 2, ctx),
         "xor32" => evaluate_xor(&expr.args, 0xFFFF_FFFF, 4, ctx),
@@ -195,18 +186,14 @@ pub(crate) fn evaluate_expr(expr: &Expr, ctx: &mut EvalContext) -> io::Result<Ev
             }
         }),
         "shr" => evaluate_shift(&expr.args, "shr", ctx, |v, s| Ok(v >> s)),
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unsupported expr op: {other}"),
-        )),
+        other => {
+            Err(io::Error::new(io::ErrorKind::InvalidData, format!("unsupported expr op: {other}")))
+        },
     }
 }
 
 /// 测量表达式字节长度（对应 Go `measureExpr`）。
-pub(crate) fn measure_expr(
-    expr: &Expr,
-    sizes: &HashMap<String, usize>,
-) -> io::Result<usize> {
+pub(crate) fn measure_expr(expr: &Expr, sizes: &HashMap<String, usize>) -> io::Result<usize> {
     match expr.op.as_str() {
         "concat" => {
             let mut total = 0;
@@ -214,7 +201,7 @@ pub(crate) fn measure_expr(
                 total += measure_expr_arg(arg, sizes)?;
             }
             Ok(total)
-        }
+        },
         "slice" => expect_u64_literal_arg(&expr.args, 3, "slice length must be u64"),
         "be16" | "le16" => Ok(2),
         "be32" | "le32" => Ok(4),
@@ -235,39 +222,26 @@ pub(crate) fn evaluate_expr_arg(arg: &ExprArg, ctx: &mut EvalContext) -> io::Res
         ExprArg::U64(v) => Ok(EvalValue::from_u64(*v)),
         ExprArg::Var(name) => {
             let saved = ctx.vars.get(name).cloned().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unknown variable: {name}"),
-                )
+                io::Error::new(io::ErrorKind::InvalidData, format!("unknown variable: {name}"))
             })?;
             Ok(EvalValue::from_bytes(saved))
-        }
+        },
         ExprArg::Metadata(name) => ctx.metadata.get(name).cloned().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown metadata: {name}"),
-            )
+            io::Error::new(io::ErrorKind::InvalidData, format!("unknown metadata: {name}"))
         }),
         ExprArg::Expr(inner) => evaluate_expr(inner, ctx),
     }
 }
 
 /// 测量 ExprArg 字节长度（对应 Go `measureExprArg`）。
-pub(crate) fn measure_expr_arg(
-    arg: &ExprArg,
-    sizes: &HashMap<String, usize>,
-) -> io::Result<usize> {
+pub(crate) fn measure_expr_arg(arg: &ExprArg, sizes: &HashMap<String, usize>) -> io::Result<usize> {
     match arg {
         ExprArg::Bytes(b) => Ok(b.len()),
-        ExprArg::U64(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "u64 arg has no byte width",
-        )),
+        ExprArg::U64(_) => {
+            Err(io::Error::new(io::ErrorKind::InvalidData, "u64 arg has no byte width"))
+        },
         ExprArg::Var(name) => sizes.get(name).copied().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown variable: {name}"),
-            )
+            io::Error::new(io::ErrorKind::InvalidData, format!("unknown variable: {name}"))
         }),
         ExprArg::Metadata(name) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -279,12 +253,8 @@ pub(crate) fn measure_expr_arg(
 
 // ===== 公共辅助：供 tcp/udp 调用 =====
 
-
 /// 按 UDP items 列表求值（对应 Go `evaluateUDPItemsWithContext`）。
-pub(crate) fn evaluate_udp_items(
-    items: &[UDPItem],
-    ctx: &mut EvalContext,
-) -> io::Result<Vec<u8>> {
+pub(crate) fn evaluate_udp_items(items: &[UDPItem], ctx: &mut EvalContext) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
     for item in items {
         let v = evaluate_udp_item(item, ctx)?;
@@ -292,7 +262,6 @@ pub(crate) fn evaluate_udp_items(
     }
     Ok(out)
 }
-
 
 /// UDP item 求值（展开字段后调用 `evaluate_item_fields`）。
 pub(crate) fn evaluate_udp_item(item: &UDPItem, ctx: &mut EvalContext) -> io::Result<Vec<u8>> {
@@ -394,13 +363,13 @@ pub(crate) fn match_udp_items(
             }
         } else if !item.var.is_empty() {
             match ctx.vars.get(&item.var) {
-                Some(saved) if saved == &segment => {}
+                Some(saved) if saved == &segment => {},
                 _ => return None,
             }
         } else if let Some(expr) = &item.expr {
             match evaluate_expr(expr, &mut ctx) {
                 Ok(v) => match v.as_bytes() {
-                    Ok(expected) if expected == segment => {}
+                    Ok(expected) if expected == segment => {},
                     _ => return None,
                 },
                 Err(_) => return None,
@@ -423,10 +392,7 @@ pub(crate) fn sizes_from_vars(vars: &HashMap<String, Vec<u8>>) -> HashMap<String
 
 fn evaluate_slice(args: &[ExprArg], ctx: &mut EvalContext) -> io::Result<EvalValue> {
     if args.len() != 3 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "slice expects 3 args",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "slice expects 3 args"));
     }
     let source = evaluate_expr_arg(&args[0], ctx)?.as_bytes()?;
     let offset = evaluate_expr_arg(&args[1], ctx)?.as_u64()?;
@@ -437,9 +403,7 @@ fn evaluate_slice(args: &[ExprArg], ctx: &mut EvalContext) -> io::Result<EvalVal
     if end > source.len() as u64 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "slice out of bounds"));
     }
-    Ok(EvalValue::from_bytes(
-        source[offset as usize..end as usize].to_vec(),
-    ))
+    Ok(EvalValue::from_bytes(source[offset as usize..end as usize].to_vec()))
 }
 
 fn evaluate_pack(
@@ -450,48 +414,31 @@ fn evaluate_pack(
     ctx: &mut EvalContext,
 ) -> io::Result<EvalValue> {
     if args.len() != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{name} expects 1 arg"),
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{name} expects 1 arg")));
     }
     let v = evaluate_expr_arg(&args[0], ctx)?.as_u64()?;
     let out = match width {
         2 => {
             if v > 0xFFFF {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{name} overflow"),
-                ));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{name} overflow")));
             }
             let x = v as u16;
-            if big_endian {
-                x.to_be_bytes().to_vec()
-            } else {
-                x.to_le_bytes().to_vec()
-            }
-        }
+            if big_endian { x.to_be_bytes().to_vec() } else { x.to_le_bytes().to_vec() }
+        },
         4 => {
             if v > 0xFFFF_FFFF {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{name} overflow"),
-                ));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{name} overflow")));
             }
             let x = v as u32;
-            if big_endian {
-                x.to_be_bytes().to_vec()
-            } else {
-                x.to_le_bytes().to_vec()
-            }
-        }
+            if big_endian { x.to_be_bytes().to_vec() } else { x.to_le_bytes().to_vec() }
+        },
         8 => {
             if big_endian {
                 v.to_be_bytes().to_vec()
             } else {
                 v.to_le_bytes().to_vec()
             }
-        }
+        },
         _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported pack width")),
     };
     Ok(EvalValue::from_bytes(out))
@@ -499,25 +446,16 @@ fn evaluate_pack(
 
 fn evaluate_pad(args: &[ExprArg], ctx: &mut EvalContext) -> io::Result<EvalValue> {
     if args.len() != 3 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "pad expects 3 args",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "pad expects 3 args"));
     }
     let source = evaluate_expr_arg(&args[0], ctx)?.as_bytes()?;
     let target = evaluate_expr_arg(&args[1], ctx)?.as_u64()?;
     let fill = evaluate_expr_arg(&args[2], ctx)?.as_bytes()?;
     if fill.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "pad fill must not be empty",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "pad fill must not be empty"));
     }
     if target < source.len() as u64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "pad target shorter than source",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "pad target shorter than source"));
     }
     let mut out = source;
     while (out.len() as u64) < target {
@@ -533,18 +471,12 @@ fn evaluate_pad(args: &[ExprArg], ctx: &mut EvalContext) -> io::Result<EvalValue
 
 fn evaluate_truncate(args: &[ExprArg], ctx: &mut EvalContext) -> io::Result<EvalValue> {
     if args.len() != 2 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "truncate expects 2 args",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "truncate expects 2 args"));
     }
     let source = evaluate_expr_arg(&args[0], ctx)?.as_bytes()?;
     let length = evaluate_expr_arg(&args[1], ctx)?.as_u64()?;
     if length > source.len() as u64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "truncate out of bounds",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "truncate out of bounds"));
     }
     Ok(EvalValue::from_bytes(source[..length as usize].to_vec()))
 }
@@ -556,10 +488,7 @@ fn evaluate_binary_u64(
     op: impl Fn(u64, u64) -> io::Result<u64>,
 ) -> io::Result<EvalValue> {
     if args.len() != 2 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{name} expects 2 args"),
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{name} expects 2 args")));
     }
     let left = evaluate_expr_arg(&args[0], ctx)?.as_u64()?;
     let right = evaluate_expr_arg(&args[1], ctx)?.as_u64()?;
@@ -574,18 +503,12 @@ fn evaluate_shift(
     op: impl Fn(u64, u32) -> io::Result<u64>,
 ) -> io::Result<EvalValue> {
     if args.len() != 2 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{name} expects 2 args"),
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{name} expects 2 args")));
     }
     let value = evaluate_expr_arg(&args[0], ctx)?.as_u64()?;
     let shift_u64 = evaluate_expr_arg(&args[1], ctx)?.as_u64()?;
     if shift_u64 >= 64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "shift out of range",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "shift out of range"));
     }
     let result = op(value, shift_u64 as u32)?;
     Ok(EvalValue::from_u64(result))
@@ -614,10 +537,7 @@ fn evaluate_xor(
 /// 取第 idx 个 arg 为 U64 字面量（measure 用）。
 fn expect_u64_literal_arg(args: &[ExprArg], expected: usize, err: &str) -> io::Result<usize> {
     if args.len() != expected {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("expects {expected} args"),
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("expects {expected} args")));
     }
     match &args[expected - 1] {
         ExprArg::U64(v) => Ok(*v as usize),
@@ -635,7 +555,11 @@ fn fill_rand_bytes_between(buf: &mut [u8], min: u8, max: u8) {
 }
 
 /// 加载元数据：port / ip4_u32（对应 Go `loadMetadata` + `loadIPPortMetadata`）。
-fn load_metadata(metadata: &mut HashMap<String, EvalValue>, prefix: &str, addr: Option<SocketAddr>) {
+fn load_metadata(
+    metadata: &mut HashMap<String, EvalValue>,
+    prefix: &str,
+    addr: Option<SocketAddr>,
+) {
     let addr = match addr {
         Some(a) => a,
         None => return,
@@ -677,10 +601,7 @@ mod tests {
 
     #[test]
     fn concat_concatenates_bytes() {
-        let e = expr(
-            "concat",
-            vec![bytes(b"ab"), bytes(b"cd"), bytes(b"ef")],
-        );
+        let e = expr("concat", vec![bytes(b"ab"), bytes(b"cd"), bytes(b"ef")]);
         let mut ctx = EvalContext::new();
         let v = evaluate_expr(&e, &mut ctx).unwrap();
         assert_eq!(v.as_bytes().unwrap(), b"abcdef");
@@ -808,30 +729,14 @@ mod tests {
         // expr 路径：be16(0x1234) → 2 字节
         let e = expr("be16", vec![u64_arg(0x1234)]);
         let mut ctx = EvalContext::new();
-        let v = evaluate_item_fields(
-            0, 0, 0,
-            b"",
-            "",
-            "",
-            Some(&e),
-            &mut ctx,
-        )
-        .unwrap();
+        let v = evaluate_item_fields(0, 0, 0, b"", "", "", Some(&e), &mut ctx).unwrap();
         assert_eq!(v, vec![0x12, 0x34]);
     }
 
     #[test]
     fn evaluate_item_save_writes_to_vars() {
         let mut ctx = EvalContext::new();
-        let _ = evaluate_item_fields(
-            0, 0, 0,
-            b"hello",
-            "saved",
-            "",
-            None,
-            &mut ctx,
-        )
-        .unwrap();
+        let _ = evaluate_item_fields(0, 0, 0, b"hello", "saved", "", None, &mut ctx).unwrap();
         assert_eq!(ctx.vars.get("saved").map(|v| v.as_slice()), Some(b"hello" as &[u8]));
     }
 

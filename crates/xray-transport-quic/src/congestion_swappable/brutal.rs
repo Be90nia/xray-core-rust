@@ -258,9 +258,7 @@ pub fn parse_bandwidth_bps(s: &str) -> std::io::Result<u64> {
         return Ok(0);
     }
     let idx = s.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(s.len());
-    let val: f64 = s[..idx]
-        .parse()
-        .map_err(|_| invalid_bandwidth(&s))?;
+    let val: f64 = s[..idx].parse().map_err(|_| invalid_bandwidth(&s))?;
     let mul: u64 = match s[idx..].trim() {
         "" | "b" | "bps" => 1,
         "k" | "kb" | "kbps" => 1 << 10,
@@ -271,7 +269,7 @@ pub fn parse_bandwidth_bps(s: &str) -> std::io::Result<u64> {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("quicParams: unsupported unit {unit:?}"),
-            ))
+            ));
         },
     };
     // Go :490 `uint64(val*float64(mul)) / 8`：先截断再整除。

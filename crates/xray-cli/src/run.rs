@@ -21,15 +21,18 @@
 //! Rust 端用 `tokio::signal::ctrl_c()` +（unix）`SIGTERM` handler；信号触发后调
 //! [`close_if_sole_owner`] 优雅关闭 Instance。
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
-
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use clap::Args;
 
-use crate::error::{CliError, Result};
-use crate::version::print_version;
+use crate::{
+    error::{CliError, Result},
+    version::print_version,
+};
 
 /// 初始化全局 tracing subscriber（幂等：已存在全局 subscriber 时静默跳过）。
 ///
@@ -37,11 +40,10 @@ use crate::version::print_version;
 /// 9tk4：`default_directive` 由配置 `log.loglevel` 推导（见 [`loglevel_directive`]），
 /// 使直连 tracing 日志受 loglevel 单一事实源门控；工具子命令传固定 "info"。
 pub fn init_tracing(default_directive: &str) {
-    use tracing_subscriber::{fmt, EnvFilter};
+    use tracing_subscriber::{EnvFilter, fmt};
     let _ = fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(default_directive)),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_directive)),
         )
         .with_target(false)
         .with_writer(std::io::stderr)
@@ -54,12 +56,7 @@ pub fn init_tracing(default_directive: &str) {
 /// `none` 关闭两路日志（Go 同设 error/access 为 None）→ `off`。
 /// 与 xray-core `register.rs build_log_config` 的 loglevel 分支保持同口径。
 fn loglevel_directive(config: &xray_conf::config::Config) -> &'static str {
-    match config
-        .log
-        .as_ref()
-        .and_then(|l| l.loglevel.as_deref())
-        .map(str::to_lowercase)
-        .as_deref()
+    match config.log.as_ref().and_then(|l| l.loglevel.as_deref()).map(str::to_lowercase).as_deref()
     {
         Some("debug") => "debug",
         Some("info") => "info",
@@ -104,13 +101,8 @@ pub struct RunArgs {
 const CONFIG_EXTENSIONS: &[&str] = &["json", "jsonc", "toml", "yaml", "yml"];
 
 /// 工作目录默认配置文件名候选（按优先级）。
-const DEFAULT_CONFIG_FILES: &[&str] = &[
-    "config.json",
-    "config.jsonc",
-    "config.toml",
-    "config.yaml",
-    "config.yml",
-];
+const DEFAULT_CONFIG_FILES: &[&str] =
+    &["config.json", "config.jsonc", "config.toml", "config.yaml", "config.yml"];
 
 /// 执行 `xray run` 命令。
 ///
@@ -131,18 +123,15 @@ pub async fn execute(args: RunArgs) -> Result<()> {
         // 无文件 → 走 stdin 兜底（对应 Go `getConfigFilePath` 返回 `stdin:` 分支，
         // main/run.go:198-201）。
         load_stdin_config(&args.format)?
-    } else if config_files.len() == 1
-        && config_files[0].to_string_lossy() == "stdin:"
-    {
+    } else if config_files.len() == 1 && config_files[0].to_string_lossy() == "stdin:" {
         // `-c stdin:` 显式走 stdin
         load_stdin_config(&args.format)?
     } else {
         // 文件路径：多文件走 merge_configs，单文件走 load_one_config
         load_first_config(&config_files, &args.format)?
     };
-    let built = config
-        .build()
-        .map_err(|e| CliError::StartFailed(format!("config build failed: {e}")))?;
+    let built =
+        config.build().map_err(|e| CliError::StartFailed(format!("config build failed: {e}")))?;
 
     // 9tk4：tracing 过滤器由配置 loglevel 推导（RUST_LOG 仍可覆盖），使直连
     // tracing 日志与 Go loglevel 单一事实源对齐；未配 log 节时默认 warn，
@@ -178,9 +167,8 @@ pub async fn execute(args: RunArgs) -> Result<()> {
     // Runtime::new().block_on 会触发"Cannot start a runtime from within a
     // runtime"(嵌套 runtime panic,release 冒烟实测)。
     // start_full 注册传输 + outbound + spawn inbound,返回 (instance, ohm, handles)
-    let (instance, _ohm, handles) = xray_core::start_full(&built)
-        .await
-        .map_err(|e| CliError::StartFailed(e.to_string()))?;
+    let (instance, _ohm, handles) =
+        xray_core::start_full(&built).await.map_err(|e| CliError::StartFailed(e.to_string()))?;
 
     // 等待 Ctrl-C / SIGTERM 信号
     wait_for_signal().await;
@@ -201,10 +189,7 @@ pub async fn execute(args: RunArgs) -> Result<()> {
 fn config_uses_splithttp(config: &xray_conf::config::Config) -> bool {
     let inbounds = &config.inbound_configs;
     inbounds.iter().any(|ib| {
-        ib.stream_settings
-            .as_ref()
-            .and_then(|ss| ss.get("network"))
-            .and_then(|v| v.as_str())
+        ib.stream_settings.as_ref().and_then(|ss| ss.get("network")).and_then(|v| v.as_str())
             == Some("splithttp")
     })
 }
@@ -222,15 +207,15 @@ async fn wait_for_signal() {
 
     #[cfg(unix)]
     let terminate = async {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         match signal(SignalKind::terminate()) {
             Ok(mut s) => {
                 let _ = s.recv().await;
-            }
+            },
             Err(e) => {
                 tracing::warn!(error = %e, "install SIGTERM handler failed; falling back to ctrl_c only");
                 std::future::pending::<()>().await;
-            }
+            },
         }
     };
 
@@ -249,16 +234,16 @@ async fn wait_for_signal() {
 /// 暴露为 `pub` 以便单元测试覆盖两条路径（成功 close / 多持有者跳过）。
 pub fn close_if_sole_owner(instance: Arc<xray_core::Instance>) -> Result<()> {
     match Arc::try_unwrap(instance) {
-        Ok(mut inst) => inst
-            .close()
-            .map_err(|e| CliError::StartFailed(format!("instance close failed: {e}"))),
+        Ok(mut inst) => {
+            inst.close().map_err(|e| CliError::StartFailed(format!("instance close failed: {e}")))
+        },
         Err(arc) => {
             tracing::warn!(
                 strong_count = Arc::strong_count(&arc),
                 "Arc<Instance> has multiple holders; skipping graceful close"
             );
             Ok(())
-        }
+        },
     }
 }
 
@@ -326,11 +311,7 @@ fn scan_confdir(dir: &Path) -> Vec<PathBuf> {
 fn has_config_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| {
-            CONFIG_EXTENSIONS
-                .iter()
-                .any(|&e| e.eq_ignore_ascii_case(ext))
-        })
+        .map(|ext| CONFIG_EXTENSIONS.iter().any(|&e| e.eq_ignore_ascii_case(ext)))
         .unwrap_or(false)
 }
 
@@ -345,9 +326,8 @@ fn load_first_config(files: &[PathBuf], format_hint: &str) -> Result<xray_conf::
         return load_one_config(&files[0], format_hint);
     }
     // 多文件场景：合并 override（首个整体生效，其余按 tag 覆盖字段）
-    let merged = xray_conf::merge_configs(files).map_err(|e| {
-        CliError::ConfigLoadFailed(format!("merge config: {e}"))
-    })?;
+    let merged = xray_conf::merge_configs(files)
+        .map_err(|e| CliError::ConfigLoadFailed(format!("merge config: {e}")))?;
     Ok(merged)
 }
 
@@ -361,9 +341,8 @@ fn load_one_config(path: &Path, format_hint: &str) -> Result<xray_conf::Config> 
             ))
         })?
     } else {
-        parse_format_name(format_hint).ok_or_else(|| {
-            CliError::ConfigLoadFailed(format!("不支持的格式: {format_hint}"))
-        })?
+        parse_format_name(format_hint)
+            .ok_or_else(|| CliError::ConfigLoadFailed(format!("不支持的格式: {format_hint}")))?
     };
 
     xray_conf::load_file_with_format(path, format)
@@ -382,13 +361,11 @@ fn load_stdin_config(format_hint: &str) -> Result<xray_conf::Config> {
         .read_to_end(&mut buf)
         .map_err(|e| CliError::ConfigLoadFailed(format!("read stdin: {e}")))?;
     let format = if format_hint.eq_ignore_ascii_case("auto") {
-        xray_conf::Format::detect(&buf).ok_or_else(|| {
-            CliError::ConfigLoadFailed("无法识别 stdin 配置格式".into())
-        })?
+        xray_conf::Format::detect(&buf)
+            .ok_or_else(|| CliError::ConfigLoadFailed("无法识别 stdin 配置格式".into()))?
     } else {
-        parse_format_name(format_hint).ok_or_else(|| {
-            CliError::ConfigLoadFailed(format!("不支持的格式: {format_hint}"))
-        })?
+        parse_format_name(format_hint)
+            .ok_or_else(|| CliError::ConfigLoadFailed(format!("不支持的格式: {format_hint}")))?
     };
     xray_conf::load_reader(format, buf.as_slice())
         .map_err(|e| CliError::ConfigLoadFailed(format!("stdin: {e}")))
@@ -421,8 +398,9 @@ fn dump_config(args: &RunArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write;
+
+    use super::*;
 
     #[test]
     fn has_config_extension_known() {
@@ -452,10 +430,8 @@ mod tests {
 
     #[test]
     fn resolve_explicit_config_files() {
-        let args = RunArgs {
-            config: vec![PathBuf::from("/etc/config.json")],
-            ..Default::default()
-        };
+        let args =
+            RunArgs { config: vec![PathBuf::from("/etc/config.json")], ..Default::default() };
         let files = resolve_config_files(&args).unwrap();
         assert_eq!(files, vec![PathBuf::from("/etc/config.json")]);
     }
@@ -529,10 +505,7 @@ mod tests {
 
     #[test]
     fn execute_no_config_errors() {
-        let args = RunArgs {
-            test: true,
-            ..Default::default()
-        };
+        let args = RunArgs { test: true, ..Default::default() };
         // 无配置且工作目录无默认 → ConfigNotFound 或空回退
         // 实际行为取决于运行环境，仅验证不 panic
         let _ = tokio::runtime::Runtime::new().unwrap().block_on(execute(args));
@@ -562,11 +535,8 @@ mod tests {
         .unwrap();
         tmp1.flush().unwrap();
         let mut tmp2 = tempfile::NamedTempFile::with_suffix(".json").unwrap();
-        writeln!(
-            tmp2,
-            r#"{{"inbounds": [{{"protocol": "vless", "port": 443, "tag": "in"}}]}}"#
-        )
-        .unwrap();
+        writeln!(tmp2, r#"{{"inbounds": [{{"protocol": "vless", "port": 443, "tag": "in"}}]}}"#)
+            .unwrap();
         tmp2.flush().unwrap();
 
         let args = RunArgs {
@@ -581,10 +551,7 @@ mod tests {
 
     #[test]
     fn dump_config_no_files_errors() {
-        let args = RunArgs {
-            dump: true,
-            ..Default::default()
-        };
+        let args = RunArgs { dump: true, ..Default::default() };
         // 工作目录可能存在默认 config.*，结果依赖环境；仅验证不 panic。
         let _ = dump_config(&args);
     }
@@ -596,10 +563,7 @@ mod tests {
         let args = RunArgs::default();
         assert!(args.unix_socket.is_none());
         // 模拟带 flag 的解析（clap 默认行为）。
-        let args = RunArgs {
-            unix_socket: Some("/tmp/xh.sock".into()),
-            ..Default::default()
-        };
+        let args = RunArgs { unix_socket: Some("/tmp/xh.sock".into()), ..Default::default() };
         assert_eq!(args.unix_socket.as_deref(), Some("/tmp/xh.sock"));
     }
 
@@ -611,10 +575,7 @@ mod tests {
     fn config_uses_splithttp_only_for_splithttp_inbound() {
         // 空 inbound 配置 → false
         let cfg = xray_conf::config::Config::default();
-        assert!(
-            !config_uses_splithttp(&cfg),
-            "empty inbound_configs must return false"
-        );
+        assert!(!config_uses_splithttp(&cfg), "empty inbound_configs must return false");
         // 这里 cfg 字段为 Option<...>，需要一个含 inbound 但 transport != splithttp 的样本
         // 与含 inbound 且 transport = splithttp 的样本。
         // xray_conf::Config 字段私有，直接构造不便——借助 parse_http_config-style

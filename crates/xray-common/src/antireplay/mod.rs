@@ -2,9 +2,11 @@
 //!
 //! 对应 Go 版本 `common/antireplay` 包，提供基于双池时间窗的重放检测。
 
-use std::collections::HashSet;
-use std::hash::Hash;
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashSet,
+    hash::Hash,
+    time::{Duration, Instant},
+};
 
 /// 防重放过滤器 trait。
 ///
@@ -100,7 +102,7 @@ mod tests {
         assert!(filter.check(&3));
         assert!(!filter.check(&1)); // 重放
         assert!(!filter.check(&2)); // 重放
-        assert!(filter.check(&4));  // 新值
+        assert!(filter.check(&4)); // 新值
     }
 
     /// 票 j46g：双池无容量上限——大量新值不挤出旧条目（Go 语义；
@@ -112,10 +114,7 @@ mod tests {
         for i in 1..=200u32 {
             assert!(filter.check(&i), "value {i} must pass as new");
         }
-        assert!(
-            !filter.check(&0),
-            "first value must stay rejected after 200 new values"
-        );
+        assert!(!filter.check(&0), "first value must stay rejected after 200 new values");
     }
 
     /// 换代语义（`interval=0` 每次 check 都换代，确定性验证）：旧一代条目
@@ -125,9 +124,6 @@ mod tests {
         let mut filter: MapFilter<u32> = MapFilter::new(0);
         assert!(filter.check(&1));
         assert!(!filter.check(&1), "previous generation sits in poolB");
-        assert!(
-            filter.check(&1),
-            "forgotten after both pools rotated past it"
-        );
+        assert!(filter.check(&1), "forgotten after both pools rotated past it");
     }
 }

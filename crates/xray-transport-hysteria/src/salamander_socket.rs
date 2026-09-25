@@ -33,8 +33,7 @@ use quinn::{
     udp::{RecvMeta, Transmit},
 };
 use tokio::net::UdpSocket;
-use xray_transport::finalmask::salamander::SalamanderObfuscator;
-use xray_transport::finalmask::salamander_gecko::GeckoConfig;
+use xray_transport::finalmask::{salamander::SalamanderObfuscator, salamander_gecko::GeckoConfig};
 
 /// 单个 wire datagram 缓冲上限：QUIC `max_udp_payload_size` 上限 64KiB + salt。
 const MAX_WIRE_DATAGRAM: usize = 64 * 1024 + 8;
@@ -76,11 +75,9 @@ impl UdpObfs {
             UdpObfs::Salamander(obfs) => {
                 SalamanderSocket::bind(obfs.clone(), bind_addr, sockopt).await?.client_endpoint()
             },
-            UdpObfs::Gecko(cfg) => {
-                crate::gecko_socket::GeckoSocket::bind(cfg, bind_addr, sockopt)
-                    .await?
-                    .client_endpoint()
-            },
+            UdpObfs::Gecko(cfg) => crate::gecko_socket::GeckoSocket::bind(cfg, bind_addr, sockopt)
+                .await?
+                .client_endpoint(),
         }
     }
 
@@ -95,16 +92,12 @@ impl UdpObfs {
         sockopt: &xray_transport::sockopt::SocketOptions,
     ) -> io::Result<quinn::Endpoint> {
         match self {
-            UdpObfs::Salamander(obfs) => {
-                SalamanderSocket::bind(obfs.clone(), bind_addr, sockopt)
-                    .await?
-                    .server_endpoint(server_config)
-            },
-            UdpObfs::Gecko(cfg) => {
-                crate::gecko_socket::GeckoSocket::bind(cfg, bind_addr, sockopt)
-                    .await?
-                    .server_endpoint(server_config)
-            },
+            UdpObfs::Salamander(obfs) => SalamanderSocket::bind(obfs.clone(), bind_addr, sockopt)
+                .await?
+                .server_endpoint(server_config),
+            UdpObfs::Gecko(cfg) => crate::gecko_socket::GeckoSocket::bind(cfg, bind_addr, sockopt)
+                .await?
+                .server_endpoint(server_config),
         }
     }
 }
@@ -230,9 +223,9 @@ impl AsyncUdpSocket for SalamanderSocket {
                         RecvMeta { addr, len: payload, stride: payload, ecn: None, dst_ip: None };
                     return Poll::Ready(Ok(1));
                 },
-                Ok(_) => continue,  // Short packet (≤ salt) dropped, keep reading
+                Ok(_) => continue, // Short packet (≤ salt) dropped, keep reading
                 Err(_) => continue, /* WouldBlock → hang waker; other IO errors retry same as
-                                      * quinn tokio impl */
+                                     * quinn tokio impl */
             }
         }
     }
@@ -290,9 +283,7 @@ impl std::fmt::Debug for WritablePoller {
 ///
 /// # Errors
 /// `InvalidInput`：未知 type / packetSize 非法 / 多条目 / PSK 过短。
-pub fn parse_udp_obfs(
-    finalmask_json: Option<&serde_json::Value>,
-) -> io::Result<Option<UdpObfs>> {
+pub fn parse_udp_obfs(finalmask_json: Option<&serde_json::Value>) -> io::Result<Option<UdpObfs>> {
     let Some(v) = finalmask_json else { return Ok(None) };
     let Some(udp) = v.get("udp").and_then(|u| u.as_array()) else {
         return Ok(None);
@@ -411,8 +402,13 @@ mod tests {
 
     #[tokio::test]
     async fn try_send_wraps_salt_and_xor() {
-        let sock =
-            SalamanderSocket::bind(test_obfs(), "127.0.0.1:0".parse().unwrap(), &Default::default()).await.unwrap();
+        let sock = SalamanderSocket::bind(
+            test_obfs(),
+            "127.0.0.1:0".parse().unwrap(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
         let peer = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).await.unwrap();
         let plain = b"plaintext quic packet";
 
@@ -452,8 +448,13 @@ mod tests {
 
     #[tokio::test]
     async fn poll_recv_unwraps_inbound() {
-        let sock =
-            SalamanderSocket::bind(test_obfs(), "127.0.0.1:0".parse().unwrap(), &Default::default()).await.unwrap();
+        let sock = SalamanderSocket::bind(
+            test_obfs(),
+            "127.0.0.1:0".parse().unwrap(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
         let peer = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).await.unwrap();
 
         // 对端用 salamander 加密后发来
@@ -483,8 +484,13 @@ mod tests {
 
     #[tokio::test]
     async fn poll_recv_drops_short_packet_then_recovers() {
-        let sock =
-            SalamanderSocket::bind(test_obfs(), "127.0.0.1:0".parse().unwrap(), &Default::default()).await.unwrap();
+        let sock = SalamanderSocket::bind(
+            test_obfs(),
+            "127.0.0.1:0".parse().unwrap(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
         let peer = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).await.unwrap();
         let dst = sock.local_addr().unwrap();
 
@@ -539,7 +545,10 @@ mod tests {
                 r#"{{"udp":[{{"type":"salamander","settings":{{"password":"obfs-secret-1","packetSize":{ps}}}}}]}}"#
             ))
             .unwrap();
-            assert!(matches!(parse_udp_obfs(Some(&v)).unwrap(), Some(UdpObfs::Salamander(_))), "ps={ps}");
+            assert!(
+                matches!(parse_udp_obfs(Some(&v)).unwrap(), Some(UdpObfs::Salamander(_))),
+                "ps={ps}"
+            );
         }
     }
 

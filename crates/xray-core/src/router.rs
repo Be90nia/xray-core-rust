@@ -11,10 +11,8 @@
 
 use std::sync::Arc;
 
-use xray_app_dispatcher::default::SimpleOhm;
-use xray_app_dispatcher::{DispatchHandler, OutboundHandlerManager};
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
+use xray_app_dispatcher::{DispatchHandler, OutboundHandlerManager, default::SimpleOhm};
+use xray_common::net::{address::Address, destination::Destination};
 use xray_transport::link::Link;
 
 /// 路由查询 trait：给定目标，返回 outbound tag（None = 用 default）。
@@ -64,7 +62,10 @@ impl std::fmt::Debug for RoutingHandler {
 }
 
 impl DispatchHandler for RoutingHandler {
-    fn tag(&self) -> &str { &self.tag }
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
     fn dispatch(
         &self,
         dest: &Destination,
@@ -107,14 +108,18 @@ pub struct TagRouter {
 
 impl TagRouter {
     #[must_use]
-    pub fn new(rules: Vec<(String, String)>) -> Self { Self { rules } }
+    pub fn new(rules: Vec<(String, String)>) -> Self {
+        Self { rules }
+    }
 }
 
 impl DispatchRouter for TagRouter {
     fn pick_outbound_tag(&self, dest: &Destination) -> Option<String> {
         if let Address::Domain(d) = dest.address() {
             for (pattern, tag) in &self.rules {
-                if d == pattern { return Some(tag.clone()); }
+                if d == pattern {
+                    return Some(tag.clone());
+                }
             }
         }
         None
@@ -138,7 +143,7 @@ impl DomainPattern {
                 let domain_l = domain.to_lowercase();
                 let suffix_l = s.to_lowercase();
                 domain_l == suffix_l || domain_l.ends_with(&format!(".{suffix_l}"))
-            }
+            },
             Self::Keyword(k) => domain.to_lowercase().contains(&k.to_lowercase()),
         }
     }
@@ -156,10 +161,10 @@ impl IpPattern {
         match (self, ip) {
             (Self::V4(net, bits), std::net::IpAddr::V4(addr)) => {
                 cidr_v4_contains(*net, *bits, addr)
-            }
+            },
             (Self::V6(net, bits), std::net::IpAddr::V6(addr)) => {
                 cidr_v6_contains(*net, *bits, addr)
-            }
+            },
             _ => false,
         }
     }
@@ -168,8 +173,12 @@ impl IpPattern {
 fn cidr_v4_contains(net: std::net::Ipv4Addr, bits: u8, addr: std::net::Ipv4Addr) -> bool {
     let net_int = u32::from(net);
     let addr_int = u32::from(addr);
-    if bits == 0 { return true; }
-    if bits > 32 { return false; }
+    if bits == 0 {
+        return true;
+    }
+    if bits > 32 {
+        return false;
+    }
     let mask = !0u32 << (32 - bits);
     (net_int & mask) == (addr_int & mask)
 }
@@ -177,18 +186,26 @@ fn cidr_v4_contains(net: std::net::Ipv4Addr, bits: u8, addr: std::net::Ipv4Addr)
 fn cidr_v6_contains(net: std::net::Ipv6Addr, bits: u8, addr: std::net::Ipv6Addr) -> bool {
     let net_b = net.octets();
     let addr_b = addr.octets();
-    if bits == 0 { return true; }
-    if bits > 128 { return false; }
+    if bits == 0 {
+        return true;
+    }
+    if bits > 128 {
+        return false;
+    }
     let full_bytes = usize::from(bits / 8);
     let rem_bits = bits % 8;
-    if net_b[..full_bytes] != addr_b[..full_bytes] { return false; }
-    if rem_bits == 0 { return true; }
+    if net_b[..full_bytes] != addr_b[..full_bytes] {
+        return false;
+    }
+    if rem_bits == 0 {
+        return true;
+    }
     let mask = !0u8 << (8 - rem_bits);
     (net_b[full_bytes] & mask) == (addr_b[full_bytes] & mask)
 }
 
 fn parse_cidr(s: &str) -> Option<IpPattern> {
-    let (ip_part, bits_part) = s.split_once('/') ?;
+    let (ip_part, bits_part) = s.split_once('/')?;
     let bits: u8 = bits_part.parse().ok()?;
     if let Ok(v4) = ip_part.parse::<std::net::Ipv4Addr>() {
         return Some(IpPattern::V4(v4, bits));
@@ -209,16 +226,20 @@ struct PatternRule {
 
 impl PatternRule {
     fn matches(&self, dest: &Destination) -> bool {
-        let domain_hit = !self.domains.is_empty() && match dest.address() {
-            Address::Domain(d) => self.domains.iter().any(|p| p.matches(d)),
-            _ => false,
-        };
-        if domain_hit { return true; }
-        let ip_hit = !self.ips.is_empty() && match dest.address() {
-            Address::IPv4(ip) => self.ips.iter().any(|p| p.matches(std::net::IpAddr::V4(*ip))),
-            Address::IPv6(ip) => self.ips.iter().any(|p| p.matches(std::net::IpAddr::V6(*ip))),
-            _ => false,
-        };
+        let domain_hit = !self.domains.is_empty()
+            && match dest.address() {
+                Address::Domain(d) => self.domains.iter().any(|p| p.matches(d)),
+                _ => false,
+            };
+        if domain_hit {
+            return true;
+        }
+        let ip_hit = !self.ips.is_empty()
+            && match dest.address() {
+                Address::IPv4(ip) => self.ips.iter().any(|p| p.matches(std::net::IpAddr::V4(*ip))),
+                Address::IPv6(ip) => self.ips.iter().any(|p| p.matches(std::net::IpAddr::V6(*ip))),
+                _ => false,
+            };
         ip_hit
     }
 }
@@ -242,18 +263,27 @@ impl PatternRouter {
         let mut rules = Vec::new();
         if let Some(arr) = v.get("rules").and_then(|r| r.as_array()) {
             for r in arr {
-                let outbound_tag = r.get("outboundTag").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let outbound_tag =
+                    r.get("outboundTag").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 if outbound_tag.is_empty() {
                     // 可能是 balancerTag，跳过（未支持）
                     continue;
                 }
                 let mut domains = Vec::new();
-                for d in json_str_iter(r.get("domain")) { domains.push(DomainPattern::Exact(d.to_string())); }
-                for d in json_str_iter(r.get("domainSuffix")) { domains.push(DomainPattern::Suffix(d.to_string())); }
-                for d in json_str_iter(r.get("domainKeyword")) { domains.push(DomainPattern::Keyword(d.to_string())); }
+                for d in json_str_iter(r.get("domain")) {
+                    domains.push(DomainPattern::Exact(d.to_string()));
+                }
+                for d in json_str_iter(r.get("domainSuffix")) {
+                    domains.push(DomainPattern::Suffix(d.to_string()));
+                }
+                for d in json_str_iter(r.get("domainKeyword")) {
+                    domains.push(DomainPattern::Keyword(d.to_string()));
+                }
                 let mut ips = Vec::new();
                 for ip_str in json_str_iter(r.get("ip")) {
-                    if let Some(p) = parse_cidr(ip_str) { ips.push(p); }
+                    if let Some(p) = parse_cidr(ip_str) {
+                        ips.push(p);
+                    }
                 }
                 rules.push(PatternRule { domains, ips, outbound_tag });
             }
@@ -281,16 +311,18 @@ impl DispatchRouter for PatternRouter {
 }
 impl PatternRouter {
     /// 返回规则数 (仅供测试).
-    pub fn rules_len_for_test(&self) -> usize { self.rules.len() }
+    pub fn rules_len_for_test(&self) -> usize {
+        self.rules.len()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use xray_app_dispatcher::default::{DialBridge, SimpleOhm};
-    use xray_common::net::network::Network;
-    use xray_common::net::port::Port;
+    use xray_common::net::{network::Network, port::Port};
     use xray_proxy_freedom::make_freedom_dial_fn;
+
+    use super::*;
 
     fn dummy_dest(domain: &str) -> Destination {
         Destination::new(Address::Domain(domain.to_string()), Port::new(80), Network::TCP)
@@ -336,8 +368,8 @@ mod tests {
     #[test]
     fn routing_handler_registered_as_default() {
         let ohm = Arc::new(SimpleOhm::new());
-        let freedom = Arc::new(DialBridge::new("direct", make_freedom_dial_fn()))
-            as Arc<dyn DispatchHandler>;
+        let freedom =
+            Arc::new(DialBridge::new("direct", make_freedom_dial_fn())) as Arc<dyn DispatchHandler>;
         ohm.set_default(freedom.clone());
         let router = Arc::new(TagRouter::new(vec![]));
         let routing = Arc::new(RoutingHandler::new(Arc::clone(&ohm), freedom, router))
@@ -366,38 +398,24 @@ mod tests {
 
     #[test]
     fn pattern_router_domain_suffix_match() {
-        let json = make_routing_json(
-            "[{\"outboundTag\":\"proxy\",\"domainSuffix\":[\"google.com\"]}]",
-        );
+        let json =
+            make_routing_json("[{\"outboundTag\":\"proxy\",\"domainSuffix\":[\"google.com\"]}]");
         let r = PatternRouter::from_json(&json).unwrap();
-        assert_eq!(
-            r.pick_outbound_tag(&dummy_dest("www.google.com")).as_deref(),
-            Some("proxy")
-        );
-        assert_eq!(
-            r.pick_outbound_tag(&dummy_dest("google.com")).as_deref(),
-            Some("proxy")
-        );
+        assert_eq!(r.pick_outbound_tag(&dummy_dest("www.google.com")).as_deref(), Some("proxy"));
+        assert_eq!(r.pick_outbound_tag(&dummy_dest("google.com")).as_deref(), Some("proxy"));
         assert!(r.pick_outbound_tag(&dummy_dest("bing.com")).is_none());
     }
 
     #[test]
     fn pattern_router_domain_keyword_match() {
-        let json = make_routing_json(
-            "[{\"outboundTag\":\"blocked\",\"domainKeyword\":[\"bad\"]}]",
-        );
+        let json = make_routing_json("[{\"outboundTag\":\"blocked\",\"domainKeyword\":[\"bad\"]}]");
         let r = PatternRouter::from_json(&json).unwrap();
-        assert_eq!(
-            r.pick_outbound_tag(&dummy_dest("verybad.com")).as_deref(),
-            Some("blocked")
-        );
+        assert_eq!(r.pick_outbound_tag(&dummy_dest("verybad.com")).as_deref(), Some("blocked"));
     }
 
     #[test]
     fn pattern_router_ip_cidr_match() {
-        let json = make_routing_json(
-            "[{\"outboundTag\":\"direct\",\"ip\":[\"10.0.0.0/8\"]}]",
-        );
+        let json = make_routing_json("[{\"outboundTag\":\"direct\",\"ip\":[\"10.0.0.0/8\"]}]");
         let r = PatternRouter::from_json(&json).unwrap();
         let dest_in = Destination::new(
             Address::IPv4(std::net::Ipv4Addr::new(10, 1, 2, 3)),

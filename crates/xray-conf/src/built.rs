@@ -16,8 +16,8 @@
 //! ## kind 命名约定
 //!
 //! - `apps[i].kind`：app 字段名（`"log"` / `"routing"` / `"dns"` / `"policy"` / `"api"` /
-//!   `"metrics"` / `"stats"` / `"fakeDns"` / `"observatory"` / `"burstObservatory"` /
-//!   `"version"` / `"geodata"`）
+//!   `"metrics"` / `"stats"` / `"fakeDns"` / `"observatory"` / `"burstObservatory"` / `"version"` /
+//!   `"geodata"`）
 //! - `inbounds[i].kind`：协议名（`"vless"` / `"vmess"` / `"socks"` / `"freedom"` / ...）
 //! - `outbounds[i].kind`：协议名（同上）
 //!
@@ -26,9 +26,11 @@
 
 use serde_json::Value;
 
-use crate::config::Config;
-use crate::error::{ConfError, Result};
-use crate::outbound_security::validate_outbound_transport_security;
+use crate::{
+    config::Config,
+    error::{ConfError, Result},
+    outbound_security::validate_outbound_transport_security,
+};
 
 /// 单个构建产物条目：种类键 + JSON 字节。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,7 +160,6 @@ impl Config {
         // App 字段：保持 Go 中的处理顺序，方便后续 Instance::new 注册 essentialFeatures。
         // reverse 已在 build() 开头报 `ConfError::Removed`（Go v26 已移除该 feature）。
 
-
         macro_rules! push_app {
             ($field:expr, $kind:literal) => {
                 if let Some(v) = $field.as_ref() {
@@ -224,33 +225,29 @@ impl Config {
                 // UDS/tun 无端口 → 推一个占位 BuiltInbound（port=None, listen=Some），
                 // 上层 listener 会按 UDS/tun 形态接管（不依赖 port 字段）。
                 out.inbounds.push(BuiltInbound {
-                    entry: BuiltEntry {
-                        kind: ib.protocol.clone(),
-                        data: data.clone(),
-                    },
+                    entry: BuiltEntry { kind: ib.protocol.clone(), data: data.clone() },
                     tag: ib.tag.clone(),
                     port: None,
                     listen: ib.listen.as_ref().map(|a| a.0.clone()),
                     stream_settings_json: ib.stream_settings.clone(),
-                    sniffing_json: ib.sniffing.as_ref().map(|s| {
-                        serde_json::to_value(s).unwrap_or(Value::Null)
-                    }),
+                    sniffing_json: ib
+                        .sniffing
+                        .as_ref()
+                        .map(|s| serde_json::to_value(s).unwrap_or(Value::Null)),
                 });
                 continue;
             }
             for port in ports {
                 out.inbounds.push(BuiltInbound {
-                    entry: BuiltEntry {
-                        kind: ib.protocol.clone(),
-                        data: data.clone(),
-                    },
+                    entry: BuiltEntry { kind: ib.protocol.clone(), data: data.clone() },
                     tag: ib.tag.clone(),
                     port: Some(port),
                     listen: ib.listen.as_ref().map(|a| a.0.clone()),
                     stream_settings_json: ib.stream_settings.clone(),
-                    sniffing_json: ib.sniffing.as_ref().map(|s| {
-                        serde_json::to_value(s).unwrap_or(Value::Null)
-                    }),
+                    sniffing_json: ib
+                        .sniffing
+                        .as_ref()
+                        .map(|s| serde_json::to_value(s).unwrap_or(Value::Null)),
                 });
             }
         }
@@ -283,17 +280,12 @@ impl Config {
                 stream_settings_json.as_ref(),
             )?;
             out.outbounds.push(BuiltOutbound {
-                entry: BuiltEntry {
-                    kind: ob.protocol.clone(),
-                    data,
-                },
+                entry: BuiltEntry { kind: ob.protocol.clone(), data },
                 tag: ob.tag.clone(),
                 send_through: ob.send_through.clone(),
                 stream_settings_json,
                 proxy_settings_json,
-                mux_json: ob.mux.as_ref().map(|m| {
-                    serde_json::to_value(m).unwrap_or(Value::Null)
-                }),
+                mux_json: ob.mux.as_ref().map(|m| serde_json::to_value(m).unwrap_or(Value::Null)),
                 target_strategy: ob.target_strategy.clone(),
             });
         }
@@ -327,11 +319,11 @@ fn is_valid_target_strategy(s: &str) -> bool {
 /// proxySettings/streamSettings 的代理门控归一化（bd enk）。
 ///
 /// 对应 Go `infra/conf/xray.go`：
-/// - `checkChainProxyConfig`（:244-252）：`proxySettings.tag` 与
-///   `sockopt.dialerProxy` 同时非空 → Build 硬报错（warning 级）。
+/// - `checkChainProxyConfig`（:244-252）：`proxySettings.tag` 与 `sockopt.dialerProxy` 同时非空 →
+///   Build 硬报错（warning 级）。
 /// - transportLayer 注入（:316-327）：`transportLayer: true` 时把 tag 注入
-///   `sockopt.dialerProxy`（sockopt/streamSettings 不存在则创建），并清空
-///   proxySettings（应用层链路 → transport 层代理）。
+///   `sockopt.dialerProxy`（sockopt/streamSettings 不存在则创建），并清空 proxySettings（应用层链路
+///   → transport 层代理）。
 fn normalize_outbound_proxy(
     stream_settings: Option<&Value>,
     proxy_settings: Option<&Value>,
@@ -362,9 +354,7 @@ fn normalize_outbound_proxy(
         _ => serde_json::json!({}),
     };
     let obj = ss.as_object_mut().expect("guarded to object");
-    let sockopt = obj
-        .entry("sockopt")
-        .or_insert_with(|| serde_json::json!({}));
+    let sockopt = obj.entry("sockopt").or_insert_with(|| serde_json::json!({}));
     if let Some(so) = sockopt.as_object_mut() {
         so.insert("dialerProxy".to_string(), Value::String(tag.to_string()));
     }
@@ -482,20 +472,12 @@ mod tests {
         let _g = registry_lock();
         let cfg = Config::from_json_str(MINIMAL_CONFIG).unwrap();
         let built = cfg.build().unwrap();
-        let direct = built
-            .outbounds
-            .iter()
-            .find(|o| o.tag == "direct")
-            .unwrap();
+        let direct = built.outbounds.iter().find(|o| o.tag == "direct").unwrap();
         assert_eq!(direct.entry.kind, "freedom");
         // 无 settings → 空 data
         assert!(direct.entry.data.is_empty());
 
-        let proxy = built
-            .outbounds
-            .iter()
-            .find(|o| o.tag == "proxy")
-            .unwrap();
+        let proxy = built.outbounds.iter().find(|o| o.tag == "proxy").unwrap();
         assert_eq!(proxy.entry.kind, "vless");
         let s: Value = serde_json::from_slice(&proxy.entry.data).unwrap();
         assert!(s["vnext"].is_array());
@@ -563,7 +545,8 @@ mod tests {
     fn build_reverse_config_errors() {
         let _g = registry_lock();
         // Go infra/conf/xray.go: `c.Reverse != nil` → PrintRemovedFeatureError。
-        let json = r#"{ "reverse": { "bridges": [ { "tag": "b", "domain": "test.example.com" } ] } }"#;
+        let json =
+            r#"{ "reverse": { "bridges": [ { "tag": "b", "domain": "test.example.com" } ] } }"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
         let err = cfg.build().unwrap_err();
         assert!(matches!(err, ConfError::Removed { .. }));
@@ -652,10 +635,7 @@ mod tests {
         }"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
         let built = cfg.build().unwrap();
-        assert_eq!(
-            built.outbounds[0].proxy_settings_json.as_ref().unwrap()["tag"],
-            "proxy-out"
-        );
+        assert_eq!(built.outbounds[0].proxy_settings_json.as_ref().unwrap()["tag"], "proxy-out");
         assert!(built.outbounds[0].stream_settings_json.is_none());
     }
 
@@ -674,10 +654,7 @@ mod tests {
         }"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
         let err = cfg.build().unwrap_err();
-        assert!(
-            err.to_string().contains("conflicted"),
-            "unexpected error: {err}"
-        );
+        assert!(err.to_string().contains("conflicted"), "unexpected error: {err}");
     }
 
     #[test]
@@ -757,9 +734,6 @@ mod tests {
         }"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
         let err = cfg.build().unwrap_err();
-        assert!(
-            err.to_string().contains("inbound.port"),
-            "unexpected error: {err}"
-        );
+        assert!(err.to_string().contains("inbound.port"), "unexpected error: {err}");
     }
 }

@@ -6,22 +6,20 @@
 //!
 //! - `TcpHubListener` — 持有 `DefaultListener` + `ConnHandler`，spawn accept 循环
 //! - `listen_tcp_impl` — `TransportListenFn` 实现，注册到全局 listener 注册表
-//! - `keep_accepting` — accept 循环：accept → header auth wrap → `add_conn`
-//!   （Go hub.go:125-127）
+//! - `keep_accepting` — accept 循环：accept → header auth wrap → `add_conn` （Go hub.go:125-127）
 //!
 //! TLS/REALITY wrapping 不在 hub（生产 TLS 由 xray-core inbound 各协议层包装）。
 
-use std::io;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{io, net::SocketAddr, sync::Arc};
 
 use tokio::sync::Notify;
 
-use crate::connection::Connection;
-use crate::listener_registry::{ConnHandler, TransportListener};
-use crate::system_listener::SystemListener;
-use crate::sockopt::SocketOptions;
-use crate::system_listener::DefaultListener;
+use crate::{
+    connection::Connection,
+    listener_registry::{ConnHandler, TransportListener},
+    sockopt::SocketOptions,
+    system_listener::{DefaultListener, SystemListener},
+};
 
 /// TCP hub listener。对应 Go `tcp/hub.go::Listener` struct。
 ///
@@ -51,7 +49,6 @@ impl TcpHubListener {
     /// - `add_conn`：新连接回调
     ///
     /// # 错误
-    ///
     pub async fn listen(
         addr: SocketAddr,
         sockopt: &SocketOptions,
@@ -62,13 +59,7 @@ impl TcpHubListener {
         let inner = DefaultListener::bind(addr, sockopt.clone()).await?;
         let close_notify = Arc::new(Notify::new());
 
-        let listener = Self {
-            inner,
-            add_conn,
-            close_notify,
-            auth,
-            tcpmask_manager,
-        };
+        let listener = Self { inner, add_conn, close_notify, auth, tcpmask_manager };
 
         // ponytail: 暂不 spawn accept 循环——由调用方显式调用 `keep_accepting`
         // 或通过 `spawn_accept_loop` 启动。这避免在构造函数中隐式 spawn，
@@ -246,11 +237,12 @@ pub fn tcp_listen_fn() -> crate::listener_registry::TransportListenFn {
 // 保留 `register_tcp_listener` / `take_tcp_listener` 向后兼容，
 // 但标记为 deprecated——新代码应使用 `listener_registry::register_transport_listener`。
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::{collections::HashMap, sync::Mutex};
+
 use tokio::net::TcpListener as TokioTcpListener;
 
-static TCP_HUB: std::sync::OnceLock<Mutex<HashMap<SocketAddr, TokioTcpListener>>> = std::sync::OnceLock::new();
+static TCP_HUB: std::sync::OnceLock<Mutex<HashMap<SocketAddr, TokioTcpListener>>> =
+    std::sync::OnceLock::new();
 fn tcp_hub() -> &'static Mutex<HashMap<SocketAddr, TokioTcpListener>> {
     TCP_HUB.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -263,8 +255,10 @@ const MAX_TCP_HUB_ENTRIES: usize = 4096;
 pub fn register_tcp_listener(addr: SocketAddr, listener: TokioTcpListener) -> io::Result<()> {
     if let Ok(mut hub) = tcp_hub().lock() {
         if hub.len() >= MAX_TCP_HUB_ENTRIES {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                format!("TCP hub registry full ({MAX_TCP_HUB_ENTRIES})")));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("TCP hub registry full ({MAX_TCP_HUB_ENTRIES})"),
+            ));
         }
         hub.insert(addr, listener);
     }
@@ -279,17 +273,25 @@ pub fn take_tcp_listener(addr: SocketAddr) -> Option<TokioTcpListener> {
 
 #[cfg(test)]
 mod tests {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+    };
+
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
 
     #[tokio::test]
     async fn tcp_hub_listener_bind_and_accept() {
         let handler: ConnHandler = Arc::new(|_| {});
-        let listener =
-            TcpHubListener::listen("127.0.0.1:0".parse().unwrap(), &SocketOptions::default(), handler, None, None)
-                .await
-                .expect("listen 失败");
+        let listener = TcpHubListener::listen(
+            "127.0.0.1:0".parse().unwrap(),
+            &SocketOptions::default(),
+            handler,
+            None,
+            None,
+        )
+        .await
+        .expect("listen 失败");
         let addr = listener.local_addr().expect("local_addr 失败");
 
         let server = tokio::spawn(async move {
@@ -308,10 +310,15 @@ mod tests {
     #[tokio::test]
     async fn tcp_hub_listener_local_addr() {
         let handler: ConnHandler = Arc::new(|_| {});
-        let listener =
-            TcpHubListener::listen("127.0.0.1:0".parse().unwrap(), &SocketOptions::default(), handler, None, None)
-                .await
-                .expect("listen 失败");
+        let listener = TcpHubListener::listen(
+            "127.0.0.1:0".parse().unwrap(),
+            &SocketOptions::default(),
+            handler,
+            None,
+            None,
+        )
+        .await
+        .expect("listen 失败");
         let addr = listener.local_addr().expect("local_addr 失败");
         assert_eq!(addr.ip().to_string(), "127.0.0.1");
         assert_ne!(addr.port(), 0);
@@ -328,9 +335,15 @@ mod tests {
         });
 
         let listener = Arc::new(
-            TcpHubListener::listen("127.0.0.1:0".parse().unwrap(), &SocketOptions::default(), handler, None, None)
-                .await
-                .expect("listen 失败"),
+            TcpHubListener::listen(
+                "127.0.0.1:0".parse().unwrap(),
+                &SocketOptions::default(),
+                handler,
+                None,
+                None,
+            )
+            .await
+            .expect("listen 失败"),
         );
         let addr = listener.local_addr().expect("local_addr 失败");
 
@@ -377,9 +390,15 @@ mod tests {
     async fn transport_listener_trait_close_and_local_addr() {
         let handler: ConnHandler = Arc::new(|_| {});
         let listener: Box<dyn TransportListener> = Box::new(
-            TcpHubListener::listen("127.0.0.1:0".parse().unwrap(), &SocketOptions::default(), handler, None, None)
-                .await
-                .expect("listen 失败"),
+            TcpHubListener::listen(
+                "127.0.0.1:0".parse().unwrap(),
+                &SocketOptions::default(),
+                handler,
+                None,
+                None,
+            )
+            .await
+            .expect("listen 失败"),
         );
         let addr = listener.local_addr().expect("local_addr 失败");
         assert_ne!(addr.port(), 0);
@@ -407,13 +426,10 @@ mod tests {
         assert_ne!(listener.local_addr().expect("local_addr 失败").port(), 0);
 
         // 缺省/非 bool → false（Go TCPConfig 缺省 false）。
-        assert!(!accept_proxy_protocol_from_tcp_settings(
-            &crate::dialer::StreamSettings::tcp()
-        ));
+        assert!(!accept_proxy_protocol_from_tcp_settings(&crate::dialer::StreamSettings::tcp()));
         let mut settings = crate::dialer::StreamSettings::tcp();
         settings.transport_json = Some(serde_json::json!({ "acceptProxyProtocol": "yes" }));
         assert!(!accept_proxy_protocol_from_tcp_settings(&settings));
-
     }
     /// 竞态窗回归锚（票 n8k8）：close 发生在 accept 循环注册 notified() 之前。
     /// notify_one 存 permit，循环首次注册即被唤醒退出；旧 notify_waiters 语义下
@@ -466,12 +482,9 @@ mod tests {
             match tokio::net::TcpStream::connect(addr).await {
                 Err(_) => break,
                 Ok(_) => {
-                    assert!(
-                        tokio::time::Instant::now() < deadline,
-                        "close+drop 后端口仍接受连接"
-                    );
+                    assert!(tokio::time::Instant::now() < deadline, "close+drop 后端口仍接受连接");
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
+                },
             }
         }
     }
@@ -479,9 +492,12 @@ mod tests {
 
 #[cfg(test)]
 mod header_wrap_tests {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+    };
+
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
 
     /// inbound header 装配（Go tcp/hub.go:85-95 构建 + 125-127 accept 后包装）：
     /// `header.type=http` → add_conn 收到的连接已被 server 包装——
@@ -527,20 +543,14 @@ mod header_wrap_tests {
         // handler 收到的 conn 已被 server 包装（header 被吞，payload 透传）。
         let mut wrapped = rx.recv().await.expect("应收到包装连接");
         let mut buf = [0u8; 15];
-        wrapped
-            .read_exact(&mut buf)
-            .await
-            .expect("wrapped read");
+        wrapped.read_exact(&mut buf).await.expect("wrapped read");
         assert_eq!(&buf, b"inbound-payload", "header 应被吞，payload 透传");
 
         wrapped.write_all(b"resp").await.expect("wrapped write");
         let mut got = [0u8; 512];
         let n = client.read(&mut got).await.expect("client read");
         let text = String::from_utf8_lossy(&got[..n]).to_string();
-        assert!(
-            text.starts_with("HTTP/1.1 200"),
-            "应注入 response header，实际 {text:?}"
-        );
+        assert!(text.starts_with("HTTP/1.1 200"), "应注入 response header，实际 {text:?}");
         assert!(text.ends_with("resp"), "payload 应跟随 header，实际 {text:?}");
     }
 }

@@ -52,13 +52,8 @@ mod tests {
 
     #[test]
     fn error_display_not_a_service() {
-        let e = CommanderError::NotAService {
-            type_url: "xray.app.stats.command.Config".into(),
-        };
-        assert_eq!(
-            e.to_string(),
-            "not a Service (type_url=xray.app.stats.command.Config)"
-        );
+        let e = CommanderError::NotAService { type_url: "xray.app.stats.command.Config".into() };
+        assert_eq!(e.to_string(), "not a Service (type_url=xray.app.stats.command.Config)");
     }
 
     #[test]
@@ -75,10 +70,8 @@ mod tests {
 
     #[test]
     fn error_display_invalid_listen_addr() {
-        let e = CommanderError::InvalidListenAddr {
-            addr: ":-1".into(),
-            reason: "invalid port".into(),
-        };
+        let e =
+            CommanderError::InvalidListenAddr { addr: ":-1".into(), reason: "invalid port".into() };
         assert_eq!(e.to_string(), "invalid listen address `:-1`: invalid port");
     }
 
@@ -91,10 +84,7 @@ mod tests {
     #[test]
     fn error_display_outbound_register_failed() {
         let e = CommanderError::OutboundRegisterFailed("api_out".into());
-        assert_eq!(
-            e.to_string(),
-            "outbound handler register failed for tag `api_out`"
-        );
+        assert_eq!(e.to_string(), "outbound handler register failed for tag `api_out`");
     }
 
     #[test]

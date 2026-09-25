@@ -2,21 +2,21 @@
 //!
 //! ## 设计
 //!
-//! - 每协议一个 inbound / outbound settings 结构体，字段名和 JSON tag 与
-//!   Go 端对齐；未知字段默认忽略（保留前向兼容）。
+//! - 每协议一个 inbound / outbound settings 结构体，字段名和 JSON tag 与 Go
+//!   端对齐；未知字段默认忽略（保留前向兼容）。
 //! - 入站 / 出站各一个 untagged enum：`InboundSettings` / `OutboundSettings`，
 //!   反序列化时按内部结构形态自动匹配（serde untagged）。
-//! - 反序列化入口通过 [`dispatch_inbound_settings`] / [`dispatch_outbound_settings`]
-//!   按 `protocol` 字符串名分派，对应 Go `infra/conf/xray.go` 注册表。
+//! - 反序列化入口通过 [`dispatch_inbound_settings`] / [`dispatch_outbound_settings`] 按 `protocol`
+//!   字符串名分派，对应 Go `infra/conf/xray.go` 注册表。
 //!
 //! ## 协议清单（Go Xray v26.6.1）
 //!
-//! - 入站（9）：vless / vmess / trojan / shadowsocks（含 2022）/ socks（含 mixed）/
-//!   http / dokodemo-door / hysteria / blackhole
-//! - 出站（11）：vless / vmess / trojan / shadowsocks / socks / http / freedom /
-//!   blackhole / loopback / hysteria / dns
-//! - 排除：wireguard / tun 在 `app_config` 已实装；reverse 在 `Config.reverse`
-//!   顶层不属于 `settings` 字段。
+//! - 入站（9）：vless / vmess / trojan / shadowsocks（含 2022）/ socks（含 mixed）/ http /
+//!   dokodemo-door / hysteria / blackhole
+//! - 出站（11）：vless / vmess / trojan / shadowsocks / socks / http / freedom / blackhole /
+//!   loopback / hysteria / dns
+//! - 排除：wireguard / tun 在 `app_config` 已实装；reverse 在 `Config.reverse` 顶层不属于
+//!   `settings` 字段。
 
 use std::collections::HashMap;
 
@@ -240,8 +240,8 @@ pub struct HttpServerBuild {
 impl HttpInboundSettings {
     /// 对应 Go `HTTPServerConfig.Build()`（http.go:32-50，无错误路径）。
     ///
-    /// - `accounts` 非 none 时整体覆盖 `users`（含空数组——Go :38-40 以
-    ///   `Accounts != nil` 判定，空切片同样覆盖）；
+    /// - `accounts` 非 none 时整体覆盖 `users`（含空数组——Go :38-40 以 `Accounts != nil`
+    ///   判定，空切片同样覆盖）；
     /// - `users` 非空时折叠为 username → password map（:42-47）。
     #[must_use]
     pub fn build(&self) -> HttpServerBuild {
@@ -536,7 +536,7 @@ impl ShadowsocksMethod {
             "2022-blake3-aes-128-gcm" => return Some(Self::Ss2022Aes128Gcm),
             "2022-blake3-aes-256-gcm" => return Some(Self::Ss2022Aes256Gcm),
             "2022-blake3-chacha20-poly1305" => return Some(Self::Ss2022ChaCha20Poly1305),
-            _ => {}
+            _ => {},
         }
         // 旧 AEAD：小写化匹配（Go cipherFromString）。
         match name.to_ascii_lowercase().as_str() {
@@ -544,10 +544,10 @@ impl ShadowsocksMethod {
             "aes-256-gcm" | "aead_aes_256_gcm" => Some(Self::Aes256Gcm),
             "chacha20-poly1305" | "aead_chacha20_poly1305" | "chacha20-ietf-poly1305" => {
                 Some(Self::ChaCha20Poly1305)
-            }
+            },
             "xchacha20-poly1305" | "aead_xchacha20_poly1305" | "xchacha20-ietf-poly1305" => {
                 Some(Self::XChaCha20Poly1305)
-            }
+            },
             "none" | "plain" => Some(Self::None),
             _ => None,
         }
@@ -556,10 +556,7 @@ impl ShadowsocksMethod {
     /// 是否 SS-2022 系列。
     #[must_use]
     pub fn is_ss2022(self) -> bool {
-        matches!(
-            self,
-            Self::Ss2022Aes128Gcm | Self::Ss2022Aes256Gcm | Self::Ss2022ChaCha20Poly1305
-        )
+        matches!(self, Self::Ss2022Aes128Gcm | Self::Ss2022Aes256Gcm | Self::Ss2022ChaCha20Poly1305)
     }
 }
 
@@ -588,12 +585,7 @@ pub struct ShadowsocksAeadUser {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ShadowsocksServerBuild {
     /// Go `shadowsocks_2022.ServerConfig` 单用户（:116-123，不校验 key 非空）。
-    Ss2022Single {
-        method: String,
-        key: String,
-        email: String,
-        network: Option<NetworkList>,
-    },
+    Ss2022Single { method: String, key: String, email: String, network: Option<NetworkList> },
     /// Go `shadowsocks_2022.MultiUserServerConfig`（:132-157）。
     Ss2022MultiUser {
         method: String,
@@ -603,10 +595,7 @@ pub enum ShadowsocksServerBuild {
     },
     /// Go `shadowsocks.ServerConfig` 旧 AEAD（:64-110）。`users` 为空 Vec 对应
     /// Go `Users` 为非 nil 空切片的边界（:67-68 不进循环、也不落顶层账户）。
-    LegacyAead {
-        users: Vec<ShadowsocksAeadUser>,
-        network: Option<NetworkList>,
-    },
+    LegacyAead { users: Vec<ShadowsocksAeadUser>, network: Option<NetworkList> },
 }
 
 impl ShadowsocksInboundSettings {
@@ -643,8 +632,7 @@ impl ShadowsocksInboundSettings {
         // Go :128-130：多用户仅支持 blake3-aes-*-gcm（chacha 被拒）。
         if !self.method.contains("aes") {
             return Err(crate::error::ConfError::Invalid(
-                "shadowsocks 2022 (multi-user): only blake3-aes-*-gcm methods are supported"
-                    .into(),
+                "shadowsocks 2022 (multi-user): only blake3-aes-*-gcm methods are supported".into(),
             ));
         }
         // Go :132：users[0].Address 决定 multi vs relay；relay 未实装（non-goal）。
@@ -717,12 +705,9 @@ impl ShadowsocksInboundSettings {
                     });
                 }
                 Ok(ShadowsocksServerBuild::LegacyAead { users: out, network })
-            }
+            },
             // Go :67-68：Users 非 nil 空切片 → 零用户产物（顶层账户不生效）。
-            Some(_) => Ok(ShadowsocksServerBuild::LegacyAead {
-                users: Vec::new(),
-                network,
-            }),
+            Some(_) => Ok(ShadowsocksServerBuild::LegacyAead { users: Vec::new(), network }),
             None => {
                 let password = self.password.clone().unwrap_or_default();
                 if password.is_empty() {
@@ -746,7 +731,7 @@ impl ShadowsocksInboundSettings {
                     }],
                     network,
                 })
-            }
+            },
         }
     }
 }
@@ -816,14 +801,10 @@ impl ShadowsocksOutboundSettings {
         if ShadowsocksMethod::from_method(&method).is_some_and(|m| m.is_ss2022()) {
             // Go :228-236 校验顺序：address → port → password。
             let address = server.address.clone().ok_or_else(|| {
-                crate::error::ConfError::Invalid(
-                    "Shadowsocks server address is not set.".into(),
-                )
+                crate::error::ConfError::Invalid("Shadowsocks server address is not set.".into())
             })?;
             if server.port == 0 {
-                return Err(crate::error::ConfError::Invalid(
-                    "Invalid Shadowsocks port.".into(),
-                ));
+                return Err(crate::error::ConfError::Invalid("Invalid Shadowsocks port.".into()));
             }
             let key = server.password.clone().unwrap_or_default();
             if key.is_empty() {
@@ -843,14 +824,11 @@ impl ShadowsocksOutboundSettings {
             });
         }
         // Go :249-283 旧 AEAD（servers==1 时 :251-252 的 multi-server 2022 检查不可达）。
-        let address = server
-            .address
-            .clone()
-            .ok_or_else(|| crate::error::ConfError::Invalid("Shadowsocks server address is not set.".into()))?;
+        let address = server.address.clone().ok_or_else(|| {
+            crate::error::ConfError::Invalid("Shadowsocks server address is not set.".into())
+        })?;
         if server.port == 0 {
-            return Err(crate::error::ConfError::Invalid(
-                "Invalid Shadowsocks port.".into(),
-            ));
+            return Err(crate::error::ConfError::Invalid("Invalid Shadowsocks port.".into()));
         }
         let password = server.password.clone().unwrap_or_default();
         if password.is_empty() {
@@ -925,9 +903,9 @@ pub struct HttpOutboundSettings {
 }
 
 /// HTTP 出站 `servers[i].users[j]` 元素。对应 Go `HTTPRemoteConfig.Users`
-///（`json.RawMessage`，http.go:55）在 `HTTPClientConfig.Build` 中被同时
+/// （`json.RawMessage`，http.go:55）在 `HTTPClientConfig.Build` 中被同时
 /// 反序列化为 `protocol.User`（level/email，:93-102）与 `HTTPAccount`
-///（user/pass，:103-111）的联合字段面。
+/// （user/pass，:103-111）的联合字段面。
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HttpRemoteUserConfig {
@@ -1028,27 +1006,23 @@ impl HttpOutboundSettings {
 
         // Go :93-115：至多一个 user；顶层折叠路径取顶层字段，servers 路径取
         // users[0] 自身字段（raw JSON 同时喂 protocol.User 与 HTTPAccount）。
-        let user = server
-            .users
-            .as_ref()
-            .and_then(|users| users.first())
-            .map(|u| {
-                if self.address.is_some() {
-                    HttpClientUserBuild {
-                        level: self.level.unwrap_or_default(),
-                        email: self.email.clone().unwrap_or_default(),
-                        username: self.user.clone().unwrap_or_default(),
-                        password: self.pass.clone().unwrap_or_default(),
-                    }
-                } else {
-                    HttpClientUserBuild {
-                        level: u.level.unwrap_or_default(),
-                        email: u.email.clone().unwrap_or_default(),
-                        username: u.user.clone().unwrap_or_default(),
-                        password: u.pass.clone().unwrap_or_default(),
-                    }
+        let user = server.users.as_ref().and_then(|users| users.first()).map(|u| {
+            if self.address.is_some() {
+                HttpClientUserBuild {
+                    level: self.level.unwrap_or_default(),
+                    email: self.email.clone().unwrap_or_default(),
+                    username: self.user.clone().unwrap_or_default(),
+                    password: self.pass.clone().unwrap_or_default(),
                 }
-            });
+            } else {
+                HttpClientUserBuild {
+                    level: u.level.unwrap_or_default(),
+                    email: u.email.clone().unwrap_or_default(),
+                    username: u.user.clone().unwrap_or_default(),
+                    password: u.pass.clone().unwrap_or_default(),
+                }
+            }
+        });
 
         // Go :119-125：headers map → Header 列表（key/value 对）。
         let mut headers: Vec<HttpHeaderBuild> = self
@@ -1056,21 +1030,13 @@ impl HttpOutboundSettings {
             .as_ref()
             .map(|m| {
                 m.iter()
-                    .map(|(k, v)| HttpHeaderBuild {
-                        key: k.clone(),
-                        value: v.clone(),
-                    })
+                    .map(|(k, v)| HttpHeaderBuild { key: k.clone(), value: v.clone() })
                     .collect()
             })
             .unwrap_or_default();
         headers.sort_by(|a, b| a.key.cmp(&b.key));
 
-        Ok(HttpClientBuild {
-            address: server.address.clone(),
-            port: server.port,
-            user,
-            headers,
-        })
+        Ok(HttpClientBuild { address: server.address.clone(), port: server.port, user, headers })
     }
 }
 
@@ -1181,9 +1147,7 @@ impl PartialEq for LoopbackOutboundSettings {
         self.inbound_tag == other.inbound_tag
             && match (&self.sniffing, &other.sniffing) {
                 (None, None) => true,
-                (Some(a), Some(b)) => {
-                    serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
-                }
+                (Some(a), Some(b)) => serde_json::to_value(a).ok() == serde_json::to_value(b).ok(),
                 _ => false,
             }
     }
@@ -1242,7 +1206,10 @@ fn opt<T: serde::de::DeserializeOwned>(v: Value) -> Result<Option<T>, serde_json
 }
 
 /// 按 Go `protocol` 字段名将 JSON `Value` 转换为对应的出站 settings。
-pub fn dispatch_outbound_settings(protocol: &str, v: Value) -> Result<Option<OutboundSettings>, serde_json::Error> {
+pub fn dispatch_outbound_settings(
+    protocol: &str,
+    v: Value,
+) -> Result<Option<OutboundSettings>, serde_json::Error> {
     let out = match protocol {
         "vless" => opt::<VLessOutboundSettings>(v)?.map(OutboundSettings::Vless),
         "vmess" => opt::<VMessOutboundSettings>(v)?.map(OutboundSettings::Vmess),
@@ -1261,7 +1228,10 @@ pub fn dispatch_outbound_settings(protocol: &str, v: Value) -> Result<Option<Out
 }
 
 /// 按 Go `protocol` 字段名将 JSON `Value` 转换为对应的入站 settings。
-pub fn dispatch_inbound_settings(protocol: &str, v: Value) -> Result<Option<InboundSettings>, serde_json::Error> {
+pub fn dispatch_inbound_settings(
+    protocol: &str,
+    v: Value,
+) -> Result<Option<InboundSettings>, serde_json::Error> {
     let out = match protocol {
         "vless" => opt::<VLessInboundSettings>(v)?.map(InboundSettings::Vless),
         "vmess" => opt::<VMessInboundSettings>(v)?.map(InboundSettings::Vmess),
@@ -1269,7 +1239,9 @@ pub fn dispatch_inbound_settings(protocol: &str, v: Value) -> Result<Option<Inbo
         "shadowsocks" => opt::<ShadowsocksInboundSettings>(v)?.map(InboundSettings::Shadowsocks),
         "socks" | "mixed" => opt::<SocksInboundSettings>(v)?.map(InboundSettings::Socks),
         "http" => opt::<HttpInboundSettings>(v)?.map(InboundSettings::Http),
-        "dokodemo-door" => opt::<DokodemoDoorInboundSettings>(v)?.map(InboundSettings::DokodemoDoor),
+        "dokodemo-door" => {
+            opt::<DokodemoDoorInboundSettings>(v)?.map(InboundSettings::DokodemoDoor)
+        },
         "hysteria" => opt::<HysteriaInboundSettings>(v)?.map(InboundSettings::Hysteria),
         "blackhole" | "block" => opt::<BlackholeSettings>(v)?.map(InboundSettings::Blackhole),
         _ => None,
@@ -1296,10 +1268,7 @@ mod tests {
                 "vmess",
                 r#"{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","security":"aes-128-gcm"}]}"#,
             ),
-            (
-                "trojan",
-                r#"{"clients":[{"password":"test-pass-12345","email":"a@b"}]}"#,
-            ),
+            ("trojan", r#"{"clients":[{"password":"test-pass-12345","email":"a@b"}]}"#),
             (
                 "shadowsocks",
                 r#"{"method":"aes-256-gcm","password":"secret","network":["tcp","udp"]}"#,
@@ -1309,14 +1278,8 @@ mod tests {
                 // SS2022 入口靠 method 字段名"2022-blake3-aes-*-gcm" 触发。
                 r#"{"method":"2022-blake3-aes-256-gcm","password":"AAAA"}"#,
             ),
-            (
-                "socks",
-                r#"{"auth":"password","accounts":[{"user":"u","pass":"p"}],"udp":true}"#,
-            ),
-            (
-                "http",
-                r#"{"accounts":[{"user":"u","pass":"p"}],"allowTransparent":true}"#,
-            ),
+            ("socks", r#"{"auth":"password","accounts":[{"user":"u","pass":"p"}],"udp":true}"#),
+            ("http", r#"{"accounts":[{"user":"u","pass":"p"}],"allowTransparent":true}"#),
             (
                 "http",
                 // users 键方向（与 accounts 别名双向）。
@@ -1326,10 +1289,7 @@ mod tests {
                 "dokodemo-door",
                 r#"{"address":"example.com","port":80,"network":["tcp"],"followRedirect":true}"#,
             ),
-            (
-                "hysteria",
-                r#"{"version":2,"users":[{"auth":"secret-token"}]}"#,
-            ),
+            ("hysteria", r#"{"version":2,"users":[{"auth":"secret-token"}]}"#),
         ];
         for (proto, raw) in cases {
             let v: Value = serde_json::from_str(raw).unwrap();
@@ -1382,26 +1342,11 @@ mod tests {
                 // 顶层折叠路径（address/port/level/email/user/pass）。
                 r#"{"address":"1.2.3.4","port":8080,"level":1,"email":"e@x.y","user":"u","pass":"p"}"#,
             ),
-            (
-                "freedom",
-                r#"{"domainStrategy":"UseIP","userLevel":0}"#,
-            ),
-            (
-                "blackhole",
-                r#"{"response":{"type":"http"}}"#,
-            ),
-            (
-                "loopback",
-                r#"{"inboundTag":"in"}"#,
-            ),
-            (
-                "hysteria",
-                r#"{"version":2,"address":"example.com","port":443}"#,
-            ),
-            (
-                "dns",
-                r#"{"servers":[{"address":"1.1.1.1","port":53}],"queryStrategy":"UseIP"}"#,
-            ),
+            ("freedom", r#"{"domainStrategy":"UseIP","userLevel":0}"#),
+            ("blackhole", r#"{"response":{"type":"http"}}"#),
+            ("loopback", r#"{"inboundTag":"in"}"#),
+            ("hysteria", r#"{"version":2,"address":"example.com","port":443}"#),
+            ("dns", r#"{"servers":[{"address":"1.1.1.1","port":53}],"queryStrategy":"UseIP"}"#),
         ];
         for (proto, raw) in cases {
             let v: Value = serde_json::from_str(raw).unwrap();
@@ -1502,9 +1447,7 @@ mod tests {
         assert_eq!(back["inboundTag"], "socks-in");
         assert_eq!(back["sniffing"]["destOverride"], serde_json::json!(["http", "tls"]));
         assert_eq!(back["sniffing"]["routeOnly"], true);
-        let reparsed = dispatch_outbound_settings("loopback", back.clone())
-            .unwrap()
-            .unwrap();
+        let reparsed = dispatch_outbound_settings("loopback", back.clone()).unwrap().unwrap();
         assert_eq!(serde_json::to_value(&reparsed).unwrap(), back);
     }
 
@@ -1640,14 +1583,10 @@ mod tests {
         assert_eq!(back["servers"][0]["uot"], true);
         assert_eq!(back["servers"][0]["uotVersion"], 1);
         match s.build().unwrap() {
-            ShadowsocksClientBuild::Ss2022 {
-                udp_over_tcp,
-                udp_over_tcp_version,
-                ..
-            } => {
+            ShadowsocksClientBuild::Ss2022 { udp_over_tcp, udp_over_tcp_version, .. } => {
                 assert!(udp_over_tcp);
                 assert_eq!(udp_over_tcp_version, 1);
-            }
+            },
             other => panic!("expected Ss2022, got {other:?}"),
         }
 
@@ -1657,14 +1596,10 @@ mod tests {
             "uot":true,"uotVersion":2}"#;
         let s: ShadowsocksOutboundSettings = serde_json::from_str(folded).unwrap();
         match s.build().unwrap() {
-            ShadowsocksClientBuild::Ss2022 {
-                udp_over_tcp,
-                udp_over_tcp_version,
-                ..
-            } => {
+            ShadowsocksClientBuild::Ss2022 { udp_over_tcp, udp_over_tcp_version, .. } => {
                 assert!(udp_over_tcp);
                 assert_eq!(udp_over_tcp_version, 2);
-            }
+            },
             other => panic!("expected Ss2022, got {other:?}"),
         }
 
@@ -1673,14 +1608,10 @@ mod tests {
             "method":"2022-blake3-aes-256-gcm","password":"aGk="}]}"#;
         let s: ShadowsocksOutboundSettings = serde_json::from_str(plain).unwrap();
         match s.build().unwrap() {
-            ShadowsocksClientBuild::Ss2022 {
-                udp_over_tcp,
-                udp_over_tcp_version,
-                ..
-            } => {
+            ShadowsocksClientBuild::Ss2022 { udp_over_tcp, udp_over_tcp_version, .. } => {
                 assert!(!udp_over_tcp);
                 assert_eq!(udp_over_tcp_version, 0);
-            }
+            },
             other => panic!("expected Ss2022, got {other:?}"),
         }
     }
@@ -1692,10 +1623,7 @@ mod tests {
             "users":[{"password":"dXNlcg=="}]}"#;
         let s: ShadowsocksInboundSettings = serde_json::from_str(raw).unwrap();
         let err = s.build().unwrap_err().to_string();
-        assert!(
-            err.contains("only blake3-aes-*-gcm methods are supported"),
-            "got: {err}"
-        );
+        assert!(err.contains("only blake3-aes-*-gcm methods are supported"), "got: {err}");
     }
 
     #[test]
@@ -1714,7 +1642,7 @@ mod tests {
                 assert_eq!(users[0].email, "a@b");
                 assert_eq!(users[0].level, 2);
                 assert_eq!(users[1].key, "dXNlcjI=");
-            }
+            },
             other => panic!("expected Ss2022MultiUser, got {other:?}"),
         }
     }
@@ -1729,7 +1657,7 @@ mod tests {
                 assert_eq!(method, "2022-blake3-aes-256-gcm");
                 assert_eq!(key, "aGk=");
                 assert_eq!(email, "s@x");
-            }
+            },
             other => panic!("expected Ss2022Single, got {other:?}"),
         }
         // users[0].address 存在 → relay 分支（non-goal，显式报错）。
@@ -1755,7 +1683,7 @@ mod tests {
             ShadowsocksServerBuild::LegacyAead { users, .. } => {
                 assert_eq!(users.len(), 1);
                 assert_eq!(users[0].cipher, ShadowsocksMethod::None);
-            }
+            },
             other => panic!("expected LegacyAead, got {other:?}"),
         }
         // 顶层未知 cipher 报错。
@@ -1780,7 +1708,7 @@ mod tests {
                 assert_eq!(users[0].cipher, ShadowsocksMethod::ChaCha20Poly1305);
                 assert_eq!(users[0].email, "a@b");
                 assert_eq!(users[1].cipher, ShadowsocksMethod::Aes128Gcm);
-            }
+            },
             other => panic!("expected LegacyAead, got {other:?}"),
         }
         // per-user none 越界被拒（proto NONE=9 > XCHACHA=8，Go :79-81）。
@@ -1836,7 +1764,7 @@ mod tests {
                 assert_eq!(email, "a@b");
                 assert_eq!(password, "secret");
                 assert_eq!(cipher, ShadowsocksMethod::Aes256Gcm);
-            }
+            },
             other => panic!("expected LegacyAead, got {other:?}"),
         }
         // 旧 AEAD 未知 cipher / 空 password / port 0。
@@ -1845,11 +1773,7 @@ mod tests {
         assert!(s.build().unwrap_err().to_string().contains("unknown cipher method"));
         let raw = r#"{"servers":[{"address":"a","port":8388,"method":"aes-256-gcm"}]}"#;
         let s: ShadowsocksOutboundSettings = serde_json::from_str(raw).unwrap();
-        assert!(s
-            .build()
-            .unwrap_err()
-            .to_string()
-            .contains("password is not specified"));
+        assert!(s.build().unwrap_err().to_string().contains("password is not specified"));
         let raw = r#"{"servers":[{"address":"a","port":0,"method":"aes-256-gcm","password":"p"}]}"#;
         let s: ShadowsocksOutboundSettings = serde_json::from_str(raw).unwrap();
         assert!(s.build().unwrap_err().to_string().contains("Invalid Shadowsocks port"));
@@ -1898,7 +1822,7 @@ mod tests {
     }
 
     /// HTTP 入站 users/accounts alias：双向解析 + build 时 accounts 覆盖 users
-    ///（Go http.go:38-40，`Accounts != nil` 判定含空切片）。
+    /// （Go http.go:38-40，`Accounts != nil` 判定含空切片）。
     #[test]
     fn http_inbound_accounts_alias_overrides_users() {
         // accounts 优先。
@@ -1920,10 +1844,9 @@ mod tests {
         assert!(s.build().accounts.is_empty());
 
         // 双键 round-trip（serde 层别名双向）。
-        for raw in [
-            r#"{"users":[{"user":"u","pass":"p"}]}"#,
-            r#"{"accounts":[{"user":"u","pass":"p"}]}"#,
-        ] {
+        for raw in
+            [r#"{"users":[{"user":"u","pass":"p"}]}"#, r#"{"accounts":[{"user":"u","pass":"p"}]}"#]
+        {
             let s: HttpInboundSettings = serde_json::from_str(raw).unwrap();
             let back = serde_json::to_string(&s).unwrap();
             let v: Value = serde_json::from_str(&back).unwrap();
@@ -1988,14 +1911,18 @@ mod tests {
     }
 
     /// HTTP 出站 user 两条路径（Go http.go:93-115）：顶层折叠取顶层字段
-    ///（username 非空才挂）；servers 路径取 users[0] 自身字段。
+    /// （username 非空才挂）；servers 路径取 users[0] 自身字段。
     #[test]
     fn http_outbound_user_from_legacy_and_server_paths() {
         // 顶层折叠路径。
-        let raw = r#"{"address":"1.2.3.4","port":8080,"level":3,"email":"e@x.y","user":"u","pass":"p"}"#;
+        let raw =
+            r#"{"address":"1.2.3.4","port":8080,"level":3,"email":"e@x.y","user":"u","pass":"p"}"#;
         let s: HttpOutboundSettings = serde_json::from_str(raw).unwrap();
         let u = s.build().unwrap().user.expect("user attached");
-        assert_eq!((u.level, u.email.as_str(), u.username.as_str(), u.password.as_str()), (3, "e@x.y", "u", "p"));
+        assert_eq!(
+            (u.level, u.email.as_str(), u.username.as_str(), u.password.as_str()),
+            (3, "e@x.y", "u", "p")
+        );
 
         // 顶层 username 为空 → 不挂 user（Go :78 只查 Username）。
         let raw = r#"{"address":"1.2.3.4","port":8080,"pass":"p"}"#;
@@ -2007,7 +1934,10 @@ mod tests {
             "users":[{"level":5,"email":"s@x.y","user":"su","pass":"sp"}]}]}"#;
         let s: HttpOutboundSettings = serde_json::from_str(raw).unwrap();
         let u = s.build().unwrap().user.expect("user attached");
-        assert_eq!((u.level, u.email.as_str(), u.username.as_str(), u.password.as_str()), (5, "s@x.y", "su", "sp"));
+        assert_eq!(
+            (u.level, u.email.as_str(), u.username.as_str(), u.password.as_str()),
+            (5, "s@x.y", "su", "sp")
+        );
 
         // servers 路径空 users → 无 user。
         let s: HttpOutboundSettings =
@@ -2022,18 +1952,13 @@ mod tests {
         let raw = r#"{"servers":[{"address":"a","port":80}],"headers":{"B":"2","A":"1","C":"3"}}"#;
         let s: HttpOutboundSettings = serde_json::from_str(raw).unwrap();
         let b = s.build().unwrap();
-        let pairs: Vec<(&str, &str)> = b
-            .headers
-            .iter()
-            .map(|h| (h.key.as_str(), h.value.as_str()))
-            .collect();
+        let pairs: Vec<(&str, &str)> =
+            b.headers.iter().map(|h| (h.key.as_str(), h.value.as_str())).collect();
         assert_eq!(pairs, vec![("A", "1"), ("B", "2"), ("C", "3")]);
 
         // 无 headers → 空列表（Go :119 仍 make 空 slice）。
         let s: HttpOutboundSettings =
             serde_json::from_str(r#"{"servers":[{"address":"a","port":80}]}"#).unwrap();
         assert!(s.build().unwrap().headers.is_empty());
-
+    }
 }
-}
-

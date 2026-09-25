@@ -4,9 +4,10 @@
 //! Go 端 `curve25519.go` 仅提供 `Curve25519Genkey` 实现（x25519 与 wg 共用，差别只在
 //! 编码与 `-i` 语义），Rust 端 `xray x25519` 以 clap alias `curve25519` 提供双别名。
 
-use base64::engine::general_purpose::GeneralPurpose;
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use base64::Engine;
+use base64::{
+    Engine,
+    engine::general_purpose::{GeneralPurpose, STANDARD, URL_SAFE_NO_PAD},
+};
 use clap::Args;
 
 use crate::error::CliError;
@@ -109,11 +110,7 @@ pub fn gen_mldsa65(seed: [u8; 32]) -> [u8; 1952] {
 
 /// x25519 / curve25519 execute。
 pub fn execute_x25519(args: &X25519Args) -> Result<(), CliError> {
-    let enc: &GeneralPurpose = if args.std_encoding {
-        &STANDARD
-    } else {
-        &URL_SAFE_NO_PAD
-    };
+    let enc: &GeneralPurpose = if args.std_encoding { &STANDARD } else { &URL_SAFE_NO_PAD };
     curve25519_genkey_print(non_empty(args.input.as_deref()), enc);
     Ok(())
 }
@@ -178,7 +175,7 @@ fn curve25519_genkey_print(input: Option<&str>, enc: &GeneralPurpose) {
             None => {
                 println!("Invalid length of X25519 private key.");
                 return;
-            }
+            },
         },
     };
     let (private, public, hash32) = gen_curve25519(input_key);
@@ -196,13 +193,13 @@ fn decode_seed<const N: usize>(input: Option<&str>, name: &str) -> Option<[u8; N
             let mut seed = [0u8; N];
             rand::rng().fill_bytes(&mut seed);
             Some(seed)
-        }
+        },
         Some(s) => match decode_fixed::<N>(&URL_SAFE_NO_PAD, s) {
             Some(seed) => Some(seed),
             None => {
                 println!("Invalid length of {name} seed.");
                 None
-            }
+            },
         },
     }
 }

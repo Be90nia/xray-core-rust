@@ -9,11 +9,9 @@
 //!
 //! 上层（如 dispatcher）接入时，提供 `RoutingData` 适配器即可。
 
-use std::collections::HashMap;
-use std::net::IpAddr;
+use std::{collections::HashMap, net::IpAddr};
 
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
+use xray_common::net::{network::Network, port::Port};
 
 /// 路由上下文，对应 Go `routing.Context`。
 ///
@@ -202,42 +200,55 @@ impl RoutingContext for RoutingData {
     fn get_target_ips(&self) -> &[IpAddr] {
         &self.target_ips
     }
+
     fn get_target_domain(&self) -> &str {
         &self.target_domain
     }
+
     fn get_target_port(&self) -> Port {
         self.target_port
     }
+
     fn get_source_ips(&self) -> &[IpAddr] {
         &self.source_ips
     }
+
     fn get_source_port(&self) -> Port {
         self.source_port
     }
+
     fn get_local_ips(&self) -> &[IpAddr] {
         &self.local_ips
     }
+
     fn get_local_port(&self) -> Port {
         self.local_port
     }
+
     fn get_vless_route(&self) -> Port {
         self.vless_route
     }
+
     fn get_network(&self) -> Network {
         self.network
     }
+
     fn get_user(&self) -> &str {
         &self.user
     }
+
     fn get_attributes(&self) -> &HashMap<String, String> {
         &self.attributes
     }
+
     fn get_inbound_tag(&self) -> &str {
         &self.inbound_tag
     }
+
     fn get_protocol(&self) -> &str {
         &self.protocol
     }
+
     fn get_skip_dns_resolve(&self) -> bool {
         self.skip_dns_resolve
     }
@@ -245,8 +256,9 @@ impl RoutingContext for RoutingData {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::Ipv4Addr;
+
+    use super::*;
 
     #[test]
     fn test_default_routing_data() {

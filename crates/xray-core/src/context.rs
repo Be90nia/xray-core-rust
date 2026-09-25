@@ -4,8 +4,8 @@
 //! Rust 端提供双轨制：
 //!
 //! 1. **显式参数**：调用方把 `Arc<Instance>` 作为函数参数传递。最简单、最显式。
-//! 2. **Task-local**：通过 [`tokio::task_local`] 在异步任务上下文中隐式传播，
-//!    对应 Go 的 `ctx.Value(xrayKey)`。适合深层调用链避免参数污染。
+//! 2. **Task-local**：通过 [`tokio::task_local`] 在异步任务上下文中隐式传播， 对应 Go 的
+//!    `ctx.Value(xrayKey)`。适合深层调用链避免参数污染。
 //!
 //! ## 选用建议
 //!
@@ -18,6 +18,7 @@
 //! Rust 端通过 [`with_detached`] 显式提供等价语义）。
 
 use std::sync::Arc;
+
 use tokio::task_local;
 
 use crate::Instance;
@@ -61,7 +62,9 @@ pub fn current() -> Option<Arc<Instance>> {
 ///
 /// 不在 [`scope`] 内调用时 panic，错误消息包含诊断提示。
 pub fn must_current() -> Arc<Instance> {
-    current().expect("Instance is not in task-local context; wrap the call with xray_core::context::scope")
+    current().expect(
+        "Instance is not in task-local context; wrap the call with xray_core::context::scope",
+    )
 }
 
 /// 在剥离其他上下文但保留 Instance 的新 task-local 中执行 `f`。
@@ -150,10 +153,7 @@ mod tests {
         // 内联 await 仍可读。
         let inst = Arc::new(Instance::new());
         let inst_clone = Arc::clone(&inst);
-        let found_in_scope = scope(inst_clone, async {
-            current().is_some()
-        })
-        .await;
+        let found_in_scope = scope(inst_clone, async { current().is_some() }).await;
         assert!(found_in_scope);
     }
 }

@@ -5,16 +5,16 @@
 //! 通过内嵌 HTML/JS 页面 + WebSocket 连接到浏览器扩展，将浏览器作为代理拨号器。
 //! 浏览器扩展加载内嵌页面后，通过 WS 接收任务（WS/GET/POST），在浏览器内发起请求并回传结果。
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::Mutex;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    sync::Mutex,
+};
+use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
 // ── 内嵌 HTML/JS 资源 ──────────────────────────────────────────────
 // 对应 Go 的 `//go:embed dialer.html`。将浏览器扩展页面作为 const str 内嵌。
@@ -107,12 +107,7 @@ impl BrowserDialer {
     pub fn new(config: BrowserDialerConfig) -> Self {
         let csrf_token = uuid::Uuid::new_v4().to_string();
         let html_page = DIALER_HTML_TEMPLATE.replace("csrfToken", &csrf_token);
-        Self {
-            config,
-            csrf_token,
-            conns: Arc::new(Mutex::new(Vec::new())),
-            html_page,
-        }
+        Self { config, csrf_token, conns: Arc::new(Mutex::new(Vec::new())), html_page }
     }
 
     #[must_use]
@@ -188,11 +183,7 @@ impl BrowserDialer {
                 h.remove("Referer");
                 Some(h)
             },
-            cookies: if cookies.is_empty() {
-                None
-            } else {
-                Some(cookies)
-            },
+            cookies: if cookies.is_empty() { None } else { Some(cookies) },
         };
 
         let task = BrowserTask {
@@ -223,11 +214,7 @@ impl BrowserDialer {
                 h.remove("Referer");
                 Some(h)
             },
-            cookies: if cookies.is_empty() {
-                None
-            } else {
-                Some(cookies)
-            },
+            cookies: if cookies.is_empty() { None } else { Some(cookies) },
         };
 
         let task = BrowserTask {
@@ -259,7 +246,7 @@ impl BrowserDialer {
                 Some(c) => break c,
                 None => {
                     return Err(BrowserDialerError::NoConnection);
-                }
+                },
             }
         };
 
@@ -284,20 +271,16 @@ async fn check_ok<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<(), BrowserDialerError> {
     match conn.next().await {
         Some(Ok(Message::Text(msg))) if msg.as_str() == "ok" => Ok(()),
-        Some(Ok(Message::Text(msg))) => {
-            Err(BrowserDialerError::TaskRejected(msg.to_string()))
-        }
+        Some(Ok(Message::Text(msg))) => Err(BrowserDialerError::TaskRejected(msg.to_string())),
         Some(Ok(Message::Close(_))) => {
             Err(BrowserDialerError::ConnectionFailed("connection closed".to_string()))
-        }
+        },
         Some(Ok(_)) => {
             // 非 text 消息视为异常
             Err(BrowserDialerError::TaskRejected("unexpected message type".to_string()))
-        }
+        },
         Some(Err(e)) => Err(BrowserDialerError::from(e)),
-        None => Err(BrowserDialerError::ConnectionFailed(
-            "stream ended unexpectedly".to_string(),
-        )),
+        None => Err(BrowserDialerError::ConnectionFailed("stream ended unexpectedly".to_string())),
     }
 }
 
@@ -308,29 +291,30 @@ pub async fn upgrade_tcp_to_ws(
     expected_token: &str,
 ) -> Result<WebSocketStream<tokio::net::TcpStream>, BrowserDialerError> {
     // tokio-tungstenite 的 accept_hdr_async 支持在握手时检查请求
-    let callback = |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                    resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
-        // 验证 CSRF token
-        let token_ok = req
-            .uri()
-            .query()
-            .map(|q| q.contains(&format!("token={expected_token}")))
-            .unwrap_or(false);
+    let callback =
+        |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+         resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
+            // 验证 CSRF token
+            let token_ok = req
+                .uri()
+                .query()
+                .map(|q| q.contains(&format!("token={expected_token}")))
+                .unwrap_or(false);
 
-        if token_ok {
-            Ok(resp)
-        } else {
-            let denied = tokio_tungstenite::tungstenite::http::Response::builder()
-                .status(403)
-                .body(Some("invalid token".into()))
-                .map_err(|e| {
-                    tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(
-                        Some(e.to_string().into()),
-                    )
-                })?;
-            Err(denied)
-        }
-    };
+            if token_ok {
+                Ok(resp)
+            } else {
+                let denied = tokio_tungstenite::tungstenite::http::Response::builder()
+                    .status(403)
+                    .body(Some("invalid token".into()))
+                    .map_err(|e| {
+                        tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(Some(
+                            e.to_string().into(),
+                        ))
+                    })?;
+                Err(denied)
+            }
+        };
 
     let ws = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
     Ok(ws)

@@ -3,20 +3,22 @@
 //! 对应 Go `transport/internet/tls/config.go::ConfigFromStreamSettings` (server side) +
 //! `getNewGetCertificateFunc`（SNI 多证书选择）。
 
-use std::io;
-use std::sync::Arc;
+use std::{io, sync::Arc};
 
-use rustls::server::WebPkiClientVerifier;
-use rustls::{RootCertStore, ServerConfig};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::server::{ClientHello, ResolvesServerCert};
-use rustls::sign::CertifiedKey;
-
-use crate::certificate::{
-    entry_certs_and_key, entry_usage, generate_self_signed_cert, EntryUsage,
-    extract_cert_names, pem_private_key,
+use rustls::{
+    RootCertStore, ServerConfig,
+    pki_types::{CertificateDer, PrivateKeyDer},
+    server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier},
+    sign::CertifiedKey,
 };
-use crate::config::security_params;
+
+use crate::{
+    certificate::{
+        EntryUsage, entry_certs_and_key, entry_usage, extract_cert_names,
+        generate_self_signed_cert, pem_private_key,
+    },
+    config::security_params,
+};
 
 // ============================================================
 // NamedCertKey：rustls CertifiedKey + 预提取的 SNI 名称
@@ -42,10 +44,7 @@ impl NamedCertKey {
         let signing = rustls::crypto::ring::sign::any_supported_type(&key)
             .map_err(|e| io::Error::other(format!("unsupported private key: {e}")))?;
         let names = cert_names(&certs);
-        Ok(Self {
-            key: Arc::new(CertifiedKey::new(certs, signing)),
-            names,
-        })
+        Ok(Self { key: Arc::new(CertifiedKey::new(certs, signing)), names })
     }
 }
 
@@ -87,10 +86,7 @@ impl SniCertResolver {
     /// 从命名证书列表构造。`reject_unknown` 对应 Go `Config.RejectUnknownSni`。
     #[must_use]
     pub fn new(entries: Vec<NamedCertKey>, reject_unknown: bool) -> Self {
-        Self {
-            entries,
-            reject_unknown,
-        }
+        Self { entries, reject_unknown }
     }
 
     /// 条目数。
@@ -128,11 +124,7 @@ impl SniCertResolver {
                 return Some(entry);
             }
         }
-        if self.reject_unknown {
-            None
-        } else {
-            Some(&self.entries[0])
-        }
+        if self.reject_unknown { None } else { Some(&self.entries[0]) }
     }
 }
 
@@ -151,7 +143,8 @@ impl ResolvesServerCert for SniCertResolver {
 /// 从 `streamSettings` 安全配置构建 rustls `ServerConfig`。
 ///
 /// # 参数
-/// - `security`：安全层名（`"none"` / `"tls"` / `"reality"`）。非 `"tls"` / `"reality"` 返回 `None`。
+/// - `security`：安全层名（`"none"` / `"tls"` / `"reality"`）。非 `"tls"` / `"reality"` 返回
+///   `None`。
 /// - `security_json`：`tlsSettings` 的 JSON 值。
 ///
 /// # 返回
@@ -171,19 +164,17 @@ impl ResolvesServerCert for SniCertResolver {
 /// feature）在握手层实现，参见 [`crate::ocsp_stapling`]。
 ///
 /// # pwh6: Go v26 TLS 字段族增量（服务端）
-/// - `masterKeyLog`：Go `tls.Config.KeyLogWriter`（transport_security.go→config.go:467-474）
-///   string 文件路径；`"none"`/空 = 显式禁用。Rust 历史方言 bool `true` = 写
-///   `SSLKEYLOGFILE` 环境变量指向的文件（[`rustls::KeyLogFile`]）。
+/// - `masterKeyLog`：Go `tls.Config.KeyLogWriter`（transport_security.go→config.go:467-474） string
+///   文件路径；`"none"`/空 = 显式禁用。Rust 历史方言 bool `true` = 写 `SSLKEYLOGFILE`
+///   环境变量指向的文件（[`rustls::KeyLogFile`]）。
 /// - `enableSessionResumption`：bool。默认 true（rustls 0.23 builder 默认开
-///   `ServerSessionMemoryCache(256)` + `NeverProducesTickets`）；false 时
-///   禁 ticket + session cache，对齐 Go
-///   `SessionTicketsDisabled=true` + `SessionCache=nil`。
-/// - 证书级字段（Go `TLSCertConfig`，transport_security.go:248-257，作用于
-///   `certificates[]` 每条目）：`ocspStapling`（uint64 热重载间隔秒，>0 启用
-///   OCSP 装订，接线 [`crate::ocsp_stapling`]）；`oneTimeLoading`（bool，禁
-///   证书热重载 ticker——Rust 无热重载，no-op）；`buildChain`（bool，Go v26.6.1
-///   实际未消费 BuildNameToCertificate 无条件调用；rustls resolver 恒用解析
-///   names，no-op）。
+///   `ServerSessionMemoryCache(256)` + `NeverProducesTickets`）；false 时 禁 ticket + session
+///   cache，对齐 Go `SessionTicketsDisabled=true` + `SessionCache=nil`。
+/// - 证书级字段（Go `TLSCertConfig`，transport_security.go:248-257，作用于 `certificates[]`
+///   每条目）：`ocspStapling`（uint64 热重载间隔秒，>0 启用 OCSP 装订，接线
+///   [`crate::ocsp_stapling`]）；`oneTimeLoading`（bool，禁 证书热重载 ticker——Rust
+///   无热重载，no-op）；`buildChain`（bool，Go v26.6.1 实际未消费 BuildNameToCertificate
+///   无条件调用；rustls resolver 恒用解析 names，no-op）。
 pub fn build_server_config(
     security: &str,
     security_json: Option<&serde_json::Value>,
@@ -195,17 +186,12 @@ pub fn build_server_config(
     }
 
     let json = security_json.cloned().unwrap_or(serde_json::Value::Null);
-    let reject_unknown = json
-        .get("rejectUnknownSni")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let reject_unknown = json.get("rejectUnknownSni").and_then(|v| v.as_bool()).unwrap_or(false);
 
     // pwh6: TLS 字段族增量解析——所有字段缺失=默认行为，向前兼容。
     let master_key_log = parse_master_key_log(&json);
-    let enable_session_resumption = json
-        .get("enableSessionResumption")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    let enable_session_resumption =
+        json.get("enableSessionResumption").and_then(|v| v.as_bool()).unwrap_or(true);
     // 证书级键（ocspStapling/oneTimeLoading/buildChain）在 certificates[] 条目内
     // 解析（Go TLSCertConfig），见 cert_entry_flags / any_cert_ocsp_stapling。
 
@@ -255,7 +241,7 @@ pub fn build_server_config(
             match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
                 Ok(file) => {
                     config.key_log = Arc::new(KeyLogFileWriter(parking_lot::Mutex::new(file)));
-                }
+                },
                 Err(e) => tracing::warn!(
                     target: "xray_tls::server_config",
                     error = %e,
@@ -263,9 +249,9 @@ pub fn build_server_config(
                     "failed to open masterKeyLog as file; key log disabled"
                 ),
             }
-        }
+        },
         MasterKeyLogSetting::EnvFile => config.key_log = Arc::new(rustls::KeyLogFile::new()),
-        MasterKeyLogSetting::Off => {}
+        MasterKeyLogSetting::Off => {},
     }
 
     // pwh6: enableSessionResumption=false 禁用票据+session cache。
@@ -304,14 +290,12 @@ fn parse_alpn(json: &serde_json::Value) -> io::Result<Vec<Vec<u8>>> {
     if let Some(arr) = json.get("alpn").and_then(|v| v.as_array()) {
         arr.iter()
             .map(|s| {
-                s.as_str()
-                    .map(|x| x.as_bytes().to_vec())
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "alpn array must contain only strings",
-                        )
-                    })
+                s.as_str().map(|x| x.as_bytes().to_vec()).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "alpn array must contain only strings",
+                    )
+                })
             })
             .collect()
     } else {
@@ -337,7 +321,7 @@ pub(crate) fn parse_master_key_log(json: &serde_json::Value) -> MasterKeyLogSett
         Some(serde_json::Value::Bool(true)) => MasterKeyLogSetting::EnvFile,
         Some(serde_json::Value::String(s)) if !s.is_empty() && s != "none" => {
             MasterKeyLogSetting::Path(s.clone())
-        }
+        },
         _ => MasterKeyLogSetting::Off,
     }
 }
@@ -349,9 +333,8 @@ pub(crate) struct KeyLogFileWriter(pub(crate) parking_lot::Mutex<std::fs::File>)
 impl rustls::KeyLog for KeyLogFileWriter {
     fn log(&self, label: &str, client_random: &[u8], secret: &[u8]) {
         use std::io::Write as _;
-        let mut line = String::with_capacity(
-            label.len() + 2 + (client_random.len() + secret.len()) * 2 + 1,
-        );
+        let mut line =
+            String::with_capacity(label.len() + 2 + (client_random.len() + secret.len()) * 2 + 1);
         line.push_str(label);
         line.push(' ');
         for byte in client_random {
@@ -385,18 +368,9 @@ struct CertEntryFlags {
 #[must_use]
 fn cert_entry_flags(entry: &serde_json::Value) -> CertEntryFlags {
     CertEntryFlags {
-        ocsp_stapling_secs: entry
-            .get("ocspStapling")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        one_time_loading: entry
-            .get("oneTimeLoading")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        build_chain: entry
-            .get("buildChain")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        ocsp_stapling_secs: entry.get("ocspStapling").and_then(|v| v.as_u64()).unwrap_or(0),
+        one_time_loading: entry.get("oneTimeLoading").and_then(|v| v.as_bool()).unwrap_or(false),
+        build_chain: entry.get("buildChain").and_then(|v| v.as_bool()).unwrap_or(false),
     }
 }
 
@@ -404,13 +378,11 @@ fn cert_entry_flags(entry: &serde_json::Value) -> CertEntryFlags {
 /// ticker 独立间隔；Rust 的 wrap 是 resolver 级全局开关，取"任一启用"）。
 #[must_use]
 fn any_cert_ocsp_stapling(json: &serde_json::Value) -> bool {
-    json.get("certificates")
-        .and_then(|v| v.as_array())
-        .is_some_and(|arr| {
-            arr.iter()
-                .filter(|e| entry_usage(e) == EntryUsage::Encipherment)
-                .any(|e| cert_entry_flags(e).ocsp_stapling_secs > 0)
-        })
+    json.get("certificates").and_then(|v| v.as_array()).is_some_and(|arr| {
+        arr.iter()
+            .filter(|e| entry_usage(e) == EntryUsage::Encipherment)
+            .any(|e| cert_entry_flags(e).ocsp_stapling_secs > 0)
+    })
 }
 
 /// 从 `tlsSettings` JSON 解析全部命名证书。
@@ -449,10 +421,9 @@ fn build_named_cert_keys(json: &serde_json::Value) -> io::Result<Vec<NamedCertKe
         }
     }
     if out.is_empty() {
-        if let (Some(cert_str), Some(key_str)) = (
-            json.get("cert").and_then(|x| x.as_str()),
-            json.get("key").and_then(|x| x.as_str()),
-        ) {
+        if let (Some(cert_str), Some(key_str)) =
+            (json.get("cert").and_then(|x| x.as_str()), json.get("key").and_then(|x| x.as_str()))
+        {
             out.push(NamedCertKey::from_cert_der(
                 pem_certs(cert_str.as_bytes())?,
                 pem_key(key_str.as_bytes())?,
@@ -515,9 +486,7 @@ mod tests {
         .unwrap();
         // 设 CN = 首个 SAN，避免 rcgen 默认 CN "rcgen self signed cert" 污染 names。
         params.distinguished_name = rcgen::DistinguishedName::new();
-        params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, sans[0]);
+        params.distinguished_name.push(rcgen::DnType::CommonName, sans[0]);
         let cert = params.self_signed(&key_pair).unwrap();
         (cert.pem(), key_pair.serialize_pem())
     }
@@ -543,12 +512,8 @@ mod tests {
 
     #[test]
     fn server_config_defaults_alpn() {
-        let config =
-            build_server_config("tls", Some(&serde_json::json!({}))).unwrap().unwrap();
-        assert_eq!(
-            config.alpn_protocols,
-            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
-        );
+        let config = build_server_config("tls", Some(&serde_json::json!({}))).unwrap().unwrap();
+        assert_eq!(config.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
     }
 
     #[test]
@@ -650,7 +615,10 @@ mod tests {
         install_provider();
         let (c, k) = leaf_cert(&["example.com"]);
         let e = named(&c, &k);
-        let r = SniCertResolver::new(vec![e.clone(), named(&leaf_cert(&["other.com"]).0, &leaf_cert(&["other.com"]).1)], false);
+        let r = SniCertResolver::new(
+            vec![e.clone(), named(&leaf_cert(&["other.com"]).0, &leaf_cert(&["other.com"]).1)],
+            false,
+        );
 
         // 大写 SNI 应回落小写后匹配
         let got = r.select(Some("EXAMPLE.COM")).unwrap();
@@ -719,11 +687,7 @@ aZ9A3Sng12a1YFnJcLOELh+loNChRANCAATG2iorYlDeMjaVlb7XdvtKt1Og/t5H
         let cfg = build_server_config("tls", Some(&json))
             .unwrap()
             .expect("tls config must build with mislabeled key");
-        assert_eq!(
-            cfg.alpn_protocols,
-            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
-        );
-
+        assert_eq!(cfg.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
     }
 
     // ===== pwh6: TLS 字段族增量行为测试 =====
@@ -732,14 +696,10 @@ aZ9A3Sng12a1YFnJcLOELh+loNChRANCAATG2iorYlDeMjaVlb7XdvtKt1Og/t5H
     #[test]
     fn pwh6_master_key_log_enables_key_log_file() {
         install_provider();
-        let cfg_off =
-            build_server_config("tls", Some(&serde_json::json!({}))).unwrap().unwrap();
-        let cfg_on = build_server_config(
-            "tls",
-            Some(&serde_json::json!({ "masterKeyLog": true })),
-        )
-        .unwrap()
-        .unwrap();
+        let cfg_off = build_server_config("tls", Some(&serde_json::json!({}))).unwrap().unwrap();
+        let cfg_on = build_server_config("tls", Some(&serde_json::json!({ "masterKeyLog": true })))
+            .unwrap()
+            .unwrap();
         // 两个 ServerConfig 的 key_log 字段内存地址不同（不同实例）。
         assert!(!std::sync::Arc::ptr_eq(&cfg_off.key_log, &cfg_on.key_log));
 
@@ -758,9 +718,7 @@ aZ9A3Sng12a1YFnJcLOELh+loNChRANCAATG2iorYlDeMjaVlb7XdvtKt1Og/t5H
         .unwrap();
         assert_eq!(cfg.send_tls13_tickets, 0);
         // session_storage 类型应是 NoServerSessionStorage（与默认不同实例）。
-        let default_s = build_server_config("tls", Some(&serde_json::json!({})))
-            .unwrap()
-            .unwrap();
+        let default_s = build_server_config("tls", Some(&serde_json::json!({}))).unwrap().unwrap();
         assert!(!std::sync::Arc::ptr_eq(&cfg.session_storage, &default_s.session_storage));
     }
 
@@ -782,9 +740,7 @@ aZ9A3Sng12a1YFnJcLOELh+loNChRANCAATG2iorYlDeMjaVlb7XdvtKt1Og/t5H
         )
         .unwrap()
         .unwrap();
-        let cfg_off = build_server_config("tls", Some(&serde_json::json!({})))
-            .unwrap()
-            .unwrap();
+        let cfg_off = build_server_config("tls", Some(&serde_json::json!({}))).unwrap().unwrap();
 
         // 不再抑制 ticket：与默认构建值一致。
         assert_eq!(cfg.send_tls13_tickets, cfg_off.send_tls13_tickets);
@@ -816,14 +772,8 @@ aZ9A3Sng12a1YFnJcLOELh+loNChRANCAATG2iorYlDeMjaVlb7XdvtKt1Og/t5H
         };
         let cfg_true = make(true);
         let cfg_false = make(false);
-        assert_eq!(
-            cfg_true.alpn_protocols,
-            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-        );
-        assert_eq!(
-            cfg_false.alpn_protocols,
-            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-        );
+        assert_eq!(cfg_true.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()],);
+        assert_eq!(cfg_false.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()],);
     }
 
     /// 默认 `ocspStapling=false` 时返回原 ServerConfig（不经过 ocsp-stapling 包装器）。
@@ -832,9 +782,7 @@ aZ9A3Sng12a1YFnJcLOELh+loNChRANCAATG2iorYlDeMjaVlb7XdvtKt1Og/t5H
     #[test]
     fn pwh6_ocsp_stapling_default_off_builds_plain_server_config() {
         install_provider();
-        let cfg = build_server_config("tls", Some(&serde_json::json!({})))
-            .unwrap()
-            .unwrap();
+        let cfg = build_server_config("tls", Some(&serde_json::json!({}))).unwrap().unwrap();
         // alpn 默认
         assert_eq!(cfg.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
     }
@@ -844,12 +792,7 @@ aZ9A3Sng12a1YFnJcLOELh+loNChRANCAATG2iorYlDeMjaVlb7XdvtKt1Og/t5H
     fn temp_keylog_path(tag: &str) -> std::path::PathBuf {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "xray_tls_8k4s_{}_{}_{}.log",
-            tag,
-            std::process::id(),
-            n
-        ))
+        std::env::temp_dir().join(format!("xray_tls_8k4s_{}_{}_{}.log", tag, std::process::id(), n))
     }
 
     /// `masterKeyLog` 四态解析：缺失/false/空串/"none" → Off；
@@ -872,10 +815,7 @@ aZ9A3Sng12a1YFnJcLOELh+loNChRANCAATG2iorYlDeMjaVlb7XdvtKt1Og/t5H
         assert_eq!(parse_master_key_log(&env), MasterKeyLogSetting::EnvFile);
 
         let path = serde_json::json!({ "masterKeyLog": "keys.log" });
-        assert_eq!(
-            parse_master_key_log(&path),
-            MasterKeyLogSetting::Path("keys.log".into())
-        );
+        assert_eq!(parse_master_key_log(&path), MasterKeyLogSetting::Path("keys.log".into()));
     }
 
     /// KeyLogFileWriter 写出 NSS 行：`label client_random_hex secret_hex\n`，
@@ -895,10 +835,7 @@ aZ9A3Sng12a1YFnJcLOELh+loNChRANCAATG2iorYlDeMjaVlb7XdvtKt1Og/t5H
         std::fs::remove_file(&path).ok();
         let mut lines = content.lines();
         assert_eq!(lines.next(), Some("CLIENT_RANDOM 0102 aa"));
-        assert_eq!(
-            lines.next(),
-            Some("CLIENT_HANDSHAKE_TRAFFIC_SECRET 03 bbcc")
-        );
+        assert_eq!(lines.next(), Some("CLIENT_HANDSHAKE_TRAFFIC_SECRET 03 bbcc"));
         assert_eq!(lines.next(), None);
     }
 

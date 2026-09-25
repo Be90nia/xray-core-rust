@@ -4,10 +4,10 @@
 //! `SubjectSelector` 非空时启动 background 探测循环。
 //!
 //! IO 注入：
-//! - selector：在 [`BurstObservatoryFeature::start`] 时用 `subject_selector`
-//!   闭包构造（固定筛选，与 Go `SubjectSelector` 等价）。
-//! - executor：通过 [`set_io`](Self::set_io) 在装配阶段注入
-//!   （对应 Go `New()` 中 RequireFeatures 拿 outbound.Manager + dispatcher）。
+//! - selector：在 [`BurstObservatoryFeature::start`] 时用 `subject_selector` 闭包构造（固定筛选，与
+//!   Go `SubjectSelector` 等价）。
+//! - executor：通过 [`set_io`](Self::set_io) 在装配阶段注入 （对应 Go `New()` 中 RequireFeatures 拿
+//!   outbound.Manager + dispatcher）。
 //!
 //! `set_io` 注入后 `start` 启动 `BurstObserver::start_scheduler`。
 //! 未注入时 `start` 返 StartFailed——让 Instance 装配失败早暴露（f23r 模式）。
@@ -15,11 +15,12 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-
 use xray_features::{Feature, FeatureError, Result};
 
-use crate::burst::{BurstObserver, HealthPingConfig, HealthPingSettings};
-use crate::observer::{HttpProbeExecutor, ProbeExecutor};
+use crate::{
+    burst::{BurstObserver, HealthPingConfig, HealthPingSettings},
+    observer::{HttpProbeExecutor, ProbeExecutor},
+};
 
 /// Burst Observatory app Feature 实现。包装 [`BurstObserver`] + 调度 IO。
 pub struct BurstObservatoryFeature {
@@ -91,11 +92,9 @@ impl Feature for BurstObservatoryFeature {
                 let subject = self.subject_selector.clone();
                 let selector: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                     Arc::new(move || subject.clone());
-                self.observer
-                    .clone()
-                    .start_scheduler(selector, executor);
+                self.observer.clone().start_scheduler(selector, executor);
                 Ok(())
-            }
+            },
             None => Err(FeatureError::StartFailed {
                 name: "burstObservatory",
                 message: "executor not injected (call set_io before start)".to_string(),
@@ -135,8 +134,7 @@ impl Feature for BurstObservatoryFeature {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ProbeResult;
-    use crate::observer::FixedProbeExecutor;
+    use crate::{config::ProbeResult, observer::FixedProbeExecutor};
 
     #[test]
     fn new_empty_subject_noop() {
@@ -160,13 +158,10 @@ mod tests {
     #[tokio::test]
     async fn start_with_executor_runs_scheduler() {
         let f = BurstObservatoryFeature::new(vec!["out-a".to_string()], None);
-        let executor: Arc<dyn ProbeExecutor> = Arc::new(
-            FixedProbeExecutor::new().with_result("out-a", ProbeResult {
-                alive: true,
-                delay: 100,
-                last_error_reason: String::new(),
-            }),
-        );
+        let executor: Arc<dyn ProbeExecutor> = Arc::new(FixedProbeExecutor::new().with_result(
+            "out-a",
+            ProbeResult { alive: true, delay: 100, last_error_reason: String::new() },
+        ));
         f.set_io(executor);
         f.start().expect("with executor should start");
         assert!(f.observer.is_scheduler_running());
@@ -210,8 +205,7 @@ mod tests {
             "timeout": 500_000_000i64,
         });
         let f = BurstObservatoryFeature::new(vec!["out-a".to_string()], Some(&ping));
-        f.start()
-            .expect_err("without bag injection start must still fail");
+        f.start().expect_err("without bag injection start must still fail");
 
         let sel: Arc<dyn xray_features::OutboundTagSelector> = Arc::new(NoTags);
         let bag = xray_features::DepBag::new().with_outbound_selector(sel);

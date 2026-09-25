@@ -2,8 +2,8 @@
 //!
 //! 对应 Go [`sagernet/sing` `common/uot`](https://github.com/sagernet/sing/tree/v0.5.1/common/uot)：
 //!
-//! - [`UotServerConn`] — 服务器端：将 `tokio::net::UdpSocket` 包成 `Connection`（双向流），
-//!   内部用 `tokio::io::DuplexStream` 桥接，spawn 两个 pump task 在 UDP 与流之间搬运。
+//! - [`UotServerConn`] — 服务器端：将 `tokio::net::UdpSocket` 包成 `Connection`（双向流）， 内部用
+//!   `tokio::io::DuplexStream` 桥接，spawn 两个 pump task 在 UDP 与流之间搬运。
 //! - [`UotClientConn`] — 客户端：将 `Connection`（双向 TCP 流）包成 UDP 风格的
 //!   `write_to`/`read_from` 接口。
 //!
@@ -16,8 +16,8 @@
 //!
 //! - `0x00` = IPv4（4 字节地址）
 //! - `0x01` = IPv6（16 字节地址）
-//! - `0x02` = 域名（`[len:1][bytes...]`）— 仅在编码端支持；解码遇到域名返回错误
-//!   （UotServerConn / UotClientConn 测试场景不依赖域名目标）。
+//! - `0x02` = 域名（`[len:1][bytes...]`）— 仅在编码端支持；解码遇到域名返回错误 （UotServerConn /
+//!   UotClientConn 测试场景不依赖域名目标）。
 //!
 //! Request 头（仅 `UotVersion::Current`，对应 Go sing `Version=2`）：
 //!
@@ -37,15 +37,19 @@
 //! 与 sing v0.5.1 的 `MagicAddress` / `LegacyMagicAddress`
 //! （`"sp.v2.udp-over-tcp.arpa"` / `"sp.udp-over-tcp.arpa"`）字符串差异的占位映射。
 //! 包装层不依赖魔术域名字符串，只看 `UotVersion`。
-use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::{
+    io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UdpSocket;
-use tokio::task::JoinHandle;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::UdpSocket,
+    task::JoinHandle,
+};
+use xray_transport::connection::{Connection, DuplexConnection};
 
 use super::handler::UotVersion;
-use xray_transport::connection::{Connection, DuplexConnection};
 
 /// UoT duplex 缓冲（与 hysteria / tuic / ss dispatcher 一致：64 KiB）。
 const DUPLEX_BUF_SIZE: usize = 64 * 1024;
@@ -69,11 +73,11 @@ fn encode_socksaddr(buf: &mut Vec<u8>, addr: SocketAddr) -> io::Result<()> {
         IpAddr::V4(v4) => {
             buf.push(ADDR_IPV4);
             buf.extend_from_slice(&v4.octets());
-        }
+        },
         IpAddr::V6(v6) => {
             buf.push(ADDR_IPV6);
             buf.extend_from_slice(&v6.octets());
-        }
+        },
     }
     buf.extend_from_slice(&addr.port().to_be_bytes());
     Ok(())
@@ -84,51 +88,42 @@ fn encode_socksaddr(buf: &mut Vec<u8>, addr: SocketAddr) -> io::Result<()> {
 /// 返回 `(SocketAddr, consumed_bytes)`。
 fn decode_socksaddr(buf: &[u8], offset: usize) -> io::Result<(SocketAddr, usize)> {
     if offset >= buf.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "uot: short addr header",
-        ));
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "uot: short addr header"));
     }
     let family = buf[offset];
     let mut pos = offset + 1;
     let ip = match family {
         ADDR_IPV4 => {
             if buf.len() < pos + 4 + 2 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "uot: short ipv4 addr",
-                ));
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "uot: short ipv4 addr"));
             }
             let mut ip_bytes = [0u8; 4];
             ip_bytes.copy_from_slice(&buf[pos..pos + 4]);
             pos += 4;
             IpAddr::V4(Ipv4Addr::from(ip_bytes))
-        }
+        },
         ADDR_IPV6 => {
             if buf.len() < pos + 16 + 2 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "uot: short ipv6 addr",
-                ));
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "uot: short ipv6 addr"));
             }
             let mut ip_bytes = [0u8; 16];
             ip_bytes.copy_from_slice(&buf[pos..pos + 16]);
             pos += 16;
             IpAddr::V6(Ipv6Addr::from(ip_bytes))
-        }
+        },
         ADDR_DOMAIN => {
             // 解码域名需要 DNS 解析；UoT 层不在此解析。
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "uot: domain addr decoding not supported",
             ));
-        }
+        },
         other => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("uot: unknown addr family {other}"),
             ));
-        }
+        },
     };
     let port = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
     pos += 2;
@@ -146,10 +141,7 @@ fn encode_request(buf: &mut Vec<u8>, is_connect: bool, dest: SocketAddr) -> io::
 /// 解码 request 头。返回 `(is_connect, dest, total_consumed)`。
 fn decode_request(buf: &[u8]) -> io::Result<(bool, SocketAddr, usize)> {
     if buf.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "uot: short request header",
-        ));
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "uot: short request header"));
     }
     let is_connect = buf[0] != 0;
     let (dest, n) = decode_socksaddr(buf, 1)?;
@@ -175,7 +167,7 @@ fn try_parse_packet(
             Ok((a, n)) => {
                 pos += n;
                 a
-            }
+            },
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(e),
         }
@@ -231,13 +223,7 @@ impl UotServerConn {
         let pump_output = tokio::spawn(pump_output(server_w, udp_b));
 
         let conn: Box<dyn Connection> = Box::new(DuplexConnection::new(client_io));
-        Ok((
-            conn,
-            Self {
-                _pump_input: pump_input,
-                _pump_output: pump_output,
-            },
-        ))
+        Ok((conn, Self { _pump_input: pump_input, _pump_output: pump_output }))
     }
 }
 
@@ -345,13 +331,13 @@ where
             let (dest, consumed) = decode_socksaddr(head, 0)?;
             debug_assert_eq!(consumed, head.len());
             return Ok((dest, dest));
-        }
+        },
         other => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("uot: bad family {other}"),
             ));
-        }
+        },
     };
     let mut rest = vec![0u8; addr_len + 2];
     reader.read_exact(&mut rest).await?;
@@ -381,7 +367,7 @@ where
                     return false;
                 }
                 return true;
-            }
+            },
             Ok(None) => continue,
             Err(_) => return false,
         }
@@ -421,15 +407,9 @@ impl UotClientConn {
             conn.write_all(&req)
                 .await
                 .map_err(|e| io::Error::other(format!("uot: write request: {e}")))?;
-            conn.flush()
-                .await
-                .map_err(|e| io::Error::other(format!("uot: flush request: {e}")))?;
+            conn.flush().await.map_err(|e| io::Error::other(format!("uot: flush request: {e}")))?;
         }
-        Ok(Self {
-            inner: conn,
-            is_connect,
-            destination,
-        })
+        Ok(Self { inner: conn, is_connect, destination })
     }
 
     /// 发送一个 UDP 数据报到指定目标。
@@ -438,10 +418,7 @@ impl UotClientConn {
     /// connect 模式：`dest` 被忽略，使用 `new()` 时传入的固定 `destination`。
     pub async fn write_to(&mut self, payload: &[u8], dest: SocketAddr) -> io::Result<()> {
         if payload.len() > UOT_MAX_PAYLOAD {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "uot: payload > 65535",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "uot: payload > 65535"));
         }
         let mut frame = Vec::with_capacity(payload.len() + 32);
         if !self.is_connect {
@@ -454,10 +431,7 @@ impl UotClientConn {
             .write_all(&frame)
             .await
             .map_err(|e| io::Error::other(format!("uot: write frame: {e}")))?;
-        self.inner
-            .flush()
-            .await
-            .map_err(|e| io::Error::other(format!("uot: flush frame: {e}")))?;
+        self.inner.flush().await.map_err(|e| io::Error::other(format!("uot: flush frame: {e}")))?;
         Ok(())
     }
 
@@ -474,22 +448,15 @@ impl UotClientConn {
                 .await
                 .map_err(|e| io::Error::other(format!("uot: read frame: {e}")))?;
             if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "uot: stream closed",
-                ));
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "uot: stream closed"));
             }
             acc.extend_from_slice(&chunk[..n]);
             match try_parse_packet(&acc, self.is_connect) {
                 Ok(Some((parsed_dest, payload_offset, payload_len))) => {
                     let payload = acc[payload_offset..payload_offset + payload_len].to_vec();
-                    let dest = if self.is_connect {
-                        self.destination
-                    } else {
-                        parsed_dest
-                    };
+                    let dest = if self.is_connect { self.destination } else { parsed_dest };
                     return Ok((dest, payload));
-                }
+                },
                 Ok(None) => continue,
                 Err(e) => return Err(e),
             }
@@ -499,10 +466,11 @@ impl UotClientConn {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::SocketAddr;
-    use tokio::io::AsyncReadExt as _;
-    use tokio::io::AsyncWriteExt as _;
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    use super::*;
 
     // ===== socksaddr round-trip =====
 
@@ -570,9 +538,7 @@ mod tests {
         let dest: SocketAddr = "192.0.2.5:9000".parse().unwrap();
         let payload = b"hello-udp";
 
-        let mut client = UotClientConn::new(conn, false, dest, UotVersion::Legacy)
-            .await
-            .unwrap();
+        let mut client = UotClientConn::new(conn, false, dest, UotVersion::Legacy).await.unwrap();
         client.write_to(payload, dest).await.unwrap();
         // 释放写半，触发对端 EOF。
         drop(client);
@@ -596,14 +562,9 @@ mod tests {
         let dest: SocketAddr = "1.1.1.1:443".parse().unwrap();
         let payload = b"data";
 
-        let mut client = UotClientConn::new(conn, true, dest, UotVersion::Legacy)
-            .await
-            .unwrap();
+        let mut client = UotClientConn::new(conn, true, dest, UotVersion::Legacy).await.unwrap();
         // connect 模式下 dest 参数被忽略。
-        client
-            .write_to(payload, "8.8.8.8:53".parse().unwrap())
-            .await
-            .unwrap();
+        client.write_to(payload, "8.8.8.8:53".parse().unwrap()).await.unwrap();
         drop(client);
 
         let mut got = Vec::new();
@@ -622,9 +583,7 @@ mod tests {
         let conn: Box<dyn Connection> = Box::new(DuplexConnection::new(peer_w));
         let dest: SocketAddr = "10.0.0.1:5000".parse().unwrap();
 
-        let mut client = UotClientConn::new(conn, false, dest, UotVersion::Current)
-            .await
-            .unwrap();
+        let mut client = UotClientConn::new(conn, false, dest, UotVersion::Current).await.unwrap();
         client.write_to(b"x", dest).await.unwrap();
         drop(client);
         let mut got = Vec::new();
@@ -647,9 +606,7 @@ mod tests {
         let dest: SocketAddr = "192.0.2.7:9999".parse().unwrap();
         let payload = vec![0xCCu8; 60_000];
 
-        let mut client = UotClientConn::new(conn, false, dest, UotVersion::Legacy)
-            .await
-            .unwrap();
+        let mut client = UotClientConn::new(conn, false, dest, UotVersion::Legacy).await.unwrap();
         client.write_to(&payload, dest).await.unwrap();
         drop(client);
 
@@ -671,9 +628,7 @@ mod tests {
         let dest: SocketAddr = "192.0.2.7:9999".parse().unwrap();
         let payload = vec![0u8; u16::MAX as usize + 1];
 
-        let mut client = UotClientConn::new(conn, false, dest, UotVersion::Legacy)
-            .await
-            .unwrap();
+        let mut client = UotClientConn::new(conn, false, dest, UotVersion::Legacy).await.unwrap();
         let r = client.write_to(&payload, dest).await;
         assert!(r.is_err());
         drop(client);
@@ -687,8 +642,7 @@ mod tests {
         let (mut client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
         let conn: Box<dyn Connection> = Box::new(DuplexConnection::new(server_io));
         let dest: SocketAddr = "192.0.2.42:65000".parse().unwrap();
-        let mut client =
-            UotClientConn::new(conn, false, dest, UotVersion::Legacy).await.unwrap();
+        let mut client = UotClientConn::new(conn, false, dest, UotVersion::Legacy).await.unwrap();
 
         // 对端写一个帧（socksaddr + len + payload）。
         let payload = b"reply-data";
@@ -736,7 +690,7 @@ mod tests {
                     if buf.len() >= 7 + 2 + payload.len() {
                         break;
                     }
-                }
+                },
                 _ => continue,
             }
         }
@@ -773,13 +727,11 @@ mod tests {
         stream_conn.flush().await.unwrap();
 
         let mut got = vec![0u8; 4096];
-        let (n, from) = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            peer.recv_from(&mut got),
-        )
-        .await
-        .expect("udp recv timeout")
-        .expect("udp recv");
+        let (n, from) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), peer.recv_from(&mut got))
+                .await
+                .expect("udp recv timeout")
+                .expect("udp recv");
         assert_eq!(from, server_local);
         assert_eq!(&got[..n], payload);
 

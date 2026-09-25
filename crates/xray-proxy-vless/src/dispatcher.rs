@@ -13,27 +13,33 @@
 //! [`DialFn`]: xray_app_dispatcher::default::DialFn
 //! [`Connection`]: xray_transport::connection::Connection
 
-use std::future::Future;
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
-use crate::encryption::vision_conn::VisionConn;
-use xray_app_dispatcher::default::DialFn;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-use xray_common::uuid::UUID;
-use xray_proto::xray::proxy::vless::encoding::Addons;
-use xray_transport::connection::Connection;
-use xray_transport::dialer::{dial, StreamSettings};
-use xray_transport::sockopt::SocketOptions;
+use std::{
+    future::Future,
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::{Duration, Instant},
+};
 
-use crate::encoding::{client::encode_request_header, empty_addons, VlessCommand, VERSION};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use xray_app_dispatcher::default::DialFn;
+use xray_common::{
+    net::{address::Address, destination::Destination, network::Network, port::Port},
+    uuid::UUID,
+};
+use xray_proto::xray::proxy::vless::encoding::Addons;
+use xray_transport::{
+    connection::Connection,
+    dialer::{StreamSettings, dial},
+    sockopt::SocketOptions,
+};
+
+use crate::{
+    encoding::{VERSION, VlessCommand, client::encode_request_header, empty_addons},
+    encryption::vision_conn::VisionConn,
+};
 
 /// VLESS outbound 配置。
 #[derive(Debug, Clone)]
@@ -69,7 +75,6 @@ pub struct VlessOutboundConfig {
 }
 
 impl VlessOutboundConfig {
-
     /// 构造（raw TCP，无 streamSettings）。
     pub fn new(user_uuid: UUID, server_address: Address, server_port: Port) -> Self {
         Self {
@@ -86,6 +91,7 @@ impl VlessOutboundConfig {
             email: String::new(),
         }
     }
+
     /// 指定 streamSettings（builder 风格）。
     ///
     /// `Some(ws_settings)` 后拨号走 ws transport；`None` 回退 raw TCP。
@@ -101,6 +107,7 @@ impl VlessOutboundConfig {
         self.flow = flow.into();
         self
     }
+
     /// 设置 encryption（builder 风格）。
     #[must_use]
     pub fn with_encryption(mut self, encryption: impl Into<String>) -> Self {
@@ -134,12 +141,14 @@ impl VlessOutboundConfig {
         self.testpre = count;
         self
     }
+
     /// 设置用户 level（builder 风格）。
     #[must_use]
     pub fn with_level(mut self, level: u32) -> Self {
         self.level = level;
         self
     }
+
     #[must_use]
     pub fn with_email(mut self, email: impl Into<String>) -> Self {
         self.email = email.into();
@@ -148,11 +157,7 @@ impl VlessOutboundConfig {
 
     /// 服务器 Destination（TCP）。
     fn server_destination(&self) -> Destination {
-        Destination::new(
-            self.server_address.clone(),
-            self.server_port,
-            Network::TCP,
-        )
+        Destination::new(self.server_address.clone(), self.server_port, Network::TCP)
     }
 }
 
@@ -181,11 +186,7 @@ impl PreConns {
         // 1 条 + testpre 个 worker 各挂 1 条阻塞在 send —— 同样零新拨号；
         // 消费时缓冲即刻有货（Go rendezvous 由队头 sender 秒交付）。
         let (tx, rx) = tokio::sync::mpsc::channel(1);
-        Self {
-            ttl,
-            tx,
-            rx: tokio::sync::Mutex::new(rx),
-        }
+        Self { ttl, tx, rx: tokio::sync::Mutex::new(rx) }
     }
 
     /// 入池：满则阻塞直到消费者腾位（Go worker 空闲时休息在此）。
@@ -226,7 +227,7 @@ fn spawn_preconn_workers(config: Arc<VlessOutboundConfig>, pool: Arc<PreConns>, 
                         if pool.push(conn).await.is_err() {
                             break; // handler 已释放，收摊
                         }
-                    }
+                    },
                     Err(e) => tracing::debug!(error = %e, "vless pre-connect failed"),
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -238,11 +239,7 @@ fn spawn_preconn_workers(config: Arc<VlessOutboundConfig>, pool: Arc<PreConns>, 
 /// 仅拨到 VLESS 服务器（transport 层），不含 ENC/请求头/vision 包装。
 async fn dial_server_conn(config: &VlessOutboundConfig) -> Result<Box<dyn Connection>, String> {
     let server_dest = config.server_destination();
-    let sockopt = config
-        .stream_settings
-        .as_ref()
-        .map(|s| s.socket_options())
-        .unwrap_or_default();
+    let sockopt = config.stream_settings.as_ref().map(|s| s.socket_options()).unwrap_or_default();
     match &config.stream_settings {
         Some(s) => dial(&server_dest, s, &sockopt)
             .await
@@ -253,10 +250,13 @@ async fn dial_server_conn(config: &VlessOutboundConfig) -> Result<Box<dyn Connec
     }
 }
 
-type EstablishFn =
-    Arc<dyn Fn(&Destination) -> Pin<Box<dyn Future<Output = Result<Box<dyn Connection>, String>> + Send>>
+type EstablishFn = Arc<
+    dyn Fn(
+            &Destination,
+        ) -> Pin<Box<dyn Future<Output = Result<Box<dyn Connection>, String>> + Send>>
         + Send
-        + Sync>;
+        + Sync,
+>;
 
 /// 构造 VLESS 的 DialFn 闭包。
 ///
@@ -296,8 +296,8 @@ pub fn make_dial_fn_with_handshake_timeout(
         // testpre 预连接（Go `testpre > 0 && reverse == nil`；本 dispatcher 是
         // 普通 outbound 路径，reverse 是独立 outbound 不经此处）。首次拨号时
         // 才起 worker（对齐 Go initpre.Do 惰性初始化）。
-        let pre_conns = (config.testpre > 0)
-            .then(|| Arc::new(PreConns::new(Duration::from_secs(120))));
+        let pre_conns =
+            (config.testpre > 0).then(|| Arc::new(PreConns::new(Duration::from_secs(120))));
         let preconn_once = Arc::new(std::sync::Once::new());
         Arc::new(move |dest: &Destination| {
             let config = Arc::clone(&config);
@@ -350,10 +350,9 @@ async fn establish_conn(
     handshake_timeout: std::time::Duration,
 ) -> Result<Box<dyn Connection>, String> {
     // 1. 取连接：testpre 池命中（免 TCP 握手）→ 用预连接。Go testpre>0 时
-    //    消费端阻塞等池（outbound.go:174-183 `<-h.preConns`），从不自拨；
-    //    worker 与消费者同 runtime，await 让出即互不阻塞。pop 返回 None
-    //    仅在 pool 的 Sender 全部释放时类型上可能（消费期间 pool 由闭包
-    //    持有不会发生），分支保留作防御兜底。
+    //    消费端阻塞等池（outbound.go:174-183 `<-h.preConns`），从不自拨； worker 与消费者同
+    //    runtime，await 让出即互不阻塞。pop 返回 None 仅在 pool 的 Sender
+    //    全部释放时类型上可能（消费期间 pool 由闭包 持有不会发生），分支保留作防御兜底。
     let mut conn: Box<dyn Connection> = match pre_conns.as_ref() {
         Some(p) => match p.pop().await {
             Some(c) => c,
@@ -374,8 +373,8 @@ async fn establish_conn(
             Err(_) => {
                 return Err(format!(
                     "vless enc handshake timeout after {handshake_timeout:?}: server unresponsive"
-                ))
-            }
+                ));
+            },
         };
         conn = Box::new(crate::encryption::EncConnectionAdapter::new(enc_conn));
     }
@@ -401,10 +400,9 @@ async fn establish_conn(
     //     才 flush；dial 阶段同步等待会让上行首包发不出去 → 双向互等 →
     //     服务端超时断开。vision 首块 uuid padding 尤甚，见 #9/#15/#32）。
     conn = Box::new(crate::encoding::client::ResponseHeaderReader::new(conn, VERSION));
-    // 3. flow=xtls-rprx-vision（encryption=none）：请求头写出后即包装
-    //    VisionConn——padding 从业务数据开始（对齐 Go outbound VisionWriter/
-    //    VisionReader 的包装时机，首块 padding 携带本账号 uuid）。
-    //    ENC(mlkem768)+vision 组合走 CommonConn，见 bd 4lf/byo。
+    // 3. flow=xtls-rprx-vision（encryption=none）：请求头写出后即包装 VisionConn——padding
+    //    从业务数据开始（对齐 Go outbound VisionWriter/ VisionReader 的包装时机，首块 padding
+    //    携带本账号 uuid）。 ENC(mlkem768)+vision 组合走 CommonConn，见 bd 4lf/byo。
     if config.flow == crate::FLOW_XRV && config.encryption == "none" {
         let uuid_bytes = config.user_uuid.as_bytes().to_vec();
         // testseed：账户本地 padding 参数注入（对应 Go EncodeBodyAddons →
@@ -444,18 +442,14 @@ struct EncRetryConn {
     dest: Destination,
     retried: bool,
     /// Mutex 包装只为 Sync（Connection 要求）：poll 单线程独占，锁无竞争。
-    reconnecting: parking_lot::Mutex<Option<Pin<Box<dyn Future<Output = Result<Box<dyn Connection>, String>> + Send>>>>,
+    reconnecting: parking_lot::Mutex<
+        Option<Pin<Box<dyn Future<Output = Result<Box<dyn Connection>, String>> + Send>>>,
+    >,
 }
 
 impl EncRetryConn {
     fn new(inner: Box<dyn Connection>, establish: EstablishFn, dest: Destination) -> Self {
-        Self {
-            inner,
-            establish,
-            dest,
-            retried: false,
-            reconnecting: parking_lot::Mutex::new(None),
-        }
+        Self { inner, establish, dest, retried: false, reconnecting: parking_lot::Mutex::new(None) }
     }
 }
 
@@ -475,14 +469,14 @@ impl AsyncRead for EncRetryConn {
                             this.inner = conn;
                             *slot = None;
                             this.retried = true;
-                        }
+                        },
                         Poll::Ready(Err(e)) => {
                             *slot = None;
                             this.retried = true;
                             return Poll::Ready(Err(io::Error::other(format!(
                                 "vless enc retry dial: {e}"
                             ))));
-                        }
+                        },
                         Poll::Pending => return Poll::Pending,
                     }
                 }
@@ -491,7 +485,7 @@ impl AsyncRead for EncRetryConn {
                 Poll::Ready(Err(e)) if !this.retried && is_ticket_rejected(&e) => {
                     *this.reconnecting.lock() = Some((this.establish)(&this.dest));
                     continue;
-                }
+                },
                 r => return r,
             }
         }
@@ -510,6 +504,7 @@ impl AsyncWrite for EncRetryConn {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut *self.get_mut().inner).poll_flush(cx)
     }
+
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut *self.get_mut().inner).poll_shutdown(cx)
     }
@@ -535,7 +530,8 @@ pub fn make_dial_fn_with_addons(config: Arc<VlessOutboundConfig>, addons: Addons
         let target_port = dest.port();
         Box::pin(async move {
             let server_dest = config.server_destination();
-            let sockopt = config.stream_settings.as_ref().map(|s| s.socket_options()).unwrap_or_default();
+            let sockopt =
+                config.stream_settings.as_ref().map(|s| s.socket_options()).unwrap_or_default();
             let mut conn: Box<dyn Connection> = match &config.stream_settings {
                 Some(s) => dial(&server_dest, s, &sockopt)
                     .await
@@ -564,10 +560,10 @@ pub fn make_dial_fn_with_addons(config: Arc<VlessOutboundConfig>, addons: Addons
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rand::SeedableRng;
-    use xray_common::net::address::Address;
-    use xray_common::uuid::UUID;
+    use xray_common::{net::address::Address, uuid::UUID};
+
+    use super::*;
 
     /// 读一个 Vision padding 块：`[uuid(16, 仅首块)][command(1)][content_len(2 BE)]
     /// [padding_len(2 BE)][content][padding]`。`has_uuid` = 首块（带 uuid 前缀）。
@@ -579,11 +575,7 @@ mod tests {
         use tokio::io::AsyncReadExt;
         let mut hdr = vec![0u8; if has_uuid { 21 } else { 5 }];
         sock.read_exact(&mut hdr).await.unwrap();
-        let (uuid, off) = if has_uuid {
-            (Some(hdr[..16].to_vec()), 16)
-        } else {
-            (None, 0)
-        };
+        let (uuid, off) = if has_uuid { (Some(hdr[..16].to_vec()), 16) } else { (None, 0) };
         let content_len = ((hdr[off + 1] as usize) << 8) | hdr[off + 2] as usize;
         let pad_len = ((hdr[off + 3] as usize) << 8) | hdr[off + 4] as usize;
         let mut content = vec![0u8; content_len];
@@ -623,11 +615,16 @@ mod tests {
     /// 服务端 decode_request_header 应读到 xtls-rprx-vision。
     #[tokio::test]
     async fn make_dial_fn_sends_flow_in_request_header() {
-        use crate::encoding::server::decode_request_header;
-        use crate::{MemoryAccount, MemoryUser, MemoryValidator, Validator as _};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::{TcpListener, TcpStream};
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::{TcpListener, TcpStream},
+        };
         use xray_proto::xray::proxy::vless::Account as ProtoAccount;
+
+        use crate::{
+            MemoryAccount, MemoryUser, MemoryValidator, Validator as _,
+            encoding::server::decode_request_header,
+        };
 
         let test_uuid = UUID::parse("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
 
@@ -642,9 +639,8 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
-            let decoded = decode_request_header(false, &mut None, &mut sock, &validator)
-                .await
-                .unwrap();
+            let decoded =
+                decode_request_header(false, &mut None, &mut sock, &validator).await.unwrap();
             // 回响应头（version + addon_len）
             crate::encoding::server::encode_response_header(&mut sock, VERSION, &empty_addons())
                 .await
@@ -657,8 +653,12 @@ mod tests {
 
         // client：make_dial_fn（flow=xtls-rprx-vision）
         let cfg = Arc::new(
-            VlessOutboundConfig::new(test_uuid, Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(addr.port()))
-                .with_flow("xtls-rprx-vision"),
+            VlessOutboundConfig::new(
+                test_uuid,
+                Address::from_ipv4_bytes([127, 0, 0, 1]),
+                Port::new(addr.port()),
+            )
+            .with_flow("xtls-rprx-vision"),
         );
         let dial = make_dial_fn(cfg);
         let dest = Destination::tcp(Address::new_domain("target.example.com"), Port::new(80));
@@ -676,11 +676,13 @@ mod tests {
     /// uuid / 业务内容裸奔 → fail。
     #[tokio::test]
     async fn make_dial_fn_wraps_conn_with_vision_when_flow_xrv() {
-        use crate::encryption::vision::COMMAND_PADDING_CONTINUE;
-        use crate::encoding::server::decode_request_header;
-        use tokio::time::{timeout, Duration};
-        use crate::{MemoryAccount, MemoryUser, MemoryValidator, Validator as _};
+        use tokio::time::{Duration, timeout};
         use xray_proto::xray::proxy::vless::Account as ProtoAccount;
+
+        use crate::{
+            MemoryAccount, MemoryUser, MemoryValidator, Validator as _,
+            encoding::server::decode_request_header, encryption::vision::COMMAND_PADDING_CONTINUE,
+        };
 
         let test_uuid = UUID::parse("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
         let server_uuid = test_uuid.as_bytes().to_vec();
@@ -696,15 +698,17 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
-            let _ = decode_request_header(false, &mut None, &mut sock, &validator)
-                .await
-                .unwrap();
+            let _ = decode_request_header(false, &mut None, &mut sock, &validator).await.unwrap();
             // 注：此处不回 VLESS 响应头——本测试只验证上行 wire 形态，client
             // 不读；若先写响应头，client 关闭时接收队列有未读数据 → Windows
             // 以 RST 代 FIN → server 后续 read_exact 以 10053 中断。
             // 首块：uuid-only padding
             let (uuid1, cmd1, content1, _) = read_vision_block(&mut sock, true).await;
-            assert_eq!(uuid1.as_deref(), Some(server_uuid.as_slice()), "first block must start with user uuid");
+            assert_eq!(
+                uuid1.as_deref(),
+                Some(server_uuid.as_slice()),
+                "first block must start with user uuid"
+            );
             assert_eq!(cmd1, COMMAND_PADDING_CONTINUE, "data frame command");
             assert!(content1.is_empty(), "uuid-only block carries no content");
             // 第二块：业务 payload（uuid 写一次后不再出现）
@@ -732,10 +736,7 @@ mod tests {
 
         let payload: &[u8] = b"vision-payload";
         let content = timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
-        assert_eq!(
-            content, payload,
-            "business block content must be the payload verbatim"
-        );
+        assert_eq!(content, payload, "business block content must be the payload verbatim");
     }
 
     /// 回归（#9/#15/#32 early eof 根因）：dial 不得阻塞等待响应头。Go 服务端
@@ -744,13 +745,18 @@ mod tests {
     /// decode_response_header）在此死锁 → 本测试超时失败。
     #[tokio::test]
     async fn vision_dial_returns_before_deferred_response_header() {
-        use crate::encoding::server::decode_request_header;
-        use crate::encryption::vision::{xtls_padding, COMMAND_PADDING_CONTINUE};
-        use crate::{MemoryAccount, MemoryUser, MemoryValidator, Validator as _};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
-        use tokio::time::{timeout, Duration};
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+            time::{Duration, timeout},
+        };
         use xray_proto::xray::proxy::vless::Account as ProtoAccount;
+
+        use crate::{
+            MemoryAccount, MemoryUser, MemoryValidator, Validator as _,
+            encoding::server::decode_request_header,
+            encryption::vision::{COMMAND_PADDING_CONTINUE, xtls_padding},
+        };
 
         let test_uuid = UUID::parse("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
         let server_uuid = test_uuid.as_bytes().to_vec();
@@ -769,12 +775,14 @@ mod tests {
         let server_payload = payload.clone();
         let server = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
-            let _ = decode_request_header(false, &mut None, &mut sock, &validator)
-                .await
-                .unwrap();
+            let _ = decode_request_header(false, &mut None, &mut sock, &validator).await.unwrap();
             // 首块：uuid-only padding（此时尚未回响应头——dial 必须已先行返回）
             let (uuid1, cmd1, content1, _) = read_vision_block(&mut sock, true).await;
-            assert_eq!(uuid1.as_deref(), Some(server_uuid.as_slice()), "server must see uuid-prefixed block");
+            assert_eq!(
+                uuid1.as_deref(),
+                Some(server_uuid.as_slice()),
+                "server must see uuid-prefixed block"
+            );
             assert_eq!(cmd1, COMMAND_PADDING_CONTINUE);
             assert!(content1.is_empty());
             // 业务块：client 首个 payload
@@ -875,6 +883,7 @@ mod tests {
     #[tokio::test]
     async fn enc_retry_conn_retries_once_on_ticket_rejection() {
         use std::sync::atomic::{AtomicUsize, Ordering};
+
         use tokio::io::AsyncReadExt as _;
 
         struct MockErrConn {
@@ -897,9 +906,11 @@ mod tests {
             ) -> Poll<io::Result<usize>> {
                 Poll::Ready(Err(io::Error::other("mock write")))
             }
+
             fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
                 Poll::Ready(Ok(()))
             }
+
             fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
                 Poll::Ready(Ok(()))
             }
@@ -908,6 +919,7 @@ mod tests {
             fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
                 Ok(None)
             }
+
             fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
                 Ok(None)
             }
@@ -945,9 +957,11 @@ mod tests {
             ) -> Poll<io::Result<usize>> {
                 Poll::Ready(Err(io::Error::other("mock write")))
             }
+
             fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
                 Poll::Ready(Ok(()))
             }
+
             fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
                 Poll::Ready(Ok(()))
             }
@@ -956,6 +970,7 @@ mod tests {
             fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
                 Ok(None)
             }
+
             fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
                 Ok(None)
             }
@@ -973,10 +988,8 @@ mod tests {
                             msg: crate::encryption::TICKET_REJECTED_MSG.to_string(),
                         }) as Box<dyn Connection>)
                     } else {
-                        Ok(Box::new(MockDataThenErrConn {
-                            data: b"recovered".to_vec(),
-                            pos: 0,
-                        }) as Box<dyn Connection>)
+                        Ok(Box::new(MockDataThenErrConn { data: b"recovered".to_vec(), pos: 0 })
+                            as Box<dyn Connection>)
                     }
                 })
             })
@@ -994,19 +1007,19 @@ mod tests {
 
         // 第二次同类错误：retried=true，不再重拨，错误直接上抛
         let mut buf2 = [0u8; 1];
-        let err = rc
-            .read_exact(&mut buf2)
-            .await
-            .expect_err("second rejection must surface");
+        let err = rc.read_exact(&mut buf2).await.expect_err("second rejection must surface");
         assert!(is_ticket_rejected(&err));
         assert_eq!(dials.load(Ordering::SeqCst), 2, "只重试一次");
     }
 
     /// 空壳连接 stub：池操作不触碰 IO。
     fn mk_nop_conn() -> Box<dyn Connection> {
-        use std::io;
-        use std::pin::Pin;
-        use std::task::{Context, Poll};
+        use std::{
+            io,
+            pin::Pin,
+            task::{Context, Poll},
+        };
+
         use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
         struct NopConn;
@@ -1027,9 +1040,11 @@ mod tests {
             ) -> Poll<io::Result<usize>> {
                 Poll::Ready(Ok(buf.len()))
             }
+
             fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
                 Poll::Ready(Ok(()))
             }
+
             fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
                 Poll::Ready(Ok(()))
             }
@@ -1038,6 +1053,7 @@ mod tests {
             fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
                 Ok(None)
             }
+
             fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
                 Ok(None)
             }
@@ -1068,9 +1084,7 @@ mod tests {
         let got = pool.pop().await;
         assert!(got.is_some(), "consumer must receive the first conn");
         push1.await.unwrap().unwrap();
-        push2.await
-            .unwrap()
-            .expect("push2 completes once consumer arrived");
+        push2.await.unwrap().expect("push2 completes once consumer arrived");
     }
 
     /// 排队延迟致交付即过期的条目被丢弃跳过（Go ConnExpire 消费检查同语义）。

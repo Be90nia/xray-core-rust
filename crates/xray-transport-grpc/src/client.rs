@@ -12,8 +12,9 @@
 //! 已建立的 `HunkStream`（典型由 hyper/h2 dialer 实现）。本模块只做协议层
 //! 构造，把 HunkStream 适配为 `transport::Link` 给 proxy handler。
 
-use crate::encoding::{HunkReader, HunkReaderWriter, HunkStream, MultiHunkReaderWriter};
 use xray_transport::link::Link;
+
+use crate::encoding::{HunkReader, HunkReaderWriter, HunkStream, MultiHunkReaderWriter};
 
 /// gRPC 客户端配置（用于生成 service/stream 名）。
 ///
@@ -66,11 +67,7 @@ impl GrpcClient {
     /// 返回当前选择的 stream 名（multi_mode ? multi : tun）。
     #[must_use]
     pub fn active_stream_name(&self) -> &str {
-        if self.multi_mode {
-            &self.tun_multi_stream_name
-        } else {
-            &self.tun_stream_name
-        }
+        if self.multi_mode { &self.tun_multi_stream_name } else { &self.tun_stream_name }
     }
 }
 
@@ -86,31 +83,37 @@ const _: fn() = || {
 
 #[cfg(test)]
 mod tests {
+    use std::{future::Future, pin::Pin};
+
     use super::*;
     use crate::config::Config;
-    use std::future::Future;
-    use std::pin::Pin;
 
     struct DummyStream;
     impl HunkStream for DummyStream {
-        fn recv_hunk(&mut self) -> Pin<Box<dyn Future<Output = crate::error::Result<Vec<u8>>> + Send + '_>> {
+        fn recv_hunk(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = crate::error::Result<Vec<u8>>> + Send + '_>> {
             Box::pin(async { Ok(Vec::new()) })
         }
-        fn send_hunk(&mut self, _data: Vec<u8>) -> Pin<Box<dyn Future<Output = crate::error::Result<()>> + Send + '_>> {
+
+        fn send_hunk(
+            &mut self,
+            _data: Vec<u8>,
+        ) -> Pin<Box<dyn Future<Output = crate::error::Result<()>> + Send + '_>> {
             Box::pin(async { Ok(()) })
         }
-        fn close_send(&mut self) -> Pin<Box<dyn Future<Output = crate::error::Result<()>> + Send + '_>> {
+
+        fn close_send(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = crate::error::Result<()>> + Send + '_>> {
             Box::pin(async { Ok(()) })
         }
     }
 
     #[test]
     fn from_config_traditional() {
-        let cfg = Config {
-            service_name: "GunService".into(),
-            multi_mode: false,
-            ..Default::default()
-        };
+        let cfg =
+            Config { service_name: "GunService".into(), multi_mode: false, ..Default::default() };
         let client = GrpcClient::from_config(&cfg);
         assert_eq!(client.service_name, "GunService");
         assert_eq!(client.tun_stream_name, "Tun");

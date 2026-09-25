@@ -14,11 +14,14 @@
 //! - [`FakeDnsSnifferFactory`] 持有 `Box<dyn FakeDnsEngine>`，sniff 实现独立可测
 //! - [`FakeDnsEngine`] trait 由 xray-app-dns crate 实现
 
-use crate::error::DispatcherError;
-use crate::sniffer::{ProtocolSniffer, SniffError, SniffResult, SnifferIsProtoSubsetOf};
-use std::fmt::Debug;
-use std::net::IpAddr;
+use std::{fmt::Debug, net::IpAddr};
+
 use xray_common::net::network::Network;
+
+use crate::{
+    error::DispatcherError,
+    sniffer::{ProtocolSniffer, SniffError, SniffResult, SnifferIsProtoSubsetOf},
+};
 
 /// Fake DNS 引擎 trait
 ///
@@ -50,9 +53,7 @@ impl FakeDnsSniffResult {
     /// 用域名构造。
     #[must_use]
     pub fn new(domain_name: impl Into<String>) -> Self {
-        Self {
-            domain_name: domain_name.into(),
-        }
+        Self { domain_name: domain_name.into() }
     }
 
     /// 获取持有的域名。
@@ -123,9 +124,7 @@ pub struct FakeDnsSnifferFactory {
 
 impl Debug for FakeDnsSnifferFactory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
- f.debug_struct("FakeDnsSnifferFactory")
-            .field("target_ip", &self.target_ip)
-            .finish()
+        f.debug_struct("FakeDnsSnifferFactory").field("target_ip", &self.target_ip).finish()
     }
 }
 
@@ -133,10 +132,7 @@ impl FakeDnsSnifferFactory {
     /// 用 engine 构造嗅探器。
     #[must_use]
     pub fn new(engine: Box<dyn FakeDnsEngine>) -> Self {
-        Self {
-            engine,
-            target_ip: None,
-        }
+        Self { engine, target_ip: None }
     }
 
     /// 设置要查询的 IP（builder）。
@@ -176,7 +172,8 @@ pub fn try_new_fake_dns_sniffer(
 ) -> Result<FakeDnsSnifferFactory, DispatcherError> {
     let Some(engine) = engine else {
         return Err(DispatcherError::FakeDnsNotInitialized);
-    };    Ok(FakeDnsSnifferFactory::new(engine))
+    };
+    Ok(FakeDnsSnifferFactory::new(engine))
 }
 
 #[cfg(test)]
@@ -194,6 +191,7 @@ mod tests {
         fn get_domain_from_fake_dns(&self, addr: &IpAddr) -> String {
             self.mapping.get(addr).cloned().unwrap_or_default()
         }
+
         fn is_ip_in_ip_pool(&self, addr: &IpAddr) -> bool {
             self.pool.contains(addr)
         }
@@ -239,10 +237,8 @@ mod tests {
 
     #[test]
     fn fake_dns_sniffer_factory_returns_noclue_without_target_ip() {
-        let engine = Box::new(MockEngine {
-            mapping: std::collections::HashMap::new(),
-            pool: vec![],
-        });
+        let engine =
+            Box::new(MockEngine { mapping: std::collections::HashMap::new(), pool: vec![] });
         let s = FakeDnsSnifferFactory::new(engine);
         let r = s.sniff(&[]).expect("no error");
         assert!(r.is_none());
@@ -252,10 +248,7 @@ mod tests {
     fn fake_dns_sniffer_factory_returns_domain_when_mapped() {
         let mut map = std::collections::HashMap::new();
         map.insert(ip("198.51.100.1"), "mapped.example.com".to_string());
-        let engine = Box::new(MockEngine {
-            mapping: map,
-            pool: vec![],
-        });
+        let engine = Box::new(MockEngine { mapping: map, pool: vec![] });
         let s = FakeDnsSnifferFactory::new(engine).with_target_ip(ip("198.51.100.1"));
         let r = s.sniff(&[]).expect("no error").expect("match");
         assert_eq!(r.protocol(), "fakedns");
@@ -264,10 +257,8 @@ mod tests {
 
     #[test]
     fn fake_dns_sniffer_factory_returns_noclue_when_ip_not_in_pool() {
-        let engine = Box::new(MockEngine {
-            mapping: std::collections::HashMap::new(),
-            pool: vec![],
-        });
+        let engine =
+            Box::new(MockEngine { mapping: std::collections::HashMap::new(), pool: vec![] });
         let s = FakeDnsSnifferFactory::new(engine).with_target_ip(ip("198.51.100.99"));
         let r = s.sniff(&[]).expect("no error");
         assert!(r.is_none());
@@ -275,10 +266,8 @@ mod tests {
 
     #[test]
     fn fake_dns_sniffer_is_metadata_only() {
-        let engine = Box::new(MockEngine {
-            mapping: std::collections::HashMap::new(),
-            pool: vec![],
-        });
+        let engine =
+            Box::new(MockEngine { mapping: std::collections::HashMap::new(), pool: vec![] });
         let s = FakeDnsSnifferFactory::new(engine);
         assert!(s.metadata_only());
     }

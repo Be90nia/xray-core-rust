@@ -84,28 +84,18 @@ mod tests {
     #[test]
     fn error_display_messages_match_go() {
         // 关键错误消息保持英文 + 与 Go 版本一致，方便日志对照。
-        assert_eq!(
-            TlsError::NoCertificates.to_string(),
-            "no certificates configured"
-        );
-        assert_eq!(
-            TlsError::InvalidEchKeyLength.to_string(),
-            "invalid ECH key length"
-        );
+        assert_eq!(TlsError::NoCertificates.to_string(), "no certificates configured");
+        assert_eq!(TlsError::InvalidEchKeyLength.to_string(), "invalid ECH key length");
         assert_eq!(
             TlsError::PinnedCertNotFound.to_string(),
             "peer cert is unrecognized (against pinnedPeerCertSha256)"
         );
-        assert!(TlsError::UnknownFingerprint("foo".into())
-            .to_string()
-            .contains("foo"));
+        assert!(TlsError::UnknownFingerprint("foo".into()).to_string().contains("foo"));
     }
 
     #[test]
     fn peer_cert_invalid_carries_context() {
-        let e = TlsError::PeerCertInvalid {
-            against: "root CAs and verifyPeerCertByName",
-        };
+        let e = TlsError::PeerCertInvalid { against: "root CAs and verifyPeerCertByName" };
         assert!(e.to_string().contains("root CAs"));
     }
 }

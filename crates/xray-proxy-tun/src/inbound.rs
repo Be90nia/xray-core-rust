@@ -34,50 +34,53 @@
 //! `endpoint.port == dst_port`（`smoltcp/socket/udp.rs:222`、`iface/interface/udp.rs:481`），
 //! 无法"接收任意端口的 UDP"。TUN 必须截获所有 UDP 流量，绕过 smoltcp UDP socket：
 //!
-//! 1. 从 TUN recv IP 包后，先用 [`parse_udp_packet`] 解 IP+UDP 头，提取 (src, dst)。
-//!    是 UDP 包 → 走本路径；否则继续交给 smoltcp（TCP/ICMP）。
-//! 2. 按 `event.src`（IP+UDP 头的源端）作 full-cone NAT key，懒建
-//!    [`UdpDispatchSession`]，首包确定 routing。
-//! 3. session.send_packet(&dest, payload) 把数据转发到 dispatcher
-//!    （`dest = event.dst`，即 IP+UDP 头中的真实目标地址）。
-//! 4. session reader task 持续 recv 响应，用 [`build_udp_response`] 装回 IP+UDP
-//!    包（src/dst 交换），写回 TUN。
+//! 1. 从 TUN recv IP 包后，先用 [`parse_udp_packet`] 解 IP+UDP 头，提取 (src, dst)。 是 UDP 包 →
+//!    走本路径；否则继续交给 smoltcp（TCP/ICMP）。
+//! 2. 按 `event.src`（IP+UDP 头的源端）作 full-cone NAT key，懒建 [`UdpDispatchSession`]，首包确定
+//!    routing。
+//! 3. session.send_packet(&dest, payload) 把数据转发到 dispatcher （`dest = event.dst`，即 IP+UDP
+//!    头中的真实目标地址）。
+//! 4. session reader task 持续 recv 响应，用 [`build_udp_response`] 装回 IP+UDP 包（src/dst
+//!    交换），写回 TUN。
 //!
 //! # ponytail: 一个 remote src 一个 session
 //!
 //! 对应 Go `proxy/tun/udp_fullcone.go` 的 `udpConns map[net.Destination]*udpConn`：
 //! 按 source 分桶天然 cone NAT。session 生命周期由 inbound handler 持有
 //! （Arc<Mutex<HashMap>>），后续切片可加 idle 淘汰（Go `CancelAfterInactivity(1min)`）。
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicI64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
 use async_trait::async_trait;
 use bytes::Bytes;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
 use parking_lot::Mutex as ParkMutex;
-use smoltcp::iface::SocketHandle;
-use smoltcp::wire::IpEndpoint;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tokio::time::interval;
+use smoltcp::{iface::SocketHandle, wire::IpEndpoint};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::{Mutex as AsyncMutex, mpsc},
+    task::JoinHandle,
+    time::interval,
+};
 use xray_app_dispatcher::{DispatchHandler, UdpDispatchSession};
 use xray_buf::io::{new_reader, new_writer};
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
+use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
 use xray_features::inbound::{InboundError, InboundHandler};
 use xray_transport::link::Link;
 
-use crate::config::{StackOptions, Tun};
-use crate::device::TunDevice;
-use crate::error::Result;
-use crate::netstack::{
-    build_udp_response, parse_tcp_syn_dst, parse_udp_packet, TcpAcceptEvent, TunNetStack,
-    UdpPacketMeta,
+use crate::{
+    config::{StackOptions, Tun},
+    device::TunDevice,
+    error::Result,
+    netstack::{
+        TcpAcceptEvent, TunNetStack, UdpPacketMeta, build_udp_response, parse_tcp_syn_dst,
+        parse_udp_packet,
+    },
 };
 
 /// TUN 设备接收缓冲。
@@ -184,9 +187,7 @@ impl InboundHandler for TunInboundHandler {
         );
 
         // 启动设备
-        device
-            .start()
-            .map_err(|e| InboundError::ListenError(format!("tun device start: {e}")))?;
+        device.start().map_err(|e| InboundError::ListenError(format!("tun device start: {e}")))?;
 
         // 用配置地址重建 netstack（gateway 全部 CIDR；空则设备默认 v4）
         {
@@ -381,10 +382,7 @@ impl RxPackets {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = device;
-            Self {
-                buf: vec![0u8; TUN_RECV_BUF_SIZE],
-                len: 0,
-            }
+            Self { buf: vec![0u8; TUN_RECV_BUF_SIZE], len: 0 }
         }
     }
 
@@ -392,9 +390,7 @@ impl RxPackets {
     async fn recv(&mut self, device: &TunDevice) -> std::io::Result<usize> {
         #[cfg(target_os = "linux")]
         {
-            device
-                .recv_batch(&mut self.original, &mut self.bufs, &mut self.sizes)
-                .await
+            device.recv_batch(&mut self.original, &mut self.bufs, &mut self.sizes).await
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -461,17 +457,12 @@ fn handle_udp_packet(
                     meta.src,
                     meta.dst,
                 );
-                Arc::new(UdpSessionEntry {
-                    cmd_tx,
-                    last_used_nanos: AtomicI64::new(now_nanos()),
-                })
+                Arc::new(UdpSessionEntry { cmd_tx, last_used_nanos: AtomicI64::new(now_nanos()) })
             })
             .clone()
     };
     // 每次命中刷新最后活跃时间，sweep 据此淘汰。
-    entry
-        .last_used_nanos
-        .store(now_nanos(), Ordering::Relaxed);
+    entry.last_used_nanos.store(now_nanos(), Ordering::Relaxed);
 
     // 非阻塞入队（票 8gr6）：对端不应答使 recv 挂死时，后续包照常入队送达，
     // 不再与 reader 争锁排队。首包由 owner task 懒建 dispatch link。
@@ -479,10 +470,7 @@ fn handle_udp_packet(
         tracing::warn!(src = %meta.src, dst = %meta.dst, "udp: invalid destination, dropping");
         return;
     };
-    let _ = entry.cmd_tx.send(SessionCmd::Send {
-        dest,
-        payload: Bytes::copy_from_slice(payload),
-    });
+    let _ = entry.cmd_tx.send(SessionCmd::Send { dest, payload: Bytes::copy_from_slice(payload) });
 }
 
 /// 当前 wall-clock 纳秒（SystemTime → UNIX_EPOCH 偏移）。用作 session
@@ -539,12 +527,8 @@ fn sweep_udp_sessions(sessions: &UdpSessions) {
 /// 把 IP 协议族的 smoltcp IpEndpoint 转 xray Destination（UDP）。
 fn ip_endpoint_to_udp_destination(ep: &IpEndpoint) -> Option<Destination> {
     let address = match ep.addr {
-        smoltcp::wire::IpAddress::Ipv4(v4) => {
-            Address::IPv4(std::net::Ipv4Addr::from(v4.octets()))
-        }
-        smoltcp::wire::IpAddress::Ipv6(v6) => {
-            Address::IPv6(std::net::Ipv6Addr::from(v6.octets()))
-        }
+        smoltcp::wire::IpAddress::Ipv4(v4) => Address::IPv4(std::net::Ipv4Addr::from(v4.octets())),
+        smoltcp::wire::IpAddress::Ipv6(v6) => Address::IPv6(std::net::Ipv6Addr::from(v6.octets())),
     };
     Some(Destination::new(address, Port::new(ep.port), Network::UDP))
 }
@@ -708,7 +692,7 @@ async fn accept_tcp_connection(
             );
             netstack.lock().await.remove_socket(event.handle);
             return;
-        }
+        },
     };
 
     // 创建两路 duplex 桥接 smoltcp socket ↔ Link
@@ -744,12 +728,8 @@ async fn accept_tcp_connection(
 fn ip_endpoint_to_destination(local: &Option<IpEndpoint>) -> Option<Destination> {
     let ep = local.as_ref()?;
     let address = match ep.addr {
-        smoltcp::wire::IpAddress::Ipv4(v4) => {
-            Address::IPv4(std::net::Ipv4Addr::from(v4.octets()))
-        }
-        smoltcp::wire::IpAddress::Ipv6(v6) => {
-            Address::IPv6(std::net::Ipv6Addr::from(v6.octets()))
-        }
+        smoltcp::wire::IpAddress::Ipv4(v4) => Address::IPv4(std::net::Ipv4Addr::from(v4.octets())),
+        smoltcp::wire::IpAddress::Ipv6(v6) => Address::IPv6(std::net::Ipv6Addr::from(v6.octets())),
     };
     Some(Destination::new(address, Port::new(ep.port), Network::TCP))
 }
@@ -848,24 +828,31 @@ impl TunTcpRelay {
 
 #[cfg(test)]
 mod tests {
+    use std::{future::Future, pin::Pin, sync::atomic::AtomicU32};
+
     use super::*;
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::sync::atomic::AtomicU32;
 
     struct DummyTun;
     impl crate::config::Tun for DummyTun {
-        fn start(&self) -> std::result::Result<(), crate::error::TunError> { Ok(()) }
-        fn close(&self) -> std::result::Result<(), crate::error::TunError> { Ok(()) }
-        fn name(&self) -> std::result::Result<String, crate::error::TunError> { Ok("dummy0".into()) }
-        fn index(&self) -> std::result::Result<i32, crate::error::TunError> { Ok(0) }
+        fn start(&self) -> std::result::Result<(), crate::error::TunError> {
+            Ok(())
+        }
+
+        fn close(&self) -> std::result::Result<(), crate::error::TunError> {
+            Ok(())
+        }
+
+        fn name(&self) -> std::result::Result<String, crate::error::TunError> {
+            Ok("dummy0".into())
+        }
+
+        fn index(&self) -> std::result::Result<i32, crate::error::TunError> {
+            Ok(0)
+        }
     }
 
     fn make_options() -> StackOptions {
-        StackOptions {
-            tun: Some(Box::new(DummyTun)),
-            ..Default::default()
-        }
+        StackOptions { tun: Some(Box::new(DummyTun)), ..Default::default() }
     }
 
     /// 测试用 DispatchHandler——记录 dispatch 调用次数。
@@ -883,7 +870,10 @@ mod tests {
     }
 
     impl DispatchHandler for CountingDispatch {
-        fn tag(&self) -> &str { &self.tag }
+        fn tag(&self) -> &str {
+            &self.tag
+        }
+
         fn dispatch(
             &self,
             _dest: &Destination,
@@ -941,7 +931,9 @@ mod tests {
     #[test]
     fn ip_endpoint_to_destination_ipv6() {
         let ep = smoltcp::wire::IpEndpoint {
-            addr: smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::new(0, 0, 0, 0, 0, 0, 0, 1)),
+            addr: smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::new(
+                0, 0, 0, 0, 0, 0, 0, 1,
+            )),
             port: 8080,
         };
         let dest = ip_endpoint_to_destination(&Some(ep)).expect("some dest");
@@ -974,7 +966,9 @@ mod tests {
     #[test]
     fn ip_endpoint_to_udp_destination_ipv6() {
         let ep = smoltcp::wire::IpEndpoint {
-            addr: smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            addr: smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::new(
+                0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
+            )),
             port: 443,
         };
         let dest = ip_endpoint_to_udp_destination(&ep).expect("some dest");
@@ -993,7 +987,10 @@ mod tests {
         #[derive(Debug)]
         struct CaptureHandler(Arc<Mutex<Option<Destination>>>);
         impl DispatchHandler for CaptureHandler {
-            fn tag(&self) -> &str { "capture" }
+            fn tag(&self) -> &str {
+                "capture"
+            }
+
             fn dispatch(
                 &self,
                 dest: &Destination,
@@ -1010,17 +1007,17 @@ mod tests {
         // 构造 fake UDP 包：src=10.0.0.2:12345, dst=8.8.8.8:53, payload="dns-query"
         let req = make_test_ipv4_udp_packet([10, 0, 0, 2], 12345, [8, 8, 8, 8], 53, b"dns-query");
         let (meta, payload) = parse_udp_packet(&req).expect("parse fake udp packet");
-        assert_eq!(meta.dst.addr, smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(8, 8, 8, 8)));
+        assert_eq!(
+            meta.dst.addr,
+            smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(8, 8, 8, 8))
+        );
         assert_eq!(meta.dst.port, 53);
         assert_eq!(payload, b"dns-query");
 
         // 把真实 destination (meta.dst) 转 xray Destination，喂给 UdpDispatchSession
         let dest = ip_endpoint_to_udp_destination(&meta.dst).expect("udp dest");
         let mut session = UdpDispatchSession::new(handler);
-        session
-            .send_packet(&dest, payload)
-            .await
-            .expect("send_packet should succeed");
+        session.send_packet(&dest, payload).await.expect("send_packet should succeed");
 
         // 等 dispatch 跑完（spawn 后给点时间）
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1042,13 +1039,15 @@ mod tests {
     /// 不同 source src 各自分桶（full-cone NAT 语义）：两个 src 各发一包 → 两路 dispatch。
     #[tokio::test]
     async fn udp_dispatch_full_cone_per_source() {
-        use std::collections::HashSet;
-        use std::sync::Mutex;
+        use std::{collections::HashSet, sync::Mutex};
 
         #[derive(Debug)]
         struct CaptureHandler(Arc<Mutex<Vec<Destination>>>);
         impl DispatchHandler for CaptureHandler {
-            fn tag(&self) -> &str { "capture" }
+            fn tag(&self) -> &str {
+                "capture"
+            }
+
             fn dispatch(
                 &self,
                 dest: &Destination,
@@ -1116,8 +1115,13 @@ mod tests {
 
     /// 构造测试用 IPv4+TCP 包（无校验和——VirtualDevice caps 全 ignored）。
     fn make_test_ipv4_tcp_packet(
-        src_ip: [u8; 4], src_port: u16, dst_ip: [u8; 4], dst_port: u16,
-        seq: u32, ack: u32, flags: u8,
+        src_ip: [u8; 4],
+        src_port: u16,
+        dst_ip: [u8; 4],
+        dst_port: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
     ) -> Vec<u8> {
         let total = 20 + 20;
         let mut pkt = vec![0u8; total];
@@ -1145,12 +1149,16 @@ mod tests {
     #[tokio::test]
     async fn tcp_syn_handshake_triggers_dispatch_with_real_destination() {
         use std::sync::Mutex;
-        use smoltcp::wire::{IpCidr, IpAddress, Ipv4Address};
+
+        use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
 
         #[derive(Debug)]
         struct CaptureHandler(Arc<Mutex<Option<Destination>>>);
         impl DispatchHandler for CaptureHandler {
-            fn tag(&self) -> &str { "capture" }
+            fn tag(&self) -> &str {
+                "capture"
+            }
+
             fn dispatch(
                 &self,
                 dest: &Destination,
@@ -1170,8 +1178,13 @@ mod tests {
 
         // TUN 真实形态：SYN 的 dst 是公网 IP（非本机接口地址），依赖 AnyIP 放行
         let syn = make_test_ipv4_tcp_packet(
-            [10, 0, 0, 2], 40000, [93, 184, 216, 34], 443,
-            1000, 0, 0x02, // SYN
+            [10, 0, 0, 2],
+            40000,
+            [93, 184, 216, 34],
+            443,
+            1000,
+            0,
+            0x02, // SYN
         );
 
         {
@@ -1192,8 +1205,13 @@ mod tests {
 
             // ③ ACK 完成握手 → socket Established
             let ack = make_test_ipv4_tcp_packet(
-                [10, 0, 0, 2], 40000, [93, 184, 216, 34], 443,
-                1001, synack_seq.wrapping_add(1), 0x10, // ACK
+                [10, 0, 0, 2],
+                40000,
+                [93, 184, 216, 34],
+                443,
+                1001,
+                synack_seq.wrapping_add(1),
+                0x10, // ACK
             );
             stack.ingest_rx(ack);
             stack.poll(smoltcp::time::Instant::now());
@@ -1255,6 +1273,7 @@ mod tests {
             fn tag(&self) -> &str {
                 "stub"
             }
+
             fn dispatch(
                 &self,
                 _dest: &Destination,
@@ -1291,14 +1310,20 @@ mod tests {
         let (cmd_tx_new, _cmd_rx_new) = mpsc::unbounded_channel();
         {
             let mut m = sessions.lock();
-            m.insert(old_ep, Arc::new(UdpSessionEntry {
-                cmd_tx,
-                last_used_nanos: AtomicI64::new(0), // 远古
-            }));
-            m.insert(new_ep, Arc::new(UdpSessionEntry {
-                cmd_tx: cmd_tx_new,
-                last_used_nanos: AtomicI64::new(now_nanos()),
-            }));
+            m.insert(
+                old_ep,
+                Arc::new(UdpSessionEntry {
+                    cmd_tx,
+                    last_used_nanos: AtomicI64::new(0), // 远古
+                }),
+            );
+            m.insert(
+                new_ep,
+                Arc::new(UdpSessionEntry {
+                    cmd_tx: cmd_tx_new,
+                    last_used_nanos: AtomicI64::new(now_nanos()),
+                }),
+            );
         }
 
         sweep_udp_sessions(&sessions);
@@ -1330,6 +1355,7 @@ mod tests {
             fn tag(&self) -> &str {
                 "blackhole"
             }
+
             fn dispatch(
                 &self,
                 _dest: &Destination,
@@ -1351,7 +1377,7 @@ mod tests {
                                     // EOF 兜底：避免空转烧 CPU
                                     tokio::time::sleep(Duration::from_millis(1)).await;
                                 }
-                            }
+                            },
                             Err(_) => return,
                         }
                     }
@@ -1407,12 +1433,16 @@ mod tests {
     #[tokio::test]
     async fn batch_drive_completes_handshake_and_defers_spawn_out_of_lock() {
         use std::sync::Mutex;
-        use smoltcp::wire::{IpCidr, IpAddress, Ipv4Address};
+
+        use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
 
         #[derive(Debug)]
         struct CaptureHandler(Arc<Mutex<Option<Destination>>>);
         impl DispatchHandler for CaptureHandler {
-            fn tag(&self) -> &str { "capture" }
+            fn tag(&self) -> &str {
+                "capture"
+            }
+
             fn dispatch(
                 &self,
                 dest: &Destination,
@@ -1432,8 +1462,13 @@ mod tests {
 
         // 批 1：SYN 单包批 → 批尾一次 poll 出 SYN-ACK（GRO 批读聚合形态）
         let syn = make_test_ipv4_tcp_packet(
-            [10, 0, 0, 2], 40000, [93, 184, 216, 34], 443,
-            1000, 0, 0x02, // SYN
+            [10, 0, 0, 2],
+            40000,
+            [93, 184, 216, 34],
+            443,
+            1000,
+            0,
+            0x02, // SYN
         );
         let (accepted1, tx) = {
             let mut stack = netstack.lock().await;
@@ -1445,12 +1480,21 @@ mod tests {
             .find(|p| p.len() >= 34 && p[9] == 6 && (p[20 + 13] & 0x12) == 0x12)
             .map(|p| u32::from_be_bytes([p[20 + 4], p[20 + 5], p[20 + 6], p[20 + 7]]))
             .expect("SYN-ACK must be emitted at batch end");
-        assert_eq!(captured.lock().expect("lock").is_some(), false, "no dispatch inside critical section");
+        assert_eq!(
+            captured.lock().expect("lock").is_some(),
+            false,
+            "no dispatch inside critical section"
+        );
 
         // 批 2：ACK 完成握手 → accept 事件批尾收集
         let ack = make_test_ipv4_tcp_packet(
-            [10, 0, 0, 2], 40000, [93, 184, 216, 34], 443,
-            1001, synack_seq.wrapping_add(1), 0x10, // ACK
+            [10, 0, 0, 2],
+            40000,
+            [93, 184, 216, 34],
+            443,
+            1001,
+            synack_seq.wrapping_add(1),
+            0x10, // ACK
         );
         let (accepted2, _) = {
             let mut stack = netstack.lock().await;
@@ -1461,7 +1505,11 @@ mod tests {
         // 锁外建桥 → dispatch 收到 SYN 的 dst（与真实 driver loop 两段式一致）
         dispatch_accepted(&netstack, accepted2, &handler).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let dest = captured.lock().expect("lock").clone().expect("dispatch must fire from lock-external bridge");
+        let dest = captured
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("dispatch must fire from lock-external bridge");
         assert_eq!(dest.address(), &Address::IPv4(std::net::Ipv4Addr::new(93, 184, 216, 34)));
         assert_eq!(dest.port().value(), 443);
         assert_eq!(dest.network(), Network::TCP);
@@ -1473,17 +1521,15 @@ mod tests {
     /// 必须在 deadline 内完成；持锁跨 await 或锁序颠倒都会撞死 deadline。
     #[tokio::test]
     async fn concurrent_batch_drive_and_relay_no_deadlock() {
-        use smoltcp::wire::{IpCidr, IpAddress, Ipv4Address};
+        use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
 
         let local = IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)), 24);
         let netstack: Arc<AsyncMutex<TunNetStack>> =
             Arc::new(AsyncMutex::new(TunNetStack::new(&[local], 1500)));
 
         // 真实握手造一条 Established 连接：SYN 批 → ACK 批 → accept
-        let syn = make_test_ipv4_tcp_packet(
-            [10, 0, 0, 2], 40000, [93, 184, 216, 34], 443,
-            1000, 0, 0x02,
-        );
+        let syn =
+            make_test_ipv4_tcp_packet([10, 0, 0, 2], 40000, [93, 184, 216, 34], 443, 1000, 0, 0x02);
         let synack_seq = {
             let mut stack = netstack.lock().await;
             let (_, tx) = drive_stack_batch(&mut stack, vec![syn.to_vec()]);
@@ -1493,8 +1539,13 @@ mod tests {
                 .expect("SYN-ACK")
         };
         let ack = make_test_ipv4_tcp_packet(
-            [10, 0, 0, 2], 40000, [93, 184, 216, 34], 443,
-            1001, synack_seq.wrapping_add(1), 0x10,
+            [10, 0, 0, 2],
+            40000,
+            [93, 184, 216, 34],
+            443,
+            1001,
+            synack_seq.wrapping_add(1),
+            0x10,
         );
         let (accepted, _) = {
             let mut stack = netstack.lock().await;

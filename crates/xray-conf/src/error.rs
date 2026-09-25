@@ -13,19 +13,11 @@ pub enum ConfError {
 
     /// 解析失败并携带格式与行列位置（serde_json 的 SyntaxError 类）。
     #[error("failed to parse {format} config at line {line} column {column}: {message}")]
-    Parse {
-        format: &'static str,
-        line: usize,
-        column: usize,
-        message: String,
-    },
+    Parse { format: &'static str, line: usize, column: usize, message: String },
 
     /// 解析失败但无精确位置（yaml/toml 或顶层 IO 错误）。
     #[error("failed to parse {format} config: {message}")]
-    ParseSimple {
-        format: &'static str,
-        message: String,
-    },
+    ParseSimple { format: &'static str, message: String },
 
     /// 配置语义非法（如 PortList 为空、协议未知）。
     #[error("invalid config: {0}")]
@@ -53,9 +45,10 @@ pub enum ConfError {
 
     /// 使用了已移除的配置（全局 `transport` / 顶层 `reverse` 字段）。对应 Go
     /// `common/errors.PrintRemovedFeatureError`，文案与 Go 对齐。
-    #[error("The feature {feature} has been removed and migrated to {migrate}. Please update your config(s) according to release note and documentation.")]
+    #[error(
+        "The feature {feature} has been removed and migrated to {migrate}. Please update your config(s) according to release note and documentation."
+    )]
     Removed { feature: &'static str, migrate: &'static str },
-
 
     /// Build 阶段序列化失败（极少触发，因字段已成功解析）。
     #[error("failed to build {what}: {message}")]
@@ -75,10 +68,7 @@ impl ConfError {
 
     /// 包装为 ParseSimple（用于 yaml/toml）。
     pub fn simple(format: &'static str, err: impl std::fmt::Display) -> Self {
-        ConfError::ParseSimple {
-            format,
-            message: err.to_string(),
-        }
+        ConfError::ParseSimple { format, message: err.to_string() }
     }
 }
 
@@ -109,7 +99,7 @@ mod tests {
             ConfError::Parse { format, line, .. } => {
                 assert_eq!(format, "json");
                 assert!(line > 0);
-            }
+            },
             _ => panic!("expected Parse variant"),
         }
     }

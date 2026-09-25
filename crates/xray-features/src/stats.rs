@@ -4,17 +4,17 @@
 //! - [`Counter`] / [`OnlineMap`] / [`Channel`] 三大接口
 //! - [`Manager`] 注册表接口（含 `*OnlineMap*` / `*Channel*` 12 个方法）
 //! - [`NoopManager`] 空实现
-//! - [`get_or_register_counter`] / [`get_or_register_online_map`] /
-//!   [`get_or_register_channel`] 工具函数
+//! - [`get_or_register_counter`] / [`get_or_register_online_map`] / [`get_or_register_channel`]
+//!   工具函数
 //! - [`subscribe_runnable_channel`] / [`unsubscribe_closable_channel`] 工具函数
 //!
 //! ## 与 Go 的语义对齐
 //!
-//! - `Counter::add` 返回**旧值**（Go `atomic.AddInt64` 返回新值，但 `Counter.Add`
-//!   interface 注释明确 "returns the previous value"）
+//! - `Counter::add` 返回**旧值**（Go `atomic.AddInt64` 返回新值，但 `Counter.Add` interface
+//!   注释明确 "returns the previous value"）
 //! - `Counter::set` 返回**旧值**（Go `atomic.SwapInt64`）
-//! - `Manager::register_*` 在重名时返回 [`ManagerError::AlreadyRegistered`]，
-//!   对齐 Go 的 `errors.New("... already registered.")`
+//! - `Manager::register_*` 在重名时返回 [`ManagerError::AlreadyRegistered`]， 对齐 Go 的
+//!   `errors.New("... already registered.")`
 //!
 //! ## 异步
 //!
@@ -23,7 +23,9 @@
 //! （Go 的 sync.RWMutex + buffered chan + goroutine broadcast）。
 
 use std::sync::Arc;
+
 use thiserror::Error;
+
 use crate::Feature;
 
 /// Feature type identifier for Stats.
@@ -286,9 +288,7 @@ pub fn get_or_register_channel(
 
 /// 订阅 Runnable Channel（首个订阅者触发 `start`）。
 /// 对应 Go `SubscribeRunnableChannel(c)`。
-pub fn subscribe_runnable_channel(
-    c: &dyn Channel,
-) -> Result<ChannelSubscriber, ChannelError> {
+pub fn subscribe_runnable_channel(c: &dyn Channel) -> Result<ChannelSubscriber, ChannelError> {
     if c.subscribers() == 0 {
         c.start()?;
     }
@@ -323,25 +323,33 @@ impl Manager for NoopManager {
     fn register_counter(&self, _name: &str) -> Result<Arc<dyn Counter>, ManagerError> {
         Err(ManagerError::NotImplemented)
     }
+
     fn unregister_counter(&self, _name: &str) {}
+
     fn get_counter(&self, _name: &str) -> Option<Arc<dyn Counter>> {
         None
     }
+
     fn visit_counters(&self, _f: &mut dyn FnMut(&str, &dyn Counter) -> bool) {}
 
     fn register_online_map(&self, _name: &str) -> Result<Arc<dyn OnlineMap>, ManagerError> {
         Err(ManagerError::NotImplemented)
     }
+
     fn unregister_online_map(&self, _name: &str) {}
+
     fn get_online_map(&self, _name: &str) -> Option<Arc<dyn OnlineMap>> {
         None
     }
+
     fn visit_online_maps(&self, _f: &mut dyn FnMut(&str, &dyn OnlineMap) -> bool) {}
 
     fn register_channel(&self, _name: &str) -> Result<Arc<dyn Channel>, ManagerError> {
         Err(ManagerError::NotImplemented)
     }
+
     fn unregister_channel(&self, _name: &str) {}
+
     fn get_channel(&self, _name: &str) -> Option<Arc<dyn Channel>> {
         None
     }
@@ -375,21 +383,50 @@ impl Manager for DefaultStatsFeature {
     fn register_counter(&self, name: &str) -> Result<Arc<dyn Counter>, ManagerError> {
         self.manager.register_counter(name)
     }
-    fn unregister_counter(&self, name: &str) { self.manager.unregister_counter(name) }
-    fn get_counter(&self, name: &str) -> Option<Arc<dyn Counter>> { self.manager.get_counter(name) }
-    fn visit_counters(&self, f: &mut dyn FnMut(&str, &dyn Counter) -> bool) { self.manager.visit_counters(f) }
+
+    fn unregister_counter(&self, name: &str) {
+        self.manager.unregister_counter(name)
+    }
+
+    fn get_counter(&self, name: &str) -> Option<Arc<dyn Counter>> {
+        self.manager.get_counter(name)
+    }
+
+    fn visit_counters(&self, f: &mut dyn FnMut(&str, &dyn Counter) -> bool) {
+        self.manager.visit_counters(f)
+    }
+
     fn register_online_map(&self, name: &str) -> Result<Arc<dyn OnlineMap>, ManagerError> {
         self.manager.register_online_map(name)
     }
-    fn unregister_online_map(&self, name: &str) { self.manager.unregister_online_map(name) }
-    fn get_online_map(&self, name: &str) -> Option<Arc<dyn OnlineMap>> { self.manager.get_online_map(name) }
-    fn visit_online_maps(&self, f: &mut dyn FnMut(&str, &dyn OnlineMap) -> bool) { self.manager.visit_online_maps(f) }
+
+    fn unregister_online_map(&self, name: &str) {
+        self.manager.unregister_online_map(name)
+    }
+
+    fn get_online_map(&self, name: &str) -> Option<Arc<dyn OnlineMap>> {
+        self.manager.get_online_map(name)
+    }
+
+    fn visit_online_maps(&self, f: &mut dyn FnMut(&str, &dyn OnlineMap) -> bool) {
+        self.manager.visit_online_maps(f)
+    }
+
     fn register_channel(&self, name: &str) -> Result<Arc<dyn Channel>, ManagerError> {
         self.manager.register_channel(name)
     }
-    fn unregister_channel(&self, name: &str) { self.manager.unregister_channel(name) }
-    fn get_channel(&self, name: &str) -> Option<Arc<dyn Channel>> { self.manager.get_channel(name) }
-    fn get_all_online_users(&self) -> Vec<String> { self.manager.get_all_online_users() }
+
+    fn unregister_channel(&self, name: &str) {
+        self.manager.unregister_channel(name)
+    }
+
+    fn get_channel(&self, name: &str) -> Option<Arc<dyn Channel>> {
+        self.manager.get_channel(name)
+    }
+
+    fn get_all_online_users(&self) -> Vec<String> {
+        self.manager.get_all_online_users()
+    }
 }
 
 #[cfg(test)]
@@ -494,10 +531,7 @@ mod tests {
 
     #[test]
     fn manager_error_display() {
-        let e = ManagerError::AlreadyRegistered {
-            kind: "Counter",
-            name: "x".into(),
-        };
+        let e = ManagerError::AlreadyRegistered { kind: "Counter", name: "x".into() };
         assert_eq!(e.to_string(), "Counter `x` already registered");
         let e = ManagerError::NotImplemented;
         assert_eq!(e.to_string(), "not implemented");

@@ -105,8 +105,9 @@ impl StatsProvider for NoopStatsProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::{AtomicI64, Ordering};
+
+    use super::*;
 
     /// 测试用 atomic counter
     struct TestCounter(AtomicI64);
@@ -121,6 +122,7 @@ mod tests {
         fn value(&self) -> i64 {
             self.0.load(Ordering::SeqCst)
         }
+
         fn add(&self, delta: i64) -> i64 {
             self.0.fetch_add(delta, Ordering::SeqCst) + delta
         }
@@ -133,26 +135,17 @@ mod tests {
 
     #[test]
     fn counter_name_inbound_downlink() {
-        assert_eq!(
-            inbound_downlink_name("socks"),
-            "inbound>>>socks>>>traffic>>>downlink"
-        );
+        assert_eq!(inbound_downlink_name("socks"), "inbound>>>socks>>>traffic>>>downlink");
     }
 
     #[test]
     fn counter_name_outbound_uplink() {
-        assert_eq!(
-            outbound_uplink_name("direct"),
-            "outbound>>>direct>>>traffic>>>uplink"
-        );
+        assert_eq!(outbound_uplink_name("direct"), "outbound>>>direct>>>traffic>>>uplink");
     }
 
     #[test]
     fn counter_name_outbound_downlink() {
-        assert_eq!(
-            outbound_downlink_name("proxy"),
-            "outbound>>>proxy>>>traffic>>>downlink"
-        );
+        assert_eq!(outbound_downlink_name("proxy"), "outbound>>>proxy>>>traffic>>>downlink");
     }
 
     #[test]

@@ -1,16 +1,17 @@
 //! SendingWindow + SendingWorker（对应 Go `sending.go`）。
 
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 
 use parking_lot::Mutex;
 use xray_buf::buffer::Buffer;
 
-use crate::config::{Config, ConfigExt};
-use crate::output::SegmentWriter;
-use crate::round_trip::RoundTripInfo;
-use crate::segment::{DataSegment, Segment, SEGMENT_OPTION_CLOSE};
-use crate::state::State;
+use crate::{
+    config::{Config, ConfigExt},
+    output::SegmentWriter,
+    round_trip::RoundTripInfo,
+    segment::{DataSegment, SEGMENT_OPTION_CLOSE, Segment},
+    state::State,
+};
 
 /// 发送窗口（对应 Go `SendingWindow struct`）。
 pub struct SendingWindow {
@@ -20,10 +21,7 @@ pub struct SendingWindow {
 
 impl SendingWindow {
     pub fn new() -> Self {
-        Self {
-            cache: VecDeque::new(),
-            total_in_flight_size: 0,
-        }
+        Self { cache: VecDeque::new(), total_in_flight_size: 0 }
     }
 
     pub fn release(&mut self) {
@@ -119,11 +117,7 @@ impl SendingWindow {
             seg.timestamp = current;
             seg.transmit += 1;
             seg.conv = conv;
-            seg.option = if state == State::ReadyToClose {
-                SEGMENT_OPTION_CLOSE
-            } else {
-                0
-            };
+            seg.option = if state == State::ReadyToClose { SEGMENT_OPTION_CLOSE } else { 0 };
             seg.sending_next = first_unacknowledged;
             to_send.push(clone_for_send(seg));
 
@@ -241,12 +235,7 @@ impl SendingWorker {
         removed
     }
 
-    pub fn process_ack_segment(
-        &self,
-        current: u32,
-        mut ack: crate::segment::AckSegment,
-        rto: u32,
-    ) {
+    pub fn process_ack_segment(&self, current: u32, mut ack: crate::segment::AckSegment, rto: u32) {
         let ack_timestamp = ack.timestamp;
         let maxack_data = {
             let mut inner = self.inner.lock();
@@ -318,9 +307,7 @@ impl SendingWorker {
         }
 
         let mut cwnd = self.config.get_sending_in_flight_size();
-        let una_diff = inner
-            .remote_next_number
-            .wrapping_sub(inner.first_unacknowledged);
+        let una_diff = inner.remote_next_number.wrapping_sub(inner.first_unacknowledged);
         if cwnd > una_diff {
             cwnd = una_diff;
         }
@@ -332,14 +319,8 @@ impl SendingWorker {
         let rto = self.rtt.timeout();
         let first_unacknowledged = inner.first_unacknowledged;
 
-        let prep = inner.window.prepare_flush(
-            current,
-            rto,
-            cwnd,
-            self.conv,
-            state,
-            first_unacknowledged,
-        );
+        let prep =
+            inner.window.prepare_flush(current, rto, cwnd, self.conv, state, first_unacknowledged);
 
         if prep.in_flight > 0 && prep.total_in_flight_size > 0 {
             let rate = prep.lost * 100 / prep.total_in_flight_size;
@@ -416,9 +397,7 @@ pub fn adjust_control_window(current: u32, loss_rate: u32, config: &Config) -> u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::default_config;
-    use crate::output::SimpleSegmentWriter;
-    use crate::round_trip::RoundTripInfo;
+    use crate::{config::default_config, output::SimpleSegmentWriter, round_trip::RoundTripInfo};
 
     fn make_buf(data: &[u8]) -> Buffer {
         let mut b = Buffer::new();
@@ -579,8 +558,10 @@ mod tests {
 
     #[test]
     fn worker_flush_with_data_calls_writer() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        use std::sync::Mutex as StdMutex;
+        use std::sync::{
+            Mutex as StdMutex,
+            atomic::{AtomicU32, Ordering},
+        };
 
         struct CountingWriter {
             count: Arc<AtomicU32>,

@@ -61,10 +61,7 @@ mod tests {
 
     #[test]
     fn display_probe_failed() {
-        let e = ObservatoryError::ProbeFailed {
-            outbound: "out".into(),
-            reason: "timeout".into(),
-        };
+        let e = ObservatoryError::ProbeFailed { outbound: "out".into(), reason: "timeout".into() };
         let s = format!("{e}");
         assert!(s.contains("out"));
         assert!(s.contains("timeout"));

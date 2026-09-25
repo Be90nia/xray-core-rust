@@ -6,11 +6,11 @@
 //! - `MemoryAccount::equals()`：账户相等性比较（仅比对 `ID.uuid`）
 //! - `MemoryAccount::to_proto()`：运行时 → proto（用于序列化）
 
-use xray_common::protocol::ID;
-use xray_common::uuid::UUID;
-use xray_proto::xray::app::proxyman::SniffingConfig;
-use xray_proto::xray::proxy::vless::Account as ProtoAccount;
-use xray_proto::xray::proxy::vless::Reverse as ProtoReverse;
+use xray_common::{protocol::ID, uuid::UUID};
+use xray_proto::xray::{
+    app::proxyman::SniffingConfig,
+    proxy::vless::{Account as ProtoAccount, Reverse as ProtoReverse},
+};
 
 use crate::error::{Result, VlessError};
 
@@ -26,18 +26,12 @@ pub struct Reverse {
 impl Reverse {
     /// 从 proto `&Reverse` 转换为运行时 `Reverse`。
     pub fn from_proto(p: &ProtoReverse) -> Self {
-        Self {
-            tag: p.tag.clone(),
-            sniffing: p.sniffing.clone(),
-        }
+        Self { tag: p.tag.clone(), sniffing: p.sniffing.clone() }
     }
 
     /// 转换回 proto `Reverse`。
     pub fn to_proto(&self) -> ProtoReverse {
-        ProtoReverse {
-            tag: self.tag.clone(),
-            sniffing: self.sniffing.clone(),
-        }
+        ProtoReverse { tag: self.tag.clone(), sniffing: self.sniffing.clone() }
     }
 }
 
@@ -152,7 +146,7 @@ mod tests {
         match MemoryAccount::from_proto_account(&p) {
             Err(VlessError::InvalidUuid(s)) => {
                 assert_eq!(s, "this-id-is-longer-than-thirty-bytes!!")
-            }
+            },
             other => panic!("expected InvalidUuid, got {other:?}"),
         }
     }
@@ -160,10 +154,7 @@ mod tests {
     #[test]
     fn from_proto_account_short_text_derives_v5() {
         // 对拍 Go：VLESS 自定义短 id（非 UUID 文本）派生 UUIDv5 账户。
-        let p = ProtoAccount {
-            id: "not-a-uuid".into(),
-            ..sample_proto_account("")
-        };
+        let p = ProtoAccount { id: "not-a-uuid".into(), ..sample_proto_account("") };
         let m = MemoryAccount::from_proto_account(&p).expect("short id derives v5");
         assert_eq!(m.id.uuid().as_bytes()[6] >> 4, 5);
     }
@@ -171,10 +162,7 @@ mod tests {
     #[test]
     fn from_proto_account_with_reverse() {
         let p = ProtoAccount {
-            reverse: Some(ProtoReverse {
-                tag: "portal".into(),
-                sniffing: None,
-            }),
+            reverse: Some(ProtoReverse { tag: "portal".into(), sniffing: None }),
             ..sample_proto_account("")
         };
         let m = MemoryAccount::from_proto_account(&p).expect("parse");
@@ -216,10 +204,7 @@ mod tests {
 
     #[test]
     fn reverse_from_to_proto_roundtrip() {
-        let p = ProtoReverse {
-            tag: "portal-x".into(),
-            sniffing: None,
-        };
+        let p = ProtoReverse { tag: "portal-x".into(), sniffing: None };
         let r = Reverse::from_proto(&p);
         let p2 = r.to_proto();
         assert_eq!(p2.tag, p.tag);

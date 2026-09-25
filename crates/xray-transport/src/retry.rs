@@ -3,8 +3,7 @@
 //! Go `ExponentialBackoff` 名为指数实为线性：第 n 次失败后延迟 `n * base`
 //! （0, d, 2d, 3d...），首次立即执行。成功立即返回；连续相同错误去重累积。
 
-use std::future::Future;
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
 /// 全部重试失败后的聚合错误（对应 Go `ErrRetryFailed` + accumulated errors）。
 #[derive(Debug)]
@@ -28,8 +27,8 @@ impl<E: std::fmt::Display + std::fmt::Debug> std::error::Error for RetryError<E>
 /// 指数退避重试（对应 Go `retry.ExponentialBackoff(attempts, delay).On(f)`）。
 ///
 /// - 首次立即执行；第 n 次失败（n 从 0 计）后延迟 `n * base_delay_ms` 再重试。
-/// - 共执行 `attempts` 次；末次失败后不再延迟直接返回聚合错误
-///   （Go 版末次失败后多 sleep 一次属实现浪费，不复制）。
+/// - 共执行 `attempts` 次；末次失败后不再延迟直接返回聚合错误 （Go 版末次失败后多 sleep
+///   一次属实现浪费，不复制）。
 /// - 连续相同的错误消息只累积一条（Go `On()` 同款去重）。
 ///
 /// # Errors
@@ -57,7 +56,7 @@ where
                     tokio::time::sleep(Duration::from_millis(u64::from(attempt) * base_delay_ms))
                         .await;
                 }
-            }
+            },
         }
     }
     Err(RetryError { errors })

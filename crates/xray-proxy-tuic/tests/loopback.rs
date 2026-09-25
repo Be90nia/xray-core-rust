@@ -11,18 +11,20 @@
 
 #![cfg(test)]
 
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 use uuid::Uuid;
-
-use xray_proxy_tuic::client::TuicClient;
-use xray_proxy_tuic::protocol::Address;
-use xray_proxy_tuic::server::TuicMockServer;
-use xray_proxy_tuic::pool::QuinnConnectionPool;
+use xray_proxy_tuic::{
+    client::TuicClient, pool::QuinnConnectionPool, protocol::Address, server::TuicMockServer,
+};
 
 /// 启动简单 echo TCP server。
 async fn start_echo_server() -> SocketAddr {
@@ -42,7 +44,7 @@ async fn start_echo_server() -> SocketAddr {
                             if sock.write_all(&buf[..n]).await.is_err() {
                                 break;
                             }
-                        }
+                        },
                     }
                 }
             });
@@ -56,9 +58,7 @@ fn make_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.add(cert_der.to_vec().into()).unwrap();
     Arc::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth(),
+        rustls::ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth(),
     )
 }
 
@@ -89,7 +89,14 @@ async fn loopback_echo_works() {
     let client_cfg = make_client_config(&cert_der);
     let client = tokio::time::timeout(
         Duration::from_secs(10),
-        TuicClient::connect(server_addr, "localhost", uuid, password, client_cfg, QuinnConnectionPool::new()),
+        TuicClient::connect(
+            server_addr,
+            "localhost",
+            uuid,
+            password,
+            client_cfg,
+            QuinnConnectionPool::new(),
+        ),
     )
     .await
     .expect("connect timed out")
@@ -205,7 +212,14 @@ async fn heartbeat_then_bi_relay_still_works() {
     let client = Arc::new(
         tokio::time::timeout(
             Duration::from_secs(10),
-            TuicClient::connect(server_addr, "localhost", uuid, password, client_cfg, QuinnConnectionPool::new()),
+            TuicClient::connect(
+                server_addr,
+                "localhost",
+                uuid,
+                password,
+                client_cfg,
+                QuinnConnectionPool::new(),
+            ),
         )
         .await
         .expect("connect timed out")
@@ -256,7 +270,14 @@ async fn loopback_large_payload() {
     let client_cfg = make_client_config(&cert_der);
     let client = tokio::time::timeout(
         Duration::from_secs(10),
-        TuicClient::connect(server_addr, "localhost", uuid, password, client_cfg, QuinnConnectionPool::new()),
+        TuicClient::connect(
+            server_addr,
+            "localhost",
+            uuid,
+            password,
+            client_cfg,
+            QuinnConnectionPool::new(),
+        ),
     )
     .await
     .expect("connect timed out")
@@ -304,7 +325,14 @@ async fn auth_wrong_password_rejected() {
     let client_cfg = make_client_config(&cert_der);
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        TuicClient::connect(server_addr, "localhost", uuid, "wrong-password", client_cfg, QuinnConnectionPool::new()),
+        TuicClient::connect(
+            server_addr,
+            "localhost",
+            uuid,
+            "wrong-password",
+            client_cfg,
+            QuinnConnectionPool::new(),
+        ),
     )
     .await;
 

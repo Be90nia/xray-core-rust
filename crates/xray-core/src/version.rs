@@ -45,15 +45,7 @@ pub fn version_statement() -> Vec<String> {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
     vec![
-        format!(
-            "Xray {} ({}) {} (rustc {}, {}/{})",
-            version(),
-            CODENAME,
-            BUILD,
-            rustc,
-            os,
-            arch,
-        ),
+        format!("Xray {} ({}) {} (rustc {}, {}/{})", version(), CODENAME, BUILD, rustc, os, arch,),
         INTRO.to_string(),
     ]
 }

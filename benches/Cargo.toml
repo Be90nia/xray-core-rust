@@ -12,6 +12,7 @@ xray-app-router = { path = "../crates/xray-app-router" }
 xray-common = { path = "../crates/xray-common" }
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "macros", "net"] }
 
 [[bench]]
 name = "crypto_bench"
@@ -31,4 +32,9 @@ harness = false
 [[bench]]
 name = "transport_bench"
 path = "transport_bench.rs"
+harness = false
+
+[[bench]]
+name = "readv_bench"
+path = "readv_bench.rs"
 harness = false

@@ -13,10 +13,12 @@ use std::net::{IpAddr, SocketAddr};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::config::Config;
-use crate::connection::HttpUpgradeConnection;
-use crate::error::Result;
-use crate::hub::{apply_trusted_x_forwarded_for, build_upgrade_response, parse_upgrade_request};
+use crate::{
+    config::Config,
+    connection::HttpUpgradeConnection,
+    error::Result,
+    hub::{apply_trusted_x_forwarded_for, build_upgrade_response, parse_upgrade_request},
+};
 
 /// HTTP/1.1 请求头读取缓冲初始大小（含 `\r\n\r\n` 终止符）。
 const READ_INITIAL_CAPACITY: usize = 1024;
@@ -54,8 +56,8 @@ impl HttpUpgradeServer {
     /// # Errors
     /// - [`crate::error::HttpUpgradeError::Io`]：底层 IO 读写失败
     /// - [`crate::error::HttpUpgradeError::InvalidHttpFormat`]：请求字节格式非法
-    /// - [`crate::error::HttpUpgradeError::BadHost`] / [`crate::error::HttpUpgradeError::BadPath`]：
-    ///   host/path 不匹配
+    /// - [`crate::error::HttpUpgradeError::BadHost`] /
+    ///   [`crate::error::HttpUpgradeError::BadPath`]： host/path 不匹配
     /// - [`crate::error::HttpUpgradeError::UnrecognizedRequest`]：缺 Upgrade/Connection header
     pub async fn handshake_io<IO>(&self, mut io: IO) -> Result<(HttpUpgradeConnection<IO>, Vec<u8>)>
     where
@@ -92,7 +94,7 @@ impl HttpUpgradeServer {
                 return Err(crate::error::HttpUpgradeError::InvalidHttpFormat(
                     "handshake read timeout (4s, Go SetReadDeadline)".into(),
                 ));
-            }
+            },
         }
 
         // 2. 校验请求（注意：parse_upgrade_request 不消费余留 payload）
@@ -110,14 +112,9 @@ impl HttpUpgradeServer {
 
         // 余留 payload（紧跟 \r\n\r\n 之后的字节）
         // parse_upgrade_request 内部找到 \r\n\r\n 但不返回位置，需要重新计算
-        let payload_offset = find_header_end(&buf)
-            .map(|p| p + 4)
-            .unwrap_or(buf.len());
-        let leftover = if payload_offset < buf.len() {
-            buf[payload_offset..].to_vec()
-        } else {
-            Vec::new()
-        };
+        let payload_offset = find_header_end(&buf).map(|p| p + 4).unwrap_or(buf.len());
+        let leftover =
+            if payload_offset < buf.len() { buf[payload_offset..].to_vec() } else { Vec::new() };
 
         Ok((HttpUpgradeConnection::new(io, remote_addr), leftover))
     }
@@ -130,14 +127,12 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tokio::io::duplex;
 
+    use super::*;
+
     fn make_config(path: &str) -> Config {
-        Config {
-            path: path.into(),
-            ..Default::default()
-        }
+        Config { path: path.into(), ..Default::default() }
     }
 
     #[tokio::test]
@@ -146,7 +141,8 @@ mod tests {
         let (mut server_io, mut client_io) = duplex(8192);
 
         // 客户端先发请求
-        let req = b"GET /ws HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+        let req =
+            b"GET /ws HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
         client_io.write_all(req).await.unwrap();
         client_io.flush().await.unwrap();
 
@@ -244,7 +240,8 @@ mod tests {
         let server = HttpUpgradeServer::new(make_config("/ws"));
         let (mut server_io, mut client_io) = duplex(8192);
 
-        let req = b"GET /other HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+        let req =
+            b"GET /other HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
         client_io.write_all(req).await.unwrap();
 
         let err = server.handshake_io(&mut server_io).await.unwrap_err();
@@ -272,5 +269,4 @@ mod tests {
         let err = server.handshake_io(&mut server_io).await.unwrap_err();
         assert!(matches!(err, crate::error::HttpUpgradeError::InvalidHttpFormat(_)));
     }
-
 }

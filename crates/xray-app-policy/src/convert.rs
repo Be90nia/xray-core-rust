@@ -4,10 +4,13 @@
 
 use std::time::Duration;
 
-use xray_features::policy::{BufferPolicy, Policy, StatsPolicy, TimeoutPolicy, DEFAULT_BUFFER_WRITE};
-use xray_proto::xray::app::policy::{Policy as ProtoPolicy, Second, SystemPolicy as ProtoSystemPolicy};
-
 pub use xray_features::policy::SystemStats;
+use xray_features::policy::{
+    BufferPolicy, DEFAULT_BUFFER_WRITE, Policy, StatsPolicy, TimeoutPolicy,
+};
+use xray_proto::xray::app::policy::{
+    Policy as ProtoPolicy, Second, SystemPolicy as ProtoSystemPolicy,
+};
 
 /// 把 proto `Second` 转换为 `Duration`，None 视作 0 秒。
 ///
@@ -27,7 +30,8 @@ pub fn policy_from_proto(proto: &ProtoPolicy) -> Policy {
 
     if let Some(timeout) = proto.timeout.as_ref() {
         policy.timeout = TimeoutPolicy {
-            handshake: second_to_duration(timeout.handshake.as_ref()).max(policy.timeout.handshake)
+            handshake: second_to_duration(timeout.handshake.as_ref())
+                .max(policy.timeout.handshake)
                 .checked_add(Duration::ZERO)
                 .unwrap_or(policy.timeout.handshake),
             // 用 proto 提供值覆盖；为 0（None 等价）时保留默认值
@@ -82,13 +86,10 @@ pub fn policy_from_proto(proto: &ProtoPolicy) -> Policy {
 /// 子消息透传到 `SystemStats.buffer.connection`（i32 1:1）。
 pub fn system_stats_from_proto(proto: &ProtoSystemPolicy) -> SystemStats {
     let stats = proto.stats.as_ref();
-    let buffer = proto
-        .buffer
-        .as_ref()
-        .map_or_else(BufferPolicy::default, |b| BufferPolicy {
-            connection: b.connection,
-            write: DEFAULT_BUFFER_WRITE,
-        });
+    let buffer = proto.buffer.as_ref().map_or_else(BufferPolicy::default, |b| BufferPolicy {
+        connection: b.connection,
+        write: DEFAULT_BUFFER_WRITE,
+    });
     SystemStats {
         inbound_uplink: stats.map(|s| s.inbound_uplink).unwrap_or(false),
         inbound_downlink: stats.map(|s| s.inbound_downlink).unwrap_or(false),
@@ -100,12 +101,13 @@ pub fn system_stats_from_proto(proto: &ProtoSystemPolicy) -> SystemStats {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use xray_features::policy::DEFAULT_BUFFER_CONNECTION;
     use xray_proto::xray::app::policy::{
         policy::{Buffer as PolicyBuffer, Stats as PolicyStats, Timeout as PolicyTimeout},
         system_policy::{Buffer as SystemPolicyBuffer, Stats as SystemPolicyStats},
     };
+
+    use super::*;
 
     #[test]
     fn second_to_duration_none_is_zero() {
@@ -168,11 +170,7 @@ mod tests {
     fn policy_from_proto_overrides_stats() {
         let proto = ProtoPolicy {
             timeout: None,
-            stats: Some(PolicyStats {
-                user_uplink: true,
-                user_downlink: true,
-                user_online: true,
-            }),
+            stats: Some(PolicyStats { user_uplink: true, user_downlink: true, user_online: true }),
             buffer: None,
         };
         let p = policy_from_proto(&proto);
@@ -195,7 +193,8 @@ mod tests {
     #[test]
     fn policy_from_proto_negative_buffer_becomes_minus_one() {
         // Go 用 -1 表示无限缓冲；Rust BufferPolicy.connection 直接 i32 1:1 透传。
-        // 后续 dispatcher 写到 pipe.limit=-1，pipe.rs is_full 在 limit<0 时永真分支跳过 size check。
+        // 后续 dispatcher 写到 pipe.limit=-1，pipe.rs is_full 在 limit<0 时永真分支跳过 size
+        // check。
         let proto = ProtoPolicy {
             timeout: None,
             stats: None,
@@ -268,10 +267,8 @@ mod tests {
     #[test]
     fn system_stats_from_proto_buffer_override_unlimited() {
         // SystemPolicy proto Buffer.connection=-1 → SystemStats.buffer.connection=-1（直接透传）。
-        let proto = ProtoSystemPolicy {
-            stats: None,
-            buffer: Some(SystemPolicyBuffer { connection: -1 }),
-        };
+        let proto =
+            ProtoSystemPolicy { stats: None, buffer: Some(SystemPolicyBuffer { connection: -1 }) };
         let s = system_stats_from_proto(&proto);
         assert_eq!(s.buffer.connection, -1_i32);
     }
@@ -279,10 +276,8 @@ mod tests {
     #[test]
     fn system_stats_from_proto_buffer_zero_is_legal() {
         // SystemPolicy proto Buffer.connection=0 表示 ZeroBuffer；不走 default。
-        let proto = ProtoSystemPolicy {
-            stats: None,
-            buffer: Some(SystemPolicyBuffer { connection: 0 }),
-        };
+        let proto =
+            ProtoSystemPolicy { stats: None, buffer: Some(SystemPolicyBuffer { connection: 0 }) };
         let s = system_stats_from_proto(&proto);
         assert_eq!(s.buffer.connection, 0, "Buffer=0 must survive round-trip");
         assert_ne!(s.buffer.connection, DEFAULT_BUFFER_CONNECTION);

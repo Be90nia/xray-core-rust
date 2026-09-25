@@ -6,13 +6,14 @@
 //! 参考 clash-rs `clash-lib/src/proxy/hysteria2/salamander.rs`（算法一致）。
 //! Gecko 子模式（QUIC 长头部分片重组）待 rpn-B 实现。
 
-use std::io;
-use std::net::SocketAddr;
+use std::{io, net::SocketAddr};
 
 use async_trait::async_trait;
-use blake2::Blake2bVar;
-use blake2::digest::{Update, VariableOutput};
-use rand::{rng, RngCore};
+use blake2::{
+    Blake2bVar,
+    digest::{Update, VariableOutput},
+};
+use rand::{RngCore, rng};
 
 use super::{UdpIo, Udpmask};
 

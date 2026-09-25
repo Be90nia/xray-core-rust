@@ -18,9 +18,11 @@
 //! 一旦 cache 命中，每次路由查表只一次 lock，开销可忽略。升级路径：
 //! 用 `arc_swap` 或 dashmap shards。
 
-use std::collections::HashMap;
-use std::hash::Hash;
-use std::sync::{Arc, Mutex, Weak};
+use std::{
+    collections::HashMap,
+    hash::Hash,
+    sync::{Arc, Mutex, Weak},
+};
 
 /// 弱引用缓存。
 ///

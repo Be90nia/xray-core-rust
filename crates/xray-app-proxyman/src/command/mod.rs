@@ -9,38 +9,47 @@
 //! - [`InboundOperation`] / [`OutboundOperation`] trait — Go 同名接口
 //! - [`AddUserOperation`] / [`RemoveUserOperation`] — proto 操作类型 + Apply 逻辑
 //! - [`command::UserManager`] trait — Go `proxy.UserManager`
-//! - [`InboundHandlerProvider`] / [`OutboundHandlerProvider`] trait — Go `proxy.GetInbound`/`GetOutbound`
+//! - [`InboundHandlerProvider`] / [`OutboundHandlerProvider`] trait — Go
+//!   `proxy.GetInbound`/`GetOutbound`
 //! - [`HandlerService`] trait + [`DefaultHandlerService`] 编排（依赖 manager 注入）
 //!
 //! IO 边界（TODO）：
 //! - gRPC server 注册（Go `service.Register(*grpc.Server)`）— 依赖 tonic + xray-app-commander
 
-use crate::error::ProxymanError;
-use crate::inbound::InboundHandler;
-use crate::outbound::OutboundHandler;
 use std::sync::Arc;
-use xray_proto::xray::app::proxyman::command::{
-    AddInboundRequest, AddInboundResponse, AddOutboundRequest, AddOutboundResponse,
-    AddUserOperation as ProtoAddUserOp, AlterInboundRequest, AlterInboundResponse,
-    AlterOutboundRequest, AlterOutboundResponse, GetInboundUserRequest, GetInboundUserResponse,
-    GetInboundUsersCountResponse, ListInboundsRequest, ListInboundsResponse,
-    ListOutboundsRequest, ListOutboundsResponse, RemoveInboundRequest, RemoveInboundResponse,
-    RemoveOutboundRequest, RemoveOutboundResponse, RemoveUserOperation as ProtoRemoveUserOp,
+
+use xray_proto::xray::{
+    app::proxyman::command::{
+        AddInboundRequest, AddInboundResponse, AddOutboundRequest, AddOutboundResponse,
+        AddUserOperation as ProtoAddUserOp, AlterInboundRequest, AlterInboundResponse,
+        AlterOutboundRequest, AlterOutboundResponse, GetInboundUserRequest, GetInboundUserResponse,
+        GetInboundUsersCountResponse, ListInboundsRequest, ListInboundsResponse,
+        ListOutboundsRequest, ListOutboundsResponse, RemoveInboundRequest, RemoveInboundResponse,
+        RemoveOutboundRequest, RemoveOutboundResponse, RemoveUserOperation as ProtoRemoveUserOp,
+    },
+    common::protocol::User as ProtoUser,
 };
-use xray_proto::xray::common::protocol::User as ProtoUser;
+
+use crate::{error::ProxymanError, inbound::InboundHandler, outbound::OutboundHandler};
 
 // ========== Operation traits ==========
 
 /// 入站操作 trait（对应 Go `InboundOperation interface`）
 pub trait InboundOperation: Send + Sync {
     /// 应用到此入站 handler（对应 Go `ApplyInbound(ctx, Handler) error`）
-    fn apply_inbound(&self, handler: &dyn InboundHandlerWithUserManager) -> Result<(), ProxymanError>;
+    fn apply_inbound(
+        &self,
+        handler: &dyn InboundHandlerWithUserManager,
+    ) -> Result<(), ProxymanError>;
 }
 
 /// 出站操作 trait（对应 Go `OutboundOperation interface`）
 pub trait OutboundOperation: Send + Sync {
     /// 应用到此出站 handler（对应 Go `ApplyOutbound(ctx, Handler) error`）
-    fn apply_outbound(&self, handler: &dyn OutboundHandlerWithUserManager) -> Result<(), ProxymanError>;
+    fn apply_outbound(
+        &self,
+        handler: &dyn OutboundHandlerWithUserManager,
+    ) -> Result<(), ProxymanError>;
 }
 
 // ========== User management ==========
@@ -63,10 +72,7 @@ impl MemoryUser {
     /// Account 解析依赖具体代理类型，留 TODO。
     #[must_use]
     pub fn from_proto(u: &ProtoUser) -> Self {
-        Self {
-            email: u.email.clone(),
-            level: u.level,
-        }
+        Self { email: u.email.clone(), level: u.level }
     }
 
     /// 转 proto User（对应 Go `protocol.ToProtoUser(memoryUser)`）
@@ -128,20 +134,17 @@ impl AddUserOperation {
     /// 从 proto 构造（含 `ToMemoryUser` 转换）
     #[must_use]
     pub fn from_proto(op: &ProtoAddUserOp) -> Self {
-        let user = op
-            .user
-            .as_ref()
-            .map(MemoryUser::from_proto)
-            .unwrap_or_default();
+        let user = op.user.as_ref().map(MemoryUser::from_proto).unwrap_or_default();
         Self { user }
     }
 }
 
 impl InboundOperation for AddUserOperation {
-    fn apply_inbound(&self, handler: &dyn InboundHandlerWithUserManager) -> Result<(), ProxymanError> {
-        let um = handler
-            .user_manager()
-            .ok_or(ProxymanError::NotUserManager)?;
+    fn apply_inbound(
+        &self,
+        handler: &dyn InboundHandlerWithUserManager,
+    ) -> Result<(), ProxymanError> {
+        let um = handler.user_manager().ok_or(ProxymanError::NotUserManager)?;
         um.add_user(self.user.clone())
     }
 }
@@ -161,17 +164,16 @@ impl RemoveUserOperation {
     /// 从 proto 构造
     #[must_use]
     pub fn from_proto(op: &ProtoRemoveUserOp) -> Self {
-        Self {
-            email: op.email.clone(),
-        }
+        Self { email: op.email.clone() }
     }
 }
 
 impl InboundOperation for RemoveUserOperation {
-    fn apply_inbound(&self, handler: &dyn InboundHandlerWithUserManager) -> Result<(), ProxymanError> {
-        let um = handler
-            .user_manager()
-            .ok_or(ProxymanError::NotUserManager)?;
+    fn apply_inbound(
+        &self,
+        handler: &dyn InboundHandlerWithUserManager,
+    ) -> Result<(), ProxymanError> {
+        let um = handler.user_manager().ok_or(ProxymanError::NotUserManager)?;
         um.remove_user(&self.email)
     }
 }
@@ -206,18 +208,39 @@ pub trait OperationDecoder: Send + Sync {
 /// 让 service 取到底层 handler。
 pub trait HandlerService: Send + Sync {
     fn add_inbound(&self, req: AddInboundRequest) -> Result<AddInboundResponse, ProxymanError>;
-    fn remove_inbound(&self, req: RemoveInboundRequest) -> Result<RemoveInboundResponse, ProxymanError>;
-    fn alter_inbound(&self, req: AlterInboundRequest) -> Result<AlterInboundResponse, ProxymanError>;
-    fn list_inbounds(&self, req: ListInboundsRequest) -> Result<ListInboundsResponse, ProxymanError>;
-    fn get_inbound_users(&self, req: GetInboundUserRequest) -> Result<GetInboundUserResponse, ProxymanError>;
+    fn remove_inbound(
+        &self,
+        req: RemoveInboundRequest,
+    ) -> Result<RemoveInboundResponse, ProxymanError>;
+    fn alter_inbound(
+        &self,
+        req: AlterInboundRequest,
+    ) -> Result<AlterInboundResponse, ProxymanError>;
+    fn list_inbounds(
+        &self,
+        req: ListInboundsRequest,
+    ) -> Result<ListInboundsResponse, ProxymanError>;
+    fn get_inbound_users(
+        &self,
+        req: GetInboundUserRequest,
+    ) -> Result<GetInboundUserResponse, ProxymanError>;
     fn get_inbound_users_count(
         &self,
         req: GetInboundUserRequest,
     ) -> Result<GetInboundUsersCountResponse, ProxymanError>;
     fn add_outbound(&self, req: AddOutboundRequest) -> Result<AddOutboundResponse, ProxymanError>;
-    fn remove_outbound(&self, req: RemoveOutboundRequest) -> Result<RemoveOutboundResponse, ProxymanError>;
-    fn alter_outbound(&self, req: AlterOutboundRequest) -> Result<AlterOutboundResponse, ProxymanError>;
-    fn list_outbounds(&self, req: ListOutboundsRequest) -> Result<ListOutboundsResponse, ProxymanError>;
+    fn remove_outbound(
+        &self,
+        req: RemoveOutboundRequest,
+    ) -> Result<RemoveOutboundResponse, ProxymanError>;
+    fn alter_outbound(
+        &self,
+        req: AlterOutboundRequest,
+    ) -> Result<AlterOutboundResponse, ProxymanError>;
+    fn list_outbounds(
+        &self,
+        req: ListOutboundsRequest,
+    ) -> Result<ListOutboundsResponse, ProxymanError>;
 }
 
 /// Inbound handler 提供方（让 HandlerService 找到具体 handler）
@@ -357,17 +380,25 @@ impl DefaultHandlerService {
 
 impl HandlerService for DefaultHandlerService {
     fn add_inbound(&self, req: AddInboundRequest) -> Result<AddInboundResponse, ProxymanError> {
-        let registrar = self.inbound_registrar.as_ref()
+        let registrar = self
+            .inbound_registrar
+            .as_ref()
             .ok_or_else(|| ProxymanError::Other("inbound registrar not set".into()))?;
-        let factory = self.factory.as_ref()
+        let factory = self
+            .factory
+            .as_ref()
             .ok_or_else(|| ProxymanError::Other("handler factory not set".into()))?;
-        let config = req.inbound.ok_or_else(|| ProxymanError::Other("missing inbound config".into()))?;
+        let config =
+            req.inbound.ok_or_else(|| ProxymanError::Other("missing inbound config".into()))?;
         let handler = factory.create_inbound(&config)?;
         registrar.add_inbound_handler(handler)?;
         Ok(AddInboundResponse {})
     }
 
-    fn remove_inbound(&self, req: RemoveInboundRequest) -> Result<RemoveInboundResponse, ProxymanError> {
+    fn remove_inbound(
+        &self,
+        req: RemoveInboundRequest,
+    ) -> Result<RemoveInboundResponse, ProxymanError> {
         let provider = self
             .inbound_provider
             .as_ref()
@@ -383,21 +414,24 @@ impl HandlerService for DefaultHandlerService {
         Ok(RemoveInboundResponse {})
     }
 
-    fn alter_inbound(&self, req: AlterInboundRequest) -> Result<AlterInboundResponse, ProxymanError> {
+    fn alter_inbound(
+        &self,
+        req: AlterInboundRequest,
+    ) -> Result<AlterInboundResponse, ProxymanError> {
         let decoder = self
             .op_decoder
             .as_ref()
             .ok_or_else(|| ProxymanError::Other("operation decoder not set".into()))?;
-        let op = req
-            .operation
-            .as_ref()
-            .ok_or(ProxymanError::UnknownOperation)?;
+        let op = req.operation.as_ref().ok_or(ProxymanError::UnknownOperation)?;
         let boxed = decoder.decode_inbound_op(&op.r#type, &op.value)?;
         self.apply_inbound_op(&req.tag, boxed)?;
         Ok(AlterInboundResponse {})
     }
 
-    fn list_inbounds(&self, req: ListInboundsRequest) -> Result<ListInboundsResponse, ProxymanError> {
+    fn list_inbounds(
+        &self,
+        req: ListInboundsRequest,
+    ) -> Result<ListInboundsResponse, ProxymanError> {
         let provider = self
             .inbound_provider
             .as_ref()
@@ -407,7 +441,8 @@ impl HandlerService for DefaultHandlerService {
             let mut cfg = xray_proto::xray::core::InboundHandlerConfig::default();
             cfg.tag = tag;
             if !req.is_only_tags {
-                // 填充 receiver/proxy type_url（完整 TypedMessage 序列化需上层注入，当前填 type_url）
+                // 填充 receiver/proxy type_url（完整 TypedMessage 序列化需上层注入，当前填
+                // type_url）
                 if let Some(url) = &recv_url {
                     cfg.receiver_settings = Some(xray_proto::xray::common::serial::TypedMessage {
                         r#type: url.clone(),
@@ -435,9 +470,7 @@ impl HandlerService for DefaultHandlerService {
         let handler = provider
             .get_inbound_with_um(&req.tag)
             .ok_or_else(|| ProxymanError::HandlerNotFound(req.tag.clone()))?;
-        let um = handler
-            .user_manager()
-            .ok_or(ProxymanError::NotUserManager)?;
+        let um = handler.user_manager().ok_or(ProxymanError::NotUserManager)?;
 
         let mut resp = GetInboundUserResponse::default();
         if !req.email.is_empty() {
@@ -463,20 +496,23 @@ impl HandlerService for DefaultHandlerService {
         let handler = provider
             .get_inbound_with_um(&req.tag)
             .ok_or_else(|| ProxymanError::HandlerNotFound(req.tag.clone()))?;
-        let um = handler
-            .user_manager()
-            .ok_or(ProxymanError::NotUserManager)?;
+        let um = handler.user_manager().ok_or(ProxymanError::NotUserManager)?;
         Ok(GetInboundUsersCountResponse {
             count: i64::try_from(um.users_count()).unwrap_or(i64::MAX),
         })
     }
 
     fn add_outbound(&self, req: AddOutboundRequest) -> Result<AddOutboundResponse, ProxymanError> {
-        let registrar = self.outbound_registrar.as_ref()
+        let registrar = self
+            .outbound_registrar
+            .as_ref()
             .ok_or_else(|| ProxymanError::Other("outbound registrar not set".into()))?;
-        let factory = self.factory.as_ref()
+        let factory = self
+            .factory
+            .as_ref()
             .ok_or_else(|| ProxymanError::Other("handler factory not set".into()))?;
-        let config = req.outbound.ok_or_else(|| ProxymanError::Other("missing outbound config".into()))?;
+        let config =
+            req.outbound.ok_or_else(|| ProxymanError::Other("missing outbound config".into()))?;
         let handler = factory.create_outbound(&config)?;
         registrar.add_outbound_handler(handler)?;
         Ok(AddOutboundResponse {})
@@ -508,10 +544,7 @@ impl HandlerService for DefaultHandlerService {
             .op_decoder
             .as_ref()
             .ok_or_else(|| ProxymanError::Other("operation decoder not set".into()))?;
-        let op = req
-            .operation
-            .as_ref()
-            .ok_or(ProxymanError::UnknownOperation)?;
+        let op = req.operation.as_ref().ok_or(ProxymanError::UnknownOperation)?;
         let boxed = decoder.decode_outbound_op(&op.r#type, &op.value)?;
         self.apply_outbound_op(&req.tag, boxed)?;
         Ok(AlterOutboundResponse {})
@@ -548,8 +581,9 @@ impl HandlerService for DefaultHandlerService {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use parking_lot::Mutex;
+
+    use super::*;
 
     // ========== 测试 UserManager ==========
 
@@ -559,9 +593,7 @@ mod tests {
 
     impl TestUserManager {
         fn new() -> Self {
-            Self {
-                users: Mutex::new(Vec::new()),
-            }
+            Self { users: Mutex::new(Vec::new()) }
         }
     }
 
@@ -570,14 +602,17 @@ mod tests {
             self.users.lock().push(user);
             Ok(())
         }
+
         fn remove_user(&self, email: &str) -> Result<(), ProxymanError> {
             let mut u = self.users.lock();
             u.retain(|x| x.email != email);
             Ok(())
         }
+
         fn get_user(&self, email: &str) -> Option<MemoryUser> {
             self.users.lock().iter().find(|u| u.email == email).cloned()
         }
+
         fn list_users(&self) -> Vec<MemoryUser> {
             self.users.lock().clone()
         }
@@ -594,17 +629,19 @@ mod tests {
         fn tag(&self) -> &str {
             &self.tag
         }
+
         fn start(&self) -> crate::inbound::PinFuture<Result<(), ProxymanError>> {
             Box::pin(async { Ok(()) })
         }
+
         fn close(&self) -> crate::inbound::PinFuture<Result<(), ProxymanError>> {
             Box::pin(async { Ok(()) })
         }
-        fn receiver_settings(
-            &self,
-        ) -> Option<&xray_proto::xray::app::proxyman::ReceiverConfig> {
+
+        fn receiver_settings(&self) -> Option<&xray_proto::xray::app::proxyman::ReceiverConfig> {
             None
         }
+
         fn proxy_type_url(&self) -> &str {
             "xray.test"
         }
@@ -617,10 +654,7 @@ mod tests {
     }
 
     fn make_stub_inbound(tag: &str) -> Arc<StubInboundWithUM> {
-        Arc::new(StubInboundWithUM {
-            tag: tag.to_string(),
-            um: Arc::new(TestUserManager::new()),
-        })
+        Arc::new(StubInboundWithUM { tag: tag.to_string(), um: Arc::new(TestUserManager::new()) })
     }
 
     // ========== MemoryUser ==========
@@ -644,10 +678,7 @@ mod tests {
 
     #[test]
     fn memory_user_round_trip() {
-        let m = MemoryUser {
-            email: "bob@x.com".to_string(),
-            level: 3,
-        };
+        let m = MemoryUser { email: "bob@x.com".to_string(), level: 3 };
         let p = m.to_proto();
         let m2 = MemoryUser::from_proto(&p);
         assert_eq!(m, m2);
@@ -658,10 +689,7 @@ mod tests {
     #[test]
     fn add_user_op_applies_to_user_manager() {
         let h = make_stub_inbound("vless");
-        let op = AddUserOperation::new(MemoryUser {
-            email: "u1@x.com".to_string(),
-            level: 1,
-        });
+        let op = AddUserOperation::new(MemoryUser { email: "u1@x.com".to_string(), level: 1 });
         op.apply_inbound(h.as_ref()).unwrap();
         assert_eq!(h.um.list_users().len(), 1);
         assert_eq!(h.um.list_users()[0].email, "u1@x.com");
@@ -670,11 +698,7 @@ mod tests {
     #[test]
     fn remove_user_op_applies_to_user_manager() {
         let h = make_stub_inbound("vless");
-        h.um.add_user(MemoryUser {
-            email: "gone@x.com".to_string(),
-            level: 0,
-        })
-        .unwrap();
+        h.um.add_user(MemoryUser { email: "gone@x.com".to_string(), level: 0 }).unwrap();
         assert_eq!(h.um.list_users().len(), 1);
         let op = RemoveUserOperation::new("gone@x.com");
         op.apply_inbound(h.as_ref()).unwrap();
@@ -708,17 +732,21 @@ mod tests {
             fn tag(&self) -> &str {
                 "x"
             }
+
             fn start(&self) -> crate::inbound::PinFuture<Result<(), ProxymanError>> {
                 Box::pin(async { Ok(()) })
             }
+
             fn close(&self) -> crate::inbound::PinFuture<Result<(), ProxymanError>> {
                 Box::pin(async { Ok(()) })
             }
+
             fn receiver_settings(
                 &self,
             ) -> Option<&xray_proto::xray::app::proxyman::ReceiverConfig> {
                 None
             }
+
             fn proxy_type_url(&self) -> &str {
                 "x"
             }
@@ -733,7 +761,7 @@ mod tests {
         match op.apply_inbound(&h) {
             Err(ProxymanError::NotUserManager) => (),
             Err(e) => panic!("expected NotUserManager, got: {e}"),
-    Ok(_) => panic!("expected error, got Ok"),
+            Ok(_) => panic!("expected error, got Ok"),
         }
     }
 
@@ -745,12 +773,9 @@ mod tests {
 
     impl InboundHandlerProvider for StubInboundProvider {
         fn get_inbound_with_um(&self, tag: &str) -> Option<Arc<dyn InboundHandlerWithUserManager>> {
-            self.handlers
-                .lock()
-                .iter()
-                .find(|h| h.tag() == tag)
-                .cloned()
+            self.handlers.lock().iter().find(|h| h.tag() == tag).cloned()
         }
+
         fn get_inbound(&self, tag: &str) -> Option<Arc<dyn InboundHandler>> {
             self.handlers
                 .lock()
@@ -759,6 +784,7 @@ mod tests {
                 .cloned()
                 .map(|h| h as Arc<dyn InboundHandler>)
         }
+
         fn list_inbound_tags(&self) -> Vec<(String, Option<String>, String)> {
             self.handlers
                 .lock()
@@ -771,30 +797,15 @@ mod tests {
     fn make_service_with_inbound(
         h: Arc<dyn InboundHandlerWithUserManager>,
     ) -> DefaultHandlerService {
-        let provider = Arc::new(StubInboundProvider {
-            handlers: Mutex::new(vec![h]),
-        });
-        DefaultHandlerService {
-            inbound_provider: Some(provider),
-            ..Default::default()
-        }
+        let provider = Arc::new(StubInboundProvider { handlers: Mutex::new(vec![h]) });
+        DefaultHandlerService { inbound_provider: Some(provider), ..Default::default() }
     }
 
     #[test]
     fn get_inbound_users_returns_all_when_email_empty() {
         let h = make_stub_inbound("in");
-        h.um
-            .add_user(MemoryUser {
-                email: "a@x.com".to_string(),
-                level: 0,
-            })
-            .unwrap();
-        h.um
-            .add_user(MemoryUser {
-                email: "b@x.com".to_string(),
-                level: 0,
-            })
-            .unwrap();
+        h.um.add_user(MemoryUser { email: "a@x.com".to_string(), level: 0 }).unwrap();
+        h.um.add_user(MemoryUser { email: "b@x.com".to_string(), level: 0 }).unwrap();
         let svc = make_service_with_inbound(h.clone());
         let resp = svc
             .get_inbound_users(GetInboundUserRequest {
@@ -808,12 +819,7 @@ mod tests {
     #[test]
     fn get_inbound_users_single_when_email_set() {
         let h = make_stub_inbound("in");
-        h.um
-            .add_user(MemoryUser {
-                email: "x@x.com".to_string(),
-                level: 0,
-            })
-            .unwrap();
+        h.um.add_user(MemoryUser { email: "x@x.com".to_string(), level: 0 }).unwrap();
         let svc = make_service_with_inbound(h.clone());
         let resp = svc
             .get_inbound_users(GetInboundUserRequest {
@@ -828,18 +834,8 @@ mod tests {
     #[test]
     fn get_inbound_users_count() {
         let h = make_stub_inbound("in");
-        h.um
-            .add_user(MemoryUser {
-                email: "1".to_string(),
-                level: 0,
-            })
-            .unwrap();
-        h.um
-            .add_user(MemoryUser {
-                email: "2".to_string(),
-                level: 0,
-            })
-            .unwrap();
+        h.um.add_user(MemoryUser { email: "1".to_string(), level: 0 }).unwrap();
+        h.um.add_user(MemoryUser { email: "2".to_string(), level: 0 }).unwrap();
         let svc = make_service_with_inbound(h);
         let resp = svc
             .get_inbound_users_count(GetInboundUserRequest {
@@ -860,15 +856,8 @@ mod tests {
                 h2.clone() as Arc<dyn InboundHandlerWithUserManager>,
             ]),
         });
-        let svc = DefaultHandlerService {
-            inbound_provider: Some(provider),
-            ..Default::default()
-        };
-        let resp = svc
-            .list_inbounds(ListInboundsRequest {
-                is_only_tags: true,
-            })
-            .unwrap();
+        let svc = DefaultHandlerService { inbound_provider: Some(provider), ..Default::default() };
+        let resp = svc.list_inbounds(ListInboundsRequest { is_only_tags: true }).unwrap();
         assert_eq!(resp.inbounds.len(), 2);
         let tags: Vec<String> = resp.inbounds.into_iter().map(|c| c.tag).collect();
         assert!(tags.contains(&"a".to_string()));
@@ -881,7 +870,7 @@ mod tests {
         match svc.list_inbounds(ListInboundsRequest::default()) {
             Err(ProxymanError::Other(_)) => (),
             Err(e) => panic!("expected Other, got: {e}"),
-    Ok(_) => panic!("expected error, got Ok"),
+            Ok(_) => panic!("expected error, got Ok"),
         }
     }
 
@@ -889,12 +878,10 @@ mod tests {
     fn remove_inbound_unknown_returns_handler_not_found() {
         let h = make_stub_inbound("a");
         let svc = make_service_with_inbound(h);
-        match svc.remove_inbound(RemoveInboundRequest {
-            tag: "ghost".to_string(),
-        }) {
+        match svc.remove_inbound(RemoveInboundRequest { tag: "ghost".to_string() }) {
             Err(ProxymanError::HandlerNotFound(t)) => assert_eq!(t, "ghost"),
             Err(e) => panic!("expected HandlerNotFound, got: {e}"),
-    Ok(_) => panic!("expected error, got Ok"),
+            Ok(_) => panic!("expected error, got Ok"),
         }
     }
 
@@ -904,7 +891,7 @@ mod tests {
         match svc.add_inbound(AddInboundRequest::default()) {
             Err(ProxymanError::Other(_)) => (),
             Err(e) => panic!("expected Other, got: {e}"),
-    Ok(_) => panic!("expected error, got Ok"),
+            Ok(_) => panic!("expected error, got Ok"),
         }
     }
 
@@ -918,7 +905,7 @@ mod tests {
         match svc.alter_inbound(req) {
             Err(ProxymanError::Other(_)) => (),
             Err(e) => panic!("expected Other, got: {e}"),
-    Ok(_) => panic!("expected error, got Ok"),
+            Ok(_) => panic!("expected error, got Ok"),
         }
     }
 
@@ -1007,27 +994,71 @@ mod tests {
         tag: String,
     }
     impl crate::outbound::OutboundHandler for StubOutboundHandler {
-        fn tag(&self) -> &str { &self.tag }
-        fn start(&self) -> crate::inbound::PinFuture<Result<(), ProxymanError>> { Box::pin(async { Ok(()) }) }
-        fn close(&self) -> crate::inbound::PinFuture<Result<(), ProxymanError>> { Box::pin(async { Ok(()) }) }
-        fn sender_type_url(&self) -> Option<&str> { Some("sender_url") }
-        fn proxy_type_url(&self) -> &str { "xray.test.outbound" }
-        fn dispatch(&self, _session: xray_common::session::Session, _link: xray_transport::link::Link) -> crate::inbound::PinFuture<Result<(), ProxymanError>> { Box::pin(async { Ok(()) }) }
-        fn dial(&self, _dest: &xray_common::net::destination::Destination) -> crate::inbound::PinFuture<std::io::Result<Box<dyn xray_transport::connection::Connection>>> { Box::pin(async { Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "stub")) }) }
+        fn tag(&self) -> &str {
+            &self.tag
+        }
+
+        fn start(&self) -> crate::inbound::PinFuture<Result<(), ProxymanError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn close(&self) -> crate::inbound::PinFuture<Result<(), ProxymanError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn sender_type_url(&self) -> Option<&str> {
+            Some("sender_url")
+        }
+
+        fn proxy_type_url(&self) -> &str {
+            "xray.test.outbound"
+        }
+
+        fn dispatch(
+            &self,
+            _session: xray_common::session::Session,
+            _link: xray_transport::link::Link,
+        ) -> crate::inbound::PinFuture<Result<(), ProxymanError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn dial(
+            &self,
+            _dest: &xray_common::net::destination::Destination,
+        ) -> crate::inbound::PinFuture<
+            std::io::Result<Box<dyn xray_transport::connection::Connection>>,
+        > {
+            Box::pin(async { Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "stub")) })
+        }
     }
 
     struct StubOutboundProvider {
         handlers: Mutex<Vec<Arc<StubOutboundHandler>>>,
     }
     impl OutboundHandlerProvider for StubOutboundProvider {
-        fn get_outbound_with_um(&self, tag: &str) -> Option<Arc<dyn OutboundHandlerWithUserManager>> { None }
+        fn get_outbound_with_um(
+            &self,
+            tag: &str,
+        ) -> Option<Arc<dyn OutboundHandlerWithUserManager>> {
+            None
+        }
+
         fn get_outbound(&self, tag: &str) -> Option<Arc<dyn crate::outbound::OutboundHandler>> {
-            self.handlers.lock().iter().find(|h| h.tag() == tag).cloned()
+            self.handlers
+                .lock()
+                .iter()
+                .find(|h| h.tag() == tag)
+                .cloned()
                 .map(|h| h as Arc<dyn crate::outbound::OutboundHandler>)
         }
+
         fn list_outbound_tags(&self) -> Vec<(String, Option<String>, String)> {
-            self.handlers.lock().iter()
-                .map(|h| (h.tag().to_string(), Some("sender_url".into()), h.proxy_type_url().to_string()))
+            self.handlers
+                .lock()
+                .iter()
+                .map(|h| {
+                    (h.tag().to_string(), Some("sender_url".into()), h.proxy_type_url().to_string())
+                })
                 .collect()
         }
     }
@@ -1053,10 +1084,7 @@ mod tests {
         let provider = Arc::new(StubOutboundProvider {
             handlers: Mutex::new(vec![Arc::new(StubOutboundHandler { tag: "out_full".into() })]),
         });
-        let svc = DefaultHandlerService {
-            outbound_provider: Some(provider),
-            ..Default::default()
-        };
+        let svc = DefaultHandlerService { outbound_provider: Some(provider), ..Default::default() };
         let resp = svc.list_outbounds(ListOutboundsRequest::default()).unwrap();
         assert_eq!(resp.outbounds.len(), 1);
         let cfg = &resp.outbounds[0];

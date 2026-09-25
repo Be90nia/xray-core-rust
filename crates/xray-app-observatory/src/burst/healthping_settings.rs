@@ -2,9 +2,10 @@
 //!
 //! 对应 Go `app/observatory/burst/healthping.go` 的 `HealthPingSettings` + `NewHealthPing`。
 
-use crate::error::ObservatoryError;
 use serde::{Deserialize, Serialize};
 use xray_proto::xray::core::app::observatory::burst::HealthPingConfig as ProtoHealthPingConfig;
+
+use crate::error::ObservatoryError;
 
 /// HealthPingConfig，对应 proto `HealthPingConfig`。
 /// JSON 字段命名采用 camelCase 对齐 Go proto（`samplingCount` / `httpMethod`）。
@@ -58,9 +59,8 @@ mod duration_nanos {
         let mut total: i64 = 0;
         let mut rest = s;
         while !rest.is_empty() {
-            let num_end = rest
-                .find(|c: char| !c.is_ascii_digit() && c != '.')
-                .unwrap_or(rest.len());
+            let num_end =
+                rest.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(rest.len());
             if num_end == 0 {
                 return None;
             }

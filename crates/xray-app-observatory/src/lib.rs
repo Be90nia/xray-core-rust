@@ -33,6 +33,7 @@ pub use burst::{
     },
     healthping_stats::{HealthPingRtts, HealthPingStats, PingRtt},
 };
+pub use burst_feature::BurstObservatoryFeature;
 pub use command::{
     DefaultObservatoryService, NoopObservatoryServiceRegistrar, ObservationProvider,
     ObservatoryService, ObservatoryServiceDescriptor, ObservatoryServiceRegistrar,
@@ -41,12 +42,10 @@ pub use config::{
     DEAD_DELAY_MS, DEFAULT_PROBE_INTERVAL_MS, DEFAULT_PROBE_URL, HealthPingMeasurement,
     ObservationResult, ObservatoryConfig, OutboundStatus, ProbeResult,
 };
-pub use error::{at_error, at_warning, ObservatoryError};
+pub use error::{ObservatoryError, at_error, at_warning};
 pub use error_collector::ErrorCollector;
-pub use observer::{
-    FixedProbeExecutor, HttpProbeExecutor, NoopOutboundSelector, Observer,
-    OutboundSelector, ProbeExecutor, RealOutboundProbeExecutor, RealOutboundSelector,
-    now_unix_secs,
-};
-pub use burst_feature::BurstObservatoryFeature;
 pub use feature::ObservatoryFeature;
+pub use observer::{
+    FixedProbeExecutor, HttpProbeExecutor, NoopOutboundSelector, Observer, OutboundSelector,
+    ProbeExecutor, RealOutboundProbeExecutor, RealOutboundSelector, now_unix_secs,
+};

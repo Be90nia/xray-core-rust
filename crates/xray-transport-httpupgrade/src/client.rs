@@ -11,11 +11,13 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::config::Config;
-use crate::connection::HttpUpgradeConnection;
-use crate::deferred::DeferredResponseReader;
-use crate::dialer::{build_upgrade_request, parse_upgrade_response};
-use crate::error::Result;
+use crate::{
+    config::Config,
+    connection::HttpUpgradeConnection,
+    deferred::DeferredResponseReader,
+    dialer::{build_upgrade_request, parse_upgrade_response},
+    error::Result,
+};
 
 /// HTTP/1.1 响应头读取缓冲初始大小（含 `\r\n\r\n` 终止符）。
 const READ_INITIAL_CAPACITY: usize = 1024;
@@ -47,8 +49,8 @@ impl HttpUpgradeClient {
     /// 1. 用 `build_upgrade_request` 构造 GET 字节流并全量写入 IO
     /// 2. 读响应直到遇到 `\r\n\r\n`
     /// 3. 用 `parse_upgrade_response` 校验 101 状态 + Upgrade/Connection header
-    /// 4. 若响应末尾后还有字节（payload），保留在 HttpUpgradeConnection 内部
-    ///    由调用方继续读取（对齐 Go `ConnRF` 行为）
+    /// 4. 若响应末尾后还有字节（payload），保留在 HttpUpgradeConnection 内部 由调用方继续读取（对齐
+    ///    Go `ConnRF` 行为）
     ///
     /// # 返回
     /// 成功时返回 `HttpUpgradeConnection` 包装的底层 IO + 余留 payload 字节。
@@ -97,11 +99,8 @@ impl HttpUpgradeClient {
         let payload_offset = parse_upgrade_response(&buf)?;
 
         // 4. 提取余留 payload（如有）
-        let leftover = if payload_offset < buf.len() {
-            buf[payload_offset..].to_vec()
-        } else {
-            Vec::new()
-        };
+        let leftover =
+            if payload_offset < buf.len() { buf[payload_offset..].to_vec() } else { Vec::new() };
 
         Ok((HttpUpgradeConnection::new(io, None), leftover))
     }
@@ -111,7 +110,10 @@ impl HttpUpgradeClient {
     /// 与 [`dial_over_io`] 相同，但返回 `DeferredResponseReader` 包装，
     /// 首次 `AsyncRead::poll_read` 时才解析 101 响应。
     /// 调用方根据 `config.ed > 0` 选择此方法。
-    pub async fn dial_over_io_deferred<IO>(&self, mut io: IO) -> Result<HttpUpgradeConnection<DeferredResponseReader<IO>>>
+    pub async fn dial_over_io_deferred<IO>(
+        &self,
+        mut io: IO,
+    ) -> Result<HttpUpgradeConnection<DeferredResponseReader<IO>>>
     where
         IO: AsyncRead + AsyncWrite + Unpin,
     {
@@ -126,26 +128,22 @@ impl HttpUpgradeClient {
     }
 }
 
-
 /// 在字节流中查找 `\r\n\r\n`（header 终止符）位置。返回起始下标。
 fn find_header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncReadExt, duplex};
+
     use super::*;
-    use tokio::io::{duplex, AsyncReadExt};
 
     #[tokio::test]
     async fn dial_writes_request_and_reads_101_response() {
         let client = HttpUpgradeClient::new(
             "example.com".into(),
-            Config {
-                path: "/ws".into(),
-                ..Default::default()
-            },
+            Config { path: "/ws".into(), ..Default::default() },
         );
 
         // duplex 模拟 server 端
@@ -176,13 +174,8 @@ mod tests {
 
     #[tokio::test]
     async fn dial_captures_payload_after_response() {
-        let client = HttpUpgradeClient::new(
-            "h".into(),
-            Config {
-                path: "/".into(),
-                ..Default::default()
-            },
-        );
+        let client =
+            HttpUpgradeClient::new("h".into(), Config { path: "/".into(), ..Default::default() });
         let (mut client_io, mut server_io) = duplex(8192);
         let handle = tokio::spawn(async move { client.dial_over_io(client_io).await });
 
@@ -199,10 +192,7 @@ mod tests {
 
     #[tokio::test]
     async fn dial_rejects_non_101_response() {
-        let client = HttpUpgradeClient::new(
-            "h".into(),
-            Config::default(),
-        );
+        let client = HttpUpgradeClient::new("h".into(), Config::default());
         let (mut client_io, mut server_io) = duplex(8192);
         let handle = tokio::spawn(async move { client.dial_over_io(client_io).await });
 
@@ -225,8 +215,8 @@ mod tests {
         let err = client.dial_over_io(&mut client_io).await.unwrap_err();
         // 服务端断连：EOF 返 InvalidHttpFormat，或 BrokenPipe 返 Io —— 都算协议失败
         match err {
-            crate::error::HttpUpgradeError::InvalidHttpFormat(_) => {}
-            crate::error::HttpUpgradeError::Io(_) => {}
+            crate::error::HttpUpgradeError::InvalidHttpFormat(_) => {},
+            crate::error::HttpUpgradeError::Io(_) => {},
             other => panic!("unexpected error: {other:?}"),
         }
     }

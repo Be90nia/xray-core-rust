@@ -8,5 +8,5 @@ pub mod command;
 pub mod packet;
 
 pub use address::Address;
-pub use command::{parse_header, Command, TOKEN_LEN, VERSION};
+pub use command::{Command, TOKEN_LEN, VERSION, parse_header};
 pub use packet::{FragmentAssembler, Packet};

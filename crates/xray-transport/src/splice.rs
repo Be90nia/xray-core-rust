@@ -24,13 +24,12 @@
 pub use imp::{bridge_with, plan, splice_copy, splice_copy_counted};
 
 mod imp {
-    use std::io;
-    use std::net::SocketAddr;
-    use std::os::unix::io::AsRawFd;
+    use std::{io, net::SocketAddr, os::unix::io::AsRawFd};
+
     use tokio::net::TcpStream;
+    use xray_common::platform::splice::splice_allowed;
 
     use crate::connection::Connection;
-    use xray_common::platform::splice::splice_allowed;
 
     /// Linux 默认 pipe 容量（16 × 4KiB）。仅在 `pending < PIPE_CAP` 时尝试
     /// fill，规避 pipe 满导致的 EAGAIN 空转（内核容量被调小到低于此值时，
@@ -72,10 +71,7 @@ mod imp {
     pub async fn splice_copy_counted(
         from: &TcpStream,
         to: &TcpStream,
-        counters: Option<(
-            &dyn xray_features::stats::Counter,
-            &dyn xray_features::stats::Counter,
-        )>,
+        counters: Option<(&dyn xray_features::stats::Counter, &dyn xray_features::stats::Counter)>,
     ) -> io::Result<u64> {
         let mut fds: [libc::c_int; 2] = [0; 2];
         // O_NONBLOCK：socket 侧本就非阻塞；pipe 侧非阻塞使满/空均 EAGAIN，
@@ -113,16 +109,17 @@ mod imp {
                             out_c.add(n64);
                             in_c.add(n64);
                         }
-                    }
+                    },
                     0 => eof = true,
                     n if n < 0 => {
                         let err = io::Error::last_os_error();
                         if is_eagain(&err) {
-                            from.readable().await?; let _ = from.try_read(&mut []);
+                            from.readable().await?;
+                            let _ = from.try_read(&mut []);
                         } else {
                             return Err(err);
                         }
-                    }
+                    },
                     _ => unreachable!(),
                 }
             }
@@ -132,11 +129,12 @@ mod imp {
                     n if n < 0 => {
                         let err = io::Error::last_os_error();
                         if is_eagain(&err) {
-                            to.writable().await?; let _ = to.try_write(&mut []);
+                            to.writable().await?;
+                            let _ = to.try_write(&mut []);
                         } else {
                             return Err(err);
                         }
-                    }
+                    },
                     // pending>0 且 pipe 读端非阻塞：0 不可达。万一命中（内核态
                     // 异常），大声报错终止而非静默原地空转。
                     _ => {
@@ -144,7 +142,7 @@ mod imp {
                             io::ErrorKind::UnexpectedEof,
                             "splice: pipe underflow (pending>0 but drain returned 0)",
                         ));
-                    }
+                    },
                 }
             }
         }
@@ -181,12 +179,15 @@ mod imp {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod tests {
-    use std::net::SocketAddr;
-    use std::io;
+    use std::{io, net::SocketAddr};
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+
     use super::imp::{bridge_with, plan, splice_copy};
     use crate::connection::{Connection, TcpConnection};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
 
     /// 起一对回环连接：(本端持有 socket, 其对端 socket)。
     async fn loopback_pair() -> (TcpStream, TcpStream) {
@@ -213,9 +214,8 @@ mod tests {
         let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
         let expect = payload.clone();
 
-        let pump = tokio::spawn(async move {
-            splice_copy(&sa_for_pump, &sb_for_pump).await.unwrap()
-        });
+        let pump =
+            tokio::spawn(async move { splice_copy(&sa_for_pump, &sb_for_pump).await.unwrap() });
 
         // A 端独立任务写满并关写端（EOF 驱动泵退出）；B 端 read_exact 逐字节校验。
         let writer = tokio::spawn(async move {
@@ -300,12 +300,14 @@ mod tests {
             ) -> std::task::Poll<io::Result<usize>> {
                 std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
             }
+
             fn poll_flush(
                 mut self: std::pin::Pin<&mut Self>,
                 cx: &mut std::task::Context<'_>,
             ) -> std::task::Poll<io::Result<()>> {
                 std::pin::Pin::new(&mut self.0).poll_flush(cx)
             }
+
             fn poll_shutdown(
                 mut self: std::pin::Pin<&mut Self>,
                 cx: &mut std::task::Context<'_>,
@@ -317,9 +319,11 @@ mod tests {
             fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
                 self.0.peer_addr().map(Some)
             }
+
             fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
                 self.0.local_addr().map(Some)
             }
+
             // raw_tcp_clone 穿透（TLS 包装层的真实形态），但 is_raw_tcp 保持
             // 默认 false —— splice 准入必须拒绝。
             fn raw_tcp_clone(&self) -> Option<TcpStream> {

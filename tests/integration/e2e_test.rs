@@ -1,4 +1,5 @@
-//! End-to-end (e2e) integration tests: full config -> build xray-core instance -> start proxy -> send request -> verify.
+//! End-to-end (e2e) integration tests: full config -> build xray-core instance -> start proxy ->
+//! send request -> verify.
 //!
 //! Unlike existing Rust-only tests that directly call `serve_vmess`/`serve_vless` etc,
 //! these tests go through the full startup path via `xray_core::functions::start_full`:
@@ -11,31 +12,34 @@
 use std::sync::Arc;
 
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tokio::net::TcpStream;
-
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::port::Port;
-use xray_common::protocol::{Command, RequestHeader, SecurityType};
-use xray_common::uuid::UUID;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
+use xray_common::{
+    net::{address::Address, destination::Destination, port::Port},
+    protocol::{Command, RequestHeader, SecurityType},
+    uuid::UUID,
+};
 use xray_conf::{BuiltConfig, BuiltEntry, BuiltInbound, BuiltOutbound};
 use xray_core::functions::start_full;
-use xray_proxy_vmess::account::cmd_key_of;
-use xray_proxy_vmess::encoding::client::ClientSession as VmessClientSession;
-use xray_proxy_vmess::encoding::VERSION as VMESS_VERSION;
-use xray_proxy_vless::encoding::client::{
-    decode_response_header as vless_decode_response_header,
-    encode_request_header as vless_encode_request_header,
-};
-use xray_proxy_vless::encoding::{empty_addons as vless_empty_addons, VlessCommand, VERSION as VLESS_VERSION};
-use xray_proxy_trojan::config::MemoryAccount as TrojanMemoryAccount;
-use xray_proxy_trojan::protocol::{
-    write_request_header as trojan_write_request_header, Network as TrojanNetwork,
-};
 use xray_proxy_ss::config::{CipherType, MemoryAccount as SsMemoryAccount};
-
+use xray_proxy_trojan::{
+    config::MemoryAccount as TrojanMemoryAccount,
+    protocol::{Network as TrojanNetwork, write_request_header as trojan_write_request_header},
+};
+use xray_proxy_vless::encoding::{
+    VERSION as VLESS_VERSION, VlessCommand,
+    client::{
+        decode_response_header as vless_decode_response_header,
+        encode_request_header as vless_encode_request_header,
+    },
+    empty_addons as vless_empty_addons,
+};
+use xray_proxy_vmess::{
+    account::cmd_key_of,
+    encoding::{VERSION as VMESS_VERSION, client::ClientSession as VmessClientSession},
+};
 
 /// VMess test UUID (consistent with vmess_test.rs for debugging).
 const VMESS_UUID_STR: &str = "66ad4540-b58c-4ad2-9926-ea63445a9b57";
@@ -108,22 +112,17 @@ impl E2eTestBuilder {
                         if sock.write_all(&buf[..n]).await.is_err() {
                             break;
                         }
-                    }
+                    },
                 }
             }
         });
-        Ok(Self {
-            echo_addr,
-            instance: None,
-            inbound_handles: Vec::new(),
-        })
+        Ok(Self { echo_addr, instance: None, inbound_handles: Vec::new() })
     }
 
     /// Start xray-core instance with `BuiltConfig` (includes inbound/outbound).
     pub async fn with_xray(mut self, built: &BuiltConfig) -> Result<Self, E2eError> {
-        let (instance, _ohm, handles) = start_full(built)
-            .await
-            .map_err(|e| E2eError::CoreStart(e.to_string()))?;
+        let (instance, _ohm, handles) =
+            start_full(built).await.map_err(|e| E2eError::CoreStart(e.to_string()))?;
         self.instance = Some(instance);
         self.inbound_handles = handles;
         // Wait for listener to be ready
@@ -157,10 +156,7 @@ async fn pick_free_port() -> Result<u16, E2eError> {
 /// Build a freedom outbound (default, dials directly to echo server).
 fn freedom_outbound(tag: &str) -> BuiltOutbound {
     BuiltOutbound {
-        entry: BuiltEntry {
-            kind: "freedom".into(),
-            data: b"{}".to_vec(),
-        },
+        entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
         tag: tag.into(),
         send_through: None,
         stream_settings_json: None,
@@ -207,10 +203,8 @@ async fn send_and_verify_via_vmess(
 ) -> Result<(), E2eError> {
     let mut client = TcpStream::connect(proxy_addr).await?;
     let session = VmessClientSession::new();
-    let dest = Destination::tcp(
-        Address::ipv4(std::net::Ipv4Addr::LOCALHOST),
-        Port::new(echo_addr.port()),
-    );
+    let dest =
+        Destination::tcp(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(echo_addr.port()));
     let header = RequestHeader::new(VMESS_VERSION, Command::Tcp, dest, SecurityType::Aes128Gcm);
     let cmd_key = cmd_key_of(uuid);
     let sealed = session
@@ -299,9 +293,7 @@ async fn send_and_verify_via_socks5(
     let mut resp = [0u8; 2];
     client.read_exact(&mut resp).await?;
     if resp != [0x05, 0x00] {
-        return Err(E2eError::Codec(format!(
-            "socks5 handshake unexpected: {resp:?}"
-        )));
+        return Err(E2eError::Codec(format!("socks5 handshake unexpected: {resp:?}")));
     }
     // CONNECT echo_addr (IPv4)
     let ipv4 = match echo_addr.ip() {
@@ -315,10 +307,7 @@ async fn send_and_verify_via_socks5(
     let mut connect_resp = [0u8; 10];
     client.read_exact(&mut connect_resp).await?;
     if connect_resp[1] != 0x00 {
-        return Err(E2eError::Codec(format!(
-            "socks5 connect failed: code {}",
-            connect_resp[1]
-        )));
+        return Err(E2eError::Codec(format!("socks5 connect failed: code {}", connect_resp[1])));
     }
     // Send payload + read echo
     client.write_all(PAYLOAD).await?;
@@ -358,7 +347,8 @@ fn make_ss_account() -> SsMemoryAccount {
 // End-to-end tests: VMess / VLESS / Trojan / SS
 // ============================================================
 
-/// VMess e2e: BuiltConfig(vmess inbound + freedom outbound) -> start_full -> VMess client -> echo -> verify.
+/// VMess e2e: BuiltConfig(vmess inbound + freedom outbound) -> start_full -> VMess client -> echo
+/// -> verify.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_vmess_proxy() {
     let mut env = E2eTestBuilder::new().await.expect("echo server");
@@ -381,20 +371,15 @@ async fn e2e_vmess_proxy() {
     built.outbounds.push(freedom_outbound("direct"));
 
     env = env.with_xray(&built).await.expect("start xray-core");
-    assert!(
-        env.instance.as_ref().is_some_and(|i| i.is_running()),
-        "instance should be running"
-    );
+    assert!(env.instance.as_ref().is_some_and(|i| i.is_running()), "instance should be running");
 
-    let proxy_addr: std::net::SocketAddr = format!("127.0.0.1:{vmess_port}")
-        .parse()
-        .expect("proxy addr");
-    send_and_verify_via_vmess(proxy_addr, env.echo_addr, &uuid)
-        .await
-        .expect("vmess e2e");
+    let proxy_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{vmess_port}").parse().expect("proxy addr");
+    send_and_verify_via_vmess(proxy_addr, env.echo_addr, &uuid).await.expect("vmess e2e");
 }
 
-/// VLESS e2e: BuiltConfig(vless inbound + freedom outbound) -> start_full -> VLESS client -> echo -> verify.
+/// VLESS e2e: BuiltConfig(vless inbound + freedom outbound) -> start_full -> VLESS client -> echo
+/// -> verify.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_vless_proxy() {
     let mut env = E2eTestBuilder::new().await.expect("echo server");
@@ -417,19 +402,14 @@ async fn e2e_vless_proxy() {
     built.outbounds.push(freedom_outbound("direct"));
 
     env = env.with_xray(&built).await.expect("start xray-core");
-    assert!(
-        env.instance.as_ref().is_some_and(|i| i.is_running()),
-        "instance should be running"
-    );
+    assert!(env.instance.as_ref().is_some_and(|i| i.is_running()), "instance should be running");
 
-    let proxy_addr: std::net::SocketAddr = format!("127.0.0.1:{vless_port}")
-        .parse()
-        .expect("proxy addr");
-    send_and_verify_via_vless(proxy_addr, env.echo_addr, &uuid)
-        .await
-        .expect("vless e2e");
+    let proxy_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{vless_port}").parse().expect("proxy addr");
+    send_and_verify_via_vless(proxy_addr, env.echo_addr, &uuid).await.expect("vless e2e");
 }
-/// Trojan e2e: BuiltConfig(trojan inbound + freedom outbound) -> start_full -> Trojan client -> echo -> verify.
+/// Trojan e2e: BuiltConfig(trojan inbound + freedom outbound) -> start_full -> Trojan client ->
+/// echo -> verify.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_trojan_proxy() {
     let mut env = E2eTestBuilder::new().await.expect("echo server");
@@ -452,20 +432,15 @@ async fn e2e_trojan_proxy() {
     built.outbounds.push(freedom_outbound("direct"));
 
     env = env.with_xray(&built).await.expect("start xray-core");
-    assert!(
-        env.instance.as_ref().is_some_and(|i| i.is_running()),
-        "instance should be running"
-    );
+    assert!(env.instance.as_ref().is_some_and(|i| i.is_running()), "instance should be running");
 
-    let proxy_addr: std::net::SocketAddr = format!("127.0.0.1:{trojan_port}")
-        .parse()
-        .expect("proxy addr");
-    send_and_verify_via_trojan(proxy_addr, env.echo_addr, &account)
-        .await
-        .expect("trojan e2e");
+    let proxy_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{trojan_port}").parse().expect("proxy addr");
+    send_and_verify_via_trojan(proxy_addr, env.echo_addr, &account).await.expect("trojan e2e");
 }
 
-/// SS e2e: BuiltConfig(socks5 inbound + freedom outbound) -> start_full -> SOCKS5 proxy -> echo -> verify.
+/// SS e2e: BuiltConfig(socks5 inbound + freedom outbound) -> start_full -> SOCKS5 proxy -> echo ->
+/// verify.
 ///
 /// TODO: xray-core outbound.rs does not yet support SS outbound, and SS inbound
 /// is not registered in spawn_inbounds. This test uses SOCKS5 inbound as a proxy
@@ -480,10 +455,7 @@ async fn e2e_ss_proxy() {
 
     let mut built = BuiltConfig::default();
     built.inbounds.push(BuiltInbound {
-        entry: BuiltEntry {
-            kind: "socks".into(),
-            data: b"{}".to_vec(),
-        },
+        entry: BuiltEntry { kind: "socks".into(), data: b"{}".to_vec() },
         tag: "socks-in".into(),
         port: Some(socks_port),
         listen: Some("127.0.0.1".into()),
@@ -493,15 +465,11 @@ async fn e2e_ss_proxy() {
     built.outbounds.push(freedom_outbound("direct"));
 
     env = env.with_xray(&built).await.expect("start xray-core");
-    assert!(
-        env.instance.as_ref().is_some_and(|i| i.is_running()),
-        "instance should be running"
-    );
+    assert!(env.instance.as_ref().is_some_and(|i| i.is_running()), "instance should be running");
 
     // Verify the full core startup path works via SOCKS5
-    let proxy_addr: std::net::SocketAddr = format!("127.0.0.1:{socks_port}")
-        .parse()
-        .expect("proxy addr");
+    let proxy_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{socks_port}").parse().expect("proxy addr");
     send_and_verify_via_socks5(proxy_addr, env.echo_addr)
         .await
         .expect("socks5 e2e (SS proxy entry point)");

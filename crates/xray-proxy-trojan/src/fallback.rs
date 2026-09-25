@@ -5,8 +5,7 @@
 //! 3 级匹配树：SNI → ALPN → Path。
 //! 每级先精确匹配，回退到通配（空字符串）。
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 /// 单个 Fallback 配置。对应 proto `Fallback`。
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -19,7 +18,8 @@ pub struct Fallback {
     pub path: String,
     /// 拨号网络类型（`"tcp"` / `"unix"`，空 = 未指定）。
     ///
-    /// 对应 proto `Fallback.type`；Go `server.go:457` `dialer.DialContext(ctx, fb.Type, fb.Dest)`。
+    /// 对应 proto `Fallback.type`；Go `server.go:457` `dialer.DialContext(ctx, fb.Type,
+    /// fb.Dest)`。
     pub r#type: String,
     /// 目标地址（host:port 或 Unix socket 路径）。
     pub dest: String,
@@ -224,8 +224,8 @@ mod tests {
     #[test]
     fn exact_match_wins_over_wildcard() {
         let policy = FallbackPolicy::from_list(&[
-            fb("", "", "", "default"),       // 通配
-            fb("a.com", "", "", "a.com"),    // SNI 精确
+            fb("", "", "", "default"),    // 通配
+            fb("a.com", "", "", "a.com"), // SNI 精确
         ]);
         assert_eq!(policy.decide("a.com", "", "").unwrap().dest, "a.com");
         assert_eq!(policy.decide("b.com", "", "").unwrap().dest, "default");
@@ -268,10 +268,8 @@ mod tests {
     /// 查询侧 lowercase：恶意大写 SNI 不得绕过精确规则（Go server.go:385-386）。
     #[test]
     fn sni_lowercase_matches_case_insensitively() {
-        let policy = FallbackPolicy::from_list(&[
-            fb("", "", "", "default"),
-            fb("a.com", "", "", "a.com"),
-        ]);
+        let policy =
+            FallbackPolicy::from_list(&[fb("", "", "", "default"), fb("a.com", "", "", "a.com")]);
         assert_eq!(policy.decide("A.COM", "", "").unwrap().dest, "a.com");
         assert_eq!(policy.decide("a.Com", "", "").unwrap().dest, "a.com");
     }
@@ -285,10 +283,7 @@ mod tests {
             fb("example.com", "", "", "example.com"),
             fb("other.org", "", "", "other.org"),
         ]);
-        assert_eq!(
-            policy.decide("sub.example.com", "", "").unwrap().dest,
-            "example.com"
-        );
+        assert_eq!(policy.decide("sub.example.com", "", "").unwrap().dest, "example.com");
     }
 
     /// 模糊匹配取最长 contains 命中（Go server.go:392-394 `len(n) > len(match)`）。
@@ -299,9 +294,6 @@ mod tests {
             fb("example.com", "", "", "example.com"),
             fb("a.example.com", "", "", "a.example.com"),
         ]);
-        assert_eq!(
-            policy.decide("x.a.example.com", "", "").unwrap().dest,
-            "a.example.com"
-        );
+        assert_eq!(policy.decide("x.a.example.com", "", "").unwrap().dest, "a.example.com");
     }
 }

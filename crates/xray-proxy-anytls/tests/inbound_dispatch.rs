@@ -12,22 +12,28 @@
 
 #![cfg(test)]
 
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
-use rustls::ClientConfig as RustlsClientConfig;
-use rustls::ServerConfig as RustlsServerConfig;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use rustls::{ClientConfig as RustlsClientConfig, ServerConfig as RustlsServerConfig};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 use tokio_rustls::TlsAcceptor;
-
-use xray_app_dispatcher::default::{DialBridge, SimpleOhm};
-use xray_app_dispatcher::OutboundHandlerManager;
+use xray_app_dispatcher::{
+    OutboundHandlerManager,
+    default::{DialBridge, SimpleOhm},
+};
 use xray_features::inbound::InboundHandler;
-use xray_proxy_anytls::client::{AnytlsClient, ClientConfig};
-use xray_proxy_anytls::inbound::AnytlsInboundHandler;
-use xray_proxy_anytls::socks::SocksAddr;
+use xray_proxy_anytls::{
+    client::{AnytlsClient, ClientConfig},
+    inbound::AnytlsInboundHandler,
+    socks::SocksAddr,
+};
 async fn start_echo_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -43,7 +49,7 @@ async fn start_echo_server() -> SocketAddr {
                             if sock.write_all(&buf[..n]).await.is_err() {
                                 break;
                             }
-                        }
+                        },
                     }
                 }
             });
@@ -57,9 +63,7 @@ fn make_server_config() -> (RustlsServerConfig, Vec<u8>) {
     use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
     let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     params.distinguished_name = DistinguishedName::new();
-    params
-        .distinguished_name
-        .push(DnType::CommonName, "localhost");
+    params.distinguished_name.push(DnType::CommonName, "localhost");
     let key_pair = KeyPair::generate().unwrap();
     let cert = params.self_signed(&key_pair).unwrap();
     let cert_der = cert.der().clone();
@@ -75,11 +79,7 @@ fn make_server_config() -> (RustlsServerConfig, Vec<u8>) {
 fn make_client_config(server_cert_der: &[u8]) -> Arc<RustlsClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.add(server_cert_der.to_vec().into()).unwrap();
-    Arc::new(
-        RustlsClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth(),
-    )
+    Arc::new(RustlsClientConfig::builder().with_root_certificates(root_store).with_no_client_auth())
 }
 
 #[tokio::test]
@@ -103,12 +103,9 @@ async fn inbound_dispatches_via_router() {
         ohm.get_default_handler().unwrap();
 
     // 4. AnyTLS inbound（with_dispatch）
-    let handler = AnytlsInboundHandler::new(
-        "anytls-in",
-        "127.0.0.1:0".parse().unwrap(),
-        tls_acceptor,
-    )
-    .with_dispatch(dispatch);
+    let handler =
+        AnytlsInboundHandler::new("anytls-in", "127.0.0.1:0".parse().unwrap(), tls_acceptor)
+            .with_dispatch(dispatch);
     handler.start().await.expect("anytls inbound start");
     let inbound_port = handler.port();
     assert!(inbound_port > 0, "inbound must bind ephemeral port");
@@ -131,9 +128,7 @@ async fn inbound_dispatches_via_router() {
     let payload = b"hello anytls via inbound dispatcher";
     conn.write_all(payload).await.unwrap();
     let mut got = vec![0u8; payload.len()];
-    conn.read_exact(&mut got)
-        .await
-        .expect("read_exact should succeed via dispatcher→freedom→echo");
+    conn.read_exact(&mut got).await.expect("read_exact should succeed via dispatcher→freedom→echo");
     assert_eq!(&got, payload, "inbound must relay via dispatcher/router");
 
     drop(conn);

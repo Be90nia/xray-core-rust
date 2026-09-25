@@ -26,9 +26,11 @@ use std::{
 use bytes::Bytes;
 use quinn::{Connection, RecvStream, SendStream, VarInt};
 use tokio::sync::Mutex;
-use crate::salamander_socket::UdpObfs;
 
-use crate::conn::{QuicConn, QuicStream};
+use crate::{
+    conn::{QuicConn, QuicStream},
+    salamander_socket::UdpObfs,
+};
 
 /// quinn 双向 stream 包装为 [`QuicStream`]。
 ///
@@ -86,11 +88,7 @@ impl QuicStream for QuinnQuicStream {
         Box::pin(std::future::poll_fn(move |cx| self.poll_write(cx, buf)))
     }
 
-    fn poll_write(
-        &self,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<io::Result<usize>> {
+    fn poll_write(&self, cx: &mut Context<'_>, buf: &[u8]) -> std::task::Poll<io::Result<usize>> {
         // 直通 quinn 原生 poll_write（固有方法，返回 WriteError 需手动映射——
         // 错误分类与原 async write 一致），单次拷入发送缓冲，零 Vec 装箱（bd）
         let mut send = self.send.lock();
@@ -287,7 +285,8 @@ pub(crate) fn build_hysteria_transport_config(
         t.keep_alive_interval(Some(Duration::from_millis(qc.keep_alive_period_ms)));
     }
     // 缺省 disabled（Go parity：dialer.go:111-113 KeepAlivePeriod 仅来自用户配置，
-    // 注释内默认 10s 是死代码；bd c1qh 回滚 u9um 的 15s 有意偏离。NAT 场景用户显式配 keepAlivePeriod 找回）。
+    // 注释内默认 10s 是死代码；bd c1qh 回滚 u9um 的 15s 有意偏离。NAT 场景用户显式配
+    // keepAlivePeriod 找回）。
     if qc.enable_datagrams {
         // 参数化（rjo9）：取 QuicConfig.max_datagram_frame_size——from_params 与
         // default_for_hysteria 均取 crate::config::MaxDatagramFrameSize，对齐 Go
@@ -422,10 +421,7 @@ impl QuinnListenerFactory {
 
     /// 注入 QUIC 端点 socket 选项（UDP 缓冲调谐；builder 风格）。
     #[must_use]
-    pub fn with_sockopt(
-        mut self,
-        sockopt: xray_transport::sockopt::SocketOptions,
-    ) -> Self {
+    pub fn with_sockopt(mut self, sockopt: xray_transport::sockopt::SocketOptions) -> Self {
         self.sockopt = sockopt;
         self
     }
@@ -482,9 +478,7 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
                     .server_endpoint(template.clone(), bind_addr, &sockopt)
                     .await
                     .map_err(|e| {
-                        crate::error::HysteriaError::Io(io::Error::other(format!(
-                            "obfs bind: {e}"
-                        )))
+                        crate::error::HysteriaError::Io(io::Error::other(format!("obfs bind: {e}")))
                     })?,
                 None => {
                     let std_sock = xray_transport::sockopt::bind_udp_endpoint(bind_addr, &sockopt)
@@ -1601,10 +1595,7 @@ mod tests {
         )
         .unwrap();
         let obfs = parse_udp_obfs(Some(&fm)).unwrap();
-        assert!(
-            matches!(obfs, Some(UdpObfs::Gecko(_))),
-            "packetSize must select gecko mode"
-        );
+        assert!(matches!(obfs, Some(UdpObfs::Gecko(_))), "packetSize must select gecko mode");
 
         // 自签证书
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -1629,8 +1620,7 @@ mod tests {
                 1
             }
         }
-        let validator: Option<Arc<dyn crate::hub::AuthValidator>> =
-            Some(Arc::new(GeckoValidator));
+        let validator: Option<Arc<dyn crate::hub::AuthValidator>> = Some(Arc::new(GeckoValidator));
 
         let (stream_tx, mut stream_rx) =
             tokio::sync::mpsc::unbounded_channel::<Arc<InterStreamConn>>();

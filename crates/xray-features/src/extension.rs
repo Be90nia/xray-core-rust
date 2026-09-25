@@ -33,7 +33,10 @@ pub trait Environment: Send + Sync {
 /// context.Context，这里用 `TypeId` → `Arc<dyn Any>` 表提供同等查找能力。
 #[derive(Default)]
 pub struct Context {
-    features: std::collections::HashMap<std::any::TypeId, std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    features: std::collections::HashMap<
+        std::any::TypeId,
+        std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    >,
 }
 
 impl Context {
@@ -49,11 +52,7 @@ impl Context {
 
     /// 按类型取 feature，等价 `core.RequireFeatures(ctx, ...)` 单类型版本。
     pub fn require<T: crate::feature::Feature>(&self) -> Option<std::sync::Arc<T>> {
-        self.features
-            .get(&std::any::TypeId::of::<T>())?
-            .clone()
-            .downcast::<T>()
-            .ok()
+        self.features.get(&std::any::TypeId::of::<T>())?.clone().downcast::<T>().ok()
     }
 }
 
@@ -76,9 +75,7 @@ pub struct DefaultContextReceiver {
 
 impl DefaultContextReceiver {
     pub fn new() -> Self {
-        Self {
-            receivers: parking_lot::Mutex::new(Vec::new()),
-        }
+        Self { receivers: parking_lot::Mutex::new(Vec::new()) }
     }
 
     /// 添加一个 receiver。
@@ -125,9 +122,7 @@ mod tests {
 
     impl MockExtension {
         fn new(name: &str) -> Self {
-            Self {
-                name: name.to_string(),
-            }
+            Self { name: name.to_string() }
         }
     }
 
@@ -151,9 +146,7 @@ mod tests {
 
     impl MockEnvironment {
         fn new() -> Self {
-            Self {
-                config: std::collections::HashMap::new(),
-            }
+            Self { config: std::collections::HashMap::new() }
         }
     }
 

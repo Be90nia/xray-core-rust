@@ -25,9 +25,12 @@
 //! 响应校验：`101 Switching Protocols` + `Upgrade: websocket`（小写比较） +
 //! `Connection: upgrade`（小写比较）。
 
-use crate::config::Config;
-use crate::error::{HttpUpgradeError, Result};
 use xray_common::browser::{set_header, try_default_headers_with};
+
+use crate::{
+    config::Config,
+    error::{HttpUpgradeError, Result},
+};
 
 /// 构造 HTTP/1.1 GET upgrade 请求字节流。
 ///
@@ -43,13 +46,10 @@ use xray_common::browser::{set_header, try_default_headers_with};
 #[must_use]
 pub fn build_upgrade_request(host: &str, config: &Config) -> Vec<u8> {
     // 1. 用户自定义 header（Go dialer.go:96-98 AddHeader 循环）。
-    let mut headers: Vec<(String, String)> = config
-        .header
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    // 2. 浏览器伪装（Go dialer.go:99）：UA 缺省 → Chrome 全套；UA 为浏览器
-    //    枚举值 → 对应伪装；其他自定义 UA → 原样保留。
+    let mut headers: Vec<(String, String)> =
+        config.header.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    // 2. 浏览器伪装（Go dialer.go:99）：UA 缺省 → Chrome 全套；UA 为浏览器 枚举值 →
+    //    对应伪装；其他自定义 UA → 原样保留。
     try_default_headers_with(&mut headers, "ws");
     // 3. Connection/Upgrade 最后 Set（Go dialer.go:100-101）：覆盖用户同名配置。
     set_header(&mut headers, "Connection", "Upgrade");
@@ -92,14 +92,14 @@ fn write_header(buf: &mut Vec<u8>, key: &str, value: &str) {
 /// 校验 `resp.Status` / `Upgrade` / `Connection`。
 pub fn parse_upgrade_response(bytes: &[u8]) -> Result<usize> {
     // 找 \r\n\r\n 分隔头与 body。
-    let sep = find_header_end(bytes)
-        .ok_or_else(|| HttpUpgradeError::InvalidHttpFormat("missing \\r\\n\\r\\n terminator".into()))?;
+    let sep = find_header_end(bytes).ok_or_else(|| {
+        HttpUpgradeError::InvalidHttpFormat("missing \\r\\n\\r\\n terminator".into())
+    })?;
     let head = std::str::from_utf8(&bytes[..sep])
         .map_err(|e| HttpUpgradeError::InvalidHttpFormat(format!("non-utf8 header: {e}")))?;
     let mut lines = head.split("\r\n");
-    let status_line = lines
-        .next()
-        .ok_or_else(|| HttpUpgradeError::InvalidHttpFormat("empty response".into()))?;
+    let status_line =
+        lines.next().ok_or_else(|| HttpUpgradeError::InvalidHttpFormat("empty response".into()))?;
     // 状态行形如 "HTTP/1.1 101 Switching Protocols"
     if !status_line.starts_with("HTTP/") {
         return Err(HttpUpgradeError::InvalidHttpFormat(format!(
@@ -109,7 +109,9 @@ pub fn parse_upgrade_response(bytes: &[u8]) -> Result<usize> {
     let status = status_line
         .splitn(2, ' ')
         .nth(1)
-        .ok_or_else(|| HttpUpgradeError::InvalidHttpFormat(format!("malformed status: {status_line:?}")))?
+        .ok_or_else(|| {
+            HttpUpgradeError::InvalidHttpFormat(format!("malformed status: {status_line:?}"))
+        })?
         .trim();
     // 收集 Connection / Upgrade header（大小写不敏感比较值）
     let mut connection_value = String::new();
@@ -124,14 +126,14 @@ pub fn parse_upgrade_response(bytes: &[u8]) -> Result<usize> {
                         connection_value.push(',');
                     }
                     connection_value.push_str(value);
-                }
+                },
                 "upgrade" => {
                     if !upgrade_value.is_empty() {
                         upgrade_value.push(',');
                     }
                     upgrade_value.push_str(value);
-                }
-                _ => {}
+                },
+                _ => {},
             }
         }
     }
@@ -157,9 +159,7 @@ pub fn parse_upgrade_response(bytes: &[u8]) -> Result<usize> {
 
 /// 在字节流中查找 `\r\n\r\n`（header 终止符）位置。返回起始下标。
 fn find_header_end(bytes: &[u8]) -> Option<usize> {
-    bytes
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
+    bytes.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
 #[cfg(test)]
@@ -167,11 +167,7 @@ mod tests {
     use super::*;
 
     fn make_config(path: &str) -> Config {
-        Config {
-            host: "example.com".into(),
-            path: path.into(),
-            ..Default::default()
-        }
+        Config { host: "example.com".into(), path: path.into(), ..Default::default() }
     }
 
     #[test]

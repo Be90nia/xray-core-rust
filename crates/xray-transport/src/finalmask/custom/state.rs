@@ -2,8 +2,10 @@
 //!
 //! TCP/UDP 用于跨连接复用 vars（按 local|remote 或 addr 作 key），TTL 默认 5 秒。
 
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use parking_lot::Mutex;
 
@@ -21,10 +23,7 @@ pub struct StateStore {
 
 impl StateStore {
     pub fn new(ttl: Duration) -> Self {
-        Self {
-            ttl,
-            entries: Mutex::new(HashMap::new()),
-        }
+        Self { ttl, entries: Mutex::new(HashMap::new()) }
     }
 
     /// 读取 key 的 vars 副本；过期则清理并返回 None。
@@ -43,10 +42,7 @@ impl StateStore {
         let mut entries = self.entries.lock();
         entries.insert(
             key.to_string(),
-            StateEntry {
-                vars: clone_vars(vars),
-                expires_at: Instant::now() + self.ttl,
-            },
+            StateEntry { vars: clone_vars(vars), expires_at: Instant::now() + self.ttl },
         );
     }
 }
@@ -58,8 +54,9 @@ pub(crate) fn clone_vars(vars: &HashMap<String, Vec<u8>>) -> HashMap<String, Vec
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::HashMap;
+
+    use super::*;
 
     #[test]
     fn set_then_get_returns_clone() {

@@ -3,8 +3,10 @@
 //! 对应 Go `app/policy/policy.go` 中 `Manager` 作为 `features.Feature`。
 //! Go 版 `Start`/`Close` 为 no-op（Manager 在 `New` 时已构建完毕）。
 
-use xray_features::policy::{Policy, PolicyManager, SystemStats};
-use xray_features::{Feature, FeatureError, Result};
+use xray_features::{
+    Feature, FeatureError, Result,
+    policy::{Policy, PolicyManager, SystemStats},
+};
 use xray_proto::xray::app::policy::Config;
 
 use crate::manager::{Manager, ManagerError};
@@ -17,11 +19,9 @@ pub struct PolicyFeature {
 impl PolicyFeature {
     /// 从 proto 配置创建 PolicyFeature。
     pub fn new(config: Config) -> Result<Self> {
-        let manager =
-            Manager::new(config).map_err(|e: ManagerError| FeatureError::StartFailed {
-                name: "policy",
-                message: e.to_string(),
-            })?;
+        let manager = Manager::new(config).map_err(|e: ManagerError| {
+            FeatureError::StartFailed { name: "policy", message: e.to_string() }
+        })?;
         Ok(Self { manager })
     }
 

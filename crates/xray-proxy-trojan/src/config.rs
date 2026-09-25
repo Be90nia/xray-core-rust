@@ -9,16 +9,15 @@
 //! 切片2 待办：proto 生成 + `Build`（→ protobuf） + ServerConfig/ClientConfig/Fallback。
 
 use sha2::{Digest, Sha224};
-
-use xray_proto::xray::common::protocol::ServerEndpoint;
-use xray_proto::xray::proxy::trojan::{
-    Account as ProtoAccount, ClientConfig as ProtoClientConfig,
-    ServerConfig as ProtoServerConfig,
+use xray_proto::xray::{
+    common::protocol::ServerEndpoint,
+    proxy::trojan::{
+        Account as ProtoAccount, ClientConfig as ProtoClientConfig,
+        ServerConfig as ProtoServerConfig,
+    },
 };
 
-use crate::error::Result;
-use crate::fallback::Fallback;
-use crate::validator::MemoryUser;
+use crate::{error::Result, fallback::Fallback, validator::MemoryUser};
 
 /// HEX 编码后的 SHA-224 字节数长度（SHA-224 输出 28 字节，hex 后 56 字符）。
 pub const HEX_KEY_LEN: usize = 56;
@@ -174,11 +173,7 @@ impl ServerConfig {
     /// `failed to get hysteria user` 同类路径——`User.ToMemoryUser` 出错即整体失败）。
     pub fn from_proto(p: ProtoServerConfig) -> Result<Self> {
         Ok(Self {
-            users: p
-                .users
-                .iter()
-                .map(MemoryUser::from_proto_user)
-                .collect::<Result<_>>()?,
+            users: p.users.iter().map(MemoryUser::from_proto_user).collect::<Result<_>>()?,
             fallbacks: p.fallbacks.into_iter().map(Fallback::from_proto).collect(),
         })
     }
@@ -221,9 +216,7 @@ mod tests {
 
     #[test]
     fn test_account_as_account() {
-        let acc = Account {
-            password: "secret".into(),
-        };
+        let acc = Account { password: "secret".into() };
         let mem = acc.as_account();
         assert_eq!(mem.password, "secret");
         assert_eq!(mem.key.len(), HEX_KEY_LEN);
@@ -324,10 +317,7 @@ mod tests {
     fn server_config_from_proto_rejects_bad_user() {
         use xray_proto::xray::common::protocol::User as ProtoUser;
         // 无 account 的 user：Go ToMemoryUser 报错 → NewServer 整体失败
-        let p = ProtoServerConfig {
-            users: vec![ProtoUser::default()],
-            fallbacks: vec![],
-        };
+        let p = ProtoServerConfig { users: vec![ProtoUser::default()], fallbacks: vec![] };
         assert!(ServerConfig::from_proto(p).is_err());
 
         // account type_url 非 trojan Account：同样拒绝

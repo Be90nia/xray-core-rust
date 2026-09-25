@@ -10,15 +10,15 @@
 //! - 暴露握手状态查询（基于 [`Tunnel::time_since_last_handshake`]）
 //! - 不负责 socket IO 与定时器驱动——由 [`crate::driver::WgDriver`] 调度
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use parking_lot::Mutex;
 
-use crate::config::{DeviceConfig, PeerConfig};
-use crate::error::{Result, WgError};
-use crate::tunnel::Tunnel;
+use crate::{
+    config::{DeviceConfig, PeerConfig},
+    error::{Result, WgError},
+    tunnel::Tunnel,
+};
 
 /// 握手超时——超过此时间无握手认为 peer 不可达。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -124,7 +124,9 @@ pub fn shared_peer(device: &DeviceConfig, peer: &PeerConfig, index: u32) -> Resu
 /// 用于 client 模式从 `PeerConfig.endpoint` (`"host:port"`) 初始化远端地址。
 /// 不做 DNS 解析——host 必须是 IP 地址；域名解析由上层负责。
 pub fn parse_endpoint_addr(s: &str) -> Result<SocketAddr> {
-    s.parse::<SocketAddr>().map_err(|_| WgError::InvalidEndpoint(format!("peer endpoint not host:port or not IP: {s}")))
+    s.parse::<SocketAddr>().map_err(|_| {
+        WgError::InvalidEndpoint(format!("peer endpoint not host:port or not IP: {s}"))
+    })
 }
 
 #[cfg(test)]
@@ -142,19 +144,13 @@ mod tests {
     }
 
     fn make_peer(pub_hex: String) -> PeerConfig {
-        PeerConfig {
-            public_key: pub_hex,
-            ..Default::default()
-        }
+        PeerConfig { public_key: pub_hex, ..Default::default() }
     }
 
     #[test]
     fn peer_session_constructs_from_config() {
         let (sec, pub_) = make_keypair(0x11);
-        let device = DeviceConfig {
-            secret_key: sec,
-            ..Default::default()
-        };
+        let device = DeviceConfig { secret_key: sec, ..Default::default() };
         let peer = make_peer(pub_);
         let session = PeerSession::new(&device, &peer, 0);
         assert!(session.is_ok(), "construct failed: {:?}", session.err());
@@ -163,10 +159,7 @@ mod tests {
     #[test]
     fn endpoint_set_and_get() {
         let (sec, pub_) = make_keypair(0x22);
-        let device = DeviceConfig {
-            secret_key: sec,
-            ..Default::default()
-        };
+        let device = DeviceConfig { secret_key: sec, ..Default::default() };
         let peer = make_peer(pub_);
         let session = PeerSession::new(&device, &peer, 0).expect("construct");
 
@@ -186,10 +179,7 @@ mod tests {
     #[test]
     fn is_online_false_before_handshake() {
         let (sec, pub_) = make_keypair(0x33);
-        let device = DeviceConfig {
-            secret_key: sec,
-            ..Default::default()
-        };
+        let device = DeviceConfig { secret_key: sec, ..Default::default() };
         let peer = make_peer(pub_);
         let session = PeerSession::new(&device, &peer, 0).expect("construct");
 
@@ -201,10 +191,7 @@ mod tests {
     #[test]
     fn with_tunnel_executes_closure() {
         let (sec, pub_) = make_keypair(0x44);
-        let device = DeviceConfig {
-            secret_key: sec,
-            ..Default::default()
-        };
+        let device = DeviceConfig { secret_key: sec, ..Default::default() };
         let peer = make_peer(pub_);
         let session = PeerSession::new(&device, &peer, 0).expect("construct");
 
@@ -229,10 +216,7 @@ mod tests {
     #[test]
     fn shared_peer_returns_arc() {
         let (sec, pub_) = make_keypair(0x55);
-        let device = DeviceConfig {
-            secret_key: sec,
-            ..Default::default()
-        };
+        let device = DeviceConfig { secret_key: sec, ..Default::default() };
         let peer = make_peer(pub_);
         let shared = shared_peer(&device, &peer, 0);
         assert!(shared.is_ok(), "shared_peer failed: {:?}", shared.err());

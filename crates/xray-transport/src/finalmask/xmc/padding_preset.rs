@@ -7,9 +7,7 @@
 
 use std::io;
 
-use super::padding::{
-    PaddingDelayRange, PaddingDirection, PaddingTurn, PaddingVariant,
-};
+use super::padding::{PaddingDelayRange, PaddingDirection, PaddingTurn, PaddingVariant};
 
 /// 区间长度（对应 Go `paddingLengthRange2612`）。
 #[derive(Debug, Clone, Copy)]
@@ -38,10 +36,7 @@ fn millisecond_range(minimum: u64, maximum: u64) -> PaddingDelayRange {
 }
 
 fn variant_from_chunks(chunks: &[i32]) -> PaddingVariant {
-    PaddingVariant {
-        chunks: chunks.to_vec(),
-        delays: Vec::new(),
-    }
+    PaddingVariant { chunks: chunks.to_vec(), delays: Vec::new() }
 }
 
 fn paced_variant(chunks: &[i32], pauses: &[(usize, PaddingDelayRange)]) -> PaddingVariant {
@@ -52,10 +47,7 @@ fn paced_variant(chunks: &[i32], pauses: &[(usize, PaddingDelayRange)]) -> Paddi
         }
         delays[*chunk] = *delay;
     }
-    PaddingVariant {
-        chunks: chunks.to_vec(),
-        delays,
-    }
+    PaddingVariant { chunks: chunks.to_vec(), delays }
 }
 
 fn registry_padding_variant() -> PaddingVariant {
@@ -64,10 +56,7 @@ fn registry_padding_variant() -> PaddingVariant {
             1590, 226, 329, 229, 186, 151, 78, 81, 79, 235, 67, 67, 78, 71, 82, 74, 982, 117, 1118,
             1038, 970, 400, 239, 49, 50, 95, 65, 104, 32320, 2,
         ],
-        &[
-            (28, millisecond_range(1, 4)),
-            (29, millisecond_range(44, 61)),
-        ],
+        &[(28, millisecond_range(1, 4)), (29, millisecond_range(44, 61))],
     )
 }
 
@@ -77,13 +66,7 @@ fn play_start_padding_variant(chunks: &[i32]) -> PaddingVariant {
     }
     let mid = chunks.len() / 2;
     let last = chunks.len() - 1;
-    paced_variant(
-        chunks,
-        &[
-            (mid, millisecond_range(1, 5)),
-            (last, millisecond_range(9, 20)),
-        ],
-    )
+    paced_variant(chunks, &[(mid, millisecond_range(1, 5)), (last, millisecond_range(9, 20))])
 }
 
 /// 启动 6 turn 模板（client→server / server→client 交替，对应 Go `startupPaddingSchedule2612`）。
@@ -128,8 +111,7 @@ pub fn startup_padding_schedule_2612() -> Vec<PaddingTurn> {
                     4941, 262, 284, 272, 260, 260, 313, 264, 151, 224, 207, 215, 224, 390,
                 ]),
                 play_start_padding_variant(&[
-                    4941, 257, 272, 275, 260, 260, 313, 283, 274, 226, 207, 230, 215, 204, 221,
-                    352,
+                    4941, 257, 272, 275, 260, 260, 313, 283, 274, 226, 207, 230, 215, 204, 221, 352,
                 ]),
                 play_start_padding_variant(&[
                     4941, 259, 272, 288, 260, 260, 311, 270, 70, 236, 223, 201, 210, 352,
@@ -137,9 +119,7 @@ pub fn startup_padding_schedule_2612() -> Vec<PaddingTurn> {
                 play_start_padding_variant(&[
                     4941, 255, 269, 277, 263, 260, 136, 207, 210, 232, 325,
                 ]),
-                play_start_padding_variant(&[
-                    4941, 259, 270, 274, 263, 258, 327, 170, 210, 375,
-                ]),
+                play_start_padding_variant(&[4941, 259, 270, 274, 263, 258, 327, 170, 210, 375]),
                 play_start_padding_variant(&[
                     4941, 257, 275, 291, 260, 260, 325, 269, 70, 230, 226, 207, 221, 352,
                 ]),
@@ -153,18 +133,14 @@ pub fn startup_padding_schedule_2612() -> Vec<PaddingTurn> {
                 play_start_padding_variant(&[
                     4941, 254, 267, 272, 260, 253, 311, 167, 204, 232, 207, 481, 8,
                 ]),
-                play_start_padding_variant(&[
-                    4941, 259, 269, 272, 261, 313, 207, 213, 500, 19,
-                ]),
+                play_start_padding_variant(&[4941, 259, 269, 272, 261, 313, 207, 213, 500, 19]),
                 play_start_padding_variant(&[
                     4941, 262, 269, 274, 263, 274, 311, 270, 242, 210, 229, 221, 210, 431,
                 ]),
                 play_start_padding_variant(&[
                     4941, 259, 265, 277, 263, 277, 316, 269, 156, 204, 210, 226, 207, 413,
                 ]),
-                play_start_padding_variant(&[
-                    4941, 215, 251, 249, 317, 260, 270, 249, 52,
-                ]),
+                play_start_padding_variant(&[4941, 215, 251, 249, 317, 260, 270, 249, 52]),
                 play_start_padding_variant(&[
                     4941, 224, 263, 277, 316, 267, 272, 260, 138, 230, 226, 207, 204, 352,
                 ]),
@@ -411,11 +387,7 @@ pub fn new_server_padding_schedule_2612() -> Result<Vec<PaddingTurn>, io::Error>
     let profile = server_play_branch_masks_2612()[profile_index];
     let startup_len = startup_padding_schedule_2612().len();
     for (i, branches) in server_play_branches_2612().iter().enumerate() {
-        let length_range = if profile & (1 << i) != 0 {
-            branches.large
-        } else {
-            branches.small
-        };
+        let length_range = if profile & (1 << i) != 0 { branches.large } else { branches.small };
         let idx = startup_len + 1 + i * 2;
         if idx >= schedule.len() {
             return Err(io::Error::new(

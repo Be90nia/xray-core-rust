@@ -3,14 +3,14 @@
 //! 对应 Go `app/geodata/download.go` 的 `downloader` + `idleConn` + `http.Client`。
 //! HTTP fetch 与 dispatcher dial 全部留 trait 注入，避免绑定 hyper/reqwest。
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
-use crate::config::GeodataAsset;
-use crate::error::GeodataError;
-use crate::swap::{Stage, Tx, clean, swap_all};
+use crate::{
+    config::GeodataAsset,
+    error::GeodataError,
+    swap::{Stage, Tx, clean, swap_all},
+};
 
-///
 /// 对应 Go `downloader.downloadOne`。
 pub trait AssetDownloader: Send + Sync {
     /// 把 url 内容下载到指定的 temp 文件路径。
@@ -35,9 +35,7 @@ impl DefaultAssetDownloader {
     }
 
     pub fn with_temp_dir() -> Self {
-        Self {
-            asset_dir: std::env::temp_dir().join("xray-geodata-default"),
-        }
+        Self { asset_dir: std::env::temp_dir().join("xray-geodata-default") }
     }
 }
 
@@ -70,7 +68,7 @@ pub fn download_assets<D: AssetDownloader + ?Sized>(
             Err(e) => {
                 clean(&staged);
                 return Err(e);
-            }
+            },
         }
     }
     Ok(staged)
@@ -108,7 +106,7 @@ pub fn reload_with_update<D: AssetDownloader + ?Sized, R: GeodataReloader + ?Siz
         Err(e) => {
             clean(&staged);
             return Err(e);
-        }
+        },
     };
 
     match reloader.reload() {
@@ -120,7 +118,7 @@ pub fn reload_with_update<D: AssetDownloader + ?Sized, R: GeodataReloader + ?Siz
                 Ok(()) => Err(reload_err),
                 Err(rb) => Err(GeodataError::Other(format!("{reload_err}; rollback: {rb}").into())),
             }
-        }
+        },
     }
 }
 
@@ -157,10 +155,7 @@ pub struct RealAssetDownloader {
 
 impl RealAssetDownloader {
     pub fn new(asset_dir: PathBuf) -> Self {
-        Self {
-            asset_dir,
-            timeout: std::time::Duration::from_secs(30),
-        }
+        Self { asset_dir, timeout: std::time::Duration::from_secs(30) }
     }
 
     /// 覆盖默认超时。用于测试或特殊网络环境。
@@ -189,14 +184,13 @@ impl RealAssetDownloader {
         };
         let (host, port) = match host_port.rfind(':') {
             Some(i) => {
-                let p: u16 = host_port[i + 1..]
-                    .parse()
-                    .map_err(|_| GeodataError::DownloadFailed {
+                let p: u16 =
+                    host_port[i + 1..].parse().map_err(|_| GeodataError::DownloadFailed {
                         url: url.to_string(),
                         reason: format!("invalid port: {}", &host_port[i + 1..]),
                     })?;
                 (&host_port[..i], p)
-            }
+            },
             None => (host_port, if scheme == "https" { 443 } else { 80 }),
         };
 
@@ -217,35 +211,27 @@ struct ParsedUrl {
 }
 
 impl AssetDownloader for RealAssetDownloader {
-    fn download_to(
-        &self,
-        url: &str,
-        temp_path: &std::path::Path,
-    ) -> Result<(), GeodataError> {
+    fn download_to(&self, url: &str, temp_path: &std::path::Path) -> Result<(), GeodataError> {
         let parsed = self.parse_url(url)?;
 
-        use std::io::{Read, Write};
-        use std::net::TcpStream;
-        use std::time::Instant;
+        use std::{
+            io::{Read, Write},
+            net::TcpStream,
+            time::Instant,
+        };
 
         let addr = format!("{}:{}", parsed.host, parsed.port);
-        let mut tcp = TcpStream::connect(&addr).map_err(|e| {
-            GeodataError::DownloadFailed {
-                url: url.to_string(),
-                reason: format!("connect {addr}: {e}"),
-            }
+        let mut tcp = TcpStream::connect(&addr).map_err(|e| GeodataError::DownloadFailed {
+            url: url.to_string(),
+            reason: format!("connect {addr}: {e}"),
         })?;
-        tcp.set_read_timeout(Some(self.timeout)).map_err(|e| {
-            GeodataError::DownloadFailed {
-                url: url.to_string(),
-                reason: format!("set_read_timeout: {e}"),
-            }
+        tcp.set_read_timeout(Some(self.timeout)).map_err(|e| GeodataError::DownloadFailed {
+            url: url.to_string(),
+            reason: format!("set_read_timeout: {e}"),
         })?;
-        tcp.set_write_timeout(Some(self.timeout)).map_err(|e| {
-            GeodataError::DownloadFailed {
-                url: url.to_string(),
-                reason: format!("set_write_timeout: {e}"),
-            }
+        tcp.set_write_timeout(Some(self.timeout)).map_err(|e| GeodataError::DownloadFailed {
+            url: url.to_string(),
+            reason: format!("set_write_timeout: {e}"),
         })?;
 
         let req = format!(
@@ -278,19 +264,15 @@ impl AssetDownloader for RealAssetDownloader {
                 ),
             })?;
             let mut tls = https_handshake(&mut conn, &mut tcp, &parsed.host, self.timeout)?;
-            tls.write_all(req.as_bytes()).map_err(|e| {
-                GeodataError::DownloadFailed {
-                    url: url.to_string(),
-                    reason: format!("write request (tls): {e}"),
-                }
+            tls.write_all(req.as_bytes()).map_err(|e| GeodataError::DownloadFailed {
+                url: url.to_string(),
+                reason: format!("write request (tls): {e}"),
             })?;
             read_http_body(tls, url, temp_path, Instant::now() + self.timeout)
         } else {
-            tcp.write_all(req.as_bytes()).map_err(|e| {
-                GeodataError::DownloadFailed {
-                    url: url.to_string(),
-                    reason: format!("write request: {e}"),
-                }
+            tcp.write_all(req.as_bytes()).map_err(|e| GeodataError::DownloadFailed {
+                url: url.to_string(),
+                reason: format!("write request: {e}"),
             })?;
             read_http_body(tcp, url, temp_path, Instant::now() + self.timeout)
         }
@@ -313,8 +295,7 @@ fn read_http_body<R: std::io::Read>(
     temp_path: &std::path::Path,
     deadline: std::time::Instant,
 ) -> Result<(), GeodataError> {
-    use std::io::Read;
-    use std::io::Write;
+    use std::io::{Read, Write};
 
     // 读 headers 到 \r\n\r\n。
     let mut header_buf = Vec::with_capacity(512);
@@ -330,39 +311,38 @@ fn read_http_body<R: std::io::Read>(
                 if header_buf.ends_with(b"\r\n\r\n") {
                     break;
                 }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut =>
+            },
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 return Err(GeodataError::IdleTimeout);
-            }
+            },
             Err(e) => {
                 return Err(GeodataError::DownloadFailed {
                     url: url.to_string(),
                     reason: format!("read header: {e}"),
                 });
-            }
+            },
         }
     }
 
-    let header_str = std::str::from_utf8(&header_buf).map_err(|e| {
-        GeodataError::DownloadFailed {
+    let header_str =
+        std::str::from_utf8(&header_buf).map_err(|e| GeodataError::DownloadFailed {
             url: url.to_string(),
             reason: format!("invalid header utf-8: {e}"),
-        }
-    })?;
+        })?;
 
     let mut lines = header_str.split("\r\n");
     let status_line = lines.next().unwrap_or("");
     let mut status_parts = status_line.split_whitespace();
     let _http_ver = status_parts.next();
-    let status_code: u16 = status_parts
-        .next()
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| GeodataError::DownloadFailed {
+    let status_code: u16 = status_parts.next().and_then(|s| s.parse().ok()).ok_or_else(|| {
+        GeodataError::DownloadFailed {
             url: url.to_string(),
             reason: format!("invalid status line: {status_line}"),
-        })?;
+        }
+    })?;
 
     let mut content_length: Option<usize> = None;
     for line in lines {
@@ -380,11 +360,9 @@ fn read_http_body<R: std::io::Read>(
         return Err(GeodataError::UnexpectedStatus(status_code));
     }
 
-    let mut out = std::fs::File::create(temp_path).map_err(|e| {
-        GeodataError::DownloadFailed {
-            url: url.to_string(),
-            reason: format!("create temp file: {e}"),
-        }
+    let mut out = std::fs::File::create(temp_path).map_err(|e| GeodataError::DownloadFailed {
+        url: url.to_string(),
+        reason: format!("create temp file: {e}"),
     })?;
 
     let mut total: usize = 0;
@@ -399,18 +377,19 @@ fn read_http_body<R: std::io::Read>(
                     out.write_all(&chunk[..n])?;
                     remaining -= n;
                     total += n;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                },
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
                     return Err(GeodataError::IdleTimeout);
-                }
+                },
                 Err(e) => {
                     return Err(GeodataError::DownloadFailed {
                         url: url.to_string(),
                         reason: format!("read body: {e}"),
                     });
-                }
+                },
             }
         }
     } else {
@@ -421,18 +400,19 @@ fn read_http_body<R: std::io::Read>(
                 Ok(n) => {
                     out.write_all(&chunk[..n])?;
                     total += n;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                },
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
                     break;
-                }
+                },
                 Err(e) => {
                     return Err(GeodataError::DownloadFailed {
                         url: url.to_string(),
                         reason: format!("read body: {e}"),
                     });
-                }
+                },
             }
         }
     }
@@ -460,25 +440,21 @@ fn https_handshake<'a>(
     host: &str,
     timeout: std::time::Duration,
 ) -> Result<rustls::Stream<'a, rustls::ClientConnection, std::net::TcpStream>, GeodataError> {
-    use rustls::pki_types::ServerName;
-    use rustls::ClientConfig;
     use std::io::Read;
+
+    use rustls::{ClientConfig, pki_types::ServerName};
 
     xray_common::ensure_default_crypto_provider();
 
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = Arc::new(
-        ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    );
-    let server_name = ServerName::try_from(host.to_string()).map_err(|e| {
-        GeodataError::DownloadFailed {
+    let config =
+        Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+    let server_name =
+        ServerName::try_from(host.to_string()).map_err(|e| GeodataError::DownloadFailed {
             url: host.to_string(),
             reason: format!("invalid server name for SNI: {e}"),
-        }
-    })?;
+        })?;
     *conn = rustls::ClientConnection::new(config, server_name).map_err(|e| {
         GeodataError::DownloadFailed {
             url: host.to_string(),
@@ -495,25 +471,24 @@ fn https_handshake<'a>(
         // 每次循环短命 Stream 让 borrow checker 通过。
         let mut tls = rustls::Stream::new(&mut *conn, &mut *tcp);
         match tls.read(&mut scratch) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut =>
+            Ok(_) => {},
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 std::thread::sleep(std::time::Duration::from_millis(10));
-            }
+            },
             Err(e) => {
                 return Err(GeodataError::DownloadFailed {
                     url: host.to_string(),
                     reason: format!("rustls handshake: {e}"),
                 });
-            }
+            },
         }
     }
 
     Ok(rustls::Stream::new(&mut *conn, &mut *tcp))
 }
-
-
 
 /// `GeodataReloader` 实现：调用全局 IP + 域名注册表的 reload。
 ///
@@ -526,9 +501,10 @@ pub struct ReloadBothRegistries;
 
 impl GeodataReloader for ReloadBothRegistries {
     fn reload(&self) -> Result<(), GeodataError> {
-        use xray_geodata::matcher::ip::IP_REG;
-        use xray_geodata::matcher::domain::DOMAIN_REG;
-        use xray_geodata::pb::IpRule;
+        use xray_geodata::{
+            matcher::{domain::DOMAIN_REG, ip::IP_REG},
+            pb::IpRule,
+        };
 
         // ponytail: 空 rules reload — 调用 reload_with 让 reg 内的 matcher 状态被原子切换。
         // 在没有新规则源时此调用等价于"标记 reload 已执行"。
@@ -545,11 +521,11 @@ impl GeodataReloader for ReloadBothRegistries {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Mutex;
+
+    use super::*;
 
     struct StubDownloader {
         fail_url: Option<String>,
@@ -559,11 +535,7 @@ mod tests {
 
     impl StubDownloader {
         fn new(dir: PathBuf) -> Self {
-            Self {
-                fail_url: None,
-                calls: Mutex::new(Vec::new()),
-                resolve_dir: dir,
-            }
+            Self { fail_url: None, calls: Mutex::new(Vec::new()), resolve_dir: dir }
         }
 
         fn snapshot(&self) -> Vec<(String, PathBuf)> {
@@ -573,10 +545,7 @@ mod tests {
 
     impl AssetDownloader for StubDownloader {
         fn download_to(&self, url: &str, temp: &std::path::Path) -> Result<(), GeodataError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((url.to_string(), temp.to_path_buf()));
+            self.calls.lock().unwrap().push((url.to_string(), temp.to_path_buf()));
             if let Some(fail) = &self.fail_url {
                 if url == fail {
                     return Err(GeodataError::DownloadFailed {
@@ -588,6 +557,7 @@ mod tests {
             std::fs::write(temp, b"data").unwrap();
             Ok(())
         }
+
         fn resolve_target(&self, file: &str) -> Result<PathBuf, GeodataError> {
             Ok(self.resolve_dir.join(file))
         }
@@ -598,10 +568,7 @@ mod tests {
         base.push(format!(
             "xray-geodata-dl-test-{}-{}-{name}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&base).unwrap();
         base
@@ -633,14 +600,8 @@ mod tests {
         let dir = unique_dir("dl_ok");
         let dl = StubDownloader::new(dir.clone());
         let assets = vec![
-            GeodataAsset {
-                url: "u1".into(),
-                file: "a.dat".into(),
-            },
-            GeodataAsset {
-                url: "u2".into(),
-                file: "b.dat".into(),
-            },
+            GeodataAsset { url: "u1".into(), file: "a.dat".into() },
+            GeodataAsset { url: "u2".into(), file: "b.dat".into() },
         ];
         let stages = download_assets(&dl, &assets).unwrap();
         assert_eq!(stages.len(), 2);
@@ -657,14 +618,8 @@ mod tests {
         let mut dl = StubDownloader::new(dir.clone());
         dl.fail_url = Some("u2".into());
         let assets = vec![
-            GeodataAsset {
-                url: "u1".into(),
-                file: "a.dat".into(),
-            },
-            GeodataAsset {
-                url: "u2".into(),
-                file: "b.dat".into(),
-            },
+            GeodataAsset { url: "u1".into(), file: "a.dat".into() },
+            GeodataAsset { url: "u2".into(), file: "b.dat".into() },
         ];
         let err = download_assets(&dl, &assets).unwrap_err();
         assert!(matches!(err, GeodataError::DownloadFailed { .. }));
@@ -680,10 +635,7 @@ mod tests {
     fn reload_with_update_success_commits() {
         let dir = unique_dir("reload_ok");
         let dl = StubDownloader::new(dir.clone());
-        let assets = vec![GeodataAsset {
-            url: "u1".into(),
-            file: "a.dat".into(),
-        }];
+        let assets = vec![GeodataAsset { url: "u1".into(), file: "a.dat".into() }];
         reload_with_update(&dl, &NoopReloader, &assets).unwrap();
         // target 应存在并包含 "data"
         let target = dir.join("a.dat");
@@ -707,10 +659,7 @@ mod tests {
         std::fs::write(&target, "original").unwrap();
 
         let dl = StubDownloader::new(dir.clone());
-        let assets = vec![GeodataAsset {
-            url: "u1".into(),
-            file: "a.dat".into(),
-        }];
+        let assets = vec![GeodataAsset { url: "u1".into(), file: "a.dat".into() }];
         let err = reload_with_update(&dl, &FailingReloader, &assets).unwrap_err();
         assert!(matches!(err, GeodataError::ReloadFailed { .. }));
         // 回滚后内容应是 original

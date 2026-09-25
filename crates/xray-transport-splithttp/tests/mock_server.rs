@@ -1,37 +1,42 @@
 //! 切片 A 端到端集成测试：mock HTTP server + dial_packet_up。
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::{
+    Method, Request, Response, StatusCode, body::Incoming, server::conn::http1, service::service_fn,
+};
 use hyper_util::rt::TokioIo;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 use webpki_roots::TLS_SERVER_ROOTS;
-
-use xray_transport_splithttp::client::{DefaultDialerClient, DialTarget, Fingerprint};
-use xray_transport_splithttp::config::{Config, RangeConfig};
-use xray_transport_splithttp::dialer::dial_packet_up;
-use xray_transport_splithttp::error::SplitHttpError;
-
+use xray_transport_splithttp::{
+    client::{DefaultDialerClient, DialTarget, Fingerprint},
+    config::{Config, RangeConfig},
+    dialer::dial_packet_up,
+    error::SplitHttpError,
+};
 
 /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
 static CRYPTO_ONCE: std::sync::Once = std::sync::Once::new();
 fn ensure_crypto_provider() {
-    CRYPTO_ONCE.call_once(|| { let _ = rustls::crypto::ring::default_provider().install_default(); });
+    CRYPTO_ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 fn make_tls_config() -> rustls::ClientConfig {
     let roots = rustls::RootCertStore::from_iter(TLS_SERVER_ROOTS.iter().cloned());
-    rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth()
+    rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth()
 }
 
 #[derive(Debug, Default)]
@@ -96,11 +101,8 @@ async fn dial_packet_up_end_to_end_via_mock_http1_server() {
     let server_addr = listener.local_addr().unwrap();
     let stats = Arc::new(ServerStats::default());
     let download_payload = b"hello-splithttp-download".to_vec();
-    let server_task = tokio::spawn(mock_splithttp_server(
-        listener,
-        stats.clone(),
-        download_payload.clone(),
-    ));
+    let server_task =
+        tokio::spawn(mock_splithttp_server(listener, stats.clone(), download_payload.clone()));
 
     let config = Arc::new(Config {
         host: format!("127.0.0.1:{}", server_addr.port()),
@@ -108,12 +110,19 @@ async fn dial_packet_up_end_to_end_via_mock_http1_server() {
         ..Default::default()
     });
     let tls_config = make_tls_config();
-    let client = Arc::new(DefaultDialerClient::new(config, tls_config, DialTarget { host: "127.0.0.1".into(), port: server_addr.port(), sni: String::new() }, None, None));
+    let client = Arc::new(DefaultDialerClient::new(
+        config,
+        tls_config,
+        DialTarget { host: "127.0.0.1".into(), port: server_addr.port(), sni: String::new() },
+        None,
+        None,
+    ));
 
     let base_uri = format!("http://127.0.0.1:{}/", server_addr.port());
     let session_id = "test-session-1".to_string();
 
-    let conn = dial_packet_up(client, base_uri, session_id, 1024, RangeConfig::new(0, 0)).await.unwrap();
+    let conn =
+        dial_packet_up(client, base_uri, session_id, 1024, RangeConfig::new(0, 0)).await.unwrap();
 
     let mut conn = conn;
     let mut read_buf = vec![0u8; download_payload.len()];
@@ -166,15 +175,18 @@ async fn post_packet_returns_bad_status_on_500() {
 
     let config = Arc::new(Config::default());
     let tls_config = make_tls_config();
-    let client = Arc::new(DefaultDialerClient::new(config, tls_config, DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() }, None, None));
+    let client = Arc::new(DefaultDialerClient::new(
+        config,
+        tls_config,
+        DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
+        None,
+        None,
+    ));
     let base_uri = format!("http://127.0.0.1:{}/", addr.port());
 
     let result = client.post_packet(&base_uri, "sess", "0", b"x".to_vec()).await;
     let err = result.unwrap_err();
-    assert!(
-        matches!(err, SplitHttpError::BadStatus(500)),
-        "expected BadStatus(500), got {err:?}"
-    );
+    assert!(matches!(err, SplitHttpError::BadStatus(500)), "expected BadStatus(500), got {err:?}");
 }
 
 /// GET 分支 lazy 契约：非 200 不再从 `open_stream` 返回 `BadStatus`，
@@ -208,7 +220,13 @@ async fn open_stream_get_non_200_yields_eof() {
 
     let config = Arc::new(Config::default());
     let tls_config = make_tls_config();
-    let client = Arc::new(DefaultDialerClient::new(config, tls_config, DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() }, None, None));
+    let client = Arc::new(DefaultDialerClient::new(
+        config,
+        tls_config,
+        DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
+        None,
+        None,
+    ));
     let base_uri = format!("http://127.0.0.1:{}/", addr.port());
 
     // lazy：open_stream 立即返回，非 200 在读端以 EOF 呈现
@@ -246,19 +264,24 @@ async fn mock_splithttp_tls_server(
                     if req.method() == Method::GET {
                         got_get.store(true, Ordering::Relaxed);
                         Ok::<_, std::convert::Infallible>(
-                            Response::builder().status(StatusCode::OK)
-                                .body(Full::new(Bytes::from(dl))).unwrap(),
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .body(Full::new(Bytes::from(dl)))
+                                .unwrap(),
                         )
                     } else {
-                        Ok(Response::builder().status(StatusCode::OK)
-                            .body(Full::new(Bytes::new())).unwrap())
+                        Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Full::new(Bytes::new()))
+                            .unwrap())
                     }
                 }
             });
             if use_http2 {
-                let _ = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
-                    .serve_connection(TokioIo::new(tls), svc)
-                    .await;
+                let _ =
+                    hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                        .serve_connection(TokioIo::new(tls), svc)
+                        .await;
             } else {
                 let _ = http1::Builder::new().serve_connection(TokioIo::new(tls), svc).await;
             }
@@ -309,7 +332,13 @@ async fn fingerprint_btls_end_to_end_http1() {
     });
     // mock 自签证书：走 crate 自身 allowInsecure 语义跳过 btls 证书验证
     // （本测试对象是指纹握手 + ALPN roundtrip，不是证书链）。
-    let client = Arc::new(DefaultDialerClient::new(config, make_tls_config(), DialTarget { host: "127.0.0.1".into(), port, sni: String::new() }, Some(Fingerprint::Chrome), Some(serde_json::json!({"allowInsecure": true}))));
+    let client = Arc::new(DefaultDialerClient::new(
+        config,
+        make_tls_config(),
+        DialTarget { host: "127.0.0.1".into(), port, sni: String::new() },
+        Some(Fingerprint::Chrome),
+        Some(serde_json::json!({"allowInsecure": true})),
+    ));
 
     let mut conn = dial_packet_up(
         client,
@@ -339,7 +368,13 @@ async fn fingerprint_btls_end_to_end_http2() {
         path: "/".into(),
         ..Default::default()
     });
-    let client = Arc::new(DefaultDialerClient::new(config, make_tls_config(), DialTarget { host: "127.0.0.1".into(), port, sni: String::new() }, Some(Fingerprint::Chrome), Some(serde_json::json!({"allowInsecure": true}))));
+    let client = Arc::new(DefaultDialerClient::new(
+        config,
+        make_tls_config(),
+        DialTarget { host: "127.0.0.1".into(), port, sni: String::new() },
+        Some(Fingerprint::Chrome),
+        Some(serde_json::json!({"allowInsecure": true})),
+    ));
 
     let mut conn = dial_packet_up(
         client,
@@ -419,15 +454,10 @@ async fn conn_drop_terminates_all_http_connections() {
     ));
     let base_uri = format!("http://127.0.0.1:{}/", server_addr.port());
 
-    let mut conn = dial_packet_up(
-        client,
-        base_uri,
-        "drop-sess".into(),
-        1024,
-        RangeConfig::new(0, 0),
-    )
-    .await
-    .unwrap();
+    let mut conn =
+        dial_packet_up(client, base_uri, "drop-sess".into(), 1024, RangeConfig::new(0, 0))
+            .await
+            .unwrap();
     let mut buf = vec![0u8; 2];
     conn.read_exact(&mut buf).await.unwrap();
     conn.write_all(b"x").await.unwrap();
@@ -462,8 +492,7 @@ async fn bridge_eof_propagates_without_conn_idle() {
 
     use futures_util::{StreamExt, TryStreamExt};
     use xray_features::policy::TimeoutPolicy;
-    use xray_transport::bridge::bridge_link_with_stream_full;
-    use xray_transport::link::Link;
+    use xray_transport::{bridge::bridge_link_with_stream_full, link::Link};
 
     ensure_crypto_provider();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -504,9 +533,9 @@ async fn bridge_eof_propagates_without_conn_idle() {
                                     Bytes,
                                     std::convert::Infallible,
                                 > = http_body_util::BodyExt::boxed(
-                                    http_body_util::StreamBody::new(body.map_ok(|b| {
-                                        hyper::body::Frame::data(b)
-                                    })),
+                                    http_body_util::StreamBody::new(
+                                        body.map_ok(|b| hyper::body::Frame::data(b)),
+                                    ),
                                 );
                                 Ok::<_, std::convert::Infallible>(
                                     Response::builder().status(StatusCode::OK).body(body).unwrap(),
@@ -571,11 +600,13 @@ async fn bridge_eof_propagates_without_conn_idle() {
     );
     tokio::spawn(async move {
         use xray_buf::io::Writer as _;
-        let _ = up_w.write_multi_buffer({
-            let mut mb = xray_buf::multi::MultiBuffer::new();
-            mb.merge_bytes(b"payload");
-            mb
-        }).await;
+        let _ = up_w
+            .write_multi_buffer({
+                let mut mb = xray_buf::multi::MultiBuffer::new();
+                mb.merge_bytes(b"payload");
+                mb
+            })
+            .await;
         up_w.shutdown(); // inbound EOF：触发桥 half-close 窗口
     });
 
@@ -587,7 +618,10 @@ async fn bridge_eof_propagates_without_conn_idle() {
     })
     .await;
     let elapsed = started.elapsed();
-    assert!(res.is_ok(), "bridge must return via half-close window (1s), not connIdle=300s; elapsed {elapsed:?}");
+    assert!(
+        res.is_ok(),
+        "bridge must return via half-close window (1s), not connIdle=300s; elapsed {elapsed:?}"
+    );
     let _ = res.unwrap().expect("bridge io ok");
     assert!(
         elapsed < Duration::from_secs(4),
@@ -610,8 +644,8 @@ async fn bridge_eof_propagates_without_conn_idle() {
 
 /// rcgen 自签证书（SAN 127.0.0.1）→ (cert PEM, key PEM, cert DER 供客户端信任)。
 fn self_signed_tls() -> (String, String, rustls::pki_types::CertificateDer<'static>) {
-    let params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
-        .expect("rcgen params");
+    let params =
+        rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("rcgen params");
     let key_pair = rcgen::KeyPair::generate().expect("rcgen keypair");
     let cert = params.self_signed(&key_pair).expect("rcgen self_signed");
     let der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
@@ -625,9 +659,9 @@ fn self_signed_tls() -> (String, String, rustls::pki_types::CertificateDer<'stat
 /// 断言：上行 POST → dispatcher echo → 下行 GET body 双向可达。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn packet_up_end_to_end_tls_h2_via_serve_http_conn() {
-    use xray_transport::dialer::StreamSettings;
-    use xray_transport::listener_registry::ConnHandler;
-    use xray_transport::sockopt::SocketOptions;
+    use xray_transport::{
+        dialer::StreamSettings, listener_registry::ConnHandler, sockopt::SocketOptions,
+    };
     use xray_transport_splithttp::transport::listen_splithttp;
 
     ensure_crypto_provider();
@@ -650,7 +684,7 @@ async fn packet_up_end_to_end_tls_h2_via_serve_http_conn() {
                         if conn.write_all(&buf[..n]).await.is_err() {
                             break;
                         }
-                    }
+                    },
                 }
             }
         });
@@ -673,9 +707,8 @@ async fn packet_up_end_to_end_tls_h2_via_serve_http_conn() {
     // enable_http1+enable_http2 注入 [h2, http/1.1]（client.rs bd 3ze9 注释）。
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert_der).expect("add root");
-    let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let tls_config =
+        rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
     let config = Arc::new(Config {
         host: format!("127.0.0.1:{}", server_addr.port()),
         path: "/".into(),
@@ -684,11 +717,7 @@ async fn packet_up_end_to_end_tls_h2_via_serve_http_conn() {
     let client = Arc::new(DefaultDialerClient::new(
         config,
         tls_config,
-        DialTarget {
-            host: "127.0.0.1".into(),
-            port: server_addr.port(),
-            sni: "127.0.0.1".into(),
-        },
+        DialTarget { host: "127.0.0.1".into(), port: server_addr.port(), sni: "127.0.0.1".into() },
         None,
         None,
     ));

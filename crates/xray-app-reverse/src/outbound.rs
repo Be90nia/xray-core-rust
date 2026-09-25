@@ -3,27 +3,24 @@
 //! 对应 Go `portal.go` 的 `Outbound` struct（实现 `outbound.Handler.Dispatch`）+
 //! `Portal.Start()` 调用 `ohm.AddHandler` / `Portal.Close()` 调用 `ohm.RemoveHandler`。
 //!
-//! - [`OutboundRegistrar`]：对应 Go `outbound.Manager.AddHandler/RemoveHandler`，
-//!   生产实现 [`SimpleOhmRegistrar`]（包 xray-app-dispatcher 的 `SimpleOhm`）
-//! - [`PortalOutbound`]：注册进 outbound manager 的 portal 出站 handler，
-//!   `dispatch` = Go `Outbound.Dispatch` → `Portal.HandleConnection`
+//! - [`OutboundRegistrar`]：对应 Go `outbound.Manager.AddHandler/RemoveHandler`， 生产实现
+//!   [`SimpleOhmRegistrar`]（包 xray-app-dispatcher 的 `SimpleOhm`）
+//! - [`PortalOutbound`]：注册进 outbound manager 的 portal 出站 handler， `dispatch` = Go
+//!   `Outbound.Dispatch` → `Portal.HandleConnection`
 
 use std::sync::Arc;
 
-use xray_app_dispatcher::DispatchHandler;
-use xray_app_dispatcher::default::SimpleOhm;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-use xray_mux::client::{ClientWorker, Link as MuxLink};
-use xray_mux::session::ClientStrategy;
+use xray_app_dispatcher::{DispatchHandler, default::SimpleOhm};
+use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
+use xray_mux::{
+    client::{ClientWorker, Link as MuxLink},
+    session::ClientStrategy,
+};
 use xray_transport::link::Link as TransportLink;
 
-use crate::bridge::is_domain;
-use crate::error::ReverseError;
-use crate::picker::StaticMuxPicker;
-use crate::worker::PortalWorker;
+use crate::{
+    bridge::is_domain, error::ReverseError, picker::StaticMuxPicker, worker::PortalWorker,
+};
 
 /// Outbound handler 注册 trait。
 ///
@@ -31,11 +28,8 @@ use crate::worker::PortalWorker;
 /// Portal 在 `start()` 时注册、`close()` 时注销。
 pub trait OutboundRegistrar: Send + Sync {
     /// 注册 handler（tag 对应 Portal.tag）。
-    fn add_handler(
-        &self,
-        tag: &str,
-        handler: Arc<dyn DispatchHandler>,
-    ) -> Result<(), ReverseError>;
+    fn add_handler(&self, tag: &str, handler: Arc<dyn DispatchHandler>)
+    -> Result<(), ReverseError>;
 
     /// 按 tag 注销 handler。
     fn remove_handler(&self, tag: &str) -> Result<(), ReverseError>;
@@ -55,11 +49,7 @@ impl OutboundRegistrar for SimpleOhmRegistrar {
     }
 
     fn remove_handler(&self, tag: &str) -> Result<(), ReverseError> {
-        if self.0.remove(tag) {
-            Ok(())
-        } else {
-            Err(ReverseError::OutboundMetadataMissing)
-        }
+        if self.0.remove(tag) { Ok(()) } else { Err(ReverseError::OutboundMetadataMissing) }
     }
 }
 
@@ -71,9 +61,7 @@ pub struct StubOutboundRegistrar {
 impl StubOutboundRegistrar {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            handlers: parking_lot::Mutex::new(Vec::new()),
-        }
+        Self { handlers: parking_lot::Mutex::new(Vec::new()) }
     }
 
     pub fn count(&self) -> usize {
@@ -116,8 +104,8 @@ impl OutboundRegistrar for StubOutboundRegistrar {
 ///
 /// 持 picker + portal domain；`dispatch` 即 Go `Portal.HandleConnection`
 /// （portal.go:67-101）：
-/// - 目标域 == portal domain：本连接是 bridge 建来的反向 carrier——
-///   `mux.NewClientWorker(link)` + `NewPortalWorker` + `picker.AddWorker`
+/// - 目标域 == portal domain：本连接是 bridge 建来的反向 carrier—— `mux.NewClientWorker(link)` +
+///   `NewPortalWorker` + `picker.AddWorker`
 /// - 其余：picker 选 worker，dispatch 子会话到 carrier
 pub struct PortalOutbound {
     tag: String,
@@ -150,10 +138,7 @@ impl PortalOutbound {
         if is_domain(dest.address().as_domain(), &self.domain) {
             // 反向 carrier：在链路上起 mux client + portal worker
             let client = ClientWorker::new(
-                MuxLink {
-                    reader: link.reader,
-                    writer: link.writer,
-                },
+                MuxLink { reader: link.reader, writer: link.writer },
                 ClientStrategy::default(),
             );
             let worker = PortalWorker::new(client.clone()).map_err(|e| {
@@ -181,10 +166,7 @@ impl PortalOutbound {
                 .client()
                 .dispatch_with_source(
                     &d,
-                    MuxLink {
-                        reader: link.reader,
-                        writer: link.writer,
-                    },
+                    MuxLink { reader: link.reader, writer: link.writer },
                     None,
                     inbound,
                 )
@@ -291,11 +273,8 @@ mod tests {
     fn stub_registrar_add_multiple() {
         let reg = StubOutboundRegistrar::new();
         let mk = |t: &str| {
-            Arc::new(PortalOutbound::new(
-                t.into(),
-                Arc::new(StaticMuxPicker::new()),
-                "d".into(),
-            )) as Arc<dyn DispatchHandler>
+            Arc::new(PortalOutbound::new(t.into(), Arc::new(StaticMuxPicker::new()), "d".into()))
+                as Arc<dyn DispatchHandler>
         };
         reg.add_handler("a", mk("a")).unwrap();
         reg.add_handler("b", mk("b")).unwrap();

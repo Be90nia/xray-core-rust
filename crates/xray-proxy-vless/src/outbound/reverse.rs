@@ -10,8 +10,7 @@
 //! 本模块是纯逻辑 + 线程安全状态（`Mutex<Vec<…>>`），实际的 IO（建立
 //! 连接）由上层 dispatcher 注入。`start()` 返回初始需要建立的连接数。
 
-use std::sync::Arc;
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use parking_lot::Mutex;
 
@@ -30,10 +29,7 @@ impl ReverseConnState {
     /// 创建一条活跃连接状态。
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            active: true,
-            established_at: Instant::now(),
-        }
+        Self { active: true, established_at: Instant::now() }
     }
 }
 
@@ -75,11 +71,7 @@ impl ReverseMonitor {
     /// `target_conns` 对应 Go 端反向代理维持的并行隧道数（通常为 1～数条）。
     #[must_use]
     pub fn new(tag: impl Into<String>, target_conns: u32) -> Self {
-        Self {
-            tag: tag.into(),
-            target_conns,
-            inner: Arc::new(Mutex::new(Vec::new())),
-        }
+        Self { tag: tag.into(), target_conns, inner: Arc::new(Mutex::new(Vec::new())) }
     }
 
     /// 启动监控：返回初始需要建立的连接数。
@@ -109,9 +101,7 @@ impl ReverseMonitor {
                 return Ok(());
             }
         }
-        Err(VlessError::Other(
-            "no active reverse connection to close".into(),
-        ))
+        Err(VlessError::Other("no active reverse connection to close".into()))
     }
 
     /// 清理已关闭的连接记录（GC），返回清理数。

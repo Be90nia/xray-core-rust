@@ -3,16 +3,16 @@
 //! 对应 Go `proxy/dns` 中调用 `dns.Client.Query` 的部分。
 //! 接收 dispatcher 转发的 DNS 查询字节 → 解析 → 调用上游 resolver → 返回 DNS 响应字节。
 
-use std::net::IpAddr;
-use std::time::Duration;
+use std::{net::IpAddr, time::Duration};
 
 use async_trait::async_trait;
-use hickory_resolver::config::{ConnectionConfig, NameServerConfig, ResolverConfig};
-use hickory_resolver::net::runtime::TokioRuntimeProvider;
-use hickory_resolver::proto::op::{Message, OpCode, ResponseCode};
-use hickory_resolver::TokioResolver;
-use xray_common::net::destination::Destination;
-use xray_common::session::Session;
+use hickory_resolver::{
+    TokioResolver,
+    config::{ConnectionConfig, NameServerConfig, ResolverConfig},
+    net::runtime::TokioRuntimeProvider,
+    proto::op::{Message, OpCode, ResponseCode},
+};
+use xray_common::{net::destination::Destination, session::Session};
 use xray_features::outbound::{OutboundError, OutboundHandler};
 
 use crate::error::{DnsProxyError, Result};
@@ -36,10 +36,7 @@ impl DnsOutbound {
             .map_err(|e| DnsProxyError::UpstreamForwardFailed(format!("init: {e}")))?
             .build()
             .map_err(|e| DnsProxyError::UpstreamForwardFailed(format!("build: {e}")))?;
-        Ok(Self {
-            tag: tag.into(),
-            resolver,
-        })
+        Ok(Self { tag: tag.into(), resolver })
     }
 
     /// 用自定义上游 DNS 服务器列表创建（测试 / Hijack 重写场景）。
@@ -61,10 +58,7 @@ impl DnsOutbound {
         let resolver = TokioResolver::builder_with_config(cfg, TokioRuntimeProvider::default())
             .build()
             .map_err(|e| DnsProxyError::UpstreamForwardFailed(format!("build: {e}")))?;
-        Ok(Self {
-            tag: tag.into(),
-            resolver,
-        })
+        Ok(Self { tag: tag.into(), resolver })
     }
 
     /// 转发 DNS 查询字节到上游 → 返回 DNS 响应字节。
@@ -94,9 +88,7 @@ impl DnsOutbound {
             .map_err(|e| DnsProxyError::UpstreamForwardFailed(e.to_string()))?;
         // lookup.message() 是上游返回的完整 DNS Message（含 answers）。
         let response = lookup.message().clone().into_response();
-        response
-            .to_vec()
-            .map_err(|e| DnsProxyError::ResponseBuildFailed(e.to_string()))
+        response.to_vec().map_err(|e| DnsProxyError::ResponseBuildFailed(e.to_string()))
     }
 }
 
@@ -143,9 +135,8 @@ pub async fn forward_udp_raw(
     dest: &Destination,
     timeout: Duration,
 ) -> Result<Vec<u8>> {
-    let addr = dest_to_socket_addr(dest)
-        .await
-        .map_err(|e| DnsProxyError::UpstreamForwardFailed(e))?;
+    let addr =
+        dest_to_socket_addr(dest).await.map_err(|e| DnsProxyError::UpstreamForwardFailed(e))?;
     let sock = tokio::net::UdpSocket::bind(if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })
         .await
         .map_err(|e| DnsProxyError::UpstreamForwardFailed(format!("bind: {e}")))?;
@@ -178,9 +169,8 @@ pub async fn forward_tcp_raw(
 ) -> Result<Vec<u8>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let addr = dest_to_socket_addr(dest)
-        .await
-        .map_err(|e| DnsProxyError::UpstreamForwardFailed(e))?;
+    let addr =
+        dest_to_socket_addr(dest).await.map_err(|e| DnsProxyError::UpstreamForwardFailed(e))?;
     let mut stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr))
         .await
         .map_err(|_| DnsProxyError::UpstreamForwardFailed("tcp upstream connect timeout".into()))?
@@ -228,16 +218,14 @@ impl OutboundHandler for DnsOutbound {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::Ipv4Addr;
+
+    use super::*;
 
     #[test]
     fn new_with_servers_builds_resolver() {
-        let ob = DnsOutbound::new_with_servers(
-            "test",
-            &[(IpAddr::V4(Ipv4Addr::LOCALHOST), 5353)],
-        )
-        .expect("build resolver");
+        let ob = DnsOutbound::new_with_servers("test", &[(IpAddr::V4(Ipv4Addr::LOCALHOST), 5353)])
+            .expect("build resolver");
         assert_eq!(ob.tag(), "test");
     }
 

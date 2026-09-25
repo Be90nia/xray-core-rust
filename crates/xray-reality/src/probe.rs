@@ -28,13 +28,12 @@
 //!
 //! # 实现细节
 //!
-//! - 探测 handshake 走 [`xray_tls::btls_client::BtlsConn`]（`verifier=None`，
-//!   对齐 Go uClient 不校验证书），ALPN 通过 `connect_with_alpn` 覆盖。
-//! - 握手完成后用 [`BtlsConn::raw_tcp_clone`] 拿到底层 `tokio::net::TcpStream`
-//!   （与 BoringSSL BIO 共享 fd），通过它发 raw CCS record + `peek` 1 秒等 Alert。
-//! - `raw_tcp_clone` 与 btls 的 BIO 共享 fd。我们只往 fd 写 CCS，不读 → 1 秒内
-//!   若对端发 Alert，该字节落在 fd 接收缓冲，BIO 下次 read 才消费。我们
-//!   `peek` 看一眼拿到即返回。
+//! - 探测 handshake 走 [`xray_tls::btls_client::BtlsConn`]（`verifier=None`， 对齐 Go uClient
+//!   不校验证书），ALPN 通过 `connect_with_alpn` 覆盖。
+//! - 握手完成后用 [`BtlsConn::raw_tcp_clone`] 拿到底层 `tokio::net::TcpStream` （与 BoringSSL BIO
+//!   共享 fd），通过它发 raw CCS record + `peek` 1 秒等 Alert。
+//! - `raw_tcp_clone` 与 btls 的 BIO 共享 fd。我们只往 fd 写 CCS，不读 → 1 秒内 若对端发
+//!   Alert，该字节落在 fd 接收缓冲，BIO 下次 read 才消费。我们 `peek` 看一眼拿到即返回。
 //!
 //! # 调用方
 //!
@@ -42,16 +41,18 @@
 //! 后调用 [`detect_max_useless_records`]，结果落地到 `RealityConfig::max_useless_records`
 //! （待 config 层补字段）。本提交仅落探测函数 + 单元测试。
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use parking_lot::Mutex;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::time::{Instant, timeout, timeout_at};
-use xray_tls::btls_client::BtlsConn;
-use xray_tls::fingerprint::{get_fingerprint, Fingerprint};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    time::{Instant, timeout, timeout_at},
+};
+use xray_tls::{
+    btls_client::BtlsConn,
+    fingerprint::{Fingerprint, get_fingerprint},
+};
 use xray_transport::connection::{Connection, TcpConnection};
 
 /// CCS 探测每轮观测窗口（Go `record_detect.go:167` `time.Sleep(1 * time.Second)`）。
@@ -146,8 +147,8 @@ impl ProbeTable {
 /// 根据 ALPN 索引取 ALPN wire 字节（用于 `BtlsConn::connect_with_alpn`）。
 ///
 /// 对齐 Go `utls.Config.NextProtos`：
-/// - `AlpnId::None` → `None`（uTLS 模板本身无 ALPN；Chrome 模板带 ALPN，所以
-///   这里走 [`Fingerprint::RandomizedNoAlpn`] 实际无 ALPN 的 chrome_133_no_alpn 模板）
+/// - `AlpnId::None` → `None`（uTLS 模板本身无 ALPN；Chrome 模板带 ALPN，所以 这里走
+///   [`Fingerprint::RandomizedNoAlpn`] 实际无 ALPN 的 chrome_133_no_alpn 模板）
 /// - `AlpnId::Http11` → `b"\x08http/1.1"`
 /// - `AlpnId::H2` → `b"\x02h2\x08http/1.1"`
 fn alpn_wire(alpn: AlpnId) -> Option<&'static [u8]> {
@@ -173,18 +174,8 @@ fn alpn_wire(alpn: AlpnId) -> Option<&'static [u8]> {
 /// `connect_with_alpn` 会挂在等 ServerHello，无 OS 层兜底）。
 const DETECT_TIMEOUT: Duration = Duration::from_secs(15);
 
-pub async fn detect_one(
-    dest: &str,
-    server_name: &str,
-    alpn: AlpnId,
-) -> Option<MaxUselessRecords> {
-    timeout(
-        DETECT_TIMEOUT,
-        detect_one_inner(dest, server_name, alpn),
-    )
-    .await
-    .ok()
-    .flatten()
+pub async fn detect_one(dest: &str, server_name: &str, alpn: AlpnId) -> Option<MaxUselessRecords> {
+    timeout(DETECT_TIMEOUT, detect_one_inner(dest, server_name, alpn)).await.ok().flatten()
 }
 
 async fn detect_one_inner(
@@ -201,16 +192,8 @@ async fn detect_one_inner(
         AlpnId::Http11 | AlpnId::H2 => get_fingerprint("chrome").ok()?,
     };
     let alpn_wire = alpn_wire(alpn);
-    let tls_conn = BtlsConn::connect_with_alpn(
-        conn,
-        server_name,
-        fp,
-        None,
-        None,
-        alpn_wire,
-    )
-    .await
-    .ok()?;
+    let tls_conn =
+        BtlsConn::connect_with_alpn(conn, server_name, fp, None, None, alpn_wire).await.ok()?;
 
     // 拿底层 TCP 用于写 raw CCS + 读 Alert。`raw_tcp_clone` 与 BoringSSL BIO
     // 共享 fd；握手已结束、BIO 不主动 read，fd 接收缓冲不被消费。
@@ -310,11 +293,7 @@ pub fn detect_max_useless_records(
 
     for sni in server_names {
         for alpn in [AlpnId::None, AlpnId::Http11, AlpnId::H2] {
-            let key = ProbeKey {
-                dest: dest.clone(),
-                server_name: sni.clone(),
-                alpn,
-            };
+            let key = ProbeKey { dest: dest.clone(), server_name: sni.clone(), alpn };
             // 避免重复探测：若已存在，跳过。
             if table.get(&key).is_some() {
                 continue;
@@ -352,7 +331,7 @@ const RECORD_LENS_TIMEOUT: Duration = Duration::from_secs(15);
 /// - `length > len(data)` = illegal data，break（已收集的保留）。
 ///
 /// 返回列表**可为空**——空列表是有效探测结论（dest 未主动发 type23），
-/// 消费侧 gate 据此恒不发 mirror。
+/// 消费侧 gate 据此不发 mirror；非空 = 逐条发送字节级等价 mirror（bd z32z）。
 fn parse_post_handshake_record_lens(mut data: &[u8]) -> Vec<u32> {
     let mut lens = Vec::new();
     while data.len() >= 5 && data[..3] == [23, 3, 3] {
@@ -369,11 +348,11 @@ fn parse_post_handshake_record_lens(mut data: &[u8]) -> Vec<u32> {
 /// 单 key 记录长度探测（Go `PostHandshakeRecordDetectConn` 等价）。
 ///
 /// - 握手（uTLS 同款指纹/ALPN 形态）→ Go `record_detect.go:80-83`；
-/// - Go 的 `CcsSent` hook 在客户端写出 compat CCS（`{20,3,3}` 开头）后激活
-///   读取——TLS 1.3 客户端握手尾必发该记录，btls（BoringSSL）同样，因此
-///   **握手返回 = CCS 已写出**，直接进入 raw 读窗口；
-/// - raw 读窗口 5 秒（Go `SetReadDeadline` + `io.ReadAll`，`record_detect.go:127-130`）
-///   后按 [`parse_post_handshake_record_lens`] 解析。
+/// - Go 的 `CcsSent` hook 在客户端写出 compat CCS（`{20,3,3}` 开头）后激活 读取——TLS 1.3
+///   客户端握手尾必发该记录，btls（BoringSSL）同样，因此 **握手返回 = CCS 已写出**，直接进入 raw
+///   读窗口；
+/// - raw 读窗口 5 秒（Go `SetReadDeadline` + `io.ReadAll`，`record_detect.go:127-130`） 后按
+///   [`parse_post_handshake_record_lens`] 解析。
 ///
 /// `None` = TCP/握手/克隆失败（对齐 Go 直接 return，由 spawn 层 defer 存空列表）。
 async fn detect_one_record_lens_inner(
@@ -442,11 +421,7 @@ pub fn detect_post_handshake_record_lens(
 
     for sni in server_names {
         for alpn in [AlpnId::None, AlpnId::Http11, AlpnId::H2] {
-            let key = ProbeKey {
-                dest: dest.clone(),
-                server_name: sni.clone(),
-                alpn,
-            };
+            let key = ProbeKey { dest: dest.clone(), server_name: sni.clone(), alpn };
             if table.record_lens_for_key(&key).is_some() {
                 continue;
             }
@@ -454,12 +429,14 @@ pub fn detect_post_handshake_record_lens(
             let dest_c = dest.clone();
             let sni_c = sni.clone();
             tokio::spawn(async move {
-                let lens =
-                    timeout(RECORD_LENS_TIMEOUT, detect_one_record_lens_inner(&dest_c, &sni_c, alpn))
-                        .await
-                        .ok()
-                        .flatten()
-                        .unwrap_or_default();
+                let lens = timeout(
+                    RECORD_LENS_TIMEOUT,
+                    detect_one_record_lens_inner(&dest_c, &sni_c, alpn),
+                )
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
                 table_inner.lock().insert(key, lens);
             });
         }
@@ -468,9 +445,12 @@ pub fn detect_post_handshake_record_lens(
 
 #[cfg(test)]
 mod tests {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
 
     /// mock target：在收到首条 CCS record（任意时刻）后立即发 Alert。
     #[allow(dead_code)] // 接入 full TLS handshake 后启用（当前单测仅 silent 路径）
@@ -488,13 +468,11 @@ mod tests {
                             // 一旦看到 CCS 头 (0x14) 就发 Alert
                             if buf[0] == 0x14 {
                                 // TLS Alert: level=warning(1), desc=unexpected_message(10)
-                                let alert = [
-                                    0x15, 0x03, 0x03, 0x00, 0x02, 0x01, 0x0a,
-                                ];
+                                let alert = [0x15, 0x03, 0x03, 0x00, 0x02, 0x01, 0x0a];
                                 let _ = s.write_all(&alert).await;
                                 return;
                             }
-                        }
+                        },
                         Err(_) => return,
                     }
                 }
@@ -513,7 +491,7 @@ mod tests {
                 loop {
                     match s.read(&mut buf).await {
                         Ok(0) | Err(_) => return,
-                        Ok(_) => {} // 静默吞
+                        Ok(_) => {}, // 静默吞
                     }
                 }
             }
@@ -562,11 +540,7 @@ mod tests {
     #[test]
     fn probe_for_key_returns_inserted_value() {
         let t = ProbeTable::new();
-        let key = ProbeKey {
-            dest: "d".into(),
-            server_name: "s".into(),
-            alpn: AlpnId::None,
-        };
+        let key = ProbeKey { dest: "d".into(), server_name: "s".into(), alpn: AlpnId::None };
         assert!(probe_for_key(&t, &key).is_none());
         t.insert(key.clone(), 16);
         assert_eq!(probe_for_key(&t, &key), Some(16));
@@ -687,12 +661,14 @@ mod tests {
             0,
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(t.record_lens_for_key(&ProbeKey {
-            dest: "127.0.0.1:1".into(),
-            server_name: "localhost".into(),
-            alpn: AlpnId::None
-        })
-        .is_none());
+        assert!(
+            t.record_lens_for_key(&ProbeKey {
+                dest: "127.0.0.1:1".into(),
+                server_name: "localhost".into(),
+                alpn: AlpnId::None
+            })
+            .is_none()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -706,11 +682,13 @@ mod tests {
             1,
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(t.record_lens_for_key(&ProbeKey {
-            dest: "127.0.0.1:1".into(),
-            server_name: "localhost".into(),
-            alpn: AlpnId::None
-        })
-        .is_none());
+        assert!(
+            t.record_lens_for_key(&ProbeKey {
+                dest: "127.0.0.1:1".into(),
+                server_name: "localhost".into(),
+                alpn: AlpnId::None
+            })
+            .is_none()
+        );
     }
 }

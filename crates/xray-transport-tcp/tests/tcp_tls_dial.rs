@@ -2,16 +2,15 @@
 //!
 //! 验证 `dial_with_settings("tcp", security:tls)` 正确包装 TLS 握手而非裸 TCP。
 
-use std::net::Ipv4Addr;
-use std::sync::Arc;
+use std::{net::Ipv4Addr, sync::Arc};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::TlsAcceptor;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::port::Port;
-use xray_transport::dialer::{StreamSettings, dial_with_settings};
-use xray_transport::sockopt::SocketOptions;
+use xray_common::net::{address::Address, destination::Destination, port::Port};
+use xray_transport::{
+    dialer::{StreamSettings, dial_with_settings},
+    sockopt::SocketOptions,
+};
 
 /// TCP + TLS 出站：dial 应完成 TLS 握手并能 echo 回环。
 ///
@@ -44,7 +43,7 @@ async fn tcp_plus_tls_wraps_tls_and_echoes() {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let _ = tls.write_all(&buf[..n]).await;
-                }
+                },
             }
         }
     });
@@ -98,7 +97,7 @@ async fn tcp_plus_tls_with_fingerprint_uses_btls() {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let _ = tls.write_all(&buf[..n]).await;
-                }
+                },
             }
         }
     });

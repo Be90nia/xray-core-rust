@@ -110,7 +110,8 @@ pub struct StackOptions {
     /// MTU。JSON `"mtu"`，0/缺省 → 1500（Go infra/conf/tun.go:37-39）。
     pub mtu: u32,
     /// 接口地址 CIDR 列表（如 `"10.0.0.1/24"`）。JSON `"gateway"`——Go 侧即接口地址
-    /// （Windows `SetIPAddresses`，tun_windows.go:117-123；Darwin `setIPAddress`，tun_darwin.go:248）。
+    /// （Windows `SetIPAddresses`，tun_windows.go:117-123；Darwin
+    /// `setIPAddress`，tun_darwin.go:248）。
     pub gateway: Vec<String>,
     /// DNS 服务器。JSON `"dns"`（Go tun_windows.go:163-175 SetDNS；Linux 由外部配置）。
     pub dns: Vec<String>,
@@ -214,8 +215,7 @@ impl StackOptions {
     /// （Go 无此默认——Linux 由外部配置地址；smoltcp netstack 需要本地地址）。
     #[must_use]
     pub fn device_ipv4(&self) -> (std::net::Ipv4Addr, u8) {
-        self.ipv4_gateway()
-            .unwrap_or((std::net::Ipv4Addr::new(10, 0, 0, 1), 24))
+        self.ipv4_gateway().unwrap_or((std::net::Ipv4Addr::new(10, 0, 0, 1), 24))
     }
 
     /// netstack 本地地址列表：gateway 全部 CIDR（v4+v6）；空则设备默认 v4。
@@ -269,13 +269,12 @@ impl StackOptions {
             Some(p.auto_outbounds_interface.clone())
         };
         // Build 归一化（Go infra/conf/tun.go:30-39）
-        let auto_outbounds_interface = if !p.auto_system_routing_table.is_empty()
-            && auto_outbounds_interface.is_none()
-        {
-            Some("auto".to_string())
-        } else {
-            auto_outbounds_interface
-        };
+        let auto_outbounds_interface =
+            if !p.auto_system_routing_table.is_empty() && auto_outbounds_interface.is_none() {
+                Some("auto".to_string())
+            } else {
+                auto_outbounds_interface
+            };
         if name.is_empty() {
             name = "xray0".to_string();
         }
@@ -306,10 +305,7 @@ impl StackOptions {
             dns: self.dns.clone(),
             user_level: self.user_level,
             auto_system_routing_table: self.auto_system_routing_table.clone(),
-            auto_outbounds_interface: self
-                .auto_outbounds_interface
-                .clone()
-                .unwrap_or_default(),
+            auto_outbounds_interface: self.auto_outbounds_interface.clone().unwrap_or_default(),
         }
     }
 }
@@ -333,11 +329,9 @@ fn parse_duration_value(val: &serde_json::Value, field: &str) -> Result<Duration
                 TunError::InvalidConfig(format!("{field}: not a positive integer"))
             })?;
             Ok(Duration::from_secs(secs))
-        }
+        },
         serde_json::Value::String(s) => parse_duration_suffix(s, field),
-        _ => Err(TunError::InvalidConfig(format!(
-            "{field}: expected number or string"
-        ))),
+        _ => Err(TunError::InvalidConfig(format!("{field}: expected number or string"))),
     }
 }
 
@@ -372,19 +366,19 @@ fn parse_duration_suffix(s: &str, field: &str) -> Result<Duration> {
                 };
                 total_secs += n * mult;
                 num_buf.clear();
-            }
+            },
             _ => {
                 return Err(TunError::InvalidConfig(format!(
                     "{field}: unknown suffix '{ch}' in '{s}'"
                 )));
-            }
+            },
         }
     }
     // 无后缀的尾部数字视为秒
     if !num_buf.is_empty() {
-        let n: u64 = num_buf.parse().map_err(|_| {
-            TunError::InvalidConfig(format!("{field}: trailing number in '{s}'"))
-        })?;
+        let n: u64 = num_buf
+            .parse()
+            .map_err(|_| TunError::InvalidConfig(format!("{field}: trailing number in '{s}'")))?;
         total_secs += n;
     }
     Ok(Duration::from_secs(total_secs))
@@ -419,10 +413,7 @@ mod tests {
     #[test]
     fn score_192168_only_counted_once() {
         // 多个 192.168 地址也只 +1（与 Go break 一致）
-        assert_eq!(
-            score("eth0", &["192.168.1.1/24", "192.168.2.1/24"]),
-            1
-        );
+        assert_eq!(score("eth0", &["192.168.1.1/24", "192.168.2.1/24"]), 1);
     }
 
     #[test]
@@ -442,10 +433,7 @@ mod tests {
 
     #[test]
     fn stack_options_custom_idle_timeout() {
-        let opts = StackOptions {
-            idle_timeout: Duration::from_secs(120),
-            ..Default::default()
-        };
+        let opts = StackOptions { idle_timeout: Duration::from_secs(120), ..Default::default() };
         assert_eq!(opts.idle_timeout, Duration::from_secs(120));
     }
 
@@ -495,12 +483,14 @@ mod tests {
     #[test]
     fn parse_json_routing_table_implies_auto_interface() {
         // Go tun.go:30-32：autoSystemRoutingTable 非空且未指定 interface → "auto"
-        let opts = StackOptions::parse_json(br#"{"autoSystemRoutingTable":["0.0.0.0/0"]}"#).unwrap();
+        let opts =
+            StackOptions::parse_json(br#"{"autoSystemRoutingTable":["0.0.0.0/0"]}"#).unwrap();
         assert_eq!(opts.auto_outbounds_interface.as_deref(), Some("auto"));
         // 显式指定则不覆盖
-        let opts =
-            StackOptions::parse_json(br#"{"autoSystemRoutingTable":["0.0.0.0/0"],"autoOutboundsInterface":"wlan0"}"#)
-                .unwrap();
+        let opts = StackOptions::parse_json(
+            br#"{"autoSystemRoutingTable":["0.0.0.0/0"],"autoOutboundsInterface":"wlan0"}"#,
+        )
+        .unwrap();
         assert_eq!(opts.auto_outbounds_interface.as_deref(), Some("wlan0"));
     }
 
@@ -519,7 +509,8 @@ mod tests {
 
     #[test]
     fn device_ipv4_from_gateway() {
-        let opts = StackOptions::parse_json(br#"{"gateway":["172.16.0.1/24","fd00::1/64"]}"#).unwrap();
+        let opts =
+            StackOptions::parse_json(br#"{"gateway":["172.16.0.1/24","fd00::1/64"]}"#).unwrap();
         let (addr, prefix) = opts.device_ipv4();
         assert_eq!(addr, std::net::Ipv4Addr::new(172, 16, 0, 1));
         assert_eq!(prefix, 24);
@@ -537,14 +528,26 @@ mod tests {
 
     #[test]
     fn local_cidrs_all_gateways() {
-        let opts = StackOptions::parse_json(br#"{"gateway":["172.16.0.1/24","fd00::1/64"]}"#).unwrap();
+        let opts =
+            StackOptions::parse_json(br#"{"gateway":["172.16.0.1/24","fd00::1/64"]}"#).unwrap();
         let cidrs = opts.local_cidrs();
         assert_eq!(cidrs.len(), 2);
-        assert_eq!(cidrs[0], smoltcp::wire::IpCidr::new(
-            smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(172, 16, 0, 1)), 24));
-        assert_eq!(cidrs[1], smoltcp::wire::IpCidr::new(
-            smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::new(
-                0xfd00, 0, 0, 0, 0, 0, 0, 1)), 64));
+        assert_eq!(
+            cidrs[0],
+            smoltcp::wire::IpCidr::new(
+                smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(172, 16, 0, 1)),
+                24
+            )
+        );
+        assert_eq!(
+            cidrs[1],
+            smoltcp::wire::IpCidr::new(
+                smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::new(
+                    0xfd00, 0, 0, 0, 0, 0, 0, 1
+                )),
+                64
+            )
+        );
     }
 
     #[test]
@@ -552,8 +555,13 @@ mod tests {
         let opts = StackOptions::parse_json(b"{}").unwrap();
         let cidrs = opts.local_cidrs();
         assert_eq!(cidrs.len(), 1);
-        assert_eq!(cidrs[0], smoltcp::wire::IpCidr::new(
-            smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(10, 0, 0, 1)), 24));
+        assert_eq!(
+            cidrs[0],
+            smoltcp::wire::IpCidr::new(
+                smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(10, 0, 0, 1)),
+                24
+            )
+        );
     }
 
     // ===== parse_ip_cidr =====
@@ -589,12 +597,15 @@ mod tests {
         fn start(&self) -> Result<()> {
             Ok(())
         }
+
         fn close(&self) -> Result<()> {
             Ok(())
         }
+
         fn name(&self) -> Result<String> {
             Ok("dummy0".into())
         }
+
         fn index(&self) -> Result<i32> {
             Ok(0)
         }
@@ -614,6 +625,7 @@ mod tests {
         fn start(&self) -> Result<()> {
             Ok(())
         }
+
         fn close(&self) -> Result<()> {
             Ok(())
         }
@@ -660,10 +672,8 @@ mod tests {
     fn from_proto_applies_go_build_defaults() {
         // Go infra/conf/tun.go:30-39：name 空→xray0、mtu 0→1500、
         // routing table 非空且未指定 interface→auto
-        let p = ProtoConfig {
-            auto_system_routing_table: vec!["60".into()],
-            ..ProtoConfig::default()
-        };
+        let p =
+            ProtoConfig { auto_system_routing_table: vec!["60".into()], ..ProtoConfig::default() };
         let opts = StackOptions::from_proto(&p);
         assert_eq!(opts.name, "xray0");
         assert_eq!(opts.mtu, 1500);
@@ -696,13 +706,7 @@ mod tests {
         assert_eq!(from_json.gateway, from_proto.gateway);
         assert_eq!(from_json.dns, from_proto.dns);
         assert_eq!(from_json.user_level, from_proto.user_level);
-        assert_eq!(
-            from_json.auto_system_routing_table,
-            from_proto.auto_system_routing_table
-        );
-        assert_eq!(
-            from_json.auto_outbounds_interface,
-            from_proto.auto_outbounds_interface
-        );
+        assert_eq!(from_json.auto_system_routing_table, from_proto.auto_system_routing_table);
+        assert_eq!(from_json.auto_outbounds_interface, from_proto.auto_outbounds_interface);
     }
 }

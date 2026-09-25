@@ -3,9 +3,9 @@
 //! 对应 Go 版本 `common/buf/copy.go`，提供 Reader→Writer 的数据拷贝管道，
 //! 支持超时、活动回调、大小计数等选项。
 
+use std::{sync::Arc, time::Duration};
+
 use crate::io::{self, Reader, Result, Writer};
-use std::sync::Arc;
-use std::time::Duration;
 
 // ========== CopyOptions ==========
 
@@ -22,10 +22,7 @@ pub struct CopyOptions {
 
 impl Default for CopyOptions {
     fn default() -> Self {
-        Self {
-            on_update_activity: None,
-            on_count_size: None,
-        }
+        Self { on_update_activity: None, on_count_size: None }
     }
 }
 
@@ -136,10 +133,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::Cursor,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
     use super::*;
     use crate::io::{new_reader, new_writer};
-    use std::io::Cursor;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
     async fn test_copy_basic() {
@@ -180,9 +180,7 @@ mod tests {
         let mut opts = CopyOptions::default();
         update_fn(&mut opts);
 
-        copy_with_options(&mut reader, &mut writer, opts)
-            .await
-            .expect("copy failed");
+        copy_with_options(&mut reader, &mut writer, opts).await.expect("copy failed");
 
         assert!(count.load(Ordering::Relaxed) > 0);
     }
@@ -204,9 +202,7 @@ mod tests {
         let mut opts = CopyOptions::default();
         size_fn(&mut opts);
 
-        copy_with_options(&mut reader, &mut writer, opts)
-            .await
-            .expect("copy failed");
+        copy_with_options(&mut reader, &mut writer, opts).await.expect("copy failed");
 
         assert!(total_size.load(Ordering::Relaxed) > 0);
     }

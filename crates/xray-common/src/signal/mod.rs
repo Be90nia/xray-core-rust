@@ -3,11 +3,10 @@
 //! 对应 Go 版本 `common/signal` 包，包含 Done 信号、Notifier、
 //! ActivityTimer、PubSub 和 Semaphore 等并发原语。
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::Mutex;
-use tokio::sync::{watch, Notify, Semaphore as TokioSemaphore};
+use tokio::sync::{Notify, Semaphore as TokioSemaphore, watch};
 
 // ========== Done 信号 (Go: signal/done) ==========
 
@@ -79,9 +78,7 @@ impl std::fmt::Debug for Notifier {
 impl Notifier {
     /// 创建新的通知器。
     pub fn new() -> Self {
-        Self {
-            notify: Arc::new(Notify::new()),
-        }
+        Self { notify: Arc::new(Notify::new()) }
     }
 
     /// 发出通知信号。
@@ -103,9 +100,7 @@ impl Default for Notifier {
 
 impl Clone for Notifier {
     fn clone(&self) -> Self {
-        Self {
-            notify: Arc::clone(&self.notify),
-        }
+        Self { notify: Arc::clone(&self.notify) }
     }
 }
 
@@ -170,8 +165,8 @@ impl ActivityTimer {
     /// 重新调度超时窗口。对应 Go `common/signal/timer.go:53-76` `ActivityTimer.SetTimeout`：
     ///
     /// - `t == Duration::ZERO`：立即 cancel done（等价 Go `SetTimeout(0) → finish()`）。
-    /// - `t > Duration::ZERO`：替换内部 timeout + 唤醒 `run` 循环以重算 deadline
-    ///   （Go 等价：close old checkTask + new checkTask + `Update()`）。
+    /// - `t > Duration::ZERO`：替换内部 timeout + 唤醒 `run` 循环以重算 deadline （Go 等价：close
+    ///   old checkTask + new checkTask + `Update()`）。
     /// - 多次调用安全；`is_cancelled()` 后调用为 no-op。
     pub fn set_timeout(&self, t: std::time::Duration) {
         if self.done.is_cancelled() {
@@ -266,9 +261,7 @@ pub struct PubSub<T: Clone + Send + Sync + 'static> {
 impl<T: Clone + Send + Sync + 'static> PubSub<T> {
     /// 创建新的 PubSub 服务。
     pub fn new() -> Self {
-        Self {
-            subscribers: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-        }
+        Self { subscribers: Arc::new(tokio::sync::RwLock::new(HashMap::new())) }
     }
 
     /// 订阅全局主题（无主题名），返回订阅者。
@@ -327,9 +320,7 @@ impl<T: Clone + Send + Sync + 'static> PubSub<T> {
     /// 主要用于测试 / 诊断。
     pub async fn subscribers_by_topic(&self) -> HashMap<String, usize> {
         let subs = self.subscribers.read().await;
-        subs.iter()
-            .map(|(k, v)| (k.clone(), v.len()))
-            .collect()
+        subs.iter().map(|(k, v)| (k.clone(), v.len())).collect()
     }
 }
 
@@ -370,9 +361,7 @@ pub struct Semaphore {
 impl Semaphore {
     /// 创建新的信号量，指定最大并发数。
     pub fn new(max: usize) -> Self {
-        Self {
-            inner: Arc::new(TokioSemaphore::new(max)),
-        }
+        Self { inner: Arc::new(TokioSemaphore::new(max)) }
     }
 
     /// 获取一个许可，返回许可持有者。
@@ -396,9 +385,7 @@ impl Semaphore {
 
 impl Clone for Semaphore {
     fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
+        Self { inner: Arc::clone(&self.inner) }
     }
 }
 
@@ -409,8 +396,9 @@ pub struct SemaphorePermit {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
+
+    use super::*;
 
     // ---- Done 测试 ----
 
@@ -648,9 +636,7 @@ mod tests {
 
         // global 不应收到。
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), sub_global.wait())
-                .await
-                .is_err(),
+            tokio::time::timeout(Duration::from_millis(50), sub_global.wait()).await.is_err(),
             "global topic 不应收到 DnsStats 消息"
         );
         // dns 应收到。

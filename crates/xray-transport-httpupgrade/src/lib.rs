@@ -25,25 +25,24 @@
 //!   实际 TCP/TLS 监听 + `keepAccepting` 循环 + PROXY protocol 解析留 follow-up
 //!   （依赖 `xray-transport::Dialer` impl + `k9t reality-s2` 的 uTLS 决策）。
 
+pub mod client;
 pub mod config;
 pub mod connection;
-pub mod client;
+pub mod deferred;
 pub mod dialer;
 pub mod error;
 pub mod hub;
-pub mod server;
 pub mod register;
-pub mod deferred;
+pub mod server;
 
 // 顶层 re-export。
 pub use config::Config;
 pub use connection::HttpUpgradeConnection;
+pub use deferred::DeferredResponseReader;
 pub use dialer::{build_upgrade_request, parse_upgrade_response};
 pub use error::{HttpUpgradeError, Result};
 pub use hub::{
-    UpgradeRequest, apply_trusted_x_forwarded_for, build_upgrade_response,
-    parse_upgrade_request, parse_x_forwarded_for,
+    UpgradeRequest, apply_trusted_x_forwarded_for, build_upgrade_response, parse_upgrade_request,
+    parse_x_forwarded_for,
 };
-pub use deferred::DeferredResponseReader;
-
 pub use register::{register_dialer, register_listener};

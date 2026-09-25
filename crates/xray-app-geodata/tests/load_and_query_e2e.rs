@@ -4,17 +4,20 @@
 //! （O(log n) 是 Go 原版目标；当前 IPSet 与 Go 原版一致采用前缀排序 + early short-circuit
 //!  on /0 catch-all，本质 O(n) 但实际命中提前退出。MPH domain matcher 为 O(1) 查询。）
 
-use std::net::{IpAddr, Ipv4Addr};
-use std::path::PathBuf;
+use std::{
+    net::{IpAddr, Ipv4Addr},
+    path::PathBuf,
+};
 
 use prost::Message;
-
-use xray_geodata::loader::GeoDataLoader;
-use xray_geodata::matcher::domain::{
-    DomainMatcher, DomainRule, DomainType, MphDomainMatcher,
+use xray_geodata::{
+    loader::GeoDataLoader,
+    matcher::{
+        domain::{DomainMatcher, DomainRule, DomainType, MphDomainMatcher},
+        ip::{HeuristicIPMatcher, IPMatcher},
+    },
+    pb::{Cidr, Domain, GeoIp, GeoIpList, GeoSite, GeoSiteList},
 };
-use xray_geodata::matcher::ip::{HeuristicIPMatcher, IPMatcher};
-use xray_geodata::pb::{Cidr, Domain, GeoIp, GeoIpList, GeoSite, GeoSiteList};
 
 // ── 测试夹具：构造标准 dat 字节 ───────────────────────────────────
 
@@ -39,10 +42,7 @@ fn unique_dir(label: &str) -> PathBuf {
     p.push(format!(
         "xray-geodata-e2e-{}-{label}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     std::fs::create_dir_all(&p).unwrap();
     p

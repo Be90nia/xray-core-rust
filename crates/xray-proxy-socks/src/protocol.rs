@@ -86,7 +86,7 @@ pub struct SocksAddr {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Host {
     /// IPv4 地址。
-   Ipv4(Ipv4Addr),
+    Ipv4(Ipv4Addr),
     /// IPv6 地址。
     Ipv6(Ipv6Addr),
     /// 域名字符串。
@@ -154,18 +154,18 @@ pub fn write_address_port(buf: &mut Vec<u8>, addr: &SocksAddr) -> usize {
         Host::Ipv4(ip) => {
             buf.push(ATYP_IPV4);
             buf.extend_from_slice(&ip.octets());
-        }
+        },
         Host::Ipv6(ip) => {
             buf.push(ATYP_IPV6);
             buf.extend_from_slice(&ip.octets());
-        }
+        },
         Host::Domain(domain) => {
             buf.push(ATYP_DOMAIN);
             let bytes = domain.as_bytes();
             // 域名长度 1 字节（域名最大 255 字节）
             buf.push(bytes.len().min(255) as u8);
             buf.extend_from_slice(bytes);
-        }
+        },
     }
     // port BE 2 字节
     buf.push((addr.port >> 8) as u8);
@@ -203,7 +203,7 @@ pub fn parse_address_port(bytes: &[u8]) -> Result<(SocksAddr, usize)> {
             octets.copy_from_slice(&bytes[offset..offset + 4]);
             offset += 4;
             Host::Ipv4(Ipv4Addr::from(octets))
-        }
+        },
         ATYP_IPV6 => {
             if bytes.len() < offset + 16 {
                 return Err(SocksError::InvalidFrame(format!(
@@ -216,7 +216,7 @@ pub fn parse_address_port(bytes: &[u8]) -> Result<(SocksAddr, usize)> {
             octets.copy_from_slice(&bytes[offset..offset + 16]);
             offset += 16;
             Host::Ipv6(Ipv6Addr::from(octets))
-        }
+        },
         ATYP_DOMAIN => {
             if bytes.len() < offset + 1 {
                 return Err(SocksError::InvalidFrame("domain length truncated".into()));
@@ -242,12 +242,10 @@ pub fn parse_address_port(bytes: &[u8]) -> Result<(SocksAddr, usize)> {
                 .to_string();
             offset += len;
             Host::Domain(domain)
-        }
+        },
         other => {
-            return Err(SocksError::InvalidFrame(format!(
-                "unknown atyp: {other:#x}"
-            )));
-        }
+            return Err(SocksError::InvalidFrame(format!("unknown atyp: {other:#x}")));
+        },
     };
     if bytes.len() < offset + 2 {
         return Err(SocksError::InvalidFrame(format!(
@@ -461,10 +459,7 @@ mod tests {
 
     #[test]
     fn decode_udp_rejects_fragment() {
-        let mut packet = encode_udp_packet(
-            &SocksAddr::ipv4(Ipv4Addr::LOCALHOST, 80),
-            &[],
-        );
+        let mut packet = encode_udp_packet(&SocksAddr::ipv4(Ipv4Addr::LOCALHOST, 80), &[]);
         packet[2] = 1; // FRAGMENT = 1
         let err = decode_udp_packet(&packet).unwrap_err();
         assert!(matches!(err, SocksError::UdpPacketError(_)));
@@ -497,10 +492,7 @@ mod tests {
     #[test]
     fn host_to_socket_addr_only_for_ip() {
         let h = Host::Ipv4(Ipv4Addr::LOCALHOST);
-        assert_eq!(
-            h.to_socket_addr(80),
-            Some("127.0.0.1:80".parse().unwrap())
-        );
+        assert_eq!(h.to_socket_addr(80), Some("127.0.0.1:80".parse().unwrap()));
         let h = Host::Domain("example.com".into());
         assert_eq!(h.to_socket_addr(80), None);
     }

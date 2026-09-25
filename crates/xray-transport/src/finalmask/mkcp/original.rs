@@ -11,8 +11,7 @@
 //!
 //! 固定 6 字节（对应 Go `simple.Overhead()`）。
 
-use std::io;
-use std::net::SocketAddr;
+use std::{io, net::SocketAddr};
 
 use async_trait::async_trait;
 
@@ -86,10 +85,7 @@ pub fn seal(plaintext: &[u8]) -> Vec<u8> {
 /// - `InvalidData`：FNV1a-32 校验失败，或 length 字段与实际 payload 长度不符，或输入过短。
 pub fn open(ciphertext: &[u8]) -> io::Result<Vec<u8>> {
     if ciphertext.len() < SIMPLE_OVERHEAD {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "original: ciphertext too short",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "original: ciphertext too short"));
     }
     let mut buf = ciphertext.to_vec();
     let orig_len = buf.len();

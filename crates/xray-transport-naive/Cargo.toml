@@ -10,6 +10,11 @@ xray-common = { path = "../xray-common" }
 xray-transport = { path = "../xray-transport" }
 xray-tls = { path = "../xray-tls" }
 xray-app-dispatcher = { path = "../xray-app-dispatcher" }
+xray-features = { path = "../xray-features" }
+xray-buf = { path = "../xray-buf" }
+async-trait = { workspace = true }
+tokio-rustls = { workspace = true }
+subtle = "2"
 tokio = { workspace = true }
 hyper = { workspace = true }
 serde_json = { workspace = true }
@@ -23,3 +28,6 @@ tokio-stream = "0.1"
 rand = { workspace = true }
 tracing = { workspace = true }
 base64 = "0.22"
+
+[dev-dependencies]
+rustls = { workspace = true }

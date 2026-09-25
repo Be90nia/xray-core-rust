@@ -6,19 +6,18 @@
 //!
 //! UDPStandaloneConfig 不实现（推迟到 rpn-future）。
 
-use std::io;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 
-use super::evaluator::{
-    collect_saved_udp_sizes, evaluate_udp_items, match_udp_items, measure_udp_items,
-    measure_udp_items_with_fallback, EvalContext,
+use super::{
+    UDPConfig, UDPItem,
+    evaluator::{
+        EvalContext, collect_saved_udp_sizes, evaluate_udp_items, match_udp_items,
+        measure_udp_items, measure_udp_items_with_fallback,
+    },
+    state::StateStore,
 };
-use super::state::StateStore;
-use super::{UDPConfig, UDPItem};
 
 /// 由 client 包装的 UDP conn：发送时 evaluate client items，
 /// 接收时 match server items。
@@ -38,8 +37,7 @@ impl UdpCustomClient {
         ttl: Duration,
     ) -> io::Result<Self> {
         let client_saved = collect_saved_udp_sizes(&config.client);
-        let server_header_size =
-            measure_udp_items_with_fallback(&config.server, &client_saved)?;
+        let server_header_size = measure_udp_items_with_fallback(&config.server, &client_saved)?;
         Ok(Self {
             inner,
             client_items: config.client,
@@ -233,13 +231,10 @@ mod tests {
 
         let mut recv = vec![0u8; crate::finalmask::UDP_SIZE];
         // recv_from 会循环到匹配包为止；用 timeout 兜底防卡死
-        let (n, _) = tokio::time::timeout(
-            Duration::from_secs(2),
-            wrapped_b.recv_from(&mut recv),
-        )
-        .await
-        .expect("recv_from did not complete in time")
-        .unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), wrapped_b.recv_from(&mut recv))
+            .await
+            .expect("recv_from did not complete in time")
+            .unwrap();
         assert_eq!(&recv[..n], payload);
     }
 
@@ -269,24 +264,18 @@ mod tests {
         // a → b
         wrapped_a.send_to(b"ping", addr_b).await.unwrap();
         let mut buf = vec![0u8; 16];
-        let (n, _) = tokio::time::timeout(
-            Duration::from_secs(2),
-            wrapped_b.recv_from(&mut buf),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), wrapped_b.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(&buf[..n], b"ping");
 
         // b → a
         wrapped_b.send_to(b"pong", addr_a).await.unwrap();
-        let (n, _) = tokio::time::timeout(
-            Duration::from_secs(2),
-            wrapped_a.recv_from(&mut buf),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), wrapped_a.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(&buf[..n], b"pong");
     }
 
@@ -295,5 +284,4 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         assert_eq!(udp_state_key(addr), "127.0.0.1:8080");
     }
-
 }

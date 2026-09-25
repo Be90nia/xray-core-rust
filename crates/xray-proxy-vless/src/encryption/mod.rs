@@ -12,25 +12,28 @@
 //! Go 端实现依赖以下 Rust 生态尚不完整的组件：
 //!
 //! 1. **`mlkem-768`**：后量子密钥封装（`crypto/mlkem`，Rust 标准/常用 crate 缺失）。
-//! 2. **`unsafe.Pointer` 提取 TLS conn 私有字段**：Go 用反射拿 `tls.Conn.input/rawInput`
-//!    做 splice copy，Rust 没有等价物（也不应做）。
+//! 2. **`unsafe.Pointer` 提取 TLS conn 私有字段**：Go 用反射拿 `tls.Conn.input/rawInput` 做 splice
+//!    copy，Rust 没有等价物（也不应做）。
 //! 3. **TLS 1.3 record header 伪装**：需要可注入的 fake-write，依赖完整 transport 链路。
 //!
 //! 因此本模块仅声明 trait + 数据结构骨架，所有 IO 操作返回
 //! [`VlessError::NotImplemented`]。等上层 transport 链路 + Rust 加密 crate 接入后
 //! 再注入实现。
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::Instant;
-use parking_lot::RwLock;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Instant,
+};
 
-use crate::error::{Result, VlessError};
-
-use crate::encryption::xor::CtrXor;
 use ml_kem::{Decapsulate, KeyExport};
-
+use parking_lot::RwLock;
 // rand_core trait bounds for build_relaychain RNG
 use rand_core::{CryptoRng, RngCore};
+
+use crate::{
+    encryption::xor::CtrXor,
+    error::{Result, VlessError},
+};
 /// SendOsRng REMOVED (compat harness too fragile).
 /// See handshake body for new pattern.
 pub mod aead;
@@ -39,17 +42,18 @@ pub mod common_conn;
 
 pub mod client;
 pub mod common;
-pub mod server;
-pub mod xor;
-pub mod xor_conn;
-pub mod vision;
-pub mod vision_conn;
 /// 客户端 ENC 字符串解析（Go `infra/conf/vless.go` 出站 encryption 校验对齐）。
 pub mod params;
-pub use params::{parse_client_encryption, parse_server_decryption, ClientEncParams, ServerDecParams};
+pub mod server;
+pub mod vision;
+pub mod vision_conn;
+pub mod xor;
+pub mod xor_conn;
+pub use params::{
+    ClientEncParams, ServerDecParams, parse_client_encryption, parse_server_decryption,
+};
 pub mod adapter;
 pub use adapter::EncConnectionAdapter;
-
 
 /// XTLS Vision 加密会话包装的连接 trait。
 ///
@@ -59,7 +63,9 @@ pub use adapter::EncConnectionAdapter;
 /// - AEAD 自动轮换（Nonce 达到 `MaxNonce` 时重新派生）
 ///
 /// 对应 Go 的 `encryption.CommonConn`。
-pub trait EncryptionConn: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin {
+pub trait EncryptionConn:
+    tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin
+{
     /// 关闭连接，刷新内部缓冲。
     fn close(
         &mut self,
@@ -103,20 +109,20 @@ impl ZeroRttCache {
     }
 }
 
- /// 客户端加密实例（对应 Go `ClientInstance`）。
+/// 客户端加密实例（对应 Go `ClientInstance`）。
 ///
 /// 持有 X25519 静态公钥 + ML-KEM-768 封装密钥数组。
 #[derive(Debug)]
 pub struct ClientInstance {
-     /// 远端公钥数组（每个元素：32B=X25519 pub，1184B=ML-KEM-768 encap key）。
-     pub nfs_pkeys: Vec<Vec<u8>>,
-     /// 扁平化公钥字节（CTR XOR 用，对应 Go `NfsPKeysBytes`）。
-     pub nfs_pkeys_flat: Vec<u8>,
-     /// 每个公钥的 blake3 hash（对应 Go `Hash32s`）。
-     pub hash32s: Vec<[u8; 32]>,
-     /// relay chain 总长度（对应 Go `RelaysLength`）。
-     pub relays_length: usize,
-     /// XOR 模式（0=off, 1=XOR relays, 2=XorConn）。
+    /// 远端公钥数组（每个元素：32B=X25519 pub，1184B=ML-KEM-768 encap key）。
+    pub nfs_pkeys: Vec<Vec<u8>>,
+    /// 扁平化公钥字节（CTR XOR 用，对应 Go `NfsPKeysBytes`）。
+    pub nfs_pkeys_flat: Vec<u8>,
+    /// 每个公钥的 blake3 hash（对应 Go `Hash32s`）。
+    pub hash32s: Vec<[u8; 32]>,
+    /// relay chain 总长度（对应 Go `RelaysLength`）。
+    pub relays_length: usize,
+    /// XOR 模式（0=off, 1=XOR relays, 2=XorConn）。
     pub xor_mode: u32,
     /// 0-RTT ticket 有效秒数。
     pub seconds: u32,
@@ -130,8 +136,7 @@ pub struct ClientInstance {
     /// united_key——server 侧 Sessions 只存 pfs_key，nfs_key 每连接重新协商，
     /// Go server.go:226）。
     cache: Arc<ZeroRttCache>,
- }
-
+}
 
 impl Default for ClientInstance {
     fn default() -> Self {
@@ -148,7 +153,8 @@ impl Default for ClientInstance {
         }
     }
 }
-/// `pfsKeyExchange` 段总长：18 (encryptedLength) + 1184 (ML-KEM-768 ciphertext) + 32 (X25519 pub) + 16 (auth tag)
+/// `pfsKeyExchange` 段总长：18 (encryptedLength) + 1184 (ML-KEM-768 ciphertext) + 32 (X25519 pub) +
+/// 16 (auth tag)
 const PFS_LEN: usize = 1250;
 /// 最小 padding 段长度（EncodeLength(16) + empty tag）
 const PADDING_LEN: usize = 34;
@@ -320,10 +326,8 @@ impl ClientInstance {
 
             // lastCTR = NewCTR(nfsKey, iv)；写下段 hash32（CTR XOR）
             let mut new_ctr = CtrXor::new(&nfs_key, &iv)?;
-            new_ctr.xor_into(
-                &mut client_hello[pos + index..pos + index + 32],
-                &self.hash32s[j + 1],
-            );
+            new_ctr
+                .xor_into(&mut client_hello[pos + index..pos + index + 32], &self.hash32s[j + 1]);
             last_ctr = Some(new_ctr);
             pos += index + 32;
         }
@@ -391,10 +395,7 @@ impl ClientInstance {
     ///
     /// # Errors
     /// IO / 解密 / 协议错误返回 [`VlessError`]。
-    pub async fn handshake<C>(
-        &self,
-        conn: C,
-    ) -> Result<Box<dyn EncryptionConn>>
+    pub async fn handshake<C>(&self, conn: C) -> Result<Box<dyn EncryptionConn>>
     where
         C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
     {
@@ -409,13 +410,12 @@ impl ClientInstance {
         // 0-RTT 快路径（Go client.go:113-129）：`seconds > 0` 且缓存未过期时跳过
         // PFS 协商，首包 = iv(16) + relays + nfsAEAD.seal(EncodeLength(32)) +
         // nfsAEAD.seal(ticket[:16])。三个关键语义：
-        //   1. nfsAEAD 用**本次新协商**的 nfs_key（build_relay_chain 现场生成，
-        //      server 从 relays 恢复同一 nfs_key 解密，Go server.go:206）；
-        //   2. united_key = 缓存 pfs_key + 新 nfs_key（Go client.go:117；
-        //      server 侧 Sessions[ticket].PfsKey + 本次 nfs_key，Go server.go:226）；
-        //   3. 上行 AEAD context = 加密后 ticket 32B（Go client.go:122）；下行
-        //      AEAD context = server 首发的 16B 随机数（CommonConn 首次读时建立，
-        //      Go common.go:84-93）。
+        //   1. nfsAEAD 用**本次新协商**的 nfs_key（build_relay_chain 现场生成， server 从 relays
+        //      恢复同一 nfs_key 解密，Go server.go:206）；
+        //   2. united_key = 缓存 pfs_key + 新 nfs_key（Go client.go:117； server 侧
+        //      Sessions[ticket].PfsKey + 本次 nfs_key，Go server.go:226）；
+        //   3. 上行 AEAD context = 加密后 ticket 32B（Go client.go:122）；下行 AEAD context =
+        //      server 首发的 16B 随机数（CommonConn 首次读时建立， Go common.go:84-93）。
         if self.seconds > 0 {
             // 单锁快照 clone（合锁后一次读锁拿全三字段；parking_lot 守卫 !Send，
             // 必须在 await 前 clone 出 owned——let-chain 禁止）。
@@ -441,13 +441,11 @@ impl ClientInstance {
                         };
                         (iv, nfs_key)
                     };
-                    let mut nfs_aead =
-                        crate::encryption::aead::Aead::new(&iv, &nfs_key, use_aes);
+                    let mut nfs_aead = crate::encryption::aead::Aead::new(&iv, &nfs_key, use_aes);
                     let len_bytes = 32u16.to_be_bytes();
                     let mut enc_len = Vec::with_capacity(18);
                     nfs_aead.seal(&mut enc_len, None, &len_bytes, &[])?;
-                    pre_write[iv_and_relays_len..iv_and_relays_len + 18]
-                        .copy_from_slice(&enc_len);
+                    pre_write[iv_and_relays_len..iv_and_relays_len + 18].copy_from_slice(&enc_len);
                     let mut enc_ticket = Vec::with_capacity(32);
                     nfs_aead.seal(&mut enc_ticket, None, &ticket, &[])?;
                     pre_write[iv_and_relays_len + 18..iv_and_relays_len + 50]
@@ -479,12 +477,20 @@ impl ClientInstance {
                             united_key.clone(),
                         );
                         let conn_wrapper = crate::encryption::common_conn::CommonConn::new_zero_rtt(
-                            xor_conn, aead, united_key, use_aes, Some(Arc::clone(&self.cache)),
+                            xor_conn,
+                            aead,
+                            united_key,
+                            use_aes,
+                            Some(Arc::clone(&self.cache)),
                         );
                         return Ok(Box::new(conn_wrapper));
                     }
                     let conn_wrapper = crate::encryption::common_conn::CommonConn::new_zero_rtt(
-                        conn, aead, united_key, use_aes, Some(Arc::clone(&self.cache)),
+                        conn,
+                        aead,
+                        united_key,
+                        use_aes,
+                        Some(Arc::clone(&self.cache)),
                     );
                     return Ok(Box::new(conn_wrapper));
                 }
@@ -542,15 +548,13 @@ impl ClientInstance {
             // Go client.go:140 Seal(padding[:18], nil, padding[18:paddingLength-16]) —
             // 密文必须写入 client_hello，否则发出全零字节（服务端 AEAD open 必败）。
             client_hello[pad_offset..pad_offset + 18].copy_from_slice(&pad_tmp);
-            client_hello[pad_offset + 18..pad_offset + padding_length]
-                .copy_from_slice(&pad_tmp2);
+            client_hello[pad_offset + 18..pad_offset + padding_length].copy_from_slice(&pad_tmp2);
             // Go client.go:148：首段并入 iv+relays+pfsKeyExchange 长度
             padding_lens_seg[0] += pad_offset as u32;
         }
         // 6. 分段发送 clientHello（Go client.go:149-155：逐段写、段间按 gaps
         //    sleep，制造可变流量形态，直至内部 VLESS 流接管）
-        write_padding_fragments(&mut conn, &client_hello, &padding_lens_seg, &padding_gaps)
-            .await?;
+        write_padding_fragments(&mut conn, &client_hello, &padding_lens_seg, &padding_gaps).await?;
         let mut encrypted_pfs = vec![0u8; 1088 + 32 + 16];
         conn.read_exact(&mut encrypted_pfs).await?;
         let mut decrypted_pfs = Vec::with_capacity(1120);
@@ -585,13 +589,9 @@ impl ClientInstance {
         united_key.extend_from_slice(&nfs_key);
 
         // 9. aead / peer_aead（context 对齐 Go：pfs_public_key / decrypted_pfs[..1120]）
-        let aead =
-            crate::encryption::aead::Aead::new(&pfs.pfs_public_key, &united_key, use_aes);
-        let mut peer_aead = crate::encryption::aead::Aead::new(
-            &decrypted_pfs[..1120],
-            &united_key,
-            use_aes,
-        );
+        let aead = crate::encryption::aead::Aead::new(&pfs.pfs_public_key, &united_key, use_aes);
+        let mut peer_aead =
+            crate::encryption::aead::Aead::new(&decrypted_pfs[..1120], &united_key, use_aes);
 
         // 10. 读 encryptedTicket(32) → seconds
         let mut encrypted_ticket = vec![0u8; 32];
@@ -612,11 +612,12 @@ impl ClientInstance {
         let mut encrypted_padding = vec![0u8; peer_padding_len];
         conn.read_exact(&mut encrypted_padding).await?;
         peer_aead.open(&mut Vec::new(), None, &encrypted_padding, &[])?;
-        // 13. 缓存 0-RTT 凭据（Go client.go:188-194：`seconds > 0 && seconds > 0`
-        //     ——与 xor_mode 无关；ticket 前 2B 是 server 编码的 seconds）。
+        // 13. 缓存 0-RTT 凭据（Go client.go:188-194：`seconds > 0 && seconds > 0` ——与 xor_mode
+        //     无关；ticket 前 2B 是 server 编码的 seconds）。
         let server_seconds = _seconds;
         if self.seconds > 0 && server_seconds > 0 {
-            let ticket16: [u8; 16] = ticket_pt[..16].try_into()
+            let ticket16: [u8; 16] = ticket_pt[..16]
+                .try_into()
                 .map_err(|_| VlessError::Other("ticket plaintext not 16 bytes".into()))?;
             let expire = Instant::now() + std::time::Duration::from_secs(server_seconds as u64);
             // 单写锁原子更新三字段（原三把写锁各自持放，读者可观察到中间态）
@@ -645,20 +646,12 @@ impl ClientInstance {
                 0,
             );
             let conn_wrapper = crate::encryption::common_conn::CommonConn::new(
-                xor_conn,
-                aead,
-                peer_aead,
-                use_aes,
-                united_key,
+                xor_conn, aead, peer_aead, use_aes, united_key,
             );
             Ok(Box::new(conn_wrapper))
         } else {
             let conn_wrapper = crate::encryption::common_conn::CommonConn::new(
-                conn,
-                aead,
-                peer_aead,
-                use_aes,
-                united_key,
+                conn, aead, peer_aead, use_aes, united_key,
             );
             Ok(Box::new(conn_wrapper))
         }
@@ -729,7 +722,8 @@ fn unix_minute() -> i64 {
     (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0) / 60) as i64
+        .unwrap_or(0)
+        / 60) as i64
 }
 
 /// 服务端加密实例（对应 Go `ServerInstance`）。
@@ -935,7 +929,7 @@ impl ServerInstance {
                     let peer_pub = x25519_dalek::PublicKey::from(peer_pub_bytes);
                     let shared = secret.diffie_hellman(&peer_pub);
                     nfs_key.copy_from_slice(shared.as_bytes());
-                }
+                },
                 NfsSKey::MlKem(dk) => {
                     let ct: ml_kem::Ciphertext<ml_kem::MlKem768> =
                         ml_kem::array::Array::try_from(&relays[pos..pos + 1088])
@@ -944,14 +938,15 @@ impl ServerInstance {
                         .try_decapsulate(&ct)
                         .map_err(|_| VlessError::Other("ml-kem decapsulate failed".into()))?;
                     nfs_key.copy_from_slice(&ss[..]);
-                }
+                },
             }
 
             if j == last_idx {
                 break;
             }
 
-            // 4. 校验下段 hash32：client 写 hash32s[j+1] XOR ctr keystream；server 反 XOR 应 == hash32s[j+1]
+            // 4. 校验下段 hash32：client 写 hash32s[j+1] XOR ctr keystream；server 反 XOR 应 ==
+            //    hash32s[j+1]
             let mut new_ctr = CtrXor::new(&nfs_key, iv)?;
             let mut expected_hash = [0u8; 32];
             new_ctr.xor_into(&mut expected_hash, &relays[pos + index..pos + index + 32]);
@@ -976,10 +971,7 @@ impl ServerInstance {
     ///
     /// # Errors
     /// IO / 解密 / 协议错误返回 [`VlessError`]。
-    pub async fn handshake<C>(
-        &self,
-        conn: C,
-    ) -> Result<Box<dyn EncryptionConn>>
+    pub async fn handshake<C>(&self, conn: C) -> Result<Box<dyn EncryptionConn>>
     where
         C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
     {
@@ -990,17 +982,14 @@ impl ServerInstance {
             return Err(VlessError::Other("ServerInstance not initialized".into()));
         }
 
-
         let mut conn = conn;
         let use_aes = true; // 阶段 B：假设 AES 硬件支持（对齐 client）
-
 
         // 1. 读 ivAndRelays(16 + relays_length)
         let iv_and_relays_len = 16 + self.relays_length;
         let mut iv_and_relays = vec![0u8; iv_and_relays_len];
         conn.read_exact(&mut iv_and_relays).await?;
-        let iv: [u8; 16] =
-            iv_and_relays[..16].try_into().expect("iv is 16 bytes");
+        let iv: [u8; 16] = iv_and_relays[..16].try_into().expect("iv is 16 bytes");
 
         // 2. relay chain 反向解密 → nfs_key
         let nfs_key = self.parse_relay_chain(&mut iv_and_relays[16..], &iv)?;
@@ -1014,12 +1003,10 @@ impl ServerInstance {
         let mut length_pt = Vec::with_capacity(2);
         nfs_aead.open(&mut length_pt, None, &encrypted_length, &[])?; // → nonce 0001
         let length = u16::from_be_bytes([length_pt[0], length_pt[1]]) as usize;
-        // 5. 0-RTT ticket 路径（Go server.go:198-235）：client 快路径凭缓存 ticket
-        //    重连——解 ticket → 查会话（replay 防护/过期噪声）→ PreWrite 16B 随机。
+        // 5. 0-RTT ticket 路径（Go server.go:198-235）：client 快路径凭缓存 ticket 重连——解 ticket
+        //    → 查会话（replay 防护/过期噪声）→ PreWrite 16B 随机。
         if length == 32 {
-            return self
-                .handshake_zero_rtt(conn, &mut nfs_aead, &nfs_key, &iv)
-                .await;
+            return self.handshake_zero_rtt(conn, &mut nfs_aead, &nfs_key, &iv).await;
         }
 
         // 6. 读 encryptedPfsPublicKey(length) → pfs_public_key(1216)
@@ -1032,7 +1019,15 @@ impl ServerInstance {
         nfs_aead.open(&mut pfs_pub_pt, None, &encrypted_pfs, &[])?; // → nonce 0002
         // ThreadRng !Send：把 RNG + 同步 AEAD 派生全部封在内部 block，await 前 drop。
         // iv/united_key/ticket 被外层 xor_conn/CommonConn 构造用到，须在 outer 保留。
-        let (server_hello, aead, peer_aead, ticket_arr, united_key_bytes, padding_lens_seg, padding_gaps) = {
+        let (
+            server_hello,
+            aead,
+            peer_aead,
+            ticket_arr,
+            united_key_bytes,
+            padding_lens_seg,
+            padding_gaps,
+        ) = {
             let mut rng = rand::rng();
             let ek_bytes: ml_kem::Key<ml_kem::EncapsulationKey768> =
                 ml_kem::array::Array::try_from(&pfs_pub_pt[..1184])
@@ -1070,12 +1065,10 @@ impl ServerInstance {
             let mut united_key = Vec::with_capacity(96);
             united_key.extend_from_slice(&pfs_key);
             united_key.extend_from_slice(&nfs_key);
-            let mut aead = crate::encryption::aead::Aead::new(&server_pfs_pub, &united_key, use_aes);
-            let peer_aead = crate::encryption::aead::Aead::new(
-                &pfs_pub_pt[..1184 + 32],
-                &united_key,
-                use_aes,
-            );
+            let mut aead =
+                crate::encryption::aead::Aead::new(&server_pfs_pub, &united_key, use_aes);
+            let peer_aead =
+                crate::encryption::aead::Aead::new(&pfs_pub_pt[..1184 + 32], &united_key, use_aes);
             let mut ticket = [0u8; 16];
             rng.fill_bytes(&mut ticket);
             // Go server.go:271-277：协商有效期秒数（to==0 → from×rand[50,100)/100，
@@ -1102,18 +1095,17 @@ impl ServerInstance {
                 // 时间戳换算分钟，+2 保险余量。
                 let now_secs = unix_minute() * 60;
                 let mut store = self.sessions.lock();
-                store
-                    .lasts
-                    .insert((now_secs + max_seconds) / 60 + 2, ticket);
+                store.lasts.insert((now_secs + max_seconds) / 60 + 2, ticket);
                 store.tickets.push(ticket);
                 store.sessions.insert(
                     ticket,
-                    ServerSession {
-                        pfs_key: pfs_key.clone(),
-                        nfs_keys: HashSet::new(),
-                    },
+                    ServerSession { pfs_key: pfs_key.clone(), nfs_keys: HashSet::new() },
                 );
-                tracing::info!(sessions = store.sessions.len(), seconds, "vless enc: 1-RTT done, session stored (ticket issued)");
+                tracing::info!(
+                    sessions = store.sessions.len(),
+                    seconds,
+                    "vless enc: 1-RTT done, session stored (ticket issued)"
+                );
             }
             // 随机 padding（对齐 Go server.go:288 CreatPadding，含 gaps），
             // 钳最小 34B 防 0 长度自定义配置下溢（Go 同配置直接 panic），
@@ -1136,20 +1128,11 @@ impl ServerInstance {
             let pad_len_bytes = ((padding_length - 18) as u16).to_be_bytes();
             aead.seal(&mut server_hello, None, &pad_len_bytes, &[])?;
             aead.seal(&mut server_hello, None, &vec![0u8; padding_length - 34], &[])?;
-            (
-                server_hello,
-                aead,
-                peer_aead,
-                ticket,
-                united_key,
-                seg_lens,
-                gaps_dur,
-            )
+            (server_hello, aead, peer_aead, ticket, united_key, seg_lens, gaps_dur)
         };
-        // 13. 分段发送 serverHello（Go server.go:304-306：逐段写、段间按 gaps
-        //     sleep——允许 client 缓慢发 padding，消除 1-RTT 流量形态）
-        write_padding_fragments(&mut conn, &server_hello, &padding_lens_seg, &padding_gaps)
-            .await?;
+        // 13. 分段发送 serverHello（Go server.go:304-306：逐段写、段间按 gaps sleep——允许 client
+        //     缓慢发 padding，消除 1-RTT 流量形态）
+        write_padding_fragments(&mut conn, &server_hello, &padding_lens_seg, &padding_gaps).await?;
         conn.flush().await?;
 
         // 14. 读 client padding：encryptedLength(18) + encryptedPadding(DecodeLength)
@@ -1162,13 +1145,16 @@ impl ServerInstance {
         let mut encrypted_padding = vec![0u8; client_pad_len];
         conn.read_exact(&mut encrypted_padding).await?;
 
-        // 15. 构造加密连接：xor_mode==2 时 XorConn 包在 CommonConn 之下
-        //     （Go server.go:324-326：CommonConn{Conn: XorConn{conn}}，skip 0/0）。
+        // 15. 构造加密连接：xor_mode==2 时 XorConn 包在 CommonConn 之下 （Go
+        //     server.go:324-326：CommonConn{Conn: XorConn{conn}}，skip 0/0）。
         if self.xor_mode == 2 {
             let xor_conn = crate::encryption::xor_conn::XorConn::new(
                 conn,
-                CtrXor::new(&united_key_bytes, &iv)?,         // 读：解密 client 写侧 CTR(iv)（Go server.go:325 PeerCTR）
-                CtrXor::new(&united_key_bytes, &ticket_arr)?, // 写：加密给 client 读侧 CTR(ticket)（Go server.go:325 CTR）
+                CtrXor::new(&united_key_bytes, &iv)?, /* 读：解密 client 写侧 CTR(iv)（Go
+                                                       * server.go:325 PeerCTR） */
+                CtrXor::new(&united_key_bytes, &ticket_arr)?, /* 写：加密给 client 读侧
+                                                               * CTR(ticket)（Go server.go:325
+                                                               * CTR） */
                 0,
                 0,
             );
@@ -1264,7 +1250,10 @@ impl ServerInstance {
             if !session.nfs_keys.insert(*nfs_key) {
                 return Err(VlessError::Other("replay detected".into()));
             }
-            tracing::info!(nfs_keys = session.nfs_keys.len(), "vless enc: 0-RTT ticket accepted (session hit, replay-guard recorded)");
+            tracing::info!(
+                nfs_keys = session.nfs_keys.len(),
+                "vless enc: 0-RTT ticket accepted (session hit, replay-guard recorded)"
+            );
             // Go server.go:226：缓存 pfs_key + 本次新 nfs_key（同 nfsKey 链接上下行，
             // 防 server→client 的另一请求）。
             united_key = {
@@ -1384,8 +1373,8 @@ mod tests {
     }
 
     // === build_relay_chain 测试 ===
-    use rand_core::RngCore;
     use ml_kem::KeyExport;
+    use rand_core::RngCore;
 
     /// 单 X25519 pub：relays_length = (32+32)-32 = 32。验证 ephemeral pub 写入 + nfs_key 非零。
     #[test]
@@ -1422,7 +1411,8 @@ mod tests {
         let mut rng = rand::rng();
         let nfs_key = c.build_relay_chain(&mut client_hello, &mut rng).unwrap();
 
-        // 段1[16..48]=ephemeral pub1；hash32[48..80]=hash32s[1] XOR keystream；段2[80..112]=pub2 XOR'd
+        // 段1[16..48]=ephemeral pub1；hash32[48..80]=hash32s[1] XOR keystream；段2[80..112]=pub2
+        // XOR'd
         assert!(nfs_key.iter().any(|&b| b != 0));
         assert!(client_hello[16..48].iter().any(|&b| b != 0));
         assert!(client_hello[48..80].iter().any(|&b| b != 0)); // hash32 XOR'd（与 hash32s[1] 不同）
@@ -1486,19 +1476,12 @@ mod tests {
         // round-trip：用重建 nfs_aead（nonce=初始）解密验证结构与 pfs_public_key 一致
         let mut dec_aead = crate::encryption::aead::Aead::new(&iv, &nfs_key, true);
         let mut len_pt = Vec::new();
-        dec_aead
-            .open(&mut len_pt, None, &client_hello[pfs_offset..pfs_offset + 18], &[])
-            .unwrap();
+        dec_aead.open(&mut len_pt, None, &client_hello[pfs_offset..pfs_offset + 18], &[]).unwrap();
         assert_eq!(len_pt, 1232u16.to_be_bytes());
 
         let mut pk_pt = Vec::new();
         dec_aead
-            .open(
-                &mut pk_pt,
-                None,
-                &client_hello[pfs_offset + 18..pfs_offset + 1250],
-                &[],
-            )
+            .open(&mut pk_pt, None, &client_hello[pfs_offset + 18..pfs_offset + 1250], &[])
             .unwrap();
         assert_eq!(pk_pt.len(), 1216);
         assert_eq!(pk_pt, pfs.pfs_public_key);
@@ -1650,7 +1633,8 @@ mod tests {
             let mut server = ServerInstance::new();
             server.init(server_skeys.clone(), 0, 600, 600, "").unwrap();
             let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-            let (c_res, s_res) = tokio::join!(client.handshake(client_io), server.handshake(server_io));
+            let (c_res, s_res) =
+                tokio::join!(client.handshake(client_io), server.handshake(server_io));
             if !matches!((c_res, s_res), (Ok(_), Ok(_))) {
                 continue;
             }
@@ -1686,7 +1670,8 @@ mod tests {
             let mut server = ServerInstance::new();
             server.init(server_skeys.clone(), 0, 1, 1, "").unwrap();
             let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-            let (c_res, s_res) = tokio::join!(client.handshake(client_io), server.handshake(server_io));
+            let (c_res, s_res) =
+                tokio::join!(client.handshake(client_io), server.handshake(server_io));
             if !matches!((c_res, s_res), (Ok(_), Ok(_))) {
                 continue;
             }
@@ -1701,7 +1686,6 @@ mod tests {
         }
         panic!("1-RTT handshake failed after 32 attempts");
     }
-
 
     /// 0-RTT 快路径全链路（对齐 Go client.go:113-129 + server.go:198-235 +
     /// common.go:84-93）：第一连 1-RTT 写缓存 → 第二连 0-RTT pre_write + 手动
@@ -1795,10 +1779,7 @@ mod tests {
             let mut s2c_aead = crate::encryption::aead::Aead::new(&sr, &uk, true);
             let payload = b"s2c-0rtt!";
             let mut hdr = [0u8; 5];
-            crate::encryption::common::write_tls_record_header(
-                &mut hdr,
-                payload.len() as u16 + 16,
-            );
+            crate::encryption::common::write_tls_record_header(&mut hdr, payload.len() as u16 + 16);
             let mut down = Vec::new();
             down.extend_from_slice(&sr);
             down.extend_from_slice(&hdr);
@@ -1876,9 +1857,7 @@ mod tests {
             let mut ff = Vec::with_capacity(16 + 32 + 18 + 32);
             ff.extend_from_slice(&iv);
             ff.extend_from_slice(&pub_bytes);
-            nfs_aead
-                .seal(&mut ff, None, &32u16.to_be_bytes(), &[])
-                .unwrap();
+            nfs_aead.seal(&mut ff, None, &32u16.to_be_bytes(), &[]).unwrap();
             nfs_aead.seal(&mut ff, None, cached_ticket, &[]).unwrap();
             return ff;
         }
@@ -1980,10 +1959,7 @@ mod tests {
             let (mut fake_c, fake_s) = tokio::io::duplex(64 * 1024);
             use tokio::io::AsyncWriteExt as _;
             fake_c.write_all(&first_flight).await.unwrap();
-            server
-                .handshake(fake_s)
-                .await
-                .expect("同一首包首次提交应成功（会话命中）");
+            server.handshake(fake_s).await.expect("同一首包首次提交应成功（会话命中）");
         }
 
         // 重放同一首包字节 → replay detected（同 nfs_key 二次使用）
@@ -1999,10 +1975,7 @@ mod tests {
                 VlessError::Other(m) => m.clone(),
                 other => panic!("unexpected error kind: {other:?}"),
             };
-            assert!(
-                msg.contains("replay detected"),
-                "重放应报 replay detected，实际: {msg}"
-            );
+            assert!(msg.contains("replay detected"), "重放应报 replay detected，实际: {msg}");
         }
     }
 
@@ -2085,13 +2058,8 @@ mod tests {
             }
         }
         assert!(established, "1-RTT first connection failed after 32 attempts");
-        let expiry_minute = *server
-            .sessions
-            .lock()
-            .lasts
-            .keys()
-            .next()
-            .expect("1-RTT 应写入 lasts");
+        let expiry_minute =
+            *server.sessions.lock().lasts.keys().next().expect("1-RTT 应写入 lasts");
         assert!(expiry_minute > unix_minute(), "过期分钟应在未来");
 
         // 当下分钟清理：不动
@@ -2099,11 +2067,7 @@ mod tests {
         assert_eq!(server.sessions.lock().sessions.len(), 1);
 
         // 保险条目：minute-1 也应在目标清理时一并删除
-        server
-            .sessions
-            .lock()
-            .lasts
-            .insert(expiry_minute - 1, [7u8; 16]);
+        server.sessions.lock().lasts.insert(expiry_minute - 1, [7u8; 16]);
 
         // 目标分钟清理：会话清空
         server.sessions.lock().cleanup_expired(expiry_minute);
@@ -2247,10 +2211,7 @@ mod tests {
                 .read_exact(&mut buf)
                 .await
                 .expect_err("ticket rejection must surface as read error");
-            assert!(
-                err.to_string().contains(TICKET_REJECTED_MSG),
-                "应返回专用错误，实际: {err}"
-            );
+            assert!(err.to_string().contains(TICKET_REJECTED_MSG), "应返回专用错误，实际: {err}");
 
             // 三缓存清空 → 下条连接回 1-RTT 慢路径
             let snap = client.cache.entry.read().clone();

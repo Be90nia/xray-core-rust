@@ -29,11 +29,7 @@ impl std::error::Error for MultiError {}
 /// 对应 Go `errors.Combine(maybeError ...error) error` 的 nil 过滤语义。
 pub fn combine(errors: impl IntoIterator<Item = Option<Error>>) -> Option<MultiError> {
     let errs: Vec<Error> = errors.into_iter().flatten().collect();
-    if errs.is_empty() {
-        None
-    } else {
-        Some(MultiError { errors: errs })
-    }
+    if errs.is_empty() { None } else { Some(MultiError { errors: errs }) }
 }
 
 /// 检查 `actual`（或其每个聚合元素）是否都匹配 `expected`。
@@ -76,8 +72,8 @@ mod tests {
 
     #[test]
     fn combine_filters_none() {
-        let combined = combine([None, Some(Error::new("a")), None, Some(Error::new("b"))])
-            .expect("non-empty");
+        let combined =
+            combine([None, Some(Error::new("a")), None, Some(Error::new("b"))]).expect("non-empty");
         assert_eq!(combined.to_string(), "multierr: a | b | ");
     }
 

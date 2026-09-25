@@ -9,12 +9,9 @@
 //! （TCP/TLS/WebSocket/gRPC 等）在各协议 crate 内实现并通过下游显式构造
 //! 注入。
 
-use std::future::Future;
-use std::io;
-use std::net::IpAddr;
-use std::pin::Pin;
-use xray_common::errors::removed_feature_message;
-use xray_common::net::destination::Destination;
+use std::{future::Future, io, net::IpAddr, pin::Pin};
+
+use xray_common::{errors::removed_feature_message, net::destination::Destination};
 
 use crate::connection::Connection;
 
@@ -30,11 +27,11 @@ use crate::connection::Connection;
 /// ```
 ///
 /// Rust 翻译取舍：
-/// - `dial` 返回 `Box<dyn Connection>`（而非 Go 的 `stat.Connection`——那是
-///   `net.Conn` 接口别名，统计包装通过 `CounterConnection` 装饰，不在 trait 级强制）
-/// - `set_outbound_gateway` 依赖未实现的 `session.Outbound`，此处仅声明为
-///   `&self` 可选项，下游实现可暂返回 `Ok(())` 或暂不实现直到 Phase 4+
-///   Outbound 就绪。必要时后续拆成子 trait。
+/// - `dial` 返回 `Box<dyn Connection>`（而非 Go 的 `stat.Connection`——那是 `net.Conn`
+///   接口别名，统计包装通过 `CounterConnection` 装饰，不在 trait 级强制）
+/// - `set_outbound_gateway` 依赖未实现的 `session.Outbound`，此处仅声明为 `&self`
+///   可选项，下游实现可暂返回 `Ok(())` 或暂不实现直到 Phase 4+ Outbound 就绪。必要时后续拆成子
+///   trait。
 pub trait Dialer: Send + Sync {
     /// 向 `dest` 发起连接。返回的 Connection 对象以 trait object 形式交由上层多态使用。
     fn dial<'a>(
@@ -63,8 +60,10 @@ pub trait Dialer: Send + Sync {
 // 每个 transport 协议（tcp/tls/websocket/grpc/httpupgrade/splithttp/reality/kcp/hysteria）
 // 在 init() 中注册自己的 dialFunc。上层拨号时按 streamSettings.ProtocolName 查找。
 
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 
 use parking_lot::RwLock;
 
@@ -75,10 +74,14 @@ use crate::sockopt::{HappyEyeballsConfig, SocketOptions};
 /// 每个协议注册一个此类型函数，接收目标地址 + socket 选项，返回包装后的 Connection。
 /// Transport 协议拨号函数签名。对应 Go `dialFunc`。
 ///
-/// 每个协议注册一个此类型函数，接收目标地址 + socket 选项 + streamSettings（含 transport/security 配置），
-/// 返回包装后的 Connection。
+/// 每个协议注册一个此类型函数，接收目标地址 + socket 选项 + streamSettings（含 transport/security
+/// 配置）， 返回包装后的 Connection。
 pub type TransportDialFn = Arc<
-    dyn Fn(&Destination, &SocketOptions, &StreamSettings) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Connection>>> + Send>>
+    dyn Fn(
+            &Destination,
+            &SocketOptions,
+            &StreamSettings,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Connection>>> + Send>>
         + Send
         + Sync,
 >;
@@ -128,10 +131,12 @@ impl StreamSettings {
     /// `{ "network": "ws", "security": "tls", "tlsSettings": {...}, "wsSettings": {...} }`
     ///
     /// # 参数
-    /// - `json`：`Some(v)` 取 `network` / `security` / `<proto>Settings` / `tlsSettings` / `realitySettings`；
-    ///   `None` 返回默认 TCP。
+    /// - `json`：`Some(v)` 取 `network` / `security` / `<proto>Settings` / `tlsSettings` /
+    ///   `realitySettings`； `None` 返回默认 TCP。
     pub fn from_json(json: Option<&serde_json::Value>) -> Self {
-        let Some(v) = json else { return Self::tcp(); };
+        let Some(v) = json else {
+            return Self::tcp();
+        };
         // 已移除特性警告（Go infra/conf 硬报错；Rust 保留宽容行为：warn + 继续解析）。
         for w in removed_feature_warnings(v) {
             xray_common::log::warning(w);
@@ -139,21 +144,23 @@ impl StreamSettings {
         let protocol = v.get("network").and_then(|n| n.as_str()).unwrap_or("tcp").to_string();
         let security = v.get("security").and_then(|s| s.as_str()).unwrap_or("").to_string();
         // 协议特定配置：尝试 `<protocol>Settings`（如 `wsSettings`/`grpcSettings`/`tcpSettings`）。
-        // Go JSON 解析器约定 `network` 值与 settings 字段名对应（`tcp`→`tcpSettings`, `ws`→`wsSettings`, ...）。
-        // ponytail: Go JSON 字段名约定 `<proto>Settings`，但 Go xhttp 网络对应的
-        // JSON 字段是 `xhttpSettings`（与 splithttpSettings 都合法；客户端常混用）。
-        // ponytail: 取两者之一，避免 xhttpSettings JSON 字段被丢弃导致 splithttp
-        // 配置丢失（host/path/mode 等全部退化为默认 + dest fallback）。
+        // Go JSON 解析器约定 `network` 值与 settings 字段名对应（`tcp`→`tcpSettings`,
+        // `ws`→`wsSettings`, ...）。 ponytail: Go JSON 字段名约定 `<proto>Settings`，但 Go
+        // xhttp 网络对应的 JSON 字段是 `xhttpSettings`（与 splithttpSettings
+        // 都合法；客户端常混用）。 ponytail: 取两者之一，避免 xhttpSettings JSON
+        // 字段被丢弃导致 splithttp 配置丢失（host/path/mode 等全部退化为默认 + dest
+        // fallback）。
         let transport_json = protocol_settings_key(&protocol)
             .and_then(|k| v.get(k).cloned())
-            .or_else(|| v.get("xhttpSettings").cloned())
-;
-        let security_json = v.get("tlsSettings").cloned().or_else(|| v.get("realitySettings").cloned());
+            .or_else(|| v.get("xhttpSettings").cloned());
+        let security_json =
+            v.get("tlsSettings").cloned().or_else(|| v.get("realitySettings").cloned());
         // Socket 选项（`sockopt`）与 finalmask 流量伪装配置。
         let sockopt_json = v.get("sockopt").cloned();
         let finalmask_json = v.get("finalmask").cloned();
         Self { protocol, security, transport_json, security_json, sockopt_json, finalmask_json }
     }
+
     /// 是否启用 TLS（`security == "tls"` 或 `security == "reality"`）。
     #[must_use]
     pub fn is_tls(&self) -> bool {
@@ -192,12 +199,12 @@ impl StreamSettings {
         ] {
             if let Some(raw) = obj.get(key) {
                 match raw.as_i64() {
-                    Some(n) if (I32_MIN..=I32_MAX).contains(&n) => {}
+                    Some(n) if (I32_MIN..=I32_MAX).contains(&n) => {},
                     _ => {
                         return Err(std::io::Error::other(format!(
                             "sockopt.{key}: integer value out of int32 range"
                         )));
-                    }
+                    },
                 }
             }
         }
@@ -347,12 +354,32 @@ impl StreamSettings {
                 .filter_map(|c| {
                     let o = c.as_object()?;
                     Some(crate::sockopt::CustomSockopt {
-                        system: o.get("system").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                        network: o.get("network").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                        level: o.get("level").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                        system: o
+                            .get("system")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        network: o
+                            .get("network")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        level: o
+                            .get("level")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
                         opt: o.get("opt").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                        value: o.get("value").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                        r#type: o.get("type").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                        value: o
+                            .get("value")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        r#type: o
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
                     })
                 })
                 .collect();
@@ -364,9 +391,9 @@ impl StreamSettings {
             opts.trusted_x_forwarded_for =
                 v.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
         }
-         opts
-     }
- }
+        opts
+    }
+}
 
 /// `domainStrategy` 字符串 → 枚举。对应 Go transport_internet.go:1082-1108
 /// 的 `strings.ToLower` switch；未知值 warn + AsIs（Go 在 conf Build 硬报错）。
@@ -387,7 +414,7 @@ fn parse_domain_strategy(s: &str) -> crate::sockopt::DomainStrategy {
         other => {
             tracing::warn!(value = other, "unsupported domain strategy, fallback to AsIs");
             DomainStrategy::AsIs
-        }
+        },
     }
 }
 
@@ -405,7 +432,7 @@ fn parse_address_port_strategy(s: &str) -> crate::sockopt::AddressPortStrategy {
         other => {
             tracing::warn!(value = other, "unsupported address port strategy, fallback to None");
             AddressPortStrategy::None
-        }
+        },
     }
 }
 
@@ -418,7 +445,7 @@ fn parse_tproxy(v: &serde_json::Value) -> bool {
         serde_json::Value::Bool(b) => *b,
         serde_json::Value::String(s) => {
             matches!(s.to_ascii_lowercase().as_str(), "tproxy" | "redirect")
-        }
+        },
         _ => false,
     }
 }
@@ -447,8 +474,8 @@ fn protocol_settings_key(protocol: &str) -> Option<&'static str> {
 /// Go 基准（`infra/conf/transport_internet.go`，均在 conf Build 硬报错）：
 /// - `:988-989` `h2`/`h3`/`http` 传输 → HTTP transport（单一文案，三别名同触发）
 /// - `:990-991` `quic` 传输 → QUIC transport
-/// - `:1824-1827` finalmask `xdns` 的 `domain` 键（注：非 SOCKS 设置，
-///   Go 侧属 finalmask tcp 链的 Xdns 配置）
+/// - `:1824-1827` finalmask `xdns` 的 `domain` 键（注：非 SOCKS 设置， Go 侧属 finalmask tcp 链的
+///   Xdns 配置）
 /// - `:2048-2049` `security == "xtls"` → Legacy XTLS
 ///
 /// Rust 保留现有宽容行为：`from_json` 仅 warn 不阻断，协议映射/安全层判定不变。
@@ -464,31 +491,21 @@ fn removed_feature_warnings(v: &serde_json::Value) -> Vec<String> {
             "QUIC transport (without web service, etc.)",
             "XHTTP stream-one H3",
         )),
-        _ => {}
+        _ => {},
     }
     let security = v.get("security").and_then(|s| s.as_str()).unwrap_or("");
     if security.eq_ignore_ascii_case("xtls") {
-        warnings.push(removed_feature_message(
-            "Legacy XTLS",
-            "xtls-rprx-vision with TLS or REALITY",
-        ));
+        warnings
+            .push(removed_feature_message("Legacy XTLS", "xtls-rprx-vision with TLS or REALITY"));
     }
-    let tcp_masks = v
-        .get("finalmask")
-        .and_then(|f| f.get("tcp"))
-        .and_then(|t| t.as_array());
+    let tcp_masks = v.get("finalmask").and_then(|f| f.get("tcp")).and_then(|t| t.as_array());
     if let Some(entries) = tcp_masks {
         for entry in entries {
             let is_xdns = entry.get("type").and_then(|t| t.as_str()) == Some("xdns");
-            let has_domain = entry
-                .get("settings")
-                .and_then(|s| s.get("domain"))
-                .is_some();
+            let has_domain = entry.get("settings").and_then(|s| s.get("domain")).is_some();
             if is_xdns && has_domain {
-                warnings.push(removed_feature_message(
-                    "domain",
-                    "domains(server) & resolvers(client)",
-                ));
+                warnings
+                    .push(removed_feature_message("domain", "domains(server) & resolvers(client)"));
             }
         }
     }
@@ -543,7 +560,8 @@ pub fn get_transport_dialer(protocol: &str) -> Option<TransportDialFn> {
 ///
 /// - `NotFound`：protocol 未注册
 /// - dialer 内部错误透传
-/// 上层 transport 拨号（旧入口，等价于 `dial_with_settings(dest, &StreamSettings::tcp(), sockopt)`）。
+/// 上层 transport 拨号（旧入口，等价于 `dial_with_settings(dest, &StreamSettings::tcp(),
+/// sockopt)`）。
 ///
 /// **新代码应优先使用 [`dial_with_settings`] / [`dial`]。** 本函数保留向后兼容。
 pub async fn dial_transport(
@@ -576,10 +594,7 @@ pub async fn dial_with_settings(
     if protocol == "tcp" || protocol == "raw" {
         return crate::system_dialer::dial_system(destination, sockopt).await;
     }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        format!("{protocol} dialer not registered"),
-    ))
+    Err(io::Error::new(io::ErrorKind::NotFound, format!("{protocol} dialer not registered")))
 }
 
 /// 顶层 transport 入口。对应 Go `transport/internet/dialer.go::Dial`。
@@ -600,11 +615,11 @@ pub async fn dial(
 
 #[cfg(test)]
 mod transport_cache_tests {
-    use super::*;
-    use xray_common::net::address::Address;
-    use xray_common::net::port::Port;
     use std::net::Ipv4Addr;
 
+    use xray_common::net::{address::Address, port::Port};
+
+    use super::*;
 
     // ===== removed_feature_warnings（Go infra/conf/transport_internet.go 对齐）=====
 
@@ -662,9 +677,8 @@ mod transport_cache_tests {
     #[test]
     fn removed_warnings_xdns_domain() {
         // Go :1824-1827（finalmask tcp 链 xdns 的 settings.domain）
-        let warns = rfw(
-            r#"{"finalmask":{"tcp":[{"type":"xdns","settings":{"domain":"t.example.com"}}]}}"#,
-        );
+        let warns =
+            rfw(r#"{"finalmask":{"tcp":[{"type":"xdns","settings":{"domain":"t.example.com"}}]}}"#);
         assert_eq!(
             warns,
             vec![
@@ -675,13 +689,18 @@ mod transport_cache_tests {
             ]
         );
         // xdns 无 domain（用 domains/resolvers 新形式）不触发
-        assert!(rfw(r#"{"finalmask":{"tcp":[{"type":"xdns","settings":{"domains":["a.com"]}}]}}"#).is_empty());
+        assert!(
+            rfw(r#"{"finalmask":{"tcp":[{"type":"xdns","settings":{"domains":["a.com"]}}]}}"#)
+                .is_empty()
+        );
     }
 
     #[test]
     fn removed_warnings_clean_config_is_empty() {
         // 常规 tcp/tls/ws 配置不触发任何警告
-        assert!(rfw(r#"{"network":"tcp","security":"tls","tlsSettings":{"alpn":["h2"]}}"#).is_empty());
+        assert!(
+            rfw(r#"{"network":"tcp","security":"tls","tlsSettings":{"alpn":["h2"]}}"#).is_empty()
+        );
         assert!(rfw(r#"{"network":"ws","security":"reality"}"#).is_empty());
         assert!(rfw("{}").is_empty());
     }
@@ -746,12 +765,20 @@ mod transport_cache_tests {
     fn validate_sockopt_json_hard_errors_and_ok() {
         use super::StreamSettings;
         // 字符串 tfo → 拒（Go :82 "only boolean and integer value is acceptable"）。
-        let err = StreamSettings::validate_sockopt_json(Some(&serde_json::json!({"tcpFastOpen": "yes"})))
-            .err()
-            .expect("string tfo must reject");
+        let err =
+            StreamSettings::validate_sockopt_json(Some(&serde_json::json!({"tcpFastOpen": "yes"})))
+                .err()
+                .expect("string tfo must reject");
         assert!(err.to_string().contains("tcpFastOpen"), "{err}");
         // int32 越界 → 拒。
-        for key in ["mark", "tcpWindowClamp", "tcpMaxSeg", "tcpUserTimeout", "receiveBufferSize", "sendBufferSize"] {
+        for key in [
+            "mark",
+            "tcpWindowClamp",
+            "tcpMaxSeg",
+            "tcpUserTimeout",
+            "receiveBufferSize",
+            "sendBufferSize",
+        ] {
             let obj = serde_json::json!({ key: 9_000_000_000i64 });
             let err = StreamSettings::validate_sockopt_json(Some(&obj)).err().expect("must reject");
             assert!(err.to_string().contains(key), "key={key} err={err}");
@@ -962,9 +989,10 @@ mod transport_cache_tests {
 
     #[test]
     fn register_and_get_transport_dialer() {
-        let dialer: TransportDialFn = Arc::new(|_dest: &Destination, _sockopt: &SocketOptions, _s: &StreamSettings| {
-            Box::pin(async { Err(io::Error::new(io::ErrorKind::Other, "test")) })
-        });
+        let dialer: TransportDialFn =
+            Arc::new(|_dest: &Destination, _sockopt: &SocketOptions, _s: &StreamSettings| {
+                Box::pin(async { Err(io::Error::new(io::ErrorKind::Other, "test")) })
+            });
         // 注册（如果之前已注册同名，忽略 AlreadyExists）。
         let _ = register_transport_dialer("test-protocol-cache", dialer.clone());
         assert!(get_transport_dialer("test-protocol-cache").is_some());
@@ -992,10 +1020,7 @@ mod transport_cache_tests {
         let accept_task = tokio::spawn(async move {
             let _ = listener.accept().await;
         });
-        let dest = Destination::tcp(
-            Address::IPv4(Ipv4Addr::LOCALHOST),
-            Port::new(addr.port()),
-        );
+        let dest = Destination::tcp(Address::IPv4(Ipv4Addr::LOCALHOST), Port::new(addr.port()));
         let sockopt = SocketOptions::default();
         let result = dial_transport("tcp", &dest, &sockopt).await;
         assert!(result.is_ok());
@@ -1009,7 +1034,10 @@ mod transport_cache_tests {
         let result = dial_transport("unregistered-proto", &dest, &sockopt).await;
         match result {
             Err(err) => assert_eq!(err.kind(), io::ErrorKind::NotFound),
-            other => { let _ = other; panic!("expected err"); }
+            other => {
+                let _ = other;
+                panic!("expected err");
+            },
         }
     }
 
@@ -1029,18 +1057,27 @@ mod transport_cache_tests {
         let s = StreamSettings::from_json(Some(&v));
         assert_eq!(s.protocol, "ws");
         assert!(s.is_tls());
-        assert_eq!(s.transport_json.as_ref().unwrap().get("path").and_then(|p| p.as_str()), Some("/ray"));
-        assert_eq!(s.security_json.as_ref().unwrap().get("serverName").and_then(|n| n.as_str()), Some("x.com"));
+        assert_eq!(
+            s.transport_json.as_ref().unwrap().get("path").and_then(|p| p.as_str()),
+            Some("/ray")
+        );
+        assert_eq!(
+            s.security_json.as_ref().unwrap().get("serverName").and_then(|n| n.as_str()),
+            Some("x.com")
+        );
     }
 
     #[test]
     fn stream_settings_grpc_settings_key() {
-        let v: serde_json::Value = serde_json::from_str(
-            r#"{"network":"grpc","grpcSettings":{"serviceName":"gun"}}"#
-        ).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"network":"grpc","grpcSettings":{"serviceName":"gun"}}"#)
+                .unwrap();
         let s = StreamSettings::from_json(Some(&v));
         assert_eq!(s.protocol, "grpc");
-        assert_eq!(s.transport_json.as_ref().unwrap().get("serviceName").and_then(|n| n.as_str()), Some("gun"));
+        assert_eq!(
+            s.transport_json.as_ref().unwrap().get("serviceName").and_then(|n| n.as_str()),
+            Some("gun")
+        );
     }
 
     #[test]

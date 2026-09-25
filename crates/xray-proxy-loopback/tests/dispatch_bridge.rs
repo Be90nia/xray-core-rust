@@ -16,14 +16,14 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-
 use xray_app_dispatcher::default::DispatchHandler;
-use xray_buf::io::{Reader, Writer};
-use xray_buf::multi::MultiBuffer;
-use xray_common::net::address::Address as XrayAddress;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
+use xray_buf::{
+    io::{Reader, Writer},
+    multi::MultiBuffer,
+};
+use xray_common::net::{
+    address::Address as XrayAddress, destination::Destination, network::Network, port::Port,
+};
 use xray_proxy_loopback::{LoopbackFuture, LoopbackHandler, LoopbackSink};
 
 fn dummy_dest() -> Destination {
@@ -69,9 +69,7 @@ impl LoopbackSink for CaptureSink {
 
 #[tokio::test]
 async fn loopback_dispatch_bridges_to_sink_with_link_roundtrip() {
-    let sink = Arc::new(CaptureSink {
-        received: Arc::new(Mutex::new(Vec::new())),
-    });
+    let sink = Arc::new(CaptureSink { received: Arc::new(Mutex::new(Vec::new())) });
 
     let handler =
         LoopbackHandler::with_inbound_tag("loopback-out", "target-in").with_sink(sink.clone());
@@ -80,14 +78,14 @@ async fn loopback_dispatch_bridges_to_sink_with_link_roundtrip() {
         let (loopback_read, mut client_write) = xray_buf::pipe::new();
         let _ = client_read;
         let payload = b"ping loopback";
-    client_write
-        .write_multi_buffer({
-            let mut mb = MultiBuffer::new();
-            mb.merge_bytes(payload);
-            mb
-        })
-        .await
-        .expect("client write to loopback");
+        client_write
+            .write_multi_buffer({
+                let mut mb = MultiBuffer::new();
+                mb.merge_bytes(payload);
+                mb
+            })
+            .await
+            .expect("client write to loopback");
         xray_transport::link::Link::new(Box::new(loopback_read), Box::new(loopback_write))
     };
 
@@ -101,9 +99,6 @@ async fn loopback_dispatch_bridges_to_sink_with_link_roundtrip() {
     assert_eq!(received.len(), 1, "sink must record exactly one dispatch");
     assert_eq!(received[0].0, "target-in");
     assert_eq!(received[0].1.port().value(), 0);
-    assert_eq!(
-        received[0].1.address(),
-        &XrayAddress::Domain("loopback.test".into())
-    );
+    assert_eq!(received[0].1.address(), &XrayAddress::Domain("loopback.test".into()));
     assert_eq!(received[0].2, b"ping loopback".to_vec());
 }

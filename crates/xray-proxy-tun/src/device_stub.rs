@@ -7,8 +7,10 @@
 //! [`TunDevice`] 类型签名可编译（`TunInboundHandler` 等下游类型不变），任何
 //! create/recv/send 返回 Unsupported 错误并注明宿主注入方案。
 
-use crate::config::Tun;
-use crate::error::{Result, TunError};
+use crate::{
+    config::Tun,
+    error::{Result, TunError},
+};
 
 const UNSUPPORTED: &str =
     "tun unsupported on this platform; Android=VpnService / iOS=NEPacketTunnelProvider 宿主注入";
@@ -30,34 +32,22 @@ impl TunDevice {
 
     /// 异步读 IP 包——Unsupported。
     pub async fn recv(&self, _buf: &mut [u8]) -> std::io::Result<usize> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            UNSUPPORTED,
-        ))
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, UNSUPPORTED))
     }
 
     /// 非阻塞读 IP 包——Unsupported。
     pub fn try_recv(&self, _buf: &mut [u8]) -> std::io::Result<usize> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            UNSUPPORTED,
-        ))
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, UNSUPPORTED))
     }
 
     /// 异步发送 IP 包——Unsupported。
     pub async fn send(&self, _buf: &[u8]) -> std::io::Result<usize> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            UNSUPPORTED,
-        ))
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, UNSUPPORTED))
     }
 
     /// 非阻塞发送 IP 包——Unsupported。
     pub fn try_send(&self, _buf: &[u8]) -> std::io::Result<usize> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            UNSUPPORTED,
-        ))
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, UNSUPPORTED))
     }
 }
 
@@ -93,9 +83,8 @@ mod tests {
     /// create 必须报 Unsupported 语义（DeviceCreateFailed + 宿主注入提示）。
     #[test]
     fn create_returns_unsupported() {
-        let err = TunDevice::create("xray0", "10.0.0.1", 24, 1500)
-            .err()
-            .expect("stub create must fail");
+        let err =
+            TunDevice::create("xray0", "10.0.0.1", 24, 1500).err().expect("stub create must fail");
         assert!(format!("{err}").contains("VpnService"), "got: {err}");
     }
 }

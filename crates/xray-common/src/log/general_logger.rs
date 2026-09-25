@@ -10,13 +10,10 @@
 //! Rust 端口用 `tokio::sync::mpsc::channel(128)` + 单一后台 `tokio::spawn` task
 //! + `tokio::time::interval(60s)` + `parking_lot::Mutex<bool>` 充当 Go semaphore 单 token。
 
-use std::io;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{io, sync::Arc, time::Duration};
 
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::{sync::mpsc, task::JoinHandle};
 
 use super::{Handler, Message};
 
@@ -106,11 +103,7 @@ impl GeneralLogger {
     #[must_use]
     pub fn new(creator: Arc<dyn WriterCreator>) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Inner {
-                tx: None,
-                handle: None,
-                running: false,
-            })),
+            inner: Arc::new(Mutex::new(Inner { tx: None, handle: None, running: false })),
             creator,
         }
     }
@@ -175,7 +168,7 @@ async fn run_loop(
         None => {
             inner.lock().running = false;
             return;
-        }
+        },
     };
 
     let mut ticker = tokio::time::interval(IDLE_FLUSH_INTERVAL);
@@ -226,9 +219,10 @@ fn format_message(msg: &Message) -> String {
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
+
     use super::*;
     use crate::log::Severity;
-    use parking_lot::Mutex;
 
     /// 测试用 writer，把每行累计到共享 buffer。
     struct CollectingWriter {
@@ -248,18 +242,14 @@ mod tests {
 
     impl WriterCreator for CollectingCreator {
         fn create(&self) -> Option<Box<dyn Writer>> {
-            Some(Box::new(CollectingWriter {
-                lines: Arc::clone(&self.lines),
-            }))
+            Some(Box::new(CollectingWriter { lines: Arc::clone(&self.lines) }))
         }
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn handle_buffers_and_writer_receives() {
         let lines = Arc::new(Mutex::new(Vec::new()));
-        let creator = Arc::new(CollectingCreator {
-            lines: Arc::clone(&lines),
-        });
+        let creator = Arc::new(CollectingCreator { lines: Arc::clone(&lines) });
         let logger = GeneralLogger::new(creator);
 
         logger.handle_message(&Message::new(Severity::Info, "hello"));
@@ -277,16 +267,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn handle_drops_when_channel_full() {
         let lines = Arc::new(Mutex::new(Vec::new()));
-        let creator = Arc::new(CollectingCreator {
-            lines: Arc::clone(&lines),
-        });
+        let creator = Arc::new(CollectingCreator { lines: Arc::clone(&lines) });
         let logger = GeneralLogger::new(creator);
 
         for i in 0..200 {
-            logger.handle_message(&Message::new(
-                Severity::Info,
-                format!("m{i}"),
-            ));
+            logger.handle_message(&Message::new(Severity::Info, format!("m{i}")));
         }
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -301,9 +286,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn concurrent_handle_only_one_backend_task() {
         let lines = Arc::new(Mutex::new(Vec::new()));
-        let creator = Arc::new(CollectingCreator {
-            lines: Arc::clone(&lines),
-        });
+        let creator = Arc::new(CollectingCreator { lines: Arc::clone(&lines) });
         let logger = Arc::new(GeneralLogger::new(creator));
 
         let mut joins = Vec::new();
@@ -311,10 +294,7 @@ mod tests {
             let l = Arc::clone(&logger);
             joins.push(tokio::spawn(async move {
                 for i in 0..10 {
-                    l.handle_message(&Message::new(
-                        Severity::Info,
-                        format!("m{i}"),
-                    ));
+                    l.handle_message(&Message::new(Severity::Info, format!("m{i}")));
                 }
             }));
         }
@@ -339,9 +319,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn close_then_handle_does_not_deadlock() {
         let lines = Arc::new(Mutex::new(Vec::new()));
-        let creator = Arc::new(CollectingCreator {
-            lines: Arc::clone(&lines),
-        });
+        let creator = Arc::new(CollectingCreator { lines: Arc::clone(&lines) });
         let logger = GeneralLogger::new(creator);
 
         logger.handle_message(&Message::new(Severity::Info, "first"));

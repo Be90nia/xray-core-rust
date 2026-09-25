@@ -13,10 +13,11 @@
 
 use std::sync::Arc;
 
-use xray_geodata::matcher::domain::{
-    DomainRule as GeoDomainRule, DomainType as GeoDomainType, parse_domain,
+use xray_geodata::matcher::{
+    MatcherGroup,
+    domain::{DomainRule as GeoDomainRule, DomainType as GeoDomainType, parse_domain},
 };
-use xray_geodata::matcher::MatcherGroup;
+
 use crate::error::Result;
 
 /// DNS 规则动作。对应 proto `RuleAction` 枚举。
@@ -123,27 +124,27 @@ impl Config {
 ///
 /// `domains` 用 geodata `SimpleMatcherGroup`（strmatcher 基建，支持
 /// Full/Domain/Substr/Regex 全类型线性匹配，与 Go `BuildDomainMatcher` 语义对齐）。
- #[derive(Debug, Clone)]
- pub struct DnsRule {
-     /// 规则动作。
-     pub action: RuleAction,
-     /// 匹配的 DNS 查询类型（已转为 u16）。空列表匹配所有类型。
-     pub q_types: Vec<u16>,
-     /// rCode（用于 `Return` 动作）。
-     pub r_code: u16,
+#[derive(Debug, Clone)]
+pub struct DnsRule {
+    /// 规则动作。
+    pub action: RuleAction,
+    /// 匹配的 DNS 查询类型（已转为 u16）。空列表匹配所有类型。
+    pub q_types: Vec<u16>,
+    /// rCode（用于 `Return` 动作）。
+    pub r_code: u16,
     /// 编译后的域名匹配器。
     ///
     /// - `None`：配置未填 domains → 恒真（Go `domains==nil`）
     /// - `Some(空组)`：domains 非空但全部条目解析失败 → 永不命中（fail-closed）
     domains: Option<Arc<xray_geodata::matcher::SimpleMatcherGroup>>,
- }
+}
 
 impl DnsRule {
     /// 从 [`DnsRuleConfig`] 构造运行时规则。
     ///
     /// - `q_type` → u16 列表；`domain` → 就地编译为匹配器组。
-    /// - proto `geosite` 变体需 geo dat 文件加载器，DNS 代理配置路径未持有
-    ///   datadir：warn + 跳过该条目（对齐 router 无 loader 时的降级）。
+    /// - proto `geosite` 变体需 geo dat 文件加载器，DNS 代理配置路径未持有 datadir：warn +
+    ///   跳过该条目（对齐 router 无 loader 时的降级）。
     #[must_use]
     pub fn from_config(cfg: &DnsRuleConfig) -> Self {
         let mut group = xray_geodata::matcher::SimpleMatcherGroup::new();
@@ -161,26 +162,22 @@ impl DnsRule {
                         other => {
                             tracing::warn!(target: "xray_proxy_dns::config", domain_type = other, "unknown domain rule type, skipping");
                             continue;
-                        }
+                        },
                     };
                     let rule = GeoDomainRule::new(dt, d.value.clone(), (i + 1) as u32);
                     match parse_domain(&rule) {
                         Ok(m) => group.add(m, (i + 1) as u32),
                         Err(e) => {
                             tracing::error!(target: "xray_proxy_dns::config", error = %e, value = %d.value, "domain rule parse failed; entry skipped");
-                        }
+                        },
                     }
-                }
+                },
                 xray_proto::xray::common::geodata::domain_rule::Value::Geosite(g) => {
                     tracing::warn!(target: "xray_proxy_dns::config", file = %g.file, code = %g.code, "geosite domain rule present but no geo_loader on DNS proxy path, skipping");
-                }
+                },
             }
         }
-        let domains = if cfg.domain.is_empty() {
-            None
-        } else {
-            Some(Arc::new(group))
-        };
+        let domains = if cfg.domain.is_empty() { None } else { Some(Arc::new(group)) };
         Self {
             action: cfg.action,
             q_types: cfg.q_type.iter().map(|&v| v as u16).collect(),
@@ -206,7 +203,8 @@ impl DnsRule {
     /// 完整匹配检查（qType + domain）。
     ///
     /// 对应 Go `dns.go::DNSRule.Apply`：
-    /// `matchQType(qType) && (domains == nil || domains.MatchAny(TrimSuffix(ToLower(domain), ".")))`。
+    /// `matchQType(qType) && (domains == nil || domains.MatchAny(TrimSuffix(ToLower(domain),
+    /// ".")))`。
     #[must_use]
     pub fn apply(&self, q_type: u16, domain: &str) -> bool {
         if !self.match_q_type(q_type) {
@@ -251,12 +249,8 @@ mod tests {
 
     #[test]
     fn match_q_type_empty_matches_all() {
-        let rule = DnsRule {
-            action: RuleAction::Direct,
-            q_types: vec![],
-            r_code: 0,
-            domains: None,
-        };
+        let rule =
+            DnsRule { action: RuleAction::Direct, q_types: vec![], r_code: 0, domains: None };
         assert!(rule.match_q_type(1)); // A
         assert!(rule.match_q_type(28)); // AAAA
         assert!(rule.match_q_type(255)); // ANY
@@ -278,12 +272,7 @@ mod tests {
 
     #[test]
     fn apply_q_type_gate_with_empty_domains() {
-        let rule = DnsRule {
-            action: RuleAction::Drop,
-            q_types: vec![1],
-            r_code: 0,
-            domains: None,
-        };
+        let rule = DnsRule { action: RuleAction::Drop, q_types: vec![1], r_code: 0, domains: None };
         // qType 匹配 + 空 domains 恒真 → true
         assert!(rule.apply(1, "example.com"));
         // qType 不匹配 → false
@@ -308,11 +297,7 @@ mod tests {
 
     #[test]
     fn proto_roundtrip_minimal() {
-        let cfg = Config {
-            user_level: 0,
-            rule: vec![],
-            rewrite_server: None,
-        };
+        let cfg = Config { user_level: 0, rule: vec![], rewrite_server: None };
         let proto = cfg.to_proto();
         let cfg2 = Config::from_proto(proto).unwrap();
         assert_eq!(cfg, cfg2);
@@ -363,9 +348,7 @@ mod tests {
         }
     }
 
-    fn rule_with_domains(
-        domain: Vec<xray_proto::xray::common::geodata::DomainRule>,
-    ) -> DnsRule {
+    fn rule_with_domains(domain: Vec<xray_proto::xray::common::geodata::DomainRule>) -> DnsRule {
         DnsRule::from_config(&DnsRuleConfig {
             action: RuleAction::Drop,
             q_type: vec![],

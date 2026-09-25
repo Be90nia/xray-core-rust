@@ -35,9 +35,7 @@ pub struct FullMatcher {
 impl FullMatcher {
     /// 创建新的精确全匹配器。
     pub fn new(pattern: impl Into<String>) -> Self {
-        Self {
-            pattern: pattern.into(),
-        }
+        Self { pattern: pattern.into() }
     }
 }
 
@@ -77,9 +75,9 @@ impl std::fmt::Display for FullMatcher {
 /// use xray_geodata::matcher::{DomainMatcher, Matcher};
 ///
 /// let m = DomainMatcher::new("example.com");
-/// assert!(m.match_str("example.com"));       // 完全相等
-/// assert!(m.match_str("sub.example.com"));   // 子域名
-/// assert!(!m.match_str("notexample.com"));   // 非域名边界
+/// assert!(m.match_str("example.com")); // 完全相等
+/// assert!(m.match_str("sub.example.com")); // 子域名
+/// assert!(!m.match_str("notexample.com")); // 非域名边界
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DomainMatcher {
@@ -89,9 +87,7 @@ pub struct DomainMatcher {
 impl DomainMatcher {
     /// 创建新的域名后缀匹配器。
     pub fn new(pattern: impl Into<String>) -> Self {
-        Self {
-            pattern: pattern.into(),
-        }
+        Self { pattern: pattern.into() }
     }
 }
 
@@ -140,7 +136,7 @@ impl std::fmt::Display for DomainMatcher {
 /// # 示例
 ///
 /// ```
-/// use xray_geodata::matcher::{SubstrMatcher, Matcher};
+/// use xray_geodata::matcher::{Matcher, SubstrMatcher};
 ///
 /// let m = SubstrMatcher::new("evil");
 /// assert!(m.match_str("evil.com"));
@@ -155,9 +151,7 @@ pub struct SubstrMatcher {
 impl SubstrMatcher {
     /// 创建新的子串包含匹配器。
     pub fn new(pattern: impl Into<String>) -> Self {
-        Self {
-            pattern: pattern.into(),
-        }
+        Self { pattern: pattern.into() }
     }
 }
 
@@ -193,7 +187,7 @@ impl std::fmt::Display for SubstrMatcher {
 /// # 示例
 ///
 /// ```
-/// use xray_geodata::matcher::{RegexMatcher, Matcher};
+/// use xray_geodata::matcher::{Matcher, RegexMatcher};
 ///
 /// let m = RegexMatcher::new(r"evil\..*").unwrap();
 /// assert!(m.match_str("evil.com"));
@@ -214,10 +208,7 @@ impl RegexMatcher {
     /// 正则表达式编译失败时返回 `MatcherError::RegexCompile`。
     pub fn new(pattern: &str) -> Result<Self, super::MatcherError> {
         let regex = Regex::new(pattern)?;
-        Ok(Self {
-            pattern: pattern.to_owned(),
-            regex,
-        })
+        Ok(Self { pattern: pattern.to_owned(), regex })
     }
 }
 
@@ -432,9 +423,7 @@ mod tests {
 
     #[test]
     fn test_matcher_type_new_full() {
-        let m = MatcherType::Full
-            .new_matcher("example.com")
-            .unwrap();
+        let m = MatcherType::Full.new_matcher("example.com").unwrap();
         assert_eq!(m.matcher_type(), MatcherType::Full);
         assert!(m.match_str("example.com"));
         assert!(!m.match_str("other.com"));
@@ -442,27 +431,21 @@ mod tests {
 
     #[test]
     fn test_matcher_type_new_domain() {
-        let m = MatcherType::Domain
-            .new_matcher("example.com")
-            .unwrap();
+        let m = MatcherType::Domain.new_matcher("example.com").unwrap();
         assert_eq!(m.matcher_type(), MatcherType::Domain);
         assert!(m.match_str("sub.example.com"));
     }
 
     #[test]
     fn test_matcher_type_new_substr() {
-        let m = MatcherType::Substr
-            .new_matcher("evil")
-            .unwrap();
+        let m = MatcherType::Substr.new_matcher("evil").unwrap();
         assert_eq!(m.matcher_type(), MatcherType::Substr);
         assert!(m.match_str("evil.com"));
     }
 
     #[test]
     fn test_matcher_type_new_regex() {
-        let m = MatcherType::Regex
-            .new_matcher(r"evil\..*")
-            .unwrap();
+        let m = MatcherType::Regex.new_matcher(r"evil\..*").unwrap();
         assert_eq!(m.matcher_type(), MatcherType::Regex);
         assert!(m.match_str("evil.com"));
     }

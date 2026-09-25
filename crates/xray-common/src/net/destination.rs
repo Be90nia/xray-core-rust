@@ -4,9 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::address::Address;
-use super::network::Network;
-use super::port::Port;
+use super::{address::Address, network::Network, port::Port};
 
 /// 网络目的地 = 地址 + 端口 + 网络类型。
 ///
@@ -22,11 +20,7 @@ impl Destination {
     /// 创建新的目的地。
     #[must_use]
     pub fn new(address: Address, port: Port, network: Network) -> Self {
-        Self {
-            address,
-            port,
-            network,
-        }
+        Self { address, port, network }
     }
 
     /// 创建 TCP 目的地。
@@ -74,11 +68,7 @@ impl Destination {
     /// 返回使用指定网络类型的新目的地。
     #[must_use]
     pub fn with_network(&self, network: Network) -> Self {
-        Self {
-            address: self.address.clone(),
-            port: self.port,
-            network,
-        }
+        Self { address: self.address.clone(), port: self.port, network }
     }
 }
 
@@ -125,8 +115,9 @@ impl std::fmt::Display for Endpoint {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use super::*;
 
     #[test]
     fn test_destination_new() {

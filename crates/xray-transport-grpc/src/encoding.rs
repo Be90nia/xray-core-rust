@@ -30,17 +30,16 @@
 //! - field 1, wire type 2（length-delimited），tag = `(1<<3)|2 = 0x0a`
 //! - 编码：`tag(0x0a) + varint_len(data) + data`
 
-use std::future::Future;
-use std::io::Read as _;
-use std::pin::Pin;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::{future::Future, io::Read as _, pin::Pin, sync::Arc};
 
-use xray_buf::io::{Reader, Writer};
-use xray_buf::multi::MultiBuffer;
+use flate2::read::GzDecoder;
+use tokio::sync::Mutex;
+use xray_buf::{
+    io::{Reader, Writer},
+    multi::MultiBuffer,
+};
 
 use crate::error::{GrpcError, Result};
-use flate2::read::GzDecoder;
 
 // ============================================================================
 // gRPC 压缩算法（对应 Go grpc-go encoding.Compressor 注册表）
@@ -87,7 +86,7 @@ fn decompress_payload(payload: &[u8], encoding: CompressionEncoding) -> Result<V
                 .read_to_end(&mut buf)
                 .map_err(|e| GrpcError::Decompression(format!("gzip: {e}")))?;
             Ok(buf)
-        }
+        },
     }
 }
 
@@ -133,15 +132,12 @@ impl Hunk {
     /// - len 超过剩余字节数
     pub fn decode(buf: &[u8]) -> Result<Self> {
         if buf.is_empty() {
-            return Err(GrpcError::InvalidConfig(
-                "hunk proto: empty buffer".into(),
-            ));
+            return Err(GrpcError::InvalidConfig("hunk proto: empty buffer".into()));
         }
         if buf[0] != HUNK_TAG {
             return Err(GrpcError::InvalidConfig(format!(
                 "hunk proto: tag mismatch (expected 0x{:02x}, got 0x{:02x})",
-                HUNK_TAG,
-                buf[0]
+                HUNK_TAG, buf[0]
             )));
         }
         let (len, consumed) = decode_varint(&buf[1..])
@@ -156,9 +152,7 @@ impl Hunk {
                 buf.len() - data_start
             )));
         }
-        Ok(Self {
-            data: buf[data_start..data_end].to_vec(),
-        })
+        Ok(Self { data: buf[data_start..data_end].to_vec() })
     }
 }
 
@@ -217,12 +211,13 @@ impl MultiHunk {
                     HUNK_TAG, buf[pos]
                 )));
             }
-            let (len, consumed) = decode_varint(&buf[pos + 1..])
-                .ok_or_else(|| GrpcError::InvalidConfig("multi_hunk proto: truncated varint".into()))?;
+            let (len, consumed) = decode_varint(&buf[pos + 1..]).ok_or_else(|| {
+                GrpcError::InvalidConfig("multi_hunk proto: truncated varint".into())
+            })?;
             let data_start = pos + 1 + consumed;
-            let data_end = data_start
-                .checked_add(len as usize)
-                .ok_or_else(|| GrpcError::InvalidConfig("multi_hunk proto: length overflow".into()))?;
+            let data_end = data_start.checked_add(len as usize).ok_or_else(|| {
+                GrpcError::InvalidConfig("multi_hunk proto: length overflow".into())
+            })?;
             if data_end > buf.len() {
                 return Err(GrpcError::InvalidConfig(format!(
                     "multi_hunk proto: data truncated at offset {pos} (need {len} bytes, have {})",
@@ -268,14 +263,15 @@ pub fn encode_hunk_frame(data: &[u8]) -> Vec<u8> {
 /// - `Ok(None)`：缓冲区不足一个完整 frame，需要继续读
 /// - `Ok(Some((consumed, data)))`：成功解析，consumed 是本 frame 在 buf 中占用的字节数
 /// - `Err`：协议错误（截断、长度超限、压缩算法不支持、解压失败、Hunk 解码失败）
-pub fn decode_hunk_frame(buf: &[u8], encoding: Option<CompressionEncoding>) -> Result<Option<(usize, Vec<u8>)>> {
+pub fn decode_hunk_frame(
+    buf: &[u8],
+    encoding: Option<CompressionEncoding>,
+) -> Result<Option<(usize, Vec<u8>)>> {
     if buf.len() < FRAME_HEADER_LEN {
         return Ok(None);
     }
     let compressed = buf[0];
-    let payload_len = u32::from_be_bytes([
-        buf[1], buf[2], buf[3], buf[4],
-    ]) as usize;
+    let payload_len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
     if payload_len > MAX_FRAME_PAYLOAD {
         return Err(GrpcError::InvalidConfig(format!(
             "grpc frame: payload {payload_len} exceeds max {MAX_FRAME_PAYLOAD}"
@@ -325,14 +321,15 @@ pub fn encode_multi_hunk_frame(chunks: &[&[u8]]) -> Vec<u8> {
 /// - `Ok(None)`：缓冲区不足一个完整 frame
 /// - `Ok(Some((consumed, data_vec)))`：成功解析，data_vec 是 repeated bytes 的列表
 /// - `Err`：协议错误
-pub fn decode_multi_hunk_frame(buf: &[u8], encoding: Option<CompressionEncoding>) -> Result<Option<(usize, Vec<Vec<u8>>)>> {
+pub fn decode_multi_hunk_frame(
+    buf: &[u8],
+    encoding: Option<CompressionEncoding>,
+) -> Result<Option<(usize, Vec<Vec<u8>>)>> {
     if buf.len() < FRAME_HEADER_LEN {
         return Ok(None);
     }
     let compressed = buf[0];
-    let payload_len = u32::from_be_bytes([
-        buf[1], buf[2], buf[3], buf[4],
-    ]) as usize;
+    let payload_len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
     if payload_len > MAX_FRAME_PAYLOAD {
         return Err(GrpcError::InvalidConfig(format!(
             "grpc frame: payload {payload_len} exceeds max {MAX_FRAME_PAYLOAD}"
@@ -416,7 +413,8 @@ pub trait HunkStream: Send {
     fn recv_hunk(&mut self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + '_>>;
 
     /// 发送一个 Hunk（自动加 frame 头）。
-    fn send_hunk(&mut self, data: Vec<u8>) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+    fn send_hunk(&mut self, data: Vec<u8>)
+    -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
 
     /// 关闭发送方向（客户端表示请求结束）。
     fn close_send(&mut self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
@@ -429,8 +427,8 @@ pub trait HunkStream: Send {
 /// 把 `HunkStream` 适配为字节流 `Reader + Writer`。
 ///
 /// 对应 Go 的 `encoding.HunkReaderWriter`：
-/// - `Read`：从底层 stream `recv_hunk()` 拿到一个 Hunk，缓存到内部 buf，
-///   后续 `read_multi_buffer` 从 buf 切片返回
+/// - `Read`：从底层 stream `recv_hunk()` 拿到一个 Hunk，缓存到内部 buf， 后续 `read_multi_buffer`
+///   从 buf 切片返回
 /// - `Write`：把 MultiBuffer 拼成单个 Vec 调 `send_hunk()`
 ///
 /// 内部 buf 用 `Arc<Mutex<VecDeque<u8>>>`，让 Reader/Writer 各自持有引用
@@ -443,22 +441,15 @@ impl<S: HunkStream + 'static> HunkReaderWriter<S> {
     /// 构造。`stream` 用 `Arc<Mutex>` 包装以共享给 reader/writer 两端。
     #[must_use]
     pub fn new(stream: S) -> Self {
-        Self {
-            stream: Arc::new(Mutex::new(stream)),
-        }
+        Self { stream: Arc::new(Mutex::new(stream)) }
     }
 
     /// 拆出 reader/writer 两个独立句柄（共享底层 stream）。
     #[must_use]
     pub fn into_parts(self) -> (HunkReader<S>, HunkWriter<S>) {
         (
-            HunkReader {
-                stream: Arc::clone(&self.stream),
-                buf: Vec::new(),
-            },
-            HunkWriter {
-                stream: self.stream,
-            },
+            HunkReader { stream: Arc::clone(&self.stream), buf: Vec::new() },
+            HunkWriter { stream: self.stream },
         )
     }
 }
@@ -483,7 +474,10 @@ impl<S: HunkStream + 'static> Reader for HunkReader<S> {
             if self.buf.is_empty() {
                 let data = {
                     let mut stream = self.stream.lock().await;
-                    stream.recv_hunk().await.map_err(|e| xray_buf::io::Error::ReadError(format!("{e}")))?
+                    stream
+                        .recv_hunk()
+                        .await
+                        .map_err(|e| xray_buf::io::Error::ReadError(format!("{e}")))?
                 };
                 self.buf.extend_from_slice(&data);
             }
@@ -493,9 +487,7 @@ impl<S: HunkStream + 'static> Reader for HunkReader<S> {
                 // 兜底：stream 返空 data，构造空 MultiBuffer
                 return Ok(MultiBuffer::new());
             }
-            Ok(MultiBuffer::from_buffer(xray_buf::buffer::Buffer::from_vec(
-                data,
-            )))
+            Ok(MultiBuffer::from_buffer(xray_buf::buffer::Buffer::from_vec(data)))
         })
     }
 }
@@ -512,12 +504,14 @@ impl<S: HunkStream + 'static> Writer for HunkWriter<S> {
                 payload.extend_from_slice(buf.bytes());
             }
             let mut stream = self.stream.lock().await;
-            stream.send_hunk(payload).await.map_err(|e| xray_buf::io::Error::WriteError(format!("{e}")))?;
+            stream
+                .send_hunk(payload)
+                .await
+                .map_err(|e| xray_buf::io::Error::WriteError(format!("{e}")))?;
             Ok(())
         })
     }
 }
-
 
 // ============================================================================
 // MultiHunkReaderWriter：把 HunkStream 适配为 Reader/Writer（TunMulti 模式）
@@ -538,23 +532,15 @@ impl<S: HunkStream + 'static> MultiHunkReaderWriter<S> {
     /// 构造。
     #[must_use]
     pub fn new(stream: S) -> Self {
-        Self {
-            stream: Arc::new(Mutex::new(stream)),
-        }
+        Self { stream: Arc::new(Mutex::new(stream)) }
     }
 
     /// 拆出 reader/writer 两个独立句柄。
     #[must_use]
     pub fn into_parts(self) -> (MultiHunkReader<S>, MultiHunkWriter<S>) {
         (
-            MultiHunkReader {
-                stream: Arc::clone(&self.stream),
-                pending: Vec::new(),
-                pos: 0,
-            },
-            MultiHunkWriter {
-                stream: self.stream,
-            },
+            MultiHunkReader { stream: Arc::clone(&self.stream), pending: Vec::new(), pos: 0 },
+            MultiHunkWriter { stream: self.stream },
         )
     }
 }
@@ -583,10 +569,8 @@ impl<S: HunkStream + 'static> Reader for MultiHunkReader<S> {
                 let chunks: Vec<Vec<u8>> = self.pending.drain(self.pos..).collect();
                 self.pos = 0;
                 self.pending.clear();
-                let buffers: Vec<xray_buf::buffer::Buffer> = chunks
-                    .into_iter()
-                    .map(xray_buf::buffer::Buffer::from_vec)
-                    .collect();
+                let buffers: Vec<xray_buf::buffer::Buffer> =
+                    chunks.into_iter().map(xray_buf::buffer::Buffer::from_vec).collect();
                 return Ok(MultiBuffer::from_buffers(buffers));
             }
             // pending 空，从 stream recv 一个 hunk 并 decode 为 MultiHunk
@@ -594,23 +578,20 @@ impl<S: HunkStream + 'static> Reader for MultiHunkReader<S> {
             self.pos = 0;
             let raw = {
                 let mut stream = self.stream.lock().await;
-                stream.recv_hunk().await.map_err(|e| {
-                    xray_buf::io::Error::ReadError(format!("{e}"))
-                })?
+                stream
+                    .recv_hunk()
+                    .await
+                    .map_err(|e| xray_buf::io::Error::ReadError(format!("{e}")))?
             };
             // HunkStream.recv_hunk 返回已解 frame + Hunk proto 的 data 字段
             // 在 TunMulti 模式下，这个 data 实际上是 MultiHunk 的 repeated bytes 编码
-            let mh = MultiHunk::decode(&raw).map_err(|e| {
-                xray_buf::io::Error::ReadError(format!("multi_hunk decode: {e}"))
-            })?;
+            let mh = MultiHunk::decode(&raw)
+                .map_err(|e| xray_buf::io::Error::ReadError(format!("multi_hunk decode: {e}")))?;
             if mh.data.is_empty() {
                 return Ok(MultiBuffer::new());
             }
-            let buffers: Vec<xray_buf::buffer::Buffer> = mh
-                .data
-                .into_iter()
-                .map(xray_buf::buffer::Buffer::from_vec)
-                .collect();
+            let buffers: Vec<xray_buf::buffer::Buffer> =
+                mh.data.into_iter().map(xray_buf::buffer::Buffer::from_vec).collect();
             Ok(MultiBuffer::from_buffers(buffers))
         })
     }
@@ -629,9 +610,10 @@ impl<S: HunkStream + 'static> Writer for MultiHunkWriter<S> {
             );
             let payload = mh.encode_to_vec();
             let mut stream = self.stream.lock().await;
-            stream.send_hunk(payload).await.map_err(|e| {
-                xray_buf::io::Error::WriteError(format!("{e}"))
-            })?;
+            stream
+                .send_hunk(payload)
+                .await
+                .map_err(|e| xray_buf::io::Error::WriteError(format!("{e}")))?;
             Ok(())
         })
     }
@@ -643,8 +625,9 @@ impl<S: HunkStream + 'static> Writer for MultiHunkWriter<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::VecDeque;
+
+    use super::*;
 
     // ---- Hunk proto 编解码 ----
 
@@ -734,10 +717,7 @@ mod tests {
         // compressed(0) + BE u32 len(3) + tag + varint(2) + "hi"
         // Hunk 编码：[0x0a, 0x02, b'h', b'i'] = 4 字节
         // payload len = 4
-        assert_eq!(
-            frame,
-            vec![0x00, 0x00, 0x00, 0x00, 0x04, 0x0a, 0x02, b'h', b'i']
-        );
+        assert_eq!(frame, vec![0x00, 0x00, 0x00, 0x00, 0x04, 0x0a, 0x02, b'h', b'i']);
     }
 
     #[test]
@@ -773,9 +753,7 @@ mod tests {
         assert_eq!(data1, b"first");
 
         // 解析第二帧
-        let (consumed2, data2) = decode_hunk_frame(&combined[consumed1..], None)
-            .unwrap()
-            .unwrap();
+        let (consumed2, data2) = decode_hunk_frame(&combined[consumed1..], None).unwrap().unwrap();
         assert_eq!(consumed2, f2.len());
         assert_eq!(data2, b"second");
     }
@@ -792,21 +770,16 @@ mod tests {
     fn frame_decode_payload_too_large_errors() {
         // 声明 payload > MAX_FRAME_PAYLOAD
         let oversize = (MAX_FRAME_PAYLOAD as u32 + 1).to_be_bytes();
-        let bad = vec![
-            0x00,
-            oversize[0],
-            oversize[1],
-            oversize[2],
-            oversize[3],
-        ];
+        let bad = vec![0x00, oversize[0], oversize[1], oversize[2], oversize[3]];
         let err = decode_hunk_frame(&bad, None).unwrap_err();
         assert!(format!("{err}").contains("exceeds max"));
     }
 
     #[test]
     fn frame_decode_gzip_compressed_roundtrip() {
-        use flate2::write::GzEncoder;
         use std::io::Write as _;
+
+        use flate2::write::GzEncoder;
 
         let original = b"gzip compressed payload".to_vec();
         let hunk_payload = Hunk::new(original.clone()).encode_to_vec();
@@ -821,9 +794,8 @@ mod tests {
         frame.extend_from_slice(&(compressed_payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(&compressed_payload);
 
-        let (consumed, data) = decode_hunk_frame(&frame, Some(CompressionEncoding::Gzip))
-            .unwrap()
-            .unwrap();
+        let (consumed, data) =
+            decode_hunk_frame(&frame, Some(CompressionEncoding::Gzip)).unwrap().unwrap();
         assert_eq!(consumed, frame.len());
         assert_eq!(data, original);
     }
@@ -839,11 +811,7 @@ mod tests {
 
     impl MockStream {
         fn new() -> Self {
-            Self {
-                recv_queue: VecDeque::new(),
-                sent: Vec::new(),
-                closed: false,
-            }
+            Self { recv_queue: VecDeque::new(), sent: Vec::new(), closed: false }
         }
 
         fn enqueue(&mut self, data: Vec<u8>) {
@@ -864,7 +832,10 @@ mod tests {
             })
         }
 
-        fn send_hunk(&mut self, data: Vec<u8>) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        fn send_hunk(
+            &mut self,
+            data: Vec<u8>,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
             Box::pin(async move {
                 self.sent.push(data);
                 Ok(())
@@ -912,7 +883,8 @@ mod tests {
         let rw = HunkReaderWriter::new(mock);
         let (_reader, mut writer) = rw.into_parts();
 
-        let mb = MultiBuffer::from_buffer(xray_buf::buffer::Buffer::from_vec(b"data to send".to_vec()));
+        let mb =
+            MultiBuffer::from_buffer(xray_buf::buffer::Buffer::from_vec(b"data to send".to_vec()));
         writer.write_multi_buffer(mb).await.unwrap();
 
         // 验证：通过 into_parts 拿不回 mock（Arc 持有），用 weak 验证留 follow-up

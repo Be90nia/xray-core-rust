@@ -12,34 +12,32 @@
 //!
 //! 见 bd Xray-core-rust-dax。
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
-use anytls::core::{Command, Frame};
-use anytls::proxy::session::{DEFAULT_SID, Session, new_server_session};
-use anytls::runtime::DefaultPaddingFactory;
-use anytls::AsyncReadWrite;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream};
-use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::server::TlsStream;
-use tokio_rustls::TlsAcceptor;
+use anytls::{
+    AsyncReadWrite,
+    core::{Command, Frame},
+    proxy::session::{DEFAULT_SID, Session, new_server_session},
+    runtime::DefaultPaddingFactory,
+};
 use sha2::{Digest, Sha256};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream},
+    net::{TcpListener, TcpStream},
+};
+use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tracing::debug;
-
 use xray_app_dispatcher::DispatchHandler;
 use xray_buf::io::{new_reader, new_writer};
-use xray_common::net::address::Address as XAddress;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
+use xray_common::net::{
+    address::Address as XAddress, destination::Destination, network::Network, port::Port,
+};
 use xray_transport::link::Link;
 
-use crate::error::Result;
-use crate::socks::SocksAddr;
+use crate::{error::Result, socks::SocksAddr};
 
 /// anytls duplex 缓冲（64 KiB，与 client.rs 一致）。
 const DUPLEX_BUF_SIZE: usize = 64 * 1024;
-
 
 /// AnyTLS mock 服务端句柄，`stop()` 后 listener 关闭。
 pub struct AnytlsMockServer {
@@ -83,13 +81,8 @@ impl AnytlsMockServer {
             expected_password_sha256,
             stop_rx,
         ));
-        Ok(Self {
-            local_addr,
-            join,
-            stop_tx,
-        })
+        Ok(Self { local_addr, join, stop_tx })
     }
-
 
     /// 停止 server 并等待 task 结束。
     pub async fn stop(self) {
@@ -123,7 +116,6 @@ async fn serve_loop(
     }
 }
 
-
 async fn handle_conn(
     tcp: TcpStream,
     tls_acceptor: TlsAcceptor,
@@ -139,14 +131,14 @@ async fn handle_conn(
         Err(e) => {
             debug!("anytls mock server: tcp into_std failed: {e}");
             return;
-        }
+        },
     };
     let kill_sock = match tcp_std.try_clone() {
         Ok(s) => s,
         Err(e) => {
             debug!("anytls mock server: tcp try_clone failed: {e}");
             return;
-        }
+        },
     };
     if let Err(e) = tcp_std.set_nonblocking(true) {
         debug!("anytls mock server: tcp set_nonblocking failed: {e}");
@@ -157,7 +149,7 @@ async fn handle_conn(
         Err(e) => {
             debug!("anytls mock server: tcp from_std failed: {e}");
             return;
-        }
+        },
     };
     let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
@@ -170,7 +162,7 @@ async fn handle_conn(
         Err(e) => {
             debug!("anytls mock server TLS accept failed: {e}");
             return;
-        }
+        },
     };
     // 读取并校验客户端认证帧（protocol.md Authentication）：
     // `sha256(password)`(32B) || padding0 长度（BE u16）|| padding0。
@@ -183,10 +175,8 @@ async fn handle_conn(
     }
     if let Some(expected) = expected_password_sha256 {
         // 常数时间比对（XOR 折叠，无早退分支；32B 等长由类型保证）
-        let mismatch = auth_head[..32]
-            .iter()
-            .zip(expected.iter())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+        let mismatch =
+            auth_head[..32].iter().zip(expected.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b));
         if mismatch != 0 {
             debug!("anytls mock server: auth rejected (password mismatch)");
             return;
@@ -206,10 +196,7 @@ async fn handle_conn(
     let kill_tx_cell = std::sync::Mutex::new(Some(kill_tx));
     let on_new_session: Box<dyn Fn(Arc<Session>) + Send + Sync> = Box::new(move |session| {
         let dispatch = dispatch.clone();
-        let kill_tx = kill_tx_cell
-            .lock()
-            .expect("anytls kill_tx cell poisoned")
-            .take();
+        let kill_tx = kill_tx_cell.lock().expect("anytls kill_tx cell poisoned").take();
         tokio::spawn(handle_session(session, dispatch, kill_tx));
     });
     let session = Arc::new(
@@ -226,7 +213,6 @@ async fn handle_conn(
     });
 }
 
-
 /// 处理一个 incoming session：读 SOCKS5 target → 直连或 dispatcher 桥接。
 async fn handle_session(
     session: Arc<Session>,
@@ -240,7 +226,7 @@ async fn handle_session(
         Err(e) => {
             debug!("anytls mock server: read socks5 target failed: {e}");
             return;
-        }
+        },
     };
     if n == 0 {
         debug!("anytls mock server: empty first read");
@@ -252,7 +238,7 @@ async fn handle_session(
         Err(e) => {
             debug!("anytls mock server: decode socks5 failed: {e}");
             return;
-        }
+        },
     };
 
     if let Some(handler) = dispatch {
@@ -264,10 +250,7 @@ async fn handle_session(
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
         let (rd_half, wr_half) = tokio::io::split(client_io);
         tokio::spawn(pump_session_to_duplex(session.clone(), server_io));
-        let reader = new_reader(InitialedReader::new(
-            buf[consumed..n].to_vec(),
-            rd_half,
-        ));
+        let reader = new_reader(InitialedReader::new(buf[consumed..n].to_vec(), rd_half));
         let writer = new_writer(wr_half);
         let link = Link::new(reader, writer);
         handler.dispatch(&dest, link).await;
@@ -286,7 +269,7 @@ async fn handle_session(
             Err(e) => {
                 debug!("anytls mock server: dial target {target_str} failed: {e}");
                 return;
-            }
+            },
         };
 
         if n > consumed {
@@ -309,13 +292,8 @@ async fn handle_session(
 /// recv_loop 退出 → `run()` 结束 → Arc<Session> 全量 drop → TLS fd 释放。
 /// anytls-rs 的 terminate() 做不到后者（纯本地标记），单流会话里它是 fd
 /// 挂死的根因（s9 压测）。
-async fn finish_session(
-    session: &Session,
-    kill_tx: Option<tokio::sync::oneshot::Sender<()>>,
-) {
-    let _ = session
-        .write_frame(Frame::new(Command::Fin, DEFAULT_SID))
-        .await;
+async fn finish_session(session: &Session, kill_tx: Option<tokio::sync::oneshot::Sender<()>>) {
+    let _ = session.write_frame(Frame::new(Command::Fin, DEFAULT_SID)).await;
     let _ = session.mark_local_stream_closed(DEFAULT_SID).await;
     if let Some(kill_tx) = kill_tx {
         let _ = kill_tx.send(());
@@ -347,11 +325,11 @@ async fn pump_session_to_duplex(session: Arc<Session>, server_io: DuplexStream) 
                     if wr.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
-                }
+                },
                 Err(e) => {
                     debug!("pump session→duplex read: {e}");
                     break;
-                }
+                },
             }
         }
         let _ = wr.shutdown().await;
@@ -365,11 +343,11 @@ async fn pump_session_to_duplex(session: Arc<Session>, server_io: DuplexStream) 
                     if session.write(&buf[..n]).await.is_err() {
                         break;
                     }
-                }
+                },
                 Err(e) => {
                     debug!("pump duplex→session read: {e}");
                     break;
-                }
+                },
             }
         }
         // 会话收尾（FIN + shutdown）由 handle_session::finish_session 统一执行。
@@ -385,10 +363,7 @@ struct InitialedReader<R> {
 
 impl<R> InitialedReader<R> {
     fn new(initial: Vec<u8>, inner: R) -> Self {
-        Self {
-            initial: std::io::Cursor::new(initial),
-            inner,
-        }
+        Self { initial: std::io::Cursor::new(initial), inner }
     }
 }
 
@@ -430,7 +405,9 @@ async fn bridge(session: Arc<Session>, outbound: TcpStream) -> std::io::Result<(
         loop {
             match rd.read(&mut buf).await {
                 Ok(0) => break,
-                Ok(n) => { let _ = session.write(&buf[..n]).await?; }
+                Ok(n) => {
+                    let _ = session.write(&buf[..n]).await?;
+                },
                 Err(e) => return Err(e),
             }
         }
@@ -443,12 +420,13 @@ async fn bridge(session: Arc<Session>, outbound: TcpStream) -> std::io::Result<(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use rustls::{ClientConfig as RustlsClientConfig, ServerConfig as RustlsServerConfig};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
     use crate::client::{AnytlsClient, ClientConfig};
-    use rustls::ClientConfig as RustlsClientConfig;
-    use rustls::ServerConfig as RustlsServerConfig;
-    use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// 简单 echo TCP server（tests/loopback.rs 同款）。
     async fn start_echo_server() -> SocketAddr {
@@ -466,7 +444,7 @@ mod tests {
                                 if sock.write_all(&buf[..n]).await.is_err() {
                                     break;
                                 }
-                            }
+                            },
                         }
                     }
                 });
@@ -506,20 +484,17 @@ mod tests {
         (server, cert_der)
     }
 
-    fn make_client(server_addr: SocketAddr, password: &str, server_cert_der: &[u8]) -> AnytlsClient {
+    fn make_client(
+        server_addr: SocketAddr,
+        password: &str,
+        server_cert_der: &[u8],
+    ) -> AnytlsClient {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.add(server_cert_der.to_vec().into()).unwrap();
         let tls = Arc::new(
-            RustlsClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
+            RustlsClientConfig::builder().with_root_certificates(root_store).with_no_client_auth(),
         );
-        AnytlsClient::new(ClientConfig::new(
-            server_addr.to_string(),
-            "localhost",
-            password,
-            tls,
-        ))
+        AnytlsClient::new(ClientConfig::new(server_addr.to_string(), "localhost", password, tls))
     }
 
     /// 对密码：认证通过，端到端 echo 完整走通。
@@ -528,10 +503,8 @@ mod tests {
         let echo = start_echo_server().await;
         let (server, cert_der) = start_server_with_password(Some("s3cret")).await;
         let client = make_client(server.local_addr, "s3cret", &cert_der);
-        let mut conn = client
-            .dial(&SocksAddr::from_socket(echo))
-            .await
-            .expect("dial with correct password");
+        let mut conn =
+            client.dial(&SocksAddr::from_socket(echo)).await.expect("dial with correct password");
         conn.write_all(b"ping").await.expect("write");
         let mut buf = [0u8; 4];
         tokio::time::timeout(Duration::from_secs(5), conn.read_exact(&mut buf))
@@ -563,7 +536,7 @@ mod tests {
                                 if sock.write_all(&buf[..n]).await.is_err() {
                                     break;
                                 }
-                            }
+                            },
                         }
                     }
                     counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -581,10 +554,7 @@ mod tests {
         let (echo, active) = start_tracked_echo_server().await;
         let (server, cert_der) = start_server_with_password(Some("s3cret")).await;
         let client = make_client(server.local_addr, "s3cret", &cert_der);
-        let mut conn = client
-            .dial(&SocksAddr::from_socket(echo))
-            .await
-            .expect("dial");
+        let mut conn = client.dial(&SocksAddr::from_socket(echo)).await.expect("dial");
         conn.write_all(b"ping").await.expect("write");
         let mut buf = [0u8; 4];
         tokio::time::timeout(Duration::from_secs(5), conn.read_exact(&mut buf))
@@ -619,21 +589,19 @@ mod tests {
         // 客户端侧拨号可能在本地 duplex 提前返回 Ok；断言点：数据到不了 echo
         //（读侧 EOF/错误，或 5s 内读不到回显即失败）。
         match client.dial(&SocksAddr::from_socket(echo)).await {
-            Err(_) => {} // 拨号即失败也算拒绝证据
+            Err(_) => {}, // 拨号即失败也算拒绝证据
             Ok(mut conn) => {
                 let _ = conn.write_all(b"ping").await;
                 let mut buf = [0u8; 4];
                 match tokio::time::timeout(Duration::from_secs(5), conn.read_exact(&mut buf)).await
                 {
-                    Ok(Ok(n)) => assert_ne!(
-                        &buf[..n],
-                        b"ping",
-                        "wrong-password data must never be echoed"
-                    ),
-                    Ok(Err(_)) => {} // 服务端拒后连接断开
+                    Ok(Ok(n)) => {
+                        assert_ne!(&buf[..n], b"ping", "wrong-password data must never be echoed")
+                    },
+                    Ok(Err(_)) => {}, // 服务端拒后连接断开
                     Err(_) => panic!("wrong-password connection stayed open (timeout)"),
                 }
-            }
+            },
         }
         client.close().await.ok();
         server.stop().await;

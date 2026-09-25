@@ -8,12 +8,13 @@
 //! - `execute_ping`：拨号到目标 IP:port（仅 `443` 或 `domain:port` 形式）
 //! - 其他子命令：stdout / 内存计算，零 I/O
 use clap::{Args, Subcommand};
-
-use crate::error::CliError;
-use crate::commands::api_exec::{build_inbound_configs, build_outbound_configs};
 use prost::Message as _;
-use xray_proto::xray::common::serial::TypedMessage;
-use xray_proto::xray::core::Config as ProtoConfig;
+use xray_proto::xray::{common::serial::TypedMessage, core::Config as ProtoConfig};
+
+use crate::{
+    commands::api_exec::{build_inbound_configs, build_outbound_configs},
+    error::CliError,
+};
 
 // ---------------------------------------------------------------------------
 // uuid 命令
@@ -46,7 +47,7 @@ pub fn resolve_uuid(input: Option<&str>) -> Result<String, CliError> {
             xray_common::uuid::UUID::parse(input)
                 .map(|u| u.to_string())
                 .ok_or_else(|| CliError::UuidParseFailed(input.to_string()))
-        }
+        },
         None => Ok(uuid::Uuid::new_v4().to_string()),
     }
 }
@@ -117,9 +118,7 @@ pub struct TlsHashArgs {
 impl TlsHashArgs {
     /// 解析后的 cert 路径：优先 `--cert`，否则取第一个位置参数。
     pub fn cert_path(&self) -> Option<&str> {
-        self.cert
-            .as_deref()
-            .or_else(|| self.positional_cert.first().map(String::as_str))
+        self.cert.as_deref().or_else(|| self.positional_cert.first().map(String::as_str))
     }
 }
 
@@ -166,12 +165,9 @@ pub struct TlsCertArgs {
 impl TlsCertArgs {
     /// 有效域名列表（domains 非空直接用，否则用占位 `localhost` 通过 rcgen 校验）。
     pub fn effective_domains(&self) -> Vec<String> {
-        if self.domains.is_empty() {
-            vec!["localhost".to_string()]
-        } else {
-            self.domains.clone()
-        }
+        if self.domains.is_empty() { vec!["localhost".to_string()] } else { self.domains.clone() }
     }
+
     /// `--file` 优先，否则 `--out`（历史 Rust 简写）。
     pub fn file_prefix(&self) -> Option<&str> {
         self.file.as_deref().or(self.out.as_deref())
@@ -246,32 +242,32 @@ pub async fn execute_tls(cmd: &TlsCommand) -> Result<(), CliError> {
             let out = execute_ping(args).await?;
             print!("{out}");
             Ok(())
-        }
+        },
         TlsCommand::Hash(args) => {
             let out = execute_hash(args)?;
             print!("{out}");
             Ok(())
-        }
+        },
         TlsCommand::Cert(args) => {
             execute_cert(args)?;
             Ok(())
-        }
+        },
         TlsCommand::Ech(args) => {
             let out = execute_ech(args)?;
             print!("{out}");
             Ok(())
-        }
+        },
     }
 }
 
 /// convert 子命令 execute。
 ///
-/// - `convert json [-type] <file>`：TypedMessage → JSON，`-type` 注入
-///   `_TypedMessage_` 键（Go reflect/marshal.go:42-44）。无 proto 注册表无法
-///   GetInstance 结构化解码，输出 TypedMessage 原样（type + base64 value）。
-/// - `convert pb [-debug] [-outpbfile f] <files...>`：合并多文件配置后，
-///   `-debug` 输出 JSON（Go protobuf.go:81-88）；`-outpbfile` 写
-///   `xray.core.Config` proto 原始字节（Go protobuf.go:90-105 proto.Marshal）。
+/// - `convert json [-type] <file>`：TypedMessage → JSON，`-type` 注入 `_TypedMessage_` 键（Go
+///   reflect/marshal.go:42-44）。无 proto 注册表无法 GetInstance 结构化解码，输出 TypedMessage
+///   原样（type + base64 value）。
+/// - `convert pb [-debug] [-outpbfile f] <files...>`：合并多文件配置后， `-debug` 输出 JSON（Go
+///   protobuf.go:81-88）；`-outpbfile` 写 `xray.core.Config` proto 原始字节（Go protobuf.go:90-105
+///   proto.Marshal）。
 pub fn execute_convert(cmd: &ConvertCommand) -> Result<(), CliError> {
     match cmd {
         ConvertCommand::Json(args) => execute_convert_json(args),
@@ -292,9 +288,8 @@ fn execute_convert_json(args: &ConvertJsonArgs) -> Result<(), CliError> {
 /// value 原样输出。
 fn convert_json_output(args: &ConvertJsonArgs) -> Result<String, CliError> {
     let raw = read_input(&args.input)?;
-    let tm: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| {
-        CliError::ConfigLoadFailed(format!("failed to unmarshal config: {e}"))
-    })?;
+    let tm: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|e| CliError::ConfigLoadFailed(format!("failed to unmarshal config: {e}")))?;
     let obj = tm
         .as_object()
         .ok_or_else(|| CliError::ConfigLoadFailed("not a TypedMessage JSON".into()))?;
@@ -304,15 +299,11 @@ fn convert_json_output(args: &ConvertJsonArgs) -> Result<String, CliError> {
     out.insert("type".into(), serde_json::Value::String(type_url.into()));
     out.insert("value".into(), serde_json::Value::String(value.into()));
     if args.inject_type {
-        out.insert(
-            "_TypedMessage_".into(),
-            serde_json::Value::String(type_url.into()),
-        );
+        out.insert("_TypedMessage_".into(), serde_json::Value::String(type_url.into()));
     }
     serde_json::to_string_pretty(&serde_json::Value::Object(out))
         .map_err(|e| CliError::ConfigLoadFailed(format!("marshal TypedMessage: {e}")))
 }
-
 
 /// 从文件或 `stdin:` 读取全部字节。
 fn read_input(spec: &str) -> Result<Vec<u8>, CliError> {
@@ -322,8 +313,7 @@ fn read_input(spec: &str) -> Result<Vec<u8>, CliError> {
             .map_err(|e| CliError::InvalidArgument(format!("read stdin: {e}")))?;
         Ok(buf)
     } else {
-        std::fs::read(spec)
-            .map_err(|e| CliError::InvalidArgument(format!("read {spec}: {e}")))
+        std::fs::read(spec).map_err(|e| CliError::InvalidArgument(format!("read {spec}: {e}")))
     }
 }
 
@@ -332,10 +322,7 @@ fn execute_convert_pb(args: &ConvertPbArgs) -> Result<(), CliError> {
     // Go protobuf.go:61-70：-o 扩展名须为 pb/protobuf/无扩展名；无 -o 且非
     // -debug → fatal "-outpbfile not specified"。
     if let Some(out) = &args.out {
-        let ext = std::path::Path::new(out)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = std::path::Path::new(out).extension().and_then(|e| e.to_str()).unwrap_or("");
         if !ext.is_empty() && ext != "pb" && ext != "protobuf" {
             return Err(CliError::InvalidArgument(
                 "-outpbfile followed by a possible original config.".into(),
@@ -351,8 +338,7 @@ fn execute_convert_pb(args: &ConvertPbArgs) -> Result<(), CliError> {
         )));
     }
 
-    let paths: Vec<std::path::PathBuf> =
-        args.inputs.iter().map(std::path::PathBuf::from).collect();
+    let paths: Vec<std::path::PathBuf> = args.inputs.iter().map(std::path::PathBuf::from).collect();
     let merged = xray_conf::merge_config_from_files(&paths)
         .map_err(|e| CliError::ConfigLoadFailed(format!("failed to load config: {e}")))?;
 
@@ -409,31 +395,22 @@ fn json_config_to_proto_config(config: &serde_json::Value) -> ProtoConfig {
     add(tm("xray.app.policy.Config", config.get("policy")));
     add(tm("xray.app.reverse.Config", config.get("reverse")));
     add(tm("xray.app.observatory.Config", config.get("observatory")));
-    add(tm(
-        "xray.app.observatory.burst.Config",
-        config.get("burstObservatory"),
-    ));
+    add(tm("xray.app.observatory.burst.Config", config.get("burstObservatory")));
     add(tm("xray.app.geodata.Config", config.get("geodata")));
     drop(add);
 
     let raw = serde_json::to_vec(config).unwrap_or_default();
     let inbound = build_inbound_configs(&raw).unwrap_or_default();
     let outbound = build_outbound_configs(&raw).unwrap_or_default();
-    ProtoConfig {
-        inbound,
-        outbound,
-        app,
-        extension: Vec::new(),
-    }
+    ProtoConfig { inbound, outbound, app, extension: Vec::new() }
 }
 /// `xray tls hash` 核心：读 cert 文件 → 解析 PEM/DER → 输出 SHA-256 hex 表格。
 ///
 /// 对应 Go `main/commands/all/tls/hash.go::executeHash`：
 /// - 文件以 `BEGIN` 起头 → 走 `pem.Decode` 逐块；否则尝试 `x509.ParseCertificates`（DER）。
 /// - 第一张带 DNS SAN 的证书视为 leaf，其余视为 CA（按 Go 注释）。
-/// - 输出格式对齐 Go `tabwriter` 2-spacing：`Leaf SHA256:\t<hex>` /
-///   `CA <CN> SHA256:\t<hex>`。Go 用 `\t` 间隔由 `tabwriter` 渲染为列；Rust
-///   无 tabwriter 等价物，固定为 `\t` + 实际列宽。
+/// - 输出格式对齐 Go `tabwriter` 2-spacing：`Leaf SHA256:\t<hex>` / `CA <CN> SHA256:\t<hex>`。Go 用
+///   `\t` 间隔由 `tabwriter` 渲染为列；Rust 无 tabwriter 等价物，固定为 `\t` + 实际列宽。
 pub fn execute_hash(args: &TlsHashArgs) -> Result<String, CliError> {
     use x509_parser::prelude::FromDer;
     use xray_tls::pin::generate_cert_hash_hex;
@@ -475,11 +452,7 @@ pub fn execute_hash(args: &TlsHashArgs) -> Result<String, CliError> {
             .unwrap_or("")
             .to_string();
         let has_san = cert.subject_alternative_name().ok().flatten().is_some();
-        parsed.push(Parsed {
-            cn,
-            der_hash: generate_cert_hash_hex(der),
-            has_san,
-        });
+        parsed.push(Parsed { cn, der_hash: generate_cert_hash_hex(der), has_san });
     }
 
     // 输出：第一张 has_san 的视作 leaf；其余按 `CA <CN>` 输出。
@@ -504,7 +477,8 @@ pub fn execute_hash(args: &TlsHashArgs) -> Result<String, CliError> {
 /// - `--expire` 解析 human duration（`90d`/`24h`/`30m`/`60s`），默认 90d。
 pub fn execute_cert(args: &TlsCertArgs) -> Result<(), CliError> {
     use std::time::Duration;
-    use xray_tls::certificate::{generate_self_signed_cert_with_options, CertOptions};
+
+    use xray_tls::certificate::{CertOptions, generate_self_signed_cert_with_options};
 
     let expire = parse_duration_human(&args.expire).map_err(|e| {
         CliError::InvalidArgument(format!(
@@ -554,9 +528,7 @@ fn parse_duration_human(s: &str) -> Result<u64, String> {
         return Err("empty duration".to_string());
     }
     let (num_str, unit) = s.split_at(s.len() - 1);
-    let n: u64 = num_str
-        .parse()
-        .map_err(|e| format!("not a number: {num_str} ({e})"))?;
+    let n: u64 = num_str.parse().map_err(|e| format!("not a number: {num_str} ({e})"))?;
     let multiplier = match unit {
         "s" => 1u64,
         "m" => 60,
@@ -564,19 +536,18 @@ fn parse_duration_human(s: &str) -> Result<u64, String> {
         "d" => 24 * 3600,
         _ => return Err(format!("unknown unit: {unit}")),
     };
-    n.checked_mul(multiplier)
-        .ok_or_else(|| "overflow".to_string())
+    n.checked_mul(multiplier).ok_or_else(|| "overflow".to_string())
 }
 
 /// `xray tls ping` 核心：TCP 拨号 + TLS 握手（带 SNI / 不带 SNI），打印证书链。
 ///
 /// 对应 Go `main/commands/all/tls/ping.go::executePing`：
-/// - 不带 SNI（InsecureSkipVerify 等价）：`rfc5077` 模式下 SNI 留空，rustls
-///   必传 `ServerName`，此处用 IP 字面作为 `ServerName`（rustls 0.23
-///   `ServerName::IpAddress`）以贴近 Go 行为。
+/// - 不带 SNI（InsecureSkipVerify 等价）：`rfc5077` 模式下 SNI 留空，rustls 必传
+///   `ServerName`，此处用 IP 字面作为 `ServerName`（rustls 0.23 `ServerName::IpAddress`）以贴近 Go
+///   行为。
 /// - 带 SNI：`ServerName = domain`。
-/// - 输出两次 `Pinging without SNI` / `with SNI`，每段打印 TLS 版本、cert 链
-///   长度 + leaf SHA256 + CA CN SHA256 + DNSNames。
+/// - 输出两次 `Pinging without SNI` / `with SNI`，每段打印 TLS 版本、cert 链 长度 + leaf SHA256 +
+///   CA CN SHA256 + DNSNames。
 ///
 /// **限制**：rustls 握手无 uTLS 真实指纹（与 xray_tls::client 一致），实际 ClientHello
 /// 字节布局是 rustls 默认；Go 端走 utls.UClient。此差异仅影响客户端指纹，
@@ -585,11 +556,10 @@ pub async fn execute_ping(args: &TlsPingArgs) -> Result<String, CliError> {
     // 解析 domain[:port]，默认 443
     let (domain, port) = match args.domain.rsplit_once(':') {
         Some((d, p)) => {
-            let port: u16 = p
-                .parse()
-                .map_err(|e| CliError::InvalidArgument(format!("bad port {p}: {e}")))?;
+            let port: u16 =
+                p.parse().map_err(|e| CliError::InvalidArgument(format!("bad port {p}: {e}")))?;
             (d.to_string(), port)
-        }
+        },
         None => (args.domain.clone(), 443u16),
     };
 
@@ -615,7 +585,7 @@ pub async fn execute_ping(args: &TlsPingArgs) -> Result<String, CliError> {
         Ok(s) => {
             out.push_str("Handshake succeeded\n");
             out.push_str(&s);
-        }
+        },
     }
 
     // 段 2：with SNI
@@ -625,25 +595,20 @@ pub async fn execute_ping(args: &TlsPingArgs) -> Result<String, CliError> {
         Ok(s) => {
             out.push_str("Handshake succeeded\n");
             out.push_str(&s);
-        }
+        },
     }
 
     out.push_str("-------------------\nTLS ping finished\n");
     Ok(out)
 }
 
-
 /// 一次 TLS 握手（带或不带 SNI），返回 cert 链详情字符串（无前缀行）。
-async fn ping_once(
-    ip: std::net::IpAddr,
-    port: u16,
-    sni: Option<&str>,
-) -> Result<String, String> {
+async fn ping_once(ip: std::net::IpAddr, port: u16, sni: Option<&str>) -> Result<String, String> {
     use std::sync::Arc;
+
     use rustls_pki_types::ServerName;
     use tokio::net::TcpStream;
-    use tokio_rustls::rustls::ClientConfig;
-    use tokio_rustls::TlsConnector;
+    use tokio_rustls::{TlsConnector, rustls::ClientConfig};
 
     let tcp = TcpStream::connect(std::net::SocketAddr::new(ip, port))
         .await
@@ -655,16 +620,12 @@ async fn ping_once(
         .with_no_client_auth();
     // rustls 0.23 ServerName::try_from 接受 DNSName 或 IpAddress
     let server_name: ServerName<'static> = match sni {
-        Some(d) => ServerName::try_from(d.to_string())
-            .map_err(|e| format!("SNI {d}: {e}"))?,
+        Some(d) => ServerName::try_from(d.to_string()).map_err(|e| format!("SNI {d}: {e}"))?,
         None => ServerName::try_from(ip.to_string())
             .map_err(|e| format!("no-SNI server_name from IP {ip}: {e}"))?,
     };
     let connector = TlsConnector::from(Arc::new(cfg));
-    let tls = connector
-        .connect(server_name, tcp)
-        .await
-        .map_err(|e| format!("handshake: {e}"))?;
+    let tls = connector.connect(server_name, tcp).await.map_err(|e| format!("handshake: {e}"))?;
     let conn = tls.get_ref().1;
     let mut s = String::new();
     // TLS version
@@ -712,6 +673,7 @@ impl rustls::client::danger::ServerCertVerifier for SkipVerify {
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
+
     fn verify_tls12_signature(
         &self,
         _message: &[u8],
@@ -720,6 +682,7 @@ impl rustls::client::danger::ServerCertVerifier for SkipVerify {
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
+
     fn verify_tls13_signature(
         &self,
         _message: &[u8],
@@ -728,6 +691,7 @@ impl rustls::client::danger::ServerCertVerifier for SkipVerify {
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
+
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
@@ -738,11 +702,7 @@ impl rustls::client::danger::ServerCertVerifier for SkipVerify {
 fn extract_cn(der: &[u8]) -> Option<String> {
     use x509_parser::prelude::FromDer;
     let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der).ok()?;
-    cert.subject()
-        .iter_common_name()
-        .next()
-        .and_then(|a| a.as_str().ok())
-        .map(|s| s.to_string())
+    cert.subject().iter_common_name().next().and_then(|a| a.as_str().ok()).map(|s| s.to_string())
 }
 
 fn extract_dns_sans(der: &[u8]) -> Option<Vec<String>> {
@@ -767,11 +727,11 @@ fn extract_dns_sans(der: &[u8]) -> Option<Vec<String>> {
 
 /// `xray tls ech` 核心：生成/还原 ECH keyset，返回输出文本。
 ///
-/// - 无 `-i`：生成新 keyset（X25519 + 9 cipher suites，`generate_ech_key_set`）；
-///   `config list` = 单 config 的 u16 前缀打包，`server keys` = `[klen][key][clen][config]`。
+/// - 无 `-i`：生成新 keyset（X25519 + 9 cipher suites，`generate_ech_key_set`）； `config list` =
+///   单 config 的 u16 前缀打包，`server keys` = `[klen][key][clen][config]`。
 /// - `-i`：base64 解码既有 server keys → 逐 config 还原 `config list`；`server keys` 原样。
-/// - `--pem`：PEM 块（`ECH CONFIGS` / `ECH KEYS`，64 列 base64）；
-///   否则 Go 原样文本 `"ECH config list: \n{b64}\n"` + `"ECH server keys: \n{b64}\n"`。
+/// - `--pem`：PEM 块（`ECH CONFIGS` / `ECH KEYS`，64 列 base64）； 否则 Go 原样文本 `"ECH config
+///   list: \n{b64}\n"` + `"ECH server keys: \n{b64}\n"`。
 pub fn execute_ech(args: &TlsEchArgs) -> Result<String, CliError> {
     use base64::Engine as _;
     use xray_tls::ech::{
@@ -783,22 +743,21 @@ pub fn execute_ech(args: &TlsEchArgs) -> Result<String, CliError> {
     let (config_buffer, key_buffer) = match &args.input {
         None => {
             let (config, priv_bytes) = generate_ech_key_set(&args.server_name);
-            (
-                pack_ech_config_list(&[&config]),
-                pack_ech_server_keys(&priv_bytes, &config),
-            )
-        }
+            (pack_ech_config_list(&[&config]), pack_ech_server_keys(&priv_bytes, &config))
+        },
         Some(input) => {
-            let key_buffer = B64
-                .decode(input)
-                .map_err(|e| CliError::InvalidArgument(format!("Failed to decode ECHServerKeys: {e}")))?;
+            let key_buffer = B64.decode(input).map_err(|e| {
+                CliError::InvalidArgument(format!("Failed to decode ECHServerKeys: {e}"))
+            })?;
             // 解析校验（对齐 Go：ConvertToGoECHKeys 失败即报错返回）
-            convert_to_ech_keys(&key_buffer)
-                .map_err(|e| CliError::InvalidArgument(format!("Failed to decode ECHServerKeys: {e}")))?;
-            let config_buffer = ech_config_list_from_server_keys(&key_buffer)
-                .map_err(|e| CliError::InvalidArgument(format!("Failed to decode ECHServerKeys: {e}")))?;
+            convert_to_ech_keys(&key_buffer).map_err(|e| {
+                CliError::InvalidArgument(format!("Failed to decode ECHServerKeys: {e}"))
+            })?;
+            let config_buffer = ech_config_list_from_server_keys(&key_buffer).map_err(|e| {
+                CliError::InvalidArgument(format!("Failed to decode ECHServerKeys: {e}"))
+            })?;
             (config_buffer, key_buffer)
-        }
+        },
     };
 
     if args.pem {
@@ -831,16 +790,13 @@ fn pem_block(label: &str, der: &[u8]) -> String {
 
 #[cfg(test)]
 mod ech_tests {
-    use super::*;
     use base64::Engine as _;
     use xray_tls::ech::{convert_to_ech_keys, generate_ech_key_set, pack_ech_config_list};
 
+    use super::*;
+
     fn args(input: Option<&str>, pem: bool) -> TlsEchArgs {
-        TlsEchArgs {
-            input: input.map(str::to_string),
-            server_name: "ech.test".to_string(),
-            pem,
-        }
+        TlsEchArgs { input: input.map(str::to_string), server_name: "ech.test".to_string(), pem }
     }
 
     /// 无 -i：输出两行 base64；config list 可解析回 u16 前缀结构，
@@ -902,10 +858,7 @@ mod ech_tests {
         ));
         // base64 合法但长度字段超界
         let bad = base64::engine::general_purpose::STANDARD.encode([0x00u8, 0xff, 0x01]);
-        assert!(matches!(
-            execute_ech(&args(Some(&bad), false)),
-            Err(CliError::InvalidArgument(_))
-        ));
+        assert!(matches!(execute_ech(&args(Some(&bad), false)), Err(CliError::InvalidArgument(_))));
     }
 
     /// --pem：BEGIN/END 块格式 + 内容可解码回。
@@ -921,8 +874,9 @@ mod ech_tests {
 
 #[cfg(test)]
 mod tls_hash_tests {
-    use super::*;
     use xray_tls::pin::generate_cert_hash_hex;
+
+    use super::*;
 
     /// helper：生成一个临时自签 cert 写到文件，返回路径。
     fn write_temp_cert() -> (tempfile::NamedTempFile, String) {
@@ -931,10 +885,7 @@ mod tls_hash_tests {
         let f = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(f.path(), &cert_pem).unwrap();
         let hex = generate_cert_hash_hex(
-            &rustls_pemfile::certs(&mut cert_pem.as_bytes())
-                .next()
-                .unwrap()
-                .unwrap(),
+            &rustls_pemfile::certs(&mut cert_pem.as_bytes()).next().unwrap().unwrap(),
         );
         (f, hex)
     }
@@ -967,10 +918,7 @@ mod tls_hash_tests {
     /// 缺 cert → InvalidArgument。
     #[test]
     fn hash_missing_cert_errors() {
-        let args = TlsHashArgs {
-            cert: None,
-            positional_cert: vec![],
-        };
+        let args = TlsHashArgs { cert: None, positional_cert: vec![] };
         assert!(matches!(execute_hash(&args), Err(CliError::InvalidArgument(_))));
     }
 
@@ -987,8 +935,9 @@ mod tls_hash_tests {
 
 #[cfg(test)]
 mod tls_cert_tests {
-    use super::*;
     use std::time::Duration;
+
+    use super::*;
 
     fn basic_args(domains: Vec<&str>) -> TlsCertArgs {
         TlsCertArgs {
@@ -1110,10 +1059,8 @@ mod tls_ping_tests {
     #[test]
     fn ping_args_domain_parsing_in_execute_ping_setup() {
         // 验证 domain 带端口的解析（仅语法层面，不实际拨号）。
-        let args = TlsPingArgs {
-            domain: "example.com:8443".to_string(),
-            ip: Some("1.2.3.4".to_string()),
-        };
+        let args =
+            TlsPingArgs { domain: "example.com:8443".to_string(), ip: Some("1.2.3.4".to_string()) };
         assert_eq!(args.domain, "example.com:8443");
         // ip 解析正确
         let parsed: std::net::IpAddr = args.ip.as_ref().unwrap().parse().unwrap();
@@ -1156,11 +1103,7 @@ mod convert_tests {
         assert_eq!(decoded.inbound.len(), 1);
         assert_eq!(decoded.inbound[0].tag, "in-1");
         assert_eq!(
-            decoded.inbound[0]
-                .receiver_settings
-                .as_ref()
-                .unwrap()
-                .r#type,
+            decoded.inbound[0].receiver_settings.as_ref().unwrap().r#type,
             "xray.app.proxyman.ReceiverConfig"
         );
         assert_eq!(
@@ -1171,11 +1114,7 @@ mod convert_tests {
         assert_eq!(decoded.outbound.len(), 1);
         assert_eq!(decoded.outbound[0].tag, "out-1");
         assert_eq!(
-            decoded.outbound[0]
-                .sender_settings
-                .as_ref()
-                .unwrap()
-                .r#type,
+            decoded.outbound[0].sender_settings.as_ref().unwrap().r#type,
             "xray.app.proxyman.SenderConfig"
         );
         assert_eq!(
@@ -1237,7 +1176,6 @@ mod convert_tests {
         let go_urls: Vec<String> = go.app.iter().map(|t| t.r#type.clone()).collect();
         assert_eq!(urls, go_urls);
     }
-
 
     /// convert json -t：注入 `_TypedMessage_`（Go reflect/marshal.go:42-44）。
     #[test]
@@ -1363,12 +1301,7 @@ mod convert_tests {
     fn convert_pb_requires_out_or_debug() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = write_temp(&dir, "config.json", r#"{"inbounds":[],"outbounds":[]}"#);
-        let args = ConvertPbArgs {
-            out: None,
-            debug: false,
-            inject_type: false,
-            inputs: vec![cfg],
-        };
+        let args = ConvertPbArgs { out: None, debug: false, inject_type: false, inputs: vec![cfg] };
         let err = execute_convert_pb(&args).unwrap_err();
         assert!(err.to_string().contains("-outpbfile not specified"));
     }
@@ -1385,8 +1318,6 @@ mod convert_tests {
             inputs: vec![cfg],
         };
         let err = execute_convert_pb(&args).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("-outpbfile followed by a possible original config."));
+        assert!(err.to_string().contains("-outpbfile followed by a possible original config."));
     }
 }

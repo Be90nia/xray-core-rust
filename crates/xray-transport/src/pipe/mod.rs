@@ -13,8 +13,9 @@ pub fn pipe() -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
 
     #[tokio::test]
     async fn pipe_relays_data() {

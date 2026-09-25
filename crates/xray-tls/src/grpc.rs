@@ -6,10 +6,9 @@
 //! gRPC 集成依赖 Rust 端 gRPC crate（如 `tonic`）+ uTLS 实现，**均未就绪**。
 //! 本模块只翻译类型定义与 trait，待 Phase 5 (transport-grpc) + uTLS 接入后实现。
 
-use crate::error::TlsError;
-use crate::fingerprint::Fingerprint;
-use std::future::Future;
-use std::pin::Pin;
+use std::{future::Future, pin::Pin};
+
+use crate::{error::TlsError, fingerprint::Fingerprint};
 
 /// gRPC TLS 认证信息。
 ///
@@ -63,7 +62,6 @@ pub trait GrpcUtlsCredentials: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), TlsError>> + Send + 'a>>;
 }
 
-
 /// 构造 gRPC uTLS credentials。
 ///
 /// 对应 Go `NewGrpcUtls(c *gotls.Config, fingerprint *utls.ClientHelloID)`。
@@ -90,12 +88,15 @@ mod tests {
             fn client_handshake<'a>(
                 &'a mut self,
                 _authority: &'a str,
-            ) -> Pin<Box<dyn Future<Output = Result<GrpcUtlsInfo, TlsError>> + Send + 'a>> {
+            ) -> Pin<Box<dyn Future<Output = Result<GrpcUtlsInfo, TlsError>> + Send + 'a>>
+            {
                 Box::pin(async { Err(TlsError::UtlsNotImplemented) })
             }
+
             fn clone_box(&self) -> Box<dyn GrpcUtlsCredentials> {
                 Box::new(DummyCreds)
             }
+
             fn override_server_name<'a>(
                 &'a mut self,
                 _name: &'a str,
@@ -109,9 +110,6 @@ mod tests {
 
     #[test]
     fn factory_returns_not_implemented() {
-        assert!(matches!(
-            new_grpc_utls(Fingerprint::Chrome),
-            Err(TlsError::UtlsNotImplemented)
-        ));
+        assert!(matches!(new_grpc_utls(Fingerprint::Chrome), Err(TlsError::UtlsNotImplemented)));
     }
 }

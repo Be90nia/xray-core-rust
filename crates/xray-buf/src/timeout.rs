@@ -3,11 +3,12 @@
 //! 对应 Go 版本 `common/buf/timeout.go`，为 Reader 和 Writer 提供超时包装。
 //! 使用 `tokio::select!` 实现超时机制。
 
-use crate::io::{Error, Reader, Result, TimeoutReader, Writer};
-use crate::multi::MultiBuffer;
-use std::future::Future;
-use std::pin::Pin;
-use std::time::Duration;
+use std::{future::Future, pin::Pin, time::Duration};
+
+use crate::{
+    io::{Error, Reader, Result, TimeoutReader, Writer},
+    multi::MultiBuffer,
+};
 
 // ========== TimeoutReaderWrapper ==========
 
@@ -100,10 +101,13 @@ impl<W: Writer + Send> TimeoutWriterWrapper<W> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::buffer::Buffer;
-    use crate::io::{new_reader, new_writer};
     use std::io::Cursor;
+
+    use super::*;
+    use crate::{
+        buffer::Buffer,
+        io::{new_reader, new_writer},
+    };
 
     #[tokio::test]
     async fn test_timeout_reader_success() {
@@ -161,9 +165,7 @@ mod tests {
 
         let mut wrapper = TimeoutReaderWrapper::new(SlowReader);
 
-        let result = wrapper
-            .read_multi_buffer_timeout(Duration::from_millis(50))
-            .await;
+        let result = wrapper.read_multi_buffer_timeout(Duration::from_millis(50)).await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::TimeoutError));

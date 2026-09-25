@@ -3,11 +3,11 @@
 //! 翻译自 Go `transport/internet/tls/config.go` + `infra/conf/transport_internet.go`
 //! 中与证书相关的部分：
 //! - `generate_self_signed_cert`：rcgen 自签（Go `tls.go::Generate`）
-//! - `generate_self_signed_cert_with_options`：支持 is_ca/org/CN/expire 的变体，
-//!   对应 Go `main/commands/all/tls/cert.go::executeCert` 的 flag 选项
+//! - `generate_self_signed_cert_with_options`：支持 is_ca/org/CN/expire 的变体， 对应 Go
+//!   `main/commands/all/tls/cert.go::executeCert` 的 flag 选项
 //! - `extract_cert_names`：CN + DNS SAN 提取（SNI 选择用）
-//! - `EntryUsage` + `entry_usage` + `entry_certs_and_key`：`certificates[]` 条目
-//!   的 usage 分类与 file-or-inline 读取（Go `TLSCertConfig.Build` + `readFileOrString`）
+//! - `EntryUsage` + `entry_usage` + `entry_certs_and_key`：`certificates[]` 条目 的 usage 分类与
+//!   file-or-inline 读取（Go `TLSCertConfig.Build` + `readFileOrString`）
 //!
 //! **已删除**（bd yuz 死代码清理，全仓零调用方）：`CertificateUsage` proto wrapper、
 //! `is_encipherment`/`is_authority_issue`、`issue_certificate`（AUTHORITY_ISSUE 动态
@@ -20,8 +20,7 @@
 //! `generate_self_signed_cert*` 是**确定性 + 无 I/O 副作用**的纯计算：rcgen 在内存
 //! 里构造 `CertificateParams` + 生成临时 `KeyPair` + 私钥签名 → 输出 PEM 文本。
 //! 调用方若要落盘需自行 `fs::write`。
-use std::io;
-use std::time::Duration as StdDuration;
+use std::{io, time::Duration as StdDuration};
 
 use rcgen::{BasicConstraints, IsCa, KeyUsagePurpose};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
@@ -46,10 +45,12 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 pub fn generate_self_signed_cert(common_names: &[&str]) -> io::Result<(String, String)> {
     let params = rcgen::CertificateParams::new(
         common_names.iter().map(|s| s.to_string()).collect::<Vec<String>>(),
-    ).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
     let key_pair = rcgen::KeyPair::generate()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-    let cert = params.self_signed(&key_pair)
+    let cert = params
+        .self_signed(&key_pair)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
     Ok((cert.pem(), key_pair.serialize_pem()))
 }
@@ -89,18 +90,11 @@ pub fn generate_self_signed_cert_with_options(
 ) -> io::Result<(String, String)> {
     let mut params = rcgen::CertificateParams::new(domains.to_vec())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-    params.distinguished_name.push(
-        rcgen::DnType::CommonName,
-        opts.common_name.clone(),
-    );
-    params.distinguished_name.push(
-        rcgen::DnType::OrganizationName,
-        opts.organization.clone(),
-    );
+    params.distinguished_name.push(rcgen::DnType::CommonName, opts.common_name.clone());
+    params.distinguished_name.push(rcgen::DnType::OrganizationName, opts.organization.clone());
     let not_after = time::OffsetDateTime::now_utc()
-        + time::Duration::try_from(opts.not_after).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidInput, format!("not_after: {e}"))
-        })?;
+        + time::Duration::try_from(opts.not_after)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("not_after: {e}")))?;
     params.not_after = not_after;
     if opts.is_ca {
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -117,7 +111,6 @@ pub fn generate_self_signed_cert_with_options(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
     Ok((cert.pem(), key_pair.serialize_pem()))
 }
-
 
 /// 从单个 DER 证书提取 `(CommonName, DNS SANs)`，名称一律转小写。
 ///
@@ -160,8 +153,8 @@ pub fn extract_cert_names(der: &[u8]) -> (Option<String>, Vec<String>) {
 ///
 /// 对应 Go `TLSCertConfig.Build` 的字符串映射：
 /// - `"encipherment"`（默认，未知值也回落到此）：服务端加密证书。
-/// - `"verify"`：**Rust 扩展**——Go 的 `AUTHORITY_VERIFY` 在 v26 无任何消费方；
-///   Rust 用作 mTLS 客户端 CA（`server_config` 以此 opt-in 要求客户端证书）。
+/// - `"verify"`：**Rust 扩展**——Go 的 `AUTHORITY_VERIFY` 在 v26 无任何消费方； Rust 用作 mTLS
+///   客户端 CA（`server_config` 以此 opt-in 要求客户端证书）。
 /// - `"issue"`：Go `AUTHORITY_ISSUE` 动态签发 CA；Rust 未实现动态签发，
 ///   目前仅用于把条目从服务端证书集合中排除（对齐 Go `BuildCertificates` 过滤）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,12 +171,7 @@ pub enum EntryUsage {
 ///
 /// 未知值回落 [`EntryUsage::Encipherment`]——对齐 Go `Build` 的 `default` 分支。
 pub fn entry_usage(entry: &serde_json::Value) -> EntryUsage {
-    match entry
-        .get("usage")
-        .and_then(|v| v.as_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
+    match entry.get("usage").and_then(|v| v.as_str()).map(str::to_ascii_lowercase).as_deref() {
         Some("verify") => EntryUsage::Verify,
         Some("issue") => EntryUsage::Issue,
         _ => EntryUsage::Encipherment,
@@ -216,7 +204,7 @@ fn file_or_inline(
                 return Err(io::Error::other(format!("{what}: empty inline value")));
             }
             Ok(Some(s.clone().into_bytes()))
-        }
+        },
         Some(serde_json::Value::Array(items)) => {
             let mut lines = Vec::with_capacity(items.len());
             for v in items {
@@ -228,7 +216,7 @@ fn file_or_inline(
                 lines.push(s);
             }
             Ok(Some(lines.join("\n").into_bytes()))
-        }
+        },
         Some(other) => Err(io::Error::other(format!(
             "{what}: expected string or array of PEM lines, got {other}"
         ))),
@@ -256,13 +244,12 @@ pub(crate) fn pem_private_key(pem: &[u8]) -> io::Result<Option<PrivateKeyDer<'st
 /// 对应 Go `TLSCertConfig.Build`（infra/conf/transport_security.go:260-298）：
 /// `certificateFile`+`keyFile`（磁盘）或 `certificate`+`key`（内联）。
 ///
-/// - 证书内容缺失（无 file 且无内联/内联为空）→ `Err`——对齐 Go
-///   `readFileOrString` 的 "both file and bytes are empty." → Build error；
-///   Go 中无内容条目不存在跳过语义，配置直接加载失败。
+/// - 证书内容缺失（无 file 且无内联/内联为空）→ `Err`——对齐 Go `readFileOrString` 的 "both file and
+///   bytes are empty." → Build error； Go 中无内容条目不存在跳过语义，配置直接加载失败。
 /// - PEM 解析出 0 张证书 → `Err`（Go 侧空内容透传后在 X509KeyPair 层报错；
 ///   宁可启动报错也不静默回退自签证书）。
-/// - key 缺失 → key 为 `None`——`usage:"verify"` 的 CA 条目合法地不带私钥
-///   （Go 仅在 `len(KeyFile)>0 || len(KeyStr)>0` 时才读取 key）。
+/// - key 缺失 → key 为 `None`——`usage:"verify"` 的 CA 条目合法地不带私钥 （Go 仅在 `len(KeyFile)>0
+///   || len(KeyStr)>0` 时才读取 key）。
 ///
 /// # Errors
 /// - 证书/私钥文件读取失败、内联类型非法或 PEM 解析失败/无证书块。
@@ -275,24 +262,17 @@ pub fn entry_certs_and_key(
         "certificate",
     )?;
     let Some(cert_bytes) = cert_bytes else {
-        return Err(io::Error::other(
-            "certificate: both file and inline content are empty",
-        ));
+        return Err(io::Error::other("certificate: both file and inline content are empty"));
     };
     let certs = rustls_pemfile::certs(&mut cert_bytes.as_slice())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| io::Error::other(format!("parse cert PEM: {e}")))?;
     if certs.is_empty() {
-        return Err(io::Error::other(
-            "certificate: no PEM certificate block found",
-        ));
+        return Err(io::Error::other("certificate: no PEM certificate block found"));
     }
 
-    let key_bytes = file_or_inline(
-        entry.get("keyFile").and_then(|v| v.as_str()),
-        entry.get("key"),
-        "key",
-    )?;
+    let key_bytes =
+        file_or_inline(entry.get("keyFile").and_then(|v| v.as_str()), entry.get("key"), "key")?;
     let key = match key_bytes {
         Some(b) => pem_private_key(&b)?,
         None => None,
@@ -300,15 +280,16 @@ pub fn entry_certs_and_key(
     Ok((certs, key))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn leaf_der(sans: &[&str]) -> Vec<u8> {
         let key = rcgen::KeyPair::generate().unwrap();
-        let mut params =
-            rcgen::CertificateParams::new(sans.iter().map(|s| (*s).to_string()).collect::<Vec<String>>()).unwrap();
+        let mut params = rcgen::CertificateParams::new(
+            sans.iter().map(|s| (*s).to_string()).collect::<Vec<String>>(),
+        )
+        .unwrap();
         params.distinguished_name.push(rcgen::DnType::CommonName, sans[0]);
         params.self_signed(&key).unwrap().der().to_vec()
     }
@@ -434,19 +415,14 @@ K2JQ3jI2lZW+13b7SrdToP7eR+OaxQstS7El4hqNjJLWwojUB4Pe9hSU8EsuUC2C
         assert_eq!(certs.len(), 1);
         // PEM 行数组（Go readFileOrString join "\n"）
         let lines: Vec<&str> = pem.lines().collect();
-        let (certs2, _) =
-            entry_certs_and_key(&cert_entry(serde_json::json!(lines))).unwrap();
+        let (certs2, _) = entry_certs_and_key(&cert_entry(serde_json::json!(lines))).unwrap();
         assert_eq!(certs2, certs);
     }
-
 
     #[test]
     fn options_default_matches_go_ninety_days() {
         // Go `cmdCert.Flag.Duration("expire", 90d)` 默认 90 天
-        assert_eq!(
-            CertOptions::default().not_after,
-            StdDuration::from_secs(90 * 24 * 60 * 60)
-        );
+        assert_eq!(CertOptions::default().not_after, StdDuration::from_secs(90 * 24 * 60 * 60));
         assert!(!CertOptions::default().is_ca);
         assert_eq!(CertOptions::default().common_name, "Xray Inc");
         assert_eq!(CertOptions::default().organization, "Xray Inc");
@@ -456,21 +432,14 @@ K2JQ3jI2lZW+13b7SrdToP7eR+OaxQstS7El4hqNjJLWwojUB4Pe9hSU8EsuUC2C
     fn with_options_ca_sets_basic_constraints() {
         let (cert_pem, key_pem) = generate_self_signed_cert_with_options(
             &["ca.test".to_string()],
-            &CertOptions {
-                is_ca: true,
-                ..CertOptions::default()
-            },
+            &CertOptions { is_ca: true, ..CertOptions::default() },
         )
         .unwrap();
         assert!(cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(key_pem.contains("BEGIN PRIVATE KEY"));
         use x509_parser::prelude::FromDer;
-        let der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
-            .next()
-            .unwrap()
-            .unwrap();
-        let (_, cert) =
-            x509_parser::certificate::X509Certificate::from_der(&der).unwrap();
+        let der = rustls_pemfile::certs(&mut cert_pem.as_bytes()).next().unwrap().unwrap();
+        let (_, cert) = x509_parser::certificate::X509Certificate::from_der(&der).unwrap();
         let bc = cert.basic_constraints().unwrap();
         assert!(bc.map(|b| b.value.ca).unwrap_or(false));
     }
@@ -487,12 +456,8 @@ K2JQ3jI2lZW+13b7SrdToP7eR+OaxQstS7El4hqNjJLWwojUB4Pe9hSU8EsuUC2C
         )
         .unwrap();
         use x509_parser::prelude::FromDer;
-        let der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
-            .next()
-            .unwrap()
-            .unwrap();
-        let (_, cert) =
-            x509_parser::certificate::X509Certificate::from_der(&der).unwrap();
+        let der = rustls_pemfile::certs(&mut cert_pem.as_bytes()).next().unwrap().unwrap();
+        let (_, cert) = x509_parser::certificate::X509Certificate::from_der(&der).unwrap();
         let subject = cert.subject().to_string();
         assert!(subject.contains("My Org"), "subject should contain O=My Org: {subject}");
         assert!(subject.contains("My CN"), "subject should contain CN=My CN: {subject}");
@@ -501,18 +466,11 @@ K2JQ3jI2lZW+13b7SrdToP7eR+OaxQstS7El4hqNjJLWwojUB4Pe9hSU8EsuUC2C
     #[test]
     fn with_options_multiple_domains_appear_as_sans() {
         let domains = vec!["a.test".to_string(), "b.test".to_string(), "c.test".to_string()];
-        let (cert_pem, _) = generate_self_signed_cert_with_options(
-            &domains,
-            &CertOptions::default(),
-        )
-        .unwrap();
+        let (cert_pem, _) =
+            generate_self_signed_cert_with_options(&domains, &CertOptions::default()).unwrap();
         use x509_parser::prelude::FromDer;
-        let der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
-            .next()
-            .unwrap()
-            .unwrap();
-        let (_, cert) =
-            x509_parser::certificate::X509Certificate::from_der(&der).unwrap();
+        let der = rustls_pemfile::certs(&mut cert_pem.as_bytes()).next().unwrap().unwrap();
+        let (_, cert) = x509_parser::certificate::X509Certificate::from_der(&der).unwrap();
         let sans: Vec<String> = cert
             .subject_alternative_name()
             .unwrap()
@@ -535,27 +493,21 @@ K2JQ3jI2lZW+13b7SrdToP7eR+OaxQstS7El4hqNjJLWwojUB4Pe9hSU8EsuUC2C
         // not_after=0s 不应 panic；rcgen 接受 not_after = now
         let result = generate_self_signed_cert_with_options(
             &["x".to_string()],
-            &CertOptions {
-                not_after: StdDuration::from_secs(0),
-                ..CertOptions::default()
-            },
+            &CertOptions { not_after: StdDuration::from_secs(0), ..CertOptions::default() },
         );
         assert!(result.is_ok());
     }
 
-
     #[test]
     fn entry_usage_mapping() {
-        let v: serde_json::Value =
-            serde_json::from_str(r#"{"usage":"VERIFY"}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(r#"{"usage":"VERIFY"}"#).unwrap();
         assert_eq!(entry_usage(&v), EntryUsage::Verify);
         let v: serde_json::Value = serde_json::from_str(r#"{"usage":"issue"}"#).unwrap();
         assert_eq!(entry_usage(&v), EntryUsage::Issue);
         // 缺失 / 未知 → Encipherment（Go default 分支）
         let v: serde_json::Value = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(entry_usage(&v), EntryUsage::Encipherment);
-        let v: serde_json::Value =
-            serde_json::from_str(r#"{"usage":"bogus"}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(r#"{"usage":"bogus"}"#).unwrap();
         assert_eq!(entry_usage(&v), EntryUsage::Encipherment);
     }
 

@@ -3,9 +3,8 @@
 //! 集中描述 outbound/inbound 一次 dial/listen 所需的全部流设置：
 //!
 //! - 协议名（tcp / ws / grpc / ...）+ 安全层名（none / tls / reality）
-//! - **TCP/UDP mask manager 配置块**（对应 Go `TcpmaskManager` / `UdpmaskManager`，
-//!   当前阶段只持有 JSON-shaped entries，未实例化 manager 对象——运行时接线由各
-//!   transport crate 负责）
+//! - **TCP/UDP mask manager 配置块**（对应 Go `TcpmaskManager` / `UdpmaskManager`， 当前阶段只持有
+//!   JSON-shaped entries，未实例化 manager 对象——运行时接线由各 transport crate 负责）
 //! - **QuicParams 配置块**（对应 Go `QuicParamsConfig` JSON 形态，
 //!   `infra/conf/transport_internet.go:620-635`）
 //! - **DownloadSettings 配置块**（splithttp 高级特性，下载流的嵌套 StreamConfig）
@@ -161,7 +160,9 @@ pub fn to_memory_stream_config(json: Option<&serde_json::Value>) -> io::Result<M
     })
 }
 
-fn parse_tcpmask_manager(v: Option<&serde_json::Value>) -> io::Result<Option<TcpmaskManagerConfig>> {
+fn parse_tcpmask_manager(
+    v: Option<&serde_json::Value>,
+) -> io::Result<Option<TcpmaskManagerConfig>> {
     let Some(arr) = v.and_then(|v| v.as_array()) else { return Ok(None) };
     let mut masks = Vec::with_capacity(arr.len());
     for entry in arr {
@@ -170,7 +171,9 @@ fn parse_tcpmask_manager(v: Option<&serde_json::Value>) -> io::Result<Option<Tcp
     Ok(Some(TcpmaskManagerConfig { masks }))
 }
 
-fn parse_udpmask_manager(v: Option<&serde_json::Value>) -> io::Result<Option<UdpmaskManagerConfig>> {
+fn parse_udpmask_manager(
+    v: Option<&serde_json::Value>,
+) -> io::Result<Option<UdpmaskManagerConfig>> {
     let Some(arr) = v.and_then(|v| v.as_array()) else { return Ok(None) };
     let mut masks = Vec::with_capacity(arr.len());
     for entry in arr {
@@ -181,8 +184,11 @@ fn parse_udpmask_manager(v: Option<&serde_json::Value>) -> io::Result<Option<Udp
 
 fn parse_mask_entry(v: &serde_json::Value) -> io::Result<MaskEntry> {
     let obj = v.as_object().ok_or_else(|| invalid("mask: expected an object"))?;
-    let mask_type = obj.get("type").and_then(|t| t.as_str())
-        .ok_or_else(|| invalid("mask: missing `type`"))?.to_string();
+    let mask_type = obj
+        .get("type")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| invalid("mask: missing `type`"))?
+        .to_string();
     let settings = obj.get("settings").cloned();
     Ok(MaskEntry { mask_type, settings })
 }
@@ -227,8 +233,7 @@ fn parse_udp_hop(v: Option<&serde_json::Value>) -> io::Result<UdpHopConfig> {
         Some(v) => parse_port_list(v)?,
     };
     // interval: {from, to} → (i64, i64)
-    let (interval_min, interval_max) = parse_int32_range(obj.get("interval"))
-        .unwrap_or((0, 0));
+    let (interval_min, interval_max) = parse_int32_range(obj.get("interval")).unwrap_or((0, 0));
     Ok(UdpHopConfig { ports, interval_min, interval_max })
 }
 fn parse_port_list(v: &serde_json::Value) -> io::Result<Vec<u32>> {
@@ -239,25 +244,36 @@ fn parse_port_list(v: &serde_json::Value) -> io::Result<Vec<u32>> {
     if let Some(s) = v.as_str() {
         for item in s.split(',') {
             let t = item.trim();
-            if t.is_empty() { continue; }
+            if t.is_empty() {
+                continue;
+            }
             if let Some(idx) = t.find('-') {
                 let from_s = &t[..idx];
                 let to_s = &t[idx + 1..];
-                let from: u32 = from_s.parse().map_err(|_| invalid(format!("ports: invalid range start {from_s:?}")))?;
-                let to: u32 = to_s.parse().map_err(|_| invalid(format!("ports: invalid range end {to_s:?}")))?;
-                if from > to { return Err(invalid(format!("ports: range start > end ({from}>{to})"))); }
+                let from: u32 = from_s
+                    .parse()
+                    .map_err(|_| invalid(format!("ports: invalid range start {from_s:?}")))?;
+                let to: u32 = to_s
+                    .parse()
+                    .map_err(|_| invalid(format!("ports: invalid range end {to_s:?}")))?;
+                if from > to {
+                    return Err(invalid(format!("ports: range start > end ({from}>{to})")));
+                }
                 for p in from..=to {
                     out.push(p);
                 }
             } else {
-                let p: u32 = t.parse().map_err(|_| invalid(format!("ports: invalid port {t:?}")))?;
+                let p: u32 =
+                    t.parse().map_err(|_| invalid(format!("ports: invalid port {t:?}")))?;
                 out.push(p);
             }
         }
         return Ok(out);
     }
     if let Some(n) = v.as_u64() {
-        if n > u32::MAX as u64 { return Err(invalid("ports: out of u32 range")); }
+        if n > u32::MAX as u64 {
+            return Err(invalid("ports: out of u32 range"));
+        }
         return Ok(vec![n as u32]);
     }
     let arr = v.as_array().ok_or_else(|| invalid("ports: expected string, number, or array"))?;
@@ -265,9 +281,11 @@ fn parse_port_list(v: &serde_json::Value) -> io::Result<Vec<u32>> {
         match item {
             serde_json::Value::Number(n) => {
                 let p = n.as_u64().ok_or_else(|| invalid("ports: not a u32"))?;
-                if p > u32::MAX as u64 { return Err(invalid("ports: out of u32 range")); }
+                if p > u32::MAX as u64 {
+                    return Err(invalid("ports: out of u32 range"));
+                }
                 out.push(p as u32);
-            }
+            },
             serde_json::Value::Object(_) => {
                 let (from, to) = parse_int32_range(Some(item))?;
                 if from < 0 || to < 0 || from > u32::MAX as i64 || to > u32::MAX as i64 {
@@ -276,7 +294,7 @@ fn parse_port_list(v: &serde_json::Value) -> io::Result<Vec<u32>> {
                 for p in from.max(0) as u32..=to.max(0) as u32 {
                     out.push(p);
                 }
-            }
+            },
             _ => return Err(invalid("ports: expected number or {from,to} object")),
         }
     }
@@ -289,18 +307,20 @@ fn parse_int32_range(v: Option<&serde_json::Value>) -> io::Result<(i64, i64)> {
         serde_json::Value::Number(n) => {
             let x = n.as_i64().ok_or_else(|| invalid("range: not an i64"))?;
             Ok((x, x))
-        }
+        },
         serde_json::Value::Object(o) => {
             let from = o.get("from").and_then(|v| v.as_i64()).unwrap_or(0);
             let to = o.get("to").and_then(|v| v.as_i64()).unwrap_or(from);
             Ok((from, to))
-        }
+        },
         serde_json::Value::Null => Ok((0, 0)),
         _ => Err(invalid("range: expected number or {from,to} object")),
     }
 }
 
-fn parse_download_settings(v: Option<&serde_json::Value>) -> io::Result<Option<DownloadSettingsConfig>> {
+fn parse_download_settings(
+    v: Option<&serde_json::Value>,
+) -> io::Result<Option<DownloadSettingsConfig>> {
     let Some(inner) = v else { return Ok(None) };
     let inner = to_memory_stream_config(Some(inner))?;
     Ok(Some(DownloadSettingsConfig { inner: Box::new(inner) }))
@@ -312,8 +332,9 @@ fn invalid(msg: impl AsRef<str>) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     // ===== 默认值 =====
 
@@ -341,7 +362,8 @@ mod tests {
         let m = to_memory_stream_config(Some(&json!({
             "network": "splithttp",
             "security": "reality"
-        }))).expect("ok");
+        })))
+        .expect("ok");
         assert_eq!(m.protocol_name, "splithttp");
         assert_eq!(m.security_type, "reality");
     }
@@ -357,7 +379,8 @@ mod tests {
                     { "type": "xdns" }
                 ]
             }
-        }))).expect("ok");
+        })))
+        .expect("ok");
         let tm = m.tcpmask_manager.expect("tcpmask_manager");
         assert_eq!(tm.masks.len(), 2);
         assert_eq!(tm.masks[0].mask_type, "mkcp-legacy");
@@ -386,7 +409,8 @@ mod tests {
                     { "type": "salamander", "settings": { "key": "abc" } }
                 ]
             }
-        }))).expect("ok");
+        })))
+        .expect("ok");
         let um = m.udpmask_manager.expect("udpmask_manager");
         assert_eq!(um.masks.len(), 1);
         assert_eq!(um.masks[0].mask_type, "salamander");
@@ -426,7 +450,8 @@ mod tests {
                     "maxIncomingStreams": 64
                 }
             }
-        }))).expect("ok");
+        })))
+        .expect("ok");
         let q = m.quic_params.expect("quic_params");
         assert_eq!(q.congestion, "Brutal");
         assert!(q.debug);
@@ -467,7 +492,8 @@ mod tests {
     fn quic_params_udp_hop_with_only_ports() {
         let m = to_memory_stream_config(Some(&json!({
             "finalmask": {"quicParams": {"udpHop": {"ports": [443]}}}
-        }))).unwrap();
+        })))
+        .unwrap();
         let q = m.quic_params.unwrap();
         assert_eq!(q.udp_hop.ports, vec![443]);
         assert_eq!(q.udp_hop.interval_min, 0);
@@ -490,7 +516,8 @@ mod tests {
                     ]
                 }
             }
-        }))).expect("ok");
+        })))
+        .expect("ok");
         let dl = m.download_settings.expect("download_settings");
         assert_eq!(dl.inner.protocol_name, "splithttp");
         assert_eq!(dl.inner.security_type, "none");

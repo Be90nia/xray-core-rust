@@ -15,8 +15,8 @@ use xray_buf::io::{Reader, Writer};
 /// # 示例
 ///
 /// ```
-/// use xray_transport::link::Link;
 /// use xray_buf::io::{Reader, Writer};
+/// use xray_transport::link::Link;
 ///
 /// fn build_link(reader: Box<dyn Reader>, writer: Box<dyn Writer>) -> Link {
 ///     Link::new(reader, writer)
@@ -51,8 +51,9 @@ impl std::fmt::Debug for Link {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use xray_buf::io::{new_reader, new_writer};
+
+    use super::*;
 
     #[test]
     fn link_new_stores_reader_writer() {
@@ -74,10 +75,7 @@ mod tests {
         let mb = link.reader.read_multi_buffer().await.expect("read ok");
         assert!(!mb.is_empty());
 
-        link.writer
-            .write_multi_buffer(mb)
-            .await
-            .expect("write ok");
+        link.writer.write_multi_buffer(mb).await.expect("write ok");
     }
 
     #[test]

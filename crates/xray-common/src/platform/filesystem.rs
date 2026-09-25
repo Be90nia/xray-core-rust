@@ -7,13 +7,14 @@
 //! `std::fs` 操作；Go `filepath.Localize`（Windows 下 `/` → `\`）无需
 //! 等价物——Windows API 与 Rust `Path` 两种分隔符均接受。
 
-use std::fs;
-use std::fs::File;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    fs::File,
+    io,
+    path::{Path, PathBuf},
+};
 
-use super::get_asset_location;
-use super::get_cert_location;
+use super::{get_asset_location, get_cert_location};
 
 /// 读取整个文件（Go `ReadFile`）。
 pub fn read_file(path: &Path) -> io::Result<Vec<u8>> {
@@ -44,11 +45,8 @@ pub fn resolve_asset(file: &str) -> io::Result<PathBuf> {
 
 /// 读取证书文件（Go `ReadCert`）：绝对路径直接读，否则相对证书目录。
 pub fn read_cert(file: &str) -> io::Result<Vec<u8>> {
-    let path = if Path::new(file).is_absolute() {
-        PathBuf::from(file)
-    } else {
-        get_cert_location(file)
-    };
+    let path =
+        if Path::new(file).is_absolute() { PathBuf::from(file) } else { get_cert_location(file) };
     fs::read(path)
 }
 
@@ -71,10 +69,7 @@ fn asset_file_location(file: &str) -> io::Result<(PathBuf, fs::Metadata)> {
     let path = get_asset_location(file);
     let meta = fs::metadata(&path)?;
     if !meta.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "asset is not a regular file",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "asset is not a regular file"));
     }
     Ok((path, meta))
 }
@@ -85,12 +80,8 @@ fn asset_file_location(file: &str) -> io::Result<(PathBuf, fs::Metadata)> {
 /// Windows 下额外拒绝盘符（`C:` / `C:\`）、UNC（`\\server\share`）
 /// 与 `NUL` 设备名（Go `filepath.isWindowsNulName`）。
 fn validate_local_name(file: &str) -> io::Result<()> {
-    let reject = || {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "asset path must stay in asset directory",
-        )
-    };
+    let reject =
+        || io::Error::new(io::ErrorKind::InvalidInput, "asset path must stay in asset directory");
     if file.is_empty() || file == "." {
         return Err(reject());
     }
@@ -159,10 +150,7 @@ mod tests {
         d.push(format!(
             "xray-fs-test-{}-{}-{label}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         d
     }
@@ -211,9 +199,8 @@ mod tests {
             "/geoip.dat",
             "/tmp/geoip.dat",
         ] {
-            let err = stat_asset(file)
-                .err()
-                .unwrap_or_else(|| panic!("expected error for {file:?}"));
+            let err =
+                stat_asset(file).err().unwrap_or_else(|| panic!("expected error for {file:?}"));
             assert!(
                 err.to_string().contains("must stay in asset directory"),
                 "guard must reject {file:?} before resolution, got: {err}"
@@ -226,15 +213,11 @@ mod tests {
 
         // Windows 盘符/UNC/反斜杠词法形态：守卫必须在解析前拒绝（Go 同语义）。
         #[cfg(windows)]
-        for file in [
-            r"C:\geoip.dat",
-            r"C:geoip.dat",
-            r"\\server\share\geoip.dat",
-            r"nested\..\geoip.dat",
-        ] {
-            let err = stat_asset(file)
-                .err()
-                .unwrap_or_else(|| panic!("expected error for {file:?}"));
+        for file in
+            [r"C:\geoip.dat", r"C:geoip.dat", r"\\server\share\geoip.dat", r"nested\..\geoip.dat"]
+        {
+            let err =
+                stat_asset(file).err().unwrap_or_else(|| panic!("expected error for {file:?}"));
             assert!(
                 err.to_string().contains("must stay in asset directory"),
                 "guard must reject {file:?} before resolution, got: {err}"
@@ -244,12 +227,9 @@ mod tests {
         // POSIX：反斜杠是合法文件名字符，同输入是合法相对路径 → 守卫放行，
         // 文件不存在仅要求报错（stat 兜底）。CI ubuntu 首跑实证语义分歧。
         #[cfg(not(windows))]
-        for file in [
-            r"C:\geoip.dat",
-            r"C:geoip.dat",
-            r"\\server\share\geoip.dat",
-            r"nested\..\geoip.dat",
-        ] {
+        for file in
+            [r"C:\geoip.dat", r"C:geoip.dat", r"\\server\share\geoip.dat", r"nested\..\geoip.dat"]
+        {
             assert!(
                 stat_asset(file).is_err(),
                 "posix: legal relative name must fall through to stat error: {file:?}"
@@ -263,26 +243,18 @@ mod tests {
     #[test]
     fn asset_roundtrip_from_env_dir() {
         with_env_dirs(|| {
-            let dir = PathBuf::from(
-                std::env::var("XRAY_LOCATION_ASSET").unwrap(),
-            );
+            let dir = PathBuf::from(std::env::var("XRAY_LOCATION_ASSET").unwrap());
             fs::write(dir.join("geoip.dat"), b"hello-geo").unwrap();
             fs::create_dir_all(dir.join("sub")).unwrap();
             fs::write(dir.join("sub").join("geosite.dat"), b"hello-site").unwrap();
 
             assert_eq!(read_asset("geoip.dat").unwrap(), b"hello-geo");
-            assert_eq!(
-                resolve_asset("geoip.dat").unwrap(),
-                dir.join("geoip.dat")
-            );
+            assert_eq!(resolve_asset("geoip.dat").unwrap(), dir.join("geoip.dat"));
             assert_eq!(stat_asset("geoip.dat").unwrap().len(), 9);
 
             let mut buf = String::new();
             use std::io::Read;
-            open_asset("geoip.dat")
-                .unwrap()
-                .read_to_string(&mut buf)
-                .unwrap();
+            open_asset("geoip.dat").unwrap().read_to_string(&mut buf).unwrap();
             assert_eq!(buf, "hello-geo");
 
             // 子目录相对路径合法（Go fs.ValidPath 允许嵌套）
@@ -301,8 +273,7 @@ mod tests {
     fn read_cert_relative_and_absolute() {
         // 相对：相对 XRAY_LOCATION_CERT
         with_env_dirs(|| {
-            let dir =
-                PathBuf::from(std::env::var("XRAY_LOCATION_CERT").unwrap());
+            let dir = PathBuf::from(std::env::var("XRAY_LOCATION_CERT").unwrap());
             fs::write(dir.join("ca.pem"), b"cert-bytes").unwrap();
             assert_eq!(read_cert("ca.pem").unwrap(), b"cert-bytes");
         });

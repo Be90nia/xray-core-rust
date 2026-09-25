@@ -17,14 +17,16 @@
 //! - [`driver`] — UDP driver task（UdpSocket + Tunnel + smoltcp pump）
 //! - [`netstack`] — smoltcp userspace 网络栈（IP 包 ↔ TCP/UDP socket）
 //! - [`peer`] — peer 会话管理（Tunnel + endpoint + 握手状态）
-//! - [`outbound`] — [`WireguardOutboundHandler`]（driver/netstack lazy-init 容器；
-//!   生产 dial 走 [`dispatcher::make_wireguard_dial_fn`](crate::dispatcher::make_wireguard_dial_fn)）
-//! - [`inbound`] — [`WireguardInboundHandler`] 实现 [`InboundHandler`](xray_features::inbound::InboundHandler)
+//! - [`outbound`] — [`WireguardOutboundHandler`]（driver/netstack lazy-init 容器； 生产 dial 走
+//!   [`dispatcher::make_wireguard_dial_fn`](crate::dispatcher::make_wireguard_dial_fn)）
+//! - [`inbound`] — [`WireguardInboundHandler`] 实现
+//!   [`InboundHandler`](xray_features::inbound::InboundHandler)
 //!
 //! 当前限制：dispatcher 桥接（smoltcp socket ↔ Xray router）留待后续切片。
 //! dial/start 能创建 socket 与 driver，但实际用户数据拷贝未接入。
 
 pub mod config;
+pub mod dispatcher;
 pub mod driver;
 pub mod error;
 pub mod inbound;
@@ -32,12 +34,12 @@ pub mod netstack;
 pub mod outbound;
 pub mod peer;
 pub mod tunnel;
-pub mod wireguard;
-pub mod dispatcher;
 pub mod users;
+pub mod wireguard;
 
 // 顶层 re-export。
 pub use config::{DeviceConfig, DomainStrategy, PeerConfig};
+pub use dispatcher::make_wireguard_dial_fn;
 pub use driver::WgDriver;
 pub use error::{Result, WgError};
 pub use inbound::WireguardInboundHandler;
@@ -45,6 +47,7 @@ pub use netstack::{TcpAcceptEvent, VirtualDevice, WgNetStack};
 pub use outbound::WireguardOutboundHandler;
 pub use peer::{PeerSession, SharedPeer};
 pub use tunnel::{Output as TunnelOutput, Tunnel};
-pub use wireguard::{ParsedEndpoints, create_ipc_request, parse_endpoints, SERVER_LISTEN_PORT_PLACEHOLDER};
-pub use dispatcher::make_wireguard_dial_fn;
 pub use users::{WgUser, WgUserRegistry};
+pub use wireguard::{
+    ParsedEndpoints, SERVER_LISTEN_PORT_PLACEHOLDER, create_ipc_request, parse_endpoints,
+};

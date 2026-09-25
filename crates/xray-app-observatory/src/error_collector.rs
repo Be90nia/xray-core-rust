@@ -13,9 +13,7 @@ pub struct ErrorCollector {
 
 impl ErrorCollector {
     pub fn new() -> Self {
-        Self {
-            errors: Mutex::new(Vec::new()),
-        }
+        Self { errors: Mutex::new(Vec::new()) }
     }
 
     /// 提交一个错误（仅记录字符串描述，避免泛化错误类型）。
@@ -86,7 +84,7 @@ mod tests {
         match err {
             ObservatoryError::UnderlyingConnectionError(msg) => {
                 assert!(msg.contains("connection refused"));
-            }
+            },
             _ => panic!("expected UnderlyingConnectionError"),
         }
     }
@@ -104,7 +102,7 @@ mod tests {
                 assert!(msg.contains("err2"));
                 assert!(msg.contains("err3"));
                 assert!(msg.contains(";"));
-            }
+            },
             _ => panic!("expected UnderlyingConnectionError"),
         }
     }
@@ -117,8 +115,7 @@ mod tests {
 
     #[test]
     fn thread_safe_concurrent_submit() {
-        use std::sync::Arc;
-        use std::thread;
+        use std::{sync::Arc, thread};
 
         let c = Arc::new(ErrorCollector::new());
         let handles: Vec<_> = (0..8)

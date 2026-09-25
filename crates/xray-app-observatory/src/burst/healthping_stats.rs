@@ -40,13 +40,7 @@ pub struct HealthPingRtts {
 impl HealthPingRtts {
     /// 创建容量为 `cap`、RTT 有效期为 `validity_nanos` 的缓冲。
     pub fn new(cap: usize, validity_nanos: i64) -> Self {
-        Self {
-            cap,
-            validity_nanos,
-            rtts: Vec::with_capacity(cap),
-            idx: 0,
-            initialized: false,
-        }
+        Self { cap, validity_nanos, rtts: Vec::with_capacity(cap), idx: 0, initialized: false }
     }
 
     /// 当前容量。
@@ -64,10 +58,7 @@ impl HealthPingRtts {
             self.idx = 0;
             self.initialized = true;
         }
-        self.rtts[self.idx] = PingRtt {
-            time: now_unix_nanos,
-            value,
-        };
+        self.rtts[self.idx] = PingRtt { time: now_unix_nanos, value };
         self.idx = (self.idx + 1) % self.cap;
     }
 
@@ -160,11 +151,7 @@ impl HealthPingRtts {
 
     /// 当前样本数（含 failed）。
     pub fn len(&self) -> usize {
-        if self.initialized {
-            self.cap
-        } else {
-            0
-        }
+        if self.initialized { self.cap } else { 0 }
     }
 
     pub fn is_empty(&self) -> bool {

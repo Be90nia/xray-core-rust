@@ -7,10 +7,13 @@
 //!
 //! `XorConn`（xor_mode==2）见 [`crate::encryption::xor_conn`]：header-only XOR 状态机。
 
-use crate::error::{Result, VlessError};
-use aes::cipher::{KeyIvInit, StreamCipher};
-use aes::Aes256;
+use aes::{
+    Aes256,
+    cipher::{KeyIvInit, StreamCipher},
+};
 use ctr::Ctr128BE;
+
+use crate::error::{Result, VlessError};
 
 /// BLAKE3 派生密钥的上下文（Go 端硬编码 `"VLESS"`）。
 const BLAKE3_CONTEXT: &str = "VLESS";
@@ -31,10 +34,7 @@ impl CtrXor {
     /// `iv` 长度不是 16 字节返回 [`VlessError::Other`]。
     pub fn new(key: &[u8], iv: &[u8]) -> Result<Self> {
         if iv.len() != 16 {
-            return Err(VlessError::Other(format!(
-                "CTR iv must be 16 bytes, got {}",
-                iv.len()
-            )));
+            return Err(VlessError::Other(format!("CTR iv must be 16 bytes, got {}", iv.len())));
         }
         let derived = blake3::derive_key(BLAKE3_CONTEXT, key);
         let cipher = Aes256Ctr::new_from_slices(&derived, iv)

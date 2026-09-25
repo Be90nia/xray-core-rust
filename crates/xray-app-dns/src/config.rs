@@ -16,8 +16,8 @@ use crate::error::DnsError;
 /// - `USE_IP = 0`：返回 IPv4 + IPv6
 /// - `USE_IP4 = 1`：仅返回 IPv4
 /// - `USE_IP6 = 2`：仅返回 IPv6
-/// - `USE_SYS = 3`：跟随系统偏好（业务层置 `check_system = true`；
-///   值对齐 Go `app/dns/config.proto:36`，此前误写 4）
+/// - `USE_SYS = 3`：跟随系统偏好（业务层置 `check_system = true`； 值对齐 Go
+///   `app/dns/config.proto:36`，此前误写 4）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 pub enum QueryStrategy {
@@ -80,11 +80,7 @@ pub use xray_features::dns::IpOption;
 #[must_use]
 pub const fn ip_option_from_strategy(s: QueryStrategy) -> IpOption {
     let (v4, v6) = s.ip_enables();
-    IpOption {
-        ipv4_enable: v4,
-        ipv6_enable: v6,
-        fake_enable: false,
-    }
+    IpOption { ipv4_enable: v4, ipv6_enable: v6, fake_enable: false }
 }
 
 /// 按 `override_strategy` 覆盖基线 `IpOption`。
@@ -105,7 +101,7 @@ pub fn resolve_ip_option_override(
                 ipv6_enable: v6 && base.ipv6_enable,
                 fake_enable: base.fake_enable,
             }
-        }
+        },
         None => base,
     }
 }
@@ -120,11 +116,8 @@ pub fn to_net_ip(addrs: &[Address]) -> Result<Vec<IpAddr>, DnsError> {
             Address::IPv4(v) => ips.push(IpAddr::V4(*v)),
             Address::IPv6(v) => ips.push(IpAddr::V6(*v)),
             other => {
-                return Err(FeaturesDnsError::Other(format!(
-                    "not an ip address: {other:?}"
-                ))
-                .into());
-            }
+                return Err(FeaturesDnsError::Other(format!("not an ip address: {other:?}")).into());
+            },
         }
     }
     Ok(ips)
@@ -195,11 +188,7 @@ mod tests {
 
     #[test]
     fn ip_option_is_empty_when_both_disabled() {
-        let o = IpOption {
-            ipv4_enable: false,
-            ipv6_enable: false,
-            fake_enable: true,
-        };
+        let o = IpOption { ipv4_enable: false, ipv6_enable: false, fake_enable: true };
         assert!(o.is_empty());
     }
 
@@ -221,11 +210,7 @@ mod tests {
 
     #[test]
     fn override_intersect_with_base_when_v6_disabled_in_base() {
-        let base = IpOption {
-            ipv4_enable: true,
-            ipv6_enable: false,
-            fake_enable: false,
-        };
+        let base = IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false };
         // 子 ns 想查 IPv6，但基线已禁用，结果 IPv6 仍禁用。
         let o = resolve_ip_option_override(base, Some(QueryStrategy::UseIp6));
         assert!(!o.ipv4_enable);
@@ -234,10 +219,8 @@ mod tests {
 
     #[test]
     fn to_net_ip_returns_addresses_in_order() {
-        let addrs = vec![
-            Address::IPv4(Ipv4Addr::new(1, 2, 3, 4)),
-            Address::IPv6(Ipv6Addr::LOCALHOST),
-        ];
+        let addrs =
+            vec![Address::IPv4(Ipv4Addr::new(1, 2, 3, 4)), Address::IPv6(Ipv6Addr::LOCALHOST)];
         let ips = to_net_ip(&addrs).unwrap();
         assert_eq!(ips.len(), 2);
         assert!(matches!(ips[0], IpAddr::V4(_)));

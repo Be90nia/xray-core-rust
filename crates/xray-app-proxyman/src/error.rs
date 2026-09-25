@@ -110,7 +110,6 @@ pub enum ProxymanError {
     #[error("unsupported UoT version")]
     UnsupportedUoTVersion,
 
-
     /// 其他错误（用于 trait/IO 边界占位）
     #[error("other: {0}")]
     Other(String),
@@ -183,10 +182,7 @@ mod tests {
 
     #[test]
     fn display_xudp_reject() {
-        assert_eq!(
-            ProxymanError::XudpRejectUdp443.to_string(),
-            "XUDP rejected UDP/443 traffic"
-        );
+        assert_eq!(ProxymanError::XudpRejectUdp443.to_string(), "XUDP rejected UDP/443 traffic");
     }
 
     #[test]

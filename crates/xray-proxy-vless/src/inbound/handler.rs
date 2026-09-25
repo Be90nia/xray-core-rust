@@ -6,18 +6,18 @@
 //!
 //! # 当前状态
 //!
-//! - **完整实现**：[`FallbackPolicy`]（`napfb[name][alpn][path]` 三级 map）+ 
+//! - **完整实现**：[`FallbackPolicy`]（`napfb[name][alpn][path]` 三级 map）+
 //!   [`extract_path_from_first_bytes`]（从 first buffer 字节 4 位置提取 path）。
 //!   这两个是纯算法，可独立单元测试。
 //! - **trait stub**：[`InboundProcessor::process`]（依赖 `xray_buf::BufferedReader`
 //!   + `tls.Conn` + `reality.ConnConnectionState` + retry + dispatcher 全链路）。
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
-
-use crate::error::{Result, VlessError};
-use crate::validator::Validator;
+use crate::{
+    error::{Result, VlessError},
+    validator::Validator,
+};
 
 /// Fallback 路由策略：`name → alpn → path → FallbackDest` 三级 map。
 ///
@@ -70,16 +70,8 @@ impl FallbackPolicy {
 
     /// 精确匹配（不做通配）。
     #[must_use]
-    pub fn find(
-        &self,
-        name: &str,
-        alpn: &str,
-        path: &str,
-    ) -> Option<&FallbackDest> {
-        self.entries
-            .get(name)
-            .and_then(|m| m.get(alpn))
-            .and_then(|m| m.get(path))
+    pub fn find(&self, name: &str, alpn: &str, path: &str) -> Option<&FallbackDest> {
+        self.entries.get(name).and_then(|m| m.get(alpn)).and_then(|m| m.get(path))
     }
 
     /// 按 Go 端 fallback 语义查找：先精确，再降级到空 name/alpn/path。
@@ -94,12 +86,7 @@ impl FallbackPolicy {
     /// 7. ("", "", path)
     /// 8. ("", "", "")
     #[must_use]
-    pub fn find_with_fallback(
-        &self,
-        name: &str,
-        alpn: &str,
-        path: &str,
-    ) -> Option<&FallbackDest> {
+    pub fn find_with_fallback(&self, name: &str, alpn: &str, path: &str) -> Option<&FallbackDest> {
         for (n, a, p) in [
             (name, alpn, path),
             (name, alpn, ""),
@@ -120,11 +107,7 @@ impl FallbackPolicy {
     /// 总规则数（所有 name × alpn × path 组合）。
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries
-            .values()
-            .flat_map(|m| m.values())
-            .map(|m| m.len())
-            .sum()
+        self.entries.values().flat_map(|m| m.values()).map(|m| m.len()).sum()
     }
 
     /// 是否为空。
@@ -134,8 +117,8 @@ impl FallbackPolicy {
     }
 }
 
-
-/// 从 first buffer 提取 HTTP path（已上移 `xray_transport::fallback`，re-export 保持模块 API）。
+/// 从 first buffer 提取 HTTP path（已上移 `xray_transport::fallback`，re-export 保持模块
+/// API）。
 pub use xray_transport::fallback::extract_path_from_first_bytes;
 
 // ---------------------------------------------------------------------------
@@ -168,15 +151,13 @@ impl InboundProcessor for StubProcessor {
         _conn: Box<dyn xray_transport::connection::Connection>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async {
-            Err(VlessError::NotImplemented(
-                "inbound Process requires full transport stack".into(),
-            ))
+            Err(VlessError::NotImplemented("inbound Process requires full transport stack".into()))
         })
     }
 }
 
 /// 真实入站处理器：委托给 `handle_connection` 执行 VLESS 握手 + dispatch。
-/// 
+///
 /// ponytail: fallback IO replay 未实现——需要 RecordingConnection 包装。
 /// 当前握手失败时直接返回错误。
 pub struct VlessInboundProcessor {
@@ -198,7 +179,6 @@ impl InboundProcessor for VlessInboundProcessor {
         })
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -311,5 +291,4 @@ mod tests {
         let path = extract_path_from_first_bytes(bytes).unwrap();
         assert_eq!(path, "/longpath");
     }
-
 }

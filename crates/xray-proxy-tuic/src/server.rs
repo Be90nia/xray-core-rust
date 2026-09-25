@@ -5,29 +5,31 @@
 //! 2. quinn Endpoint::server 监听，ALPN 协商 h3 + tuic
 //! 3. accept_uni → Authenticate 校验 token（export_keying_material）
 //! 4. accept_bi → Connect → tokio TCP dial 目标 → 双向 copy（true relay）
-//! 5. UDP Packet：quic 模式经 uni stream（spec 同模 open_uni 回包）、
-//!    native 模式经 QUIC DATAGRAM → per-assoc UDP 会话表（bd 1ur/7ry），
-//!    Dissociate 销毁会话
+//! 5. UDP Packet：quic 模式经 uni stream（spec 同模 open_uni 回包）、 native 模式经 QUIC DATAGRAM →
+//!    per-assoc UDP 会话表（bd 1ur/7ry）， Dissociate 销毁会话
 
-use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
-
 use xray_app_dispatcher::{DispatchHandler, UdpDispatchSession};
-use xray_common::net::address::Address as XAddress;
-use xray_common::net::destination::Destination;
-use xray_common::net::port::Port;
+use xray_common::net::{address::Address as XAddress, destination::Destination, port::Port};
 
-use crate::error::{Result, TuicError};
-use crate::protocol::command::{type_code, TOKEN_LEN};
-use crate::protocol::{Address, Command, Packet};
-use crate::udp::{quinn_read_exact_err, read_packet_payload};
+use crate::{
+    error::{Result, TuicError},
+    protocol::{
+        Address, Command, Packet,
+        command::{TOKEN_LEN, type_code},
+    },
+    udp::{quinn_read_exact_err, read_packet_payload},
+};
 
 /// 自签证书产物（仅 mock 用）。
 struct TlsCert {
@@ -38,15 +40,10 @@ struct TlsCert {
 fn gen_self_signed(server_name: &str) -> std::result::Result<TlsCert, rcgen::Error> {
     let mut params = CertificateParams::new(vec![server_name.to_string()])?;
     params.distinguished_name = DistinguishedName::new();
-    params
-        .distinguished_name
-        .push(DnType::CommonName, server_name);
+    params.distinguished_name.push(DnType::CommonName, server_name);
     let key_pair = KeyPair::generate()?;
     let cert = params.self_signed(&key_pair)?;
-    Ok(TlsCert {
-        cert_der: cert.der().to_vec(),
-        key_der: key_pair.serialize_der(),
-    })
+    Ok(TlsCert { cert_der: cert.der().to_vec(), key_der: key_pair.serialize_der() })
 }
 
 /// TUIC mock server。用于 loopback 测试，**不是生产 server**。
@@ -84,7 +81,9 @@ impl TuicMockServer {
         server_crypto.alpn_protocols = vec![b"h3".to_vec(), b"tuic".to_vec()];
 
         let quic_server_cfg = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
-            .map_err(|e| TuicError::Io(std::io::Error::other(format!("quinn rustls convert: {e}"))))?;
+            .map_err(|e| {
+                TuicError::Io(std::io::Error::other(format!("quinn rustls convert: {e}")))
+            })?;
         let server_crypto_arc = Arc::new(quic_server_cfg);
 
         let mut transport = quinn::TransportConfig::default();
@@ -101,12 +100,7 @@ impl TuicMockServer {
         )?;
 
         Ok((
-            Self {
-                endpoint,
-                expected_uuid: uuid,
-                password,
-                cert_der: tls.cert_der.clone(),
-            },
+            Self { endpoint, expected_uuid: uuid, password, cert_der: tls.cert_der.clone() },
             tls.cert_der,
         ))
     }
@@ -155,28 +149,25 @@ async fn handle_connection(
 ) -> Result<()> {
     let conn = incoming.await?;
 
-        // 生成 expected_token (对齐官方 tuic v5: label=UUID 16字节)
-        let mut expected_token = [0u8; TOKEN_LEN];
-        conn.export_keying_material(&mut expected_token, expected_uuid.as_bytes(), password.as_bytes())
-            .map_err(|_| TuicError::KeyingMaterialExport)?;
+    // 生成 expected_token (对齐官方 tuic v5: label=UUID 16字节)
+    let mut expected_token = [0u8; TOKEN_LEN];
+    conn.export_keying_material(&mut expected_token, expected_uuid.as_bytes(), password.as_bytes())
+        .map_err(|_| TuicError::KeyingMaterialExport)?;
     // accept_uni 读 Authenticate
     let mut uni = conn.accept_uni().await?;
     let cmd = read_authenticate(&mut uni).await?;
     match cmd {
-        crate::protocol::Command::Authenticate {
-            uuid_bytes,
-            token,
-        } => {
+        crate::protocol::Command::Authenticate { uuid_bytes, token } => {
             if uuid_bytes != *expected_uuid.as_bytes() || token != expected_token {
                 conn.close(1u32.into(), b"auth failed");
                 return Err(TuicError::Io(std::io::Error::other("auth failed")));
             }
-        }
+        },
         _ => {
             return Err(TuicError::Io(std::io::Error::other(
                 "first uni stream must be Authenticate",
             )));
-        }
+        },
     }
 
     // accept_bi + accept_uni + read_datagram 三路循环（bd 8hb + 7ry/1ur）：
@@ -220,18 +211,14 @@ async fn handle_connection(
 ///
 /// spec：datagram 承载完整命令帧（VER + TYPE + 负载）；Packet 路由到
 /// assoc 会话并以 datagram 模式回写，Heartbeat 等保活命令忽略。
-fn handle_datagram(
-    dg: &bytes::Bytes,
-    conn: &quinn::Connection,
-    table: &mut UdpAssocTable,
-) {
+fn handle_datagram(dg: &bytes::Bytes, conn: &quinn::Connection, table: &mut UdpAssocTable) {
     let mut cursor = &dg[..];
     match crate::protocol::parse_header(&mut cursor) {
         Ok(t) if t == type_code::PACKET => match Packet::read_payload(&mut cursor) {
             Ok(pkt) => table.handle_packet(pkt, ReplySink::Dgram(conn.clone())),
             Err(e) => tracing::debug!("tuic server: datagram packet parse: {e:?}"),
         },
-        Ok(_) => {} // Heartbeat 可走 datagram（spec），保活语义无需处理
+        Ok(_) => {}, // Heartbeat 可走 datagram（spec），保活语义无需处理
         Err(e) => tracing::debug!("tuic server: datagram header: {e:?}"),
     }
 }
@@ -251,12 +238,12 @@ async fn handle_bi_frame(send_bi: quinn::SendStream, recv_bi: quinn::RecvStream)
                     tracing::debug!("tuic relay {target}: {e:?}");
                 }
             });
-        }
-        Ok((_, _, _)) => {}
+        },
+        Ok((_, _, _)) => {},
         Err(e) => {
             // bi 收到 Packet（TYPE 0x02）等非 Connect 帧落此路径，忽略（spec，票 d1zr）
             tracing::debug!("tuic server: bi frame skipped/invalid: {e:?}");
-        }
+        },
     }
 }
 
@@ -274,10 +261,7 @@ pub(crate) enum UniFrame {
 /// 变长 Connect 只走 bi）循环累积到 [`Command::read_payload`] 可解析为止。
 pub(crate) async fn read_uni_frame(stream: &mut quinn::RecvStream) -> Result<UniFrame> {
     let mut vt = [0u8; 2];
-    stream
-        .read_exact(&mut vt)
-        .await
-        .map_err(quinn_read_exact_err)?;
+    stream.read_exact(&mut vt).await.map_err(quinn_read_exact_err)?;
     let mut vh: &[u8] = &vt;
     let type_byte = crate::protocol::parse_header(&mut vh)?;
     if type_byte == type_code::PACKET {
@@ -288,7 +272,7 @@ pub(crate) async fn read_uni_frame(stream: &mut quinn::RecvStream) -> Result<Uni
         let mut cursor: &[u8] = &buf;
         match Command::read_payload(type_byte, &mut cursor) {
             Ok(cmd) => return Ok(UniFrame::Command(cmd)),
-            Err(TuicError::UnexpectedEof(_)) => {}
+            Err(TuicError::UnexpectedEof(_)) => {},
             Err(e) => return Err(e),
         }
         let mut chunk = [0u8; 64];
@@ -313,9 +297,9 @@ pub(crate) async fn read_uni_frame(stream: &mut quinn::RecvStream) -> Result<Uni
 pub(crate) async fn read_authenticate(stream: &mut quinn::RecvStream) -> Result<Command> {
     match read_uni_frame(stream).await? {
         UniFrame::Command(cmd) => Ok(cmd),
-        UniFrame::Packet(_) => Err(TuicError::Io(std::io::Error::other(
-            "first uni stream must be Authenticate",
-        ))),
+        UniFrame::Packet(_) => {
+            Err(TuicError::Io(std::io::Error::other("first uni stream must be Authenticate")))
+        },
     }
 }
 
@@ -328,19 +312,18 @@ pub(crate) async fn handle_incoming_uni(
     ctx: &str,
 ) {
     match read_uni_frame(&mut uni).await {
-        Ok(UniFrame::Command(Command::Heartbeat)) => {}
+        Ok(UniFrame::Command(Command::Heartbeat)) => {},
         Ok(UniFrame::Command(Command::Dissociate { assoc_id })) => {
             udp_table.dissociate(assoc_id);
-        }
-        Ok(UniFrame::Command(_)) => {}
+        },
+        Ok(UniFrame::Command(_)) => {},
         Ok(UniFrame::Packet(pkt)) => {
             // 路由进 assoc 会话，响应由会话 task open_uni 回写（票 d1zr）
             udp_table.handle_packet(pkt, ReplySink::Uni(conn.clone()));
-        }
+        },
         Err(e) => tracing::debug!("{ctx}: uni stream read: {e:?}"),
     }
 }
-
 
 /// 真正的双向 relay：client ↔ (quinn bi) ↔ server ↔ (tcp) ↔ 目标。
 ///
@@ -424,12 +407,12 @@ impl ReplySink {
         match self {
             ReplySink::Dgram(c) => {
                 c.send_datagram(out.freeze()).map_err(TuicError::QuinnSendDatagram)?;
-            }
+            },
             ReplySink::Uni(c) => {
                 let mut uni = c.open_uni().await?;
                 uni.write_all(&out).await?;
                 let _ = uni.finish();
-            }
+            },
         }
         Ok(())
     }
@@ -453,11 +436,7 @@ pub(crate) struct UdpAssocTable {
 
 impl UdpAssocTable {
     pub(crate) fn new(dispatcher: Option<Arc<dyn DispatchHandler>>) -> Self {
-        Self {
-            dispatcher,
-            sessions: HashMap::new(),
-            frags: HashMap::new(),
-        }
+        Self { dispatcher, sessions: HashMap::new(), frags: HashMap::new() }
     }
 
     /// 路由一个客户端 Packet 到其 assoc 会话；无则新建。
@@ -471,23 +450,19 @@ impl UdpAssocTable {
         // 分片路径：喂给该 assoc 的 assembler，未到齐则缓存
         if pkt.frag_total > 1 {
             let assoc = pkt.assoc_id;
-            let assembler = self
-                .frags
-                .entry(assoc)
-                .or_insert_with(crate::protocol::FragmentAssembler::new);
+            let assembler =
+                self.frags.entry(assoc).or_insert_with(crate::protocol::FragmentAssembler::new);
             match assembler.feed(pkt) {
                 Ok(Some(complete)) => {
                     // 重组成功 → 走常规路由
                     self.route_packet(complete, sink);
-                }
+                },
                 Ok(None) => {
                     // 等待其他片
-                }
+                },
                 Err(e) => {
-                    tracing::debug!(
-                        "tuic udp relay: fragment assemble error assoc={assoc}: {e:?}"
-                    );
-                }
+                    tracing::debug!("tuic udp relay: fragment assemble error assoc={assoc}: {e:?}");
+                },
             }
             return;
         }
@@ -543,7 +518,7 @@ async fn udp_assoc_direct(assoc_id: u16, mut rx: tokio::sync::mpsc::Receiver<Udp
         Err(e) => {
             tracing::debug!("tuic udp assoc {assoc_id} bind: {e:?}");
             return;
-        }
+        },
     };
     let mut sink: Option<ReplySink> = None;
     let mut cur_pkt_id: u16 = 0;
@@ -657,9 +632,7 @@ async fn udp_assoc_dispatch(
 /// TUIC Address → UDP Destination（域名原样保留，由 outbound 解析）。
 pub(crate) fn tuic_addr_to_udp_dest(addr: &Address) -> Option<Destination> {
     match addr {
-        Address::Domain(d, p) => {
-            Some(Destination::udp(XAddress::Domain(d.clone()), Port::new(*p)))
-        }
+        Address::Domain(d, p) => Some(Destination::udp(XAddress::Domain(d.clone()), Port::new(*p))),
         Address::Ipv4(ip, p) => Some(Destination::udp(XAddress::IPv4(*ip), Port::new(*p))),
         Address::Ipv6(ip, p) => Some(Destination::udp(XAddress::IPv6(*ip), Port::new(*p))),
         Address::None => None,
@@ -690,10 +663,9 @@ async fn resolve_udp_dest(dest: &Destination) -> Option<SocketAddr> {
     match dest.address() {
         XAddress::IPv4(ip) => Some(SocketAddr::new(IpAddr::V4(*ip), port)),
         XAddress::IPv6(ip) => Some(SocketAddr::new(IpAddr::V6(*ip), port)),
-        XAddress::Domain(d) => tokio::net::lookup_host((d.as_str(), port))
-            .await
-            .ok()
-            .and_then(|mut i| i.next()),
+        XAddress::Domain(d) => {
+            tokio::net::lookup_host((d.as_str(), port)).await.ok().and_then(|mut i| i.next())
+        },
     }
 }
 
@@ -707,30 +679,32 @@ pub(crate) fn addr_to_socket_addr(addr: &crate::protocol::Address) -> Option<Soc
 
 #[cfg(test)]
 mod udp_assoc_tests {
-    use std::net::{Ipv4Addr, SocketAddr};
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::{
+        net::{Ipv4Addr, SocketAddr},
+        sync::Arc,
+        time::Duration,
+    };
 
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::UdpSocket;
+    use bytes::BufMut;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::UdpSocket,
+    };
     use uuid::Uuid;
-
-    use xray_app_dispatcher::default::PinFuture;
-    use xray_app_dispatcher::DispatchHandler;
+    use xray_app_dispatcher::{DispatchHandler, default::PinFuture};
+    use xray_common::net::{
+        address::Address as XAddress, destination::Destination, network::Network, port::Port,
+    };
     use xray_features::inbound::InboundHandler;
-    use xray_common::net::address::Address as XAddress;
-    use xray_common::net::destination::Destination;
-    use xray_common::net::network::Network;
-    use xray_common::net::port::Port;
     use xray_transport::link::Link;
 
-    use crate::client::{CongestionControl, TuicClient};
-    use crate::inbound::{TuicInboundConfig, TuicInboundHandler};
-    use crate::pool::QuinnConnectionPool;
-    use crate::protocol::command::type_code;
-    use crate::protocol::{Address, Command, Packet};
-    use bytes::BufMut;
-    use crate::server::TuicMockServer;
+    use crate::{
+        client::{CongestionControl, TuicClient},
+        inbound::{TuicInboundConfig, TuicInboundHandler},
+        pool::QuinnConnectionPool,
+        protocol::{Address, Command, Packet, command::type_code},
+        server::TuicMockServer,
+    };
 
     /// 普通 UDP echo server。
     async fn start_udp_echo() -> SocketAddr {
@@ -756,8 +730,7 @@ mod udp_assoc_tests {
             let mut buf = vec![0u8; 65_536];
             loop {
                 let Ok((n, peer)) = sock.recv_from(&mut buf).await else { break };
-                let resp =
-                    format!("{}|{}", peer.port(), String::from_utf8_lossy(&buf[..n]));
+                let resp = format!("{}|{}", peer.port(), String::from_utf8_lossy(&buf[..n]));
                 if sock.send_to(resp.as_bytes(), peer).await.is_err() {
                     break;
                 }
@@ -776,9 +749,7 @@ mod udp_assoc_tests {
         )
     }
 
-    async fn connect_mock(
-        password: &str,
-    ) -> (TuicClient, tokio::task::JoinHandle<()>) {
+    async fn connect_mock(password: &str) -> (TuicClient, tokio::task::JoinHandle<()>) {
         let uuid = Uuid::new_v4();
         let (server, cert_der) = TuicMockServer::bind(
             "127.0.0.1:0".parse().expect("parse addr"),
@@ -817,6 +788,7 @@ mod udp_assoc_tests {
         fn tag(&self) -> &str {
             "capture"
         }
+
         fn dispatch(&self, dest: &Destination, link: Link) -> PinFuture<()> {
             self.0.lock().push(dest.clone());
             Box::pin(async move {
@@ -835,6 +807,7 @@ mod udp_assoc_tests {
         fn tag(&self) -> &str {
             "echo"
         }
+
         fn dispatch(&self, _dest: &Destination, link: Link) -> PinFuture<()> {
             Box::pin(async move {
                 use xray_buf::io::{Reader, Writer};
@@ -956,9 +929,7 @@ mod udp_assoc_tests {
         let assoc = client.dial_udp(0x0DD0);
         let target = Address::Domain("example.invalid".to_string(), 53);
         // 无 echo handler：预期超时，仅验证 dest 送达 dispatch
-        let _ = assoc
-            .send_recv(target, b"dns-q", Some(Duration::from_millis(500)))
-            .await;
+        let _ = assoc.send_recv(target, b"dns-q", Some(Duration::from_millis(500))).await;
 
         for _ in 0..50 {
             if store.lock().len() >= 1 {
@@ -995,9 +966,7 @@ mod udp_assoc_tests {
         let assoc_id = 0x0D55;
         let assoc = client.dial_udp(assoc_id);
         let target = Address::Ipv4(Ipv4Addr::new(127, 0, 0, 1), 9);
-        let _ = assoc
-            .send_recv(target.clone(), b"a", Some(Duration::from_millis(500)))
-            .await;
+        let _ = assoc.send_recv(target.clone(), b"a", Some(Duration::from_millis(500))).await;
         for _ in 0..50 {
             if store.lock().len() >= 1 {
                 break;
@@ -1015,9 +984,7 @@ mod udp_assoc_tests {
         let _ = uni.finish();
 
         // 同 assoc 再发包 → 新会话
-        let _ = assoc
-            .send_recv(target, b"b", Some(Duration::from_millis(500)))
-            .await;
+        let _ = assoc.send_recv(target, b"b", Some(Duration::from_millis(500))).await;
         for _ in 0..50 {
             if store.lock().len() >= 2 {
                 break;
@@ -1057,8 +1024,7 @@ mod udp_assoc_tests {
 
         // ② bi-stream Packet 被忽略（无响应 → 读端超时）
         let pkt = Packet::new(0x0A11, 999, target, bytes::Bytes::from_static(b"bi ping"));
-        let (mut send, mut recv) =
-            client.quinn_conn().open_bi().await.expect("open bi");
+        let (mut send, mut recv) = client.quinn_conn().open_bi().await.expect("open bi");
         let mut buf = bytes::BytesMut::with_capacity(pkt.encoded_len() + 2);
         buf.put_u8(VERSION);
         buf.put_u8(type_code::PACKET);
@@ -1095,12 +1061,9 @@ mod udp_assoc_tests {
     #[tokio::test]
     async fn inbound_with_hysteria_bbr_cc_connects_and_relays() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = connect_inbound(
-            Arc::new(EchoHandler),
-            "cc-e2e",
-            Some(CongestionControl::HysteriaBbr),
-        )
-        .await;
+        let client =
+            connect_inbound(Arc::new(EchoHandler), "cc-e2e", Some(CongestionControl::HysteriaBbr))
+                .await;
 
         // bi stream Connect → 写数据 → dispatch echo 回来 = relay 双向活
         let mut conn = client
@@ -1121,15 +1084,16 @@ mod udp_assoc_tests {
 /// TLS 证书验证 + 连接选项 e2e（bd 7p0）。
 #[cfg(test)]
 mod tls_connect_tests {
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
     use uuid::Uuid;
 
-    use crate::error::TuicError;
-    use crate::client::{CongestionControl, TuicClient, TuicConnectOptions};
-    use crate::pool::QuinnConnectionPool;
-    use crate::server::TuicMockServer;
+    use crate::{
+        client::{CongestionControl, TuicClient, TuicConnectOptions},
+        error::TuicError,
+        pool::QuinnConnectionPool,
+        server::TuicMockServer,
+    };
 
     /// 验证路径必须拒绝自签证书：空 trust store 的客户端握手失败
     /// （等效 webpki-only 根对自签的行为——默认路径不再是 NoVerifier）。
@@ -1146,7 +1110,9 @@ mod tls_connect_tests {
         .await
         .expect("mock server bind");
         let addr = server.local_addr();
-        tokio::spawn(async move { let _ = server.run().await; });
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
 
         let cfg = Arc::new(
             rustls::ClientConfig::builder()
@@ -1157,7 +1123,14 @@ mod tls_connect_tests {
         // 故超时预算 45s；断言最终以 UnknownIssuer 类 TLS 错误拒绝
         let res = tokio::time::timeout(
             Duration::from_secs(45),
-            TuicClient::connect(addr, "localhost", uuid, "tls-reject", cfg, QuinnConnectionPool::new()),
+            TuicClient::connect(
+                addr,
+                "localhost",
+                uuid,
+                "tls-reject",
+                cfg,
+                QuinnConnectionPool::new(),
+            ),
         )
         .await;
         assert!(
@@ -1182,7 +1155,9 @@ mod tls_connect_tests {
         .await
         .expect("mock server bind");
         let addr = server.local_addr();
-        tokio::spawn(async move { let _ = server.run().await; });
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
 
         let mut root_store = rustls::RootCertStore::empty();
         root_store.add(cert_der.to_vec().into()).expect("add cert");
@@ -1233,9 +1208,6 @@ mod tls_connect_tests {
         )
         .await
         .expect("connect timed out");
-        assert!(
-            res.is_err(),
-            "user-supplied ALPN must be honored, not clobbered by default"
-        );
+        assert!(res.is_err(), "user-supplied ALPN must be honored, not clobbered by default");
     }
 }

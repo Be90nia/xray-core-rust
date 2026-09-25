@@ -7,8 +7,10 @@
 
 use std::io::Read;
 
-use crate::config::Config;
-use crate::error::{ConfError, Result};
+use crate::{
+    config::Config,
+    error::{ConfError, Result},
+};
 
 /// 从 reader 解析 YAML 配置。
 pub fn decode_yaml(reader: impl Read) -> Result<Config> {

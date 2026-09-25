@@ -4,8 +4,7 @@
 
 use std::sync::Arc;
 
-use crate::config::ObservationResult;
-use crate::error::ObservatoryError;
+use crate::{config::ObservationResult, error::ObservatoryError};
 
 /// ObservationProvider trait：暴露当前观测快照。
 ///
@@ -59,10 +58,8 @@ impl ObservatoryService for DefaultObservatoryService {
 pub struct ObservatoryServiceDescriptor;
 
 impl ObservatoryServiceDescriptor {
-    pub const SERVICE_NAME: &'static str = "xray.core.app.observatory.ObservatoryService";
-
     pub const LEGACY_SERVICE_NAME: &'static str = "v2ray.core.app.observatory.ObservatoryService";
-
+    pub const SERVICE_NAME: &'static str = "xray.core.app.observatory.ObservatoryService";
     pub const TYPE_URL: &'static str = "xray.core.app.observatory.command.Config";
 }
 
@@ -78,11 +75,7 @@ mod tests {
 
     impl ObservationProvider for FixedProvider {
         fn get_observation(&self) -> Result<ObservationResult, ObservatoryError> {
-            if self.fail {
-                Err(ObservatoryError::NoObservation)
-            } else {
-                Ok(self.result.clone())
-            }
+            if self.fail { Err(ObservatoryError::NoObservation) } else { Ok(self.result.clone()) }
         }
     }
 
@@ -99,12 +92,11 @@ mod tests {
     #[test]
     fn noop_registrar_always_ok() {
         let r = NoopObservatoryServiceRegistrar;
-        let svc: Arc<dyn ObservatoryService> = Arc::new(DefaultObservatoryService::new(
-            Arc::new(FixedProvider {
+        let svc: Arc<dyn ObservatoryService> =
+            Arc::new(DefaultObservatoryService::new(Arc::new(FixedProvider {
                 result: ObservationResult::default(),
                 fail: false,
-            }),
-        ));
+            })));
         assert!(r.register_observatory_service(svc).is_ok());
     }
 
@@ -129,10 +121,7 @@ mod tests {
 
     #[test]
     fn default_service_propagates_provider_error() {
-        let provider = Arc::new(FixedProvider {
-            result: ObservationResult::default(),
-            fail: true,
-        });
+        let provider = Arc::new(FixedProvider { result: ObservationResult::default(), fail: true });
         let svc = DefaultObservatoryService::new(provider);
         let err = svc.get_outbound_status().unwrap_err();
         assert!(matches!(err, ObservatoryError::NoObservation));

@@ -9,22 +9,21 @@
 //! skip 初值（Go 握手末段 `NewXorConn` 调用点）：
 //! - client 1-RTT：`(0, 0)`（下行 padding 已在握手期被 client 消费）
 //! - server 1-RTT：`(0, 0)`
-//! - client 0-RTT：`(0, 16)`，读侧 CTR 延迟建立（iv = 下行头 16B serverRandom，
-//!   Go common.go:90-92 回填 PeerCTR）
+//! - client 0-RTT：`(0, 16)`，读侧 CTR 延迟建立（iv = 下行头 16B serverRandom， Go common.go:90-92
+//!   回填 PeerCTR）
 //! - server 0-RTT：`(16, 0)`（首写 16B PreWrite 透传，写 CTR iv = PreWrite）
 
-use std::io;
-use std::pin::Pin;
-use std::task::ready;
-use std::task::{Context, Poll};
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll, ready},
+};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::encryption::xor::CtrXor;
-use crate::encryption::{EncryptionConn, Result};
+use crate::encryption::{EncryptionConn, Result, xor::CtrXor};
 
 const RECORD_HEADER_LEN: usize = 5;
-
 
 pub struct XorConn<IO> {
     inner: IO,
@@ -196,9 +195,7 @@ where
                 }
             }
         }
-        self.read_ctr
-            .as_mut()
-            .expect("read ctr set at construction or derived from first 16 bytes")
+        self.read_ctr.as_mut().expect("read ctr set at construction or derived from first 16 bytes")
     }
 
     /// 写出密文残余。Poll 语义与标准 AsyncWrite 一致。
@@ -213,7 +210,7 @@ where
                         io::ErrorKind::WriteZero,
                         "inner conn accepted 0 bytes",
                     )));
-                }
+                },
                 Poll::Ready(Ok(n)) => {
                     let new_sent = sent + n;
                     if new_sent == end {
@@ -222,14 +219,13 @@ where
                         self.write_pending = Some((new_sent, end));
                         return Poll::Pending;
                     }
-                }
+                },
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
         }
         Poll::Ready(Ok(()))
     }
-
 }
 
 fn header_len_field(h: &[u8; RECORD_HEADER_LEN]) -> usize {
@@ -263,7 +259,7 @@ where
                     this.xor_read(&mut buf.filled_mut()[filled_before..filled_after]);
                 }
                 Poll::Ready(Ok(()))
-            }
+            },
             other => other,
         }
     }
@@ -313,13 +309,13 @@ where
                         io::ErrorKind::WriteZero,
                         "inner conn accepted 0 bytes",
                     )));
-                }
+                },
                 Poll::Ready(Ok(n)) => {
                     sent += n;
                     if sent == end {
                         return Poll::Ready(Ok(buf.len()));
                     }
-                }
+                },
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 // 部分写/零写后 Pending：inner 已用当前 cx 注册写 waker，残余密文
                 // 由后续 poll_read / poll_flush / 下次 poll_write 清出。write_buf
@@ -327,7 +323,7 @@ where
                 Poll::Pending => {
                     this.write_pending = Some((sent, end));
                     return Poll::Ready(Ok(buf.len()));
-                }
+                },
             }
         }
     }
@@ -349,9 +345,7 @@ impl<IO> EncryptionConn for XorConn<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + Sync,
 {
-    fn close(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+    fn close(&mut self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
             use tokio::io::AsyncWriteExt;
             self.flush().await?;
@@ -363,13 +357,14 @@ where
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
     use super::*;
-    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 
     const KEY: [u8; 32] = [
-        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
-        0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
-        0x1c, 0x1d, 0x1e, 0x1f,
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f,
     ];
 
     /// 三条 record（body 27×0x01 / 300×0x02 / 16×0x03）拼成的明文流。
@@ -382,7 +377,6 @@ mod tests {
         v
     }
 
-
     /// Go 真值 fixture（D:/tmp/goenc/main.go 生成：lukechampine.com/blake3
     /// DeriveKey("VLESS") + crypto/aes-256-CTR，与 Go proxy/vless/encryption/xor.go
     /// 完全同链路）。每行：
@@ -392,16 +386,20 @@ mod tests {
     #[test]
     fn go_fixture_write_and_read() {
         fn unhex(s: &str) -> Vec<u8> {
-            (0..s.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-                .collect()
+            (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
         }
         let data = include_str!("testdata/xor_conn_go_fixture.txt");
         for line in data.lines().filter(|l| !l.is_empty()) {
             let f: Vec<&str> = line.split_whitespace().collect();
-            let (name, out_skip, in_skip, write_iv, read_iv, plain, wire) =
-                (f[0], f[1].parse::<usize>().unwrap(), f[2].parse::<usize>().unwrap(), unhex(f[3]), f[4], unhex(f[5]), unhex(f[6]));
+            let (name, out_skip, in_skip, write_iv, read_iv, plain, wire) = (
+                f[0],
+                f[1].parse::<usize>().unwrap(),
+                f[2].parse::<usize>().unwrap(),
+                unhex(f[3]),
+                f[4],
+                unhex(f[5]),
+                unhex(f[6]),
+            );
             let key: &[u8] = &KEY;
 
             // 写侧：按 fixture 的 skip 初值，整条流一次 XOR 后与 Go wire 逐字节比对。
@@ -455,10 +453,7 @@ mod tests {
     #[test]
     fn go_fixture_fragmented_split_skip() {
         fn unhex(s: &str) -> Vec<u8> {
-            (0..s.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-                .collect()
+            (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
         }
         let line = include_str!("testdata/xor_conn_go_fixture.txt")
             .lines()

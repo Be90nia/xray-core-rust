@@ -3,6 +3,7 @@
 //! 对应 Go `app/log/log.go` 的 `ParseMaskAddress` 与 `MaskedMsgWrapper.String`。
 
 use std::sync::LazyLock;
+
 use regex::Regex;
 
 use crate::error::LogError;
@@ -50,7 +51,7 @@ pub fn parse_mask_address(spec: &str) -> Result<(i32, i32), LogError> {
                 }
             }
             (local_m4, local_m6)
-        }
+        },
     };
 
     if m4 < 0 || m4 > 32 || m4 % 8 != 0 {

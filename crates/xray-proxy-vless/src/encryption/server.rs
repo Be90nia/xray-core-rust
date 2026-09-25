@@ -8,8 +8,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::encryption::ServerInstance;
-    use crate::error::VlessError;
+    use crate::{encryption::ServerInstance, error::VlessError};
 
     #[test]
     fn server_init_empty_keys_rejected() {

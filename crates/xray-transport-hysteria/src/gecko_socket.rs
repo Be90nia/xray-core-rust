@@ -10,14 +10,13 @@
 //! 的 [`GeckoConn`]（rpn-B 已落地并测试），本模块只做异步 `UdpIo` → quinn
 //! poll 式 [`AsyncUdpSocket`] 的桥接：
 //!
-//! - 发送 `try_send`：把 datagram 推给发送 driver task（有界队列，满载即丢——
-//!   QUIC 按 UDP 语义容忍丢包，对齐 `PacketIoConn` fire-and-forget 先例），
-//!   driver 经 `GeckoConn::send_to` 变换后写底层 socket。
-//! - 接收 `poll_recv`：driver 持续 `GeckoConn::recv_from`（内部分片重组直到
-//!   凑齐一包），完整包经 unbounded channel 交给 poll_recv 零阻塞取出。
-//! - 生命周期：两个 driver task 都持有 `Arc<GeckoConn>`；`GeckoSocket` drop 时
-//!   发送队列关闭 + watch 信号触发，driver 退出 → `GeckoConn` 归还 → GC task
-//!   被 abort，底层 socket 引用归零自动关闭。
+//! - 发送 `try_send`：把 datagram 推给发送 driver task（有界队列，满载即丢—— QUIC 按 UDP
+//!   语义容忍丢包，对齐 `PacketIoConn` fire-and-forget 先例）， driver 经 `GeckoConn::send_to`
+//!   变换后写底层 socket。
+//! - 接收 `poll_recv`：driver 持续 `GeckoConn::recv_from`（内部分片重组直到 凑齐一包），完整包经
+//!   unbounded channel 交给 poll_recv 零阻塞取出。
+//! - 生命周期：两个 driver task 都持有 `Arc<GeckoConn>`；`GeckoSocket` drop 时 发送队列关闭 + watch
+//!   信号触发，driver 退出 → `GeckoConn` 归还 → GC task 被 abort，底层 socket 引用归零自动关闭。
 //!
 //! GSO/GRO/ECN 不透传（同 `crate::salamander_socket::SalamanderSocket`）：
 //! `may_fragment()` 保持默认 true，quinn 关闭路径 MTU 探测（Gecko 分片每包
@@ -28,8 +27,10 @@ use std::{
     io::IoSliceMut,
     net::SocketAddr,
     pin::Pin,
-    sync::Arc,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll},
 };
 
@@ -39,10 +40,14 @@ use quinn::{
     AsyncUdpSocket, UdpPoller,
     udp::{RecvMeta, Transmit},
 };
-use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, watch};
-use xray_transport::finalmask::salamander_gecko::{GeckoConfig, GeckoConn};
-use xray_transport::finalmask::{UDP_SIZE, UdpIo};
+use tokio::{
+    net::UdpSocket,
+    sync::{mpsc, watch},
+};
+use xray_transport::finalmask::{
+    UDP_SIZE, UdpIo,
+    salamander_gecko::{GeckoConfig, GeckoConn},
+};
 
 /// 发送队列容量：driver 消费不及时丢新包（QUIC 容忍），杜绝无界增长。
 /// 对齐 `finalmask::PACKET_QUEUE_CAP` 的 UDP 语义先例。
@@ -94,7 +99,13 @@ impl GeckoSocket {
         spawn_send_driver(conn.clone(), send_rx);
         spawn_recv_driver(conn, recv_tx, closed_rx, Arc::clone(&dropped));
 
-        Ok(Arc::new(Self { io, send_tx, recv_rx: Mutex::new(recv_rx), dropped, _closed_tx: closed_tx }))
+        Ok(Arc::new(Self {
+            io,
+            send_tx,
+            recv_rx: Mutex::new(recv_rx),
+            dropped,
+            _closed_tx: closed_tx,
+        }))
     }
 
     /// 构造注入 quinn 用的 endpoint（client 侧，`server_config = None`）。
@@ -171,11 +182,12 @@ impl AsyncUdpSocket for GeckoSocket {
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
         if transmit.segment_size.is_some() {
             // max_transmit_segments()==1 时 quinn 不应构造多段 Transmit
-            return Err(io::Error::other(
-                "gecko socket: multi-segment (GSO) transmit unsupported",
-            ));
+            return Err(io::Error::other("gecko socket: multi-segment (GSO) transmit unsupported"));
         }
-        match self.send_tx.try_send((Bytes::copy_from_slice(transmit.contents), transmit.destination)) {
+        match self
+            .send_tx
+            .try_send((Bytes::copy_from_slice(transmit.contents), transmit.destination))
+        {
             Ok(()) => Ok(()),
             // 队列满：丢包（UDP 缓冲满即丢的内核语义；QUIC 重传兜底）+ 计数
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -200,8 +212,7 @@ impl AsyncUdpSocket for GeckoSocket {
             Poll::Ready(Some((data, addr))) => {
                 let len = data.len().min(bufs[0].len());
                 bufs[0][..len].copy_from_slice(&data[..len]);
-                meta[0] =
-                    RecvMeta { addr, len, stride: len, ecn: None, dst_ip: None };
+                meta[0] = RecvMeta { addr, len, stride: len, ecn: None, dst_ip: None };
                 Poll::Ready(Ok(1))
             },
             // 所有 GeckoSocket 已 drop
@@ -274,12 +285,20 @@ mod tests {
 
     #[tokio::test]
     async fn long_header_fragments_and_reassembles_roundtrip() {
-        let a = GeckoSocket::bind(&gecko_cfg("shared-psk-1", 512, 1200), "127.0.0.1:0".parse().unwrap(), &Default::default())
-            .await
-            .unwrap();
-        let b = GeckoSocket::bind(&gecko_cfg("shared-psk-1", 512, 1200), "127.0.0.1:0".parse().unwrap(), &Default::default())
-            .await
-            .unwrap();
+        let a = GeckoSocket::bind(
+            &gecko_cfg("shared-psk-1", 512, 1200),
+            "127.0.0.1:0".parse().unwrap(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        let b = GeckoSocket::bind(
+            &gecko_cfg("shared-psk-1", 512, 1200),
+            "127.0.0.1:0".parse().unwrap(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
 
         // QUIC 长头形态：顶位 set；1200B（> 默认 max_pkt=1200 分片阈值形态）
         let mut plain = vec![0u8; 1200];
@@ -305,10 +324,13 @@ mod tests {
 
     #[tokio::test]
     async fn long_header_writes_multiple_wire_datagrams() {
-        let sock =
-            GeckoSocket::bind(&gecko_cfg("unit-test-psk", 512, 1200), "127.0.0.1:0".parse().unwrap(), &Default::default())
-                .await
-                .unwrap();
+        let sock = GeckoSocket::bind(
+            &gecko_cfg("unit-test-psk", 512, 1200),
+            "127.0.0.1:0".parse().unwrap(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
         let peer = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).await.unwrap();
 
         let mut plain = vec![0u8; 1200];
@@ -318,8 +340,9 @@ mod tests {
         // 读 wire：分片数随机 [2,8]，逐帧剥 salt+XOR 后按 decode_frame 校验并重组。
         // 这是与 xray_transport::finalmask::salamander_gecko 帧 primitives 的字节级对拍：
         // GeckoSocket 发出的 wire 包必须能被同一套 Go 对齐的 encode/decode 原语解开。
-        let obfs = xray_transport::finalmask::salamander::SalamanderObfuscator::new(b"unit-test-psk")
-            .unwrap();
+        let obfs =
+            xray_transport::finalmask::salamander::SalamanderObfuscator::new(b"unit-test-psk")
+                .unwrap();
         let mut wire = vec![0u8; 64 * 1024];
         let mut frames: Vec<(u8, u8, Vec<u8>)> = Vec::new(); // (chunk_idx, total, payload)
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
@@ -336,11 +359,7 @@ mod tests {
                             &plain_buf[..payload_len],
                         )
                         .expect("wire packet must be a valid gecko frame");
-                    frames.push((
-                        h.chunk_idx,
-                        h.total_chunks,
-                        plain_buf[start..end].to_vec(),
-                    ));
+                    frames.push((h.chunk_idx, h.total_chunks, plain_buf[start..end].to_vec()));
                 },
                 _ => break,
             }
@@ -371,12 +390,20 @@ mod tests {
 
     #[tokio::test]
     async fn psk_mismatch_never_yields_plaintext() {
-        let a = GeckoSocket::bind(&gecko_cfg("psk-client-side", 512, 1200), "127.0.0.1:0".parse().unwrap(), &Default::default())
-            .await
-            .unwrap();
-        let b = GeckoSocket::bind(&gecko_cfg("psk-server-side", 512, 1200), "127.0.0.1:0".parse().unwrap(), &Default::default())
-            .await
-            .unwrap();
+        let a = GeckoSocket::bind(
+            &gecko_cfg("psk-client-side", 512, 1200),
+            "127.0.0.1:0".parse().unwrap(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        let b = GeckoSocket::bind(
+            &gecko_cfg("psk-server-side", 512, 1200),
+            "127.0.0.1:0".parse().unwrap(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
 
         let plain = b"\x40top-secret-payload-must-not-leak";
         try_send_to(&a, plain, b.local_addr().unwrap()).await;

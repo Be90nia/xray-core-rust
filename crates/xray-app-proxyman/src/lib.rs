@@ -6,7 +6,8 @@
 //!
 //! 业务核心（独立可测）：
 //! - [`config::SniffingRequest`] 与 [`config::build_sniffing_request`] — 嗅探配置解析
-//! - [`inbound::InboundManager`] / [`outbound::OutboundManager`] — handler 注册表（HashMap + RwLock）
+//! - [`inbound::InboundManager`] / [`outbound::OutboundManager`] — handler 注册表（HashMap +
+//!   RwLock）
 //! - [`inbound::AlwaysOnInboundHandler`] / [`outbound::OutboundHandlerEntry`] — handler 配置载体
 //! - [`outbound::parse_random_ip`] — CIDR 子网随机 IP
 //! - 流量计数器命名规则（[`stats::counter_name`]）
@@ -15,7 +16,8 @@
 //!
 //! IO 边界（trait + NotImplemented 占位）：
 //! - worker 创建（TCP/UDP/Unix listener）— 依赖 `xray_transport::Listener` + xray-mux
-//! - `outbound::OutboundHandlerEntry` 的 `dispatch`/`dial` — 依赖 `transport.Link` + 代理 + mux + xudp + DNS
+//! - `outbound::OutboundHandlerEntry` 的 `dispatch`/`dial` — 依赖 `transport.Link` + 代理 + mux +
+//!   xudp + DNS
 //! - UoT ([`outbound::OutboundHandlerEntry::get_uo_t_connection`]) — UDP over TCP 桥接
 //! - gRPC server 注册 — 依赖 tonic + xray-app-commander
 //! - TypedMessage 操作解码 — 由上层注入 [`command::OperationDecoder`] 实现
@@ -29,8 +31,13 @@ pub mod stats;
 
 pub use config::{SniffingRequest, build_sniffing_request};
 pub use error::ProxymanError;
-pub use inbound::{AlwaysOnInboundHandler, InboundHandler, InboundManager, PinFuture};
-pub use inbound::worker::{ProxyInbound, InboundConn, Worker, TcpWorker, UdpWorker, DsWorker, UdpSession};
-pub use outbound::uot::{UotClientConn, UotServerConn};
-pub use outbound::{OutboundHandler, OutboundManager, OutboundHandlerEntry, OutboundDialer, ProxyOutbound, UotVersion, parse_random_ip};
+pub use inbound::{
+    AlwaysOnInboundHandler, InboundHandler, InboundManager, PinFuture,
+    worker::{DsWorker, InboundConn, ProxyInbound, TcpWorker, UdpSession, UdpWorker, Worker},
+};
+pub use outbound::{
+    OutboundDialer, OutboundHandler, OutboundHandlerEntry, OutboundManager, ProxyOutbound,
+    UotVersion, parse_random_ip,
+    uot::{UotClientConn, UotServerConn},
+};
 pub use stats::{Counter, HandlerKind, NoopStatsProvider, StatsProvider, TrafficDirection};

@@ -5,9 +5,7 @@
 //! - [`SimpleSegmentWriter`]：buffered 单 segment 写，对应 Go 同名 struct。
 //! - [`RetryableWriter`]：5 次 100ms 间隔重试包装，对应 Go 同名 struct。
 
-use std::io;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{io, sync::Arc, time::Duration};
 
 use parking_lot::Mutex;
 
@@ -44,9 +42,7 @@ pub trait UnderlyingWriter: Send + Sync {
 impl<W: UnderlyingWriter> SimpleSegmentWriter<W> {
     /// 构造（对应 Go `NewSegmentWriter`）。
     pub fn new(writer: W) -> Self {
-        Self {
-            inner: Mutex::new(Inner { writer }),
-        }
+        Self { inner: Mutex::new(Inner { writer }) }
     }
 
     /// 借用底层 writer（用于 Close / 状态查询）。
@@ -81,20 +77,12 @@ pub struct RetryableWriter {
 impl RetryableWriter {
     /// 构造（对应 Go `NewRetryableWriter`，默认 5 次 100ms）。
     pub fn new(inner: Arc<dyn SegmentWriter>) -> Self {
-        Self {
-            inner,
-            retries: 5,
-            interval: Duration::from_millis(100),
-        }
+        Self { inner, retries: 5, interval: Duration::from_millis(100) }
     }
 
     /// 自定义重试参数。
     pub fn with_retries(inner: Arc<dyn SegmentWriter>, retries: u32, interval: Duration) -> Self {
-        Self {
-            inner,
-            retries,
-            interval,
-        }
+        Self { inner, retries, interval }
     }
 }
 
@@ -107,7 +95,7 @@ impl SegmentWriter for RetryableWriter {
                 Err(e) => {
                     last_err = Some(e);
                     std::thread::sleep(self.interval);
-                }
+                },
             }
         }
         Err(last_err.unwrap_or_else(|| io::Error::other("retry exhausted")))
@@ -146,7 +134,6 @@ impl CollectWriter {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,8 +163,7 @@ mod tests {
     #[test]
     fn retryable_writer_succeeds_first_try() {
         let collect: std::sync::Arc<CollectWriter> = std::sync::Arc::new(CollectWriter::default());
-        let inner: Arc<dyn SegmentWriter> =
-            Arc::new(SimpleSegmentWriter::new(collect.clone()));
+        let inner: Arc<dyn SegmentWriter> = Arc::new(SimpleSegmentWriter::new(collect.clone()));
         let retry = RetryableWriter::new(inner);
         let seg = make_seg();
         retry.write_segment(&seg).expect("ok");
@@ -198,8 +184,7 @@ mod tests {
     #[test]
     fn retryable_writer_recovers_after_failures() {
         let intermittent = IntermittentWriter::new(2); // 前 2 次失败，第 3 次成功
-        let inner: Arc<dyn SegmentWriter> =
-            Arc::new(SimpleSegmentWriter::new(intermittent));
+        let inner: Arc<dyn SegmentWriter> = Arc::new(SimpleSegmentWriter::new(intermittent));
         let retry = RetryableWriter::with_retries(inner, 5, Duration::from_millis(1));
         let seg = make_seg();
         retry.write_segment(&seg).expect("第 3 次应成功");
@@ -221,9 +206,7 @@ mod tests {
 
     impl IntermittentWriter {
         fn new(initial_fails: u32) -> Self {
-            Self {
-                fails_left: std::sync::Mutex::new(initial_fails),
-            }
+            Self { fails_left: std::sync::Mutex::new(initial_fails) }
         }
     }
 

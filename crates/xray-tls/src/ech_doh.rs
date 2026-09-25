@@ -3,36 +3,33 @@
 //! 对应 Go `transport/internet/tls/ech.go`：
 //! - `ApplyECH` client 分支的 `://` 形式拆分（`example.com+https://1.1.1.1/dns-query`）
 //! - `QueryRecord`：进程级 TTL 缓存（Go `GlobalECHConfigCache`）
-//! - `dnsQuery` 的 DoH 分支：`https://`/`h2c://` → POST（RFC 8484，body 为裸
-//!   DNS message），响应交 [`crate::ech_https_rr::extract_ech_and_ttl_from_dns_response`]
+//! - `dnsQuery` 的 DoH 分支：`https://`/`h2c://` → POST（RFC 8484，body 为裸 DNS message），响应交
+//!   [`crate::ech_https_rr::extract_ech_and_ttl_from_dns_response`]
 //!
 //! # 对齐差异（有意为之）
-//! - Go 的 EDNS0(4096)+随机 padding 与 `X-Padding` 头是流量指纹混淆项，不
-//!   影响正确性（DoH 无 UDP 512B 限制，主流 DoH 对无 EDNS 查询正常回答）。
-//!   ponytail: 指纹级对齐需要时再加。
-//! - Go `udp://` 经典 UDP 查询：本版明确报错（Go 可成功），待真实需求再补
-//!   datagram 路径。
-//! - Go `QueryRecord` 的「4h 内旧值+后台刷新」分支：TTL 过期一律同步重查
-//!   （无 singleflight 去重，并发 miss 只多打几次 DoH，无正确性影响）。
+//! - Go 的 EDNS0(4096)+随机 padding 与 `X-Padding` 头是流量指纹混淆项，不 影响正确性（DoH 无 UDP
+//!   512B 限制，主流 DoH 对无 EDNS 查询正常回答）。 ponytail: 指纹级对齐需要时再加。
+//! - Go `udp://` 经典 UDP 查询：本版明确报错（Go 可成功），待真实需求再补 datagram 路径。
+//! - Go `QueryRecord` 的「4h 内旧值+后台刷新」分支：TTL 过期一律同步重查 （无 singleflight
+//!   去重，并发 miss 只多打几次 DoH，无正确性影响）。
 
-use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 use h2::client;
-use http::header::CONTENT_TYPE;
-use http::{Method, Request, StatusCode};
+use http::{Method, Request, StatusCode, header::CONTENT_TYPE};
 use parking_lot::Mutex;
-use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::{net::TcpStream, time::timeout};
 use tokio_rustls::rustls::ClientConfig;
-
 use xray_transport::connection::TcpConnection;
 
-use crate::ech::EchConfigRecord;
-use crate::ech_https_rr::extract_ech_and_ttl_from_dns_response;
-use crate::error::TlsError;
+use crate::{
+    ech::EchConfigRecord, ech_https_rr::extract_ech_and_ttl_from_dns_response, error::TlsError,
+};
 
 /// DoH 单次查询整体超时（对应 Go `http.Client{Timeout: 30s}`）。
 const DOH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -60,11 +57,10 @@ static GLOBAL_ECH_CACHE: LazyLock<Mutex<HashMap<String, EchConfigRecord>>> =
 /// 解析 `echConfigList` 的 DNS 形式为 `(待查域名, DNS 服务器 URL)`。
 ///
 /// 对齐 Go `ApplyECH`（ech.go `strings.SplitN(c.EchConfigList, "+", 2)`）：
-/// - `example.com+https://1.1.1.1/dns-query` → (`example.com`, `https://...`)；
-///   多个 `+` 归入 server 段（SplitN limit=2 语义）。
-/// - `https://1.1.1.1/dns-query`（单段）→ (`server_name`, server)；`server_name`
-///   为 IP 字面量时（Go `net.ParseAddress(...).IsDomain()` 为 false）无查询名
-///   → 硬错，错误文案对齐 Go。
+/// - `example.com+https://1.1.1.1/dns-query` → (`example.com`, `https://...`)； 多个 `+` 归入
+///   server 段（SplitN limit=2 语义）。
+/// - `https://1.1.1.1/dns-query`（单段）→ (`server_name`, server)；`server_name` 为 IP 字面量时（Go
+///   `net.ParseAddress(...).IsDomain()` 为 false）无查询名 → 硬错，错误文案对齐 Go。
 pub fn parse_ech_dns_server(
     config_list: &str,
     server_name: &str,
@@ -77,7 +73,7 @@ pub fn parse_ech_dns_server(
                 if is_domain { server_name.to_string() } else { String::new() },
                 config_list.to_string(),
             )
-        }
+        },
     };
     if name_to_query.is_empty() {
         return Err(TlsError::EchApply(
@@ -92,13 +88,12 @@ pub fn parse_ech_dns_server(
 ///
 /// - 缓存未过期 → 直接返回（零网络 IO）。
 /// - 否则真实查询 [`dns_query_doh`] 并按响应 TTL 回填缓存。
-/// - `tls_config`：`https://` 查询的 TLS 配置；`None` 用 [`DEFAULT_DOH_TLS_CONFIG`]
-///   （系统 roots + ALPN h2，对应 Go `http2.Transport` + `utls.Config{ServerName}`
-///   默认验证）。测试可注入信任 mock 自签证书的 config；注入方需自带 ALPN h2
-///   方可对真实 DoH server 查询。
-/// - 查询失败返回 `Err`；调用方（`utls::u_client_with_alpn`）保持原串，由
-///   resolve 落 [`crate::ech::INVALID_ECH_CONFIG`]（Go defer 失败语义：ECH
-///   获取失败必须连接失败，不静默明文 SNI）。
+/// - `tls_config`：`https://` 查询的 TLS 配置；`None` 用 [`DEFAULT_DOH_TLS_CONFIG`] （系统 roots +
+///   ALPN h2，对应 Go `http2.Transport` + `utls.Config{ServerName}` 默认验证）。测试可注入信任 mock
+///   自签证书的 config；注入方需自带 ALPN h2 方可对真实 DoH server 查询。
+/// - 查询失败返回 `Err`；调用方（`utls::u_client_with_alpn`）保持原串，由 resolve 落
+///   [`crate::ech::INVALID_ECH_CONFIG`]（Go defer 失败语义：ECH 获取失败必须连接失败，不静默明文
+///   SNI）。
 pub async fn query_ech_config(
     config_list: &str,
     server_name: &str,
@@ -140,7 +135,7 @@ async fn dns_query_doh(
             return Err(TlsError::InvalidEchDnsServerFormat(format!(
                 "{server} (ECH DNS query supports https:// and h2c:// only; udp:// not implemented)"
             )));
-        }
+        },
     };
     let (host, port, path) = parse_authority(rest)?;
 
@@ -162,9 +157,7 @@ async fn dns_query_doh(
     edns.set_max_payload(4096);
     edns.set_version(0);
     msg.set_edns(edns);
-    let payload = msg
-        .to_vec()
-        .map_err(|e| TlsError::EchApply(format!("pack dns query: {e}")))?;
+    let payload = msg.to_vec().map_err(|e| TlsError::EchApply(format!("pack dns query: {e}")))?;
 
     // TCP 连接（域名字段走系统 resolver，对应 Go net/http 默认行为）。
     let tcp = timeout(DOH_TIMEOUT, TcpStream::connect((host.as_str(), port)))
@@ -175,11 +168,8 @@ async fn dns_query_doh(
     // 完整 URL（scheme://authority/path）：h2 请求需 :authority 伪头——仅 path
     // 时 h2 不发送 authority，真实 DoH server（如 cloudflare）回 400。对齐 Go
     // `http.NewRequest("POST", server, ...)` 的完整 URL 语义。
-    let authority = if host.contains(':') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    };
+    let authority =
+        if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
     let url = format!("{}://{authority}{path}", if use_tls { "https" } else { "http" });
 
     let wire = if use_tls {
@@ -195,7 +185,10 @@ async fn dns_query_doh(
         // 失败携带响应 wire 摘要（head 256B hex）：真实 DoH server 的 RR 形态
         // 多样（param 顺序/未知 param/压缩指针），无上下文的 NoEchConfig 无法定位。
         let head: String = wire.iter().take(256).map(|b| format!("{b:02x}")).collect();
-        TlsError::EchApply(format!("parse ECH from DNS response ({e}; wire {} bytes: {head})", wire.len()))
+        TlsError::EchApply(format!(
+            "parse ECH from DNS response ({e}; wire {} bytes: {head})",
+            wire.len()
+        ))
     })
 }
 
@@ -226,7 +219,7 @@ fn parse_authority(rest: &str) -> Result<(String, u16, String), TlsError> {
                     .parse::<u16>()
                     .map_err(|_| TlsError::InvalidEchDnsServerFormat(authority.to_string()))?;
                 (h.to_string(), port)
-            }
+            },
             None => (authority.to_string(), DEFAULT_PORT),
         }
     };
@@ -294,7 +287,7 @@ where
                         buf.len()
                     )));
                 }
-            }
+            },
             Ok(None) => break,
             Err(_) => return Err(TlsError::EchApply("DoH body read timeout".to_string())),
         }
@@ -307,14 +300,24 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use hickory_proto::op::{Message, MessageType, OpCode};
-    use hickory_proto::rr::rdata::svcb::{EchConfigList, SVCB, SvcParamKey, SvcParamValue};
-    use hickory_proto::rr::rdata::HTTPS;
-    use hickory_proto::rr::{Name, RData, Record};
-    use std::net::SocketAddr;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        net::SocketAddr,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use hickory_proto::{
+        op::{Message, MessageType, OpCode},
+        rr::{
+            Name, RData, Record,
+            rdata::{
+                HTTPS,
+                svcb::{EchConfigList, SVCB, SvcParamKey, SvcParamValue},
+            },
+        },
+    };
     use tokio::net::TcpListener;
+
+    use super::*;
 
     // ---- parse_ech_dns_server（Go ApplyECH 拆分语义） ----
 
@@ -326,8 +329,8 @@ mod tests {
 
     #[test]
     fn parse_plus_format_splits_domain_and_server() {
-        let got =
-            parse_ech_dns_server("example.com+https://1.1.1.1/dns-query", "ignored.invalid").unwrap();
+        let got = parse_ech_dns_server("example.com+https://1.1.1.1/dns-query", "ignored.invalid")
+            .unwrap();
         assert_eq!(got, ("example.com".to_string(), "https://1.1.1.1/dns-query".to_string()));
     }
 
@@ -376,10 +379,7 @@ mod tests {
         let svcb = SVCB::new(
             1,
             Name::from_ascii(".").unwrap(),
-            vec![(
-                SvcParamKey::EchConfigList,
-                SvcParamValue::EchConfigList(EchConfigList(ech)),
-            )],
+            vec![(SvcParamKey::EchConfigList, SvcParamValue::EchConfigList(EchConfigList(ech)))],
         );
         let mut msg = Message::new(req_id, MessageType::Response, OpCode::Query);
         msg.add_answer(Record::from_rdata(owner, ttl, RData::HTTPS(HTTPS(svcb))));
@@ -465,11 +465,7 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 1);
         let second = query_ech_config(&url, "unused.invalid", None).await.unwrap();
         assert_eq!(second, ech);
-        assert_eq!(
-            count.load(Ordering::SeqCst),
-            1,
-            "第二次查询必须走缓存（不新建连接）"
-        );
+        assert_eq!(count.load(Ordering::SeqCst), 1, "第二次查询必须走缓存（不新建连接）");
     }
 
     #[tokio::test]
@@ -477,16 +473,18 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
-        let got =
-            query_ech_config(&format!("refused.example.com+https://{addr}"), "unused.invalid", None)
-                .await;
+        let got = query_ech_config(
+            &format!("refused.example.com+https://{addr}"),
+            "unused.invalid",
+            None,
+        )
+        .await;
         assert!(got.is_err(), "连接拒绝必须报错（不得静默返回垃圾 config）");
     }
 
     #[tokio::test]
     async fn unsupported_scheme_yields_err() {
-        let got =
-            query_ech_config("q.example.com+udp://8.8.8.8", "unused.invalid", None).await;
+        let got = query_ech_config("q.example.com+udp://8.8.8.8", "unused.invalid", None).await;
         let err = got.unwrap_err();
         assert!(matches!(err, TlsError::InvalidEchDnsServerFormat(_)), "got: {err:?}");
     }
@@ -494,15 +492,15 @@ mod tests {
     /// `https://` 分支：真实 TLS 握手（自签证书 + 注入信任根）→ DoH 查询。
     #[tokio::test]
     async fn query_via_https_doh_with_self_signed_mock() {
-        use tokio_rustls::rustls::pki_types::CertificateDer;
-        use tokio_rustls::rustls::{RootCertStore, ServerConfig};
-        use tokio_rustls::TlsAcceptor;
+        use tokio_rustls::{
+            TlsAcceptor,
+            rustls::{RootCertStore, ServerConfig, pki_types::CertificateDer},
+        };
 
         ensure_crypto_provider();
 
         // rcgen 自签证书（SAN: localhost；client 以 host=localhost 连接）。
-        let cert_params =
-            rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         let key_pair = rcgen::KeyPair::generate().unwrap();
         let cert = cert_params.self_signed(&key_pair).unwrap();
         let cert_der = cert.der().to_vec();
@@ -510,10 +508,7 @@ mod tests {
         let key = tokio_rustls::rustls::pki_types::PrivateKeyDer::try_from(key_der).unwrap();
         let server_config = ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(
-                vec![CertificateDer::from(cert_der.clone())],
-                key,
-            )
+            .with_single_cert(vec![CertificateDer::from(cert_der.clone())], key)
             .unwrap();
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
 

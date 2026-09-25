@@ -14,12 +14,11 @@
 //!
 //! AEAD 实现复用 [`xray_crypto::aead::Aes128Gcm`]（ring 后端）。
 
-use std::io;
-use std::net::SocketAddr;
+use std::{io, net::SocketAddr};
 
 use async_trait::async_trait;
 use rand::RngCore;
-use ring::digest::{digest, SHA256};
+use ring::digest::{SHA256, digest};
 use xray_crypto::aead::{AeadCipher, Aes128Gcm, CryptoError};
 
 use super::super::{UdpIo, Udpmask};
@@ -65,9 +64,7 @@ fn map_crypto_err(e: CryptoError) -> io::Error {
 pub fn seal(cipher: &Aes128Gcm, plaintext: &[u8]) -> io::Result<Vec<u8>> {
     let mut nonce = [0u8; AES128GCM_NONCE_SIZE];
     rand::rng().fill_bytes(&mut nonce);
-    let ct = cipher
-        .seal(&nonce, b"", plaintext)
-        .map_err(map_crypto_err)?;
+    let ct = cipher.seal(&nonce, b"", plaintext).map_err(map_crypto_err)?;
     let mut out = Vec::with_capacity(AES128GCM_NONCE_SIZE + ct.len());
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&ct);
@@ -82,10 +79,7 @@ pub fn seal(cipher: &Aes128Gcm, plaintext: &[u8]) -> io::Result<Vec<u8>> {
 /// - `InvalidData`：长度不足或 AEAD 校验失败。
 pub fn open(cipher: &Aes128Gcm, packet: &[u8]) -> io::Result<Vec<u8>> {
     if packet.len() < AES128GCM_OVERHEAD {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "aes128gcm: packet too short",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "aes128gcm: packet too short"));
     }
     let (nonce, ct) = packet.split_at(AES128GCM_NONCE_SIZE);
     cipher.open(nonce, b"", ct).map_err(map_crypto_err)
@@ -127,9 +121,7 @@ impl Aes128GcmCodec {
         let h = digest(&SHA256, password.as_bytes());
         let mut key = [0u8; 16];
         key.copy_from_slice(&h.as_ref()[..16]);
-        Aes128Gcm::new(&key)
-            .map_err(map_crypto_err)
-            .map(|cipher| Self { cipher })
+        Aes128Gcm::new(&key).map_err(map_crypto_err).map(|cipher| Self { cipher })
     }
 }
 
@@ -175,17 +167,13 @@ mod tests {
     use super::*;
 
     fn test_cipher() -> Aes128Gcm {
-        let cfg = Aes128GcmConfig {
-            password: "test-password".into(),
-        };
+        let cfg = Aes128GcmConfig { password: "test-password".into() };
         cfg.build_cipher().unwrap()
     }
 
     #[test]
     fn key_derivation_is_deterministic() {
-        let cfg = Aes128GcmConfig {
-            password: "abc".into(),
-        };
+        let cfg = Aes128GcmConfig { password: "abc".into() };
         let k1 = cfg.derive_key();
         let k2 = cfg.derive_key();
         assert_eq!(k1, k2);
@@ -193,12 +181,8 @@ mod tests {
 
     #[test]
     fn key_derivation_depends_on_password() {
-        let a = Aes128GcmConfig {
-            password: "abc".into(),
-        };
-        let b = Aes128GcmConfig {
-            password: "abd".into(),
-        };
+        let a = Aes128GcmConfig { password: "abc".into() };
+        let b = Aes128GcmConfig { password: "abd".into() };
         assert_ne!(a.derive_key(), b.derive_key());
     }
 

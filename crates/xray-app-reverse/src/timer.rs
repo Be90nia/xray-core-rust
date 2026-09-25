@@ -10,9 +10,13 @@
 //! `run(&mut self)` 独占，无 `set_timeout`/terminate 回调；本 crate 的 BridgeWorker
 //! 依赖 `SetTimeout(0)`（立即终止）与 `SetTimeout(24h)`（drain 窗口）语义。
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use parking_lot::RwLock;
 use tokio::sync::Notify;
@@ -102,8 +106,9 @@ fn finish(inner: &Inner) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    use super::*;
 
     #[tokio::test]
     async fn timeout_fires_on_timeout_once() {

@@ -1,4 +1,4 @@
-﻿//! 嗅探框架
+//! 嗅探框架
 //!
 //! 对应 Go `app/dispatcher/sniffer.go`。
 //!
@@ -9,9 +9,11 @@
 //! - [Sniffer] struct 持有 Vec<Box<dyn ProtocolSniffer>> 编排多协议嗅探
 //! - [CompositeSniffResult] 组合 metadata + content 结果
 
-use crate::error::DispatcherError;
 use std::fmt::Debug;
+
 use xray_common::net::network::Network;
+
+use crate::error::DispatcherError;
 
 /// 嗅探错误
 pub type SniffError = DispatcherError;
@@ -47,9 +49,7 @@ pub struct Sniffer {
 
 impl Debug for Sniffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Sniffer")
-            .field("count", &self.sniffers.len())
-            .finish()
+        f.debug_struct("Sniffer").field("count", &self.sniffers.len()).finish()
     }
 }
 
@@ -97,20 +97,20 @@ impl Sniffer {
                 Ok(Some(result)) => {
                     hit = Some(result);
                     break;
-                }
+                },
                 // 非本协议（Go result==nil && err==nil）：本轮跳过，不保留
-                Ok(None) => {}
+                Ok(None) => {},
                 Err(SniffError::NoClue) => {
                     // 无定论：可能后续分段命中，保留待重试（Go sniffer.go:67-69）
                     pending.push(i);
-                }
+                },
                 Err(SniffError::NeedMoreData) => {
                     // 协议命中但需更多数据：集合收缩到该探测器（Go sniffer.go:70-72）
                     pending = vec![i];
                     need_more = true;
                     break;
-                }
-                Err(_) => {}
+                },
+                Err(_) => {},
             }
         }
 
@@ -144,9 +144,9 @@ impl Sniffer {
                 Ok(Some(result)) => {
                     hit = Some(result);
                     break;
-                }
+                },
                 Err(SniffError::NoClue) => pending.push(i),
-                _ => {}
+                _ => {},
             }
         }
 
@@ -180,14 +180,8 @@ pub struct CompositeSniffResult {
 
 impl CompositeSniffResult {
     #[must_use]
-    pub fn new(
-        domain_result: Box<dyn SniffResult>,
-        protocol_result: Box<dyn SniffResult>,
-    ) -> Self {
-        Self {
-            domain_result,
-            protocol_result,
-        }
+    pub fn new(domain_result: Box<dyn SniffResult>, protocol_result: Box<dyn SniffResult>) -> Self {
+        Self { domain_result, protocol_result }
     }
 }
 
@@ -227,6 +221,7 @@ impl SniffResult for ProtoSniffResult {
     fn protocol(&self) -> &str {
         self.protocol
     }
+
     fn domain(&self) -> &str {
         &self.domain
     }
@@ -267,16 +262,13 @@ impl ProtocolSniffer for HttpSniffer {
         let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut req = httparse::Request::new(&mut headers);
         match req.parse(payload) {
-            Ok(httparse::Status::Complete(_)) => {}
+            Ok(httparse::Status::Complete(_)) => {},
             // 头未到齐 / 畸形：Go 逐行扫描找不到 Host 即 ErrNoClue（可重试）
             Ok(httparse::Status::Partial) | Err(_) => return Err(SniffError::NoClue),
         }
 
         // ny1g：Host 头未到达 ≠ 放弃（Go http/sniff.go:116 Host 缺失即 ErrNoClue）
-        let host = req
-            .headers
-            .iter()
-            .find(|h| h.name.eq_ignore_ascii_case("host"));
+        let host = req.headers.iter().find(|h| h.name.eq_ignore_ascii_case("host"));
         let Some(host_header) = host else {
             return Err(SniffError::NoClue);
         };
@@ -297,6 +289,7 @@ impl ProtocolSniffer for HttpSniffer {
             domain,
         })))
     }
+
     fn network(&self) -> Network {
         Network::TCP
     }
@@ -314,8 +307,8 @@ fn parse_host_header(host: &str) -> Option<String> {
             // 空端口等价 missing port（Go SplitHostPort 允许，ParseHost 用默认端口）
             Some(port) if !port.is_empty() && !port.bytes().all(|b| b.is_ascii_digit()) => {
                 return None;
-            }
-            _ => {}
+            },
+            _ => {},
         }
         Some(domain.to_string())
     } else {
@@ -323,7 +316,7 @@ fn parse_host_header(host: &str) -> Option<String> {
             None => Some(host.to_string()),
             Some((h, port)) if port.is_empty() || port.bytes().all(|b| b.is_ascii_digit()) => {
                 Some(h.to_string())
-            }
+            },
             // 非数字端口（Go strconv.Atoi 失败）或伪 IPv6 多冒号（Go too many colons）
             Some(_) => None,
         }
@@ -341,6 +334,7 @@ impl ProtocolSniffer for TlsSniffer {
     fn sniff(&self, payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffError> {
         parse_tls_client_hello(payload)
     }
+
     fn network(&self) -> Network {
         Network::TCP
     }
@@ -425,8 +419,7 @@ fn parse_client_hello_from_handshake(
     if hello_body.len() < offset + 2 {
         return Err(SniffError::NoClue);
     }
-    let extensions_len =
-        u16::from_be_bytes([hello_body[offset], hello_body[offset + 1]]) as usize;
+    let extensions_len = u16::from_be_bytes([hello_body[offset], hello_body[offset + 1]]) as usize;
     offset += 2;
 
     let extensions_end = offset + extensions_len;
@@ -511,6 +504,7 @@ impl ProtocolSniffer for BittorrentSniffer {
         }
         Ok(None)
     }
+
     fn network(&self) -> Network {
         Network::TCP
     }
@@ -566,9 +560,7 @@ const QUIC_V2: QuicVersionSpec = QuicVersionSpec {
 const QUIC_CRYPTO_BUF_MAX: usize = 32767;
 
 fn quic_version_spec(ver: u32) -> Option<&'static QuicVersionSpec> {
-    [&QUIC_V1, &QUIC_DRAFT29, &QUIC_V2]
-        .into_iter()
-        .find(|s| s.ver == ver)
+    [&QUIC_V1, &QUIC_DRAFT29, &QUIC_V2].into_iter().find(|s| s.ver == ver)
 }
 
 /// 拼接版本标签前缀与后缀（" hp"/" key"/" iv"；前缀最长 "quicv2"=6，后缀最长 4，总长 ≤10）
@@ -589,6 +581,7 @@ impl ProtocolSniffer for QuicSniffer {
     fn sniff(&self, payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffError> {
         sniff_quic(payload)
     }
+
     fn network(&self) -> Network {
         Network::UDP
     }
@@ -610,11 +603,11 @@ fn read_quic_varint(buf: &[u8]) -> Option<(u64, usize)> {
         4 => {
             let v = u32::from_be_bytes([buf[0] & 0x3F, buf[1], buf[2], buf[3]]);
             u64::from(v)
-        }
+        },
         8 => {
             // 8 字节 varint 超出 short varint 范围
             return None;
-        }
+        },
         _ => return None,
     };
     if val > 65535 {
@@ -711,7 +704,8 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
 
         // Initial 包有 token 字段
         if is_initial {
-            let (token_len, vb) = read_quic_varint(&payload[offset..]).ok_or(SniffError::UnknownContent)?;
+            let (token_len, vb) =
+                read_quic_varint(&payload[offset..]).ok_or(SniffError::UnknownContent)?;
             offset += vb;
             offset += token_len as usize;
             if payload.len() < offset {
@@ -720,7 +714,8 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
         }
 
         // packet_len
-        let (packet_len, vb) = read_quic_varint(&payload[offset..]).ok_or(SniffError::UnknownContent)?;
+        let (packet_len, vb) =
+            read_quic_varint(&payload[offset..]).ok_or(SniffError::UnknownContent)?;
         if packet_len < 4 {
             return Ok(None);
         }
@@ -757,11 +752,9 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
         hkdf_expand_label(&client_in_secret, &hp_label[..hp_label_len], &[], &mut hp_key_bytes)?;
 
         // header protection key
-        let hp_key = ring::aead::quic::HeaderProtectionKey::new(
-            &ring::aead::quic::AES_128,
-            &hp_key_bytes,
-        )
-        .map_err(|_| SniffError::UnknownContent)?;
+        let hp_key =
+            ring::aead::quic::HeaderProtectionKey::new(&ring::aead::quic::AES_128, &hp_key_bytes)
+                .map_err(|_| SniffError::UnknownContent)?;
 
         // 需要至少 hdr_len+4+16 字节来解密 header protection
         let sample_offset = hdr_len + 4;
@@ -833,37 +826,45 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
 
             match frame_type {
                 0x00 => continue, // PADDING: 单字节帧，已通过上面的 frame_offset += 1 消耗
-                0x01 => {} // PING
+                0x01 => {},       // PING
                 0x02 | 0x03 => {
                     // ACK frame
                     let _ = read_quic_varint(&decrypted[frame_offset..]);
-                    frame_offset += read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
+                    frame_offset +=
+                        read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
                     let _ = read_quic_varint(&decrypted[frame_offset..]);
-                    frame_offset += read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
+                    frame_offset +=
+                        read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
                     let ack_range_count = read_quic_varint(&decrypted[frame_offset..]);
                     frame_offset += ack_range_count.map_or(0, |(_, l)| l);
                     let _ = read_quic_varint(&decrypted[frame_offset..]);
-                    frame_offset += read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
+                    frame_offset +=
+                        read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
                     if let Some((count, _cl)) = ack_range_count {
                         for _ in 0..count {
                             let _ = read_quic_varint(&decrypted[frame_offset..]);
-                            frame_offset += read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
+                            frame_offset +=
+                                read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
                             let _ = read_quic_varint(&decrypted[frame_offset..]);
-                            frame_offset += read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
+                            frame_offset +=
+                                read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
                         }
                     }
                     if frame_type == 0x03 {
                         for _ in 0..3 {
                             let _ = read_quic_varint(&decrypted[frame_offset..]);
-                            frame_offset += read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
+                            frame_offset +=
+                                read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
                         }
                     }
-                }
+                },
                 0x06 => {
                     // CRYPTO frame - 收集 TLS ClientHello 数据
-                    let (offset_val, vl) = read_quic_varint(&decrypted[frame_offset..]).ok_or(SniffError::UnknownContent)?;
+                    let (offset_val, vl) = read_quic_varint(&decrypted[frame_offset..])
+                        .ok_or(SniffError::UnknownContent)?;
                     frame_offset += vl;
-                    let (length, vl) = read_quic_varint(&decrypted[frame_offset..]).ok_or(SniffError::UnknownContent)?;
+                    let (length, vl) = read_quic_varint(&decrypted[frame_offset..])
+                        .ok_or(SniffError::UnknownContent)?;
                     frame_offset += vl;
 
                     let end = frame_offset + length as usize;
@@ -881,28 +882,33 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
                     if crypto_len < write_end {
                         crypto_len = write_end;
                     }
-                    crypto_data[write_start..write_end].copy_from_slice(&decrypted[frame_offset..end]);
+                    crypto_data[write_start..write_end]
+                        .copy_from_slice(&decrypted[frame_offset..end]);
                     frame_offset = end;
-                }
+                },
                 0x1c => {
                     // CONNECTION_CLOSE
                     let _ = read_quic_varint(&decrypted[frame_offset..]);
-                    frame_offset += read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
+                    frame_offset +=
+                        read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
                     let _ = read_quic_varint(&decrypted[frame_offset..]);
-                    frame_offset += read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
-                    let (reason_len, vl) = read_quic_varint(&decrypted[frame_offset..]).ok_or(SniffError::UnknownContent)?;
+                    frame_offset +=
+                        read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
+                    let (reason_len, vl) = read_quic_varint(&decrypted[frame_offset..])
+                        .ok_or(SniffError::UnknownContent)?;
                     frame_offset += vl + reason_len as usize;
-                }
+                },
                 _ => {
                     // 其他帧类型不允许在 Initial 包中出现
                     break;
-                }
+                },
             }
         }
 
         // 尝试从 crypto_data 解析 TLS ClientHello
         if crypto_len > 0 {
-            if let Ok(Some(result)) = parse_client_hello_from_handshake(&crypto_data[..crypto_len]) {
+            if let Ok(Some(result)) = parse_client_hello_from_handshake(&crypto_data[..crypto_len])
+            {
                 return Ok(Some(Box::new(ProtoSniffResult {
                     protocol: "quic",
                     domain: result.domain().to_string(),
@@ -959,13 +965,13 @@ impl ProtocolSniffer for UtpSniffer {
                     if length < 4 || length % 4 != 0 {
                         return Ok(None);
                     }
-                }
+                },
                 2 => {
                     // extension bits：固定 8 字节（µTorrent 在 ST_SYN 发送）
                     if length != 8 {
                         return Ok(None);
                     }
-                }
+                },
                 _ => return Ok(None),
             }
             if payload.len() < offset + 2 + length {
@@ -980,11 +986,9 @@ impl ProtocolSniffer for UtpSniffer {
             return Ok(None);
         }
 
-        Ok(Some(Box::new(ProtoSniffResult {
-            protocol: "bittorrent",
-            domain: String::new(),
-        })))
+        Ok(Some(Box::new(ProtoSniffResult { protocol: "bittorrent", domain: String::new() })))
     }
+
     fn network(&self) -> Network {
         Network::UDP
     }
@@ -1019,6 +1023,7 @@ mod tests {
         fn protocol(&self) -> &str {
             self.protocol
         }
+
         fn domain(&self) -> &str {
             self.domain
         }
@@ -1038,6 +1043,7 @@ mod tests {
                 domain: self.result.domain,
             })))
         }
+
         fn network(&self) -> Network {
             self.network
         }
@@ -1053,6 +1059,7 @@ mod tests {
         fn sniff(&self, _payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffError> {
             Err(SniffError::NoClue)
         }
+
         fn network(&self) -> Network {
             self.network
         }
@@ -1068,6 +1075,7 @@ mod tests {
         fn sniff(&self, _payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffError> {
             Err(SniffError::NeedMoreData)
         }
+
         fn network(&self) -> Network {
             self.network
         }
@@ -1084,17 +1092,17 @@ mod tests {
             self.result
                 .as_ref()
                 .map(|r| {
-                    Some(Box::new(TestResult {
-                        protocol: r.protocol,
-                        domain: r.domain,
-                    }) as Box<dyn SniffResult>)
+                    Some(Box::new(TestResult { protocol: r.protocol, domain: r.domain })
+                        as Box<dyn SniffResult>)
                 })
                 .map(Ok)
                 .unwrap_or(Ok(None))
         }
+
         fn metadata_only(&self) -> bool {
             true
         }
+
         fn network(&self) -> Network {
             Network::TCP
         }
@@ -1129,17 +1137,11 @@ mod tests {
         let mut s = Sniffer::from_sniffers(vec![
             Box::new(AlwaysMatchSniffer {
                 network: Network::TCP,
-                result: TestResult {
-                    protocol: "http",
-                    domain: "example.com",
-                },
+                result: TestResult { protocol: "http", domain: "example.com" },
             }),
             Box::new(AlwaysMatchSniffer {
                 network: Network::TCP,
-                result: TestResult {
-                    protocol: "tls",
-                    domain: "other.com",
-                },
+                result: TestResult { protocol: "tls", domain: "other.com" },
             }),
         ]);
         let r = s.sniff(b"x", Network::TCP).expect("match");
@@ -1152,17 +1154,11 @@ mod tests {
         let mut s = Sniffer::from_sniffers(vec![
             Box::new(AlwaysMatchSniffer {
                 network: Network::UDP,
-                result: TestResult {
-                    protocol: "quic",
-                    domain: "",
-                },
+                result: TestResult { protocol: "quic", domain: "" },
             }),
             Box::new(AlwaysMatchSniffer {
                 network: Network::TCP,
-                result: TestResult {
-                    protocol: "http",
-                    domain: "",
-                },
+                result: TestResult { protocol: "http", domain: "" },
             }),
         ]);
         let r = s.sniff(b"x", Network::TCP).expect("match");
@@ -1173,17 +1169,11 @@ mod tests {
     fn sniff_skips_metadata_sniffers() {
         let mut s = Sniffer::from_sniffers(vec![
             Box::new(MetadataSniffer {
-                result: Some(TestResult {
-                    protocol: "fakedns",
-                    domain: "",
-                }),
+                result: Some(TestResult { protocol: "fakedns", domain: "" }),
             }),
             Box::new(AlwaysMatchSniffer {
                 network: Network::TCP,
-                result: TestResult {
-                    protocol: "http",
-                    domain: "",
-                },
+                result: TestResult { protocol: "http", domain: "" },
             }),
         ]);
         let r = s.sniff(b"x", Network::TCP).expect("match");
@@ -1207,10 +1197,7 @@ mod tests {
             Box::new(NeedMoreDataSniffer { network: Network::TCP }),
             Box::new(AlwaysMatchSniffer {
                 network: Network::TCP,
-                result: TestResult {
-                    protocol: "http",
-                    domain: "",
-                },
+                result: TestResult { protocol: "http", domain: "" },
             }),
         ]);
         let err = s.sniff(b"x", Network::TCP).unwrap_err();
@@ -1241,24 +1228,16 @@ mod tests {
                 if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                     return Err(SniffError::NoClue);
                 }
-                Ok(Some(Box::new(TestResult {
-                    protocol: "tls",
-                    domain: "retry.example.com",
-                })))
+                Ok(Some(Box::new(TestResult { protocol: "tls", domain: "retry.example.com" })))
             }
+
             fn network(&self) -> Network {
                 self.network
             }
         }
 
-        let delayed = MatchOnSecondCall {
-            network: Network::TCP,
-            calls: AtomicUsize::new(0),
-        };
-        let mut s = Sniffer::from_sniffers(vec![
-            Box::new(HttpSniffer),
-            Box::new(delayed),
-        ]);
+        let delayed = MatchOnSecondCall { network: Network::TCP, calls: AtomicUsize::new(0) };
+        let mut s = Sniffer::from_sniffers(vec![Box::new(HttpSniffer), Box::new(delayed)]);
         // 第一轮：HttpSniffer 对非 HTTP payload 丢弃（Ok(None)），delayed 报 NoClue
         let err = s.sniff(b"not-http", Network::TCP).unwrap_err();
         assert!(matches!(err, SniffError::NoClue));
@@ -1272,17 +1251,11 @@ mod tests {
     fn sniff_metadata_invokes_metadata_sniffers() {
         let mut s = Sniffer::from_sniffers(vec![
             Box::new(MetadataSniffer {
-                result: Some(TestResult {
-                    protocol: "fakedns",
-                    domain: "faked.example.com",
-                }),
+                result: Some(TestResult { protocol: "fakedns", domain: "faked.example.com" }),
             }),
             Box::new(AlwaysMatchSniffer {
                 network: Network::TCP,
-                result: TestResult {
-                    protocol: "http",
-                    domain: "",
-                },
+                result: TestResult { protocol: "http", domain: "" },
             }),
         ]);
         let r = s.sniff_metadata().expect("match");
@@ -1296,10 +1269,7 @@ mod tests {
             Box::new(MetadataSniffer { result: None }),
             Box::new(AlwaysMatchSniffer {
                 network: Network::TCP,
-                result: TestResult {
-                    protocol: "http",
-                    domain: "",
-                },
+                result: TestResult { protocol: "http", domain: "" },
             }),
         ]);
         let err = s.sniff_metadata().unwrap_err();
@@ -1309,14 +1279,8 @@ mod tests {
     #[test]
     fn composite_result_uses_protocol_from_protocol_side() {
         let c = CompositeSniffResult::new(
-            Box::new(TestResult {
-                protocol: "fakedns",
-                domain: "fake.example.com",
-            }),
-            Box::new(TestResult {
-                protocol: "http",
-                domain: "",
-            }),
+            Box::new(TestResult { protocol: "fakedns", domain: "fake.example.com" }),
+            Box::new(TestResult { protocol: "http", domain: "" }),
         );
         assert_eq!(c.protocol(), "http");
         assert_eq!(c.domain(), "fake.example.com");
@@ -1325,14 +1289,8 @@ mod tests {
     #[test]
     fn composite_result_protocol_for_domain_returns_domain_protocol() {
         let c = CompositeSniffResult::new(
-            Box::new(TestResult {
-                protocol: "fakedns",
-                domain: "",
-            }),
-            Box::new(TestResult {
-                protocol: "http",
-                domain: "",
-            }),
+            Box::new(TestResult { protocol: "fakedns", domain: "" }),
+            Box::new(TestResult { protocol: "http", domain: "" }),
         );
         assert_eq!(c.protocol_for_domain_result(), "fakedns");
     }
@@ -1384,9 +1342,7 @@ mod tests {
             payload.push_str(&format!("X-Pad-{i}: v\r\n"));
         }
         payload.push_str("Host: many.example.com\r\n\r\n");
-        let result = HttpSniffer.sniff(payload.as_bytes())
-            .expect("ok")
-            .expect("some");
+        let result = HttpSniffer.sniff(payload.as_bytes()).expect("ok").expect("some");
         assert_eq!(result.domain(), "many.example.com");
     }
 
@@ -1399,10 +1355,8 @@ mod tests {
             .expect("some");
         assert_eq!(r.domain(), "2001:db8::1");
 
-        let r = HttpSniffer
-            .sniff(b"GET / HTTP/1.1\r\nHost: [::1]\r\n\r\n")
-            .expect("ok")
-            .expect("some");
+        let r =
+            HttpSniffer.sniff(b"GET / HTTP/1.1\r\nHost: [::1]\r\n\r\n").expect("ok").expect("some");
         assert_eq!(r.domain(), "::1");
     }
 
@@ -1411,9 +1365,8 @@ mod tests {
     fn http_sniff_malformed_host_rejected() {
         let r = HttpSniffer.sniff(b"GET / HTTP/1.1\r\nHost: a:b:c\r\n\r\n").unwrap_err();
         assert!(matches!(r, SniffError::UnknownContent));
-        let r = HttpSniffer
-            .sniff(b"GET / HTTP/1.1\r\nHost: example.com:notaport\r\n\r\n")
-            .unwrap_err();
+        let r =
+            HttpSniffer.sniff(b"GET / HTTP/1.1\r\nHost: example.com:notaport\r\n\r\n").unwrap_err();
         assert!(matches!(r, SniffError::UnknownContent));
     }
 
@@ -1490,8 +1443,7 @@ mod tests {
     #[test]
     fn tls_sniff_sni_control_char_returns_need_more_data() {
         let entries: Vec<(u8, &[u8])> = vec![(0, b"bad\x00name.example.com")];
-        let result = TlsSniffer
-            .sniff(&wrap_record(&build_client_hello_with_sni_entries(&entries)));
+        let result = TlsSniffer.sniff(&wrap_record(&build_client_hello_with_sni_entries(&entries)));
         assert!(matches!(result, Err(SniffError::NeedMoreData)));
     }
 
@@ -1682,11 +1634,7 @@ mod tests {
             ("wrong version", wrong_version, 1),
             ("unknown packet type", utp_packet(5, 0, 0, &[]), 1),
             ("unknown extension", utp_packet(4, 3, 0, &[]), 1),
-            (
-                "extension chain past the datagram",
-                utp_packet(4, 1, 0, &[0, 8, 0xff]),
-                1,
-            ),
+            ("extension chain past the datagram", utp_packet(4, 1, 0, &[0, 8, 0xff]), 1),
             (
                 "selective ack not in multiples of 4",
                 {
@@ -1702,9 +1650,11 @@ mod tests {
             let result = UtpSniffer.sniff(&payload);
             match expect {
                 2 => {
-                    let r = result.expect(&format!("{name}: no error")).expect(&format!("{name}: some"));
+                    let r = result
+                        .expect(&format!("{name}: no error"))
+                        .expect(&format!("{name}: some"));
                     assert_eq!(r.protocol(), "bittorrent", "{name}");
-                }
+                },
                 1 => assert!(result.expect(&format!("{name}: no error")).is_none(), "{name}"),
                 _ => assert!(matches!(result, Err(SniffError::NoClue)), "{name}"),
             }
@@ -1755,9 +1705,7 @@ mod tests {
     const TEST_DCID: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 
     /// 按 RFC 9001 §5 派生 Initial 密钥材料（key/iv/hp；v2 用独立 salt 与 "quicv2" 标签）
-    fn derive_initial_keys(
-        spec: &'static QuicVersionSpec,
-    ) -> ([u8; 16], [u8; 12], [u8; 16]) {
+    fn derive_initial_keys(spec: &'static QuicVersionSpec) -> ([u8; 16], [u8; 12], [u8; 16]) {
         use ring::hmac;
 
         let salt_key = hmac::Key::new(hmac::HMAC_SHA256, spec.initial_salt);
@@ -1838,17 +1786,12 @@ mod tests {
         let mut packet = header.clone();
         packet.extend_from_slice(&plaintext);
         let tag = key
-            .seal_in_place_separate_tag(
-                nonce,
-                aead::Aad::from(&header[..]),
-                &mut packet[hdr_len..],
-            )
+            .seal_in_place_separate_tag(nonce, aead::Aad::from(&header[..]), &mut packet[hdr_len..])
             .unwrap();
         packet.extend_from_slice(tag.as_ref());
 
         // 5. Header protection
-        let hp_key =
-            aead::quic::HeaderProtectionKey::new(&aead::quic::AES_128, hp_bytes).unwrap();
+        let hp_key = aead::quic::HeaderProtectionKey::new(&aead::quic::AES_128, hp_bytes).unwrap();
         // PN 字段位于 header 末尾（helper 的 hdr_len 含 PN）；
         // HP sample 从 PN 偏移 +4 起取（RFC 9001 §5.4.2），与 sniff_quic 内部偏移一致。
         let pn_offset = hdr_len - pn_length;
@@ -1900,8 +1843,9 @@ mod tests {
         while plaintext.len() < 128 {
             plaintext.push(0x00); // PADDING
         }
-        let packet =
-            build_quic_initial_from_plaintext(&QUIC_V1, &key_bytes, &iv_bytes, &hp_bytes, &plaintext);
+        let packet = build_quic_initial_from_plaintext(
+            &QUIC_V1, &key_bytes, &iv_bytes, &hp_bytes, &plaintext,
+        );
         let result = QuicSniffer.sniff(&packet).expect("no hard error");
         assert!(result.is_none(), "crypto offset+length 超限必须放弃嗅探");
 
@@ -1912,11 +1856,13 @@ mod tests {
         while plaintext_ok.len() < 128 {
             plaintext_ok.push(0x00);
         }
-        let packet_ok =
-            build_quic_initial_from_plaintext(&QUIC_V1, &key_bytes, &iv_bytes, &hp_bytes, &plaintext_ok);
-        assert!(matches!(
-            QuicSniffer.sniff(&packet_ok),
-            Err(SniffError::NeedMoreData)
-        ));
+        let packet_ok = build_quic_initial_from_plaintext(
+            &QUIC_V1,
+            &key_bytes,
+            &iv_bytes,
+            &hp_bytes,
+            &plaintext_ok,
+        );
+        assert!(matches!(QuicSniffer.sniff(&packet_ok), Err(SniffError::NeedMoreData)));
     }
 }

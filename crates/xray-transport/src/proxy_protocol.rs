@@ -5,15 +5,20 @@
 //!
 //! 参考：Go `transport/internet/headers.go` + `proxyproto` 包。
 
-use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::{
+    io,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+};
+
 use tokio::io::AsyncReadExt;
 
 /// 读 PROXY protocol v1/v2 header，返回真实客户端地址。
 ///
 /// 在 listener accept 后，若 `accept_proxy_protocol == true`，
 /// 在应用层握手前先读 PROXY header 拿真实客户端地址（覆盖 TCP remote）。
-pub async fn read_proxy_protocol<R: AsyncReadExt + Unpin>(reader: &mut R) -> io::Result<Option<SocketAddr>> {
+pub async fn read_proxy_protocol<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> io::Result<Option<SocketAddr>> {
     // 读前 6 字节判断 v1/v2。
     let mut sig = [0u8; 6];
     reader.read_exact(&mut sig).await?;
@@ -39,7 +44,7 @@ pub async fn read_proxy_protocol<R: AsyncReadExt + Unpin>(reader: &mut R) -> io:
                 let src = Ipv4Addr::new(payload[0], payload[1], payload[2], payload[3]);
                 let sport = u16::from_be_bytes([payload[8], payload[9]]);
                 Ok(Some(SocketAddr::V4(SocketAddrV4::new(src, sport))))
-            }
+            },
             2 => {
                 if payload.len() < 36 {
                     return Ok(None);
@@ -47,13 +52,8 @@ pub async fn read_proxy_protocol<R: AsyncReadExt + Unpin>(reader: &mut R) -> io:
                 let mut src = [0u8; 16];
                 src.copy_from_slice(&payload[0..16]);
                 let sport = u16::from_be_bytes([payload[32], payload[33]]);
-                Ok(Some(SocketAddr::V6(SocketAddrV6::new(
-                    src.into(),
-                    sport,
-                    0,
-                    0,
-                ))))
-            }
+                Ok(Some(SocketAddr::V6(SocketAddrV6::new(src.into(), sport, 0, 0))))
+            },
             _ => Ok(None), // UNSPEC/UNIX/UNKNOWN
         }
     } else if sig == V1_PREFIX {
@@ -73,8 +73,9 @@ pub async fn read_proxy_protocol<R: AsyncReadExt + Unpin>(reader: &mut R) -> io:
                 ));
             }
         }
-        let text = std::str::from_utf8(&line)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "proxy protocol v1 not utf8"))?;
+        let text = std::str::from_utf8(&line).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "proxy protocol v1 not utf8")
+        })?;
         // "PROXY TCP4 src dst sport dport\r\n"
         let parts: Vec<&str> = text.trim_end().split_whitespace().collect();
         if parts.len() >= 6 {
@@ -84,22 +85,19 @@ pub async fn read_proxy_protocol<R: AsyncReadExt + Unpin>(reader: &mut R) -> io:
                     if let Ok(ip) = parts[2].parse::<Ipv4Addr>() {
                         return Ok(Some(SocketAddr::V4(SocketAddrV4::new(ip, sport))));
                     }
-                }
+                },
                 "TCP6" => {
                     if let Ok(ip) = parts[2].parse::<Ipv6Addr>() {
                         return Ok(Some(SocketAddr::V6(SocketAddrV6::new(ip, sport, 0, 0))));
                     }
-                }
-                _ => {}
+                },
+                _ => {},
             }
         }
         Ok(None) // UNKNOWN 或解析失败
     } else {
         // 非 PROXY protocol：调用方保证启用时有 header，当错误处理
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "expected proxy protocol header",
-        ))
+        Err(io::Error::new(io::ErrorKind::InvalidData, "expected proxy protocol header"))
     }
 }
 
@@ -121,10 +119,10 @@ fn build_proxy_header_v1(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
     let (proto, src_ip, dst_ip, src_port, dst_port) = match (src, dst) {
         (SocketAddr::V4(a), SocketAddr::V4(b)) => {
             ("TCP4", a.ip().to_string(), b.ip().to_string(), a.port(), b.port())
-        }
+        },
         (SocketAddr::V6(a), SocketAddr::V6(b)) => {
             ("TCP6", a.ip().to_string(), b.ip().to_string(), a.port(), b.port())
-        }
+        },
         // 地址族不一致：降级为 UNKNOWN（与 go-proxyproto 一致）。
         _ => return b"PROXY UNKNOWN\r\n".to_vec(),
     };
@@ -133,9 +131,7 @@ fn build_proxy_header_v1(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
 
 /// v2：12 字节 signature + ver/cmd + family/proto + length + 地址负载。
 fn build_proxy_header_v2(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
-    const SIG: [u8; 12] = [
-        0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
-    ];
+    const SIG: [u8; 12] = [0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A];
     // version=2 (高 4 bit) | command=PROXY (低 4 bit, 值 1) → 0x21。
     const VER_CMD_PROXY: u8 = 0x21;
     let (fam_proto, addr_bytes) = match (src, dst) {
@@ -147,7 +143,7 @@ fn build_proxy_header_v2(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
             v.extend_from_slice(&a.port().to_be_bytes());
             v.extend_from_slice(&b.port().to_be_bytes());
             (0x11u8, v)
-        }
+        },
         (SocketAddr::V6(a), SocketAddr::V6(b)) => {
             // address family=INET6(2) | transport=STREAM(1) → 0x21。
             let mut v = Vec::with_capacity(36);
@@ -156,7 +152,7 @@ fn build_proxy_header_v2(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
             v.extend_from_slice(&a.port().to_be_bytes());
             v.extend_from_slice(&b.port().to_be_bytes());
             (0x21u8, v)
-        }
+        },
         // 地址族不一致：AF_UNSPEC | UNSPEC(0) → 0x00，无地址负载。
         _ => (0x00u8, Vec::new()),
     };
@@ -217,12 +213,15 @@ mod tests {
     #[tokio::test]
     async fn read_proxy_protocol_v2_tcp6() {
         let mut header = vec![
-            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
-            0x21, 0x21, // af(2=INET6)+proto(STREAM)
+            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, 0x21,
+            0x21, // af(2=INET6)+proto(STREAM)
             0x00, 0x24, // length=36
         ];
         let mut src = [0u8; 16];
-        src[0] = 0x20; src[1] = 0x01; src[2] = 0x0d; src[3] = 0xb8;
+        src[0] = 0x20;
+        src[1] = 0x01;
+        src[2] = 0x0d;
+        src[3] = 0xb8;
         src[15] = 0x01;
         header.extend_from_slice(&src); // src
         header.extend_from_slice(&[0u8; 16]); // dst

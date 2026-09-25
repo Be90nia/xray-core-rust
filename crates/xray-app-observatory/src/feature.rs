@@ -7,22 +7,25 @@
 //!
 //! # 装配路径（bd issue f23r wiring 双断点修复）
 //!
-//! - 直接构造后手动 [`set_io`](Self::set_io) 后 [`start`](Feature::start)；
-//!   适用测试。
-//! - 通过 [`init_dependencies`](Feature::init_dependencies) 走 [`DepBag`]：
-//!   Instance 在所有 feature 注册完成后、start 前调用本方法，本方法
-//!   从 bag 拿 `OutboundTagSelector` 后端并装配 [`RealOutboundSelector`] +
-//!   [`HttpProbeExecutor::from_config`] 自动注入 IO。`bag.outbound_selector`
-//!   为 `None`（proxyman 尚未装配）时 fail-fast：
-//!   `SubjectSelector` 非空但缺 IO → 返 [`FeatureError::StartFailed`]；
-//!   `SubjectSelector` 为空 → 与 Go observer.go:50 一致静默 no-op。
+//! - 直接构造后手动 [`set_io`](Self::set_io) 后 [`start`](Feature::start)； 适用测试。
+//! - 通过 [`init_dependencies`](Feature::init_dependencies) 走 [`DepBag`]： Instance 在所有 feature
+//!   注册完成后、start 前调用本方法，本方法 从 bag 拿 `OutboundTagSelector` 后端并装配
+//!   [`RealOutboundSelector`] + [`HttpProbeExecutor::from_config`] 自动注入
+//!   IO。`bag.outbound_selector` 为 `None`（proxyman 尚未装配）时 fail-fast： `SubjectSelector`
+//!   非空但缺 IO → 返 [`FeatureError::StartFailed`]； `SubjectSelector` 为空 → 与 Go observer.go:50
+//!   一致静默 no-op。
+
+use std::sync::Arc;
 
 use parking_lot::RwLock;
-use std::sync::Arc;
 use xray_features::{DepBag, Feature, FeatureError, Result};
 
-use crate::config::ObservatoryConfig;
-use crate::observer::{HttpProbeExecutor, Observer, OutboundSelector, ProbeExecutor, RealOutboundSelector};
+use crate::{
+    config::ObservatoryConfig,
+    observer::{
+        HttpProbeExecutor, Observer, OutboundSelector, ProbeExecutor, RealOutboundSelector,
+    },
+};
 
 /// Observatory app Feature 实现。包装 [`Observer`]。
 pub struct ObservatoryFeature {
@@ -34,10 +37,7 @@ pub struct ObservatoryFeature {
 impl ObservatoryFeature {
     /// 从配置创建 ObservatoryFeature。
     pub fn new(config: ObservatoryConfig) -> Self {
-        Self {
-            observer: Observer::new(config),
-            io: RwLock::new(None),
-        }
+        Self { observer: Observer::new(config), io: RwLock::new(None) }
     }
 
     /// 获取内部 Observer 引用（读观测快照 / 上层桥接 ObservationProvider）。
@@ -49,11 +49,7 @@ impl ObservatoryFeature {
     /// + dispatcher）。须在 `Feature::start` 前调用。
     ///
     /// 重复调用：后者覆盖前者（fail-fast 装配阶段使用）。
-    pub fn set_io(
-        &self,
-        selector: Arc<dyn OutboundSelector>,
-        executor: Arc<dyn ProbeExecutor>,
-    ) {
+    pub fn set_io(&self, selector: Arc<dyn OutboundSelector>, executor: Arc<dyn ProbeExecutor>) {
         *self.io.write() = Some((selector, executor));
     }
 }
@@ -81,13 +77,9 @@ impl Feature for ObservatoryFeature {
 
         let io = self.io.read().clone();
         match io {
-            Some((selector, executor)) => self
-                .observer
-                .start(selector, executor)
-                .map_err(|e| FeatureError::StartFailed {
-                    name: "observatory",
-                    message: e.to_string(),
-                }),
+            Some((selector, executor)) => self.observer.start(selector, executor).map_err(|e| {
+                FeatureError::StartFailed { name: "observatory", message: e.to_string() }
+            }),
             None => Err(FeatureError::StartFailed {
                 name: "observatory",
                 message: "selector/executor not injected (call set_io before start, \
@@ -100,10 +92,7 @@ impl Feature for ObservatoryFeature {
     fn close(&self) -> Result<()> {
         self.observer
             .close()
-            .map_err(|e| FeatureError::CloseFailed {
-                name: "observatory",
-                message: e.to_string(),
-            })
+            .map_err(|e| FeatureError::CloseFailed { name: "observatory", message: e.to_string() })
     }
 
     /// 装配阶段依赖注入（兜底）：若 bag 提供 `OutboundTagSelector` 则注入
@@ -137,10 +126,10 @@ impl Feature for ObservatoryFeature {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::Arc, time::Duration};
+
     use super::*;
     use crate::observer::{CountingProbeExecutor, NoopOutboundSelector};
-    use std::sync::Arc;
-    use std::time::Duration;
 
     fn fast_cfg() -> ObservatoryConfig {
         ObservatoryConfig {
@@ -154,10 +143,7 @@ mod tests {
     async fn feature_start_spawns_probe_loop() {
         let f = ObservatoryFeature::new(fast_cfg());
         let executor = Arc::new(CountingProbeExecutor::new(true));
-        f.set_io(
-            Arc::new(NoopOutboundSelector::new(vec!["a".into()])),
-            executor.clone(),
-        );
+        f.set_io(Arc::new(NoopOutboundSelector::new(vec!["a".into()])), executor.clone());
         f.start().unwrap();
         assert!(f.observer().is_started());
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -174,21 +160,14 @@ mod tests {
     async fn feature_close_cancels_probe_loop() {
         let f = ObservatoryFeature::new(fast_cfg());
         let executor = Arc::new(CountingProbeExecutor::new(true));
-        f.set_io(
-            Arc::new(NoopOutboundSelector::new(vec!["a".into()])),
-            executor.clone(),
-        );
+        f.set_io(Arc::new(NoopOutboundSelector::new(vec!["a".into()])), executor.clone());
         f.start().unwrap();
         tokio::time::sleep(Duration::from_millis(120)).await;
         assert!(executor.count() >= 1);
         f.close().unwrap();
         let frozen = executor.count();
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(
-            executor.count(),
-            frozen,
-            "probe loop must stop after Feature::close"
-        );
+        assert_eq!(executor.count(), frozen, "probe loop must stop after Feature::close");
     }
 
     #[tokio::test]
@@ -200,7 +179,7 @@ mod tests {
         match err {
             xray_features::FeatureError::StartFailed { name, .. } => {
                 assert_eq!(name, "observatory");
-            }
+            },
             other => panic!("unexpected error variant: {other:?}"),
         }
         assert!(!f.observer().is_started());
@@ -224,7 +203,7 @@ mod tests {
         let cfg = ObservatoryConfig {
             subject_selector: vec!["node1".into()],
             probe_url: "http://127.0.0.1:1/".into(), // 必连失败
-            probe_interval: 60_000, // 长间隔防止探测跑（仅验 selector 路径）
+            probe_interval: 60_000,                  // 长间隔防止探测跑（仅验 selector 路径）
             ..Default::default()
         };
         let f = ObservatoryFeature::new(cfg);
@@ -252,8 +231,9 @@ mod tests {
     #[tokio::test]
     async fn feature_explicit_set_io_overrides_init_dependencies() {
         // 已 set_io → init_dependencies 不覆盖（显式优先）。
-        use crate::observer::FixedProbeExecutor;
         use xray_features::{DepBag, OutboundTagSelector};
+
+        use crate::observer::FixedProbeExecutor;
         struct BoomSelector;
         impl OutboundTagSelector for BoomSelector {
             fn select_by_prefix(&self, _p: &[String]) -> Vec<String> {
@@ -263,20 +243,12 @@ mod tests {
         let f = ObservatoryFeature::new(fast_cfg());
         let exec = Arc::new(FixedProbeExecutor::new().with_result(
             "a",
-            crate::config::ProbeResult {
-                alive: true,
-                delay: 5,
-                last_error_reason: String::new(),
-            },
+            crate::config::ProbeResult { alive: true, delay: 5, last_error_reason: String::new() },
         ));
-        f.set_io(
-            Arc::new(NoopOutboundSelector::new(vec!["a".into()])),
-            exec.clone(),
-        );
-        f.init_dependencies(
-            &DepBag::new()
-                .with_outbound_selector(Arc::new(BoomSelector) as Arc<dyn xray_features::OutboundTagSelector>),
-        );
+        f.set_io(Arc::new(NoopOutboundSelector::new(vec!["a".into()])), exec.clone());
+        f.init_dependencies(&DepBag::new().with_outbound_selector(
+            Arc::new(BoomSelector) as Arc<dyn xray_features::OutboundTagSelector>
+        ));
         f.start().unwrap();
         assert!(f.observer().is_started());
     }
@@ -284,16 +256,10 @@ mod tests {
     #[tokio::test]
     async fn feature_start_empty_subject_selector_noop() {
         // Go observer.go:50：SubjectSelector 空 → 不启动 background
-        let cfg = ObservatoryConfig {
-            probe_interval: 50,
-            ..Default::default()
-        };
+        let cfg = ObservatoryConfig { probe_interval: 50, ..Default::default() };
         let f = ObservatoryFeature::new(cfg);
         let executor = Arc::new(CountingProbeExecutor::new(true));
-        f.set_io(
-            Arc::new(NoopOutboundSelector::new(vec!["a".into()])),
-            executor.clone(),
-        );
+        f.set_io(Arc::new(NoopOutboundSelector::new(vec!["a".into()])), executor.clone());
         f.start().unwrap();
         assert!(!f.observer().is_started());
         tokio::time::sleep(Duration::from_millis(120)).await;

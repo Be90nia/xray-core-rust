@@ -155,11 +155,7 @@ impl DeviceConfig {
     /// 获取有效 MTU（0 时返回默认 1420）。
     #[must_use]
     pub fn effective_mtu(&self) -> i32 {
-        if self.mtu == 0 {
-            Self::DEFAULT_MTU
-        } else {
-            self.mtu
-        }
+        if self.mtu == 0 { Self::DEFAULT_MTU } else { self.mtu }
     }
 
     /// 从 prost 生成的 proto DeviceConfig 构造。
@@ -222,8 +218,8 @@ impl DeviceConfig {
     ///
     /// - 空 → [`DnsConfig::Default`]（Cloudflare 四址）
     /// - `["local"]` → [`DnsConfig::Local`]（本地 app DNS）
-    /// - 其余 → [`DnsConfig::Servers`]（非法 IP 字面量报错；Go 侧
-    ///   `netip.MustParseAddr` 直接 panic，Rust 侧返回错误更合理）
+    /// - 其余 → [`DnsConfig::Servers`]（非法 IP 字面量报错；Go 侧 `netip.MustParseAddr` 直接
+    ///   panic，Rust 侧返回错误更合理）
     pub fn resolve_dns(&self) -> Result<DnsConfig> {
         match self.dns.as_slice() {
             [] => Ok(DnsConfig::Default),
@@ -237,7 +233,7 @@ impl DeviceConfig {
                     servers.push(ip);
                 }
                 Ok(DnsConfig::Servers(servers))
-            }
+            },
         }
     }
 }
@@ -324,20 +320,14 @@ mod tests {
 
     #[test]
     fn effective_mtu_default_when_zero() {
-        let cfg = DeviceConfig {
-            mtu: 0,
-            ..Default::default()
-        };
+        let cfg = DeviceConfig { mtu: 0, ..Default::default() };
         assert_eq!(cfg.effective_mtu(), DeviceConfig::DEFAULT_MTU);
         assert_eq!(cfg.effective_mtu(), 1420);
     }
 
     #[test]
     fn effective_mtu_passthrough_when_set() {
-        let cfg = DeviceConfig {
-            mtu: 1280,
-            ..Default::default()
-        };
+        let cfg = DeviceConfig { mtu: 1280, ..Default::default() };
         assert_eq!(cfg.effective_mtu(), 1280);
     }
 

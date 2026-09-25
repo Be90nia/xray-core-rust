@@ -26,13 +26,13 @@ use quinn_proto::congestion::Controller;
 use super::{
     bbr::{BbrSender, Clock as _, DefaultClock, Profile},
     brutal::BrutalSender,
+    error::{CongestionError, Result},
     types::{
         AckedPacketInfo, ByteCount, CongestionControl, INITIAL_PACKET_SIZE, LostPacketInfo,
         MonoTime, PacketNumber, RttStatsProvider,
     },
     utils::CongestionSetter,
 };
-use super::error::{CongestionError, Result};
 
 /// 把 quinn 事件时间映射到 hysteria MonoTime 域（DefaultClock 的全局基准）。
 ///
@@ -513,8 +513,7 @@ mod tests {
         assert!(!slot.has_active(), "fresh slot must be fallback-only");
         apply_brutal(&slot, 10_000_000, false); // 10 MB/s
         assert!(slot.has_active());
-        slot.rtt
-            .update(std::time::Duration::from_millis(1), std::time::Duration::from_millis(1));
+        slot.rtt.update(std::time::Duration::from_millis(1), std::time::Duration::from_millis(1));
         // 数学：2 × 10_000_000 bps × 0.001 s = 20_000 字节 ≫ 1 MTU。
         assert_eq!(slot.current_window(), 20_000);
     }

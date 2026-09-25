@@ -10,15 +10,18 @@
 //! - [`XUDP`]: UDP 会话扩展
 //! - [`XUDPManager`]: UDP 会话管理器
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
-use tokio::sync::{watch, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, watch};
 use tracing::debug;
-use xray_buf::reader::BufferedReader;
-use xray_buf::writer::BufferedWriter;
+use xray_buf::{reader::BufferedReader, writer::BufferedWriter};
 
 // ========== 传输类型 ==========
 
@@ -350,7 +353,6 @@ impl Session {
     pub fn downlink_bytes(&self) -> u64 {
         self.downlink_bytes.load(Ordering::Relaxed)
     }
-
 }
 
 impl std::fmt::Debug for Session {
@@ -384,12 +386,7 @@ impl XUDP {
     /// 创建新的 XUDP 扩展。
     #[must_use]
     pub fn new(global_id: [u8; 8]) -> Self {
-        Self {
-            global_id,
-            status: XudpStatus::Initializing,
-            expire: Instant::now(),
-            mux: None,
-        }
+        Self { global_id, status: XudpStatus::Initializing, expire: Instant::now(), mux: None }
     }
 
     /// 设置关联会话。
@@ -463,7 +460,6 @@ impl SessionManager {
         self.shared.closed_flag.load(Ordering::Acquire)
     }
 
-
     /// 获取当前活跃会话数（无锁原子读，Go `Size()` 等价）。
     pub async fn size(&self) -> usize {
         self.active_count()
@@ -478,6 +474,7 @@ impl SessionManager {
     pub fn active_count(&self) -> usize {
         self.shared.size.load(Ordering::Acquire)
     }
+
     /// 获取已分配的会话总数（包括已关闭的）。
     #[must_use]
     pub fn count(&self) -> u16 {
@@ -586,11 +583,7 @@ impl SessionManager {
     /// - 无活跃会话
     /// - `check_size` 为 0（外部确认无待处理数据）
     /// - `check_count` 等于内部 count（外部确认无待处理连接）
-    pub async fn close_if_no_session_and_idle(
-        &self,
-        check_size: usize,
-        check_count: u16,
-    ) -> bool {
+    pub async fn close_if_no_session_and_idle(&self, check_size: usize, check_count: u16) -> bool {
         let mut inner = self.shared.inner.write().await;
 
         if inner.closed {
@@ -633,7 +626,6 @@ impl SessionManager {
         inner.sessions.clear();
         self.shared.size.store(0, Ordering::Release);
     }
-
 }
 
 impl Default for SessionManager {
@@ -674,10 +666,7 @@ impl XUDPManager {
     /// 创建新的 XUDP 管理器。
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            entries: Arc::new(parking_lot::RwLock::new(HashMap::new())),
-            cleanup_handle: None,
-        }
+        Self { entries: Arc::new(parking_lot::RwLock::new(HashMap::new())), cleanup_handle: None }
     }
 
     /// 启动清理任务。
@@ -777,17 +766,17 @@ impl Drop for XUDPManager {
 
 impl std::fmt::Debug for XUDPManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("XUDPManager")
-            .field("entries", &"<locked>")
-            .finish()
+        f.debug_struct("XUDPManager").field("entries", &"<locked>").finish()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Cursor;
+
     use xray_buf::io::{new_reader, new_writer};
+
+    use super::*;
 
     // ========== TransferType 测试 ==========
 
@@ -917,10 +906,7 @@ mod tests {
     #[tokio::test]
     async fn test_session_manager_allocate_max_concurrency() {
         let manager = SessionManager::new();
-        let strategy = ClientStrategy {
-            max_concurrency: 2,
-            max_connection: 0,
-        };
+        let strategy = ClientStrategy { max_concurrency: 2, max_connection: 0 };
 
         let s1 = manager.allocate(&strategy).await;
         assert!(s1.is_some());
@@ -933,10 +919,7 @@ mod tests {
     #[tokio::test]
     async fn test_session_manager_allocate_max_connection() {
         let manager = SessionManager::new();
-        let strategy = ClientStrategy {
-            max_concurrency: 0,
-            max_connection: 3,
-        };
+        let strategy = ClientStrategy { max_concurrency: 0, max_connection: 3 };
 
         for _ in 0..3 {
             let s = manager.allocate(&strategy).await;
@@ -1005,9 +988,7 @@ mod tests {
         assert_eq!(manager.count(), count);
 
         // 满足空闲条件可关闭
-        let result = manager
-            .close_if_no_session_and_idle(0, count)
-            .await;
+        let result = manager.close_if_no_session_and_idle(0, count).await;
         assert!(result);
         assert!(manager.is_closed());
     }
@@ -1020,9 +1001,7 @@ mod tests {
         let _s = manager.allocate(&strategy).await.unwrap();
 
         // 有活跃会话，不应关闭
-        let result = manager
-            .close_if_no_session_and_idle(0, 0)
-            .await;
+        let result = manager.close_if_no_session_and_idle(0, 0).await;
         assert!(!result);
         assert!(!manager.is_closed());
     }
@@ -1165,10 +1144,8 @@ mod tests {
     #[tokio::test]
     async fn test_session_manager_add_close_removes_entry() {
         let manager = SessionManager::new();
-        let session = manager
-            .add(Session::new(7, TransferType::Stream))
-            .await
-            .expect("add on open manager");
+        let session =
+            manager.add(Session::new(7, TransferType::Stream)).await.expect("add on open manager");
         assert_eq!(manager.size().await, 1);
 
         session.close().await;
@@ -1177,12 +1154,7 @@ mod tests {
 
         // 已关闭的管理器 add 返回 None
         manager.close().await;
-        assert!(
-            manager
-                .add(Session::new(8, TransferType::Stream))
-                .await
-                .is_none()
-        );
+        assert!(manager.add(Session::new(8, TransferType::Stream)).await.is_none());
     }
 
     // ========== Debug 格式化测试 ==========
@@ -1213,18 +1185,9 @@ mod tests {
 
     #[test]
     fn test_session_error_display() {
-        assert_eq!(
-            format!("{}", SessionError::SessionClosed),
-            "session is closed"
-        );
-        assert_eq!(
-            format!("{}", SessionError::ManagerClosed),
-            "session manager is closed"
-        );
-        assert_eq!(
-            format!("{}", SessionError::SessionNotFound(42)),
-            "session not found: 42"
-        );
+        assert_eq!(format!("{}", SessionError::SessionClosed), "session is closed");
+        assert_eq!(format!("{}", SessionError::ManagerClosed), "session manager is closed");
+        assert_eq!(format!("{}", SessionError::SessionNotFound(42)), "session not found: 42");
     }
 
     // ========== 流量统计测试 ==========
@@ -1248,7 +1211,6 @@ mod tests {
         assert_eq!(session.uplink_bytes(), 150);
         assert_eq!(session.downlink_bytes(), 350);
     }
-
 
     // ========== multi_thread runtime 锁迁移回归 ==========
 

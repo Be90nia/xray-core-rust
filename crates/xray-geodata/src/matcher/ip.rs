@@ -2,9 +2,11 @@
 //!
 //! 对应 Go 版本 `common/geodata/ip_matcher`，提供 IP 地址匹配功能。
 
-use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Mutex;
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::Mutex,
+};
 
 use crate::pb::{self, Cidr, IpRule};
 
@@ -87,10 +89,7 @@ struct Ipv4Cidr {
 impl Ipv4Cidr {
     fn new(addr: Ipv4Addr, prefix: u8) -> Self {
         let prefix = prefix.min(32);
-        Self {
-            addr: u32::from_be_bytes(addr.octets()),
-            prefix,
-        }
+        Self { addr: u32::from_be_bytes(addr.octets()), prefix }
     }
 
     fn contains(&self, ip: Ipv4Addr) -> bool {
@@ -98,11 +97,7 @@ impl Ipv4Cidr {
             return true;
         }
         let ip_val = u32::from_be_bytes(ip.octets());
-        let mask = if self.prefix == 32 {
-            !0u32
-        } else {
-            !0u32 << (32 - self.prefix)
-        };
+        let mask = if self.prefix == 32 { !0u32 } else { !0u32 << (32 - self.prefix) };
         (ip_val & mask) == (self.addr & mask)
     }
 
@@ -111,11 +106,7 @@ impl Ipv4Cidr {
         if self.prefix == 0 {
             return (0, u32::MAX);
         }
-        let mask = if self.prefix >= 32 {
-            !0u32
-        } else {
-            !0u32 << (32 - self.prefix)
-        };
+        let mask = if self.prefix >= 32 { !0u32 } else { !0u32 << (32 - self.prefix) };
         let base = self.addr & mask;
         (base, base | !mask)
     }
@@ -131,10 +122,7 @@ struct Ipv6Cidr {
 impl Ipv6Cidr {
     fn new(addr: Ipv6Addr, prefix: u8) -> Self {
         let prefix = prefix.min(128);
-        Self {
-            addr: u128::from_be_bytes(addr.octets()),
-            prefix,
-        }
+        Self { addr: u128::from_be_bytes(addr.octets()), prefix }
     }
 
     fn contains(&self, ip: Ipv6Addr) -> bool {
@@ -142,11 +130,7 @@ impl Ipv6Cidr {
             return true;
         }
         let ip_val = u128::from_be_bytes(ip.octets());
-        let mask = if self.prefix == 128 {
-            !0u128
-        } else {
-            !0u128 << (128 - self.prefix)
-        };
+        let mask = if self.prefix == 128 { !0u128 } else { !0u128 << (128 - self.prefix) };
         (ip_val & mask) == (self.addr & mask)
     }
 
@@ -155,11 +139,7 @@ impl Ipv6Cidr {
         if self.prefix == 0 {
             return (0, u128::MAX);
         }
-        let mask = if self.prefix >= 128 {
-            !0u128
-        } else {
-            !0u128 << (128 - self.prefix)
-        };
+        let mask = if self.prefix >= 128 { !0u128 } else { !0u128 << (128 - self.prefix) };
         let base = self.addr & mask;
         (base, base | !mask)
     }
@@ -193,7 +173,7 @@ fn merge_sorted_ranges<T: Copy + Ord>(mut ranges: Vec<(T, T)>) -> Vec<(T, T)> {
                 if e > last.1 {
                     last.1 = e;
                 }
-            }
+            },
             _ => merged.push((s, e)),
         }
     }
@@ -220,17 +200,13 @@ impl IPSet {
 
         for cidr in cidrs {
             if cidr.ip.len() == 4 {
-                let addr = Ipv4Addr::new(
-                    cidr.ip[0], cidr.ip[1], cidr.ip[2], cidr.ip[3],
-                );
+                let addr = Ipv4Addr::new(cidr.ip[0], cidr.ip[1], cidr.ip[2], cidr.ip[3]);
                 let prefix = cidr.prefix.min(32) as u8;
                 let net = Ipv4Cidr::new(addr, prefix);
 
                 if prefix == 0 {
                     max4 = IPV4_MATCH_ALL;
-                } else if max4 != IPV4_MATCH_ALL
-                    && (prefix > max4 || max4 == IPV4_NO_ENTRIES)
-                {
+                } else if max4 != IPV4_MATCH_ALL && (prefix > max4 || max4 == IPV4_NO_ENTRIES) {
                     // 存**最细**前缀（Go BuildIPSet：`b > max4`，ip_matcher.go:922）。
                     // 启发式桶门控要求全部前缀 ≤24，即最细 ≤24；存最小（最粗）
                     // 会让含 /32 的 geo 集合误开桶记忆化（bd 5dzf）。
@@ -238,17 +214,14 @@ impl IPSet {
                 }
                 ipv4_ranges.push(net.range());
             } else if cidr.ip.len() == 16 {
-                let bytes: [u8; 16] =
-                    cidr.ip[..16].try_into().unwrap_or([0; 16]);
+                let bytes: [u8; 16] = cidr.ip[..16].try_into().unwrap_or([0; 16]);
                 let addr = Ipv6Addr::from(bytes);
                 let prefix = cidr.prefix.min(128) as u8;
                 let net = Ipv6Cidr::new(addr, prefix);
 
                 if prefix == 0 {
                     max6 = IPV6_MATCH_ALL;
-                } else if max6 != IPV6_MATCH_ALL
-                    && (prefix > max6 || max6 == IPV6_NO_ENTRIES)
-                {
+                } else if max6 != IPV6_MATCH_ALL && (prefix > max6 || max6 == IPV6_NO_ENTRIES) {
                     max6 = prefix;
                 }
                 ipv6_ranges.push(net.range());
@@ -266,8 +239,12 @@ impl IPSet {
     /// 判断 IPv4 地址是否在集合内。
     #[must_use]
     pub fn contains_v4(&self, ip: Ipv4Addr) -> bool {
-        if self.max4 == IPV4_NO_ENTRIES { return false; }
-        if self.max4 == IPV4_MATCH_ALL { return true; }
+        if self.max4 == IPV4_NO_ENTRIES {
+            return false;
+        }
+        if self.max4 == IPV4_MATCH_ALL {
+            return true;
+        }
         let v = u32::from_be_bytes(ip.octets());
         let idx = self.ipv4_ranges.partition_point(|&(_, e)| e < v);
         self.ipv4_ranges.get(idx).is_some_and(|&(s, _)| s <= v)
@@ -276,8 +253,12 @@ impl IPSet {
     /// 判断 IPv6 地址是否在集合内。
     #[must_use]
     pub fn contains_v6(&self, ip: Ipv6Addr) -> bool {
-        if self.max6 == IPV6_NO_ENTRIES { return false; }
-        if self.max6 == IPV6_MATCH_ALL { return true; }
+        if self.max6 == IPV6_NO_ENTRIES {
+            return false;
+        }
+        if self.max6 == IPV6_MATCH_ALL {
+            return true;
+        }
         let v = u128::from_be_bytes(ip.octets());
         let idx = self.ipv6_ranges.partition_point(|&(_, e)| e < v);
         self.ipv6_ranges.get(idx).is_some_and(|&(s, _)| s <= v)
@@ -294,23 +275,33 @@ impl IPSet {
 
     /// IPv4 最大前缀位数。
     #[must_use]
-    pub fn max4(&self) -> u8 { self.max4 }
+    pub fn max4(&self) -> u8 {
+        self.max4
+    }
 
     /// IPv6 最大前缀位数。
     #[must_use]
-    pub fn max6(&self) -> u8 { self.max6 }
+    pub fn max6(&self) -> u8 {
+        self.max6
+    }
 
     /// IPv4 条目是否为空。
     #[must_use]
-    pub fn is_empty_v4(&self) -> bool { self.max4 == IPV4_NO_ENTRIES }
+    pub fn is_empty_v4(&self) -> bool {
+        self.max4 == IPV4_NO_ENTRIES
+    }
 
     /// IPv6 条目是否为空。
     #[must_use]
-    pub fn is_empty_v6(&self) -> bool { self.max6 == IPV6_NO_ENTRIES }
+    pub fn is_empty_v6(&self) -> bool {
+        self.max6 == IPV6_NO_ENTRIES
+    }
 }
 
 impl Default for IPSet {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Clone for IPSet {
@@ -373,13 +364,13 @@ impl HeuristicIPMatcher {
                     return false;
                 }
                 self.ipset.contains_v4(v4) != self.reverse
-            }
+            },
             IpAddr::V6(v6) => {
                 if self.ipset.max6() == IPV6_NO_ENTRIES {
                     return false;
                 }
                 self.ipset.contains_v6(v6) != self.reverse
-            }
+            },
         }
     }
 
@@ -389,21 +380,30 @@ impl HeuristicIPMatcher {
     fn heuristic_v4(&self) -> bool {
         self.ipset.max4() <= 24
     }
+
     fn heuristic_v6(&self) -> bool {
         self.ipset.max6() <= 64
     }
 
     /// 获取内部 IPSet 的引用。
     #[must_use]
-    pub fn ipset(&self) -> &IPSet { &self.ipset }
+    pub fn ipset(&self) -> &IPSet {
+        &self.ipset
+    }
 }
 
 impl IPMatcher for HeuristicIPMatcher {
-    fn match_ip(&self, ip: IpAddr) -> bool { self.match_addr(ip) }
+    fn match_ip(&self, ip: IpAddr) -> bool {
+        self.match_addr(ip)
+    }
 
     fn any_match(&self, ips: &[IpAddr]) -> bool {
-        if ips.is_empty() { return false; }
-        if ips.len() == 1 { return self.match_ip(ips[0]); }
+        if ips.is_empty() {
+            return false;
+        }
+        if ips.len() == 1 {
+            return self.match_ip(ips[0]);
+        }
 
         let heur4 = self.heuristic_v4();
         let heur6 = self.heuristic_v6();
@@ -419,20 +419,30 @@ impl IPMatcher for HeuristicIPMatcher {
 
             if use_heur {
                 if let Some(&r) = seen.get(&key) {
-                    if r { return true; }
+                    if r {
+                        return true;
+                    }
                     continue;
                 }
             }
             let r = self.match_ip(*ip);
-            if use_heur { seen.insert(key, r); }
-            if r { return true; }
+            if use_heur {
+                seen.insert(key, r);
+            }
+            if r {
+                return true;
+            }
         }
         false
     }
 
     fn matches(&self, ips: &[IpAddr]) -> bool {
-        if ips.is_empty() { return false; }
-        if ips.len() == 1 { return self.match_ip(ips[0]); }
+        if ips.is_empty() {
+            return false;
+        }
+        if ips.len() == 1 {
+            return self.match_ip(ips[0]);
+        }
 
         let heur4 = self.heuristic_v4();
         let heur6 = self.heuristic_v6();
@@ -448,34 +458,35 @@ impl IPMatcher for HeuristicIPMatcher {
 
             if use_heur {
                 if let Some(&r) = buckets.get(&key) {
-                    if !r { return false; }
+                    if !r {
+                        return false;
+                    }
                     continue;
                 }
             }
             let r = self.match_ip(*ip);
-            if use_heur { buckets.insert(key, r); }
-            if !r { return false; }
+            if use_heur {
+                buckets.insert(key, r);
+            }
+            if !r {
+                return false;
+            }
         }
         true
     }
 
     fn filter_ips(&self, ips: &[IpAddr]) -> Vec<IpAddr> {
-        if ips.is_empty() { return Vec::new(); }
+        if ips.is_empty() {
+            return Vec::new();
+        }
         if ips.len() == 1 {
-            return if self.match_ip(ips[0]) {
-                vec![ips[0]]
-            } else {
-                Vec::new()
-            };
+            return if self.match_ip(ips[0]) { vec![ips[0]] } else { Vec::new() };
         }
 
         let heur4 = self.heuristic_v4();
         let heur6 = self.heuristic_v6();
         if !heur4 && !heur6 {
-            return ips.iter()
-                .filter(|ip| self.match_ip(**ip))
-                .copied()
-                .collect();
+            return ips.iter().filter(|ip| self.match_ip(**ip)).copied().collect();
         }
 
         let mut buckets: HashMap<[u8; 9], bool> = HashMap::new();
@@ -486,10 +497,10 @@ impl IPMatcher for HeuristicIPMatcher {
             let use_heur = if is_v4 { heur4 } else { heur6 };
 
             if use_heur {
-                let matched = *buckets
-                    .entry(key)
-                    .or_insert_with(|| self.match_ip(*ip));
-                if matched { result.push(*ip); }
+                let matched = *buckets.entry(key).or_insert_with(|| self.match_ip(*ip));
+                if matched {
+                    result.push(*ip);
+                }
             } else if self.match_ip(*ip) {
                 result.push(*ip);
             }
@@ -497,8 +508,13 @@ impl IPMatcher for HeuristicIPMatcher {
         result
     }
 
-    fn reverse(&self) -> bool { self.reverse }
-    fn set_reverse(&mut self, reverse: bool) { self.reverse = reverse; }
+    fn reverse(&self) -> bool {
+        self.reverse
+    }
+
+    fn set_reverse(&mut self, reverse: bool) {
+        self.reverse = reverse;
+    }
 }
 
 // ── GeneralMultiIPMatcher ───────────────────────────────────────
@@ -529,13 +545,13 @@ impl IPMatcher for GeneralMultiIPMatcher {
     }
 
     fn filter_ips(&self, ips: &[IpAddr]) -> Vec<IpAddr> {
-        ips.iter()
-            .filter(|ip| self.match_ip(**ip))
-            .copied()
-            .collect()
+        ips.iter().filter(|ip| self.match_ip(**ip)).copied().collect()
     }
 
-    fn reverse(&self) -> bool { false }
+    fn reverse(&self) -> bool {
+        false
+    }
+
     fn set_reverse(&mut self, _reverse: bool) {}
 }
 
@@ -567,13 +583,13 @@ impl IPMatcher for HeuristicMultiIPMatcher {
     }
 
     fn filter_ips(&self, ips: &[IpAddr]) -> Vec<IpAddr> {
-        ips.iter()
-            .filter(|ip| self.match_ip(**ip))
-            .copied()
-            .collect()
+        ips.iter().filter(|ip| self.match_ip(**ip)).copied().collect()
     }
 
-    fn reverse(&self) -> bool { false }
+    fn reverse(&self) -> bool {
+        false
+    }
+
     fn set_reverse(&mut self, _reverse: bool) {}
 }
 
@@ -610,7 +626,9 @@ impl IPSetFactory {
 }
 
 impl Default for IPSetFactory {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── 构建优化匹配器 ─────────────────────────────────────────────
@@ -649,7 +667,7 @@ pub fn build_optimized_ip_matcher(
         match &rule.value {
             Some(pb::ip_rule::Value::Geoip(_)) => {
                 geo_matchers.push(HeuristicIPMatcher::from_cidrs(&[]));
-            }
+            },
             Some(pb::ip_rule::Value::Custom(cidr_rule)) => {
                 if let Some(cidr) = &cidr_rule.cidr {
                     if cidr_rule.reverse_match {
@@ -658,8 +676,8 @@ pub fn build_optimized_ip_matcher(
                         pos_custom.push(cidr.clone());
                     }
                 }
-            }
-            None => {}
+            },
+            None => {},
         }
     }
 
@@ -718,19 +736,10 @@ mod tests {
 
     #[test]
     fn ipv6_cidr_contains() {
-        let addr = Ipv6Addr::from([
-            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0,
-        ]);
+        let addr = Ipv6Addr::from([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         let cidr = Ipv6Cidr::new(addr, 32);
-        let ip_in = Ipv6Addr::from([
-            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1,
-            0, 0, 0, 0, 0, 0, 0, 1,
-        ]);
-        let ip_out = Ipv6Addr::from([
-            0x20, 0x02, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 1,
-        ]);
+        let ip_in = Ipv6Addr::from([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let ip_out = Ipv6Addr::from([0x20, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         assert!(cidr.contains(ip_in));
         assert!(!cidr.contains(ip_out));
     }
@@ -754,10 +763,7 @@ mod tests {
 
     #[test]
     fn ipset_from_ipv4_cidrs() {
-        let cidrs = vec![
-            Cidr::new(vec![192, 168, 0, 0], 16),
-            Cidr::new(vec![10, 0, 0, 0], 8),
-        ];
+        let cidrs = vec![Cidr::new(vec![192, 168, 0, 0], 16), Cidr::new(vec![10, 0, 0, 0], 8)];
         let ipset = IPSet::from_cidrs(&cidrs);
         assert!(!ipset.is_empty_v4());
         assert!(ipset.is_empty_v6());
@@ -771,8 +777,7 @@ mod tests {
 
     #[test]
     fn ipset_from_ipv6_cidrs() {
-        let addr = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
-                     0, 0, 0, 0, 0, 0, 0, 1];
+        let addr = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         let cidrs = vec![Cidr::new(addr.to_vec(), 32)];
         let ipset = IPSet::from_cidrs(&cidrs);
         assert!(ipset.is_empty_v4());
@@ -831,10 +836,7 @@ mod tests {
     fn heuristic_any_match() {
         let cidrs = vec![Cidr::new(vec![10, 0, 0, 0], 8)];
         let matcher = HeuristicIPMatcher::from_cidrs(&cidrs);
-        let ips = vec![
-            IpAddr::from([10, 0, 0, 1]),
-            IpAddr::from([192, 168, 1, 1]),
-        ];
+        let ips = vec![IpAddr::from([10, 0, 0, 1]), IpAddr::from([192, 168, 1, 1])];
         assert!(matcher.any_match(&ips));
         assert!(!matcher.any_match(&[]));
     }
@@ -843,15 +845,9 @@ mod tests {
     fn heuristic_matches() {
         let cidrs = vec![Cidr::new(vec![10, 0, 0, 0], 8)];
         let matcher = HeuristicIPMatcher::from_cidrs(&cidrs);
-        let all_match = vec![
-            IpAddr::from([10, 0, 0, 1]),
-            IpAddr::from([10, 0, 0, 2]),
-        ];
+        let all_match = vec![IpAddr::from([10, 0, 0, 1]), IpAddr::from([10, 0, 0, 2])];
         assert!(matcher.matches(&all_match));
-        let partial = vec![
-            IpAddr::from([10, 0, 0, 1]),
-            IpAddr::from([192, 168, 1, 1]),
-        ];
+        let partial = vec![IpAddr::from([10, 0, 0, 1]), IpAddr::from([192, 168, 1, 1])];
         assert!(!matcher.matches(&partial));
     }
 
@@ -882,10 +878,7 @@ mod tests {
     /// 漏判、matches([1.2.3.5, 1.2.3.4]) 误判。
     #[test]
     fn heuristic_bucket_memoization_disabled_with_fine_prefix() {
-        let cidrs = vec![
-            Cidr::new(vec![10, 0, 0, 0], 8),
-            Cidr::new(vec![1, 2, 3, 5], 32),
-        ];
+        let cidrs = vec![Cidr::new(vec![10, 0, 0, 0], 8), Cidr::new(vec![1, 2, 3, 5], 32)];
         let matcher = HeuristicIPMatcher::from_cidrs(&cidrs);
         let miss_first = [IpAddr::from([1, 2, 3, 4]), IpAddr::from([1, 2, 3, 5])];
         let hit_first = [IpAddr::from([1, 2, 3, 5]), IpAddr::from([1, 2, 3, 4])];
@@ -1038,11 +1031,7 @@ mod tests {
         if prefix == 0 {
             return (0, u32::MAX);
         }
-        let mask = if prefix >= 32 {
-            u32::MAX
-        } else {
-            u32::MAX << (32 - prefix)
-        };
+        let mask = if prefix >= 32 { u32::MAX } else { u32::MAX << (32 - prefix) };
         let base = a & mask;
         (base, base | !mask)
     }
@@ -1052,11 +1041,7 @@ mod tests {
         if prefix == 0 {
             return (0, u128::MAX);
         }
-        let mask = if prefix >= 128 {
-            u128::MAX
-        } else {
-            u128::MAX << (128 - prefix)
-        };
+        let mask = if prefix >= 128 { u128::MAX } else { u128::MAX << (128 - prefix) };
         let base = a & mask;
         (base, base | !mask)
     }
@@ -1119,7 +1104,7 @@ mod tests {
                     let hi = xorshift64(&mut rng);
                     let lo = xorshift64(&mut rng);
                     ((hi as u128) << 64) | lo as u128
-                }
+                },
             };
             let ip = Ipv6Addr::from(ip_raw);
             let want = ref_nets.iter().any(|n| n.contains(ip));
@@ -1157,10 +1142,7 @@ mod tests {
     #[test]
     fn ipset_overlapping_prefixes_union_semantics() {
         // 10.0.0.0/8 与 10.128.0.0/9 嵌套重叠：并集语义不受区间合并影响
-        let cidrs = vec![
-            Cidr::new(vec![10, 0, 0, 0], 8),
-            Cidr::new(vec![10, 128, 0, 0], 9),
-        ];
+        let cidrs = vec![Cidr::new(vec![10, 0, 0, 0], 8), Cidr::new(vec![10, 128, 0, 0], 9)];
         let ipset = IPSet::from_cidrs(&cidrs);
         assert!(ipset.contains_v4(Ipv4Addr::new(10, 0, 0, 0)));
         assert!(ipset.contains_v4(Ipv4Addr::new(10, 127, 255, 255)));
@@ -1173,10 +1155,7 @@ mod tests {
     #[test]
     fn ipset_adjacent_ranges_boundary() {
         // 10.0.0.0/8 与 11.0.0.0/8 相邻不相交：两侧边界全命中，外部 miss
-        let cidrs = vec![
-            Cidr::new(vec![11, 0, 0, 0], 8),
-            Cidr::new(vec![10, 0, 0, 0], 8),
-        ];
+        let cidrs = vec![Cidr::new(vec![11, 0, 0, 0], 8), Cidr::new(vec![10, 0, 0, 0], 8)];
         let ipset = IPSet::from_cidrs(&cidrs);
         assert!(ipset.contains_v4(Ipv4Addr::new(10, 255, 255, 255)));
         assert!(ipset.contains_v4(Ipv4Addr::new(11, 0, 0, 0)));
@@ -1190,20 +1169,14 @@ mod tests {
         assert!(v4_only.is_empty_v6());
         assert!(!v4_only.contains_v6(Ipv6Addr::LOCALHOST));
 
-        let v6_only = IPSet::from_cidrs(&[Cidr::new(
-            Ipv6Addr::LOCALHOST.octets().to_vec(),
-            128,
-        )]);
+        let v6_only = IPSet::from_cidrs(&[Cidr::new(Ipv6Addr::LOCALHOST.octets().to_vec(), 128)]);
         assert!(v6_only.is_empty_v4());
         assert!(!v6_only.contains_v4(Ipv4Addr::new(127, 0, 0, 1)));
     }
 
     #[test]
     fn ipset_duplicate_cidrs() {
-        let cidrs = vec![
-            Cidr::new(vec![192, 168, 0, 0], 16),
-            Cidr::new(vec![192, 168, 0, 0], 16),
-        ];
+        let cidrs = vec![Cidr::new(vec![192, 168, 0, 0], 16), Cidr::new(vec![192, 168, 0, 0], 16)];
         let ipset = IPSet::from_cidrs(&cidrs);
         assert!(ipset.contains_v4(Ipv4Addr::new(192, 168, 1, 1)));
         assert!(!ipset.contains_v4(Ipv4Addr::new(192, 169, 0, 0)));
@@ -1216,17 +1189,15 @@ mod tests {
         for _ in 0..200 {
             let raw = xorshift64(&mut rng) as u32;
             let prefix = (xorshift64(&mut rng) % 33) as u8;
-            cidrs.push(Cidr::new(
-                Ipv4Addr::from(raw).octets().to_vec(),
-                prefix as u32,
-            ));
+            cidrs.push(Cidr::new(Ipv4Addr::from(raw).octets().to_vec(), prefix as u32));
         }
         let ipset = IPSet::from_cidrs(&cidrs);
         for w in ipset.ipv4_ranges.windows(2) {
             assert!(
                 w[0].1 < w[1].0,
                 "ranges must be sorted and disjoint: {:?} then {:?}",
-                w[0], w[1]
+                w[0],
+                w[1]
             );
         }
         assert!(
@@ -1238,8 +1209,10 @@ mod tests {
 
 // ── IP registry (热替换) ─────────────────────────────────────────
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 /// IP 匹配器注册表 + 热替换。
 ///
@@ -1261,11 +1234,7 @@ struct RegistryEntry {
 impl IpRegistry {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            inner: RwLock::new(IpRegistryInner {
-                entries: Vec::new(),
-            }),
-        }
+        Self { inner: RwLock::new(IpRegistryInner { entries: Vec::new() }) }
     }
 
     /// 添加一组规则并返回动态 IP 匹配器。
@@ -1276,20 +1245,14 @@ impl IpRegistry {
         let initial = build_optimized_ip_matcher(rules)?;
         let matcher = Arc::new(DynamicIPMatcher::new(initial));
         let mut g = self.inner.write().expect("IpRegistry poisoned");
-        g.entries.push(RegistryEntry {
-            matcher: Arc::clone(&matcher),
-            rules: rules.to_vec(),
-        });
+        g.entries.push(RegistryEntry { matcher: Arc::clone(&matcher), rules: rules.to_vec() });
         Ok(matcher)
     }
 
     /// 用新规则列表重建所有匹配器（原子热切换）。
     ///
     /// 对应 Go `IPRegistry.Reload`：每个 entry 用 new_rules 重建 matcher。
-    pub fn reload_with(
-        &self,
-        new_rules: &[IpRule],
-    ) -> Result<(), BuildIPMatcherError> {
+    pub fn reload_with(&self, new_rules: &[IpRule]) -> Result<(), BuildIPMatcherError> {
         // 一次拷出 entries 引用，避免长时间持写锁。
         let entries: Vec<Arc<DynamicIPMatcher>> = {
             let g = self.inner.read().expect("IpRegistry poisoned");
@@ -1387,21 +1350,27 @@ impl IPMatcher for DynamicIPMatcher {
     fn match_ip(&self, ip: IpAddr) -> bool {
         self.with_state(|m| m.match_ip(ip))
     }
+
     fn any_match(&self, ips: &[IpAddr]) -> bool {
         self.with_state(|m| m.any_match(ips))
     }
+
     fn matches(&self, ips: &[IpAddr]) -> bool {
         self.with_state(|m| m.matches(ips))
     }
+
     fn filter_ips(&self, ips: &[IpAddr]) -> Vec<IpAddr> {
         self.with_state(|m| m.filter_ips(ips))
     }
+
     fn reverse(&self) -> bool {
         self.reverse.load(Ordering::Acquire)
     }
+
     fn set_reverse(&mut self, _reverse: bool) {
         // DynamicIPMatcher 顶层 API 请用 set_reverse(&self)。
     }
+
     fn toggle_reverse(&mut self) {
         // 同上：通过顶层 toggle_reverse(&self) 调用。
     }
@@ -1409,9 +1378,7 @@ impl IPMatcher for DynamicIPMatcher {
 
 impl std::fmt::Debug for DynamicIPMatcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DynamicIPMatcher")
-            .field("reverse", &self.reverse())
-            .finish()
+        f.debug_struct("DynamicIPMatcher").field("reverse", &self.reverse()).finish()
     }
 }
 
@@ -1420,4 +1387,3 @@ impl std::fmt::Debug for DynamicIPMatcher {
 /// 对应 Go `commongeodata.IPReg`。`routing` 层在 reload 时通过此处触达
 /// 所有已注册的 IP matcher。如需 per-instance registry，优先本地 `new()`。
 pub static IP_REG: std::sync::LazyLock<IpRegistry> = std::sync::LazyLock::new(IpRegistry::new);
-

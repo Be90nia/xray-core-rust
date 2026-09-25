@@ -23,12 +23,10 @@ pub mod scheduler;
 pub mod swap;
 pub use config::{GeodataAsset, GeodataConfig};
 pub use downloader::{
-    download_assets, reload_with_update, AssetDownloader,
-    DefaultAssetDownloader, GeodataReloader, NoopReloader, RealAssetDownloader,
+    AssetDownloader, DefaultAssetDownloader, GeodataReloader, NoopReloader, RealAssetDownloader,
+    download_assets, reload_with_update,
 };
-pub use scheduler::CronScheduler;
-pub use error::{at_error, at_warning, GeodataError};
+pub use error::{GeodataError, at_error, at_warning};
 pub use feature::GeodataFeature;
-pub use instance::{
-    GeodataInstance, NoopScheduler, ScheduleHandle, Scheduler,
-};
+pub use instance::{GeodataInstance, NoopScheduler, ScheduleHandle, Scheduler};
+pub use scheduler::CronScheduler;

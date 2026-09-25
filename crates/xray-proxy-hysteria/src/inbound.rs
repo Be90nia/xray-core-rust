@@ -18,23 +18,25 @@
 //! [`StaticAuthValidator`] 做简单字符串匹配（config.auth == 客户端 auth 头），
 //! [`MultiUserValidator`] 支持多用户动态增删，对应 Go `account.Validator`。
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tokio::{sync::Mutex, task::JoinHandle};
 use tracing::info;
 use xray_features::inbound::{InboundError, InboundHandler};
 use xray_proto::xray::transport::internet::QuicParams;
-use xray_transport_hysteria::conn::{InterConn, InterStreamConn};
-use xray_transport_hysteria::hub::{
-    AuthValidator, HysteriaListener, HysteriaListenerFactory, HysteriaQuicListener, MasqType,
+use xray_transport_hysteria::{
+    conn::{InterConn, InterStreamConn},
+    hub::{
+        AuthValidator, HysteriaListener, HysteriaListenerFactory, HysteriaQuicListener, MasqType,
+    },
+    proto_config::Config as ProtoConfig,
 };
-use xray_transport_hysteria::proto_config::Config as ProtoConfig;
 
-use crate::config::{HysteriaConfig, HysteriaInboundConfig, MultiUserValidator};
-use crate::error::Result;
+use crate::{
+    config::{HysteriaConfig, HysteriaInboundConfig, MultiUserValidator},
+    error::Result,
+};
 
 /// TCP 流量调度器 trait（对应 Go `routing.Dispatcher`）。
 ///
@@ -62,19 +64,13 @@ pub struct StaticAuthValidator {
 impl StaticAuthValidator {
     #[must_use]
     pub fn new(expected: impl Into<String>) -> Self {
-        Self {
-            expected: expected.into(),
-        }
+        Self { expected: expected.into() }
     }
 }
 
 impl AuthValidator for StaticAuthValidator {
     fn validate(&self, auth: &str) -> Option<String> {
-        if auth == self.expected {
-            Some(self.expected.clone())
-        } else {
-            None
-        }
+        if auth == self.expected { Some(self.expected.clone()) } else { None }
     }
 
     fn count(&self) -> usize {
@@ -184,7 +180,8 @@ impl HysteriaInboundHandler {
         let bind_addr_str = inbound_config.bind_addr.clone();
         let bind_addr: SocketAddr = bind_addr_str.parse().map_err(|e| {
             crate::error::HysteriaProxyError::InvalidConfig(format!(
-                "invalid bind_addr '{}': {e}", bind_addr_str
+                "invalid bind_addr '{}': {e}",
+                bind_addr_str
             ))
         })?;
         // 构造内部 HysteriaConfig（复用现有 build_proto_config 逻辑）
@@ -297,8 +294,8 @@ impl InboundHandler for HysteriaInboundHandler {
         // on_new_udp_session 回调：auth 后每个新 UDP session（首包 4B session id）触发。
         // 对应 Go server.go UDP 分支——每个 session 当一条虚拟连接 dispatch。
         let udp_dispatcher = self.udp_dispatcher.clone();
-        let on_new_udp_session: Option<Arc<dyn Fn(Arc<InterConn>) + Send + Sync>> =
-            udp_dispatcher.map(|disp| {
+        let on_new_udp_session: Option<Arc<dyn Fn(Arc<InterConn>) + Send + Sync>> = udp_dispatcher
+            .map(|disp| {
                 Arc::new(move |sess: Arc<InterConn>| {
                     let disp = Arc::clone(&disp);
                     tokio::spawn(async move {
@@ -342,11 +339,7 @@ impl InboundHandler for HysteriaInboundHandler {
             info!(tag = %tag, "hysteria inbound listener started");
         });
 
-        *slot = Some(InboundSlot {
-            _listener: listener,
-            quic_listener,
-            _accept_task: accept_task,
-        });
+        *slot = Some(InboundSlot { _listener: listener, quic_listener, _accept_task: accept_task });
         Ok(())
     }
 
@@ -406,7 +399,7 @@ async fn handle_tcp_stream(
                 stream.write(&resp_buf).await?;
                 // 调度到 dispatcher
                 return dispatcher.dispatch_tcp(&addr, stream).await;
-            }
+            },
             Err(crate::error::HysteriaProxyError::ProtocolParse(_)) => {
                 // 数据可能不完整，继续读
                 if buf.len() > 8192 {
@@ -420,7 +413,7 @@ async fn handle_tcp_stream(
                     ));
                 }
                 continue;
-            }
+            },
             Err(e) => {
                 // 其他错误（地址非法等），写拒绝响应
                 let mut err_resp = Vec::new();
@@ -430,7 +423,7 @@ async fn handle_tcp_stream(
                     std::io::ErrorKind::InvalidData,
                     format!("tcp request parse error: {e}"),
                 ));
-            }
+            },
         }
     }
 }
@@ -445,8 +438,9 @@ async fn handle_udp_session(
     sess: Arc<InterConn>,
     dispatcher: Arc<dyn xray_app_dispatcher::DispatchHandler>,
 ) -> std::io::Result<()> {
-    use crate::protocol::{Defragger, UdpMessage};
     use xray_app_dispatcher::UdpDispatchSession;
+
+    use crate::protocol::{Defragger, UdpMessage};
 
     let mut session = UdpDispatchSession::new(dispatcher);
     let mut df = Defragger::new();
@@ -504,12 +498,11 @@ async fn handle_udp_session(
     Ok(())
 }
 
-
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use xray_transport_hysteria::hub::StubListenerFactory;
+
+    use super::*;
 
     fn make_handler(auth: &str) -> HysteriaInboundHandler {
         let cfg = HysteriaConfig::new("0.0.0.0:0", auth);

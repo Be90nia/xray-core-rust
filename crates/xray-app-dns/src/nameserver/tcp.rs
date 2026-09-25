@@ -13,29 +13,36 @@
 //! - TLS 包装（DoT 见 follow-up 任务）
 //! - 长连接复用（每次查询都新连接；ponytail：简化代码，连接池可后续加）
 
-use std::future::Future;
-use std::io;
-use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    future::Future,
+    io,
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use hickory_proto::rr::RecordType;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::timeout;
-
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::port::Port;
-
-use crate::cache_controller::CacheController;
-use crate::config::IpOption;
-use crate::dnscommon::{
-    build_dns_query, parse_dns_response, parsed_to_ip_record, AtomicReqIdGen, IpRecord, ReqIdGen,
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    time::timeout,
 };
-use crate::error::DnsError;
-use crate::nameserver::cached::{query_ip, CachedNameserver, QueryOutcome};
-use crate::nameserver::{local, NameServerConfig, Server};
+use xray_common::net::{address::Address, destination::Destination, port::Port};
+
+use crate::{
+    cache_controller::CacheController,
+    config::IpOption,
+    dnscommon::{
+        AtomicReqIdGen, IpRecord, ReqIdGen, build_dns_query, parse_dns_response,
+        parsed_to_ip_record,
+    },
+    error::DnsError,
+    nameserver::{
+        NameServerConfig, Server,
+        cached::{CachedNameserver, QueryOutcome, query_ip},
+        local,
+    },
+};
 
 /// TCP DNS 单次响应最大字节数（DNS over TCP 理论上限 65535；实际 rarely > 4096）。
 const TCP_RECV_MAX: usize = 65535;
@@ -144,16 +151,19 @@ impl TcpNameServer {
         record_type: RecordType,
     ) -> Result<IpRecord, DnsError> {
         timeout(self.query_timeout, stream.write_all(len_be))
-            .await.map_err(|_| DnsError::WireFormat("tcp write len timeout".to_string()))?
+            .await
+            .map_err(|_| DnsError::WireFormat("tcp write len timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("tcp write len: {e}")))?;
         timeout(self.query_timeout, stream.write_all(payload))
-            .await.map_err(|_| DnsError::WireFormat("tcp write payload timeout".to_string()))?
+            .await
+            .map_err(|_| DnsError::WireFormat("tcp write payload timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("tcp write payload: {e}")))?;
         stream.flush().await.map_err(io_to_dns)?;
 
         let mut len_buf = [0u8; 2];
         timeout(self.query_timeout, stream.read_exact(&mut len_buf))
-            .await.map_err(|_| DnsError::WireFormat("tcp read len timeout".to_string()))?
+            .await
+            .map_err(|_| DnsError::WireFormat("tcp read len timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("tcp read len: {e}")))?;
         let resp_len = usize::from(u16::from_be_bytes(len_buf));
         if resp_len == 0 || resp_len > TCP_RECV_MAX {
@@ -162,7 +172,8 @@ impl TcpNameServer {
 
         let mut buf = vec![0u8; resp_len];
         timeout(self.query_timeout, stream.read_exact(&mut buf))
-            .await.map_err(|_| DnsError::WireFormat("tcp read payload timeout".to_string()))?
+            .await
+            .map_err(|_| DnsError::WireFormat("tcp read payload timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("tcp read payload: {e}")))?;
 
         let now = Instant::now();
@@ -171,11 +182,7 @@ impl TcpNameServer {
     }
 
     /// 发送单次 DNS 查询（TCP），等待响应。连接池复用连接，失败时重试一次。
-    async fn query_once(
-        &self,
-        fqdn: &str,
-        record_type: RecordType,
-    ) -> Result<IpRecord, DnsError> {
+    async fn query_once(&self, fqdn: &str, record_type: RecordType) -> Result<IpRecord, DnsError> {
         let req_id = self.id_gen.next_id();
         let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
         let len_be = u16::try_from(payload.len())
@@ -187,9 +194,7 @@ impl TcpNameServer {
             // 地址变更后新查询必须用新 IP。运行期解析在 connect() 内
             // （经路由出站交路由系统；直连兜底每查询现解析）。
             let mut stream = self.connect().await?;
-            return self
-                .try_query(&mut stream, &len_be, &payload, req_id, record_type)
-                .await;
+            return self.try_query(&mut stream, &len_be, &payload, req_id, record_type).await;
         }
 
         let mut conn_guard = self.conn.lock().await;
@@ -197,15 +202,19 @@ impl TcpNameServer {
             *conn_guard = Some(self.connect().await?);
         }
 
-        match self.try_query(conn_guard.as_mut().unwrap(), &len_be, &payload, req_id, record_type).await {
+        match self
+            .try_query(conn_guard.as_mut().unwrap(), &len_be, &payload, req_id, record_type)
+            .await
+        {
             Ok(result) => Ok(result),
             Err(e) => {
                 // 首查失败静默重连不可观测（iq1o）：记录首查错误再重试。
                 tracing::debug!(error = %e, "DNS-over-TCP query on pooled connection failed, reconnecting");
                 *conn_guard = None;
                 *conn_guard = Some(self.connect().await?);
-                self.try_query(conn_guard.as_mut().unwrap(), &len_be, &payload, req_id, record_type).await
-            }
+                self.try_query(conn_guard.as_mut().unwrap(), &len_be, &payload, req_id, record_type)
+                    .await
+            },
         }
     }
 }
@@ -272,14 +281,17 @@ pub fn new_tcp_local_name_server(ns: &NameServerConfig) -> Result<Box<dyn Server
 
 #[cfg(test)]
 mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use hickory_proto::{
+        op::{Message, MessageType, OpCode, Query},
+        rr::{Name, RData, Record, RecordType},
+    };
+    use tokio::{io::AsyncWriteExt, net::TcpListener};
+    use xray_transport::connection::TcpConnection;
+
     use super::*;
     use crate::config::IpOption;
-    use hickory_proto::op::{Message, MessageType, OpCode, Query};
-    use hickory_proto::rr::{Name, RData, Record, RecordType};
-    use std::net::{Ipv4Addr, Ipv6Addr};
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
-    use xray_transport::connection::TcpConnection;
 
     /// 共享 dialer 槽是进程级全局：涉 dialer 的测试须串行。
     static DIALER_SLOT_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
@@ -288,13 +300,13 @@ mod tests {
         Destination::tcp(Address::from(addr.ip()), Port::new(addr.port()))
     }
 
-
     fn make_a_response(req_id: u16, fqdn: &str, ips: Vec<Ipv4Addr>, ttl: u32) -> Vec<u8> {
         let name = Name::parse(fqdn, None).unwrap();
         let mut msg = Message::new(req_id, MessageType::Response, OpCode::Query);
         msg.add_query(Query::query(name.clone(), RecordType::A));
         for ip in ips {
-            let rec = Record::from_rdata(name.clone(), ttl, RData::A(hickory_proto::rr::rdata::A(ip)));
+            let rec =
+                Record::from_rdata(name.clone(), ttl, RData::A(hickory_proto::rr::rdata::A(ip)));
             msg.add_answer(rec);
         }
         msg.to_vec().unwrap()
@@ -333,7 +345,8 @@ mod tests {
     #[tokio::test]
     async fn tcp_query_once_returns_a_record() {
         let _slot = DIALER_SLOT_LOCK.lock();
-        let (addr, _h) = spawn_mock_tcp_server("example.com.", vec![Ipv4Addr::new(10, 0, 0, 1)], 120).await;
+        let (addr, _h) =
+            spawn_mock_tcp_server("example.com.", vec![Ipv4Addr::new(10, 0, 0, 1)], 120).await;
         let ns = TcpNameServer::new(
             ip_dest(addr),
             Arc::new(CacheController::new("test", true, false, 0, 0)),
@@ -361,11 +374,7 @@ mod tests {
         let outcome = ns
             .send_query(
                 "z.com.",
-                IpOption {
-                    ipv4_enable: true,
-                    ipv6_enable: false,
-                    fake_enable: false,
-                },
+                IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },
             )
             .await;
         assert!(outcome.rec_v4.is_some());
@@ -391,11 +400,7 @@ mod tests {
         let outcome = ns
             .send_query(
                 "slow.com.",
-                IpOption {
-                    ipv4_enable: true,
-                    ipv6_enable: false,
-                    fake_enable: false,
-                },
+                IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },
             )
             .await;
         // TCP connect 成功（listener 在），但 read 等到 timeout。
@@ -418,8 +423,8 @@ mod tests {
             let dest = dest.clone();
             Box::pin(async move {
                 let ip = dest.address().ip().expect("test dest is IP");
-                let sock =
-                    tokio::net::TcpStream::connect(SocketAddr::new(ip, dest.port().value())).await?;
+                let sock = tokio::net::TcpStream::connect(SocketAddr::new(ip, dest.port().value()))
+                    .await?;
                 Ok(Box::new(TcpConnection::new(sock)) as crate::dial::DnsStream)
             })
         }
@@ -427,11 +432,12 @@ mod tests {
         fn dial_udp(
             &self,
             _dest: &Destination,
-        ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn crate::dial::UdpPacketSession>>> + Send + '_>>
-        {
-            Box::pin(async {
-                Err(io::Error::new(io::ErrorKind::Unsupported, "tcp test dialer"))
-            })
+        ) -> Pin<
+            Box<
+                dyn Future<Output = io::Result<Box<dyn crate::dial::UdpPacketSession>>> + Send + '_,
+            >,
+        > {
+            Box::pin(async { Err(io::Error::new(io::ErrorKind::Unsupported, "tcp test dialer")) })
         }
     }
 
@@ -440,7 +446,8 @@ mod tests {
     #[tokio::test]
     async fn tcp_query_routes_through_dialer() {
         let _slot = DIALER_SLOT_LOCK.lock();
-        let (addr, _h) = spawn_mock_tcp_server("routed.com.", vec![Ipv4Addr::new(10, 0, 0, 9)], 60).await;
+        let (addr, _h) =
+            spawn_mock_tcp_server("routed.com.", vec![Ipv4Addr::new(10, 0, 0, 9)], 60).await;
 
         let dialer = Arc::new(RecordingDialer::default());
         crate::dial::set_shared_dialer(Some(dialer.clone()));
@@ -524,9 +531,7 @@ mod tests {
         assert_eq!(r1.ips, vec![IpAddr::V4(Ipv4Addr::new(10, 9, 0, 1))]);
 
         // 上游地址"变更"。
-        resolver
-            .to_b
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        resolver.to_b.store(true, std::sync::atomic::Ordering::SeqCst);
 
         // 新查询 → 解析到 B server，回 B 记录（新 IP 生效）。
         let r2 = ns.query_once("var.com.", RecordType::A).await.unwrap();
@@ -539,10 +544,7 @@ mod tests {
     }
 
     /// 在指定 listener 上 accept 一次并回 A 记录响应。
-    fn spawn_echo_server(
-        listener: TcpListener,
-        reply_ip: Ipv4Addr,
-    ) -> tokio::task::JoinHandle<()> {
+    fn spawn_echo_server(listener: TcpListener, reply_ip: Ipv4Addr) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut len_buf = [0u8; 2];

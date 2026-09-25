@@ -1,26 +1,27 @@
 //! Freedom TCP 分片。对应 Go `proxy/freedom/freedom.go` FragmentWriter (:730-815)。
 //!
 //! 两模式（对齐 Go `Write`）：
-//! - **tlshello**（`packets_from==0 && packets_to==1`）：仅首包且为完整 TLS
-//!   handshake record（`b[0]==22` 且 `len>=recordLen`）时，把 record payload 按
-//!   随机长度重组为多个独立 TLS record 发送；`interval_max==0` 时合并为一次
-//!   write（Go `hello`），record 后的剩余字节直发。非首包/非 TLS/半截 record 直发。
-//! - **通用**（其他配置）：`packets_from!=0` 时仅窗口 `[from,to]` 内的包分片
-//!   （`packets 0-0` = 所有包都分片）；每片独立 write + 写后 sleep。
+//! - **tlshello**（`packets_from==0 && packets_to==1`）：仅首包且为完整 TLS handshake
+//!   record（`b[0]==22` 且 `len>=recordLen`）时，把 record payload 按 随机长度重组为多个独立 TLS
+//!   record 发送；`interval_max==0` 时合并为一次 write（Go `hello`），record
+//!   后的剩余字节直发。非首包/非 TLS/半截 record 直发。
+//! - **通用**（其他配置）：`packets_from!=0` 时仅窗口 `[from,to]` 内的包分片 （`packets 0-0` =
+//!   所有包都分片）；每片独立 write + 写后 sleep。
 //!
 //! 消费方：[`FragmentStream`]（直接 async 写，测试/独立路径）与
 //! [`FragmentConnection`]（dispatcher TCP 路径 dial 后包装 Connection，
 //! 对齐 Go :410-418 `writer = buf.NewWriter(&FragmentWriter{...})`）。
 
-use std::collections::VecDeque;
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use std::time::Duration;
+use std::{
+    collections::VecDeque,
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
-
 use xray_transport::connection::Connection;
 
 use crate::config::Fragment;
@@ -154,7 +155,7 @@ impl<W: AsyncWrite + Unpin> FragmentStream<W> {
         match build_pieces(&self.fragment, self.count, buf) {
             None => {
                 self.writer.write_all(buf).await?;
-            }
+            },
             Some(pieces) => {
                 for (data, sleep_after) in pieces {
                     self.writer.write_all(&data).await?;
@@ -163,7 +164,7 @@ impl<W: AsyncWrite + Unpin> FragmentStream<W> {
                             .await;
                     }
                 }
-            }
+            },
         }
         Ok(buf.len())
     }
@@ -213,7 +214,11 @@ impl FragmentConnection {
 }
 
 impl AsyncRead for FragmentConnection {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         Pin::new(&mut *self.get_mut().inner).poll_read(cx, buf)
     }
 }
@@ -223,7 +228,11 @@ impl AsyncWrite for FragmentConnection {
     ///
     /// 与 tokio 约定一致：`Ready(Ok(n))` 的 `n` 恒为当初接受的 `buf.len()`
     /// （整个缓冲已被分片计划消费）；忙时忽略新 `buf` 继续推进未完成的写。
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         if !this.busy() {
             if buf.is_empty() {
@@ -250,7 +259,7 @@ impl AsyncWrite for FragmentConnection {
                         let n = this.accepted;
                         this.accepted = 0;
                         return Poll::Ready(Ok(n));
-                    }
+                    },
                 }
             }
             let (data, off, _) = this.current.as_mut().expect("current set");
@@ -261,7 +270,7 @@ impl AsyncWrite for FragmentConnection {
                         io::ErrorKind::WriteZero,
                         "fragment write: inner connection wrote 0 bytes",
                     )));
-                }
+                },
                 Poll::Ready(Ok(n)) => {
                     if *off + n >= data.len() {
                         let (_, _, sleep_after) = this.current.take().expect("current set");
@@ -273,11 +282,11 @@ impl AsyncWrite for FragmentConnection {
                     } else {
                         *off += n;
                     }
-                }
+                },
                 Poll::Ready(Err(e)) => {
                     this.reset();
                     return Poll::Ready(Err(e));
-                }
+                },
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -309,13 +318,17 @@ impl Connection for FragmentConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{FragmentConnection, FragmentStream, rand_between};
-    use crate::config::Fragment;
-    use std::pin::Pin;
-    use std::sync::Arc;
-    use std::task::{Context, Poll};
+    use std::{
+        pin::Pin,
+        sync::Arc,
+        task::{Context, Poll},
+    };
+
     use parking_lot::Mutex;
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    use super::{FragmentConnection, FragmentStream, rand_between};
+    use crate::config::Fragment;
 
     /// 记录每次 poll_write 字节的测试流（读端永远 Pending）。
     struct RecStream {
@@ -323,19 +336,29 @@ mod tests {
     }
 
     impl AsyncRead for RecStream {
-        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
             Poll::Pending
         }
     }
 
     impl AsyncWrite for RecStream {
-        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
             self.writes.lock().push(buf.to_vec());
             Poll::Ready(Ok(buf.len()))
         }
+
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
@@ -362,7 +385,13 @@ mod tests {
         out
     }
 
-    fn frag(packets_from: u64, packets_to: u64, len: u64, interval_max: u64, max_split: u64) -> Fragment {
+    fn frag(
+        packets_from: u64,
+        packets_to: u64,
+        len: u64,
+        interval_max: u64,
+        max_split: u64,
+    ) -> Fragment {
         Fragment {
             packets_from,
             packets_to,
@@ -381,7 +410,6 @@ mod tests {
         stream.write_fragmented(buf).await.unwrap();
     }
 
-
     // ===== tlshello 模式（packets 0-1） =====
 
     /// 首包 TLS record：按 length 固定 4 字节重组分片，interval=0 合并为一次 write。
@@ -391,14 +419,19 @@ mod tests {
         let payload: Vec<u8> = (0..12u8).collect();
         let b = tls_record(&payload);
         let writes_rec = Arc::new(Mutex::new(Vec::new()));
-        let mut s = FragmentStream::new(frag(0, 1, 4, 0, 0), RecStream { writes: writes_rec.clone() });
+        let mut s =
+            FragmentStream::new(frag(0, 1, 4, 0, 0), RecStream { writes: writes_rec.clone() });
         run(&mut s, &b).await;
 
         let ws = writes_rec.lock().clone();
         // interval_max == 0 → 合并发送（Go freedom.go:767-768）
         assert_eq!(ws.len(), 1, "combined into one write");
         let records = parse_records(&ws[0]);
-        assert!(records.len() >= 3, "payload 12 bytes / piece 4 → at least 3 records, got {}", records.len());
+        assert!(
+            records.len() >= 3,
+            "payload 12 bytes / piece 4 → at least 3 records, got {}",
+            records.len()
+        );
         for (typ, ver, _) in &records {
             assert_eq!(*typ, 22);
             assert_eq!(*ver, [3, 1], "version bytes preserved from original");
@@ -413,7 +446,8 @@ mod tests {
         let payload: Vec<u8> = (0..12u8).collect();
         let b = tls_record(&payload);
         let writes_rec = Arc::new(Mutex::new(Vec::new()));
-        let mut s = FragmentStream::new(frag(0, 1, 4, 10, 0), RecStream { writes: writes_rec.clone() });
+        let mut s =
+            FragmentStream::new(frag(0, 1, 4, 10, 0), RecStream { writes: writes_rec.clone() });
         run(&mut s, &b).await;
         let ws = writes_rec.lock().clone();
         assert_eq!(ws.len(), 3, "12 bytes / piece 4 → 3 separate writes");
@@ -423,7 +457,8 @@ mod tests {
     #[tokio::test]
     async fn tlshello_non_tls_first_packet_passthrough() {
         let writes_rec = Arc::new(Mutex::new(Vec::new()));
-        let mut s = FragmentStream::new(frag(0, 1, 4, 10, 0), RecStream { writes: writes_rec.clone() });
+        let mut s =
+            FragmentStream::new(frag(0, 1, 4, 10, 0), RecStream { writes: writes_rec.clone() });
         let b = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
         run(&mut s, b).await;
         let ws = writes_rec.lock().clone();
@@ -437,7 +472,8 @@ mod tests {
         let mut b = tls_record(&[0u8; 20]);
         b.truncate(10); // record 声称 20 字节但只有 5
         let writes_rec = Arc::new(Mutex::new(Vec::new()));
-        let mut s = FragmentStream::new(frag(0, 1, 4, 10, 0), RecStream { writes: writes_rec.clone() });
+        let mut s =
+            FragmentStream::new(frag(0, 1, 4, 10, 0), RecStream { writes: writes_rec.clone() });
         run(&mut s, &b).await;
         let ws = writes_rec.lock().clone();
         assert_eq!(ws.len(), 1);
@@ -448,7 +484,8 @@ mod tests {
     #[tokio::test]
     async fn tlshello_only_first_packet_fragmented() {
         let writes_rec = Arc::new(Mutex::new(Vec::new()));
-        let mut s = FragmentStream::new(frag(0, 1, 4, 10, 0), RecStream { writes: writes_rec.clone() });
+        let mut s =
+            FragmentStream::new(frag(0, 1, 4, 10, 0), RecStream { writes: writes_rec.clone() });
         run(&mut s, &tls_record(&[7u8; 12])).await;
         run(&mut s, &tls_record(&[8u8; 12])).await;
         let ws = writes_rec.lock().clone();
@@ -465,14 +502,16 @@ mod tests {
     #[tokio::test]
     async fn generic_window_fragment_packets_2_to_3_only() {
         let writes_rec = Arc::new(Mutex::new(Vec::new()));
-        let mut s = FragmentStream::new(frag(2, 3, 3, 10, 0), RecStream { writes: writes_rec.clone() });
+        let mut s =
+            FragmentStream::new(frag(2, 3, 3, 10, 0), RecStream { writes: writes_rec.clone() });
         run(&mut s, b"packet-one-1111").await; // 包 1：窗外 → 直发
         let ws = writes_rec.lock().clone();
         assert_eq!(ws.len(), 1, "packet 1 outside window: direct");
         assert_eq!(ws[0], b"packet-one-1111".to_vec());
 
         let writes_rec2 = Arc::new(Mutex::new(Vec::new()));
-        let mut s2 = FragmentStream::new(frag(2, 3, 3, 10, 0), RecStream { writes: writes_rec2.clone() });
+        let mut s2 =
+            FragmentStream::new(frag(2, 3, 3, 10, 0), RecStream { writes: writes_rec2.clone() });
         run(&mut s2, b"packet-one-1111").await; // 包 1 窗外
         run(&mut s2, b"packet-two-2222").await; // 包 2 窗内 → 分片
         let ws2 = writes_rec2.lock().clone();
@@ -493,7 +532,8 @@ mod tests {
     #[tokio::test]
     async fn generic_all_packets_mode_fragments_everything() {
         let writes_rec = Arc::new(Mutex::new(Vec::new()));
-        let mut s = FragmentStream::new(frag(0, 0, 3, 10, 0), RecStream { writes: writes_rec.clone() });
+        let mut s =
+            FragmentStream::new(frag(0, 0, 3, 10, 0), RecStream { writes: writes_rec.clone() });
         run(&mut s, b"first-packet!").await;
         run(&mut s, b"second-packet").await;
         let ws = writes_rec.lock().clone();
@@ -506,7 +546,8 @@ mod tests {
     #[tokio::test]
     async fn generic_maxsplit_caps_piece_count() {
         let writes_rec = Arc::new(Mutex::new(Vec::new()));
-        let mut s = FragmentStream::new(frag(0, 0, 1, 10, 2), RecStream { writes: writes_rec.clone() });
+        let mut s =
+            FragmentStream::new(frag(0, 0, 1, 10, 2), RecStream { writes: writes_rec.clone() });
         run(&mut s, &[9u8; 10]).await;
         let ws = writes_rec.lock().clone();
         assert_eq!(ws.len(), 2, "maxSplit=2 → exactly 2 pieces");
@@ -517,11 +558,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn generic_interval_sleeps_between_pieces() {
         let writes_rec = Arc::new(Mutex::new(Vec::new()));
-        let mut s = FragmentStream::new(frag(0, 0, 1, 10, 0), RecStream { writes: writes_rec.clone() });
+        let mut s =
+            FragmentStream::new(frag(0, 0, 1, 10, 0), RecStream { writes: writes_rec.clone() });
         let start = tokio::time::Instant::now();
         run(&mut s, &[1u8; 3]).await;
         let elapsed = start.elapsed();
-        assert!(elapsed >= std::time::Duration::from_millis(30), "3 pieces × 10ms interval, got {elapsed:?}");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(30),
+            "3 pieces × 10ms interval, got {elapsed:?}"
+        );
     }
 
     // ===== rand_between =====
@@ -535,7 +580,9 @@ mod tests {
         for _ in 0..200 {
             let v = rand_between(1, 4);
             assert!((1..4).contains(&v));
-            if v == 3 { saw_to = true; }
+            if v == 3 {
+                saw_to = true;
+            }
         }
         assert!(saw_to, "upper-1 reachable");
     }
@@ -560,20 +607,30 @@ mod tests {
     }
 
     impl AsyncRead for PartialStream {
-        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
             Poll::Pending
         }
     }
 
     impl AsyncWrite for PartialStream {
-        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
             let n = buf.len().min(3);
             self.writes.lock().push(buf[..n].to_vec());
             Poll::Ready(Ok(n))
         }
+
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }

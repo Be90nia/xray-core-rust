@@ -14,13 +14,11 @@ pub(crate) mod state;
 pub(crate) mod tcp;
 pub(crate) mod udp;
 
-use std::io;
-use std::sync::Arc;
-use std::time::Duration;
-
-use crate::finalmask::{AsyncIo, Tcpmask, UdpIo, Udpmask};
+use std::{io, sync::Arc, time::Duration};
 
 pub use evaluator::{EvalContext, EvalValue, Expr, ExprArg};
+
+use crate::finalmask::{AsyncIo, Tcpmask, UdpIo, Udpmask};
 
 /// TCP 单个 item：一次 write/read 单元。
 #[derive(Debug, Clone, Default)]
@@ -96,12 +94,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
-            tcp: None,
-            udp: None,
-            udp_standalone: None,
-            state_ttl: Duration::from_secs(5),
-        }
+        Self { tcp: None, udp: None, udp_standalone: None, state_ttl: Duration::from_secs(5) }
     }
 }
 
@@ -131,11 +124,7 @@ impl Udpmask for Config {
         _level_count: usize,
     ) -> io::Result<Box<dyn UdpIo>> {
         match &self.udp {
-            Some(cfg) => Ok(Box::new(udp::UdpCustomClient::new(
-                raw,
-                cfg.clone(),
-                self.state_ttl,
-            )?)),
+            Some(cfg) => Ok(Box::new(udp::UdpCustomClient::new(raw, cfg.clone(), self.state_ttl)?)),
             None => Ok(raw),
         }
     }
@@ -147,11 +136,7 @@ impl Udpmask for Config {
         _level_count: usize,
     ) -> io::Result<Box<dyn UdpIo>> {
         match &self.udp {
-            Some(cfg) => Ok(Box::new(udp::UdpCustomServer::new(
-                raw,
-                cfg.clone(),
-                self.state_ttl,
-            )?)),
+            Some(cfg) => Ok(Box::new(udp::UdpCustomServer::new(raw, cfg.clone(), self.state_ttl)?)),
             None => Ok(raw),
         }
     }

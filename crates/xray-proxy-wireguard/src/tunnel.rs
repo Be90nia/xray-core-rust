@@ -9,25 +9,27 @@
 //!   不持有 UDP socket；调用方负责把 [`Output::Network`] 发出去、把收到的 WG 数据报喂给
 //!   [`Tunnel::decapsulate`]。
 //! - **切片2（待办）**：UDP socket driver loop——tokio task 持有 `UdpSocket` + `Tunnel`，
-//!   自动路由：socket → `decapsulate` → IP 包入口（`mpsc::Receiver` 或回调）；
-//!   IP 包出口 → `encapsulate` → socket。
+//!   自动路由：socket → `decapsulate` → IP 包入口（`mpsc::Receiver` 或回调）； IP 包出口 →
+//!   `encapsulate` → socket。
 //! - **切片3（待办）**：smoltcp netstack + InboundHandler / OutboundHandler 适配。
 //!
 //! ## boringtun API 关键点
 //!
-//! - `Tunn::new(static_private, peer_public, psk, keepalive, index, rate_limiter)`
-//!   —— `rate_limiter` 传 `None` 自动创建默认实例
+//! - `Tunn::new(static_private, peer_public, psk, keepalive, index, rate_limiter)` ——
+//!   `rate_limiter` 传 `None` 自动创建默认实例
 //! - `encapsulate(ip_pkt, &mut dst) -> TunnResult`——`dst` 由调用方预分配（≥ src.len()+32）
-//! - `decapsulate(src_addr, datagram, &mut dst) -> TunnResult`——返回 `WriteToNetwork`
-//!   时必须用空 datagram 再调，直到 `Done`（boringtun 的协议约定）
-//! - `TunnResult::WriteToNetwork(&mut [u8])` 是 dst 缓冲区的子切片，调用方必须立即
-//!   `.to_vec()` 复制后才能释放 dst
+//! - `decapsulate(src_addr, datagram, &mut dst) -> TunnResult`——返回 `WriteToNetwork` 时必须用空
+//!   datagram 再调，直到 `Done`（boringtun 的协议约定）
+//! - `TunnResult::WriteToNetwork(&mut [u8])` 是 dst 缓冲区的子切片，调用方必须立即 `.to_vec()`
+//!   复制后才能释放 dst
 //! - 无 async API、无 timer 线程，需要外部驱动 [`Tunnel::update_timers`]
 
 use std::time::Duration;
 
-use boringtun::noise::{Tunn, TunnResult};
-use boringtun::x25519::{PublicKey, StaticSecret};
+use boringtun::{
+    noise::{Tunn, TunnResult},
+    x25519::{PublicKey, StaticSecret},
+};
 
 use crate::error::{Result, WgError};
 
@@ -122,11 +124,8 @@ impl Tunnel {
         } else {
             Some(peer.keep_alive.min(u32::from(u16::MAX)) as u16)
         };
-        let psk = if peer.pre_shared_key.is_empty() {
-            None
-        } else {
-            Some(peer.pre_shared_key.as_str())
-        };
+        let psk =
+            if peer.pre_shared_key.is_empty() { None } else { Some(peer.pre_shared_key.as_str()) };
         Self::new(&device.secret_key, &peer.public_key, psk, keepalive, 0)
     }
 
@@ -141,11 +140,9 @@ impl Tunnel {
             TunnResult::Done => Ok(Vec::new()),
             TunnResult::Err(e) => Err(WgError::HandshakeFailed(format!("encapsulate: {e:?}"))),
             // encapsulate 永远不返回 WriteToTunnel*（输入已是 IP 包）
-            TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => {
-                Err(WgError::HandshakeFailed(
-                    "encapsulate returned unexpected WriteToTunnel".into(),
-                ))
-            }
+            TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => Err(
+                WgError::HandshakeFailed("encapsulate returned unexpected WriteToTunnel".into()),
+            ),
         }
     }
 
@@ -162,14 +159,14 @@ impl Tunnel {
             match result {
                 TunnResult::WriteToTunnelV4(ip, _) | TunnResult::WriteToTunnelV6(ip, _) => {
                     out.push(Output::Ip(ip.to_vec()));
-                }
+                },
                 TunnResult::WriteToNetwork(reply) => {
                     out.push(Output::Network(reply.to_vec()));
-                }
+                },
                 TunnResult::Done => break,
                 TunnResult::Err(e) => {
                     return Err(WgError::HandshakeFailed(format!("decapsulate: {e:?}")));
-                }
+                },
             }
             // 第一次循环后用空 input 继续（boringtun 约定）
             input = &[];
@@ -203,7 +200,7 @@ impl Tunnel {
                 Err(WgError::HandshakeFailed(
                     "update_timers returned WriteToTunnel (unexpected)".into(),
                 ))
-            }
+            },
         }
     }
 
@@ -266,15 +263,19 @@ fn hex_to_array_32(hex_str: &str, field: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(hex_str)
         .map_err(|e| WgError::InvalidConfig(format!("{field} hex decode: {e}")))?;
     let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-        WgError::InvalidConfig(format!("{field} must be 32 bytes (64 hex chars), got {}", bytes.len()))
+        WgError::InvalidConfig(format!(
+            "{field} must be 32 bytes (64 hex chars), got {}",
+            bytes.len()
+        ))
     })?;
     Ok(arr)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use boringtun::x25519::{PublicKey, StaticSecret};
+
+    use super::*;
 
     // ===== 工具：生成测试 keypair =====
 
@@ -390,10 +391,7 @@ mod tests {
 
         // 握手完成检查——A 应已记录握手时间
         // 注意：boringtun 握手需要往返，A 收到 B 的 response 后才完成
-        assert!(
-            a.time_since_last_handshake().is_some(),
-            "handshake not completed on A side"
-        );
+        assert!(a.time_since_last_handshake().is_some(), "handshake not completed on A side");
 
         (a, b)
     }
@@ -460,10 +458,7 @@ mod tests {
     fn from_config_zero_keepalive_becomes_none() {
         let (sec_a, pub_a) = make_test_keypair(0x11);
         let (_, pub_b) = make_test_keypair(0x22);
-        let device = crate::config::DeviceConfig {
-            secret_key: sec_a,
-            ..Default::default()
-        };
+        let device = crate::config::DeviceConfig { secret_key: sec_a, ..Default::default() };
         let peer = crate::config::PeerConfig {
             public_key: pub_b,
             keep_alive: 0,
@@ -473,24 +468,14 @@ mod tests {
         let t = Tunnel::from_config(&device, &peer);
         assert!(t.is_ok());
         // 对端视角验证 key 可用
-        let _peer_view = Tunnel::new(
-            &hex::encode([0x22u8; 32]),
-            &pub_a,
-            None,
-            None,
-            0,
-        )
-        .unwrap();
+        let _peer_view = Tunnel::new(&hex::encode([0x22u8; 32]), &pub_a, None, None, 0).unwrap();
     }
 
     #[test]
     fn from_config_keepalive_overflow_truncated() {
         // u32::MAX 应截断为 u16::MAX，不报错
         let (sec, pub_) = make_test_keypair(0x33);
-        let device = crate::config::DeviceConfig {
-            secret_key: sec,
-            ..Default::default()
-        };
+        let device = crate::config::DeviceConfig { secret_key: sec, ..Default::default() };
         let peer = crate::config::PeerConfig {
             public_key: pub_,
             keep_alive: u32::MAX,

@@ -9,7 +9,7 @@ use thiserror::Error;
 use xray_features::policy::{Policy, PolicyManager};
 use xray_proto::xray::app::policy::Config;
 
-use crate::convert::{policy_from_proto, system_stats_from_proto, SystemStats};
+use crate::convert::{SystemStats, policy_from_proto, system_stats_from_proto};
 
 /// Manager 构造错误。
 #[derive(Debug, Error)]
@@ -38,14 +38,9 @@ impl Manager {
         for (lv, proto_policy) in &config.level {
             levels.insert(*lv, policy_from_proto(proto_policy));
         }
-        let system = config
-            .system
-            .as_ref()
-            .map(system_stats_from_proto)
-            .unwrap_or_default();
+        let system = config.system.as_ref().map(system_stats_from_proto).unwrap_or_default();
         Ok(Self { levels, system })
     }
-
 }
 
 impl PolicyManager for Manager {
@@ -77,21 +72,18 @@ impl PolicyManager for Manager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use xray_proto::xray::app::policy::{
+        Policy as ProtoPolicy, Second, SystemPolicy as ProtoSystemPolicy,
         policy::{Stats as PolicyStats, Timeout as PolicyTimeout},
         system_policy::Stats as ProtoSystemStats,
-        Policy as ProtoPolicy, Second, SystemPolicy as ProtoSystemPolicy,
     };
+
+    use super::*;
 
     fn proto_policy_with_stats(up: bool, down: bool, online: bool) -> ProtoPolicy {
         ProtoPolicy {
             timeout: None,
-            stats: Some(PolicyStats {
-                user_uplink: up,
-                user_downlink: down,
-                user_online: online,
-            }),
+            stats: Some(PolicyStats { user_uplink: up, user_downlink: down, user_online: online }),
             buffer: None,
         }
     }
@@ -175,10 +167,7 @@ mod tests {
 
     #[test]
     fn manager_default_system_stats_when_absent() {
-        let cfg = Config {
-            level: HashMap::new(),
-            system: None,
-        };
+        let cfg = Config { level: HashMap::new(), system: None };
         let manager = Manager::new(cfg).unwrap();
         assert_eq!(manager.for_system(), SystemStats::default());
     }
@@ -197,10 +186,7 @@ mod tests {
         let p = manager.policy_for_level(5);
         assert_eq!(p.timeout.handshake, std::time::Duration::from_secs(42));
         // 未覆盖的字段保留默认
-        assert_eq!(
-            p.timeout.connection_idle,
-            xray_features::policy::DEFAULT_CONN_IDLE_TIMEOUT
-        );
+        assert_eq!(p.timeout.connection_idle, xray_features::policy::DEFAULT_CONN_IDLE_TIMEOUT);
     }
 
     #[test]
@@ -261,16 +247,19 @@ mod tests {
         let cfg = Config {
             level: {
                 let mut m = HashMap::new();
-                m.insert(1, ProtoPolicy {
-                    timeout: Some(PolicyTimeout {
-                        handshake: None,
-                        connection_idle: Some(Second { value: 7200 }),
-                        uplink_only: None,
-                        downlink_only: None,
-                    }),
-                    stats: None,
-                    buffer: None,
-                });
+                m.insert(
+                    1,
+                    ProtoPolicy {
+                        timeout: Some(PolicyTimeout {
+                            handshake: None,
+                            connection_idle: Some(Second { value: 7200 }),
+                            uplink_only: None,
+                            downlink_only: None,
+                        }),
+                        stats: None,
+                        buffer: None,
+                    },
+                );
                 m
             },
             system: None,

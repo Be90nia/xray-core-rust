@@ -9,17 +9,18 @@
 //! ```
 
 use base64::Engine;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::time::{timeout, Duration};
-
-use xray_common::net::address::Address;
-use xray_common::uuid::UUID;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    time::{Duration, timeout},
+};
+use xray_common::{net::address::Address, uuid::UUID};
 use xray_proto::xray::proxy::vless::encoding::Addons;
-use xray_proxy_vless::encoding::client::encode_request_header;
-use xray_proxy_vless::encoding::VlessCommand;
-use xray_reality::RealityConfig;
-use xray_reality::client::{UConnState, u_client};
+use xray_proxy_vless::encoding::{VlessCommand, client::encode_request_header};
+use xray_reality::{
+    RealityConfig,
+    client::{UConnState, u_client},
+};
 use xray_transport::connection::TcpConnection;
 
 const VLESS_VERSION: u8 = 0;
@@ -41,9 +42,8 @@ async fn vless_reality_vision_vps_interop() {
     let sid_hex = "363396b6";
 
     // base64url decode public_key (32 bytes X25519)
-    let public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(pbk_b64url)
-        .expect("decode pbk");
+    let public_key =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(pbk_b64url).expect("decode pbk");
     assert_eq!(public_key.len(), 32, "X25519 public key must be 32 bytes");
 
     // hex decode + pad short_id to 8 bytes (Go ShortId is [8]byte)
@@ -78,10 +78,7 @@ async fn vless_reality_vision_vps_interop() {
     // 4. VLESS header (flow=xtls-rprx-vision, target=www.google.com:80)
     eprintln!("[3/5] VLESS header (flow=xtls-rprx-vision, target=www.google.com:80)");
     let target_addr = Address::Domain("www.google.com".to_string());
-    let addons = Addons {
-        flow: "xtls-rprx-vision".to_string(),
-        ..Default::default()
-    };
+    let addons = Addons { flow: "xtls-rprx-vision".to_string(), ..Default::default() };
     encode_request_header(
         &mut tls,
         VLESS_VERSION,
@@ -100,13 +97,12 @@ async fn vless_reality_vision_vps_interop() {
     let uuid_bytes = uuid.as_bytes().to_vec();
     // v50 起 VisionConn 的 AsyncRead/AsyncWrite 带 InnerRawClone bound；经
     // Box<dyn Connection> 适配（RealityTlsStream 已实现 Connection）。
-    let mut vision =
-        VisionConn::new(Box::new(tls) as Box<dyn xray_transport::connection::Connection>, uuid_bytes);
+    let mut vision = VisionConn::new(
+        Box::new(tls) as Box<dyn xray_transport::connection::Connection>,
+        uuid_bytes,
+    );
     let http_req = b"GET / HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\n\r\n";
-    vision
-        .write_all(http_req)
-        .await
-        .expect("write HTTP via Vision");
+    vision.write_all(http_req).await.expect("write HTTP via Vision");
     vision.flush().await.expect("flush Vision");
 
     // 6. 读 response（VisionConn 自动 unpadding；若服务端 raw 则 passthrough）
@@ -128,7 +124,7 @@ async fn vless_reality_vision_vps_interop() {
                 "REALITY+VLESS+Vision interop: non-HTTP response (Vision unpadding may need adjustment)"
             );
             eprintln!("✅ REALITY+VLESS+Vision VPS interop PASS!");
-        }
+        },
         Ok(Err(e)) => panic!("Read error: {e}"),
         Err(_) => panic!("Timeout 10s: REALITY handshake or Vision padding rejected"),
     }

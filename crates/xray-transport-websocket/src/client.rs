@@ -113,17 +113,19 @@ pub async fn dial(
                     Ok(fp) => {
                         let alpn =
                             xray_tls::utls::websocket_handshake_alpn(opts.security_json.as_ref());
-                        Box::new(xray_tls::utls::u_client_with_alpn(
-                            inner,
-                            sni,
-                            cfg,
-                            fp,
-                            None,
-                            opts.security_json.as_ref(),
-                            Some(&alpn),
-                        )
-                        .await?) as Box<dyn xray_transport::connection::Connection>
-                    }
+                        Box::new(
+                            xray_tls::utls::u_client_with_alpn(
+                                inner,
+                                sni,
+                                cfg,
+                                fp,
+                                None,
+                                opts.security_json.as_ref(),
+                                Some(&alpn),
+                            )
+                            .await?,
+                        ) as Box<dyn xray_transport::connection::Connection>
+                    },
                     Err(_) => Box::new(xray_tls::utls::client(inner, sni, cfg).await?)
                         as Box<dyn xray_transport::connection::Connection>,
                 };
@@ -691,13 +693,10 @@ mod tests {
         if let Some(alpn) = alpn.as_deref() {
             sec["alpn"] = serde_json::json!(alpn);
         }
-        let tls_config = xray_tls::client_config::build_client_config(
-            "tls",
-            Some(&sec),
-            "localhost",
-        )
-        .unwrap()
-        .unwrap();
+        let tls_config =
+            xray_tls::client_config::build_client_config("tls", Some(&sec), "localhost")
+                .unwrap()
+                .unwrap();
         let result = dial(DialOptions {
             config: &Config::default(),
             destination: &d,
@@ -711,7 +710,6 @@ mod tests {
         assert!(result.is_err(), "capture server drops conn → dial must fail");
         server.await.unwrap()
     }
-
 
     /// 最小 ClientHello 解析：提取 cipher_suites 段（GREASE 判别用）。
     /// 返回 `(cipher 字节, cipher 数量)`；结构异常返回 None。
@@ -735,10 +733,7 @@ mod tests {
         let Some((suites, n)) = parse_cipher_suites(hello) else {
             return false;
         };
-        n >= 12
-            && suites
-                .chunks_exact(2)
-                .any(|c| c[0] == c[1] && (c[0] & 0x0f) == 0x0a)
+        n >= 12 && suites.chunks_exact(2).any(|c| c[0] == c[1] && (c[0] & 0x0f) == 0x0a)
     }
 
     /// md5i 验收：ws 出站 fingerprint=chrome → btls 真实 chrome ClientHello
@@ -781,7 +776,6 @@ mod tests {
         assert!(n <= 16, "rustls hello must have a small cipher set, got {n}");
         assert!(!is_btls_chrome_hello(&hello));
     }
-
 
     use std::{sync::Mutex, time::Duration};
 

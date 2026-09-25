@@ -13,13 +13,18 @@
 //!
 //! [`Connection`]: xray_transport::connection::Connection
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
 
-use crate::error::{Result, SocksError};
-use crate::protocol::{
-    ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, AUTH_NO_MATCHING_METHOD, AUTH_NOT_REQUIRED, AUTH_PASSWORD,
-    CMD_TCP_CONNECT, SOCKS5_VERSION, STATUS_SUCCESS, SocksAddr, write_address_port,
+use crate::{
+    error::{Result, SocksError},
+    protocol::{
+        ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, AUTH_NO_MATCHING_METHOD, AUTH_NOT_REQUIRED,
+        AUTH_PASSWORD, CMD_TCP_CONNECT, SOCKS5_VERSION, STATUS_SUCCESS, SocksAddr,
+        write_address_port,
+    },
 };
 
 /// SOCKS 客户端配置：server 地址 + 可选认证。
@@ -79,18 +84,18 @@ impl SocksClient {
     /// 流程见模块文档。
     pub async fn dial(&self, target: &SocksAddr) -> Result<TcpStream> {
         let mut stream = TcpStream::connect(&self.config.server_addr).await.map_err(|e| {
-            SocksError::HandshakeFailed(format!("connect to socks server {}: {e}", self.config.server_addr))
+            SocksError::HandshakeFailed(format!(
+                "connect to socks server {}: {e}",
+                self.config.server_addr
+            ))
         })?;
 
         // 1. method negotiation
         // Go protocol.go:443-447：按凭据有无二选一只发 1 个 method
         //（带凭据 [05 01 02] / 无凭据 [05 01 00]；发两个 method 的
         // [05 02 00 02] 是 DPI 可辨的 Rust 指纹，票 g6kn）。
-        let auth_method: u8 = if self.config.username.is_some() {
-            AUTH_PASSWORD
-        } else {
-            AUTH_NOT_REQUIRED
-        };
+        let auth_method: u8 =
+            if self.config.username.is_some() { AUTH_PASSWORD } else { AUTH_NOT_REQUIRED };
         stream.write_all(&[SOCKS5_VERSION, 0x01, auth_method]).await?;
 
         let mut resp = [0u8; 2];
@@ -105,7 +110,7 @@ impl SocksClient {
 
         // 2. 处理选定的 method
         match method {
-            AUTH_NOT_REQUIRED => {}
+            AUTH_NOT_REQUIRED => {},
             AUTH_PASSWORD => {
                 let (u, p) = match (&self.config.username, &self.config.password) {
                     (Some(u), Some(p)) => (u.as_str(), p.as_str()),
@@ -113,18 +118,18 @@ impl SocksClient {
                         return Err(SocksError::AuthFailed(
                             "server picked password auth but client provided no credentials".into(),
                         ));
-                    }
+                    },
                 };
                 Self::auth_password(&mut stream, u, p).await?;
-            }
+            },
             AUTH_NO_MATCHING_METHOD => {
                 return Err(SocksError::AuthFailed("server returned no matching method".into()));
-            }
+            },
             other => {
                 return Err(SocksError::HandshakeFailed(format!(
                     "server picked unknown method: {other:#x}"
                 )));
-            }
+            },
         }
 
         // 3. CONNECT 请求
@@ -157,12 +162,12 @@ impl SocksClient {
                 let mut len_buf = [0u8; 1];
                 stream.read_exact(&mut len_buf).await?;
                 len_buf[0] as usize
-            }
+            },
             other => {
                 return Err(SocksError::InvalidFrame(format!(
                     "unknown ATYP in connect response: {other:#x}"
                 )));
-            }
+            },
         };
         let mut rest = vec![0u8; addr_len + 2];
         stream.read_exact(&mut rest).await?;
@@ -175,9 +180,7 @@ impl SocksClient {
         let ub = username.as_bytes();
         let pb = password.as_bytes();
         if ub.len() > 255 || pb.len() > 255 {
-            return Err(SocksError::AuthFailed(
-                "username/password exceeds 255 bytes".into(),
-            ));
+            return Err(SocksError::AuthFailed("username/password exceeds 255 bytes".into()));
         }
         let mut buf = Vec::with_capacity(3 + ub.len() + pb.len());
         buf.push(0x01); // RFC 1929 版本
@@ -207,12 +210,15 @@ impl SocksClient {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::config::ServerConfig;
-    use crate::server::socks5_server_handshake;
     use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    use super::*;
+    use crate::{config::ServerConfig, server::socks5_server_handshake};
 
     /// 启动一个 mock SOCKS5 server：完成 handshake，然后把 client 的流量 echo 给 target。
     /// 用于 e2e 验证 client handshake 正确 + 数据流透传。
@@ -231,8 +237,8 @@ mod tests {
                                 Ok(t) => t,
                                 Err(_) => return,
                             };
-                            // 2. ponytail: mock 不真去连 target，直接 echo
-                            //    （target 在握手成功后已透明——client 写啥我们 echo 回去）
+                            // 2. ponytail: mock 不真去连 target，直接 echo （target
+                            //    在握手成功后已透明——client 写啥我们 echo 回去）
                             let _ = target;
                             let mut buf = [0u8; 1024];
                             loop {
@@ -242,12 +248,12 @@ mod tests {
                                         if sock.write_all(&buf[..n]).await.is_err() {
                                             break;
                                         }
-                                    }
+                                    },
                                 }
                             }
                             let _ = sock;
                         });
-                    }
+                    },
                     Err(_) => break,
                 }
             }

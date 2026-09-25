@@ -13,19 +13,21 @@
 //! `impl OutboundHandler`（dial 建 socket 后返 Ok 无数据流动的公共 API 陷阱）
 //! 已删除）。
 
-use std::net::SocketAddr;
-use std::net::IpAddr;
-use std::sync::Arc;
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
 use tokio::sync::Mutex as AsyncMutex;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
+use xray_common::net::{address::Address, destination::Destination};
 
-use crate::config::DeviceConfig;
-use crate::driver::{bind_udp_socket, WgDriver, WgTransport, DialedUdp};
-use crate::error::{Result, WgError};
-use crate::netstack::WgNetStack;
-use crate::peer::{shared_peer, SharedPeer};
+use crate::{
+    config::DeviceConfig,
+    driver::{DialedUdp, WgDriver, WgTransport, bind_udp_socket},
+    error::{Result, WgError},
+    netstack::WgNetStack,
+    peer::{SharedPeer, shared_peer},
+};
 
 /// WireGuard 出站 Handler。
 ///
@@ -52,8 +54,8 @@ impl WireguardOutboundHandler {
     ///
     /// 对应 Go `client.go:94-143 processWireGuard(ctx, dialer)`——`dialer`
     /// 为 `internet.Dialer`（Rust 侧 `DialFn`）：
-    /// - `Some`：WG peer endpoint 以 UDP dest 经出站链拨号（可经 socks 等），
-    ///   惰性连接（Go `netBindClient.connectTo` 在首次 Send 时拨）
+    /// - `Some`：WG peer endpoint 以 UDP dest 经出站链拨号（可经 socks 等）， 惰性连接（Go
+    ///   `netBindClient.connectTo` 在首次 Send 时拨）
     /// - `None`：绑定本地直连 UDP socket（与远端同族，随机端口）
     ///
     /// 其余步骤：
@@ -70,7 +72,9 @@ impl WireguardOutboundHandler {
     ) -> Result<Self> {
         let tag = tag.into();
         if config.peers.is_empty() {
-            return Err(WgError::InvalidConfig("wireguard outbound requires at least one peer".into()));
+            return Err(WgError::InvalidConfig(
+                "wireguard outbound requires at least one peer".into(),
+            ));
         }
         let peer_cfg = &config.peers[0];
 
@@ -87,10 +91,7 @@ impl WireguardOutboundHandler {
         // 在外层 wrap_dial_with_send_through 的 DIAL_SRC scope 内，此处读取快照并
         // 应用到 WG 传输 socket（代理链分支同 Go dialer.go:233——dialer_proxy 存在
         // 时不消费源地址，链式 dispatch 天然忽略 DIAL_SRC）。
-        let src_ip = xray_transport::system_dialer::DIAL_SRC
-            .try_with(|v| *v)
-            .ok()
-            .flatten();
+        let src_ip = xray_transport::system_dialer::DIAL_SRC.try_with(|v| *v).ok().flatten();
         let transport = match &system_dialer {
             Some(dialer) => {
                 let addr = match remote_addr.ip() {
@@ -116,11 +117,11 @@ impl WireguardOutboundHandler {
                                     .await
                             })
                         })
-                    }
+                    },
                     None => Arc::clone(dialer),
                 };
                 WgTransport::Dialed(Arc::new(DialedUdp::new(dialer, dest)))
-            }
+            },
             None => {
                 // 绑定本地 UDP：sendThrough 源地址（与远端同族时）优先，否则通配。
                 let bind_addr = match src_ip {
@@ -130,7 +131,7 @@ impl WireguardOutboundHandler {
                     _ => "[::]:0".to_string(),
                 };
                 WgTransport::Direct(bind_udp_socket(&bind_addr).await?)
-            }
+            },
         };
 
         // smoltcp 网栈——从 config.endpoint 解析 interface 地址
@@ -172,9 +173,9 @@ async fn resolve_endpoint_addr(
         return Ok(addr);
     }
     // host:port 拆分（Go net.SplitHostPort）
-    let (host, port) = endpoint
-        .rsplit_once(':')
-        .ok_or_else(|| WgError::InvalidEndpoint(format!("peer endpoint not host:port: {endpoint}")))?;
+    let (host, port) = endpoint.rsplit_once(':').ok_or_else(|| {
+        WgError::InvalidEndpoint(format!("peer endpoint not host:port: {endpoint}"))
+    })?;
     let port: u16 = port
         .parse()
         .map_err(|_| WgError::InvalidEndpoint(format!("peer endpoint bad port: {endpoint}")))?;
@@ -189,15 +190,10 @@ async fn resolve_endpoint_addr(
         }
     }
     let (has_v4, has_v6) = crate::dispatcher::endpoint_families(config);
-    let ip = crate::dispatcher::resolve_dest_domain(
-        host,
-        config.domain_strategy,
-        has_v4,
-        has_v6,
-        dns,
-    )
-    .await
-    .map_err(|e| WgError::InvalidEndpoint(format!("peer endpoint DNS resolve: {e}")))?;
+    let ip =
+        crate::dispatcher::resolve_dest_domain(host, config.domain_strategy, has_v4, has_v6, dns)
+            .await
+            .map_err(|e| WgError::InvalidEndpoint(format!("peer endpoint DNS resolve: {e}")))?;
     // 本地 app DNS 不暴露记录 TTL → 缺省 300（Go netstack 默认，c7e569b0）。
     if let Some(cache) = dns_cache {
         cache.put(host, vec![ip], crate::dispatcher::DEFAULT_DNS_TTL_SECS);
@@ -216,8 +212,12 @@ fn parse_local_cidrs(config: &DeviceConfig) -> Result<Vec<smoltcp::wire::IpCidr>
         .map(|addr| {
             let cidr_prefix = if addr.is_ipv4() { 32 } else { 128 };
             let smoltcp_addr = match addr {
-                IpAddr::V4(v4) => smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_octets(v4.octets())),
-                IpAddr::V6(v6) => smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from_octets(v6.octets())),
+                IpAddr::V4(v4) => smoltcp::wire::IpAddress::Ipv4(
+                    smoltcp::wire::Ipv4Address::from_octets(v4.octets()),
+                ),
+                IpAddr::V6(v6) => smoltcp::wire::IpAddress::Ipv6(
+                    smoltcp::wire::Ipv6Address::from_octets(v6.octets()),
+                ),
             };
             Ok(smoltcp::wire::IpCidr::new(smoltcp_addr, cidr_prefix))
         })
@@ -265,10 +265,7 @@ mod tests {
     fn parse_local_cidrs_empty_config_ok() {
         // 空 endpoint——返回空 cidr 列表（构造 handler 时会失败，但解析本身通过）
         let (sec, _) = make_keypair(0x33);
-        let cfg = DeviceConfig {
-            secret_key: sec,
-            ..Default::default()
-        };
+        let cfg = DeviceConfig { secret_key: sec, ..Default::default() };
         let cidrs = parse_local_cidrs(&cfg).expect("parse");
         assert!(cidrs.is_empty());
     }
@@ -276,10 +273,7 @@ mod tests {
     #[tokio::test]
     async fn new_rejects_config_without_peers() {
         let (sec, _) = make_keypair(0x44);
-        let cfg = DeviceConfig {
-            secret_key: sec,
-            ..Default::default()
-        };
+        let cfg = DeviceConfig { secret_key: sec, ..Default::default() };
         let result = WireguardOutboundHandler::new("test", &cfg, None).await;
         assert!(result.is_err(), "should reject empty peers");
     }

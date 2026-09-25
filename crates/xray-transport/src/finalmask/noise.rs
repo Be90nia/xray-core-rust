@@ -2,15 +2,16 @@
 //!
 //! 在 UDP 真实包发送前，按地址周期性注入随机噪声包，维持流量特征对抗分析。
 
-use std::collections::HashMap;
-use std::io;
-use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    io,
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use rand::rng;
-use rand::RngCore;
+use rand::{RngCore, rng};
 
 use super::{UdpIo, Udpmask};
 
@@ -53,6 +54,7 @@ impl Udpmask for NoiseConfig {
     ) -> io::Result<Box<dyn UdpIo>> {
         Ok(Box::new(NoiseConn::new(self.clone(), raw)))
     }
+
     fn wrap_packet_conn_server(
         &self,
         raw: Box<dyn UdpIo>,
@@ -73,11 +75,7 @@ struct NoiseConn {
 
 impl NoiseConn {
     fn new(config: NoiseConfig, inner: Box<dyn UdpIo>) -> Self {
-        Self {
-            inner,
-            config,
-            last_expire: Mutex::new(HashMap::new()),
-        }
+        Self { inner, config, last_expire: Mutex::new(HashMap::new()) }
     }
 }
 
@@ -104,7 +102,11 @@ impl UdpIo for NoiseConn {
                 if item.rand_max > 0 {
                     let len = rand_between(item.rand_min, item.rand_max).max(0) as usize;
                     let mut noise = vec![0u8; len];
-                    fill_random_range(&mut noise, item.rand_range_min as u8, item.rand_range_max as u8);
+                    fill_random_range(
+                        &mut noise,
+                        item.rand_range_min as u8,
+                        item.rand_range_max as u8,
+                    );
                     let _ = self.inner.send_to(&noise, addr).await;
                 } else {
                     let _ = self.inner.send_to(&item.packet, addr).await;
@@ -220,9 +222,11 @@ mod tests {
             self.packets.lock().push((buf.to_vec(), addr));
             Ok(buf.len())
         }
+
         async fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
             Err(io::Error::new(io::ErrorKind::WouldBlock, "mock"))
         }
+
         fn local_addr(&self) -> io::Result<SocketAddr> {
             Ok("127.0.0.1:0".parse().unwrap())
         }

@@ -58,9 +58,9 @@ pub enum Fingerprint {
 
     // ===== OtherFingerprints（旧版/Golang/randomized/特殊） =====
     HelloGolang,
-    HelloRandomized,        // 与 Randomized 略有差异：Go 端 random 包含 ALPN 选择
-    HelloRandomizedAlpn,    // 与 Randomized 同义，保留独立变体以 1:1 翻译
-    HelloRandomizedNoAlpn,  // 与 RandomizedNoAlpn 同义，保留独立变体
+    HelloRandomized,       // 与 Randomized 略有差异：Go 端 random 包含 ALPN 选择
+    HelloRandomizedAlpn,   // 与 Randomized 同义，保留独立变体以 1:1 翻译
+    HelloRandomizedNoAlpn, // 与 RandomizedNoAlpn 同义，保留独立变体
     HelloFirefoxAuto,
     HelloFirefox55,
     HelloFirefox56,
@@ -138,7 +138,7 @@ pub const MODERN_FINGERPRINTS: &[Fingerprint] = &[
 ///
 /// # 示例
 /// ```
-/// use xray_tls::fingerprint::{get_fingerprint, Fingerprint};
+/// use xray_tls::fingerprint::{Fingerprint, get_fingerprint};
 ///
 /// assert_eq!(get_fingerprint("").unwrap(), Fingerprint::Chrome);
 /// assert_eq!(get_fingerprint("chrome").unwrap(), Fingerprint::Chrome);
@@ -265,8 +265,18 @@ mod tests {
     fn preset_table_complete() {
         // 所有 PresetFingerprints 的 key 都能解析
         for key in [
-            "chrome", "firefox", "safari", "ios", "android", "edge", "360",
-            "qq", "random", "randomized", "randomizednoalpn", "unsafe",
+            "chrome",
+            "firefox",
+            "safari",
+            "ios",
+            "android",
+            "edge",
+            "360",
+            "qq",
+            "random",
+            "randomized",
+            "randomizednoalpn",
+            "unsafe",
         ] {
             assert!(get_fingerprint(key).is_ok(), "preset key {key} should resolve");
         }
@@ -275,10 +285,17 @@ mod tests {
     #[test]
     fn modern_table_complete() {
         for key in [
-            "hellofirefox_120", "hellofirefox_148", "hellochrome_120",
-            "hellochrome_131", "hellochrome_133", "helloios_13",
-            "helloios_14", "helloedge_106", "hellosafari_26_3",
-            "hello360_11_0", "helloqq_11_1",
+            "hellofirefox_120",
+            "hellofirefox_148",
+            "hellochrome_120",
+            "hellochrome_131",
+            "hellochrome_133",
+            "helloios_13",
+            "helloios_14",
+            "helloedge_106",
+            "hellosafari_26_3",
+            "hello360_11_0",
+            "helloqq_11_1",
         ] {
             assert!(get_fingerprint(key).is_ok(), "modern key {key} should resolve");
         }
@@ -299,7 +316,7 @@ mod tests {
         match get_fingerprint("nonexistent_fingerprint") {
             Err(TlsError::UnknownFingerprint(s)) => {
                 assert_eq!(s, "nonexistent_fingerprint");
-            }
+            },
             other => panic!("expected UnknownFingerprint, got {other:?}"),
         }
     }
@@ -325,8 +342,20 @@ mod tests {
     #[test]
     fn preset_modern_other_no_overlap() {
         // 三张表之间不应有同名字符串
-        let preset = ["chrome", "firefox", "safari", "ios", "android", "edge",
-                      "360", "qq", "random", "randomized", "randomizednoalpn", "unsafe"];
+        let preset = [
+            "chrome",
+            "firefox",
+            "safari",
+            "ios",
+            "android",
+            "edge",
+            "360",
+            "qq",
+            "random",
+            "randomized",
+            "randomizednoalpn",
+            "unsafe",
+        ];
         for k in preset {
             // preset 命中后不应再走到 modern/other
             assert!(lookup_modern(k).is_none(), "{k} overlap with modern");

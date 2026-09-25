@@ -11,7 +11,7 @@
 //! # 用法
 //!
 //! ```
-//! use xray_app_version::{Version, Config};
+//! use xray_app_version::{Config, Version};
 //!
 //! let cfg = Config {
 //!     core_version: "1.8.0".into(),
@@ -23,5 +23,5 @@
 
 pub mod version;
 
-pub use version::{compare_versions, Version, VersionError};
+pub use version::{Version, VersionError, compare_versions};
 pub use xray_proto::xray::app::version::Config;

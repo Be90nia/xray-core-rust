@@ -9,10 +9,10 @@ use serde::{Deserialize, Serialize};
 pub struct Port(u16);
 
 impl Port {
-    /// 最小端口号。
-    pub const MIN: Port = Port(0);
     /// 最大端口号。
     pub const MAX: Port = Port(65535);
+    /// 最小端口号。
+    pub const MIN: Port = Port(0);
 
     /// 创建新的端口号。
     #[must_use]

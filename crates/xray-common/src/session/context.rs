@@ -9,9 +9,7 @@
 use std::sync::Arc;
 
 use super::{Outbound, Session};
-use crate::ctx::SessionKey;
-use crate::errors::Error;
-use crate::net::network::Network;
+use crate::{ctx::SessionKey, errors::Error, net::network::Network};
 
 // ========== SessionKey 常量（Go context.go:16-29，编号逐一对齐） ==========
 
@@ -113,7 +111,10 @@ impl Session {
     }
 
     /// 挂出站错误 tracker（Go `TrackedConnectionError`，context.go:126-128）。
-    pub fn with_tracked_connection_error(mut self, tracker: Arc<dyn TrackedRequestErrorFeedback>) -> Self {
+    pub fn with_tracked_connection_error(
+        mut self,
+        tracker: Arc<dyn TrackedRequestErrorFeedback>,
+    ) -> Self {
         self.error_tracker = Some(tracker);
         self
     }
@@ -122,20 +123,14 @@ impl Session {
     ///
     /// 无值时返回空串（Go 语义）。
     pub fn forced_outbound_tag(&self) -> &str {
-        self.content
-            .attributes
-            .get("forcedOutboundTag")
-            .map(|s| s.as_str())
-            .unwrap_or("")
+        self.content.attributes.get("forcedOutboundTag").map(|s| s.as_str()).unwrap_or("")
     }
 
     /// 写 forced outbound tag（Go `SetForcedOutboundTagToContext`，context.go:107-113）。
     ///
     /// Go 在 ctx 无 Content 时先挂空 Content；Rust Session 恒有 content，直接写。
     pub fn set_forced_outbound_tag(&mut self, tag: impl AsRef<str>) {
-        self.content
-            .attributes
-            .insert("forcedOutboundTag".to_string(), tag.as_ref().to_string());
+        self.content.attributes.insert("forcedOutboundTag".to_string(), tag.as_ref().to_string());
     }
 
     /// 向请求发起方回传出站错误（Go `SubmitOutboundErrorToOriginator`，context.go:119-124）。
@@ -153,10 +148,7 @@ impl Session {
     /// `Outbound::new()`），content 保留浅拷贝。Go 在 content 已带属性时
     /// panic（mux 子上下文不允许继承嗅探属性），Rust 以 assert 等价对齐。
     pub fn sub_context_from_mux_inbound(&self) -> Session {
-        assert!(
-            self.content.attributes.is_empty(),
-            "content.Attributes != nil"
-        );
+        assert!(self.content.attributes.is_empty(), "content.Attributes != nil");
         let mut sub = self.clone();
         sub.outbound = Outbound::new();
         sub
@@ -165,8 +157,9 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use parking_lot::Mutex;
+
+    use super::*;
 
     /// 记录型 tracker，验证错误回传。
     #[derive(Default)]
@@ -262,7 +255,10 @@ mod tests {
     #[test]
     fn test_submit_outbound_error_records_via_tracker() {
         let recorder = Arc::new(Recorder::default());
-        let s = Session::new().with_tracked_connection_error(recorder.clone() as Arc<dyn TrackedRequestErrorFeedback>);
+        let s =
+            Session::new().with_tracked_connection_error(
+                recorder.clone() as Arc<dyn TrackedRequestErrorFeedback>
+            );
         s.submit_outbound_error(Error::new("dial failed"));
         assert_eq!(recorder.0.lock().len(), 1);
         assert!(recorder.0.lock()[0].contains("dial failed"));
@@ -299,16 +295,12 @@ mod tests {
     }
     #[test]
     fn test_sub_context_from_mux_inbound() {
-        use crate::net::address::Address;
-        use crate::net::destination::Destination;
-        use crate::net::port::Port;
         use std::net::Ipv4Addr;
-        use super::super::Content;
 
-        let dest = Destination::tcp(
-            Address::ipv4(Ipv4Addr::new(1, 2, 3, 4)),
-            Port::new(443),
-        );
+        use super::super::Content;
+        use crate::net::{address::Address, destination::Destination, port::Port};
+
+        let dest = Destination::tcp(Address::ipv4(Ipv4Addr::new(1, 2, 3, 4)), Port::new(443));
 
         let parent = Session::new()
             .with_content(Content::new().with_protocol("http/1.1"))

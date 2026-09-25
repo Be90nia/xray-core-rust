@@ -4,18 +4,20 @@
 //!
 //! - **Go**：`RequireFeatures(callback)` 用 reflect 扫描回调参数类型，匹配 features
 //!   列表中的实现，注入并调用回调。这是一种运行时反射 DI。
-//! - **Rust**：暴露 `get_feature::<T>()` 显式类型化获取 API，调用方自己取所需
-//!   features 编译期类型安全。若需要「等待多个 feature 就绪后执行」的语义，
-//!   调用方在初始化阶段顺序 add_feature + 显式校验所需 feature 已注册即可。
+//! - **Rust**：暴露 `get_feature::<T>()` 显式类型化获取 API，调用方自己取所需 features
+//!   编译期类型安全。若需要「等待多个 feature 就绪后执行」的语义， 调用方在初始化阶段顺序
+//!   add_feature + 显式校验所需 feature 已注册即可。
 //!
 //! 这避免了 Go 端因 reflect 带来的 panic 风险与错误处理模糊。
 
-use std::any::{Any, TypeId};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{
+    any::{Any, TypeId},
+    collections::HashMap,
+    sync::Arc,
+};
 
-use xray_features::{Feature, FeatureError, Result};
 use tokio_util::sync::CancellationToken;
+use xray_features::{Feature, FeatureError, Result};
 
 /// 安装 panic → tracing hook（幂等，进程一次）。
 ///
@@ -137,13 +139,13 @@ impl Instance {
                         "feature created from built config"
                     );
                     inst.add_feature_dyn(feat)?;
-                }
+                },
                 Err(FeatureError::NotFound { ref name }) => {
                     tracing::warn!(
                         kind = %name,
                         "no FeatureFactory registered for kind, skipping"
                     );
-                }
+                },
                 Err(FeatureError::StartFailed { ref name, ref message }) => {
                     // Stub factory 返回 StartFailed = 该 Feature 尚未实现，非致命
                     tracing::warn!(
@@ -151,7 +153,7 @@ impl Instance {
                         message = %message,
                         "feature not yet implemented (stub factory), skipping"
                     );
-                }
+                },
                 Err(e) => return Err(e),
             }
         }
@@ -326,8 +328,9 @@ impl Default for Instance {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use super::*;
     #[test]
     fn panic_hook_install_is_idempotent() {
         install_panic_hook();
@@ -356,6 +359,7 @@ mod tests {
         fn feature_name(&self) -> &'static str {
             self.name
         }
+
         fn start(&self) -> Result<()> {
             self.start_count.fetch_add(1, Ordering::SeqCst);
             if self.start_fails {
@@ -366,6 +370,7 @@ mod tests {
             }
             Ok(())
         }
+
         fn close(&self) -> Result<()> {
             self.close_count.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -448,10 +453,12 @@ mod tests {
             fn feature_name(&self) -> &'static str {
                 self.tag
             }
+
             fn start(&self) -> Result<()> {
                 self.order.lock().push(format!("start:{}", self.tag));
                 Ok(())
             }
+
             fn close(&self) -> Result<()> {
                 self.order.lock().push(format!("close:{}", self.tag));
                 Ok(())
@@ -459,16 +466,8 @@ mod tests {
         }
 
         let mut inst = Instance::new();
-        inst.add_feature(Arc::new(OrderSensitive {
-            tag: "f1",
-            order: order.clone(),
-        }))
-        .unwrap();
-        inst.add_feature(Arc::new(OrderSensitive {
-            tag: "f2",
-            order: order.clone(),
-        }))
-        .unwrap();
+        inst.add_feature(Arc::new(OrderSensitive { tag: "f1", order: order.clone() })).unwrap();
+        inst.add_feature(Arc::new(OrderSensitive { tag: "f2", order: order.clone() })).unwrap();
         inst.start().unwrap();
         inst.close().unwrap();
         let recorded = order.lock().clone();
@@ -535,10 +534,7 @@ mod tests {
                 Ok(())
             }
         }
-        inst.add_feature(Arc::new(LateStarted {
-            flag: started.clone(),
-        }))
-        .unwrap();
+        inst.add_feature(Arc::new(LateStarted { flag: started.clone() })).unwrap();
         assert!(started.load(Ordering::SeqCst));
     }
 
@@ -612,9 +608,9 @@ mod tests {
 /// stats 注入真实 [`AppStatsFeature`]（Go 同样注入真实 app/stats.Instance），
 /// 其余为占位实现。
 fn ensure_essential_features(inst: &mut Instance) {
-    use xray_features::dns::DefaultDnsFeature;
-    use xray_features::policy::DefaultPolicyFeature;
-    use xray_features::routing::DefaultRouterFeature;
+    use xray_features::{
+        dns::DefaultDnsFeature, policy::DefaultPolicyFeature, routing::DefaultRouterFeature,
+    };
 
     if inst.get_feature::<DefaultDnsFeature>().is_none() {
         tracing::info!("no dns feature configured, injecting default");
@@ -633,4 +629,3 @@ fn ensure_essential_features(inst: &mut Instance) {
         inst.add_feature(Arc::new(crate::register::AppStatsFeature::new())).ok();
     }
 }
-

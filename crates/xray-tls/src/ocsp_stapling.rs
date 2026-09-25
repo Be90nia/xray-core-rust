@@ -22,8 +22,7 @@
 use std::sync::Arc;
 
 use ocsp_stapler::Stapler;
-use rustls::server::ResolvesServerCertUsingSni;
-use rustls::sign::CertifiedKey;
+use rustls::{server::ResolvesServerCertUsingSni, sign::CertifiedKey};
 use rustls_pemfile;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tracing::info;
@@ -220,9 +219,7 @@ mod tests {
 
     // 安装 ring crypto provider，否则 Stapler 会 panic
     fn install_ring_provider() {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .unwrap_or_default();
+        rustls::crypto::ring::default_provider().install_default().unwrap_or_default();
     }
     #[test]
     fn ocsp_stapler_config_from_proto() {

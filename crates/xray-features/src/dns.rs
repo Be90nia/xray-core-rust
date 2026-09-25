@@ -26,11 +26,7 @@ impl IpOption {
     /// 全开（IPv4 + IPv6 + FakeDNS）。
     #[must_use]
     pub const fn all() -> Self {
-        Self {
-            ipv4_enable: true,
-            ipv6_enable: true,
-            fake_enable: true,
-        }
+        Self { ipv4_enable: true, ipv6_enable: true, fake_enable: true }
     }
 
     /// 是否完全无查询目标。
@@ -144,11 +140,7 @@ impl DnsClient for DefaultDnsFeature {
             })
             .collect();
 
-        if ips.is_empty() {
-            Err(DnsError::EmptyResponse)
-        } else {
-            Ok((ips, DEFAULT_TTL))
-        }
+        if ips.is_empty() { Err(DnsError::EmptyResponse) } else { Ok((ips, DEFAULT_TTL)) }
     }
 }
 
@@ -219,19 +211,15 @@ mod tests {
         let result = feature
             .lookup_ip(
                 "localhost",
-                IpOption {
-                    ipv4_enable: true,
-                    ipv6_enable: true,
-                    fake_enable: false,
-                },
+                IpOption { ipv4_enable: true, ipv6_enable: true, fake_enable: false },
             )
             .await;
         match result {
             Ok((ips, ttl)) => {
                 assert!(!ips.is_empty());
                 assert_eq!(ttl, DEFAULT_TTL);
-            }
-            Err(DnsError::EmptyResponse) | Err(DnsError::Other(_)) => {}
+            },
+            Err(DnsError::EmptyResponse) | Err(DnsError::Other(_)) => {},
             Err(e) => panic!("unexpected error: {e}"),
         }
     }

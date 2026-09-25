@@ -118,14 +118,8 @@ impl WsListener {
             .accept(tcp)
             .await
             .map_err(|e| WsError::HandshakeFailed(format!("tls accept: {e}")))?;
-        Self::ws_handshake(
-            tls_stream,
-            remote,
-            local,
-            &self.configs,
-            &self.trusted_x_forwarded_for,
-        )
-        .await
+        Self::ws_handshake(tls_stream, remote, local, &self.configs, &self.trusted_x_forwarded_for)
+            .await
     }
 
     /// 解析 PROXY protocol（如果启用），返回真实客户端地址。
@@ -214,12 +208,11 @@ impl WsListener {
 
         // H14：握手全程 4s 超时（Go hub.go:27-33 Upgrader HandshakeTimeout: 4s；
         // 慢速/半开连接不再无限占用 accept 并发）。
-        let ws_stream = tokio::time::timeout(Duration::from_secs(4), accept_hdr_async(stream, callback))
-            .await
-            .map_err(|_| {
-                WsError::HandshakeFailed("websocket handshake timeout (4s)".into())
-            })?
-            .map_err(|e| WsError::HandshakeFailed(format!("accept_hdr_async: {e}")))?;
+        let ws_stream =
+            tokio::time::timeout(Duration::from_secs(4), accept_hdr_async(stream, callback))
+                .await
+                .map_err(|_| WsError::HandshakeFailed("websocket handshake timeout (4s)".into()))?
+                .map_err(|e| WsError::HandshakeFailed(format!("accept_hdr_async: {e}")))?;
 
         let early_data = early_data_slot.lock().map(|g| g.clone()).unwrap_or_default();
         let xff_ip = xff_slot.lock().ok().and_then(|mut g| g.take());
@@ -511,8 +504,7 @@ mod tests {
         use tokio_tungstenite::{client_async, tungstenite::client::IntoClientRequest};
 
         let cfg = Arc::new(Config::default());
-        let mut listener =
-            WsListener::bind("127.0.0.1:0".parse().unwrap(), cfg).await.unwrap();
+        let mut listener = WsListener::bind("127.0.0.1:0".parse().unwrap(), cfg).await.unwrap();
         // H1 语义：仅 sockopt.trustedXForwardedFor 名单命中才采纳 XFF——
         // 测试须配置名单，否则空名单=永不采纳（防伪造）。
         listener.trusted_x_forwarded_for = vec!["X-Real-IP".to_string()];

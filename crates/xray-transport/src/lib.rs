@@ -19,43 +19,42 @@
 //!
 //! 参考：Go 版本位于 `E:\Projcet\Xray-core\transport\`。
 
-pub mod link;
 pub mod bridge;
-pub mod connection;
 pub mod cnc;
-pub mod listener;
+pub mod connection;
 pub mod dialer;
-pub mod system_dialer;
-pub mod system_listener;
-pub mod stat;
-pub mod listener_registry;
 pub mod fallback;
+pub mod link;
+pub mod listener;
+pub mod listener_registry;
 pub mod retry;
 pub mod splice;
+pub mod stat;
+pub mod system_dialer;
+pub mod system_listener;
 
 // 以下模块依赖 Phase 4+ 才会出现的 features（dns/outbound/policy 等），当前为 stub。
-pub mod sockopt;
-pub mod tcp;
-pub mod udp;
-pub mod headers;
-pub mod finalmask;
-pub mod pipe;
-pub mod config;
-pub mod filelocker;
-pub mod happy_eyeballs;
 #[cfg(feature = "browser-dialer")]
 pub mod browser_dialer;
-pub mod tagged;
+pub mod config;
+pub mod filelocker;
+pub mod finalmask;
+pub mod happy_eyeballs;
+pub mod headers;
 pub mod memory_settings;
+pub mod pipe;
 pub mod proxy_protocol;
+pub mod sockopt;
+pub mod tagged;
+pub mod tcp;
+pub mod udp;
 // 顶层 re-export。
 pub use bridge::{bridge_connections, bridge_connections_with_splice, copy_one_way};
 pub use proxy_protocol::{build_proxy_header, read_proxy_protocol};
-
-/// TLS acceptor for inbound connections.
-/// Re-exported so proxy crates don't need a direct `tokio-rustls` dependency.
-pub use tokio_rustls::TlsAcceptor;
 /// Re-exported so proxy crates can inspect negotiated TLS parameters (e.g.
 /// `ServerConnection::protocol_version` for VLESS XRV outer-TLS1.3 gating)
 /// without a direct `rustls` dependency.
 pub use rustls;
+/// TLS acceptor for inbound connections.
+/// Re-exported so proxy crates don't need a direct `tokio-rustls` dependency.
+pub use tokio_rustls::TlsAcceptor;

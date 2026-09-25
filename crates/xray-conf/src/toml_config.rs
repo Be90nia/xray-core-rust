@@ -8,16 +8,16 @@
 
 use std::io::Read;
 
-use crate::config::Config;
-use crate::error::{ConfError, Result};
+use crate::{
+    config::Config,
+    error::{ConfError, Result},
+};
 
 /// 从 reader 解析 TOML 配置。
 pub fn decode_toml(mut reader: impl Read) -> Result<Config> {
     // toml crate 的反序列化器要求字符串输入（不支持 from_reader）。
     let mut buf = String::new();
-    reader
-        .read_to_string(&mut buf)
-        .map_err(ConfError::Io)?;
+    reader.read_to_string(&mut buf).map_err(ConfError::Io)?;
 
     let toml_value: toml::Value = toml::from_str(&buf).map_err(|e| ConfError::simple("toml", e))?;
 

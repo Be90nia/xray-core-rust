@@ -3,8 +3,9 @@
 //! 对应 Go 版本 `common/buf.MultiBuffer`，管理一组 `Buffer` 的集合。
 //! 用于高效处理分散/聚集 I/O，避免频繁的内存拷贝。
 
-use crate::buffer::Buffer;
 use std::mem::ManuallyDrop;
+
+use crate::buffer::Buffer;
 
 /// 多缓冲区容器，管理一组 `Buffer`。
 ///
@@ -23,30 +24,22 @@ impl MultiBuffer {
 
     /// 创建空的 MultiBuffer。
     pub fn new() -> Self {
-        Self {
-            buffers: ManuallyDrop::new(Vec::new()),
-        }
+        Self { buffers: ManuallyDrop::new(Vec::new()) }
     }
 
     /// 预分配指定数量的缓冲区槽位。
     pub fn with_capacity(n: usize) -> Self {
-        Self {
-            buffers: ManuallyDrop::new(Vec::with_capacity(n)),
-        }
+        Self { buffers: ManuallyDrop::new(Vec::with_capacity(n)) }
     }
 
     /// 从单个 Buffer 构造。
     pub fn from_buffer(buf: Buffer) -> Self {
-        Self {
-            buffers: ManuallyDrop::new(vec![buf]),
-        }
+        Self { buffers: ManuallyDrop::new(vec![buf]) }
     }
 
     /// 从 Vec<Buffer> 构造。
     pub fn from_buffers(buffers: Vec<Buffer>) -> Self {
-        Self {
-            buffers: ManuallyDrop::new(buffers),
-        }
+        Self { buffers: ManuallyDrop::new(buffers) }
     }
 
     // ========== 基本操作 ==========
@@ -414,8 +407,8 @@ impl std::fmt::Debug for MultiBuffer {
 }
 
 impl IntoIterator for MultiBuffer {
-    type Item = Buffer;
     type IntoIter = std::vec::IntoIter<Buffer>;
+    type Item = Buffer;
 
     fn into_iter(self) -> Self::IntoIter {
         self.into_buffers().into_iter()
@@ -423,8 +416,8 @@ impl IntoIterator for MultiBuffer {
 }
 
 impl<'a> IntoIterator for &'a MultiBuffer {
-    type Item = &'a Buffer;
     type IntoIter = std::slice::Iter<'a, Buffer>;
+    type Item = &'a Buffer;
 
     fn into_iter(self) -> Self::IntoIter {
         self.buffers.iter()
@@ -432,8 +425,8 @@ impl<'a> IntoIterator for &'a MultiBuffer {
 }
 
 impl<'a> IntoIterator for &'a mut MultiBuffer {
-    type Item = &'a mut Buffer;
     type IntoIter = std::slice::IterMut<'a, Buffer>;
+    type Item = &'a mut Buffer;
 
     fn into_iter(self) -> Self::IntoIter {
         self.buffers.iter_mut()
@@ -442,8 +435,9 @@ impl<'a> IntoIterator for &'a mut MultiBuffer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use bytes::BytesMut;
+
+    use super::*;
 
     fn make_buffer(data: &[u8]) -> Buffer {
         Buffer::from_bytes(BytesMut::from(data))
@@ -503,10 +497,7 @@ mod tests {
 
     #[test]
     fn test_split_bytes_full() {
-        let mut mb = MultiBuffer::from_buffers(vec![
-            make_buffer(b"hello"),
-            make_buffer(b" world"),
-        ]);
+        let mut mb = MultiBuffer::from_buffers(vec![make_buffer(b"hello"), make_buffer(b" world")]);
         let split = mb.split_bytes(5);
         assert_eq!(split.len(), 5);
         assert_eq!(split.to_vec(), b"hello");
@@ -544,10 +535,7 @@ mod tests {
 
     #[test]
     fn test_split_first() {
-        let mut mb = MultiBuffer::from_buffers(vec![
-            make_buffer(b"first"),
-            make_buffer(b"second"),
-        ]);
+        let mut mb = MultiBuffer::from_buffers(vec![make_buffer(b"first"), make_buffer(b"second")]);
         let first = mb.split_first();
         assert!(first.is_some());
         assert_eq!(first.expect("checked").bytes(), b"first");
@@ -574,10 +562,7 @@ mod tests {
 
     #[test]
     fn test_split_size_exact() {
-        let mut mb = MultiBuffer::from_buffers(vec![
-            make_buffer(b"aaa"),
-            make_buffer(b"bbb"),
-        ]);
+        let mut mb = MultiBuffer::from_buffers(vec![make_buffer(b"aaa"), make_buffer(b"bbb")]);
         let split = mb.split_size(6);
         assert_eq!(split.to_vec(), b"aaabbb");
         assert_eq!(mb.len(), 0);
@@ -645,10 +630,7 @@ mod tests {
 
     #[test]
     fn test_release() {
-        let mut mb = MultiBuffer::from_buffers(vec![
-            make_buffer(b"a"),
-            make_buffer(b"b"),
-        ]);
+        let mut mb = MultiBuffer::from_buffers(vec![make_buffer(b"a"), make_buffer(b"b")]);
         mb.release();
         assert_eq!(mb.buffer_count(), 0);
         assert!(mb.is_empty());
@@ -656,10 +638,7 @@ mod tests {
 
     #[test]
     fn test_read_to() {
-        let mut mb = MultiBuffer::from_buffers(vec![
-            make_buffer(b"hel"),
-            make_buffer(b"lo"),
-        ]);
+        let mut mb = MultiBuffer::from_buffers(vec![make_buffer(b"hel"), make_buffer(b"lo")]);
         let mut dst = [0u8; 5];
         let n = mb.read_to(&mut dst);
         assert_eq!(n, 5);
@@ -688,10 +667,7 @@ mod tests {
 
     #[test]
     fn test_copy_to_slice() {
-        let mb = MultiBuffer::from_buffers(vec![
-            make_buffer(b"hello"),
-            make_buffer(b" world"),
-        ]);
+        let mb = MultiBuffer::from_buffers(vec![make_buffer(b"hello"), make_buffer(b" world")]);
         let mut dst = [0u8; 5];
         mb.copy_to_slice(3, &mut dst);
         assert_eq!(&dst, b"lo wo");
@@ -719,20 +695,14 @@ mod tests {
 
     #[test]
     fn test_iter() {
-        let mb = MultiBuffer::from_buffers(vec![
-            make_buffer(b"ab"),
-            make_buffer(b"cd"),
-        ]);
+        let mb = MultiBuffer::from_buffers(vec![make_buffer(b"ab"), make_buffer(b"cd")]);
         let lens: Vec<usize> = mb.iter().map(|b| b.len()).collect();
         assert_eq!(lens, vec![2, 2]);
     }
 
     #[test]
     fn test_iter_mut() {
-        let mut mb = MultiBuffer::from_buffers(vec![
-            make_buffer(b"ab"),
-            make_buffer(b"cd"),
-        ]);
+        let mut mb = MultiBuffer::from_buffers(vec![make_buffer(b"ab"), make_buffer(b"cd")]);
         for buf in mb.iter_mut() {
             buf.as_mut()[0] = b'x';
         }
@@ -741,38 +711,26 @@ mod tests {
 
     #[test]
     fn test_into_iter() {
-        let mb = MultiBuffer::from_buffers(vec![
-            make_buffer(b"ab"),
-            make_buffer(b"cd"),
-        ]);
+        let mb = MultiBuffer::from_buffers(vec![make_buffer(b"ab"), make_buffer(b"cd")]);
         let bufs: Vec<Buffer> = mb.into_iter().collect();
         assert_eq!(bufs.len(), 2);
     }
 
     #[test]
     fn test_to_vec() {
-        let mb = MultiBuffer::from_buffers(vec![
-            make_buffer(b"hel"),
-            make_buffer(b"lo"),
-        ]);
+        let mb = MultiBuffer::from_buffers(vec![make_buffer(b"hel"), make_buffer(b"lo")]);
         assert_eq!(mb.to_vec(), b"hello");
     }
 
     #[test]
     fn test_into_vec() {
-        let mb = MultiBuffer::from_buffers(vec![
-            make_buffer(b"hel"),
-            make_buffer(b"lo"),
-        ]);
+        let mb = MultiBuffer::from_buffers(vec![make_buffer(b"hel"), make_buffer(b"lo")]);
         assert_eq!(mb.into_vec(), b"hello");
     }
 
     #[test]
     fn test_debug() {
-        let mb = MultiBuffer::from_buffers(vec![
-            make_buffer(b"ab"),
-            make_buffer(b"cd"),
-        ]);
+        let mb = MultiBuffer::from_buffers(vec![make_buffer(b"ab"), make_buffer(b"cd")]);
         let debug = format!("{mb:?}");
         assert!(debug.contains("buffer_count: 2"));
         assert!(debug.contains("total_len: 4"));
@@ -812,10 +770,7 @@ mod tests {
 
     #[test]
     fn test_into_buffers() {
-        let mb = MultiBuffer::from_buffers(vec![
-            make_buffer(b"a"),
-            make_buffer(b"b"),
-        ]);
+        let mb = MultiBuffer::from_buffers(vec![make_buffer(b"a"), make_buffer(b"b")]);
         let bufs = mb.into_buffers();
         assert_eq!(bufs.len(), 2);
     }
@@ -838,10 +793,7 @@ mod tests {
     fn test_split_first_bytes_basic() {
         // 对应 Go TestSplitFirstBytes：mb 只有一个 buffer "ab" + "cd" 两个 buffer。
         // 第一个 buffer ("ab") 被完全消费并 copy 到 dst，mb 保留剩余 buffer。
-        let mut mb = MultiBuffer::from_buffers(vec![
-            make_buffer(b"ab"),
-            make_buffer(b"cd"),
-        ]);
+        let mut mb = MultiBuffer::from_buffers(vec![make_buffer(b"ab"), make_buffer(b"cd")]);
         let mut dst = [0u8; 2];
         let n = mb.split_first_bytes(&mut dst);
         assert_eq!(n, 2);
@@ -875,10 +827,7 @@ mod tests {
     fn test_split_first_bytes_only_consumes_first() {
         // 关键语义：SplitFirstBytes 只 split 第一个 Buffer，
         // 后续 Buffer 保留在 mb 中。
-        let mut mb = MultiBuffer::from_buffers(vec![
-            make_buffer(b"hello"),
-            make_buffer(b"world"),
-        ]);
+        let mut mb = MultiBuffer::from_buffers(vec![make_buffer(b"hello"), make_buffer(b"world")]);
         let mut dst = [0u8; 5];
         let n = mb.split_first_bytes(&mut dst);
         assert_eq!(n, 5);

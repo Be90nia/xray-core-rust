@@ -5,14 +5,13 @@
 //! - [`ProxyOutbound`] — 代理出站处理（Go `proxy.Outbound.Process`）
 //! - [`OutboundDialer`] — 拨号器接口（Go `internet.Dialer`），由 mux 和代理链使用
 
-use crate::error::ProxymanError;
+use std::{io, sync::Arc};
+
 use async_trait::async_trait;
-use std::io;
-use std::sync::Arc;
-use xray_common::net::destination::Destination;
-use xray_common::session::Session;
-use xray_transport::connection::Connection;
-use xray_transport::link::Link;
+use xray_common::{net::destination::Destination, session::Session};
+use xray_transport::{connection::Connection, link::Link};
+
+use crate::error::ProxymanError;
 
 /// 出站代理处理 trait（对应 Go `proxy.Outbound`）。
 ///

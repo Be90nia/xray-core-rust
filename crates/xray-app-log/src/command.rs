@@ -5,8 +5,10 @@
 
 use std::sync::Arc;
 
-use crate::error::LogError;
-use crate::instance::{HandlerCreatorRegistry, LogInstance};
+use crate::{
+    error::LogError,
+    instance::{HandlerCreatorRegistry, LogInstance},
+};
 
 /// Log 服务 trait：暴露 restart RPC。
 ///
@@ -51,12 +53,10 @@ impl LogService for DefaultLogService {
 pub struct LogServiceDescriptor;
 
 impl LogServiceDescriptor {
-    /// 服务名（与 Go `LoggerService_ServiceDesc.ServiceName` 一致）。
-    pub const SERVICE_NAME: &'static str = "xray.app.log.command.LoggerService";
-
     /// 兼容旧名（v2ray.core 兼容服务名）。
     pub const LEGACY_SERVICE_NAME: &'static str = "v2ray.core.app.log.command.LoggerService";
-
+    /// 服务名（与 Go `LoggerService_ServiceDesc.ServiceName` 一致）。
+    pub const SERVICE_NAME: &'static str = "xray.app.log.command.LoggerService";
     /// type_url（与 commander 的 Service trait 模式一致）。
     pub const TYPE_URL: &'static str = "xray.app.log.command.Config";
 }
@@ -71,11 +71,7 @@ mod tests {
     }
     impl LogService for FailingInstance {
         fn restart_logger(&self) -> Result<(), LogError> {
-            if self.fail {
-                Err(LogError::NotActive)
-            } else {
-                Ok(())
-            }
+            if self.fail { Err(LogError::NotActive) } else { Ok(()) }
         }
     }
 
@@ -102,8 +98,11 @@ mod tests {
         let cfg = LogConfig::default();
         let inst = Arc::new(LogInstance::new(cfg).unwrap());
         let reg = Arc::new(HandlerCreatorRegistry::new());
-        reg.register(crate::config::LogType::Console, Arc::new(crate::instance::NoneHandlerCreator))
-            .unwrap();
+        reg.register(
+            crate::config::LogType::Console,
+            Arc::new(crate::instance::NoneHandlerCreator),
+        )
+        .unwrap();
         reg.register(crate::config::LogType::None, Arc::new(crate::instance::NoneHandlerCreator))
             .unwrap();
         let svc = DefaultLogService::new(inst.clone(), reg);

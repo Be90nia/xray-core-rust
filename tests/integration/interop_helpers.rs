@@ -1,16 +1,15 @@
 //! Go<->Rust interop test shared helpers.
-//!
 // Go xray-core subprocess management, port wait, HTTP test request,
 // JSON config generation. All interop test files share this module.
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::process::{Child, Command};
-use tokio::time;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    process::{Child, Command},
+    time,
+};
 
 // -- Error types -------------------------------------------------------
 
@@ -28,13 +27,15 @@ pub enum InteropError {
 impl std::fmt::Display for InteropError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::GoBinaryNotFound { path } => write!(f, "Go xray binary not found: {}", path.display()),
+            Self::GoBinaryNotFound { path } => {
+                write!(f, "Go xray binary not found: {}", path.display())
+            },
             Self::GoProcessStartFailed { source } => {
                 write!(f, "Go xray process failed to start: {source}")
-            }
+            },
             Self::PortTimeout { port, timeout_ms } => {
                 write!(f, "Port {port} not ready within {timeout_ms}ms")
-            }
+            },
             Self::HttpRequestFailed(s) => write!(f, "HTTP request through proxy failed: {s}"),
             Self::ConfigWrite(s) => write!(f, "Config write error: {s}"),
             Self::Io(e) => write!(f, "IO error: {e}"),
@@ -66,16 +67,10 @@ pub type Result<T> = std::result::Result<T, InteropError>;
 // Priority: env var XRAY_GO_BIN, else D:/Project/Xray-core/target/xray-go.exe
 // (d4v3: 旧机盘符 E:\Projcet 残留已移除; 也可用 D:/Project/Xray-core/target/release/xray.exe)
 pub fn go_xray_bin_path() -> PathBuf {
-    std::env::var("XRAY_GO_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let d = PathBuf::from(r"D:\Project\Xray-core\target\xray-go.exe");
-            if d.exists() {
-                d
-            } else {
-                PathBuf::from(r"D:\Project\Xray-core\target\release\xray.exe")
-            }
-        })
+    std::env::var("XRAY_GO_BIN").map(PathBuf::from).unwrap_or_else(|_| {
+        let d = PathBuf::from(r"D:\Project\Xray-core\target\xray-go.exe");
+        if d.exists() { d } else { PathBuf::from(r"D:\Project\Xray-core\target\release\xray.exe") }
+    })
 }
 
 // -- Go xray subprocess management -------------------------------------
@@ -187,9 +182,7 @@ pub async fn http_get_via_socks5(
     while total < 4 {
         let n = stream.read(&mut connect_resp[total..]).await?;
         if n == 0 {
-            return Err(InteropError::HttpRequestFailed(
-                "SOCKS5 connect response EOF".into(),
-            ));
+            return Err(InteropError::HttpRequestFailed("SOCKS5 connect response EOF".into()));
         }
         total += n;
     }
@@ -200,8 +193,8 @@ pub async fn http_get_via_socks5(
         other => {
             return Err(InteropError::HttpRequestFailed(format!(
                 "SOCKS5 unknown address type: {other}"
-            )))
-        }
+            )));
+        },
     };
     let need = 4 + addr_len + 2;
     while total < need {
@@ -238,10 +231,8 @@ pub async fn http_get_via_socks5(
                 if e.kind() == std::io::ErrorKind::ConnectionReset {
                     break;
                 }
-                return Err(InteropError::HttpRequestFailed(format!(
-                    "HTTP read error: {e}"
-                )));
-            }
+                return Err(InteropError::HttpRequestFailed(format!("HTTP read error: {e}")));
+            },
         }
     }
 
@@ -268,7 +259,7 @@ pub async fn spawn_echo_server() -> Result<u16> {
                                 if sock.write_all(&buf[..n]).await.is_err() {
                                     break;
                                 }
-                            }
+                            },
                         }
                     }
                 });

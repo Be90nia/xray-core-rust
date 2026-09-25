@@ -4,8 +4,8 @@
 //!
 //! - `DnsService` 顶层结构 + 配置构造：完整翻译。
 //! - `sort_clients`：业务核心，独立可测。
-//! - `lookup_ip`：完整翻译（hosts 查询部分），nameservers 查询部分依赖
-//!   `Server` trait 实际执行，由调用方在 trait 实现后接入。
+//! - `lookup_ip`：完整翻译（hosts 查询部分），nameservers 查询部分依赖 `Server` trait
+//!   实际执行，由调用方在 trait 实现后接入。
 //! - `check_routes`：系统路由探测（IPv4/IPv6 可达性），对应 Go `utils.CheckRoutes`。
 //!
 //! ## 跳过范围
@@ -14,18 +14,20 @@
 //!   方法占位，调用方提供具体实现（实现时需要持有 `tokio::task::JoinSet`）。
 //! - Go `init()` 全局注册：Rust 无副作用全局。
 
-use std::net::IpAddr;
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::{
+    net::IpAddr,
+    sync::{Arc, OnceLock},
+};
 
 use parking_lot::Mutex;
-use xray_features::Feature;
-use xray_features::dns::DnsError as FeaturesDnsError;
+use xray_features::{Feature, dns::DnsError as FeaturesDnsError};
 
-use crate::config::{to_net_ip, IpOption, QueryStrategy};
-use crate::error::DnsError;
-use crate::hosts::StaticHosts;
-use crate::nameserver::Client;
+use crate::{
+    config::{IpOption, QueryStrategy, to_net_ip},
+    error::DnsError,
+    hosts::StaticHosts,
+    nameserver::Client,
+};
 
 /// 域名匹配信息（与 Go `DomainMatcherInfo` 对齐）。
 #[derive(Debug, Clone)]
@@ -85,11 +87,7 @@ impl DnsService {
     pub fn new(mut cfg: DnsServiceConfig) -> Self {
         let domain_matcher = cfg.domain_matcher.take();
         let matcher_infos = std::mem::take(&mut cfg.matcher_infos);
-        Self {
-            cfg,
-            matcher: Mutex::new(domain_matcher),
-            matcher_infos: Mutex::new(matcher_infos),
-        }
+        Self { cfg, matcher: Mutex::new(domain_matcher), matcher_infos: Mutex::new(matcher_infos) }
     }
 
     /// 注入域名匹配器（用于 `sort_clients`）。
@@ -247,7 +245,7 @@ impl DnsService {
         // `Some(vec![])` = 记录存在但按 option 过滤后无有效 IP。
         let mut ns_domain = domain.to_string();
         match self.cfg.hosts.lookup(domain, effective)? {
-            None => {}
+            None => {},
             Some(addrs) => {
                 if let [xray_common::net::address::Address::Domain(d)] = addrs.as_slice() {
                     // 域名替换：以尾域名走 nameservers，不再进 hosts
@@ -261,7 +259,7 @@ impl DnsService {
                     let ips = to_net_ip(&addrs)?;
                     return Ok((ips, 10));
                 }
-            }
+            },
         }
 
         // Nameservers 查询（hosts 域名替换后的尾域名也走这里）。
@@ -334,7 +332,7 @@ async fn serial_query(
                 // 只作用于 sortClients 的序列截断；查询失败仍记日志继续问下一
                 // 个（fallback）server，最后 mergeQueryErrors。
                 outcomes.push(Err(e));
-            }
+            },
         }
     }
     Err(merge_query_errors(domain, &outcomes).expect_err("serial_query outcomes are all Err"))
@@ -440,16 +438,16 @@ async fn parallel_query(
         match &outcome {
             Ok((ips, ttl)) if !ips.is_empty() => {
                 outcomes[idx] = ClientOutcome::Success(ips.clone(), *ttl);
-            }
+            },
             Ok(_) => {
                 // Ok 但空 IP → 视为 Failure（Go 同步 dns.ErrEmptyResponse）。
                 outcomes[idx] = ClientOutcome::Failure;
                 raw_errs[idx] = Err(DnsError::EmptyResponse);
-            }
+            },
             Err(e) => {
                 outcomes[idx] = ClientOutcome::Failure;
                 raw_errs[idx] = Err(clone_dns_err(e));
-            }
+            },
         }
 
         // 对齐 Go dns.go:412-437：每收到一个结果立即连续推进组检查。
@@ -516,19 +514,15 @@ fn advance_groups(
 
 /// 组内任一已收结果成功 → 返回 (ips, ttl)（Go dns.go:419-426 组内 race）。
 fn group_success(outcomes: &[ClientOutcome], g: Group) -> Option<(Vec<IpAddr>, u32)> {
-    outcomes[g.start..=g.end]
-        .iter()
-        .find_map(|o| match o {
-            ClientOutcome::Success(ips, ttl) => Some((ips.clone(), *ttl)),
-            _ => None,
-        })
+    outcomes[g.start..=g.end].iter().find_map(|o| match o {
+        ClientOutcome::Success(ips, ttl) => Some((ips.clone(), *ttl)),
+        _ => None,
+    })
 }
 
 /// 组内是否还有未返回的查询（Go dns.go:428 pending 计数 > 0）。
 fn group_pending(outcomes: &[ClientOutcome], g: Group) -> bool {
-    outcomes[g.start..=g.end]
-        .iter()
-        .any(|o| matches!(o, ClientOutcome::Pending))
+    outcomes[g.start..=g.end].iter().any(|o| matches!(o, ClientOutcome::Pending))
 }
 // ── 错误聚合 + 决策日志（Go dns.go:339-361 mergeQueryErrors + dns.go:330-337 logDecision）──
 
@@ -544,9 +538,8 @@ fn clone_dns_err(e: &DnsError) -> DnsError {
         DnsError::InvalidStaticHostsIP(s) => DnsError::InvalidStaticHostsIP(s.clone()),
         DnsError::InvalidFakeDnsSetting => DnsError::InvalidFakeDnsSetting,
         DnsError::InvalidFakeDnsCidr(s) => DnsError::InvalidFakeDnsCidr(s.clone()),
-        DnsError::LruBiggerThanSubnet { lru, rooms } => DnsError::LruBiggerThanSubnet {
-            lru: *lru,
-            rooms: *rooms,
+        DnsError::LruBiggerThanSubnet { lru, rooms } => {
+            DnsError::LruBiggerThanSubnet { lru: *lru, rooms: *rooms }
         },
         DnsError::NoFakeDnsEngine => DnsError::NoFakeDnsEngine,
         DnsError::Features(f) => DnsError::Features(f.clone()),
@@ -568,10 +561,7 @@ fn merge_query_errors(
     domain: &str,
     outcomes: &[Result<(Vec<IpAddr>, u32), DnsError>],
 ) -> Result<(Vec<IpAddr>, u32), DnsError> {
-    let errs: Vec<&DnsError> = outcomes
-        .iter()
-        .filter_map(|r| r.as_ref().err())
-        .collect();
+    let errs: Vec<&DnsError> = outcomes.iter().filter_map(|r| r.as_ref().err()).collect();
 
     if errs.is_empty() {
         return Err(DnsError::EmptyResponse);
@@ -589,18 +579,14 @@ fn merge_query_errors(
             Some(prev) if !same_dns_error_kind(prev, e) => {
                 has_multiple_distinct = true;
                 break;
-            }
-            _ => {}
+            },
+            _ => {},
         }
     }
 
     if has_multiple_distinct {
         // Go: errors.New("returning nil for domain ").Base(errors.Combine(errs...))
-        let combined = errs
-            .iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-            .join("; ");
+        let combined = errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
         return Err(DnsError::SystemResolve(format!(
             "returning nil for domain {domain}: {combined}"
         )));
@@ -657,25 +643,23 @@ pub fn check_routes() -> (bool, bool) {
 fn probe_routes() -> (bool, bool) {
     // Go: net.Dial("udp4", "192.33.4.12:53") —— 创建 UDP socket 并 connect。
     // Rust std: UdpSocket::bind → connect。connect 不发送数据，仅检查路由可达性。
-    let ipv4 = std::net::UdpSocket::bind("0.0.0.0:0")
-        .and_then(|s| s.connect("192.33.4.12:53"))
-        .is_ok();
-    let ipv6 = std::net::UdpSocket::bind("[::]:0")
-        .and_then(|s| s.connect("[2001:500:2::c]:53"))
-        .is_ok();
+    let ipv4 =
+        std::net::UdpSocket::bind("0.0.0.0:0").and_then(|s| s.connect("192.33.4.12:53")).is_ok();
+    let ipv6 =
+        std::net::UdpSocket::bind("[::]:0").and_then(|s| s.connect("[2001:500:2::c]:53")).is_ok();
     (ipv4, ipv6)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{future::Future, net::Ipv4Addr, pin::Pin, time::Duration};
+
     use super::*;
-    use crate::config::QueryStrategy;
-    use crate::hosts::HostMapping;
-    use crate::nameserver::{NameServerConfig, Server};
-    use std::net::Ipv4Addr;
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::time::Duration;
+    use crate::{
+        config::QueryStrategy,
+        hosts::HostMapping,
+        nameserver::{NameServerConfig, Server},
+    };
 
     /// 测试用 Server：固定返回指定 IP + TTL。
     struct StaticServer {
@@ -687,14 +671,17 @@ mod tests {
         fn name(&self) -> &str {
             &self.name
         }
+
         fn is_disable_cache(&self) -> bool {
             false
         }
+
         fn query_ip<'a>(
             &'a self,
             _domain: &'a str,
             _option: IpOption,
-        ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>>
+        {
             let ips = self.ips.clone();
             Box::pin(async move { Ok((ips, 60)) })
         }
@@ -704,7 +691,12 @@ mod tests {
         make_client_with_ips(tag, skip_fallback, final_query, Vec::new())
     }
 
-    fn make_client_with_ips(tag: &str, skip_fallback: bool, final_query: bool, ips: Vec<IpAddr>) -> Arc<Client> {
+    fn make_client_with_ips(
+        tag: &str,
+        skip_fallback: bool,
+        final_query: bool,
+        ips: Vec<IpAddr>,
+    ) -> Arc<Client> {
         make_client_with_policy(tag, skip_fallback, final_query, ips, 0)
     }
 
@@ -722,10 +714,7 @@ mod tests {
             policy_id,
             ..Default::default()
         };
-        let server: Box<dyn Server> = Box::new(StaticServer {
-            name: tag.to_string(),
-            ips,
-        });
+        let server: Box<dyn Server> = Box::new(StaticServer { name: tag.to_string(), ips });
         Arc::new(Client::new(ns, IpOption::all(), server).unwrap())
     }
 
@@ -741,14 +730,17 @@ mod tests {
         fn name(&self) -> &str {
             &self.name
         }
+
         fn is_disable_cache(&self) -> bool {
             false
         }
+
         fn query_ip<'a>(
             &'a self,
             _domain: &'a str,
             _option: IpOption,
-        ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>>
+        {
             let ips = self.ips.clone();
             let delay = self.delay;
             Box::pin(async move {
@@ -764,16 +756,8 @@ mod tests {
         ips: Vec<IpAddr>,
         delay: Duration,
     ) -> Arc<Client> {
-        let ns = NameServerConfig {
-            tag: tag.to_string(),
-            policy_id,
-            ..Default::default()
-        };
-        let server: Box<dyn Server> = Box::new(DelayedServer {
-            name: tag.to_string(),
-            ips,
-            delay,
-        });
+        let ns = NameServerConfig { tag: tag.to_string(), policy_id, ..Default::default() };
+        let server: Box<dyn Server> = Box::new(DelayedServer { name: tag.to_string(), ips, delay });
         Arc::new(Client::new(ns, IpOption::all(), server).unwrap())
     }
     fn make_service_cfg(
@@ -812,7 +796,6 @@ mod tests {
         make_service_cfg(clients, hosts, false)
     }
 
-
     #[test]
     fn sort_clients_returns_all_when_no_matcher() {
         let c1 = make_client("a", false, false);
@@ -838,15 +821,10 @@ mod tests {
         let ns = NameServerConfig {
             tag: "exp".to_string(),
             expected_ip_rules: vec![xray_geodata::pb::IpRule {
-                value: Some(xray_geodata::pb::ip_rule::Value::Custom(
-                    xray_geodata::pb::CidrRule {
-                        cidr: Some(Cidr {
-                            ip: vec![10, 0, 0, 0],
-                            prefix: 8,
-                        }),
-                        reverse_match: false,
-                    },
-                )),
+                value: Some(xray_geodata::pb::ip_rule::Value::Custom(xray_geodata::pb::CidrRule {
+                    cidr: Some(Cidr { ip: vec![10, 0, 0, 0], prefix: 8 }),
+                    reverse_match: false,
+                })),
             }],
             ..Default::default()
         };
@@ -873,10 +851,7 @@ mod tests {
                 expected_ip_rules: vec![xray_geodata::pb::IpRule {
                     value: Some(xray_geodata::pb::ip_rule::Value::Custom(
                         xray_geodata::pb::CidrRule {
-                            cidr: Some(Cidr {
-                                ip: vec![10, 0, 0, 0],
-                                prefix: 8,
-                            }),
+                            cidr: Some(Cidr { ip: vec![10, 0, 0, 0], prefix: 8 }),
                             reverse_match: false,
                         },
                     )),
@@ -989,13 +964,9 @@ mod tests {
                 matcher_rules: Vec::new(),
             }],
         );
-        let v6_only = IpOption {
-            ipv4_enable: false,
-            ipv6_enable: true,
-            fake_enable: false,
-        };
+        let v6_only = IpOption { ipv4_enable: false, ipv6_enable: true, fake_enable: false };
         match svc.lookup_ip("x.com", v6_only).await {
-            Err(DnsError::EmptyResponse) => {}
+            Err(DnsError::EmptyResponse) => {},
             other => panic!("expected EmptyResponse, got {other:?}"),
         }
     }
@@ -1003,10 +974,8 @@ mod tests {
     #[tokio::test]
     async fn lookup_ip_queries_nameservers_when_not_in_hosts() {
         use std::net::Ipv4Addr;
-        let client = make_client_with_ips(
-            "a", false, false,
-            vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))],
-        );
+        let client =
+            make_client_with_ips("a", false, false, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
         let svc = make_service(vec![client], Vec::new());
         let (ips, ttl) = svc.lookup_ip("unknown.com", IpOption::all()).await.unwrap();
         assert_eq!(ips.len(), 1);
@@ -1037,18 +1006,15 @@ mod tests {
     /// Go dns.go:365-369——!FakeEnable 时 FakeDNS client 不参与查询。
     #[tokio::test]
     async fn lookup_ip_skips_fakedns_when_fake_disabled() {
-        use crate::nameserver::fakedns::FakeDnsServer;
-        use crate::fakedns::Holder;
+        use crate::{fakedns::Holder, nameserver::fakedns::FakeDnsServer};
 
         // FakeDNS client（tag 无关，server name 决定跳过）。
         let ns = NameServerConfig { tag: "fake".into(), ..Default::default() };
         let fake: Box<dyn Server> = Box::new(FakeDnsServer::new(Holder::new_default().unwrap()));
         let fake_client = Arc::new(Client::new(ns, IpOption::all(), fake).unwrap());
         // 真实 client 兜底。
-        let real = make_client_with_ips(
-            "real", false, false,
-            vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))],
-        );
+        let real =
+            make_client_with_ips("real", false, false, vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))]);
         let svc = make_service(vec![fake_client, real], Vec::new());
 
         // fake_enable=false：跳过 FakeDNS，拿到 real 的 9.9.9.9。
@@ -1132,7 +1098,7 @@ mod tests {
         );
         let fut = svc.lookup_ip("a.com", IpOption::all());
         match tokio::time::timeout(Duration::from_secs(2), fut).await {
-            Ok(Err(DnsError::EmptyResponse)) => {}
+            Ok(Err(DnsError::EmptyResponse)) => {},
             Ok(other) => panic!("expected EmptyResponse, got {other:?}"),
             Err(_) => panic!("hosts redirect cycle must terminate"),
         }
@@ -1140,8 +1106,9 @@ mod tests {
 
     // ---- features::dns::DnsClient trait 边界（drj：单方法 + IPOption + TTL）----
 
-    fn make_trait_service(hosts: Vec<HostMapping>) -> std::sync::Arc<dyn xray_features::dns::DnsClient>
-    {
+    fn make_trait_service(
+        hosts: Vec<HostMapping>,
+    ) -> std::sync::Arc<dyn xray_features::dns::DnsClient> {
         std::sync::Arc::new(make_service(Vec::new(), hosts))
     }
 
@@ -1154,10 +1121,8 @@ mod tests {
             proxied_domain: String::new(),
             matcher_rules: Vec::new(),
         }]);
-        let (ips, ttl) = svc
-            .lookup_ip("example.com", IpOption::all())
-            .await
-            .expect("hosts hit must resolve");
+        let (ips, ttl) =
+            svc.lookup_ip("example.com", IpOption::all()).await.expect("hosts hit must resolve");
         assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
         assert_eq!(ttl, 10);
     }
@@ -1201,18 +1166,9 @@ mod tests {
         let ip_b = IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2));
         let ip_c = IpAddr::V4(Ipv4Addr::new(3, 3, 3, 3));
         // 同一 policy_id=7，3 个 client，rtt 差异：b 最快、a 次之、c 最慢。
-        let c_a = make_delayed_client(
-            "a", 7, vec![ip_a],
-            Duration::from_millis(50),
-        );
-        let c_b = make_delayed_client(
-            "b", 7, vec![ip_b],
-            Duration::from_millis(10),
-        );
-        let c_c = make_delayed_client(
-            "c", 7, vec![ip_c],
-            Duration::from_millis(100),
-        );
+        let c_a = make_delayed_client("a", 7, vec![ip_a], Duration::from_millis(50));
+        let c_b = make_delayed_client("b", 7, vec![ip_b], Duration::from_millis(10));
+        let c_c = make_delayed_client("c", 7, vec![ip_c], Duration::from_millis(100));
         let clients = vec![c_a, c_b, c_c];
         // 先单独验证 make_groups：3 个同 policy → 1 group。
         let (groups, group_of) = make_groups(&clients);
@@ -1239,10 +1195,7 @@ mod tests {
         let g1_b = make_client_with_policy("g1b", false, false, Vec::new(), 2);
         // group2 (policy=3): 成功。
         let success_ip = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9));
-        let g2_a = make_delayed_client(
-            "g2a", 3, vec![success_ip],
-            Duration::from_millis(20),
-        );
+        let g2_a = make_delayed_client("g2a", 3, vec![success_ip], Duration::from_millis(20));
         let clients = vec![g0_a, g0_b, g1_a, g1_b, g2_a];
         // make_groups：3 个不同 policy → 3 个 group，邻接合并按 [0..1][2..3][4..4]。
         let (groups, group_of) = make_groups(&clients);
@@ -1266,8 +1219,7 @@ mod tests {
     /// 返回 Err（Go 同配置返回成功）。
     #[tokio::test]
     async fn parallel_query_fakedns_same_group_does_not_swallow_success() {
-        use crate::fakedns::Holder;
-        use crate::nameserver::fakedns::FakeDnsServer;
+        use crate::{fakedns::Holder, nameserver::fakedns::FakeDnsServer};
 
         let ns = NameServerConfig { tag: "fake".into(), ..Default::default() };
         let fake: Box<dyn Server> = Box::new(FakeDnsServer::new(Holder::new_default().unwrap()));
@@ -1292,8 +1244,14 @@ mod tests {
     async fn parallel_query_panicked_task_treated_as_failure() {
         struct PanicServer;
         impl Server for PanicServer {
-            fn name(&self) -> &str { "panic" }
-            fn is_disable_cache(&self) -> bool { false }
+            fn name(&self) -> &str {
+                "panic"
+            }
+
+            fn is_disable_cache(&self) -> bool {
+                false
+            }
+
             fn query_ip<'a>(
                 &'a self,
                 _d: &'a str,
@@ -1338,15 +1296,10 @@ mod tests {
     #[test]
     fn merge_query_errors_all_empty_returns_empty() {
         // Go dns.go:354-356：noRNF == ErrEmptyResponse → ErrEmptyResponse。
-        let outcomes: Vec<Result<(Vec<IpAddr>, u32), DnsError>> = vec![
-            Err(DnsError::EmptyResponse),
-            Err(DnsError::EmptyResponse),
-        ];
+        let outcomes: Vec<Result<(Vec<IpAddr>, u32), DnsError>> =
+            vec![Err(DnsError::EmptyResponse), Err(DnsError::EmptyResponse)];
         let err = merge_query_errors("x.com", &outcomes).unwrap_err();
-        assert!(
-            matches!(err, DnsError::EmptyResponse),
-            "全 EmptyResponse → EmptyResponse"
-        );
+        assert!(matches!(err, DnsError::EmptyResponse), "全 EmptyResponse → EmptyResponse");
     }
 
     #[test]
@@ -1358,19 +1311,14 @@ mod tests {
             Err(DnsError::RecordNotFound),
         ];
         let err = merge_query_errors("x.com", &outcomes).unwrap_err();
-        assert!(
-            matches!(err, DnsError::RCodeError(3)),
-            "errRNF 忽略 + 第一个非 RNF 取回"
-        );
+        assert!(matches!(err, DnsError::RCodeError(3)), "errRNF 忽略 + 第一个非 RNF 取回");
     }
 
     #[test]
     fn merge_query_errors_two_distinct_returns_combined() {
         // Go dns.go:350-352：第二个不同的非 RNF → errors.Combine。
-        let outcomes: Vec<Result<(Vec<IpAddr>, u32), DnsError>> = vec![
-            Err(DnsError::RCodeError(3)),
-            Err(DnsError::WireFormat("bad packet".into())),
-        ];
+        let outcomes: Vec<Result<(Vec<IpAddr>, u32), DnsError>> =
+            vec![Err(DnsError::RCodeError(3)), Err(DnsError::WireFormat("bad packet".into()))];
         let err = merge_query_errors("x.com", &outcomes).unwrap_err();
         // combined 包在 SystemResolve variant（包含原始 combined 字符串）。
         match err {
@@ -1378,7 +1326,7 @@ mod tests {
                 assert!(s.contains("returning nil for domain x.com"));
                 assert!(s.contains("dns rcode error: 3"));
                 assert!(s.contains("dns wire format error: bad packet"));
-            }
+            },
             other => panic!("expected SystemResolve combined, got {other:?}"),
         }
     }
@@ -1386,10 +1334,8 @@ mod tests {
     #[test]
     fn merge_query_errors_same_kind_non_rnf_returns_first() {
         // 两个同类非 RNF 不算 distinct。
-        let outcomes: Vec<Result<(Vec<IpAddr>, u32), DnsError>> = vec![
-            Err(DnsError::RCodeError(3)),
-            Err(DnsError::RCodeError(5)),
-        ];
+        let outcomes: Vec<Result<(Vec<IpAddr>, u32), DnsError>> =
+            vec![Err(DnsError::RCodeError(3)), Err(DnsError::RCodeError(5))];
         let err = merge_query_errors("x.com", &outcomes).unwrap_err();
         // 取第一个（RCodeError(3)）。
         assert!(matches!(err, DnsError::RCodeError(3)));
@@ -1409,17 +1355,14 @@ mod tests {
     /// parallel_query 中显式覆盖）。
     #[tokio::test]
     async fn serial_query_skips_fakedns_when_fake_disabled() {
-        use crate::fakedns::Holder;
-        use crate::nameserver::fakedns::FakeDnsServer;
+        use crate::{fakedns::Holder, nameserver::fakedns::FakeDnsServer};
 
         // FakeDNS server（name="FakeDNS" 是跳过判定依据）。
         let ns = NameServerConfig { tag: "fake".into(), ..Default::default() };
         let fake: Box<dyn Server> = Box::new(FakeDnsServer::new(Holder::new_default().unwrap()));
         let fake_client = Arc::new(Client::new(ns, IpOption::all(), fake).unwrap());
-        let real = make_client_with_ips(
-            "real", false, false,
-            vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))],
-        );
+        let real =
+            make_client_with_ips("real", false, false, vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))]);
         // enable_parallel_query=false 走 serial_query；fake_enable=false 跳过 FakeDNS。
         let svc = make_service(vec![fake_client, real], Vec::new());
         let opt = IpOption { ipv4_enable: true, ipv6_enable: true, fake_enable: false };
@@ -1430,8 +1373,10 @@ mod tests {
     /// Go dns.go:373-374：串行查询首个返回非空 IP 的 client 即胜出。
     #[tokio::test]
     async fn serial_query_returns_first_non_empty() {
-        let a = make_client_with_ips("a", false, false, vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]);
-        let b = make_client_with_ips("b", false, false, vec![IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))]);
+        let a =
+            make_client_with_ips("a", false, false, vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]);
+        let b =
+            make_client_with_ips("b", false, false, vec![IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))]);
         // serial_query 顺序按 clients 切片序：a 先胜。
         let (ips, _ttl) = serial_query(&[a, b], "x.com", IpOption::all()).await.unwrap();
         assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]);
@@ -1445,41 +1390,46 @@ mod tests {
         // final_query client 失败 → 继续问后续 client；后续命中则成功返回。
         struct FailServer;
         impl Server for FailServer {
-            fn name(&self) -> &str { "fail" }
-            fn is_disable_cache(&self) -> bool { false }
+            fn name(&self) -> &str {
+                "fail"
+            }
+
+            fn is_disable_cache(&self) -> bool {
+                false
+            }
+
             fn query_ip<'a>(
                 &'a self,
                 _d: &'a str,
                 _o: IpOption,
-            ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
+            ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>>
+            {
                 Box::pin(async { Err(DnsError::RecordNotFound) })
             }
         }
         struct HitServer;
         impl Server for HitServer {
-            fn name(&self) -> &str { "fallback" }
-            fn is_disable_cache(&self) -> bool { false }
+            fn name(&self) -> &str {
+                "fallback"
+            }
+
+            fn is_disable_cache(&self) -> bool {
+                false
+            }
+
             fn query_ip<'a>(
                 &'a self,
                 _d: &'a str,
                 _o: IpOption,
-            ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
-                Box::pin(async {
-                    Ok((vec![IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4))], 60))
-                })
+            ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>>
+            {
+                Box::pin(async { Ok((vec![IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4))], 60)) })
             }
         }
-        let ns = NameServerConfig {
-            tag: "final".into(),
-            final_query: true,
-            ..Default::default()
-        };
+        let ns = NameServerConfig { tag: "final".into(), final_query: true, ..Default::default() };
         let server: Box<dyn Server> = Box::new(FailServer);
         let final_client = Arc::new(Client::new(ns, IpOption::all(), server).unwrap());
-        let ns2 = NameServerConfig {
-            tag: "fallback".into(),
-            ..Default::default()
-        };
+        let ns2 = NameServerConfig { tag: "fallback".into(), ..Default::default() };
         let server2: Box<dyn Server> = Box::new(HitServer);
         let fallback_client = Arc::new(Client::new(ns2, IpOption::all(), server2).unwrap());
         let (ips, _) = serial_query(&[final_client, fallback_client], "x.com", IpOption::all())
@@ -1500,14 +1450,17 @@ mod tests {
         fn name(&self) -> &str {
             &self.name
         }
+
         fn is_disable_cache(&self) -> bool {
             false
         }
+
         fn query_ip<'a>(
             &'a self,
             _domain: &'a str,
             option: IpOption,
-        ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>>
+        {
             let ips: Vec<IpAddr> = self
                 .ips
                 .iter()
@@ -1526,15 +1479,8 @@ mod tests {
         query_strategy: Option<QueryStrategy>,
         ips: Vec<IpAddr>,
     ) -> Arc<Client> {
-        let ns = NameServerConfig {
-            tag: tag.to_string(),
-            query_strategy,
-            ..Default::default()
-        };
-        let server: Box<dyn Server> = Box::new(FamilyFilterServer {
-            name: tag.to_string(),
-            ips,
-        });
+        let ns = NameServerConfig { tag: tag.to_string(), query_strategy, ..Default::default() };
+        let server: Box<dyn Server> = Box::new(FamilyFilterServer { name: tag.to_string(), ips });
         Arc::new(Client::new(ns, IpOption::all(), server).unwrap())
     }
 
@@ -1546,11 +1492,7 @@ mod tests {
     }
 
     fn v4_only() -> IpOption {
-        IpOption {
-            ipv4_enable: true,
-            ipv6_enable: false,
-            fake_enable: false,
-        }
+        IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false }
     }
 
     /// 回归（WgTimeoutFix 定位）：ipv6_enable=false 时 serial_query 须把 option
@@ -1585,19 +1527,12 @@ mod tests {
     #[tokio::test]
     async fn client_query_ip_ands_request_option_with_client_strategy() {
         let client = make_filter_client("v4only", Some(QueryStrategy::UseIp4), mixed_family_ips());
-        let (ips, _) = client
-            .query_ip("mixed.example", IpOption::all())
-            .await
-            .unwrap();
+        let (ips, _) = client.query_ip("mixed.example", IpOption::all()).await.unwrap();
         assert!(
             ips.iter().all(|ip| matches!(ip, IpAddr::V4(_))),
             "client 策略 USE_IP4 应钳制请求 option，实际 {ips:?}"
         );
-        let v6_only = IpOption {
-            ipv4_enable: false,
-            ipv6_enable: true,
-            fake_enable: false,
-        };
+        let v6_only = IpOption { ipv4_enable: false, ipv6_enable: true, fake_enable: false };
         let res = client.query_ip("mixed.example", v6_only).await;
         assert!(matches!(res, Err(DnsError::EmptyResponse)));
     }
@@ -1626,8 +1561,14 @@ mod tests {
             seen: Arc<parking_lot::Mutex<Vec<String>>>,
         }
         impl Server for CaptureServer {
-            fn name(&self) -> &str { "capture" }
-            fn is_disable_cache(&self) -> bool { false }
+            fn name(&self) -> &str {
+                "capture"
+            }
+
+            fn is_disable_cache(&self) -> bool {
+                false
+            }
+
             fn query_ip<'a>(
                 &'a self,
                 d: &'a str,
@@ -1635,15 +1576,16 @@ mod tests {
             ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>>
             {
                 self.seen.lock().push(d.to_string());
-                Box::pin(async {
-                    Ok((vec![IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4))], 60))
-                })
+                Box::pin(async { Ok((vec![IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4))], 60)) })
             }
         }
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let ns = NameServerConfig { tag: "cap".into(), ..Default::default() };
         let server: Box<dyn Server> = Box::new(CaptureServer { seen: Arc::clone(&seen) });
-        let svc = make_service(vec![Arc::new(Client::new(ns, IpOption::all(), server).unwrap())], Vec::new());
+        let svc = make_service(
+            vec![Arc::new(Client::new(ns, IpOption::all(), server).unwrap())],
+            Vec::new(),
+        );
 
         svc.lookup_ip("x.com..", IpOption::all()).await.unwrap();
         assert_eq!(&*seen.lock(), &["x.com.".to_string()], "应只剥一个尾点");
@@ -1709,5 +1651,4 @@ mod tests {
         // 函数签名可被外部 crate 调用（pub fn）。
         log_decision("example.com", &["google", "cloudflare"]);
     }
-
 }

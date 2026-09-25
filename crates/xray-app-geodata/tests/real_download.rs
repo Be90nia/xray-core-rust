@@ -3,16 +3,16 @@
 //! 对应 Go `downloader.download` — 用 std::net TCP 写最小 HTTP/1.1 GET。
 //! 测试环境：loopback TcpListener 返回固定响应。
 
-use std::io::{Read, Write};
-use std::net::TcpListener;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
-
-use xray_app_geodata::downloader::{
-    AssetDownloader, RealAssetDownloader,
+use std::{
+    io::{Read, Write},
+    net::TcpListener,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
 };
+
+use xray_app_geodata::downloader::{AssetDownloader, RealAssetDownloader};
 
 /// 一次性 HTTP 服务器：accept 一个连接，回写固定 response。
 struct OneShotServer {
@@ -39,13 +39,11 @@ fn spawn_server(body: Vec<u8>) -> OneShotServer {
                         if req.windows(4).any(|w| w == b"\r\n\r\n") {
                             break;
                         }
-                    }
+                    },
                     Err(_) => break,
                 }
             }
-            log_clone.lock().unwrap().push(
-                String::from_utf8_lossy(&req).to_string(),
-            );
+            log_clone.lock().unwrap().push(String::from_utf8_lossy(&req).to_string());
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
                 body_for_thread.len()
@@ -55,11 +53,7 @@ fn spawn_server(body: Vec<u8>) -> OneShotServer {
             stream.flush().ok();
         }
     });
-    OneShotServer {
-        addr,
-        body,
-        request_log: log,
-    }
+    OneShotServer { addr, body, request_log: log }
 }
 
 fn unique_dir(name: &str) -> PathBuf {
@@ -67,10 +61,7 @@ fn unique_dir(name: &str) -> PathBuf {
     base.push(format!(
         "xray-app-geodata-real-{}-{}-{name}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     std::fs::create_dir_all(&base).unwrap();
     base
@@ -104,9 +95,7 @@ fn real_downloader_errors_on_non_2xx() {
         if let Ok((mut stream, _)) = listener.accept() {
             let mut buf = [0u8; 256];
             let _ = stream.read(&mut buf);
-            stream
-                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
-                .unwrap();
+            stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").unwrap();
             stream.flush().ok();
         }
     });
@@ -116,8 +105,10 @@ fn real_downloader_errors_on_non_2xx() {
     let temp = dir.join("x.tmp");
     let err = dl.download_to(&url, &temp).unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("404") || msg.to_lowercase().contains("status"),
-        "expected 404 status error, got: {msg}");
+    assert!(
+        msg.contains("404") || msg.to_lowercase().contains("status"),
+        "expected 404 status error, got: {msg}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -133,9 +124,11 @@ fn real_downloader_errors_on_connection_refused() {
     let temp = dir.join("x.tmp");
     let err = dl.download_to(&url, &temp).unwrap_err();
     let msg = err.to_string();
-    assert!(msg.to_lowercase().contains("refused")
-        || msg.to_lowercase().contains("connect")
-        || msg.to_lowercase().contains("io"));
+    assert!(
+        msg.to_lowercase().contains("refused")
+            || msg.to_lowercase().contains("connect")
+            || msg.to_lowercase().contains("io")
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -173,8 +166,10 @@ fn real_downloader_respects_request_timeout() {
     let res = dl.download_to(&url, &temp);
     let elapsed = start.elapsed();
     assert!(res.is_err(), "expected timeout error, got {res:?}");
-    assert!(elapsed < Duration::from_secs(3),
-        "timeout should fire within reasonable window, took {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "timeout should fire within reasonable window, took {elapsed:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
     drop(h);
 }

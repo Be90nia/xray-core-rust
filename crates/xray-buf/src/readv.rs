@@ -11,17 +11,23 @@
 //! env 闸门 `xray.buf.readv`（alt `XRAY_BUF_READV`）语义对齐 Go
 //! readv_reader.go:153-163：未设置 / `auto` / `enable` → 启用；其他任何值 → 禁用。
 
-use std::future::Future;
-use std::io::{ErrorKind, IoSliceMut};
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::LazyLock;
+use std::{
+    future::Future,
+    io::{ErrorKind, IoSliceMut},
+    pin::Pin,
+    sync::{
+        LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use tokio::net::tcp::OwnedReadHalf;
 
-use crate::buffer::Buffer;
-use crate::io::{self, Reader, Result};
-use crate::multi::MultiBuffer;
+use crate::{
+    buffer::Buffer,
+    io::{self, Reader, Result},
+    multi::MultiBuffer,
+};
 
 // ========== env 闸门（Go readv_reader.go:147-163） ==========
 
@@ -30,6 +36,12 @@ use crate::multi::MultiBuffer;
 static USE_READV: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(parse_readv_env()));
 
 /// 读取 `xray.buf.readv` 环境闸门当前值。
+///
+/// 唯一事实源：readv 闸门全仓只有本模块的 `USE_READV` AtomicBool 一个判定
+/// 存储——生产消费点仅 [`crate::io::new_readv_reader`]；写侧仅
+/// [`parse_readv_env`]（首调）+ [`reload_env_settings`]（显式刷新）。
+/// `xray-common::platform::env::use_readv` 是指向这里的转发别名（Go
+/// `platform.UseReadV` binding 等价入口），不得在别处另建 env 解析。
 ///
 /// 语义对齐 Go `useReadV()`：未设置（默认）/ `auto` / `enable` → 启用；
 /// 其他任何值 → 禁用（顺序读）。
@@ -47,9 +59,7 @@ pub fn reload_env_settings() {
 
 /// 读 env 并按三态语义解析 `xray.buf.readv`（原名优先，alt 兜底）。
 fn parse_readv_env() -> bool {
-    let v = std::env::var("xray.buf.readv")
-        .or_else(|_| std::env::var("XRAY_BUF_READV"))
-        .ok();
+    let v = std::env::var("xray.buf.readv").or_else(|_| std::env::var("XRAY_BUF_READV")).ok();
     parse_readv_flag(v.as_deref())
 }
 
@@ -93,11 +103,7 @@ impl AllocStrategy {
 
     /// 对应 Go `Adjust(n)`（readv_reader.go:23-37）。
     pub fn adjust(&mut self, n: u32) {
-        self.current = if n >= self.current {
-            self.current * 2
-        } else {
-            n
-        };
+        self.current = if n >= self.current { self.current * 2 } else { n };
         if self.current > 8 {
             self.current = 8;
         }
@@ -189,10 +195,7 @@ impl ReadVReader {
     /// 对应 Go `NewReadVReader`。
     #[must_use]
     pub fn new(src: OwnedReadHalf) -> Self {
-        Self {
-            src,
-            alloc: AllocStrategy::new(),
-        }
+        Self { src, alloc: AllocStrategy::new() }
     }
 
     /// 当前分配策略（测试与观测用）。
@@ -241,7 +244,7 @@ impl ReadVReader {
             Err(e) => {
                 release_slots(&mut bufs);
                 return Err(io::classify_io_error(e, true));
-            }
+            },
         };
 
         if n == 0 {
@@ -265,8 +268,9 @@ impl ReadVReader {
 }
 
 impl Reader for ReadVReader {
-    fn read_multi_buffer(&mut self) -> Pin<Box<dyn Future<Output = Result<MultiBuffer>> + Send + '_>>
-    {
+    fn read_multi_buffer(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<MultiBuffer>> + Send + '_>> {
         Box::pin(self.read_multi())
     }
 }
@@ -533,7 +537,9 @@ mod tests {
     #[test]
     fn distribute_slots_byte_conservation_and_release() {
         let mut lens = [0usize; MAX_READV];
-        let fill = |bufs: &mut [Option<Buffer>; MAX_READV], n_bufs: usize, lens: &mut [usize; MAX_READV]| {
+        let fill = |bufs: &mut [Option<Buffer>; MAX_READV],
+                    n_bufs: usize,
+                    lens: &mut [usize; MAX_READV]| {
             for slot in bufs.iter_mut().take(n_bufs) {
                 *slot = Some(Buffer::new());
             }

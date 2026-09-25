@@ -22,11 +22,7 @@ type HeaderMap<'a> = &'a http::HeaderMap;
 
 /// 从 `http::Request` 的 headers 中按名称取值。
 fn header_get(headers: HeaderMap<'_>, name: &str) -> String {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_string()
+    headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string()
 }
 
 /// 从 `Cookie:` header 中按名称提取 cookie 值。
@@ -74,13 +70,14 @@ pub fn extract_meta<B>(req: &Request<B>, config: &Config, base_path: &str) -> Re
     let headers = req.headers();
 
     // path placement 需要拆分 URL path 的子段。
-    let subpath: Vec<&str> = if session_placement == PLACEMENT_PATH || seq_placement == PLACEMENT_PATH {
-        let full_path = req.uri().path();
-        let after_base = full_path.strip_prefix(base_path).unwrap_or(full_path);
-        after_base.split('/').filter(|s| !s.is_empty()).collect()
-    } else {
-        Vec::new()
-    };
+    let subpath: Vec<&str> =
+        if session_placement == PLACEMENT_PATH || seq_placement == PLACEMENT_PATH {
+            let full_path = req.uri().path();
+            let after_base = full_path.strip_prefix(base_path).unwrap_or(full_path);
+            after_base.split('/').filter(|s| !s.is_empty()).collect()
+        } else {
+            Vec::new()
+        };
 
     let mut path_part = 0usize;
     let mut session_id = String::new();
@@ -93,17 +90,17 @@ pub fn extract_meta<B>(req: &Request<B>, config: &Config, base_path: &str) -> Re
                 session_id = subpath[path_part].to_string();
                 path_part += 1;
             }
-        }
+        },
         PLACEMENT_QUERY => {
             session_id = query_get(req.uri().query().unwrap_or(""), session_key);
-        }
+        },
         PLACEMENT_HEADER => {
             session_id = header_get(headers, session_key);
-        }
+        },
         PLACEMENT_COOKIE => {
             session_id = cookie_get(headers, session_key);
-        }
-        _ => {}
+        },
+        _ => {},
     }
 
     // seq
@@ -113,17 +110,17 @@ pub fn extract_meta<B>(req: &Request<B>, config: &Config, base_path: &str) -> Re
                 seq_str = subpath[path_part].to_string();
                 let _ = path_part;
             }
-        }
+        },
         PLACEMENT_QUERY => {
             seq_str = query_get(req.uri().query().unwrap_or(""), seq_key);
-        }
+        },
         PLACEMENT_HEADER => {
             seq_str = header_get(headers, seq_key);
-        }
+        },
         PLACEMENT_COOKIE => {
             seq_str = cookie_get(headers, seq_key);
-        }
-        _ => {}
+        },
+        _ => {},
     }
 
     RequestMetaInfo { session_id, seq_str }
@@ -131,9 +128,10 @@ pub fn extract_meta<B>(req: &Request<B>, config: &Config, base_path: &str) -> Re
 
 #[cfg(test)]
 mod tests {
+    use http::Request;
+
     use super::*;
     use crate::config::Config;
-    use http::Request;
 
     fn make_request(uri: &str, headers: &[(&str, &str)]) -> Request<()> {
         let mut builder = Request::builder().uri(uri);
@@ -172,10 +170,7 @@ mod tests {
             seq_placement: "header".into(),
             ..Default::default()
         };
-        let req = make_request(
-            "/ws",
-            &[("X-Session", "hdr-sess"), ("X-Seq", "9")],
-        );
+        let req = make_request("/ws", &[("X-Session", "hdr-sess"), ("X-Seq", "9")]);
         let meta = extract_meta(&req, &cfg, "/ws/");
         assert_eq!(meta.session_id, "hdr-sess");
         assert_eq!(meta.seq_str, "9");
@@ -188,10 +183,7 @@ mod tests {
             seq_placement: "cookie".into(),
             ..Default::default()
         };
-        let req = make_request(
-            "/ws",
-            &[("Cookie", "x_session=ck-sess; x_seq=7")],
-        );
+        let req = make_request("/ws", &[("Cookie", "x_session=ck-sess; x_seq=7")]);
         let meta = extract_meta(&req, &cfg, "/ws/");
         assert_eq!(meta.session_id, "ck-sess");
         assert_eq!(meta.seq_str, "7");
@@ -228,10 +220,7 @@ mod tests {
             seq_key: "custom_seq".into(),
             ..Default::default()
         };
-        let req = make_request(
-            "/ws?custom_seq=10",
-            &[("X-Custom-S", "my-session")],
-        );
+        let req = make_request("/ws?custom_seq=10", &[("X-Custom-S", "my-session")]);
         let meta = extract_meta(&req, &cfg, "/ws/");
         assert_eq!(meta.session_id, "my-session");
         assert_eq!(meta.seq_str, "10");

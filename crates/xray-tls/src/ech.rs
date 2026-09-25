@@ -8,17 +8,17 @@
 //! - ECH keyset 生成（`generate_ech_key_set`，对应 Go CLI `generateECHKeySet`+`marshalBinary`）
 //! - 客户端 config list 解析（`resolve_client_ech_config_list`，对应 Go `ApplyECH` client 分支）
 //! - JSON 字段解析（`parse_ech_server_keys`/`parse_ech_config_list`，对应 Go infra/conf L728-735）
-//! - `ApplyEch` trait 的 btls (BoringSSL) 客户端实装（`Ssl::set_ech_config_list`，
-//!   经 `utls::u_client` 接入生产 dial 路径；服务端 keys 注册被 btls 上游导出缺口
-//!   阻塞，见 trait 文档）
+//! - `ApplyEch` trait 的 btls (BoringSSL) 客户端实装（`Ssl::set_ech_config_list`， 经
+//!   `utls::u_client` 接入生产 dial 路径；服务端 keys 注册被 btls 上游导出缺口 阻塞，见 trait
+//!   文档）
 //!
 //! DNS 查询路径（`://` 形式的 HTTPS RR 查询）由 `crate::ech_doh` 实装
 //! （DoH，握手前异步查询，`utls::u_client_with_alpn` 接线）；查询失败仍按
 //! Go「查询失败」语义落 invalid config（握手必败）。
 
+use std::{sync::Mutex, time::Instant};
+
 use crate::error::TlsError;
-use std::sync::Mutex;
-use std::time::Instant;
 
 // ============================================================
 // ECH key 二进制解析（对应 Go ConvertToGoECHKeys）
@@ -44,7 +44,7 @@ pub struct EncryptedClientHelloKey {
 ///
 /// # 示例
 /// ```
-/// use xray_tls::ech::{convert_to_ech_keys, EncryptedClientHelloKey};
+/// use xray_tls::ech::{EncryptedClientHelloKey, convert_to_ech_keys};
 ///
 /// // 构造一个简单的 2-byte key + 3-byte config
 /// let mut data = Vec::new();
@@ -81,10 +81,7 @@ pub fn convert_to_ech_keys(data: &[u8]) -> Result<Vec<EncryptedClientHelloKey>, 
         let config = &s[..usize::from(config_len)];
         s = &s[usize::from(config_len)..];
 
-        keys.push(EncryptedClientHelloKey {
-            private_key: sk.to_vec(),
-            config: config.to_vec(),
-        });
+        keys.push(EncryptedClientHelloKey { private_key: sk.to_vec(), config: config.to_vec() });
     }
 
     Ok(keys)
@@ -131,8 +128,8 @@ impl EchConfigRecord {
 
 /// ECH 配置缓存。
 ///
-/// 对应 Go `ECHConfigCache struct { configRecord atomic.Pointer[echConfigRecord]; UpdateLock sync.Mutex }`。
-/// Rust 用 `Mutex<EchConfigRecord>` 替代 atomic.Pointer + Mutex（Rust 的 atomic
+/// 对应 Go `ECHConfigCache struct { configRecord atomic.Pointer[echConfigRecord]; UpdateLock
+/// sync.Mutex }`。 Rust 用 `Mutex<EchConfigRecord>` 替代 atomic.Pointer + Mutex（Rust 的 atomic
 /// 指针语义不直接支持 arbitrary struct，简化为 Mutex 内整体替换）。
 #[derive(Debug, Default)]
 pub struct EchConfigCache {
@@ -160,10 +157,7 @@ impl EchConfigCache {
     ///
     /// 闭包返回 `(new_record, result)`；`new_record` 被存入，`result` 返回给调用者。
     /// Go 端「双检锁」逻辑在闭包内自行实现。
-    pub fn with_lock<R>(
-        &self,
-        f: impl FnOnce(&EchConfigRecord) -> (EchConfigRecord, R),
-    ) -> R {
+    pub fn with_lock<R>(&self, f: impl FnOnce(&EchConfigRecord) -> (EchConfigRecord, R)) -> R {
         let mut guard = self.inner.lock().expect("ECH cache mutex poisoned");
         let (new_record, result) = f(&guard);
         *guard = new_record;
@@ -239,8 +233,8 @@ pub const INVALID_ECH_CONFIG: &[u8] = &[1, 1, 4, 5, 1, 4];
 /// `marshalBinary`。
 ///
 /// 返回 `(config, private_key)`：
-/// - `config`：完整 ECHConfig wire 格式 `[version:u16][u16-len body]`
-///   （body = config_id=0 + kem + pub + suites + max_name_len=0 + public_name + 空 extensions）
+/// - `config`：完整 ECHConfig wire 格式 `[version:u16][u16-len body]` （body = config_id=0 + kem +
+///   pub + suites + max_name_len=0 + public_name + 空 extensions）
 /// - `private_key`：32 字节 X25519 私钥（未 clamp，运算时按 RFC 7748 clamp）
 #[must_use]
 pub fn generate_ech_key_set(public_name: &str) -> (Vec<u8>, [u8; 32]) {
@@ -320,22 +314,18 @@ pub fn ech_config_list_from_server_keys(server_keys: &[u8]) -> Result<Vec<u8>, T
 ///
 /// **永不失败**（对齐 Go defer 语义，ech.go L51-57）：只要配置了 ECH 就必有返回值——
 /// - base64（标准编码）→ 解码 bytes；
-/// - 含 `://` 的 DNS 形式（`https://...` / `domain+https://...`）→ 同步占位：
-///   按 [`EchForceQuery`] 策略分叉（full/half → invalid；none → 空 list）。
-///   生产路径（`utls::u_client_with_alpn`）会先经 [`crate::ech_doh::query_ech_config`]
-///   异步查询并把结果 base64 回灌到本函数（不含 `://`，走 base64 分支），
-///   本占位仅兜底未接线的直接调用；
+/// - 含 `://` 的 DNS 形式（`https://...` / `domain+https://...`）→ 同步占位： 按 [`EchForceQuery`]
+///   策略分叉（full/half → invalid；none → 空 list）。 生产路径（`utls::u_client_with_alpn`）会先经
+///   [`crate::ech_doh::query_ech_config`] 异步查询并把结果 base64 回灌到本函数（不含 `://`，走
+///   base64 分支）， 本占位仅兜底未接线的直接调用；
 /// - base64 解码失败 → invalid。
 ///
 /// # 异步查询路径
-/// 真实 DNS 查询见 [`crate::ech_doh::query_ech_config`] + `crate::ech_https_rr::extract_ech_from_dns_response`；
-/// 本函数本身保持同步 + 不 panic + 不依赖运行时（可在 btls
-/// `SSL_set1_ech_config_list` 同步路径直接调用）。
+/// 真实 DNS 查询见 [`crate::ech_doh::query_ech_config`] +
+/// `crate::ech_https_rr::extract_ech_from_dns_response`； 本函数本身保持同步 + 不 panic +
+/// 不依赖运行时（可在 btls `SSL_set1_ech_config_list` 同步路径直接调用）。
 #[must_use]
-pub fn resolve_client_ech_config_list(
-    config_list: &str,
-    force_query: EchForceQuery,
-) -> Vec<u8> {
+pub fn resolve_client_ech_config_list(config_list: &str, force_query: EchForceQuery) -> Vec<u8> {
     use base64::Engine as _;
     use tracing::warn;
 
@@ -363,7 +353,7 @@ pub fn resolve_client_ech_config_list(
                     "echForceQuery=none: skipping ECH (returning empty config list)"
                 );
                 Vec::new()
-            }
+            },
             EchForceQuery::Full | EchForceQuery::Half => {
                 warn!(
                     target: "xray_tls::ech",
@@ -372,7 +362,7 @@ pub fn resolve_client_ech_config_list(
                     "ECH DNS query not yet wired (resolve path is sync); falling back to invalid config (handshake will fail)"
                 );
                 INVALID_ECH_CONFIG.to_vec()
-            }
+            },
         }
     } else {
         match base64::engine::general_purpose::STANDARD.decode(config_list) {
@@ -384,7 +374,7 @@ pub fn resolve_client_ech_config_list(
                     "failed to base64-decode ECHConfigList; falling back to invalid config"
                 );
                 INVALID_ECH_CONFIG.to_vec()
-            }
+            },
         }
     }
 }
@@ -431,9 +421,7 @@ pub fn parse_ech_config_list(json: &serde_json::Value) -> String {
 /// 内容交由 sockopt 应用层解释。
 #[must_use]
 pub fn parse_ech_sockopt(json: &serde_json::Value) -> Option<&serde_json::Value> {
-    json.as_object()
-        .and_then(|m| m.get("echSockopt"))
-        .filter(|v| !v.is_null())
+    json.as_object().and_then(|m| m.get("echSockopt")).filter(|v| !v.is_null())
 }
 
 // ============================================================
@@ -448,12 +436,11 @@ pub fn parse_ech_sockopt(json: &serde_json::Value) -> Option<&serde_json::Value>
 /// # 语义
 /// - `Full`：DNS 查询失败 → 硬错（Go v26.3.27 默认）。`resolve_*` 返回
 ///   `INVALID_ECH_CONFIG`，握手必败——避免静默明文 SNI 泄露。
-/// - `Half`：DNS 查询失败 → 软降级：返回 INVALID config（与 `Full` 同形态，
-///   但 trace 级别不同，运维可识别是降级而非用户主动 full）。Go 实现下
-///   half 会继续原连接（不带 ECH），Rust 简化统一 invalid——**这是有意的
-///   简化**：half 半连接的语义在 Rust DNS 基建未到位时无意义。
-/// - `None`：DNS 查询失败 → 跳过 ECH，返回空 config list（TLS 层识别为
-///   "no ECH"），连接建立走明文 SNI。仅供用户主动选择非 ECH 路径。
+/// - `Half`：DNS 查询失败 → 软降级：返回 INVALID config（与 `Full` 同形态， 但 trace
+///   级别不同，运维可识别是降级而非用户主动 full）。Go 实现下 half 会继续原连接（不带 ECH），Rust
+///   简化统一 invalid——**这是有意的 简化**：half 半连接的语义在 Rust DNS 基建未到位时无意义。
+/// - `None`：DNS 查询失败 → 跳过 ECH，返回空 config list（TLS 层识别为 "no ECH"），连接建立走明文
+///   SNI。仅供用户主动选择非 ECH 路径。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EchForceQuery {
     /// DNS 查询失败硬错（默认，对齐 Go v26.3.27）。
@@ -475,10 +462,7 @@ pub enum EchForceQuery {
 /// 非法字符串返回 `TlsError::EchApply`，与 Go 错误信息字符串形态一致：
 /// `"unknown ECH force query mode: <input>"`。
 pub fn parse_ech_force_query(json: &serde_json::Value) -> Result<EchForceQuery, TlsError> {
-    let Some(s) = json
-        .as_object()
-        .and_then(|m| m.get("echForceQuery"))
-        .and_then(|v| v.as_str())
+    let Some(s) = json.as_object().and_then(|m| m.get("echForceQuery")).and_then(|v| v.as_str())
     else {
         return Ok(EchForceQuery::default());
     };
@@ -486,9 +470,7 @@ pub fn parse_ech_force_query(json: &serde_json::Value) -> Result<EchForceQuery, 
         "full" => Ok(EchForceQuery::Full),
         "half" => Ok(EchForceQuery::Half),
         "none" => Ok(EchForceQuery::None),
-        other => Err(TlsError::EchApply(format!(
-            "unknown ECH force query mode: {other}"
-        ))),
+        other => Err(TlsError::EchApply(format!("unknown ECH force query mode: {other}"))),
     }
 }
 
@@ -500,22 +482,17 @@ pub fn parse_ech_force_query(json: &serde_json::Value) -> Result<EchForceQuery, 
 ///
 /// 对应 Go `ApplyECH(c *Config, config *tls.Config) error`（双分支单函数）：
 /// - 客户端：`config_list` 非空 → 提供 ECH config list（加密 ClientHello）。
-/// - 服务端：`server_keys` 非空 → 注册 ECH 解密 keys。**当前不可实装**：
-///   btls v0.5.6 未公开导出 `SslEchKeys`/`SslEchKeysBuilder`（仅 `SslEchKeysRef`），
-///   `SslContextRef::set_ech_keys` 的参数类型在 crate 外不可构造；且生产 inbound
-///   TLS 走 rustls（无 btls acceptor、rustls 无 ECH feature），本就没有接线点。
-///   待 btls 上游导出修复 + btls server acceptor 集成后补充。
+/// - 服务端：`server_keys` 非空 → 注册 ECH 解密 keys。**当前不可实装**： btls v0.5.6 未公开导出
+///   `SslEchKeys`/`SslEchKeysBuilder`（仅 `SslEchKeysRef`）， `SslContextRef::set_ech_keys`
+///   的参数类型在 crate 外不可构造；且生产 inbound TLS 走 rustls（无 btls acceptor、rustls 无 ECH
+///   feature），本就没有接线点。 待 btls 上游导出修复 + btls server acceptor 集成后补充。
 ///
 /// 已有实装：[`btls::ssl::Ssl`]（客户端，per-connection）→ `SSL_set1_ech_config_list`，
 /// 由 [`crate::utls::u_client`] 在握手前调用（`xray-transport-tcp` 生产 dial 路径）。
 pub trait ApplyEch {
     /// 应用 ECH 配置。参数与 Go `ApplyECH` 一致：client 实装取 `config_list`，
     /// 空值跳过。
-    fn apply_ech(
-        &mut self,
-        server_keys: &[u8],
-        config_list: &str,
-    ) -> Result<(), TlsError>;
+    fn apply_ech(&mut self, server_keys: &[u8], config_list: &str) -> Result<(), TlsError>;
 }
 
 impl ApplyEch for btls::ssl::Ssl {
@@ -524,11 +501,7 @@ impl ApplyEch for btls::ssl::Ssl {
     ///
     /// 同步 resolve 默认走 [`EchForceQuery::Full`] 语义（DNS 形式 → invalid）；
     /// 真实 DNS 查询路径待 async wiring，本实装不触发网络 IO。
-    fn apply_ech(
-        &mut self,
-        _server_keys: &[u8],
-        config_list: &str,
-    ) -> Result<(), TlsError> {
+    fn apply_ech(&mut self, _server_keys: &[u8], config_list: &str) -> Result<(), TlsError> {
         if config_list.is_empty() {
             return Ok(());
         }
@@ -544,8 +517,9 @@ impl ApplyEch for btls::ssl::Ssl {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
+
+    use super::*;
 
     fn pack_key(sk: &[u8], cfg: &[u8]) -> Vec<u8> {
         let mut v = Vec::new();
@@ -584,10 +558,7 @@ mod tests {
     fn convert_truncated_after_key_len_errors() {
         let mut data = pack_key(b"sk", b"cfg");
         data.truncate(2); // 只留 key_len 字段
-        assert!(matches!(
-            convert_to_ech_keys(&data),
-            Err(TlsError::InvalidEchKeyLength)
-        ));
+        assert!(matches!(convert_to_ech_keys(&data), Err(TlsError::InvalidEchKeyLength)));
     }
 
     #[test]
@@ -595,10 +566,7 @@ mod tests {
         let mut data = pack_key(b"sk", b"cfg");
         // 删掉一部分
         data.truncate(4); // key_len(2) + key(2)
-        assert!(matches!(
-            convert_to_ech_keys(&data),
-            Err(TlsError::InvalidEchKeyLength)
-        ));
+        assert!(matches!(convert_to_ech_keys(&data), Err(TlsError::InvalidEchKeyLength)));
     }
 
     #[test]
@@ -606,18 +574,12 @@ mod tests {
         let mut data = pack_key(b"sk", b"cfg");
         // 删除 config 最后一字节
         data.pop();
-        assert!(matches!(
-            convert_to_ech_keys(&data),
-            Err(TlsError::InvalidEchKeyLength)
-        ));
+        assert!(matches!(convert_to_ech_keys(&data), Err(TlsError::InvalidEchKeyLength)));
     }
 
     #[test]
     fn convert_single_byte_input_errors() {
-        assert!(matches!(
-            convert_to_ech_keys(&[0u8]),
-            Err(TlsError::InvalidEchKeyLength)
-        ));
+        assert!(matches!(convert_to_ech_keys(&[0u8]), Err(TlsError::InvalidEchKeyLength)));
     }
 
     // ---- EchConfigRecord / EchConfigCache ----
@@ -632,10 +594,8 @@ mod tests {
     #[test]
     fn record_with_future_expire_not_expired() {
         let now = Instant::now();
-        let r = EchConfigRecord {
-            config: vec![1, 2, 3],
-            expire: Some(now + Duration::from_secs(60)),
-        };
+        let r =
+            EchConfigRecord { config: vec![1, 2, 3], expire: Some(now + Duration::from_secs(60)) };
         assert!(!r.is_expired(now));
         assert!(!r.is_uninitialized());
     }
@@ -686,10 +646,7 @@ mod tests {
 
     #[test]
     fn cache_key_unique_per_sockopt_id() {
-        assert_ne!(
-            ech_cache_key("srv", "dom", 1),
-            ech_cache_key("srv", "dom", 2)
-        );
+        assert_ne!(ech_cache_key("srv", "dom", 1), ech_cache_key("srv", "dom", 2));
     }
 
     // ---- generate_ech_key_set / pack / extract（对应 Go CLI）----
@@ -699,20 +656,14 @@ mod tests {
         let (config, priv_bytes) = generate_ech_key_set("example.com");
 
         // version + u16 长度前缀
-        assert_eq!(
-            u16::from_be_bytes([config[0], config[1]]),
-            EXTENSION_ENCRYPTED_CLIENT_HELLO
-        );
+        assert_eq!(u16::from_be_bytes([config[0], config[1]]), EXTENSION_ENCRYPTED_CLIENT_HELLO);
         let body_len = u16::from_be_bytes([config[2], config[3]]) as usize;
         assert_eq!(config.len(), 4 + body_len, "body length prefix must cover rest");
         let body = &config[4..];
 
         // config_id=0, kem=0x20
         assert_eq!(body[0], 0);
-        assert_eq!(
-            u16::from_be_bytes([body[1], body[2]]),
-            KEM_X25519_HKDF_SHA256
-        );
+        assert_eq!(u16::from_be_bytes([body[1], body[2]]), KEM_X25519_HKDF_SHA256);
         // pub key 32 字节
         let pub_len = u16::from_be_bytes([body[3], body[4]]) as usize;
         assert_eq!(pub_len, 32);
@@ -757,10 +708,7 @@ mod tests {
         let list = ech_config_list_from_server_keys(&server_keys).unwrap();
         assert_eq!(list, pack_ech_config_list(&[&config]));
         // 首个 u16 = config 长度
-        assert_eq!(
-            u16::from_be_bytes([list[0], list[1]]) as usize,
-            config.len()
-        );
+        assert_eq!(u16::from_be_bytes([list[0], list[1]]) as usize, config.len());
     }
 
     #[test]
@@ -776,10 +724,7 @@ mod tests {
         use base64::Engine as _;
         let raw = vec![1, 2, 3, 4, 5];
         let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
-        assert_eq!(
-            resolve_client_ech_config_list(&b64, EchForceQuery::Full),
-            raw
-        );
+        assert_eq!(resolve_client_ech_config_list(&b64, EchForceQuery::Full), raw);
     }
 
     #[test]
@@ -872,9 +817,7 @@ mod tests {
 
     #[test]
     fn apply_ech_on_btls_ssl_sets_config_list() {
-        let ctx = btls::ssl::SslContext::builder(btls::ssl::SslMethod::tls())
-            .unwrap()
-            .build();
+        let ctx = btls::ssl::SslContext::builder(btls::ssl::SslMethod::tls()).unwrap().build();
         let mut ssl = btls::ssl::Ssl::new(&ctx).unwrap();
 
         // base64 形式（真实 SSL_set1_ech_config_list）

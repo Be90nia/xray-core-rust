@@ -2,24 +2,28 @@
 //!
 //! 对应 Go 版本 `common/mux/server.go`，实现 Mux 服务端帧处理与空闲 monitor。
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
-use tokio::sync::watch;
-use tokio::time::Duration;
+use tokio::{sync::watch, time::Duration};
 use tracing::{debug, warn};
-use xray_buf::io::{Reader, Writer};
-use xray_buf::reader::BufferedReader;
-use xray_buf::writer::BufferedWriter;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
+use xray_buf::{
+    buffer::Buffer,
+    io::{Reader, Writer},
+    multi::MultiBuffer,
+    reader::BufferedReader,
+    writer::BufferedWriter,
+};
+use xray_common::net::{destination::Destination, network::Network};
 
-use crate::client::{Link, MUX_COOL_ADDRESS};
-use crate::frame::{FrameMetadata, SessionStatus, MAX_METADATA_LEN};
-use crate::session::{Session, SessionManager, TransferType, XUDP, XUDPManager, XudpStatus};
-use crate::writer::MuxWriter;
-use xray_buf::buffer::Buffer;
-use xray_buf::multi::MultiBuffer;
+use crate::{
+    client::{Link, MUX_COOL_ADDRESS},
+    frame::{FrameMetadata, MAX_METADATA_LEN, SessionStatus},
+    session::{Session, SessionManager, TransferType, XUDP, XUDPManager, XudpStatus},
+    writer::MuxWriter,
+};
 
 /// 服务端 monitor 间隔（60 秒，Go server.go:101 `time.NewTicker(60s)`）。
 pub const SERVER_MONITOR_INTERVAL: Duration = Duration::from_secs(60);
@@ -76,15 +80,9 @@ impl Dispatcher for DispatchHandlerAdapter {
         let (read_b, write_b) = xray_buf::pipe::new();
 
         // DispatchHandler 接收 transport::Link
-        let dispatch_link = xray_transport::link::Link::new(
-            Box::new(read_b),
-            Box::new(write_a),
-        );
+        let dispatch_link = xray_transport::link::Link::new(Box::new(read_b), Box::new(write_a));
         // 返回 mux::Link
-        let return_link = Link {
-            reader: Box::new(read_a),
-            writer: Box::new(write_b),
-        };
+        let return_link = Link { reader: Box::new(read_a), writer: Box::new(write_b) };
 
         let handler = Arc::clone(&self.handler);
         let dest_clone = dest.clone();
@@ -241,29 +239,31 @@ impl ServerWorker {
 
     /// Handle normal New frame (non-XUDP).
     pub async fn handle_normal_new(
-        &self, meta: &FrameMetadata,
+        &self,
+        meta: &FrameMetadata,
         data: Buffer,
         link_writer: &Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>>,
     ) -> Result<(), ServerError> {
-        let target = meta.target().cloned().ok_or_else(|| {
-            ServerError::InvalidFrame("new session without target".to_string())
-        })?;
+        let target = meta
+            .target()
+            .cloned()
+            .ok_or_else(|| ServerError::InvalidFrame("new session without target".to_string()))?;
         // txno④：Reverse-mux New 帧的 source/local 经 dispatch_inbound 抵达
         // dispatcher ctx（Go server.go:166-174 覆写 ctx inbound 等价）；普通
         // mux（未启用 read_source_and_local 或帧无元数据）走原路径。
         let link = if self.read_source_and_local && meta.source().is_some() {
             self.dispatcher
-                .dispatch_inbound(
-                    target.clone(),
-                    meta.source().cloned(),
-                    meta.local().cloned(),
-                )
+                .dispatch_inbound(target.clone(), meta.source().cloned(), meta.local().cloned())
                 .await
         } else {
             self.dispatcher.dispatch(target.clone()).await
         }
         .map_err(|e| ServerError::DispatchFailed(format!("dispatch to {}: {}", target, e)))?;
-        let tt = if target.network() == Network::UDP { TransferType::Packet } else { TransferType::Stream };
+        let tt = if target.network() == Network::UDP {
+            TransferType::Packet
+        } else {
+            TransferType::Stream
+        };
         let session = Session::new(meta.session_id(), tt);
         session.set_input(BufferedReader::new(link.reader)).await;
         // 会话 output 直写（Go server.go:271-277 直接使用 link.Writer，无缓
@@ -287,7 +287,9 @@ impl ServerWorker {
         };
         let os = session.clone();
         let ow = link_writer.clone();
-        tokio::spawn(async move { Self::handle_session_output(os, ow).await; });
+        tokio::spawn(async move {
+            Self::handle_session_output(os, ow).await;
+        });
         Ok(())
     }
 
@@ -302,14 +304,16 @@ impl ServerWorker {
     /// 下行转发目标），`handle()` 泵任务读真 I/O 回写 carrier。旧实现的孤儿
     /// ms 使泵任务读空 input 立即退出，上游数据永远回不来。
     pub async fn handle_xudp_new(
-        &self, meta: &FrameMetadata,
+        &self,
+        meta: &FrameMetadata,
         data: Buffer,
         link_writer: &Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>>,
         global_id: [u8; 8],
     ) -> Result<(), ServerError> {
-        let target = meta.target().cloned().ok_or_else(|| {
-            ServerError::InvalidFrame("XUDP session without target".to_string())
-        })?;
+        let target = meta
+            .target()
+            .cloned()
+            .ok_or_else(|| ServerError::InvalidFrame("XUDP session without target".to_string()))?;
         let xmgr = &self.xudp_manager;
         let mut xudp = match xmgr.get(&global_id).await {
             None => {
@@ -317,7 +321,7 @@ impl ServerWorker {
                 let x = XUDP::new(global_id);
                 xmgr.register(x.clone()).await;
                 x
-            }
+            },
             Some(mut ex) => {
                 if ex.status == XudpStatus::Initializing {
                     warn!("XUDP conflict {:?}", global_id);
@@ -343,14 +347,14 @@ impl ServerWorker {
                 ex.status = XudpStatus::Initializing;
                 xmgr.register(ex.clone()).await;
                 ex
-            }
+            },
         };
         let link = match self.dispatcher.dispatch(target.clone()).await {
             Ok(l) => l,
             Err(e) => {
                 xmgr.unregister(&global_id).await;
                 return Err(ServerError::DispatchFailed(format!("XUDP dispatch: {}", e)));
-            }
+            },
         };
         // XUDP 恒为 Packet：直写（禁缓冲），New 帧内联 data 转发到 dispatch 目标
         // ponytail: miss 路径建新上游；hit 路径复用旧上游（zv9l 已对齐 Go
@@ -377,10 +381,11 @@ impl ServerWorker {
         xmgr.register(xudp).await;
         let os = session.clone();
         let ow = link_writer.clone();
-        tokio::spawn(async move { Self::handle_session_output(os, ow).await; });
+        tokio::spawn(async move {
+            Self::handle_session_output(os, ow).await;
+        });
         Ok(())
     }
-
 
     /// XUDP hit 复用路径（bd zv9l，对齐 Go server.go:216-260）。
     ///
@@ -406,9 +411,7 @@ impl ServerWorker {
                 return false;
             };
             if writer
-                .write_multi_buffer_impl(MultiBuffer::from_buffer(Buffer::from_vec(
-                    data.to_vec(),
-                )))
+                .write_multi_buffer_impl(MultiBuffer::from_buffer(Buffer::from_vec(data.to_vec())))
                 .await
                 .is_err()
             {
@@ -433,7 +436,9 @@ impl ServerWorker {
         self.xudp_manager.register(xudp.clone()).await;
         let os = session.clone();
         let ow = link_writer.clone();
-        tokio::spawn(async move { Self::handle_session_output(os, ow).await; });
+        tokio::spawn(async move {
+            Self::handle_session_output(os, ow).await;
+        });
         true
     }
 
@@ -470,7 +475,7 @@ impl ServerWorker {
                 Some(Err(_)) => {
                     rw.set_error();
                     break;
-                }
+                },
                 None => break,
             };
             if mb.is_empty() {
@@ -509,7 +514,7 @@ impl ServerWorker {
             r = Self::read_exact_slice(reader, &mut len_buf) => r,
         };
         match first_read {
-            Ok(()) => {}
+            Ok(()) => {},
             Err(ServerError::InvalidFrame(msg)) if msg.starts_with("EOF") => return Ok(false),
             Err(e) => return Err(e),
         }
@@ -572,7 +577,7 @@ impl ServerWorker {
                 } else {
                     self.handle_normal_new(&meta, data, link_writer).await?;
                 }
-            }
+            },
             SessionStatus::Keep => self.handle_status_keep(&meta, data).await?,
             SessionStatus::End => self.handle_status_end(&meta).await?,
             SessionStatus::KeepAlive => {}, // data 已读出丢弃
@@ -681,9 +686,9 @@ pub enum ServerError {
 
 #[cfg(test)]
 mod tests {
+    use xray_common::net::{address::Address, port::Port};
+
     use super::*;
-    use xray_common::net::address::Address;
-    use xray_common::net::port::Port;
 
     struct MockDispatcher;
     #[async_trait::async_trait]
@@ -738,11 +743,7 @@ mod tests {
         tokio::task::yield_now().await;
 
         let strategy = crate::session::ClientStrategy::default();
-        let session = worker
-            .session_manager()
-            .allocate(&strategy)
-            .await
-            .expect("allocate");
+        let session = worker.session_manager().allocate(&strategy).await.expect("allocate");
 
         tokio::time::advance(Duration::from_secs(301)).await;
         tokio::task::yield_now().await;
@@ -754,10 +755,7 @@ mod tests {
         tokio::time::advance(SERVER_MONITOR_INTERVAL + Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
-        assert!(
-            !worker.is_closed(),
-            "count 变化后的第一个周期不关闭（快照失效）"
-        );
+        assert!(!worker.is_closed(), "count 变化后的第一个周期不关闭（快照失效）");
 
         tokio::time::advance(SERVER_MONITOR_INTERVAL + Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
@@ -769,12 +767,18 @@ mod tests {
 
     #[test]
     fn test_dispatch_error_display() {
-        assert_eq!(format!("{}", DispatchError::NoRoute("1.2.3.4".to_string())), "no route to destination: 1.2.3.4");
+        assert_eq!(
+            format!("{}", DispatchError::NoRoute("1.2.3.4".to_string())),
+            "no route to destination: 1.2.3.4"
+        );
     }
 
     #[test]
     fn test_server_error_display() {
-        assert_eq!(format!("{}", ServerError::InvalidFrame("bad".to_string())), "invalid frame: bad");
+        assert_eq!(
+            format!("{}", ServerError::InvalidFrame("bad".to_string())),
+            "invalid frame: bad"
+        );
     }
 
     #[tokio::test]
@@ -812,14 +816,19 @@ mod tests {
 
     #[test]
     fn test_server_is_mux_destination() {
-        let d = Destination::new(Address::new_domain(MUX_COOL_ADDRESS), Port::new(9527), Network::TCP);
+        let d =
+            Destination::new(Address::new_domain(MUX_COOL_ADDRESS), Port::new(9527), Network::TCP);
         assert!(Server::is_mux_destination(&d));
     }
 
     #[tokio::test]
     async fn test_server_dispatch_non_mux() {
         let server = Server::new(Arc::new(MockDispatcher));
-        let d = Destination::new(Address::new_domain("example.com".to_string()), Port::new(443), Network::TCP);
+        let d = Destination::new(
+            Address::new_domain("example.com".to_string()),
+            Port::new(443),
+            Network::TCP,
+        );
         assert!(server.dispatch(&d).await.is_err());
     }
 
@@ -835,28 +844,34 @@ mod tests {
         let _: &dyn std::error::Error = &err;
     }
 
-
     #[tokio::test]
     async fn test_dispatch_handler_adapter_creates_link() {
         use xray_app_dispatcher::default::DispatchHandler;
-        use xray_common::net::address::Address;
-        use xray_common::net::port::Port;
+        use xray_common::net::{address::Address, port::Port};
 
         #[derive(Debug)]
         struct NopHandler;
         impl DispatchHandler for NopHandler {
-            fn tag(&self) -> &str { "nop" }
+            fn tag(&self) -> &str {
+                "nop"
+            }
+
             fn dispatch(
                 &self,
                 _dest: &xray_common::net::destination::Destination,
                 _link: xray_transport::link::Link,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
+            {
                 Box::pin(async {})
             }
         }
 
         let adapter = DispatchHandlerAdapter::new(Arc::new(NopHandler));
-        let dest = Destination::new(Address::new_domain("example.com".to_string()), Port::new(443), Network::TCP);
+        let dest = Destination::new(
+            Address::new_domain("example.com".to_string()),
+            Port::new(443),
+            Network::TCP,
+        );
         let result = adapter.dispatch(dest).await;
         assert!(result.is_ok(), "adapter should return a link");
     }
@@ -885,16 +900,11 @@ mod tests {
         mb.merge_bytes(&b"x".to_vec());
         use xray_buf::io::Writer as _;
         input_w.write_multi_buffer(mb).await.unwrap();
-        session
-            .set_input(BufferedReader::new(Box::new(input_r)))
-            .await;
+        session.set_input(BufferedReader::new(Box::new(input_r))).await;
 
         let link_writer: Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>> =
             Arc::new(tokio::sync::Mutex::new(Some(Box::new(StalledWriter))));
-        tokio::spawn(ServerWorker::handle_session_output(
-            Arc::clone(&session),
-            link_writer,
-        ));
+        tokio::spawn(ServerWorker::handle_session_output(Arc::clone(&session), link_writer));
         // 等泵进入写 pending（修复前此处泵仍持 input 锁）
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -908,15 +918,20 @@ mod tests {
     // ===== bd 6z8：XUDP gate 触发 + New 帧内联 data 转发 + 首帧即时送达 =====
 
     mod gate_tests {
-        use super::*;
         use std::sync::Arc;
+
         use tokio::sync::Mutex as AsyncMutex;
-        use xray_buf::io::{Reader as _, Writer as _};
-        use xray_buf::pipe;
-        use xray_buf::reader::BufferedReader;
-        use xray_common::net::address::Address;
-        use xray_common::net::port::Port;
-        use xray_common::serial;
+        use xray_buf::{
+            io::{Reader as _, Writer as _},
+            pipe,
+            reader::BufferedReader,
+        };
+        use xray_common::{
+            net::{address::Address, port::Port},
+            serial,
+        };
+
+        use super::*;
 
         /// 捕获 dispatcher：记录 dispatch dest，交出 payload 读端
         /// （ret writer 保活，防 session input 立即 EOF）。
@@ -933,10 +948,7 @@ mod tests {
                 let (pay_r, pay_w) = pipe::new();
                 self.keepers.lock().push(ret_w);
                 let _ = self.tx.send((dest.clone(), pay_r));
-                Ok(Link {
-                    reader: Box::new(ret_r),
-                    writer: Box::new(pay_w),
-                })
+                Ok(Link { reader: Box::new(ret_r), writer: Box::new(pay_w) })
             }
         }
 
@@ -969,21 +981,16 @@ mod tests {
             frame: Vec<u8>,
         ) -> (Destination, pipe::Reader, Arc<ServerWorker>) {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            let dispatcher = CaptureDispatcher {
-                tx,
-                keepers: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            };
+            let dispatcher =
+                CaptureDispatcher { tx, keepers: Arc::new(parking_lot::Mutex::new(Vec::new())) };
             let server = Arc::new(ServerWorker::new(Arc::new(dispatcher)));
             let (_lw_r, lw_w) = pipe::new();
             let link_writer: Arc<AsyncMutex<Option<Box<dyn Writer>>>> =
                 Arc::new(AsyncMutex::new(Some(Box::new(lw_w))));
-            let mut reader = BufferedReader::new(xray_buf::io::new_reader(
-                std::io::Cursor::new(frame),
-            ));
-            let ok = server
-                .process_frame(&mut reader, &link_writer)
-                .await
-                .expect("frame processed");
+            let mut reader =
+                BufferedReader::new(xray_buf::io::new_reader(std::io::Cursor::new(frame)));
+            let ok =
+                server.process_frame(&mut reader, &link_writer).await.expect("frame processed");
             assert!(ok, "frame should be processed");
             let (dest, pay) = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
                 .await
@@ -994,10 +1001,13 @@ mod tests {
 
         /// 从 payload 读端读出全部字节（短超时：验证即时送达，非缓冲滞留）。
         async fn read_payload(pay: &mut pipe::Reader) -> Vec<u8> {
-            let mb = tokio::time::timeout(std::time::Duration::from_millis(1500), pay.read_multi_buffer())
-                .await
-                .expect("payload must arrive without further writes (no buffer stall)")
-                .expect("read ok");
+            let mb = tokio::time::timeout(
+                std::time::Duration::from_millis(1500),
+                pay.read_multi_buffer(),
+            )
+            .await
+            .expect("payload must arrive without further writes (no buffer stall)")
+            .expect("read ok");
             let mut out = Vec::new();
             for b in mb.iter() {
                 out.extend_from_slice(b.bytes());
@@ -1056,20 +1066,16 @@ mod tests {
             let frame = new_frame_with_data(meta, b"unexpected-tcp");
 
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-            let dispatcher = CaptureDispatcher {
-                tx,
-                keepers: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            };
+            let dispatcher =
+                CaptureDispatcher { tx, keepers: Arc::new(parking_lot::Mutex::new(Vec::new())) };
             let server = Arc::new(
-                ServerWorker::new(Arc::new(dispatcher))
-                    .with_allowed_network(Network::UDP),
+                ServerWorker::new(Arc::new(dispatcher)).with_allowed_network(Network::UDP),
             );
             let (_lw_r, lw_w) = pipe::new();
             let link_writer: Arc<AsyncMutex<Option<Box<dyn Writer>>>> =
                 Arc::new(AsyncMutex::new(Some(Box::new(lw_w))));
-            let mut reader = BufferedReader::new(xray_buf::io::new_reader(
-                std::io::Cursor::new(frame),
-            ));
+            let mut reader =
+                BufferedReader::new(xray_buf::io::new_reader(std::io::Cursor::new(frame)));
 
             let res = server.process_frame(&mut reader, &link_writer).await;
             assert!(res.is_err(), "TCP New frame must be rejected under allowed=UDP");
@@ -1082,20 +1088,16 @@ mod tests {
             let frame = new_frame_with_data(meta, b"udp-ok");
 
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            let dispatcher = CaptureDispatcher {
-                tx,
-                keepers: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            };
+            let dispatcher =
+                CaptureDispatcher { tx, keepers: Arc::new(parking_lot::Mutex::new(Vec::new())) };
             let server = Arc::new(
-                ServerWorker::new(Arc::new(dispatcher))
-                    .with_allowed_network(Network::UDP),
+                ServerWorker::new(Arc::new(dispatcher)).with_allowed_network(Network::UDP),
             );
             let (_lw_r, lw_w) = pipe::new();
             let link_writer: Arc<AsyncMutex<Option<Box<dyn Writer>>>> =
                 Arc::new(AsyncMutex::new(Some(Box::new(lw_w))));
-            let mut reader = BufferedReader::new(xray_buf::io::new_reader(
-                std::io::Cursor::new(frame),
-            ));
+            let mut reader =
+                BufferedReader::new(xray_buf::io::new_reader(std::io::Cursor::new(frame)));
 
             let ok = server
                 .process_frame(&mut reader, &link_writer)
@@ -1112,11 +1114,14 @@ mod tests {
 
     /// XUDP e2e：client GlobalID 接线 + server 装配 + 双向收发。
     mod xudp_e2e_tests {
-        use super::*;
-        use crate::client::{ClientWorker, Link as ClientLink};
-        use crate::session::ClientStrategy;
         use tokio::sync::Mutex as AsyncMutex;
         use xray_buf::pipe;
+
+        use super::*;
+        use crate::{
+            client::{ClientWorker, Link as ClientLink},
+            session::ClientStrategy,
+        };
 
         /// UDP 捕获 dispatcher：交出"注入上游响应"的写端与"观察客户端
         /// 上行"的读端（Go 等价：真 UDP socket 两方向）。
@@ -1130,10 +1135,7 @@ mod tests {
                 let (r_down, w_down) = pipe::new(); // 上游→客户端：测试持 w_down 注入
                 let (up_r, up_w) = pipe::new(); // 客户端→上游：测试持 up_r 观察
                 let _ = self.tx.send((dest, w_down, up_r));
-                Ok(Link {
-                    reader: Box::new(r_down),
-                    writer: Box::new(up_w),
-                })
+                Ok(Link { reader: Box::new(r_down), writer: Box::new(up_w) })
             }
         }
 
@@ -1146,15 +1148,15 @@ mod tests {
         }
 
         /// ClientWorker ↔ ServerWorker 直连管道拓扑 + UDP 捕获 dispatcher。
-        async fn spawn_topology()
-        -> (Arc<ClientWorker>, Arc<ServerWorker>, tokio::sync::mpsc::UnboundedReceiver<(Destination, pipe::Writer, pipe::Reader)>) {
+        async fn spawn_topology() -> (
+            Arc<ClientWorker>,
+            Arc<ServerWorker>,
+            tokio::sync::mpsc::UnboundedReceiver<(Destination, pipe::Writer, pipe::Reader)>,
+        ) {
             let (c_read, s_write) = pipe::new(); // server → client
             let (s_read, c_write) = pipe::new(); // client → server
             let client = ClientWorker::new(
-                ClientLink {
-                    reader: Box::new(c_read),
-                    writer: Box::new(c_write),
-                },
+                ClientLink { reader: Box::new(c_read), writer: Box::new(c_write) },
                 ClientStrategy::default(),
             );
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1223,10 +1225,12 @@ mod tests {
             let w = Arc::clone(&client);
             let d = udp_target();
             let task = tokio::spawn(async move {
-                w.dispatch_with_source(&d, ClientLink {
-                    reader: Box::new(req_rd),
-                    writer: Box::new(resp_wr),
-                }, Some(&input), None)
+                w.dispatch_with_source(
+                    &d,
+                    ClientLink { reader: Box::new(req_rd), writer: Box::new(resp_wr) },
+                    Some(&input),
+                    None,
+                )
                 .await
             });
 
@@ -1238,11 +1242,8 @@ mod tests {
                     .expect("channel open");
             assert_eq!(dest.network(), Network::UDP);
             assert_eq!(server.active_connections().await, 1, "XUDP session registered");
-            let entry = server
-                .xudp_manager
-                .get(&gid)
-                .await
-                .expect("XUDP entry keyed by client GlobalID");
+            let entry =
+                server.xudp_manager.get(&gid).await.expect("XUDP entry keyed by client GlobalID");
             assert_eq!(entry.status, XudpStatus::Active, "entry must be Active after assembly");
 
             // 上行：New 内联 data → 到达"上游"读端
@@ -1258,16 +1259,19 @@ mod tests {
             .await
             .expect("write downlink");
             let _ = pong.close();
-            let back = tokio::time::timeout(std::time::Duration::from_secs(3), resp.read_multi_buffer())
-                .await
-                .expect("downlink within timeout")
-                .expect("read ok");
+            let back =
+                tokio::time::timeout(std::time::Duration::from_secs(3), resp.read_multi_buffer())
+                    .await
+                    .expect("downlink within timeout")
+                    .expect("read ok");
             assert_eq!(back.to_vec(), b"dns-answer", "upstream response must flow back via pump");
 
             // 收尾：客户端半关闭 → End → server session 摘除
             let _ = req.close();
             let _ = task.await;
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), resp.read_multi_buffer()).await;
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(2), resp.read_multi_buffer())
+                    .await;
         }
 
         /// kgjo：同 GlobalID 重复 New 命中复用——不再调 dispatcher、不建新 session，
@@ -1291,7 +1295,12 @@ mod tests {
                 let mut meta = FrameMetadata::new_session(100 + i as u16, udp_target());
                 meta.set_global_id(gid);
                 server
-                    .handle_xudp_new(&meta, Buffer::from_vec(payload.to_vec()), &Arc::new(AsyncMutex::new(None)), gid)
+                    .handle_xudp_new(
+                        &meta,
+                        Buffer::from_vec(payload.to_vec()),
+                        &Arc::new(AsyncMutex::new(None)),
+                        gid,
+                    )
                     .await
                     .expect("handle_xudp_new");
             }
@@ -1303,26 +1312,18 @@ mod tests {
                     .expect("dispatch within timeout")
                     .expect("channel open");
             // 第二次不应再触发 dispatcher.recv（unbounded 单元素已消费）
-            assert!(
-                rx.try_recv().is_err(),
-                "second New must reuse, not re-dispatch"
-            );
+            assert!(rx.try_recv().is_err(), "second New must reuse, not re-dispatch");
             // 旧上行读端：两条 payload 通过同一管道到达，pipe 在 read_multi_buffer
             // 上一次性返回所有可读字节，故一次 read 就能拿到两个 payload 拼接。
             // 验证关键：复用路径下 dispatcher 不被第二次调用（try_recv 已断言）。
             let combined = read_all(&mut up_r).await;
             assert_eq!(
-                combined,
-                b"req-1req-2",
+                combined, b"req-1req-2",
                 "both packets arrive at the single upstream via reuse"
             );
 
             // XUDP entry 仍 Active（hit 路径不重置 status）
-            let entry = server
-                .xudp_manager
-                .get(&gid)
-                .await
-                .expect("XUDP entry persists");
+            let entry = server.xudp_manager.get(&gid).await.expect("XUDP entry persists");
             assert_eq!(entry.status, XudpStatus::Active);
 
             // zv9l 验收：hit 重绑后新 sessionID 必须注册进 manager，
@@ -1352,11 +1353,14 @@ mod tests {
     /// 送达 dispatcher（Go server.go:166-174 ctx 覆写的等价物）。
     /// 此前该通道缺失，帧内恒无 source/local。
     mod reverse_mux_tests {
-        use super::*;
-        use crate::client::{ClientWorker, Link as ClientLink};
-        use crate::session::ClientStrategy;
         use tokio::sync::Mutex as AsyncMutex;
         use xray_buf::pipe;
+
+        use super::*;
+        use crate::{
+            client::{ClientWorker, Link as ClientLink},
+            session::ClientStrategy,
+        };
 
         fn tcp_target() -> Destination {
             Destination::new(
@@ -1406,10 +1410,7 @@ mod tests {
                 let _ = self.tx.send((dest, source.clone(), local.clone()));
                 let (ret_r, ret_w) = pipe::new();
                 let (_pay_r, pay_w) = pipe::new();
-                Ok(Link {
-                    reader: Box::new(ret_r),
-                    writer: Box::new(pay_w),
-                })
+                Ok(Link { reader: Box::new(ret_r), writer: Box::new(pay_w) })
             }
         }
 
@@ -1419,10 +1420,7 @@ mod tests {
             let (c_read, s_write) = pipe::new();
             let (s_read, c_write) = pipe::new();
             let client = ClientWorker::new(
-                ClientLink {
-                    reader: Box::new(c_read),
-                    writer: Box::new(c_write),
-                },
+                ClientLink { reader: Box::new(c_read), writer: Box::new(c_write) },
                 ClientStrategy::default(),
             );
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1461,10 +1459,7 @@ mod tests {
             let task = tokio::spawn(async move {
                 w.dispatch_with_source(
                     &d,
-                    ClientLink {
-                        reader: Box::new(_req_rd),
-                        writer: Box::new(resp_wr),
-                    },
+                    ClientLink { reader: Box::new(_req_rd), writer: Box::new(resp_wr) },
                     None,
                     Some((source_dest(), local_dest())),
                 )

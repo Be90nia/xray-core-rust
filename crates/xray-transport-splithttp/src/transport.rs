@@ -2,34 +2,42 @@
 //!
 //! 对应 Go `transport/internet/splithttp/hub.go::ListenXH`（449-582 行）：
 //! - **isH3 判定**（hub.go:469）：`tlsSettings.alpn == ["h3"]` → UDP + QUIC + h3 server
-//! - **TCP**（hub.go:536-545）：accept → 可选 TLS（hub.go:553-556）/ REALITY（hub.go:558-560）
-//!   → hyper auto（h1 + h2c，hub.go:565-567）→ [`crate::hub::handler::handle_request`]
+//! - **TCP**（hub.go:536-545）：accept → 可选 TLS（hub.go:553-556）/ REALITY（hub.go:558-560） →
+//!   hyper auto（h1 + h2c，hub.go:565-567）→ [`crate::hub::handler::handle_request`]
 //! - **unix**（hub.go:472-480 `port == 0` → `ListenUnix`）：不支持——Rust 生产入口
 //!   `listen_splithttp` 只分 h3/TCP，`SocketAddr` 无法承载 unix 路径。
 //!
 //! Go 的 `requestHandler.ServeHTTP` 与传输无关（同一 handler 服务 h1/h2/h3 三路），
 //! 本文件把 hub handler 接到 h3/TCP 两种监听形态上。
 
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::Duration;
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use base64::Engine as _;
 use bytes::{Buf as _, Bytes};
 use http_body_util::BodyExt as _;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use xray_transport::connection::Connection;
-use xray_transport::dialer::StreamSettings;
-use xray_transport::fallback::fallback_to_dest;
-use xray_transport::listener_registry::{ConnHandler, TransportListener};
-use xray_transport::sockopt::SocketOptions;
+use xray_transport::{
+    connection::Connection,
+    dialer::StreamSettings,
+    fallback::fallback_to_dest,
+    listener_registry::{ConnHandler, TransportListener},
+    sockopt::SocketOptions,
+};
 
-use crate::config::Config;
-use crate::hub::handler::{self, HandlerContext};
-use crate::hub::{HubConnHandler, ServerConn, SessionMap};
+use crate::{
+    config::Config,
+    hub::{
+        HubConnHandler, ServerConn, SessionMap,
+        handler::{self, HandlerContext},
+    },
+};
 
 /// h1 请求头读取超时。对应 Go hub.go:570 `ReadHeaderTimeout: time.Second * 4`。
 const READ_HEADER_TIMEOUT: Duration = Duration::from_secs(4);
@@ -46,9 +54,8 @@ pub async fn listen_splithttp(
     sockopt: &SocketOptions,
     handler: ConnHandler,
 ) -> io::Result<Box<dyn TransportListener>> {
-    let config = Arc::new(crate::register::parse_splithttp_config(
-        settings.transport_json.as_ref(),
-    )?);
+    let config =
+        Arc::new(crate::register::parse_splithttp_config(settings.transport_json.as_ref())?);
     let tls_cfg = xray_tls::server_config::build_server_config(
         &settings.security,
         settings.security_json.as_ref(),
@@ -68,11 +75,9 @@ pub async fn listen_splithttp(
     } else {
         // Tcpmask（Go splithttp/hub.go:547-549：`!isH3 && TcpmaskManager != nil`
         // 才 WrapListener——H3/QUIC 分支不接 Tcpmask）。空 manager = 恒等。
-        let tcpmask = Some(Arc::new(
-            xray_transport::finalmask::build_tcpmask_manager_from_json(
-                settings.finalmask_json.as_ref(),
-            )?,
-        ));
+        let tcpmask = Some(Arc::new(xray_transport::finalmask::build_tcpmask_manager_from_json(
+            settings.finalmask_json.as_ref(),
+        )?));
         listen_tcp(
             addr,
             &settings.security,
@@ -101,10 +106,8 @@ async fn listen_tcp(
     let reality = reality_server_config(security, security_json)?;
     // bd frxi：配置启用探测时 spawn CCS 探测写 ProbeTable（Go tcp/hub.go:79
     // `go goreality.DetectPostHandshakeRecordsLens` 等价；Rust 侧 opt-in）。
-    let reality_probe = reality
-        .as_ref()
-        .filter(|rc| rc.max_useless_records.is_enabled())
-        .map(|rc| {
+    let reality_probe =
+        reality.as_ref().filter(|rc| rc.max_useless_records.is_enabled()).map(|rc| {
             let table = xray_reality::probe::ProbeTable::new();
             xray_reality::probe::detect_max_useless_records(
                 table.clone(),
@@ -139,22 +142,21 @@ async fn listen_tcp(
             let _ = stream.set_nodelay(true);
             // Tcpmask wrap（Go hub.go:546-549 WrapListener：mask 在 TLS/REALITY
             // 之内、最贴近 wire；wrap 失败丢连接继续 accept）。
-            let stream: Box<dyn xray_transport::connection::Connection> =
-                match tcpmask.as_ref() {
-                    Some(m) => {
-                        match xray_transport::finalmask::wrap_conn_server_into_connection(
-                            m,
-                            Box::new(xray_transport::connection::TcpConnection::new(stream)),
-                        ) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                tracing::debug!(error = %e, "XHTTP tcpmask wrap failed");
-                                continue;
-                            }
-                        }
+            let stream: Box<dyn xray_transport::connection::Connection> = match tcpmask.as_ref() {
+                Some(m) => {
+                    match xray_transport::finalmask::wrap_conn_server_into_connection(
+                        m,
+                        Box::new(xray_transport::connection::TcpConnection::new(stream)),
+                    ) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "XHTTP tcpmask wrap failed");
+                            continue;
+                        },
                     }
-                    None => Box::new(xray_transport::connection::TcpConnection::new(stream)),
-                };
+                },
+                None => Box::new(xray_transport::connection::TcpConnection::new(stream)),
+            };
             let ctx = Arc::clone(&ctx);
             let tls = tls_cfg.clone();
             let rc = reality.clone();
@@ -210,9 +212,7 @@ where
     let io = TokioIo::new(stream);
     let svc = service_fn(move |req| {
         let ctx = Arc::clone(&ctx);
-        async move {
-            Ok::<_, std::convert::Infallible>(handler::handle_request(req, peer, &ctx).await)
-        }
+        async move { Ok::<_, std::convert::Infallible>(handler::handle_request(req, peer, &ctx).await) }
     });
     let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
     builder
@@ -272,9 +272,7 @@ fn reality_server_config(
     if let Some(arr) = json.get("serverNames").and_then(|x| x.as_array()) {
         for v in arr {
             let Some(name) = v.as_str() else {
-                return Err(io::Error::other(
-                    "reality: invalid serverNames entry (need string)",
-                ));
+                return Err(io::Error::other("reality: invalid serverNames entry (need string)"));
             };
             server_names.push(name.to_string());
         }
@@ -300,9 +298,7 @@ fn reality_server_config(
             )));
         };
         if hex.len() > 16 {
-            return Err(io::Error::other(format!(
-                "reality: too long \"shortIds[{i}]\": {hex}"
-            )));
+            return Err(io::Error::other(format!("reality: too long \"shortIds[{i}]\": {hex}")));
         }
         let bytes = hex::decode(hex)
             .map_err(|_| io::Error::other(format!("reality: invalid \"shortIds[{i}]\": {hex}")))?;
@@ -312,21 +308,17 @@ fn reality_server_config(
     }
 
     // dest/target：int（端口→localhost:port）或字符串 host:port
-    let dest_raw = json
-        .get("target")
-        .or_else(|| json.get("dest"))
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
+    let dest_raw =
+        json.get("target").or_else(|| json.get("dest")).cloned().unwrap_or(serde_json::Value::Null);
     let fallback_dest = match dest_raw.as_u64() {
         Some(port) => format!("localhost:{port}"),
         None => dest_raw.as_str().unwrap_or("localhost:443").to_string(),
     };
     let xver = json.get("xver").and_then(|x| x.as_u64()).unwrap_or(0).min(2) as u8;
     // bd frxi：realitySettings.maxUselessRecords 三态（缺省/true/数值）。
-    let max_useless_records = xray_reality::MaxUselessRecordsSetting::from_json(
-        json.get("maxUselessRecords"),
-    )
-    .map_err(io::Error::other)?;
+    let max_useless_records =
+        xray_reality::MaxUselessRecordsSetting::from_json(json.get("maxUselessRecords"))
+            .map_err(io::Error::other)?;
     // bd tce2：realitySettings.serverAcceptor（"rustls" 默认 / "btls" opt-in）。
     let server_acceptor =
         xray_reality::ServerAcceptorSetting::from_json(json.get("serverAcceptor"))
@@ -343,10 +335,7 @@ fn reality_server_config(
     }
     // maxTimeDiff：Go 默认 0（禁用），单位毫秒 → 转换为秒传给 verify。
     // 之前注入 43200 + 按秒解释 = 三重语义偏差（详见 docs/audit/crypto.md）。
-    let max_time_diff_ms = json
-        .get("maxTimeDiff")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0);
+    let max_time_diff_ms = json.get("maxTimeDiff").and_then(|x| x.as_u64()).unwrap_or(0);
     let max_time_diff = (max_time_diff_ms / 1000) as u32;
 
     // fs0o: 解析 minClientVer/maxClientVer（"26.3.27" → `[26, 3, 27]`）。
@@ -366,9 +355,7 @@ fn reality_server_config(
                 io::Error::other(format!("reality: invalid {key} segment '{part}': {e}"))
             })?;
             if n > 255 {
-                return Err(io::Error::other(format!(
-                    "reality: {key} segment {n} > 255"
-                )));
+                return Err(io::Error::other(format!("reality: {key} segment {n} > 255")));
             }
             v.push(n as u8);
         }
@@ -406,14 +393,11 @@ async fn serve_reality_conn<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    use xray_reality::server::{server_tls, RealityServerOutcome};
+    use xray_reality::server::{RealityServerOutcome, server_tls};
 
     // bd tce2：serverAcceptor="btls" 走 BoringSSL 握手（含 26zn 后握手记录
     // 模仿消费）；默认 rustls 路径行为不变。
-    let outcome = if matches!(
-        rc.server_acceptor,
-        xray_reality::ServerAcceptorSetting::Btls
-    ) {
+    let outcome = if matches!(rc.server_acceptor, xray_reality::ServerAcceptorSetting::Btls) {
         #[cfg(not(target_os = "ios"))]
         {
             xray_reality::server::server_tls_btls(
@@ -456,19 +440,16 @@ async fn serve_reality_conn<S>(
         .await
     };
     match outcome {
-        Ok(RealityServerOutcome::Verified {
-            tls,
-            max_useless_records,
-        }) => {
+        Ok(RealityServerOutcome::Verified { tls, max_useless_records }) => {
             // bd frxi：探测值随连接交付（rustls 无 record 层消费点，
             // mygg 后握手记录模仿落地前仅可观察）。
             tracing::debug!(peer = %peer, max_useless_records, "reality verified with probe result");
             serve_http_conn(tls, peer, ctx).await
-        }
+        },
         Ok(RealityServerOutcome::Invalid { conn, record, reason }) => {
             tracing::debug!(error = ?reason, dest = %rc.fallback_dest, "splithttp reality fallback");
             let _ = fallback_to_dest(conn, &record, &rc.fallback_dest, peer, local, rc.xver).await;
-        }
+        },
         Err(e) => tracing::warn!(error = %e, "splithttp reality handshake error"),
     }
 }
@@ -482,7 +463,6 @@ fn base64_url_decode(s: &str) -> io::Result<Vec<u8>> {
         .or_else(|_| base64::engine::general_purpose::STANDARD.decode(s))
         .map_err(|e| io::Error::other(format!("reality: base64 privateKey: {e}")))
 }
-
 
 // ===== H3（Go hub.go:481-535：UDP + QUIC + http3.Server） =====
 
@@ -527,21 +507,16 @@ async fn listen_h3(
             });
         }
     });
-    Ok(Box::new(SplithttpListener {
-        local,
-        tcp_abort: None,
-        h3_endpoint: Some(listener_endpoint),
-    }))
+    Ok(Box::new(SplithttpListener { local, tcp_abort: None, h3_endpoint: Some(listener_endpoint) }))
 }
 
 /// 单个 QUIC 连接：h3 server handshake → accept 请求循环。
 async fn serve_h3_conn(conn: quinn::Connection, ctx: Arc<HandlerContext>) {
-    let mut h3_conn = match h3::server::Connection::new(h3_quinn::Connection::new(conn.clone()))
-        .await
-    {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+    let mut h3_conn =
+        match h3::server::Connection::new(h3_quinn::Connection::new(conn.clone())).await {
+            Ok(c) => c,
+            Err(_) => return,
+        };
     while let Ok(Some(resolver)) = h3_conn.accept().await {
         let ctx = Arc::clone(&ctx);
         let conn = conn.clone();
@@ -620,11 +595,11 @@ impl hyper::body::Body for H3RecvBody {
             Poll::Ready(Ok(Some(mut chunk))) => {
                 let n = chunk.remaining();
                 Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk.copy_to_bytes(n)))))
-            }
+            },
             Poll::Ready(Ok(None)) => Poll::Ready(None),
-            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(io::Error::other(format!(
-                "h3 recv_data: {e}"
-            ))))),
+            Poll::Ready(Err(e)) => {
+                Poll::Ready(Some(Err(io::Error::other(format!("h3 recv_data: {e}")))))
+            },
             Poll::Pending => Poll::Pending,
         }
     }
@@ -662,17 +637,9 @@ impl HubConnHandler for ConnHandlerAdapter {
         let (client, server) = tokio::io::duplex(DUPLEX_BUF);
         let remote = conn.remote_addr;
         let local = conn.local_addr;
-        (self.0)(Box::new(DuplexConn {
-            inner: client,
-            remote: Some(remote),
-            local: Some(local),
-        }));
+        (self.0)(Box::new(DuplexConn { inner: client, remote: Some(remote), local: Some(local) }));
         tokio::spawn(async move {
-            let ServerConn {
-                reader: mut up,
-                writer: mut down,
-                ..
-            } = conn;
+            let ServerConn { reader: mut up, writer: mut down, .. } = conn;
             let (mut rd, mut wr) = tokio::io::split(server);
             // 上行（客户端上传 → dispatcher 读）/ 下行（dispatcher 写 → HTTP 响应）
             let a = tokio::io::copy(&mut up, &mut wr);
@@ -707,9 +674,11 @@ impl AsyncWrite for DuplexConn {
     ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
+
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
@@ -719,6 +688,7 @@ impl Connection for DuplexConn {
     fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(self.remote)
     }
+
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(self.local)
     }
@@ -737,6 +707,7 @@ impl TransportListener for SplithttpListener {
     fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.local)
     }
+
     fn close(&self) -> io::Result<()> {
         tracing::info!("splithttp listener close addr={}", self.local);
         if let Some(task) = &self.tcp_abort {
@@ -750,10 +721,14 @@ impl TransportListener for SplithttpListener {
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    use tokio::net::TcpStream;
+
+    use tokio::{
+        io::{AsyncReadExt as _, AsyncWriteExt as _},
+        net::TcpStream,
+    };
+
+    use super::*;
     fn ensure_provider() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
@@ -778,10 +753,7 @@ mod tests {
     }
 
     fn plain_settings() -> StreamSettings {
-        StreamSettings {
-            protocol: "splithttp".into(),
-            ..Default::default()
-        }
+        StreamSettings { protocol: "splithttp".into(), ..Default::default() }
     }
 
     /// h1 客户端接入（stream-one）：明文 HTTP/1.1 GET → 200 + 下行数据。
@@ -818,10 +790,7 @@ mod tests {
         tcp.read_to_end(&mut resp).await.unwrap();
         let text = String::from_utf8_lossy(&resp);
         assert!(text.contains("200"), "h1 status line missing: {text}");
-        assert!(
-            text.contains("hello-from-server"),
-            "h1 stream-one download missing: {text}"
-        );
+        assert!(text.contains("hello-from-server"), "h1 stream-one download missing: {text}");
         assert_eq!(count.load(Ordering::SeqCst), 1, "handler should see 1 conn");
     }
 
@@ -856,11 +825,7 @@ mod tests {
         ));
         let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         endpoint.set_default_client_config(quic_cfg);
-        let conn = endpoint
-            .connect(addr, "127.0.0.1")
-            .unwrap()
-            .await
-            .expect("quic connect");
+        let conn = endpoint.connect(addr, "127.0.0.1").unwrap().await.expect("quic connect");
         let (mut driver, mut send_req) =
             h3::client::new(h3_quinn::Connection::new(conn)).await.unwrap();
         tokio::spawn(async move {
@@ -886,7 +851,7 @@ mod tests {
                 Ok(Some(mut chunk)) => {
                     let n = chunk.remaining();
                     got.extend_from_slice(&chunk.copy_to_bytes(n));
-                }
+                },
                 Ok(None) => break,
                 Err(e) => panic!("h3 recv_data: {e}"),
             }
@@ -948,15 +913,8 @@ mod tests {
             .await
             .expect("fallback within 5s")
             .expect("fallback channel open");
-        assert!(
-            got.starts_with(garbage),
-            "fallback should receive original record, got {got:?}"
-        );
-        assert_eq!(
-            count.load(Ordering::SeqCst),
-            0,
-            "fallback conn must not reach dispatcher"
-        );
+        assert!(got.starts_with(garbage), "fallback should receive original record, got {got:?}");
+        assert_eq!(count.load(Ordering::SeqCst), 0, "fallback conn must not reach dispatcher");
     }
     /// TCP 分支：close() abort accept task → TcpListener drop → 端口释放
     /// （票 4kjs 回归锚：修复前 close 仅日志，连接一直成功）。
@@ -986,7 +944,7 @@ mod tests {
                         "close 后端口仍接受连接（accept task 未终止）"
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
+                },
             }
         }
     }
@@ -1019,8 +977,7 @@ mod tests {
         .unwrap()
         .expect("client tls config");
         let mut transport = quinn::TransportConfig::default();
-        transport
-            .max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(1_000))));
+        transport.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(1_000))));
         let mut quic_cfg = quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap(),
         ));

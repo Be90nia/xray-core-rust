@@ -11,24 +11,29 @@
 //! [`DialBridge`]: xray_app_dispatcher::default::DialBridge
 //! [`DialFn`]: xray_app_dispatcher::default::DialFn
 
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use xray_app_dispatcher::default::DialFn;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network as XrayNetwork;
-use xray_common::net::port::Port;
-use xray_transport::connection::Connection;
-use xray_transport::dialer::{dial, StreamSettings};
-use xray_transport::sockopt::SocketOptions;
+use xray_common::net::{
+    address::Address, destination::Destination, network::Network as XrayNetwork, port::Port,
+};
+use xray_transport::{
+    connection::Connection,
+    dialer::{StreamSettings, dial},
+    sockopt::SocketOptions,
+};
 
-use crate::config::MemoryAccount;
-use crate::protocol::{write_request_header, Network as TrojanNetwork};
+use crate::{
+    config::MemoryAccount,
+    protocol::{Network as TrojanNetwork, write_request_header},
+};
 
 /// Trojan outbound 配置。
 #[derive(Debug, Clone)]
@@ -107,43 +112,39 @@ pub fn make_dial_fn(config: Arc<TrojanOutboundConfig>) -> DialFn {
         let target_port = dest.port().value();
         let is_udp = dest.is_udp();
         Box::pin(async move {
-            // 1. dial Trojan server：有 streamSettings 走 transport dialer（ws/grpc/...），否则裸 TCP。
+            // 1. dial Trojan server：有 streamSettings 走 transport dialer（ws/grpc/...），否则裸
+            //    TCP。
             let server_dest = config.server_destination();
-            let sockopt = config.stream_settings.as_ref().map(|s| s.socket_options()).unwrap_or_default();
-            let mut conn: Box<dyn Connection> = xray_transport::retry::exponential_backoff(5, 100, || async {
-                match &config.stream_settings {
-                    Some(s) => dial(&server_dest, s, &sockopt)
-                        .await
-                        .map_err(|e| format!("trojan dial server ({}): {e}", s.protocol)),
-                    None => xray_transport::system_dialer::dial_system(&server_dest, &sockopt)
-                        .await
-                        .map_err(|e| format!("trojan dial server (tcp): {e}")),
-                }
-            })
-            .await
-            .map_err(|e| format!("failed to find an available destination: {e}"))?;
+            let sockopt =
+                config.stream_settings.as_ref().map(|s| s.socket_options()).unwrap_or_default();
+            let mut conn: Box<dyn Connection> =
+                xray_transport::retry::exponential_backoff(5, 100, || async {
+                    match &config.stream_settings {
+                        Some(s) => dial(&server_dest, s, &sockopt)
+                            .await
+                            .map_err(|e| format!("trojan dial server ({}): {e}", s.protocol)),
+                        None => xray_transport::system_dialer::dial_system(&server_dest, &sockopt)
+                            .await
+                            .map_err(|e| format!("trojan dial server (tcp): {e}")),
+                    }
+                })
+                .await
+                .map_err(|e| format!("failed to find an available destination: {e}"))?;
 
             // 2. 构造 Trojan 请求头（UDP dest → command UDP，Go client.go 同分支）
             let network = if is_udp { TrojanNetwork::Udp } else { TrojanNetwork::Tcp };
             let mut header = Vec::with_capacity(128);
-            write_request_header(
-                &mut header,
-                &config.account,
-                network,
-                &target_addr,
-                target_port,
-            )
-            .map_err(|e| format!("trojan write header: {e}"))?;
-
-            // 3. 写头到连接
-            conn.write_all(&header)
-                .await
+            write_request_header(&mut header, &config.account, network, &target_addr, target_port)
                 .map_err(|e| format!("trojan write header: {e}"))?;
 
-            // 4. UDP：包一层 Trojan UDP 分帧（[addr][len][CRLF][payload] per packet，
-            //    Go PacketWriter/PacketReader）。write 边界≈packet 边界。
+            // 3. 写头到连接
+            conn.write_all(&header).await.map_err(|e| format!("trojan write header: {e}"))?;
+
+            // 4. UDP：包一层 Trojan UDP 分帧（[addr][len][CRLF][payload] per packet， Go
+            //    PacketWriter/PacketReader）。write 边界≈packet 边界。
             if is_udp {
-                Ok(Box::new(TrojanUdpFramedConn::new(conn, target_addr, target_port)) as Box<dyn Connection>)
+                Ok(Box::new(TrojanUdpFramedConn::new(conn, target_addr, target_port))
+                    as Box<dyn Connection>)
             } else {
                 Ok(conn)
             }
@@ -183,7 +184,10 @@ impl AsyncWrite for TrojanUdpFramedConn {
                 Pin::new(&mut *this.inner).poll_write(cx, &this.wpending[this.wpos..])
             )?;
             if n == 0 {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "trojan udp: frame write stalled")));
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "trojan udp: frame write stalled",
+                )));
             }
             this.wpos += n;
         }
@@ -198,7 +202,10 @@ impl AsyncWrite for TrojanUdpFramedConn {
                 Pin::new(&mut *this.inner).poll_write(cx, &this.wpending[this.wpos..])
             )?;
             if n == 0 {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "trojan udp: frame write stalled")));
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "trojan udp: frame write stalled",
+                )));
             }
             this.wpos += n;
         }
@@ -231,8 +238,8 @@ impl AsyncRead for TrojanUdpFramedConn {
                         let keep_from = consumed - payload.len() + n;
                         self.rbuf.drain(..keep_from);
                         return Poll::Ready(Ok(()));
-                    }
-                    Ok(None) => {} // 数据不足一帧，继续从 inner 读
+                    },
+                    Ok(None) => {}, // 数据不足一帧，继续从 inner 读
                     // 致命帧错误（ATYP 非法 / payload 超限）→ 终止会话；
                     // 对齐入站 server.rs UDP relay fatal 分支与 Go PacketReader
                     Err(e) => {
@@ -240,7 +247,7 @@ impl AsyncRead for TrojanUdpFramedConn {
                             io::ErrorKind::InvalidData,
                             format!("trojan udp: parse frame: {e}"),
                         )));
-                    }
+                    },
                 }
             }
             // 缓冲不足一帧 → 从 inner 再读
@@ -254,14 +261,17 @@ impl AsyncRead for TrojanUdpFramedConn {
                             Poll::Ready(Ok(())) // EOF
                         } else {
                             // 残留半帧：协议损坏，报错
-                            Poll::Ready(Err(io::Error::new(io::ErrorKind::UnexpectedEof, "trojan udp: truncated frame")))
+                            Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "trojan udp: truncated frame",
+                            )))
                         };
                     }
                     self.rbuf.extend_from_slice(filled);
-                }
+                },
                 Poll::Pending => {
                     return Poll::Pending;
-                }
+                },
             }
         }
     }
@@ -271,6 +281,7 @@ impl Connection for TrojanUdpFramedConn {
     fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
         self.inner.remote_addr()
     }
+
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         self.inner.local_addr()
     }
@@ -278,8 +289,9 @@ impl Connection for TrojanUdpFramedConn {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use xray_common::net::address::Address;
+
+    use super::*;
 
     #[test]
     fn config_server_destination_roundtrip() {
@@ -357,9 +369,6 @@ mod tests {
 
         let mut out = [0u8; 16];
         let result = framed.read(&mut out).await;
-        assert!(
-            result.is_err(),
-            "fatal frame must terminate the session, got {result:?}"
-        );
+        assert!(result.is_err(), "fatal frame must terminate the session, got {result:?}");
     }
 }

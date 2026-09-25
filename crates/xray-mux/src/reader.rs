@@ -1,13 +1,15 @@
-﻿//! Mux 帧数据读取器
+//! Mux 帧数据读取器
 //!
 //! 实现 PacketReader 和 StreamReader 用于读取 Mux 协议帧数据
 
 use std::pin::Pin;
 
-use xray_buf::buffer::Buffer;
-use xray_buf::multi::MultiBuffer;
-use xray_buf::reader::BufferedReader;
-use xray_buf::io::{self as buf_io, Reader};
+use xray_buf::{
+    buffer::Buffer,
+    io::{self as buf_io, Reader},
+    multi::MultiBuffer,
+    reader::BufferedReader,
+};
 use xray_common::net::destination::Destination;
 
 use crate::frame::{FrameMetadata, MuxError, SessionStatus};
@@ -91,8 +93,13 @@ impl PacketReader {
         Ok(mb)
     }
 
-    pub fn is_eof(&self) -> bool { self.eof }
-    pub fn destination(&self) -> Option<&Destination> { self.dest.as_ref() }
+    pub fn is_eof(&self) -> bool {
+        self.eof
+    }
+
+    pub fn destination(&self) -> Option<&Destination> {
+        self.dest.as_ref()
+    }
 }
 
 /// StreamReader 读取流式 Mux 帧数据
@@ -184,19 +191,25 @@ impl StreamReader {
                     if is_end && is_empty {
                         return Err(MuxError::Io("session ended".to_string()));
                     }
-                    if is_empty && !is_end { continue; }
+                    if is_empty && !is_end {
+                        continue;
+                    }
                     self.current_frame = Some(frame);
-                }
+                },
                 None => continue,
             }
         }
     }
 
-    pub fn session_id(&self) -> u16 { self.session_id }
+    pub fn session_id(&self) -> u16 {
+        self.session_id
+    }
 }
 
 impl Reader for PacketReader {
-    fn read_multi_buffer<'a>(&'a mut self) -> Pin<Box<dyn std::future::Future<Output = buf_io::Result<MultiBuffer>> + Send + 'a>> {
+    fn read_multi_buffer<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn std::future::Future<Output = buf_io::Result<MultiBuffer>> + Send + 'a>> {
         Box::pin(async move {
             self.read().await.map_err(|e| match e {
                 MuxError::Io(msg) => buf_io::Error::ReadError(msg),
@@ -207,7 +220,9 @@ impl Reader for PacketReader {
 }
 
 impl Reader for StreamReader {
-    fn read_multi_buffer<'a>(&'a mut self) -> Pin<Box<dyn std::future::Future<Output = buf_io::Result<MultiBuffer>> + Send + 'a>> {
+    fn read_multi_buffer<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn std::future::Future<Output = buf_io::Result<MultiBuffer>> + Send + 'a>> {
         Box::pin(async move {
             self.read().await.map_err(|e| match e {
                 MuxError::Io(msg) => buf_io::Error::ReadError(msg),
@@ -219,12 +234,14 @@ impl Reader for StreamReader {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Cursor;
-    use xray_common::net::address::Address;
-    use xray_common::net::network::Network;
-    use xray_common::net::port::Port;
-    use xray_common::serial::write_uint16;
+
+    use xray_common::{
+        net::{address::Address, network::Network, port::Port},
+        serial::write_uint16,
+    };
+
+    use super::*;
 
     fn create_test_reader(data: Vec<u8>) -> Box<dyn Reader> {
         buf_io::new_reader(Cursor::new(data))

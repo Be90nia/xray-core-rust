@@ -7,13 +7,14 @@
 //! **跳过范围**（IO 边界）：`init()` 全局 `RegisterConfig` —— 改由
 //! [`set_shared_multi`] 显式注册共享引擎（见其文档）。
 
-use std::net::IpAddr;
-use std::sync::{Arc, LazyLock};
+use std::{
+    net::IpAddr,
+    sync::{Arc, LazyLock},
+};
 
 use ipnet::IpNet;
 use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
-
 #[cfg(test)]
 use xray_common::net::address::Address;
 
@@ -55,10 +56,7 @@ impl FakeDnsPool {
     /// 对应 Go `dns.FakeIPv4Pool`。
     #[must_use]
     pub fn default_v4() -> Self {
-        Self {
-            ip_pool: "240.0.0.0/4".to_string(),
-            lru_size: 65535,
-        }
+        Self { ip_pool: "240.0.0.0/4".to_string(), lru_size: 65535 }
     }
 }
 
@@ -78,9 +76,7 @@ impl Holder {
     #[must_use]
     pub fn with_config(conf: FakeDnsPool) -> Self {
         Self {
-            inner: Mutex::new(HolderInner {
-                domain_to_ip: LruCache::unbounded(),
-            }),
+            inner: Mutex::new(HolderInner { domain_to_ip: LruCache::unbounded() }),
             // 暂填一个占位 range，initialize() 才会真正设置。
             ip_range: "0.0.0.0/32".parse().unwrap(),
             config: conf,
@@ -114,18 +110,16 @@ impl Holder {
         // 子网空间检查。
         let rooms = subnet_rooms(&ip_range);
         if rooms < u32::BITS && (lru_size as u64) >= (1u64 << rooms) {
-            return Err(DnsError::LruBiggerThanSubnet {
-                lru: lru_size,
-                rooms,
-            });
+            return Err(DnsError::LruBiggerThanSubnet { lru: lru_size, rooms });
         }
 
         self.ip_range = ip_range;
         let mut inner = self.inner.lock();
-        inner.domain_to_ip = LruCache::new(std::num::NonZeroUsize::new(lru_size).unwrap_or_else(|| {
-            // ponytail: lru_size 为 0 时退回 1（Go 行为是 panic）。
-            std::num::NonZeroUsize::new(1).unwrap()
-        }));
+        inner.domain_to_ip =
+            LruCache::new(std::num::NonZeroUsize::new(lru_size).unwrap_or_else(|| {
+                // ponytail: lru_size 为 0 时退回 1（Go 行为是 panic）。
+                std::num::NonZeroUsize::new(1).unwrap()
+            }));
         Ok(())
     }
 
@@ -170,12 +164,7 @@ impl Holder {
     }
 
     /// 三参数版本（按 v4/v6 启用过滤）。对应 Go `GetFakeIPForDomain3`。
-    pub fn get_fake_ip_for_domain_3(
-        &self,
-        domain: &str,
-        ipv4: bool,
-        ipv6: bool,
-    ) -> Vec<IpAddr> {
+    pub fn get_fake_ip_for_domain_3(&self, domain: &str, ipv4: bool, ipv6: bool) -> Vec<IpAddr> {
         let is_v6 = matches!(self.ip_range, IpNet::V6(_));
         if (is_v6 && ipv6) || (!is_v6 && ipv4) {
             self.get_fake_ip_for_domain(domain)
@@ -193,11 +182,7 @@ impl Holder {
             return None;
         }
         let inner = self.inner.lock();
-        inner
-            .domain_to_ip
-            .iter()
-            .find(|(_, v)| **v == ip)
-            .map(|(k, _)| k.clone())
+        inner.domain_to_ip.iter().find(|(_, v)| **v == ip).map(|(k, _)| k.clone())
     }
 
     /// 当前池类型（IPv4/IPv6）。
@@ -224,12 +209,12 @@ impl Holder {
                 let base = u32::from(v);
                 let new = base.wrapping_add(ts as u32);
                 IpAddr::V4(std::net::Ipv4Addr::from(new))
-            }
+            },
             IpAddr::V6(v) => {
                 let mut octets = v.octets();
                 add_to_be_bytes(&mut octets, ts);
                 IpAddr::V6(std::net::Ipv6Addr::from(octets))
-            }
+            },
         }
     }
 }
@@ -270,12 +255,7 @@ impl HolderMulti {
     }
 
     /// 按 v4/v6 过滤。
-    pub fn get_fake_ip_for_domain_3(
-        &self,
-        domain: &str,
-        ipv4: bool,
-        ipv6: bool,
-    ) -> Vec<IpAddr> {
+    pub fn get_fake_ip_for_domain_3(&self, domain: &str, ipv4: bool, ipv6: bool) -> Vec<IpAddr> {
         let mut all = Vec::new();
         for h in &self.holders {
             all.extend(h.get_fake_ip_for_domain_3(domain, ipv4, ipv6));
@@ -319,10 +299,7 @@ fn subnet_rooms(net: &IpNet) -> u32 {
 
 fn now_millis() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -337,8 +314,9 @@ fn address_to_ip(addr: &Address) -> Option<IpAddr> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::Ipv4Addr;
+
+    use super::*;
 
     #[test]
     fn holder_initializes_with_v4_pool() {
@@ -351,12 +329,10 @@ mod tests {
     #[test]
     fn holder_rejects_lru_bigger_than_subnet() {
         // /30 只有 4 个地址（2 bit），LRU 16 太大。
-        let mut h = Holder::with_config(FakeDnsPool {
-            ip_pool: "10.0.0.0/30".to_string(),
-            lru_size: 16,
-        });
+        let mut h =
+            Holder::with_config(FakeDnsPool { ip_pool: "10.0.0.0/30".to_string(), lru_size: 16 });
         match h.initialize() {
-            Err(DnsError::LruBiggerThanSubnet { lru: 16, rooms: 2 }) => {}
+            Err(DnsError::LruBiggerThanSubnet { lru: 16, rooms: 2 }) => {},
             other => panic!("expected LruBiggerThanSubnet, got {other:?}"),
         }
     }
@@ -390,10 +366,7 @@ mod tests {
     fn get_domain_returns_original_domain_for_known_ip() {
         let h = Holder::new_default().unwrap();
         let ip = h.get_fake_ip_for_domain("example.com")[0];
-        assert_eq!(
-            h.get_domain_from_fake_dns(ip).as_deref(),
-            Some("example.com")
-        );
+        assert_eq!(h.get_domain_from_fake_dns(ip).as_deref(), Some("example.com"));
     }
 
     #[test]
@@ -415,16 +388,13 @@ mod tests {
         let ips = multi.get_fake_ip_for_domain("x.com");
         assert_eq!(ips.len(), 1);
         assert!(multi.is_ip_in_pool(ips[0]));
-        assert_eq!(
-            multi.get_domain_from_fake_dns(ips[0]).as_deref(),
-            Some("x.com")
-        );
+        assert_eq!(multi.get_domain_from_fake_dns(ips[0]).as_deref(), Some("x.com"));
     }
 
     #[test]
     fn holder_multi_rejects_empty_pools() {
         match HolderMulti::new(Vec::new()) {
-            Err(DnsError::InvalidFakeDnsSetting) => {}
+            Err(DnsError::InvalidFakeDnsSetting) => {},
             Err(e) => panic!("expected InvalidFakeDnsSetting, got error: {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
@@ -441,12 +411,9 @@ mod tests {
 
     #[test]
     fn start_rejects_empty_config() {
-        let h = Holder::with_config(FakeDnsPool {
-            ip_pool: String::new(),
-            lru_size: 0,
-        });
+        let h = Holder::with_config(FakeDnsPool { ip_pool: String::new(), lru_size: 0 });
         match h.start() {
-            Err(DnsError::InvalidFakeDnsSetting) => {}
+            Err(DnsError::InvalidFakeDnsSetting) => {},
             other => panic!("expected InvalidFakeDnsSetting, got {other:?}"),
         }
     }

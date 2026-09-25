@@ -5,8 +5,7 @@
 //!
 //! This crate provides:
 //! - Protobuf-generated types via prost (`xray.geodata` package)
-//! - Convenience methods for constructing and querying
-//!   GeoIP/GeoSite data
+//! - Convenience methods for constructing and querying GeoIP/GeoSite data
 //! - Domain and IP matchers for routing decisions
 //!
 //! ## Type hierarchy
@@ -24,10 +23,7 @@
 pub mod pb {
     pub mod xray {
         pub mod geodata {
-            include!(concat!(
-                env!("OUT_DIR"),
-                "/xray.geodata.rs"
-            ));
+            include!(concat!(env!("OUT_DIR"), "/xray.geodata.rs"));
         }
     }
 
@@ -42,6 +38,6 @@ pub mod weak_cache;
 // Re-export the most commonly used types at crate root for
 // convenience.
 pub use pb::{
-    Cidr, CidrRule, Domain, DomainRule, GeoIp, GeoIpList,
-    GeoIpRule, GeoSite, GeoSiteList, GeoSiteRule, IpRule,
+    Cidr, CidrRule, Domain, DomainRule, GeoIp, GeoIpList, GeoIpRule, GeoSite, GeoSiteList,
+    GeoSiteRule, IpRule,
 };

@@ -3,21 +3,21 @@
 //! 验证完整代理链路：客户端通过 SOCKS5 代理连接 echo 服务器，数据双向流通。
 //! 这是 SystemDialer/SystemListener/bridge_connections/freedom/socks 协同工作的端到端证明。
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
+use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
 use xray_features::inbound::InboundHandler;
-use xray_proxy_socks::protocol::Host;
-use xray_proxy_socks::server::{SocksServer, socks5_server_handshake};
-use xray_proxy_socks::config::{AuthType, ServerConfig};
-use xray_transport::bridge::bridge_connections;
-use xray_transport::connection::TcpConnection;
-use xray_transport::sockopt::SocketOptions;
-use xray_transport::system_dialer::dial_system;
+use xray_proxy_socks::{
+    config::{AuthType, ServerConfig},
+    protocol::Host,
+    server::{SocksServer, socks5_server_handshake},
+};
+use xray_transport::{
+    bridge::bridge_connections, connection::TcpConnection, sockopt::SocketOptions,
+    system_dialer::dial_system,
+};
 
 /// 手动组装 socks proxy → dial_system → bridge 链路，验证 echo 往返。
 #[tokio::test]
@@ -40,13 +40,8 @@ async fn socks5_proxy_to_echo_target_e2e() {
     tokio::spawn(async move {
         let (mut client_stream, _) = proxy_listener.accept().await.unwrap();
         // SOCKS5 handshake（NoAuth）
-        let config = ServerConfig {
-            auth_type: AuthType::NoAuth,
-            ..Default::default()
-        };
-        let dest = socks5_server_handshake(&mut client_stream, &config)
-            .await
-            .expect("handshake");
+        let config = ServerConfig { auth_type: AuthType::NoAuth, ..Default::default() };
+        let dest = socks5_server_handshake(&mut client_stream, &config).await.expect("handshake");
         // SocksRequest::TcpConnect(SocksAddr) → Destination
         let dest_addr = match dest {
             xray_proxy_socks::server::SocksRequest::TcpConnect(addr) => addr,
@@ -59,9 +54,8 @@ async fn socks5_proxy_to_echo_target_e2e() {
         };
         let destination = Destination::new(address, Port::new(dest_addr.port), Network::TCP);
         // dial target
-        let target_conn = dial_system(&destination, &SocketOptions::default())
-            .await
-            .expect("dial target");
+        let target_conn =
+            dial_system(&destination, &SocketOptions::default()).await.expect("dial target");
         // bridge client ↔ target
         let client_conn: Box<dyn xray_transport::connection::Connection> =
             Box::new(TcpConnection::new(client_stream));
@@ -104,18 +98,16 @@ async fn socks5_proxy_to_echo_target_e2e() {
 /// 这是 SocksServer lifecycle 端到端验证。
 #[tokio::test]
 async fn socks_server_start_and_handshake_lifecycle() {
-    let server = SocksServer::new("test-socks", ServerConfig {
-        auth_type: AuthType::NoAuth,
-        ..Default::default()
-    });
+    let server = SocksServer::new(
+        "test-socks",
+        ServerConfig { auth_type: AuthType::NoAuth, ..Default::default() },
+    );
     server.start().await.unwrap();
     let port = server.bound_port().await;
     assert!(port > 0, "bound port should be non-zero after start");
 
     // 客户端连接，做 greeting + method negotiation
-    let mut client = TcpStream::connect(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
+    let mut client = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
     client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
     let mut resp = [0u8; 2];
     client.read_exact(&mut resp).await.unwrap();

@@ -49,17 +49,10 @@ impl WeightManager {
                 let regex = Regex::new(&w.r#match)?;
                 settings.push(WeightSetting::Regex { regex, value });
             } else {
-                settings.push(WeightSetting::Literal {
-                    tag: w.r#match.clone(),
-                    value,
-                });
+                settings.push(WeightSetting::Literal { tag: w.r#match.clone(), value });
             }
         }
-        Ok(Self {
-            settings,
-            cache: Mutex::new(std::collections::HashMap::new()),
-            default_weight,
-        })
+        Ok(Self { settings, cache: Mutex::new(std::collections::HashMap::new()), default_weight })
     }
 
     /// 取 tag 的权重。命中规则返回规则值，否则返回默认值。
@@ -101,12 +94,8 @@ impl WeightManager {
 /// 从字符串中提取第一个数字（Go `numberFinder`，为调用者保留工具）。
 pub fn number_finder(s: &str) -> Option<f64> {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        Regex::new(r"(\d+(\.\d+)?)").expect("number regex compiles")
-    });
-    re.captures(s)
-        .and_then(|c| c.get(1))
-        .and_then(|m| m.as_str().parse::<f64>().ok())
+    let re = RE.get_or_init(|| Regex::new(r"(\d+(\.\d+)?)").expect("number regex compiles"));
+    re.captures(s).and_then(|c| c.get(1)).and_then(|m| m.as_str().parse::<f64>().ok())
 }
 
 #[cfg(test)]
@@ -114,11 +103,7 @@ mod tests {
     use super::*;
 
     fn sw(regexp: bool, r#match: &str, value: f32) -> StrategyWeight {
-        StrategyWeight {
-            regexp,
-            r#match: r#match.into(),
-            value,
-        }
+        StrategyWeight { regexp, r#match: r#match.into(), value }
     }
 
     #[test]

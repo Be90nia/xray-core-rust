@@ -20,8 +20,8 @@
 //! hyper 1.x 已经在内部完整处理 HTTP/1.1 连接管理：
 //!
 //! - **响应 buffer**：hyper 自带 `BufReader` 等价机制，不需要应用层包装
-//! - **连接池**：`hyper-util::client::legacy::Client` 内置 H1/H2 连接池
-//!   （`pool_idle_timeout` / `pool_max_idle_per_host` 配置）
+//! - **连接池**：`hyper-util::client::legacy::Client` 内置 H1/H2 连接池 （`pool_idle_timeout` /
+//!   `pool_max_idle_per_host` 配置）
 //! - **chunked transfer**：hyper 自动处理 chunked encoding
 //! - **未读响应跟踪**：hyper 内部 state machine 管理，不需要手动 count
 //!

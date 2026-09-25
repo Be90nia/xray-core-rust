@@ -6,8 +6,10 @@
 //! ## 当前支持
 //!
 //! - **freedom**：完整支持（无 settings）
-//! - **vless**：JSON 解析 `vnext` → [`VlessOutboundConfig`] → `make_dial_fn`（raw TCP，不含 streamSettings）
-//! - **trojan**：JSON 解析 `servers` → [`TrojanOutboundConfig`] → `make_dial_fn`（raw TCP，不含 streamSettings）
+//! - **vless**：JSON 解析 `vnext` → [`VlessOutboundConfig`] → `make_dial_fn`（raw TCP，不含
+//!   streamSettings）
+//! - **trojan**：JSON 解析 `servers` → [`TrojanOutboundConfig`] → `make_dial_fn`（raw TCP，不含
+//!   streamSettings）
 //! - **blackhole**：JSON 解析 `response.type` → [`BlackholeHandler`]（DispatchHandler，不拨号）
 //! - **socks**：JSON 解析 `servers[0]` → [`SocksClient`] + `make_socks_dial_fn`（SOCKS5 outbound）
 //! - **vmess**：JSON 解析 `vnext[0]` → `VmessOutboundConfig` → `make_vmess_dial_fn`
@@ -20,44 +22,43 @@
 //! - **dns**：JSON 解析 → `DnsDispatchBridge`（拦截 DNS 查询并转发）
 //! - **loopback**：JSON 解析 → LoopbackHandler（直接 impl DispatchHandler）
 //! - **http**：JSON 解析 `servers[0]` → `HttpOutboundConfig` → `make_http_dial_fn`
-//! - **dokodemo**：JSON 解析 → `DokodemoOutboundConfig` → `make_dokodemo_dial_fn`（拨号到配置的 rewrite_address:rewrite_port）
+//! - **dokodemo**：JSON 解析 → `DokodemoOutboundConfig` → `make_dokodemo_dial_fn`（拨号到配置的
+//!   rewrite_address:rewrite_port）
 //! - **tun**：`make_tun_dial_fn`（系统拨号，TUN 路由由 OS 处理）
 //! ## streamSettings
 //!
 //! 当前不处理 streamSettings（TLS/WS/Reality）—— vless/trojan 走裸 TCP `dial_system`。
 //! transport 层补全后，`try_build_handler` 将在此注入 TLS-wrapped 拨号闭包。
 
-use std::str::FromStr;
-use std::sync::Arc;
+use std::{str::FromStr, sync::Arc};
 
-use xray_app_dispatcher::default::{DefaultDispatcher, DialBridge, PinFuture, SimpleOhm, SniffingRequest};
-use xray_app_dispatcher::DispatchHandler;
-use xray_app_dispatcher::OutboundHandlerManager;
-use xray_proxy_loopback::{LoopbackError, LoopbackFuture, LoopbackSink};
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::port::Port;
-use xray_common::uuid::UUID;
-use xray_proto::xray::core::OutboundHandlerConfig as OutboundHandlerConfigProto;
+use xray_app_dispatcher::{
+    DispatchHandler, OutboundHandlerManager,
+    default::{DefaultDispatcher, DialBridge, PinFuture, SimpleOhm, SniffingRequest},
+};
+use xray_common::{
+    net::{address::Address, destination::Destination, port::Port},
+    uuid::UUID,
+};
 use xray_conf::{BuiltConfig, BuiltOutbound};
 use xray_features::Result;
-use xray_proxy_trojan::{MemoryAccount, TrojanOutboundConfig};
-use xray_proxy_vless::VlessOutboundConfig;
-use xray_transport::dialer::StreamSettings;
-use xray_transport::link::Link;
 // mux outbound：client 数据路径
 use xray_mux::client::{DialingWorkerFactory, IncrementalWorkerPicker, UnderlyingSlot};
 use xray_mux::session::ClientStrategy;
+use xray_proto::xray::core::OutboundHandlerConfig as OutboundHandlerConfigProto;
+use xray_proxy_freedom::{Config as FreedomConfig, DomainStrategy, Fragment, Noise};
 // 补全协议注册
 use xray_proxy_hysteria::HysteriaConfig;
-use xray_proxy_freedom::{Config as FreedomConfig, DomainStrategy, Fragment, Noise};
+use xray_proxy_loopback::{LoopbackError, LoopbackFuture, LoopbackSink};
+use xray_proxy_trojan::{MemoryAccount, TrojanOutboundConfig};
+use xray_proxy_vless::VlessOutboundConfig;
 use xray_proxy_wireguard::{DeviceConfig, DomainStrategy as WgDomainStrategy};
-
+use xray_transport::{dialer::StreamSettings, link::Link};
 
 /// Dispatcher → LoopbackSink 桥接。
 ///
-/// `DefaultDispatcher` 定义在 `xray-app-dispatcher`，`LoopbackSink` trait 在 `xray-proxy-loopback`，
-/// 两者有循环依赖不能直接 impl。此 wrapper 在 `xray-core` 层桥接。
+/// `DefaultDispatcher` 定义在 `xray-app-dispatcher`，`LoopbackSink` trait 在
+/// `xray-proxy-loopback`， 两者有循环依赖不能直接 impl。此 wrapper 在 `xray-core` 层桥接。
 /// 由生产装配（functions.rs register_outbounds 调用点）构造注入（票 rdcc）。
 #[derive(Debug)]
 pub(crate) struct DispatcherLoopbackSink {
@@ -82,15 +83,10 @@ impl LoopbackSink for DispatcherLoopbackSink {
         // Go loopback.go:32-36：content.SniffingRequest = l.sniffingRequest 注入重分发；
         // loopback.go:37-44：新 Inbound{Tag: l.inboundTag} 进 ctx——Rust 经
         // access.inbound_tag 供 inboundTag 路由规则匹配（from/email 留空）。
-        let access = Some(xray_app_dispatcher::AccessContext {
-            inbound_tag,
-            ..Default::default()
-        });
+        let access = Some(xray_app_dispatcher::AccessContext { inbound_tag, ..Default::default() });
         match self.inner.dispatch_link(&destination, link, &sniffing, access, None) {
             Ok(()) => Box::pin(async { Ok(()) }),
-            Err(e) => Box::pin(async move {
-                Err(LoopbackError::DispatchFailed(e.to_string()))
-            }),
+            Err(e) => Box::pin(async move { Err(LoopbackError::DispatchFailed(e.to_string())) }),
         }
     }
 }
@@ -162,15 +158,17 @@ pub fn register_outbounds(
     let mut mux_bridges: Vec<(Arc<MuxBridge>, Option<String>)> = Vec::new();
     // freedom 默认 final rule 的入站选择（Go getDefaultFinalRule(inbound.Name) :154-169）：
     // inbound tag → 协议名 → DefaultRuleType。无匹配协议的入站不入表（= 无默认规则）。
-    let inbound_default_rules: std::collections::HashMap<String, xray_proxy_freedom::DefaultRuleType> =
-        built
-            .inbounds
-            .iter()
-            .filter_map(|ib| {
-                xray_proxy_freedom::get_default_rule_type(&ib.entry.kind)
-                    .map(|rule| (ib.tag.clone(), rule))
-            })
-            .collect();
+    let inbound_default_rules: std::collections::HashMap<
+        String,
+        xray_proxy_freedom::DefaultRuleType,
+    > = built
+        .inbounds
+        .iter()
+        .filter_map(|ib| {
+            xray_proxy_freedom::get_default_rule_type(&ib.entry.kind)
+                .map(|rule| (ib.tag.clone(), rule))
+        })
+        .collect();
     for (i, ob) in built.outbounds.iter().enumerate() {
         match try_build_handler(
             ob,
@@ -199,14 +197,14 @@ pub fn register_outbounds(
                     default = ohm.get_default_handler().as_ref().map(|h| h.tag() == ob.tag).unwrap_or(false),
                     "outbound registered"
                 );
-            }
+            },
             Err(BuildError::Unsupported(protocol)) => {
                 tracing::warn!(
                     tag = %ob.tag,
                     protocol = %protocol,
                     "outbound protocol not yet supported, skipping"
                 );
-            }
+            },
             Err(BuildError::Parse(e)) => {
                 tracing::warn!(
                     tag = %ob.tag,
@@ -214,13 +212,14 @@ pub fn register_outbounds(
                     error = %e,
                     "failed to parse outbound config, skipping"
                 );
-            }
+            },
         }
     }
 
     // Phase 2: 设置代理链——为有 proxy_chain_tag 的 DialBridge 注入 outbound_manager
     if !chain_bridges.is_empty() {
-        let ohm_arc: Arc<dyn xray_app_dispatcher::OutboundHandlerManager> = Arc::new(OhmRef { inner: ohm });
+        let ohm_arc: Arc<dyn xray_app_dispatcher::OutboundHandlerManager> =
+            Arc::new(OhmRef { inner: ohm });
         for (bridge, chain_tag) in chain_bridges {
             bridge.set_proxy_chain(chain_tag, ohm_arc.clone());
             tracing::debug!(
@@ -278,14 +277,14 @@ pub fn register_outbounds(
             Some(None) => {
                 tracing::warn!(tag = %bridge.tag(), via = ?via_tag, "mux via tag not found, fallback default");
                 ohm.get_default_handler()
-            }
+            },
             None => ohm.get_default_handler(),
         };
         match underlying {
             Some(h) => {
                 bridge.set_underlying(h);
                 tracing::debug!(tag = %bridge.tag(), "mux underlying configured");
-            }
+            },
             None => tracing::warn!(tag = %bridge.tag(), "mux outbound has no underlying handler"),
         }
     }
@@ -309,12 +308,12 @@ fn parse_send_through(
 
     if let Some(prefix) = prefix_part {
         // CIDR 形态：地址必须可解析为 IP（Go ParseRandomIP 组 `ip+"/"+prefix`）
-        let base: std::net::IpAddr = addr_part.parse().map_err(|_| {
-            BuildError::Parse(format!("unable to send through: {raw}"))
-        })?;
-        let prefix: u8 = prefix.parse().map_err(|_| {
-            BuildError::Parse(format!("invalid sendThrough CIDR prefix: {raw}"))
-        })?;
+        let base: std::net::IpAddr = addr_part
+            .parse()
+            .map_err(|_| BuildError::Parse(format!("unable to send through: {raw}")))?;
+        let prefix: u8 = prefix
+            .parse()
+            .map_err(|_| BuildError::Parse(format!("invalid sendThrough CIDR prefix: {raw}")))?;
         let max = if base.is_ipv4() { 32 } else { 128 };
         if prefix > max {
             return Err(BuildError::Parse(format!("invalid sendThrough CIDR prefix: {raw}")));
@@ -349,10 +348,8 @@ fn wrap_dial_with_send_through(
         Box::pin(async move {
             match spec.resolve() {
                 Some(ip) => {
-                    xray_transport::system_dialer::DIAL_SRC
-                        .scope(Some(ip), dial(&dest))
-                        .await
-                }
+                    xray_transport::system_dialer::DIAL_SRC.scope(Some(ip), dial(&dest)).await
+                },
                 None => dial(&dest).await,
             }
         })
@@ -374,7 +371,10 @@ fn wrap_bridge(
     // sm80③/czwu：session policy（Go freedom.go:393）。非 freedom 出站固定
     // level 0（出站无 per-outbound userLevel，仅 freedom settings 有）。
     policy_manager: Option<&dyn xray_features::policy::PolicyManager>,
-) -> std::result::Result<(Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>), BuildError> {
+) -> std::result::Result<
+    (Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>),
+    BuildError,
+> {
     let dial_fn = match target_strategy {
         Some(s) => wrap_dial_with_target_strategy(dial_fn, s, dns.cloned()),
         None => dial_fn,
@@ -418,26 +418,19 @@ pub fn build_single_outbound(
 ///
 /// TypedMessage 约定（与 CLI `api_exec::build_typed_message` 一致）：
 /// - `proxy_settings.type`：`xray.proxy.{protocol}.Config`，value = 协议 settings JSON
-/// - `sender_settings.type`：`xray.app.proxyman.outbound`，value = sender JSON
-///   （`streamSettings` 字段提升为 `BuiltOutbound.stream_settings_json`）
+/// - `sender_settings.type`：`xray.app.proxyman.outbound`，value = sender JSON （`streamSettings`
+///   字段提升为 `BuiltOutbound.stream_settings_json`）
 pub fn built_outbound_from_proto(
     cfg: &OutboundHandlerConfigProto,
 ) -> std::result::Result<BuiltOutbound, BuildError> {
-    let type_url = cfg
-        .proxy_settings
-        .as_ref()
-        .map(|m| m.r#type.as_str())
-        .unwrap_or_default();
+    let type_url = cfg.proxy_settings.as_ref().map(|m| m.r#type.as_str()).unwrap_or_default();
     // 协议名：`xray.proxy.freedom.Config` → `freedom`。
     let protocol = type_url
         .strip_prefix("xray.proxy.")
         .and_then(|s| s.strip_suffix(".Config"))
         .ok_or_else(|| BuildError::Unsupported(type_url.to_string()))?;
     let proxy_json: serde_json::Value = serde_json::from_slice(
-        &cfg.proxy_settings
-            .as_ref()
-            .map(|m| m.value.clone())
-            .unwrap_or_default(),
+        &cfg.proxy_settings.as_ref().map(|m| m.value.clone()).unwrap_or_default(),
     )
     .map_err(|e| BuildError::Parse(e.to_string()))?;
     let mut stream_settings_json = None;
@@ -479,12 +472,7 @@ impl ApiOutboundRuntime {
 }
 
 impl xray_app_commander::OutboundRuntime for ApiOutboundRuntime {
-
-
-    fn add_outbound(
-        &self,
-        cfg: &OutboundHandlerConfigProto,
-    ) -> std::result::Result<(), String> {
+    fn add_outbound(&self, cfg: &OutboundHandlerConfigProto) -> std::result::Result<(), String> {
         let ob = built_outbound_from_proto(cfg).map_err(|e| format!("{e:?}"))?;
         if self.ohm.get_handler(&cfg.tag).is_some() {
             return Err(format!("existing tag found: {}", cfg.tag));
@@ -495,11 +483,7 @@ impl xray_app_commander::OutboundRuntime for ApiOutboundRuntime {
     }
 
     fn remove_outbound(&self, tag: &str) -> std::result::Result<(), String> {
-        if self.ohm.remove(tag) {
-            Ok(())
-        } else {
-            Err(format!("tag not found: {tag}"))
-        }
+        if self.ohm.remove(tag) { Ok(()) } else { Err(format!("tag not found: {tag}")) }
     }
 
     fn list_outbound_tags(&self) -> Vec<String> {
@@ -531,9 +515,10 @@ pub(crate) fn parse_udp443_policies(
             tracing::warn!(tag = %ob.tag, "invalid mux config, ignoring udp443 policy");
             continue;
         };
-        if let Some(policy) =
-            xray_app_dispatcher::default::Udp443Policy::from_mux(cfg.enabled, &cfg.xudp_proxy_udp_443)
-        {
+        if let Some(policy) = xray_app_dispatcher::default::Udp443Policy::from_mux(
+            cfg.enabled,
+            &cfg.xudp_proxy_udp_443,
+        ) {
             map.insert(ob.tag.clone(), policy);
         }
     }
@@ -553,7 +538,10 @@ fn try_build_handler(
     dns: Option<&Arc<xray_app_dns::DnsService>>,
     inbound_default_rules: &std::collections::HashMap<String, xray_proxy_freedom::DefaultRuleType>,
     policy_manager: Option<&dyn xray_features::policy::PolicyManager>,
-) -> std::result::Result<(Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>), BuildError> {
+) -> std::result::Result<
+    (Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>),
+    BuildError,
+> {
     let (handler, bridge_ref, proxy_chain_tag) = build_protocol_handler(
         ob,
         loopback_sink,
@@ -572,7 +560,7 @@ fn try_build_handler(
             match outbound_xudp_mode(ob) {
                 XudpMode::Direct => mux_bridge.udp_direct = true,
                 XudpMode::Manager(n) => mux_bridge.attach_xudp_manager(n),
-                XudpMode::Carrier => {}
+                XudpMode::Carrier => {},
             }
             mux_bridge.set_underlying(Arc::clone(&handler));
             return Ok((
@@ -594,11 +582,7 @@ fn outbound_mux_concurrency(ob: &BuiltOutbound) -> Option<u32> {
     if !cfg.enabled || cfg.concurrency < 0 {
         return None;
     }
-    Some(if cfg.concurrency == 0 {
-        8
-    } else {
-        cfg.concurrency as u32
-    })
+    Some(if cfg.concurrency == 0 { 8 } else { cfg.concurrency as u32 })
 }
 
 /// xudpConcurrency 三态（Go `NewHandler` :143-164）：
@@ -660,15 +644,15 @@ fn build_protocol_handler(
     // sm80③/czwu：session policy manager（Go freedom.go:393/222-225）。
     // freedom 按 settings.userLevel 查档位，其余协议固定 level 0。
     policy_manager: Option<&dyn xray_features::policy::PolicyManager>,
-) -> std::result::Result<(Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>), BuildError> {
+) -> std::result::Result<
+    (Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>),
+    BuildError,
+> {
     let proxy_chain_tag = parse_proxy_chain_tag(ob.proxy_settings_json.as_ref());
     // targetStrategy（bd bqm）：字符串 → 枚举；AsIs（无策略）不包装
     // （Go handler.go:184 `HasStrategy()` 门控）
-    let target_strategy = ob
-        .target_strategy
-        .as_deref()
-        .and_then(parse_target_strategy)
-        .filter(|s| s.has_strategy());
+    let target_strategy =
+        ob.target_strategy.as_deref().and_then(parse_target_strategy).filter(|s| s.has_strategy());
     // sendThrough（bd 7zc）：outbound 顶层字段 → 源地址规格（Go xray.go:287-301）
     let send_through = parse_send_through(&ob.send_through)?;
     // sockopt 数值/类型启动期硬错（Go 解码期语义）。
@@ -683,8 +667,10 @@ fn build_protocol_handler(
             let domain_strategy = config.domain_strategy;
             // czwu③：freedom settings.userLevel → 出站腿 policy 档位
             // （Go freedom.go:222-225 policyManager.ForLevel(config.UserLevel)）
-            let bridge_policy = policy_manager
-                .map(|pm| xray_features::policy::PolicyManager::policy_for_level(pm, config.user_level).timeout);
+            let bridge_policy = policy_manager.map(|pm| {
+                xray_features::policy::PolicyManager::policy_for_level(pm, config.user_level)
+                    .timeout
+            });
             // #6742（Go freedom.go:193-198 Init 早退 + :263-265 defaultRule=nil）：
             // dialerProxy（sockopt.dialerProxy，含 transportLayer 注入）或 proxy_chain
             // （proxySettings.tag）时 freedom 非最终出站——finalRules 不构建（配了则
@@ -715,10 +701,8 @@ fn build_protocol_handler(
                     .collect()
             };
             // sockopt.dialerProxy 下沉拨号层（Go freedom.go:58 + dialer.go:270-279 redirect）
-            let dial_fn = xray_proxy_freedom::make_freedom_dial_fn_with_sockopt(
-                config,
-                stream_dialer_proxy,
-            );
+            let dial_fn =
+                xray_proxy_freedom::make_freedom_dial_fn_with_sockopt(config, stream_dialer_proxy);
             let dial_fn = match target_strategy {
                 Some(s) => wrap_dial_with_target_strategy(dial_fn, s, dns.cloned()),
                 None => dial_fn,
@@ -737,13 +721,12 @@ fn build_protocol_handler(
             // txno-splice：freedom 是 Go `ob.CanSpliceCopy = 1`（freedom.go:260）
             // 的唯一置 1 点——DialBridge 桥接判定处据此放行 splice 快路径准入。
             tcp_bridge.set_splice_outbound(true);
-            let mut bridge = xray_proxy_freedom::FreedomDispatchBridge::from_bridge(
-                Arc::clone(&tcp_bridge),
-            )
-            .with_noises(noises)
-            .with_destination_override(destination_override)
-            .with_final_rules(final_rules)
-            .with_domain_strategy(domain_strategy);
+            let mut bridge =
+                xray_proxy_freedom::FreedomDispatchBridge::from_bridge(Arc::clone(&tcp_bridge))
+                    .with_noises(noises)
+                    .with_destination_override(destination_override)
+                    .with_final_rules(final_rules)
+                    .with_domain_strategy(domain_strategy);
             if !uses_dialer_proxy {
                 bridge = bridge.with_inbound_default_rules(inbound_default_rules.clone());
             }
@@ -753,19 +736,37 @@ fn build_protocol_handler(
             let handler = Arc::new(bridge) as Arc<dyn DispatchHandler>;
             let bridge_ref = if proxy_chain_tag.is_some() { Some(tcp_bridge) } else { None };
             Ok((handler, bridge_ref, proxy_chain_tag))
-        }
+        },
         "vless" => {
             let config = parse_vless_config(&ob.entry.data)?;
-            let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
+            let config =
+                config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_vless::make_vless_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
-        }
+            wrap_bridge(
+                ob.tag.clone(),
+                dial_fn,
+                &proxy_chain_tag,
+                target_strategy,
+                dns,
+                send_through.as_ref(),
+                policy_manager,
+            )
+        },
         "trojan" => {
             let config = parse_trojan_config(&ob.entry.data)?;
-            let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
+            let config =
+                config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_trojan::make_trojan_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
-        }
+            wrap_bridge(
+                ob.tag.clone(),
+                dial_fn,
+                &proxy_chain_tag,
+                target_strategy,
+                dns,
+                send_through.as_ref(),
+                policy_manager,
+            )
+        },
         "blackhole" => {
             let response = parse_blackhole_response(&ob.entry.data)?;
             let handler = Arc::new(xray_proxy_blackhole::BlackholeHandler::with_response(
@@ -773,7 +774,7 @@ fn build_protocol_handler(
                 response,
             )) as Arc<dyn DispatchHandler>;
             Ok((handler, None, None))
-        }
+        },
         "socks" => {
             let (server_addr, auth) = parse_socks_outbound_config(&ob.entry.data)?;
             let client = Arc::new(match auth {
@@ -785,8 +786,16 @@ fn build_protocol_handler(
                 ),
             });
             let dial_fn = xray_proxy_socks::make_socks_dial_fn(client);
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
-        }
+            wrap_bridge(
+                ob.tag.clone(),
+                dial_fn,
+                &proxy_chain_tag,
+                target_strategy,
+                dns,
+                send_through.as_ref(),
+                policy_manager,
+            )
+        },
         "mux" => {
             let (concurrency, via_tag) = parse_mux_config(&ob.entry.data)?;
             let (bridge, _slot) = MuxBridge::new(ob.tag.clone(), concurrency);
@@ -794,20 +803,37 @@ fn build_protocol_handler(
             mux_bridges.push((Arc::clone(&bridge), via_tag));
             let handler = bridge as Arc<dyn DispatchHandler>;
             Ok((handler, None, None))
-        }
+        },
         "vmess" => {
             let config = xray_proxy_vmess::parse_vmess_config(&ob.entry.data)?;
-            let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
+            let config =
+                config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_vmess::make_vmess_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
-        }
+            wrap_bridge(
+                ob.tag.clone(),
+                dial_fn,
+                &proxy_chain_tag,
+                target_strategy,
+                dns,
+                send_through.as_ref(),
+                policy_manager,
+            )
+        },
         "shadowsocks" => {
             let config = xray_proxy_ss::parse_ss_config(&ob.entry.data)?;
             let config =
                 config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_ss::make_ss_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
-        }
+            wrap_bridge(
+                ob.tag.clone(),
+                dial_fn,
+                &proxy_chain_tag,
+                target_strategy,
+                dns,
+                send_through.as_ref(),
+                policy_manager,
+            )
+        },
         "hysteria" => {
             let (server_addr, auth, server_name) = parse_hysteria_config(&ob.entry.data)?;
             let config = HysteriaConfig::new(&server_addr, &auth).with_server_name(&server_name);
@@ -816,38 +842,60 @@ fn build_protocol_handler(
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerifier))
                 .with_no_client_auth();
-            let stream_settings = xray_transport::dialer::StreamSettings::from_json(ob.stream_settings_json.as_ref());
+            let stream_settings =
+                xray_transport::dialer::StreamSettings::from_json(ob.stream_settings_json.as_ref());
             let obfs = xray_transport_hysteria::salamander_socket::parse_udp_obfs(
                 stream_settings.finalmask_json.as_ref(),
-            ).map_err(|e| format!("hysteria finalmask: {e}"))?;
+            )
+            .map_err(|e| format!("hysteria finalmask: {e}"))?;
             // streamSettings.finalmask.quicParams → HysteriaConfig（brutal/CC/windows/keepAlive）
             let quic_params = xray_transport_hysteria::quic_params::parse_quic_params(
                 stream_settings.finalmask_json.as_ref(),
-            ).map_err(|e| format!("hysteria quicParams: {e}"))?
-                .unwrap_or_else(xray_transport_hysteria::quic_params::default_hysteria_quic_params);
+            )
+            .map_err(|e| format!("hysteria quicParams: {e}"))?
+            .unwrap_or_else(xray_transport_hysteria::quic_params::default_hysteria_quic_params);
             let config = config.with_quic_params(quic_params);
-            let transport = xray_transport_hysteria::hysteria_transport::QuinnHysteriaTransport::new(
-                tls_config, "0.0.0.0:0".parse().map_err(|e| format!("bind addr: {e}"))?,
-            ).map_err(|e| format!("hysteria transport: {e}"))?
+            let transport =
+                xray_transport_hysteria::hysteria_transport::QuinnHysteriaTransport::new(
+                    tls_config,
+                    "0.0.0.0:0".parse().map_err(|e| format!("bind addr: {e}"))?,
+                )
+                .map_err(|e| format!("hysteria transport: {e}"))?
                 // QUIC 端点缓冲：streamSettings.sockopt（缺省 = 8MB 下限语义）。
                 .with_sockopt(stream_settings.socket_options())
                 .with_obfs(obfs);
             let dial_fn = xray_proxy_hysteria::make_hysteria_dial_fn(config, Arc::new(transport));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
-        }
+            wrap_bridge(
+                ob.tag.clone(),
+                dial_fn,
+                &proxy_chain_tag,
+                target_strategy,
+                dns,
+                send_through.as_ref(),
+                policy_manager,
+            )
+        },
         "anytls" => {
             let config = parse_anytls_config(&ob.entry.data)?;
             // streamSettings.sockopt → dial_system（mark/dialerProxy/happyEyeballs/
             // domainStrategy，bd n65u）；network/security 段由 anytls 协议自持
             // TLS，不消费。
-            let sockopt = xray_transport::dialer::StreamSettings::from_json(
-                ob.stream_settings_json.as_ref(),
-            )
-            .socket_options();
-            let client = Arc::new(xray_proxy_anytls::AnytlsClient::new(config.with_sockopt(sockopt)));
+            let sockopt =
+                xray_transport::dialer::StreamSettings::from_json(ob.stream_settings_json.as_ref())
+                    .socket_options();
+            let client =
+                Arc::new(xray_proxy_anytls::AnytlsClient::new(config.with_sockopt(sockopt)));
             let dial_fn = xray_proxy_anytls::make_anytls_dial_fn(client);
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
-        }
+            wrap_bridge(
+                ob.tag.clone(),
+                dial_fn,
+                &proxy_chain_tag,
+                target_strategy,
+                dns,
+                send_through.as_ref(),
+                policy_manager,
+            )
+        },
         "tuic" => {
             let s = parse_tuic_config(&ob.entry.data)?;
             // streamSettings.tlsSettings.pinnedPeerCertSha256 → 证书钉扎验证器
@@ -856,10 +904,8 @@ fn build_protocol_handler(
             let pinned_verifier = if s.insecure {
                 None
             } else {
-                let tls_json = ob
-                    .stream_settings_json
-                    .as_ref()
-                    .and_then(|ss| ss.get("tlsSettings"));
+                let tls_json =
+                    ob.stream_settings_json.as_ref().and_then(|ss| ss.get("tlsSettings"));
                 let has_pins = tls_json
                     .and_then(|j| j.get("pinnedPeerCertSha256"))
                     .and_then(|v| v.as_str())
@@ -910,8 +956,9 @@ fn build_protocol_handler(
             };
             let tcp_bridge = Arc::new(DialBridge::new(ob.tag.clone(), dial_fn));
             if let Some(pm) = policy_manager {
-                tcp_bridge
-                    .with_policy(xray_features::policy::PolicyManager::policy_for_level(pm, 0).timeout);
+                tcp_bridge.with_policy(
+                    xray_features::policy::PolicyManager::policy_for_level(pm, 0).timeout,
+                );
             }
             let udp_params = Arc::new(TuicUdpParams {
                 server_addr: s.server_addr,
@@ -929,7 +976,7 @@ fn build_protocol_handler(
             let handler = Arc::new(dispatch) as Arc<dyn DispatchHandler>;
             let bridge_ref = if proxy_chain_tag.is_some() { Some(tcp_bridge) } else { None };
             Ok((handler, bridge_ref, proxy_chain_tag))
-        }
+        },
         "wireguard" => {
             let config = parse_wireguard_config(&ob.entry.data)?;
             // Go handler.go:242 把 Handler 自身作为 internet.Dialer 传给
@@ -949,65 +996,108 @@ fn build_protocol_handler(
                             xray_transport::system_dialer::dial_system(&dest, &sockopt)
                                 .await
                                 .map_err(|e| format!("wireguard chain dial: {e}"))
-                        }) as std::pin::Pin<Box<
-                            dyn Future<
-                                Output = std::result::Result<
-                                    Box<dyn xray_transport::connection::Connection>,
-                                    String,
+                        })
+                            as std::pin::Pin<
+                                Box<
+                                    dyn Future<
+                                            Output = std::result::Result<
+                                                Box<dyn xray_transport::connection::Connection>,
+                                                String,
+                                            >,
+                                        > + Send,
                                 >,
-                            > + Send,
-                        >>
+                            >
                     }) as xray_app_dispatcher::default::DialFn
                 });
             let dial_fn =
                 xray_proxy_wireguard::make_wireguard_dial_fn(config, dns.cloned(), system_dialer);
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
-        }
+            wrap_bridge(
+                ob.tag.clone(),
+                dial_fn,
+                &proxy_chain_tag,
+                target_strategy,
+                dns,
+                send_through.as_ref(),
+                policy_manager,
+            )
+        },
         "dns" => {
             let handler = parse_dns_outbound_config(&ob.entry.data)?;
             let bridge = DnsDispatchBridge::new(ob.tag.clone(), handler, dns.cloned());
             Ok((Arc::new(bridge) as Arc<dyn DispatchHandler>, None, None))
-        }
+        },
         "loopback" => {
             // Go loopback.go:56-62：sniffing 经 BuildSniffingRequest 注入重分发；
             // sink 由生产装配注入（functions.rs），per-handler sniffing 透传到
             // DispatcherLoopbackSink → dispatch_link。
             let (inbound_tag, sniffing) = parse_loopback_config(&ob.entry.data)?;
-            let handler = xray_proxy_loopback::LoopbackHandler::with_inbound_tag(
-                ob.tag.clone(), inbound_tag,
-            )
-            .with_sniffing_request(sniffing);
+            let handler =
+                xray_proxy_loopback::LoopbackHandler::with_inbound_tag(ob.tag.clone(), inbound_tag)
+                    .with_sniffing_request(sniffing);
             let handler = match loopback_sink {
                 Some(sink) => handler.with_sink(sink),
                 None => handler,
             };
             Ok((Arc::new(handler) as Arc<dyn DispatchHandler>, None, None))
-        }
+        },
         "http" => {
             let config = xray_proxy_http::parse_http_config(&ob.entry.data)?;
-            let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
+            let config =
+                config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
             let dial_fn = xray_proxy_http::make_http_dial_fn(Arc::new(config));
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
-        }
+            wrap_bridge(
+                ob.tag.clone(),
+                dial_fn,
+                &proxy_chain_tag,
+                target_strategy,
+                dns,
+                send_through.as_ref(),
+                policy_manager,
+            )
+        },
         "naive" => {
             let config = parse_naive_config(&ob.entry.data)?;
             let dial_fn = xray_transport_naive::make_naive_dial_fn(config);
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
-        }
+            wrap_bridge(
+                ob.tag.clone(),
+                dial_fn,
+                &proxy_chain_tag,
+                target_strategy,
+                dns,
+                send_through.as_ref(),
+                policy_manager,
+            )
+        },
         "dokodemo" => {
             let config = parse_dokodemo_config(&ob.entry.data)?;
             let dial_fn = xray_proxy_dokodemo::make_dokodemo_dial_fn(config);
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
-        }
+            wrap_bridge(
+                ob.tag.clone(),
+                dial_fn,
+                &proxy_chain_tag,
+                target_strategy,
+                dns,
+                send_through.as_ref(),
+                policy_manager,
+            )
+        },
         #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
         "tun" => {
             let dial_fn = xray_proxy_tun::make_tun_dial_fn();
-            wrap_bridge(ob.tag.clone(), dial_fn, &proxy_chain_tag, target_strategy, dns, send_through.as_ref(), policy_manager)
-        }
+            wrap_bridge(
+                ob.tag.clone(),
+                dial_fn,
+                &proxy_chain_tag,
+                target_strategy,
+                dns,
+                send_through.as_ref(),
+                policy_manager,
+            )
+        },
         #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
-        "tun" => {
-            Err(BuildError::Unsupported("TUN outbound is only supported on Linux/Android/FreeBSD".to_string()))
-        }
+        "tun" => Err(BuildError::Unsupported(
+            "TUN outbound is only supported on Linux/Android/FreeBSD".to_string(),
+        )),
         _ => Err(BuildError::Unsupported(ob.entry.kind.clone())),
     }
 }
@@ -1086,10 +1176,7 @@ impl MuxBridge {
     /// 挂独立 UDP worker 管理器（xudpConcurrency > 0）：与 TCP 载体共用底层
     /// slot 拨号，但并发账本独立（Go `h.xudp` 独立 ClientManager/Picker）。
     pub(crate) fn attach_xudp_manager(&mut self, concurrency: u32) {
-        let strategy = ClientStrategy {
-            max_concurrency: concurrency,
-            max_connection: 128,
-        };
+        let strategy = ClientStrategy { max_concurrency: concurrency, max_connection: 128 };
         let factory = Arc::new(DialingWorkerFactory::with_slot(Arc::clone(&self.slot), strategy));
         self.xudp_picker = Some(Arc::new(IncrementalWorkerPicker::new(factory)));
     }
@@ -1182,11 +1269,7 @@ impl DispatchHandler for MuxBridge {
 fn parse_mux_config(data: &[u8]) -> std::result::Result<(u32, Option<String>), String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
     let concurrency = v.get("concurrency").and_then(|x| x.as_u64()).unwrap_or(8) as u32;
-    let via = v
-        .get("via")
-        .and_then(|x| x.as_str())
-        .filter(|s| !s.is_empty())
-        .map(String::from);
+    let via = v.get("via").and_then(|x| x.as_str()).filter(|s| !s.is_empty()).map(String::from);
     Ok((concurrency, via))
 }
 /// 解析 vless outbound settings JSON → VlessOutboundConfig。
@@ -1224,9 +1307,7 @@ fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutboundConfig, S
     if vnext.len() != 1 {
         return Err(r#"vless "vnext" should have one and only one member. Multiple endpoints should use multiple VLESS outbounds and routing balancer instead"#.into());
     }
-    let first = vnext
-        .first()
-        .ok_or_else(|| "vnext array is empty".to_string())?;
+    let first = vnext.first().ok_or_else(|| "vnext array is empty".to_string())?;
     let address = first
         .get("address")
         .and_then(|v| v.as_str())
@@ -1250,11 +1331,7 @@ fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutboundConfig, S
     let uuid = UUID::from_str(user_id)?;
     // 可选 user 字段：flow / encryption / level / email（对应 Go infra/conf outbound user）。
     let flow = user.get("flow").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let encryption = user
-        .get("encryption")
-        .and_then(|v| v.as_str())
-        .unwrap_or("none")
-        .to_string();
+    let encryption = user.get("encryption").and_then(|v| v.as_str()).unwrap_or("none").to_string();
     // Go infra/conf/vless.go:355-360：非空且非 none 的 encryption 解析失败 =
     // 启动硬错（拼错 mlkem 串静默降级明文是机密性回退）。空串/none 走明文
     // 通过（Rust 缺字段 unwrap_or("none")，较 Go 的空串硬错宽松，存量配置兼容）。
@@ -1271,17 +1348,11 @@ fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutboundConfig, S
         .get("testseed")
         .or_else(|| v.get("testseed"))
         .and_then(|s| s.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_u64().map(|n| n as u32))
-                .collect::<Vec<u32>>()
-        })
+        .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect::<Vec<u32>>())
         .unwrap_or_default();
-    let testpre = user
-        .get("testpre")
-        .or_else(|| v.get("testpre"))
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0) as u32;
+    let testpre =
+        user.get("testpre").or_else(|| v.get("testpre")).and_then(|x| x.as_u64()).unwrap_or(0)
+            as u32;
     Ok(VlessOutboundConfig::new(
         uuid,
         Address::Domain(address.to_string()),
@@ -1336,9 +1407,7 @@ fn parse_trojan_config(data: &[u8]) -> std::result::Result<TrojanOutboundConfig,
             xray_common::log::warning(w);
         }
     }
-    let first = servers
-        .first()
-        .ok_or_else(|| "servers array is empty".to_string())?;
+    let first = servers.first().ok_or_else(|| "servers array is empty".to_string())?;
     let address = first
         .get("address")
         .and_then(|v| v.as_str())
@@ -1400,27 +1469,24 @@ fn parse_freedom_config(data: &[u8]) -> std::io::Result<FreedomConfig> {
         .unwrap_or_default();
     // destinationOverride / proxyProtocol / finalRules（Go FreedomConfig json 键，
     // freedom.go:19-29；解析在 freedom crate `from_json`，Go 语义对齐）
-    let destination_override = v
-        .get("destinationOverride")
-        .and_then(xray_proxy_freedom::DestinationOverride::from_json);
+    let destination_override =
+        v.get("destinationOverride").and_then(xray_proxy_freedom::DestinationOverride::from_json);
     // userLevel（Go infra/conf/freedom.go UserLevel json 键；czwu③ 出站 policy 档位）
     let user_level = v.get("userLevel").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-    let proxy_protocol = v
-        .get("proxyProtocol")
-        .and_then(|p| p.as_u64())
-        .unwrap_or(0) as u32;
+    let proxy_protocol = v.get("proxyProtocol").and_then(|p| p.as_u64()).unwrap_or(0) as u32;
     // finalRules：单条非法整出站拒启（Go freedom.go:186-191 `r.Build() 失败
     // 即 return nil, err`），不再逐条 warn+丢弃。
-    let final_rules: Vec<xray_proxy_freedom::FinalRuleConfig> = match v.get("finalRules").and_then(|r| r.as_array()) {
-        Some(arr) => arr
-            .iter()
-            .map(|rv| {
-                xray_proxy_freedom::FinalRuleConfig::from_json(rv)
-                    .map_err(|e| std::io::Error::other(format!("freedom finalRule: {e}")))
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()?,
-        None => Vec::new(),
-    };
+    let final_rules: Vec<xray_proxy_freedom::FinalRuleConfig> =
+        match v.get("finalRules").and_then(|r| r.as_array()) {
+            Some(arr) => arr
+                .iter()
+                .map(|rv| {
+                    xray_proxy_freedom::FinalRuleConfig::from_json(rv)
+                        .map_err(|e| std::io::Error::other(format!("freedom finalRule: {e}")))
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+            None => Vec::new(),
+        };
     Ok(FreedomConfig {
         domain_strategy: domain_strategy as i32,
         destination_override,
@@ -1435,9 +1501,9 @@ fn parse_freedom_config(data: &[u8]) -> std::io::Result<FreedomConfig> {
 /// `PrintRemovedFeatureError("noise = { ... }", "noises = [ { ... } ]")`）。
 /// 返回 Go 对齐警告文案；键不存在返回 `None`。
 pub(crate) fn freedom_noise_removed_warning(v: &serde_json::Value) -> Option<String> {
-    v.get("noise")
-        .is_some()
-        .then(|| xray_common::errors::removed_feature_message("noise = { ... }", "noises = [ { ... } ]"))
+    v.get("noise").is_some().then(|| {
+        xray_common::errors::removed_feature_message("noise = { ... }", "noises = [ { ... } ]")
+    })
 }
 
 /// Trojan Flow 已移除（Go infra/conf/trojan.go:73-75 客户端 / :134-136 服务端，
@@ -1452,9 +1518,7 @@ pub(crate) fn trojan_flow_removed_warning(user: &serde_json::Value) -> Option<St
 
 /// 把 domainStrategy 字符串映射为枚举值（Go freedom.go:65-88：ToLower +
 /// 11 值全谱含 forceip 族，未知值硬错；错误信息保留原始大小写）。
-fn parse_freedom_domain_strategy(
-    s: &str,
-) -> std::io::Result<xray_proxy_freedom::DomainStrategy> {
+fn parse_freedom_domain_strategy(s: &str) -> std::io::Result<xray_proxy_freedom::DomainStrategy> {
     use xray_proxy_freedom::DomainStrategy;
     Ok(match s.to_ascii_lowercase().as_str() {
         "asis" | "" => DomainStrategy::AsIs,
@@ -1469,10 +1533,8 @@ fn parse_freedom_domain_strategy(
         "forceipv4v6" => DomainStrategy::ForceIPv4v6,
         "forceipv6v4" => DomainStrategy::ForceIPv6v4,
         _ => {
-            return Err(std::io::Error::other(format!(
-                "unsupported domain strategy: {s}"
-            )));
-        }
+            return Err(std::io::Error::other(format!("unsupported domain strategy: {s}")));
+        },
     })
 }
 
@@ -1548,16 +1610,15 @@ async fn lookup_for_ip(
 /// ## 与 Go 的差异（`DialFn` 签名无 session 上下文）
 ///
 /// - `content.SkipDNSResolve` 门控未实现（Go handler.go:184）
-/// - UDP `GetDynamicStrategy(origTargetAddr)` 动态策略未实现（Go handler.go:186-188）；
-///   UDP 域名目标按原策略解析
+/// - UDP `GetDynamicStrategy(origTargetAddr)` 动态策略未实现（Go handler.go:186-188）； UDP
+///   域名目标按原策略解析
 fn wrap_dial_with_target_strategy(
     inner: xray_app_dispatcher::default::DialFn,
     strategy: DomainStrategy,
     dns: Option<Arc<xray_app_dns::DnsService>>,
 ) -> xray_app_dispatcher::default::DialFn {
     use rand::Rng;
-    use xray_common::net::address::Address;
-    use xray_common::net::destination::Destination;
+    use xray_common::net::{address::Address, destination::Destination};
     Arc::new(move |dest: &Destination| {
         let inner = Arc::clone(&inner);
         let dns = dns.clone();
@@ -1584,7 +1645,7 @@ fn wrap_dial_with_target_strategy(
                     tracing::debug!(target = %domain, resolved = %ip, "target strategy resolved");
                     let resolved = Destination::new(Address::from(ip), dest.port(), dest.network());
                     inner(&resolved).await
-                }
+                },
                 Err(e) => {
                     // Go handler.go:190-199：Force* 断链报错；Use* 回退域名直连
                     if strategy.force_ip() {
@@ -1592,7 +1653,7 @@ fn wrap_dial_with_target_strategy(
                     }
                     tracing::info!(target = %domain, error = %e, "resolve failed, fallback to domain");
                     inner(&dest).await
-                }
+                },
             }
         })
     })
@@ -1635,8 +1696,8 @@ fn parse_freedom_noise(v: &serde_json::Value) -> Option<Noise> {
 /// - `{}` 或无 `response` → None
 /// - `{ "response": { "type": "none" } }` → None
 /// - `{ "response": { "type": "http" } }` → Http403
-/// - `{ "response": { "type": "custom", "customResponseData": "<base64>" } }` → Custom
-///   （Go :38-42：base64 标准解码，失败即 Build 硬错）
+/// - `{ "response": { "type": "custom", "customResponseData": "<base64>" } }` → Custom （Go
+///   :38-42：base64 标准解码，失败即 Build 硬错）
 fn parse_blackhole_response(
     data: &[u8],
 ) -> std::result::Result<xray_proxy_blackhole::ResponseConfig, String> {
@@ -1656,7 +1717,7 @@ fn parse_blackhole_response(
                 .decode(raw)
                 .map_err(|e| format!("failed to decode custom response data: {e}"))?;
             Ok(ResponseConfig::Custom(bytes))
-        }
+        },
         _ => Ok(ResponseConfig::None),
     }
 }
@@ -1673,9 +1734,7 @@ fn parse_socks_outbound_config(
         .get("servers")
         .and_then(|v| v.as_array())
         .ok_or_else(|| "missing servers array".to_string())?;
-    let first = servers
-        .first()
-        .ok_or_else(|| "servers array is empty".to_string())?;
+    let first = servers.first().ok_or_else(|| "servers array is empty".to_string())?;
     let address = first
         .get("address")
         .and_then(|v| v.as_str())
@@ -1684,13 +1743,11 @@ fn parse_socks_outbound_config(
         .get("port")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| "missing servers[0].port".to_string())?;
-    let server_addr = format!("{address}:{}", u16::try_from(port).map_err(|_| "port out of range")?);
+    let server_addr =
+        format!("{address}:{}", u16::try_from(port).map_err(|_| "port out of range")?);
     // users[0] 可选
-    let auth = first
-        .get("users")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|u| {
+    let auth =
+        first.get("users").and_then(|v| v.as_array()).and_then(|arr| arr.first()).and_then(|u| {
             let user = u.get("user")?.as_str()?.to_string();
             let pass = u.get("pass")?.as_str()?.to_string();
             Some((user, pass))
@@ -1707,11 +1764,7 @@ fn parse_stream_settings(json: &Option<serde_json::Value>) -> Option<StreamSetti
     // 例外（bd enk）：配了 `sockopt` 不折叠——TCP+无 TLS 的 sockopt（如
     // dialerProxy/mark）必须到达 dial_system（Go 中 SocketSettings 存在时
     // sockopt 恒生效，dialer.go:270）。
-    if s.protocol == "tcp" && !s.is_tls() && s.sockopt_json.is_none() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.protocol == "tcp" && !s.is_tls() && s.sockopt_json.is_none() { None } else { Some(s) }
 }
 
 // ========== StubDispatchBridge：协议 stub 注册 ==========
@@ -1741,7 +1794,9 @@ impl std::fmt::Debug for StubDispatchBridge {
 }
 
 impl DispatchHandler for StubDispatchBridge {
-    fn tag(&self) -> &str { &self.tag }
+    fn tag(&self) -> &str {
+        &self.tag
+    }
 
     fn dispatch(&self, dest: &Destination, link: Link) -> PinFuture<()> {
         let tag = self.tag.clone();
@@ -1765,8 +1820,8 @@ impl DispatchHandler for StubDispatchBridge {
 ///
 /// 对应 Go `proxy/dns/dns.go::Handler.Process`：
 /// - ownLink 防环（dns.go:242-247）：本 DNS 服务自身的上游查询原样转发
-/// - 规则匹配 → Drop / Return（rCode 空响应）/ Hijack（DnsService.lookup_ip，
-///   fake_enable=true 可触发 FakeDNS）/ Direct（原样字节转发到 rewrite 后的 dest）
+/// - 规则匹配 → Drop / Return（rCode 空响应）/ Hijack（DnsService.lookup_ip， fake_enable=true
+///   可触发 FakeDNS）/ Direct（原样字节转发到 rewrite 后的 dest）
 /// - UDP 单请求-响应；TCP 双路 IO loop（request 帧 → 决策，response 帧 → 回写）
 /// DNS 不走标准 DialBridge（无 dial 语义），而是直接实现 DispatchHandler。
 struct DnsDispatchBridge {
@@ -1788,17 +1843,13 @@ impl DnsDispatchBridge {
 
     /// Go `isOwnLink`（dns.go:118-120）：DnsService 实现 ownLinkVerifier。
     fn is_own_link(&self, inbound_tag: &str) -> bool {
-        self.dns_service
-            .as_ref()
-            .is_some_and(|s| s.is_own_link(inbound_tag))
+        self.dns_service.as_ref().is_some_and(|s| s.is_own_link(inbound_tag))
     }
 }
 
 impl std::fmt::Debug for DnsDispatchBridge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DnsDispatchBridge")
-            .field("tag", &self.tag)
-            .finish()
+        f.debug_struct("DnsDispatchBridge").field("tag", &self.tag).finish()
     }
 }
 
@@ -1842,7 +1893,7 @@ async fn forward_raw(
         Err(e) => {
             tracing::debug!(upstream = %upstream, error = %e, "dns raw forward failed");
             None
-        }
+        },
     }
 }
 
@@ -1865,15 +1916,15 @@ async fn handle_ip_query(
     match svc.lookup_ip(&question.name, option).await {
         Ok((ips, ttl)) if !ips.is_empty() => {
             Some(xray_proxy_dns::build_ip_response(&header, &question, &ips, ttl))
-        }
+        },
         // Go: ErrEmptyResponse → rCode 0 空响应（dns.go:334 构造空 answer）。
         Err(xray_app_dns::error::DnsError::EmptyResponse) => {
             Some(xray_proxy_dns::build_dns_response(&header, &question, 0))
-        }
+        },
         // Go: RCodeFromError 提取 RCodeError → 响应带该 rCode。
         Err(xray_app_dns::error::DnsError::RCodeError(rc)) => {
             Some(xray_proxy_dns::build_dns_response(&header, &question, rc as u8))
-        }
+        },
         // Go dns.go:334-337：其余错误静默（rCode 0 + ips 空 + 非 EmptyResponse）。
         Ok((_, _)) | Err(_) => None,
     }
@@ -1926,8 +1977,10 @@ async fn dispatch_dns_link(
     own_link: bool,
     mut link: Link,
 ) {
-    use xray_buf::io::{Reader, Writer};
-    use xray_buf::multi::MultiBuffer;
+    use xray_buf::{
+        io::{Reader, Writer},
+        multi::MultiBuffer,
+    };
 
     if upstream.is_udp() {
         // ---- UDP：单包请求-响应（Go UDPReader/UDPWriter + outboundConn） ----
@@ -1938,7 +1991,7 @@ async fn dispatch_dns_link(
                     q.extend_from_slice(b.bytes());
                 }
                 q
-            }
+            },
             _ => return,
         };
         let response = if own_link {
@@ -1950,7 +2003,7 @@ async fn dispatch_dns_link(
                 Ok(xray_proxy_dns::ProcessOutcome::Respond { response }) => Some(response),
                 Ok(xray_proxy_dns::ProcessOutcome::Forward { query }) => {
                     forward_raw(&query, &upstream, timeout).await
-                }
+                },
                 Ok(xray_proxy_dns::ProcessOutcome::Hijack { query }) => match &dns_service {
                     Some(svc) => handle_ip_query(&query, svc).await,
                     None => None,
@@ -1958,7 +2011,7 @@ async fn dispatch_dns_link(
                 Err(e) => {
                     tracing::debug!(tag = %tag, "dns udp process: {e}");
                     None
-                }
+                },
             }
         };
         if let Some(resp) = response {
@@ -2001,7 +2054,7 @@ async fn dispatch_dns_link(
                     Ok(Err(e)) => {
                         tracing::debug!(tag = %tag, "dns upstream read: {e}");
                         return;
-                    }
+                    },
                 };
                 frames.clear();
                 decoder.feed(&buf[..n], &mut frames);
@@ -2056,10 +2109,10 @@ async fn dispatch_dns_link(
                 match handler.process(&query).await {
                     Ok(xray_proxy_dns::ProcessOutcome::Drop) => {
                         tracing::debug!(tag = %tag, "dns tcp query dropped by rule");
-                    }
+                    },
                     Ok(xray_proxy_dns::ProcessOutcome::Respond { response }) => {
                         write_client_frame(&writer_for_req, &tag, &response).await;
-                    }
+                    },
                     Ok(xray_proxy_dns::ProcessOutcome::Forward { query }) => {
                         write_or_inline_upstream(
                             &write_slot,
@@ -2071,7 +2124,7 @@ async fn dispatch_dns_link(
                             timeout,
                         )
                         .await;
-                    }
+                    },
                     Ok(xray_proxy_dns::ProcessOutcome::Hijack { query }) => {
                         // Go: go h.handleIPQuery(...)——异步不阻塞请求循环。
                         if let Some(svc) = dns_service.clone() {
@@ -2083,10 +2136,10 @@ async fn dispatch_dns_link(
                                 }
                             });
                         }
-                    }
+                    },
                     Err(e) => {
                         tracing::debug!(tag = %tag, "dns tcp process: {e}");
-                    }
+                    },
                 }
             }
         }
@@ -2109,8 +2162,7 @@ async fn write_client_frame(
     let Ok(framed) = xray_proxy_dns::encode_tcp_dns_message(msg) else {
         return;
     };
-    let mb =
-        xray_buf::multi::MultiBuffer::from_buffer(xray_buf::buffer::Buffer::from_vec(framed));
+    let mb = xray_buf::multi::MultiBuffer::from_buffer(xray_buf::buffer::Buffer::from_vec(framed));
     if let Err(e) = writer.lock().await.write_multi_buffer(mb).await {
         tracing::debug!(tag = %tag, "dns client write: {e}");
     }
@@ -2148,18 +2200,18 @@ async fn write_or_inline_upstream(
             Err(e) => {
                 tracing::debug!(upstream = %upstream, error = %e, "dns upstream resolve failed");
                 return;
-            }
+            },
         };
         match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
             Ok(Ok(conn)) => {
                 let (rh, wh) = conn.into_split();
                 *guard = Some(wh);
                 let _ = read_tx.try_send(rh); // 唤醒 response loop
-            }
+            },
             _ => {
                 tracing::debug!(upstream = %upstream, "dns upstream dial failed/timeout");
                 return;
-            }
+            },
         }
     }
     if let Some(wh) = guard.as_mut() {
@@ -2176,8 +2228,8 @@ async fn write_or_inline_upstream(
 /// JSON（Rust 扩展，Go JSON 侧 dns outbound settings 为空对象）：
 /// `{"rule":[{"action":"drop","qType":[28],"rCode":5}], "rewriteServer":{...}}`
 fn parse_dns_outbound_config(data: &[u8]) -> std::result::Result<xray_proxy_dns::Handler, String> {
-    let v: serde_json::Value = serde_json::from_slice(data)
-        .map_err(|e| format!("dns outbound settings JSON: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(data).map_err(|e| format!("dns outbound settings JSON: {e}"))?;
     let mut config = xray_proxy_dns::Config::default();
 
     if let Some(rules) = v.get("rule").and_then(|x| x.as_array()) {
@@ -2194,9 +2246,7 @@ fn parse_dns_outbound_config(data: &[u8]) -> std::result::Result<xray_proxy_dns:
             let q_type = r
                 .get("qType")
                 .and_then(|x| x.as_array())
-                .map(|arr| {
-                    arr.iter().filter_map(|x| x.as_i64().map(|n| n as i32)).collect()
-                })
+                .map(|arr| arr.iter().filter_map(|x| x.as_i64().map(|n| n as i32)).collect())
                 .unwrap_or_default();
             let r_code = r.get("rCode").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
             config.rule.push(xray_proxy_dns::DnsRuleConfig {
@@ -2210,9 +2260,9 @@ fn parse_dns_outbound_config(data: &[u8]) -> std::result::Result<xray_proxy_dns:
 
     if let Some(rw) = v.get("rewriteServer") {
         let network = match rw.get("network").and_then(|x| x.as_str()) {
-            Some("tcp") => 2,  // xray.common.net.Network.TCP
-            Some("udp") => 3,  // xray.common.net.Network.UDP
-            _ => 0,            // Unknown → 不覆盖
+            Some("tcp") => 2, // xray.common.net.Network.TCP
+            Some("udp") => 3, // xray.common.net.Network.UDP
+            _ => 0,           // Unknown → 不覆盖
         };
         let address = rw.get("address").and_then(|x| x.as_str()).and_then(|s| {
             if let Ok(v4) = s.parse::<std::net::Ipv4Addr>() {
@@ -2245,35 +2295,26 @@ fn parse_dns_outbound_config(data: &[u8]) -> std::result::Result<xray_proxy_dns:
     Ok(xray_proxy_dns::Handler::init(&config))
 }
 
-
 // ========== AnyTLS 配置解析 ==========
 
 /// 解析 anytls outbound settings JSON → ClientConfig。
 ///
-/// JSON 格式：`{ "server": "...", "server_port": 443, "sni": "...", "insecure": false, "password": "..." }`
-fn parse_anytls_config(data: &[u8]) -> std::result::Result<xray_proxy_anytls::ClientConfig, String> {
+/// JSON 格式：`{ "server": "...", "server_port": 443, "sni": "...", "insecure": false, "password":
+/// "..." }`
+fn parse_anytls_config(
+    data: &[u8],
+) -> std::result::Result<xray_proxy_anytls::ClientConfig, String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
-    let address = v
-        .get("server")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "missing server".to_string())?;
+    let address =
+        v.get("server").and_then(|v| v.as_str()).ok_or_else(|| "missing server".to_string())?;
     let port = v
         .get("server_port")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| "missing server_port".to_string())?;
     let port = u16::try_from(port).map_err(|_| "port out of range")?;
-    let sni = v
-        .get("sni")
-        .and_then(|v| v.as_str())
-        .unwrap_or(address);
-    let insecure = v
-        .get("insecure")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let password = v
-        .get("password")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
+    let sni = v.get("sni").and_then(|v| v.as_str()).unwrap_or(address);
+    let insecure = v.get("insecure").and_then(|v| v.as_bool()).unwrap_or(false);
+    let password = v.get("password").and_then(|v| v.as_str()).unwrap_or_default();
     // 构造 rustls ClientConfig
     xray_common::ensure_default_crypto_provider();
     let tls_config = if insecure {
@@ -2285,9 +2326,7 @@ fn parse_anytls_config(data: &[u8]) -> std::result::Result<xray_proxy_anytls::Cl
         let root_store = rustls::RootCertStore {
             roots: webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect(),
         };
-        rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth()
+        rustls::ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth()
     };
     Ok(xray_proxy_anytls::ClientConfig::new(
         &format!("{address}:{port}"),
@@ -2380,17 +2419,23 @@ fn parse_hysteria_config(data: &[u8]) -> std::result::Result<(String, String, St
             return Err(format!("hysteria version {ver} not supported (only version 2)"));
         }
     }
-    let servers = v.get("servers").and_then(|v| v.as_array())
+    let servers = v
+        .get("servers")
+        .and_then(|v| v.as_array())
         .ok_or_else(|| "missing servers array".to_string())?;
     let first = servers.first().ok_or_else(|| "servers array is empty".to_string())?;
-    let address = first.get("address").and_then(|v| v.as_str())
-        .ok_or_else(|| "missing servers[0].address".to_string())?;
-    let port = first.get("port").and_then(|v| v.as_u64())
-        .ok_or_else(|| "missing servers[0].port".to_string())?;
-    let auth = first.get("auth").or_else(|| first.get("password"))
+    let address = first
+        .get("address")
         .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let server_name = first.get("serverName")
+        .ok_or_else(|| "missing servers[0].address".to_string())?;
+    let port = first
+        .get("port")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "missing servers[0].port".to_string())?;
+    let auth =
+        first.get("auth").or_else(|| first.get("password")).and_then(|v| v.as_str()).unwrap_or("");
+    let server_name = first
+        .get("serverName")
         .or_else(|| first.get("server_name"))
         .or_else(|| first.get("sni"))
         .and_then(|v| v.as_str())
@@ -2434,11 +2479,7 @@ impl DispatchHandler for TuicUdpDispatch {
         &self.tag
     }
 
-    fn dispatch(
-        &self,
-        dest: &Destination,
-        link: Link,
-    ) -> PinFuture<()> {
+    fn dispatch(&self, dest: &Destination, link: Link) -> PinFuture<()> {
         if dest.network() == xray_common::net::network::Network::UDP {
             let params = Arc::clone(&self.params);
             let tag = self.tag.clone();
@@ -2491,7 +2532,12 @@ async fn pump_tuic_udp(
         let mut made_progress = true;
         while made_progress {
             made_progress = match tuic_frame_relay(
-                &assoc, mode, &mut accum, &default_addr, &global_id, &mut writer,
+                &assoc,
+                mode,
+                &mut accum,
+                &default_addr,
+                &global_id,
+                &mut writer,
             )
             .await
             {
@@ -2499,7 +2545,7 @@ async fn pump_tuic_udp(
                 Err(e) => {
                     tracing::debug!("tuic udp frame relay: {e}");
                     return Ok(());
-                }
+                },
             };
         }
         match reader.read_multi_buffer().await {
@@ -2511,7 +2557,7 @@ async fn pump_tuic_udp(
                 if accum.len() > 2 * 1024 * 1024 {
                     return Err("tuic udp accum exceeded 2MiB".to_string());
                 }
-            }
+            },
             Err(_) => return Ok(()),
         }
     }
@@ -2553,10 +2599,10 @@ async fn tuic_frame_relay(
             let resp = match mode {
                 xray_proxy_tuic::UdpRelayMode::Native => {
                     assoc.send_recv_native(addr.clone(), &data, None).await
-                }
+                },
                 xray_proxy_tuic::UdpRelayMode::Quic => {
                     assoc.send_recv(addr.clone(), &data, None).await
-                }
+                },
             }
             .map_err(|e| std::io::Error::other(format!("tuic udp send_recv: {e}")))?;
             // 响应帧来源 = 请求目标（dest 若被域名帧改写则用帧内目标）
@@ -2580,18 +2626,14 @@ async fn tuic_frame_relay(
             };
             let mut frame = Vec::with_capacity(resp.len() + 64);
             let mut pw = PacketWriter::new(&mut frame, source, *global_id);
-            pw.write_packet(&resp)
-                .map_err(std::io::Error::other)?;
+            pw.write_packet(&resp).map_err(std::io::Error::other)?;
             drop(pw);
-            let mb = xray_buf::multi::MultiBuffer::from_buffer(
-                xray_buf::buffer::Buffer::from_vec(frame),
-            );
-            writer
-                .write_multi_buffer(mb)
-                .await
-                .map_err(std::io::Error::other)?;
+            let mb = xray_buf::multi::MultiBuffer::from_buffer(xray_buf::buffer::Buffer::from_vec(
+                frame,
+            ));
+            writer.write_multi_buffer(mb).await.map_err(std::io::Error::other)?;
             Ok(true)
-        }
+        },
         Ok(None) => Ok(false),
         Err(PacketError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
         Err(PacketError::MetadataTooShort(_)) => Ok(false),
@@ -2643,24 +2685,33 @@ struct TuicOutboundSettings {
 /// "insecure":false,"certificate":"<PEM>"}]}`。
 fn parse_tuic_config(data: &[u8]) -> std::result::Result<TuicOutboundSettings, String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
-    let servers = v.get("servers").and_then(|v| v.as_array())
+    let servers = v
+        .get("servers")
+        .and_then(|v| v.as_array())
         .ok_or_else(|| "missing servers array".to_string())?;
     let first = servers.first().ok_or_else(|| "servers array is empty".to_string())?;
-    let address = first.get("address").and_then(|v| v.as_str())
+    let address = first
+        .get("address")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| "missing servers[0].address".to_string())?;
-    let port = first.get("port").and_then(|v| v.as_u64())
+    let port = first
+        .get("port")
+        .and_then(|v| v.as_u64())
         .ok_or_else(|| "missing servers[0].port".to_string())?;
-    let uuid_str = first.get("uuid").and_then(|v| v.as_str())
+    let uuid_str = first
+        .get("uuid")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| "missing servers[0].uuid".to_string())?;
-    let password = first.get("password").and_then(|v| v.as_str())
+    let password = first
+        .get("password")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| "missing servers[0].password".to_string())?;
-    let server_name = first.get("server_name").and_then(|v| v.as_str())
-        .unwrap_or(address).to_string();
+    let server_name =
+        first.get("server_name").and_then(|v| v.as_str()).unwrap_or(address).to_string();
     // 域名地址（真实节点）保留原样，dial 时 ToSocketAddrs 解析；此处 parse::<SocketAddr>
     // 会硬拒域名（bd #17/#30 根因："invalid socket address syntax"）
     let server_addr = format!("{address}:{port}");
-    let uuid = uuid::Uuid::parse_str(uuid_str)
-        .map_err(|e| format!("invalid tuic uuid: {e}"))?;
+    let uuid = uuid::Uuid::parse_str(uuid_str).map_err(|e| format!("invalid tuic uuid: {e}"))?;
 
     let congestion_name = first.get("congestion_control").and_then(|v| v.as_str()).unwrap_or("bbr");
     let congestion_control = xray_proxy_tuic::CongestionControl::from_name(congestion_name)
@@ -2670,33 +2721,33 @@ fn parse_tuic_config(data: &[u8]) -> std::result::Result<TuicOutboundSettings, S
     // s8ti：hysteria_brutal 带宽必须显式配置（TUIC 协议无 Hysteria-CC-RX/TX 协商，
     // 带宽只能本地配置；未配置=0 在 crate 层会回落 BBR，这里 parse 时直接拒绝更明确）。
     let brutal_up_bps = first.get("brutal_up_bps").and_then(|v| v.as_u64()).unwrap_or(0);
-    if congestion_control == xray_proxy_tuic::CongestionControl::HysteriaBrutal && brutal_up_bps == 0 {
+    if congestion_control == xray_proxy_tuic::CongestionControl::HysteriaBrutal
+        && brutal_up_bps == 0
+    {
         return Err("tuic congestion_control=hysteria_brutal requires brutal_up_bps (> 0)".into());
     }
-    let alpn: Vec<Vec<u8>> = first.get("alpn").and_then(|v| v.as_array())
-        .map(|arr| arr.iter()
-            .filter_map(|x| x.as_str().map(|s| s.as_bytes().to_vec()))
-            .collect())
+    let alpn: Vec<Vec<u8>> = first
+        .get("alpn")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.as_bytes().to_vec())).collect())
         .unwrap_or_default();
-    let reduce_rtt = first.get("reduce_rtt").and_then(|v| v.as_bool())
+    let reduce_rtt = first
+        .get("reduce_rtt")
+        .and_then(|v| v.as_bool())
         .or_else(|| first.get("zero_rtt_handshake").and_then(|v| v.as_bool()))
         .unwrap_or(false);
     let udp_mode_name = first.get("udp_relay_mode").and_then(|v| v.as_str()).unwrap_or("native");
-    let udp_relay_mode = xray_proxy_tuic::UdpRelayMode::from_name(udp_mode_name)
-        .ok_or_else(|| format!(
-            "invalid tuic udp_relay_mode: {udp_mode_name} (valid: native, quic)"
-        ))?;
+    let udp_relay_mode =
+        xray_proxy_tuic::UdpRelayMode::from_name(udp_mode_name).ok_or_else(|| {
+            format!("invalid tuic udp_relay_mode: {udp_mode_name} (valid: native, quic)")
+        })?;
     // 票 ieik④：官方 heartbeat 是 Go duration 串（"3s"/"500ms"）；数字 = 秒
     //（本仓方言兼容）。串解析失败显式报错而非静默回落 3s。
     let heartbeat = match first.get("heartbeat") {
-        Some(serde_json::Value::String(s)) => {
-            crate::wiring::parse_go_duration_str(s)
-                .map(|ns| std::time::Duration::from_nanos(ns.max(0) as u64))
-                .ok_or_else(|| format!("invalid tuic heartbeat: {s}"))?
-        }
-        Some(v) if v.as_u64().is_some() => {
-            std::time::Duration::from_secs(v.as_u64().unwrap())
-        }
+        Some(serde_json::Value::String(s)) => crate::wiring::parse_go_duration_str(s)
+            .map(|ns| std::time::Duration::from_nanos(ns.max(0) as u64))
+            .ok_or_else(|| format!("invalid tuic heartbeat: {s}"))?,
+        Some(v) if v.as_u64().is_some() => std::time::Duration::from_secs(v.as_u64().unwrap()),
         _ => std::time::Duration::from_secs(3),
     };
     let insecure = first.get("insecure").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -2761,16 +2812,11 @@ fn build_tuic_rustls_config(
                 return Err("tuic certificate: no certificate found in PEM".to_string());
             }
         }
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth()
+        rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth()
     };
     // TUIC v5 要求 ALPN；用户未配置时用默认 [h3, tuic]
-    config.alpn_protocols = if alpn.is_empty() {
-        vec![b"h3".to_vec(), b"tuic".to_vec()]
-    } else {
-        alpn.to_vec()
-    };
+    config.alpn_protocols =
+        if alpn.is_empty() { vec![b"h3".to_vec(), b"tuic".to_vec()] } else { alpn.to_vec() };
     // 官方 zero_rtt_handshake：quinn 的 QuicClientConfig::try_from 强制
     // enable_early_data=true，故此处只需控制会话恢复——true 启用恢复票据（复连自动 0-RTT），
     // false 显式禁用（对齐官方默认：不尝试 0-RTT）。
@@ -2782,13 +2828,8 @@ fn build_tuic_rustls_config(
     Ok(Arc::new(config))
 }
 
-
 /// camelCase 主键（Go infra/conf wireguard.go:17-68 JSON tag）缺失时读 snake_case 别名。
-fn wg_get<'a>(
-    v: &'a serde_json::Value,
-    camel: &str,
-    snake: &str,
-) -> Option<&'a serde_json::Value> {
+fn wg_get<'a>(v: &'a serde_json::Value, camel: &str, snake: &str) -> Option<&'a serde_json::Value> {
     v.get(camel).or_else(|| v.get(snake))
 }
 
@@ -2834,40 +2875,45 @@ fn parse_wireguard_domain_strategy(
 /// "domainStrategy":"ForceIP"}`。
 pub(crate) fn parse_wireguard_config(data: &[u8]) -> std::result::Result<DeviceConfig, String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
-    let secret_key = wg_get(&v, "secretKey", "secret_key").and_then(|x| x.as_str())
+    let secret_key = wg_get(&v, "secretKey", "secret_key")
+        .and_then(|x| x.as_str())
         .ok_or_else(|| "missing secretKey".to_string())?;
     let secret_key = parse_wireguard_key(secret_key)?;
     let mut peers = Vec::new();
     if let Some(arr) = v.get("peers").and_then(|x| x.as_array()) {
         for p in arr {
-            let public_key = wg_get(p, "publicKey", "public_key").and_then(|x| x.as_str())
+            let public_key = wg_get(p, "publicKey", "public_key")
+                .and_then(|x| x.as_str())
                 .ok_or_else(|| "missing peer publicKey".to_string())?;
             let public_key = parse_wireguard_key(public_key)?;
-            let endpoint = p.get("endpoint").and_then(|x| x.as_str())
+            let endpoint = p
+                .get("endpoint")
+                .and_then(|x| x.as_str())
                 .ok_or_else(|| "missing peer endpoint".to_string())?;
             // Go wireguard.go:39-44：空 PreSharedKey → 无 PSK。
-            let pre_shared_key = match wg_get(p, "preSharedKey", "pre_shared_key")
-                .and_then(|x| x.as_str())
-            {
-                Some(s) if !s.is_empty() => parse_wireguard_key(s)?,
-                _ => String::new(),
-            };
+            let pre_shared_key =
+                match wg_get(p, "preSharedKey", "pre_shared_key").and_then(|x| x.as_str()) {
+                    Some(s) if !s.is_empty() => parse_wireguard_key(s)?,
+                    _ => String::new(),
+                };
             // Go wireguard.go:47-49 KeepAlive → persistent_keepalive_interval（秒）。
-            let keep_alive = wg_get(p, "keepAlive", "keep_alive").and_then(|x| x.as_u64())
+            let keep_alive = wg_get(p, "keepAlive", "keep_alive")
+                .and_then(|x| x.as_u64())
                 .map(|n| u32::try_from(n).map_err(|_| "keepAlive out of u32 range".to_string()))
                 .transpose()?
                 .unwrap_or(0);
             // Go wireguard.go:50-54 AllowedIPs；缺省（字段缺失）→ 全路由
             // 双栈（Go wireguard.go:53-55 AllowedIPs == nil → 0.0.0.0/0+::0/0，
             // bd 7v0k①）。显式空数组尊重为空。
-            let allowed_ips = match wg_get(p, "allowedIPs", "allowed_ips").and_then(|x| x.as_array())
-            {
-                Some(a) => a.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
-                None => vec!["0.0.0.0/0".to_string(), "::0/0".to_string()],
-            };
+            let allowed_ips =
+                match wg_get(p, "allowedIPs", "allowed_ips").and_then(|x| x.as_array()) {
+                    Some(a) => a.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+                    None => vec!["0.0.0.0/0".to_string(), "::0/0".to_string()],
+                };
             // Go wireguard.go:24-25 per-user Level/Email（server 模式 users 载荷）
             let level = wg_get(p, "level", "level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-            let email = wg_get(p, "email", "email").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let email =
+                wg_get(p, "email", "email").and_then(|x| x.as_str()).unwrap_or("").to_string();
             peers.push(xray_proxy_wireguard::PeerConfig {
                 public_key,
                 endpoint: endpoint.to_string(),
@@ -2880,21 +2926,20 @@ pub(crate) fn parse_wireguard_config(data: &[u8]) -> std::result::Result<DeviceC
         }
     }
     // Go wireguard.go:75-79：address 缺省 → bogon 双栈（bd 7v0k①）
-    let endpoint = v.get("address").and_then(|x| x.as_array())
+    let endpoint = v
+        .get("address")
+        .and_then(|x| x.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-        .unwrap_or_else(|| {
-            vec![
-                "10.0.0.1".to_string(),
-                "fd59:7153:2388:b5fd::1".to_string(),
-            ]
-        });
+        .unwrap_or_else(|| vec!["10.0.0.1".to_string(), "fd59:7153:2388:b5fd::1".to_string()]);
     // Go wireguard.go:106-110：MTU 0 → 消费侧 effective_mtu() 回落 1420。
-    let mtu = wg_get(&v, "mtu", "mtu").and_then(|x| x.as_i64())
+    let mtu = wg_get(&v, "mtu", "mtu")
+        .and_then(|x| x.as_i64())
         .map(|n| i32::try_from(n).map_err(|_| "mtu out of i32 range".to_string()))
         .transpose()?
         .unwrap_or(0);
     // Go wireguard.go:112-115："reserved" 应为空或恰好 3 字节。
-    let reserved = wg_get(&v, "reserved", "reserved").and_then(|x| x.as_array())
+    let reserved = wg_get(&v, "reserved", "reserved")
+        .and_then(|x| x.as_array())
         .map(|a| {
             a.iter()
                 .map(|x| {
@@ -2950,16 +2995,13 @@ fn parse_loopback_config(data: &[u8]) -> std::result::Result<(String, SniffingRe
 ///
 /// JSON 格式：`{ "address": "1.2.3.4", "port": 443 }`。
 /// address 支持域名和 IP；port 必须 0-65535。
-fn parse_dokodemo_config(data: &[u8]) -> std::result::Result<xray_proxy_dokodemo::DokodemoOutboundConfig, String> {
+fn parse_dokodemo_config(
+    data: &[u8],
+) -> std::result::Result<xray_proxy_dokodemo::DokodemoOutboundConfig, String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
-    let address_str = v
-        .get("address")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "missing address".to_string())?;
-    let port = v
-        .get("port")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| "missing port".to_string())?;
+    let address_str =
+        v.get("address").and_then(|v| v.as_str()).ok_or_else(|| "missing address".to_string())?;
+    let port = v.get("port").and_then(|v| v.as_u64()).ok_or_else(|| "missing port".to_string())?;
     let port = u16::try_from(port).map_err(|_| "port out of range")?;
     let address = if let Ok(ip) = address_str.parse::<std::net::IpAddr>() {
         match ip {
@@ -2990,17 +3032,14 @@ impl From<String> for BuildError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use xray_app_dispatcher::default::SimpleOhm;
-    use xray_app_dispatcher::OutboundHandlerManager;
+    use xray_app_dispatcher::{OutboundHandlerManager, default::SimpleOhm};
     use xray_conf::{BuiltConfig, BuiltEntry, BuiltOutbound};
+
+    use super::*;
 
     fn make_outbound(kind: &str, tag: &str, data: &str) -> BuiltOutbound {
         BuiltOutbound {
-            entry: BuiltEntry {
-                kind: kind.to_string(),
-                data: data.as_bytes().to_vec(),
-            },
+            entry: BuiltEntry { kind: kind.to_string(), data: data.as_bytes().to_vec() },
             tag: tag.to_string(),
             send_through: None,
             stream_settings_json: None,
@@ -3011,10 +3050,7 @@ mod tests {
     }
 
     fn mux_outbound(tag: &str, mux_json: serde_json::Value) -> BuiltOutbound {
-        BuiltOutbound {
-            mux_json: Some(mux_json),
-            ..make_outbound("freedom", tag, "{}")
-        }
+        BuiltOutbound { mux_json: Some(mux_json), ..make_outbound("freedom", tag, "{}") }
     }
 
     /// 对齐 Go proxyman/outbound/outbound.go:109-111：default = 首个注册成功的
@@ -3034,8 +3070,8 @@ mod tests {
 
     #[test]
     fn parse_udp443_policies_from_mux_json() {
-        use xray_app_dispatcher::default::Udp443Policy;
         use serde_json::json;
+        use xray_app_dispatcher::default::Udp443Policy;
 
         let outbounds = vec![
             // mux enabled 无字段 → 空串规范化为 Reject（Go MuxConfig.Build）
@@ -3078,7 +3114,6 @@ mod tests {
         assert!(sniffing.route_only);
     }
 
-
     #[test]
     fn register_freedom_sets_default_and_tagged() {
         let mut built = BuiltConfig::default();
@@ -3114,15 +3149,16 @@ mod tests {
     #[tokio::test]
     async fn freedom_send_through_binds_source_ip() {
         use std::net::IpAddr;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
+
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
         use xray_app_dispatcher::default::{DefaultDispatcher, SniffingRequest};
-        use xray_buf::io::Writer as _;
-        use xray_buf::multi::MultiBuffer;
-        use xray_common::net::address::Address;
-        use xray_common::net::destination::Destination;
-        use xray_common::net::network::Network;
-        use xray_common::net::port::Port;
+        use xray_buf::{io::Writer as _, multi::MultiBuffer};
+        use xray_common::net::{
+            address::Address, destination::Destination, network::Network, port::Port,
+        };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_port = listener.local_addr().unwrap().port();
@@ -3186,7 +3222,6 @@ mod tests {
         );
     }
 
-
     /// bd 7zc：parse_send_through 对齐 Go xray.go:287-301 解析与校验。
     #[test]
     fn parse_send_through_forms() {
@@ -3203,10 +3238,7 @@ mod tests {
         );
         assert_eq!(
             parse_send_through(&Some("10.0.0.0/24".into())).unwrap(),
-            Some(SendThroughSpec::Cidr {
-                base: "10.0.0.0".parse().unwrap(),
-                prefix: 24
-            })
+            Some(SendThroughSpec::Cidr { base: "10.0.0.0".parse().unwrap(), prefix: 24 })
         );
         assert_eq!(
             parse_send_through(&Some("origin".into())).unwrap(),
@@ -3251,8 +3283,10 @@ mod tests {
                 { "address": "b.example.com", "port": 443, "users": [{ "id": "b831381d-6324-4d53-ad4f-8cda48b30811" }] }
             ]
         }"#;
-        assert!(parse_vless_config(settings.as_bytes()).is_err(),
-            "multiple vnext entries should be rejected like Go");
+        assert!(
+            parse_vless_config(settings.as_bytes()).is_err(),
+            "multiple vnext entries should be rejected like Go"
+        );
     }
 
     #[test]
@@ -3267,8 +3301,10 @@ mod tests {
                 ]
             }]
         }"#;
-        assert!(parse_vless_config(settings.as_bytes()).is_err(),
-            "multiple users should be rejected like Go");
+        assert!(
+            parse_vless_config(settings.as_bytes()).is_err(),
+            "multiple users should be rejected like Go"
+        );
     }
 
     #[test]
@@ -3346,10 +3382,7 @@ mod tests {
         let ohm = SimpleOhm::new();
         register_outbounds(&built, &ohm, None, None, None).unwrap();
 
-        assert!(
-            ohm.get_handler("bad-vless").is_none(),
-            "invalid uuid should skip"
-        );
+        assert!(ohm.get_handler("bad-vless").is_none(), "invalid uuid should skip");
     }
 
     #[test]
@@ -3396,8 +3429,8 @@ mod tests {
         };
 
         // 拼错 mode（nativ ≠ native）→ 拒启，错误含 Go 原文前缀。
-        let err = parse_vless_config(mk("mlkem768x25519plus.nativ.0rtt.AAAA").as_bytes())
-            .unwrap_err();
+        let err =
+            parse_vless_config(mk("mlkem768x25519plus.nativ.0rtt.AAAA").as_bytes()).unwrap_err();
         assert!(
             err.contains(r#"unsupported "encryption""#) && err.contains("nativ"),
             "拼错 mode 必须拒启，got: {err}"
@@ -3405,8 +3438,10 @@ mod tests {
 
         // 非法 rtt / 畸形 key 段同样拒启。
         assert!(parse_vless_config(mk("mlkem768x25519plus.native.5rtt.AAAA").as_bytes()).is_err());
-        assert!(parse_vless_config(mk("mlkem768x25519plus.native.0rtt.!!!not-base64!").as_bytes())
-            .is_err());
+        assert!(
+            parse_vless_config(mk("mlkem768x25519plus.native.0rtt.!!!not-base64!").as_bytes())
+                .is_err()
+        );
 
         // none / 显式空串 / 缺字段 → 明文通过。
         assert!(parse_vless_config(mk("none").as_bytes()).is_ok());
@@ -3488,10 +3523,7 @@ mod tests {
         }"#;
         let config = parse_vless_config(data.as_bytes()).unwrap();
         assert_eq!(config.server_port.value(), 8443);
-        assert_eq!(
-            config.user_uuid.to_string(),
-            "b831381d-6324-4d53-ad4f-8cda48b30811"
-        );
+        assert_eq!(config.user_uuid.to_string(), "b831381d-6324-4d53-ad4f-8cda48b30811");
         assert_eq!(config.flow, "xtls-rprx-vision");
         match &config.server_address {
             Address::Domain(d) => assert_eq!(d, "flat.example.com"),
@@ -3669,17 +3701,13 @@ mod tests {
             "bb".repeat(32),
         );
         let config = parse_wireguard_config(data.as_bytes()).unwrap();
-        assert!(
-            config.peers[0].allowed_ips.is_empty(),
-            "显式空 allowedIPs 尊重为空"
-        );
+        assert!(config.peers[0].allowed_ips.is_empty(), "显式空 allowedIPs 尊重为空");
     }
 
     #[test]
     fn freedom_noise_removed_warning_aligns_go() {
         // Go infra/conf/freedom.go:145-147：单数 noise 已移除。
-        let v: serde_json::Value =
-            serde_json::from_str(r#"{"noise":{"lengthMin":100}}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(r#"{"noise":{"lengthMin":100}}"#).unwrap();
         assert_eq!(
             freedom_noise_removed_warning(&v),
             Some(
@@ -3740,10 +3768,7 @@ mod tests {
         }
         // 未知值拒启，错误信息保留原始大小写（Go :88）。
         let err = parse_freedom_domain_strategy("UseIPv3").err().expect("must reject");
-        assert!(
-            err.to_string().contains("unsupported domain strategy: UseIPv3"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("unsupported domain strategy: UseIPv3"), "got: {err}");
     }
 
     /// vrll①：targetStrategy 非空优先于 domainStrategy（Go freedom.go:62-64）。
@@ -3861,10 +3886,8 @@ mod tests {
     /// sockopt 字段必须到达 dial_system）。
     #[test]
     fn parse_stream_settings_tcp_sockopt_keeps_some() {
-        let v: serde_json::Value = serde_json::from_str(
-            r#"{"sockopt": {"dialerProxy": "proxy-out"}}"#,
-        )
-        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"sockopt": {"dialerProxy": "proxy-out"}}"#).unwrap();
         let s = parse_stream_settings(&Some(v)).expect("sockopt must keep Some");
         assert_eq!(s.socket_options().dialer_proxy, "proxy-out");
     }
@@ -3881,7 +3904,8 @@ mod tests {
 
     #[test]
     fn register_blackhole_http_response_type() {
-        // ponytail: blackhole response.type=http 注册不报错即可（dispatch 行为已在 blackhole crate 测过）
+        // ponytail: blackhole response.type=http 注册不报错即可（dispatch 行为已在 blackhole crate
+        // 测过）
         let settings = r#"{"response":{"type":"http"}}"#;
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("blackhole", "bh-http", settings));
@@ -3902,7 +3926,8 @@ mod tests {
 
     #[test]
     fn register_socks_outbound_parses_auth() {
-        let settings = r#"{"servers":[{"address":"1.2.3.4","port":1080,"users":[{"user":"u","pass":"p"}]}]}"#;
+        let settings =
+            r#"{"servers":[{"address":"1.2.3.4","port":1080,"users":[{"user":"u","pass":"p"}]}]}"#;
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("socks", "socks-auth", settings));
         let ohm = SimpleOhm::new();
@@ -3962,10 +3987,7 @@ mod tests {
             None
         );
         // 0 → 8（Go "same as before" 默认）
-        assert_eq!(
-            super::outbound_mux_concurrency(&ob(Some(json!({"enabled": true})))),
-            Some(8)
-        );
+        assert_eq!(super::outbound_mux_concurrency(&ob(Some(json!({"enabled": true})))), Some(8));
         // 正值透传
         assert_eq!(
             super::outbound_mux_concurrency(&ob(Some(json!({"enabled": true, "concurrency": 16})))),
@@ -3976,8 +3998,9 @@ mod tests {
     /// xudpConcurrency 三态解析（Go NewHandler :143-164）。
     #[test]
     fn outbound_xudp_mode_tri_state_like_go_new_handler() {
-        use super::{XudpMode, outbound_xudp_mode};
         use serde_json::json;
+
+        use super::{XudpMode, outbound_xudp_mode};
         let ob = |mux: Option<serde_json::Value>| BuiltOutbound {
             mux_json: mux,
             ..make_outbound("freedom", "m", "{}")
@@ -3992,10 +4015,7 @@ mod tests {
             outbound_xudp_mode(&ob(Some(json!({"enabled": true, "xudpConcurrency": 0})))),
             XudpMode::Carrier
         );
-        assert_eq!(
-            outbound_xudp_mode(&ob(Some(json!({"enabled": true})))),
-            XudpMode::Carrier
-        );
+        assert_eq!(outbound_xudp_mode(&ob(Some(json!({"enabled": true})))), XudpMode::Carrier);
         // >0 → Manager(n)（独立管理器）
         assert_eq!(
             outbound_xudp_mode(&ob(Some(json!({"enabled": true, "xudpConcurrency": 4})))),
@@ -4013,8 +4033,8 @@ mod tests {
     /// 载体直发底层出站（Go ClientManager{Enabled:false}）。
     #[tokio::test]
     async fn mux_bridge_xudp_direct_sends_udp_straight_to_underlying() {
-        use xray_buf::io::Reader as _;
         use tokio::io::AsyncWriteExt as _;
+        use xray_buf::io::Reader as _;
 
         #[derive(Debug)]
         struct CaptureUnderlying {
@@ -4024,6 +4044,7 @@ mod tests {
             fn tag(&self) -> &str {
                 "capture-direct"
             }
+
             fn dispatch(&self, _dest: &Destination, link: Link) -> PinFuture<()> {
                 let captured = Arc::clone(&self.captured);
                 Box::pin(async move {
@@ -4035,7 +4056,7 @@ mod tests {
                                 for b in mb.iter() {
                                     c.extend_from_slice(b.bytes());
                                 }
-                            }
+                            },
                             _ => break,
                         }
                     }
@@ -4046,9 +4067,7 @@ mod tests {
         let (mut bridge, _slot) = MuxBridge::new("mux-direct", 4);
         let captured: Arc<parking_lot::Mutex<Vec<u8>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
-        bridge.set_underlying(Arc::new(CaptureUnderlying {
-            captured: Arc::clone(&captured),
-        }));
+        bridge.set_underlying(Arc::new(CaptureUnderlying { captured: Arc::clone(&captured) }));
         bridge.udp_direct = true;
         let bridge = Arc::new(bridge);
 
@@ -4166,16 +4185,14 @@ mod tests {
         assert!(!super::outbound_mux_udp443_skip(&ob(Some(
             serde_json::json!({"enabled": true, "xudpProxyUDP443": "allow"})
         ))));
-        assert!(!super::outbound_mux_udp443_skip(&ob(Some(
-            serde_json::json!({"enabled": true})
-        ))));
+        assert!(!super::outbound_mux_udp443_skip(&ob(Some(serde_json::json!({"enabled": true})))));
         assert!(!super::outbound_mux_udp443_skip(&ob(None)));
     }
 
     #[tokio::test]
     async fn udp443_skip_sends_raw_to_underlying() {
-        use xray_buf::io::Reader as _;
         use tokio::io::AsyncWriteExt as _;
+        use xray_buf::io::Reader as _;
 
         #[derive(Debug)]
         struct CaptureUnderlying {
@@ -4185,6 +4202,7 @@ mod tests {
             fn tag(&self) -> &str {
                 "capture-skip"
             }
+
             fn dispatch(&self, _dest: &Destination, link: Link) -> PinFuture<()> {
                 let captured = Arc::clone(&self.captured);
                 Box::pin(async move {
@@ -4196,7 +4214,7 @@ mod tests {
                                 for b in mb.iter() {
                                     c.extend_from_slice(b.bytes());
                                 }
-                            }
+                            },
                             _ => break,
                         }
                     }
@@ -4208,9 +4226,7 @@ mod tests {
             Arc::new(parking_lot::Mutex::new(Vec::new()));
         let (bridge, _slot) = MuxBridge::new("mux-skip", 8);
         let bridge = bridge.with_udp443_skip();
-        bridge.set_underlying(Arc::new(CaptureUnderlying {
-            captured: Arc::clone(&captured),
-        }));
+        bridge.set_underlying(Arc::new(CaptureUnderlying { captured: Arc::clone(&captured) }));
         let bridge = Arc::new(bridge);
 
         let (mut child, child_server) = tokio::io::duplex(64 * 1024);
@@ -4258,13 +4274,15 @@ mod tests {
 
     #[test]
     fn parse_proxy_chain_tag_extracts_tag() {
-        let json: serde_json::Value = serde_json::json!({ "tag": "proxy-out", "transportLayerProxy": true });
+        let json: serde_json::Value =
+            serde_json::json!({ "tag": "proxy-out", "transportLayerProxy": true });
         assert_eq!(parse_proxy_chain_tag(Some(&json)), Some("proxy-out".to_string()));
     }
 
     #[test]
     fn parse_proxy_chain_tag_empty_string_returns_none() {
-        let json: serde_json::Value = serde_json::json!({ "tag": "", "transportLayerProxy": false });
+        let json: serde_json::Value =
+            serde_json::json!({ "tag": "", "transportLayerProxy": false });
         assert_eq!(parse_proxy_chain_tag(Some(&json)), None);
     }
 
@@ -4355,7 +4373,9 @@ mod tests {
     #[test]
     fn parse_tuic_config_invalid_values_rejected() {
         assert!(parse_tuic_config(tuic_json(r#","udp_relay_mode":"udp""#).as_bytes()).is_err());
-        assert!(parse_tuic_config(tuic_json(r#","congestion_control":"bbrv3""#).as_bytes()).is_err());
+        assert!(
+            parse_tuic_config(tuic_json(r#","congestion_control":"bbrv3""#).as_bytes()).is_err()
+        );
     }
 
     /// s8ti：hysteria_bbr / hysteria_brutal 变体解析；brutal 必须显式带 brutal_up_bps。
@@ -4425,7 +4445,9 @@ mod tests {
         .await
         .expect("mock bind");
         let addr = server.local_addr();
-        tokio::spawn(async move { let _ = server.run().await; });
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
         (addr, cert_der)
     }
 
@@ -4535,11 +4557,11 @@ mod tests {
     // ========== targetStrategy（bd bqm）==========
 
     use std::sync::Mutex;
+
     use xray_app_dispatcher::default::DialFn;
-    use xray_common::net::address::Address;
-    use xray_common::net::destination::Destination;
-    use xray_common::net::network::Network;
-    use xray_common::net::port::Port;
+    use xray_common::net::{
+        address::Address, destination::Destination, network::Network, port::Port,
+    };
 
     /// 记录 dest 的 fake dial_fn，返回 duplex 连接（不断链）。
     fn recording_dial(recorded: Arc<Mutex<Vec<Destination>>>) -> DialFn {
@@ -4557,20 +4579,15 @@ mod tests {
 
     /// 构造带静态 hosts 的 DnsService（hosts：resolve-test.invalid → 127.0.0.1）。
     fn hosts_dns_service() -> Arc<xray_app_dns::DnsService> {
-        let cfg: xray_app_dns::DnsAppConfig = serde_json::from_str(
-            r#"{"hosts": {"resolve-test.invalid": "127.0.0.1"}}"#,
-        )
-        .expect("dns config json");
+        let cfg: xray_app_dns::DnsAppConfig =
+            serde_json::from_str(r#"{"hosts": {"resolve-test.invalid": "127.0.0.1"}}"#)
+                .expect("dns config json");
         let svc = cfg.build().expect("dns config build");
         Arc::new(xray_app_dns::DnsService::new(svc))
     }
 
     fn domain_dest(domain: &str) -> Destination {
-        Destination::new(
-            Address::Domain(domain.to_string()),
-            Port::new(443),
-            Network::TCP,
-        )
+        Destination::new(Address::Domain(domain.to_string()), Port::new(443), Network::TCP)
     }
 
     #[test]
@@ -4666,11 +4683,14 @@ mod tests {
     /// 对照组（无 targetStrategy）：OS 无法解析 `.invalid` 域名 → 无回显。
     #[tokio::test]
     async fn target_strategy_end_to_end_json_to_echo() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
-        use xray_buf::io::Reader as _;
-        use xray_buf::io::Writer as _;
-        use xray_buf::multi::MultiBuffer;
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        use xray_buf::{
+            io::{Reader as _, Writer as _},
+            multi::MultiBuffer,
+        };
 
         // echo server
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4683,7 +4703,7 @@ mod tests {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         let _ = sock.write_all(&buf[..n]).await;
-                    }
+                    },
                 }
             }
         });
@@ -4699,8 +4719,10 @@ mod tests {
         let handler = ohm.get_handler("out").expect("outbound registered");
 
         // inbound 侧 link：pipe 双向
-        let (up_r, mut up_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
-        let (mut dn_r, dn_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let (up_r, mut up_w) =
+            xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let (mut dn_r, dn_w) =
+            xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
         let link = xray_transport::link::Link::new(
             Box::new(up_r) as Box<dyn xray_buf::io::Reader>,
             Box::new(dn_w) as Box<dyn xray_buf::io::Writer>,
@@ -4719,10 +4741,11 @@ mod tests {
         let mut mb = MultiBuffer::new();
         mb.merge_bytes(b"target-strategy-e2e");
         up_w.write_multi_buffer(mb).await.unwrap();
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
-            .await
-            .expect("echo should come back via resolved IP")
-            .unwrap();
+        let resp =
+            tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
+                .await
+                .expect("echo should come back via resolved IP")
+                .unwrap();
         assert_eq!(resp.to_vec(), b"target-strategy-e2e");
 
         // 对照组：无 targetStrategy → 域名直连 OS 解析失败（.invalid RFC 6761）→ 无回显
@@ -4735,8 +4758,10 @@ mod tests {
         let ohm2 = SimpleOhm::new();
         register_outbounds(&plain, &ohm2, None, Some(hosts_dns_service()), None).unwrap();
         let h2 = ohm2.get_handler("plain").unwrap();
-        let (up_r2, mut up_w2) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
-        let (mut dn_r2, dn_w2) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let (up_r2, mut up_w2) =
+            xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let (mut dn_r2, dn_w2) =
+            xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
         let link2 = xray_transport::link::Link::new(
             Box::new(up_r2) as Box<dyn xray_buf::io::Reader>,
             Box::new(dn_w2) as Box<dyn xray_buf::io::Writer>,
@@ -4780,7 +4805,7 @@ mod tests {
                                 if sock.write_all(&buf[..n]).await.is_err() {
                                     break;
                                 }
-                            }
+                            },
                         }
                     }
                 });
@@ -4791,15 +4816,11 @@ mod tests {
 
     /// 手工 socks5 服务器：no-auth 握手 + 记录 CONNECT 目标 + 双向桥接。
     /// 记录是「经代理而非直连」的判别器。返回 (端口, 记录)。
-    async fn spawn_socks5_recorder() -> (
-        u16,
-        Arc<Mutex<Vec<(std::net::IpAddr, u16)>>>,
-    ) {
+    async fn spawn_socks5_recorder() -> (u16, Arc<Mutex<Vec<(std::net::IpAddr, u16)>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let recorded: Arc<Mutex<Vec<(std::net::IpAddr, u16)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let recorded: Arc<Mutex<Vec<(std::net::IpAddr, u16)>>> = Arc::new(Mutex::new(Vec::new()));
         let rec = Arc::clone(&recorded);
         tokio::spawn(async move {
             loop {
@@ -4818,18 +4839,19 @@ mod tests {
                         return;
                     };
                     let target_addr = match &addr.host {
-                        xray_proxy_socks::Host::Domain(d) => tokio::net::lookup_host(format!("{d}:{}", addr.port))
-                            .await
-                            .ok()
-                            .and_then(|mut i| i.next()),
+                        xray_proxy_socks::Host::Domain(d) => {
+                            tokio::net::lookup_host(format!("{d}:{}", addr.port))
+                                .await
+                                .ok()
+                                .and_then(|mut i| i.next())
+                        },
                         h => h.to_socket_addr(addr.port),
                     };
                     let Some(target_addr) = target_addr else {
                         return;
                     };
                     rec.lock().expect("lock").push((target_addr.ip(), target_addr.port()));
-                    let Ok(mut target) = tokio::net::TcpStream::connect(target_addr).await
-                    else {
+                    let Ok(mut target) = tokio::net::TcpStream::connect(target_addr).await else {
                         return;
                     };
                     let _ = tokio::io::copy_bidirectional(&mut sock, &mut target).await;
@@ -4856,7 +4878,8 @@ mod tests {
             let (stream_json, proxy_json) = if use_transport_layer {
                 (
                     String::new(),
-                    r#", "proxySettings": {"tag": "socks-out", "transportLayer": true }"#.to_string(),
+                    r#", "proxySettings": {"tag": "socks-out", "transportLayer": true }"#
+                        .to_string(),
                 )
             } else {
                 (
@@ -4947,14 +4970,12 @@ mod tests {
 
             let (proxy_json, stream_json) = if use_transport_layer {
                 (
-                    r#", "proxySettings": {"tag": "socks-out", "transportLayer": true}"#.to_string(),
+                    r#", "proxySettings": {"tag": "socks-out", "transportLayer": true}"#
+                        .to_string(),
                     String::new(),
                 )
             } else {
-                (
-                    r#", "proxySettings": {"tag": "socks-out"}"#.to_string(),
-                    String::new(),
-                )
+                (r#", "proxySettings": {"tag": "socks-out"}"#.to_string(), String::new())
             };
             let json = format!(
                 r#"{{"outbounds": [
@@ -5022,7 +5043,7 @@ mod tests {
             );
         }
     }
- 
+
     // ========== DnsDispatchBridge e2e（bd 8hl） ==========
 
     /// 构造最小 DNS 查询（Header + Question）。
@@ -5061,35 +5082,30 @@ mod tests {
 
     /// DnsService（含 fakedns client）——Hijack 动作 e2e 用。
     fn make_fakedns_service(client_tag: &str) -> Arc<xray_app_dns::server::DnsService> {
-        use xray_app_dns::fakedns::Holder;
-        use xray_app_dns::nameserver::fakedns::FakeDnsServer;
-        use xray_app_dns::nameserver::{Client, NameServerConfig, Server};
-
-        let ns = NameServerConfig {
-            tag: client_tag.to_string(),
-            ..Default::default()
+        use xray_app_dns::{
+            fakedns::Holder,
+            nameserver::{Client, NameServerConfig, Server, fakedns::FakeDnsServer},
         };
-        let fake: Box<dyn Server> =
-            Box::new(FakeDnsServer::new(Holder::new_default().unwrap()));
+
+        let ns = NameServerConfig { tag: client_tag.to_string(), ..Default::default() };
+        let fake: Box<dyn Server> = Box::new(FakeDnsServer::new(Holder::new_default().unwrap()));
         let client = Client::new(ns, xray_app_dns::config::IpOption::all(), fake).unwrap();
-        Arc::new(xray_app_dns::server::DnsService::new(
-            xray_app_dns::server::DnsServiceConfig {
-                client_ip: Vec::new(),
-                query_strategy: xray_app_dns::config::QueryStrategy::UseIp,
-                tag: "test-dns".into(),
-                hosts: xray_app_dns::hosts::StaticHosts::new(Vec::new()).unwrap(),
-                clients: vec![Arc::new(client)],
-                disable_fallback: false,
-                disable_fallback_if_match: false,
-                enable_parallel_query: false,
-                disable_cache: false,
-                serve_stale: false,
-                serve_expired_ttl: 0,
-                use_system_hosts: false,
-                domain_matcher: None,
-                matcher_infos: Vec::new(),
-            },
-        ))
+        Arc::new(xray_app_dns::server::DnsService::new(xray_app_dns::server::DnsServiceConfig {
+            client_ip: Vec::new(),
+            query_strategy: xray_app_dns::config::QueryStrategy::UseIp,
+            tag: "test-dns".into(),
+            hosts: xray_app_dns::hosts::StaticHosts::new(Vec::new()).unwrap(),
+            clients: vec![Arc::new(client)],
+            disable_fallback: false,
+            disable_fallback_if_match: false,
+            enable_parallel_query: false,
+            disable_cache: false,
+            serve_stale: false,
+            serve_expired_ttl: 0,
+            use_system_hosts: false,
+            domain_matcher: None,
+            matcher_infos: Vec::new(),
+        }))
     }
 
     /// dispatch bridge 并返回 (up_writer, dn_reader)。
@@ -5097,10 +5113,7 @@ mod tests {
         bridge: &DnsDispatchBridge,
         dest: &Destination,
         access: Option<xray_app_dispatcher::default::AccessContext>,
-    ) -> (
-        Box<dyn xray_buf::io::Writer>,
-        Box<dyn xray_buf::io::Reader>,
-    ) {
+    ) -> (Box<dyn xray_buf::io::Writer>, Box<dyn xray_buf::io::Reader>) {
         let (up_r, up_w) = xray_buf::pipe::new();
         let (dn_r, dn_w) = xray_buf::pipe::new();
         let link = Link::new(
@@ -5113,13 +5126,13 @@ mod tests {
                 tokio::spawn(async move {
                     let _ = fut.await;
                 });
-            }
+            },
             None => {
                 let fut = bridge.dispatch(dest, link);
                 tokio::spawn(async move {
                     let _ = fut.await;
                 });
-            }
+            },
         }
         (
             Box::new(up_w) as Box<dyn xray_buf::io::Writer>,
@@ -5130,21 +5143,22 @@ mod tests {
     /// e2e：UDP Direct 规则 → 原样 query 转发到上游 → 响应回客户端。
     #[tokio::test]
     async fn dns_udp_direct_forwards_raw_roundtrip() {
-        use xray_buf::io::{Reader as _, Writer as _};
-        use xray_buf::multi::MultiBuffer;
+        use xray_buf::{
+            io::{Reader as _, Writer as _},
+            multi::MultiBuffer,
+        };
 
         let upstream_resp = dns_make_query(0x7777, "example.com", 1); // 原样回显即可
         let captured: Arc<parking_lot::Mutex<Option<Vec<u8>>>> =
             Arc::new(parking_lot::Mutex::new(None));
-        let addr =
-            spawn_dns_udp_mock(upstream_resp.clone(), captured.clone()).await;
+        let addr = spawn_dns_udp_mock(upstream_resp.clone(), captured.clone()).await;
 
         // Direct 规则（qType A）。
         let handler =
-            parse_dns_outbound_config(br#"{"rule":[{"action":"direct","qType":[1]}]}"#)
-                .unwrap();
+            parse_dns_outbound_config(br#"{"rule":[{"action":"direct","qType":[1]}]}"#).unwrap();
         let bridge = DnsDispatchBridge::new("dns-out", handler, None);
-        let dest = Destination::udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(addr.port()));
+        let dest =
+            Destination::udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(addr.port()));
         let (mut up_w, mut dn_r) = spawn_dns_bridge(&bridge, &dest, None);
 
         let query = dns_make_query(0x1234, "example.com", 1);
@@ -5152,10 +5166,11 @@ mod tests {
         mb.merge_bytes(&query);
         up_w.write_multi_buffer(mb).await.unwrap();
 
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
-            .await
-            .expect("timeout waiting response")
-            .unwrap();
+        let resp =
+            tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
+                .await
+                .expect("timeout waiting response")
+                .unwrap();
         assert_eq!(resp.to_vec(), upstream_resp);
         // 上游收到原样 query（未重新编码）。
         assert_eq!(captured.lock().clone(), Some(query));
@@ -5164,8 +5179,10 @@ mod tests {
     /// e2e：默认（无规则）A 查询 → Hijack → DnsService(fakedns) → fake IP 响应。
     #[tokio::test]
     async fn dns_udp_default_a_hijacks_via_fakedns() {
-        use xray_buf::io::{Reader as _, Writer as _};
-        use xray_buf::multi::MultiBuffer;
+        use xray_buf::{
+            io::{Reader as _, Writer as _},
+            multi::MultiBuffer,
+        };
 
         let svc = make_fakedns_service("fake-in");
         let handler = parse_dns_outbound_config(b"{}").unwrap();
@@ -5179,10 +5196,11 @@ mod tests {
         mb.merge_bytes(&query);
         up_w.write_multi_buffer(mb).await.unwrap();
 
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
-            .await
-            .expect("timeout waiting hijack response")
-            .unwrap();
+        let resp =
+            tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
+                .await
+                .expect("timeout waiting hijack response")
+                .unwrap();
         let resp = resp.to_vec();
         // Header：id 回显 + QR=1。
         assert_eq!(&resp[0..2], &0x4242u16.to_be_bytes());
@@ -5197,9 +5215,8 @@ mod tests {
     /// `xudp.GetGlobalID(ctx)` 语义）；TCP 目标退化为无源 dispatch。
     #[tokio::test]
     async fn mux_bridge_dispatch_with_access_carries_global_id_for_udp() {
-        use xray_buf::io::Reader as _;
-        use xray_buf::io::Writer as _;
         use tokio::io::AsyncWriteExt as _;
+        use xray_buf::io::{Reader as _, Writer as _};
 
         // ---- 捕获 carrier 字节的假 underlying（DialingWorkerFactory 拨号落点）----
         #[derive(Debug)]
@@ -5210,6 +5227,7 @@ mod tests {
             fn tag(&self) -> &str {
                 "capture-underlying"
             }
+
             fn dispatch(&self, _dest: &Destination, link: Link) -> PinFuture<()> {
                 let captured = Arc::clone(&self.captured);
                 Box::pin(async move {
@@ -5221,7 +5239,7 @@ mod tests {
                                 for b in mb.iter() {
                                     c.extend_from_slice(b.bytes());
                                 }
-                            }
+                            },
                             _ => break,
                         }
                     }
@@ -5232,9 +5250,7 @@ mod tests {
         let (bridge, slot) = MuxBridge::new("mux-gid", 4);
         let captured: Arc<parking_lot::Mutex<Vec<u8>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
-        bridge.set_underlying(Arc::new(CaptureUnderlying {
-            captured: Arc::clone(&captured),
-        }));
+        bridge.set_underlying(Arc::new(CaptureUnderlying { captured: Arc::clone(&captured) }));
 
         // 子会话 link：client 侧首包 "probe" 随 New 帧下发。
         let (mut child_client, child_server) = tokio::io::duplex(64 * 1024);
@@ -5242,10 +5258,8 @@ mod tests {
         let link = Link::new(xray_buf::io::new_reader(sr), xray_buf::io::new_writer(sw));
         child_client.write_all(b"probe").await.unwrap();
 
-        let dest = Destination::udp(
-            Address::ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
-            Port::new(53),
-        );
+        let dest =
+            Destination::udp(Address::ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)), Port::new(53));
         let access = xray_app_dispatcher::default::AccessContext {
             from: "10.0.0.9:5555".to_string(),
             ..Default::default()
@@ -5290,9 +5304,8 @@ mod tests {
     /// bd 4jyhm 对称面：TCP 目标不携带 GlobalID（Go GetGlobalID 仅 UDP 源）。
     #[tokio::test]
     async fn mux_bridge_dispatch_with_access_tcp_has_no_global_id() {
-        use xray_buf::io::Reader as _;
-        use xray_buf::io::Writer as _;
         use tokio::io::AsyncWriteExt as _;
+        use xray_buf::io::{Reader as _, Writer as _};
 
         #[derive(Debug)]
         struct CaptureUnderlying {
@@ -5302,6 +5315,7 @@ mod tests {
             fn tag(&self) -> &str {
                 "capture-underlying-tcp"
             }
+
             fn dispatch(&self, _dest: &Destination, link: Link) -> PinFuture<()> {
                 let captured = Arc::clone(&self.captured);
                 Box::pin(async move {
@@ -5313,7 +5327,7 @@ mod tests {
                                 for b in mb.iter() {
                                     c.extend_from_slice(b.bytes());
                                 }
-                            }
+                            },
                             _ => break,
                         }
                     }
@@ -5324,9 +5338,7 @@ mod tests {
         let (bridge, slot) = MuxBridge::new("mux-gid-tcp", 4);
         let captured: Arc<parking_lot::Mutex<Vec<u8>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
-        bridge.set_underlying(Arc::new(CaptureUnderlying {
-            captured: Arc::clone(&captured),
-        }));
+        bridge.set_underlying(Arc::new(CaptureUnderlying { captured: Arc::clone(&captured) }));
 
         let (mut child_client, child_server) = tokio::io::duplex(64 * 1024);
         let (sr, sw) = tokio::io::split(child_server);
@@ -5363,32 +5375,29 @@ mod tests {
         let meta_len = u16::from_be_bytes([snap[0], snap[1]]) as usize;
         let (meta, _) = xray_mux::frame::FrameMetadata::read_from_bytes(&snap[..2 + meta_len])
             .expect("parse New frame meta");
-        assert_eq!(
-            meta.global_id(),
-            None,
-            "TCP New frame must not carry GlobalID"
-        );
+        assert_eq!(meta.global_id(), None, "TCP New frame must not carry GlobalID");
         task.abort();
     }
-
 
     /// e2e：ownLink（inbound tag = nameserver client tag）→ 原样转发不劫持。
     #[tokio::test]
     async fn dns_udp_own_link_bypasses_rules() {
-        use xray_buf::io::{Reader as _, Writer as _};
-        use xray_buf::multi::MultiBuffer;
+        use xray_buf::{
+            io::{Reader as _, Writer as _},
+            multi::MultiBuffer,
+        };
 
         let upstream_resp = dns_make_query(0x9999, "upstream.com", 1);
         let captured: Arc<parking_lot::Mutex<Option<Vec<u8>>>> =
             Arc::new(parking_lot::Mutex::new(None));
-        let addr =
-            spawn_dns_udp_mock(upstream_resp.clone(), captured.clone()).await;
+        let addr = spawn_dns_udp_mock(upstream_resp.clone(), captured.clone()).await;
 
         // 无规则（A 默认 Hijack）+ DnsService 带 client tag "self-loop"。
         let svc = make_fakedns_service("self-loop");
         let handler = parse_dns_outbound_config(b"{}").unwrap();
         let bridge = DnsDispatchBridge::new("dns-out", handler, Some(svc));
-        let dest = Destination::udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(addr.port()));
+        let dest =
+            Destination::udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(addr.port()));
 
         let mut access = xray_app_dispatcher::default::AccessContext::default();
         access.inbound_tag = "self-loop".into();
@@ -5399,10 +5408,11 @@ mod tests {
         mb.merge_bytes(&query);
         up_w.write_multi_buffer(mb).await.unwrap();
 
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
-            .await
-            .expect("timeout waiting own-link response")
-            .unwrap();
+        let resp =
+            tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
+                .await
+                .expect("timeout waiting own-link response")
+                .unwrap();
         // 响应来自 mock（非 fakedns），上游收到原样 query。
         assert_eq!(resp.to_vec(), upstream_resp);
         assert_eq!(captured.lock().clone(), Some(query));
@@ -5411,13 +5421,14 @@ mod tests {
     /// e2e：Return 规则 + rCode 5 + TXT 查询 → REFUSED 响应（Go rejectNonIPQuery）。
     #[tokio::test]
     async fn dns_udp_return_rule_responds_rcode() {
-        use xray_buf::io::{Reader as _, Writer as _};
-        use xray_buf::multi::MultiBuffer;
+        use xray_buf::{
+            io::{Reader as _, Writer as _},
+            multi::MultiBuffer,
+        };
 
-        let handler = parse_dns_outbound_config(
-            br#"{"rule":[{"action":"return","qType":[16],"rCode":5}]}"#,
-        )
-        .unwrap();
+        let handler =
+            parse_dns_outbound_config(br#"{"rule":[{"action":"return","qType":[16],"rCode":5}]}"#)
+                .unwrap();
         let bridge = DnsDispatchBridge::new("dns-out", handler, None);
         let dest = Destination::udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(53));
         let (mut up_w, mut dn_r) = spawn_dns_bridge(&bridge, &dest, None);
@@ -5427,10 +5438,11 @@ mod tests {
         mb.merge_bytes(&query);
         up_w.write_multi_buffer(mb).await.unwrap();
 
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
-            .await
-            .expect("timeout waiting reject response")
-            .unwrap();
+        let resp =
+            tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
+                .await
+                .expect("timeout waiting reject response")
+                .unwrap();
         let resp = resp.to_vec();
         assert_eq!(&resp[0..2], &0x3141u16.to_be_bytes());
         assert_eq!(resp[2] & 0x80, 0x80, "response bit");
@@ -5441,8 +5453,10 @@ mod tests {
     #[tokio::test]
     async fn dns_tcp_direct_dual_loop_pipeline() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use xray_buf::io::{Reader as _, Writer as _};
-        use xray_buf::multi::MultiBuffer;
+        use xray_buf::{
+            io::{Reader as _, Writer as _},
+            multi::MultiBuffer,
+        };
 
         // mock TCP DNS server：帧循环回显（改 id 尾字节区分）。
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5474,13 +5488,10 @@ mod tests {
         });
 
         let handler =
-            parse_dns_outbound_config(br#"{"rule":[{"action":"direct","qType":[1]}]}"#)
-                .unwrap();
+            parse_dns_outbound_config(br#"{"rule":[{"action":"direct","qType":[1]}]}"#).unwrap();
         let bridge = DnsDispatchBridge::new("dns-out", handler, None);
-        let dest = Destination::tcp(
-            Address::from_ipv4_bytes([127, 0, 0, 1]),
-            Port::new(upstream_port),
-        );
+        let dest =
+            Destination::tcp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(upstream_port));
         let (mut up_w, mut dn_r) = spawn_dns_bridge(&bridge, &dest, None);
 
         // 连发两帧（pipeline，不等第一响应）。
@@ -5535,6 +5546,7 @@ mod tests {
     #[tokio::test]
     async fn freedom_user_level_drives_conn_idle() {
         use std::collections::HashMap;
+
         use xray_proto::xray::app::policy::policy::Timeout as PolicyTimeout;
         let mut levels = HashMap::new();
         levels.insert(
@@ -5570,7 +5582,7 @@ mod tests {
                                 if sock.write_all(&buf[..n]).await.is_err() {
                                     break;
                                 }
-                            }
+                            },
                         }
                     }
                 });
@@ -5705,8 +5717,10 @@ mod tests {
             std::net::IpAddr::V6(_) => panic!("expected v4 echo addr"),
         };
         let dest = Destination::udp(Address::IPv4(echo_v4), Port::new(echo_addr.port()));
-        let (up_r, mut up_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
-        let (mut dn_r, dn_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let (up_r, mut up_w) =
+            xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let (mut dn_r, dn_w) =
+            xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
         let fut = handler.dispatch(
             &dest,
             Link::new(
@@ -5738,7 +5752,7 @@ mod tests {
                 Ok(Ok(mb2)) if !mb2.is_empty() => {
                     resp_bytes.extend_from_slice(&mb2.to_vec());
                     break;
-                }
+                },
                 Ok(Ok(_)) => continue,
                 Ok(Err(e)) => panic!("read resp: {e}"),
                 Err(_) => continue,
@@ -5747,10 +5761,7 @@ mod tests {
         assert!(!resp_bytes.is_empty(), "no udp response within timeout");
         let mut cursor = std::io::Cursor::new(&resp_bytes[..]);
         let mut pr = PacketReader::new(&mut cursor);
-        let pkt = pr
-            .read_packet()
-            .expect("parse resp xudp frame")
-            .expect("empty stream");
+        let pkt = pr.read_packet().expect("parse resp xudp frame").expect("empty stream");
         let (data, _src) = pkt.into_parts();
         assert_eq!(data, b"tuic-udp-e2e");
     }

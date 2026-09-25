@@ -10,7 +10,7 @@
 //! 每 part 解码后 32B 或 64B。
 //!
 //! 出站仅需解析客户端 encryption；server-side 仅 server.rs 涉及。
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
 /// ENC 出站参数（解析后等价于 Go conf.Build 之后的 `account` 字段集合）。
 ///
@@ -164,13 +164,7 @@ pub fn parse_server_decryption(raw: &str) -> Option<ServerDecParams> {
     } else {
         String::new()
     };
-    Some(ServerDecParams {
-        keys,
-        xor_mode,
-        seconds_from,
-        seconds_to,
-        padding,
-    })
+    Some(ServerDecParams { keys, xor_mode, seconds_from, seconds_to, padding })
 }
 
 #[cfg(test)]
@@ -201,8 +195,12 @@ mod tests {
     #[test]
     fn parses_x25519_pub() {
         // 32B X25519 pub = 43 chars base64url no-pad
-        let b64x: String = (0..32).map(|i| "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-            .as_bytes()[i as usize % 64] as char).collect();
+        let b64x: String = (0..32)
+            .map(|i| {
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".as_bytes()
+                    [i as usize % 64] as char
+            })
+            .collect();
         assert_eq!(b64x.len(), 32); // < 20 字符触发 padding 分支 → 不行
         // 重新生成 ≥20 字符
         let b64x: String = "PZ-YRaLJBZ84xZ5zB0nIBK7wkVVWMUOjapustH_MPHg".into(); // 43 chars
@@ -238,7 +236,11 @@ mod tests {
         let raw = "mlkem768x25519plus.native.0rtt.nOBcbXEFa0hjb-hGAfGBK5g96NmCpWA4nrtKRESyvsu8Gtl0LYLAEphydgeiNzlxOoYmt3tHBKkl68W3fEwlYfh8ZQtDvGl7K6IV1MVDQBtLieGbVkiVXYvFcpLEYFlO3LIxsOwHwGAy4umunqOGQOmDfbBOtAltcLWHInkLzqR7uEfGcXIDV2RvC1YD20oPuNmKZRO_s0vI9wbBzmxmCcwpk5ZiO2eNBekwu3xC42lZ8St05IlVcFFDfbkJk5SM8qqy1QpFMvhHBSW_78NQzMxOdkcjwMfKTqnHqacZ2cGmWZer2iGSBCU0UZSG6RyQA_YaCMmXr-OzDEdZ6sBQshsjmMOD91geV5JQdzQmHyULQhqkdhtLQYiOpalba9a0yWOFmFsAPgw3rujFN7CLbiF1LgEXqEWOtEUYu7uDzgKw_OyTk9LDsZsSZgZh6MoaQeY_wIa7jotBB8pEz7O-nQpwSnI-5HxVxfuqFzYTOwULZ2dfjVQ_MSc-cHJA0uY_hPYkrXx6IQNa3qB88mLOw_hP7CJgP4gZYTuWOxtAVarEeRJkwIV9e0hPpquzJIuFvMu0CUqeewsAabptsqBfp4soxWEcOUNZBGNJdbBAEZsfqfvOnrYgDOKSrstswxOeYlckdVix5BUHMQmuz4tJp-IKZ-e59xGyHAYp-KYxSknErbUgnjIJ1wFVb-Ms7AKjQ3gh_-KyBlhOAZWRXIljBiyefrS8beQAl1SbtAeum7jFT4tHspA-GQJFfOu1hgR0SpgYaUWKiqFAHoKBm2fAOdqGXHnOD9C5laosYUWsHMi3bmKAacE2qnI1oJWy90K962Wp5KDN9bIxDgtoPYyFb7MVzERIxYU65SR1r6nKnKQexsB6mHlM74zB9Bi__9FK8tRFYEmXNIsQIaq0YPVSHyyL3Gtq0Ei5E8AFELRip9FLnwZ1qoYzS1OxWsqbPOiXkei_ORDLgzteFUVEjVsuGUNy_HQ7mXBueCvBO3qn-rcaXRyti5xFsoAjcFsb2gRO7AuOmOmQsDmrcPkosoUoZnZUjtt2UyJNKmxVW2m6WybJIlMbyagttwQpQAVCgng41GmVEAxN5zV6MwgXHxan45SfHxoaa0yh9RO5KZGzYTEdOxFTP6Iscgk9xKtoe5kmIHqLuYuLo3hBnXUf2dMksHxyqfYzVpJzC5XA2YfK01HOP7SG91J54hyLKhZoGEwdbCuUKikMfjQYgIKLo_Yq0fFqOIG-IxofaxCO8Nk_kOPDc_OlkLk7mzQtdhZsyBCkygWksBpPODgU_SBh_TI4Llcg5elHHZLGBGnN70scrUZyVnxEyEYwK0OWPRcwv8RG-WwLV_dlDmIMMEKLwkFb2dhFs9M76BIjjmNH6MYFfGY8WJlgn1hs4GPFLMRX6JtACclPqTV24Eh38ReQltfGhEVFc-l7I_SjdjeFTmp0dnSz_7YihuVmb7SorURMiiAW9Kw-JUCT_ec8jYRaJxBfzZMbtRsIZQsFdhRQr0aBQJxb2cHMMuaM1rJDuQcAwYxb6_3DDmRYrqr6tArgwR1lEc00NcLMLbhaxnXgnYpTunA";
         let p = parse_client_encryption(raw).expect("parse real link");
         // VPS 公钥应是 ML-KEM-768 (1184B)
-        assert!(p.keys.iter().any(|k| k.len() == 1184), "expected 1184B ML-KEM ek, got lens {:?}", p.keys.iter().map(|k| k.len()).collect::<Vec<_>>());
+        assert!(
+            p.keys.iter().any(|k| k.len() == 1184),
+            "expected 1184B ML-KEM ek, got lens {:?}",
+            p.keys.iter().map(|k| k.len()).collect::<Vec<_>>()
+        );
         assert_eq!(p.xor_mode, 0); // native
         assert_eq!(p.seconds, 1); // 0rtt
     }

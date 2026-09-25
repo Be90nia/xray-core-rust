@@ -5,8 +5,8 @@
 //! # 设计
 //!
 //! - `Router` 持有规则列表 + 平衡器映射，提供 `pick_route` 同步接口。
-//! - 域名策略（`DomainStrategy`）保留为字段，但**当前实现不执行 DNS 解析**
-//!   （`xray-features::dns` 与本 crate trait 不兼容，留待接入）。
+//! - 域名策略（`DomainStrategy`）保留为字段，但**当前实现不执行 DNS 解析** （`xray-features::dns`
+//!   与本 crate trait 不兼容，留待接入）。
 //! - IO 边界（出站选择、观测器、dispatcher）通过 trait + Arc 注入。
 //!
 //! # IO 边界
@@ -15,18 +15,19 @@
 //! - `ObservationProvider` 仅 LeastPing/LeastLoad 策略需要。
 //! - DNS 解析路径：TODO（等上层接入）。
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::RwLock;
 use xray_geodata::loader::GeoDataLoader;
 use xray_proto::xray::app::router::{BalancingRule, Config, RoutingRule};
 
-use crate::balancing::{Balancer, BalancingStrategy, ObservationProvider, OutboundHandlerSelector};
-use crate::config::DomainStrategy;
-use crate::context::RoutingContext;
-use crate::error::RouterError;
-use crate::rule::{build_rule, Rule};
+use crate::{
+    balancing::{Balancer, BalancingStrategy, ObservationProvider, OutboundHandlerSelector},
+    config::DomainStrategy,
+    context::RoutingContext,
+    error::RouterError,
+    rule::{Rule, build_rule},
+};
 
 /// 路由结果。对应 Go `router.Route`。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +131,7 @@ impl Router {
     pub fn observer(&self) -> Option<Arc<dyn ObservationProvider>> {
         self.observer.read().clone()
     }
+
     /// 注入 DNS 解析能力（对应 Go `r.dns`，由 core 装配时设置）。
     pub fn set_dns_client(&self, dns: Arc<dyn xray_features::dns::DnsClient>) {
         *self.dns.write() = Some(dns);
@@ -156,18 +158,16 @@ impl Router {
             if let Some(tag) = rule.apply(ctx) {
                 // qrog：Go 行为——命中即中止，空 tag 即"交由上层走默认出站"。
                 // 此前 skip-and-continue 导致后续规则静默覆盖此意图。
-                return Ok(Route {
-                    outbound_tag: tag,
-                    rule_tag: rule.rule_tag.clone(),
-                });
+                return Ok(Route { outbound_tag: tag, rule_tag: rule.rule_tag.clone() });
             }
         }
         Err(RouterError::NoClue)
     }
+
     /// 带 DNS 解析的路由匹配。对应 Go `pickRouteInternal` 的 domainStrategy 分支。
     ///
-    /// - `IpOnDemand`：匹配前先解析域名注入 target_ips（Go 用 ResolvableContext 懒解析，
-    ///   此处 eager——结果等价，多解析由 DnsService 缓存兜住）。
+    /// - `IpOnDemand`：匹配前先解析域名注入 target_ips（Go 用 ResolvableContext 懒解析， 此处
+    ///   eager——结果等价，多解析由 DnsService 缓存兜住）。
     /// - `IpIfNonMatch`：第一轮全不中且目标为域名时，解析后重跑一轮。
     /// - `AsIs` / 无 dns / skip_dns_resolve：退化为 [`Router::pick_route`]。
     pub async fn pick_route_resolved(
@@ -182,7 +182,7 @@ impl Router {
             DomainStrategy::IpOnDemand if can_resolve => {
                 self.resolve_into(ctx).await;
                 self.pick_route(ctx)
-            }
+            },
             DomainStrategy::IpIfNonMatch => {
                 if let Ok(r) = self.pick_route(ctx) {
                     return Ok(r);
@@ -192,7 +192,7 @@ impl Router {
                     return self.pick_route(ctx);
                 }
                 Err(RouterError::NoClue)
-            }
+            },
             _ => self.pick_route(ctx),
         }
     }
@@ -205,20 +205,16 @@ impl Router {
         };
         // Go ResolvableContext：IPOption{IPv4+IPv6, FakeDisable}
         // （app/router/router_test.go:176-179 同参数）。
-        let option = IpOption {
-            ipv4_enable: true,
-            ipv6_enable: true,
-            fake_enable: false,
-        };
+        let option = IpOption { ipv4_enable: true, ipv6_enable: true, fake_enable: false };
         match dns.lookup_ip(ctx.get_target_domain(), option).await {
             Ok((ips, _ttl)) => {
                 if !ips.is_empty() {
                     ctx.target_ips = ips;
                 }
-            }
+            },
             Err(e) => {
                 tracing::debug!(error = %e, "router dns resolve failed, rules match by domain only");
-            }
+            },
         }
     }
 
@@ -283,11 +279,7 @@ impl Router {
     /// 覆盖平衡器目标。
     ///
     /// 对应 Go `Router.OverrideBalancer`。
-    pub fn override_balancer(
-        &self,
-        balancer_tag: &str,
-        target: &str,
-    ) -> Result<(), RouterError> {
+    pub fn override_balancer(&self, balancer_tag: &str, target: &str) -> Result<(), RouterError> {
         let balancers = self.balancers.read();
         let b = balancers
             .get(balancer_tag)
@@ -308,8 +300,10 @@ impl Router {
 /// 同一 ctx 在进程内始终返回同一 key（确定性），跨进程可能因 SipHash seed 不同
 /// 出现差异——对于 ConsistentHashing 同进程内 session-affinity 够用。
 pub(crate) fn ctx_hash_key(ctx: &dyn RoutingContext) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+    };
     let mut h = DefaultHasher::new();
     if let Some(ip) = ctx.get_target_ips().first() {
         ip.hash(&mut h);
@@ -329,9 +323,9 @@ pub(crate) fn ctx_hash_key(ctx: &dyn RoutingContext) -> u64 {
 /// - 策略名 `ToLower` 归一（Go config.go:122）
 /// - `""` 与 `random` 同走 RandomStrategy（Go config.go:153-161 fallthrough）
 /// - `roundrobin` 不依赖 observer
-/// - `leastping` / `leastload` 依赖 observer。无 observer 时**仍构建**，但
-///   策略在 `pick_outbound` 时返回空 → `Balancer` 走 `fallback_tag`（与 Go
-///   无 observatory 时返回空字符串 → fallback 的行为一致）。
+/// - `leastping` / `leastload` 依赖 observer。无 observer 时**仍构建**，但 策略在 `pick_outbound`
+///   时返回空 → `Balancer` 走 `fallback_tag`（与 Go 无 observatory 时返回空字符串 → fallback
+///   的行为一致）。
 /// - 其余策略名报错（Go config.go:162-163 "unrecognized balancer type"）
 ///
 /// `strategy_settings`（TypedMessage 反序列化）当前不解析：LeastLoad 用
@@ -351,11 +345,14 @@ fn build_balancer(
             if let Some(obs) = observer {
                 // ga1k：把 balancer 的 outbound_selector 作为候选列表注入策略，
                 // 与 Go `LeastPingStrategy.PickOutbound(strings []string)` 一致。
-                Arc::new(crate::strategy_leastping::LeastPingStrategy::new(obs, br.outbound_selector.clone()))
+                Arc::new(crate::strategy_leastping::LeastPingStrategy::new(
+                    obs,
+                    br.outbound_selector.clone(),
+                ))
             } else {
                 Arc::new(StubLeastPingStrategy)
             }
-        }
+        },
         "leastload" => {
             // 同 leastping；observer 缺失时返回空 → fallback。
             if let Some(obs) = observer {
@@ -381,7 +378,7 @@ fn build_balancer(
             } else {
                 Arc::new(StubLeastLoadStrategy)
             }
-        }
+        },
         "" => Arc::new(crate::strategy_random::RandomStrategy::new(
             br.outbound_selector.clone(),
             ohm.clone(),
@@ -395,15 +392,10 @@ fn build_balancer(
             // 对齐 Go config.go:162-163：未知策略拒绝启动（此前 warn 降级
             // roundrobin 会把拼错的 "LeastLoad"/"Random" 静默变成轮询）。
             return Err(RouterError::UnknownBalancerType);
-        }
+        },
     };
 
-    Ok(Balancer::new(
-        br.outbound_selector.clone(),
-        strategy,
-        ohm.clone(),
-        br.fallback_tag.clone(),
-    ))
+    Ok(Balancer::new(br.outbound_selector.clone(), strategy, ohm.clone(), br.fallback_tag.clone()))
 }
 
 /// 无 observer 时的 LeastPing 占位：始终返回空 → Balancer 走 fallback。
@@ -424,24 +416,23 @@ impl BalancingStrategy for StubLeastLoadStrategy {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::context::RoutingData;
-    use crate::balancing::NotImplementedSelector;
     use std::net::{IpAddr, Ipv4Addr};
 
+    use super::*;
+    use crate::{balancing::NotImplementedSelector, context::RoutingData};
+
     fn simple_tag_rule(tag: &str, domain: &str) -> RoutingRule {
-        use xray_proto::xray::app::router::routing_rule::TargetTag;
-        use xray_proto::xray::common::geodata::{Domain, DomainRule};
-        use xray_proto::xray::common::geodata::domain::Type as DT;
+        use xray_proto::xray::{
+            app::router::routing_rule::TargetTag,
+            common::geodata::{Domain, DomainRule, domain::Type as DT},
+        };
         RoutingRule {
             target_tag: Some(TargetTag::Tag(tag.into())),
             rule_tag: String::new(),
             domain: vec![DomainRule {
-                value: Some(xray_proto::xray::common::geodata::domain_rule::Value::Custom(Domain {
-                    r#type: DT::Full as i32,
-                    value: domain.into(),
-                    attribute: vec![],
-                })),
+                value: Some(xray_proto::xray::common::geodata::domain_rule::Value::Custom(
+                    Domain { r#type: DT::Full as i32, value: domain.into(), attribute: vec![] },
+                )),
             }],
             ip: vec![],
             port_list: None,
@@ -506,9 +497,7 @@ mod tests {
     fn test_reload_rules_replaces_all() {
         let r = Router::empty(Arc::new(NotImplementedSelector), None);
         r.add_rule("r1".into(), simple_tag_rule("t1", "a.com")).unwrap();
-        let new_rules = vec![
-            simple_tag_rule("t2", "b.com"),
-        ];
+        let new_rules = vec![simple_tag_rule("t2", "b.com")];
         // 给新规则添加 rule_tag
         let _ = r.reload_rules(&new_rules);
         // 不抛错即 OK；详情见 list_rules
@@ -530,8 +519,6 @@ mod tests {
         assert_eq!(r.domain_strategy(), DomainStrategy::IpOnDemand);
     }
 
-
-
     // ── GeoIP / GeoSite rule E2E ──
     //
     // 构造临时 dat 文件 → GeoDataLoader → Router 路由命中。
@@ -541,10 +528,7 @@ mod tests {
         p.push(format!(
             "xray-router-e2e-{}-{label}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -552,7 +536,7 @@ mod tests {
 
     fn make_geoip_dat() -> Vec<u8> {
         use prost::Message;
-        use xray_proto::xray::common::geodata::{Cidr, GeoIpList, GeoIp};
+        use xray_proto::xray::common::geodata::{Cidr, GeoIp, GeoIpList};
         let cn = GeoIp {
             code: "CN".into(),
             cidr: vec![
@@ -580,9 +564,10 @@ mod tests {
     }
 
     fn geoip_rule() -> RoutingRule {
-        use xray_proto::xray::app::router::routing_rule::TargetTag;
-        use xray_proto::xray::common::geodata::{GeoIpRule, IpRule};
-        use xray_proto::xray::common::geodata::ip_rule::Value as IV;
+        use xray_proto::xray::{
+            app::router::routing_rule::TargetTag,
+            common::geodata::{GeoIpRule, IpRule, ip_rule::Value as IV},
+        };
         RoutingRule {
             target_tag: Some(TargetTag::Tag("cn_direct".into())),
             rule_tag: String::new(),
@@ -598,9 +583,10 @@ mod tests {
     }
 
     fn geosite_rule() -> RoutingRule {
-        use xray_proto::xray::app::router::routing_rule::TargetTag;
-        use xray_proto::xray::common::geodata::{DomainRule, GeoSiteRule};
-        use xray_proto::xray::common::geodata::domain_rule::Value as DV;
+        use xray_proto::xray::{
+            app::router::routing_rule::TargetTag,
+            common::geodata::{DomainRule, GeoSiteRule, domain_rule::Value as DV},
+        };
         RoutingRule {
             target_tag: Some(TargetTag::Tag("cn_site".into())),
             rule_tag: String::new(),
@@ -680,22 +666,22 @@ mod tests {
     // - 有 observer：构建 + pick_outbound 返回正确 tag
     // - 无 observer：构建成功 + pick_outbound → fallback_tag
 
-    use crate::balancing::{MemoryObservationProvider, SimpleSelector};
     use xray_proto::xray::core::app::observatory::{ObservationResult, OutboundStatus};
+
+    use crate::balancing::{MemoryObservationProvider, SimpleSelector};
     /// 简单 tag 规则（domain="x.test" → tag）；用于挂上 BalancingRule。
     fn simple_balance_rule(balancer_tag: &str) -> RoutingRule {
-        use xray_proto::xray::common::geodata::{Domain, DomainRule};
-        use xray_proto::xray::common::geodata::domain::Type as DT;
-        use xray_proto::xray::app::router::routing_rule::TargetTag;
+        use xray_proto::xray::{
+            app::router::routing_rule::TargetTag,
+            common::geodata::{Domain, DomainRule, domain::Type as DT},
+        };
         RoutingRule {
             target_tag: Some(TargetTag::BalancingTag(balancer_tag.into())),
             rule_tag: String::new(),
             domain: vec![DomainRule {
-                value: Some(xray_proto::xray::common::geodata::domain_rule::Value::Custom(Domain {
-                    r#type: DT::Full as i32,
-                    value: "x.test".into(),
-                    attribute: vec![],
-                })),
+                value: Some(xray_proto::xray::common::geodata::domain_rule::Value::Custom(
+                    Domain { r#type: DT::Full as i32, value: "x.test".into(), attribute: vec![] },
+                )),
             }],
             ..Default::default()
         }
@@ -871,8 +857,7 @@ mod tests {
     /// ctx → balancer.pick_outbound_with_key(ctx_hash_key(ctx)) 链通）。
     #[test]
     fn test_router_consistent_hashing_same_ctx_picks_same_outbound() {
-        use crate::balancing::MemoryObservationProvider;
-        use crate::strategy_leastload::LeastLoadStrategy;
+        use crate::{balancing::MemoryObservationProvider, strategy_leastload::LeastLoadStrategy};
 
         let obs = Arc::new(MemoryObservationProvider::new());
         obs.update(ObservationResult {
@@ -896,12 +881,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let balancer = Arc::new(Balancer::new(
-            vec!["a".into(), "b".into(), "c".into()],
-            strategy,
-            ohm,
-            "fb",
-        ));
+        let balancer =
+            Arc::new(Balancer::new(vec!["a".into(), "b".into(), "c".into()], strategy, ohm, "fb"));
 
         // 直接构造 Rule 挂上该 balancer，绕过 build_balancer（其默认 Availability 模式）。
         let rule = Rule {
@@ -915,18 +896,15 @@ mod tests {
         *r.rules.write() = vec![Arc::new(rule)];
 
         // 同一 ctx（target_ip）两次 pick_route → 同 outbound
-        let ctx1 = RoutingData::new()
-            .with_target_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let ctx1 = RoutingData::new().with_target_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let p1a = r.pick_route(&ctx1).unwrap().outbound_tag;
         let p1b = r.pick_route(&ctx1).unwrap().outbound_tag;
         assert_eq!(p1a, p1b, "same ctx must return same tag (session affinity)");
         assert!(["a", "b", "c"].contains(&p1a.as_str()));
 
         // 不同 ctx（不同 target_ip）→ 可能不同 outbound（ConsistentHashing 分布）
-        let ctx2 = RoutingData::new()
-            .with_target_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
-        let ctx3 = RoutingData::new()
-            .with_target_ip(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)));
+        let ctx2 = RoutingData::new().with_target_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+        let ctx3 = RoutingData::new().with_target_ip(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)));
         let p2 = r.pick_route(&ctx2).unwrap().outbound_tag;
         let p3 = r.pick_route(&ctx3).unwrap().outbound_tag;
         assert!(["a", "b", "c"].contains(&p2.as_str()));

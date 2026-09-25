@@ -2,8 +2,10 @@
 //!
 //! Corresponds to Go's `features/policy` package.
 
-use async_trait::async_trait;
 use std::time::Duration;
+
+use async_trait::async_trait;
+
 use crate::Feature;
 
 /// Feature type identifier for Policy.
@@ -93,7 +95,6 @@ impl Default for TimeoutPolicy {
     }
 }
 
-///
 /// Corresponds to Go's `features/policy.StatsPolicy`.
 #[derive(Debug, Clone)]
 pub struct StatsPolicy {
@@ -111,15 +112,9 @@ pub struct StatsPolicy {
 
 impl Default for StatsPolicy {
     fn default() -> Self {
-        Self {
-            user_uplink: false,
-            user_downlink: false,
-            user_online: false,
-        }
+        Self { user_uplink: false, user_downlink: false, user_online: false }
     }
 }
-
-
 
 /// Buffer policy for connection buffering.
 ///
@@ -130,9 +125,9 @@ pub struct BufferPolicy {
     ///
     /// `i32` 对齐 Go `Buffer.PerConnection int32`。约定：
     /// - `>= 0`：每连接字节数（**仅 dispatch 用作 pipe limit，policy 本身不起分配**）。
-    /// - `-1`：无限缓冲。Go `pipe.OptionsFromContext` 见 `bp.PerConnection < 0` 分支跳过 SizeLimit；
-    ///   Rust 由 `xray_app_dispatcher` 直接透传到 `pipe.limit`，`pipe::PipeOption::is_full`
-    ///   在 `limit < 0` 时永不触发（已对齐 Go 行为）。
+    /// - `-1`：无限缓冲。Go `pipe.OptionsFromContext` 见 `bp.PerConnection < 0` 分支跳过
+    ///   SizeLimit； Rust 由 `xray_app_dispatcher` 直接透传到
+    ///   `pipe.limit`，`pipe::PipeOption::is_full` 在 `limit < 0` 时永不触发（已对齐 Go 行为）。
     /// - `0`：不分配 per-conn 缓冲（VMessClosing/ZeroBuffer 等场景）。
     pub connection: i32,
     /// Write buffer size.
@@ -141,10 +136,7 @@ pub struct BufferPolicy {
 
 impl Default for BufferPolicy {
     fn default() -> Self {
-        Self {
-            connection: *DEFAULT_BUFFER_CONNECTION_FROM_ENV,
-            write: DEFAULT_BUFFER_WRITE,
-        }
+        Self { connection: *DEFAULT_BUFFER_CONNECTION_FROM_ENV, write: DEFAULT_BUFFER_WRITE }
     }
 }
 
@@ -156,7 +148,7 @@ fn parse_xray_bufsize(raw: Option<&str>) -> Option<i64> {
 }
 
 /// `XRAY_BUFSIZE` → SessionDefault per-connection buffer，进程级一次读取缓存
-///（对齐 Go `defaultBufferSize atomic.Int32` init 时填充；Rust 无 SIGHUP
+/// （对齐 Go `defaultBufferSize atomic.Int32` init 时填充；Rust 无 SIGHUP
 /// reload 机制，进程生命周期内取一次值）。
 static DEFAULT_BUFFER_CONNECTION_FROM_ENV: std::sync::LazyLock<i32> =
     std::sync::LazyLock::new(|| {
@@ -172,11 +164,11 @@ static DEFAULT_BUFFER_CONNECTION_FROM_ENV: std::sync::LazyLock<i32> =
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SystemStats {
     /// 是否开启 inbound uplink/downlink 流量统计
-    ///（对应 Go `System.Stats.Inbound{Uplink,Downlink}`）。
+    /// （对应 Go `System.Stats.Inbound{Uplink,Downlink}`）。
     pub inbound_uplink: bool,
     pub inbound_downlink: bool,
     /// 是否开启 outbound uplink/downlink 流量统计
-    ///（对应 Go `System.Stats.Outbound{Uplink,Downlink}`）。
+    /// （对应 Go `System.Stats.Outbound{Uplink,Downlink}`）。
     pub outbound_uplink: bool,
     pub outbound_downlink: bool,
     /// 系统级连接缓冲策略（对应 Go `System.Buffer`）。
@@ -205,7 +197,7 @@ pub fn default_buffer_connection_from_env(env_mb: Option<i64>) -> i32 {
             let bytes = (n as i64).saturating_mul(1024 * 1024);
             // clamp 到 i32 正值上限；超出视为「错误配置 → 0」（与 Go int32 截断语义近似）
             i32::try_from(bytes.min(i32::MAX as i64)).unwrap_or(0)
-        }
+        },
         // 负数（除 0）、无效输入 → 0（Go defaultBufferSize = int32(负) 截断到 0）
         Some(_) => 0,
         None => {
@@ -227,7 +219,7 @@ pub fn default_buffer_connection_from_env(env_mb: Option<i64>) -> i32 {
             {
                 (512 * 1024) as i32
             }
-        }
+        },
     }
 }
 
@@ -266,7 +258,6 @@ impl PolicyManager for DefaultPolicyFeature {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,7 +279,6 @@ mod tests {
         assert!(!policy.stats.user_online, "user_online must default false");
         assert_eq!(policy.buffer.connection, DEFAULT_BUFFER_CONNECTION);
     }
-
 
     #[test]
     fn test_default_stats_policy_user_online_false() {
@@ -319,15 +309,8 @@ mod tests {
                 uplink_only: Duration::from_secs(180),
                 downlink_only: Duration::from_secs(180),
             },
-            stats: StatsPolicy {
-                user_uplink: true,
-                user_downlink: true,
-                user_online: true,
-            },
-            buffer: BufferPolicy {
-                connection: 2048,
-                write: 2048,
-            },
+            stats: StatsPolicy { user_uplink: true, user_downlink: true, user_online: true },
+            buffer: BufferPolicy { connection: 2048, write: 2048 },
         };
         assert_eq!(policy.timeout.handshake, Duration::from_secs(10));
         assert!(policy.stats.user_uplink);
@@ -371,12 +354,10 @@ mod tests {
     #[test]
     fn test_default_buffer_env_zero_means_unlimited() {
         let size = default_buffer_connection_from_env(Some(0));
-        assert_eq!(
-            size, -1_i32,
-            "env=0 must map to unlimited (-1_i32), got {size}"
-        );
+        assert_eq!(size, -1_i32, "env=0 must map to unlimited (-1_i32), got {size}");
     }
-    /// `XRAY_BUFSIZE=N`（N>0）→ N MiB（policy.go:104 `defaultBufferSize = int32(size) * 1024 * 1024`）。
+    /// `XRAY_BUFSIZE=N`（N>0）→ N MiB（policy.go:104 `defaultBufferSize = int32(size) * 1024 *
+    /// 1024`）。
     #[test]
     fn test_default_buffer_env_n_mb_scales_by_mb() {
         assert_eq!(default_buffer_connection_from_env(Some(1)), 1 * 1024 * 1024);
@@ -405,8 +386,9 @@ mod tests {
         assert_eq!(size, 512 * 1024, "其他 GOARCH 分支（x86_64 等）期望 512 KiB");
     }
 
-    /// SystemStats.buffer 默认 512 KiB（policy.go:108-112 `defaultBufferPolicy()`），验证 SystemPolicy
-    /// proto 未暴露 buffer 字段时 `system_stats_from_proto` 仍回落到 `BufferPolicy::default()`=512 KiB。
+    /// SystemStats.buffer 默认 512 KiB（policy.go:108-112 `defaultBufferPolicy()`），验证
+    /// SystemPolicy proto 未暴露 buffer 字段时 `system_stats_from_proto` 仍回落到
+    /// `BufferPolicy::default()`=512 KiB。
     #[test]
     fn test_system_stats_buffer_default_roundtrip_via_default_policy() {
         // 对应 Go features/policy/policy.go:52-56 System{Buffer: defaultBufferPolicy()}
@@ -429,7 +411,7 @@ mod tests {
     }
 
     /// XRAY_BUFSIZE 原始串解析：有效整数/空白容忍/非数字与缺失回退 None
-    ///（Go GetValueAsInt 解析失败 = 未设置语义）。
+    /// （Go GetValueAsInt 解析失败 = 未设置语义）。
     #[test]
     fn test_parse_xray_bufsize_env_raw() {
         assert_eq!(parse_xray_bufsize(Some("4")), Some(4));
@@ -498,10 +480,7 @@ mod tests {
         let policy = Policy {
             timeout: TimeoutPolicy::default(),
             stats: StatsPolicy::default(),
-            buffer: BufferPolicy {
-                connection: 0,
-                write: DEFAULT_BUFFER_WRITE,
-            },
+            buffer: BufferPolicy { connection: 0, write: DEFAULT_BUFFER_WRITE },
         };
         assert_eq!(policy.buffer.connection, 0, "Buffer.connection=0 is legal zero-buffer");
         // 0 ≠ -1（无限）；二者分别对应：
@@ -525,10 +504,7 @@ mod tests {
     /// 这里用结构构造验证 connection=-1 可安全表示（不会 panic、不被 clamp 到 0）。
     #[test]
     fn test_buffer_connection_minus_one_is_unlimited_sentinel() {
-        let buf = BufferPolicy {
-            connection: -1,
-            write: DEFAULT_BUFFER_WRITE,
-        };
+        let buf = BufferPolicy { connection: -1, write: DEFAULT_BUFFER_WRITE };
         assert_eq!(buf.connection, -1);
         // 作为 i64 透传到 pipe.limit（dispatcher default.rs:704,769）：
         // `-1_i32 as i64 == -1_i64`，pipe.rs is_full 检查 `self.limit >= 0 && cur > limit`

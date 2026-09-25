@@ -5826,6 +5826,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "rand 0.9.4",
+ "tokio",
  "xray-app-router",
  "xray-buf",
  "xray-common",
@@ -6695,6 +6696,7 @@ dependencies = [
 name = "xray-transport-naive"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64",
  "bytes",
  "futures-util",
@@ -6703,13 +6705,18 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rand 0.9.4",
+ "rustls",
  "serde_json",
+ "subtle",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-util",
  "tracing",
  "xray-app-dispatcher",
+ "xray-buf",
  "xray-common",
+ "xray-features",
  "xray-tls",
  "xray-transport",
 ]

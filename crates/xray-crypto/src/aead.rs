@@ -28,18 +28,18 @@
 //! - XChaCha20-Poly1305 nonces must be 24 bytes
 //! - All public APIs return `Result` instead of panicking
 
-use aes::cipher::{KeyIvInit, StreamCipher};
-use aes::{Aes128, Aes256};
-use cfb_mode::{
-    BufDecryptor as CfbDecryptor, BufEncryptor as CfbEncryptor,
+use aes::{
+    Aes128, Aes256,
+    cipher::{KeyIvInit, StreamCipher},
 };
+use cfb_mode::{BufDecryptor as CfbDecryptor, BufEncryptor as CfbEncryptor};
 use chacha20::ChaCha20;
-use chacha20poly1305::aead::{Aead, AeadInOut, KeyInit, Payload};
-use chacha20poly1305::{ChaCha20Poly1305, XChaCha20Poly1305};
-use ctr::Ctr128BE;
-use ring::aead::{
-    Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM, AES_256_GCM,
+use chacha20poly1305::{
+    ChaCha20Poly1305, XChaCha20Poly1305,
+    aead::{Aead, AeadInOut, KeyInit, Payload},
 };
+use ctr::Ctr128BE;
+use ring::aead::{AES_128_GCM, AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 
 /// Cryptographic operation errors.
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
@@ -89,12 +89,7 @@ pub trait AeadCipher {
     ///
     /// Returns `CryptoError::InvalidNonceLength` if nonce size is
     /// incorrect.
-    fn seal(
-        &self,
-        nonce: &[u8],
-        aad: &[u8],
-        plaintext: &[u8],
-    ) -> Result<Vec<u8>, CryptoError>;
+    fn seal(&self, nonce: &[u8], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError>;
     /// Like [`Self::seal`] but appends the sealed output (ciphertext+tag)
     /// to `out` instead of returning a new Vec.
     ///
@@ -121,16 +116,9 @@ pub trait AeadCipher {
     ///
     /// # Errors
     ///
-    /// - `CryptoError::InvalidNonceLength` if nonce size is
-    ///   incorrect.
-    /// - `CryptoError::AuthenticationFailed` if tag verification
-    ///   fails.
-    fn open(
-        &self,
-        nonce: &[u8],
-        aad: &[u8],
-        ciphertext: &[u8],
-    ) -> Result<Vec<u8>, CryptoError>;
+    /// - `CryptoError::InvalidNonceLength` if nonce size is incorrect.
+    /// - `CryptoError::AuthenticationFailed` if tag verification fails.
+    fn open(&self, nonce: &[u8], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError>;
 
     /// Like [`Self::open`] but decrypts `ciphertext` in place and returns
     /// the plaintext sub-slice, avoiding intermediate allocations.
@@ -195,9 +183,7 @@ impl Aes128Gcm {
         }
         let unbound = UnboundKey::new(&AES_128_GCM, key)
             .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
-        Ok(Self {
-            key: LessSafeKey::new(unbound),
-        })
+        Ok(Self { key: LessSafeKey::new(unbound) })
     }
 }
 
@@ -217,12 +203,7 @@ impl AeadCipher for Aes128Gcm {
         16
     }
 
-    fn seal(
-        &self,
-        nonce: &[u8],
-        aad: &[u8],
-        plaintext: &[u8],
-    ) -> Result<Vec<u8>, CryptoError> {
+    fn seal(&self, nonce: &[u8], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         if nonce.len() != self.nonce_size() {
             return Err(CryptoError::InvalidNonceLength {
                 expected: self.nonce_size(),
@@ -265,12 +246,7 @@ impl AeadCipher for Aes128Gcm {
         Ok(())
     }
 
-    fn open(
-        &self,
-        nonce: &[u8],
-        aad: &[u8],
-        ciphertext: &[u8],
-    ) -> Result<Vec<u8>, CryptoError> {
+    fn open(&self, nonce: &[u8], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         if nonce.len() != self.nonce_size() {
             return Err(CryptoError::InvalidNonceLength {
                 expected: self.nonce_size(),
@@ -351,9 +327,7 @@ impl Aes256Gcm {
         }
         let unbound = UnboundKey::new(&AES_256_GCM, key)
             .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
-        Ok(Self {
-            key: LessSafeKey::new(unbound),
-        })
+        Ok(Self { key: LessSafeKey::new(unbound) })
     }
 }
 
@@ -373,12 +347,7 @@ impl AeadCipher for Aes256Gcm {
         32
     }
 
-    fn seal(
-        &self,
-        nonce: &[u8],
-        aad: &[u8],
-        plaintext: &[u8],
-    ) -> Result<Vec<u8>, CryptoError> {
+    fn seal(&self, nonce: &[u8], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         if nonce.len() != self.nonce_size() {
             return Err(CryptoError::InvalidNonceLength {
                 expected: self.nonce_size(),
@@ -391,9 +360,7 @@ impl AeadCipher for Aes256Gcm {
         let mut in_out = plaintext.to_vec();
         self.key
             .seal_in_place_append_tag(ring_nonce, ring_aad, &mut in_out)
-            .map_err(|_| {
-                CryptoError::EncryptionError("seal failed".into())
-            })?;
+            .map_err(|_| CryptoError::EncryptionError("seal failed".into()))?;
         Ok(in_out)
     }
 
@@ -423,12 +390,7 @@ impl AeadCipher for Aes256Gcm {
         Ok(())
     }
 
-    fn open(
-        &self,
-        nonce: &[u8],
-        aad: &[u8],
-        ciphertext: &[u8],
-    ) -> Result<Vec<u8>, CryptoError> {
+    fn open(&self, nonce: &[u8], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         if nonce.len() != self.nonce_size() {
             return Err(CryptoError::InvalidNonceLength {
                 expected: self.nonce_size(),
@@ -486,9 +448,7 @@ impl AeadCipher for Aes256Gcm {
 /// # Example
 ///
 /// ```
-/// use xray_crypto::aead::{
-///     AesCfbEncryptor, AesCfbDecryptor, CryptoError,
-/// };
+/// use xray_crypto::aead::{AesCfbDecryptor, AesCfbEncryptor, CryptoError};
 ///
 /// let key = [0u8; 16];
 /// let iv = [0u8; 16];
@@ -517,31 +477,23 @@ impl AesCfbEncryptor {
     ///
     /// # Errors
     ///
-    /// - `CryptoError::InvalidKeyLength` if key is not 16 or 32
-    ///   bytes.
+    /// - `CryptoError::InvalidKeyLength` if key is not 16 or 32 bytes.
     /// - `CryptoError::InvalidNonceLength` if IV is not 16 bytes.
     pub fn new(key: &[u8], iv: &[u8]) -> Result<Self, CryptoError> {
         if iv.len() != 16 {
-            return Err(CryptoError::InvalidNonceLength {
-                expected: 16,
-                actual: iv.len(),
-            });
+            return Err(CryptoError::InvalidNonceLength { expected: 16, actual: iv.len() });
         }
         match key.len() {
             16 => {
                 let cipher = CfbEncryptor::<Aes128>::new_from_slices(key, iv)
-                    .map_err(|e| {
-                        CryptoError::EncryptionError(e.to_string())
-                    })?;
+                    .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
                 Ok(Self::Aes128(cipher))
-            }
+            },
             32 => {
                 let cipher = CfbEncryptor::<Aes256>::new_from_slices(key, iv)
-                    .map_err(|e| {
-                        CryptoError::EncryptionError(e.to_string())
-                    })?;
+                    .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
                 Ok(Self::Aes256(cipher))
-            }
+            },
             _ => Err(CryptoError::InvalidKeyLength(key.len())),
         }
     }
@@ -562,9 +514,7 @@ impl AesCfbEncryptor {
 /// # Example
 ///
 /// ```
-/// use xray_crypto::aead::{
-///     AesCfbEncryptor, AesCfbDecryptor, CryptoError,
-/// };
+/// use xray_crypto::aead::{AesCfbDecryptor, AesCfbEncryptor, CryptoError};
 ///
 /// let key = [0u8; 16];
 /// let iv = [0u8; 16];
@@ -593,31 +543,23 @@ impl AesCfbDecryptor {
     ///
     /// # Errors
     ///
-    /// - `CryptoError::InvalidKeyLength` if key is not 16 or 32
-    ///   bytes.
+    /// - `CryptoError::InvalidKeyLength` if key is not 16 or 32 bytes.
     /// - `CryptoError::InvalidNonceLength` if IV is not 16 bytes.
     pub fn new(key: &[u8], iv: &[u8]) -> Result<Self, CryptoError> {
         if iv.len() != 16 {
-            return Err(CryptoError::InvalidNonceLength {
-                expected: 16,
-                actual: iv.len(),
-            });
+            return Err(CryptoError::InvalidNonceLength { expected: 16, actual: iv.len() });
         }
         match key.len() {
             16 => {
                 let cipher = CfbDecryptor::<Aes128>::new_from_slices(key, iv)
-                    .map_err(|e| {
-                        CryptoError::EncryptionError(e.to_string())
-                    })?;
+                    .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
                 Ok(Self::Aes128(cipher))
-            }
+            },
             32 => {
                 let cipher = CfbDecryptor::<Aes256>::new_from_slices(key, iv)
-                    .map_err(|e| {
-                        CryptoError::EncryptionError(e.to_string())
-                    })?;
+                    .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
                 Ok(Self::Aes256(cipher))
-            }
+            },
             _ => Err(CryptoError::InvalidKeyLength(key.len())),
         }
     }
@@ -675,33 +617,23 @@ impl AesCtrStream {
     ///
     /// # Errors
     ///
-    /// - `CryptoError::InvalidKeyLength` if key is not 16 or 32
-    ///   bytes.
+    /// - `CryptoError::InvalidKeyLength` if key is not 16 or 32 bytes.
     /// - `CryptoError::InvalidNonceLength` if IV is not 16 bytes.
     pub fn new(key: &[u8], iv: &[u8]) -> Result<Self, CryptoError> {
         if iv.len() != 16 {
-            return Err(CryptoError::InvalidNonceLength {
-                expected: 16,
-                actual: iv.len(),
-            });
+            return Err(CryptoError::InvalidNonceLength { expected: 16, actual: iv.len() });
         }
         match key.len() {
             16 => {
-                let cipher =
-                    Ctr128BE::<Aes128>::new_from_slices(key, iv)
-                        .map_err(|e| {
-                            CryptoError::EncryptionError(e.to_string())
-                        })?;
+                let cipher = Ctr128BE::<Aes128>::new_from_slices(key, iv)
+                    .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
                 Ok(Self::Aes128(cipher))
-            }
+            },
             32 => {
-                let cipher =
-                    Ctr128BE::<Aes256>::new_from_slices(key, iv)
-                        .map_err(|e| {
-                            CryptoError::EncryptionError(e.to_string())
-                        })?;
+                let cipher = Ctr128BE::<Aes256>::new_from_slices(key, iv)
+                    .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
                 Ok(Self::Aes256(cipher))
-            }
+            },
             _ => Err(CryptoError::InvalidKeyLength(key.len())),
         }
     }
@@ -729,8 +661,8 @@ impl AesCtrStream {
 /// # Nonce formats
 ///
 /// - 12-byte nonce: IETF RFC 8439 standard format
-/// - 8-byte nonce: Legacy Bernstein format (padded to 12 bytes
-///   internally with 4 zero bytes prepended)
+/// - 8-byte nonce: Legacy Bernstein format (padded to 12 bytes internally with 4 zero bytes
+///   prepended)
 ///
 /// # Example
 ///
@@ -780,8 +712,7 @@ impl ChaCha20Stream {
     /// # Errors
     ///
     /// - `CryptoError::InvalidKeyLength` if key is not 32 bytes
-    /// - `CryptoError::InvalidNonceLength` if nonce is not 8 or 12
-    ///   bytes
+    /// - `CryptoError::InvalidNonceLength` if nonce is not 8 or 12 bytes
     pub fn new(key: &[u8], nonce: &[u8]) -> Result<Self, CryptoError> {
         if key.len() != CHACHA20_KEY_SIZE {
             return Err(CryptoError::InvalidKeyLength(key.len()));
@@ -792,7 +723,7 @@ impl ChaCha20Stream {
                 let cipher = ChaCha20::new_from_slices(key, nonce)
                     .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
                 Ok(Self { inner: cipher })
-            }
+            },
             CHACHA20_LEGACY_NONCE_SIZE => {
                 // 8-byte nonce padded to 12 bytes:
                 // [0, 0, 0, 0] + nonce[0..8]
@@ -801,7 +732,7 @@ impl ChaCha20Stream {
                 let cipher = ChaCha20::new_from_slices(key, &padded)
                     .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
                 Ok(Self { inner: cipher })
-            }
+            },
             _ => Err(CryptoError::InvalidNonceLength {
                 expected: CHACHA20_NONCE_SIZE,
                 actual: nonce.len(),
@@ -827,15 +758,9 @@ impl ChaCha20Stream {
     ///
     /// Returns `CryptoError::EncryptionError` if `dst` is shorter
     /// than `src`.
-    pub fn xor_key_stream_b2b(
-        &mut self,
-        dst: &mut [u8],
-        src: &[u8],
-    ) -> Result<(), CryptoError> {
+    pub fn xor_key_stream_b2b(&mut self, dst: &mut [u8], src: &[u8]) -> Result<(), CryptoError> {
         if dst.len() < src.len() {
-            return Err(CryptoError::EncryptionError(
-                "destination buffer too short".into(),
-            ));
+            return Err(CryptoError::EncryptionError("destination buffer too short".into()));
         }
         self.inner.apply_keystream_b2b(src, dst);
         Ok(())
@@ -854,9 +779,7 @@ impl ChaCha20Stream {
 /// # Example
 ///
 /// ```
-/// use xray_crypto::aead::{
-///     AeadCipher, ChaCha20Poly1305Aead, CryptoError,
-/// };
+/// use xray_crypto::aead::{AeadCipher, ChaCha20Poly1305Aead, CryptoError};
 ///
 /// let key = [0x42u8; 32];
 /// let cipher = ChaCha20Poly1305Aead::new(&key)?;
@@ -904,61 +827,33 @@ impl AeadCipher for ChaCha20Poly1305Aead {
         CHACHA20_KEY_SIZE
     }
 
-    fn seal(
-        &self,
-        nonce: &[u8],
-        aad: &[u8],
-        plaintext: &[u8],
-    ) -> Result<Vec<u8>, CryptoError> {
+    fn seal(&self, nonce: &[u8], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         if nonce.len() != self.nonce_size() {
             return Err(CryptoError::InvalidNonceLength {
                 expected: self.nonce_size(),
                 actual: nonce.len(),
             });
         }
-        let nonce_arr: chacha20poly1305::Nonce = nonce
-            .try_into()
-            .map_err(|_| CryptoError::InvalidNonceLength {
-                expected: self.nonce_size(),
-                actual: nonce.len(),
-            })?;
+        let nonce_arr: chacha20poly1305::Nonce = nonce.try_into().map_err(|_| {
+            CryptoError::InvalidNonceLength { expected: self.nonce_size(), actual: nonce.len() }
+        })?;
         self.inner
-            .encrypt(
-                &nonce_arr,
-                Payload {
-                    msg: plaintext,
-                    aad,
-                },
-            )
+            .encrypt(&nonce_arr, Payload { msg: plaintext, aad })
             .map_err(|e| CryptoError::EncryptionError(e.to_string()))
     }
 
-    fn open(
-        &self,
-        nonce: &[u8],
-        aad: &[u8],
-        ciphertext: &[u8],
-    ) -> Result<Vec<u8>, CryptoError> {
+    fn open(&self, nonce: &[u8], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         if nonce.len() != self.nonce_size() {
             return Err(CryptoError::InvalidNonceLength {
                 expected: self.nonce_size(),
                 actual: nonce.len(),
             });
         }
-        let nonce_arr: chacha20poly1305::Nonce = nonce
-            .try_into()
-            .map_err(|_| CryptoError::InvalidNonceLength {
-                expected: self.nonce_size(),
-                actual: nonce.len(),
-            })?;
+        let nonce_arr: chacha20poly1305::Nonce = nonce.try_into().map_err(|_| {
+            CryptoError::InvalidNonceLength { expected: self.nonce_size(), actual: nonce.len() }
+        })?;
         self.inner
-            .decrypt(
-                &nonce_arr,
-                Payload {
-                    msg: ciphertext,
-                    aad,
-                },
-            )
+            .decrypt(&nonce_arr, Payload { msg: ciphertext, aad })
             .map_err(|e| CryptoError::EncryptionError(e.to_string()))
     }
 
@@ -975,26 +870,20 @@ impl AeadCipher for ChaCha20Poly1305Aead {
                 actual: nonce.len(),
             });
         }
-        let nonce_arr: chacha20poly1305::Nonce = nonce
-            .try_into()
-            .map_err(|_| CryptoError::InvalidNonceLength {
-                expected: self.nonce_size(),
-                actual: nonce.len(),
-            })?;
+        let nonce_arr: chacha20poly1305::Nonce = nonce.try_into().map_err(|_| {
+            CryptoError::InvalidNonceLength { expected: self.nonce_size(), actual: nonce.len() }
+        })?;
         let start = out.len();
         out.extend_from_slice(plaintext);
-        match self
-            .inner
-            .encrypt_inout_detached(&nonce_arr, aad, (&mut out[start..]).into())
-        {
+        match self.inner.encrypt_inout_detached(&nonce_arr, aad, (&mut out[start..]).into()) {
             Ok(tag) => {
                 out.extend_from_slice(tag.as_ref());
                 Ok(())
-            }
+            },
             Err(e) => {
                 out.truncate(start);
                 Err(CryptoError::EncryptionError(e.to_string()))
-            }
+            },
         }
     }
 
@@ -1010,12 +899,9 @@ impl AeadCipher for ChaCha20Poly1305Aead {
                 actual: nonce.len(),
             });
         }
-        let nonce_arr: chacha20poly1305::Nonce = nonce
-            .try_into()
-            .map_err(|_| CryptoError::InvalidNonceLength {
-                expected: self.nonce_size(),
-                actual: nonce.len(),
-            })?;
+        let nonce_arr: chacha20poly1305::Nonce = nonce.try_into().map_err(|_| {
+            CryptoError::InvalidNonceLength { expected: self.nonce_size(), actual: nonce.len() }
+        })?;
         let ct_len = ciphertext
             .len()
             .checked_sub(self.tag_size())
@@ -1043,9 +929,7 @@ impl AeadCipher for ChaCha20Poly1305Aead {
 /// # Example
 ///
 /// ```
-/// use xray_crypto::aead::{
-///     AeadCipher, XChaCha20Poly1305Aead, CryptoError,
-/// };
+/// use xray_crypto::aead::{AeadCipher, CryptoError, XChaCha20Poly1305Aead};
 ///
 /// let key = [0x42u8; 32];
 /// let cipher = XChaCha20Poly1305Aead::new(&key)?;
@@ -1093,61 +977,33 @@ impl AeadCipher for XChaCha20Poly1305Aead {
         CHACHA20_KEY_SIZE
     }
 
-    fn seal(
-        &self,
-        nonce: &[u8],
-        aad: &[u8],
-        plaintext: &[u8],
-    ) -> Result<Vec<u8>, CryptoError> {
+    fn seal(&self, nonce: &[u8], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         if nonce.len() != self.nonce_size() {
             return Err(CryptoError::InvalidNonceLength {
                 expected: self.nonce_size(),
                 actual: nonce.len(),
             });
         }
-        let nonce_arr: chacha20poly1305::XNonce = nonce
-            .try_into()
-            .map_err(|_| CryptoError::InvalidNonceLength {
-                expected: self.nonce_size(),
-                actual: nonce.len(),
-            })?;
+        let nonce_arr: chacha20poly1305::XNonce = nonce.try_into().map_err(|_| {
+            CryptoError::InvalidNonceLength { expected: self.nonce_size(), actual: nonce.len() }
+        })?;
         self.inner
-            .encrypt(
-                &nonce_arr,
-                Payload {
-                    msg: plaintext,
-                    aad,
-                },
-            )
+            .encrypt(&nonce_arr, Payload { msg: plaintext, aad })
             .map_err(|e| CryptoError::EncryptionError(e.to_string()))
     }
 
-    fn open(
-        &self,
-        nonce: &[u8],
-        aad: &[u8],
-        ciphertext: &[u8],
-    ) -> Result<Vec<u8>, CryptoError> {
+    fn open(&self, nonce: &[u8], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         if nonce.len() != self.nonce_size() {
             return Err(CryptoError::InvalidNonceLength {
                 expected: self.nonce_size(),
                 actual: nonce.len(),
             });
         }
-        let nonce_arr: chacha20poly1305::XNonce = nonce
-            .try_into()
-            .map_err(|_| CryptoError::InvalidNonceLength {
-                expected: self.nonce_size(),
-                actual: nonce.len(),
-            })?;
+        let nonce_arr: chacha20poly1305::XNonce = nonce.try_into().map_err(|_| {
+            CryptoError::InvalidNonceLength { expected: self.nonce_size(), actual: nonce.len() }
+        })?;
         self.inner
-            .decrypt(
-                &nonce_arr,
-                Payload {
-                    msg: ciphertext,
-                    aad,
-                },
-            )
+            .decrypt(&nonce_arr, Payload { msg: ciphertext, aad })
             .map_err(|e| CryptoError::EncryptionError(e.to_string()))
     }
 }
@@ -1166,12 +1022,10 @@ mod tests {
         let plaintext = b"secret message to encrypt";
 
         let cipher = Aes128Gcm::new(&key).expect("key should be valid");
-        let ciphertext =
-            cipher.seal(&nonce, aad, plaintext).expect("seal should work");
+        let ciphertext = cipher.seal(&nonce, aad, plaintext).expect("seal should work");
         assert!(ciphertext.len() > plaintext.len());
 
-        let decrypted =
-            cipher.open(&nonce, aad, &ciphertext).expect("open should work");
+        let decrypted = cipher.open(&nonce, aad, &ciphertext).expect("open should work");
         assert_eq!(plaintext.as_slice(), decrypted.as_slice());
     }
 
@@ -1183,15 +1037,13 @@ mod tests {
         let plaintext = b"secret message";
 
         let cipher = Aes256Gcm::new(&key).expect("key should be valid");
-        let ciphertext =
-            cipher.seal(&nonce, aad, plaintext).expect("seal should work");
-        let decrypted =
-            cipher.open(&nonce, aad, &ciphertext).expect("open should work");
+        let ciphertext = cipher.seal(&nonce, aad, plaintext).expect("seal should work");
+        let decrypted = cipher.open(&nonce, aad, &ciphertext).expect("open should work");
         assert_eq!(plaintext.as_slice(), decrypted.as_slice());
     }
 
     /// seal_into 必须产生与 seal 完全一致的字节，且支持向非空 out 追加
-    ///（SS chunk 写路径依赖：size 段+payload 段拼同一缓冲单次写出）。
+    /// （SS chunk 写路径依赖：size 段+payload 段拼同一缓冲单次写出）。
     #[test]
     fn seal_into_matches_seal_and_appends() {
         let key = [3u8; 32];
@@ -1209,12 +1061,8 @@ mod tests {
             let part1 = b"first segment";
             let part2 = b"second segment payload";
             let mut out = Vec::new();
-            cipher
-                .seal_into(nonce, aad, part1, &mut out)
-                .expect("seal_into 1");
-            cipher
-                .seal_into(nonce, aad, part2, &mut out)
-                .expect("seal_into 2");
+            cipher.seal_into(nonce, aad, part1, &mut out).expect("seal_into 1");
+            cipher.seal_into(nonce, aad, part2, &mut out).expect("seal_into 2");
             let expected = [
                 cipher.seal(nonce, aad, part1).expect("seal 1"),
                 cipher.seal(nonce, aad, part2).expect("seal 2"),
@@ -1243,9 +1091,8 @@ mod tests {
 
             let mut buf = sealed.clone();
             buf.extend_from_slice(b"trailing-sentinel");
-            let opened = cipher
-                .open_in_place(nonce, aad, &mut buf[..sealed.len()])
-                .expect("open_in_place");
+            let opened =
+                cipher.open_in_place(nonce, aad, &mut buf[..sealed.len()]).expect("open_in_place");
             assert_eq!(opened, plaintext);
             assert_eq!(&buf[sealed.len()..], b"trailing-sentinel");
 
@@ -1259,20 +1106,14 @@ mod tests {
     fn aes128_gcm_invalid_key_length() {
         let key = [0u8; 15];
         let result = Aes128Gcm::new(&key);
-        assert!(matches!(
-            result,
-            Err(CryptoError::InvalidKeyLength(15))
-        ));
+        assert!(matches!(result, Err(CryptoError::InvalidKeyLength(15))));
     }
 
     #[test]
     fn aes256_gcm_invalid_key_length() {
         let key = [0u8; 31];
         let result = Aes256Gcm::new(&key);
-        assert!(matches!(
-            result,
-            Err(CryptoError::InvalidKeyLength(31))
-        ));
+        assert!(matches!(result, Err(CryptoError::InvalidKeyLength(31))));
     }
 
     #[test]
@@ -1293,10 +1134,7 @@ mod tests {
         let nonce = [0u8; 12];
         let cipher = Aes128Gcm::new(&key).expect("key should be valid");
         let result = cipher.open(&nonce, b"", b"corrupted ciphertext");
-        assert!(matches!(
-            result,
-            Err(CryptoError::AuthenticationFailed)
-        ));
+        assert!(matches!(result, Err(CryptoError::AuthenticationFailed)));
     }
 
     #[test]
@@ -1306,19 +1144,13 @@ mod tests {
         let cipher = Aes128Gcm::new(&key).expect("key should be valid");
 
         // Empty AAD
-        let ct = cipher
-            .seal(&nonce, b"", b"msg")
-            .expect("empty aad seal");
+        let ct = cipher.seal(&nonce, b"", b"msg").expect("empty aad seal");
         let pt = cipher.open(&nonce, b"", &ct).expect("empty aad open");
         assert_eq!(b"msg".as_slice(), pt.as_slice());
 
         // Non-empty AAD
-        let ct2 = cipher
-            .seal(&nonce, b"auth data", b"msg2")
-            .expect("non-empty aad seal");
-        let pt2 = cipher
-            .open(&nonce, b"auth data", &ct2)
-            .expect("non-empty aad open");
+        let ct2 = cipher.seal(&nonce, b"auth data", b"msg2").expect("non-empty aad seal");
+        let pt2 = cipher.open(&nonce, b"auth data", &ct2).expect("non-empty aad open");
         assert_eq!(b"msg2".as_slice(), pt2.as_slice());
 
         // Wrong AAD should fail
@@ -1346,14 +1178,12 @@ mod tests {
         let iv = [0u8; 16];
         let plaintext = b"secret message for cfb mode";
 
-        let mut encryptor =
-            AesCfbEncryptor::new(&key, &iv).expect("new encryptor");
+        let mut encryptor = AesCfbEncryptor::new(&key, &iv).expect("new encryptor");
         let mut ciphertext = plaintext.to_vec();
         encryptor.encrypt(&mut ciphertext);
         assert_ne!(plaintext.as_slice(), ciphertext.as_slice());
 
-        let mut decryptor =
-            AesCfbDecryptor::new(&key, &iv).expect("new decryptor");
+        let mut decryptor = AesCfbDecryptor::new(&key, &iv).expect("new decryptor");
         decryptor.decrypt(&mut ciphertext);
         assert_eq!(plaintext.as_slice(), ciphertext.as_slice());
     }
@@ -1364,13 +1194,11 @@ mod tests {
         let iv = [0u8; 16];
         let plaintext = b"secret message for cfb-256";
 
-        let mut encryptor =
-            AesCfbEncryptor::new(&key, &iv).expect("new encryptor");
+        let mut encryptor = AesCfbEncryptor::new(&key, &iv).expect("new encryptor");
         let mut ciphertext = plaintext.to_vec();
         encryptor.encrypt(&mut ciphertext);
 
-        let mut decryptor =
-            AesCfbDecryptor::new(&key, &iv).expect("new decryptor");
+        let mut decryptor = AesCfbDecryptor::new(&key, &iv).expect("new decryptor");
         decryptor.decrypt(&mut ciphertext);
         assert_eq!(plaintext.as_slice(), ciphertext.as_slice());
     }
@@ -1380,10 +1208,7 @@ mod tests {
         let key = [0u8; 8];
         let iv = [0u8; 16];
         let result = AesCfbEncryptor::new(&key, &iv);
-        assert!(matches!(
-            result,
-            Err(CryptoError::InvalidKeyLength(8))
-        ));
+        assert!(matches!(result, Err(CryptoError::InvalidKeyLength(8))));
     }
 
     #[test]
@@ -1391,18 +1216,14 @@ mod tests {
         let key = [0u8; 16];
         let iv = [0u8; 8];
         let result = AesCfbEncryptor::new(&key, &iv);
-        assert!(matches!(
-            result,
-            Err(CryptoError::InvalidNonceLength { expected: 16, actual: 8 })
-        ));
+        assert!(matches!(result, Err(CryptoError::InvalidNonceLength { expected: 16, actual: 8 })));
     }
 
     #[test]
     fn aes_cfb_empty_data() {
         let key = [0u8; 16];
         let iv = [0u8; 16];
-        let mut encryptor =
-            AesCfbEncryptor::new(&key, &iv).expect("new encryptor");
+        let mut encryptor = AesCfbEncryptor::new(&key, &iv).expect("new encryptor");
         let mut data: [u8; 0] = [];
         encryptor.encrypt(&mut data);
         assert!(data.is_empty());
@@ -1416,14 +1237,12 @@ mod tests {
         let iv = [0u8; 16];
         let plaintext = b"secret message for ctr mode";
 
-        let mut cipher =
-            AesCtrStream::new(&key, &iv).expect("new ctr cipher");
+        let mut cipher = AesCtrStream::new(&key, &iv).expect("new ctr cipher");
         let mut data = plaintext.to_vec();
         cipher.apply_keystream(&mut data);
         assert_ne!(plaintext.as_slice(), data.as_slice());
 
-        let mut cipher2 =
-            AesCtrStream::new(&key, &iv).expect("new ctr cipher");
+        let mut cipher2 = AesCtrStream::new(&key, &iv).expect("new ctr cipher");
         cipher2.apply_keystream(&mut data);
         assert_eq!(plaintext.as_slice(), data.as_slice());
     }
@@ -1434,13 +1253,11 @@ mod tests {
         let iv = [0u8; 16];
         let plaintext = b"secret message for ctr-256";
 
-        let mut cipher =
-            AesCtrStream::new(&key, &iv).expect("new ctr cipher");
+        let mut cipher = AesCtrStream::new(&key, &iv).expect("new ctr cipher");
         let mut data = plaintext.to_vec();
         cipher.apply_keystream(&mut data);
 
-        let mut cipher2 =
-            AesCtrStream::new(&key, &iv).expect("new ctr cipher");
+        let mut cipher2 = AesCtrStream::new(&key, &iv).expect("new ctr cipher");
         cipher2.apply_keystream(&mut data);
         assert_eq!(plaintext.as_slice(), data.as_slice());
     }
@@ -1450,10 +1267,7 @@ mod tests {
         let key = [0u8; 8];
         let iv = [0u8; 16];
         let result = AesCtrStream::new(&key, &iv);
-        assert!(matches!(
-            result,
-            Err(CryptoError::InvalidKeyLength(8))
-        ));
+        assert!(matches!(result, Err(CryptoError::InvalidKeyLength(8))));
     }
 
     #[test]
@@ -1461,18 +1275,14 @@ mod tests {
         let key = [0u8; 16];
         let iv = [0u8; 8];
         let result = AesCtrStream::new(&key, &iv);
-        assert!(matches!(
-            result,
-            Err(CryptoError::InvalidNonceLength { expected: 16, actual: 8 })
-        ));
+        assert!(matches!(result, Err(CryptoError::InvalidNonceLength { expected: 16, actual: 8 })));
     }
 
     #[test]
     fn aes_ctr_empty_data() {
         let key = [0u8; 16];
         let iv = [0u8; 16];
-        let mut cipher =
-            AesCtrStream::new(&key, &iv).expect("new ctr cipher");
+        let mut cipher = AesCtrStream::new(&key, &iv).expect("new ctr cipher");
         let mut data: [u8; 0] = [];
         cipher.apply_keystream(&mut data);
         assert!(data.is_empty());
@@ -1485,14 +1295,12 @@ mod tests {
         let iv = [0u8; 16];
         let plaintext = b"hello world streaming test";
 
-        let mut cipher1 =
-            AesCtrStream::new(&key, &iv).expect("new ctr cipher");
+        let mut cipher1 = AesCtrStream::new(&key, &iv).expect("new ctr cipher");
         let mut full_data = plaintext.to_vec();
         cipher1.apply_keystream(&mut full_data);
 
         // Process in two chunks
-        let mut cipher2 =
-            AesCtrStream::new(&key, &iv).expect("new ctr cipher");
+        let mut cipher2 = AesCtrStream::new(&key, &iv).expect("new ctr cipher");
         let mut chunked_data = plaintext.to_vec();
         cipher2.apply_keystream(&mut chunked_data[..5]);
         cipher2.apply_keystream(&mut chunked_data[5..]);
@@ -1508,14 +1316,12 @@ mod tests {
         let nonce = [0x24u8; 12];
         let plaintext = b"hello chacha20 world";
 
-        let mut cipher =
-            ChaCha20Stream::new(&key, &nonce).expect("new chacha20");
+        let mut cipher = ChaCha20Stream::new(&key, &nonce).expect("new chacha20");
         let mut data = plaintext.to_vec();
         cipher.xor_key_stream(&mut data);
         assert_ne!(plaintext.as_slice(), data.as_slice());
 
-        let mut cipher2 =
-            ChaCha20Stream::new(&key, &nonce).expect("new chacha20");
+        let mut cipher2 = ChaCha20Stream::new(&key, &nonce).expect("new chacha20");
         cipher2.xor_key_stream(&mut data);
         assert_eq!(plaintext.as_slice(), data.as_slice());
     }
@@ -1526,13 +1332,11 @@ mod tests {
         let nonce = [0x24u8; 8];
         let plaintext = b"legacy nonce test";
 
-        let mut cipher =
-            ChaCha20Stream::new(&key, &nonce).expect("new chacha20");
+        let mut cipher = ChaCha20Stream::new(&key, &nonce).expect("new chacha20");
         let mut data = plaintext.to_vec();
         cipher.xor_key_stream(&mut data);
 
-        let mut cipher2 =
-            ChaCha20Stream::new(&key, &nonce).expect("new chacha20");
+        let mut cipher2 = ChaCha20Stream::new(&key, &nonce).expect("new chacha20");
         cipher2.xor_key_stream(&mut data);
         assert_eq!(plaintext.as_slice(), data.as_slice());
     }
@@ -1542,10 +1346,7 @@ mod tests {
         let key = [0u8; 16];
         let nonce = [0u8; 12];
         let result = ChaCha20Stream::new(&key, &nonce);
-        assert!(matches!(
-            result,
-            Err(CryptoError::InvalidKeyLength(16))
-        ));
+        assert!(matches!(result, Err(CryptoError::InvalidKeyLength(16))));
     }
 
     #[test]
@@ -1555,10 +1356,7 @@ mod tests {
         let result = ChaCha20Stream::new(&key, &nonce);
         assert!(matches!(
             result,
-            Err(CryptoError::InvalidNonceLength {
-                expected: 12,
-                actual: 10
-            })
+            Err(CryptoError::InvalidNonceLength { expected: 12, actual: 10 })
         ));
     }
 
@@ -1566,8 +1364,7 @@ mod tests {
     fn chacha20_stream_empty_data() {
         let key = [0u8; 32];
         let nonce = [0u8; 12];
-        let mut cipher =
-            ChaCha20Stream::new(&key, &nonce).expect("new chacha20");
+        let mut cipher = ChaCha20Stream::new(&key, &nonce).expect("new chacha20");
         let mut data: [u8; 0] = [];
         cipher.xor_key_stream(&mut data);
         assert!(data.is_empty());
@@ -1579,20 +1376,14 @@ mod tests {
         let nonce = [0x24u8; 12];
         let plaintext = b"buffer to buffer test";
 
-        let mut cipher =
-            ChaCha20Stream::new(&key, &nonce).expect("new chacha20");
+        let mut cipher = ChaCha20Stream::new(&key, &nonce).expect("new chacha20");
         let mut dst = vec![0u8; plaintext.len()];
-        cipher
-            .xor_key_stream_b2b(&mut dst, plaintext)
-            .expect("b2b should work");
+        cipher.xor_key_stream_b2b(&mut dst, plaintext).expect("b2b should work");
 
         // Decrypt back
-        let mut cipher2 =
-            ChaCha20Stream::new(&key, &nonce).expect("new chacha20");
+        let mut cipher2 = ChaCha20Stream::new(&key, &nonce).expect("new chacha20");
         let mut decrypted = vec![0u8; dst.len()];
-        cipher2
-            .xor_key_stream_b2b(&mut decrypted, &dst)
-            .expect("b2b decrypt");
+        cipher2.xor_key_stream_b2b(&mut decrypted, &dst).expect("b2b decrypt");
         assert_eq!(plaintext.as_slice(), decrypted.as_slice());
     }
 
@@ -1605,17 +1396,12 @@ mod tests {
         let aad = b"additional data";
         let plaintext = b"authenticated secret";
 
-        let cipher =
-            ChaCha20Poly1305Aead::new(&key).expect("new chacha20poly1305");
-        let ciphertext = cipher
-            .seal(&nonce, aad, plaintext)
-            .expect("seal should work");
+        let cipher = ChaCha20Poly1305Aead::new(&key).expect("new chacha20poly1305");
+        let ciphertext = cipher.seal(&nonce, aad, plaintext).expect("seal should work");
         // Ciphertext = encrypted data + 16-byte tag
         assert_eq!(ciphertext.len(), plaintext.len() + 16);
 
-        let decrypted = cipher
-            .open(&nonce, aad, &ciphertext)
-            .expect("open should work");
+        let decrypted = cipher.open(&nonce, aad, &ciphertext).expect("open should work");
         assert_eq!(plaintext.as_slice(), decrypted.as_slice());
     }
 
@@ -1623,34 +1409,23 @@ mod tests {
     fn chacha20poly1305_invalid_key_length() {
         let key = [0u8; 16];
         let result = ChaCha20Poly1305Aead::new(&key);
-        assert!(matches!(
-            result,
-            Err(CryptoError::InvalidKeyLength(16))
-        ));
+        assert!(matches!(result, Err(CryptoError::InvalidKeyLength(16))));
     }
 
     #[test]
     fn chacha20poly1305_invalid_nonce_length() {
         let key = [0u8; 32];
-        let cipher =
-            ChaCha20Poly1305Aead::new(&key).expect("new chacha20poly1305");
+        let cipher = ChaCha20Poly1305Aead::new(&key).expect("new chacha20poly1305");
         let bad_nonce = [0u8; 8];
         let result = cipher.seal(&bad_nonce, b"", b"test");
-        assert!(matches!(
-            result,
-            Err(CryptoError::InvalidNonceLength {
-                expected: 12,
-                actual: 8
-            })
-        ));
+        assert!(matches!(result, Err(CryptoError::InvalidNonceLength { expected: 12, actual: 8 })));
     }
 
     #[test]
     fn chacha20poly1305_authentication_failed() {
         let key = [0u8; 32];
         let nonce = [0u8; 12];
-        let cipher =
-            ChaCha20Poly1305Aead::new(&key).expect("new chacha20poly1305");
+        let cipher = ChaCha20Poly1305Aead::new(&key).expect("new chacha20poly1305");
         let result = cipher.open(&nonce, b"", b"corrupted ciphertext");
         assert!(result.is_err());
     }
@@ -1659,11 +1434,8 @@ mod tests {
     fn chacha20poly1305_aad_mismatch() {
         let key = [0x42u8; 32];
         let nonce = [0u8; 12];
-        let cipher =
-            ChaCha20Poly1305Aead::new(&key).expect("new chacha20poly1305");
-        let ct = cipher
-            .seal(&nonce, b"correct aad", b"secret")
-            .expect("seal");
+        let cipher = ChaCha20Poly1305Aead::new(&key).expect("new chacha20poly1305");
+        let ct = cipher.seal(&nonce, b"correct aad", b"secret").expect("seal");
         let result = cipher.open(&nonce, b"wrong aad", &ct);
         assert!(result.is_err());
     }
@@ -1672,8 +1444,7 @@ mod tests {
     fn chacha20poly1305_empty_plaintext() {
         let key = [0u8; 32];
         let nonce = [0u8; 12];
-        let cipher =
-            ChaCha20Poly1305Aead::new(&key).expect("new chacha20poly1305");
+        let cipher = ChaCha20Poly1305Aead::new(&key).expect("new chacha20poly1305");
         let ct = cipher.seal(&nonce, b"", b"").expect("empty seal");
         assert_eq!(ct.len(), 16); // Tag only
         let pt = cipher.open(&nonce, b"", &ct).expect("empty open");
@@ -1689,16 +1460,11 @@ mod tests {
         let aad = b"additional data";
         let plaintext = b"authenticated secret";
 
-        let cipher = XChaCha20Poly1305Aead::new(&key)
-            .expect("new xchacha20poly1305");
-        let ciphertext = cipher
-            .seal(&nonce, aad, plaintext)
-            .expect("seal should work");
+        let cipher = XChaCha20Poly1305Aead::new(&key).expect("new xchacha20poly1305");
+        let ciphertext = cipher.seal(&nonce, aad, plaintext).expect("seal should work");
         assert_eq!(ciphertext.len(), plaintext.len() + 16);
 
-        let decrypted = cipher
-            .open(&nonce, aad, &ciphertext)
-            .expect("open should work");
+        let decrypted = cipher.open(&nonce, aad, &ciphertext).expect("open should work");
         assert_eq!(plaintext.as_slice(), decrypted.as_slice());
     }
 
@@ -1706,25 +1472,18 @@ mod tests {
     fn xchacha20poly1305_invalid_key_length() {
         let key = [0u8; 16];
         let result = XChaCha20Poly1305Aead::new(&key);
-        assert!(matches!(
-            result,
-            Err(CryptoError::InvalidKeyLength(16))
-        ));
+        assert!(matches!(result, Err(CryptoError::InvalidKeyLength(16))));
     }
 
     #[test]
     fn xchacha20poly1305_invalid_nonce_length() {
         let key = [0u8; 32];
-        let cipher = XChaCha20Poly1305Aead::new(&key)
-            .expect("new xchacha20poly1305");
+        let cipher = XChaCha20Poly1305Aead::new(&key).expect("new xchacha20poly1305");
         let bad_nonce = [0u8; 12];
         let result = cipher.seal(&bad_nonce, b"", b"test");
         assert!(matches!(
             result,
-            Err(CryptoError::InvalidNonceLength {
-                expected: 24,
-                actual: 12
-            })
+            Err(CryptoError::InvalidNonceLength { expected: 24, actual: 12 })
         ));
     }
 
@@ -1732,8 +1491,7 @@ mod tests {
     fn xchacha20poly1305_authentication_failed() {
         let key = [0u8; 32];
         let nonce = [0u8; 24];
-        let cipher = XChaCha20Poly1305Aead::new(&key)
-            .expect("new xchacha20poly1305");
+        let cipher = XChaCha20Poly1305Aead::new(&key).expect("new xchacha20poly1305");
         let result = cipher.open(&nonce, b"", b"corrupted ciphertext");
         assert!(result.is_err());
     }
@@ -1742,11 +1500,8 @@ mod tests {
     fn xchacha20poly1305_aad_mismatch() {
         let key = [0x42u8; 32];
         let nonce = [0u8; 24];
-        let cipher = XChaCha20Poly1305Aead::new(&key)
-            .expect("new xchacha20poly1305");
-        let ct = cipher
-            .seal(&nonce, b"correct aad", b"secret")
-            .expect("seal");
+        let cipher = XChaCha20Poly1305Aead::new(&key).expect("new xchacha20poly1305");
+        let ct = cipher.seal(&nonce, b"correct aad", b"secret").expect("seal");
         let result = cipher.open(&nonce, b"wrong aad", &ct);
         assert!(result.is_err());
     }
@@ -1755,8 +1510,7 @@ mod tests {
     fn xchacha20poly1305_empty_plaintext() {
         let key = [0u8; 32];
         let nonce = [0u8; 24];
-        let cipher = XChaCha20Poly1305Aead::new(&key)
-            .expect("new xchacha20poly1305");
+        let cipher = XChaCha20Poly1305Aead::new(&key).expect("new xchacha20poly1305");
         let ct = cipher.seal(&nonce, b"", b"").expect("empty seal");
         assert_eq!(ct.len(), 16); // Tag only
         let pt = cipher.open(&nonce, b"", &ct).expect("empty open");

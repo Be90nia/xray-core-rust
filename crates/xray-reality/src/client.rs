@@ -4,12 +4,11 @@
 //!
 //! # 实现（双路径）
 //!
-//! - **btls 指纹路径（主路径）**：[`xray_tls::btls_reality::connect_reality`]
-//!   用 BoringSSL 原生浏览器 ClientHello（Chrome/Firefox/Safari/... 指纹，
-//!   对应 Go `utls.UClient` 的 uTLS 模板握手），在 ClientHello record 写出
-//!   前（BIO 拦截）注入 REALITY session_id（auth_key = ECDH(X25519 key share
-//!   私钥, 服务端公钥)，AES-256-GCM Seal，AAD = zero-session-id 版
-//!   handshake message），握手后验证证书 HMAC-SHA512。
+//! - **btls 指纹路径（主路径）**：[`xray_tls::btls_reality::connect_reality`] 用 BoringSSL
+//!   原生浏览器 ClientHello（Chrome/Firefox/Safari/... 指纹， 对应 Go `utls.UClient` 的 uTLS
+//!   模板握手），在 ClientHello record 写出 前（BIO 拦截）注入 REALITY session_id（auth_key =
+//!   ECDH(X25519 key share 私钥, 服务端公钥)，AES-256-GCM Seal，AAD = zero-session-id 版 handshake
+//!   message），握手后验证证书 HMAC-SHA512。
 //! - **watfaq-rustls 路径（fallback）**：指纹不被 btls 支持时退回
 //!   `ClientConfig::builder().with_reality()`（标准 rustls ClientHello）。
 //!
@@ -21,26 +20,25 @@
 //! `u_client` 返回 [`RealityTlsStream`]；上层可包装为 `SplicableTlsStream`（待实现）
 //! 以支持 XTLS-Vision 的 splice 模式（clash-rs PR#1057 方案）。
 
-use std::io;
-use std::sync::Arc;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    io,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use btls::ssl::SslRef;
 use parking_lot::Mutex;
-use rustls::client::RealityConfig as WatfaqRealityConfig;
-use rustls::{ClientConfig, RootCertStore};
+use rustls::{ClientConfig, RootCertStore, client::RealityConfig as WatfaqRealityConfig};
 use rustls_pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::client::TlsStream;
 use webpki_roots::TLS_SERVER_ROOTS;
-use xray_tls::btls_reality::{connect_reality, x25519_key_share_private, RealityHooks};
+use xray_tls::btls_reality::{RealityHooks, connect_reality, x25519_key_share_private};
 use xray_transport::connection::Connection;
 
-use crate::config::RealityConfig;
-use crate::crypto;
-use crate::error::RealityError;
+use crate::{config::RealityConfig, crypto, error::RealityError};
 
 /// REALITY 客户端连接状态（握手前/握手后统一形态）。
 ///
@@ -108,12 +106,14 @@ impl<S: Connection> AsyncWrite for RealityTlsStream<S> {
             RealityTlsStream::Rustls(t) => Pin::new(t).poll_write(cx, buf),
         }
     }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut *self {
             RealityTlsStream::Btls(c) => Pin::new(c).poll_flush(cx),
             RealityTlsStream::Rustls(t) => Pin::new(t).poll_flush(cx),
         }
     }
+
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut *self {
             RealityTlsStream::Btls(c) => Pin::new(c).poll_shutdown(cx),
@@ -128,12 +128,14 @@ impl<S: Connection> Connection for RealityTlsStream<S> {
             RealityTlsStream::Rustls(t) => t.get_ref().0.remote_addr(),
         }
     }
+
     fn local_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
         match self {
             RealityTlsStream::Btls(c) => c.local_addr(),
             RealityTlsStream::Rustls(t) => t.get_ref().0.local_addr(),
         }
     }
+
     fn raw_tcp_clone(&self) -> Option<tokio::net::TcpStream> {
         // 穿透 TLS 层克隆内层流的裸 TCP（vision splice 用）。
         match self {
@@ -203,16 +205,19 @@ impl RealityHooks for BtlsRealityHooks {
             // handshake record 且首消息为 ClientHello
             if content_type == 22 && rec_len > 44 && record[body_start] == 1 {
                 let hs = &mut record[body_start..body_end];
-                // handshake 布局：[type(1)][len(3)][legacy_version(2)][random(32)][sid_len(1)][sid(32)]
+                // handshake 布局：
+                // [type(1)][len(3)][legacy_version(2)][random(32)][sid_len(1)][sid(32)]
                 const HS_HDR: usize = 1 + 3 + 2; // type+len+version → random 起点
                 const SID_LEN_OFF: usize = HS_HDR + 32;
                 const SID_OFF: usize = SID_LEN_OFF + 1; // = 39，与服务端 SESSION_ID_OFFSET_IN_HANDSHAKE 一致
                 if hs[SID_LEN_OFF] != 32 {
-                    return Err(io::Error::other("REALITY: unexpected session_id length in ClientHello"));
+                    return Err(io::Error::other(
+                        "REALITY: unexpected session_id length in ClientHello",
+                    ));
                 }
-                let random: [u8; 32] = hs[HS_HDR..HS_HDR + 32].try_into().map_err(|_| {
-                    io::Error::other("REALITY: short ClientHello random")
-                })?;
+                let random: [u8; 32] = hs[HS_HDR..HS_HDR + 32]
+                    .try_into()
+                    .map_err(|_| io::Error::other("REALITY: short ClientHello random"))?;
 
                 // auth_key = HKDF(ECDH(key share priv, server pub), salt=random[:20])
                 let priv_key = x25519_key_share_private(ssl).ok_or_else(|| {
@@ -269,19 +274,15 @@ impl RealityHooks for BtlsRealityHooks {
             .try_into()
             .map_err(|_| io::Error::other("REALITY: short ClientHello random"))?;
 
-        let priv_key = xray_tls::btls_reality::x25519_key_share_private_raw(ssl_ptr)
-            .ok_or_else(|| {
-                io::Error::other(
-                    "REALITY: current fingerprint does not offer an X25519 key share",
-                )
+        let priv_key =
+            xray_tls::btls_reality::x25519_key_share_private_raw(ssl_ptr).ok_or_else(|| {
+                io::Error::other("REALITY: current fingerprint does not offer an X25519 key share")
             })?;
         let auth_key = crypto::derive_auth_key(&priv_key, &self.server_pub, &random[..20])
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as u32)
-            .unwrap_or(0);
+        let ts =
+            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0);
         let mut sid = crypto::encode_session_id(REALITY_VERSION, ts, &self.short_id)
             .map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -304,15 +305,15 @@ impl RealityHooks for BtlsRealityHooks {
         *self.server_hello_raw.lock() = Some(msg.to_vec());
         Ok(())
     }
+
     /// 握手后验证证书：末尾 64 字节须为 HMAC-SHA512(auth_key, ed25519 pubkey)；
     /// 配置 `mldsa65Verify` 时追加 PQC 扩展验签（cm97）。
     ///
     /// 对应 Go `UConn.VerifyPeerCertificate`；失败 = 真证书/被转发 → 断连。
     fn verify_handshake(&self, ssl: &SslRef) -> io::Result<()> {
-        let auth_key = self
-            .auth_key
-            .lock()
-            .ok_or_else(|| io::Error::other("REALITY: auth key not derived (no ClientHello sent)"))?;
+        let auth_key = self.auth_key.lock().ok_or_else(|| {
+            io::Error::other("REALITY: auth key not derived (no ClientHello sent)")
+        })?;
         let cert = ssl
             .peer_certificate()
             .ok_or_else(|| io::Error::other("REALITY: server sent no certificate"))?;
@@ -336,9 +337,9 @@ impl RealityHooks for BtlsRealityHooks {
 /// 对应 Go `UConn.VerifyPeerCertificate` 全部分支：
 /// 1. `HMAC(auth_key, pub)` == cert 末尾 64B（两种模板都必须）；
 /// 2. 配置 `mldsa65Verify` 时：cert 必须带 OID 0.0 扩展（服务端 mldsa65 变体
-///    模板标记），`HMAC(auth, pub‖CH.Raw‖SH.Raw)` 的 ML-DSA-65 验签必须通过。
-///    Go 端此分支失败会落 x509 fallback（对自签 REALITY cert 必败 → 断连），
-///    Rust 无 x509 fallback，直接返回错误——语义等价。
+///    模板标记），`HMAC(auth, pub‖CH.Raw‖SH.Raw)` 的 ML-DSA-65 验签必须通过。 Go 端此分支失败会落
+///    x509 fallback（对自签 REALITY cert 必败 → 断连）， Rust 无 x509
+///    fallback，直接返回错误——语义等价。
 ///
 /// 提纯自 [`BtlsRealityHooks::verify_handshake`]（`SslRef` 不可 mock），
 /// 契约测试直接驱动本函数。
@@ -370,12 +371,10 @@ fn verify_reality_cert_full(
         };
         // Go: if len(certs[0].Extensions) > 0 —— 无扩展 = 服务端未签 mldsa65 →
         // x509 fallback 必败 → 断连
-        let (off, len) = crate::util::find_oid_0_0_extension(cert_der).ok_or(
-            RealityError::RealCertificateReceived,
-        )?;
+        let (off, len) = crate::util::find_oid_0_0_extension(cert_der)
+            .ok_or(RealityError::RealCertificateReceived)?;
         let ext_sig = &cert_der[off..off + len];
-        let msg =
-            crypto::hmac_reality_message(auth_key, &pub_key, ch_raw, sh_raw)?;
+        let msg = crypto::hmac_reality_message(auth_key, &pub_key, ch_raw, sh_raw)?;
         let verified =
             crypto::verify_mldsa65_signature(mldsa65_verify, &msg, ext_sig).unwrap_or(false);
         if !verified {
@@ -430,20 +429,17 @@ fn extract_ed25519_pubkey(cert_der: &[u8]) -> Option<[u8; 32]> {
 ///
 /// # 路径选择
 ///
-/// 1. 指纹被 btls 支持（chrome/firefox/safari/ios/edge/360/qq 及其变体）
-///    → BoringSSL 浏览器指纹 ClientHello + REALITY 注入（主路径）。
-/// 2. 指纹不被 btls 支持 → watfaq-rustls 标准握手（fallback，
-///    ClientHello 为标准 rustls 指纹，REALITY session_id 由 rustls 内部注入）。
+/// 1. 指纹被 btls 支持（chrome/firefox/safari/ios/edge/360/qq 及其变体） → BoringSSL 浏览器指纹
+///    ClientHello + REALITY 注入（主路径）。
+/// 2. 指纹不被 btls 支持 → watfaq-rustls 标准握手（fallback， ClientHello 为标准 rustls
+///    指纹，REALITY session_id 由 rustls 内部注入）。
 ///
 /// # Errors
 ///
 /// - [`RealityError::FingerprintNotFound`]：指纹名未知
 /// - [`RealityError::TlsHandshake`]：握手 IO 错误或 REALITY 证书验证失败
 /// - [`RealityError::WatfaqConfig`] / [`RealityError::InvalidServerName`]：fallback 路径配置错误
-pub async fn u_client<S>(
-    inner: S,
-    state: UConnState,
-) -> Result<RealityTlsStream<S>, RealityError>
+pub async fn u_client<S>(inner: S, state: UConnState) -> Result<RealityTlsStream<S>, RealityError>
 where
     S: Connection,
 {
@@ -469,14 +465,12 @@ where
     // 49i9：主路径守卫不满足时的两条硬错（对齐 Go UClient 握手期硬错语义，
     // 防 panic / 防 fail-open）——正常入口 UConnState::new 的 validate_client
     // 已前置拒绝，这里兜底字面构造 UConnState 的绕过路径：
-    // - publicKey 非 32B：Go `ecdh.X25519().NewPublicKey` err → "REALITY:
-    //   publicKey == nil" 硬错（Rust 现状 copy_from_slice 会 panic）；
-    // - 配了 mldsa65Verify：watfaq-rustls 无 mldsa65 证书扩展验签钩子，
-    //   静默跳过 = fail-open（Go 全指纹走 utls 均验签），直接拒绝。
+    // - publicKey 非 32B：Go `ecdh.X25519().NewPublicKey` err → "REALITY: publicKey == nil"
+    //   硬错（Rust 现状 copy_from_slice 会 panic）；
+    // - 配了 mldsa65Verify：watfaq-rustls 无 mldsa65 证书扩展验签钩子， 静默跳过 = fail-open（Go
+    //   全指纹走 utls 均验签），直接拒绝。
     if config.public_key.len() != crate::config::X25519_KEY_LEN {
-        return Err(RealityError::InvalidPublicKeyLen {
-            actual: config.public_key.len(),
-        });
+        return Err(RealityError::InvalidPublicKeyLen { actual: config.public_key.len() });
     }
     if !config.mldsa65_verify.is_empty() {
         return Err(RealityError::Mldsa65VerifyNeedsBtlsFingerprint);
@@ -598,8 +592,8 @@ mod tests {
     fn extract_ed25519_pubkey_from_reality_cert() {
         let auth_key = [0x42u8; 32];
         let (cert_der, _key) = crate::mitm::generate_reality_ed25519_cert(&auth_key).unwrap();
-        let pub_key = extract_ed25519_pubkey(&cert_der)
-            .expect("REALITY cert should contain Ed25519 pubkey");
+        let pub_key =
+            extract_ed25519_pubkey(&cert_der).expect("REALITY cert should contain Ed25519 pubkey");
         assert_eq!(pub_key.len(), 32);
 
         // 端到端：verify_handshake 的验证逻辑（HMAC roundtrip）
@@ -617,18 +611,11 @@ mod tests {
         let ch = [0x11u8; 256];
         let sh = [0x22u8; 90];
         let (cert_der, _) =
-            crate::mitm::generate_reality_ed25519_cert_mldsa65(&auth_key, &ch, &sh, &seed)
-                .unwrap();
+            crate::mitm::generate_reality_ed25519_cert_mldsa65(&auth_key, &ch, &sh, &seed).unwrap();
         let pubkey_1952 = crypto::derive_mldsa65_pubkey(&seed).unwrap();
 
-        verify_reality_cert_full(
-            &cert_der,
-            &auth_key,
-            &pubkey_1952,
-            Some(&ch),
-            Some(&sh),
-        )
-        .expect("mldsa65 signed cert must verify");
+        verify_reality_cert_full(&cert_der, &auth_key, &pubkey_1952, Some(&ch), Some(&sh))
+            .expect("mldsa65 signed cert must verify");
     }
 
     /// mldsa65Verify 配置 + 标准cert（无 OID 0.0 扩展）→ 拒绝（Go 语义：
@@ -685,8 +672,8 @@ mod tests {
             .expect("standard path must stay compatible");
         // 配置了 mldsa65Verify 但捕获缺失：显式 TlsHandshake 错误
         let pubkey_1952 = vec![0xabu8; crypto::MLDSA65_PUBKEY_LEN];
-        let err = verify_reality_cert_full(&std_cert, &auth_key, &pubkey_1952, None, None)
-            .unwrap_err();
+        let err =
+            verify_reality_cert_full(&std_cert, &auth_key, &pubkey_1952, None, None).unwrap_err();
         assert!(matches!(err, RealityError::TlsHandshake(_)));
     }
 

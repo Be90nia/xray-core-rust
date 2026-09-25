@@ -6,20 +6,23 @@
 //!
 //! 1. `InboundHandler::start` 被调用
 //! 2. 启动 TCP listener + TLS acceptor（[`tokio_rustls::TlsAcceptor`]）
-//! 3. 每个新 TLS conn 经 anytls server session 处理：读 SOCKS5 target →
-//!    `dispatch = Some` 走 [`xray_app_dispatcher::DispatchHandler::dispatch`]，
-//!    `dispatch = None` 保留 mock 直连（loopback 测试）
+//! 3. 每个新 TLS conn 经 anytls server session 处理：读 SOCKS5 target → `dispatch = Some` 走
+//!    [`xray_app_dispatcher::DispatchHandler::dispatch`]， `dispatch = None` 保留 mock
+//!    直连（loopback 测试）
 //! 4. `close` 时停止 listener 并清理资源
 //!
 //! 见 bd Xray-core-rust-dax。
 
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::Arc;
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU16, Ordering},
+    },
+};
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tokio::{sync::Mutex, task::JoinHandle};
 use tracing::info;
 use xray_app_dispatcher::DispatchHandler;
 use xray_features::inbound::{InboundError, InboundHandler};
@@ -124,10 +127,7 @@ impl InboundHandler for AnytlsInboundHandler {
             std::future::pending::<()>().await;
         });
 
-        *slot = Some(InboundSlot {
-            server,
-            _accept_task: accept_task,
-        });
+        *slot = Some(InboundSlot { server, _accept_task: accept_task });
         Ok(())
     }
 
@@ -150,13 +150,14 @@ impl InboundHandler for AnytlsInboundHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::client::{AnytlsClient, ClientConfig};
+    use std::sync::{Arc, Once};
+
     use rcgen::{CertificateParams, KeyPair};
     use rustls::pki_types::PrivateKeyDer;
-    use std::sync::Arc;
-    use std::sync::Once;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    use super::*;
+    use crate::client::{AnytlsClient, ClientConfig};
 
     static INIT_CRYPTO: Once = Once::new();
 
@@ -185,18 +186,11 @@ mod tests {
             .with_single_cert(vec![cert_der.clone().into()], key_der)
             .unwrap();
 
-        (
-            tokio_rustls::TlsAcceptor::from(Arc::new(config)),
-            cert_der.to_vec(),
-        )
+        (tokio_rustls::TlsAcceptor::from(Arc::new(config)), cert_der.to_vec())
     }
 
     fn make_handler() -> AnytlsInboundHandler {
-        AnytlsInboundHandler::new(
-            "test",
-            "127.0.0.1:0".parse().unwrap(),
-            make_tls_acceptor(),
-        )
+        AnytlsInboundHandler::new("test", "127.0.0.1:0".parse().unwrap(), make_tls_acceptor())
     }
 
     #[test]
@@ -249,7 +243,7 @@ mod tests {
                                 {
                                     break;
                                 }
-                            }
+                            },
                         }
                     }
                 });
@@ -266,12 +260,7 @@ mod tests {
                 .with_root_certificates(root_store)
                 .with_no_client_auth(),
         );
-        AnytlsClient::new(ClientConfig::new(
-            server_addr.to_string(),
-            "localhost",
-            password,
-            tls,
-        ))
+        AnytlsClient::new(ClientConfig::new(server_addr.to_string(), "localhost", password, tls))
     }
 
     /// bd 1zko8：handler 层密码接线——with_password 后 start 走
@@ -279,25 +268,21 @@ mod tests {
     #[tokio::test]
     async fn handler_with_password_accepts_correct_rejects_wrong() {
         use std::time::Duration;
+
         use crate::socks::SocksAddr;
 
         let echo = start_echo_server().await;
         let (acceptor, cert_der) = make_tls_acceptor_with_cert();
-        let handler = AnytlsInboundHandler::new(
-            "anytls-pw",
-            "127.0.0.1:0".parse().unwrap(),
-            acceptor,
-        )
-        .with_password(Some("s3cret".into()));
+        let handler =
+            AnytlsInboundHandler::new("anytls-pw", "127.0.0.1:0".parse().unwrap(), acceptor)
+                .with_password(Some("s3cret".into()));
         handler.start().await.unwrap();
         let server_addr = SocketAddr::from(([127, 0, 0, 1], handler.port()));
 
         // 对密码：认证通过，echo 完整走通。
         let client = make_client(server_addr, "s3cret", &cert_der);
-        let mut conn = client
-            .dial(&SocksAddr::from_socket(echo))
-            .await
-            .expect("dial with correct password");
+        let mut conn =
+            client.dial(&SocksAddr::from_socket(echo)).await.expect("dial with correct password");
         conn.write_all(b"ping").await.expect("write");
         let mut buf = [0u8; 4];
         tokio::time::timeout(Duration::from_secs(5), conn.read_exact(&mut buf))
@@ -310,21 +295,19 @@ mod tests {
         // 错密码：认证帧比对失败，数据永远到不了 echo。
         let bad = make_client(server_addr, "wrong", &cert_der);
         match bad.dial(&SocksAddr::from_socket(echo)).await {
-            Err(_) => {}
+            Err(_) => {},
             Ok(mut conn) => {
                 let _ = conn.write_all(b"ping").await;
                 let mut buf = [0u8; 4];
                 match tokio::time::timeout(Duration::from_secs(5), conn.read_exact(&mut buf)).await
                 {
-                    Ok(Ok(n)) => assert_ne!(
-                        &buf[..n],
-                        b"ping",
-                        "wrong-password data must never be echoed"
-                    ),
-                    Ok(Err(_)) => {}
+                    Ok(Ok(n)) => {
+                        assert_ne!(&buf[..n], b"ping", "wrong-password data must never be echoed")
+                    },
+                    Ok(Err(_)) => {},
                     Err(_) => panic!("wrong-password connection stayed open (timeout)"),
                 }
-            }
+            },
         }
         bad.close().await.ok();
 
@@ -335,23 +318,19 @@ mod tests {
     #[tokio::test]
     async fn handler_without_password_allows_connection() {
         use std::time::Duration;
+
         use crate::socks::SocksAddr;
 
         let echo = start_echo_server().await;
         let (acceptor, cert_der) = make_tls_acceptor_with_cert();
-        let handler = AnytlsInboundHandler::new(
-            "anytls-nopw",
-            "127.0.0.1:0".parse().unwrap(),
-            acceptor,
-        );
+        let handler =
+            AnytlsInboundHandler::new("anytls-nopw", "127.0.0.1:0".parse().unwrap(), acceptor);
         handler.start().await.unwrap();
         let server_addr = SocketAddr::from(([127, 0, 0, 1], handler.port()));
 
         let client = make_client(server_addr, "whatever", &cert_der);
-        let mut conn = client
-            .dial(&SocksAddr::from_socket(echo))
-            .await
-            .expect("dial without server password");
+        let mut conn =
+            client.dial(&SocksAddr::from_socket(echo)).await.expect("dial without server password");
         conn.write_all(b"hi").await.expect("write");
         let mut buf = [0u8; 2];
         tokio::time::timeout(Duration::from_secs(5), conn.read_exact(&mut buf))

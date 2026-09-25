@@ -3,8 +3,7 @@
 //! 对应 Go `transport/internet/quic/config.go::Config`。
 //! 解析安全层（TLS）所需的字段 + 拥塞控制（`congestion`）。
 
-use std::io;
-use std::sync::Arc;
+use std::{io, sync::Arc};
 
 /// QUIC 配置。
 ///
@@ -15,8 +14,8 @@ use std::sync::Arc;
 ///   `""`/`"brutal"`/`"reno"`/`"bbr"` 合法；`"force-brutal"` 需 brutalUp>0（本层
 ///   无该字段，恒报错）；未知值硬错（文案同 Go）
 /// - `keepAlive`：QUIC keepalive 周期（与 Go `keep_alive` 同义；quinn 端叫 keep_alive_period）
-/// - `initialStreamReceiveWindow` / `maxStreamReceiveWindow`：流接收窗口两级
-///   （quinn 单固定窗口 → 取 max 对齐 Go Initial/Max 稳态）
+/// - `initialStreamReceiveWindow` / `maxStreamReceiveWindow`：流接收窗口两级 （quinn 单固定窗口 →
+///   取 max 对齐 Go Initial/Max 稳态）
 /// - `initialConnectionReceiveWindow` / `maxConnectionReceiveWindow`：连接级窗口
 /// - `maxIdleTimeout` / `keepAlivePeriod`：秒（quinn 内部 ms，乘 1000）
 /// - `disablePathMtuDiscovery`：true 禁用 PMTUD
@@ -55,33 +54,26 @@ impl QuicConfig {
     /// # Errors
     /// JSON 非 object → [`InvalidData`](io::ErrorKind::InvalidData)。
     pub fn from_json(json: Option<&serde_json::Value>) -> io::Result<Self> {
-        let Some(v) = json else { return Ok(Self::default()); };
+        let Some(v) = json else {
+            return Ok(Self::default());
+        };
         let Some(obj) = v.as_object() else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "quicSettings must be a JSON object",
             ));
         };
-        let keep_alive = obj
-            .get("keepAlive")
-            .and_then(|x| x.as_bool())
-            .unwrap_or(false);
+        let keep_alive = obj.get("keepAlive").and_then(|x| x.as_bool()).unwrap_or(false);
         // congestion 字面值校验（Go infra/conf/transport_internet.go:245-253）：小写归一，
         // ""/brutal/reno/bbr 合法直通；force-brutal 需 QuicParams.brutalUp>0——本层
         // （quicSettings）无 brutalUp 字段，忠实映射 Go up==0 分支恒报错；未知值硬错。
-        let congestion = obj
-            .get("congestion")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
+        let congestion =
+            obj.get("congestion").and_then(|x| x.as_str()).unwrap_or("").to_ascii_lowercase();
         match congestion.as_str() {
-            "" | "brutal" | "reno" | "bbr" => {}
+            "" | "brutal" | "reno" | "bbr" => {},
             "force-brutal" => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "force-brutal requires up",
-                ));
-            }
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "force-brutal requires up"));
+            },
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -89,7 +81,7 @@ impl QuicConfig {
                         "unknown congestion control: {congestion}, valid values: reno, bbr, brutal, force-brutal"
                     ),
                 ));
-            }
+            },
         }
         // qeyo：finalmask.quicParams 也可承载窗口/idle/keepalive 字段（与 hysteria crate 同源
         // QuicParamsConfig 解析——finalmask 路径走 memory_settings.rs::parse_quic_params_config，
@@ -150,7 +142,9 @@ impl QuicConfig {
         }
         // keep-alive 周期（与 hysteria crate 同源字段；与 keep_alive bool 字段等价）
         if self.keep_alive_period_ms > 0 {
-            t.keep_alive_interval(Some(std::time::Duration::from_millis(self.keep_alive_period_ms)));
+            t.keep_alive_interval(Some(std::time::Duration::from_millis(
+                self.keep_alive_period_ms,
+            )));
         }
         // PMTUD：true → 禁用
         if self.disable_path_mtu_discovery {
@@ -169,19 +163,19 @@ impl QuicConfig {
                 t.congestion_controller_factory(Arc::new(
                     quinn_proto::congestion::BbrConfig::default(),
                 ));
-            }
+            },
             // 解析层已保证字面值合法；`Default` 构造的 "" 落 CUBIC（quinn 默认）。
             // "brutal" 在本 crate 无 BrutalSender（hysteria crate 专属），落 CUBIC 登记。
             "reno" => {
                 t.congestion_controller_factory(Arc::new(
                     quinn_proto::congestion::NewRenoConfig::default(),
                 ));
-            }
+            },
             _ => {
                 t.congestion_controller_factory(Arc::new(
                     quinn_proto::congestion::CubicConfig::default(),
                 ));
-            }
+            },
         }
         t
     }
@@ -218,7 +212,7 @@ mod tests {
         for lit in ["brutal", "reno", "bbr", "BRUTAL", "Reno"] {
             // Go ToLower 后严格匹配（无 trim）——仅验证合法字面值与大小写归一；
             // 带空格串属未知值，走硬错分支（见下方 rejected 测试）。
-        // " Reno " 类带空格串 Go 侧硬错（ToLower 无 trim），归入 rejected 语义。
+            // " Reno " 类带空格串 Go 侧硬错（ToLower 无 trim），归入 rejected 语义。
             let v: serde_json::Value =
                 serde_json::from_str(&format!(r#"{{"congestion":"{lit}"}}"#)).unwrap();
             let cfg = QuicConfig::from_json(Some(&v)).unwrap();
@@ -243,7 +237,8 @@ mod tests {
     #[test]
     fn congestion_force_brutal_requires_up() {
         // 本层无 brutalUp 字段 → 恒等价 Go up==0 分支（transport_internet.go:249-250）。
-        let v: serde_json::Value = serde_json::from_str(r#"{"congestion":"force-brutal"}"#).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"congestion":"force-brutal"}"#).unwrap();
         let err = QuicConfig::from_json(Some(&v)).unwrap_err();
         assert_eq!(err.to_string(), "force-brutal requires up");
     }
@@ -277,10 +272,7 @@ mod tests {
 
     #[test]
     fn build_transport_config_bbr() {
-        let cfg = QuicConfig {
-            congestion: "bbr".into(),
-            ..Default::default()
-        };
+        let cfg = QuicConfig { congestion: "bbr".into(), ..Default::default() };
         // 不 panic 即可——quinn TransportConfig 内部不暴露已设的 congestion 类型
         let _t = cfg.build_transport_config();
     }
@@ -293,10 +285,7 @@ mod tests {
 
     #[test]
     fn build_transport_config_case_insensitive() {
-        let cfg = QuicConfig {
-            congestion: "BBR".into(),
-            ..Default::default()
-        };
+        let cfg = QuicConfig { congestion: "BBR".into(), ..Default::default() };
         let _t = cfg.build_transport_config();
     }
 }

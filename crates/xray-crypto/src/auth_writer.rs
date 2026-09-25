@@ -9,8 +9,7 @@
 //!
 //! # 工作模式
 //!
-//! - **Stream 模式**: 将数据按 payloadSize 分块，每块 seal 加密后写入，
-//!   最后写入 0 长度终止标记
+//! - **Stream 模式**: 将数据按 payloadSize 分块，每块 seal 加密后写入， 最后写入 0 长度终止标记
 //! - **Packet 模式**: 逐个 Buffer 独立 seal 加密后写入
 //!
 //! # 数据格式
@@ -21,13 +20,18 @@
 //! - `encrypted_payload`: AEAD 密文（len + overhead）
 //! - `padding`: 随机填充字节
 
-use crate::authenticator::Authenticator;
-use crate::chunk::{ChunkSizeEncoder, PaddingLengthGenerator};
-use crate::aead::CryptoError;
-use xray_buf::buffer::Buffer;
-use xray_buf::multi::MultiBuffer;
-use xray_buf::io::{self, Writer};
+use xray_buf::{
+    buffer::Buffer,
+    io::{self, Writer},
+    multi::MultiBuffer,
+};
 use xray_common::protocol::TransferType;
+
+use crate::{
+    aead::CryptoError,
+    authenticator::Authenticator,
+    chunk::{ChunkSizeEncoder, PaddingLengthGenerator},
+};
 
 /// 默认缓冲区大小 (8KB)，对应 Go 的 `buf.Size`。
 const DEFAULT_SIZE: usize = 8192;
@@ -65,13 +69,7 @@ impl<'a> AuthenticationWriter<'a> {
         transfer_type: TransferType,
         padding: Box<dyn PaddingLengthGenerator>,
     ) -> Self {
-        Self {
-            auth,
-            writer,
-            size_encoder,
-            transfer_type,
-            padding,
-        }
+        Self { auth, writer, size_encoder, transfer_type, padding }
     }
 
     /// 加密单个数据块。
@@ -155,10 +153,8 @@ impl<'a> AuthenticationWriter<'a> {
             match self.seal(&chunk_data) {
                 Ok(encrypted_buf) => mb2_write.push(encrypted_buf),
                 Err(_) => {
-                    return Err(io::Error::WriteError(
-                        "seal failed in write_stream".into(),
-                    ));
-                }
+                    return Err(io::Error::WriteError("seal failed in write_stream".into()));
+                },
             }
         }
 
@@ -206,9 +202,9 @@ impl<'a> AuthenticationWriter<'a> {
     pub async fn write_multi_buffer(&mut self, mb: MultiBuffer) -> io::Result<()> {
         if mb.is_empty() {
             // 写入 0 长度终止标记
-            let terminator = self.seal(&[]).map_err(|e| {
-                io::Error::WriteError(format!("seal terminator failed: {e}"))
-            })?;
+            let terminator = self
+                .seal(&[])
+                .map_err(|e| io::Error::WriteError(format!("seal terminator failed: {e}")))?;
             let mb_term = MultiBuffer::from_buffer(terminator);
             return self.writer.write_multi_buffer(mb_term).await;
         }
@@ -222,23 +218,19 @@ impl<'a> AuthenticationWriter<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::{future::Future, pin::Pin};
+
     use super::*;
-    use crate::authenticator::{
-        generate_aead_nonce_with_size, AEADAuthenticator,
+    use crate::{
+        aead::Aes128Gcm,
+        authenticator::{AEADAuthenticator, generate_aead_nonce_with_size},
+        chunk::{NoPadding, PlainChunkSizeParser, ShufflePadding},
     };
-    use crate::aead::Aes128Gcm;
-    use crate::chunk::{NoPadding, PlainChunkSizeParser, ShufflePadding};
-    use std::future::Future;
-    use std::pin::Pin;
 
     /// 辅助: 创建测试用 Authenticator（递增 nonce）
     fn make_auth() -> Box<dyn Authenticator> {
         let cipher = Aes128Gcm::new(&[0u8; 16]).unwrap();
-        Box::new(AEADAuthenticator::new(
-            cipher,
-            generate_aead_nonce_with_size(12),
-            None,
-        ))
+        Box::new(AEADAuthenticator::new(cipher, generate_aead_nonce_with_size(12), None))
     }
 
     /// 辅助: 创建测试用 ChunkSizeEncoder

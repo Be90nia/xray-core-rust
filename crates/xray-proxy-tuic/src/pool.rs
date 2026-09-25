@@ -17,15 +17,18 @@
 //! - 池内连接：强引用计数归零时从池中移除
 //! - 池本身：[`Arc`] 持有，drop 时关闭所有连接
 
-use std::collections::HashMap;
-use std::future::Future;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    future::Future,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
-use tokio::sync::Mutex;
-use tokio::time::sleep;
+use tokio::{sync::Mutex, time::sleep};
 
 use crate::error::{Result, TuicError};
 
@@ -46,16 +49,10 @@ pub struct PoolKey {
 impl PoolKey {
     /// 从参数构造 key。
     pub fn new(server_addr: SocketAddr, server_name: &str, alpn: &[Vec<u8>]) -> Self {
-        let mut alpn_parts: Vec<String> = alpn
-            .iter()
-            .map(|p| String::from_utf8_lossy(p).into_owned())
-            .collect();
+        let mut alpn_parts: Vec<String> =
+            alpn.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect();
         alpn_parts.sort_unstable();
-        Self {
-            server_addr,
-            server_name: server_name.to_string(),
-            alpn_tag: alpn_parts.join(","),
-        }
+        Self { server_addr, server_name: server_name.to_string(), alpn_tag: alpn_parts.join(",") }
     }
 }
 
@@ -133,8 +130,7 @@ impl QuinnConnectionPool {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<quinn::Connection>>,
     {
-        self.get_or_connect_dial_timeout(key, connector, DIAL_TIMEOUT)
-            .await
+        self.get_or_connect_dial_timeout(key, connector, DIAL_TIMEOUT).await
     }
 
     /// [`Self::get_or_connect`] 带可配置拨号超时（测试用小超时）。
@@ -182,14 +178,12 @@ impl QuinnConnectionPool {
         }
 
         // 慢速路径：新建连接（兜底超时——connector 本身无时限时防无限挂起）
-        let conn = tokio::time::timeout(dial_timeout, connector())
-            .await
-            .map_err(|_| {
-                TuicError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "tuic pool dial timeout",
-                ))
-            })??;
+        let conn = tokio::time::timeout(dial_timeout, connector()).await.map_err(|_| {
+            TuicError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "tuic pool dial timeout",
+            ))
+        })??;
         let pooled = PooledConnection {
             conn,
             created_at: Instant::now(),
@@ -221,7 +215,6 @@ impl QuinnConnectionPool {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-
 }
 
 impl Default for QuinnConnectionPool {
@@ -256,46 +249,34 @@ impl ReconnectingConnection {
     /// 获取活跃连接，失败时自动重连。
     ///
     /// `connector` 每次重试都会调用。
-    pub async fn get_or_reconnect<F, Fut>(
-        &self,
-        connector: F,
-    ) -> Result<PooledConnection>
+    pub async fn get_or_reconnect<F, Fut>(&self, connector: F) -> Result<PooledConnection>
     where
         F: Fn() -> Fut + Clone,
         Fut: Future<Output = Result<quinn::Connection>>,
     {
         let mut last_err = None;
         for attempt in 0..=self.max_retries {
-            match self
-                .pool
-                .get_or_connect(self.key.clone(), connector.clone())
-                .await
-            {
+            match self.pool.get_or_connect(self.key.clone(), connector.clone()).await {
                 Ok(pooled) => {
                     if pooled.is_alive() {
                         return Ok(pooled);
                     }
                     // 池中连接已死，移除后重试
                     self.pool.remove(&self.key);
-                }
+                },
                 Err(e) => {
                     last_err = Some(e);
-                }
+                },
             }
 
             if attempt < self.max_retries {
-                let delay = self
-                    .base_delay
-                    .mul_f64(2f64.powi(attempt as i32))
-                    .min(self.max_delay);
+                let delay = self.base_delay.mul_f64(2f64.powi(attempt as i32)).min(self.max_delay);
                 sleep(delay).await;
             }
         }
 
         Err(last_err.unwrap_or_else(|| {
-            TuicError::Io(std::io::Error::other(
-                "reconnect exhausted: all attempts failed",
-            ))
+            TuicError::Io(std::io::Error::other("reconnect exhausted: all attempts failed"))
         }))
     }
 }
@@ -310,13 +291,6 @@ pub struct MultiplexedConnection {
     pub pooled: PooledConnection,
 }
 
-
-
-
-
-
-
-
 impl MultiplexedConnection {
     /// 从 [`PooledConnection`] 构造。
     pub fn new(pooled: PooledConnection) -> Self {
@@ -325,51 +299,23 @@ impl MultiplexedConnection {
 
     /// 打开 bidirectional stream。
     pub async fn open_bi(&self) -> Result<(quinn::SendStream, quinn::RecvStream)> {
-        self.pooled
-            .conn
-            .open_bi()
-            .await
-            .map_err(TuicError::Quinn)
+        self.pooled.conn.open_bi().await.map_err(TuicError::Quinn)
     }
 
     /// 打开 unidirectional stream。
     pub async fn open_uni(&self) -> Result<quinn::SendStream> {
-        self.pooled
-            .conn
-            .open_uni()
-            .await
-            .map_err(TuicError::Quinn)
+        self.pooled.conn.open_uni().await.map_err(TuicError::Quinn)
     }
 
     /// 发送 QUIC DATAGRAM（native UDP 模式）。
     pub fn send_datagram(&self, data: bytes::Bytes) -> Result<()> {
-        self.pooled
-            .conn
-            .send_datagram(data)
-            .map_err(TuicError::QuinnSendDatagram)
+        self.pooled.conn.send_datagram(data).map_err(TuicError::QuinnSendDatagram)
     }
-
-
-
-
-
-
 
     /// 接收 QUIC DATAGRAM（native UDP 模式）。
     pub async fn recv_datagram(&self) -> Result<bytes::Bytes> {
-        self.pooled
-            .conn
-            .read_datagram()
-            .await
-            .map_err(TuicError::Quinn)
+        self.pooled.conn.read_datagram().await.map_err(TuicError::Quinn)
     }
-
-
-
-
-
-
-
 
     /// 关闭连接。
     pub fn close(&self, error_code: quinn::VarInt, reason: &[u8]) {
@@ -384,8 +330,9 @@ impl MultiplexedConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::{Ipv4Addr, SocketAddrV4};
+
+    use super::*;
 
     #[test]
     fn pool_key_hashable() {

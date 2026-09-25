@@ -23,12 +23,16 @@
 //! Bridge/Portal 两侧的 TCP 均为 tokio 类型，yamux 使用 futures trait，
 //! 通过 `tokio_util::compat` 适配层桥接。
 
-use std::io;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    io,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::{mpsc, oneshot},
+};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
 /// yamux 子流（tokio `AsyncRead` + `AsyncWrite`）。
@@ -63,7 +67,8 @@ impl YamuxBridge {
 
     /// 在已有 TCP 连接上建立 yamux 客户端会话（测试 / 已有连接复用）。
     pub async fn connect_on(tcp: TcpStream) -> io::Result<Self> {
-        let conn = yamux::Connection::new(tcp.compat(), yamux::Config::default(), yamux::Mode::Client);
+        let conn =
+            yamux::Connection::new(tcp.compat(), yamux::Config::default(), yamux::Mode::Client);
         let (open_tx, open_rx) = mpsc::channel(64);
         tokio::spawn(drive_bridge(conn, open_rx));
         Ok(Self { open_tx })
@@ -74,12 +79,8 @@ impl YamuxBridge {
     /// 多次调用复用同一 TCP 连接——这是与 Go 版一致的多路复用行为。
     pub async fn open_stream(&self) -> io::Result<MuxStream> {
         let (tx, rx) = oneshot::channel();
-        self.open_tx
-            .send(tx)
-            .await
-            .map_err(|_| io::Error::other("bridge driver stopped"))?;
-        rx.await
-            .map_err(|_| io::Error::other("bridge driver dropped reply"))?
+        self.open_tx.send(tx).await.map_err(|_| io::Error::other("bridge driver stopped"))?;
+        rx.await.map_err(|_| io::Error::other("bridge driver dropped reply"))?
     }
 }
 
@@ -102,7 +103,9 @@ async fn drive_bridge(
             // 先排空入站子流（Bridge 端不应有，但安全丢弃）。
             loop {
                 match conn.poll_next_inbound(cx) {
-                    Poll::Ready(None) | Poll::Ready(Some(Err(_))) => return Poll::Ready(Action::Done),
+                    Poll::Ready(None) | Poll::Ready(Some(Err(_))) => {
+                        return Poll::Ready(Action::Done);
+                    },
                     Poll::Ready(Some(Ok(_))) => continue, // 丢弃意外的入站子流
                     Poll::Pending => break,
                 }
@@ -125,7 +128,7 @@ async fn drive_bridge(
                     .map(|s| s.compat())
                     .map_err(map_yamux_err);
                 let _ = req.send(result);
-            }
+            },
         }
     }
     tracing::debug!("bridge yamux driver exited");
@@ -151,7 +154,7 @@ where
             Err(e) => {
                 tracing::warn!(error = %e, "portal accept error");
                 continue;
-            }
+            },
         };
         tcp.set_nodelay(true).ok();
 
@@ -178,13 +181,13 @@ where
             Some(Err(e)) => {
                 tracing::debug!(error = ?e, "portal yamux session error");
                 break;
-            }
+            },
             Some(Ok(stream)) => {
                 let cb = Arc::clone(&on_stream);
                 tokio::spawn(async move {
                     cb(stream.compat()).await;
                 });
-            }
+            },
         }
     }
 }
@@ -204,8 +207,9 @@ fn map_yamux_err(e: yamux::ConnectionError) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
 
     #[test]
     fn bridge_type_exists() {
@@ -307,7 +311,6 @@ mod tests {
             sock.read_exact(&mut buf).await.unwrap();
             assert_eq!(buf, [i]);
         }
-
 
         // 等待可能的额外 accept 注册（不应有）。
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;

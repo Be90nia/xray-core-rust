@@ -7,21 +7,26 @@
 //! 隧道协议：payload → base32 编码 → 切成 ≤63 字节 label → 拼到 domain 前 →
 //! 构造 DNS 查询；轮询包（payload 空）用更长 padding 区分。
 
-use std::io;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    io,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
 use rand::RngCore;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
-use super::base32::encode_lower;
-use super::dns::{message_from_wire_format, Message, Name, Question, RR, RR_TYPE_OPT, CLASS_IN};
-use super::record_transport::decode_response_payload;
-use super::UdpIo;
+use super::{
+    UdpIo,
+    base32::encode_lower,
+    dns::{CLASS_IN, Message, Name, Question, RR, RR_TYPE_OPT, message_from_wire_format},
+    record_transport::decode_response_payload,
+};
 
 /// payload 长度上限（对应 Go encode 中的 224 上限校验）。
 const PAYLOAD_MAX: usize = 224;
@@ -48,11 +53,7 @@ pub(crate) fn encode(
         ));
     }
 
-    let n = if p.is_empty() {
-        NUM_PADDING_FOR_POLL
-    } else {
-        NUM_PADDING
-    };
+    let n = if p.is_empty() { NUM_PADDING_FOR_POLL } else { NUM_PADDING };
     let mut decoded: Vec<u8> = Vec::with_capacity(8 + 1 + n as usize + 1 + p.len());
     decoded.extend_from_slice(client_id);
     decoded.push(224 + n);
@@ -73,11 +74,7 @@ pub(crate) fn encode(
     let query = Message {
         id,
         flags: 0x0100, // RD=1
-        question: vec![Question {
-            name,
-            qtype,
-            qclass: CLASS_IN,
-        }],
+        question: vec![Question { name, qtype, qclass: CLASS_IN }],
         answer: vec![],
         authority: vec![],
         additional: vec![RR {
@@ -177,10 +174,7 @@ pub(crate) struct XdnsConnClient {
 impl XdnsConnClient {
     pub(crate) fn new(inner: Box<dyn UdpIo>, resolvers: Vec<String>) -> io::Result<Self> {
         if resolvers.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "empty resolvers",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty resolvers"));
         }
 
         let mut domains = Vec::new();
@@ -190,10 +184,7 @@ impl XdnsConnClient {
         for rs in &resolvers {
             let (name, server, rr_type) = super::spec::parse_resolver(rs)?;
             let addr: SocketAddr = server.parse().map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("invalid resolver addr: {e}"),
-                )
+                io::Error::new(io::ErrorKind::InvalidInput, format!("invalid resolver addr: {e}"))
             })?;
             domains.push(name);
             types.push(rr_type);
@@ -204,13 +195,8 @@ impl XdnsConnClient {
         let mut client_id = [0u8; 8];
         rand::rng().fill_bytes(&mut client_id);
 
-        let state = Arc::new(ResolverState {
-            addrs,
-            types,
-            domains,
-            sends,
-            idx: AtomicU32::new(0),
-        });
+        let state =
+            Arc::new(ResolverState { addrs, types, domains, sends, idx: AtomicU32::new(0) });
 
         let (write_tx, write_rx) = mpsc::channel(WRITE_QUEUE_CAP);
         let (poll_tx, poll_rx) = mpsc::channel(super::POLL_LIMIT);
@@ -219,13 +205,7 @@ impl XdnsConnClient {
         let closed = Arc::new(AtomicBool::new(false));
         let inner_arc: Arc<dyn UdpIo> = Arc::from(inner);
 
-        tokio::spawn(recv_loop(
-            state.clone(),
-            inner_arc.clone(),
-            closed.clone(),
-            read_tx,
-            poll_tx,
-        ));
+        tokio::spawn(recv_loop(state.clone(), inner_arc.clone(), closed.clone(), read_tx, poll_tx));
         let state_clone = state.clone();
         let inner_clone = inner_arc.clone();
         tokio::spawn(send_loop(
@@ -283,10 +263,7 @@ async fn recv_loop(
         let mut any_packet = false;
         while let Some(p) = next_packet(&mut reader) {
             any_packet = true;
-            let pkt = Packet {
-                data: p,
-                addr: Some(addr),
-            };
+            let pkt = Packet { data: p, addr: Some(addr) };
             // 队列满则丢弃（与 Go default case 一致）
             let _ = read_tx.try_send(pkt);
         }
@@ -365,15 +342,13 @@ fn pick_next_resolver(state: &ResolverState) -> usize {
 impl UdpIo for XdnsConnClient {
     async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
         if self.closed.load(Ordering::Relaxed) {
-            return Err(io::Error::other( "xdns client closed"));
+            return Err(io::Error::other("xdns client closed"));
         }
 
         let idx = self.state.idx.load(Ordering::Relaxed) as usize % self.state.addrs.len();
-        let encoded = encode(buf, &self.client_id, &self.state.domains[idx], self.state.types[idx])?;
-        let pkt = Packet {
-            data: encoded,
-            addr: Some(addr),
-        };
+        let encoded =
+            encode(buf, &self.client_id, &self.state.domains[idx], self.state.types[idx])?;
+        let pkt = Packet { data: encoded, addr: Some(addr) };
         let _ = self.write_tx.try_send(pkt);
         Ok(buf.len())
     }
@@ -384,13 +359,11 @@ impl UdpIo for XdnsConnClient {
             rx.recv().await
         };
         let Some(pkt) = pkt else {
-            return Err(io::Error::other( "xdns client closed"));
+            return Err(io::Error::other("xdns client closed"));
         };
         let n = pkt.data.len().min(buf.len());
         buf[..n].copy_from_slice(&pkt.data[..n]);
-        let addr = pkt
-            .addr
-            .unwrap_or_else(|| SocketAddr::from(([0u8, 0, 0, 0], 0)));
+        let addr = pkt.addr.unwrap_or_else(|| SocketAddr::from(([0u8, 0, 0, 0], 0)));
         Ok((n, addr))
     }
 
@@ -414,10 +387,7 @@ mod tests {
     fn chunks_basic() {
         let data = b"abcdef";
         let result = chunks(data, 2);
-        assert_eq!(
-            result,
-            vec![vec![b'a', b'b'], vec![b'c', b'd'], vec![b'e', b'f']]
-        );
+        assert_eq!(result, vec![vec![b'a', b'b'], vec![b'c', b'd'], vec![b'e', b'f']]);
 
         let data = b"abc";
         let result = chunks(data, 5);

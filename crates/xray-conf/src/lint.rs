@@ -12,21 +12,21 @@
 //! 的 `init()` 各自独立，无法跨 crate 自动连入）。故采用 Go 等价：
 //!
 //! - 注册表用 [`std::sync::LazyLock`] 持有（首次访问时建空 map），
-//! - 调用方在启动早期调用 [`register_stage`] / [`crate::init::register_builtin_stages`]
-//!   注入。
+//! - 调用方在启动早期调用 [`register_stage`] / [`crate::init::register_builtin_stages`] 注入。
 //! - [`post_process`] 顺序跑所有阶段，首错即返回（与 Go 一致）。
 //!
 //! 跨 crate 复用：各 `xray-app-*` crate 可在自己模块顶层 `pub fn init()` 内
 //! 调用 `xray_conf::lint::register_stage(...)`，再由 `xray-core` 启动时
 //! 显式调用 `xray_conf::init::register_builtin_stages()` 把核心阶段串起来。
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, LazyLock};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, LazyLock},
+};
 
 use parking_lot::Mutex;
 
-use crate::config::Config;
-use crate::error::ConfError;
+use crate::{config::Config, error::ConfError};
 
 /// Lint 阶段错误。对应 Go `errors.New("Rejected by Postprocessing Stage ", k)`。
 ///
@@ -71,13 +71,21 @@ static REGISTRY: LazyLock<Mutex<BTreeMap<&'static str, Arc<dyn LintStage>>>> =
 ///
 /// ```
 /// use std::sync::Arc;
-/// use xray_conf::lint::{register_stage, LintStage, post_process};
-/// use xray_conf::Config;
+///
+/// use xray_conf::{
+///     Config,
+///     lint::{LintStage, post_process, register_stage},
+/// };
 ///
 /// struct Noop;
 /// impl LintStage for Noop {
-///     fn name(&self) -> &'static str { "noop" }
-///     fn process(&self, _cfg: &mut Config) -> Result<(), xray_conf::lint::LintError> { Ok(()) }
+///     fn name(&self) -> &'static str {
+///         "noop"
+///     }
+///
+///     fn process(&self, _cfg: &mut Config) -> Result<(), xray_conf::lint::LintError> {
+///         Ok(())
+///     }
 /// }
 ///
 /// register_stage(Arc::new(Noop));
@@ -113,10 +121,7 @@ pub fn post_process(cfg: &mut Config) -> Result<(), LintError> {
         if let Err(err) = stage.process(cfg) {
             return Err(match err {
                 LintError::Stage { .. } => err,
-                other => LintError::Stage {
-                    stage: stage.name(),
-                    message: other.to_string(),
-                },
+                other => LintError::Stage { stage: stage.name(), message: other.to_string() },
             });
         }
     }
@@ -138,8 +143,7 @@ pub mod tests {
 
 #[cfg(test)]
 mod lint_tests {
-    use super::tests::TEST_LOCK;
-    use super::*;
+    use super::{tests::TEST_LOCK, *};
     use crate::app_config::FakeDnsConfig;
 
     /// 计数器 A：name 不同用于验证多阶段顺序触发。
@@ -150,6 +154,7 @@ mod lint_tests {
         fn name(&self) -> &'static str {
             "counter-a"
         }
+
         fn process(&self, _cfg: &mut Config) -> Result<(), LintError> {
             *self.hits.lock() += 1;
             Ok(())
@@ -164,6 +169,7 @@ mod lint_tests {
         fn name(&self) -> &'static str {
             "counter-b"
         }
+
         fn process(&self, _cfg: &mut Config) -> Result<(), LintError> {
             *self.hits.lock() += 1;
             Ok(())
@@ -176,6 +182,7 @@ mod lint_tests {
         fn name(&self) -> &'static str {
             "boom"
         }
+
         fn process(&self, _cfg: &mut Config) -> Result<(), LintError> {
             Err(LintError::Invalid("kaboom".into()))
         }
@@ -195,12 +202,8 @@ mod lint_tests {
         super::clear_stages();
         let hits_a = std::sync::Arc::new(parking_lot::Mutex::new(0));
         let hits_b = std::sync::Arc::new(parking_lot::Mutex::new(0));
-        super::register_stage(Arc::new(CounterA {
-            hits: hits_a.clone(),
-        }));
-        super::register_stage(Arc::new(CounterB {
-            hits: hits_b.clone(),
-        }));
+        super::register_stage(Arc::new(CounterA { hits: hits_a.clone() }));
+        super::register_stage(Arc::new(CounterB { hits: hits_b.clone() }));
         let mut cfg = Config::default();
         super::post_process(&mut cfg).unwrap();
         assert_eq!(*hits_a.lock(), 1);
@@ -213,9 +216,7 @@ mod lint_tests {
         super::clear_stages();
         let hits = std::sync::Arc::new(parking_lot::Mutex::new(0));
         super::register_stage(Arc::new(Boom));
-        super::register_stage(Arc::new(CounterA {
-            hits: hits.clone(),
-        }));
+        super::register_stage(Arc::new(CounterA { hits: hits.clone() }));
         let mut cfg = Config::default();
         let err = super::post_process(&mut cfg).unwrap_err();
         match err {
@@ -257,10 +258,7 @@ mod lint_tests {
 
     #[test]
     fn lint_error_display_contains_name() {
-        let err = LintError::Stage {
-            stage: "fake-dns",
-            message: "no fakedns address".into(),
-        };
+        let err = LintError::Stage { stage: "fake-dns", message: "no fakedns address".into() };
         let s = err.to_string();
         assert!(s.contains("fake-dns"));
         assert!(s.contains("no fakedns address"));
@@ -276,6 +274,7 @@ mod lint_tests {
             fn name(&self) -> &'static str {
                 "write-fake"
             }
+
             fn process(&self, cfg: &mut Config) -> Result<(), LintError> {
                 cfg.fake_dns = Some(FakeDnsConfig {
                     ip_pool: Some("198.18.0.0/15".into()),

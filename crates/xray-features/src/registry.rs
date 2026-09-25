@@ -4,11 +4,11 @@
 //!
 //! ## Go vs Rust
 //!
-//! - **Go**：`map[reflect.Type]ConfigCreator`，键是 `reflect.TypeOf(config)`，配置以
-//!   `interface{}` 传入；feature crate 的 `init()` 调 `RegisterConfig` 自注册。
-//! - **Rust**：`HashMap<&'static str, FeatureFactory>`，键是 prost `Any::type_url`
-//!   （如 `"type.googleapis.com/xray.app.dns.Config"`）；factory 接收原始字节数据
-//!   自行 `prost::Message::decode`，避免本 crate 依赖具体配置类型。
+//! - **Go**：`map[reflect.Type]ConfigCreator`，键是 `reflect.TypeOf(config)`，配置以 `interface{}`
+//!   传入；feature crate 的 `init()` 调 `RegisterConfig` 自注册。
+//! - **Rust**：`HashMap<&'static str, FeatureFactory>`，键是 prost `Any::type_url` （如
+//!   `"type.googleapis.com/xray.app.dns.Config"`）；factory 接收原始字节数据 自行
+//!   `prost::Message::decode`，避免本 crate 依赖具体配置类型。
 //!
 //! 用 `type_url` 字符串而非 `TypeId` 作键：`type_url` 是 prost Any 的天然标识，
 //! 跨进程稳定（写入配置文件），与 Go 反射键的"序列化稳定"语义对齐。
@@ -20,8 +20,10 @@
 //! 显式调用 `register_feature("...type_url...", factory)`。
 //! 测试场景下可手动调用，注册表是 process-wide 全局可变状态。
 
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 
 use parking_lot::RwLock;
 
@@ -35,8 +37,7 @@ use crate::{Feature, FeatureError, Result};
 ///
 /// 1. 避免本 crate 依赖具体 feature 的 Config 类型（无循环依赖）
 /// 2. 让每个 feature crate 自己负责反序列化与构造
-pub type FeatureFactory =
-    Arc<dyn Fn(&[u8]) -> Result<Arc<dyn Feature>> + Send + Sync + 'static>;
+pub type FeatureFactory = Arc<dyn Fn(&[u8]) -> Result<Arc<dyn Feature>> + Send + Sync + 'static>;
 
 static REGISTRY: OnceLock<RwLock<HashMap<&'static str, FeatureFactory>>> = OnceLock::new();
 
@@ -56,8 +57,8 @@ const MAX_FEATURE_ENTRIES: usize = 1024;
 ///
 /// # 参数
 ///
-/// - `type_url`：prost `Any::type_url`，如 `"type.googleapis.com/xray.app.dns.Config"`。
-///   必须是 `'static str`（保证注册表生命周期无界）。
+/// - `type_url`：prost `Any::type_url`，如 `"type.googleapis.com/xray.app.dns.Config"`。 必须是
+///   `'static str`（保证注册表生命周期无界）。
 /// - `factory`：闭包，输入 `&[u8]`（prost Any value），输出 `Arc<dyn Feature>`。
 pub fn register_feature(type_url: &'static str, factory: FeatureFactory) -> Result<()> {
     let mut reg = registry().write();
@@ -90,9 +91,7 @@ pub fn create_feature(type_url: &str, data: &[u8]) -> Result<Arc<dyn Feature>> {
         let reg = registry().read();
         reg.get(type_url)
             .cloned()
-            .ok_or_else(|| FeatureError::NotFound {
-                name: type_url.to_string(),
-            })?
+            .ok_or_else(|| FeatureError::NotFound { name: type_url.to_string() })?
     };
     factory(data)
 }
@@ -124,11 +123,10 @@ mod tests {
     /// 工厂：把 bytes 解析成 tag 后构造 StubFeature。
     /// 用 `String::from_utf8` 模拟 prost decode。
     fn stub_factory(data: &[u8]) -> Result<Arc<dyn Feature>> {
-        let tag = String::from_utf8(data.to_vec())
-            .map_err(|_| FeatureError::StartFailed {
-                name: "StubFeature",
-                message: "invalid utf-8".into(),
-            })?;
+        let tag = String::from_utf8(data.to_vec()).map_err(|_| FeatureError::StartFailed {
+            name: "StubFeature",
+            message: "invalid utf-8".into(),
+        })?;
         // 泄漏到 'static 以匹配 feature_name 的 &'static str 返回签名。
         // 仅测试用，生产 feature 用 String 字段 + 引用计数返回。
         let leaked: &'static str = Box::leak(tag.into_boxed_str());
@@ -160,12 +158,10 @@ mod tests {
     fn register_overrides_previous() {
         let _g = TEST_LOCK.lock();
         clear_registry_for_test();
-        let f1: FeatureFactory = Arc::new(|_| {
-            Ok(Arc::new(StubFeature { tag: "v1" }) as Arc<dyn Feature>)
-        });
-        let f2: FeatureFactory = Arc::new(|_| {
-            Ok(Arc::new(StubFeature { tag: "v2" }) as Arc<dyn Feature>)
-        });
+        let f1: FeatureFactory =
+            Arc::new(|_| Ok(Arc::new(StubFeature { tag: "v1" }) as Arc<dyn Feature>));
+        let f2: FeatureFactory =
+            Arc::new(|_| Ok(Arc::new(StubFeature { tag: "v2" }) as Arc<dyn Feature>));
         register_feature("type.googleapis.com/test.Override", f1);
         register_feature("type.googleapis.com/test.Override", f2);
 

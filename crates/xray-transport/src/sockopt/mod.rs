@@ -23,20 +23,21 @@
 //! 配置——两者均不调用 setsockopt）。平台模块 `apply` 内自行 `>0` 时启用、
 //! `tcp_fast_open==false` 时跳过。
 
-#[cfg(target_os = "linux")]
-pub mod linux;
-#[cfg(target_os = "windows")]
-pub mod windows;
 #[cfg(target_os = "macos")]
 pub mod darwin;
 #[cfg(target_os = "freebsd")]
 pub mod freebsd;
-use std::time::Duration;
-use socket2::{Domain, Protocol, Socket, Type};
+#[cfg(target_os = "linux")]
+pub mod linux;
+#[cfg(target_os = "windows")]
+pub mod windows;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "windows")]
 use std::os::windows::io::AsRawSocket;
+use std::time::Duration;
+
+use socket2::{Domain, Protocol, Socket, Type};
 /// 基础 socket 选项。对应 Go `SocketConfig` 的核心字段子集。
 ///
 /// 默认值与 Go DefaultSystemDialer 一致：
@@ -335,12 +336,7 @@ pub struct HappyEyeballsConfig {
 impl Default for HappyEyeballsConfig {
     fn default() -> Self {
         // 与 Go infra/conf/transport_internet.go:1021 UnmarshalJSON 缺省值一致。
-        Self {
-            prioritize_ipv6: false,
-            interleave: 1,
-            try_delay_ms: 0,
-            max_concurrent_try: 4,
-        }
+        Self { prioritize_ipv6: false, interleave: 1, try_delay_ms: 0, max_concurrent_try: 4 }
     }
 }
 /// 自定义 socket 选项条目。对应 Go `internet.CustomSockopt`（config.proto:94-101）。
@@ -402,11 +398,10 @@ impl Default for SocketOptions {
 /// 跳过 TFO 设置，因此本函数可在 `SocketOptions::default()` 上无副作用通过。
 ///
 /// 各平台覆盖范围：
-/// - Linux：TFO_CONNECT / TCP_CONGESTION / TCP_WINDOW_CLAMP / TCP_USER_TIMEOUT /
-///   TCP_MAXSEG / SO_REUSEPORT / IP_TRANSPARENT（tproxy）/ SO_MARK / SO_BINDTODEVICE
+/// - Linux：TFO_CONNECT / TCP_CONGESTION / TCP_WINDOW_CLAMP / TCP_USER_TIMEOUT / TCP_MAXSEG /
+///   SO_REUSEPORT / IP_TRANSPARENT（tproxy）/ SO_MARK / SO_BINDTODEVICE
 /// - FreeBSD：TFO / SO_REUSEPORT_LB→SO_REUSEPORT / SO_USER_COOKIE（mark）
-/// - Darwin：TFO_CLIENT 位 / SO_REUSEPORT / IP_BOUND_IF / IPV6_BOUND_IF /
-///   TCP_KEEPALIVE-KEEPINTVL
+/// - Darwin：TFO_CLIENT 位 / SO_REUSEPORT / IP_BOUND_IF / IPV6_BOUND_IF / TCP_KEEPALIVE-KEEPINTVL
 /// - Windows：Winsock TCP_FASTOPEN=15 / IP_UNICAST_IF / IPV6_UNICAST_IF
 /// 把 [`SocketOptions`] 应用到已建立的 [`Socket`]（TCP 专用）。
 pub fn apply_outbound_socket_options(
@@ -501,13 +496,13 @@ pub fn apply_outbound_socket_options(
 /// 的跨平台通用部分（sockopt_linux.go:115-232）。
 ///
 /// 与 [`apply_outbound_socket_options`] 的差异：
-/// 1. 不设置 TFO（Go inbound TCP_FASTOPEN 是监听 socket 上的 backlog 设置，必须
-///    在 listen() 之前；本函数作用于 accept 出的连接，TFO 在该层无效）——见
+/// 1. 不设置 TFO（Go inbound TCP_FASTOPEN 是监听 socket 上的 backlog 设置，必须 在 listen()
+///    之前；本函数作用于 accept 出的连接，TFO 在该层无效）——见
 ///    [`crate::system_listener::DefaultListener::bind`]。
-/// 2. 入站连接默认禁用 keepalive（Go 端 `lc.KeepAlive = -1`，system_listener.go:91），
-///    仅 idle/interval 任一非零时启用（Go system_listener.go:102-109「任一 >0 即 Enable」）。
-/// 3. FreeBSD/Darwin inbound 走相同平台 `apply` 但 `inbound=true`（Darwin 决定 TFO
-///    SERVER 位 vs CLIENT 位）；FreeBSD TFO 出站 clamp 1、入站原值（sockopt_freebsd.go:136-138）。
+/// 2. 入站连接默认禁用 keepalive（Go 端 `lc.KeepAlive = -1`，system_listener.go:91）， 仅
+///    idle/interval 任一非零时启用（Go system_listener.go:102-109「任一 >0 即 Enable」）。
+/// 3. FreeBSD/Darwin inbound 走相同平台 `apply` 但 `inbound=true`（Darwin 决定 TFO SERVER 位 vs
+///    CLIENT 位）；FreeBSD TFO 出站 clamp 1、入站原值（sockopt_freebsd.go:136-138）。
 pub fn apply_inbound_socket_options(socket: &Socket, opts: &SocketOptions) -> std::io::Result<()> {
     socket.set_nodelay(opts.tcp_nodelay)?;
     if opts.ipv6_only {
@@ -526,7 +521,7 @@ pub fn apply_inbound_socket_options(socket: &Socket, opts: &SocketOptions) -> st
         // accept 出的连接可设 tproxy/mark/bind_if_index；tproxy 在 Linux 上对 accepted
         // connection 仍生效（sockopt_linux.go:211-215 不区分方向）。
         linux::LinuxSockOpt {
-            tcp_fast_open: 0, // inbound TFO backlog 走 listener 层，不在这里设
+            tcp_fast_open: 0,  // inbound TFO backlog 走 listener 层，不在这里设
             reuse_port: false, // REUSEPORT 仅监听 socket 相关，accept 后无意义
             tproxy: opts.tproxy,
             tcp_congestion: opts.tcp_congestion.clone(),
@@ -596,13 +591,12 @@ const QUIC_UDP_MIN_BUFFER: usize = 8 << 20;
 /// 对应 Go `transport/internet/quic` 拨号/监听前的 socket 工厂位（Go 侧缓冲由
 /// quic-go `wrapConn` 自动处理）。缓冲语义（对齐 PM 拍板方案 C）：
 ///
-/// 1. `receive_buffer_size` / `send_buffer_size` 显式 `> 0`：直接设置（优先于默认
-///    下限；失败仅 `warn` 不阻断——超过 `rmem_max`/`wmem_max` 的值内核静默钳制，
+/// 1. `receive_buffer_size` / `send_buffer_size` 显式 `> 0`：直接设置（优先于默认 下限；失败仅
+///    `warn` 不阻断——超过 `rmem_max`/`wmem_max` 的值内核静默钳制，
 ///    缓冲是优化非正确性需求，硬错反而害配置可移植性）。
-/// 2. 显式值缺省（`0`）：Go `wrapConn` 下限语义——回读当前值，≥8MB 不动（只升不降），
-///    <8MB 提到 8MB；Linux 上 setsockopt 失败（EPERM 等）再试 `SO_RCVBUFFORCE` /
-///    `SO_SNDBUFFORCE`（需 CAP_NET_ADMIN，对齐 Go `forceSetReceiveBuffer`）；
-///    仍失败仅 `warn`。
+/// 2. 显式值缺省（`0`）：Go `wrapConn` 下限语义——回读当前值，≥8MB 不动（只升不降）， <8MB 提到
+///    8MB；Linux 上 setsockopt 失败（EPERM 等）再试 `SO_RCVBUFFORCE` / `SO_SNDBUFFORCE`（需
+///    CAP_NET_ADMIN，对齐 Go `forceSetReceiveBuffer`）； 仍失败仅 `warn`。
 ///
 /// 返回的 socket 已设 nonblocking（quinn `wrap_udp_socket` 要求）并完成 bind。
 /// IPv6 地址默认关 `IPV6_V6ONLY`（dual-stack，对齐 quinn `Endpoint::client`
@@ -615,11 +609,7 @@ pub fn bind_udp_endpoint(
     addr: std::net::SocketAddr,
     opts: &SocketOptions,
 ) -> std::io::Result<std::net::UdpSocket> {
-    let sock = Socket::new(
-        Domain::for_address(addr),
-        Type::DGRAM,
-        Some(Protocol::UDP),
-    )?;
+    let sock = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
     let v6only = addr.is_ipv6() && opts.ipv6_only;
     let _ = sock.set_only_v6(v6only);
     tune_udp_buffer(&sock, opts.receive_buffer_size, UdpBufDir::Recv);
@@ -670,11 +660,7 @@ impl UdpBufDir {
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             )
         };
-        if r == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
+        if r == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
     }
 }
 
@@ -710,20 +696,17 @@ fn tune_udp_buffer(sock: &Socket, explicit: i32, dir: UdpBufDir) {
 /// sockopt_darwin.go:152-188/248-284；sockopt_freebsd.go 无此循环，调用点已 cfg 门控）。
 ///
 /// - `system` 过滤：非空且 ≠ 当前 OS 跳过（`std::env::consts::OS` ≡ `runtime.GOOS`）。
-/// - `network` 前缀过滤（Go `strings.HasPrefix`）：Go 调用层只产生 "tcp"/"udp" 两族
-///   （net.Dial network），此处按 socket 类型等价推导；"tcp" 前缀天然覆盖 tcp4/tcp6。
+/// - `network` 前缀过滤（Go `strings.HasPrefix`）：Go 调用层只产生 "tcp"/"udp" 两族 （net.Dial
+///   network），此处按 socket 类型等价推导；"tcp" 前缀天然覆盖 tcp4/tcp6。
 /// - `opt` 为空报 "No opt!"；Atoi 失败静默取 0（Go `opt, _ = strconv.Atoi` 同款）。
-/// - `type`：`"int"` 全平台 / `"str"` Windows 报错不支持（Go :113）/ 其他值报
-///   "unknown CustomSockopt type"。
+/// - `type`：`"int"` 全平台 / `"str"` Windows 报错不支持（Go :113）/ 其他值报 "unknown
+///   CustomSockopt type"。
 fn apply_custom_sockopt(socket: &Socket, opts: &SocketOptions) -> std::io::Result<()> {
     if opts.custom_sockopt.is_empty() {
         return Ok(());
     }
-    let network = if socket.r#type().is_ok_and(|t| t == socket2::Type::DGRAM) {
-        "udp"
-    } else {
-        "tcp"
-    };
+    let network =
+        if socket.r#type().is_ok_and(|t| t == socket2::Type::DGRAM) { "udp" } else { "tcp" };
     for custom in &opts.custom_sockopt {
         if !custom.system.is_empty() && custom.system != std::env::consts::OS {
             continue;
@@ -744,7 +727,7 @@ fn apply_custom_sockopt(socket: &Socket, opts: &SocketOptions) -> std::io::Resul
             "int" => {
                 let value: i32 = custom.value.parse().unwrap_or(0);
                 set_custom_sockopt_int(socket, level, opt, value)?;
-            }
+            },
             "str" => {
                 #[cfg(target_os = "windows")]
                 {
@@ -762,13 +745,13 @@ fn apply_custom_sockopt(socket: &Socket, opts: &SocketOptions) -> std::io::Resul
                     })?;
                     set_custom_sockopt_str(socket, level, opt, &c_val)?;
                 }
-            }
+            },
             other => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!("unknown CustomSockopt type: {other}"),
                 ));
-            }
+            },
         }
     }
     Ok(())
@@ -840,19 +823,19 @@ fn set_custom_sockopt_str(
 
 #[cfg(windows)]
 /// Go 1.23 `net.KeepAliveConfig` 未配置字段（`-1`）的默认物化值
-///（Go net 文档：Idle/Interval 缺省 15s；Windows `SIO_KEEPALIVE_VALS` 要求显式值）。
+/// （Go net 文档：Idle/Interval 缺省 15s；Windows `SIO_KEEPALIVE_VALS` 要求显式值）。
 pub(crate) const DEFAULT_KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
 /// 同上，Interval 缺省 15s。
 #[cfg(windows)]
 pub(crate) const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// 应用 TCP keepalive 配置。对应 Go `net.KeepAliveConfig` 语义
-///（system_listener.go:96-109 / system_dialer.go:89-110）：
+/// （system_listener.go:96-109 / system_dialer.go:89-110）：
 ///
 /// - `idle` 与 `interval` 均为 0（Go `Enable: false`）：不动 `SO_KEEPALIVE`（默认关）。
-/// - 任一非零（Go「任一 >0 即 Enable」）：设 `SO_KEEPALIVE=1`；未配置的字段用
-///   OS 默认——unix 上跳过对应 setsockopt（Linux 内核默认，对齐 Go `Idle: -1`）；
-///   Windows 上 `SIO_KEEPALIVE_VALS` 必须显式给值，物化为 Go 缺省 15s。
+/// - 任一非零（Go「任一 >0 即 Enable」）：设 `SO_KEEPALIVE=1`；未配置的字段用 OS 默认——unix
+///   上跳过对应 setsockopt（Linux 内核默认，对齐 Go `Idle: -1`）； Windows 上 `SIO_KEEPALIVE_VALS`
+///   必须显式给值，物化为 Go 缺省 15s。
 ///
 /// 与 Go 的差异：Go 的 `Count`（`TCP_KEEPCNT`）Xray 从不配置（恒 `-1` 用系统默认），
 /// 此处同样不设置。
@@ -886,7 +869,7 @@ pub(crate) fn set_keepalive_config(socket: &Socket, opts: &SocketOptions) -> std
 }
 
 /// 尝试启用 MPTCP（Linux `TCP_MPTCP=1`）。对应 Go `SetMultipathTCP(true)`
-///（system_listener.go:110-112）。
+/// （system_listener.go:110-112）。
 ///
 /// 必须在 `listen()` 之前对监听 socket 调用。内核不支持（`ENOPROTOOPT`）时
 /// 返回 Err，调用方按 Go 行为记录后静默回退普通 TCP。
@@ -908,11 +891,7 @@ pub(crate) fn try_set_mptcp(socket: &Socket) -> std::io::Result<()> {
             std::mem::size_of::<i32>() as libc::socklen_t,
         )
     };
-    if ret < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    if ret < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
 }
 
 /// 获取被 iptables REDIRECT 的 TCP 连接的原始目标地址。
@@ -927,10 +906,7 @@ pub fn get_original_dst(_fd: i32) -> std::io::Result<std::net::SocketAddr> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "SO_ORIGINAL_DST is Linux-only",
-        ))
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "SO_ORIGINAL_DST is Linux-only"))
     }
 }
 
@@ -986,9 +962,11 @@ pub fn resolve_interface_index(name: &str) -> std::io::Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::{Ipv4Addr, SocketAddrV4};
+
     use tokio::net::TcpListener;
+
+    use super::*;
 
     #[tokio::test]
     async fn apply_socket_options_on_real_tcp_connection() {
@@ -1030,7 +1008,9 @@ mod tests {
     async fn apply_socket_options_with_tfo_congestion_tproxy() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let accept_task = tokio::spawn(async move { let _ = listener.accept().await; });
+        let accept_task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
         // 生产语义：先 apply 再 connect。TCP_FASTOPEN_CONNECT 在 ESTABLISHED
         // socket 上新内核（6.8+）返回 EINVAL（CI ubuntu 首跑实证）——socket2
         // 建未连接 socket → apply → connect，对齐 apply_outbound_socket_options
@@ -1096,7 +1076,9 @@ mod tests {
     async fn apply_tfo_outbound_does_not_panic_on_default_socket() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let accept_task = tokio::spawn(async move { let _ = listener.accept().await; });
+        let accept_task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
         // 同上：未连接 socket → apply → connect（ESTABLISHED 后设
         // TCP_FASTOPEN_CONNECT 新内核 EINVAL，CI ubuntu 首跑实证）。
         let socket = socket2::Socket::new(
@@ -1136,7 +1118,9 @@ mod tests {
     async fn apply_tproxy_outbound_returns_err_for_unprivileged() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let accept_task = tokio::spawn(async move { let _ = listener.accept().await; });
+        let accept_task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let socket = socket2::Socket::from(stream.into_std().unwrap());
         let mut opts = SocketOptions::default();
@@ -1197,8 +1181,12 @@ mod tests {
     #[test]
     fn receive_buffer_size_applies_and_defaults_off() {
         let make = || {
-            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
-                .unwrap()
+            socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )
+            .unwrap()
         };
         let rcvbuf = |s: &socket2::Socket| s.recv_buffer_size().unwrap();
         let plain = make();
@@ -1333,12 +1321,7 @@ mod tests {
     #[test]
     fn domain_strategy_from_i32_roundtrip_and_fallback() {
         use DomainStrategy::*;
-        for (v, s) in [
-            (0, AsIs),
-            (1, UseIP),
-            (5, UseIPv6v4),
-            (10, ForceIPv6v4),
-        ] {
+        for (v, s) in [(0, AsIs), (1, UseIP), (5, UseIPv6v4), (10, ForceIPv6v4)] {
             assert_eq!(DomainStrategy::from_i32(v), s);
             assert_eq!(s as i32, v);
         }
@@ -1443,10 +1426,7 @@ mod tests {
         opts.custom_sockopt[0].opt = "1".to_string();
         opts.custom_sockopt[0].r#type = "bogus".to_string();
         let err = apply_outbound_socket_options(&socket, &opts, None).unwrap_err();
-        assert!(
-            err.to_string().contains("unknown CustomSockopt type"),
-            "应报 unknown type：{err}"
-        );
+        assert!(err.to_string().contains("unknown CustomSockopt type"), "应报 unknown type：{err}");
 
         drop(socket);
         accept_task.await.unwrap();

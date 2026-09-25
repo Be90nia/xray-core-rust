@@ -5,8 +5,7 @@
 //! dns app）一致按 `IpOption` 过滤家族。全局 `DNS_CLIENT` 是进程级槽位，
 //! 使用方须持 [`FAKE_DNS_LOCK`] 串行设置/还原。
 
-use std::net::IpAddr;
-use std::sync::Arc;
+use std::{net::IpAddr, sync::Arc};
 
 use parking_lot::Mutex;
 use xray_features::dns::{DnsClient, DnsError, IpOption};
@@ -56,10 +55,7 @@ impl DnsClient for FakeDns {
         domain: &str,
         option: IpOption,
     ) -> Result<(Vec<IpAddr>, u32), DnsError> {
-        self.inner
-            .seen
-            .lock()
-            .push((domain.to_string(), option.ipv4_enable, option.ipv6_enable));
+        self.inner.seen.lock().push((domain.to_string(), option.ipv4_enable, option.ipv6_enable));
         let result = {
             let mut results = self.inner.results.lock();
             if results.is_empty() { None } else { Some(results.remove(0)) }
@@ -69,15 +65,14 @@ impl DnsClient for FakeDns {
         match result {
             Some(Ok(mut ips)) => {
                 ips.retain(|ip| {
-                    (ip.is_ipv4() && option.ipv4_enable)
-                        || (ip.is_ipv6() && option.ipv6_enable)
+                    (ip.is_ipv4() && option.ipv4_enable) || (ip.is_ipv6() && option.ipv6_enable)
                 });
                 if ips.is_empty() {
                     Err(DnsError::EmptyResponse)
                 } else {
                     Ok((ips, xray_features::dns::DEFAULT_TTL))
                 }
-            }
+            },
             Some(Err(e)) => Err(e),
             None => Err(DnsError::EmptyResponse),
         }

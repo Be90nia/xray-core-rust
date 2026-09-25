@@ -18,7 +18,7 @@
 use rand::RngCore;
 
 use crate::config::{
-    uri_append_query, RequestMeta, PLACEMENT_COOKIE, PLACEMENT_HEADER, PLACEMENT_QUERY_IN_HEADER,
+    PLACEMENT_COOKIE, PLACEMENT_HEADER, PLACEMENT_QUERY_IN_HEADER, RequestMeta, uri_append_query,
 };
 
 /// 填充方法：重复 'X'（每个 X = 8 bits，HPACK 不压缩长度）。
@@ -142,8 +142,7 @@ pub fn generate_tokenish_padding_base62(target_huffman_bytes: i32) -> String {
     if target_huffman_bytes <= 0 {
         return String::new();
     }
-    let mut n =
-        ((target_huffman_bytes as f64) / AVG_HUFFMAN_BYTES_PER_CHAR_BASE62).ceil() as usize;
+    let mut n = ((target_huffman_bytes as f64) / AVG_HUFFMAN_BYTES_PER_CHAR_BASE62).ceil() as usize;
     if n < 1 {
         n = 1;
     }
@@ -186,12 +185,8 @@ pub fn generate_padding(method: &str, length: i32) -> String {
     match method {
         PADDING_METHOD_TOKENISH => {
             let v = generate_tokenish_padding_base62(length);
-            if v.is_empty() {
-                "X".repeat(length as usize)
-            } else {
-                v
-            }
-        }
+            if v.is_empty() { "X".repeat(length as usize) } else { v }
+        },
         _ => "X".repeat(length as usize),
     }
 }
@@ -216,7 +211,7 @@ pub fn is_padding_valid(padding_value: &str, mut from: i32, mut to: i32, method:
             let n = huffman_encode_length(padding_value) as i32;
             let lo = (from - VALIDATION_TOLERANCE).max(0);
             (n, lo, to + VALIDATION_TOLERANCE)
-        }
+        },
         _ => (padding_value.len() as i32, from, to),
     };
     n >= lo && n <= hi
@@ -237,31 +232,25 @@ pub fn apply_xpadding_to_request_meta(meta: &mut RequestMeta, config: &XPaddingC
     }
     match placement {
         PLACEMENT_HEADER => {
-            meta.headers
-                .push((config.placement.header.clone(), padding_value));
-        }
+            meta.headers.push((config.placement.header.clone(), padding_value));
+        },
         PLACEMENT_QUERY_IN_HEADER => {
             // header 值是 URL，把 padding 写入 URL query
             // 例：Referer: <base> -> Referer: <base>?x_padding=XXX
             let new_value = if config.placement.raw_url.is_empty() {
                 format!("?{}={}", config.placement.key, padding_value)
             } else {
-                uri_append_query(
-                    &config.placement.raw_url,
-                    &config.placement.key,
-                    &padding_value,
-                )
+                uri_append_query(&config.placement.raw_url, &config.placement.key, &padding_value)
             };
             meta.headers.push((config.placement.header.clone(), new_value));
-        }
+        },
         PLACEMENT_COOKIE => {
-            meta.cookies
-                .push((config.placement.key.clone(), padding_value));
-        }
+            meta.cookies.push((config.placement.key.clone(), padding_value));
+        },
         // 默认 query：注入到 URI 的 query string
         _ => {
             meta.uri = uri_append_query(&meta.uri, &config.placement.key, &padding_value);
-        }
+        },
     }
 }
 
@@ -290,26 +279,25 @@ mod tests {
     fn huffman_table_matches_rfc7541_for_all_256_bytes() {
         // RFC 7541 Appendix B 完整 Huffman code 长度表（256 项）。
         const RFC: [u8; 256] = [
-            13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28,
-            28, 28, 28, 28, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28, 28,
-            6, 10, 10, 12, 13, 6, 8, 11, 10, 10, 8, 11, 8, 6, 6, 6,
-            5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 7, 8, 15, 6, 12, 10,
-            13, 10, 13, 23, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-            7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 8, 13, 19, 13,
-            14, 6, 15, 5, 6, 5, 6, 5, 6, 6, 6, 5, 7, 7, 6, 6,
-            6, 5, 6, 7, 6, 5, 5, 6, 7, 7, 7, 7, 7, 11, 11, 14,
-            13, 28, 20, 22, 20, 20, 22, 22, 22, 23, 22, 23, 23, 23, 23, 23,
-            24, 23, 24, 24, 24, 24, 24, 23, 24, 24, 24, 23, 24, 24, 24, 24,
-            21, 22, 22, 22, 22, 21, 22, 22, 23, 23, 24, 23, 23, 23, 23, 23,
-            23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
-            23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
-            23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
-            23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
-            23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
+            13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28,
+            30, 28, 28, 28, 28, 28, 28, 28, 28, 28, 6, 10, 10, 12, 13, 6, 8, 11, 10, 10, 8, 11, 8,
+            6, 6, 6, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 7, 8, 15, 6, 12, 10, 13, 10, 13, 23, 7, 7, 7, 7,
+            7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 8, 13, 19, 13, 14, 6, 15,
+            5, 6, 5, 6, 5, 6, 6, 6, 5, 7, 7, 6, 6, 6, 5, 6, 7, 6, 5, 5, 6, 7, 7, 7, 7, 7, 11, 11,
+            14, 13, 28, 20, 22, 20, 20, 22, 22, 22, 23, 22, 23, 23, 23, 23, 23, 24, 23, 24, 24, 24,
+            24, 24, 23, 24, 24, 24, 23, 24, 24, 24, 24, 21, 22, 22, 22, 22, 21, 22, 22, 23, 23, 24,
+            23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
+            23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
+            23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
+            23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
         ];
         for (i, (&got, &want)) in HUFFMAN_BITS.iter().zip(RFC.iter()).enumerate() {
-            assert_eq!(got, want, "byte {i:#04x} ({}): rust={got} rfc={want}",
-                if (32..127).contains(&i) { char::from(i as u8) } else { '?' });
+            assert_eq!(
+                got,
+                want,
+                "byte {i:#04x} ({}): rust={got} rfc={want}",
+                if (32..127).contains(&i) { char::from(i as u8) } else { '?' }
+            );
         }
     }
 
@@ -381,10 +369,7 @@ mod tests {
     fn generate_tokenish_padding_returns_base62() {
         let s = generate_tokenish_padding_base62(100);
         for b in s.bytes() {
-            assert!(
-                CHARSET_BASE62.contains(&b),
-                "non-base62 char in padding: {b}"
-            );
+            assert!(CHARSET_BASE62.contains(&b), "non-base62 char in padding: {b}");
         }
     }
 
@@ -484,10 +469,7 @@ mod tests {
             method: PADDING_METHOD_REPEAT_X.into(),
         };
         apply_xpadding_to_request_meta(&mut meta, &config);
-        assert_eq!(
-            meta.headers,
-            vec![("X-Pad".to_string(), "XXXXXXXX".to_string())]
-        );
+        assert_eq!(meta.headers, vec![("X-Pad".to_string(), "XXXXXXXX".to_string())]);
     }
 
     #[test]

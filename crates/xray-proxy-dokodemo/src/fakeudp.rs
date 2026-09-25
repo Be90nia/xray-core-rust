@@ -5,8 +5,7 @@
 //! 客户端原始目标地址——普通 socket 做不到，需要 `IP_TRANSPARENT` 透明 socket
 //! bind 到伪造地址后发送。仅 Linux 可用（iptables TPROXY 生态）。
 
-use std::io;
-use std::net::SocketAddr;
+use std::{io, net::SocketAddr};
 
 /// 创建绑定到 `addr` 的透明 UDP socket。
 ///
@@ -86,11 +85,7 @@ unsafe fn setsockopt_int(
         &val as *const _ as *const libc::c_void,
         std::mem::size_of::<libc::c_int>() as libc::socklen_t,
     );
-    if rv < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    if rv < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 
 /// `bind(fd, addr)`。
@@ -107,7 +102,7 @@ unsafe fn bind(fd: libc::c_int, addr: &SocketAddr) -> io::Result<()> {
                 &sa as *const _ as *const libc::sockaddr,
                 std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
             )
-        }
+        },
         SocketAddr::V6(a) => {
             let mut sa: libc::sockaddr_in6 = std::mem::zeroed();
             sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
@@ -118,13 +113,9 @@ unsafe fn bind(fd: libc::c_int, addr: &SocketAddr) -> io::Result<()> {
                 &sa as *const _ as *const libc::sockaddr,
                 std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
             )
-        }
+        },
     };
-    if rv < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    if rv < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 
 #[cfg(test)]
@@ -151,10 +142,10 @@ mod tests {
             Ok(sock) => {
                 let local = sock.local_addr().unwrap();
                 assert!(local.is_ipv4());
-            }
+            },
             Err(e) => {
                 assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "got: {e}");
-            }
+            },
         }
     }
 }

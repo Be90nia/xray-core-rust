@@ -5,8 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::report::StatsHandle;
-use crate::topology::socks_roundtrip;
+use crate::{report::StatsHandle, topology::socks_roundtrip};
 
 /// S1：短连接风暴。`concurrency` 个 worker 持续建连 → 小 roundtrip → 断开。
 /// 目标：连接生命周期内存回环。
@@ -32,11 +31,7 @@ pub async fn s1_short_burst(
                 let started = Instant::now();
                 match socks_roundtrip(socks_port, echo_port, payload).await {
                     Ok(_) => {
-                        stats.record_ok(
-                            payload.len() as u64,
-                            payload.len() as u64,
-                            ms(started),
-                        );
+                        stats.record_ok(payload.len() as u64, payload.len() as u64, ms(started));
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     },
                     Err(e) => {
@@ -138,13 +133,7 @@ pub async fn s4_mixed(
         stats.clone(),
         delay_ms,
     ));
-    let long = tokio::spawn(s2_long_flow(
-        kcp_socks_port,
-        echo_port,
-        long_conns,
-        deadline,
-        stats,
-    ));
+    let long = tokio::spawn(s2_long_flow(kcp_socks_port, echo_port, long_conns, deadline, stats));
     let _ = tokio::join!(short, long);
 }
 

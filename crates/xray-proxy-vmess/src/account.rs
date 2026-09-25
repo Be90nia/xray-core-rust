@@ -11,10 +11,11 @@
 //! 不依赖 `protocol::ID::cmd_key()`。
 
 use prost::Message;
-use xray_common::protocol::{self, ID};
-use xray_common::uuid::UUID;
-use xray_proto::xray::common::protocol::SecurityConfig;
-use xray_proto::xray::proxy::vmess::Account as ProtoAccount;
+use xray_common::{
+    protocol::{self, ID},
+    uuid::UUID,
+};
+use xray_proto::xray::{common::protocol::SecurityConfig, proxy::vmess::Account as ProtoAccount};
 
 use crate::error::{Result, VmessError};
 
@@ -88,9 +89,7 @@ impl MemoryAccount {
             tests.push_str("NoTerminationSignal");
         }
 
-        let security_settings = SecurityConfig {
-            r#type: self.security.as_u8() as i32,
-        };
+        let security_settings = SecurityConfig { r#type: self.security.as_u8() as i32 };
 
         ProtoAccount {
             id: self.id.uuid().to_string(),
@@ -105,7 +104,8 @@ impl MemoryAccount {
     ///
     /// - [`VmessError::InvalidUuid`]：UUID 字符串无法解析。
     pub fn from_proto(account: &ProtoAccount) -> Result<Self> {
-        let uuid = UUID::parse(&account.id).ok_or_else(|| VmessError::InvalidUuid(account.id.clone()))?;
+        let uuid =
+            UUID::parse(&account.id).ok_or_else(|| VmessError::InvalidUuid(account.id.clone()))?;
         let proto_id = ID::new(uuid);
         let authenticated_length = account.tests_enabled.contains("AuthenticatedLength");
         let no_termination_signal = account.tests_enabled.contains("NoTerminationSignal");
@@ -153,7 +153,8 @@ impl MemoryAccount {
 
 /// 计算 VMess cmd_key = MD5(UUID.Bytes() || magic_uuid)。
 ///
-/// 与 Go 端 `NewID` 字节级对齐：Go 用 `md5(uuid.Bytes() + "c48619fe-8f02-49e0-b9e9-edf763e17e21")`。
+/// 与 Go 端 `NewID` 字节级对齐：Go 用 `md5(uuid.Bytes() +
+/// "c48619fe-8f02-49e0-b9e9-edf763e17e21")`。
 #[must_use]
 pub fn cmd_key_of(uuid: &UUID) -> [u8; 16] {
     use md5::{Digest, Md5};
@@ -203,7 +204,8 @@ mod tests {
     #[test]
     fn not_equals_different_uuid() {
         let a = MemoryAccount::new(sample_uuid());
-        let b = MemoryAccount::new(UUID::parse("66ad4540-b58c-4ad2-9926-ea63445a9b58").expect("valid"));
+        let b =
+            MemoryAccount::new(UUID::parse("66ad4540-b58c-4ad2-9926-ea63445a9b58").expect("valid"));
         assert!(!a.equals(&b));
     }
 

@@ -5,9 +5,11 @@
 //! 当 `config.ed > 0` 时，客户端写完 HTTP Upgrade 请求后不立即读 101 响应，
 //! 让上层协议先写 early data（0-RTT），首次 `AsyncRead::poll_read` 时才解析响应。
 
-use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -43,10 +45,7 @@ pub struct DeferredResponseReader<IO> {
 impl<IO> DeferredResponseReader<IO> {
     /// 构造延迟读取器。`inner` 已写完 HTTP Upgrade 请求但未读响应。
     pub fn new(inner: IO) -> Self {
-        Self {
-            inner,
-            state: State::Pending,
-        }
+        Self { inner, state: State::Pending }
     }
 
     /// 拆出内层 IO。
@@ -76,7 +75,7 @@ impl<IO: AsyncRead + Unpin> AsyncRead for DeferredResponseReader<IO> {
                         )));
                     }
                     Action::ContinueReading
-                }
+                },
                 State::Ready { leftover } => {
                     if !leftover.is_empty() {
                         Action::DrainLeftover
@@ -84,13 +83,13 @@ impl<IO: AsyncRead + Unpin> AsyncRead for DeferredResponseReader<IO> {
                         // leftover 空，透传到 inner
                         return Pin::new(&mut self.inner).poll_read(cx, buf);
                     }
-                }
+                },
             };
 
             match action {
                 Action::StartReading => {
                     self.state = State::ReadingResponse(Vec::with_capacity(1024));
-                }
+                },
                 Action::ContinueReading => {
                     // 取出 response_buf，读 inner，再放回
                     let rb = match std::mem::replace(&mut self.state, State::Pending) {
@@ -104,14 +103,14 @@ impl<IO: AsyncRead + Unpin> AsyncRead for DeferredResponseReader<IO> {
                         Poll::Pending => {
                             self.state = State::ReadingResponse(rb);
                             return Poll::Pending;
-                        }
+                        },
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                         Poll::Ready(Ok(())) if read_buf.filled().is_empty() => {
                             return Poll::Ready(Err(io::Error::new(
                                 io::ErrorKind::ConnectionReset,
                                 "EOF before HTTP response header complete",
                             )));
-                        }
+                        },
                         Poll::Ready(Ok(())) => {
                             let mut rb = rb;
                             rb.extend_from_slice(read_buf.filled());
@@ -123,7 +122,7 @@ impl<IO: AsyncRead + Unpin> AsyncRead for DeferredResponseReader<IO> {
                                             io::ErrorKind::ConnectionRefused,
                                             format!("HTTPUpgrade response validation failed: {e}"),
                                         )));
-                                    }
+                                    },
                                 };
                                 let leftover = if payload_offset < rb.len() {
                                     rb[payload_offset..].to_vec()
@@ -134,15 +133,13 @@ impl<IO: AsyncRead + Unpin> AsyncRead for DeferredResponseReader<IO> {
                             } else {
                                 self.state = State::ReadingResponse(rb);
                             }
-                        }
+                        },
                     }
-                }
+                },
                 Action::DrainLeftover => {
                     let leftover = match std::mem::replace(
                         &mut self.state,
-                        State::Ready {
-                            leftover: Vec::new(),
-                        },
+                        State::Ready { leftover: Vec::new() },
                     ) {
                         State::Ready { leftover } => leftover,
                         _ => unreachable!(),
@@ -150,12 +147,10 @@ impl<IO: AsyncRead + Unpin> AsyncRead for DeferredResponseReader<IO> {
                     let n = leftover.len().min(buf.remaining());
                     buf.put_slice(&leftover[..n]);
                     if n < leftover.len() {
-                        self.state = State::Ready {
-                            leftover: leftover[n..].to_vec(),
-                        };
+                        self.state = State::Ready { leftover: leftover[n..].to_vec() };
                     }
                     return Poll::Ready(Ok(()));
-                }
+                },
             }
         }
     }
@@ -198,15 +193,21 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+    use super::*;
 
     #[tokio::test]
     async fn deferred_read_parses_101_on_first_read() {
         let (mut client_io, mut server_io) = duplex(8192);
 
         // 客户端先写请求（模拟 dial_over_io 已写完）
-        client_io.write_all(b"GET /ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n").await.unwrap();
+        client_io
+            .write_all(
+                b"GET /ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            )
+            .await
+            .unwrap();
         client_io.flush().await.unwrap();
 
         let mut reader = DeferredResponseReader::new(client_io);

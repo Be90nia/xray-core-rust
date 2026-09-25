@@ -5,28 +5,21 @@
 
 use std::sync::Arc;
 
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
-use xray_common::net::port::Port;
-use xray_mux::session::{ClientStrategy, SessionManager, TransferType};
-use xray_mux::frame::{FrameMetadata, SessionStatus};
-use xray_mux::client::{
-    ClientWorker, ClientManager, DialingWorkerFactory, Link, MUX_COOL_ADDRESS, WorkerPicker,
-};
-use xray_mux::worker::{Dispatcher, DispatchError, Server, ServerWorker};
 use xray_buf::io::Writer;
+use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
+use xray_mux::{
+    client::{
+        ClientManager, ClientWorker, DialingWorkerFactory, Link, MUX_COOL_ADDRESS, WorkerPicker,
+    },
+    frame::{FrameMetadata, SessionStatus},
+    session::{ClientStrategy, SessionManager, TransferType},
+    worker::{DispatchError, Dispatcher, Server, ServerWorker},
+};
 
 /// 回环 carrier 的测试 worker。
 fn loop_worker(strategy: ClientStrategy) -> Arc<ClientWorker> {
     let (r, w) = xray_buf::pipe::new();
-    ClientWorker::new(
-        Link {
-            reader: Box::new(r),
-            writer: Box::new(w),
-        },
-        strategy,
-    )
+    ClientWorker::new(Link { reader: Box::new(r), writer: Box::new(w) }, strategy)
 }
 
 /// 空底层 handler（dispatch 立即返回）。
@@ -36,6 +29,7 @@ impl xray_app_dispatcher::DispatchHandler for NopUnderlying {
     fn tag(&self) -> &str {
         "nop"
     }
+
     fn dispatch(
         &self,
         _dest: &Destination,
@@ -101,10 +95,7 @@ async fn test_session_manager_get_and_remove() {
 #[tokio::test]
 async fn test_session_manager_max_concurrency() {
     let mgr = Arc::new(SessionManager::new());
-    let strategy = ClientStrategy {
-        max_concurrency: 2,
-        max_connection: 0,
-    };
+    let strategy = ClientStrategy { max_concurrency: 2, max_connection: 0 };
 
     let s1 = mgr.allocate(&strategy).await;
     assert!(s1.is_some());
@@ -192,7 +183,9 @@ async fn test_server_worker_dispatch_fails_with_mock() {
     );
     let link_writer = Arc::new(tokio::sync::Mutex::new(None::<Box<dyn Writer>>));
     let meta = FrameMetadata::new_session(1, dest);
-    let result = worker.handle_normal_new(&meta, xray_buf::buffer::Buffer::with_capacity(0), &link_writer).await;
+    let result = worker
+        .handle_normal_new(&meta, xray_buf::buffer::Buffer::with_capacity(0), &link_writer)
+        .await;
     assert!(result.is_err());
 }
 
@@ -227,10 +220,7 @@ async fn test_client_worker_allocate_session() {
 
 #[tokio::test]
 async fn test_client_worker_max_concurrency() {
-    let strategy = ClientStrategy {
-        max_concurrency: 1,
-        max_connection: 0,
-    };
+    let strategy = ClientStrategy { max_concurrency: 1, max_connection: 0 };
     let worker = loop_worker(strategy);
     let s1 = worker.allocate_session().await;
     assert!(s1.is_some());
@@ -248,10 +238,7 @@ async fn test_client_worker_close() {
 
 #[tokio::test]
 async fn test_client_worker_is_full_with_max_connection() {
-    let strategy = ClientStrategy {
-        max_concurrency: 0,
-        max_connection: 1,
-    };
+    let strategy = ClientStrategy { max_concurrency: 0, max_connection: 1 };
     let worker = loop_worker(strategy);
     assert!(!worker.is_full());
     assert!(!worker.is_closing());
@@ -321,10 +308,8 @@ async fn test_session_close_signal() {
 async fn test_incremental_picker_empty_initially() {
     use xray_mux::client::{DialingWorkerFactory, IncrementalWorkerPicker};
 
-    let factory = Arc::new(DialingWorkerFactory::new(
-        Arc::new(NopUnderlying),
-        ClientStrategy::default(),
-    ));
+    let factory =
+        Arc::new(DialingWorkerFactory::new(Arc::new(NopUnderlying), ClientStrategy::default()));
     let picker = IncrementalWorkerPicker::new(factory);
     assert_eq!(picker.worker_count().await, 0);
 }
@@ -357,24 +342,17 @@ impl Dispatcher for SuccessDispatcher {
 /// - EOF 干净退出（Ok(false)）
 #[tokio::test]
 async fn test_e2e_multi_session_dispatch_via_process_frame() {
-    use xray_buf::io::new_reader;
-    use xray_buf::reader::BufferedReader;
+    use xray_buf::{io::new_reader, reader::BufferedReader};
     use xray_common::serial;
 
     let dests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let dispatcher = Arc::new(SuccessDispatcher { dests: dests.clone() });
     let worker = ServerWorker::new(dispatcher);
 
-    let dest1 = Destination::new(
-        Address::new_domain("a.com".to_string()),
-        Port::new(80),
-        Network::TCP,
-    );
-    let dest2 = Destination::new(
-        Address::new_domain("b.com".to_string()),
-        Port::new(80),
-        Network::TCP,
-    );
+    let dest1 =
+        Destination::new(Address::new_domain("a.com".to_string()), Port::new(80), Network::TCP);
+    let dest2 =
+        Destination::new(Address::new_domain("b.com".to_string()), Port::new(80), Network::TCP);
 
     // 构造字节流：session 1 New + data + End, session 2 New + data + End
     let mut bytes = Vec::new();
@@ -414,8 +392,7 @@ async fn test_e2e_multi_session_dispatch_via_process_frame() {
 /// 验证 process_frame 处理 Keep 帧：data 路由到已注册 session.output 不 panic。
 #[tokio::test]
 async fn test_e2e_keep_frame_routes_to_existing_session() {
-    use xray_buf::io::new_reader;
-    use xray_buf::reader::BufferedReader;
+    use xray_buf::{io::new_reader, reader::BufferedReader};
     use xray_common::bitmask::Bitmask;
     use xray_mux::frame::OPTION_DATA;
 
@@ -451,8 +428,7 @@ async fn test_e2e_keep_frame_routes_to_existing_session() {
 /// 验证空输入时 process_frame 干净返 Ok(false)。
 #[tokio::test]
 async fn test_e2e_process_frame_clean_eof() {
-    use xray_buf::io::new_reader;
-    use xray_buf::reader::BufferedReader;
+    use xray_buf::{io::new_reader, reader::BufferedReader};
 
     let dests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let dispatcher = Arc::new(SuccessDispatcher { dests });

@@ -2,8 +2,10 @@
 //!
 //! ## 实现
 //!
-//! - `tokio::net::TcpStream` → `xray_tls::client` TLS 握手 → `h2::client::handshake` → POST /dns-query。
-//! - DNS wire format 由 `hickory-proto` 处理，body 为裸 DNS message（无 2B 长度前缀，HTTP/2 自带 framing）。
+//! - `tokio::net::TcpStream` → `xray_tls::client` TLS 握手 → `h2::client::handshake` → POST
+//!   /dns-query。
+//! - DNS wire format 由 `hickory-proto` 处理，body 为裸 DNS message（无 2B 长度前缀，HTTP/2 自带
+//!   framing）。
 //! - RFC 8484：POST + Content-Type: application/dns-message。
 //! - 默认端口 443。
 //! - 自动接入 cache（实现 `CachedNameserver`）。
@@ -13,35 +15,37 @@
 //! - 走 Xray routing/dispatcher 出口（直接用 tokio socket + xray_tls + h2）
 //! - 长连接复用（每次查询都新 h2 连接；ponytail：连接池可后续加）
 
-use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    future::Future,
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
+use h2::{client, server};
 use hickory_proto::rr::RecordType;
-use h2::client;
-use h2::server;
-use http::header::CONTENT_TYPE;
-use http::{Method, Request, Response, StatusCode};
+use http::{Method, Request, Response, StatusCode, header::CONTENT_TYPE};
 use tokio::time::timeout;
 use tokio_rustls::rustls::ClientConfig;
-
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::port::Port;
+use xray_common::net::{address::Address, destination::Destination, port::Port};
 use xray_tls::utls::client as tls_client;
 use xray_transport::connection::TcpConnection;
 
-use crate::cache_controller::CacheController;
-use crate::config::IpOption;
-use crate::dnscommon::{
-    build_dns_query, parse_dns_response, parsed_to_ip_record, AtomicReqIdGen, IpRecord, ReqIdGen,
+use crate::{
+    cache_controller::CacheController,
+    config::IpOption,
+    dnscommon::{
+        AtomicReqIdGen, IpRecord, ReqIdGen, build_dns_query, parse_dns_response,
+        parsed_to_ip_record,
+    },
+    error::DnsError,
+    nameserver::{
+        NameServerConfig, Server,
+        cached::{CachedNameserver, QueryOutcome, query_ip},
+    },
 };
-use crate::error::DnsError;
-use crate::nameserver::cached::{query_ip, CachedNameserver, QueryOutcome};
-use crate::nameserver::{NameServerConfig, Server};
 
 /// DoH 响应最大字节数。
 const DOH_RECV_MAX: usize = 65535;
@@ -138,10 +142,19 @@ impl DohNameServer {
         ));
         cache.start_cleanup_task(crate::cache_controller::CLEANUP_INTERVAL);
         Ok(Box::new(Arc::new(
-            Self::new(dest, server_name, tls_config, cache, ns.client_ip.clone(), timeout_dur, false)
-                .force_local(ns.force_local),
+            Self::new(
+                dest,
+                server_name,
+                tls_config,
+                cache,
+                ns.client_ip.clone(),
+                timeout_dur,
+                false,
+            )
+            .force_local(ns.force_local),
         )))
     }
+
     /// h2c（明文 HTTP/2）构造。对应 Go `NewDoHNameServer(u, dispatcher, true, ...)`。
     pub fn from_config_h2c(ns: &NameServerConfig) -> Result<Box<dyn Server>, DnsError> {
         let dest = Destination::tcp(ns.address.clone(), Port::new(ns.port));
@@ -171,12 +184,9 @@ impl DohNameServer {
             .force_local(ns.force_local),
         )))
     }
+
     /// 发送单次 DNS 查询（DoH），等待响应。
-    async fn query_once(
-        &self,
-        fqdn: &str,
-        record_type: RecordType,
-    ) -> Result<IpRecord, DnsError> {
+    async fn query_once(&self, fqdn: &str, record_type: RecordType) -> Result<IpRecord, DnsError> {
         let req_id = self.id_gen.next_id();
         let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
 
@@ -197,17 +207,16 @@ impl DohNameServer {
                 .await
                 .map_err(|_| DnsError::WireFormat("doh h2c handshake timeout".to_string()))?
                 .map_err(|e| DnsError::WireFormat(format!("doh h2c handshake: {e}")))?;
-            (h2, Box::pin(async move {
-                let _ = conn.await;
-            }))
+            (
+                h2,
+                Box::pin(async move {
+                    let _ = conn.await;
+                }),
+            )
         } else {
             let tls_stream = timeout(
                 self.query_timeout,
-                tls_client(
-                    stream,
-                    &self.server_name,
-                    Arc::clone(&self.tls_config),
-                ),
+                tls_client(stream, &self.server_name, Arc::clone(&self.tls_config)),
             )
             .await
             .map_err(|_| DnsError::WireFormat("doh tls handshake timeout".to_string()))?
@@ -216,9 +225,12 @@ impl DohNameServer {
                 .await
                 .map_err(|_| DnsError::WireFormat("doh h2 handshake timeout".to_string()))?
                 .map_err(|e| DnsError::WireFormat(format!("doh h2 handshake: {e}")))?;
-            (h2, Box::pin(async move {
-                let _ = conn.await;
-            }))
+            (
+                h2,
+                Box::pin(async move {
+                    let _ = conn.await;
+                }),
+            )
         };
         tokio::spawn(h2_conn);
 
@@ -252,10 +264,7 @@ impl DohNameServer {
             .map_err(|e| DnsError::WireFormat(format!("doh response: {e}")))?;
 
         if response.status() != StatusCode::OK {
-            return Err(DnsError::WireFormat(format!(
-                "doh http status: {}",
-                response.status()
-            )));
+            return Err(DnsError::WireFormat(format!("doh http status: {}", response.status())));
         }
 
         // 读 body（DNS wire format，无长度前缀）。
@@ -264,7 +273,8 @@ impl DohNameServer {
         loop {
             match timeout(self.query_timeout, body.data()).await {
                 Ok(Some(chunk)) => {
-                    let chunk = chunk.map_err(|e| DnsError::WireFormat(format!("doh body: {e}")))?;
+                    let chunk =
+                        chunk.map_err(|e| DnsError::WireFormat(format!("doh body: {e}")))?;
                     buf.extend_from_slice(&chunk);
                     if buf.len() > DOH_RECV_MAX {
                         return Err(DnsError::WireFormat(format!(
@@ -272,13 +282,11 @@ impl DohNameServer {
                             buf.len()
                         )));
                     }
-                }
+                },
                 Ok(None) => break,
                 Err(_) => {
-                    return Err(DnsError::WireFormat(
-                        "doh body read timeout".to_string(),
-                    ));
-                }
+                    return Err(DnsError::WireFormat("doh body read timeout".to_string()));
+                },
             }
         }
 
@@ -355,15 +363,18 @@ pub fn new_doh_h2c_name_server(ns: &NameServerConfig) -> Result<Box<dyn Server>,
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
+    use hickory_proto::{
+        op::{Message, MessageType, OpCode, Query},
+        rr::{Name, RData, Record, RecordType},
+    };
+    use tokio::net::TcpListener;
+    use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
+    use xray_transport::connection::TcpConnection;
+
     use super::*;
     use crate::config::IpOption;
-    use hickory_proto::op::{Message, MessageType, OpCode, Query};
-    use hickory_proto::rr::{Name, RData, Record, RecordType};
-    use std::net::Ipv4Addr;
-    use tokio::net::TcpListener;
-    use tokio_rustls::rustls::ServerConfig;
-    use tokio_rustls::TlsAcceptor;
-    use xray_transport::connection::TcpConnection;
 
     fn ip_dest(addr: SocketAddr) -> Destination {
         Destination::tcp(Address::from(addr.ip()), Port::new(addr.port()))
@@ -372,7 +383,9 @@ mod tests {
     /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
     fn ensure_crypto_provider() {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| { let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default(); });
+        ONCE.call_once(|| {
+            let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        });
     }
 
     fn make_a_response(req_id: u16, fqdn: &str, ips: Vec<Ipv4Addr>, ttl: u32) -> Vec<u8> {
@@ -380,7 +393,8 @@ mod tests {
         let mut msg = Message::new(req_id, MessageType::Response, OpCode::Query);
         msg.add_query(Query::query(name.clone(), RecordType::A));
         for ip in ips {
-            let rec = Record::from_rdata(name.clone(), ttl, RData::A(hickory_proto::rr::rdata::A(ip)));
+            let rec =
+                Record::from_rdata(name.clone(), ttl, RData::A(hickory_proto::rr::rdata::A(ip)));
             msg.add_answer(rec);
         }
         msg.to_vec().unwrap()
@@ -391,15 +405,10 @@ mod tests {
         fqdn: &str,
         ips: Vec<Ipv4Addr>,
         ttl: u32,
-    ) -> (
-        SocketAddr,
-        Arc<ClientConfig>,
-        tokio::task::JoinHandle<()>,
-    ) {
+    ) -> (SocketAddr, Arc<ClientConfig>, tokio::task::JoinHandle<()>) {
         ensure_crypto_provider();
         // rcgen 自签证书（SAN: localhost）。
-        let cert_params =
-            rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         let key_pair = rcgen::KeyPair::generate().unwrap();
         let cert = cert_params.self_signed(&key_pair).unwrap();
         let cert_der = cert.der().to_vec();
@@ -410,9 +419,7 @@ mod tests {
         let server_config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(
-                vec![tokio_rustls::rustls::pki_types::CertificateDer::from(
-                    cert_der.clone(),
-                )],
+                vec![tokio_rustls::rustls::pki_types::CertificateDer::from(cert_der.clone())],
                 key,
             )
             .unwrap();
@@ -445,12 +452,8 @@ mod tests {
 
                 // 解析 query ID，构造响应。
                 let query_msg = Message::from_vec(&query_buf).unwrap();
-                let resp_payload = make_a_response(
-                    query_msg.metadata.id,
-                    &fqdn_owned,
-                    ips.clone(),
-                    ttl,
-                );
+                let resp_payload =
+                    make_a_response(query_msg.metadata.id, &fqdn_owned, ips.clone(), ttl);
 
                 // 发回 HTTP 200 + body。
                 let resp = Response::builder()
@@ -466,15 +469,9 @@ mod tests {
 
         // 信任自签证书的 client config。
         let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
-        root_store
-            .add(tokio_rustls::rustls::pki_types::CertificateDer::from(
-                cert_der,
-            ))
-            .unwrap();
+        root_store.add(tokio_rustls::rustls::pki_types::CertificateDer::from(cert_der)).unwrap();
         let client_config = Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
+            ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth(),
         );
 
         (addr, client_config, handle)
@@ -517,11 +514,7 @@ mod tests {
         let outcome = ns
             .send_query(
                 "z.com.",
-                IpOption {
-                    ipv4_enable: true,
-                    ipv6_enable: false,
-                    fake_enable: false,
-                },
+                IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },
             )
             .await;
         assert!(outcome.rec_v4.is_some());
@@ -532,8 +525,7 @@ mod tests {
     #[tokio::test]
     async fn doh_query_http_status_error() {
         ensure_crypto_provider();
-        let cert_params =
-            rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         let key_pair = rcgen::KeyPair::generate().unwrap();
         let cert = cert_params.self_signed(&key_pair).unwrap();
         let cert_der = cert.der().to_vec();
@@ -543,9 +535,7 @@ mod tests {
         let server_config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(
-                vec![tokio_rustls::rustls::pki_types::CertificateDer::from(
-                    cert_der.clone(),
-                )],
+                vec![tokio_rustls::rustls::pki_types::CertificateDer::from(cert_der.clone())],
                 key,
             )
             .unwrap();
@@ -565,25 +555,17 @@ mod tests {
                     Err(_) => break,
                 };
                 // 回 500 + empty body + end_of_stream。
-                let resp = Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(())
-                    .unwrap();
+                let resp =
+                    Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).body(()).unwrap();
                 let mut send = respond.send_response(resp, false).unwrap();
                 send.send_data(Bytes::new(), true).unwrap();
             }
         });
 
         let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
-        root_store
-            .add(tokio_rustls::rustls::pki_types::CertificateDer::from(
-                cert_der,
-            ))
-            .unwrap();
+        root_store.add(tokio_rustls::rustls::pki_types::CertificateDer::from(cert_der)).unwrap();
         let tls_config = Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
+            ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth(),
         );
 
         let ns = DohNameServer::new(
@@ -598,9 +580,6 @@ mod tests {
         let result = ns.query_once("bad.com.", RecordType::A).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("http status"),
-            "expected http status error, got: {err}"
-        );
+        assert!(err.to_string().contains("http status"), "expected http status error, got: {err}");
     }
 }

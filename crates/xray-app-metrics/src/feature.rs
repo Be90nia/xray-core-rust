@@ -4,8 +4,8 @@
 //!
 //! ## `Feature::start` 编排（对应 Go `MetricsHandler.Start`，metrics.go:87-123）
 //!
-//! 1. 若 `MetricsConfig::listen` 非空：`TokioHttpServer::start_http_listen` 绑端口
-//!    并 `tokio::spawn` accept loop，处理 `GET /metrics` 返回 Prometheus 文本。
+//! 1. 若 `MetricsConfig::listen` 非空：`TokioHttpServer::start_http_listen` 绑端口 并
+//!    `tokio::spawn` accept loop，处理 `GET /metrics` 返回 Prometheus 文本。
 //! 2. 创建 `Outbound`（`OutboundListener` + tag）并经 registrar add。
 //! 3. 幂等：第二次 `start` 仅返回 `Ok(())`，不重复 spawn。
 //!
@@ -16,23 +16,27 @@
 //!
 //! 默认情况下 `MetricsFeature` 内部持有：
 //! - [`TokioHttpServer`]：真实 HTTP server（已实现）。
-//! - `EmptyStats` collector：返回空 `StatsSnapshot`；HTTP body 仅含 `# HELP`/`# TYPE`
-//!   头，仍能 curl 到合法 Prometheus exposition format。
+//! - `EmptyStats` collector：返回空 `StatsSnapshot`；HTTP body 仅含 `# HELP`/`# TYPE` 头，仍能 curl
+//!   到合法 Prometheus exposition format。
 //! - `RecordingOutboundRegistrar`：仅记 tag。
 //!
 //! 上层可经 [`MetricsFeature::with_stats_collector`] / [`with_obs_collector`]
 //! 注入真实 stats/observability 收集器。
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use xray_features::Feature;
 
-use crate::config::MetricsConfig;
-use crate::error::MetricsError;
-use crate::metrics::{
-    MetricsHandler, ObservationCollector, RecordingOutboundRegistrar, StatsCollector,
-    TokioHttpServer,
+use crate::{
+    config::MetricsConfig,
+    error::MetricsError,
+    metrics::{
+        MetricsHandler, ObservationCollector, RecordingOutboundRegistrar, StatsCollector,
+        TokioHttpServer,
+    },
 };
 
 /// 空 StatsCollector：返回空快照；HTTP body 仍含 `# HELP`/`# TYPE`。
@@ -104,12 +108,12 @@ impl Feature for MetricsFeature {
         }
         let stats = self.stats.read().clone();
         let obs = self.obs.read().clone();
-        self.handler
-            .start(&self.http_server, stats, obs, self.registrar.as_ref())
-            .map_err(|e: MetricsError| xray_features::FeatureError::StartFailed {
+        self.handler.start(&self.http_server, stats, obs, self.registrar.as_ref()).map_err(
+            |e: MetricsError| xray_features::FeatureError::StartFailed {
                 name: "metrics",
                 message: format!("{e}"),
-            })
+            },
+        )
     }
 
     fn close(&self) -> xray_features::Result<()> {

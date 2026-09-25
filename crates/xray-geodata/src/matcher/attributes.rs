@@ -52,31 +52,19 @@ impl DomainAttribute {
     /// 创建仅有 key 的属性（无值）。
     #[must_use]
     pub fn new(key: impl Into<String>) -> Self {
-        Self {
-            key: key.into(),
-            bool_value: None,
-            int_value: None,
-        }
+        Self { key: key.into(), bool_value: None, int_value: None }
     }
 
     /// 创建带布尔值的属性。
     #[must_use]
     pub fn with_bool(key: impl Into<String>, value: bool) -> Self {
-        Self {
-            key: key.into(),
-            bool_value: Some(value),
-            int_value: None,
-        }
+        Self { key: key.into(), bool_value: Some(value), int_value: None }
     }
 
     /// 创建带整数值的属性。
     #[must_use]
     pub fn with_int(key: impl Into<String>, value: i64) -> Self {
-        Self {
-            key: key.into(),
-            bool_value: None,
-            int_value: Some(value),
-        }
+        Self { key: key.into(), bool_value: None, int_value: Some(value) }
     }
 }
 
@@ -110,14 +98,10 @@ pub trait AttributeMatcher: Send + Sync {
 /// # 示例
 ///
 /// ```
-/// use xray_geodata::matcher::attributes::{
-///     DomainAttribute, HasAttrMatcher, AttributeMatcher,
-/// };
+/// use xray_geodata::matcher::attributes::{AttributeMatcher, DomainAttribute, HasAttrMatcher};
 ///
-/// let attrs = vec![
-///     DomainAttribute::with_bool("tls", true),
-///     DomainAttribute::with_int("port", 443),
-/// ];
+/// let attrs =
+///     vec![DomainAttribute::with_bool("tls", true), DomainAttribute::with_int("port", 443)];
 ///
 /// let matcher = HasAttrMatcher::new("tls");
 /// assert!(matcher.match_domain(&attrs));
@@ -167,13 +151,11 @@ impl std::fmt::Display for HasAttrMatcher {
 ///
 /// ```
 /// use xray_geodata::matcher::attributes::{
-///     AllAttrsMatcher, HasAttrMatcher, DomainAttribute, AttributeMatcher,
+///     AllAttrsMatcher, AttributeMatcher, DomainAttribute, HasAttrMatcher,
 /// };
 ///
-/// let attrs = vec![
-///     DomainAttribute::with_bool("tls", true),
-///     DomainAttribute::with_int("port", 443),
-/// ];
+/// let attrs =
+///     vec![DomainAttribute::with_bool("tls", true), DomainAttribute::with_int("port", 443)];
 ///
 /// // 两个属性都有
 /// let matcher = AllAttrsMatcher::from_matchers(vec![
@@ -248,11 +230,8 @@ pub fn parse_attrs(attrs: &str) -> Option<AllAttrsMatcher> {
         return None;
     }
 
-    let matchers: Vec<HasAttrMatcher> = attrs
-        .split('@')
-        .filter(|s| !s.is_empty())
-        .map(|s| HasAttrMatcher::new(s))
-        .collect();
+    let matchers: Vec<HasAttrMatcher> =
+        attrs.split('@').filter(|s| !s.is_empty()).map(|s| HasAttrMatcher::new(s)).collect();
 
     if matchers.is_empty() {
         return None;
@@ -271,11 +250,7 @@ pub fn filter_by_attrs(
     matcher: Option<&AllAttrsMatcher>,
 ) -> Vec<(Vec<DomainAttribute>, String)> {
     match matcher {
-        Some(m) => domains
-            .iter()
-            .filter(|(attrs, _)| m.match_domain(attrs))
-            .cloned()
-            .collect(),
+        Some(m) => domains.iter().filter(|(attrs, _)| m.match_domain(attrs)).cloned().collect(),
         None => domains.to_vec(),
     }
 }
@@ -315,14 +290,8 @@ mod tests {
     #[test]
     fn test_domain_attribute_display() {
         assert_eq!(format!("{}", DomainAttribute::new("tls")), "tls");
-        assert_eq!(
-            format!("{}", DomainAttribute::with_bool("tls", true)),
-            "tls=true"
-        );
-        assert_eq!(
-            format!("{}", DomainAttribute::with_int("port", 443)),
-            "port=443"
-        );
+        assert_eq!(format!("{}", DomainAttribute::with_bool("tls", true)), "tls=true");
+        assert_eq!(format!("{}", DomainAttribute::with_int("port", 443)), "port=443");
     }
 
     #[test]
@@ -338,10 +307,8 @@ mod tests {
 
     #[test]
     fn test_has_attr_matcher_found() {
-        let attrs = vec![
-            DomainAttribute::with_bool("tls", true),
-            DomainAttribute::with_int("port", 443),
-        ];
+        let attrs =
+            vec![DomainAttribute::with_bool("tls", true), DomainAttribute::with_int("port", 443)];
         let matcher = HasAttrMatcher::new("tls");
         assert!(matcher.match_domain(&attrs));
     }
@@ -375,26 +342,22 @@ mod tests {
 
     #[test]
     fn test_all_attrs_matcher_all_present() {
-        let attrs = vec![
-            DomainAttribute::with_bool("tls", true),
-            DomainAttribute::with_int("port", 443),
-        ];
-        let matcher =
-            AllAttrsMatcher::from_matchers(vec![
-                HasAttrMatcher::new("tls"),
-                HasAttrMatcher::new("port"),
-            ]);
+        let attrs =
+            vec![DomainAttribute::with_bool("tls", true), DomainAttribute::with_int("port", 443)];
+        let matcher = AllAttrsMatcher::from_matchers(vec![
+            HasAttrMatcher::new("tls"),
+            HasAttrMatcher::new("port"),
+        ]);
         assert!(matcher.match_domain(&attrs));
     }
 
     #[test]
     fn test_all_attrs_matcher_partial_missing() {
         let attrs = vec![DomainAttribute::with_bool("tls", true)];
-        let matcher =
-            AllAttrsMatcher::from_matchers(vec![
-                HasAttrMatcher::new("tls"),
-                HasAttrMatcher::new("port"),
-            ]);
+        let matcher = AllAttrsMatcher::from_matchers(vec![
+            HasAttrMatcher::new("tls"),
+            HasAttrMatcher::new("port"),
+        ]);
         assert!(!matcher.match_domain(&attrs));
     }
 
@@ -474,9 +437,7 @@ mod tests {
             (vec![DomainAttribute::with_int("port", 80)], "b.com".to_string()),
             (vec![], "c.com".to_string()),
         ];
-        let matcher = AllAttrsMatcher::from_matchers(vec![
-            HasAttrMatcher::new("tls"),
-        ]);
+        let matcher = AllAttrsMatcher::from_matchers(vec![HasAttrMatcher::new("tls")]);
         let filtered = filter_by_attrs(&domains, Some(&matcher));
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].1, "a.com");

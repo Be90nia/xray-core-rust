@@ -3,21 +3,20 @@
 //! 对应 Go 版本 `common/protocol/` 包，定义安全类型、命令、ID 和请求/响应头。
 
 pub mod account;
+pub mod address_parser;
 pub mod http;
 pub mod server_spec;
 pub mod time;
 pub mod user;
-pub mod address_parser;
 
 use serde::{Deserialize, Serialize};
 
-use crate::bitmask::Bitmask;
-
-use crate::net::address::Address;
-use crate::net::destination::Destination;
-use crate::uuid::UUID;
-
 use self::user::MemoryUser;
+use crate::{
+    bitmask::Bitmask,
+    net::{address::Address, destination::Destination},
+    uuid::UUID,
+};
 
 /// 加密安全类型。
 ///
@@ -233,11 +232,7 @@ impl ID {
     #[must_use]
     pub fn new(uuid: UUID) -> Self {
         let cmd_key = uuid.cmd_key();
-        Self {
-            uuid,
-            cmd_key,
-            alter_ids: Vec::new(),
-        }
+        Self { uuid, cmd_key, alter_ids: Vec::new() }
     }
 
     /// 添加替代 ID。
@@ -299,7 +294,6 @@ pub mod request_option {
     pub const NO_TERMINATION_SIGNAL: u8 = 0x80;
 }
 
-
 // ========== 请求头 ==========
 
 /// 协议请求头。
@@ -330,14 +324,7 @@ impl RequestHeader {
         destination: Destination,
         security: SecurityType,
     ) -> Self {
-        Self {
-            version,
-            user: None,
-            command,
-            destination,
-            security,
-            option: Bitmask::default(),
-        }
+        Self { version, user: None, command, destination, security, option: Bitmask::default() }
     }
 
     /// 设置用户，返回新的 RequestHeader。
@@ -374,11 +361,7 @@ impl ResponseHeader {
     /// 创建新的响应头。
     #[must_use]
     pub fn new(command: Command) -> Self {
-        Self {
-            command,
-            option: Bitmask::default(),
-            response_command: ResponseCommand::None,
-        }
+        Self { command, option: Bitmask::default(), response_command: ResponseCommand::None }
     }
 
     /// 设置选项，返回新的 ResponseHeader。
@@ -398,10 +381,10 @@ impl ResponseHeader {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::net::address::Address;
-    use crate::net::port::Port;
     use std::net::Ipv4Addr;
+
+    use super::*;
+    use crate::net::{address::Address, port::Port};
 
     // ========== SecurityType 测试 ==========
     #[test]
@@ -427,7 +410,6 @@ mod tests {
             assert_eq!(st.as_u8(), value);
         }
     }
-
 
     #[test]
     fn test_security_type_display() {

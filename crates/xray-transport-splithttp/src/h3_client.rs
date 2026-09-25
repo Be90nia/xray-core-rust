@@ -18,12 +18,12 @@
 //!
 //! # 简化点（vs Go 原版）
 //!
-//! - **stream-one 等价于 stream-up**：H3 没有 REALITY 流量伪装需求（REALITY 强制 H2），
-//!   所以 stream-one 用两个独立 H3 stream 实现（POST 上传 + GET 下载），与 stream-up 同。
-//! - **不实现连接池**：QUIC 多路复用，一条连接开多个 RequestStream 已足够；
-//!   `SendRequest` 可 Clone，packet-up 多次 POST 复用同一 QUIC 连接。
-//! - **driver 后台驱动**：`h3::client::new` 返回的 `ConnectionDriver` 必须 poll，
-//!   spawn 后台 task 持续驱动。
+//! - **stream-one 等价于 stream-up**：H3 没有 REALITY 流量伪装需求（REALITY 强制 H2）， 所以
+//!   stream-one 用两个独立 H3 stream 实现（POST 上传 + GET 下载），与 stream-up 同。
+//! - **不实现连接池**：QUIC 多路复用，一条连接开多个 RequestStream 已足够； `SendRequest` 可
+//!   Clone，packet-up 多次 POST 复用同一 QUIC 连接。
+//! - **driver 后台驱动**：`h3::client::new` 返回的 `ConnectionDriver` 必须 poll， spawn 后台 task
+//!   持续驱动。
 //! - **watfaq-rustls 兼容**：quinn 用 rustls 0.23，与 watfaq patch 全兼容（API superset）。
 //!
 //! # 全双工限制
@@ -32,25 +32,32 @@
 //! 全双工需要单 task 内 `select!` 交替。本实现采用「先发完上传 body 再收响应」的简化
 //! 模式（对 splithttp 协议足够：客户端先 upload 完，server 才回 download）。
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    net::SocketAddr,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use bytes::{Buf, Bytes};
 use futures_util::{Future, Stream, StreamExt};
-use http::request::Request;
-use http::{Method, StatusCode};
+use http::{Method, StatusCode, request::Request};
 use rustls::ClientConfig as RustlsClientConfig;
-use std::pin::Pin;
-use tokio::io::AsyncRead as AsyncReadTrait;
-use tokio::sync::{mpsc, Mutex};
-use tokio_util::io::StreamReader;
+use tokio::{
+    io::AsyncRead as AsyncReadTrait,
+    sync::{Mutex, mpsc},
+};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::io::StreamReader;
 use tracing::debug;
 
-use crate::client::CloseSignal;
-use crate::config::{Config, RequestMeta};
-use crate::error::{Result, SplitHttpError};
+use crate::{
+    client::CloseSignal,
+    config::{Config, RequestMeta},
+    error::{Result, SplitHttpError},
+};
 
 /// h3 SendRequest 类型别名（h3-quinn 适配）。
 ///
@@ -65,24 +72,23 @@ pub type H3RequestStream = h3::client::RequestStream<h3_quinn::BidiStream<Bytes>
 /// Rust 侧 memory_settings 宽容解析故在此一并硬错）。
 ///
 /// 与 Go 逐条对齐：
-/// - `quicParams == None` → 兜底 `BbrProfile=standard`、congestion 空 → BBR
-///   （PR #5711：H3 默认 BBR）
+/// - `quicParams == None` → 兜底 `BbrProfile=standard`、congestion 空 → BBR （PR #5711：H3 默认
+///   BBR）
 /// - congestion 大小写不敏感（Go conf :245 ToLower）
 /// - `"reno"` → 不应用（Go 空 case 体，保留 quinn 默认 CUBIC）
 /// - `""`/`"bbr"` → BBR；未知 profile → Err（Go conf `"unknown bbr profile"` 硬错）
-/// - `"force-brutal"` → Brutal(brutalUp, brutalDisableLossCompensation)；up==0 → Err
-///   （Go conf `"force-brutal requires up"`）
+/// - `"force-brutal"` → Brutal(brutalUp, brutalDisableLossCompensation)；up==0 → Err （Go conf
+///   `"force-brutal requires up"`）
 /// - 带宽字符串无条件解析（Go conf :229-236 不论 congestion 取值），失败 → Err
-/// - `"brutal"` 通过 conf 白名单（:247）但 splithttp dialer switch 无此臂 → Go `panic`；
-///   未知值同 panic。Rust 生产路径安全化为 Err。
+/// - `"brutal"` 通过 conf 白名单（:247）但 splithttp dialer switch 无此臂 → Go `panic`； 未知值同
+///   panic。Rust 生产路径安全化为 Err。
 fn apply_splithttp_cc(
     slot: &xray_transport_quic::congestion_swappable::HysteriaCCSlot,
     quic_params: Option<&xray_transport::memory_settings::QuicParamsConfig>,
 ) -> Result<()> {
     use xray_transport_quic::congestion_swappable::{
-        apply_bbr, apply_brutal, parse_bandwidth_bps,
+        apply_bbr, apply_brutal, bbr::Profile, parse_bandwidth_bps,
     };
-    use xray_transport_quic::congestion_swappable::bbr::Profile;
 
     let Some(qp) = quic_params else {
         // Go dialer.go:161-164：quicParams 为 nil 时兜底 BbrProfile=standard，
@@ -107,23 +113,23 @@ fn apply_splithttp_cc(
         ));
     }
     match qp.congestion.to_ascii_lowercase().as_str() {
-        "reno" => {}
+        "reno" => {},
         "" | "bbr" => {
             let profile = Profile::parse(&qp.bbr_profile)
                 .map_err(|e| SplitHttpError::Hyper(format!("quicParams: {e}")))?;
             apply_bbr(slot, profile);
-        }
+        },
         "force-brutal" => {
             if brutal_up_bps == 0 {
                 return Err(SplitHttpError::Hyper("force-brutal requires up".to_string()));
             }
             apply_brutal(slot, brutal_up_bps, qp.brutal_disable_loss_compensation);
-        }
+        },
         other => {
             return Err(SplitHttpError::Hyper(format!(
                 "unknown congestion control: {other}, valid values: reno, bbr, brutal, force-brutal"
             )));
-        }
+        },
     }
     Ok(())
 }
@@ -148,8 +154,7 @@ impl Drop for H3Conn {
         // 缓冲堆积成 RSS 主泄漏（对齐 Go AfterFunc{conn.Context}→tr.Close()）。
         if !self.closed.load(Ordering::Relaxed) {
             self.closed.store(true, Ordering::Relaxed);
-            self.quinn_conn
-                .close(quinn::VarInt::from_u32(0), b"client conn dropped");
+            self.quinn_conn.close(quinn::VarInt::from_u32(0), b"client conn dropped");
         }
     }
 }
@@ -270,8 +275,7 @@ impl H3Conn {
     /// endpoint driver 与连接状态（约 MB 级缓冲）持续驻留（bd s12 泄漏根因之一）。
     pub fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
-        self.quinn_conn
-            .close(quinn::VarInt::from_u32(0), b"client conn dropped");
+        self.quinn_conn.close(quinn::VarInt::from_u32(0), b"client conn dropped");
     }
 
     fn mark_closed(&self) {
@@ -299,17 +303,11 @@ impl H3Conn {
             builder = builder.header(name, value);
         }
         if !meta.cookies.is_empty() {
-            let cookie_str = meta
-                .cookies
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join("; ");
+            let cookie_str =
+                meta.cookies.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("; ");
             builder = builder.header("Cookie", cookie_str);
         }
-        builder
-            .body(())
-            .map_err(|e| SplitHttpError::InvalidUrl(format!("body {e}")))
+        builder.body(()).map_err(|e| SplitHttpError::InvalidUrl(format!("body {e}")))
     }
 
     /// packet-up：单次 POST 等待 200，drain body。
@@ -322,9 +320,12 @@ impl H3Conn {
         seq_str: &str,
         payload: Vec<u8>,
     ) -> Result<()> {
-        let meta =
-            self.config
-                .build_packet_request_meta(base_uri, session_id, seq_str, payload.clone())?;
+        let meta = self.config.build_packet_request_meta(
+            base_uri,
+            session_id,
+            seq_str,
+            payload.clone(),
+        )?;
         let req = Self::build_h3_request(&meta)?;
 
         let mut send_req = self.send_req.lock().await;
@@ -338,10 +339,7 @@ impl H3Conn {
             .send_data(Bytes::from(payload))
             .await
             .map_err(|e| SplitHttpError::Hyper(format!("h3 send_data: {e}")))?;
-        stream
-            .finish()
-            .await
-            .map_err(|e| SplitHttpError::Hyper(format!("h3 finish: {e}")))?;
+        stream.finish().await.map_err(|e| SplitHttpError::Hyper(format!("h3 finish: {e}")))?;
 
         let resp = stream
             .recv_response()
@@ -372,9 +370,7 @@ impl H3Conn {
         body: Option<Vec<u8>>,
         close: Option<CloseSignal>,
     ) -> Result<(Box<dyn AsyncReadTrait + Send + Unpin>, SocketAddr, SocketAddr)> {
-        let meta = self
-            .config
-            .build_stream_request_meta(base_uri, session_id, body.clone())?;
+        let meta = self.config.build_stream_request_meta(base_uri, session_id, body.clone())?;
         let req = Self::build_h3_request(&meta)?;
 
         let mut send_req = self.send_req.lock().await;
@@ -390,10 +386,7 @@ impl H3Conn {
                 .await
                 .map_err(|e| SplitHttpError::Hyper(format!("h3 send_data: {e}")))?;
         }
-        stream
-            .finish()
-            .await
-            .map_err(|e| SplitHttpError::Hyper(format!("h3 finish: {e}")))?;
+        stream.finish().await.map_err(|e| SplitHttpError::Hyper(format!("h3 finish: {e}")))?;
 
         let (remote, local) = self.addrs();
         if body.is_none() {
@@ -426,26 +419,21 @@ impl H3Conn {
     /// 对应 `DefaultDialerClient::open_stream_uploading`。
     ///
     /// - `upload_only = true` → POST 完即弃，返 None（stream-up）
-    /// - `upload_only = false` → 额外开 GET 下载流（stream-one；H3 下与 stream-up 等价，
-    ///   因 H3 无 REALITY 流量伪装需求）
+    /// - `upload_only = false` → 额外开 GET 下载流（stream-one；H3 下与 stream-up 等价， 因 H3 无
+    ///   REALITY 流量伪装需求）
     pub async fn open_stream_uploading<S>(
         self: &Arc<Self>,
         base_uri: &str,
         session_id: &str,
         body_stream: S,
         upload_only: bool,
-    ) -> Result<(
-        Option<Box<dyn AsyncReadTrait + Send + Unpin>>,
-        SocketAddr,
-        SocketAddr,
-    )>
+    ) -> Result<(Option<Box<dyn AsyncReadTrait + Send + Unpin>>, SocketAddr, SocketAddr)>
     where
         S: Stream<Item = std::io::Result<Bytes>> + Send + 'static,
     {
         // 1. POST streaming body
         let post_meta =
-            self.config
-                .build_stream_request_meta(base_uri, session_id, Some(Vec::new()))?;
+            self.config.build_stream_request_meta(base_uri, session_id, Some(Vec::new()))?;
         let post_req = Self::build_h3_request(&post_meta)?;
         let mut send_req = self.send_req.lock().await;
         let mut upload_stream = send_req.send_request(post_req).await.map_err(|e| {
@@ -478,25 +466,25 @@ impl H3Conn {
                             }
                             return;
                         }
-                    }
+                    },
                     Err(_) => {
                         if let Some(c) = me_for_closed.upgrade() {
                             c.mark_closed();
                         }
                         return;
-                    }
+                    },
                 }
             }
             let _ = upload_stream.finish().await;
             // 响应头校验（对齐 DefaultDialerClient：非 200 → mark_closed + EOF）
             match upload_stream.recv_response().await {
-                Ok(resp) if resp.status() == StatusCode::OK => {}
+                Ok(resp) if resp.status() == StatusCode::OK => {},
                 Ok(_) => {
                     if let Some(c) = me_for_closed.upgrade() {
                         c.mark_closed();
                     }
                     return;
-                }
+                },
                 Err(e) => {
                     if let Some(c) = me_for_closed.upgrade() {
                         c.mark_closed();
@@ -505,7 +493,7 @@ impl H3Conn {
                         .send(Err(std::io::Error::other(format!("h3 recv_response: {e}"))))
                         .await;
                     return;
-                }
+                },
             }
             if upload_only {
                 // stream-up：drain 响应（h3 协议要求收完否则连接异常）
@@ -526,8 +514,9 @@ impl H3Conn {
         if upload_only {
             return Ok((None, remote, local));
         }
-        let reader: Box<dyn AsyncReadTrait + Send + Unpin> =
-            Box::new(tokio_util::io::StreamReader::new(tokio_stream::wrappers::ReceiverStream::new(data_rx)));
+        let reader: Box<dyn AsyncReadTrait + Send + Unpin> = Box::new(
+            tokio_util::io::StreamReader::new(tokio_stream::wrappers::ReceiverStream::new(data_rx)),
+        );
         Ok((Some(reader), remote, local))
     }
 }
@@ -542,7 +531,9 @@ impl H3Conn {
 ///
 /// 必须用 channel 是因为 h3 `RequestStream` 的 `send_data`/`recv_data` 都需 `&mut self`，
 /// 不能拆分到两个 task（spawn 单向接收任务 + 主任务发送是安全的）。
-fn spawn_h3_recv_reader<S, B>(mut stream: h3::client::RequestStream<S, B>) -> Box<dyn AsyncReadTrait + Send + Unpin>
+fn spawn_h3_recv_reader<S, B>(
+    mut stream: h3::client::RequestStream<S, B>,
+) -> Box<dyn AsyncReadTrait + Send + Unpin>
 where
     h3::client::RequestStream<S, B>: Send,
     S: h3::quic::RecvStream + 'static,
@@ -558,17 +549,14 @@ where
                     if tx.send(Ok(bytes)).await.is_err() {
                         return; // 接收端 drop，结束
                     }
-                }
+                },
                 Ok(None) => return,
                 Err(e) => {
                     let _ = tx
-                        .send(Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            e.to_string(),
-                        )))
+                        .send(Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))
                         .await;
                     return;
-                }
+                },
             }
         }
     });
@@ -656,11 +644,15 @@ mod tests {
     // H3 端到端测试在 tests/mock_h3_server.rs 集成测试覆盖（mock h3::server）。
     // 单元测试需要真实网络 + QUIC + TLS，留集成测试。
 
-    use super::apply_splithttp_cc;
     use xray_transport_quic::congestion_swappable::HysteriaCCSlot;
 
+    use super::apply_splithttp_cc;
+
     /// 从 finalmask.quicParams JSON 形态解析 QuicParamsConfig（走生产同款解析）。
-    fn qp_from_json(congestion: &str, extra: &str) -> xray_transport::memory_settings::QuicParamsConfig {
+    fn qp_from_json(
+        congestion: &str,
+        extra: &str,
+    ) -> xray_transport::memory_settings::QuicParamsConfig {
         let body = format!(r#"{{"congestion":"{congestion}"{extra}}}"#);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         xray_transport::memory_settings::parse_quic_params_config(Some(&v))
@@ -702,7 +694,10 @@ mod tests {
     #[test]
     fn splithttp_cc_force_brutal_installs_brutal() {
         let slot = HysteriaCCSlot::new();
-        let qp = qp_from_json("force-brutal", r#","brutalUp":"1 mbps","brutalDisableLossCompensation":true"#);
+        let qp = qp_from_json(
+            "force-brutal",
+            r#","brutalUp":"1 mbps","brutalDisableLossCompensation":true"#,
+        );
         apply_splithttp_cc(&slot, Some(&qp)).unwrap();
         assert!(slot.has_active());
         assert_eq!(slot.current_window(), 10_240, "Brutal floor without RTT samples");
@@ -746,7 +741,9 @@ mod tests {
     /// Go conf :229-243：带宽字符串解析失败硬错（Up/Down 都验，不论 congestion 取值）。
     #[test]
     fn splithttp_cc_bad_bandwidth_rejected() {
-        for (congestion, extra) in [("bbr", r#","brutalUp":"abc""#), ("bbr", r#","brutalDown":"abc""#)] {
+        for (congestion, extra) in
+            [("bbr", r#","brutalUp":"abc""#), ("bbr", r#","brutalDown":"abc""#)]
+        {
             let slot = HysteriaCCSlot::new();
             let qp = qp_from_json(congestion, extra);
             assert!(apply_splithttp_cc(&slot, Some(&qp)).is_err(), "{extra}");
@@ -790,13 +787,9 @@ mod tests {
         tc.stream_receive_window(quinn::VarInt::from_u64(qp.init_stream_receive_window).unwrap());
         tc.receive_window(quinn::VarInt::from_u64(qp.init_connection_receive_window).unwrap());
         tc.max_idle_timeout(Some(
-            std::time::Duration::from_secs(qp.max_idle_timeout as u64)
-                .try_into()
-                .unwrap(),
+            std::time::Duration::from_secs(qp.max_idle_timeout as u64).try_into().unwrap(),
         ));
-        tc.keep_alive_interval(Some(std::time::Duration::from_secs(
-            qp.keep_alive_period as u64,
-        )));
+        tc.keep_alive_interval(Some(std::time::Duration::from_secs(qp.keep_alive_period as u64)));
         // VarInt 边界：2^62 - 1 应通过；2^63 应失败。
         let max_v = quinn::VarInt::from_u64((1u64 << 62) - 1);
         assert!(max_v.is_ok(), "max VarInt must succeed");

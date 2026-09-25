@@ -10,13 +10,13 @@
 //! Go 版操作 `buf.Buffer.UDP` 元数据（逐包原子）；Rust 的 link 语义是 XUDP
 //! 字节流（bd b2e 约定），故此处解析帧边界做改写，跨读/写的半帧累积在 `pending`。
 
-use std::future::Future;
-use std::pin::Pin;
-use xray_buf::io::{Reader, Result as IoResult, Writer};
-use xray_buf::multi::MultiBuffer;
-use xray_common::net::address::Address;
-use xray_common::net::destination::Destination;
-use xray_common::net::network::Network;
+use std::{future::Future, pin::Pin};
+
+use xray_buf::{
+    io::{Reader, Result as IoResult, Writer},
+    multi::MultiBuffer,
+};
+use xray_common::net::{address::Address, destination::Destination, network::Network};
 use xray_xudp::packet::FrameMetadata;
 
 /// 改写 `buf` 前缀所有完整 XUDP 帧：目标地址 == `from` 的帧改写为 `to`
@@ -48,10 +48,8 @@ fn rewrite_complete_frames(buf: &[u8], from: &Address, to: &Address) -> (Vec<u8>
         let frame_end = consumed + if meta.has_data() { 2 + data_len } else { 0 };
 
         // 改写命中的帧目标；未命中/无目标帧原样拷贝（Go override.go 只改写相等地址）
-        let rewritten = meta
-            .target()
-            .filter(|t| t.network() == Network::UDP && t.address() == from)
-            .map(|t| {
+        let rewritten =
+            meta.target().filter(|t| t.network() == Network::UDP && t.address() == from).map(|t| {
                 let mut m = meta.clone();
                 m.set_target(Destination::udp(to.clone(), t.port()));
                 m
@@ -88,7 +86,9 @@ impl EndpointOverrideReader {
 }
 
 impl Reader for EndpointOverrideReader {
-    fn read_multi_buffer(&mut self) -> Pin<Box<dyn Future<Output = IoResult<MultiBuffer>> + Send + '_>> {
+    fn read_multi_buffer(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = IoResult<MultiBuffer>> + Send + '_>> {
         Box::pin(async move {
             loop {
                 let mb = self.inner.read_multi_buffer().await?;
@@ -137,7 +137,10 @@ impl EndpointOverrideWriter {
 }
 
 impl Writer for EndpointOverrideWriter {
-    fn write_multi_buffer(&mut self, mb: MultiBuffer) -> Pin<Box<dyn Future<Output = IoResult<()>> + Send + '_>> {
+    fn write_multi_buffer(
+        &mut self,
+        mb: MultiBuffer,
+    ) -> Pin<Box<dyn Future<Output = IoResult<()>> + Send + '_>> {
         Box::pin(async move {
             // 逐 buffer extend：mb.to_vec() 会先堆分配扁平 Vec 再拷一次
             for b in mb.iter() {
@@ -161,11 +164,12 @@ impl Writer for EndpointOverrideWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tokio::io::AsyncWriteExt;
     use xray_buf::io::new_reader;
     use xray_common::net::port::Port;
     use xray_xudp::packet::{PacketReader, PacketWriter};
+
+    use super::*;
 
     fn addr_v4(octets: [u8; 4]) -> Address {
         Address::from_ipv4_bytes(octets)
@@ -243,19 +247,17 @@ mod tests {
         up_w.write_all(&frame[..half]).await.unwrap();
         up_w.write_all(&frame[half..]).await.unwrap();
 
-        let mb = tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_multi_buffer())
-            .await
-            .expect("timeout")
-            .expect("read ok");
+        let mb =
+            tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_multi_buffer())
+                .await
+                .expect("timeout")
+                .expect("read ok");
         let out = mb.to_vec();
 
         let mut pr = PacketReader::new(std::io::Cursor::new(&out[..]));
         let p1 = pr.read_packet().unwrap().expect("frame 1");
         assert_eq!(p1.data(), b"first-payload");
-        assert_eq!(
-            p1.udp_target().unwrap().address().as_domain(),
-            Some("sniffed.example.com")
-        );
+        assert_eq!(p1.udp_target().unwrap().address().as_domain(), Some("sniffed.example.com"));
     }
 
     #[tokio::test]
@@ -272,13 +274,11 @@ mod tests {
         writer.write_multi_buffer(mb).await.unwrap();
 
         let mut raw_reader = Box::new(dn_r) as Box<dyn Reader>;
-        let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            raw_reader.read_multi_buffer(),
-        )
-        .await
-        .expect("timeout")
-        .expect("read ok");
+        let resp =
+            tokio::time::timeout(std::time::Duration::from_secs(5), raw_reader.read_multi_buffer())
+                .await
+                .expect("timeout")
+                .expect("read ok");
 
         let resp_bytes = resp.to_vec();
         let mut pr = PacketReader::new(std::io::Cursor::new(&resp_bytes[..]));
@@ -291,12 +291,10 @@ mod tests {
 
         // shutdown 传播：读端应收到 EOF（pipe 约定：Err(Error::Eof)）
         writer.shutdown();
-        let eof = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            raw_reader.read_multi_buffer(),
-        )
-        .await
-        .expect("timeout");
+        let eof =
+            tokio::time::timeout(std::time::Duration::from_secs(5), raw_reader.read_multi_buffer())
+                .await
+                .expect("timeout");
         assert!(
             matches!(eof, Err(xray_buf::io::Error::Eof)),
             "reader should see EOF after shutdown, got: {eof:?}"

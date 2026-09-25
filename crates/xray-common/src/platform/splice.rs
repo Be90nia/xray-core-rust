@@ -37,8 +37,7 @@ pub fn platform_supported() -> bool {
 /// 泵，故 `==1` 全称量词已蕴含 ≠3。
 #[must_use]
 pub fn signals_allow_splice(inbound_can: i32, outbounds_can: &[i32]) -> bool {
-    inbound_can == CAN_SPLICE_COPY_YES
-        && outbounds_can.iter().all(|&c| c == CAN_SPLICE_COPY_YES)
+    inbound_can == CAN_SPLICE_COPY_YES && outbounds_can.iter().all(|&c| c == CAN_SPLICE_COPY_YES)
 }
 
 /// 总闸门（Go freedom.go:428 + proxy.go:722-751 的前置条件并集）。
@@ -50,8 +49,8 @@ pub fn splice_allowed(inbound_can: i32, outbounds_can: &[i32]) -> bool {
 ///
 /// Go `CopyRawConnIfExist`（proxy.go:718-751）的准入核心：
 /// - CanSpliceCopy：inbound == 1 且 outbound == 1（0/2/3 均回退，proxy.go:746-750）；
-/// - 双端 raw TCP（freedom.go:428 `IsRAWTransportWithoutSecurity(conn)` +
-///   `inbound.Conn != nil`，freedom.go:433-435）。
+/// - 双端 raw TCP（freedom.go:428 `IsRAWTransportWithoutSecurity(conn)` + `inbound.Conn !=
+///   nil`，freedom.go:433-435）。
 #[must_use]
 pub fn splice_raw_gate(
     inbound_can: i32,
@@ -74,7 +73,9 @@ pub fn bridge_splice_admission(
     inbound_raw: bool,
     outbound_raw: bool,
 ) -> bool {
-    platform_supported() && use_splice() && splice_raw_gate(inbound_can, outbound_can, inbound_raw, outbound_raw)
+    platform_supported()
+        && use_splice()
+        && splice_raw_gate(inbound_can, outbound_can, inbound_raw, outbound_raw)
 }
 
 #[cfg(test)]

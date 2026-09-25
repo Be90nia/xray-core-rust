@@ -10,8 +10,10 @@
 
 use std::io::Read;
 
-use crate::config::Config;
-use crate::error::{ConfError, Result};
+use crate::{
+    config::Config,
+    error::{ConfError, Result},
+};
 
 /// 从 reader 解析 JSON 配置（默认容忍 // 和 /* */ 注释）。
 ///
@@ -19,7 +21,9 @@ use crate::error::{ConfError, Result};
 /// 按严格 RFC 8259 解析（对应 Go `platform.UseStrictJSON`）。
 pub fn decode_json(reader: impl Read) -> Result<Config> {
     let mut buf = String::new();
-    reader.take(64 * 1024 * 1024).read_to_string(&mut buf)
+    reader
+        .take(64 * 1024 * 1024)
+        .read_to_string(&mut buf)
         .map_err(|e| ConfError::Read(format!("read JSON: {e}")))?;
     decode_json_from_str(&buf)
 }
@@ -29,7 +33,9 @@ pub fn decode_json(reader: impl Read) -> Result<Config> {
 /// 用于远程源（HTTP）等机器生成、不应含注释的场景。
 pub fn decode_json_strict(reader: impl Read) -> Result<Config> {
     let mut buf = String::new();
-    reader.take(64 * 1024 * 1024).read_to_string(&mut buf)
+    reader
+        .take(64 * 1024 * 1024)
+        .read_to_string(&mut buf)
         .map_err(|e| ConfError::Read(format!("read JSON: {e}")))?;
     serde_json::from_str(&buf).map_err(|e| ConfError::from_json("json", e))
 }
@@ -45,7 +51,8 @@ pub fn decode_json_from_str(s: &str) -> Result<Config> {
 
 /// 从字节切片解析 JSON 配置（容忍注释，strict env 可关）。
 pub fn decode_json_from_slice(s: &[u8]) -> Result<Config> {
-    let s = std::str::from_utf8(s).map_err(|e| ConfError::ParseSimple { format: "json", message: format!("UTF-8: {e}") })?;
+    let s = std::str::from_utf8(s)
+        .map_err(|e| ConfError::ParseSimple { format: "json", message: format!("UTF-8: {e}") })?;
     decode_json_from_str(s)
 }
 
@@ -67,7 +74,9 @@ fn strip_json_comments(input: &str) -> String {
                 i += 2;
                 continue;
             }
-            if c == '"' { in_string = false; }
+            if c == '"' {
+                in_string = false;
+            }
             i += 1;
             continue;
         }
@@ -82,15 +91,21 @@ fn strip_json_comments(input: &str) -> String {
         if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
             // 跳到行尾
             i += 2;
-            while i < chars.len() && chars[i] != '\n' { i += 1; }
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
             continue;
         }
         // 块注释 /* */
         if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
             i += 2;
-            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') { i += 1; }
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
             i += 2; // skip */
-            if i > chars.len() { i = chars.len(); }
+            if i > chars.len() {
+                i = chars.len();
+            }
             continue;
         }
         out.push(c);
@@ -109,10 +124,7 @@ mod tests {
         let cfg = decode_json_from_str(json).unwrap();
         assert_eq!(cfg.inbound_count(), 1);
         assert_eq!(cfg.inbound_configs[0].tag, "in");
-        assert_eq!(
-            cfg.inbound_configs[0].port.as_ref().unwrap().0,
-            vec![PortRange::single(443)]
-        );
+        assert_eq!(cfg.inbound_configs[0].port.as_ref().unwrap().0, vec![PortRange::single(443)]);
     }
 
     #[test]
@@ -123,7 +135,7 @@ mod tests {
             ConfError::Parse { format, line, .. } => {
                 assert_eq!(format, "json");
                 assert!(line >= 1);
-            }
+            },
             other => panic!("expected Parse, got {other:?}"),
         }
     }

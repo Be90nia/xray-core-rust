@@ -50,7 +50,7 @@ fn decode_char(c: u8) -> io::Result<u32> {
                 io::ErrorKind::InvalidData,
                 format!("invalid base32 char: {c:#x}"),
             ));
-        }
+        },
     };
     Ok(v)
 }

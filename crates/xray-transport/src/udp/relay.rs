@@ -10,22 +10,25 @@
 //!
 //! 设计：
 //! - 每个 `UdpRelay` 绑定一次入站连接（连接级生命周期）。
-//! - `send_to(dest, payload, resp_tx)` 懒创建连接到 `dest` 的 UDP socket，并 spawn
-//!   reader + idle timer task。
-//! - 每 session 维护 `last_refresh` 时间戳（Go `CancelAfterInactivity` 等价，默认
-//!   60s）；reader 收到包 / `send_to` 重发均刷新；timer task 滑动检查超时后中止
-//!   reader 并从 map 移除该项（防 socket 泄漏）。
+//! - `send_to(dest, payload, resp_tx)` 懒创建连接到 `dest` 的 UDP socket，并 spawn reader + idle
+//!   timer task。
+//! - 每 session 维护 `last_refresh` 时间戳（Go `CancelAfterInactivity` 等价，默认 60s）；reader
+//!   收到包 / `send_to` 重发均刷新；timer task 滑动检查超时后中止 reader 并从 map 移除该项（防
+//!   socket 泄漏）。
 //! - 连接结束时调用 [`UdpRelay::close`] 中止所有 reader / timer task。
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, Weak},
+    time::{Duration, Instant},
+};
 
-use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, mpsc};
-use tokio::task::JoinHandle;
-
+use tokio::{
+    net::UdpSocket,
+    sync::{Mutex, mpsc},
+    task::JoinHandle,
+};
 
 /// UDP 接收缓冲（单包最大 64 KiB）。
 const RECV_BUF: usize = 65_535;
@@ -111,15 +114,8 @@ impl UdpRelay {
                     self.idle_timeout,
                     Arc::clone(&last_refresh),
                 );
-                sessions.insert(
-                    dest,
-                    Session {
-                        sock: Arc::clone(&sock),
-                        reader,
-                        timer,
-                        last_refresh,
-                    },
-                );
+                sessions
+                    .insert(dest, Session { sock: Arc::clone(&sock), reader, timer, last_refresh });
                 sock
             }
         };
@@ -158,11 +154,11 @@ impl UdpRelay {
 
 /// 每个 socket 的回包 reader + 空闲计时器。
 ///
-/// - reader: `recv → channel`，socket 出错 / 被 abort 时退出；每次成功 recv 刷新
-///   `last_refresh` 时间戳。
+/// - reader: `recv → channel`，socket 出错 / 被 abort 时退出；每次成功 recv 刷新 `last_refresh`
+///   时间戳。
 /// - timer: 滑动 idle 检查——睡到「上次刷新 + idle_timeout」，醒来后复查时间戳，
-///   有新刷新则继续睡；真超时后回收：升级 `Weak<UdpRelay>` 移除本 session 并
-///   `abort()` reader 让其本地 `Arc<UdpSocket>` 立即 drop（关闭 socket）。
+///   有新刷新则继续睡；真超时后回收：升级 `Weak<UdpRelay>` 移除本 session 并 `abort()` reader
+///   让其本地 `Arc<UdpSocket>` 立即 drop（关闭 socket）。
 ///
 /// ponytail: 纯时间戳排序，无唤醒通道——刷新写入先于 timer 判定读取即生效；
 /// 判定读取之后到达的刷新存在微秒级误杀窗口（Go timer.Stop 同类 race），实测无害。
@@ -189,7 +185,7 @@ fn spawn_session(
                     if resp_tx.send((dest, buf[..n].to_vec())).is_err() {
                         break; // 调用方已停止接收
                     }
-                }
+                },
             }
         }
     });
@@ -211,9 +207,7 @@ fn spawn_session(
             // 仅当 entry 仍是本 session 的 sock 时才回收——防 close→新建同名
             // dest 后被旧 timer 误删（移除前 ptr 比对）。
             let entry = match sessions.get(&dest) {
-                Some(entry) if Arc::ptr_eq(&entry.sock, &sock_for_timer) => {
-                    sessions.remove(&dest)
-                }
+                Some(entry) if Arc::ptr_eq(&entry.sock, &sock_for_timer) => sessions.remove(&dest),
                 _ => None,
             };
             drop(sessions);
@@ -228,10 +222,11 @@ fn spawn_session(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use tokio::net::UdpSocket;
+
+    use super::*;
 
     /// 端到端：UdpRelay.send_to 把数据报投递到目标 UDP echo，回包经 channel 回来。
     #[tokio::test]
@@ -245,7 +240,7 @@ mod tests {
                 match echo.recv_from(&mut buf).await {
                     Ok((n, peer)) => {
                         let _ = echo.send_to(&buf[..n], peer).await;
-                    }
+                    },
                     Err(_) => break,
                 }
             }
@@ -253,10 +248,7 @@ mod tests {
 
         let relay = UdpRelay::new();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        relay
-            .send_to(echo_addr, b"ping", tx)
-            .await
-            .expect("send_to");
+        relay.send_to(echo_addr, b"ping", tx).await.expect("send_to");
 
         let (src, data) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
@@ -284,7 +276,7 @@ mod tests {
                 match echo.recv_from(&mut buf).await {
                     Ok((n, peer)) => {
                         let _ = echo.send_to(&buf[..n], peer).await;
-                    }
+                    },
                     Err(_) => break,
                 }
             }
@@ -292,10 +284,7 @@ mod tests {
 
         let relay = UdpRelay::with_idle_timeout(Duration::from_millis(200));
         let (tx, mut rx) = mpsc::unbounded_channel();
-        relay
-            .send_to(echo_addr, b"ping", tx)
-            .await
-            .expect("send_to");
+        relay.send_to(echo_addr, b"ping", tx).await.expect("send_to");
 
         let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
@@ -306,11 +295,7 @@ mod tests {
         // 等 idle 超时（200ms）+ 裕量（timer 1s polling + map lock + abort）
         tokio::time::sleep(Duration::from_millis(800)).await;
 
-        assert_eq!(
-            relay.len().await,
-            0,
-            "idle session should be evicted after timeout"
-        );
+        assert_eq!(relay.len().await, 0, "idle session should be evicted after timeout");
 
         echo_running.store(false, Ordering::Relaxed);
     }
@@ -328,7 +313,7 @@ mod tests {
                 match echo.recv_from(&mut buf).await {
                     Ok((n, peer)) => {
                         let _ = echo.send_to(&buf[..n], peer).await;
-                    }
+                    },
                     Err(_) => break,
                 }
             }
@@ -337,10 +322,7 @@ mod tests {
         // 200ms 超时，每 100ms 发包 → 持续刷新活动
         let relay = UdpRelay::with_idle_timeout(Duration::from_millis(200));
         let (tx, mut rx) = mpsc::unbounded_channel();
-        relay
-            .send_to(echo_addr, b"ping", tx.clone())
-            .await
-            .expect("send_to");
+        relay.send_to(echo_addr, b"ping", tx.clone()).await.expect("send_to");
 
         for i in 0..5 {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -349,11 +331,7 @@ mod tests {
                 .await
                 .expect("send_to keepalive");
             let _ = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
-            assert_eq!(
-                relay.len().await,
-                1,
-                "active session must not be evicted (round {i})"
-            );
+            assert_eq!(relay.len().await, 1, "active session must not be evicted (round {i})");
         }
 
         // 停发 → 等超时 → 被淘汰

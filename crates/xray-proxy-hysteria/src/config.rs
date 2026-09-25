@@ -6,21 +6,23 @@
 //!
 //! 入站配置 [`HysteriaInboundConfig`] 对应 Go `proxy/hysteria/server.go` 的 ServerConfig。
 
-use std::sync::Arc;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::Mutex;
 use prost::Message as _;
-use xray_proto::xray::common::protocol::{ServerEndpoint, User as ProtoUser};
-use xray_proto::xray::common::serial::TypedMessage;
-use xray_proto::xray::proxy::hysteria::{
-    ClientConfig as ProtoClientConfig, ServerConfig as ProtoServerConfig,
+use xray_proto::xray::{
+    common::{
+        protocol::{ServerEndpoint, User as ProtoUser},
+        serial::TypedMessage,
+    },
+    proxy::hysteria::{
+        ClientConfig as ProtoClientConfig, ServerConfig as ProtoServerConfig,
+        account::Account as ProtoHysteriaAccount,
+    },
 };
-use xray_proto::xray::proxy::hysteria::account::Account as ProtoHysteriaAccount;
-use xray_transport_hysteria::hub::AuthValidator;
-use xray_transport_hysteria::quic_params::default_hysteria_quic_params;
+use xray_transport_hysteria::{hub::AuthValidator, quic_params::default_hysteria_quic_params};
 
-use crate::error::{Result, HysteriaProxyError};
+use crate::error::{HysteriaProxyError, Result};
 
 /// Hysteria 代理配置（客户端出站）。
 #[derive(Debug, Clone)]
@@ -52,7 +54,6 @@ pub struct HysteriaConfig {
 impl HysteriaConfig {
     /// 默认 ALPN（与 Go hysteria 一致）。
     pub const DEFAULT_ALPN: &'static [&'static str] = &["hysteria", "h3"];
-
     /// UDP 空闲超时默认值（与 Go init() 一致）。
     pub const DEFAULT_UDP_IDLE_TIMEOUT: u64 = 60;
 
@@ -81,7 +82,6 @@ impl HysteriaConfig {
         self.masq = Some(masq);
         self
     }
-
 
     /// 设置 TLS SNI（不设则用 server_addr 的 host 部分）。
     #[must_use]
@@ -127,7 +127,10 @@ impl HysteriaConfig {
 
     /// 设置 QUIC 参数（`finalmask.quicParams` 解析产物）。
     #[must_use]
-    pub fn with_quic_params(mut self, p: xray_proto::xray::transport::internet::QuicParams) -> Self {
+    pub fn with_quic_params(
+        mut self,
+        p: xray_proto::xray::transport::internet::QuicParams,
+    ) -> Self {
         self.quic_params = Arc::new(p);
         self
     }
@@ -215,11 +218,7 @@ impl HysteriaUser {
     /// 构造用户（level=0）。
     #[must_use]
     pub fn new(email: impl Into<String>, auth: impl Into<String>) -> Self {
-        Self {
-            email: email.into(),
-            auth: auth.into(),
-            level: 0,
-        }
+        Self { email: email.into(), auth: auth.into(), level: 0 }
     }
 
     /// 设置用户等级。
@@ -228,7 +227,6 @@ impl HysteriaUser {
         self.level = level;
         self
     }
-
 
     /// 从 proto `protocol.User` 构造：account `TypedMessage` 解码为
     /// `hysteria.account.Account{auth}`，对应 Go `User.ToMemoryUser()`
@@ -293,7 +291,8 @@ pub const HYSTERIA_ACCOUNT_TYPE_URL: &str =
 /// type_url 后缀匹配用（from 方向接受任意前缀写法）。
 const HYSTERIA_ACCOUNT_TYPE_URL_SUFFIX: &str = "xray.proxy.hysteria.account.Account";
 
-/// Hysteria 客户端配置（proto 镜像），对应 proto `ClientConfig{server}`（v26.7.28 移除 `version`）。
+/// Hysteria 客户端配置（proto 镜像），对应 proto `ClientConfig{server}`（v26.7.28 移除
+/// `version`）。
 ///
 /// Go `client.go:31-46`：`server` 缺失即 `no target server found`，端点经
 /// `NewServerSpecFromPB` 转 ServerSpec。`version` 字段已被 Go 上游删除。
@@ -331,14 +330,10 @@ impl ServerConfig {
     ///
     /// # Errors
     /// 任一用户 account 无效 → [`HysteriaProxyError::InvalidConfig`]
-    ///（对应 Go server.go:33-35 `failed to get hysteria user` AtError）。
+    /// （对应 Go server.go:33-35 `failed to get hysteria user` AtError）。
     pub fn from_proto(p: ProtoServerConfig) -> Result<Self> {
         Ok(Self {
-            users: p
-                .users
-                .iter()
-                .map(HysteriaUser::from_proto_user)
-                .collect::<Result<_>>()?,
+            users: p.users.iter().map(HysteriaUser::from_proto_user).collect::<Result<_>>()?,
         })
     }
 
@@ -422,7 +417,8 @@ impl HysteriaInboundConfig {
             }
             if !seen.insert(&user.email) {
                 return Err(HysteriaProxyError::InvalidConfig(format!(
-                    "duplicate user email: {}", user.email
+                    "duplicate user email: {}",
+                    user.email
                 )));
             }
         }
@@ -469,7 +465,8 @@ impl MultiUserValidator {
         if !user.email.is_empty() {
             if emails.contains(&user.email) {
                 return Err(HysteriaProxyError::InvalidConfig(format!(
-                    "user {} already exists", user.email
+                    "user {} already exists",
+                    user.email
                 )));
             }
             emails.insert(user.email.clone());
@@ -488,15 +485,12 @@ impl MultiUserValidator {
         }
         let mut emails = self.emails.lock();
         if !emails.remove(email) {
-            return Err(HysteriaProxyError::InvalidConfig(format!(
-                "user {email} not found"
-            )));
+            return Err(HysteriaProxyError::InvalidConfig(format!("user {email} not found")));
         }
         let mut users = self.users.lock();
         // 找到对应 auth 删除
-        let key_to_remove = users
-            .iter()
-            .find_map(|(k, v)| if v == email { Some(k.clone()) } else { None });
+        let key_to_remove =
+            users.iter().find_map(|(k, v)| if v == email { Some(k.clone()) } else { None });
         if let Some(k) = key_to_remove {
             users.remove(&k);
         }
@@ -533,7 +527,6 @@ impl AuthValidator for MultiUserValidator {
         Self::count(self)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -618,7 +611,8 @@ mod tests {
         assert_eq!(cfg.obfs.as_deref(), Some("salamander-key"));
     }
 
-    // ===== from_proto/to_proto（bd v5g：对齐 Go client.go/server.go + infra/conf/hysteria.go） =====
+    // ===== from_proto/to_proto（bd v5g：对齐 Go client.go/server.go + infra/conf/hysteria.go）
+    // =====
 
     #[test]
     fn hysteria_user_proto_roundtrip_all_fields() {

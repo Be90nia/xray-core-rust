@@ -2,8 +2,9 @@
 //!
 //! 对应 Go 版本 `common/reflect` 包，提供带类型信息的 JSON 序列化/反序列化功能。
 
-use crate::serial::TypedMessage;
 use serde_json::Value;
+
+use crate::serial::TypedMessage;
 
 /// 反射错误类型
 #[derive(Debug, thiserror::Error)]
@@ -59,9 +60,7 @@ pub fn unmarshal_from_json<T: serde::de::DeserializeOwned>(json: &str) -> Result
 /// 如果消息体不是有效的 JSON，则将其包装为包含原始字节的 JSON 对象。
 pub fn typed_message_to_json_value(msg: &TypedMessage) -> Result<Value, ReflectError> {
     if msg.type_url.is_empty() {
-        return Err(ReflectError::InvalidTypeUrl(
-            "type URL must not be empty".into(),
-        ));
+        return Err(ReflectError::InvalidTypeUrl("type URL must not be empty".into()));
     }
 
     // 尝试将消息体解析为 JSON
@@ -75,7 +74,7 @@ pub fn typed_message_to_json_value(msg: &TypedMessage) -> Result<Value, ReflectE
                 serde_json::json!({
                     "value": msg.value,
                 })
-            }
+            },
         }
     };
 
@@ -120,10 +119,7 @@ mod tests {
 
     #[test]
     fn test_marshal_to_json() {
-        let data = TestStruct {
-            name: "test".into(),
-            value: 42,
-        };
+        let data = TestStruct { name: "test".into(), value: 42 };
         let json = marshal_to_json(&data).expect("marshal should succeed");
         assert!(json.contains("\"name\""));
         assert!(json.contains("\"test\""));
@@ -133,10 +129,7 @@ mod tests {
 
     #[test]
     fn test_marshal_to_json_pretty() {
-        let data = TestStruct {
-            name: "test".into(),
-            value: 42,
-        };
+        let data = TestStruct { name: "test".into(), value: 42 };
         let json = marshal_to_json_pretty(&data).expect("marshal should succeed");
         assert!(json.contains('\n'));
     }
@@ -158,10 +151,7 @@ mod tests {
 
     #[test]
     fn test_marshal_unmarshal_roundtrip() {
-        let original = TestStruct {
-            name: "roundtrip".into(),
-            value: 123,
-        };
+        let original = TestStruct { name: "roundtrip".into(), value: 123 };
         let json = marshal_to_json(&original).expect("marshal should succeed");
         let restored: TestStruct = unmarshal_from_json(&json).expect("unmarshal should succeed");
         assert_eq!(original, restored);
@@ -169,10 +159,8 @@ mod tests {
 
     #[test]
     fn test_typed_message_to_json_value_with_json_body() {
-        let msg = TypedMessage::new(
-            "type.googleapis.com/xray.Test",
-            br#"{"field":"hello"}"#.to_vec(),
-        );
+        let msg =
+            TypedMessage::new("type.googleapis.com/xray.Test", br#"{"field":"hello"}"#.to_vec());
         let value = typed_message_to_json_value(&msg).expect("should succeed");
         assert_eq!(value["@type"], "type.googleapis.com/xray.Test");
         assert_eq!(value["field"], "hello");
@@ -180,10 +168,7 @@ mod tests {
 
     #[test]
     fn test_typed_message_to_json_value_with_non_json_body() {
-        let msg = TypedMessage::new(
-            "type.googleapis.com/xray.Test",
-            vec![0x01, 0x02, 0x03],
-        );
+        let msg = TypedMessage::new("type.googleapis.com/xray.Test", vec![0x01, 0x02, 0x03]);
         let value = typed_message_to_json_value(&msg).expect("should succeed");
         assert_eq!(value["@type"], "type.googleapis.com/xray.Test");
         // 非 JSON 消息体应包含 value 字段
@@ -207,10 +192,8 @@ mod tests {
 
     #[test]
     fn test_marshal_typed_message_to_json() {
-        let msg = TypedMessage::new(
-            "type.googleapis.com/xray.Test",
-            br#"{"field":"hello"}"#.to_vec(),
-        );
+        let msg =
+            TypedMessage::new("type.googleapis.com/xray.Test", br#"{"field":"hello"}"#.to_vec());
         let json = marshal_typed_message_to_json(&msg).expect("should succeed");
         assert!(json.contains("@type"));
         assert!(json.contains("type.googleapis.com/xray.Test"));
@@ -222,10 +205,7 @@ mod tests {
             "@type": "type.googleapis.com/xray.Test",
             "field": "hello"
         });
-        assert_eq!(
-            extract_type_url(&value),
-            Some("type.googleapis.com/xray.Test")
-        );
+        assert_eq!(extract_type_url(&value), Some("type.googleapis.com/xray.Test"));
     }
 
     #[test]

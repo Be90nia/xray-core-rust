@@ -2,12 +2,14 @@
 //!
 //! 对应 Go 版本 `common/crypto/chunk.go`，提供分块大小编解码和流式读写。
 
-use crate::authenticator::Authenticator;
-use crate::aead::CryptoError;
-use xray_buf::io::{self, Writer};
-use xray_buf::buffer::Buffer;
-use xray_buf::reader::BufferedReader;
-use xray_buf::multi::MultiBuffer;
+use xray_buf::{
+    buffer::Buffer,
+    io::{self, Writer},
+    multi::MultiBuffer,
+    reader::BufferedReader,
+};
+
+use crate::{aead::CryptoError, authenticator::Authenticator};
 
 // ========== ChunkSizeDecoder ==========
 
@@ -66,9 +68,7 @@ impl ChunkSizeDecoder for PlainChunkSizeParser {
 
     fn decode(&self, b: &[u8]) -> Result<u16, CryptoError> {
         if b.len() < 2 {
-            return Err(CryptoError::EncryptionError(
-                "insufficient bytes for chunk size".into(),
-            ));
+            return Err(CryptoError::EncryptionError("insufficient bytes for chunk size".into()));
         }
         Ok(u16::from_be_bytes([b[0], b[1]]))
     }
@@ -112,9 +112,7 @@ impl ChunkSizeDecoder for AEADChunkSizeParser {
     fn decode(&self, b: &[u8]) -> Result<u16, CryptoError> {
         let decrypted = self.auth.open(&mut [], b)?;
         if decrypted.len() < 2 {
-            return Err(CryptoError::EncryptionError(
-                "decrypted chunk size too short".into(),
-            ));
+            return Err(CryptoError::EncryptionError("decrypted chunk size too short".into()));
         }
         let size = u16::from_be_bytes([decrypted[0], decrypted[1]]);
         Ok(size + self.auth.overhead() as u16)
@@ -150,10 +148,7 @@ pub struct ChunkStreamReader<'a> {
 }
 
 impl<'a> ChunkStreamReader<'a> {
-    pub fn new(
-        size_decoder: Box<dyn ChunkSizeDecoder>,
-        reader: &'a mut BufferedReader,
-    ) -> Self {
+    pub fn new(size_decoder: Box<dyn ChunkSizeDecoder>, reader: &'a mut BufferedReader) -> Self {
         Self::with_chunk_count(size_decoder, reader, 0)
     }
 
@@ -176,9 +171,7 @@ impl<'a> ChunkStreamReader<'a> {
     async fn read_size(&mut self) -> Result<u16, CryptoError> {
         let n = self.reader.read(&mut self.size_buffer).await;
         if n < self.size_buffer.len() {
-            return Err(CryptoError::EncryptionError(
-                "insufficient bytes for chunk size".into(),
-            ));
+            return Err(CryptoError::EncryptionError("insufficient bytes for chunk size".into()));
         }
         self.size_decoder.decode(&self.size_buffer)
     }
@@ -215,10 +208,7 @@ pub struct ChunkStreamWriter<'a> {
 }
 
 impl<'a> ChunkStreamWriter<'a> {
-    pub fn new(
-        size_encoder: Box<dyn ChunkSizeEncoder>,
-        writer: &'a mut dyn Writer,
-    ) -> Self {
+    pub fn new(size_encoder: Box<dyn ChunkSizeEncoder>, writer: &'a mut dyn Writer) -> Self {
         Self { size_encoder, writer }
     }
 
@@ -253,8 +243,13 @@ impl<'a> ChunkStreamWriter<'a> {
 pub struct NoPadding;
 
 impl PaddingLengthGenerator for NoPadding {
-    fn max_padding_len(&self) -> u16 { 0 }
-    fn next_padding_len(&self) -> u16 { 0 }
+    fn max_padding_len(&self) -> u16 {
+        0
+    }
+
+    fn next_padding_len(&self) -> u16 {
+        0
+    }
 }
 
 // ========== ShufflePadding ==========
@@ -270,19 +265,24 @@ impl ShufflePadding {
 }
 
 impl PaddingLengthGenerator for ShufflePadding {
-    fn max_padding_len(&self) -> u16 { self.max_padding_len }
+    fn max_padding_len(&self) -> u16 {
+        self.max_padding_len
+    }
+
     fn next_padding_len(&self) -> u16 {
-        if self.max_padding_len == 0 { return 0; }
+        if self.max_padding_len == 0 {
+            return 0;
+        }
         crate::rand_between(0, self.max_padding_len as i64) as u16
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::authenticator::{
-        generate_aead_nonce_with_size, generate_static_bytes, AEADAuthenticator,
+    use crate::{
+        aead::Aes128Gcm,
+        authenticator::{AEADAuthenticator, generate_aead_nonce_with_size, generate_static_bytes},
     };
-    use crate::aead::Aes128Gcm;
 
     #[test]
     fn test_plain_chunk_size_parser_size_bytes() {
@@ -319,21 +319,18 @@ mod tests {
 
     fn make_aead_parser() -> AEADChunkSizeParser {
         let cipher = Aes128Gcm::new(&[0u8; 16]).unwrap();
-        let auth: Box<dyn Authenticator> = Box::new(AEADAuthenticator::new(
-            cipher, generate_static_bytes(vec![0u8; 12]), None,
-        ));
+        let auth: Box<dyn Authenticator> =
+            Box::new(AEADAuthenticator::new(cipher, generate_static_bytes(vec![0u8; 12]), None));
         AEADChunkSizeParser::new(auth)
     }
 
     fn make_aead_parser_pair() -> (AEADChunkSizeParser, AEADChunkSizeParser) {
         let c1 = Aes128Gcm::new(&[0u8; 16]).unwrap();
-        let a1: Box<dyn Authenticator> = Box::new(AEADAuthenticator::new(
-            c1, generate_static_bytes(vec![0u8; 12]), None,
-        ));
+        let a1: Box<dyn Authenticator> =
+            Box::new(AEADAuthenticator::new(c1, generate_static_bytes(vec![0u8; 12]), None));
         let c2 = Aes128Gcm::new(&[0u8; 16]).unwrap();
-        let a2: Box<dyn Authenticator> = Box::new(AEADAuthenticator::new(
-            c2, generate_static_bytes(vec![0u8; 12]), None,
-        ));
+        let a2: Box<dyn Authenticator> =
+            Box::new(AEADAuthenticator::new(c2, generate_static_bytes(vec![0u8; 12]), None));
         (AEADChunkSizeParser::new(a1), AEADChunkSizeParser::new(a2))
     }
 
@@ -358,14 +355,12 @@ mod tests {
     #[test]
     fn test_aead_chunk_size_encode_decode_multiple() {
         let c1 = Aes128Gcm::new(&[0u8; 16]).unwrap();
-        let a1: Box<dyn Authenticator> = Box::new(AEADAuthenticator::new(
-            c1, generate_aead_nonce_with_size(12), None,
-        ));
+        let a1: Box<dyn Authenticator> =
+            Box::new(AEADAuthenticator::new(c1, generate_aead_nonce_with_size(12), None));
         let encoder = AEADChunkSizeParser::new(a1);
         let c2 = Aes128Gcm::new(&[0u8; 16]).unwrap();
-        let a2: Box<dyn Authenticator> = Box::new(AEADAuthenticator::new(
-            c2, generate_aead_nonce_with_size(12), None,
-        ));
+        let a2: Box<dyn Authenticator> =
+            Box::new(AEADAuthenticator::new(c2, generate_aead_nonce_with_size(12), None));
         let decoder = AEADChunkSizeParser::new(a2);
         let sb = ChunkSizeEncoder::size_bytes(&encoder) as usize;
         for payload in [0u16, 1, 100, 8192] {

@@ -12,30 +12,40 @@
 //! - 走 Xray routing/dispatcher 出口（直接用 quinn）
 //! - 长连接/endpoint 复用（每次查询都新 endpoint+connection；ponytail：可后续加池化）
 
-use std::future::Future;
-use std::io;
-use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    future::Future,
+    io,
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use hickory_proto::rr::RecordType;
-use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{ClientConfig as QuinnClientConfig, Endpoint, ServerConfig as QuinnServerConfig};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::timeout;
+use quinn::{
+    ClientConfig as QuinnClientConfig, Endpoint, ServerConfig as QuinnServerConfig,
+    crypto::rustls::{QuicClientConfig, QuicServerConfig},
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    time::timeout,
+};
 use tokio_rustls::rustls::ClientConfig;
-
 use xray_common::net::address::Address;
 
-use crate::cache_controller::CacheController;
-use crate::config::IpOption;
-use crate::dnscommon::{
-    build_dns_query, parse_dns_response, parsed_to_ip_record, AtomicReqIdGen, IpRecord, ReqIdGen,
+use crate::{
+    cache_controller::CacheController,
+    config::IpOption,
+    dnscommon::{
+        AtomicReqIdGen, IpRecord, ReqIdGen, build_dns_query, parse_dns_response,
+        parsed_to_ip_record,
+    },
+    error::DnsError,
+    nameserver::{
+        NameServerConfig, Server,
+        cached::{CachedNameserver, QueryOutcome, query_ip},
+    },
 };
-use crate::error::DnsError;
-use crate::nameserver::cached::{query_ip, CachedNameserver, QueryOutcome};
-use crate::nameserver::{NameServerConfig, Server};
 
 /// DoQ 单次响应最大字节数。
 const DOQ_RECV_MAX: usize = 65535;
@@ -93,7 +103,7 @@ impl DoqNameServer {
                 return Err(DnsError::WireFormat(format!(
                     "doq nameserver requires IP address, got: {other:?}"
                 )));
-            }
+            },
         };
         let timeout_dur = if ns.timeout_ms > 0 {
             Duration::from_millis(u64::from(ns.timeout_ms))
@@ -129,13 +139,9 @@ impl DoqNameServer {
 
     /// 创建 quinn client endpoint，bind 地址匹配 target 的 IP 族。
     fn make_client_endpoint(&self) -> Result<Endpoint, DnsError> {
-        let bind_addr: SocketAddr = if self.addr.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        }
-        .parse()
-        .map_err(|e| DnsError::WireFormat(format!("parse bind addr: {e}")))?;
+        let bind_addr: SocketAddr = if self.addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }
+            .parse()
+            .map_err(|e| DnsError::WireFormat(format!("parse bind addr: {e}")))?;
 
         let mut endpoint = Endpoint::client(bind_addr)
             .map_err(|e| DnsError::WireFormat(format!("quinn endpoint: {e}")))?;
@@ -143,11 +149,7 @@ impl DoqNameServer {
         Ok(endpoint)
     }
 
-    async fn query_once(
-        &self,
-        fqdn: &str,
-        record_type: RecordType,
-    ) -> Result<IpRecord, DnsError> {
+    async fn query_once(&self, fqdn: &str, record_type: RecordType) -> Result<IpRecord, DnsError> {
         let req_id = self.id_gen.next_id();
         let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
 
@@ -164,10 +166,7 @@ impl DoqNameServer {
         let conn = timeout(self.query_timeout, connect_fut)
             .await
             .map_err(|_| {
-                DnsError::WireFormat(format!(
-                    "doq connect timeout after {:?}",
-                    self.query_timeout
-                ))
+                DnsError::WireFormat(format!("doq connect timeout after {:?}", self.query_timeout))
             })?
             .map_err(|e| DnsError::WireFormat(format!("doq connect: {e}")))?;
 
@@ -184,8 +183,7 @@ impl DoqNameServer {
         send.write_all(&payload)
             .await
             .map_err(|e| DnsError::WireFormat(format!("doq write payload: {e}")))?;
-        send.finish()
-            .map_err(|e| DnsError::WireFormat(format!("doq finish send: {e}")))?;
+        send.finish().map_err(|e| DnsError::WireFormat(format!("doq finish send: {e}")))?;
 
         // 读 2 字节长度前缀。
         let mut len_buf = [0u8; 2];
@@ -195,9 +193,7 @@ impl DoqNameServer {
             .map_err(|e| DnsError::WireFormat(format!("doq read len: {e:?}")))?;
         let resp_len = usize::from(u16::from_be_bytes(len_buf));
         if resp_len == 0 || resp_len > DOQ_RECV_MAX {
-            return Err(DnsError::WireFormat(format!(
-                "invalid doq response length: {resp_len}"
-            )));
+            return Err(DnsError::WireFormat(format!("invalid doq response length: {resp_len}")));
         }
 
         // 读响应 payload。
@@ -271,17 +267,23 @@ pub fn new_quic_name_server(
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
+    use hickory_proto::{
+        op::{Message, MessageType, OpCode, Query},
+        rr::{Name, RData, Record, RecordType},
+    };
+    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
     use super::*;
     use crate::config::IpOption;
-    use hickory_proto::op::{Message, MessageType, OpCode, Query};
-    use hickory_proto::rr::{Name, RData, Record, RecordType};
-    use std::net::Ipv4Addr;
-    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
     /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
     fn ensure_crypto_provider() {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| { let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default(); });
+        ONCE.call_once(|| {
+            let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        });
     }
 
     fn make_a_response(req_id: u16, fqdn: &str, ips: Vec<Ipv4Addr>, ttl: u32) -> Vec<u8> {
@@ -289,11 +291,8 @@ mod tests {
         let mut msg = Message::new(req_id, MessageType::Response, OpCode::Query);
         msg.add_query(Query::query(name.clone(), RecordType::A));
         for ip in ips {
-            let rec = Record::from_rdata(
-                name.clone(),
-                ttl,
-                RData::A(hickory_proto::rr::rdata::A(ip)),
-            );
+            let rec =
+                Record::from_rdata(name.clone(), ttl, RData::A(hickory_proto::rr::rdata::A(ip)));
             msg.add_answer(rec);
         }
         msg.to_vec().unwrap()
@@ -304,15 +303,10 @@ mod tests {
         fqdn: &str,
         ips: Vec<Ipv4Addr>,
         ttl: u32,
-    ) -> (
-        SocketAddr,
-        Arc<ClientConfig>,
-        tokio::task::JoinHandle<()>,
-    ) {
+    ) -> (SocketAddr, Arc<ClientConfig>, tokio::task::JoinHandle<()>) {
         ensure_crypto_provider();
         // rcgen 自签证书（SAN: localhost）。
-        let cert_params =
-            rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         let key_pair = rcgen::KeyPair::generate().unwrap();
         let cert = cert_params.self_signed(&key_pair).unwrap();
         let cert_der = cert.der().to_vec();
@@ -327,8 +321,7 @@ mod tests {
         server_config.alpn_protocols = vec![DOQ_ALPN.to_vec()];
 
         let quic_server_config = QuicServerConfig::try_from(Arc::new(server_config)).unwrap();
-        let quinn_server_config =
-            QuinnServerConfig::with_crypto(Arc::new(quic_server_config));
+        let quinn_server_config = QuinnServerConfig::with_crypto(Arc::new(quic_server_config));
 
         let endpoint =
             Endpoint::server(quinn_server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
@@ -347,10 +340,14 @@ mod tests {
                 };
 
                 let mut len_buf = [0u8; 2];
-                if recv.read_exact(&mut len_buf).await.is_err() { return; }
+                if recv.read_exact(&mut len_buf).await.is_err() {
+                    return;
+                }
                 let plen = usize::from(u16::from_be_bytes(len_buf));
                 let mut buf = vec![0u8; plen];
-                if recv.read_exact(&mut buf).await.is_err() { return; }
+                if recv.read_exact(&mut buf).await.is_err() {
+                    return;
+                }
 
                 let query_msg = Message::from_vec(&buf).unwrap();
                 let resp = make_a_response(query_msg.metadata.id, &fqdn_owned, ips.clone(), ttl);
@@ -367,13 +364,9 @@ mod tests {
 
         // 信任自签证书的 client config。
         let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
-        root_store
-            .add(CertificateDer::from(cert_der))
-            .unwrap();
+        root_store.add(CertificateDer::from(cert_der)).unwrap();
         let client_config = Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
+            ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth(),
         );
 
         (addr, client_config, handle)
@@ -414,11 +407,7 @@ mod tests {
         let outcome = ns
             .send_query(
                 "z.com.",
-                IpOption {
-                    ipv4_enable: true,
-                    ipv6_enable: false,
-                    fake_enable: false,
-                },
+                IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },
             )
             .await;
         assert!(outcome.rec_v4.is_some());
@@ -433,17 +422,14 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let cert_params =
-            rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         let key_pair = rcgen::KeyPair::generate().unwrap();
         let cert = cert_params.self_signed(&key_pair).unwrap();
         let cert_der = cert.der().to_vec();
         let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
         root_store.add(CertificateDer::from(cert_der)).unwrap();
         let tls_config = Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
+            ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth(),
         );
 
         let ns = DoqNameServer::new(
@@ -457,11 +443,7 @@ mod tests {
         let outcome = ns
             .send_query(
                 "bad.com.",
-                IpOption {
-                    ipv4_enable: true,
-                    ipv6_enable: false,
-                    fake_enable: false,
-                },
+                IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },
             )
             .await;
         assert!(outcome.rec_v4.is_none());

@@ -10,8 +10,10 @@ use std::sync::Arc;
 
 use rand::seq::IndexedRandom;
 
-use crate::balancing::{BalancingStrategy, OutboundHandlerSelector};
-use crate::error::RouterError;
+use crate::{
+    balancing::{BalancingStrategy, OutboundHandlerSelector},
+    error::RouterError,
+};
 
 /// 随机负载均衡策略。
 pub struct RandomStrategy {
