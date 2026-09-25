@@ -7,6 +7,7 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -91,3 +92,30 @@ jobs:
       - run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  # Fuzz smoke（cargo-fuzz）：仅在手动触发时运行，不阻塞主干 PR。
+  # 每靶 30s 冒烟：发现 crash 即失败；不做 OOM/depth 调优。
+  fuzz:
+    name: Fuzz Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            fuzz
+      - name: Build fuzzers
+        working-directory: fuzz
+        run: cargo fuzz build --sanitizer address
+      - name: Smoke run (30s per target)
+        working-directory: fuzz
+        run: |
+          for t in kcp_segment ss2022_packet vless_inbound; do
+            echo "=== $t ==="
+            cargo fuzz run "$t" -- -max_total_time=30 -rss_limit_mb=4096 -max_len=8192
+          done

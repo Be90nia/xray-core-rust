@@ -214,8 +214,11 @@ impl From<io::Error> for MuxError {
 /// 域名超长（>255，u8 len 前缀装不下）报错——修复前 addr_buf(32B) 会
 /// 静默截断域名，写出 len 与数据不符的坏帧（bd n43f desync 根源）。
 fn write_target_to_vec(buf: &mut Vec<u8>, target: &Destination) -> Result<(), MuxError> {
+    // Go 写帧直接编码 network string（无 panic 路径）；Unix 目标在 Rust 侧
+    // 无法编码为线格式单字节，显式拒绝而非 panic（远程可达：Unix 入站目标
+    // 经 mux 转发即触发）。
     let net = TargetNetwork::from_network(target.network())
-        .expect("target network must be TCP or UDP for mux frames");
+        .ok_or_else(|| MuxError::Io(format!("unsupported mux target network: {:?}", target.network())))?;
     buf.push(net.to_byte());
 
     // 按地址实际线格式精确预分配，杜绝 Buffer 截断：

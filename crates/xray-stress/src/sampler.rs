@@ -75,11 +75,15 @@ impl Sampler {
     }
 
     /// 采样一次并追加 CSV。`elapsed` 为本次 run 已进行秒数。
-    pub fn sample_once(&mut self, elapsed: f64, interval: Duration) -> std::io::Result<()> {
+    /// `drain=true` 时行标签写 `__drain__`（负载已停、基础设施保留的观察窗），
+    /// 且不入 `samples_rss`——负载期泄漏判定不得被 drain 回落稀释。
+    pub fn sample_once(&mut self, elapsed: f64, interval: Duration, drain: bool) -> std::io::Result<()> {
         let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let (rss_mb, fd_count) = sample_process();
         let rt = RuntimeMetricsSnapshot::capture(&Handle::current());
-        self.samples_rss.push((elapsed, rss_mb));
+        if !drain {
+            self.samples_rss.push((elapsed, rss_mb));
+        }
 
         let mut rows = Vec::with_capacity(self.stats.len() + 1);
         let mut agg_bytes = 0u64;
@@ -116,7 +120,7 @@ impl Sampler {
         self.samples_throughput.push((elapsed, agg_bytes as f64 / interval.as_secs_f64().max(1e-6)));
         rows.push(SampleRow {
             ts,
-            scenario: "__proc__".into(),
+            scenario: if drain { "__drain__".into() } else { "__proc__".into() },
             conn_ok: 0,
             conn_fail: 0,
             tx_bps: 0.0,

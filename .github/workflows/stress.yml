@@ -39,6 +39,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # 泄漏门禁脚本（tools/check_stress_leak.py）需要 python；setup-python 三平台统一提供
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
       # boringssl cmake 配置需要 go（macos-14 镜像缺省无 go）
       - uses: actions/setup-go@v5
         with:
@@ -99,7 +103,14 @@ jobs:
             --concurrency 8 --s2-conns 4 `
             --scenarios $batch `
             --sample-interval 30 `
+            --drain-secs 360 `
             --out-dir stress-out
+      # 泄漏门禁：fd/RSS 斜率判定，超阈非零退出 → job 红。
+      # 360s drain 窗覆盖 s12 connIdle 300s；RSS 负载期超阈但有 drain 回落 = 固有堆积放行。
+      # 阈值调整见 tools/check_stress_leak.py 头注释（默认锚定 docs/impl-stress-leak-* 实测）。
+      - name: Leak gate (fd/RSS slope)
+        shell: bash
+        run: python tools/check_stress_leak.py --csv stress-out/metrics.csv
       - name: Upload results
         uses: actions/upload-artifact@v4
         if: always()

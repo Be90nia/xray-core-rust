@@ -137,18 +137,20 @@ impl MultiBuffer {
         };
         let n = first.bytes().len().min(dst.len());
         dst[..n].copy_from_slice(&first.bytes()[..n]);
-        // 释放 first buffer 后移除。
-        let mut removed = self.buffers.remove(0);
-        removed.release();
+        // 释放 first buffer 后移除（drain(..1) 单次 memmove，替代 remove(0)）。
+        for mut removed in self.buffers.drain(..1) {
+            removed.release();
+        }
         n
     }
 
     /// 对应 Go 的 `SplitFirst`。
     pub fn split_first(&mut self) -> Option<Buffer> {
+        // drain 的 end 超 len 会 panic，空 Vec 须先 guard。
         if self.buffers.is_empty() {
             return None;
         }
-        Some(self.buffers.remove(0))
+        self.buffers.drain(..1).next()
     }
 
     /// 分割出总计约 `size` 字节的 MultiBuffer。
@@ -295,16 +297,20 @@ impl MultiBuffer {
         let mut total_read = 0;
         let mut dst_offset = 0;
 
-        while dst_offset < dst.len() && !self.buffers.is_empty() {
-            let front = &mut self.buffers[0];
+        // 已读空的前缀数量：循环内只推进索引，结束后一次 drain 单次 memmove，
+        // 消除逐个 remove(0) 的 O(k·n) 前缀搬迁。
+        let mut emptied = 0usize;
+        while dst_offset < dst.len() && self.buffers.len() > emptied {
+            let front = &mut self.buffers[emptied];
             let n = front.read_to(&mut dst[dst_offset..]);
             dst_offset += n;
             total_read += n;
 
             if front.is_empty() {
-                let _ = self.buffers.remove(0);
+                emptied += 1;
             }
         }
+        self.buffers.drain(..emptied);
 
         total_read
     }
