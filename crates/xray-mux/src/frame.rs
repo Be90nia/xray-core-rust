@@ -253,8 +253,8 @@ fn read_target(data: &[u8]) -> Result<(Destination, usize), MuxError> {
     let network = net.to_network();
 
     // PortThenAddress 格式：port(2B) + address(variable)
-    let (port, addr, addr_consumed) = AddressParser::parse_port_address(&data[1..])
-        .ok_or(MuxError::AddressParseFailed)?;
+    let (port, addr, addr_consumed) =
+        AddressParser::parse_port_address(&data[1..]).ok_or(MuxError::AddressParseFailed)?;
 
     let target = Destination::new(addr, port, network);
     Ok((target, 1 + addr_consumed))
@@ -490,7 +490,7 @@ impl FrameMetadata {
     ///
     /// 线格式：`length(2B) + session_id(2B) + status(1B) + option(1B) + [target...]`。
     ///
-    /// 总长超过 [`MAX_METADATA_LEN`] 报错（对齐 Go frame.go:119-121 读侧
+    /// 总长超过 `MAX_METADATA_LEN` 报错（对齐 Go frame.go:119-121 读侧
     /// 512 硬顶）：写出超长帧对端必拒收并永久 desync，本端必须早失败
     /// 而非静默饱和 length 字段（bd n43f）。
     pub fn to_bytes(&self) -> Result<Vec<u8>, MuxError> {

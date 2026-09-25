@@ -10,7 +10,7 @@
 //!   字段访问器。
 //! - **UdpHop**（[`udphop`]）：`UdpHopPacketConn` —— 多端口 UDP 跳跃连接，完整翻译 Go
 //!   `udphop/conn.go` 的 hop/recv 循环 + buf pool 复用。
-//! - **Congestion / Pacer**（[`congestion::common`]）：token bucket pacer，BBR/Brutal 共用。
+//! - **Congestion / Pacer**（`congestion::common`）：token bucket pacer，BBR/Brutal 共用。
 //! - **Congestion / Brutal**（[`congestion::brutal`]）：固定带宽发送器 + ACK 率滑动窗口统计。
 //! - **Congestion / BBR**（[`congestion::bbr`]）：完整 BBR 算法翻译（bandwidth sampler + bbr sender
 //!   状态机 + windowed filter + ring buffer + packet number queue）。

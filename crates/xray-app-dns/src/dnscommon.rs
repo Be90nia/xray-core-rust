@@ -74,7 +74,6 @@ impl IpRecord {
     /// - RCode 非 0：`(空, ttl, from_rcode(rcode))`
     /// - IP 为空：`(空, ttl, EmptyResponse)`
     /// - 正常：`(ips, ttl, Ok(ips))`
-    #[must_use]
     pub fn get_ips(&self, now: Instant) -> Result<(Vec<IpAddr>, i32), DnsError> {
         let ttl = self.ttl_seconds(now);
         if ttl <= 0 {
@@ -261,10 +260,9 @@ pub fn response_code_to_u16(rc: ResponseCode) -> RCode {
 ///
 /// 参数：
 /// - `fqdn`: 已规范化的全限定域名（不以 `.` 结尾会被自动补上）
-/// `client_ip`: EDNS0 client subnet。空 Vec 表示不加 EDNS0；
-/// 长度 4 表示 IPv4 (/24)，长度 16 表示 IPv6 (/96)。
-/// 对齐 Go `app/dns/dnscommon.go:91` 注释 `// 24 for IPV4, 96 for IPv6` 和
-/// `dnscommon.go:94 netmask = 96`：IPv6 默认 /96（v26.6.1 行为）。
+/// - `client_ip`: EDNS0 client subnet。空 Vec 表示不加 EDNS0； 长度 4 表示 IPv4 (/24)，长度 16 表示
+///   IPv6 (/96)。 对齐 Go `app/dns/dnscommon.go:91` 注释 `// 24 for IPV4, 96 for IPv6` 和
+///   `dnscommon.go:94 netmask = 96`：IPv6 默认 /96（v26.6.1 行为）。
 ///
 /// 返回序列化后的 DNS wire bytes。
 pub fn build_dns_query(
@@ -534,7 +532,7 @@ mod tests {
             rdata::{A, AAAA},
         };
         let mut msg = Message::new(req_id, MessageType::Response, OpCode::Query);
-        for (rtype, ttl, ip) in answers {
+        for (_rtype, ttl, ip) in answers {
             let Some(ip) = ip else { continue };
             let name = Name::parse("x.test.", None).unwrap();
             let rdata = match ip {

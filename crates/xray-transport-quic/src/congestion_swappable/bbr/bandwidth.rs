@@ -60,6 +60,7 @@ impl std::ops::Mul<u64> for Bandwidth {
 impl std::ops::Div<u64> for Bandwidth {
     type Output = Self;
 
+    #[allow(clippy::manual_checked_ops)] // INF 特判语义显式保留，不用 checked_div 组合
     fn div(self, rhs: u64) -> Self {
         if rhs == 0 { INF_BANDWIDTH } else { Self(self.0 / rhs) }
     }

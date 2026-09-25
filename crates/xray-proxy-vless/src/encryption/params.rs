@@ -6,7 +6,7 @@
 //! (X25519 公钥) 或 1184B (ML-KEM-768 封装公钥)；短 part（<20 字符）计 padding。
 //!
 //! ENC 服务端私钥格式见 `infra/conf/vless.go:104-150`（inbound 端）：
-//! s[2] 必须可 SplitN "-" 解析为 `<from>[-<to>]`，结尾无 's'（vless.go:121）；
+//! `s[2]` 必须可 SplitN "-" 解析为 `<from>[-<to>]`，结尾无 's'（vless.go:121）；
 //! 每 part 解码后 32B 或 64B。
 //!
 //! 出站仅需解析客户端 encryption；server-side 仅 server.rs 涉及。

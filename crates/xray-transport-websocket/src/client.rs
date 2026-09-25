@@ -370,6 +370,7 @@ fn build_request_uri(cfg: &Config, dest: &Destination, use_tls: bool) -> String 
 
 /// 构造自定义 WS Upgrade request：Host 三级回退 + user header + 浏览器伪装头
 /// + early-data。
+#[allow(clippy::result_large_err)] // 存量清零批次：result_large_err
 fn build_request(
     uri: &str,
     cfg: &Config,
@@ -655,8 +656,6 @@ mod tests {
     // md5i：fingerprint 接线 — ws TLS 出站 btls 真实指纹 + ALPN 重写
     // -------------------------------------------------------------------
 
-    use tokio::io::AsyncReadExt as _;
-
     /// 抓取拨号发来的首个 TLS record（ClientHello）；收满 record 或 EOF 即止。
     async fn capture_client_hello(listener: tokio::net::TcpListener) -> Vec<u8> {
         let (mut sock, _) = listener.accept().await.unwrap();
@@ -851,7 +850,7 @@ mod tests {
         let (factory, mut server) = recording_factory(record.clone(), Duration::ZERO);
         let mut conn = DelayDialConn::new(4, factory);
         let payload = [7u8; 10];
-        conn.write(&payload).await.unwrap();
+        conn.write_all(&payload).await.unwrap();
         assert_eq!(recorded(&record), vec![None]);
         let mut buf = [0u8; 10];
         server.read_exact(&mut buf).await.unwrap();

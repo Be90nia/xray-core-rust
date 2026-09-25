@@ -12,7 +12,7 @@
 //!
 //! 1. 读 salt（len = key_size）
 //! 2. 用 server PSK + salt 派生 session subkey（blake3）
-//! 3. 构造 AEAD，nonce [0;12]
+//! 3. 构造 AEAD，nonce `[0;12]`
 //! 4. open fixed-header-chunk：headerType + timestamp_BE_u64 + variableLen_BE_u16
 //! 5. 验证 headerType（0=client）+ timestamp（防重放）
 //! 6. open variable-header-chunk：addr+port + paddingLen + padding（尾部含客户端首段 payload，先于
@@ -150,13 +150,14 @@ pub struct MultiUserInbound {
     /// 服务端主 PSK。
     psk: Vec<u8>,
     kind: CipherKind2022,
-    /// 用户列表（Arc<Mutex> 支持动态增删）。
+    /// 用户列表（`Arc<Mutex>` 支持动态增删）。
     ///
     /// 每项 = (user, psk_identity(user.psk))：identity 在用户装载/添加时
     /// 预计算一次（blake3），EIH 匹配退化为 16B memcmp，消除每连接 ×
     /// 用户数的哈希放大（对齐 Go `identityMap` 语义）。
     users: Arc<Mutex<Vec<(Ss2022User, [u8; 16])>>>,
     /// 时间戳容忍窗口（秒）。
+    #[allow(dead_code)] // 时间戳校验由 header 时间戳直接比较承担；字段为配置面 Go 对齐保留
     timestamp_tolerance: u64,
     /// 明文 salt 重放过滤器（sing `replay.NewSimple(60s)` 语义，check 即注册）。
     replay: SaltReplayFilter,
@@ -299,6 +300,7 @@ pub struct RelayInbound {
     /// 中继目标列表。
     destinations: Vec<RelayDestination>,
     /// 时间戳容忍窗口（秒）。
+    #[allow(dead_code)] // 时间戳校验由 header 时间戳直接比较承担；字段为配置面 Go 对齐保留
     timestamp_tolerance: u64,
 }
 
@@ -711,7 +713,7 @@ mod tests {
         var.extend_from_slice(b"example.com");
         var.extend_from_slice(&443u16.to_be_bytes());
         var.extend_from_slice(&padding_len.to_be_bytes());
-        var.extend(std::iter::repeat(0u8).take(padding_len as usize));
+        var.extend(std::iter::repeat_n(0u8, padding_len as usize));
         var.extend_from_slice(first_payload);
         let sealed_var = aead.seal(&nonce, &[], &var).unwrap();
 
@@ -731,7 +733,6 @@ mod tests {
     #[tokio::test]
     async fn multi_user_two_clients_roundtrip() {
         use base64::Engine as _;
-        use tokio::io::AsyncWriteExt;
 
         use crate::ss2022::client::Client2022;
 
@@ -772,7 +773,7 @@ mod tests {
                     .with_identity(&b64(&server_psk))
                     .unwrap();
             let mut stream = client.dial_target("example.com", 443).await.unwrap();
-            stream.write_chunk(&vec![fill; 64]).await.unwrap();
+            stream.write_chunk(&[fill; 64]).await.unwrap();
             stream.flush().await.unwrap();
         }
 
@@ -904,7 +905,7 @@ mod tests {
                 .unwrap()
                 .with_identity(&server_psk_b64)
                 .unwrap();
-        let mut stream = client.dial_target("example.com", 443).await.unwrap();
+        let _stream = client.dial_target("example.com", 443).await.unwrap();
 
         let result = server.await.unwrap().unwrap();
         assert_eq!(result.address, Address::Domain("example.com".to_string()));

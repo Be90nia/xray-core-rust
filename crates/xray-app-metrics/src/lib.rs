@@ -10,7 +10,7 @@
 //! - expvar.Publish("stats") / expvar.Publish("observatory")：通过 [`StatsCollector`] /
 //!   [`ObservationCollector`] 暴露快照数据
 //! - outbound.Manager.AddHandler/RemoveHandler：[`OutboundRegistrar`] trait
-//! - transport.Link → Conn 的转换：上层负责构造 [`BoxedConn`] 投递到 [`Outbound::dispatch`]
+//! - transport.Link → Conn 的转换：上层负责构造 `BoxedConn` 投递到 `Outbound::dispatch`
 //!
 //! ## 配套 proto
 //!

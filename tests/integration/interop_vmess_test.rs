@@ -11,10 +11,7 @@ mod interop_helpers;
 use std::sync::Arc;
 
 use interop_helpers::*;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
-};
+use tokio::{io::AsyncWriteExt as _, net::TcpListener};
 use xray_app_dispatcher::{
     DispatchHandler,
     default::{DialBridge, SimpleOhm},
@@ -34,9 +31,6 @@ use xray_proxy_vmess::{
 
 // Fixed UUID for interop tests.
 const SAMPLE_UUID: &str = "66ad4540-b58c-4ad2-9926-ea63445a9b57";
-
-// Test payload.
-const PAYLOAD: &[u8] = b"hello vmess interop test!";
 
 // -- Helper: construct Rust VMess server (validator + serve_vmess + freedom) --
 

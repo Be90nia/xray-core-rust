@@ -161,7 +161,7 @@ impl ResolvesServerCert for SniCertResolver {
 /// 对应 Go `setupOcspTicker` 的后台热重载 + OCSP 刷新当前留作 TODO：
 /// 需把 resolver 包进 `arc_swap::ArcSwap` 并 spawn tokio 定时任务重新读取
 /// `certificatePath`/`keyPath` 后原子替换。OCSP 装订已由 `ocsp-stapler`（`ocsp-stapling`
-/// feature）在握手层实现，参见 [`crate::ocsp_stapling`]。
+/// feature）在握手层实现，参见 `crate::ocsp_stapling`。
 ///
 /// # pwh6: Go v26 TLS 字段族增量（服务端）
 /// - `masterKeyLog`：Go `tls.Config.KeyLogWriter`（transport_security.go→config.go:467-474） string
@@ -172,7 +172,7 @@ impl ResolvesServerCert for SniCertResolver {
 ///   cache，对齐 Go `SessionTicketsDisabled=true` + `SessionCache=nil`。
 /// - 证书级字段（Go `TLSCertConfig`，transport_security.go:248-257，作用于 `certificates[]`
 ///   每条目）：`ocspStapling`（uint64 热重载间隔秒，>0 启用 OCSP 装订，接线
-///   [`crate::ocsp_stapling`]）；`oneTimeLoading`（bool，禁 证书热重载 ticker——Rust
+///   `crate::ocsp_stapling`）；`oneTimeLoading`（bool，禁 证书热重载 ticker——Rust
 ///   无热重载，no-op）；`buildChain`（bool，Go v26.6.1 实际未消费 BuildNameToCertificate
 ///   无条件调用；rustls resolver 恒用解析 names，no-op）。
 pub fn build_server_config(

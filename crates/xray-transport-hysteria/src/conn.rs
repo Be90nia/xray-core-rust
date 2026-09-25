@@ -351,14 +351,17 @@ impl InterStreamConn {
 pub struct HysteriaConn {
     inner: Arc<InterStreamConn>,
     /// 缓存进行中的 read future。
+    #[allow(clippy::type_complexity)] // 存量清零批次
     read_state: parking_lot::Mutex<
         Option<Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<u8>>> + Send>>>,
     >,
     /// 缓存进行中的 write future。
+    #[allow(clippy::type_complexity)] // 存量清零批次
     write_state: parking_lot::Mutex<
         Option<Pin<Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send>>>,
     >,
     /// 缓存进行中的 close future。
+    #[allow(clippy::type_complexity)] // 存量清零批次
     close_state: parking_lot::Mutex<
         Option<Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>>,
     >,
@@ -528,6 +531,7 @@ pub struct InterConn {
     /// 是否已关闭。
     closed: Mutex<bool>,
     /// 写回调（QUIC conn.SendDatagram）。
+    #[allow(clippy::type_complexity)] // 存量清零批次
     write_fn: Mutex<
         Option<
             Arc<

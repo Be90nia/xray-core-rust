@@ -65,7 +65,7 @@ pub trait OutboundListener: Send + Sync {
 /// 使用 xray-features 的 OutboundHandler trait。
 /// 动态 handler 管理 trait（内部使用，不暴露给 gRPC 层）。
 ///
-/// 提供运行时增删 outbound handler 的能力，由 [`OutboundHandlerRegistry`] 实现。
+/// 提供运行时增删 outbound handler 的能力，由 `OutboundHandlerRegistry` 实现。
 pub trait HandlerManager: Send + Sync {
     /// 添加 handler。若 tag 已存在则返回错误。
     fn add_handler(

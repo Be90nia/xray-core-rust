@@ -235,8 +235,10 @@ fn handshake_timeout() -> std::time::Duration {
 /// 带 fallback 的连接处理（Go `vless/inbound/inbound.go::Process` 语义）：
 ///
 /// 1. 预读 first buffer（最多 1024 字节）
-/// 2. first[0]==VLESS VERSION 且 decode 成功 → 正常 dispatch
+/// 2. `first[0]==VLESS VERSION` 且 decode 成功 → 正常 dispatch
 /// 3. 否则（非 VLESS 流量 / 认证失败）→ 查 FallbackPolicy 转发到 fallback dest
+// 装配层单入口：参数即 Go handleConnection 上下文全集，收紧签名反而要引入聚合体
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_connection_with_fallback<S>(
     stream: S,
     handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
@@ -360,6 +362,7 @@ where
 }
 
 /// fallback：path 提取 → 查 policy → 透明转发（PROXY header + first 回放 + 双向 pipe）。
+#[allow(clippy::too_many_arguments)] // 与 Go fallback 转发参数一一对应
 async fn do_fallback<R, W>(
     read_half: R,
     write_half: W,
@@ -677,15 +680,11 @@ where
         return Ok(());
     }
 
-    let registry = opts.and_then(|o| o.reverse_registry.as_ref()).ok_or_else(|| {
-        std::io::Error::other(
-            "vless Reverse enabled but no registry configured",
-        )
-    })?;
+    let registry = opts
+        .and_then(|o| o.reverse_registry.as_ref())
+        .ok_or_else(|| std::io::Error::other("vless Reverse enabled but no registry configured"))?;
     let ohm: Arc<SimpleOhm> = opts.and_then(|o| o.reverse_ohm.clone()).ok_or_else(|| {
-        std::io::Error::other(
-            "vless Reverse enabled but no reverse_ohm configured",
-        )
+        std::io::Error::other("vless Reverse enabled but no reverse_ohm configured")
     })?;
 
     // 按 account.Reverse.Tag 路由（Go `proxy/vless/inbound/inbound.go:198-216`）：

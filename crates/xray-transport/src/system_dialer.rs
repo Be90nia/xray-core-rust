@@ -590,7 +590,7 @@ fn split_host_port(s: &str) -> Option<(String, String)> {
 /// 3. `domain_strategy` 有策略 + 域名目标 → [`lookup_for_ip`] 预解析（bd 5y8）： Happy Eyeballs
 ///    条件满足时竞争拨号（bd 0ko），否则随机取一 IP 改写目标； 解析失败时 ForceIP
 ///    报错、否则保留域名走系统 resolver（dialer.go:251-267）
-/// 4. `dialer_proxy` 非空 → 经 [`DIALER_PROXY_HOOK`] 重定向（bd enk，redirect）
+/// 4. `dialer_proxy` 非空 → 经 `DIALER_PROXY_HOOK` 重定向（bd enk，redirect）
 /// 5. effective dialer 直连
 ///
 /// # 参数

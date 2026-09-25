@@ -4,12 +4,12 @@
 //!
 //! # 核心组件
 //!
-//! - [`Link`]: 传输链路（读写两端）
-//! - [`ClientManager`]: 顶层调度入口
-//! - [`WorkerPicker`]: Worker 选择器 trait
-//! - [`IncrementalWorkerPicker`]: 增量式选择器（LRU + 30s 清理）
-//! - [`ClientWorker`]: 核心工作单元
-//! - [`ClientWorkerFactory`]: Worker 工厂 trait
+//! - `Link`：传输链路（读写两端）
+//! - `ClientManager`：顶层调度入口
+//! - `WorkerPicker`：Worker 选择器 trait
+//! - `IncrementalWorkerPicker`：增量式选择器（LRU + 30s 清理）
+//! - `ClientWorker`：核心工作单元
+//! - `ClientWorkerFactory`：Worker 工厂 trait
 //! - [`DialingWorkerFactory`]: 拨号式 Worker 工厂
 
 use std::sync::{
@@ -1110,17 +1110,12 @@ mod tests {
                 tokio::spawn(async move {
                     let mut r = r_up;
                     let mut w = w_down;
-                    loop {
-                        match r.read_multi_buffer().await {
-                            Ok(mb) => {
-                                if mb.is_empty() {
-                                    break;
-                                }
-                                if w.write_multi_buffer(mb).await.is_err() {
-                                    break;
-                                }
-                            },
-                            Err(_) => break,
+                    while let Ok(mb) = r.read_multi_buffer().await {
+                        if mb.is_empty() {
+                            break;
+                        }
+                        if w.write_multi_buffer(mb).await.is_err() {
+                            break;
                         }
                     }
                     let _ = w.close();
@@ -1234,12 +1229,7 @@ mod tests {
         let monitor_h = server.spawn_monitor(Arc::clone(&link_writer));
         let frame_server = Arc::clone(&server);
         tokio::spawn(async move {
-            loop {
-                match frame_server.process_frame(&mut reader, &link_writer).await {
-                    Ok(true) => continue,
-                    _ => break,
-                }
-            }
+            while let Ok(true) = frame_server.process_frame(&mut reader, &link_writer).await {}
             frame_server.close();
             monitor_h.abort();
         });

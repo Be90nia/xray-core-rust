@@ -25,7 +25,7 @@ const STREAM_CHUNK_SIZE: usize = 8 * 1024;
 /// `global_id` 用 `Option<[u8;8]>` 表达 Go 端 `xudp.GetGlobalID` 在 cone=false
 /// 或非 UDP inbound 时返回的全零值（Go 服务端 `if meta.GlobalID != [8]byte{}`
 /// 短路跳过 XUDP 路径）。Rust 旧版恒设 `[0;8]`，UDP dest 帧被服务端误判走 XUDP
-/// 路径丢弃内联 data。Option 化后 [0;8] → None → 仅在显式传入非零时下发。
+/// 路径丢弃内联 data。Option 化后 `[0;8]` → None → 仅在显式传入非零时下发。
 pub struct MuxWriter {
     dest: Option<Destination>,
     writer: BufferedWriter,

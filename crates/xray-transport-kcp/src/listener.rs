@@ -258,6 +258,7 @@ mod tests {
             })
         }
 
+        #[allow(dead_code)] // 测试辅助队列入口，保留对称 API
         fn push(&self, payload: Vec<u8>, src: SocketAddr) {
             self.incoming.lock().push((payload, src));
         }

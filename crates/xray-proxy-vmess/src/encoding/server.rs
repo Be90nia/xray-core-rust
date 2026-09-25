@@ -60,6 +60,7 @@ pub struct SessionHistory {
 }
 
 /// 周期清理间隔（对齐 Go `task.Periodic(30s)`）。
+#[allow(dead_code)] // Go 对齐常量：清理接线随 dispatcher 稳定批次跟进
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 
 impl SessionHistory {
@@ -69,14 +70,12 @@ impl SessionHistory {
     /// 本结构只在 ServerSession 中持引用，进程退出时 task 自动 drop，无泄漏。
     #[must_use]
     pub fn new() -> Self {
-        
         Self { inner: Mutex::new(HashMap::new()), ttl: Duration::from_secs(180) }
     }
 
     /// 用自定义 TTL。
     #[must_use]
     pub fn with_ttl(ttl: Duration) -> Self {
-        
         Self { inner: Mutex::new(HashMap::new()), ttl }
     }
 
@@ -348,9 +347,9 @@ impl<'v> ServerSession<'v> {
     /// 2. 派生 response_body_iv = SHA256(request_body_iv)[..16]
     /// 3. 构造明文 payload = `[1B response_header][1B option][1B cmd_id=0][1B data_len=0]` （
     ///    ponytail: 当前不处理 command 序列化，留 follow-up）
-    /// 4. KDF16 派生 len key，KDF 派生 len IV[:12]
+    /// 4. KDF16 派生 len key，KDF 派生 len `IV[:12]`
     /// 5. Seal length(2B BE u16) + tag → 写入 writer
-    /// 6. KDF16 派生 payload key，KDF 派生 payload IV[:12]
+    /// 6. KDF16 派生 payload key，KDF 派生 payload `IV[:12]`
     /// 7. Seal payload + tag → 写入 writer
     ///
     /// # Errors
@@ -653,11 +652,7 @@ impl<'v> ServerSession<'v> {
         self.response_body_key.copy_from_slice(&body_key_hash[..16]);
         self.response_body_iv.copy_from_slice(&body_iv_hash[..16]);
 
-        let mut plaintext = Vec::with_capacity(4);
-        plaintext.push(self.response_header);
-        plaintext.push(header.option.bits());
-        plaintext.push(0);
-        plaintext.push(0);
+        let plaintext = vec![self.response_header, header.option.bits(), 0, 0];
 
         let len_key = aead::kdf16(&self.response_body_key, &[consts::AEAD_RESP_HEADER_LEN_KEY]);
         let len_iv_full = aead::kdf(&self.response_body_iv, &[consts::AEAD_RESP_HEADER_LEN_IV]);
@@ -1037,8 +1032,8 @@ mod tests {
         server.request_body_iv = [0x33u8; 16];
         // encode_response_body 依赖 response_body_key/iv，手动填充跳过 encode_response_header
         use sha2::{Digest, Sha256};
-        let body_key_hash = Sha256::digest(&server.request_body_key);
-        let body_iv_hash = Sha256::digest(&server.request_body_iv);
+        let body_key_hash = Sha256::digest(server.request_body_key);
+        let body_iv_hash = Sha256::digest(server.request_body_iv);
         server.response_body_key.copy_from_slice(&body_key_hash[..16]);
         server.response_body_iv.copy_from_slice(&body_iv_hash[..16]);
 

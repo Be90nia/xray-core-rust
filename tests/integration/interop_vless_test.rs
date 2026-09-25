@@ -35,9 +35,6 @@ use xray_proxy_vless::{
 // Fixed UUID for interop tests.
 const SAMPLE_UUID: &str = "a3482e88-686a-4a58-8126-99c9214826d7";
 
-// Test payload.
-const PAYLOAD: &[u8] = b"hello vless interop test!";
-
 // -- Helper: construct Rust VLESS server --
 
 fn make_vless_ohm() -> Arc<SimpleOhm> {
@@ -180,7 +177,11 @@ async fn rust_vless_server_go_client() {
     let ohm_clone = Arc::clone(&ohm);
     let validator_clone = Arc::clone(&validator);
     tokio::spawn(async move {
-        let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None, None, None).await;
+        let listener = xray_transport::system_listener::InboundTcpListener::from_tokio(
+            vless_listener,
+            xray_transport::sockopt::SocketOptions::default(),
+        );
+        let _ = serve_vless(listener, ohm_clone, validator_clone, None, None, None).await;
     });
 
     // Configure Go xray: SOCKS5 inbound -> VLESS outbound -> Rust server

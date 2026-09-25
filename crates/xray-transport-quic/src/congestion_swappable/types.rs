@@ -163,6 +163,7 @@ pub(crate) mod test_support {
             Self { rtt: Mutex::new(rtt) }
         }
 
+        #[allow(dead_code)] // RTT setter 为测试面与未来探针预留
         pub fn set(&self, rtt: Duration) {
             *self.rtt.lock().unwrap() = rtt;
         }

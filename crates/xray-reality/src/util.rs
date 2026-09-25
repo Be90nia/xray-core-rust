@@ -29,7 +29,7 @@ pub fn open_key_log_writer<P: AsRef<Path>>(path: P) -> Option<std::fs::File> {
 /// 随机选 index；本实现不引 `rand` 依赖（避免在配置层加 RNG 源），用
 /// `paths.iter().next()` 取 HashMap 迭代序的首项作为确定性 fallback。
 ///
-/// 真正的随机选择等接入 [`xray_crypto`] 的 rand 等价品后替换；当前确定性
+/// 真正的随机选择等接入 `xray_crypto` 的 rand 等价品后替换；当前确定性
 /// 选择对 REALITY 握手业务无影响（spider 模式仅在 fallback 路径触发）。
 ///
 /// # 参数
@@ -58,9 +58,7 @@ pub fn find_oid_0_0_extension(cert_der: &[u8]) -> Option<(usize, usize)> {
     const OID_0_0: [u8; 3] = [0x06, 0x01, 0x00];
     let mut from = 0usize;
     while from + OID_0_0.len() <= cert_der.len() {
-        let Some(rel) = cert_der[from..].windows(OID_0_0.len()).position(|w| w == OID_0_0) else {
-            return None;
-        };
+        let rel = cert_der[from..].windows(OID_0_0.len()).position(|w| w == OID_0_0)?;
         // extnID 之后紧跟 extnValue = OCTET STRING（tag 0x04）
         let v = from + rel + OID_0_0.len();
         if v < cert_der.len() && cert_der[v] == 0x04 {

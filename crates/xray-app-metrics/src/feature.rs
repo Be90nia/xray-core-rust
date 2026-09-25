@@ -20,7 +20,7 @@
 //!   到合法 Prometheus exposition format。
 //! - `RecordingOutboundRegistrar`：仅记 tag。
 //!
-//! 上层可经 [`MetricsFeature::with_stats_collector`] / [`with_obs_collector`]
+//! 上层可经 [`MetricsFeature::with_stats_collector`] / `with_obs_collector`
 //! 注入真实 stats/observability 收集器。
 
 use std::sync::{

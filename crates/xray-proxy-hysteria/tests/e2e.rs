@@ -28,6 +28,7 @@ fn self_signed()
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert_der = cert.cert.der().clone();
     let key_der = cert.key_pair.serialize_der();
+    #[allow(clippy::useless_conversion)] // 存量清零批次
     (vec![cert_der.into()], rustls_pki_types::PrivateKeyDer::try_from(key_der).unwrap())
 }
 

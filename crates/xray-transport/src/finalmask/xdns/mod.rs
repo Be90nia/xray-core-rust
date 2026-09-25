@@ -8,11 +8,11 @@
 //!
 //! ## 子模块
 //!
-//! - [`dns`]：DNS wire format 编解码（RFC1035）
-//! - [`spec`]：domainSpec / parseResolver
-//! - [`record_transport`]：payload ↔ RR answers 编码
-//! - `client`：[`XdnsConnClient`] 实现 [`super::UdpIo`]
-//! - `server`：[`XdnsConnServer`] 实现 [`super::UdpIo`]
+//! - `dns`：DNS wire format 编解码（RFC1035）
+//! - `spec`：domainSpec / parseResolver
+//! - `record_transport`：payload ↔ RR answers 编码
+//! - `client`：`XdnsConnClient` 实现 [`super::UdpIo`]
+//! - `server`：`XdnsConnServer` 实现 [`super::UdpIo`]
 //! - `base32`：RFC4648 base32（无 padding）
 
 pub(crate) mod base32;
@@ -38,7 +38,7 @@ pub const UDP_SIZE: usize = super::UDP_SIZE;
 pub struct Config {
     /// 服务端：用于响应的域名规范（形如 "t.example.com[:txt|a|aaaa]"）。
     pub domains: Vec<String>,
-    /// 客户端：解析器规范（形如 "domain[:rrType]+udp://resolver:53"）。
+    /// 客户端：解析器规范（形如 `domain[:rrType]+udp://resolver:53`）。
     pub resolvers: Vec<String>,
 }
 

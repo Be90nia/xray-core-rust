@@ -1,3 +1,4 @@
+#![allow(dead_code)] // 共享 helper：按测试需要选择性使用
 //! Go<->Rust interop test shared helpers.
 // Go xray-core subprocess management, port wait, HTTP test request,
 // JSON config generation. All interop test files share this module.

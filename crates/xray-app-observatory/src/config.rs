@@ -32,6 +32,7 @@ impl HealthPingMeasurement {
         }
     }
 
+    #[allow(clippy::field_reassign_with_default)] // 测试装配逐字段赋值对齐 Go 表意
     pub fn to_proto(&self) -> ProtoHealthPing {
         let mut out = ProtoHealthPing::default();
         out.all = self.all;
@@ -65,14 +66,11 @@ impl OutboundStatus {
             outbound_tag: p.outbound_tag.clone(),
             last_seen_time: p.last_seen_time,
             last_try_time: p.last_try_time,
-            health_ping: if p.health_ping.is_some() {
-                Some(HealthPingMeasurement::from_proto(p.health_ping.as_ref().unwrap()))
-            } else {
-                None
-            },
+            health_ping: p.health_ping.as_ref().map(HealthPingMeasurement::from_proto),
         }
     }
 
+    #[allow(clippy::field_reassign_with_default)] // 测试装配逐字段赋值对齐 Go 表意
     pub fn to_proto(&self) -> ProtoOutboundStatus {
         let mut out = ProtoOutboundStatus::default();
         out.alive = self.alive;
@@ -99,6 +97,7 @@ impl ObservationResult {
         Self { status: p.status.iter().map(OutboundStatus::from_proto).collect() }
     }
 
+    #[allow(clippy::field_reassign_with_default)] // 测试装配逐字段赋值对齐 Go 表意
     pub fn to_proto(&self) -> ProtoObservationResult {
         let mut out = ProtoObservationResult::default();
         out.status = self.status.iter().map(|s| s.to_proto()).collect();
@@ -119,6 +118,7 @@ impl ProbeResult {
         Self { alive: p.alive, delay: p.delay, last_error_reason: p.last_error_reason.clone() }
     }
 
+    #[allow(clippy::field_reassign_with_default)] // 测试装配逐字段赋值对齐 Go 表意
     pub fn to_proto(&self) -> ProtoProbeResult {
         let mut out = ProtoProbeResult::default();
         out.alive = self.alive;
@@ -138,15 +138,13 @@ pub const DEFAULT_PROBE_INTERVAL_MS: i64 = 10_000;
 pub const DEAD_DELAY_MS: i64 = 99_999_999;
 
 /// Observer 配置。
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ObservatoryConfig {
     pub subject_selector: Vec<String>,
     pub probe_url: String,
     pub probe_interval: i64,
     pub enable_concurrency: bool,
 }
-
 
 impl ObservatoryConfig {
     pub fn from_proto(p: &ProtoConfig) -> Self {
@@ -158,6 +156,7 @@ impl ObservatoryConfig {
         }
     }
 
+    #[allow(clippy::field_reassign_with_default)] // 测试装配逐字段赋值对齐 Go 表意
     pub fn to_proto(&self) -> ProtoConfig {
         let mut out = ProtoConfig::default();
         out.subject_selector = self.subject_selector.clone();
@@ -228,6 +227,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
     fn outbound_status_proto_roundtrip_with_health() {
         let mut s = OutboundStatus::default();
         s.outbound_tag = "out".into();

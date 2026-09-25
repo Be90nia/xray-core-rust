@@ -1,6 +1,6 @@
 //! WireGuard outbound → DialBridge 适配器。
 //!
-//! 把 [`WireguardOutboundHandler`] 接入 dispatcher 的 [`DialBridge`]。
+//! 把 [`WireguardOutboundHandler`] 接入 dispatcher 的 `DialBridge`。
 //!
 //! ## 桥接架构
 //!
@@ -270,6 +270,7 @@ pub(crate) async fn pump_client_to_udp(
     default_dest: &Destination,
     acc: &mut Vec<u8>,
 ) {
+    #[allow(unused_imports)] // 存量清零批次
     use std::io::Read as _;
     if bytes.is_empty() {
         return;
@@ -385,6 +386,7 @@ pub(crate) async fn resolve_dest_domain(
                     "wireguard: no DNS candidate matches interface address families".to_string()
                 );
             }
+            #[allow(deprecated)] // 存量清零批次
             let idx = rand::thread_rng().gen_range(0..usable.len());
             Ok(usable[idx])
         },
@@ -532,9 +534,11 @@ pub fn make_wireguard_dial_fn(
                 Network::TCP => {
                     let ip = match dest.address() {
                         Address::IPv4(v4) => smoltcp::wire::IpAddress::Ipv4(
+                            #[allow(clippy::incompatible_msrv)] // 存量清零批次
                             smoltcp::wire::Ipv4Address::from_octets(v4.octets()),
                         ),
                         Address::IPv6(v6) => smoltcp::wire::IpAddress::Ipv6(
+                            #[allow(clippy::incompatible_msrv)] // 存量清零批次
                             smoltcp::wire::Ipv6Address::from_octets(v6.octets()),
                         ),
                         Address::Domain(_) => unreachable!("resolved above"),
@@ -647,6 +651,7 @@ impl UdpOrTcpRelay {
 }
 
 /// 创建 duplex pair 并 spawn 中继 task，返回 client 侧 Connection。
+#[allow(deprecated)] // 存量清零批次：deprecated
 async fn spawn_relay<F>(make: F) -> Result<Box<dyn Connection>, String>
 where
     F: FnOnce(tokio::io::DuplexStream, tokio::io::DuplexStream) -> UdpOrTcpRelay,
@@ -669,6 +674,7 @@ where
 pub(crate) fn bind_ephemeral(sock: &mut smoltcp::socket::udp::Socket<'static>) {
     use rand::Rng;
     for _ in 0..16 {
+        #[allow(deprecated)] // 存量清零批次
         let port: u16 = rand::thread_rng().gen_range(1024..65535);
         if sock.bind(port).is_ok() {
             return;
@@ -728,6 +734,7 @@ impl TtlDnsCache {
         let mut map = self.map.lock();
         if let Some(e) = map.get(host) {
             if std::time::Instant::now() < e.expires_at {
+                #[allow(deprecated)] // 存量清零批次
                 let idx = rand::thread_rng().gen_range(0..e.ips.len());
                 return Some(e.ips[idx]);
             }
@@ -780,7 +787,7 @@ pub(crate) async fn resolve_domain_in_tunnel(
     let handle = {
         let mut stack = netstack.lock().await;
         let h = stack.add_udp_socket();
-        stack.with_udp_socket(h, |sock| bind_ephemeral(sock));
+        stack.with_udp_socket(h, bind_ephemeral);
         h
     };
 
@@ -788,15 +795,18 @@ pub(crate) async fn resolve_domain_in_tunnel(
     let mut found: Vec<std::net::IpAddr> = Vec::new();
     let mut best_ttl = DEFAULT_DNS_TTL_SECS;
     'qtypes: for want_a in qtypes {
+        #[allow(deprecated)] // 存量清零批次
         let req_id: u16 = rand::thread_rng().random();
         let query = dns_build_query(domain, want_a, req_id)?;
         for server in servers.iter().filter(|ip| ip.is_ipv4() == want_a) {
             let target = smoltcp::wire::IpEndpoint::new(
                 match server {
                     std::net::IpAddr::V4(v4) => smoltcp::wire::IpAddress::Ipv4(
+                        #[allow(clippy::incompatible_msrv)] // 存量清零批次
                         smoltcp::wire::Ipv4Address::from_octets(v4.octets()),
                     ),
                     std::net::IpAddr::V6(v6) => smoltcp::wire::IpAddress::Ipv6(
+                        #[allow(clippy::incompatible_msrv)] // 存量清零批次
                         smoltcp::wire::Ipv6Address::from_octets(v6.octets()),
                     ),
                 },
@@ -1263,6 +1273,7 @@ mod tests {
         // 客户端写一帧 XUDP（target 8.8.4.4:53，payload "dns-query"）
         let mut frame = Vec::new();
         {
+            #[allow(unused_imports)] // 存量清零批次
             use std::io::Write;
             let mut pw = xray_xudp::packet::PacketWriter::new(&mut frame, udp_dest(53), [0x42; 8]);
             pw.write_packet(b"dns-query").expect("write frame");
@@ -1505,7 +1516,7 @@ mod tests {
         assert_eq!(target.port().value(), 51820);
         let data = pkt.data();
         assert!(
-            matches!(data.first().map(|b| b & 0x07), Some(1 | 2 | 3 | 4)),
+            matches!(data.first().map(|b| b & 0x07), Some(1..=4)),
             "WG 消息类型（握手/数据），got head: {:?}",
             &data[..data.len().min(4)]
         );

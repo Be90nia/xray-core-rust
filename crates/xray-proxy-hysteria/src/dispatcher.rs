@@ -1,7 +1,7 @@
 //! Hysteria outbound → DialBridge 适配器。
 //!
-//! 把 [`HysteriaClient`]（QUIC stream）接入 dispatcher 的 [`DialBridge`]：
-//! [`make_dial_fn`] 闭包内部 dial → `HysteriaClient::tcp()` → pump 桥接到 duplex。
+//! 把 `HysteriaClient`（QUIC stream）接入 dispatcher 的 `DialBridge`：
+//! `make_dial_fn` 闭包内部 dial → `HysteriaClient::tcp()` → pump 桥接到 duplex。
 
 use std::{
     io,
@@ -456,6 +456,7 @@ mod tests {
     }
 
     impl MockEchoConn {
+        #[allow(clippy::type_complexity)] // 测试返回类型形态固定
         fn new() -> (Arc<Self>, Arc<parking_lot::Mutex<Vec<(u32, UdpMessage)>>>) {
             let (tx, rx) = mpsc::unbounded_channel();
             let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));

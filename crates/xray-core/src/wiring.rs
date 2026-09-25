@@ -16,9 +16,9 @@ use std::{future::Future, net::IpAddr, path::Path, pin::Pin, sync::Arc};
 use xray_app_dispatcher::{
     DispatchHandler, DispatcherError,
     default::{
-        AccessContext, DefaultDispatcher, DispatcherContext, ExcludeDomainMatcher,
-        ExcludeIpMatcher, Route as DispRoute, RoutingContext as DispRoutingContext, RoutingRouter,
-        SimpleOhm, SniffingRequest,
+        AccessContext, DefaultDispatcher, ExcludeDomainMatcher, ExcludeIpMatcher,
+        Route as DispRoute, RoutingContext as DispRoutingContext, RoutingRouter, SimpleOhm,
+        SniffingRequest,
     },
     maybe_wrap_reader, maybe_wrap_writer,
 };
@@ -40,6 +40,7 @@ use xray_geodata::{
     rule_parser::{parse_domain_rule, parse_ip_rules},
 };
 use xray_mux::client::MUX_COOL_ADDRESS;
+#[allow(unused_imports)] // 存量清零批次
 use xray_proto::xray::common::geodata::CidrRule;
 use xray_transport::link::Link;
 
@@ -918,7 +919,6 @@ fn parse_routing_json_to_proto_in(
                 }),
                 // 对齐 Go router.go:264-270：webhook → WebhookConfig。
                 webhook: r.get("webhook").and_then(parse_webhook_config),
-                ..Default::default()
             });
         }
     }
@@ -983,6 +983,7 @@ fn parse_routing_json_to_proto_in(
     // 故 Registry 不会被 Router 使用；但配置错误必须现在就暴露，不能等到
     // 远端首次请求才发现错配。
     if let Some(arr) = v.get("ruleSet").and_then(|x| x.as_array()) {
+        #[allow(unused_mut)] // 存量清零批次
         let mut registry = xray_app_router::RuleSetRegistry::new();
         let mut seen_tags: std::collections::HashSet<String> = std::collections::HashSet::new();
         for rs in arr {
@@ -1303,6 +1304,7 @@ fn parse_duration_ns(v: &serde_json::Value) -> Option<i64> {
     }
 }
 
+#[allow(clippy::question_mark)] // 存量清零批次
 pub(crate) fn parse_go_duration_str(s: &str) -> Option<i64> {
     let neg = s.trim_start().starts_with('-');
     let s = s.trim().trim_start_matches(['-', '+']);
@@ -1361,6 +1363,8 @@ fn resolve_asset_dir() -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use xray_app_dispatcher::default::DispatcherContext;
+
     use super::*;
 
     /// 测试桩 handler：dispatch 即返回（SimpleOhm 注册用）。
@@ -2088,6 +2092,7 @@ mod tests {
     fn parse_port_list_invalid_rejected_valid_ok() {
         // 非法：字符串 "abc" / 对象形态。
         for bad in [serde_json::json!("abc"), serde_json::json!({"port": 80})] {
+            #[allow(clippy::err_expect)] // 存量清零批次
             let err = super::parse_port_list(Some(&bad)).err().expect("must reject");
             assert!(matches!(err, WiringError::JsonParse(_)), "{err:?}");
         }
@@ -2102,6 +2107,7 @@ mod tests {
     /// vrll⑤ + uasr②：balancer 空 tag / 空 selector / 未知 strategy 硬错
     /// （Go router.go:30-41）；合法 balancer 通过且 strategy 规范化 random。
     #[test]
+    #[allow(clippy::err_expect, clippy::question_mark)] // 存量清零批次：测试断言期 expect
     fn balancer_config_hard_errors_and_normalization() {
         let dir = temp_asset_dir("balancer-hard");
         // 空 tag。
@@ -2139,6 +2145,7 @@ mod tests {
     /// 补票②：rules JSON domain 数组非字符串项硬错（Go StringList 解码期
     /// 拒启 / rule_parser 逐条失败即拒），不再 filter_map 静默丢弃。
     #[test]
+    #[allow(clippy::err_expect)] // 存量清零批次：测试断言期 expect
     fn routing_domain_non_string_entry_rejected() {
         let dir = temp_asset_dir("domain-nonstring");
         let err = parse_routing_json_to_proto_in(

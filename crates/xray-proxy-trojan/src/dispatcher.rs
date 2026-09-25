@@ -19,15 +19,12 @@ use std::{
     task::{Context, Poll},
 };
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use xray_app_dispatcher::default::DialFn;
-use xray_common::net::{
-    address::Address, destination::Destination, network::Network as XrayNetwork, port::Port,
-};
+use xray_common::net::{address::Address, destination::Destination, port::Port};
 use xray_transport::{
     connection::Connection,
     dialer::{StreamSettings, dial},
-    sockopt::SocketOptions,
 };
 
 use crate::{
@@ -137,6 +134,7 @@ pub fn make_dial_fn(config: Arc<TrojanOutboundConfig>) -> DialFn {
             write_request_header(&mut header, &config.account, network, &target_addr, target_port)
                 .map_err(|e| format!("trojan write header: {e}"))?;
 
+            use tokio::io::AsyncWriteExt as _;
             // 3. 写头到连接
             conn.write_all(&header).await.map_err(|e| format!("trojan write header: {e}"))?;
 
@@ -357,6 +355,8 @@ mod tests {
     /// （对齐入站 server.rs UDP relay fatal 分支；修复前坏帧滞留 rbuf 被无限重读）。
     #[tokio::test]
     async fn udp_framed_conn_fatal_frame_terminates() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
         let (client_side, mut server_side) = tokio::io::duplex(4096);
         let mut framed = TrojanUdpFramedConn::new(
             Box::new(xray_transport::connection::DuplexConnection::new(client_side)),

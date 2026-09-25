@@ -31,7 +31,7 @@ pub enum ConfError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// JSON 错误自动转换。位置信息通过 [`ConfError::with_position`] 提取。
+    /// JSON 错误自动转换。位置信息通过 `ConfError::with_position` 提取。
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 

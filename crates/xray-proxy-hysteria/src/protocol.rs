@@ -26,7 +26,7 @@ pub const MAX_MESSAGE_LENGTH: u64 = 64 * 1024;
 
 /// Padding 最大长度（64 KiB）。
 ///
-/// padding 读取后即丢弃（[`discard_exact`] 按块读，不按声明值预分配）。
+/// padding 读取后即丢弃（`discard_exact` 按块读，不按声明值预分配）。
 pub const MAX_PADDING_LENGTH: u64 = 64 * 1024;
 
 // ===== QUIC varint 读写 =====
@@ -305,6 +305,7 @@ pub fn frag_udp_message(m: &UdpMessage, max_size: usize) -> Vec<UdpMessage> {
         return vec![];
     }
     let full = &m.data;
+    #[allow(clippy::manual_div_ceil)] // usize 运算显式表达分片上限
     let frag_count = ((full.len() + max_payload - 1) / max_payload) as u8;
     let mut frags = Vec::with_capacity(frag_count as usize);
     let mut off = 0;
@@ -373,12 +374,10 @@ impl Defragger {
         if self.count == m.frag_count {
             let mut data = Vec::with_capacity(self.data_size);
             let mut addr = String::new();
-            for frag in &self.frags {
-                if let Some(f) = frag {
-                    data.extend_from_slice(&f.data);
-                    if addr.is_empty() {
-                        addr = f.addr.clone();
-                    }
+            for f in self.frags.iter().flatten() {
+                data.extend_from_slice(&f.data);
+                if addr.is_empty() {
+                    addr = f.addr.clone();
                 }
             }
             let result = UdpMessage {

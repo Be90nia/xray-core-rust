@@ -3,7 +3,7 @@
 //! 算法：以恒定速率 `bps` 发送，但根据近 5 秒 ACK 率动态调整 effective rate。
 //! ACK 率 < 0.8 钳制为 0.8；样本不足时按 1.0 处理。
 
-use std::{sync::{Arc, Mutex}, time::Duration};
+use std::sync::{Arc, Mutex};
 
 use super::{
     pacer::Pacer,
@@ -282,6 +282,8 @@ fn invalid_bandwidth(s: &str) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::congestion_swappable::types::test_support::MockRttStats;
 

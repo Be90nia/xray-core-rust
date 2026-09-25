@@ -11,7 +11,7 @@
 //! reader EOF → flush 剩余 → 退出。
 //!
 //! POST 通过 `post_fn: FnMut(Vec<u8>) -> Future<()>` 回调，便于多场景复用
-//! （hyper [`DefaultDialerClient::post_packet`]、H3 [`H3Conn::post_packet`]）。
+//! （hyper `DefaultDialerClient::post_packet`、H3 `H3Conn::post_packet`）。
 //!
 //! # 简化（vs Go）
 //!

@@ -3,8 +3,8 @@
 //! 对应 Go `app/commander/`：
 //! - `commander.go` → [`commander::Commander`]（service 容器 + 配置载体）
 //! - `service.go` → [`commander::Service`] trait + [`commander::ReflectionService`]
-//! - `outbound.go` → [`outbound::OutboundListener`] / [`outbound::OutboundHandler`] trait
-//!   stub（依赖 transport 全链路）
+//! - `outbound.go` → [`outbound::OutboundListener`] / `outbound::OutboundHandler` trait stub（依赖
+//!   transport 全链路）
 //! - `config.proto` → [`commander::Config`] + [`commander::TypedMessageConfig`]
 //!
 //! ## IO 边界范围（与 P4-4 proxyman / P4-7 stats 一致）

@@ -270,6 +270,7 @@ mod tests {
         assert_eq!(huffman_encode_length("ZZZZ"), 4); // 32 bits → 4 bytes
     }
 
+    #[allow(clippy::doc_lazy_continuation)] // 存量清零批次
     /// w1s7：HUFFMAN_BITS 完整 256 项逐字节对照 RFC 7541 Appendix B 真值。
     /// 之前手抄版 144 项错（base62 字符 e/g/h/i/j/k/m/o/q/r/s/t/u/y/z 全错位
     /// + 0x80-0xff 段多位偏差），tokenish padding 长度系统性偏离 ~15% → Go

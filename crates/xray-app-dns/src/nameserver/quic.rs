@@ -21,14 +21,8 @@ use std::{
 };
 
 use hickory_proto::rr::RecordType;
-use quinn::{
-    ClientConfig as QuinnClientConfig, Endpoint,
-    crypto::rustls::QuicClientConfig,
-};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    time::timeout,
-};
+use quinn::{ClientConfig as QuinnClientConfig, Endpoint, crypto::rustls::QuicClientConfig};
+use tokio::time::timeout;
 use tokio_rustls::rustls::ClientConfig;
 use xray_common::net::address::Address;
 
@@ -272,13 +266,11 @@ mod tests {
         op::{Message, MessageType, OpCode, Query},
         rr::{Name, RData, Record, RecordType},
     };
+    use quinn::{ServerConfig as QuinnServerConfig, crypto::rustls::QuicServerConfig};
     use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
     use super::*;
     use crate::config::IpOption;
-
-    use quinn::crypto::rustls::QuicServerConfig;
-    use quinn::ServerConfig as QuinnServerConfig;
 
     /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
     fn ensure_crypto_provider() {

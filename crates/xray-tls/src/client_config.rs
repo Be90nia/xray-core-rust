@@ -5,11 +5,11 @@
 //! - `serverName`（SNI 由调用方传给 `utls::client`，此处仅解析）
 //! - `allowInsecure` / `alpn`
 //! - `minVersion` / `maxVersion` / `cipherSuites` / `curvePreferences` （经
-//!   [`crate::config::security_params`]，rustls 边界项 warn 后降级）
+//!   `crate::config::security_params`，rustls 边界项 warn 后降级）
 //! - `disableSystemRoot` + `certificates[]`：自定义 CA 信任根替代 webpki-roots （对应 Go
 //!   `getCertPool` → `loadSelfCertPool`）
 //! - `pinnedPeerCertSha256`：证书钉扎（对应 Go `RandCarrier.verifyPeerCert` + `verifyChain`，见
-//!   [`PinnedServerCertVerifier`]）
+//!   `PinnedServerCertVerifier`）
 //! - `certificates[]` 带 key 条目：客户端身份证书（mTLS 双向握手；Go 无此能力， Rust 扩展）
 //!
 //! ECH 留待 115 另 issue；`verifyPeerCertByName` 未实现（Go v26 新增，暂无需求）。
@@ -60,11 +60,11 @@ const DEFAULT_ALPN: &[&str] = &["h2", "http/1.1"];
 /// - `serverName`（SNI 由调用方传给 `utls::client`，此处仅解析）
 /// - `allowInsecure` / `alpn`
 /// - `minVersion` / `maxVersion` / `cipherSuites` / `curvePreferences` （经
-///   [`crate::config::security_params`]，rustls 边界项 warn 后降级）
+///   `crate::config::security_params`，rustls 边界项 warn 后降级）
 /// - `disableSystemRoot` + `certificates[]`：自定义 CA 信任根替代 webpki-roots （对应 Go
 ///   `getCertPool` → `loadSelfCertPool`）
 /// - `pinnedPeerCertSha256`：证书钉扎（对应 Go `RandCarrier.verifyPeerCert` + `verifyChain`，见
-///   [`PinnedServerCertVerifier`]）
+///   `PinnedServerCertVerifier`）
 /// - `certificates[]` 带 key 条目：客户端身份证书（mTLS 双向握手；Go 无此能力， Rust 扩展）
 /// - `verifyPeerCertByName`（Go v26 新增）：以字符串而非 SNI 主机名做证书验证， 用于 ECH/PSK
 ///   等握手阶段 SNI 与真实服务名不一致的场景。

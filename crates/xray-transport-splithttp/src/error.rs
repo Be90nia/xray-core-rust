@@ -49,7 +49,7 @@ pub enum SplitHttpError {
     #[error("invalid url: {0}")]
     InvalidUrl(String),
 
-    /// 无效 HTTP header value/name（来自 [`http::header::InvalidName`] /
+    /// 无效 HTTP header value/name（来自 `http::header::InvalidName` /
     /// [`http::header::InvalidHeaderValue`]）。
     #[error("invalid http header: {0}")]
     InvalidHeader(String),

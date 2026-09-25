@@ -18,7 +18,7 @@
 //!
 //! ## 切片2 （P1-639）
 //!
-//! 接入 [`tokio-tungstenite`] 0.26 + rustls，实现真实拨号/监听 + early data (0-RTT)：
+//! 接入 `tokio-tungstenite` 0.26 + rustls，实现真实拨号/监听 + early data (0-RTT)：
 //! - [`client::dial`] — TCP→TLS→WS 握手，构造自定义 request (host/path/Sec-WebSocket-Protocol)
 //! - [`server::WsListener`] — TCP listener + accept_hdr_async 拦截 host/path 校验 + early data 提取
 //! - [`ws_bridge::WsConnection`] — WebSocketStream → AsyncRead/AsyncWrite + Connection 包装

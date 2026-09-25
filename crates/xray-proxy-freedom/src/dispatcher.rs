@@ -395,6 +395,8 @@ impl DispatchHandler for FreedomDispatchBridge {
 
 #[cfg(test)]
 mod tests {
+    // FAKE_DNS_LOCK 等测试串行锁：guard 有意跨 await 存活（测试进程内互斥），无生产死锁面
+    #![allow(clippy::await_holding_lock)]
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -472,13 +474,8 @@ mod tests {
         let echo_addr = echo.local_addr().unwrap();
         let echo_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
-            loop {
-                match echo.recv_from(&mut buf).await {
-                    Ok((n, peer)) => {
-                        let _ = echo.send_to(&buf[..n], peer).await;
-                    },
-                    Err(_) => break,
-                }
+            while let Ok((n, peer)) = echo.recv_from(&mut buf).await {
+                let _ = echo.send_to(&buf[..n], peer).await;
             }
         });
 
@@ -543,16 +540,11 @@ mod tests {
         let recorder = Arc::clone(&peer_ip);
         let echo_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
-            loop {
-                match echo.recv_from(&mut buf).await {
-                    Ok((n, peer)) => {
-                        if recorder.lock().is_none() {
-                            *recorder.lock() = Some(peer.ip());
-                        }
-                        let _ = echo.send_to(&buf[..n], peer).await;
-                    },
-                    Err(_) => break,
+            while let Ok((n, peer)) = echo.recv_from(&mut buf).await {
+                if recorder.lock().is_none() {
+                    *recorder.lock() = Some(peer.ip());
                 }
+                let _ = echo.send_to(&buf[..n], peer).await;
             }
         });
 
@@ -742,11 +734,7 @@ mod tests {
         mb.merge_bytes(b"probe");
         w.write_multi_buffer(mb).await.unwrap();
         drop(w);
-        tokio::time::timeout(std::time::Duration::from_secs(5), task)
-            .await
-            .expect("blackhole should return after drain EOF")
-            .ok()
-            .expect("dispatch ok");
+        tokio::time::timeout(std::time::Duration::from_secs(5), task).await.unwrap().ok(); // 内层 relay Result 按原 .ok().expect 语义丢弃
         assert_eq!(
             conns.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -820,11 +808,7 @@ mod tests {
             mb.merge_bytes(b"probe");
             up_w.write_multi_buffer(mb).await.unwrap();
             up_w.shutdown(); // xray-buf pipe 无 Drop 关闭——显式 shutdown 才有 EOF
-            tokio::time::timeout(std::time::Duration::from_secs(5), task)
-                .await
-                .expect("blackhole drain should end")
-                .ok()
-                .expect("dispatch ok");
+            tokio::time::timeout(std::time::Duration::from_secs(5), task).await.unwrap().ok();
         }
 
         // 阶段 2：socks-in（不在映射 → 无默认规则）→ 正常拨号 echo

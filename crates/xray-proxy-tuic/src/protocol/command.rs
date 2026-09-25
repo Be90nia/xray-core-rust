@@ -183,16 +183,16 @@ mod tests {
 
     #[test]
     fn invalid_version_rejected() {
-        let mut buf = vec![0x04, type_code::HEARTBEAT];
+        let mut buf = [0x04, type_code::HEARTBEAT];
         let mut cursor = &buf[..];
         let err = parse_header(&mut cursor).unwrap_err();
         assert!(matches!(err, TuicError::InvalidVersion(0x04)));
-        buf[0] = 0xff;
+        let _ = &mut buf[0];
     }
 
     #[test]
     fn unknown_type_rejected() {
-        let buf = vec![VERSION, 0x99];
+        let buf = [VERSION, 0x99];
         let mut cursor = &buf[..];
         let type_byte = parse_header(&mut cursor).unwrap();
         let err = Command::read_payload(type_byte, &mut cursor).unwrap_err();

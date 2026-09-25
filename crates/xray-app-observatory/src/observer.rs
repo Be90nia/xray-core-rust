@@ -890,7 +890,7 @@ impl RealOutboundSelector {
     ///
     /// 内部包装一个 `OutboundSelector` 适配器（每次 `select` 转发到
     /// `OutboundTagSelector::select_by_prefix`）。开销为一次间接调用 + 一次
-    /// Vec<String> 分配；observatory 探测间隔 ≥ 1s，可忽略。
+    /// Vec````<String>```` 分配；observatory 探测间隔 ≥ 1s，可忽略。
     pub fn with_selector(backend: Arc<dyn xray_features::OutboundTagSelector>) -> Self {
         struct BackendAdapter(Arc<dyn xray_features::OutboundTagSelector>);
         impl OutboundSelector for BackendAdapter {
@@ -916,7 +916,7 @@ impl OutboundSelector for RealOutboundSelector {
 /// - **burst healthping**（`new`）：沿用配置的 method + 200-399 判 alive （Go
 ///   `healthping.go:175-179`）。
 pub struct HttpProbeExecutor {
-    /// 探测目标 URL（如 https://www.google.com/generate_204）
+    /// 探测目标 URL（如 <<<<https://www.google.com/generate_204）>>>>
     url: String,
     /// HTTP 方法（如 HEAD）
     method: String,
@@ -1094,6 +1094,7 @@ struct LinkConnIo {
 
 struct ReaderSlot {
     inner: Option<Box<dyn BufReader>>,
+    #[allow(clippy::type_complexity)] // 泵 future 类型即协议形态
     fut: Option<
         Pin<
             Box<
@@ -1165,6 +1166,7 @@ impl AsyncRead for ReaderSlot {
 
 struct WriterSlot {
     inner: Option<Box<dyn BufWriter>>,
+    #[allow(clippy::type_complexity)] // 泵 future 类型即协议形态
     fut: Option<
         Pin<Box<dyn Future<Output = (Box<dyn BufWriter>, xray_buf::io::Result<()>)> + Send>>,
     >,
@@ -1539,7 +1541,7 @@ mod link_conn_tests {
         // pipe 写端 drop 不触发 close（buf pipe 无 Drop impl）——不 shutdown
         // 读端永远 Pending。
         tokio::spawn(async move {
-            use xray_buf::io::{Reader as _, Writer as _};
+            use xray_buf::io::Writer as _;
             let mut w = s_w;
             let mut r = s_r;
             let _ = r.read_multi_buffer().await;

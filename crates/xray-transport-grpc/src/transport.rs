@@ -415,6 +415,7 @@ pub async fn listen(
     Ok(Box::new(GrpcListener { local, listener, shutdown }))
 }
 
+#[allow(clippy::too_many_arguments)] // 存量清零批次：too_many_arguments
 async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
     conn: T,
     handler: ConnHandler,
@@ -760,6 +761,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
     fn cfg_single(name: &str) -> Config {
         let mut c = Config::default();
         c.service_name = name.to_string();
@@ -813,6 +815,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
     async fn dial_h2_sends_authority_and_user_agent() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -995,6 +998,7 @@ mod tests {
     /// 帧全部元素拼接到达（修复前 decode_hunk_frame 把 repeated bytes 覆盖
     /// 合并只留最后元素 = 截断）。
     #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
     async fn dial_h2_multi_mode_roundtrips_multi_element_frames() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

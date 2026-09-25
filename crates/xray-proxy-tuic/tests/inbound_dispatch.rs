@@ -24,10 +24,7 @@ use xray_app_dispatcher::{
 };
 use xray_features::inbound::InboundHandler as _;
 use xray_proxy_tuic::{
-    client::TuicClient,
-    inbound::{TuicInboundConfig, TuicInboundHandler},
-    pool::QuinnConnectionPool,
-    protocol::Address,
+    client::TuicClient, inbound::TuicInboundConfig, pool::QuinnConnectionPool, protocol::Address,
 };
 
 async fn start_echo_server() -> SocketAddr {
@@ -114,7 +111,7 @@ async fn tuic_inbound_dispatches_via_router() {
     .expect("connect timed out")
     .expect("connect failed");
 
-    let mut conn = tokio::time::timeout(
+    let conn = tokio::time::timeout(
         Duration::from_secs(10),
         client.dial(Address::Ipv4(std::net::Ipv4Addr::LOCALHOST, echo_addr.port())),
     )

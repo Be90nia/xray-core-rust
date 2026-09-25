@@ -116,7 +116,7 @@ impl QuicConfig {
         })
     }
 
-    /// 构建 quinn [`TransportConfig`]（qeyo：完整 6 字段 + 拥塞控制）。
+    /// 构建 quinn `TransportConfig`（qeyo：完整 6 字段 + 拥塞控制）。
     ///
     /// `"bbr"` → quinn BBR；`"reno"` → quinn NewReno；`""`/`"brutal"` → CUBIC
     /// （解析层已保证字面值合法；`Default` 的 `""` 落 CUBIC 即 quinn 默认）。

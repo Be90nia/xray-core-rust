@@ -104,7 +104,8 @@ impl RoutingService {
     /// 获取平衡器原则目标（对应 Go `routingServer.GetBalancerInfo` 之 principle
     /// 字段，即 `(*RoundRobinStrategy).GetPrincipleTarget` 等）。
     ///
-    /// 返回 balance `selectors` 经 [`OutboundHandlerSelector::select_outbounds`]
+    /// 返回 balance `selectors` 经
+    /// [`OutboundHandlerSelector::select_outbounds`](crate::balancing::OutboundHandlerSelector::select_outbounds)
     /// 过滤后的 outbound 列表（顺序由 strategy 决定；当前实现直接走 selectors 顺序，
     /// 与 Go `RoundRobinStrategy.GetPrincipleTarget(strings) []string { return strings }`
     /// 的 Round-Robin 行为等价）。

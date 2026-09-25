@@ -7,7 +7,7 @@
 //! DNS 代理拦截 DNS 查询，按规则（qType + domain）决定动作：直接转发 / 丢弃 /
 //! 返回空响应 / 劫持重写。支持把查询重定向到指定上游 DNS 服务器。
 //!
-//! 实现配置层 + [`DNSRule::match_q_type`] / [`DNSRule::apply`] 纯函数。
+//! 实现配置层 + `DNSRule::match_q_type` / `DNSRule::apply` 纯函数。
 //! domain 匹配已接 `xray_geodata` matcher（`SimpleMatcherGroup`，就地编译）；
 //! 实际 DNS 转发依赖 `dns::Client` feature + transport::Link。
 

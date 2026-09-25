@@ -247,7 +247,6 @@ fn filter_ip_entries(entries: &[&ResponseEntry], option: IpOption) -> Vec<Addres
 /// `example.com` / `foo.example.com` / `a.b.example.com`，由
 /// `MphDomainMatcher` 配合 `DomainType::Domain` 规则承担。删除旧的 exact-only
 /// `InMemoryMatcher`（见 commit 之前逻辑）。
-
 // Address 构造辅助。
 trait AddressExt {
     fn ipv4_or_v6(ip: IpAddr) -> Self;

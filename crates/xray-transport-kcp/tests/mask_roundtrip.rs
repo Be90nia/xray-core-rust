@@ -53,6 +53,7 @@ impl RecordingProxy {
         thread::spawn(move || {
             let mut buf = [0u8; 2048];
             let mut client: Option<SocketAddr> = None;
+            #[allow(clippy::single_match)] // Err/非匹配分支保活等待（测试 echo 线程）
             while !st.load(Ordering::Relaxed) {
                 match socket.recv_from(&mut buf) {
                     Ok((n, src)) => {

@@ -298,7 +298,7 @@ pub fn new_dot_name_server(
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, SocketAddr};
 
     use hickory_proto::{
         op::{Message, MessageType, OpCode, Query},
@@ -306,13 +306,11 @@ mod tests {
     };
     use tokio::net::TcpListener;
     use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
+    use xray_common::net::address::Address;
     use xray_transport::connection::TcpConnection;
 
     use super::*;
     use crate::config::IpOption;
-
-    use std::net::SocketAddr;
-    use xray_common::net::address::Address;
 
     fn ip_dest(addr: SocketAddr) -> Destination {
         Destination::tcp(Address::from(addr.ip()), Port::new(addr.port()))

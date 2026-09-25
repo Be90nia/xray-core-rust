@@ -17,11 +17,7 @@ use xray_app_dispatcher::{
     DispatchHandler,
     default::{DialBridge, SimpleOhm},
 };
-use xray_common::{
-    net::{address::Address, port::Port},
-    protocol::ID,
-    uuid::UUID,
-};
+use xray_common::{net::address::Address, protocol::ID, uuid::UUID};
 use xray_proxy_freedom::make_freedom_dial_fn;
 use xray_proxy_vless::{
     account::MemoryAccount,
@@ -105,7 +101,11 @@ async fn run_vless_e2e() {
     let ohm_clone = Arc::clone(&ohm);
     let validator_clone = Arc::clone(&validator);
     tokio::spawn(async move {
-        let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None, None, None).await;
+        let listener = xray_transport::system_listener::InboundTcpListener::from_tokio(
+            vless_listener,
+            xray_transport::sockopt::SocketOptions::default(),
+        );
+        let _ = serve_vless(listener, ohm_clone, validator_clone, None, None, None).await;
     });
 
     // 4. VLESS client：connect → encode header → decode response → echo round-trip
@@ -153,7 +153,11 @@ async fn vless_rejects_unknown_user() {
     let ohm_clone = Arc::clone(&ohm);
     let validator_clone = Arc::clone(&validator);
     tokio::spawn(async move {
-        let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None, None, None).await;
+        let listener = xray_transport::system_listener::InboundTcpListener::from_tokio(
+            vless_listener,
+            xray_transport::sockopt::SocketOptions::default(),
+        );
+        let _ = serve_vless(listener, ohm_clone, validator_clone, None, None, None).await;
     });
 
     // client 用未注册的随机 UUID

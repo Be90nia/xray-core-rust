@@ -5,7 +5,7 @@
 //! - 每个 [`PooledConnection`] 包装 [`quinn::Connection`] + 引用计数 + 状态标记
 //! - 连接断开时自动重建（指数退避，最大 5 次）
 //! - 多 stream 复用：一个 QUIC 连接上开多个 bi/uni stream
-//! - UDP native 模式：通过 [`quinn::Connection::send_datagram`] / [`recv_datagram`] 传输
+//! - UDP native 模式：通过 [`quinn::Connection::send_datagram`] / `recv_datagram` 传输
 //!
 //! ## 线程安全
 //!
@@ -58,7 +58,7 @@ impl PoolKey {
 
 /// 池内连接项 — 包装 quinn 连接 + 元数据。
 ///
-/// 字段公开以便 [`TuicClient`] 直接访问底层连接。
+/// 字段公开以便 `TuicClient` 直接访问底层连接。
 #[derive(Clone)]
 pub struct PooledConnection {
     /// 底层 quinn 连接。
@@ -287,7 +287,7 @@ impl ReconnectingConnection {
 /// 这里只提供便捷方法：open_bi / open_uni / send_datagram / recv_datagram。
 #[derive(Clone)]
 pub struct MultiplexedConnection {
-    /// 内部池连接（公开以便 [`TuicClient`] 访问）。
+    /// 内部池连接（公开以便 `TuicClient` 访问）。
     pub pooled: PooledConnection,
 }
 

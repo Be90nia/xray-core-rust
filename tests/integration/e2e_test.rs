@@ -268,7 +268,7 @@ async fn send_and_verify_via_trojan(
 ) -> Result<(), E2eError> {
     let mut client = TcpStream::connect(proxy_addr).await?;
     let mut header_buf = Vec::new();
-    trojan_write_request_header(
+    let _unused = trojan_write_request_header(
         &mut header_buf,
         account,
         TrojanNetwork::Tcp,

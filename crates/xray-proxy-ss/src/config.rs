@@ -91,7 +91,7 @@ impl CipherType {
 /// `+ Send + Sync` 保证 SSStream 可跨线程（tokio::spawn 要求 Future: Send）。
 pub type InnerAead = Box<dyn AeadCipherImpl + Send + Sync>;
 
-/// AEAD creator 函数签名：key → Box<dyn AeadCipherImpl>。
+/// AEAD creator 函数签名：key → `Box<dyn AeadCipherImpl>`。
 pub type AeadCreator = fn(&[u8]) -> std::result::Result<InnerAead, CryptoError>;
 
 /// AES-128-GCM creator。
@@ -237,6 +237,8 @@ impl Cipher {
         if buf.len() <= iv_len {
             return Err(SsError::InsufficientData(buf.len()));
         }
+        // Self 当前仅 Aead 变体（还原代码形态），模式必真
+        #[allow(irrefutable_let_patterns)]
         if let Self::Aead(_) = self {
             let iv: Vec<u8> = buf[..iv_len].to_vec();
             let aead = self.create_aead(key, &iv)?.expect("aead for Aead variant");
@@ -358,7 +360,7 @@ mod tests {
 
     #[test]
     fn cipher_type_roundtrip() {
-        for ct in [CipherType::XChaCha20Poly1305] {}
+        let _ct = CipherType::XChaCha20Poly1305;
     }
 
     #[test]

@@ -223,10 +223,11 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::assertions_on_constants)] // 存量清零批次：assertions_on_constants
     fn disabled_pool_never_donates() {
         let pool = PreConnectPool::new(PreConnectConfig::default()); // count=0
         assert!(!pool.config().enabled());
-        assert_eq!(pool.try_donate().unwrap(), false);
+        assert!(!pool.try_donate().unwrap());
         assert!(pool.is_empty());
     }
 
@@ -245,6 +246,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)] // 存量清零批次：assertions_on_constants
     fn donate_full_rejects() {
         let pool = PreConnectPool::new(PreConnectConfig { count: 2, ttl: Duration::from_secs(30) });
         pool.try_donate().unwrap();
@@ -252,7 +254,7 @@ mod tests {
         assert_eq!(pool.len(), 2);
 
         // 池满
-        assert_eq!(pool.try_donate().unwrap(), false);
+        assert!(!pool.try_donate().unwrap());
         assert_eq!(pool.rejected_full(), 1);
         assert_eq!(pool.len(), 2);
     }

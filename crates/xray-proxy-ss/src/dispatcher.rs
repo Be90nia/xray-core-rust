@@ -49,7 +49,7 @@ const GLOBAL_ID_LEN: usize = 8;
 /// SS 加密流 → Connection trait 实现。
 ///
 /// 桥接 `SSStream<Box<dyn Connection>>` 的 `write_chunk`/`read_chunk` 到
-/// `AsyncRead`/`AsyncWrite`：spawn 一个 [`pump_ss_stream`] task，在 SS 加密
+/// ``AsyncRead`/`AsyncWrite`：spawn 一个 `pump_ss_stream` task，在 SS 加密`
 /// chunk 流与 `tokio::io::duplex` 明文 IO 之间双向搬运。`SsConnection` 自身只
 /// 持有 duplex 客户端半 + pump task 句柄，trait 方法全部委托给 duplex。
 ///
@@ -449,7 +449,7 @@ pub fn make_ss_dial_fn(config: Arc<SsOutboundConfig>) -> DialFn {
                         // pump_ss_stream 首次 try_open_chunk 时会经 drive_2022_rekey 解
                         // salt+fixed+var（payload=0 时只读 salt+fixed）。此处不再额外
                         // read_response_handshake，否则双重读同 conn → 首 read_exact EOF。
-                        
+
                         client
                             .dial_target_on(conn, &target_str, target_port)
                             .await

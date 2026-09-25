@@ -1,7 +1,7 @@
 //! SS-2022 key derivation (blake3, SIP022)
 //!
 //! 参考：
-//! - https://shadowsocks.org/doc/sip022.html
+//! - <https://shadowsocks.org/doc/sip022.html>
 //! - sing-shadowsocks/shadowaead_2022/protocol.go
 
 use crate::error::{Result, SsError};
@@ -234,7 +234,7 @@ mod tests {
         let subkey2 = derive_session_subkey(&psk, &salt, CipherKind2022::Aes256Gcm);
         assert_eq!(subkey, subkey2);
         // 不同 salt 不同输出
-        let salt2 = vec![0xcd; 31].iter().chain(&[0xce]).copied().collect::<Vec<_>>();
+        let salt2 = [0xcd; 31].iter().chain(&[0xce]).copied().collect::<Vec<_>>();
         let subkey3 = derive_session_subkey(&psk, &salt2, CipherKind2022::Aes256Gcm);
         assert_ne!(subkey, subkey3);
     }

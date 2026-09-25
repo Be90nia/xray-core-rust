@@ -6,7 +6,7 @@
 //! - TCP_FASTOPEN（Winsock 值 15；Go :16-32 是真实实现而非 no-op，Win10 1607+ 才支持 per-socket
 //!   TFO，老系统 setsockopt 返回 WSAENOPROTOOPT 由调用方处理）
 //! - IP_UNICAST_IF / IPV6_UNICAST_IF（出站接口绑定，Go :35-66；v4 值必须 network byte order——Go
-//!   :46-48 的 BigEndian 往返坑，见 [`unicast_if_v4_value`]）
+//!   :46-48 的 BigEndian 往返坑，见 `unicast_if_v4_value`）
 //!
 //! 对齐 Go stub（sockopt_windows.go:184-190）：Windows `setReuseAddr`/`setReusePort`
 //! 为 no-op（SO_EXCLUSIVEADDRUSE 语义下 Windows 默认行为已等价）。

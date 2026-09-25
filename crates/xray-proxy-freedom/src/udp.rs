@@ -302,6 +302,7 @@ async fn resolve_udp_domain(
 /// 2. 域名帧逐帧解析 + per-domain 缓存（bd czwu，Go :610-641）；
 /// 3. finalRule Block 检查在解析后的 IP 上，命中丢包继续（bd 6x5o，:634-637）；
 /// 4. noises 首包前注入，override 端口 53 时跳过（NoisePacketWriter :668-674）。
+///
 /// 帧不完整（UnexpectedEof）或 accum 为空返回 false。致命错误返回 Err。
 async fn parse_and_send(
     sock: &UdpSocket,
@@ -499,6 +500,8 @@ fn dest_to_socket_addr(dest: &Destination) -> Option<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
+    // FAKE_DNS_LOCK 等测试串行锁：guard 有意跨 await 存活（测试进程内互斥），无生产死锁面
+    #![allow(clippy::await_holding_lock)]
     use xray_common::net::{address::Address, network::Network, port::Port};
 
     use super::*;
@@ -517,13 +520,8 @@ mod tests {
         let echo_addr = echo.local_addr().unwrap();
         let echo_task = tokio::spawn(async move {
             let mut buf = vec![0u8; RECV_BUF_SIZE];
-            loop {
-                match echo.recv_from(&mut buf).await {
-                    Ok((n, peer)) => {
-                        let _ = echo.send_to(&buf[..n], peer).await;
-                    },
-                    Err(_) => break,
-                }
+            while let Ok((n, peer)) = echo.recv_from(&mut buf).await {
+                let _ = echo.send_to(&buf[..n], peer).await;
             }
         });
 
@@ -582,13 +580,8 @@ mod tests {
         let echo_addr = echo.local_addr().unwrap();
         let echo_task = tokio::spawn(async move {
             let mut buf = vec![0u8; RECV_BUF_SIZE];
-            loop {
-                match echo.recv_from(&mut buf).await {
-                    Ok((n, peer)) => {
-                        let _ = echo.send_to(&buf[..n], peer).await;
-                    },
-                    Err(_) => break,
-                }
+            while let Ok((n, peer)) = echo.recv_from(&mut buf).await {
+                let _ = echo.send_to(&buf[..n], peer).await;
             }
         });
 
@@ -660,6 +653,7 @@ mod tests {
     }
 
     /// 构造 relay 策略 + destinationOverride JSON（复用生产解析路径）。
+    #[allow(clippy::unnecessary_literal_unwrap)] // 测试常量 JSON 必然 Some
     fn override_to(port: u16) -> UdpPolicy {
         UdpPolicy {
             destination_override: Some(crate::config::DestinationOverride::from_json(
@@ -681,7 +675,7 @@ mod tests {
 
         let pipe_opt = xray_buf::pipe::PipeOption::default();
         let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
-        let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
+        let (_dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
         let link = Link::new(Box::new(up_r) as Box<dyn Reader>, Box::new(dn_w) as Box<dyn Writer>);
         let dest = udp_dest("127.0.0.1", a_port);
         let relay_task = tokio::spawn(async move { relay_policy(&dest, link, &[], &policy).await });
@@ -729,7 +723,7 @@ mod tests {
 
         let pipe_opt = xray_buf::pipe::PipeOption::default();
         let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
-        let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
+        let (_dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
         let link = Link::new(Box::new(up_r) as Box<dyn Reader>, Box::new(dn_w) as Box<dyn Writer>);
         let dest = udp_dest("127.0.0.1", echo_port);
         let relay_task = tokio::spawn(async move { relay_policy(&dest, link, &[], &policy).await });
@@ -766,7 +760,7 @@ mod tests {
             Ok(s) => s,
             Err(_) => return, // 环境端口冲突，跳过验证
         };
-        let mut policy = override_to(53);
+        let policy = override_to(53);
         let noises = vec![crate::config::Noise {
             packet: vec![1, 2, 3, 4],
             apply_to: "ip".into(),
@@ -775,7 +769,7 @@ mod tests {
 
         let pipe_opt = xray_buf::pipe::PipeOption::default();
         let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
-        let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
+        let (_dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
         let link = Link::new(Box::new(up_r) as Box<dyn Reader>, Box::new(dn_w) as Box<dyn Writer>);
         let dest = udp_dest("127.0.0.1", 53001);
         let relay_task =
@@ -813,7 +807,7 @@ mod tests {
     #[tokio::test]
     async fn udp_relay_terminator_frame_ends_request_pump() {
         // 0x00 0x02 = body_len=2 < MIN_META_LEN=4 → MetadataTooShort
-        let terminator = vec![0x00u8, 0x02u8, 0xAA, 0xBB];
+        let terminator = [0x00u8, 0x02u8, 0xAA, 0xBB];
         let mut cursor = std::io::Cursor::new(&terminator[..]);
         let mut pr = xray_xudp::packet::PacketReader::new(&mut cursor);
         let r = pr.read_packet();
@@ -858,7 +852,7 @@ mod tests {
 
         let pipe_opt = xray_buf::pipe::PipeOption::default();
         let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
-        let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
+        let (_dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
         let link = Link::new(Box::new(up_r) as Box<dyn Reader>, Box::new(dn_w) as Box<dyn Writer>);
         let dest = udp_dest("127.0.0.1", closed_port);
         let policy = UdpPolicy {

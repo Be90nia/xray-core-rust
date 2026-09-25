@@ -101,6 +101,7 @@ impl ChunkNonceGenerator {
 
     /// 生成下一个 nonce（自增 count）。
     #[must_use]
+    #[allow(clippy::should_implement_trait)] // 非 Iterator：nonce 自增器语义，改名破坏 Go 对齐阅读
     pub fn next(&mut self) -> Vec<u8> {
         self.next_ref().to_vec()
     }

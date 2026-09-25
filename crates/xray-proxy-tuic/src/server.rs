@@ -17,7 +17,7 @@ use std::{
 
 use bytes::{BufMut, Bytes, BytesMut};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
-use tokio::io::AsyncWriteExt;
+use tokio::io::AsyncWriteExt as _;
 use uuid::Uuid;
 use xray_app_dispatcher::{DispatchHandler, UdpDispatchSession};
 use xray_common::net::{address::Address as XAddress, destination::Destination, port::Port};
@@ -450,8 +450,7 @@ impl UdpAssocTable {
         // 分片路径：喂给该 assoc 的 assembler，未到齐则缓存
         if pkt.frag_total > 1 {
             let assoc = pkt.assoc_id;
-            let assembler =
-                self.frags.entry(assoc).or_default();
+            let assembler = self.frags.entry(assoc).or_default();
             match assembler.feed(pkt) {
                 Ok(Some(complete)) => {
                     // 重组成功 → 走常规路由
@@ -686,10 +685,7 @@ mod udp_assoc_tests {
     };
 
     use bytes::BufMut;
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::UdpSocket,
-    };
+    use tokio::net::UdpSocket;
     use uuid::Uuid;
     use xray_app_dispatcher::{DispatchHandler, default::PinFuture};
     use xray_common::net::{
@@ -932,6 +928,7 @@ mod udp_assoc_tests {
         let _ = assoc.send_recv(target, b"dns-q", Some(Duration::from_millis(500))).await;
 
         for _ in 0..50 {
+            #[allow(clippy::len_zero)] // 存量清零批次
             if store.lock().len() >= 1 {
                 break;
             }
@@ -968,6 +965,7 @@ mod udp_assoc_tests {
         let target = Address::Ipv4(Ipv4Addr::new(127, 0, 0, 1), 9);
         let _ = assoc.send_recv(target.clone(), b"a", Some(Duration::from_millis(500))).await;
         for _ in 0..50 {
+            #[allow(clippy::len_zero)] // 存量清零批次
             if store.lock().len() >= 1 {
                 break;
             }
@@ -1029,6 +1027,7 @@ mod udp_assoc_tests {
         buf.put_u8(VERSION);
         buf.put_u8(type_code::PACKET);
         pkt.write_payload(&mut buf);
+        #[allow(unused_imports)] // 存量清零批次
         use tokio::io::AsyncWriteExt as _;
         send.write_all(&buf.freeze()).await.expect("write bi packet");
         let _ = send.finish();

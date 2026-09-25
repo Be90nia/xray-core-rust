@@ -27,6 +27,7 @@ const PAYLOAD: &[u8] = b"hello e2e p2 batch!";
 const READY_DELAY: Duration = Duration::from_millis(120);
 
 #[derive(Debug, Error)]
+#[allow(dead_code)] // 变体按错误分支选择性使用
 enum E2eP2Error {
     #[error("xray-core start failed: {0}")]
     CoreStart(String),
@@ -52,6 +53,7 @@ impl From<String> for E2eP2Error {
 async fn start_echo() -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
     let addr = listener.local_addr().expect("echo addr");
+    #[allow(clippy::while_let_loop)] // 存量清零批次
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
@@ -168,7 +170,11 @@ async fn socks5_echo(
     sock.write_all(payload).await?;
     let mut got = vec![0u8; payload.len()];
     sock.read_exact(&mut got).await?;
-    if &got == payload { Ok(()) } else { Err(format!("echo mismatch: got {got:?}").into()) }
+    if got.as_slice() == payload {
+        Ok(())
+    } else {
+        Err(format!("echo mismatch: got {got:?}").into())
+    }
 }
 
 // ============================================================
@@ -375,7 +381,7 @@ async fn e2e_p2_wireguard_full_chain() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_p2_tls_utls_pinned() {
-    use xray_tls::{certificate::generate_self_signed_cert, pin::generate_cert_hash};
+    use xray_tls::certificate::generate_self_signed_cert;
 
     let echo_addr = start_echo().await;
     let vless_port = pick_free_port().await;
@@ -522,8 +528,10 @@ async fn e2e_p2_dns_core_resolution() {
         DnsService,
         cache_controller::CacheController,
         config::IpOption,
+        dial::SystemHostResolver,
         nameserver::{Server as _, udp::UdpNameServer},
     };
+    use xray_common::net::{address::Address, destination::Destination, port::Port};
     use xray_core::Feature as _;
 
     // (1) Mock UDP DNS server: 10.0.0.42 A record for any query.
@@ -556,12 +564,16 @@ async fn e2e_p2_dns_core_resolution() {
     });
 
     // (2) Production UdpNameServer lookup against the mock.
-    let ns = UdpNameServer::new(
-        std::net::SocketAddr::from(([127, 0, 0, 1], dns_port)),
+    let ns = Arc::new(UdpNameServer::new(
+        Destination::udp(
+            Address::from(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            Port::new(dns_port),
+        ),
         Arc::new(CacheController::new("test", true, false, 0, 0)),
         Vec::new(),
         Duration::from_secs(2),
-    );
+        Arc::new(SystemHostResolver),
+    ));
     let (ips, ttl) = tokio::time::timeout(
         Duration::from_secs(5),
         ns.query_ip(

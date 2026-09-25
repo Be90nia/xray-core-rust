@@ -490,7 +490,7 @@ async fn conn_drop_terminates_all_http_connections() {
 async fn bridge_eof_propagates_without_conn_idle() {
     use std::sync::atomic::AtomicUsize;
 
-    use futures_util::{StreamExt, TryStreamExt};
+    use futures_util::TryStreamExt;
     use xray_features::policy::TimeoutPolicy;
     use xray_transport::{bridge::bridge_link_with_stream_full, link::Link};
 
@@ -534,7 +534,7 @@ async fn bridge_eof_propagates_without_conn_idle() {
                                     std::convert::Infallible,
                                 > = http_body_util::BodyExt::boxed(
                                     http_body_util::StreamBody::new(
-                                        body.map_ok(|b| hyper::body::Frame::data(b)),
+                                        body.map_ok(hyper::body::Frame::data),
                                     ),
                                 );
                                 Ok::<_, std::convert::Infallible>(
@@ -588,7 +588,7 @@ async fn bridge_eof_propagates_without_conn_idle() {
     .await
     .unwrap();
     // 生产同款包装（register.rs：Sync bound）
-    let mut conn = conn.into_sync_reader();
+    let conn = conn.into_sync_reader();
 
     // 模拟 inbound 侧：up 管道写 payload 后 shutdown（SOCKS FIN 等价）；
     // down 管道读端由本测试持有（客户端收下行）。
@@ -622,7 +622,7 @@ async fn bridge_eof_propagates_without_conn_idle() {
         res.is_ok(),
         "bridge must return via half-close window (1s), not connIdle=300s; elapsed {elapsed:?}"
     );
-    let _ = res.unwrap().expect("bridge io ok");
+    res.unwrap().expect("bridge io ok");
     assert!(
         elapsed < Duration::from_secs(4),
         "bridge must exit within half-close window, elapsed {elapsed:?}"

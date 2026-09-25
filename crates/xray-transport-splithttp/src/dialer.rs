@@ -693,6 +693,7 @@ mod tests {
             .with_no_client_auth();
         let client = Arc::new(DefaultDialerClient::new(
             config.clone(),
+            #[allow(clippy::useless_conversion)] // 存量清零批次
             tls.into(),
             DialTarget { host: "h".into(), port: 0, sni: String::new() },
             None,
@@ -754,9 +755,7 @@ mod tests {
         // 不连真实服务器（用未知端口）。此测试仅覆盖 dial_splithttp 的下载 client
         // 构建路径不上 panic，且 connect 失败被透传出来。
         // 实装下由 mock_server.rs 覆盖真端到端；本测试为单元层 coverage。
-        let mut dl = Config::default();
-        dl.host = "dl-host".into();
-        dl.path = "/d/".into();
+        let dl = Config { host: "dl-host".into(), path: "/d/".into(), ..Default::default() };
         let main = Arc::new(Config {
             host: "main-host".into(),
             path: "/m/".into(),
@@ -800,6 +799,7 @@ mod tests {
             // send_request 死等 → 与 #11 无关的 mock 侧假死）。
             let mut driver_conn = conn;
             tokio::spawn(async move {
+                #[allow(clippy::while_let_loop)] // 存量清零批次
                 loop {
                     match driver_conn.accept().await {
                         Some(Ok(_)) => continue,

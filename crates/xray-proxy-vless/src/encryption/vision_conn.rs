@@ -39,6 +39,7 @@ const MAX_PADDING_CONTENT: usize = 2027;
 /// 生产链内层是 `Box<dyn Connection>`（实现 [`Connection`]，穿透到最底层
 /// `TcpConnection::raw_tcp_clone`）；tests/inbound 的内层（`CommonConn<DuplexStream>`、
 /// `tokio::io::Join`）无裸 TCP 可克隆，走默认 `None`。
+#[allow(private_bounds)] // trait 有意 crate 内私有，公开类型 bound 泄露为既定设计
 pub(crate) trait InnerRawClone {
     fn inner_raw_tcp_clone(&self) -> Option<TcpStream> {
         None
@@ -71,6 +72,7 @@ pub struct VisionConn<C> {
     /// uplink 首次 padding 附带的 uuid（take 后 None）。
     uplink_uuid_pending: Option<Vec<u8>>,
     /// uplink（writer）方向状态。
+    #[allow(dead_code)] // 写路径经 inner conn 承载，字段保留与 downlink_state 对称
     uplink_state: DirectionState,
     /// downlink（reader）方向状态。
     downlink_state: DirectionState,
@@ -118,6 +120,7 @@ pub struct VisionConn<C> {
 /// splice 切换仅首个上游写承担一次，对吞吐无影响。
 const RAW_WRITE_ARM_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
+#[allow(private_interfaces)] // InnerRawClone 为 crate 内实现细节，随公开方法泄露属刻意
 impl<C> VisionConn<C>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
@@ -195,7 +198,7 @@ where
     }
 
     /// dial 同步阶段主动发 uuid-only padding 块,后续 chunk 进 vision content。
-    /// 对齐 Go outbound VisionWriter mb[0]=nil → XtlsPadding(None, CommandPaddingContinue)。
+    /// 对齐 Go outbound VisionWriter `mb[0]=nil` → XtlsPadding(None, CommandPaddingContinue)。
     pub async fn write_uuid_only_padding(&mut self) -> io::Result<()> {
         use tokio::io::AsyncWriteExt;
 
@@ -489,6 +492,7 @@ where
     }
 }
 
+#[allow(private_bounds)] // InnerRawClone 有意 crate 内私有；bound 泄露为既定设计（rustc private-bounds）
 impl<C> VisionConn<C>
 where
     C: InnerRawClone + AsyncWrite + Unpin,
@@ -505,6 +509,7 @@ where
     ///   静默停摆，macOS Interop #08 r2 实测形态）；
     /// - 尾巴随后被下一次 inner 写带出时，后续 raw 字节已先上线——线序 颠倒，对端把 raw 明文当隧道
     ///   TLS 记录解析 → DecryptError 级联。
+    ///
     /// Go 无此坑：crypto/tls.Conn.Write 从不虚报写完。
     fn poll_arm_gate(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if !self.splice_armed {
@@ -556,6 +561,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+    use crate::encryption::aead::Aead;
 
     /// 构造 TCP 回环 socket 对 + 各自的裸克隆件（server splice 测试）。
     async fn make_tcp_pair() -> (
@@ -860,6 +866,7 @@ mod tests {
     }
 
     /// server 读侧 splice：收 client DIRECT 帧 → 自身读切裸 TCP。
+    #[allow(dead_code)] // 存量清零批次
     async fn server_splice_read_switch_on_client_direct() {
         let ((c, mut c2), (s, s2)) = make_tcp_pair().await;
         let uuid = vec![0xABu8; 16];
@@ -971,6 +978,7 @@ mod tests {
     /// raw 直传明文（判定期零激活 → 写完激活 → raw 明文可收）。
     #[tokio::test]
     async fn splice_raw_write_only_after_direct_completes() {
+        #[allow(unused_mut)] // 存量清零批次
         let ((mut c, _c2), (s, s2)) = make_tcp_pair().await;
         let key = b"united-key".to_vec();
         let mut server = VisionConn::new_server(
@@ -1110,6 +1118,7 @@ mod tests {
         );
 
         // raw 通道接管：对端裸发明文必须直达 caller，且 inner 读计数不动
+        #[allow(unused_mut)] // 存量清零批次
         let (mut raw_peer, mut raw_own2) = make_std_tcp_pair();
         rx.raw_fallback = Some(raw_own2);
         raw_peer.write_all(b"raw-downlink").await.unwrap();

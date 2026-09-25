@@ -138,12 +138,16 @@ pub struct TuicClient {
     /// 复用的 QUIC 连接（通过连接池管理）。
     multiplexed: MultiplexedConnection,
     /// 连接池引用（用于后续重连）。
+    #[allow(dead_code)] // 存量清零批次
     pool: QuinnConnectionPool,
     /// 连接参数（用于重连时重建）。
+    #[allow(dead_code)] // Go 对齐配置面字段
     key: PoolKey,
     /// UUID（认证用）。
+    #[allow(dead_code)] // Go 对齐配置面字段
     uuid: Uuid,
     /// 密码（认证用）。
+    #[allow(dead_code)] // Go 对齐配置面字段
     password: String,
     /// quic 模式 UDP 响应路由（per-connection uni-stream pump）。
     router: UniRespRouter,

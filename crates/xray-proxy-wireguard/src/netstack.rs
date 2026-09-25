@@ -404,6 +404,7 @@ impl phy::Device for VirtualDevice {
         Some(VirtTxToken { tx_queue_ptr: &mut self.tx_queue as *mut _ })
     }
 
+    #[allow(clippy::incompatible_msrv)] // 存量清零批次：incompatible_msrv
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
@@ -426,12 +427,14 @@ impl phy::Device for VirtualDevice {
 /// 此函数仅作为显式转换点，方便阅读。
 #[must_use]
 pub fn to_smoltcp_v4(addr: std::net::Ipv4Addr) -> Ipv4Address {
+    #[allow(clippy::incompatible_msrv)] // 存量清零批次
     Ipv4Address::from_octets(addr.octets())
 }
 
 /// 把 std::net::Ipv6Addr 转 smoltcp::wire::Ipv6Address。
 #[must_use]
 pub fn to_smoltcp_v6(addr: std::net::Ipv6Addr) -> Ipv6Address {
+    #[allow(clippy::incompatible_msrv)] // 存量清零批次
     Ipv6Address::from_octets(addr.octets())
 }
 
@@ -530,7 +533,8 @@ mod tests {
     fn tcp_connect_allocates_nonzero_local_port_and_distinct_tuples() {
         let mut stack = make_stack();
         let h1 = stack.add_tcp_socket();
-        let h2 = stack.add_tcp_socket();
+        #[allow(unused_variables)] // 存量清零批次
+        let _h2 = stack.add_tcp_socket();
         let dst = IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1));
         // smoltcp 0.12 对本地端口 0 恒报 Unaddressable——内部分配端口后必须成功
         stack.tcp_connect(h1, dst, 80).expect("first connect");

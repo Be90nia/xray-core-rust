@@ -35,6 +35,7 @@ pub struct PeerSession {
     /// peer 公钥 hex（调试用）。
     public_key_hex: String,
     /// session index，用于多 peer 场景唯一标识。
+    #[allow(dead_code)] // 存量清零批次
     index: u32,
 }
 
@@ -85,7 +86,7 @@ impl PeerSession {
 
     /// peer 是否「在线」——已握手且未超时。
     ///
-    /// 超过 [`HANDSHAKE_TIMEOUT`] 无握手视为离线（需要重新握手）。
+    /// 超过 `HANDSHAKE_TIMEOUT` 无握手视为离线（需要重新握手）。
     #[must_use]
     pub fn is_online(&self) -> bool {
         match self.time_since_last_handshake() {

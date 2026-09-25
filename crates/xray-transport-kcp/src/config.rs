@@ -36,6 +36,7 @@ pub trait ConfigExt {
 }
 
 impl ConfigExt for Config {
+    #[allow(clippy::manual_clamp)] // 存量清零批次：manual_clamp
     fn get_sending_in_flight_size(&self) -> u32 {
         let mtu = self.mtu.max(1);
         let tti = self.tti.max(1).min(1000);
@@ -50,6 +51,7 @@ impl ConfigExt for Config {
         self.max_sending_window / self.mtu.max(1)
     }
 
+    #[allow(clippy::manual_clamp)] // 存量清零批次：manual_clamp
     fn get_receiving_in_flight_size(&self) -> u32 {
         let mtu = self.mtu.max(1);
         let tti = self.tti.max(1).min(1000);

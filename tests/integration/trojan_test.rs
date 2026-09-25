@@ -6,14 +6,11 @@
 
 use std::sync::Arc;
 
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
-};
+use tokio::{io::AsyncWriteExt as _, net::TcpListener};
 use xray_common::net::address::Address;
 use xray_proxy_trojan::{
     config::MemoryAccount,
-    protocol::{COMMAND_TCP, CRLF, write_request_header},
+    protocol::{CRLF, write_request_header},
     server::trojan_server_handshake,
     validator::{MemoryUser, Validator},
 };
@@ -41,7 +38,8 @@ async fn trojan_handshake_succeeds() {
     let validator_clone = Arc::clone(&validator);
     let server_handle = tokio::spawn(async move {
         let (mut sock, _) = listener.accept().await.unwrap();
-        trojan_server_handshake(&mut sock, &validator_clone).await
+        trojan_server_handshake(&mut sock, &validator_clone, std::time::Duration::from_secs(30))
+            .await
     });
 
     // client task：connect → write_request_header
@@ -51,7 +49,7 @@ async fn trojan_handshake_succeeds() {
     let dest_port: u16 = 8080;
 
     let mut header_buf = Vec::new();
-    write_request_header(
+    let _unused = write_request_header(
         &mut header_buf,
         &account,
         xray_proxy_trojan::protocol::Network::Tcp,
@@ -83,7 +81,8 @@ async fn trojan_rejects_unknown_user() {
     let validator_clone = Arc::clone(&validator);
     let server_handle = tokio::spawn(async move {
         let (mut sock, _) = listener.accept().await.unwrap();
-        trojan_server_handshake(&mut sock, &validator_clone).await
+        trojan_server_handshake(&mut sock, &validator_clone, std::time::Duration::from_secs(30))
+            .await
     });
 
     // client 用未注册的密码
@@ -92,7 +91,7 @@ async fn trojan_rejects_unknown_user() {
 
     let dest_addr = Address::ipv4(std::net::Ipv4Addr::LOCALHOST);
     let mut header_buf = Vec::new();
-    write_request_header(
+    let _unused = write_request_header(
         &mut header_buf,
         &fake_account,
         xray_proxy_trojan::protocol::Network::Tcp,

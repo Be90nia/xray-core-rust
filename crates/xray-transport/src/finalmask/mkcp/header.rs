@@ -374,7 +374,7 @@ impl Udpmask for HeaderConfig {
 
 /// 同步逐包 codec（供 KCP 等同步 UDP 栈复用同一套算子，见 [`super::super::PacketCodec`]）。
 ///
-/// encode：`[header][payload]`（DTLS/SRTP/WeChat 序列号随发送递增，与 [`HeaderConn`] 一致）；
+/// encode：`[header][payload]`（DTLS/SRTP/WeChat 序列号随发送递增，与 `HeaderConn` 一致）；
 /// decode：剥离 `size()` 字节（接收不更新状态）。
 pub struct HeaderCodec {
     header: Mutex<Box<dyn Header>>,

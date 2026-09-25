@@ -4,10 +4,10 @@
 //! `TransportConfig::congestion_controller_factory` 预装。本模块用一个「可热切换的
 //! Controller 包装」弥合：
 //!
-//! - [`QuinnCCFactory`] 预装进 TransportConfig，每连接 build 出 [`QuinnCCAdapter`]；
+//! - `QuinnCCFactory` 预装进 TransportConfig，每连接 build 出 `QuinnCCAdapter`；
 //! - 初始委托 quinn 内建 CUBIC（对应 Go 未切换前的 quic-go 默认）；
 //! - auth 握手后调 [`apply_negotiated`]（对应 Go dialer.go:229-243 / hub.go:75-86 的 congestion
-//!   switch），把 BrutalSender/BbrSender 装进 [`HysteriaCCSlot`]， [`QuinnCCAdapter`]
+//!   switch），把 BrutalSender/BbrSender 装进 [`HysteriaCCSlot`]， `QuinnCCAdapter`
 //!   即刻切到真实算法。
 //!
 //! ## 与 Go 的差异
@@ -173,6 +173,7 @@ impl SentBook {
         lost
     }
 
+    #[allow(dead_code)] // 队列空检查为对称 API，测试面保留
     fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
@@ -188,7 +189,7 @@ struct CCState {
     book: SentBook,
 }
 
-/// CC 槽位：跨 [`QuinnCCAdapter`] clone 共享（quinn clone_box 走 path migration 时保持
+/// CC 槽位：跨 `QuinnCCAdapter` clone 共享（quinn clone_box 走 path migration 时保持
 /// 已协商算法）。同时是 [`CongestionSetter`] 的第一个生产实现。
 pub struct HysteriaCCSlot {
     state: Mutex<CCState>,
@@ -566,7 +567,7 @@ mod tests {
         // 模拟 factory build：fallback 变为真 CUBIC。
         let factory: Arc<QuinnCCFactory> = Arc::new(QuinnCCFactory { slot: Arc::clone(&slot) });
         quinn_proto::congestion::ControllerFactory::build(factory, Instant::now(), 1200);
-        let mut adapter = QuinnCCAdapter { slot };
+        let adapter = QuinnCCAdapter { slot };
         // CUBIC 初始窗口 = 14720.clamp(2*1200, 10*1200) = 12000（quinn 语义）。
         assert_eq!(adapter.window(), 12_000);
 
@@ -599,7 +600,7 @@ mod tests {
         assert_eq!(adapter.window(), 10_240);
 
         // clone_box 共享 slot：切换对 clone 生效（path migration 语义）。
-        let mut cloned = adapter.clone_box();
+        let cloned = adapter.clone_box();
         apply_brutal(&slot, 2_000_000, false);
         // 2MB/s 无 RTT → 仍是 10240 floor；喂 RTT 后 = 2×2MB/s×50ms。
         slot.rtt.update(std::time::Duration::from_millis(50), std::time::Duration::from_millis(50));

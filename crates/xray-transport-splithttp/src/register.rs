@@ -1,7 +1,7 @@
 //! SplitHTTP transport dialer + listener 注册。
 //!
-//! dialer: 已集成——通过 [`MutexReader`] 包装 `!Sync` reader 使 `SplitConn` 满足
-//! [`Connection`](xray_transport::connection::Connection) 的 `Sync` bound。
+//! dialer: 已集成——通过 `MutexReader` 包装 `!Sync` reader 使 `SplitConn` 满足
+//! ``Connection` 的 `Sync` bound。
 //! listener: HTTP/2 server 监听待集成，当前返回 `Unsupported`。
 //!
 //! 协议名同时注册 `"splithttp"`（Go 标准）和 `"xhttp"`（用户配置简写）。

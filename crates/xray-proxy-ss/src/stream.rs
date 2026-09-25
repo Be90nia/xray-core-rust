@@ -408,7 +408,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     ///
     /// 与 [`Self::read_chunk`] 的区别：读来源是调用方维护的缓冲而非直接 IO，
     /// 使 pump 层可以用 cancel-safe 的单次底层 read 喂数据（`Box<dyn Connection>`
-    /// 无 TcpStream::readable）。半帧状态存 [`Self::pending_payload`]。
+    ///     `无 TcpStream::readable）。半帧状态存 `Self::pending_payload`。`
     pub fn try_open_chunk(&mut self, pending: &mut Vec<u8>) -> Result<ChunkOut> {
         if !self.plain_prefix.is_empty() {
             return Ok(ChunkOut::Message(std::mem::take(&mut self.plain_prefix)));
@@ -475,11 +475,8 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     /// SS-2022 响应 rekey 状态机：salt → fixed → var（sing `readResponse` 缓冲版）。
     fn drive_2022_rekey(&mut self, pending: &mut Vec<u8>) -> Result<ChunkOut> {
         // 循环推进各阶段；任一阶段需更多字节 → NeedMore（状态保留）。
-        loop {
-            let stage = match self.response_rekey_2022.take() {
-                Some(s) => s,
-                None => break, // rekey 完成，落到下面的 half-frame / body loop。
-            };
+        // rekey 完成 → 退出落到下面的 half-frame / body loop。
+        while let Some(stage) = self.response_rekey_2022.take() {
             match stage {
                 Rekey2022::Salt { psk, kind, request_salt } => {
                     let salt_size = kind.salt_size();
@@ -666,7 +663,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     /// 标记流为「读 Go 风格 server response」（legacy IV rekey）：
     /// 第一次 `read_chunk` 前先读 IV 并 rekey 读侧 AEAD。
     ///
-    /// 对应 [`Client::dial_target_for_proxy`] 的 lazy rekey 模式。
+    /// 对应 `Client::dial_target_for_proxy` 的 lazy rekey 模式。
     pub fn mark_response_rekey(&mut self, account: MemoryAccount) {
         self.response_rekey = Some(account);
     }

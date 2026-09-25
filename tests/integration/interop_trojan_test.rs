@@ -99,7 +99,8 @@ async fn rust_trojan_client_connect(server_port: u16, echo_port: u16) -> std::io
     // Write Trojan request header
     let dest_addr = Address::ipv4(std::net::Ipv4Addr::LOCALHOST);
     let mut header_buf = Vec::new();
-    write_request_header(&mut header_buf, &account, TrojanNetwork::Tcp, &dest_addr, echo_port);
+    let _unused =
+        write_request_header(&mut header_buf, &account, TrojanNetwork::Tcp, &dest_addr, echo_port);
     client.write_all(&header_buf).await?;
     client.flush().await?;
 
@@ -206,7 +207,8 @@ async fn rust_trojan_server_go_client_handshake_only() {
     let validator_clone = Arc::clone(&validator);
     let server_handle = tokio::spawn(async move {
         let (mut sock, _) = listener.accept().await.expect("accept");
-        trojan_server_handshake(&mut sock, &validator_clone, std::time::Duration::from_secs(30)).await
+        trojan_server_handshake(&mut sock, &validator_clone, std::time::Duration::from_secs(30))
+            .await
     });
 
     // Rust client constructs Trojan handshake in Go-compatible format
@@ -215,7 +217,8 @@ async fn rust_trojan_server_go_client_handshake_only() {
 
     let dest_addr = Address::ipv4(std::net::Ipv4Addr::LOCALHOST);
     let mut header_buf = Vec::new();
-    write_request_header(&mut header_buf, &account, TrojanNetwork::Tcp, &dest_addr, 8080);
+    let _unused =
+        write_request_header(&mut header_buf, &account, TrojanNetwork::Tcp, &dest_addr, 8080);
     client.write_all(&header_buf).await.expect("write header");
     client.flush().await.expect("flush");
 

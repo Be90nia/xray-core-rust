@@ -251,7 +251,7 @@ async fn handle_request(
         return Ok(response_status(StatusCode::BAD_REQUEST));
     };
     let host = authority.host().to_string();
-    drop(authority);
+    // drop(authority)（no-op）已移除：authority 为引用，drop 无效果
 
     // 请求带 padding 头 → 服务端支持确认，响应也带，双向首 8 帧帧化
     let padded = req.headers().contains_key("padding");

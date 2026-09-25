@@ -4,7 +4,7 @@
 //! （即 Go 的 `net.Conn`）。在 Rust 端基于 tokio `AsyncRead + AsyncWrite`，
 //! 额外暴露 `remote_addr` / `local_addr` 供代理层记录路由信息。
 //!
-//! # Box<dyn Connection>
+//! # `Box<dyn Connection>`
 //!
 //! `Connection: AsyncRead + AsyncWrite + Unpin + Send + Sync`——supertrait 约束。
 //! tokio 提供 `impl<T: AsyncRead + ?Sized> AsyncRead for Box<T>` blanket impl，

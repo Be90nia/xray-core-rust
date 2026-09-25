@@ -56,7 +56,6 @@ impl Address {
     }
 
     /// 主机地址字符串（None 返空串）。
-
     /// 序列化到 [`BufMut`]（对应 tuic-core marshal）。
     ///
     /// 长度：None=3, IPv4=7, IPv6=19, Domain=1+len(domain)+2。

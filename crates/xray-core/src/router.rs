@@ -240,6 +240,7 @@ impl PatternRule {
                 Address::IPv6(ip) => self.ips.iter().any(|p| p.matches(std::net::IpAddr::V6(*ip))),
                 _ => false,
             };
+        #[allow(clippy::let_and_return)] // 存量清零批次
         ip_hit
     }
 }

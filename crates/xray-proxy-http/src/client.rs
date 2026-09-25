@@ -10,11 +10,10 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use xray_app_dispatcher::default::DialFn;
-use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
+use xray_common::net::{address::Address, destination::Destination, port::Port};
 use xray_transport::{
     connection::Connection,
     dialer::{StreamSettings, dial},
-    sockopt::SocketOptions,
 };
 
 use crate::config::Account;
@@ -29,7 +28,7 @@ pub struct HttpOutboundConfig {
     pub auth: Option<Account>,
     /// 可选 streamSettings（TLS/WS/...）。None 走 raw TCP。
     pub stream_settings: Option<StreamSettings>,
-    /// 6a5v：servers[0].headers 解析为 CONNECT 请求附加 header。
+    /// 6a5v：servers`0`.headers 解析为 CONNECT 请求附加 header。
     /// 保留插入序（HashMap 默认无序——这里改 Vec 保序）。
     pub headers: Vec<(String, String)>,
 }
@@ -124,15 +123,12 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
         let target_port = dest.port().value();
         Box::pin(async move {
             // 拨号到上游 HTTP 代理
-            use xray_common::net::{
-                address::Address, destination::Destination, network::Network, port::Port,
-            };
+            use xray_common::net::{address::Address, destination::Destination, network::Network};
             let server_addr = match &config.server_address {
                 Address::Domain(d) => d.clone(),
                 Address::IPv4(ip) => ip.to_string(),
                 Address::IPv6(ip) => ip.to_string(),
             };
-            let server_port = config.server_port.value();
             let server_dest =
                 Destination::new(config.server_address.clone(), config.server_port, Network::TCP);
             let sockopt =
@@ -247,6 +243,7 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
 fn base64_encode(input: &str) -> String {
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let bytes = input.as_bytes();
+    #[allow(clippy::manual_div_ceil)] // base64 4/3 容量公式，保持可读
     let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as u32;

@@ -4,11 +4,11 @@
 //!
 //! # 核心组件
 //!
-//! - [`TransferType`]: 传输类型（流式/包式）
-//! - [`Session`]: 单个 Mux 会话
-//! - [`SessionManager`]: 会话管理器
-//! - [`XUDP`]: UDP 会话扩展
-//! - [`XUDPManager`]: UDP 会话管理器
+//! - `TransferType`：传输类型（流式/包式）
+//! - `Session`：单个 Mux 会话
+//! - `SessionManager`：会话管理器
+//! - `XUDP`：UDP 会话扩展
+//! - `XUDPManager`：UDP 会话管理器
 
 use std::{
     collections::HashMap,
@@ -554,10 +554,9 @@ impl SessionManager {
     /// 若管理器已关闭则忽略。
     pub async fn remove(&self, id: u16) {
         let mut inner = self.shared.inner.write().await;
-        if !inner.closed
-            && inner.sessions.remove(&id).is_some() {
-                self.shared.size.fetch_sub(1, Ordering::Release);
-            }
+        if !inner.closed && inner.sessions.remove(&id).is_some() {
+            self.shared.size.fetch_sub(1, Ordering::Release);
+        }
     }
 
     /// 获取会话。
@@ -815,11 +814,11 @@ mod tests {
         let rx = session.done_receiver();
 
         // 初始值为 false
-        assert_eq!(*rx.borrow(), false);
+        assert!(!*rx.borrow());
 
         // 关闭后发送 done 信号
         session.close().await;
-        assert_eq!(*rx.borrow(), true);
+        assert!(*rx.borrow());
     }
 
     #[tokio::test]

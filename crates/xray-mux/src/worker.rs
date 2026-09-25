@@ -897,8 +897,7 @@ mod tests {
         // 预填 1 字节：泵读到非空 mb 走进写分支，卡在 StalledWriter.write
         let (input_r, mut input_w) = xray_buf::pipe::new();
         let mut mb = MultiBuffer::new();
-        mb.merge_bytes(&b"x".to_vec());
-        use xray_buf::io::Writer as _;
+        mb.merge_bytes(&b"x"[..]);
         input_w.write_multi_buffer(mb).await.unwrap();
         session.set_input(BufferedReader::new(Box::new(input_r))).await;
 
@@ -921,7 +920,7 @@ mod tests {
         use std::sync::Arc;
 
         use tokio::sync::Mutex as AsyncMutex;
-        use xray_buf::{io::Reader as _, pipe, reader::BufferedReader};
+        use xray_buf::{pipe, reader::BufferedReader};
         use xray_common::{
             net::{address::Address, port::Port},
             serial,
@@ -1163,12 +1162,7 @@ mod tests {
             let monitor_h = server.spawn_monitor(Arc::clone(&link_writer));
             let frame_server = Arc::clone(&server);
             tokio::spawn(async move {
-                loop {
-                    match frame_server.process_frame(&mut reader, &link_writer).await {
-                        Ok(true) => continue,
-                        _ => break,
-                    }
-                }
+                while let Ok(true) = frame_server.process_frame(&mut reader, &link_writer).await {}
                 frame_server.close();
                 monitor_h.abort();
             });
@@ -1404,7 +1398,7 @@ mod tests {
                 local: Option<Destination>,
             ) -> Result<Link, DispatchError> {
                 let _ = self.tx.send((dest, source.clone(), local.clone()));
-                let (ret_r, ret_w) = pipe::new();
+                let (ret_r, _ret_w) = pipe::new();
                 let (_pay_r, pay_w) = pipe::new();
                 Ok(Link { reader: Box::new(ret_r), writer: Box::new(pay_w) })
             }
@@ -1430,12 +1424,7 @@ mod tests {
             let monitor_h = server.spawn_monitor(Arc::clone(&link_writer));
             let frame_server = Arc::clone(&server);
             tokio::spawn(async move {
-                loop {
-                    match frame_server.process_frame(&mut reader, &link_writer).await {
-                        Ok(true) => continue,
-                        _ => break,
-                    }
-                }
+                while let Ok(true) = frame_server.process_frame(&mut reader, &link_writer).await {}
                 frame_server.close();
                 monitor_h.abort();
             });

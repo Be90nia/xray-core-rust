@@ -79,6 +79,7 @@ impl HealthPingRtts {
     /// - `now_unix_nanos` 当前时间，用于判断过期
     /// - 若无有效项，stats.min = 0
     /// - 若有效项 < 2，deviation = average / 2（与 Go 一致）
+    #[allow(clippy::field_reassign_with_default)] // 逐字段重置对齐 Go resetStats 表意
     pub fn statistics(&self, now_unix_nanos: i64) -> HealthPingStats {
         let mut stats = HealthPingStats::default();
         stats.max = 0;
@@ -354,6 +355,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)] // 存量清零批次：assertions_on_constants
     fn is_valid_rtt_helper() {
         assert!(50_i64 != RTT_UNTESTED && 50_i64 != RTT_FAILED);
         assert!(RTT_UNTESTED == RTT_UNTESTED);

@@ -362,23 +362,21 @@ pub fn new_doh_h2c_name_server(ns: &NameServerConfig) -> Result<Box<dyn Server>,
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, SocketAddr};
 
+    use h2::server;
     use hickory_proto::{
         op::{Message, MessageType, OpCode, Query},
         rr::{Name, RData, Record, RecordType},
     };
+    use http::Response;
     use tokio::net::TcpListener;
     use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
+    use xray_common::net::address::Address;
     use xray_transport::connection::TcpConnection;
 
     use super::*;
     use crate::config::IpOption;
-
-    use h2::server;
-    use http::Response;
-    use std::net::SocketAddr;
-    use xray_common::net::address::Address;
 
     fn ip_dest(addr: SocketAddr) -> Destination {
         Destination::tcp(Address::from(addr.ip()), Port::new(addr.port()))

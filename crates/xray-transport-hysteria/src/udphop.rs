@@ -278,6 +278,7 @@ impl UdpHopPacketConn {
     }
 
     /// 发送到当前活跃 addr（对应 Go `WriteTo`）。
+    #[allow(clippy::await_holding_lock)] // guard 有意存活跨 await（同步锁保护写路径）
     pub async fn write_to(&self, buf: &[u8]) -> std::io::Result<usize> {
         let inner = self.inner.lock();
         if inner.closed {
@@ -293,6 +294,7 @@ impl UdpHopPacketConn {
     }
 
     /// 关闭（对应 Go `Close`）。
+    #[allow(clippy::await_holding_lock)] // guard 有意存活跨 await（同步锁保护）
     pub async fn close(&self) -> std::io::Result<()> {
         // abort hop loop
         if let Some(handle) = self.hop_handle.lock().await.take() {
@@ -304,6 +306,7 @@ impl UdpHopPacketConn {
             h.abort();
         }
 
+        #[allow(clippy::await_holding_lock)] // 存量清零批次
         let mut inner = self.inner.lock();
         if inner.closed {
             return Ok(());

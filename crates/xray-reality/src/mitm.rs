@@ -20,10 +20,10 @@
 //!
 //! # 工作流
 //!
-//! 1. [`DUMMY_CERT`]：进程级固定模板（Go `init()` 等价）
+//! 1. `DUMMY_CERT`：进程级固定模板（Go `init()` 等价）
 //! 2. [`generate_reality_ed25519_cert`]：克隆模板 + HMAC 覆盖末尾 64 字节
 //! 3. [`build_server_config`]：用证书构建 rustls `ServerConfig`
-//! 4. [`server_tls`]（[`crate::server`]）：peek ClientHello → verify → TLS 握手 / fallback
+//! 4. `server_tls`（[`crate::server`]）：peek ClientHello → verify → TLS 握手 / fallback
 
 use std::sync::LazyLock;
 
@@ -113,7 +113,7 @@ static FORCE_ED25519_PROVIDER: &dyn rustls::crypto::KeyProvider = &ForceEd25519K
 
 /// 用证书 + 私钥构建 rustls `ServerConfig`（无客户端认证）。
 ///
-/// 强推 Ed25519 语义见 [`ForceEd25519SigningKey`]（Go fork `hs.sigAlg = Ed25519`
+/// 强推 Ed25519 语义见 `ForceEd25519SigningKey`（Go fork `hs.sigAlg = Ed25519`
 /// 复刻；rustls 默认协商会在 Go utls 客户端上触发 NoSignatureSchemesInCommon）。
 ///
 /// # Errors
@@ -210,7 +210,7 @@ fn build_dummy_cert() -> Result<DummyCert> {
 
 /// 生成 REALITY Ed25519 证书（Go `handshake()` pickCertificate 块的 Rust 等价）。
 ///
-/// 1. 克隆进程级固定模板 [`DUMMY_CERT`]（Go `bytes.Clone(signedCert)`）
+/// 1. 克隆进程级固定模板 `DUMMY_CERT`（Go `bytes.Clone(signedCert)`）
 /// 2. 计算 HMAC-SHA512(auth_key, 模板 ed25519 公钥) （[`crate::crypto::sign_reality_certificate`]）
 /// 3. 覆盖 cert_der 末尾 64 字节（Go `h.Sum(cert[:len(cert)-64])`——rcgen Ed25519 cert DER 末尾为
 ///    BIT STRING signature，内容恰 64 字节）
@@ -221,7 +221,7 @@ fn build_dummy_cert() -> Result<DummyCert> {
 ///
 /// # 参数
 ///
-/// - `auth_key`：HKDF-SHA256 派生的认证密钥（来自 [`verify_reality_client_hello`]）
+/// - `auth_key`：HKDF-SHA256 派生的认证密钥（来自 `verify_reality_client_hello`）
 ///
 /// # 返回
 ///
@@ -252,7 +252,7 @@ pub fn generate_reality_ed25519_cert(auth_key: &[u8]) -> Result<(Vec<u8>, Vec<u8
 /// `h.Write(clientHello.original); h.Write(hello.original)`，把
 /// `HMAC-SHA512(AuthKey, pub‖CH‖SH)` 的 ML-DSA-65 签名写入 `cert[126:]`。
 /// Rust 侧差异仅在偏移获取方式：rcgen 与 Go x509 的 DER 布局不同，签名写入
-/// 点由模板构建期动态定位（[`DummyCert::mldsa65_ext_value_off`]），语义一致。
+/// 点由模板构建期动态定位（`DummyCert::mldsa65_ext_value_off`），语义一致。
 ///
 /// # 参数
 ///

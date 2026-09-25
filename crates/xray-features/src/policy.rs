@@ -95,7 +95,7 @@ pub struct StatsPolicy {
     /// Whether to track online IPs per user.
     ///
     /// 对应 Go `features/policy.Stats.UserOnline`。开启后 inbound session
-    /// 在 `StatsPolicy.user_online` 为 true 时通过 [`xray_app_stats`] 注册
+    /// 在 `StatsPolicy.user_online` 为 true 时通过 `xray_app_stats` 注册
     /// `user>>>{email}>>>online` OnlineMap 并 AddIP，会话结束时 RemoveIP。
     pub user_online: bool,
 }

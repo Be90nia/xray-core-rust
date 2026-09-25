@@ -9,7 +9,6 @@
 //! 留给上层 transport（依赖 uTLS 决策），本模块只暴露 `handshake_io`
 //! 在调用方注入的 `AsyncRead + AsyncWrite` 上跑握手。
 
-
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
@@ -139,7 +138,7 @@ mod tests {
     #[tokio::test]
     async fn handshake_reads_request_writes_response() {
         let server = HttpUpgradeServer::new(make_config("/ws"));
-        let (mut server_io, mut client_io) = duplex(8192);
+        let (server_io, mut client_io) = duplex(8192);
 
         // 客户端先发请求
         let req =
@@ -163,7 +162,7 @@ mod tests {
     #[tokio::test]
     async fn handshake_captures_payload_after_terminator() {
         let server = HttpUpgradeServer::new(make_config("/ws"));
-        let (mut server_io, mut client_io) = duplex(8192);
+        let (server_io, mut client_io) = duplex(8192);
 
         // 客户端发请求 + payload
         let req = b"GET /ws HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nhello after";
@@ -184,7 +183,7 @@ mod tests {
     #[tokio::test]
     async fn handshake_rejects_xff_by_default_without_trusted_config() {
         let server = HttpUpgradeServer::new(make_config("/ws"));
-        let (mut server_io, mut client_io) = duplex(8192);
+        let (server_io, mut client_io) = duplex(8192);
 
         let req = b"GET /ws HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nX-Forwarded-For: 10.0.0.1, 192.168.1.1\r\n\r\n";
         client_io.write_all(req).await.unwrap();
@@ -202,7 +201,7 @@ mod tests {
     async fn handshake_adopts_xff_when_trusted_header_present() {
         let mut server = HttpUpgradeServer::new(make_config("/ws"));
         server.trusted_x_forwarded_for = vec!["X-Real-IP".into()];
-        let (mut server_io, mut client_io) = duplex(8192);
+        let (server_io, mut client_io) = duplex(8192);
 
         let req = b"GET /ws HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nX-Real-IP: 1.2.3.4\r\nX-Forwarded-For: 10.0.0.1, 192.168.1.1\r\n\r\n";
         client_io.write_all(req).await.unwrap();
@@ -223,7 +222,7 @@ mod tests {
     async fn handshake_rejects_xff_when_trusted_header_absent() {
         let mut server = HttpUpgradeServer::new(make_config("/ws"));
         server.trusted_x_forwarded_for = vec!["X-Real-IP".into()];
-        let (mut server_io, mut client_io) = duplex(8192);
+        let (server_io, mut client_io) = duplex(8192);
 
         let req = b"GET /ws HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nX-Forwarded-For: 10.0.0.1\r\n\r\n";
         client_io.write_all(req).await.unwrap();

@@ -1,4 +1,5 @@
-//! Blackhole dispatcher：把 [`Handler`] 接入 [`DispatchHandler`]。
+//! `Blackhole dispatcher：把 `Handler` 接入
+//! [`DispatchHandler`](xray_app_dispatcher::default::DispatchHandler)。`
 //!
 //! 对应 Go `proxy/blackhole/blackhole.go::Handler.Process(ctx, link, dialer)`。
 //!

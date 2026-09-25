@@ -87,6 +87,6 @@ mod tests {
         let _y: u8 = VERSION_Y;
         let _z: u8 = VERSION_Z;
         // 编译期断言：版本号非零（Xray 26.x 系列保证）。
-        assert!(VERSION_X > 0);
+        assert!(VERSION_X > 0, "VERSION_X must be nonzero");
     }
 }

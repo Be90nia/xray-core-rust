@@ -47,6 +47,7 @@ pub trait Server: Send + Sync {
     /// 查询域名对应的 IP。
     ///
     /// 返回 `(ips, ttl_seconds)`。
+    #[allow(clippy::type_complexity)] // 存量清零批次：type_complexity
     fn query_ip<'a>(
         &'a self,
         domain: &'a str,
@@ -162,7 +163,6 @@ impl Client {
     /// 入参：nameserver 配置 + 基线 IP 选项 + 可选 server 实现。
     /// ponytail: Go 用 `core.RequireFeatures` 从容器拿 Dispatcher，Rust 端要求调用方传入
     /// `Box<dyn Server>`，避免依赖全局容器。
-    #[must_use]
     pub fn new(
         ns: NameServerConfig,
         base_ip_option: IpOption,
@@ -205,6 +205,7 @@ impl Client {
     /// expected/unexpected IP 四分支过滤（nameserver.go 195-225）：
     /// 非 prior 的 expected 过滤空即 Err；非 unprior 的 unexpected 剥离空即 Err；
     /// actPrior/actUnprior 命中非空时替换结果集。
+    #[allow(clippy::type_complexity)] // Box<dyn Future> 返回即 Server trait 签名形态
     pub fn query_ip<'a>(
         &'a self,
         domain: &'a str,
@@ -396,8 +397,6 @@ fn parse_dns_url_host(input: &str, default_port: u16) -> Result<(Address, u16, S
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
 
     /// 确保 rustls CryptoProvider 在并行测试中只初始化一次

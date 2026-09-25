@@ -262,6 +262,7 @@ const CHROME_120_ALPS: &[u8] = CHROME_133_ALPS;
 /// 与 Chrome 131 相同：无 record_size_limit，无 delegated_credentials。
 /// 有 ECH (0x003a) 和 ApplicationSettings (0xfe0d)。
 #[cfg(test)]
+#[allow(dead_code)] // Chrome 指纹模板对齐保留
 fn chrome_120_ext_perm() -> Vec<btls::ssl::ExtensionType> {
     chrome_131_ext_perm()
 }
@@ -1014,7 +1015,7 @@ impl<S: Connection + Unpin> BtlsConn<S> {
             .await
     }
 
-    /// [`connect`] 的 ALPN 覆盖版（ws/httpupgrade 出站接线用，md5i）。
+    /// `connect` 的 ALPN 覆盖版（ws/httpupgrade 出站接线用，md5i）。
     ///
     /// 对应 Go `UConn.WebsocketHandshakeContext`（tls.go:98-133）：保持指纹模板
     /// 其余 ClientHello 形态，仅把 ALPN 扩展重写为 `alpn_wire`（openssl wire

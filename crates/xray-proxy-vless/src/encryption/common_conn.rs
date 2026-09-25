@@ -30,7 +30,7 @@ use crate::{
 /// 单段明文上限（对齐 Go `CommonConn` 的 8192）。
 const MAX_SEGMENT: usize = 8192;
 
-/// 加密连接：包装底层 `C`，实现 [`EncryptionConn`]。
+/// `加密连接：包装底层 `C`，实现 `EncryptionConn`。`
 ///
 /// 对应 Go 的 `*CommonConn`。构造时传入握手后的 AEAD 对（`aead` 发送 / `peer_aead` 接收）。
 pub struct CommonConn<C> {
@@ -70,6 +70,7 @@ impl<C> CommonConn<C> {
         &self.conn
     }
 
+    #[allow(dead_code)] // 对称 accessor：inner_conn() 已接线，mut 版为 passthrough 场景预留
     pub(crate) fn inner_conn_mut(&mut self) -> &mut C {
         &mut self.conn
     }

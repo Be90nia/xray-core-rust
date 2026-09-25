@@ -76,6 +76,7 @@ impl UConnState {
 }
 
 /// REALITY TLS 流：btls 指纹路径或 watfaq-rustls fallback 路径。
+#[allow(clippy::large_enum_variant)] // 双 TLS 栈 variant 尺寸差为 btls/rustls 事实
 pub enum RealityTlsStream<S> {
     /// btls (BoringSSL) 浏览器指纹握手（`S` 被包进 BIO 拦截层）。
     Btls(xray_tls::btls_client::BtlsConn<xray_tls::btls_reality::HelloRewriteStream<S>>),

@@ -8,7 +8,7 @@
 //! 业务核心（独立可测）：
 //! - [`InboundOperation`] / [`OutboundOperation`] trait — Go 同名接口
 //! - [`AddUserOperation`] / [`RemoveUserOperation`] — proto 操作类型 + Apply 逻辑
-//! - [`command::UserManager`] trait — Go `proxy.UserManager`
+//! - `command::UserManager` trait — Go `proxy.UserManager`
 //! - [`InboundHandlerProvider`] / [`OutboundHandlerProvider`] trait — Go
 //!   `proxy.GetInbound`/`GetOutbound`
 //! - [`HandlerService`] trait + [`DefaultHandlerService`] 编排（依赖 manager 注入）
@@ -78,10 +78,7 @@ impl MemoryUser {
     /// 转 proto User（对应 Go `protocol.ToProtoUser(memoryUser)`）
     #[must_use]
     pub fn to_proto(&self) -> ProtoUser {
-        let mut u = ProtoUser::default();
-        u.email = self.email.clone();
-        u.level = self.level;
-        u
+        ProtoUser { email: self.email.clone(), level: self.level, ..Default::default() }
     }
 }
 
@@ -316,7 +313,6 @@ pub struct DefaultHandlerService {
     pub factory: Option<Arc<dyn HandlerFactory>>,
 }
 
-
 impl std::fmt::Debug for DefaultHandlerService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DefaultHandlerService")
@@ -425,8 +421,8 @@ impl HandlerService for DefaultHandlerService {
             .ok_or_else(|| ProxymanError::Other("inbound provider not set".into()))?;
         let mut resp = ListInboundsResponse::default();
         for (tag, recv_url, proxy_url) in provider.list_inbound_tags() {
-            let mut cfg = xray_proto::xray::core::InboundHandlerConfig::default();
-            cfg.tag = tag;
+            let mut cfg =
+                xray_proto::xray::core::InboundHandlerConfig { tag, ..Default::default() };
             if !req.is_only_tags {
                 // 填充 receiver/proxy type_url（完整 TypedMessage 序列化需上层注入，当前填
                 // type_url）
@@ -547,8 +543,8 @@ impl HandlerService for DefaultHandlerService {
             .ok_or_else(|| ProxymanError::Other("outbound provider not set".into()))?;
         let mut resp = ListOutboundsResponse::default();
         for (tag, send_url, proxy_url) in provider.list_outbound_tags() {
-            let mut cfg = xray_proto::xray::core::OutboundHandlerConfig::default();
-            cfg.tag = tag;
+            let mut cfg =
+                xray_proto::xray::core::OutboundHandlerConfig { tag, ..Default::default() };
             // ListOutboundsRequest 无 is_only_tags 字段，总是返回完整配置
             if let Some(url) = &send_url {
                 cfg.sender_settings = Some(xray_proto::xray::common::serial::TypedMessage {
@@ -568,6 +564,8 @@ impl HandlerService for DefaultHandlerService {
 
 #[cfg(test)]
 mod tests {
+    // 测试构造以字段赋值表意（对齐 Go 逐字段装配），struct update 化反而降低对照度
+    #![allow(clippy::field_reassign_with_default)]
     use parking_lot::Mutex;
 
     use super::*;
@@ -1025,7 +1023,7 @@ mod tests {
     impl OutboundHandlerProvider for StubOutboundProvider {
         fn get_outbound_with_um(
             &self,
-            tag: &str,
+            _tag: &str,
         ) -> Option<Arc<dyn OutboundHandlerWithUserManager>> {
             None
         }

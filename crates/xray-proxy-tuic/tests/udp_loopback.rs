@@ -29,14 +29,9 @@ async fn start_udp_echo_server() -> SocketAddr {
     let addr = sock.local_addr().expect("local_addr");
     tokio::spawn(async move {
         let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            match sock.recv_from(&mut buf).await {
-                Ok((n, peer)) => {
-                    if sock.send_to(&buf[..n], peer).await.is_err() {
-                        break;
-                    }
-                },
-                Err(_) => break,
+        while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+            if sock.send_to(&buf[..n], peer).await.is_err() {
+                break;
             }
         }
     });

@@ -6,7 +6,7 @@
 //! IO 注入：
 //! - selector：在 [`BurstObservatoryFeature::start`] 时用 `subject_selector` 闭包构造（固定筛选，与
 //!   Go `SubjectSelector` 等价）。
-//! - executor：通过 [`set_io`](Self::set_io) 在装配阶段注入 （对应 Go `New()` 中 RequireFeatures 拿
+//! - executor：通过 `set_io` 在装配阶段注入 （对应 Go `New()` 中 RequireFeatures 拿
 //!   outbound.Manager + dispatcher）。
 //!
 //! `set_io` 注入后 `start` 启动 `BurstObserver::start_scheduler`。

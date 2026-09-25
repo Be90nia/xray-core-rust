@@ -7,7 +7,7 @@
 
 #![cfg(test)]
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use xray_crypto::aead::{AeadCipher, Aes256Gcm};
 use xray_proxy_ss::ss2022::{
     Client2022,

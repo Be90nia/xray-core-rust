@@ -350,6 +350,7 @@ struct Group {
 ///
 /// 返回 `(groups, group_of)`：`groups[i].start..=groups[i].end` 是第 i 组的下标范围；
 /// `group_of[j]` 是下标 j 所属的组下标。
+#[allow(clippy::needless_range_loop)] // 存量清零批次：needless_range_loop
 fn make_groups(clients: &[Arc<Client>]) -> (Vec<Group>, Vec<usize>) {
     let n = clients.len();
     if n == 0 {
@@ -383,6 +384,7 @@ fn make_groups(clients: &[Arc<Client>]) -> (Vec<Group>, Vec<usize>) {
 /// - `asyncQueryAll` 同时向所有 client 发起查询；
 /// - 收集结果时按 group 序遍历：当前组内已收到任一成功即返回（组内 race）；
 ///   当前组全部失败再进入下一组。
+///
 /// 单个 client 的查询结果分类（避免 clone DnsError）。
 #[derive(Debug, Clone)]
 enum ClientOutcome {
@@ -391,6 +393,7 @@ enum ClientOutcome {
     Pending,
 }
 
+#[allow(clippy::type_complexity)] // 存量清零批次：type_complexity
 async fn parallel_query(
     clients: &[Arc<Client>],
     domain: &str,
@@ -630,7 +633,7 @@ static ROUTE_CACHE: OnceLock<(bool, bool)> = OnceLock::new();
 
 /// 探测系统 IPv4/IPv6 路由可达性。对应 Go `utils.CheckRoutes()`。
 ///
-/// 通过 UDP connect 到已知根服务器地址（192.33.4.12:53 / [2001:500:2::c]:53）
+/// 通过 UDP connect 到已知根服务器地址（192.33.4.12:53 / `2001:500:2::c`:53）
 /// 判断对应协议栈是否可用。`connect` 不发送数据，仅检查路由。
 ///
 /// 结果缓存到进程生命周期（`OnceLock`），首次调用后不再重复探测。
@@ -1161,6 +1164,7 @@ mod tests {
     /// hmot：3 clients 同 policyID → 1 group race。
     /// 验证 `make_groups` 相邻合并 + 组内 race minimum rtt（最快返回者胜出）。
     #[tokio::test]
+    #[allow(clippy::needless_range_loop)] // 存量清零批次：needless_range_loop
     async fn parallel_query_same_policy_groups_into_one_race() {
         let ip_a = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
         let ip_b = IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2));

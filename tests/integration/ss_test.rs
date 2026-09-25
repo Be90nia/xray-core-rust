@@ -4,10 +4,7 @@
 //! client 写 IV + 加密首帧(addr+port) + 加密 body →
 //! server read_request 解析 → read_chunk 读 body → 验证数据一致。
 
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
-};
+use tokio::net::TcpListener;
 use xray_common::net::address::Address;
 use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
 use xray_proxy_ss::{
@@ -15,7 +12,6 @@ use xray_proxy_ss::{
     config::{CipherType, MemoryAccount},
     protocol::write_address_port_ss,
     server::read_request,
-    validator::{MemoryUser, Validator},
 };
 
 /// 测试密码。

@@ -283,8 +283,6 @@ impl AlwaysOnInboundHandler {
     }
 
     /// 引用 sniffing_request
-
-    /// 引用 sniffing_request
     #[must_use]
     pub fn sniffing_request(&self) -> &SniffingRequest {
         &self.sniffing_request

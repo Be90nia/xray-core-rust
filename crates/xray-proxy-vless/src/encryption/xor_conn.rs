@@ -372,7 +372,7 @@ mod tests {
         let mut v = Vec::new();
         for (n, b) in [(27u16, 0x01u8), (300u16, 0x02u8), (16u16, 0x03u8)] {
             v.extend_from_slice(&[23, 3, 3, (n >> 8) as u8, n as u8]);
-            v.extend(std::iter::repeat(b).take(usize::from(n)));
+            v.extend(std::iter::repeat_n(b, usize::from(n)));
         }
         v
     }

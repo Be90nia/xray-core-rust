@@ -214,6 +214,7 @@ impl InboundHandler for WireguardInboundHandler {
 }
 
 /// 从 DeviceConfig.endpoint 解析为 smoltcp IpCidr（与 outbound 共用逻辑）。
+#[allow(clippy::incompatible_msrv)] // 存量清零批次：incompatible_msrv
 fn parse_local_cidrs(config: &DeviceConfig) -> Result<Vec<smoltcp::wire::IpCidr>> {
     let parsed = crate::wireguard::parse_endpoints(config)?;
     parsed
@@ -566,6 +567,7 @@ mod tests {
     }
 
     impl EchoDispatch {
+        #[allow(clippy::type_complexity)] // 存量清零批次：type_complexity
         fn new(
             tag: &str,
             response: &[u8],
@@ -694,6 +696,7 @@ mod tests {
     /// server inbound，请求数据 echo 往返。无 Go 标准客户端环境，以
     /// boringtun Rust↔Rust 全隧道（真 noise 握手 + 真加密 IP 包）替代。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 测试断言期 guard 有意存活
     async fn tunnel_tcp_end_to_end_echoes() {
         use std::net::SocketAddr;
 
@@ -799,6 +802,7 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "dispatch not recorded in 5s");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        #[allow(clippy::await_holding_lock)] // 存量清零批次
         let s = seen.lock();
         let (dest, payload) = &s[0];
         assert_eq!(dest.network(), Network::TCP);
@@ -807,6 +811,7 @@ mod tests {
         assert_eq!(payload, b"ping");
 
         // bd ttni：dispatch 携带的 user 上下文来自 GetUserByAddr(10.0.0.2)
+        #[allow(clippy::await_holding_lock)] // 存量清零批次
         let acc = access_seen.lock();
         let ctx = acc.last().expect("dispatch_with_access captured");
         assert_eq!(ctx.email, "u@wg", "user email 挂接");

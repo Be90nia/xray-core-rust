@@ -7,9 +7,8 @@
 //! ## 范围
 //!
 //! - **HandlerService**：注入 [`OutboundRuntime`]（bd ze3，生产 SimpleOhm）时 add/remove/list
-//!   outbound 操作真实 outbound manager；未注入时退回内部
-//!   [`OutboundHandlerRegistry`](crate::server::OutboundHandlerRegistry)（stub handler）。
-//!   其余方法（inbound / alter / users）返回 `UNIMPLEMENTED`。
+//!   outbound 操作真实 outbound manager；未注入时退回内部 ``OutboundHandlerRegistry`（stub
+//!   handler）。 其余方法（inbound / alter / users）返回 `UNIMPLEMENTED`。
 //! - **LoggerService**：委托领域 `xray_app_log::command::LogService` （`DefaultLogService` →
 //!   `LogInstance::restart`）。
 //! - **StatsService**：委托领域 `xray_app_stats::command::StatsService`，proto ↔ domain 翻译。
@@ -976,6 +975,7 @@ impl tokio::io::AsyncWrite for CommanderStream {
 impl tonic::transport::server::Connected for CommanderStream {
     type ConnectInfo = ();
 
+    #[allow(clippy::too_many_arguments)] // 存量清零批次：too_many_arguments
     fn connect_info(&self) -> Self::ConnectInfo {}
 }
 
@@ -986,6 +986,7 @@ impl tonic::transport::server::Connected for CommanderStream {
 /// 均按 `enable_*` + 后端注入（`Some`）双条件注册——对应 Go
 /// `Commander.Start` 只注册 `config.Service`（`ApiConfig.services`）列举的
 /// 服务，未声明不暴露（bd dnw3）。
+#[allow(clippy::too_many_arguments)] // Commander 全服务装配参数集（对齐 Go Commander.Start）
 pub(crate) fn build_router(
     registry: Arc<OutboundHandlerRegistry>,
     enable_handler: bool,
@@ -1257,6 +1258,7 @@ mod tests {
 
         struct NopSelector;
         impl OutboundHandlerSelector for NopSelector {
+            #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
             fn select_outbounds(
                 &self,
                 selectors: &[String],
@@ -1270,9 +1272,11 @@ mod tests {
             xray_app_router::command::RoutingService::with_router(router),
         ));
 
-        let mut rule = RoutingRule::default();
-        rule.rule_tag = "rule-1".into();
-        rule.networks = vec![2]; // TCP
+        let mut rule = RoutingRule {
+            rule_tag: "rule-1".into(),
+            networks: vec![2], // TCP
+            ..Default::default()
+        };
         rule.target_tag =
             Some(xray_proto::xray::app::router::routing_rule::TargetTag::Tag("direct".into()));
         svc.add_rule(Request::new(prouter::AddRuleRequest {
@@ -1748,6 +1752,7 @@ mod tests {
 
         struct NopSelector;
         impl OutboundHandlerSelector for NopSelector {
+            #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
             fn select_outbounds(
                 &self,
                 selectors: &[String],
@@ -1761,9 +1766,11 @@ mod tests {
             xray_app_router::command::RoutingService::with_router(router),
         ));
 
-        let mut rule = RoutingRule::default();
-        rule.rule_tag = "rule-1".into();
-        rule.networks = vec![2]; // TCP（proto Network: TCP=2），保证有有效匹配字段
+        let mut rule = RoutingRule {
+            rule_tag: "rule-1".into(),
+            networks: vec![2], // TCP（proto Network: TCP=2），保证有有效匹配字段
+            ..Default::default()
+        };
         rule.target_tag =
             Some(xray_proto::xray::app::router::routing_rule::TargetTag::Tag("direct".into()));
         svc.add_rule(Request::new(prouter::AddRuleRequest {

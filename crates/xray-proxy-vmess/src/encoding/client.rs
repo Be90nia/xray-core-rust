@@ -233,9 +233,9 @@ impl ClientSession {
     ///
     /// # 算法
     ///
-    /// 1. KDF16 派生 len key，KDF 派生 len IV[:12]
+    /// 1. KDF16 派生 len key，KDF 派生 len `IV[:12]`
     /// 2. 读 18B 加密 length，AES-128-GCM Open → 2B length BE u16
-    /// 3. KDF16 派生 payload key，KDF 派生 payload IV[:12]
+    /// 3. KDF16 派生 payload key，KDF 派生 payload `IV[:12]`
     /// 4. 读 (length+16)B 加密 payload，AES-128-GCM Open
     /// 5. 解析 payload: [1B response_header | 1B option | 1B cmd_id | 1B data_len | N B data]
     /// 6. 验证 response_header == self.response_header
@@ -641,7 +641,7 @@ mod tests {
     #[test]
     fn response_body_key_derived_from_request_body_key() {
         let s = ClientSession::new();
-        let hash = Sha256::digest(&s.request_body_key);
+        let hash = Sha256::digest(s.request_body_key);
         let mut expected = [0u8; 16];
         expected.copy_from_slice(&hash[..16]);
         assert_eq!(s.response_body_key, expected);
@@ -650,7 +650,7 @@ mod tests {
     #[test]
     fn response_body_iv_derived_from_request_body_iv() {
         let s = ClientSession::new();
-        let hash = Sha256::digest(&s.request_body_iv);
+        let hash = Sha256::digest(s.request_body_iv);
         let mut expected = [0u8; 16];
         expected.copy_from_slice(&hash[..16]);
         assert_eq!(s.response_body_iv, expected);

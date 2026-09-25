@@ -6,8 +6,8 @@
 //! TCP_KEEPINTVL + V6Only）。
 //! 切片2（本模块）：平台特定选项（TFO/TCP_CONGESTION/SO_REUSEPORT/
 //! IP_TRANSPARENT/SO_USER_COOKIE）由 [`apply_outbound_socket_options`] /
-//! [`apply_inbound_socket_options`] 跨平台分发到 [`linux`] / [`windows`] /
-//! [`darwin`] / [`freebsd`] 各平台模块实现。MPTCP 单独走 [`try_set_mptcp`]
+//! [`apply_inbound_socket_options`] 跨平台分发到 `linux` / `windows` /
+//! `darwin` / `freebsd` 各平台模块实现。MPTCP 单独走 `try_set_mptcp`
 //! （仅 Linux 监听前生效）。入站 listener 端 TFO backlog / SO_REUSEPORT 在
 //! [`crate::system_listener::DefaultListener::bind`] 之前对原始 socket 设置。
 //!
@@ -395,7 +395,7 @@ impl Default for SocketOptions {
 ///
 /// 对应 Go `applyOutboundSocketOptions`（sockopt_linux.go:16-111 / freebsd.go:127-178
 /// / windows.go:34-121）。失败时返回 [`std::io::Error`]，调用方决定是忽略（继续拨号）
-/// 还是中止。平台模块（[`linux::LinuxSockOpt::apply`] 等）内按 `tcp_fast_open=false`
+/// 还是中止。平台模块（`linux::LinuxSockOpt::apply` 等）内按 `tcp_fast_open=false`
 /// 跳过 TFO 设置，因此本函数可在 `SocketOptions::default()` 上无副作用通过。
 ///
 /// 各平台覆盖范围：
