@@ -71,6 +71,7 @@ pub struct DialOptions<'a> {
 ///
 /// 返回 `WsConnection<MaybeTlsStream<TcpStream>>`，可直接作为
 /// `AsyncRead + AsyncWrite + Connection` 使用。
+#[allow(clippy::result_large_err)] // WsError::Tungstenite 136B；Box 化属类型变更，超出行为零变更契约
 pub async fn dial(
     opts: DialOptions<'_>,
 ) -> Result<WsConnection<MaybeTlsStream<Box<dyn xray_transport::connection::Connection>>>> {
@@ -168,6 +169,7 @@ pub struct DialParams {
 }
 
 /// 用 owned 参数拨号（内部组 [`DialOptions`] 调 [`dial`]）。
+#[allow(clippy::result_large_err)] // WsError::Tungstenite 136B；Box 化属类型变更，超出行为零变更契约
 pub async fn dial_with_params(
     params: DialParams,
     early_data: Option<Vec<u8>>,

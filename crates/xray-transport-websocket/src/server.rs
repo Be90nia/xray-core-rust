@@ -70,6 +70,7 @@ pub struct WsListener {
 
 impl WsListener {
     /// 绑定到 `addr`，使用单个 WS 配置（host/path/heartbeat）。
+    #[allow(clippy::result_large_err)] // WsError::Tungstenite 136B；Box 化属类型变更，超出行为零变更契约
     pub async fn bind(addr: SocketAddr, config: Arc<Config>) -> Result<Self> {
         Self::bind_multi(addr, vec![config]).await
     }
@@ -78,6 +79,7 @@ impl WsListener {
     ///
     /// 一个 TCP 端点接受多个 path，握手时按 (host, path) 匹配找到对应 config。
     /// 对应 Go 多个 requestHandler 共享一个 listener（Go 实际是单 path/server）。
+    #[allow(clippy::result_large_err)] // WsError::Tungstenite 136B；Box 化属类型变更，超出行为零变更契约
     pub async fn bind_multi(addr: SocketAddr, configs: Vec<Arc<Config>>) -> Result<Self> {
         if configs.is_empty() {
             return Err(WsError::InvalidUpgradeRequest { reason: "no WS configs provided".into() });
@@ -87,8 +89,7 @@ impl WsListener {
     }
 
     /// 本地地址。
-    #[allow(clippy::result_large_err)] // WsError 携带协议上下文，Box 化徒增间接
-    #[allow(clippy::result_large_err)] // WsError 携带协议上下文
+    #[allow(clippy::result_large_err)] // WsError 136B；Box 化属类型变更，超出行为零变更契约
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.listener.local_addr().map_err(WsError::Io)
     }
@@ -96,6 +97,7 @@ impl WsListener {
     /// 接受一条新连接，完成 WS 握手 + 校验 host/path + 提取 early data。
     ///
     /// **不支持 TLS**：明文 ws:// only。TLS 场景请用 [`accept_tls`](Self::accept_tls)。
+    #[allow(clippy::result_large_err)] // WsError::Tungstenite 136B；Box 化属类型变更，超出行为零变更契约
     pub async fn accept(&self) -> Result<AcceptedConn> {
         let (mut tcp, remote) = self.listener.accept().await.map_err(WsError::Io)?;
         let local = tcp.local_addr().ok();
@@ -107,6 +109,7 @@ impl WsListener {
     ///
     /// 流程：TCP accept → PROXY protocol（可选）→ TLS accept → WS handshake。
     /// 对应 Go `tls.NewListener(l, tlsConfig)` 包装 TCP listener。
+    #[allow(clippy::result_large_err)] // WsError::Tungstenite 136B；Box 化属类型变更，超出行为零变更契约
     pub async fn accept_tls(
         &self,
         tls_config: Arc<tokio_rustls::rustls::ServerConfig>,
@@ -125,6 +128,7 @@ impl WsListener {
     }
 
     /// 解析 PROXY protocol（如果启用），返回真实客户端地址。
+    #[allow(clippy::result_large_err)] // WsError::Tungstenite 136B；Box 化属类型变更，超出行为零变更契约
     async fn parse_proxy_protocol(
         &self,
         tcp: &mut tokio::net::TcpStream,
