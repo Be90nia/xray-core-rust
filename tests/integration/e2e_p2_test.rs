@@ -87,7 +87,12 @@ async fn pick_free_port() -> u16 {
 
 fn freedom_outbound(tag: &str) -> BuiltOutbound {
     BuiltOutbound {
-        entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+        // vless inbound 默认规则 BlockPrivate（Go getDefaultFinalRule）封回环——
+        // echo 目标必须显式放行（对齐 lib FREEDOM_ALLOW_ALL_SETTINGS 先例）。
+        entry: BuiltEntry {
+            kind: "freedom".into(),
+            data: br#"{"finalRules":[{"action":"allow","network":"tcp,udp","ip":["127.0.0.0/8","::1/128"]}]}"#.to_vec(),
+        },
         tag: tag.into(),
         send_through: None,
         stream_settings_json: None,
@@ -112,7 +117,10 @@ fn vless_inbound(port: u16, tag: &str, uuid: &str) -> BuiltInbound {
     BuiltInbound {
         entry: BuiltEntry {
             kind: "vless".into(),
-            data: format!(r#"{{"clients":[{{"id":"{uuid}","level":0}}]}}"#).into_bytes(),
+            data: format!(
+                r#"{{"clients":[{{"id":"{uuid}","level":0}}],"decryption":"none"}}"#
+            )
+            .into_bytes(),
         },
         tag: tag.into(),
         port: Some(port),
@@ -250,6 +258,7 @@ async fn e2e_p2_wireguard_full_chain() {
                 "address": ["10.0.0.1/32"],
                 "peers": [{
                     "publicKey": pub_a,
+                    "endpoint": format!("127.0.0.1:{wg_port}"),
                     "allowedIps": ["10.0.0.2/32"]
                 }],
                 "port": wg_port
@@ -394,8 +403,18 @@ async fn e2e_p2_tls_utls_pinned() {
     // pinned verification uses the certificate's DER, but here we use the cert
     // PEM bytes for the hex string. The unit-tested `verify_chain` semantics are:
     // pin hit on leaf → handshake succeeds without webpki validation.
-    let cert_bytes_der = cert_pem.as_bytes();
-    let pinned_hex = generate_cert_hash_hex(cert_bytes_der);
+    // pin 比对对象是证书 DER（PinnedServerCertVerifier 对 peer DER 做 SHA-256），
+    // 因此必须从 PEM 中解出 DER 再计算（PEM 文本 hash ≠ DER hash）。
+    let cert_bytes_der = {
+        use base64::Engine as _;
+        let b64: String = cert_pem
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect::<Vec<_>>()
+            .join("");
+        base64::engine::general_purpose::STANDARD.decode(b64).expect("pem base64 decode")
+    };
+    let pinned_hex = generate_cert_hash_hex(&cert_bytes_der);
 
     // Server TLS: leaf cert + key.
     let server_tls: serde_json::Value = serde_json::from_str(&format!(
