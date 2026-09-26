@@ -12,12 +12,24 @@ use xray_transport::{
     sockopt::SocketOptions,
 };
 
+
+/// rustls 默认 ring provider 装一次（dial_with_settings 的 tls 路径需要）。
+/// 多测试并行场景下 Once 保证只调一次。
+fn ensure_crypto_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// TCP + TLS 出站：dial 应完成 TLS 握手并能 echo 回环。
 ///
 /// 若未包装 TLS（裸 TCP），client 写明文到 TLS server，server 的 TLS accept
 /// 失败并关闭连接，client read 返回 0/err——测试因此失败，暴露回归。
 #[tokio::test]
 async fn tcp_plus_tls_wraps_tls_and_echoes() {
+    ensure_crypto_provider();
     // 自签证书 + rustls ServerConfig
     let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     let key_pair = rcgen::KeyPair::generate().unwrap();
@@ -74,6 +86,7 @@ async fn tcp_plus_tls_wraps_tls_and_echoes() {
 /// server 端是标准 rustls TlsAcceptor——btls ClientHello 与标准 rustls server 兼容。
 #[tokio::test]
 async fn tcp_plus_tls_with_fingerprint_uses_btls() {
+    ensure_crypto_provider();
     let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     let key_pair = rcgen::KeyPair::generate().unwrap();
     let cert = cert_params.self_signed(&key_pair).unwrap();
