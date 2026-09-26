@@ -12,7 +12,6 @@ use xray_transport::{
     sockopt::SocketOptions,
 };
 
-
 /// rustls 默认 ring provider 装一次（dial_with_settings 的 tls 路径需要）。
 /// 多测试并行场景下 Once 保证只调一次。
 fn ensure_crypto_provider() {
