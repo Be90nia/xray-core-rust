@@ -157,7 +157,12 @@ fn vmess_outbound(upstream_port: u16, stream_settings_json: serde_json::Value) -
 
 fn freedom_outbound() -> BuiltOutbound {
     BuiltOutbound {
-        entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+        // vmess/vless inbound 默认规则 BlockPrivate（Go getDefaultFinalRule）封回环——
+        // echo 目标必须显式放行（对齐 lib FREEDOM_ALLOW_ALL_SETTINGS 先例）。
+        entry: BuiltEntry {
+            kind: "freedom".into(),
+            data: br#"{"finalRules":[{"action":"allow","network":"tcp,udp","ip":["127.0.0.0/8","::1/128"]}]}"#.to_vec(),
+        },
         tag: "direct".into(),
         send_through: None,
         stream_settings_json: None,
@@ -348,7 +353,7 @@ async fn reality_transport_via_vless_e2e() {
     let short_id_hex = "0123456789abcdef";
 
     let server_reality: serde_json::Value = serde_json::from_str(&format!(
-        r#"{{"network":"tcp","security":"reality","realitySettings":{{"privateKey":"{priv_key_b64}","shortIds":["{short_id_hex}"],"dest":"{}:{}"}}}}"#,
+        r#"{{"network":"tcp","security":"reality","realitySettings":{{"privateKey":"{priv_key_b64}","shortIds":["{short_id_hex}"],"serverNames":["localhost"],"dest":"{}:{}"}}}}"#,
         "127.0.0.1",
         echo_addr.port()
     ))
