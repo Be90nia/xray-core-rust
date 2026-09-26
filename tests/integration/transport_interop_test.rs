@@ -93,7 +93,8 @@ fn vless_inbound(port: u16, tag: &str) -> BuiltInbound {
     BuiltInbound {
         entry: BuiltEntry {
             kind: "vless".into(),
-            data: format!(r#"{{"clients":[{{"id":"{TEST_UUID}"}}]}}"#).into_bytes(),
+            data: format!(r#"{{"clients":[{{"id":"{TEST_UUID}"}}],"decryption":"none"}}"#)
+                .into_bytes(),
         },
         tag: tag.into(),
         port: Some(port),
@@ -125,7 +126,8 @@ fn vmess_inbound(port: u16, tag: &str) -> BuiltInbound {
     BuiltInbound {
         entry: BuiltEntry {
             kind: "vmess".into(),
-            data: format!(r#"{{"clients":[{{"id":"{TEST_UUID}"}}]}}"#).into_bytes(),
+            data: format!(r#"{{"clients":[{{"id":"{TEST_UUID}"}}],"decryption":"none"}}"#)
+                .into_bytes(),
         },
         tag: tag.into(),
         port: Some(port),
