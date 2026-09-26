@@ -11,14 +11,11 @@
 //!
 //! ## 使用
 //!
-//! ```no_run
-//! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+//! ```text
 //! serve_grpc("127.0.0.1:8080", |server| {
 //!     server.add_service(stats_server).add_service(router_server)
 //! })
 //! .await?;
-//! # Ok(())
-//! # }
 //! ```
 
 use std::{error::Error, net::SocketAddr};
