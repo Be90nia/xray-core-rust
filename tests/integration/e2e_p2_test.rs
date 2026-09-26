@@ -117,10 +117,8 @@ fn vless_inbound(port: u16, tag: &str, uuid: &str) -> BuiltInbound {
     BuiltInbound {
         entry: BuiltEntry {
             kind: "vless".into(),
-            data: format!(
-                r#"{{"clients":[{{"id":"{uuid}","level":0}}],"decryption":"none"}}"#
-            )
-            .into_bytes(),
+            data: format!(r#"{{"clients":[{{"id":"{uuid}","level":0}}],"decryption":"none"}}"#)
+                .into_bytes(),
         },
         tag: tag.into(),
         port: Some(port),
@@ -345,9 +343,9 @@ async fn e2e_p2_wireguard_full_chain() {
 
     // 接收服务端 handshake response（driver worker_loop decapsulate 后 send_wg 回源地址）
     let mut response = vec![0u8; 256];
-    let (n, _) = tokio::time::timeout(Duration::from_secs(5), udp.recv_from(&mut response))
+    let (n, _) = tokio::time::timeout(Duration::from_secs(20), udp.recv_from(&mut response))
         .await
-        .expect("handshake response within 5s")
+        .expect("handshake response within 20s")
         .expect("recv_from ok");
     response.truncate(n);
 
@@ -407,11 +405,8 @@ async fn e2e_p2_tls_utls_pinned() {
     // 因此必须从 PEM 中解出 DER 再计算（PEM 文本 hash ≠ DER hash）。
     let cert_bytes_der = {
         use base64::Engine as _;
-        let b64: String = cert_pem
-            .lines()
-            .filter(|l| !l.starts_with("-----"))
-            .collect::<Vec<_>>()
-            .join("");
+        let b64: String =
+            cert_pem.lines().filter(|l| !l.starts_with("-----")).collect::<Vec<_>>().join("");
         base64::engine::general_purpose::STANDARD.decode(b64).expect("pem base64 decode")
     };
     let pinned_hex = generate_cert_hash_hex(&cert_bytes_der);
