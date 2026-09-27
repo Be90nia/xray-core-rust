@@ -41,6 +41,19 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -eq "Linux") {
+            sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
+          } elseif ($env:RUNNER_OS -eq "macOS") {
+            brew install protobuf
+          } else {
+            # Windows: 依赖图含 xray-proto(prost-build)需要 protoc（同 stress.yml）
+            choco install -y protoc 2>&1 | Out-Null
+            echo "C:\ProgramData\chocolatey\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          }
+          Write-Host "protoc: $(protoc --version)"
       - name: Build release
         run: cargo build --release -p xray-cli --target ${{ matrix.target }}
       - name: Upload artifact
