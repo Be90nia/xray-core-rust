@@ -41,6 +41,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      - name: Prepare patched boringssl
+        uses: ./.github/actions/setup-boringssl
       - name: Install protoc
         shell: pwsh
         run: |
