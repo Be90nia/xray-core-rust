@@ -6806,8 +6806,12 @@ name = "xray-transport-websocket"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "bytes",
  "futures-util",
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "rcgen 0.13.2",
  "rustls",
  "rustls-pemfile",
