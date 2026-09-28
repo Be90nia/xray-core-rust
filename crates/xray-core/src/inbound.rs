@@ -2490,7 +2490,7 @@ async fn spawn_one_inbound(
             return Ok(None);
         },
     };
-    let addr = format!("{listen}:{port}");
+    let addr = parse_listen_addr(listen, port)?.to_string();
     // e7le：入站 sockopt（streamSettings.sockopt JSON；缺省 tcp_nodelay=true）
     // 统一喂给 InboundTcpListener——此前 9 处裸 bind+accept 无 nodelay，
     // 与 Go net 默认（NoDelay=true）相反，流式下行每 chunk 受 Nagle 拖累。
@@ -3038,6 +3038,45 @@ async fn spawn_one_inbound(
 /// `@` 开头为 Linux abstract socket。
 fn is_unix_listen_path(listen: &str) -> bool {
     listen.starts_with('/') || listen.starts_with('@')
+}
+
+/// 入站 listen 地址归一化为 [`SocketAddr`]（Go 语义对齐：infra/conf xray.go:144
+/// anyip 分支 + port 恒取 inbound.port 字段）。
+///
+/// - `""` / `"::"` → `[::]:port`（IPv6 any，Linux 默认双栈）
+/// - `"0.0.0.0"` → `0.0.0.0:port`（IPv4 any）
+/// - 已是合法 SocketAddr（含端口）→ 直用
+/// - 其余先按裸 IP 补端口（IPv6 加方括号），再按 `{addr}:{port}` 字面兜底；
+///   全失败报错（错误信息保留原文）。
+fn parse_listen_addr(addr: &str, port: u16) -> std::io::Result<SocketAddr> {
+    let addr = addr.trim();
+    if addr.is_empty() || addr == "::" {
+        return Ok(SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            port,
+        ));
+    }
+    if addr == "0.0.0.0" {
+        return Ok(SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            port,
+        ));
+    }
+    if let Ok(sa) = addr.parse::<SocketAddr>() {
+        return Ok(sa);
+    }
+    // 裸 IPv6 须加方括号：字面拼接 "::1:18923" 会被解析器当作整体 IPv6 拒绝。
+    let candidate = if addr.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{addr}]:{port}")
+    } else {
+        format!("{addr}:{port}")
+    };
+    candidate.parse().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("parse listen addr {addr:?}: {e}"),
+        )
+    })
 }
 
 /// UDS accept 循环：每连接调用 `on_conn`（与 transport hub ConnHandler 同形）。
@@ -7190,6 +7229,26 @@ mod tests {
 
     fn tuic_inbound_json(extra: &str) -> String {
         format!(r#"{{"uuid":"{TUIC_INBOUND_TEST_UUID}","password":"pw"{extra}}}"#)
+    }
+
+    /// listen 地址归一化：Go anyip 语义（listen="::"/空 → 双栈 any）+ 裸 IP 补端口。
+    #[test]
+    fn parse_listen_addr_normalizes_go_semantics() {
+        let p = |a: &str| super::parse_listen_addr(a, 18923).map(|sa| sa.to_string());
+        assert_eq!(p("").unwrap(), "[::]:18923");
+        assert_eq!(p("  ").unwrap(), "[::]:18923");
+        assert_eq!(p("::").unwrap(), "[::]:18923");
+        assert_eq!(p("0.0.0.0").unwrap(), "0.0.0.0:18923");
+        // 已含端口直用（port 参数忽略）
+        assert_eq!(p("127.0.0.1:1").unwrap(), "127.0.0.1:1");
+        assert_eq!(p("[::]:1").unwrap(), "[::]:1");
+        // 裸 IP 补端口：IPv6 须加方括号（裸拼接 "::1:18923" 无法解析）
+        assert_eq!(p("::1").unwrap(), "[::1]:18923");
+        assert_eq!(p("127.0.0.1").unwrap(), "127.0.0.1:18923");
+        // 域名/非法串报错且错误信息保留原文
+        assert!(p("example.com").is_err());
+        let err = super::parse_listen_addr("bad addr!", 1).unwrap_err();
+        assert!(err.to_string().contains("bad addr!"), "err: {err}");
     }
 
     /// 票 7ykg：官方 tuic-server 缺省 congestion_control="cubic"（服务端形态，
