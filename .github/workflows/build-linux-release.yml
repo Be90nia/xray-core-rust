@@ -29,7 +29,7 @@ jobs:
           # + boringssl C/C++ 编译；hosted VM 预装 build-essential，容器须显式装）；
           # build deps 同原 hosted 步骤。
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            ca-certificates curl git python3 cmake nasm pkg-config libssl-dev unzip gcc g++ make clang
+            ca-certificates curl git python3 cmake nasm pkg-config libssl-dev unzip gcc g++ make clang file
           # apt 的 protobuf-compiler 太旧（3.12）不支持 proto3 optional，下载新版 protoc 二进制替代
           curl -fsSL -o /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v36.1/protoc-36.1-linux-x86_64.zip
           unzip -o /tmp/protoc.zip -d /usr/local
