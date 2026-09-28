@@ -25,6 +25,11 @@ rustls-pemfile = "2"
 
 futures-util = "0.3"
 http = "1"
+# ALPN=h2 拒绝服务（wsh2 修复）：Go net/http 对 ws TLS listener 自动装配 h2 层
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 rcgen = "0.13"

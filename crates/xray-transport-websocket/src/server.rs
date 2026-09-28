@@ -123,8 +123,70 @@ impl WsListener {
             .accept(tcp)
             .await
             .map_err(|e| WsError::HandshakeFailed(format!("tls accept: {e}")))?;
+        // wsh2 修复：ALPN 协商出 h2 时进 h2 拒绝服务，而非把 HTTP/2 帧喂给
+        // http/1.1-only 的 ws_handshake（裸断根因：curl --http2 = 000，CF 回源
+        // 协商 h2 后 CDN 族全挂）。Go hub.go:158 `http.Server.Serve(tls.NewListener)`
+        // 由 net/http 对 TLS listener 自动装配 h2 层，gorilla upgrader 对 h2 请求
+        // 回 400——此处对齐该行为。h2 服务随连接终结，Err 让 accept loop 继续。
+        if tls_stream.get_ref().1.alpn_protocol() == Some(&b"h2"[..]) {
+            Self::serve_h2_reject(tls_stream, self.configs.clone()).await;
+            return Err(WsError::HandshakeFailed("http/2 request rejected".into()));
+        }
         Self::ws_handshake(tls_stream, remote, local, &self.configs, &self.trusted_x_forwarded_for)
             .await
+    }
+
+    /// ALPN=h2 时的 h2 拒绝服务（wsh2 修复）。
+    ///
+    /// Go 端 net/http 对 ws TLS listener 自动装配 h2（`hub.go:158`），gorilla
+    /// upgrader 对 h2 请求回 400（h2 剥除 connection-specific 头，`Connection:
+    /// upgrade` 校验必败）。host/path 不匹配仍回 404——对齐 Go requestHandler
+    /// （hub.go:41-52）的校验顺序：host 404 → path 404 → upgrader 400。
+    /// h2 上 host 在 `:authority` 伪头（`uri().host()`），Host header 回落——
+    /// 同 splithttp dispatch_request 语义（对齐 Go `r.Host`）。
+    async fn serve_h2_reject<S>(stream: S, configs: Vec<Arc<Config>>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        use hyper::service::service_fn;
+        use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+
+        let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+            let host = req
+                .uri()
+                .host()
+                .map(str::to_owned)
+                .or_else(|| {
+                    req.headers()
+                        .get(hyper::header::HOST)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
+            let matched = configs.iter().any(|c| {
+                (c.host.is_empty()
+                    || xray_common::protocol::http::is_valid_http_host(&host, &c.host))
+                    && req.uri().path() == c.normalized_path()
+            });
+            let status = if matched { StatusCode::BAD_REQUEST } else { StatusCode::NOT_FOUND };
+            async move {
+                Ok::<_, std::convert::Infallible>(
+                    hyper::Response::builder()
+                        .status(status)
+                        .body(http_body_util::Full::new(bytes::Bytes::new()))
+                        .expect("static status/body: builder cannot fail"),
+                )
+            }
+        });
+
+        let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+        builder.http2().timer(TokioTimer::new());
+        // ponytail: hyper h2 serve 对客户端 hard close（无 GOAWAY，curl 超时/CF 断连）
+        // 不退出——裸 TCP probe 实锤（hyper 层，与 TLS 无关；splithttp serve_http_conn
+        // 同族形态 = bd 已登记的 s10 fd 泄漏族）。30s 外挂兜底强杀：400/404 响应毫秒级
+        // 完成，30s 仅覆盖慢链路重传窗口。hyper 侧根因修复后可移除。
+        let serve = builder.serve_connection(TokioIo::new(stream), svc);
+        let _ = tokio::time::timeout(Duration::from_secs(30), serve).await;
     }
 
     /// 解析 PROXY protocol（如果启用），返回真实客户端地址。
@@ -463,6 +525,87 @@ mod tests {
             accepted.remote.ip(),
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
         );
+    }
+
+    /// wsh2 回归：ALPN 协商出 h2 时必须得到 HTTP 响应（Go net/http + gorilla
+    /// 行为：匹配 path → 400，不匹配 → 404），而非把 h2 帧喂给 http/1.1-only
+    /// 握手后裸断（修复前 curl --http2 = 000，CF 回源 CDN 族全挂）。
+    #[tokio::test]
+    async fn accept_tls_alpn_h2_gets_http_response_not_bare_close() {
+        use http_body_util::Empty;
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+
+        ensure_crypto_provider();
+        let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = cert_params.self_signed(&key_pair).unwrap();
+        let cert_der = cert.der().to_vec();
+        let key = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap();
+        let mut server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls::pki_types::CertificateDer::from(cert_der.clone())],
+                key,
+            )
+            .unwrap();
+        // 生产默认广播（xray-tls server_config.rs:246 对齐 Go GetTLSConfig）。
+        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        let cfg = Arc::new(Config { path: "/ws".into(), ..Default::default() });
+        let listener = WsListener::bind("127.0.0.1:0".parse().unwrap(), cfg).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server =
+            tokio::spawn(async move { listener.accept_tls(Arc::new(server_config)).await });
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(rustls::pki_types::CertificateDer::from(cert_der)).unwrap();
+        let mut client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![b"h2".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let tls = connector.connect("localhost".try_into().unwrap(), tcp).await.unwrap();
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]), "ALPN must negotiate h2");
+
+        let (mut sender, conn) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+                .await
+                .unwrap();
+        let conn_task = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        // 匹配 path → 400（gorilla：h2 剥除 Connection 头，upgrade 校验必败）。
+        let req = hyper::Request::builder()
+            .method("GET")
+            .uri(format!("https://localhost:{}/ws", addr.port()))
+            .header("host", format!("localhost:{}", addr.port()))
+            .body(Empty::<bytes::Bytes>::new())
+            .unwrap();
+        let resp = tokio::time::timeout(Duration::from_secs(5), sender.send_request(req))
+            .await
+            .expect("h2 response timeout")
+            .expect("send_request");
+        assert_eq!(resp.status(), 400, "h2 on matched path must get 400, not bare close");
+
+        // 不匹配 path → 404（Go requestHandler host/path 校验先于 upgrader）。
+        let req = hyper::Request::builder()
+            .method("GET")
+            .uri(format!("https://localhost:{}/wrong", addr.port()))
+            .body(Empty::<bytes::Bytes>::new())
+            .unwrap();
+        let resp = tokio::time::timeout(Duration::from_secs(5), sender.send_request(req))
+            .await
+            .expect("h2 response timeout")
+            .expect("send_request");
+        assert_eq!(resp.status(), 404, "h2 on unmatched path must get 404");
+
+        // 收尾：显式 abort 两个 task（accept_tls 的 30s 兜底由 probe 实验背书，
+        // 不在测试里等 30s；spawn task 悬持 IO 会卡测试进程退出）。
+        drop(sender);
+        conn_task.abort();
+        server.abort();
     }
 
     // --- 多 path 路由 E2E ---
