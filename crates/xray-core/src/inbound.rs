@@ -2360,6 +2360,166 @@ async fn serve_reality_vless(
     }
 }
 
+/// Trojan + REALITY inbound：accept → server_tls 验证。
+///
+/// - Verified：REALITY TLS 流走 Trojan 协议处理（`serve_trojan_conn`）
+/// - Invalid：原连接 + ClientHello record fallback 到 dest（PROXY protocol xver）
+///
+/// 对齐 Go：trojan inbound 的 `iConn` 已是 `*reality.Conn`（transport 层包装，
+/// server.go:378-382 经 `realityConn.ConnectionState()` 取 SNI/ALPN 供
+/// fallback 匹配）。Rust 侧 REALITY 验证在 inbound 层完成（tcp hub 不包装
+/// security），`RealityTlsStream` 暂无 SNI/ALPN 查询口，`tls_name`/`tls_alpn`
+/// 传空——与 transport 分支 `serve_trojan_conn` 调用点既有行为一致。
+///
+/// 此前的缺陷（39436 战役）：trojan 分支 `security=reality` 误走
+/// `build_tls_acceptor` → 标准 rustls（自签证书）而非 REALITY——客户端
+/// REALITY 证书校验必败（"received real certificate"），握手后服务端把
+/// TLS record 当裸 trojan header 读，`failed to read user hash: peer closed`。
+async fn serve_reality_trojan(
+    listener: InboundTcpListener,
+    ohm: Arc<SimpleOhm>,
+    users: HashMap<String, TrojanMemoryUser>,
+    fb_policy: Option<Arc<FallbackPolicy>>,
+    cfg: RealityInboundConfig,
+    handshake_timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    use xray_reality::server::{RealityServerOutcome, fallback_to_dest, server_tls};
+
+    let handler = ohm
+        .get_default_handler()
+        .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
+    let local = listener.local_addr()?;
+    tracing::info!(addr = %local, users = users.len(), "trojan+reality inbound listening");
+
+    let validator = Arc::new(xray_proxy_trojan::Validator::new());
+    for (_, user) in users {
+        if let Err(e) = validator.add(user) {
+            tracing::warn!(error = %e, "skip duplicate user during trojan+reality inbound init");
+        }
+    }
+
+    // bd frxi：探测上下文（Go tcp/hub.go:79 无条件跑，Rust 侧 opt-in）；
+    // 与 serve_reality_vless 同构，probe 结果随连接交付。
+    let probe_ctx = if cfg.max_useless_records.is_enabled() {
+        let table = xray_reality::probe::ProbeTable::new();
+        xray_reality::probe::detect_max_useless_records(
+            table.clone(),
+            cfg.fallback_dest.clone(),
+            cfg.server_names.clone(),
+            "tcp".to_string(),
+            cfg.xver,
+        );
+        xray_reality::probe::detect_post_handshake_record_lens(
+            table.clone(),
+            cfg.fallback_dest.clone(),
+            cfg.server_names.clone(),
+            "tcp".to_string(),
+            cfg.xver,
+        );
+        tracing::info!(dest = %cfg.fallback_dest, "reality maxUselessRecords probe started");
+        Some(xray_reality::server::ProbeContext {
+            table,
+            dest: cfg.fallback_dest.clone(),
+            fallback: cfg.max_useless_records,
+        })
+    } else {
+        None
+    };
+
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "trojan+reality inbound accept failed");
+                continue;
+            },
+        };
+        let handler = Arc::clone(&handler);
+        let validator = Arc::clone(&validator);
+        let fb_policy = fb_policy.clone();
+        let key = cfg.server_private_key;
+        let names = cfg.server_names.clone();
+        let ids = cfg.short_ids.clone();
+        let max_diff = cfg.max_diff;
+        let dest = cfg.fallback_dest.clone();
+        let xver = cfg.xver;
+        let min_ver = cfg.min_client_ver.clone();
+        let max_ver = cfg.max_client_ver.clone();
+        let probe_ctx = probe_ctx.clone();
+        let use_btls = matches!(cfg.server_acceptor, xray_reality::ServerAcceptorSetting::Btls);
+        tokio::spawn(async move {
+            let outcome = if use_btls {
+                #[cfg(not(target_os = "ios"))]
+                {
+                    xray_reality::server::server_tls_btls(
+                        stream,
+                        &key,
+                        &ids,
+                        max_diff,
+                        &min_ver,
+                        &max_ver,
+                        &names,
+                        probe_ctx.as_ref(),
+                    )
+                    .await
+                }
+                #[cfg(target_os = "ios")]
+                {
+                    // iOS 无注入 FFI（配置解析层已拒 serverAcceptor=btls），
+                    // 此处运行时防御性回落 rustls（零功能损失）。
+                    server_tls(
+                        stream,
+                        &key,
+                        &ids,
+                        max_diff,
+                        &min_ver,
+                        &max_ver,
+                        &names,
+                        probe_ctx.as_ref(),
+                    )
+                    .await
+                }
+            } else {
+                server_tls(
+                    stream,
+                    &key,
+                    &ids,
+                    max_diff,
+                    &min_ver,
+                    &max_ver,
+                    &names,
+                    probe_ctx.as_ref(),
+                )
+                .await
+            };
+            match outcome {
+                Ok(RealityServerOutcome::Verified { tls, .. }) => {
+                    xray_proxy_trojan::serve_trojan_conn(
+                        tls,
+                        validator,
+                        handler,
+                        fb_policy,
+                        peer,
+                        local,
+                        String::new(),
+                        String::new(),
+                        handshake_timeout,
+                    )
+                    .await;
+                },
+                Ok(RealityServerOutcome::Invalid { conn, record, reason }) => {
+                    // 非 REALITY 客户端（浏览器/探测器）→ 透明转发到 fallback dest
+                    tracing::debug!(error = ?reason, dest = %dest, "trojan+reality verify failed, fallback");
+                    let _ = fallback_to_dest(conn, &record, &dest, peer, local, xver).await;
+                },
+                Err(e) => {
+                    tracing::warn!(error = ?e, "trojan+reality tls handshake error");
+                },
+            }
+        });
+    }
+}
+
 /// settings.protocol 是否由 transport listener 承载（非裸 TCP）。
 ///
 /// 对应 Go `tcp_hub.go::ListenTCP` 按 protocolName 查注册表；`tcp`/`raw`
@@ -2673,6 +2833,25 @@ async fn spawn_one_inbound(
                     on_conn,
                 )
                 .await
+            } else if settings.security == "reality" {
+                // REALITY：server_tls 验证 → Verified 走 Trojan；Invalid fallback 到 dest。
+                // （39436 修复：此前误走 build_tls_acceptor 标准 rustls——客户端
+                // REALITY 证书校验必败，trojan header 永远读不到。对齐 Go：
+                // trojan inbound 收到的 iConn 已是 *reality.Conn。）
+                let reality = parse_reality_config(&settings)?;
+                let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone()).await?;
+                tracing::info!(tag = %ib.tag, addr = %addr, users = users.len(), fallback = %reality.fallback_dest, "trojan+reality inbound listening");
+                Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                    serve_reality_trojan(
+                        listener,
+                        ohm,
+                        users,
+                        fallbacks,
+                        reality,
+                        handshake_timeout_for(&policy, 0),
+                    )
+                    .await
+                })))
             } else {
                 let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
                 let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone()).await?;
@@ -5770,6 +5949,136 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         conn.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, payload, "vless over reality should echo");
+    }
+
+    /// 39436 回归锁定：trojan + tcp + reality inbound 必须走 REALITY 验证路径
+    /// （serve_reality_trojan），不得误装配标准 rustls。
+    ///
+    /// 缺陷形态（修复前）：`spawn_one_inbound` trojan 分支 `security=reality`
+    /// 落入 `build_tls_acceptor` → 标准自签证书 TLS——REALITY 客户端证书校验
+    /// 必败（"received real certificate"），服务端把 TLS record 当裸 trojan
+    /// header 读，`failed to read user hash: peer closed`。VPS 生产实测：
+    /// Go 同配置 204+6.19MB/s 通，Rust 回环 dial failed。
+    ///
+    /// 本测试从函数级复刻该装配（serve_reality_trojan）：REALITY dial →
+    /// trojan header → freedom → echo 回环。修复前该函数不存在（编译红）；
+    /// 修复后装配层已接线（inbound.rs trojan 分支 security=reality 分派）。
+    #[tokio::test]
+    async fn trojan_reality_inbound_e2e() {
+        static PROVIDER: std::sync::Once = std::sync::Once::new();
+        PROVIDER.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+        use base64::Engine as _;
+        use xray_proxy_trojan::protocol::{Network as TrojanNetwork, write_request_header};
+        use xray_transport::{
+            dialer::{StreamSettings, dial_with_settings},
+            sockopt::SocketOptions,
+        };
+
+        // 1. echo server（trojan 数据目标）
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = echo_listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    },
+                }
+            }
+        });
+
+        // 2. freedom outbound → SimpleOhm
+        let ohm = Arc::new(SimpleOhm::new());
+        let bridge = Arc::new(xray_app_dispatcher::default::DialBridge::new(
+            "freedom",
+            make_freedom_dial_fn(),
+        )) as Arc<dyn xray_app_dispatcher::DispatchHandler>;
+        ohm.set_default(bridge);
+
+        // 3. trojan users
+        let account = TrojanMemoryAccount::new("trojan-reality-39436-pass");
+        let user = TrojanMemoryUser::new("reality-e2e@trojan", 0, account.clone());
+        let mut users = HashMap::new();
+        users.insert(user.key_hash(), user);
+
+        // 4. serve_reality_trojan（修复后的装配路径）
+        let server_secret = x25519_dalek::StaticSecret::from([0x77u8; 32]);
+        let server_public = x25519_dalek::PublicKey::from(&server_secret);
+        let short_id = [9u8, 8, 7, 6, 5, 4, 3, 2];
+        let reality_cfg = RealityInboundConfig {
+            server_private_key: server_secret.to_bytes(),
+            // 客户端 SNI=reality.local（下方 settings），白名单含它 → SNI 门放行。
+            server_names: vec!["reality.local".to_string()],
+            short_ids: vec![short_id],
+            max_diff: 43200,
+            fallback_dest: format!("127.0.0.1:{}", echo_addr.port()),
+            xver: 0,
+            min_client_ver: Vec::new(),
+            max_client_ver: Vec::new(),
+            max_useless_records: xray_reality::MaxUselessRecordsSetting::Disabled,
+            server_acceptor: xray_reality::ServerAcceptorSetting::Rustls,
+        };
+        let rl = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        )
+        .await
+        .unwrap();
+        let rl_addr = rl.local_addr().unwrap();
+        let ohm_c = Arc::clone(&ohm);
+        tokio::spawn(async move {
+            let _ = serve_reality_trojan(
+                rl,
+                ohm_c,
+                users,
+                None,
+                reality_cfg,
+                std::time::Duration::from_secs(30),
+            )
+            .await;
+        });
+
+        // 5. client：tcp+reality dial → trojan header + payload → echo 回读
+        let _ = xray_transport_tcp::register::register_dialer();
+        let mut settings = StreamSettings::tcp();
+        settings.security = "reality".to_string();
+        settings.security_json = Some(serde_json::json!({
+            "serverName": "reality.local",
+            "publicKey": base64::engine::general_purpose::STANDARD.encode(server_public.to_bytes()),
+            "shortId": hex::encode(short_id),
+            "fingerprint": "chrome"
+        }));
+        let dest = Destination::tcp(
+            Address::IPv4(std::net::Ipv4Addr::LOCALHOST),
+            Port::new(rl_addr.port()),
+        );
+        let mut conn = dial_with_settings("tcp", &dest, &SocketOptions::default(), &settings)
+            .await
+            .expect("tcp+reality dial should succeed against trojan+reality inbound");
+
+        // trojan 请求头（TCP → echo）+ payload 一次写入
+        let mut header = Vec::with_capacity(128);
+        write_request_header(
+            &mut header,
+            &account,
+            TrojanNetwork::Tcp,
+            &Address::IPv4(std::net::Ipv4Addr::LOCALHOST),
+            echo_addr.port(),
+        )
+        .unwrap();
+        let payload = b"hello trojan+reality!";
+        header.extend_from_slice(payload);
+        conn.write_all(&header).await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        conn.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, payload, "trojan over reality should echo");
     }
 
     #[test]
