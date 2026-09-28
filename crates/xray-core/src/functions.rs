@@ -1392,6 +1392,137 @@ mod tests {
         }
     }
 
+    /// FieldAudit P1 回归共用回环：SOCKS5 → `kind` 入站（settings JSON 由调用方给，
+    /// 用于锁 users 形态）→ Freedom → echo。断言协议连接全链路可达。
+    async fn assert_socks_chain_via_inbound_settings(kind: &str, server_settings: &str) {
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = echo_listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    },
+                }
+            }
+        });
+
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let in_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: kind.into(), data: server_settings.as_bytes().to_vec() },
+            tag: "proxy-in".into(),
+            port: Some(in_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        server_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
+            tag: "direct".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
+        });
+        let (_si, _so, sh) = start_full(&server_cfg).await.unwrap_or_else(|e| {
+            panic!("{kind} server with users-form settings failed to start: {e}")
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let outbound_user_field = if kind == "vless" { "encryption" } else { "security" };
+        let outbound_value = if kind == "vless" { "none" } else { "auto" };
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "socks".into(), data: vec![] },
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        client_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry {
+                kind: kind.into(),
+                data: format!(
+                    r#"{{"vnext":[{{"address":"127.0.0.1","port":{in_port},"users":[{{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","{outbound_user_field}":"{outbound_value}"}}]}}]}}"#
+                )
+                .into_bytes(),
+            },
+            tag: "proxy".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
+        });
+        let (_ci, _co, ch) = start_full(&client_cfg).await.expect("client");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.unwrap();
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x05, 0x00]);
+        let ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
+        let mut req = vec![0x05, 0x01, 0x00, 0x01];
+        req.extend_from_slice(&ip);
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        client.write_all(&req).await.unwrap();
+        let mut cr = [0u8; 10];
+        client.read_exact(&mut cr).await.unwrap();
+        assert_eq!(cr[1], 0x00, "{kind} CONNECT via users-form inbound");
+
+        let payload = b"hello users-form chain!";
+        client.write_all(payload).await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got))
+            .await
+        {
+            Ok(Ok(_)) => assert_eq!(&got, payload, "echo through {kind} users-form inbound"),
+            Ok(Err(e)) => panic!("{kind} users-form read error: {e}"),
+            Err(_) => panic!("timeout: {kind} users-form inbound rejected the connection"),
+        }
+        for h in sh.iter().chain(ch.iter()) {
+            h.abort();
+        }
+    }
+
+    /// FieldAudit P1 回归：vmess 入站 users 形态（生产 xr.json 形态）可接受协议连接。
+    #[tokio::test]
+    async fn integration_socks_through_vmess_users_form_to_echo() {
+        assert_socks_chain_via_inbound_settings(
+            "vmess",
+            r#"{"users":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}"#,
+        )
+        .await;
+    }
+
+    /// FieldAudit P1 回归：vless 入站 users 形态（生产 xr.json 形态）可接受协议连接。
+    #[tokio::test]
+    async fn integration_socks_through_vless_users_form_to_echo() {
+        assert_socks_chain_via_inbound_settings(
+            "vless",
+            r#"{"users":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}],"decryption":"none"}"#,
+        )
+        .await;
+    }
+
     /// SOCKS5 → VLESS → Freedom → echo 全链路
     #[tokio::test]
     async fn integration_socks_through_vless_to_echo() {

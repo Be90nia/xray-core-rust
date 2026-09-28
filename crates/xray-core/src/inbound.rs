@@ -3611,7 +3611,16 @@ fn build_vless_validator(data: &[u8]) -> std::io::Result<std::sync::Arc<dyn Vles
             .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect::<Vec<u32>>())
             .unwrap_or_default()
     }
-    if let Some(clients) = v.get("clients").and_then(|c| c.as_array()) {
+    // users/clients 双读（FieldAudit P1：Go vless.go:46-48 `if c.Clients != nil
+    // { c.Users = c.Clients }`——clients 键在场（非 null，含空数组）完全覆盖
+    // users，否则 users 为合法别名。生产 xr.json 全部 users 形态，只读 clients
+    // → 0 用户全拒）。
+    let client_list = v
+        .get("clients")
+        .filter(|c| !c.is_null())
+        .or_else(|| v.get("users"))
+        .and_then(|c| c.as_array());
+    if let Some(clients) = client_list {
         for c in clients {
             let id = c.get("id").and_then(|x| x.as_str()).unwrap_or("");
             let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -4028,7 +4037,15 @@ fn build_vmess_validator(data: &[u8]) -> std::io::Result<std::sync::Arc<VmessTim
     // Go VMessDefaultConfig：{"default":{"level":N}}，user 未显式给 level 时的默认值。
     let default_level =
         v.get("default").and_then(|d| d.get("level")).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-    if let Some(clients) = v.get("clients").and_then(|c| c.as_array()) {
+    // users/clients 双读（FieldAudit P1：Go vmess.go:73-75 `if c.Clients != nil
+    // { c.Users = c.Clients }`——clients 键在场（非 null，含空数组）完全覆盖
+    // users，否则 users 为合法别名。只读 clients → users 形态 0 用户全拒）。
+    let client_list = v
+        .get("clients")
+        .filter(|c| !c.is_null())
+        .or_else(|| v.get("users"))
+        .and_then(|c| c.as_array());
+    if let Some(clients) = client_list {
         for c in clients {
             let id = c.get("id").and_then(|x| x.as_str()).unwrap_or("");
             let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -6890,6 +6907,51 @@ mod tests {
         assert_eq!(user.email, "alice@example.com");
     }
 
+    /// FieldAudit P1 回归：users 形态（生产 xr.json 全族形态）必须可达——
+    /// Go vless.go:46-48 users 为 clients 合法别名，只读 clients = 0 用户全拒。
+    #[test]
+    fn build_vless_validator_accepts_users_alias() {
+        let uuid = "66ad4540-b58c-4ad2-9926-ea63445a9b57";
+        let settings =
+            serde_json::json!({ "users": [{ "id": uuid, "email": "alice@example.com" }] });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let validator = super::build_vless_validator(&data).unwrap();
+        use xray_proxy_vless::Validator as VlessValidatorTrait;
+        assert_eq!(VlessValidatorTrait::get_uuid_count(&*validator), 1);
+    }
+
+    /// clients+users 同场：Go 覆盖语义 = clients 完全取代 users（vless.go:46-48）。
+    #[test]
+    fn build_vless_validator_clients_override_users_when_both_present() {
+        let ua = "b831381d-6324-4d53-ad4f-8cda48b30811";
+        let ub = "66ad4540-b58c-4ad2-9926-ea63445a9b57";
+        let uc = "d342d11e-d424-4583-b36e-524ab1f0afa4";
+        let settings = serde_json::json!({
+            "users": [{ "id": ua }, { "id": ub }],
+            "clients": [{ "id": uc }],
+        });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let validator = super::build_vless_validator(&data).unwrap();
+        use xray_proxy_vless::Validator as VlessValidatorTrait;
+        assert_eq!(VlessValidatorTrait::get_uuid_count(&*validator), 1, "clients wins");
+        let uc_uuid = xray_common::uuid::UUID::parse(uc).unwrap();
+        assert!(VlessValidatorTrait::get(&*validator, &uc_uuid).is_some(), "client registered");
+        let ua_uuid = xray_common::uuid::UUID::parse(ua).unwrap();
+        assert!(VlessValidatorTrait::get(&*validator, &ua_uuid).is_none(), "users dropped");
+    }
+
+    /// `"clients": null` 不覆盖 users（Go JSON null → nil slice，不触发覆盖分支）。
+    #[test]
+    fn build_vless_validator_null_clients_falls_back_to_users() {
+        let uuid = "66ad4540-b58c-4ad2-9926-ea63445a9b57";
+        let settings =
+            serde_json::json!({ "clients": null, "users": [{ "id": uuid }], });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let validator = super::build_vless_validator(&data).unwrap();
+        use xray_proxy_vless::Validator as VlessValidatorTrait;
+        assert_eq!(VlessValidatorTrait::get_uuid_count(&*validator), 1);
+    }
+
     #[test]
     fn build_vless_validator_empty_clients() {
         let settings = serde_json::json!({ "decryption": "none" });
@@ -7523,6 +7585,45 @@ mod tests {
             Network::TCP,
         );
         assert!(!super::is_mux_destination(&dest));
+    }
+
+    /// FieldAudit P1 回归：users 形态（生产 xr.json 全族形态）必须可达——
+    /// Go vmess.go:73-75 users 为 clients 合法别名。
+    #[test]
+    fn build_vmess_validator_accepts_users_alias() {
+        let uuid = "66ad4540-b58c-4ad2-9926-ea63445a9b57";
+        let settings = serde_json::json!({ "users": [{ "id": uuid, "email": "alice" }] });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let validator = super::build_vmess_validator(&data).unwrap();
+        use xray_proxy_vmess::Validator as VmessValidatorTrait;
+        assert_eq!(VmessValidatorTrait::count(&*validator), 1);
+    }
+
+    /// clients+users 同场：Go 覆盖语义 = clients 完全取代 users（vmess.go:73-75）。
+    #[test]
+    fn build_vmess_validator_clients_override_users_when_both_present() {
+        let ua = "b831381d-6324-4d53-ad4f-8cda48b30811";
+        let ub = "66ad4540-b58c-4ad2-9926-ea63445a9b57";
+        let uc = "d342d11e-d424-4583-b36e-524ab1f0afa4";
+        let settings = serde_json::json!({
+            "users": [{ "id": ua }, { "id": ub }],
+            "clients": [{ "id": uc }],
+        });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let validator = super::build_vmess_validator(&data).unwrap();
+        use xray_proxy_vmess::Validator as VmessValidatorTrait;
+        assert_eq!(VmessValidatorTrait::count(&*validator), 1, "clients wins");
+    }
+
+    /// `"clients": null` 不覆盖 users（Go JSON null → nil slice，不触发覆盖分支）。
+    #[test]
+    fn build_vmess_validator_null_clients_falls_back_to_users() {
+        let uuid = "66ad4540-b58c-4ad2-9926-ea63445a9b57";
+        let settings = serde_json::json!({ "clients": null, "users": [{ "id": uuid }] });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let validator = super::build_vmess_validator(&data).unwrap();
+        use xray_proxy_vmess::Validator as VmessValidatorTrait;
+        assert_eq!(VmessValidatorTrait::count(&*validator), 1);
     }
 
     #[test]
