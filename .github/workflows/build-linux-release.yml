@@ -12,7 +12,8 @@ on:
       - '.github/workflows/build-linux-release.yml'
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    # ubuntu-22.04 image 已退休（runner 分配即败、零 steps）；对齐 mobile.yml 用固定 24.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
