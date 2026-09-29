@@ -1438,12 +1438,33 @@ mod tests {
             vision.uplink_traffic.enable_xtls = true;
             vision.uplink_traffic.is_tls = true;
             vision.uplink_traffic.is_tls12_or_above = true;
+            let (mut sr, mut sw) = tokio::io::split(vision);
+            // 上行汇：并发读 VisionConn 读半（含 DIRECT 后 raw 切换），防止客户端
+            // 上行无汇导致的缓冲填满假死
+            let sink = tokio::spawn(async move {
+                let mut tmp = [0u8; 16384];
+                let mut total = 0usize;
+                let dl = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+                while tokio::time::Instant::now() < dl {
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), sr.read(&mut tmp))
+                        .await
+                    {
+                        Ok(Ok(0)) => break,
+                        Ok(Ok(n)) => total += n,
+                        _ => break,
+                    }
+                }
+                eprintln!("[tap2][srv] uplink sink total={total}");
+            });
             for i in 0..40u8 {
                 let chunk = make_chunk(i);
-                vision.write_all(&chunk).await.expect("srv pump write");
-                vision.flush().await.expect("srv pump flush");
+                sw.write_all(&chunk).await.expect("srv pump write");
+                sw.flush().await.expect("srv pump flush");
+                eprintln!("[tap2][srv] chunk {i} written");
             }
-            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            eprintln!("[tap2][srv] pump done, parking 60s");
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let _ = sink.await;
         });
 
         let csock = tokio::net::TcpStream::connect(addr).await.unwrap();
