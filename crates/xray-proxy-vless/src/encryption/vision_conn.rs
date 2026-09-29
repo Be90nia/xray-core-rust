@@ -1280,10 +1280,21 @@ mod tests {
         // 首帧携带 UUID 前缀（16B）+ 5B 帧头
         assert_eq!(&server.inner.sealed[..16], &uuid[..], "UUID 前缀");
         assert_eq!(server.inner.sealed[16], COMMAND_PADDING_END);
-        assert!(
-            (21 + 16 + 1000..=21 + 16 + 1000 + 255).contains(&sealed_len),
-            "sealed={sealed_len}"
-        );
+        // 帧几何契约：unpadding 必须精确还原 block1（pad 随机值无关；内容
+        // 截断/长度场损坏在此暴露）
+        {
+            let mut st = crate::encryption::vision::DirectionState::default();
+            let content =
+                crate::encryption::vision::xtls_unpadding(&server.inner.sealed, &mut st, &uuid);
+            assert_eq!(
+                content,
+                block1,
+                "End 帧 content 必须精确还原 block1: got={}B cmd={}",
+                content.len(),
+                st.current_command
+            );
+            assert_eq!(st.current_command, COMMAND_PADDING_END as i32);
+        }
         assert!(server.inner.wire.is_empty(), "flush 未解除不得上线");
 
         // 写 #2（重入，同一 flush 窗口）：必须 Pending 且不产生任何新字节
@@ -1497,14 +1508,18 @@ mod tests {
             }
             // 读侧 3ms 停顿：逼服务端 rustls write_io 撞 WouldBlock（背压路径）
             tokio::time::sleep(std::time::Duration::from_millis(3)).await;
-            let n = tokio::time::timeout(std::time::Duration::from_secs(15), cr.read(&mut buf))
-                .await
-                .expect("cli read deadline")
-                .expect("cli read io");
-            if n == 0 {
-                panic!("EOF at {}", got.len());
-            }
+            let read =
+                tokio::time::timeout(std::time::Duration::from_secs(15), cr.read(&mut buf)).await;
+            let n = match read {
+                Ok(Ok(n)) if n > 0 => n,
+                Ok(Ok(_)) => panic!("EOF at {}", got.len()),
+                Ok(Err(e)) => panic!("cli read io at {}: {e}", got.len()),
+                Err(_) => panic!("cli read deadline at {} bytes received", got.len()),
+            };
             got.extend_from_slice(&buf[..n]);
+            if got.len() % 65536 < n {
+                eprintln!("[tap2][cli] downlink progress: {} bytes", got.len());
+            }
         }
         let mut rebuilt: Vec<u8> = Vec::new();
         for i in 0..40u8 {
