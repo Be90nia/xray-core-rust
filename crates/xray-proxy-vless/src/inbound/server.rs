@@ -524,8 +524,9 @@ where
         VlessCommand::Tcp => {
             finish_tcp_dispatch(reader, write_half, &decoded, handler, raw_tcp, &access).await
         },
-        VlessCommand::Udp =>
-            handle_udp_relay(reader, write_half, &decoded, handler, udp_idle_timeout()).await,
+        VlessCommand::Udp => {
+            handle_udp_relay(reader, write_half, &decoded, handler, udp_idle_timeout()).await
+        },
         VlessCommand::Mux => handle_mux_relay(reader, write_half, &decoded, handler, &access).await,
         VlessCommand::Rvs => {
             handle_reverse_relay(reader, write_half, &decoded, handler, options.as_ref()).await
@@ -616,14 +617,10 @@ where
     // 读到包交 channel；EOF/Err 即退出（客户端方向结束，tx drop 唤醒 relay）。
     let (up_tx, mut up_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
     let uplink = tokio::spawn(async move {
-        loop {
-            match read_length_packet(&mut reader).await {
-                Ok(pkt) => {
-                    if up_tx.send(pkt).await.is_err() {
-                        break; // relay 已退出
-                    }
-                },
-                Err(_) => break,
+        // while let：Ok 继续、Err（EOF/IO）即退出（clippy while_let_loop 同构改写）
+        while let Ok(pkt) = read_length_packet(&mut reader).await {
+            if up_tx.send(pkt).await.is_err() {
+                break; // relay 已退出
             }
         }
     });
@@ -2003,9 +2000,12 @@ mod tests {
                 }
                 for data in got.iter().rev() {
                     let mut frame = Vec::new();
-                    FrameMetadata::keep_udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(53))
-                        .write_to(&mut frame)
-                        .unwrap();
+                    FrameMetadata::keep_udp(
+                        Address::from_ipv4_bytes([127, 0, 0, 1]),
+                        Port::new(53),
+                    )
+                    .write_to(&mut frame)
+                    .unwrap();
                     frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
                     frame.extend_from_slice(data);
                     let mut out = xray_buf::multi::MultiBuffer::new();
