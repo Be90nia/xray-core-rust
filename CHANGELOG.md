@@ -32,6 +32,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - mux 帧编码 `Network::Unix` 目标远程可达 panic → 显式 `Err`（对齐 Go 无 panic 路径）
 - VLESS 0-RTT `handshake_zero_rtt` 会话 TOCTOU expect panic → miss 语义显式拒绝（`expired ticket`）
+- vless 入站 UDP relay 串行挂死（WSLEAK，生产 443 CLOSE-WAIT 泄漏根因）：改 uplink 独立 task + `select!` 双方向并发泵 + 滑动 idle deadline + 客户端 EOF 结束会话（对齐 vmess `pump_udp_session` 与 Go `inbound.go:416` ActivityTimer），UDP 目标不回包不再阻塞读客户端
 
 - 互通矩阵扩展 1.5×2：新增 `rust_to_go` 反向套件（Rust→Go 6 协议）+ 新协议 splithttp/gRPC/REALITY/Hysteria2/AnyTLS/TUIC（默认套件 37 测 = Rust↔Rust 12 + Go→Rust 6 + Rust→Go 6 + 新协议 13）（`1dfdb769`）
 - interop 新增 splithttp/kcp/httpupgrade 三脚本（双向 + R↔R 共 12 测），Go→Rust go suite 3→6 协议（`22a08743`）

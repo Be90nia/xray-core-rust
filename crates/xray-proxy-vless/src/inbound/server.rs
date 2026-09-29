@@ -232,6 +232,20 @@ fn handshake_timeout() -> std::time::Duration {
 fn handshake_timeout() -> std::time::Duration {
     std::time::Duration::from_millis(100)
 }
+
+/// UDP relay 滑动空闲限时（Go `inbound.go:416` ActivityTimer，policy
+/// `Timeouts.ConnectionIdle`）。独立成函数仅为可测性：cfg(test) 收短到
+/// 500ms，让「静默会话 → idle 拆除」行为测试无需真实等待 300s；产品路径
+/// 恒为 SessionDefault 真值。
+#[cfg(not(test))]
+fn udp_idle_timeout() -> std::time::Duration {
+    xray_features::policy::DEFAULT_CONN_IDLE_TIMEOUT
+}
+
+#[cfg(test)]
+fn udp_idle_timeout() -> std::time::Duration {
+    std::time::Duration::from_millis(500)
+}
 /// 带 fallback 的连接处理（Go `vless/inbound/inbound.go::Process` 语义）：
 ///
 /// 1. 预读 first buffer（最多 1024 字节）
@@ -510,7 +524,8 @@ where
         VlessCommand::Tcp => {
             finish_tcp_dispatch(reader, write_half, &decoded, handler, raw_tcp, &access).await
         },
-        VlessCommand::Udp => handle_udp_relay(reader, write_half, &decoded, handler).await,
+        VlessCommand::Udp =>
+            handle_udp_relay(reader, write_half, &decoded, handler, udp_idle_timeout()).await,
         VlessCommand::Mux => handle_mux_relay(reader, write_half, &decoded, handler, &access).await,
         VlessCommand::Rvs => {
             handle_reverse_relay(reader, write_half, &decoded, handler, options.as_ref()).await
@@ -569,11 +584,17 @@ where
 /// 客户端 TCP 上每个包是 `[2B BE len][payload]`，payload 作为 UDP 数据报。
 /// 首包目的地用 `decoded.address/port`（请求头解析得到），后续包用同一目的地
 /// （与 Go `udpInbound` 单 session 一致）。
+///
+/// WSLEAK：此前实现为串行「读包 → send → 阻塞等响应」，UDP 目标不回包时
+/// 挂死在 `recv_packet` 上不再读客户端 → FIN 不可见 → CLOSE-WAIT 永久堆积。
+/// 现为 uplink 独立 task + `select!` 双方向并发泵 + 滑动 idle deadline
+/// （对齐 vmess `pump_udp_session` 与 Go `inbound.go:416` ActivityTimer）。
 async fn handle_udp_relay<R, W>(
     mut reader: R,
     mut writer: W,
     decoded: &crate::encoding::server::DecodedRequest,
     handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
+    idle_timeout: std::time::Duration,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -590,35 +611,55 @@ where
 
     let mut session = xray_app_dispatcher::UdpDispatchSession::new(handler.clone());
 
-    loop {
-        let payload = match read_length_packet(&mut reader).await {
-            Ok(p) => p,
-            Err(crate::error::VlessError::Io(e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                // 客户端关闭 TCP：正常退出（与 Go UDP relay 行为一致）
-                return Ok(());
-            },
-            Err(e) => {
-                return Err(std::io::Error::other(format!("vless UDP read: {e}")));
-            },
-        };
-
-        if let Err(e) = session.send_packet(&udp_dest, &payload).await {
-            return Err(std::io::Error::other(format!("vless UDP dispatch: {e}")));
+    // uplink 拆独立 task：`read_length_packet` 是两次 `read_exact`，非
+    // cancel-safe，不能直接进 select!（对齐 vmess pump 的 up/relay 拆分）。
+    // 读到包交 channel；EOF/Err 即退出（客户端方向结束，tx drop 唤醒 relay）。
+    let (up_tx, mut up_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    let uplink = tokio::spawn(async move {
+        loop {
+            match read_length_packet(&mut reader).await {
+                Ok(pkt) => {
+                    if up_tx.send(pkt).await.is_err() {
+                        break; // relay 已退出
+                    }
+                },
+                Err(_) => break,
+            }
         }
+    });
 
-        // 收取响应包（cone NAT：同一 session 接收多个回包）
-        match session.recv_packet().await {
-            Ok(Some((_source, resp))) => {
-                if let Err(e) = write_length_packet(&mut writer, &resp).await {
-                    return Err(std::io::Error::other(format!("vless UDP write: {e}")));
-                }
+    // 双方向并发泵 + 滑动 idle deadline：每轮循环重建 sleep_until，任一方向
+    // 来包即重置；到期拆除会话（Go ActivityTimer 同源）。`send_packet` 在
+    // select 分支体内 await（select 已定，不会被取消）；`recv_packet` 可取消
+    // （半帧累积在 session 内部，见 udp_session.rs）。
+    let result = loop {
+        let deadline = tokio::time::Instant::now() + idle_timeout;
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break Ok(()), // 空闲到期拆除
+            pkt = up_rx.recv() => match pkt {
+                Some(payload) => {
+                    if let Err(e) = session.send_packet(&udp_dest, &payload).await {
+                        break Err(std::io::Error::other(format!("vless UDP dispatch: {e}")));
+                    }
+                },
+                None => break Ok(()), // 客户端 EOF：会话终（Go 客户端断即拆）
             },
-            Ok(None) => return Ok(()), // outbound 关闭
-            Err(e) => return Err(std::io::Error::other(format!("vless UDP recv: {e}"))),
+            resp = session.recv_packet() => match resp {
+                // cone NAT：同一 session 接收多个回包
+                Ok(Some((_source, packet))) => {
+                    if let Err(e) = write_length_packet(&mut writer, &packet).await {
+                        break Err(std::io::Error::other(format!("vless UDP write: {e}")));
+                    }
+                },
+                Ok(None) => break Ok(()), // outbound 关闭
+                Err(e) => break Err(std::io::Error::other(format!("vless UDP recv: {e}"))),
+            },
         }
-    }
+    };
+    // 会话已结束：abort uplink 释放客户端读半（否则其阻塞的 read 永久持有
+    // socket，idle 拆除场景下反向泄漏）。
+    uplink.abort();
+    result
 }
 
 /// Mux 命令 relay：按请求目的地原样 dispatch（Go `inbound.go:633`）。
@@ -1887,5 +1928,214 @@ mod tests {
     #[tokio::test]
     async fn vless_inbound_rejects_xrv_without_outer_tls13() {
         assert_flow_rejected(crate::FLOW_XRV, VlessCommand::Tcp, false, crate::FLOW_XRV).await;
+    }
+
+    // ------------------------------------------------------------------
+    // WSLEAK 回归：handle_udp_relay 并发泵 + idle deadline（WSLEAK.md
+    // regression_tests 1-3；修复前串行实现在 recv_packet 上永久挂起）。
+    // ------------------------------------------------------------------
+
+    /// 黑洞 outbound：dispatch link 消费后永不响应（生产形态 = DNS 被过滤 /
+    /// QUIC 黑洞）。响应永不到达，旧实现挂在 `recv_packet` 上。
+    #[derive(Debug)]
+    struct SilentUdpHandler;
+
+    impl xray_app_dispatcher::DispatchHandler for SilentUdpHandler {
+        fn tag(&self) -> &str {
+            "udp-silent-test"
+        }
+
+        fn dispatch(
+            &self,
+            _dest: &xray_common::net::destination::Destination,
+            _link: xray_transport::link::Link,
+        ) -> xray_app_dispatcher::default::PinFuture<()> {
+            Box::pin(async { std::future::pending::<()>().await })
+        }
+    }
+
+    /// 批量 echo：收齐 `expected` 帧后**逆序**回写（乱序响应证明响应处理
+    /// 不依赖读序；收齐前不写任何帧 → 旧串行实现死锁收不齐 3 包）。
+    #[derive(Debug)]
+    struct BatchEchoHandler {
+        expected: usize,
+    }
+
+    impl xray_app_dispatcher::DispatchHandler for BatchEchoHandler {
+        fn tag(&self) -> &str {
+            "udp-batch-echo-test"
+        }
+
+        fn dispatch(
+            &self,
+            _dest: &xray_common::net::destination::Destination,
+            link: xray_transport::link::Link,
+        ) -> xray_app_dispatcher::default::PinFuture<()> {
+            let expected = self.expected;
+            Box::pin(async move {
+                use std::io::Cursor;
+
+                use xray_xudp::packet::{FrameMetadata, PacketReader};
+
+                let mut reader = link.reader;
+                let mut writer = link.writer;
+                let mut got: Vec<Vec<u8>> = Vec::new();
+                let mut accum: Vec<u8> = Vec::new();
+                while got.len() < expected {
+                    let mb = match reader.read_multi_buffer().await {
+                        Ok(mb) => mb,
+                        Err(_) => return,
+                    };
+                    accum.extend_from_slice(&mb.to_vec());
+                    loop {
+                        let mut cursor = Cursor::new(&accum[..]);
+                        let mut pr = PacketReader::new(&mut cursor);
+                        match pr.read_packet() {
+                            Ok(Some(pkt)) => {
+                                let consumed = cursor.position() as usize;
+                                let (data, _target) = pkt.into_parts();
+                                got.push(data);
+                                accum.drain(..consumed);
+                            },
+                            _ => break,
+                        }
+                    }
+                }
+                for data in got.iter().rev() {
+                    let mut frame = Vec::new();
+                    FrameMetadata::keep_udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(53))
+                        .write_to(&mut frame)
+                        .unwrap();
+                    frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
+                    frame.extend_from_slice(data);
+                    let mut out = xray_buf::multi::MultiBuffer::new();
+                    out.merge_bytes(&frame);
+                    if writer.write_multi_buffer(out).await.is_err() {
+                        return;
+                    }
+                }
+            })
+        }
+    }
+
+    /// WSLEAK 回归装配：交叉双 duplex（收发两方向独立管道，EOF 用 drop 写端
+    /// 模拟客户端 FIN），decoded = UDP 请求目标 1.2.3.4:53。
+    fn udp_relay_fixture() -> (
+        tokio::io::DuplexStream, // client → server 发包写端
+        tokio::io::DuplexStream, // server 读端（handle_udp_relay reader）
+        tokio::io::DuplexStream, // server 写端（handle_udp_relay writer）
+        tokio::io::DuplexStream, // client ← server 收响应读端
+        crate::encoding::server::DecodedRequest,
+    ) {
+        let (client_out, server_read) = tokio::io::duplex(64 * 1024);
+        let (server_write, client_in) = tokio::io::duplex(64 * 1024);
+        let decoded = crate::encoding::server::DecodedRequest {
+            address: Some(Address::from_ipv4_bytes([1, 2, 3, 4])),
+            port: Some(53),
+            ..Default::default()
+        };
+        (client_out, server_read, server_write, client_in, decoded)
+    }
+
+    /// 回归 1：客户端发 1 包后 FIN，outbound 永不回包 → 会话必须随客户端 EOF
+    /// 提前结束（修复前挂在 recv_packet 上，2s 守卫必超时 = WSLEAK 复现）。
+    #[tokio::test]
+    async fn udp_relay_client_eof_ends_session_without_response() {
+        use crate::encoding::write_length_packet;
+
+        let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> = Arc::new(SilentUdpHandler);
+        let (mut client_out, server_read, server_write, _client_in, decoded) = udp_relay_fixture();
+
+        write_length_packet(&mut client_out, b"query").await.unwrap();
+        drop(client_out); // 客户端 FIN
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handle_udp_relay(server_read, server_write, &decoded, &handler, udp_idle_timeout()),
+        )
+        .await
+        .expect("session must end on client EOF (hang = WSLEAK regression)");
+        assert!(result.is_ok(), "EOF teardown must be clean: {result:?}");
+        // EOF 路径必须远早于 500ms idle deadline 生效
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(400),
+            "EOF must end the session well before the idle deadline, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 回归 2：客户端静默 + outbound 静默 → idle deadline（cfg(test) 500ms）
+    /// 到期拆除会话（计时器兜底；修复前永久挂起）。
+    #[tokio::test]
+    async fn udp_relay_idle_deadline_fires() {
+        let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> = Arc::new(SilentUdpHandler);
+        // _client_out 保持存活（静默客户端不断开），仅靠 deadline 拆除
+        let (_client_out, server_read, server_write, _client_in, decoded) = udp_relay_fixture();
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handle_udp_relay(server_read, server_write, &decoded, &handler, udp_idle_timeout()),
+        )
+        .await
+        .expect("idle deadline must fire (hang = WSLEAK regression)");
+        assert!(result.is_ok(), "idle teardown must be clean: {result:?}");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= udp_idle_timeout(),
+            "deadline must not fire before the idle window: {elapsed:?}"
+        );
+    }
+
+    /// 回归 3：无队头阻塞——连发 3 包，outbound 收齐才逆序回写。旧串行实现
+    /// 发完第 1 包即阻塞等响应、停止读客户端，永远收不齐 3 包 → 本测试超时；
+    /// 并发泵下 3 包全被读、3 响应全数写回（顺带覆盖 uplink 拆分后 select! 的
+    /// cancel-safety 结构）。
+    #[tokio::test]
+    async fn udp_relay_no_head_of_line_block() {
+        use crate::encoding::{read_length_packet, write_length_packet};
+
+        let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
+            Arc::new(BatchEchoHandler { expected: 3 });
+        let (mut client_out, server_read, server_write, mut client_in, decoded) =
+            udp_relay_fixture();
+        let handler_for_task = Arc::clone(&handler);
+        let decoded_for_task = decoded.clone();
+
+        let relay = tokio::spawn(async move {
+            handle_udp_relay(
+                server_read,
+                server_write,
+                &decoded_for_task,
+                &handler_for_task,
+                udp_idle_timeout(),
+            )
+            .await
+        });
+
+        for p in ["p1", "p2", "p3"] {
+            write_length_packet(&mut client_out, p.as_bytes()).await.unwrap();
+        }
+
+        // 收齐 3 包才回写且逆序 → 首个响应必为 p3（串行实现收不齐 3 包）
+        for expected in ["p3", "p2", "p1"] {
+            let got = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                read_length_packet(&mut client_in),
+            )
+            .await
+            .expect("response must arrive (no head-of-line block)")
+            .expect("read response packet");
+            assert_eq!(got, expected.as_bytes());
+        }
+
+        // 3 响应写回后客户端 FIN → 会话结束，无残留挂起 task
+        drop(client_out);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), relay)
+            .await
+            .expect("relay task must end on client EOF")
+            .expect("join relay task");
+        assert!(result.is_ok(), "EOF teardown must be clean: {result:?}");
     }
 }
