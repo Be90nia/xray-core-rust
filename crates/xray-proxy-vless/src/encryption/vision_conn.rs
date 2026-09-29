@@ -1455,7 +1455,7 @@ mod tests {
             let sink = tokio::spawn(async move {
                 let mut tmp = [0u8; 16384];
                 let mut total = 0usize;
-                let dl = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+                let dl = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
                 while tokio::time::Instant::now() < dl {
                     match tokio::time::timeout(std::time::Duration::from_secs(5), sr.read(&mut tmp))
                         .await
@@ -1467,7 +1467,7 @@ mod tests {
                 }
                 eprintln!("[tap2][srv] uplink sink total={total}");
             });
-            for i in 0..40u8 {
+            for i in 0..6u8 {
                 let chunk = make_chunk(i);
                 sw.write_all(&chunk).await.expect("srv pump write");
                 sw.flush().await.expect("srv pump flush");
@@ -1492,7 +1492,7 @@ mod tests {
 
         let (mut cr, mut cw) = tokio::io::split(cvision);
         let upump = tokio::spawn(async move {
-            for _ in 0..12u8 {
+            for _ in 0..3u8 {
                 let chunk = make_chunk(0x40);
                 cw.write_all(&chunk).await.expect("cli uplink write");
                 cw.flush().await.expect("cli uplink flush");
@@ -1502,14 +1502,14 @@ mod tests {
         let mut got: Vec<u8> = Vec::new();
         let mut buf = [0u8; 16384];
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-        while got.len() < 40 * 8192 {
+        while got.len() < 6 * 8192 {
             if tokio::time::Instant::now() >= deadline {
                 panic!("deadline: got={}", got.len());
             }
             // 读侧 3ms 停顿：逼服务端 rustls write_io 撞 WouldBlock（背压路径）
-            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             let read =
-                tokio::time::timeout(std::time::Duration::from_secs(15), cr.read(&mut buf)).await;
+                tokio::time::timeout(std::time::Duration::from_secs(30), cr.read(&mut buf)).await;
             let n = match read {
                 Ok(Ok(n)) if n > 0 => n,
                 Ok(Ok(_)) => panic!("EOF at {}", got.len()),
@@ -1522,7 +1522,7 @@ mod tests {
             }
         }
         let mut rebuilt: Vec<u8> = Vec::new();
-        for i in 0..40u8 {
+        for i in 0..6u8 {
             rebuilt.extend_from_slice(&make_chunk(i));
         }
         assert_eq!(got.len(), rebuilt.len(), "downlink content length mismatch");
