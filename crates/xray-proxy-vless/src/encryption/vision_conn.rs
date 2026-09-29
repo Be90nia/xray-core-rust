@@ -105,6 +105,10 @@ pub struct VisionConn<C> {
     /// SSL out-of-order。判定时仅置位；poll_write 把 pending 帧写完返回
     /// Ok 时经 [`Self::arm_splice_raw`] 真正启用。
     splice_armed: bool,
+    /// End 提交闸（bd VISIONMAC）：End 帧已入队/写完但 inner flush 尚未确认
+    /// 上线。commit（flush Ready → `uplink_padding=false`）之前 branch 2
+    /// 不可达——未成帧明文永不逃逸，switch 帧绝不丢失。
+    end_commit: bool,
     /// 角色标记（new=client / new_server=server），预留诊断。
     #[allow(dead_code)]
     is_server: bool,
@@ -152,6 +156,7 @@ where
             raw_tcp: None,
             read_tmp: Vec::with_capacity(16 * 1024),
             splice_armed: false,
+            end_commit: false,
             is_server: false,
             raw_write_gate: None,
         }
@@ -192,6 +197,7 @@ where
             raw_tcp: Some(raw_tcp),
             read_tmp: Vec::with_capacity(16 * 1024),
             splice_armed: false,
+            end_commit: false,
             is_server: true,
             raw_write_gate: None,
         }
@@ -439,11 +445,8 @@ where
             // downlink_traffic → 永远发不出 Direct/End（39824 修 C）。
             // 触发还需 caller 写入是完整的 TLS app-data record（0x17 0x03
             // 0x03 前缀 = curl 的端到端 TLS records）。
-            let write_side = if this.is_server {
-                &this.uplink_traffic
-            } else {
-                &this.downlink_traffic
-            };
+            let write_side =
+                if this.is_server { &this.uplink_traffic } else { &this.downlink_traffic };
             let is_app_data = buf.len() >= 3 && buf[0] == 0x17 && buf[1] == 0x03 && buf[2] == 0x03;
             // Go 分支 1：完整 app-data 记录帧 → padding 到此为止，末帧恒
             // End；XTLS 命中才升格 Direct 并切裸写。
@@ -478,16 +481,19 @@ where
             );
             this.uplink_write_pending = Some((padded, 0, n));
             if command == COMMAND_PADDING_DIRECT {
-                this.uplink_padding = false;
                 // 只置挂起标志，不立即启用 raw 通道（对齐 Go f926ee4a）：
                 // 激活推迟到 pending 帧写完的 arm_splice_raw——若在此提前
                 // 启用，in-flight 写期间 poll_flush/poll_shutdown 会走 raw，
                 // 半关闭/并发写与安全层写竞态同一 TCP fd（issue #4878）。
                 this.splice_armed = true;
             } else if command == COMMAND_PADDING_END {
-                // Go *isPadding = false：End 帧后 caller 数据不再 padding，
-                // 经 inner 直写（无 raw 通道时不 splice）。
-                this.uplink_padding = false;
+                // Go *isPadding = false 的时序等价后移：End 帧确认上线
+                //（poll_arm_gate 的 inner flush Ready）才 commit 翻转——
+                // 判定到 commit 之间 caller 写入被 pending 机制串行化，
+                // 未成帧明文无逃逸窗口（bd VISIONMAC :39057 间歇死亡：
+                // switch 帧在真实 tokio-rustls 异步提交时序下丢失，
+                // 客户端未收到 End/Direct 却收到未成帧明文）。
+                this.end_commit = true;
             }
             // continue → 步骤 1 写 pending
         }
@@ -532,16 +538,28 @@ where
     ///
     /// Go 无此坑：crypto/tls.Conn.Write 从不虚报写完。
     fn poll_arm_gate(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if !self.splice_armed {
-            return Poll::Ready(Ok(()));
-        }
-        match Pin::new(&mut self.inner).poll_flush(cx) {
-            Poll::Ready(Ok(())) => {
-                self.arm_splice_raw();
-                Poll::Ready(Ok(()))
-            },
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
+        if self.splice_armed {
+            match Pin::new(&mut self.inner).poll_flush(cx) {
+                Poll::Ready(Ok(())) => {
+                    self.arm_splice_raw();
+                    Poll::Ready(Ok(()))
+                },
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
+        } else if self.end_commit {
+            // End 提交闸：End 帧（含密文尾巴）确认全部上线，才放行未成帧直写
+            match Pin::new(&mut self.inner).poll_flush(cx) {
+                Poll::Ready(Ok(())) => {
+                    self.uplink_padding = false;
+                    self.end_commit = false;
+                    Poll::Ready(Ok(()))
+                },
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -552,6 +570,8 @@ where
     fn arm_splice_raw(&mut self) {
         if self.splice_armed {
             self.splice_armed = false;
+            // Direct commit：switch 帧已确认上线，此后 caller 写入走裸流
+            self.uplink_padding = false;
             self.raw_write_gate = Some(Box::pin(tokio::time::sleep(RAW_WRITE_ARM_DELAY)));
             if self.raw_fallback.is_none() {
                 self.raw_fallback =
@@ -937,6 +957,544 @@ mod tests {
         server.read_exact(&mut raw).await.unwrap();
         assert_eq!(&raw, b"raw-upstream");
     }
+    /// [reg L1/L2] 泵压中途 DIRECT（bd VISIONMAC 回归）：8KB 块 = [rec 8098][rec 84]，
+    /// 尾写 = 完整小 0x17 record → DIRECT 在尾帧触发；BufSim 提供 BufWriter 语义 +
+    /// drip 背压 flush（gate Pending 路径）。客户端 sim 字节流式解帧，cmd>2 = 断裂。
+    #[tokio::test]
+    async fn reg_midpump_direct_frame_chain() {
+        use std::time::Duration;
+
+        fn rec(payload: &[u8]) -> Vec<u8> {
+            let mut v = vec![0x17, 0x03, 0x03, (payload.len() >> 8) as u8, payload.len() as u8];
+            v.extend_from_slice(payload);
+            v
+        }
+
+        /// tokio-rustls BufWriter 语义模拟：poll_write 只缓冲（Ok），flush 每轮
+        /// 至多吐一条 record + 1ms drip 背压——逼出 poll_arm_gate 的 Pending 路径。
+        struct BufSim {
+            inner: CommonConn<tokio::net::TcpStream>,
+            pending: Vec<Vec<u8>>,
+            drip: Pin<Box<tokio::time::Sleep>>,
+        }
+        impl AsyncRead for BufSim {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+            }
+        }
+        impl AsyncWrite for BufSim {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                let this = self.get_mut();
+                this.pending.push(buf.to_vec());
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                let this = self.get_mut();
+                loop {
+                    if this.pending.is_empty() {
+                        return Poll::Ready(Ok(()));
+                    }
+                    let rec = this.pending.remove(0);
+                    match Pin::new(&mut this.inner).poll_write(cx, &rec) {
+                        Poll::Ready(Ok(n)) if n == rec.len() => {},
+                        Poll::Ready(Ok(_)) => {
+                            return Poll::Ready(Err(io::Error::other("bufsim short write")));
+                        },
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => {
+                            this.pending.insert(0, rec);
+                            return Poll::Pending;
+                        },
+                    }
+                    this.drip
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + std::time::Duration::from_millis(1));
+                    if this.drip.as_mut().poll(cx).is_pending() {
+                        return Poll::Pending;
+                    }
+                }
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+            }
+        }
+        impl InnerRawClone for BufSim {
+            fn inner_raw_tcp_clone(&self) -> Option<TcpStream> {
+                self.inner.inner_raw_tcp_clone()
+            }
+        }
+
+        let ((c, mut c2), (s, s2)) = make_tcp_pair().await;
+        let uuid = vec![0xABu8; 16];
+        let key = b"united-key".to_vec();
+        let mut server = VisionConn::new_server(
+            BufSim {
+                inner: CommonConn::new(
+                    s,
+                    Aead::new(b"ctx", &key, true),
+                    Aead::new(b"ctx", &key, true),
+                    true,
+                    key.clone(),
+                ),
+                pending: Vec::new(),
+                drip: Box::pin(tokio::time::sleep(std::time::Duration::from_millis(1))),
+            },
+            uuid.clone(),
+            s2,
+        );
+        server.uplink_traffic.enable_xtls = true;
+        server.uplink_traffic.is_tls = true;
+        server.uplink_traffic.is_tls12_or_above = true;
+
+        let mut chunk = rec(&vec![0xA0u8; 8103]);
+        chunk.extend_from_slice(&rec(&vec![0xB7u8; 79]));
+        assert_eq!(chunk.len(), 8192);
+        let pump = tokio::spawn(async move {
+            for _ in 0..6u8 {
+                server.write_all(&chunk).await.expect("pump write");
+                server.flush().await.expect("pump flush");
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let mut client = CommonConn::new(
+            c,
+            Aead::new(b"ctx", &key, true),
+            Aead::new(b"ctx", &key, true),
+            true,
+            key.clone(),
+        );
+        let mut pending: Vec<u8> = Vec::new();
+        let mut phase = 0u8; // 0=uuid,1=hdr,2=content,3=pad
+        let mut hdr_pos = 0u8;
+        let mut cmd = 0i32;
+        let mut content_left = 0i32;
+        let mut pad_left = 0i32;
+        let mut saw_direct = false;
+        let mut frames = 0usize;
+        let mut buf = [0u8; 16384];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "deadline; frames={frames} saw_direct={saw_direct} pending={}",
+                    pending.len()
+                );
+            }
+            if saw_direct {
+                let n = tokio::time::timeout(Duration::from_secs(10), c2.read(&mut buf))
+                    .await
+                    .expect("raw read deadline")
+                    .expect("raw read io")
+                    .max(0);
+                assert!(n > 0, "raw stream must flow after DIRECT");
+                assert_eq!(buf[0], 0x17, "raw stream must start with the next chunk record header");
+                pump.abort();
+                return;
+            }
+            let n = tokio::time::timeout(Duration::from_secs(10), client.read(&mut buf))
+                .await
+                .expect("frame read deadline")
+                .expect("frame read io");
+            if n == 0 {
+                panic!(
+                    "EOF before DIRECT; frames={frames} pending={:?}",
+                    &pending[..pending.len().min(24)]
+                );
+            }
+            pending.extend_from_slice(&buf[..n]);
+            let mut pos = 0usize;
+            loop {
+                if phase == 0 {
+                    if pending.len() - pos < 21 {
+                        break;
+                    }
+                    assert_eq!(&pending[pos..pos + 16], &uuid[..], "UUID mismatch");
+                    pos += 16;
+                    phase = 1;
+                    hdr_pos = 0;
+                }
+                while phase == 1 {
+                    if pos >= pending.len() {
+                        break;
+                    }
+                    let b = pending[pos] as i32;
+                    pos += 1;
+                    match hdr_pos {
+                        0 => cmd = b,
+                        1 => content_left = b << 8,
+                        2 => content_left |= b,
+                        3 => pad_left = b << 8,
+                        _ => pad_left |= b,
+                    }
+                    hdr_pos += 1;
+                    if hdr_pos == 5 {
+                        frames += 1;
+                        if cmd > 2 || content_left > 2047 || pad_left > 1943 {
+                            panic!(
+                                "FRAME ANOMALY at frame #{frames}: cmd={cmd} content={content_left} pad={pad_left}"
+                            );
+                        }
+                        if cmd == 2 {
+                            saw_direct = true;
+                        }
+                        phase = if content_left > 0 {
+                            2
+                        } else if pad_left > 0 {
+                            3
+                        } else {
+                            1
+                        };
+                        hdr_pos = 0;
+                    }
+                }
+                if phase == 2 {
+                    let take = (content_left as usize).min(pending.len() - pos);
+                    pos += take;
+                    content_left -= take as i32;
+                    if content_left == 0 {
+                        phase = if pad_left > 0 { 3 } else { 1 };
+                        hdr_pos = 0;
+                    }
+                }
+                if phase == 3 {
+                    let take = (pad_left as usize).min(pending.len() - pos);
+                    pos += take;
+                    pad_left -= take as i32;
+                    if pad_left == 0 {
+                        phase = 1;
+                        hdr_pos = 0;
+                    }
+                }
+                if pos >= pending.len() && phase != 0 {
+                    break;
+                }
+                if phase == 0 && pending.len() - pos < 21 {
+                    break;
+                }
+            }
+            pending.drain(..pos);
+        }
+    }
+
+    /// [reg End-commit] commit-record 契约（bd VISIONMAC :39057 间歇死亡回归）：
+    /// End 帧判定后、inner flush 确认上线前——① `uplink_padding` 必须保持 true、
+    /// ② 重入 poll_write 不得产生任何未成帧字节（帧只入队一次）、③ flush 解除后
+    /// commit 翻转，后续写入走 inner 直写且严格排在 End 帧之后。
+    #[tokio::test]
+    async fn reg_end_commit_pending_flush_reentry() {
+        use std::task::{Context, Poll, Waker};
+
+        /// 内层模拟：镜像 tokio-rustls 语义——poll_write 消费即封帧入 send
+        /// 缓冲；socket 阻塞期间（blocked）重入 poll_write 一律 Pending 且
+        /// 不重复消费；flush 在 unblock 前 Pending，unblock 后把 send 缓冲
+        /// 全量上线。
+        struct GateMock {
+            sealed: Vec<u8>,
+            wire: Vec<u8>,
+            blocked: bool,
+            unblock: bool,
+        }
+        impl AsyncRead for GateMock {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+        }
+        impl AsyncWrite for GateMock {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                let this = self.get_mut();
+                if this.blocked {
+                    return Poll::Pending;
+                }
+                this.sealed.extend_from_slice(buf);
+                this.blocked = true; // 首推即撞背压（真实栈：write_io WouldBlock）
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                let this = self.get_mut();
+                if this.unblock {
+                    this.wire.extend_from_slice(&this.sealed);
+                    this.sealed.clear();
+                    this.blocked = false;
+                    Poll::Ready(Ok(()))
+                } else {
+                    this.blocked = true;
+                    Poll::Pending
+                }
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                self.poll_flush(cx)
+            }
+        }
+        impl InnerRawClone for GateMock {
+            fn inner_raw_tcp_clone(&self) -> Option<TcpStream> {
+                None
+            }
+        }
+
+        let (_raw_peer, raw_own) = make_std_tcp_pair();
+        let uuid = vec![0xABu8; 16];
+        let mut server = VisionConn::new_server(
+            GateMock { sealed: Vec::new(), wire: Vec::new(), blocked: false, unblock: false },
+            uuid.clone(),
+            raw_own,
+        );
+        // 白盒：非 TLS12+ 流量 + 过滤窗口将尽 → 首写即 is_early_end（Go proxy.go:382-386）
+        server.uplink_traffic.number_of_packet_to_filter = 1;
+        server.uplink_traffic.is_tls12_or_above = false;
+        server.uplink_traffic.is_tls = true;
+
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        let block1 = vec![0x11u8; 1000];
+        let block2 = vec![0x22u8; 700];
+
+        // 写 #1：End 判定 → End 帧入 mock send 缓冲 → flush Pending → 写 Pending
+        //（Pending = 背压窗口开启：commit 闸持有中）
+        match Pin::new(&mut server).poll_write(&mut cx, &block1) {
+            Poll::Pending => {},
+            other => panic!("write#1 unexpected: {other:?}"),
+        }
+        assert!(server.end_commit, "End 帧在途，commit 闸必须持有");
+        assert!(server.uplink_padding, "commit 前 padding 必须未翻转");
+        assert_eq!(server.raw_fallback.is_none(), true);
+        // End 帧已在 send 缓冲（未上线）：cmd=End，content=block1，长 pad ∈ [0,255]
+        let sealed_len = server.inner.sealed.len();
+        // 首帧携带 UUID 前缀（16B）+ 5B 帧头
+        assert_eq!(&server.inner.sealed[..16], &uuid[..], "UUID 前缀");
+        assert_eq!(server.inner.sealed[16], COMMAND_PADDING_END);
+        assert!(
+            (21 + 16 + 1000..=21 + 16 + 1000 + 255).contains(&sealed_len),
+            "sealed={sealed_len}"
+        );
+        assert!(server.inner.wire.is_empty(), "flush 未解除不得上线");
+
+        // 写 #2（重入，同一 flush 窗口）：必须 Pending 且不产生任何新字节
+        match Pin::new(&mut server).poll_write(&mut cx, &block2) {
+            Poll::Pending => {},
+            other => panic!("commit 前重入必须 Pending 且零逃逸: {other:?}"),
+        }
+        assert!(server.uplink_padding, "重入后 padding 仍须未翻转");
+        assert_eq!(server.inner.sealed.len(), sealed_len, "重入不得追加任何字节");
+        assert!(server.inner.wire.is_empty());
+
+        // 解除背压：重入驱动 → flush Ready → commit → 写 #1 完成
+        server.inner.unblock = true;
+        let mut n = 0usize;
+        loop {
+            match Pin::new(&mut server).poll_write(&mut cx, &block1) {
+                Poll::Ready(Ok(done)) => {
+                    n = done;
+                    break;
+                },
+                Poll::Pending => continue,
+                other => panic!("write#1 retry unexpected: {other:?}"),
+            }
+        }
+        assert_eq!(n, block1.len());
+        assert!(!server.end_commit, "commit 后闸必须复位");
+        assert!(!server.uplink_padding, "commit 后 padding 必须关闭");
+        // End 帧已上线
+        assert_eq!(server.inner.wire[16], COMMAND_PADDING_END);
+        assert_eq!(server.inner.wire.len(), sealed_len); // End 帧 + pad 全量上线
+
+        // commit 后写入走 inner 直写（无帧），严格排在 End 帧之后
+        server.write_all(&block2).await.unwrap();
+        server.flush().await.unwrap();
+        assert_eq!(
+            &server.inner.wire[sealed_len..],
+            &block2[..],
+            "unframed bytes must follow End frame"
+        );
+
+        // 线上帧链可被 Go 语义解帧验证：End 帧 content == block1
+        let mut st = crate::encryption::vision::DirectionState::default();
+        let content = crate::encryption::vision::xtls_unpadding(
+            &server.inner.wire[..sealed_len],
+            &mut st,
+            &uuid,
+        );
+        assert_eq!(content, block1);
+        assert_eq!(st.current_command, COMMAND_PADDING_END as i32);
+    }
+
+    /// [reg L3/L4] 全栈实验室（bd VISIONMAC 回归）：真 rustls 双端 + RecordFramer +
+    /// 双向并发 8KB record 形态泵 + 双向 DIRECT（对齐生产 :39057 拓扑）+ 读侧背压。
+    /// 下行输出流做字节级连续性验证。
+    #[tokio::test]
+    async fn reg_fullstack_direct_backpressure() {
+        use std::sync::Arc;
+
+        use rustls::{
+            DigitallySignedStruct, SignatureScheme,
+            client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+            pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
+        };
+        use tokio_rustls::TlsConnector;
+        use xray_transport::TlsAcceptor;
+        use xray_transport::connection::dup_tcp_stream;
+        use xray_transport::rustls::{ClientConfig, ServerConfig};
+
+        fn rec(payload: &[u8]) -> Vec<u8> {
+            let mut v = vec![0x17, 0x03, 0x03, (payload.len() >> 8) as u8, payload.len() as u8];
+            v.extend_from_slice(payload);
+            v
+        }
+
+        fn make_chunk(tag: u8) -> Vec<u8> {
+            let mut p1 = vec![0xA0u8; 8103];
+            p1[0] = tag;
+            let mut chunk = rec(&p1);
+            let mut p2 = vec![0xB7u8; 79];
+            p2[0] = tag.wrapping_add(1);
+            chunk.extend_from_slice(&rec(&p2));
+            assert_eq!(chunk.len(), 8192);
+            chunk
+        }
+
+        #[derive(Debug)]
+        struct NoVerify;
+        impl ServerCertVerifier for NoVerify {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &CertificateDer<'_>,
+                _intermediates: &[CertificateDer<'_>],
+                _server_name: &ServerName<'_>,
+                _ocsp: &[u8],
+                _now: UnixTime,
+            ) -> Result<ServerCertVerified, rustls::Error> {
+                Ok(ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn verify_tls13_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                vec![SignatureScheme::RSA_PKCS1_SHA256, SignatureScheme::ECDSA_NISTP256_SHA256]
+            }
+        }
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = cert_params.self_signed(&key_pair).unwrap();
+        let cert_der = cert.der().to_vec();
+        let key_der = key_pair.serialize_der();
+        let key = PrivateKeyDer::try_from(key_der).unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![CertificateDer::from(cert_der.clone())], key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let mut client_cfg = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth();
+        client_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let connector = TlsConnector::from(Arc::new(client_cfg));
+
+        let uuid = vec![0xABu8; 16];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let uuid_srv = uuid.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let raw = dup_tcp_stream(&stream).unwrap();
+            let framer = crate::inbound::record_framer::RecordFramer::new(stream);
+            let tls = acceptor.accept_with(framer, |_| ()).await.expect("server tls accept");
+            let (r, w) = tokio::io::split(tls);
+            let mut vision = VisionConn::new_server(tokio::io::join(r, w), uuid_srv, raw);
+            vision.uplink_traffic.enable_xtls = true;
+            vision.uplink_traffic.is_tls = true;
+            vision.uplink_traffic.is_tls12_or_above = true;
+            for i in 0..40u8 {
+                let chunk = make_chunk(i);
+                vision.write_all(&chunk).await.expect("srv pump write");
+                vision.flush().await.expect("srv pump flush");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        });
+
+        let csock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let craw = dup_tcp_stream(&csock).unwrap();
+        let tls = connector
+            .connect(ServerName::try_from("localhost".to_string()).unwrap(), csock)
+            .await
+            .expect("client tls connect");
+        let (r, w) = tokio::io::split(tls);
+        let mut cvision = VisionConn::new_server(tokio::io::join(r, w), uuid.clone(), craw);
+        cvision.downlink_traffic.enable_xtls = true;
+        cvision.downlink_traffic.is_tls = true;
+        cvision.downlink_traffic.is_tls12_or_above = true;
+
+        let (mut cr, mut cw) = tokio::io::split(cvision);
+        let upump = tokio::spawn(async move {
+            for _ in 0..12u8 {
+                let chunk = make_chunk(0x40);
+                cw.write_all(&chunk).await.expect("cli uplink write");
+                cw.flush().await.expect("cli uplink flush");
+            }
+        });
+
+        let mut got: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 16384];
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        while got.len() < 40 * 8192 {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("deadline: got={}", got.len());
+            }
+            // 读侧 3ms 停顿：逼服务端 rustls write_io 撞 WouldBlock（背压路径）
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+            let n = tokio::time::timeout(std::time::Duration::from_secs(15), cr.read(&mut buf))
+                .await
+                .expect("cli read deadline")
+                .expect("cli read io");
+            if n == 0 {
+                panic!("EOF at {}", got.len());
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        let mut rebuilt: Vec<u8> = Vec::new();
+        for i in 0..40u8 {
+            rebuilt.extend_from_slice(&make_chunk(i));
+        }
+        assert_eq!(got.len(), rebuilt.len(), "downlink content length mismatch");
+        assert_eq!(got, rebuilt, "downlink content stream corrupted");
+        upump.await.ok();
+        server.abort();
+    }
+
     /// 造 std 回环 socket 对并转 tokio（#[test] 无 runtime 场景用）。
     fn make_std_tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1382,8 +1940,7 @@ mod tests {
             server.flush().await.unwrap();
             let (cmd, content) = read_vision_frame(&mut peer, i == 0).await;
             assert_eq!(content, block.as_bytes(), "block {i} content must round-trip");
-            let expect =
-                if i < 6 { COMMAND_PADDING_CONTINUE } else { COMMAND_PADDING_END };
+            let expect = if i < 6 { COMMAND_PADDING_CONTINUE } else { COMMAND_PADDING_END };
             assert_eq!(
                 cmd, expect,
                 "block {i}: non-TLS traffic must end padding at filter-window exhaustion"
