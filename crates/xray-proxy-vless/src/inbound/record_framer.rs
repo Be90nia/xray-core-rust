@@ -37,7 +37,7 @@ const HEADER_LEN: usize = 5;
 /// 记录对齐读状态机：
 /// - `body_remaining == 0 && have < HEADER_LEN`：攒记录头。
 /// - `body_remaining > 0`：按记录体剩余量限长直读。
-pub(crate) struct RecordFramer<S> {
+pub struct RecordFramer<S> {
     sock: S,
     /// 记录头积累缓冲（跨 poll 存活：头可能分多个 TCP 段到达）。
     hdr: [u8; HEADER_LEN],
@@ -48,7 +48,7 @@ pub(crate) struct RecordFramer<S> {
 }
 
 impl<S> RecordFramer<S> {
-    pub(crate) fn new(sock: S) -> Self {
+    pub fn new(sock: S) -> Self {
         Self { sock, hdr: [0u8; HEADER_LEN], have: 0, body_remaining: 0 }
     }
 }
