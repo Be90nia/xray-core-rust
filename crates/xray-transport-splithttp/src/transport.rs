@@ -641,12 +641,36 @@ impl HubConnHandler for ConnHandlerAdapter {
         tokio::spawn(async move {
             let ServerConn { reader: mut up, writer: mut down, .. } = conn;
             let (mut rd, mut wr) = tokio::io::split(server);
-            // 上行（客户端上传 → dispatcher 读）/ 下行（dispatcher 写 → HTTP 响应）
-            let a = tokio::io::copy(&mut up, &mut wr);
-            let b = tokio::io::copy(&mut rd, &mut down);
+            // 上行（客户端上传 → dispatcher 读）/ 下行（dispatcher 写 → HTTP 响应）。
+            // 显式 64KB 缓冲：tokio::io::copy 内部 DEFAULT_BUF_SIZE=8KB 会把 DATA
+            // 帧粒度钉死在 8KB，高 RTT 路径帧数放大 ~8x（对照 Go dispatcher
+            // MultiBuffer 合并写）。
+            let a = copy_large(&mut up, &mut wr);
+            let b = copy_large(&mut rd, &mut down);
             let _ = tokio::join!(a, b);
         });
     }
+}
+
+/// 64KB 缓冲单向拷贝（替代 [`tokio::io::copy`] 的 8KB 内部缓冲）。
+/// 错误传播语义一致：Err 即终止该方向；调用方 `join!` 吞返回值（原语义）。
+async fn copy_large<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>(
+    r: &mut R,
+    w: &mut W,
+) -> std::io::Result<u64> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = vec![0u8; DUPLEX_BUF];
+    let mut total = 0u64;
+    loop {
+        let n = r.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        w.write_all(&buf[..n]).await?;
+        total += n as u64;
+    }
+    w.flush().await?;
+    Ok(total)
 }
 
 /// duplex 半部，满足 `Connection: AsyncRead + AsyncWrite + Send + Sync + Unpin`。
