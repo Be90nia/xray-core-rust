@@ -1822,6 +1822,129 @@ mod tests {
         }
     }
 
+    /// 传输矩阵：SS-2022（2022-blake3-aes-256-gcm）over WebSocket → Freedom → echo
+    ///
+    /// 回归防护：ss2022 入站装配必须按 streamSettings 走 transport listener
+    /// （对齐 Go shadowsocks_2022 inbound 语义），不得降级裸 TCP（裸 TCP 会把
+    /// ws 握手字节喂给 SS2022 salt 解析，连接必死）。
+    #[tokio::test]
+    async fn integration_ss2022_over_websocket_to_echo() {
+        use base64::Engine as _;
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = echo_listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    },
+                }
+            }
+        });
+
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ss_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let psk_b64 = base64::engine::general_purpose::STANDARD
+            .encode(b"ss2022-ws-e2e-psk-32-bytes-ok!!!".as_slice());
+        let ws_settings = r#"{"network":"ws","security":"none","wsSettings":{"path":"/ss2022"}}"#;
+
+        // server: SS2022+WS inbound + Freedom outbound
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry {
+                kind: "shadowsocks".into(),
+                data: format!(r#"{{"method":"2022-blake3-aes-256-gcm","password":"{psk_b64}"}}"#)
+                    .into_bytes(),
+            },
+            tag: "ss2022-ws-in".into(),
+            port: Some(ss_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: Some(ws_settings.into()),
+            sniffing_json: None,
+        });
+        server_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry { kind: "freedom".into(), data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec() },
+            tag: "direct".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
+        });
+        let (_si, _so, sh) = start_full(&server_cfg).await.expect("ss2022-ws server");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // client: SOCKS inbound + SS2022+WS outbound
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "socks".into(), data: vec![] },
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        client_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry {
+                kind: "shadowsocks".into(),
+                data: format!(
+                    r#"{{"servers":[{{"address":"127.0.0.1","port":{ss_port},"method":"2022-blake3-aes-256-gcm","password":"{psk_b64}"}}]}}"#
+                )
+                .into_bytes(),
+            },
+            tag: "proxy".into(),
+            send_through: None,
+            stream_settings_json: Some(ws_settings.into()),
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
+        });
+        let (_ci, _co, ch) = start_full(&client_cfg).await.expect("ss2022-ws client");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // SOCKS5 → SS2022/WS → echo
+        let mut client = TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.unwrap();
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x05, 0x00]);
+        let ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
+        let mut req = vec![0x05, 0x01, 0x00, 0x01];
+        req.extend_from_slice(&ip);
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        client.write_all(&req).await.unwrap();
+        let mut cr = [0u8; 10];
+        client.read_exact(&mut cr).await.unwrap();
+        assert_eq!(cr[1], 0x00, "SS2022/WS CONNECT");
+
+        let payload = b"hello ss2022 over ws!";
+        client.write_all(payload).await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut got))
+            .await
+        {
+            Ok(Ok(_)) => assert_eq!(&got, payload, "echo through SS2022/WS"),
+            Ok(Err(e)) => panic!("SS2022/WS read error: {e}"),
+            Err(_) => panic!("timeout: SS2022/WS inbound may have downgraded to raw TCP"),
+        }
+        for h in sh.iter().chain(ch.iter()) {
+            h.abort();
+        }
+    }
+
     /// 路由分发测试：多 outbound + 域名规则 → 正确 outbound 被选中
     #[tokio::test]
     async fn integration_routing_selects_correct_outbound() {

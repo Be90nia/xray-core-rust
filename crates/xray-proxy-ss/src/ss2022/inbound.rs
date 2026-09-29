@@ -48,13 +48,16 @@ use crate::{
 // ============================================================================
 
 /// SS-2022 入站请求结果：目标地址 + 加密流 + 匹配的用户标识。
-pub struct InboundResult {
+///
+/// `C` 为承载流：裸 TCP 时为 `TcpStream`（缺省），transport inbound（ws/grpc 等
+/// hub 解包）时为 `Box<dyn Connection>`。
+pub struct InboundResult<C = TcpStream> {
     /// 目标地址。
     pub address: Address,
     /// 目标端口。
     pub port: u16,
     /// 加密流（可继续读写 body）。
-    pub stream: SSStream<TcpStream>,
+    pub stream: SSStream<C>,
     /// 匹配的用户标识（email），单用户模式为配置的 email。
     pub user_email: String,
 }
@@ -108,9 +111,14 @@ impl Ss2022Inbound {
 
     /// 处理入站 TCP 连接：读 salt → 派生 subkey → 解密 header → 解析目标。
     ///
+    /// `C` 泛型以支持 transport inbound（ws/grpc hub 解包后的明文流）。
+    ///
     /// # Errors
     /// - 透传 AEAD、IO、协议解析错误。
-    pub async fn handle_conn(&self, conn: TcpStream) -> io::Result<InboundResult> {
+    pub async fn handle_conn<C>(&self, conn: C) -> io::Result<InboundResult<C>>
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    {
         let result =
             read_ss2022_request(conn, &self.psk, self.kind, self.timestamp_tolerance, &self.replay)
                 .await
@@ -191,10 +199,15 @@ impl MultiUserInbound {
 
     /// 处理入站 TCP 连接：逐用户尝试解密，匹配成功返回结果。
     ///
+    /// `C` 泛型以支持 transport inbound（ws/grpc hub 解包后的明文流）。
+    ///
     /// # Errors
     /// - [`SsError::Ss2022NoUserMatched`]：无用户匹配。
     /// - 透传其他错误。
-    pub async fn handle_conn(&self, conn: TcpStream) -> io::Result<InboundResult> {
+    pub async fn handle_conn<C>(&self, conn: C) -> io::Result<InboundResult<C>>
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    {
         let users = self.users.lock().clone();
         read_ss2022_request_multi(
             conn,
@@ -339,10 +352,13 @@ impl RelayInbound {
     /// # Errors
     /// - [`SsError::Ss2022NoUserMatched`]：无 destination 身份匹配。
     /// - 透传 IO 错误。
-    pub async fn handle_conn_relay(
+    pub async fn handle_conn_relay<C>(
         &self,
-        mut conn: TcpStream,
-    ) -> io::Result<(Address, u16, Vec<u8>, TcpStream)> {
+        mut conn: C,
+    ) -> io::Result<(Address, u16, Vec<u8>, C)>
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    {
         let salt_len = self.kind.key_size();
         let mut salt = vec![0u8; salt_len];
         conn.read_exact(&mut salt).await?;
@@ -395,13 +411,16 @@ fn increment_nonce(nonce: &mut [u8]) {
 /// 单用户请求读取：salt -> subkey -> open fixed/variable header -> SSStream。
 ///
 /// 返回 (address, port, SSStream)。
-async fn read_ss2022_request(
-    mut conn: TcpStream,
+async fn read_ss2022_request<C>(
+    mut conn: C,
     server_psk: &[u8],
     kind: CipherKind2022,
     timestamp_tolerance: u64,
     replay: &SaltReplayFilter,
-) -> Result<(Address, u16, SSStream<TcpStream>)> {
+) -> Result<(Address, u16, SSStream<C>)>
+where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     // 1. 读 salt
     let salt_size = kind.salt_size();
     let mut salt = vec![0u8; salt_size];
@@ -495,14 +514,17 @@ async fn read_ss2022_request(
 ///
 /// SS-2022 多用户匹配：identitySubkey = blake3::derive_key(iPSK||salt)，
 /// EIH 解密得 `psk_identity(uPSK)` 查表；session key 用命中用户的 uPSK 派生。
-async fn read_ss2022_request_multi(
-    mut conn: TcpStream,
+async fn read_ss2022_request_multi<C>(
+    mut conn: C,
     server_psk: &[u8],
     kind: CipherKind2022,
     users: &[(Ss2022User, [u8; 16])],
     timestamp_tolerance: u64,
     replay: &SaltReplayFilter,
-) -> Result<InboundResult> {
+) -> Result<InboundResult<C>>
+where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     // 1. 读 salt
     let salt_size = kind.salt_size();
     let mut salt = vec![0u8; salt_size];
