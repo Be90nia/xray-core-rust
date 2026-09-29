@@ -40,3 +40,7 @@ futures-util = "0.3"
 xray-proxy-freedom = { path = "../xray-proxy-freedom" }
 # write_padding_fragments 的 start_paused 虚拟时钟测试
 tokio = { workspace = true, features = ["test-util"] }
+# vision DIRECT/END commit-record 全栈回归实验室（真 rustls + rcgen 自签证书）
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rcgen = "0.13"
