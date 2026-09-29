@@ -1279,74 +1279,90 @@ pub async fn serve_ss(
         let handler = Arc::clone(&handler);
         let mode = inbound.clone();
         tokio::spawn(async move {
-            match mode {
-                SsInboundMode::Legacy(ib) => {
-                    ss_legacy_pipeline(ib, handler, stream, handshake_timeout).await;
-                },
-                SsInboundMode::Ss2022(ib) => {
-                    let handshake =
-                        tokio::time::timeout(handshake_timeout, ib.handle_conn(stream)).await;
-                    let handshake = match handshake {
-                        Ok(r) => r
-                            .map(|resp| (resp.address, resp.port, resp.stream))
-                            .map_err(|e| std::io::Error::other(e.to_string())),
-                        Err(_) => {
-                            tracing::debug!("ss2022 inbound handshake timeout");
-                            return;
-                        },
-                    };
-                    if let Ok((address, port, ss_stream)) = handshake {
-                        let dest = Destination::new(address, Port::new(port), Network::TCP);
-                        spawn_ss_pump(ss_stream, dest, handler).await;
-                    } else if let Err(e) = handshake {
-                        tracing::debug!(error = %e, "ss inbound handshake failed");
-                    }
-                },
-                SsInboundMode::Ss2022Multi(ib) => {
-                    let handshake =
-                        tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, ib.handle_conn(stream))
-                            .await;
-                    let handshake = match handshake {
-                        Ok(r) => r
-                            .map(|resp| (resp.address, resp.port, resp.stream))
-                            .map_err(|e| std::io::Error::other(e.to_string())),
-                        Err(_) => {
-                            tracing::debug!("ss2022 multi inbound handshake timeout");
-                            return;
-                        },
-                    };
-                    if let Ok((address, port, ss_stream)) = handshake {
-                        let dest = Destination::new(address, Port::new(port), Network::TCP);
-                        spawn_ss_pump(ss_stream, dest, handler).await;
-                    } else if let Err(e) = handshake {
-                        tracing::debug!(error = %e, "ss inbound handshake failed");
-                    }
-                },
-                SsInboundMode::Ss2022Relay(ib) => {
-                    // relay：身份匹配 + 剥 identity header，字节原样桥（无 chunk 解密）
-                    let handshake = tokio::time::timeout(
-                        DEFAULT_HANDSHAKE_TIMEOUT,
-                        ib.handle_conn_relay(stream),
-                    )
-                    .await;
-                    let handshake = match handshake {
-                        Ok(v) => v,
-                        Err(_) => {
-                            tracing::debug!("ss2022 relay inbound handshake timeout");
-                            return;
-                        },
-                    };
-                    let Ok((_addr, port, prefix, tcp)) = handshake else {
-                        tracing::debug!("ss2022 relay inbound handshake failed");
-                        return;
-                    };
-                    let dest = Destination::new(_addr, Port::new(port), Network::TCP);
-                    let (r, w) = tokio::io::split(tcp);
-                    let link = Link::new(new_reader(SsRelayReader::new(prefix, r)), new_writer(w));
-                    let _ = handler.dispatch(&dest, link).await;
-                },
-            }
+            ss_mode_conn_pipeline(mode, handler, stream, handshake_timeout).await;
         });
+    }
+}
+
+/// SS inbound 单条连接 pipeline（按 [`SsInboundMode`] 分派）。
+///
+/// raw TCP accept loop（[`serve_ss`]）与 transport inbound（ws/grpc/kcp 等 hub
+/// 解包后的明文流）共用：握手限时 → handle_conn → spawn_ss_pump → dispatch。
+async fn ss_mode_conn_pipeline<C>(
+    mode: SsInboundMode,
+    handler: std::sync::Arc<dyn DispatchHandler>,
+    stream: C,
+    // Legacy / Ss2022 单用户的握手限时；Multi / Relay 保持既有 DEFAULT_HANDSHAKE_TIMEOUT
+    handshake_timeout: std::time::Duration,
+) where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    match mode {
+        SsInboundMode::Legacy(ib) => {
+            ss_legacy_pipeline(ib, handler, stream, handshake_timeout).await;
+        },
+        SsInboundMode::Ss2022(ib) => {
+            let handshake =
+                tokio::time::timeout(handshake_timeout, ib.handle_conn(stream)).await;
+            let handshake = match handshake {
+                Ok(r) => r
+                    .map(|resp| (resp.address, resp.port, resp.stream))
+                    .map_err(|e| std::io::Error::other(e.to_string())),
+                Err(_) => {
+                    tracing::debug!("ss2022 inbound handshake timeout");
+                    return;
+                },
+            };
+            if let Ok((address, port, ss_stream)) = handshake {
+                let dest = Destination::new(address, Port::new(port), Network::TCP);
+                spawn_ss_pump(ss_stream, dest, handler).await;
+            } else if let Err(e) = handshake {
+                tracing::debug!(error = %e, "ss inbound handshake failed");
+            }
+        },
+        SsInboundMode::Ss2022Multi(ib) => {
+            let handshake =
+                tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, ib.handle_conn(stream))
+                    .await;
+            let handshake = match handshake {
+                Ok(r) => r
+                    .map(|resp| (resp.address, resp.port, resp.stream))
+                    .map_err(|e| std::io::Error::other(e.to_string())),
+                Err(_) => {
+                    tracing::debug!("ss2022 multi inbound handshake timeout");
+                    return;
+                },
+            };
+            if let Ok((address, port, ss_stream)) = handshake {
+                let dest = Destination::new(address, Port::new(port), Network::TCP);
+                spawn_ss_pump(ss_stream, dest, handler).await;
+            } else if let Err(e) = handshake {
+                tracing::debug!(error = %e, "ss inbound handshake failed");
+            }
+        },
+        SsInboundMode::Ss2022Relay(ib) => {
+            // relay：身份匹配 + 剥 identity header，字节原样桥（无 chunk 解密）
+            let handshake = tokio::time::timeout(
+                DEFAULT_HANDSHAKE_TIMEOUT,
+                ib.handle_conn_relay(stream),
+            )
+            .await;
+            let handshake = match handshake {
+                Ok(v) => v,
+                Err(_) => {
+                    tracing::debug!("ss2022 relay inbound handshake timeout");
+                    return;
+                },
+            };
+            let Ok((_addr, port, prefix, tcp)) = handshake else {
+                tracing::debug!("ss2022 relay inbound handshake failed");
+                return;
+            };
+            let dest = Destination::new(_addr, Port::new(port), Network::TCP);
+            let (r, w) = tokio::io::split(tcp);
+            let link = Link::new(new_reader(SsRelayReader::new(prefix, r)), new_writer(w));
+            let _ = handler.dispatch(&dest, link).await;
+        },
     }
 }
 
@@ -3013,39 +3029,38 @@ async fn spawn_one_inbound(
         "shadowsocks" => {
             let settings =
                 xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref());
-            // transport 分支（grpc/kcp/ws hub 承载）：仅 Legacy 模式接线（2022 模式
-            // 的 handle_conn 尚为 TcpStream 特化，保持裸 TCP 回落不回归）。
+            // transport 分支（grpc/kcp/ws hub 承载）：Legacy 与 SS2022（单用户/
+            // 多用户/中继）统一接线，对齐 Go proxyman 语义（streamSettings 包好
+            // transport 后调用 Process，见 shadowsocks_2022/inbound.go）。
             if is_transport_listener_protocol(&settings.protocol) {
-                if let SsInboundMode::Legacy(ss_ib) = parse_ss_inbound_config(&ib.entry.data)? {
-                    let handler = ohm.get_default_handler().ok_or_else(|| {
-                        std::io::Error::other("no default outbound handler registered")
-                    })?;
-                    let bind_addr: SocketAddr = addr.parse().map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            format!("parse addr: {e}"),
-                        )
-                    })?;
-                    tracing::info!(tag = %ib.tag, addr = %addr, network = %settings.protocol, security = %settings.security, "ss transport inbound listening");
-                    let on_conn: xray_transport::listener_registry::ConnHandler =
-                        Arc::new(move |conn| {
-                            let ib = Arc::clone(&ss_ib);
-                            let handler = Arc::clone(&handler);
-                            let hs_timeout = handshake_timeout_for(&policy, 0);
-                            tokio::spawn(async move {
-                                ss_legacy_pipeline(ib, handler, conn, hs_timeout).await;
-                            });
-                        });
-                    return spawn_transport_listener_inbound(
-                        &ib.tag,
-                        bind_addr,
-                        settings,
-                        shutdown_token,
-                        on_conn,
+                let mode = parse_ss_inbound_config(&ib.entry.data)?;
+                let handler = ohm.get_default_handler().ok_or_else(|| {
+                    std::io::Error::other("no default outbound handler registered")
+                })?;
+                let bind_addr: SocketAddr = addr.parse().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("parse addr: {e}"),
                     )
-                    .await;
-                }
-                tracing::warn!(tag = %ib.tag, network = %settings.protocol, "ss transport inbound only supports legacy AEAD mode; falling back to raw TCP");
+                })?;
+                tracing::info!(tag = %ib.tag, addr = %addr, network = %settings.protocol, security = %settings.security, "ss transport inbound listening");
+                let hs_timeout = handshake_timeout_for(&policy, 0);
+                let on_conn: xray_transport::listener_registry::ConnHandler =
+                    Arc::new(move |conn| {
+                        let mode = mode.clone();
+                        let handler = Arc::clone(&handler);
+                        tokio::spawn(async move {
+                            ss_mode_conn_pipeline(mode, handler, conn, hs_timeout).await;
+                        });
+                    });
+                return spawn_transport_listener_inbound(
+                    &ib.tag,
+                    bind_addr,
+                    settings,
+                    shutdown_token,
+                    on_conn,
+                )
+                .await;
             }
             let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone()).await?;
             let inbound = parse_ss_inbound_config(&ib.entry.data)?;
