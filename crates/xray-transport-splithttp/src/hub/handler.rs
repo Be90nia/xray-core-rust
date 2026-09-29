@@ -418,7 +418,10 @@ where
         sid: session_id.to_string(),
         close_signal: Some(close_signal),
     });
-    let dl_stream = ReaderStream::new(GuardedReader { inner: dl_rx, _guard: guard });
+    // with_capacity(64KB)：tokio-util 默认容量 4096B 会把 DATA 帧粒度钉死在
+    // 4KB——高 RTT 路径（CF tunnel）帧数/唤醒数放大 ~16x，是 xhttp 吞吐缺陷主因。
+    // 对照 Go：dispatcher MultiBuffer 合并写 + httpServerConn.Write 每写即 Flush。
+    let dl_stream = ReaderStream::with_capacity(GuardedReader { inner: dl_rx, _guard: guard }, DUPLEX_BUF);
     let body = StreamBody::new(dl_stream.map_ok(Frame::data)).boxed();
 
     // 构造 ServerConn 并交给 dispatcher
@@ -449,7 +452,9 @@ async fn forward_queue_to_writer(
     queue: Arc<crate::UploadQueue>,
     mut writer: tokio::io::DuplexStream,
 ) {
-    let mut buf = vec![0u8; 8192];
+    // 64KB：对齐 Go uploadQueue.Read 单 packet 全量读；8KB 会把上行拷贝粒度
+    // 钉死（packet-up POST body 达 maxEachPostBytes 量级）。
+    let mut buf = vec![0u8; DUPLEX_BUF];
     loop {
         match queue.read(&mut buf).await {
             Ok(0) => break,
