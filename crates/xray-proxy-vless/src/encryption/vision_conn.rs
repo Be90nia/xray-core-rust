@@ -429,25 +429,41 @@ where
             if this.uplink_traffic.number_of_packet_to_filter > 0 {
                 xtls_filter_tls(&[&buf[..n]], &mut this.uplink_traffic);
             }
-            // splice trigger（对齐 Go VisionWriter.WriteMultiBuffer L356-393）：
-            // Go 的 TrafficState.EnableXtls 是共享字段——由下行 ServerHello
-            // 检测置位，上行 writer 直接读它（Rust 侧两个实例，等价于读
-            // downlink_traffic）。触发还需 caller 写入是完整的 TLS app-data
-            // record（0x17 0x03 0x03 前缀 = curl 的端到端 TLS records）。
+            // splice trigger（对齐 Go VisionWriter.WriteMultiBuffer L356-393）。
+            // Go 的 TrafficState 是单实例共享：EnableXtls/IsTLS12orAbove 由
+            // ServerHello 检测侧置位、writer 同侧判定。Rust 双实例下
+            // ServerHello 流经的实例按角色不同——服务端在**写方向**（下行
+            // ServerHello 经 poll_write 被 uplink_traffic 的 filter 捕获），
+            // 客户端在**读方向**（读 ServerHello 置位 downlink_traffic，
+            // 写侧读它即模拟 Go 共享语义）。此前服务端写侧恒读
+            // downlink_traffic → 永远发不出 Direct/End（39824 修 C）。
+            // 触发还需 caller 写入是完整的 TLS app-data record（0x17 0x03
+            // 0x03 前缀 = curl 的端到端 TLS records）。
+            let write_side = if this.is_server {
+                &this.uplink_traffic
+            } else {
+                &this.downlink_traffic
+            };
             let is_app_data = buf.len() >= 3 && buf[0] == 0x17 && buf[1] == 0x03 && buf[2] == 0x03;
-            let command = if this.downlink_traffic.enable_xtls
-                && is_app_data
-                && is_complete_record(buf)
-                && n == buf.len()
-            {
+            // Go 分支 1：完整 app-data 记录帧 → padding 到此为止，末帧恒
+            // End；XTLS 命中才升格 Direct 并切裸写。
+            let is_complete_app_data =
+                is_app_data && write_side.is_tls && is_complete_record(buf) && n == buf.len();
+            // Go proxy.go:382-386 分支 2：非 TLS12+ 流量过滤窗口将尽 →
+            // 提前 End（兼容早期 vision 接收端），不再无限 Continue。
+            let is_early_end =
+                !write_side.is_tls12_or_above && write_side.number_of_packet_to_filter <= 1;
+            let command = if is_complete_app_data && write_side.enable_xtls {
                 COMMAND_PADDING_DIRECT
+            } else if is_complete_app_data || is_early_end {
+                COMMAND_PADDING_END
             } else {
                 COMMAND_PADDING_CONTINUE
             };
             // 对齐 Go proxy.go:359/363/391：longPadding := trafficState.IsTLS
-            // （Go 单一共享状态，Rust 双实例取并集）；TLS app-data 帧
-            // （DIRECT 分支）Go 恒传 true。
-            let long_padding = if command == COMMAND_PADDING_DIRECT {
+            // （Go 单一共享状态，Rust 双实例取并集）；app-data 末帧
+            // （End/Direct 分支 1）Go 恒传 true。
+            let long_padding = if is_complete_app_data {
                 true
             } else {
                 this.uplink_traffic.is_tls || this.downlink_traffic.is_tls
@@ -468,6 +484,10 @@ where
                 // 启用，in-flight 写期间 poll_flush/poll_shutdown 会走 raw，
                 // 半关闭/并发写与安全层写竞态同一 TCP fd（issue #4878）。
                 this.splice_armed = true;
+            } else if command == COMMAND_PADDING_END {
+                // Go *isPadding = false：End 帧后 caller 数据不再 padding，
+                // 经 inner 直写（无 raw 通道时不 splice）。
+                this.uplink_padding = false;
             }
             // continue → 步骤 1 写 pending
         }
@@ -836,8 +856,11 @@ mod tests {
             uuid,
             s2,
         );
-        // 白盒置位（生产由读侧 xtls_filter_tls 检测 ClientHello 置位）
-        server.downlink_traffic.enable_xtls = true;
+        // 白盒置位（39824 修 C：服务端写侧判定读写方向实例——生产由
+        // 下行 ServerHello 流经 poll_write 被 uplink_traffic 的 filter 置位）
+        server.uplink_traffic.enable_xtls = true;
+        server.uplink_traffic.is_tls = true;
+        server.uplink_traffic.is_tls12_or_above = true;
         let app = build_tls_app_data(b"GET / HTTP/1.1\r\n\r\n");
         server.write_all(&app).await.unwrap();
         server.flush().await.unwrap();
@@ -950,8 +973,11 @@ mod tests {
             vec![0xABu8; 16],
             raw_own,
         );
-        // 白盒置位（生产由读侧 xtls_filter_tls 检测 ServerHello 置位）
-        server.downlink_traffic.enable_xtls = true;
+        // 白盒置位（39824 修 C：服务端写侧判定读 uplink_traffic——生产由
+        // 下行 ServerHello 流经 poll_write 被 filter 置位）
+        server.uplink_traffic.enable_xtls = true;
+        server.uplink_traffic.is_tls = true;
+        server.uplink_traffic.is_tls12_or_above = true;
         let app = build_tls_app_data(b"GET / HTTP/1.1\r\n\r\n");
 
         let mut cx = Context::from_waker(std::task::Waker::noop());
@@ -992,7 +1018,9 @@ mod tests {
             vec![0xABu8; 16],
             s2,
         );
-        server.downlink_traffic.enable_xtls = true;
+        server.uplink_traffic.enable_xtls = true;
+        server.uplink_traffic.is_tls = true;
+        server.uplink_traffic.is_tls12_or_above = true;
         assert!(server.raw_fallback.is_none(), "pre-judgement must not activate raw");
         let app = build_tls_app_data(b"GET / HTTP/1.1\r\n\r\n");
         server.write_all(&app).await.unwrap();
@@ -1188,8 +1216,11 @@ mod tests {
     async fn splice_raw_activation_waits_for_inner_flush() {
         let mock = DeferredFlushMock { flush_polls: 0 };
         let mut client = VisionConn::new(mock, vec![0xABu8; 16]);
-        // 白盒置位（生产由读侧 xtls_filter_tls 检测 ServerHello 置位）
+        // 白盒置位（生产由读侧 xtls_filter_tls 检测 ServerHello 置位；
+        // 39824 修 C 分支 1 新增 IsTLS 前提，白盒同步补齐）
         client.downlink_traffic.enable_xtls = true;
+        client.downlink_traffic.is_tls = true;
+        client.downlink_traffic.is_tls12_or_above = true;
         let app = build_tls_app_data(b"GET / HTTP/1.1\r\n\r\n");
 
         let mut cx = Context::from_waker(std::task::Waker::noop());
@@ -1215,5 +1246,156 @@ mod tests {
         assert!(!client.splice_armed, "armed flag consumed");
         assert!(client.raw_fallback.is_some(), "raw activates exactly after inner flush completes");
         assert_eq!(client.inner.flush_polls, 2, "gate drove exactly two flush polls");
+    }
+
+    /// 帧感知读取对端 CommonConn 流上的 vision 帧，返回 (command, content)。
+    /// 帧布局 `[uuid?][cmd][content_len 2B][padding_len 2B][content][padding]`；
+    /// `first_frame` = true 时帧带 16B uuid 前缀（writeOnceUserUUID 语义）。
+    /// 定长读「16+5+content」会因随机 padding 与后续帧无 uuid 而错位，必须
+    /// 按 content_len+padding_len 消费整帧。
+    async fn read_vision_frame<R: tokio::io::AsyncRead + Unpin>(
+        peer: &mut R,
+        first_frame: bool,
+    ) -> (u8, Vec<u8>) {
+        let head_len = if first_frame { 21 } else { 5 };
+        let mut head = vec![0u8; head_len];
+        peer.read_exact(&mut head).await.unwrap();
+        let off = usize::from(first_frame) * 16;
+        let cmd = head[off];
+        let clen = u16::from_be_bytes([head[off + 1], head[off + 2]]) as usize;
+        let plen = u16::from_be_bytes([head[off + 3], head[off + 4]]) as usize;
+        let mut rest = vec![0u8; clen + plen];
+        peer.read_exact(&mut rest).await.unwrap();
+        rest.truncate(clen);
+        (cmd, rest)
+    }
+
+    /// 构造最小 TLS 1.3 ServerHello record（85B：触发 filter 的 b.len()>=79
+    /// + session_id 解析 + supported_versions 扫描，cipher = AES_128_GCM）。
+    fn build_server_hello() -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x16, 0x03, 0x03, 0x00, 0x00]); // record header（len 回填）
+        buf.push(0x02); // handshake_type = ServerHello
+        buf.extend_from_slice(&[0x00, 0x00, 0x00]); // handshake length（占位）
+        buf.extend_from_slice(&[0x03, 0x03]); // server_version
+        buf.extend_from_slice(&[0u8; 32]); // random
+        buf.push(0x20); // session_id_len = 32
+        buf.extend_from_slice(&[0u8; 32]); // session_id
+        buf.extend_from_slice(&[0x13, 0x01]); // cipher = TLS_AES_128_GCM_SHA256
+        buf.push(0x00); // compression_method
+        buf.extend_from_slice(&crate::encryption::vision::TLS13_SUPPORTED_VERSIONS);
+        let record_payload_len = buf.len() - 5;
+        buf[3] = (record_payload_len >> 8) as u8;
+        buf[4] = record_payload_len as u8;
+        buf
+    }
+
+    /// 39824 修 C 回归：服务端下行 splice 判定必须读**本写方向**的 filter
+    /// 实例。Go TrafficState 单实例共享（proxy.go WriteMultiBuffer）：下行
+    /// ServerHello 经服务端 poll_write 被 filter 捕获置位 EnableXtls，写侧
+    /// 判定读同一状态。Rust 双实例下服务端写方向 = uplink_traffic；此前判
+    /// 定恒读 downlink_traffic（客户端角色实例）→ 服务端下行永远发不出
+    /// Direct，Go 客户端永不 splice。
+    /// 生产装配形态（非白盒）：ServerHello 字节真实流经 poll_write →
+    /// xtls_filter_tls 置位 → 首个完整 0x17 批次触发 DIRECT。
+    #[tokio::test]
+    async fn server_write_path_direct_on_write_side_server_hello() {
+        let ((c, _c2), (s, s2)) = make_tcp_pair().await;
+        let uuid = vec![0xABu8; 16];
+        let key = b"united-key".to_vec();
+        let mut server = VisionConn::new_server(
+            CommonConn::new(
+                s,
+                Aead::new(b"ctx", &key, true),
+                Aead::new(b"ctx", &key, true),
+                true,
+                key.clone(),
+            ),
+            uuid.clone(),
+            s2,
+        );
+        // ServerHello 流经写路径（生产 = 网站下行 TLS 流），filter 真实置位
+        let server_hello = build_server_hello();
+        server.write_all(&server_hello).await.unwrap();
+        assert!(
+            server.uplink_traffic.enable_xtls,
+            "ServerHello through the write path must arm uplink xtls"
+        );
+
+        // 对端消费 SH 的 Continue 帧（帧感知读取：uuid 头 + 随机 padding）
+        let mut peer = CommonConn::new(
+            c,
+            Aead::new(b"ctx", &key, true),
+            Aead::new(b"ctx", &key, true),
+            true,
+            key.clone(),
+        );
+        let (cmd, sh_content) = read_vision_frame(&mut peer, true).await;
+        assert_eq!(cmd, COMMAND_PADDING_CONTINUE, "ServerHello batch is not an app-data frame");
+        assert_eq!(sh_content, server_hello);
+
+        // 首个完整 0x17 app-data 批次 → 必须 DIRECT（修复前恒 Continue）
+        let app = build_tls_app_data(b"GET / HTTP/1.1\r\n\r\n");
+        server.write_all(&app).await.unwrap();
+        server.flush().await.unwrap();
+        let (cmd, content) = read_vision_frame(&mut peer, false).await;
+        assert_eq!(content, app, "app-data batch content must round-trip");
+        assert_eq!(
+            cmd, COMMAND_PADDING_DIRECT,
+            "server downlink must splice on write-side ServerHello"
+        );
+        assert!(!server.uplink_padding, "padding must end after DIRECT");
+    }
+
+    /// 39824 修 C End 分支（Go proxy.go:382-386）：非 TLS12+ 流量过滤窗口
+    /// 将尽（NumberOfPacketToFilter <= 1）→ 提前发 End 结束 padding，不再
+    /// 无限 Continue（此前写路径无 End 分支）。
+    #[tokio::test]
+    async fn server_write_path_early_end_for_non_tls_traffic() {
+        let ((c, _c2), (s, s2)) = make_tcp_pair().await;
+        let uuid = vec![0xABu8; 16];
+        let key = b"united-key".to_vec();
+        let mut server = VisionConn::new_server(
+            CommonConn::new(
+                s,
+                Aead::new(b"ctx", &key, true),
+                Aead::new(b"ctx", &key, true),
+                true,
+                key.clone(),
+            ),
+            uuid.clone(),
+            s2,
+        );
+        let mut peer = CommonConn::new(
+            c,
+            Aead::new(b"ctx", &key, true),
+            Aead::new(b"ctx", &key, true),
+            true,
+            key.clone(),
+        );
+        // 非 TLS 明文写 7 块：filter 窗口 8 → 逐块递减，块 6 递减后 counter=1
+        // 命中 Go `NumberOfPacketToFilter <= 1`（proxy.go:382-386）→ 该帧 End；
+        // 前 6 帧 Continue。第 8 块在 padding 关闭后走 inner 直写（无帧包装）。
+        for i in 0..7u32 {
+            let block = format!("GET /plain/{i} HTTP/1.1\r\n\r\n");
+            server.write_all(block.as_bytes()).await.unwrap();
+            server.flush().await.unwrap();
+            let (cmd, content) = read_vision_frame(&mut peer, i == 0).await;
+            assert_eq!(content, block.as_bytes(), "block {i} content must round-trip");
+            let expect =
+                if i < 6 { COMMAND_PADDING_CONTINUE } else { COMMAND_PADDING_END };
+            assert_eq!(
+                cmd, expect,
+                "block {i}: non-TLS traffic must end padding at filter-window exhaustion"
+            );
+        }
+        assert!(!server.uplink_padding, "padding must end after the early End frame");
+        // End 后 caller 数据不再 padding：直写明文（无帧头），对端裸收
+        let tail = b"plain after end";
+        server.write_all(tail).await.unwrap();
+        server.flush().await.unwrap();
+        let mut raw = vec![0u8; tail.len()];
+        peer.read_exact(&mut raw).await.unwrap();
+        assert_eq!(&raw, tail, "post-End writes must bypass padding");
     }
 }

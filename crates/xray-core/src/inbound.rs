@@ -2294,11 +2294,20 @@ async fn serve_reality_vless(
         // 模仿消费）；默认 rustls 路径行为不变。
         let use_btls = matches!(cfg.server_acceptor, xray_reality::ServerAcceptorSetting::Btls);
         tokio::spawn(async move {
+            // bd e0ni/39824：vision splice 装配对齐 serve_vless 三件套——①accept
+            // 后 dup 裸 TCP；②握手入口垫 RecordFramer（记录对齐读，「DIRECT 帧 +
+            // 其后裸流」合流入站时裸尾留内核缓冲，不被 rustls deframer 拉走）；
+            // ③raw 克隆传入 handle_vless_connection。缺任意一环：客户端 DIRECT
+            // 帧后切裸 socket 直写（Go proxy.go switchToDirectCopy），服务端无
+            // raw 通道 → 从 rustls 安全层读端到端明文 → AEAD open 失败 → fatal
+            // bad_record_mac，隧道死。
+            let raw_tcp = xray_transport::connection::dup_tcp_stream(&stream);
+            let framer = xray_proxy_vless::inbound::record_framer::RecordFramer::new(stream);
             let outcome = if use_btls {
                 #[cfg(not(target_os = "ios"))]
                 {
                     xray_reality::server::server_tls_btls(
-                        stream,
+                        framer,
                         &key,
                         &ids,
                         max_diff,
@@ -2314,7 +2323,7 @@ async fn serve_reality_vless(
                     // iOS 无注入 FFI（配置解析层已拒 serverAcceptor=btls），
                     // 此处运行时防御性回落 rustls（零功能损失）。
                     server_tls(
-                        stream,
+                        framer,
                         &key,
                         &ids,
                         max_diff,
@@ -2327,7 +2336,7 @@ async fn serve_reality_vless(
                 }
             } else {
                 server_tls(
-                    stream,
+                    framer,
                     &key,
                     &ids,
                     max_diff,
@@ -2355,7 +2364,7 @@ async fn serve_reality_vless(
                         &handler,
                         &validator,
                         options.clone(),
-                        None,
+                        raw_tcp,
                     )
                     .await
                     {
@@ -5981,6 +5990,264 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         conn.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, payload, "vless over reality should echo");
+    }
+
+    /// 39824 修 A 回归共享脚手架：REALITY+vision 入站（serve_reality_vless，
+    /// 修 A 三件套：dup + RecordFramer + raw 通道）+ capture 型 echo + flow=XRV
+    /// validator + 已完成 REALITY 握手的客户端连接 + 客户端侧裸流克隆
+    /// （Go 客户端 UnwrapRawConn 后的 rawConn 形态）。
+    #[allow(clippy::type_complexity)] // 测试脚手架元组
+    async fn spawn_reality_vision_harness() -> (
+        Box<dyn xray_transport::connection::Connection>,
+        tokio::net::TcpStream,
+        u16,
+        std::sync::Arc<parking_lot::Mutex<Vec<u8>>>,
+        UUID,
+    ) {
+        static PROVIDER: std::sync::Once = std::sync::Once::new();
+        PROVIDER.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+        use base64::Engine as _;
+        use xray_transport::dialer::StreamSettings;
+
+        // 1. capture 型 echo（记录收到的全部字节）
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo_listener.local_addr().unwrap().port();
+        let received = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let received_c = Arc::clone(&received);
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = echo_listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => received_c.lock().extend_from_slice(&buf[..n]),
+                }
+            }
+        });
+
+        // 2. freedom outbound → SimpleOhm
+        let ohm = Arc::new(SimpleOhm::new());
+        let bridge = Arc::new(xray_app_dispatcher::default::DialBridge::new(
+            "freedom",
+            make_freedom_dial_fn(),
+        )) as Arc<dyn xray_app_dispatcher::DispatchHandler>;
+        ohm.set_default(bridge);
+
+        // 3. validator（flow=xtls-rprx-vision 账号）
+        let validator = Arc::new(VlessMemoryValidator::new());
+        let test_uuid = UUID::parse("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
+        let proto_account = VlessProtoAccount {
+            id: "b831381d-6324-4d53-ad4f-8cda48b30811".to_string(),
+            flow: xray_proxy_vless::FLOW_XRV.to_string(),
+            ..Default::default()
+        };
+        let account = VlessMemoryAccount::from_proto_account(&proto_account).unwrap();
+        validator.add(VlessMemoryUser::new("vision-user", 0, account)).unwrap();
+
+        // 4. serve_reality_vless（options=Some → Verified 分支置 outer_tls13）
+        let server_secret = x25519_dalek::StaticSecret::from([0x42u8; 32]);
+        let server_public = x25519_dalek::PublicKey::from(&server_secret);
+        let short_id = [4u8, 3, 9, 8, 2, 7, 1, 6];
+        let reality_cfg = RealityInboundConfig {
+            server_private_key: server_secret.to_bytes(),
+            server_names: vec!["reality.local".to_string()],
+            short_ids: vec![short_id],
+            max_diff: 43200,
+            fallback_dest: format!("127.0.0.1:{echo_port}"),
+            xver: 0,
+            min_client_ver: Vec::new(),
+            max_client_ver: Vec::new(),
+            max_useless_records: xray_reality::MaxUselessRecordsSetting::Disabled,
+            server_acceptor: xray_reality::ServerAcceptorSetting::Rustls,
+        };
+        let rl = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        )
+        .await
+        .unwrap();
+        let rl_addr = rl.local_addr().unwrap();
+        let ohm_c = Arc::clone(&ohm);
+        let val_c = Arc::clone(&validator) as Arc<dyn VlessValidator>;
+        tokio::spawn(async move {
+            let _ = serve_reality_vless(
+                rl,
+                ohm_c,
+                val_c,
+                reality_cfg,
+                Some(xray_proxy_vless::VlessInboundOptions::default()),
+            )
+            .await;
+        });
+
+        // 5. 客户端：TCP 连接 → 握手前 dup 裸流克隆（Go 客户端
+        // switchToDirectCopy 的 rawConn 等价物）→ REALITY over u_client 指纹
+        let mut settings = StreamSettings::tcp();
+        settings.security = "reality".to_string();
+        settings.security_json = Some(serde_json::json!({
+            "serverName": "reality.local",
+            "publicKey": base64::engine::general_purpose::STANDARD.encode(server_public.to_bytes()),
+            "shortId": hex::encode(short_id),
+            "fingerprint": "chrome"
+        }));
+        let tcp = tokio::net::TcpStream::connect(rl_addr).await.unwrap();
+        let raw_dup = xray_transport::connection::dup_tcp_stream(&tcp)
+            .expect("dup_tcp_stream must succeed on a fresh loopback socket");
+        let conn = xray_transport::connection::TcpConnection::new(tcp);
+        let reality_conn = xray_reality::register::handshake_over(Box::new(conn), &settings)
+            .await
+            .expect("reality handshake should succeed");
+        (reality_conn, raw_dup, echo_port, received, test_uuid)
+    }
+
+    /// 轮询等待 capture echo 收到目标字节（超时 panic，附已收内容）。
+    async fn wait_for_echo_received(received: &Arc<parking_lot::Mutex<Vec<u8>>>, needle: &[u8]) {
+        for _ in 0..100 {
+            if received.lock().windows(needle.len()).any(|w| w == needle) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!(
+            "echo never received expected bytes; got: {}",
+            String::from_utf8_lossy(&received.lock())
+        );
+    }
+
+    /// 构造完整 TLS app-data record（客户端内层 0x17 批次）。
+    fn build_vision_app_record(payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(payload.len() + 5);
+        buf.extend_from_slice(&[0x17, 0x03, 0x03]);
+        buf.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    /// 39824 修 A 回归（debugger 阶段 tmp_repro_no_raw_channel_dies_on_client_splice
+    /// 的正向化）：REALITY+vision 入站必须提供裸流通道。Go 形态客户端在安全层
+    /// 内发 [UUID Continue 帧][DIRECT 帧] 后切裸 socket 直写（Go proxy.go
+    /// switchToDirectCopy：UnwrapRawConn + rawConn.Write）——服务端必须经 raw
+    /// 通道把裸字节送达目标。修复前装配（无 dup/framer/raw）：裸字节被 rustls
+    /// 当下一条隧道记录 AEAD 解密 → fatal bad_record_mac 断链，目标永远收不到
+    /// （公网 :39824 下载 0.0 的第一现场）。
+    #[tokio::test]
+    async fn reality_vision_inbound_delivers_raw_upstream_after_client_direct() {
+        use xray_proxy_vless::encryption::vision::{xtls_padding, DEFAULT_PADDING_SEED};
+        use rand::SeedableRng;
+
+        let (mut reality_conn, mut raw_dup, echo_port, received, test_uuid) =
+            spawn_reality_vision_harness().await;
+
+        // VLESS 请求头（flow=XRV）走外层 REALITY/TLS conn
+        let addons = xray_proxy_vless::encoding::EncAddons {
+            flow: xray_proxy_vless::FLOW_XRV.to_string(),
+            seed: Vec::new(),
+        };
+        xray_proxy_vless::encoding::client::encode_request_header(
+            &mut reality_conn,
+            0,
+            &test_uuid,
+            xray_proxy_vless::encoding::VlessCommand::Tcp,
+            Some(&Address::IPv4(std::net::Ipv4Addr::LOCALHOST)),
+            Some(echo_port),
+            &addons,
+        )
+        .await
+        .unwrap();
+
+        // Go 客户端上行帧序列：首帧 Continue 带 uuid（内层 TLS 批次），随后
+        // DIRECT 帧（splice 触发，content 空）
+        let first = build_vision_app_record(b"GET / HTTP/1.1\r\n\r\n");
+        let frame_continue = xtls_padding(
+            Some(&first),
+            xray_proxy_vless::encryption::vision::COMMAND_PADDING_CONTINUE,
+            &mut Some(test_uuid.as_bytes().to_vec()),
+            true,
+            &DEFAULT_PADDING_SEED,
+            &mut rand::rngs::StdRng::from_os_rng(),
+        );
+        let frame_direct = xtls_padding(
+            Some(&[]),
+            xray_proxy_vless::encryption::vision::COMMAND_PADDING_DIRECT,
+            &mut None,
+            true,
+            &DEFAULT_PADDING_SEED,
+            &mut rand::rngs::StdRng::from_os_rng(),
+        );
+        reality_conn.write_all(&frame_continue).await.unwrap();
+        reality_conn.write_all(&frame_direct).await.unwrap();
+        reality_conn.flush().await.unwrap();
+
+        // 客户端切裸 socket 直写（同一 TCP 连接的 dup 克隆，字节级等价
+        // Go rawConn.Write）
+        raw_dup.write_all(b"raw-upstream-payload").await.unwrap();
+        raw_dup.flush().await.unwrap();
+
+        // 目标必须收到裸写字节（修复前：服务端 AEAD 解密失败断链，收不到）
+        wait_for_echo_received(&received, b"raw-upstream-payload").await;
+    }
+
+    /// 39824 修 A framer 接线回归：DIRECT 帧 TLS 记录与裸尾背靠背（同/相邻
+    /// TCP 段）入站时，记录对齐读把裸尾留在内核缓冲交 raw 通道完整送达——
+    /// 修复前 rustls deframer 贪婪 recv 把裸尾拉进 TLS 层（完整记录形态 →
+    /// DecryptError 断链；半记录 → 滞留不可达），字节永久丢失（bd jeu9
+    /// Linux CI body=0B 形态）。
+    #[tokio::test]
+    async fn reality_vision_inbound_delivers_coalesced_raw_tail() {
+        use xray_proxy_vless::encryption::vision::{xtls_padding, DEFAULT_PADDING_SEED};
+        use rand::SeedableRng;
+
+        let (mut reality_conn, mut raw_dup, echo_port, received, test_uuid) =
+            spawn_reality_vision_harness().await;
+
+        let addons = xray_proxy_vless::encoding::EncAddons {
+            flow: xray_proxy_vless::FLOW_XRV.to_string(),
+            seed: Vec::new(),
+        };
+        xray_proxy_vless::encoding::client::encode_request_header(
+            &mut reality_conn,
+            0,
+            &test_uuid,
+            xray_proxy_vless::encoding::VlessCommand::Tcp,
+            Some(&Address::IPv4(std::net::Ipv4Addr::LOCALHOST)),
+            Some(echo_port),
+            &addons,
+        )
+        .await
+        .unwrap();
+
+        let first = build_vision_app_record(b"GET / HTTP/1.1\r\n\r\n");
+        let frame_continue = xtls_padding(
+            Some(&first),
+            xray_proxy_vless::encryption::vision::COMMAND_PADDING_CONTINUE,
+            &mut Some(test_uuid.as_bytes().to_vec()),
+            true,
+            &DEFAULT_PADDING_SEED,
+            &mut rand::rngs::StdRng::from_os_rng(),
+        );
+        let frame_direct = xtls_padding(
+            Some(&[]),
+            xray_proxy_vless::encryption::vision::COMMAND_PADDING_DIRECT,
+            &mut None,
+            true,
+            &DEFAULT_PADDING_SEED,
+            &mut rand::rngs::StdRng::from_os_rng(),
+        );
+        // DIRECT 帧上线后立即（零 sleep）背靠背裸写两段：TCP 侧帧记录与裸尾
+        // 大概率合并/相邻段到达，服务端 framer + raw 通道必须完整保序送达。
+        reality_conn.write_all(&frame_continue).await.unwrap();
+        reality_conn.write_all(&frame_direct).await.unwrap();
+        reality_conn.flush().await.unwrap();
+        raw_dup.write_all(b"coalesced-tail-A").await.unwrap();
+        raw_dup.write_all(b"coalesced-tail-B").await.unwrap();
+        raw_dup.flush().await.unwrap();
+
+        wait_for_echo_received(&received, b"coalesced-tail-A").await;
+        wait_for_echo_received(&received, b"coalesced-tail-B").await;
     }
 
     /// 39436 回归锁定：trojan + tcp + reality inbound 必须走 REALITY 验证路径
