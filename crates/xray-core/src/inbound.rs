@@ -1302,8 +1302,7 @@ async fn ss_mode_conn_pipeline<C>(
             ss_legacy_pipeline(ib, handler, stream, handshake_timeout).await;
         },
         SsInboundMode::Ss2022(ib) => {
-            let handshake =
-                tokio::time::timeout(handshake_timeout, ib.handle_conn(stream)).await;
+            let handshake = tokio::time::timeout(handshake_timeout, ib.handle_conn(stream)).await;
             let handshake = match handshake {
                 Ok(r) => r
                     .map(|resp| (resp.address, resp.port, resp.stream))
@@ -1322,8 +1321,7 @@ async fn ss_mode_conn_pipeline<C>(
         },
         SsInboundMode::Ss2022Multi(ib) => {
             let handshake =
-                tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, ib.handle_conn(stream))
-                    .await;
+                tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, ib.handle_conn(stream)).await;
             let handshake = match handshake {
                 Ok(r) => r
                     .map(|resp| (resp.address, resp.port, resp.stream))
@@ -1342,11 +1340,8 @@ async fn ss_mode_conn_pipeline<C>(
         },
         SsInboundMode::Ss2022Relay(ib) => {
             // relay：身份匹配 + 剥 identity header，字节原样桥（无 chunk 解密）
-            let handshake = tokio::time::timeout(
-                DEFAULT_HANDSHAKE_TIMEOUT,
-                ib.handle_conn_relay(stream),
-            )
-            .await;
+            let handshake =
+                tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, ib.handle_conn_relay(stream)).await;
             let handshake = match handshake {
                 Ok(v) => v,
                 Err(_) => {
@@ -3254,16 +3249,10 @@ fn is_unix_listen_path(listen: &str) -> bool {
 fn parse_listen_addr(addr: &str, port: u16) -> std::io::Result<SocketAddr> {
     let addr = addr.trim();
     if addr.is_empty() || addr == "::" {
-        return Ok(SocketAddr::new(
-            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-            port,
-        ));
+        return Ok(SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), port));
     }
     if addr == "0.0.0.0" {
-        return Ok(SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-            port,
-        ));
+        return Ok(SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port));
     }
     if let Ok(sa) = addr.parse::<SocketAddr>() {
         return Ok(sa);
@@ -6136,8 +6125,8 @@ mod tests {
     /// （公网 :39824 下载 0.0 的第一现场）。
     #[tokio::test]
     async fn reality_vision_inbound_delivers_raw_upstream_after_client_direct() {
-        use xray_proxy_vless::encryption::vision::{xtls_padding, DEFAULT_PADDING_SEED};
         use rand::SeedableRng;
+        use xray_proxy_vless::encryption::vision::{DEFAULT_PADDING_SEED, xtls_padding};
 
         let (mut reality_conn, mut raw_dup, echo_port, received, test_uuid) =
             spawn_reality_vision_harness().await;
@@ -6198,8 +6187,8 @@ mod tests {
     /// Linux CI body=0B 形态）。
     #[tokio::test]
     async fn reality_vision_inbound_delivers_coalesced_raw_tail() {
-        use xray_proxy_vless::encryption::vision::{xtls_padding, DEFAULT_PADDING_SEED};
         use rand::SeedableRng;
+        use xray_proxy_vless::encryption::vision::{DEFAULT_PADDING_SEED, xtls_padding};
 
         let (mut reality_conn, mut raw_dup, echo_port, received, test_uuid) =
             spawn_reality_vision_harness().await;
@@ -7226,8 +7215,7 @@ mod tests {
     #[test]
     fn build_vless_validator_null_clients_falls_back_to_users() {
         let uuid = "66ad4540-b58c-4ad2-9926-ea63445a9b57";
-        let settings =
-            serde_json::json!({ "clients": null, "users": [{ "id": uuid }], });
+        let settings = serde_json::json!({ "clients": null, "users": [{ "id": uuid }], });
         let data = serde_json::to_vec(&settings).unwrap();
         let validator = super::build_vless_validator(&data).unwrap();
         use xray_proxy_vless::Validator as VlessValidatorTrait;

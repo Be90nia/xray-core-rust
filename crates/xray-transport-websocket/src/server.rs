@@ -543,10 +543,7 @@ mod tests {
         let key = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap();
         let mut server_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(
-                vec![rustls::pki_types::CertificateDer::from(cert_der.clone())],
-                key,
-            )
+            .with_single_cert(vec![rustls::pki_types::CertificateDer::from(cert_der.clone())], key)
             .unwrap();
         // 生产默认广播（xray-tls server_config.rs:246 对齐 Go GetTLSConfig）。
         server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];

@@ -421,7 +421,8 @@ where
     // with_capacity(64KB)：tokio-util 默认容量 4096B 会把 DATA 帧粒度钉死在
     // 4KB——高 RTT 路径（CF tunnel）帧数/唤醒数放大 ~16x，是 xhttp 吞吐缺陷主因。
     // 对照 Go：dispatcher MultiBuffer 合并写 + httpServerConn.Write 每写即 Flush。
-    let dl_stream = ReaderStream::with_capacity(GuardedReader { inner: dl_rx, _guard: guard }, DUPLEX_BUF);
+    let dl_stream =
+        ReaderStream::with_capacity(GuardedReader { inner: dl_rx, _guard: guard }, DUPLEX_BUF);
     let body = StreamBody::new(dl_stream.map_ok(Frame::data)).boxed();
 
     // 构造 ServerConn 并交给 dispatcher

@@ -352,10 +352,7 @@ impl RelayInbound {
     /// # Errors
     /// - [`SsError::Ss2022NoUserMatched`]：无 destination 身份匹配。
     /// - 透传 IO 错误。
-    pub async fn handle_conn_relay<C>(
-        &self,
-        mut conn: C,
-    ) -> io::Result<(Address, u16, Vec<u8>, C)>
+    pub async fn handle_conn_relay<C>(&self, mut conn: C) -> io::Result<(Address, u16, Vec<u8>, C)>
     where
         C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     {
