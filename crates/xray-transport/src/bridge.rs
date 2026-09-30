@@ -297,6 +297,8 @@ where
     let conn_idle = policy.connection_idle;
     let uplink_only = policy.uplink_only;
     let downlink_only = policy.downlink_only;
+    // bd 7p1m 专项埋点：XRAY_P7LM_TRACE=1 时逐批输出读/写字节数（warn 级穿透 loglevel）。
+    let p7lm_trace = std::env::var("XRAY_P7LM_TRACE").is_ok();
 
     let Link { mut reader, mut writer } = link;
     // tokio::io::split（out_f1 33Mbps 实证拓扑，无锁）。自研 BiLock 轮转锁在
@@ -350,6 +352,9 @@ where
             };
             match mb {
                 Ok(mb) if !mb.is_empty() => {
+                    if p7lm_trace {
+                        tracing::warn!(target: "p7lm", bytes = mb.len(), phase = "up_read", "");
+                    }
                     // channel 满阻塞在此（不抢对向时间片）；writer task 已死时
                     // send 立即 Err → 本向级联退出，绝不静默吞数据。
                     if up_tx.send(mb).await.is_err() {
@@ -365,6 +370,9 @@ where
     // 上行 writer：up_rx → stream 写半部聚合写（vectored 批写，y1yx）。只写不读。
     let up_writer = async move {
         while let Some(mb) = up_rx.recv().await {
+            if p7lm_trace {
+                tracing::warn!(target: "p7lm", bytes = mb.len(), phase = "up_write", "");
+            }
             if write_all_mb(&mut s_write, &mb).await.is_err() {
                 break;
             }
@@ -400,6 +408,9 @@ where
             };
             match mb {
                 Ok(mb) if !mb.is_empty() => {
+                    if p7lm_trace {
+                        tracing::warn!(target: "p7lm", bytes = mb.len(), phase = "down_read", "");
+                    }
                     if down_tx.send(mb).await.is_err() {
                         break;
                     }
@@ -414,6 +425,9 @@ where
     // 下行 writer：down_rx → link.writer（xray_buf Writer 管线，自带池化）。
     let down_writer = async move {
         while let Some(mb) = down_rx.recv().await {
+            if p7lm_trace {
+                tracing::warn!(target: "p7lm", bytes = mb.len(), phase = "down_write", "");
+            }
             if writer.write_multi_buffer(mb).await.is_err() {
                 break;
             }
