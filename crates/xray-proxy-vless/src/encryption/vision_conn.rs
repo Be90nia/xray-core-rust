@@ -118,6 +118,15 @@ pub struct VisionConn<C> {
     /// 记录解密 → BadRecordMac fatal alert → 双端皆死，macOS #08 实测）。
     /// 定时器到期后清 None，后续 raw 写零开销。
     raw_write_gate: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// [VISIONMAC 诊断] XRAY_FRDBG 读路径轮询计数（临时埋点）。
+    frdbg_polls: u64,
+}
+
+fn frdbg_micros() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() % 1_000_000_000)
+        .unwrap_or(0)
 }
 
 /// 上行待写帧：padded 帧字节 + 已写偏移 + 该帧对应的 caller 消费量 + 提交闸类别。
@@ -180,6 +189,7 @@ where
             end_commit: false,
             is_server: false,
             raw_write_gate: None,
+        frdbg_polls: 0,
         }
     }
 
@@ -221,6 +231,7 @@ where
             end_commit: false,
             is_server: true,
             raw_write_gate: None,
+        frdbg_polls: 0,
         }
     }
 
@@ -274,7 +285,35 @@ where
                 if let Some(raw) = this.raw_fallback.as_mut() {
                     return Pin::new(raw).poll_read(cx, buf);
                 }
-                return Pin::new(&mut this.inner).poll_read(cx, buf);
+                let res = Pin::new(&mut this.inner).poll_read(cx, buf);
+                if std::env::var("XRAY_FRDBG").is_ok() {
+                    this.frdbg_polls += 1;
+                    match &res {
+                        Poll::Pending => {
+                            if this.frdbg_polls % 4096 == 0 {
+                                eprintln!(
+                                    "[VCDBG:{}MS] raw-inner Pending polls={}",
+                                    frdbg_micros(),
+                                    this.frdbg_polls
+                                );
+                            }
+                        },
+                        Poll::Ready(Ok(())) => {
+                            let n = buf.filled().len();
+                            if n == 0 {
+                                eprintln!(
+                                    "[VCDBG:{}MS] raw-inner EOF polls={}",
+                                    frdbg_micros(),
+                                    this.frdbg_polls
+                                );
+                            }
+                        },
+                        Poll::Ready(Err(e)) => {
+                            eprintln!("[VCDBG:{}MS] raw-inner ERR {e}", frdbg_micros());
+                        },
+                    }
+                }
+                return res;
             }
             // 3. padding 模式 → CommonConn read + unpadding。临时缓冲提升为 struct
             //    字段（read_tmp）避免每 poll_read 16KB 栈帧；栈帧不被 编译器复用 →
@@ -311,6 +350,13 @@ where
                         && this.downlink_state.remaining_padding <= 0
                         && cmd != 0;
                     if frames_done {
+                        if std::env::var("XRAY_FRDBG").is_ok() {
+                            eprintln!(
+                                "[VCDBG:{}MS] frame done cmd={}",
+                                frdbg_micros(),
+                                cmd
+                            );
+                        }
                         if cmd == COMMAND_PADDING_END as i32 {
                             this.downlink_padding = false;
                         } else if cmd == COMMAND_PADDING_DIRECT as i32 {
@@ -1774,6 +1820,211 @@ mod tests {
         assert_eq!(got.len(), rebuilt.len(), "downlink content length mismatch");
         assert_eq!(got, rebuilt, "downlink content stream corrupted");
         upump.await.ok();
+        server.abort();
+    }
+
+    /// [VISIONMAC 截断] End 模式（内层明文，无 DIRECT）+ 客户端线缆切碎器：
+    /// 服务端早发 End 后整流为裸 payload TLS records；切碎器把服务端→客户端
+    /// 密文按随机小片（200-3000B）+ 微停顿重发，强制「单条 TLS 记录跨多个
+    /// TCP 段」。镜像 VPS :39058 netem 截断签名：服务端全量写出、内核全量
+    /// 送达、客户端 userspace 读路径停止消费。字节级连续性验证。
+    #[tokio::test]
+    async fn tmp_end_mode_segmented_stall_repro() {
+        use std::sync::Arc;
+
+        use rand::{Rng, SeedableRng};
+
+        use rustls::{
+            DigitallySignedStruct, SignatureScheme,
+            client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+            pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
+        };
+        use tokio_rustls::TlsConnector;
+        use xray_transport::TlsAcceptor;
+        use xray_transport::connection::dup_tcp_stream;
+        use xray_transport::rustls::{ClientConfig, ServerConfig};
+
+        const CHUNKS: usize = 640;
+        const CHUNK: usize = 8192;
+        const TOTAL: usize = CHUNKS * CHUNK;
+
+        #[derive(Debug)]
+        struct NoVerify;
+        impl ServerCertVerifier for NoVerify {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &CertificateDer<'_>,
+                _intermediates: &[CertificateDer<'_>],
+                _server_name: &ServerName<'_>,
+                _ocsp: &[u8],
+                _now: UnixTime,
+            ) -> Result<ServerCertVerified, rustls::Error> {
+                Ok(ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn verify_tls13_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                vec![SignatureScheme::RSA_PKCS1_SHA256, SignatureScheme::ECDSA_NISTP256_SHA256]
+            }
+        }
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = cert_params.self_signed(&key_pair).unwrap();
+        let cert_der = cert.der().to_vec();
+        let key = PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![CertificateDer::from(cert_der.clone())], key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let mut client_cfg = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth();
+        client_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let connector = TlsConnector::from(Arc::new(client_cfg));
+
+        let uuid = vec![0xABu8; 16];
+        let front = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front_addr = front.local_addr().unwrap();
+        let back = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let back_addr = back.local_addr().unwrap();
+
+        // 真 TLS 服务端：End 模式（plain content，写侧早 End 后裸 payload 直出）。
+        let uuid_srv = uuid.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = back.accept().await.unwrap();
+            let raw = dup_tcp_stream(&stream).unwrap();
+            let framer = xray_transport::record_framer::RecordFramer::new(stream);
+            let tls = acceptor.accept_with(framer, |_| ()).await.expect("server tls accept");
+            let (r, w) = tokio::io::split(tls);
+            let mut vision = VisionConn::new_server(tokio::io::join(r, w), uuid_srv, raw);
+            // 白盒：plain content（非 TLS12+）+ 过滤窗将尽 → 首批即 End（Go proxy.go:382-386）。
+            vision.uplink_traffic.is_tls = false;
+            vision.uplink_traffic.is_tls12_or_above = false;
+            vision.uplink_traffic.number_of_packet_to_filter = 1;
+            let (_sr, mut sw) = tokio::io::split(vision);
+            for i in 0..CHUNKS {
+                let mut chunk = vec![0u8; CHUNK];
+                chunk[0] = (i & 0xff) as u8;
+                chunk[1..9].copy_from_slice(&(i as u64).to_be_bytes());
+                sw.write_all(&chunk).await.expect("srv pump write");
+                sw.flush().await.expect("srv pump flush");
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            eprintln!("[chop][srv] pump done ({TOTAL}B), parking 30s");
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+
+        // 切碎器：front←accept / back←connect 裸字节搬运。上行直通；下行随机小片 + 微停顿。
+        let front_conn = tokio::spawn(async move {
+            let (sock_front, _) = front.accept().await.unwrap();
+            let sock_back = tokio::net::TcpStream::connect(back_addr).await.unwrap();
+            let (mut fr, mut fw) = tokio::io::split(sock_front);
+            let (mut br, mut bw) = tokio::io::split(sock_back);
+            // 上行直通
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut fr, &mut bw).await;
+            });
+            // 下行切碎
+            let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let n = match br.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                let mut off = 0;
+                while off < n {
+                    let piece = rng.gen_range(200..=3000).min(n - off);
+                    if fw.write_all(&buf[off..off + piece]).await.is_err() {
+                        return;
+                    }
+                    let _ = fw.flush().await;
+                    tokio::time::sleep(std::time::Duration::from_micros(
+                        rng.gen_range(80..=400),
+                    ))
+                    .await;
+                    off += piece;
+                }
+            }
+        });
+
+        let csock = tokio::net::TcpStream::connect(front_addr).await.unwrap();
+        // 等 TLS 服务端就绪：chopper 已把 front↔back 桥好，直连 back_addr 的
+        // 握手会绕过切碎器——此处必须连 front，让握手字节也走切碎器。
+        let _ = back_addr;
+        let craw = dup_tcp_stream(&csock).unwrap();
+        let framer = xray_transport::record_framer::RecordFramer::new(csock);
+        let tls = connector
+            .connect(ServerName::try_from("localhost".to_string()).unwrap(), framer)
+            .await
+            .expect("client tls connect");
+        let (r, w) = tokio::io::split(tls);
+        let mut cvision = VisionConn::new_server(tokio::io::join(r, w), uuid.clone(), craw);
+        cvision.downlink_traffic.is_tls = false;
+        cvision.downlink_traffic.is_tls12_or_above = false;
+
+        let (mut cr, _cw) = tokio::io::split(cvision);
+        let mut got: Vec<u8> = Vec::with_capacity(TOTAL);
+        let mut buf = [0u8; 16384];
+        let mut reads = 0usize;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
+        while got.len() < TOTAL {
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "[chop][cli] STALL: got={}/{} (missing {}), eof_signature=none",
+                    got.len(),
+                    TOTAL,
+                    TOTAL - got.len()
+                );
+            }
+            reads += 1;
+            // 宏背压：周期性 150ms 停读——对齐 VPS netem RTT 窗口效应
+            //（接收窗关闭 → 服务端 write_io 撞 WouldBlock → 单条记录被
+            // 分段写出 → 客户端线缆出现跨段半记录）。
+            if reads % 40 == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            }
+            let read =
+                tokio::time::timeout(std::time::Duration::from_secs(15), cr.read(&mut buf)).await;
+            let n = match read {
+                Ok(Ok(n)) if n > 0 => n,
+                Ok(Ok(_)) => panic!("[chop][cli] premature EOF at {}/{}", got.len(), TOTAL),
+                Ok(Err(e)) => panic!("[chop][cli] io error at {}: {e}", got.len()),
+                Err(_) => panic!(
+                    "[chop][cli] single-read 15s deadline at {}/{}",
+                    got.len(),
+                    TOTAL
+                ),
+            };
+            got.extend_from_slice(&buf[..n]);
+        }
+        eprintln!("[chop][cli] full {TOTAL}B received");
+        // 字节级连续性
+        for i in 0..CHUNKS {
+            let off = i * CHUNK;
+            assert_eq!(got[off], (i & 0xff) as u8, "chunk {i} tag mismatch");
+            assert_eq!(&got[off + 1..off + 9], &(i as u64).to_be_bytes(), "chunk {i} seq");
+        }
+        front_conn.abort();
         server.abort();
     }
 
