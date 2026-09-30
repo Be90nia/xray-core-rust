@@ -43,6 +43,17 @@ async fn dial_tcp(
     settings: &StreamSettings,
 ) -> io::Result<Box<dyn Connection>> {
     let conn = xray_transport::system_dialer::dial_system(dest, sockopt).await?;
+    // 记录对齐读钳制（bd VISIONMAC）：TLS/REALITY 层 deframer 贪婪 recv 会在
+    // vision DIRECT 切换窗口把「DIRECT 帧 + 对端 raw 字节」一并拉进 TLS 层
+    // （半条记录滞留 opaque 缓冲 → 切 raw 后字节永久不可达 → 下游停滞）。
+    // framer 让安全层每次 recv 恰好消费一条完整记录，DIRECT 帧后的 socket
+    // 游标精确停在记录边界，raw 克隆天然续读完整裸流（等价 Go readFromUntil
+    // + UnwrapRawConn 反射回收组合，无需 unsafe）。
+    let conn: Box<dyn Connection> = if settings.is_tls() {
+        Box::new(xray_transport::record_framer::RecordFramer::new(conn))
+    } else {
+        conn
+    };
     let conn = wrap_security(conn, settings, dest).await?;
     // Tcpmask 装配（Go tcp/dialer.go:28 WrapConnClient）：finalmask_json.tcp[] 每条 mask
     // 链式 WrapConnClient；无 mask / 空数组 → 跳过（向后兼容）。
