@@ -17,6 +17,9 @@ use xray_transport::{connection::Connection, sockopt::SocketOptions, system_dial
 
 use crate::config::Config;
 
+/// bd 7p1m：TCP 出站默认接收缓冲（字节）。见 make_dial_fn_with_sockopt 内注释。
+const OUTBOUND_TCP_RCVBUF: i32 = 4 * 1024 * 1024;
+
 /// 构造 Freedom 的 DialFn 闭包（默认配置）。
 ///
 /// 等价 [`make_dial_fn_with_config`] 传入 `Config::default()`。保留无参签名以兼容既有调用方。
@@ -60,8 +63,25 @@ pub fn make_dial_fn_with_sockopt(config: Config, dialer_proxy: String) -> DialFn
             // destinationOverride 改写（Go :269-279；isValidAddress 排除 AnyIP）
             let dial_dest =
                 crate::config::apply_destination_override(&dest, destination_override.as_ref());
-            let sockopt =
-                SocketOptions { domain_strategy, dialer_proxy, ..SocketOptions::default() };
+            // bd 7p1m：TCP 出站默认 SO_RCVBUF 4MB。内核 DRS（tcp_moderate_rcvbuf）
+            // 对「快排空 relay」结构性自稳定：收端即时排空 → 接收队列恒空 →
+            // rcv_rtt=真实 RTT、space=窗字节数 → rcvbuf 目标恒等于当前值，
+            // autotune 永不逃逸 → 接收窗钉死 64KB、高 RTT 吞吐=窗/RTT
+            // （netem 150ms 实测 0.31MB/s，Go 对照 11.6MB/s；Go 靠运行时调度
+            // 偶然逃逸，tokio 朴素泵不可复制，socat 同病 54KB/s）。显式缓冲
+            // 解锁接收窗（内核翻倍记账→窗约 4MB→150ms 约 26MB/s 上限）；
+            // rcvbuf 是记账上限非预分配，空闲连接零内存代价。显式设置会锁定
+            // DRS，更高 BDP 场景需抬此常量。
+            let sockopt = SocketOptions {
+                domain_strategy,
+                dialer_proxy,
+                receive_buffer_size: if dial_dest.network() == Network::TCP {
+                    OUTBOUND_TCP_RCVBUF
+                } else {
+                    0
+                },
+                ..SocketOptions::default()
+            };
             // Go :281 retry.ExponentialBackoff(5, 100)：dial 瞬时失败指数退避重试
             let conn: Box<dyn Connection> =
                 xray_transport::retry::exponential_backoff(5, 100, || {
