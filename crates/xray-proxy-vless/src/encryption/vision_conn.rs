@@ -8,6 +8,7 @@
 //! 切片 2b：splice（command=Direct 触发，绕过 Vision padding，仍走底层 conn）。
 
 use std::{
+    collections::VecDeque,
     io,
     pin::Pin,
     task::{Context, Poll},
@@ -80,7 +81,7 @@ pub struct VisionConn<C> {
     downlink_pending: Vec<u8>,
     downlink_pending_pos: usize,
     /// padding 块待写入底层（padded, sent_in_padded, original_buf_len）。
-    uplink_write_pending: Option<(Vec<u8>, usize, usize)>,
+    uplink_pending: VecDeque<UpFrame>,
     /// padding 模式标志（command=End 后关闭）。
     uplink_padding: bool,
     downlink_padding: bool,
@@ -119,6 +120,26 @@ pub struct VisionConn<C> {
     raw_write_gate: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
+/// 上行待写帧：padded 帧字节 + 已写偏移 + 该帧对应的 caller 消费量 + 提交闸类别。
+/// 多帧队列 = GO MultiBuffer 批语义（批内 Continue，末帧 End/Direct）。
+#[derive(Default)]
+struct UpFrame {
+    padded: Vec<u8>,
+    sent: usize,
+    orig_len: usize,
+    gate: UpGate,
+}
+
+/// 尾帧提交闸类别。
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum UpGate {
+    #[default]
+    None,
+    /// Direct 帧写完 → poll_arm_gate（arm raw + commit 翻转）。
+    DirectArm,
+    /// End 帧写完 → inner flush Ready（commit 翻转）。
+    EndCommit,
+}
 /// raw 起步闸延迟：覆盖对端「收 DIRECT 帧 → 处理 → 切 raw 读」的调度
 /// 延迟。实测恶性窗口 ~1.5ms（loopback 合流），50ms=30x 余量；每次
 /// splice 切换仅首个上游写承担一次，对吞吐无影响。
@@ -145,7 +166,7 @@ where
             downlink_state: DirectionState::default(),
             downlink_pending: Vec::new(),
             downlink_pending_pos: 0,
-            uplink_write_pending: None,
+            uplink_pending: VecDeque::new(),
             uplink_padding: true,
             downlink_padding: true,
             rng: StdRng::from_os_rng(),
@@ -186,7 +207,7 @@ where
             downlink_state: DirectionState::default(),
             downlink_pending: Vec::new(),
             downlink_pending_pos: 0,
-            uplink_write_pending: None,
+            uplink_pending: VecDeque::new(),
             uplink_padding: true,
             downlink_padding: true,
             rng: StdRng::from_os_rng(),
@@ -360,58 +381,57 @@ where
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         loop {
-            // 1. 先写完 pending padded
-            if let Some((padded, sent, orig_len)) = this.uplink_write_pending.take() {
-                if sent >= padded.len() {
-                    // 帧已写完：过激活闸门（inner flush 确认）再 arm raw
-                    match this.poll_arm_gate(cx) {
-                        Poll::Ready(Ok(())) => return Poll::Ready(Ok(orig_len)),
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                        Poll::Pending => {
-                            this.uplink_write_pending = Some((padded, sent, orig_len));
-                            return Poll::Pending;
+            // 1. 先写完 pending 队首（switch 帧在途时，caller 后续写入在此串行化）
+            if let Some(frame) = this.uplink_pending.front_mut() {
+                if frame.sent < frame.padded.len() {
+                    match Pin::new(&mut this.inner).poll_write(cx, &frame.padded[frame.sent..]) {
+                        Poll::Ready(Ok(0)) => {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "inner conn accepted 0 bytes",
+                            )));
                         },
+                        Poll::Ready(Ok(n)) => {
+                            frame.sent += n;
+                            if frame.sent < frame.padded.len() {
+                                // 底层 Ready，continue 继续写剩余
+                                continue;
+                            }
+                        },
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
                     }
                 }
-                match Pin::new(&mut this.inner).poll_write(cx, &padded[sent..]) {
-                    // Ok(0)（非空 buf）= 底层无法再接受数据；裸 Pending 无 waker
-                    // 注册（底层刚返回 Ready），跨窗口背压下会死锁。
-                    Poll::Ready(Ok(0)) => {
-                        this.uplink_write_pending = Some((padded, sent, orig_len));
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "inner conn accepted 0 bytes",
-                        )));
+                // 帧已全量写入：过提交闸（尾帧 gate）或直接完成
+                let (orig_len, gate) = (frame.orig_len, frame.gate);
+                match gate {
+                    UpGate::None => {
+                        this.uplink_pending.pop_front();
+                        return Poll::Ready(Ok(orig_len));
                     },
-                    Poll::Ready(Ok(n)) => {
-                        let new_sent = sent + n;
-                        if new_sent >= padded.len() {
-                            // 帧写完：过激活闸门（inner flush 确认）再 arm raw。
-                            // inner 可能刚以 BufWriter 语义返回 Ok（密文尾巴滞
-                            // 留 sendable_tls），flush Pending 则挂回 pending 帧
-                            // 等下一轮（waker 已由 inner poll_flush 注册）。
-                            match this.poll_arm_gate(cx) {
-                                Poll::Ready(Ok(())) => return Poll::Ready(Ok(orig_len)),
-                                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                                Poll::Pending => {
-                                    this.uplink_write_pending = Some((padded, new_sent, orig_len));
-                                    return Poll::Pending;
-                                },
-                            }
-                        }
-                        this.uplink_write_pending = Some((padded, new_sent, orig_len));
-                        // 底层 Ready，continue 循环继续写剩余 padded（避免无 wakeup 的 Pending）
+                    UpGate::DirectArm => match this.poll_arm_gate(cx) {
+                        Poll::Ready(Ok(())) => {
+                            this.uplink_pending.pop_front();
+                            return Poll::Ready(Ok(orig_len));
+                        },
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
                     },
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => {
-                        this.uplink_write_pending = Some((padded, sent, orig_len));
-                        return Poll::Pending;
+                    UpGate::EndCommit => match Pin::new(&mut this.inner).poll_flush(cx) {
+                        Poll::Ready(Ok(())) => {
+                            this.uplink_padding = false;
+                            this.end_commit = false;
+                            this.uplink_pending.pop_front();
+                            return Poll::Ready(Ok(orig_len));
+                        },
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
                     },
                 }
             }
 
-            // 2. padding 关闭 → 优先裸 TCP 直写（splice 后对端已拆外层 TLS， 写 inner 会把 caller
-            //    的 TLS records 当明文再加密一层）。
+            // 2. padding 关闭 → 裸 TCP 直写（Direct commit 后）或 inner 直写
+            //    （End commit 后，无 raw 通道不 splice）
             if !this.uplink_padding {
                 if let Some(raw) = this.raw_fallback.as_mut() {
                     // raw 起步闸：等对端消费 DIRECT 帧（见 raw_write_gate 注释）。
@@ -426,76 +446,76 @@ where
                 return Pin::new(&mut this.inner).poll_write(cx, buf);
             }
 
-            // 3. padding 模式 → TLS 检测 + 分段 padding
+            // 3. padding 模式 → 批级 TLS 检测 + 整写分帧入队（GO MultiBuffer
+            //    批语义：整批 = 完整 0x17 record 组才升格；末帧携 End/Direct，
+            //    其余帧 Continue）
             if buf.is_empty() {
                 return Poll::Ready(Ok(0));
             }
-            let n = buf.len().min(MAX_PADDING_CONTENT);
-            // TLS filter：检测 TLS 1.3 ServerHello → enable_xtls（仅过滤窗口内）
+            let n = buf.len();
+            // TLS filter（过滤窗口内；探针取首 2KB，对齐 GO 按缓冲计数）
             if this.uplink_traffic.number_of_packet_to_filter > 0 {
-                xtls_filter_tls(&[&buf[..n]], &mut this.uplink_traffic);
+                let probe_end = n.min(MAX_PADDING_CONTENT);
+                xtls_filter_tls(&[&buf[..probe_end]], &mut this.uplink_traffic);
             }
-            // splice trigger（对齐 Go VisionWriter.WriteMultiBuffer L356-393）。
-            // Go 的 TrafficState 是单实例共享：EnableXtls/IsTLS12orAbove 由
-            // ServerHello 检测侧置位、writer 同侧判定。Rust 双实例下
-            // ServerHello 流经的实例按角色不同——服务端在**写方向**（下行
-            // ServerHello 经 poll_write 被 uplink_traffic 的 filter 捕获），
-            // 客户端在**读方向**（读 ServerHello 置位 downlink_traffic，
-            // 写侧读它即模拟 Go 共享语义）。此前服务端写侧恒读
-            // downlink_traffic → 永远发不出 Direct/End（39824 修 C）。
-            // 触发还需 caller 写入是完整的 TLS app-data record（0x17 0x03
-            // 0x03 前缀 = curl 的端到端 TLS records）。
             let write_side =
                 if this.is_server { &this.uplink_traffic } else { &this.downlink_traffic };
-            let is_app_data = buf.len() >= 3 && buf[0] == 0x17 && buf[1] == 0x03 && buf[2] == 0x03;
-            // Go 分支 1：完整 app-data 记录帧 → padding 到此为止，末帧恒
-            // End；XTLS 命中才升格 Direct 并切裸写。
-            let is_complete_app_data =
-                is_app_data && write_side.is_tls && is_complete_record(buf) && n == buf.len();
-            // Go proxy.go:382-386 分支 2：非 TLS12+ 流量过滤窗口将尽 →
-            // 提前 End（兼容早期 vision 接收端），不再无限 Continue。
+            let is_app_data = n >= 3 && buf[0] == 0x17 && buf[1] == 0x03 && buf[2] == 0x03;
+            let whole_complete = is_app_data && write_side.is_tls && is_complete_record(buf);
             let is_early_end =
                 !write_side.is_tls12_or_above && write_side.number_of_packet_to_filter <= 1;
-            let command = if is_complete_app_data && write_side.enable_xtls {
+            let batch_command = if whole_complete && write_side.enable_xtls {
                 COMMAND_PADDING_DIRECT
-            } else if is_complete_app_data || is_early_end {
+            } else if whole_complete || is_early_end {
                 COMMAND_PADDING_END
             } else {
                 COMMAND_PADDING_CONTINUE
             };
-            // 对齐 Go proxy.go:359/363/391：longPadding := trafficState.IsTLS
-            // （Go 单一共享状态，Rust 双实例取并集）；app-data 末帧
-            // （End/Direct 分支 1）Go 恒传 true。
-            let long_padding = if is_complete_app_data {
+            let long_padding = if whole_complete {
                 true
             } else {
                 this.uplink_traffic.is_tls || this.downlink_traffic.is_tls
             };
-            let padded = xtls_padding(
-                Some(&buf[..n]),
-                command,
-                &mut this.uplink_uuid_pending,
-                long_padding,
-                &this.padding_seed,
-                &mut this.rng,
-            );
-            this.uplink_write_pending = Some((padded, 0, n));
-            if command == COMMAND_PADDING_DIRECT {
-                // 只置挂起标志，不立即启用 raw 通道（对齐 Go f926ee4a）：
-                // 激活推迟到 pending 帧写完的 arm_splice_raw——若在此提前
-                // 启用，in-flight 写期间 poll_flush/poll_shutdown 会走 raw，
-                // 半关闭/并发写与安全层写竞态同一 TCP fd（issue #4878）。
-                this.splice_armed = true;
-            } else if command == COMMAND_PADDING_END {
-                // Go *isPadding = false 的时序等价后移：End 帧确认上线
-                //（poll_arm_gate 的 inner flush Ready）才 commit 翻转——
-                // 判定到 commit 之间 caller 写入被 pending 机制串行化，
-                // 未成帧明文无逃逸窗口（bd VISIONMAC :39057 间歇死亡：
-                // switch 帧在真实 tokio-rustls 异步提交时序下丢失，
-                // 客户端未收到 End/Direct 却收到未成帧明文）。
-                this.end_commit = true;
+            // 整写分帧：≤MAX_PADDING_CONTENT 逐片 Continue；末片携 End/Direct。
+            // early_end 时末片即 End 帧，commit 后 caller 余量经 branch 2 inner
+            // 直写（= GO break 后剩余缓冲 unpadded 的等价时序）。
+            let mut off = 0usize;
+            while off < n {
+                let end = (off + MAX_PADDING_CONTENT).min(n);
+                let is_last = end == n;
+                let (piece_cmd, piece_gate) = if is_last {
+                    match batch_command {
+                        COMMAND_PADDING_DIRECT => (COMMAND_PADDING_DIRECT, UpGate::DirectArm),
+                        COMMAND_PADDING_END => (COMMAND_PADDING_END, UpGate::EndCommit),
+                        _ => (COMMAND_PADDING_CONTINUE, UpGate::None),
+                    }
+                } else {
+                    (COMMAND_PADDING_CONTINUE, UpGate::None)
+                };
+                let padded = xtls_padding(
+                    Some(&buf[off..end]),
+                    piece_cmd,
+                    &mut this.uplink_uuid_pending,
+                    long_padding,
+                    &this.padding_seed,
+                    &mut this.rng,
+                );
+                let orig = end - off;
+                this.uplink_pending.push_back(UpFrame {
+                    padded,
+                    sent: 0,
+                    orig_len: orig,
+                    gate: piece_gate,
+                });
+                off = end;
             }
-            // continue → 步骤 1 写 pending
+            // 尾帧 Direct/End 的模式翻转推迟到提交（commit-record）
+            match batch_command {
+                COMMAND_PADDING_DIRECT => this.splice_armed = true,
+                COMMAND_PADDING_END => this.end_commit = true,
+                _ => {},
+            }
+            // continue → branch 1 从队首开始写
         }
     }
 
