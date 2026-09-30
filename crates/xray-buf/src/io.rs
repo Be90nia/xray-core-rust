@@ -156,6 +156,21 @@ pub fn new_readv_reader(r: tokio::net::tcp::OwnedReadHalf) -> Box<dyn Reader> {
     }
 }
 
+/// [`new_readv_reader`] 的整流变体（dup 读腿装配）。
+///
+/// 读源是整条 TcpStream：drop 只关闭该句柄，不 shutdown 共享 socket 的任一
+/// 方向——桥接 dup 读腿必须走这里（`into_split` 对偶写半 drop 会
+/// `shutdown(WR)` 打断共享 socket 写向，bd VISIONMAC e2e early-eof 实锤）。
+#[must_use]
+pub fn new_readv_reader_whole(r: tokio::net::TcpStream) -> Box<dyn Reader> {
+    if crate::readv::use_readv() {
+        Box::new(crate::readv::ReadVReader::new_whole(r))
+    } else {
+        // readv 禁用时退顺序读；整流直接顺序读等价读半。
+        Box::new(crate::reader::SingleReader::new(r))
+    }
+}
+
 /// 将 tokio AsyncRead 包装为 UDP 包语义的 Reader
 ///
 /// 对应 Go 的 `buf.NewPacketReader(io.Reader)`，使用 PacketReader 实现。
