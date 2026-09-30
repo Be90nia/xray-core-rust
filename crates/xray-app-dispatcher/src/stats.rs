@@ -2,7 +2,7 @@
 //!
 //! 对应 Go `app/dispatcher/stats.go`。`SizeStatWriter` 在每次写入时累加计数，
 //! `SizeStatReader` 在每次读取时累加计数，用于统计用户上下行流量。
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use xray_buf::{
     io::{Reader, Result as IoResult, Writer},
@@ -47,6 +47,11 @@ impl Writer for SizeStatWriter {
     /// 否则下游 reader 收不到 EOF。
     fn shutdown(&self) {
         self.writer.shutdown();
+    }
+
+    /// 排空 + 半关闭穿透（bd VISIONMAC：隧道写半收尾必须穿透 stats 包装）。
+    fn shutdown_flush(&mut self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
+        self.writer.shutdown_flush()
     }
 }
 

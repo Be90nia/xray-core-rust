@@ -196,8 +196,15 @@ where
             }
         }
         xray_buf::alloc::release(buf);
-        // bridge 结束前通知读端 EOF（pipe.Writer.close）
-        writer.shutdown();
+        // bridge 结束前通知读端 EOF（pipe.Writer.close）。
+        // bd VISIONMAC：TLS 隧道场景须 flush+shutdown 排空滞留尾巴（同
+        // bridge_link_with_stream_full down_writer 注释）；pipe 场景默认
+        // 实现退化为 shutdown() EOF 信号，行为不变。
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            writer.shutdown_flush(),
+        )
+        .await;
         io::Result::Ok(())
     };
     tokio::pin!(up, down);
@@ -447,7 +454,15 @@ where
             }
         }
         // 桥结束确保下游 reader 收到 EOF；同样只关本向，不碰 stream 写半部。
-        writer.shutdown();
+        // bd VISIONMAC：收尾必须 flush+shutdown（poll_shutdown）——TLS 层
+        // poll_write 是 BufWriter 语义（Ok(len) 只保证密文入 sendable_tls，
+        // write_io 撞 WouldBlock 尾巴滞留缓冲，poll_arm_gate 文档同源），
+        // 旧 no-op shutdown 下滞留尾巴随 drop 静默蒸发：对端 deframer 停在
+        // 半条记录上永久 Pending，直到 FIN → "peer closed without
+        // close_notify" 断链截断（VPS netem r6 实锤滞留 65,383B =
+        // sendable_tls 64KB 上限）。Go 无此坑：internalClose 链显式
+        // CloseWrite+排空。3s 上限防极端积压下收尾挂死（连接本就在收尾）。
+        let _ = timeout(std::time::Duration::from_secs(3), writer.shutdown_flush()).await;
         io::Result::Ok(())
     };
 
@@ -560,7 +575,13 @@ where
             Some(from) => crate::splice::splice_copy_counted(&from, &write_raw, counters).await,
             None => Ok(0),
         };
-        writer.shutdown();
+        // bd VISIONMAC：同 full 变体——收尾 flush+shutdown 排空 TLS 层滞留
+        // 尾巴（splice 已 arm 时 VisionConn 走 raw 分支半关闭，安全）。
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            writer.shutdown_flush(),
+        )
+        .await;
         let _ = down_done_tx.send(Some(downlink_only));
         res.map(|_| ())
     };
@@ -632,7 +653,12 @@ pub async fn bridge_link_with_link(
                 _ => break,
             }
         }
-        b_writer.shutdown();
+        // bd VISIONMAC：TLS 链路场景须 flush+shutdown 排空滞留尾巴。
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            b_writer.shutdown_flush(),
+        )
+        .await;
         let _ = up_done_tx.send(Some(uplink_only));
         io::Result::Ok(())
     };
@@ -671,7 +697,11 @@ pub async fn bridge_link_with_link(
                 _ => break,
             }
         }
-        a_writer.shutdown();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            a_writer.shutdown_flush(),
+        )
+        .await;
         let _ = down_done_tx.send(Some(downlink_only));
         io::Result::Ok(())
     };
@@ -882,6 +912,147 @@ mod tests {
         drop(client_a);
         drop(client_b);
         let _ = bridge.await;
+    }
+
+    /// bd VISIONMAC 截断回归：down 侧结束后，link.writer 收尾必须走
+    /// shutdown_flush（排空 + poll_shutdown），不能止步于 no-op sync
+    /// shutdown——否则 TLS 层 BufWriter 语义下滞留 sendable_tls 的尾巴随
+    /// drop 蒸发：对端 deframer 停在半条记录上永久 Pending，直到 FIN →
+    /// "peer closed without close_notify" 断链（VPS netem r6 实锤滞留
+    /// 65,383B = sendable_tls 64KB 上限）。
+    ///
+    /// mock 复刻 rustls 语义：poll_write 全量「收下」但不上线（sendable），
+    /// poll_flush/poll_shutdown 才放行到 wire；修复前 wire 缺尾 + 无
+    /// shutdown 标志，修复后全量到达 + shutdown 置位。
+    #[tokio::test]
+    async fn bridge_stream_full_down_teardown_flushes_and_shuts_down_writer() {
+        use std::{
+            net::SocketAddr,
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+            task::{Context, Poll},
+        };
+
+        use parking_lot::Mutex;
+        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+        use crate::link::Link;
+        use xray_buf::io::Writer as _;
+
+        /// 「TLS 层」mock：写半收下的字节滞留 sendable，flush/shutdown 才上线。
+        #[derive(Clone)]
+        struct TlsLike {
+            sendable: Arc<Mutex<Vec<u8>>>,
+            wire: Arc<Mutex<Vec<u8>>>,
+            shutdown_seen: Arc<AtomicBool>,
+        }
+        impl AsyncWrite for TlsLike {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                // BufWriter 谎报：全量接受、滞留缓冲（rustls sendable_tls 语义）
+                self.sendable.lock().extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                let mut sendable = self.sendable.lock();
+                self.wire.lock().append(&mut sendable);
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                self.shutdown_seen.store(true, Ordering::SeqCst);
+                Self::poll_flush(self, cx)
+            }
+        }
+
+        /// 隧道整流（Connection）：读半吐响应后 EOF，写半=TlsLike。
+        struct TunnelConn {
+            data: Vec<u8>,
+            pos: usize,
+            tls: TlsLike,
+        }
+        impl AsyncRead for TunnelConn {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                let rest = &self.data[self.pos..];
+                if rest.is_empty() {
+                    return Poll::Ready(Ok(())); // EOF
+                }
+                let n = rest.len().min(buf.remaining());
+                buf.put_slice(&rest[..n]);
+                self.pos += n;
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl AsyncWrite for TunnelConn {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Pin::new(&mut self.tls).poll_write(cx, buf)
+            }
+            fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.tls).poll_flush(cx)
+            }
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.tls).poll_shutdown(cx)
+            }
+        }
+        impl Connection for TunnelConn {
+            fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+            fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+        }
+
+        let response = vec![0x42u8; 3 * 8192];
+        let tls = TlsLike {
+            sendable: Arc::new(Mutex::new(Vec::new())),
+            wire: Arc::new(Mutex::new(Vec::new())),
+            shutdown_seen: Arc::new(AtomicBool::new(false)),
+        };
+        // stream = 出站侧（freedom mock）：读半吐响应后 EOF，写半不用。
+        let stream = TunnelConn { data: response.clone(), pos: 0, tls: tls.clone() };
+
+        let (up_r, mut up_w) = xray_buf::pipe::new();
+        // link.writer = SequentialWriter(WriteHalf<TunnelConn 写半>)——生产装配
+        // 同形（server.rs: new_writer(split(vision) 写半)）。下行数据
+        // stream→down_writer→link.writer→TLS mock（滞留→teardown 排空）。
+        let tunnel = TunnelConn { data: Vec::new(), pos: 0, tls: tls.clone() };
+        let (_t_read, t_write) = tokio::io::split(tunnel);
+        let link = Link::new(Box::new(up_r), xray_buf::io::new_writer(t_write));
+
+        let bridge = tokio::spawn(bridge_link_with_stream_full_default(link, stream));
+        up_w.shutdown(); // 上行立即 EOF，桥仅余下行收尾路径
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), bridge)
+            .await
+            .expect("bridge must finish")
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            tls.shutdown_seen.load(Ordering::SeqCst),
+            "teardown must poll_shutdown the link writer (flush stranded bytes + half-close)"
+        );
+        assert_eq!(
+            *tls.wire.lock(),
+            response,
+            "stranded sendable bytes must reach the wire at teardown"
+        );
     }
 
     #[tokio::test]
