@@ -60,10 +60,10 @@ impl Writer for SequentialWriter {
     }
 
     /// 排空 + 半关闭底层 AsyncWrite（poll_shutdown：TLS 层=flush sendable_tls
-    /// + close_notify；裸 TCP=FIN）。bd VISIONMAC：bridge 收尾必须走这里，
+    /// 后发 close_notify；裸 TCP=FIN）。bd VISIONMAC：bridge 收尾必须走这里，
     /// 默认 no-op 会让 TLS BufWriter 语义滞留的尾巴随 drop 蒸发。
     fn shutdown_flush(&mut self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
-        Box::pin(std::future::poll_fn(|cx| Pin::new(&mut *self.inner).poll_shutdown(cx)))
+        Box::pin(poll_fn(|cx| Pin::new(&mut *self.inner).poll_shutdown(cx)))
     }
 }
 
