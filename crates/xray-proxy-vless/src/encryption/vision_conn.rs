@@ -25,8 +25,8 @@ use crate::encryption::{
     common_conn::CommonConn,
     vision::{
         COMMAND_PADDING_CONTINUE, COMMAND_PADDING_DIRECT, COMMAND_PADDING_END,
-        DEFAULT_PADDING_SEED, DirectionState, TrafficState, is_complete_record, xtls_filter_tls,
-        xtls_padding, xtls_unpadding,
+        DEFAULT_PADDING_SEED, DirectionState, TrafficState, is_complete_record_slices,
+        xtls_filter_tls, xtls_padding, xtls_unpadding,
     },
 };
 
@@ -379,6 +379,21 @@ where
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        // 单片批：与 poll_write_vectored 共用整批判定状态机（bd VISIONMAC）。
+        self.poll_write_vectored(cx, &[io::IoSlice::new(buf)])
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        // 写侧整批判定依赖 vectored 入口拿到完整批次（Go WriteMultiBuffer 的
+        // 整 mb 语义）；bridge write_all_mb 据此选择聚合路径。
+        true
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         loop {
             // 1. 先写完 pending 队首（switch 帧在途时，caller 后续写入在此串行化）
@@ -431,7 +446,7 @@ where
             }
 
             // 2. padding 关闭 → 裸 TCP 直写（Direct commit 后）或 inner 直写
-            //    （End commit 后，无 raw 通道不 splice）
+            //    （End commit 后，无 raw 通道不 splice）。vectored 聚合直透。
             if !this.uplink_padding {
                 if let Some(raw) = this.raw_fallback.as_mut() {
                     // raw 起步闸：等对端消费 DIRECT 帧（见 raw_write_gate 注释）。
@@ -441,27 +456,33 @@ where
                         }
                         this.raw_write_gate = None;
                     }
-                    return Pin::new(raw).poll_write(cx, buf);
+                    return Pin::new(raw).poll_write_vectored(cx, bufs);
                 }
-                return Pin::new(&mut this.inner).poll_write(cx, buf);
+                return Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
             }
 
-            // 3. padding 模式 → 批级 TLS 检测 + 整写分帧入队（GO MultiBuffer
+            // 3. padding 模式 → 批级 TLS 检测 + 整批分帧入队（GO MultiBuffer
             //    批语义：整批 = 完整 0x17 record 组才升格；末帧携 End/Direct，
-            //    其余帧 Continue）
-            if buf.is_empty() {
+            //    其余帧 Continue。整批 = 整个 vectored 批（对齐 Go 对整个
+            //    MultiBuffer 做 IsCompleteRecord），8KB 单缓冲粒度判定是
+            //    Direct 触发不足的写侧半边（bd VISIONMAC）。
+            let total: usize = bufs.iter().map(|s| s.len()).sum();
+            if total == 0 {
                 return Poll::Ready(Ok(0));
             }
-            let n = buf.len();
-            // TLS filter（过滤窗口内；探针取首 2KB，对齐 GO 按缓冲计数）
+            // TLS filter（过滤窗口内；探针取批首 ≤2KB，跨片拷贝，对齐 GO 按缓冲计数）
+            let probe_end = total.min(MAX_PADDING_CONTENT);
+            let mut probe = [0u8; MAX_PADDING_CONTENT];
+            copy_io_slice_span(bufs, 0, probe_end, &mut probe[..probe_end]);
             if this.uplink_traffic.number_of_packet_to_filter > 0 {
-                let probe_end = n.min(MAX_PADDING_CONTENT);
-                xtls_filter_tls(&[&buf[..probe_end]], &mut this.uplink_traffic);
+                xtls_filter_tls(&[&probe[..probe_end]], &mut this.uplink_traffic);
             }
             let write_side =
                 if this.is_server { &this.uplink_traffic } else { &this.downlink_traffic };
-            let is_app_data = n >= 3 && buf[0] == 0x17 && buf[1] == 0x03 && buf[2] == 0x03;
-            let whole_complete = is_app_data && write_side.is_tls && is_complete_record(buf);
+            let is_app_data =
+                total >= 3 && probe[0] == 0x17 && probe[1] == 0x03 && probe[2] == 0x03;
+            let whole_complete =
+                is_app_data && write_side.is_tls && is_complete_record_slices(bufs);
             let is_early_end =
                 !write_side.is_tls12_or_above && write_side.number_of_packet_to_filter <= 1;
             let batch_command = if whole_complete && write_side.enable_xtls {
@@ -476,13 +497,15 @@ where
             } else {
                 this.uplink_traffic.is_tls || this.downlink_traffic.is_tls
             };
-            // 整写分帧：≤MAX_PADDING_CONTENT 逐片 Continue；末片携 End/Direct。
+            // 整批分帧：≤MAX_PADDING_CONTENT 逐片 Continue；末片携 End/Direct。
             // early_end 时末片即 End 帧，commit 后 caller 余量经 branch 2 inner
-            // 直写（= GO break 后剩余缓冲 unpadded 的等价时序）。
+            // 直写（= GO break 后剩余缓冲 unpadded 的等价时序）。跨片片段
+            // 拷入栈缓冲（xtls_padding 随后仍要拷入 padded 帧，双拷贝仅跨片
+            // 发生）。
             let mut off = 0usize;
-            while off < n {
-                let end = (off + MAX_PADDING_CONTENT).min(n);
-                let is_last = end == n;
+            while off < total {
+                let end = (off + MAX_PADDING_CONTENT).min(total);
+                let is_last = end == total;
                 let (piece_cmd, piece_gate) = if is_last {
                     match batch_command {
                         COMMAND_PADDING_DIRECT => (COMMAND_PADDING_DIRECT, UpGate::DirectArm),
@@ -492,8 +515,11 @@ where
                 } else {
                     (COMMAND_PADDING_CONTINUE, UpGate::None)
                 };
+                let plen = end - off;
+                let mut piece = [0u8; MAX_PADDING_CONTENT];
+                copy_io_slice_span(bufs, off, end, &mut piece[..plen]);
                 let padded = xtls_padding(
-                    Some(&buf[off..end]),
+                    Some(&piece[..plen]),
                     piece_cmd,
                     &mut this.uplink_uuid_pending,
                     long_padding,
@@ -536,6 +562,31 @@ where
         }
         Pin::new(&mut this.inner).poll_shutdown(cx)
     }
+}
+
+/// 从 IoSlice 批中拷出逻辑区间 `[start, end)`（跨片拼接，片内直接拷贝）。
+/// 批语义下片段跨片的场景仅 8KB 缓冲边界一处（片长 ≥ 片段上限 2027B 的
+/// 整数倍边界），双拷贝开销可忽略。
+fn copy_io_slice_span(bufs: &[io::IoSlice<'_>], start: usize, end: usize, out: &mut [u8]) {
+    debug_assert!(end >= start && out.len() >= end - start);
+    let mut pos = 0usize;
+    let mut oi = 0usize;
+    for s in bufs {
+        let (sbegin, send) = (pos, pos + s.len());
+        pos = send;
+        if send <= start {
+            continue;
+        }
+        if sbegin >= end {
+            break;
+        }
+        let lo = start.max(sbegin) - sbegin;
+        let hi = end.min(send) - sbegin;
+        let n = hi - lo;
+        out[oi..oi + n].copy_from_slice(&s[lo..hi]);
+        oi += n;
+    }
+    debug_assert_eq!(oi, end - start);
 }
 
 #[allow(private_bounds)] // InnerRawClone 有意 crate 内私有；bound 泄露为既定设计（rustc private-bounds）
@@ -1366,6 +1417,186 @@ mod tests {
         assert_eq!(st.current_command, COMMAND_PADDING_END as i32);
     }
 
+    /// [reg L3/L4] DIRECT 提交窗口过读吞流（bd VISIONMAC 终局）：背压暂停跨过
+    /// RAW_WRITE_ARM_DELAY 窗口时，对端 raw 字节与 DIRECT 帧同段落入 rustls 一次
+    /// recv —— 无记录钳制时 raw 前缀被 deframer 当半条隧道记录扣留，切 raw 后
+    /// 永久不可达（下游字节流断 2921B → 永久停滞）。修复形态 = 读侧记录对齐
+    /// （RecordFramer 垫在 rustls 之下，等价 Go readFromUntil 精确读形态）。
+    /// 客户端 csock 的 framer 包装镜像生产 dial_tcp 的 security=tls 钳制。
+    #[tokio::test]
+    async fn reg_direct_switch_coalesce_swallow_backpressure() {
+        use std::sync::Arc;
+
+        use rustls::{
+            DigitallySignedStruct, SignatureScheme,
+            client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+            pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
+        };
+        use tokio_rustls::TlsConnector;
+        use xray_transport::TlsAcceptor;
+        use xray_transport::connection::dup_tcp_stream;
+        use xray_transport::rustls::{ClientConfig, ServerConfig};
+
+        fn rec(payload: &[u8]) -> Vec<u8> {
+            let mut v = vec![0x17, 0x03, 0x03, (payload.len() >> 8) as u8, payload.len() as u8];
+            v.extend_from_slice(payload);
+            v
+        }
+
+        fn make_chunk(tag: u8) -> Vec<u8> {
+            let mut p1 = vec![0xA0u8; 8103];
+            p1[0] = tag;
+            let mut chunk = rec(&p1);
+            let mut p2 = vec![0xB7u8; 79];
+            p2[0] = tag.wrapping_add(1);
+            chunk.extend_from_slice(&rec(&p2));
+            assert_eq!(chunk.len(), 8192);
+            chunk
+        }
+
+        #[derive(Debug)]
+        struct NoVerify;
+        impl ServerCertVerifier for NoVerify {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &CertificateDer<'_>,
+                _intermediates: &[CertificateDer<'_>],
+                _server_name: &ServerName<'_>,
+                _ocsp: &[u8],
+                _now: UnixTime,
+            ) -> Result<ServerCertVerified, rustls::Error> {
+                Ok(ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn verify_tls13_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                vec![SignatureScheme::RSA_PKCS1_SHA256, SignatureScheme::ECDSA_NISTP256_SHA256]
+            }
+        }
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = cert_params.self_signed(&key_pair).unwrap();
+        let cert_der = cert.der().to_vec();
+        let key_der = key_pair.serialize_der();
+        let key = PrivateKeyDer::try_from(key_der).unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![CertificateDer::from(cert_der.clone())], key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let mut client_cfg = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth();
+        client_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let connector = TlsConnector::from(Arc::new(client_cfg));
+
+        let uuid = vec![0xABu8; 16];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let uuid_srv = uuid.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let raw = dup_tcp_stream(&stream).unwrap();
+            let framer = xray_transport::record_framer::RecordFramer::new(stream);
+            let tls = acceptor.accept_with(framer, |_| ()).await.expect("server tls accept");
+            let (r, w) = tokio::io::split(tls);
+            let mut vision = VisionConn::new_server(tokio::io::join(r, w), uuid_srv, raw);
+            vision.uplink_traffic.enable_xtls = true;
+            vision.uplink_traffic.is_tls = true;
+            vision.uplink_traffic.is_tls12_or_above = true;
+            let (mut _sr, mut sw) = tokio::io::split(vision);
+            // chunk 0：padded 批，末帧 Direct → arm（50ms raw 起步闸在写侧）
+            let chunk = make_chunk(0);
+            sw.write_all(&chunk).await.expect("srv chunk0 write");
+            sw.flush().await.expect("srv chunk0 flush");
+            eprintln!("[tap3][srv] chunk0 (direct batch) written, gate 50ms");
+            // t≈50ms：gate 到期，第一段 raw 只发 2921B（半条记录），随后静默
+            // 300ms——客户端背压暂停跨过 arm 窗口，recv 必然把 DIRECT 帧 + 该
+            // 前缀合流拉进 deframer。
+            let chunk1 = make_chunk(1);
+            sw.write_all(&chunk1[..2921]).await.expect("srv raw piece-a write");
+            sw.flush().await.expect("srv raw piece-a flush");
+            eprintln!("[tap3][srv] raw piece-a (2921B) written, pausing 300ms");
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            // t≈350ms：发剩余 raw 流（piece-b + chunks 2..5）
+            sw.write_all(&chunk1[2921..]).await.expect("srv raw piece-b write");
+            for i in 2..6u8 {
+                let c = make_chunk(i);
+                sw.write_all(&c).await.expect("srv raw tail write");
+            }
+            sw.flush().await.expect("srv raw tail flush");
+            eprintln!("[tap3][srv] raw tail written, parking 30s");
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+
+        let csock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let craw = dup_tcp_stream(&csock).unwrap();
+        // 镜像生产 dial_tcp（security=tls）：记录对齐钳制垫在 rustls 客户端之下。
+        let framer = xray_transport::record_framer::RecordFramer::new(csock);
+        let tls = connector
+            .connect(ServerName::try_from("localhost".to_string()).unwrap(), framer)
+            .await
+            .expect("client tls connect");
+        let (r, w) = tokio::io::split(tls);
+        let mut cvision = VisionConn::new_server(tokio::io::join(r, w), uuid.clone(), craw);
+        cvision.downlink_traffic.enable_xtls = true;
+        cvision.downlink_traffic.is_tls = true;
+        cvision.downlink_traffic.is_tls12_or_above = true;
+
+        let (mut cr, _cw) = tokio::io::split(cvision);
+        // 背压暂停 60ms > 50ms arm 闸：DIRECT 帧 + piece-a 同段 recv 的窗口。
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        let mut got: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 16384];
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while got.len() < 6 * 8192 {
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "deadline: got={} (expected {}); swallow signature = {} bytes",
+                    got.len(),
+                    6 * 8192,
+                    6 * 8192 - got.len()
+                );
+            }
+            let read =
+                tokio::time::timeout(std::time::Duration::from_secs(10), cr.read(&mut buf)).await;
+            let n = match read {
+                Ok(Ok(n)) if n > 0 => n,
+                Ok(Ok(_)) => panic!("EOF at {}", got.len()),
+                Ok(Err(e)) => panic!("cli read io at {}: {e}", got.len()),
+                Err(_) => panic!("cli read deadline at {} bytes received", got.len()),
+            };
+            got.extend_from_slice(&buf[..n]);
+            eprintln!("[tap3][cli] progress: {} bytes (+{n})", got.len());
+        }
+        let mut rebuilt: Vec<u8> = Vec::new();
+        for i in 0..6u8 {
+            rebuilt.extend_from_slice(&make_chunk(i));
+        }
+        assert_eq!(got.len(), rebuilt.len(), "downlink content length mismatch");
+        assert_eq!(got, rebuilt, "downlink content stream corrupted");
+        server.abort();
+    }
+
     /// [reg L3/L4] 全栈实验室（bd VISIONMAC 回归）：真 rustls 双端 + RecordFramer +
     /// 双向并发 8KB record 形态泵 + 双向 DIRECT（对齐生产 :39057 拓扑）+ 读侧背压。
     /// 下行输出流做字节级连续性验证。
@@ -1462,7 +1693,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let raw = dup_tcp_stream(&stream).unwrap();
-            let framer = crate::inbound::record_framer::RecordFramer::new(stream);
+            let framer = xray_transport::record_framer::RecordFramer::new(stream);
             let tls = acceptor.accept_with(framer, |_| ()).await.expect("server tls accept");
             let (r, w) = tokio::io::split(tls);
             let mut vision = VisionConn::new_server(tokio::io::join(r, w), uuid_srv, raw);

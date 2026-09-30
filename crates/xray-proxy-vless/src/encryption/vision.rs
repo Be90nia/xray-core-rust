@@ -355,6 +355,72 @@ pub fn is_complete_record(buf: &[u8]) -> bool {
     i == total
 }
 
+/// [`is_complete_record`] 的切片批版本（逐字节语义与拼接后完全一致）。
+///
+/// vision 写侧整批判定（bd VISIONMAC，对齐 Go `VisionWriter.WriteMultiBuffer`
+/// 的整 mb `IsCompleteRecord`）：bridge readv 聚合读的批次以 IoSlice 批形态
+/// 到达 `poll_write_vectored`，End/Direct 判定必须在**整批**上做——8KB 单缓冲
+/// 粒度判定是 Direct 触发不足的写侧半边。记录体跳过走算术，只有记录头 5B
+/// 触碰真实字节，零拷贝。
+#[must_use]
+pub fn is_complete_record_slices(slices: &[std::io::IoSlice<'_>]) -> bool {
+    let total: usize = slices.iter().map(|s| s.len()).sum();
+    // 按全局位置跨片取字节（只有记录头 5B/记录触碰；记录体走算术跳过，
+    // 不维护片内游标——体跳过若同步推进游标极易漂移，全局位置寻址无此坑）。
+    fn byte_at(slices: &[std::io::IoSlice<'_>], mut global: usize) -> u8 {
+        for s in slices {
+            if global < s.len() {
+                return s[global];
+            }
+            global -= s.len();
+        }
+        unreachable!("caller guarantees pos < total");
+    }
+    let mut pos = 0usize;
+    let mut header_left = 5usize;
+    let mut record_len = 0usize;
+    while pos < total {
+        if header_left == 0 {
+            // 记录体：算术跳过（不触碰、不消费任何字节）；批尾截断即刻判假
+            // （与标量版 `remaining < record_len → false` 同型）。
+            let skip = record_len.min(total - pos);
+            pos += skip;
+            record_len -= skip;
+            if record_len != 0 {
+                return false;
+            }
+            header_left = 5;
+            continue;
+        }
+        let byte = byte_at(slices, pos);
+        pos += 1;
+        match header_left {
+            5 => {
+                if byte != 0x17 {
+                    return false;
+                }
+            },
+            4 | 3 => {
+                if byte != 0x03 {
+                    return false;
+                }
+            },
+            2 => record_len = (byte as usize) << 8,
+            1 => {
+                record_len |= byte as usize;
+                if record_len == 0 {
+                    // 零长记录：立即回头阶段。
+                    header_left = 5;
+                    continue;
+                }
+            },
+            _ => unreachable!("header_left ∈ 1..=5"),
+        }
+        header_left -= 1;
+    }
+    header_left == 5
+}
+
 // === XRV -udp443 流控（对齐 Go `proxy/vless/encryption/vision.go` udp443 逻辑）===
 
 /// QUIC initial packet 类型（对齐 Go ` pktTypeUDP443` 常量）。
@@ -729,6 +795,36 @@ mod tests {
     #[test]
     fn is_complete_record_empty() {
         assert!(is_complete_record(&[]));
+    }
+
+    /// 切片批版本与拼接版逐字节等价（含跨片切开的记录头/记录体）。
+    #[test]
+    fn is_complete_record_slices_matches_concat() {
+        use std::io::IoSlice;
+        let mut whole = vec![0x17, 0x03, 0x03, 0x00, 0x05, 1, 2, 3, 4, 5];
+        whole.extend_from_slice(&[0x17, 0x03, 0x03, 0x00, 0x02, 0xAA, 0xBB]);
+        // 逐种切片边界拆分，含 1 字节微片（记录头被切开的形态）。
+        for split in [1usize, 3, 5, 6, 9, 12, 15] {
+            let (a, b) = whole.split_at(split);
+            let slices = [IoSlice::new(a), IoSlice::new(b)];
+            assert_eq!(
+                is_complete_record_slices(&slices),
+                is_complete_record(&whole),
+                "split at {split} must match concat semantics"
+            );
+        }
+        // 三片跨切 + 空片。
+        let (a, rest) = whole.split_at(4);
+        let (b, c) = rest.split_at(7);
+        let slices = [IoSlice::new(a), IoSlice::new(&[]), IoSlice::new(b), IoSlice::new(c)];
+        assert!(is_complete_record_slices(&slices));
+        // 截断尾：批量不含完整记录体。
+        let slices = [IoSlice::new(&whole[..whole.len() - 1])];
+        assert!(!is_complete_record_slices(&slices));
+        // 非 0x17 开头。
+        let bad = [0x16u8, 0x03, 0x03, 0x00, 0x01, 0x00];
+        let slices = [IoSlice::new(&bad)];
+        assert!(!is_complete_record_slices(&slices));
     }
 
     // === XRV -udp443 + CanSpliceCopy 测试 ===
