@@ -1126,7 +1126,7 @@ mod tests {
         server.uplink_traffic.is_tls12_or_above = true;
 
         let mut chunk = rec(&vec![0xA0u8; 8103]);
-        chunk.extend_from_slice(&rec(&vec![0xB7u8; 79]));
+        chunk.extend_from_slice(&rec(&[0xB7u8; 79]));
         assert_eq!(chunk.len(), 8192);
         let pump = tokio::spawn(async move {
             for _ in 0..6u8 {
@@ -1164,8 +1164,7 @@ mod tests {
                 let n = tokio::time::timeout(Duration::from_secs(10), c2.read(&mut buf))
                     .await
                     .expect("raw read deadline")
-                    .expect("raw read io")
-                    .max(0);
+                    .expect("raw read io");
                 assert!(n > 0, "raw stream must flow after DIRECT");
                 assert_eq!(buf[0], 0x17, "raw stream must start with the next chunk record header");
                 pump.abort();
@@ -1345,7 +1344,7 @@ mod tests {
         }
         assert!(server.end_commit, "End 帧在途，commit 闸必须持有");
         assert!(server.uplink_padding, "commit 前 padding 必须未翻转");
-        assert_eq!(server.raw_fallback.is_none(), true);
+        assert!(server.raw_fallback.is_none());
         // End 帧已在 send 缓冲（未上线）：cmd=End，content=block1，长 pad ∈ [0,255]
         let sealed_len = server.inner.sealed.len();
         // 首帧携带 UUID 前缀（16B）+ 5B 帧头
@@ -1379,17 +1378,13 @@ mod tests {
 
         // 解除背压：重入驱动 → flush Ready → commit → 写 #1 完成
         server.inner.unblock = true;
-        let mut n = 0usize;
-        loop {
+        let n = loop {
             match Pin::new(&mut server).poll_write(&mut cx, &block1) {
-                Poll::Ready(Ok(done)) => {
-                    n = done;
-                    break;
-                },
+                Poll::Ready(Ok(done)) => break done,
                 Poll::Pending => continue,
                 other => panic!("write#1 retry unexpected: {other:?}"),
             }
-        }
+        };
         assert_eq!(n, block1.len());
         assert!(!server.end_commit, "commit 后闸必须复位");
         assert!(!server.uplink_padding, "commit 后 padding 必须关闭");
