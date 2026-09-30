@@ -133,9 +133,7 @@ impl Writer for Box<dyn Writer> {
         (**self).shutdown();
     }
 
-    fn shutdown_flush(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
+    fn shutdown_flush(&mut self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
         (**self).shutdown_flush()
     }
 }
