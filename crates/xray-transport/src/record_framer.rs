@@ -51,6 +51,13 @@ pub struct RecordFramer<S> {
     body_remaining: usize,
 }
 
+fn micros() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() % 1_000_000_000)
+        .unwrap_or(0)
+}
+
 impl<S> RecordFramer<S> {
     pub fn new(sock: S) -> Self {
         Self { sock, hdr: [0u8; HEADER_LEN], have: 0, body_remaining: 0 }
@@ -96,7 +103,14 @@ impl<S: AsyncRead + Unpin> AsyncRead for RecordFramer<S> {
             let mut rb = ReadBuf::new(&mut this.hdr[this.have..]);
             match Pin::new(&mut this.sock).poll_read(cx, &mut rb) {
                 Poll::Ready(Ok(())) => {},
-                other => return other,
+                other => {
+                    if std::env::var("XRAY_FRDBG").is_ok() {
+                        if let Poll::Pending = other {
+                            eprintln!("[FRDBG:{}MS] hdr Pending have={}", micros(), this.have);
+                        }
+                    }
+                    return other;
+                },
             }
             let n = rb.filled().len();
             if n == 0 {
@@ -121,9 +135,19 @@ impl<S: AsyncRead + Unpin> AsyncRead for RecordFramer<S> {
         let mut rb = ReadBuf::new(&mut unfilled[..want]);
         match Pin::new(&mut this.sock).poll_read(cx, &mut rb) {
             Poll::Ready(Ok(())) => {},
-            other => return other,
+            other => {
+                if std::env::var("XRAY_FRDBG").is_ok() {
+                    if let Poll::Pending = other {
+                        eprintln!("[FRDBG:{}MS] body Pending rem={}", micros(), this.body_remaining);
+                    }
+                }
+                return other;
+            },
         }
         let n = rb.filled().len();
+        if std::env::var("XRAY_FRDBG").is_ok() && n == 0 {
+            eprintln!("[FRDBG:{}MS] body ZERO-READ rem={}", micros(), this.body_remaining);
+        }
         buf.advance(n);
         this.body_remaining -= n;
         Poll::Ready(Ok(()))
