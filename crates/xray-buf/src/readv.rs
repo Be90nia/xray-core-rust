@@ -226,7 +226,7 @@ impl ReadVReader {
         Self { src: ReadVSource::Half(src), alloc: AllocStrategy::new() }
     }
 
-    /// 整流读源（dup 读腿装配；见 [`ReadVSource::Whole`] 的 drop 语义说明）。
+    /// 整流读源（dup 读腿装配；`ReadVSource::Whole` 变体，drop 语义见类型注释）。
     #[must_use]
     pub fn new_whole(src: tokio::net::TcpStream) -> Self {
         Self { src: ReadVSource::Whole(src), alloc: AllocStrategy::new() }
