@@ -95,6 +95,20 @@ pub trait Writer: Send {
     /// 默认空操作；pipe.Writer override 为实际 close。
     /// bridge 结束时调用，确保下游 reader 收到 EOF。
     fn shutdown(&self) {}
+
+    /// 写半部收尾：排空底层缓冲并半关闭写向（flush + poll_shutdown）。
+    ///
+    /// 对应 Go 收尾链的显式 CloseWrite+排空（freedom.go internalClose /
+    /// tls.Conn.Close 语义）。默认退化为 [`Writer::shutdown`]（EOF 信号，不
+    /// 排空）——直接包裹 AsyncWrite 的实现（如 SequentialWriter）应覆写为
+    /// `poll_shutdown`，否则 TLS 层 BufWriter 语义下滞留 sendable_tls 的尾巴
+    /// 会随 drop 静默蒸发：对端 deframer 停在半条记录上永久 Pending，直到
+    /// FIN 报 "peer closed without close_notify" 断链（bd VISIONMAC 截断根因，
+    /// VPS netem r6 实锤滞留 65,383B = sendable_tls 64KB 上限）。
+    fn shutdown_flush(&mut self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
+        self.shutdown();
+        Box::pin(std::future::ready(Ok(())))
+    }
 }
 
 // ========== Box<dyn> 实现 ==========
@@ -117,6 +131,12 @@ impl Writer for Box<dyn Writer> {
 
     fn shutdown(&self) {
         (**self).shutdown();
+    }
+
+    fn shutdown_flush(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
+        (**self).shutdown_flush()
     }
 }
 
