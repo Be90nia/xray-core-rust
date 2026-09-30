@@ -136,7 +136,9 @@ pub async fn serve_vless(
                 // 或半记录滞留，字节不可恢复 → Linux CI 确定性挂）。framer 按
                 // 记录边界限长读，裸尾留在内核缓冲，raw_tcp 克隆（dup 共享
                 // 内核缓冲游标）切 DIRECT 后天然读到完整裸流。
-                match acc.accept_with(super::record_framer::RecordFramer::new(stream), |_| ()).await
+                match acc
+                    .accept_with(xray_transport::record_framer::RecordFramer::new(stream), |_| ())
+                    .await
                 {
                     Ok(tls_stream) => {
                         let conn = tls_stream.get_ref().1;

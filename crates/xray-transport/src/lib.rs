@@ -44,6 +44,7 @@ pub mod headers;
 pub mod memory_settings;
 pub mod pipe;
 pub mod proxy_protocol;
+pub mod record_framer;
 pub mod sockopt;
 pub mod tagged;
 pub mod tcp;

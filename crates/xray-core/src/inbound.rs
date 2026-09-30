@@ -2297,7 +2297,7 @@ async fn serve_reality_vless(
             // raw 通道 → 从 rustls 安全层读端到端明文 → AEAD open 失败 → fatal
             // bad_record_mac，隧道死。
             let raw_tcp = xray_transport::connection::dup_tcp_stream(&stream);
-            let framer = xray_proxy_vless::inbound::record_framer::RecordFramer::new(stream);
+            let framer = xray_transport::record_framer::RecordFramer::new(stream);
             let outcome = if use_btls {
                 #[cfg(not(target_os = "ios"))]
                 {
