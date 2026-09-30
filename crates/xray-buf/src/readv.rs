@@ -187,15 +187,49 @@ fn release_slots(bufs: &mut [Option<Buffer>; MAX_READV]) {
 /// `current == 1` 时单缓冲读（Go ReadBuffer 分支），填满即扩容到 2；
 /// `current >= 2` 时一次 `readv` 填多缓冲，按实填数调整策略。
 pub struct ReadVReader {
-    src: OwnedReadHalf,
+    src: ReadVSource,
     alloc: AllocStrategy,
+}
+
+/// readv 读源。
+///
+/// [`ReadVSource::Half`] 是既有入站装配的 `into_split` 读半（对偶写半由调用
+/// 方持有，无 drop shutdown 问题）；[`ReadVSource::Whole`] 是整条 TcpStream
+/// （dup 读腿场景：drop 只关闭 dup 句柄，**不** shutdown 共享 socket——
+/// `into_split` 的对偶写半 drop 会 `shutdown(WR)` 打断共享 socket 的写向，
+/// 桥接读腿绝不能走它，bd VISIONMAC early-eof 实锤）。
+enum ReadVSource {
+    Whole(tokio::net::TcpStream),
+    Half(OwnedReadHalf),
+}
+
+impl ReadVSource {
+    async fn readable(&self) -> std::io::Result<()> {
+        match self {
+            Self::Whole(s) => s.readable().await,
+            Self::Half(s) => s.readable().await,
+        }
+    }
+
+    fn try_read_vectored(&self, slices: &mut [IoSliceMut<'_>]) -> std::io::Result<usize> {
+        match self {
+            Self::Whole(s) => s.try_read_vectored(slices),
+            Self::Half(s) => s.try_read_vectored(slices),
+        }
+    }
 }
 
 impl ReadVReader {
     /// 对应 Go `NewReadVReader`。
     #[must_use]
     pub fn new(src: OwnedReadHalf) -> Self {
-        Self { src, alloc: AllocStrategy::new() }
+        Self { src: ReadVSource::Half(src), alloc: AllocStrategy::new() }
+    }
+
+    /// 整流读源（dup 读腿装配；见 [`ReadVSource::Whole`] 的 drop 语义说明）。
+    #[must_use]
+    pub fn new_whole(src: tokio::net::TcpStream) -> Self {
+        Self { src: ReadVSource::Whole(src), alloc: AllocStrategy::new() }
     }
 
     /// 当前分配策略（测试与观测用）。

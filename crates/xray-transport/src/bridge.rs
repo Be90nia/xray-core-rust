@@ -292,7 +292,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Connection + 'static,
 {
     use tokio::{io::AsyncWriteExt, time::timeout};
-    use xray_buf::io::{Reader, Writer, new_reader};
+    use xray_buf::io::{Reader, Writer, new_reader, new_readv_reader_whole};
 
     let conn_idle = policy.connection_idle;
     let uplink_only = policy.uplink_only;
@@ -304,10 +304,24 @@ where
     // tokio::io::split（out_f1 33Mbps 实证拓扑，无锁）。自研 BiLock 轮转锁在
     // join! 固定轮询顺序下被 up 大流量系统性抢占（50074b2 同源塌陷：VPS 实测
     // up 1.58Mbps + strace「突发排空→恰 1 RTT 停顿」锁步签名），已整体删除。
-    // WriteHalf 转发 poll_write_vectored/is_write_vectored（y1yx 聚合写保持）；
-    // 下行顺序读（readv 重接属 bd 2o9l 专项，勿混入本票）。
-    let (s_read, mut s_write) = tokio::io::split(stream);
-    let mut s_read = new_reader(s_read);
+    // WriteHalf 转发 poll_write_vectored/is_write_vectored（y1yx 聚合写保持）。
+    // 下行读侧聚合读（bd VISIONMAC，对齐 Go readv 批语义）：裸 TCP 时在 split
+    // 前 dup 专用读腿（ReadHalf 不穿透 Connection trait），走 ReadVReader 多
+    // 缓冲聚合读（自适应至多缓冲）。SingleReader 单缓冲顺序读把批边界钉死在
+    // 8KB，写侧整批 IsCompleteRecord 判定几乎必然失准 → End/Direct 触发不足
+    // → 持续 padded 限速。读腿必须走**整流** dup（new_readv_reader_whole）：
+    // into_split 对偶写半 drop 会 shutdown(WR) 共享 socket 写向 → 对端 early
+    // EOF（e2e 实锤）；dup 句柄 drop 只关句柄不 shutdown。原 stream 的写半
+    // 照常承担写向，读半闲置（dup 已接管读向，共享内核缓冲游标）。
+    let s_read_dup = (stream.is_raw_tcp() && xray_buf::readv::use_readv())
+        .then(|| stream.raw_tcp_clone())
+        .flatten()
+        .map(new_readv_reader_whole);
+    let (s_read_half, mut s_write) = tokio::io::split(stream);
+    let mut s_read: Box<dyn Reader> = match s_read_dup {
+        Some(r) => r,
+        None => new_reader(s_read_half),
+    };
 
     // 512KiB bounded mpsc ×2：容量按条目计（Go pipe 按字节软限，这里
     // 64 条 × 1-8 buffer × 8KiB，常态 ≥512KiB，只影响内存上限不影响正确性）。
