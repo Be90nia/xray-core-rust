@@ -104,10 +104,8 @@ impl<S: AsyncRead + Unpin> AsyncRead for RecordFramer<S> {
             match Pin::new(&mut this.sock).poll_read(cx, &mut rb) {
                 Poll::Ready(Ok(())) => {},
                 other => {
-                    if std::env::var("XRAY_FRDBG").is_ok() {
-                        if let Poll::Pending = other {
-                            eprintln!("[FRDBG:{}MS] hdr Pending have={}", micros(), this.have);
-                        }
+                    if std::env::var("XRAY_FRDBG").is_ok() && other.is_pending() {
+                        eprintln!("[FRDBG:{}MS] hdr Pending have={}", micros(), this.have);
                     }
                     return other;
                 },
@@ -136,14 +134,8 @@ impl<S: AsyncRead + Unpin> AsyncRead for RecordFramer<S> {
         match Pin::new(&mut this.sock).poll_read(cx, &mut rb) {
             Poll::Ready(Ok(())) => {},
             other => {
-                if std::env::var("XRAY_FRDBG").is_ok() {
-                    if let Poll::Pending = other {
-                        eprintln!(
-                            "[FRDBG:{}MS] body Pending rem={}",
-                            micros(),
-                            this.body_remaining
-                        );
-                    }
+                if std::env::var("XRAY_FRDBG").is_ok() && other.is_pending() {
+                    eprintln!("[FRDBG:{}MS] body Pending rem={}", micros(), this.body_remaining);
                 }
                 return other;
             },
