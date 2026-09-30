@@ -189,7 +189,7 @@ where
             end_commit: false,
             is_server: false,
             raw_write_gate: None,
-        frdbg_polls: 0,
+            frdbg_polls: 0,
         }
     }
 
@@ -231,7 +231,7 @@ where
             end_commit: false,
             is_server: true,
             raw_write_gate: None,
-        frdbg_polls: 0,
+            frdbg_polls: 0,
         }
     }
 
@@ -351,11 +351,7 @@ where
                         && cmd != 0;
                     if frames_done {
                         if std::env::var("XRAY_FRDBG").is_ok() {
-                            eprintln!(
-                                "[VCDBG:{}MS] frame done cmd={}",
-                                frdbg_micros(),
-                                cmd
-                            );
+                            eprintln!("[VCDBG:{}MS] frame done cmd={}", frdbg_micros(), cmd);
                         }
                         if cmd == COMMAND_PADDING_END as i32 {
                             this.downlink_padding = false;
@@ -491,8 +487,8 @@ where
                 }
             }
 
-            // 2. padding 关闭 → 裸 TCP 直写（Direct commit 后）或 inner 直写
-            //    （End commit 后，无 raw 通道不 splice）。vectored 聚合直透。
+            // 2. padding 关闭 → 裸 TCP 直写（Direct commit 后）或 inner 直写 （End commit 后，无
+            //    raw 通道不 splice）。vectored 聚合直透。
             if !this.uplink_padding {
                 if let Some(raw) = this.raw_fallback.as_mut() {
                     // raw 起步闸：等对端消费 DIRECT 帧（见 raw_write_gate 注释）。
@@ -507,11 +503,10 @@ where
                 return Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
             }
 
-            // 3. padding 模式 → 批级 TLS 检测 + 整批分帧入队（GO MultiBuffer
-            //    批语义：整批 = 完整 0x17 record 组才升格；末帧携 End/Direct，
-            //    其余帧 Continue。整批 = 整个 vectored 批（对齐 Go 对整个
-            //    MultiBuffer 做 IsCompleteRecord），8KB 单缓冲粒度判定是
-            //    Direct 触发不足的写侧半边（bd VISIONMAC）。
+            // 3. padding 模式 → 批级 TLS 检测 + 整批分帧入队（GO MultiBuffer 批语义：整批 = 完整
+            //    0x17 record 组才升格；末帧携 End/Direct， 其余帧 Continue。整批 = 整个 vectored
+            //    批（对齐 Go 对整个 MultiBuffer 做 IsCompleteRecord），8KB 单缓冲粒度判定是 Direct
+            //    触发不足的写侧半边（bd VISIONMAC）。
             let total: usize = bufs.iter().map(|s| s.len()).sum();
             if total == 0 {
                 return Poll::Ready(Ok(0));
@@ -1113,6 +1108,7 @@ mod tests {
                 this.pending.push(buf.to_vec());
                 Poll::Ready(Ok(buf.len()))
             }
+
             fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
                 let this = self.get_mut();
                 loop {
@@ -1139,6 +1135,7 @@ mod tests {
                     }
                 }
             }
+
             fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
                 Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
             }
@@ -1342,6 +1339,7 @@ mod tests {
                 this.blocked = true; // 首推即撞背压（真实栈：write_io WouldBlock）
                 Poll::Ready(Ok(buf.len()))
             }
+
             fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
                 let this = self.get_mut();
                 if this.unblock {
@@ -1354,6 +1352,7 @@ mod tests {
                     Poll::Pending
                 }
             }
+
             fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
                 self.poll_flush(cx)
             }
@@ -1474,9 +1473,11 @@ mod tests {
             pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
         };
         use tokio_rustls::TlsConnector;
-        use xray_transport::TlsAcceptor;
-        use xray_transport::connection::dup_tcp_stream;
-        use xray_transport::rustls::{ClientConfig, ServerConfig};
+        use xray_transport::{
+            TlsAcceptor,
+            connection::dup_tcp_stream,
+            rustls::{ClientConfig, ServerConfig},
+        };
 
         fn rec(payload: &[u8]) -> Vec<u8> {
             let mut v = vec![0x17, 0x03, 0x03, (payload.len() >> 8) as u8, payload.len() as u8];
@@ -1508,6 +1509,7 @@ mod tests {
             ) -> Result<ServerCertVerified, rustls::Error> {
                 Ok(ServerCertVerified::assertion())
             }
+
             fn verify_tls12_signature(
                 &self,
                 _message: &[u8],
@@ -1516,6 +1518,7 @@ mod tests {
             ) -> Result<HandshakeSignatureValid, rustls::Error> {
                 Ok(HandshakeSignatureValid::assertion())
             }
+
             fn verify_tls13_signature(
                 &self,
                 _message: &[u8],
@@ -1524,6 +1527,7 @@ mod tests {
             ) -> Result<HandshakeSignatureValid, rustls::Error> {
                 Ok(HandshakeSignatureValid::assertion())
             }
+
             fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
                 vec![SignatureScheme::RSA_PKCS1_SHA256, SignatureScheme::ECDSA_NISTP256_SHA256]
             }
@@ -1651,9 +1655,11 @@ mod tests {
             pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
         };
         use tokio_rustls::TlsConnector;
-        use xray_transport::TlsAcceptor;
-        use xray_transport::connection::dup_tcp_stream;
-        use xray_transport::rustls::{ClientConfig, ServerConfig};
+        use xray_transport::{
+            TlsAcceptor,
+            connection::dup_tcp_stream,
+            rustls::{ClientConfig, ServerConfig},
+        };
 
         fn rec(payload: &[u8]) -> Vec<u8> {
             let mut v = vec![0x17, 0x03, 0x03, (payload.len() >> 8) as u8, payload.len() as u8];
@@ -1685,6 +1691,7 @@ mod tests {
             ) -> Result<ServerCertVerified, rustls::Error> {
                 Ok(ServerCertVerified::assertion())
             }
+
             fn verify_tls12_signature(
                 &self,
                 _message: &[u8],
@@ -1693,6 +1700,7 @@ mod tests {
             ) -> Result<HandshakeSignatureValid, rustls::Error> {
                 Ok(HandshakeSignatureValid::assertion())
             }
+
             fn verify_tls13_signature(
                 &self,
                 _message: &[u8],
@@ -1701,6 +1709,7 @@ mod tests {
             ) -> Result<HandshakeSignatureValid, rustls::Error> {
                 Ok(HandshakeSignatureValid::assertion())
             }
+
             fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
                 vec![SignatureScheme::RSA_PKCS1_SHA256, SignatureScheme::ECDSA_NISTP256_SHA256]
             }
@@ -1833,16 +1842,17 @@ mod tests {
         use std::sync::Arc;
 
         use rand::{Rng, SeedableRng};
-
         use rustls::{
             DigitallySignedStruct, SignatureScheme,
             client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
             pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
         };
         use tokio_rustls::TlsConnector;
-        use xray_transport::TlsAcceptor;
-        use xray_transport::connection::dup_tcp_stream;
-        use xray_transport::rustls::{ClientConfig, ServerConfig};
+        use xray_transport::{
+            TlsAcceptor,
+            connection::dup_tcp_stream,
+            rustls::{ClientConfig, ServerConfig},
+        };
 
         const CHUNKS: usize = 640;
         const CHUNK: usize = 8192;
@@ -1861,6 +1871,7 @@ mod tests {
             ) -> Result<ServerCertVerified, rustls::Error> {
                 Ok(ServerCertVerified::assertion())
             }
+
             fn verify_tls12_signature(
                 &self,
                 _message: &[u8],
@@ -1869,6 +1880,7 @@ mod tests {
             ) -> Result<HandshakeSignatureValid, rustls::Error> {
                 Ok(HandshakeSignatureValid::assertion())
             }
+
             fn verify_tls13_signature(
                 &self,
                 _message: &[u8],
@@ -1877,6 +1889,7 @@ mod tests {
             ) -> Result<HandshakeSignatureValid, rustls::Error> {
                 Ok(HandshakeSignatureValid::assertion())
             }
+
             fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
                 vec![SignatureScheme::RSA_PKCS1_SHA256, SignatureScheme::ECDSA_NISTP256_SHA256]
             }
@@ -1958,10 +1971,8 @@ mod tests {
                         return;
                     }
                     let _ = fw.flush().await;
-                    tokio::time::sleep(std::time::Duration::from_micros(
-                        rng.gen_range(80..=400),
-                    ))
-                    .await;
+                    tokio::time::sleep(std::time::Duration::from_micros(rng.gen_range(80..=400)))
+                        .await;
                     off += piece;
                 }
             }
@@ -2009,11 +2020,7 @@ mod tests {
                 Ok(Ok(n)) if n > 0 => n,
                 Ok(Ok(_)) => panic!("[chop][cli] premature EOF at {}/{}", got.len(), TOTAL),
                 Ok(Err(e)) => panic!("[chop][cli] io error at {}: {e}", got.len()),
-                Err(_) => panic!(
-                    "[chop][cli] single-read 15s deadline at {}/{}",
-                    got.len(),
-                    TOTAL
-                ),
+                Err(_) => panic!("[chop][cli] single-read 15s deadline at {}/{}", got.len(), TOTAL),
             };
             got.extend_from_slice(&buf[..n]);
         }

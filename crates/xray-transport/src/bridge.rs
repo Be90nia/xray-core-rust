@@ -200,11 +200,8 @@ where
         // bd VISIONMAC：TLS 隧道场景须 flush+shutdown 排空滞留尾巴（同
         // bridge_link_with_stream_full down_writer 注释）；pipe 场景默认
         // 实现退化为 shutdown() EOF 信号，行为不变。
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            writer.shutdown_flush(),
-        )
-        .await;
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(3), writer.shutdown_flush()).await;
         io::Result::Ok(())
     };
     tokio::pin!(up, down);
@@ -577,11 +574,8 @@ where
         };
         // bd VISIONMAC：同 full 变体——收尾 flush+shutdown 排空 TLS 层滞留
         // 尾巴（splice 已 arm 时 VisionConn 走 raw 分支半关闭，安全）。
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            writer.shutdown_flush(),
-        )
-        .await;
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(3), writer.shutdown_flush()).await;
         let _ = down_done_tx.send(Some(downlink_only));
         res.map(|_| ())
     };
@@ -654,11 +648,8 @@ pub async fn bridge_link_with_link(
             }
         }
         // bd VISIONMAC：TLS 链路场景须 flush+shutdown 排空滞留尾巴。
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            b_writer.shutdown_flush(),
-        )
-        .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), b_writer.shutdown_flush())
+            .await;
         let _ = up_done_tx.send(Some(uplink_only));
         io::Result::Ok(())
     };
@@ -697,11 +688,8 @@ pub async fn bridge_link_with_link(
                 _ => break,
             }
         }
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            a_writer.shutdown_flush(),
-        )
-        .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), a_writer.shutdown_flush())
+            .await;
         let _ = down_done_tx.send(Some(downlink_only));
         io::Result::Ok(())
     };
@@ -937,9 +925,9 @@ mod tests {
 
         use parking_lot::Mutex;
         use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+        use xray_buf::io::Writer as _;
 
         use crate::link::Link;
-        use xray_buf::io::Writer as _;
 
         /// 「TLS 层」mock：写半收下的字节滞留 sendable，flush/shutdown 才上线。
         #[derive(Clone)]
@@ -958,11 +946,13 @@ mod tests {
                 self.sendable.lock().extend_from_slice(buf);
                 Poll::Ready(Ok(buf.len()))
             }
+
             fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
                 let mut sendable = self.sendable.lock();
                 self.wire.lock().append(&mut sendable);
                 Poll::Ready(Ok(()))
             }
+
             fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
                 self.shutdown_seen.store(true, Ordering::SeqCst);
                 Self::poll_flush(self, cx)
@@ -999,9 +989,11 @@ mod tests {
             ) -> Poll<io::Result<usize>> {
                 Pin::new(&mut self.tls).poll_write(cx, buf)
             }
+
             fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
                 Pin::new(&mut self.tls).poll_flush(cx)
             }
+
             fn poll_shutdown(
                 mut self: Pin<&mut Self>,
                 cx: &mut Context<'_>,
@@ -1013,6 +1005,7 @@ mod tests {
             fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
                 Ok(None)
             }
+
             fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
                 Ok(None)
             }

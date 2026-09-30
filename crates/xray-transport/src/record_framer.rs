@@ -138,7 +138,11 @@ impl<S: AsyncRead + Unpin> AsyncRead for RecordFramer<S> {
             other => {
                 if std::env::var("XRAY_FRDBG").is_ok() {
                     if let Poll::Pending = other {
-                        eprintln!("[FRDBG:{}MS] body Pending rem={}", micros(), this.body_remaining);
+                        eprintln!(
+                            "[FRDBG:{}MS] body Pending rem={}",
+                            micros(),
+                            this.body_remaining
+                        );
                     }
                 }
                 return other;
