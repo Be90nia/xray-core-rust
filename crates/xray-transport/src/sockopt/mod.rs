@@ -292,8 +292,9 @@ pub struct SocketOptions {
     /// （字段 17，JSON `tcpMaxSeg`）。仅 Linux 应用（sockopt_linux.go:58-62）。
     /// `0`=不设置。
     pub tcp_max_seg: i32,
-    /// SO_RCVBUF 接收缓冲（字节）。JSON `receiveBufferSize`。`0`=不设置（默认，
-    /// 内核 DRC 自动调节）。**Go `SocketConfig` 无此字段**（v26.9.9 config.proto
+    /// SO_RCVBUF 接收缓冲（字节）。JSON `receiveBufferSize`。`0`=TCP 路径取
+    /// [`TCP_RCVBUF_DEFAULT`]（4MB，bd 88m0 默认）。
+    /// **Go `SocketConfig` 无此字段**（v26.9.9 config.proto
     /// 全字段核对），本仓库 opt-in 运维扩展：显式设置即锁定该 socket 的内核接收
     /// 窗自动调节（Linux `SOCK_RCVBUF_LOCK`，通告窗上限=值×2 字节记账），用于高
     /// BDP 链路下转发应用消费过快致 rcvbuf 恒空、DRC 无扩窗信号的窗死锁。
@@ -391,6 +392,17 @@ impl Default for SocketOptions {
     }
 }
 
+/// TCP 出站/入站 SO_RCVBUF 缺省值（字节；内核记账翻倍 → 通告窗约 8MB）。
+///
+/// bd 88m0（862340ff/7p1m 接收侧同族，下载方向孪生）：内核 DRS
+/// （tcp_moderate_rcvbuf）对「快排空 relay」结构性自稳定——收端即时排空 →
+/// 接收队列恒空 → rcv_rtt=真实 RTT、space=窗字节数 → rcvbuf 目标恒等于当前值，
+/// autotune 永不逃逸 → 接收窗钉死 ~64KB、高 RTT 吞吐=窗/RTT（VPS netem 实测
+/// 413-433KB/s，出生掷签 ~25%；Go 对照同拓扑 10/10 全净靠运行时调度偶然逃逸）。
+/// 显式 4MB 锁定窗上限，为记账上限非预分配，空闲连接零内存代价。显式
+/// `receiveBufferSize` 配置优先于本默认。
+pub(crate) const TCP_RCVBUF_DEFAULT: i32 = 4 * 1024 * 1024;
+
 /// 把 [`SocketOptions`] 应用到已建立的 [`Socket`]（TCP 专用）。
 ///
 /// 对应 Go `applyOutboundSocketOptions`（sockopt_linux.go:16-111 / freebsd.go:127-178
@@ -405,7 +417,8 @@ impl Default for SocketOptions {
 /// - Darwin：TFO_CLIENT 位 / SO_REUSEPORT / IP_BOUND_IF / IPV6_BOUND_IF / TCP_KEEPALIVE-KEEPINTVL
 /// - Windows：Winsock TCP_FASTOPEN=15 / IP_UNICAST_IF / IPV6_UNICAST_IF
 ///
-/// 把 [`SocketOptions`] 应用到已建立的 [`Socket`]（TCP 专用）。
+/// SO_RCVBUF 缺省值见 [`TCP_RCVBUF_DEFAULT`]；显式 `receiveBufferSize` 优先
+/// （因此 `SocketOptions::default()` 会设置 4MB 接收缓冲——非零副作用，见常量文档）。
 pub fn apply_outbound_socket_options(
     socket: &Socket,
     opts: &SocketOptions,
@@ -417,12 +430,17 @@ pub fn apply_outbound_socket_options(
     if opts.ipv6_only {
         socket.set_only_v6(true)?;
     }
-    // SO_RCVBUF（opt-in，`receiveBufferSize`）：accept/dial 路径共用；显式值锁定
-    // 内核接收窗自动调节（Linux SOCK_RCVBUF_LOCK）。socket2 跨平台（unix SO_RCVBUF /
-    // Winsock SO_RCVBUF），0=跳过。
-    if opts.receive_buffer_size > 0 {
-        socket.set_recv_buffer_size(opts.receive_buffer_size as usize)?;
-    }
+    // SO_RCVBUF：显式 `receiveBufferSize` 优先；缺省 TCP 默认 4MB（bd 88m0，
+    // 862340ff/7p1m 接收侧同族——内核 DRS 对快排空 relay 结构性自稳定，接收窗
+    // 钉死 ~64KB、高 RTT 吞吐=窗/RTT，见 [`TCP_RCVBUF_DEFAULT`]）。显式设置
+    // 锁定内核接收窗自动调节（Linux SOCK_RCVBUF_LOCK），socket2 跨平台
+    // （unix/Winsock SO_RCVBUF）。
+    let rcvbuf = if opts.receive_buffer_size > 0 {
+        opts.receive_buffer_size
+    } else {
+        TCP_RCVBUF_DEFAULT
+    };
+    socket.set_recv_buffer_size(rcvbuf as usize)?;
     // SO_KEEPALIVE + TCP_KEEPIDLE/TCP_KEEPINTVL（Go KeepAliveConfig 语义，见
     // [`set_keepalive_config`]）。Darwin 平台 keepalive 走 darwin 模块自带逻辑。
     set_keepalive_config(socket, opts)?;
@@ -512,11 +530,16 @@ pub fn apply_inbound_socket_options(socket: &Socket, opts: &SocketOptions) -> st
         socket.set_only_v6(true)?;
     }
     set_keepalive_config(socket, opts)?;
-    // SO_RCVBUF（opt-in，`receiveBufferSize`）：per-accept 设置——Linux accept 出的
-    // 连接不继承 listener 的 SO_RCVBUF 锁定语义，必须在连接 socket 上显式设。
-    if opts.receive_buffer_size > 0 {
-        socket.set_recv_buffer_size(opts.receive_buffer_size as usize)?;
-    }
+    // SO_RCVBUF：per-accept 设置——Linux accept 出的连接不继承 listener 的
+    // SO_RCVBUF 锁定语义，必须在连接 socket 上显式设。显式 `receiveBufferSize`
+    // 优先；缺省 TCP 默认 4MB（bd 88m0，862340ff/7p1m 同族，见
+    // [`TCP_RCVBUF_DEFAULT`]）。
+    let rcvbuf = if opts.receive_buffer_size > 0 {
+        opts.receive_buffer_size
+    } else {
+        TCP_RCVBUF_DEFAULT
+    };
+    socket.set_recv_buffer_size(rcvbuf as usize)?;
 
     #[cfg(target_os = "linux")]
     {
@@ -986,8 +1009,29 @@ mod tests {
         assert!(result.is_ok(), "apply_outbound_socket_options failed: {result:?}");
         // TCP_NODELAY 已设置
         assert_eq!(socket.nodelay().unwrap(), opts.tcp_nodelay);
+        // bd 88m0：缺省 SO_RCVBUF 4MB（内核对值记账翻倍/钳制，回读应 ≥ 设置值）。
+        assert!(
+            socket.recv_buffer_size().unwrap() >= TCP_RCVBUF_DEFAULT as usize,
+            "缺省出站应设 4MB 接收缓冲: got={}",
+            socket.recv_buffer_size().unwrap()
+        );
         drop(socket);
         accept_task.await.unwrap();
+    }
+    #[test]
+    fn outbound_explicit_receive_buffer_size_wins_over_default() {
+        // 显式 receiveBufferSize 优先于缺省 4MB（bd 88m0 回归锁）。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = std::net::TcpStream::connect(addr).unwrap();
+        let socket = socket2::Socket::from(stream);
+        let opts = SocketOptions { receive_buffer_size: 1 * 1024 * 1024, ..SocketOptions::default() };
+        apply_outbound_socket_options(&socket, &opts, None).unwrap();
+        assert!(
+            socket.recv_buffer_size().unwrap() < TCP_RCVBUF_DEFAULT as usize,
+            "显式 1MB 不应被缺省 4MB 覆盖: got={}",
+            socket.recv_buffer_size().unwrap()
+        );
     }
     #[test]
     fn default_socket_options_match_chrome_defaults() {
@@ -1179,7 +1223,7 @@ mod tests {
     /// 并回读放大；默认 0 不触碰 socket（回读=内核默认）。未连接 TCP socket 即可
     /// 验证（SO_RCVBUF 是 socket 层选项，与连接状态无关）。
     #[test]
-    fn receive_buffer_size_applies_and_defaults_off() {
+    fn receive_buffer_size_applies_and_defaults_4mb() {
         let make = || {
             socket2::Socket::new(
                 socket2::Domain::IPV4,
@@ -1211,10 +1255,23 @@ mod tests {
             rcvbuf(&out)
         );
 
-        // 默认 0：不设置（apply 全程在 default SocketOptions 上无副作用通过）。
+        // 默认 0：TCP 路径取 4MB 缺省（bd 88m0——DRS 对快排空 relay 自稳定钉死
+        // 接收窗 ~64KB，窗/RTT 吞吐；显式设置锁窗为记账上限，内核翻倍记账）。
         let off = make();
         apply_inbound_socket_options(&off, &SocketOptions::default()).unwrap();
-        assert_eq!(rcvbuf(&off), default_rcv, "默认 0 不应触碰 SO_RCVBUF");
+        assert!(
+            rcvbuf(&off) >= TCP_RCVBUF_DEFAULT as usize,
+            "默认 0 应设 4MB 接收缓冲: got={} want>={}",
+            rcvbuf(&off),
+            TCP_RCVBUF_DEFAULT
+        );
+        let off_out = make();
+        apply_outbound_socket_options(&off_out, &SocketOptions::default(), None).unwrap();
+        assert!(
+            rcvbuf(&off_out) >= TCP_RCVBUF_DEFAULT as usize,
+            "默认 0 出站同上: got={}",
+            rcvbuf(&off_out)
+        );
     }
 
     // ===== QUIC 系 UDP 端点缓冲（Go quic-go wrapConn parity，PM 拍板方案 C）=====

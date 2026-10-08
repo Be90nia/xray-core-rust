@@ -270,8 +270,8 @@ impl StreamSettings {
             opts.tcp_user_timeout = v as i32;
         }
         // receiveBufferSize（SO_RCVBUF 字节；本仓库 opt-in 扩展，Go `SocketConfig`
-        // 无此字段——JSON 命名对齐 Go camelCase 风格）。0=不设置（默认，内核
-        // DRC 自动调节）。见 [`SocketOptions::receive_buffer_size`]。
+        // 无此字段——JSON 命名对齐 Go camelCase 风格）。0/缺省=TCP 路径取
+        // 4MB 默认（bd 88m0，见 [`SocketOptions::receive_buffer_size`]）。
         if let Some(v) = obj.get("receiveBufferSize").and_then(|v| v.as_i64()) {
             opts.receive_buffer_size = v as i32;
         }
