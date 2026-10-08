@@ -11,7 +11,7 @@
 //!   - `aead`：KDF（嵌套 HMAC-SHA256）+ `CreateAuthID`（AES-128 单块）+ `Seal/Open VMess AEAD
 //!     Header` + `AuthIDDecoderHolder`（含反重放）
 //!   - `validator`：`TimedUserValidator` 整合 AuthIDDecoderHolder + behaviorSeed
-//!   - `encoding::auth`：`Authenticate`（FNV1a）+ `GenerateChacha20Poly1305Key` +
+//!     `encoding::auth`：`Authenticate`（FNV1a）+ `GenerateChacha20Poly1305Key` +
 //!     `GenerateChunkNonce` + `ShakeSizeParser` + `AEADSizeParser`
 //!   - `encoding::server`：`ServerSession::DecodeRequestHeader`（AEAD 完整）+ `SessionHistory`
 //!
@@ -21,6 +21,10 @@
 //!   - `inbound`/`outbound`：Handler `Process` 主入口依赖 `transport::Link` 全链路
 //!
 //! 等上层 buf chunk 加密包装链 + transport 接入后，注入 trait 实现即可激活。
+
+// async-trait 展开对 trait 脱糖方法加 #[must_use]（其 expand.rs:69），clippy 1.99 起
+// 将 Pin<Box<dyn Future>> 判为已 must_use → double_must_use 误报；宏行为非本 crate 可控。
+#![allow(clippy::double_must_use)]
 
 pub mod account;
 pub mod aead;

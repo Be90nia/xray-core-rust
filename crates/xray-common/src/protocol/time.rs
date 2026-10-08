@@ -63,7 +63,6 @@ pub type TimestampGenerator = Box<dyn Fn() -> Timestamp + Send + Sync>;
 /// 对应 Go 版本的 `NewTimestampGenerator(base, delta)`：
 /// 内部等价于 `dice.Roll(delta*2) - delta`，即 `[0, 2*delta)` 均匀分布再平移。
 /// `delta <= 0` 时恒返回 `base`。
-#[must_use]
 pub fn new_timestamp_generator(base: Timestamp, delta: i64) -> TimestampGenerator {
     let base = base.0;
     if delta <= 0 {

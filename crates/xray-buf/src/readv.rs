@@ -104,12 +104,7 @@ impl AllocStrategy {
     /// 对应 Go `Adjust(n)`（readv_reader.go:23-37）。
     pub fn adjust(&mut self, n: u32) {
         self.current = if n >= self.current { self.current * 2 } else { n };
-        if self.current > 8 {
-            self.current = 8;
-        }
-        if self.current == 0 {
-            self.current = 1;
-        }
+        self.current = self.current.clamp(1, 8);
     }
 }
 

@@ -1966,13 +1966,15 @@ mod tests {
                 };
                 let mut off = 0;
                 while off < n {
-                    let piece = rng.gen_range(200..=3000).min(n - off);
+                    let piece = rng.random_range(200..=3000).min(n - off);
                     if fw.write_all(&buf[off..off + piece]).await.is_err() {
                         return;
                     }
                     let _ = fw.flush().await;
-                    tokio::time::sleep(std::time::Duration::from_micros(rng.gen_range(80..=400)))
-                        .await;
+                    tokio::time::sleep(std::time::Duration::from_micros(
+                        rng.random_range(80..=400),
+                    ))
+                    .await;
                     off += piece;
                 }
             }
@@ -2045,7 +2047,8 @@ mod tests {
         impl<V> crate::encryption::vision_conn::InnerRawClone for ConnShim<V> {}
         let cvision_box: Box<dyn xray_transport::connection::Connection> =
             Box::new(ConnShim(cvision));
-        let bridge = tokio::spawn(async move {
+        // 桥任务独立运行，测试以读侧进度判定，JoinHandle 即弃（detached）。
+        tokio::spawn(async move {
             let policy = xray_features::policy::TimeoutPolicy::default();
             xray_transport::bridge::bridge_link_with_stream_full(link, cvision_box, &policy).await
         });

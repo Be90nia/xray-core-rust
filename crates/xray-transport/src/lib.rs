@@ -11,6 +11,7 @@
 //! - `dialer::Dialer` trait（仅声明，无实现）
 //! - `stat::CounterConnection` 字节计数包装器
 //!
+
 //! ## 未实现（留 stub）
 //! `sockopt` / `tcp` / `udp` / `headers` / `finalmask` / `pipe` / `config` /
 //! `filelocker` / `browser_dialer` / `tagged` / `memory_settings`
@@ -18,6 +19,10 @@
 //! `policy.BufferPolicyFromContext` / 平台特定 syscall，留待具体传输实现 crate 处理。
 //!
 //! 参考：Go 版本位于 `E:\Projcet\Xray-core\transport\`。
+
+// async-trait 展开对 trait 脱糖方法加 #[must_use]（其 expand.rs:69），clippy 1.99 起
+// 将 Pin<Box<dyn Future>> 判为已 must_use → double_must_use 误报；宏行为非本 crate 可控。
+#![allow(clippy::double_must_use)]
 
 pub mod bridge;
 pub mod cnc;

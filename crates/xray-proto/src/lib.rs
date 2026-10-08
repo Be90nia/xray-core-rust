@@ -1,3 +1,7 @@
+// 生成代码（tonic server traits）经 async-trait 脱糖后带 #[must_use]，clippy 1.99 起
+// double_must_use 命中；仅本 crate（纯 include! 生成物）豁免。
+#![allow(clippy::double_must_use)]
+
 pub mod xray {
     pub mod common {
         pub mod net {
