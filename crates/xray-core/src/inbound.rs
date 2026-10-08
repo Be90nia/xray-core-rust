@@ -2180,9 +2180,9 @@ fn parse_reality_config(
     let parse_ver =
         |s: &str| -> Vec<u8> { s.split('.').filter_map(|p| p.trim().parse::<u8>().ok()).collect() };
     let min_client_ver =
-        json.get("minClientVer").and_then(|x| x.as_str()).map(&parse_ver).unwrap_or_default();
+        json.get("minClientVer").and_then(|x| x.as_str()).map(parse_ver).unwrap_or_default();
     let max_client_ver =
-        json.get("maxClientVer").and_then(|x| x.as_str()).map(&parse_ver).unwrap_or_default();
+        json.get("maxClientVer").and_then(|x| x.as_str()).map(parse_ver).unwrap_or_default();
 
     Ok(RealityInboundConfig {
         server_private_key: key,

@@ -5,6 +5,10 @@
 //!
 //! 所有 trait 都是 `Send + Sync`，约定 Xray 多线程运行时安全共享。
 
+// async-trait 展开对每个脱糖方法加 #[must_use]（其 expand.rs:69），clippy 1.99 起
+// 将 Pin<Box<dyn Future>> 判为已 must_use → double_must_use 误报；宏行为非本 crate 可控。
+#![allow(clippy::double_must_use)]
+
 pub mod dns;
 pub mod extension;
 pub mod feature;

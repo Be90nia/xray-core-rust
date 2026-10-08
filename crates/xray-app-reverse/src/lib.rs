@@ -15,6 +15,10 @@
 //! - [`timer::InactivityTimer`]：Go `signal.CancelAfterInactivity` 等价 （含 `SetTimeout`
 //!   语义；xray_common 版无 set_timeout/terminate 回调）
 
+// async-trait 展开对 trait 脱糖方法加 #[must_use]（其 expand.rs:69），clippy 1.99 起
+// 将 Pin<Box<dyn Future>> 判为已 must_use → double_must_use 误报；宏行为非本 crate 可控。
+#![allow(clippy::double_must_use)]
+
 pub mod bridge;
 pub mod config;
 pub mod error;
