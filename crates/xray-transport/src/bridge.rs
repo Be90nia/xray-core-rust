@@ -442,11 +442,16 @@ where
 
     // 下行 writer：down_rx → link.writer（xray_buf Writer 管线，自带池化）。
     let down_writer = async move {
+        let mut dw_bytes: u64 = 0;
         while let Some(mb) = down_rx.recv().await {
             if p7lm_trace {
                 tracing::warn!(target: "p7lm", bytes = mb.len(), phase = "down_write", "");
             }
+            dw_bytes += mb.len() as u64;
             if writer.write_multi_buffer(mb).await.is_err() {
+                if p7lm_trace {
+                    eprintln!("[P7LM-DW] write err at total={dw_bytes}B");
+                }
                 break;
             }
         }
@@ -458,8 +463,19 @@ where
         // 半条记录上永久 Pending，直到 FIN → "peer closed without
         // close_notify" 断链截断（VPS netem r6 实锤滞留 65,383B =
         // sendable_tls 64KB 上限）。Go 无此坑：internalClose 链显式
+        if p7lm_trace {
+            eprintln!("[P7LM-DW] drain done total={dw_bytes}B, shutdown_flush begin");
+        }
+        let flush_res = timeout(std::time::Duration::from_secs(3), writer.shutdown_flush()).await;
+        if p7lm_trace {
+            match &flush_res {
+                Ok(Ok(())) => eprintln!("[P7LM-DW] shutdown_flush ok total={dw_bytes}B"),
+                Ok(Err(e)) => eprintln!("[P7LM-DW] shutdown_flush ERR total={dw_bytes}B: {e}"),
+                Err(_) => eprintln!("[P7LM-DW] shutdown_flush TIMEOUT(3s) total={dw_bytes}B"),
+            }
+        }
+        let _ = flush_res;
         // CloseWrite+排空。3s 上限防极端积压下收尾挂死（连接本就在收尾）。
-        let _ = timeout(std::time::Duration::from_secs(3), writer.shutdown_flush()).await;
         io::Result::Ok(())
     };
 

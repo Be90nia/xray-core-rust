@@ -2056,6 +2056,30 @@ mod tests {
         let mut got: Vec<u8> = Vec::with_capacity(TOTAL);
         let mut buf = [0u8; 16384];
         let mut reads = 0usize;
+        let macro_every: usize = std::env::var("XRAY_STALL_MACRO_EVERY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(40);
+        let macro_ms: u64 = std::env::var("XRAY_STALL_MACRO_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(150);
+        let macro_seed: u64 = std::env::var("XRAY_STALL_SEED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let macro_seed = if macro_seed == 0 {
+            let s = (std::process::id() as u64) << 32
+                | std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos() as u64)
+                    .unwrap_or(0);
+            eprintln!("[chop][cli] macro seed (time-derived) = {s}");
+            s
+        } else {
+            macro_seed
+        };
+        let mut macro_rng = StdRng::seed_from_u64(macro_seed);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
         while got.len() < TOTAL {
             if tokio::time::Instant::now() >= deadline {
@@ -2067,11 +2091,15 @@ mod tests {
                 );
             }
             reads += 1;
-            // 宏背压：周期性 150ms 停读——对齐 VPS netem RTT 窗口效应
+            // 宏背压：周期性停读——对齐 VPS netem RTT 窗口效应
             //（接收窗关闭 → 服务端 write_io 撞 WouldBlock → 单条记录被
             // 分段写出 → 客户端线缆出现跨段半记录）。
-            if reads % 40 == 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            // 88m0 复现加压旋钮（缺省=原 40/150 行为）：XRAY_STALL_MACRO_EVERY
+            // 控制停读周期，XRAY_STALL_MACRO_MS 控制停读基准时长（±50% 抖动），
+            // XRAY_STALL_SEED 固定抖动种子（0=时间+pid 每轮独立抽样，启动时打印）。
+            if reads % macro_every == 0 {
+                let ms = macro_rng.random_range(macro_ms / 2..=macro_ms + macro_ms / 2);
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
             }
             let read = tokio::time::timeout(
                 std::time::Duration::from_secs(15),
