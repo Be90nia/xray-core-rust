@@ -30,6 +30,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- VLESS Vision 高 RTT 链路吞吐塌缩（bd 88m0）：TCP 缺省 SO_RCVBUF 4MB 根治下载收侧内核 DRS 自稳定钉窗（862340ff 同族孪生）——接收窗出生掷签钉 ~64KB 致吞吐=窗/RTT（433KB/s 锁步、~25% 连接命中），VPS netem 20 轮 25% 异常→20/20 全净且整体提速；显式 `receiveBufferSize` 优先（`3e755458`）
+- VLESS Vision 下载截断（TRUNC）：桥下行收尾 flush+shutdown 写半——TLS BufWriter 滞留尾巴随 drop 蒸发，VPS A/B 5/20→0/26 实证（`61ba8fc1`）
 - mux 帧编码 `Network::Unix` 目标远程可达 panic → 显式 `Err`（对齐 Go 无 panic 路径）
 - VLESS 0-RTT `handshake_zero_rtt` 会话 TOCTOU expect panic → miss 语义显式拒绝（`expired ticket`）
 - vless 入站 UDP relay 串行挂死（WSLEAK，生产 443 CLOSE-WAIT 泄漏根因）：改 uplink 独立 task + `select!` 双方向并发泵 + 滑动 idle deadline + 客户端 EOF 结束会话（对齐 vmess `pump_udp_session` 与 Go `inbound.go:416` ActivityTimer），UDP 目标不回包不再阻塞读客户端
