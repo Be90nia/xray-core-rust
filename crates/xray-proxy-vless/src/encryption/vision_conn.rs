@@ -1993,7 +1993,63 @@ mod tests {
         cvision.downlink_traffic.is_tls = false;
         cvision.downlink_traffic.is_tls12_or_above = false;
 
-        let (mut cr, _cw) = tokio::io::split(cvision);
+        // 生产形态客户端读路径：curl 侧 duplex + 真 bridge（mpsc 64 + 超时窗 +
+        // BiLock split）——手工读循环换下，复刻 VPS 停摆的调用形态。
+        let (mut fake_client, curl_io) = tokio::io::duplex(64 * 1024);
+        let (curl_rd, curl_wr) = tokio::io::split(curl_io);
+        let link = xray_transport::link::Link::new(
+            xray_buf::io::new_reader(curl_rd),
+            xray_buf::io::new_writer(curl_wr),
+        );
+        // Join<ReadHalf,WriteHalf> 不实现 Connection（VisionConn<C: Connection>
+        // 约束）——测试侧薄 shim 透传 AsyncRead/Write，语义与生产 Box<dyn> 路径一致。
+        struct ConnShim<V>(V);
+        impl<V: AsyncRead + Unpin> AsyncRead for ConnShim<V> {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.0).poll_read(cx, buf)
+            }
+        }
+        impl<V: AsyncWrite + Unpin> AsyncWrite for ConnShim<V> {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Pin::new(&mut self.0).poll_write(cx, buf)
+            }
+            fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.0).poll_flush(cx)
+            }
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.0).poll_shutdown(cx)
+            }
+        }
+        use std::net::SocketAddr;
+        impl<V: AsyncRead + AsyncWrite + Send + Sync + Unpin> xray_transport::connection::Connection
+            for ConnShim<V>
+        {
+            fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+            fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+        }
+        impl<V> crate::encryption::vision_conn::InnerRawClone for ConnShim<V> {}
+        let cvision_box: Box<dyn xray_transport::connection::Connection> =
+            Box::new(ConnShim(cvision));
+        let bridge = tokio::spawn(async move {
+            let policy = xray_features::policy::TimeoutPolicy::default();
+            xray_transport::bridge::bridge_link_with_stream_full(link, cvision_box, &policy).await
+        });
+
         let mut got: Vec<u8> = Vec::with_capacity(TOTAL);
         let mut buf = [0u8; 16384];
         let mut reads = 0usize;
@@ -2014,8 +2070,11 @@ mod tests {
             if reads % 40 == 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
             }
-            let read =
-                tokio::time::timeout(std::time::Duration::from_secs(15), cr.read(&mut buf)).await;
+            let read = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                fake_client.read(&mut buf),
+            )
+            .await;
             let n = match read {
                 Ok(Ok(n)) if n > 0 => n,
                 Ok(Ok(_)) => panic!("[chop][cli] premature EOF at {}/{}", got.len(), TOTAL),

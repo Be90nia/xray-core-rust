@@ -1020,7 +1020,7 @@ mod tests {
         // stream = 出站侧（freedom mock）：读半吐响应后 EOF，写半不用。
         let stream = TunnelConn { data: response.clone(), pos: 0, tls: tls.clone() };
 
-        let (up_r, mut up_w) = xray_buf::pipe::new();
+        let (up_r, up_w) = xray_buf::pipe::new();
         // link.writer = SequentialWriter(WriteHalf<TunnelConn 写半>)——生产装配
         // 同形（server.rs: new_writer(split(vision) 写半)）。下行数据
         // stream→down_writer→link.writer→TLS mock（滞留→teardown 排空）。
