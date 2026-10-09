@@ -336,7 +336,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     /// 「有 payload 或有 padding」）。无待发状态时 no-op。
     ///
     /// # Errors
-    /// - 透传 [`Self::emit_pending_client_2022`] 错误。
+    /// - 透传 `Self::emit_pending_client_2022` 错误。
     pub async fn flush_pending_client_2022(&mut self) -> Result<()> {
         if self.pending_client_2022.is_none() {
             return Ok(());
