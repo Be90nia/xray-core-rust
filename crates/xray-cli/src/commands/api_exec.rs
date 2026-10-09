@@ -493,7 +493,7 @@ pub async fn execute_restart_logger(args: &RestartLoggerArgs) -> Result<(), CliE
 ///
 /// 对应 Go `inbound_user_add.go::executeAddInboundUsers` + `extractInboundUsers`：
 /// 配置文件为标准 xray config JSON，每个 inbound 的 `settings.clients` (vmess) /
-/// `settings.clients` (vless/trojan) / `settings.users` (ss) 作为用户来源。
+/// `settings.clients` (vless/trojan) / `settings.users` (ss/ss2022/hysteria) 作为用户来源。
 pub async fn execute_add_user(args: &AddUserArgs) -> Result<(), CliError> {
     let data = load_config(&args.config)?;
     let inbounds = build_inbound_configs(&data)?;
@@ -755,7 +755,7 @@ pub async fn execute_online_users(args: &OnlineUsersArgs) -> Result<(), CliError
 /// 从标准 xray config JSON 提取每个 inbound 的用户列表。
 ///
 /// 对应 Go `extractInboundUsers` + 各协议的 `Build()`：支持 vmess / vless / trojan / ss /
-/// ss2022。每个用户构造 proto `User { level, email, account: TypedMessage }`。
+/// ss2022 / hysteria。每个用户构造 proto `User { level, email, account: TypedMessage }`。
 fn extract_users_from_inbound(
     ib: &InboundHandlerConfig,
 ) -> Vec<xray_proto::xray::common::protocol::User> {
@@ -768,27 +768,49 @@ fn extract_users_from_inbound(
 
     // vmess/vless/trojan: settings.clients[] = { id, email, level }
     // ss/ss2022:        settings.users[]   = { email, level, password, method?, cipher? }
+    // hysteria:         settings.users[]   = { auth, email, level }（clients 非空覆盖）
     let candidates: &[(&str, &str)] = &[
         ("vmess", "clients"),
         ("vless", "clients"),
         ("trojan", "clients"),
         ("shadowsocks", "users"),
         ("shadowsocks_2022", "users"),
+        ("hysteria", "users"),
     ];
     let mut users = Vec::new();
     for (proto, field) in candidates {
         if !proxy.r#type.contains(proto) {
             continue;
         }
-        let Some(arr) = settings.get(*field).and_then(|v| v.as_array()) else {
+        // Go HysteriaServerConfig.Build：clients 字段在 JSON 中出现（含空数组）→ 覆盖 users。
+        let field = if *proto == "hysteria" {
+            match settings.get("clients").and_then(|v| v.as_array()) {
+                Some(_) => "clients",
+                None => *field,
+            }
+        } else {
+            *field
+        };
+        let Some(arr) = settings.get(field).and_then(|v| v.as_array()) else {
             continue;
         };
         for entry in arr {
             let email = entry.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let level = entry.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let account_json = serde_json::to_vec(entry).unwrap_or_default();
-            let account =
-                TypedMessage { r#type: format!("xray.proxy.{proto}.Account"), value: account_json };
+            // Go hysteria 的 account 类型在 account 子包（proxy/hysteria/account/config.proto），
+            // 载荷 = proto 编码 Account{auth}（infra/conf/hysteria.go:59-63），不走 JSON 透传。
+            let account = if *proto == "hysteria" {
+                let acc = xray_proto::xray::proxy::hysteria::account::Account {
+                    auth: entry.get("auth").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                };
+                TypedMessage {
+                    r#type: "xray.proxy.hysteria.account.Account".to_string(),
+                    value: prost::Message::encode_to_vec(&acc),
+                }
+            } else {
+                let account_json = serde_json::to_vec(entry).unwrap_or_default();
+                TypedMessage { r#type: format!("xray.proxy.{proto}.Account"), value: account_json }
+            };
             users.push(xray_proto::xray::common::protocol::User {
                 level,
                 email,
@@ -863,6 +885,44 @@ mod tests {
         let users = extract_users_from_inbound(&ib);
         assert_eq!(users.len(), 1);
         assert_eq!(users[0].email, "ss@x");
+    }
+
+    #[test]
+    fn extract_hysteria_users_encodes_proto_account() {
+        // Go infra/conf/hysteria.go:59-63：account = proto Account{auth}，
+        // 类型名在 account 子包（proxy/hysteria/account/config.proto）。
+        let ib = inbound_with_settings(
+            "hysteria",
+            serde_json::json!({
+                "users": [{"auth": "tok-1", "email": "hy@x", "level": 2}]
+            }),
+        );
+        let users = extract_users_from_inbound(&ib);
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].email, "hy@x");
+        assert_eq!(users[0].level, 2);
+        let acc = users[0].account.as_ref().unwrap();
+        assert_eq!(acc.r#type, "xray.proxy.hysteria.account.Account");
+        use prost::Message as _;
+        let decoded =
+            xray_proto::xray::proxy::hysteria::account::Account::decode(acc.value.as_slice())
+                .unwrap();
+        assert_eq!(decoded.auth, "tok-1");
+    }
+
+    #[test]
+    fn extract_hysteria_clients_override_users() {
+        // Go HysteriaServerConfig.Build：clients 在 JSON 中出现 → 整体覆盖 users。
+        let ib = inbound_with_settings(
+            "hysteria",
+            serde_json::json!({
+                "users": [{"auth": "stale", "email": "old@x"}],
+                "clients": [{"auth": "tok-2", "email": "new@x"}]
+            }),
+        );
+        let users = extract_users_from_inbound(&ib);
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].email, "new@x");
     }
 
     #[test]
