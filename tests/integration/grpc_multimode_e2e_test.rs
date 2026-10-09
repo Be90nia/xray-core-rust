@@ -9,7 +9,9 @@
 //! Pattern: SOCKS5 inbound + VLESS outbound (over chosen gRPC settings) →
 //! VLESS inbound (server side) + freedom outbound → echo.
 //!
-//! All tests `#[ignore]` — run with `cargo test --test integration_grpc_multimode -- --ignored`.
+//! All tests run by default: `cargo test --test integration_grpc_multimode`.
+//! （历史 known-fail ignore 已随 4817b040 BlockPrivate 回环放行修复拆除；bd
+//! Xray-core-rust-y1hq 收口）
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
