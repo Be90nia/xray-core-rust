@@ -1120,7 +1120,7 @@ fn build_noise_config(settings: &serde_json::Value) -> io::Result<noise::NoiseCo
     let mut items = Vec::new();
     for item in settings.get("noise").and_then(|x| x.as_array()).unwrap_or(&empty) {
         let (rand_min, rand_max) = json_range(item, "rand")?;
-        let is_exp = json_str(item, "type").to_ascii_lowercase() == "exp";
+        let is_exp = json_str(item, "type").eq_ignore_ascii_case("exp");
         // Go：互斥校验先于 exp 分支——exp 的 packet 是 JSON 字符串（原始字节恒非空），
         // 故 type=exp 且 rand.to>0 时 Go 侧必触发互斥错误，此处对齐。
         if rand_max > 0 && is_exp {
