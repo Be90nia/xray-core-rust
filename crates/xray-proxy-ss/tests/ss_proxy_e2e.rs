@@ -38,9 +38,8 @@ fn make_account(ct: CipherType, password: &str) -> MemoryAccount {
 ///    - 裸 TcpStream::connect 拨号到 echo（等价于 freedom outbound 对 IP 目标）
 ///    - 明文转发到 echo，读回 echo 响应
 ///    - SSStream.write_chunk 加密发回客户端
-/// 3. SS 客户端：Client::dial_target（写 IV + 首帧 addr+port）→ write_chunk(payload) → read_chunk
+/// 3. SS 客户端：Client::dial_target_for_proxy（写 IV + 首帧 addr+port）→ write_chunk(payload) → read_chunk
 ///    验证回环
-#[ignore = "known-fail（bd 待登记 P2）：响应方向 IV 缺失——server::read_request 用 new_client 构造服务端流，写响应不带新 IV，而 client dial_target 设了 response_rekey 期待新 IV → AEAD 认证失败。属 SS legacy 响应写路径产品缺陷（生产 handle_conn 走 new_server_body 不受影响），协议专项后拆除"]
 #[tokio::test]
 async fn ss_proxy_to_echo_target_e2e() {
     // ===== 1. echo 目标服务器 =====
@@ -104,9 +103,10 @@ async fn ss_proxy_to_echo_target_e2e() {
         _ => panic!("expected IPv4 echo addr"),
     };
 
-    // dial_target 完成：TCP connect + 写 IV + 写首帧（addr+port）
+    // dial_target_for_proxy 完成：TCP connect + 写 IV + 写首帧（addr+port），
+    // 并标记响应方向 lazy rekey（server 会先写新响应 IV）
     let mut stream =
-        client.dial_target(&Address::IPv4(echo_v4), echo_addr.port()).await.expect("dial_target");
+        client.dial_target_for_proxy(&Address::IPv4(echo_v4), echo_addr.port()).await.expect("dial");
 
     // 写 body chunk
     let payload = b"hello ss e2e!";
