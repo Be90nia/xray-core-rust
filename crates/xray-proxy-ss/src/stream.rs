@@ -316,7 +316,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         Ok(())
     }
 
-    /// SS-2022 客户端请求首写待发状态登记（[`Client2022::dial_target_on`] 调用）。
+    /// SS-2022 客户端请求首写待发状态登记（`Client2022::dial_target_on` 调用）。
     pub fn set_pending_client_2022(
         &mut self,
         prefix: Vec<u8>,
