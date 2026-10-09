@@ -32,6 +32,13 @@ pub enum FeatureError {
     #[error("feature {name} failed to start: {message}")]
     StartFailed { name: &'static str, message: String },
 
+    /// Feature 配置非法（工厂期配置硬错）。对应 Go config `Build()` 硬错
+    /// （如 api.go:24 `API tag can't be empty.`）：`Instance::new_from_built`
+    /// 对其**致命**（Instance 构造失败），区别于 [`FeatureError::StartFailed`]
+    /// （stub 未实现，warn+跳过）。bd onx4。
+    #[error("invalid config for feature {name}: {message}")]
+    ConfigInvalid { name: &'static str, message: String },
+
     /// Feature 关闭失败。聚合所有 feature 的关闭错误时使用。
     #[error("feature {name} failed to close: {message}")]
     CloseFailed { name: &'static str, message: String },

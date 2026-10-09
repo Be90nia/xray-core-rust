@@ -687,6 +687,42 @@ mod tests {
     }
 
     #[test]
+    fn start_from_built_config_hard_error_is_fatal() {
+        // bd onx4：真实配置硬错（ConfigInvalid）= 致命，区别于上方 stub 未实现
+        // （StartFailed）的 warn+跳过。对齐 Go config Build 硬错 →
+        // initInstanceWithConfig 返回错误 → InstanceStart 失败（core/xray.go:196-210）。
+        let factory: FeatureFactory = Arc::new(|_data: &[u8]| {
+            Err(FeatureError::ConfigInvalid {
+                name: "BadConfigFeature",
+                message: "injected config error".into(),
+            })
+        });
+        let _ = registry::register_feature("xray.test.config_invalid", factory);
+
+        let mut built = xray_conf::BuiltConfig::default();
+        built.apps.push(xray_conf::BuiltEntry {
+            kind: "xray.test.config_invalid".into(),
+            data: b"{}".to_vec(),
+        });
+        let err = start_from_built(&built).err().expect("config hard error must be fatal");
+        assert!(matches!(err, CoreFunctionError::InstanceInit(_)), "{err:?}");
+        assert!(err.to_string().contains("injected config error"), "{err}");
+    }
+
+    #[test]
+    fn start_from_built_api_tag_empty_is_fatal() {
+        // bd onx4：真实 commander factory 的 `API tag can't be empty.`（Go api.go:24
+        // Build 硬错）必须启动期致命，而非 warn+跳过把失败推迟到 connect 期。
+        let mut built = xray_conf::BuiltConfig::default();
+        built
+            .apps
+            .push(xray_conf::BuiltEntry { kind: "api".into(), data: br#"{"tag":""}"#.to_vec() });
+        let err = start_from_built(&built).err().expect("api tag empty must be fatal");
+        assert!(matches!(err, CoreFunctionError::InstanceInit(_)), "{err:?}");
+        assert!(err.to_string().contains("API tag can't be empty"), "{err}");
+    }
+
+    #[test]
     fn start_from_built_multiple_apps_in_order() {
         let order = StdArc::new(parking_lot::Mutex::new(Vec::new()));
         struct OrderedFeature {
