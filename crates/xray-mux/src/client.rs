@@ -1286,6 +1286,84 @@ mod tests {
         assert!(dispatch_task.await.expect("join"), "dispatch accepted");
     }
 
+    /// E2E 回归（bd txhn 残留）：carrier 读侧死亡必须级联终止全部会话的
+    /// app 下行——Go `Session.Close` 的 `common.Close(s.output)` 语义：pipe
+    /// close → 读端 EOF。旧实现只 flush 不关，dispatcher 下行 bridge 永久
+    /// 悬挂：carrier 死后 app 连接冻结（VPS 形态：8 流 87s 零字节、无
+    /// ERROR、无重建）。
+    #[tokio::test]
+    async fn carrier_death_cascades_app_downlink_eof() {
+        // carrier 双向管道：downlink 读端由 worker 持有，测试持写端（close
+        // 即注入载体 EOF）；uplink 读端持有不读——End 帧滞留 pipe 而非写
+        // 失败提前关会话，保证会话存活到死亡注入时刻。
+        let (down_rd, down_wr) = pipe::new();
+        let (up_rd, up_wr) = pipe::new();
+        let worker = ClientWorker::new(
+            Link { reader: Box::new(down_rd), writer: Box::new(up_wr) },
+            ClientStrategy::default(),
+        );
+        let _keep_uplink_reader = up_rd;
+
+        let dest = Destination::new(
+            xray_common::net::address::Address::new_domain("echo.internal"),
+            xray_common::net::port::Port::new(80),
+            Network::TCP,
+        );
+
+        // 两个活跃会话。dispatch 在会话关闭前不返回（client.rs
+        // dispatch_with_source 尾部 wait_done）→ handle 完成即级联生效。
+        let mut dispatches = Vec::new();
+        let mut downlinks = Vec::new();
+        for _ in 0..2 {
+            let (up_r, mut up_w) = pipe::new();
+            let (dn_r, dn_w) = pipe::new();
+            let link = Link { reader: Box::new(up_r), writer: Box::new(dn_w) };
+            let w = Arc::clone(&worker);
+            let d = dest.clone();
+            dispatches.push(tokio::spawn(async move { w.dispatch(&d, link).await }));
+            up_w.write_multi_buffer(MultiBuffer::from_buffer(Buffer::from_vec(vec![b'x'; 64])))
+                .await
+                .expect("write first payload");
+            downlinks.push(dn_r);
+        }
+
+        // 无限缓冲 pipe 的写不 yield：让出调度直到两个 dispatch 注册完会话
+        // （注册发生在 dispatch 内 wait_done 停靠之前）。
+        for _ in 0..100 {
+            if worker.session_manager().active_count() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            worker.session_manager().active_count(),
+            2,
+            "both sessions active before carrier death"
+        );
+
+        // 注入载体死亡：carrier downlink 写端 close → fetch_output 读到 EOF
+        let _ = down_wr.close();
+
+        // 全部会话必须有界时间内显式终止（非静默冻结）
+        for h in dispatches {
+            let accepted = tokio::time::timeout(Duration::from_secs(5), h)
+                .await
+                .expect("dispatch must terminate after carrier death")
+                .expect("dispatch task join");
+            assert!(accepted, "session was accepted before carrier death");
+        }
+        // app 下行必须见到 EOF（旧实现：此读永久悬挂 = VPS 87s 冻结形态）
+        for mut dn in downlinks {
+            let eof = tokio::time::timeout(Duration::from_secs(5), dn.read_multi_buffer())
+                .await
+                .expect("app downlink must observe EOF within timeout, not hang");
+            assert!(eof.is_err(), "downlink read must error (EOF): {:?}", eof);
+        }
+        assert!(worker.is_closed(), "worker closed after carrier death");
+        assert_eq!(worker.session_manager().active_count(), 0, "no leaked sessions");
+    }
+
     /// 验收：首包前 EOF → End 帧 option=0x02（Go fetchInput client.go:276-279
     /// 的 hasError 传播）。旧实现 Abort 路径漏 set_error，End 帧 option=0x00，
     /// 线级异常信号丢失。

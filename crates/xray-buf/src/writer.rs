@@ -237,6 +237,13 @@ impl Writer for BufferedWriter {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move { self.write_multi_buffer_impl(mb).await })
     }
+
+    fn shutdown(&self) {
+        // 转发内层（pipe.Writer 覆写为实际 close → 读端 EOF）。默认 no-op 会让
+        // 包裹 pipe 的会话写端永不通知 EOF（Go common.Close(s.output) 无对应）。
+        // 不排空内部缓冲——需要保序的调用方先 flush 再 shutdown。
+        self.writer.shutdown()
+    }
 }
 
 // ========== Discard ==========
