@@ -915,10 +915,13 @@ fn build_protocol_handler(
             } else {
                 let tls_json =
                     ob.stream_settings_json.as_ref().and_then(|ss| ss.get("tlsSettings"));
+                // 非 string（数组等手误）置 true，让 build_server_cert_verifier →
+                // parse_pinned_hashes 报类型错拒启，而非静默丢 pin（bd zl5t）。
                 let has_pins = tls_json
                     .and_then(|j| j.get("pinnedPeerCertSha256"))
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|v| !v.is_empty());
+                    .is_some_and(|v| {
+                        !v.is_null() && v.as_str().is_none_or(|s| !s.is_empty())
+                    });
                 if has_pins {
                     xray_tls::client_config::build_server_cert_verifier(tls_json)
                         .map_err(|e| format!("tuic pinned verifier: {e}"))?
