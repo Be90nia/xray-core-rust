@@ -229,7 +229,7 @@ fn stub_factory(kind: &'static str) -> FeatureFactory {
 fn log_factory() -> FeatureFactory {
     Arc::new(|data: &[u8]| {
         let json_cfg: xray_conf::app_config::LogConfig =
-            serde_json::from_slice(data).map_err(|e| FeatureError::StartFailed {
+            serde_json::from_slice(data).map_err(|e| FeatureError::ConfigInvalid {
                 name: "log",
                 message: format!("invalid log config: {e}"),
             })?;
@@ -293,11 +293,11 @@ fn build_log_config(v: &xray_conf::app_config::LogConfig) -> xray_app_log::LogCo
 fn dns_factory() -> FeatureFactory {
     Arc::new(|data: &[u8]| {
         let cfg: xray_app_dns::DnsAppConfig = serde_json::from_slice(data).map_err(|e| {
-            FeatureError::StartFailed { name: "dns", message: format!("invalid dns config: {e}") }
+            FeatureError::ConfigInvalid { name: "dns", message: format!("invalid dns config: {e}") }
         })?;
         let svc = cfg
             .build()
-            .map_err(|e| FeatureError::StartFailed { name: "dns", message: e.to_string() })?;
+            .map_err(|e| FeatureError::ConfigInvalid { name: "dns", message: e.to_string() })?;
         let dns = xray_app_dns::DnsService::new(svc);
         Ok(Arc::new(dns) as Arc<dyn Feature>)
     })
@@ -317,7 +317,7 @@ fn policy_factory() -> FeatureFactory {
             if data.iter().all(|b| b.is_ascii_whitespace()) {
                 Default::default()
             } else {
-                serde_json::from_slice(data).map_err(|e| FeatureError::StartFailed {
+                serde_json::from_slice(data).map_err(|e| FeatureError::ConfigInvalid {
                     name: "policy",
                     message: format!("invalid policy config: {e}"),
                 })?
@@ -325,7 +325,7 @@ fn policy_factory() -> FeatureFactory {
 
         let mut proto = xray_proto::xray::app::policy::Config::default();
         for (lv_str, pl) in &json_cfg.levels {
-            let lv = lv_str.parse::<u32>().map_err(|_| FeatureError::StartFailed {
+            let lv = lv_str.parse::<u32>().map_err(|_| FeatureError::ConfigInvalid {
                 name: "policy",
                 message: format!("invalid policy level key: {lv_str:?} (need unsigned integer)"),
             })?;
@@ -359,8 +359,12 @@ fn policy_factory() -> FeatureFactory {
 /// （factory 时无 outbound.Manager/dispatcher 可取，对应 Go RequireFeatures）。
 fn observatory_factory() -> FeatureFactory {
     Arc::new(|data: &[u8]| {
-        let json_cfg: xray_conf::app_config::ObservatoryConfig =
-            serde_json::from_slice(data).unwrap_or_default();
+        // Go GetInstance 解码硬错（core/xray.go:198-200）→ 致命，不吞。
+        let json_cfg: xray_conf::app_config::ObservatoryConfig = serde_json::from_slice(data)
+            .map_err(|e| FeatureError::ConfigInvalid {
+                name: "observatory",
+                message: format!("invalid observatory config: {e}"),
+            })?;
 
         let config = xray_app_observatory::ObservatoryConfig {
             // z9ma：Go `subjectSelector` 数组优先，单值方言 `subjectOutbound`
@@ -393,8 +397,12 @@ fn observatory_factory() -> FeatureFactory {
 /// 对应 Go RequireFeatures）。
 fn burst_observatory_factory() -> FeatureFactory {
     Arc::new(|data: &[u8]| {
-        let json_cfg: xray_conf::app_config::BurstObservatoryConfig =
-            serde_json::from_slice(data).unwrap_or_default();
+        // Go GetInstance 解码硬错（core/xray.go:198-200）→ 致命，不吞。
+        let json_cfg: xray_conf::app_config::BurstObservatoryConfig = serde_json::from_slice(data)
+            .map_err(|e| FeatureError::ConfigInvalid {
+                name: "burstObservatory",
+                message: format!("invalid burstObservatory config: {e}"),
+            })?;
 
         // z9ma：Go `subjectSelector` 数组优先，单值方言兜底（Go
         // BurstObservatoryConfig 只有 SubjectSelector + pingConfig）。
@@ -418,8 +426,12 @@ fn burst_observatory_factory() -> FeatureFactory {
 /// 端口并 `tokio::spawn` accept loop，`GET /metrics` 返回 Prometheus exposition format。
 fn metrics_factory() -> FeatureFactory {
     Arc::new(|data: &[u8]| {
+        // Go GetInstance 解码硬错（core/xray.go:198-200）→ 致命，不吞。
         let json_cfg: xray_conf::app_config::MetricsConfig =
-            serde_json::from_slice(data).unwrap_or_default();
+            serde_json::from_slice(data).map_err(|e| FeatureError::ConfigInvalid {
+                name: "metrics",
+                message: format!("invalid metrics config: {e}"),
+            })?;
 
         // hfwq：Go metrics.go:8-11 tag 字段接线（listen 兼容形态；inbound
         // handler 供路由暴露属架构接线，与 4qjw 同类设计先行票，此处只保字段不丢）。
@@ -430,8 +442,9 @@ fn metrics_factory() -> FeatureFactory {
 
         let config = xray_app_metrics::MetricsConfig::from_proto(&proto);
         // c1mg：tag 与 listen 至少一项非空——两者皆空 metrics 永远不可达，配置错误。
+        // Go metrics.go:15 Build 硬错（bd onx4：ConfigInvalid 致命）。
         if let Err(e) = config.validate() {
-            return Err(xray_features::FeatureError::StartFailed {
+            return Err(xray_features::FeatureError::ConfigInvalid {
                 name: "metrics",
                 #[allow(clippy::useless_format)] // 存量清零批次
                 message: format!("{e}"),
@@ -568,7 +581,7 @@ fn reverse_factory() -> FeatureFactory {
     use prost::Message as _;
     Arc::new(|data: &[u8]| {
         let proto = xray_proto::xray::app::reverse::Config::decode(data).map_err(|e| {
-            FeatureError::StartFailed { name: "reverse", message: format!("config decode: {e}") }
+            FeatureError::ConfigInvalid { name: "reverse", message: format!("config decode: {e}") }
         })?;
         let feature = xray_app_reverse::ReverseFeature::new(
             xray_app_reverse::ReverseConfig::from_proto(&proto),
@@ -703,12 +716,15 @@ fn commander_factory() -> FeatureFactory {
         DeclaredServiceMarker, HandlerServiceMarker, ReflectionService, api_services,
     };
     Arc::new(|data: &[u8]| {
-        let cfg: xray_conf::app_config::ApiConfig =
-            serde_json::from_slice(data).unwrap_or_default();
+        // Go GetInstance 解码硬错（core/xray.go:198-200）→ 致命，不吞。
+        let cfg: xray_conf::app_config::ApiConfig = serde_json::from_slice(data).map_err(|e| {
+            FeatureError::ConfigInvalid { name: "api", message: format!("invalid api config: {e}") }
+        })?;
         // Go api.go:23-25：`API tag can't be empty.`（Build 硬错）。
+        // bd onx4：ConfigInvalid = 致命（区别于 stub 未实现的 warn+跳过）。
         let tag = cfg.tag.clone().unwrap_or_default();
         if tag.is_empty() {
-            return Err(FeatureError::StartFailed {
+            return Err(FeatureError::ConfigInvalid {
                 name: "api",
                 message: "API tag can't be empty.".to_string(),
             });
@@ -763,7 +779,7 @@ fn commander_factory() -> FeatureFactory {
 fn fake_dns_factory() -> FeatureFactory {
     Arc::new(|data: &[u8]| {
         let cfg: xray_conf::app_config::FakeDnsConfig =
-            serde_json::from_slice(data).map_err(|e| FeatureError::StartFailed {
+            serde_json::from_slice(data).map_err(|e| FeatureError::ConfigInvalid {
                 name: "fakeDns",
                 message: format!("parse FakeDnsConfig: {e}"),
             })?;
@@ -803,11 +819,12 @@ fn build_fake_dns_holder(
             lru_size: u64::from(cfg.pool_size.unwrap_or(65535)),
         }]
     };
-    let multi =
-        xray_app_dns::fakedns::HolderMulti::new(pools).map_err(|e| FeatureError::StartFailed {
+    let multi = xray_app_dns::fakedns::HolderMulti::new(pools).map_err(|e| {
+        FeatureError::ConfigInvalid {
             name: "fakeDns",
             message: format!("initialize fake dns pools: {e}"),
-        })?;
+        }
+    })?;
     Ok(Arc::new(multi))
 }
 
@@ -866,8 +883,8 @@ pub fn fake_dns_engine_bridge(
 ///
 /// 对应 Go `app/geodata` 的 `init()` + `New(ctx, config)`。JSON shape 对齐 Go
 /// `{cron, outbound, assets}`；映射时按 Go `infra/conf` Build() 语义校验
-/// （cron 非法 / asset url 非 https / asset file 本地缺失 → `StartFailed`，
-/// 由 instance 装配循环 warn+skip，即"告警"面）。cron 为空时
+/// （cron 非法 / asset url 非 https / asset file 本地缺失 → `ConfigInvalid`，
+/// Go geodata.go:20,23,53 Build 硬错，bd onx4：启动期致命）。cron 为空时
 /// `GeodataInstance.start_with_callback` 不调度（与 Go `if config.Cron == ""`
 /// 等价）。
 ///
@@ -882,7 +899,7 @@ fn geodata_factory() -> FeatureFactory {
         };
 
         let json_cfg: xray_conf::app_config::GeodataConfig =
-            serde_json::from_slice(data).map_err(|e| FeatureError::StartFailed {
+            serde_json::from_slice(data).map_err(|e| FeatureError::ConfigInvalid {
                 name: "geodata",
                 message: format!("invalid geodata config: {e}"),
             })?;
@@ -901,7 +918,7 @@ fn geodata_factory() -> FeatureFactory {
 
 /// JSON 字段映射进运行时 [`xray_app_geodata::GeodataConfig`]，并按 Go
 /// `infra/conf/geodata.go:48-71` Build() 语义校验：cron 非法 / asset url
-/// 非 https / asset file 本地缺失 → 硬错（instance 装配循环 warn+skip）。
+/// 非 https / asset file 本地缺失 → `ConfigInvalid` 硬错（bd onx4：启动期致命）。
 /// cron 为空则原样放行（start 时不调度，与 Go `if config.Cron == ""` 等价）。
 fn map_geodata_config(
     json_cfg: xray_conf::app_config::GeodataConfig,
@@ -912,13 +929,13 @@ fn map_geodata_config(
         let file = a.file.unwrap_or_default();
         let host = url.strip_prefix("https://").unwrap_or("");
         if host.is_empty() || host.starts_with('/') {
-            return Err(FeatureError::StartFailed {
+            return Err(FeatureError::ConfigInvalid {
                 name: "geodata",
                 message: format!("invalid geodata asset url: {url}"),
             });
         }
         if file.is_empty() || !default_asset_dir().join(&file).exists() {
-            return Err(FeatureError::StartFailed {
+            return Err(FeatureError::ConfigInvalid {
                 name: "geodata",
                 message: format!("invalid geodata asset file: {file}"),
             });
@@ -932,7 +949,7 @@ fn map_geodata_config(
     };
     if !config.cron.is_empty() {
         xray_app_geodata::CronScheduler::validate(&config.cron).map_err(|e| {
-            FeatureError::StartFailed {
+            FeatureError::ConfigInvalid {
                 name: "geodata",
                 message: format!("invalid geodata cron: {e}"),
             }
@@ -950,11 +967,15 @@ fn default_asset_dir() -> PathBuf {
 ///
 /// 在 build 时从 `crate::VERSION_X/Y/Z` 拼成（与 Go `core.Version_x/y/z` 同构）。
 /// `Version::new` 在版本不满足时直接返回 `Err`，factory 透传为
-/// `FeatureError::StartFailed`（与 Go `app.New` 同款 hard error）。
+/// `FeatureError::ConfigInvalid`（Go version.go:24,33 Build 硬错，bd onx4 致命）。
 fn version_factory() -> FeatureFactory {
     Arc::new(|data: &[u8]| {
+        // Go GetInstance 解码硬错 → 致命，不吞。
         let json_cfg: xray_conf::app_config::VersionConfig =
-            serde_json::from_slice(data).unwrap_or_default();
+            serde_json::from_slice(data).map_err(|e| FeatureError::ConfigInvalid {
+                name: "version",
+                message: format!("invalid version config: {e}"),
+            })?;
         let core_version =
             format!("{}.{}.{}", crate::VERSION_X, crate::VERSION_Y, crate::VERSION_Z);
         let feature = xray_app_version::version::VersionFeature::new(
@@ -962,7 +983,7 @@ fn version_factory() -> FeatureFactory {
             json_cfg.min,
             json_cfg.max,
         )
-        .map_err(|e| FeatureError::StartFailed {
+        .map_err(|e| FeatureError::ConfigInvalid {
             name: "version",
             message: format!("version constraint not satisfied: {e}"),
         })?;
@@ -999,13 +1020,14 @@ mod tests {
 
     /// uasr①：policy levels 非数字键 / 损坏 JSON 拒启（Go policy.go:73
     /// map[uint32] 解码期硬错），不再 continue 静默丢级 / unwrap_or_default。
+    /// bd onx4：此类配置硬错归 `ConfigInvalid`（启动期致命）。
     #[test]
     fn policy_factory_rejects_bad_level_keys_and_broken_json() {
         let factory = policy_factory();
-        // 非数字 level 键 → StartFailed("policy")。
+        // 非数字 level 键 → ConfigInvalid("policy")。
         let err = registry_err(factory(br#"{"levels":{"abc":{"handshake":5}}}"#));
         assert!(err.contains("invalid policy level key"), "{err}");
-        // 损坏 JSON → StartFailed。
+        // 损坏 JSON → ConfigInvalid。
         let err = registry_err(factory(b"{not json"));
         assert!(err.contains("invalid policy config"), "{err}");
         // 合法数字键通过。
@@ -1014,15 +1036,15 @@ mod tests {
         assert!(factory(b"").is_ok());
     }
 
-    /// 从 factory 结果提取 StartFailed 消息（非 StartFailed 时 panic）。
+    /// 从 factory 结果提取 ConfigInvalid 消息（非 ConfigInvalid 时 panic）。
     fn registry_err(result: Result<Arc<dyn Feature>, FeatureError>) -> String {
         match result {
-            Err(FeatureError::StartFailed { name, message }) => {
+            Err(FeatureError::ConfigInvalid { name, message }) => {
                 assert_eq!(name, "policy");
                 message
             },
-            Err(_) => panic!("expected StartFailed, got other error variant"),
-            Ok(_) => panic!("expected StartFailed, got Ok"),
+            Err(_) => panic!("expected ConfigInvalid, got other error variant"),
+            Ok(_) => panic!("expected ConfigInvalid, got Ok"),
         }
     }
 
@@ -1092,7 +1114,7 @@ mod tests {
     fn dns_factory_rejects_malformed_json() {
         register_all_features();
         let result = registry::create_feature("dns", b"{not json");
-        assert!(matches!(result, Err(FeatureError::StartFailed { name, .. }) if name == "dns"));
+        assert!(matches!(result, Err(FeatureError::ConfigInvalid { name, .. }) if name == "dns"));
     }
     #[test]
     fn stats_factory_wires_real_manager() {

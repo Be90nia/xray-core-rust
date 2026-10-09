@@ -125,8 +125,11 @@ impl Instance {
     ///
     /// # 容错策略
     ///
-    /// - 未注册的 `kind`：记 warn 跳过（对应 Go essentialFeatures 默认实现路径）
-    /// - factory 内部错误：立即返回（如 prost decode 失败、配置非法）
+    /// - 未注册的 `kind`（`NotFound`）：记 warn 跳过（对应 Go essentialFeatures 默认实现路径）
+    /// - stub 未实现（`StartFailed`）：记 warn 跳过（该 Feature 尚未实现的合法降级）
+    /// - 配置硬错（`ConfigInvalid`）：**致命**，立即返回使 Instance 构造失败 （对齐 Go config Build
+    ///   硬错 → `initInstanceWithConfig` 返回错误，core/xray.go:196-210）
+    /// - factory 内部错误：立即返回（如 prost decode 失败）
     pub fn new_from_built(built: &xray_conf::BuiltConfig) -> Result<Self> {
         install_panic_hook();
         let mut inst = Self::new();
@@ -145,6 +148,13 @@ impl Instance {
                         kind = %name,
                         "no FeatureFactory registered for kind, skipping"
                     );
+                },
+                Err(FeatureError::ConfigInvalid { ref name, ref message }) => {
+                    // 真实配置硬错（bd onx4，对齐 Go：config Build 硬错 →
+                    // initInstanceWithConfig 返回错误 → InstanceStart 失败，
+                    // core/xray.go:196-210）。致命，区别于下方 stub 未实现。
+                    tracing::error!(kind = %name, message = %message, "invalid app config");
+                    return Err(FeatureError::ConfigInvalid { name, message: message.clone() });
                 },
                 Err(FeatureError::StartFailed { ref name, ref message }) => {
                     // Stub factory 返回 StartFailed = 该 Feature 尚未实现，非致命
