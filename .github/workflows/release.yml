@@ -43,7 +43,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # prefix-key 炸缓存：旧 key 里混着 ubuntu-24.04（glibc 2.39）编的 aws_lc_sys
+      # 产物（sscanf→__isoc23_* 重定向），恢复进 22.04 链接必炸——强制全量重编
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v2-gcc22-glibc235"
       - name: Prepare patched boringssl
         uses: ./.github/actions/setup-boringssl
       - name: Install protoc
@@ -60,11 +64,16 @@ jobs:
           } elseif ($env:RUNNER_OS -eq "macOS") {
             brew install protobuf
           } else {
-            # Windows: 依赖图含 xray-proto(prost-build)需要 protoc（同 stress.yml）
-            choco install -y protoc 2>&1 | Out-Null
-            echo "C:\ProgramData\chocolatey\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+            # Windows: 依赖图含 xray-proto(prost-build)需要 protoc
+            # choco shim 间歇未生成（Out-Null 吞错）→ 改直连下载 protoc 25.1
+            $protocZip = "$env:RUNNER_TEMP\protoc.zip"
+            $protocDir = "$env:RUNNER_TEMP\protoc"
+            Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-win64.zip" -OutFile $protocZip
+            Expand-Archive -Path $protocZip -DestinationPath $protocDir -Force
+            echo "$protocDir\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
           }
-          Write-Host "protoc: $(protoc --version)"
+          # GITHUB_PATH 对本步不生效，版本检查仅非 Windows（Linux/macOS 即时装好）
+          if ($env:RUNNER_OS -ne "Windows") { Write-Host "protoc: $(protoc --version)" }
       - name: Build release
         run: cargo build --release -p xray-cli --target ${{ matrix.target }}
       - name: Upload artifact
