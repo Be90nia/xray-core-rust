@@ -32,6 +32,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - mux carrier 高丢包链路 ~2s 静默死亡（bd txhn）：共享写端帧写入非原子——`MuxWriter` 帧头经 `BufferedWriter` 内部缓冲 flush、载荷直写，两个共享锁临界区间可被并发会话完整帧插隔，读端把孤立载荷当帧头解析出 `meta_len too large` 后整条 carrier 连带全部子会话静默断流（VPS loss 0.5%+RTT150ms 下 9/9 复现、8 流冻结无重建）。修为整帧单次落盘（`write_multi_buffer_direct`，对齐 Go writer.go:71-87 单 `WriteMultiBuffer` 形态）+ carrier 终止 error 级日志 + `MuxBridge` dispatch 对齐 Go 16 次重试环（死亡竞窗不再丢 link）
+- mux carrier 死亡级联下半程缺失（bd txhn 残留）：`Session::close` 对 app 下行 output 只 flush 不关——pipe 裸 drop 不关闭语义下 dispatcher 下行 bridge 永久悬挂（carrier 死后 8 流 87s 零字节冻结形态；服务端 End 正常收包路径同悬挂）。补 `BufferedWriter::shutdown` 转发内层 + close 时调用（对齐 Go session.go `common.Close(s.output)`；XUDP 分支维持 Go 同款不关）
 - VLESS Vision 高 RTT 链路吞吐塌缩（bd 88m0）：TCP 缺省 SO_RCVBUF 4MB 根治下载收侧内核 DRS 自稳定钉窗（862340ff 同族孪生）——接收窗出生掷签钉 ~64KB 致吞吐=窗/RTT（433KB/s 锁步、~25% 连接命中），VPS netem 20 轮 25% 异常→20/20 全净且整体提速；显式 `receiveBufferSize` 优先（`3e755458`）
 - VLESS Vision 下载截断（TRUNC）：桥下行收尾 flush+shutdown 写半——TLS BufWriter 滞留尾巴随 drop 蒸发，VPS A/B 5/20→0/26 实证（`61ba8fc1`）
 - mux 帧编码 `Network::Unix` 目标远程可达 panic → 显式 `Err`（对齐 Go 无 panic 路径）
