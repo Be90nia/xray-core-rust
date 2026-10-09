@@ -48,7 +48,13 @@ impl SsOutbound {
     /// 返回 [`io::Error`]（`ErrorKind::Other`）当 TCP 连接失败、
     /// AEAD 初始化失败或写首帧失败。错误信息携带原始 [`crate::error::SsError`] 描述。
     pub async fn process(&self, addr: &Address, port: u16) -> io::Result<SSStream<TcpStream>> {
-        self.client.dial_target(addr, port).await.map_err(|e| io::Error::other(e.to_string()))
+        // 响应方向走 Go `ReadTCPResponse` 语义（lazy 读新 IV + 重派生读 AEAD）；
+        // 生产 server（read_request→begin_server_response）恒先写响应 IV header，
+        // 不设 rekey 的 dial_target 会让客户端拿请求 AEAD 解响应 → 认证失败。
+        self.client
+            .dial_target_for_proxy(addr, port)
+            .await
+            .map_err(|e| io::Error::other(e.to_string()))
     }
 
     /// 返回内部 [`Client`] 引用（供 dispatcher 复用账户配置 / 测试断言）。

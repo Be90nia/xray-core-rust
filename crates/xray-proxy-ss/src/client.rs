@@ -127,8 +127,9 @@ impl Client {
     /// IV 读取是 **lazy** 的（第一次 `read_chunk` 时执行）：server 只在拿到 target
     /// 响应数据后才写 IV，若 dial 后同步读 IV 会与「server 等 client body」互等死锁。
     ///
-    /// `dial_target` 本身不标记（用于 inbound server 测试场景——Rust inbound server
-    /// 不写 IV header，那个上下文读 response 无需 rekey）。
+    /// `dial_target` 本身不标记，仅适用于**不读响应**的调用方（只写/半关闭场景）；
+    /// 生产 server 已恒写响应 IV header（`begin_server_response`），读响应必须走
+    /// 本方法。
     ///
     /// # Errors
     /// - 透传 [`Self::dial_target`] 错误。
