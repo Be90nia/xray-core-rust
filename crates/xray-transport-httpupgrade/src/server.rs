@@ -98,8 +98,10 @@ impl HttpUpgradeServer {
         // 2. 校验请求（注意：parse_upgrade_request 不消费余留 payload）
         let req = parse_upgrade_request(&buf, &self.config)?;
 
-        // 3. 写 101 响应
-        let resp_bytes = build_upgrade_response();
+        // 3. 写 101 响应（请求带非空 Sec-WebSocket-Key 时附 Accept，Go 0fc37920
+        //    hub.go:86-89；headers 为小写键 map）。
+        let ws_key = req.headers.get("sec-websocket-key").map(String::as_str);
+        let resp_bytes = build_upgrade_response(ws_key);
         io.write_all(&resp_bytes).await?;
         io.flush().await?;
 
@@ -154,6 +156,27 @@ mod tests {
         let resp_str = std::str::from_utf8(&buf[..n]).unwrap();
         assert!(resp_str.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
         assert!(resp_str.contains("Upgrade: websocket"));
+
+        let (_conn, leftover) = handle.await.unwrap().unwrap();
+        assert!(leftover.is_empty());
+    }
+
+    /// Go 0fc37920：请求带 Sec-WebSocket-Key → 响应回 RFC 6455 §1.3 向量的 Accept。
+    #[tokio::test]
+    async fn handshake_echoes_sec_websocket_accept() {
+        let server = HttpUpgradeServer::new(make_config("/ws"));
+        let (server_io, mut client_io) = duplex(8192);
+
+        let req = b"GET /ws HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+                    Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+        client_io.write_all(req).await.unwrap();
+        client_io.flush().await.unwrap();
+
+        let handle = tokio::spawn(async move { server.handshake_io(server_io).await });
+        let mut buf = vec![0u8; 1024];
+        let n = client_io.read(&mut buf).await.unwrap();
+        let resp_str = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(resp_str.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"));
 
         let (_conn, leftover) = handle.await.unwrap().unwrap();
         assert!(leftover.is_empty());
