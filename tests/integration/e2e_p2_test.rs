@@ -301,9 +301,9 @@ async fn e2e_p2_wireguard_full_chain() {
     let _dokodemo_check =
         TcpStream::connect(("127.0.0.1", dokodemo_port)).await.expect("dokodemo accepts");
 
-    // (b) WireGuard handshake 探测已拆至独立 #[ignore] 用例
-    // e2e_p2_wireguard_handshake_probe（CI Linux 20s 无 response，本地 Windows 绿——
-    // WG driver Linux 路径待专项）。
+    // (b) WireGuard inbound 真实握手探测在独立用例 e2e_p2_wireguard_handshake_probe
+    // （客户端带 update_timers 重传泵；服务端 Linux 路径已由
+    // inbound::tests::tunnel_tcp_end_to_end_echoes 在 CI Linux 实证）。
 
     for h in handles.iter() {
         h.abort();
@@ -495,14 +495,22 @@ async fn e2e_p2_dns_core_resolution() {
     }
 }
 
-/// WireGuard 真实握手探测（独立留档）。
+/// WireGuard 真实握手探测（bd dxim）。
 ///
-/// #[ignore] 理由：CI Linux（run 36206616471）手写 boringtun handshake init 发出后
-/// 20s 未收到 server handshake response；本地 Windows 同代码绿。start_full 装配、
-/// wg-in UDP listener bind/accept 均已验证通过（主用例 (a)(b) 断言），断点在
-/// server driver worker_loop 的 Linux 响应路径——WG inbound driver Linux 专项排查
-/// 后拆除本 ignore。
-#[ignore = "bd dxim：CI Linux WG handshake response 未回（36206616471 实证，本地 Windows 绿），WG driver Linux 路径待专项，修后拆除"]
+/// 历史：初版手写单发 init 段（client encapsulate → 一次 UDP send → 裸等
+/// response）在 CI Linux（run 36206616471）20s 无 response，本地 Windows 绿。
+/// 分诊结论（2026-10-09 复核）：
+/// - 服务端路径在 CI Linux 无罪——`inbound::tests::tunnel_tcp_end_to_end_echoes` （同
+///   `WireguardInboundHandler` + driver worker_loop + loopback UDP 真 noise 握手）在 CI Linux
+///   debug/release 双绿；
+/// - 单发形态在 Linux 也无罪——独立 boringtun 容器复现（零 workspace 依赖） 单发 init → response
+///   往返 0.3ms PASS；
+/// - 唯一 CI 独有形态 = 测试进程满载并发下的一次性首包交换：单发客户端无 重传，首交换一旦被时序
+///   skew 吞掉即 20s 挂死（真 WG 客户端不会这样）。
+///
+/// 修复：客户端补 `update_timers` 100ms 泵（boringtun REKEY_TIMEOUT=5s 重传
+/// 语义，等价 `WgDriver::main_loop` 的定时器驱动），自愈首包时序问题；服务端
+/// start_full 生产装配路径保持不变。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_p2_wireguard_handshake_probe() {
     let _echo = start_echo().await;
@@ -577,16 +585,29 @@ async fn e2e_p2_wireguard_handshake_probe() {
     let our_addr = udp.local_addr().expect("udp local_addr");
     udp.send_to(&init_bytes, ("127.0.0.1", wg_port)).await.expect("send init");
 
-    // 接收服务端 handshake response（driver worker_loop decapsulate 后 send_wg 回源地址）
-    let mut response = vec![0u8; 256];
-    let (n, _) = tokio::time::timeout(Duration::from_secs(20), udp.recv_from(&mut response))
-        .await
-        .expect("handshake response within 20s")
-        .expect("recv_from ok");
-    response.truncate(n);
+    // 接收服务端 handshake response（driver worker_loop decapsulate 后 send_wg 回源地址）。
+    // 100ms 泵 `update_timers`：REKEY_TIMEOUT(5s) 无 response 时 boringtun 强制重发
+    // handshake init（与 WgDriver::main_loop 定时器语义一致），自愈 CI 满载进程下的
+    // 首包时序 skew。
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let resp_outputs = loop {
+        assert!(std::time::Instant::now() < deadline, "handshake response within 20s");
+        for out in client_tunnel.update_timers().expect("client timers") {
+            if let TunnelOutput::Network(wg) = out {
+                udp.send_to(&wg, ("127.0.0.1", wg_port)).await.expect("re-send init");
+            }
+        }
+        let mut response = vec![0u8; 256];
+        match tokio::time::timeout(Duration::from_millis(100), udp.recv_from(&mut response)).await {
+            Ok(Ok((n, _))) => {
+                response.truncate(n);
+                break client_tunnel.decapsulate(&response).expect("client decapsulate response");
+            },
+            Ok(Err(e)) => panic!("recv_from ok: {e}"),
+            Err(_) => continue, // 本窗口无 response → 下一轮 timer 泵
+        }
+    };
 
-    // 客户端 decapsulate 服务端 response：握手完成
-    let resp_outputs = client_tunnel.decapsulate(&response).expect("client decapsulate response");
     // response 应包含服务端 Output::Network（keepalive 等）或 Output::Ip——任一即可证
     assert!(
         !resp_outputs.is_empty(),
