@@ -54,7 +54,7 @@ use xray_proxy_hysteria::HysteriaConfig;
 use xray_proxy_loopback::{LoopbackError, LoopbackFuture, LoopbackSink};
 use xray_proxy_trojan::{MemoryAccount, TrojanOutboundConfig};
 use xray_proxy_vless::VlessOutboundConfig;
-use xray_proxy_wireguard::{DeviceConfig, DomainStrategy as WgDomainStrategy};
+use xray_proxy_wireguard::DeviceConfig;
 use xray_transport::{dialer::StreamSettings, link::Link};
 
 /// Dispatcher → LoopbackSink 桥接。
@@ -2903,17 +2903,15 @@ fn parse_wireguard_key(s: &str) -> std::result::Result<String, String> {
     Ok(decoded.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Go infra/conf/wireguard.go:120-134 domainStrategy → [`WgDomainStrategy`]。
-fn parse_wireguard_domain_strategy(
-    s: Option<&str>,
-) -> std::result::Result<WgDomainStrategy, String> {
-    match s.unwrap_or("").to_ascii_lowercase().as_str() {
-        "" | "forceip" => Ok(WgDomainStrategy::ForceIp),
-        "forceipv4" => Ok(WgDomainStrategy::ForceIp4),
-        "forceipv6" => Ok(WgDomainStrategy::ForceIp6),
-        "forceipv4v6" => Ok(WgDomainStrategy::ForceIp46),
-        "forceipv6v4" => Ok(WgDomainStrategy::ForceIp64),
-        other => Err(format!("unsupported domain strategy: {other}")),
+/// Go efc9e6da 删除 domainStrategy（JSON 字段与 proto 枚举均已移除，行为回落
+/// 隧道 DNS + IP 字面量先行）；此处保留解析仅为对存量配置打 deprecation 警告，
+/// 不硬错（PM 拍板保翻先例）。
+fn warn_wireguard_domain_strategy(s: Option<&str>) {
+    if s.is_some_and(|s| !s.is_empty()) {
+        tracing::warn!(
+            "wireguard outbound: domainStrategy is deprecated and ignored (removed upstream, \
+             efc9e6da); domain targets resolve via tunnel DNS"
+        );
     }
 }
 
@@ -2921,8 +2919,8 @@ fn parse_wireguard_domain_strategy(
 ///
 /// JSON 格式（Go `infra/conf/wireguard.go:17-68`，camelCase 主键、snake_case 别名双读）：
 /// `{"secretKey":"...","peers":[{"publicKey":"...","preSharedKey":"...","endpoint":"...",
-/// "keepAlive":25,"allowedIPs":["0.0.0.0/0"]}],"mtu":1420,"reserved":[2,5,1],
-/// "domainStrategy":"ForceIP"}`。
+/// "keepAlive":25,"allowedIPs":["0.0.0.0/0"]}],"mtu":1420,"reserved":[2,5,1]}`。
+/// `domainStrategy` 已随 Go efc9e6da 删除：出现时警告后忽略。
 pub(crate) fn parse_wireguard_config(data: &[u8]) -> std::result::Result<DeviceConfig, String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
     let secret_key = wg_get(&v, "secretKey", "secret_key")
@@ -3004,24 +3002,16 @@ pub(crate) fn parse_wireguard_config(data: &[u8]) -> std::result::Result<DeviceC
     if !reserved.is_empty() && reserved.len() != 3 {
         return Err(r#""reserved" should be empty or 3 bytes"#.to_string());
     }
-    let domain_strategy = parse_wireguard_domain_strategy(
+    // Go efc9e6da 删除 domainStrategy（枚举+JSON 面）；存量配置警告后忽略。
+    warn_wireguard_domain_strategy(
         wg_get(&v, "domainStrategy", "domain_strategy").and_then(|x| x.as_str()),
-    )?;
-    // Go c7e569b0：`remoteDNS`（隧道内 DNS 服务器列表；["local"] = 走本地 app DNS）。
+    );
+    // Go c7e569b0：`remoteDNS`（隧道内 DNS 服务器列表；["local"] 已废弃，回落默认隧道 DNS）。
     let dns = wg_get(&v, "remoteDNS", "remote_dns")
         .and_then(|x| x.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<String>>())
         .unwrap_or_default();
-    Ok(DeviceConfig {
-        secret_key,
-        peers,
-        endpoint,
-        mtu,
-        reserved,
-        domain_strategy,
-        dns,
-        ..Default::default()
-    })
+    Ok(DeviceConfig { secret_key, peers, endpoint, mtu, reserved, dns, ..Default::default() })
 }
 
 /// 解析 loopback outbound settings JSON → (inbound_tag, 嗅探请求)。
@@ -3637,7 +3627,7 @@ mod tests {
         assert_eq!(config.secret_key, secret);
         assert_eq!(config.effective_mtu(), 1400);
         assert_eq!(config.reserved, vec![2, 5, 1]);
-        assert_eq!(config.domain_strategy, WgDomainStrategy::ForceIp4);
+        // domainStrategy 已删除（efc9e6da）：解析成功（警告回落），字段不存在。
         let peer = &config.peers[0];
         assert_eq!(peer.public_key, pub_key);
         assert_eq!(peer.pre_shared_key, psk);
@@ -3662,8 +3652,7 @@ mod tests {
                     "pre_shared_key": "{psk_b64}",
                     "keep_alive": 15,
                     "allowed_ips": ["10.0.0.0/8"]
-                }}],
-                "domain_strategy": "forceipv6"
+                }}]
             }}"#,
             "aa".repeat(32),
             "bb".repeat(32),
@@ -3673,11 +3662,10 @@ mod tests {
         assert_eq!(peer.pre_shared_key, "dd".repeat(32), "base64 PSK normalized to hex");
         assert_eq!(peer.keep_alive, 15);
         assert_eq!(peer.allowed_ips, vec!["10.0.0.0/8"]);
-        assert_eq!(config.domain_strategy, WgDomainStrategy::ForceIp6);
     }
 
     #[test]
-    fn parse_wireguard_config_rejects_bad_reserved_and_strategy() {
+    fn parse_wireguard_config_rejects_bad_reserved_and_warns_deprecated_strategy() {
         let base = |extra: &str| {
             format!(
                 r#"{{"secretKey": "{}", "peers": [{{"publicKey": "{}", "endpoint": "e:1"}}], {extra}}}"#,
@@ -3688,10 +3676,9 @@ mod tests {
         // Go wireguard.go:112-115：reserved 非空须恰好 3 字节
         let err = parse_wireguard_config(base(r#""reserved": [1, 2]"#).as_bytes()).unwrap_err();
         assert!(err.contains("should be empty or 3 bytes"), "got {err}");
-        // Go wireguard.go:120-134：未知策略拒绝
-        let err =
-            parse_wireguard_config(base(r#""domainStrategy": "bogus""#).as_bytes()).unwrap_err();
-        assert!(err.contains("unsupported domain strategy"), "got {err}");
+        // domainStrategy 已删除（efc9e6da）：未知值不再硬错，警告后忽略。
+        let cfg = parse_wireguard_config(base(r#""domainStrategy": "bogus""#).as_bytes()).unwrap();
+        assert!(cfg.dns.is_empty());
     }
 
     #[test]

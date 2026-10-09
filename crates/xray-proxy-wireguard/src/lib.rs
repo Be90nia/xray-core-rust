@@ -38,7 +38,7 @@ pub mod users;
 pub mod wireguard;
 
 // 顶层 re-export。
-pub use config::{DeviceConfig, DomainStrategy, PeerConfig};
+pub use config::{DeviceConfig, PeerConfig};
 pub use dispatcher::make_wireguard_dial_fn;
 pub use driver::WgDriver;
 pub use error::{Result, WgError};

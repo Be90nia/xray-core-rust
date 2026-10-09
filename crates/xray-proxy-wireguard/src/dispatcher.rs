@@ -37,11 +37,7 @@ use xray_common::net::{address::Address, destination::Destination, network::Netw
 use xray_transport::connection::Connection;
 use xray_xudp::packet::{PacketReader, PacketWriter};
 
-use crate::{
-    config::{DeviceConfig, DomainStrategy},
-    netstack::WgNetStack,
-    outbound::WireguardOutboundHandler,
-};
+use crate::{config::DeviceConfig, netstack::WgNetStack, outbound::WireguardOutboundHandler};
 
 /// duplex 缓冲大小。
 const DUPLEX_BUF: usize = 64 * 1024;
@@ -346,13 +342,12 @@ pub(crate) async fn pump_udp_to_client(
     (!out.is_empty()).then_some(out)
 }
 
-/// 域名目标解析（Go `client.go:167-187`）。
+/// 目标域名解析（本地 app DNS 路径，peer endpoint 用）。
 ///
-/// 用 WireGuard 自身的 `domainStrategy` + interface 地址族约束（`hasIPv4/6`）
-/// 解析；空结果且有 fallback 策略时二次解析；随机选一个 IP（`dice.Roll`）。
+/// Go efc9e6da 后 `resolveLocal`（client.go:373-377）：双栈 `LookupIP`，无 WG
+/// `domainStrategy`（已删除）；接口地址族约束（`hasIPv4/6`）由查询与出口过滤共同施加。
 pub(crate) async fn resolve_dest_domain(
     domain: &str,
-    strategy: DomainStrategy,
     has_v4: bool,
     has_v6: bool,
     dns: &Arc<DnsService>,
@@ -360,24 +355,8 @@ pub(crate) async fn resolve_dest_domain(
     use rand::Rng;
     use xray_app_dns::config::IpOption;
 
-    let prefer = IpOption {
-        ipv4_enable: has_v4 && strategy.prefer_ip4(),
-        ipv6_enable: has_v6 && strategy.prefer_ip6(),
-        fake_enable: false,
-    };
-    let mut result = dns.lookup_ip(domain, prefer).await;
-    let need_fallback = match &result {
-        Ok((ips, _)) => ips.is_empty(),
-        Err(_) => true,
-    };
-    if need_fallback && (strategy.fallback_ip4() || strategy.fallback_ip6()) {
-        let fallback = IpOption {
-            ipv4_enable: has_v4 && strategy.fallback_ip4(),
-            ipv6_enable: has_v6 && strategy.fallback_ip6(),
-            fake_enable: false,
-        };
-        result = dns.lookup_ip(domain, fallback).await;
-    }
+    let prefer = IpOption { ipv4_enable: has_v4, ipv6_enable: has_v6, fake_enable: false };
+    let result = dns.lookup_ip(domain, prefer).await;
     match result {
         Ok((ips, _)) if !ips.is_empty() => {
             let usable = filter_by_interface_family(ips, has_v4, has_v6);
@@ -460,8 +439,7 @@ pub(crate) fn clear_reserved(pkt: &mut [u8]) {
 ///
 /// - `system_dialer`：`Some` 时 WG 自身 UDP 经此拨号出站（Go `client.go:94-143` processWireGuard 的
 ///   `internet.Dialer`——UDP 可经 socks 等出站链）； `None` 直连（Go 无 ProxySettings 时的 raw UDP）
-/// - 域名目标：经 WireGuard 自身 `domainStrategy` 解析（Go `client.go:167-187`， `dns`
-///   缺失时域名断链报错）
+/// - 域名目标：走隧道内 DNS（remoteDNS 服务器或默认四址；Go efc9e6da 后语义）
 /// - UDP 目标：smoltcp UDP socket + XUDP 帧中继（Go `client.go:225-244`）
 ///
 /// # Panics
@@ -505,20 +483,13 @@ pub fn make_wireguard_dial_fn(
 
             let netstack = handler.netstack();
 
-            // 域名目标 → 缓存（Go Handler.cache TTL 内随机取一）→ 未命中按
-            // remoteDNS 模式解析（["local"] = 本地 app DNS；其余 = 隧道内 DNS，
-            // 服务器列表来自 remoteDNS 或默认四址）→ 写回缓存（Go resolveDomain
-            // client.go:388-446，c7e569b0）。
+            // 域名目标 → 缓存（Go Handler.cache TTL 内随机取一）→ 未命中走隧道内
+            // DNS（服务器列表来自 remoteDNS 或默认四址；"local" 已废弃，resolve_dns
+            // 内警告回落）→ 写回缓存（Go efc9e6da 后 client.go 语义）。
             let dest = match dest.address() {
                 Address::Domain(domain) => {
                     let ip = resolve_dest_ip_cached(
-                        domain,
-                        netstack,
-                        has_v4,
-                        has_v6,
-                        &config,
-                        dns.as_ref(),
-                        &dns_cache,
+                        domain, netstack, has_v4, has_v6, &config, &dns_cache,
                     )
                     .await?;
                     let addr = match ip {
@@ -599,30 +570,21 @@ pub fn make_wireguard_dial_fn(
     })
 }
 
-/// 目标域名解析（缓存包装）。Go `resolveRemote`/`resolveDomain`（client.go:379-446，
-/// c7e569b0）：TTL 内命中随机取一；未命中按 remoteDNS 模式解析后写回。
+/// 目标域名解析（缓存包装）。Go efc9e6da 后语义：TTL 内命中随机取一；未命中走
+/// 隧道内 DNS（服务器列表来自 remoteDNS 或默认四址）后写回。"local" 模式已删除
+/// （resolve_dns 内警告回落 Default）。
 async fn resolve_dest_ip_cached(
     domain: &str,
     netstack: &Arc<AsyncMutex<WgNetStack>>,
     has_v4: bool,
     has_v6: bool,
     config: &DeviceConfig,
-    dns: Option<&Arc<DnsService>>,
     cache: &TtlDnsCache,
 ) -> Result<std::net::IpAddr, String> {
     if let Some(ip) = cache.get(domain) {
         return Ok(ip);
     }
     let (ips, ttl) = match config.resolve_dns() {
-        Ok(crate::config::DnsConfig::Local) => {
-            // Go resolveRemote 的 local 分支：走 app DNS（h.dns.LookupIP），
-            // 不经隧道。app DNS 不暴露记录 TTL → 缺省 300（Go netstack 默认）。
-            let d = dns.ok_or_else(|| {
-                "wireguard outbound: remoteDNS=local requires dns service".to_string()
-            })?;
-            let ip = resolve_dest_domain(domain, config.domain_strategy, has_v4, has_v6, d).await?;
-            (vec![ip], DEFAULT_DNS_TTL_SECS)
-        },
         Ok(crate::config::DnsConfig::Default) => {
             resolve_domain_in_tunnel(netstack, domain, has_v4, has_v6, &TUNNEL_DNS_SERVERS).await?
         },
@@ -1163,37 +1125,22 @@ mod tests {
     #[tokio::test]
     async fn resolve_dest_domain_prefers_matching_family() {
         let dns = hosts_dns().await;
-        // Go client.go:170-172 —— IPv4Enable = hasIPv4 && preferIP4()
-        let ip = resolve_dest_domain(
-            "wg-test.invalid",
-            crate::config::DomainStrategy::ForceIp,
-            true,
-            true,
-            &dns,
-        )
-        .await
-        .expect("resolve v4");
+        // Go efc9e6da 后 resolveLocal：双栈 LookupIP（接口族约束经 has_v4/has_v6）。
+        let ip =
+            resolve_dest_domain("wg-test.invalid", true, true, &dns).await.expect("resolve v4");
         assert!(ip.is_ipv4());
 
         // v6 正路径不测：check_routes() 系统探测在无 IPv6 路由的测试机上
         // 将 ipv6_enable 置 false（Go checkSystem 同语义，server.rs:211-220），
         // v6-only 查询必然 EmptyResponse——非实现缺陷，是环境约束。
         // v6 约束语义由下方 family_constraint 测试覆盖（它断言 Err 路径）。
-        let _ = crate::config::DomainStrategy::ForceIp;
     }
 
     #[tokio::test]
     async fn resolve_dest_domain_family_constraint_yields_error() {
         let dns = hosts_dns().await;
         // interface 只有 v6 但 hosts 只有 v4 记录 → 空结果报错（Go dns.ErrEmptyResponse）
-        let r = resolve_dest_domain(
-            "wg-test.invalid",
-            crate::config::DomainStrategy::ForceIp,
-            false,
-            true,
-            &dns,
-        )
-        .await;
+        let r = resolve_dest_domain("wg-test.invalid", false, true, &dns).await;
         assert!(r.is_err());
     }
 
@@ -1230,15 +1177,9 @@ mod tests {
         // （上方）由 hosts 层过滤产生 Err；此处覆盖出口过滤分支——
         // v4-only 接口 + v4-only 记录正常解析（回归面：过滤不得误杀合法候选）。
         let dns = hosts_dns().await;
-        let ip = resolve_dest_domain(
-            "wg-test.invalid",
-            crate::config::DomainStrategy::ForceIp,
-            true,
-            false,
-            &dns,
-        )
-        .await
-        .expect("v4-only interface with v4 record resolves");
+        let ip = resolve_dest_domain("wg-test.invalid", true, false, &dns)
+            .await
+            .expect("v4-only interface with v4 record resolves");
         assert!(ip.is_ipv4());
     }
 

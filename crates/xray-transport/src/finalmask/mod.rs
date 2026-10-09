@@ -1120,6 +1120,26 @@ fn build_noise_config(settings: &serde_json::Value) -> io::Result<noise::NoiseCo
     let mut items = Vec::new();
     for item in settings.get("noise").and_then(|x| x.as_array()).unwrap_or(&empty) {
         let (rand_min, rand_max) = json_range(item, "rand")?;
+        let is_exp = json_str(item, "type").to_ascii_lowercase() == "exp";
+        // Go：互斥校验先于 exp 分支——exp 的 packet 是 JSON 字符串（原始字节恒非空），
+        // 故 type=exp 且 rand.to>0 时 Go 侧必触发互斥错误，此处对齐。
+        if rand_max > 0 && is_exp {
+            return Err(mask_err("noise item: packet and rand are mutually exclusive"));
+        }
+        if is_exp {
+            let Some(exp) = item.get("packet").and_then(|x| x.as_str()) else {
+                return Err(mask_err(r#""packet" of noise "type": "exp" must be a string"#));
+            };
+            let segments = parse_noise_exp(exp)?;
+            let (delay_min, delay_max) = json_range(item, "delay")?;
+            items.push(noise::NoiseItem {
+                segments,
+                delay_min,
+                delay_max,
+                ..noise::NoiseItem::default()
+            });
+            continue;
+        }
         let packet = parse_byte_slice(item.get("packet"), json_str(item, "type"))?;
         if !packet.is_empty() && rand_max > 0 {
             return Err(mask_err("noise item: packet and rand are mutually exclusive"));
@@ -1134,9 +1154,128 @@ fn build_noise_config(settings: &serde_json::Value) -> io::Result<noise::NoiseCo
             packet,
             delay_min,
             delay_max,
+            segments: Vec::new(),
         });
     }
     Ok(noise::NoiseConfig { reset_min, reset_max, items })
+}
+
+/// Go `parseNoiseExp`（e51b3c36）：按 `<\s*([a-z]+)(?:\s+([^>]*?))?\s*>` 逐段切分
+/// exp 表达式；段间/尾部非空白内容报 `invalid noise exp near ...`；零段报
+/// `empty noise exp`。手写扫描复刻正则语义（避免为此引入 regex 依赖）。
+fn parse_noise_exp(exp: &str) -> io::Result<Vec<noise::NoiseSegment>> {
+    let mut segments = Vec::new();
+    let bytes = exp.as_bytes();
+    let (mut last, mut i) = (0usize, 0usize);
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let Some((end, key, arg)) = try_match_noise_tag(exp, i) else {
+            i += 1;
+            continue;
+        };
+        if !exp[last..i].trim().is_empty() {
+            return Err(mask_err(format!("invalid noise exp near {}", &exp[last..i])));
+        }
+        last = end;
+        i = end;
+        segments.push(build_noise_segment(key, arg)?);
+    }
+    if !exp[last..].trim().is_empty() {
+        return Err(mask_err(format!("invalid noise exp near {}", &exp[last..])));
+    }
+    if segments.is_empty() {
+        return Err(mask_err(format!("empty noise exp: {exp}")));
+    }
+    Ok(segments)
+}
+
+/// 在 `start` 处尝试匹配 Go 正则 `<\s*([a-z]+)(?:\s+([^>]*?))?\s*>`。
+///
+/// 成功返回 `(匹配终点, key, arg)`；失败返回 `None`（调用方前移一格继续扫描，
+/// 与 `FindAllStringSubmatchIndex` 的逐位置尝试语义一致）。
+fn try_match_noise_tag(exp: &str, start: usize) -> Option<(usize, &str, &str)> {
+    let b = exp.as_bytes();
+    let mut j = start + 1;
+    while j < b.len() && b[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    let key_start = j;
+    while j < b.len() && b[j].is_ascii_lowercase() {
+        j += 1;
+    }
+    if j == key_start {
+        return None;
+    }
+    let key = &exp[key_start..j];
+    // 可选参数组 `\s+([^>]*?)` + 尾随 `\s*`：arg 从首个非空白起，到 `'>'` 前的
+    // 最后一个非空白止（惰性 `[^>]*?` 与贪婪 `\s*` 的净效果）。
+    let mut k = j;
+    while k < b.len() && b[k].is_ascii_whitespace() {
+        k += 1;
+    }
+    match b.get(k) {
+        Some(b'>') => Some((k + 1, key, "")),
+        Some(_) => {
+            let mut m = k;
+            while m < b.len() && b[m] != b'>' {
+                m += 1;
+            }
+            if m >= b.len() {
+                return None;
+            }
+            Some((m + 1, key, exp[k..m].trim_end()))
+        },
+        None => None,
+    }
+}
+
+/// Go `buildNoiseSegment`：`<key arg>` → [`noise::NoiseSegment`]。
+///
+/// - `b`：hex 字节串（容忍内部空白，`0x`/`0X` 前缀可剥）
+/// - `r`/`rc`/`rd`：随机字节/ASCII 字母/数字，尺寸 `"lo-hi"` 或 `"n"`（0..=65535）
+/// - `t`/`c`/`n`：时间戳/计数器/nonce，无参
+fn build_noise_segment(key: &str, arg: &str) -> io::Result<noise::NoiseSegment> {
+    let size_segment = |kind: noise::NoiseSegmentKind| -> io::Result<noise::NoiseSegment> {
+        if arg.is_empty() {
+            return Err(mask_err(format!("<{key}> in noise exp needs a size")));
+        }
+        let (lo, hi) = parse_range_string(arg)?;
+        if lo < 0 || hi < lo || hi > 65535 {
+            return Err(mask_err(format!("invalid size in noise exp: {arg}")));
+        }
+        Ok(noise::NoiseSegment { kind, bytes: Vec::new(), min_size: lo, max_size: hi })
+    };
+    match key {
+        "b" => {
+            let joined: String = arg.split_whitespace().collect();
+            let hex_str =
+                joined.strip_prefix("0x").or_else(|| joined.strip_prefix("0X")).unwrap_or(&joined);
+            if hex_str.is_empty() {
+                return Err(mask_err("empty bytes in noise exp"));
+            }
+            let raw = hex::decode(hex_str)
+                .map_err(|e| mask_err(format!("invalid hex in noise exp: {arg}: {e}")))?;
+            Ok(noise::NoiseSegment { bytes: raw, ..noise::NoiseSegment::default() })
+        },
+        "r" => size_segment(noise::NoiseSegmentKind::Random),
+        "rc" => size_segment(noise::NoiseSegmentKind::RandomAscii),
+        "rd" => size_segment(noise::NoiseSegmentKind::RandomDigit),
+        "t" | "c" | "n" => {
+            if !arg.is_empty() {
+                return Err(mask_err(format!("<{key}> in noise exp takes no argument")));
+            }
+            let kind = match key {
+                "t" => noise::NoiseSegmentKind::Timestamp,
+                "c" => noise::NoiseSegmentKind::Counter,
+                _ => noise::NoiseSegmentKind::Nonce,
+            };
+            Ok(noise::NoiseSegment { kind, ..noise::NoiseSegment::default() })
+        },
+        _ => Err(mask_err(format!("unknown <{key}> in noise exp"))),
+    }
 }
 
 /// Go `Sudoku.Build` → `sudoku::SudokuConfig`（新驼峰键优先，legacy 下划线键兜底）。
@@ -1914,6 +2053,67 @@ mod tests {
         // packet 与 rand>0 互斥（对齐 Go Build 校验）
         let bad = fm(r#"{"noise":[{"rand":{"from":1,"to":9},"packet":[1]}]}"#);
         assert!(build_noise_config(&bad).is_err());
+    }
+
+    #[test]
+    fn parse_json_noise_exp_config_roundtrip() {
+        // type=exp：packet 是表达式字符串；delay 字段 roundtrip 进 Item。
+        let settings = fm(r#"{"reset":{"from":1,"to":2},
+                "noise":[{"type":"exp","packet":"<b 0x0d0a0d0a><t><r 24><rc 8-16><rd 4><c><n>","delay":{"from":5,"to":9}}]}"#);
+        let cfg = build_noise_config(&settings).unwrap();
+        assert_eq!(cfg.items.len(), 1);
+        let segs = &cfg.items[0].segments;
+        assert_eq!(segs.len(), 7);
+        assert_eq!(segs[0].kind, noise::NoiseSegmentKind::Bytes);
+        assert_eq!(segs[0].bytes, vec![0x0d, 0x0a, 0x0d, 0x0a]);
+        assert_eq!(segs[1].kind, noise::NoiseSegmentKind::Timestamp);
+        assert_eq!(segs[2].kind, noise::NoiseSegmentKind::Random);
+        assert_eq!((segs[2].min_size, segs[2].max_size), (24, 24));
+        assert_eq!(segs[3].kind, noise::NoiseSegmentKind::RandomAscii);
+        assert_eq!((segs[3].min_size, segs[3].max_size), (8, 16));
+        assert_eq!(segs[4].kind, noise::NoiseSegmentKind::RandomDigit);
+        assert_eq!((segs[4].min_size, segs[4].max_size), (4, 4));
+        assert_eq!(segs[5].kind, noise::NoiseSegmentKind::Counter);
+        assert_eq!(segs[6].kind, noise::NoiseSegmentKind::Nonce);
+        // delay 字段 roundtrip（任务验收点）
+        assert_eq!((cfg.items[0].delay_min, cfg.items[0].delay_max), (5, 9));
+        // legacy item 不受影响（同配置混排）。
+        let mixed = fm(r#"{"noise":[{"type":"exp","packet":"<b 01>"},
+                         {"packet":[9],"delay":1}]}"#);
+        let cfg = build_noise_config(&mixed).unwrap();
+        assert_eq!(cfg.items[1].packet, vec![9]);
+        assert!(cfg.items[1].segments.is_empty());
+        // type 大小写不敏感（Go strings.ToLower）。
+        let upper = fm(r#"{"noise":[{"type":"EXP","packet":"<b ff>"}]}"#);
+        assert_eq!(build_noise_config(&upper).unwrap().items[0].segments.len(), 1);
+    }
+
+    #[test]
+    fn parse_json_noise_exp_errors() {
+        // packet 非字符串（Go json.Unmarshal 报 "must be a string"）。
+        let e =
+            build_noise_config(&fm(r#"{"noise":[{"type":"exp","packet":[1,2]}]}"#)).unwrap_err();
+        assert!(e.to_string().contains("must be a string"), "{e}");
+        // exp + rand>0 → Go 侧互斥校验先触发。
+        let e =
+            build_noise_config(&fm(r#"{"noise":[{"type":"exp","packet":"<t>","rand":{"to":9}}]}"#))
+                .unwrap_err();
+        assert!(e.to_string().contains("mutually exclusive"), "{e}");
+        // 散文本段间 → invalid near。
+        let e = parse_noise_exp("x<r>").unwrap_err();
+        assert!(e.to_string().contains("invalid noise exp near x"), "{e}");
+        // 尾部散文本（用无参合法段，避免段错误先于尾检触发——Go 同序）。
+        let e = parse_noise_exp("<t>trailing").unwrap_err();
+        assert!(e.to_string().contains("invalid noise exp near trailing"), "{e}");
+        // 空表达式。
+        let e = parse_noise_exp("").unwrap_err();
+        assert!(e.to_string().contains("empty noise exp"), "{e}");
+        // 未知 key / 缺尺寸 / 无参 key 带参 / 非法尺寸 / 非法 hex。
+        assert!(parse_noise_exp("<zz 5>").is_err());
+        assert!(parse_noise_exp("<r>").is_err());
+        assert!(parse_noise_exp("<t 5>").is_err());
+        assert!(parse_noise_exp("<r 70000>").is_err());
+        assert!(parse_noise_exp("<b zzzz>").is_err());
     }
 
     #[test]
