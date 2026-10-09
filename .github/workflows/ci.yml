@@ -83,6 +83,13 @@ jobs:
       - uses: ./.github/actions/setup-boringssl
       - run: cargo build --workspace --release
       - run: cargo build --workspace
+      # 生产换核用：Linux xray 二进制上传为 artifact（一次性 ops，swap 后 revert）
+      - name: Upload Linux xray binary
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-prod-swap
+          path: target/release/xray
 
   # 测试
   test:
