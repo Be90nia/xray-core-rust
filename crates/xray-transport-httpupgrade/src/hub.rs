@@ -13,6 +13,9 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 
+use base64::Engine;
+use sha1::{Digest, Sha1};
+
 use crate::{
     config::Config,
     error::{HttpUpgradeError, Result},
@@ -106,14 +109,30 @@ pub fn parse_upgrade_request(bytes: &[u8], config: &Config) -> Result<UpgradeReq
     Ok(UpgradeRequest { path, host, headers, forwarded_for })
 }
 
+/// RFC 6455 全局 GUID，参与 `Sec-WebSocket-Accept` 计算
+/// （Go hub.go 注释：magic number in RFC 6455）。
+const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
 /// 构造 101 Switching Protocols 响应字节流。对应 Go `hub.go::server.upgrade`
 /// 响应部分。
+///
+/// `ws_key` 为客户端 `Sec-WebSocket-Key`（`None` 或空串都不回 Accept——
+/// Go `wsKey != ""`，0fc37920 hub.go:86-89）。
 #[must_use]
-pub fn build_upgrade_response() -> Vec<u8> {
+pub fn build_upgrade_response(ws_key: Option<&str>) -> Vec<u8> {
     let mut buf = Vec::with_capacity(128);
     buf.extend_from_slice(b"HTTP/1.1 101 Switching Protocols\r\n");
     buf.extend_from_slice(b"Connection: Upgrade\r\n");
     buf.extend_from_slice(b"Upgrade: websocket\r\n");
+    if let Some(key) = ws_key.filter(|k| !k.is_empty()) {
+        let mut sha = Sha1::new();
+        sha.update(key.as_bytes());
+        sha.update(WS_GUID.as_bytes());
+        let accept = base64::engine::general_purpose::STANDARD.encode(sha.finalize());
+        buf.extend_from_slice(b"Sec-WebSocket-Accept: ");
+        buf.extend_from_slice(accept.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
     buf.extend_from_slice(b"\r\n");
     buf
 }
@@ -291,12 +310,30 @@ mod tests {
 
     #[test]
     fn build_response_format() {
-        let bytes = build_upgrade_response();
+        let bytes = build_upgrade_response(None);
         let s = std::str::from_utf8(&bytes).unwrap();
         assert!(s.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
         assert!(s.contains("Connection: Upgrade\r\n"));
         assert!(s.contains("Upgrade: websocket\r\n"));
         assert!(s.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn build_response_accept_matches_rfc6455_vector() {
+        // Go 0fc37920 hub.go:86-89 + RFC 6455 §1.3 官方向量。
+        let bytes = build_upgrade_response(Some("dGhlIHNhbXBsZSBub25jZQ=="));
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(s.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"));
+    }
+
+    #[test]
+    fn build_response_empty_key_omits_accept() {
+        // Go `wsKey != ""`：空值等同缺失。
+        for key in [None, Some("")] {
+            let bytes = build_upgrade_response(key);
+            let s = std::str::from_utf8(&bytes).unwrap();
+            assert!(!s.contains("Sec-WebSocket-Accept"));
+        }
     }
 
     #[test]
@@ -320,8 +357,11 @@ mod tests {
         let req = crate::dialer::build_upgrade_request("example.com", &cfg);
         let parsed = parse_upgrade_request(&req, &cfg).unwrap();
         assert_eq!(parsed.path, "/ws");
-        let resp = build_upgrade_response();
+        // 0fc37920 后客户端缺省带 key → 响应恒回 Accept。
+        let ws_key = parsed.headers.get("sec-websocket-key").map(String::as_str);
+        let resp = build_upgrade_response(ws_key);
         assert!(!resp.is_empty());
+        assert!(std::str::from_utf8(&resp).unwrap().contains("Sec-WebSocket-Accept: "));
     }
 
     #[test]

@@ -11,7 +11,7 @@
 //!
 //! ## HTTP/1.1 格式
 //!
-//! 请求（手写，不引 http crate），header 集合对齐 Go dialer.go:96-101：
+//! 请求（手写，不引 http crate），header 集合对齐 Go dialer.go:96-110：
 //! ```text
 //! GET <path> HTTP/1.1\r\n
 //! Host: <host>\r\n
@@ -19,12 +19,14 @@
 //! <browser-masquerade-headers（UA 缺省/枚举值时注入）>\r\n
 //! Connection: Upgrade\r\n
 //! Upgrade: websocket\r\n
+//! Sec-WebSocket-Key/Sec-WebSocket-Version（缺省时补齐，Go 0fc37920）\r\n
 //! \r\n
 //! ```
 //!
 //! 响应校验：`101 Switching Protocols` + `Upgrade: websocket`（小写比较） +
 //! `Connection: upgrade`（小写比较）。
 
+use base64::Engine;
 use xray_common::browser::{set_header, try_default_headers_with};
 
 use crate::{
@@ -42,7 +44,8 @@ use crate::{
 ///
 /// header 顺序对齐 Go `dialer.go::dialhttpUpgrade`：自定义 header（AddHeader）
 /// → 浏览器伪装（`TryDefaultHeadersWith(header, "ws")`，"ws" 是 variant 名）
-/// → `Connection`/`Upgrade` Set 覆盖（dialer.go:96-101）。
+/// → `Connection`/`Upgrade` Set 覆盖 → `Sec-WebSocket-*` 缺省时补齐
+/// （Go 0fc37920 dialer.go:102-110）。
 #[must_use]
 pub fn build_upgrade_request(host: &str, config: &Config) -> Vec<u8> {
     // 1. 用户自定义 header（Go dialer.go:96-98 AddHeader 循环）。
@@ -54,6 +57,16 @@ pub fn build_upgrade_request(host: &str, config: &Config) -> Vec<u8> {
     // 3. Connection/Upgrade 最后 Set（Go dialer.go:100-101）：覆盖用户同名配置。
     set_header(&mut headers, "Connection", "Upgrade");
     set_header(&mut headers, "Upgrade", "websocket");
+    // 4. Sec-WebSocket-* 握手头（Go 0fc37920 dialer.go:102-110）：仅用户未提供时 补齐——随机 16B
+    //    base64 key（RFC 6455，恒 24 字符）+ 版本 13。 存在性判断大小写不敏感（Go 经 Header.Values
+    //    规范化键名查询）。
+    if headers.iter().all(|(k, _)| !k.eq_ignore_ascii_case("sec-websocket-key")) {
+        let key = base64::engine::general_purpose::STANDARD.encode(rand::random::<[u8; 16]>());
+        set_header(&mut headers, "Sec-WebSocket-Key", &key);
+    }
+    if headers.iter().all(|(k, _)| !k.eq_ignore_ascii_case("sec-websocket-version")) {
+        set_header(&mut headers, "Sec-WebSocket-Version", "13");
+    }
 
     let mut buf = Vec::with_capacity(512);
     // 请求行
@@ -250,6 +263,47 @@ mod tests {
         assert!(!s.contains("h2c"), "user Upgrade overridden");
         assert!(s.matches("Connection: Upgrade\r\n").count() == 1);
         assert!(s.matches("Upgrade: websocket\r\n").count() == 1);
+    }
+
+    /// 提取首个指定 header 的值（测试辅助）。
+    fn header_value<'a>(s: &'a str, name: &str) -> Option<&'a str> {
+        s.lines().find_map(|l| l.strip_prefix(name)?.strip_prefix(": "))
+    }
+
+    #[test]
+    fn build_request_adds_sec_websocket_handshake_headers() {
+        // Go 0fc37920：缺省补随机 key（16B → 24 字符 base64，尾 "=="）+ 版本 13。
+        let cfg = make_config("/ws");
+        let bytes = build_upgrade_request("example.com", &cfg);
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert_eq!(header_value(s, "Sec-WebSocket-Version"), Some("13"));
+        let key = header_value(s, "Sec-WebSocket-Key").expect("key injected by default");
+        assert_eq!(key.len(), 24);
+        assert!(key.ends_with("=="));
+    }
+
+    #[test]
+    fn build_request_key_is_random_per_call() {
+        let cfg = make_config("/ws");
+        let bytes_a = build_upgrade_request("example.com", &cfg);
+        let bytes_b = build_upgrade_request("example.com", &cfg);
+        let a = std::str::from_utf8(&bytes_a).unwrap();
+        let b = std::str::from_utf8(&bytes_b).unwrap();
+        assert_ne!(header_value(a, "Sec-WebSocket-Key"), header_value(b, "Sec-WebSocket-Key"));
+    }
+
+    #[test]
+    fn build_request_preserves_user_provided_sec_websocket_headers() {
+        // Go `Header.Values(...) == 0` 才补：用户配置了 key/version 不覆盖、不重复。
+        let mut cfg = make_config("/ws");
+        cfg.header.insert("Sec-WebSocket-Key".into(), "dGhlIHNhbXBsZSBub25jZQ==".into());
+        cfg.header.insert("Sec-WebSocket-Version".into(), "8".into());
+        let bytes = build_upgrade_request("example.com", &cfg);
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert_eq!(header_value(s, "Sec-WebSocket-Key"), Some("dGhlIHNhbXBsZSBub25jZQ=="));
+        assert_eq!(s.matches("Sec-WebSocket-Key:").count(), 1);
+        assert_eq!(header_value(s, "Sec-WebSocket-Version"), Some("8"));
+        assert_eq!(s.matches("Sec-WebSocket-Version:").count(), 1);
     }
 
     #[test]
