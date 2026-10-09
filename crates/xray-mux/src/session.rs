@@ -21,7 +21,7 @@ use std::{
 
 use tokio::sync::{Mutex, RwLock, watch};
 use tracing::debug;
-use xray_buf::{reader::BufferedReader, writer::BufferedWriter};
+use xray_buf::{io::Writer as _, reader::BufferedReader, writer::BufferedWriter};
 
 // ========== 传输类型 ==========
 
@@ -289,12 +289,16 @@ impl Session {
             // 无 XUDP：中断输入，关闭输出
             drop(xudp_guard);
 
-            if let Some(ref mut reader) = *self.input.lock().await {
+            if let Some(reader) = &mut *self.input.lock().await {
                 reader.interrupt();
                 reader.close();
             }
-            if let Some(ref mut writer) = *self.output.lock().await {
+            if let Some(writer) = &mut *self.output.lock().await {
                 let _ = writer.flush().await;
+                // Go Session.Close：common.Close(s.output)——pipe 关闭让 app
+                // 下行读端收 EOF；只 flush 不关会让 dispatcher 下行 bridge 永久
+                // 悬挂（bd txhn：carrier 死后 8 流 87s 零字节冻结）。
+                writer.shutdown();
             }
         } else {
             // 有 XUDP：Active 状态转为 Expiring，设置 60 秒过期
