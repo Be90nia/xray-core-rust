@@ -57,6 +57,7 @@ coverage/
 # 压测 harness 本地产物（metrics.csv / summary.md，不入库）
 stress-out*/
 stress-tmp-debug/
+stress-analysis-tmp/
 
 # docker 镜像构建注入的已 patch boringssl（本地复制自宿主机 boringssl-fv，不入库）
 .docker-boringssl/
