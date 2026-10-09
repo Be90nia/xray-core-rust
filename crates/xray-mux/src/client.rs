@@ -551,15 +551,18 @@ impl ClientWorker {
     /// 任何读错/EOF 退出并关闭 worker。
     async fn fetch_output(self: Arc<Self>, mut reader: BufferedReader) {
         let done = self.done_rx();
+        let mut stop_reason = String::from("worker closed");
         loop {
             let (meta, data) = tokio::select! {
                 _ = wait_done(done.clone()) => break,
                 frame = read_frame(&mut reader) => match frame {
                     Ok(f) => f,
                     Err(e) => {
-                        if !e.is_empty() {
-                            debug!("mux client fetch_output stopped: {}", e);
-                        }
+                        stop_reason = if e.is_empty() {
+                            "carrier EOF (peer closed connection)".to_string()
+                        } else {
+                            format!("carrier read error: {e}")
+                        };
                         break;
                     }
                 },
@@ -575,10 +578,25 @@ impl ClientWorker {
                 },
                 SessionStatus::Keep => {
                     if self.handle_status_keep(&meta, data).await {
+                        stop_reason =
+                            "carrier write failed while closing unknown session".to_string();
                         break;
                     }
                 },
             }
+        }
+        // carrier 死亡必须可观测（bd txhn）：一条 carrier 承载全部子会话，
+        // 死亡即批量断流；旧实现 EOF 零日志、错误仅 debug 级，loss+RTT 下的
+        // 载体静默死亡完全不可见。
+        let dropped = self.session_manager.active_count();
+        if dropped > 0 {
+            tracing::error!(
+                dropped_sessions = dropped,
+                reason = %stop_reason,
+                "mux carrier terminated, active sessions dropped"
+            );
+        } else {
+            debug!(reason = %stop_reason, "mux carrier terminated (no active sessions)");
         }
         // Go fetchOutput defer: done.Close()
         self.close();

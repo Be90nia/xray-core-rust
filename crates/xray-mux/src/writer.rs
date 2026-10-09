@@ -121,27 +121,24 @@ impl MuxWriter {
         meta
     }
 
-    /// 仅写入元数据帧
-    /// 小于缓冲区半容量的数据帧会被 `BufferedWriter` 滞留——每次写入后
-    /// `flush()`，避免首包/小包滞留 carrier 队列（Go 等价 `buf.Writer` 直透）。
+    /// 仅写入元数据帧。
+    /// 整帧单次落盘（Go writer.go:62-69 `WriteMultiBuffer({b})` 同形）。
     async fn write_meta_only(&mut self) -> Result<(), MuxError> {
         let meta = self.get_next_frame_meta();
         let mut vec = Vec::new();
         meta.write_to(&mut vec).map_err(|e| MuxError::Io(format!("meta: {:?}", e)))?;
         let mb = MultiBuffer::from_buffer(Buffer::from_vec(vec));
         self.writer
-            .write_multi_buffer_impl(mb)
+            .write_multi_buffer_direct(mb)
             .await
-            .map_err(|e| MuxError::Io(format!("write: {:?}", e)))?;
-        self.writer.flush().await.map_err(|e| MuxError::Io(format!("flush: {:?}", e)))
+            .map_err(|e| MuxError::Io(format!("write: {:?}", e)))
     }
 
-    /// 写入元数据+数据帧；写入后 flush（详见 [`Self::write_meta_only`]）。
+    /// 写入元数据+数据帧。
     async fn write_data(&mut self, data: MultiBuffer) -> Result<(), MuxError> {
         let mut meta = self.get_next_frame_meta();
         meta.set_option(OPTION_DATA);
-        write_meta_with_frame(&mut self.writer, meta, data).await?;
-        self.writer.flush().await.map_err(|e| MuxError::Io(format!("flush: {:?}", e)))
+        write_meta_with_frame(&mut self.writer, meta, data).await
     }
 
     /// 写入 MultiBuffer 数据
@@ -167,7 +164,7 @@ impl MuxWriter {
         Ok(())
     }
 
-    /// 关闭写入器，发送 End 帧
+    /// 关闭写入器，发送 End 帧（整帧单次落盘）
     pub async fn close(&mut self) -> Result<(), MuxError> {
         let mut option = Bitmask::default();
         if self.has_error {
@@ -178,10 +175,9 @@ impl MuxWriter {
         meta.write_to(&mut vec).map_err(|e| MuxError::Io(format!("close meta: {:?}", e)))?;
         let mb = MultiBuffer::from_buffer(Buffer::from_vec(vec));
         self.writer
-            .write_multi_buffer_impl(mb)
+            .write_multi_buffer_direct(mb)
             .await
-            .map_err(|e| MuxError::Io(format!("close write: {:?}", e)))?;
-        self.writer.flush().await.map_err(|e| MuxError::Io(format!("close flush: {:?}", e)))
+            .map_err(|e| MuxError::Io(format!("close write: {:?}", e)))
     }
 
     pub fn set_error(&mut self) {
@@ -205,7 +201,14 @@ impl MuxWriter {
     }
 }
 
-/// 写入元数据+数据帧到底层 Writer
+/// 写入元数据+数据帧到底层 Writer。
+///
+/// 整帧（帧头+全部载荷）经 `write_multi_buffer_direct` 单次落盘——共享
+/// carrier 写端的多个 MuxWriter 间帧不可拆分（Go writer.go:71-87 把
+/// frame 与 data append 进同一 mb 后一次 `WriteMultiBuffer`；Rust 旧实现
+/// 走 `write_multi_buffer_impl` 逐 Buffer 写，帧头先 flush、载荷直写，
+/// 两个锁临界区之间会被并发会话的完整帧插隔 → 读端把孤立载荷当前帧头
+/// 解析出 `meta_len too large` → 整条 carrier 静默死亡，bd txhn）。
 async fn write_meta_with_frame(
     writer: &mut BufferedWriter,
     meta: FrameMetadata,
@@ -230,7 +233,7 @@ async fn write_meta_with_frame(
     for buf in data.into_buffers() {
         mb.push(buf);
     }
-    writer.write_multi_buffer_impl(mb).await.map_err(|e| MuxError::Io(format!("write: {:?}", e)))
+    writer.write_multi_buffer_direct(mb).await.map_err(|e| MuxError::Io(format!("write: {:?}", e)))
 }
 
 impl Writer for MuxWriter {
@@ -414,5 +417,133 @@ mod tests {
         mb.push(Buffer::from_vec(b"first".to_vec()));
         mb.push(Buffer::from_vec(b"second".to_vec()));
         assert!(w.write(mb).await.is_ok());
+    }
+
+    /// bd txhn 回归：共享写端上多个 MuxWriter 并发整帧写入必须帧原子。
+    ///
+    /// 旧实现帧头经 BufferedWriter 内部缓冲 flush、载荷（> 容量半量）直写，
+    /// 两个共享锁临界区之间可被并发会话的完整帧插隔——读端把孤立载荷当
+    /// 帧头解析出 `meta_len too large`，整条 carrier 静默死亡、全部子会话
+    /// 断流。修后整帧单次落盘（对齐 Go writer.go:71-87），并发下流内帧序
+    /// 仍可逐帧解析，载荷不跨会话污染。
+    #[tokio::test]
+    async fn shared_writer_interleaved_frame_writes_stay_atomic() {
+        use std::sync::Arc;
+
+        use tokio::sync::Mutex;
+        use xray_buf::{pipe, reader::BufferedReader};
+
+        const SESSIONS: u16 = 2;
+        const CHUNKS: usize = 24;
+        const CHUNK_LEN: usize = STREAM_CHUNK_SIZE; // > 缓冲半量，走直写分支
+        // 各会话独立填充字节：错位时孤儿载荷的前两字节必为 0xA1xx/0xB2xx
+        // （> 512），meta_len 合法性断言即刻击穿
+        const FILL: [u8; 2] = [0xA1, 0xB2];
+
+        let (raw_r, raw_w) = pipe::new_with_option(xray_buf::pipe::PipeOption {
+            limit: 64 * 1024,
+            ..Default::default()
+        });
+        let shared: Arc<Mutex<Option<Box<dyn Writer>>>> =
+            Arc::new(Mutex::new(Some(Box::new(raw_w))));
+        let mut reader = BufferedReader::new(Box::new(raw_r));
+
+        let mut writers = Vec::new();
+        for sid in 1..=SESSIONS {
+            let shared = Arc::clone(&shared);
+            let fill = FILL[(sid - 1) as usize];
+            writers.push(tokio::spawn(async move {
+                let mut mw = MuxWriter::new(
+                    sid,
+                    make_tcp_dest(),
+                    Box::new(SharedWriter::new(shared)),
+                    TransferType::Stream,
+                    None,
+                );
+                for _ in 0..CHUNKS {
+                    let mut mb = MultiBuffer::new();
+                    mb.push(Buffer::from_vec(vec![fill; CHUNK_LEN]));
+                    mw.write(mb).await.expect("frame write");
+                }
+            }));
+        }
+
+        // 并发解析：帧流量（2×192KB）远超管道上限（64KB），写侧必然在管道
+        // 背压点交错挂起——这正是旧实现暴露拆帧窗口的调度形态
+        let mut counts = [0usize; (SESSIONS + 1) as usize];
+        let mut frames = 0usize;
+        let mut head = [0u8; 2];
+        // BufferedReader 无 read_exact 原语（client.rs read_frame 同款循环）
+        async fn read_exact_local(reader: &mut BufferedReader, dst: &mut [u8]) {
+            let mut off = 0;
+            while off < dst.len() {
+                let n = reader.read(&mut dst[off..]).await;
+                assert!(n > 0, "unexpected EOF at offset {off}");
+                off += n;
+            }
+        }
+        while frames < SESSIONS as usize * CHUNKS {
+            let rd = async {
+                let mut off = 0;
+                while off < head.len() {
+                    let n = reader.read(&mut head[off..]).await;
+                    assert!(n > 0, "carrier EOF at frame {frames}");
+                    off += n;
+                }
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(30), rd)
+                .await
+                .expect("frame header read stalled");
+            let meta_len = u16::from_be_bytes(head) as usize;
+            assert!(
+                (4..=512).contains(&meta_len),
+                "frame stream desync: bogus meta_len {meta_len} at frame {frames}"
+            );
+            let mut meta_buf = vec![0u8; meta_len + 2];
+            meta_buf[..2].copy_from_slice(&head);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                read_exact_local(&mut reader, &mut meta_buf[2..]),
+            )
+            .await
+            .expect("meta read stalled");
+            let (meta, _) =
+                FrameMetadata::read_from_bytes(&meta_buf).expect("parse meta at frame {frames}");
+            let sid = meta.session_id();
+            assert!((1..=SESSIONS).contains(&sid), "frame stream desync: unknown session {sid}");
+            if meta.has_data() {
+                let mut len_buf = [0u8; 2];
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    read_exact_local(&mut reader, &mut len_buf),
+                )
+                .await
+                .expect("payload len read stalled");
+                let payload_len = u16::from_be_bytes(len_buf) as usize;
+                assert_eq!(
+                    payload_len, CHUNK_LEN,
+                    "frame stream desync: payload split at frame {frames}"
+                );
+                let mut payload = vec![0u8; payload_len];
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    read_exact_local(&mut reader, &mut payload),
+                )
+                .await
+                .expect("payload read stalled");
+                assert!(
+                    payload.iter().all(|&b| b == FILL[(sid - 1) as usize]),
+                    "frame stream desync: cross-session payload at frame {frames}"
+                );
+            }
+            counts[sid as usize] += 1;
+            frames += 1;
+        }
+        for t in writers {
+            t.await.expect("writer task");
+        }
+        for sid in 1..=SESSIONS {
+            assert_eq!(counts[sid as usize], CHUNKS, "session {sid} frame count");
+        }
     }
 }

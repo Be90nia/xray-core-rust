@@ -183,6 +183,18 @@ impl BufferedWriter {
         Ok(())
     }
 
+    /// 直接整批写入底层 Writer（绕过内部缓冲的二次拆分）。
+    ///
+    /// 先 flush 既有内部缓冲（保持字节先后序），再把 `mb` 作为**单次**底层
+    /// 写入交付。对帧协议写入方这是原子性边界：多路复用共享写端时，一次
+    /// 调用的全部 Buffer 落在共享锁同一临界区内，中途不会插入其他写者的
+    /// 帧（`write_multi_buffer_impl` 会按 Buffer 逐个 write_buffer，帧头与
+    /// 载荷可被并发写者的完整帧插隔——mux carrier 帧错位根因，bd txhn）。
+    pub async fn write_multi_buffer_direct(&mut self, mb: MultiBuffer) -> Result<()> {
+        self.flush().await?;
+        self.writer.write_multi_buffer(mb).await
+    }
+
     /// 设置缓冲模式
     ///
     /// buffered = true 时启用内部缓冲，false 时直接写入底层。
