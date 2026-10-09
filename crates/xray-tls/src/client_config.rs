@@ -312,8 +312,24 @@ fn custom_root_store(json: &serde_json::Value) -> io::Result<RootCertStore> {
 ///
 /// 对应 Go `TLSConfig.Build` L701-717：空段跳过；hex 非法或长度 ≠ 32 报错。
 fn parse_pinned_hashes(json: &serde_json::Value) -> io::Result<Vec<Vec<u8>>> {
-    let Some(spec) = json.get("pinnedPeerCertSha256").and_then(|v| v.as_str()) else {
+    // 缺失或 null 视同未配（Go encoding/json：缺省零值 / null no-op）；存在但
+    // 非 string 是配置类型错，fail-fast 拒启——不得静默丢 pin 后让 webpki 报
+    // 无关的 UnknownIssuer（bd zl5t；Go 基线实测 unmarshal array→string 硬错）。
+    let Some(pin) = json.get("pinnedPeerCertSha256").filter(|v| !v.is_null()) else {
         return Ok(Vec::new());
+    };
+    let Some(spec) = pin.as_str() else {
+        let got = match pin {
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Bool(_) => "bool",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::Object(_) => "object",
+            _ => "non-string value",
+        };
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("pinnedPeerCertSha256: expected string (comma-separated hex), got {got}"),
+        ));
     };
     let mut pins = Vec::new();
     for v in spec.split(',') {
@@ -776,6 +792,36 @@ mod tests {
             "x.com",
         );
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn pinned_hashes_type_mismatch_fails_fast() {
+        // bd zl5t: 数组/数字等类型手误必须硬错点名字段，不得静默丢 pin 后
+        // 由 webpki 报无关的 UnknownIssuer（对齐 Go unmarshal array→string 硬错）。
+        let bad = [
+            serde_json::json!({"pinnedPeerCertSha256": ["ab".repeat(16), "cd".repeat(16)]}),
+            serde_json::json!({"pinnedPeerCertSha256": 42}),
+        ];
+        for v in &bad {
+            let e = parse_pinned_hashes(v).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+            let msg = e.to_string();
+            assert!(msg.contains("pinnedPeerCertSha256"), "msg: {msg}");
+            assert!(msg.contains("expected string"), "msg: {msg}");
+        }
+        // build 层透传（通用 tlsSettings 装配路径）
+        let r = build_client_config(
+            "tls",
+            Some(&serde_json::json!({"pinnedPeerCertSha256": ["ab".repeat(16)]})),
+            "x.com",
+        );
+        assert!(r.is_err());
+        // null 视同未配（Go encoding/json null no-op）
+        assert!(
+            parse_pinned_hashes(&serde_json::json!({"pinnedPeerCertSha256": null}))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
