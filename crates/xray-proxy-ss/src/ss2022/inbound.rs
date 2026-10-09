@@ -423,11 +423,6 @@ where
     let mut salt = vec![0u8; salt_size];
     conn.read_exact(&mut salt).await?;
 
-    // 重放检查（Go sing：解密前 Check，check 即注册，重放 = ErrSaltNotUnique）
-    if !replay.check(&salt) {
-        return Err(SsError::Ss2022SaltNotUnique);
-    }
-
     // 2. 派生 session subkey
     let subkey = derive_session_subkey(server_psk, &salt, kind);
     let aead = build_aead(kind, &subkey)?;
@@ -494,7 +489,13 @@ where
     }
     let first_payload = variable_plain[payload_start..].to_vec();
 
-    // 7. 构造 SSStream
+    // 7. salt 重放检查（Go InitServerStream：请求头解密+解析全部成功后才
+    // Check——check 即注册；解密失败的未知 salt 不入池，防未认证 salt 毒化）
+    if !replay.check(&salt) {
+        return Err(SsError::Ss2022SaltNotUnique);
+    }
+
+    // 8. 构造 SSStream
     nonce[0] = 1;
     let mut stream = SSStream::new_with_aead_and_nonce(conn, aead, nonce);
     // server 读侧续接请求 nonce 序列（body 首帧 [2,0..]）
@@ -526,11 +527,6 @@ where
     let salt_size = kind.salt_size();
     let mut salt = vec![0u8; salt_size];
     conn.read_exact(&mut salt).await?;
-
-    // 重放检查（Go sing：解密前 Check，check 即注册，重放 = ErrSaltNotUnique）
-    if !replay.check(&salt) {
-        return Err(SsError::Ss2022SaltNotUnique);
-    }
 
     // 2. SIP023 EIH：wire 顺序 salt || EIH || AEAD chunks（先读 16B identity header）
     let tag_size: usize = match kind {
@@ -607,6 +603,12 @@ where
         return Err(SsError::InsufficientData(variable_plain.len()));
     }
     let first_payload = variable_plain[payload_start..].to_vec();
+
+    // salt 重放检查（Go InitServerStream：请求头解密+解析全部成功后才 Check，
+    // check 即注册；解密失败的未知 salt 不入池，防未认证 salt 毒化）
+    if !replay.check(&salt) {
+        return Err(SsError::Ss2022SaltNotUnique);
+    }
 
     nonce[0] = 1;
     let mut stream = SSStream::new_with_aead_and_nonce(conn, aead, nonce);
@@ -786,11 +788,13 @@ mod tests {
         });
 
         for (psk, fill) in [(&alice_psk, 0x77u8), (&bob_psk, 0x88u8)] {
-            let client =
-                Client2022::new("2022-blake3-aes-256-gcm", &b64(psk), "127.0.0.1", addr.port())
-                    .unwrap()
-                    .with_identity(&b64(&server_psk))
-                    .unwrap();
+            let client = Client2022::new(
+                "2022-blake3-aes-256-gcm",
+                &[b64(&server_psk), b64(psk)],
+                "127.0.0.1",
+                addr.port(),
+            )
+            .unwrap();
             let mut stream = client.dial_target("example.com", 443).await.unwrap();
             stream.write_chunk(&[fill; 64]).await.unwrap();
             stream.flush().await.unwrap();
@@ -893,7 +897,7 @@ mod tests {
         );
         server.await.unwrap();
     }
-    /// SIP023 EIH 端到端：Client2022(with_identity) 写 EIH → MultiUserInbound 匹配对应用户。
+    /// SIP023 EIH 端到端：Client2022(PSK 链) 写 EIH → MultiUserInbound 匹配对应用户。
     #[tokio::test]
     async fn multi_user_eih_roundtrip() {
         use base64::Engine as _;
@@ -919,12 +923,17 @@ mod tests {
             inbound.handle_conn(conn).await
         });
 
-        let client =
-            Client2022::new("2022-blake3-aes-256-gcm", &user_psk_b64, "127.0.0.1", addr.port())
-                .unwrap()
-                .with_identity(&server_psk_b64)
-                .unwrap();
-        let _stream = client.dial_target("example.com", 443).await.unwrap();
+        let client = Client2022::new(
+            "2022-blake3-aes-256-gcm",
+            &[server_psk_b64.clone(), user_psk_b64],
+            "127.0.0.1",
+            addr.port(),
+        )
+        .unwrap();
+        let mut stream = client.dial_target("example.com", 443).await.unwrap();
+        // 请求头 deferred：显式 flush（padding-only）让服务端完成握手解析
+        stream.flush_pending_client_2022().await.unwrap();
+        drop(stream);
 
         let result = server.await.unwrap().unwrap();
         assert_eq!(result.address, Address::Domain("example.com".to_string()));
@@ -958,11 +967,13 @@ mod tests {
             inbound.handle_conn(conn).await
         });
 
-        let client =
-            Client2022::new("2022-blake3-aes-256-gcm", &other_psk_b64, "127.0.0.1", addr.port())
-                .unwrap()
-                .with_identity(&server_psk_b64)
-                .unwrap();
+        let client = Client2022::new(
+            "2022-blake3-aes-256-gcm",
+            &[server_psk_b64.clone(), other_psk_b64],
+            "127.0.0.1",
+            addr.port(),
+        )
+        .unwrap();
         let _ = client.dial_target("example.com", 443).await;
 
         let result = server.await.unwrap();
@@ -970,7 +981,7 @@ mod tests {
     }
 
     /// SS-2022 relay e2e（对齐 sing-shadowsocks relay.go）：
-    /// Client(with_identity) → [salt][EIH][EISS] → RelayInbound 剥 EIH →
+    /// Client(PSK 链 [iPSK, destPSK]) → [salt][EIH][EISS] → RelayInbound 剥 EIH →
     /// destination Ss2022Inbound 用 dest PSK 解密 → echo（sing writeResponse 响应头）→ 原路回包。
     #[tokio::test]
     async fn relay_tunnel_roundtrip() {
@@ -1088,11 +1099,13 @@ mod tests {
         });
 
         // 3. client：dest PSK 加密 + relay server PSK 的 EIH
-        let client =
-            Client2022::new("2022-blake3-aes-256-gcm", &dest_psk_b64, "127.0.0.1", relay_port)
-                .unwrap()
-                .with_identity(&server_psk_b64)
-                .unwrap();
+        let client = Client2022::new(
+            "2022-blake3-aes-256-gcm",
+            &[server_psk_b64.clone(), dest_psk_b64],
+            "127.0.0.1",
+            relay_port,
+        )
+        .unwrap();
         // 看门狗：wire 任一侧失配时快速失败而非无限挂起（挂起测试回归防护）
         let roundtrip = async {
             let mut stream = client.dial_target("127.0.0.1", echo_port).await.unwrap();

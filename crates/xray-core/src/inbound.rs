@@ -321,7 +321,9 @@ pub(crate) async fn handle_mux_inbound_link(
             Ok(true) => continue,
             Ok(false) => break, // 干净 EOF
             Err(e) => {
-                tracing::warn!(error = %e, "mux frame processing error");
+                // 整条 carrier 连同全部子会话在此拆除（bd txhn：warn 级曾使
+                // loss+RTT 下的载体死亡在 ERROR 过滤的日志里完全不可见）
+                tracing::error!(error = %e, "mux frame processing error, tearing down carrier");
                 break;
             },
         }
@@ -1562,7 +1564,8 @@ pub async fn serve_ss2022_udp(
         // 海量 UDP 客户端下是内存泄漏；对齐 Go sing udpSessions LRU 淘汰。
         let now = std::time::Instant::now();
         sweep_expired_ss2022_sessions(&mut server_sessions, now);
-        // 1. ECB 解头 + EIH 用户识别
+        // 1. ECB 解头 + EIH 用户识别（chacha：整包一次 XChaCha 解开，
+        //    body 明文随 hdr.chacha_plain 交付）
         let hdr = match server_decode_header(kind, &server_psk, &users, &buf[..n]) {
             Ok(h) => h,
             Err(e) => {
@@ -1590,15 +1593,18 @@ pub async fn serve_ss2022_udp(
         };
         *deadline = now + SS2022_UDP_SESSION_LIFETIME;
         let session = Arc::clone(session);
-        // 3. AEAD 解 body + 解析目标（重放/时间戳校验在 decode_body 内）
-        let (address, port, payload) =
-            match session.decode_body(&hdr.hdr, hdr.packet_id, &buf[16 + hdr.eih_len..n]) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::debug!(error = %e, "ss2022 udp decode body failed");
-                    continue;
-                },
-            };
+        // 3. AEAD 解 body + 解析目标（重放/时间戳校验在 decode 内）
+        let decoded = match &hdr.chacha_plain {
+            Some(plain) => session.decode_chacha_body(plain, hdr.packet_id),
+            None => session.decode_body(&hdr.hdr, hdr.packet_id, &buf[16 + hdr.eih_len..n]),
+        };
+        let (address, port, payload) = match decoded {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "ss2022 udp decode body failed");
+                continue;
+            },
+        };
         let dest = Destination::new(address, Port::new(port), Network::UDP);
         // 4. 分发到 relay task（首包懒建）
         let tx = sessions.entry(sid).or_insert_with(|| {
@@ -5301,6 +5307,110 @@ mod tests {
             let n = tokio::time::timeout_at(deadline, client_io.read(&mut buf))
                 .await
                 .expect("response within 5s")
+                .expect("read");
+            accum.extend_from_slice(&buf[..n]);
+            let mut cursor = std::io::Cursor::new(&accum[..]);
+            let mut pr = PacketReader::new(&mut cursor);
+            if let Ok(Some(pkt)) = pr.read_packet() {
+                let (data, _) = pkt.into_parts();
+                assert_eq!(data, payload);
+                return;
+            }
+        }
+    }
+
+    /// SS-2022 chacha 单用户 UDP 全链 e2e（v26.9.30 对齐：chacha UDP 解封）：
+    /// parse（chacha 单 PSK）→ pump_ss2022_udp（XChaCha 24B nonce 帧）→
+    /// serve_ss2022_udp（chacha_plain 整包解密）→ freedom → echo → 回程。
+    #[tokio::test]
+    async fn ss2022_chacha_udp_outbound_inbound_roundtrip_e2e() {
+        use base64::Engine as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use xray_app_dispatcher::default::DialBridge;
+        use xray_proxy_freedom::{dispatcher::FreedomDispatchBridge, make_freedom_dial_fn};
+        use xray_xudp::packet::{PacketReader, PacketWriter};
+
+        // 1. UDP echo server
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        let echo_v4 = match echo_addr.ip() {
+            std::net::IpAddr::V4(v4) => v4,
+            _ => panic!("echo should be ipv4"),
+        };
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65_535];
+            loop {
+                let Ok((n, peer)) = echo.recv_from(&mut buf).await else { break };
+                let _ = echo.send_to(&buf[..n], peer).await;
+            }
+        });
+
+        // 2. SS-2022 server（inbound 侧，chacha 单用户：users 空）
+        let psk: Vec<u8> = (0x40..0x60u8).collect();
+        let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_port = relay.local_addr().unwrap().port();
+        let echo_handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
+            Arc::new(FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new(
+                "freedom",
+                make_freedom_dial_fn(),
+            ))));
+        tokio::spawn(serve_ss2022_udp(
+            Arc::new(relay),
+            xray_proxy_ss::ss2022::key::CipherKind2022::ChaCha20Poly1305,
+            psk.clone(),
+            Vec::new(),
+            echo_handler,
+        ));
+
+        // 3. SS-2022 outbound（chacha 单 PSK 密码）
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let cfg_json = format!(
+            r#"{{"servers":[{{"address":"127.0.0.1","port":{relay_port},
+            "method":"2022-blake3-chacha20-poly1305",
+            "password":"{}"}}]}}"#,
+            b64.encode(&psk),
+        );
+        let cfg = std::sync::Arc::new(xray_proxy_ss::parse_ss_config(cfg_json.as_bytes()).unwrap());
+        assert!(cfg.ss2022.is_some(), "chacha 2022 method should route to ss2022 params");
+        let ss_bridge =
+            Arc::new(DialBridge::new("ss2022-chacha-out", xray_proxy_ss::make_ss_dial_fn(cfg)));
+
+        // 4. dispatch link：duplex 承载 XUDP 帧流
+        let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let dest =
+            Destination::new(Address::IPv4(echo_v4), Port::new(echo_addr.port()), Network::UDP);
+        let (srv_rd, srv_wr) = tokio::io::split(server_io);
+        tokio::spawn(async move {
+            ss_bridge
+                .dispatch(
+                    &dest,
+                    xray_transport::link::Link::new(
+                        xray_buf::io::new_reader(srv_rd),
+                        xray_buf::io::new_writer(srv_wr),
+                    ),
+                )
+                .await;
+        });
+
+        // 5. XUDP 帧 → chacha UDP pump → inbound → freedom → echo → 回帧
+        let payload = b"ss2022-chacha-udp-e2e".to_vec();
+        let mut frame = Vec::new();
+        let mut pw = PacketWriter::new(
+            &mut frame,
+            Destination::new(Address::IPv4(echo_v4), Port::new(echo_addr.port()), Network::UDP),
+            [0u8; 8],
+        );
+        pw.write_packet(&payload).unwrap();
+        drop(pw);
+        client_io.write_all(&frame).await.unwrap();
+
+        let mut accum = Vec::new();
+        let mut buf = vec![0u8; 8 * 1024];
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let n = tokio::time::timeout_at(deadline, client_io.read(&mut buf))
+                .await
+                .expect("chacha response within 5s")
                 .expect("read");
             accum.extend_from_slice(&buf[..n]);
             let mut cursor = std::io::Cursor::new(&accum[..]);

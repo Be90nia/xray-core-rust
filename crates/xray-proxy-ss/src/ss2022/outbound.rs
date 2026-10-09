@@ -25,9 +25,14 @@ impl Ss2022Outbound {
     /// 创建 SS-2022 出站适配器。
     ///
     /// # Errors
-    /// - 透传 [`Client2022::new`] 错误（cipher/PSK 无效）。
-    pub fn new(cipher: &str, psk_b64: &str, server_host: &str, server_port: u16) -> Result<Self> {
-        let client = Client2022::new(cipher, psk_b64, server_host, server_port)?;
+    /// - 透传 [`Client2022::new`] 错误（cipher/PSK 无效、chacha 多 PSK 硬错）。
+    pub fn new(
+        cipher: &str,
+        psk_b64_list: &[String],
+        server_host: &str,
+        server_port: u16,
+    ) -> Result<Self> {
+        let client = Client2022::new(cipher, psk_b64_list, server_host, server_port)?;
         Ok(Self { client })
     }
 
@@ -83,8 +88,8 @@ pub struct Ss2022OutboundConfig {
     pub port: u16,
     /// 加密方法名称。
     pub method: String,
-    /// PSK（base64 编码）。
-    pub key: String,
+    /// PSK 链（base64 段，"iPSK:...:uPSK" 冒号拆分后；chacha 恒单段）。
+    pub key_list: Vec<String>,
     /// UDP-over-TCP 配置。
     pub udp_over_tcp: UdpOverTcpConfig,
 }
@@ -95,6 +100,6 @@ impl Ss2022OutboundConfig {
     /// # Errors
     /// - 透传 [`Ss2022Outbound::new`] 错误。
     pub fn create_outbound(&self) -> Result<Ss2022Outbound> {
-        Ss2022Outbound::new(&self.method, &self.key, &self.address, self.port)
+        Ss2022Outbound::new(&self.method, &self.key_list, &self.address, self.port)
     }
 }

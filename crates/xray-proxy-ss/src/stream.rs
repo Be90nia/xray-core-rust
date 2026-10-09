@@ -43,6 +43,9 @@ pub struct SSStream<C> {
     pending_payload: Option<usize>,
     /// SS-2022 服务端响应懒写头状态（`mark_server_response_2022` 设置）。
     pending_server_2022: Option<PendingServer2022>,
+    /// SS-2022 客户端请求首写待发状态（`set_pending_client_2022` 设置，
+    /// Go WriteTCPRequest(payload)：variable chunk 留待与首段数据合并封装）。
+    pending_client_2022: Option<PendingClient2022>,
     /// 已解密待交付的请求首段明文（SS-2022 variable chunk 尾部 payload，
     /// 对应 sing `serverConn` reader 的 cached 语义）。
     plain_prefix: Vec<u8>,
@@ -74,6 +77,16 @@ struct PendingServer2022 {
     psk: Vec<u8>,
     kind: crate::ss2022::CipherKind2022,
     request_salt: Vec<u8>,
+}
+
+/// SS-2022 客户端请求首写待发状态（Go `WriteTCPRequest` 的 deferred 形态）：
+/// `prefix` = salt + EIH 层（明文 wire 段）；fixed/variable 两个 chunk 留待
+/// 首写时才封装——variable 长度依赖首段 payload，fixed 的 varHeaderLen 字段
+/// 也要等该长度确定后才能封（对齐 Go「初始载荷并入请求首写」）。
+struct PendingClient2022 {
+    prefix: Vec<u8>,
+    fixed_plain: [u8; 11],
+    addr_port: Vec<u8>,
 }
 
 /// LE increment（byte[0]++，进位），对应 Go `GenerateIncreasingNonce`。
@@ -126,6 +139,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             write_buf: Vec::new(),
             pending_payload: None,
             pending_server_2022: None,
+            pending_client_2022: None,
             plain_prefix: Vec::new(),
         })
     }
@@ -180,6 +194,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             response_rekey_2022: None,
             pending_payload: None,
             pending_server_2022: None,
+            pending_client_2022: None,
             plain_prefix: Vec::new(),
             write_buf: Vec::new(),
         }
@@ -199,6 +214,17 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     /// - [`SsError::Io`]：底层写失败。
     pub async fn write_chunk(&mut self, plaintext: &[u8]) -> Result<()> {
         if plaintext.is_empty() {
+            return Ok(());
+        }
+        // SS-2022 客户端请求首写合并（Go WriteTCPRequest(payload)，SIP022 §3.1.4）：
+        // salt+EIH+fixed+variable(含首段 payload) 一次性写出；首段数据整个并入
+        // variable chunk，超出 u16 varHeaderLen 容量的尾段才走常规 body chunk。
+        if self.pending_client_2022.is_some() {
+            let rest = self.emit_pending_client_2022(plaintext).await?;
+            let max_payload = 8192 - self.tag_size - 2;
+            for part in rest.chunks(max_payload.max(1)) {
+                self.write_single_chunk(part).await?;
+            }
             return Ok(());
         }
         // SS-2022 服务端响应懒写头（sing `serverConn.writeResponse`，service.go:261）：
@@ -290,6 +316,86 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         Ok(())
     }
 
+    /// SS-2022 客户端请求首写待发状态登记（[`Client2022::dial_target_on`] 调用）。
+    pub fn set_pending_client_2022(
+        &mut self,
+        prefix: Vec<u8>,
+        fixed_plain: [u8; 11],
+        addr_port: Vec<u8>,
+    ) {
+        self.pending_client_2022 = Some(PendingClient2022 { prefix, fixed_plain, addr_port });
+    }
+
+    /// 是否存在未发客户端请求头（pump 据此决定空闲兜底 flush / 定时 flush）。
+    #[must_use]
+    pub fn has_pending_client_2022(&self) -> bool {
+        self.pending_client_2022.is_some()
+    }
+
+    /// 无首段数据时兜底发出请求头（padding 1..900 满足 SIP022 §3.1.4
+    /// 「有 payload 或有 padding」）。无待发状态时 no-op。
+    ///
+    /// # Errors
+    /// - 透传 [`Self::emit_pending_client_2022`] 错误。
+    pub async fn flush_pending_client_2022(&mut self) -> Result<()> {
+        if self.pending_client_2022.is_none() {
+            return Ok(());
+        }
+        self.emit_pending_client_2022(&[]).await?;
+        Ok(())
+    }
+
+    /// 封装并写出请求头：seal fixed(nonce[0]) → seal variable(nonce[1]，明文 =
+    /// addr_port + padLen + padding + 首段 payload)，与 prefix 单次 write_all
+    /// 写出（Go `WriteTCPRequest` 的 handshakeBuf 单写语义）。返回未并入
+    /// variable chunk 的 payload 尾段（超出 u16 容量时才有）。
+    ///
+    /// padding 策略对齐 Go：payload < 900 → 随机 1..=900；否则 0。
+    async fn emit_pending_client_2022(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        let Some(p) = self.pending_client_2022.take() else { return Ok(payload.to_vec()) };
+        let padding_len: usize = if payload.len() < crate::ss2022::packet::MAX_PADDING_LENGTH {
+            rand::random::<u16>() as usize % crate::ss2022::packet::MAX_PADDING_LENGTH + 1
+        } else {
+            0
+        };
+        // variable 明文容量 u16：addr+padLen+padding+首段 payload
+        let max_first = u16::MAX as usize - p.addr_port.len() - 2 - padding_len;
+        let first = payload.len().min(max_first);
+
+        let mut var = Vec::with_capacity(p.addr_port.len() + 2 + padding_len + first);
+        var.extend_from_slice(&p.addr_port);
+        var.extend_from_slice(&(padding_len as u16).to_be_bytes());
+        var.resize(var.len() + padding_len, 0);
+        var.extend_from_slice(&payload[..first]);
+
+        // variable 长度此刻才确定：回填 fixed chunk 的 varHeaderLen 字段
+        let mut fixed_plain = p.fixed_plain;
+        let Ok(var_len) = u16::try_from(var.len()) else {
+            return Err(SsError::InsufficientData(var.len()));
+        };
+        fixed_plain[9..11].copy_from_slice(&var_len.to_be_bytes());
+
+        let sealed_fixed = self
+            .write_aead
+            .seal(&self.write_nonce, &[], &fixed_plain)
+            .map_err(|e| SsError::AeadSeal(e.to_string()))?;
+        increment_nonce_bytes(&mut self.write_nonce); // [0] → [1]
+        let sealed_var = self
+            .write_aead
+            .seal(&self.write_nonce, &[], &var)
+            .map_err(|e| SsError::AeadSeal(e.to_string()))?;
+        increment_nonce_bytes(&mut self.write_nonce); // [1] → [2]
+        // 回拨 [1]：后续 body chunk 由 write_single_chunk 先 increment 落在 [2]
+        self.write_nonce[0] = 1;
+
+        self.write_buf.clear();
+        self.write_buf.extend_from_slice(&p.prefix);
+        self.write_buf.extend_from_slice(&sealed_fixed);
+        self.write_buf.extend_from_slice(&sealed_var);
+        self.inner.write_all(&self.write_buf).await?;
+        Ok(payload[first..].to_vec())
+    }
+
     /// flush 底层连接。
     /// # Errors
     /// - 透传 IO 错误。
@@ -333,6 +439,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             response_rekey_2022: None,
             pending_payload: None,
             pending_server_2022: None,
+            pending_client_2022: None,
             plain_prefix: Vec::new(),
             write_buf: Vec::new(),
         }

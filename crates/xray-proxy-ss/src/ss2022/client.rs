@@ -22,16 +22,20 @@ use xray_crypto::aead::{AeadCipher, Aes128Gcm, Aes256Gcm, ChaCha20Poly1305Aead};
 
 use crate::{
     error::{Result, SsError},
-    ss2022::key::{CipherKind2022, derive_psk, derive_session_subkey, psk_from_base64},
+    ss2022::key::{
+        CipherKind2022, derive_psk, derive_session_subkey, encrypt_identity_header, psk_from_base64,
+    },
     stream::SSStream,
 };
 
 /// SS-2022 TCP client。
+///
+/// PSK 链（Go `ParsePSKList`，密码 "iPSK:...:uPSK" 冒号分段）：末段为实际
+/// 用户 PSK，前面各段逐层写 EIH（TCP EIH 用 salt 派生的 identity subkey）。
+/// chacha + 多 PSK 在构造即硬错（Go outbound.go:48-50）。
 #[derive(Debug)]
 pub struct Client2022 {
-    psk: Vec<u8>,
-    /// 多用户模式：server 主 PSK（iPSK）。Some 时在 salt 后写 1 层 EIH（SIP023）。
-    identity_psk: Option<Vec<u8>>,
+    psk_list: Vec<Vec<u8>>,
     kind: CipherKind2022,
     server_host: String,
     server_port: u16,
@@ -42,18 +46,27 @@ impl Client2022 {
     /// # Errors
     /// - [`SsError::InvalidCipherName`]：cipher 名称不支持。
     /// - [`SsError::InvalidPassword`]：PSK base64 解码失败或长度不匹配。
-    pub fn new(cipher: &str, psk_b64: &str, host: &str, port: u16) -> Result<Self> {
+    /// - [`SsError::Ss2022UnsupportedMethod`]：chacha + 多 PSK（Go 硬错对齐）。
+    pub fn new(cipher: &str, psk_b64_list: &[String], host: &str, port: u16) -> Result<Self> {
         let kind = CipherKind2022::from_name(cipher)?;
-        let psk = derive_psk(&psk_from_base64(psk_b64)?, kind)?;
-        Ok(Self { psk, identity_psk: None, kind, server_host: host.to_string(), server_port: port })
+        if psk_b64_list.is_empty() {
+            return Err(SsError::Ss2022MissingKey);
+        }
+        let psk_list = psk_b64_list
+            .iter()
+            .map(|b| derive_psk(&psk_from_base64(b)?, kind))
+            .collect::<Result<Vec<_>>>()?;
+        if kind == CipherKind2022::ChaCha20Poly1305 && psk_list.len() > 1 {
+            return Err(SsError::Ss2022UnsupportedMethod(
+                "multi-key is not supported for chacha20-poly1305".to_string(),
+            ));
+        }
+        Ok(Self { psk_list, kind, server_host: host.to_string(), server_port: port })
     }
 
-    /// 设置 server 主 PSK（iPSK）启用多用户 EIH（SIP023）。
-    /// 单端口多用户服务器配置 "server_psk:user_psk" 时：psk=user_psk，此处传 server_psk。
-    pub fn with_identity(mut self, server_psk_b64: &str) -> Result<Self> {
-        let ipsk = derive_psk(&psk_from_base64(server_psk_b64)?, self.kind)?;
-        self.identity_psk = Some(ipsk);
-        Ok(self)
+    /// 最终 PSK（PSK 链末段，session key 派生材料）。
+    fn final_psk(&self) -> &[u8] {
+        &self.psk_list[self.psk_list.len() - 1]
     }
 
     /// 从 subkey 构造 AEAD。
@@ -93,6 +106,12 @@ impl Client2022 {
     /// 生产路径（dispatcher）经 transport 层（ws+tls 等 streamSettings 包装）拿到
     /// 连接后调用本方法完成 SS-2022 握手；[`Self::dial_target`] 是裸 TCP 便捷版。
     ///
+    /// 请求头**不在此处落线**（Go WriteTCPRequest(payload) 语义）：salt+EIH+fixed
+    /// 明文与 variable chunk 的 addr_port 材料登记为 [`SSStream`] 首写待发状态，
+    /// 首段 body 数据与 variable chunk 合并封装后**单次写出**（TCP 初始载荷并入
+    /// 请求首写）；无首段数据时由调用方 `flush_pending_client_2022` 兜底发出
+    /// （padding 1..900 满足 SIP022 §3.1.4）。
+    ///
     /// 返回 `SSStream<C>`，调用方继续 `write_chunk` 发送 body + `read_chunk` 读响应。
     ///
     /// # Errors
@@ -101,7 +120,7 @@ impl Client2022 {
     /// - 透传 AEAD 初始化错误。
     pub async fn dial_target_on<C>(
         &self,
-        mut conn: C,
+        conn: C,
         target_addr: &str,
         target_port: u16,
     ) -> Result<SSStream<C>>
@@ -109,12 +128,14 @@ impl Client2022 {
         C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         // 随机 salt + derive subkey + build AEAD
+        let psk = self.final_psk();
         let salt = self.random_salt();
-        let subkey = derive_session_subkey(&self.psk, &salt, self.kind);
+        let subkey = derive_session_subkey(psk, &salt, self.kind);
         let aead = self.build_aead(&subkey)?;
 
-        // nonce 从 [0;12] 开始（SS-2022 规范）
-        let mut nonce = vec![0u8; 12];
+        // nonce 从 [0;12] 开始（SS-2022 规范）；两个 header chunk 的 seal
+        // 推迟到首写 emit 时进行（stream.rs emit_pending_client_2022）
+        let nonce = vec![0u8; 12];
 
         // timestamp
         let timestamp = SystemTime::now()
@@ -122,72 +143,42 @@ impl Client2022 {
             .map_err(|e| SsError::GetCipher(e.to_string()))?
             .as_secs();
 
-        // padding: 1~900 随机（SIP022 要求 request 有 payload 或 padding）
-        let padding_len: u16 = rand::random::<u16>() % 900 + 1;
+        // fixed-header-chunk 明文（11B）：variable 长度在首写时才定，先按 0 占位
+        let mut fixed_plain = [0u8; 11];
+        fixed_plain[0] = 0u8; // headerType=0 client
+        fixed_plain[1..9].copy_from_slice(&timestamp.to_be_bytes());
+        // variable_len 字段在 emit 时随实际长度回填，此处不写
 
-        // addr+port 长度 (SOCKS5 domain: ATYP + 1B len + domain + 2B port)
-        let addr_port_len = 1 + 1 + target_addr.len() + 2;
+        // addr+port 段（SOCKS5 domain: ATYP + 1B len + domain + 2B port）
+        let mut addr_port = Vec::with_capacity(1 + 1 + target_addr.len() + 2);
+        addr_port.push(3u8); // ATYP=3 domain
+        addr_port.push(u8::try_from(target_addr.len()).map_err(|_| SsError::InvalidRemoteAddress)?);
+        addr_port.extend_from_slice(target_addr.as_bytes());
+        addr_port.extend_from_slice(&target_port.to_be_bytes());
 
-        // variable-header-chunk 明文长度 = addr_port + 2(paddingLen field) + padding
-        let variable_len = addr_port_len + 2 + padding_len as usize;
-
-        // 手动 seal fixed-header-chunk (11B): headerType=0 + timestamp_BE_u64 + variableLen_BE_u16
-        //    SS-2022 header 用直接 seal（无 size prefix），对应 Go shadowaead.Writer.WriteChunk
-        let mut fixed = Vec::with_capacity(11);
-        fixed.push(0u8); // headerType=0 client
-        fixed.extend_from_slice(&timestamp.to_be_bytes());
-        fixed.extend_from_slice(&(variable_len as u16).to_be_bytes());
-        let sealed_fixed =
-            aead.seal(&nonce, &[], &fixed).map_err(|e| SsError::AeadSeal(e.to_string()))?;
-        increment_nonce(&mut nonce); // [0;12] → [1,0,...]
-
-        // 手动 seal variable-header-chunk: addr+port + paddingLen_BE_u16 + padding
-        let mut var = Vec::with_capacity(variable_len);
-        var.push(3u8); // ATYP=3 domain
-        var.push(u8::try_from(target_addr.len()).map_err(|_| SsError::InvalidRemoteAddress)?);
-        var.extend_from_slice(target_addr.as_bytes());
-        var.extend_from_slice(&target_port.to_be_bytes());
-        var.extend_from_slice(&padding_len.to_be_bytes());
-        for _ in 0..padding_len {
-            var.push(rand::random::<u8>());
+        // 合并 wire 前缀：salt + EIH 层（SIP023：TCP EIH 用 salt 派生 identity
+        // subkey 加密下一层 PSK hash，Go WriteTCPRequest pskList[:-1] 循环）
+        let mut prefix = Vec::with_capacity(salt.len() + (self.psk_list.len() - 1) * 16);
+        prefix.extend_from_slice(&salt);
+        for i in 0..self.psk_list.len() - 1 {
+            let eih = encrypt_identity_header(
+                &self.psk_list[i],
+                &self.psk_list[i + 1],
+                &salt,
+                self.kind,
+            )?;
+            prefix.extend_from_slice(&eih);
         }
-        let sealed_var =
-            aead.seal(&nonce, &[], &var).map_err(|e| SsError::AeadSeal(e.to_string()))?;
-        increment_nonce(&mut nonce); // [1,0,...] → [2,0,...]
 
-        // 合并发送 salt [+ EIH] + sealed_fixed + sealed_var（一次性，避免分次写导致 DPI 识别）
-        let mut header_buf =
-            Vec::with_capacity(salt.len() + sealed_fixed.len() + sealed_var.len() + 16);
-        header_buf.extend_from_slice(&salt);
-        // SIP023：identity PSK 存在时写 1 层 EIH（server iPSK 派生 subkey 加密 uPSK hash）
-        if let Some(ipsk) = &self.identity_psk {
-            let eih =
-                crate::ss2022::key::encrypt_identity_header(ipsk, &self.psk, &salt, self.kind)?;
-            header_buf.extend_from_slice(&eih);
-        }
-        header_buf.extend_from_slice(&sealed_fixed);
-        header_buf.extend_from_slice(&sealed_var);
-        use tokio::io::AsyncWriteExt;
-        conn.write_all(&header_buf).await?;
-        conn.flush().await?;
-
-        nonce[0] = 1;
+        // 写 nonce 语义：emit 时 fixed 用 [0]、variable 用 [1]；body chunk 由
+        // write_single_chunk 先 increment，size chunk 落在 [2]（服务端读序一致）
         let mut stream = SSStream::new_with_aead_and_nonce(conn, aead, nonce);
+        stream.set_pending_client_2022(prefix, fixed_plain, addr_port);
         // SS-2022 响应头分阶段 rekey：sing `clientConn.readResponse`
         //（salt → blake3 重派生 subkey → fixed header chunk → variable header chunk）。
-        stream.mark_response_rekey_2022(self.psk.clone(), self.kind, salt);
+        stream.mark_response_rekey_2022(psk.to_vec(), self.kind, salt);
 
         Ok(stream)
-    }
-}
-
-/// LE increment（byte[0]++，进位），对应 Go `increaseNonce`。
-fn increment_nonce(nonce: &mut [u8]) {
-    for b in nonce.iter_mut() {
-        *b = b.wrapping_add(1);
-        if *b != 0 {
-            break;
-        }
     }
 }
 
@@ -195,17 +186,17 @@ fn increment_nonce(nonce: &mut [u8]) {
 mod tests {
     use super::*;
 
+    fn psk256_b64() -> String {
+        "swzPBNUUnCN6/Ply/V90cKtGbQdNf/UK6v1UjIRAsdQ=".to_string()
+    }
+
     #[test]
     fn client_new_aes256() {
-        let c = Client2022::new(
-            "2022-blake3-aes-256-gcm",
-            "swzPBNUUnCN6/Ply/V90cKtGbQdNf/UK6v1UjIRAsdQ=",
-            "example.com",
-            8388,
-        );
+        let c = Client2022::new("2022-blake3-aes-256-gcm", &[psk256_b64()], "example.com", 8388);
         assert!(c.is_ok());
         let c = c.unwrap();
-        assert_eq!(c.psk.len(), 32);
+        assert_eq!(c.psk_list.len(), 1);
+        assert_eq!(c.final_psk().len(), 32);
         assert_eq!(c.kind, CipherKind2022::Aes256Gcm);
     }
 
@@ -214,11 +205,25 @@ mod tests {
         // aes-256 需要 32B PSK，给 16B → 错误
         let c = Client2022::new(
             "2022-blake3-aes-256-gcm",
-            "AAAAAAAAAAAAAAAAAAAAAA==", // 16B base64
+            &["AAAAAAAAAAAAAAAAAAAAAA==".to_string()], // 16B base64
             "example.com",
             8388,
         );
         assert!(c.is_err());
+    }
+
+    /// chacha + 多 PSK 出站硬错（Go outbound.go:48-50）。
+    #[test]
+    fn client_new_chacha_multi_psk_rejected() {
+        let c = Client2022::new(
+            "2022-blake3-chacha20-poly1305",
+            &[psk256_b64(), psk256_b64()],
+            "example.com",
+            8388,
+        );
+        let err = c.unwrap_err();
+        assert!(matches!(err, SsError::Ss2022UnsupportedMethod(_)));
+        assert!(err.to_string().contains("multi-key is not supported"));
     }
 
     #[test]
@@ -226,18 +231,14 @@ mod tests {
         // 2022-blake3-chacha20-poly1305：TCP 直接用 ChaCha20-Poly1305 替换 AES-GCM（SIP022 §4），
         // KDF 与 AES-256-GCM 完全一致（blake3 derive_key 32B subkey）。
         // 验证 build_aead 不再返回 not-implemented，且 seal/open 往返一致。
-        let c = Client2022::new(
-            "2022-blake3-chacha20-poly1305",
-            "swzPBNUUnCN6/Ply/V90cKtGbQdNf/UK6v1UjIRAsdQ=",
-            "example.com",
-            8388,
-        )
-        .expect("Client2022::new chacha20");
-        assert_eq!(c.psk.len(), 32);
+        let c =
+            Client2022::new("2022-blake3-chacha20-poly1305", &[psk256_b64()], "example.com", 8388)
+                .expect("Client2022::new chacha20");
+        assert_eq!(c.final_psk().len(), 32);
         assert_eq!(c.kind, CipherKind2022::ChaCha20Poly1305);
 
         let salt = vec![0xABu8; c.kind.salt_size()];
-        let subkey = derive_session_subkey(&c.psk, &salt, c.kind);
+        let subkey = derive_session_subkey(c.final_psk(), &salt, c.kind);
         assert_eq!(subkey.len(), 32);
 
         let aead = c.build_aead(&subkey).expect("build_aead chacha20");
@@ -264,13 +265,9 @@ mod tests {
         let conn = tokio::net::TcpStream::connect(addr).await.expect("connect");
         let (mut server_sock, _) = listener.accept().await.expect("accept");
 
-        let client = Client2022::new(
-            "2022-blake3-aes-256-gcm",
-            "swzPBNUUnCN6/Ply/V90cKtGbQdNf/UK6v1UjIRAsdQ=",
-            "example.com",
-            8388,
-        )
-        .expect("client");
+        let client =
+            Client2022::new("2022-blake3-aes-256-gcm", &[psk256_b64()], "example.com", 8388)
+                .expect("client");
 
         // 256+ 字节域名 → u8 长度装不下 → 早退（写 header 之前）。
         let oversize_domain = "a".repeat(300);
@@ -282,5 +279,93 @@ mod tests {
         let mut buf = [0u8; 16];
         let n = server_sock.read(&mut buf).await.expect("read after early return");
         assert_eq!(n, 0, "server must observe EOF (conn closed) after early return");
+    }
+
+    /// TCP 初始载荷并入请求首写（Go WriteTCPRequest(payload)，v26.9.30）：
+    /// 首段 body 数据必须 riding 在 variable chunk 尾部——对端
+    /// [`crate::ss2022::Ss2022Inbound`] 解出的 first_payload 即首写数据，
+    /// 且 TCP wire 上首写是一个 write_all（server 单次 read 即收到完整请求头+载荷）。
+    #[tokio::test]
+    async fn dial_target_on_merges_initial_payload_into_first_write() {
+        use base64::Engine as _;
+
+        let psk = [0x55u8; 32];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(psk);
+        let inbound = std::sync::Arc::new(
+            crate::ss2022::Ss2022Inbound::new("2022-blake3-aes-256-gcm", &b64, "u1").unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (conn, _) = listener.accept().await.unwrap();
+            let result = inbound.handle_conn(conn).await.unwrap();
+            // 首个 chunk = variable chunk 尾部首段 payload，第二个 chunk = 常规 body
+            let mut stream = result.stream;
+            let head = stream.read_chunk().await.unwrap().expect("early payload chunk");
+            assert_eq!(head, b"GET / HTTP early", "initial payload must ride the var chunk");
+            let got = stream.read_chunk().await.unwrap().expect("body chunk");
+            assert_eq!(got, b"second");
+        });
+
+        let client = Client2022::new(
+            "2022-blake3-aes-256-gcm",
+            std::slice::from_ref(&b64),
+            "127.0.0.1",
+            addr.port(),
+        )
+        .unwrap();
+        let conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut stream = client.dial_target_on(conn, "example.com", 80).await.unwrap();
+        // 首写 → salt+fixed+var(含本段) 一次落线；次写 → 常规 body chunk
+        stream.write_chunk(b"GET / HTTP early").await.unwrap();
+        stream.write_chunk(b"second").await.unwrap();
+        stream.flush().await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("initial-payload roundtrip timed out")
+            .unwrap();
+    }
+
+    /// 无首段数据（dial 后直接 flush + 关闭）：兜底 flush 必须发出请求头
+    /// （padding 1..900 满足 SIP022 §3.1.4），对端正常解出目标地址。
+    #[tokio::test]
+    async fn dial_target_on_flush_pending_sends_header_without_payload() {
+        use base64::Engine as _;
+
+        let psk = [0x66u8; 32];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(psk);
+        let inbound = std::sync::Arc::new(
+            crate::ss2022::Ss2022Inbound::new("2022-blake3-aes-256-gcm", &b64, "u1").unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (conn, _) = listener.accept().await.unwrap();
+            let result = inbound.handle_conn(conn).await.unwrap();
+            assert_eq!(
+                result.address,
+                xray_common::net::address::Address::Domain("empty.example".into())
+            );
+        });
+
+        let client = Client2022::new(
+            "2022-blake3-aes-256-gcm",
+            std::slice::from_ref(&b64),
+            "127.0.0.1",
+            addr.port(),
+        )
+        .unwrap();
+        let conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut stream = client.dial_target_on(conn, "empty.example", 443).await.unwrap();
+        stream.flush_pending_client_2022().await.unwrap();
+        stream.flush().await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("flush-only roundtrip timed out")
+            .unwrap();
     }
 }

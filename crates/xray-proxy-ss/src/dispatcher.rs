@@ -145,6 +145,12 @@ async fn pump_ss_stream(mut stream: SSStream<Box<dyn Connection>>, server_io: Du
     let mut up_buf = vec![0u8; 8 * 1024];
     let mut down_buf = vec![0u8; 16 * 1024];
     let mut pending: Vec<u8> = Vec::new();
+    // SS-2022 客户端请求头首写待发兜底（Go 在 Process 里立即写请求头，Rust 首写
+    // 在 pump 侧才出现）：上游 200ms 内无数据也必须发出（padding-only 请求），
+    // 否则 server-speaks-first 目标（FTP/SMTP banner）会双向等死锁。
+    let mut hdr_timer = stream
+        .has_pending_client_2022()
+        .then(|| Box::pin(tokio::time::sleep(std::time::Duration::from_millis(200))));
     loop {
         // 先把 pending 中完整帧全部解出（NeedMore 才进 select 等新数据）
         loop {
@@ -172,6 +178,9 @@ async fn pump_ss_stream(mut stream: SSStream<Box<dyn Connection>>, server_io: Du
             n = rd.read(&mut up_buf) => {
                 match n {
                     Ok(0) => {
+                        // 半关闭：请求头尚未落线（无任何首写）时兜底发出
+                        // （Go requestDone 恒写请求头，payload 可为空）
+                        let _ = stream.flush_pending_client_2022().await;
                         let _ = stream.shutdown().await;
                         break;
                     }
@@ -187,6 +196,20 @@ async fn pump_ss_stream(mut stream: SSStream<Box<dyn Connection>>, server_io: Du
                         tracing::debug!("ss pump up read error: {e}");
                         break;
                     }
+                }
+            }
+            // SS-2022 请求头空闲兜底：上游迟迟无首写也要发 padding-only 请求头
+            _ = async {
+                if let Some(t) = hdr_timer.as_mut() {
+                    t.as_mut().await;
+                }
+            }, if hdr_timer.is_some() => {
+                if stream.flush_pending_client_2022().await.is_err() {
+                    break;
+                }
+                // 兜底只发一次：推远避免反复唤醒（pending 已清，语义等价停表）
+                if let Some(t) = hdr_timer.as_mut() {
+                    t.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
                 }
             }
             // down: cancel-safe 单次底层读 → pending（解帧在循环顶部同步完成）
@@ -233,10 +256,9 @@ pub struct SsOutboundConfig {
 pub struct Ss2022DialParams {
     /// cipher method 名（"2022-blake3-aes-128-gcm" 等）。
     pub method: String,
-    /// 用户 PSK（base64）。
-    pub psk_b64: String,
-    /// server 主 PSK（base64，多用户 "iPSK:uPSK" 密码格式的第一段）。
-    pub identity_psk_b64: Option<String>,
+    /// PSK 链（base64 段，有序："iPSK:...:uPSK" 冒号拆分；chacha 恒单段，
+    /// 多 PSK + chacha 在 parse 处硬错，Go outbound.go:48-50）。
+    pub psk_list_b64: Vec<String>,
 }
 impl SsOutboundConfig {
     /// 构造配置。
@@ -331,11 +353,18 @@ pub fn parse_ss_config(data: &[u8]) -> Result<SsOutboundConfig, String> {
             enabled: first.get("uot").and_then(|v| v.as_bool()).unwrap_or(false),
             version: first.get("uotVersion").and_then(|v| v.as_i64()).unwrap_or(0) as u32,
         };
-        let (psk_b64, identity_psk_b64) = match password.split(':').collect::<Vec<_>>()[..] {
-            [u] => (u.to_string(), None),
-            [i, u, ..] => (u.to_string(), Some(i.to_string())),
-            [] => return Err("empty password".to_string()),
-        };
+        // Go ParsePSKList：密码按 ':' 拆 PSK 链（收全段）；chacha + 多 PSK
+        // 硬错（Go outbound.go:48-50，NewClient 构造期错误 → 配置即拒）。
+        let psk_list_b64: Vec<String> = password.split(':').map(str::to_string).collect();
+        if psk_list_b64.is_empty() {
+            return Err("empty password".to_string());
+        }
+        let kind =
+            crate::ss2022::key::CipherKind2022::from_name(method).map_err(|e| e.to_string())?;
+        if kind == crate::ss2022::key::CipherKind2022::ChaCha20Poly1305 && psk_list_b64.len() > 1 {
+            return Err("multi-key is not supported for chacha20-poly1305".to_string());
+        }
+        let psk_b64 = psk_list_b64[psk_list_b64.len() - 1].clone();
         // account 占位：2022 拨号路径读 ss2022 参数，不读 account；cipher 字段用
         // 任意 AEAD（None 已被 Go 上游 v26.7.28 删除）。
         let placeholder =
@@ -349,11 +378,7 @@ pub fn parse_ss_config(data: &[u8]) -> Result<SsOutboundConfig, String> {
             .with_level(level)
             .with_email(email)
             .with_udp_over_tcp(uot_cfg)
-            .with_ss2022(Ss2022DialParams {
-                method: method.to_string(),
-                psk_b64,
-                identity_psk_b64,
-            }));
+            .with_ss2022(Ss2022DialParams { method: method.to_string(), psk_list_b64 }));
     }
     let cipher_type = crate::config::CipherType::from_name(method)
         .ok_or_else(|| format!("unsupported cipher: {method}"))?;
@@ -432,23 +457,19 @@ pub fn make_ss_dial_fn(config: Arc<SsOutboundConfig>) -> DialFn {
 
                     // 2. 在该连接上跑 SS 协议握手 + 拨 target
                     let stream = if let Some(p) = &config.ss2022 {
-                        // SS-2022：Client2022（多用户时 EIH 首帧）
-                        let mut client = crate::ss2022::client::Client2022::new(
+                        // SS-2022：Client2022（PSK 链；chacha 多 PSK 已在 parse 硬错）
+                        let client = crate::ss2022::client::Client2022::new(
                             &p.method,
-                            &p.psk_b64,
+                            &p.psk_list_b64,
                             &host,
                             config.server_port,
                         )
                         .map_err(|e| format!("ss2022 client: {e}"))?;
-                        if let Some(i) = &p.identity_psk_b64 {
-                            client = client
-                                .with_identity(i)
-                                .map_err(|e| format!("ss2022 identity: {e}"))?;
-                        }
                         // dial_target_on 已 mark_response_rekey_2022 设响应 rekey 状态机；
-                        // pump_ss_stream 首次 try_open_chunk 时会经 drive_2022_rekey 解
-                        // salt+fixed+var（payload=0 时只读 salt+fixed）。此处不再额外
-                        // read_response_handshake，否则双重读同 conn → 首 read_exact EOF。
+                        // 请求头登记为首写待发状态，pump_ss_stream 首写时与首段
+                        // body 合并落线（Go WriteTCPRequest(payload)）。响应读侧在
+                        // pump 首次 try_open_chunk 时经 drive_2022_rekey 解
+                        // salt+fixed+var（payload=0 时只读 salt+fixed）。
 
                         client
                             .dial_target_on(conn, &target_str, target_port)
@@ -612,11 +633,12 @@ async fn pump_ss2022_udp(
 
     let kind = CipherKind2022::from_name(&params.method);
     let session = match kind.map_err(|e| e.to_string()).and_then(|kind| {
-        let mut psk_list = Vec::new();
-        if let Some(i) = &params.identity_psk_b64 {
-            psk_list.push(psk_from_base64(i).map_err(|e| e.to_string())?);
-        }
-        psk_list.push(psk_from_base64(&params.psk_b64).map_err(|e| e.to_string())?);
+        // PSK 链（Go ParsePSKList 顺序：iPSK…:uPSK；chacha 多 PSK 已在 parse 硬错）
+        let psk_list: Vec<Vec<u8>> = params
+            .psk_list_b64
+            .iter()
+            .map(|b| psk_from_base64(b).map_err(|e| e.to_string()))
+            .collect::<Result<Vec<_>, String>>()?;
         ClientUdpSession2022::new(kind, psk_list).map_err(|e| e.to_string())
     }) {
         Ok(s) => std::sync::Arc::new(s),
@@ -794,8 +816,7 @@ mod tests {
         let cfg = parse_ss_config(data).expect("parse 2022");
         let p = cfg.ss2022.expect("ss2022 params");
         assert_eq!(p.method, "2022-blake3-aes-256-gcm");
-        assert_eq!(p.psk_b64, "aGkgZnJvbSBzczIwMjIgc2VydmVyIHByaW1hcnkga2V5IQ==");
-        assert!(p.identity_psk_b64.is_none());
+        assert_eq!(p.psk_list_b64, vec!["aGkgZnJvbSBzczIwMjIgc2VydmVyIHByaW1hcnkga2V5IQ=="]);
         assert_eq!(cfg.server_port, 8388);
     }
 
@@ -814,9 +835,19 @@ mod tests {
         // 非法 PSK 长度：dial 时才校验，parse 阶段只要 method 命中就通过
         if let Ok(cfg) = r {
             let p = cfg.ss2022.expect("ss2022 params");
-            assert_eq!(p.identity_psk_b64.as_deref(), Some(ipsk.as_str()));
-            assert_eq!(p.psk_b64, upsk);
+            assert_eq!(p.psk_list_b64, vec![ipsk, upsk], "PSK 链必须收全冒号分段");
         }
+    }
+
+    /// chacha + 多 PSK 出站密码：parse 即硬错（Go outbound.go:48-50，
+    /// NewClient 构造期错误 → 配置装载即拒）。
+    #[test]
+    fn parse_ss_config_2022_chacha_multi_psk_rejected() {
+        let data = br#"{"servers":[{"address":"ss.example.com","port":8388,
+            "method":"2022-blake3-chacha20-poly1305",
+            "password":"cHNrMQ==:cHNyMg=="}]}"#;
+        let err = parse_ss_config(data).unwrap_err();
+        assert!(err.contains("multi-key is not supported for chacha20-poly1305"));
     }
 
     #[test]
