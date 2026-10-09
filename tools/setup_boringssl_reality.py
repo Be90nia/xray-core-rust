@@ -227,26 +227,73 @@ def _force_remove(func, path, _exc):
     func(path)
 
 
-def insert_after(text: str, anchor: str, insertion: str) -> str:
+def insert_after(text: str, anchor: str, insertion: str, what: str) -> str:
     idx = text.find(anchor)
     if idx < 0:
-        raise SystemExit(f"reality patch anchor not found: {anchor[:60]!r}")
+        raise SystemExit(
+            f"{what}: anchor not found (boringssl version drift?): {anchor[:80]!r}"
+        )
     end = idx + len(anchor)
     return text[:end] + insertion + text[end:]
 
 
 def replace_exact(text: str, old: str, new: str, what: str) -> str:
     n = text.count(old)
+    if n == 0:
+        raise SystemExit(
+            f"{what}: anchor not found (boringssl version drift?): {old[:80]!r}"
+        )
     if n != 1:
         raise SystemExit(f"{what}: anchor count {n} != 1 (already applied?)")
     return text.replace(old, new)
+
+
+def _read_target(path: Path) -> str:
+    if not path.is_file():
+        raise SystemExit(
+            f"reality patch target missing: {path} — empty or non-boringssl tree?"
+        )
+    return path.read_text(encoding="utf-8")
+
+
+# apply 末尾自校验符号表（bd 4jrt：锚点失配时旧版静默空插仍报 applied，
+# vendored 树零 REALITY 符号 → LNK2019；每目标文件符号计数必须 >0）
+VERIFY_SYMBOLS = {
+    "include/openssl/ssl.h": (
+        "SSL_get_x25519_key_share_private",
+        "SSL_set_reality_rewrite_cb",
+        "SSL_set_reality_server_hello_cb",
+    ),
+    "ssl/ssl_lib.cc": (
+        "SSL_get_x25519_key_share_private",
+        "SSL_set_reality_rewrite_cb",
+        "SSL_set_reality_server_hello_cb",
+    ),
+    "ssl/internal.h": ("ssl_reality_rewrite_maybe", "ssl_reality_server_hello_maybe"),
+    "ssl/handshake.cc": ("ssl_reality_rewrite_maybe",),
+    "ssl/handshake_client.cc": ("ssl_reality_rewrite_maybe",),
+    "ssl/tls13_client.cc": ("ssl_reality_server_hello_maybe",),
+}
+
+
+def verify_reality_patches(dest: Path) -> None:
+    """自校验：每个目标文件的 REALITY 符号计数必须 >0，不足即硬错（只读）。"""
+    for rel, symbols in VERIFY_SYMBOLS.items():
+        text = _read_target(dest / rel)
+        for sym in symbols:
+            if text.count(sym) == 0:
+                raise SystemExit(
+                    f"reality patch self-check failed: {rel} contains 0 occurrence of "
+                    f"{sym!r} — anchor drift or partial apply; refusing to report success"
+                )
+    print("reality patch self-check ok: REALITY symbols present in all 6 target files")
 
 
 def apply_reality_patches(dest: Path) -> None:
     """应用 REALITY patch 集（锚点式插入/替换，幂等）。"""
     # ---- 1/2. ssl.h 声明 ----
     ssl_h = dest / "include" / "openssl" / "ssl.h"
-    text = ssl_h.read_text(encoding="utf-8")
+    text = _read_target(ssl_h)
     add = []
     if "SSL_get_x25519_key_share_private" not in text:
         add.append(REALITY_SSL_H_DECL)
@@ -260,7 +307,7 @@ def apply_reality_patches(dest: Path) -> None:
             "                                              const uint16_t *group_ids,\n"
             "                                              size_t num_group_ids);\n"
         )
-        text = insert_after(text, anchor, "\n" + "\n".join(add))
+        text = insert_after(text, anchor, "\n" + "\n".join(add), what="include/openssl/ssl.h")
         ssl_h.write_text(text, encoding="utf-8", newline="\n")
         print("applied reality patch: ssl.h")
     else:
@@ -268,7 +315,7 @@ def apply_reality_patches(dest: Path) -> None:
 
     # ---- 3. ssl_lib.cc 实现（全局区：C linkage + bssl helper）----
     ssl_lib = dest / "ssl" / "ssl_lib.cc"
-    text = ssl_lib.read_text(encoding="utf-8")
+    text = _read_target(ssl_lib)
     add = []
     if "SSL_get_x25519_key_share_private" not in text:
         add.append(REALITY_SSL_LIB_IMPL)
@@ -283,7 +330,9 @@ def apply_reality_patches(dest: Path) -> None:
         )
         idx = text.find(anchor)
         if idx < 0:
-            raise SystemExit("reality patch anchor not found in ssl_lib.cc")
+            raise SystemExit(
+                f"ssl/ssl_lib.cc: anchor not found (boringssl version drift?): {anchor[:80]!r}"
+            )
         close = text.find("\n}\n", idx)
         if close < 0:
             raise SystemExit("SSL_set1_client_key_shares impl end not found")
@@ -296,12 +345,14 @@ def apply_reality_patches(dest: Path) -> None:
 
     # ---- 4. internal.h 声明 ----
     internal_h = dest / "ssl" / "internal.h"
-    text = internal_h.read_text(encoding="utf-8")
+    text = _read_target(internal_h)
     changed = False
     if "ssl_reality_rewrite_maybe" not in text:
         anchor = "bool ssl_add_message_cbb(SSL *ssl, CBB *cbb);\n"
         text = insert_after(
-            text, anchor, "\nbool ssl_reality_rewrite_maybe(SSL *ssl, Array<uint8_t> *msg);\n"
+            text, anchor,
+            "\nbool ssl_reality_rewrite_maybe(SSL *ssl, Array<uint8_t> *msg);\n",
+            what="ssl/internal.h",
         )
         changed = True
     if "ssl_reality_server_hello_maybe" not in text:
@@ -310,6 +361,7 @@ def apply_reality_patches(dest: Path) -> None:
             text, anchor,
             "\n// REALITY (cert PQC): ServerHello 捕获（tls13_client.cc key schedule 前）。\n"
             "bool ssl_reality_server_hello_maybe(SSL *ssl, const SSLMessage &msg);\n",
+            what="ssl/internal.h",
         )
         changed = True
     if changed:
@@ -320,7 +372,7 @@ def apply_reality_patches(dest: Path) -> None:
 
     # ---- 5. handshake.cc ssl_add_message_cbb 调用点 ----
     handshake_cc = dest / "ssl" / "handshake.cc"
-    text = handshake_cc.read_text(encoding="utf-8")
+    text = _read_target(handshake_cc)
     if "ssl_reality_rewrite_maybe" not in text:
         text = replace_exact(text, HANDSHAKE_CBB_OLD, HANDSHAKE_CBB_NEW, "handshake.cc")
         handshake_cc.write_text(text, encoding="utf-8", newline="\n")
@@ -330,7 +382,7 @@ def apply_reality_patches(dest: Path) -> None:
 
     # ---- 6. handshake_client.cc ssl_add_client_hello 调用点（关键）----
     client_cc = dest / "ssl" / "handshake_client.cc"
-    text = client_cc.read_text(encoding="utf-8")
+    text = _read_target(client_cc)
     if "ssl_reality_rewrite_maybe" not in text:
         text = replace_exact(text, CLIENT_HELLO_OLD, CLIENT_HELLO_NEW, "handshake_client.cc")
         client_cc.write_text(text, encoding="utf-8", newline="\n")
@@ -340,7 +392,7 @@ def apply_reality_patches(dest: Path) -> None:
 
     # ---- 7. tls13_client.cc 删 session_id 回显 + ServerHello 捕获挂点 ----
     tls13_cc = dest / "ssl" / "tls13_client.cc"
-    text = tls13_cc.read_text(encoding="utf-8")
+    text = _read_target(tls13_cc)
     if "expected_session_id" in text:
         if text.count(TLS13_SID_DECL_OLD) != 1 or text.count(TLS13_SID_CMP_OLD) != 1:
             raise SystemExit("tls13_client.cc: session_id anchors drifted; re-derive")
@@ -360,6 +412,8 @@ def apply_reality_patches(dest: Path) -> None:
         print("applied reality patch: tls13_client.cc (server hello hook)")
     else:
         print("reality patch already present: tls13_client.cc (server hello hook, skip)")
+
+    verify_reality_patches(dest)
 
 
 def main() -> None:
