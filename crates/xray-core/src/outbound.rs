@@ -43,7 +43,9 @@ use xray_common::{
 use xray_conf::{BuiltConfig, BuiltOutbound};
 use xray_features::Result;
 // mux outbound：client 数据路径
-use xray_mux::client::{DialingWorkerFactory, IncrementalWorkerPicker, UnderlyingSlot};
+use xray_mux::client::{
+    DialingWorkerFactory, IncrementalWorkerPicker, MAX_DISPATCH_RETRY, UnderlyingSlot,
+};
 use xray_mux::session::ClientStrategy;
 use xray_proto::xray::core::OutboundHandlerConfig as OutboundHandlerConfigProto;
 use xray_proxy_freedom::{Config as FreedomConfig, DomainStrategy, Fragment, Noise};
@@ -1192,6 +1194,48 @@ impl MuxBridge {
         let factory = Arc::new(DialingWorkerFactory::with_slot(Arc::clone(&self.slot), strategy));
         self.xudp_picker = Some(Arc::new(IncrementalWorkerPicker::new(factory)));
     }
+
+    /// 按 picker 语义把 link 调度到 worker（对齐 Go `ClientManager.Dispatch`
+    /// 的 16 次重试环，client.go:30-53）。
+    ///
+    /// carrier 死亡（`is_closed → is_full`）与新会话到达存在竞窗：
+    /// `ClientWorker::dispatch` 一旦消费 link，false 返回路径无法归还，故
+    /// 重试以 `is_full` 预检为界——预检通过才消费 link。picker 的
+    /// `find_available` 跳过 closed worker、无可用时经 factory 新建 carrier
+    /// （死亡后的补位重建）；预检与 allocate 之间的极小竞窗仍可能拒绝，
+    /// 此时按 Go 重试耗尽语义显式 error（应用流终止可观测），绝不静默。
+    async fn dispatch_via_picker(
+        picker: &Arc<IncrementalWorkerPicker>,
+        dest: &Destination,
+        link: Link,
+        input: Option<&xray_xudp::GlobalIdInput>,
+        tag: &str,
+    ) {
+        for _ in 0..MAX_DISPATCH_RETRY {
+            let Some(worker) = picker.pick_internal().await else {
+                tracing::error!(tag = %tag, "mux dispatch: no worker available, dropping link");
+                drop(link);
+                return;
+            };
+            if worker.is_full() {
+                continue;
+            }
+            let inner = xray_mux::client::Link { reader: link.reader, writer: link.writer };
+            if worker.dispatch_with_source(dest, inner, input, None).await {
+                return;
+            }
+            tracing::error!(
+                tag = %tag,
+                "mux dispatch rejected after accept-check (carrier died mid-dispatch), dropping link"
+            );
+            return;
+        }
+        tracing::error!(
+            tag = %tag,
+            retries = MAX_DISPATCH_RETRY,
+            "mux dispatch: no available worker after retries, dropping link"
+        );
+    }
 }
 
 impl std::fmt::Debug for MuxBridge {
@@ -1212,16 +1256,7 @@ impl DispatchHandler for MuxBridge {
         let tag = self.tag.clone();
         let picker = Arc::clone(&self.picker);
         Box::pin(async move {
-            // pick（或 bootstrap）worker → ClientWorker::dispatch 把 link 桥成 mux session
-            let Some(worker) = picker.pick_internal().await else {
-                tracing::warn!(tag = %tag, "mux dispatch: no worker available");
-                drop(link);
-                return;
-            };
-            let inner = xray_mux::client::Link { reader: link.reader, writer: link.writer };
-            if !worker.dispatch(&dest, inner).await {
-                tracing::warn!(tag = %tag, "mux dispatch: worker full, dropping link");
-            }
+            Self::dispatch_via_picker(&picker, &dest, link, None, &tag).await;
         })
     }
 
@@ -1264,15 +1299,7 @@ impl DispatchHandler for MuxBridge {
             cone: !xray_common::platform::env::cone_disabled(),
         };
         Box::pin(async move {
-            let Some(worker) = picker.pick_internal().await else {
-                tracing::warn!(tag = %tag, "mux dispatch: no worker available");
-                drop(link);
-                return;
-            };
-            let inner = xray_mux::client::Link { reader: link.reader, writer: link.writer };
-            if !worker.dispatch_with_source(&dest, inner, Some(&input), None).await {
-                tracing::warn!(tag = %tag, "mux dispatch: worker full, dropping link");
-            }
+            Self::dispatch_via_picker(&picker, &dest, link, Some(&input), &tag).await;
         })
     }
 }
