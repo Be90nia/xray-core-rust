@@ -501,8 +501,8 @@ fn slot_window(st: &mut RemoteState, slot: RemoteSlot) -> &mut SlidingWindow {
 /// client 侧两代 server session 的归属判定 + 轮换（sing protocol.go:643-653 语义）。
 ///
 /// - 命中当前/上一代 → 原位返回（上一代收包刷新 `last_remote_seen`）
-/// - 新 sessionId：上一代收包 < 60s 拒绝轮换；否则当前代降级为上一代、
-///   登记新 sessionId（[`RemoteSlot::New`]，调用方按需派生 cipher）
+/// - 新 sessionId：上一代收包 < 60s 拒绝轮换；否则当前代降级为上一代、 登记新
+///   sessionId（[`RemoteSlot::New`]，调用方按需派生 cipher）
 fn route_remote_generation(st: &mut RemoteState, session_id: u64) -> Result<RemoteSlot> {
     if session_id != 0 && session_id == st.remote_session_id {
         return Ok(RemoteSlot::Current);

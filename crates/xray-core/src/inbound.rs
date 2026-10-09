@@ -1564,8 +1564,8 @@ pub async fn serve_ss2022_udp(
         // 海量 UDP 客户端下是内存泄漏；对齐 Go sing udpSessions LRU 淘汰。
         let now = std::time::Instant::now();
         sweep_expired_ss2022_sessions(&mut server_sessions, now);
-        // 1. ECB 解头 + EIH 用户识别（chacha：整包一次 XChaCha 解开，
-        //    body 明文随 hdr.chacha_plain 交付）
+        // 1. ECB 解头 + EIH 用户识别（chacha：整包一次 XChaCha 解开， body 明文随 hdr.chacha_plain
+        //    交付）
         let hdr = match server_decode_header(kind, &server_psk, &users, &buf[..n]) {
             Ok(h) => h,
             Err(e) => {
