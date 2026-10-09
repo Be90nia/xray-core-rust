@@ -34,7 +34,8 @@ async fn ss2022_tcp_vps_interop() {
     let salt_len = kind.salt_size();
     let tag_len = 16usize;
 
-    let client = Client2022::new(cipher, psk_b64, "sg.yzswgroup.top", 39101).expect("client");
+    let client =
+        Client2022::new(cipher, &[psk_b64.to_string()], "sg.yzswgroup.top", 39101).expect("client");
     let mut stream = client.dial_target("www.google.com", 80).await.expect("dial");
 
     // 发 HTTP 请求（body chunk，标准 size+payload 格式）

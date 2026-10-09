@@ -36,7 +36,8 @@ fn b64(psk: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(psk)
 }
 
-/// mock SS-2022 多用户 UDP server：解 EIH 识别用户 → echo 回包（多用户全路径）。
+/// mock SS-2022 多用户 UDP server：解 EIH 识别用户 → echo 回包（多用户全路径；
+/// chacha 分支走 `chacha_plain` 整包解密）。
 async fn spawn_multi_user_udp_server(sock: UdpSocket) {
     let ipsk = IPSK.to_vec();
     let upsk = UPSK.to_vec();
@@ -52,9 +53,11 @@ async fn spawn_multi_user_udp_server(sock: UdpSocket) {
             else {
                 continue;
             };
-            let Ok((addr, port, payload)) =
-                session.decode_body(&hdr.hdr, hdr.packet_id, &buf[16 + hdr.eih_len..n])
-            else {
+            let decoded = match &hdr.chacha_plain {
+                Some(plain) => session.decode_chacha_body(plain, hdr.packet_id),
+                None => session.decode_body(&hdr.hdr, hdr.packet_id, &buf[16 + hdr.eih_len..n]),
+            };
+            let Ok((addr, port, payload)) = decoded else {
                 continue;
             };
             let Ok(enc) = session.encode(&addr, port, &payload) else {
@@ -95,10 +98,9 @@ async fn ss2022_uot_multi_user_udp_dispatch_roundtrip() {
     // uot/uotVersion 解析进配置（Go shadowsocks.go:243-244 口径）
     assert!(cfg.udp_over_tcp.enabled, "uot:true must be parsed");
     assert_eq!(cfg.udp_over_tcp.version, 1);
-    // 多用户密码拆分：iPSK:uPSK → identity + user PSK
+    // 多用户密码拆分：iPSK:uPSK → PSK 链收全段
     let ss2022 = cfg.ss2022.as_ref().expect("ss2022 params");
-    assert_eq!(ss2022.psk_b64, b64(UPSK));
-    assert_eq!(ss2022.identity_psk_b64.as_deref(), Some(b64(IPSK).as_str()));
+    assert_eq!(ss2022.psk_list_b64, vec![b64(IPSK), b64(UPSK)]);
 
     // ===== 3. dispatcher UDP 会话（XUDP 帧 ↔ 2022 会话帧 pump）=====
     let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =

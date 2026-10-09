@@ -1,11 +1,9 @@
 //! SS-2022 UDP 帧编解码（SIP022 UDP）。
 //!
-//! 对应 Go `sing-shadowsocks/shadowaead_2022/protocol.go` 的
-//! `clientPacketConn.WritePacket/ReadPacket`、`service.go` 的
-//! `newPacket`/`serverPacketWriter.WritePacket`。
+//! 对齐 Go `proxy/shadowsocks_2022/packet.go`（v26.9.30 终态，65e853ed+00863626
+//! 去 sing 重写后的 `UDPCodec`/`ClientUDPSession`/`ServerUDPSession`）。
 //!
-//! # 帧格式（AES cipher；chacha20-poly1305 的 24B nonce 变体不支持，
-//!   Go 多用户 chacha UDP 同样 panic "unsupported chacha extended header"）
+//! # 帧格式（AES cipher，支持 n 层 PSK；chacha 见下）
 //!
 //! client → server（多用户 n 层 PSK，单用户 n=1）：
 //! ```text
@@ -17,13 +15,25 @@
 //!                      .seal(type=0 || ts_be8 || padLen_be2 || padding || addr || payload)
 //! ```
 //!
-//! server → client（无 EIH）：
+//! server → client（无 EIH，回包恒 padding=0）：
 //! ```text
 //! [0:16]   AES-ECB(psk, serverSessionId_be8 || serverPacketId_be8)
 //! [16:]    AEAD(SessionKey(psk, serverSessionId_be8),
 //!               nonce=(serverSessionId||serverPacketId)[4..16])
 //!              .seal(type=1 || ts_be8 || clientSessionId_be8 || padLen_be2 || padding || addr || payload)
 //! ```
+//!
+//! # chacha20-poly1305（SIP022 §4，仅单 PSK）
+//!
+//! 无 ECB 包头、无 EIH、无 session subkey 派生：24B 随机 nonce 明文前缀 +
+//! XChaCha20-Poly1305(finalPSK) 直 seal，sessionId/packetId 在 AEAD 明文头：
+//! ```text
+//! [0:24]  nonce（明文随机）
+//! [24:]   XChaCha20Poly1305(psk).seal(sessionId || packetId || type || ts
+//!                                        || [clientSessionId] || padLen || padding || addr || payload)
+//! ```
+//! 多 PSK + chacha 出站/codec 构造即硬错（Go outbound.go:48-50 /
+//! packet.go NewUDPPacketCodec）。
 //!
 //! 与 TCP EIH 的差异：UDP EIH 用 **raw iPSK** 直接作 ECB 密钥（TCP 用
 //! salt 派生的 identity subkey），且明文是与包头头的 XOR。
@@ -35,7 +45,7 @@ use std::{
 
 use parking_lot::Mutex;
 use xray_common::net::address::Address;
-use xray_crypto::aead::{AeadCipher, Aes128Gcm, Aes256Gcm};
+use xray_crypto::aead::{AeadCipher, Aes128Gcm, Aes256Gcm, XChaCha20Poly1305Aead};
 
 use crate::{
     error::{Result, SsError},
@@ -54,6 +64,8 @@ pub const TIMESTAMP_TOLERANCE_SECS: i64 = 30;
 
 /// 包头长度（sessionId 8B + packetId 8B）。
 const PACKET_HEADER_LEN: usize = 16;
+/// chacha UDP nonce 长度（XChaCha20-Poly1305，SIP022 §4 / Go PacketNonceSize）。
+const UDP_CHACHA_NONCE_SIZE: usize = 24;
 /// AEAD 最小明文：type(1) + ts(8) + 2/8 + padLen(2) + addr(7) 。
 const MIN_PLAINTEXT: usize = 1 + 8 + 2 + 7;
 
@@ -61,22 +73,34 @@ fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-fn build_aead(kind: CipherKind2022, key: &[u8]) -> Result<Box<dyn AeadCipher + Send + Sync>> {
-    match kind {
-        CipherKind2022::Aes128Gcm => Ok(Box::new(Aes128Gcm::new(key)?)),
-        CipherKind2022::Aes256Gcm => Ok(Box::new(Aes256Gcm::new(key)?)),
-        CipherKind2022::ChaCha20Poly1305 => Err(SsError::Ss2022UnsupportedMethod(
-            "chacha20-poly1305 UDP uses 24B nonce variant, unsupported".to_string(),
-        )),
+/// chacha + 多 PSK 硬错（Go outbound.go:48-50 / packet.go NewUDPPacketCodec）。
+fn ensure_psk_list_len(kind: CipherKind2022, psk_list: &[Vec<u8>]) -> Result<()> {
+    if kind == CipherKind2022::ChaCha20Poly1305 && psk_list.len() > 1 {
+        return Err(SsError::Ss2022UnsupportedMethod(
+            "multi-key is not supported for chacha20-poly1305".to_string(),
+        ));
     }
+    Ok(())
 }
 
-fn check_aead_kind(kind: CipherKind2022) -> Result<()> {
+/// UDP 会话 AEAD（Go `newUDPCodec`/`NewClientSession`/`EnsureServerState`）：
+/// AES → `SessionKey(psk, session_salt)` 派生后 AES-GCM；
+/// chacha → XChaCha20-Poly1305 以 raw PSK 直作 key（SIP022 §4，24B nonce）。
+fn udp_aead(
+    kind: CipherKind2022,
+    psk: &[u8],
+    session_salt: &[u8],
+) -> Result<Box<dyn AeadCipher + Send + Sync>> {
     match kind {
-        CipherKind2022::Aes128Gcm | CipherKind2022::Aes256Gcm => Ok(()),
-        CipherKind2022::ChaCha20Poly1305 => Err(SsError::Ss2022UnsupportedMethod(
-            "chacha20-poly1305 UDP uses 24B nonce variant, unsupported".to_string(),
-        )),
+        CipherKind2022::Aes128Gcm => {
+            let subkey = derive_session_subkey(psk, session_salt, kind);
+            Ok(Box::new(Aes128Gcm::new(&subkey)?))
+        },
+        CipherKind2022::Aes256Gcm => {
+            let subkey = derive_session_subkey(psk, session_salt, kind);
+            Ok(Box::new(Aes256Gcm::new(&subkey)?))
+        },
+        CipherKind2022::ChaCha20Poly1305 => Ok(Box::new(XChaCha20Poly1305Aead::new(psk)?)),
     }
 }
 
@@ -173,19 +197,18 @@ fn build_client_plaintext(addr: &Address, port: u16, payload: &[u8]) -> Vec<u8> 
 }
 
 /// 构造 server 帧明文区：type || ts || clientSessionId || padLen || padding || addr || payload。
+/// Go `EncodeServerPacket` 回包恒 padding=0（两种 cipher 均如此），此处对齐。
 fn build_server_plaintext(
     client_session_id: u64,
     addr: &Address,
     port: u16,
     payload: &[u8],
 ) -> Vec<u8> {
-    let pad = padding_len_for(port, payload.len());
-    let mut out = Vec::with_capacity(MIN_PLAINTEXT + 8 + pad + payload.len() + 4);
+    let mut out = Vec::with_capacity(MIN_PLAINTEXT + 8 + payload.len() + 4);
     out.push(HEADER_TYPE_SERVER);
     out.extend_from_slice(&now_unix().to_be_bytes());
     out.extend_from_slice(&client_session_id.to_be_bytes());
-    out.extend_from_slice(&(pad as u16).to_be_bytes());
-    out.resize(out.len() + pad, 0);
+    out.extend_from_slice(&0u16.to_be_bytes());
     write_address_port_ss(&mut out, addr, port);
     out.extend_from_slice(payload);
     out
@@ -281,22 +304,24 @@ struct RemoteState {
 impl ClientUdpSession2022 {
     /// 构造 client 会话。sessionId 随机，首个 packetId = 0（Go `packetId--` 后自增）。
     ///
+    /// chacha 仅接受单 PSK（多 PSK 硬错，Go `NewUDPPacketCodec`）；AES 的
+    /// session AEAD 从 final PSK + sessionId 派生（chacha 用 raw PSK 直作 key）。
+    ///
     /// # Errors
-    /// - [`SsError::Ss2022UnsupportedMethod`]：chacha cipher。
+    /// - [`SsError::Ss2022UnsupportedMethod`]：chacha + 多 PSK。
     /// - [`SsError::InvalidPassword`]：PSK 长度不匹配。
     pub fn new(kind: CipherKind2022, psk_list: Vec<Vec<u8>>) -> Result<Self> {
-        check_aead_kind(kind)?;
         if psk_list.is_empty() {
             return Err(SsError::Ss2022MissingKey);
         }
         let psk_list: Vec<Vec<u8>> =
             psk_list.into_iter().map(|p| derive_psk(&p, kind)).collect::<Result<Vec<_>>>()?;
+        ensure_psk_list_len(kind, &psk_list)?;
         let session_id = rand::random::<u64>();
-        let subkey =
-            derive_session_subkey(&psk_list[psk_list.len() - 1], &session_id.to_be_bytes(), kind);
+        let cipher = udp_aead(kind, &psk_list[psk_list.len() - 1], &session_id.to_be_bytes())?;
         Ok(Self {
             kind,
-            cipher: build_aead(kind, &subkey)?,
+            cipher,
             psk_list,
             session_id,
             packet_id: AtomicU64::new(u64::MAX),
@@ -326,14 +351,31 @@ impl ClientUdpSession2022 {
         // atomic fetch_add 溢出 wrap：u64::MAX + 1 → 0（首包 id=0）
         let packet_id = self.packet_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         let hdr = pk_header(self.session_id, packet_id);
-
         let plain = build_client_plaintext(addr, port, payload);
+
+        // chacha（SIP022 §4）：无 ECB 头、无 EIH；24B 随机 nonce 明文前缀 +
+        // XChaCha(finalPSK) 直 seal，sessionId/packetId 在 AEAD 明文头
+        //（Go EncodePacket chacha 分支）。
+        if self.kind == CipherKind2022::ChaCha20Poly1305 {
+            let nonce: [u8; UDP_CHACHA_NONCE_SIZE] = rand::random();
+            let mut sealed_plain = Vec::with_capacity(PACKET_HEADER_LEN + plain.len());
+            sealed_plain.extend_from_slice(&hdr);
+            sealed_plain.extend_from_slice(&plain);
+            let sealed = self
+                .cipher
+                .seal(&nonce, b"", &sealed_plain)
+                .map_err(|e| SsError::AeadSeal(e.to_string()))?;
+            let mut out = Vec::with_capacity(UDP_CHACHA_NONCE_SIZE + sealed.len());
+            out.extend_from_slice(&nonce);
+            out.extend_from_slice(&sealed);
+            return Ok(out);
+        }
+
+        let eih_count = self.psk_list.len().saturating_sub(1);
         let sealed = self
             .cipher
             .seal(&hdr[4..16], b"", &plain)
             .map_err(|e| SsError::AeadSeal(e.to_string()))?;
-
-        let eih_count = self.psk_list.len().saturating_sub(1);
         let mut out = Vec::with_capacity(PACKET_HEADER_LEN + eih_count * 16 + sealed.len());
         // EIH：raw iPSK 直接作 ECB key（与 TCP 的 salt 派生不同）
         for i in 0..eih_count {
@@ -361,7 +403,11 @@ impl ClientUdpSession2022 {
     /// - [`SsError::Ss2022PacketIdNotUnique`]：重放。
     /// - [`SsError::AeadOpen`]：解密失败。
     /// - [`SsError::Ss2022BadClientSessionId`]：clientSessionId 不匹配。
+    /// - [`SsError::Ss2022TooManyServerSessions`]：60s 内第二次 server 会话轮换。
     pub fn decode(&self, pkt: &[u8]) -> Result<(Address, u16, Vec<u8>)> {
+        if self.kind == CipherKind2022::ChaCha20Poly1305 {
+            return self.decode_chacha(pkt);
+        }
         if pkt.len() < PACKET_HEADER_LEN + MIN_PLAINTEXT {
             return Err(SsError::InsufficientData(pkt.len()));
         }
@@ -371,49 +417,119 @@ impl ClientUdpSession2022 {
         let packet_id = u64::from_be_bytes(hdr[8..].try_into().unwrap());
 
         let mut st = self.remote.lock();
-        // 归属判断（sessionId=0 视为未知：0 是未初始化哨兵）
-        let cur = session_id != 0 && session_id == st.remote_session_id;
-        let lst = !cur && session_id != 0 && session_id == st.last_remote_session_id;
-        if lst {
-            // sing protocol.go:646：last 代收包刷新 lastRemoteSeen（轮换时限基准）
-            st.last_remote_seen = now_unix();
+        let slot = route_remote_generation(&mut st, session_id)?;
+        if slot == RemoteSlot::New {
+            // 新 server session：AES body cipher 从 finalPSK + 新 sessionId 派生
+            st.remote_cipher = Some(udp_aead(self.kind, last, &hdr[..8])?);
         }
-        if (cur && !st.window.check(packet_id)) || (lst && !st.last_window.check(packet_id)) {
+        decode_server_frame(
+            &mut st,
+            slot,
+            &hdr[4..16],
+            packet_id,
+            &pkt[PACKET_HEADER_LEN..],
+            self.session_id,
+        )
+    }
+
+    /// chacha 分支：整包一次 XChaCha(finalPSK) 解开，sessionId/packetId 在明文头
+    /// （Go `ClientUDPSession.DecodePacket` chacha 分支；两代会话状态机与 AES 共用）。
+    fn decode_chacha(&self, pkt: &[u8]) -> Result<(Address, u16, Vec<u8>)> {
+        if pkt.len() < UDP_CHACHA_NONCE_SIZE + PACKET_HEADER_LEN + MIN_PLAINTEXT {
+            return Err(SsError::InsufficientData(pkt.len()));
+        }
+        let plain = self
+            .cipher
+            .open(&pkt[..UDP_CHACHA_NONCE_SIZE], b"", &pkt[UDP_CHACHA_NONCE_SIZE..])
+            .map_err(|e| SsError::AeadOpen(e.to_string()))?;
+        if plain.len() < PACKET_HEADER_LEN + MIN_PLAINTEXT {
+            return Err(SsError::InsufficientData(plain.len()));
+        }
+        let session_id = u64::from_be_bytes(plain[..8].try_into().unwrap());
+        let packet_id = u64::from_be_bytes(plain[8..16].try_into().unwrap());
+
+        let mut st = self.remote.lock();
+        let slot = route_remote_generation(&mut st, session_id)?;
+        decode_server_frame(
+            &mut st,
+            slot,
+            &[],
+            packet_id,
+            &plain[PACKET_HEADER_LEN..],
+            self.session_id,
+        )
+    }
+}
+
+/// server → client 帧解码收尾：重放窗口 check → 解密（chacha 传空 nonce，明文已
+/// 在调用方整包解开）→ 解析 → add（Go DecodePacket 两分支共用次序）。
+fn decode_server_frame(
+    st: &mut RemoteState,
+    slot: RemoteSlot,
+    nonce: &[u8],
+    packet_id: u64,
+    body: &[u8],
+    expect_client_session_id: u64,
+) -> Result<(Address, u16, Vec<u8>)> {
+    {
+        let window = slot_window(st, slot);
+        if !window.check(packet_id) {
             return Err(SsError::Ss2022PacketIdNotUnique);
         }
-        if !cur && !lst {
-            // 新 server session：对齐 sing protocol.go:643-653——当前代降级为
-            // 上一代有 60s 时限（`now - lastRemoteSeen < 60` 拒绝轮换，防合法
-            // PSK 客户端无限速轮换 sessionId 定向挤出双代窗口）。
-            if st.remote_session_id != 0 {
-                if now_unix() - st.last_remote_seen < 60 {
-                    return Err(SsError::Ss2022TooManyServerSessions);
-                }
-                st.last_remote_session_id = st.remote_session_id;
-                st.last_remote_cipher = st.remote_cipher.take();
-                st.last_window = std::mem::take(&mut st.window);
-                st.last_remote_seen = now_unix();
-            }
-            st.remote_session_id = session_id;
-            let subkey = derive_session_subkey(last, &hdr[..8], self.kind);
-            st.remote_cipher = Some(build_aead(self.kind, &subkey)?);
-        }
-        let cipher =
-            if lst { st.last_remote_cipher.as_deref() } else { st.remote_cipher.as_deref() };
+    }
+    let plain = if nonce.is_empty() {
+        body.to_vec()
+    } else {
+        let cipher = match slot {
+            RemoteSlot::Previous => st.last_remote_cipher.as_deref(),
+            RemoteSlot::Current | RemoteSlot::New => st.remote_cipher.as_deref(),
+        };
         let Some(cipher) = cipher else {
             return Err(SsError::AeadOpen("remote cipher missing".into()));
         };
-        let plain = cipher
-            .open(&hdr[4..16], b"", &pkt[PACKET_HEADER_LEN..])
-            .map_err(|e| SsError::AeadOpen(e.to_string()))?;
-        if lst {
-            st.last_window.add(packet_id);
-        } else {
-            st.window.add(packet_id);
-        }
-        drop(st);
-        parse_server_plaintext(&plain, self.session_id)
+        cipher.open(nonce, b"", body).map_err(|e| SsError::AeadOpen(e.to_string()))?
+    };
+    let decoded = parse_server_plaintext(&plain, expect_client_session_id)?;
+    slot_window(st, slot).add(packet_id);
+    Ok(decoded)
+}
+
+fn slot_window(st: &mut RemoteState, slot: RemoteSlot) -> &mut SlidingWindow {
+    if slot == RemoteSlot::Previous { &mut st.last_window } else { &mut st.window }
+}
+
+/// client 侧两代 server session 的归属判定 + 轮换（sing protocol.go:643-653 语义）。
+///
+/// - 命中当前/上一代 → 原位返回（上一代收包刷新 `last_remote_seen`）
+/// - 新 sessionId：上一代收包 < 60s 拒绝轮换；否则当前代降级为上一代、
+///   登记新 sessionId（[`RemoteSlot::New`]，调用方按需派生 cipher）
+fn route_remote_generation(st: &mut RemoteState, session_id: u64) -> Result<RemoteSlot> {
+    if session_id != 0 && session_id == st.remote_session_id {
+        return Ok(RemoteSlot::Current);
     }
+    if session_id != 0 && session_id == st.last_remote_session_id {
+        st.last_remote_seen = now_unix();
+        return Ok(RemoteSlot::Previous);
+    }
+    if st.remote_session_id != 0 {
+        if now_unix() - st.last_remote_seen < 60 {
+            return Err(SsError::Ss2022TooManyServerSessions);
+        }
+        st.last_remote_session_id = st.remote_session_id;
+        st.last_remote_cipher = st.remote_cipher.take();
+        st.last_window = std::mem::take(&mut st.window);
+        st.last_remote_seen = now_unix();
+    }
+    st.remote_session_id = session_id;
+    Ok(RemoteSlot::New)
+}
+
+/// [`route_remote_generation`] 的归属结果。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RemoteSlot {
+    Current,
+    Previous,
+    New,
 }
 
 fn pk_header(session_id: u64, packet_id: u64) -> [u8; 16] {
@@ -434,12 +550,15 @@ pub struct DecodedClientHeader<'a> {
     pub session_id: u64,
     /// client packetId。
     pub packet_id: u64,
-    /// 已 ECB 解密的明文包头（nonce/派生材料）。
+    /// 已 ECB 解密的明文包头（nonce/派生材料）；chacha 模式恒零（不用）。
     pub hdr: [u8; 16],
     /// EIH 块字节数（multi = (n-1)*16，single = 0）。
     pub eih_len: usize,
     /// AEAD 派生 PSK（single→server_psk；multi→匹配用户 uPSK）。
     pub aead_psk: &'a [u8],
+    /// chacha 模式：整包解出的明文体（sessionId/packetId 之后），
+    /// 供 [`ServerUdpSession2022::decode_chacha_body`] 做窗口检查 + 解析。
+    pub chacha_plain: Option<Vec<u8>>,
 }
 
 /// server 侧解 client 包第一步：ECB 解包头 + EIH 识别用户。
@@ -456,6 +575,31 @@ pub fn server_decode_header<'a>(
     users: &'a [([u8; 16], Vec<u8>)],
     pkt: &[u8],
 ) -> Result<DecodedClientHeader<'a>> {
+    // chacha：整包一次 XChaCha(psk) 解开（无 ECB 头、无 EIH、无用户识别），
+    // sessionId/packetId 在明文头；body 明文随 hdr.chacha_plain 交付，
+    // 调用方建 session 后用 `decode_chacha_body` 做重放窗口 + 解析
+    //（Go `UDPCodec.DecodePacket` chacha 分支）。
+    if kind == CipherKind2022::ChaCha20Poly1305 {
+        if pkt.len() < UDP_CHACHA_NONCE_SIZE + PACKET_HEADER_LEN + MIN_PLAINTEXT {
+            return Err(SsError::InsufficientData(pkt.len()));
+        }
+        let aead = XChaCha20Poly1305Aead::new(server_psk)?;
+        let plain = aead
+            .open(&pkt[..UDP_CHACHA_NONCE_SIZE], b"", &pkt[UDP_CHACHA_NONCE_SIZE..])
+            .map_err(|e| SsError::AeadOpen(e.to_string()))?;
+        if plain.len() < PACKET_HEADER_LEN + MIN_PLAINTEXT {
+            return Err(SsError::InsufficientData(plain.len()));
+        }
+        return Ok(DecodedClientHeader {
+            session_id: u64::from_be_bytes(plain[..8].try_into().unwrap()),
+            packet_id: u64::from_be_bytes(plain[8..16].try_into().unwrap()),
+            hdr: [0u8; 16],
+            eih_len: 0,
+            aead_psk: server_psk,
+            chacha_plain: Some(plain[PACKET_HEADER_LEN..].to_vec()),
+        });
+    }
+
     let eih_len = if users.is_empty() { 0 } else { 16 };
     if pkt.len() < PACKET_HEADER_LEN + eih_len + MIN_PLAINTEXT {
         return Err(SsError::InsufficientData(pkt.len()));
@@ -480,7 +624,7 @@ pub fn server_decode_header<'a>(
         psk.as_slice()
     };
 
-    Ok(DecodedClientHeader { session_id, packet_id, hdr, eih_len, aead_psk })
+    Ok(DecodedClientHeader { session_id, packet_id, hdr, eih_len, aead_psk, chacha_plain: None })
 }
 
 /// SS-2022 UDP server 会话（per client sessionId 的 NAT entry，
@@ -503,26 +647,36 @@ pub struct ServerUdpSession2022 {
 impl ServerUdpSession2022 {
     /// 构造 server 会话（首包时按解出的 client sessionId + 匹配 PSK）。
     ///
+    /// AES：回包 AEAD 从 server sessionId 派生、解包 AEAD 从 client sessionId 派生；
+    /// chacha：两者同为一个 XChaCha(rawPSK)（SIP022 §4，无 subkey 派生）。
+    ///
     /// # Errors
-    /// - [`SsError::Ss2022UnsupportedMethod`]：chacha cipher。
+    /// - 透传 AEAD 初始化错误。
     pub fn new(kind: CipherKind2022, psk: Vec<u8>, client_session_id: u64) -> Result<Self> {
-        check_aead_kind(kind)?;
         let session_id = rand::random::<u64>();
-        let sk = derive_session_subkey(&psk, &session_id.to_be_bytes(), kind);
-        let rk = derive_session_subkey(&psk, &client_session_id.to_be_bytes(), kind);
+        let (cipher, remote_cipher) = if kind == CipherKind2022::ChaCha20Poly1305 {
+            // chacha：raw PSK 直作 key，回包/解包同 key（SIP022 §4）
+            let c = udp_aead(kind, &psk, &[])?;
+            let rc = udp_aead(kind, &psk, &[])?;
+            (c, rc)
+        } else {
+            let c = udp_aead(kind, &psk, &session_id.to_be_bytes())?;
+            let rc = udp_aead(kind, &psk, &client_session_id.to_be_bytes())?;
+            (c, rc)
+        };
         Ok(Self {
             kind,
             psk,
             session_id,
             packet_id: AtomicU64::new(u64::MAX),
-            cipher: build_aead(kind, &sk)?,
+            cipher,
             client_session_id,
-            remote_cipher: build_aead(kind, &rk)?,
+            remote_cipher,
             window: Mutex::new(SlidingWindow::default()),
         })
     }
 
-    /// server 会话第二步：AEAD 解密 body + 解析 client 帧明文区。
+    /// server 会话第二步（AES）：AEAD 解密 body + 解析 client 帧明文区。
     ///
     /// `hdr` = [`server_decode_header`] 解出的明文包头；
     /// `body` = `pkt[16 + eih_len ..]`。
@@ -551,6 +705,25 @@ impl ServerUdpSession2022 {
         }
     }
 
+    /// server 会话第二步（chacha）：`hdr.chacha_plain` 已整包解开，这里只做
+    /// 重放窗口 check → 解析 → add（Go chacha 分支的 CheckPacketID/parse/Add 次序）。
+    ///
+    /// # Errors
+    /// - [`SsError::Ss2022PacketIdNotUnique`]：重放。
+    pub fn decode_chacha_body(
+        &self,
+        plain: &[u8],
+        packet_id: u64,
+    ) -> Result<(Address, u16, Vec<u8>)> {
+        let mut w = self.window.lock();
+        if !w.check(packet_id) {
+            return Err(SsError::Ss2022PacketIdNotUnique);
+        }
+        let r = parse_client_plaintext(plain)?;
+        w.add(packet_id);
+        Ok(r)
+    }
+
     /// 编码 server → client 回包帧。
     ///
     /// # Errors
@@ -559,6 +732,24 @@ impl ServerUdpSession2022 {
         let packet_id = self.packet_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         let hdr = pk_header(self.session_id, packet_id);
         let plain = build_server_plaintext(self.client_session_id, addr, port, payload);
+
+        // chacha：24B 随机 nonce 明文前缀 + XChaCha 直 seal，
+        // serverSessionId/serverPacketId 在 AEAD 明文头（Go EncodeServerPacket）。
+        if self.kind == CipherKind2022::ChaCha20Poly1305 {
+            let nonce: [u8; UDP_CHACHA_NONCE_SIZE] = rand::random();
+            let mut sealed_plain = Vec::with_capacity(PACKET_HEADER_LEN + plain.len());
+            sealed_plain.extend_from_slice(&hdr);
+            sealed_plain.extend_from_slice(&plain);
+            let sealed = self
+                .cipher
+                .seal(&nonce, b"", &sealed_plain)
+                .map_err(|e| SsError::AeadSeal(e.to_string()))?;
+            let mut out = Vec::with_capacity(UDP_CHACHA_NONCE_SIZE + sealed.len());
+            out.extend_from_slice(&nonce);
+            out.extend_from_slice(&sealed);
+            return Ok(out);
+        }
+
         let sealed = self
             .cipher
             .seal(&hdr[4..16], b"", &plain)
@@ -774,17 +965,67 @@ mod tests {
         assert!(client.decode(&frame).is_err());
     }
 
-    /// chacha cipher 的 UDP 被拒。
+    /// chacha 单用户 UDP：client ↔ server 双向 roundtrip（XChaCha 24B nonce，
+    /// 无 ECB 头/EIH；Go EncodePacket/EncodeServerPacket chacha 分支对齐）。
     #[test]
-    fn chacha_udp_unsupported() {
+    fn chacha_udp_roundtrip() {
+        let kind = CipherKind2022::ChaCha20Poly1305;
+        let psk = (0..32u8).collect::<Vec<u8>>();
+        let client = ClientUdpSession2022::new(kind, vec![psk.clone()]).unwrap();
+
+        // client → server
+        let frame = client.encode(&Address::Domain("c.example".into()), 443, b"up").unwrap();
+        let hdr = server_decode_header(kind, &psk, &[], &frame).unwrap();
+        assert_eq!(hdr.session_id, client.session_id());
+        assert_eq!(hdr.packet_id, 0);
+        assert_eq!(hdr.eih_len, 0);
+        let plain = hdr.chacha_plain.clone().expect("chacha plain");
+        let session =
+            ServerUdpSession2022::new(kind, hdr.aead_psk.to_vec(), hdr.session_id).unwrap();
+        let (addr, port, payload) = session.decode_chacha_body(&plain, hdr.packet_id).unwrap();
+        assert_eq!(addr, Address::Domain("c.example".into()));
+        assert_eq!(port, 443);
+        assert_eq!(payload, b"up");
+
+        // server → client（回包 padding 恒 0）
+        let reply = session
+            .encode(&Address::IPv4(std::net::Ipv4Addr::new(1, 1, 1, 1)), 443, b"down")
+            .unwrap();
+        let (addr, port, payload) = client.decode(&reply).unwrap();
+        assert_eq!(addr, Address::IPv4(std::net::Ipv4Addr::new(1, 1, 1, 1)));
+        assert_eq!(port, 443);
+        assert_eq!(payload, b"down");
+    }
+
+    /// chacha + 多 PSK：codec 构造硬错（Go NewUDPPacketCodec / outbound.go:48-50）。
+    #[test]
+    fn chacha_udp_multi_psk_rejected() {
+        let kind = CipherKind2022::ChaCha20Poly1305;
         let err = match ClientUdpSession2022::new(
-            CipherKind2022::ChaCha20Poly1305,
-            vec![(0..32u8).collect()],
+            kind,
+            vec![(0..32u8).collect(), (32..64u8).collect()],
         ) {
             Err(e) => e,
-            Ok(_) => panic!("chacha udp should be unsupported"),
+            Ok(_) => panic!("chacha multi-psk must be rejected"),
         };
         assert!(matches!(err, SsError::Ss2022UnsupportedMethod(_)));
+    }
+
+    /// chacha UDP 重放（同 packetId 二次）被拒。
+    #[test]
+    fn chacha_udp_replay_rejected() {
+        let kind = CipherKind2022::ChaCha20Poly1305;
+        let psk = (0..32u8).collect::<Vec<u8>>();
+        let client = ClientUdpSession2022::new(kind, vec![psk.clone()]).unwrap();
+        let frame =
+            client.encode(&Address::IPv4(std::net::Ipv4Addr::new(2, 2, 2, 2)), 80, b"p").unwrap();
+        let hdr = server_decode_header(kind, &psk, &[], &frame).unwrap();
+        let plain = hdr.chacha_plain.expect("chacha plain");
+        let session =
+            ServerUdpSession2022::new(kind, hdr.aead_psk.to_vec(), hdr.session_id).unwrap();
+        assert!(session.decode_chacha_body(&plain, hdr.packet_id).is_ok());
+        let err = session.decode_chacha_body(&plain, hdr.packet_id).unwrap_err();
+        assert!(matches!(err, SsError::Ss2022PacketIdNotUnique));
     }
 
     /// DNS(53) 包带 padding 也能正确 roundtrip（padding 剥离）。
