@@ -293,7 +293,7 @@ pub struct SocketOptions {
     /// `0`=不设置。
     pub tcp_max_seg: i32,
     /// SO_RCVBUF 接收缓冲（字节）。JSON `receiveBufferSize`。`0`=TCP 路径取
-    /// [`TCP_RCVBUF_DEFAULT`]（4MB，bd 88m0 默认）。
+    /// `TCP_RCVBUF_DEFAULT`（4MB，bd 88m0 默认）。
     /// **Go `SocketConfig` 无此字段**（v26.9.9 config.proto
     /// 全字段核对），本仓库 opt-in 运维扩展：显式设置即锁定该 socket 的内核接收
     /// 窗自动调节（Linux `SOCK_RCVBUF_LOCK`，通告窗上限=值×2 字节记账），用于高
@@ -417,7 +417,7 @@ pub(crate) const TCP_RCVBUF_DEFAULT: i32 = 4 * 1024 * 1024;
 /// - Darwin：TFO_CLIENT 位 / SO_REUSEPORT / IP_BOUND_IF / IPV6_BOUND_IF / TCP_KEEPALIVE-KEEPINTVL
 /// - Windows：Winsock TCP_FASTOPEN=15 / IP_UNICAST_IF / IPV6_UNICAST_IF
 ///
-/// SO_RCVBUF 缺省值见 [`TCP_RCVBUF_DEFAULT`]；显式 `receiveBufferSize` 优先
+/// SO_RCVBUF 缺省值见 `TCP_RCVBUF_DEFAULT`；显式 `receiveBufferSize` 优先
 /// （因此 `SocketOptions::default()` 会设置 4MB 接收缓冲——非零副作用，见常量文档）。
 pub fn apply_outbound_socket_options(
     socket: &Socket,
@@ -1025,7 +1025,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let stream = std::net::TcpStream::connect(addr).unwrap();
         let socket = socket2::Socket::from(stream);
-        let opts = SocketOptions { receive_buffer_size: 1 * 1024 * 1024, ..SocketOptions::default() };
+        let opts = SocketOptions { receive_buffer_size: 1024 * 1024, ..SocketOptions::default() };
         apply_outbound_socket_options(&socket, &opts, None).unwrap();
         assert!(
             socket.recv_buffer_size().unwrap() < TCP_RCVBUF_DEFAULT as usize,
