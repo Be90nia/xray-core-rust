@@ -919,9 +919,7 @@ fn build_protocol_handler(
                 // parse_pinned_hashes 报类型错拒启，而非静默丢 pin（bd zl5t）。
                 let has_pins = tls_json
                     .and_then(|j| j.get("pinnedPeerCertSha256"))
-                    .is_some_and(|v| {
-                        !v.is_null() && v.as_str().is_none_or(|s| !s.is_empty())
-                    });
+                    .is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|s| !s.is_empty()));
                 if has_pins {
                     xray_tls::client_config::build_server_cert_verifier(tls_json)
                         .map_err(|e| format!("tuic pinned verifier: {e}"))?

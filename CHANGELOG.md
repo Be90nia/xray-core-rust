@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- 压测 harness 泄漏判定改尾半段拟合（bd 2f8o）：启动爬坡段污染全段最小二乘 → macOS 6h 跑假阳 SUSPECT（5.00/6.27 %/h）；RSS 斜率只取 `samples[n/2..]` 稳态段，基线/阈值不变；run 36237760680 回放 macOS a/b SUSPECT→OK，linux/windows 结论不翻转
 - 全库 rustfmt 新规则重排（CI stable 工具链升级致 Format job 全库违规，一次性对齐，零语义）
 - CI 修复：runner 镜像不再预装 protoc——clippy/build(三平台)/test/docs/fuzz 五 job 补装
 

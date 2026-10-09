@@ -2023,9 +2023,11 @@ mod tests {
             ) -> Poll<io::Result<usize>> {
                 Pin::new(&mut self.0).poll_write(cx, buf)
             }
+
             fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
                 Pin::new(&mut self.0).poll_flush(cx)
             }
+
             fn poll_shutdown(
                 mut self: Pin<&mut Self>,
                 cx: &mut Context<'_>,
@@ -2040,6 +2042,7 @@ mod tests {
             fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
                 Ok(None)
             }
+
             fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
                 Ok(None)
             }
@@ -2056,18 +2059,12 @@ mod tests {
         let mut got: Vec<u8> = Vec::with_capacity(TOTAL);
         let mut buf = [0u8; 16384];
         let mut reads = 0usize;
-        let macro_every: usize = std::env::var("XRAY_STALL_MACRO_EVERY")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(40);
-        let macro_ms: u64 = std::env::var("XRAY_STALL_MACRO_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(150);
-        let macro_seed: u64 = std::env::var("XRAY_STALL_SEED")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+        let macro_every: usize =
+            std::env::var("XRAY_STALL_MACRO_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+        let macro_ms: u64 =
+            std::env::var("XRAY_STALL_MACRO_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(150);
+        let macro_seed: u64 =
+            std::env::var("XRAY_STALL_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         let macro_seed = if macro_seed == 0 {
             let s = (std::process::id() as u64) << 32
                 | std::time::SystemTime::now()

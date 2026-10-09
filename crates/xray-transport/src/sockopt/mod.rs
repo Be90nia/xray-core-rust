@@ -401,6 +401,10 @@ impl Default for SocketOptions {
 /// 413-433KB/s，出生掷签 ~25%；Go 对照同拓扑 10/10 全净靠运行时调度偶然逃逸）。
 /// 显式 4MB 锁定窗上限，为记账上限非预分配，空闲连接零内存代价。显式
 /// `receiveBufferSize` 配置优先于本默认。
+///
+/// **Linux 运营者注意**：`setsockopt(SO_RCVBUF)` 受 `net.core.rmem_max` 静默
+/// 钳制（stock 缺省 212992）——要吃满 4MB 需 `sysctl -w net.core.rmem_max=8388608`
+/// （wmem 同理；7p1m 战役 VPS 已调）。
 pub(crate) const TCP_RCVBUF_DEFAULT: i32 = 4 * 1024 * 1024;
 
 /// 把 [`SocketOptions`] 应用到已建立的 [`Socket`]（TCP 专用）。
@@ -435,11 +439,8 @@ pub fn apply_outbound_socket_options(
     // 钉死 ~64KB、高 RTT 吞吐=窗/RTT，见 [`TCP_RCVBUF_DEFAULT`]）。显式设置
     // 锁定内核接收窗自动调节（Linux SOCK_RCVBUF_LOCK），socket2 跨平台
     // （unix/Winsock SO_RCVBUF）。
-    let rcvbuf = if opts.receive_buffer_size > 0 {
-        opts.receive_buffer_size
-    } else {
-        TCP_RCVBUF_DEFAULT
-    };
+    let rcvbuf =
+        if opts.receive_buffer_size > 0 { opts.receive_buffer_size } else { TCP_RCVBUF_DEFAULT };
     socket.set_recv_buffer_size(rcvbuf as usize)?;
     // SO_KEEPALIVE + TCP_KEEPIDLE/TCP_KEEPINTVL（Go KeepAliveConfig 语义，见
     // [`set_keepalive_config`]）。Darwin 平台 keepalive 走 darwin 模块自带逻辑。
@@ -534,11 +535,8 @@ pub fn apply_inbound_socket_options(socket: &Socket, opts: &SocketOptions) -> st
     // SO_RCVBUF 锁定语义，必须在连接 socket 上显式设。显式 `receiveBufferSize`
     // 优先；缺省 TCP 默认 4MB（bd 88m0，862340ff/7p1m 同族，见
     // [`TCP_RCVBUF_DEFAULT`]）。
-    let rcvbuf = if opts.receive_buffer_size > 0 {
-        opts.receive_buffer_size
-    } else {
-        TCP_RCVBUF_DEFAULT
-    };
+    let rcvbuf =
+        if opts.receive_buffer_size > 0 { opts.receive_buffer_size } else { TCP_RCVBUF_DEFAULT };
     socket.set_recv_buffer_size(rcvbuf as usize)?;
 
     #[cfg(target_os = "linux")]
