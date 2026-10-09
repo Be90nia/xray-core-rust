@@ -13,7 +13,6 @@
 //! | `mtu` | MTU，默认 1420 |
 //! | `num_workers` | WireGuard 工作线程数 |
 //! | `reserved` | WireGuard reserved 字段（3 字节，用于混淆） |
-//! | `domain_strategy` | DNS 解析策略（FORCE_IP / FORCE_IP4 / FORCE_IP6 / FORCE_IP46 / FORCE_IP64） |
 //! | `is_client` | 客户端（出站）or 服务端（入站） |
 //! | `no_kernel_tun` | 强制使用 userspace TUN（gVisor），不用内核 TUN |
 //!
@@ -27,75 +26,6 @@
 //! | `allowed_ips` | 允许的源 IP CIDR 列表 |
 
 use crate::error::{Result, WgError};
-
-/// DNS 解析策略。对应 Go `DeviceConfig_DomainStrategy` 枚举。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[repr(i32)]
-pub enum DomainStrategy {
-    /// 优先 IP（任意 IP 版本）。
-    #[default]
-    ForceIp = 0,
-    /// 强制 IPv4。
-    ForceIp4 = 1,
-    /// 强制 IPv6。
-    ForceIp6 = 2,
-    /// 优先 IPv4，回退 IPv6。
-    ForceIp46 = 3,
-    /// 优先 IPv6，回退 IPv4。
-    ForceIp64 = 4,
-}
-
-impl DomainStrategy {
-    /// 从 proto i32 值构造。非法值返回 `ForceIp`（默认）。
-    #[must_use]
-    pub fn from_proto_value(v: i32) -> Self {
-        match v {
-            1 => Self::ForceIp4,
-            2 => Self::ForceIp6,
-            3 => Self::ForceIp46,
-            4 => Self::ForceIp64,
-            _ => Self::ForceIp,
-        }
-    }
-
-    /// 转换为 proto i32 值。
-    #[must_use]
-    pub fn to_proto_value(self) -> i32 {
-        self as i32
-    }
-
-    /// 是否优先 IPv4。对应 Go `preferIP4()`。
-    #[must_use]
-    pub fn prefer_ip4(self) -> bool {
-        matches!(self, Self::ForceIp | Self::ForceIp4 | Self::ForceIp46)
-    }
-
-    /// 是否优先 IPv6。对应 Go `preferIP6()`。
-    #[must_use]
-    pub fn prefer_ip6(self) -> bool {
-        matches!(self, Self::ForceIp | Self::ForceIp6 | Self::ForceIp64)
-    }
-
-    /// 是否有 fallback（双栈）。对应 Go `hasFallback()`。
-    #[must_use]
-    pub fn has_fallback(self) -> bool {
-        matches!(self, Self::ForceIp46 | Self::ForceIp64)
-    }
-
-    /// fallback 是否为 IPv4（即主策略是 IPv6，回退到 IPv4）。
-    /// 对应 Go `fallbackIP4()`。
-    #[must_use]
-    pub fn fallback_ip4(self) -> bool {
-        matches!(self, Self::ForceIp64)
-    }
-
-    /// fallback 是否为 IPv6（即主策略是 IPv4，回退到 IPv6）。
-    /// 对应 Go `fallbackIP6()`。
-    #[must_use]
-    pub fn fallback_ip6(self) -> bool {
-        matches!(self, Self::ForceIp46)
-    }
-}
 
 /// 对端配置。对应 proto `xray.proxy.wireguard.PeerConfig` + Go `WireGuardPeerConfig`
 /// 的 `level`/`email`（wireguard.go:24-25：服务端形态经 `protocol.User` 供
@@ -133,17 +63,15 @@ pub struct DeviceConfig {
     pub num_workers: i32,
     /// reserved 字段（3 字节，用于混淆）。
     pub reserved: Vec<u8>,
-    /// DNS 解析策略。
-    pub domain_strategy: DomainStrategy,
     /// 客户端（出站）or 服务端（入站）。
     pub is_client: bool,
     /// 强制 userspace TUN。
     pub no_kernel_tun: bool,
     /// 隧道内 DNS 服务器（Go c7e569b0 `remoteDNS` → DeviceConfig.DNS）。
     ///
-    /// 语义（Go client.go:112-123）：
+    /// 语义（Go efc9e6da 删除 "local" 模式后）：
     /// - 空 → 默认 Cloudflare 四址（`TUNNEL_DNS_SERVERS`）
-    /// - `["local"]` → 走本地 app DNS（`DnsService`），不走隧道
+    /// - `["local"]` → 已废弃：警告后回落默认隧道 DNS（Go 侧删除，Rust 保翻不硬错）
     /// - 其余 → 逐项 IP 字面量，作为隧道内 DNS 查询目标
     pub dns: Vec<String>,
 }
@@ -180,7 +108,6 @@ impl DeviceConfig {
             mtu: p.mtu,
             num_workers: p.num_workers,
             reserved: p.reserved,
-            domain_strategy: DomainStrategy::from_proto_value(p.domain_strategy),
             is_client: p.is_client,
             no_kernel_tun: p.no_kernel_tun,
             dns: p.dns,
@@ -207,23 +134,29 @@ impl DeviceConfig {
             mtu: self.mtu,
             num_workers: self.num_workers,
             reserved: self.reserved.clone(),
-            domain_strategy: self.domain_strategy.to_proto_value(),
             is_client: self.is_client,
             no_kernel_tun: self.no_kernel_tun,
             dns: self.dns.clone(),
         }
     }
 
-    /// 解析 `dns` 字段语义（Go client.go:112-123，c7e569b0）。
+    /// 解析 `dns` 字段语义（Go efc9e6da 删除 "local" 模式后）。
     ///
     /// - 空 → [`DnsConfig::Default`]（Cloudflare 四址）
-    /// - `["local"]` → [`DnsConfig::Local`]（本地 app DNS）
+    /// - `["local"]` → 已废弃（Go 删除后 `netip.MustParseAddr` 直接 panic；Rust 保翻
+    ///   先例不硬错）：警告后回落 [`DnsConfig::Default`] 隧道 DNS
     /// - 其余 → [`DnsConfig::Servers`]（非法 IP 字面量报错；Go 侧 `netip.MustParseAddr` 直接
     ///   panic，Rust 侧返回错误更合理）
     pub fn resolve_dns(&self) -> Result<DnsConfig> {
         match self.dns.as_slice() {
             [] => Ok(DnsConfig::Default),
-            [s] if s == "local" => Ok(DnsConfig::Local),
+            [s] if s == "local" => {
+                tracing::warn!(
+                    "wireguard outbound: remoteDNS \"local\" is deprecated (removed upstream, \
+                     efc9e6da); falling back to default tunnel DNS"
+                );
+                Ok(DnsConfig::Default)
+            },
             entries => {
                 let mut servers = Vec::with_capacity(entries.len());
                 for e in entries {
@@ -238,13 +171,11 @@ impl DeviceConfig {
     }
 }
 
-/// `remoteDNS` 解析结果（Go client.go `local` 标志 + `dnses` 列表的 Rust 形态）。
+/// `remoteDNS` 解析结果（Go client.go `dnses` 列表的 Rust 形态；efc9e6da 后无 "local" 模式）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsConfig {
     /// 未配置 → Cloudflare 默认四址。
     Default,
-    /// `["local"]` → 目标域名走本地 app DnsService（不经隧道）。
-    Local,
     /// 显式服务器列表（隧道内查询目标）。
     Servers(Vec<std::net::IpAddr>),
 }
@@ -252,69 +183,6 @@ pub enum DnsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ===== DomainStrategy =====
-
-    #[test]
-    fn domain_strategy_from_proto_value_roundtrip() {
-        let cases = [
-            (0, DomainStrategy::ForceIp),
-            (1, DomainStrategy::ForceIp4),
-            (2, DomainStrategy::ForceIp6),
-            (3, DomainStrategy::ForceIp46),
-            (4, DomainStrategy::ForceIp64),
-        ];
-        for (v, expected) in cases {
-            assert_eq!(DomainStrategy::from_proto_value(v), expected);
-            assert_eq!(expected.to_proto_value(), v);
-        }
-    }
-
-    #[test]
-    fn domain_strategy_invalid_value_defaults_to_force_ip() {
-        assert_eq!(DomainStrategy::from_proto_value(99), DomainStrategy::ForceIp);
-        assert_eq!(DomainStrategy::from_proto_value(-1), DomainStrategy::ForceIp);
-    }
-
-    #[test]
-    fn domain_strategy_prefer_ip4_logic() {
-        assert!(DomainStrategy::ForceIp.prefer_ip4());
-        assert!(DomainStrategy::ForceIp4.prefer_ip4());
-        assert!(DomainStrategy::ForceIp46.prefer_ip4());
-        assert!(!DomainStrategy::ForceIp6.prefer_ip4());
-        assert!(!DomainStrategy::ForceIp64.prefer_ip4());
-    }
-
-    #[test]
-    fn domain_strategy_prefer_ip6_logic() {
-        assert!(DomainStrategy::ForceIp.prefer_ip6());
-        assert!(DomainStrategy::ForceIp6.prefer_ip6());
-        assert!(DomainStrategy::ForceIp64.prefer_ip6());
-        assert!(!DomainStrategy::ForceIp4.prefer_ip6());
-        assert!(!DomainStrategy::ForceIp46.prefer_ip6());
-    }
-
-    #[test]
-    fn domain_strategy_has_fallback_only_dual_stack() {
-        assert!(DomainStrategy::ForceIp46.has_fallback());
-        assert!(DomainStrategy::ForceIp64.has_fallback());
-        assert!(!DomainStrategy::ForceIp.has_fallback());
-        assert!(!DomainStrategy::ForceIp4.has_fallback());
-        assert!(!DomainStrategy::ForceIp6.has_fallback());
-    }
-
-    #[test]
-    fn domain_strategy_fallback_direction() {
-        // ForceIp64: 主 v6，fallback v4
-        assert!(DomainStrategy::ForceIp64.fallback_ip4());
-        assert!(!DomainStrategy::ForceIp64.fallback_ip6());
-        // ForceIp46: 主 v4，fallback v6
-        assert!(DomainStrategy::ForceIp46.fallback_ip6());
-        assert!(!DomainStrategy::ForceIp46.fallback_ip4());
-        // 非双栈策略不触发 fallback
-        assert!(!DomainStrategy::ForceIp.fallback_ip4());
-        assert!(!DomainStrategy::ForceIp.fallback_ip6());
-    }
 
     // ===== DeviceConfig =====
 
@@ -348,7 +216,6 @@ mod tests {
             mtu: 1280,
             num_workers: 4,
             reserved: vec![0, 0, 0],
-            domain_strategy: DomainStrategy::ForceIp46,
             is_client: true,
             no_kernel_tun: false,
             dns: vec!["1.1.1.1".into(), "8.8.8.8".into()],
@@ -360,12 +227,13 @@ mod tests {
 
     #[test]
     fn resolve_dns_semantics() {
-        // Go client.go:112-123：空 → 默认；["local"] → 本地 app DNS；其余按 IP 解析。
+        // Go efc9e6da：空 → 默认；["local"] 已废弃（警告+回落默认隧道 DNS，不硬错）；
+        // 其余按 IP 解析。
         let mut cfg = DeviceConfig::default();
         assert_eq!(cfg.resolve_dns().unwrap(), DnsConfig::Default);
 
         cfg.dns = vec!["local".into()];
-        assert_eq!(cfg.resolve_dns().unwrap(), DnsConfig::Local);
+        assert_eq!(cfg.resolve_dns().unwrap(), DnsConfig::Default);
 
         cfg.dns = vec!["1.1.1.1".into(), "2606:4700:4700::1111".into()];
         assert_eq!(
@@ -394,7 +262,6 @@ mod tests {
         let cfg = DeviceConfig::default();
         assert!(!cfg.is_client);
         assert!(!cfg.no_kernel_tun);
-        assert_eq!(cfg.domain_strategy, DomainStrategy::ForceIp);
         assert_eq!(cfg.mtu, 0);
         assert!(cfg.endpoint.is_empty());
         assert!(cfg.peers.is_empty());

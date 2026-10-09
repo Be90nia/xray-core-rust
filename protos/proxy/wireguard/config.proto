@@ -15,22 +15,15 @@ message PeerConfig {
 }
 
 message DeviceConfig {
-  enum DomainStrategy {
-    FORCE_IP = 0;
-    FORCE_IP4 = 1;
-    FORCE_IP6 = 2;
-    FORCE_IP46 = 3;
-    FORCE_IP64 = 4;
-  }
   string secret_key = 1;
   repeated string endpoint = 2;
   repeated PeerConfig peers = 3;
   int32 mtu = 4;
   int32 num_workers = 5;
   bytes reserved = 6;
-  DomainStrategy domain_strategy = 7;
+  // 7 曾为 domain_strategy（Go efc9e6da 删除：目标域名统一走隧道 DNS + IP 字面量先行）。
   bool is_client = 8;
   bool no_kernel_tun = 9;
-  // Go c7e569b0: remoteDNS（隧道内 DNS 服务器；["local"]=走本地 app DNS）。
+  // Go c7e569b0: remoteDNS（隧道内 DNS 服务器；["local"] 已废弃，回落默认隧道 DNS）。
   repeated string DNS = 10;
 }

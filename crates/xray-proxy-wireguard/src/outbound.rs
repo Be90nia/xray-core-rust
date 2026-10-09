@@ -164,9 +164,8 @@ impl WireguardOutboundHandler {
 
 /// 解析 peer endpoint（`host:port`）。
 ///
-/// IP 直连；域名经 `dns` + WireGuard `domainStrategy` 解析（Go `client.go:298-329`
-/// 的 createIPCRequest endpoint 分支 / `resolveLocal`，dice.Roll 随机选 IP），
-/// 结果进 TTL 缓存（Go `Handler.cache`，c7e569b0；缓存键 = endpoint host）。
+/// IP 直连；域名经 `dns` 解析（Go efc9e6da 后 `resolveLocal`：双栈 LookupIP，无 WG
+/// `domainStrategy`），dice.Roll 随机选 IP，结果进 TTL 缓存（Go `Handler.cache`）。
 async fn resolve_endpoint_addr(
     endpoint: &str,
     config: &DeviceConfig,
@@ -194,10 +193,9 @@ async fn resolve_endpoint_addr(
         }
     }
     let (has_v4, has_v6) = crate::dispatcher::endpoint_families(config);
-    let ip =
-        crate::dispatcher::resolve_dest_domain(host, config.domain_strategy, has_v4, has_v6, dns)
-            .await
-            .map_err(|e| WgError::InvalidEndpoint(format!("peer endpoint DNS resolve: {e}")))?;
+    let ip = crate::dispatcher::resolve_dest_domain(host, has_v4, has_v6, dns)
+        .await
+        .map_err(|e| WgError::InvalidEndpoint(format!("peer endpoint DNS resolve: {e}")))?;
     // 本地 app DNS 不暴露记录 TTL → 缺省 300（Go netstack 默认，c7e569b0）。
     if let Some(cache) = dns_cache {
         cache.put(host, vec![ip], crate::dispatcher::DEFAULT_DNS_TTL_SECS);
