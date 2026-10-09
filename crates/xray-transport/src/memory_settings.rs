@@ -232,8 +232,15 @@ fn parse_udp_hop(v: Option<&serde_json::Value>) -> io::Result<UdpHopConfig> {
         None | Some(serde_json::Value::Null) => Vec::new(),
         Some(v) => parse_port_list(v)?,
     };
-    // interval: {from, to} → (i64, i64)
-    let (interval_min, interval_max) = parse_int32_range(obj.get("interval")).unwrap_or((0, 0));
+    // interval: {from, to} → (i64, i64)。Go UDPHop.Build（7780db9b）：
+    // 双零 → 默认 (30, 30)；From < 5 → 硬错（Go errors.New("interval must be at least 5")）。
+    let (mut interval_min, mut interval_max) = parse_int32_range(obj.get("interval"))?;
+    if interval_min == 0 && interval_max == 0 {
+        interval_min = 30;
+        interval_max = 30;
+    } else if interval_min < 5 {
+        return Err(invalid("interval must be at least 5"));
+    }
     Ok(UdpHopConfig { ports, interval_min, interval_max })
 }
 fn parse_port_list(v: &serde_json::Value) -> io::Result<Vec<u32>> {
@@ -496,8 +503,36 @@ mod tests {
         .unwrap();
         let q = m.quic_params.unwrap();
         assert_eq!(q.udp_hop.ports, vec![443]);
-        assert_eq!(q.udp_hop.interval_min, 0);
-        assert_eq!(q.udp_hop.interval_max, 0);
+        // Go UDPHop.Build（7780db9b）：双零 interval → 默认 (30, 30)。
+        assert_eq!(q.udp_hop.interval_min, 30);
+        assert_eq!(q.udp_hop.interval_max, 30);
+    }
+
+    #[test]
+    fn quic_params_udp_hop_interval_below_5_rejected() {
+        // Go UDPHop.Build（7780db9b）：From < 5 → "interval must be at least 5"。
+        // 显式 interval=3。
+        let m = to_memory_stream_config(Some(&json!({
+            "finalmask": {"quicParams": {"udpHop": {"interval": 3}}}
+        })));
+        let err = m.expect_err("interval 3 must be rejected").to_string();
+        assert!(err.contains("interval must be at least 5"), "got: {err}");
+        // From=0 且 To=10：非双零不触发默认 → From=0 < 5 硬错（Go 同语义）。
+        let m = to_memory_stream_config(Some(&json!({
+            "finalmask": {"quicParams": {"udpHop": {"interval": {"from": 0, "to": 10}}}}
+        })));
+        let err = m.expect_err("interval from=0 must be rejected").to_string();
+        assert!(err.contains("interval must be at least 5"), "got: {err}");
+    }
+
+    #[test]
+    fn quic_params_udp_hop_malformed_interval_is_hard_error() {
+        // 非 interval 合法形态 → parse_int32_range 错误传播（Go Int32Range unmarshal 失败即错，
+        // 不静默回落默认池）。
+        let m = to_memory_stream_config(Some(&json!({
+            "finalmask": {"quicParams": {"udpHop": {"interval": "soon"}}}
+        })));
+        assert!(m.is_err(), "malformed interval must propagate, not silently default");
     }
 
     // ===== DownloadSettings 解析（bd 44s 第 4 块）=====

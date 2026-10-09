@@ -12,7 +12,7 @@
 //! 1. 扫描 `dns.servers[]` —— 含 `fakedns` 地址时视为启用 FakeDNS；
 //! 2. 按 `dns.queryStrategy` 推断 IPv4/IPv6 开关；
 //! 3. 若启用 FakeDNS 且 `cfg.fake_dns` 缺失，则根据 IPv4/6 开关填充默认 IP 池 （IPv4 =
-//!    `198.18.0.0/15`，IPv6 = `fc00::/18`，LRU 默认 `32768`，仅 IPv4 或 IPv6 时 LRU = `65535`）；
+//!    `198.18.0.0/15`，IPv6 = `2001:2::/48`，LRU 默认 `32768`，仅 IPv4 或 IPv6 时 LRU = `65535`）；
 //! 4. 若启用 FakeDNS 但没有任何 inbound 启用 `destOverride: ["fakedns"|"fakedns+others"]`， 通过
 //!    `tracing::warn!` 记录警告（Go 等价物是 `errors.LogWarning(...)`）。
 //!
@@ -82,7 +82,7 @@ impl LintStage for FakeDnsStage {
             };
 
         // 3. FakeDNS 已配置 → 不覆盖；未配置 → 按 IPv4/6 开关填默认池。
-        // Go fakedns.go:94-118：双开 = pools[198.18.0.0/15 + fc00::/18] 各
+        // Go fakedns.go:94-118：双开 = pools[198.18.0.0/15 + 2001:2::/48] 各
         // 32768（两池）；单开 = 单池 65535。
         if cfg.fake_dns.is_none() {
             use crate::app_config::{FakeDnsConfig, FakeDnsPoolElement};
@@ -90,8 +90,10 @@ impl LintStage for FakeDnsStage {
                 ip_pool: Some("198.18.0.0/15".into()),
                 pool_size: Some(32768),
             };
-            let v6 =
-                || FakeDnsPoolElement { ip_pool: Some("fc00::/18".into()), pool_size: Some(32768) };
+            let v6 = || FakeDnsPoolElement {
+                ip_pool: Some("2001:2::/48".into()),
+                pool_size: Some(32768),
+            };
             let single = |pool: &str| FakeDnsConfig {
                 ip_pool: Some(pool.into()),
                 pool_size: Some(65535),
@@ -101,7 +103,7 @@ impl LintStage for FakeDnsStage {
                 (true, true) => {
                     FakeDnsConfig { ip_pool: None, pool_size: None, pools: Some(vec![v4(), v6()]) }
                 },
-                (false, true) => single("fc00::/18"),
+                (false, true) => single("2001:2::/48"),
                 (true, false) => single("198.18.0.0/15"),
                 (false, false) => FakeDnsConfig::default(),
             });
@@ -404,7 +406,7 @@ mod tests {
         assert_eq!(pools.len(), 2);
         assert_eq!(pools[0].ip_pool.as_deref(), Some("198.18.0.0/15"));
         assert_eq!(pools[0].pool_size, Some(32768));
-        assert_eq!(pools[1].ip_pool.as_deref(), Some("fc00::/18"));
+        assert_eq!(pools[1].ip_pool.as_deref(), Some("2001:2::/48"));
         assert_eq!(pools[1].pool_size, Some(32768));
         assert!(fd.ip_pool.is_none(), "dual-stack uses pools[], not single pool");
     }
@@ -428,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn post_process_ipv6_only_uses_fc00() {
+    fn post_process_ipv6_only_uses_default_v6_pool() {
         let _g = TEST_LOCK.lock();
         clear_stages();
         register_builtin_stages();
@@ -441,7 +443,7 @@ mod tests {
         };
         post_process(&mut cfg).unwrap();
         let fd = cfg.fake_dns.unwrap();
-        assert_eq!(fd.ip_pool.as_deref(), Some("fc00::/18"));
+        assert_eq!(fd.ip_pool.as_deref(), Some("2001:2::/48"));
         assert_eq!(fd.pool_size, Some(65535));
     }
 
