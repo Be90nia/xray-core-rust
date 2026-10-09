@@ -10,7 +10,6 @@
 //! - `listener::Listener` trait + `TcpListenerConn` 参考实现
 //! - `dialer::Dialer` trait（仅声明，无实现）
 //! - `stat::CounterConnection` 字节计数包装器
-//!
 
 //! ## 未实现（留 stub）
 //! `sockopt` / `tcp` / `udp` / `headers` / `finalmask` / `pipe` / `config` /

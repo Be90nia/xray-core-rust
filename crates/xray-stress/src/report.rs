@@ -121,9 +121,15 @@ pub struct LeakVerdict {
 }
 
 /// RSS 泄漏判定：基线 = 前 10% 样本均值，斜率百分比 > `threshold_pct_per_h` → SUSPECT。
+///
+/// 斜率只对尾半段（`samples[n/2..]`，RSS 稳态后）拟合：启动爬坡段会污染全段拟合产生
+/// 假阳（bd 2f8o：macOS 6h 跑前 20% 爬坡 → 全段 5.00/6.27 %/h 假阳，尾段实际平台化）。
+/// 样本不足以劈半（n≤2，尾段不足 2 个）时退回全段。
 pub fn judge_leak(samples: &[(f64, f64)], threshold_pct_per_h: f64) -> Option<LeakVerdict> {
-    let slope_mb_per_h = rss_slope_mb_per_h(samples)?;
     let n = samples.len();
+    let tail = &samples[n / 2..];
+    let fit: &[(f64, f64)] = if tail.len() >= 2 { tail } else { samples };
+    let slope_mb_per_h = rss_slope_mb_per_h(fit)?;
     let baseline_n = (n / 10).max(1);
     let baseline_mb: f64 =
         samples[..baseline_n].iter().map(|s| s.1).sum::<f64>() / baseline_n as f64;
@@ -176,7 +182,7 @@ pub fn render_summary(
     match leak {
         Some(v) => {
             md.push_str(&format!(
-                "- baseline (first 10%): {:.1} MB\n- first / last / peak: {:.1} / {:.1} / {:.1} MB\n- linear slope: {:.2} MB/h ({:.2} %/h of baseline)\n- leak threshold: {:.1} %/h\n- verdict: **{}**\n\n",
+                "- baseline (first 10%): {:.1} MB\n- first / last / peak: {:.1} / {:.1} / {:.1} MB\n- tail-half slope (steady-state fit): {:.2} MB/h ({:.2} %/h of baseline)\n- leak threshold: {:.1} %/h\n- verdict: **{}**\n\n",
                 v.baseline_mb,
                 v.first_mb,
                 v.last_mb,
@@ -306,6 +312,20 @@ mod tests {
             (0..10).map(|i| (i as f64 * 3600.0, 100.0 + (i % 2) as f64)).collect();
         let v = judge_leak(&s, 5.0).unwrap();
         assert!(!v.suspect);
+    }
+
+    #[test]
+    fn leak_startup_ramp_then_plateau_is_ok() {
+        // bd 2f8o：前 20% 启动爬坡（100→880MB）后平台化；全段拟合会把它读成泄漏，
+        // 尾半段拟合必须判 OK（run 36237760680 macOS 形态回放）
+        let s: Vec<(f64, f64)> = (0..100)
+            .map(|i| {
+                let rss = if i < 20 { 100.0 + i as f64 * 40.0 } else { 900.0 + (i % 3) as f64 };
+                (i as f64 * 60.0, rss)
+            })
+            .collect();
+        let v = judge_leak(&s, 5.0).unwrap();
+        assert!(!v.suspect, "slope_pct={}", v.slope_pct_per_h);
     }
 
     #[test]

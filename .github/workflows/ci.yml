@@ -98,6 +98,10 @@ jobs:
       # btls-sys bindings 含注入符号（bd mygg/z32z），与 interop/mobile 同源
       # 配方；顺序须在 rust-cache 之后（action 尾部清理恢复的旧 btls-sys 产物）
       - uses: ./.github/actions/setup-boringssl
+      # bd 88m0：缺省 SO_RCVBUF 4MB 测试断言需要 rmem_max ≥ 8MB（stock 内核
+      # 212992 会静默钳制 setsockopt；生产主机同样需要此调优）
+      - name: Raise rmem_max for SO_RCVBUF tests
+        run: sudo sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608
       - run: cargo test --workspace
       - run: cargo test --workspace --release
 
