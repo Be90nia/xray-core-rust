@@ -10,6 +10,9 @@ env:
   # 用户下载，必须通用 target 生成（老机器 SIGILL 防线）；RUSTFLAGS env 完全
   # 覆盖 build.rustflags（cargo 语义）。
   RUSTFLAGS: ""
+  # aws-lc-sys 预编译产物含 glibc 2.38+ 符号（__isoc23_*），VPS Debian 12 (2.36)
+  # 跑不动；强制源码编译让本地 gcc 出普通 sscanf 引用（生产换核 a2aae6cf 战役）
+  AWS_LC_SYS_PREGENERATING: "false"
 
 jobs:
   build:
