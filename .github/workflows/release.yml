@@ -47,7 +47,13 @@ jobs:
         shell: pwsh
         run: |
           if ($env:RUNNER_OS -eq "Linux") {
-            sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
+            # ubuntu-22.04 默认 protobuf-compiler 3.12 不支持 proto3 optional
+            # 装新 protoc 25.1 到 /usr/local/bin（apt 旧版被 PATH 覆盖）
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq unzip wget
+            sudo wget -q https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-linux-x86_64.zip -O /tmp/protoc.zip
+            sudo unzip -q -o /tmp/protoc.zip -d /usr/local
+            sudo rm /tmp/protoc.zip
           } elseif ($env:RUNNER_OS -eq "macOS") {
             brew install protobuf
           } else {
