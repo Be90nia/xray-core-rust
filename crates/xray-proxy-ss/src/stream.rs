@@ -255,19 +255,23 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
                     .map_err(|_| SsError::InsufficientData(first_len))?
                     .to_be_bytes(),
             );
-            self.inner.write_all(&salt).await?;
+            // 新版 Go 客户端(v26.9.30 ReadTCPResponse)单次 Read 要求
+            // salt+加密头(+首段) ≥91B 原子到达——必须单次 write_all 单帧写出。
             increment_nonce_bytes(&mut self.write_nonce);
             let sealed_fixed = self
                 .write_aead
                 .seal(&self.write_nonce, &[], &fixed)
                 .map_err(|e| SsError::AeadSeal(e.to_string()))?;
-            self.inner.write_all(&sealed_fixed).await?;
             increment_nonce_bytes(&mut self.write_nonce);
             let sealed_first = self
                 .write_aead
                 .seal(&self.write_nonce, &[], &plaintext[..first_len])
                 .map_err(|e| SsError::AeadSeal(e.to_string()))?;
-            self.inner.write_all(&sealed_first).await?;
+            let mut head = Vec::with_capacity(salt.len() + 64 + sealed_first.len());
+            head.extend_from_slice(&salt);
+            head.extend_from_slice(&sealed_fixed);
+            head.extend_from_slice(&sealed_first);
+            self.inner.write_all(&head).await?;
             rest = &plaintext[first_len..];
         }
         // 8192 = Go buf.Size；tag_size+2 是 size chunk 的 wire 开销。
