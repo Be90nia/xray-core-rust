@@ -279,16 +279,25 @@ fn parse_sni(edata: &[u8]) -> Option<String> {
 /// 是纯 X25519），hybrid MLKEM 段在 auth_key 派生中不参与；REALITY 10.0
 /// PQC 安全性来自 TLS session key 的 hybrid 派生，而非 auth_key 本身。
 ///
-/// 选择逻辑逐条对齐 Go xtls/reality tls.go:214-231（t2js 修正：此前 sb6g 误
-/// 加「MLKEM 必在 / 顺序颠倒 / 重复 entry 即拒」门禁——Go 源码没有这些拒绝
-/// 分支，Go std crypto/tls 与多数 uTLS 指纹只发独立 X25519，误拒即拒真客户端）：
-/// - 独立 X25519（group 0x001D, 32B）**首选**：任一位置首遇即选中（Go 第一轮 循环 `break`），其余
-///   entry 继续扫 MLKEM；
+/// 选择逻辑对照 Go xtls/reality@20260908 tls.go:214-238。**osn1 注释勘误**：
+/// 钉定基线**有** MLKEM768 必在门——`peerPub2 == nil → break`（tls.go:233-235，
+/// reject→forward），且 MLKEM768 须位于独立 X25519 之前（X25519 首遇即
+/// break，tls.go:224-231，其后 entry 不再消费）。t2js 曾以「Go 源码没有这些
+/// 拒绝分支」为由移除 sb6g 的对齐门禁——该论断与钉定模块不符，sb6g 行为
+/// 恰为 Go 一致（除 X25519 重复 entry 边角）。
+///
+/// **Rust 现状 = 有意放宽**（t2js，interop 动机：旧 Go crypto/tls 客户端只发
+/// 首个偏好 curve 的 keyshare）：
+/// - 独立 X25519（group 0x001D, 32B）**首选**：任一位置首遇即选中，
 /// - X25519MLKEM768（group **0x11EC** = 十进制 4588；历史实现误写 0x4588 ——把十进制当十六进制）取
-///   data 末段 32B **兜底**（Go `peerPub == nil` 才进第二轮），首遇即停；
-/// - 顺序颠倒 / 重复 entry 均无害（两轮各自 first-match-wins）；
-/// - 两类都缺 → `(None, false)`，Go `peerPub != nil` 不成立 → 不做 REALITY 验证，连接 forward
-///   fallback。
+///   data 末段 32B **兜底**，首遇即停；
+/// - 顺序颠倒 / 重复 entry 均无害；
+/// - 两类都缺 → `(None, false)` → NoKeyShareX25519 → forward fallback。
+///
+/// 后果（osn1 记录）：X25519-only 的 ClientHello Go 基线会 reject→forward，
+/// Rust 会做 REALITY 认证（方向 accept-more，非安全洞，interop 双向绿建立
+/// 其上）。是否回贴 Go 门禁属行为变更（涉 interop 已验证路径），留 PM 决策；
+/// 本注释先行如实记录分歧，防按失实前提重挖。
 fn parse_key_shares(edata: &[u8]) -> (Option<[u8; 32]>, bool) {
     if edata.len() < 2 {
         return (None, false);
