@@ -36,7 +36,7 @@ use crate::{
 #[serde(default)]
 pub struct DnsAppConfig {
     /// Nameserver 列表（每个含 address/port/skipFallback 等）。条目兼容对象
-    /// 与裸字符串两种形式（见 [`deserialize_servers`]）。
+    /// 与裸字符串两种形式（见 `deserialize_servers`）。
     #[serde(deserialize_with = "deserialize_servers")]
     pub servers: Vec<NameServerJson>,
     /// 静态 hosts：key 可带类型前缀（`domain:` / `full:`），value 为 IP 字符串或数组。
