@@ -35,7 +35,7 @@ jobs:
       - name: Install zig (cargo-zigbuild 依赖本体;mlugg 镜像服务 404/503 实锤→ziglang.org 官方源 pinned 0.13.0)
         run: |
           wget -q https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz
-          tar xzf zig-linux-x86_64-0.13.0.tar.xz -C /opt
+          tar xJf zig-linux-x86_64-0.13.0.tar.xz -C /opt
           echo "/opt/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
           zig version
       - name: Install protoc 25.1
