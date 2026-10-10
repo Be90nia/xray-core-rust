@@ -315,17 +315,23 @@ impl SsOutboundConfig {
     }
 }
 
-/// 解析 SS outbound settings JSON → SsOutboundConfig。
+/// 解析 SS outbound settings JSON → `SsOutboundConfig`。
 ///
-/// JSON 格式：`{ "servers": [{ "address": "...", "port": 8388, "method": "aes-256-gcm", "password":
-/// "..." }] }`
+/// 支持两种形态（v2ray-core 历史遗留，v2rayN 客户端测速仍用裸字段）：
+/// - 数组形态：`{ "servers": [{ "address": "...", "port": 8388, "method": "aes-256-gcm", "password":
+///   "..." }] }`（Go infra/conf/shadowsocks.go 标准）
+/// - 裸字段形态：`{ "address": "...", "port": 8388, "method": "...", "password": "..." }`
+///   （v2rayN / 旧 v2ray-core，2022 节点亦用此形）
 pub fn parse_ss_config(data: &[u8]) -> Result<SsOutboundConfig, String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
-    let servers = v
-        .get("servers")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| "missing servers array".to_string())?;
-    let first = servers.first().ok_or_else(|| "servers array is empty".to_string())?;
+    // 形 1: servers 数组; 形 2: settings 裸字段(顶层含 address)。两种都映射到 `first`。
+    let first: &serde_json::Value = match v.get("servers") {
+        Some(serde_json::Value::Array(arr)) => {
+            arr.first().ok_or_else(|| "servers array is empty".to_string())?
+        }
+        None if v.get("address").is_some() => &v,
+        _ => return Err("missing servers array".to_string()),
+    };
     let address = first
         .get("address")
         .and_then(|v| v.as_str())
@@ -1051,5 +1057,47 @@ mod tests {
         assert_eq!(&got[..], payload);
         assert_eq!(source.address(), dest.address());
         assert_eq!(source.port(), dest.port());
+    }
+
+    /// 数组形态（Go infra/conf 标准）→ 解析成功。
+    #[test]
+    fn parse_ss_config_servers_array_form() {
+        let data = br#"{"servers":[{"address":"a.com","port":8388,"method":"aes-256-gcm","password":"pw"}]}"#;
+        let cfg = parse_ss_config(data).expect("servers-array form");
+        assert_eq!(cfg.server_port, 8388);
+    }
+
+    /// 裸字段形态（v2rayN / 旧 v2ray-core 测速 config）→ 也应解析成功。
+    #[test]
+    fn parse_ss_config_bare_fields_form() {
+        let data = br#"{"address":"a.com","port":8388,"method":"aes-256-gcm","password":"pw"}"#;
+        let cfg = parse_ss_config(data).expect("bare-fields form");
+        assert_eq!(cfg.server_port, 8388);
+    }
+
+    /// 用户 v2rayN 测速 SS-2022 节点形态（v2rayN 写真实配置）→ 解析成功 + ss2022 参数绑定。
+    #[test]
+    fn parse_ss_config_v2rayn_2022_bare_form() {
+        let data = br#"{
+            "address": "home.begonia92.top",
+            "port": 443,
+            "level": 1,
+            "method": "2022-blake3-aes-256-gcm",
+            "ota": false,
+            "password": "kuCcn1ZLDQcesaQRAYNQexYQjbESH19odLuB4UbuCmU="
+        }"#;
+        let cfg = parse_ss_config(data).expect("v2rayN 2022 bare form");
+        assert_eq!(cfg.server_port, 443);
+        assert_eq!(cfg.level, 1);
+        let s2022 = cfg.ss2022.as_ref().expect("ss2022 bound");
+        assert_eq!(s2022.method, "2022-blake3-aes-256-gcm");
+        assert_eq!(s2022.psk_list_b64.len(), 1);
+    }
+
+    /// 全空 settings 仍应硬错（保护性回归测试）。
+    #[test]
+    fn parse_ss_config_empty_settings_still_errors() {
+        let data = b"{}";
+        assert!(parse_ss_config(data).is_err());
     }
 }
