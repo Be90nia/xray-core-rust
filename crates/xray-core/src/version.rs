@@ -9,9 +9,9 @@
 pub const VERSION_X: u8 = 26;
 
 /// 次版本号。对应 Go `Version_y`。
-pub const VERSION_Y: u8 = 7;
+pub const VERSION_Y: u8 = 10;
 
-pub const VERSION_Z: u8 = 28;
+pub const VERSION_Z: u8 = 10;
 
 /// 内部代号。对应 Go `codename`。
 pub const CODENAME: &str = "Xray, Penetrates Everything.";

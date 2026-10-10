@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [26.10.10] - 2026-10-10
+
 ### Added
 
 - naive 入站实现（88vp 收口）：rustls+hyper h2 CONNECT 隧道（404 fallback/407 恒定时间认证/padding 协商），extra 套件加回 naive；顺带根因修复 outbound PaddingWriter Pending 重入重复发送真 bug
@@ -31,6 +33,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- SS2022 响应头单帧原子写（bd 8174，面板双节点无流量实锤）：多锁临界区间拆两次写被响应体/keepalive 帧插隔，读端孤立 header 误判 `invalid salt length` 全断——对齐 Go v26.9.30 `ReadTCPResponse` 单次 Read 契约，header+首块 body 单帧落盘（txhn mux 同族第三例）
+- WG 握手探测假死（bd dxim）：e2e 探测客户端单发 init 无重传，CI 满载时序 skew 吞首包即挂死（服务端路径 CI 双绿+独立容器单发 PASS 无罪对照）——客户端补 `update_timers` 100ms 泵（REKEY_TIMEOUT 5s 重传）+ 拆 ignore
 - mux carrier 高丢包链路 ~2s 静默死亡（bd txhn）：共享写端帧写入非原子——`MuxWriter` 帧头经 `BufferedWriter` 内部缓冲 flush、载荷直写，两个共享锁临界区间可被并发会话完整帧插隔，读端把孤立载荷当帧头解析出 `meta_len too large` 后整条 carrier 连带全部子会话静默断流（VPS loss 0.5%+RTT150ms 下 9/9 复现、8 流冻结无重建）。修为整帧单次落盘（`write_multi_buffer_direct`，对齐 Go writer.go:71-87 单 `WriteMultiBuffer` 形态）+ carrier 终止 error 级日志 + `MuxBridge` dispatch 对齐 Go 16 次重试环（死亡竞窗不再丢 link）
 - mux carrier 死亡级联下半程缺失（bd txhn 残留）：`Session::close` 对 app 下行 output 只 flush 不关——pipe 裸 drop 不关闭语义下 dispatcher 下行 bridge 永久悬挂（carrier 死后 8 流 87s 零字节冻结形态；服务端 End 正常收包路径同悬挂）。补 `BufferedWriter::shutdown` 转发内层 + close 时调用（对齐 Go session.go `common.Close(s.output)`；XUDP 分支维持 Go 同款不关）
 - VLESS Vision 高 RTT 链路吞吐塌缩（bd 88m0）：TCP 缺省 SO_RCVBUF 4MB 根治下载收侧内核 DRS 自稳定钉窗（862340ff 同族孪生）——接收窗出生掷签钉 ~64KB 致吞吐=窗/RTT（433KB/s 锁步、~25% 连接命中），VPS netem 20 轮 25% 异常→20/20 全净且整体提速；显式 `receiveBufferSize` 优先（`3e755458`）
