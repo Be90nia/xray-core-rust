@@ -35,7 +35,9 @@ use crate::{
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct DnsAppConfig {
-    /// Nameserver 列表（每个含 address/port/skipFallback 等）。
+    /// Nameserver 列表（每个含 address/port/skipFallback 等）。条目兼容对象
+    /// 与裸字符串两种形式（见 [`deserialize_servers`]）。
+    #[serde(deserialize_with = "deserialize_servers")]
     pub servers: Vec<NameServerJson>,
     /// 静态 hosts：key 可带类型前缀（`domain:` / `full:`），value 为 IP 字符串或数组。
     pub hosts: serde_json::Map<String, serde_json::Value>,
@@ -128,6 +130,32 @@ pub struct NameServerJson {
     /// 负缓存 TTL（秒）；None/0 = 禁用。Rust 内部 cache 字段，Go 端无对应 JSON 字段。
     #[serde(rename = "negativeTtlSecs")]
     pub negative_ttl_secs: Option<u32>,
+}
+
+/// 单个 server 条目的双形式反序列化：裸字符串等价 `{address: <str>, ..其余字段默认}`，
+/// 其余值走原对象 derive 路径。对齐 Go `infra/conf.NameServerConfig.UnmarshalJSON`
+/// （infra/conf/dns.go:37-41：先试字符串 Address，成功即返回，失败再试结构体）；
+/// v2rayN 等客户端会在 `servers` 数组内混用两种形式。经 [`DnsAppConfig::servers`]
+/// 接线（唯一生产解析入口）；不在类型上自定义 `Deserialize`——对象路径若再走
+/// `serde_json::from_value::<NameServerJson>` 会递归回自定义 impl，且镜像结构体
+/// 会引入字段漂移风险。
+fn name_server_from_json(value: serde_json::Value) -> Result<NameServerJson, serde_json::Error> {
+    match value {
+        serde_json::Value::String(address) => Ok(NameServerJson { address, ..Default::default() }),
+        other => serde_json::from_value(other),
+    }
+}
+
+/// [`DnsAppConfig::servers`] 的逐条目双形式兼容（`deserialize_with` 接线）。
+fn deserialize_servers<'de, D>(deserializer: D) -> Result<Vec<NameServerJson>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<serde_json::Value>::deserialize(deserializer)?
+        .into_iter()
+        .map(name_server_from_json)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(serde::de::Error::custom)
 }
 
 impl DnsAppConfig {
@@ -1031,5 +1059,56 @@ mod tests {
         // 未知值 → UseIp 默认
         assert_eq!(parse_query_strategy(Some("uselookup")), QueryStrategy::UseIp);
         assert_eq!(parse_query_strategy(None), QueryStrategy::UseIp);
+    }
+
+    /// dnsfix P1：裸字符串 server 条目（对齐 Go infra/conf/dns.go:37-41；
+    /// v2rayN 生成的配置在 `servers` 数组混用对象与字符串形式，此前启动即失败）。
+    /// 字符串形式等价 `{address: <str>, ..其余字段默认}`。
+    #[test]
+    fn servers_accept_bare_string_entries() {
+        let cfg: DnsAppConfig =
+            serde_json::from_str(r#"{"servers": ["https://cloudflare-dns.com/dns-query"]}"#)
+                .unwrap();
+        let ns = &cfg.servers[0];
+        assert_eq!(ns.address, "https://cloudflare-dns.com/dns-query");
+        // 其余字段全默认。
+        assert_eq!(ns.port, None);
+        assert_eq!(ns.client_ip, None);
+        assert!(!ns.skip_fallback);
+        assert_eq!(ns.timeout, None);
+        assert_eq!(ns.query_strategy, None);
+        assert_eq!(ns.domains, None);
+        assert_eq!(ns.expected_ips, None);
+        assert_eq!(ns.expect_ips, None);
+        assert_eq!(ns.tag, None);
+
+        let cfg: DnsAppConfig = serde_json::from_str(r#"{"servers": ["localhost"]}"#).unwrap();
+        assert_eq!(cfg.servers[0].address, "localhost");
+    }
+
+    /// dnsfix P1：对象与字符串混排（用户真实配置缩样）反序列化成功且对象条目
+    /// 语义不变；字符串条目与对象条目同样能 build 出 client。
+    #[test]
+    fn servers_accept_mixed_object_and_string_entries() {
+        let cfg: DnsAppConfig = serde_json::from_str(
+            r#"{
+            "servers": [
+                {"address": "119.29.29.29", "domains": ["domain:example.com"], "skipFallback": true},
+                "https://cloudflare-dns.com/dns-query",
+                {"address": "8.8.8.8"}
+            ]
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.servers.len(), 3);
+        assert_eq!(cfg.servers[0].address, "119.29.29.29");
+        assert!(cfg.servers[0].skip_fallback);
+        assert_eq!(cfg.servers[0].domains, Some(vec!["domain:example.com".to_string()]));
+        assert_eq!(cfg.servers[1].address, "https://cloudflare-dns.com/dns-query");
+        assert!(!cfg.servers[1].skip_fallback);
+        assert_eq!(cfg.servers[2].address, "8.8.8.8");
+
+        let built = cfg.build().unwrap();
+        assert_eq!(built.clients.len(), 3, "string entry must build like object");
     }
 }
