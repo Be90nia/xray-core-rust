@@ -100,6 +100,11 @@ pub struct VisionConn<C> {
     /// poll_read 时的 16KB 栈帧占用（栈帧不被编译器复用）。Vec 容量在
     /// new/new_server 中按 16KB 预分配后稳态复用。
     read_tmp: Vec<u8>,
+    /// uplink padding 帧构建 scratch（clear+写入复用；帧经 mem::take 拥有
+    /// 所有权入 uplink_pending 队列，出队后把帧缓冲 swap 回本字段流转容量，
+    /// 稳态零每帧堆分配。容量 = vision::BUF_SIZE，单帧最大 21+2027+padding
+    /// ≤ 2048 覆盖）。
+    padding_scratch: Vec<u8>,
     /// 写侧 DIRECT 已判定、待「当前 write 完成」才激活 raw_fallback 的挂起标志。
     /// 对齐 Go f926ee4a（issue #4878）：激活提前于 in-flight 写时，第二个
     /// writer（splice 泵/half-close）会与安全层写并发触碰同一 TCP fd →
@@ -185,6 +190,7 @@ where
             raw_fallback: None,
             raw_tcp: None,
             read_tmp: Vec::with_capacity(16 * 1024),
+            padding_scratch: Vec::with_capacity(2048), // vision::BUF_SIZE
             splice_armed: false,
             end_commit: false,
             is_server: false,
@@ -227,6 +233,7 @@ where
             raw_fallback: None,
             raw_tcp: Some(raw_tcp),
             read_tmp: Vec::with_capacity(16 * 1024),
+            padding_scratch: Vec::with_capacity(2048), // vision::BUF_SIZE
             splice_armed: false,
             end_commit: false,
             is_server: true,
@@ -241,16 +248,27 @@ where
         use tokio::io::AsyncWriteExt;
 
         use crate::encryption::vision::{COMMAND_PADDING_CONTINUE, xtls_padding};
-        let padded = xtls_padding(
+        xtls_padding(
             None,
             COMMAND_PADDING_CONTINUE,
             &mut self.uplink_uuid_pending,
             true,
             &self.padding_seed,
             &mut self.rng,
+            &mut self.padding_scratch,
         );
-        self.inner.write_all(&padded).await?;
+        self.inner.write_all(&self.padding_scratch).await?;
         Ok(())
+    }
+}
+
+impl<C> VisionConn<C> {
+    /// 出队队首帧并把帧缓冲（`padded`）swap 回 padding_scratch：容量随帧
+    /// 流转，稳态构建零每帧分配；此刻 `frame.padded` 为空 Vec，drop 零释放。
+    fn pop_frame_recycle(&mut self) {
+        if let Some(mut frame) = self.uplink_pending.pop_front() {
+            std::mem::swap(&mut self.padding_scratch, &mut frame.padded);
+        }
     }
 }
 
@@ -332,10 +350,14 @@ where
                     if n == 0 {
                         return Poll::Ready(Ok(()));
                     }
-                    let content = xtls_unpadding(
+                    // unpadding 直写 downlink_pending（scratch 复用：消费完
+                    // clear 保留容量，跨帧零分配）。
+                    this.downlink_pending.clear();
+                    xtls_unpadding(
                         &this.read_tmp[..n],
                         &mut this.downlink_state,
                         &this.user_uuid,
+                        &mut this.downlink_pending,
                     );
                     let cmd = this.downlink_state.current_command;
                     // server 关闭下行 padding：END=只关 padding（继续读 TLS 层），
@@ -389,13 +411,12 @@ where
                             // 写侧激活竞态（本轮 macOS #08 实测定罪为写侧）。
                         }
                     }
-                    if !content.is_empty() {
+                    if !this.downlink_pending.is_empty() {
                         // downlink TLS 过滤：检测下行 TLS 1.3 → enable_xtls
                         // 对齐 Go VisionReader 的 xtls_filter_tls 调用
                         if this.downlink_traffic.number_of_packet_to_filter > 0 {
-                            xtls_filter_tls(&[&content], &mut this.downlink_traffic);
+                            xtls_filter_tls(&[&this.downlink_pending], &mut this.downlink_traffic);
                         }
-                        this.downlink_pending = content;
                         this.downlink_pending_pos = 0;
                     }
                     // content 空（纯 padding 块）或已存 pending → continue
@@ -463,12 +484,12 @@ where
                 let (orig_len, gate) = (frame.orig_len, frame.gate);
                 match gate {
                     UpGate::None => {
-                        this.uplink_pending.pop_front();
+                        this.pop_frame_recycle();
                         return Poll::Ready(Ok(orig_len));
                     },
                     UpGate::DirectArm => match this.poll_arm_gate(cx) {
                         Poll::Ready(Ok(())) => {
-                            this.uplink_pending.pop_front();
+                            this.pop_frame_recycle();
                             return Poll::Ready(Ok(orig_len));
                         },
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -478,7 +499,7 @@ where
                         Poll::Ready(Ok(())) => {
                             this.uplink_padding = false;
                             this.end_commit = false;
-                            this.uplink_pending.pop_front();
+                            this.pop_frame_recycle();
                             return Poll::Ready(Ok(orig_len));
                         },
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -559,15 +580,19 @@ where
                 let plen = end - off;
                 let mut piece = [0u8; MAX_PADDING_CONTENT];
                 copy_io_slice_span(bufs, off, end, &mut piece[..plen]);
-                let padded = xtls_padding(
+                xtls_padding(
                     Some(&piece[..plen]),
                     piece_cmd,
                     &mut this.uplink_uuid_pending,
                     long_padding,
                     &this.padding_seed,
                     &mut this.rng,
+                    &mut this.padding_scratch,
                 );
                 let orig = end - off;
+                // mem::take：帧缓冲拥有所有权入队；scratch 容量由出队回收流转
+                //（pop_frame_recycle），批内多帧时 Vec 自动扩容兜底。
+                let padded = std::mem::take(&mut this.padding_scratch);
                 this.uplink_pending.push_back(UpFrame {
                     padded,
                     sent: 0,
@@ -1039,13 +1064,15 @@ mod tests {
         );
         // client 发 DIRECT padding 帧（content=app record），经安全层
         let app = build_tls_app_data(b"hello-direct");
-        let padded = xtls_padding(
+        let mut padded = Vec::new();
+        xtls_padding(
             Some(&app),
             COMMAND_PADDING_DIRECT,
             &mut Some(uuid.clone()),
             false,
             &DEFAULT_PADDING_SEED,
             &mut StdRng::from_os_rng(),
+            &mut padded,
         );
         let mut client = CommonConn::new(
             c,
@@ -1399,8 +1426,13 @@ mod tests {
         // 截断/长度场损坏在此暴露）
         {
             let mut st = crate::encryption::vision::DirectionState::default();
-            let content =
-                crate::encryption::vision::xtls_unpadding(&server.inner.sealed, &mut st, &uuid);
+            let mut content = Vec::new();
+            crate::encryption::vision::xtls_unpadding(
+                &server.inner.sealed,
+                &mut st,
+                &uuid,
+                &mut content,
+            );
             assert_eq!(
                 content,
                 block1,
@@ -1448,10 +1480,12 @@ mod tests {
 
         // 线上帧链可被 Go 语义解帧验证：End 帧 content == block1
         let mut st = crate::encryption::vision::DirectionState::default();
-        let content = crate::encryption::vision::xtls_unpadding(
+        let mut content = Vec::new();
+        crate::encryption::vision::xtls_unpadding(
             &server.inner.wire[..sealed_len],
             &mut st,
             &uuid,
+            &mut content,
         );
         assert_eq!(content, block1);
         assert_eq!(st.current_command, COMMAND_PADDING_END as i32);
@@ -2297,13 +2331,15 @@ mod tests {
     async fn direct_switch_never_reads_inner_again() {
         let uuid = vec![0xABu8; 16];
         let app = build_tls_app_data(b"hello-direct");
-        let frame = xtls_padding(
+        let mut frame = Vec::new();
+        xtls_padding(
             Some(&app),
             COMMAND_PADDING_DIRECT,
             &mut Some(uuid.clone()),
             false,
             &DEFAULT_PADDING_SEED,
             &mut StdRng::from_os_rng(),
+            &mut frame,
         );
         let (_raw_peer, raw_own) = make_std_tcp_pair();
         let mut rx = VisionConn::new_server(

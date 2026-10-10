@@ -802,13 +802,15 @@ mod tests {
                 .unwrap();
             let mut uuid_opt = Some(server_uuid.clone());
             let mut rng = rand::rngs::StdRng::from_os_rng();
-            let block = xtls_padding(
+            let mut block = Vec::new();
+            xtls_padding(
                 Some(&content2),
                 COMMAND_PADDING_CONTINUE,
                 &mut uuid_opt,
                 false,
                 &crate::encryption::vision::DEFAULT_PADDING_SEED,
                 &mut rng,
+                &mut block,
             );
             sock.write_all(&block).await.unwrap();
             sock.flush().await.unwrap();
