@@ -26,6 +26,11 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact: xray-linux-amd64
             bin: xray
+          # OpenWrt/iStoreOS 系 musl 固件原生静态二进制(zig 交叉配方探针实证 38024052697)
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            artifact: xray-linux-amd64-musl
+            bin: xray
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: xray-windows-amd64.exe
@@ -74,7 +79,24 @@ jobs:
           }
           # GITHUB_PATH 对本步不生效，版本检查仅非 Windows（Linux/macOS 即时装好）
           if ($env:RUNNER_OS -ne "Windows") { Write-Host "protoc: $(protoc --version)" }
+      # musl 交叉:C/C++ 依赖(boringssl/aws-lc)经 zig 工具链(探针 38024052697 实证配方)
+      - name: Install zig (musl target only)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          wget -q https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz
+          tar xJf zig-linux-x86_64-0.13.0.tar.xz -C /opt
+          echo "/opt/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+          # GITHUB_PATH 对当前步不生效,下一步才消费
+      - name: Install cargo-zigbuild (musl target only)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Build release (musl via zigbuild)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: cargo zigbuild --release -p xray-cli --target ${{ matrix.target }}
       - name: Build release
+        if: matrix.target != 'x86_64-unknown-linux-musl'
         run: cargo build --release -p xray-cli --target ${{ matrix.target }}
       - name: Upload artifact
         uses: actions/upload-artifact@v4
