@@ -28,10 +28,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "musl-probe-v1"
-      - name: Install musl cross toolchain (C++, musl.cc)
+      - name: Install musl cross toolchain (C++, musl.cc via TUNA mirror)
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
-          wget -q https://musl.cc/x86_64-linux-musl-cross.tgz
+          # musl.cc 间歇性网络失败(exit 4 实锤),TUNA 镜像优先,musl.cc 回退
+          wget -q --tries=2 https://mirrors.tuna.tsinghua.edu.cn/musl.cc/x86_64-linux-musl-cross.tgz \
+            || wget -q --tries=2 https://musl.cc/x86_64-linux-musl-cross.tgz
           tar xzf x86_64-linux-musl-cross.tgz -C /opt
           echo "/opt/x86_64-linux-musl-cross/bin" >> "$GITHUB_PATH"
       - name: Install protoc 25.1
