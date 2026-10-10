@@ -1,0 +1,59 @@
+# OpenWrt 兼容探针:x86_64 musl 静态编译试验(bd 后续票,exp 分支 workflow_dispatch 手动触发)
+#
+# 目的:验证 xray-cli 能否编出 x86_64-unknown-linux-musl 静态二进制(原生跑
+# OpenWrt/iStoreOS 系 musl 固件)。三个已知风险点由本探针实证:
+#   1. btls-sys 的 boringssl cmake 子构建在 musl 工具链下能否编过(C++,
+#      Debian musl-tools 无 musl-g++ → 用 musl.cc 交叉工具链)
+#   2. aws-lc-sys 源码编译 musl 兼容性(AWS_LC_SYS_PREGENERATING=false 同 release.yml)
+#   3. 全静态链接后二进制可执行性(runner 上直接 ./xray version 冒烟)
+name: Musl Probe
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: ""
+  AWS_LC_SYS_PREGENERATING: "false"
+
+jobs:
+  probe:
+    name: musl x86_64 build probe
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "musl-probe-v1"
+      - name: Install musl cross toolchain (C++, musl.cc)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+          wget -q https://musl.cc/x86_64-linux-musl-cross.tgz
+          tar xzf x86_64-linux-musl-cross.tgz -C /opt
+          echo "/opt/x86_64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+      - name: Install protoc 25.1
+        run: |
+          sudo wget -q https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-linux-x86_64.zip -O /tmp/protoc.zip
+          sudo unzip -q -o /tmp/protoc.zip -d /usr/local && sudo rm /tmp/protoc.zip
+          protoc --version
+      - name: Prepare patched boringssl
+        uses: ./.github/actions/setup-boringssl
+      - name: Build musl static
+        env:
+          CC_x86_64_unknown_linux_musl: /opt/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc
+          CXX_x86_64_unknown_linux_musl: /opt/x86_64-linux-musl-cross/bin/x86_64-linux-musl-g++
+          AR_x86_64_unknown_linux_musl: /opt/x86_64-linux-musl-cross/bin/x86_64-linux-musl-ar
+        run: |
+          cargo build --release -p xray-cli --target x86_64-unknown-linux-musl 2>&1 | tail -30
+          file target/x86_64-unknown-linux-musl/release/xray
+          ldd target/x86_64-unknown-linux-musl/release/xray 2>&1 | head -2 || true
+      - name: Smoke on runner (musl binary exec)
+        run: ./target/x86_64-unknown-linux-musl/release/xray version
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-linux-amd64-musl
+          path: target/x86_64-unknown-linux-musl/release/xray
