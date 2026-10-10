@@ -212,6 +212,13 @@ impl ReadVSource {
             Self::Half(s) => s.try_read_vectored(slices),
         }
     }
+
+    fn try_read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Whole(s) => s.try_read(buf),
+            Self::Half(s) => s.try_read(buf),
+        }
+    }
 }
 
 impl ReadVReader {
@@ -253,9 +260,12 @@ impl ReadVReader {
     /// 零分配路径（bd fwhh）：缓冲槽与 iovec 批都在栈上（`[Option<Buffer>; 8]` +
     /// `IovecBatch`），每读唯一堆分配 = 返回值 MultiBuffer 内部 Vec。
     pub async fn read_multi(&mut self) -> Result<MultiBuffer> {
-        // Go 以 current==1 分流：单缓冲读（填满才扩容）vs 多缓冲 readv（按实填数调整）。
-        // 分支判定在入口取快照，读后按各自分支调整一次（对齐 Go :127-129 / :143）。
-        let single = self.alloc.current() == 1;
+        // 单缓冲快速路径：readv 多 iovec 装配对单个 8KB 缓冲净亏，直接单缓冲
+        // read。AllocStrategy 节奏不变（填满 → adjust(1) → 升 2）。
+        if self.alloc.current() == 1 {
+            return self.read_multi_single().await;
+        }
+
         let n_bufs = (self.alloc.current() as usize).min(MAX_READV);
 
         // 栈上构建：填缓冲槽 → 拼 iovec（对应 Go posixReader.Init 直写 bs[nBuf].v）。
@@ -283,16 +293,49 @@ impl ReadVReader {
         }
 
         let mb = distribute_slots(n, &mut bufs, &lens, n_iov);
-        if single {
-            // Go :127-129：单缓冲读填满（IsFull）→ Adjust(1) → 扩到 2，下次起用 readv。
-            if n >= lens[0] {
-                self.alloc.adjust(1);
-            }
-        } else {
-            // Go :143：多缓冲读按实填缓冲数调整。
-            self.alloc.adjust(mb.buffer_count() as u32);
-        }
+        // Go :143：多缓冲读按实填缓冲数调整。
+        self.alloc.adjust(mb.buffer_count() as u32);
         Ok(mb)
+    }
+
+    /// 单缓冲读（Go ReadBuffer 分支，readv_reader.go:124-129 等价语义）：
+    /// 分配 1 个池化 Buffer 直读；填满（IsFull）→ adjust(1) → 扩到 2，
+    /// 下次起用 readv 多缓冲。
+    async fn read_multi_single(&mut self) -> Result<MultiBuffer> {
+        let mut buf = Buffer::new();
+        let cap = buf.writable_bytes().len();
+        let read = self.read_ready_single(buf.writable_bytes()).await;
+        let n = match read {
+            Ok(n) => n,
+            Err(e) => {
+                buf.release();
+                return Err(io::classify_io_error(e, true));
+            },
+        };
+        if n == 0 {
+            // 空 MultiBuffer = EOF（本 crate 约定）。
+            buf.release();
+            return Ok(MultiBuffer::new());
+        }
+        buf.advance_write(n);
+        if n >= cap {
+            self.alloc.adjust(1);
+        }
+        let mut mb = MultiBuffer::with_capacity(1);
+        mb.push(buf);
+        Ok(mb)
+    }
+
+    /// 就绪等待 + 非阻塞单缓冲读循环（`try_read`，非 readv）。
+    async fn read_ready_single(&self, w: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            self.src.readable().await?;
+            match self.src.try_read(w) {
+                Ok(n) => return Ok(n),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 
