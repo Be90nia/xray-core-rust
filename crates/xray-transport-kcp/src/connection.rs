@@ -1109,12 +1109,29 @@ mod tests {
         let conn = Arc::new(conn);
         let kcp = Arc::new(tokio::sync::Mutex::new(KcpConn::new(conn.clone())));
 
+        // 有界 in-flight 背压（bd Xray-core-rust-z0ni）：receiving 侧
+        // process_segment 对窗口外（idx >= window_size）段静默丢弃，本测试
+        // 对端不重传 → 丢一段 = 永久序号缺口 = 消费端 stall。故注入器与主测
+        // 循环共享 consumed 计数（已消费整段数，PAYLOAD 字节/段；left_over
+        // 滞留使其低估真实推进量，保守安全方向），注入 number=N 前自旋等
+        // consumed >= N - BOUND，任意时刻在飞段数 ≤ BOUND ≤ window_size/2，
+        // 永不超窗。无死锁：主测 Pending ⇔ 已注入段全部交付 ⇔ consumed 已
+        // 满足下一注入阈值，注入器必然放行。注入器是 blocking 线程，等待用
+        // yield_now 轮询（禁 tokio）。
+        let bound = (conn.inner.receiving_worker.window_size() as usize / 2).min(8);
+        let consumed = Arc::new(AtomicUsize::new(0));
+
         // 真实 runtime 注入：spawn_blocking 保证 OS 线程真起（macOS 冷启 ~10ms
         // 足以让主测先走若干 Pending 迭代），且 notify 经真实 waker re-poll。
         let conn_inj = conn.clone();
+        let consumed_inj = consumed.clone();
         let injector = tokio::task::spawn_blocking(move || {
             let payload = vec![0xABu8; PAYLOAD];
             for number in 0..ROUNDS as u32 {
+                let target = (number as usize).saturating_sub(bound);
+                while consumed_inj.load(Ordering::Relaxed) < target {
+                    std::thread::yield_now();
+                }
                 let seg = make_data(CONV, number, &payload);
                 conn_inj.input(vec![SegmentKind::Data(seg)]);
             }
@@ -1139,6 +1156,7 @@ mod tests {
             assert!(n > 0, "read returned 0 (received={received}/{total})");
             assert!(received + n <= total, "read more than injected: {received} + {n} > {total}");
             received += n;
+            consumed.store(received / PAYLOAD, Ordering::Relaxed);
             use_big = !use_big;
         }
         injector.await.expect("injector join");
