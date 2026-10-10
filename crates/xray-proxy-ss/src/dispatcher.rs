@@ -318,17 +318,17 @@ impl SsOutboundConfig {
 /// 解析 SS outbound settings JSON → `SsOutboundConfig`。
 ///
 /// 支持两种形态（v2ray-core 历史遗留，v2rayN 客户端测速仍用裸字段）：
-/// - 数组形态：`{ "servers": [{ "address": "...", "port": 8388, "method": "aes-256-gcm", "password":
-///   "..." }] }`（Go infra/conf/shadowsocks.go 标准）
-/// - 裸字段形态：`{ "address": "...", "port": 8388, "method": "...", "password": "..." }`
-///   （v2rayN / 旧 v2ray-core，2022 节点亦用此形）
+/// - 数组形态：`{ "servers": [{ "address": "...", "port": 8388, "method": "aes-256-gcm",
+///   "password": "..." }] }`（Go infra/conf/shadowsocks.go 标准）
+/// - 裸字段形态：`{ "address": "...", "port": 8388, "method": "...", "password": "..." }` （v2rayN
+///   / 旧 v2ray-core，2022 节点亦用此形）
 pub fn parse_ss_config(data: &[u8]) -> Result<SsOutboundConfig, String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
     // 形 1: servers 数组; 形 2: settings 裸字段(顶层含 address)。两种都映射到 `first`。
     let first: &serde_json::Value = match v.get("servers") {
         Some(serde_json::Value::Array(arr)) => {
             arr.first().ok_or_else(|| "servers array is empty".to_string())?
-        }
+        },
         None if v.get("address").is_some() => &v,
         _ => return Err("missing servers array".to_string()),
     };
