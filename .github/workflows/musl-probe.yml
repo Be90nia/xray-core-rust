@@ -32,6 +32,8 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-zigbuild
+      - name: Install zig (cargo-zigbuild 依赖本体,上轮 Failed to find zig 实锤)
+        uses: mlugg/setup-zig@v1
       - name: Install protoc 25.1
         run: |
           sudo wget -q https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-linux-x86_64.zip -O /tmp/protoc.zip
