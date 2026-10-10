@@ -6261,21 +6261,25 @@ mod tests {
         // Go 客户端上行帧序列：首帧 Continue 带 uuid（内层 TLS 批次），随后
         // DIRECT 帧（splice 触发，content 空）
         let first = build_vision_app_record(b"GET / HTTP/1.1\r\n\r\n");
-        let frame_continue = xtls_padding(
+        let mut frame_continue = Vec::new();
+        xtls_padding(
             Some(&first),
             xray_proxy_vless::encryption::vision::COMMAND_PADDING_CONTINUE,
             &mut Some(test_uuid.as_bytes().to_vec()),
             true,
             &DEFAULT_PADDING_SEED,
             &mut rand::rngs::StdRng::from_os_rng(),
+            &mut frame_continue,
         );
-        let frame_direct = xtls_padding(
+        let mut frame_direct = Vec::new();
+        xtls_padding(
             Some(&[]),
             xray_proxy_vless::encryption::vision::COMMAND_PADDING_DIRECT,
             &mut None,
             true,
             &DEFAULT_PADDING_SEED,
             &mut rand::rngs::StdRng::from_os_rng(),
+            &mut frame_direct,
         );
         reality_conn.write_all(&frame_continue).await.unwrap();
         reality_conn.write_all(&frame_direct).await.unwrap();
@@ -6320,21 +6324,25 @@ mod tests {
         .unwrap();
 
         let first = build_vision_app_record(b"GET / HTTP/1.1\r\n\r\n");
-        let frame_continue = xtls_padding(
+        let mut frame_continue = Vec::new();
+        xtls_padding(
             Some(&first),
             xray_proxy_vless::encryption::vision::COMMAND_PADDING_CONTINUE,
             &mut Some(test_uuid.as_bytes().to_vec()),
             true,
             &DEFAULT_PADDING_SEED,
             &mut rand::rngs::StdRng::from_os_rng(),
+            &mut frame_continue,
         );
-        let frame_direct = xtls_padding(
+        let mut frame_direct = Vec::new();
+        xtls_padding(
             Some(&[]),
             xray_proxy_vless::encryption::vision::COMMAND_PADDING_DIRECT,
             &mut None,
             true,
             &DEFAULT_PADDING_SEED,
             &mut rand::rngs::StdRng::from_os_rng(),
+            &mut frame_direct,
         );
         // DIRECT 帧上线后立即（零 sleep）背靠背裸写两段：TCP 侧帧记录与裸尾
         // 大概率合并/相邻段到达，服务端 framer + raw 通道必须完整保序送达。

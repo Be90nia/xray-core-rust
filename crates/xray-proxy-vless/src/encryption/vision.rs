@@ -146,7 +146,7 @@ impl TrafficState {
 /// - `long_padding`：是否生成长 padding（隐藏 VLESS header）
 /// - `seed`：padding 长度种子 `[短阈值, 长上限, 长基准, 短上限]`
 /// - `rng`：随机数生成器
-#[must_use]
+/// - `out`：调用方 scratch（clear + 写入；复用容量避免每帧堆分配）
 pub fn xtls_padding<R: Rng>(
     content: Option<&[u8]>,
     command: u8,
@@ -154,7 +154,9 @@ pub fn xtls_padding<R: Rng>(
     long_padding: bool,
     seed: &[u32; 4],
     rng: &mut R,
-) -> Vec<u8> {
+    out: &mut Vec<u8>,
+) {
+    out.clear();
     let content_len = content.map_or(0_i32, |c| c.len() as i32);
     let mut padding_len = if content_len < seed[0] as i32 && long_padding {
         rng.random_range(0..seed[1]) as i32 + seed[2] as i32 - content_len
@@ -169,7 +171,6 @@ pub fn xtls_padding<R: Rng>(
         padding_len = 0;
     }
 
-    let mut out = Vec::new();
     if let Some(uuid) = user_uuid.take() {
         out.extend_from_slice(&uuid);
     }
@@ -183,7 +184,6 @@ pub fn xtls_padding<R: Rng>(
     }
     // padding 用零填充（对齐 Go `buf.Buffer.Extend` 行为）
     out.resize(out.len() + padding_len as usize, 0);
-    out
 }
 
 /// Vision unpadding 解码（对齐 Go `XtlsUnpadding`）。
@@ -192,13 +192,12 @@ pub fn xtls_padding<R: Rng>(
 ///
 /// 初始状态（`remaining_command == remaining_content == remaining_padding == -1`）：
 /// - 匹配 `user_uuid` 前 16 字节 → 跳过 uuid，进入解析
-/// - 不匹配 → 原样返回（非 Vision 块）
+/// - 不匹配 → 原样写入 `out`（非 Vision 块）
 ///
-/// # 返回
-/// 提取出的 content 字节（padding 被丢弃）。
-#[must_use]
-pub fn xtls_unpadding(buf: &[u8], state: &mut DirectionState, user_uuid: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
+/// # 参数
+/// - `out`：调用方 scratch（clear + 写入；明文所有权归调用方，容量跨帧复用）
+pub fn xtls_unpadding(buf: &[u8], state: &mut DirectionState, user_uuid: &[u8], out: &mut Vec<u8>) {
+    out.clear();
     let mut pos = 0;
 
     // 初始状态：等待 user_uuid（16 字节 + 5 header = 21 最小）
@@ -211,7 +210,8 @@ pub fn xtls_unpadding(buf: &[u8], state: &mut DirectionState, user_uuid: &[u8]) 
             state.remaining_command = 5;
         } else {
             // 非 Vision 块，原样返回
-            return buf.to_vec();
+            out.extend_from_slice(buf);
+            return;
         }
     }
 
@@ -261,7 +261,6 @@ pub fn xtls_unpadding(buf: &[u8], state: &mut DirectionState, user_uuid: &[u8]) 
             }
         }
     }
-    out
 }
 
 /// TLS 1.3 检测（对齐 Go `XtlsFilterTls`）。
@@ -575,13 +574,15 @@ mod tests {
         let mut write_uuid = Some(user_uuid.clone());
         let content = b"hello";
 
-        let padded = xtls_padding(
+        let mut padded = Vec::new();
+        xtls_padding(
             Some(content),
             COMMAND_PADDING_END,
             &mut write_uuid,
             false,
             &DEFAULT_PADDING_SEED,
             &mut rng,
+            &mut padded,
         );
 
         // uuid 被消费
@@ -602,13 +603,15 @@ mod tests {
     fn padding_no_uuid_second_block() {
         let mut rng = rng();
         let mut write_uuid: Option<Vec<u8>> = None; // 已消费
-        let padded = xtls_padding(
+        let mut padded = Vec::new();
+        xtls_padding(
             Some(b"data"),
             COMMAND_PADDING_CONTINUE,
             &mut write_uuid,
             false,
             &DEFAULT_PADDING_SEED,
             &mut rng,
+            &mut padded,
         );
         // 无 uuid 前缀，直接从 command 开始
         assert_eq!(padded[0], COMMAND_PADDING_CONTINUE);
@@ -619,26 +622,30 @@ mod tests {
         let mut rng = rng();
         let mut write_uuid = Some(vec![0u8; 16]);
         // 短 content + long_padding → padding_len = rand(0..500) + 900 - content_len
-        let short = xtls_padding(
+        let mut short = Vec::new();
+        xtls_padding(
             Some(b"hi"),
             COMMAND_PADDING_END,
             &mut write_uuid,
             true,
             &DEFAULT_PADDING_SEED,
             &mut rng,
+            &mut short,
         );
         let pad_len = ((short[19] as usize) << 8) | short[20] as usize;
         // long padding 至少 900 - 2 - 500 = 398 起（rand 下限 0）
         assert!(pad_len >= 398, "long padding too small: {pad_len}");
 
         let mut write_uuid2 = Some(vec![0u8; 16]);
-        let _short2 = xtls_padding(
+        let mut short2 = Vec::new();
+        xtls_padding(
             Some(b"hi"),
             COMMAND_PADDING_END,
             &mut write_uuid2,
             false,
             &DEFAULT_PADDING_SEED,
             &mut rng,
+            &mut short2,
         );
     }
 
@@ -649,17 +656,20 @@ mod tests {
         let mut write_uuid = Some(user_uuid.clone());
         let content = b"hello vision world";
 
-        let padded = xtls_padding(
+        let mut padded = Vec::new();
+        xtls_padding(
             Some(content),
             COMMAND_PADDING_END,
             &mut write_uuid,
             false,
             &DEFAULT_PADDING_SEED,
             &mut rng,
+            &mut padded,
         );
 
         let mut state = DirectionState::default();
-        let unpadded = xtls_unpadding(&padded, &mut state, &user_uuid);
+        let mut unpadded = Vec::new();
+        xtls_unpadding(&padded, &mut state, &user_uuid, &mut unpadded);
         assert_eq!(unpadded, content);
         // End 后回初始状态
         assert_eq!(state.remaining_command, -1);
@@ -672,27 +682,32 @@ mod tests {
         let mut write_uuid = Some(user_uuid.clone());
 
         // 块1: Continue + content1
-        let mut buf = xtls_padding(
+        let mut buf = Vec::new();
+        xtls_padding(
             Some(b"part1"),
             COMMAND_PADDING_CONTINUE,
             &mut write_uuid,
             false,
             &DEFAULT_PADDING_SEED,
             &mut rng,
+            &mut buf,
         );
         // 块2: End + content2（无 uuid）
-        let block2 = xtls_padding(
+        let mut block2 = Vec::new();
+        xtls_padding(
             Some(b"part2"),
             COMMAND_PADDING_END,
             &mut write_uuid,
             false,
             &DEFAULT_PADDING_SEED,
             &mut rng,
+            &mut block2,
         );
         buf.extend_from_slice(&block2);
 
         let mut state = DirectionState::default();
-        let unpadded = xtls_unpadding(&buf, &mut state, &user_uuid);
+        let mut unpadded = Vec::new();
+        xtls_unpadding(&buf, &mut state, &user_uuid, &mut unpadded);
         assert_eq!(unpadded, b"part1part2");
     }
 
@@ -701,7 +716,8 @@ mod tests {
         let mut state = DirectionState::default();
         let user_uuid = vec![0u8; 16];
         let raw = b"not a vision block, just raw data";
-        let out = xtls_unpadding(raw, &mut state, &user_uuid);
+        let mut out = Vec::new();
+        xtls_unpadding(raw, &mut state, &user_uuid, &mut out);
         assert_eq!(out, raw);
     }
 
@@ -946,7 +962,17 @@ mod tests {
         let mk = |seed: &[u32; 4]| {
             let mut rng = StdRng::from_seed([42u8; 32]);
             let mut u = Some(uuid.clone());
-            xtls_padding(Some(&content), COMMAND_PADDING_CONTINUE, &mut u, true, seed, &mut rng)
+            let mut block = Vec::new();
+            xtls_padding(
+                Some(&content),
+                COMMAND_PADDING_CONTINUE,
+                &mut u,
+                true,
+                seed,
+                &mut rng,
+                &mut block,
+            );
+            block
         };
         let with_default = mk(&DEFAULT_PADDING_SEED);
         let with_custom = mk(&[10, 20, 30, 40]);
