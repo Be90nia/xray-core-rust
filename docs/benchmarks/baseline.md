@@ -110,3 +110,20 @@ python tools/loopback_alloc_bench.py --tag <名> --runs 3 --alloc-stats \
   netem 隔离测速床或真实 endpoint 同窗配对（30gf 方法论）。
 - alloc/MB 为进程级累计（含握手/建连一次性开销），非纯数据路径口径；
   P1 对比时用同法采样保持口径一致。
+
+## P1 收口对照（R4，同法采样，commit 3287ef93）
+
+| 指标 | 基线（R3） | P1 终态 | Δ |
+|---|---|---|---|
+| alloc/MB server | 2.15 MiB/MiB | 2.136 | -0.6% |
+| alloc/MB client | 2.22 MiB/MiB | 2.168 | -2.3% |
+| alloc 次数 server | 188,209 | 165,722 | **-12.0%** |
+| alloc 次数 client | 464,870 | 308,355 | **-33.7%** |
+| loopback 吞吐 | 154-167 带稳态 | 149.3/168.5/167.7（暖机后稳态带内） | 持平 |
+
+- 解读：被消除的分配均为小对象（chunk to_vec/segment/box），总字节由池化大
+  buffer 主导——mimalloc 下小分配字节成本≈0，故字节口径变化小；**次数大降
+  （cli -33.7%）才是收益正身**（分配器调用频率/锁/cache 压力）。v1 可证伪
+  条款触发判定：alloc/MB 字节口径 <5% 且 loopback 无差 → io.rs 去 box **保留
+  改造但降级为非性能票**，真实收益待真实端点同窗 A/B 复测（深谷未测，如实
+  标注）。cli live_bytes 窗末 138MB 异常值疑采样残留，待复测非泄漏结论。
