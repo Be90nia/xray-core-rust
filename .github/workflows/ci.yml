@@ -55,7 +55,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # linux 钉 22.04：产物换核生产 Debian 12（glibc 2.36），24.04 构建要求
+          # GLIBC_2.38 起不来（2026-10-11 实锤回滚）；与 release.yml 同理由
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
           - os: windows-latest
             target: x86_64-pc-windows-msvc
