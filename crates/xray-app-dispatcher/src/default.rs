@@ -1519,6 +1519,8 @@ impl CachedReader {
     }
 
     /// 取缓存的首包字节切片（用于 sniffing）。
+    /// 诊断/嗅探快照访问器，非 relay 数据热路径（每连接一次）。
+    #[allow(clippy::disallowed_methods)]
     pub fn cached_bytes(&self) -> Vec<u8> {
         self.cache.as_ref().map_or(Vec::new(), |mb| mb.to_vec())
     }

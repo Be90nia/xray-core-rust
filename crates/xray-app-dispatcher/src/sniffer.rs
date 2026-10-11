@@ -766,6 +766,8 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
         let mask = hp_key.new_mask(sample).map_err(|_| SniffError::UnknownContent)?;
 
         // 解密 header protection（在可变副本上操作）
+        // HP 掩码解密需要可变副本，拷贝为算法固有（ring open_in_place 前置变换）
+        #[allow(clippy::disallowed_methods)]
         let mut packet_buf = payload.to_vec();
 
         // 第一个字节低 4 位
@@ -808,7 +810,8 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
             return Ok(None);
         }
 
-        // 先复制 aad 数据避免同时不可变+可变借用 packet_buf
+        // 先复制 aad 数据避免同时不可变+可变借用 packet_buf（借用分裂固有拷贝）
+        #[allow(clippy::disallowed_methods)]
         let aad_data = packet_buf[..ext_hdr_len].to_vec();
         let aad = ring::aead::Aad::from(&aad_data[..]);
         let decrypted_len = quic_key

@@ -14,6 +14,9 @@
 //! 替换 `tls_acceptor.accept(tcp)` 为 `reality::u_client(tcp, state)` 即可。
 //! 架构路径（hyper h2 handshake）与普通 TLS 完全一致。
 
+// 测试编译单元统一豁免（数据面分配纪律见 crate clippy.toml）
+#![allow(clippy::disallowed_methods)]
+
 use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;

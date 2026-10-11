@@ -4,6 +4,9 @@
 //! 必须走 H2 全双工。本测试用 mock H2 server（自签 TLS + ALPN h2 + hyper h2）
 //! 覆盖两个 stream 模式。
 
+// 测试编译单元统一豁免（数据面分配纪律见 crate clippy.toml）
+#![allow(clippy::disallowed_methods)]
+
 use std::{
     sync::{
         Arc,

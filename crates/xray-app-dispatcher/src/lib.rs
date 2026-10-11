@@ -24,6 +24,10 @@
 //! 2. 协议嗅探器（HTTP/TLS/BitTorrent/QUIC/UTP）全 trait + NotImplemented stub
 //! 3. 不直接依赖 xray-app-dns / xray-app-router，避免循环依赖，trait 在本 crate 定义
 
+// 数据面分配纪律（P0 护栏，见本 crate clippy.toml）：测试编译单元统一豁免，
+// 断言扁平化属测试便利；生产代码禁令不受影响。
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 pub mod config;
 pub mod default;
 pub mod endpoint_override;

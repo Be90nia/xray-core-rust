@@ -182,12 +182,17 @@ enum Command {
 
 // bd uf2p: mimalloc 全局分配器（feature 默认开；--no-default-features 回退
 // 系统分配器）。proxy 小对象密集分配场景公开基准 +5-15%。
+// P0 护栏：包一层计数 wrapper，XRAY_ALLOC_STATS=1 时启用进程级统计，
+// 默认零开销直通（alloc_stats 模块文档）。
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
-static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL_ALLOC: xray_cli::alloc_stats::StatsAlloc<mimalloc::MiMalloc> =
+    xray_cli::alloc_stats::StatsAlloc(mimalloc::MiMalloc);
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // P0 护栏：计数分配器开关解析 + dump 线程（未开 env 时零开销直返）。
+    xray_cli::alloc_stats::init();
     // 9tk4：tracing subscriber 不再在此急切初始化（此前固定 EnvFilter "info"
     // 完全绕过 loglevel 配置）。`run` 路径在配置解析后按 `log.loglevel`
     // 推导过滤器（见 run::execute → run::init_tracing）；其余工具子命令

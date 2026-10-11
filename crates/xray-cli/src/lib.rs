@@ -14,6 +14,7 @@
 //! 切片2 待办：完整 `run` 启动路径 + gRPC client 接入（API 命令真实调用）
 //! + 信号处理（SIGINT/SIGTERM）。
 
+pub mod alloc_stats;
 pub mod commands;
 pub mod distro;
 pub mod error;

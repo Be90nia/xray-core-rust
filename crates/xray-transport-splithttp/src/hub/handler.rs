@@ -325,7 +325,10 @@ where
         let mut stream = req.into_body().into_data_stream();
         let mut seq = 0u64;
         while let Ok(Some(chunk)) = stream.try_next().await {
-            if queue.push(Packet::new(chunk.to_vec(), seq)).await.is_err() {
+            // P1 收口点：h2 Bytes 边界，等 Buffer::from_bytes 零拷贝入口（oracle §1.1-3）
+            #[allow(clippy::disallowed_methods)]
+            let chunk = chunk.to_vec();
+            if queue.push(Packet::new(chunk, seq)).await.is_err() {
                 break;
             }
             seq += 1;

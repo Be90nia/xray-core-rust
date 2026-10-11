@@ -162,7 +162,10 @@ impl UploadQueue {
                     if n < packet.payload.len() {
                         // 余下保留为 current，下次继续读
                         let mut rest = packet;
-                        rest.payload = rest.payload[n..].to_vec();
+                        // 部分消费重打包：P1 收口点（等零拷贝切片入口）
+                        #[allow(clippy::disallowed_methods)]
+                        let rest_tail = rest.payload[n..].to_vec();
+                        rest.payload = rest_tail;
                         inner.current = Some(rest);
                     } else {
                         // 完整消费，nextSeq++
