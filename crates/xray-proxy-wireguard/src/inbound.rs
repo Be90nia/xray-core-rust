@@ -617,14 +617,14 @@ mod tests {
             Box::pin(async move {
                 let mut r = link.reader;
                 let mut w = link.writer;
-                let mb = match r.read_multi_buffer().await {
+                let mb = match xray_buf::io::read_mb(&mut *r).await {
                     Ok(mb) if !mb.is_empty() => mb,
                     _ => return,
                 };
                 seen.lock().push((dest.clone(), mb.to_vec()));
                 let mut resp = MultiBuffer::new();
                 resp.merge_bytes(&response);
-                let _ = w.write_multi_buffer(resp).await;
+                let _ = xray_buf::io::write_mb(&mut *w, resp).await;
             })
         }
     }
