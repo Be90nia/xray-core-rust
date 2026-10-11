@@ -1,25 +1,66 @@
 # Xray-core-rust 分层宪法（ARCHITECTURE.md）
 
 > **效力**：治理文档。每次新增协议、每个 AI 子代理派单，先对齐本图，再动手。
-> **细则不在本文**：裁决全文见 [`docs/refs/oracle-framing-arch.md`](docs/refs/oracle-framing-arch.md)（oracle 裁决书）；病灶清单见 [`docs/refs/alloc-audit-report.md`](docs/refs/alloc-audit-report.md)（AllocAudit 审计）。宪法只立规矩，细则走链接。
+> **细则不在本文**：裁决全文见 [`docs/refs/oracle-framing-arch.md`](docs/refs/oracle-framing-arch.md)（v1 裁决书）、[`docs/refs/oracle-framing-v2.md`](docs/refs/oracle-framing-v2.md)（v2：数据面 Filter/引擎）、[`docs/refs/oracle-framing-v3.md`](docs/refs/oracle-framing-v3.md)（v3：MVVM 增补）；病灶清单见 [`docs/refs/alloc-audit-report.md`](docs/refs/alloc-audit-report.md)（AllocAudit 审计）。宪法只立规矩，细则走链接。
 > English version: [ARCHITECTURE.en.md](ARCHITECTURE.en.md)（主文档为中文版；英文版跟随本文件同步修订，变更记录双记）。
 > **标注铁律**：【现状】= 已落地，可 grep 验证；【规划】= 裁决已定、未落地。禁止把规划写成现状，禁止给未定型 API 写文档承诺。
 > **分层阅读**：每节开头紧凑表即原 138 行审定版（TL;DR 层），`详细` 小节为展开层。只对齐图景读 TL;DR 层即可；动手开发新协议必须读完 §3 详细 recipe——本宪法按「未参与决策会话的开发者只读本文即可正确开发」标准书写。
 
-## 0. TL;DR——三层总图
+## 0. TL;DR——MVVM 五层全景图
 
 ### 0.1 三层隐喻与依赖方向
 
 项目所有者隐喻：**骨架 = GameFrameWork**（内存分配调度、线程管理、资源回收，框架托管）；**血肉 = 协议和 DNS**（只管协议逻辑开发）；**皮囊 = V2rayN 等客户端**（对接层）。
 
-```text
-皮囊  cli / 配置兼容 / commander API                 对接外部世界
-血肉  xray-proxy-* / transport 协议语义 / DNS / app 协议性模块   只写协议逻辑
-骨架  tokio / xray-buf / dispatcher / 统一 accept / 观测调参      托管一切
+> 实线=依赖（单向向下，View→VM→注册表→血肉→骨架，永不反向）；虚线=数据流（计数上浮、控制下沉）。⚔ = 机械化检查点。（v3 §4 全景图原样迁入）
 
-依赖方向：皮囊 → 血肉 → 骨架，严格单向。
-血肉不 import 皮囊；协议不绕过骨架自建缓冲/调度/accept/统计。
+```mermaid
+flowchart TB
+    subgraph VIEW["View · 皮囊（仓库外）"]
+        GN["v2rayN GUI"]
+        CLIC["CLI / 脚本"]
+        EXT["外部监控 / 客户端"]
+    end
+
+    subgraph VML["ViewModel · 中介绑定层（仓库内唯一对外面）"]
+        CONF["xray-conf + parse_*_config<br/>配置绑定：方言归一<br/>⚔ §4.2 封闭清单 + golden corpus"]
+        CMD["xray-app-commander<br/>状态绑定：gRPC 只读<br/>⚔ 名册快照 add-only"]
+        STAT["xray-app-stats + log<br/>计数聚合 + 渲染"]
+    end
+
+    subgraph REG["注册表 · 解耦枢纽"]
+        FR["FactoryRegistry<br/>显式注册 + tag 选择<br/>⚔ 依赖分层表 + 兄弟零边"]
+        AH["AdminHandle 控制动词"]
+    end
+
+    subgraph FLESH["Model · 血肉（三种嵌入形态，互不 import）"]
+        HF["HeaderFilter 族<br/>vless/vmess/ss/trojan...（H 层）"]
+        WC["WireCodec 层<br/>vision/enc/xor/TLS（W 层）"]
+        SSD["SessionService 族<br/>quic/h2/ws/kcp/UDP（S 层）"]
+    end
+
+    subgraph SKELETON["Model · 骨架引擎"]
+        ENG["RelayEngine + accept 框架"]
+        BUFN["xray-buf 池 + io"]
+        OBSV["观测 / 调参面（P4/P5）"]
+        TOK["tokio 运行时"]
+    end
+
+    VIEW -->|"json 方言 / gRPC（冻结契约）"| VML
+    VML -->|"注册 / tag 查询 / AdminHandle"| REG
+    FR -->|"build / new_filter（零逻辑注册行）"| FLESH
+    FLESH -->|"被驱动：ctx 14 字段即全部可见宇宙"| SKELETON
+    STAT -.->|"计数/事件上浮（数据流）"| SKELETON
+    AH -.->|"控制动词下沉（数据流）"| ENG
+
+    classDef checkpoint stroke:#c0392b,stroke-width:2px
+    class CONF,CMD,FR checkpoint
 ```
+
+读法三句（v3 §4）：**依赖只向下**（View 永远不知道 Model 存在；血肉永远不知道 commander 存在）；**三处 ⚔ 是全部纪律的执法点**（配置快照、名册快照、依赖分层表——三份 CI 检查管住整个 MVVM）；**血肉可见宇宙 = ConnCtx 冻结字段（14+1，§6.4）+ 注册表**，除此之外的一切不可见即不可用。
+
+依赖方向：View → ViewModel → 注册表 → 血肉 → 骨架，严格单向。
+血肉不 import ViewModel（commander/stats/conf）；协议不绕过骨架自建缓冲/调度/accept/统计。
 
 血肉范围：17 个 `xray-proxy-*` + 各 transport 的协议语义部分 + `xray-app-dns` 及 app 模块中承载协议逻辑的部分（其托管面——连接、缓冲、调度——仍归骨架）。
 皮囊范围：cli 装配、配置形态兼容、commander API。
@@ -34,6 +75,8 @@
 | 缓冲与池 | 【现状】xray-buf 11 模块逐文件镜像 Go `common/buf`；两级分层池（TLS 缓存 + 8 分片全局，2K/8K/32K/128K）；`Buffer` `#[must_use]` + Drop 回池；`copy_with_options` = Go `buf.Copy` 直译。【规划】`Bytes` 零拷贝入口 `Buffer::from_bytes_frozen`；io.rs Reader/Writer 去 box（poll-based + 具名 future 默认方法；连接边界 `BoxedReader` 每连接 1 box） |
 | transport 抽象 | 【现状】`xray-transport-*` crate 族；security（tls/reality）包装在独立 crate，防依赖环 |
 | dispatcher | 【现状】DefaultDispatcher + 装饰链（SizeStat/Cached/EndpointOverride）+ splice 准入闸（Go `CanSpliceCopy` 1/2/3 语义）。【规划】装饰链 poll 直通：每层 1 box → 0 分配 |
+| 连接引擎 | 【规划·P2.5（v2）】RelayEngine = DialBridge 泛化：统一 5 处分裂泵；RelayFilter 三回调（poll_decode/poll_encode/on_event）；首迁 vmess inbound |
+| 注册表 | 【规划·P2.0（v3）】FactoryRegistry 显式注册 + config tag 选择：outbound/inbound 中央 match 臂退化为零逻辑注册行，臂内构造逻辑随臂回血肉（BuildCtx 显式化环境依赖） |
 | 统一 accept | 【现状】各 transport 手写循环 + 点状 4s timeout（httpupgrade/websocket 各自手抄）；串行 accept 残留（慢 ClientHello 占 accept 位）；httpupgrade 的 PROXY protocol 读取在超时窗外。【规划】`accept_loop` + `AcceptLimits` + `StreamHandshake` 泛型握手回调（单态化零 box）；QUIC/UDP 另立薄模板，不强统一 |
 | 观测 | 【现状】stats 计数 + debug log，薄。【规划】per-stage 原子计数 + 定期 tracing（accept 速率/握手延迟直方图/超时数/active conns）、relay 积压水位；不引 metrics 框架 |
 | 调参面 | 【现状】窗口/超时为硬编码常量（88m0 收窗钉、enc8x h2 窗钉两次战役均需改码→CI→换核，约 4 小时一轮）。【规划】常量进配置：TCP SO_RCVBUF 缺省、h2 STREAM_WINDOW/max_send_buf、hyper send_buf、bridge idle（300s/1s）、握手 timeout |
@@ -51,7 +94,7 @@
 
 ### 0.4 文档冲突裁决顺序
 
-本文（宪法）> `docs/refs/` 两份治理输入（裁决书/审计的细则）> 记忆库教训（可能过时）。**任何文档与代码冲突时，以代码为准**——文档错则修文档；疑似代码 bug（文档描述才合理）只报告不改码。本宪法的【现状】条目全部带锚点，引用前先验锚点。
+本文（宪法）> `docs/refs/` 四份治理输入（v1/v2/v3 裁决书 + 分配审计的细则）> 记忆库教训（可能过时）。**任何文档与代码冲突时，以代码为准**——文档错则修文档；疑似代码 bug（文档描述才合理）只报告不改码。本宪法的【现状】条目全部带锚点，引用前先验锚点。
 
 ## 1. 骨架承诺清单
 
@@ -70,6 +113,18 @@
 | 逃生舱 | splice 准入闸、readv opt-in 是一等公民，各自挂 benchmark；不许在「统一抽象」时顺手删除 |
 
 血肉**永远不自己造**（义务边界）：① 不裸堆分配进热路径（clippy 红线，见 §6）；② 不手写 accept 循环、不自带超时/限流（现存点状 4s 补丁是债务不是范式）；③ 不 spawn 线程、不包装 executor；④ 不绕过 dispatcher 自建统计/日志通道；⑤ 不自定窗口/超时常量（用骨架默认，特殊需求走配置面【规划】）。
+
+**血肉可见五件套（v3 §7.4：§1 承诺的最终形态，正面清单冻结）**：
+
+| # | 门面 | 入口 | 对应承诺 |
+|---|---|---|---|
+| 1 | 日志门面 | `ctx.event(level, msg, fields)`——引擎 accept 时建 span，conn_id/stage/inbound_tag/target/email 自动携带；对端断开不是 ERROR（级别跟 RelayError 分类走） | P6 |
+| 2 | 事件管理器 | 生命周期=引擎预布线（血肉零动作）；S 层可 `ctx.subscribe_mgmt()` 订阅热更 | P8（§1.3） |
+| 3 | buffer 池 | `ctx.alloc()` / `ctx.scratch()` | P1 |
+| 4 | 受监督调度 | `ctx.spawn_supervised(name, fut)`——会话表登记、终局回收（s9/s10 泄漏类封死） | P3 |
+| 5 | 热调参读取 | `ctx.tuning() -> &TuningSnapshot`——只读快照+generation；写路径归 AdminHandle | P5 |
+
+**五件之外皆禁**：tokio 直用（S 层白名单例外不变）、socket、log 宏、自建 channel、全局 static、自解析配置。负面清单的执法见 §6.4 clippy 三件套；正面清单的价值：血肉开发者只知道五件套就够写协议——骨架对血肉，如同 ViewModel 对 View，是稳定接口。
 
 ### 1.2 详细——承诺三件套（现状锚点 + 规划草图 + 验收判据）
 
@@ -147,6 +202,22 @@ pub fn accept_loop<H: StreamHandshake>(listener: TcpListener, hs: H, limits: Acc
 - 现状锚点：splice 准入闸 `xray-app-dispatcher/src/default.rs:1768-1783`（Go `CanSpliceCopy` 1/2/3 语义）；readv 保持 opt-in（a07041ae 实测真网 -25%——批量化不是免费午餐）。
 - 规划：无——保留现状即承诺；任何「统一抽象」不得顺手删除，各自挂 benchmark。
 - 验收判据：readv_perf.rs 级 micro-bench 存续；splice 闸语义与 Go 对齐（PR porting note 覆盖）。
+
+### 1.3 详细——事件管理器（P8 承诺，v3 §7 追加裁决）
+
+**形态红线：预布线 + 规范封装，不做总线。总量预算 ≈ 1 个文件 ~200 行**（`ConnEventRecord` + `LifecycleTap`（有界 mpsc）+ `MgmtWatch`（watch channel）+ 一个 drain task）——超体量或出现「主题注册」字样即已越界成总线框架，砍回预布线形态。
+
+| 类 | 事件 | 通道裁决 | 背压语义 |
+|---|---|---|---|
+| T1 连接生命周期 | accept / 握手完成 / 半关闭 / 关闭（原因走 RelayError 分类） | 引擎**同步直调** filter（热路径零间接）；连接外观察者=启动期显式注册 `LifecycleTap`（有界 mpsc + 单 drain task），运行时不开放订阅。RelayFilter 不经此 | 满即丢 + 自计数 `events_dropped{tap}`，**永不反压数据泵** |
+| T2 进程管理 | 配置热更（窗口/超时新值+generation）、shutdown、stats tick | `tokio::sync::watch`（最新值胜出、天然有损）；broadcast（无回放需求）/mpsc（多订阅者要中心路由）否决 | watch 无背压问题（读端永远拿最新） |
+| T3 数据面告警 | 水位告警 / 限速触发 / rekey | **不设新通道**：量级→counter、离散→`ctx.event` 日志、连接内控制→既有 ctx 方法（`set_idle`/PauseRead） | — |
+
+- 背压三铁律：一切观察者通道**有界**；满即丢+自计数，**绝不阻塞泵**（观测不可税——splice 双 revert 教训的推广）；丢弃本身可观测（`events_dropped` 上浮告警）。慢订阅者修法=批量 drain 聚合，不是加缓冲。
+- **单一真相规则**：`on_event` 是引擎对 filter 的同步直调（连接内控制流），不是事件管理器的订阅者——一源两汇：filter 同步收到（必须快），T1 tap 异步收到轻量 `ConnEventRecord`（Copy，无 payload）。计数是第一真相（原子加，不可丢），事件是时间线补充（可丢，服务诊断）；stats **永不依赖事件消费来聚合**（事件丢弃不得污染计数）。
+- 选型总原则：**控制流不坐事件通道**——dial 完成、半关闭决策、错误处理都是引擎同步直调；通道丢事件只损失诊断信息，不损失正确性。
+- 落点：T1 预布线随 **P2.5 引擎**同批（引擎本来就在半关闭/关闭处发通知，顺手接 tap）；T2 watch 随 **P3 热调参**落地（配置热更的载体）；首批观察者=observatory、online-ip、admin 活跃连接表（隐式计数改造为显式订阅）。
+- 血肉自定义事件：**YAGNI 否决**（现状零场景 + 事件枚举类型归属悖论，v3 §7.5；再议须三判据全满足走 RFC）。血肉想「发布」什么→ `ctx.event`（日志时间线）或 counter（量级）——观测语义，两口都在五件套内。
 
 ## 2. 框架吃掉的 Rust 坑清单
 
@@ -338,12 +409,22 @@ InboundHandler::with_dispatch(Arc<dyn DispatchHandler>)   // builder 注入分�
 | handler 生命周期教训 | `xray-proxy-anytls` | §2 坑 2 事故现场与修法（start() 外移 + pending 保活） |
 | 反面教材（待 P1 收口） | `xray-transport-splithttp` | h2/Bytes 边界 to_vec 族 F1/F2/F3/F15——新协议严禁模仿，等 `from_bytes_frozen` |
 
-## 4. 皮囊契约
+## 4. ViewModel 契约
 
 ### 4.1 TL;DR
 
 **配置形态兼容承诺**：Go Xray-core 已定义的配置形态（含 v2rayN 混排 JSON、`streamSettings` 等历史形态）是**兼容承诺**：内部重构不得破坏既有配置解析。自创配置形态不进承诺；框架 API 永不领先 Go 改名。反面教材：proxyman 平行世界（建了即不接入）——皮囊对接一律走生产装配路径。
 **commander API 边界**：commander 是皮囊对骨架/血肉的管理面入口；对外 API 变更同样受 §6 转正门槛约束；皮囊不触碰血肉内部结构。
+
+**ViewModel 命名（v3 §2）**：仓库内的「对外面」= xray-conf + commander + stats + log 四个 crate 群 + 一条边界法，总称 **ViewModel**（View 绑定面的总和）。View 在仓库外（v2rayN/CLI），天然满足 View ⊥ Model；真正设防的是仓库内 VM↔M 边界。三契约：
+
+| 契约 | 冻结物 | 机械化 |
+|---|---|---|
+| ① 配置绑定（View→Model） | §4.2 封闭清单 + 归一入口签名（每血肉 crate 恰一个公开 `parse_*_config`） | golden config corpus 快照（§4.2 末） |
+| ② 状态绑定（Model→View，只读） | gRPC 端点名 / 计数名 / 日志字段名，**add-only** | 名册快照测试（§4.3 末） |
+| ③ VM 自身依赖纪律 | VM 可依赖：骨架全部、注册表句柄、血肉公开 parse 入口与只读查询 trait；不可：绕过注册表点名血肉类型、在 VM 写协议语义（解析器归一化除外——那本来就是绑定工作） | 依赖分层表（§6.4） |
+
+**组合根诚实条款**：二进制必须链接血肉 crate（物理现实：feature 门控的 dist 裁剪），允许 `use` 到**注册行**为止（`reg.outbound::<FreedomFactory>("freedom")`），禁止其他调用——**链接合法、点名构造非法**。总边界：血肉 crate 不 import commander/stats/conf 任何符号；ViewModel 不 import 血肉 Handler/Filter 类型（只经注册表拿 trait 对象）。
 
 ### 4.2 详细——v2rayN 混排形态承诺清单（逐项，锚点可验）
 
@@ -370,6 +451,8 @@ InboundHandler::with_dispatch(Arc<dyn DispatchHandler>)   // builder 注入分�
 {"dns": {"servers": ["8.8.8.8", "1.1.1.1"]}}                              // 裸字符串
 ```
 
+**v3 制度化（配置绑定契约的保障机制）**：① **golden config corpus（金样本快照）**——仓库存一组真实 v2rayN 导出配置为 fixture（§4.2 已实证形态各一条 + SS-2022 实锤样本即首批），每条断言 `parse → 归一化结构 serde 序列化 → 与快照逐字节一致`；**内核任何重构跑红 snapshot 即违规**——「内核重构零波及皮囊」的机械化形态（「+单测钉死」从单票实践升级为全协议 corpus）。② **归一入口唯一**——每血肉 crate 恰好一个公开 parse 入口，入口内做双形态分支（d0555c26 模式）；归一化之后的内部结构可自由重构、永不外溢——皮囊只见 json 方言，血肉内部只见归一类型。
+
 ### 4.3 详细——commander API 现有端点清单
 
 - **暴露形态**：gRPC（tonic）；listen 为 TCP（`127.0.0.1:port`）或 Unix socket（commander.rs:43-46）；**声明制**——`ApiConfig.services` 列举的服务才暴露（commander.rs:191-194，对齐 Go Commander.Start）。
@@ -377,6 +460,7 @@ InboundHandler::with_dispatch(Arc<dyn DispatchHandler>)   // builder 注入分�
 - **StatsService**（grpc.rs:51）、**LoggerService**（RestartLogger，grpc.rs:36-37,364-368）、**RoutingService**（TestRoute 支持 FieldSelectors 投影 / GetBalancerInfo / SubscribeRoutingStats，grpc.rs:15-17）、**ObservatoryService**（grpc.rs:57-59）。
 - **注入点**：`xray-core/src/functions.rs:364-367`（bd ze3/bg7：HandlerService 操作生产 SimpleOhm，LoggerService 接 LogInstance::restart，对齐 Go Commander.Start RequireFeatures）。
 - **变更程序**：proto 变更走 `xray-proto`；对外语义变更过 §6 转正门槛；**平行世界禁令**——proxyman crate 的平行装配不接入皮囊，皮囊只走生产路径。
+- **v3 状态绑定纪律（add-only 名册）**：计数名/端点名/日志字段名 = View 契约（`outbound>>>tag>>>traffic>>>downlink` 已被外部工具消费，default.rs:376 注释在用）——**新增随便，改名/删除永远禁止**（退役标 deprecated 留壳）。演进规则：新观测项=VM 层（stats/log）加聚合与暴露，血肉侧至多加一个 `ctx.counter()`/`ctx.event()` 调用点；**端点定义权只在 VM 层**，血肉不定义 gRPC 面。机械化：CI 枚举全部注册计数名与 gRPC 方法名 diff 快照即红（P0 扩展三件之一，T0.7）。
 
 ### 4.4 详细——皮囊兼容性变更程序
 
@@ -386,7 +470,7 @@ InboundHandler::with_dispatch(Arc<dyn DispatchHandler>)   // builder 注入分�
 
 ### 5.1 TL;DR
 
-总纪律：每阶段出口 = CI 九门 + bench 护栏非回归 + 网络面改动走**真实端点同窗配对 A/B**（localhost 测不出窗钉与网络路径回归）。护栏工具链现成：loopback 吞吐矩阵（基线 154–167MB/s）、stress.yml、xray-stress 场景 s5–s12、clippy 宽门镜像。依赖：P0 → P1 → {P2 ∥ P3} → P4；P3 的超时项依赖 P2 的 AcceptLimits 落点。
+总纪律：每阶段出口 = CI 九门 + bench 护栏非回归 + 网络面改动走**真实端点同窗配对 A/B**（localhost 测不出窗钉与网络路径回归）。护栏工具链现成：loopback 吞吐矩阵（基线 154–167MB/s）、stress.yml、xray-stress 场景 s5–s12、clippy 宽门镜像。依赖：P0 → P1 → {P2 ∥ P2.0 ∥ P3} → P2.5 → P4；**P2.0（注册表）先于 P2.5（引擎从注册表取工厂，顺序反了必返工）**；P3 的超时项依赖 P2 的 AcceptLimits 落点。
 
 | 阶段 | 交付 | 可证伪出口判据 |
 |---|---|---|
@@ -396,13 +480,18 @@ InboundHandler::with_dispatch(Arc<dyn DispatchHandler>)   // builder 注入分�
 | P3 调参 + 观测 | 窗口/超时常量进配置；relay 积压水位 + per-tag 错误计数 | 一次真实调参全程不碰 cargo；挂死演练从发现到定位 <5 分钟 |
 | P4 API 转正 | recipe 文档；API stable 标记；Go↔Rust 映射表 + PR porting note 字段 | 下一真实新协议按 recipe 落地：零框架外分配、零手写 accept |
 
+**v3 路线增补（v3 §5）**：① **P0 扩三件**廉价护栏（进 AllocGuard 同期）：dep-tier 脚本（T0.5）、golden corpus 首批（T0.6）、名册快照（T0.7）——先立执法点再动大手术，与计数分配器同级。② **P2.0 注册表改造**（新增槽位，与 P1/P2 并行——三者文件不相交：装配 wiring/outbound vs xray-buf vs transport 监听循环）：**纯代码搬家**，闸门 = 32/32 integration + golden corpus 全绿；无性能主张，**不设 A/B 闸**（不碰数据面）。③ **P2.5 RelayEngine**（v2 裁决）：DialBridge 泛化、首迁 vmess，闸门见 v2 §2.4；**T1 事件预布线随批**。④ P3 增 **T2 watch 随批**（T3.5）。vmess 首迁等 v2 迁移序列一字不变（引擎机制与 MVVM 分层正交）；AllocGuard P0 数字全部继续有效，且稳态 0 alloc/chunk 闸门兼任分层抽查（CI 冒烟对 H 层协议跑一次连接，断言除池/ctx 外零分配——验证血肉没绕开窄接口）。
+
 ### 5.2 详细——任务分解（可派单粒度）
 
-**P0 护栏先行**（4 票，内部依赖 T0.1→T0.3→T0.4）：
+**P0 护栏先行**（7 票，内部依赖 T0.1→T0.3→T0.4；T0.5–T0.7 为 v3 增补护栏，与计数分配器同期）：
 - T0.1 计数分配器：feature `bench-alloc`，全局分配器 wrapper（绕 mimalloc 统计），按 relay 方向统计 alloc 次数/字节数/MB。验收：可对任意 e2e 场景输出 alloc/MB 报告。
 - T0.2 clippy 禁令：`disallowed-methods` 清单（热路径 crate 禁 `to_vec`/裸 `Vec::new` 入池），存量命中逐个豁免注理由。验收：CI 红线生效，新增 bypass 进不来。
 - T0.3 bench 基线：loopback 吞吐矩阵 + splithttp/vision/grpc 三协议真实端点同窗配对（各 5 轮取中位）落档。
 - T0.4 三份基线报告（依赖 T0.1+T0.3）：**P0 出口 = 三份数字，没有它们后续「无回归」都是口头的**。
+- T0.5 【规划·v3】`tools/check_dep_tiers.py`（约 50 行）+ 声明式分层表白名单（§6.4）：cargo metadata 断言血肉 normal deps ⊆ 本层白名单，且 xray-proxy-*/xray-transport-* 兄弟零边；豁免走 `docs/refs/dep-tier-waivers.md`（每条带理由+复评日期）。验收：CI 红线生效，伪造依赖边进不来。
+- T0.6 【规划·v3】golden config corpus 首批：§4.2 已实证七形态各一条 + SS-2022 实锤样本，snapshot 断言逐字节一致（§4.2 末机制）。验收：内核重构跑红 snapshot 即违规的机械化落地。
+- T0.7 【规划·v3】stats/gRPC 名册快照测试：CI 枚举全部注册计数名与 gRPC 方法名 diff 快照（§4.3 末 add-only 执法）。验收：改名/删除计数名 CI 红。
 
 **P1 数据面收口**（6 票，依赖 P0；T1.3 依赖 T1.2）：
 - T1.1 `Buffer::from_bytes_frozen` + MultiBuffer 兼容（内部 enum Frozen|Pooled）。验收：hyper Bytes→relay 全程 0 拷贝（计数分配器证明）。
@@ -419,11 +508,21 @@ InboundHandler::with_dispatch(Arc<dyn DispatchHandler>)   // builder 注入分�
 - T2.4 QUIC/UDP 薄模板（复用 limits + 观测，含 open_bi 首包语义）。验收：tuic/hysteria 既有 e2e 全绿。
 - T2.5 slowloris/慢读/flood conformance 进 CI。验收：max_pending 占满时新连接排队非拒绝、超时 permit 释放、三类用例绿。
 
-**P3 调参 + 观测**（4 票，与 P2 并行；T3.1 的超时项依赖 T2.1）：
+**P2.0 注册表改造**（【规划·v3】新增槽位；与 P1/P2 并行，**先于 P2.5**）：
+- 每协议一个 PR：`build_protocol_handler`（outbound.rs:650 起）/ inbound 同型的中央 match 臂内构造逻辑**原样搬家**进 `OutboundFactory::build`（BuildCtx 显式化环境依赖：policy/dns/mux_bridges/inbound_default_rules，v3 §3.1 签名），中央文件退化为 wiring.rs 零逻辑注册行（`reg.outbound(FreedomFactory); …`——只有行，没有逻辑）。工厂 trait 双方法：`tag()`（也作 config tag）+ `build(&BuildEntry, &mut BuildCtx)`。
+- 闸门：32/32 integration + golden corpus 全绿；**无性能主张，不设 A/B 闸**（不碰数据面）。可证伪：某协议搬家 PR 超 3 天 → BuildCtx 缺环境依赖，补 BuildCtx 而非放宽注册表律。
+
+**P2.5 RelayEngine**（【规划·v2】v2 裁决 §6；依赖 P2.0）：
+- 引擎 = DialBridge 泛化（非重写）：RelayFilter 三回调（poll_decode/poll_encode/on_event）+ 五种 Action + staging 所有权交接；首迁 **vmess inbound**（最乱处：duplex 泵+UDP 泵+join 全塌缩进引擎），次 vless，再批量；硬边界：quinn/hyper/tungstenite 不 onData 化（SessionService 形态嵌入）。
+- 闸门（v2 §2.4）：32/32 integration + 计数分配器稳态 0 alloc/chunk + loopback ≥ 基线 154-167MB/s + 真实端点同窗 A/B；同一协议连续两次 A/B 回归 → 停手诊断。
+- **T1 事件预布线随批**：引擎在半关闭/关闭处发通知，顺手接 LifecycleTap（§1.3）；首批观察者=observatory、online-ip、admin 活跃连接表（隐式计数改造为显式订阅）。
+
+**P3 调参 + 观测**（5 票，与 P2 并行；T3.1 的超时项依赖 T2.1；T3.5 为 v3 增补）：
 - T3.1 常量进配置：TCP SO_RCVBUF 缺省 / h2 STREAM_WINDOW+conn 窗+max_send_buf / hyper send_buf / bridge idle（300s/1s）/ 握手 timeout。验收：enc8x 16MB 窗 @0.3s RTT 40-60MB/s 用配置复现一次。
 - T3.2 relay 积压水位（channel 深度）+ per-tag 错误计数。验收：人为制造 2087 型挂死，告警/日志 <1min 暴露。
 - T3.3 挂死演练验收：<5 分钟从发现到定位（对照 5 小时）。
 - T3.4 全流程验收：一次真实调参全程不触碰 cargo。
+- T3.5 【规划·v3】T2 事件 watch（MgmtWatch）随热调参落地：配置热更（窗口/超时新值+generation 号）的运行载体，S 层血肉可 `ctx.subscribe_mgmt()` 订阅（§1.3）。验收：热更后订阅端拿到新值+generation；旧值撕裂场景按 v3 §7.6 加 generation 校验，不改通道形态。
 
 **P4 API 转正**（3 票，依赖 P1+P2 用户落地）：
 - T4.1 recipe 文档（本 §3 的持续修订版）+ trivial 协议端到端（echo over 自定义帧按 recipe 从零实现）。验收：跑通 + 新旧写法代码量/分配次数对照表。
@@ -439,6 +538,7 @@ InboundHandler::with_dispatch(Arc<dyn DispatchHandler>)   // builder 注入分�
 3. **API 转正门槛（hard gate）**：API 标记 stable 需 ≥3 个真实协议用户 + 每个都有同窗 A/B 数字；此前一律 `pub(crate)` 或 `#[doc(hidden)]`。首批用户必须形状多样（splithttp = h2/Bytes 边界、grpc = 消息帧、kcp = UDP），防止过拟合 TCP 流式。
 4. **负优化前科铭记**（每条都发生过，勿重演）：bridge 泵 revert 378ab889；splice 双 revert d8562b56/a427613b；ReadVReader 真网 -25% a07041ae。推论：先验抽象在本仓命中率≈0；凡优化必须真实端点同窗配对 A/B。
 5. **Go diff 纪律**：镜像式框架化降低 diff（Go `common/buf` 本就存在，协议可 1:1 移植；自创式才拉大 diff）；xray-buf 维护 Go API↔Rust API 映射表；PR 模板带 porting note 字段（上游改动是否触及 buf 所有权/窗口/超时/accept 语义）。
+6. **解耦三律机械化（v3：解耦不靠自觉）**：注册表律 / 窄接口律 / 框架驱动律全部落 CI 执法（§6.4）；执法三件套 = `check_dep_tiers.py`（依赖边）+ cargo-deny（全局禁令）+ clippy disallowed（符号级）。
 
 ### 6.2 详细——操作形态
 
@@ -463,6 +563,38 @@ InboundHandler::with_dispatch(Arc<dyn DispatchHandler>)   // builder 注入分�
 
 子代理报 PASS ≠ 真 PASS（Batch16 实证：子代理只跑自加测试漏 4 处 fixture）——主代理验收必须跑全套受影响面的测试，不看子代理自报。
 
+### 6.4 详细——解耦三律机械化（v3：解耦不靠自觉）
+
+| 律 | 裁决 | 机械化形式 |
+|---|---|---|
+| 注册表律 | **显式注册函数 + config tag 选择**。inventory/linkme 静态注册否决：链接期魔法，二进制里有哪些协议不可见、dist feature 裁剪变隐式、排查链路不可 grep。工厂签名带 BuildCtx（match 臂教训：臂内嵌着构造逻辑，逻辑随臂回血肉） | wiring.rs 零逻辑注册行 + 依赖分层表 CI 断言（T0.5） |
+| 窄接口律 | **三层依赖白名单 + ConnCtx 冻结**（14 项 + 第 15 项 `tuning()`；加方法 = RFC + 三层白名单再审；永不加入：config json、registry 句柄、runtime handle、socket 类型） | check_dep_tiers.py + clippy 符号禁令 |
+| 框架驱动律 | 控制动词（改参/断连/重载）路径 = commander(gRPC) → **AdminHandle** trait（骨架实现：引擎控制面 + 热调参落点）→ 引擎执行；VM 只翻译不执行；血肉不接收控制动词 | v2 RelayFilter/SessionService 已覆盖数据面，AdminHandle 补控制通道即闭环 |
+
+三层依赖白名单（管 normal deps；dev-dependencies 豁免——表管生产不管测试）：
+
+| 层 | 覆盖 | 允许依赖 | 额外禁止 |
+|---|---|---|---|
+| H 纯逻辑（HeaderFilter） | vless/vmess/ss/trojan/http/socks/dokodemo/loopback/blackhole | std、xray-buf、xray-common、xray-crypto、xray-proto、xray-features | tokio、quinn/hyper/h2、tracing、`bytes` 直引、兄弟血肉 |
+| W 连接包装（WireCodec） | vision/xor/enc、xray-tls、xray-reality | H + tokio（default-features=false，仅 io+time）、xray-transport（trait）、rustls 系 | tokio::net、直调 tokio::spawn、tracing 直宏、兄弟血肉 |
+| S 引擎嵌入（SessionService） | quic/hysteria/tuic、splithttp/grpc、ws、kcp | W + 各自引擎（quinn/hyper/tungstenite）+ tokio（full） | 裸 listener bind、直调 tokio::spawn（用 `ctx.spawn_supervised`）、tracing 直宏、兄弟血肉 |
+| 全局（所有血肉） | — | — | mimalloc（workspace 级分配器）、tokio::process、std::thread |
+
+**执法三件套**（各司其职，不重复造轮子）：① `check_dep_tiers.py`（cargo metadata）管**依赖边**——血肉 normal deps ⊆ 本层白名单，且 xray-proxy-*/xray-transport-* 相互零边（无边即无法走私类型：Rust 的依赖图就是可见性边界）；② cargo-deny `[bans]` 管**全局禁令**（mimalloc 等）；③ clippy per-crate `disallowed_methods`（S 层禁 `tokio::spawn` 直调、H/W 层禁 `to_vec` 族）+ `disallowed_types`（血肉禁 `std::net::TcpListener`/tokio::net）+ `disallowed_macros`（血肉禁 tracing 宏）管**符号级**（依赖边查不到的宏/方法）。
+
+ConnCtx 冻结清单——血肉可见宇宙的总和（v2 §7 草图 → v3 §3.2 冻结 14 项；§7.4 追加第 15 项 `tuning()` 即该 RFC 的第一次行使，冻结纪律本身不变）：
+
+```rust
+// 观测（P4/P6）                          // 资源（P1）
+event(level, msg, fields)  counter() -> StatHandle   alloc() -> Buffer  scratch() -> &mut Scratch
+// 控制面（P2/P3）
+dial(dest, opts) -> DialTicket  wake()  /*Parked*/  set_idle(d)  spawn_supervised(name, fut) -> TaskHandle
+// 只读元数据                            // 调参（P5，v3 第 15 项）
+access: AccessContext  peer() -> SocketAddr  target() -> Option<&Destination>  now()  tuning() -> &TuningSnapshot
+```
+
+冻结规则：ConnCtx 是骨架里的**具体 struct**（不是 trait，boring 优先）；ctx 是血肉可见宇宙的总和，膨胀即耦合。可证伪翻转条件（v3 §6/§7.6）：分层表两周内豁免 >5 条 = 切层错，重新切层不堆豁免；装配行 merge 冲突单窗口 ≥3 次 = 翻转 linkme（FactoryRegistry trait 不变——机制可换、契约不动）；新协议走 RFC 加字段是正常演进，连续 ≥3 个新协议都要加才说明设计错；血肉经 watch 读热更撕裂 → TuningSnapshot 加 generation 校验，不改通道形态；T1 tap 丢弃计数常态 >0.1% → 批量 drain 聚合，不加缓冲不限泵。
+
 ## 7. 明确不做（负面清单）
 
 ### 7.1 TL;DR
@@ -484,6 +616,6 @@ InboundHandler::with_dispatch(Arc<dyn DispatchHandler>)   // builder 注入分�
 
 ---
 
-变更记录：2026-10-11 初版（138 行审定版，即本文各节 TL;DR 层），依据 oracle 裁决书 + AllocAudit 审计起草；同日增补 §2「框架吃掉的 Rust 坑清单」（所有者要求）；同日新增英文版 ARCHITECTURE.en.md（互链，双语同步纪律：中文为主，修订双记）；裁决书/审计两份治理输入迁入 `docs/refs/`（原出处 D:/tmp/，md5 一致：0692ca24…/f50019a5…）；同日按所有者要求展开详细版（≤300 行限制解除，目标 500-800 行/语种；TL;DR 层内容原样保留，§0.3/1.2/2.2/3.2-3.10/4.2-4.3/5.2/6.2/7.2 为展开层；详细度标准=未参与决策会话的协议开发者只读本文即可正确开发）。
+变更记录：2026-10-11 初版（138 行审定版，即本文各节 TL;DR 层），依据 oracle 裁决书 + AllocAudit 审计起草；同日增补 §2「框架吃掉的 Rust 坑清单」（所有者要求）；同日新增英文版 ARCHITECTURE.en.md（互链，双语同步纪律：中文为主，修订双记）；裁决书/审计两份治理输入迁入 `docs/refs/`（原出处 D:/tmp/，md5 一致：0692ca24…/f50019a5…）；同日按所有者要求展开详细版（≤300 行限制解除，目标 500-800 行/语种；TL;DR 层内容原样保留，§0.3/1.2/2.2/3.2-3.10/4.2-4.3/5.2/6.2/7.2 为展开层；详细度标准=未参与决策会话的协议开发者只读本文即可正确开发）；同日 v3 增补修订（依 oracle-framing-v3 裁决：§0 三层总图替换为 MVVM 五层全景图+三句话读法、§0.2 补连接引擎/注册表【规划】行；§1 扩「血肉可见五件套」正面清单 + 新增 §1.3 事件管理器 P8 承诺（T1/T2/T3 三通道+背压+单一真相+~200 行红线）；§4 更名 ViewModel 契约，v3 §2 三契约与组合根诚实条款并入、v2rayN 七项承诺保留为配置绑定面实证、golden corpus 与 add-only 名册两机制落地；§5 插入 P2.0 注册表改造（先于 P2.5 引擎、纯代码搬家无 A/B 闸）与 P2.5 引擎槽位、P0 扩三件护栏（T0.5-T0.7）、事件预布线随批标注（T1 随 P2.5、T2 随 P3）；§6 新增 §6.4 解耦三律机械化（三层依赖白名单+ConnCtx 冻结+执法三件套）。TL;DR 层原样保留仅增量；现状/规划标注纪律全程维持；中英双语同步双记）。
 
-治理输入出处注：`docs/refs/oracle-framing-arch.md`（FramingArch 裁决书，2026-10-11）与 `docs/refs/alloc-audit-report.md`（全仓数据面热路径内存分配审计）原出处为会话临时目录 D:/tmp/，2026-10-11 字节一致拷贝入仓（.gitignore 已加 `!docs/refs/` 例外）。
+治理输入出处注：`docs/refs/oracle-framing-arch.md`（v1 FramingArch 裁决书，2026-10-11）与 `docs/refs/alloc-audit-report.md`（全仓数据面热路径内存分配审计）原出处为会话临时目录 D:/tmp/，2026-10-11 字节一致拷贝入仓（md5：0692ca24…/f50019a5…；.gitignore 已加 `!docs/refs/` 例外）；`docs/refs/oracle-framing-v2.md`（数据面 Filter/引擎裁决）与 `docs/refs/oracle-framing-v3.md`（MVVM 增补裁决）同日自 D:/tmp/ 字节一致拷入，md5：`a3faf3bacd179effc230912dc975895c` / `174a9c38b9bfabd1be26e8f53e14a37d`。
