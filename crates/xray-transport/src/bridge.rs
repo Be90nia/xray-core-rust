@@ -1453,8 +1453,6 @@ mod tests {
     /// 照常送达 stream，桥有限时间退出。
     #[tokio::test]
     async fn bridge_stream_full_down_write_err_keeps_uplink() {
-        use std::pin::Pin;
-
         use xray_buf::{
             io::{Error as BufError, Result as BufResult, Writer},
             multi::MultiBuffer,
@@ -1465,11 +1463,13 @@ mod tests {
         /// 写恒错的 mock link.writer。
         struct ErrLinkWriter;
         impl Writer for ErrLinkWriter {
-            fn write_multi_buffer(
+            fn poll_write_multi_buffer(
                 &mut self,
-                _mb: MultiBuffer,
-            ) -> Pin<Box<dyn Future<Output = BufResult<()>> + Send + '_>> {
-                Box::pin(async { Err(BufError::WriteError("link writer broken".into())) })
+                _cx: &mut std::task::Context<'_>,
+                mb: &mut MultiBuffer,
+            ) -> std::task::Poll<BufResult<()>> {
+                mb.release();
+                std::task::Poll::Ready(Err(BufError::WriteError("link writer broken".into())))
             }
         }
 
