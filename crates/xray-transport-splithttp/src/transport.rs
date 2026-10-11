@@ -226,10 +226,11 @@ where
         .http2()
         .timer(hyper_util::rt::TokioTimer::new())
         // hyper h2 每流发送缓冲默认 400KB（DEFAULT_MAX_SEND_BUF_SIZE）——发送速率
-        // 被钉在 min(400KB, 客户端窗口)/RTT：高 BDP 路径（用户↔源站 h2 直连 150ms
-        // RTT ≈ 2.7MB/s，与公网实测个位数吻合；回环 RTT≈0 测不出）。Go 服务端无
-        // 此上限（仅受客户端窗口约束）。4MB 对齐 Go 行为。
-        .max_send_buf_size(4 * 1024 * 1024);
+        // 被钉在 min(send_buf, 客户端窗口)/RTT：400KB 时代高 BDP 路径钉 2.7MB/s；
+        // 4MB 时代 min(4MB, Go 客户端 4MB)/0.45s≈8.8MB/s（bd enc8x 窗钉模型三组
+        // 历史数字闭环）。16MB 配合客户端 16MB 流窗（dialer.rs 同批）→ 40-60MB/s。
+        // Go 服务端无此上限（仅受客户端窗口约束）。
+        .max_send_buf_size(16 * 1024 * 1024);
     // ponytail: Go hub.go:571 MaxHeaderBytes（GetNormalizedServerMaxHeaderBytes）无
     // hyper 字节级对应（仅 max_headers 条数），默认值即 Go 默认 1MiB 量级，未接入。
     let _ = builder.serve_connection(io, svc).await;
