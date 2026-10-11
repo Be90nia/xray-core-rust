@@ -5,6 +5,9 @@
 //! 2. H3Conn::connect → dial_h3_packet_up：GET 下载 + POST 上传
 //! 3. server 端验证 POST 收到字节数
 
+// 测试编译单元统一豁免（数据面分配纪律见 crate clippy.toml）
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::{
     Arc,
     atomic::{AtomicU64, AtomicUsize, Ordering},

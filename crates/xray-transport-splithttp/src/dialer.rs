@@ -89,6 +89,7 @@ pub async fn dial_packet_up(
                     break;
                 },
             };
+            #[allow(clippy::disallowed_methods)] // P1 收口点：等 Bytes 零拷贝入口（oracle §1.1-3）
             let payload = read_buf[..n].to_vec();
             let seq_str = seq.to_string();
             seq += 1;
@@ -371,6 +372,7 @@ pub async fn dial_h3_packet_up(
                     break;
                 },
             };
+            #[allow(clippy::disallowed_methods)] // P1 收口点：等 Bytes 零拷贝入口（oracle §1.1-3）
             let payload = read_buf[..n].to_vec();
             let seq_str = seq.to_string();
             seq += 1;

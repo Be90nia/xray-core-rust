@@ -194,7 +194,10 @@ impl H3Conn {
         quic_params: Option<&xray_transport::memory_settings::QuicParamsConfig>,
         sockopt: &xray_transport::sockopt::SocketOptions,
     ) -> Result<Arc<Self>> {
-        tls.alpn_protocols = vec![b"h3".to_vec()];
+        // QUIC 客户端构造期一次性 ALPN 配置（冷路径，非数据面分块拷贝）
+        #[allow(clippy::disallowed_methods)]
+        let alpn_h3 = b"h3".to_vec();
+        tls.alpn_protocols = vec![alpn_h3];
         let mut quic_cfg = quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls))
                 .map_err(|e| SplitHttpError::Hyper(format!("QuicClientConfig: {e}")))?,

@@ -1,0 +1,18 @@
+# 数据面分配纪律（oracle-framing-arch Phase 0 护栏）：禁热路径扁平化拷贝。
+# 生效范围：本 crate 生产代码；测试代码经 src/lib.rs 顶部 cfg_attr(test, allow)
+# 统一豁免（断言扁平化属测试便利）。CI 宽门 clippy -D warnings 使其成为红线。
+# 注：slice 方法路径的 root 段必须是 primitive 关键字 `slice`（clippy
+# find_primitive_impls 机制），写 alloc::slice::/std::slice:: 反而解析不到。
+#
+# 注：per-crate clippy.toml 会替换 root 配置，root 阈值键在此镜像维护。
+cognitive-complexity-threshold = 30
+type-complexity-threshold = 300
+
+# 已知未覆盖角落（后续批次补）：
+# - to_owned() / .collect::<Vec<_>>() / Vec::from(&buf[..]) 等价分配形态
+# - QUIC sniff 的 packet_buf 可变副本（算法固有，已豁免登记）
+# - Vec::new 后逐段 extend（语义上等价 to_vec，静态识别需新 lint）
+disallowed-methods = [
+    { path = "slice::to_vec", reason = "数据面禁 to_vec 扁平化堆分配：热路径用池化 Buffer/MultiBuffer 传递；确需扁平化时 #[allow(clippy::disallowed_methods)] + 理由注释登记" },
+    { path = "xray_buf::multi::MultiBuffer::to_vec", reason = "数据面禁 MultiBuffer 整链扁平化：确需快照时 #[allow] + 理由注释登记" },
+]

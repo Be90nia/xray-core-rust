@@ -1,5 +1,8 @@
 //! 切片 A 端到端集成测试：mock HTTP server + dial_packet_up。
 
+// 测试编译单元统一豁免（数据面分配纪律见 crate clippy.toml）
+#![allow(clippy::disallowed_methods)]
+
 use std::{
     sync::{
         Arc,
