@@ -321,8 +321,9 @@ impl H3Conn {
         base_uri: &str,
         session_id: &str,
         seq_str: &str,
-        payload: Vec<u8>,
+        payload: Bytes,
     ) -> Result<()> {
+        // Bytes clone = 引用计数（重放/请求构造共享同一块，不再深拷贝）
         let meta = self.config.build_packet_request_meta(
             base_uri,
             session_id,
@@ -339,7 +340,7 @@ impl H3Conn {
         drop(send_req);
 
         stream
-            .send_data(Bytes::from(payload))
+            .send_data(payload)
             .await
             .map_err(|e| SplitHttpError::Hyper(format!("h3 send_data: {e}")))?;
         stream.finish().await.map_err(|e| SplitHttpError::Hyper(format!("h3 finish: {e}")))?;

@@ -27,6 +27,9 @@ pub struct SimpleSegmentWriter<W: UnderlyingWriter> {
 
 struct Inner<W: UnderlyingWriter> {
     writer: W,
+    /// 持久序列化 scratch（Go output.go:32-35 `buffer.Clear()+Extend` 同型）：
+    /// 容量跨 segment 复用，免每 segment 一次堆分配。
+    scratch: Vec<u8>,
 }
 
 /// 底层字节写入器接口（注入到 `SimpleSegmentWriter`）。
@@ -42,7 +45,7 @@ pub trait UnderlyingWriter: Send + Sync {
 impl<W: UnderlyingWriter> SimpleSegmentWriter<W> {
     /// 构造（对应 Go `NewSegmentWriter`）。
     pub fn new(writer: W) -> Self {
-        Self { inner: Mutex::new(Inner { writer }) }
+        Self { inner: Mutex::new(Inner { writer, scratch: Vec::new() }) }
     }
 
     /// 借用底层 writer（用于 Close / 状态查询）。
@@ -54,10 +57,16 @@ impl<W: UnderlyingWriter> SimpleSegmentWriter<W> {
 
 impl<W: UnderlyingWriter> SegmentWriter for SimpleSegmentWriter<W> {
     fn write_segment(&self, seg: &dyn Segment) -> io::Result<()> {
-        let mut buf = vec![0u8; seg.byte_size()];
-        seg.serialize(&mut buf);
-        let inner = self.inner.lock();
-        inner.writer.write_all(&buf)
+        let mut inner = self.inner.lock();
+        // 持久 scratch 直写（Go output.go:32-35 buffer.Clear+Extend 同型）：
+        // 容量跨 segment 复用，serialize 覆盖全部 size 字节，尾部残留在
+        // write_all 切片之外不可见。
+        let size = seg.byte_size();
+        if inner.scratch.len() < size {
+            inner.scratch.resize(size, 0);
+        }
+        seg.serialize(&mut inner.scratch[..size]);
+        inner.writer.write_all(&inner.scratch[..size])
     }
 }
 

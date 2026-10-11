@@ -204,21 +204,26 @@ pub struct ListenerWriter {
     id: ConnectionId,
     hub: Arc<dyn UdpHub>,
     listener: Weak<Listener>,
+    /// 持久序列化 scratch（同 output.go `buffer.Clear+Extend`），容量跨 segment 复用。
+    scratch: parking_lot::Mutex<Vec<u8>>,
 }
 
 impl ListenerWriter {
     #[must_use]
     pub fn new(id: ConnectionId, hub: Arc<dyn UdpHub>, listener: Weak<Listener>) -> Self {
-        Self { id, hub, listener }
+        Self { id, hub, listener, scratch: parking_lot::Mutex::new(Vec::new()) }
     }
 }
 
 impl SegmentWriter for ListenerWriter {
     fn write_segment(&self, seg: &dyn crate::segment::Segment) -> std::io::Result<()> {
         let size = seg.byte_size();
-        let mut buf = vec![0u8; size];
-        seg.serialize(&mut buf);
-        self.hub.write_to(&buf, self.id.remote)
+        let mut scratch = self.scratch.lock();
+        if scratch.len() < size {
+            scratch.resize(size, 0);
+        }
+        seg.serialize(&mut scratch[..size]);
+        self.hub.write_to(&scratch[..size], self.id.remote)
     }
 }
 

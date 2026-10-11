@@ -325,9 +325,7 @@ where
         let mut stream = req.into_body().into_data_stream();
         let mut seq = 0u64;
         while let Ok(Some(chunk)) = stream.try_next().await {
-            // P1 收口点：h2 Bytes 边界，等 Buffer::from_bytes 零拷贝入口（oracle §1.1-3）
-            #[allow(clippy::disallowed_methods)]
-            let chunk = chunk.to_vec();
+            // hyper h2 body chunk 本就是 Bytes：零拷贝所有权直入 Packet
             if queue.push(Packet::new(chunk, seq)).await.is_err() {
                 break;
             }

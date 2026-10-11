@@ -21,15 +21,16 @@
 
 use std::{cmp::Reverse, collections::BinaryHeap};
 
+use bytes::Bytes;
 use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::error::{Result, SplitHttpError};
 
-/// 单个上传分包。对应 Go `upload_queue.Packet`。
+/// 单个上传分包。对应 Go `uploadQueue.Packet`。
 #[derive(Debug, Clone)]
 pub struct Packet {
-    /// 分包字节载荷。
-    pub payload: Vec<u8>,
+    /// 分包字节载荷（`Bytes`：hyper chunk / 客户端 freeze 块零拷贝所有权转移）。
+    pub payload: Bytes,
     /// 分包序号（从 0 开始严格递增）。
     pub seq: u64,
 }
@@ -37,8 +38,8 @@ pub struct Packet {
 impl Packet {
     /// 构造新 Packet。
     #[must_use]
-    pub fn new(payload: Vec<u8>, seq: u64) -> Self {
-        Self { payload, seq }
+    pub fn new(payload: impl Into<Bytes>, seq: u64) -> Self {
+        Self { payload: payload.into(), seq }
     }
 }
 
@@ -160,12 +161,9 @@ impl UploadQueue {
                     let n = std::cmp::min(dst.len(), packet.payload.len());
                     dst[..n].copy_from_slice(&packet.payload[..n]);
                     if n < packet.payload.len() {
-                        // 余下保留为 current，下次继续读
+                        // 余下保留为 current，下次继续读（Bytes 零拷贝切片）
                         let mut rest = packet;
-                        // 部分消费重打包：P1 收口点（等零拷贝切片入口）
-                        #[allow(clippy::disallowed_methods)]
-                        let rest_tail = rest.payload[n..].to_vec();
-                        rest.payload = rest_tail;
+                        rest.payload = rest.payload.slice(n..);
                         inner.current = Some(rest);
                     } else {
                         // 完整消费，nextSeq++

@@ -313,11 +313,9 @@ impl HttpConnection for SplitStream {
     }
 }
 
-/// 构造一次性 body（`Vec<u8>` → `Full<Bytes>` boxed）。
-fn make_full_body(b: Vec<u8>) -> ReqBody {
-    Full::new(Bytes::from(b))
-        .map_err(|e: std::convert::Infallible| -> std::io::Error { match e {} })
-        .boxed()
+/// 构造一次性 body（`Bytes` → `Full<Bytes>` boxed，零拷贝）。
+fn make_full_body(b: Bytes) -> ReqBody {
+    Full::new(b).map_err(|e: std::convert::Infallible| -> std::io::Error { match e {} }).boxed()
 }
 
 /// 空 body（GET 请求用）。
@@ -631,7 +629,7 @@ impl DefaultDialerClient {
         base_uri: &str,
         session_id: &str,
         seq_str: &str,
-        payload: Vec<u8>,
+        payload: Bytes,
     ) -> Result<()> {
         let meta = self.config.build_packet_request_meta(base_uri, session_id, seq_str, payload)?;
         match self.client.request(Self::build_request(meta.clone())?).await {
@@ -805,7 +803,7 @@ mod tests {
             uri: "https://example.com/ws/sess/0".into(),
             headers: vec![],
             cookies: vec![("k1".into(), "v1".into()), ("k2".into(), "v2".into())],
-            body: Some(b"payload".to_vec()),
+            body: Some(bytes::Bytes::from_static(b"payload")),
         };
         let req = DefaultDialerClient::build_request(meta).unwrap();
         assert_eq!(req.method(), Method::POST);
@@ -829,7 +827,7 @@ mod tests {
     #[test]
     fn make_full_body_and_empty_body_compile() {
         // 编译时验证：Full + BoxBody 类型转换正确
-        let _b1: ReqBody = make_full_body(b"hello".to_vec());
+        let _b1: ReqBody = make_full_body(bytes::Bytes::from_static(b"hello"));
         let _b2: ReqBody = empty_body();
     }
 
@@ -969,7 +967,7 @@ mod tests {
         let base = format!("https://127.0.0.1:{port}/");
         let cc = std::sync::Arc::clone(&c);
         let pp = tokio::spawn(async move {
-            cc.post_packet(&base, "sess", "0", b"hello xray".to_vec()).await
+            cc.post_packet(&base, "sess", "0", bytes::Bytes::from_static(b"hello xray")).await
         });
 
         let result = tokio::time::timeout(std::time::Duration::from_secs(10), pp)
@@ -1018,7 +1016,7 @@ mod tests {
         );
 
         let base = format!("https://127.0.0.1:{port}/");
-        let err = c.post_packet(&base, "sess", "0", b"x".to_vec()).await;
+        let err = c.post_packet(&base, "sess", "0", bytes::Bytes::from_static(b"x")).await;
         assert!(matches!(err, Err(SplitHttpError::BadStatus(503))), "{err:?}");
         server.await.expect("mock server");
     }

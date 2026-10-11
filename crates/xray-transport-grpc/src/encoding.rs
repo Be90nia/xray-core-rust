@@ -30,7 +30,13 @@
 //! - field 1, wire type 2（length-delimited），tag = `(1<<3)|2 = 0x0a`
 //! - 编码：`tag(0x0a) + varint_len(data) + data`
 
-use std::{future::Future, io::Read as _, pin::Pin, sync::Arc};
+use std::{
+    future::Future,
+    io::Read as _,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll, ready},
+};
 
 use flate2::read::GzDecoder;
 use tokio::sync::Mutex;
@@ -244,13 +250,18 @@ pub const MAX_FRAME_PAYLOAD: usize = 4 * 1024 * 1024;
 /// 编码一个完整的 gRPC frame：header + Hunk payload。
 ///
 /// 返回 `compressed(0) + BE u32 length + Hunk proto`。
+///
+/// 单次成型：header/tag/varint/payload 一次分配直写（P1 F4，替代
+/// `data.to_vec()` + `encode_to_vec()` 的两次全量拷贝三次分配）。
 #[must_use]
 pub fn encode_hunk_frame(data: &[u8]) -> Vec<u8> {
-    let payload = Hunk::new(data.to_vec()).encode_to_vec();
-    let mut out = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
+    let payload_len = 1 + varint_len(data.len()) + data.len();
+    let mut out = Vec::with_capacity(FRAME_HEADER_LEN + payload_len);
     out.push(0u8); // compressed = false
-    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    out.extend_from_slice(&payload);
+    out.extend_from_slice(&(payload_len as u32).to_be_bytes());
+    out.push(HUNK_TAG);
+    encode_varint(&mut out, data.len() as u64);
+    out.extend_from_slice(data);
     out
 }
 
@@ -267,6 +278,46 @@ pub fn decode_hunk_frame(
     buf: &[u8],
     encoding: Option<CompressionEncoding>,
 ) -> Result<Option<(usize, Vec<u8>)>> {
+    Ok(decode_hunk_frame_ref(buf, encoding)?.map(|(used, data)| (used, data.into_owned())))
+}
+
+/// [`decode_hunk_frame`] 的数据载荷形态：未压缩帧借用输入缓冲（热路径零拷贝），
+/// 压缩帧持有解压产物。
+pub enum HunkData<'a> {
+    /// 直接借用输入缓冲（未压缩帧）。
+    Borrowed(&'a [u8]),
+    /// 压缩帧解压产物。
+    Owned(Vec<u8>),
+}
+
+impl HunkData<'_> {
+    /// 载荷字节切片。
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            HunkData::Borrowed(s) => s,
+            HunkData::Owned(v) => v,
+        }
+    }
+
+    /// 转为所有权载荷（未压缩帧拷贝一次）。
+    #[must_use]
+    pub fn into_owned(self) -> Vec<u8> {
+        match self {
+            HunkData::Borrowed(s) => s.to_vec(),
+            HunkData::Owned(v) => v,
+        }
+    }
+}
+
+/// [`decode_hunk_frame`] 的借用变体（P1 F5）：未压缩帧以 `HunkData::Borrowed`
+/// 返回 buf 内数据切片，直写下游免中间 `to_vec` 两连拷；wire 校验与错误
+/// 信息同 [`decode_hunk_frame`] 逐字一致（旧 fn 已委托本 fn，roundtrip 测试
+/// 护栏共享）。
+pub fn decode_hunk_frame_ref<'a>(
+    buf: &'a [u8],
+    encoding: Option<CompressionEncoding>,
+) -> Result<Option<(usize, HunkData<'a>)>> {
     if buf.len() < FRAME_HEADER_LEN {
         return Ok(None);
     }
@@ -284,32 +335,60 @@ pub fn decode_hunk_frame(
         return Ok(None);
     }
     let raw_payload = &buf[FRAME_HEADER_LEN..frame_end];
-    let payload = if compressed != 0 {
+    let data = if compressed != 0 {
         let enc = encoding.ok_or_else(|| {
             GrpcError::Decompression(
                 "grpc frame: compressed flag set but no grpc-encoding header".into(),
             )
         })?;
-        decompress_payload(raw_payload, enc)?
+        let payload = decompress_payload(raw_payload, enc)?;
+        HunkData::Owned(Hunk::decode(&payload)?.data)
     } else {
-        raw_payload.to_vec()
+        // Hunk::decode 的借用化：tag/varint/range 校验，切片零拷贝
+        if raw_payload.is_empty() {
+            return Err(GrpcError::InvalidConfig("hunk proto: empty buffer".into()));
+        }
+        if raw_payload[0] != HUNK_TAG {
+            return Err(GrpcError::InvalidConfig(format!(
+                "hunk proto: tag mismatch (expected 0x{:02x}, got 0x{:02x})",
+                HUNK_TAG, raw_payload[0]
+            )));
+        }
+        let (len, consumed) = decode_varint(&raw_payload[1..])
+            .ok_or_else(|| GrpcError::InvalidConfig("hunk proto: truncated varint".into()))?;
+        let data_start = 1 + consumed;
+        let data_end = data_start
+            .checked_add(len as usize)
+            .ok_or_else(|| GrpcError::InvalidConfig("hunk proto: length overflow".into()))?;
+        if data_end > raw_payload.len() {
+            return Err(GrpcError::InvalidConfig(format!(
+                "hunk proto: data truncated (need {len} bytes, have {})",
+                raw_payload.len() - data_start
+            )));
+        }
+        HunkData::Borrowed(&buf[FRAME_HEADER_LEN + data_start..FRAME_HEADER_LEN + data_end])
     };
-    let hunk = Hunk::decode(&payload)?;
-    Ok(Some((frame_end, hunk.data)))
+    Ok(Some((frame_end, data)))
 }
 
 /// 编码一个完整的 gRPC frame：header + MultiHunk payload。
 ///
 /// 返回 `compressed(0) + BE u32 length + MultiHunk proto`。
 /// 对应 TunMulti RPC 的发送端。
+///
+/// 单次成型：逐 chunk tag/varint/内容一次分配直写（P1 F4），不再经
+/// `Vec<Vec<u8>>` 中转（每 chunk 一次 to_vec 拷贝）。
 #[must_use]
 pub fn encode_multi_hunk_frame(chunks: &[&[u8]]) -> Vec<u8> {
-    let mh = MultiHunk::new(chunks.iter().map(|c| c.to_vec()).collect());
-    let payload = mh.encode_to_vec();
-    let mut out = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
+    let payload_len: usize = chunks.iter().map(|c| 1 + varint_len(c.len()) + c.len()).sum();
+    let mut out = Vec::with_capacity(FRAME_HEADER_LEN + payload_len);
     out.push(0u8); // compressed = false
-    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    out.extend_from_slice(&payload);
+    out.extend_from_slice(&(payload_len as u32).to_be_bytes());
+    for chunk in chunks {
+        out.push(HUNK_TAG);
+        encode_varint(&mut out, chunk.len() as u64);
+        out.extend_from_slice(chunk);
+    }
     out
 }
 
@@ -325,6 +404,17 @@ pub fn decode_multi_hunk_frame(
     buf: &[u8],
     encoding: Option<CompressionEncoding>,
 ) -> Result<Option<(usize, Vec<Vec<u8>>)>> {
+    Ok(decode_multi_hunk_frame_ref(buf, encoding)?
+        .map(|(used, datas)| (used, datas.into_iter().map(HunkData::into_owned).collect())))
+}
+
+/// [`decode_multi_hunk_frame`] 的借用变体（P1 F5）：未压缩帧每个 hunk 以
+/// `HunkData::Borrowed` 返回 buf 内切片，直写下游免 `to_vec` 多连拷；wire
+/// 校验与错误信息同旧 fn 逐字一致（旧 fn 已委托本 fn）。
+pub fn decode_multi_hunk_frame_ref<'a>(
+    buf: &'a [u8],
+    encoding: Option<CompressionEncoding>,
+) -> Result<Option<(usize, Vec<HunkData<'a>>)>> {
     if buf.len() < FRAME_HEADER_LEN {
         return Ok(None);
     }
@@ -342,18 +432,45 @@ pub fn decode_multi_hunk_frame(
         return Ok(None);
     }
     let raw_payload = &buf[FRAME_HEADER_LEN..frame_end];
-    let payload = if compressed != 0 {
+    let datas = if compressed != 0 {
         let enc = encoding.ok_or_else(|| {
             GrpcError::Decompression(
                 "grpc frame: compressed flag set but no grpc-encoding header".into(),
             )
         })?;
-        decompress_payload(raw_payload, enc)?
+        let payload = decompress_payload(raw_payload, enc)?;
+        MultiHunk::decode(&payload)?.data.into_iter().map(HunkData::Owned).collect()
     } else {
-        raw_payload.to_vec()
+        let mut datas = Vec::new();
+        let mut pos = 0;
+        while pos < raw_payload.len() {
+            if raw_payload[pos] != HUNK_TAG {
+                return Err(GrpcError::InvalidConfig(format!(
+                    "multi_hunk proto: tag mismatch at offset {pos} (expected 0x{:02x}, got 0x{:02x})",
+                    HUNK_TAG, raw_payload[pos]
+                )));
+            }
+            let (len, consumed) = decode_varint(&raw_payload[pos + 1..]).ok_or_else(|| {
+                GrpcError::InvalidConfig("multi_hunk proto: truncated varint".into())
+            })?;
+            let data_start = pos + 1 + consumed;
+            let data_end = data_start.checked_add(len as usize).ok_or_else(|| {
+                GrpcError::InvalidConfig("multi_hunk proto: length overflow".into())
+            })?;
+            if data_end > raw_payload.len() {
+                return Err(GrpcError::InvalidConfig(format!(
+                    "multi_hunk proto: data truncated at offset {pos} (need {len} bytes, have {})",
+                    raw_payload.len() - data_start
+                )));
+            }
+            datas.push(HunkData::Borrowed(
+                &buf[FRAME_HEADER_LEN + data_start..FRAME_HEADER_LEN + data_end],
+            ));
+            pos = data_end;
+        }
+        datas
     };
-    let mh = MultiHunk::decode(&payload)?;
-    Ok(Some((frame_end, mh.data)))
+    Ok(Some((frame_end, datas)))
 }
 
 // ============================================================================
@@ -448,8 +565,8 @@ impl<S: HunkStream + 'static> HunkReaderWriter<S> {
     #[must_use]
     pub fn into_parts(self) -> (HunkReader<S>, HunkWriter<S>) {
         (
-            HunkReader { stream: Arc::clone(&self.stream), buf: Vec::new() },
-            HunkWriter { stream: self.stream },
+            HunkReader { stream: Arc::clone(&self.stream), buf: Vec::new(), recv_fut: None },
+            HunkWriter { stream: self.stream, send_fut: None },
         )
     }
 }
@@ -458,58 +575,70 @@ impl<S: HunkStream + 'static> HunkReaderWriter<S> {
 pub struct HunkReader<S: HunkStream> {
     stream: Arc<Mutex<S>>,
     buf: Vec<u8>,
+    /// poll 读的在途 recv（Arc 搬移构造，不借用 self；每调用 1 box 同旧形态）。
+    recv_fut: Option<Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send>>>,
 }
 
 /// HunkStream 适配的 Writer 端。
 pub struct HunkWriter<S: HunkStream> {
     stream: Arc<Mutex<S>>,
+    /// poll 写的在途 send（同上）。
+    send_fut: Option<Pin<Box<dyn Future<Output = Result<()>> + Send>>>,
 }
 
 impl<S: HunkStream + 'static> Reader for HunkReader<S> {
-    fn read_multi_buffer(
+    fn poll_read_multi_buffer(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = xray_buf::io::Result<MultiBuffer>> + Send + '_>> {
-        Box::pin(async move {
+        cx: &mut Context<'_>,
+    ) -> Poll<xray_buf::io::Result<MultiBuffer>> {
+        {
             // ponytail: &mut self 直接 mutate buf，buf 空时从 stream recv 一个 hunk
             if self.buf.is_empty() {
-                let data = {
-                    let mut stream = self.stream.lock().await;
-                    stream
-                        .recv_hunk()
-                        .await
-                        .map_err(|e| xray_buf::io::Error::ReadError(format!("{e}")))?
-                };
+                if self.recv_fut.is_none() {
+                    let stream = Arc::clone(&self.stream);
+                    self.recv_fut = Some(Box::pin(async move {
+                        let mut s = stream.lock().await;
+                        s.recv_hunk().await
+                    }));
+                }
+                let data = ready!(self.recv_fut.as_mut().unwrap().as_mut().poll(cx))
+                    .map_err(|e| xray_buf::io::Error::ReadError(format!("{e}")))?;
+                self.recv_fut = None;
                 self.buf.extend_from_slice(&data);
             }
             // 取出所有缓存数据一次性返回（对应 Go ReadMultiBuffer 行为）
             let data = std::mem::take(&mut self.buf);
             if data.is_empty() {
                 // 兜底：stream 返空 data，构造空 MultiBuffer
-                return Ok(MultiBuffer::new());
+                return Poll::Ready(Ok(MultiBuffer::new()));
             }
-            Ok(MultiBuffer::from_buffer(xray_buf::buffer::Buffer::from_vec(data)))
-        })
+            Poll::Ready(Ok(MultiBuffer::from_buffer(xray_buf::buffer::Buffer::from_vec(data))))
+        }
     }
 }
 
 impl<S: HunkStream + 'static> Writer for HunkWriter<S> {
-    fn write_multi_buffer(
+    fn poll_write_multi_buffer(
         &mut self,
-        mb: MultiBuffer,
-    ) -> Pin<Box<dyn Future<Output = xray_buf::io::Result<()>> + Send + '_>> {
-        Box::pin(async move {
+        cx: &mut Context<'_>,
+        mb: &mut MultiBuffer,
+    ) -> Poll<xray_buf::io::Result<()>> {
+        if self.send_fut.is_none() {
             // 把 MultiBuffer 拼成单个 Vec 一次性发出（对齐 Go Write 行为）
             let mut payload: Vec<u8> = Vec::with_capacity(mb.len());
-            for buf in mb.into_buffers() {
+            for buf in mb.iter_mut() {
                 payload.extend_from_slice(buf.bytes());
             }
-            let mut stream = self.stream.lock().await;
-            stream
-                .send_hunk(payload)
-                .await
-                .map_err(|e| xray_buf::io::Error::WriteError(format!("{e}")))?;
-            Ok(())
-        })
+            mb.release();
+            let stream = Arc::clone(&self.stream);
+            self.send_fut = Some(Box::pin(async move {
+                let mut s = stream.lock().await;
+                s.send_hunk(payload).await
+            }));
+        }
+        let result = ready!(self.send_fut.as_mut().unwrap().as_mut().poll(cx));
+        self.send_fut = None;
+        Poll::Ready(result.map_err(|e| xray_buf::io::Error::WriteError(format!("{e}"))))
     }
 }
 
@@ -539,8 +668,13 @@ impl<S: HunkStream + 'static> MultiHunkReaderWriter<S> {
     #[must_use]
     pub fn into_parts(self) -> (MultiHunkReader<S>, MultiHunkWriter<S>) {
         (
-            MultiHunkReader { stream: Arc::clone(&self.stream), pending: Vec::new(), pos: 0 },
-            MultiHunkWriter { stream: self.stream },
+            MultiHunkReader {
+                stream: Arc::clone(&self.stream),
+                pending: Vec::new(),
+                pos: 0,
+                recv_fut: None,
+            },
+            MultiHunkWriter { stream: self.stream, send_fut: None },
         )
     }
 }
@@ -552,70 +686,83 @@ pub struct MultiHunkReader<S: HunkStream> {
     pending: Vec<Vec<u8>>,
     /// 当前 pending 中的消费位置。
     pos: usize,
+    /// poll 读的在途 recv（同 HunkReader）。
+    recv_fut: Option<Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send>>>,
 }
 
 /// MultiHunk 适配的 Writer 端。
 pub struct MultiHunkWriter<S: HunkStream> {
     stream: Arc<Mutex<S>>,
+    /// poll 写的在途 send（同 HunkWriter）。
+    send_fut: Option<Pin<Box<dyn Future<Output = Result<()>> + Send>>>,
 }
 
 impl<S: HunkStream + 'static> Reader for MultiHunkReader<S> {
-    fn read_multi_buffer(
+    fn poll_read_multi_buffer(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = xray_buf::io::Result<MultiBuffer>> + Send + '_>> {
-        Box::pin(async move {
-            // 如果 pending 有未消费的 chunks，先返回它们
-            if self.pos < self.pending.len() {
-                let chunks: Vec<Vec<u8>> = self.pending.drain(self.pos..).collect();
-                self.pos = 0;
-                self.pending.clear();
-                let buffers: Vec<xray_buf::buffer::Buffer> =
-                    chunks.into_iter().map(xray_buf::buffer::Buffer::from_vec).collect();
-                return Ok(MultiBuffer::from_buffers(buffers));
-            }
-            // pending 空，从 stream recv 一个 hunk 并 decode 为 MultiHunk
+        cx: &mut Context<'_>,
+    ) -> Poll<xray_buf::io::Result<MultiBuffer>> {
+        // 如果 pending 有未消费的 chunks，先返回它们
+        if self.pos < self.pending.len() {
+            let chunks: Vec<Vec<u8>> = self.pending.drain(self.pos..).collect();
+            self.pos = 0;
+            self.pending.clear();
+            let buffers: Vec<xray_buf::buffer::Buffer> =
+                chunks.into_iter().map(xray_buf::buffer::Buffer::from_vec).collect();
+            return Poll::Ready(Ok(MultiBuffer::from_buffers(buffers)));
+        }
+        // pending 空，从 stream recv 一个 hunk 并 decode 为 MultiHunk
+        if self.recv_fut.is_none() {
             self.pending.clear();
             self.pos = 0;
-            let raw = {
-                let mut stream = self.stream.lock().await;
-                stream
-                    .recv_hunk()
-                    .await
-                    .map_err(|e| xray_buf::io::Error::ReadError(format!("{e}")))?
-            };
-            // HunkStream.recv_hunk 返回已解 frame + Hunk proto 的 data 字段
-            // 在 TunMulti 模式下，这个 data 实际上是 MultiHunk 的 repeated bytes 编码
-            let mh = MultiHunk::decode(&raw)
-                .map_err(|e| xray_buf::io::Error::ReadError(format!("multi_hunk decode: {e}")))?;
-            if mh.data.is_empty() {
-                return Ok(MultiBuffer::new());
-            }
-            let buffers: Vec<xray_buf::buffer::Buffer> =
-                mh.data.into_iter().map(xray_buf::buffer::Buffer::from_vec).collect();
-            Ok(MultiBuffer::from_buffers(buffers))
-        })
+            let stream = Arc::clone(&self.stream);
+            self.recv_fut = Some(Box::pin(async move {
+                let mut s = stream.lock().await;
+                s.recv_hunk().await
+            }));
+        }
+        let raw = ready!(self.recv_fut.as_mut().unwrap().as_mut().poll(cx))
+            .map_err(|e| xray_buf::io::Error::ReadError(format!("{e}")))?;
+        self.recv_fut = None;
+        // HunkStream.recv_hunk 返回已解 frame + Hunk proto 的 data 字段
+        // 在 TunMulti 模式下，这个 data 实际上是 MultiHunk 的 repeated bytes 编码
+        let mh = MultiHunk::decode(&raw)
+            .map_err(|e| xray_buf::io::Error::ReadError(format!("multi_hunk decode: {e}")))?;
+        if mh.data.is_empty() {
+            return Poll::Ready(Ok(MultiBuffer::new()));
+        }
+        let buffers: Vec<xray_buf::buffer::Buffer> =
+            mh.data.into_iter().map(xray_buf::buffer::Buffer::from_vec).collect();
+        Poll::Ready(Ok(MultiBuffer::from_buffers(buffers)))
     }
 }
 
 impl<S: HunkStream + 'static> Writer for MultiHunkWriter<S> {
-    fn write_multi_buffer(
+    fn poll_write_multi_buffer(
         &mut self,
-        mb: MultiBuffer,
-    ) -> Pin<Box<dyn Future<Output = xray_buf::io::Result<()>> + Send + '_>> {
-        Box::pin(async move {
+        cx: &mut Context<'_>,
+        mb: &mut MultiBuffer,
+    ) -> Poll<xray_buf::io::Result<()>> {
+        if self.send_fut.is_none() {
             // 把 MultiBuffer 的每个 Buffer 作为 MultiHunk 的一个 repeated bytes 元素
             // send_hunk 发送的是 proto payload（不含 frame 头），HunkStream 实现者加 frame 头
             let mh = MultiHunk::new(
-                mb.into_buffers().into_iter().map(|b| b.into_bytes().to_vec()).collect(),
+                std::mem::take(mb)
+                    .into_buffers()
+                    .into_iter()
+                    .map(|b| b.into_bytes().to_vec())
+                    .collect(),
             );
             let payload = mh.encode_to_vec();
-            let mut stream = self.stream.lock().await;
-            stream
-                .send_hunk(payload)
-                .await
-                .map_err(|e| xray_buf::io::Error::WriteError(format!("{e}")))?;
-            Ok(())
-        })
+            let stream = Arc::clone(&self.stream);
+            self.send_fut = Some(Box::pin(async move {
+                let mut s = stream.lock().await;
+                s.send_hunk(payload).await
+            }));
+        }
+        let result = ready!(self.send_fut.as_mut().unwrap().as_mut().poll(cx));
+        self.send_fut = None;
+        Poll::Ready(result.map_err(|e| xray_buf::io::Error::WriteError(format!("{e}"))))
     }
 }
 
