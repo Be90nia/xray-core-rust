@@ -3,15 +3,15 @@
 //! 对应 Go 版本 `common/buf/reader.go`，提供 SingleReader、PacketReader 和 BufferedReader。
 
 use std::{
-    future::Future,
     pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    task::{Context, Poll},
 };
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::{
     buffer::Buffer,
@@ -37,28 +37,30 @@ impl SingleReader {
 }
 
 impl Reader for SingleReader {
-    fn read_multi_buffer(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<MultiBuffer>> + Send + '_>> {
-        Box::pin(async move {
-            let mut buf = Buffer::new();
-            let writable = buf.writable_bytes();
-            match self.inner.read(writable).await {
-                Ok(0) => {
+    fn poll_read_multi_buffer(&mut self, cx: &mut Context<'_>) -> Poll<Result<MultiBuffer>> {
+        let mut buf = Buffer::new();
+        let n = {
+            let mut rb = ReadBuf::new(buf.writable_bytes());
+            match Pin::new(&mut *self.inner).poll_read(cx, &mut rb) {
+                Poll::Ready(Ok(())) => rb.filled().len(),
+                Poll::Ready(Err(e)) => {
                     buf.release();
-                    Ok(MultiBuffer::new())
+                    return Poll::Ready(Err(io::classify_io_error(e, true)));
                 },
-                Ok(n) => {
-                    buf.advance_write(n);
-                    tracing::trace!(bytes = n, "SingleReader 读取");
-                    Ok(MultiBuffer::from_buffer(buf))
-                },
-                Err(e) => {
+                Poll::Pending => {
+                    // rb 借用随块尾结束（NLL），块尾 buf 先释放回池再返回
                     buf.release();
-                    Err(io::classify_io_error(e, true))
+                    return Poll::Pending;
                 },
             }
-        })
+        };
+        if n == 0 {
+            buf.release();
+            return Poll::Ready(Ok(MultiBuffer::new()));
+        }
+        buf.advance_write(n);
+        tracing::trace!(bytes = n, "SingleReader 读取");
+        Poll::Ready(Ok(MultiBuffer::from_buffer(buf)))
     }
 }
 
@@ -67,7 +69,7 @@ impl Reader for SingleReader {
 /// UDP 包语义读取器
 ///
 /// 对应 Go 的 `PacketReader`，模拟 UDP 数据包读取行为。
-/// 读取时跳过空数据包（最多重试 64 次），确保返回非空数据。
+/// 读到 0 字节按 EOF 约定返回空 MultiBuffer。
 pub struct PacketReader {
     inner: Box<dyn AsyncRead + Unpin + Send>,
 }
@@ -80,38 +82,29 @@ impl PacketReader {
 }
 
 impl Reader for PacketReader {
-    fn read_multi_buffer(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<MultiBuffer>> + Send + '_>> {
-        Box::pin(async move {
-            const MAX_RETRIES: usize = 64;
-
-            for _ in 0..MAX_RETRIES {
-                let mut buf = Buffer::new();
-                let writable = buf.writable_bytes();
-                match self.inner.read(writable).await {
-                    Ok(0) => {
-                        buf.release();
-                        return Ok(MultiBuffer::new());
-                    },
-                    Ok(n) => {
-                        if n == 0 {
-                            buf.release();
-                            continue;
-                        }
-                        buf.advance_write(n);
-                        tracing::trace!(bytes = n, "PacketReader 读取");
-                        return Ok(MultiBuffer::from_buffer(buf));
-                    },
-                    Err(e) => {
-                        buf.release();
-                        return Err(io::classify_io_error(e, true));
-                    },
-                }
+    fn poll_read_multi_buffer(&mut self, cx: &mut Context<'_>) -> Poll<Result<MultiBuffer>> {
+        let mut buf = Buffer::new();
+        let n = {
+            let mut rb = ReadBuf::new(buf.writable_bytes());
+            match Pin::new(&mut *self.inner).poll_read(cx, &mut rb) {
+                Poll::Ready(Ok(())) => rb.filled().len(),
+                Poll::Ready(Err(e)) => {
+                    buf.release();
+                    return Poll::Ready(Err(io::classify_io_error(e, true)));
+                },
+                Poll::Pending => {
+                    buf.release();
+                    return Poll::Pending;
+                },
             }
-
-            Ok(MultiBuffer::new())
-        })
+        };
+        if n == 0 {
+            buf.release();
+            return Poll::Ready(Ok(MultiBuffer::new()));
+        }
+        buf.advance_write(n);
+        tracing::trace!(bytes = n, "PacketReader 读取");
+        Poll::Ready(Ok(MultiBuffer::from_buffer(buf)))
     }
 }
 
@@ -157,21 +150,27 @@ impl BufferedReader {
         }
     }
 
-    /// 读取 MultiBuffer（内部实现）
-    ///
-    /// 优先返回缓存数据，缓存为空时从底层 Reader 读取。
-    async fn read_multi_buffer_impl(&mut self) -> Result<MultiBuffer> {
-        if self.interrupted.load(Ordering::Relaxed) {
-            return Err(io::Error::Interrupted);
+    /// [`BufferedReader::read`] 的 poll 形态（poll 状态机驱动用，行为一致）。
+    pub fn poll_read(&mut self, dst: &mut [u8], cx: &mut Context<'_>) -> Poll<usize> {
+        if dst.is_empty() {
+            return Poll::Ready(0);
         }
 
         if !self.buffer.is_empty() {
-            let len = self.buffer.len();
-            let result = self.buffer.split_bytes(len);
-            return Ok(result);
+            return Poll::Ready(self.buffer.read_to(dst));
         }
 
-        self.reader.read_multi_buffer().await
+        match self.reader.poll_read_multi_buffer(cx) {
+            Poll::Ready(Ok(mb)) => {
+                if mb.is_empty() {
+                    return Poll::Ready(0);
+                }
+                self.buffer.merge(mb);
+                Poll::Ready(self.buffer.read_to(dst))
+            },
+            Poll::Ready(Err(_)) => Poll::Ready(0),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     /// 读取最多 size 字节
@@ -208,7 +207,7 @@ impl BufferedReader {
         if !self.buffer.is_empty() {
             let len = self.buffer.len();
             let mb = self.buffer.split_bytes(len);
-            writer.write_multi_buffer(mb).await?;
+            crate::io::write_mb(writer, mb).await?;
         }
         Ok(())
     }
@@ -232,10 +231,17 @@ impl BufferedReader {
 }
 
 impl Reader for BufferedReader {
-    fn read_multi_buffer(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<MultiBuffer>> + Send + '_>> {
-        Box::pin(async move { self.read_multi_buffer_impl().await })
+    fn poll_read_multi_buffer(&mut self, cx: &mut Context<'_>) -> Poll<Result<MultiBuffer>> {
+        if self.interrupted.load(Ordering::Relaxed) {
+            return Poll::Ready(Err(io::Error::Interrupted));
+        }
+
+        if !self.buffer.is_empty() {
+            let len = self.buffer.len();
+            return Poll::Ready(Ok(self.buffer.split_bytes(len)));
+        }
+
+        self.reader.poll_read_multi_buffer(cx)
     }
 }
 

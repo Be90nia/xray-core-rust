@@ -1,23 +1,32 @@
 //! 核心 Buffer 结构
 //!
 //! 对应 Go 版本 `common/buf.Buffer`，封装 `BytesMut` 并维护读写游标。
-//! Buffer 是单所有权的（Rust 所有权系统天然保证），不需要 Go 中的 ownership enum。
+//! Buffer 是单所有权的（Rust 所有权系统天然保证）；
+//! [`Buffer::from_bytes_frozen`] 补回 Go ownership enum 的只读形态
+//! （oracle v1 §2.2-3）：外部 `Bytes` 零拷贝进入 relay，Drop 不回池。
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 
 use crate::alloc;
 
-/// 核心缓冲区，封装 `BytesMut` 并维护读写游标。
+/// Buffer 内部存储双态。
+enum Inner {
+    /// 池化管理：Drop / release 归还分配池。
+    Pooled(BytesMut),
+    /// 外部所有权冻结只读（hyper/h2 chunk 经 [`Buffer::from_bytes_frozen`] 进入）。
+    /// 非池来源：Drop 直接释放。首次可变访问写时复制（引用计数唯一则零拷贝转正）。
+    Frozen(Bytes),
+}
+
+/// 核心缓冲区，封装 `BytesMut`（或冻结 `Bytes`）并维护读写游标。
 ///
 /// - `start`: 读游标（已读数据起始位置）
 /// - `end`: 写游标（已写数据结束位置）
 ///
 /// 有效数据范围: `inner[start..end]`
-///
-/// 对应 Go 版本的 `buf.Buffer`，但利用 Rust 所有权系统消除了 Go 的 ownership 枚举。
 #[must_use = "Buffer 持有池化内存，丢弃前应调用 release() 或让 Drop 自动回收"]
 pub struct Buffer {
-    inner: BytesMut,
+    inner: Inner,
     start: usize,
     end: usize,
     /// UDP 目的地覆盖，对应 Go `buf.Buffer.UDP`。
@@ -34,7 +43,7 @@ impl Buffer {
     /// 对应 Go 的 `New()` 构造函数。
     pub fn new() -> Self {
         let inner = alloc::alloc(alloc::DEFAULT_SIZE);
-        Self { inner, start: 0, end: 0, udp: None }
+        Self { inner: Inner::Pooled(inner), start: 0, end: 0, udp: None }
     }
 
     /// 分配指定大小的缓冲区（直接分配，不经过池）。
@@ -43,7 +52,7 @@ impl Buffer {
     /// 如需池化分配，使用 [`Buffer::new()`]。
     pub fn with_capacity(size: usize) -> Self {
         let inner = BytesMut::with_capacity(size);
-        Self { inner, start: 0, end: 0, udp: None }
+        Self { inner: Inner::Pooled(inner), start: 0, end: 0, udp: None }
     }
 
     /// 从外部数据构造缓冲区（非池化管理）。
@@ -53,7 +62,20 @@ impl Buffer {
     pub fn from_bytes(data: impl Into<BytesMut>) -> Self {
         let inner = data.into();
         let end = inner.len();
-        Self { inner, start: 0, end, udp: None }
+        Self { inner: Inner::Pooled(inner), start: 0, end, udp: None }
+    }
+
+    /// 持有外部 `Bytes`（零拷贝只读入口，所有权转移 freeze）。
+    ///
+    /// 对应 Go ownership enum 的只读形态（oracle v1 §2.2-3）：hyper/h2 产出的
+    /// `Bytes` 无拷贝进入 Buffer/MultiBuffer relay。语义要点：
+    /// - **所有权转移**：`Bytes` move 进 Buffer，全程零拷贝；
+    /// - **Drop 不回池**：frozen 来源非池，Drop 直接释放（与池化路径的关口）；
+    /// - 需要可变访问（`as_mut`/写路径）时写时复制：引用计数唯一则 零拷贝转正，共享（如
+    ///   `BytesMut::split_to().freeze()` 的姊妹份 仍存活）才真实拷贝。
+    pub fn from_bytes_frozen(data: Bytes) -> Self {
+        let end = data.len();
+        Self { inner: Inner::Frozen(data), start: 0, end, udp: None }
     }
 
     /// 从 Vec 构造缓冲区。
@@ -61,7 +83,31 @@ impl Buffer {
         let len = data.len();
         let mut inner = BytesMut::with_capacity(len);
         inner.extend_from_slice(&data);
-        Self { inner, start: 0, end: len, udp: None }
+        Self { inner: Inner::Pooled(inner), start: 0, end: len, udp: None }
+    }
+
+    /// 写路径统一入口：`Frozen` → `Pooled` 写时复制（COW）。
+    ///
+    /// frozen 是非池只读所有权，首次可变访问转正为普通 `BytesMut`；
+    /// 引用计数唯一走 `try_into_mut` 零拷贝，共享才真实拷贝——永不 panic，
+    /// 只读 relay 热路径（`bytes()`/`advance`/`split_to`）完全不经过这里。
+    fn pooled_mut(&mut self) -> &mut BytesMut {
+        if let Inner::Frozen(data) = &mut self.inner {
+            let owned = std::mem::take(data);
+            let converted = match owned.try_into_mut() {
+                Ok(vec) => vec,
+                Err(shared) => {
+                    let mut m = BytesMut::with_capacity(shared.len());
+                    m.extend_from_slice(&shared);
+                    m
+                },
+            };
+            self.inner = Inner::Pooled(converted);
+        }
+        match &mut self.inner {
+            Inner::Pooled(m) => m,
+            Inner::Frozen(_) => unreachable!("上一分支已转正"),
+        }
     }
 
     // ========== 读操作 ==========
@@ -85,7 +131,10 @@ impl Buffer {
     /// 对应 Go 的 `Buffer.Bytes()`。
     #[inline]
     pub fn bytes(&self) -> &[u8] {
-        &self.inner[self.start..self.end]
+        match &self.inner {
+            Inner::Pooled(m) => &m[self.start..self.end],
+            Inner::Frozen(b) => &b[self.start..self.end],
+        }
     }
 
     /// 返回索引 `index` 处的字节（相对于未读数据起始位置）。
@@ -97,7 +146,7 @@ impl Buffer {
     #[inline]
     pub fn byte(&self, index: usize) -> u8 {
         assert!(index < self.len(), "byte index {index} 超过未读数据长度 {}", self.len());
-        self.inner[self.start + index]
+        self.bytes()[index]
     }
 
     /// 设置索引 `index` 处的字节为 `value`（相对于未读数据起始位置）。
@@ -109,7 +158,8 @@ impl Buffer {
     #[inline]
     pub fn set_byte(&mut self, index: usize, value: u8) {
         assert!(index < self.len(), "set_byte index {index} 超过未读数据长度 {}", self.len());
-        self.inner[self.start + index] = value;
+        let idx = self.start + index;
+        self.pooled_mut()[idx] = value;
     }
 
     /// 将读游标前进 n 字节（跳过 n 字节数据）。
@@ -127,7 +177,7 @@ impl Buffer {
     /// 对应 Go 的 `Buffer.Read()`。
     pub fn read_to(&mut self, dst: &mut [u8]) -> usize {
         let n = self.len().min(dst.len());
-        dst[..n].copy_from_slice(&self.inner[self.start..self.start + n]);
+        dst[..n].copy_from_slice(&self.bytes()[..n]);
         self.start += n;
         n
     }
@@ -137,7 +187,7 @@ impl Buffer {
         if self.is_empty() {
             return None;
         }
-        let b = self.inner[self.start];
+        let b = self.byte(0);
         self.start += 1;
         Some(b)
     }
@@ -145,9 +195,14 @@ impl Buffer {
     // ========== 写操作 ==========
 
     /// 返回缓冲区总容量。
+    ///
+    /// Frozen 变体无可写容量（返回数据长度，`free()` 恒为 0）。
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.inner.capacity()
+        match &self.inner {
+            Inner::Pooled(m) => m.capacity(),
+            Inner::Frozen(b) => b.len(),
+        }
     }
 
     /// 返回剩余可写空间。
@@ -155,7 +210,7 @@ impl Buffer {
     /// 对应 Go 的 `Buffer.Free()`。
     #[inline]
     pub fn free(&self) -> usize {
-        self.inner.capacity() - self.end
+        self.capacity() - self.end
     }
 
     /// 返回可写区域的可变引用（end 之后的空间）。
@@ -164,14 +219,15 @@ impl Buffer {
     /// 注意：返回的切片长度为 BytesMut 的剩余容量，不是 free()。
     pub fn writable_bytes(&mut self) -> &mut [u8] {
         let end = self.end;
-        let cap = self.inner.capacity();
+        let m = self.pooled_mut();
+        let cap = m.capacity();
         // SAFETY: 扩展 len 到 capacity 以暴露可写区域
-        if cap > self.inner.len() {
+        if cap > m.len() {
             unsafe {
-                self.inner.set_len(cap);
+                m.set_len(cap);
             }
         }
-        &mut self.inner[end..]
+        &mut m[end..]
     }
 
     /// 将写游标前进 n 字节（确认写入了 n 字节）。
@@ -181,17 +237,18 @@ impl Buffer {
     pub fn advance_write(&mut self, n: usize) {
         let new_end = self.end + n;
         assert!(
-            new_end <= self.inner.capacity(),
+            new_end <= self.capacity(),
             "advance_write {n} 超过可写空间 (end={}, cap={})",
             self.end,
-            self.inner.capacity()
+            self.capacity()
         );
+        let m = self.pooled_mut();
         // 确保 BytesMut 知道数据已写入
-        if new_end > self.inner.len() {
+        if new_end > m.len() {
             // SAFETY: 我们只在已分配的 capacity 范围内扩展 length，
             // 调用方负责确保通过 writable_bytes() 写入了有效数据。
             unsafe {
-                self.inner.set_len(new_end);
+                m.set_len(new_end);
             }
         }
         self.end = new_end;
@@ -208,15 +265,17 @@ impl Buffer {
         }
         let end = self.end;
         let new_end = end + n;
-        // SAFETY: BytesMut::with_capacity 创建 len=0 但 capacity>0 的缓冲区。
-        // 我们需要先扩展 len 到目标位置，然后写入数据。
-        // 这是安全的因为 capacity 足够（available 已检查）且我们会立即填充数据。
-        if new_end > self.inner.len() {
-            unsafe {
-                self.inner.set_len(new_end);
+        {
+            let m = self.pooled_mut();
+            // SAFETY: free() 已确认容量充足（Pooled 变体 capacity>=end+n），
+            // 先扩展 len 到目标位置再填充数据。
+            if new_end > m.len() {
+                unsafe {
+                    m.set_len(new_end);
+                }
             }
+            m[end..new_end].copy_from_slice(&src[..n]);
         }
-        self.inner[end..new_end].copy_from_slice(&src[..n]);
         self.end = new_end;
         n
     }
@@ -228,13 +287,16 @@ impl Buffer {
         }
         let end = self.end;
         let new_end = end + 1;
-        // SAFETY: 同 write_from，先扩展 len 再写入
-        if new_end > self.inner.len() {
-            unsafe {
-                self.inner.set_len(new_end);
+        {
+            let m = self.pooled_mut();
+            // SAFETY: 同 write_from，free() 已确认容量充足
+            if new_end > m.len() {
+                unsafe {
+                    m.set_len(new_end);
+                }
             }
+            m[end] = b;
         }
-        self.inner[end] = b;
         self.end = new_end;
         true
     }
@@ -250,17 +312,21 @@ impl Buffer {
             return;
         }
         let new_end = self.end + data_len;
-        // 确保有足够的 capacity
-        if new_end > self.inner.capacity() {
-            self.inner.resize(new_end, 0);
-        }
-        // SAFETY: 扩展 len 以覆盖写入区域
-        if new_end > self.inner.len() {
-            unsafe {
-                self.inner.set_len(new_end);
+        let end = self.end;
+        {
+            let m = self.pooled_mut();
+            // 确保有足够的 capacity
+            if new_end > m.capacity() {
+                m.resize(new_end, 0);
             }
+            // SAFETY: 扩展 len 以覆盖写入区域
+            if new_end > m.len() {
+                unsafe {
+                    m.set_len(new_end);
+                }
+            }
+            m[end..new_end].copy_from_slice(&data);
         }
-        self.inner[self.end..new_end].copy_from_slice(&data);
         self.end = new_end;
     }
 
@@ -273,6 +339,12 @@ impl Buffer {
         self.start = 0;
         self.end = 0;
         self.udp = None;
+        // Frozen 非池来源没有「可清后复用」语义：丢弃 Bytes 并转出一份
+        // 池化空缓冲，保证 clear 后的写路径仍走池化（与 Pooled 行为一致）。
+        if let Inner::Frozen(b) = &mut self.inner {
+            *b = Bytes::new();
+            self.inner = Inner::Pooled(alloc::alloc(alloc::DEFAULT_SIZE));
+        }
     }
 
     /// 截断缓冲区，仅保留前 n 字节未读数据。
@@ -307,26 +379,61 @@ impl Buffer {
     /// 对应 Go 的 `Buffer.Slice()` 和分割操作。
     /// 原缓冲区的读游标前进 n 字节。
     ///
+    /// 双态均零拷贝：Pooled 走 `BytesMut` 引用计数分割（O(1)），Frozen 走
+    /// `Bytes::slice`（姊妹份共享底层分配，与 `BytesMut::split_to().freeze()`
+    /// 的零拷贝语义同源）。
+    ///
     /// # Panics
     /// 如果 n 超过未读数据长度会 panic。
     pub fn split_to(&mut self, n: usize) -> Buffer {
         assert!(n <= self.len(), "split_to {n} 超过未读数据长度 {}", self.len());
         let split_end = self.start + n;
-        let mut new_inner = BytesMut::with_capacity(n);
-        new_inner.extend_from_slice(&self.inner[self.start..split_end]);
-        self.start = split_end;
+        let remaining = self.len() - n;
+        let new_inner = match &mut self.inner {
+            Inner::Pooled(m) => {
+                // O(1) 引用计数分割：先摘走已读前缀，再摘出前 n 字节；
+                // 原缓冲余量随之从 0 起（end 之后不可见区保持不可见）
+                if self.start > 0 {
+                    m.advance(self.start);
+                }
+                let front = m.split_to(n);
+                self.start = 0;
+                self.end = remaining;
+                Inner::Pooled(front)
+            },
+            Inner::Frozen(b) => {
+                // 底层不动：返回切片，原缓冲纯游标推进
+                let front = b.slice(self.start..split_end);
+                self.start = split_end;
+                Inner::Frozen(front)
+            },
+        };
         Buffer { inner: new_inner, start: 0, end: n, udp: None }
     }
 
     /// 在 n 字节处分割，保留后段，返回前段。
     ///
-    /// 原缓冲区保留第 n 字节之后的数据。
+    /// 原缓冲区保留第 n 字节之后的数据。零拷贝语义同 [`Buffer::split_to`]。
     pub fn split_off(&mut self, n: usize) -> Buffer {
         assert!(n <= self.len(), "split_off {n} 超过未读数据长度 {}", self.len());
         let split_end = self.start + n;
-        let mut new_inner = BytesMut::with_capacity(n);
-        new_inner.extend_from_slice(&self.inner[self.start..split_end]);
-        self.start = split_end;
+        let remaining = self.len() - n;
+        let new_inner = match &mut self.inner {
+            Inner::Pooled(m) => {
+                if self.start > 0 {
+                    m.advance(self.start);
+                }
+                let front = m.split_to(n);
+                self.start = 0;
+                self.end = remaining;
+                Inner::Pooled(front)
+            },
+            Inner::Frozen(b) => {
+                let front = b.slice(self.start..split_end);
+                self.start = split_end;
+                Inner::Frozen(front)
+            },
+        };
         Buffer { inner: new_inner, start: 0, end: n, udp: None }
     }
 
@@ -334,10 +441,15 @@ impl Buffer {
     ///
     /// 对应 Go 的将 Buffer 内容转为字节切片的场景。
     pub fn into_bytes(mut self) -> Bytes {
-        let data = self.inner.split_off(self.start);
-        self.start = 0;
-        self.end = 0;
-        data.freeze()
+        match &mut self.inner {
+            Inner::Pooled(m) => {
+                if self.start > 0 {
+                    m.advance(self.start);
+                }
+                m.split().freeze()
+            },
+            Inner::Frozen(b) => b.slice(self.start..self.end),
+        }
     }
 
     /// 调整缓冲区大小。
@@ -352,13 +464,17 @@ impl Buffer {
         }
         let extra = new_len - current;
         let needed = self.end + extra;
-        // 使用 resize 扩展并填充零
-        if needed > self.inner.len() {
-            self.inner.resize(needed, 0);
-        } else {
-            // 已有足够 len，只需填充零
-            for i in self.end..needed {
-                self.inner[i] = 0;
+        let end = self.end;
+        {
+            let m = self.pooled_mut();
+            // 使用 resize 扩展并填充零
+            if needed > m.len() {
+                m.resize(needed, 0);
+            } else {
+                // 已有足够 len，只需填充零
+                for i in end..needed {
+                    m[i] = 0;
+                }
             }
         }
         self.end = needed;
@@ -369,29 +485,41 @@ impl Buffer {
     /// 释放缓冲区回池中。
     ///
     /// 对应 Go 的 `Buffer.Release()`。重置游标并归还 `BytesMut` 到分配池。
+    /// Frozen 变体（[`Buffer::from_bytes_frozen`] 非池来源）直接释放，**不回池**。
     pub fn release(&mut self) {
         self.start = 0;
         self.end = 0;
         self.udp = None;
-        // 将 inner 替换为空，把旧的归还池中
-        let old = std::mem::replace(&mut self.inner, BytesMut::new());
-        alloc::release(old);
+        match &mut self.inner {
+            Inner::Pooled(m) => {
+                // 将 inner 替换为空，把旧的归还池中
+                let old = std::mem::replace(m, BytesMut::new());
+                alloc::release(old);
+            },
+            Inner::Frozen(b) => *b = Bytes::new(),
+        }
     }
 
     /// 检查缓冲区是否已释放（inner 为空）。
     #[inline]
     pub fn is_released(&self) -> bool {
-        self.inner.capacity() == 0
+        match &self.inner {
+            Inner::Pooled(m) => m.capacity() == 0,
+            Inner::Frozen(b) => b.is_empty(),
+        }
     }
 }
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        if self.inner.capacity() > 0 {
-            self.start = 0;
-            self.end = 0;
-            let old = std::mem::replace(&mut self.inner, BytesMut::new());
-            alloc::release(old);
+        // 只有池化分支回池；Frozen 非池来源随 Bytes 引用计数自然释放。
+        if let Inner::Pooled(m) = &mut self.inner {
+            if m.capacity() > 0 {
+                self.start = 0;
+                self.end = 0;
+                let old = std::mem::replace(m, BytesMut::new());
+                alloc::release(old);
+            }
         }
     }
 }
@@ -420,7 +548,7 @@ impl AsMut<[u8]> for Buffer {
     fn as_mut(&mut self) -> &mut [u8] {
         let start = self.start;
         let end = self.end;
-        &mut self.inner[start..end]
+        &mut self.pooled_mut()[start..end]
     }
 }
 
@@ -803,5 +931,104 @@ mod tests {
         buf.set_byte(0, b'L');
         assert_eq!(buf.bytes(), b"Llo");
         assert_eq!(buf.byte(2), b'o');
+    }
+
+    // ========== from_bytes_frozen（P1 零拷贝入口） ==========
+
+    #[test]
+    fn test_frozen_basics() {
+        let data = Bytes::from_static(b"hello frozen");
+        let len = data.len();
+        let buf = Buffer::from_bytes_frozen(data);
+        assert_eq!(buf.len(), len);
+        assert_eq!(buf.bytes(), b"hello frozen");
+        assert_eq!(buf.as_ref(), b"hello frozen");
+        assert!(buf.capacity() >= len);
+        // Frozen 无可写空间：free 恒 0，写不进去（与池化满缓冲行为一致）
+        assert_eq!(buf.free(), 0);
+    }
+
+    #[test]
+    fn test_frozen_advance_and_read() {
+        let mut buf = Buffer::from_bytes_frozen(Bytes::from_static(b"abcdef"));
+        buf.advance(2);
+        assert_eq!(buf.bytes(), b"cdef");
+        let mut dst = [0u8; 2];
+        assert_eq!(buf.read_to(&mut dst), 2);
+        assert_eq!(&dst, b"cd");
+        assert_eq!(buf.bytes(), b"ef");
+    }
+
+    #[test]
+    fn test_frozen_release_not_pooled() {
+        init();
+        let mut buf = Buffer::from_bytes_frozen(Bytes::from_static(b"temp"));
+        assert!(!buf.is_released());
+        buf.release();
+        assert!(buf.is_released());
+        // release 后写入仍安全（转出池化空缓冲语义由 clear 同款路径承接）
+    }
+
+    #[test]
+    fn test_frozen_cow_write_unique_is_cheap() {
+        // 唯一引用：try_into_mut 零拷贝转正
+        let mut buf = Buffer::from_bytes_frozen(Bytes::from(b"hello".to_vec()));
+        buf.put(Bytes::from_static(b"!"));
+        assert_eq!(buf.bytes(), b"hello!");
+    }
+
+    #[test]
+    fn test_frozen_cow_write_shared() {
+        // 共享引用（姊妹份存活）：COW 真实拷贝，内容正确、互不可见
+        let shared = Bytes::from(b"hello".to_vec());
+        let sister = shared.clone();
+        let mut buf = Buffer::from_bytes_frozen(shared);
+        buf.set_byte(0, b'H');
+        assert_eq!(buf.bytes(), b"Hello");
+        assert_eq!(&sister[..], b"hello");
+    }
+
+    #[test]
+    fn test_frozen_split_to() {
+        let buf = Buffer::from_bytes_frozen(Bytes::from_static(b"hello world"));
+        let mut it = buf;
+        let front = it.split_to(5);
+        assert_eq!(front.bytes(), b"hello");
+        assert_eq!(it.bytes(), b" world");
+        let tail = it.split_to(1);
+        assert_eq!(tail.bytes(), b" ");
+        assert_eq!(it.bytes(), b"world");
+    }
+
+    #[test]
+    fn test_frozen_into_bytes_zero_copy() {
+        let mut buf = Buffer::from_bytes_frozen(Bytes::from(b"abcdef".to_vec()));
+        buf.advance(2);
+        let bytes = buf.into_bytes();
+        assert_eq!(&bytes[..], b"cdef");
+    }
+
+    #[test]
+    fn test_pooled_split_to_after_partial_read() {
+        // 回归守卫：已读前缀（start>0）存在时 split_to 的余量游标必须正确。
+        let mut buf = Buffer::from_bytes(BytesMut::from(&b"0123456789"[..]));
+        buf.advance(2); // 未读 "23456789"
+        let front = buf.split_to(2); // front = "23"
+        assert_eq!(front.bytes(), b"23");
+        assert_eq!(buf.bytes(), b"456789");
+        let rest = buf.split_off(buf.len()); // 余量整体摘出
+        assert_eq!(rest.bytes(), b"456789");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_frozen_clear_transitions_to_pooled() {
+        init();
+        let mut buf = Buffer::from_bytes_frozen(Bytes::from_static(b"gone"));
+        buf.clear();
+        assert!(buf.is_empty());
+        // clear 后转池化：可继续写
+        assert_eq!(buf.write_from(b"new"), 3);
+        assert_eq!(buf.bytes(), b"new");
     }
 }

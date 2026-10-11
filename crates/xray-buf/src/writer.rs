@@ -6,9 +6,10 @@ use std::{
     future::{Future, poll_fn},
     io::IoSlice,
     pin::Pin,
+    task::{Context, Poll, ready},
 };
 
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncWrite;
 
 use crate::{
     buffer::Buffer,
@@ -39,24 +40,18 @@ impl SequentialWriter {
 }
 
 impl Writer for SequentialWriter {
-    fn write_multi_buffer(
+    fn poll_write_multi_buffer(
         &mut self,
-        mb: MultiBuffer,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-        Box::pin(async move {
-            let buffers = mb.into_buffers();
-            // 底层支持 vectored（裸 TCP sendmsg 等）时聚合一次写出；
-            // TLS 包装层等默认 is_write_vectored()==false 自动退回逐块顺序写。
-            let res = if self.inner.is_write_vectored() {
-                write_vectored_all(&mut self.inner, &buffers).await
-            } else {
-                write_sequential(&mut self.inner, &buffers).await
-            };
-            for mut buf in buffers {
-                buf.release();
-            }
-            res
-        })
+        cx: &mut Context<'_>,
+        mb: &mut MultiBuffer,
+    ) -> Poll<Result<()>> {
+        // 无跨 poll 状态字段：进度持久化在 mb（整块写完即摘除回池，半块
+        // 游标推进放回队首），每次 poll 重建 iovec/顺序游标。
+        if self.inner.is_write_vectored() {
+            self.poll_write_vectored(cx, mb)
+        } else {
+            self.poll_write_sequential(cx, mb)
+        }
     }
 
     /// 排空 + 半关闭底层 AsyncWrite（poll_shutdown：TLS 层=flush sendable_tls
@@ -67,57 +62,106 @@ impl Writer for SequentialWriter {
     }
 }
 
-/// 逐块顺序写（原 [`SequentialWriter`] 行为）。
-async fn write_sequential<W: AsyncWrite + Unpin + ?Sized>(
-    w: &mut W,
-    buffers: &[Buffer],
-) -> Result<()> {
-    for buf in buffers {
-        let data = buf.bytes();
-        if data.is_empty() {
-            continue;
+impl SequentialWriter {
+    /// vectored 聚合写：剩余块收集为 iovec 尽量单次 `poll_write_vectored`
+    /// 写出；部分写从断点续传（N×8KB 块收敛 ~1 次 syscall）。
+    fn poll_write_vectored(
+        &mut self,
+        cx: &mut Context<'_>,
+        mb: &mut MultiBuffer,
+    ) -> Poll<Result<()>> {
+        loop {
+            // 沿途释放队首空块
+            release_empty_front(mb);
+            if mb.is_empty() {
+                return Poll::Ready(Ok(()));
+            }
+            let slices: Vec<IoSlice<'_>> =
+                mb.iter().map(|b| IoSlice::new(b.bytes())).filter(|s| !s.is_empty()).collect();
+            let mut write = std::pin::pin!(poll_fn(
+                |cx| Pin::new(&mut *self.inner).poll_write_vectored(cx, &slices)
+            ));
+            let n = match write.as_mut().poll(cx) {
+                Poll::Ready(Ok(n)) => n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(io::classify_io_error(e, false))),
+                Poll::Pending => return Poll::Pending,
+            };
+            if n == 0 {
+                return Poll::Ready(Err(io::classify_io_error(
+                    std::io::Error::new(std::io::ErrorKind::WriteZero, "write_vectored returned 0"),
+                    false,
+                )));
+            }
+            consume_front_bytes(mb, n);
         }
-        w.write_all(data).await.map_err(|e| io::classify_io_error(e, false))?;
     }
-    Ok(())
+
+    /// 逐块顺序写（非 vectored 底层，TLS 包装等）。
+    fn poll_write_sequential(
+        &mut self,
+        cx: &mut Context<'_>,
+        mb: &mut MultiBuffer,
+    ) -> Poll<Result<()>> {
+        loop {
+            release_empty_front(mb);
+            if mb.is_empty() {
+                return Poll::Ready(Ok(()));
+            }
+            let mut write = std::pin::pin!(poll_fn(|cx| {
+                let data = mb.iter().next().map_or(&[][..], |b| b.bytes());
+                Pin::new(&mut *self.inner).poll_write(cx, data)
+            }));
+            let n = match write.as_mut().poll(cx) {
+                Poll::Ready(Ok(n)) => n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(io::classify_io_error(e, false))),
+                Poll::Pending => return Poll::Pending,
+            };
+            if n == 0 {
+                // AsyncWrite 协议：非空 buf 的 Ok(0) = 写入器无法再接受数据
+                return Poll::Ready(Err(io::classify_io_error(
+                    std::io::Error::new(std::io::ErrorKind::WriteZero, "write returned 0"),
+                    false,
+                )));
+            }
+            consume_front_bytes(mb, n);
+        }
+    }
 }
 
-/// vectored 聚合写：把全部非空块收集为 iovec，尽量单次 `poll_write_vectored`
-/// 写出；部分写（返回值小于总量）时从断点继续。N×8KB 块从 N 次 syscall
-/// 收敛到 ~1 次。
-async fn write_vectored_all<W: AsyncWrite + Unpin + ?Sized>(
-    w: &mut W,
-    buffers: &[Buffer],
-) -> Result<()> {
-    let mut slices: Vec<IoSlice<'_>> = buffers
-        .iter()
-        .map(|b| IoSlice::new(b.bytes()))
-        // ponytail: Vec.remove(0) 前进——块数 ≤8，O(n²) 无关紧要
-        .filter(|s| !s.is_empty())
-        .collect();
-    while !slices.is_empty() {
-        let n = poll_fn(|cx| Pin::new(&mut *w).poll_write_vectored(cx, &slices))
-            .await
-            .map_err(|e| io::classify_io_error(e, false))?;
-        if n == 0 {
-            return Err(io::classify_io_error(
-                std::io::Error::new(std::io::ErrorKind::WriteZero, "write_vectored returned 0"),
-                false,
-            ));
-        }
-        let mut rem = n;
-        while rem > 0 && !slices.is_empty() {
-            let len = slices[0].len();
-            if len <= rem {
-                rem -= len;
-                slices.remove(0);
-            } else {
-                slices[0].advance(rem);
-                rem = 0;
-            }
+/// 释放 mb 队首连续空块（回池）。
+fn release_empty_front(mb: &mut MultiBuffer) {
+    while let Some(mut front) = mb.split_first() {
+        if front.bytes().is_empty() {
+            front.release();
+        } else {
+            mb.push_front(front);
+            break;
         }
     }
-    Ok(())
+}
+
+/// 从队首消费 n 字节：整块写完摘除回池，半块游标推进放回队首。
+fn consume_front_bytes(mb: &mut MultiBuffer, mut n: usize) {
+    while n > 0 {
+        match mb.split_first() {
+            Some(mut front) => {
+                let len = front.len();
+                if len == 0 {
+                    front.release();
+                    continue;
+                }
+                if len <= n {
+                    n -= len;
+                    front.release();
+                } else {
+                    front.advance(n);
+                    mb.push_front(front);
+                    n = 0;
+                }
+            },
+            None => break,
+        }
+    }
 }
 
 // ========== BufferedWriter ==========
@@ -131,6 +175,9 @@ pub struct BufferedWriter {
     buffer: Option<Buffer>,
     buffered: bool,
     flush_next: bool,
+    /// poll 写路径的在途 flush 批：Pending 期间暂存内部缓存，Ready 后清空
+    /// （poll 状态机跨 poll 的唯一自带状态；async 路径不经此字段）。
+    flushing: Option<MultiBuffer>,
 }
 
 impl BufferedWriter {
@@ -138,7 +185,7 @@ impl BufferedWriter {
     ///
     /// 默认为缓冲模式（buffered = true）。
     pub fn new(writer: Box<dyn Writer>) -> Self {
-        Self { writer, buffer: None, buffered: true, flush_next: false }
+        Self { writer, buffer: None, buffered: true, flush_next: false, flushing: None }
     }
 
     /// 写入单个 Buffer
@@ -213,15 +260,38 @@ impl BufferedWriter {
     ///
     /// 将内部 Buffer 的数据写入底层 Writer 并释放 Buffer。
     pub async fn flush(&mut self) -> Result<()> {
+        std::future::poll_fn(|cx| self.poll_flush(cx)).await
+    }
+
+    /// [`BufferedWriter::flush`] 的 poll 形态（poll 状态机驱动用）。
+    pub fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        // 先驱动在途 flush 批
+        if let Some(flight) = self.flushing.as_mut() {
+            ready!(self.writer.poll_write_multi_buffer(cx, flight))?;
+            self.flushing = None;
+        }
         if let Some(mut buf) = self.buffer.take() {
             if !buf.is_empty() {
-                let mb = MultiBuffer::from_buffer(buf);
-                self.writer.write_multi_buffer(mb).await?;
+                let mut mb = MultiBuffer::with_capacity(1);
+                mb.push(buf);
+                ready!(self.writer.poll_write_multi_buffer(cx, &mut mb))?;
             } else {
                 buf.release();
             }
         }
-        Ok(())
+        Poll::Ready(Ok(()))
+    }
+
+    /// [`BufferedWriter::write_multi_buffer_direct`] 的 poll 形态
+    /// （MuxWriter 等 poll 状态机驱动用）：先排空内部缓存（保序），
+    /// 再把 `mb` 整批直写底层。
+    pub fn poll_write_multi_buffer_direct(
+        &mut self,
+        cx: &mut Context<'_>,
+        mb: &mut MultiBuffer,
+    ) -> Poll<Result<()>> {
+        ready!(self.poll_flush(cx))?;
+        self.writer.poll_write_multi_buffer(cx, mb)
     }
 
     /// 检查是否为缓冲模式
@@ -231,11 +301,61 @@ impl BufferedWriter {
 }
 
 impl Writer for BufferedWriter {
-    fn write_multi_buffer(
+    fn poll_write_multi_buffer(
         &mut self,
-        mb: MultiBuffer,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-        Box::pin(async move { self.write_multi_buffer_impl(mb).await })
+        cx: &mut Context<'_>,
+        mb: &mut MultiBuffer,
+    ) -> Poll<Result<()>> {
+        if !self.buffered {
+            // 直通模式：等价 write_buffer 非缓冲分支——不进内部缓存，整批转交
+            return self.poll_write_multi_buffer_direct(cx, mb);
+        }
+        loop {
+            // 在途 flush 优先驱动
+            if let Some(flight) = self.flushing.as_mut() {
+                ready!(self.writer.poll_write_multi_buffer(cx, flight))?;
+                self.flushing = None;
+            }
+
+            let Some(mut buf) = mb.split_first() else { return Poll::Ready(Ok(())) };
+            let buf_len = buf.len();
+
+            // flush_next：先刷新既有缓存再缓冲新块（SetFlushNext 语义）
+            if self.flush_next {
+                self.stage_flush();
+                self.flush_next = false;
+                if self.flushing.is_some() {
+                    mb.push_front(buf);
+                    continue; // 回循环顶先驱动 flush，再回来处理本块
+                }
+            }
+
+            // 吸收进缓存 / 缓存不足先冲刷 / 大块直写（write_buffer 语义）
+            let cache_fits = match self.buffer.as_mut() {
+                Some(inner) if inner.free() >= buf_len => true,
+                Some(_) => {
+                    self.stage_flush();
+                    if self.flushing.is_some() {
+                        mb.push_front(buf);
+                        continue;
+                    }
+                    false
+                },
+                None => false,
+            };
+
+            if cache_fits {
+                let inner = self.buffer.as_mut().expect("cache_fits 已确认存在");
+                inner.write_from(buf.bytes());
+                buf.release();
+            } else if buf_len <= buf.capacity() / 2 {
+                self.buffer = Some(buf);
+            } else {
+                let mut one = MultiBuffer::with_capacity(1);
+                one.push(buf);
+                ready!(self.writer.poll_write_multi_buffer(cx, &mut one))?;
+            }
+        }
     }
 
     fn shutdown(&self) {
@@ -243,6 +363,23 @@ impl Writer for BufferedWriter {
         // 包裹 pipe 的会话写端永不通知 EOF（Go common.Close(s.output) 无对应）。
         // 不排空内部缓冲——需要保序的调用方先 flush 再 shutdown。
         self.writer.shutdown()
+    }
+}
+
+impl BufferedWriter {
+    /// 把内部缓存移入在途 flush 批（若非空）。仅 poll 路径使用。
+    fn stage_flush(&mut self) {
+        if self.flushing.is_none() {
+            if let Some(mut buf) = self.buffer.take() {
+                if !buf.is_empty() {
+                    let mut mb = MultiBuffer::with_capacity(1);
+                    mb.push(buf);
+                    self.flushing = Some(mb);
+                } else {
+                    buf.release();
+                }
+            }
+        }
     }
 }
 
@@ -258,15 +395,14 @@ pub struct Discard;
 pub const DISCARD: Discard = Discard;
 
 impl Writer for Discard {
-    fn write_multi_buffer(
+    fn poll_write_multi_buffer(
         &mut self,
-        mb: MultiBuffer,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-        Box::pin(async move {
-            let mut mb = mb;
-            mb.release();
-            Ok(())
-        })
+        _cx: &mut Context<'_>,
+        mb: &mut MultiBuffer,
+    ) -> Poll<Result<()>> {
+        // 同步丢弃：整批就地释放（回池），恒 Ready
+        mb.release();
+        Poll::Ready(Ok(()))
     }
 }
 

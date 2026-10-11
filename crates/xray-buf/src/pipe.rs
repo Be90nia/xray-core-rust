@@ -10,11 +10,11 @@
 
 use std::{
     future::Future,
-    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -31,27 +31,59 @@ use crate::{
 /// wait 先消费已有 count，未消费才 await notify。
 struct CountingNotify {
     count: AtomicU64,
-    notify: Notify,
+    /// poll 等待的 waker 槽：poll-based 等待（bridge 泵直驱
+    /// poll_read_multi_buffer）下，等待 future 若每次 poll 重建，注册随 drop
+    /// 销毁，后到的 signal 只剩计数、不再有任何 waker → 读端永久失唤醒（死锁）。
+    /// waker 存槽跨 poll 存活，注册持续有效；signal 时取走唤醒。
+    waker: parking_lot::Mutex<Option<std::task::Waker>>,
 }
 
 impl CountingNotify {
     fn new() -> Self {
-        Self { count: AtomicU64::new(0), notify: Notify::new() }
+        Self { count: AtomicU64::new(0), waker: parking_lot::Mutex::new(None) }
     }
 
-    /// 发一个 signal，计数 +1。多次 signal 会累积。
+    /// 发一个 signal，计数 +1。多次 signal 会累积；首个 signal 唤醒等待者。
     fn signal(&self) {
-        self.count.fetch_add(1, Ordering::SeqCst);
-        self.notify.notify_one();
+        if self.count.fetch_add(1, Ordering::SeqCst) == 0 {
+            if let Some(w) = self.waker.lock().take() {
+                w.wake();
+            }
+        }
     }
 
-    /// 等待 signal：swap 全部 count，如果 >0 立即返回；否则 await notify。
+    /// 等待 signal：swap 全部 count，如果 >0 立即返回；否则挂起等唤醒。
     /// 对应 Go Notifier.Wait 的 `Swap(0)>0 return nil chan` 语义。
     async fn wait(&self) {
         if self.count.swap(0, Ordering::SeqCst) > 0 {
             return;
         }
-        self.notify.notified().await;
+        // 注册 waker 后双检窗口内到达的 signal 直接消费（防丢唤醒）
+        std::future::poll_fn(|cx| {
+            if self.count.swap(0, Ordering::SeqCst) > 0 {
+                return std::task::Poll::Ready(());
+            }
+            *self.waker.lock() = Some(cx.waker().clone());
+            if self.count.swap(0, Ordering::SeqCst) > 0 {
+                return std::task::Poll::Ready(());
+            }
+            std::task::Poll::Pending
+        })
+        .await
+    }
+
+    /// [`CountingNotify::wait`] 的 poll 形态：waker 存槽跨 poll 保活（读端
+    /// poll 直驱的性命攸关语义，见结构注释）。返回 true = 有 signal 待消费。
+    fn poll_wait(&self, cx: &mut Context<'_>) -> bool {
+        if self.count.swap(0, Ordering::SeqCst) > 0 {
+            return true;
+        }
+        *self.waker.lock() = Some(cx.waker().clone());
+        // 双检：注册窗口内 signal 可能已到
+        if self.count.swap(0, Ordering::SeqCst) > 0 {
+            return true;
+        }
+        false
     }
 }
 
@@ -97,7 +129,7 @@ struct PipeInner {
 }
 
 struct PipeShared {
-    inner: std::sync::Mutex<PipeInner>,
+    inner: parking_lot::Mutex<PipeInner>,
     /// 写端通知读端：有新数据可读。
     read_signal: CountingNotify,
     /// 读端通知写端：缓冲有空间可写。
@@ -109,7 +141,7 @@ struct PipeShared {
     /// 错误注入槽（ReturnAnError/Recover）。
     /// ponytail: Go 用 buffered channel（阻塞 send），这里用 slot 非阻塞覆盖。
     /// 行为差异：重复 return_an_error 会覆盖（Go 阻塞）。实际使用成对调用，覆盖语义不影响。
-    err_slot: std::sync::Mutex<Option<Error>>,
+    err_slot: parking_lot::Mutex<Option<Error>>,
 }
 
 impl PipeShared {
@@ -153,7 +185,7 @@ pub fn new() -> (Reader, Writer) {
 /// 创建一对 (Reader, Writer) pipe，使用指定选项。
 pub fn new_with_option(option: PipeOption) -> (Reader, Writer) {
     let shared = Arc::new(PipeShared {
-        inner: std::sync::Mutex::new(PipeInner {
+        inner: parking_lot::Mutex::new(PipeInner {
             data: MultiBuffer::new(),
             option,
             state: State::Open,
@@ -162,7 +194,7 @@ pub fn new_with_option(option: PipeOption) -> (Reader, Writer) {
         write_signal: CountingNotify::new(),
         closed: AtomicBool::new(false),
         closed_notify: Notify::new(),
-        err_slot: std::sync::Mutex::new(None),
+        err_slot: parking_lot::Mutex::new(None),
     });
     (Reader(shared.clone()), Writer(shared))
 }
@@ -180,7 +212,7 @@ impl Reader {
         loop {
             // 取 buffered 数据
             let (data, idle_timeout) = {
-                let mut inner = self.0.inner.lock().unwrap();
+                let mut inner = self.0.inner.lock();
                 let data = if !inner.data.is_empty() {
                     std::mem::take(&mut inner.data)
                 } else {
@@ -196,7 +228,7 @@ impl Reader {
 
             // 空，检查状态
             {
-                let inner = self.0.inner.lock().unwrap();
+                let inner = self.0.inner.lock();
                 match inner.state {
                     State::Open => {},
                     State::Closed => return Err(Error::Eof),
@@ -206,7 +238,7 @@ impl Reader {
 
             // 检查错误槽
             {
-                let mut slot = self.0.err_slot.lock().unwrap();
+                let mut slot = self.0.err_slot.lock();
                 if let Some(err) = slot.take() {
                     return Err(err);
                 }
@@ -247,7 +279,7 @@ impl Reader {
     }
 
     fn interrupt_shared(shared: &Arc<PipeShared>) {
-        let mut inner = shared.inner.lock().unwrap();
+        let mut inner = shared.inner.lock();
         if !inner.data.is_empty() {
             inner.data.release();
             inner.data = MultiBuffer::new();
@@ -264,18 +296,18 @@ impl Reader {
 
     /// 注入一个错误，使下一次 read 返回该错误。
     pub fn return_an_error(&self, err: Error) {
-        let mut slot = self.0.err_slot.lock().unwrap();
+        let mut slot = self.0.err_slot.lock();
         *slot = Some(err);
     }
 
     /// 取出注入的错误（如果有）。
     pub fn recover(&self) -> Option<Error> {
-        self.0.err_slot.lock().unwrap().take()
+        self.0.err_slot.lock().take()
     }
 
     /// 当前 buffered 字节数。
     pub fn len(&self) -> usize {
-        self.0.inner.lock().unwrap().data.len()
+        self.0.inner.lock().data.len()
     }
 
     /// 是否为空。
@@ -290,10 +322,62 @@ impl Reader {
 }
 
 impl BufReader for Reader {
-    fn read_multi_buffer(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<MultiBuffer>> + Send + '_>> {
-        Box::pin(async move { Reader::read_multi_buffer(self).await })
+    fn poll_read_multi_buffer(&mut self, cx: &mut Context<'_>) -> Poll<Result<MultiBuffer>> {
+        // 与 inherent read_multi_buffer 逐段同语义的 poll 形态；等待段不走
+        // 可重启 async future（其 notified 注册随 future 丢弃销毁，后到 signal
+        // 无法唤醒 → 永久失读），改为 CountingNotify::poll_wait 持久注册。
+        loop {
+            // 取 buffered 数据
+            let (data, idle_timeout) = {
+                let mut inner = self.0.inner.lock();
+                let data = if !inner.data.is_empty() {
+                    std::mem::take(&mut inner.data)
+                } else {
+                    MultiBuffer::new()
+                };
+                (data, inner.option.idle_timeout)
+            };
+            if !data.is_empty() {
+                self.0.write_signal.signal();
+                return Poll::Ready(Ok(data));
+            }
+            // 空，检查状态
+            {
+                let inner = self.0.inner.lock();
+                match inner.state {
+                    State::Open => {},
+                    State::Closed => return Poll::Ready(Err(Error::Eof)),
+                    State::Errord => {
+                        return Poll::Ready(Err(Error::WriteError("pipe interrupted".into())));
+                    },
+                }
+            }
+            // 检查错误槽
+            {
+                let mut slot = self.0.err_slot.lock();
+                if let Some(err) = slot.take() {
+                    return Poll::Ready(Err(err));
+                }
+            }
+            // 等待任一信号（waker 注册持久于共享槽，不掉唤醒）
+            let sig_fired = self.0.read_signal.poll_wait(cx);
+            let shared = self.0.clone();
+            let mut close_fut = std::pin::pin!(PipeShared::wait_close(shared));
+            let close_fired = close_fut.as_mut().poll(cx).is_ready();
+            if let Some(timeout) = idle_timeout {
+                // idle 定时器随 poll 重建（漂移语义：仅连续假唤醒下顺延），
+                // 数据/关闭唤醒才是正常路径；注册丢失风险由 sig/close 槽兜底。
+                let mut idle = std::pin::pin!(tokio::time::sleep(timeout));
+                let idle_fired = idle.as_mut().poll(cx).is_ready();
+                if idle_fired {
+                    return Poll::Ready(Err(Error::Eof));
+                }
+            }
+            if sig_fired || close_fired {
+                continue;
+            }
+            return Poll::Pending;
+        }
     }
 }
 
@@ -324,7 +408,7 @@ impl Writer {
         let mut mb_slot = Some(mb);
         loop {
             let action = {
-                let mut inner = self.0.inner.lock().unwrap();
+                let mut inner = self.0.inner.lock();
                 match inner.state {
                     State::Open => {
                         if inner.option.is_full(inner.data.len()) {
@@ -375,7 +459,7 @@ impl Writer {
     /// 关闭 pipe。读端读完 buffered 后返回 EOF。多次调用幂等。
     pub fn close(&self) -> Result<()> {
         let was_open = {
-            let mut inner = self.0.inner.lock().unwrap();
+            let mut inner = self.0.inner.lock();
             let was_open = inner.state == State::Open;
             if was_open {
                 inner.state = State::Closed;
@@ -395,7 +479,7 @@ impl Writer {
 
     /// 当前 buffered 字节数。
     pub fn len(&self) -> usize {
-        self.0.inner.lock().unwrap().data.len()
+        self.0.inner.lock().data.len()
     }
 
     /// 是否为空。
@@ -410,11 +494,58 @@ impl Writer {
 }
 
 impl BufWriter for Writer {
-    fn write_multi_buffer(
+    fn poll_write_multi_buffer(
         &mut self,
-        mb: MultiBuffer,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-        Box::pin(async move { Writer::write_multi_buffer(self, mb).await })
+        cx: &mut Context<'_>,
+        mb: &mut MultiBuffer,
+    ) -> Poll<Result<()>> {
+        if mb.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+        // 无跨 poll 自带状态：mb 由调用方具名 future 持有，Pending 后重 poll
+        // 原样续写（满缓冲等待期间数据仍在 mb）；每次 poll 重建 notified/wait
+        // future（CountingNotify 计数先查 + wait_close 先查关闭位，唤醒不丢）。
+        loop {
+            let action = {
+                let mut inner = self.0.inner.lock();
+                match inner.state {
+                    State::Open => {
+                        if inner.option.is_full(inner.data.len()) {
+                            if inner.option.discard_overflow {
+                                mb.release();
+                                return Poll::Ready(Ok(()));
+                            }
+                            WriteAction::Wait
+                        } else {
+                            let m = std::mem::take(mb);
+                            inner.data.merge(m);
+                            WriteAction::Done
+                        }
+                    },
+                    State::Closed | State::Errord => WriteAction::Err,
+                }
+            };
+
+            match action {
+                WriteAction::Done => {
+                    self.0.read_signal.signal();
+                    return Poll::Ready(Ok(()));
+                },
+                WriteAction::Err => {
+                    mb.release();
+                    return Poll::Ready(Err(Error::WriteError("closed pipe".into())));
+                },
+                WriteAction::Wait => {
+                    let mut sig = std::pin::pin!(self.0.write_signal.wait());
+                    let shared = self.0.clone();
+                    let mut close = std::pin::pin!(PipeShared::wait_close(shared));
+                    match (sig.as_mut().poll(cx), close.as_mut().poll(cx)) {
+                        (Poll::Ready(()), _) | (_, Poll::Ready(())) => continue,
+                        (Poll::Pending, Poll::Pending) => return Poll::Pending,
+                    }
+                },
+            }
+        }
     }
 
     fn shutdown(&self) {
@@ -704,7 +835,7 @@ mod tests {
         let (mut r, mut w) = new();
         w.write_multi_buffer(mb(b"trait")).await.unwrap();
         let r_trait: &mut dyn BufReader = &mut r;
-        let out = r_trait.read_multi_buffer().await.unwrap();
+        let out = crate::io::read_mb(r_trait).await.unwrap();
         assert_eq!(out.to_vec(), b"trait");
     }
 
@@ -712,7 +843,7 @@ mod tests {
     async fn test_writer_trait_impl() {
         let (mut r, mut w) = new();
         let w_trait: &mut dyn BufWriter = &mut w;
-        w_trait.write_multi_buffer(mb(b"trait")).await.unwrap();
+        crate::io::write_mb(w_trait, mb(b"trait")).await.unwrap();
         let out = r.read_multi_buffer().await.unwrap();
         assert_eq!(out.to_vec(), b"trait");
     }

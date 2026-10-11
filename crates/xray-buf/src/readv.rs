@@ -14,11 +14,11 @@
 use std::{
     future::Future,
     io::{ErrorKind, IoSliceMut},
-    pin::Pin,
     sync::{
         LazyLock,
         atomic::{AtomicBool, Ordering},
     },
+    task::{Context, Poll},
 };
 
 use tokio::net::tcp::OwnedReadHalf;
@@ -219,6 +219,21 @@ impl ReadVSource {
             Self::Half(s) => s.try_read(buf),
         }
     }
+
+    /// [`ReadVSource::readable`] 的 poll 形态（poll 状态机驱动用）。
+    /// Half 变体无 poll_read_ready，借 `readable()` future 逐 poll 重建。
+    fn poll_readable(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self {
+            Self::Whole(s) => s.poll_read_ready(cx),
+            Self::Half(s) => {
+                let mut fut = std::pin::pin!(s.readable());
+                fut.as_mut().poll(cx)
+            },
+        }
+    }
 }
 
 impl ReadVReader {
@@ -340,10 +355,69 @@ impl ReadVReader {
 }
 
 impl Reader for ReadVReader {
-    fn read_multi_buffer(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<MultiBuffer>> + Send + '_>> {
-        Box::pin(self.read_multi())
+    fn poll_read_multi_buffer(&mut self, cx: &mut Context<'_>) -> Poll<Result<MultiBuffer>> {
+        use std::task::ready;
+        // 单 poll 内循环形态：缓冲槽批在本调用内构建一次，readiness 直接以
+        // cx poll（不走可重启 async fn）——杜绝旧 pin!-restart 形态下 future
+        // 重建与 tokio readiness/分配策略的交互回归（e2e dial-bridge 卡读）。
+        // 每次调用恰好交付一个 MultiBuffer（单缓冲或 readv 批），无外层重试。
+        if self.alloc.current() == 1 {
+            // 单缓冲快速路径：readv 对单个 8KB 净亏，直接单缓冲读
+            let mut buf = Buffer::new();
+            let cap = buf.writable_bytes().len();
+            let n = {
+                let w = buf.writable_bytes();
+                loop {
+                    ready!(self.src.poll_readable(cx))
+                        .map_err(|e| io::classify_io_error(e, true))?;
+                    match self.src.try_read(w) {
+                        Ok(n) => break n,
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+                        Err(e) => {
+                            buf.release();
+                            return Poll::Ready(Err(io::classify_io_error(e, true)));
+                        },
+                    }
+                }
+            };
+            if n == 0 {
+                buf.release();
+                return Poll::Ready(Ok(MultiBuffer::new()));
+            }
+            buf.advance_write(n);
+            if n >= cap {
+                self.alloc.adjust(1);
+            }
+            let mut mb = MultiBuffer::with_capacity(1);
+            mb.push(buf);
+            return Poll::Ready(Ok(mb));
+        }
+
+        let n_bufs = (self.alloc.current() as usize).min(MAX_READV);
+        let mut bufs: [Option<Buffer>; MAX_READV] = std::array::from_fn(|_| None);
+        for slot in bufs.iter_mut().take(n_bufs) {
+            *slot = Some(Buffer::new());
+        }
+        let mut batch = IovecBatch::build(&mut bufs, n_bufs);
+        let (lens, n_iov) = (batch.lens, batch.n);
+        let n = loop {
+            ready!(self.src.poll_readable(cx)).map_err(|e| io::classify_io_error(e, true))?;
+            match self.src.try_read_vectored(&mut batch.slices[..batch.n]) {
+                Ok(n) => break n,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+                Err(e) => {
+                    release_slots(&mut bufs);
+                    return Poll::Ready(Err(io::classify_io_error(e, true)));
+                },
+            }
+        };
+        if n == 0 {
+            release_slots(&mut bufs);
+            return Poll::Ready(Ok(MultiBuffer::new()));
+        }
+        let mb = distribute_slots(n, &mut bufs, &lens, n_iov);
+        self.alloc.adjust(mb.buffer_count() as u32);
+        Poll::Ready(Ok(mb))
     }
 }
 
