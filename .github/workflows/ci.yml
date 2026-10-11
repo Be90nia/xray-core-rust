@@ -66,7 +66,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # prefix-key 防 24.04→22.04 跨 OS 缓存污染（2026-10-09 release.yml 实锤：
+      # 默认 key 不含 runner OS，旧 OS 的 aws_lc_sys .o 恢复进新 OS 链接必炸）
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: build-v2-2204
       # workspace 依赖图含 xray-proto(prost-build)，构建需要 protoc（runner 镜像已不再预装）
       - name: Install protoc
         shell: pwsh
