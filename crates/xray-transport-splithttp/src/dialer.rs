@@ -78,10 +78,12 @@ pub async fn dial_packet_up(
     let session_id_for_task = session_id.clone();
     tokio::spawn(async move {
         let mut seq: u64 = 0;
-        let mut read_buf = vec![0u8; sc_max_each_post_bytes];
+        // 池化语义单缓冲：split().freeze() 摘出整块所有权转移给 POST body，
+        // 容量跨 chunk 复用（免逐 chunk to_vec 分配+拷贝）
+        let mut read_buf = bytes::BytesMut::with_capacity(sc_max_each_post_bytes);
         let mut last_write = std::time::Instant::now();
         loop {
-            let n = match pipe_server.read(&mut read_buf).await {
+            let n = match pipe_server.read_buf(&mut read_buf).await {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) => {
@@ -89,8 +91,8 @@ pub async fn dial_packet_up(
                     break;
                 },
             };
-            #[allow(clippy::disallowed_methods)] // P1 收口点：等 Bytes 零拷贝入口（oracle §1.1-3）
-            let payload = read_buf[..n].to_vec();
+            let payload = read_buf.split().freeze();
+            debug_assert_eq!(n, payload.len());
             let seq_str = seq.to_string();
             seq += 1;
 
@@ -361,10 +363,12 @@ pub async fn dial_h3_packet_up(
     let client_for_task = Arc::clone(&client);
     tokio::spawn(async move {
         let mut seq: u64 = 0;
-        let mut read_buf = vec![0u8; sc_max_each_post_bytes];
+        // 池化语义单缓冲：split().freeze() 摘出整块所有权转移给 POST body，
+        // 容量跨 chunk 复用（免逐 chunk to_vec 分配+拷贝）
+        let mut read_buf = bytes::BytesMut::with_capacity(sc_max_each_post_bytes);
         let mut last_write = std::time::Instant::now();
         loop {
-            let n = match pipe_server.read(&mut read_buf).await {
+            let n = match pipe_server.read_buf(&mut read_buf).await {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) => {
@@ -372,8 +376,8 @@ pub async fn dial_h3_packet_up(
                     break;
                 },
             };
-            #[allow(clippy::disallowed_methods)] // P1 收口点：等 Bytes 零拷贝入口（oracle §1.1-3）
-            let payload = read_buf[..n].to_vec();
+            let payload = read_buf.split().freeze();
+            debug_assert_eq!(n, payload.len());
             let seq_str = seq.to_string();
             seq += 1;
 

@@ -578,10 +578,18 @@ where
                     (COMMAND_PADDING_CONTINUE, UpGate::None)
                 };
                 let plen = end - off;
+                // 片段落在单个 IoSlice 内 → 直接借用批内切片传 xtls_padding
+                //（免跨片栈中转整片拷贝）；跨片片段仍拷入栈缓冲拼接。
                 let mut piece = [0u8; MAX_PADDING_CONTENT];
-                copy_io_slice_span(bufs, off, end, &mut piece[..plen]);
+                let content: &[u8] = match locate_io_slice_span(bufs, off, end) {
+                    Some(span) => span,
+                    None => {
+                        copy_io_slice_span(bufs, off, end, &mut piece[..plen]);
+                        &piece[..plen]
+                    },
+                };
                 xtls_padding(
-                    Some(&piece[..plen]),
+                    Some(content),
                     piece_cmd,
                     &mut this.uplink_uuid_pending,
                     long_padding,
@@ -731,6 +739,28 @@ where
     fn local_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
         self.inner.local_addr()
     }
+}
+
+/// 在 IoSlice 批上定位全局偏移 `[off, end)` 是否落在单个切片内；
+/// 是则返回该连续子切片（vision 写路径免栈中转直借），否则 None。
+#[must_use]
+fn locate_io_slice_span<'a>(
+    bufs: &'a [io::IoSlice<'a>],
+    off: usize,
+    end: usize,
+) -> Option<&'a [u8]> {
+    let mut pos = 0usize;
+    for slice in bufs {
+        let len = slice.len();
+        if end <= pos + len {
+            if off >= pos {
+                return Some(&slice[off - pos..end - pos]);
+            }
+            return None;
+        }
+        pos += len;
+    }
+    None
 }
 
 #[cfg(test)]

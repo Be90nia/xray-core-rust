@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 
+use bytes::Bytes;
 use rand::Rng;
 
 use crate::{
@@ -528,7 +529,8 @@ pub struct RequestMeta {
     /// Cookie 列表（name, value）。调用方需合并为单个 `Cookie:` header。
     pub cookies: Vec<(String, String)>,
     /// 请求 body（packet-up / stream-up 有；GET stream-down 为 None）。
-    pub body: Option<Vec<u8>>,
+    /// `Bytes`：客户端 freeze 块零拷贝进 meta，重放 clone 为引用计数（不再深拷贝）。
+    pub body: Option<Bytes>,
 }
 
 impl Config {
@@ -725,8 +727,9 @@ impl Config {
         base_uri: &str,
         session_id: &str,
         seq_str: &str,
-        payload: Vec<u8>,
+        payload: impl Into<Bytes>,
     ) -> Result<RequestMeta> {
+        let payload = payload.into();
         let mut headers = self.get_request_header();
 
         let (uri, meta_headers, meta_cookies) =
@@ -812,6 +815,7 @@ impl Config {
         } else {
             "GET".to_string()
         };
+        let body = body.map(Bytes::from);
         let mut meta = RequestMeta { method, uri, headers, cookies: meta_cookies, body };
         let xpad = self.build_xpadding_config(base_uri);
         apply_xpadding_to_request_meta(&mut meta, &xpad);

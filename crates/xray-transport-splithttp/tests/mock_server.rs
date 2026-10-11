@@ -187,7 +187,7 @@ async fn post_packet_returns_bad_status_on_500() {
     ));
     let base_uri = format!("http://127.0.0.1:{}/", addr.port());
 
-    let result = client.post_packet(&base_uri, "sess", "0", b"x".to_vec()).await;
+    let result = client.post_packet(&base_uri, "sess", "0", bytes::Bytes::from_static(b"x")).await;
     let err = result.unwrap_err();
     assert!(matches!(err, SplitHttpError::BadStatus(500)), "expected BadStatus(500), got {err:?}");
 }

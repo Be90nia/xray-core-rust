@@ -642,6 +642,9 @@ pub struct KcpConn {
     inner: Arc<Connection>,
     read_state: parking_lot::Mutex<Option<Pin<Box<dyn Future<Output = ()> + Send>>>>,
     write_state: parking_lot::Mutex<Option<Pin<Box<dyn Future<Output = ()> + Send>>>>,
+    /// poll_read 持久 scratch（vision read_tmp 同型）：虚假唤醒重 poll 不再
+    /// 逐次堆分配（原 `vec![0u8; remaining]` 每 poll 一次，P1 F7）。
+    read_scratch: Vec<u8>,
 }
 
 impl KcpConn {
@@ -652,6 +655,7 @@ impl KcpConn {
             inner,
             read_state: parking_lot::Mutex::new(None),
             write_state: parking_lot::Mutex::new(None),
+            read_scratch: Vec::new(),
         }
     }
 
@@ -681,20 +685,24 @@ impl tokio::io::AsyncRead for KcpConn {
         // 对齐 Go Connection.Read（connection.go:316）：循环「用当前 buf 同步读 →
         // 无数据等通知」。缓存 future 只等 data_input（Go waitForDataInput 不携带
         // 调用参数），唤醒后用本次 poll 的 buf 重读。
-        let mut tmp = vec![0u8; buf.remaining()];
+        let this = self.get_mut();
+        let need = buf.remaining();
+        if this.read_scratch.len() < need {
+            this.read_scratch.resize(need, 0);
+        }
         loop {
-            match self.inner.read(&mut tmp) {
+            match this.inner.read(&mut this.read_scratch[..need]) {
                 Ok(0) => {},
                 Ok(n) => {
-                    buf.put_slice(&tmp[..n]);
+                    buf.put_slice(&this.read_scratch[..n]);
                     return std::task::Poll::Ready(Ok(()));
                 },
                 Err(e) => return std::task::Poll::Ready(Err(std::io::Error::other(e.to_string()))),
             }
 
-            let mut state = self.read_state.lock();
+            let mut state = this.read_state.lock();
             if state.is_none() {
-                let inner = Arc::clone(&self.inner);
+                let inner = Arc::clone(&this.inner);
                 *state = Some(Box::pin(async move {
                     inner.inner.data_input.notified().await;
                 }));

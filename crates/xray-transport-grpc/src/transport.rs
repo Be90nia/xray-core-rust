@@ -272,23 +272,31 @@ where
                 let d = d.map_err(io_err)?;
                 let _ = recv_stream.flow_control().release_capacity(d.len());
                 acc.extend_from_slice(&d);
+                // P1 F5：借用化解码直写——帧数据切片零拷贝交给下游 write_all，
+                // 消费进度攒满本批后单次 drain（替代逐帧 to_vec + drain 的
+                // 每 帧 O(n) memmove + 两次全量拷贝）。
+                let mut consumed = 0usize;
                 loop {
                     let frame = if multi_mode {
-                        crate::encoding::decode_multi_hunk_frame(&acc, None).map_err(io_err)?
+                        crate::encoding::decode_multi_hunk_frame_ref(&acc[consumed..], None)
+                            .map_err(io_err)?
                     } else {
-                        crate::encoding::decode_hunk_frame(&acc, None)
+                        crate::encoding::decode_hunk_frame_ref(&acc[consumed..], None)
                             .map_err(io_err)?
                             .map(|(used, data)| (used, vec![data]))
                     };
                     match frame {
                         Some((used, datas)) => {
-                            acc.drain(..used);
                             for data in datas {
-                                wr.write_all(&data).await?;
+                                wr.write_all(data.as_slice()).await?;
                             }
+                            consumed += used;
                         },
                         None => break,
                     }
+                }
+                if consumed > 0 {
+                    acc.drain(..consumed);
                 }
             }
             Ok::<_, io::Error>(())
