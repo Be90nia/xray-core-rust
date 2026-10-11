@@ -77,7 +77,7 @@ where
     W: Writer + ?Sized,
 {
     loop {
-        let mb = reader.read_multi_buffer().await?;
+        let mb = io::read_mb(reader).await?;
 
         if mb.is_empty() {
             tracing::trace!("copy: 读取到空 MultiBuffer，结束");
@@ -86,13 +86,13 @@ where
 
         let size = mb.len();
 
-        if let Some(ref cb) = options.on_count_size {
+        if let Some(cb) = &options.on_count_size {
             cb(size);
         }
 
-        writer.write_multi_buffer(mb).await?;
+        io::write_mb(writer, mb).await?;
 
-        if let Some(ref cb) = options.on_update_activity {
+        if let Some(cb) = &options.on_update_activity {
             cb();
         }
     }
@@ -112,7 +112,7 @@ where
     W: Writer + ?Sized,
 {
     let mb = tokio::select! {
-        result = reader.read_multi_buffer() => result?,
+        result = io::read_mb(reader) => result?,
         _ = tokio::time::sleep(timeout) => {
             return Err(io::Error::TimeoutError);
         }
@@ -122,7 +122,7 @@ where
         return Ok(());
     }
 
-    writer.write_multi_buffer(mb).await?;
+    io::write_mb(writer, mb).await?;
     Ok(())
 }
 

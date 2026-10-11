@@ -49,6 +49,11 @@ impl MultiBuffer {
         self.buffers.push(buf);
     }
 
+    /// 头插一个 Buffer（poll 写游标部分消费回退用；O(n) memmove 仅单元素）。
+    pub fn push_front(&mut self, buf: Buffer) {
+        self.buffers.insert(0, buf);
+    }
+
     /// 所有缓冲区中的总字节数。
     pub fn len(&self) -> usize {
         self.buffers.iter().map(|b| b.len()).sum()
