@@ -255,7 +255,6 @@ impl<'a> AuthenticationReader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::{future::Future, pin::Pin};
 
     use xray_buf::io::Reader;
 
@@ -286,16 +285,16 @@ mod tests {
     }
 
     impl io::Writer for VecWriter {
-        fn write_multi_buffer(
+        fn poll_write_multi_buffer(
             &mut self,
-            mb: MultiBuffer,
-        ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
-            Box::pin(async move {
-                for buf in mb.into_buffers() {
-                    self.data.extend_from_slice(buf.bytes());
-                }
-                Ok(())
-            })
+            _cx: &mut std::task::Context<'_>,
+            mb: &mut MultiBuffer,
+        ) -> std::task::Poll<io::Result<()>> {
+            for buf in mb.iter_mut() {
+                self.data.extend_from_slice(buf.bytes());
+            }
+            mb.release();
+            std::task::Poll::Ready(Ok(()))
         }
     }
 

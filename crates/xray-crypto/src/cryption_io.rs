@@ -10,6 +10,8 @@
 //! - [`CryptionReader`] — 解密读取器：从 BufferedReader 读取密文并解密
 //! - [`CryptionWriter`] — 加密写入器：加密明文后写入 Writer
 
+use std::task::{Context, Poll};
+
 use xray_buf::{
     buffer::Buffer,
     io::{self, Writer},
@@ -126,6 +128,9 @@ impl<'a> CryptionReader<'a> {
 pub struct CryptionWriter {
     stream: Box<dyn StreamCipher>,
     writer: Box<dyn Writer>,
+    /// poll 写路径的密文舞台：mb 在首 poll 同步加密后整批搬入（搬空即从
+    /// 调用方 mb 摘除——重 poll 不会重复 XOR），Pending 期间持久保存。
+    enc_stage: MultiBuffer,
 }
 
 impl CryptionWriter {
@@ -133,7 +138,7 @@ impl CryptionWriter {
     ///
     /// 对应 Go 的 `NewCryptionWriter(stream, writer)`。
     pub fn new(stream: Box<dyn StreamCipher>, writer: Box<dyn Writer>) -> Self {
-        Self { stream, writer }
+        Self { stream, writer, enc_stage: MultiBuffer::new() }
     }
 
     /// 加密并写入原始字节切片。
@@ -176,11 +181,21 @@ impl CryptionWriter {
 }
 
 impl Writer for CryptionWriter {
-    fn write_multi_buffer(
+    fn poll_write_multi_buffer(
         &mut self,
-        mb: MultiBuffer,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + '_>> {
-        Box::pin(async move { self.write_multi_buffer(mb).await })
+        cx: &mut Context<'_>,
+        mb: &mut MultiBuffer,
+    ) -> Poll<io::Result<()>> {
+        // 1. 同步加密：调用方 mb 逐块搬入密文舞台（每块恰一次——搬空即摘除）
+        while let Some(mut buf) = mb.split_first() {
+            let data = buf.as_mut();
+            if !data.is_empty() {
+                self.stream.xor_key_stream(data);
+            }
+            self.enc_stage.push(buf);
+        }
+        // 2. 驱动密文舞台下发（进度持久化在 enc_stage）
+        self.writer.poll_write_multi_buffer(cx, &mut self.enc_stage)
     }
 }
 

@@ -154,10 +154,7 @@ impl AsyncRead for LinkStream {
                 // pending 非空但无字节（全空 buffer）：释放后驱动底层。
                 this.pending.release();
             }
-            let got = {
-                let mut fut = this.reader.read_multi_buffer();
-                fut.as_mut().poll(cx)
-            };
+            let got = xray_buf::io::Reader::poll_read_multi_buffer(&mut this.reader, cx);
             match got {
                 Poll::Ready(Ok(mb)) => {
                     if mb.is_empty() {
@@ -189,10 +186,7 @@ impl AsyncWrite for LinkStream {
         let this = self.get_mut();
         let mut mb = MultiBuffer::new();
         mb.write_from(buf);
-        let got = {
-            let mut fut = this.writer.write_multi_buffer(mb);
-            fut.as_mut().poll(cx)
-        };
+        let got = xray_buf::io::Writer::poll_write_multi_buffer(&mut this.writer, cx, &mut mb);
         match got {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
             Poll::Ready(Err(xray_buf::io::Error::Eof)) => {
