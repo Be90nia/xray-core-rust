@@ -1,25 +1,66 @@
 # Xray-core-rust Layered Constitution (ARCHITECTURE.en.md)
 
 > **Force**: this is a governance document. Every new protocol and every AI subagent dispatch aligns on this map first, then acts.
-> **Details live elsewhere**: the full ruling is in [`docs/refs/oracle-framing-arch.md`](docs/refs/oracle-framing-arch.md) (oracle ruling); the defect inventory in [`docs/refs/alloc-audit-report.md`](docs/refs/alloc-audit-report.md) (AllocAudit). The constitution sets rules; details follow the links.
+> **Details live elsewhere**: the full rulings are in [`docs/refs/oracle-framing-arch.md`](docs/refs/oracle-framing-arch.md) (v1 ruling), [`docs/refs/oracle-framing-v2.md`](docs/refs/oracle-framing-v2.md) (v2: data-plane Filter/engine), [`docs/refs/oracle-framing-v3.md`](docs/refs/oracle-framing-v3.md) (v3: MVVM addendum); the defect inventory in [`docs/refs/alloc-audit-report.md`](docs/refs/alloc-audit-report.md) (AllocAudit). The constitution sets rules; details follow the links.
 > 中文版: [ARCHITECTURE.md](ARCHITECTURE.md)（主文档为中文版；本英文版跟随其同步修订，变更记录双记 / The Chinese file is the master; this English version is revised in lockstep with dual changelog entries）。
 > **Annotation discipline**: `[Current]` = shipped and grep-verifiable; `[Planned]` = ruled upon but not landed. Never write plans as current; never document un-stabilized APIs.
 > **Layered reading**: the compact block at the head of each section is the approved 138-line baseline (the TL;DR layer); the `Details` subsections are the expansion. Reading only the TL;DR layer aligns you on the map; actually building a protocol requires the full §3 recipe — this document is written to the standard "a developer who missed every decision session can build correctly from this file alone".
 
-## 0. TL;DR — The Three Layers
+## 0. TL;DR — The MVVM Five-Layer Panorama
 
 ### 0.1 The metaphor and the dependency direction
 
 The project owner's metaphor: **Skeleton layer (骨架) = GameFrameWork** (memory allocation & scheduling, thread management, resource reclamation — all framework-hosted); **Protocol flesh (血肉) = protocols and DNS** (protocol-logic development only); **Skin adapters (皮囊) = V2rayN-class clients** (the integration layer).
 
-```text
-Skin adapters     cli / config compatibility / commander API                  faces the outside world
-Protocol flesh    xray-proxy-* / transport protocol semantics / DNS / protocol-bearing app modules   writes protocol logic only
-Skeleton          tokio / xray-buf / dispatcher / unified accept / observability & tuning        hosts everything
+> Solid lines = dependencies (one-way downward: View→VM→Registry→Flesh→Skeleton, never reversed); dashed = data flow (counters up, control down). ⚔ = mechanized checkpoints. (Figure migrated verbatim from v3 §4; labels kept bilingual with the master.)
 
-Dependency direction: Skin → Flesh → Skeleton, strictly one-way.
-Flesh never imports Skin; protocols never bypass the skeleton for buffering / scheduling / accept / stats.
+```mermaid
+flowchart TB
+    subgraph VIEW["View · Skin (outside the repo)"]
+        GN["v2rayN GUI"]
+        CLIC["CLI / scripts"]
+        EXT["external monitors / clients"]
+    end
+
+    subgraph VML["ViewModel · binding layer (the only outward face in-repo)"]
+        CONF["xray-conf + parse_*_config<br/>config binding: dialect normalization<br/>⚔ §4.2 closed list + golden corpus"]
+        CMD["xray-app-commander<br/>status binding: gRPC read-only<br/>⚔ roster snapshot add-only"]
+        STAT["xray-app-stats + log<br/>counter aggregation + rendering"]
+    end
+
+    subgraph REG["Registry · decoupling hub"]
+        FR["FactoryRegistry<br/>explicit registration + tag selection<br/>⚔ dependency tier table + zero sibling edges"]
+        AH["AdminHandle control verbs"]
+    end
+
+    subgraph FLESH["Model · Flesh (three embed shapes, never importing each other)"]
+        HF["HeaderFilter family<br/>vless/vmess/ss/trojan... (tier H)"]
+        WC["WireCodec layer<br/>vision/enc/xor/TLS (tier W)"]
+        SSD["SessionService family<br/>quic/h2/ws/kcp/UDP (tier S)"]
+    end
+
+    subgraph SKELETON["Model · Skeleton engine"]
+        ENG["RelayEngine + accept framework"]
+        BUFN["xray-buf pool + io"]
+        OBSV["observability / tuning (P4/P5)"]
+        TOK["tokio runtime"]
+    end
+
+    VIEW -->|"json dialect / gRPC (frozen contracts)"| VML
+    VML -->|"register / tag lookup / AdminHandle"| REG
+    FR -->|"build / new_filter (zero-logic registration lines)"| FLESH
+    FLESH -->|"driven: ctx 14 fields = the entire visible universe"| SKELETON
+    STAT -.->|"counters/events up (data flow)"| SKELETON
+    AH -.->|"control verbs down (data flow)"| ENG
+
+    classDef checkpoint stroke:#c0392b,stroke-width:2px
+    class CONF,CMD,FR checkpoint
 ```
+
+How to read it in three sentences (v3 §4): **dependencies point only downward** (View never knows Model exists; flesh never knows commander exists); **the three ⚔ are the enforcement points of all discipline** (config snapshot, roster snapshot, dependency tier table — three CI checks govern the whole MVVM); **flesh's visible universe = the frozen ConnCtx fields (14+1, §6.4) + the registry** — everything else, being invisible, is unusable.
+
+Dependency direction: View → ViewModel → Registry → Flesh → Skeleton, strictly one-way.
+Flesh never imports the ViewModel (commander/stats/conf); protocols never bypass the skeleton for buffering / scheduling / accept / stats.
 
 Flesh scope: the 17 `xray-proxy-*` crates + the protocol-semantics portions of each transport + `xray-app-dns` and the protocol-bearing parts of the app modules (their hosting surfaces — connections, buffers, scheduling — remain skeleton).
 Skin scope: cli assembly, config-form compatibility, the commander API.
@@ -34,6 +75,8 @@ Verdict on the game-engine analogy: **copy "resource hosting + fill-in hooks"; d
 | Buffers & pool | [Current] xray-buf's 11 modules mirror Go `common/buf` file-for-file; two-tier pool (TLS cache + 8-shard global, 2K/8K/32K/128K); `Buffer` is `#[must_use]` and returns to the pool on Drop; `copy_with_options` is a literal translation of Go `buf.Copy`. [Planned] a zero-copy ingress `Buffer::from_bytes_frozen` for `Bytes`; de-boxing the io.rs Reader/Writer traits (poll-based + named-future default methods; a `BoxedReader` adapter at connection boundaries costs 1 box per connection) |
 | Transport abstraction | [Current] the `xray-transport-*` crate family; security (tls/reality) wrappers live in separate crates to break dependency cycles |
 | Dispatcher | [Current] DefaultDispatcher + decorator chain (SizeStat/Cached/EndpointOverride) + the splice admission gate (Go `CanSpliceCopy` 1/2/3 semantics). [Planned] decorators forward poll directly: 1 box per layer → 0 allocations |
+| Connection engine | [Planned · P2.5 (v2)] RelayEngine = DialBridge generalization: unifies the 5 fragmented pumps; RelayFilter's three callbacks (poll_decode/poll_encode/on_event); vmess inbound migrates first |
+| Registry | [Planned · P2.0 (v3)] FactoryRegistry explicit registration + config-tag selection: the central outbound/inbound match arms degrade to zero-logic registration lines; arm-embedded construction logic moves back into flesh with the arm (BuildCtx makes environmental deps explicit) |
 | Unified accept | [Current] hand-rolled loops per transport + spot 4s timeouts (httpupgrade/websocket each hand-copied); serial-accept residue (a slow ClientHello occupies the accept slot); httpupgrade's PROXY protocol read sits outside the timeout window. [Planned] `accept_loop` + `AcceptLimits` + `StreamHandshake` generic handshake callback (monomorphized, zero box); QUIC/UDP get their own thin template — no forced unification |
 | Observability | [Current] stats counters + debug logs — thin. [Planned] per-stage atomic counters + periodic tracing (accept rate / handshake-latency histogram / timeout count / active conns), relay backlog watermark; no metrics framework |
 | Tuning surface | [Current] window/timeout constants are hardcoded (the 88m0 receive-window pin and the enc8x h2-window pin each cost a code→CI→kernel-swap cycle, ~4 hours). [Planned] constants become config: default TCP SO_RCVBUF, h2 STREAM_WINDOW/max_send_buf, hyper send_buf, bridge idle (300s/1s), handshake timeout |
@@ -51,7 +94,7 @@ Verdict on the game-engine analogy: **copy "resource hosting + fill-in hooks"; d
 
 ### 0.4 Document conflict resolution order
 
-This constitution > the two governance inputs in `docs/refs/` (ruling / audit details) > memory-bank lessons (possibly stale). **Whenever any document contradicts the code, the code wins** — fix the document; if the document is right and the code looks wrong, report the suspected bug, don't fix code from a documentation task. Every `[Current]` claim here carries an anchor — verify the anchor before citing it.
+This constitution > the four governance inputs in `docs/refs/` (v1/v2/v3 rulings + audit details) > memory-bank lessons (possibly stale). **Whenever any document contradicts the code, the code wins** — fix the document; if the document is right and the code looks wrong, report the suspected bug, don't fix code from a documentation task. Every `[Current]` claim here carries an anchor — verify the anchor before citing it.
 
 ## 1. Skeleton Promises
 
@@ -70,6 +113,18 @@ What flesh **gets** (promises; a missing promise is a skeleton bug):
 | escape hatches | the splice admission gate and opt-in readv are first-class citizens, each with its own benchmark; never deleted as a side effect of "unification" |
 
 What flesh **never builds itself** (obligation boundary): ① no raw heap allocation on hot paths (clippy red line, §6); ② no hand-written accept loops, no self-rolled timeout/rate limiting (today's spot 4s patches are debt, not a pattern); ③ no spawning threads, no wrapping executors; ④ no bypassing the dispatcher with self-built stats/log channels; ⑤ no local window/timeout constants (take skeleton defaults; special needs go through the config surface [Planned]).
+
+**The flesh-visible five-piece set (v3 §7.4: the final form of §1's promises, positive list frozen)**:
+
+| # | Facade | Entry | Promise |
+|---|---|---|---|
+| 1 | logging facade | `ctx.event(level, msg, fields)` — the engine builds the span at accept; conn_id/stage/inbound_tag/target/email attach automatically; a peer disconnect is never ERROR (levels follow the RelayError classification) | P6 |
+| 2 | event manager | lifecycle = engine pre-wiring (zero flesh action); tier S may `ctx.subscribe_mgmt()` for hot-reload | P8 (§1.3) |
+| 3 | buffer pool | `ctx.alloc()` / `ctx.scratch()` | P1 |
+| 4 | supervised scheduling | `ctx.spawn_supervised(name, fut)` — session-table registration, terminal reclamation (seals the s9/s10 leak class) | P3 |
+| 5 | hot-tuning reads | `ctx.tuning() -> &TuningSnapshot` — read-only snapshot + generation; writes belong to AdminHandle | P5 |
+
+**Beyond the five, all banned**: direct tokio (tier-S whitelist exception unchanged), sockets, log macros, self-built channels, global statics, self-parsed config. Negative-list enforcement: the §6.4 clippy trio. The positive list's value: a flesh developer needs only these five to write a protocol — the skeleton is to flesh what the ViewModel is to View: a stable interface.
 
 ### 1.2 Details — each promise as a triple (current anchor + planned sketch + acceptance)
 
@@ -150,6 +205,22 @@ pub fn accept_loop<H: StreamHandshake>(listener: TcpListener, hs: H, limits: Acc
 - Current anchors: splice admission gate at `xray-app-dispatcher/src/default.rs:1768-1783` (Go `CanSpliceCopy` 1/2/3 semantics); readv stays opt-in (a07041ae measured -25% on real networks — batching is not free).
 - Plan: none — preserving the status quo IS the promise; no "unification" may delete them in passing, each keeps its own benchmark.
 - Acceptance: readv_perf.rs-class micro-benches survive; splice-gate semantics stay Go-aligned (covered by the PR porting note).
+
+### 1.3 Details — the event manager (Promise 8, v3 §7 addendum)
+
+**Form red line: pre-wiring + disciplined encapsulation, not a bus. Total budget ≈ one file, ~200 lines** (`ConnEventRecord` + `LifecycleTap` (bounded mpsc) + `MgmtWatch` (watch channel) + one drain task) — exceeding this size, or the appearance of "topic registration", means it has become a bus framework; cut back to the pre-wired form.
+
+| Class | Events | Channel verdict | Backpressure semantics |
+|---|---|---|---|
+| T1 connection lifecycle | accept / handshake done / half-close / close (reasons via the RelayError classification) | engine **synchronous direct call** to the filter (zero hot-path indirection); off-connection observers = startup-time explicitly registered `LifecycleTap` (bounded mpsc + single drain task); no runtime subscription. RelayFilter does not go through this | full → drop + self-count `events_dropped{tap}`; **never backpressures the pump** |
+| T2 process management | config hot-reload (new window/timeout values + generation), shutdown, stats ticks | `tokio::sync::watch` (latest value wins, lossy by nature); broadcast (no replay need) / mpsc (multi-subscriber needs central routing) vetoed | watch has no backpressure problem (readers always get the latest) |
+| T3 data-plane alerts | watermark / rate-limit trips / rekey | **no new channel**: magnitudes → counters; discrete turns → `ctx.event` log; in-connection control → existing ctx methods (`set_idle`/PauseRead) | — |
+
+- Backpressure iron rules: every observer channel is **bounded**; full → drop + self-count, **never block the pump** (observability must not tax — a generalization of the double-splice-revert lesson); drops are themselves observable (`events_dropped` surfaces as an alert). Slow subscribers are fixed by batched drain/aggregation, never by adding buffers.
+- **Single-source-of-truth rule**: `on_event` is the engine's synchronous direct call into the filter (in-connection control flow), not a subscription of the event manager — one source, two sinks: the filter gets it synchronously (must be fast), the T1 tap gets a lightweight `ConnEventRecord` (Copy, no payload) asynchronously. Counters are the first truth (atomic adds, never dropped); events are timeline supplements (droppable, for diagnostics); stats **never depends on event consumption for aggregation** (event drops must not pollute counters).
+- Selection principle: **control flow never rides the event channel** — dial completion, half-close decisions, error handling are all engine synchronous direct calls; a dropped event loses diagnostics, never correctness.
+- Landing: T1 pre-wiring ships with the **P2.5 engine** batch (the engine already notifies at half-close/close anyway); T2 watch ships with **P3 hot tuning** (it is the carrier of config hot-reload); first observers = observatory, online-ip, the admin active-connection table (implicit counters become explicit subscriptions).
+- Flesh-defined events: **YAGNI veto** (zero scenarios today + the event-enum ownership paradox, v3 §7.5; reopening requires all three criteria via RFC). Flesh wanting to "publish" something → `ctx.event` (log timeline) or a counter (magnitudes) — observational semantics, both within the five-piece set.
 
 ## 2. Rust Pitfalls the Framework Eats
 
@@ -343,12 +414,22 @@ Taking "mock: length-prefixed frames + token handshake" as the minimal walkthrou
 | the handler-lifecycle lesson | `xray-proxy-anytls` | the §2 pit-2 incident site and fix (start() moved out + pending keep-alive) |
 | a negative exemplar (awaiting P1) | `xray-transport-splithttp` | the h2/Bytes-boundary to_vec family F1/F2/F3/F15 — new protocols must NOT imitate it; wait for `from_bytes_frozen` |
 
-## 4. Skin Contract
+## 4. ViewModel Contract
 
 ### 4.1 TL;DR
 
 **Config-form compatibility promise**: config forms defined by Go Xray-core (including v2rayN mixed-form JSON and historical `streamSettings` shapes) are a **compatibility promise**: internal refactors must not break existing config parsing. Self-invented forms carry no promise; framework APIs never rename ahead of Go. Cautionary tale: the proxyman parallel universe (built, never wired in) — skin integration always goes through the production assembly path.
 **commander API boundary**: commander is the skin's management-surface entry into skeleton/flesh; outward-facing API changes are bound by the §6 graduation gate; the skin never touches flesh internals.
+
+**Naming the ViewModel (v3 §2)**: the in-repo "outward face" = the four crate groups xray-conf + commander + stats + log, plus one boundary law — together the **ViewModel** (the sum of View's binding surfaces). View lives outside the repo (v2rayN/CLI), so View ⊥ Model holds naturally; what actually needs defending is the in-repo VM↔M boundary. Three contracts:
+
+| Contract | Frozen object | Mechanization |
+|---|---|---|
+| ① config binding (View→Model) | the §4.2 closed list + the normalized entry signature (exactly one public `parse_*_config` per flesh crate) | golden config corpus snapshots (end of §4.2) |
+| ② status binding (Model→View, read-only) | gRPC endpoint names / counter names / log field names, **add-only** | roster snapshot test (end of §4.3) |
+| ③ VM's own dependency discipline | VM may depend on: the whole skeleton, registry handles, flesh's public parse entries and read-only query traits; may not: name flesh types bypassing the registry, or write protocol semantics in the VM (parser normalization excepted — that IS binding work) | the dependency tier table (§6.4) |
+
+**Composition-root honesty clause**: binaries must link the flesh crates (physical reality: feature-gated dist trimming); `use` is allowed up to the **registration line** (`reg.outbound::<FreedomFactory>("freedom")`) and nothing beyond — **linking is legal, naming-and-constructing is not**. Overall boundary: flesh crates never import any commander/stats/conf symbol; the ViewModel never imports flesh Handler/Filter types (trait objects come only via the registry).
 
 ### 4.2 Details — the v2rayN mixed-form promise list (itemized, anchors verifiable)
 
@@ -375,6 +456,8 @@ The verified forms as JSON (commit-message semantics):
 {"dns": {"servers": ["8.8.8.8", "1.1.1.1"]}}                              // bare strings
 ```
 
+**v3 institutionalization (the guarantee mechanisms of the config-binding contract)**: ① **the golden config corpus** — the repo keeps a set of real v2rayN-exported configs as fixtures (one per verified §4.2 form + the SS-2022 field-verified sample as the first batch), each asserting `parse → serde-serialize the normalized struct → byte-identical to the snapshot`; **any kernel refactor that turns a snapshot red is a violation** — the mechanized form of "kernel refactors never ripple into the skin" ("pin with a test" upgraded from a per-ticket practice to an all-protocol corpus). ② **one normalized entry** — exactly one public parse entry per flesh crate, doing the dual-form branch inside (the d0555c26 pattern); the post-normalization internal structure may be refactored freely and never leaks — the skin sees only the json dialect, flesh internals see only normalized types.
+
 ### 4.3 Details — the commander API endpoint inventory
 
 - **Exposure shape**: gRPC (tonic); listen on TCP (`127.0.0.1:port`) or a Unix socket (commander.rs:43-46); **declaration-based** — only services listed in `ApiConfig.services` are exposed (commander.rs:191-194, matching Go Commander.Start).
@@ -382,6 +465,7 @@ The verified forms as JSON (commit-message semantics):
 - **StatsService** (grpc.rs:51), **LoggerService** (RestartLogger, grpc.rs:36-37,364-368), **RoutingService** (TestRoute with FieldSelectors projection / GetBalancerInfo / SubscribeRoutingStats, grpc.rs:15-17), **ObservatoryService** (grpc.rs:57-59).
 - **Injection point**: `xray-core/src/functions.rs:364-367` (bd ze3/bg7: HandlerService operates the production SimpleOhm; LoggerService wires LogInstance::restart; matches Go Commander.Start RequireFeatures).
 - **Change procedure**: proto changes go through `xray-proto`; outward semantic changes pass the §6 graduation gate; **parallel-universe ban** — the proxyman crate's parallel assembly is never wired into the skin; the skin only walks the production path.
+- **v3 status-binding discipline (the add-only roster)**: counter names / endpoint names / log field names = View contracts (`outbound>>>tag>>>traffic>>>downlink` is already consumed by external tooling, cited at default.rs:376) — **adding is free; renaming/deleting is forever forbidden** (retire by marking deprecated, keeping the shell). Evolution rule: a new observable = the VM layer (stats/log) adds aggregation and exposure; flesh adds at most one `ctx.counter()`/`ctx.event()` call site; **endpoint definition lives only in the VM layer** — flesh never defines gRPC surfaces. Mechanization: CI enumerates all registered counter names and gRPC method names; a snapshot diff goes red (one of the three P0 guardrail additions, T0.7).
 
 ### 4.4 Details — the skin compatibility change procedure
 
@@ -391,7 +475,7 @@ The verified forms as JSON (commit-message semantics):
 
 ### 5.1 TL;DR
 
-Standing discipline: every phase exits with CI's nine gates + non-regressing bench guardrails + **real-endpoint same-window paired A/B** for anything touching the network path (localhost cannot expose window pins or network-path regressions). Guardrail tooling exists today: the loopback throughput matrix (baseline 154–167MB/s), stress.yml, xray-stress scenarios s5–s12, the clippy wide-gate mirror. Dependencies: P0 → P1 → {P2 ∥ P3} → P4; P3's timeout item depends on where P2 lands AcceptLimits.
+Standing discipline: every phase exits with CI's nine gates + non-regressing bench guardrails + **real-endpoint same-window paired A/B** for anything touching the network path (localhost cannot expose window pins or network-path regressions). Guardrail tooling exists today: the loopback throughput matrix (baseline 154–167MB/s), stress.yml, xray-stress scenarios s5–s12, the clippy wide-gate mirror. Dependencies: P0 → P1 → {P2 ∥ P2.0 ∥ P3} → P2.5 → P4; **P2.0 (registry) precedes P2.5 (the engine takes factories from the registry; reversing the order guarantees rework)**; P3's timeout item depends on where P2 lands AcceptLimits.
 
 | Phase | Deliverables | Falsifiable exit criteria |
 |---|---|---|
@@ -401,13 +485,18 @@ Standing discipline: every phase exits with CI's nine gates + non-regressing ben
 | P3 tuning + observability | window/timeout constants into config; relay backlog watermark + per-tag error counters | One real tuning pass without touching cargo; hang drill localized in <5 minutes |
 | P4 API graduation | recipe docs; stable markers; Go↔Rust mapping table + PR porting-note field | The next real protocol lands via the recipe: zero off-framework allocations, zero hand-written accept |
 
+**v3 roadmap addendum (v3 §5)**: ① **P0 gains three cheap guardrails** (same batch as AllocGuard): the dep-tier script (T0.5), the golden-corpus first batch (T0.6), the roster snapshot (T0.7) — establish the enforcement points before the big surgery, same class as the counting allocator. ② **P2.0 registry refactoring** (new slot; parallel with P1/P2 — the three touch disjoint files: assembly wiring/outbound vs xray-buf vs transport listen loops): **pure code-moving**, gate = 32/32 integration + golden corpus green; no performance claim, **no A/B gate** (never touches the data plane). ③ **P2.5 RelayEngine** (v2 ruling): DialBridge generalization, vmess first, gate per v2 §2.4; **T1 event pre-wiring ships with the batch**. ④ P3 gains **T2 watch with the batch** (T3.5). The vmess-first v2 migration sequence stays verbatim (the engine mechanism is orthogonal to the MVVM layering); the AllocGuard P0 numbers all remain valid, and the steady-state 0-alloc/chunk gate is promoted to a tier auditor (CI smoke runs one connection against a tier-H protocol, asserting zero allocations outside pool/ctx — proof flesh never bypassed the narrow interface).
+
 ### 5.2 Details — task breakdown (dispatchable granularity)
 
-**P0 guardrails first** (4 tickets; internal order T0.1→T0.3→T0.4):
+**P0 guardrails first** (7 tickets; internal order T0.1→T0.3→T0.4; T0.5–T0.7 are the v3 addendum guardrails, same batch as the counting allocator):
 - T0.1 counting allocator: feature `bench-alloc`, global allocator wrapper (bypassing mimalloc for stats), per-relay-direction alloc counts/bytes/MB. Acceptance: an alloc/MB report for any e2e scenario.
 - T0.2 clippy bans: the `disallowed-methods` list (hot-path crates forbid `to_vec`/bare `Vec::new` into pooled paths), existing hits exempted one by one with reasons. Acceptance: the CI red line live; new bypasses cannot enter.
 - T0.3 bench baselines: the loopback throughput matrix + splithttp/vision/grpc real-endpoint same-window paired runs (5 rounds each, median) archived.
 - T0.4 the three baseline reports (depends on T0.1+T0.3): **P0's exit is three sets of numbers; without them every later "no regression" is oral**.
+- T0.5 [Planned · v3] `tools/check_dep_tiers.py` (~50 lines) + the declarative tier-table whitelist (§6.4): cargo metadata asserts flesh normal deps ⊆ the tier whitelist and zero sibling edges among xray-proxy-*/xray-transport-*; exemptions live in `docs/refs/dep-tier-waivers.md` (each with a reason + re-review date). Acceptance: the CI red line live; forged dependency edges cannot enter.
+- T0.6 [Planned · v3] golden config corpus first batch: one fixture per verified §4.2 form + the SS-2022 field-verified sample, snapshot-asserted byte-identical (mechanism at the end of §4.2). Acceptance: the mechanized "kernel refactor turning a snapshot red = violation" is live.
+- T0.7 [Planned · v3] stats/gRPC roster snapshot test: CI enumerates all registered counter names and gRPC method names and diffs the snapshot (add-only enforcement, end of §4.3). Acceptance: renaming/deleting a counter name goes red in CI.
 
 **P1 data-plane convergence** (6 tickets; depends on P0; T1.3 depends on T1.2):
 - T1.1 `Buffer::from_bytes_frozen` + MultiBuffer compatibility (interior enum Frozen|Pooled). Acceptance: hyper Bytes→relay at 0 copies (proven by the counting allocator).
@@ -424,11 +513,21 @@ Standing discipline: every phase exits with CI's nine gates + non-regressing ben
 - T2.4 the QUIC/UDP thin template (reusing limits + observability, with open_bi first-packet semantics). Acceptance: existing tuic/hysteria e2e all green.
 - T2.5 slowloris/slow-read/flood conformance into CI. Acceptance: max_pending full → new connections queue rather than get refused; permits released after timeout; all three cases green.
 
-**P3 tuning + observability** (4 tickets; parallel with P2; T3.1's timeout item depends on T2.1):
+**P2.0 registry refactoring** ([Planned · v3] new slot; parallel with P1/P2, **precedes P2.5**):
+- One PR per protocol: the construction logic inside the central match arms (`build_protocol_handler` from outbound.rs:650; inbound is the same shape) moves **verbatim** into `OutboundFactory::build` (BuildCtx making environmental deps explicit: policy/dns/mux_bridges/inbound_default_rules, v3 §3.1 signature); the central file degrades to zero-logic registration lines in wiring.rs (`reg.outbound(FreedomFactory); …` — only lines, no logic). Factory trait, two methods: `tag()` (doubles as the config tag) + `build(&BuildEntry, &mut BuildCtx)`.
+- Gate: 32/32 integration + golden corpus green; **no performance claim, no A/B gate** (never touches the data plane). Falsifiable: a protocol's move PR exceeding 3 days → BuildCtx is missing an environmental dep; extend BuildCtx, never loosen the registry law.
+
+**P2.5 RelayEngine** ([Planned · v2] v2 ruling §6; depends on P2.0):
+- Engine = DialBridge generalization (not a rewrite): the three RelayFilter callbacks (poll_decode/poll_encode/on_event) + five Actions + staging ownership handoff; **vmess inbound migrates first** (the messiest: duplex pump + UDP pump + join all collapse into the engine), then vless, then the batches; hard boundary: quinn/hyper/tungstenite are never onData-ized (they embed as SessionService).
+- Gate (v2 §2.4): 32/32 integration + counting allocator steady-state 0 alloc/chunk + loopback ≥ the 154-167MB/s baseline + real-endpoint same-window A/B; two consecutive A/B regressions on one protocol → stop and diagnose.
+- **T1 event pre-wiring ships with the batch**: the engine already notifies at half-close/close; tap in the LifecycleTap (§1.3) in passing; first observers = observatory, online-ip, the admin active-connection table (implicit counters become explicit subscriptions).
+
+**P3 tuning + observability** (5 tickets; parallel with P2; T3.1's timeout item depends on T2.1; T3.5 is the v3 addendum):
 - T3.1 constants into config: default TCP SO_RCVBUF / h2 STREAM_WINDOW+conn window+max_send_buf / hyper send_buf / bridge idle (300s/1s) / handshake timeout. Acceptance: the enc8x numbers (16MB window @0.3s RTT, 40-60MB/s) reproduced once via config.
 - T3.2 relay backlog watermark (channel depth) + per-tag error counters. Acceptance: a manufactured 2087-style hang surfaces in alerts/logs <1min.
 - T3.3 hang-drill acceptance: <5 minutes from detection to localization.
 - T3.4 full-process acceptance: one real tuning pass never touching cargo.
+- T3.5 [Planned · v3] the T2 event watch (MgmtWatch) lands with hot tuning: the runtime carrier of config hot-reload (new window/timeout values + generation number); tier-S flesh may subscribe via `ctx.subscribe_mgmt()` (§1.3). Acceptance: subscribers receive the new value + generation after a hot reload; torn/stale reads are handled per v3 §7.6 with generation validation, never by changing the channel form.
 
 **P4 API graduation** (3 tickets; depends on P1+P2 consumers landing):
 - T4.1 the recipe doc (this §3, maintained) + a trivial protocol end to end (echo over a custom frame, built from zero via the recipe). Acceptance: it runs + an old-vs-new code-size/allocation comparison table.
@@ -444,6 +543,7 @@ Standing discipline: every phase exits with CI's nine gates + non-regressing ben
 3. **API graduation gate (hard gate)**: marking an API stable requires ≥3 real protocol consumers + a same-window A/B number from each; until then `pub(crate)` or `#[doc(hidden)]`. First graduates must be shape-diverse (splithttp = h2/Bytes boundary, grpc = message frames, kcp = UDP) to prevent overfitting to TCP streaming.
 4. **negative-optimization history, remember** (each happened; do not repeat): bridge-pump revert 378ab889; double splice revert d8562b56/a427613b; ReadVReader -25% on real networks a07041ae. Corollary: a-priori abstraction's hit rate here ≈ 0; every optimization must pass a real-endpoint same-window paired A/B.
 5. **Go-diff discipline**: mirror-style framework building shrinks the diff (Go `common/buf` exists; protocols port 1:1; home-grown styles grow it); xray-buf maintains a Go API↔Rust API mapping table; the PR template carries a porting-note field (did the upstream change touch buf ownership / windows / timeouts / accept semantics).
+6. **Decoupling's three laws, mechanized (v3: decoupling never rides on good intentions)**: the registry law / narrow-interface law / framework-driven law all get CI enforcement (§6.4); the enforcement trio = `check_dep_tiers.py` (dependency edges) + cargo-deny (global bans) + clippy disallowed (symbol level).
 
 ### 6.2 Details — operational shapes
 
@@ -468,6 +568,38 @@ Every AI subagent ticket must carry these fields (missing any = bounced):
 
 A subagent reporting PASS ≠ actually PASS (Batch16 proof: the subagent ran only its own new tests and missed 4 fixture references) — the main agent's acceptance must run the full affected test surface, never trusting self-reports.
 
+### 6.4 Details — decoupling's three laws, mechanized (v3: decoupling never rides on good intentions)
+
+| Law | Verdict | Mechanized form |
+|---|---|---|
+| Registry law | **explicit registration functions + config-tag selection**. inventory/linkme static registration vetoed: link-time magic — which protocols are in the binary becomes invisible, dist feature trimming turns implicit, the debugging trail is un-greppable. Factory signatures carry BuildCtx (the match-arm lesson: arms embed construction logic; logic moves back into flesh with the arm) | zero-logic wiring.rs registration lines + the dependency tier table asserted in CI (T0.5) |
+| Narrow-interface law | **the three-tier dependency whitelist + the frozen ConnCtx** (14 fields + the 15th, `tuning()`; adding a method = RFC + tier-whitelist re-review; never admissible: config json, registry handles, runtime handles, socket types) | check_dep_tiers.py + clippy symbol bans |
+| Framework-driven law | control verbs (retune/disconnect/reload) path = commander(gRPC) → the **AdminHandle** trait (skeleton-implemented: the engine control plane + the hot-tuning surface) → engine executes; the VM only translates, never executes; flesh never receives control verbs | v2's RelayFilter/SessionService already covers the data plane; AdminHandle closes the loop with the control channel |
+
+The three-tier dependency whitelist (governs normal deps; dev-dependencies exempt — the table governs production, not tests):
+
+| Tier | Covers | Allowed deps | Additionally banned |
+|---|---|---|---|
+| H pure logic (HeaderFilter) | vless/vmess/ss/trojan/http/socks/dokodemo/loopback/blackhole | std, xray-buf, xray-common, xray-crypto, xray-proto, xray-features | tokio, quinn/hyper/h2, tracing, direct `bytes`, sibling flesh |
+| W connection wrapper (WireCodec) | vision/xor/enc, xray-tls, xray-reality | H + tokio (default-features=false, io+time only), xray-transport (traits), the rustls family | tokio::net, direct tokio::spawn, tracing macros, sibling flesh |
+| S engine-embedded (SessionService) | quic/hysteria/tuic, splithttp/grpc, ws, kcp | W + each engine (quinn/hyper/tungstenite) + tokio (full) | bare listener bind, direct tokio::spawn (use `ctx.spawn_supervised`), tracing macros, sibling flesh |
+| global (all flesh) | — | — | mimalloc (workspace-level allocator), tokio::process, std::thread |
+
+**The enforcement trio** (each with one job, no wheel reinvention): ① `check_dep_tiers.py` (cargo metadata) governs **dependency edges** — flesh normal deps ⊆ the tier whitelist, and xray-proxy-*/xray-transport-* crates have zero edges among themselves (no edge = no type smuggling: Rust's dependency graph IS the visibility boundary); ② cargo-deny `[bans]` governs **global bans** (mimalloc etc.); ③ clippy per-crate `disallowed_methods` (tier S: no direct `tokio::spawn`; tiers H/W: no `to_vec` family) + `disallowed_types` (flesh: no `std::net::TcpListener`/tokio::net) + `disallowed_macros` (flesh: no tracing macros) governs the **symbol level** (macros/methods invisible to the dependency edge).
+
+The frozen ConnCtx list — the sum of flesh's visible universe (v2 §7 sketch → frozen at v3 §3.2 as 14 items; §7.4's added 15th item `tuning()` is that RFC's first exercise; the freeze discipline itself unchanged):
+
+```rust
+// observability (P4/P6)                        // resources (P1)
+event(level, msg, fields)  counter() -> StatHandle   alloc() -> Buffer  scratch() -> &mut Scratch
+// control plane (P2/P3)
+dial(dest, opts) -> DialTicket  wake()  /*Parked*/  set_idle(d)  spawn_supervised(name, fut) -> TaskHandle
+// read-only metadata                           // tuning (P5, v3 15th item)
+access: AccessContext  peer() -> SocketAddr  target() -> Option<&Destination>  now()  tuning() -> &TuningSnapshot
+```
+
+Freeze rules: ConnCtx is a **concrete struct** in the skeleton (not a trait — boring first); ctx is the sum of flesh's visible universe, and growth is coupling. Falsifiable flip conditions (v3 §6/§7.6): more than 5 tier-table waivers within two weeks = wrong tiering, re-tier instead of piling waivers; ≥3 registration-line merge conflicts in one iteration window = flip to linkme (the FactoryRegistry trait unchanged — the mechanism is swappable, the contract is not); a new protocol adding a field via RFC is normal evolution — only ≥3 consecutive new protocols needing fields would indict the design; torn/stale hot-reload reads via watch → add generation validation to TuningSnapshot, never change the channel form; T1 tap's steady-state drop rate >0.1% → batched drain aggregation, never add buffers or limit the pump.
+
 ## 7. Explicitly Not Doing (negative list)
 
 ### 7.1 TL;DR
@@ -489,6 +621,6 @@ New scheduler / executor wrappers; ECS and componentization; macro-generated cod
 
 ---
 
-Changelog: 2026-10-11 initial draft (the approved 138-line version, now the TL;DR layer of each section), based on the oracle ruling + the AllocAudit; same day added §2 "Rust Pitfalls the Framework Eats" (owner request); same day this English version added (cross-linked; bilingual sync discipline: Chinese is the master, revisions dual-recorded); the two governance inputs moved into `docs/refs/` (originally D:/tmp/, md5-identical: 0692ca24…/f50019a5…); same day expanded to the detailed edition at the owner's request (the ≤300-line cap lifted, target 500-800 lines per language; the TL;DR layer preserved verbatim; §0.3/1.2/2.2/3.2-3.11/4.2-4.4/5.2/6.2-6.3/7.2 are the expansion layer; the detail standard: a protocol developer who missed every decision session can build correctly from this document alone).
+Changelog: 2026-10-11 initial draft (the approved 138-line version, now the TL;DR layer of each section), based on the oracle ruling + the AllocAudit; same day added §2 "Rust Pitfalls the Framework Eats" (owner request); same day this English version added (cross-linked; bilingual sync discipline: Chinese is the master, revisions dual-recorded); the two governance inputs moved into `docs/refs/` (originally D:/tmp/, md5-identical: 0692ca24…/f50019a5…); same day expanded to the detailed edition at the owner's request (the ≤300-line cap lifted, target 500-800 lines per language; the TL;DR layer preserved verbatim; §0.3/1.2/2.2/3.2-3.11/4.2-4.4/5.2/6.2-6.3/7.2 are the expansion layer; the detail standard: a protocol developer who missed every decision session can build correctly from this document alone); same day, the v3 addendum revision (per the oracle-framing-v3 ruling: §0's three-layer diagram replaced by the MVVM five-layer panorama + the three-sentence reading; §0.2 gains the connection-engine/registry [Planned] rows; §1 expanded with the flesh-visible five-piece set + new §1.3 event-manager Promise 8 (T1/T2/T3 channels + backpressure + single-source-of-truth + the ~200-line red line); §4 renamed the ViewModel Contract, incorporating v3 §2's three contracts and the composition-root honesty clause, with the seven v2rayN promises kept as config-binding-surface evidence and the golden-corpus + add-only-roster mechanisms landed; §5 inserts the P2.0 registry refactoring (preceding the P2.5 engine; pure code-moving, no A/B gate) and the P2.5 engine slot, P0 gains three guardrails (T0.5-T0.7), and event pre-wiring is annotated to its batches (T1 with P2.5, T2 with P3); §6 gains §6.4 decoupling's three laws mechanized (the tier whitelist + frozen ConnCtx + the enforcement trio). The TL;DR layer preserved verbatim, additions only; the Current/Planned annotation discipline maintained throughout; bilingual sync, dual changelog entries).
 
-Provenance note: `docs/refs/oracle-framing-arch.md` (the FramingArch ruling, 2026-10-11) and `docs/refs/alloc-audit-report.md` (the full-repo data-plane hot-path allocation audit) originated in the session temp directory D:/tmp/ and were copied byte-identically into the repo on 2026-10-11 (a `!docs/refs/` exception was added to .gitignore).
+Provenance note: `docs/refs/oracle-framing-arch.md` (the v1 FramingArch ruling, 2026-10-11) and `docs/refs/alloc-audit-report.md` (the full-repo data-plane hot-path allocation audit) originated in the session temp directory D:/tmp/ and were copied byte-identically into the repo on 2026-10-11 (md5: 0692ca24…/f50019a5…; a `!docs/refs/` exception was added to .gitignore); `docs/refs/oracle-framing-v2.md` (the data-plane Filter/engine ruling) and `docs/refs/oracle-framing-v3.md` (the MVVM addendum ruling) were copied byte-identically from D:/tmp/ the same day, md5: `a3faf3bacd179effc230912dc975895c` / `174a9c38b9bfabd1be26e8f53e14a37d`.
