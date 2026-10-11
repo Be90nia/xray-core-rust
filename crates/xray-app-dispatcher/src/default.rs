@@ -15,7 +15,15 @@
 //!   全链路
 //! - [`CachedReader`] — 依赖 `pipe.Reader`，主体留 TODO
 
-use std::{collections::HashMap, fmt::Debug, future::Future, net::IpAddr, pin::Pin, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    future::Future,
+    net::IpAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use xray_buf::multi::MultiBuffer;
 
@@ -1483,8 +1491,7 @@ impl CachedReader {
             .inner
             .as_mut()
             .ok_or_else(|| DispatcherError::Io("cached reader: no inner reader".into()))?;
-        let mb = inner
-            .read_multi_buffer()
+        let mb = std::future::poll_fn(|cx| inner.poll_read_multi_buffer(cx))
             .await
             .map_err(|e| DispatcherError::Io(format!("cached reader read_first: {e}")))?;
         if !mb.is_empty() {
@@ -1503,8 +1510,7 @@ impl CachedReader {
             .inner
             .as_mut()
             .ok_or_else(|| DispatcherError::Io("cached reader: no inner reader".into()))?;
-        let mb = inner
-            .read_multi_buffer()
+        let mb = std::future::poll_fn(|cx| inner.poll_read_multi_buffer(cx))
             .await
             .map_err(|e| DispatcherError::Io(format!("cached reader read_more: {e}")))?;
         if mb.is_empty() {
@@ -1527,22 +1533,23 @@ impl CachedReader {
 }
 
 impl xray_buf::io::Reader for CachedReader {
-    fn read_multi_buffer(
+    fn poll_read_multi_buffer(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<MultiBuffer, xray_buf::io::Error>> + Send + '_>> {
-        Box::pin(async move {
-            // 先回放缓存
-            if let Some(cached) = self.cache.take() {
-                if !cached.is_empty() {
-                    return Ok(cached);
-                }
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<MultiBuffer, xray_buf::io::Error>> {
+        // 先回放缓存（仅 take 空缓存或一次性命中，无 Pending 后丢数据路径）
+        if let Some(cached) = self.cache.take() {
+            if !cached.is_empty() {
+                return Poll::Ready(Ok(cached));
             }
-            // 缓存空，读 inner
-            let inner = self.inner.as_mut().ok_or_else(|| {
-                xray_buf::io::Error::ReadError("cached reader: no inner reader".into())
-            })?;
-            inner.read_multi_buffer().await
-        })
+        }
+        // 缓存空，读 inner（同步直通，零分配）
+        let Some(inner) = self.inner.as_mut() else {
+            return Poll::Ready(Err(xray_buf::io::Error::ReadError(
+                "cached reader: no inner reader".into(),
+            )));
+        };
+        inner.poll_read_multi_buffer(cx)
     }
 }
 
@@ -1760,6 +1767,7 @@ impl DispatchHandler for DialBridge {
         Box::pin(async move {
             match dial(&dest).await {
                 Ok(remote) => {
+                    eprintln!("[splice-probe] dial ok raw={}", remote.is_raw_tcp());
                     // splice 快路径判定（txno-splice，Go freedom.go:428-436 +
                     // proxy.go:718-751 的等价判定点）：入站元数据经
                     // [`INBOUND_SPLICE`] 抵达，出站信号 = splice_out（freedom
@@ -1803,11 +1811,14 @@ impl DispatchHandler for DialBridge {
                         }
                     }
                     let _ = &inbound; // 非 Linux：元数据仅参与判定日志
+                    eprintln!("[splice-probe] bridge start");
                     if let Err(e) = bridge_link_with_stream_full(link, remote, &policy).await {
+                        eprintln!("[splice-probe] bridge ended: {e}");
                         tracing::warn!(tag = %tag, "bridge ended: {e}");
                     }
                 },
                 Err(e) => {
+                    eprintln!("[splice-probe] dial failed: {e}");
                     tracing::error!(tag = %tag, "dial failed: {e}");
                 },
             }
@@ -2386,10 +2397,7 @@ mod tests {
             io::{AsyncReadExt, AsyncWriteExt},
             net::{TcpListener, TcpStream},
         };
-        use xray_buf::{
-            io::{Reader, Writer},
-            multi::MultiBuffer,
-        };
+        use xray_buf::{io::Writer, multi::MultiBuffer};
         use xray_common::net::{
             address::Address, destination::Destination, network::Network, port::Port,
         };
@@ -2443,12 +2451,13 @@ mod tests {
 
         let mut mb = MultiBuffer::new();
         mb.merge_bytes(b"e2e dispatch bridge");
-        w.write_multi_buffer(mb).await.unwrap();
+        xray_buf::io::write_mb(&mut w, mb).await.unwrap();
 
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
-            .await
-            .expect("timeout waiting for echo response")
-            .unwrap();
+        let resp =
+            tokio::time::timeout(std::time::Duration::from_secs(5), xray_buf::io::read_mb(&mut r))
+                .await
+                .expect("timeout waiting for echo response")
+                .unwrap();
 
         assert_eq!(resp.to_vec(), b"e2e dispatch bridge");
         w.shutdown(); // 关闭触发 bridge 结束
@@ -2582,9 +2591,9 @@ mod tests {
                     *recorded.lock() = domain;
                     let mut r = link.reader;
                     let mut w = link.writer;
-                    if let Ok(mb) = r.read_multi_buffer().await {
+                    if let Ok(mb) = xray_buf::io::read_mb(&mut r).await {
                         if !mb.is_empty() {
-                            let _ = w.write_multi_buffer(mb).await;
+                            let _ = xray_buf::io::write_mb(&mut w, mb).await;
                         }
                     }
                     w.shutdown();
@@ -2646,14 +2655,15 @@ mod tests {
         let mut w: Box<dyn xray_buf::io::Writer> = Box::new(up_w);
         let mut mb = MultiBuffer::new();
         mb.merge_bytes(b"hello routed");
-        w.write_multi_buffer(mb).await.unwrap();
+        xray_buf::io::write_mb(&mut w, mb).await.unwrap();
 
         // 读下行（echo 回来）
         let mut r: Box<dyn xray_buf::io::Reader> = Box::new(dn_r);
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
-            .await
-            .expect("timeout waiting echo")
-            .unwrap();
+        let resp =
+            tokio::time::timeout(std::time::Duration::from_secs(5), xray_buf::io::read_mb(&mut r))
+                .await
+                .expect("timeout waiting echo")
+                .unwrap();
         assert_eq!(resp.to_vec(), b"hello routed");
 
         // resolved 路径选中 tag-out；同步版标签未被使用
@@ -2695,9 +2705,9 @@ mod tests {
                 Box::pin(async move {
                     let mut r = link.reader;
                     let mut w = link.writer;
-                    if let Ok(mb) = r.read_multi_buffer().await {
+                    if let Ok(mb) = xray_buf::io::read_mb(&mut r).await {
                         if !mb.is_empty() {
-                            let _ = w.write_multi_buffer(mb).await;
+                            let _ = xray_buf::io::write_mb(&mut w, mb).await;
                         }
                     }
                     w.shutdown();
@@ -2754,12 +2764,13 @@ mod tests {
         let mut w: Box<dyn xray_buf::io::Writer> = Box::new(up_w);
         let mut mb = MultiBuffer::new();
         mb.merge_bytes(b"user traffic probe");
-        w.write_multi_buffer(mb).await.unwrap();
+        xray_buf::io::write_mb(&mut w, mb).await.unwrap();
         let mut r: Box<dyn xray_buf::io::Reader> = Box::new(dn_r);
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
-            .await
-            .expect("timeout waiting echo")
-            .unwrap();
+        let resp =
+            tokio::time::timeout(std::time::Duration::from_secs(5), xray_buf::io::read_mb(&mut r))
+                .await
+                .expect("timeout waiting echo")
+                .unwrap();
         assert_eq!(resp.to_vec(), b"user traffic probe");
 
         let up_ctr = stats
@@ -2797,9 +2808,9 @@ mod tests {
                 Box::pin(async move {
                     let mut r = link.reader;
                     let mut w = link.writer;
-                    if let Ok(mb) = r.read_multi_buffer().await {
+                    if let Ok(mb) = xray_buf::io::read_mb(&mut r).await {
                         if !mb.is_empty() {
-                            let _ = w.write_multi_buffer(mb).await;
+                            let _ = xray_buf::io::write_mb(&mut w, mb).await;
                         }
                     }
                     w.shutdown();
@@ -2835,12 +2846,13 @@ mod tests {
         let mut w: Box<dyn xray_buf::io::Writer> = Box::new(up_w);
         let mut mb = MultiBuffer::new();
         mb.merge_bytes(b"gated probe");
-        w.write_multi_buffer(mb).await.unwrap();
+        xray_buf::io::write_mb(&mut w, mb).await.unwrap();
         let mut r: Box<dyn xray_buf::io::Reader> = Box::new(dn_r);
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
-            .await
-            .expect("timeout waiting echo")
-            .unwrap();
+        let resp =
+            tokio::time::timeout(std::time::Duration::from_secs(5), xray_buf::io::read_mb(&mut r))
+                .await
+                .expect("timeout waiting echo")
+                .unwrap();
         assert_eq!(resp.to_vec(), b"gated probe");
 
         assert!(
@@ -2877,9 +2889,9 @@ mod tests {
                 Box::pin(async move {
                     let mut r = link.reader;
                     let mut w = link.writer;
-                    if let Ok(mb) = r.read_multi_buffer().await {
+                    if let Ok(mb) = xray_buf::io::read_mb(&mut r).await {
                         if !mb.is_empty() {
-                            let _ = w.write_multi_buffer(mb).await;
+                            let _ = xray_buf::io::write_mb(&mut w, mb).await;
                         }
                     }
                     w.shutdown();
@@ -2903,13 +2915,15 @@ mod tests {
             let mut w: Box<dyn xray_buf::io::Writer> = Box::new(up_w);
             let mut mb = MultiBuffer::new();
             mb.merge_bytes(b"tag counter probe");
-            w.write_multi_buffer(mb).await.unwrap();
+            xray_buf::io::write_mb(&mut w, mb).await.unwrap();
             let mut r: Box<dyn xray_buf::io::Reader> = Box::new(dn_r);
-            let resp =
-                tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
-                    .await
-                    .expect("timeout waiting echo")
-                    .unwrap();
+            let resp = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                xray_buf::io::read_mb(&mut r),
+            )
+            .await
+            .expect("timeout waiting echo")
+            .unwrap();
             assert_eq!(resp.to_vec(), b"tag counter probe");
         }
 
@@ -2982,11 +2996,12 @@ mod tests {
         let mut r = link.reader;
         let mut mb = MultiBuffer::new();
         mb.merge_bytes(b"ping tagged");
-        w.write_multi_buffer(mb).await.unwrap();
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
-            .await
-            .expect("timeout waiting echo")
-            .unwrap();
+        xray_buf::io::write_mb(&mut w, mb).await.unwrap();
+        let resp =
+            tokio::time::timeout(std::time::Duration::from_secs(5), xray_buf::io::read_mb(&mut r))
+                .await
+                .expect("timeout waiting echo")
+                .unwrap();
         assert_eq!(resp.to_vec(), b"ping tagged");
         w.shutdown();
 
@@ -3082,11 +3097,12 @@ mod tests {
         let mut r = link.reader;
         let mut mb = MultiBuffer::new();
         mb.merge_bytes(b"hello tagged outbound");
-        w.write_multi_buffer(mb).await.unwrap();
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
-            .await
-            .expect("timeout waiting echo")
-            .unwrap();
+        xray_buf::io::write_mb(&mut w, mb).await.unwrap();
+        let resp =
+            tokio::time::timeout(std::time::Duration::from_secs(5), xray_buf::io::read_mb(&mut r))
+                .await
+                .expect("timeout waiting echo")
+                .unwrap();
         assert_eq!(resp.to_vec(), b"hello tagged outbound");
         w.shutdown();
 
@@ -3123,9 +3139,9 @@ mod tests {
                 called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let mut r = link.reader;
                 let mut w = link.writer;
-                if let Ok(mb) = r.read_multi_buffer().await {
+                if let Ok(mb) = xray_buf::io::read_mb(&mut r).await {
                     if !mb.is_empty() {
-                        let _ = w.write_multi_buffer(mb).await;
+                        let _ = xray_buf::io::write_mb(&mut w, mb).await;
                     }
                 }
                 w.shutdown();
@@ -3168,9 +3184,9 @@ mod tests {
                 called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let mut r = link.reader;
                 let mut w = link.writer;
-                if let Ok(mb) = r.read_multi_buffer().await {
+                if let Ok(mb) = xray_buf::io::read_mb(&mut r).await {
                     if !mb.is_empty() {
-                        let _ = w.write_multi_buffer(mb).await;
+                        let _ = xray_buf::io::write_mb(&mut w, mb).await;
                     }
                 }
                 w.shutdown();
@@ -3201,7 +3217,6 @@ mod tests {
 
     #[tokio::test]
     async fn udp443_reject_interrupts_udp_443_dispatch() {
-        use xray_buf::io::Reader;
         let (d, called) = udp443_dispatcher(Some(Udp443Policy::Reject));
 
         let inbound = d
@@ -3210,9 +3225,10 @@ mod tests {
 
         // 下行被关闭：inbound reader 收到 EOF（pipe 约定 Err(Eof)）
         let mut r = inbound.reader;
-        let res = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
-            .await
-            .expect("timeout waiting EOF");
+        let res =
+            tokio::time::timeout(std::time::Duration::from_secs(5), xray_buf::io::read_mb(&mut r))
+                .await
+                .expect("timeout waiting EOF");
         assert!(
             matches!(res, Err(xray_buf::io::Error::Eof)),
             "reject should close downlink, got: {res:?}"
@@ -3226,10 +3242,7 @@ mod tests {
 
     #[tokio::test]
     async fn udp443_skip_dispatches_udp_443_direct() {
-        use xray_buf::{
-            io::{Reader, Writer},
-            multi::MultiBuffer,
-        };
+        use xray_buf::multi::MultiBuffer;
         let (d, called) = udp443_dispatcher(Some(Udp443Policy::Skip));
 
         let inbound = d
@@ -3240,12 +3253,13 @@ mod tests {
 
         let mut mb = MultiBuffer::new();
         mb.merge_bytes(b"quic-ish");
-        w.write_multi_buffer(mb).await.expect("write uplink");
+        xray_buf::io::write_mb(&mut w, mb).await.expect("write uplink");
 
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
-            .await
-            .expect("timeout waiting echo")
-            .expect("read ok");
+        let resp =
+            tokio::time::timeout(std::time::Duration::from_secs(5), xray_buf::io::read_mb(&mut r))
+                .await
+                .expect("timeout waiting echo")
+                .expect("read ok");
         assert_eq!(resp.to_vec(), b"quic-ish");
         assert_eq!(
             called.load(std::sync::atomic::Ordering::SeqCst),
@@ -3300,13 +3314,12 @@ mod tests {
             let seen = Arc::clone(&self.seen_target);
             let dest = dest.clone();
             Box::pin(async move {
-                use xray_buf::io::Reader as _;
                 let mut r = link.reader;
                 let mut w = link.writer;
                 // 累积读直到能解出一个 XUDP 帧
                 let mut acc = Vec::new();
                 let pkt = loop {
-                    if let Ok(mb) = r.read_multi_buffer().await {
+                    if let Ok(mb) = xray_buf::io::read_mb(&mut r).await {
                         if mb.is_empty() {
                             return;
                         }
@@ -3328,7 +3341,7 @@ mod tests {
                 drop(pw);
                 let mut mb = xray_buf::multi::MultiBuffer::new();
                 mb.merge_bytes(&frame);
-                let _ = w.write_multi_buffer(mb).await;
+                let _ = xray_buf::io::write_mb(&mut w, mb).await;
                 w.shutdown();
             })
         }
@@ -3336,10 +3349,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_link_udp_endpoint_override_rewrites_xudp_frames() {
-        use xray_buf::{
-            io::{Reader as _, Writer as _},
-            multi::MultiBuffer,
-        };
+        use xray_buf::multi::MultiBuffer;
         use xray_common::net::address::Address;
 
         let ohm = SimpleOhm::new();
@@ -3377,15 +3387,17 @@ mod tests {
         }
         let mut mb = MultiBuffer::new();
         mb.merge_bytes(&frame);
-        w.write_multi_buffer(mb).await.expect("write uplink frame");
+        xray_buf::io::write_mb(&mut w, mb).await.expect("write uplink frame");
 
         // 读回包（下行帧来源应被改回原始 IP）
         let mut acc = Vec::new();
         let pkt = loop {
-            let resp =
-                tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
-                    .await
-                    .expect("timeout reading downlink");
+            let resp = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                xray_buf::io::read_mb(&mut r),
+            )
+            .await
+            .expect("timeout reading downlink");
             match resp {
                 Ok(mb) if !mb.is_empty() => acc.extend_from_slice(&mb.to_vec()),
                 _ => panic!("downlink closed before frame"),
@@ -3414,10 +3426,7 @@ mod tests {
 
     #[tokio::test]
     async fn udp443_no_policy_flows_untouched() {
-        use xray_buf::{
-            io::{Reader, Writer},
-            multi::MultiBuffer,
-        };
+        use xray_buf::multi::MultiBuffer;
         let (d, called) = udp443_dispatcher(None);
 
         let inbound = d
@@ -3428,12 +3437,13 @@ mod tests {
 
         let mut mb = MultiBuffer::new();
         mb.merge_bytes(b"quic");
-        w.write_multi_buffer(mb).await.expect("write uplink");
+        xray_buf::io::write_mb(&mut w, mb).await.expect("write uplink");
 
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
-            .await
-            .expect("timeout waiting echo")
-            .expect("read ok");
+        let resp =
+            tokio::time::timeout(std::time::Duration::from_secs(5), xray_buf::io::read_mb(&mut r))
+                .await
+                .expect("timeout waiting echo")
+                .expect("read ok");
         assert_eq!(resp.to_vec(), b"quic");
         assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -3793,7 +3803,7 @@ mod tests {
         let (r, mut w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
         let mut mb = MultiBuffer::new();
         mb.merge_bytes(&payload);
-        w.write_multi_buffer(mb).await.unwrap();
+        xray_buf::io::write_mb(&mut w, mb).await.unwrap();
         w.shutdown();
 
         let mut cr = CachedReader::with_inner(Box::new(r));
@@ -3837,7 +3847,7 @@ mod tests {
         let (r, mut w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
         let mut mb = MultiBuffer::new();
         mb.merge_bytes(&payload);
-        w.write_multi_buffer(mb).await.unwrap();
+        xray_buf::io::write_mb(&mut w, mb).await.unwrap();
         w.shutdown();
 
         let mut cr = CachedReader::with_inner(Box::new(r));
@@ -3879,7 +3889,7 @@ mod tests {
         let (r, mut w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
         let mut mb = MultiBuffer::new();
         mb.merge_bytes(&payload);
-        w.write_multi_buffer(mb).await.unwrap();
+        xray_buf::io::write_mb(&mut w, mb).await.unwrap();
         w.shutdown();
 
         let mut cr = CachedReader::with_inner(Box::new(r));
@@ -3922,10 +3932,10 @@ mod tests {
         let (r, mut w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
         let mut first = MultiBuffer::new();
         first.merge_bytes(b"GET /path HTTP/1.1\r\n");
-        w.write_multi_buffer(first).await.unwrap();
+        xray_buf::io::write_mb(&mut w, first).await.unwrap();
         let mut second = MultiBuffer::new();
         second.merge_bytes(b"Host: late.example.com\r\n\r\n");
-        w.write_multi_buffer(second).await.unwrap();
+        xray_buf::io::write_mb(&mut w, second).await.unwrap();
         w.shutdown();
 
         let mut cr = CachedReader::with_inner(Box::new(r));
@@ -3961,15 +3971,12 @@ mod tests {
         // 永不出数据的 reader：read_first 挂到超时
         struct SilentReader;
         impl xray_buf::io::Reader for SilentReader {
-            fn read_multi_buffer(
+            fn poll_read_multi_buffer(
                 &mut self,
-            ) -> Pin<Box<dyn Future<Output = Result<MultiBuffer, xray_buf::io::Error>> + Send + '_>>
-            {
-                Box::pin(async {
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-                    }
-                })
+                _cx: &mut Context<'_>,
+            ) -> Poll<Result<MultiBuffer, xray_buf::io::Error>> {
+                // 恒 Pending（原 3600s sleep 循环的等价形态）
+                Poll::Pending
             }
         }
 
@@ -4021,7 +4028,7 @@ mod tests {
         let (r, mut w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
         let mut mb = MultiBuffer::new();
         mb.merge_bytes(&payload);
-        w.write_multi_buffer(mb).await.unwrap();
+        xray_buf::io::write_mb(&mut w, mb).await.unwrap();
         w.shutdown();
 
         let mut cr = CachedReader::with_inner(Box::new(r));
@@ -4091,15 +4098,17 @@ mod tests {
         d.dispatch_link(&dest, outbound, &SniffingRequest::default(), None, None)
             .expect("dispatch_link ok");
         let mut r: Box<dyn xray_buf::io::Reader> = Box::new(dn_r);
-        let eof =
-            match tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
-                .await
-            {
-                Err(_) => panic!("timeout waiting EOF"),
-                Ok(Err(_)) => true, // writer shutdown → 管道 EOF
+        let eof = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            xray_buf::io::read_mb(&mut r),
+        )
+        .await
+        {
+            Err(_) => panic!("timeout waiting EOF"),
+            Ok(Err(_)) => true, // writer shutdown → 管道 EOF
 
-                Ok(Ok(mb)) => mb.is_empty(),
-            };
+            Ok(Ok(mb)) => mb.is_empty(),
+        };
         assert!(eof, "downlink should be EOF after missing-tag shutdown");
 
         // 默认出站不得被触发
@@ -4136,11 +4145,13 @@ mod tests {
         let (stats, d) = build_oz1t_dispatcher(true);
         let payload = b"with-overhead-12345";
         let (up_w, mut dn_r) = drive_oz1t_traffic(&d, "gated2.example.com", payload).await;
-        let resp =
-            tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
-                .await
-                .expect("timeout")
-                .unwrap();
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            xray_buf::io::read_mb(&mut dn_r),
+        )
+        .await
+        .expect("timeout")
+        .unwrap();
         drop(up_w);
         assert_eq!(resp.to_vec(), payload);
         let up =
@@ -4174,9 +4185,9 @@ mod tests {
                 Box::pin(async move {
                     let mut r = link.reader;
                     let mut w = link.writer;
-                    if let Ok(mb) = r.read_multi_buffer().await {
+                    if let Ok(mb) = xray_buf::io::read_mb(&mut r).await {
                         if !mb.is_empty() {
-                            let _ = w.write_multi_buffer(mb).await;
+                            let _ = xray_buf::io::write_mb(&mut w, mb).await;
                         }
                     }
                     w.shutdown();
@@ -4232,7 +4243,7 @@ mod tests {
         let mut w: Box<dyn xray_buf::io::Writer> = Box::new(up_w);
         let mut mb = xray_buf::multi::MultiBuffer::new();
         mb.merge_bytes(payload);
-        w.write_multi_buffer(mb).await.unwrap();
+        xray_buf::io::write_mb(&mut w, mb).await.unwrap();
         let r: Box<dyn xray_buf::io::Reader> = Box::new(dn_r);
         (w, r)
     }
@@ -4406,18 +4417,20 @@ mod tests {
             let mut dn_r = dn_r;
             let leaked = tokio::time::timeout(
                 std::time::Duration::from_millis(300),
-                dn_r.read_multi_buffer(),
+                xray_buf::io::read_mb(&mut dn_r),
             )
             .await;
             assert!(leaked.is_err(), "splice 激活时 link.writer 不应承载下行");
         } else {
             // 回退泵：echo 经 link.writer 双向流通
             let mut dn_r = dn_r;
-            let resp =
-                tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
-                    .await
-                    .expect("echo within timeout")
-                    .expect("read ok");
+            let resp = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                xray_buf::io::read_mb(&mut dn_r),
+            )
+            .await
+            .expect("echo within timeout")
+            .expect("read ok");
             let mut out = Vec::new();
             for b in resp.iter() {
                 out.extend_from_slice(b.bytes());

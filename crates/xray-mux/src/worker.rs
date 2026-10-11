@@ -884,12 +884,14 @@ mod tests {
         #[derive(Debug)]
         struct StalledWriter;
         impl xray_buf::io::Writer for StalledWriter {
-            fn write_multi_buffer<'a>(
-                &'a mut self,
-                _mb: MultiBuffer,
-            ) -> std::pin::Pin<Box<dyn Future<Output = xray_buf::io::Result<()>> + Send + 'a>>
-            {
-                Box::pin(std::future::pending())
+            fn poll_write_multi_buffer(
+                &mut self,
+                _cx: &mut std::task::Context<'_>,
+                mb: &mut MultiBuffer,
+            ) -> std::task::Poll<xray_buf::io::Result<()>> {
+                // 恒 Pending（原 std::future::pending 等价形态）
+                let _ = mb;
+                std::task::Poll::Pending
             }
         }
 
