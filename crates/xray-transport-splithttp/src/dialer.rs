@@ -549,7 +549,20 @@ where
     S: AsyncReadTrait + AsyncWriteTrait + Unpin + Send + 'static,
 {
     let io = hyper_util::rt::TokioIo::new(tls_stream);
-    let (mut sender, conn) = http2::handshake::<_, _, ReqBody>(TokioExecutor::new(), io)
+    // h2 流控窗口（8f7cd28c 服务端 max_send_buf 同族）：hyper 客户端默认每流接收窗
+    // DEFAULT_STREAM_WINDOW=2MB、连接窗 5MB、max_send_buf 400KB。下载方向在途被钉
+    // min(服务端 send_buf, 客户端流窗)/RTT——169ms RTT 下 2MB 窗 ≈ 11.8MB/s 理论上限
+    // （公网实测 ~8.8；回环 RTT≈0 测不出）。Go x/net/http2 客户端无此量级钉子
+    // （transportDefaultStreamFlow 4MB 起步且 BDP 自适应）。16MB 流窗 + 32MB 连接窗
+    // 让在途上限回到服务端 send_buf 一侧；上行 400KB→4MB 与服务端对称。
+    let mut builder = http2::Builder::new(TokioExecutor::new());
+    builder
+        .timer(hyper_util::rt::TokioTimer::new())
+        .initial_stream_window_size(16 * 1024 * 1024)
+        .initial_connection_window_size(32 * 1024 * 1024)
+        .max_send_buf_size(4 * 1024 * 1024);
+    let (mut sender, conn) = builder
+        .handshake::<_, ReqBody>(io)
         .await
         .map_err(|e| SplitHttpError::Hyper(format!("h2 handshake: {e}")))?;
     // spawn conn driver（必须，否则 h2 连接不动）
