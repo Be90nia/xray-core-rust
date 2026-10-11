@@ -119,8 +119,18 @@ async fn listen_httpupgrade(
                 }
             }
 
-            match do_handshake(tcp, &server, tls_config.clone(), remote).await {
-                Ok(conn) => {
+            // Go hub.go:39-41：SetReadDeadline(+4s) 在 TLS wrap 前设置——4s 覆盖
+            // TLS 惰性握手 + GET 读取全程（升级完成 defer 清零）。整段限时：
+            // 半开/分片 ClientHello 的连接超时丢弃，accept 循环永不被单个连接
+            // 堵死（串行 accept 下一次无超时的 rustls accept 即瘫痪全 inbound，
+            // 生产 P0 实锤：半个 ClientHello 挂死 5 小时）。
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(4),
+                do_handshake(tcp, &server, tls_config.clone(), remote),
+            )
+            .await
+            {
+                Ok(Ok(conn)) => {
                     // Tcpmask wrap 失败 → 丢弃该 conn 继续（Go tcpListener.Accept 语义）。
                     match xray_transport::finalmask::wrap_conn_server_into_connection(
                         &tcpmask, conn,
@@ -131,8 +141,11 @@ async fn listen_httpupgrade(
                         },
                     }
                 },
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::debug!("HTTPUpgrade handshake error: {e}");
+                },
+                Err(_) => {
+                    tracing::debug!("HTTPUpgrade handshake timeout (4s, Go SetReadDeadline)");
                 },
             }
         }
