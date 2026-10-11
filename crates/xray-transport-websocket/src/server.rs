@@ -116,13 +116,30 @@ impl WsListener {
     ) -> Result<AcceptedConn> {
         let (mut tcp, remote) = self.listener.accept().await.map_err(WsError::Io)?;
         let local = tcp.local_addr().ok();
-        let remote = self.parse_proxy_protocol(&mut tcp, remote).await?;
-        // TLS 握手。
-        let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
-        let tls_stream = acceptor
-            .accept(tcp)
-            .await
-            .map_err(|e| WsError::HandshakeFailed(format!("tls accept: {e}")))?;
+        // Go hub.go:143 http.Server{ReadHeaderTimeout: 4s}——deadline 在 TLS wrap 前
+        // 生效，4s 覆盖 PROXY protocol 解析 + TLS 惰性握手全程。整段限时：半开/分片
+        // ClientHello 的连接超时丢弃，accept 循环永不被单个连接堵死（串行 accept 下
+        // 无超时的 rustls accept 即瘫痪全 inbound，httpupgrade P0 同族：半个
+        // ClientHello 挂死 5 小时）。WS 升级握手另有自身 4s 超时（H14，
+        // HandshakeTimeout），h2 拒绝服务另有 30s 兜底，均在本窗之外不变。
+        let (remote, tls_stream) = match tokio::time::timeout(Duration::from_secs(4), async {
+            let remote = self.parse_proxy_protocol(&mut tcp, remote).await?;
+            let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+            let tls_stream = acceptor
+                .accept(tcp)
+                .await
+                .map_err(|e| WsError::HandshakeFailed(format!("tls accept: {e}")))?;
+            Ok::<_, WsError>((remote, tls_stream))
+        })
+        .await
+        {
+            Ok(Ok((remote, tls_stream))) => (remote, tls_stream),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                tracing::debug!("ws TLS accept timeout (4s, Go ReadHeaderTimeout)");
+                return Err(WsError::HandshakeFailed("tls accept timeout (4s)".into()));
+            },
+        };
         // wsh2 修复：ALPN 协商出 h2 时进 h2 拒绝服务，而非把 HTTP/2 帧喂给
         // http/1.1-only 的 ws_handshake（裸断根因：curl --http2 = 000，CF 回源
         // 协商 h2 后 CDN 族全挂）。Go hub.go:158 `http.Server.Serve(tls.NewListener)`
