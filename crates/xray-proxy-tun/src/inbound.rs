@@ -1372,7 +1372,7 @@ mod tests {
                     // EOF → recv_packet Ok(None)，黑洞前提被破坏。
                     let _writer = link.writer;
                     loop {
-                        match reader.read_multi_buffer().await {
+                        match xray_buf::io::read_mb(&mut *reader).await {
                             Ok(mb) => {
                                 req_bytes.fetch_add(mb.len(), Ordering::Relaxed);
                                 if mb.is_empty() {
