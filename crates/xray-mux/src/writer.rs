@@ -13,7 +13,7 @@ use xray_buf::{
 use xray_common::{bitmask::Bitmask, net::destination::Destination};
 
 use crate::{
-    frame::{FrameMetadata, MuxError, OPTION_DATA, OPTION_ERROR, SessionStatus},
+    frame::{FrameMetadata, MAX_METADATA_LEN, MuxError, OPTION_DATA, OPTION_ERROR, SessionStatus},
     session::TransferType,
 };
 
@@ -38,6 +38,8 @@ pub struct MuxWriter {
     /// writer.go:23）。New 帧写出 source/local（Go frame.go:87-99），与
     /// GlobalID 互斥（frame.go:100 else 分支）。txno④ portal 写侧消费。
     inbound: Option<(Destination, Destination)>,
+    /// meta 序列化 scratch（clear + 复用容量，免每帧 `Vec` 堆分配）。
+    meta_scratch: Vec<u8>,
 }
 
 impl MuxWriter {
@@ -61,6 +63,7 @@ impl MuxWriter {
             transfer_type,
             global_id,
             inbound: None,
+            meta_scratch: Vec::with_capacity(MAX_METADATA_LEN + 2),
         }
     }
 
@@ -87,6 +90,7 @@ impl MuxWriter {
             transfer_type,
             global_id: None,
             inbound: None,
+            meta_scratch: Vec::with_capacity(MAX_METADATA_LEN + 2),
         }
     }
 
@@ -125,9 +129,20 @@ impl MuxWriter {
     /// 整帧单次落盘（Go writer.go:62-69 `WriteMultiBuffer({b})` 同形）。
     async fn write_meta_only(&mut self) -> Result<(), MuxError> {
         let meta = self.get_next_frame_meta();
-        let mut vec = Vec::new();
-        meta.write_to(&mut vec).map_err(|e| MuxError::Io(format!("meta: {:?}", e)))?;
-        let mb = MultiBuffer::from_buffer(Buffer::from_vec(vec));
+        self.meta_scratch.clear();
+        meta.write_bytes_into(&mut self.meta_scratch)
+            .map_err(|e| MuxError::Io(format!("meta: {:?}", e)))?;
+        // 直序进池化 Buffer（同 write_meta_with_frame 形态）：免 from_vec
+        // 二次拷贝，scratch 容量留在 self 跨帧复用。
+        let mut frame = Buffer::new();
+        {
+            let spare = frame.writable_bytes();
+            let n = self.meta_scratch.len();
+            assert!(n <= spare.len(), "mux meta exceeds buffer writable capacity");
+            spare[..n].copy_from_slice(&self.meta_scratch);
+            frame.advance_write(n);
+        }
+        let mb = MultiBuffer::from_buffer(frame);
         self.writer
             .write_multi_buffer_direct(mb)
             .await
@@ -138,7 +153,7 @@ impl MuxWriter {
     async fn write_data(&mut self, data: MultiBuffer) -> Result<(), MuxError> {
         let mut meta = self.get_next_frame_meta();
         meta.set_option(OPTION_DATA);
-        write_meta_with_frame(&mut self.writer, meta, data).await
+        write_meta_with_frame(&mut self.writer, meta, data, &mut self.meta_scratch).await
     }
 
     /// 写入 MultiBuffer 数据
@@ -171,9 +186,18 @@ impl MuxWriter {
             option.set(OPTION_ERROR);
         }
         let meta = FrameMetadata::new(self.id, SessionStatus::End, option);
-        let mut vec = Vec::new();
-        meta.write_to(&mut vec).map_err(|e| MuxError::Io(format!("close meta: {:?}", e)))?;
-        let mb = MultiBuffer::from_buffer(Buffer::from_vec(vec));
+        self.meta_scratch.clear();
+        meta.write_bytes_into(&mut self.meta_scratch)
+            .map_err(|e| MuxError::Io(format!("close meta: {:?}", e)))?;
+        let mut frame = Buffer::new();
+        {
+            let spare = frame.writable_bytes();
+            let n = self.meta_scratch.len();
+            assert!(n <= spare.len(), "mux meta exceeds buffer writable capacity");
+            spare[..n].copy_from_slice(&self.meta_scratch);
+            frame.advance_write(n);
+        }
+        let mb = MultiBuffer::from_buffer(frame);
         self.writer
             .write_multi_buffer_direct(mb)
             .await
@@ -213,19 +237,22 @@ async fn write_meta_with_frame(
     writer: &mut BufferedWriter,
     meta: FrameMetadata,
     data: MultiBuffer,
+    scratch: &mut Vec<u8>,
 ) -> Result<(), MuxError> {
     let data_len = data.len() as u16;
     // 直序进池化 Buffer（wfx8-3，对齐 Go FrameMetadata.WriteTo(buf.Buffer) 直写
-    // 形态）：免每数据帧一次 Vec 分配 + Buffer::from_vec 的二次拷贝。to_bytes
-    // 内部的既有分配不在本票范围。
-    let meta_bytes = meta.to_bytes().map_err(|e| MuxError::Io(format!("meta: {:?}", e)))?;
+    // 形态）：meta 序列化走调用方 scratch（fzir 池化，7681f7cc 范式），免每数据帧
+    // 一次 Vec 分配 + Buffer::from_vec 的二次拷贝。
+    scratch.clear();
+    meta.write_bytes_into(scratch).map_err(|e| MuxError::Io(format!("meta: {:?}", e)))?;
     let mut frame = Buffer::new();
     {
         let spare = frame.writable_bytes();
-        let n = meta_bytes.len() + 2;
+        let meta_len = scratch.len();
+        let n = meta_len + 2;
         assert!(n <= spare.len(), "mux meta + length exceeds buffer writable capacity");
-        spare[..meta_bytes.len()].copy_from_slice(&meta_bytes);
-        spare[meta_bytes.len()..n].copy_from_slice(&data_len.to_be_bytes());
+        spare[..meta_len].copy_from_slice(scratch);
+        spare[meta_len..n].copy_from_slice(&data_len.to_be_bytes());
         frame.advance_write(n);
     }
     let mut mb = MultiBuffer::with_capacity(data.buffer_count() + 1);
