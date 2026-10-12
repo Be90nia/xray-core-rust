@@ -155,9 +155,9 @@ enum UpGate {
     EndCommit,
 }
 /// raw 起步闸延迟：覆盖对端「收 DIRECT 帧 → 处理 → 切 raw 读」的调度
-/// 延迟。实测恶性窗口 ~1.5ms（loopback 合流），50ms=30x 余量；每次
-/// splice 切换仅首个上游写承担一次，对吞吐无影响。
-const RAW_WRITE_ARM_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+/// 延迟。实测恶性窗口 ~1.5ms（loopback 合流），5ms=3x 余量；arm 受
+/// is_none 守卫仅建立一次，每次 splice 切换仅首个上游写承担一次。
+const RAW_WRITE_ARM_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
 
 #[allow(private_interfaces)] // InnerRawClone 为 crate 内实现细节，随公开方法泄露属刻意
 impl<C> VisionConn<C>
@@ -717,7 +717,11 @@ where
             self.splice_armed = false;
             // Direct commit：switch 帧已确认上线，此后 caller 写入走裸流
             self.uplink_padding = false;
-            self.raw_write_gate = Some(Box::pin(tokio::time::sleep(RAW_WRITE_ARM_DELAY)));
+            // 仅首次 arm（结构保证）：重复置位不得重建/重置起步闸计时——
+            // 5ms 余量收紧后重置会把 raw 写背压拖过 1.5ms 恶性窗口数倍。
+            if self.raw_write_gate.is_none() {
+                self.raw_write_gate = Some(Box::pin(tokio::time::sleep(RAW_WRITE_ARM_DELAY)));
+            }
             if self.raw_fallback.is_none() {
                 self.raw_fallback =
                     self.raw_tcp.take().or_else(|| self.inner.inner_raw_tcp_clone());
@@ -1845,8 +1849,14 @@ mod tests {
 
         let csock = tokio::net::TcpStream::connect(addr).await.unwrap();
         let craw = dup_tcp_stream(&csock).unwrap();
+        // 镜像生产 dial_tcp（security=tls）：记录对齐钳制垫在 rustls 客户端之下
+        // （与 reg_direct_switch_coalesce_swallow_backpressure / reg 中帧实验室
+        // 同型）。缺失时 gate 窗口收窄后 raw 前缀混入 rustls recv 被 deframer
+        // 扣留——50ms 时代被窗口施舍掩盖的测试拓扑缺陷（:1710 注释自称含
+        // RecordFramer，生产 xray-transport-tcp/register.rs security=tls 亦垫）。
+        let framer = xray_transport::record_framer::RecordFramer::new(csock);
         let tls = connector
-            .connect(ServerName::try_from("localhost".to_string()).unwrap(), csock)
+            .connect(ServerName::try_from("localhost".to_string()).unwrap(), framer)
             .await
             .expect("client tls connect");
         let (r, w) = tokio::io::split(tls);
@@ -2497,6 +2507,50 @@ mod tests {
         assert!(!client.splice_armed, "armed flag consumed");
         assert!(client.raw_fallback.is_some(), "raw activates exactly after inner flush completes");
         assert_eq!(client.inner.flush_polls, 2, "gate drove exactly two flush polls");
+    }
+
+    /// [reg fix-perf-p1-2026-10-12] arm 幂等契约：raw_write_gate 只建立一次，
+    /// 重复 arm（splice_armed 被再置位）不得重建/重置起步闸计时——5ms 余量
+    /// 收紧后重置会把 raw 写背压拖过 1.5ms 恶性窗口数倍。
+    #[tokio::test]
+    async fn raw_write_gate_armed_exactly_once() {
+        let mock = DeferredFlushMock { flush_polls: 0 };
+        let mut client = VisionConn::new(mock, vec![0xABu8; 16]);
+        client.downlink_traffic.enable_xtls = true;
+        client.downlink_traffic.is_tls = true;
+        client.downlink_traffic.is_tls12_or_above = true;
+        let app = build_tls_app_data(b"GET / HTTP/1.1\r\n\r\n");
+
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        // poll #1：判 DIRECT → 帧写入（虚报 Ok）→ flush #1 Pending → 整体 Pending
+        let poll = Pin::new(&mut client).poll_write(&mut cx, &app);
+        assert!(
+            matches!(poll, Poll::Pending),
+            "must not complete while inner flush pending, got {poll:?}"
+        );
+        // poll #2：flush #2 Ready → arm_splice_raw（gate 建立）→ 写完成
+        let poll = Pin::new(&mut client).poll_write(&mut cx, &app);
+        assert!(
+            matches!(poll, Poll::Ready(Ok(n)) if n == app.len()),
+            "write must complete through the arm path, got {poll:?}"
+        );
+        assert!(!client.splice_armed, "armed flag consumed");
+        let gate1 = client.raw_write_gate.as_ref().expect("gate established at arm");
+        let deadline1 = gate1.deadline();
+
+        // 时间前进 ≥1ms：保证「重置计时」必然推后 deadline（同毫秒粒度会假绿）
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+        // 防御契约：人为再置位 + 重复 arm，gate 不得被覆盖
+        client.splice_armed = true;
+        client.arm_splice_raw();
+        let gate2 = client.raw_write_gate.as_ref().expect("gate must survive a repeated arm");
+        assert_eq!(
+            gate2.deadline(),
+            deadline1,
+            "repeated arm must not rebuild/reset the raw write gate"
+        );
+        assert!(!client.splice_armed, "repeated arm still consumes the flag");
     }
 
     /// 帧感知读取对端 CommonConn 流上的 vision 帧，返回 (command, content)。
