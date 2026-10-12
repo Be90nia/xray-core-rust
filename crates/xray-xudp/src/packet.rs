@@ -157,31 +157,40 @@ impl FrameMetadata {
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(64);
+        self.write_bytes_into(&mut buf);
+        buf
+    }
+
+    /// 序列化进调用方 scratch（clear + 写入，容量跨包复用，免每包 `Vec` 堆分配）。
+    ///
+    /// 线格式与 [`Self::to_bytes`] 完全一致。
+    pub fn write_bytes_into(&self, out: &mut Vec<u8>) {
+        out.clear();
+        out.reserve(64);
         // 占位 length(2B) + session_id(2B=0)
-        buf.extend_from_slice(&[0u8; 4]);
+        out.extend_from_slice(&[0u8; 4]);
         // status
-        buf.push(self.status.to_byte());
+        out.push(self.status.to_byte());
         // opt
-        buf.push(if self.has_data { OPT_DATA } else { 0 });
+        out.push(if self.has_data { OPT_DATA } else { 0 });
         // target
-        if let Some(ref t) = self.target {
+        if let Some(t) = &self.target {
             if t.network() == Network::UDP {
-                buf.push(NETWORK_UDP);
+                out.push(NETWORK_UDP);
                 let mut addr_buf = Buffer::with_capacity(32);
                 AddressSerializer::write_port_address(&mut addr_buf, t.port(), t.address());
-                buf.extend_from_slice(addr_buf.bytes());
+                out.extend_from_slice(addr_buf.bytes());
             }
         }
         // GlobalID（仅 New 帧）
         if self.status == FrameStatus::New {
-            if let Some(ref gid) = self.global_id {
-                buf.extend_from_slice(gid);
+            if let Some(gid) = &self.global_id {
+                out.extend_from_slice(gid);
             }
         }
         // 回写 length = body 长度（不含 length 字段自身）
-        let body_len = (buf.len() - 2) as u16;
-        buf[0..2].copy_from_slice(&body_len.to_be_bytes());
-        buf
+        let body_len = (out.len() - 2) as u16;
+        out[0..2].copy_from_slice(&body_len.to_be_bytes());
     }
 
     /// 写入到实现 `Write` 的目标
@@ -286,13 +295,15 @@ pub struct PacketWriter<W> {
     dest: Destination,
     global_id: [u8; GLOBAL_ID_LEN],
     new_sent: bool,
+    /// meta 序列化 scratch（clear + 复用容量，免每包 `Vec` 堆分配）。
+    scratch: Vec<u8>,
 }
 
 impl<W: Write> PacketWriter<W> {
     /// 创建写入器
     #[must_use]
     pub fn new(writer: W, dest: Destination, global_id: [u8; GLOBAL_ID_LEN]) -> Self {
-        Self { writer, dest, global_id, new_sent: false }
+        Self { writer, dest, global_id, new_sent: false, scratch: Vec::with_capacity(64) }
     }
 
     /// 写入一个数据包
@@ -306,11 +317,12 @@ impl<W: Write> PacketWriter<W> {
         if !self.new_sent && self.dest.network() == Network::UDP {
             self.new_sent = true;
             FrameMetadata::new_udp(self.dest.address().clone(), self.dest.port(), self.global_id)
-                .write_to(&mut self.writer)?;
+                .write_bytes_into(&mut self.scratch);
         } else {
             FrameMetadata::keep_udp(self.dest.address().clone(), self.dest.port())
-                .write_to(&mut self.writer)?;
+                .write_bytes_into(&mut self.scratch);
         }
+        self.writer.write_all(&self.scratch)?;
 
         self.writer.write_all(&(data.len() as u16).to_be_bytes())?;
         self.writer.write_all(data)?;
@@ -332,11 +344,12 @@ impl<W: Write> PacketWriter<W> {
         if !self.new_sent && self.dest.network() == Network::UDP {
             self.new_sent = true;
             FrameMetadata::new_udp(self.dest.address().clone(), self.dest.port(), self.global_id)
-                .write_to(&mut self.writer)?;
+                .write_bytes_into(&mut self.scratch);
         } else {
             FrameMetadata::keep_udp(udp.address().clone(), udp.port())
-                .write_to(&mut self.writer)?;
+                .write_bytes_into(&mut self.scratch);
         }
+        self.writer.write_all(&self.scratch)?;
 
         self.writer.write_all(&(data.len() as u16).to_be_bytes())?;
         self.writer.write_all(data)?;
@@ -379,13 +392,15 @@ impl PacketData {
 /// XUDP 数据包读取器
 pub struct PacketReader<R> {
     reader: R,
+    /// 帧读取 scratch（长度前缀 + meta body 复用容量，免每包 `Vec` 堆分配）。
+    frame_scratch: Vec<u8>,
 }
 
 impl<R: Read> PacketReader<R> {
     /// 创建读取器
     #[must_use]
     pub fn new(reader: R) -> Self {
-        Self { reader }
+        Self { reader, frame_scratch: Vec::with_capacity(64) }
     }
 
     /// 读取一个数据包
@@ -395,13 +410,23 @@ impl<R: Read> PacketReader<R> {
     /// KeepAlive 帧会被自动跳过。
     pub fn read_packet(&mut self) -> Result<Option<PacketData>, PacketError> {
         loop {
-            let meta = match FrameMetadata::read_from(&mut self.reader) {
-                Ok(m) => m,
-                Err(PacketError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    return Ok(None);
-                },
-                Err(e) => return Err(e),
-            };
+            let mut len_buf = [0u8; 2];
+            match self.reader.read_exact(&mut len_buf) {
+                Ok(()) => {},
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(e) => return Err(e.into()),
+            }
+            let body_len = u16::from_be_bytes(len_buf) as usize;
+            if body_len < MIN_META_LEN {
+                return Err(PacketError::MetadataTooShort(body_len));
+            }
+
+            // 帧头+meta 读进 scratch（容量跨包复用），解析走 from_bytes
+            self.frame_scratch.clear();
+            self.frame_scratch.extend_from_slice(&len_buf);
+            self.frame_scratch.resize(2 + body_len, 0);
+            self.reader.read_exact(&mut self.frame_scratch[2..])?;
+            let (meta, _) = FrameMetadata::from_bytes(&self.frame_scratch)?;
 
             // New/Keep 帧都带目标地址（Go xudp 读端对两者同样提取）
             let udp_target = meta.target().cloned();
