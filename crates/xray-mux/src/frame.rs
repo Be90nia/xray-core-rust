@@ -495,49 +495,59 @@ impl FrameMetadata {
     /// 而非静默饱和 length 字段（bd n43f）。
     pub fn to_bytes(&self) -> Result<Vec<u8>, MuxError> {
         let mut buf = Vec::with_capacity(64);
+        self.write_bytes_into(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// 序列化进调用方 scratch（clear + 写入，容量跨帧复用，免每帧 `Vec` 堆分配）。
+    ///
+    /// 线格式与 [`Self::to_bytes`] 完全一致；超长报错语义同（bd n43f 早失败）。
+    pub fn write_bytes_into(&self, out: &mut Vec<u8>) -> Result<(), MuxError> {
+        out.clear();
+        out.reserve(64);
         // 预留 2 字节 length
-        buf.extend_from_slice(&[0u8; 2]);
+        out.extend_from_slice(&[0u8; 2]);
 
         // session_id (2B BE)
-        buf.extend_from_slice(&serial::write_uint16(self.session_id));
+        out.extend_from_slice(&serial::write_uint16(self.session_id));
 
         // session_status (1B)
-        buf.push(self.session_status.to_byte());
+        out.push(self.session_status.to_byte());
 
         // option (1B)
-        buf.push(self.option.bits());
+        out.push(self.option.bits());
 
         // 目标地址
         if self.session_status == SessionStatus::New {
             if let Some(target) = &self.target {
-                write_target_to_vec(&mut buf, target)?;
+                write_target_to_vec(out, target)?;
             }
             if let Some(source) = &self.source {
                 // Go frame.go:87-99：Reverse-mux 场景写 source/local，
                 // 与 GlobalID 互斥（Go :100 else 分支）
-                write_inbound_to_vec(&mut buf, source, self.local.as_ref())?;
+                write_inbound_to_vec(out, source, self.local.as_ref())?;
             } else if self.is_udp_target() {
                 if let Some(gid) = &self.global_id {
-                    buf.extend_from_slice(gid);
+                    out.extend_from_slice(gid);
                 }
             }
         } else if self.session_status == SessionStatus::Keep {
             if let Some(target) = &self.target {
                 if target.network() == Network::UDP {
-                    write_target_to_vec(&mut buf, target)?;
+                    write_target_to_vec(out, target)?;
                 }
             }
         }
 
         // 回填 length（length 字段后的所有内容长度）。
         // 512 检查通过则 content_len ≤ 512 < u16::MAX，转换无截断。
-        let content_len = buf.len() - 2;
+        let content_len = out.len() - 2;
         if content_len > MAX_METADATA_LEN {
             return Err(MuxError::MetadataTooLong(content_len));
         }
-        buf[0..2].copy_from_slice(&serial::write_uint16(content_len as u16));
+        out[0..2].copy_from_slice(&serial::write_uint16(content_len as u16));
 
-        Ok(buf)
+        Ok(())
     }
 
     /// 将帧元数据写入 `Write` trait 对象。
