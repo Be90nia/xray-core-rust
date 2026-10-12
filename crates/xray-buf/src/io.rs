@@ -3,12 +3,7 @@
 //! 对应 Go 版本 `common/buf` 的 io.go，定义异步 Reader/Writer trait、
 //! 错误类型和工厂函数。所有 IO 操作均为异步，基于 tokio AsyncRead/AsyncWrite。
 
-use std::{
-    future::Future,
-    pin::Pin,
-    task::{Context, Poll},
-    time::Duration,
-};
+use std::{future::Future, pin::Pin, time::Duration};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -75,44 +70,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// 异步多缓冲区读取接口
 ///
 /// 对应 Go 的 `buf.Reader` 接口，读取返回 `MultiBuffer`。
-///
-/// ## poll-based 契约（P1 F8 去 box，oracle v1 §2.2）
-///
-/// 核心入口是 [`Reader::poll_read_multi_buffer`]：对象安全、装饰层（计数/
-/// 缓存/目标改写）同步直通转发——**一个 chunk 过 N 层装饰零次装箱**。
-/// 人体工学由 [`Reader::read_multi_buffer`] 具名 Future 提供（`Self: Sized`
-/// 泛型路径零分配；`&mut dyn`/`?Sized` 上下文用 [`read_mb`]）。
+/// 使用 `Pin<Box<dyn Future>>` 返回类型以支持动态分发。
 pub trait Reader: Send {
-    /// poll 形态读取。返回空 MultiBuffer = EOF（本 crate 约定）。
-    fn poll_read_multi_buffer(&mut self, cx: &mut Context<'_>) -> Poll<Result<MultiBuffer>>;
-
-    /// 异步读取数据，返回 MultiBuffer（具名 Future，泛型路径零装箱）。
-    fn read_multi_buffer(&mut self) -> ReadMultiBuffer<'_, Self>
-    where
-        Self: Sized,
-    {
-        ReadMultiBuffer { reader: self }
-    }
-}
-
-/// [`Reader::read_multi_buffer`] 的具名 Future：跨 Pending 持有 reader 引用，
-/// 直接转发内层 poll，零堆分配。
-pub struct ReadMultiBuffer<'a, R: ?Sized> {
-    reader: &'a mut R,
-}
-
-impl<R: Reader + ?Sized> Future for ReadMultiBuffer<'_, R> {
-    type Output = Result<MultiBuffer>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.get_mut().reader.poll_read_multi_buffer(cx)
-    }
-}
-
-/// `?Sized` 上下文（`&mut dyn Reader` / `R: Reader + ?Sized` 泛型循环）的
-/// 读取包装——trait 默认方法带 `Self: Sized` 不可用于 dyn，此为等价入口。
-pub fn read_mb<R: Reader + ?Sized>(reader: &mut R) -> ReadMultiBuffer<'_, R> {
-    ReadMultiBuffer { reader }
+    /// 异步读取数据，返回 MultiBuffer
+    fn read_multi_buffer(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<MultiBuffer>> + Send + '_>>;
 }
 
 // ========== Writer trait ==========
@@ -120,27 +83,13 @@ pub fn read_mb<R: Reader + ?Sized>(reader: &mut R) -> ReadMultiBuffer<'_, R> {
 /// 异步多缓冲区写入接口
 ///
 /// 对应 Go 的 `buf.Writer` 接口，接受 `MultiBuffer` 写入。
-///
-/// ## poll-based 契约（P1 F8 去 box）
-///
-/// 核心入口 [`Writer::poll_write_multi_buffer`] 以 `&mut MultiBuffer` 就地
-/// 消费：**写完的块从 mb 摘除（回池）、半块游标推进**，进度持久化在 mb 中，
-/// 无状态转发层（装饰器）可以零分配直通。`Ready(Ok)` 时 mb 必为空。
+/// 使用 `Pin<Box<dyn Future>>` 返回类型以支持动态分发。
 pub trait Writer: Send {
-    /// poll 形态写入：就地消费 `mb` 直到写完（Ready）或底层阻塞（Pending）。
-    fn poll_write_multi_buffer(
+    /// 异步写入 MultiBuffer
+    fn write_multi_buffer(
         &mut self,
-        cx: &mut Context<'_>,
-        mb: &mut MultiBuffer,
-    ) -> Poll<Result<()>>;
-
-    /// 异步写入 MultiBuffer（具名 Future 持有 mb 跨 Pending，泛型路径零装箱）。
-    fn write_multi_buffer(&mut self, mb: MultiBuffer) -> WriteMultiBuffer<'_, Self>
-    where
-        Self: Sized,
-    {
-        WriteMultiBuffer { writer: self, buf: Some(mb) }
-    }
+        mb: MultiBuffer,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
 
     /// 通知读端 EOF（对应 Go pipe.Close）。
     /// 默认空操作；pipe.Writer override 为实际 close。
@@ -156,70 +105,28 @@ pub trait Writer: Send {
     /// 会随 drop 静默蒸发：对端 deframer 停在半条记录上永久 Pending，直到
     /// FIN 报 "peer closed without close_notify" 断链（bd VISIONMAC 截断根因，
     /// VPS netem r6 实锤滞留 65,383B = sendable_tls 64KB 上限）。
-    ///
-    /// 保持 boxed：每连接收尾一次的冷路径，不进数据热循环（oracle §2.2-2
-    /// 「每连接可以 dyn，每 chunk 不许 dyn」）。
     fn shutdown_flush(&mut self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
         self.shutdown();
         Box::pin(std::future::ready(Ok(())))
     }
 }
 
-/// [`Writer::write_multi_buffer`] 的具名 Future：持有 mb 跨 Pending 复传
-/// （写完的块已被 writer 摘除释放，进度不丢）。
-pub struct WriteMultiBuffer<'a, W: ?Sized> {
-    writer: &'a mut W,
-    buf: Option<MultiBuffer>,
-}
-
-impl<W: Writer + ?Sized> Future for WriteMultiBuffer<'_, W> {
-    type Output = Result<()>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        let mut buf = this.buf.take().unwrap_or_default();
-        match this.writer.poll_write_multi_buffer(cx, &mut buf) {
-            Poll::Ready(result) => Poll::Ready(result),
-            Poll::Pending => {
-                this.buf = Some(buf);
-                Poll::Pending
-            },
-        }
-    }
-}
-
-/// `?Sized` 上下文的写入包装（同 [`read_mb`] 的定位）。
-pub fn write_mb<W: Writer + ?Sized>(writer: &mut W, mb: MultiBuffer) -> WriteMultiBuffer<'_, W> {
-    WriteMultiBuffer { writer, buf: Some(mb) }
-}
-
-// ========== Box<dyn> 实现（连接边界：每连接一次 box 保留，poll 直通零分配） ==========
+// ========== Box<dyn> 实现 ==========
 
 impl Reader for Box<dyn Reader> {
-    fn poll_read_multi_buffer(&mut self, cx: &mut Context<'_>) -> Poll<Result<MultiBuffer>> {
-        (**self).poll_read_multi_buffer(cx)
-    }
-
-    /// 具名包装显式覆盖：`Box<dyn Reader>` 是 Sized，可直接用零装箱具名
-    /// future（默认方法在本 impl 上不被方法解析选中——receiver 会先 deref
-    /// 到 `dyn Reader` 触发 Sized 拒绝）。
-    fn read_multi_buffer(&mut self) -> ReadMultiBuffer<'_, Self> {
-        ReadMultiBuffer { reader: self }
+    fn read_multi_buffer(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<MultiBuffer>> + Send + '_>> {
+        (**self).read_multi_buffer()
     }
 }
 
 impl Writer for Box<dyn Writer> {
-    fn poll_write_multi_buffer(
+    fn write_multi_buffer(
         &mut self,
-        cx: &mut Context<'_>,
-        mb: &mut MultiBuffer,
-    ) -> Poll<Result<()>> {
-        (**self).poll_write_multi_buffer(cx, mb)
-    }
-
-    /// 同 [`Reader::read_multi_buffer`] 的显式覆盖理由。
-    fn write_multi_buffer(&mut self, mb: MultiBuffer) -> WriteMultiBuffer<'_, Self> {
-        WriteMultiBuffer { writer: self, buf: Some(mb) }
+        mb: MultiBuffer,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        (**self).write_multi_buffer(mb)
     }
 
     fn shutdown(&self) {

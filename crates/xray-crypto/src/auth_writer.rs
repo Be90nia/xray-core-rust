@@ -158,7 +158,7 @@ impl<'a> AuthenticationWriter<'a> {
             }
         }
 
-        xray_buf::io::write_mb(self.writer, mb2_write).await
+        self.writer.write_multi_buffer(mb2_write).await
     }
 
     /// Packet 模式写入。
@@ -187,7 +187,7 @@ impl<'a> AuthenticationWriter<'a> {
             return Ok(());
         }
 
-        xray_buf::io::write_mb(self.writer, mb2_write).await
+        self.writer.write_multi_buffer(mb2_write).await
     }
 
     /// 写入多缓冲区数据。
@@ -206,7 +206,7 @@ impl<'a> AuthenticationWriter<'a> {
                 .seal(&[])
                 .map_err(|e| io::Error::WriteError(format!("seal terminator failed: {e}")))?;
             let mb_term = MultiBuffer::from_buffer(terminator);
-            return xray_buf::io::write_mb(self.writer, mb_term).await;
+            return self.writer.write_multi_buffer(mb_term).await;
         }
 
         match self.transfer_type {
@@ -218,6 +218,7 @@ impl<'a> AuthenticationWriter<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::{future::Future, pin::Pin};
 
     use super::*;
     use crate::{
@@ -253,17 +254,17 @@ mod tests {
         }
     }
 
-    impl io::Writer for VecWriter {
-        fn poll_write_multi_buffer(
+    impl Writer for VecWriter {
+        fn write_multi_buffer(
             &mut self,
-            _cx: &mut std::task::Context<'_>,
-            mb: &mut MultiBuffer,
-        ) -> std::task::Poll<io::Result<()>> {
-            for buf in mb.iter_mut() {
-                self.data.extend_from_slice(buf.bytes());
-            }
-            mb.release();
-            std::task::Poll::Ready(Ok(()))
+            mb: MultiBuffer,
+        ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            Box::pin(async move {
+                for buf in mb.into_buffers() {
+                    self.data.extend_from_slice(buf.bytes());
+                }
+                Ok(())
+            })
         }
     }
 

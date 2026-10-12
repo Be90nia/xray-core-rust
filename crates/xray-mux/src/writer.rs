@@ -2,11 +2,7 @@
 //!
 //! 实现 MuxWriter 用于写入 Mux 协议帧数据
 
-use std::{
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll, ready},
-};
+use std::{pin::Pin, sync::Arc};
 
 use xray_buf::{
     buffer::Buffer,
@@ -42,8 +38,6 @@ pub struct MuxWriter {
     /// writer.go:23）。New 帧写出 source/local（Go frame.go:87-99），与
     /// GlobalID 互斥（frame.go:100 else 分支）。txno④ portal 写侧消费。
     inbound: Option<(Destination, Destination)>,
-    /// poll 写路径的在途帧（meta+载荷整帧）：Pending 期间暂存，Ready 后清空。
-    in_flight: Option<MultiBuffer>,
 }
 
 impl MuxWriter {
@@ -67,7 +61,6 @@ impl MuxWriter {
             transfer_type,
             global_id,
             inbound: None,
-            in_flight: None,
         }
     }
 
@@ -94,7 +87,6 @@ impl MuxWriter {
             transfer_type,
             global_id: None,
             inbound: None,
-            in_flight: None,
         }
     }
 
@@ -245,69 +237,16 @@ async fn write_meta_with_frame(
 }
 
 impl Writer for MuxWriter {
-    fn poll_write_multi_buffer(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-        mb: &mut MultiBuffer,
-    ) -> Poll<buf_io::Result<()>> {
-        use std::task::ready;
-        // 状态机化 write()：在途帧优先驱动 → 空发一帧 meta-only 即返回 →
-        // 按传输类型切帧入在途（错误串与旧 write()/write_meta_with_frame 一致）。
-        loop {
-            if let Some(flight) = self.in_flight.as_mut() {
-                ready!(self.writer.poll_write_multi_buffer_direct(cx, flight))
-                    .map_err(|e| buf_io::Error::WriteError(format!("write: {e:?}")))?;
-                self.in_flight = None;
-            }
-            if mb.is_empty() {
-                // write() 空 mb 语义：发一帧 meta-only（首帧 New / 后续 Keep），
-                // 写完即返回（不循环——否则无限发 Keep 帧）
-                let meta = self.get_next_frame_meta();
-                let meta_bytes = meta
-                    .to_bytes()
-                    .map_err(|e| buf_io::Error::WriteError(format!("meta: {e:?}")))?;
-                let mut frame = Buffer::new();
-                frame.write_from(&meta_bytes);
-                let mut flight = MultiBuffer::with_capacity(1);
-                flight.push(frame);
-                ready!(self.writer.poll_write_multi_buffer_direct(cx, &mut flight))
-                    .map_err(|e| buf_io::Error::WriteError(format!("write: {e:?}")))?;
-                return Poll::Ready(Ok(()));
-            }
-            let chunk = if self.transfer_type == TransferType::Stream {
-                mb.split_size(STREAM_CHUNK_SIZE)
-            } else {
-                match mb.split_first() {
-                    Some(b) => {
-                        let mut c = MultiBuffer::with_capacity(1);
-                        c.push(b);
-                        c
-                    },
-                    None => break,
-                }
-            };
-            let mut meta = self.get_next_frame_meta();
-            meta.set_option(OPTION_DATA);
-            let data_len = chunk.len() as u16;
-            let meta_bytes =
-                meta.to_bytes().map_err(|e| buf_io::Error::WriteError(format!("meta: {e:?}")))?;
-            let mut frame = Buffer::new();
-            {
-                let spare = frame.writable_bytes();
-                let n = meta_bytes.len() + 2;
-                assert!(n <= spare.len(), "mux meta + length exceeds buffer writable capacity");
-                spare[..meta_bytes.len()].copy_from_slice(&meta_bytes);
-                spare[meta_bytes.len()..n].copy_from_slice(&data_len.to_be_bytes());
-                frame.advance_write(n);
-            }
-            let mut flight = MultiBuffer::with_capacity(chunk.buffer_count() + 1);
-            flight.push(frame);
-            for buf in chunk.into_buffers() {
-                flight.push(buf);
-            }
-            self.in_flight = Some(flight);
-        }
-        Poll::Ready(Ok(()))
+    fn write_multi_buffer<'a>(
+        &'a mut self,
+        mb: MultiBuffer,
+    ) -> Pin<Box<dyn std::future::Future<Output = buf_io::Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.write(mb).await.map_err(|e| match e {
+                MuxError::Io(msg) => buf_io::Error::WriteError(msg),
+                other => buf_io::Error::WriteError(format!("{:?}", other)),
+            })
+        })
     }
 }
 
@@ -320,39 +259,26 @@ impl Writer for MuxWriter {
 /// 经此适配器 + `Arc<tokio::sync::Mutex<..>>` 串行化共写）。
 pub(crate) struct SharedWriter {
     inner: Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>>,
-    /// poll 写路径的在途临界区 future（lock+写）：每写调用 1 box（同旧形态）。
-    write_fut: Option<Pin<Box<dyn Future<Output = buf_io::Result<()>> + Send>>>,
 }
 
 impl SharedWriter {
     pub(crate) fn new(inner: Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>>) -> Self {
-        Self { inner, write_fut: None }
+        Self { inner }
     }
 }
 
 impl Writer for SharedWriter {
-    fn poll_write_multi_buffer(
-        &mut self,
-        cx: &mut Context<'_>,
-        mb: &mut MultiBuffer,
-    ) -> Poll<buf_io::Result<()>> {
-        if self.write_fut.is_none() {
-            // tokio Mutex 临界区含 await：以 Arc 搬移构造不借用 self 的在途
-            // future（每写调用 1 次 box，与旧 boxed-future 形态等价——共享
-            // carrier 锁窗口本身就是临界区，见类型注释）。
-            let inner = Arc::clone(&self.inner);
-            let owned = std::mem::take(mb);
-            self.write_fut = Some(Box::pin(async move {
-                let mut guard = inner.lock().await;
-                match guard.as_mut() {
-                    Some(w) => xray_buf::io::write_mb(&mut **w, owned).await,
-                    None => Err(buf_io::Error::WriteError("mux carrier writer closed".to_string())),
-                }
-            }));
-        }
-        let result = ready!(self.write_fut.as_mut().unwrap().as_mut().poll(cx));
-        self.write_fut = None;
-        Poll::Ready(result)
+    fn write_multi_buffer<'a>(
+        &'a mut self,
+        mb: MultiBuffer,
+    ) -> Pin<Box<dyn Future<Output = buf_io::Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut guard = self.inner.lock().await;
+            match guard.as_mut() {
+                Some(w) => w.write_multi_buffer(mb).await,
+                None => Err(buf_io::Error::WriteError("mux carrier writer closed".to_string())),
+            }
+        })
     }
 }
 

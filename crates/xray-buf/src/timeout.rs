@@ -101,7 +101,7 @@ impl<W: Writer + Send> TimeoutWriterWrapper<W> {
 
 #[cfg(test)]
 mod tests {
-    use std::{future::Future as _, io::Cursor, task::Poll};
+    use std::io::Cursor;
 
     use super::*;
     use crate::{
@@ -153,13 +153,13 @@ mod tests {
         struct SlowReader;
 
         impl Reader for SlowReader {
-            fn poll_read_multi_buffer(
+            fn read_multi_buffer(
                 &mut self,
-                cx: &mut std::task::Context<'_>,
-            ) -> Poll<Result<MultiBuffer>> {
-                // 恒慢 100s 的读（定时器每次 poll 重建，仅测试超时路径用）
-                let mut slow = std::pin::pin!(tokio::time::sleep(Duration::from_secs(100)));
-                slow.as_mut().poll(cx).map(|_| Ok(MultiBuffer::new()))
+            ) -> Pin<Box<dyn Future<Output = Result<MultiBuffer>> + Send + '_>> {
+                Box::pin(async {
+                    tokio::time::sleep(Duration::from_secs(100)).await;
+                    Ok(MultiBuffer::new())
+                })
             }
         }
 

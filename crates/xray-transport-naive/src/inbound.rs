@@ -437,7 +437,7 @@ mod tests {
         ) -> xray_app_dispatcher::default::PinFuture<()> {
             Box::pin(async move {
                 loop {
-                    let mb = match xray_buf::io::read_mb(&mut *link.reader).await {
+                    let mb = match link.reader.read_multi_buffer().await {
                         Ok(mb) => mb,
                         Err(e) => {
                             tracing::debug!(target: "naive", error = %e, "echo dispatch read ended");
@@ -447,7 +447,7 @@ mod tests {
                     if mb.is_empty() {
                         break;
                     }
-                    if let Err(e) = xray_buf::io::write_mb(&mut *link.writer, mb).await {
+                    if let Err(e) = link.writer.write_multi_buffer(mb).await {
                         tracing::debug!(target: "naive", error = %e, "echo dispatch write ended");
                         break;
                     }

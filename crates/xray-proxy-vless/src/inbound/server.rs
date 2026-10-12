@@ -1380,7 +1380,7 @@ mod tests {
                 let mut writer = link.writer;
                 let mut accum: Vec<u8> = Vec::new();
                 loop {
-                    let mb = match xray_buf::io::read_mb(&mut *reader).await {
+                    let mb = match reader.read_multi_buffer().await {
                         Ok(mb) => mb,
                         Err(_) => return,
                     };
@@ -1406,7 +1406,7 @@ mod tests {
                                 frame.extend_from_slice(&data);
                                 let mut out = xray_buf::multi::MultiBuffer::new();
                                 out.merge_bytes(&frame);
-                                if xray_buf::io::write_mb(&mut *writer, out).await.is_err() {
+                                if writer.write_multi_buffer(out).await.is_err() {
                                     return;
                                 }
                                 accum.drain(..consumed);
@@ -1519,7 +1519,7 @@ mod tests {
                 *dest_seen.lock() = Some(dest);
                 // 读 link 第一个字节以消费（避免测试挂住）
                 let mut reader = _link.reader;
-                let _ = xray_buf::io::read_mb(&mut *reader).await;
+                let _ = reader.read_multi_buffer().await;
             })
         }
     }
@@ -1602,7 +1602,7 @@ mod tests {
                 // read_multi_buffer 为非阻塞语义（Go buf.ReadMultiBuffer 同款）：
                 // 数据未到时返回空 MultiBuffer，轮询直到首帧到达。
                 let bytes = loop {
-                    match xray_buf::io::read_mb(&mut *reader).await {
+                    match reader.read_multi_buffer().await {
                         Ok(mb) => {
                             let bytes = mb.to_vec();
                             if !bytes.is_empty() {
@@ -1981,7 +1981,7 @@ mod tests {
                 let mut got: Vec<Vec<u8>> = Vec::new();
                 let mut accum: Vec<u8> = Vec::new();
                 while got.len() < expected {
-                    let mb = match xray_buf::io::read_mb(&mut *reader).await {
+                    let mb = match reader.read_multi_buffer().await {
                         Ok(mb) => mb,
                         Err(_) => return,
                     };
@@ -2012,7 +2012,7 @@ mod tests {
                     frame.extend_from_slice(data);
                     let mut out = xray_buf::multi::MultiBuffer::new();
                     out.merge_bytes(&frame);
-                    if xray_buf::io::write_mb(&mut *writer, out).await.is_err() {
+                    if writer.write_multi_buffer(out).await.is_err() {
                         return;
                     }
                 }

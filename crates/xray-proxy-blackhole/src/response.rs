@@ -74,7 +74,7 @@ impl ResponseConfig {
             let mut buf = xray_buf::buffer::Buffer::new();
             buf.write_from(&payload);
             let mb = xray_buf::multi::MultiBuffer::from_buffer(buf);
-            xray_buf::io::write_mb(writer, mb).await?;
+            writer.write_multi_buffer(mb).await?;
             Ok(n)
         })
     }
@@ -112,8 +112,6 @@ pub fn proto_response(
 
 #[cfg(test)]
 mod tests {
-    use std::task::{Context, Poll};
-
     use xray_buf::multi::MultiBuffer;
 
     use super::*;
@@ -140,14 +138,12 @@ mod tests {
     }
 
     impl Writer for CollectWriter {
-        fn poll_write_multi_buffer(
+        fn write_multi_buffer(
             &mut self,
-            _cx: &mut Context<'_>,
-            mb: &mut MultiBuffer,
-        ) -> Poll<io::Result<()>> {
-            // 收集语义：搬空传入 mb 的 Buffer 归自己所有
-            self.chunks.push(std::mem::take(mb));
-            Poll::Ready(Ok(()))
+            mb: MultiBuffer,
+        ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            self.chunks.push(mb);
+            Box::pin(async { Ok(()) })
         }
     }
 

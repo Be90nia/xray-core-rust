@@ -2,7 +2,7 @@
 //!
 //! 对应 Go `app/dispatcher/stats.go`。`SizeStatWriter` 在每次写入时累加计数，
 //! `SizeStatReader` 在每次读取时累加计数，用于统计用户上下行流量。
-use std::{future::Future, pin::Pin, sync::Arc, task::Context};
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use xray_buf::{
     io::{Reader, Result as IoResult, Writer},
@@ -19,38 +19,26 @@ pub struct SizeStatWriter {
     pub counter: Arc<dyn Counter>,
     /// 被包装的 Writer
     pub writer: Box<dyn Writer>,
-    /// 当前批已计数标记（poll 语义：一批只计一次，Ready 后复位）
-    counted: bool,
 }
 
 impl SizeStatWriter {
     /// 用 counter 和 writer 构造。
     #[must_use]
     pub fn new(counter: Arc<dyn Counter>, writer: Box<dyn Writer>) -> Self {
-        Self { counter, writer, counted: false }
+        Self { counter, writer }
     }
 }
 
 impl Writer for SizeStatWriter {
-    fn poll_write_multi_buffer(
+    fn write_multi_buffer(
         &mut self,
-        cx: &mut Context<'_>,
-        mb: &mut MultiBuffer,
-    ) -> std::task::Poll<IoResult<()>> {
-        // 计数一次/批：poll 首驱记满批字节（mb 就地消费进度持久化，重 poll
-        // 不再重复计数——半块重入时 counted 已置位）
-        if !self.counted {
+        mb: MultiBuffer,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = IoResult<()>> + Send + '_>> {
+        Box::pin(async move {
             let n = i64::try_from(mb.len()).unwrap_or(i64::MAX);
             self.counter.add(n);
-            self.counted = true;
-        }
-        match self.writer.poll_write_multi_buffer(cx, mb) {
-            std::task::Poll::Ready(result) => {
-                self.counted = false;
-                std::task::Poll::Ready(result)
-            },
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
+            self.writer.write_multi_buffer(mb).await
+        })
     }
 
     /// 关闭底层 writer（对应 Go `(*SizeStatWriter).Interrupt/Close` 委托内层）。
@@ -96,19 +84,16 @@ impl SizeStatReader {
 }
 
 impl Reader for SizeStatReader {
-    fn poll_read_multi_buffer(
+    fn read_multi_buffer(
         &mut self,
-        cx: &mut Context<'_>,
-    ) -> std::task::Poll<IoResult<MultiBuffer>> {
-        // 读是原子的（内层 Ready 即完整 mb），计数无重入歧义——直通零分配
-        match self.reader.poll_read_multi_buffer(cx) {
-            std::task::Poll::Ready(Ok(mb)) => {
-                let n = i64::try_from(mb.len()).unwrap_or(i64::MAX);
-                self.counter.add(n);
-                std::task::Poll::Ready(Ok(mb))
-            },
-            other => other,
-        }
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = IoResult<MultiBuffer>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let mb = self.reader.read_multi_buffer().await?;
+            let n = i64::try_from(mb.len()).unwrap_or(i64::MAX);
+            self.counter.add(n);
+            Ok(mb)
+        })
     }
 }
 
@@ -169,14 +154,17 @@ mod tests {
     struct CollectingWriter;
 
     impl Writer for CollectingWriter {
-        fn poll_write_multi_buffer(
+        fn write_multi_buffer(
             &mut self,
-            _cx: &mut Context<'_>,
-            mb: &mut MultiBuffer,
-        ) -> std::task::Poll<IoResult<()>> {
-            // 只记长度，丢弃 mb
-            mb.release();
-            std::task::Poll::Ready(Ok(()))
+            mb: MultiBuffer,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = IoResult<()>> + Send + '_>>
+        {
+            let _n = mb.len();
+            Box::pin(async move {
+                // 只记长度，丢弃 mb
+                drop(mb);
+                Ok(())
+            })
         }
     }
 
@@ -224,10 +212,10 @@ mod tests {
     }
 
     impl Reader for FixedReader {
-        fn poll_read_multi_buffer(
+        fn read_multi_buffer(
             &mut self,
-            _cx: &mut Context<'_>,
-        ) -> std::task::Poll<IoResult<MultiBuffer>> {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = IoResult<MultiBuffer>> + Send + '_>>
+        {
             let mb = if self.idx < self.data.len() {
                 let mut buf = MultiBuffer::new();
                 buf.merge_bytes(&self.data[self.idx]);
@@ -236,7 +224,7 @@ mod tests {
             } else {
                 MultiBuffer::default()
             };
-            std::task::Poll::Ready(Ok(mb))
+            Box::pin(async move { Ok(mb) })
         }
     }
 

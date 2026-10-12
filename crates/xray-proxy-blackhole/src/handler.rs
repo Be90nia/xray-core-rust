@@ -63,7 +63,7 @@ impl Handler {
 
 #[cfg(test)]
 mod tests {
-    use std::task::{Context, Poll};
+    use std::{future::Future, pin::Pin};
 
     use xray_buf::multi::MultiBuffer;
 
@@ -89,14 +89,12 @@ mod tests {
         }
     }
     impl Writer for CollectWriter {
-        fn poll_write_multi_buffer(
+        fn write_multi_buffer(
             &mut self,
-            _cx: &mut Context<'_>,
-            mb: &mut MultiBuffer,
-        ) -> Poll<io::Result<()>> {
-            // 收集语义：搬空传入 mb 的 Buffer 归自己所有
-            self.chunks.push(std::mem::take(mb));
-            std::task::Poll::Ready(Ok(()))
+            mb: MultiBuffer,
+        ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            self.chunks.push(mb);
+            Box::pin(async { Ok(()) })
         }
     }
 
