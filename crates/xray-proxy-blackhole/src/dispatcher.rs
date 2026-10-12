@@ -102,7 +102,7 @@ impl DispatchHandler for BlackholeHandler {
 
             // 2. drain reader（Go Process 里 buf.Copy(link.Reader, buf.Discard)）
             while let Ok(Ok(_)) =
-                tokio::time::timeout(drain_timeout, xray_buf::io::read_mb(&mut *reader)).await
+                tokio::time::timeout(drain_timeout, reader.read_multi_buffer()).await
             {
                 // drain 一帧
             }
@@ -138,26 +138,25 @@ mod tests {
     /// 立即返回错误的 reader（模拟 EOF / 已关闭）。
     struct EofReader;
     impl Reader for EofReader {
-        fn poll_read_multi_buffer(
-            &mut self,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<io::Result<MultiBuffer>> {
-            std::task::Poll::Ready(Err(io::Error::ReadError("eof".into())))
+        fn read_multi_buffer<'a>(
+            &'a mut self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<MultiBuffer>> + Send + 'a>>
+        {
+            Box::pin(async { Err(io::Error::ReadError("eof".into())) })
         }
     }
 
     /// 计数所有写入字节数的 writer。
     struct CountingWriter(Arc<AtomicUsize>);
     impl Writer for CountingWriter {
-        fn poll_write_multi_buffer(
-            &mut self,
-            _cx: &mut std::task::Context<'_>,
-            mb: &mut MultiBuffer,
-        ) -> std::task::Poll<io::Result<()>> {
+        fn write_multi_buffer<'a>(
+            &'a mut self,
+            mb: MultiBuffer,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + 'a>>
+        {
             let n = mb.iter().map(|b| b.bytes().len()).sum::<usize>();
             self.0.fetch_add(n, Ordering::Relaxed);
-            mb.release();
-            std::task::Poll::Ready(Ok(()))
+            Box::pin(async { Ok(()) })
         }
     }
 

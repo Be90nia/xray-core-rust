@@ -234,7 +234,7 @@ impl<'a> ChunkStreamWriter<'a> {
             }
         }
 
-        xray_buf::io::write_mb(self.writer, mb2_write).await
+        self.writer.write_multi_buffer(mb2_write).await
     }
 }
 

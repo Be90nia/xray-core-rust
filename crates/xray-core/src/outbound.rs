@@ -2113,7 +2113,7 @@ async fn dispatch_dns_link(
                     let mb = xray_buf::multi::MultiBuffer::from_buffer(
                         xray_buf::buffer::Buffer::from_vec(resp),
                     );
-                    if let Err(e) = xray_buf::io::write_mb(&mut **writer.lock().await, mb).await {
+                    if let Err(e) = writer.lock().await.write_multi_buffer(mb).await {
                         tracing::debug!(tag = %tag, "dns client write: {e}");
                         return;
                     }
@@ -2210,7 +2210,7 @@ async fn write_client_frame(
         return;
     };
     let mb = xray_buf::multi::MultiBuffer::from_buffer(xray_buf::buffer::Buffer::from_vec(framed));
-    if let Err(e) = xray_buf::io::write_mb(&mut **writer.lock().await, mb).await {
+    if let Err(e) = writer.lock().await.write_multi_buffer(mb).await {
         tracing::debug!(tag = %tag, "dns client write: {e}");
     }
 }
@@ -2597,7 +2597,7 @@ async fn pump_tuic_udp(
                 },
             };
         }
-        match xray_buf::io::read_mb(&mut *reader).await {
+        match reader.read_multi_buffer().await {
             Ok(mb) => {
                 if mb.is_empty() {
                     return Ok(()); // link EOF
@@ -2680,7 +2680,7 @@ async fn tuic_frame_relay(
             let mb = xray_buf::multi::MultiBuffer::from_buffer(xray_buf::buffer::Buffer::from_vec(
                 frame,
             ));
-            xray_buf::io::write_mb(&mut *writer, mb).await.map_err(std::io::Error::other)?;
+            writer.write_multi_buffer(mb).await.map_err(std::io::Error::other)?;
             Ok(true)
         },
         Ok(None) => Ok(false),

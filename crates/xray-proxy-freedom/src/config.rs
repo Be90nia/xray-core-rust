@@ -919,7 +919,7 @@ pub(crate) async fn blackhole_link(link: xray_transport::link::Link, tag: &str, 
     // EOF 语义与 udp pump 一致：Err 或 Ok(空 buffer) 都视为对端关闭
     let drain = async {
         loop {
-            match xray_buf::io::read_mb(&mut *reader).await {
+            match reader.read_multi_buffer().await {
                 Ok(mb) if !mb.is_empty() => continue,
                 _ => break,
             }

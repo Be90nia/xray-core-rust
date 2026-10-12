@@ -10,7 +10,7 @@
 //! Go 版操作 `buf.Buffer.UDP` 元数据（逐包原子）；Rust 的 link 语义是 XUDP
 //! 字节流（bd b2e 约定），故此处解析帧边界做改写，跨读/写的半帧累积在 `pending`。
 
-use std::task::{Context, Poll, ready};
+use std::{future::Future, pin::Pin};
 
 use xray_buf::{
     io::{Reader, Result as IoResult, Writer},
@@ -86,40 +86,35 @@ impl EndpointOverrideReader {
 }
 
 impl Reader for EndpointOverrideReader {
-    fn poll_read_multi_buffer(&mut self, cx: &mut Context<'_>) -> Poll<IoResult<MultiBuffer>> {
-        // 重入安全：循环状态全部在 self.pending（重写缓冲）里，逐轮
-        // 读→改写无跨 await 局部状态——stack pin 重启幂等，零堆分配。
-        let mut fut = std::pin::pin!(self.read_loop());
-        fut.as_mut().poll(cx)
-    }
-}
-
-impl EndpointOverrideReader {
-    async fn read_loop(&mut self) -> IoResult<MultiBuffer> {
-        loop {
-            let mb = xray_buf::io::read_mb(&mut *self.inner).await?;
-            let eof = mb.is_empty();
-            // 逐 buffer extend：mb.to_vec() 会先堆分配扁平 Vec 再拷一次
-            for b in mb.iter() {
-                self.pending.extend_from_slice(b.bytes());
+    fn read_multi_buffer(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = IoResult<MultiBuffer>> + Send + '_>> {
+        Box::pin(async move {
+            loop {
+                let mb = self.inner.read_multi_buffer().await?;
+                let eof = mb.is_empty();
+                // 逐 buffer extend：mb.to_vec() 会先堆分配扁平 Vec 再拷一次
+                for b in mb.iter() {
+                    self.pending.extend_from_slice(b.bytes());
+                }
+                let (out, consumed) = rewrite_complete_frames(&self.pending, &self.from, &self.to);
+                self.pending.drain(..consumed);
+                if eof {
+                    // EOF：残帧原样冲出（尽力而为）；无残帧时返回空 = EOF 传播
+                    let mut mb_out = MultiBuffer::new();
+                    mb_out.merge_bytes(&out);
+                    let tail = std::mem::take(&mut self.pending);
+                    mb_out.merge_bytes(&tail);
+                    return Ok(mb_out);
+                }
+                if consumed > 0 {
+                    let mut mb_out = MultiBuffer::new();
+                    mb_out.merge_bytes(&out);
+                    return Ok(mb_out);
+                }
+                // 非空读但无完整帧 → 继续读
             }
-            let (out, consumed) = rewrite_complete_frames(&self.pending, &self.from, &self.to);
-            self.pending.drain(..consumed);
-            if eof {
-                // EOF：残帧原样冲出（尽力而为）；无残帧时返回空 = EOF 传播
-                let mut mb_out = MultiBuffer::new();
-                mb_out.merge_bytes(&out);
-                let tail = std::mem::take(&mut self.pending);
-                mb_out.merge_bytes(&tail);
-                return Ok(mb_out);
-            }
-            if consumed > 0 {
-                let mut mb_out = MultiBuffer::new();
-                mb_out.merge_bytes(&out);
-                return Ok(mb_out);
-            }
-            // 非空读但无完整帧 → 继续读
-        }
+        })
     }
 }
 
@@ -132,47 +127,34 @@ pub struct EndpointOverrideWriter {
     from: Address,
     to: Address,
     pending: Vec<u8>,
-    /// poll 写路径的在途转发批：Pending 期间暂存改写后的帧，Ready 后清空。
-    in_flight: Option<MultiBuffer>,
 }
 
 impl EndpointOverrideWriter {
     /// 构造：`from` = 改写后地址，`to` = 原始地址。
     pub fn new(inner: Box<dyn Writer>, from: Address, to: Address) -> Self {
-        Self { inner, from, to, pending: Vec::new(), in_flight: None }
+        Self { inner, from, to, pending: Vec::new() }
     }
 }
 
 impl Writer for EndpointOverrideWriter {
-    fn poll_write_multi_buffer(
+    fn write_multi_buffer(
         &mut self,
-        cx: &mut Context<'_>,
-        mb: &mut MultiBuffer,
-    ) -> Poll<IoResult<()>> {
-        loop {
-            // 1. 在途转发批优先驱动
-            if let Some(flight) = self.in_flight.as_mut() {
-                ready!(self.inner.poll_write_multi_buffer(cx, flight))?;
-                self.in_flight = None;
-            }
-            // 2. 上游 mb 为空且无在途 → 本批完成
-            if mb.is_empty() {
-                return Poll::Ready(Ok(()));
-            }
-            // 3. 同步改写：摘空上游 mb 进 pending（重 poll 不会重复改写）
+        mb: MultiBuffer,
+    ) -> Pin<Box<dyn Future<Output = IoResult<()>> + Send + '_>> {
+        Box::pin(async move {
+            // 逐 buffer extend：mb.to_vec() 会先堆分配扁平 Vec 再拷一次
             for b in mb.iter() {
                 self.pending.extend_from_slice(b.bytes());
             }
-            mb.release();
             let (out, consumed) = rewrite_complete_frames(&self.pending, &self.from, &self.to);
             self.pending.drain(..consumed);
             if out.is_empty() {
-                return Poll::Ready(Ok(()));
+                return Ok(());
             }
             let mut mb_out = MultiBuffer::new();
             mb_out.merge_bytes(&out);
-            self.in_flight = Some(mb_out);
-        }
+            self.inner.write_multi_buffer(mb_out).await
+        })
     }
 
     fn shutdown(&self) {

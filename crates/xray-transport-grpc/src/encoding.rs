@@ -30,13 +30,7 @@
 //! - field 1, wire type 2（length-delimited），tag = `(1<<3)|2 = 0x0a`
 //! - 编码：`tag(0x0a) + varint_len(data) + data`
 
-use std::{
-    future::Future,
-    io::Read as _,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll, ready},
-};
+use std::{future::Future, io::Read as _, pin::Pin, sync::Arc};
 
 use flate2::read::GzDecoder;
 use tokio::sync::Mutex;
@@ -565,8 +559,8 @@ impl<S: HunkStream + 'static> HunkReaderWriter<S> {
     #[must_use]
     pub fn into_parts(self) -> (HunkReader<S>, HunkWriter<S>) {
         (
-            HunkReader { stream: Arc::clone(&self.stream), buf: Vec::new(), recv_fut: None },
-            HunkWriter { stream: self.stream, send_fut: None },
+            HunkReader { stream: Arc::clone(&self.stream), buf: Vec::new() },
+            HunkWriter { stream: self.stream },
         )
     }
 }
@@ -575,70 +569,58 @@ impl<S: HunkStream + 'static> HunkReaderWriter<S> {
 pub struct HunkReader<S: HunkStream> {
     stream: Arc<Mutex<S>>,
     buf: Vec<u8>,
-    /// poll 读的在途 recv（Arc 搬移构造，不借用 self；每调用 1 box 同旧形态）。
-    recv_fut: Option<Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send>>>,
 }
 
 /// HunkStream 适配的 Writer 端。
 pub struct HunkWriter<S: HunkStream> {
     stream: Arc<Mutex<S>>,
-    /// poll 写的在途 send（同上）。
-    send_fut: Option<Pin<Box<dyn Future<Output = Result<()>> + Send>>>,
 }
 
 impl<S: HunkStream + 'static> Reader for HunkReader<S> {
-    fn poll_read_multi_buffer(
+    fn read_multi_buffer(
         &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<xray_buf::io::Result<MultiBuffer>> {
-        {
+    ) -> Pin<Box<dyn Future<Output = xray_buf::io::Result<MultiBuffer>> + Send + '_>> {
+        Box::pin(async move {
             // ponytail: &mut self 直接 mutate buf，buf 空时从 stream recv 一个 hunk
             if self.buf.is_empty() {
-                if self.recv_fut.is_none() {
-                    let stream = Arc::clone(&self.stream);
-                    self.recv_fut = Some(Box::pin(async move {
-                        let mut s = stream.lock().await;
-                        s.recv_hunk().await
-                    }));
-                }
-                let data = ready!(self.recv_fut.as_mut().unwrap().as_mut().poll(cx))
-                    .map_err(|e| xray_buf::io::Error::ReadError(format!("{e}")))?;
-                self.recv_fut = None;
+                let data = {
+                    let mut stream = self.stream.lock().await;
+                    stream
+                        .recv_hunk()
+                        .await
+                        .map_err(|e| xray_buf::io::Error::ReadError(format!("{e}")))?
+                };
                 self.buf.extend_from_slice(&data);
             }
             // 取出所有缓存数据一次性返回（对应 Go ReadMultiBuffer 行为）
             let data = std::mem::take(&mut self.buf);
             if data.is_empty() {
                 // 兜底：stream 返空 data，构造空 MultiBuffer
-                return Poll::Ready(Ok(MultiBuffer::new()));
+                return Ok(MultiBuffer::new());
             }
-            Poll::Ready(Ok(MultiBuffer::from_buffer(xray_buf::buffer::Buffer::from_vec(data))))
-        }
+            Ok(MultiBuffer::from_buffer(xray_buf::buffer::Buffer::from_vec(data)))
+        })
     }
 }
 
 impl<S: HunkStream + 'static> Writer for HunkWriter<S> {
-    fn poll_write_multi_buffer(
+    fn write_multi_buffer(
         &mut self,
-        cx: &mut Context<'_>,
-        mb: &mut MultiBuffer,
-    ) -> Poll<xray_buf::io::Result<()>> {
-        if self.send_fut.is_none() {
+        mb: MultiBuffer,
+    ) -> Pin<Box<dyn Future<Output = xray_buf::io::Result<()>> + Send + '_>> {
+        Box::pin(async move {
             // 把 MultiBuffer 拼成单个 Vec 一次性发出（对齐 Go Write 行为）
             let mut payload: Vec<u8> = Vec::with_capacity(mb.len());
-            for buf in mb.iter_mut() {
+            for buf in mb.into_buffers() {
                 payload.extend_from_slice(buf.bytes());
             }
-            mb.release();
-            let stream = Arc::clone(&self.stream);
-            self.send_fut = Some(Box::pin(async move {
-                let mut s = stream.lock().await;
-                s.send_hunk(payload).await
-            }));
-        }
-        let result = ready!(self.send_fut.as_mut().unwrap().as_mut().poll(cx));
-        self.send_fut = None;
-        Poll::Ready(result.map_err(|e| xray_buf::io::Error::WriteError(format!("{e}"))))
+            let mut stream = self.stream.lock().await;
+            stream
+                .send_hunk(payload)
+                .await
+                .map_err(|e| xray_buf::io::Error::WriteError(format!("{e}")))?;
+            Ok(())
+        })
     }
 }
 
@@ -668,13 +650,8 @@ impl<S: HunkStream + 'static> MultiHunkReaderWriter<S> {
     #[must_use]
     pub fn into_parts(self) -> (MultiHunkReader<S>, MultiHunkWriter<S>) {
         (
-            MultiHunkReader {
-                stream: Arc::clone(&self.stream),
-                pending: Vec::new(),
-                pos: 0,
-                recv_fut: None,
-            },
-            MultiHunkWriter { stream: self.stream, send_fut: None },
+            MultiHunkReader { stream: Arc::clone(&self.stream), pending: Vec::new(), pos: 0 },
+            MultiHunkWriter { stream: self.stream },
         )
     }
 }
@@ -686,83 +663,70 @@ pub struct MultiHunkReader<S: HunkStream> {
     pending: Vec<Vec<u8>>,
     /// 当前 pending 中的消费位置。
     pos: usize,
-    /// poll 读的在途 recv（同 HunkReader）。
-    recv_fut: Option<Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send>>>,
 }
 
 /// MultiHunk 适配的 Writer 端。
 pub struct MultiHunkWriter<S: HunkStream> {
     stream: Arc<Mutex<S>>,
-    /// poll 写的在途 send（同 HunkWriter）。
-    send_fut: Option<Pin<Box<dyn Future<Output = Result<()>> + Send>>>,
 }
 
 impl<S: HunkStream + 'static> Reader for MultiHunkReader<S> {
-    fn poll_read_multi_buffer(
+    fn read_multi_buffer(
         &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<xray_buf::io::Result<MultiBuffer>> {
-        // 如果 pending 有未消费的 chunks，先返回它们
-        if self.pos < self.pending.len() {
-            let chunks: Vec<Vec<u8>> = self.pending.drain(self.pos..).collect();
-            self.pos = 0;
+    ) -> Pin<Box<dyn Future<Output = xray_buf::io::Result<MultiBuffer>> + Send + '_>> {
+        Box::pin(async move {
+            // 如果 pending 有未消费的 chunks，先返回它们
+            if self.pos < self.pending.len() {
+                let chunks: Vec<Vec<u8>> = self.pending.drain(self.pos..).collect();
+                self.pos = 0;
+                self.pending.clear();
+                let buffers: Vec<xray_buf::buffer::Buffer> =
+                    chunks.into_iter().map(xray_buf::buffer::Buffer::from_vec).collect();
+                return Ok(MultiBuffer::from_buffers(buffers));
+            }
+            // pending 空，从 stream recv 一个 hunk 并 decode 为 MultiHunk
             self.pending.clear();
+            self.pos = 0;
+            let raw = {
+                let mut stream = self.stream.lock().await;
+                stream
+                    .recv_hunk()
+                    .await
+                    .map_err(|e| xray_buf::io::Error::ReadError(format!("{e}")))?
+            };
+            // HunkStream.recv_hunk 返回已解 frame + Hunk proto 的 data 字段
+            // 在 TunMulti 模式下，这个 data 实际上是 MultiHunk 的 repeated bytes 编码
+            let mh = MultiHunk::decode(&raw)
+                .map_err(|e| xray_buf::io::Error::ReadError(format!("multi_hunk decode: {e}")))?;
+            if mh.data.is_empty() {
+                return Ok(MultiBuffer::new());
+            }
             let buffers: Vec<xray_buf::buffer::Buffer> =
-                chunks.into_iter().map(xray_buf::buffer::Buffer::from_vec).collect();
-            return Poll::Ready(Ok(MultiBuffer::from_buffers(buffers)));
-        }
-        // pending 空，从 stream recv 一个 hunk 并 decode 为 MultiHunk
-        if self.recv_fut.is_none() {
-            self.pending.clear();
-            self.pos = 0;
-            let stream = Arc::clone(&self.stream);
-            self.recv_fut = Some(Box::pin(async move {
-                let mut s = stream.lock().await;
-                s.recv_hunk().await
-            }));
-        }
-        let raw = ready!(self.recv_fut.as_mut().unwrap().as_mut().poll(cx))
-            .map_err(|e| xray_buf::io::Error::ReadError(format!("{e}")))?;
-        self.recv_fut = None;
-        // HunkStream.recv_hunk 返回已解 frame + Hunk proto 的 data 字段
-        // 在 TunMulti 模式下，这个 data 实际上是 MultiHunk 的 repeated bytes 编码
-        let mh = MultiHunk::decode(&raw)
-            .map_err(|e| xray_buf::io::Error::ReadError(format!("multi_hunk decode: {e}")))?;
-        if mh.data.is_empty() {
-            return Poll::Ready(Ok(MultiBuffer::new()));
-        }
-        let buffers: Vec<xray_buf::buffer::Buffer> =
-            mh.data.into_iter().map(xray_buf::buffer::Buffer::from_vec).collect();
-        Poll::Ready(Ok(MultiBuffer::from_buffers(buffers)))
+                mh.data.into_iter().map(xray_buf::buffer::Buffer::from_vec).collect();
+            Ok(MultiBuffer::from_buffers(buffers))
+        })
     }
 }
 
 impl<S: HunkStream + 'static> Writer for MultiHunkWriter<S> {
-    fn poll_write_multi_buffer(
+    fn write_multi_buffer(
         &mut self,
-        cx: &mut Context<'_>,
-        mb: &mut MultiBuffer,
-    ) -> Poll<xray_buf::io::Result<()>> {
-        if self.send_fut.is_none() {
+        mb: MultiBuffer,
+    ) -> Pin<Box<dyn Future<Output = xray_buf::io::Result<()>> + Send + '_>> {
+        Box::pin(async move {
             // 把 MultiBuffer 的每个 Buffer 作为 MultiHunk 的一个 repeated bytes 元素
             // send_hunk 发送的是 proto payload（不含 frame 头），HunkStream 实现者加 frame 头
             let mh = MultiHunk::new(
-                std::mem::take(mb)
-                    .into_buffers()
-                    .into_iter()
-                    .map(|b| b.into_bytes().to_vec())
-                    .collect(),
+                mb.into_buffers().into_iter().map(|b| b.into_bytes().to_vec()).collect(),
             );
             let payload = mh.encode_to_vec();
-            let stream = Arc::clone(&self.stream);
-            self.send_fut = Some(Box::pin(async move {
-                let mut s = stream.lock().await;
-                s.send_hunk(payload).await
-            }));
-        }
-        let result = ready!(self.send_fut.as_mut().unwrap().as_mut().poll(cx));
-        self.send_fut = None;
-        Poll::Ready(result.map_err(|e| xray_buf::io::Error::WriteError(format!("{e}"))))
+            let mut stream = self.stream.lock().await;
+            stream
+                .send_hunk(payload)
+                .await
+                .map_err(|e| xray_buf::io::Error::WriteError(format!("{e}")))?;
+            Ok(())
+        })
     }
 }
 
