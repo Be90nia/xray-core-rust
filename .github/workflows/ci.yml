@@ -95,14 +95,15 @@ jobs:
       - uses: ./.github/actions/setup-boringssl
       - run: cargo build --workspace --release
       - run: cargo build --workspace
-      # 常态测试流程：CI 绿后从 artifact 下载 linux xray 换核验证（发版需用户同意，
+      # 常态测试流程：CI 绿后从 artifact 下载对应平台二进制测试（发版需用户同意，
       # 测试阶段不打 tag）；同 commit 功能与 release 资产等价
-      - name: Upload Linux xray binary
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+      - name: Upload xray binary (per-platform)
         uses: actions/upload-artifact@v4
         with:
-          name: xray-prod-swap
-          path: target/release/xray
+          name: xray-${{ matrix.target }}
+          path: |
+            target/release/xray
+            target/release/xray.exe
 
   # 测试
   test:
