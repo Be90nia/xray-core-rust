@@ -1,0 +1,18 @@
+[toolchain]
+# 锁 Rust 版本——所有协作者一致（CLAUDE.md §1 5 分钟上手前提）
+# 已知基线：rustc 1.98.0-nightly (cced03bfd 2026-05-28) / cargo 1.98.0-nightly (fbb61be30 2026-05-26)
+# 当前状态: master 87d72569 + ci.yml 9 绿跑通
+
+# 组件（Xray-core-rust 编译 + 工具链需要）
+channel = "nightly-2026-05-28"
+components = ["rustfmt", "clippy", "rust-src"]
+
+# 目标（CI 9 宽门镜像——避免协作者本地门 ≠ CI 门教训 2026-10-09）
+targets = [
+    "x86_64-pc-windows-msvc",     # 本机 v2rayN 测速
+    "x86_64-unknown-linux-gnu",   # CI linux runner
+    "aarch64-apple-darwin",       # CI macOS runner
+]
+
+# Profile（保留）
+profile = "minimal"

@@ -81,3 +81,16 @@ docs/*
 !docs/benchmarks/
 # 例外: docs/audit-*.md 立项级审计(5 维+9 票+综合+立项级 共 6 份, 治理资产, 与 docs/refs/ 治理输入同级) 2026-10-12; PM 拍板入仓
 !docs/audit-*.md
+
+# 临时调试产物(应走 tools/logs/ 归档, 不入仓) 2026-10-12
+build-debug.log
+clippy-hold.log
+test-hup.log
+*.log
+# 临时分析目录(PM 工具链) 2026-10-12
+stress-analysis-tmp/
+.docker-boringssl/
+# 工具本地缓存 2026-10-12
+.codebase-memory/
+.omo/
+.atl/
