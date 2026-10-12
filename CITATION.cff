@@ -1,0 +1,40 @@
+# CITATION.cff — Xray-core-rust 学术引用
+
+> 5 维审计 5 维 P3 项目规范治理债补齐——学术引用标准化
+> GitHub 自动识别此文件生成 "Cite this repository" 按钮
+
+cff-version: 1.2.0
+title: Xray-core-rust
+message: |
+  Xray-core-rust = Go Xray-core v26.9.9 Rust 复刻。32/32 协议全通，
+  7 万行 Rust / 20+ crate / master 87d72569 CI 9 绿。
+  5 维综合 3.5/5 立项级 GO-WITH-CONDITIONS（5 维审计+9 票架构审视）。
+type: software
+version: 0.1.0
+date-released: 2026-09-15
+url: "https://github.com/Be90nia/xray-core-rust"
+repository-code: "https://github.com/Be90nia/xray-core-rust"
+keywords:
+  - xray
+  - proxy
+  - rust
+  - port
+  - mirror-of-go
+license: AGPL-3.0-or-later
+copyright: "Copyright 2026 Xray-core-rust contributors"
+authors:
+  - family-names: "Maintainer"
+    given-names: "Be90nia"
+    affiliation: "GitHub @Be90nia"
+references:
+  - type: software
+    title: "Xray-core (Go baseline v26.9.9)"
+    url: "https://github.com/XTLS/Xray-core"
+    version: "v26.9.9"
+  - type: document
+    title: "Xray-core-rust ARCHITECTURE.md"
+    url: "https://github.com/Be90nia/xray-core-rust/blob/master/docs/ARCHITECTURE.md"
+  - type: report
+    title: "Xray-core-rust 5 维审计 6 份报告 + 立项级 GO-WITH-CONDITIONS 决议"
+    url: "https://github.com/Be90nia/xray-core-rust/blob/master/docs/audit-立项级别-2026-10-12.md"
+    date: 2026-10-12
