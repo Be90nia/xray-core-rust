@@ -79,3 +79,5 @@ docs/*
 !docs/refs/
 # 例外: docs/benchmarks/ 性能基线(框架支线 P0 护栏产出, alloc/MB 与 loopback 数字, P1 对照依据) 2026-10-11
 !docs/benchmarks/
+# 例外: docs/audit-*.md 立项级审计(5 维+9 票+综合+立项级 共 6 份, 治理资产, 与 docs/refs/ 治理输入同级) 2026-10-12; PM 拍板入仓
+!docs/audit-*.md
