@@ -810,12 +810,11 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
             return Ok(None);
         }
 
-        // 先复制 aad 数据避免同时不可变+可变借用 packet_buf（借用分裂固有拷贝）
-        #[allow(clippy::disallowed_methods)]
-        let aad_data = packet_buf[..ext_hdr_len].to_vec();
-        let aad = ring::aead::Aad::from(&aad_data[..]);
+        // split_at_mut 借用分裂：aad 区与密文区互斥借出（免旧实现的 aad 整段拷贝）
+        let (aad_part, cipher_part) = packet_buf.split_at_mut(ext_hdr_len);
+        let aad = ring::aead::Aad::from(&*aad_part);
         let decrypted_len = quic_key
-            .open_in_place(nonce, aad, &mut packet_buf[ext_hdr_len..payload_end])
+            .open_in_place(nonce, aad, &mut cipher_part[..payload_end - ext_hdr_len])
             .map_err(|_| SniffError::UnknownContent)?
             .len();
 
