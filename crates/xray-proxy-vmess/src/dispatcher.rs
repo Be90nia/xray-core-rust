@@ -605,7 +605,10 @@ where
         chunk_buf.resize(start + padding_size, 0);
         rand::rng().fill_bytes(&mut chunk_buf[start..]);
     }
-    let size_value = u16::try_from(chunk_buf.len() - sb).unwrap_or(u16::MAX);
+    // size 字段 u16：超出即显式报错（静默回退 u16::MAX 会致收端按 65535 读、错位）
+    let size_value = u16::try_from(chunk_buf.len() - sb).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "vmess chunk size exceeds u16")
+    })?;
     size_parser.encode(size_value, &mut chunk_buf[..sb]);
     writer.write_all(chunk_buf).await
 }

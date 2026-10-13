@@ -162,6 +162,9 @@ impl ClientSession {
             SealHeaderError::InvalidKeyLength(n) => {
                 VmessError::Other(format!("cmd_key length mismatch: {n}"))
             },
+            SealHeaderError::PayloadTooLarge(n) => {
+                VmessError::Other(format!("request header payload too large: {n}"))
+            },
             SealHeaderError::Crypto(c) => VmessError::Crypto(c),
         })
     }

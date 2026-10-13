@@ -238,6 +238,11 @@ pub enum SealHeaderError {
     #[error("cmdKey must be 16 bytes, got {0}")]
     InvalidKeyLength(usize),
 
+    /// 头负载超过 u16 可编码长度。Go 端 `uint16(len(data))` 静默截断会致收端
+    /// 错位（协议可达输入恒小于 u16::MAX，此处防御性显式报错）。
+    #[error("header payload length {0} exceeds u16 max")]
+    PayloadTooLarge(usize),
+
     /// AEAD 加密失败。
     #[error("crypto error: {0}")]
     Crypto(#[from] xray_crypto::aead::CryptoError),
@@ -267,6 +272,7 @@ impl From<CreateAuthIDError> for SealHeaderError {
 /// # Errors
 ///
 /// - [`SealHeaderError::InvalidKeyLength`]：cmdKey 长度不是 16。
+/// - [`SealHeaderError::PayloadTooLarge`]：头负载超过 u16 可编码长度（防御性）。
 /// - [`SealHeaderError::Crypto`]：AEAD 加密失败（极少）。
 pub fn seal_vmess_aead_header(
     cmd_key: &[u8],
@@ -282,7 +288,8 @@ pub fn seal_vmess_aead_header(
     use rand::RngCore;
     rand::rng().fill_bytes(&mut connection_nonce);
 
-    let header_payload_data_len = u16::try_from(data.len()).unwrap_or(u16::MAX);
+    let header_payload_data_len =
+        u16::try_from(data.len()).map_err(|_| SealHeaderError::PayloadTooLarge(data.len()))?;
     let len_plain = header_payload_data_len.to_be_bytes();
 
     // KDF path 用字节切片（Go 端用 string(byte_slice)，非 UTF-8 也合法）

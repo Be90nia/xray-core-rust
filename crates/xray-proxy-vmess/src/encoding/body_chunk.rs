@@ -295,7 +295,9 @@ fn write_one_chunk<W: Write>(
 
     let padding_size = if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
     let encrypted_size = sealed.len(); // = data.len() + TAG_SIZE
-    let size_value = u16::try_from(encrypted_size + padding_size).unwrap_or(u16::MAX);
+    let size_value = u16::try_from(encrypted_size + padding_size).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "vmess chunk size exceeds u16")
+    })?;
 
     let sb = size_parser.size_bytes();
     let mut size_field = vec![0u8; sb];
@@ -506,7 +508,9 @@ async fn write_one_chunk_async<W: AsyncWrite + Unpin>(
 
     let padding_size = if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
     let encrypted_size = sealed.len();
-    let size_value = u16::try_from(encrypted_size + padding_size).unwrap_or(u16::MAX);
+    let size_value = u16::try_from(encrypted_size + padding_size).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "vmess chunk size exceeds u16")
+    })?;
 
     let sb = size_parser.size_bytes();
     let mut size_field = vec![0u8; sb];
