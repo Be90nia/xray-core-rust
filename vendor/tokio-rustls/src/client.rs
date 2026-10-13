@@ -55,25 +55,6 @@ impl TlsConnector {
 
     /// Connect with a session ID generator (used by Shadow-TLS V3).
     ///
-    /// The `session_id_generator` is called with the serialised ClientHello
-    /// (header stripped) and must return a 32-byte session ID. Pass `None`
-    /// for standard behaviour.
-    #[inline]
-    pub fn connect_with_session_id_generator<IO, F, T>(
-        &self,
-        domain: ServerName<'static>,
-        stream: IO,
-        session_id_generator: Option<T>,
-        f: F,
-    ) -> Connect<IO>
-    where
-        IO: AsyncRead + AsyncWrite + Unpin,
-        F: FnOnce(&mut ClientConnection),
-        T: Fn(&[u8]) -> [u8; 32],
-    {
-        self.connect_impl_with_session_id_generator(domain, stream, session_id_generator, f)
-    }
-
     fn connect_impl<IO, F>(
         &self,
         domain: ServerName<'static>,
