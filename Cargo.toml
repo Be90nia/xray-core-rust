@@ -200,9 +200,11 @@ httparse = "1.10"
 # OCSP 装订客户端（对应 Go crypto/x509 + ocsp；xray-tls OCSP stapling）
 ocsp-stapler = { version = "0.4", default-features = false, features = ["ring"] }
 # uTLS 指纹伪造（btls = 0x676e67/btls BoringSSL 绑定；提供 GREASE/extension permutation/ECH GREASE/key shares 等 BoringSSL 原生指纹 API；替代 Go uTLS）
-btls = { git = "https://github.com/0x676e67/btls", rev = "ab7f522c3d7be139740175901b9c4d9f8cd90e1b" }
-tokio-btls = { git = "https://github.com/0x676e67/btls", rev = "ab7f522c3d7be139740175901b9c4d9f8cd90e1b" }
-btls-sys = { git = "https://github.com/0x676e67/btls", rev = "ab7f522c3d7be139740175901b9c4d9f8cd90e1b" }
+# URL 指向自有 mirror（github.com/Be90nia/btls，fork 自 0x676e67/btls，rev 逐字一致）：
+# 0x676e67 单人维护断供兜底，rev 内容寻址保证构建产物与上游逐字节等价（gqkk 阶段4）
+btls = { git = "https://github.com/Be90nia/btls", rev = "ab7f522c3d7be139740175901b9c4d9f8cd90e1b" }
+tokio-btls = { git = "https://github.com/Be90nia/btls", rev = "ab7f522c3d7be139740175901b9c4d9f8cd90e1b" }
+btls-sys = { git = "https://github.com/Be90nia/btls", rev = "ab7f522c3d7be139740175901b9c4d9f8cd90e1b" }
 # btls SslRef ForeignTypeRef trait（from_ptr/as_ptr）
 foreign-types = "0.5"
 
