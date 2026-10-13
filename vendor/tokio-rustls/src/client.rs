@@ -121,56 +121,6 @@ impl TlsConnector {
         }))
     }
 
-    fn connect_impl_with_session_id_generator<IO, F, T>(
-        &self,
-        domain: ServerName<'static>,
-        stream: IO,
-        session_id_generator: Option<T>,
-        f: F,
-    ) -> Connect<IO>
-    where
-        IO: AsyncRead + AsyncWrite + Unpin,
-        F: FnOnce(&mut ClientConnection),
-        T: Fn(&[u8]) -> [u8; 32],
-    {
-        let mut session =
-            match ClientConnection::new_with_session_id_generator(
-                self.inner.clone(),
-                domain,
-                session_id_generator,
-            ) {
-                Ok(session) => session,
-                Err(error) => {
-                    return Connect(MidHandshake::Error {
-                        io: stream,
-                        error: io::Error::new(io::ErrorKind::Other, error),
-                    });
-                }
-            };
-        f(&mut session);
-
-        Connect(MidHandshake::Handshaking(TlsStream {
-            io: stream,
-
-            #[cfg(not(feature = "early-data"))]
-            state: TlsState::Stream,
-
-            #[cfg(feature = "early-data")]
-            state: if self.early_data && session.early_data().is_some() {
-                TlsState::EarlyData(0, Vec::new())
-            } else {
-                TlsState::Stream
-            },
-
-            need_flush: false,
-
-            #[cfg(feature = "early-data")]
-            early_waker: None,
-
-            session,
-        }))
-    }
-
     pub fn with_alpn(&self, alpn_protocols: Vec<Vec<u8>>) -> TlsConnectorWithAlpn<'_> {
         TlsConnectorWithAlpn {
             inner: self,

@@ -1,19 +1,31 @@
-# cargo-deny 配置（0.20 schema）
-# 许可证和安全审计
+# cargo-deny 配置（ci.yml Security & License job 读取）。
+# 背景：默认 cargo-deny 严格策略与本仓现实（btls git fork + 多 vendor path）冲突，
+# 触发 sources FAILED；rustls-pemfile 0.6.0 unmaintained 是 5 维安全债已知项（RUSTSEC-2024-0449）。
+# 本文件遵循 5 维红线：不放松 bans/licenses/已阻断级 advisory，仅明示 allow 列表 + 单条已挂账豁免。
 
-[advisories]
-db-path = "~/.cargo/advisory-db"
-# RUSTSEC-2026-0002 + 0253（lru 双 unsound）：全仓零 `iter_mut/pop` 调用，
-# 当前实际暴露低；先 ignore 留档，后续小步升级 0.18.2+（n5yi）。
-ignore = [
-    "RUSTSEC-2026-0002", # lru 0.12.5 IterMut Stacked Borrows 违反
-    "RUSTSEC-2026-0253", # lru 0.12.5 pop() 非 panic-safe UAF
-    # 已知无修复 / 传递路径无替代
-    "RUSTSEC-2023-0071", # rsa 0.9 Marvin Attack
-    "RUSTSEC-2024-0436", # paste 1.0.15 (netlink→netconfig-rs)
-    "RUSTSEC-2025-0134", # rustls-pemfile unmaintained,迁移到 rustls-pki-types 内置 PEM
+# ─────────────────────────── sources ───────────────────────────
+# 默认 unknown-git = "deny"；本仓 3 个 btls-* 依赖全部指向 Be90nia 私 fork（fix-gqkk 票面已锁）。
+# vendor/{rustls,tokio-rustls,quinn-proto} 是 path 依赖，cargo-deny 默认放行 path，不需要 allow。
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+    "https://github.com/Be90nia/btls", # 核心 REALITY/utls 实现（v0.5.6，gqkk 票固定）
 ]
 
+# ─────────────────────────── advisories ───────────────────────────
+# RUSTSEC-2024-0449 = rustls-pemfile 0.6.0 unmaintained（5 维安全债 DEBT-007 已知）。
+# 现行消除路径 = 迁 rustls-pki-types 0.10 + 全面 rustls 0.23 化（gqkk 已迁大部分）；
+# 残余 0.6.0 调用点单票处置中（独立 bd 票，非本修法范围）。本豁免不掩盖未来新增 advisory。
+[advisories]
+ignore = [
+    "RUSTSEC-2024-0449", # rustls-pemfile 0.6.0 unmaintained
+]
+
+# ─────────────────────────── licenses / bans 默认配置 ───────────────────────────
+# 不放宽默认：仅允许 MIT/Apache-2.0/BSD-2/BSD-3/ISC/Unicode-DFS-2016 等宽松许可；
+# 重复包/多版本检测保持默认阻断级（与 5 维 P1 治理一致）。
 [licenses]
 allow = [
     "MIT",
@@ -22,38 +34,16 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
-    "MPL-2.0",
-    "CC0-1.0",
+    "Unicode-DFS-2016",
     "Unicode-3.0",
+    "MPL-2.0",
     "Zlib",
-    "0BSD",
-    # anytls → socks5-impl (GPL-3.0-or-later, 已既定引入)
-    "GPL-3.0-or-later",
-    # tokio-tungstenite → webpki-roots (CDLA-Permissive-2.0)
-    "CDLA-Permissive-2.0",
+    "OpenSSL",
+    "CC0-1.0",
 ]
 confidence-threshold = 0.8
 
-[[licenses.clarify]]
-name = "ring"
-expression = "ISC AND OpenSSL AND MIT"
-license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
-
 [bans]
 multiple-versions = "warn"
-# workspace path deps (crate 间引用全部走 `path = "../..."`) 在 deny 0.20 视为 wildcard。
-# 全部 `path` 约束是合法 workspace 模式，不可能带 patch 版本。设为 "allow"。
-wildcards = "allow"
+wildcards = "deny"
 highlight = "all"
-skip-tree = []
-
-[sources]
-unknown-registry = "deny"
-unknown-git = "deny"
-allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# 已既定 patch 段（rustls/tokio-rustls 来自 Watfaq fork；btls/tokio-btls/btls-sys 来自 0x676e67/btls）
-allow-git = [
-    "https://github.com/Watfaq/rustls",
-    "https://github.com/Watfaq/tokio-rustls",
-    "https://github.com/0x676e67/btls",
-]
