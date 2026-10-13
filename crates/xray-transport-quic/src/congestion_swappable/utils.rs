@@ -91,7 +91,7 @@ pub fn use_configured<S: CongestionSetter + ?Sized>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     use super::*;
 
@@ -106,13 +106,13 @@ mod tests {
         }
 
         fn was_set(&self) -> bool {
-            self.last_set.lock().unwrap().is_some()
+            self.last_set.lock().is_some()
         }
     }
 
     impl CongestionSetter for TestSetter {
         fn set_congestion_control(&self, cc: Box<dyn CongestionControl>) {
-            *self.last_set.lock().unwrap() = Some(cc);
+            *self.last_set.lock() = Some(cc);
         }
     }
 

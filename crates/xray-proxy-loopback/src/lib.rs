@@ -386,7 +386,7 @@ mod tests {
     /// Mock sink：记录最后一次收到的 inbound_tag + 调用计数。
     #[derive(Debug, Default)]
     struct MockSink {
-        calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        calls: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
     }
 
     impl LoopbackSink for MockSink {
@@ -399,7 +399,7 @@ mod tests {
         ) -> LoopbackFuture<std::result::Result<(), LoopbackError>> {
             let calls = self.calls.clone();
             Box::pin(async move {
-                calls.lock().unwrap().push(inbound_tag);
+                calls.lock().push(inbound_tag);
                 Ok(())
             })
         }
@@ -486,24 +486,24 @@ mod tests {
 
     #[tokio::test]
     async fn handler_dispatch_with_sink_invokes_dispatch_loopback() {
-        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let calls = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
         let sink = std::sync::Arc::new(MockSink { calls: calls.clone() });
         let h = LoopbackHandler::with_inbound_tag("lb", "target-in").with_sink(sink);
         let link = pipe_link();
         h.dispatch(&dummy_dest(), link).await;
-        let recorded = calls.lock().unwrap().clone();
+        let recorded = calls.lock().clone();
         assert_eq!(recorded, vec!["target-in".to_string()]);
     }
 
     #[tokio::test]
     async fn handler_dispatch_multiple_calls_accumulate_in_sink() {
-        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let calls = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
         let sink = std::sync::Arc::new(MockSink { calls: calls.clone() });
         let h = LoopbackHandler::with_inbound_tag("lb", "in").with_sink(sink);
         for _ in 0..3 {
             h.dispatch(&dummy_dest(), pipe_link()).await;
         }
-        assert_eq!(calls.lock().unwrap().len(), 3);
+        assert_eq!(calls.lock().len(), 3);
     }
 
     #[test]
@@ -520,13 +520,13 @@ mod tests {
 
     #[tokio::test]
     async fn outbound_dial_with_sink_succeeds() {
-        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let calls = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
         let sink = std::sync::Arc::new(MockSink { calls: calls.clone() });
         let h = LoopbackHandler::with_inbound_tag("lb", "target-in").with_sink(sink);
         let dest = dummy_dest();
         let session = Session::new();
         assert!(h.dial(&dest, &session).await.is_ok());
-        let recorded = calls.lock().unwrap().clone();
+        let recorded = calls.lock().clone();
         assert_eq!(recorded, vec!["target-in".to_string()]);
     }
 

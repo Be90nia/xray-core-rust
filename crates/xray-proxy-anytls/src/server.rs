@@ -193,10 +193,10 @@ async fn handle_conn(
     let padding = DefaultPaddingFactory::load();
     // Fn 闭包不能 move out kill_tx：用 take 单次取出（回调单次触发由
     // anytls 单流模式的 handler_started 保护保证）。
-    let kill_tx_cell = std::sync::Mutex::new(Some(kill_tx));
+    let kill_tx_cell = parking_lot::Mutex::new(Some(kill_tx));
     let on_new_session: Box<dyn Fn(Arc<Session>) + Send + Sync> = Box::new(move |session| {
         let dispatch = dispatch.clone();
-        let kill_tx = kill_tx_cell.lock().expect("anytls kill_tx cell poisoned").take();
+        let kill_tx = kill_tx_cell.lock().take();
         tokio::spawn(handle_session(session, dispatch, kill_tx));
     });
     let session = Arc::new(

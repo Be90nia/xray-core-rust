@@ -226,9 +226,9 @@ impl CustomLayout {
         let pad_marker = padding_pool[0];
 
         Ok(Self {
-            x_bits: x_bits.try_into().unwrap(),
-            p_bits: p_bits.try_into().unwrap(),
-            v_bits: v_bits.try_into().unwrap(),
+            x_bits: x_bits.try_into().expect("pattern shape validated by normalize_custom_table"),
+            p_bits: p_bits.try_into().expect("pattern shape validated by normalize_custom_table"),
+            v_bits: v_bits.try_into().expect("pattern shape validated by normalize_custom_table"),
             x_mask,
             pad_marker,
             padding_pool,

@@ -288,16 +288,17 @@ pub type DialerProxyHook = Arc<
         + Sync,
 >;
 
-static DIALER_PROXY_HOOK: std::sync::RwLock<Option<DialerProxyHook>> = std::sync::RwLock::new(None);
+static DIALER_PROXY_HOOK: parking_lot::RwLock<Option<DialerProxyHook>> =
+    parking_lot::RwLock::new(None);
 
 /// 注册全局 DialerProxy 钩子（xray-core `register_outbounds` 调用）。
 pub fn set_dialer_proxy_hook(hook: DialerProxyHook) {
-    *DIALER_PROXY_HOOK.write().expect("DIALER_PROXY_HOOK lock poisoned") = Some(hook);
+    *DIALER_PROXY_HOOK.write() = Some(hook);
 }
 
 /// 清除钩子（测试隔离用）。
 pub fn clear_dialer_proxy_hook() {
-    *DIALER_PROXY_HOOK.write().expect("DIALER_PROXY_HOOK lock poisoned") = None;
+    *DIALER_PROXY_HOOK.write() = None;
 }
 
 // ===== LookupForIP（bd 5y8，Go dialer.go:87-109）=====
@@ -305,16 +306,16 @@ pub fn clear_dialer_proxy_hook() {
 /// 全局 DNS 客户端。对应 Go dialer.go:82-85 的包级 `dnsClient`（由
 /// `InitSystemDialer(dc dns.Client, ...)` 注入）。回调注入而非直接依赖
 /// xray-app-dns（依赖方向：app-dns → transport，反向成环）。
-static DNS_CLIENT: std::sync::RwLock<Option<Arc<dyn DnsClient>>> = std::sync::RwLock::new(None);
+static DNS_CLIENT: parking_lot::RwLock<Option<Arc<dyn DnsClient>>> = parking_lot::RwLock::new(None);
 
 /// 注入全局 DNS 客户端。对应 Go `InitSystemDialer` 的 `dnsClient = dc`。
 /// `None` 清除（测试隔离）。
 pub fn set_dns_client(client: Option<Arc<dyn DnsClient>>) {
-    *DNS_CLIENT.write().expect("DNS_CLIENT lock poisoned") = client;
+    *DNS_CLIENT.write() = client;
 }
 
 fn dns_client() -> Option<Arc<dyn DnsClient>> {
-    DNS_CLIENT.read().expect("DNS_CLIENT lock poisoned").clone()
+    DNS_CLIENT.read().clone()
 }
 
 /// DomainStrategy 感知的 DNS 解析。对应 Go `LookupForIP`（dialer.go:87-109）：
@@ -677,7 +678,7 @@ pub async fn dial_system(
     // 3. DialerProxy（bd enk）：对应 Go dialer.go:270-279——非空时不直连，经指定 tag 的 outbound
     //    handler 拨号（redirect）。可能已带上步骤 2 解析的 IP。
     if !sockopt.dialer_proxy.is_empty() {
-        let hook = DIALER_PROXY_HOOK.read().expect("DIALER_PROXY_HOOK lock poisoned").clone();
+        let hook = DIALER_PROXY_HOOK.read().clone();
         let Some(hook) = hook else {
             return Err(io::Error::other("there is no outbound manager for dialerProxy"));
         };

@@ -19,11 +19,11 @@ sha2 = "0.10"
 tracing = { workspace = true }
 xray-features = { path = "../xray-features" }
 async-trait = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 rcgen = "0.13"
-parking_lot = { workspace = true }
 xray-buf = { path = "../xray-buf" }
 xray-app-dispatcher = { path = "../xray-app-dispatcher" }
 xray-proxy-freedom = { path = "../xray-proxy-freedom" }

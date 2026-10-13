@@ -7,10 +7,9 @@
 //! 给 drainer 提供反 probing 行为种子。`GetBehaviorSeed` 调用后 fused，
 //! 新加用户不再累积 seed。
 
-use std::sync::Mutex;
-
 use crc::{CRC_64_ECMA_182, Crc};
 use hmac::{Hmac, Mac};
+use parking_lot::Mutex;
 use sha2::Sha256;
 
 use crate::{
@@ -135,7 +134,7 @@ impl Validator {
     /// # Errors
     /// - [`SsError::NoMultiUserForStreamCipher`]：已有用户且新用户是非 AEAD。
     pub fn add(&self, user: MemoryUser) -> Result<()> {
-        let mut inner = self.inner.lock().expect("validator mutex poisoned");
+        let mut inner = self.inner.lock();
         let account = &user.account;
         if !account.cipher.is_aead() && !inner.users.is_empty() {
             return Err(SsError::NoMultiUserForStreamCipher);
@@ -167,7 +166,7 @@ impl Validator {
         if email.is_empty() {
             return Err(SsError::EmptyEmail);
         }
-        let mut inner = self.inner.lock().expect("validator mutex poisoned");
+        let mut inner = self.inner.lock();
         let lower = email.to_ascii_lowercase();
         let idx = inner.users.iter().position(|u| u.email.to_ascii_lowercase() == lower);
         let Some(idx) = idx else {
@@ -186,7 +185,7 @@ impl Validator {
         if email.is_empty() {
             return None;
         }
-        let inner = self.inner.lock().expect("validator mutex poisoned");
+        let inner = self.inner.lock();
         let lower = email.to_ascii_lowercase();
         inner.users.iter().find(|u| u.email.to_ascii_lowercase() == lower).cloned()
     }
@@ -194,14 +193,14 @@ impl Validator {
     /// 获取所有用户副本。
     #[must_use]
     pub fn get_all(&self) -> Vec<MemoryUser> {
-        let inner = self.inner.lock().expect("validator mutex poisoned");
+        let inner = self.inner.lock();
         inner.users.clone()
     }
 
     /// 当前用户数。
     #[must_use]
     pub fn count(&self) -> u64 {
-        let inner = self.inner.lock().expect("validator mutex poisoned");
+        let inner = self.inner.lock();
         inner.users.len() as u64
     }
 
@@ -216,7 +215,7 @@ impl Validator {
     /// - [`SsError::UserNotFound`]：无用户匹配。
     /// - [`SsError::IvNotUnique`]：IV 已见过（仅 `iv_check` 为 true 时）。
     pub fn get(&self, bs: &[u8], command: RequestCommand) -> Result<GetResult> {
-        let mut inner = self.inner.lock().expect("validator mutex poisoned");
+        let mut inner = self.inner.lock();
 
         // Phase 1: match user (shared borrow of inner.users).
         let matched: Option<(MemoryUser, u32, Option<crate::config::InnerAead>, Vec<u8>)> = {
@@ -274,7 +273,7 @@ impl Validator {
     /// seed 为 0 时生成随机值。
     #[must_use]
     pub fn behavior_seed(&self) -> u64 {
-        let mut inner = self.inner.lock().expect("validator mutex poisoned");
+        let mut inner = self.inner.lock();
         inner.behavior_fused = true;
         if inner.behavior_seed == 0 {
             // Go 用 dice.RollUint64()，Rust 用 rand::random

@@ -200,10 +200,15 @@ impl Segment for DataSegment {
         if body.len() < 14 {
             return (false, 0);
         }
-        self.timestamp = u32::from_be_bytes(body[0..4].try_into().unwrap());
-        self.number = u32::from_be_bytes(body[4..8].try_into().unwrap());
-        self.sending_next = u32::from_be_bytes(body[8..12].try_into().unwrap());
-        let data_len = u16::from_be_bytes(body[12..14].try_into().unwrap()) as usize;
+        self.timestamp =
+            u32::from_be_bytes(body[0..4].try_into().expect("body.len() >= 14 checked above"));
+        self.number =
+            u32::from_be_bytes(body[4..8].try_into().expect("body.len() >= 14 checked above"));
+        self.sending_next =
+            u32::from_be_bytes(body[8..12].try_into().expect("body.len() >= 14 checked above"));
+        let data_len =
+            u16::from_be_bytes(body[12..14].try_into().expect("body.len() >= 14 checked above"))
+                as usize;
         if body.len() < 14 + data_len {
             return (false, 0);
         }
@@ -317,9 +322,12 @@ impl Segment for AckSegment {
         if body.len() < 13 {
             return (false, 0);
         }
-        self.receiving_window = u32::from_be_bytes(body[0..4].try_into().unwrap());
-        self.receiving_next = u32::from_be_bytes(body[4..8].try_into().unwrap());
-        self.timestamp = u32::from_be_bytes(body[8..12].try_into().unwrap());
+        self.receiving_window =
+            u32::from_be_bytes(body[0..4].try_into().expect("body.len() >= 13 checked above"));
+        self.receiving_next =
+            u32::from_be_bytes(body[4..8].try_into().expect("body.len() >= 13 checked above"));
+        self.timestamp =
+            u32::from_be_bytes(body[8..12].try_into().expect("body.len() >= 13 checked above"));
         let count = body[12] as usize;
         if body.len() < 13 + count * 4 {
             return (false, 0);
@@ -328,7 +336,9 @@ impl Segment for AckSegment {
         self.number_list.reserve(count);
         for i in 0..count {
             let off = 13 + i * 4;
-            self.number_list.push(u32::from_be_bytes(body[off..off + 4].try_into().unwrap()));
+            self.number_list.push(u32::from_be_bytes(
+                body[off..off + 4].try_into().expect("body.len() >= 13 + count * 4 checked above"),
+            ));
         }
         (true, 13 + count * 4)
     }
@@ -406,9 +416,12 @@ impl Segment for CmdOnlySegment {
         if body.len() < 12 {
             return (false, 0);
         }
-        self.sending_next = u32::from_be_bytes(body[0..4].try_into().unwrap());
-        self.receiving_next = u32::from_be_bytes(body[4..8].try_into().unwrap());
-        self.peer_rto = u32::from_be_bytes(body[8..12].try_into().unwrap());
+        self.sending_next =
+            u32::from_be_bytes(body[0..4].try_into().expect("body.len() >= 12 checked above"));
+        self.receiving_next =
+            u32::from_be_bytes(body[4..8].try_into().expect("body.len() >= 12 checked above"));
+        self.peer_rto =
+            u32::from_be_bytes(body[8..12].try_into().expect("body.len() >= 12 checked above"));
         (true, 12)
     }
 }
@@ -477,6 +490,7 @@ impl SegmentKind {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

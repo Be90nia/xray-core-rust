@@ -519,7 +519,7 @@ impl GeodataReloader for ReloadBothRegistries {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     use super::*;
 
@@ -535,13 +535,13 @@ mod tests {
         }
 
         fn snapshot(&self) -> Vec<(String, PathBuf)> {
-            self.calls.lock().unwrap().clone()
+            self.calls.lock().clone()
         }
     }
 
     impl AssetDownloader for StubDownloader {
         fn download_to(&self, url: &str, temp: &std::path::Path) -> Result<(), GeodataError> {
-            self.calls.lock().unwrap().push((url.to_string(), temp.to_path_buf()));
+            self.calls.lock().push((url.to_string(), temp.to_path_buf()));
             if let Some(fail) = &self.fail_url {
                 if url == fail {
                     return Err(GeodataError::DownloadFailed {

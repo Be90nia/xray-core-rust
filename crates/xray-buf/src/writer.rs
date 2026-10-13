@@ -406,14 +406,14 @@ mod tests {
     /// `is_write_vectored()==true` 的 mock：记录聚合结果与调用次数，
     /// 可配置每次最多消费的字节数（模拟部分写）。
     struct VectoredMock {
-        data: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        data: std::sync::Arc<parking_lot::Mutex<Vec<u8>>>,
         chunk: Option<usize>,
         vectored_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl VectoredMock {
         fn new(chunk: Option<usize>) -> (Self, Self) {
-            let data = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let data = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
             let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let writer_mock = Self {
                 data: std::sync::Arc::clone(&data),
@@ -431,7 +431,7 @@ mod tests {
             _cx: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<std::io::Result<usize>> {
-            self.data.lock().expect("unpoisoned").extend_from_slice(buf);
+            self.data.lock().extend_from_slice(buf);
             Poll::Ready(Ok(buf.len()))
         }
 
@@ -449,7 +449,7 @@ mod tests {
                     break;
                 }
                 let take = rem.min(s.len());
-                self.data.lock().expect("unpoisoned").extend_from_slice(&s[..take]);
+                self.data.lock().extend_from_slice(&s[..take]);
                 rem -= take;
             }
             Poll::Ready(Ok(n))
@@ -480,11 +480,7 @@ mod tests {
         writer.write_multi_buffer(mb).await.expect("write failed");
 
         use std::sync::atomic::Ordering::Relaxed;
-        assert_eq!(
-            *probe.data.lock().expect("unpoisoned"),
-            b"aaabbbcc".as_slice(),
-            "聚合写必须保序拼接全部块"
-        );
+        assert_eq!(*probe.data.lock(), b"aaabbbcc".as_slice(), "聚合写必须保序拼接全部块");
         assert_eq!(probe.vectored_calls.load(Relaxed), 1, "3 块应单次 poll_write_vectored 写出");
     }
 
@@ -501,11 +497,7 @@ mod tests {
         writer.write_multi_buffer(mb).await.expect("write failed");
 
         use std::sync::atomic::Ordering::Relaxed;
-        assert_eq!(
-            *probe.data.lock().expect("unpoisoned"),
-            b"aaabbbccc".as_slice(),
-            "部分写必须从断点续写且保序"
-        );
+        assert_eq!(*probe.data.lock(), b"aaabbbccc".as_slice(), "部分写必须从断点续写且保序");
         assert_eq!(probe.vectored_calls.load(Relaxed), 3);
     }
 }

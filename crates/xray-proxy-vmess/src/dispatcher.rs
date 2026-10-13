@@ -180,7 +180,7 @@ pub fn parse_vmess_config(data: &[u8]) -> Result<VmessOutboundConfig, String> {
     if users.len() != 1 {
         return Err(r#"vmess "users" should have one and only one member. Multiple members should use multiple VMess outbounds and routing balancer instead"#.into());
     }
-    let user = users.first().unwrap();
+    let user = users.first().expect("users.len() == 1 checked above");
     let user_id = user
         .get("id")
         .and_then(|v| v.as_str())

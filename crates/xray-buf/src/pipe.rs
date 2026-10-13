@@ -97,7 +97,7 @@ struct PipeInner {
 }
 
 struct PipeShared {
-    inner: std::sync::Mutex<PipeInner>,
+    inner: parking_lot::Mutex<PipeInner>,
     /// 写端通知读端：有新数据可读。
     read_signal: CountingNotify,
     /// 读端通知写端：缓冲有空间可写。
@@ -109,7 +109,7 @@ struct PipeShared {
     /// 错误注入槽（ReturnAnError/Recover）。
     /// ponytail: Go 用 buffered channel（阻塞 send），这里用 slot 非阻塞覆盖。
     /// 行为差异：重复 return_an_error 会覆盖（Go 阻塞）。实际使用成对调用，覆盖语义不影响。
-    err_slot: std::sync::Mutex<Option<Error>>,
+    err_slot: parking_lot::Mutex<Option<Error>>,
 }
 
 impl PipeShared {
@@ -153,7 +153,7 @@ pub fn new() -> (Reader, Writer) {
 /// 创建一对 (Reader, Writer) pipe，使用指定选项。
 pub fn new_with_option(option: PipeOption) -> (Reader, Writer) {
     let shared = Arc::new(PipeShared {
-        inner: std::sync::Mutex::new(PipeInner {
+        inner: parking_lot::Mutex::new(PipeInner {
             data: MultiBuffer::new(),
             option,
             state: State::Open,
@@ -162,7 +162,7 @@ pub fn new_with_option(option: PipeOption) -> (Reader, Writer) {
         write_signal: CountingNotify::new(),
         closed: AtomicBool::new(false),
         closed_notify: Notify::new(),
-        err_slot: std::sync::Mutex::new(None),
+        err_slot: parking_lot::Mutex::new(None),
     });
     (Reader(shared.clone()), Writer(shared))
 }
@@ -180,7 +180,7 @@ impl Reader {
         loop {
             // 取 buffered 数据
             let (data, idle_timeout) = {
-                let mut inner = self.0.inner.lock().unwrap();
+                let mut inner = self.0.inner.lock();
                 let data = if !inner.data.is_empty() {
                     std::mem::take(&mut inner.data)
                 } else {
@@ -196,7 +196,7 @@ impl Reader {
 
             // 空，检查状态
             {
-                let inner = self.0.inner.lock().unwrap();
+                let inner = self.0.inner.lock();
                 match inner.state {
                     State::Open => {},
                     State::Closed => return Err(Error::Eof),
@@ -206,7 +206,7 @@ impl Reader {
 
             // 检查错误槽
             {
-                let mut slot = self.0.err_slot.lock().unwrap();
+                let mut slot = self.0.err_slot.lock();
                 if let Some(err) = slot.take() {
                     return Err(err);
                 }
@@ -247,7 +247,7 @@ impl Reader {
     }
 
     fn interrupt_shared(shared: &Arc<PipeShared>) {
-        let mut inner = shared.inner.lock().unwrap();
+        let mut inner = shared.inner.lock();
         if !inner.data.is_empty() {
             inner.data.release();
             inner.data = MultiBuffer::new();
@@ -264,18 +264,18 @@ impl Reader {
 
     /// 注入一个错误，使下一次 read 返回该错误。
     pub fn return_an_error(&self, err: Error) {
-        let mut slot = self.0.err_slot.lock().unwrap();
+        let mut slot = self.0.err_slot.lock();
         *slot = Some(err);
     }
 
     /// 取出注入的错误（如果有）。
     pub fn recover(&self) -> Option<Error> {
-        self.0.err_slot.lock().unwrap().take()
+        self.0.err_slot.lock().take()
     }
 
     /// 当前 buffered 字节数。
     pub fn len(&self) -> usize {
-        self.0.inner.lock().unwrap().data.len()
+        self.0.inner.lock().data.len()
     }
 
     /// 是否为空。
@@ -324,7 +324,7 @@ impl Writer {
         let mut mb_slot = Some(mb);
         loop {
             let action = {
-                let mut inner = self.0.inner.lock().unwrap();
+                let mut inner = self.0.inner.lock();
                 match inner.state {
                     State::Open => {
                         if inner.option.is_full(inner.data.len()) {
@@ -375,7 +375,7 @@ impl Writer {
     /// 关闭 pipe。读端读完 buffered 后返回 EOF。多次调用幂等。
     pub fn close(&self) -> Result<()> {
         let was_open = {
-            let mut inner = self.0.inner.lock().unwrap();
+            let mut inner = self.0.inner.lock();
             let was_open = inner.state == State::Open;
             if was_open {
                 inner.state = State::Closed;
@@ -395,7 +395,7 @@ impl Writer {
 
     /// 当前 buffered 字节数。
     pub fn len(&self) -> usize {
-        self.0.inner.lock().unwrap().data.len()
+        self.0.inner.lock().data.len()
     }
 
     /// 是否为空。

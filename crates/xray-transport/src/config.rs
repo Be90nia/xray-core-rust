@@ -2,7 +2,9 @@
 //!
 //! 对应 Go `transport/internet/config.go`。全局传输配置注册表。
 
-use std::{collections::HashMap, io, sync::Mutex};
+use std::{collections::HashMap, io};
+
+use parking_lot::Mutex;
 
 static TRANSPORT_CONFIG: std::sync::OnceLock<Mutex<HashMap<String, serde_json::Value>>> =
     std::sync::OnceLock::new();
@@ -15,7 +17,7 @@ fn transport_config() -> &'static Mutex<HashMap<String, serde_json::Value>> {
 }
 
 pub fn register_transport_config(tag: &str, config: serde_json::Value) -> io::Result<()> {
-    let mut map = transport_config().lock().unwrap();
+    let mut map = transport_config().lock();
     if map.len() >= MAX_CONFIG_ENTRIES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -27,7 +29,7 @@ pub fn register_transport_config(tag: &str, config: serde_json::Value) -> io::Re
 }
 
 pub fn get_transport_config(tag: &str) -> Option<serde_json::Value> {
-    transport_config().lock().unwrap().get(tag).cloned()
+    transport_config().lock().get(tag).cloned()
 }
 
 #[cfg(test)]
@@ -43,7 +45,7 @@ mod tests {
     #[test]
     fn register_and_get() {
         let _g = TEST_LOCK.lock();
-        transport_config().lock().unwrap().clear();
+        transport_config().lock().clear();
         register_transport_config("test-tgg", serde_json::json!({"k":"v"})).unwrap();
         assert_eq!(get_transport_config("test-tgg").unwrap(), serde_json::json!({"k":"v"}));
     }
@@ -51,12 +53,12 @@ mod tests {
     #[test]
     fn register_exceeds_capacity() {
         let _g = TEST_LOCK.lock();
-        transport_config().lock().unwrap().clear();
+        transport_config().lock().clear();
         for i in 0..MAX_CONFIG_ENTRIES {
             register_transport_config(&format!("cap-{i}"), serde_json::json!(i)).unwrap();
         }
         let result = register_transport_config("overflow", serde_json::json!(0));
         assert!(result.is_err());
-        transport_config().lock().unwrap().clear();
+        transport_config().lock().clear();
     }
 }

@@ -41,6 +41,7 @@ impl PacketReader for KCPPacketReader {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::segment::{CmdOnlySegment, Command, Segment};

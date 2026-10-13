@@ -7,6 +7,7 @@
 //! 若 TLS 包装层或内层库存在"部分写后返回裸 Pending"同族缺陷（v50 在
 //! CommonConn/VisionConn 修掉的模式），跨窗口背压下 waker 丢失即挂死——
 //! timeout 兜底防止挂死整个测试套件。
+#![allow(clippy::unwrap_used)]
 
 use std::{
     io,

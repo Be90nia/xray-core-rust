@@ -116,13 +116,13 @@ impl SegmentWriter for RetryableWriter {
 #[cfg(test)]
 #[derive(Debug, Default)]
 struct CollectWriter {
-    chunks: std::sync::Mutex<Vec<Vec<u8>>>,
+    chunks: parking_lot::Mutex<Vec<Vec<u8>>>,
 }
 
 #[cfg(test)]
 impl UnderlyingWriter for std::sync::Arc<CollectWriter> {
     fn write_all(&self, buf: &[u8]) -> io::Result<()> {
-        self.chunks.lock().unwrap().push(buf.to_vec());
+        self.chunks.lock().push(buf.to_vec());
         Ok(())
     }
 }
@@ -130,7 +130,7 @@ impl UnderlyingWriter for std::sync::Arc<CollectWriter> {
 #[cfg(test)]
 impl CollectWriter {
     fn collected(&self) -> Vec<u8> {
-        let chunks = self.chunks.lock().unwrap();
+        let chunks = self.chunks.lock();
         let mut out = Vec::new();
         for c in chunks.iter() {
             out.extend_from_slice(c);
@@ -139,11 +139,12 @@ impl CollectWriter {
     }
 
     fn call_count(&self) -> usize {
-        self.chunks.lock().unwrap().len()
+        self.chunks.lock().len()
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::segment::{CmdOnlySegment, Command, Segment};
@@ -210,18 +211,18 @@ mod tests {
 
     #[derive(Debug)]
     struct IntermittentWriter {
-        fails_left: std::sync::Mutex<u32>,
+        fails_left: parking_lot::Mutex<u32>,
     }
 
     impl IntermittentWriter {
         fn new(initial_fails: u32) -> Self {
-            Self { fails_left: std::sync::Mutex::new(initial_fails) }
+            Self { fails_left: parking_lot::Mutex::new(initial_fails) }
         }
     }
 
     impl UnderlyingWriter for IntermittentWriter {
         fn write_all(&self, _buf: &[u8]) -> io::Result<()> {
-            let mut fl = self.fails_left.lock().unwrap();
+            let mut fl = self.fails_left.lock();
             if *fl > 0 {
                 *fl -= 1;
                 return Err(io::Error::other("transient fail"));

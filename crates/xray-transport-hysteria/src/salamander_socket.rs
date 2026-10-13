@@ -257,7 +257,7 @@ impl UdpPoller for WritablePoller {
             let io = Arc::clone(&this.io);
             this.fut = Some(Box::pin(async move { io.writable().await }));
         }
-        let result = this.fut.as_mut().unwrap().as_mut().poll(cx);
+        let result = this.fut.as_mut().expect("fut set above when None").as_mut().poll(cx);
         if result.is_ready() {
             this.fut = None;
         }

@@ -57,7 +57,7 @@ impl SendingWindow {
             if front.number >= una {
                 break;
             }
-            let mut seg = self.cache.pop_front().unwrap();
+            let mut seg = self.cache.pop_front().expect("front() returned Some in loop");
             seg.release();
         }
     }
@@ -82,7 +82,7 @@ impl SendingWindow {
             if self.total_in_flight_size > 0 {
                 self.total_in_flight_size -= 1;
             }
-            let mut seg = self.cache.remove(idx).unwrap();
+            let mut seg = self.cache.remove(idx).expect("position() returned Some above");
             seg.release();
             true
         } else {
@@ -395,6 +395,7 @@ pub fn adjust_control_window(current: u32, loss_rate: u32, config: &Config) -> u
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::{config::default_config, output::SimpleSegmentWriter, round_trip::RoundTripInfo};
@@ -558,25 +559,22 @@ mod tests {
 
     #[test]
     fn worker_flush_with_data_calls_writer() {
-        use std::sync::{
-            Mutex as StdMutex,
-            atomic::{AtomicU32, Ordering},
-        };
+        use std::sync::atomic::{AtomicU32, Ordering};
 
         struct CountingWriter {
             count: Arc<AtomicU32>,
-            chunks: Arc<StdMutex<Vec<Vec<u8>>>>,
+            chunks: Arc<Mutex<Vec<Vec<u8>>>>,
         }
         impl crate::output::UnderlyingWriter for CountingWriter {
             fn write_all(&self, buf: &[u8]) -> std::io::Result<()> {
                 self.count.fetch_add(1, Ordering::SeqCst);
-                self.chunks.lock().unwrap().push(buf.to_vec());
+                self.chunks.lock().push(buf.to_vec());
                 Ok(())
             }
         }
 
         let count = Arc::new(AtomicU32::new(0));
-        let chunks = Arc::new(StdMutex::new(Vec::new()));
+        let chunks = Arc::new(Mutex::new(Vec::new()));
         let writer = SimpleSegmentWriter::new(CountingWriter {
             count: count.clone(),
             chunks: chunks.clone(),

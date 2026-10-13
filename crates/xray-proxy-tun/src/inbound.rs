@@ -983,7 +983,7 @@ mod tests {
     /// dispatcher 收到的 destination 与 IP 头的 dst 一致。
     #[tokio::test]
     async fn udp_dispatch_uses_real_destination_from_ip_header() {
-        use std::sync::Mutex;
+        use parking_lot::Mutex;
 
         // Capture handler：记录 dispatch 收到的 destination
         #[derive(Debug)]
@@ -998,7 +998,7 @@ mod tests {
                 dest: &Destination,
                 _link: Link,
             ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
-                *self.0.lock().expect("lock") = Some(dest.clone());
+                *self.0.lock() = Some(dest.clone());
                 Box::pin(async {})
             }
         }
@@ -1024,11 +1024,7 @@ mod tests {
         // 等 dispatch 跑完（spawn 后给点时间）
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let captured_dest = captured
-            .lock()
-            .expect("dispatcher should have been called")
-            .clone()
-            .expect("captured destination");
+        let captured_dest = captured.lock().clone().expect("captured destination");
         assert_eq!(
             captured_dest.address(),
             &Address::IPv4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
@@ -1041,7 +1037,9 @@ mod tests {
     /// 不同 source src 各自分桶（full-cone NAT 语义）：两个 src 各发一包 → 两路 dispatch。
     #[tokio::test]
     async fn udp_dispatch_full_cone_per_source() {
-        use std::{collections::HashSet, sync::Mutex};
+        use std::collections::HashSet;
+
+        use parking_lot::Mutex;
 
         #[derive(Debug)]
         struct CaptureHandler(Arc<Mutex<Vec<Destination>>>);
@@ -1055,7 +1053,7 @@ mod tests {
                 dest: &Destination,
                 _link: Link,
             ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
-                self.0.lock().expect("lock").push(dest.clone());
+                self.0.lock().push(dest.clone());
                 Box::pin(async {})
             }
         }
@@ -1083,7 +1081,6 @@ mod tests {
 
         let seen: HashSet<_> = captured
             .lock()
-            .expect("lock")
             .iter()
             .map(|d| (format!("{}", d.address()), d.port().value()))
             .collect();
@@ -1150,8 +1147,7 @@ mod tests {
     /// dispatch 收到的 destination 与 SYN 的 dst 一致。
     #[tokio::test]
     async fn tcp_syn_handshake_triggers_dispatch_with_real_destination() {
-        use std::sync::Mutex;
-
+        use parking_lot::Mutex;
         use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
 
         #[derive(Debug)]
@@ -1166,7 +1162,7 @@ mod tests {
                 dest: &Destination,
                 _link: Link,
             ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
-                *self.0.lock().expect("lock") = Some(dest.clone());
+                *self.0.lock() = Some(dest.clone());
                 Box::pin(async {})
             }
         }
@@ -1229,11 +1225,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // dispatch 同步捕获（CaptureHandler.dispatch 立即写 captured）
-        let dest = captured
-            .lock()
-            .expect("lock")
-            .clone()
-            .expect("dispatch must be triggered by handshake");
+        let dest = captured.lock().clone().expect("dispatch must be triggered by handshake");
         assert_eq!(
             dest.address(),
             &Address::IPv4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
@@ -1434,8 +1426,7 @@ mod tests {
     /// 零触发，建桥 spawn 只发生在锁外 dispatch_accepted。
     #[tokio::test]
     async fn batch_drive_completes_handshake_and_defers_spawn_out_of_lock() {
-        use std::sync::Mutex;
-
+        use parking_lot::Mutex;
         use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
 
         #[derive(Debug)]
@@ -1450,7 +1441,7 @@ mod tests {
                 dest: &Destination,
                 _link: Link,
             ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
-                *self.0.lock().expect("lock") = Some(dest.clone());
+                *self.0.lock() = Some(dest.clone());
                 Box::pin(async {})
             }
         }
@@ -1482,7 +1473,7 @@ mod tests {
             .find(|p| p.len() >= 34 && p[9] == 6 && (p[20 + 13] & 0x12) == 0x12)
             .map(|p| u32::from_be_bytes([p[20 + 4], p[20 + 5], p[20 + 6], p[20 + 7]]))
             .expect("SYN-ACK must be emitted at batch end");
-        assert!(!captured.lock().expect("lock").is_some(), "no dispatch inside critical section");
+        assert!(!captured.lock().is_some(), "no dispatch inside critical section");
 
         // 批 2：ACK 完成握手 → accept 事件批尾收集
         let ack = make_test_ipv4_tcp_packet(
@@ -1503,11 +1494,7 @@ mod tests {
         // 锁外建桥 → dispatch 收到 SYN 的 dst（与真实 driver loop 两段式一致）
         dispatch_accepted(&netstack, accepted2, &handler).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let dest = captured
-            .lock()
-            .expect("lock")
-            .clone()
-            .expect("dispatch must fire from lock-external bridge");
+        let dest = captured.lock().clone().expect("dispatch must fire from lock-external bridge");
         assert_eq!(dest.address(), &Address::IPv4(std::net::Ipv4Addr::new(93, 184, 216, 34)));
         assert_eq!(dest.port().value(), 443);
         assert_eq!(dest.network(), Network::TCP);

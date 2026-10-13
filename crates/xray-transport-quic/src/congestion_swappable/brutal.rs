@@ -3,7 +3,9 @@
 //! 算法：以恒定速率 `bps` 发送，但根据近 5 秒 ACK 率动态调整 effective rate。
 //! ACK 率 < 0.8 钳制为 0.8；样本不足时按 1.0 处理。
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use super::{
     pacer::Pacer,
@@ -49,7 +51,7 @@ struct BrutalInner {
 
 impl std::fmt::Debug for BrutalSender {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         f.debug_struct("BrutalSender")
             .field("bps", &inner.bps)
             .field("max_datagram_size", &inner.max_datagram_size)
@@ -69,7 +71,7 @@ impl BrutalSender {
         let shared_ack_rate = Arc::new(Mutex::new(1.0_f64));
         let ar_for_closure = Arc::clone(&shared_ack_rate);
         let pacer = Arc::new(Pacer::new(move || {
-            let rate = *ar_for_closure.lock().unwrap();
+            let rate = *ar_for_closure.lock();
             // effective_bps = bps / ack_rate
             ((bps_i as f64) / rate) as ByteCount
         }));
@@ -90,12 +92,12 @@ impl BrutalSender {
 
     /// 测试访问：当前 ack_rate。
     pub fn ack_rate(&self) -> f64 {
-        self.inner.lock().unwrap().ack_rate
+        self.inner.lock().ack_rate
     }
 
     /// 当前 bps（目标速率）。
     pub fn bps(&self) -> ByteCount {
-        self.inner.lock().unwrap().bps
+        self.inner.lock().bps
     }
 
     /// 更新 ack_rate（对应 Go `updateAckRate`），持锁调用。
@@ -131,7 +133,7 @@ impl BrutalSender {
 
 impl CongestionControl for BrutalSender {
     fn set_rtt_stats_provider(&mut self, provider: Box<dyn RttStatsProvider>) {
-        self.inner.lock().unwrap().rtt_stats = Some(provider);
+        self.inner.lock().rtt_stats = Some(provider);
     }
 
     fn time_until_send(&self, _bytes_in_flight: ByteCount) -> MonoTime {
@@ -139,7 +141,7 @@ impl CongestionControl for BrutalSender {
     }
 
     fn has_pacing_budget(&self, now: MonoTime) -> bool {
-        let mds = self.inner.lock().unwrap().max_datagram_size;
+        let mds = self.inner.lock().max_datagram_size;
         self.pacer.budget(now) >= mds
     }
 
@@ -148,7 +150,7 @@ impl CongestionControl for BrutalSender {
     }
 
     fn congestion_window(&self) -> ByteCount {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         let rtt = inner.rtt_stats.as_ref().map(|p| p.smoothed_rtt()).unwrap_or_default();
         if rtt.is_zero() {
             return 10_240;
@@ -202,7 +204,7 @@ impl CongestionControl for BrutalSender {
         let slot = (current_timestamp_secs.rem_euclid(PKT_INFO_SLOT_COUNT as i64)) as usize;
         let ack_n = acked_packets.len() as u64;
         let loss_n = lost_packets.len() as u64;
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         if inner.pkt_info_slots[slot].timestamp == current_timestamp_secs {
             inner.pkt_info_slots[slot].loss_count += loss_n;
             inner.pkt_info_slots[slot].ack_count += ack_n;
@@ -214,12 +216,12 @@ impl CongestionControl for BrutalSender {
         // 同步 effective rate 到 pacer 闭包。
         let new_rate = inner.ack_rate;
         drop(inner);
-        *self.shared_ack_rate.lock().unwrap() = new_rate;
+        *self.shared_ack_rate.lock() = new_rate;
     }
 
     fn set_max_datagram_size(&mut self, size: ByteCount) {
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
             inner.max_datagram_size = size;
         }
         self.pacer.set_max_datagram_size(size);

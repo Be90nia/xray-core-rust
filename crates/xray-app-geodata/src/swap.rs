@@ -86,9 +86,9 @@ fn combine_errs(errs: Vec<GeodataError>) -> Result<(), GeodataError> {
     if errs.is_empty() {
         Ok(())
     } else if errs.len() == 1 {
-        Err(errs.into_iter().next().unwrap())
+        Err(errs.into_iter().next().expect("len == 1 branch: non-empty"))
     } else {
-        let first = errs.into_iter().next().unwrap();
+        let first = errs.into_iter().next().expect("else branch: len > 1");
         Err(GeodataError::Other(format!("{first}").into()))
     }
 }

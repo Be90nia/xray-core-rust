@@ -331,7 +331,8 @@ impl ClientSession {
                         if data.len() < 5 {
                             return Ok(ResponseCommand::None);
                         }
-                        let ip = <[u8; 4]>::try_from(&data[1..5]).unwrap();
+                        let ip = <[u8; 4]>::try_from(&data[1..5])
+                            .expect("data.len() >= 5 checked above");
                         (Some(Address::IPv4(Ipv4Addr::from(ip))), 5)
                     },
                     0x03 => {
@@ -351,7 +352,8 @@ impl ClientSession {
                         if data.len() < 17 {
                             return Ok(ResponseCommand::None);
                         }
-                        let ip = <[u8; 16]>::try_from(&data[1..17]).unwrap();
+                        let ip = <[u8; 16]>::try_from(&data[1..17])
+                            .expect("data.len() >= 17 checked above");
                         (Some(Address::IPv6(Ipv6Addr::from(ip))), 17)
                     },
                     _ => (None, 1),

@@ -3,7 +3,7 @@
 //! Ponytail：`Pacer` 用纯整数 token bucket 实现，时钟用纳秒级 `u64`（对应 Go
 //! `monotime.Time`），带宽查询通过 closure 注入（对应 Go `getBandwidth func()`）。
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use super::types::{ByteCount, INITIAL_PACKET_SIZE, MIN_PACING_DELAY_NS, MonoTime};
 
@@ -29,7 +29,7 @@ struct PacerInner {
 
 impl std::fmt::Debug for Pacer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         f.debug_struct("Pacer")
             .field("budget_at_last_sent", &inner.budget_at_last_sent)
             .field("max_datagram_size", &inner.max_datagram_size)
@@ -55,7 +55,7 @@ impl Pacer {
 
     /// 记录一次发包（对应 Go `SentPacket`）。
     pub fn sent_packet(&self, send_time_ns: MonoTime, size: ByteCount) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let budget = budget_at(&inner, send_time_ns, &self.get_bandwidth);
         if size > budget {
             inner.budget_at_last_sent = 0;
@@ -68,7 +68,7 @@ impl Pacer {
     /// 当前可用 budget（bytes，对应 Go `Budget`）。
     #[must_use]
     pub fn budget(&self, now_ns: MonoTime) -> ByteCount {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         budget_at(&inner, now_ns, &self.get_bandwidth)
     }
 
@@ -77,7 +77,7 @@ impl Pacer {
     /// 返回 0 表示立即可发。
     #[must_use]
     pub fn time_until_send(&self) -> MonoTime {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         if inner.budget_at_last_sent >= inner.max_datagram_size {
             return 0;
         }
@@ -95,7 +95,7 @@ impl Pacer {
 
     /// 设置最大数据包大小（对应 Go `SetMaxDatagramSize`）。
     pub fn set_max_datagram_size(&self, size: ByteCount) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.max_datagram_size = size;
     }
 }

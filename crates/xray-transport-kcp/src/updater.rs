@@ -182,6 +182,7 @@ impl Updater for NoopUpdater {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use std::sync::atomic::AtomicU32;
 

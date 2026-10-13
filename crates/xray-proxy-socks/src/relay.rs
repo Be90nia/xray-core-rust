@@ -14,7 +14,7 @@
 //! expected 地址。
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use tokio::net::UdpSocket;
 
 use crate::protocol::Host;
@@ -102,9 +102,8 @@ impl TempUdpRelay {
         self.socket.local_addr()
     }
 
-    fn expected(&self) -> std::sync::MutexGuard<'_, SocketAddr> {
-        // 临界区无 await、无 panic 路径——poison 恢复即可（锁内仅读取/赋值）
-        self.expected.lock().unwrap_or_else(|p| p.into_inner())
+    fn expected(&self) -> parking_lot::MutexGuard<'_, SocketAddr> {
+        self.expected.lock()
     }
 }
 

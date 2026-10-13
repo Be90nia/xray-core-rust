@@ -110,6 +110,7 @@ impl Default for RoundTripInfo {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

@@ -572,7 +572,7 @@ impl ServerWorker {
                     }
                 }
                 if meta.is_udp_target() && meta.global_id().is_some() {
-                    let gid = *meta.global_id().unwrap();
+                    let gid = *meta.global_id().expect("short-circuit is_some handled on left");
                     self.handle_xudp_new(&meta, data, link_writer, gid).await?;
                 } else {
                     self.handle_normal_new(&meta, data, link_writer).await?;

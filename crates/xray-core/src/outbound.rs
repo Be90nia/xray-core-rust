@@ -1362,7 +1362,7 @@ fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutboundConfig, S
     if users.len() != 1 {
         return Err(r#"vless "users" should have one and only one member. Multiple members should use multiple VLESS outbounds and routing balancer instead"#.into());
     }
-    let user = users.first().unwrap();
+    let user = users.first().expect("users.len() == 1 checked above");
     let user_id = user
         .get("id")
         .and_then(|v| v.as_str())
@@ -2796,7 +2796,9 @@ fn parse_tuic_config(data: &[u8]) -> std::result::Result<TuicOutboundSettings, S
         Some(serde_json::Value::String(s)) => crate::wiring::parse_go_duration_str(s)
             .map(|ns| std::time::Duration::from_nanos(ns.max(0) as u64))
             .ok_or_else(|| format!("invalid tuic heartbeat: {s}"))?,
-        Some(v) if v.as_u64().is_some() => std::time::Duration::from_secs(v.as_u64().unwrap()),
+        Some(v) if v.as_u64().is_some() => {
+            std::time::Duration::from_secs(v.as_u64().expect("match arm guard above ensures Some"))
+        },
         _ => std::time::Duration::from_secs(3),
     };
     let insecure = first.get("insecure").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -4595,8 +4597,7 @@ mod tests {
 
     // ========== targetStrategy（bd bqm）==========
 
-    use std::sync::Mutex;
-
+    use parking_lot::Mutex;
     use xray_app_dispatcher::default::DialFn;
     use xray_common::net::{
         address::Address, destination::Destination, network::Network, port::Port,
@@ -4608,7 +4609,7 @@ mod tests {
             let dest = dest.clone();
             let recorded = Arc::clone(&recorded);
             Box::pin(async move {
-                recorded.lock().expect("lock").push(dest);
+                recorded.lock().push(dest);
                 let (client, _server) = tokio::io::duplex(4096);
                 Ok(Box::new(xray_transport::connection::DuplexConnection::new(client))
                     as Box<dyn xray_transport::connection::Connection>)
@@ -4659,7 +4660,7 @@ mod tests {
             Some(hosts_dns_service()),
         );
         dial(&domain_dest("resolve-test.invalid")).await.expect("dial ok");
-        let got = recorded.lock().expect("lock").pop().expect("dial called");
+        let got = recorded.lock().pop().expect("dial called");
         assert_eq!(
             got.address(),
             &Address::from(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
@@ -4683,7 +4684,7 @@ mod tests {
         ))
         .await
         .expect("ip dest dials without DNS");
-        assert_eq!(recorded.lock().expect("lock").len(), 1);
+        assert_eq!(recorded.lock().len(), 1);
     }
 
     /// UseIP 解析失败回退域名直连（Go handler.go:190-199 非 Force 分支）。
@@ -4696,7 +4697,7 @@ mod tests {
             None,
         );
         dial(&domain_dest("resolve-test.invalid")).await.expect("dial ok");
-        let got = recorded.lock().expect("lock").pop().expect("dial called");
+        let got = recorded.lock().pop().expect("dial called");
         assert_eq!(got.address(), &Address::Domain("resolve-test.invalid".into()));
     }
 
@@ -4714,7 +4715,7 @@ mod tests {
             Ok(_) => panic!("ForceIP must fail when DNS unavailable"),
         };
         assert!(err.contains("resolve-test.invalid"), "error mentions domain: {err}");
-        assert!(recorded.lock().expect("lock").is_empty(), "inner dial must not run");
+        assert!(recorded.lock().is_empty(), "inner dial must not run");
     }
 
     /// e2e：JSON `targetStrategy: "UseIP"` → BuiltConfig → register_outbounds →
@@ -4888,7 +4889,7 @@ mod tests {
                     let Some(target_addr) = target_addr else {
                         return;
                     };
-                    rec.lock().expect("lock").push((target_addr.ip(), target_addr.port()));
+                    rec.lock().push((target_addr.ip(), target_addr.port()));
                     let Ok(mut target) = tokio::net::TcpStream::connect(target_addr).await else {
                         return;
                     };
@@ -4986,7 +4987,7 @@ mod tests {
             );
 
             // 「经代理而非直连」判别：socks5 服务器必须见到 CONNECT → echo 端口
-            let rec = recorded.lock().expect("lock");
+            let rec = recorded.lock();
             assert!(
                 rec.iter().any(|(_, p)| *p == echo_port),
                 "transportLayer={use_transport_layer}: socks outbound should see CONNECT to echo:{echo_port}, got {rec:?}"
@@ -5074,7 +5075,7 @@ mod tests {
             );
 
             // 「经链路而非直连」判别：socks5 服务器必须见到 CONNECT → echo 端口
-            let rec = recorded.lock().expect("lock");
+            let rec = recorded.lock();
             assert!(
                 rec.iter().any(|(_, p)| *p == echo_port),
                 "transportLayer={use_transport_layer}: socks outbound should see CONNECT to echo:{echo_port}, got {rec:?}"

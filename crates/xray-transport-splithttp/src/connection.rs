@@ -21,10 +21,10 @@ use std::{
     io,
     net::SocketAddr,
     pin::Pin,
-    sync::Mutex,
     task::{Context, Poll},
 };
 
+use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// SplitHTTP 客户端连接（reader/writer + addr 元数据）。
@@ -56,13 +56,13 @@ impl<R, W> SplitConn<R, W> {
 
     /// 设置关闭回调（ [`Drop`] 时调用一次）。对应 Go `splitConn.onClose` 字段。
     pub fn set_on_close<F: FnOnce() + Send + Sync + 'static>(&self, f: F) {
-        let mut guard = self.on_close.lock().expect("on_close mutex poisoned");
+        let mut guard = self.on_close.lock();
         *guard = Some(Box::new(f));
     }
 
     /// 显式触发 on_close（用于手动 drop 之外的清理路径）。
     pub fn fire_on_close(&self) {
-        if let Some(f) = self.on_close.lock().expect("on_close mutex poisoned").take() {
+        if let Some(f) = self.on_close.lock().take() {
             f();
         }
     }
@@ -84,7 +84,7 @@ impl<R, W> SplitConn<R, W> {
         let this = std::mem::ManuallyDrop::new(self);
         // SAFETY: we move every field out and reconstruct on_close before any panic path.
         // ManuallyDrop ensures the old SplitConn's Drop won't fire.
-        let on_close = this.on_close.lock().expect("on_close mutex poisoned").take();
+        let on_close = this.on_close.lock().take();
         SplitConn {
             reader: MutexReader::new(unsafe { std::ptr::read(&this.reader) }),
             writer: unsafe { std::ptr::read(&this.writer) },
@@ -125,7 +125,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> AsyncWrite for SplitConn<R, W>
 
 impl<R, W> Drop for SplitConn<R, W> {
     fn drop(&mut self) {
-        if let Some(f) = self.on_close.lock().expect("on_close mutex poisoned").take() {
+        if let Some(f) = self.on_close.lock().take() {
             f();
         }
     }
@@ -161,7 +161,7 @@ impl<R: AsyncRead + Unpin + Send> AsyncRead for MutexReader<R> {
     ) -> Poll<io::Result<()>> {
         // MutexReader<R: Unpin> is Unpin (Mutex<R> is Unpin), so get_mut is safe.
         let this = self.get_mut();
-        let mut guard = this.inner.lock().expect("MutexReader poisoned");
+        let mut guard = this.inner.lock();
         Pin::new(&mut *guard).poll_read(cx, buf)
     }
 }

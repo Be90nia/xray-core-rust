@@ -326,7 +326,8 @@ impl GeckoConn {
             return None;
         }
 
-        let entry = state.reassembly.get_mut(key).unwrap();
+        let entry =
+            state.reassembly.get_mut(key).expect("entry inserted or verified present above");
         let idx = h.chunk_idx as usize;
         if idx >= entry.chunks.len() || entry.chunks[idx].is_some() {
             return None;

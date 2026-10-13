@@ -235,6 +235,7 @@ impl Tun for TunDevice {
 }
 
 #[cfg(all(any(unix, windows), test))]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -354,6 +355,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod trait_tests {
     use super::*;
 
@@ -377,6 +379,7 @@ mod trait_tests {
 /// 票 0qef/g545 契约测试：垫头 free list 的布局/复用/上限行为。
 /// 平台无关（HdrFreeList 不依赖 tun_rs），Windows 本地可跑。
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod free_list_tests {
     use super::hdr_free_list::{HDR_FREE_MAX, HdrFreeList};
 

@@ -69,6 +69,7 @@ impl Drop for FileLocker {
 }
 
 #[cfg(all(test, unix))]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

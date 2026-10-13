@@ -4,10 +4,9 @@
 //! 状态机内部简化（标记 TODO：完整 STARTUP/DRAIN/PROBE_BW/PROBE_RTT 状态转换
 //! 等真正需要运行 hysteria 时补全；quinn 集成可改用 quinn-proto 自带 BBR）。
 
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
+
+use parking_lot::Mutex;
 
 use super::{
     super::{
@@ -208,7 +207,7 @@ struct BbrInner {
 
 impl std::fmt::Debug for BbrSender {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         f.debug_struct("BbrSender")
             .field("mode", &inner.mode)
             .field("round_trip_count", &inner.round_trip_count)
@@ -237,7 +236,7 @@ impl BbrSender {
         let bw_state = Arc::new(Mutex::new((Bandwidth(0), 1.0_f64)));
         let bw_for_closure = Arc::clone(&bw_state);
         let pacer = Arc::new(Pacer::new(move || {
-            let (rate, gain) = *bw_for_closure.lock().unwrap();
+            let (rate, gain) = *bw_for_closure.lock();
             ((rate.0 as f64) * gain) as ByteCount
         }));
 
@@ -294,7 +293,7 @@ impl BbrSender {
         };
 
         // 同步初始 (rate, gain) 到 pacer 闭包
-        *bw_state.lock().unwrap() = (inner.pacing_rate, inner.pacing_gain);
+        *bw_state.lock() = (inner.pacing_rate, inner.pacing_gain);
 
         Self { inner: Mutex::new(inner), pacer, clock }
         // bw_state 在 drop 时释放（pacer 闭包持有副本）
@@ -326,23 +325,23 @@ impl BbrSender {
 
     /// 当前模式。
     pub fn mode(&self) -> BbrMode {
-        self.inner.lock().unwrap().mode
+        self.inner.lock().mode
     }
 
     /// 当前 profile。
     pub fn profile(&self) -> Profile {
-        self.inner.lock().unwrap().profile
+        self.inner.lock().profile
     }
 
     /// 当前 pacing rate。
     pub fn pacing_rate(&self) -> Bandwidth {
-        self.inner.lock().unwrap().pacing_rate
+        self.inner.lock().pacing_rate
     }
 }
 
 impl CongestionControl for BbrSender {
     fn set_rtt_stats_provider(&mut self, provider: Box<dyn RttStatsProvider>) {
-        self.inner.lock().unwrap().rtt_stats = Some(provider);
+        self.inner.lock().rtt_stats = Some(provider);
     }
 
     fn time_until_send(&self, _bytes_in_flight: ByteCount) -> MonoTime {
@@ -350,7 +349,7 @@ impl CongestionControl for BbrSender {
     }
 
     fn has_pacing_budget(&self, now: MonoTime) -> bool {
-        let mds = self.inner.lock().unwrap().max_datagram_size;
+        let mds = self.inner.lock().max_datagram_size;
         self.pacer.budget(now) >= mds
     }
 
@@ -359,7 +358,7 @@ impl CongestionControl for BbrSender {
     }
 
     fn congestion_window(&self) -> ByteCount {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         if inner.mode == BbrMode::ProbeRtt {
             return inner.min_congestion_window;
         }
@@ -378,7 +377,7 @@ impl CongestionControl for BbrSender {
         is_retransmittable: bool,
     ) {
         self.pacer.sent_packet(sent_time, bytes);
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.last_sent_packet = packet_number;
         inner.bytes_in_flight = bytes_in_flight;
         if bytes_in_flight == 0 {
@@ -422,7 +421,7 @@ impl CongestionControl for BbrSender {
         // ponytail: 简化实现 —— 更新 bytes_in_flight + sampler 累积计数。
         // 完整算法应更新 maxBandwidth / minRtt / pacing_rate / recovery_window，
         // 等真正运行 hysteria 时补全（quinn-proto BBR 可替代）。
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.bytes_in_flight = prior_in_flight;
         for p in acked_packets {
             inner.bytes_in_flight -= p.bytes_acked;
@@ -443,7 +442,7 @@ impl CongestionControl for BbrSender {
     }
 
     fn set_max_datagram_size(&mut self, size: ByteCount) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         assert!(size >= inner.max_datagram_size, "BBR cannot decrease max datagram size");
         let old_mds = inner.max_datagram_size;
         let old_min_cwnd = inner.min_congestion_window;
@@ -480,11 +479,11 @@ impl CongestionControl for BbrSender {
     }
 
     fn in_slow_start(&self) -> bool {
-        self.inner.lock().unwrap().mode == BbrMode::Startup
+        self.inner.lock().mode == BbrMode::Startup
     }
 
     fn in_recovery(&self) -> bool {
-        self.inner.lock().unwrap().recovery_state != BbrRecoveryState::NotInRecovery
+        self.inner.lock().recovery_state != BbrRecoveryState::NotInRecovery
     }
 
     fn maybe_exit_slow_start(&mut self) {
@@ -540,7 +539,7 @@ mod tests {
         let mut s = make_sender();
         s.set_max_datagram_size(1400);
         // min_cwnd 应从 4 * 1200 = 4800 → 4 * 1400 = 5600
-        let inner = s.inner.lock().unwrap();
+        let inner = s.inner.lock();
         assert_eq!(inner.min_congestion_window, 5600);
         assert_eq!(inner.initial_congestion_window, 32 * 1400);
         assert_eq!(inner.max_datagram_size, 1400);
@@ -576,7 +575,7 @@ mod tests {
     fn on_packet_sent_records_state() {
         let mut s = make_sender();
         s.on_packet_sent(100, 1200, 1, 1200, true);
-        let inner = s.inner.lock().unwrap();
+        let inner = s.inner.lock();
         assert_eq!(inner.last_sent_packet, 1);
         assert_eq!(inner.bytes_in_flight, 1200);
     }
@@ -588,7 +587,7 @@ mod tests {
         let acked =
             vec![AckedPacketInfo { packet_number: 1, bytes_acked: 1200, receive_time_ns: 200 }];
         s.on_congestion_event_ex(1200, 200, &acked, &[]);
-        let inner = s.inner.lock().unwrap();
+        let inner = s.inner.lock();
         assert_eq!(inner.bytes_in_flight, 0);
     }
 

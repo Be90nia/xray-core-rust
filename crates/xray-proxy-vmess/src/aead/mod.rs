@@ -10,7 +10,6 @@
 
 use std::{
     collections::HashMap,
-    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -19,6 +18,7 @@ use aes::{
     cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray},
 };
 use hmac::{Hmac, Mac};
+use parking_lot::Mutex;
 use sha2::Sha256;
 use xray_common::antireplay::{MapFilter, ReplayFilter};
 use xray_crypto::aead::{AeadCipher, Aes128Gcm};
@@ -536,18 +536,18 @@ impl AuthIDDecoderHolder {
 
     /// 添加用户（key = cmdKey）。
     pub fn add_user(&self, key: [u8; 16]) {
-        self.items.lock().expect("items poisoned").insert(key, AuthIDDecoderItem::new(key));
+        self.items.lock().insert(key, AuthIDDecoderItem::new(key));
     }
 
     /// 移除用户。
     pub fn remove_user(&self, key: &[u8; 16]) {
-        self.items.lock().expect("items poisoned").remove(key);
+        self.items.lock().remove(key);
     }
 
     /// 用户数量。
     #[must_use]
     pub fn user_count(&self) -> usize {
-        self.items.lock().expect("items poisoned").len()
+        self.items.lock().len()
     }
 
     /// 尝试匹配 16B AuthID，返回匹配到的用户 cmdKey。
@@ -562,7 +562,7 @@ impl AuthIDDecoderHolder {
     /// - [`AuthIDMatchError::Replay`]：authID 已见过（反重放）。
     /// - [`AuthIDMatchError::NotFound`]：无用户匹配。
     pub fn match_auth_id(&self, auth_id: &[u8; 16]) -> Result<[u8; 16], AuthIDMatchError> {
-        let items = self.items.lock().expect("items poisoned");
+        let items = self.items.lock();
         for (key, item) in items.iter() {
             let (t, crc, _, decrypted) = item.decode(auth_id);
             if crc32fast::hash(&decrypted[..12]) != crc {
@@ -581,7 +581,7 @@ impl AuthIDDecoderHolder {
                 return Err(AuthIDMatchError::InvalidTime);
             }
 
-            let mut filter = self.replay_filter.lock().expect("replay poisoned");
+            let mut filter = self.replay_filter.lock();
             if !filter.check(auth_id) {
                 return Err(AuthIDMatchError::Replay);
             }

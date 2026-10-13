@@ -16,7 +16,9 @@
 //! （DoH，握手前异步查询，`utls::u_client_with_alpn` 接线）；查询失败仍按
 //! Go「查询失败」语义落 invalid config（握手必败）。
 
-use std::{sync::Mutex, time::Instant};
+use std::time::Instant;
+
+use parking_lot::Mutex;
 
 use crate::error::TlsError;
 
@@ -144,12 +146,12 @@ impl EchConfigCache {
 
     /// 获取当前记录（克隆）。
     pub fn load(&self) -> EchConfigRecord {
-        self.inner.lock().expect("ECH cache mutex poisoned").clone()
+        self.inner.lock().clone()
     }
 
     /// 替换当前记录。返回旧记录。
     pub fn store(&self, record: EchConfigRecord) -> EchConfigRecord {
-        let mut guard = self.inner.lock().expect("ECH cache mutex poisoned");
+        let mut guard = self.inner.lock();
         std::mem::replace(&mut *guard, record)
     }
 
@@ -158,7 +160,7 @@ impl EchConfigCache {
     /// 闭包返回 `(new_record, result)`；`new_record` 被存入，`result` 返回给调用者。
     /// Go 端「双检锁」逻辑在闭包内自行实现。
     pub fn with_lock<R>(&self, f: impl FnOnce(&EchConfigRecord) -> (EchConfigRecord, R)) -> R {
-        let mut guard = self.inner.lock().expect("ECH cache mutex poisoned");
+        let mut guard = self.inner.lock();
         let (new_record, result) = f(&guard);
         *guard = new_record;
         result

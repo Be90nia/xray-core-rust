@@ -669,7 +669,12 @@ fn base64url_decode(s: &str) -> Result<Vec<u8>, ()> {
         if vals.iter().any(Option::is_none) {
             return Err(());
         }
-        let v: [u8; 4] = [vals[0].unwrap(), vals[1].unwrap(), vals[2].unwrap(), vals[3].unwrap()];
+        let v: [u8; 4] = [
+            vals[0].expect("is_none checked above"),
+            vals[1].expect("is_none checked above"),
+            vals[2].expect("is_none checked above"),
+            vals[3].expect("is_none checked above"),
+        ];
         out.push((v[0] << 2) | (v[1] >> 4));
         out.push((v[1] << 4) | (v[2] >> 2));
         out.push((v[2] << 6) | v[3]);
