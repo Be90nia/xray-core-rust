@@ -495,7 +495,17 @@ async fn pump_response_body<C, W>(
                     chunk_buf.resize(start + padding_size, 0);
                     rand::rng().fill_bytes(&mut chunk_buf[start..]);
                 }
-                let size_value = u16::try_from(chunk_buf.len() - sb).unwrap_or(u16::MAX);
+                // size 字段 u16：超出即中止流（静默回退 u16::MAX 会致收端错位）
+                let size_value = match u16::try_from(chunk_buf.len() - sb) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        tracing::error!(
+                            len = chunk_buf.len() - sb,
+                            "vmess response chunk size exceeds u16; aborting body stream"
+                        );
+                        break;
+                    },
+                };
                 size_parser.encode(size_value, &mut chunk_buf[..sb]);
                 if stream_w.write_all(&chunk_buf).await.is_err() {
                     break;
@@ -517,11 +527,18 @@ async fn pump_response_body<C, W>(
         chunk_buf.clear();
         chunk_buf.resize(sb, 0);
         if cipher.seal_into(nonce, &[], &[], &mut chunk_buf).is_ok() {
-            size_parser.encode(
-                u16::try_from(chunk_buf.len() - sb).unwrap_or(u16::MAX),
-                &mut chunk_buf[..sb],
-            );
-            let _ = stream_w.write_all(&chunk_buf).await;
+            // 终止 chunk 明文为空：size 恒 = tag 长度，try_from 不可能失败；
+            // 失败 = 缓冲被污染，跳过终止写并记 error，禁回退 u16::MAX 制造收端错位
+            match u16::try_from(chunk_buf.len() - sb) {
+                Ok(v) => {
+                    size_parser.encode(v, &mut chunk_buf[..sb]);
+                    let _ = stream_w.write_all(&chunk_buf).await;
+                },
+                Err(_) => tracing::error!(
+                    len = chunk_buf.len() - sb,
+                    "vmess termination chunk size exceeds u16; skipping termination"
+                ),
+            }
         }
     }
     let _ = stream_w.flush().await;
@@ -556,7 +573,10 @@ async fn write_udp_chunk<W: AsyncWrite + Unpin>(
         chunk_buf.resize(start + padding_size, 0);
         rand::rng().fill_bytes(&mut chunk_buf[start..]);
     }
-    let size_value = u16::try_from(chunk_buf.len() - sb).unwrap_or(u16::MAX);
+    // size 字段 u16：超出即显式报错（静默回退 u16::MAX 会致收端按 65535 读、错位）
+    let size_value = u16::try_from(chunk_buf.len() - sb).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "vmess udp chunk size exceeds u16")
+    })?;
     sp.encode(size_value, &mut chunk_buf[..sb]);
     stream_w.write_all(chunk_buf).await
 }
