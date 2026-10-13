@@ -1,3 +1,5 @@
+#![deny(warnings)]
+// 治理红线（bd 75rv ②）：任何 rustc warning 即构建失败；豁免一律显式 allow + 理由
 #![allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)]
 // 压测 harness：stdout 结构化进度行即产品接口（采样/判定报告消费方为脚本）
 //! xray-stress：Xray-core-rust 压测 harness 入口。
