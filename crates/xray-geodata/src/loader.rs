@@ -144,8 +144,8 @@ pub fn find<R: Read + Seek>(
     }
 }
 
-/// 编码 varint 到缓冲区。
-#[allow(dead_code)]
+/// 编码 varint 到缓冲区（roundtrip 测试锚点；生产编码在 proto 生成层）。
+#[cfg(test)]
 fn encode_varint(value: u64, buf: &mut Vec<u8>) {
     let mut v = value;
     loop {

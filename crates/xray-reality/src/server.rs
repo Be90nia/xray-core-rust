@@ -501,7 +501,7 @@ struct VerifiedHandshake {
 ///
 /// Err = REALITY 验证失败（调用方转 [`RealityServerOutcome::Invalid`] 走
 /// fallback）；不返回 Err 的约定由各 server_tls* 函数保持。
-#[allow(clippy::too_many_arguments)] // 存量清零批次：too_many_arguments
+#[allow(clippy::too_many_arguments)] // Go 装配 API 参数面直译，打包结构属 API 变更
 fn verify_and_probe(
     record: &[u8],
     server_private_key: &[u8; 32],

@@ -33,7 +33,7 @@ use crate::{
 ///
 /// 持有 driver + smoltcp 网栈句柄。dial 在 netstack 上建 socket。
 pub struct WireguardOutboundHandler {
-    #[allow(dead_code)] // 存量清零批次
+    #[allow(dead_code)] // handler tag 保留（日志/管理面对齐 Go）
     tag: String,
     /// driver task 句柄。
     #[allow(dead_code)] // 句柄由 worker task 持有，字段保留生命周期
@@ -206,7 +206,7 @@ async fn resolve_endpoint_addr(
 /// 从 DeviceConfig.endpoint 解析为 smoltcp IpCidr。
 ///
 /// 复用 [`crate::wireguard::parse_endpoints`] 的解析逻辑。
-#[allow(clippy::incompatible_msrv)] // 存量清零批次：incompatible_msrv
+#[allow(clippy::incompatible_msrv)] // 工作区实际工具链新于 MSRV=1.85，该 API 受控使用
 fn parse_local_cidrs(config: &DeviceConfig) -> Result<Vec<smoltcp::wire::IpCidr>> {
     let parsed = crate::wireguard::parse_endpoints(config)?;
     parsed

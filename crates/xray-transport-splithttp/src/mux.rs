@@ -104,7 +104,7 @@ impl<C: XmuxConn + 'static> XmuxClient<C> {
 
     /// 减少一个剩余请求数（不可低于 0）。
     // fetch_update 在 1.99 改名 try_update，但工作区 MSRV=1.85，保持旧名 + 局部豁免。
-    #[allow(deprecated)]
+    #[allow(deprecated)] // fetch_update 1.99 改名 try_update，MSRV=1.85 保持旧名
     pub fn dec_left_requests(&self) {
         let _ = self.left_requests.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
             if v > 0 { Some(v - 1) } else { None }
@@ -312,7 +312,7 @@ mod tests {
     /// 测试用 XmuxConn 实现——可手动标记 closed。
     struct FakeConn {
         closed: std::sync::atomic::AtomicBool,
-        #[allow(dead_code)] // 存量清零批次
+        #[allow(dead_code)] // 测试 fake 保 trait 完整实现
         id: usize,
     }
 
@@ -321,7 +321,7 @@ mod tests {
             Self { closed: std::sync::atomic::AtomicBool::new(false), id }
         }
 
-        #[allow(dead_code)] // 存量清零批次
+        #[allow(dead_code)] // 测试 fake 的显式关闭入口（配合 closed 断言）
         fn close(&self) {
             self.closed.store(true, Ordering::SeqCst);
         }

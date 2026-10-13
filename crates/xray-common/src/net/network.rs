@@ -23,9 +23,7 @@ impl Network {
     }
 
     /// 从字符串解析网络协议。
-    // 复刻 Go `common/net.ParseNetwork` 的 Option 语义；FromStr 的 Result/Err
-    // 语义不同，保持既有 API 不变，不做 trait 化改写。
-    #[allow(clippy::should_implement_trait)]
+    #[allow(clippy::should_implement_trait)] // 复刻 Go ParseNetwork 返回 Option 语义，FromStr 的 Result 语义不同
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "tcp" => Some(Self::TCP),

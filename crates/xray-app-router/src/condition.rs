@@ -842,7 +842,7 @@ mod lsof_parser {
 /// Rust 实现调 /usr/sbin/lsof -F pcnTi -i :<port>[@ip] -nP 取机器可读输出，
 /// 解析委托给 lsof_parser 模块。
 #[cfg(target_os = "macos")]
-#[allow(dead_code)]
+#[allow(dead_code)] // Go find_process_others.go：macOS 明确不支持进程查找，模块保留备用
 mod proc_macos {
     use std::{net::IpAddr, process::Command};
 
@@ -1289,7 +1289,7 @@ mod tests {
     #[test]
     fn test_user_matcher_lenient_alias_still_compiles() {
         // 历史 API 别名仍可用——编译期兜底（不验证 substring 行为，因为该类型已弃用）。
-        #[allow(deprecated)]
+        #[allow(deprecated)] // 历史 API 别名编译期兜底用例，刻意触达弃用项
         let _m: UserMatcherLenient = UserMatcherCondition::new(vec!["x@example.com".into()]);
     }
 

@@ -48,7 +48,7 @@ pub trait PacketInput: Send {
 /// 生产实现注入：UDP socket + 可选 TLS 客户端包装 + 可选 Udpmask 包装。
 pub trait KcpDialerFactory: Send + Sync {
     /// 建立底层连接，返回 (reader, writer, closer, metadata) 四元组。
-    #[allow(clippy::type_complexity)] // 存量清零批次：type_complexity
+    #[allow(clippy::type_complexity)] // 签名类型即业务语义，抽 type alias 反而更晦涩
     fn dial_udp(
         &self,
         dest: &str,

@@ -119,7 +119,7 @@ mod tests {
         let server_addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             // accept Err 时保持轮询（mock listener 生命周期内 Err 仅瞬时；while let 会提前退出）
-            #[allow(clippy::while_let_loop)]
+            #[allow(clippy::while_let_loop)] // mock accept Err 瞬时需保持轮询，loop+if let 即语义
             loop {
                 if let Ok((mut sock, _)) = listener.accept().await {
                     tokio::spawn(async move {

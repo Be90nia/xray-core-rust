@@ -1024,7 +1024,7 @@ async fn dokodemo_peer_relay(
     overridden: bool,
 ) {
     let mut session = UdpDispatchSession::new(handler);
-    #[allow(unused_mut)]
+    #[allow(unused_mut)] // fake_cache 仅 linux cfg 分支被 &mut 借用，非 linux 构建下 mut 冗余
     let mut fake_cache: HashMap<(std::net::IpAddr, u16), Arc<tokio::net::UdpSocket>> =
         HashMap::new();
     loop {
@@ -1887,6 +1887,7 @@ struct DnsUdpRecvBatch {
     addrs: Box<[libc::sockaddr_storage]>,
     /// iovec 数组：仅经 msg_hdr.msg_iov 指针间接访问。
     #[allow(dead_code)]
+    // iovs 仅经 msgs[i].msg_hdr.msg_iov 指针间接引用，字段持所有权保地址固定
     iovs: Box<[libc::iovec]>,
     /// recvmmsg 消息向量（msg_len 为内核写回的各包实际长度）。
     msgs: Box<[libc::mmsghdr]>,
@@ -4351,7 +4352,7 @@ fn parse_hysteria_inbound_config(
 fn build_hysteria_tls_server_config(
     v: &serde_json::Value,
 ) -> std::io::Result<rustls::ServerConfig> {
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls::pki_types::PrivateKeyDer;
     let (cert_der, key_der) = if let (Some(cert_str), Some(key_str)) =
         (v.get("cert").and_then(|x| x.as_str()), v.get("key").and_then(|x| x.as_str()))
     {
@@ -4377,18 +4378,15 @@ fn build_hysteria_tls_server_config(
             .self_signed(&key_pair)
             .map_err(|e| std::io::Error::other(format!("rcgen self_signed: {e}")))?;
         (
-            #[allow(clippy::useless_conversion)] // 存量清零批次
-            CertificateDer::from(cert.der().clone()),
+            cert.der().clone(),
             PrivateKeyDer::try_from(key_pair.serialize_der())
                 .map_err(|e| std::io::Error::other(format!("rcgen key der: {e}")))?,
         )
     };
-    #[allow(clippy::needless_bool, clippy::needless_question_mark, clippy::useless_conversion)]
-    // 证书转换与 Ok 包装为既有接线形态
-    Ok(rustls::ServerConfig::builder()
+    rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(vec![cert_der.into()], key_der)
-        .map_err(|e| std::io::Error::other(format!("rustls server config: {e}")))?)
+        .with_single_cert(vec![cert_der], key_der)
+        .map_err(|e| std::io::Error::other(format!("rustls server config: {e}")))
 }
 
 /// 从 inbound entry.data（JSON）解析 anytls TLS acceptor + 认证密码。

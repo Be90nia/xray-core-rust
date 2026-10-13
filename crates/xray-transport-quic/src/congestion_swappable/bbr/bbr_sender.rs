@@ -153,7 +153,7 @@ struct BbrInner {
     current_round_trip_end: PacketNumber,
     #[allow(dead_code)] // Go 对齐统计面：loss events/bytes lost 待 hysteresis 接线
     num_loss_events_in_round: u64,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // 同上 Go 对齐统计面，loss 事件批接线
     bytes_lost_in_round: ByteCount,
     min_rtt: Duration,
     #[allow(dead_code)] // Go 对齐统计面：min RTT 时间戳待探针接线
@@ -170,7 +170,7 @@ struct BbrInner {
     pacing_gain: f64,
     #[allow(dead_code)] // Go 对齐 BBR 增益面：拥塞窗口增益待动态增益批接线
     congestion_window_gain: f64,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // 同上 Go 对齐增益面常量
     congestion_window_gain_constant: f64,
     num_startup_rtts: i64,
     cycle_current_offset: usize,
@@ -178,11 +178,11 @@ struct BbrInner {
     last_cycle_start: MonoTime,
     #[allow(dead_code)] // Go 对齐 BBR 状态面字段，后续批次接线
     is_at_full_bandwidth: bool,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // 同上 BBR 状态面（startup 退出判定），后续批次接线
     rounds_without_bandwidth_gain: i64,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // 同上 BBR 状态面（带宽采样锚点）
     bandwidth_at_last_round: Bandwidth,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // 同上 BBR 状态面（quiescence 退出判定）
     exiting_quiescence: bool,
     exit_probe_rtt_at: MonoTime,
     probe_rtt_round_passed: bool,

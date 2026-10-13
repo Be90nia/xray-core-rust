@@ -29,7 +29,6 @@ use xray_common::{
     net::{address::Address, destination::Destination, network::Network, port::Port},
     uuid::UUID,
 };
-use xray_proto::xray::proxy::vless::encoding::Addons;
 use xray_transport::{
     connection::Connection,
     dialer::{StreamSettings, dial},
@@ -442,7 +441,7 @@ struct EncRetryConn {
     retried: bool,
     /// Mutex 包装只为 Sync（Connection 要求）：poll 单线程独占，锁无竞争。
     #[allow(clippy::type_complexity)]
-    // 重连 future 的完整类型即业务语义，抽 type alias 反而更晦涩
+    // 重连 future 完整类型即业务语义，抽 type alias 反而更晦涩
     reconnecting: parking_lot::Mutex<
         Option<Pin<Box<dyn Future<Output = Result<Box<dyn Connection>, String>> + Send>>>,
     >,
@@ -521,44 +520,6 @@ impl Connection for EncRetryConn {
     }
 }
 
-/// 兼容：直接传 Addons（高级用户可注入 flow）。
-#[allow(dead_code)]
-pub fn make_dial_fn_with_addons(config: Arc<VlessOutboundConfig>, addons: Addons) -> DialFn {
-    Arc::new(move |dest: &Destination| {
-        let config = Arc::clone(&config);
-        let addons = addons.clone();
-        let target_addr = dest.address().clone();
-        let target_port = dest.port();
-        Box::pin(async move {
-            let server_dest = config.server_destination();
-            let sockopt =
-                config.stream_settings.as_ref().map(|s| s.socket_options()).unwrap_or_default();
-            let mut conn: Box<dyn Connection> = match &config.stream_settings {
-                Some(s) => dial(&server_dest, s, &sockopt)
-                    .await
-                    .map_err(|e| format!("vless dial server ({}): {e}", s.protocol))?,
-                None => xray_transport::system_dialer::dial_system(&server_dest, &sockopt)
-                    .await
-                    .map_err(|e| format!("vless dial server (tcp): {e}"))?,
-            };
-            encode_request_header(
-                &mut conn,
-                VERSION,
-                &config.user_uuid,
-                VlessCommand::Tcp,
-                Some(&target_addr),
-                Some(target_port.value()),
-                &addons,
-            )
-            .await
-            .map_err(|e| format!("vless encode header: {e}"))?;
-
-            conn = Box::new(crate::encoding::client::ResponseHeaderReader::new(conn, VERSION));
-            Ok(conn)
-        })
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use rand::SeedableRng;
@@ -615,7 +576,7 @@ mod tests {
     /// flow 字段上线验证：config.flow 经 make_dial_fn 写入请求头 addons.flow，
     /// 服务端 decode_request_header 应读到 xtls-rprx-vision。
     #[tokio::test]
-    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
+    #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
     async fn make_dial_fn_sends_flow_in_request_header() {
         use tokio::{
             io::{AsyncReadExt, AsyncWriteExt},
@@ -677,7 +638,7 @@ mod tests {
     /// 写入 = 第二个 padding 块（uuid 已消费，无前缀）。未包装 → 首字节非
     /// uuid / 业务内容裸奔 → fail。
     #[tokio::test]
-    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
+    #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
     async fn make_dial_fn_wraps_conn_with_vision_when_flow_xrv() {
         use tokio::{
             io::AsyncWriteExt as _,
@@ -750,7 +711,7 @@ mod tests {
     /// 时序：读完 uuid-only 块 + 业务块之后才写响应头。旧行为（dial 内同步
     /// decode_response_header）在此死锁 → 本测试超时失败。
     #[tokio::test]
-    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
+    #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
     async fn vision_dial_returns_before_deferred_response_header() {
         use tokio::{
             io::{AsyncReadExt, AsyncWriteExt},

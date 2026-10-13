@@ -380,7 +380,7 @@ mod tests {
         (addr, handle)
     }
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // 存量清零批次：await_holding_lock
+    #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
     async fn query_once_returns_parsed_a_record() {
         let _slot = DIALER_SLOT_LOCK.lock();
         let (addr, _h) =
@@ -400,7 +400,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // 存量清零批次：await_holding_lock
+    #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
     async fn send_query_populates_rec_v4_only() {
         let _slot = DIALER_SLOT_LOCK.lock();
         let (addr, _h) = spawn_mock_udp_server("x.com.", vec![Ipv4Addr::new(9, 9, 9, 9)], 30).await;
@@ -424,7 +424,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // 存量清零批次：await_holding_lock
+    #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
     async fn send_query_records_error_when_server_silent() {
         let _slot = DIALER_SLOT_LOCK.lock();
         // 启 server 但不响应。
@@ -547,7 +547,7 @@ mod tests {
     /// bd mcpo 验收②：UDP 查询经路由出站——dialer 收到查询目标，
     /// 数据经 dialer 数据报会话往返。
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // 存量清零批次：await_holding_lock
+    #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
     async fn udp_query_routes_through_dialer() {
         let _slot = DIALER_SLOT_LOCK.lock();
         let (addr, _h) =

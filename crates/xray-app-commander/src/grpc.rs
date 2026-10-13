@@ -872,6 +872,7 @@ pub(crate) enum ListenSpec {
     Tcp(SocketAddr),
     /// Unix domain socket 路径（`/` 或 `@` 前缀；Go commander.go:81-82）。
     #[allow(dead_code)]
+    // Go Commander.Start 的 unix listen 形态，当前 gRPC 接线仅 TCP，变体保留待接线
     Unix(String),
 }
 
@@ -975,7 +976,7 @@ impl tokio::io::AsyncWrite for CommanderStream {
 impl tonic::transport::server::Connected for CommanderStream {
     type ConnectInfo = ();
 
-    #[allow(clippy::too_many_arguments)] // 存量清零批次：too_many_arguments
+    #[allow(clippy::too_many_arguments)] // Go 装配 API 参数面直译，打包结构属 API 变更
     fn connect_info(&self) -> Self::ConnectInfo {}
 }
 
@@ -1258,7 +1259,7 @@ mod tests {
 
         struct NopSelector;
         impl OutboundHandlerSelector for NopSelector {
-            #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
+            #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
             fn select_outbounds(
                 &self,
                 selectors: &[String],
@@ -1752,7 +1753,7 @@ mod tests {
 
         struct NopSelector;
         impl OutboundHandlerSelector for NopSelector {
-            #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
+            #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
             fn select_outbounds(
                 &self,
                 selectors: &[String],

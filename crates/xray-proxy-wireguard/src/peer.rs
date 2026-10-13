@@ -35,7 +35,7 @@ pub struct PeerSession {
     /// peer 公钥 hex（调试用）。
     public_key_hex: String,
     /// session index，用于多 peer 场景唯一标识。
-    #[allow(dead_code)] // 存量清零批次
+    #[allow(dead_code)] // session index 多 peer 唯一标识（调试面）
     index: u32,
 }
 

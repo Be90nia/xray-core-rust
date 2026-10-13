@@ -99,8 +99,7 @@ pub trait Closable {
 /// 对应 Go `task.Close(v interface{}) func() error`：Go 在 `common.Close`
 /// 中检查是否实现 `Closable`，未实现则返回 nil。Rust 端用 trait bound 在
 /// 调用处约束，编译期拒绝非 `Closable` 类型——更严格但更安全。
-// 函数名对齐 Go `task.Close` API，保留大写。
-#[allow(non_snake_case)]
+#[allow(non_snake_case)] // 函数名对齐 Go task.Close API，保留大写
 pub fn Close<T: Closable>(v: T) -> impl FnOnce() -> Result<(), Error> {
     move || v.close()
 }
@@ -108,8 +107,7 @@ pub fn Close<T: Closable>(v: T) -> impl FnOnce() -> Result<(), Error> {
 /// 串行组合 f 和 g：当 f 返回 Ok 时执行 g。
 ///
 /// 对应 Go `task.OnSuccess(f, g func() error) func() error`。
-// 函数名对齐 Go `task.OnSuccess` API，保留大写。
-#[allow(non_snake_case)]
+#[allow(non_snake_case)] // 函数名对齐 Go task.OnSuccess API，保留大写
 pub fn OnSuccess<F, G>(f: F, g: G) -> impl FnOnce() -> Result<(), Error>
 where
     F: FnOnce() -> Result<(), Error>,
@@ -130,8 +128,7 @@ where
 ///
 /// 工作线程数受 `std::thread::available_parallelism()` 限制（默认上限 16）。
 /// 任一任务失败立即返回错误，其他 worker 仍在并发跑完。
-// 函数名对齐 Go `task.Run` API，保留大写。
-#[allow(non_snake_case)]
+#[allow(non_snake_case)] // 函数名对齐 Go task.Run API，保留大写
 pub fn Run<C, F>(ctx: &C, tasks: Vec<F>) -> Result<(), Error>
 where
     C: ?Sized,
@@ -171,8 +168,7 @@ where
 /// 对应 Go `task.ParallelForN(n int, fn func(i int) error) error`。
 /// 索引被划分为连续 chunk；每个 worker 处理一段，worker 数受
 /// `std::thread::available_parallelism()` 限制。
-// 函数名对齐 Go `task.ParallelForN` API，保留大写。
-#[allow(non_snake_case)]
+#[allow(non_snake_case)] // 函数名对齐 Go task.ParallelForN API，保留大写
 pub fn ParallelForN<F>(n: usize, f: F) -> Result<(), Error>
 where
     F: Fn(usize) -> Result<(), Error> + Sync + Send,

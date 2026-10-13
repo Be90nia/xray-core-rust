@@ -239,6 +239,7 @@ impl Cipher {
         }
         // Self 当前仅 Aead 变体（还原代码形态），模式必真
         #[allow(irrefutable_let_patterns)]
+        // Self 当前仅 Aead 变体，let 模式必真（还原 Go 代码形态）
         if let Self::Aead(_) = self {
             let iv: Vec<u8> = buf[..iv_len].to_vec();
             let aead = self.create_aead(key, &iv)?.expect("aead for Aead variant");

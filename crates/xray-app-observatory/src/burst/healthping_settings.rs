@@ -253,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
+    #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
     fn from_config_overrides_destination() {
         let mut c = HealthPingConfig::default();
         c.destination = "  https://custom.test  ".into();
@@ -262,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
+    #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
     fn from_config_empty_destination_keeps_default() {
         let mut c = HealthPingConfig::default();
         c.destination = "   ".into();
@@ -271,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
+    #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
     fn from_config_interval_zero_uses_default() {
         let mut c = HealthPingConfig::default();
         c.interval = 0;
@@ -280,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
+    #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
     fn from_config_interval_below_min_clamped() {
         let mut c = HealthPingConfig::default();
         c.interval = 1_000; // 1us, way below MIN
@@ -289,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
+    #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
     fn from_config_interval_valid_kept() {
         let mut c = HealthPingConfig::default();
         c.interval = 120_000_000_000; // 2 min
@@ -298,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
+    #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
     fn from_config_sampling_zero_uses_default() {
         let mut c = HealthPingConfig::default();
         c.sampling_count = 0;
@@ -307,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
+    #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
     fn from_config_sampling_valid_kept() {
         let mut c = HealthPingConfig::default();
         c.sampling_count = 20;
@@ -316,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
+    #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
     fn from_config_timeout_zero_uses_default() {
         let mut c = HealthPingConfig::default();
         c.timeout = 0;
@@ -325,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
+    #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
     fn from_config_timeout_valid_kept() {
         let mut c = HealthPingConfig::default();
         c.timeout = 10_000_000_000; // 10s
@@ -334,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
+    #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
     fn from_config_http_method_empty_uses_default() {
         let mut c = HealthPingConfig::default();
         c.http_method = "".into();
@@ -343,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
+    #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
     fn from_config_http_method_trimmed() {
         let mut c = HealthPingConfig::default();
         c.http_method = "  GET  ".into();
@@ -352,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
+    #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
     fn from_config_connectivity_trimmed() {
         let mut c = HealthPingConfig::default();
         c.connectivity = "  https://c.test  ".into();
@@ -367,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
+    #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
     fn validate_fails_for_zero_sampling() {
         let mut s = HealthPingSettings::default();
         s.sampling_count = 0;
@@ -375,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
+    #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
     fn validate_fails_for_negative_sampling() {
         let mut s = HealthPingSettings::default();
         s.sampling_count = -1;
@@ -383,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
+    #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
     fn validate_fails_for_zero_interval() {
         let mut s = HealthPingSettings::default();
         s.interval = 0;
@@ -391,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
+    #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
     fn validate_fails_for_zero_timeout() {
         let mut s = HealthPingSettings::default();
         s.timeout = 0;

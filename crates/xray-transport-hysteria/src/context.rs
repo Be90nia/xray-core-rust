@@ -61,7 +61,7 @@ mod tests {
     /// 测试用 context 载体：可变字段用 RwLock 保护。
     struct TestCtx {
         datagram: RwLock<bool>,
-        #[allow(dead_code)] // 存量清零批次
+        #[allow(dead_code)] // 测试 ctx 载体对齐完整接口形态
         auth: RwLock<Option<Arc<str>>>,
     }
 

@@ -30,14 +30,14 @@ pub struct DokodemoServer {
     /// 配置（含 predefined address + port + allowed_networks）。
     // 当前 accept 路径未消费 config（目标改由 dispatcher 注入）；保留字段
     // 与 predefined/destination 构造方法族，待 transparent/redirect 接线票启用。
-    #[allow(dead_code)]
+    #[allow(dead_code)] // config 字段待 transparent/redirect 接线票启用
     config: Config,
     /// tokio 监听器。`None` 表示未启动或已关闭。
     listener: Arc<Mutex<Option<TcpListener>>>,
 }
 
 /// 将 [`PredefinedAddress`] 转为 [`Address`]。
-#[allow(dead_code)]
+#[allow(dead_code)] // 待 transparent/redirect 接线票启用（同 config 字段）
 fn predefined_to_address(addr: PredefinedAddress) -> Address {
     match addr {
         PredefinedAddress::Ip(ip) => match ip {
@@ -57,7 +57,7 @@ impl DokodemoServer {
 
     // build_destination 族与 is_network_allowed 属 Go Process 的 dest 构造
     // 路径，当前 Rust accept 路径未接线（同 config 字段，待专项票）。
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Go Process dest 构造路径，待 transparent/redirect 接线票启用
     fn build_destination_ex(
         &self,
         fd: Option<i32>,
@@ -120,19 +120,19 @@ impl DokodemoServer {
     }
 
     /// 构造 TCP 目标（兼容旧调用方）。等价于 `build_destination_ex(fd, None, false)`。
-    #[allow(dead_code)]
+    #[allow(dead_code)] // 同 build_destination_ex，待 transparent/redirect 接线票启用
     fn build_destination(&self, fd: Option<i32>) -> Option<Destination> {
         self.build_destination_ex(fd, None, false)
     }
 
     /// 构造 UDP 目标。用于 dokodemo UDP relay。
-    #[allow(dead_code)]
+    #[allow(dead_code)] // 同 build_destination_ex，待 transparent/redirect 接线票启用
     fn build_udp_destination(&self, local_port: Option<u16>) -> Option<Destination> {
         self.build_destination_ex(None, local_port, true)
     }
 
     /// 网络类型是否被配置允许。
-    #[allow(dead_code)]
+    #[allow(dead_code)] // 同 build_destination_ex，待 transparent/redirect 接线票启用
     fn is_network_allowed(&self, net: Network) -> bool {
         self.config.allows_network(net)
     }

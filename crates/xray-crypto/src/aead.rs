@@ -463,7 +463,7 @@ impl AeadCipher for Aes256Gcm {
 /// assert_eq!(plaintext.as_slice(), ciphertext.as_slice());
 /// # Ok::<(), CryptoError>(())
 /// ```
-#[allow(clippy::large_enum_variant)]
+#[allow(clippy::large_enum_variant)] // AES-128/256 各持自家 state，Box 化反增堆分配；尺寸差属算法固有
 pub enum AesCfbEncryptor {
     /// AES-128-CFB encryptor.
     Aes128(CfbEncryptor<Aes128>),
@@ -530,7 +530,7 @@ impl AesCfbEncryptor {
 /// assert_eq!(plaintext.as_slice(), ciphertext.as_slice());
 /// # Ok::<(), CryptoError>(())
 /// ```
-#[allow(clippy::large_enum_variant)]
+#[allow(clippy::large_enum_variant)] // AES-128/256 各持自家 state，Box 化反增堆分配；尺寸差属算法固有
 pub enum AesCfbDecryptor {
     /// AES-128-CFB decryptor.
     Aes128(CfbDecryptor<Aes128>),
@@ -605,7 +605,7 @@ impl AesCfbDecryptor {
 /// assert_eq!(plaintext.as_slice(), data.as_slice());
 /// # Ok::<(), CryptoError>(())
 /// ```
-#[allow(clippy::large_enum_variant)]
+#[allow(clippy::large_enum_variant)] // AES-128/256 各持自家 state，Box 化反增堆分配；尺寸差属算法固有
 pub enum AesCtrStream {
     /// AES-128-CTR stream cipher.
     Aes128(Ctr128BE<Aes128>),

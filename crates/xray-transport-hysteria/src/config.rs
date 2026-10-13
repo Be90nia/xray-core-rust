@@ -19,49 +19,49 @@ pub const CLOSE_ERR_CODE_PROTOCOL_ERROR: u64 = 0x101;
 // ===== HTTP 头部常量 =====
 
 /// HTTP Host（对应 Go `URLHost = "hysteria"`）。
-#[allow(dead_code)] // 存量清零批次
+#[allow(dead_code)] // Go 协议字面对齐：wire 常量全集保留（部分 header 当前链路未触达）
 #[allow(non_upper_case_globals)] // 对齐 Go 协议字面命名
 pub const URLHost: &str = "hysteria";
 
 /// HTTP 路径（对应 Go `URLPath = "/auth"`）。
-#[allow(dead_code)] // 存量清零批次
+#[allow(dead_code)] // Go 协议字面对齐：wire 常量全集保留（部分 header 当前链路未触达）
 #[allow(non_upper_case_globals)] // 对齐 Go 协议字面命名
 pub const URLPath: &str = "/auth";
 
 /// 请求头：鉴权 token（对应 Go `RequestHeaderAuth = "Hysteria-Auth"`）。
-#[allow(dead_code)] // 存量清零批次
+#[allow(dead_code)] // Go 协议字面对齐：wire 常量全集保留（部分 header 当前链路未触达）
 #[allow(non_upper_case_globals)] // 对齐 Go 协议字面命名
 pub const RequestHeaderAuth: &str = "Hysteria-Auth";
 
 /// 响应头：是否启用 UDP（对应 Go `ResponseHeaderUDPEnabled = "Hysteria-UDP"`）。
-#[allow(dead_code)] // 存量清零批次
+#[allow(dead_code)] // Go 协议字面对齐：wire 常量全集保留（部分 header 当前链路未触达）
 #[allow(non_upper_case_globals)] // 对齐 Go 协议字面命名
 pub const ResponseHeaderUDPEnabled: &str = "Hysteria-UDP";
 
 /// 公共头：Brutal 下行带宽（对应 Go `CommonHeaderCCRX = "Hysteria-CC-RX"`）。
-#[allow(dead_code)] // 存量清零批次
+#[allow(dead_code)] // Go 协议字面对齐：wire 常量全集保留（部分 header 当前链路未触达）
 #[allow(non_upper_case_globals)] // 对齐 Go 协议字面命名
 pub const CommonHeaderCCRX: &str = "Hysteria-CC-RX";
 
 /// 公共头：padding（对应 Go `CommonHeaderPadding = "Hysteria-Padding"`）。
-#[allow(dead_code)] // 存量清零批次
+#[allow(dead_code)] // Go 协议字面对齐：wire 常量全集保留（部分 header 当前链路未触达）
 #[allow(non_upper_case_globals)] // 对齐 Go 协议字面命名
 pub const CommonHeaderPadding: &str = "Hysteria-Padding";
 
 // ===== Frame Type / 容量 =====
 
 /// 鉴权 OK 的 HTTP 状态码（对应 Go `StatusAuthOK = 233`）。
-#[allow(dead_code)] // 存量清零批次
+#[allow(dead_code)] // Go 协议字面对齐：wire 常量全集保留（部分 header 当前链路未触达）
 #[allow(non_upper_case_globals)] // 对齐 Go 协议字面命名
 pub const StatusAuthOK: u16 = 233;
 
 /// TCP 请求 frame type（对应 Go `FrameTypeTCPRequest = 0x401`）。
-#[allow(dead_code)] // 存量清零批次
+#[allow(dead_code)] // Go 协议字面对齐：wire 常量全集保留（部分 header 当前链路未触达）
 #[allow(non_upper_case_globals)] // 对齐 Go 协议字面命名
 pub const FrameTypeTCPRequest: u64 = 0x401;
 
 /// QUIC datagram 最大字节数（对应 Go `MaxDatagramFrameSize = 1200`）。
-#[allow(dead_code)] // 存量清零批次
+#[allow(dead_code)] // Go 协议字面对齐：wire 常量全集保留（部分 header 当前链路未触达）
 #[allow(non_upper_case_globals)] // 对齐 Go 协议字面命名
 pub const MaxDatagramFrameSize: usize = 1200;
 
@@ -116,22 +116,22 @@ impl Padding {
 }
 
 /// 鉴权请求 padding 范围（对应 Go `AuthRequestPadding = padding{256, 2048}`）。
-#[allow(dead_code)] // 存量清零批次
+#[allow(dead_code)] // Go 协议字面对齐：wire 常量全集保留（部分 header 当前链路未触达）
 #[allow(non_upper_case_globals)] // 对齐 Go 协议字面命名
 pub static AuthRequestPadding: LazyPadding = LazyPadding::new(Padding::new(256, 2048));
 
 /// 鉴权响应 padding 范围（对应 Go `AuthResponsePadding = padding{256, 2048}`）。
-#[allow(dead_code)] // 存量清零批次
+#[allow(dead_code)] // Go 协议字面对齐：wire 常量全集保留（部分 header 当前链路未触达）
 #[allow(non_upper_case_globals)] // 对齐 Go 协议字面命名
 pub static AuthResponsePadding: LazyPadding = LazyPadding::new(Padding::new(256, 2048));
 
 /// TCP 请求 padding 范围（对应 Go `TcpRequestPadding = padding{64, 512}`）。
-#[allow(dead_code)] // 存量清零批次
+#[allow(dead_code)] // Go 协议字面对齐：wire 常量全集保留（部分 header 当前链路未触达）
 #[allow(non_upper_case_globals)] // 对齐 Go 协议字面命名
 pub static TcpRequestPadding: LazyPadding = LazyPadding::new(Padding::new(64, 512));
 
 /// TCP 响应 padding 范围（对应 Go `TcpResponsePadding = padding{128, 1024}`）。
-#[allow(dead_code)] // 存量清零批次
+#[allow(dead_code)] // Go 协议字面对齐：wire 常量全集保留（部分 header 当前链路未触达）
 #[allow(non_upper_case_globals)] // 对齐 Go 协议字面命名
 pub static TcpResponsePadding: LazyPadding = LazyPadding::new(Padding::new(128, 1024));
 

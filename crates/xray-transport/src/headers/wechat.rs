@@ -9,7 +9,7 @@ pub struct WechatConfig {
 
 pub struct WechatHeader {
     // 与 Go headers/wechat 一致：config 仅为构造形态保留，encode 写死伪装字节。
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Go 同型：config 仅为构造形态保留，encode 写死伪装字节
     config: WechatConfig,
 }
 

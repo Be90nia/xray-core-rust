@@ -119,7 +119,7 @@ pub fn register_all_transports() {
     tracing::info!("all transport dialers + listeners registered");
 }
 
-#[allow(dead_code)] // 存量清零批次
+#[allow(dead_code)] // kind 清单锚点：与 xray-conf built.rs push_app! 宏对齐（文档性）
 /// App kind 列表（与 `xray-conf/src/built.rs` push_app! 宏的 kind 一致）。
 const APP_KINDS: &[&str] = &[
     "log",
@@ -991,7 +991,7 @@ fn version_factory() -> FeatureFactory {
     })
 }
 
-#[allow(dead_code)] // 存量清零批次
+#[allow(dead_code)] // noop factory 备件：给将来想挂 noop 的 kind 留（历史 stub 同款）
 /// 极简 no-op Feature；`feature_name()` 返回 `"simple"`。
 /// 给将来想挂 noop factory 的 kind 留个备件（与历史 stub 同款语义）。
 struct SimpleFeature {
@@ -1004,7 +1004,7 @@ impl xray_features::Feature for SimpleFeature {
     }
 }
 
-#[allow(dead_code)] // 存量清零批次
+#[allow(dead_code)] // 同上 noop factory 备件（api/metrics 挂载点）
 /// 为 api/metrics
 /// 创建 SimpleFeature 工厂（实现 Feature trait 的最简 no-op）。
 fn simple_feature_factory(kind: &'static str) -> FeatureFactory {

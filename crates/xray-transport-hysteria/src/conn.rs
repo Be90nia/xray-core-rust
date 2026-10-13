@@ -351,17 +351,17 @@ impl InterStreamConn {
 pub struct HysteriaConn {
     inner: Arc<InterStreamConn>,
     /// 缓存进行中的 read future。
-    #[allow(clippy::type_complexity)] // 存量清零批次
+    #[allow(clippy::type_complexity)] // 签名类型即业务语义，抽 type alias 反而更晦涩
     read_state: parking_lot::Mutex<
         Option<Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<u8>>> + Send>>>,
     >,
     /// 缓存进行中的 write future。
-    #[allow(clippy::type_complexity)] // 存量清零批次
+    #[allow(clippy::type_complexity)] // 签名类型即业务语义，抽 type alias 反而更晦涩
     write_state: parking_lot::Mutex<
         Option<Pin<Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send>>>,
     >,
     /// 缓存进行中的 close future。
-    #[allow(clippy::type_complexity)] // 存量清零批次
+    #[allow(clippy::type_complexity)] // 签名类型即业务语义，抽 type alias 反而更晦涩
     close_state: parking_lot::Mutex<
         Option<Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>>,
     >,
@@ -531,7 +531,7 @@ pub struct InterConn {
     /// 是否已关闭。
     closed: Mutex<bool>,
     /// 写回调（QUIC conn.SendDatagram）。
-    #[allow(clippy::type_complexity)] // 存量清零批次
+    #[allow(clippy::type_complexity)] // 签名类型即业务语义，抽 type alias 反而更晦涩
     write_fn: Mutex<
         Option<
             Arc<
@@ -700,9 +700,10 @@ pub struct UdpSessionManager {
     inner: Arc<TokioMutex<UdpSessionInner>>,
     /// 后台清理任务句柄。
     #[allow(dead_code)]
+    // 句柄随 manager 保活统一回收（abort 走 inner.closed 检查），本体无需读取
     clean_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// 后台 recv 任务句柄。
-    #[allow(dead_code)]
+    #[allow(dead_code)] // 同 clean_handle，任务生命周期随 manager
     run_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 

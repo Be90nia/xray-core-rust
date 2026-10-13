@@ -38,7 +38,7 @@ pub struct AuthenticationReader<'a> {
     auth: Box<dyn Authenticator>,
     reader: &'a mut BufferedReader,
     size_decoder: Box<dyn ChunkSizeDecoder>,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // vision 协议 transfer_type 语义字段，诊断/direct 判定待接线
     transfer_type: TransferType,
     padding: Box<dyn PaddingLengthGenerator>,
     size_bytes: Vec<u8>,

@@ -172,7 +172,7 @@ impl OutboundHandlerEntry {
     /// `proxy_type_url` 对应 Go `proxyConfig` 的 proto 类型 URL。
     /// `stats` 决定是否拉取流量计数器。
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // Go NewHandler(ctx, config) 拆参直译，打包结构属 API 变更
     pub fn new(
         tag: impl Into<String>,
         sender_config: Option<SenderConfig>,
@@ -486,7 +486,7 @@ impl OutboundDialer for HandlerDialer {
 ///
 /// # Errors
 /// - [`ProxymanError::Other`]：CIDR 字符串无法解析
-#[allow(clippy::module_name_repetitions)]
+#[allow(clippy::module_name_repetitions)] // 函数名对齐 Go randomip.ParseRandomIP 语义，不回模块前缀
 pub fn parse_random_ip(ip: IpAddr, prefix: u8) -> Result<IpAddr, ProxymanError> {
     let net = IpNet::new(ip, prefix).map_err(|e| ProxymanError::Other(e.to_string()))?;
     let start = network_start(&net);

@@ -404,7 +404,7 @@ impl phy::Device for VirtualDevice {
         Some(VirtTxToken { tx_queue_ptr: &mut self.tx_queue as *mut _ })
     }
 
-    #[allow(clippy::incompatible_msrv)] // 存量清零批次：incompatible_msrv
+    #[allow(clippy::incompatible_msrv)] // 工作区实际工具链新于 MSRV=1.85，该 API 受控使用
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
@@ -427,14 +427,14 @@ impl phy::Device for VirtualDevice {
 /// 此函数仅作为显式转换点，方便阅读。
 #[must_use]
 pub fn to_smoltcp_v4(addr: std::net::Ipv4Addr) -> Ipv4Address {
-    #[allow(clippy::incompatible_msrv)] // 存量清零批次
+    #[allow(clippy::incompatible_msrv)] // 工作区实际工具链新于 MSRV=1.85，该 API 受控使用
     Ipv4Address::from_octets(addr.octets())
 }
 
 /// 把 std::net::Ipv6Addr 转 smoltcp::wire::Ipv6Address。
 #[must_use]
 pub fn to_smoltcp_v6(addr: std::net::Ipv6Addr) -> Ipv6Address {
-    #[allow(clippy::incompatible_msrv)] // 存量清零批次
+    #[allow(clippy::incompatible_msrv)] // 工作区实际工具链新于 MSRV=1.85，该 API 受控使用
     Ipv6Address::from_octets(addr.octets())
 }
 

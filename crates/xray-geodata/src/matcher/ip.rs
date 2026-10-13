@@ -92,8 +92,8 @@ impl Ipv4Cidr {
         Self { addr: u32::from_be_bytes(addr.octets()), prefix }
     }
 
-    // 生产路径走 range() 区间匹配；contains 仅测试使用。
-    #[allow(dead_code)]
+    // 生产路径走 range() 区间匹配；contains 仅测试断言锚点用。
+    #[cfg(test)]
     fn contains(&self, ip: Ipv4Addr) -> bool {
         if self.prefix == 0 {
             return true;
@@ -127,8 +127,8 @@ impl Ipv6Cidr {
         Self { addr: u128::from_be_bytes(addr.octets()), prefix }
     }
 
-    // 生产路径走 range() 区间匹配；contains 仅测试使用。
-    #[allow(dead_code)]
+    // 生产路径走 range() 区间匹配；contains 仅测试断言锚点用。
+    #[cfg(test)]
     fn contains(&self, ip: Ipv6Addr) -> bool {
         if self.prefix == 0 {
             return true;
@@ -710,7 +710,7 @@ pub fn build_optimized_ip_matcher(
 
 // 历史布局：正式 item（IpRegistry/DynamicIPMatcher 等）在测试模块之后，
 // 整体移动是大 diff 重构，保持现状。
-#[allow(clippy::items_after_test_module)]
+#[allow(clippy::items_after_test_module)] // 历史布局保持，整体移动属大 diff 重构
 #[cfg(test)]
 mod tests {
     use super::*;

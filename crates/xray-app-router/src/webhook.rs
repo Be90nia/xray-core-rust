@@ -92,7 +92,6 @@ pub struct WebhookNotifier {
     headers: std::collections::HashMap<String, String>,
     dedup_window: Duration,
     seen: Mutex<Seen>,
-    #[allow(dead_code)]
     closed: Mutex<bool>,
 }
 

@@ -82,7 +82,7 @@ impl Tunnel {
     /// # 错误
     ///
     /// 返回 [`WgError::InvalidConfig`]：hex 非法 / 长度不为 32 字节。
-    #[allow(clippy::needless_pass_by_value)]
+    #[allow(clippy::needless_pass_by_value)] // hex 字符串参对齐 Go Tunnel 构造面，&str 保调用方 ergonomic
     pub fn new(
         secret_hex: &str,
         peer_pub_hex: &str,

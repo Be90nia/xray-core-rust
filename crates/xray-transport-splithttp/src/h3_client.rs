@@ -195,7 +195,7 @@ impl H3Conn {
         sockopt: &xray_transport::sockopt::SocketOptions,
     ) -> Result<Arc<Self>> {
         // QUIC 客户端构造期一次性 ALPN 配置（冷路径，非数据面分块拷贝）
-        #[allow(clippy::disallowed_methods)]
+        #[allow(clippy::disallowed_methods)] // ALPN 冷路径一次性构造，非数据面热路径
         let alpn_h3 = b"h3".to_vec();
         tls.alpn_protocols = vec![alpn_h3];
         let mut quic_cfg = quinn::ClientConfig::new(Arc::new(
