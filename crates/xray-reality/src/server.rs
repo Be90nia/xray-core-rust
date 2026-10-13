@@ -493,6 +493,8 @@ struct VerifiedHandshake {
     /// `GlobalPostHandshakeRecordsLens.Load(key)` 等价；空 = dest 未主动发
     /// type23 / 未启用探测 / 查表 miss）。非空 = 发送 gate 命中，逐条发送
     /// 字节级等价 mirror（bd z32z，见 [`server_tls_btls`] 处置记录）。
+    // 75rv ② 隐性回归:仅 rustls server_tls 路径消费,btls/iOS 等路径 dead_code
+    #[allow(dead_code)]
     mirror_record_lens: Vec<u32>,
 }
 
