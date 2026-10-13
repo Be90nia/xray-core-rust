@@ -24,7 +24,7 @@ use crate::error::{Result, VmessError};
 /// 对应 Go `*MemoryAccount`。在 Rust 端不支持 Go interface，
 /// 因此不复用 `protocol::MemoryUser`（其 `account` 字段是 `Option<TypedMessage>`），
 /// 而是独立定义在此 crate 内部。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MemoryAccount {
     /// 主 ID（UUID + cmd_key 派生）。
     pub id: ID,
@@ -34,6 +34,19 @@ pub struct MemoryAccount {
     pub authenticated_length_experiment: bool,
     /// 不发送 termination signal。
     pub no_termination_signal: bool,
+}
+
+// Debug 脱敏：id 含 UUID/cmd_key 认证凭据，禁止经 derive(Debug) 泄露
+// （安全审计红线：含密码/UUID 的 struct 不得 derive Debug）。
+impl std::fmt::Debug for MemoryAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryAccount")
+            .field("id", &"[REDACTED]")
+            .field("security", &self.security)
+            .field("authenticated_length_experiment", &self.authenticated_length_experiment)
+            .field("no_termination_signal", &self.no_termination_signal)
+            .finish()
+    }
 }
 
 impl MemoryAccount {

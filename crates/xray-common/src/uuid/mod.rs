@@ -10,8 +10,16 @@ use rand::RngCore;
 /// 自定义 UUID 类型，基于 16 字节数组存储。
 ///
 /// 对应 Go 版本的 `uuid.UUID`，支持 v4 随机生成和标准格式解析。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct UUID([u8; 16]);
+
+// Debug 脱敏：UUID 即 VLESS/VMess 认证凭据，禁止经 derive(Debug) 进入
+// tracing/panic 输出（安全审计红线：含密码/UUID 的 struct 不得 derive Debug）。
+impl fmt::Debug for UUID {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("UUID([REDACTED])")
+    }
+}
 
 impl Default for UUID {
     /// 随机 v4 UUID，与 [`UUID::new`] 一致（对齐 Go `uuid.New` 随机语义）。
