@@ -133,6 +133,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+      # osv-scanner：GHSA/CVE 基线扫描（gqkk 供应链票，与 cargo-deny 的 RustSec 面
+      # 互补）。当前基线含票外命中（hickory-resolver/lru/paste/rsa 等 2026-10-13
+      # 扫描记录见 reports/fix-gqkk-vendor.md），故暂为告警级（continue-on-error）；
+      # rustls 0.23.45 升级消解 GHSA-2mjx-qc3c-rqvc 后，其余命中单独开票处置，
+      # 全零后移除本行切阻断级。
+      - name: osv-scanner (CVE/GHSA baseline)
+        continue-on-error: true
+        run: |
+          curl -sSfL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 -o /usr/local/bin/osv-scanner
+          chmod +x /usr/local/bin/osv-scanner
+          osv-scanner scan --lockfile=Cargo.lock --format=table
 
   # 文档构建
   docs:
