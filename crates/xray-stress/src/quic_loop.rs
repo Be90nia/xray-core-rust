@@ -20,22 +20,23 @@ use xray_transport_hysteria::{
     quinn_adapter::QuinnListenerFactory,
 };
 
-use crate::report::StatsHandle;
+use crate::{
+    error::{Result, StressError},
+    report::StatsHandle,
+};
 
 const AUTH_SECRET: &str = "xray-stress-secret";
 const S3_PAYLOAD_LEN: usize = 8 * 1024;
 
 /// PEM → DER（自签证书场景，无链无加密段；rcgen 产物为单段 PKCS#8）。
-pub(crate) fn pem_to_der(pem: &str) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn pem_to_der(pem: &str) -> Result<Vec<u8>> {
     let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
     use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD
-        .decode(body.trim())
-        .map_err(|e| anyhow::anyhow!("pem base64 decode: {e}"))
+    Ok(base64::engine::general_purpose::STANDARD.decode(body.trim())?)
 }
 
 /// S3 服务端：QUIC listener + TCPRequest 解析 + echo 回调。
-pub async fn start_quic_echo_server() -> anyhow::Result<SocketAddr> {
+pub async fn start_quic_echo_server() -> Result<SocketAddr> {
     let (cert_pem, key_pem) = xray_tls::certificate::generate_self_signed_cert(&["localhost"])?;
     let cert_der = pem_to_der(&cert_pem)?;
     let key_der = pem_to_der(&key_pem)?;
@@ -44,9 +45,9 @@ pub async fn start_quic_echo_server() -> anyhow::Result<SocketAddr> {
         .with_single_cert(
             vec![rustls::pki_types::CertificateDer::from(cert_der)],
             rustls::pki_types::PrivateKeyDer::try_from(key_der)
-                .map_err(|e| anyhow::anyhow!("private key der: {e}"))?,
+                .map_err(|e| StressError::KeyDer(format!("private key der: {e}")))?,
         )
-        .map_err(|e| anyhow::anyhow!("server cert: {e}"))?;
+        .map_err(|e| StressError::Rustls(format!("server cert: {e}")))?;
 
     let factory = QuinnListenerFactory::new(Arc::new(server_tls));
     let validator: Option<Arc<dyn AuthValidator>> = Some(Arc::new(StaticValidator));

@@ -28,7 +28,7 @@ sysinfo = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 parking_lot = { workspace = true }
-anyhow = { workspace = true }
+thiserror = { workspace = true }
 base64 = "0.22"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 rand = "0.9"

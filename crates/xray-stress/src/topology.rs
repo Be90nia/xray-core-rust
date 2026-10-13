@@ -8,6 +8,8 @@ use tokio::net::{TcpListener, TcpStream};
 use xray_conf::{BuiltConfig, BuiltEntry, BuiltInbound, BuiltOutbound};
 use xray_core::functions::start_full;
 
+use crate::error::{Result, StressError};
+
 pub const TEST_UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
 pub const SHORT_ID_HEX: &str = "0123456789abcdef";
 /// listener 就绪 + QUIC/KCP 握手 warmup（e2e 同款量级）。
@@ -174,7 +176,7 @@ fn vless_outbound(upstream_port: u16, stream: serde_json::Value) -> BuiltOutboun
 /// 双实例。返回 (socks_port, server_handles, client_handles)。
 pub async fn start_reality_link(
     echo_port: u16,
-) -> anyhow::Result<(u16, Vec<tokio::task::JoinHandle<()>>, Vec<tokio::task::JoinHandle<()>>)> {
+) -> Result<(u16, Vec<tokio::task::JoinHandle<()>>, Vec<tokio::task::JoinHandle<()>>)> {
     let (priv_b64, pub_b64) = reality_keypair();
     let vless_port = pick_free_port().await;
     let socks_port = pick_free_port().await;
@@ -195,10 +197,12 @@ pub async fn start_reality_link(
     client_cfg.inbounds.push(socks_inbound(socks_port));
     client_cfg.outbounds.push(vless_outbound(vless_port, client_reality));
 
-    let (_si, _so, sh) =
-        start_full(&server_cfg).await.map_err(|e| anyhow::anyhow!("reality server: {e}"))?;
-    let (_ci, _co, ch) =
-        start_full(&client_cfg).await.map_err(|e| anyhow::anyhow!("reality client: {e}"))?;
+    let (_si, _so, sh) = start_full(&server_cfg)
+        .await
+        .map_err(|e| StressError::Start(format!("reality server: {e}")))?;
+    let (_ci, _co, ch) = start_full(&client_cfg)
+        .await
+        .map_err(|e| StressError::Start(format!("reality client: {e}")))?;
     tokio::time::sleep(READY_WARMUP).await;
     Ok((socks_port, sh, ch))
 }
@@ -206,7 +210,7 @@ pub async fn start_reality_link(
 /// 起一组 vless+mKCP 双实例。返回 (socks_port, handles...)。
 pub async fn start_kcp_link(
     echo_port: u16,
-) -> anyhow::Result<(u16, Vec<tokio::task::JoinHandle<()>>, Vec<tokio::task::JoinHandle<()>>)> {
+) -> Result<(u16, Vec<tokio::task::JoinHandle<()>>, Vec<tokio::task::JoinHandle<()>>)> {
     let _ = echo_port; // kcp dest 由 socks 请求目标决定，echo 端口仅用于探针
     let vless_port = pick_free_port().await;
     let socks_port = pick_free_port().await;
@@ -222,21 +226,23 @@ pub async fn start_kcp_link(
     client_cfg.inbounds.push(socks_inbound(socks_port));
     client_cfg.outbounds.push(vless_outbound(vless_port, kcp));
 
-    let (_si, _so, sh) =
-        start_full(&server_cfg).await.map_err(|e| anyhow::anyhow!("kcp server: {e}"))?;
-    let (_ci, _co, ch) =
-        start_full(&client_cfg).await.map_err(|e| anyhow::anyhow!("kcp client: {e}"))?;
+    let (_si, _so, sh) = start_full(&server_cfg)
+        .await
+        .map_err(|e| StressError::Start(format!("kcp server: {e}")))?;
+    let (_ci, _co, ch) = start_full(&client_cfg)
+        .await
+        .map_err(|e| StressError::Start(format!("kcp client: {e}")))?;
     tokio::time::sleep(READY_WARMUP).await;
     Ok((socks_port, sh, ch))
 }
 
 /// 首连探针：链路不通立即失败，避免长跑空转。
-pub async fn probe_socks_roundtrip(proxy_port: u16, echo_port: u16) -> anyhow::Result<()> {
+pub async fn probe_socks_roundtrip(proxy_port: u16, echo_port: u16) -> Result<()> {
     let payload = b"GET / HTTP/1.0\r\nUser-Agent: xray-stress-probe\r\n\r\n";
     socks_roundtrip(proxy_port, echo_port, payload)
         .await
         .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("probe roundtrip failed: {e}"))
+        .map_err(|e| StressError::Probe(format!("probe roundtrip failed: {e}")))
 }
 
 /// 单次 SOCKS5 → echo roundtrip（greet + CONNECT + 写 payload + 读回显）。
@@ -444,7 +450,7 @@ async fn start_dual(
     server_stream: Option<serde_json::Value>,
     client_out: BuiltOutbound,
     socks_port: u16,
-) -> anyhow::Result<LinkHandles> {
+) -> Result<LinkHandles> {
     server_in.stream_settings_json = server_stream;
     let mut server_cfg = BuiltConfig::default();
     server_cfg.inbounds.push(server_in);
@@ -454,10 +460,12 @@ async fn start_dual(
     client_cfg.inbounds.push(socks_inbound(socks_port));
     client_cfg.outbounds.push(client_out);
 
-    let (_si, _so, sh) =
-        start_full(&server_cfg).await.map_err(|e| anyhow::anyhow!("{link} server: {e}"))?;
-    let (_ci, _co, ch) =
-        start_full(&client_cfg).await.map_err(|e| anyhow::anyhow!("{link} client: {e}"))?;
+    let (_si, _so, sh) = start_full(&server_cfg)
+        .await
+        .map_err(|e| StressError::Start(format!("{link} server: {e}")))?;
+    let (_ci, _co, ch) = start_full(&client_cfg)
+        .await
+        .map_err(|e| StressError::Start(format!("{link} client: {e}")))?;
     tokio::time::sleep(READY_WARMUP).await;
     Ok((socks_port, sh, ch))
 }
@@ -467,13 +475,13 @@ async fn start_simple_link(
     server_in: BuiltInbound,
     server_stream: Option<serde_json::Value>,
     client_out: BuiltOutbound,
-) -> anyhow::Result<LinkHandles> {
+) -> Result<LinkHandles> {
     let socks_port = pick_free_port().await;
     start_dual(link, server_in, server_stream, client_out, socks_port).await
 }
 
 /// s5：vmess(aes-128-gcm) + websocket 双实例。
-pub async fn start_vmess_ws_link(echo_port: u16) -> anyhow::Result<LinkHandles> {
+pub async fn start_vmess_ws_link(echo_port: u16) -> Result<LinkHandles> {
     let _ = echo_port;
     let proto_port = pick_free_port().await;
     start_simple_link(
@@ -486,7 +494,7 @@ pub async fn start_vmess_ws_link(echo_port: u16) -> anyhow::Result<LinkHandles> 
 }
 
 /// s6：trojan + gRPC 双实例（security none，Go trojan 支持明文 TCP 承载）。
-pub async fn start_trojan_grpc_link(echo_port: u16) -> anyhow::Result<LinkHandles> {
+pub async fn start_trojan_grpc_link(echo_port: u16) -> Result<LinkHandles> {
     let _ = echo_port;
     let proto_port = pick_free_port().await;
     start_simple_link(
@@ -499,7 +507,7 @@ pub async fn start_trojan_grpc_link(echo_port: u16) -> anyhow::Result<LinkHandle
 }
 
 /// s7：shadowsocks(aes-256-gcm) + tcp 双实例。
-pub async fn start_ss_link(echo_port: u16) -> anyhow::Result<LinkHandles> {
+pub async fn start_ss_link(echo_port: u16) -> Result<LinkHandles> {
     let _ = echo_port;
     let proto_port = pick_free_port().await;
     start_simple_link(
@@ -512,7 +520,7 @@ pub async fn start_ss_link(echo_port: u16) -> anyhow::Result<LinkHandles> {
 }
 
 /// s8：tuic v5 双实例（QUIC 系；服务端 rcgen 自签，客户端 insecure）。
-pub async fn start_tuic_link(echo_port: u16) -> anyhow::Result<LinkHandles> {
+pub async fn start_tuic_link(echo_port: u16) -> Result<LinkHandles> {
     let _ = echo_port;
     let proto_port = pick_free_port().await;
     start_simple_link(
@@ -532,12 +540,12 @@ pub async fn start_tuic_link(echo_port: u16) -> anyhow::Result<LinkHandles> {
 /// 拒（os error 10061）。生产 crate 红线禁改，harness 侧按 anytls crate
 /// 自带 e2e 形态（dispatcher_loopback.rs）直挂 `AnytlsMockServer` 持有存活，
 /// anytls session + TLS 协议栈路径不变；客户端侧仍走 start_full 生产 dispatch。
-pub async fn start_anytls_link(_echo_port: u16) -> anyhow::Result<LinkHandles> {
+pub async fn start_anytls_link(_echo_port: u16) -> Result<LinkHandles> {
     let proto_port = pick_free_port().await;
     let socks_port = pick_free_port().await;
 
     let (cert_pem, key_pem) = xray_tls::certificate::generate_self_signed_cert(&["localhost"])
-        .map_err(|e| anyhow::anyhow!("anytls self-signed cert: {e}"))?;
+        .map_err(|e| StressError::Cert(format!("anytls self-signed cert: {e}")))?;
     let cert_der = crate::quic_loop::pem_to_der(&cert_pem)?;
     let key_der = crate::quic_loop::pem_to_der(&key_pem)?;
     let server_tls = rustls::ServerConfig::builder()
@@ -545,9 +553,9 @@ pub async fn start_anytls_link(_echo_port: u16) -> anyhow::Result<LinkHandles> {
         .with_single_cert(
             vec![rustls::pki_types::CertificateDer::from(cert_der)],
             rustls::pki_types::PrivateKeyDer::try_from(key_der)
-                .map_err(|e| anyhow::anyhow!("anytls private key der: {e}"))?,
+                .map_err(|e| StressError::KeyDer(format!("anytls private key der: {e}")))?,
         )
-        .map_err(|e| anyhow::anyhow!("anytls server rustls config: {e}"))?;
+        .map_err(|e| StressError::Rustls(format!("anytls server rustls config: {e}")))?;
     let server = xray_proxy_anytls::server::AnytlsMockServer::start_with_password(
         std::net::SocketAddr::from(([127, 0, 0, 1], proto_port)),
         tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_tls)),
@@ -555,7 +563,7 @@ pub async fn start_anytls_link(_echo_port: u16) -> anyhow::Result<LinkHandles> {
         Some(STRESS_ANYTLS_PASSWORD),
     )
     .await
-    .map_err(|e| anyhow::anyhow!("anytls server bind: {e}"))?;
+    .map_err(|e| StressError::Start(format!("anytls server bind: {e}")))?;
     // 持有 server 存活至 run 结束（abort 时随 task drop）
     let keep = tokio::spawn(async move {
         let _server = server;
@@ -565,14 +573,15 @@ pub async fn start_anytls_link(_echo_port: u16) -> anyhow::Result<LinkHandles> {
     let mut client_cfg = BuiltConfig::default();
     client_cfg.inbounds.push(socks_inbound(socks_port));
     client_cfg.outbounds.push(anytls_outbound(proto_port));
-    let (_ci, _co, ch) =
-        start_full(&client_cfg).await.map_err(|e| anyhow::anyhow!("anytls client: {e}"))?;
+    let (_ci, _co, ch) = start_full(&client_cfg)
+        .await
+        .map_err(|e| StressError::Start(format!("anytls client: {e}")))?;
     tokio::time::sleep(READY_WARMUP).await;
     Ok((socks_port, vec![keep], ch))
 }
 
 /// s10：vless + splithttp(mode=auto → packet-up) 双实例。
-pub async fn start_splithttp_link(echo_port: u16) -> anyhow::Result<LinkHandles> {
+pub async fn start_splithttp_link(echo_port: u16) -> Result<LinkHandles> {
     let _ = echo_port;
     let proto_port = pick_free_port().await;
     start_simple_link(
@@ -585,7 +594,7 @@ pub async fn start_splithttp_link(echo_port: u16) -> anyhow::Result<LinkHandles>
 }
 
 /// s11：http 代理入站 + http outbound（CONNECT 语义链路）双实例。
-pub async fn start_http_link(echo_port: u16) -> anyhow::Result<LinkHandles> {
+pub async fn start_http_link(echo_port: u16) -> Result<LinkHandles> {
     let _ = echo_port;
     let proto_port = pick_free_port().await;
     start_simple_link(
@@ -598,10 +607,10 @@ pub async fn start_http_link(echo_port: u16) -> anyhow::Result<LinkHandles> {
 }
 
 /// s12：vmess + splithttp H3（QUIC 承载，Go v26 对裸 QUIC transport 的替代形态）双实例。
-pub async fn start_vmess_h3_link(echo_port: u16) -> anyhow::Result<LinkHandles> {
+pub async fn start_vmess_h3_link(echo_port: u16) -> Result<LinkHandles> {
     let _ = echo_port;
     let (cert_pem, key_pem) = xray_tls::certificate::generate_self_signed_cert(&["localhost"])
-        .map_err(|e| anyhow::anyhow!("h3 self-signed cert: {e}"))?;
+        .map_err(|e| StressError::Cert(format!("h3 self-signed cert: {e}")))?;
     let (server_stream, client_stream) = splithttp_h3_streams(&cert_pem, &key_pem);
     let proto_port = pick_free_port().await;
     start_simple_link(
