@@ -94,3 +94,6 @@ stress-analysis-tmp/
 .codebase-memory/
 .omo/
 .atl/
+
+# 本地安全扫描工具二进制（osv-scanner 等；CI 侧直接下载官方 binary，不入库）2026-10-13
+tools/bin/
