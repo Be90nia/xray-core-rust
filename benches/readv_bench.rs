@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)] // bench 骨架标记（splice PPS CI ubuntu 补测），见 unimplemented! 行注释
 //! readv/拷贝热路径高并发基准（性能批：splice/readv 收益的高并发数据补证）
 //!
 //! 拓扑：真实 TCP loopback——不用 tokio `io::duplex`（DuplexStream 未覆写

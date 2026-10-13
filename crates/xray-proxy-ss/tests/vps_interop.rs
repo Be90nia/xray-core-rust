@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr))] // vps 互操作脚本化进度输出（stderr）
 //! SS-2022 VPS 互通测试。
 //!
 //! VPS #24: sg.yzswgroup.top:39101, 2022-blake3-aes-256-gcm

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)] // CLI 分配统计瞬时告警直写 stderr（初始化早期 tracing 未装）
 //! 计数分配器（框架支线 P0 护栏，oracle-framing-arch Phase 0）。
 //!
 //! `XRAY_ALLOC_STATS=1|true|on` 启用进程级 alloc/dealloc 次数与字节数统计；

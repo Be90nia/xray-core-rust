@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)] // CLI run -test 配置校验输出即产品接口
 //! `xray run` 命令——加载配置 + 启动 Xray 实例。
 //!
 //! 对应 Go `main/run.go`。

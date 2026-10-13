@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr))] // vps 互操作脚本化进度输出（stderr）
 //! VPS 互通测试: VLESS client → Go xray-core server → 目标
 //!
 //! 验证 Rust VLESS 客户端能连真实 Go 服务端。

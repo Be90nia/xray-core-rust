@@ -450,7 +450,7 @@ where
             dw_bytes += mb.len() as u64;
             if writer.write_multi_buffer(mb).await.is_err() {
                 if p7lm_trace {
-                    eprintln!("[P7LM-DW] write err at total={dw_bytes}B");
+                    tracing::warn!(target: "p7lm", total = dw_bytes, phase = "down_write_err", "");
                 }
                 break;
             }
@@ -464,14 +464,20 @@ where
         // close_notify" 断链截断（VPS netem r6 实锤滞留 65,383B =
         // sendable_tls 64KB 上限）。Go 无此坑：internalClose 链显式
         if p7lm_trace {
-            eprintln!("[P7LM-DW] drain done total={dw_bytes}B, shutdown_flush begin");
+            tracing::warn!(target: "p7lm", total = dw_bytes, phase = "drain_done_shutdown_flush_begin", "");
         }
         let flush_res = timeout(std::time::Duration::from_secs(3), writer.shutdown_flush()).await;
         if p7lm_trace {
             match &flush_res {
-                Ok(Ok(())) => eprintln!("[P7LM-DW] shutdown_flush ok total={dw_bytes}B"),
-                Ok(Err(e)) => eprintln!("[P7LM-DW] shutdown_flush ERR total={dw_bytes}B: {e}"),
-                Err(_) => eprintln!("[P7LM-DW] shutdown_flush TIMEOUT(3s) total={dw_bytes}B"),
+                Ok(Ok(())) => {
+                    tracing::warn!(target: "p7lm", total = dw_bytes, phase = "shutdown_flush_ok", "")
+                },
+                Ok(Err(e)) => {
+                    tracing::warn!(target: "p7lm", total = dw_bytes, phase = "shutdown_flush_err", err = %e)
+                },
+                Err(_) => {
+                    tracing::warn!(target: "p7lm", total = dw_bytes, phase = "shutdown_flush_timeout_3s", "")
+                },
             }
         }
         let _ = flush_res;

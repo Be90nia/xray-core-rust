@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)] // FRDBG/VCDBG 临时诊断埋点（VISIONMAC 战役），随战役收官票清除
 //! XTLS-Vision 连接包装（对应 Go `proxy/proxy.go` 的 VisionReader/VisionWriter）。
 //!
 //! 在 [`CommonConn`]（AEAD 加密层）之上提供 Vision padding：

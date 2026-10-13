@@ -1,3 +1,6 @@
+#![cfg_attr(test, allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr))] // 测试目标统一豁免（print 宏断言便利），生产禁令不受影响
+#![warn(clippy::print_stdout, clippy::print_stderr)]
+// 库代码禁直写控制台（诊断走 tracing）；豁免面见各文件 allow 与 clippy.toml 注释
 //! # xray-transport
 //!
 //! 传输层 IO 边界抽象。提供 `Link` / `Connection` / `Listener` / `Dialer` 核心

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)] // CLI api 子命令：JSON 响应打印即产品接口
 //! # API 命令 execute 函数
 //!
 //! 通过 gRPC 调用 commander API。Go 全部 23 个子命令已在 Rust 端接通真实 RPC

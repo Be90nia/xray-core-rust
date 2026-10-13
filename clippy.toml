@@ -15,3 +15,35 @@ type-complexity-threshold = 300
 
 # 文档要求
 # missing-docs-in-crate-items = true
+
+# ===== M6 ③ 禁用面扩容（bd Xray-core-rust-75rv）=====
+# 注：per-crate clippy.toml（xray-buf / xray-app-dispatcher / xray-transport-splithttp）
+# 会整体替换 root 配置，其阈值键在各自文件镜像维护。
+
+# std print 宏：库代码禁直写控制台（诊断走 tracing）。豁免面（均需文件级
+# #![allow] + 理由注释）：CLI bin 输出面、build.rs cargo 协议、压测 harness 进度行、
+# FRDBG/VCDBG 临时埋点（战役收官清除）。单元/集成测试经 crate lib.rs 顶部
+# #![cfg_attr(test, allow(clippy::disallowed_macros))] 统一豁免（xray-buf 先例）。
+# print 家族（println/print/eprintln/eprint）是编译器内建宏，disallowed-macros 无法
+# 解析路径（实测 unreachable）→ 走 print_stdout/print_stderr lint（下方 lib.rs 顶层
+# #![warn] 启用，CI -D warnings 收紧为 deny；测试经 cfg_attr + allow-print-in-tests 豁免）。
+allow-print-in-tests = true
+
+disallowed-macros = [
+    { path = "std::dbg", reason = "调试残留禁入库" },
+    { path = "core::todo", reason = "禁未完成标记入库（交付完整性铁律）" },
+    { path = "core::unimplemented", reason = "同 todo；骨架标记需文件级 allow + 补测计划" },
+]
+
+# LazyLock/parking_lot 新代码铁律（CLAUDE.md §新代码规范）：第三方懒初始化/锁原语不入依赖。
+# std::sync::{Mutex, RwLock} 存量 73 处 lock().unwrap() 迁移 parking_lot 属独立战役，本批不开禁。
+disallowed-types = [
+    { path = "once_cell::sync::Lazy", reason = "用 std::sync::LazyLock（本仓 MSRV=1.85 已稳定），once_cell 不入依赖" },
+    { path = "once_cell::sync::LazyLock", reason = "同上" },
+    { path = "once_cell::sync::OnceCell", reason = "用 std::sync::OnceLock 或 LazyLock" },
+]
+
+# unwrap 禁用分两步：本批先落测试豁免配置与机制（供后续 unwrap_used lint 启用）；
+# 生产侧 207 处 unwrap（其中 rustdoc 示例 ~40、std 锁毒化 unwrap ~30 随 parking_lot
+# 迁移自然消解）需独立战役——一次性开禁会诱发数据面行为改动，违反治理批护栏。
+allow-unwrap-in-tests = true

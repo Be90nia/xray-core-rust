@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)] // build script cargo 协议：println!("cargo:...") 为强制机制
 //! Build script for xray-geodata.
 //!
 //! Compiles `proto/geodat.proto` via prost-build, producing Rust types

@@ -1,3 +1,7 @@
+#![cfg_attr(test, allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr))]
+#![warn(clippy::print_stdout, clippy::print_stderr)]
+// 库代码禁直写控制台（诊断走 tracing）；豁免面见各文件 allow 与 clippy.toml 注释
+// 测试目标统一豁免（print 宏断言便利），生产禁令不受影响
 // 数据面分配纪律（P0 护栏，见本 crate clippy.toml）：测试编译单元统一豁免，
 // 断言扁平化属测试便利；生产代码禁令不受影响。
 #![cfg_attr(test, allow(clippy::disallowed_methods))]

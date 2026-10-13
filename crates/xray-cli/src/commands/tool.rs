@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)] // CLI tool 子命令：转换结果打印即产品接口
 //! # 工具子命令
 //!
 //! 对应 Go `main/commands/all/` 的 uuid / tls / convert 等命令。
