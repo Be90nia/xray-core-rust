@@ -41,12 +41,18 @@ allow = [
     "CC0-1.0",
     "0BSD",
     "BSL-1.0",
-    "Zlib-acknowledgement",
     "PSF-2.0",
-    "Unicode-2.0",
     "WTFPL",
     "NCSA",
     "curl",
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
+
+[[licenses.exceptions]]
+# socks5-impl 0.8.7 (GPL-3.0-or-later)：crates.io anytls 0.3.5 的传递依赖。
+# 用户拍板（2026-10-13）：xray.exe 仅自用不分发——GPL 义务由"分发"触发，
+# 自用不构成约束。本豁免仅为 CI 门禁放行；若未来改为对外分发再重开评估。
+allow = ["GPL-3.0-or-later"]
+name = "socks5-impl"
 
