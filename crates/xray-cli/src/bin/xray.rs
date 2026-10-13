@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)] // CLI 可执行入口：错误/结果直写 stderr 即产品接口
 //! # xray CLI 入口
 //!
 //! 对应 Go `main/main.go`。clap derive 替代 Go 自定义 `base.Command` 框架。

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)] // CLI version 输出即产品接口
 //! `xray version` 命令——输出完整版本声明。
 //!
 //! 对应 Go `main/version.go` 的 `printVersion`。

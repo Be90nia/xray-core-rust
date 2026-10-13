@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr))] // vps 互操作脚本化进度输出（stderr）
 //! VPS 互通测试: VMess+WS+TLS client → Go xray-core server → 目标
 //!
 //! VMess config: home.begonia92.top:2083 / WS path=/3dba3e56aa3a6ca5-vm / TLS

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)] // FRDBG 临时诊断埋点（VISIONMAC 战役），随战役收官票清除
 //! TLS 记录对齐读包装（record-framer）。
 //!
 //! rustls 的 deframer 每次读底层 socket 是贪婪的（`DeframerVecBuffer::read`

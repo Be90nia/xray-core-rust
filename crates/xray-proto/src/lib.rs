@@ -1,3 +1,7 @@
+#![cfg_attr(test, allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr))]
+#![warn(clippy::print_stdout, clippy::print_stderr)]
+// 库代码禁直写控制台（诊断走 tracing）；豁免面见各文件 allow 与 clippy.toml 注释
+// 测试目标统一豁免（print 宏断言便利），生产禁令不受影响
 // 生成代码（tonic server traits）经 async-trait 脱糖后带 #[must_use]，clippy 1.99 起
 // double_must_use 命中；仅本 crate（纯 include! 生成物）豁免。
 #![allow(clippy::double_must_use)]

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)] // CLI keys 子命令：密钥材料打印即产品接口
 //! # 密钥生成子命令
 //!
 //! 对应 Go `main/commands/all/` 的 `x25519` / `wg` / `mldsa65` / `mlkem768` / `vlessenc`。
