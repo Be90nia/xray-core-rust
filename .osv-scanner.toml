@@ -1,0 +1,26 @@
+# osv-scanner 配置：仅对根 Cargo.lock 生效（osv-scanner 语义：配置文件
+# 放在被扫描 lockfile 同目录，不下传子目录）。
+# 2026-10-13 lbxx 票：cargo-deny 面（deny.toml [advisories]）与 osv-scanner
+# 面（本文件）保持双口径零命中——同步豁免 4 条无 fix 库：
+#   paste 1.0.15（RUSTSEC-2024-0436 unmaintained）
+#   rsa 0.9.10（RUSTSEC-2023-0071 Marvin Attack timing sidechannel）
+#   rustls-pemfile 2.2.0（RUSTSEC-2025-0134 unmaintained）
+#   unsafe-libyaml 0.2.11（RUSTSEC-2024-0449 unmaintained）
+# 其余 6 条 lbxx 票已通过依赖 bump 消除（hickory 0.26.1→0.26.2 / lru 0.12→0.18
+# / event-listener 5.4.1→5.4.2），无 ignore 需求。
+# PR 上游跟踪见 reports/fix-lbxx.md §残余债。
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0436"
+reason = "paste 1.0.15 unmaintained, proc-macro only, no fix; tracked by reports/fix-lbxx.md"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2023-0071"
+reason = "rsa 0.9.10 Marvin Attack timing sidechannel, no fix; xmc Minecraft 伪装路径使用，替换需跨多调用点评估"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0134"
+reason = "rustls-pemfile 2.2.0 unmaintained (rustls/pemfile archived 2025-08); 迁 rustls-pki-types 0.10 跨多调用点，单票治理中"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0449"
+reason = "unsafe-libyaml 0.2.11 unmaintained (dtolnay 已停更); serde_yaml→yaml-rust2 迁移跨仓评估中"
