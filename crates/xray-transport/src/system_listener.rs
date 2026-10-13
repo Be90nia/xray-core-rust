@@ -104,6 +104,9 @@ impl DefaultListener {
 
     /// 带预监听 socket 选项的绑定路径。对应 Go `lc.SetMultipathTCP(true)` 之外的
     /// `applyInboundSocketOptions` 监听前分支（sockopt_linux.go:115-232）。
+    // 75rv deny(warnings) 隐性回归:iOS/Android 平台下 cfg(target_os) 三分支不进入,
+    // sockopt 形参不被消费 → 用 allow 抑制 unused_variables 警告
+    #[allow(unused_variables)]
     async fn bind_with_prelisten_sockopt(
         addr: SocketAddr,
         sockopt: &SocketOptions,
@@ -115,16 +118,16 @@ impl DefaultListener {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
-            let fd = socket.as_raw_fd();
+            let _fd = socket.as_raw_fd();
             #[cfg(target_os = "linux")]
             if sockopt.reuse_port {
                 crate::sockopt::linux::LinuxSockOpt { reuse_port: true, ..Default::default() }
-                    .apply(fd)?;
+                    .apply(_fd)?;
             }
             #[cfg(target_os = "freebsd")]
             if sockopt.reuse_port {
                 crate::sockopt::freebsd::FreebsdSockOpt { reuse_port: true, ..Default::default() }
-                    .apply(fd)?;
+                    .apply(_fd)?;
             }
             #[cfg(target_os = "macos")]
             if sockopt.reuse_port {
@@ -133,7 +136,7 @@ impl DefaultListener {
                     inbound: true,
                     ..Default::default()
                 }
-                .apply(fd)?;
+                .apply(_fd)?;
             }
         }
         socket.bind(&addr.into())?;
@@ -142,7 +145,9 @@ impl DefaultListener {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
-            let fd = socket.as_raw_fd();
+            // iOS/Android 平台下 cfg(target_os) 三分支不进入,fd 不被消费
+            // (75rv deny(warnings) 隐性回归)
+            let _fd = socket.as_raw_fd();
             #[cfg(target_os = "linux")]
             if sockopt.tcp_fast_open {
                 crate::sockopt::linux::LinuxSockOpt {
@@ -150,7 +155,7 @@ impl DefaultListener {
                     inbound: true,
                     ..Default::default()
                 }
-                .apply(fd)?;
+                .apply(_fd)?;
             }
             #[cfg(target_os = "freebsd")]
             if sockopt.tcp_fast_open {
@@ -159,7 +164,7 @@ impl DefaultListener {
                     inbound: true,
                     ..Default::default()
                 }
-                .apply(fd)?;
+                .apply(_fd)?;
             }
             #[cfg(target_os = "macos")]
             if sockopt.tcp_fast_open {
@@ -168,7 +173,7 @@ impl DefaultListener {
                     inbound: true,
                     ..Default::default()
                 }
-                .apply(fd)?;
+                .apply(_fd)?;
             }
         }
         #[cfg(target_os = "windows")]
@@ -622,6 +627,9 @@ enum UnixAddrSpec {
     /// 普通文件系统路径 + 可选八进制权限。
     Path(PathBuf, Option<u32>),
     /// Linux abstract socket 的 sun_path 字节（已含前导 `\0`）。
+    // 75rv deny(warnings) 隐性回归:仅 linux/android 在 abstract_sockaddr_path 内构造,
+    // iOS/其他 unix 平台 dead_code → 抑制 dead_code 警告
+    #[allow(dead_code)]
     Abstract(Vec<u8>),
 }
 
