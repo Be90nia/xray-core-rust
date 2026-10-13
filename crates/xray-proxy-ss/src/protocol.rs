@@ -175,16 +175,35 @@ pub fn encode_udp_packet(
     payload: &[u8],
 ) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
+    encode_udp_packet_into(account, address, port, payload, &mut buf)?;
+    Ok(buf)
+}
+
+/// [`encode_udp_packet`] 的 out-param 形态：帧写入 `out`（relay 热路径每包复用
+/// scratch，消掉每包 buf 增长 + iv collect 两次堆分配，AUDIT-PERF-003）。
+///
+/// # Errors
+/// - 透传 cipher 错误。
+pub fn encode_udp_packet_into(
+    account: &MemoryAccount,
+    address: &Address,
+    port: u16,
+    payload: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    out.clear();
     let iv_size = account.cipher.iv_size() as usize;
     if iv_size > 0 {
-        let iv: Vec<u8> = (0..iv_size).map(|_| rand::random()).collect();
-        buf.extend_from_slice(&iv);
+        let mut iv = [0u8; 32];
+        for b in &mut iv[..iv_size] {
+            *b = rand::random();
+        }
+        out.extend_from_slice(&iv[..iv_size]);
     }
-    write_address_port_ss(&mut buf, address, port);
-    buf.extend_from_slice(payload);
+    write_address_port_ss(out, address, port);
+    out.extend_from_slice(payload);
 
-    account.cipher.encode_packet(&account.key, &mut buf)?;
-    Ok(buf)
+    account.cipher.encode_packet(&account.key, out)
 }
 
 /// 解码 SS UDP 包。
@@ -202,6 +221,22 @@ pub fn decode_udp_packet(
     validator: &Validator,
     payload: &[u8],
 ) -> Result<(RequestHeader, Vec<u8>)> {
+    let mut data = Vec::new();
+    let header = decode_udp_packet_into(validator, payload, &mut data)?;
+    Ok((header, data))
+}
+
+/// [`decode_udp_packet`] 的 out-param 形态：payload 写入 `data_out`（relay
+/// 热路径每包复用 scratch，消掉 `plaintext[consumed..].to_vec()` 一次分配）。
+///
+/// # Errors
+/// - [`SsError::UserNotFound`]：未匹配到用户。
+/// - 透传 AEAD / cipher 错误。
+pub fn decode_udp_packet_into(
+    validator: &Validator,
+    payload: &[u8],
+    data_out: &mut Vec<u8>,
+) -> Result<RequestHeader> {
     let r = validator.get(payload, RequestCommand::Udp)?;
 
     // 取得 plaintext（去掉 IV 部分）
@@ -231,18 +266,16 @@ pub fn decode_udp_packet(
     }
 
     let (addr, port, consumed) = read_address_port_ss(&plaintext)?;
-    let data = plaintext[consumed..].to_vec();
+    data_out.clear();
+    data_out.extend_from_slice(&plaintext[consumed..]);
 
-    Ok((
-        RequestHeader {
-            version: crate::VERSION,
-            user: r.user,
-            command: RequestCommand::Udp,
-            address: addr,
-            port,
-        },
-        data,
-    ))
+    Ok(RequestHeader {
+        version: crate::VERSION,
+        user: r.user,
+        command: RequestCommand::Udp,
+        address: addr,
+        port,
+    })
 }
 
 fn account_is_aead(account: &MemoryAccount) -> bool {

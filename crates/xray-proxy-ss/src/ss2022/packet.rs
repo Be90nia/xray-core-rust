@@ -183,39 +183,38 @@ fn padding_len_for(port: u16, payload_len: usize) -> usize {
     }
 }
 
-/// 构造 client 帧明文区：type || ts || padLen || padding || addr || payload。
-fn build_client_plaintext(addr: &Address, port: u16, payload: &[u8]) -> Vec<u8> {
+/// 构造 client 帧明文区：type || ts || padLen || padding || addr || payload（追加写入 `out`）。
+fn build_client_plaintext_into(addr: &Address, port: u16, payload: &[u8], out: &mut Vec<u8>) {
     let pad = padding_len_for(port, payload.len());
-    let mut out = Vec::with_capacity(MIN_PLAINTEXT + pad + payload.len() + 4);
+    out.reserve(MIN_PLAINTEXT + pad + payload.len() + 4);
     out.push(HEADER_TYPE_CLIENT);
     out.extend_from_slice(&now_unix().to_be_bytes());
     out.extend_from_slice(&(pad as u16).to_be_bytes());
     out.resize(out.len() + pad, 0);
-    write_address_port_ss(&mut out, addr, port);
+    write_address_port_ss(out, addr, port);
     out.extend_from_slice(payload);
-    out
 }
 
-/// 构造 server 帧明文区：type || ts || clientSessionId || padLen || padding || addr || payload。
-/// Go `EncodeServerPacket` 回包恒 padding=0（两种 cipher 均如此），此处对齐。
-fn build_server_plaintext(
+/// 构造 server 帧明文区：type || ts || clientSessionId || padLen || padding || addr || payload
+/// （追加写入 `out`）。Go `EncodeServerPacket` 回包恒 padding=0（两种 cipher 均如此），此处对齐。
+fn build_server_plaintext_into(
     client_session_id: u64,
     addr: &Address,
     port: u16,
     payload: &[u8],
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(MIN_PLAINTEXT + 8 + payload.len() + 4);
+    out: &mut Vec<u8>,
+) {
+    out.reserve(MIN_PLAINTEXT + 8 + payload.len() + 4);
     out.push(HEADER_TYPE_SERVER);
     out.extend_from_slice(&now_unix().to_be_bytes());
     out.extend_from_slice(&client_session_id.to_be_bytes());
     out.extend_from_slice(&0u16.to_be_bytes());
-    write_address_port_ss(&mut out, addr, port);
+    write_address_port_ss(out, addr, port);
     out.extend_from_slice(payload);
-    out
 }
 
-/// 解析 client 帧明文区（server 侧）：type/ts/pad/addr/payload。
-fn parse_client_plaintext(mut plain: &[u8]) -> Result<(Address, u16, Vec<u8>)> {
+/// 解析 client 帧明文区（server 侧）：type/ts/pad/addr/payload；payload 写入 `payload_out`。
+fn parse_client_plaintext(mut plain: &[u8], payload_out: &mut Vec<u8>) -> Result<(Address, u16)> {
     if plain.len() < MIN_PLAINTEXT {
         return Err(SsError::InsufficientData(plain.len()));
     }
@@ -235,15 +234,18 @@ fn parse_client_plaintext(mut plain: &[u8]) -> Result<(Address, u16, Vec<u8>)> {
     }
     plain = &plain[pad..];
     let (addr, port, used) = read_address_port_ss(plain)?;
-    let payload = plain[used..].to_vec();
-    Ok((addr, port, payload))
+    payload_out.clear();
+    payload_out.extend_from_slice(&plain[used..]);
+    Ok((addr, port))
 }
 
-/// 解析 server 帧明文区（client 侧）：type/ts/clientSessionId/pad/addr/payload。
+/// 解析 server 帧明文区（client 侧）：type/ts/clientSessionId/pad/addr/payload；
+/// payload 写入 `payload_out`。
 fn parse_server_plaintext(
     mut plain: &[u8],
     expect_client_session_id: u64,
-) -> Result<(Address, u16, Vec<u8>)> {
+    payload_out: &mut Vec<u8>,
+) -> Result<(Address, u16)> {
     if plain.len() < MIN_PLAINTEXT + 8 {
         return Err(SsError::InsufficientData(plain.len()));
     }
@@ -267,8 +269,9 @@ fn parse_server_plaintext(
     }
     plain = &plain[pad..];
     let (addr, port, used) = read_address_port_ss(plain)?;
-    let payload = plain[used..].to_vec();
-    Ok((addr, port, payload))
+    payload_out.clear();
+    payload_out.extend_from_slice(&plain[used..]);
+    Ok((addr, port))
 }
 
 // ============================================================================
@@ -348,35 +351,48 @@ impl ClientUdpSession2022 {
     /// # Errors
     /// - [`SsError::AeadSeal`]：AEAD 加密失败。
     pub fn encode(&self, addr: &Address, port: u16, payload: &[u8]) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut plain = Vec::new();
+        self.encode_into(addr, port, payload, &mut out, &mut plain)?;
+        Ok(out)
+    }
+
+    /// [`Self::encode`] 的 out-param 形态：帧写入 `out`，明文组装用 `plain`
+    /// （relay 热路径双 scratch 容量流转，稳态零每包堆分配，AUDIT-PERF-003）。
+    ///
+    /// # Errors
+    /// - [`SsError::AeadSeal`]：AEAD 加密失败。
+    pub fn encode_into(
+        &self,
+        addr: &Address,
+        port: u16,
+        payload: &[u8],
+        out: &mut Vec<u8>,
+        plain: &mut Vec<u8>,
+    ) -> Result<()> {
         // atomic fetch_add 溢出 wrap：u64::MAX + 1 → 0（首包 id=0）
         let packet_id = self.packet_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         let hdr = pk_header(self.session_id, packet_id);
-        let plain = build_client_plaintext(addr, port, payload);
+        out.clear();
+        plain.clear();
 
         // chacha（SIP022 §4）：无 ECB 头、无 EIH；24B 随机 nonce 明文前缀 +
         // XChaCha(finalPSK) 直 seal，sessionId/packetId 在 AEAD 明文头
         //（Go EncodePacket chacha 分支）。
         if self.kind == CipherKind2022::ChaCha20Poly1305 {
             let nonce: [u8; UDP_CHACHA_NONCE_SIZE] = rand::random();
-            let mut sealed_plain = Vec::with_capacity(PACKET_HEADER_LEN + plain.len());
-            sealed_plain.extend_from_slice(&hdr);
-            sealed_plain.extend_from_slice(&plain);
-            let sealed = self
-                .cipher
-                .seal(&nonce, b"", &sealed_plain)
-                .map_err(|e| SsError::AeadSeal(e.to_string()))?;
-            let mut out = Vec::with_capacity(UDP_CHACHA_NONCE_SIZE + sealed.len());
             out.extend_from_slice(&nonce);
-            out.extend_from_slice(&sealed);
-            return Ok(out);
+            plain.extend_from_slice(&hdr);
+            build_client_plaintext_into(addr, port, payload, plain);
+            return self
+                .cipher
+                .seal_into(&nonce, b"", plain, out)
+                .map_err(|e| SsError::AeadSeal(e.to_string()));
         }
 
         let eih_count = self.psk_list.len().saturating_sub(1);
-        let sealed = self
-            .cipher
-            .seal(&hdr[4..16], b"", &plain)
-            .map_err(|e| SsError::AeadSeal(e.to_string()))?;
-        let mut out = Vec::with_capacity(PACKET_HEADER_LEN + eih_count * 16 + sealed.len());
+        // 包头 ECB 加密在最前（nonce 用明文头）
+        out.extend_from_slice(&ecb_block(self.kind, &self.psk_list[0], &hdr, true)?);
         // EIH：raw iPSK 直接作 ECB key（与 TCP 的 salt 派生不同）
         for i in 0..eih_count {
             let mut pt = psk_identity(&self.psk_list[i + 1]);
@@ -385,13 +401,11 @@ impl ClientUdpSession2022 {
             }
             out.extend_from_slice(&ecb_block(self.kind, &self.psk_list[i], &pt, true)?);
         }
+        build_client_plaintext_into(addr, port, payload, plain);
         // AEAD 密文体
-        out.extend_from_slice(&sealed);
-        // 包头 ECB 加密放最后（nonce 用明文头）
-        let enc_hdr = ecb_block(self.kind, &self.psk_list[0], &hdr, true)?;
-        let mut frame = enc_hdr.to_vec();
-        frame.append(&mut out);
-        Ok(frame)
+        self.cipher
+            .seal_into(&hdr[4..16], b"", plain, out)
+            .map_err(|e| SsError::AeadSeal(e.to_string()))
     }
 
     /// 解码一个 server → client UDP 帧，返回 (来源地址, 端口, payload)。
@@ -405,8 +419,19 @@ impl ClientUdpSession2022 {
     /// - [`SsError::Ss2022BadClientSessionId`]：clientSessionId 不匹配。
     /// - [`SsError::Ss2022TooManyServerSessions`]：60s 内第二次 server 会话轮换。
     pub fn decode(&self, pkt: &[u8]) -> Result<(Address, u16, Vec<u8>)> {
+        let mut payload = Vec::new();
+        let (addr, port) = self.decode_into(pkt, &mut payload)?;
+        Ok((addr, port, payload))
+    }
+
+    /// [`Self::decode`] 的 out-param 形态：payload 写入 `payload_out`（relay
+    /// 热路径每包复用 scratch，AUDIT-PERF-003）。
+    ///
+    /// # Errors
+    /// 与 [`Self::decode`] 一致。
+    pub fn decode_into(&self, pkt: &[u8], payload_out: &mut Vec<u8>) -> Result<(Address, u16)> {
         if self.kind == CipherKind2022::ChaCha20Poly1305 {
-            return self.decode_chacha(pkt);
+            return self.decode_chacha_into(pkt, payload_out);
         }
         if pkt.len() < PACKET_HEADER_LEN + MIN_PLAINTEXT {
             return Err(SsError::InsufficientData(pkt.len()));
@@ -429,12 +454,13 @@ impl ClientUdpSession2022 {
             packet_id,
             &pkt[PACKET_HEADER_LEN..],
             self.session_id,
+            payload_out,
         )
     }
 
     /// chacha 分支：整包一次 XChaCha(finalPSK) 解开，sessionId/packetId 在明文头
     /// （Go `ClientUDPSession.DecodePacket` chacha 分支；两代会话状态机与 AES 共用）。
-    fn decode_chacha(&self, pkt: &[u8]) -> Result<(Address, u16, Vec<u8>)> {
+    fn decode_chacha_into(&self, pkt: &[u8], payload_out: &mut Vec<u8>) -> Result<(Address, u16)> {
         if pkt.len() < UDP_CHACHA_NONCE_SIZE + PACKET_HEADER_LEN + MIN_PLAINTEXT {
             return Err(SsError::InsufficientData(pkt.len()));
         }
@@ -457,12 +483,14 @@ impl ClientUdpSession2022 {
             packet_id,
             &plain[PACKET_HEADER_LEN..],
             self.session_id,
+            payload_out,
         )
     }
 }
 
 /// server → client 帧解码收尾：重放窗口 check → 解密（chacha 传空 nonce，明文已
-/// 在调用方整包解开）→ 解析 → add（Go DecodePacket 两分支共用次序）。
+/// 在调用方整包解开）→ 解析 → add（Go DecodePacket 两分支共用次序）；
+/// payload 写入 `payload_out`。
 fn decode_server_frame(
     st: &mut RemoteState,
     slot: RemoteSlot,
@@ -470,28 +498,32 @@ fn decode_server_frame(
     packet_id: u64,
     body: &[u8],
     expect_client_session_id: u64,
-) -> Result<(Address, u16, Vec<u8>)> {
+    payload_out: &mut Vec<u8>,
+) -> Result<(Address, u16)> {
     {
         let window = slot_window(st, slot);
         if !window.check(packet_id) {
             return Err(SsError::Ss2022PacketIdNotUnique);
         }
     }
-    let plain = if nonce.is_empty() {
-        body.to_vec()
-    } else {
-        let cipher = match slot {
-            RemoteSlot::Previous => st.last_remote_cipher.as_deref(),
-            RemoteSlot::Current | RemoteSlot::New => st.remote_cipher.as_deref(),
-        };
-        let Some(cipher) = cipher else {
-            return Err(SsError::AeadOpen("remote cipher missing".into()));
-        };
-        cipher.open(nonce, b"", body).map_err(|e| SsError::AeadOpen(e.to_string()))?
+    // chacha（nonce 空）：body 已是明文，直接解析免二次拷贝；AES：open 产出
+    // owned 明文（pkt 借用不可变，open_in_place 不可用——cipher API 固有分配）
+    if nonce.is_empty() {
+        let r = parse_server_plaintext(body, expect_client_session_id, payload_out)?;
+        slot_window(st, slot).add(packet_id);
+        return Ok(r);
+    }
+    let cipher = match slot {
+        RemoteSlot::Previous => st.last_remote_cipher.as_deref(),
+        RemoteSlot::Current | RemoteSlot::New => st.remote_cipher.as_deref(),
     };
-    let decoded = parse_server_plaintext(&plain, expect_client_session_id)?;
+    let Some(cipher) = cipher else {
+        return Err(SsError::AeadOpen("remote cipher missing".into()));
+    };
+    let plain = cipher.open(nonce, b"", body).map_err(|e| SsError::AeadOpen(e.to_string()))?;
+    let r = parse_server_plaintext(&plain, expect_client_session_id, payload_out)?;
     slot_window(st, slot).add(packet_id);
-    Ok(decoded)
+    Ok(r)
 }
 
 fn slot_window(st: &mut RemoteState, slot: RemoteSlot) -> &mut SlidingWindow {
@@ -699,9 +731,10 @@ impl ServerUdpSession2022 {
                 .remote_cipher
                 .open(&hdr[4..16], b"", body)
                 .map_err(|e| SsError::AeadOpen(e.to_string()))?;
-            let r = parse_client_plaintext(&plain)?;
+            let mut payload = Vec::new();
+            let (addr, port) = parse_client_plaintext(&plain, &mut payload)?;
             w.add(packet_id);
-            Ok(r)
+            Ok((addr, port, payload))
         }
     }
 
@@ -719,9 +752,10 @@ impl ServerUdpSession2022 {
         if !w.check(packet_id) {
             return Err(SsError::Ss2022PacketIdNotUnique);
         }
-        let r = parse_client_plaintext(plain)?;
+        let mut payload = Vec::new();
+        let (addr, port) = parse_client_plaintext(plain, &mut payload)?;
         w.add(packet_id);
-        Ok(r)
+        Ok((addr, port, payload))
     }
 
     /// 编码 server → client 回包帧。
@@ -729,35 +763,49 @@ impl ServerUdpSession2022 {
     /// # Errors
     /// - [`SsError::AeadSeal`]：AEAD 加密失败。
     pub fn encode(&self, addr: &Address, port: u16, payload: &[u8]) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut plain = Vec::new();
+        self.encode_into(addr, port, payload, &mut out, &mut plain)?;
+        Ok(out)
+    }
+
+    /// [`Self::encode`] 的 out-param 形态：帧写入 `out`，明文组装用 `plain`
+    /// （relay 热路径双 scratch 容量流转，稳态零每包堆分配，AUDIT-PERF-003）。
+    ///
+    /// # Errors
+    /// - [`SsError::AeadSeal`]：AEAD 加密失败。
+    pub fn encode_into(
+        &self,
+        addr: &Address,
+        port: u16,
+        payload: &[u8],
+        out: &mut Vec<u8>,
+        plain: &mut Vec<u8>,
+    ) -> Result<()> {
         let packet_id = self.packet_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         let hdr = pk_header(self.session_id, packet_id);
-        let plain = build_server_plaintext(self.client_session_id, addr, port, payload);
+        out.clear();
+        plain.clear();
 
         // chacha：24B 随机 nonce 明文前缀 + XChaCha 直 seal，
         // serverSessionId/serverPacketId 在 AEAD 明文头（Go EncodeServerPacket）。
         if self.kind == CipherKind2022::ChaCha20Poly1305 {
             let nonce: [u8; UDP_CHACHA_NONCE_SIZE] = rand::random();
-            let mut sealed_plain = Vec::with_capacity(PACKET_HEADER_LEN + plain.len());
-            sealed_plain.extend_from_slice(&hdr);
-            sealed_plain.extend_from_slice(&plain);
-            let sealed = self
-                .cipher
-                .seal(&nonce, b"", &sealed_plain)
-                .map_err(|e| SsError::AeadSeal(e.to_string()))?;
-            let mut out = Vec::with_capacity(UDP_CHACHA_NONCE_SIZE + sealed.len());
             out.extend_from_slice(&nonce);
-            out.extend_from_slice(&sealed);
-            return Ok(out);
+            plain.extend_from_slice(&hdr);
+            build_server_plaintext_into(self.client_session_id, addr, port, payload, plain);
+            return self
+                .cipher
+                .seal_into(&nonce, b"", plain, out)
+                .map_err(|e| SsError::AeadSeal(e.to_string()));
         }
 
-        let sealed = self
-            .cipher
-            .seal(&hdr[4..16], b"", &plain)
-            .map_err(|e| SsError::AeadSeal(e.to_string()))?;
-        let enc_hdr = ecb_block(self.kind, &self.psk, &hdr, true)?;
-        let mut frame = enc_hdr.to_vec();
-        frame.extend_from_slice(&sealed);
-        Ok(frame)
+        // 包头 ECB 加密在最前（nonce 用明文头）
+        out.extend_from_slice(&ecb_block(self.kind, &self.psk, &hdr, true)?);
+        build_server_plaintext_into(self.client_session_id, addr, port, payload, plain);
+        self.cipher
+            .seal_into(&hdr[4..16], b"", plain, out)
+            .map_err(|e| SsError::AeadSeal(e.to_string()))
     }
 }
 
