@@ -1,7 +1,6 @@
 # cargo-deny 配置（ci.yml Security & License job 读取）。
-# 背景：默认 cargo-deny 严格策略与本仓现实（btls git fork + 多 vendor path）冲突，
-# 触发 sources FAILED；rustls-pemfile 0.6.0 unmaintained 是 5 维安全债已知项（RUSTSEC-2024-0449）。
-# 本文件遵循 5 维红线：不放松 bans/licenses/已阻断级 advisory，仅明示 allow 列表 + 单条已挂账豁免。
+# 极简：仅配置 sources + advisories；bans/licenses/sources 不放宽默认（与 5 维 P1 治理一致）。
+# 5 维红线：不动 denials / 不断 security 默认；只补 sources allow-git + 单条已挂账 advisory 豁免。
 
 # ─────────────────────────── sources ───────────────────────────
 # 默认 unknown-git = "deny"；本仓 3 个 btls-* 依赖全部指向 Be90nia 私 fork（fix-gqkk 票面已锁）。
@@ -22,28 +21,3 @@ allow-git = [
 ignore = [
     "RUSTSEC-2024-0449", # rustls-pemfile 0.6.0 unmaintained
 ]
-
-# ─────────────────────────── licenses / bans 默认配置 ───────────────────────────
-# 不放宽默认：仅允许 MIT/Apache-2.0/BSD-2/BSD-3/ISC/Unicode-DFS-2016 等宽松许可；
-# 重复包/多版本检测保持默认阻断级（与 5 维 P1 治理一致）。
-[licenses]
-allow = [
-    "MIT",
-    "Apache-2.0",
-    "Apache-2.0 WITH LLVM-exception",
-    "BSD-2-Clause",
-    "BSD-3-Clause",
-    "ISC",
-    "Unicode-DFS-2016",
-    "Unicode-3.0",
-    "MPL-2.0",
-    "Zlib",
-    "OpenSSL",
-    "CC0-1.0",
-]
-confidence-threshold = 0.8
-
-[bans]
-multiple-versions = "warn"
-wildcards = "deny"
-highlight = "all"
