@@ -1,11 +1,14 @@
-//! # xdns 客户端 transport（对应 Go `xdns/client.go`）
+//! # xdns 客户端 transport（对应 Go `xdns/client.go`，v26.9.30 重构版）
 //!
-//! `XdnsConnClient` 包装底层 UDP conn，实现 `UdpIo`：
-//! - send_to：把 payload 编码为 DNS 查询 wire format，发往 resolver。
-//! - recv_from：从 resolver 收到的 DNS 响应中解码 payload。
+//! payload 编码为 DNS 查询发往 resolver（经 finalmask 隧道）：
+//! - poll 包（17B）：clientID[0]|qtype标识 + [8]=8 + 8B 随机；
+//! - 小包（≤cap-12）：[8]=3 + 3B 随机 + payload；
+//! - 分片（≤255×(cap-15)）：[8]=3|0xC0 + [12]fragID/[13]idx/[14]n + 数据。
 //!
-//! 隧道协议：payload → base32 编码 → 切成 ≤63 字节 label → 拼到 domain 前 →
-//! 构造 DNS 查询；轮询包（payload 空）用更长 padding 区分。
+//! 响应按 [len2|0xC0][bytes] 帧拆包投递上层。
+//!
+//! bd 2ktp ④：对齐 Xray-core fc8f8a45；resolver 仅 UDP 形态（Rust finalmask
+//! 栈为 UDP-only，TCP resolver 配置期报错，见 mod.rs）。
 
 use std::{
     io,
@@ -22,433 +25,369 @@ use rand::RngCore;
 use tokio::sync::{Mutex, mpsc};
 
 use super::{
-    UdpIo,
-    base32::encode_lower,
-    dns::{CLASS_IN, Message, Name, Question, RR, RR_TYPE_OPT, message_from_wire_format},
-    record_transport::decode_response_payload,
+    Config, ResolverConfig, UdpIo,
+    dns::{CLASS_IN, Message, Question, RR, RR_TYPE_OPT, message_from_wire_format},
+    domain::{Domain, type_map},
+    resp::Resp,
 };
 
-/// payload 长度上限（对应 Go encode 中的 224 上限校验）。
-const PAYLOAD_MAX: usize = 224;
-
-const NUM_PADDING: u8 = 3;
-const NUM_PADDING_FOR_POLL: u8 = 8;
 const INIT_POLL_DELAY: Duration = Duration::from_millis(500);
-const READ_QUEUE_CAP: usize = 256;
-const WRITE_QUEUE_CAP: usize = 256;
+const MAX_POLL_DELAY: Duration = Duration::from_secs(10);
+const SEND_QUEUE_CAP: usize = 16;
+const UDP_READ_BUF: usize = 4096;
 
-/// 把一段 payload 编码为 DNS 查询 wire format。
-///
-/// 对应 Go `encode`。
-pub(crate) fn encode(
-    p: &[u8],
-    client_id: &[u8; 8],
-    domain: &Name,
-    qtype: u16,
-) -> io::Result<Vec<u8>> {
-    if p.len() >= PAYLOAD_MAX {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "payload too long for xdns encoding",
-        ));
-    }
-
-    let n = if p.is_empty() { NUM_PADDING_FOR_POLL } else { NUM_PADDING };
-    let mut decoded: Vec<u8> = Vec::with_capacity(8 + 1 + n as usize + 1 + p.len());
-    decoded.extend_from_slice(client_id);
-    decoded.push(224 + n);
-    let mut padding = vec![0u8; n as usize];
-    rand::rng().fill_bytes(&mut padding);
-    decoded.extend_from_slice(&padding);
-    if !p.is_empty() {
-        decoded.push(p.len() as u8);
-        decoded.extend_from_slice(p);
-    }
-
-    let encoded = encode_lower(&decoded);
-    let mut labels = chunks(&encoded, 63);
-    labels.extend_from_slice(&domain.labels);
-    let name = Name::new(labels)?;
-
-    let id: u16 = (rand::rng().next_u32() & 0xffff) as u16;
-    let query = Message {
-        id,
-        flags: 0x0100, // RD=1
-        question: vec![Question { name, qtype, qclass: CLASS_IN }],
-        answer: vec![],
-        authority: vec![],
-        additional: vec![RR {
-            name: Name::default(),
-            rtype: RR_TYPE_OPT,
-            rclass: 4096,
-            ttl: 0,
-            data: vec![],
-        }],
-    };
-
-    query.wire_format()
-}
-
-/// 把字节切片按 n 字节切分为多片。
-///
-/// 对应 Go `chunks`。
-pub(crate) fn chunks(p: &[u8], n: usize) -> Vec<Vec<u8>> {
-    let mut result = Vec::new();
-    let mut start = 0;
-    while start < p.len() {
-        let end = (start + n).min(p.len());
-        result.push(p[start..end].to_vec());
-        start = end;
-    }
-    result
-}
-
-/// 从 payload 流中读取一个 `[len(2 BE)][bytes]` 包。
-fn next_packet(r: &mut &[u8]) -> Option<Vec<u8>> {
-    if r.len() < 2 {
-        return None;
-    }
-    let n = u16::from_be_bytes([r[0], r[1]]) as usize;
-    *r = &r[2..];
-    if r.len() < n {
-        return None;
-    }
-    let p = r[..n].to_vec();
-    *r = &r[n..];
-    Some(p)
-}
-
-/// 从 DNS 响应提取 payload 流：校验 QR=1 / RCODE=0 / answer.name 匹配已知 domain。
-///
-/// 对应 Go `dnsResponsePayload`。
-pub(crate) fn dns_response_payload(resp: &Message, domains: &[Name]) -> Option<Vec<u8>> {
-    if resp.flags & 0x8000 != 0x8000 {
-        return None;
-    }
-    if resp.flags & 0x000f != 0 {
-        return None;
-    }
-    if resp.answer.is_empty() {
-        return None;
-    }
-    for answer in &resp.answer {
-        let mut matched = false;
-        for domain in domains {
-            if answer.name.trim_suffix(domain).1 {
-                matched = true;
-                break;
-            }
-        }
-        if !matched {
-            return None;
-        }
-    }
-    decode_response_payload(&resp.answer)
-}
-
-/// 内部数据包。
+/// 内部数据包：payload + 来源 resolver 地址标签。
 struct Packet {
     data: Vec<u8>,
-    addr: Option<SocketAddr>,
+    addr: SocketAddr,
 }
 
-/// resolver 共享状态。
-struct ResolverState {
-    addrs: Vec<SocketAddr>,
-    types: Vec<u16>,
-    domains: Vec<Name>,
-    sends: Vec<Arc<AtomicU32>>,
-    idx: AtomicU32,
+/// 客户端共享状态。
+struct ClientState {
+    client_id: [u8; 8],
+    domains: Vec<Domain>,
+    resolvers: Vec<SocketAddr>,
+    /// 各 resolver 连续未命中计数（Go `resolverSends`）。
+    sends: Vec<AtomicU32>,
+    /// 轮转游标（Go `resolverIndex`）。
+    index: AtomicU32,
+    /// 分片 ID 计数（Go `fragID`）。
+    frag_id: AtomicU32,
+    extra_poll: i32,
 }
 
 /// xdns 客户端：包装底层 UDP conn，按 DNS-over-UDP 隧道协议转发。
 pub(crate) struct XdnsConnClient {
-    inner: Arc<dyn UdpIo>,
-    state: Arc<ResolverState>,
-    client_id: Arc<[u8; 8]>,
     closed: Arc<AtomicBool>,
-    write_tx: mpsc::Sender<Packet>,
+    write_tx: mpsc::Sender<Vec<u8>>,
     read_rx: Mutex<mpsc::Receiver<Packet>>,
 }
 
 impl XdnsConnClient {
-    pub(crate) fn new(inner: Box<dyn UdpIo>, resolvers: Vec<String>) -> io::Result<Self> {
-        if resolvers.is_empty() {
+    pub(crate) fn new(inner: Arc<dyn UdpIo>, config: &Config) -> io::Result<Self> {
+        if config.domains.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty domains"));
+        }
+        if config.resolvers.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty resolvers"));
         }
-
-        let mut domains = Vec::new();
-        let mut types = Vec::new();
-        let mut addrs = Vec::new();
-        let mut sends = Vec::new();
-        for rs in &resolvers {
-            let (name, server, rr_type) = super::spec::parse_resolver(rs)?;
-            let addr: SocketAddr = server.parse().map_err(|e| {
+        if config.extra_poll < 0 || config.extra_poll > 3 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "extraPoll < 0 || > 3"));
+        }
+        let mut domains = Vec::with_capacity(config.domains.len());
+        for d in &config.domains {
+            let edns0 = u16::try_from(d.edns0)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "xdns: invalid edns0"))?;
+            domains.push(Domain::new(
+                &d.name,
+                d.len_limit as usize,
+                d.label_limit as usize,
+                &d.types,
+                edns0,
+            )?);
+        }
+        let mut resolvers = Vec::with_capacity(config.resolvers.len());
+        for r in &config.resolvers {
+            let ResolverConfig::Udp { addr } = r else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "xdns: TCP resolver not supported (UDP-only stack)",
+                ));
+            };
+            let addr: SocketAddr = addr.parse().map_err(|e| {
                 io::Error::new(io::ErrorKind::InvalidInput, format!("invalid resolver addr: {e}"))
             })?;
-            domains.push(name);
-            types.push(rr_type);
-            addrs.push(addr);
-            sends.push(Arc::new(AtomicU32::new(0)));
+            resolvers.push(addr);
         }
 
         let mut client_id = [0u8; 8];
         rand::rng().fill_bytes(&mut client_id);
+        client_id[0] &= 0xFC;
 
-        let state =
-            Arc::new(ResolverState { addrs, types, domains, sends, idx: AtomicU32::new(0) });
+        let state = Arc::new(ClientState {
+            client_id,
+            sends: (0..resolvers.len()).map(|_| AtomicU32::new(0)).collect(),
+            domains,
+            resolvers,
+            index: AtomicU32::new(0),
+            frag_id: AtomicU32::new(0),
+            extra_poll: config.extra_poll,
+        });
 
-        let (write_tx, write_rx) = mpsc::channel(WRITE_QUEUE_CAP);
-        let (poll_tx, poll_rx) = mpsc::channel(super::POLL_LIMIT);
-        let (read_tx, read_rx) = mpsc::channel(READ_QUEUE_CAP);
+        let (write_tx, write_rx) = mpsc::channel(SEND_QUEUE_CAP);
+        let (poll_tx, poll_rx) = mpsc::channel::<()>(super::POLL_LIMIT);
+        // tokio mpsc 无 0 容量：cap=1 + send().await 等效 Go 无缓冲阻塞语义
+        let (read_tx, read_rx) = mpsc::channel::<Packet>(1);
 
         let closed = Arc::new(AtomicBool::new(false));
-        let inner_arc: Arc<dyn UdpIo> = Arc::from(inner);
 
-        tokio::spawn(recv_loop(state.clone(), inner_arc.clone(), closed.clone(), read_tx, poll_tx));
-        let state_clone = state.clone();
-        let inner_clone = inner_arc.clone();
-        tokio::spawn(send_loop(
-            state_clone,
-            inner_clone,
-            write_rx,
-            poll_rx,
-            closed.clone(),
-            Arc::new(client_id),
-        ));
+        tokio::spawn(recv_loop(state.clone(), inner.clone(), closed.clone(), read_tx, poll_tx));
+        tokio::spawn(send_loop(state.clone(), inner, closed.clone(), write_rx, poll_rx));
 
-        Ok(Self {
-            inner: inner_arc,
-            state,
-            client_id: Arc::new(client_id),
-            closed,
-            write_tx,
-            read_rx: tokio::sync::Mutex::new(read_rx),
-        })
+        Ok(Self { closed, write_tx, read_rx: Mutex::new(read_rx) })
     }
 }
 
-/// recv loop：读 UDP → 解码 DNS 响应 → 拆分 payload 包 → 入 read_queue。
+/// 响应读取：校验 + Resp 解码 + [len2|0xC0] 帧拆包，对应 Go `xdnsClient.read`。
+/// 返回是否有有效包投递。
+async fn client_read(
+    state: &ClientState,
+    buf: &[u8],
+    addr: SocketAddr,
+    read_tx: &mpsc::Sender<Packet>,
+) -> bool {
+    let Ok(msg) = message_from_wire_format(buf) else { return false };
+    // Response + 非 Truncated + RCodeSuccess + 单 question
+    if msg.flags & 0x8000 == 0
+        || msg.flags & 0x0200 != 0
+        || msg.flags & 0x000f != 0
+        || msg.question.len() != 1
+    {
+        return false;
+    }
+
+    let Some(domain) = state.domains.iter().find(|d| d.is_domain(&msg.question[0].name)) else {
+        return false;
+    };
+    if !domain.has_type(msg.question[0].qtype) {
+        return false;
+    }
+
+    // 上层（server）回显的 EDNS0 宣告值（additional OPT class）
+    let _ = msg.additional.iter().find(|rr| rr.rtype == RR_TYPE_OPT).map(|rr| rr.rclass);
+
+    let resp = Resp::new(msg, domain.clone(), 0);
+    let payload = resp.decode();
+
+    // [len2|0xC0 终帧标志][bytes] 帧拆包（Go read 内联逻辑，含 len 超界清空 quirk）
+    let mut bs: Vec<Vec<u8>> = Vec::new();
+    let mut b: &[u8] = &payload;
+    while b.len() > 1 {
+        let last = b[0] & 0xC0 == 0xC0;
+        let length = ((b[0] & 0x3F) as usize) << 8 | b[1] as usize;
+        b = &b[2..];
+        if length > b.len() {
+            bs.clear();
+            break;
+        }
+        bs.push(b[..length].to_vec());
+        if last {
+            break;
+        }
+        b = &b[length..];
+        if b.len() < 2 {
+            bs.clear();
+        }
+    }
+
+    let packet_count = bs.len();
+    for data in bs {
+        if read_tx.send(Packet { data, addr }).await.is_err() {
+            return true; // 读端已关（关闭中）
+        }
+    }
+    packet_count > 0
+}
+
+/// recv 循环：读隧道 UDP → 解码响应 → 投递（对应 Go `recv` goroutine 组）。
 async fn recv_loop(
-    state: Arc<ResolverState>,
+    state: Arc<ClientState>,
     inner: Arc<dyn UdpIo>,
     closed: Arc<AtomicBool>,
     read_tx: mpsc::Sender<Packet>,
     poll_tx: mpsc::Sender<()>,
 ) {
-    let mut buf = vec![0u8; super::UDP_SIZE];
+    let mut buf = vec![0u8; UDP_READ_BUF];
     loop {
         if closed.load(Ordering::Relaxed) {
-            break;
+            return;
         }
         let (n, addr) = match inner.recv_from(&mut buf).await {
             Ok(v) => v,
             Err(_) => continue,
         };
-
-        let Some(send_idx) = find_resolver(&state, addr) else {
+        let Some(idx) = state.resolvers.iter().position(|a| *a == addr) else {
             continue;
         };
-
-        let resp = match message_from_wire_format(&buf[..n]) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        let Some(payload) = dns_response_payload(&resp, &state.domains) else {
-            continue;
-        };
-
-        let mut reader = &payload[..];
-        let mut any_packet = false;
-        while let Some(p) = next_packet(&mut reader) {
-            any_packet = true;
-            let pkt = Packet { data: p, addr: Some(addr) };
-            // 队列满则丢弃（与 Go default case 一致）
-            let _ = read_tx.try_send(pkt);
-        }
-
-        if any_packet {
-            state.sends[send_idx].store(0, Ordering::Relaxed);
+        if client_read(&state, &buf[..n], addr, &read_tx).await {
+            state.sends[idx].store(0, Ordering::Relaxed);
             let _ = poll_tx.try_send(());
         }
     }
 }
 
-/// 在 resolver 列表中找到对应 addr 的索引。
-fn find_resolver(state: &ResolverState, addr: SocketAddr) -> Option<usize> {
-    state.addrs.iter().position(|a| *a == addr)
+/// 构造查询 message 并按轮转选择 resolver 发送，对应 Go `sendMsg`。
+async fn send_msg(
+    state: &ClientState,
+    inner: &dyn UdpIo,
+    p: &[u8],
+    domain: &Domain,
+    qtype: u16,
+) -> io::Result<()> {
+    let name = domain.encode(p)?;
+    let mut msg = Message {
+        id: (rand::rng().next_u32() & 0xffff) as u16,
+        flags: 0x0100, // RD=1（Go Header.RecursionDesired）
+        question: vec![Question { name, qtype, qclass: CLASS_IN }],
+        answer: vec![],
+        authority: vec![],
+        additional: vec![],
+    };
+    if domain.edns0() > 0 {
+        msg.additional.push(RR {
+            name: super::dns::Name::default(),
+            rtype: RR_TYPE_OPT,
+            rclass: domain.edns0(),
+            ttl: 0,
+            data: Vec::new(),
+        });
+    }
+    let pack = msg.wire_format()?;
+    // Go: pack 后覆写随机 ID 两字节——等价于 id 直接随机（上面已随机）
+
+    // resolver 轮转：从 index 出发找首个 sends[i] < cur，发送仍用 index
+    let n = state.resolvers.len();
+    let index = state.index.load(Ordering::Relaxed) as usize % n;
+    let cur = state.sends[index].fetch_add(1, Ordering::Relaxed) + 1;
+    let mut i = index;
+    loop {
+        i = (i + 1) % n;
+        if i == index {
+            break;
+        }
+        if cur > state.sends[i].load(Ordering::Relaxed) {
+            break;
+        }
+    }
+    state.index.store(i as u32, Ordering::Relaxed);
+    inner.send_to(&pack, state.resolvers[index]).await.map(|_| ())
 }
 
-/// send loop：writeQueue / pollChan / pollTimer 多路 select。
+/// 单次 send：随机 domain/qtype，按 poll/small/frag 三形态编码，对应 Go `send`。
+async fn send_once(state: &ClientState, inner: &dyn UdpIo, p: &[u8]) -> io::Result<()> {
+    let n_domains = state.domains.len();
+    let domain_idx = if n_domains == 1 { 0 } else { rand::rng().next_u32() as usize % n_domains };
+    let domain = &state.domains[domain_idx];
+    let n_types = domain.types_len();
+    let qtype = if n_types == 1 {
+        domain.qtype_at(0)
+    } else {
+        domain.qtype_at(rand::rng().next_u32() as usize % n_types)
+    };
+
+    let mut data = vec![0u8; 255];
+    data[..8].copy_from_slice(&state.client_id);
+    data[0] |= type_map(qtype)?;
+
+    if p.is_empty() {
+        // poll：17B = clientID + flag + 8B 随机
+        data[8] = 8;
+        rand::rng().fill_bytes(&mut data[9..17]);
+        return send_msg(state, inner, &data[..17], domain, qtype).await;
+    }
+
+    if p.len() <= domain.cap - 12 {
+        // 小包：clientID + flag + [8]=3 + 3B 随机 + payload
+        data[8] = 3;
+        rand::rng().fill_bytes(&mut data[9..12]);
+        data[12..12 + p.len()].copy_from_slice(p);
+        return send_msg(state, inner, &data[..12 + p.len()], domain, qtype).await;
+    }
+
+    if p.len() <= 255 * (domain.cap - 15) {
+        // 分片：[12]fragID [13]idx [14]fragN + 数据块（≤cap-15）
+        data[8] = 3 | 0xC0;
+        rand::rng().fill_bytes(&mut data[9..12]);
+        let frag_id = state.frag_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1) as u8;
+        let unit = domain.cap - 15;
+        let frag_n = p.len().div_ceil(unit);
+        let mut rest = p;
+        for i in 0..frag_n {
+            data[12] = frag_id;
+            data[13] = i as u8;
+            data[14] = frag_n as u8;
+            let size = rest.len().min(unit);
+            data[15..15 + size].copy_from_slice(&rest[..size]);
+            send_msg(state, inner, &data[..15 + size], domain, qtype).await?;
+            rest = &rest[size..];
+        }
+        return Ok(());
+    }
+
+    tracing::error!(len = p.len(), "xdns client: payload size exceeds domain capacity");
+    Ok(())
+}
+
+/// send 循环：writeCh / pollCh / pollTimer 多路驱动，对应 Go `send` goroutine。
 async fn send_loop(
-    state: Arc<ResolverState>,
+    state: Arc<ClientState>,
     inner: Arc<dyn UdpIo>,
-    mut write_rx: mpsc::Receiver<Packet>,
-    mut poll_rx: mpsc::Receiver<()>,
     closed: Arc<AtomicBool>,
-    client_id: Arc<[u8; 8]>,
+    mut write_rx: mpsc::Receiver<Vec<u8>>,
+    mut poll_rx: mpsc::Receiver<()>,
 ) {
-    let mut poll_delay = INIT_POLL_DELAY;
+    let mut delay = INIT_POLL_DELAY;
     loop {
         if closed.load(Ordering::Relaxed) {
             return;
         }
-
-        let (pkt, timer_expired) = tokio::select! {
-            biased;
-            p = write_rx.recv() => (p, false),
-            _ = poll_rx.recv() => (None, false),
-            _ = tokio::time::sleep(poll_delay) => (None, true),
+        let mut timeout = false;
+        let pkt: Option<Vec<u8>> = tokio::select! {
+            p = write_rx.recv() => match p {
+                Some(p) => Some(p),
+                None => return, // 写端关闭（连接关闭）
+            },
+            _ = poll_rx.recv() => None,
+            _ = tokio::time::sleep(delay) => {
+                timeout = true;
+                None
+            },
         };
 
-        let data = if let Some(p) = pkt {
-            let _ = poll_rx.try_recv();
-            p.data
-        } else {
-            let idx = state.idx.load(Ordering::Relaxed) as usize % state.addrs.len();
-            match encode(&[], &client_id, &state.domains[idx], state.types[idx]) {
-                Ok(b) => b,
-                Err(_) => continue,
-            }
-        };
-
-        poll_delay = if timer_expired {
-            (poll_delay.mul_f32(2.0)).min(super::MAX_POLL_DELAY)
-        } else {
-            INIT_POLL_DELAY
-        };
-
-        let cur = pick_next_resolver(&state);
-        let _ = state.sends[cur].fetch_add(1, Ordering::Relaxed);
-        let _ = inner.send_to(&data, state.addrs[cur]).await;
-    }
-}
-
-/// 从当前 resolver 开始，找到第一个 send 计数 < cur_send 的 resolver。
-fn pick_next_resolver(state: &ResolverState) -> usize {
-    let cur = state.idx.fetch_add(1, Ordering::Relaxed) as usize % state.addrs.len();
-    let cur_send = state.sends[cur].load(Ordering::Relaxed);
-    for i in 1..state.addrs.len() {
-        let idx = (cur + i) % state.addrs.len();
-        if state.sends[idx].load(Ordering::Relaxed) < cur_send {
-            return idx;
+        // 有真实 payload 时排空积压 poll 通知（Go select default 排空 poolCh）
+        if pkt.as_ref().is_some_and(|p| !p.is_empty()) {
+            while poll_rx.try_recv().is_ok() {}
         }
+
+        if let Err(e) = send_once(&state, inner.as_ref(), pkt.as_deref().unwrap_or(&[])).await {
+            tracing::debug!(error = %e, "xdns client: send failed");
+        }
+        // extraPoll：真实包后追加的空 poll 包
+        for _ in 0..state.extra_poll {
+            if let Err(e) = send_once(&state, inner.as_ref(), &[]).await {
+                tracing::debug!(error = %e, "xdns client: extra poll send failed");
+            }
+        }
+
+        delay = if timeout { (delay * 2).min(MAX_POLL_DELAY) } else { INIT_POLL_DELAY };
     }
-    cur
 }
 
 #[async_trait]
 impl UdpIo for XdnsConnClient {
-    async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
+    async fn send_to(&self, buf: &[u8], _addr: SocketAddr) -> io::Result<usize> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(io::Error::other("xdns client closed"));
         }
-
-        let idx = self.state.idx.load(Ordering::Relaxed) as usize % self.state.addrs.len();
-        let encoded =
-            encode(buf, &self.client_id, &self.state.domains[idx], self.state.types[idx])?;
-        let pkt = Packet { data: encoded, addr: Some(addr) };
-        let _ = self.write_tx.try_send(pkt);
+        if buf.is_empty() || buf.len() > UDP_READ_BUF {
+            tracing::error!(len = buf.len(), "xdns client: err size");
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "err size"));
+        }
+        let _ = self.write_tx.try_send(buf.to_vec());
         Ok(buf.len())
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let pkt = {
-            let mut rx = self.read_rx.lock().await;
-            rx.recv().await
-        };
+        let pkt = { self.read_rx.lock().await.recv().await };
         let Some(pkt) = pkt else {
             return Err(io::Error::other("xdns client closed"));
         };
         let n = pkt.data.len().min(buf.len());
         buf[..n].copy_from_slice(&pkt.data[..n]);
-        let addr = pkt.addr.unwrap_or_else(|| SocketAddr::from(([0u8, 0, 0, 0], 0)));
-        Ok((n, addr))
+        Ok((n, pkt.addr))
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.local_addr()
-    }
-}
-
-impl Drop for XdnsConnClient {
-    fn drop(&mut self) {
-        self.closed.store(true, Ordering::Relaxed);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::finalmask::xdns::base32::decode_upper;
-
-    #[test]
-    fn chunks_basic() {
-        let data = b"abcdef";
-        let result = chunks(data, 2);
-        assert_eq!(result, vec![vec![b'a', b'b'], vec![b'c', b'd'], vec![b'e', b'f']]);
-
-        let data = b"abc";
-        let result = chunks(data, 5);
-        assert_eq!(result, vec![vec![b'a', b'b', b'c']]);
-
-        let result = chunks(b"", 5);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn encode_payload_too_long_rejected() {
-        let client_id = [0u8; 8];
-        let domain = Name::parse("t.example.com").unwrap();
-        let big = vec![0u8; PAYLOAD_MAX];
-        let err = encode(&big, &client_id, &domain, super::super::dns::RR_TYPE_TXT).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-    }
-
-    #[test]
-    fn encode_empty_poll_packet_produces_valid_message() {
-        let client_id = [1, 2, 3, 4, 5, 6, 7, 8];
-        let domain = Name::parse("t.example.com").unwrap();
-        let wire = encode(&[], &client_id, &domain, super::super::dns::RR_TYPE_TXT).unwrap();
-        let msg = message_from_wire_format(&wire).unwrap();
-        assert_eq!(msg.question.len(), 1);
-        assert_eq!(msg.additional.len(), 1);
-        assert_eq!(msg.additional[0].rtype, RR_TYPE_OPT);
-    }
-
-    #[test]
-    fn encode_then_decode_payload_in_query_name() {
-        let client_id = [0xaa; 8];
-        let domain = Name::parse("t.example.com").unwrap();
-        let payload = b"hello xdns";
-        let wire = encode(payload, &client_id, &domain, super::super::dns::RR_TYPE_TXT).unwrap();
-        let msg = message_from_wire_format(&wire).unwrap();
-
-        let (prefix, ok) = msg.question[0].name.trim_suffix(&domain);
-        assert!(ok);
-        let mut joined: Vec<u8> = Vec::new();
-        for label in &prefix.labels {
-            joined.extend_from_slice(label);
-        }
-        joined.iter_mut().for_each(|b| b.make_ascii_uppercase());
-        let decoded = decode_upper(&joined).unwrap();
-        assert_eq!(&decoded[..8], &client_id);
-        let pad_n = decoded[8] - 224;
-        assert!(pad_n >= NUM_PADDING);
-        let off = 9 + pad_n as usize;
-        assert_eq!(decoded[off] as usize, payload.len());
-        assert_eq!(&decoded[off + 1..off + 1 + payload.len()], payload);
-    }
-
-    #[test]
-    fn next_packet_decodes_stream() {
-        let stream = vec![0u8, 3, b'a', b'b', b'c', 0, 2, b'd', b'e'];
-        let mut reader = &stream[..];
-        let p1 = next_packet(&mut reader).unwrap();
-        assert_eq!(p1, b"abc");
-        let p2 = next_packet(&mut reader).unwrap();
-        assert_eq!(p2, b"de");
-        assert!(next_packet(&mut reader).is_none());
+        Ok(SocketAddr::from(([0u8, 0, 0, 0], 0)))
     }
 }

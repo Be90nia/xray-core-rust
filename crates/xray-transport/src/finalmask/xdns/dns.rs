@@ -16,10 +16,13 @@ use std::{
 const COMPRESSION_POINTER_LIMIT: u8 = 10;
 
 // RR 类型（https://tools.ietf.org/html/rfc1035#section-3.2.2 等）
+#[allow(dead_code)] // DNS 协议标准常量（RFC 1035），保留作协议参考（xdns 测试与未来服务端特性使用）
 pub const RR_TYPE_A: u16 = 1;
 #[allow(dead_code)] // DNS 协议标准常量（RFC 1035），保留作协议参考
 pub const RR_TYPE_CNAME: u16 = 5;
+#[allow(dead_code)] // DNS 协议标准常量（RFC 1035），保留作协议参考（xdns 测试与未来服务端特性使用）
 pub const RR_TYPE_TXT: u16 = 16;
+#[allow(dead_code)] // DNS 协议标准常量（RFC 1035），保留作协议参考（xdns 测试与未来服务端特性使用）
 pub const RR_TYPE_AAAA: u16 = 28;
 pub const RR_TYPE_OPT: u16 = 41;
 
@@ -31,6 +34,7 @@ pub const RCODE_NO_ERROR: u16 = 0;
 pub const RCODE_FORMAT_ERROR: u16 = 1;
 pub const RCODE_NAME_ERROR: u16 = 3;
 pub const RCODE_NOT_IMPLEMENTED: u16 = 4;
+#[allow(dead_code)] // DNS 协议标准常量（RFC 6891 EDNS0），保留作协议参考
 pub const EXTENDED_RCODE_BAD_VERS: u16 = 16;
 
 // ============================================================================
@@ -85,6 +89,7 @@ impl Name {
     /// 空 Name 返回 "."。
     ///
     /// 对应 Go `Name.String`。
+    #[allow(dead_code)] // RFC1035 codec 完整面（dns 单测覆盖；xdns 旧路径消费）
     pub fn to_string_repr(&self) -> String {
         if self.labels.is_empty() {
             return ".".to_string();
@@ -109,6 +114,7 @@ impl Name {
     /// 未匹配时返回 `(空 Name, false)`。
     ///
     /// 对应 Go `Name.TrimSuffix`。
+    #[allow(dead_code)] // RFC1035 codec 完整面（dns 单测覆盖；xdns 旧路径消费）
     pub fn trim_suffix(&self, suffix: &Self) -> (Self, bool) {
         if self.labels.len() < suffix.labels.len() {
             return (Self::default(), false);
@@ -154,6 +160,7 @@ impl Message {
     }
 
     /// 提取 Flags 的 RCODE 字段（低 4 位）。
+    #[allow(dead_code)] // RFC1035 codec 完整面（dns 单测覆盖）
     pub fn rcode(&self) -> u16 {
         self.flags & 0x000f
     }
@@ -258,7 +265,8 @@ fn read_question<R: Read + Seek>(r: &mut R) -> io::Result<Question> {
 
 /// 读取 RR 一条。
 ///
-/// 对应 Go `readRR`。
+/// 对应 Go `readRR`。CNAME rdata 归一化为未压缩 wire name（Go dnsmessage
+/// 解析嵌套名时会跟随压缩指针；xdns Resp.Decode 依赖该语义）。
 fn read_rr<R: Read + Seek>(r: &mut R) -> io::Result<RR> {
     let name = read_name(r)?;
     let mut head = [0u8; 8];
@@ -271,7 +279,28 @@ fn read_rr<R: Read + Seek>(r: &mut R) -> io::Result<RR> {
     let rd_length = u16::from_be_bytes(rd_len_buf) as usize;
     let mut data = vec![0u8; rd_length];
     r.read_exact(&mut data)?;
-    Ok(RR { name, rtype, rclass, ttl, data })
+    let rr = RR { name, rtype, rclass, ttl, data };
+    if rtype != RR_TYPE_CNAME || rd_length == 0 {
+        return Ok(rr);
+    }
+    // 回退到 rdata 起始解嵌套名；失败则保留原始字节（resp 侧跳过）
+    let after_data = r.stream_position()?;
+    r.seek(SeekFrom::Current(-(rd_length as i64)))?;
+    match read_name(r) {
+        Ok(cname) => {
+            let mut norm = Vec::new();
+            for label in &cname.labels {
+                norm.push(label.len() as u8);
+                norm.extend_from_slice(label);
+            }
+            norm.push(0);
+            Ok(RR { data: norm, ..rr })
+        },
+        Err(_) => {
+            r.seek(SeekFrom::Start(after_data))?;
+            Ok(rr)
+        },
+    }
 }
 
 /// 读取 Name，支持压缩指针（0xC0 前缀）。
@@ -448,6 +477,7 @@ fn suffix_str(name: &Name, i: usize) -> String {
 /// 解码 TXT RDATA：串联多个 `<length><bytes>` 字符串。
 ///
 /// 对应 Go `DecodeRDataTXT`。
+#[allow(dead_code)] // RFC1035 codec 完整面（dns 单测覆盖；xdns 旧路径消费）
 pub fn decode_rdata_txt(mut p: &[u8]) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     loop {
@@ -477,6 +507,7 @@ pub fn decode_rdata_txt(mut p: &[u8]) -> io::Result<Vec<u8>> {
 /// 编码为 TXT RDATA：每 255 字节一段，至少输出一段（哪怕空）。
 ///
 /// 对应 Go `EncodeRDataTXT`。
+#[allow(dead_code)] // RFC1035 codec 完整面（dns 单测覆盖；xdns 旧路径消费）
 pub fn encode_rdata_txt(mut p: &[u8]) -> Vec<u8> {
     let mut buf = Vec::new();
     while p.len() > 255 {

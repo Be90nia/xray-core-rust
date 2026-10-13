@@ -1,366 +1,384 @@
-//! # xdns 服务端 transport（对应 Go `xdns/server.go`）
+//! # xdns 服务端 transport（对应 Go `xdns/server.go`，v26.9.30 重构版）
 //!
-//! `XdnsConnServer` 包装底层 UDP conn，实现 `UdpIo`：
-//! - recv_from：从客户端 DNS 查询中解码 payload，写入 read_queue。
-//! - send_to：把 payload 编码为 DNS response answers，发回客户端。
+//! 查询名后缀匹配 domain → base32 解码 payload（校验首字节 qtype 标识与
+//! [8]&0x3F ∈ {3,8}）→ 交上层；分片经 [`FragManager`] 重组。响应经
+//! [`SendManager`] 按 clientID 攒包，拼 [len2|0xC0] 帧后编码为 answer 段。
+//! 错误查询即时回错误响应（dr 通道）。
 //!
-//! 每个 client（按 clientID 区分）映射到一个稳定的 IPv6 地址（`fd00::clientID`）。
-//! 服务端维护 client_addr → 真实 UDP addr 的映射，使 send_to 能把响应回送到正确客户端。
+//! bd 2ktp ④：对齐 Xray-core fc8f8a45。
 
 use std::{
-    collections::HashMap,
     io,
     net::{IpAddr, Ipv6Addr, SocketAddr},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use tokio::sync::{Mutex, mpsc};
 
 use super::{
-    UdpIo,
-    base32::decode_upper,
+    Config, UdpIo,
     dns::{
-        Message, Name, Question, RR, RR_TYPE_A, RR_TYPE_AAAA, RR_TYPE_OPT, RR_TYPE_TXT,
-        message_from_wire_format,
+        Message, RCODE_FORMAT_ERROR, RCODE_NAME_ERROR, RCODE_NO_ERROR, RCODE_NOT_IMPLEMENTED,
+        RR_TYPE_OPT, message_from_wire_format,
     },
-    record_transport::{
-        MAX_UDP_PAYLOAD, RESPONSE_TTL, answers_for_payload, max_encoded_payload_for_type,
-        max_encoded_payload_txt,
-    },
-    spec::{DomainSpec, parse_domain_spec},
+    domain::{Domain, type_map_},
+    frag::{ClientID, FragManager},
+    resp::{Resp, SendManager},
 };
 
-const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
-const READ_QUEUE_CAP: usize = 512;
+const MAX_RESPONSE_DELAY: Duration = Duration::from_secs(1);
+const REC_QUEUE_CAP: usize = 255;
+const UDP_READ_BUF: usize = 4096;
 
-/// 把 8 字节 clientID 映射到稳定的 IPv6 UDP addr（`fd00::clientID`，端口 0）。
-///
-/// 对应 Go `clientIDToAddr`。
-pub(crate) fn client_id_to_addr(client_id: [u8; 8]) -> SocketAddr {
-    let mut ip = [0u8; 16];
-    ip[0] = 0xfd;
-    ip[8..].copy_from_slice(&client_id);
-    SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip)), 0)
+/// 错误即时响应（Go `resp` struct in server.go）。
+struct DrResp {
+    msg: Message,
+    addr: SocketAddr,
 }
 
-/// `client_id_to_addr` 的逆操作；非 xdns-derived addr 返回 None。
-fn addr_to_client_id(addr: SocketAddr) -> Option<[u8; 8]> {
-    let IpAddr::V6(v6) = addr.ip() else {
-        return None;
-    };
-    let octets = v6.octets();
-    if octets[0] != 0xfd || octets[1..8].iter().any(|b| *b != 0) {
-        return None;
-    }
-    let mut id = [0u8; 8];
-    id.copy_from_slice(&octets[8..]);
-    Some(id)
+/// 已解码待响应的记录（Go `Rec`）。
+struct Rec {
+    resp: Resp,
+    client_id: ClientID,
+    addr: SocketAddr,
 }
 
-/// 内部读队列数据包。
+/// 服务端共享状态。
+struct ServerState {
+    inner: Arc<dyn UdpIo>,
+    domains: Vec<Domain>,
+    frag: Arc<FragManager>,
+    send_mgr: Arc<SendManager>,
+    read_tx: mpsc::Sender<Packet>,
+    rec_tx: mpsc::Sender<Rec>,
+    dr_tx: mpsc::Sender<DrResp>,
+}
+
+/// 上层数据包：payload + clientID 派生的 fd 地址（Go `clientID.Addr()`）。
 struct Packet {
     data: Vec<u8>,
     addr: SocketAddr,
 }
 
-/// 已建立过会话的客户端信息（用于 send_to 反查真实 UDP addr）。
-struct ClientInfo {
-    real_addr: SocketAddr,
-    qtype: u16,
-    last_seen: Instant,
+/// clientID → 稳定 fd IPv6 地址（对齐 Go `ClientID.Addr`：ip[0]=0xFD, ip[8:]=id）。
+fn client_id_to_addr(client_id: ClientID) -> SocketAddr {
+    let mut ip = [0u8; 16];
+    ip[0] = 0xFD;
+    ip[8..].copy_from_slice(&client_id);
+    SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip)), 0)
 }
 
-/// 服务端共享状态。
-struct ServerState {
-    domains: Vec<DomainSpec>,
-    read_tx: mpsc::Sender<Packet>,
-    /// client_addr 字符串 → 客户端信息。
-    clients: Mutex<HashMap<String, ClientInfo>>,
+/// fd 地址 → clientID（对齐 Go `ClientIDFromAddr`：取 IP[8:]）。
+fn client_id_from_addr(addr: &SocketAddr) -> ClientID {
+    match addr.ip() {
+        IpAddr::V6(v6) => {
+            let o = v6.octets();
+            [o[8], o[9], o[10], o[11], o[12], o[13], o[14], o[15]]
+        },
+        IpAddr::V4(_) => [0u8; 8],
+    }
 }
 
 /// xdns 服务端：包装底层 UDP conn，作为 DNS-over-UDP 隧道服务端。
 pub(crate) struct XdnsConnServer {
-    inner: Arc<dyn UdpIo>,
     state: Arc<ServerState>,
     closed: Arc<AtomicBool>,
     read_rx: Mutex<mpsc::Receiver<Packet>>,
 }
 
 impl XdnsConnServer {
-    pub(crate) fn new(inner: Box<dyn UdpIo>, domains: Vec<String>) -> io::Result<Self> {
-        if domains.is_empty() {
+    pub(crate) fn new(inner: Arc<dyn UdpIo>, config: &Config) -> io::Result<Self> {
+        if config.domains.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty domains"));
         }
-        let mut specs = Vec::with_capacity(domains.len());
-        for d in &domains {
-            specs.push(parse_domain_spec(d, "")?);
+        let mut domains = Vec::with_capacity(config.domains.len());
+        for d in &config.domains {
+            let edns0 = u16::try_from(d.edns0)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "xdns: invalid edns0"))?;
+            domains.push(Domain::new(
+                &d.name,
+                d.len_limit as usize,
+                d.label_limit as usize,
+                &d.types,
+                edns0,
+            )?);
         }
 
-        let (read_tx, read_rx) = mpsc::channel(READ_QUEUE_CAP);
+        // cap=1 + send().await 等效 Go 无缓冲阻塞语义（tokio mpsc 无 0 容量）
+        let (read_tx, read_rx) = mpsc::channel::<Packet>(1);
+        let (rec_tx, rec_rx) = mpsc::channel::<Rec>(REC_QUEUE_CAP);
+        let (dr_tx, dr_rx) = mpsc::channel::<DrResp>(1);
 
         let closed = Arc::new(AtomicBool::new(false));
-        let inner_arc: Arc<dyn UdpIo> = Arc::from(inner);
-        let state =
-            Arc::new(ServerState { domains: specs, read_tx, clients: Mutex::new(HashMap::new()) });
+        let frag = Arc::new(FragManager::new());
+        let send_mgr = Arc::new(SendManager::new());
 
-        // recv loop：解析 DNS 查询 → 入 read_queue + 记录 client 信息
-        {
-            let state = state.clone();
-            let inner = inner_arc.clone();
-            let closed = closed.clone();
-            tokio::spawn(recv_loop(state, inner, closed));
-        }
-        // clean loop：定期清理过期 client
-        {
-            let state = state.clone();
-            let closed = closed.clone();
-            tokio::spawn(clean_loop(state, closed));
-        }
+        let state = Arc::new(ServerState {
+            inner,
+            domains,
+            frag: frag.clone(),
+            send_mgr: send_mgr.clone(),
+            read_tx,
+            rec_tx,
+            dr_tx,
+        });
 
-        Ok(Self { inner: inner_arc, state, closed, read_rx: Mutex::new(read_rx) })
+        tokio::spawn(recv_loop(state.clone(), closed.clone()));
+        tokio::spawn(send_loop(state.clone(), rec_rx, closed.clone()));
+        tokio::spawn(dr_loop(state.clone(), dr_rx, closed.clone()));
+        tokio::spawn(maintain_loop(frag, send_mgr, closed.clone()));
+
+        Ok(Self { state, closed, read_rx: Mutex::new(read_rx) })
     }
 }
 
-/// clean loop：定期清理 IDLE_TIMEOUT 未活动的 client 信息。
-async fn clean_loop(state: Arc<ServerState>, closed: Arc<AtomicBool>) {
-    loop {
-        tokio::time::sleep(IDLE_TIMEOUT / 2).await;
-        if closed.load(Ordering::Relaxed) {
-            return;
-        }
-        let now = Instant::now();
-        let mut map = state.clients.lock().await;
-        let to_remove: Vec<String> = map
-            .iter()
-            .filter_map(|(k, c)| {
-                if now.duration_since(c.last_seen) >= IDLE_TIMEOUT { Some(k.clone()) } else { None }
-            })
-            .collect();
-        for k in to_remove {
-            map.remove(&k);
-        }
-    }
+/// 即时错误响应投递（对应 Go `decref`：忙则丢弃）。
+fn decref(state: &ServerState, msg: Message, addr: SocketAddr) {
+    let _ = state.dr_tx.try_send(DrResp { msg, addr });
 }
 
-/// recv loop：解析 DNS 查询 → 调 responseFor → 解码 payload 包 → 入 read_queue，
-/// 同时记录 client_addr → 真实 addr 的映射。
-async fn recv_loop(state: Arc<ServerState>, inner: Arc<dyn UdpIo>, closed: Arc<AtomicBool>) {
-    let mut buf = vec![0u8; super::UDP_SIZE];
+/// 空成功响应应答头（Response + Authoritative + Success）。
+fn ok_header(mut msg: Message) -> Message {
+    msg.flags = 0x8000 | 0x0400;
+    msg.answer.clear();
+    msg.authority.clear();
+    msg.additional.clear();
+    msg
+}
+
+/// 查询处理（对应 Go `xdnsServer.read`），逐级校验并即时回错误响应。
+async fn server_read(state: &ServerState, buf: &[u8], addr: SocketAddr) {
+    let Ok(mut msg) = message_from_wire_format(buf) else { return };
+    if msg.flags & 0x8000 != 0 {
+        return; // 响应不处理
+    }
+
+    if msg.opcode() != 0 {
+        msg.flags = 0x8000 | (RCODE_NOT_IMPLEMENTED & 0xf);
+        decref(state, msg, addr);
+        return;
+    }
+
+    if msg.question.len() != 1 {
+        msg.flags = 0x8000 | (RCODE_FORMAT_ERROR & 0xf);
+        decref(state, msg, addr);
+        return;
+    }
+
+    // OPT/EDNS0：重复 OPT → FormatError（Go 此分支仅置 RCode 即回）；版本非 0 → BADVERS
+    let mut opt = false;
+    let mut edns0: u16 = 0;
+    for rr in &msg.additional {
+        if rr.rtype == RR_TYPE_OPT {
+            if opt {
+                msg.flags = (msg.flags & !0x000f) | (RCODE_FORMAT_ERROR & 0xf);
+                decref(state, msg, addr);
+                return;
+            }
+            opt = true;
+            edns0 = rr.rclass;
+            if (rr.ttl >> 16) & 0xFF != 0 {
+                msg.flags = (msg.flags & !0x000f) | (RCODE_NO_ERROR & 0xf);
+                if let Some(rr_mut) = msg.additional.iter_mut().find(|r| r.rtype == RR_TYPE_OPT) {
+                    rr_mut.ttl = 1 << 24;
+                }
+                decref(state, msg, addr);
+                return;
+            }
+        }
+    }
+    if opt {
+        edns0 = edns0.clamp(512, 4096);
+    }
+
+    let Some(domain) = state.domains.iter().find(|d| d.is_domain(&msg.question[0].name)) else {
+        msg.flags = 0x8000 | (RCODE_NAME_ERROR & 0xf);
+        decref(state, msg, addr);
+        return;
+    };
+    if !domain.has_type(msg.question[0].qtype) {
+        decref(state, ok_header(msg), addr);
+        return;
+    }
+
+    let decoded = domain.decode(&msg.question[0].name);
+    let n = decoded.len();
+    if n < 9 {
+        decref(state, ok_header(msg), addr);
+        return;
+    }
+    // 首字节低 2bit qtype 匹配 + [8]&0x3F ∈ {3,8} + 形态长度校验
+    let flag8 = decoded[8] & 0x3F;
+    if type_map_(decoded[0] & 3) != msg.question[0].qtype
+        || (flag8 != 3 && flag8 != 8)
+        || (flag8 == 3 && n < 9 + 3 + 1)
+        || (flag8 == 8 && n != 9 + 8)
+    {
+        decref(state, ok_header(msg), addr);
+        return;
+    }
+    let client_id: ClientID = decoded[..8].try_into().expect("n >= 9");
+
+    let resp = Resp::new(msg.clone(), domain.clone(), edns0);
+    let rec = Rec { resp, client_id, addr };
+    if state.rec_tx.try_send(rec).is_err() {
+        // recCh 满（Go default 分支）：回空成功响应
+        decref(state, ok_header(msg), addr);
+        return;
+    }
+
+    if flag8 == 8 {
+        return; // poll 包无 payload
+    }
+    let payload: Vec<u8> = if decoded[8] & 0xC0 == 0xC0 {
+        // 分片：[12]fragID [13]idx [14]n + 数据
+        let key = super::frag::FragKey::new(client_id, decoded[12]);
+        let out = state.frag.feed(key, decoded[13], decoded[14], &decoded[15..n]).await;
+        if out.is_empty() {
+            return;
+        }
+        out
+    } else {
+        decoded[12..n].to_vec()
+    };
+
+    let pkt = Packet { data: payload, addr: client_id_to_addr(client_id) };
+    // 读端已关（关闭中）＝无后续消费，忽略发送结果
+    let _ = state.read_tx.send(pkt).await;
+}
+
+/// recv 循环：读隧道 → 处理查询（对应 Go `recv` goroutine）。
+async fn recv_loop(state: Arc<ServerState>, closed: Arc<AtomicBool>) {
+    let mut buf = vec![0u8; UDP_READ_BUF];
     loop {
         if closed.load(Ordering::Relaxed) {
             return;
         }
-        let (n, addr) = match inner.recv_from(&mut buf).await {
+        let (n, addr) = match state.inner.recv_from(&mut buf).await {
             Ok(v) => v,
             Err(_) => continue,
         };
-
-        let query = match message_from_wire_format(&buf[..n]) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        let payload = decode_payload_from_query(&query, &state.domains).unwrap_or_default();
-        let Some(resp) = response_for(&query, &state.domains) else {
-            continue;
-        };
-
-        let mut client_id = [0u8; 8];
-        let copied = payload.len().min(8);
-        client_id[..copied].copy_from_slice(&payload[..copied]);
-        let rest = payload.get(copied..).unwrap_or(&[]);
-        let client_addr = client_id_to_addr(client_id);
-
-        // 记录 client 信息（即使 clientID 不完整，也保留以备后续 send_to 失败时发 NXDOMAIN）
-        let qtype = query.question.first().map(|q| q.qtype).unwrap_or(RR_TYPE_TXT);
-        {
-            let mut map = state.clients.lock().await;
-            map.insert(
-                client_addr.to_string(),
-                ClientInfo { real_addr: addr, qtype, last_seen: Instant::now() },
-            );
-        }
-
-        // 解析 payload 包入 read_queue（仅当完整 clientID 时）
-        if copied == 8 {
-            let mut reader = rest;
-            while let Some(p) = next_packet_server(&mut reader) {
-                let pkt = Packet { data: p, addr: client_addr };
-                let _ = state.read_tx.try_send(pkt);
-            }
-        }
-
-        // 立即发送初始响应（无 answer payload；后续 WriteTo 触发的响应才带 payload）
-        let mut modified = resp;
-        if copied != 8 && modified.rcode() == super::dns::RCODE_NO_ERROR {
-            modified.flags |= super::dns::RCODE_NAME_ERROR;
-        }
-        match modified.wire_format() {
-            Ok(out) => {
-                let _ = inner.send_to(&out, addr).await;
-            },
-            Err(_) => continue,
-        }
+        server_read(&state, &buf[..n], addr).await;
     }
 }
 
-/// 从字节流中读取一个数据包（与客户端 nextPacket 互逆，支持 padding 跳过）。
+/// 响应发送循环（对应 Go `send` goroutine）：按 rec 攒包、超时/抢占切包。
 ///
-/// 对应 Go `nextPacketServer`。
-pub(crate) fn next_packet_server(r: &mut &[u8]) -> Option<Vec<u8>> {
+/// 与 Go 的偏差：Go 的 `timer.Reset(0)` 与就绪 channel 随机竞争会随机提前
+/// 截断攒包；本实现确定性排空队列（协议合法，攒包更满）。
+async fn send_loop(
+    state: Arc<ServerState>,
+    mut rec_rx: mpsc::Receiver<Rec>,
+    closed: Arc<AtomicBool>,
+) {
+    let mut next_rec: Option<Rec> = None;
     loop {
-        let &prefix = r.first()?;
-        *r = &r[1..];
-        if prefix >= 224 {
-            // padding：跳过 prefix-224 字节
-            let pad = (prefix - 224) as usize;
-            if r.len() < pad {
-                return None;
+        if closed.load(Ordering::Relaxed) {
+            return;
+        }
+        let rec = match next_rec.take() {
+            Some(r) => r,
+            None => match rec_rx.recv().await {
+                Some(r) => r,
+                None => return,
+            },
+        };
+
+        let info = state.send_mgr.get(rec.client_id);
+        info.refresh();
+        let mut left = rec.resp.cap;
+        let mut ps: Vec<Vec<u8>> = Vec::new();
+        let mut got_any = false;
+        loop {
+            if let Some(p) = info.try_pop() {
+                let il = 2 + p.len() as isize;
+                left -= il;
+                if left < 0 {
+                    if ps.is_empty() {
+                        tracing::error!(len = p.len(), "xdns server: err size");
+                    } else {
+                        state.send_mgr.stash(rec.client_id, &p);
+                    }
+                    break;
+                }
+                ps.push(p);
+                got_any = true;
+                continue;
             }
-            *r = &r[pad..];
-        } else {
-            // 普通包：读 prefix 字节
-            let n = prefix as usize;
-            if r.len() < n {
-                return None;
+            // 队列空：挂通知前注册（防漏），再 select 通知/超时/抢占
+            let wait = if got_any { Duration::ZERO } else { MAX_RESPONSE_DELAY };
+            let notified_fut = info.notified();
+            tokio::select! {
+                _ = notified_fut => { continue; }
+                _ = tokio::time::sleep(wait) => break,
+                r = rec_rx.recv() => {
+                    next_rec = r;
+                    break;
+                }
             }
-            let p = r[..n].to_vec();
-            *r = &r[n..];
-            return Some(p);
+        }
+
+        // [len2|0xC0 终帧][bytes] 拼接 → 编码响应 → 回客户端
+        let mut d: Vec<u8> = Vec::with_capacity(rec.resp.cap.max(0) as usize + 16);
+        let n = ps.len();
+        for (i, p) in ps.iter().enumerate() {
+            let mut l = p.len();
+            if i == n - 1 {
+                l |= 0xC000;
+            }
+            d.extend_from_slice(&(l as u16).to_be_bytes());
+            d.extend_from_slice(p);
+        }
+        if let Ok(pack) = rec.resp.encode(&d) {
+            let _ = state.inner.send_to(&pack, rec.addr).await;
         }
     }
 }
 
-/// 从 query.name 中解码 base32 payload。
-fn decode_payload_from_query(query: &Message, domains: &[DomainSpec]) -> Option<Vec<u8>> {
-    let q = query.question.first()?;
-    for d in domains {
-        let (prefix, ok) = q.name.trim_suffix(&d.name);
-        if !ok {
-            continue;
+/// dr 循环：错误即时响应写出（对应 Go `dr` goroutine）。
+async fn dr_loop(
+    state: Arc<ServerState>,
+    mut dr_rx: mpsc::Receiver<DrResp>,
+    closed: Arc<AtomicBool>,
+) {
+    loop {
+        let r = tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                if closed.load(Ordering::Relaxed) { return; }
+                continue;
+            },
+            r = dr_rx.recv() => r,
+        };
+        let Some(r) = r else { return };
+        if let Ok(pack) = r.msg.wire_format() {
+            let _ = state.inner.send_to(&pack, r.addr).await;
         }
-        let mut joined: Vec<u8> = Vec::new();
-        for label in &prefix.labels {
-            joined.extend_from_slice(label);
-        }
-        joined.iter_mut().for_each(|b| b.make_ascii_uppercase());
-        return decode_upper(&joined).ok();
     }
-    None
 }
 
-/// 根据查询构造响应消息模板。返回 None 表示不回复（QR=1 查询）。
-///
-/// 对应 Go `responseFor`。
-pub(crate) fn response_for(query: &Message, domains: &[DomainSpec]) -> Option<Message> {
-    let mut resp = Message {
-        id: query.id,
-        flags: 0x8000, // QR=1
-        question: query.question.clone(),
-        answer: vec![],
-        authority: vec![],
-        additional: vec![],
-    };
-
-    // QR=1 查询（其实是响应）不回复
-    if query.flags & 0x8000 != 0 {
-        return None;
-    }
-
-    // 处理 OPT EDNS
-    let mut payload_size = 0u16;
-    for rr in &query.additional {
-        if rr.rtype != RR_TYPE_OPT {
-            continue;
+/// 维护循环：分片/SendManager TTL 清扫 + 关停时释放（对应 Go gc/Close）。
+async fn maintain_loop(
+    frag: Arc<FragManager>,
+    send_mgr: Arc<SendManager>,
+    closed: Arc<AtomicBool>,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(2)); // 覆盖 fragTTL/2 粒度
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        if closed.load(Ordering::Relaxed) {
+            frag.close().await;
+            send_mgr.close();
+            return;
         }
-        if !resp.additional.is_empty() {
-            resp.flags |= super::dns::RCODE_FORMAT_ERROR;
-            return Some(resp);
-        }
-        resp.additional.push(RR {
-            name: Name::default(),
-            rtype: RR_TYPE_OPT,
-            rclass: 4096,
-            ttl: 0,
-            data: vec![],
-        });
-        let version = (rr.ttl >> 16) & 0xff;
-        if version != 0 {
-            resp.flags |= super::dns::EXTENDED_RCODE_BAD_VERS & 0xf;
-            resp.additional[0].ttl = (u32::from(super::dns::EXTENDED_RCODE_BAD_VERS) >> 4) << 24;
-            return Some(resp);
-        }
-        payload_size = rr.rclass;
+        frag.sweep_expired().await;
+        send_mgr.sweep_expired();
     }
-    if payload_size < 512 {
-        payload_size = 512;
-    }
-
-    if query.question.len() != 1 {
-        resp.flags |= super::dns::RCODE_FORMAT_ERROR;
-        return Some(resp);
-    }
-    let question = query.question[0].clone();
-
-    // 匹配 domain
-    let mut matched: Option<&DomainSpec> = None;
-    for d in domains {
-        if question.name.trim_suffix(&d.name).1 {
-            matched = Some(d);
-            break;
-        }
-    }
-    let matched = match matched {
-        Some(m) => m,
-        None => {
-            resp.flags |= super::dns::RCODE_NAME_ERROR;
-            return Some(resp);
-        },
-    };
-    resp.flags |= 0x0400; // AA=1
-
-    if query.opcode() != 0 {
-        resp.flags |= super::dns::RCODE_NOT_IMPLEMENTED;
-        return Some(resp);
-    }
-
-    // 校验 qtype
-    match question.qtype {
-        RR_TYPE_TXT | RR_TYPE_A | RR_TYPE_AAAA => {},
-        _ => {
-            resp.flags |= super::dns::RCODE_NAME_ERROR;
-            return Some(resp);
-        },
-    }
-    if matched.rr_type != 0 && question.qtype != matched.rr_type {
-        resp.flags |= super::dns::RCODE_NAME_ERROR;
-        return Some(resp);
-    }
-
-    // 校验 payload 可解码（失败 → NXDOMAIN）
-    let prefix = question.name.trim_suffix(&matched.name).0;
-    let mut joined: Vec<u8> = Vec::new();
-    for label in &prefix.labels {
-        joined.extend_from_slice(label);
-    }
-    joined.iter_mut().for_each(|b| b.make_ascii_uppercase());
-    if decode_upper(&joined).is_err() {
-        resp.flags |= super::dns::RCODE_NAME_ERROR;
-        return Some(resp);
-    }
-
-    // payload_size 必须 ≥ MAX_UDP_PAYLOAD
-    if (payload_size as usize) < MAX_UDP_PAYLOAD {
-        resp.flags |= super::dns::RCODE_FORMAT_ERROR;
-        return Some(resp);
-    }
-
-    Some(resp)
 }
 
 #[async_trait]
@@ -369,70 +387,16 @@ impl UdpIo for XdnsConnServer {
         if self.closed.load(Ordering::Relaxed) {
             return Err(io::Error::other("xdns server closed"));
         }
-
-        let Some(_client_id) = addr_to_client_id(addr) else {
-            return Ok(0); // 非 xdns addr：静默丢弃
-        };
-
-        // 反查 client 真实 addr + qtype
-        let (real_addr, qtype) = {
-            let map = self.state.clients.lock().await;
-            let Some(info) = map.get(&addr.to_string()) else {
-                return Ok(0); // 未建立过会话：丢弃
-            };
-            (info.real_addr, info.qtype)
-        };
-
-        let qtype = if qtype == 0 { RR_TYPE_TXT } else { qtype };
-        let limit = if qtype == RR_TYPE_TXT {
-            max_encoded_payload_txt()
-        } else {
-            max_encoded_payload_for_type(qtype)
-        };
-        if buf.len() + 2 > limit {
-            return Ok(0); // 超限：静默丢弃
+        if buf.is_empty() || buf.len() > UDP_READ_BUF {
+            tracing::error!(len = buf.len(), "xdns server: err size");
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "err size"));
         }
-
-        // 用 domain 第一项作为 question.name
-        let domain_name = self.state.domains.first().map(|d| d.name.clone()).unwrap_or_default();
-
-        let answer = answers_for_payload(
-            &Question { name: domain_name.clone(), qtype, qclass: super::dns::CLASS_IN },
-            RESPONSE_TTL,
-            buf,
-        )?;
-
-        let resp = Message {
-            id: 0,
-            flags: 0x8000,
-            question: vec![Question { name: domain_name, qtype, qclass: super::dns::CLASS_IN }],
-            answer,
-            authority: vec![],
-            additional: vec![RR {
-                name: Name::default(),
-                rtype: RR_TYPE_OPT,
-                rclass: 4096,
-                ttl: 0,
-                data: vec![],
-            }],
-        };
-
-        let mut wire = resp.wire_format()?;
-        if wire.len() > MAX_UDP_PAYLOAD {
-            wire.truncate(MAX_UDP_PAYLOAD);
-            if wire.len() >= 3 {
-                wire[2] |= 0x02; // TC=1
-            }
-        }
-        self.inner.send_to(&wire, real_addr).await?;
+        self.state.send_mgr.push(client_id_from_addr(&addr), buf);
         Ok(buf.len())
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let pkt = {
-            let mut rx = self.read_rx.lock().await;
-            rx.recv().await
-        };
+        let pkt = { self.read_rx.lock().await.recv().await };
         let Some(pkt) = pkt else {
             return Err(io::Error::other("xdns server closed"));
         };
@@ -442,212 +406,6 @@ impl UdpIo for XdnsConnServer {
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.local_addr()
-    }
-}
-
-impl Drop for XdnsConnServer {
-    fn drop(&mut self) {
-        self.closed.store(true, Ordering::Relaxed);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::finalmask::xdns::dns::{
-        EXTENDED_RCODE_BAD_VERS, RCODE_FORMAT_ERROR, RCODE_NAME_ERROR, RCODE_NO_ERROR,
-        RCODE_NOT_IMPLEMENTED,
-    };
-
-    #[test]
-    fn client_id_to_addr_roundtrip() {
-        let id = [1, 2, 3, 4, 5, 6, 7, 8];
-        let addr = client_id_to_addr(id);
-        let decoded = addr_to_client_id(addr).unwrap();
-        assert_eq!(decoded, id);
-    }
-
-    #[test]
-    fn addr_to_client_id_rejects_non_xdns() {
-        let addr: SocketAddr = "1.2.3.4:53".parse().unwrap();
-        assert!(addr_to_client_id(addr).is_none());
-        let addr: SocketAddr = "[2001::1]:53".parse().unwrap();
-        assert!(addr_to_client_id(addr).is_none());
-    }
-
-    #[test]
-    fn next_packet_server_skips_padding() {
-        // [padding_count=224+3][3 pad][2][ab][padding=224+1][1 pad][3][cde]
-        let stream: Vec<u8> =
-            vec![224 + 3, 0xaa, 0xbb, 0xcc, 2, b'a', b'b', 224 + 1, 0xdd, 3, b'c', b'd', b'e'];
-        let mut reader = &stream[..];
-        let p1 = next_packet_server(&mut reader).unwrap();
-        assert_eq!(p1, b"ab");
-        let p2 = next_packet_server(&mut reader).unwrap();
-        assert_eq!(p2, b"cde");
-        assert!(next_packet_server(&mut reader).is_none());
-    }
-
-    #[test]
-    fn next_packet_server_eof_in_padding() {
-        let stream: Vec<u8> = vec![224 + 5, 1, 2];
-        let mut reader = &stream[..];
-        assert!(next_packet_server(&mut reader).is_none());
-    }
-
-    #[test]
-    fn response_for_empty_query_returns_formerr() {
-        let query = Message { id: 1, flags: 0, question: vec![], ..Message::default() };
-        let domains = vec![DomainSpec { name: Name::parse("t.example.com").unwrap(), rr_type: 0 }];
-        let resp = response_for(&query, &domains).unwrap();
-        assert_eq!(resp.flags & 0x000f, RCODE_FORMAT_ERROR);
-    }
-
-    #[test]
-    fn response_for_qr_query_returns_none() {
-        let query = Message {
-            id: 1,
-            flags: 0x8000,
-            question: vec![Question {
-                name: Name::parse("x.t.example.com").unwrap(),
-                qtype: RR_TYPE_TXT,
-                qclass: super::super::dns::CLASS_IN,
-            }],
-            ..Message::default()
-        };
-        let domains = vec![DomainSpec { name: Name::parse("t.example.com").unwrap(), rr_type: 0 }];
-        assert!(response_for(&query, &domains).is_none());
-    }
-
-    #[test]
-    fn response_for_unmatched_domain_nxdomain() {
-        let query = Message {
-            id: 1,
-            flags: 0,
-            question: vec![Question {
-                name: Name::parse("x.other.com").unwrap(),
-                qtype: RR_TYPE_TXT,
-                qclass: super::super::dns::CLASS_IN,
-            }],
-            additional: vec![RR {
-                name: Name::default(),
-                rtype: RR_TYPE_OPT,
-                rclass: 4096,
-                ttl: 0,
-                data: vec![],
-            }],
-            ..Message::default()
-        };
-        let domains = vec![DomainSpec { name: Name::parse("t.example.com").unwrap(), rr_type: 0 }];
-        let resp = response_for(&query, &domains).unwrap();
-        assert_eq!(resp.flags & 0x8000, 0x8000); // QR=1
-        assert_eq!(resp.flags & 0x0400, 0); // AA=0
-        assert_eq!(resp.flags & 0x000f, RCODE_NAME_ERROR);
-    }
-
-    #[test]
-    fn response_for_method_restriction_violated_nxdomain() {
-        // domainSpec 指定 a，但查询 txt → NXDOMAIN
-        let query = Message {
-            id: 1,
-            flags: 0,
-            question: vec![Question {
-                name: Name::parse("x.t.example.com").unwrap(),
-                qtype: RR_TYPE_TXT,
-                qclass: super::super::dns::CLASS_IN,
-            }],
-            additional: vec![RR {
-                name: Name::default(),
-                rtype: RR_TYPE_OPT,
-                rclass: 4096,
-                ttl: 0,
-                data: vec![],
-            }],
-            ..Message::default()
-        };
-        let domains =
-            vec![DomainSpec { name: Name::parse("t.example.com").unwrap(), rr_type: RR_TYPE_A }];
-        let resp = response_for(&query, &domains).unwrap();
-        assert_eq!(resp.flags & 0x000f, RCODE_NAME_ERROR);
-    }
-
-    #[test]
-    fn response_for_opcode_nonzero_notimpl() {
-        let query = Message {
-            id: 1,
-            flags: 0x0800, // OPCODE=1 (IQUERY)
-            question: vec![Question {
-                name: Name::parse("x.t.example.com").unwrap(),
-                qtype: RR_TYPE_TXT,
-                qclass: super::super::dns::CLASS_IN,
-            }],
-            additional: vec![RR {
-                name: Name::default(),
-                rtype: RR_TYPE_OPT,
-                rclass: 4096,
-                ttl: 0,
-                data: vec![],
-            }],
-            ..Message::default()
-        };
-        let domains = vec![DomainSpec { name: Name::parse("t.example.com").unwrap(), rr_type: 0 }];
-        let resp = response_for(&query, &domains).unwrap();
-        assert_eq!(resp.flags & 0x0400, 0x0400); // AA=1
-        assert_eq!(resp.flags & 0x000f, RCODE_NOT_IMPLEMENTED);
-    }
-
-    #[test]
-    fn response_for_valid_txt_query_noerror() {
-        let query = Message {
-            id: 0x1234,
-            flags: 0x0100, // RD=1
-            question: vec![Question {
-                name: Name::parse("x.t.example.com").unwrap(),
-                qtype: RR_TYPE_TXT,
-                qclass: super::super::dns::CLASS_IN,
-            }],
-            additional: vec![RR {
-                name: Name::default(),
-                rtype: RR_TYPE_OPT,
-                rclass: 4096,
-                ttl: 0,
-                data: vec![],
-            }],
-            ..Message::default()
-        };
-        let domains = vec![DomainSpec { name: Name::parse("t.example.com").unwrap(), rr_type: 0 }];
-        let resp = response_for(&query, &domains).unwrap();
-        assert_eq!(resp.id, 0x1234);
-        assert_eq!(resp.flags & 0x8000, 0x8000); // QR=1
-        assert_eq!(resp.flags & 0x0400, 0x0400); // AA=1
-        assert_eq!(resp.flags & 0x000f, RCODE_NO_ERROR);
-        assert_eq!(resp.additional.len(), 1);
-        assert_eq!(resp.additional[0].rtype, RR_TYPE_OPT);
-        assert_eq!(resp.answer.len(), 0); // 由 sendLoop 后续填
-    }
-
-    #[test]
-    fn response_for_edns_bad_version() {
-        let query = Message {
-            id: 1,
-            flags: 0,
-            question: vec![Question {
-                name: Name::parse("x.t.example.com").unwrap(),
-                qtype: RR_TYPE_TXT,
-                qclass: super::super::dns::CLASS_IN,
-            }],
-            additional: vec![RR {
-                name: Name::default(),
-                rtype: RR_TYPE_OPT,
-                rclass: 4096,
-                ttl: 1 << 16, // version=1
-                data: vec![],
-            }],
-            ..Message::default()
-        };
-        let domains = vec![DomainSpec { name: Name::parse("t.example.com").unwrap(), rr_type: 0 }];
-        let resp = response_for(&query, &domains).unwrap();
-        assert_eq!(resp.flags & 0x000f, EXTENDED_RCODE_BAD_VERS & 0xf);
+        Ok(SocketAddr::from(([0u8, 0, 0, 0], 0)))
     }
 }
