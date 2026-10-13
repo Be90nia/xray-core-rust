@@ -384,6 +384,7 @@ impl ReceivingWorker {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::{config::default_config, round_trip::RoundTripInfo};

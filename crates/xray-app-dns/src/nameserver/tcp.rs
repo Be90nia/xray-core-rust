@@ -202,7 +202,13 @@ impl TcpNameServer {
         }
 
         match self
-            .try_query(conn_guard.as_mut().unwrap(), &len_be, &payload, req_id, record_type)
+            .try_query(
+                conn_guard.as_mut().expect("conn established above when None"),
+                &len_be,
+                &payload,
+                req_id,
+                record_type,
+            )
             .await
         {
             Ok(result) => Ok(result),
@@ -211,8 +217,14 @@ impl TcpNameServer {
                 tracing::debug!(error = %e, "DNS-over-TCP query on pooled connection failed, reconnecting");
                 *conn_guard = None;
                 *conn_guard = Some(self.connect().await?);
-                self.try_query(conn_guard.as_mut().unwrap(), &len_be, &payload, req_id, record_type)
-                    .await
+                self.try_query(
+                    conn_guard.as_mut().expect("reconnected just above"),
+                    &len_be,
+                    &payload,
+                    req_id,
+                    record_type,
+                )
+                .await
             },
         }
     }

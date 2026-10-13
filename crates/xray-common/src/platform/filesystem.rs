@@ -144,7 +144,7 @@ mod tests {
     use super::*;
 
     /// 进程级 env 变更互斥锁（测试并行时串行化）。
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     fn unique_dir(label: &str) -> PathBuf {
         let mut d = std::env::temp_dir();
@@ -159,7 +159,7 @@ mod tests {
     /// 互斥锁内把 `XRAY_LOCATION_ASSET`/`XRAY_LOCATION_CERT` 指向给定目录，
     /// 结束（含 panic）后移除。
     fn with_env_dirs<F: FnOnce()>(f: F) {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock();
         let dir = unique_dir("env");
         fs::create_dir_all(&dir).unwrap();
         // SAFETY: 测试线程独占 XRAY_LOCATION_* 键，Clean guard 保证恢复顺序

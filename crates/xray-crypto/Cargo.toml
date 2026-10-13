@@ -10,6 +10,7 @@ xray-buf = { path = "../xray-buf" }
 xray-common = { path = "../xray-common" }
 ring = { workspace = true }
 rand = { workspace = true }
+parking_lot = { workspace = true }
 thiserror = { workspace = true }
 
 # ChaCha20 流加密与 AEAD (cipher 0.5 兼容版本)

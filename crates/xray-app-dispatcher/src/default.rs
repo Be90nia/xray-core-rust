@@ -1581,10 +1581,10 @@ pub struct DialBridge {
     /// 代理链配置（对应 Go `senderSettings.ProxySettings`）。
     ///
     /// 用 `RwLock` 包裹以支持注册后设置（Phase 1 注册 handler，Phase 2 设置代理链）。
-    proxy_chain: std::sync::RwLock<ProxyChainConfig>,
+    proxy_chain: parking_lot::RwLock<ProxyChainConfig>,
     /// 可选 policy：None 时 bridge 用 `TimeoutPolicy::default()`。
     /// 由 dispatcher 在装配时通过 [`Self::with_policy`] 注入，按 user_level 查询。
-    policy: std::sync::RwLock<Option<xray_features::policy::TimeoutPolicy>>,
+    policy: parking_lot::RwLock<Option<xray_features::policy::TimeoutPolicy>>,
     /// splice 出站信号（Go `ob.CanSpliceCopy = 1`，freedom.go:260 唯一置 1 点）。
     ///
     /// 仅 freedom 装配置 true（xray-core outbound.rs freedom 分支）；代理链
@@ -1657,11 +1657,11 @@ impl DialBridge {
         Self {
             tag: tag.into(),
             dial,
-            proxy_chain: std::sync::RwLock::new(ProxyChainConfig {
+            proxy_chain: parking_lot::RwLock::new(ProxyChainConfig {
                 chain_tag: None,
                 outbound_manager: None,
             }),
-            policy: std::sync::RwLock::new(None),
+            policy: parking_lot::RwLock::new(None),
             splice_outbound: std::sync::atomic::AtomicBool::new(false),
             splice_admitted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             background_tasks: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
@@ -1686,12 +1686,12 @@ impl DialBridge {
     /// 注入 per-dispatch 桥接 policy（bd 4-6：bridge 数据面超时接 policy）。
     /// 用 `&self` 因为注册 handler 之后仍可能需要按 per-dispatch 设置。
     pub fn with_policy(&self, p: xray_features::policy::TimeoutPolicy) {
-        *self.policy.write().expect("DialBridge policy lock poisoned") = Some(p);
+        *self.policy.write() = Some(p);
     }
 
     /// 取当前 policy（无显式设置时用 default）。
     fn current_policy(&self) -> xray_features::policy::TimeoutPolicy {
-        self.policy.read().expect("DialBridge policy lock poisoned").clone().unwrap_or_default()
+        self.policy.read().clone().unwrap_or_default()
     }
 
     /// 设置代理链 tag 和出站管理器。
@@ -1706,7 +1706,7 @@ impl DialBridge {
         chain_tag: impl Into<String>,
         manager: Arc<dyn OutboundHandlerManager>,
     ) {
-        let mut guard = self.proxy_chain.write().expect("DialBridge proxy_chain lock poisoned");
+        let mut guard = self.proxy_chain.write();
         guard.chain_tag = Some(chain_tag.into());
         guard.outbound_manager = Some(manager);
     }
@@ -1714,19 +1714,19 @@ impl DialBridge {
     /// 代理链 tag 是否已设置。
     #[must_use]
     pub fn has_proxy_chain(&self) -> bool {
-        self.proxy_chain.read().expect("DialBridge proxy_chain lock poisoned").chain_tag.is_some()
+        self.proxy_chain.read().chain_tag.is_some()
     }
 
     /// 获取代理链配置的快照（chain_tag, outbound_manager clone）。
     fn get_proxy_chain(&self) -> (Option<String>, Option<Arc<dyn OutboundHandlerManager>>) {
-        let guard = self.proxy_chain.read().expect("DialBridge proxy_chain lock poisoned");
+        let guard = self.proxy_chain.read();
         (guard.chain_tag.clone(), guard.outbound_manager.clone())
     }
 }
 
 impl std::fmt::Debug for DialBridge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let chain_tag = self.proxy_chain.read().ok().and_then(|g| g.chain_tag.clone());
+        let chain_tag = self.proxy_chain.read().chain_tag.clone();
         f.debug_struct("DialBridge")
             .field("tag", &self.tag)
             .field("proxy_chain_tag", &chain_tag)
@@ -1893,21 +1893,21 @@ impl DialBridge {
 ///
 /// 用于测试和简单场景。生产环境用 `proxyman::OutboundManager`。
 pub struct SimpleOhm {
-    default: std::sync::RwLock<Option<Arc<dyn DispatchHandler>>>,
-    tagged: std::sync::RwLock<std::collections::HashMap<String, Arc<dyn DispatchHandler>>>,
+    default: parking_lot::RwLock<Option<Arc<dyn DispatchHandler>>>,
+    tagged: parking_lot::RwLock<std::collections::HashMap<String, Arc<dyn DispatchHandler>>>,
 }
 
 impl SimpleOhm {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            default: std::sync::RwLock::new(None),
-            tagged: std::sync::RwLock::new(std::collections::HashMap::new()),
+            default: parking_lot::RwLock::new(None),
+            tagged: parking_lot::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
     pub fn set_default(&self, handler: Arc<dyn DispatchHandler>) {
-        *self.default.write().unwrap() = Some(handler);
+        *self.default.write() = Some(handler);
     }
 
     /// 浅快照：共享全部 tagged/default handler（Arc clone），后续对快照的
@@ -1920,8 +1920,8 @@ impl SimpleOhm {
     #[must_use]
     pub fn snapshot(&self) -> SimpleOhm {
         Self {
-            default: std::sync::RwLock::new(self.default.read().unwrap().clone()),
-            tagged: std::sync::RwLock::new(self.tagged.read().unwrap().clone()),
+            default: parking_lot::RwLock::new(self.default.read().clone()),
+            tagged: parking_lot::RwLock::new(self.tagged.read().clone()),
         }
     }
 
@@ -1929,26 +1929,26 @@ impl SimpleOhm {
     /// 显式调用方仅 xray-app-reverse bridge 的备用注册路径——保留 API 完整性。
     #[allow(dead_code)] // reverse bridge 备用注册路径生产可达性待接线，API 对位 Go AddHandler
     pub fn add(&self, tag: &str, handler: Arc<dyn DispatchHandler>) {
-        self.tagged.write().unwrap().insert(tag.to_string(), handler);
+        self.tagged.write().insert(tag.to_string(), handler);
     }
 
     /// 移除 tag 对应的 handler。对应 Go `outbound.Manager.RemoveHandler`：
     /// default handler 的 tag 与之相同时 default 一并清空。
     /// 返回 tag 是否存在（不存在 = no-op，由调用方决定是否报错）。
     pub fn remove(&self, tag: &str) -> bool {
-        let Some(_old) = self.tagged.write().unwrap().remove(tag) else {
+        let Some(_old) = self.tagged.write().remove(tag) else {
             return false;
         };
-        let default_matches = self.default.read().unwrap().as_ref().is_some_and(|h| h.tag() == tag);
+        let default_matches = self.default.read().as_ref().is_some_and(|h| h.tag() == tag);
         if default_matches {
-            *self.default.write().unwrap() = None;
+            *self.default.write() = None;
         }
         true
     }
 
     /// 列出全部 tagged handler 的 tag（动态 AddOutbound/ListOutbounds 用）。
     pub fn list_tags(&self) -> Vec<String> {
-        self.tagged.read().unwrap().keys().cloned().collect()
+        self.tagged.read().keys().cloned().collect()
     }
 }
 
@@ -1966,11 +1966,11 @@ impl Default for SimpleOhm {
 
 impl OutboundHandlerManager for SimpleOhm {
     fn get_handler(&self, tag: &str) -> Option<Arc<dyn DispatchHandler>> {
-        self.tagged.read().unwrap().get(tag).cloned()
+        self.tagged.read().get(tag).cloned()
     }
 
     fn get_default_handler(&self) -> Option<Arc<dyn DispatchHandler>> {
-        self.default.read().unwrap().clone()
+        self.default.read().clone()
     }
 }
 

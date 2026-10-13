@@ -409,7 +409,8 @@ impl OutboundHandler for OutboundHandlerEntry {
                     Some(manager) if manager.get_handler(&tag).is_some() => {
                         // 创建 duplex pipe：client 端返回给调用者，proxy 端桥接到 chained handler
                         // Go: 通过 chained handler 的 dial() 建立真实连接，然后双向桥接
-                        let handler = manager.get_handler(&tag).unwrap();
+                        let handler =
+                            manager.get_handler(&tag).expect("match arm guard above ensures Some");
                         let mut chained_conn = handler.dial(&dest).await?;
 
                         // 创建 pipe pair 做双向桥接

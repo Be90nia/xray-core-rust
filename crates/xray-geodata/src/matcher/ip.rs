@@ -5,8 +5,9 @@
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    sync::Mutex,
 };
+
+use parking_lot::Mutex;
 
 use crate::pb::{self, Cidr, IpRule};
 
@@ -615,14 +616,14 @@ impl IPSetFactory {
     /// 从 CIDR 列表创建 IPSet 并缓存。
     pub fn create_from_cidrs(&self, key: &str, cidrs: &[Cidr]) -> IPSet {
         {
-            let cache = self.cache.lock().expect("IPSetFactory lock poisoned");
+            let cache = self.cache.lock();
             if let Some(ipset) = cache.get(key) {
                 return ipset.clone();
             }
         }
         let ipset = IPSet::from_cidrs(cidrs);
         {
-            let mut cache = self.cache.lock().expect("IPSetFactory lock poisoned");
+            let mut cache = self.cache.lock();
             cache.insert(key.to_string(), ipset.clone());
         }
         ipset
@@ -1217,9 +1218,11 @@ mod tests {
 // ── IP registry (热替换) ─────────────────────────────────────────
 
 use std::sync::{
-    Arc, RwLock,
+    Arc,
     atomic::{AtomicBool, Ordering},
 };
+
+use parking_lot::RwLock;
 
 /// IP 匹配器注册表 + 热替换。
 ///
@@ -1250,7 +1253,7 @@ impl IpRegistry {
     ) -> Result<Arc<DynamicIPMatcher>, BuildIPMatcherError> {
         let initial = build_optimized_ip_matcher(rules)?;
         let matcher = Arc::new(DynamicIPMatcher::new(initial));
-        let mut g = self.inner.write().expect("IpRegistry poisoned");
+        let mut g = self.inner.write();
         g.entries.push(RegistryEntry { matcher: Arc::clone(&matcher) });
         Ok(matcher)
     }
@@ -1261,7 +1264,7 @@ impl IpRegistry {
     pub fn reload_with(&self, new_rules: &[IpRule]) -> Result<(), BuildIPMatcherError> {
         // 一次拷出 entries 引用，避免长时间持写锁。
         let entries: Vec<Arc<DynamicIPMatcher>> = {
-            let g = self.inner.read().expect("IpRegistry poisoned");
+            let g = self.inner.read();
             g.entries.iter().map(|e| Arc::clone(&e.matcher)).collect()
         };
 
@@ -1276,7 +1279,7 @@ impl IpRegistry {
     /// 当前注册的动态匹配器数量。
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.read().expect("IpRegistry poisoned").entries.len()
+        self.inner.read().entries.len()
     }
 
     #[must_use]
@@ -1320,7 +1323,7 @@ impl DynamicIPMatcher {
         } else if reverse {
             new.toggle_reverse();
         }
-        let mut g = self.state.write().expect("DynamicIPMatcher state poisoned");
+        let mut g = self.state.write();
         *g = new;
     }
 
@@ -1328,7 +1331,7 @@ impl DynamicIPMatcher {
     pub fn set_reverse(&self, reverse: bool) {
         self.reverse.store(reverse, Ordering::Release);
         self.reverse_set.store(true, Ordering::Release);
-        let mut g = self.state.write().expect("DynamicIPMatcher state poisoned");
+        let mut g = self.state.write();
         g.set_reverse(reverse);
     }
 
@@ -1336,7 +1339,7 @@ impl DynamicIPMatcher {
     pub fn toggle_reverse(&self) {
         let new = !self.reverse.load(Ordering::Acquire);
         self.reverse.store(new, Ordering::Release);
-        let mut g = self.state.write().expect("DynamicIPMatcher state poisoned");
+        let mut g = self.state.write();
         g.toggle_reverse();
     }
 
@@ -1347,7 +1350,7 @@ impl DynamicIPMatcher {
     }
 
     fn with_state<R>(&self, f: impl FnOnce(&dyn IPMatcher) -> R) -> R {
-        let g = self.state.read().expect("DynamicIPMatcher state poisoned");
+        let g = self.state.read();
         f(&**g)
     }
 }

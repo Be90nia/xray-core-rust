@@ -61,7 +61,8 @@ impl BalancingStrategy for LeastPingStrategy {
                 continue;
             }
             let rtt = effective_rtt(s);
-            if best_rtt.is_none() || rtt < best_rtt.unwrap() {
+            if best_rtt.is_none() || rtt < best_rtt.expect("short-circuit is_none handled on left")
+            {
                 best_rtt = Some(rtt);
                 best_tag = s.outbound_tag.clone();
             }

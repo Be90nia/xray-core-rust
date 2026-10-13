@@ -393,7 +393,9 @@ pub fn sign_mldsa65_signature(seed: &[u8], message: &[u8]) -> Result<Vec<u8>, Re
         return Err(RealityError::InvalidMldsa65SeedLen { actual: seed.len() });
     }
     use ml_dsa::{EncodedSignature, MlDsa65, Seed, Signer, SigningKey};
-    let sk = SigningKey::<MlDsa65>::from_seed(&Seed::from(<[u8; 32]>::try_from(seed).unwrap()));
+    let sk = SigningKey::<MlDsa65>::from_seed(&Seed::from(
+        <[u8; 32]>::try_from(seed).expect("seed.len() == MLDSA65_SEED_LEN checked above"),
+    ));
     let encoded: EncodedSignature<MlDsa65> = sk.sign(message).encode();
     Ok(encoded.as_slice().to_vec())
 }
@@ -426,7 +428,9 @@ pub fn derive_mldsa65_pubkey(seed: &[u8]) -> Result<Vec<u8>, RealityError> {
         return Err(RealityError::InvalidMldsa65SeedLen { actual: seed.len() });
     }
     use ml_dsa::{KeyExport, MlDsa65, Seed, SigningKey};
-    let sk = SigningKey::<MlDsa65>::from_seed(&Seed::from(<[u8; 32]>::try_from(seed).unwrap()));
+    let sk = SigningKey::<MlDsa65>::from_seed(&Seed::from(
+        <[u8; 32]>::try_from(seed).expect("seed.len() == MLDSA65_SEED_LEN checked above"),
+    ));
     Ok(sk.as_ref().to_bytes().to_vec())
 }
 

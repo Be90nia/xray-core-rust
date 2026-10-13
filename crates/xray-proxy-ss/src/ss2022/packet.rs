@@ -222,12 +222,16 @@ fn parse_client_plaintext(mut plain: &[u8], payload_out: &mut Vec<u8>) -> Result
     if ty != HEADER_TYPE_CLIENT {
         return Err(SsError::Ss2022InvalidHeaderType(ty));
     }
-    let ts = i64::from_be_bytes(plain[1..9].try_into().unwrap());
+    let ts = i64::from_be_bytes(
+        plain[1..9].try_into().expect("plain.len() >= MIN_PLAINTEXT checked above"),
+    );
     let diff = (now_unix() - ts).abs();
     if diff > TIMESTAMP_TOLERANCE_SECS {
         return Err(SsError::Ss2022TimestampCheck(format!("diff {diff}s")));
     }
-    let pad = u16::from_be_bytes(plain[9..11].try_into().unwrap()) as usize;
+    let pad = u16::from_be_bytes(
+        plain[9..11].try_into().expect("plain.len() >= MIN_PLAINTEXT checked above"),
+    ) as usize;
     plain = &plain[11..];
     if plain.len() < pad {
         return Err(SsError::InsufficientData(plain.len()));
@@ -253,16 +257,22 @@ fn parse_server_plaintext(
     if ty != HEADER_TYPE_SERVER {
         return Err(SsError::Ss2022InvalidHeaderType(ty));
     }
-    let ts = i64::from_be_bytes(plain[1..9].try_into().unwrap());
+    let ts = i64::from_be_bytes(
+        plain[1..9].try_into().expect("plain.len() >= MIN_PLAINTEXT + 8 checked above"),
+    );
     let diff = (now_unix() - ts).abs();
     if diff > TIMESTAMP_TOLERANCE_SECS {
         return Err(SsError::Ss2022TimestampCheck(format!("diff {diff}s")));
     }
-    let csid = u64::from_be_bytes(plain[9..17].try_into().unwrap());
+    let csid = u64::from_be_bytes(
+        plain[9..17].try_into().expect("plain.len() >= MIN_PLAINTEXT + 8 checked above"),
+    );
     if csid != expect_client_session_id {
         return Err(SsError::Ss2022BadClientSessionId);
     }
-    let pad = u16::from_be_bytes(plain[17..19].try_into().unwrap()) as usize;
+    let pad = u16::from_be_bytes(
+        plain[17..19].try_into().expect("plain.len() >= MIN_PLAINTEXT + 8 checked above"),
+    ) as usize;
     plain = &plain[19..];
     if plain.len() < pad {
         return Err(SsError::InsufficientData(plain.len()));
@@ -437,7 +447,14 @@ impl ClientUdpSession2022 {
             return Err(SsError::InsufficientData(pkt.len()));
         }
         let last = &self.psk_list[self.psk_list.len() - 1];
-        let hdr = ecb_block(self.kind, last, pkt[..16].try_into().unwrap(), false)?;
+        let hdr = ecb_block(
+            self.kind,
+            last,
+            pkt[..16]
+                .try_into()
+                .expect("pkt.len() >= PACKET_HEADER_LEN + MIN_PLAINTEXT checked above"),
+            false,
+        )?;
         let session_id = u64::from_be_bytes(hdr[..8].try_into().unwrap());
         let packet_id = u64::from_be_bytes(hdr[8..].try_into().unwrap());
 
@@ -471,8 +488,16 @@ impl ClientUdpSession2022 {
         if plain.len() < PACKET_HEADER_LEN + MIN_PLAINTEXT {
             return Err(SsError::InsufficientData(plain.len()));
         }
-        let session_id = u64::from_be_bytes(plain[..8].try_into().unwrap());
-        let packet_id = u64::from_be_bytes(plain[8..16].try_into().unwrap());
+        let session_id = u64::from_be_bytes(
+            plain[..8]
+                .try_into()
+                .expect("plain.len() >= PACKET_HEADER_LEN + MIN_PLAINTEXT checked above"),
+        );
+        let packet_id = u64::from_be_bytes(
+            plain[8..16]
+                .try_into()
+                .expect("plain.len() >= PACKET_HEADER_LEN + MIN_PLAINTEXT checked above"),
+        );
 
         let mut st = self.remote.lock();
         let slot = route_remote_generation(&mut st, session_id)?;
@@ -623,8 +648,16 @@ pub fn server_decode_header<'a>(
             return Err(SsError::InsufficientData(plain.len()));
         }
         return Ok(DecodedClientHeader {
-            session_id: u64::from_be_bytes(plain[..8].try_into().unwrap()),
-            packet_id: u64::from_be_bytes(plain[8..16].try_into().unwrap()),
+            session_id: u64::from_be_bytes(
+                plain[..8]
+                    .try_into()
+                    .expect("plain.len() >= PACKET_HEADER_LEN + MIN_PLAINTEXT checked above"),
+            ),
+            packet_id: u64::from_be_bytes(
+                plain[8..16]
+                    .try_into()
+                    .expect("plain.len() >= PACKET_HEADER_LEN + MIN_PLAINTEXT checked above"),
+            ),
             hdr: [0u8; 16],
             eih_len: 0,
             aead_psk: server_psk,
@@ -636,7 +669,14 @@ pub fn server_decode_header<'a>(
     if pkt.len() < PACKET_HEADER_LEN + eih_len + MIN_PLAINTEXT {
         return Err(SsError::InsufficientData(pkt.len()));
     }
-    let hdr = ecb_block(kind, server_psk, pkt[..16].try_into().unwrap(), false)?;
+    let hdr = ecb_block(
+        kind,
+        server_psk,
+        pkt[..16]
+            .try_into()
+            .expect("pkt.len() >= PACKET_HEADER_LEN + eih_len + MIN_PLAINTEXT checked above"),
+        false,
+    )?;
     let session_id = u64::from_be_bytes(hdr[..8].try_into().unwrap());
     let packet_id = u64::from_be_bytes(hdr[8..].try_into().unwrap());
 
@@ -644,7 +684,14 @@ pub fn server_decode_header<'a>(
         server_psk
     } else {
         // EIH 块：ECB(iPSK) 解密后 XOR 明文包头 → 用户 PSK identity
-        let eih = ecb_block(kind, server_psk, pkt[16..32].try_into().unwrap(), false)?;
+        let eih = ecb_block(
+            kind,
+            server_psk,
+            pkt[16..32]
+                .try_into()
+                .expect("users non-empty implies eih_len == 16; pkt.len() checked above"),
+            false,
+        )?;
         let mut ident = eih;
         for (b, h) in ident.iter_mut().zip(hdr.iter()) {
             *b ^= h;

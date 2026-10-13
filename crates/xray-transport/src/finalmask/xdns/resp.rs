@@ -295,11 +295,11 @@ pub(crate) fn name_wire_len(name: &Name) -> usize {
 
 /// 待发响应包队列（对应 Go `SendManager`/`SendInfo`）。
 ///
-/// 字段经 std::sync::Mutex 内部可变：服务端循环持有 `Arc<SendInfo>` 即可读写。
+/// 字段经 parking_lot::Mutex 内部可变：服务端循环持有 `Arc<SendInfo>` 即可读写。
 pub(crate) struct SendInfo {
-    stash: std::sync::Mutex<VecDeque<Vec<u8>>>,
-    ch: std::sync::Mutex<VecDeque<Vec<u8>>>,
-    deadline: std::sync::Mutex<Instant>,
+    stash: parking_lot::Mutex<VecDeque<Vec<u8>>>,
+    ch: parking_lot::Mutex<VecDeque<Vec<u8>>>,
+    deadline: parking_lot::Mutex<Instant>,
     notify: tokio::sync::Notify,
 }
 
@@ -310,14 +310,14 @@ impl SendInfo {
 
     /// 非阻塞取包：stash 优先（对齐 Go select 优先级）。
     pub(crate) fn try_pop(&self) -> Option<Vec<u8>> {
-        if let Some(p) = self.stash.lock().expect("send info mutex").pop_front() {
+        if let Some(p) = self.stash.lock().pop_front() {
             return Some(p);
         }
-        self.ch.lock().expect("send info mutex").pop_front()
+        self.ch.lock().pop_front()
     }
 
     fn push_ch(&self, p: Vec<u8>) {
-        let mut ch = self.ch.lock().expect("send info mutex");
+        let mut ch = self.ch.lock();
         if ch.len() < CH_CAP {
             ch.push_back(p);
             self.notify.notify_one();
@@ -325,7 +325,7 @@ impl SendInfo {
     }
 
     fn push_stash(&self, p: Vec<u8>) {
-        let mut stash = self.stash.lock().expect("send info mutex");
+        let mut stash = self.stash.lock();
         if stash.len() < STASH_CAP {
             stash.push_back(p);
             self.notify.notify_one();
@@ -333,7 +333,7 @@ impl SendInfo {
     }
 
     pub(crate) fn refresh(&self) {
-        *self.deadline.lock().expect("send info mutex") = Self::now_deadline();
+        *self.deadline.lock() = Self::now_deadline();
     }
 
     /// 等待新包通知（调用方须先 try_pop 再挂 notified，防漏通知）。
@@ -342,28 +342,28 @@ impl SendInfo {
     }
 
     fn expired(&self, now: Instant) -> bool {
-        now > *self.deadline.lock().expect("send info mutex")
+        now > *self.deadline.lock()
     }
 }
 
 pub(crate) struct SendManager {
-    m: std::sync::Mutex<HashMap<ClientID, Arc<SendInfo>>>,
+    m: parking_lot::Mutex<HashMap<ClientID, Arc<SendInfo>>>,
 }
 
 impl SendManager {
     pub(crate) fn new() -> Self {
-        Self { m: std::sync::Mutex::new(HashMap::new()) }
+        Self { m: parking_lot::Mutex::new(HashMap::new()) }
     }
 
     /// 取发送句柄并刷新 deadline（含缺省创建，对齐 Go `Pop`）。
     pub(crate) fn get(&self, id: ClientID) -> Arc<SendInfo> {
-        let mut m = self.m.lock().expect("send manager mutex");
+        let mut m = self.m.lock();
         m.entry(id)
             .or_insert_with(|| {
                 Arc::new(SendInfo {
-                    stash: std::sync::Mutex::new(VecDeque::new()),
-                    ch: std::sync::Mutex::new(VecDeque::new()),
-                    deadline: std::sync::Mutex::new(SendInfo::now_deadline()),
+                    stash: parking_lot::Mutex::new(VecDeque::new()),
+                    ch: parking_lot::Mutex::new(VecDeque::new()),
+                    deadline: parking_lot::Mutex::new(SendInfo::now_deadline()),
                     notify: tokio::sync::Notify::new(),
                 })
             })
@@ -379,7 +379,7 @@ impl SendManager {
 
     /// 暂存超容量包（下轮优先发出），对齐 Go `Stash`。
     pub(crate) fn stash(&self, id: ClientID, p: &[u8]) {
-        let m = self.m.lock().expect("send manager mutex");
+        let m = self.m.lock();
         if let Some(info) = m.get(&id) {
             info.refresh();
             info.push_stash(p.to_vec());
@@ -388,7 +388,7 @@ impl SendManager {
 
     /// TTL 清扫（对应 Go gc），过期 entry 移除并唤醒等待方。
     pub(crate) fn sweep_expired(&self) {
-        let mut m = self.m.lock().expect("send manager mutex");
+        let mut m = self.m.lock();
         let now = Instant::now();
         m.retain(|_, info| {
             if info.expired(now) {
@@ -402,7 +402,7 @@ impl SendManager {
 
     /// 对应 Go `Close`（服务端关停时清空并唤醒等待方）。
     pub(crate) fn close(&self) {
-        let mut m = self.m.lock().expect("send manager mutex");
+        let mut m = self.m.lock();
         for (_, info) in m.drain() {
             info.notify.notify_waiters();
         }

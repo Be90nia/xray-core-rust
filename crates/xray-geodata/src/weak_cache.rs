@@ -21,8 +21,10 @@
 use std::{
     collections::HashMap,
     hash::Hash,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Weak},
 };
+
+use parking_lot::Mutex;
 
 /// 弱引用缓存。
 ///
@@ -61,7 +63,7 @@ where
     /// 同时清理对应 slot。
     #[must_use]
     pub fn load(&self, key: &K) -> Option<Weak<V>> {
-        let mut guard = self.inner.lock().expect("WeakCacheMap poisoned");
+        let mut guard = self.inner.lock();
         let weak = guard.get(key)?.clone();
         if weak.strong_count() == 0 {
             guard.remove(key);
@@ -75,7 +77,7 @@ where
     /// 调用者必须持有 `Arc<V>`（否则弱引用立即失效）。
     pub fn store(&self, key: K, value: Arc<V>) -> Weak<V> {
         let weak = Arc::downgrade(&value);
-        let mut guard = self.inner.lock().expect("WeakCacheMap poisoned");
+        let mut guard = self.inner.lock();
         guard.insert(key, weak.clone());
         weak
     }
@@ -102,7 +104,7 @@ where
     /// 内部表条目数（含已失效弱引用），仅供监控/调试。
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("WeakCacheMap poisoned").len()
+        self.inner.lock().len()
     }
 
     /// 是否空表（条目数为 0）。
@@ -116,7 +118,7 @@ where
     /// 不需要周期性调用（Go 端 `runtime.AddCleanup` 自动清理）。
     /// 测试或调试场景可显式触发。
     pub fn cleanup_expired(&self) -> usize {
-        let mut guard = self.inner.lock().expect("WeakCacheMap poisoned");
+        let mut guard = self.inner.lock();
         let before = guard.len();
         guard.retain(|_, w| w.strong_count() > 0);
         before - guard.len()
@@ -151,23 +153,23 @@ mod tests {
     #[test]
     fn get_or_insert_with_miss_then_hit() {
         let cache: WeakCacheMap<String, Vec<u8>> = WeakCacheMap::new();
-        let counter = Arc::new(std::sync::Mutex::new(0_u32));
+        let counter = Arc::new(parking_lot::Mutex::new(0_u32));
         let c2 = Arc::clone(&counter);
         let arc = cache.get_or_insert_with("k".to_string(), || {
-            *c2.lock().unwrap() += 1;
+            *c2.lock() += 1;
             Arc::new(vec![1, 2, 3])
         });
         assert_eq!(*arc, vec![1, 2, 3]);
-        assert_eq!(*counter.lock().unwrap(), 1);
+        assert_eq!(*counter.lock(), 1);
 
         // 命中路径：不重复 init
         let c2 = Arc::clone(&counter);
         let arc2 = cache.get_or_insert_with("k".to_string(), || {
-            *c2.lock().unwrap() += 1;
+            *c2.lock() += 1;
             Arc::new(vec![9])
         });
         assert_eq!(*arc2, vec![1, 2, 3]);
-        assert_eq!(*counter.lock().unwrap(), 1);
+        assert_eq!(*counter.lock(), 1);
     }
 
     #[test]

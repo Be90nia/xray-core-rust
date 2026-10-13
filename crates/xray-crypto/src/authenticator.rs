@@ -8,7 +8,7 @@
 //! - [`AEADAuthenticator`] — 基于 AeadCipher 的实现
 //! - [`BytesGenerator`] — 字节生成器（nonce/aad 生成）
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use crate::aead::{AeadCipher, CryptoError};
 
@@ -42,7 +42,7 @@ pub fn generate_static_bytes(content: Vec<u8>) -> BytesGenerator {
 pub fn generate_increasing_nonce(nonce: Vec<u8>) -> BytesGenerator {
     let state = Mutex::new(nonce);
     Box::new(move || {
-        let mut current = state.lock().unwrap();
+        let mut current = state.lock();
         for b in current.iter_mut() {
             *b = b.wrapping_add(1);
             if *b != 0 {

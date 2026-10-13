@@ -14,7 +14,9 @@
 //! # 工厂模式
 //!
 //! - [`DomainMatcherFactory`] - 域名匹配器工厂 trait
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use super::{
     DomainMatcher as DomainMatcherImpl, FullMatcher, Matcher, MatcherError, MatcherGroup,
@@ -446,7 +448,7 @@ fn build_compact_inner(rules: &[DomainRule]) -> Result<CompactDomainMatcher, Mat
 ///
 /// 对应 Go 版本 `DynamicDomainMatcher`，支持运行时更新规则
 pub struct DynamicDomainMatcher {
-    state: std::sync::RwLock<Option<Box<dyn DomainMatcher>>>,
+    state: parking_lot::RwLock<Option<Box<dyn DomainMatcher>>>,
     rules: Mutex<Vec<DomainRule>>,
 }
 
@@ -454,7 +456,7 @@ impl DynamicDomainMatcher {
     /// 创建新的动态域名匹配器。
     #[must_use]
     pub fn new() -> Self {
-        Self { state: std::sync::RwLock::new(None), rules: Mutex::new(Vec::new()) }
+        Self { state: parking_lot::RwLock::new(None), rules: Mutex::new(Vec::new()) }
     }
 
     /// 设置规则并重建匹配器。
@@ -464,14 +466,14 @@ impl DynamicDomainMatcher {
         factory: &dyn DomainMatcherFactory,
     ) -> Result<(), MatcherError> {
         let matcher = factory.build_matcher(&rules)?;
-        *self.rules.lock().unwrap() = rules;
-        *self.state.write().unwrap() = Some(matcher);
+        *self.rules.lock() = rules;
+        *self.state.write() = Some(matcher);
         Ok(())
     }
 
     /// 更新匹配器状态。
     pub fn update(&self, matcher: Box<dyn DomainMatcher>) {
-        *self.state.write().unwrap() = Some(matcher);
+        *self.state.write() = Some(matcher);
     }
 }
 
@@ -483,7 +485,7 @@ impl Default for DynamicDomainMatcher {
 
 impl DomainMatcher for DynamicDomainMatcher {
     fn match_domain(&self, input: &str) -> Vec<u32> {
-        let guard = self.state.read().unwrap();
+        let guard = self.state.read();
         match guard.as_ref() {
             Some(m) => m.match_domain(input),
             None => Vec::new(),
@@ -491,7 +493,7 @@ impl DomainMatcher for DynamicDomainMatcher {
     }
 
     fn match_any(&self, input: &str) -> bool {
-        let guard = self.state.read().unwrap();
+        let guard = self.state.read();
         match guard.as_ref() {
             Some(m) => m.match_any(input),
             None => false,
@@ -501,7 +503,7 @@ impl DomainMatcher for DynamicDomainMatcher {
 
 impl std::fmt::Debug for DynamicDomainMatcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let has_state = self.state.read().unwrap().is_some();
+        let has_state = self.state.read().is_some();
         f.debug_struct("DynamicDomainMatcher").field("has_state", &has_state).finish()
     }
 }
@@ -531,14 +533,14 @@ impl DomainRegistry {
     ) -> Result<Arc<DynamicDomainMatcher>, MatcherError> {
         let matcher = Arc::new(DynamicDomainMatcher::new());
         matcher.set_rules(rules, self.factory.as_ref())?;
-        let mut matchers = self.matchers.lock().unwrap();
+        let mut matchers = self.matchers.lock();
         matchers.push(Arc::clone(&matcher));
         Ok(matcher)
     }
 
     /// 查询指定索引的匹配器。
     pub fn get_matcher(&self, idx: usize) -> Option<DomainRegistryGuard<'_>> {
-        let guard = self.matchers.lock().unwrap();
+        let guard = self.matchers.lock();
         if idx < guard.len() {
             drop(guard);
             Some(DomainRegistryGuard { registry: self, index: idx })
@@ -550,7 +552,7 @@ impl DomainRegistry {
     /// 返回匹配器数量。
     #[must_use]
     pub fn len(&self) -> usize {
-        self.matchers.lock().unwrap().len()
+        self.matchers.lock().len()
     }
 
     /// 是否为空。
@@ -566,7 +568,7 @@ impl DomainRegistry {
         let factory = self.factory.as_ref();
         // 拷出 matcher 引用，避免长持锁。
         let matchers: Vec<Arc<DynamicDomainMatcher>> = {
-            let g = self.matchers.lock().unwrap();
+            let g = self.matchers.lock();
             g.iter().cloned().collect()
         };
 
@@ -594,13 +596,13 @@ pub struct DomainRegistryGuard<'a> {
 impl<'a> DomainRegistryGuard<'a> {
     /// 使用匹配器执行匹配。
     pub fn match_domain(&self, input: &str) -> Vec<u32> {
-        let guard = self.registry.matchers.lock().unwrap();
+        let guard = self.registry.matchers.lock();
         guard[self.index].match_domain(input)
     }
 
     /// 使用匹配器执行存在性检查。
     pub fn match_any(&self, input: &str) -> bool {
-        let guard = self.registry.matchers.lock().unwrap();
+        let guard = self.registry.matchers.lock();
         guard[self.index].match_any(input)
     }
 }

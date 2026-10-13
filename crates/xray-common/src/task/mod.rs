@@ -11,13 +11,13 @@ use crate::errors::Error;
 /// 对应 Go 版本 `task.Periodic`，按固定间隔重复执行任务回调。
 pub struct Periodic {
     interval: Duration,
-    running: Arc<std::sync::Mutex<bool>>,
+    running: Arc<parking_lot::Mutex<bool>>,
 }
 
 impl Periodic {
     /// 创建新的周期性任务，指定执行间隔。
     pub fn new(interval: Duration) -> Self {
-        Self { interval, running: Arc::new(std::sync::Mutex::new(false)) }
+        Self { interval, running: Arc::new(parking_lot::Mutex::new(false)) }
     }
 
     /// 启动周期性任务，传入任务回调函数。
@@ -33,8 +33,7 @@ impl Periodic {
         F: Fn() -> Result<(), Error> + Send + Sync + 'static,
     {
         {
-            let mut running =
-                self.running.lock().map_err(|_| Error::new("running lock poisoned"))?;
+            let mut running = self.running.lock();
             if *running {
                 return Err(Error::new("periodic task is already running"));
             }
@@ -47,11 +46,7 @@ impl Periodic {
         tokio::spawn(async move {
             loop {
                 {
-                    let r = match running.lock() {
-                        Ok(r) => r,
-                        Err(_) => break,
-                    };
-                    if !*r {
+                    if !*running.lock() {
                         break;
                     }
                 }
@@ -59,9 +54,7 @@ impl Periodic {
                 match task() {
                     Ok(()) => {},
                     Err(_) => {
-                        if let Ok(mut r) = running.lock() {
-                            *r = false;
-                        }
+                        *running.lock() = false;
                         break;
                     },
                 }
@@ -73,16 +66,14 @@ impl Periodic {
         Ok(())
     }
 
-    /// 停止周期性任务。锁中毒时静默忽略。
+    /// 停止周期性任务。
     pub fn stop(&self) {
-        if let Ok(mut running) = self.running.lock() {
-            *running = false;
-        }
+        *self.running.lock() = false;
     }
 
-    /// 检查任务是否正在运行。锁中毒时返回 `false`。
+    /// 检查任务是否正在运行。
     pub fn is_running(&self) -> bool {
-        self.running.lock().is_ok_and(|r| *r)
+        *self.running.lock()
     }
 }
 

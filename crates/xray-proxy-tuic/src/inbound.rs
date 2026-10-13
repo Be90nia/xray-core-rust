@@ -84,7 +84,7 @@ pub struct TuicInboundHandler {
     /// listener + accept 任务句柄，close 时 abort。
     slot: Mutex<Option<InboundSlot>>,
     /// 自签证书 DER（start 时生成，供 client trust store）。
-    cert_der: std::sync::Mutex<Option<Vec<u8>>>,
+    cert_der: parking_lot::Mutex<Option<Vec<u8>>>,
     /// 实际监听端口（start 后有效；listen 配置 0 时由 OS 分配）。
     local_port: std::sync::atomic::AtomicU16,
 }
@@ -103,14 +103,14 @@ impl TuicInboundHandler {
             config,
             dispatch: None,
             slot: Mutex::new(None),
-            cert_der: std::sync::Mutex::new(None),
+            cert_der: parking_lot::Mutex::new(None),
             local_port: std::sync::atomic::AtomicU16::new(0),
         })
     }
 
     /// 自签证书 DER（start 后可用，client trust store 用）。
     pub fn cert_der(&self) -> Option<Vec<u8>> {
-        self.cert_der.lock().unwrap().clone()
+        self.cert_der.lock().clone()
     }
 
     /// 注入出站 dispatcher（生产路径：Connect 经 router 分发而非直连）。
@@ -135,7 +135,7 @@ impl TuicInboundHandler {
                     TuicError::Io(std::io::Error::other(format!("rcgen self-signed failed: {e}")))
                 })?;
                 // 暴露自签证书给 client trust store
-                *self.cert_der.lock().unwrap() = Some(tls.cert_der.clone());
+                *self.cert_der.lock() = Some(tls.cert_der.clone());
                 (tls.cert_der, tls.key_der)
             };
 

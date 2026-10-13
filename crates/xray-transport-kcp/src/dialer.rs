@@ -85,6 +85,7 @@ pub fn dial_kcp(_factory: &dyn KcpDialerFactory, _dest: &str) -> Result<Connecti
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::segment::{CmdOnlySegment, Command, Segment};

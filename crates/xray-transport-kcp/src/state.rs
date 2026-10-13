@@ -93,6 +93,7 @@ impl fmt::Display for State {
 pub const STATE_ACTIVE: State = State::Active;
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

@@ -707,7 +707,7 @@ impl tokio::io::AsyncRead for KcpConn {
                     inner.inner.data_input.notified().await;
                 }));
             }
-            if state.as_mut().unwrap().as_mut().poll(cx).is_pending() {
+            if state.as_mut().expect("state set above when None").as_mut().poll(cx).is_pending() {
                 return std::task::Poll::Pending;
             }
             // 通知已到达：消费掉缓存的 future（防重 poll 已完成 future），重读
@@ -739,7 +739,7 @@ impl tokio::io::AsyncWrite for KcpConn {
                     inner.inner.data_output.notified().await;
                 }));
             }
-            if state.as_mut().unwrap().as_mut().poll(cx).is_pending() {
+            if state.as_mut().expect("state set above when None").as_mut().poll(cx).is_pending() {
                 return std::task::Poll::Pending;
             }
             *state = None;
@@ -778,6 +778,7 @@ impl xray_transport::connection::Connection for KcpConn {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
 

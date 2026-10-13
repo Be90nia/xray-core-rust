@@ -234,9 +234,9 @@ impl WsListener {
         trusted: &[String],
     ) -> Result<AcceptedConn> {
         let configs_arc: Arc<[Arc<Config>]> = Arc::from(configs);
-        let early_data_slot: Arc<std::sync::Mutex<Vec<u8>>> = Arc::default();
-        let xff_slot: Arc<std::sync::Mutex<Option<IpAddr>>> = Arc::default();
-        let matched_idx_slot: Arc<std::sync::Mutex<Option<usize>>> = Arc::default();
+        let early_data_slot: Arc<parking_lot::Mutex<Vec<u8>>> = Arc::default();
+        let xff_slot: Arc<parking_lot::Mutex<Option<IpAddr>>> = Arc::default();
+        let matched_idx_slot: Arc<parking_lot::Mutex<Option<usize>>> = Arc::default();
 
         let ed_cb = Arc::clone(&early_data_slot);
         let xff_cb = Arc::clone(&xff_slot);
@@ -264,9 +264,7 @@ impl WsListener {
                     .unwrap();
                 return Err(denied);
             };
-            if let Ok(mut g) = matched_cb.lock() {
-                *g = Some(idx);
-            }
+            *matched_cb.lock() = Some(idx);
 
             // 2. Early data 提取：Sec-WebSocket-Protocol (base64 RawURL no pad)。
             let mut response = resp;
@@ -276,17 +274,13 @@ impl WsListener {
                 {
                     response.headers_mut().insert("Sec-WebSocket-Protocol", val);
                 }
-                if let Ok(mut guard) = ed_cb.lock() {
-                    *guard = ed_header.bytes;
-                }
+                *ed_cb.lock() = ed_header.bytes;
             }
 
             // 3. X-Forwarded-For 信任门控提取（对应 Go hub.go:63-68
             //    ApplyTrustedXForwardedFor：默认不信任，名单命中才采纳）。
             if let Some(ip) = extract_xff_trusted(headers, trusted) {
-                if let Ok(mut guard) = xff_cb.lock() {
-                    *guard = Some(ip);
-                }
+                *xff_cb.lock() = Some(ip);
             }
 
             Ok(response)
@@ -300,9 +294,9 @@ impl WsListener {
                 .map_err(|_| WsError::HandshakeFailed("websocket handshake timeout (4s)".into()))?
                 .map_err(|e| WsError::HandshakeFailed(format!("accept_hdr_async: {e}")))?;
 
-        let early_data = early_data_slot.lock().map(|g| g.clone()).unwrap_or_default();
-        let xff_ip = xff_slot.lock().ok().and_then(|mut g| g.take());
-        let matched_idx = matched_idx_slot.lock().ok().and_then(|mut g| g.take());
+        let early_data = early_data_slot.lock().clone();
+        let xff_ip = xff_slot.lock().take();
+        let matched_idx = matched_idx_slot.lock().take();
 
         // 4. Remote 决定：XFF 覆盖（port=0，对齐 Go forwardedAddrs[0]）。
         let final_remote = xff_ip.map(|ip| SocketAddr::new(ip, 0)).unwrap_or(remote);

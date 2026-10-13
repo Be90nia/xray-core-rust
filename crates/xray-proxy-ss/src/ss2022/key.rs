@@ -129,28 +129,32 @@ pub fn ecb_block(
     let enc = |buf: &mut [u8; 16]| -> Result<()> {
         match (kind, encrypt) {
             (CipherKind2022::Aes128Gcm, true) => {
-                let k: [u8; 16] = key[..16].try_into().unwrap();
+                let k: [u8; 16] =
+                    key[..16].try_into().expect("key length matches cipher kind by construction");
                 let arr: Array<u8, _> = k.into();
                 let mut b: Array<u8, _> = (*buf).into();
                 aes::Aes128::new(&arr).encrypt_block(&mut b);
                 *buf = b.into();
             },
             (CipherKind2022::Aes128Gcm, false) => {
-                let k: [u8; 16] = key[..16].try_into().unwrap();
+                let k: [u8; 16] =
+                    key[..16].try_into().expect("key length matches cipher kind by construction");
                 let arr: Array<u8, _> = k.into();
                 let mut b: Array<u8, _> = (*buf).into();
                 aes::Aes128::new(&arr).decrypt_block(&mut b);
                 *buf = b.into();
             },
             (_, true) => {
-                let k: [u8; 32] = key[..32].try_into().unwrap();
+                let k: [u8; 32] =
+                    key[..32].try_into().expect("key length matches cipher kind by construction");
                 let arr: Array<u8, _> = k.into();
                 let mut b: Array<u8, _> = (*buf).into();
                 aes::Aes256::new(&arr).encrypt_block(&mut b);
                 *buf = b.into();
             },
             (_, false) => {
-                let k: [u8; 32] = key[..32].try_into().unwrap();
+                let k: [u8; 32] =
+                    key[..32].try_into().expect("key length matches cipher kind by construction");
                 let arr: Array<u8, _> = k.into();
                 let mut b: Array<u8, _> = (*buf).into();
                 aes::Aes256::new(&arr).decrypt_block(&mut b);

@@ -13,6 +13,7 @@ xray-proto = { path = "../xray-proto" }
 xray-tls = { path = "../xray-tls" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+parking_lot = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 sha1 = "0.10"

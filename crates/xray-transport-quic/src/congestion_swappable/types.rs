@@ -149,7 +149,7 @@ pub trait CongestionControl: Send + Sync {
 pub(crate) mod test_support {
     //! 测试辅助：mock RTT 提供方。
 
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     use super::*;
 
@@ -165,13 +165,13 @@ pub(crate) mod test_support {
 
         #[allow(dead_code)] // RTT setter 为测试面与未来探针预留
         pub fn set(&self, rtt: Duration) {
-            *self.rtt.lock().unwrap() = rtt;
+            *self.rtt.lock() = rtt;
         }
     }
 
     impl RttStatsProvider for MockRttStats {
         fn smoothed_rtt(&self) -> Duration {
-            *self.rtt.lock().unwrap()
+            *self.rtt.lock()
         }
     }
 }

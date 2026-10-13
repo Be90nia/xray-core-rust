@@ -10,6 +10,7 @@ description = "GeoIP and GeoSite data types, loading and matching"
 xray-common = { path = "../xray-common" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+parking_lot = { workspace = true }
 regex = "1"
 prost = { workspace = true }
 aho-corasick = "1"

@@ -44,7 +44,7 @@ pub struct TuicUdpAssoc {
     /// quic 模式响应路由（per-connection uni-stream pump，见 [`UniRespRouter`]）。
     router: UniRespRouter,
     /// 分片重组器（native 模式接收方向，spec FRAG_TOTAL>1 时按 pkt_id 缓存拼接）。
-    assembler: Arc<std::sync::Mutex<crate::protocol::packet::FragmentAssembler>>,
+    assembler: Arc<parking_lot::Mutex<crate::protocol::packet::FragmentAssembler>>,
 }
 
 /// quic 模式（uni-stream）响应路由器。
@@ -57,15 +57,15 @@ pub struct TuicUdpAssoc {
 /// （stream 可靠有序，frag_total 恒 1），无需重组器。
 #[derive(Clone)]
 pub(crate) struct UniRespRouter {
-    waiters: Arc<std::sync::Mutex<HashMap<(u16, u16), tokio::sync::oneshot::Sender<Packet>>>>,
+    waiters: Arc<parking_lot::Mutex<HashMap<(u16, u16), tokio::sync::oneshot::Sender<Packet>>>>,
 }
 
 impl UniRespRouter {
     /// 在连接建立后调用：spawn per-connection 响应 pump（连接关闭自动退出）。
     pub(crate) fn spawn(conn: quinn::Connection) -> Self {
         let waiters: Arc<
-            std::sync::Mutex<HashMap<(u16, u16), tokio::sync::oneshot::Sender<Packet>>>,
-        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+            parking_lot::Mutex<HashMap<(u16, u16), tokio::sync::oneshot::Sender<Packet>>>,
+        > = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let w = Arc::clone(&waiters);
         tokio::spawn(async move {
             loop {
@@ -78,10 +78,7 @@ impl UniRespRouter {
                 };
                 match read_response_packet(&mut uni).await {
                     Ok(pkt) => {
-                        let waiter = w
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .remove(&(pkt.assoc_id, pkt.pkt_id));
+                        let waiter = w.lock().remove(&(pkt.assoc_id, pkt.pkt_id));
                         match waiter {
                             Some(tx) => {
                                 let _ = tx.send(pkt);
@@ -110,10 +107,7 @@ impl UniRespRouter {
         timeout: Duration,
     ) -> Result<Vec<u8>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.waiters
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert((pkt.assoc_id, pkt.pkt_id), tx);
+        self.waiters.lock().insert((pkt.assoc_id, pkt.pkt_id), tx);
         let waiters = Arc::clone(&self.waiters);
         let key = (pkt.assoc_id, pkt.pkt_id);
         let recv = async {
@@ -127,7 +121,7 @@ impl UniRespRouter {
             Ok(Ok(resp)) => Ok(resp.data.into()),
             Ok(Err(e)) => Err(e),
             Err(_) => {
-                waiters.lock().unwrap_or_else(|p| p.into_inner()).remove(&key);
+                waiters.lock().remove(&key);
                 Err(TuicError::UdpTimeout(timeout))
             },
         }
@@ -151,7 +145,7 @@ impl TuicUdpAssoc {
             assoc_id,
             pkt_id: Arc::new(AtomicU16::new(0)),
             router,
-            assembler: Arc::new(std::sync::Mutex::new(
+            assembler: Arc::new(parking_lot::Mutex::new(
                 crate::protocol::packet::FragmentAssembler::new(),
             )),
         }
@@ -244,7 +238,7 @@ impl TuicUdpAssoc {
                 return Err(TuicError::UnknownCommandType(type_byte));
             }
             let pkt = Packet::read_payload(&mut cursor)?;
-            let complete = self.assembler.lock().unwrap_or_else(|p| p.into_inner()).feed(pkt)?;
+            let complete = self.assembler.lock().feed(pkt)?;
             if let Some(full) = complete {
                 // Bytes → Vec：assembler 拼接产的 VEC-kind 唯一引用时零拷贝归还
                 return Ok(full.data.into());

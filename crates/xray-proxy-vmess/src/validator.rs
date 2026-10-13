@@ -2,7 +2,9 @@
 //!
 //! 对应 Go 版本 `proxy/vmess/validator.go`。
 
-use std::{collections::HashMap, sync::Mutex};
+use std::collections::HashMap;
+
+use parking_lot::Mutex;
 
 use crate::{account::MemoryAccount, aead::AuthIDDecoderHolder};
 
@@ -111,7 +113,7 @@ impl Default for TimedUserValidator {
 
 impl Validator for TimedUserValidator {
     fn add(&self, user: MemoryUser) -> Result<(), crate::error::VmessError> {
-        let mut inner = self.inner.lock().expect("inner poisoned");
+        let mut inner = self.inner.lock();
         let cmd_key = user.account.cmd_key();
 
         // 更新 behavior_seed（如果未冻结）
@@ -133,7 +135,7 @@ impl Validator for TimedUserValidator {
     }
 
     fn remove(&self, email: &str) -> bool {
-        let mut inner = self.inner.lock().expect("inner poisoned");
+        let mut inner = self.inner.lock();
         let target_email = email.to_lowercase();
         let mut found_key: Option<[u8; 16]> = None;
         for (key, user) in inner.users.iter() {
@@ -158,16 +160,16 @@ impl Validator for TimedUserValidator {
             crate::aead::AuthIDMatchError::InvalidTime => crate::error::VmessError::InvalidTime,
             crate::aead::AuthIDMatchError::Replay => crate::error::VmessError::Replay,
         })?;
-        let inner = self.inner.lock().expect("inner poisoned");
+        let inner = self.inner.lock();
         inner.users.get(&cmd_key).cloned().ok_or(crate::error::VmessError::UserNotFound)
     }
 
     fn count(&self) -> usize {
-        self.inner.lock().expect("inner poisoned").users.len()
+        self.inner.lock().users.len()
     }
 
     fn behavior_seed(&self) -> u64 {
-        let mut inner = self.inner.lock().expect("inner poisoned");
+        let mut inner = self.inner.lock();
         inner.behavior_fused = true;
         if inner.behavior_seed == 0 {
             use rand::RngCore;

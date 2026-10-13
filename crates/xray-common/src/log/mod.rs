@@ -3,10 +3,9 @@
 //! 对应 Go 版本 `common/log` 包，提供日志级别、消息类型、处理器接口和全局注册表。
 //! 带通道缓冲的通用 Logger 见 [`general_logger`]。
 
-use std::{
-    fmt,
-    sync::{Arc, RwLock},
-};
+use std::{fmt, sync::Arc};
+
+use parking_lot::RwLock;
 
 /// 日志严重级别。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -79,17 +78,13 @@ static HANDLERS: std::sync::LazyLock<RwLock<Vec<Arc<dyn Handler>>>> =
 
 /// 注册全局日志处理器。
 pub fn register_handler(handler: Arc<dyn Handler>) {
-    if let Ok(mut handlers) = HANDLERS.write() {
-        handlers.push(handler);
-    }
+    HANDLERS.write().push(handler);
 }
 
 /// 通过所有已注册的处理器记录消息。
 pub fn log(message: Message) {
-    if let Ok(handlers) = HANDLERS.read() {
-        for handler in handlers.iter() {
-            handler.handle(&message);
-        }
+    for handler in HANDLERS.read().iter() {
+        handler.handle(&message);
     }
 }
 
@@ -124,9 +119,7 @@ pub fn error(content: impl Into<String>) {
 /// 清除所有已注册的处理器（仅用于测试）。
 #[cfg(test)]
 fn clear_handlers() {
-    if let Ok(mut handlers) = HANDLERS.write() {
-        handlers.clear();
-    }
+    HANDLERS.write().clear();
 }
 
 /// 带通道缓冲的通用 Logger，对应 Go `common/log/logger.go::generalLogger`。
@@ -134,7 +127,7 @@ pub mod general_logger;
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     use super::*;
 
@@ -187,25 +180,23 @@ mod tests {
         }
 
         fn messages(&self) -> Vec<Message> {
-            self.messages.lock().map(|m| m.clone()).unwrap_or_default()
+            self.messages.lock().clone()
         }
     }
 
     impl Handler for TestHandler {
         fn handle(&self, message: &Message) {
-            if let Ok(mut msgs) = self.messages.lock() {
-                msgs.push(message.clone());
-            }
+            self.messages.lock().push(message.clone());
         }
     }
 
     /// 全局 `HANDLERS` 在测试间会互相污染（clear → register → log 中段
     /// 被另一测试 clear 掉，断言长度失败）。用 mutex 串行化测试。
-    static HANDLER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static HANDLER_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     #[test]
     fn test_convenience_functions() {
-        let _guard = HANDLER_TEST_LOCK.lock().unwrap();
+        let _guard = HANDLER_TEST_LOCK.lock();
         clear_handlers();
 
         let handler = Arc::new(TestHandler::new());

@@ -20,11 +20,9 @@
 //! 支持 PlainChunkSizeParser + NoPadding（默认）+ ShakeSizeParser + ShakePadding（chunk masking）
 //! 支持 Plain + Shake + AEAD（AuthenticatedLength）三条路径。
 
-use std::{
-    io::{Read, Write},
-    sync::Mutex,
-};
+use std::io::{Read, Write};
 
+use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use xray_common::protocol::SecurityType;
 use xray_crypto::{
@@ -222,7 +220,7 @@ impl ChunkNonce for ChunkNonceAdapter {
 /// 包装 `ChunkNonceGenerator` 为 `Fn() -> Vec<u8>` 闭包，用 `Mutex` 提供内部可变性。
 pub fn generate_chunk_nonce_bytes(iv: &[u8], nonce_size: usize) -> BytesGenerator {
     let nonce_gen = Mutex::new(ChunkNonceGenerator::new(iv, nonce_size));
-    Box::new(move || nonce_gen.lock().expect("nonce gen poisoned").next())
+    Box::new(move || nonce_gen.lock().next())
 }
 
 // ============================================================================

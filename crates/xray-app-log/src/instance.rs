@@ -710,7 +710,7 @@ impl LogInstance {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     use super::*;
 
@@ -725,13 +725,13 @@ mod tests {
         }
 
         fn snapshot(&self) -> Vec<String> {
-            self.recorded.lock().unwrap().clone()
+            self.recorded.lock().clone()
         }
     }
 
     impl LogHandler for CapturingHandler {
         fn handle(&self, entry: &LogEntry) {
-            self.recorded.lock().unwrap().push(entry.format());
+            self.recorded.lock().push(entry.format());
         }
     }
 

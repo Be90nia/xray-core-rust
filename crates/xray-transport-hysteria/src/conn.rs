@@ -415,8 +415,8 @@ impl tokio::io::AsyncRead for HysteriaConn {
             }));
         }
 
-        // SAFETY: state 一定有值了
-        let fut = state.as_mut().unwrap();
+        // state 一定有值：None 分支上方已装入
+        let fut = state.as_mut().expect("state set above when None");
         match fut.as_mut().poll(cx) {
             std::task::Poll::Ready(result) => {
                 // 清除缓存
@@ -461,7 +461,7 @@ impl tokio::io::AsyncWrite for HysteriaConn {
             let stream = Arc::clone(&self.inner.stream);
             let payload = tcp_request_first_payload(buf);
             *state = Some(Box::pin(async move { stream.write(&payload).await }));
-            match state.as_mut().unwrap().as_mut().poll(cx) {
+            match state.as_mut().expect("state set just above").as_mut().poll(cx) {
                 std::task::Poll::Ready(result) => {
                     *state = None;
                     std::task::Poll::Ready(result)
@@ -494,7 +494,7 @@ impl tokio::io::AsyncWrite for HysteriaConn {
             *state = Some(Box::pin(async move { inner.close().await }));
         }
 
-        let fut = state.as_mut().unwrap();
+        let fut = state.as_mut().expect("state set above when None");
         match fut.as_mut().poll(cx) {
             std::task::Poll::Ready(result) => {
                 *state = None;

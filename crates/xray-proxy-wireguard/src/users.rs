@@ -24,6 +24,7 @@ use std::{
 };
 
 use parking_lot::Mutex as ParkMutex;
+#[cfg(test)]
 use xray_app_dispatcher::default::DialFn;
 use xray_app_proxyman::{
     command::{
@@ -271,6 +272,8 @@ impl InboundHandlerWithUserManager for crate::inbound::WireguardInboundHandler {
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use xray_common::net::{
         address::Address, destination::Destination, network::Network, port::Port,

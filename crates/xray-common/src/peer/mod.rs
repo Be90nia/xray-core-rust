@@ -2,7 +2,7 @@
 //!
 //! 对应 Go 版本 `common/peer` 包，提供延迟度量和加权移动平均。
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 /// 延迟度量 trait。
 ///
@@ -50,17 +50,15 @@ impl AverageLatency {
     /// 用新采样值更新延迟（加权移动平均）。
     ///
     /// 公式：`(old + sample * 2) / 3`。
-    /// 锁中毒时静默忽略更新（与 Go 版本行为一致：Mutex 不可能中毒）。
     pub fn update(&self, new_value: u64) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.value = (inner.value + new_value * 2) / 3;
-        }
+        let mut inner = self.inner.lock();
+        inner.value = (inner.value + new_value * 2) / 3;
     }
 }
 
 impl Latency for AverageLatency {
     fn value(&self) -> u64 {
-        self.inner.lock().map_or(0, |inner| inner.value)
+        self.inner.lock().value
     }
 }
 

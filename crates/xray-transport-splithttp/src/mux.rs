@@ -24,12 +24,13 @@
 
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicI32, Ordering},
     },
     time::{Duration, Instant},
 };
 
+use parking_lot::Mutex;
 use rand::Rng;
 
 use crate::config::XmuxConfig;
@@ -122,7 +123,7 @@ impl<C: XmuxConn + 'static> XmuxClient<C> {
         if self.left_requests.load(Ordering::SeqCst) <= 0 {
             return true;
         }
-        if let Some(t) = *self.unreusable_at.lock().unwrap() {
+        if let Some(t) = *self.unreusable_at.lock() {
             if Instant::now() > t {
                 return true;
             }
@@ -191,12 +192,11 @@ impl<C: XmuxConn + 'static> XmuxManager<C> {
         // hMaxReusableSecs: rand > 0 时设置 UnreusableAt = Now + secs
         let x = self.xmux_config.normalized_h_max_reusable_secs().rand();
         if x > 0 {
-            *client.unreusable_at.lock().unwrap() =
-                Some(Instant::now() + Duration::from_secs(x as u64));
+            *client.unreusable_at.lock() = Some(Instant::now() + Duration::from_secs(x as u64));
         }
 
         let arc_client = Arc::new(client);
-        self.xmux_clients.lock().unwrap().push(arc_client.clone());
+        self.xmux_clients.lock().push(arc_client.clone());
         arc_client
     }
 
@@ -210,7 +210,7 @@ impl<C: XmuxConn + 'static> XmuxManager<C> {
     ///    空则新建；否则随机选一个，`left_usage > 0` 时 `-= 1`
     #[must_use]
     pub fn get_xmux_client(&self) -> Arc<XmuxClient<C>> {
-        let mut clients = self.xmux_clients.lock().unwrap();
+        let mut clients = self.xmux_clients.lock();
 
         // 1. 清理不可复用的（同 Go 的 for-loop retain 逻辑）
         clients.retain(|c| !c.is_unreusable());
@@ -250,7 +250,7 @@ impl<C: XmuxConn + 'static> XmuxManager<C> {
 
     /// 当前池中 client 数量（含可能不可复用的；测试用）。
     pub fn pool_size(&self) -> usize {
-        self.xmux_clients.lock().unwrap().len()
+        self.xmux_clients.lock().len()
     }
 }
 

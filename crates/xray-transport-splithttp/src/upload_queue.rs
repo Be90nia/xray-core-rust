@@ -179,7 +179,7 @@ impl UploadQueue {
                 if let Some(by_seq) = inner.heap.peek() {
                     if by_seq.0.0 == inner.next_seq {
                         // 命中 nextSeq，pop 出来
-                        let packet = inner.heap.pop().unwrap().1;
+                        let packet = inner.heap.pop().expect("peek() returned Some above").1;
                         drop(inner);
                         {
                             let mut inner = self.inner.lock().await;

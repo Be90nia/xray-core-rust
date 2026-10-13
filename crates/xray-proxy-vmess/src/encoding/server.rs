@@ -12,10 +12,10 @@
 
 use std::{
     collections::HashMap,
-    sync::Mutex,
     time::{Duration, Instant},
 };
 
+use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use xray_common::{
     bitmask::Bitmask,
@@ -81,7 +81,7 @@ impl SessionHistory {
 
     /// 添加 session，若已存在且未过期则返回 false（拒绝）。
     pub fn add_if_not_exists(&self, session: SessionId) -> bool {
-        let mut inner = self.inner.lock().expect("history poisoned");
+        let mut inner = self.inner.lock();
         // s3fj：当前实现仍 lazy retain（O(n)），但不再每次扫描——只在 map size 超过
         // `RETAIN_THRESHOLD`（10000）时触发一次清理；均摊 O(1)。生产环境真正周期清理
         // 待 `spawn_cleanup` 后台任务上线（依赖字段重构，见 fn 内注释）。
@@ -101,13 +101,13 @@ impl SessionHistory {
 
     /// 当前条目数（测试用）。
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("history poisoned").len()
+        self.inner.lock().len()
     }
 
     /// 是否为空。
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().expect("history poisoned").is_empty()
+        self.inner.lock().is_empty()
     }
 }
 

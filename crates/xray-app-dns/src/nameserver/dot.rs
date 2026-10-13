@@ -220,7 +220,13 @@ impl DotNameServer {
 
         // 尝试在已有连接上查询，失败则丢弃重连。
         match self
-            .try_query(conn_guard.as_mut().unwrap(), &len_be, &payload, req_id, record_type)
+            .try_query(
+                conn_guard.as_mut().expect("conn established above when None"),
+                &len_be,
+                &payload,
+                req_id,
+                record_type,
+            )
             .await
         {
             Ok(result) => Ok(result),
@@ -229,8 +235,14 @@ impl DotNameServer {
                 tracing::debug!(error = %e, "DoT query on pooled connection failed, reconnecting");
                 *conn_guard = None;
                 *conn_guard = Some(self.connect_tls().await?);
-                self.try_query(conn_guard.as_mut().unwrap(), &len_be, &payload, req_id, record_type)
-                    .await
+                self.try_query(
+                    conn_guard.as_mut().expect("reconnected just above"),
+                    &len_be,
+                    &payload,
+                    req_id,
+                    record_type,
+                )
+                .await
             },
         }
     }
