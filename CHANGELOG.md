@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- MemoryAccount（SS/Trojan/VLESS/VMess）与 `UUID`/`protocol::ID` Debug 脱敏：凭据禁入 tracing/panic 输出（bd 2ktp ③）
+- VMess chunk size u16 溢出 7 处 `unwrap_or(u16::MAX)` 静默替换改显式错误（防收端错位；现行调用面不可达，纯防御）（bd 2ktp ②）
+- REALITY 回贴 Go tls.go:233-235 MLKEM768 key share 门：X25519-only ClientHello reject→forward，`parse_key_shares` 对齐 v26.9.30 单轮扫描语义（bd 2ktp ①）
+
+### Changed
+
+- xdns finalmask 对齐 Go v26.9.30（fc8f8a45）：结构化 DomainProto（lenLimit/labelLimit/types/edns0）+ TypedMessage resolvers + extraPoll；wire 协议重写（poll/small/frag 三形态 + 分片重组 + 攒包下发）；TCP resolver 配置期报错（Rust 栈 UDP-only）（bd 2ktp ④）
+
 ## [26.10.10] - 2026-10-10
 
 ### Added

@@ -665,7 +665,7 @@ pub fn build_udpmask_manager(config: &FinalmaskConfig) -> io::Result<UdpmaskMana
 /// - `salamander` —— `SalamanderConfig{ password }`
 /// - `noise` —— `NoiseConfig{ reset, noise[] }`（周期重置 + 噪声包序列）
 /// - `sudoku` —— `SudokuConfig`（UDP/TCP 共用同一配置形态）
-/// - `xdns` —— `xdns::Config{ domains, resolvers }`（DNS-over-UDP 隧道）
+/// - `xdns` —— `xdns::Config{ domains, resolvers, extra_poll }`（DNS-over-UDP 隧道，v26.9.30 形态）
 /// - `xicmp` —— `XicmpConfig{ ips, dgram }`（wrap 时仅允许最外层）
 /// - `realm` —— `realm::Config`（STUN/HTTP NAT 穿透，settings 从 `url` 解析）
 /// - `header-custom` —— `custom::Config`（自定义 UDP 头，`mode`=prefix/standalone）
@@ -1306,24 +1306,53 @@ fn build_sudoku_config(settings: &serde_json::Value) -> sudoku::SudokuConfig {
     }
 }
 
-/// Go `Xdns.Build` → `xdns::Config`（`domain` 已废弃；domains=server / resolvers=client）。
+/// Go `XDNS.Build` → `xdns::Config`（bd 2ktp ④ 对齐 v26.9.30：domains 为对象
+/// 数组（lenLimit/labelLimit 缺省 255/63），resolvers 为 `{type,settings.addr}`，
+/// extraPoll 0-3；`domain` 键已废弃）。
 fn build_xdns_config(settings: &serde_json::Value) -> io::Result<xdns::Config> {
     if settings.get("domain").is_some_and(|x| !x.is_null()) {
         return Err(mask_err(
             "xdns: `domain` was removed; use domains(server) & resolvers(client)",
         ));
     }
-    let domains = json_str_vec(settings, "domains");
-    let resolvers = json_str_vec(settings, "resolvers");
-    if domains.is_empty() && resolvers.is_empty() {
-        return Err(mask_err("xdns: empty domains & empty resolvers"));
-    }
-    for r in &resolvers {
-        if !r.contains("+udp://") {
-            return Err(mask_err(format!("xdns: invalid resolver {r:?}")));
+    let mut domains = Vec::new();
+    if let Some(serde_json::Value::Array(arr)) = settings.get("domains") {
+        for d in arr {
+            domains.push(xdns::build_domain_config(d)?);
         }
     }
-    Ok(xdns::Config { domains, resolvers })
+    let mut resolvers = Vec::new();
+    if let Some(serde_json::Value::Array(arr)) = settings.get("resolvers") {
+        for r in arr {
+            let obj = r.as_object().ok_or_else(|| mask_err("xdns: resolver must be an object"))?;
+            let rtype = obj
+                .get("type")
+                .and_then(|t| t.as_str())
+                .ok_or_else(|| mask_err("xdns: resolver missing type"))?;
+            let addr = obj
+                .get("settings")
+                .and_then(|s| s.get("addr"))
+                .and_then(|a| a.as_str())
+                .ok_or_else(|| mask_err("xdns: resolver missing settings.addr"))?;
+            match rtype {
+                "udp" => resolvers.push(xdns::ResolverConfig::Udp { addr: addr.to_string() }),
+                "tcp" => resolvers.push(xdns::ResolverConfig::Tcp { addr: addr.to_string() }),
+                other => {
+                    return Err(mask_err(format!("xdns: unknown resolver type {other:?}")));
+                },
+            }
+        }
+    }
+    let extra_poll = match settings.get("extraPoll") {
+        Some(x) if !x.is_null() => {
+            x.as_i64().ok_or_else(|| mask_err("xdns: invalid extraPoll"))? as i32
+        },
+        _ => 0,
+    };
+    if !(0..=3).contains(&extra_poll) {
+        return Err(mask_err("xdns: extraPoll < 0 || extraPoll > 3"));
+    }
+    Ok(xdns::Config { domains, resolvers, extra_poll })
 }
 
 /// Go `Xicmp.Build` → `XicmpConfig`；「仅最外层」约束由 wrap 时 `level != 0` 校验（模块内）。
@@ -2135,18 +2164,38 @@ mod tests {
 
     #[test]
     fn parse_json_xdns_config_fields_and_validations() {
-        let cfg = build_xdns_config(&fm(
-            r#"{"domains":["t.example.com:txt"],"resolvers":["t.example.com+udp://1.1.1.1:53"]}"#,
-        ))
+        // v26.9.30 形态（bd 2ktp ④）：domains 对象数组 + resolvers {type,settings}
+        let cfg = build_xdns_config(&fm(r#"{"domains":[{"name":"t.example.com","types":[16]}],
+                "resolvers":[{"type":"udp","settings":{"addr":"1.1.1.1:53"}}],
+                "extraPoll":1}"#))
         .unwrap();
-        assert_eq!(cfg.domains, vec!["t.example.com:txt".to_string()]);
-        assert_eq!(cfg.resolvers, vec!["t.example.com+udp://1.1.1.1:53".to_string()]);
+        assert_eq!(cfg.domains.len(), 1);
+        assert_eq!(cfg.domains[0].name, "t.example.com");
+        assert_eq!((cfg.domains[0].len_limit, cfg.domains[0].label_limit), (255, 63));
+        assert_eq!(cfg.domains[0].types, vec![16]);
+        assert!(matches!(
+            cfg.resolvers[0],
+            xdns::ResolverConfig::Udp { ref addr } if addr == "1.1.1.1:53"
+        ));
+        assert_eq!(cfg.extra_poll, 1);
         // 已废弃 domain 键报错（对齐 Go PrintRemovedFeatureError）
         assert!(build_xdns_config(&fm(r#"{"domain":"x.com"}"#)).is_err());
-        // 双空报错
-        assert!(build_xdns_config(&fm(r#"{}"#)).is_err());
-        // resolver 缺 +udp:// 报错
-        assert!(build_xdns_config(&fm(r#"{"resolvers":["udp://1.1.1.1:53"]}"#)).is_err());
+        // extraPoll 越界报错（对齐 Go Build 校验）
+        assert!(build_xdns_config(&fm(r#"{"extraPoll":4}"#)).is_err());
+        // resolver 未知 type 报错
+        assert!(
+            build_xdns_config(&fm(
+                r#"{"resolvers":[{"type":"quic","settings":{"addr":"1.1.1.1:53"}}]}"#
+            ))
+            .is_err()
+        );
+        // tcp resolver 可解析（wrap 期报 UDP-only 不支持）
+        assert!(
+            build_xdns_config(&fm(
+                r#"{"resolvers":[{"type":"tcp","settings":{"addr":"1.1.1.1:53"}}]}"#
+            ))
+            .is_ok()
+        );
     }
 
     #[test]
@@ -2260,7 +2309,7 @@ mod tests {
         let json = fm(r#"{"udp":[
                 {"type":"noise","settings":{"reset":{"from":1,"to":2}}},
                 {"type":"sudoku","settings":{"password":"p"}},
-                {"type":"xdns","settings":{"resolvers":["t.example.com+udp://1.1.1.1:53"]}},
+                {"type":"xdns","settings":{"domains":[{"name":"t.example.com","types":[16]}],"resolvers":[{"type":"udp","settings":{"addr":"1.1.1.1:53"}}]}},
                 {"type":"xicmp","settings":{"ips":["10.0.0.1"]}},
                 {"type":"realm","settings":{"url":"realm://t@h.example.com/i","stunServers":["s.example.com:3478"]}},
                 {"type":"header-custom","settings":{"client":[]}}
