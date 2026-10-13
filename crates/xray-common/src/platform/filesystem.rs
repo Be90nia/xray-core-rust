@@ -162,6 +162,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         let dir = unique_dir("env");
         fs::create_dir_all(&dir).unwrap();
+        // SAFETY: 测试线程独占 XRAY_LOCATION_* 键，Clean guard 保证恢复顺序
         unsafe {
             std::env::set_var("XRAY_LOCATION_ASSET", &dir);
             std::env::set_var("XRAY_LOCATION_CERT", &dir);
@@ -169,6 +170,7 @@ mod tests {
         struct Clean;
         impl Drop for Clean {
             fn drop(&mut self) {
+                // SAFETY: 测试线程独占 XRAY_LOCATION_* 键，Clean guard 保证恢复顺序
                 unsafe {
                     std::env::remove_var("XRAY_LOCATION_ASSET");
                     std::env::remove_var("XRAY_LOCATION_CERT");

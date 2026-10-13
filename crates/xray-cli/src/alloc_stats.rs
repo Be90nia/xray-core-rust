@@ -90,6 +90,7 @@ pub struct StatsAlloc<A>(pub A);
 unsafe impl<A: GlobalAlloc> GlobalAlloc for StatsAlloc<A> {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: layout 满足 Alloc 契约（调用方前置条件），内层 GlobalAlloc 保证
         let ptr = unsafe { self.0.alloc(layout) };
         if COUNTING.load(Ordering::Relaxed) && !ptr.is_null() {
             ALLOC_N.fetch_add(1, Ordering::Relaxed);
@@ -99,11 +100,13 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for StatsAlloc<A> {
     }
 
     #[inline]
+    // SAFETY: Dealloc 契约——ptr/layout 必须来自配对 alloc 且未释放过（trait 前置条件）
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if COUNTING.load(Ordering::Relaxed) {
             DEALLOC_N.fetch_add(1, Ordering::Relaxed);
             DEALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
         }
+        // SAFETY: ptr/layout 来自配对 alloc，内层实现保证
         unsafe { self.0.dealloc(ptr, layout) };
     }
 
@@ -141,10 +144,12 @@ mod tests {
         let before_n = ALLOC_N.load(Ordering::Relaxed);
         let before_b = ALLOC_BYTES.load(Ordering::Relaxed);
         let layout = Layout::from_size_align(128, 8).unwrap();
+        // SAFETY: layout=(128,8) 合法；ptr 所有权归测试并配对 dealloc
         let ptr = unsafe { alloc.alloc(layout) };
         assert!(!ptr.is_null());
         assert_eq!(ALLOC_N.load(Ordering::Relaxed), before_n + 1);
         assert_eq!(ALLOC_BYTES.load(Ordering::Relaxed), before_b + 128);
+        // SAFETY: 与上行 alloc 配对，layout 一致且未释放过
         unsafe { alloc.dealloc(ptr, layout) };
         assert_eq!(DEALLOC_N.load(Ordering::Relaxed), 1);
         // 还原开关，避免影响并行测试进程内的其他用例（同进程测试共享静态）。

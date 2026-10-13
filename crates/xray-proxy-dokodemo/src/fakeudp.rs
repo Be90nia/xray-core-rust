@@ -30,6 +30,7 @@ pub fn fake_udp(addr: SocketAddr, mark: u32) -> io::Result<tokio::net::UdpSocket
 fn fake_udp_linux(addr: SocketAddr, mark: u32) -> io::Result<tokio::net::UdpSocket> {
     use std::os::fd::FromRawFd;
 
+    // SAFETY: libc socket() 创建新 fd（<0 已检查），后续 bind/setsockopt 以此为契约
     unsafe {
         let domain = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
         let mut fd = libc::socket(domain, libc::SOCK_DGRAM, 0);
@@ -72,12 +73,14 @@ fn fake_udp_linux(addr: SocketAddr, mark: u32) -> io::Result<tokio::net::UdpSock
 
 /// `setsockopt(fd, level, opt, c_int)`。
 #[cfg(target_os = "linux")]
+// SAFETY: unsafe fn 契约——fd 为合法打开 socket，opt/val 按 C 契约传值
 unsafe fn setsockopt_int(
     fd: libc::c_int,
     level: libc::c_int,
     opt: libc::c_int,
     val: libc::c_int,
 ) -> io::Result<()> {
+    // SAFETY: fd 为本模块创建的合法 socket，&val 为栈上 c_int
     let rv = unsafe {
         libc::setsockopt(
             fd,
@@ -92,8 +95,10 @@ unsafe fn setsockopt_int(
 
 /// `bind(fd, addr)`。
 #[cfg(target_os = "linux")]
+// SAFETY: unsafe fn 契约——fd 合法且 addr 族与实现匹配
 unsafe fn bind(fd: libc::c_int, addr: &SocketAddr) -> io::Result<()> {
     let rv = match addr {
+        // SAFETY: sockaddr_in POD 全零后按 AF_INET 逐字段填充，长度 sizeof(sockaddr_in)
         SocketAddr::V4(a) => unsafe {
             let mut sa: libc::sockaddr_in = std::mem::zeroed();
             sa.sin_family = libc::AF_INET as libc::sa_family_t;
@@ -105,6 +110,7 @@ unsafe fn bind(fd: libc::c_int, addr: &SocketAddr) -> io::Result<()> {
                 std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
             )
         },
+        // SAFETY: sockaddr_in6 POD 全零后按 AF_INET6 逐字段填充，长度 sizeof(sockaddr_in6)
         SocketAddr::V6(a) => unsafe {
             let mut sa: libc::sockaddr_in6 = std::mem::zeroed();
             sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;

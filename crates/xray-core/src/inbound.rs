@@ -1913,6 +1913,7 @@ impl DnsUdpRecvBatch {
             vec![libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; DNS_UDP_RECV_BATCH]
                 .into_boxed_slice();
         let mut msgs: Box<[libc::mmsghdr]> =
+            // SAFETY: mmsghdr 为 POD，全零为合法待填充态（msg_control 恒 null = 不取 ancillary）
             vec![unsafe { std::mem::zeroed() }; DNS_UDP_RECV_BATCH].into_boxed_slice();
 
         for i in 0..DNS_UDP_RECV_BATCH {

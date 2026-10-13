@@ -231,6 +231,7 @@ mod tests {
         struct Restore(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
         impl Drop for Restore {
             fn drop(&mut self) {
+                // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
                 unsafe {
                     match self.0.take() {
                         Some(v) => std::env::set_var(NAME, v),
@@ -245,6 +246,7 @@ mod tests {
                 xray_buf::readv::reload_env_settings();
             }
         }
+        // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
         unsafe {
             std::env::remove_var(NAME);
             std::env::remove_var(ALT);
@@ -256,11 +258,13 @@ mod tests {
         assert!(use_readv(), "未设置应启用（Go 缺省，经转发链）");
 
         // ② 关态：非法值禁用（转发别名与 xray-buf 本地读同源）
+        // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
         unsafe { std::env::set_var(NAME, "disable") };
         xray_buf::readv::reload_env_settings();
         assert!(!use_readv(), "disable 应经转发链禁用");
 
         // ③ 缓存语义贯穿转发链：env 变更不 reload 不得翻转
+        // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
         unsafe { std::env::set_var(NAME, "enable") };
         assert!(!use_readv(), "不 reload 不应翻转（缓存生效）");
         xray_buf::readv::reload_env_settings();
@@ -333,6 +337,7 @@ mod tests {
         struct Restore(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
         impl Drop for Restore {
             fn drop(&mut self) {
+                // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
                 unsafe {
                     match self.0.take() {
                         Some(v) => std::env::set_var(NAME, v),
@@ -347,6 +352,7 @@ mod tests {
                 super::reload_env_settings();
             }
         }
+        // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
         unsafe {
             std::env::remove_var(NAME);
             std::env::remove_var(ALT);
@@ -359,6 +365,7 @@ mod tests {
 
         // ② 显式启用值（精确匹配）
         for on in ["auto", "enable"] {
+            // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
             unsafe { std::env::set_var(NAME, on) };
             reload_env_settings();
             assert!(use_splice(), "env={on:?} 应启用");
@@ -366,24 +373,28 @@ mod tests {
 
         // ③ 非法值一律禁用（大小写敏感，空串 = LookupEnv 命中 switch 落空）
         for off in ["disable", "true", "1", "", "AUTO", "Enable"] {
+            // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
             unsafe { std::env::set_var(NAME, off) };
             reload_env_settings();
             assert!(!use_splice(), "env={off:?} 应禁用");
         }
 
         // ④ 缓存语义：env 变更不 reload 不生效（热路径零 env 查询的行为证据）
+        // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
         unsafe { std::env::set_var(NAME, "auto") };
         assert!(!use_splice(), "不 reload 不应翻转（缓存生效）");
         reload_env_settings();
         assert!(use_splice(), "reload 后应翻转");
 
         // ⑤ alt 名兜底 + 原名优先
+        // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
         unsafe {
             std::env::remove_var(NAME);
             std::env::set_var(ALT, "auto");
         }
         reload_env_settings();
         assert!(use_splice(), "alt 名应兜底");
+        // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
         unsafe { std::env::set_var(NAME, "disable") };
         reload_env_settings();
         assert!(!use_splice(), "原名命中时优先于 alt");

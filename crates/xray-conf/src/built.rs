@@ -406,6 +406,7 @@ mod tests {
         let _g = ENV_LOCK.lock();
         let _r = registry_lock();
         let probe = "XRAY_CONF_BUILD_ENV_PROBE";
+        // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
         unsafe { std::env::remove_var(probe) };
 
         let cfg =
@@ -414,6 +415,7 @@ mod tests {
         cfg.build().expect("build must succeed");
 
         assert_eq!(std::env::var(probe).as_deref(), Ok("injected"));
+        // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
         unsafe { std::env::remove_var(probe) };
     }
 

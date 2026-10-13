@@ -76,6 +76,7 @@ mod imp {
         let mut fds: [libc::c_int; 2] = [0; 2];
         // O_NONBLOCK：socket 侧本就非阻塞；pipe 侧非阻塞使满/空均 EAGAIN，
         // 交由下方 readiness 等待，绝不阻塞 executor 线程。
+        // SAFETY: fds 出参数组由内核填充，pipe2 返回 0 已检查；两 fd 由 PipeFds RAII 关闭
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK) } != 0 {
             return Err(io::Error::last_os_error());
         }
