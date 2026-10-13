@@ -119,10 +119,12 @@ pub fn dup_tcp_stream(stream: &TcpStream) -> Option<TcpStream> {
     {
         use std::os::unix::io::{AsRawFd, FromRawFd};
         let fd = stream.as_raw_fd();
+        // SAFETY: new_fd 由 dup 刚创建（<0 已检查），所有权移交 FromRawFd，仅此一次
         let new_fd = unsafe { libc::dup(fd) };
         if new_fd < 0 {
             return None;
         }
+        // SAFETY: new_fd 为 dup 产物（非阻塞 flags 继承），所有权移交通给 tokio from_std
         let std_stream = unsafe { std::net::TcpStream::from_raw_fd(new_fd) };
         // from_std 要求非阻塞模式。tokio 持有的 fd 是非阻塞的；dup 继承同样 flags。
         TcpStream::from_std(std_stream).ok()
@@ -367,6 +369,7 @@ impl Connection for UnixConnection {
 
     fn close_read(&mut self) -> io::Result<()> {
         use std::os::unix::io::AsRawFd;
+        // SAFETY: fd 来自存活 TcpStream 的 as_raw_fd，shutdown 仅关方向不夺所有权
         let ret = unsafe { libc::shutdown(self.inner.as_raw_fd(), libc::SHUT_RD) };
         if ret < 0 {
             return Err(io::Error::last_os_error());
@@ -376,6 +379,7 @@ impl Connection for UnixConnection {
 
     fn close_write(&mut self) -> io::Result<()> {
         use std::os::unix::io::AsRawFd;
+        // SAFETY: 同 close_read：存活 fd 上 shutdown(SHUT_WR)
         let ret = unsafe { libc::shutdown(self.inner.as_raw_fd(), libc::SHUT_WR) };
         if ret < 0 {
             return Err(io::Error::last_os_error());

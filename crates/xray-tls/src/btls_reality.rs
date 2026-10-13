@@ -247,9 +247,11 @@ extern "C" fn reality_server_hello_trampoline(
 
 /// 注册 per-SSL hooks 并安装全局 trampoline（幂等）。
 pub fn register_reality_hooks(ssl_key: usize, hooks: Arc<dyn RealityHooks>) {
+    // SAFETY: 进程级回调注册，BoringSSL 要求首次 SSL 使用前安装；Once 保证恰好一次
     TRAMPOLINE_INSTALLED.call_once(|| unsafe {
         SSL_set_reality_rewrite_cb(Some(reality_rewrite_trampoline));
     });
+    // SAFETY: 同上：server_hello trampoline 全局注册，Once 幂等
     SERVER_HELLO_TRAMPOLINE_INSTALLED.call_once(|| unsafe {
         SSL_set_reality_server_hello_cb(Some(reality_server_hello_trampoline));
     });
@@ -413,6 +415,7 @@ where
 /// 证书 DER 编码（`i2d_X509`）。REALITY 证书验证（HMAC 尾 64 字节）用。
 pub fn x509_to_der(cert: &btls::x509::X509) -> Option<Vec<u8>> {
     use foreign_types::ForeignTypeRef;
+    // SAFETY: cert 为存活 X509 引用（ForeignTypeRef）；i2d 成功时 p 指向新分配缓冲，失败码已检查
     unsafe {
         let mut p: *mut u8 = std::ptr::null_mut();
         let len = btls_sys::i2d_X509(cert.as_ptr(), &mut p);
@@ -562,6 +565,7 @@ mod tests {
     #[test]
     #[cfg(not(target_os = "ios"))]
     fn post_handshake_primitive_rejects_null_ssl() {
+        // SAFETY: 刻意传 null 验证注入原语的防御路径（契约允许 null 拒绝）
         let rc = unsafe {
             btls_sys::SSL_send_post_handshake_record(std::ptr::null_mut(), std::ptr::null(), 0)
         };
@@ -577,6 +581,7 @@ mod tests {
         // FFI 层：null ssl 必须被注入原语拒绝（bindgen 绑定与符号真实可链接）。
         let mut out = [0u8; 64];
         let mut out_len = 0usize;
+        // SAFETY: 同上：null ssl 走防御拒绝分支，out 容量 64 足够单记录探测
         let rc = unsafe {
             btls_sys::SSL_seal_raw_tls13_record(
                 std::ptr::null_mut(),

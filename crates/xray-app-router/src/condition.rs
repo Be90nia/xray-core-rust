@@ -650,6 +650,8 @@ mod proc_windows {
 
     fn find_pid_v4(ip: Ipv4Addr, port: u16) -> Option<u32> {
         let buf = tcp_table(AF_INET)?;
+        // SAFETY: buf 由 tcp_table 按 GetExtendedTcpTable 所需 size 分配并刚填充，布局即
+        // MIB_TCPTABLE_OWNER_PID
         unsafe {
             let table = &*(buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID);
             let rows =
@@ -667,6 +669,7 @@ mod proc_windows {
 
     fn find_pid_v6(ip: Ipv6Addr, port: u16) -> Option<u32> {
         let buf = tcp_table(AF_INET6)?;
+        // SAFETY: 同 v4 路径：按所需 size 分配且刚填充，布局即 MIB_TCP6TABLE_OWNER_PID
         unsafe {
             let table = &*(buf.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID);
             let rows =
@@ -691,6 +694,7 @@ mod proc_windows {
 
     /// 调 `GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL)` 取整张表字节。
     fn tcp_table(af: u32) -> Option<Vec<u8>> {
+        // SAFETY: 两段式 Win32 契约：首调 null buf 填 size，二调以该 size 分配的缓冲接收整表
         unsafe {
             let mut size: u32 = 0;
             // 第一次取所需大小（返回 ERROR_INSUFFICIENT_BUFFER，size 被填入）。
@@ -719,6 +723,8 @@ mod proc_windows {
 
     /// `QueryFullProcessImageNameW` → 完整 exe 路径。权限不足/系统进程返回 None。
     fn query_image_name(pid: u32) -> Option<String> {
+        // SAFETY: OpenProcess 句柄非 null 已检查；QueryFullProcessImageNameW 写入本函数 1024×u16
+        // 缓冲
         unsafe {
             let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if h.is_null() {
@@ -898,11 +904,13 @@ mod proc_freebsd {
     const ERRBUF_LEN: usize = 1024;
 
     pub(super) fn find_process(source_ip: IpAddr, source_port: u16) -> Option<ProcessInfo> {
+        // SAFETY: FFI 返回新指针，非 null 已检查，所有权归本函数
         let ps = unsafe { procstat_open_sysctl() };
         if ps.is_null() {
             return None;
         }
         let result = scan_all_pids(ps, source_ip, source_port);
+        // SAFETY: ps 来自 procstat_open_sysctl 非 null 返回，close 恰好消费一次
         unsafe { procstat_close(ps) };
         result
     }
@@ -914,14 +922,17 @@ mod proc_freebsd {
     ) -> Option<ProcessInfo> {
         // 取全进程表。
         let mut cnt: libc::c_uint = 0;
+        // SAFETY: ps 为本函数持有的合法句柄，cnt 为内核写回条目数
         let kp = unsafe { procstat_getprocs(ps, libc::KERN_PROC_ALL, 0, &mut cnt) };
         if kp.is_null() || cnt == 0 {
             if !kp.is_null() {
+                // SAFETY: kp 为 getprocs 返回指针，freeprocs 一次性释放
                 unsafe { procstat_freeprocs(ps, kp) };
             }
             return None;
         }
         let mut hit: Option<ProcessInfo> = None;
+        // SAFETY: kp 指向内核返回的 cnt 个连续 kinfo_proc（procstat 契约），只读切片
         let procs = unsafe { std::slice::from_raw_parts(kp, cnt as usize) };
         for p in procs {
             let pid = p.ki_pid as u32;
@@ -929,31 +940,39 @@ mod proc_freebsd {
                 continue;
             }
             // 取该 PID 的 fd 链表头。
+            // SAFETY: ps/p 为本函数持有句柄（p 来自 procs 切片），返回 fd 链表头
             let files_head = unsafe { procstat_getfiles(ps, p as *const _ as *mut _, 0) };
             if files_head.is_null() {
                 continue;
             }
             // 遍历 STAILQ（filestat.next.stqe_next 串联）。
+            // SAFETY: files_head 非 null 已检查，STAILQ 头字段布局由 libc 定义
             let mut cur = unsafe { (*files_head).stqh_first };
             while !cur.is_null() {
+                // SAFETY: cur 为链表内节点（非 null 已检查），节点存活期由 ps 句柄保证
                 let f: &libc::filestat = unsafe { &*cur };
                 if f.fs_type == PS_FTYPE_SOCKET {
+                    // SAFETY: sockstat 为 POD，全零是合法待填充态
                     let mut ss: libc::sockstat = unsafe { std::mem::zeroed() };
                     let mut errbuf = [0i8; ERRBUF_LEN];
                     let rc =
+                        // SAFETY: ps/cur 为本函数持有句柄，errbuf 容量 ERRBUF_LEN 满足库要求
                         unsafe { procstat_get_socket_info(ps, cur, &mut ss, errbuf.as_mut_ptr()) };
                     if rc == 0 && socket_matches(&ss, source_ip, source_port) {
                         hit = read_process_info(pid);
                         break;
                     }
                 }
+                // SAFETY: STAILQ next 读取，节点存活期由 ps 保证
                 cur = unsafe { (*cur).next.stqe_next };
             }
+            // SAFETY: 释放本函数持有的 getfiles 返回指针，一次性
             unsafe { procstat_freefiles(ps, files_head) };
             if hit.is_some() {
                 break;
             }
         }
+        // SAFETY: 释放本函数持有的 getprocs 返回指针，一次性
         unsafe { procstat_freeprocs(ps, kp) };
         hit
     }
@@ -963,6 +982,8 @@ mod proc_freebsd {
         // sockaddr_storage 布局：offset 0 = ss_len (u8), offset 1 = ss_family (sa_family_t=u8 on
         // FreeBSD). ss_len 头 1 字节：FreeBSD sockaddr_storage 与 sockaddr_in/in6
         // 头字段一致， 直接按 sockaddr_in/sockaddr_in6 解释。
+        // SAFETY: sa_local 是 sockstat 内联 sockaddr_storage 存储，按 sizeof(storage)
+        // 取只读字节在界内
         let raw: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 &ss.sa_local as *const _ as *const u8,
@@ -1662,6 +1683,7 @@ p222\ncmatch\ntiPv4\niTCPv4:1.2.3.4:54321-5.6.7.8:80\n\
     #[test]
     fn test_freebsd_sockstat_matches_v4_endpoint() {
         // 手工构造 sockaddr_storage：len(1) + family(1) + port(2) + addr(4) = 8 bytes。
+        // SAFETY: 测试构造 POD sockstat，全零为合法待填充态
         let ss: libc::sockstat = unsafe { std::mem::zeroed() };
         // sa_local 头 8 字节：len=16（sizeof sockaddr_in），family=2（AF_INET），port=0xD431（54321
         // BE）， addr=1.2.3.4（network byte order = 0x01020304）。
@@ -1674,6 +1696,7 @@ p222\ncmatch\ntiPv4\niTCPv4:1.2.3.4:54321-5.6.7.8:80\n\
         ];
         let raw_ptr = raw.as_ptr() as *const u8;
         let sa_ptr = &ss.sa_local as *const _ as *mut u8;
+        // SAFETY: 目标为本结构体内联字段指针（上一行取得），raw.len()=8 不越界
         unsafe {
             std::ptr::copy_nonoverlapping(raw_ptr, sa_ptr, raw.len());
         }
@@ -1687,6 +1710,7 @@ p222\ncmatch\ntiPv4\niTCPv4:1.2.3.4:54321-5.6.7.8:80\n\
     #[cfg(target_os = "freebsd")]
     #[test]
     fn test_freebsd_sockstat_no_match_on_port_mismatch() {
+        // SAFETY: 测试构造 POD sockstat，全零为合法待填充态
         let ss: libc::sockstat = unsafe { std::mem::zeroed() };
         let raw = [
             16u8, 2u8, 0xD4, 0x31, 0x01, 0x02, 0x03, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -1697,6 +1721,7 @@ p222\ncmatch\ntiPv4\niTCPv4:1.2.3.4:54321-5.6.7.8:80\n\
         ];
         let raw_ptr = raw.as_ptr() as *const u8;
         let sa_ptr = &ss.sa_local as *const _ as *mut u8;
+        // SAFETY: 同 1677：本结构体内联字段，长度恰等
         unsafe {
             std::ptr::copy_nonoverlapping(raw_ptr, sa_ptr, raw.len());
         }

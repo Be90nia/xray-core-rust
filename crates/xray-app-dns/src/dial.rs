@@ -218,6 +218,8 @@ impl AsyncWrite for LinkStream {
 // （poll_read/poll_write/AsyncRead/AsyncWrite）中访问；&self 方法
 // （remote_addr/local_addr）不读取任何字段。MultiBuffer 粒度 reader/writer
 // trait 无 Sync supertrait，但 LinkStream 从不并发共享 &self 可变状态。
+// SAFETY: LinkStream 无共享可变内部态；&self 方法只读自有字段，trait 缺 Sync supertrait
+// 仅为对象安全
 unsafe impl Sync for LinkStream {}
 
 impl Connection for LinkStream {

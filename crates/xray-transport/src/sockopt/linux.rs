@@ -210,6 +210,7 @@ impl LinuxSockOpt {
         let c_algo = std::ffi::CString::new(algo).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "tcp_congestion contains null byte")
         })?;
+        // SAFETY: fd 为调用方持有 socket，c_algo 为带 NUL 的合法 C 缓冲，长度 = 字节数
         unsafe {
             let ret = libc::setsockopt(
                 fd,
@@ -265,6 +266,7 @@ impl LinuxSockOpt {
         if ptr.is_null() {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: ptr 指向上一步 getsockopt 返回的 NUL 终止缓冲（SO_BINDTODEVICE 接口名）
         let name_len = unsafe { libc::strlen(ptr as *const libc::c_char) };
         // SAFETY: setsockopt 对已验证的 fd 设置字符串选项。
         // SO_BINDTODEVICE = 25，内核验证接口名是否存在。

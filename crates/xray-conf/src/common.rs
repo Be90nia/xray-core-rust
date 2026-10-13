@@ -750,9 +750,11 @@ mod tests {
     #[test]
     fn address_expands_env_prefix() {
         let _g = ENV_LOCK.lock();
+        // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
         unsafe { std::env::set_var("XRAY_CONF_TEST_ADDR", "1.2.3.4") };
         let a: Address = serde_json::from_str(r#""env:XRAY_CONF_TEST_ADDR""#).unwrap();
         assert_eq!(a.as_str(), "1.2.3.4");
+        // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
         unsafe { std::env::remove_var("XRAY_CONF_TEST_ADDR") };
     }
 
@@ -774,27 +776,33 @@ mod tests {
     fn portlist_expands_env_port() {
         // Go TestEnvPort（common_test.go:148-159）等价。
         let _g = ENV_LOCK.lock();
+        // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
         unsafe { std::env::set_var("XRAY_CONF_TEST_PORT", "1234") };
         let p: PortList = serde_json::from_str(r#""env:XRAY_CONF_TEST_PORT""#).unwrap();
         assert_eq!(p.0, vec![PortRange::single(1234)]);
+        // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
         unsafe { std::env::remove_var("XRAY_CONF_TEST_PORT") };
     }
 
     #[test]
     fn portlist_expands_env_range() {
         let _g = ENV_LOCK.lock();
+        // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
         unsafe { std::env::set_var("XRAY_CONF_TEST_PORTS", "1000-2000") };
         let p: PortList = serde_json::from_str(r#""env:XRAY_CONF_TEST_PORTS""#).unwrap();
         assert_eq!(p.0, vec![PortRange { start: 1000, end: 2000 }]);
+        // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
         unsafe { std::env::remove_var("XRAY_CONF_TEST_PORTS") };
     }
 
     #[test]
     fn portlist_env_in_comma_list() {
         let _g = ENV_LOCK.lock();
+        // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
         unsafe { std::env::set_var("XRAY_CONF_TEST_P1", "80") };
         let p: PortList = serde_json::from_str(r#""env:XRAY_CONF_TEST_P1,443""#).unwrap();
         assert_eq!(p.0, vec![PortRange::single(80), PortRange::single(443)]);
+        // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
         unsafe { std::env::remove_var("XRAY_CONF_TEST_P1") };
     }
 
@@ -802,9 +810,11 @@ mod tests {
     fn env_alt_name_uppercase_lookup() {
         // Go NewEnvFlag 双查（platform.go:42-53）：原名失败后查大写下划线形式。
         let _g = ENV_LOCK.lock();
+        // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
         unsafe { std::env::set_var("XRAY_CONF_TEST_ALT", "8080") };
         let p: PortList = serde_json::from_str(r#""env:xray.conf.test.alt""#).unwrap();
         assert_eq!(p.0, vec![PortRange::single(8080)]);
+        // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
         unsafe { std::env::remove_var("XRAY_CONF_TEST_ALT") };
     }
 }

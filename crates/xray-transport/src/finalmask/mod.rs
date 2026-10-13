@@ -214,6 +214,7 @@ impl AsyncRead for ConnAsAsyncIo {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
+        // SAFETY: newtype Pin 投影——字段 0 已被外层 Pin 结构性固定，map_unchecked_mut 不产生移动
         let this = unsafe { self.map_unchecked_mut(|s| &mut s.0) };
         AsyncRead::poll_read(this, cx, buf)
     }
@@ -224,6 +225,7 @@ impl AsyncWrite for ConnAsAsyncIo {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
+        // SAFETY: newtype Pin 投影——字段 0 已被外层 Pin 结构性固定，map_unchecked_mut 不产生移动
         let this = unsafe { self.map_unchecked_mut(|s| &mut s.0) };
         AsyncWrite::poll_write(this, cx, buf)
     }
@@ -232,6 +234,7 @@ impl AsyncWrite for ConnAsAsyncIo {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
+        // SAFETY: newtype Pin 投影——字段 0 已被外层 Pin 结构性固定，map_unchecked_mut 不产生移动
         let this = unsafe { self.map_unchecked_mut(|s| &mut s.0) };
         AsyncWrite::poll_flush(this, cx)
     }
@@ -240,6 +243,7 @@ impl AsyncWrite for ConnAsAsyncIo {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
+        // SAFETY: newtype Pin 投影——字段 0 已被外层 Pin 结构性固定，map_unchecked_mut 不产生移动
         let this = unsafe { self.map_unchecked_mut(|s| &mut s.0) };
         AsyncWrite::poll_shutdown(this, cx)
     }
@@ -351,6 +355,7 @@ impl AsyncRead for AsyncIoConn {
     ) -> std::task::Poll<io::Result<()>> {
         // ponytail: AsyncIoConn 是 newtype 包装，Pin 投影到 inner 字段
         // （unsafe 是必要的——Box<dyn AsyncIo> 是 Unpin，且 AsyncIo: Unpin）
+        // SAFETY: newtype Pin 投影——字段 0 已被外层 Pin 结构性固定，map_unchecked_mut 不产生移动
         let this = unsafe { self.map_unchecked_mut(|s| &mut s.0) };
         AsyncRead::poll_read(this, cx, buf)
     }
@@ -361,6 +366,7 @@ impl AsyncWrite for AsyncIoConn {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
+        // SAFETY: newtype Pin 投影——字段 0 已被外层 Pin 结构性固定，map_unchecked_mut 不产生移动
         let this = unsafe { self.map_unchecked_mut(|s| &mut s.0) };
         AsyncWrite::poll_write(this, cx, buf)
     }
@@ -369,6 +375,7 @@ impl AsyncWrite for AsyncIoConn {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
+        // SAFETY: newtype Pin 投影——字段 0 已被外层 Pin 结构性固定，map_unchecked_mut 不产生移动
         let this = unsafe { self.map_unchecked_mut(|s| &mut s.0) };
         AsyncWrite::poll_flush(this, cx)
     }
@@ -377,6 +384,7 @@ impl AsyncWrite for AsyncIoConn {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
+        // SAFETY: newtype Pin 投影——字段 0 已被外层 Pin 结构性固定，map_unchecked_mut 不产生移动
         let this = unsafe { self.map_unchecked_mut(|s| &mut s.0) };
         AsyncWrite::poll_shutdown(this, cx)
     }

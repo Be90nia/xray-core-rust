@@ -559,6 +559,7 @@ mod tests {
         struct Restore(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
         impl Drop for Restore {
             fn drop(&mut self) {
+                // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
                 unsafe {
                     match self.0.take() {
                         Some(v) => std::env::set_var(NAME, v),
@@ -572,6 +573,7 @@ mod tests {
                 super::reload_env_settings();
             }
         }
+        // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
         unsafe {
             std::env::remove_var(NAME);
             std::env::remove_var(ALT);
@@ -584,6 +586,7 @@ mod tests {
 
         // ② 显式启用值
         for on in ["auto", "enable"] {
+            // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
             unsafe { std::env::set_var(NAME, on) };
             reload_env_settings();
             assert!(use_readv(), "env={on:?} 应启用");
@@ -591,24 +594,28 @@ mod tests {
 
         // ③ 非法值禁用（readv 走 var()：非 UTF-8 与空串同落禁用侧）
         for off in ["disable", "true", "1", ""] {
+            // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
             unsafe { std::env::set_var(NAME, off) };
             reload_env_settings();
             assert!(!use_readv(), "env={off:?} 应禁用");
         }
 
         // ④ 缓存语义：env 变更不 reload 不生效
+        // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
         unsafe { std::env::set_var(NAME, "auto") };
         assert!(!use_readv(), "不 reload 不应翻转（缓存生效）");
         reload_env_settings();
         assert!(use_readv(), "reload 后应翻转");
 
         // ⑤ alt 名兜底 + 原名优先
+        // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
         unsafe {
             std::env::remove_var(NAME);
             std::env::set_var(ALT, "enable");
         }
         reload_env_settings();
         assert!(use_readv(), "alt 名应兜底");
+        // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者），set_var 窗口封闭
         unsafe { std::env::set_var(NAME, "disable") };
         reload_env_settings();
         assert!(!use_readv(), "原名命中时优先于 alt");

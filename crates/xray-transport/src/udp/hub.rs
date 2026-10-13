@@ -361,6 +361,7 @@ fn setsockopt_int(
     name: libc::c_int,
     val: libc::c_int,
 ) -> io::Result<()> {
+    // SAFETY: fd 为调用方持有 socket，&val 为栈上 c_int
     let ret = unsafe {
         libc::setsockopt(
             fd,
@@ -418,6 +419,7 @@ async fn start_recv_loop_tproxy_linux(
                         let control_len = msg.control_len();
                         let source = name.as_socket();
                         let target = parse_orig_dst_from_cmsg(&cmsg_buf, control_len);
+                        // SAFETY: n 为 recvmsg 返回的已接收字节数，data_buf 容量 ≥ n
                         let payload = unsafe {
                             std::slice::from_raw_parts(data_buf.as_ptr() as *const u8, n).to_vec()
                         };
@@ -492,14 +494,18 @@ fn parse_orig_dst_from_cmsg(
         return None;
     }
     // 构造临时 msghdr 让 CMSG_FIRSTHDR 工作。
+    // SAFETY: msghdr 为 POD，全零后仅填 msg_control/msg_controllen 指向已收缓冲
     let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
     hdr.msg_control = cmsg_buf.as_ptr() as *mut _;
     hdr.msg_controllen = len as _;
+    // SAFETY: hdr 的 msg_control/controllen 已指向已接收控制缓冲，契约返回首个头
     let cmsg = unsafe { libc::CMSG_FIRSTHDR(&hdr) };
     if cmsg.is_null() {
         return None;
     }
+    // SAFETY: cmsg 非 null 已检查，指向 hdr 控制缓冲内合法 cmsghdr
     let chdr = unsafe { &*cmsg };
+    // SAFETY: CMSG_DATA 契约返回 cmsg 头后的数据区（缓冲界内）
     let data = unsafe { libc::CMSG_DATA(cmsg) };
     let data_len = chdr.cmsg_len as usize - hdr_size;
 
