@@ -6513,7 +6513,6 @@ dependencies = [
 name = "xray-stress"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "base64",
  "clap",
  "parking_lot",
@@ -6521,6 +6520,7 @@ dependencies = [
  "rustls",
  "serde_json",
  "sysinfo",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
  "tracing",

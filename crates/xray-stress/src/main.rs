@@ -14,7 +14,13 @@
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use xray_stress::{quic_loop, report::StatsHandle, sampler::Sampler, scenarios as sc, topology};
+use xray_stress::{
+    error::{Result, StressError},
+    quic_loop,
+    report::StatsHandle,
+    sampler::Sampler,
+    scenarios as sc, topology,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "xray-stress", about = "Xray-core-rust stress harness")]
@@ -50,7 +56,7 @@ struct Args {
     drain_secs: u64,
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<()> {
     let args = Args::parse();
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -92,7 +98,7 @@ async fn run(
     scenarios: Vec<Scenario>,
     duration: Duration,
     interval: Duration,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     let deadline = Instant::now() + duration;
     let mut stats: Vec<StatsHandle> = Vec::new();
     // 负载 worker 与基础设施（协议链服务实例）分池：drain 观察窗停负载、
@@ -157,7 +163,7 @@ async fn run(
             topology::probe_socks_roundtrip(port, echo_port),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("{name} link probe timeout (60s)"))??;
+        .map_err(|_| StressError::ProbeTimeout { name: name.to_string() })??;
         println!("[xray-stress] {name} link ready: socks=127.0.0.1:{port}");
         protocol_links.push((sc, port));
     }
@@ -321,7 +327,7 @@ const PROTOCOL_SCENARIOS: &[(Scenario, &str)] = &[
 
 impl Scenario {
     /// s5-s12 → 对应协议链启动器（start_full 双实例）。
-    async fn start_link(self, echo_port: u16) -> anyhow::Result<topology::LinkHandles> {
+    async fn start_link(self, echo_port: u16) -> Result<topology::LinkHandles> {
         match self {
             Scenario::S5 => topology::start_vmess_ws_link(echo_port).await,
             Scenario::S6 => topology::start_trojan_grpc_link(echo_port).await,
@@ -331,7 +337,7 @@ impl Scenario {
             Scenario::S10 => topology::start_splithttp_link(echo_port).await,
             Scenario::S11 => topology::start_http_link(echo_port).await,
             Scenario::S12 => topology::start_vmess_h3_link(echo_port).await,
-            _ => anyhow::bail!("s1-s4 links are provisioned separately"),
+            _ => Err(StressError::Scenario("s1-s4 links are provisioned separately".into())),
         }
     }
 
@@ -340,7 +346,7 @@ impl Scenario {
     }
 }
 
-fn parse_scenarios(s: &str) -> anyhow::Result<Vec<Scenario>> {
+fn parse_scenarios(s: &str) -> Result<Vec<Scenario>> {
     let mut out = Vec::new();
     for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
         out.push(match part.to_ascii_lowercase().as_str() {
@@ -372,11 +378,15 @@ fn parse_scenarios(s: &str) -> anyhow::Result<Vec<Scenario>> {
                     Scenario::S12,
                 ]);
             },
-            other => anyhow::bail!("unknown scenario: {other} (expect s1..s12|all)"),
+            other => {
+                return Err(StressError::Scenario(format!(
+                    "unknown scenario: {other} (expect s1..s12|all)"
+                )));
+            },
         });
     }
     if out.is_empty() {
-        anyhow::bail!("empty --scenarios");
+        return Err(StressError::Scenario("empty --scenarios".into()));
     }
     Ok(out)
 }
