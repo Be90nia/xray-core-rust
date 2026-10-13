@@ -21,3 +21,32 @@ allow-git = [
 ignore = [
     "RUSTSEC-2024-0449", # rustls-pemfile 0.6.0 unmaintained
 ]
+
+# ─────────────────────────── licenses ───────────────────────────
+# 显式列常用 license 允许集（cargo-deny 没 [licenses] 段时用严格默认 deny 未知 license）。
+# 5 维红线不放松：未列 license 仍 deny；本表只覆盖白名单许可。
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "Zlib",
+    "OpenSSL",
+    "CC0-1.0",
+    "0BSD",
+    "BSL-1.0",
+    "Zlib-acknowledgement",
+    "PSF-2.0",
+    "Unicode-2.0",
+    "WTFPL",
+    "NCSA",
+    "curl",
+]
+confidence-threshold = 0.8
+

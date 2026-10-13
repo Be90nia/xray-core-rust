@@ -55,6 +55,13 @@ jobs:
       # 配方统一收编为 composite action（bd kumd，与 build-linux-release/mobile 同源）
       - uses: ./.github/actions/setup-boringssl
 
+      # Linux runner 默认 net.core.rmem_max = 2 MiB 会把 SO_RCVBUF 4MB 期望
+      # （bd 88m0 + 3e755458：缺省出站 4MB 接收缓冲）钳到 2MB，让 sockopt 测试跪。
+      # 与 ci.yml Test job 同型。macOS 用 kern.ipc.maxsockbuf 且默认 ≥ 4MB 不需要此步。
+      - name: Raise rmem_max for SO_RCVBUF tests
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608
+
       # macOS 上 workspace 全量编译本身即 darwin 编译烂账防线
       - name: Workspace lib tests
         run: cargo test --workspace --lib
