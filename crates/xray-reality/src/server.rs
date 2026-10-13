@@ -100,8 +100,9 @@ pub struct ParsedClientHello<'a> {
     /// key_share extension 中的 X25519 公钥（32 字节）；无则 `None`。
     pub key_share_x25519: Option<[u8; 32]>,
     /// key_share 中存在合格 X25519MLKEM768 entry（Go `peerPub2 != nil`，
-    /// tls.go:222-231）。信息性字段：命中与否不改变验证结果——auth_key 一律
-    /// 走 X25519 ECDH（key_share_x25519 已含 hybrid 末段兜底，t2js）。
+    /// tls.go:222-231）。**验证门**（bd 2ktp ①，对齐 Go tls.go:233-235）：
+    /// false 时 `verify_reality_client_hello` 返回 NoKeyShareX25519，调用方
+    /// reject→forward——X25519-only 的 ClientHello 不进 REALITY 认证。
     pub key_share_mlkem768: bool,
     /// server_name extension 中的 SNI；无则 `None`（用于 server_names 白名单匹配）。
     pub server_name: Option<String>,
@@ -273,31 +274,24 @@ fn parse_sni(edata: &[u8]) -> Option<String> {
 /// 解析 key_share extension (0x0033)，返回 `(选中的 client X25519 公钥, 是否
 /// 存在合格 MLKEM768 entry)`。
 ///
-/// tvky (REALITY 10.0)：同时支持 X25519MLKEM768 hybrid key share
-/// (group=0x11EC，data = mlkem ek(1184) + x25519 pub(32)，共 1216 字节)。
+/// 字节级对齐 Go xtls/reality@20260908 tls.go:214-238 单轮扫描（bd 2ktp ①）：
+/// - 合格 MLKEM768 entry（group 0x11EC，data 1216B = mlkem ek(1184) + x25519
+///   pub(32)）**必须在门**：缺席（或位于独立 X25519 之后未被消费）时 第二返回值为
+///   `false`，验证层据此 reject→forward（tls.go:233-235）；
+/// - 独立 X25519（group 0x001D，32B）**首遇即选中并终止扫描**——其后 entry （含
+///   MLKEM768）不再消费（tls.go:224-231 `break // ensure order`）， 故 MLKEM768 必须位于独立 X25519
+///   之前（真实 Chrome/btls 形态）；
+/// - 重复合格 MLKEM768 → Go `peerPub2 = nil // ensure fail` → 同 reject；
+/// - 两者皆合格 → 独立 X25519 优先（Go peerPub），否则取 hybrid 末段 （Go `peerPub = peerPub2`
+///   次选，tls.go:236-238）。
+///
 /// Go `MlkemEcdhe.ECDH(serverPub)` 仅返回 X25519 段（`ecdh.PrivateKey.ECDH`
 /// 是纯 X25519），hybrid MLKEM 段在 auth_key 派生中不参与；REALITY 10.0
 /// PQC 安全性来自 TLS session key 的 hybrid 派生，而非 auth_key 本身。
 ///
-/// 选择逻辑对照 Go xtls/reality@20260908 tls.go:214-238。**osn1 注释勘误**：
-/// 钉定基线**有** MLKEM768 必在门——`peerPub2 == nil → break`（tls.go:233-235，
-/// reject→forward），且 MLKEM768 须位于独立 X25519 之前（X25519 首遇即
-/// break，tls.go:224-231，其后 entry 不再消费）。t2js 曾以「Go 源码没有这些
-/// 拒绝分支」为由移除 sb6g 的对齐门禁——该论断与钉定模块不符，sb6g 行为
-/// 恰为 Go 一致（除 X25519 重复 entry 边角）。
-///
-/// **Rust 现状 = 有意放宽**（t2js，interop 动机：旧 Go crypto/tls 客户端只发
-/// 首个偏好 curve 的 keyshare）：
-/// - 独立 X25519（group 0x001D, 32B）**首选**：任一位置首遇即选中，
-/// - X25519MLKEM768（group **0x11EC** = 十进制 4588；历史实现误写 0x4588 ——把十进制当十六进制）取
-///   data 末段 32B **兜底**，首遇即停；
-/// - 顺序颠倒 / 重复 entry 均无害；
-/// - 两类都缺 → `(None, false)` → NoKeyShareX25519 → forward fallback。
-///
-/// 后果（osn1 记录）：X25519-only 的 ClientHello Go 基线会 reject→forward，
-/// Rust 会做 REALITY 认证（方向 accept-more，非安全洞，interop 双向绿建立
-/// 其上）。是否回贴 Go 门禁属行为变更（涉 interop 已验证路径），留 PM 决策；
-/// 本注释先行如实记录分歧，防按失实前提重挖。
+/// 历史（2ktp 回贴）：t2js 曾以「旧客户端 interop」为由放宽为顺序/重复无关的
+/// accept-more（X25519-only 也进 REALITY 认证），与钉定基线的 reject→forward
+/// 门不符，已恢复 Go 门禁语义。
 fn parse_key_shares(edata: &[u8]) -> (Option<[u8; 32]>, bool) {
     if edata.len() < 2 {
         return (None, false);
@@ -307,8 +301,8 @@ fn parse_key_shares(edata: &[u8]) -> (Option<[u8; 32]>, bool) {
         return (None, false);
     }
     let mut d = &edata[2..2 + list_len];
-    let mut x25519: Option<[u8; 32]> = None;
-    let mut mlkem: Option<[u8; 32]> = None;
+    let mut peer_pub: Option<[u8; 32]> = None; // Go peerPub：独立 X25519
+    let mut peer_pub2: Option<[u8; 32]> = None; // Go peerPub2：hybrid 末段
     while d.len() >= 4 {
         let group = u16::from_be_bytes([d[0], d[1]]);
         let key_len = u16::from_be_bytes([d[2], d[3]]) as usize;
@@ -317,23 +311,33 @@ fn parse_key_shares(edata: &[u8]) -> (Option<[u8; 32]>, bool) {
             // （Go 的 keyShares 由 crypto/tls 解析，到不了带畸形项这一步）
             return (None, false);
         }
-        if group == 0x001d && key_len == 32 {
-            if x25519.is_none() {
-                let mut k = [0u8; 32];
-                k.copy_from_slice(&d[4..4 + 32]);
-                x25519 = Some(k);
+        if group == 0x11ec && key_len == 1216 {
+            if peer_pub2.is_some() {
+                peer_pub2 = None; // Go `ensure fail`：重复 MLKEM768 拒绝
+                break;
             }
-        } else if group == 0x11ec && key_len == 1216 && mlkem.is_none() {
             // X25519MLKEM768 hybrid：1184B MLKEM ek + 32B X25519 pub（末段）。
             // Go 端 `MlkemEcdhe.ECDH(serverPub)` 只消费 X25519 段。
             let mut k = [0u8; 32];
             k.copy_from_slice(&d[4 + 1184..4 + 1184 + 32]);
-            mlkem = Some(k);
+            peer_pub2 = Some(k);
+        } else if group == 0x001d && key_len == 32 {
+            if peer_pub.is_some() {
+                // Go `ensure fail`（首遇即 break，正常输入不可达，保 Go 结构）
+                peer_pub2 = None;
+                break;
+            }
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&d[4..4 + 32]);
+            peer_pub = Some(k);
+            break; // Go `break // ensure order`：其后 entry 不再消费
         }
         d = &d[4 + key_len..];
     }
-    // Go：peerPub（独立 X25519）首选，nil 时取 peerPub2（hybrid 末段）
-    (x25519.or(mlkem), mlkem.is_some())
+    // Go 结构：扫描照常选出 peerPub，门在扫描之后判——合格 MLKEM768 缺席
+    // （或在独立 X25519 之后未被消费）时第二返回值为 false，验证层据此
+    // reject→forward（tls.go:233-235），parse 本身不改变选中结果。
+    (peer_pub.or(peer_pub2), peer_pub2.is_some())
 }
 
 /// `session_id` 在 handshake_message 中的字节偏移。
@@ -375,8 +379,12 @@ pub fn verify_reality_client_hello(
     max_client_ver: &[u8],
 ) -> Result<(crate::crypto::SessionPayload, [u8; 32]), RealityError> {
     // 1. 提取 client X25519 公钥：独立 X25519 entry 首选，缺席时取 X25519MLKEM768 hybrid 末段（Go
-    //    tls.go:214-231 两轮首遇扫描；t2js： Go 客户端可能只发其一，两类都缺才 NoKeyShareX25519 →
-    //    forward fallback）
+    //    tls.go:214-238 扫描语义已对齐 parse_key_shares）。 Go 门 tls.go:233-235：合格 MLKEM768
+    //    必须在门（peerPub2 == nil → break = reject→forward），X25519-only 的 CH 不进 REALITY
+    //    认证（bd 2ktp ①）。
+    if !parsed.key_share_mlkem768 {
+        return Err(RealityError::NoKeyShareX25519);
+    }
     let client_pub = parsed.key_share_x25519.ok_or(RealityError::NoKeyShareX25519)?;
 
     // 2. 构造 zero-session-id handshake message（AES-GCM AAD） 复用
@@ -1405,7 +1413,7 @@ mod tests {
         assert!(matches!(err, RealityError::NoKeyShareX25519));
     }
 
-    // ===== t2js：key_share 选择语义（Go tls.go:214-231 两轮首遇扫描）=====
+    // ===== 2ktp ①：key_share 选择语义（Go tls.go:214-238 单轮扫描 + MLKEM768 在门）=====
 
     /// 构造任意 key_share entries 的 ClientHello record（sb6g 测试专用）。
     /// entries 按 wire 顺序编码进单一 key_share extension。
@@ -1465,11 +1473,10 @@ mod tests {
         record
     }
 
-    /// t2js：纯 X25519 单 share（无 MLKEM768）——Go std crypto/tls 客户端
-    /// 形态。过 keyshare 门进 REALITY auth；错误服务端密钥下 auth_key 错 →
-    /// AEAD 解密失败（不再于 keyshare 门误拒）。
+    /// 2ktp ①：纯 X25519 单 share（无 MLKEM768）——Go tls.go:233-235 门：
+    /// `peerPub2 == nil → break` = reject→forward，不进 REALITY 认证。
     #[test]
-    fn verify_reality_client_hello_pure_x25519_passes_keyshare_gate() {
+    fn verify_reality_client_hello_pure_x25519_rejected_no_mlkem() {
         let random = [0x55u8; 32];
         let session_id = [0x77u8; 32];
         let record = build_test_client_hello_with_key_share_entries(
@@ -1484,8 +1491,8 @@ mod tests {
         let err =
             verify_reality_client_hello(&parsed, &[0u8; 32], 0, 0, &[], &[], &[]).unwrap_err();
         assert!(
-            matches!(err, RealityError::SessionIdDecryptFailed),
-            "pure X25519 must reach AEAD stage, got {err:?}"
+            matches!(err, RealityError::NoKeyShareX25519),
+            "X25519-only must be rejected at keyshare gate, got {err:?}"
         );
     }
 
@@ -1530,10 +1537,11 @@ mod tests {
         assert!(parsed.key_share_mlkem768);
     }
 
-    /// 顺序颠倒 [X25519, X25519MLKEM768]：Go 两轮各自 first-match-wins——
-    /// 独立 X25519 选中，MLKEM 检测同样命中（t2js：旧实现误拒）。
+    /// 顺序颠倒 [X25519, X25519MLKEM768]：Go tls.go:224-231 独立 X25519 首遇
+    /// 即 break——其后 entry（含 MLKEM768）不再消费，peerPub2 恒 nil →
+    /// reject→forward（2ktp ① 对齐：X25519 选中但 mlkem 门不过）。
     #[test]
-    fn parse_client_hello_x25519_before_mlkem_both_selected() {
+    fn parse_client_hello_x25519_before_mlkem_mlkem_not_consumed() {
         let random = [0x55u8; 32];
         let session_id = [0x77u8; 32];
         let record = build_test_client_hello_with_key_share_entries(
@@ -1543,14 +1551,15 @@ mod tests {
             None,
         );
         let parsed = parse_client_hello(&record).unwrap();
+        // X25519 首遇选中并终止扫描 → MLKEM768 entry 未被消费
         assert_eq!(parsed.key_share_x25519, Some([0xCCu8; 32]));
-        assert!(parsed.key_share_mlkem768);
+        assert!(!parsed.key_share_mlkem768);
     }
 
-    /// 重复 MLKEM entry：Go 循环首遇即 break，重复无害、首个生效（t2js：
-    /// 旧实现误判 reject）。
+    /// 重复合格 MLKEM entry：Go tls.go:225-229 `peerPub2 = nil // ensure fail`
+    /// → 无合格 MLKEM768 → reject→forward（2ktp ① 对齐）。
     #[test]
-    fn parse_client_hello_duplicate_mlkem_first_wins() {
+    fn parse_client_hello_duplicate_mlkem_rejected() {
         let random = [0x55u8; 32];
         let session_id = [0x77u8; 32];
         let record = build_test_client_hello_with_key_share_entries(
@@ -1560,13 +1569,14 @@ mod tests {
             None,
         );
         let parsed = parse_client_hello(&record).unwrap();
-        assert_eq!(parsed.key_share_x25519, Some([0xAAu8; 32]));
-        assert!(parsed.key_share_mlkem768);
+        // Go `ensure fail`：重复 MLKEM768 → peerPub2 置空 → 整体拒绝
+        assert_eq!(parsed.key_share_x25519, None);
+        assert!(!parsed.key_share_mlkem768);
     }
 
-    /// server_tls e2e：纯 X25519 单 share CH 过 keyshare 门，垃圾 auth 数据
-    /// 在 AEAD 层拒 → `Invalid`（调用方拿回 conn+record 走 `fallback_to_dest`），
-    /// reason = SessionIdDecryptFailed（t2js：不再于 keyshare 门误拒）。
+    /// server_tls e2e：纯 X25519 单 share CH 被键 share 门拒（Go tls.go:233-235
+    /// `peerPub2 == nil → break`）→ `Invalid`（调用方拿回 conn+record 走
+    /// `fallback_to_dest`），reason = NoKeyShareX25519（2ktp ① 回贴 Go 门禁）。
     #[tokio::test]
     async fn server_tls_pure_x25519_ch_invalid_for_fallback() {
         use tokio::io::{AsyncWriteExt, duplex};
@@ -1592,8 +1602,8 @@ mod tests {
         match server_task.await.unwrap() {
             Ok(RealityServerOutcome::Invalid { reason, .. }) => {
                 assert!(
-                    matches!(reason, RealityError::SessionIdDecryptFailed),
-                    "expected SessionIdDecryptFailed, got {reason:?}"
+                    matches!(reason, RealityError::NoKeyShareX25519),
+                    "expected NoKeyShareX25519, got {reason:?}"
                 );
             },
             Ok(RealityServerOutcome::Verified { .. }) => {

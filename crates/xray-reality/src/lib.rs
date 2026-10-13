@@ -28,8 +28,8 @@
 //!   X25519MLKEM768 hybrid KX（服务端 key_share 解析）+ mldsa65 公钥派生。
 //! - http2 spider 爬行（fallback 探测路径；`spider_x` 已解析保留，爬行未实现）
 //! - btls 全指纹 e2e 矩阵 `#[ignore]`（566y 分类：MLKEM-capable 子集已摘 active； transcript
-//!   mismatch 已不复现；非 MLKEM 模板语义另见 server.rs parse_key_shares 的 osn1 注释勘误——t2js
-//!   后服务端不再 reject X25519-only 模板）
+//!   mismatch 已不复现；非 MLKEM 模板语义：2ktp ① 已回贴 Go tls.go:233-235 门禁—— X25519-only 模板
+//!   reject→forward，不再 accept-more）
 //!
 //! 参考：Go 基准位于 `D:/Project/Xray-core/transport/internet/reality/`。
 

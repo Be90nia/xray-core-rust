@@ -80,9 +80,9 @@ pub enum RealityError {
     #[error("REALITY: short_id not in whitelist")]
     ShortIdNotAllowed,
 
-    /// key_share extension 缺失或不含任何可用 X25519 公钥（Go tls.go:214-231：
-    /// 独立 X25519 与 X25519MLKEM768 hybrid 末段都缺才 reject→forward；
-    /// t2js 修正：仅有其一即放行，此前误拒纯 X25519 客户端）。
+    /// key_share extension 无合格 MLKEM768 entry，或不含任何可用 X25519 公钥
+    /// （Go tls.go:233-235：`peerPub2 == nil → break` = reject→forward，
+    /// X25519-only 的 ClientHello 同样被拒；bd 2ktp ① 回贴 Go 门禁）。
     #[error("REALITY: key_share extension missing or no X25519 entry")]
     NoKeyShareX25519,
 
