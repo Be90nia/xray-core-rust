@@ -26,6 +26,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
+      # dtolnay/rust-toolchain v2 with.targets 单 target 失效兜底 (与 release.yml / iOS job 同型)
+      - name: Ensure target installed (android)
+        run: rustup target add aarch64-linux-android
       # boringssl 的 cmake 配置需要 go（生成测试清单/部分源码）
       - uses: actions/setup-go@v5
         with:
@@ -67,6 +70,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios
+      # dtolnay/rust-toolchain v2 with.targets 单 target 失效兜底 (CI 38363323289 E0463)
+      - name: Ensure target installed (ios)
+        run: rustup target add aarch64-apple-ios
       # boringssl cmake 需要 go（macos-14 镜像缺省无 go）
       - uses: actions/setup-go@v5
         with:
