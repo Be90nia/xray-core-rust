@@ -52,7 +52,7 @@ pub enum ResolverConfig {
 /// xdns 配置（对应 Go `xdns.Config` protobuf）。
 #[derive(Debug, Clone, Default)]
 pub struct Config {
-    /// 服务端：伪装域名（结构与默认值见 [`build_domain_config`]）。
+    /// 服务端：伪装域名（结构与默认值见 `build_domain_config()`）。
     pub domains: Vec<DomainConfig>,
     /// 客户端：resolver 列表（经隧道直连服务端伪装出口）。
     pub resolvers: Vec<ResolverConfig>,
