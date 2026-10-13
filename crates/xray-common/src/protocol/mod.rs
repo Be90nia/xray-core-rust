@@ -213,11 +213,23 @@ impl std::fmt::Display for Command {
 /// 协议 ID，包含 UUID、命令密钥和替代 ID 列表。
 ///
 /// 对应 Go 版本的 `ID` 结构体，用于 VMess 等协议的身份标识。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ID {
     uuid: UUID,
     cmd_key: [u8; 16],
     alter_ids: Vec<ID>,
+}
+
+// Debug 脱敏：uuid/cmd_key 均为认证凭据，禁止经 derive(Debug) 泄露
+// （安全审计红线：含密码/UUID 的 struct 不得 derive Debug）。
+impl std::fmt::Debug for ID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ID")
+            .field("uuid", &"[REDACTED]")
+            .field("cmd_key", &"[REDACTED]")
+            .field("alter_ids", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl ID {

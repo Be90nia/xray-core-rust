@@ -298,7 +298,7 @@ pub fn hkdf_sha1(secret: &[u8], salt: &[u8], out: &mut [u8]) {
 /// SS 运行时账户，对应 Go `MemoryAccount{Cipher, CipherType, Key, Password}`。
 ///
 /// `iv_check`：是否启用 IV 唯一性检查（反重放）。Go proto 字段 `Account.iv_check`。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MemoryAccount {
     pub cipher: Cipher,
     pub cipher_type: CipherType,
@@ -306,6 +306,20 @@ pub struct MemoryAccount {
     pub password: String,
     /// IV 唯一性检查（反重放）。true 时 Validator 会跟踪已见 IV 并拒绝重复。
     pub iv_check: bool,
+}
+
+// Debug 脱敏：key/password 为认证凭据，禁止经 derive(Debug) 泄露
+// （安全审计红线：含密码/UUID 的 struct 不得 derive Debug）。
+impl std::fmt::Debug for MemoryAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryAccount")
+            .field("cipher", &self.cipher)
+            .field("cipher_type", &self.cipher_type)
+            .field("key", &"[REDACTED]")
+            .field("password", &"[REDACTED]")
+            .field("iv_check", &self.iv_check)
+            .finish()
+    }
 }
 
 impl MemoryAccount {

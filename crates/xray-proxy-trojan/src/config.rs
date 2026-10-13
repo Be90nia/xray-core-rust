@@ -25,12 +25,23 @@ pub const HEX_KEY_LEN: usize = 56;
 /// MemoryAccount：从 Account 转换得到的运行时账户。
 ///
 /// 对应 Go `proxy/trojan/config.go::MemoryAccount`。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MemoryAccount {
     /// 用户原始密码。
     pub password: String,
     /// `hex(sha224(password))` 的字节表示（固定 56 字节，作为协议头哈希 key）。
     pub key: [u8; HEX_KEY_LEN],
+}
+
+// Debug 脱敏：password/key 为认证凭据，禁止经 derive(Debug) 泄露
+// （安全审计红线：含密码/UUID 的 struct 不得 derive Debug）。
+impl std::fmt::Debug for MemoryAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryAccount")
+            .field("password", &"[REDACTED]")
+            .field("key", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl MemoryAccount {
