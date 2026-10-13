@@ -19,7 +19,7 @@ use crate::error::DnsError;
 /// - `USE_SYS = 3`：跟随系统偏好（业务层置 `check_system = true`； 值对齐 Go
 ///   `app/dns/config.proto:36`，此前误写 4）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types)] // UseIp4/UseIp6 对齐 Go USE_IP4/USE_IP6 枚举字面，不做 IPv 拼写改写
 pub enum QueryStrategy {
     /// 同时查询 IPv4 + IPv6。
     UseIp,

@@ -132,9 +132,7 @@ impl LeastLoadStrategy {
     ///
     /// `alpha` 仅 `Adaptive` 模式相关；`hash_key_seed` 仅 `ConsistentHashing` 模式相关。
     /// `vnodes` 仅 `ConsistentHashing` 模式相关。
-    // 参数面对齐 Go `conf.StrategyLeastLoadConfig` 构建路径；打包为参数结构属
-    // API 变更，保持现状。
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // 参数面对齐 Go conf.StrategyLeastLoadConfig 构建路径，打包属 API 变更
     pub fn with_mode(
         config: &StrategyLeastLoadConfig,
         selectors: Vec<String>,

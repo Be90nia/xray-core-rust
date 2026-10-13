@@ -47,7 +47,7 @@ pub trait Server: Send + Sync {
     /// 查询域名对应的 IP。
     ///
     /// 返回 `(ips, ttl_seconds)`。
-    #[allow(clippy::type_complexity)] // 存量清零批次：type_complexity
+    #[allow(clippy::type_complexity)] // 签名类型即业务语义，抽 type alias 反而更晦涩
     fn query_ip<'a>(
         &'a self,
         domain: &'a str,

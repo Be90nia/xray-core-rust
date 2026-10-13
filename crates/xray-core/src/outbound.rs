@@ -1823,7 +1823,7 @@ pub struct StubDispatchBridge {
 }
 
 impl StubDispatchBridge {
-    #[allow(dead_code)] // 存量清零批次
+    #[allow(dead_code)] // stub 备件（历史 stub 同款语义），复用批接线
     /// 创建 stub outbound handler。
     fn new(tag: impl Into<String>, protocol: &str) -> Self {
         Self { tag: tag.into(), protocol: protocol.to_string() }
@@ -2617,7 +2617,7 @@ async fn pump_tuic_udp(
 /// 返回 `true` 表示消费了一帧；accum 为空或帧不完整返回 `false`；
 /// 致命错误返回 `Err`。响应帧来源 = 请求目标（TUIC spec：server 回包
 /// addr 与请求目标一致）。
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // TUIC 帧中继上下文 6 参直译，打包聚合体属内部 API 变更
 async fn tuic_frame_relay(
     assoc: &xray_proxy_tuic::TuicUdpAssoc,
     mode: xray_proxy_tuic::UdpRelayMode,

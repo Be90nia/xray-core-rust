@@ -1113,7 +1113,7 @@ impl DefaultDispatcher {
     /// 6. spawn handler.dispatch(link)
     ///
     /// `access` 为 None 时不记（等价 Go ctx 无 AccessMessage）。
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // Go dispatch 上下文五参面直译，打包聚合体属 API 变更
     pub fn dispatch_link(
         &self,
         destination: &xray_common::net::destination::Destination,
@@ -1925,7 +1925,9 @@ impl SimpleOhm {
         }
     }
 
-    #[allow(dead_code)]
+    /// 对应 Go `outbound.Manager.AddHandler`。当前运行时装配走 `snapshot()`/构造器，
+    /// 显式调用方仅 xray-app-reverse bridge 的备用注册路径——保留 API 完整性。
+    #[allow(dead_code)] // reverse bridge 备用注册路径生产可达性待接线，API 对位 Go AddHandler
     pub fn add(&self, tag: &str, handler: Arc<dyn DispatchHandler>) {
         self.tagged.write().unwrap().insert(tag.to_string(), handler);
     }

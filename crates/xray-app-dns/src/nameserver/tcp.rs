@@ -343,7 +343,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // 存量清零批次：await_holding_lock
+    #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
     async fn tcp_query_once_returns_a_record() {
         let _slot = DIALER_SLOT_LOCK.lock();
         let (addr, _h) =
@@ -362,7 +362,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // 存量清零批次：await_holding_lock
+    #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
     async fn tcp_send_query_v4_only() {
         let _slot = DIALER_SLOT_LOCK.lock();
         let (addr, _h) = spawn_mock_tcp_server("z.com.", vec![Ipv4Addr::new(8, 8, 8, 8)], 60).await;
@@ -385,7 +385,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // 存量清零批次：await_holding_lock
+    #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
     async fn tcp_query_timeout_records_error() {
         let _slot = DIALER_SLOT_LOCK.lock();
         // 监听但永不 accept。
@@ -447,7 +447,7 @@ mod tests {
     /// bd mcpo 验收②：dialer 注入后查询经路由出站——dialer 收到查询目标
     /// （dest 原样传递），数据经 dialer 建立的链路往返。
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // 存量清零批次：await_holding_lock
+    #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
     async fn tcp_query_routes_through_dialer() {
         let _slot = DIALER_SLOT_LOCK.lock();
         let (addr, _h) =
@@ -501,7 +501,7 @@ mod tests {
     /// bd mcpo 验收①：域名 NS 运行期解析——上游地址变更后，新查询用新 IP
     /// （旧解析不残留：连接池按域名字段每查询新建流）。
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // 存量清零批次：await_holding_lock
+    #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
     async fn tcp_domain_ns_resolves_at_query_time() {
         let _slot = DIALER_SLOT_LOCK.lock();
         // A/B 两个 mock server：同一端口、不同 loopback 地址（模拟上游 NS 换 IP）。

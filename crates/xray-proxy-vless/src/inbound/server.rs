@@ -254,7 +254,7 @@ fn udp_idle_timeout() -> std::time::Duration {
 /// 2. `first[0]==VLESS VERSION` 且 decode 成功 → 正常 dispatch
 /// 3. 否则（非 VLESS 流量 / 认证失败）→ 查 FallbackPolicy 转发到 fallback dest
 // 装配层单入口：参数即 Go handleConnection 上下文全集，收紧签名反而要引入聚合体
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // 装配层单入口，参数即 Go handleConnection 上下文全集
 pub async fn handle_connection_with_fallback<S>(
     stream: S,
     handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,

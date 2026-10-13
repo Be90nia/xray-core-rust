@@ -107,7 +107,6 @@ impl Codec {
 /// 解码（对应 Go `decodeBytes`）。
 ///
 /// 跨调用保持 `hint_buf` 和 `table_index` 状态，用于 TCP 流式解码。
-#[allow(clippy::type_complexity)]
 pub(crate) fn decode_bytes(
     tables: &[Arc<Table>],
     table_index: &mut usize,

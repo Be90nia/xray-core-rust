@@ -187,7 +187,7 @@ impl WgUserRegistry {
 }
 
 /// [`std::net::IpAddr`] → smoltcp [`smoltcp::wire::IpAddress`]（与 inbound.rs 共用逻辑）。
-#[allow(clippy::incompatible_msrv)] // 存量清零批次：incompatible_msrv
+#[allow(clippy::incompatible_msrv)] // 工作区实际工具链新于 MSRV=1.85，该 API 受控使用
 fn to_smoltcp_addr(addr: IpAddr) -> smoltcp::wire::IpAddress {
     match addr {
         IpAddr::V4(v4) => {
@@ -278,7 +278,7 @@ mod tests {
 
     use super::*;
     use crate::{driver::WgTransport, peer::SharedPeer};
-    #[allow(dead_code)] // 存量清零批次
+    #[allow(dead_code)] // 测试装配 helper，同 mod 测试共享
     fn make_keypair(seed: u8) -> (String, String) {
         use boringtun::x25519::{PublicKey, StaticSecret};
         let secret_bytes = [seed; 32];
@@ -287,7 +287,7 @@ mod tests {
     }
 
     /// Dialed 假传输 driver（不跑 main_loop，无需真实 socket）。
-    #[allow(dead_code)] // 存量清零批次
+    #[allow(dead_code)] // 测试装配 helper，同 mod 测试共享
     fn test_driver(device: &DeviceConfig, static_pub: &str) -> DriverSlot {
         let peer: SharedPeer = shared_peer(
             device,
@@ -316,7 +316,7 @@ mod tests {
         );
         Arc::new(ParkMutex::new(Some(Arc::new(driver))))
     }
-    #[allow(dead_code)] // 存量清零批次
+    #[allow(dead_code)] // 测试装配 helper，同 mod 测试共享
     fn make_registry() -> (WgUserRegistry, String, String, String) {
         let (sec_s, pub_s) = make_keypair(0x22);
         let (_, pub_static) = make_keypair(0x11);
@@ -326,7 +326,7 @@ mod tests {
         let registry = WgUserRegistry::new(device, driver).expect("registry");
         (registry, pub_s, pub_static, pub_dyn)
     }
-    #[allow(dead_code)] // 存量清零批次
+    #[allow(dead_code)] // 测试装配 helper，同 mod 测试共享
     fn peer_cfg(pub_key: String, allowed: &str) -> PeerConfig {
         PeerConfig { public_key: pub_key, allowed_ips: vec![allowed.into()], ..Default::default() }
     }

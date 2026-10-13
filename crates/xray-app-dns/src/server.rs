@@ -393,7 +393,7 @@ enum ClientOutcome {
     Pending,
 }
 
-#[allow(clippy::type_complexity)] // 存量清零批次：type_complexity
+#[allow(clippy::type_complexity)] // 签名类型即业务语义，抽 type alias 反而更晦涩
 async fn parallel_query(
     clients: &[Arc<Client>],
     domain: &str,

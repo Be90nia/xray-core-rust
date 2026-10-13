@@ -68,7 +68,7 @@ pub const SEGMENT_OPTION_CLOSE: SegmentOption = 1;
 pub const DATA_SEGMENT_OVERHEAD: usize = 18;
 
 /// 兼容旧 API 命名（推荐使用大写常量风格）。
-#[allow(non_upper_case_globals)]
+#[allow(non_upper_case_globals)] // 兼容旧调用方命名 DataSegmentOverhead，迁移后删除
 pub const DataSegmentOverhead: usize = DATA_SEGMENT_OVERHEAD;
 
 /// Segment trait：所有 segment 类型的统一接口。

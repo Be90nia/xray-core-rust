@@ -83,7 +83,7 @@ pub struct DohNameServer {
 impl DohNameServer {
     /// 构造。
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // Go NewServerClient 装配面 7 参直译，打包结构属 API 变更
     pub fn new(
         dest: Destination,
         server_name: String,

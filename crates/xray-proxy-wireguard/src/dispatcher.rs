@@ -505,11 +505,13 @@ pub fn make_wireguard_dial_fn(
                 Network::TCP => {
                     let ip = match dest.address() {
                         Address::IPv4(v4) => smoltcp::wire::IpAddress::Ipv4(
-                            #[allow(clippy::incompatible_msrv)] // 存量清零批次
+                            #[allow(clippy::incompatible_msrv)]
+                            // 工作区实际工具链新于 MSRV=1.85，该 API 受控使用
                             smoltcp::wire::Ipv4Address::from_octets(v4.octets()),
                         ),
                         Address::IPv6(v6) => smoltcp::wire::IpAddress::Ipv6(
-                            #[allow(clippy::incompatible_msrv)] // 存量清零批次
+                            #[allow(clippy::incompatible_msrv)]
+                            // 工作区实际工具链新于 MSRV=1.85，该 API 受控使用
                             smoltcp::wire::Ipv6Address::from_octets(v6.octets()),
                         ),
                         Address::Domain(_) => unreachable!("resolved above"),
@@ -764,11 +766,13 @@ pub(crate) async fn resolve_domain_in_tunnel(
             let target = smoltcp::wire::IpEndpoint::new(
                 match server {
                     std::net::IpAddr::V4(v4) => smoltcp::wire::IpAddress::Ipv4(
-                        #[allow(clippy::incompatible_msrv)] // 存量清零批次
+                        #[allow(clippy::incompatible_msrv)]
+                        // 工作区实际工具链新于 MSRV=1.85，该 API 受控使用
                         smoltcp::wire::Ipv4Address::from_octets(v4.octets()),
                     ),
                     std::net::IpAddr::V6(v6) => smoltcp::wire::IpAddress::Ipv6(
-                        #[allow(clippy::incompatible_msrv)] // 存量清零批次
+                        #[allow(clippy::incompatible_msrv)]
+                        // 工作区实际工具链新于 MSRV=1.85，该 API 受控使用
                         smoltcp::wire::Ipv6Address::from_octets(v6.octets()),
                     ),
                 },

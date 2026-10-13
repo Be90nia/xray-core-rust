@@ -18,7 +18,7 @@ use crate::error::TlsError;
 /// 对应 Go 端 `utls.ClientHelloID`，但 Rust 端只保留「客户端想要哪
 /// 种指纹」这一标记，具体字节布局等接入真实 uTLS 等价品后实现。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types)] // Qihoo360 等变体名直译 Go 指纹名（数字开头/专有拼写），UI 名单对齐
 pub enum Fingerprint {
     // ===== PresetFingerprints（UI 友好简短名） =====
     Chrome,

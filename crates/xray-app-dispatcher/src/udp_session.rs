@@ -204,7 +204,7 @@ mod tests {
                     Err(_) => return,
                 };
                 // XUDP 首帧解析需要连续字节：P1 收口点（UDP 小包 relay bench，oracle §7 Phase 1）
-                #[allow(clippy::disallowed_methods)]
+                #[allow(clippy::disallowed_methods)] // XUDP 首帧需连续字节，P1 收口点登记
                 let bytes = mb.to_vec();
                 let mut cursor = std::io::Cursor::new(&bytes[..]);
                 let mut pr = PacketReader::new(&mut cursor);
@@ -269,7 +269,7 @@ mod tests {
                             Err(_) => break,
                         };
                         // XUDP 帧累积解析：P1 收口点（同上，udp relay bench 轮次）
-                        #[allow(clippy::disallowed_methods)]
+                        #[allow(clippy::disallowed_methods)] // XUDP 帧累积需连续字节，P1 收口点登记
                         let flat = mb.to_vec();
                         accum.extend_from_slice(&flat);
                         loop {

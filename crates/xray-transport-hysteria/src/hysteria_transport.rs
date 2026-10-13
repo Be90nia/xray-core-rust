@@ -305,9 +305,9 @@ async fn authenticate_via_h3(
 /// udp_enabled/cc_rx_down 是服务端响应头解析结果，供拥塞控制选择
 /// （Go：`UseBrutal(conn, min(BrutalUp, down))`，down=0 或 BrutalUp=0 时退 BBR）。
 pub struct H3Keepalive {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // driver/send_req 刻意持有到 QUIC 连接终期（drop 即 H3_NO_ERROR 关连接）
     pub driver_task: tokio::task::JoinHandle<()>,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // 同 driver_task：保活项，本体无需读取
     pub send_req: h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>,
     /// 服务端 Hysteria-UDP 响应头（是否启用 UDP relay）。
     pub udp_enabled: bool,

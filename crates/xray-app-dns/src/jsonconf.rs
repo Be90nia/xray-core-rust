@@ -364,7 +364,7 @@ fn build_server_url(address: &str, port: Option<u16>) -> String {
 ///
 /// `derived_policy_id` 为上游按 8 元组派生的策略 id（`build` 循环）；
 /// JSON `policyID` 非零时覆盖之（Go 无此字段，见 `build`）。
-#[allow(clippy::too_many_arguments)] // 存量清零批次：too_many_arguments
+#[allow(clippy::too_many_arguments)] // Go 装配 API 参数面直译，打包结构属 API 变更
 fn build_client(
     ns: &NameServerJson,
     global_client_ip: &[u8],

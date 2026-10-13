@@ -250,7 +250,7 @@ impl std::fmt::Debug for TcpWorker {
 
 impl TcpWorker {
     /// 构造 TCP worker。
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // Go NewTcpWorker 装配面 11 参直译，打包结构属 API 变更
     pub fn new(
         address: SocketAddr,
         port: u16,
@@ -515,7 +515,7 @@ impl std::fmt::Debug for UdpWorker {
 
 impl UdpWorker {
     /// 构造 UDP worker。
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // Go NewUdpWorker 装配面 10 参直译，打包结构属 API 变更
     pub fn new(
         proxy: Arc<dyn ProxyInbound>,
         address: SocketAddr,

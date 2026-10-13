@@ -509,10 +509,7 @@ impl DefaultDialerClient {
         if resp.status() != StatusCode::OK {
             // 读 status 后丢弃 body（drain）
             let status = resp.status();
-            #[allow(unused_must_use)]
-            {
-                resp.into_body().collect().await;
-            }
+            let _ = resp.into_body().collect().await;
             return Err(SplitHttpError::BadStatus(status.as_u16()));
         }
 
@@ -586,19 +583,13 @@ impl DefaultDialerClient {
 
         if upload_only {
             // stream-up：drain body，返回 None
-            #[allow(unused_must_use)]
-            {
-                resp.into_body().collect().await;
-            }
+            let _ = resp.into_body().collect().await;
             Ok((None, remote, local))
         } else {
             // stream-one：检查 200 + 返回 body stream
             if resp.status() != StatusCode::OK {
                 let status = resp.status();
-                #[allow(unused_must_use)]
-                {
-                    resp.into_body().collect().await;
-                }
+                let _ = resp.into_body().collect().await;
                 return Err(SplitHttpError::BadStatus(status.as_u16()));
             }
             Ok((Some(BodyDataStream::new(resp.into_body())), remote, local))
@@ -655,10 +646,7 @@ impl DefaultDialerClient {
     async fn post_packet_finish(resp: http::Response<hyper::body::Incoming>) -> Result<()> {
         let status = resp.status();
         // drain body（hyper-util 要求消费 body 释放连接回 pool）
-        #[allow(unused_must_use)]
-        {
-            resp.into_body().collect().await;
-        }
+        let _ = resp.into_body().collect().await;
 
         if status != StatusCode::OK {
             return Err(SplitHttpError::BadStatus(status.as_u16()));

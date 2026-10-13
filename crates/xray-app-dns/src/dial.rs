@@ -337,7 +337,7 @@ mod tests {
     /// dialer 强制直连（Go nameserver.go:51-61 Local mode 传 nil dispatcher）；
     /// `force_local=false` 仍走 dialer。
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // 存量清零批次：await_holding_lock
+    #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
     async fn connect_stream_force_local_bypasses_shared_dialer() {
         let _slot = DIALER_SLOT_LOCK.lock();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

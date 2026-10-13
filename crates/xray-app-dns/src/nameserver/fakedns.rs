@@ -223,7 +223,7 @@ mod tests {
     /// （fakeDns app 配置的 198.18.0.0/15，而非 new_default 的 240.0.0.0/4），
     /// 且能被共享引擎（dispatcher 同引擎）反查命中。
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // 存量清零批次：await_holding_lock
+    #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
     async fn factory_serves_shared_engine_and_reverse_resolves() {
         let _slot_guard = SLOT_LOCK.lock();
         let multi = std::sync::Arc::new(
@@ -256,7 +256,7 @@ mod tests {
 
     /// 无 fakeDns app（共享槽空）时保持 `new_default` 兼容行为。
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // 存量清零批次：await_holding_lock
+    #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
     async fn factory_falls_back_to_new_default_without_shared_engine() {
         let _slot_guard = SLOT_LOCK.lock();
         crate::fakedns::set_shared_multi(None);

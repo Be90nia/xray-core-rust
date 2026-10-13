@@ -767,7 +767,7 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
 
         // 解密 header protection（在可变副本上操作）
         // HP 掩码解密需要可变副本，拷贝为算法固有（ring open_in_place 前置变换）
-        #[allow(clippy::disallowed_methods)]
+        #[allow(clippy::disallowed_methods)] // HP 解密固有可变副本，嗅探冷路径非 relay 热路径
         let mut packet_buf = payload.to_vec();
 
         // 第一个字节低 4 位

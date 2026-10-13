@@ -128,7 +128,7 @@ impl QuicConfig {
 /// 上层（quinn/h3 adapter）实现此 trait。dialer 内部用此 trait 完成：
 /// - TLS 握手 + QUIC DialEarly
 /// - HTTP/3 POST /auth 握手 + 接收响应
-#[allow(dead_code)]
+#[allow(dead_code)] // Go http3.Transport 抽象对位，quinn_adapter 实现保留（dial 收口批接线）
 pub trait HysteriaTransport: Send + Sync {
     /// 执行 dial + HTTP/3 auth 握手，返回已认证的 QUIC conn。
     fn dial_and_authenticate(

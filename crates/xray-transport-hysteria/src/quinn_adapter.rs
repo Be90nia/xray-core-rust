@@ -136,7 +136,7 @@ pub struct QuinnQuicConn {
     conn: Connection,
     /// quinn endpoint（client 端必须持有，否则 endpoint drop 会关闭 QUIC 连接；
     /// server 端 endpoint 由 QuinnQuicListener 管理，此处为 None）。
-    #[allow(dead_code)]
+    #[allow(dead_code)] // client 端保活项：endpoint drop 即关 QUIC 连接，本体无需读取
     endpoint: Option<quinn::Endpoint>,
     /// h3 客户端 driver + SendRequest 持有项（仅 client 认证后注入）。
     ///
@@ -554,7 +554,7 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
 /// 对应 Go `http3.Server.ServeQUICConn`（auth + SetCongestionControl switch）+
 /// `conn.AcceptStream`（data）。CC 协商（hub.go:75-86）：`down` 取请求
 /// `Hysteria-CC-RX`（客户端下行容量），`UseBrutal(min(BrutalUp, down))`。
-#[allow(clippy::too_many_arguments)] // 存量清零批次
+#[allow(clippy::too_many_arguments)] // Go 装配 API 参数面直译，打包结构属 API 变更
 async fn serve_hysteria_connection(
     conn: quinn::Connection,
     validator: Option<Arc<dyn crate::hub::AuthValidator>>,
@@ -1020,7 +1020,7 @@ pub struct DefaultRequestHandler {
     validator: Option<Arc<dyn crate::hub::AuthValidator>>,
     masq: Arc<dyn MasqueradeHandler>,
     on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync>,
-    #[allow(dead_code)] // 存量清零批次
+    #[allow(dead_code)] // Go 对齐装配面：salamander obfs key，接线待批
     salamander_key: Vec<u8>,
 }
 

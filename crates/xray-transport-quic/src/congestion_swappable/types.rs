@@ -90,7 +90,7 @@ pub trait CongestionControl: Send + Sync {
     fn congestion_window(&self) -> ByteCount;
 
     /// 包发送事件（对应 Go `OnPacketSent`）。
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // Go OnPacketSent 五参签名直译，trait 契约不改
     fn on_packet_sent(
         &mut self,
         sent_time: MonoTime,

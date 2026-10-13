@@ -139,7 +139,7 @@ pub struct UdpHopPacketConn {
     /// hop 任务句柄（spawn 时由调用方持有；Drop 时 abort）。
     hop_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// recv 任务句柄（每 hop 启动一个）。
-    #[allow(dead_code)]
+    #[allow(dead_code)] // 句柄随 conn 保活统一回收，本体无需读取
     recv_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
@@ -306,7 +306,7 @@ impl UdpHopPacketConn {
             h.abort();
         }
 
-        #[allow(clippy::await_holding_lock)] // 存量清零批次
+        #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
         let mut inner = self.inner.lock();
         if inner.closed {
             return Ok(());

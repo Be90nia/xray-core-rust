@@ -712,7 +712,7 @@ mod tests {
     /// Tcpmask round-trip（o54c，Go websocket/dialer.go:56-63 + hub.go:132-134）：
     /// dial 与 hub 双端配置 fragment mask 后 e2e echo 收发。
     #[tokio::test]
-    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
+    #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
     async fn ws_dial_hub_tcpmask_roundtrip() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use xray_common::net::{address::Address, network::Network, port::Port};

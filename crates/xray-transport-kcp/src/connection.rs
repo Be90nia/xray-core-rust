@@ -103,7 +103,7 @@ struct ConnectionInner {
     since: Instant,
     mss: u32,
     round_trip: Arc<RoundTripInfo>,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Go UDPSession.config 对位：kcp 调参批接线源（wnd/mtu 等），保装配面
     config: Arc<Config>,
     sending_worker: SendingWorker,
     receiving_worker: ReceivingWorker,

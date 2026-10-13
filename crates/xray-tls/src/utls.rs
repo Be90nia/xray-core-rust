@@ -315,7 +315,7 @@ impl<S: Connection + Unpin> Connection for ServerConn<S> {
 // ============================================================
 
 /// UConn 内部连接（btls 或 rustls）。
-#[allow(clippy::large_enum_variant)]
+#[allow(clippy::large_enum_variant)] // btls SSL 与 rustls Conn 尺寸差固有，Box 化反增间接层
 enum UConnInner<S> {
     /// 标准 rustls 连接（指纹不支持 btls 时的 fallback）。
     Rustls(Conn<S>),

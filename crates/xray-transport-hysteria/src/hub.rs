@@ -414,7 +414,7 @@ pub trait HysteriaQuicListener: Send + Sync {
 /// Listener 工厂 trait（对应 Go `Listen` 函数）。
 pub trait HysteriaListenerFactory: Send + Sync {
     /// 创建 QUIC listener（对应 Go `Listen()` 主体）。
-    #[allow(clippy::too_many_arguments)] // 存量清零批次
+    #[allow(clippy::too_many_arguments)] // Go 装配 API 参数面直译，打包结构属 API 变更
     fn listen(
         &self,
         bind_addr: SocketAddr,
@@ -438,14 +438,14 @@ pub struct HysteriaListener {
 
 struct ListenerInner {
     bind_addr: SocketAddr,
-    #[allow(dead_code)] // 存量清零批次
+    #[allow(dead_code)] // Go 对齐装配面：监听配置源，hub 收口批接线
     config: Arc<Config>,
     #[allow(dead_code)] // Go 对齐装配面字段
     quic_params: Arc<QuicParams>,
     masq: MasqType,
     #[allow(dead_code)] // Go 对齐装配面字段
     validator: Option<Arc<dyn AuthValidator>>,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Go 对齐装配面：accept 通知回调，observatory 观测点待接线
     on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync>,
     quic_listener: Mutex<Option<Arc<dyn HysteriaQuicListener>>>,
     closed: Mutex<bool>,
@@ -506,7 +506,7 @@ impl HysteriaListener {
     pub async fn close(&self) -> Result<()> {
         *self.inner.closed.lock() = true;
         // guard 有意跨 await 存活（close 路径持锁清理）
-        #[allow(clippy::await_holding_lock)]
+        #[allow(clippy::await_holding_lock)] // close 收尾路径持锁 take，无并发争用窗口
         let l = self.inner.quic_listener.lock().take();
         if let Some(l) = l {
             l.close().await?;

@@ -159,10 +159,10 @@ impl BalancingStrategy for RoundRobinStrategy {
 /// 平衡器。
 ///
 /// 对应 Go `Balancer`。包装策略 + fallback + override。
-#[allow(dead_code)]
 pub struct Balancer {
     selectors: Vec<String>,
     strategy: Arc<dyn BalancingStrategy>,
+    #[allow(dead_code)] // Go Balancer 装配面字段：构造注入 ohm 保依赖完整，当前 pick 路径未消费
     ohm: Arc<dyn OutboundHandlerSelector>,
     fallback_tag: String,
     override_target: Override,

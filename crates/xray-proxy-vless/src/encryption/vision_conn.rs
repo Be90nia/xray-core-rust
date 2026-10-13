@@ -116,7 +116,7 @@ pub struct VisionConn<C> {
     /// 不可达——未成帧明文永不逃逸，switch 帧绝不丢失。
     end_commit: bool,
     /// 角色标记（new=client / new_server=server），预留诊断。
-    #[allow(dead_code)]
+    #[allow(dead_code)] // 角色标记预留诊断埋点（FRDBG 类），当前仅构造赋值
     is_server: bool,
     /// raw 写入起步闸：arm 后首个 raw 写延迟 RAW_WRITE_ARM_DELAY，等对端
     /// 读完 DIRECT 帧（其 rustls 的同 recv 过读会把紧随的 raw 字节当隧道
@@ -1080,7 +1080,7 @@ mod tests {
     }
 
     /// server 读侧 splice：收 client DIRECT 帧 → 自身读切裸 TCP。
-    #[allow(dead_code)] // 存量清零批次
+    #[allow(dead_code)] // 场景脚本保留未挂 runner（splice 读切换路径历史 revert，有效性待重验）
     async fn server_splice_read_switch_on_client_direct() {
         let ((c, mut c2), (s, s2)) = make_tcp_pair().await;
         let uuid = vec![0xABu8; 16];

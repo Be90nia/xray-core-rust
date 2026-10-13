@@ -138,7 +138,7 @@ pub struct TuicClient {
     /// 复用的 QUIC 连接（通过连接池管理）。
     multiplexed: MultiplexedConnection,
     /// 连接池引用（用于后续重连）。
-    #[allow(dead_code)] // 存量清零批次
+    #[allow(dead_code)] // 连接池引用保活防 drop 关连接，重连批接线源
     pool: QuinnConnectionPool,
     /// 连接参数（用于重连时重建）。
     #[allow(dead_code)] // Go 对齐配置面字段
@@ -396,15 +396,6 @@ impl TuicClient {
     pub async fn recv_datagram(&self) -> Result<bytes::Bytes> {
         self.multiplexed.recv_datagram().await
     }
-}
-
-/// 解析地址（客户端 dial 时 `server: impl ToSocketAddrs`）。
-#[allow(dead_code)]
-pub(crate) fn resolve_first(addr: impl ToSocketAddrs) -> Result<SocketAddr> {
-    addr.to_socket_addrs()?
-        .next()
-        .ok_or_else(|| std::io::Error::other("to_socket_addrs returned empty"))
-        .map_err(Into::into)
 }
 
 /// 把 CC 配置预装进 TransportConfig（s8ti）。

@@ -227,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)] // 存量清零批次：field_reassign_with_default
+    #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
     fn outbound_status_proto_roundtrip_with_health() {
         let mut s = OutboundStatus::default();
         s.outbound_tag = "out".into();
