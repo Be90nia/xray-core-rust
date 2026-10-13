@@ -1477,10 +1477,12 @@ async fn ss_udp_client_relay(
     mut rx: tokio::sync::mpsc::Receiver<SsUdpItem>,
     handler: Arc<dyn DispatchHandler>,
 ) {
-    use xray_proxy_ss::protocol::encode_udp_packet;
+    use xray_proxy_ss::protocol::encode_udp_packet_into;
     let mut session = UdpDispatchSession::new(handler);
     // 回包加密 account：跟随最近请求的用户（Go 按 client NAT entry 记 user）
     let mut account: Option<xray_proxy_ss::config::MemoryAccount> = None;
+    // 回包帧编码 scratch（每包复用，AUDIT-PERF-003）
+    let mut enc = Vec::with_capacity(2048);
     let idle = tokio::time::sleep(SS_UDP_IDLE_TIMEOUT);
     tokio::pin!(idle);
     loop {
@@ -1501,12 +1503,15 @@ async fn ss_udp_client_relay(
                 match r {
                     Ok(Some((source, payload))) => {
                         if let Some(acct) = &account {
-                            if let Ok(enc) = encode_udp_packet(
+                            if encode_udp_packet_into(
                                 acct,
                                 source.address(),
                                 source.port().value(),
                                 &payload,
-                            ) {
+                                &mut enc,
+                            )
+                            .is_ok()
+                            {
                                 let _ = udp.send_to(&enc, client).await;
                             }
                         }
@@ -1640,6 +1645,9 @@ async fn ss2022_udp_client_relay(
     handler: Arc<dyn DispatchHandler>,
 ) {
     let mut dispatch = UdpDispatchSession::new(handler);
+    // 回包帧编码 scratch（每包复用，AUDIT-PERF-003）
+    let mut enc = Vec::with_capacity(2048);
+    let mut plain = Vec::with_capacity(2048);
     let idle = tokio::time::sleep(SS_UDP_IDLE_TIMEOUT);
     tokio::pin!(idle);
     loop {
@@ -1659,11 +1667,16 @@ async fn ss2022_udp_client_relay(
             r = dispatch.recv_packet() => {
                 match r {
                     Ok(Some((source, payload))) => {
-                        if let Ok(enc) = session.encode(
-                            source.address(),
-                            source.port().value(),
-                            &payload,
-                        ) {
+                        if session
+                            .encode_into(
+                                source.address(),
+                                source.port().value(),
+                                &payload,
+                                &mut enc,
+                                &mut plain,
+                            )
+                            .is_ok()
+                        {
                             let _ = udp.send_to(&enc, client).await;
                         }
                         idle.as_mut().reset(tokio::time::Instant::now() + SS_UDP_IDLE_TIMEOUT);

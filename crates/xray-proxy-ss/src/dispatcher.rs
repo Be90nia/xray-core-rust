@@ -34,7 +34,7 @@ use xray_xudp::packet::{PacketError, PacketReader, PacketWriter};
 use crate::{
     client::Client,
     config::MemoryAccount,
-    protocol::{decode_udp_packet, encode_udp_packet},
+    protocol::{decode_udp_packet_into, encode_udp_packet_into},
     ss2022::UdpOverTcpConfig,
     stream::SSStream,
     validator::{MemoryUser, Validator},
@@ -558,11 +558,13 @@ async fn pump_ss_udp(
     let up = async move {
         let mut accum: Vec<u8> = Vec::new();
         let mut buf = vec![0u8; 8 * 1024];
+        let mut enc = Vec::with_capacity(2048);
         loop {
             // 先把 accum 里所有完整帧消费掉
             let mut progress = true;
             while progress {
-                match parse_and_send(&up_sock, &account, &mut accum, &default_dest).await {
+                match parse_and_send(&up_sock, &account, &mut accum, &default_dest, &mut enc).await
+                {
                     Ok(made) => progress = made,
                     Err(e) => {
                         tracing::debug!("ss udp up forward error: {e}");
@@ -585,6 +587,9 @@ async fn pump_ss_udp(
     let down = async move {
         let global_id: [u8; GLOBAL_ID_LEN] = rand::random();
         let mut rbuf = vec![0u8; 65_535];
+        // 每包复用 scratch（payload 解码 + XUDP 帧组装，稳态零每包分配）
+        let mut data = Vec::with_capacity(2048);
+        let mut frame = Vec::with_capacity(2048);
         loop {
             let n = match sock.recv(&mut rbuf).await {
                 Ok(n) => n,
@@ -594,14 +599,14 @@ async fn pump_ss_udp(
                 },
             };
             // 解码失败跳过（Go DecodeUDPPacket 失败丢弃该包）
-            let Ok((header, payload)) = decode_udp_packet(&validator, &rbuf[..n]) else {
+            let Ok(header) = decode_udp_packet_into(&validator, &rbuf[..n], &mut data) else {
                 continue;
             };
             // 回包帧来源 = SS 解出的响应来源地址
             let source = Destination::udp(header.address, Port::new(header.port));
-            let mut frame = Vec::with_capacity(payload.len() + 64);
+            frame.clear();
             let mut pw = PacketWriter::new(&mut frame, source, global_id);
-            if pw.write_packet(&payload).is_err() {
+            if pw.write_packet(&data).is_err() {
                 break;
             }
             drop(pw);
@@ -663,10 +668,21 @@ async fn pump_ss2022_udp(
     let up = async move {
         let mut accum: Vec<u8> = Vec::new();
         let mut buf = vec![0u8; 8 * 1024];
+        let mut enc = Vec::with_capacity(2048);
+        let mut plain = Vec::with_capacity(2048);
         loop {
             let mut progress = true;
             while progress {
-                match parse_and_send_2022(&up_sock, &up_session, &mut accum, &default_dest).await {
+                match parse_and_send_2022(
+                    &up_sock,
+                    &up_session,
+                    &mut accum,
+                    &default_dest,
+                    &mut enc,
+                    &mut plain,
+                )
+                .await
+                {
                     Ok(made) => progress = made,
                     Err(e) => {
                         tracing::debug!("ss2022 udp up forward error: {e}");
@@ -689,6 +705,9 @@ async fn pump_ss2022_udp(
     let down = async move {
         let global_id: [u8; GLOBAL_ID_LEN] = rand::random();
         let mut rbuf = vec![0u8; 65_535];
+        // 每包复用 scratch（payload 解码 + XUDP 帧组装，稳态零每包分配）
+        let mut data = Vec::with_capacity(2048);
+        let mut frame = Vec::with_capacity(2048);
         loop {
             let n = match sock.recv(&mut rbuf).await {
                 Ok(n) => n,
@@ -698,13 +717,13 @@ async fn pump_ss2022_udp(
                 },
             };
             // 解码失败跳过（Go ReadPacket 失败丢弃该包）
-            let Ok((addr, port, payload)) = session.decode(&rbuf[..n]) else {
+            let Ok((addr, port)) = session.decode_into(&rbuf[..n], &mut data) else {
                 continue;
             };
             let source = Destination::udp(addr, Port::new(port));
-            let mut frame = Vec::with_capacity(payload.len() + 64);
+            frame.clear();
             let mut pw = PacketWriter::new(&mut frame, source, global_id);
-            if pw.write_packet(&payload).is_err() {
+            if pw.write_packet(&data).is_err() {
                 break;
             }
             drop(pw);
@@ -721,7 +740,7 @@ async fn pump_ss2022_udp(
     }
 }
 
-/// 从 accum 前端解析一个 XUDP 帧 → 2022 帧编码 → `sock.send`。
+/// 从 accum 前端解析一个 XUDP 帧 → 2022 帧编码（`enc`/`plain` scratch 复用）→ `sock.send`。
 ///
 /// 返回 `true` 表示消费了一帧；accum 为空或帧不完整返回 `false`；
 /// 致命错误返回 `Err`。
@@ -730,6 +749,8 @@ async fn parse_and_send_2022(
     session: &std::sync::Arc<crate::ss2022::packet::ClientUdpSession2022>,
     accum: &mut Vec<u8>,
     default_dest: &Destination,
+    enc: &mut Vec<u8>,
+    plain: &mut Vec<u8>,
 ) -> io::Result<bool> {
     if accum.is_empty() {
         return Ok(false);
@@ -745,10 +766,10 @@ async fn parse_and_send_2022(
             accum.drain(..consumed);
             let (data, target) = pkt.into_parts();
             let dest = target.unwrap_or_else(|| default_dest.clone());
-            let enc = session
-                .encode(dest.address(), dest.port().value(), &data)
+            session
+                .encode_into(dest.address(), dest.port().value(), &data, enc, plain)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            sock.send(&enc).await?;
+            sock.send(&enc[..]).await?;
             Ok(true)
         },
         Ok(None) => Ok(false), // 帧不完整，等更多数据
@@ -757,7 +778,7 @@ async fn parse_and_send_2022(
     }
 }
 
-/// 从 accum 前端解析一个 XUDP 帧 → `encode_udp_packet` → `sock.send`。
+/// 从 accum 前端解析一个 XUDP 帧 → `encode_udp_packet_into`（`enc` scratch 复用）→ `sock.send`。
 ///
 /// 返回 `true` 表示消费了一帧；accum 为空或帧不完整返回 `false`；
 /// 致命错误返回 `Err`。
@@ -766,6 +787,7 @@ async fn parse_and_send(
     account: &MemoryAccount,
     accum: &mut Vec<u8>,
     default_dest: &Destination,
+    enc: &mut Vec<u8>,
 ) -> io::Result<bool> {
     if accum.is_empty() {
         return Ok(false);
@@ -781,9 +803,9 @@ async fn parse_and_send(
             accum.drain(..consumed);
             let (data, target) = pkt.into_parts();
             let dest = target.unwrap_or_else(|| default_dest.clone());
-            let enc = encode_udp_packet(account, dest.address(), dest.port().value(), &data)
+            encode_udp_packet_into(account, dest.address(), dest.port().value(), &data, enc)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            sock.send(&enc).await?;
+            sock.send(&enc[..]).await?;
             Ok(true)
         },
         Ok(None) => Ok(false), // 帧不完整，等更多数据
@@ -1009,6 +1031,8 @@ mod tests {
         use std::time::Duration;
 
         use xray_app_dispatcher::UdpDispatchSession;
+
+        use crate::protocol::{decode_udp_packet, encode_udp_packet};
 
         // 1. fake SS UDP 服务器：decode（匹配用户）→ echo → encode 回来源
         let server = UdpSocket::bind("127.0.0.1:0").await.expect("bind server");

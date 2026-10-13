@@ -377,6 +377,7 @@ impl H3Conn {
     ) -> Result<(Box<dyn AsyncReadTrait + Send + Unpin>, SocketAddr, SocketAddr)> {
         let meta = self.config.build_stream_request_meta(base_uri, session_id, body.clone())?;
         let req = Self::build_h3_request(&meta)?;
+        let has_body = body.is_some();
 
         let mut send_req = self.send_req.lock().await;
         let mut stream = send_req.send_request(req).await.map_err(|e| {
@@ -385,16 +386,18 @@ impl H3Conn {
         })?;
         drop(send_req);
 
-        if let Some(b) = &body {
+        // body 消费给 send_data：Bytes::from 零拷贝接管 Vec 堆（原
+        // copy_from_slice 是纯二次拷贝，AUDIT-PERF-006/F2）
+        if let Some(b) = body {
             stream
-                .send_data(Bytes::copy_from_slice(b))
+                .send_data(Bytes::from(b))
                 .await
                 .map_err(|e| SplitHttpError::Hyper(format!("h3 send_data: {e}")))?;
         }
         stream.finish().await.map_err(|e| SplitHttpError::Hyper(format!("h3 finish: {e}")))?;
 
         let (remote, local) = self.addrs();
-        if body.is_none() {
+        if !has_body {
             // stream-down GET：发出即返回（对齐 Go `DefaultDialerClient::OpenStream`
             // 的 gotConn 语义——只等连接建立，响应在后台 goroutine 处理）。
             // server 端对 GET 立即回 200 headers（hub.go WriteHeader+Flush），数据

@@ -206,18 +206,23 @@ impl Cipher {
     /// - [`SsError::InsufficientData`]：`buf` 长度不足 IV。
     /// - 透传 AEAD 错误。
     pub fn encode_packet(&self, key: &[u8], buf: &mut Vec<u8>) -> Result<()> {
+        // UDP 每包热路径：iv/nonce 走栈上定长（iv 上限 32B=XChaCha、nonce 上限
+        // 24B=XChaCha），仅 seal 结果 1 次中间分配（AUDIT-PERF-003）。
+        const MAX_IV: usize = 32;
+        const MAX_NONCE: usize = 24;
+        debug_assert!(self.iv_size() <= MAX_IV as u32);
         let iv_len = self.iv_size() as usize;
         if buf.len() < iv_len {
             return Err(SsError::InsufficientData(buf.len()));
         }
         // 当前枚举仅 Aead 变体（if let 恒匹配，clippy single 化为直接执行）。
         {
-            let iv: Vec<u8> = buf[..iv_len].to_vec();
-            let aead = self.create_aead(key, &iv)?.expect("aead for Aead variant");
-            let plaintext: Vec<u8> = buf[iv_len..].to_vec();
-            let zero_nonce = vec![0u8; aead.nonce_size()];
+            let mut iv = [0u8; MAX_IV];
+            iv[..iv_len].copy_from_slice(&buf[..iv_len]);
+            let aead = self.create_aead(key, &iv[..iv_len])?.expect("aead for Aead variant");
+            let zero_nonce = [0u8; MAX_NONCE];
             let sealed = aead
-                .seal(&zero_nonce, &[], &plaintext)
+                .seal(&zero_nonce[..aead.nonce_size()], &[], &buf[iv_len..])
                 .map_err(|e| SsError::AeadSeal(e.to_string()))?;
             buf.truncate(iv_len);
             buf.extend_from_slice(&sealed);
@@ -233,6 +238,8 @@ impl Cipher {
     /// - [`SsError::InsufficientData`]：`buf` 长度不足 IV+tag。
     /// - 透传 AEAD 错误。
     pub fn decode_packet(&self, key: &[u8], buf: &mut Vec<u8>) -> Result<()> {
+        const MAX_IV: usize = 32;
+        const MAX_NONCE: usize = 24;
         let iv_len = self.iv_size() as usize;
         if buf.len() <= iv_len {
             return Err(SsError::InsufficientData(buf.len()));
@@ -241,15 +248,17 @@ impl Cipher {
         #[allow(irrefutable_let_patterns)]
         // Self 当前仅 Aead 变体，let 模式必真（还原 Go 代码形态）
         if let Self::Aead(_) = self {
-            let iv: Vec<u8> = buf[..iv_len].to_vec();
-            let aead = self.create_aead(key, &iv)?.expect("aead for Aead variant");
-            let ciphertext: Vec<u8> = buf[iv_len..].to_vec();
-            let zero_nonce = vec![0u8; aead.nonce_size()];
-            let plaintext = aead
-                .open(&zero_nonce, &[], &ciphertext)
-                .map_err(|e| SsError::AeadOpen(e.to_string()))?;
-            buf.truncate(iv_len);
-            buf.extend_from_slice(&plaintext);
+            // 每包热路径：iv/nonce 栈上定长 + open_in_place 原地解密
+            //（输出仍为 IV + plaintext，零中间堆分配，AUDIT-PERF-003）。
+            let mut iv = [0u8; MAX_IV];
+            iv[..iv_len].copy_from_slice(&buf[..iv_len]);
+            let aead = self.create_aead(key, &iv[..iv_len])?.expect("aead for Aead variant");
+            let zero_nonce = [0u8; MAX_NONCE];
+            let plain_len = aead
+                .open_in_place(&zero_nonce[..aead.nonce_size()], &[], &mut buf[iv_len..])
+                .map_err(|e| SsError::AeadOpen(e.to_string()))?
+                .len();
+            buf.truncate(iv_len + plain_len);
         }
         Ok(())
     }
