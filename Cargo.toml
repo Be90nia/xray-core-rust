@@ -162,8 +162,10 @@ tun-rs = { version = "2.8.7", default-features = false, features = ["async_tokio
 # WireGuard userspace 协议（批次 B：WireGuard outbound）
 boringtun = { version = "0.7.1", default-features = false }
 
-# TLS (watfaq-rustls = Rigby-Foundation/rustls utls-0.23 branch, 提供 REALITY with_reality() API; [patch.crates-io] 全局替换标准 rustls)
-rustls = { version = "=0.23.40", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+# TLS (rustls 0.23.45 + REALITY patch vendor 自持，提供 with_reality() API；
+# [patch.crates-io] 全局替换标准 rustls——基线=上游 v/0.23.45，patch 面见
+# vendor 注释。0.23.45 消解 GHSA-2mjx-qc3c-rqvc/RUSTSEC-2026-0285)
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
 webpki-roots = "1.0"
 rustls-pki-types = "1.0"
@@ -205,7 +207,14 @@ btls-sys = { git = "https://github.com/0x676e67/btls", rev = "ab7f522c3d7be13974
 foreign-types = "0.5"
 
 [patch.crates-io]
-rustls = { git = "https://github.com/Watfaq/rustls.git", rev = "e6e8e7e1a0d65f2f273eb7b5b6179896536ac174" }
+# REALITY with_reality()/session_id_generator：原 Watfaq/rustls fork 相对上游
+# v/0.23.40 3 commits，作者已实证干净 rebase 至 v/0.23.45（watfaq/0.23.45=63d10d50，
+# ahead 3/behind 0）。vendor = 上游 crates.io 0.23.45 展开 + 该 3-commit patch
+# （src/client/{builder,client_conn,hs,reality,test}.rs + crypto/mod.rs + lib.rs +
+# msgs/handshake.rs + testdata，约 +1400 行）本仓自持；升级路径：新上游 release
+# 解 .crate 后叠 fork diff（SOP 见 reports/fix-gqkk-vendor.md）。
+# 0.23.40→0.23.45 消解 GHSA-2mjx-qc3c-rqvc（TLS1.3 握手消息跨加密级别边界）。
+rustls = { path = "vendor/rustls" }
 # Shadow-TLS V3 会话 ID 生成器：原 Watfaq/tokio-rustls fork 相对上游
 # rustls/tokio-rustls v/0.26.4 仅 1 commit（src/client.rs +71 行
 # connect_with_session_id_generator，仓内暂无调用方、为 Shadow-TLS V3 预留 API）。
