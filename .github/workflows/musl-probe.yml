@@ -45,6 +45,9 @@ jobs:
           protoc --version
       - name: Prepare patched boringssl
         uses: ./.github/actions/setup-boringssl
+      # 无条件自愈: dtolnay targets 偶发未落盘时兜底(E0463 38494647893), 已装则秒回
+      - name: Ensure musl target std
+        run: rustup target add x86_64-unknown-linux-musl
       - name: Build musl static
         run: |
           cargo zigbuild --release -p xray-cli --target x86_64-unknown-linux-musl 2>&1 | tail -30
