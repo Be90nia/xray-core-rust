@@ -192,6 +192,49 @@ enum Command {
 static GLOBAL_ALLOC: xray_cli::alloc_stats::StatsAlloc<mimalloc::MiMalloc> =
     xray_cli::alloc_stats::StatsAlloc(mimalloc::MiMalloc);
 
+// bd vjbq: Go `base.Command` 的 flag 风格是单横线长名（`-test`/`-config`/`-format`），
+// clap 会把 `-test` 拆成短参聚合 `-t -e -s -t` 而报 unexpected argument——passwall
+// 启动预检 `xray run -test -c` 即因此阻塞。归一化：已登记长名（含 `-x=v` 形态）
+// 补足双横线；未登记 token（真短参聚合如 `-c`）原样保留。
+const GO_STYLE_LONG_FLAGS: &[&str] =
+    &["config", "confdir", "format", "test", "dump", "unix", "version", "help"];
+
+fn normalize_go_style_args(mut argv: Vec<String>) -> Vec<String> {
+    // Go v4 兼容（getArgsV4Compatible）：首个 token 若不是子命令、也非顶层
+    // help/version 旗标，则按"默认 run 的参数"处理——插 `run` 到 argv[1]。
+    const KNOWN_SUBS: &[&str] = &[
+        "run", "version", "uuid", "api", "tls", "convert", "x25519", "curve25519", "wg",
+        "mldsa65", "mlkem768", "vlessenc",
+    ];
+    let needs_run_insert = match argv.get(1) {
+        None => true, // 裸 `xray` → 默认 run
+        Some(a) => {
+            !(KNOWN_SUBS.contains(&a.as_str())
+                || matches!(a.as_str(), "-h" | "--help" | "-version" | "--version"))
+        },
+    };
+    if needs_run_insert {
+        argv.insert(1, "run".into());
+    }
+    for tok in argv.iter_mut().skip(1) {
+        let Some(name) = tok.strip_prefix('-') else { continue };
+        if name.starts_with('-') {
+            continue; // 已是双横线长名
+        }
+        let (base, eq_val) = match name.split_once('=') {
+            Some((b, v)) => (b, Some(v)),
+            None => (name, None),
+        };
+        if GO_STYLE_LONG_FLAGS.contains(&base) {
+            *tok = match eq_val {
+                Some(v) => format!("--{base}={v}"),
+                None => format!("--{base}"),
+            };
+        }
+    }
+    argv
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     // P0 护栏：计数分配器开关解析 + dump 线程（未开 env 时零开销直返）。
@@ -203,7 +246,7 @@ async fn main() -> std::process::ExitCode {
     // bd xag3③：env 热路径闸门启动期显式解析一次（对齐 Go reloadEnvSettings；
     // LazyLock 首调兜底，此处为显式语义锚点）。
     xray_common::platform::env::reload_env_settings();
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(normalize_go_style_args(std::env::args().collect()));
     // v4 兼容：无子命令时默认 run
     let command = cli.command.unwrap_or(Command::Run(RunArgs::default()));
     if !matches!(command, Command::Run(_)) {
@@ -279,5 +322,58 @@ async fn execute(command: Command) -> Result<(), CliError> {
         Command::Api { command } => execute_api(&command).await,
         Command::Tls { command } => tool::execute_tls(&command).await,
         Command::Convert { command } => tool::execute_convert(&command),
+    }
+}
+
+#[cfg(test)]
+mod go_flag_tests {
+    use super::normalize_go_style_args;
+
+    fn v(args: &[&str]) -> Vec<String> {
+        normalize_go_style_args(std::iter::once("xray".to_string()).chain(args.iter().map(|s| s.to_string())).collect())
+    }
+
+    #[test]
+    fn passwall_preset_single_dash_test() {
+        // bd vjbq 阻塞场景: passwall 预检 `xray run -test -c cfg`
+        assert_eq!(v(&["run", "-test", "-c", "a.json"]),
+                   vec!["xray", "run", "--test", "-c", "a.json"]);
+    }
+
+    #[test]
+    fn default_run_insertion() {
+        // 裸 xray → run (Go v4)
+        assert_eq!(v(&[]), vec!["xray", "run"]);
+        // 前导单横线旗标(非子命令) → 插 run (Go main.go 语义)
+        assert_eq!(v(&["-test", "-c", "a.json"]),
+                   vec!["xray", "run", "--test", "-c", "a.json"]);
+        assert_eq!(v(&["-config=a.json"]),
+                   vec!["xray", "run", "--config=a.json"]);
+    }
+
+    #[test]
+    fn known_long_flags_normalized() {
+        assert_eq!(v(&["run", "-config", "a.json", "-format", "json"]),
+                   vec!["xray", "run", "--config", "a.json", "--format", "json"]);
+        assert_eq!(v(&["run", "-confdir", "/etc/x", "-dump"]),
+                   vec!["xray", "run", "--confdir", "/etc/x", "--dump"]);
+    }
+
+    #[test]
+    fn short_flags_and_subcommands_untouched() {
+        // 真短参聚合(未登记名)不动
+        assert_eq!(v(&["run", "-c", "a.json"]), vec!["xray", "run", "-c", "a.json"]);
+        // 双横线不动
+        assert_eq!(v(&["run", "--test"]), vec!["xray", "run", "--test"]);
+        // 子命令路径不受影响(uuid 是子命令, 不插 run)
+        assert_eq!(v(&["uuid"]), vec!["xray", "uuid"]);
+        assert_eq!(v(&["api", "adi", "-server=127.0.0.1:8080"]),
+                   vec!["xray", "api", "adi", "-server=127.0.0.1:8080"]);
+    }
+
+    #[test]
+    fn top_level_help_version_skip_run_insert() {
+        assert_eq!(v(&["-h"]), vec!["xray", "-h"]);
+        assert_eq!(v(&["-version"]), vec!["xray", "--version"]);
     }
 }
