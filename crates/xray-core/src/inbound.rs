@@ -659,8 +659,9 @@ async fn handle_plain_http(
         up_w.shutdown(); // EOF → dispatch bridge 关闭目标写半部
     };
 
-    // 下行：读响应 → 客户端
+    // 下行：读响应 → 客户端（data 为循环级 scratch，消每轮 to_vec 分配）
     let read_resp = async {
+        let mut data = Vec::new();
         #[allow(clippy::while_let_loop)] // 存量清零批次
         loop {
             match dn_r.read_multi_buffer().await {
@@ -668,7 +669,10 @@ async fn handle_plain_http(
                     if mb.is_empty() {
                         break;
                     }
-                    let data = mb.to_vec();
+                    data.clear();
+                    for b in mb.iter() {
+                        data.extend_from_slice(b.bytes());
+                    }
                     if client_write.write_all(&data).await.is_err() {
                         break;
                     }

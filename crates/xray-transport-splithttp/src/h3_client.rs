@@ -176,7 +176,8 @@ impl H3Conn {
     ///
     /// - `init_stream_receive_window` / `init_connection_receive_window` → 流/连接初始接收窗口
     ///
-    /// `None` 时除 CC 默认 BBR 外均用 quinn 默认值。
+    /// `None`/字段 0 时窗口缺省显式 16MB 流窗/32MB 连接窗（bd wz2b W4，quinn 默认
+    /// 流收窗 1.25MB 高 BDP 钉）；CC 默认 BBR、其余用 quinn 默认值。
     ///
     /// 注：`UdpHop`（端口轮换）等需要自管 UDP socket 的特性本切片不接入——
     /// splithttp H3 路径继承 register.rs 的 quinn Endpoint 创建，不做包级劫持。
@@ -204,21 +205,27 @@ impl H3Conn {
         ));
 
         // 把 QuicParamsConfig 注入 quinn::TransportConfig。
-        let mut transport_config = quinn::TransportConfig::default();
+        // bd wz2b W4：None/0（quicParams 缺省）原不设 → quinn 缺省流收窗 1.25MB
+        // （STREAM_RWND）高 BDP 钉 1.25MB/RTT@169ms≈7.4MB/s。缺省显式 16/32MB
+        // （quic crate config.rs 同款），quicParams 显式值仍优先。
+        let (mut stream_win, mut conn_win) = (16u64 * 1024 * 1024, 32u64 * 1024 * 1024);
         if let Some(qp) = quic_params {
             if qp.init_stream_receive_window > 0 {
-                transport_config.stream_receive_window(
-                    quinn::VarInt::from_u64(qp.init_stream_receive_window)
-                        .map_err(|e| SplitHttpError::Hyper(format!("stream_window VarInt: {e}")))?,
-                );
+                stream_win = qp.init_stream_receive_window;
             }
             if qp.init_connection_receive_window > 0 {
-                transport_config.receive_window(
-                    quinn::VarInt::from_u64(qp.init_connection_receive_window)
-                        .map_err(|e| SplitHttpError::Hyper(format!("conn_window VarInt: {e}")))?,
-                );
+                conn_win = qp.init_connection_receive_window;
             }
         }
+        let mut transport_config = quinn::TransportConfig::default();
+        transport_config.stream_receive_window(
+            quinn::VarInt::from_u64(stream_win)
+                .map_err(|e| SplitHttpError::Hyper(format!("stream_window VarInt: {e}")))?,
+        );
+        transport_config.receive_window(
+            quinn::VarInt::from_u64(conn_win)
+                .map_err(|e| SplitHttpError::Hyper(format!("conn_window VarInt: {e}")))?,
+        );
         // CC 接线（Go dialer.go:161-164 + 239-246）：quicParams 缺省也默认 BBR。
         let cc_slot =
             xray_transport_quic::congestion_swappable::install_swappable_cc(&mut transport_config);

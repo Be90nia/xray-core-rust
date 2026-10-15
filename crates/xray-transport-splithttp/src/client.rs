@@ -405,9 +405,15 @@ impl DefaultDialerClient {
         };
         // （hyper-util 默认值，等价 Go http.Transport.IdleConnTimeout）。pool_timer
         // 必须配，否则 idle_timeout 不生效（hyper-util 已知坑）。
+        // bd wz2b C2：hyper-util legacy client h2 全默认（流窗 2MB/连窗 5MB/send
+        // 1MB）——packet-up/stream-down 路径下载钉 2MB/RTT（169ms≈11.8MB/s）、上行钉
+        // 1MB/RTT。16/32MB 收窗 + 16MB send 与 stream-one dialer.rs 同批同值。
         let client = Client::builder(TokioExecutor::new())
             .pool_timer(TokioTimer::new())
             .pool_idle_timeout(Some(Duration::from_secs(90)))
+            .http2_initial_stream_window_size(16 * 1024 * 1024)
+            .http2_initial_connection_window_size(32 * 1024 * 1024)
+            .http2_max_send_buf_size(16 * 1024 * 1024)
             .build(connector);
         Self { config, client, closed: Arc::new(AtomicBool::new(false)) }
     }

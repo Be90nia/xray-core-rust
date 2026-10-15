@@ -178,8 +178,14 @@ impl InboundHandler for NaiveInboundHandler {
                             let service = service_fn(move |req| {
                                 handle_request(req, dispatch.clone(), Arc::clone(&auth))
                             });
+                            // bd wz2b N1：hyper server h2 缺省收窗 1MB/1MB + 每流
+                            // send 400KB，naiveh2 下行钉 1MB/RTT。16/32MB + send
+                            // 16MB 对齐 h2 族（同 splithttp serve_http_conn）。
                             if let Err(e) =
                                 hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                                    .initial_stream_window_size(16 * 1024 * 1024)
+                                    .initial_connection_window_size(32 * 1024 * 1024)
+                                    .max_send_buf_size(16 * 1024 * 1024)
                                     .serve_connection(TokioIo::new(tls), service)
                                     .await
                             {
