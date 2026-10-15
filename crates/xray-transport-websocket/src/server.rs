@@ -146,7 +146,10 @@ impl WsListener {
         // 由 net/http 对 TLS listener 自动装配 h2 层，gorilla upgrader 对 h2 请求
         // 回 400——此处对齐该行为。h2 服务随连接终结，Err 让 accept loop 继续。
         if tls_stream.get_ref().1.alpn_protocol() == Some(&b"h2"[..]) {
-            Self::serve_h2_reject(tls_stream, self.configs.clone()).await;
+            // spawn 而非内联 await：扫描器 h2 探测常 hard-close，hyper h2 serve
+            // 对此最长挂 30s——内联会钉死串行 accept loop（backlog 满转 521，
+            // 2026-10-15 生产实锤）。Go goroutine 模型即后台并发处理。
+            tokio::spawn(Self::serve_h2_reject(tls_stream, self.configs.clone()));
             return Err(WsError::HandshakeFailed("http/2 request rejected".into()));
         }
         Self::ws_handshake(tls_stream, remote, local, &self.configs, &self.trusted_x_forwarded_for)
@@ -681,5 +684,100 @@ mod tests {
         let accepted = server.await.unwrap().unwrap();
         assert_eq!(accepted.remote.ip(), "203.0.113.5".parse::<IpAddr>().unwrap());
         assert_eq!(accepted.remote.port(), 0, "XFF override sets port to 0");
+    }
+
+    /// wsh2-accept-stall 回归（2026-10-15 生产实锤：扫描器 h2 探测 hard-close
+    /// 挂 serve_h2_reject 最长 30s，串行 accept loop 被钉死 → backlog 满 → CF 521）。
+    /// 3 条 h2 连接握手后静默 keep-alive，同时 http/1.1 ws 握手必须 <2s 完成——
+    /// 修复前（内联 await）此测试红（h2 服务不终结则 accept 永不返回），
+    /// 修复后（spawn 后台）转绿；回滚修复必须复红。
+    #[tokio::test]
+    async fn accept_tls_h2_keepalive_does_not_stall_ws_accept() {
+        use tokio_tungstenite::client_async;
+
+        ensure_crypto_provider();
+        let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = cert_params.self_signed(&key_pair).unwrap();
+        let cert_der = cert.der().to_vec();
+        let key = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap();
+        let mut server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![rustls::pki_types::CertificateDer::from(cert_der.clone())], key)
+            .unwrap();
+        // 生产默认广播（xray-tls server_config.rs:246 对齐 Go GetTLSConfig）。
+        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let tls_config = Arc::new(server_config);
+
+        let cfg = Arc::new(Config { path: "/ws".into(), ..Default::default() });
+        let listener = WsListener::bind("127.0.0.1:0".parse().unwrap(), cfg).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // 生产同款串行 accept loop（修复点所在语义）：h2 拒绝返回 Err 继续循环
+        let _accept_loop = tokio::spawn(async move {
+            loop {
+                let _ = listener.accept_tls(tls_config.clone()).await;
+            }
+        });
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(rustls::pki_types::CertificateDer::from(cert_der.clone())).unwrap();
+
+        // 3 条并发 h2 连接：TLS 握手后静默 keep-alive（模拟扫描器探测挂住不关）
+        let mut h2_client = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store.clone())
+            .with_no_client_auth();
+        h2_client.alpn_protocols = vec![b"h2".to_vec()];
+        let h2_connector = tokio_rustls::TlsConnector::from(Arc::new(h2_client));
+        for _ in 0..3 {
+            // 容忍连接失败：修复前 accept loop 被 h2#1 钉死后，后续 TLS 握手
+            // 在服务端 4s 超时——红在下方 ws 断言处，此处失败不影响判定
+            if let Ok(Ok(tls)) =
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    h2_connector.connect("localhost".try_into().unwrap(), tcp).await
+                })
+                .await
+            {
+                assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+                // 持有连接 30s 不关（keep-alive），模拟 hard-close 前的探测驻留
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    drop(tls);
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // 第 4 条：http/1.1 ALPN 真实 ws 握手——修复后必须 <2s 完成
+        // （修复前被 h2 服务内联 await 钉死串行 accept，此步必超时红）
+        let mut ws_client = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        ws_client.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let ws_connector = tokio_rustls::TlsConnector::from(Arc::new(ws_client));
+
+        let ws_tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async move {
+            let tls = ws_connector.connect("localhost".try_into().unwrap(), ws_tcp).await.unwrap();
+            let req = http::Request::builder()
+                .method("GET")
+                .uri(format!("ws://localhost:{}/ws", addr.port()))
+                .header("Host", format!("localhost:{}", addr.port()))
+                .header("Connection", "Upgrade")
+                .header("Upgrade", "websocket")
+                .header("Sec-WebSocket-Version", "13")
+                .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+                .body(())
+                .unwrap();
+            let (_ws, resp) = client_async(req, tls).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                http::StatusCode::SWITCHING_PROTOCOLS,
+                "ws handshake must succeed while h2 keep-alive conns are being served"
+            );
+        })
+        .await
+        .expect("ws handshake must complete <2s while h2 keep-alive conns are being served");
     }
 }
