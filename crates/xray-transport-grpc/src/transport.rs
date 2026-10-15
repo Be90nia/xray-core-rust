@@ -448,9 +448,17 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
         .initial_window_size(16 * 1024 * 1024)
         .initial_connection_window_size(32 * 1024 * 1024)
         .max_send_buffer_size(16 * 1024 * 1024);
-    let mut h2_srv = match builder.handshake::<_, Bytes>(conn).await {
-        Ok(s) => s,
-        Err(_) => return,
+    // bd lfeu：handshake 对发完 preface 即静默/hard-close 的对端无限等待
+    // （N-1 fd 泄漏族，同 724cc20 ws serve_h2_reject 30s 兜底形态）。
+    // 合法握手毫秒级完成，30s 仅覆盖慢链路重传窗。
+    let mut h2_srv = match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        builder.handshake::<_, Bytes>(conn),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        _ => return,
     };
     // H13：server keepalive ping（Go hub.go:86-93 ServerParameters → grpc-go
     // http2_server 每 Time 无活动发 ping、Timeout 内无 pong 断连）。

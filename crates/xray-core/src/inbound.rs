@@ -67,6 +67,18 @@ use xray_proxy_wireguard::DeviceConfig;
 use xray_transport::{link::Link, system_listener::InboundTcpListener};
 use xray_transport_hysteria::quinn_adapter::QuinnListenerFactory;
 
+/// accept 错误退避：fd 耗尽（EMFILE/ENFILE）时睡眠 500ms 再重试——否则 accept 立即
+/// 失败-continue 构成忙旋 + warn 日志洪水（audit 高并发 HC-2，意图对齐 0bb4176d 与
+/// ws register.rs 样板）。判别用大小写不敏感 `contains("too many")`：样板的小写匹配
+/// 对 glibc 大写 "Too many open files" 永不命中（静默失效）；kind 判别不可用的原因：
+/// `ErrorKind::ProcessFdQuotaExceeded/SystemFdQuotaExceeded` 仍属 unstable
+/// io_error_more（1.98.0-nightly 实测 E0599）。其他错误不睡眠，维持原行为。
+async fn accept_fd_backoff(e: &std::io::Error) {
+    if e.to_string().to_lowercase().contains("too many") {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
 /// SOCKS5 inbound 服务入口。
 ///
 /// 绑定 `addr` 监听，每个连接 spawn 独立 task：
@@ -102,6 +114,7 @@ pub async fn serve_socks5(
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "socks5 accept failed");
+                accept_fd_backoff(&e).await;
                 continue;
             },
         };
@@ -445,6 +458,7 @@ async fn serve_mixed(
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "mixed accept failed");
+                accept_fd_backoff(&e).await;
                 continue;
             },
         };
@@ -549,6 +563,7 @@ pub async fn serve_http(
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "http accept failed");
+                accept_fd_backoff(&e).await;
                 continue;
             },
         };
@@ -822,6 +837,7 @@ pub async fn serve_dokodemo(
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "dokodemo accept failed");
+                accept_fd_backoff(&e).await;
                 continue;
             },
         };
@@ -1279,6 +1295,7 @@ pub async fn serve_ss(
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "ss accept failed");
+                accept_fd_backoff(&e).await;
                 continue;
             },
         };
@@ -1767,6 +1784,7 @@ pub async fn serve_dns(
                 },
                 Err(e) => {
                     tracing::warn!(error = %e, "dns tcp accept failed");
+                    accept_fd_backoff(&e).await;
                 },
             }
         }
@@ -2295,6 +2313,7 @@ async fn serve_reality_vless(
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "reality inbound accept failed");
+                accept_fd_backoff(&e).await;
                 continue;
             },
         };
@@ -2476,6 +2495,7 @@ async fn serve_reality_trojan(
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "trojan+reality inbound accept failed");
+                accept_fd_backoff(&e).await;
                 continue;
             },
         };
@@ -3310,6 +3330,7 @@ async fn serve_unix_listener(
             Ok(conn) => on_conn(conn),
             Err(e) => {
                 tracing::warn!(error = %e, "unix inbound accept failed");
+                accept_fd_backoff(&e).await;
             },
         }
     }

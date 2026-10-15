@@ -16,7 +16,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use base64::Engine as _;
@@ -44,6 +44,12 @@ const READ_HEADER_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// duplex bridge 缓冲。与 `hub::handler::DUPLEX_BUF` 对齐（64 KiB）。
 const DUPLEX_BUF: usize = 64 * 1024;
+
+/// serve 空闲兜底窗（bd lfeu：hyper h2 serve 对客户端 hard-close/静默对端
+/// 不退出——724cc20 ws serve_h2_reject 同族 N-1）。与 ws 的差异：serve_http_conn
+/// 承载长活数据流（GET 下行流随代理会话存活），硬杀全连接会切断 >30s 活跃
+/// 传输，故按 I/O 进度滚动续期——静默连接最迟 30s 强杀释放，活跃连接不受限。
+const SERVE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// SplitHTTP 监听入口（listener registry 注册的目标）。
 ///
@@ -200,6 +206,84 @@ async fn handle_accepted_stream<S>(
     }
 }
 
+/// I/O 进度跟踪包装：记录最近一次 read/write 有实际进展的时刻，供空闲兜底判定
+/// （bd lfeu）。纯透传，不改动字节流。
+type ProgressClock = parking_lot::Mutex<Instant>;
+
+struct ProgressIo<T> {
+    inner: T,
+    last_progress: Arc<ProgressClock>,
+}
+
+impl<T> ProgressIo<T> {
+    fn touch(&self) {
+        *self.last_progress.lock() = Instant::now();
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for ProgressIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let filled_before = buf.filled().len();
+        let r = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if matches!(r, Poll::Ready(Ok(()))) && buf.filled().len() > filled_before {
+            this.touch();
+        }
+        r
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for ProgressIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let r = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if matches!(r, Poll::Ready(Ok(n)) if n > 0) {
+            this.touch();
+        }
+        r
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// serve 空闲兜底驱动（bd lfeu）。每轮 `timeout(SERVE_IDLE_TIMEOUT)` 到点后复查
+/// 真实 I/O 进度：静默/hard-close 连接在最后进度 +30s 内强杀释放 fd；窗口内有
+/// 进度的连接续期下一轮——活跃传输（含 >30s 长流）不受硬杀。
+///
+/// serve future 经 `Box<dyn Future + Send>` 擦除：泛型 `Pin<&mut F>` 形态下
+/// rustc 推不出 hyper `Serving` 的 Send（higher-ranked "not general enough"
+/// 限制），trait 对象形态 Send 显式成立于类型本身。
+async fn drive_serve_guarded(
+    mut serve: Pin<Box<dyn Future<Output = ()> + Send>>,
+    last_progress: &ProgressClock,
+    max_idle: Duration,
+) {
+    loop {
+        match tokio::time::timeout(max_idle, serve.as_mut()).await {
+            Ok(()) => return,
+            Err(_) => {
+                if last_progress.lock().elapsed() >= max_idle {
+                    return; // 真静默 30s → 强杀（N-1 fd 泄漏族兜底）
+                }
+            }
+        }
+    }
+}
+
 /// h1 + h2c 自动协商的 HTTP 服务。对应 Go hub.go:564-578
 /// （`protocols.SetHTTP1(true)` + `SetUnencryptedHTTP2(true)` 的 http.Server）。
 async fn serve_http_conn<S>(stream: S, peer: SocketAddr, ctx: Arc<HandlerContext>)
@@ -209,37 +293,46 @@ where
     use hyper::service::service_fn;
     use hyper_util::rt::{TokioExecutor, TokioIo};
 
-    let io = TokioIo::new(stream);
+    let last_progress = Arc::new(ProgressClock::new(Instant::now()));
+    let io = TokioIo::new(ProgressIo { inner: stream, last_progress: Arc::clone(&last_progress) });
     let svc = service_fn(move |req| {
         let ctx = Arc::clone(&ctx);
         async move { Ok::<_, std::convert::Infallible>(handler::handle_request(req, peer, &ctx).await) }
     });
-    let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
-    builder
-        .http1()
-        .timer(hyper_util::rt::TokioTimer::new())
-        .header_read_timeout(READ_HEADER_TIMEOUT);
-    // r2lq：默认 ALPN=["h2","http/1.1"]（xray-tls server_config.rs:246）时协商
-    // 走 h2；无显式 .http2() 时 h2 路径落默认 Builder（Time::Empty），依赖 timer
-    // 的路径 panic / 行为不完整。Go hub.go:564-578 同一 http.Server 启 h1+h2。
-    builder
-        .http2()
-        .timer(hyper_util::rt::TokioTimer::new())
-        // hyper h2 每流发送缓冲默认 400KB（DEFAULT_MAX_SEND_BUF_SIZE）——发送速率
-        // 被钉在 min(send_buf, 客户端窗口)/RTT：400KB 时代高 BDP 路径钉 2.7MB/s；
-        // 4MB 时代 min(4MB, Go 客户端 4MB)/0.45s≈8.8MB/s（bd enc8x 窗钉模型三组
-        // 历史数字闭环）。16MB 配合客户端 16MB 流窗（dialer.rs 同批）→ 40-60MB/s。
-        // Go 服务端无此上限（仅受客户端窗口约束）。
-        .max_send_buf_size(16 * 1024 * 1024)
-        // bd wz2b W2：hyper server h2 缺省收窗 1MB/1MB（proto/h2/server.rs:36-37），
-        // 上行钉 1MB/RTT@169ms≈5.9MB/s（RTT50ms 实测 17.3MB/s，verify/audit-r2-w2-ab
-        // U-A 组）。显式 16MB 流窗 + 32MB 连接窗 → U-B 组 210.7MB/s（12.2×）。窗=
-        // SETTINGS 计数器零预分配，单连接聚合上限=32MB 连接窗。
-        .initial_stream_window_size(16 * 1024 * 1024)
-        .initial_connection_window_size(32 * 1024 * 1024);
-    // ponytail: Go hub.go:571 MaxHeaderBytes（GetNormalizedServerMaxHeaderBytes）无
-    // hyper 字节级对应（仅 max_headers 条数），默认值即 Go 默认 1MiB 量级，未接入。
-    let _ = builder.serve_connection(io, svc).await;
+    // bd lfeu：30s 外挂兜底——hyper h2 serve 对客户端 hard-close/静默对端不退出
+    // （724cc20 ws serve_h2_reject 同族）。判定按 I/O 进度：静默连接最迟 30s 强杀；
+    // 活跃传输（含 >30s 长流）持续续期，不受硬杀。
+    // builder 由 async move 块持有：serve_connection 借用 &self，装箱 future
+    // 生命周期超出本函数栈帧。
+    let serve: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
+        let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+        builder
+            .http1()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(READ_HEADER_TIMEOUT);
+        // r2lq：默认 ALPN=["h2","http/1.1"]（xray-tls server_config.rs:246）时协商
+        // 走 h2；无显式 .http2() 时 h2 路径落默认 Builder（Time::Empty），依赖 timer
+        // 的路径 panic / 行为不完整。Go hub.go:564-578 同一 http.Server 启 h1+h2。
+        builder
+            .http2()
+            .timer(hyper_util::rt::TokioTimer::new())
+            // hyper h2 每流发送缓冲默认 400KB（DEFAULT_MAX_SEND_BUF_SIZE）——发送速率
+            // 被钉在 min(send_buf, 客户端窗口)/RTT：400KB 时代高 BDP 路径钉 2.7MB/s；
+            // 4MB 时代 min(4MB, Go 客户端 4MB)/0.45s≈8.8MB/s（bd enc8x 窗钉模型三组
+            // 历史数字闭环）。16MB 配合客户端 16MB 流窗（dialer.rs 同批）→ 40-60MB/s。
+            // Go 服务端无此上限（仅受客户端窗口约束）。
+            .max_send_buf_size(16 * 1024 * 1024)
+            // bd wz2b W2：hyper server h2 缺省收窗 1MB/1MB（proto/h2/server.rs:36-37），
+            // 上行钉 1MB/RTT@169ms≈5.9MB/s（RTT50ms 实测 17.3MB/s，verify/audit-r2-w2-ab
+            // U-A 组）。显式 16MB 流窗 + 32MB 连接窗 → U-B 组 210.7MB/s（12.2×）。窗=
+            // SETTINGS 计数器零预分配，单连接聚合上限=32MB 连接窗。
+            .initial_stream_window_size(16 * 1024 * 1024)
+            .initial_connection_window_size(32 * 1024 * 1024);
+        // ponytail: Go hub.go:571 MaxHeaderBytes（GetNormalizedServerMaxHeaderBytes）无
+        // hyper 字节级对应（仅 max_headers 条数），默认值即 Go 默认 1MiB 量级，未接入。
+        let _ = builder.serve_connection(io, svc).await;
+    });
+    drive_serve_guarded(serve, &last_progress, SERVE_IDLE_TIMEOUT).await;
 }
 
 // ===== REALITY（Go hub.go:558-560 goreality.NewListener 的 Rust 等价物） =====
@@ -1026,5 +1119,56 @@ mod tests {
         let result = endpoint.connect(addr, "127.0.0.1").unwrap().await;
         assert!(result.is_err(), "post-close h3 connect must fail");
         endpoint.close(0u32.into(), b"test done");
+    }
+
+    /// bd lfeu：静默连接在空闲窗内被兜底强杀——pending 的挂死 serve 在
+    /// max_idle 到点后被 drive_serve_guarded 切断（生产传 SERVE_IDLE_TIMEOUT=30s，
+    /// 测试用 80ms 窗验证同一判定逻辑）。
+    #[tokio::test]
+    async fn idle_guard_kills_silent_serve() {
+        let last = Arc::new(ProgressClock::new(Instant::now()));
+        let serve: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(std::future::pending());
+        let t0 = Instant::now();
+        drive_serve_guarded(serve, &last, Duration::from_millis(80)).await;
+        let took = t0.elapsed();
+        assert!(
+            took >= Duration::from_millis(80),
+            "guard must not return before the idle window: {took:?}"
+        );
+        assert!(
+            took < Duration::from_secs(5),
+            "guard must kill a silent serve promptly instead of hanging: {took:?}"
+        );
+    }
+
+    /// bd lfeu：ProgressIo 读/写实际进展刷新进度钟——空闲续期的判定依据。
+    /// 钟预拨到 60s 前：若 read/write 未 touch，断言（elapsed < 30s）必失败。
+    #[tokio::test]
+    async fn progress_io_records_read_write_progress() {
+        use tokio::io::duplex;
+
+        let last = Arc::new(ProgressClock::new(Instant::now() - Duration::from_secs(60)));
+        // 读方向：client → ProgressIo 包装端
+        let (mut client, server) = duplex(64 * 1024);
+        let mut io = ProgressIo { inner: server, last_progress: Arc::clone(&last) };
+        client.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        io.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+        assert!(
+            last.lock().elapsed() < Duration::from_secs(30),
+            "read progress must refresh the clock"
+        );
+        // 写方向：ProgressIo 包装端 → client
+        let (mut client2, server2) = duplex(64 * 1024);
+        let mut io2 = ProgressIo { inner: server2, last_progress: Arc::clone(&last) };
+        io2.write_all(b"pong").await.unwrap();
+        let mut buf2 = [0u8; 4];
+        client2.read_exact(&mut buf2).await.unwrap();
+        assert_eq!(&buf2, b"pong");
+        assert!(
+            last.lock().elapsed() < Duration::from_secs(30),
+            "write progress must refresh the clock"
+        );
     }
 }
