@@ -80,7 +80,14 @@ pub async fn dial_naive(
     )
     .await
     .map_err(|e| format!("naive tls handshake (sni={}): {e}", config.sni))?;
-    let (mut sender, conn) = http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+    // bd wz2b N2：hyper client h2 缺省流窗 2MB/连窗 5MB/send 1MB，naiveh2 下载钉
+    // 2MB/RTT（169ms≈11.8MB/s 理论上限）。16/32MB + send 16MB 对齐 splithttp
+    // dialer.rs 同批同值。
+    let (mut sender, conn) = http2::Builder::new(TokioExecutor::new())
+        .initial_stream_window_size(16 * 1024 * 1024)
+        .initial_connection_window_size(32 * 1024 * 1024)
+        .max_send_buf_size(16 * 1024 * 1024)
+        .handshake(TokioIo::new(tls))
         .await
         .map_err(|e| format!("naive h2 handshake: {e}"))?;
 

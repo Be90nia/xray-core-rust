@@ -230,7 +230,13 @@ where
         // 4MB 时代 min(4MB, Go 客户端 4MB)/0.45s≈8.8MB/s（bd enc8x 窗钉模型三组
         // 历史数字闭环）。16MB 配合客户端 16MB 流窗（dialer.rs 同批）→ 40-60MB/s。
         // Go 服务端无此上限（仅受客户端窗口约束）。
-        .max_send_buf_size(16 * 1024 * 1024);
+        .max_send_buf_size(16 * 1024 * 1024)
+        // bd wz2b W2：hyper server h2 缺省收窗 1MB/1MB（proto/h2/server.rs:36-37），
+        // 上行钉 1MB/RTT@169ms≈5.9MB/s（RTT50ms 实测 17.3MB/s，verify/audit-r2-w2-ab
+        // U-A 组）。显式 16MB 流窗 + 32MB 连接窗 → U-B 组 210.7MB/s（12.2×）。窗=
+        // SETTINGS 计数器零预分配，单连接聚合上限=32MB 连接窗。
+        .initial_stream_window_size(16 * 1024 * 1024)
+        .initial_connection_window_size(32 * 1024 * 1024);
     // ponytail: Go hub.go:571 MaxHeaderBytes（GetNormalizedServerMaxHeaderBytes）无
     // hyper 字节级对应（仅 max_headers 条数），默认值即 Go 默认 1MiB 量级，未接入。
     let _ = builder.serve_connection(io, svc).await;
