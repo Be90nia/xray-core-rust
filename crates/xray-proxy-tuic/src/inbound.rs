@@ -18,7 +18,7 @@ use uuid::Uuid;
 use xray_features::inbound::{InboundError, InboundHandler};
 
 use crate::{
-    client::{CongestionControl, apply_congestion_to_transport},
+    client::{CongestionControl, apply_congestion_to_transport, apply_default_windows},
     error::{Result, TuicError},
     protocol::{
         Command, Packet,
@@ -156,6 +156,9 @@ impl TuicInboundHandler {
 
         let mut transport = quinn::TransportConfig::default();
         transport.datagram_receive_buffer_size(Some(8 * 1024));
+        // bd wp9o：quinn 缺省 1.25MB 流收窗高 BDP 钉——显式 16MB 流窗 + 32MB 连接窗
+        // （与 outbound client.rs 同款，wz2b W4 窗钉族收口）。
+        apply_default_windows(&mut transport);
         // 服务端 CC 预装（对称 outbound 侧）：TUIC v5 无 Hysteria-CC 协商头，
         // 无 auth 后热切换事件，建链前预装即最终算法。
         if let Some(cc) = self.config.congestion_control {

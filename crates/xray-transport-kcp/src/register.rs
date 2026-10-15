@@ -4,7 +4,14 @@
 //! listener: 完整监听流程——StdUdpHub bind → Listener → spawn UDP recv loop → bridge → upstream
 //! ConnHandler.
 
-use std::{io, net::SocketAddr, sync::Arc};
+use std::{
+    io,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use xray_transport::{
     dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
@@ -24,6 +31,27 @@ use crate::{
     output::{RetryableWriter, SegmentWriter, SimpleSegmentWriter},
     udp_hub::{MaskedPacketInput, MaskedUdpHub, StdPacketInput, StdUdpHub},
 };
+
+/// HC-1 暴露监控：当前被拨号侧 per-conn 收包循环终身钉死的 blocking 线程数。
+///
+/// tokio `RuntimeMetrics` 的 blocking 池指标（`num_blocking_threads` 等）在无
+/// `tokio_unstable` 构建下不可见（1.53.1 stable 面仅 scheduler 指标），故应用侧
+/// 自记此计数；bin 入口周期采样，与显式 `max_blocking_threads` 上限对表告警。
+static PINNED_RECV_LOOPS: AtomicU64 = AtomicU64::new(0);
+
+/// 循环内 unwind 也要减计数，用 Drop 兜底而非循环尾手工减。
+struct PinnedRecvGuard;
+
+impl Drop for PinnedRecvGuard {
+    fn drop(&mut self) {
+        PINNED_RECV_LOOPS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// 当前 mKCP 拨号侧收包循环占用的 blocking 线程数（观测用，非 mut 状态）。
+pub fn pinned_recv_loops() -> u64 {
+    PINNED_RECV_LOOPS.load(Ordering::Relaxed)
+}
 
 /// 注册 mKCP transport dialer。
 ///
@@ -181,6 +209,9 @@ async fn dial_kcp(
     let conn_weak = Arc::downgrade(&conn);
     let reader = KCPPacketReader::new();
     tokio::task::spawn_blocking(move || {
+        // HC-1 钉线观测口径：本循环终身占用 1 条 blocking 线程，进出各计一次
+        PINNED_RECV_LOOPS.fetch_add(1, Ordering::Relaxed);
+        let _pinned = PinnedRecvGuard;
         while let Some(payload) = packet_input.read_packet() {
             let Some(conn_now) = conn_weak.upgrade() else { break };
             let segments = reader.read(&payload);

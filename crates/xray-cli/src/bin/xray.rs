@@ -235,8 +235,77 @@ fn normalize_go_style_args(mut argv: Vec<String>) -> Vec<String> {
     argv
 }
 
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
+// HC-1 路线 B：blocking 池上限显式化——原 `#[tokio::main]` 隐式 max_blocking_threads=512，
+// 而每个 mKCP dialer 连接的收包循环（transport-kcp register.rs per-conn spawn_blocking，
+// 阻塞 read_packet 直至连接关闭）终身钉死 1 条 blocking 线程：≥512 并发 mKCP 连接即饿死
+// 整池，连锁饿死 observatory/metrics 的 spawn_blocking。择路线 B 而非收包 async 化的
+// 代码现状依据：PacketInput/UdpHub 均为 dyn trait 跨工厂边界，async 化需 dyn-compatible
+// 重构（Pin<Box<dyn Future>>）横跨 udp_hub/dialer/finalmask 链与全部 mock，回归风险与
+// P2 不成比例；路线 B 显式抬高上限（线程按需 spawn、闲置回收，上限本身零内存成本）
+// + 池水位周期监控，把静默饿死转成有界可观测。
+fn main() -> std::process::ExitCode {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(max_blocking_threads())
+        .build()
+        .expect("tokio runtime must build");
+    runtime.block_on(async_main())
+}
+
+/// HC-1：blocking 池上限缺省值。tokio 缺省 512 对 ≥512 并发 mKCP 钉线场景无余量；
+/// 1024 = 512 mKCP 预算 + observatory/metrics 等其余 spawn_blocking 的余量。
+/// 线程按需创建、闲置回收，上限本身零内存成本。XRAY_MAX_BLOCKING_THREADS 可覆盖。
+const DEFAULT_MAX_BLOCKING_THREADS: usize = 1024;
+
+/// 解析 XRAY_MAX_BLOCKING_THREADS：缺失/非数字/≤0 回退缺省（tokio 对 0 会 panic）。
+fn max_blocking_threads_from(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_BLOCKING_THREADS)
+}
+
+fn max_blocking_threads() -> usize {
+    max_blocking_threads_from(std::env::var("XRAY_MAX_BLOCKING_THREADS").ok().as_deref())
+}
+
+/// HC-1 路线 B 暴露监控：周期采样 mKCP 钉线数与显式 blocking 池上限的对表水位。
+/// tokio stable `RuntimeMetrics` 无 blocking 池指标（`num_blocking_threads` 等在
+/// `cfg_unstable_metrics` 门内，本仓不用 tokio_unstable），钉线数来自 kcp crate
+/// 应用侧计数（`pinned_recv_loops`）。达半预算即 warn（≥512 钉线曾饿死缺省池的
+/// 早期信号）；平水位 debug。run 模式订阅者挂载前（≤30s 窗口）的采样静默丢弃
+/// 属预期——启动基线由 log_runtime_snapshot 覆盖。
+fn spawn_blocking_pool_monitor() {
+    tokio::spawn(async {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await; // 首跳立即完成，只看后续周期
+        loop {
+            interval.tick().await;
+            let pinned = xray_transport_kcp::pinned_recv_loops();
+            let cap = max_blocking_threads();
+            if pool_budget_at_risk(pinned, cap) {
+                tracing::warn!(
+                    pinned_recv_loops = pinned,
+                    max_blocking_threads = cap,
+                    "mKCP pinned recv loops reached half the blocking pool cap; spawn_blocking budget at risk"
+                );
+            } else {
+                tracing::debug!(
+                    pinned_recv_loops = pinned,
+                    max_blocking_threads = cap,
+                    "blocking pool headroom ok"
+                );
+            }
+        }
+    });
+}
+
+/// 钉线数达显式上限一半即视为预算告急（HC-1：≥512 钉线曾饿死缺省 512 池）。
+fn pool_budget_at_risk(pinned: u64, cap: usize) -> bool {
+    pinned as usize * 2 >= cap
+}
+
+async fn async_main() -> std::process::ExitCode {
     // P0 护栏：计数分配器开关解析 + dump 线程（未开 env 时零开销直返）。
     xray_cli::alloc_stats::init();
     // 9tk4：tracing subscriber 不再在此急切初始化（此前固定 EnvFilter "info"
@@ -251,11 +320,17 @@ async fn main() -> std::process::ExitCode {
     let command = cli.command.unwrap_or(Command::Run(RunArgs::default()));
     if !matches!(command, Command::Run(_)) {
         run::init_tracing("info");
+        // P3 护栏（tokio #8065/#8120 教训）：启动期一次性抓取 RuntimeMetrics 快照
+        // 并以 tracing::info 输出，便于日志归档 worker 行为基线（park/busy/noop/steal）。
+        // 失败仅记 warn，不影响主路径。
+        // HC-3：快照必须在 tracing 初始化之后——此前 run 生产路径走到这里时
+        // subscriber 尚未挂载（run::execute 内才 init_tracing），info 被吞、
+        // 日志缺 worker 基线行。run 路径的对应调用在 run::execute 的
+        // init_tracing 之后（run.rs，PM 批准临时纳入 owned）。
+        xray_common::runtime_guard::log_runtime_snapshot("startup");
     }
-    // P3 护栏（tokio #8065/#8120 教训）：启动期一次性抓取 RuntimeMetrics 快照
-    // 并以 tracing::info 输出，便于日志归档 worker 行为基线（park/busy/noop/steal）。
-    // 失败仅记 warn，不影响主路径。
-    xray_common::runtime_guard::log_runtime_snapshot("startup");
+    // HC-1：blocking 池水位周期监控（路线 B 暴露监控，见 spawn_blocking_pool_monitor）。
+    spawn_blocking_pool_monitor();
     match execute(command).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
@@ -375,5 +450,59 @@ mod go_flag_tests {
     fn top_level_help_version_skip_run_insert() {
         assert_eq!(v(&["-h"]), vec!["xray", "-h"]);
         assert_eq!(v(&["-version"]), vec!["xray", "--version"]);
+    }
+}
+
+#[cfg(test)]
+mod blocking_pool_tests {
+    use super::{max_blocking_threads_from, pool_budget_at_risk, DEFAULT_MAX_BLOCKING_THREADS};
+
+    #[test]
+    fn max_blocking_threads_parse_falls_back_on_bad_input() {
+        assert_eq!(max_blocking_threads_from(None), DEFAULT_MAX_BLOCKING_THREADS);
+        assert_eq!(max_blocking_threads_from(Some("2048")), 2048);
+        assert_eq!(
+            max_blocking_threads_from(Some("garbage")),
+            DEFAULT_MAX_BLOCKING_THREADS,
+            "non-numeric must fall back to default"
+        );
+        assert_eq!(
+            max_blocking_threads_from(Some("0")),
+            DEFAULT_MAX_BLOCKING_THREADS,
+            "0 must not reach tokio Builder (panics)"
+        );
+    }
+
+    #[test]
+    fn pool_budget_at_risk_threshold_is_half_cap() {
+        assert!(!pool_budget_at_risk(0, DEFAULT_MAX_BLOCKING_THREADS));
+        assert!(!pool_budget_at_risk(511, DEFAULT_MAX_BLOCKING_THREADS));
+        assert!(pool_budget_at_risk(512, DEFAULT_MAX_BLOCKING_THREADS), "half of 1024 must trigger");
+        assert!(!pool_budget_at_risk(255, 512));
+        assert!(pool_budget_at_risk(256, 512));
+    }
+
+    /// 池语义断言（HC-1 验收）：显式 max_blocking_threads=1 被 Builder 真实消费——
+    /// 8 个 spawn_blocking 任务在单线程上限下仍全部完成（串行但不死锁不饿死）。
+    #[test]
+    fn blocking_pool_explicit_cap_keeps_pool_functional() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut handles = Vec::new();
+            for i in 0..8_u32 {
+                handles.push(tokio::task::spawn_blocking(move || i));
+            }
+            for (i, h) in handles.into_iter().enumerate() {
+                assert_eq!(
+                    h.await.unwrap(),
+                    i as u32,
+                    "spawn_blocking must complete under explicit cap"
+                );
+            }
+        });
     }
 }
