@@ -238,7 +238,10 @@ def build_x(proto, P):
                       "serverName": "localhost",
                       "publicKey": pub_b64,
                       "shortId": sid,
-                      "fingerprint": "randomizednoalpn"}}
+                      # ponytail: randomizednoalpn 的随机曲线池不含 X25519MLKEM768，
+                      # 必撞 Rust 服务端 2ktp① 门（NoKeyShareX25519，Go 服务端同样
+                      # 拒）——测例组合本身无效；chrome 指纹含 MLKEM768+X25519。
+                      "fingerprint": "chrome"}}
         si = {"port": P, "listen": "127.0.0.1", "protocol": "vless",
               "settings": {"clients": [{"id": UUID}], "decryption": "none"},
               "streamSettings": ss_srv}
