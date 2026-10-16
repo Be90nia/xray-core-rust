@@ -289,7 +289,7 @@ async fn drive_serve_guarded(
                 if last_progress.lock().elapsed() >= max_idle {
                     return; // 真静默 30s → 强杀（N-1 fd 泄漏族兜底）
                 }
-            }
+            },
         }
     }
 }

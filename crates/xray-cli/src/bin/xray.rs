@@ -473,7 +473,7 @@ mod go_flag_tests {
 
 #[cfg(test)]
 mod blocking_pool_tests {
-    use super::{max_blocking_threads_from, pool_budget_at_risk, DEFAULT_MAX_BLOCKING_THREADS};
+    use super::{DEFAULT_MAX_BLOCKING_THREADS, max_blocking_threads_from, pool_budget_at_risk};
 
     #[test]
     fn max_blocking_threads_parse_falls_back_on_bad_input() {
@@ -495,7 +495,10 @@ mod blocking_pool_tests {
     fn pool_budget_at_risk_threshold_is_half_cap() {
         assert!(!pool_budget_at_risk(0, DEFAULT_MAX_BLOCKING_THREADS));
         assert!(!pool_budget_at_risk(511, DEFAULT_MAX_BLOCKING_THREADS));
-        assert!(pool_budget_at_risk(512, DEFAULT_MAX_BLOCKING_THREADS), "half of 1024 must trigger");
+        assert!(
+            pool_budget_at_risk(512, DEFAULT_MAX_BLOCKING_THREADS),
+            "half of 1024 must trigger"
+        );
         assert!(!pool_budget_at_risk(255, 512));
         assert!(pool_budget_at_risk(256, 512));
     }
