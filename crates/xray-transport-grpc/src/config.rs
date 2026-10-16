@@ -27,7 +27,7 @@ use std::io;
 use crate::error::Result;
 
 /// gRPC 配置。对应 proto `xray.transport.internet.grpc.encoding.Config`。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// HTTP/2 `:authority` 伪 header。空时用 dest 地址或 TLS ServerName。
     pub authority: String,
@@ -36,7 +36,8 @@ pub struct Config {
     pub service_name: String,
     /// 是否启用 multi-stream 模式（每连接多路 gRPC stream，提升吞吐）。
     pub multi_mode: bool,
-    /// 空闲超时（秒）。对应 gRPC keepalive `Time`。
+    /// 空闲超时（秒）。对应 gRPC keepalive `Time`。缺省 30（Bug-B：h2 PING
+    /// 检测死链防 NAT/CDN 静默切断假死；JSON 显式 0 = 关闭）。
     pub idle_timeout: i32,
     /// 健康检查超时（秒）。对应 gRPC keepalive `Timeout`。
     pub health_check_timeout: i32,
@@ -47,6 +48,21 @@ pub struct Config {
     /// User-Agent。支持预设别名：`"chrome"` / `"firefox"` / `"edge"` / `"golang"`。
     /// 空串等同 `"chrome"`。
     pub user_agent: String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            authority: String::new(),
+            service_name: String::new(),
+            multi_mode: false,
+            idle_timeout: 30,
+            health_check_timeout: 0,
+            permit_without_stream: false,
+            initial_windows_size: 0,
+            user_agent: String::new(),
+        }
+    }
 }
 
 /// 从 `grpcSettings` JSON 解析为强类型 [`Config`]。
@@ -85,11 +101,19 @@ pub(crate) fn parse_grpc_config(json: Option<&serde_json::Value>) -> io::Result<
         obj.get(camel).or_else(|| obj.get(snake)).and_then(|x| x.as_i64()).unwrap_or(0) as i32
     };
 
+    // Bug-B（bd cqyj）：idle_timeout 缺省 30s（h2 PING 检测死链）；显式 0 = 关闭。
+    let idle_timeout = obj
+        .get("idleTimeout")
+        .or_else(|| obj.get("idle_timeout"))
+        .and_then(|x| x.as_i64())
+        .map(|v| v as i32)
+        .unwrap_or(30);
+
     Ok(Config {
         authority: get_str("authority", "authority"),
         service_name: get_str("serviceName", "service_name"),
         multi_mode: get_bool("multiMode", "multi_mode"),
-        idle_timeout: get_i32("idleTimeout", "idle_timeout"),
+        idle_timeout,
         health_check_timeout: get_i32("healthCheckTimeout", "health_check_timeout"),
         permit_without_stream: get_bool("permitWithoutStream", "permit_without_stream"),
         initial_windows_size: get_i32("initialWindowSize", "initial_windows_size"),
@@ -380,7 +404,8 @@ mod tests {
         assert!(cfg.authority.is_empty());
         assert!(cfg.service_name.is_empty());
         assert!(!cfg.multi_mode);
-        assert_eq!(cfg.idle_timeout, 0);
+        // Bug-B：idle_timeout 缺省 30s（keepalive 防死链假死）。
+        assert_eq!(cfg.idle_timeout, 30);
     }
 
     #[test]

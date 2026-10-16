@@ -97,6 +97,12 @@ pub async fn dial(
     let port = opts.destination.port().value();
     let tcp = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
     tcp.set_nodelay(true).ok();
+    // Bug-B（bd cqyj）：ws 拨号此前绕过 sockopt（裸 connect 无 keepalive）——
+    // NAT/CDN 静默切断后成半开死链。45s 对齐 SocketOptions::default。
+    {
+        let ka = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(45));
+        let _ = socket2::SockRef::from(&tcp).set_tcp_keepalive(&ka);
+    }
     let stream: Box<dyn xray_transport::connection::Connection> = match opts.tls_config {
         Some(cfg) => {
             // Go dialer.go:79-99：fingerprint 解析成功即走 tls.UClient +
@@ -634,8 +640,8 @@ mod tests {
         .unwrap();
         assert!(conn.heartbeat_handle.is_some(), "heartbeatPeriod>0 → 客户端心跳任务已启动");
 
-        // 对照：period=0 不启动。
-        let cfg = Config::default();
+        // 对照：period=0（显式关闭）不启动。Bug-B 后 Default=30，须显式 0。
+        let cfg = Config { heartbeat_period: 0, ..Config::default() };
         let conn = dial(DialOptions {
             config: &cfg,
             destination: &d,

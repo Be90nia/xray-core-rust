@@ -487,7 +487,8 @@ fn parse_ws_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
     let mut host = obj.get("host").and_then(|x| x.as_str()).unwrap_or("").to_string();
     let mut path = obj.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string();
     let mut ed = obj.get("ed").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-    let heartbeat_period = obj.get("heartbeatPeriod").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    // Bug-B（bd cqyj）：缺省 30s 心跳；显式 0 = 关闭。
+    let heartbeat_period = obj.get("heartbeatPeriod").and_then(|x| x.as_u64()).map(|v| v as u32).unwrap_or(30);
     // ponytail: poolSize 缺省 → Config::default() 的 3（启用池化）；显式 0 = 关池。
     // 与 `Config::default()` 一致，避免每个 outbound 都要在 JSON 里写 poolSize。
     let pool_size = obj.get("poolSize").and_then(|x| x.as_u64()).unwrap_or(3) as u32;

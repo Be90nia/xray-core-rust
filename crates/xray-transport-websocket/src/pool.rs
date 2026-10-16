@@ -31,7 +31,7 @@ use std::{
     io,
     pin::Pin,
     sync::{Arc, LazyLock},
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
     time::{Duration, Instant},
 };
 
@@ -122,6 +122,19 @@ struct PoolEntry {
     last_used: Instant,
 }
 
+/// 非阻塞活性探测：一次 `poll_read`（noop waker）。
+///
+/// `Pending` = 活（idle 无数据——正常空闲 ws 连接必 Pending）；`Ready` 任意形态
+/// = 死：EOF（对端已发 close 帧后关闭）/ 残留帧（不该出现的半关状态）/ Err（断连）。
+/// 2026-10-17 生产事故：连接在池内 idle 期间被服务端/CF 关闭，取出复用写 vless
+/// header 即 "Sending after closing"——TTL+IO 错误毒标记都拦不住 close 帧路径。
+fn probe_conn_alive(conn: &mut Box<dyn Connection>) -> bool {
+    let mut buf = [0u8; 16];
+    let mut rb = ReadBuf::new(&mut buf);
+    let mut cx = Context::from_waker(Waker::noop());
+    matches!(Pin::new(conn).poll_read(&mut cx, &mut rb), Poll::Pending)
+}
+
 /// WebSocket 连接池：每个 key 一条 `VecDeque<Box<dyn Connection>>`。
 ///
 /// 锁粒度 = `HashMap<PoolKey, _>` 全锁；通常 outbound key 数 < 100，单次操作
@@ -185,7 +198,7 @@ impl WsConnectionPool {
             (cfg.max_idle_duration, cfg.max_idle_per_key)
         };
         let mut guard = self.inner.lock().await;
-        let entry = guard.get_mut(key)?;
+        let Some(entry) = guard.get_mut(key) else { return None };
         let now = Instant::now();
         // 从头扫除过期（FIFO：先入先过期）。
         while let Some(front) = entry.front() {
@@ -195,7 +208,15 @@ impl WsConnectionPool {
                 break;
             }
         }
-        entry.pop_front().map(|e| e.conn)
+        // 取出循环：idle 期间被对端关闭的连接（close 帧/EOF）当场丢弃，继续取
+        // 下一条——探测是唯一可靠的死活判据（TTL 拦不住 10s 内的主动 close）。
+        while let Some(e) = entry.pop_front() {
+            let mut conn = e.conn;
+            if probe_conn_alive(&mut conn) {
+                return Some(conn);
+            }
+        }
+        None
     }
 
     /// 归还连接到池。池满则直接 drop（关闭底层 socket）。
@@ -282,8 +303,11 @@ impl AsyncRead for PooledConn {
     ) -> Poll<io::Result<()>> {
         let mut this = self.as_mut();
         let r = Pin::new(this.inner.as_mut().expect("conn taken by Drop")).poll_read(cx, buf);
-        if matches!(r, Poll::Ready(Err(_))) {
-            this.io_poisoned = true;
+        match r {
+            Poll::Ready(Err(_)) => this.io_poisoned = true,
+            // Ok 且 0 填充 = EOF：对端已关连接（ws close 帧/FIN）——毒标记。
+            Poll::Ready(Ok(())) if buf.filled().is_empty() => this.io_poisoned = true,
+            _ => {}
         }
         r
     }
@@ -342,9 +366,14 @@ impl Drop for PooledConn {
     fn drop(&mut self) {
         // 关键：必须在字段 drop 前 take 出 conn —— 否则 conn 在 Drop 中先关
         // socket，池里拿到一条已死的连接。
-        if let (Some((pool, key)), Some(conn)) = (self.pool_release.take(), self.inner.take()) {
+        if let (Some((pool, key)), Some(mut conn)) = (self.pool_release.take(), self.inner.take()) {
             if self.io_poisoned {
                 // IO 出错的连接直接关，不归还——复用即死连接回归（根治）。
+                return;
+            }
+            if !probe_conn_alive(&mut conn) {
+                // idle/使用间隙收到对端 close 帧（EOF/残留帧）——归还即
+                // "Sending after closing" 事故回归，当场关闭。
                 return;
             }
             tokio::spawn(async move {
@@ -365,8 +394,13 @@ mod tests {
     use super::*;
 
     /// 测试用 duplex conn（用于 mock 一个真实 Connection）。
+    /// 2026-10-17：对端 `forget` 保活——真实 ws 连接握手完成后远端是活的；
+    /// 之前 `_b` 随函数返回 drop = mock 天生 EOF，probe 正确判死后既有
+    /// 归还/取出测试全挂。EOF 场景由 `eof_conn_not_released_and_discarded_on_acquire`
+    /// 专项覆盖。
     fn mock_conn() -> Box<dyn Connection> {
-        let (a, _b): (DuplexStream, DuplexStream) = tokio::io::duplex(64);
+        let (a, b): (DuplexStream, DuplexStream) = tokio::io::duplex(64);
+        std::mem::forget(b);
         Box::new(DuplexConnection::new(a))
     }
 
@@ -485,10 +519,7 @@ mod tests {
         assert!(matches!(n, Poll::Ready(Err(_))));
         drop(pooled); // Drop：毒标记 → 不归还
         tokio::time::sleep(Duration::from_millis(10)).await; // 等 spawn 的 release（若有）跑完
-        assert!(
-            pool.try_acquire(&key1()).await.is_none(),
-            "poisoned conn must NOT re-enter pool"
-        );
+        assert!(pool.try_acquire(&key1()).await.is_none(), "poisoned conn must NOT re-enter pool");
     }
 
     #[tokio::test]
@@ -512,6 +543,46 @@ mod tests {
         // 池里没东西（fresh conn 无 release 标记）。
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(pool.try_acquire(&key1()).await.is_none());
+    }
+
+    /// 2026-10-17 生产事故回归：idle 期间被对端关闭（read 即 EOF）的连接，
+    /// Drop 归还前探测必须拦下——否则下个 caller 复用即 "Sending after closing"。
+    #[tokio::test]
+    async fn eof_conn_not_released_and_discarded_on_acquire() {
+        // b 端持有者 drop 即 EOF 模拟对端 close。
+        let (a, b): (DuplexStream, DuplexStream) = tokio::io::duplex(64);
+        let pool = Arc::new(WsConnectionPool::new(WsPoolConfig::default()));
+        // 1) Drop 归还路径：探测拦下 EOF 连接。
+        {
+            let pooled = PooledConn::from_pool(Box::new(DuplexConnection::new(a)), pool.clone(), key1());
+            drop(b); // 对端关闭 → EOF
+            tokio::time::sleep(Duration::from_millis(10)).await; // EOF 传播
+            drop(pooled);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                pool.try_acquire(&key1()).await.is_none(),
+                "EOF conn must NOT re-enter pool (probe blocks release)"
+            );
+        }
+        // 2) 取出路径：直接 release 进池的死连接，try_acquire 当场丢弃。
+        let (c, d): (DuplexStream, DuplexStream) = tokio::io::duplex(64);
+        drop(d);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        pool.release(key1(), Box::new(DuplexConnection::new(c))).await;
+        assert!(
+            pool.try_acquire(&key1()).await.is_none(),
+            "dead conn in pool must be discarded on acquire"
+        );
+    }
+
+    /// 活连接不受探测影响：正常归还/取出照常。
+    #[tokio::test]
+    async fn alive_conn_probe_passes() {
+        let (a, b): (DuplexStream, DuplexStream) = tokio::io::duplex(64);
+        let _keep = b; // 对端持有 → 无 EOF
+        let pool = Arc::new(WsConnectionPool::new(WsPoolConfig::default()));
+        pool.release(key1(), Box::new(DuplexConnection::new(a))).await;
+        assert!(pool.try_acquire(&key1()).await.is_some(), "idle alive conn must survive probe");
     }
 
     #[tokio::test]
