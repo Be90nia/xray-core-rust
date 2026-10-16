@@ -525,8 +525,12 @@ fn verify_and_probe(
         }
     }
 
-    let now_unix =
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0);
+    // F2（bd hg1q）：时钟早于 epoch 时不再静默取 0——0 会以异常时间戳流入
+    // auth_sig/重放窗校验，形成难查的隐性握手拒绝。显式报错带原因。
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| RealityError::TlsHandshake(format!("system clock before epoch: {e}")))?
+        .as_secs() as u32;
     let (_payload, auth_key) = verify_reality_client_hello(
         &parsed,
         server_private_key,

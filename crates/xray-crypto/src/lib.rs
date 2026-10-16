@@ -73,18 +73,29 @@ pub fn rand_between(from: i64, to: i64) -> i64 {
 /// ```
 pub fn rand_bytes_between(buf: &mut [u8], from: u8, to: u8) {
     let mut rng = rand::rng();
-    rng.fill(buf);
-
     let (lo, hi) = if from > to { (to, from) } else { (from, to) };
 
     // Full u8 range — no remapping needed
     if hi.wrapping_sub(lo) == 255 {
+        rng.fill(buf);
         return;
     }
 
-    let range = hi - lo + 1;
+    // P0-3（bd 6vqk）：rejection sampling（Menezes HAC §5.4.4，Go v26.9.9 同款）。
+    // 此前 `lo + b % range` 有 modulo bias（b 均匀 [0,255]，range 不整除 256 时
+    // 低位值概率偏高）。limit = 256 - 256%range 为最大完整倍数区——拒样重抽，
+    // 重抽概率 <50%（range≥128 时为 0）。closed range 语义与 wire 均不变。
+    let range = u16::from(hi - lo) + 1;
+    let limit = 256u16 - (256 % range);
     for byte in buf.iter_mut() {
-        *byte = lo + *byte % range;
+        loop {
+            let mut sample = [0u8; 1];
+            rng.fill(&mut sample);
+            if u16::from(sample[0]) < limit {
+                *byte = lo + (u16::from(sample[0]) % range) as u8;
+                break;
+            }
+        }
     }
 }
 
@@ -197,6 +208,28 @@ mod tests {
         }
         for (i, &s) in seen.iter().enumerate() {
             assert!(s, "value {i} never appeared in 10000 samples");
+        }
+    }
+
+    /// P0-3（bd 6vqk）：modulo bias 回归——range=200（256%200=56 旧实现偏差
+    /// 区）下各值频次须均匀（±10%）。旧 `b % 200` 实现 [0,55] 概率是 [56,199]
+    /// 的 2 倍，必挂此断言。
+    #[test]
+    fn rand_bytes_between_no_modulo_bias() {
+        let range = 200usize;
+        let mut freq = vec![0usize; range];
+        let mut buf = [0u8; 200_000];
+        rand_bytes_between(&mut buf, 0, 199);
+        for &b in &buf {
+            freq[b as usize] += 1;
+        }
+        let expect = buf.len() / range;
+        for (v, &f) in freq.iter().enumerate() {
+            let dev = f.abs_diff(expect);
+            assert!(
+                dev * 10 <= expect,
+                "value {v} freq {f} deviates >10% from uniform {expect} (modulo bias?)"
+            );
         }
     }
 }
