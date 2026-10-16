@@ -30,6 +30,7 @@ use xray_transport::{
 use crate::{
     client::{DelayDialConn, DialFactory, DialOptions, DialParams, dial, dial_with_params},
     config::Config,
+    pool::{PoolKey, PooledConn, WsConnectionPool, global_pool},
 };
 
 /// 注册 WebSocket transport dialer。
@@ -177,7 +178,7 @@ impl TransportListener for WsTransportListener {
     }
 }
 
-/// 实际拨号：解析 wsSettings → tls config → 调用 client::dial → 包装为 Connection。
+/// 实际拨号：解析 wsSettings → tls config → 池查询/拨号 → 包装为 Connection。
 async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Box<dyn Connection>> {
     let config = parse_ws_config(settings.transport_json.as_ref())?;
 
@@ -226,7 +227,46 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
         return Ok(Box::new(DelayDialConn::new(ed, factory)));
     }
 
-    let conn = dial(DialOptions {
+    // ===== Bug-A ws 客户端连接池（bd k9qg） =====
+    // 池启用条件：`Config::pool_size > 0`（默认 3）。key 必须包含能区分握手细节的
+    // 字段（host/port/path/sni/fingerprint）——任意字段不同 = 不能复用（TLS
+    // 握手 / WS 升级 / SNI 校验阶段已不同）。
+    let pool_key = PoolKey {
+        host: dest.address().to_string(),
+        port: dest.port().value(),
+        path: config.normalized_path(),
+        tls_server_name: tls_server_name.clone(),
+        fingerprint: fingerprint.clone(),
+    }
+    .normalized();
+    let pool = global_pool();
+    // 首次解析到 wsSettings 时按 Config::pool_size 重新配置全局池；后续 inbound
+    // 配置变更不传播（单进程池容量固定）。
+    if config.pool_size > 0 && !pool.config_initialized() {
+        pool.init_config(config.pool_size as usize);
+    }
+    // 池尝试：命中空闲连接（msg 复用 = 跳过 TCP+TLS+WS 握手 500ms）。
+    let pooled = if config.pool_size > 0 && pool.enabled() {
+        if let Some(cached) = pool.try_acquire(&pool_key).await {
+            // 池命中：用 PooledConn 包装（Drop 时归还到池）。
+            Some(PooledConn::from_pool(cached, pool.clone(), pool_key.clone()))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(cached_pooled) = pooled {
+        // 池命中：直接包装 finalmask（每 call 应用 per-outbound finalmask_json）。
+        return xray_transport::finalmask::wrap_conn_client_from_settings(
+            settings,
+            Box::new(cached_pooled),
+        );
+    }
+
+    // 池未命中 / 池未启用：拨号新连接。
+    let raw_conn = dial(DialOptions {
         config: &config,
         destination: dest,
         early_data: None,
@@ -238,9 +278,22 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
     .await
     .map_err(io::Error::other)?;
 
-    // Tcpmask（Go websocket/dialer.go:56-63：`TcpmaskManager.WrapConnClient`，
-    // security 包装之后链式应用 finalmask_json.tcp[]）。
-    xray_transport::finalmask::wrap_conn_client_from_settings(settings, Box::new(conn))
+    // 应用 finalmask（per-call per-outbound）。
+    let wrapped: Box<dyn Connection> =
+        xray_transport::finalmask::wrap_conn_client_from_settings(settings, raw_conn)?;
+
+    // 池启用 + 无 finalmask 包装（最常见 case） → 入池供下个 caller 复用。
+    // ponytail: finalmask_json 非空时跳过入池——下个 caller 的 finalmask_json
+    // 可能不同，混用 = wrap 层串台。99% 用户 finalmask_json 空 = 入池生效。
+    if config.pool_size > 0 && pool.enabled() && settings.finalmask_json.is_none() {
+        Ok(Box::new(PooledConn::fresh_releasable(
+            wrapped,
+            pool.clone(),
+            pool_key,
+        )))
+    } else {
+        Ok(wrapped)
+    }
 }
 
 /// security_json 顶层字符串字段提取（serverName / fingerprint）。
@@ -426,6 +479,7 @@ fn hex_val(c: u8) -> Option<u8> {
 /// - `header` 或 `headers`：`map<string,string>`（同时支持两种 key 兼容客户端配置）
 /// - `ed`：u32（Early Data 长度）
 /// - `heartbeatPeriod`：u32（秒，camelCase 对齐 proto JSON）
+/// - `poolSize`：u32（连接池空闲上限，0=关池；缺省沿用 `Config::default` = 3）
 ///
 /// `None` 或非 object 返回 [`Config::default`]。
 fn parse_ws_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
@@ -440,6 +494,10 @@ fn parse_ws_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
     let mut path = obj.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string();
     let mut ed = obj.get("ed").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
     let heartbeat_period = obj.get("heartbeatPeriod").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    // ponytail: poolSize 缺省 → Config::default() 的 3（启用池化）；显式 0 = 关池。
+    // 与 `Config::default()` 一致，避免每个 outbound 都要在 JSON 里写 poolSize。
+    let pool_size =
+        obj.get("poolSize").and_then(|x| x.as_u64()).unwrap_or(3) as u32;
 
     // Go `infra/conf/transport_internet.go::WebSocketConfig.Build`：
     // path 中 `?ed=N` 提取为 Ed 字段并从 path 删除（其余 query 参数保留）。
@@ -462,7 +520,15 @@ fn parse_ws_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
     let accept_proxy_protocol =
         obj.get("acceptProxyProtocol").and_then(|x| x.as_bool()).unwrap_or(false);
 
-    Ok(Config { host, path, header, accept_proxy_protocol, ed, heartbeat_period })
+    Ok(Config {
+        host,
+        path,
+        header,
+        accept_proxy_protocol,
+        ed,
+        heartbeat_period,
+        pool_size,
+    })
 }
 
 /// 把 JSON 子对象解析为 `HashMap<String, String>`。非 object 或缺失返回 `None`。
@@ -503,6 +569,30 @@ mod tests {
         assert_eq!(cfg.path, "/ws");
         assert_eq!(cfg.ed, 2048);
         assert_eq!(cfg.heartbeat_period, 30);
+    }
+
+    /// poolSize 默认 3（启用池化）。
+    #[test]
+    fn parse_ws_config_pool_size_default_3() {
+        let v: serde_json::Value = serde_json::from_str(r#"{"path":"/ws"}"#).unwrap();
+        let cfg = parse_ws_config(Some(&v)).unwrap();
+        assert_eq!(cfg.pool_size, 3);
+    }
+
+    /// poolSize=0 显式关池。
+    #[test]
+    fn parse_ws_config_pool_size_zero_disables() {
+        let v: serde_json::Value = serde_json::from_str(r#"{"path":"/ws","poolSize":0}"#).unwrap();
+        let cfg = parse_ws_config(Some(&v)).unwrap();
+        assert_eq!(cfg.pool_size, 0);
+    }
+
+    /// poolSize=N 启用 N 条空闲上限。
+    #[test]
+    fn parse_ws_config_pool_size_custom() {
+        let v: serde_json::Value = serde_json::from_str(r#"{"path":"/ws","poolSize":6}"#).unwrap();
+        let cfg = parse_ws_config(Some(&v)).unwrap();
+        assert_eq!(cfg.pool_size, 6);
     }
 
     #[test]
