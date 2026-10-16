@@ -42,9 +42,8 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        // ponytail: 默认 3 = Chrome 6/host 限制的 1/2（实测 6 并发时 pool=3
-        // 平均节省 40% 握手；上调至 6 完全对齐 Chrome，但 VPS 端并发压力 +
-        // 双倍。配置可调，改 default 视为破坏性）。
+        // ponytail: 默认 3 = Chrome 6/host 限制的 1/2。根治后（TTL 10s + IO
+        // 错误连接不入池）CDN 死连接窗口≈0，默认启用安全。
         Self {
             host: String::new(),
             path: String::new(),
@@ -80,7 +79,7 @@ impl Config {
             accept_proxy_protocol: p.accept_proxy_protocol,
             ed: p.ed,
             heartbeat_period: p.heartbeat_period,
-            // ponytail: 老 proto 缺 pool_size 字段 → 默认 3 启用池化；
+            // ponytail: 老 proto 缺 pool_size 字段 → 与 Config::default() 一致取 3；
             // 后续 proto 加字段后切换为 `p.pool_size`。
             pool_size: 3,
         })
