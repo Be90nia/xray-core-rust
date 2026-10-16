@@ -5,6 +5,12 @@
 
 use std::{io, sync::Arc};
 
+/// 缺省流接收窗（bd wz2b W4：quinn 缺省流收窗 1.25MB STREAM_RWND 高 BDP 钉
+/// 1.25MB/RTT@169ms≈7.4MB/s；缺省显式 16MB，与 h2 族同值）。
+const DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 16 * 1024 * 1024;
+/// 缺省连接接收窗（与 splithttp/grpc h2 连接窗同值）。
+const DEFAULT_CONNECTION_RECEIVE_WINDOW: u64 = 32 * 1024 * 1024;
+
 /// QUIC 配置。
 ///
 /// Go 端字段对照：
@@ -30,9 +36,9 @@ pub struct QuicConfig {
     /// （brutal 发送器仅 hysteria 路径有真实现，本 crate 落 CUBIC 登记）。未知值解析期报错。
     pub congestion: String,
     /// 流接收窗口（字节）。qeyo：quinn 单固定窗口取 max(initial, max) 对齐 Go 稳态。
-    /// 0 = 使用 quinn 默认（~500KB）；上层解析时已映射成实际值。
+    /// 0 = 缺省显式 16MB（bd wz2b W4；原 quinn 默认 1.25MB STREAM_RWND 高 BDP 钉）。
     pub stream_receive_window: u64,
-    /// 连接级接收窗口（字节）。qeyo：同上。
+    /// 连接级接收窗口（字节）。qeyo：同上。0 = 缺省显式 32MB（bd wz2b W4）。
     pub connection_receive_window: u64,
     /// 最大空闲超时（毫秒；0 = 不设，quinn 默认 30s）。
     pub max_idle_timeout_ms: u64,
@@ -123,16 +129,24 @@ impl QuicConfig {
     #[must_use]
     pub fn build_transport_config(&self) -> quinn::TransportConfig {
         let mut t = quinn::TransportConfig::default();
-        // qeyo：流量控制窗口（Go Initial+Max → quinn 单固定窗口取 max 对齐稳态）
-        if self.stream_receive_window > 0 {
-            if let Ok(v) = quinn::VarInt::try_from(self.stream_receive_window) {
-                t.stream_receive_window(v);
-            }
+        // qeyo：流量控制窗口（Go Initial+Max → quinn 单固定窗口取 max 对齐稳态）。
+        // bd wz2b W4：0（quicSettings 缺省）原不设 → quinn 缺省流收窗 1.25MB 高 BDP
+        // 钉死；缺省显式 16MB 流窗/32MB 连接窗，用户显式配置仍优先。
+        let stream_win = if self.stream_receive_window > 0 {
+            self.stream_receive_window
+        } else {
+            DEFAULT_STREAM_RECEIVE_WINDOW
+        };
+        let conn_win = if self.connection_receive_window > 0 {
+            self.connection_receive_window
+        } else {
+            DEFAULT_CONNECTION_RECEIVE_WINDOW
+        };
+        if let Ok(v) = quinn::VarInt::try_from(stream_win) {
+            t.stream_receive_window(v);
         }
-        if self.connection_receive_window > 0 {
-            if let Ok(v) = quinn::VarInt::try_from(self.connection_receive_window) {
-                t.receive_window(v);
-            }
+        if let Ok(v) = quinn::VarInt::try_from(conn_win) {
+            t.receive_window(v);
         }
         // 空闲超时（qeyo 兼容：0 = quinn 默认 30s，>0 用配置值）
         if self.max_idle_timeout_ms > 0 {

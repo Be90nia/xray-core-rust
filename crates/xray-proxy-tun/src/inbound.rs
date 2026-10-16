@@ -52,7 +52,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -240,6 +240,21 @@ const UDP_SESSION_IDLE_SECS: u64 = 60;
 /// 空闲清理扫描间隔（30s）——避开 1 分钟阈值，每两扫一次仍可容忍 ~90s。
 const UDP_SESSION_SWEEP_SECS: u64 = 30;
 
+/// 会话 cmd/reply channel 硬顶（票 euv9：原 unbounded 在会话死亡到 sweep 之间
+/// 入队无上界，恶意/异常流量下内存无上界）。
+///
+/// cap 推导：sweep 最长滞留窗 = `UDP_SESSION_IDLE_SECS` 60s；单会话正常包率
+/// 量级为 DNS/QUIC ≤ 10pps，取 2× 余量 ~17pps → 60s×17 ≈ 1020 → cap 1024。
+/// 正常流量到不了顶；触顶即丢包（UDP 语义允许）。内存上界 ≈ 1024×(1500B
+/// MTU + dest/帧头 ~100B) ≈ 1.6MB/channel，双 channel ~3.3MB/会话——对比
+/// unbounded 的"无上界"为质变，且 owner task 正常消费速率远高于此。
+const UDP_SESSION_QUEUE_CAP: usize = 1024;
+
+/// cmd 队列满丢包计数（进程级累计，票 euv9；运维观测 + 单测断言）。
+static UDP_CMD_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// reply 队列满丢包计数（进程级累计，票 euv9）。
+static UDP_REPLY_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 /// per-source UDP session 存储（full-cone NAT，key = IP+UDP 源端点）。
 ///
 /// 对应 Go `proxy/tun/udp_fullcone.go:31` 的 `udpConns map[net.Destination]*udpConn`：
@@ -257,7 +272,8 @@ type UdpSessions = Arc<ParkMutex<HashMap<IpEndpoint, Arc<UdpSessionEntry>>>>;
 /// 30s 检查一次，超过 60s 未活动则淘汰。
 struct UdpSessionEntry {
     /// 客户端包入队口（非阻塞；owner task 顺序消费转发 outbound）。
-    cmd_tx: mpsc::UnboundedSender<SessionCmd>,
+    /// 票 euv9：bounded——满时由 [`try_enqueue_cmd`] 丢包计数，内存有硬顶。
+    cmd_tx: mpsc::Sender<SessionCmd>,
     /// 最近一次命中的 wall-clock 纳秒（std::time::SystemTime 测得）。
     /// sweep 任务对比 `now - last_used > 60s` 决定淘汰。
     last_used_nanos: AtomicI64,
@@ -267,6 +283,41 @@ struct UdpSessionEntry {
 enum SessionCmd {
     /// 转发一个客户端数据报到 outbound。
     Send { dest: Destination, payload: Bytes },
+}
+
+/// 票 euv9：非阻塞入队客户端包。队列满 → 丢包 + [`UDP_CMD_DROPPED_TOTAL`]
+/// 递增 + debug 日志（防日志洪水）；channel 关闭（owner task 已被 sweep
+/// 回收）→ 静默丢弃，与原 `let _ = send` 行为一致。
+fn try_enqueue_cmd(tx: &mpsc::Sender<SessionCmd>, cmd: SessionCmd) {
+    if let Err(e) = tx.try_send(cmd) {
+        UDP_CMD_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        if let mpsc::error::TrySendError::Full(_) = e {
+            tracing::debug!("tun udp: cmd queue full, packet dropped");
+        }
+    }
+}
+
+/// [`try_enqueue_cmd`] 对应的 reply 侧入队结果。
+enum ReplyEnqueue {
+    Enqueued,
+    /// 队列满已丢包（[`UDP_REPLY_DROPPED_TOTAL`] 已递增）。
+    Dropped,
+    /// 写回端已退出（device 失败）。
+    Closed,
+}
+
+/// 票 euv9：非阻塞入队回包。队列满 → 丢包 + 计数 + debug 日志；关闭由
+/// 调用方（[`run_udp_session`]）终结会话，与原 `is_err() → return` 行为一致。
+fn try_enqueue_reply(tx: &mpsc::Sender<Vec<u8>>, reply: Vec<u8>) -> ReplyEnqueue {
+    match tx.try_send(reply) {
+        Ok(()) => ReplyEnqueue::Enqueued,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            UDP_REPLY_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!("tun udp: reply queue full, packet dropped");
+            ReplyEnqueue::Dropped
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => ReplyEnqueue::Closed,
+    }
 }
 
 async fn tun_driver_loop(
@@ -450,7 +501,7 @@ fn handle_udp_packet(
         let mut map = sessions.lock();
         map.entry(meta.src)
             .or_insert_with(|| {
-                let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+                let (cmd_tx, cmd_rx) = mpsc::channel(UDP_SESSION_QUEUE_CAP);
                 spawn_udp_session_task(
                     Arc::clone(&dispatch),
                     cmd_rx,
@@ -471,7 +522,10 @@ fn handle_udp_packet(
         tracing::warn!(src = %meta.src, dst = %meta.dst, "udp: invalid destination, dropping");
         return;
     };
-    let _ = entry.cmd_tx.send(SessionCmd::Send { dest, payload: Bytes::copy_from_slice(payload) });
+    try_enqueue_cmd(
+        &entry.cmd_tx,
+        SessionCmd::Send { dest, payload: Bytes::copy_from_slice(payload) },
+    );
 }
 
 /// 当前 wall-clock 纳秒（SystemTime → UNIX_EPOCH 偏移）。用作 session
@@ -554,12 +608,14 @@ fn address_to_smoltcp(addr: &Address) -> Option<smoltcp::wire::IpAddress> {
 /// TUN；写回端退出（device 失败）时 abort 会话 task，session drop 关闭 duplex。
 fn spawn_udp_session_task(
     dispatch: Arc<dyn DispatchHandler>,
-    cmd_rx: mpsc::UnboundedReceiver<SessionCmd>,
+    cmd_rx: mpsc::Receiver<SessionCmd>,
     device: Arc<TunDevice>,
     original_src: IpEndpoint,
     original_dst: IpEndpoint,
 ) {
-    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
+    // 票 euv9：reply 侧同样 bounded（下行响应由 owner task 产出、写回 task
+    // 消费，device.send 慢时积压），满时丢包计数——见 [`try_enqueue_reply`]。
+    let (reply_tx, mut reply_rx) = mpsc::channel::<Vec<u8>>(UDP_SESSION_QUEUE_CAP);
     let session =
         tokio::spawn(run_udp_session(dispatch, cmd_rx, reply_tx, original_src, original_dst));
     tokio::spawn(async move {
@@ -581,8 +637,8 @@ fn spawn_udp_session_task(
 /// `Ok(None)`（outbound 关闭）或 Err → 返回。session drop → duplex 关闭。
 async fn run_udp_session(
     dispatch: Arc<dyn DispatchHandler>,
-    mut cmd_rx: mpsc::UnboundedReceiver<SessionCmd>,
-    reply_tx: mpsc::UnboundedSender<Vec<u8>>,
+    mut cmd_rx: mpsc::Receiver<SessionCmd>,
+    reply_tx: mpsc::Sender<Vec<u8>>,
     original_src: IpEndpoint,
     original_dst: IpEndpoint,
 ) {
@@ -616,7 +672,7 @@ async fn run_udp_session(
                         original_src.port,
                         &payload,
                     );
-                    if reply_tx.send(reply).is_err() {
+                    if matches!(try_enqueue_reply(&reply_tx, reply), ReplyEnqueue::Closed) {
                         return; // 写回端已退出（device 失败）
                     }
                 }
@@ -1289,8 +1345,8 @@ mod tests {
         );
 
         // idle entry 绑定一个真实 owner task，验证回收闭环
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let (reply_tx, _reply_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel(UDP_SESSION_QUEUE_CAP);
+        let (reply_tx, _reply_rx) = mpsc::channel(UDP_SESSION_QUEUE_CAP);
         let owner = tokio::spawn(run_udp_session(
             Arc::clone(&dispatch),
             cmd_rx,
@@ -1301,7 +1357,7 @@ mod tests {
                 53,
             ),
         ));
-        let (cmd_tx_new, _cmd_rx_new) = mpsc::unbounded_channel();
+        let (cmd_tx_new, _cmd_rx_new) = mpsc::channel(UDP_SESSION_QUEUE_CAP);
         {
             let mut m = sessions.lock();
             m.insert(
@@ -1393,17 +1449,18 @@ mod tests {
         );
         let dest = ip_endpoint_to_udp_destination(&dst).expect("udp dest");
 
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let (reply_tx, _reply_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel(UDP_SESSION_QUEUE_CAP);
+        let (reply_tx, _reply_rx) = mpsc::channel(UDP_SESSION_QUEUE_CAP);
         let _owner = tokio::spawn(run_udp_session(dispatch, cmd_rx, reply_tx, src, dst));
 
         let payload = bytes::Bytes::from(vec![0xABu8; 100]);
         cmd_tx
             .send(SessionCmd::Send { dest: dest.clone(), payload: payload.clone() })
+            .await
             .expect("send pkt1");
         // 等首包 establish link 后再发第二包
         tokio::time::sleep(Duration::from_millis(50)).await;
-        cmd_tx.send(SessionCmd::Send { dest, payload }).expect("send pkt2");
+        cmd_tx.send(SessionCmd::Send { dest, payload }).await.expect("send pkt2");
 
         // 两帧合计保守下限：2 × (2B len + 100B payload) = 204；XUDP 帧头
         // （meta 序列化）远小于 payload，单帧不可能达到 204。
@@ -1599,5 +1656,35 @@ mod tests {
             "deadlock suspected: relay→socket data never reached TX within 5s"
         );
         driver.await.expect("driver task join");
+    }
+
+    /// 票 euv9：cmd 队列满载时入队必须同步返回（try_send 不 await 不挂起）
+    /// 且丢包计数递增——内存硬顶的行为契约。
+    #[test]
+    fn full_cmd_queue_drops_without_blocking_and_counts() {
+        let before = UDP_CMD_DROPPED_TOTAL.load(Ordering::Relaxed);
+        let dst = smoltcp::wire::IpEndpoint::new(
+            smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(8, 8, 8, 8)),
+            53,
+        );
+        let dest = ip_endpoint_to_udp_destination(&dst).expect("udp dest");
+        let (tx, _rx) = mpsc::channel::<SessionCmd>(1);
+        try_enqueue_cmd(&tx, SessionCmd::Send { dest: dest.clone(), payload: Bytes::from_static(b"x") });
+        // 队列已满：同步函数直接返回即"不阻塞"证明；第二包被丢弃且计数 +1。
+        try_enqueue_cmd(&tx, SessionCmd::Send { dest, payload: Bytes::from_static(b"y") });
+        assert_eq!(UDP_CMD_DROPPED_TOTAL.load(Ordering::Relaxed), before + 1);
+    }
+
+    /// 票 euv9：reply 队列满载 → 丢包计数 +1；写回端 drop 后报 Closed
+    /// （owner task 据此终结会话，保持原回收语义）。
+    #[test]
+    fn full_reply_queue_drops_and_closed_is_reported() {
+        let before = UDP_REPLY_DROPPED_TOTAL.load(Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(1);
+        assert!(matches!(try_enqueue_reply(&tx, vec![1]), ReplyEnqueue::Enqueued));
+        assert!(matches!(try_enqueue_reply(&tx, vec![2]), ReplyEnqueue::Dropped));
+        assert_eq!(UDP_REPLY_DROPPED_TOTAL.load(Ordering::Relaxed), before + 1);
+        drop(rx);
+        assert!(matches!(try_enqueue_reply(&tx, vec![3]), ReplyEnqueue::Closed));
     }
 }

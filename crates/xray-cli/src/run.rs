@@ -134,6 +134,7 @@ pub async fn execute(args: RunArgs) -> Result<()> {
     // tracing 日志与 Go loglevel 单一事实源对齐；未配 log 节时默认 warn，
     // 对齐 Go infra/conf/log.go 默认 Warning（此前固定 "info" 绕过 loglevel）。
     init_tracing(loglevel_directive(&config));
+    xray_common::runtime_guard::log_runtime_snapshot("startup");
 
     // 91vi：`--unix` 启动期校验。splithttp UDS 监听尚未贯通 (M3B 域
     // xray-transport-splithttp transport.rs UDS listener 仍在开发)。
