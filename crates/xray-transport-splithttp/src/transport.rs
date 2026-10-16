@@ -51,6 +51,16 @@ const DUPLEX_BUF: usize = 64 * 1024;
 /// 传输，故按 I/O 进度滚动续期——静默连接最迟 30s 强杀释放，活跃连接不受限。
 const SERVE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// h2 连接级 keep-alive PING 间隔（服务端/客户端同值）。
+///
+/// 客户端对齐 Go `common/net/net.go:20` `ChromeH2KeepAlivePeriod = 45s`
+/// （http2.Transport ReadIdleTimeout 缺省，dialer.go http2 分支）；服务端 Go
+/// http.Server 无对应配置，hyper server http2 Builder 显式取同值。连接层 PING
+/// 是对抗 NAT/中间盒空闲回收的官方手段（librarian 调研
+/// reports/research-go-xhttp-padding-20261016.md），in-band body 填充方案已被
+/// 上游两次拒绝（#6422/#6755），勿再引入。
+pub(crate) const H2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(45);
+
 /// SplitHTTP 监听入口（listener registry 注册的目标）。
 ///
 /// 镜像 Go `ListenXH`：isH3（alpn==["h3"]）走 QUIC，其余走 TCP + TLS/REALITY 包装。
@@ -316,6 +326,10 @@ where
         builder
             .http2()
             .timer(hyper_util::rt::TokioTimer::new())
+            // h2 连接级 keep-alive PING（Go ChromeH2KeepAlivePeriod=45s 同值）：
+            // 双向对抗 NAT/中间盒空闲回收——CDN 100s idle 切断（#6554 场景）时，
+            // 45s 周期 PING 维持连接活跃度。keep_alive_timeout 取 hyper 默认 20s。
+            .keep_alive_interval(H2_KEEP_ALIVE_INTERVAL)
             // hyper h2 每流发送缓冲默认 400KB（DEFAULT_MAX_SEND_BUF_SIZE）——发送速率
             // 被钉在 min(send_buf, 客户端窗口)/RTT：400KB 时代高 BDP 路径钉 2.7MB/s；
             // 4MB 时代 min(4MB, Go 客户端 4MB)/0.45s≈8.8MB/s（bd enc8x 窗钉模型三组
@@ -860,6 +874,20 @@ mod tests {
     };
 
     use super::*;
+
+    /// 服务端 h2 keep-alive PING 接线（wp9o 形态：hyper server http2 Builder
+    /// 无配置 getter——断言常量值 + setter 链可调用；不 serve）。
+    #[test]
+    fn h2_keep_alive_wired_at_45s() {
+        assert_eq!(H2_KEEP_ALIVE_INTERVAL, Duration::from_secs(45));
+        let mut builder =
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+        let _h2 = builder
+            .http2()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .keep_alive_interval(H2_KEEP_ALIVE_INTERVAL);
+    }
+
     fn ensure_provider() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
