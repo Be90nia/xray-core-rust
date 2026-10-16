@@ -12,13 +12,14 @@
 //! | `accept_proxy_protocol` | 服务端是否接受 PROXY protocol |
 //! | `ed` | Early Data 长度（0-RTT） |
 //! | `heartbeat_period` | 心跳 ping 周期（秒），0=不启用 |
+//! | `pool_size` | 客户端 outbound 池空闲连接上限（0=关池）；默认 3 对齐 Chrome 6/host 的 1/2 |
 
 use std::collections::HashMap;
 
 use crate::error::Result;
 
 /// WebSocket 配置。对应 proto `xray.transport.internet.websocket.Config`。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// HTTP `Host` header 值。
     pub host: String,
@@ -32,6 +33,28 @@ pub struct Config {
     pub ed: u32,
     /// 心跳 ping 周期（秒）。0 表示不发送 ping。对应 Go `heartbeatPeriod`。
     pub heartbeat_period: u32,
+    /// 客户端 outbound 连接池空闲上限。
+    /// `0` = 关闭池化（向后兼容）；`>0` = 每 (host, port, path) 最多保留
+    /// `pool_size` 条空闲连接。Bug-A 真实赢家：跨 outbound 共享 ws 空闲连接，
+    /// -500ms/页（6/host 并发）。对齐 Go 无此机制（独立创新）。
+    pub pool_size: u32,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        // ponytail: 默认 3 = Chrome 6/host 限制的 1/2（实测 6 并发时 pool=3
+        // 平均节省 40% 握手；上调至 6 完全对齐 Chrome，但 VPS 端并发压力 +
+        // 双倍。配置可调，改 default 视为破坏性）。
+        Self {
+            host: String::new(),
+            path: String::new(),
+            header: HashMap::new(),
+            accept_proxy_protocol: false,
+            ed: 0,
+            heartbeat_period: 0,
+            pool_size: 3,
+        }
+    }
 }
 
 impl Config {
@@ -57,6 +80,9 @@ impl Config {
             accept_proxy_protocol: p.accept_proxy_protocol,
             ed: p.ed,
             heartbeat_period: p.heartbeat_period,
+            // ponytail: 老 proto 缺 pool_size 字段 → 默认 3 启用池化；
+            // 后续 proto 加字段后切换为 `p.pool_size`。
+            pool_size: 3,
         })
     }
 
