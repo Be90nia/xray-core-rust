@@ -414,6 +414,17 @@ impl DefaultDialerClient {
             .http2_initial_stream_window_size(16 * 1024 * 1024)
             .http2_initial_connection_window_size(32 * 1024 * 1024)
             .http2_max_send_buf_size(16 * 1024 * 1024)
+            // h2 连接级 keep-alive PING：对齐 Go dialer.go http2 分支
+            // ReadIdleTimeout = ChromeH2KeepAlivePeriod 45s（net.go:20）；
+            // timeout 15s = Go http2.PingTimeout 缺省。对抗 CDN 100s idle 切断
+            // （#6554 场景）与 NAT 空闲回收。PING 依赖 timer（Time::Empty 会
+            // panic，hyper common/time.rs:37）——须配 .timer()（pool_timer 只管池）。
+            .timer(TokioTimer::new())
+            // while_idle(true)：病灶场景=纯上传期间 GET 连接纯空闲（下行无数据），
+            // hyper-util 缺省只对活跃连接 PING——空闲 GET 恰是最需要 PING 的连接。
+            .http2_keep_alive_while_idle(true)
+            .http2_keep_alive_interval(crate::transport::H2_KEEP_ALIVE_INTERVAL)
+            .http2_keep_alive_timeout(Duration::from_secs(15))
             .build(connector);
         Self { config, client, closed: Arc::new(AtomicBool::new(false)) }
     }
@@ -774,6 +785,17 @@ mod tests {
     // 这里仅放与 hyper-util 配置相关的轻量断言。
 
     use super::*;
+
+    /// h2 keep-alive PING 接线（wp9o 形态：hyper-util legacy Builder 无配置
+    /// getter——断言常量锚定 Go ChromeH2KeepAlivePeriod=45s（net.go:20）+
+    /// setter 链可调用；不 build 不拨号）。
+    #[test]
+    fn h2_keep_alive_wired_at_45s() {
+        assert_eq!(crate::transport::H2_KEEP_ALIVE_INTERVAL, Duration::from_secs(45));
+        let _builder = Client::builder(TokioExecutor::new())
+            .http2_keep_alive_interval(crate::transport::H2_KEEP_ALIVE_INTERVAL)
+            .http2_keep_alive_timeout(Duration::from_secs(15));
+    }
 
     #[test]
     fn build_request_basic_get() {
