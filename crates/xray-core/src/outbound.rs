@@ -2602,7 +2602,9 @@ async fn pump_tuic_udp(
                 if mb.is_empty() {
                     return Ok(()); // link EOF
                 }
-                accum.extend_from_slice(&mb.to_vec());
+                for b in mb.iter() {
+                    accum.extend_from_slice(b.bytes());
+                }
                 if accum.len() > 2 * 1024 * 1024 {
                     return Err("tuic udp accum exceeded 2MiB".to_string());
                 }

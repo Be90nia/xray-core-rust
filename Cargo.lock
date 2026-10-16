@@ -5870,6 +5870,7 @@ dependencies = [
  "xray-core",
  "xray-proto",
  "xray-tls",
+ "xray-transport-kcp",
 ]
 
 [[package]]

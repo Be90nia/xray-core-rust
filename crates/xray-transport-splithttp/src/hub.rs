@@ -213,9 +213,18 @@ impl HubListener {
                     }
                 });
                 // 自动协商 H1/H2：H2 preface 检测，回退到 H1
-                let builder = hyper_util::server::conn::auto::Builder::new(
+                let mut builder = hyper_util::server::conn::auto::Builder::new(
                     hyper_util::rt::TokioExecutor::new(),
                 );
+                // bd wz2b S2：与 transport.rs serve_http_conn 同款 h2 显式流控——
+                // 零设置时收窗 1MB/1MB + 每流 send 400KB 全量默认钉（R3 复核
+                // caller 全表：明面 listener 与 TLS 路径同构，只差 ALPN）。
+                builder
+                    .http2()
+                    .timer(hyper_util::rt::TokioTimer::new())
+                    .max_send_buf_size(16 * 1024 * 1024)
+                    .initial_stream_window_size(16 * 1024 * 1024)
+                    .initial_connection_window_size(32 * 1024 * 1024);
                 let _ = builder.serve_connection(io, svc).await;
             });
         }

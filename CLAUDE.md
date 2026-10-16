@@ -15,8 +15,8 @@
 ## 1. 5 分钟上手
 
 ```bash
-# 1. 构建（btls-sys 冷编坑——见 §6 踩坑）
-cmd /c "set BORING_BSSL_ASSUME_PATCHED=1&& set BORING_BSSL_SOURCE_PATH=D:\Project\Xray-core-rust\target\boringssl-patched&& cargo build --release -p xray-cli"
+# 1. 构建（btls-sys 冷编坑——见 §6 踩坑；PROTOC/LIBCLANG 缺任一即构建/测试链挂）
+cmd /c "set BORING_BSSL_ASSUME_PATCHED=1&& set BORING_BSSL_SOURCE_PATH=D:\Project\Xray-core-rust\target\boringssl-patched&& set PROTOC=D:/Project/tools/bin/protoc.exe&& set LIBCLANG_PATH=D:\Program Files\llvm\bin&& cargo build --release -p xray-cli"
 
 # 2. 测试（CI 9 宽门镜像）
 cargo test --workspace --all-targets

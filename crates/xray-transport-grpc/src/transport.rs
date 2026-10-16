@@ -149,10 +149,22 @@ where
     T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     // Go dial.go:174-176：initialWindowsSize → SETTINGS_INITIAL_WINDOW_SIZE。
+    // bd wz2b W3：裸 h2 缺省路径 SETTINGS 省略 0x4 → RFC 9113 缺省 65535（64KB）
+    // 生效，下载钉 64KB/RTT（RTT50ms 实测 0.9MB/s，verify/audit-r2-w2-ab D 组）；
+    // 连接窗/send buffer 同落 spec/h2 缺省（64KB/400KB）。0 值补缺省 16MB 流窗，
+    // 显式 initialWindowsSize>0 仍优先（选 builder 站点补缺省而非改 config 缺省
+    // 值：Config::default 语义不动，测试 fixture 的 65535 显式值不受影响）。
     let mut builder = client::Builder::new();
-    if cfg.initial_windows_size > 0 {
-        builder.initial_window_size(cfg.initial_windows_size as u32);
-    }
+    builder
+        .initial_window_size(if cfg.initial_windows_size > 0 {
+            cfg.initial_windows_size as u32
+        } else {
+            16 * 1024 * 1024
+        })
+        // h2 连接级窗目标缺省同 64KB（client.rs:1395-1399 doc）；send buffer h2 缺省
+        // 400KB 钉上行。16/32MB 与 splithttp dialer.rs 同批同值。
+        .initial_connection_window_size(32 * 1024 * 1024)
+        .max_send_buffer_size(16 * 1024 * 1024);
     let (mut send_req, mut h2_conn) = builder.handshake(conn).await.map_err(io_err)?;
     // Go dial.go:166-172 keepalive：idle_timeout 周期发 PING，health_check_timeout
     // 内未回 PONG 视为死链断连。h2 无内置 keepalive，用 ping_pong 手动泵驱动；
@@ -438,9 +450,25 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
     ka_timeout: u64,
     keepalive_enabled: bool,
 ) {
-    let mut h2_srv = match server::handshake(conn).await {
-        Ok(s) => s,
-        Err(_) => return,
+    // bd wz2b W3：server::handshake 直调 = 零 Builder 零设置 → 收流窗/连接窗落 RFC
+    // 9113 缺省 65535（全仓最狠钉：64KB/RTT@150ms≈0.43MB/s 上行）、每流 send buffer
+    // h2 缺省 400KB 钉下行。显式 Builder 16MB 流窗 + 32MB 连接窗 + 16MB send buffer。
+    let mut builder = server::Builder::new();
+    builder
+        .initial_window_size(16 * 1024 * 1024)
+        .initial_connection_window_size(32 * 1024 * 1024)
+        .max_send_buffer_size(16 * 1024 * 1024);
+    // bd lfeu：handshake 对发完 preface 即静默/hard-close 的对端无限等待
+    // （N-1 fd 泄漏族，同 724cc20 ws serve_h2_reject 30s 兜底形态）。
+    // 合法握手毫秒级完成，30s 仅覆盖慢链路重传窗。
+    let mut h2_srv = match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        builder.handshake::<_, Bytes>(conn),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        _ => return,
     };
     // H13：server keepalive ping（Go hub.go:86-93 ServerParameters → grpc-go
     // http2_server 每 Time 无活动发 ping、Timeout 内无 pong 断连）。

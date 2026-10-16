@@ -831,30 +831,24 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
                 0x01 => {},       // PING
                 0x02 | 0x03 => {
                     // ACK frame
-                    let _ = read_quic_varint(&decrypted[frame_offset..]);
                     frame_offset +=
                         read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
-                    let _ = read_quic_varint(&decrypted[frame_offset..]);
                     frame_offset +=
                         read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
                     let ack_range_count = read_quic_varint(&decrypted[frame_offset..]);
                     frame_offset += ack_range_count.map_or(0, |(_, l)| l);
-                    let _ = read_quic_varint(&decrypted[frame_offset..]);
                     frame_offset +=
                         read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
                     if let Some((count, _cl)) = ack_range_count {
                         for _ in 0..count {
-                            let _ = read_quic_varint(&decrypted[frame_offset..]);
                             frame_offset +=
                                 read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
-                            let _ = read_quic_varint(&decrypted[frame_offset..]);
                             frame_offset +=
                                 read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
                         }
                     }
                     if frame_type == 0x03 {
                         for _ in 0..3 {
-                            let _ = read_quic_varint(&decrypted[frame_offset..]);
                             frame_offset +=
                                 read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
                         }
@@ -890,10 +884,8 @@ fn sniff_quic(mut payload: &[u8]) -> Result<Option<Box<dyn SniffResult>>, SniffE
                 },
                 0x1c => {
                     // CONNECTION_CLOSE
-                    let _ = read_quic_varint(&decrypted[frame_offset..]);
                     frame_offset +=
                         read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
-                    let _ = read_quic_varint(&decrypted[frame_offset..]);
                     frame_offset +=
                         read_quic_varint(&decrypted[frame_offset..]).map_or(0, |(_, l)| l);
                     let (reason_len, vl) = read_quic_varint(&decrypted[frame_offset..])

@@ -77,7 +77,7 @@ pub use error::{KcpError, Result};
 pub use io::{KCPPacketReader, PacketReader};
 pub use listener::{ConnHandler, ConnectionId, Listener, ListenerWriter, UdpHub};
 pub use output::{RetryableWriter, SegmentWriter, SimpleSegmentWriter, UnderlyingWriter};
-pub use register::{register_dialer, register_listener};
+pub use register::{pinned_recv_loops, register_dialer, register_listener};
 pub use round_trip::RoundTripInfo;
 pub use segment::{
     AckSegment, CmdOnlySegment, Command, DATA_SEGMENT_OVERHEAD, DataSegment, Segment, SegmentKind,

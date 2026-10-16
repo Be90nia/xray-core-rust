@@ -47,6 +47,8 @@ pub struct AuthenticationReader<'a> {
     has_size: bool,
     done: bool,
     pending_data: Vec<u8>,
+    /// conn 级连续化 scratch：soft 拼接与精确读取共用，容量跨 chunk 流转
+    scratch: Vec<u8>,
 }
 
 impl<'a> AuthenticationReader<'a> {
@@ -70,6 +72,7 @@ impl<'a> AuthenticationReader<'a> {
             has_size: false,
             done: false,
             pending_data: Vec::new(),
+            scratch: Vec::new(),
         }
     }
 
@@ -104,51 +107,42 @@ impl<'a> AuthenticationReader<'a> {
         size: usize,
         padding: usize,
     ) -> Result<Buffer, ReadInternalError> {
-        let mut data = Vec::with_capacity(size);
-        if !self.pending_data.is_empty() {
-            let take = self.pending_data.len().min(size);
-            data.extend_from_slice(&self.pending_data[..take]);
-            self.pending_data.drain(..take);
-        }
-        while data.len() < size {
-            let remaining = size - data.len();
-            let mut buf = vec![0u8; remaining];
-            let n = self.reader.read(&mut buf).await;
-            if n == 0 {
-                return Err(ReadInternalError::Io(io::Error::ReadError(
-                    "insufficient bytes for chunk data".into(),
-                )));
-            }
-            data.extend_from_slice(&buf[..n]);
-        }
+        self.fill_scratch_exact(size, "insufficient bytes for chunk data").await?;
         let ciphertext_len = size - padding;
-        let decrypted =
-            self.auth.open(&mut [], &data[..ciphertext_len]).map_err(ReadInternalError::Crypto)?;
+        let decrypted = self
+            .auth
+            .open(&mut [], &self.scratch[..ciphertext_len])
+            .map_err(ReadInternalError::Crypto)?;
         Ok(Buffer::from_vec(decrypted))
     }
 
-    async fn read_exact_with_pending(&mut self, size: usize) -> Result<Vec<u8>, ReadInternalError> {
-        let mut data = Vec::with_capacity(size);
+    async fn read_exact_into(&mut self, size: usize) -> Result<(), ReadInternalError> {
+        self.fill_scratch_exact(size, "insufficient bytes for large chunk data").await
+    }
+
+    /// 把 `self.scratch` 恰好填满 `size` 字节：先消费 pending_data，再从 reader 补齐
+    /// （读直写 scratch 尾部，零中间缓冲）。
+    async fn fill_scratch_exact(
+        &mut self,
+        size: usize,
+        insufficient_msg: &'static str,
+    ) -> Result<(), ReadInternalError> {
+        self.scratch.clear();
         if !self.pending_data.is_empty() {
             let take = self.pending_data.len().min(size);
-            data.extend_from_slice(&self.pending_data[..take]);
+            self.scratch.extend_from_slice(&self.pending_data[..take]);
             self.pending_data.drain(..take);
-            if data.len() == size {
-                return Ok(data);
-            }
         }
-        while data.len() < size {
-            let remaining = size - data.len();
-            let mut buf = vec![0u8; remaining];
-            let n = self.reader.read(&mut buf).await;
+        while self.scratch.len() < size {
+            let filled = self.scratch.len();
+            self.scratch.resize(size, 0);
+            let n = self.reader.read(&mut self.scratch[filled..]).await;
             if n == 0 {
-                return Err(ReadInternalError::Io(io::Error::ReadError(
-                    "insufficient bytes for large chunk data".into(),
-                )));
+                return Err(ReadInternalError::Io(io::Error::ReadError(insufficient_msg.into())));
             }
-            data.extend_from_slice(&buf[..n]);
+            self.scratch.truncate(filled + n);
         }
-        Ok(data)
+        Ok(())
     }
 
     async fn read_internal(
@@ -170,19 +164,35 @@ impl<'a> AuthenticationReader<'a> {
         if soft {
             match self.reader.read_at_most(size_usize).await {
                 Ok(chunk_mb) => {
-                    let chunk_data = chunk_mb.to_vec();
-                    if chunk_data.len() < size_usize {
+                    if chunk_mb.len() < size_usize {
+                        // 短读：残余进 pending_data。不变量：进入 soft 路径时 pending
+                        // 必空（非 soft 路径全量 drain），clear+extend 与替换语义等价
                         self.cached_size = size;
                         self.cached_padding = padding;
                         self.has_size = true;
-                        self.pending_data = chunk_data;
+                        self.pending_data.clear();
+                        for b in chunk_mb.iter() {
+                            self.pending_data.extend_from_slice(b.bytes());
+                        }
                         return Err(ReadInternalError::Soft);
                     }
                     let ciphertext_len = size_usize - padding_usize;
-                    let decrypted = self
-                        .auth
-                        .open(&mut [], &chunk_data[..ciphertext_len])
-                        .map_err(ReadInternalError::Crypto)?;
+                    // AEAD 需连续字节：单 buffer 零拷贝直借；跨 buffer 用 conn 级
+                    // scratch 拼连续（78c613cc out-param 范式，容量跨 chunk 流转）
+                    let decrypted = if chunk_mb.buffer_count() == 1 {
+                        let bytes = chunk_mb.iter().next().map(|b| b.bytes()).unwrap_or(&[]);
+                        self.auth
+                            .open(&mut [], &bytes[..ciphertext_len])
+                            .map_err(ReadInternalError::Crypto)?
+                    } else {
+                        self.scratch.clear();
+                        for b in chunk_mb.iter() {
+                            self.scratch.extend_from_slice(b.bytes());
+                        }
+                        self.auth
+                            .open(&mut [], &self.scratch[..ciphertext_len])
+                            .map_err(ReadInternalError::Crypto)?
+                    };
                     if size_usize <= DEFAULT_SIZE {
                         mb.push(Buffer::from_vec(decrypted));
                     } else {
@@ -205,11 +215,11 @@ impl<'a> AuthenticationReader<'a> {
             let buf = self.read_buffer(size_usize, padding_usize).await?;
             mb.push(buf);
         } else {
-            let data = self.read_exact_with_pending(size_usize).await?;
+            self.read_exact_into(size_usize).await?;
             let ciphertext_len = size_usize - padding_usize;
             let decrypted = self
                 .auth
-                .open(&mut [], &data[..ciphertext_len])
+                .open(&mut [], &self.scratch[..ciphertext_len])
                 .map_err(ReadInternalError::Crypto)?;
             mb.merge_bytes(&decrypted);
         }
@@ -528,5 +538,75 @@ mod tests {
         assert_eq!(mb.to_vec(), data);
         let result = ar.read_multi_buffer().await;
         assert!(matches!(result.unwrap_err(), io::Error::Eof));
+    }
+
+    // Test 13: soft 短读跨调用补齐 + 多 buffer chunk 拼接（scratch 化行为对拍：
+    // 同输入下输出与改造前一致——pending 残余不丢、明文逐位等于原始输入）
+    struct PrebuiltReader {
+        parts: Vec<MultiBuffer>,
+        idx: usize,
+    }
+
+    impl io::Reader for PrebuiltReader {
+        fn read_multi_buffer(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = io::Result<MultiBuffer>> + Send + '_>> {
+            Box::pin(async move {
+                if self.idx >= self.parts.len() {
+                    return Err(io::Error::Eof);
+                }
+                let mb = std::mem::replace(&mut self.parts[self.idx], MultiBuffer::new());
+                self.idx += 1;
+                Ok(mb)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_soft_short_read_pending_cross_call() {
+        let (auth_s, auth_o) = make_auth_pair();
+        // 逐 chunk 独立 write：write_stream 会把同一 MultiBuffer 按 payload_size
+        // 切片密封（小明文合并成单 chunk），无法构造两个独立 wire chunk
+        let mut vw = VecWriter::new();
+        {
+            let mut aw = crate::auth_writer::AuthenticationWriter::new(
+                auth_s,
+                &mut vw,
+                Box::new(PlainChunkSizeParser),
+                TransferType::Stream,
+                Box::new(NoPadding),
+            );
+            for chunk in [&b"AAA"[..], &b"BBBBBB"[..]] {
+                let mut mb = MultiBuffer::new();
+                mb.push(Buffer::from_vec(chunk.to_vec()));
+                aw.write_multi_buffer(mb).await.unwrap();
+            }
+        }
+        let encrypted = vw.data;
+        // NoPadding 帧格式：size(2B) + ciphertext(payload+tag16)
+        let (c1, c2) = encrypted.split_at(2 + 3 + 16);
+        let half = c2.len() / 2;
+        // chunk2 交付序列：前半（含 size header，触发 soft 短读 → pending）→
+        // 后半拆两个 buffer（触发跨 buffer scratch 拼接路径）
+        let mut mb1 = MultiBuffer::new();
+        mb1.push(Buffer::from_vec(c1.to_vec()));
+        let mut mb2a = MultiBuffer::new();
+        mb2a.push(Buffer::from_vec(c2[..half].to_vec()));
+        let mid = half + (c2.len() - half) / 2;
+        let mut mb2b = MultiBuffer::new();
+        mb2b.push(Buffer::from_vec(c2[half..mid].to_vec()));
+        mb2b.push(Buffer::from_vec(c2[mid..].to_vec()));
+        let reader: Box<dyn Reader> =
+            Box::new(PrebuiltReader { parts: vec![mb1, mb2a, mb2b], idx: 0 });
+        let mut br = BufferedReader::new(reader);
+        let mut ar = make_auth_reader(auth_o, &mut br, TransferType::Stream);
+
+        let r1 = ar.read_multi_buffer().await.unwrap();
+        assert_eq!(r1.to_vec(), b"AAA", "chunk1 正常解密；chunk2 短读后中断");
+        let r2 = ar.read_multi_buffer().await.unwrap();
+        assert_eq!(r2.to_vec(), b"BBBBBB", "pending 残余 + 后续分片补齐解密");
+        // 流尽后第 3 次调用必须报错；错误型受既有 has_size 缓存语义影响
+        // （read_size 走捷径不触流 → read_buffer 读 0 → insufficient），改造前后一致
+        assert!(ar.read_multi_buffer().await.is_err(), "流尽后必须报错");
     }
 }

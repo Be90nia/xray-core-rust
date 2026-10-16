@@ -334,27 +334,8 @@ where
         queue.close().await;
     });
 
-    // H3c：服务端 X 填充流（Go hub.go:219-232——Referer 非空或 obfs padding 被
-    // 接受时，每 `scStreamUpServerSecs.rand()` 秒向下行写 `rand()` 个 'X'）。
-    // 无填充条件时 tx 立即 drop → body 空流（行为同旧实现）。
-    let sc_secs = ctx.config.normalized_sc_stream_up_server_secs();
-    let (tx, rx) = tokio::sync::mpsc::channel::<io::Result<Frame<Bytes>>>(4);
-    if (has_referer || obfs_padding_accepted) && sc_secs.to > 0 {
-        let range = ctx.config.get_normalized_x_padding_bytes();
-        tokio::spawn(async move {
-            loop {
-                let n = range.rand().max(0) as usize;
-                if tx.send(Ok(Frame::data(Bytes::from(vec![b'X'; n])))).await.is_err() {
-                    break;
-                }
-                let secs = sc_secs.rand();
-                if secs > 0 {
-                    tokio::time::sleep(std::time::Duration::from_secs(secs as u64)).await;
-                }
-            }
-        });
-    }
-    let fill_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    // H3c：服务端 X 填充流（Go hub.go:219-232）。条件不满足时为空流（行为同旧实现）。
+    let fill_stream = spawn_x_padding_stream(ctx, has_referer, obfs_padding_accepted);
     let body = StreamBody::new(fill_stream).boxed();
 
     let mut resp = Response::builder()
@@ -448,6 +429,34 @@ where
 }
 
 // ===== 辅助函数 =====
+
+/// X 填充 keepalive 流（Go hub.go:219-232）：Referer 非空或 obfs padding 被接受
+/// 且 scStreamUpServerSecs 上界 > 0 时，每 `rand()` 秒产出 `rand()` 个 'X'；
+/// 条件不满足时 tx 立即 drop → 空流（stream-up 响应 body 专用）。
+fn spawn_x_padding_stream(
+    ctx: &HandlerContext,
+    has_referer: bool,
+    obfs_padding_accepted: bool,
+) -> tokio_stream::wrappers::ReceiverStream<io::Result<Frame<Bytes>>> {
+    let sc_secs = ctx.config.normalized_sc_stream_up_server_secs();
+    let (tx, rx) = tokio::sync::mpsc::channel::<io::Result<Frame<Bytes>>>(4);
+    if (has_referer || obfs_padding_accepted) && sc_secs.to > 0 {
+        let range = ctx.config.get_normalized_x_padding_bytes();
+        tokio::spawn(async move {
+            loop {
+                let n = range.rand().max(0) as usize;
+                if tx.send(Ok(Frame::data(Bytes::from(vec![b'X'; n])))).await.is_err() {
+                    break;
+                }
+                let secs = sc_secs.rand();
+                if secs > 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(secs as u64)).await;
+                }
+            }
+        });
+    }
+    tokio_stream::wrappers::ReceiverStream::new(rx)
+}
 
 /// UploadQueue → AsyncWrite（duplex 管道写端）。
 async fn forward_queue_to_writer(
@@ -904,6 +913,10 @@ mod tests {
         }
     }
 
+    fn make_ctx_with_config(config: Config) -> HandlerContext {
+        HandlerContext { config: Arc::new(config), ..make_ctx("") }
+    }
+
     fn plain_request(
         method: Method,
         uri: &str,
@@ -1056,5 +1069,51 @@ mod tests {
             ctx.sessions.get("sess-ikzy").await.is_none(),
             "GET body drop must remove session immediately (Go hub.go:352-353 defer)"
         );
+    }
+
+    /// stream-up 填充回归（Go hub.go:219-232）：条件满足（has_referer）时响应
+    /// body 持续收到 X keepalive 字节——1..=1 配置下首帧即达、次帧 ~1s。
+    #[tokio::test]
+    async fn stream_up_sends_x_padding_keepalive() {
+        use crate::config::RangeConfig;
+        let mut config = Config::default();
+        config.x_padding_bytes = Some(RangeConfig::new(1, 1));
+        config.sc_stream_up_server_secs = Some(RangeConfig::new(1, 1));
+        let ctx = make_ctx_with_config(config);
+
+        let req = Request::builder().method(Method::POST).body(Full::new(Bytes::new())).unwrap();
+        let resp = handle_stream_up(req, "sess-keepalive", &ctx, true, false).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 填充 task 先发后睡（1..=1）：首帧即达，次帧在 ~1s 后——两帧均须为 'X'。
+        let mut body = resp.into_body();
+        for i in 0..2 {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), body.frame())
+                .await
+                .unwrap_or_else(|_| panic!("keepalive frame {i} must arrive within 5s"))
+                .expect("body stream must not end while keepalive task alive")
+                .expect("frame io ok");
+            let data = frame.into_data().expect("frame must carry data");
+            assert_eq!(data.as_ref(), b"X", "keepalive byte must be 'X' (1..=1 range)");
+        }
+    }
+
+    /// stream-up 填充对照：条件不满足（无 Referer 无 obfs）时 body 为空流
+    /// （tx 立即 drop → EOF），无任何填充帧。
+    #[tokio::test]
+    async fn stream_up_without_padding_conditions_stays_silent() {
+        use crate::config::RangeConfig;
+        let mut config = Config::default();
+        config.x_padding_bytes = Some(RangeConfig::new(1, 1));
+        config.sc_stream_up_server_secs = Some(RangeConfig::new(1, 1));
+        let ctx = make_ctx_with_config(config);
+
+        let req = Request::builder().method(Method::POST).body(Full::new(Bytes::new())).unwrap();
+        let resp = handle_stream_up(req, "sess-silent", &ctx, false, false).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut body = resp.into_body();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(3), body.frame()).await;
+        assert!(matches!(frame, Ok(None)), "empty stream must EOF without frames, got {frame:?}");
     }
 }

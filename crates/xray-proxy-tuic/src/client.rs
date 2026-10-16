@@ -294,6 +294,8 @@ impl TuicClient {
         ));
         let mut transport = quinn::TransportConfig::default();
         transport.datagram_receive_buffer_size(Some(8 * 1024));
+        // bd wp9o：quinn 缺省 1.25MB 流收窗高 BDP 钉——显式 16MB 流窗 + 32MB 连接窗。
+        apply_default_windows(&mut transport);
         apply_congestion_to_transport(&mut transport, congestion_control, brutal_up_bps);
         let mut quinn_client_cfg = quinn_client_cfg;
         quinn_client_cfg.transport_config(Arc::new(transport));
@@ -459,6 +461,24 @@ pub(crate) fn apply_congestion_to_transport(
     }
 }
 
+/// 缺省流接收窗（bd wp9o：quinn 缺省流收窗 1.25MB STREAM_RWND 高 BDP 钉——
+/// wz2b W4 窗钉族、QUIC 族最后缺口；与 quic-h3 缺省同值，见
+/// xray-transport-quic config.rs::build_transport_config）。
+const DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 16 * 1024 * 1024;
+/// 缺省连接接收窗（与 quic-h3 同值）。
+const DEFAULT_CONNECTION_RECEIVE_WINDOW: u64 = 32 * 1024 * 1024;
+
+/// 显式设置 quinn 流控窗（bd wp9o）。TUIC 协议不承载 quicSettings 显式窗字段，
+/// inbound/outbound 统一走 16MB 流窗 + 32MB 连接窗（quic-h3 缺省对齐）。
+pub(crate) fn apply_default_windows(transport: &mut quinn::TransportConfig) {
+    if let Ok(v) = quinn::VarInt::try_from(DEFAULT_STREAM_RECEIVE_WINDOW) {
+        transport.stream_receive_window(v);
+    }
+    if let Ok(v) = quinn::VarInt::try_from(DEFAULT_CONNECTION_RECEIVE_WINDOW) {
+        transport.receive_window(v);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -541,5 +561,23 @@ mod tests {
                 "{cc:?} must keep the quinn built-in factory"
             );
         }
+    }
+
+    /// bd wp9o：inbound/outbound transport 必须显式 16MB 流窗 + 32MB 连接窗
+    /// （quic-h3 config.rs 同款缺省；quinn 缺省 1.25MB 流窗高 BDP 钉）。
+    /// quinn TransportConfig 无 getter，经手写 Debug 的字段值断言。
+    #[test]
+    fn default_windows_applied_to_transport() {
+        let mut t = quinn::TransportConfig::default();
+        apply_default_windows(&mut t);
+        let dbg = format!("{t:?}");
+        assert!(
+            dbg.contains("stream_receive_window: 16777216"),
+            "stream window must be 16MB (wz2b W4 family), got: {dbg}"
+        );
+        assert!(
+            dbg.contains("receive_window: 33554432"),
+            "connection window must be 32MB, got: {dbg}"
+        );
     }
 }
