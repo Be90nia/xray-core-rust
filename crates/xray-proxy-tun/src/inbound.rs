@@ -315,7 +315,7 @@ fn try_enqueue_reply(tx: &mpsc::Sender<Vec<u8>>, reply: Vec<u8>) -> ReplyEnqueue
             UDP_REPLY_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
             tracing::debug!("tun udp: reply queue full, packet dropped");
             ReplyEnqueue::Dropped
-        }
+        },
         Err(mpsc::error::TrySendError::Closed(_)) => ReplyEnqueue::Closed,
     }
 }
@@ -1669,7 +1669,10 @@ mod tests {
         );
         let dest = ip_endpoint_to_udp_destination(&dst).expect("udp dest");
         let (tx, _rx) = mpsc::channel::<SessionCmd>(1);
-        try_enqueue_cmd(&tx, SessionCmd::Send { dest: dest.clone(), payload: Bytes::from_static(b"x") });
+        try_enqueue_cmd(
+            &tx,
+            SessionCmd::Send { dest: dest.clone(), payload: Bytes::from_static(b"x") },
+        );
         // 队列已满：同步函数直接返回即"不阻塞"证明；第二包被丢弃且计数 +1。
         try_enqueue_cmd(&tx, SessionCmd::Send { dest, payload: Bytes::from_static(b"y") });
         assert_eq!(UDP_CMD_DROPPED_TOTAL.load(Ordering::Relaxed), before + 1);
