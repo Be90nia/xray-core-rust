@@ -12,8 +12,7 @@
 //!
 //! ## 业界对照
 //!
-//! - Go xray-core v26.9.9：**无 ws 客户端连接池**（仅 vless testpre 协议级）——
-//!   本仓独立创新空间。
+//! - Go xray-core v26.9.9：**无 ws 客户端连接池**（仅 vless testpre 协议级）—— 本仓独立创新空间。
 //! - nginx upstream keepalive / envoy ws filter：按 upstream:port 复用连接。
 //!
 //! ## Go 兼容生死线
@@ -45,11 +44,11 @@ use xray_transport::connection::Connection;
 /// 池 key：决定两条 outbound 拨号能否复用同一条 ws 连接。
 ///
 /// 必须匹配：TCP 目标（host+port）/ WS 升级路径（path）/ TLS 校验 SNI
-///（tls_server_name）/ TLS 握手指纹（fingerprint）。任一不同 = 不能复用
-///（TLS 握手阶段已不同 / WS upgrade path 不同 / ServerName 校验不同）。
+/// （tls_server_name）/ TLS 握手指纹（fingerprint）。任一不同 = 不能复用
+/// （TLS 握手阶段已不同 / WS upgrade path 不同 / ServerName 校验不同）。
 ///
 /// ponytail: 用户自定义 header 不入 key——Go header Xray 的 server 通常不校验
-///（实测 CF/CDN 不拒绝带多余 header 的复用连接）；ed/heartbeat 是 per-call 配置
+/// （实测 CF/CDN 不拒绝带多余 header 的复用连接）；ed/heartbeat 是 per-call 配置
 /// 不影响 conn 复用。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PoolKey {
@@ -111,10 +110,7 @@ pub struct WsPoolConfig {
 
 impl Default for WsPoolConfig {
     fn default() -> Self {
-        Self {
-            max_idle_per_key: 3,
-            max_idle_duration: Duration::from_secs(30),
-        }
+        Self { max_idle_per_key: 3, max_idle_duration: Duration::from_secs(30) }
     }
 }
 
@@ -256,11 +252,7 @@ impl PooledConn {
     }
 
     /// 从池取出的 conn + 池信息（Drop 时归还）。
-    pub fn from_pool(
-        conn: Box<dyn Connection>,
-        pool: Arc<WsConnectionPool>,
-        key: PoolKey,
-    ) -> Self {
+    pub fn from_pool(conn: Box<dyn Connection>, pool: Arc<WsConnectionPool>, key: PoolKey) -> Self {
         Self { inner: Some(conn), pool_release: Some((pool, key)) }
     }
 
@@ -297,18 +289,12 @@ impl AsyncWrite for PooledConn {
         Pin::new(inner).poll_write(cx, buf)
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let inner = self.inner.as_mut().expect("conn taken by Drop");
         Pin::new(inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let inner = self.inner.as_mut().expect("conn taken by Drop");
         Pin::new(inner).poll_shutdown(cx)
     }
@@ -368,10 +354,8 @@ mod tests {
 
     #[tokio::test]
     async fn pool_disabled_returns_none() {
-        let pool = WsConnectionPool::new(WsPoolConfig {
-            max_idle_per_key: 0,
-            ..WsPoolConfig::default()
-        });
+        let pool =
+            WsConnectionPool::new(WsPoolConfig { max_idle_per_key: 0, ..WsPoolConfig::default() });
         pool.release(key1(), mock_conn()).await;
         assert!(pool.try_acquire(&key1()).await.is_none());
     }
@@ -388,10 +372,8 @@ mod tests {
 
     #[tokio::test]
     async fn pool_full_drops_excess() {
-        let pool = WsConnectionPool::new(WsPoolConfig {
-            max_idle_per_key: 2,
-            ..WsPoolConfig::default()
-        });
+        let pool =
+            WsConnectionPool::new(WsPoolConfig { max_idle_per_key: 2, ..WsPoolConfig::default() });
         for _ in 0..5 {
             pool.release(key1(), mock_conn()).await;
         }
