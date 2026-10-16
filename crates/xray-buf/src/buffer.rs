@@ -78,11 +78,13 @@ impl Buffer {
         Self { inner: Inner::Frozen(data), start: 0, end, udp: None }
     }
 
-    /// 从 Vec 构造缓冲区。
+    /// 从 Vec 构造缓冲区。经 `Bytes::from(Vec)`（零拷贝接管 Vec 分配）+
+    /// `try_into_mut`（刚构造必唯一引用）得 BytesMut——XF-2 零拷贝，无二次拷贝
+    /// （bytes 1.12 无 `From<Vec<u8>> for BytesMut` 直通）。
     pub fn from_vec(data: Vec<u8>) -> Self {
         let len = data.len();
-        let mut inner = BytesMut::with_capacity(len);
-        inner.extend_from_slice(&data);
+        let b = Bytes::from(data);
+        let inner = b.try_into_mut().unwrap_or_else(|shared| BytesMut::from(&shared[..]));
         Self { inner: Inner::Pooled(inner), start: 0, end: len, udp: None }
     }
 
