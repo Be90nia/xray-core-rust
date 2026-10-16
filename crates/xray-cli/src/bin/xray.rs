@@ -203,8 +203,18 @@ fn normalize_go_style_args(mut argv: Vec<String>) -> Vec<String> {
     // Go v4 兼容（getArgsV4Compatible）：首个 token 若不是子命令、也非顶层
     // help/version 旗标，则按"默认 run 的参数"处理——插 `run` 到 argv[1]。
     const KNOWN_SUBS: &[&str] = &[
-        "run", "version", "uuid", "api", "tls", "convert", "x25519", "curve25519", "wg",
-        "mldsa65", "mlkem768", "vlessenc",
+        "run",
+        "version",
+        "uuid",
+        "api",
+        "tls",
+        "convert",
+        "x25519",
+        "curve25519",
+        "wg",
+        "mldsa65",
+        "mlkem768",
+        "vlessenc",
     ];
     let needs_run_insert = match argv.get(1) {
         None => true, // 裸 `xray` → 默认 run
@@ -330,14 +340,18 @@ mod go_flag_tests {
     use super::normalize_go_style_args;
 
     fn v(args: &[&str]) -> Vec<String> {
-        normalize_go_style_args(std::iter::once("xray".to_string()).chain(args.iter().map(|s| s.to_string())).collect())
+        normalize_go_style_args(
+            std::iter::once("xray".to_string()).chain(args.iter().map(|s| s.to_string())).collect(),
+        )
     }
 
     #[test]
     fn passwall_preset_single_dash_test() {
         // bd vjbq 阻塞场景: passwall 预检 `xray run -test -c cfg`
-        assert_eq!(v(&["run", "-test", "-c", "a.json"]),
-                   vec!["xray", "run", "--test", "-c", "a.json"]);
+        assert_eq!(
+            v(&["run", "-test", "-c", "a.json"]),
+            vec!["xray", "run", "--test", "-c", "a.json"]
+        );
     }
 
     #[test]
@@ -345,18 +359,20 @@ mod go_flag_tests {
         // 裸 xray → run (Go v4)
         assert_eq!(v(&[]), vec!["xray", "run"]);
         // 前导单横线旗标(非子命令) → 插 run (Go main.go 语义)
-        assert_eq!(v(&["-test", "-c", "a.json"]),
-                   vec!["xray", "run", "--test", "-c", "a.json"]);
-        assert_eq!(v(&["-config=a.json"]),
-                   vec!["xray", "run", "--config=a.json"]);
+        assert_eq!(v(&["-test", "-c", "a.json"]), vec!["xray", "run", "--test", "-c", "a.json"]);
+        assert_eq!(v(&["-config=a.json"]), vec!["xray", "run", "--config=a.json"]);
     }
 
     #[test]
     fn known_long_flags_normalized() {
-        assert_eq!(v(&["run", "-config", "a.json", "-format", "json"]),
-                   vec!["xray", "run", "--config", "a.json", "--format", "json"]);
-        assert_eq!(v(&["run", "-confdir", "/etc/x", "-dump"]),
-                   vec!["xray", "run", "--confdir", "/etc/x", "--dump"]);
+        assert_eq!(
+            v(&["run", "-config", "a.json", "-format", "json"]),
+            vec!["xray", "run", "--config", "a.json", "--format", "json"]
+        );
+        assert_eq!(
+            v(&["run", "-confdir", "/etc/x", "-dump"]),
+            vec!["xray", "run", "--confdir", "/etc/x", "--dump"]
+        );
     }
 
     #[test]
@@ -367,8 +383,10 @@ mod go_flag_tests {
         assert_eq!(v(&["run", "--test"]), vec!["xray", "run", "--test"]);
         // 子命令路径不受影响(uuid 是子命令, 不插 run)
         assert_eq!(v(&["uuid"]), vec!["xray", "uuid"]);
-        assert_eq!(v(&["api", "adi", "-server=127.0.0.1:8080"]),
-                   vec!["xray", "api", "adi", "-server=127.0.0.1:8080"]);
+        assert_eq!(
+            v(&["api", "adi", "-server=127.0.0.1:8080"]),
+            vec!["xray", "api", "adi", "-server=127.0.0.1:8080"]
+        );
     }
 
     #[test]

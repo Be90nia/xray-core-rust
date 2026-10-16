@@ -21,16 +21,16 @@ use std::{io, net::SocketAddr, sync::Arc};
 use xray_common::net::destination::Destination;
 use xray_transport::{
     connection::Connection,
-    dialer::{register_transport_dialer, StreamSettings, TransportDialFn},
+    dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
     listener_registry::{
-        register_transport_listener, ConnHandler, TransportListenFn, TransportListener,
+        ConnHandler, TransportListenFn, TransportListener, register_transport_listener,
     },
 };
 
 use crate::{
-    client::{dial, dial_with_params, DelayDialConn, DialFactory, DialOptions, DialParams},
+    client::{DelayDialConn, DialFactory, DialOptions, DialParams, dial, dial_with_params},
     config::Config,
-    pool::{global_pool, PoolKey, PooledConn},
+    pool::{PoolKey, PooledConn, global_pool},
 };
 
 /// 注册 WebSocket transport dialer。
