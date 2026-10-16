@@ -30,7 +30,7 @@ use xray_transport::{
 use crate::{
     client::{DelayDialConn, DialFactory, DialOptions, DialParams, dial, dial_with_params},
     config::Config,
-    pool::{PoolKey, PooledConn, WsConnectionPool, global_pool},
+    pool::{PoolKey, PooledConn, global_pool},
 };
 
 /// 注册 WebSocket transport dialer。
@@ -280,7 +280,7 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
 
     // 应用 finalmask（per-call per-outbound）。
     let wrapped: Box<dyn Connection> =
-        xray_transport::finalmask::wrap_conn_client_from_settings(settings, raw_conn)?;
+        xray_transport::finalmask::wrap_conn_client_from_settings(settings, Box::new(raw_conn))?;
 
     // 池启用 + 无 finalmask 包装（最常见 case） → 入池供下个 caller 复用。
     // ponytail: finalmask_json 非空时跳过入池——下个 caller 的 finalmask_json
