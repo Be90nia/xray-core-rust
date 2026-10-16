@@ -50,7 +50,12 @@ impl Default for Config {
             header: HashMap::new(),
             accept_proxy_protocol: false,
             ed: 0,
-            heartbeat_period: 0,
+            // Bug-B（bd cqyj）：心跳缺省 30s 对齐 Go dialer NewConnection——
+            // 缺位时 NAT/CDN 静默切断（60-180s 窗口）→ 半开死链 → 全协议假死 000。
+            // JSON 显式 heartbeatPeriod:0 仍可关闭（register.rs parse 路径）。
+            heartbeat_period: 30,
+            // 2026-10-17 池三道防线落地（取出探测/归还探测/EOF 毒标记）后
+            // 恢复默认启用；此前禁池止血。
             pool_size: 3,
         }
     }
@@ -78,9 +83,9 @@ impl Config {
             header: p.header.into_iter().collect(),
             accept_proxy_protocol: p.accept_proxy_protocol,
             ed: p.ed,
-            heartbeat_period: p.heartbeat_period,
-            // ponytail: 老 proto 缺 pool_size 字段 → 与 Config::default() 一致取 3；
-            // 后续 proto 加字段后切换为 `p.pool_size`。
+            // Bug-B：proto3 u32 无显式 0 表达——0 视为未配置 → 默认 30s。
+            heartbeat_period: if p.heartbeat_period == 0 { 30 } else { p.heartbeat_period },
+            // ponytail: 池三道防线落地后恢复默认 3（与 Config::default() 一致）。
             pool_size: 3,
         })
     }
@@ -145,6 +150,7 @@ mod tests {
         assert!(cfg.header.is_empty());
         assert!(!cfg.accept_proxy_protocol);
         assert_eq!(cfg.ed, 0);
-        assert_eq!(cfg.heartbeat_period, 0);
+        // Bug-B：心跳缺省 30s（显式 0 才关闭）。
+        assert_eq!(cfg.heartbeat_period, 30);
     }
 }

@@ -304,9 +304,10 @@ impl WsListener {
         // 4. Remote 决定：XFF 覆盖（port=0，对齐 Go forwardedAddrs[0]）。
         let final_remote = xff_ip.map(|ip| SocketAddr::new(ip, 0)).unwrap_or(remote);
 
-        // 5. 匹配 config 的 heartbeat_period 启动 ping。
+        // 5. 匹配 config 的 heartbeat_period 启动 ping。Bug-B：缺省 30s 对称启用
+        //（Go NewConnection 两侧都起 ping——服务端不 ping 时 NAT 掐断服务端方向）。
         let heartbeat_secs =
-            matched_idx.and_then(|i| configs.get(i)).map(|c| c.heartbeat_period).unwrap_or(0);
+            matched_idx.and_then(|i| configs.get(i)).map(|c| c.heartbeat_period).unwrap_or(30);
 
         let mut conn = WsConnection::from_stream(ws_stream, Some(final_remote), local);
         if heartbeat_secs > 0 {
@@ -732,12 +733,11 @@ mod tests {
         for _ in 0..3 {
             // 容忍连接失败：修复前 accept loop 被 h2#1 钉死后，后续 TLS 握手
             // 在服务端 4s 超时——红在下方 ws 断言处，此处失败不影响判定
-            if let Ok(Ok(tls)) =
-                tokio::time::timeout(Duration::from_secs(3), async {
-                    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-                    h2_connector.connect("localhost".try_into().unwrap(), tcp).await
-                })
-                .await
+            if let Ok(Ok(tls)) = tokio::time::timeout(Duration::from_secs(3), async {
+                let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+                h2_connector.connect("localhost".try_into().unwrap(), tcp).await
+            })
+            .await
             {
                 assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
                 // 持有连接 30s 不关（keep-alive），模拟 hard-close 前的探测驻留

@@ -113,7 +113,8 @@ mod tests {
         assert!(cfg.service_name.is_empty());
         assert!(cfg.authority.is_empty());
         assert!(!cfg.multi_mode);
-        assert_eq!(cfg.idle_timeout, 0);
+        // Bug-B：缺省 30s keepalive。
+        assert_eq!(cfg.idle_timeout, 30);
         assert_eq!(cfg.user_agent, "");
     }
 
@@ -182,7 +183,8 @@ mod tests {
         let cfg = parse_grpc_config(Some(&v)).unwrap();
         assert!(cfg.service_name.is_empty());
         assert!(!cfg.multi_mode);
-        assert_eq!(cfg.idle_timeout, 0);
+        // Bug-B：缺省 30s keepalive（显式 0 才关闭）。
+        assert_eq!(cfg.idle_timeout, 30);
     }
 
     #[test]
