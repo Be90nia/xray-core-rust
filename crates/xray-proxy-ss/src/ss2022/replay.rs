@@ -92,30 +92,33 @@ mod tests {
     /// 两次轮换后才可复用（Go ReplayFilter 语义）。
     #[test]
     fn salt_survives_two_rotations() {
-        let f = SaltReplayFilter::new(Duration::from_millis(30));
+        // ponytail: 窗口 200ms——30ms 时代与 sleep 竞速，CI 负载下 sleep 溢出
+        // 跨过双轮换边界必 flaky（Interop 历史 4 连挂同因）。200ms 窗口 +
+        // 100ms 步进 = 调度溢出余量 2 倍，语义覆盖不变。
+        let f = SaltReplayFilter::new(Duration::from_millis(200));
         assert!(f.check(b"rotating-salt-aaaa"));
         // <1×interval：poolA 命中
-        std::thread::sleep(Duration::from_millis(15));
+        std::thread::sleep(Duration::from_millis(100));
         assert!(!f.check(b"rotating-salt-aaaa"), "within first window rejected");
         // ≥1×interval：轮换进 poolB，仍拒绝
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(Duration::from_millis(150));
         assert!(!f.check(b"rotating-salt-aaaa"), "in poolB after rotation rejected");
         // ≥2×interval：第二次轮换后两池皆无，可复用
-        std::thread::sleep(Duration::from_millis(35));
+        std::thread::sleep(Duration::from_millis(250));
         assert!(f.check(b"rotating-salt-aaaa"), "dropped after second rotation");
     }
 
     #[test]
     fn expired_entries_swept_by_rotation() {
-        let f = SaltReplayFilter::new(Duration::from_millis(30));
+        let f = SaltReplayFilter::new(Duration::from_millis(200));
         for i in 0..100u32 {
             let _ = f.check(&i.to_be_bytes());
         }
         assert_eq!(f.len(), 100, "live entries kept in poolA");
-        std::thread::sleep(Duration::from_millis(40));
+        std::thread::sleep(Duration::from_millis(220));
         assert!(f.check(b"trigger-rotation-aaaa"), "rotation check passes");
         assert_eq!(f.len(), 101, "旧 100 条移 poolB 未删 + 新 1 条入 poolA");
-        std::thread::sleep(Duration::from_millis(35));
+        std::thread::sleep(Duration::from_millis(220));
         assert!(f.check(b"second-rotation-aaaa"), "second rotation");
         assert_eq!(f.len(), 2, "两次轮换后两池仅剩两条新 salt");
     }
