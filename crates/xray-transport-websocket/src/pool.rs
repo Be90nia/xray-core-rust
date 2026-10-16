@@ -110,7 +110,10 @@ pub struct WsPoolConfig {
 
 impl Default for WsPoolConfig {
     fn default() -> Self {
-        Self { max_idle_per_key: 3, max_idle_duration: Duration::from_secs(30) }
+        // TTL 10s（2026-10-16 根治）：CDN 边缘 idle 切断窗口 ~100s（CF），30s
+        // 时代实测 vl-ws-cdn 复用死连接（个位数/0.x 回归）——10s 令死亡窗口≈0，
+        // 浏览器秒级并发复用命中率不受损。
+        Self { max_idle_per_key: 3, max_idle_duration: Duration::from_secs(10) }
     }
 }
 
@@ -243,17 +246,20 @@ pub struct PooledConn {
     inner: Option<Box<dyn Connection>>,
     /// `Some` = Drop 时归还池；`None` = Drop 时直接关。
     pool_release: Option<(Arc<WsConnectionPool>, PoolKey)>,
+    /// IO 毒标记：任一 read/write/flush/shutdown 返回 Err 即置位。
+    /// 置位后 Drop 不归还池（连接已坏，复用即死连接回归——2026-10-16 根治）。
+    io_poisoned: bool,
 }
 
 impl PooledConn {
     /// 新拨号的 conn（无池归还）。
     pub fn new_fresh(conn: Box<dyn Connection>) -> Self {
-        Self { inner: Some(conn), pool_release: None }
+        Self { inner: Some(conn), pool_release: None, io_poisoned: false }
     }
 
     /// 从池取出的 conn + 池信息（Drop 时归还）。
     pub fn from_pool(conn: Box<dyn Connection>, pool: Arc<WsConnectionPool>, key: PoolKey) -> Self {
-        Self { inner: Some(conn), pool_release: Some((pool, key)) }
+        Self { inner: Some(conn), pool_release: Some((pool, key)), io_poisoned: false }
     }
 
     /// 新拨号 + 标记为池归还（dial 完新 conn 后入池供下个 caller 复用）。
@@ -264,7 +270,7 @@ impl PooledConn {
         pool: Arc<WsConnectionPool>,
         key: PoolKey,
     ) -> Self {
-        Self { inner: Some(conn), pool_release: Some((pool, key)) }
+        Self { inner: Some(conn), pool_release: Some((pool, key)), io_poisoned: false }
     }
 }
 
@@ -274,8 +280,12 @@ impl AsyncRead for PooledConn {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let inner = self.inner.as_mut().expect("conn taken by Drop");
-        Pin::new(inner).poll_read(cx, buf)
+        let mut this = self.as_mut();
+        let r = Pin::new(this.inner.as_mut().expect("conn taken by Drop")).poll_read(cx, buf);
+        if matches!(r, Poll::Ready(Err(_))) {
+            this.io_poisoned = true;
+        }
+        r
     }
 }
 
@@ -285,18 +295,30 @@ impl AsyncWrite for PooledConn {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let inner = self.inner.as_mut().expect("conn taken by Drop");
-        Pin::new(inner).poll_write(cx, buf)
+        let mut this = self.as_mut();
+        let r = Pin::new(this.inner.as_mut().expect("conn taken by Drop")).poll_write(cx, buf);
+        if matches!(r, Poll::Ready(Err(_))) {
+            this.io_poisoned = true;
+        }
+        r
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let inner = self.inner.as_mut().expect("conn taken by Drop");
-        Pin::new(inner).poll_flush(cx)
+        let mut this = self.as_mut();
+        let r = Pin::new(this.inner.as_mut().expect("conn taken by Drop")).poll_flush(cx);
+        if matches!(r, Poll::Ready(Err(_))) {
+            this.io_poisoned = true;
+        }
+        r
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let inner = self.inner.as_mut().expect("conn taken by Drop");
-        Pin::new(inner).poll_shutdown(cx)
+        let mut this = self.as_mut();
+        let r = Pin::new(this.inner.as_mut().expect("conn taken by Drop")).poll_shutdown(cx);
+        if matches!(r, Poll::Ready(Err(_))) {
+            this.io_poisoned = true;
+        }
+        r
     }
 }
 
@@ -321,6 +343,10 @@ impl Drop for PooledConn {
         // 关键：必须在字段 drop 前 take 出 conn —— 否则 conn 在 Drop 中先关
         // socket，池里拿到一条已死的连接。
         if let (Some((pool, key)), Some(conn)) = (self.pool_release.take(), self.inner.take()) {
+            if self.io_poisoned {
+                // IO 出错的连接直接关，不归还——复用即死连接回归（根治）。
+                return;
+            }
             tokio::spawn(async move {
                 pool.release(key, conn).await;
             });
@@ -412,6 +438,57 @@ mod tests {
         pool.release(key1(), mock_conn()).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(pool.try_acquire(&key1()).await.is_none(), "expired entry must be swept");
+    }
+
+    /// 写失败的连接必须不入池（毒标记）——复用坏连接 = CDN 死连接回归根因。
+    #[tokio::test]
+    async fn io_error_conn_not_released_to_pool() {
+        struct AlwaysErrConn;
+        impl AsyncRead for AlwaysErrConn {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Err(io::Error::other("broken")))
+            }
+        }
+        impl AsyncWrite for AlwaysErrConn {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Err(io::Error::other("broken")))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl Connection for AlwaysErrConn {
+            fn remote_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
+                Ok(None)
+            }
+            fn local_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
+                Ok(None)
+            }
+        }
+
+        let pool = Arc::new(WsConnectionPool::new(WsPoolConfig::default()));
+        let conn: Box<dyn Connection> = Box::new(AlwaysErrConn);
+        let mut pooled = PooledConn::from_pool(conn, pool.clone(), key1());
+        let n = Pin::new(&mut pooled)
+            .poll_write(&mut Context::from_waker(&std::task::Waker::noop()), b"x");
+        assert!(matches!(n, Poll::Ready(Err(_))));
+        drop(pooled); // Drop：毒标记 → 不归还
+        tokio::time::sleep(Duration::from_millis(10)).await; // 等 spawn 的 release（若有）跑完
+        assert!(
+            pool.try_acquire(&key1()).await.is_none(),
+            "poisoned conn must NOT re-enter pool"
+        );
     }
 
     #[tokio::test]
