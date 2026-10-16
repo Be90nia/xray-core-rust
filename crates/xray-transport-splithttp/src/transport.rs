@@ -233,6 +233,12 @@ where
         .max_send_buf_size(16 * 1024 * 1024);
     // ponytail: Go hub.go:571 MaxHeaderBytes（GetNormalizedServerMaxHeaderBytes）无
     // hyper 字节级对应（仅 max_headers 条数），默认值即 Go 默认 1MiB 量级，未接入。
+    // a9p7 短期治本：hyper auto::Builder 封装层不暴露 h2::server::Connection
+    // poll_closed API——peer GOAWAY / conn 终结后 serve_connection 才返回；
+    // 现有 `let _ = ...` 已隐式监听（serve_connection 返回 = conn 终结）。
+    // 进一步传播给 sessions 需要 per-conn close_signal 注册表（改动 ~30+ 行），
+    // 不在 a9p7 短期治本范围。GET response body drop guard (hub/handler.rs:411)
+    // 已主动 close_signal::close = 当前架构兜底已存在。
     let _ = builder.serve_connection(io, svc).await;
 }
 

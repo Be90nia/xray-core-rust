@@ -182,6 +182,10 @@ where
         let mut tick = tokio::time::interval(period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await; // 首跳立即返回
+        // a9p7 短期治本：h2 client::Connection 没有显式 poll_closed API，靠
+        // future 完成触发（peer GOAWAY / EOF / 错误）。下面 select 的
+        // `_ = &mut h2_conn => break` 即 GOAWAY 隐式监听——peer 发 GOAWAY
+        // 后 h2 库会让 conn future 完成。
         loop {
             tokio::select! {
                 _ = tick.tick() => {
@@ -191,7 +195,13 @@ where
                         _ => break,
                     }
                 }
-                _ = &mut h2_conn => break,
+                res = &mut h2_conn => {
+                    // a9p7：peer 主动 GOAWAY / TCP EOF → 立即断链（h2 库自动
+                    // 状态机：GOAWAY 后 send_data 返 Err，up 闭包错误经
+                    // cancel_tx 通知 DuplexConn reader）。
+                    tracing::debug!("grpc h2 conn closed: {:?}", res.as_ref().err());
+                    break;
+                },
             }
         }
     });
@@ -456,10 +466,17 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
             });
         }
     }
+    // a9p7 短期治本：h2 server::Connection 有 poll_closed API，但当前
+    // `while let Some(r) = h2_srv.accept().await` 循环在 peer GOAWAY 后
+    // accept() 返回 None 隐式退出 = 已具备 GOAWAY 监听能力。改 match 显式
+    // trace 让 GOAWAY 触发在日志可见。
     while let Some(r) = h2_srv.accept().await {
         let (req, mut respond) = match r {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::debug!("grpc h2 server accept error (peer GOAWAY?): {e}");
+                continue;
+            },
         };
         if req.method() != "POST" {
             let r = http::Response::builder().status(404).body(()).unwrap();
