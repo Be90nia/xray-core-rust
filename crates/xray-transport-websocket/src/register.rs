@@ -21,16 +21,16 @@ use std::{io, net::SocketAddr, sync::Arc};
 use xray_common::net::destination::Destination;
 use xray_transport::{
     connection::Connection,
-    dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
+    dialer::{register_transport_dialer, StreamSettings, TransportDialFn},
     listener_registry::{
-        ConnHandler, TransportListenFn, TransportListener, register_transport_listener,
+        register_transport_listener, ConnHandler, TransportListenFn, TransportListener,
     },
 };
 
 use crate::{
-    client::{DelayDialConn, DialFactory, DialOptions, DialParams, dial, dial_with_params},
+    client::{dial, dial_with_params, DelayDialConn, DialFactory, DialOptions, DialParams},
     config::Config,
-    pool::{PoolKey, PooledConn, global_pool},
+    pool::{global_pool, PoolKey, PooledConn},
 };
 
 /// 注册 WebSocket transport dialer。
@@ -247,12 +247,10 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
     }
     // 池尝试：命中空闲连接（msg 复用 = 跳过 TCP+TLS+WS 握手 500ms）。
     let pooled = if config.pool_size > 0 && pool.enabled() {
-        if let Some(cached) = pool.try_acquire(&pool_key).await {
+        pool.try_acquire(&pool_key).await.map(|cached| {
             // 池命中：用 PooledConn 包装（Drop 时归还到池）。
-            Some(PooledConn::from_pool(cached, pool.clone(), pool_key.clone()))
-        } else {
-            None
-        }
+            PooledConn::from_pool(cached, pool.clone(), pool_key.clone())
+        })
     } else {
         None
     };
@@ -286,11 +284,7 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
     // ponytail: finalmask_json 非空时跳过入池——下个 caller 的 finalmask_json
     // 可能不同，混用 = wrap 层串台。99% 用户 finalmask_json 空 = 入池生效。
     if config.pool_size > 0 && pool.enabled() && settings.finalmask_json.is_none() {
-        Ok(Box::new(PooledConn::fresh_releasable(
-            wrapped,
-            pool.clone(),
-            pool_key,
-        )))
+        Ok(Box::new(PooledConn::fresh_releasable(wrapped, pool.clone(), pool_key)))
     } else {
         Ok(wrapped)
     }
@@ -496,8 +490,7 @@ fn parse_ws_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
     let heartbeat_period = obj.get("heartbeatPeriod").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
     // ponytail: poolSize 缺省 → Config::default() 的 3（启用池化）；显式 0 = 关池。
     // 与 `Config::default()` 一致，避免每个 outbound 都要在 JSON 里写 poolSize。
-    let pool_size =
-        obj.get("poolSize").and_then(|x| x.as_u64()).unwrap_or(3) as u32;
+    let pool_size = obj.get("poolSize").and_then(|x| x.as_u64()).unwrap_or(3) as u32;
 
     // Go `infra/conf/transport_internet.go::WebSocketConfig.Build`：
     // path 中 `?ed=N` 提取为 Ed 字段并从 path 删除（其余 query 参数保留）。
@@ -520,15 +513,7 @@ fn parse_ws_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
     let accept_proxy_protocol =
         obj.get("acceptProxyProtocol").and_then(|x| x.as_bool()).unwrap_or(false);
 
-    Ok(Config {
-        host,
-        path,
-        header,
-        accept_proxy_protocol,
-        ed,
-        heartbeat_period,
-        pool_size,
-    })
+    Ok(Config { host, path, header, accept_proxy_protocol, ed, heartbeat_period, pool_size })
 }
 
 /// 把 JSON 子对象解析为 `HashMap<String, String>`。非 object 或缺失返回 `None`。

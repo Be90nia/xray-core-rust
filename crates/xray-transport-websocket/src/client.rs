@@ -22,7 +22,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll, ready},
+    task::{ready, Context, Poll},
 };
 
 use base64::Engine;
@@ -31,11 +31,12 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_tungstenite::{
-    Connector, MaybeTlsStream, client_async_tls_with_config,
+    client_async_tls_with_config,
     tungstenite::{
         client::IntoClientRequest, handshake::client::Request as WsRequest, http::HeaderValue,
         protocol::WebSocketConfig,
     },
+    Connector, MaybeTlsStream,
 };
 use xray_common::{browser::try_default_headers_with, net::destination::Destination};
 use xray_transport::connection::Connection;
