@@ -26,7 +26,7 @@ use http::{Method, StatusCode, header::PROXY_AUTHORIZATION};
 use hyper::{body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use subtle::ConstantTimeEq;
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use xray_app_dispatcher::default::DispatchHandler;
 use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
@@ -149,9 +149,12 @@ impl InboundHandler for NaiveInboundHandler {
         if self.started.swap(true, Ordering::SeqCst) {
             return Err(InboundError::AlreadyStarted(self.tag.clone()));
         }
-        let listener = TcpListener::bind(self.bind_addr).await.map_err(|e| {
-            InboundError::ListenError(format!("naive bind {}: {e}", self.bind_addr))
-        })?;
+        let listener = xray_transport::system_listener::bind_tcp_listener(
+            self.bind_addr,
+            xray_transport::system_listener::LISTEN_BACKLOG,
+        )
+        .await
+        .map_err(|e| InboundError::ListenError(format!("naive bind {}: {e}", self.bind_addr)))?;
         let port = listener
             .local_addr()
             .map_err(|e| InboundError::ListenError(format!("naive local_addr: {e}")))?

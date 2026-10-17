@@ -116,7 +116,11 @@ async fn listen_tcp(
     tcpmask: Option<Arc<xray_transport::finalmask::TcpmaskManager>>,
     handler: ConnHandler,
 ) -> io::Result<Box<dyn TransportListener>> {
-    let tcp = tokio::net::TcpListener::bind(addr).await?;
+    let tcp = xray_transport::system_listener::bind_tcp_listener(
+        addr,
+        xray_transport::system_listener::LISTEN_BACKLOG,
+    )
+    .await?;
     let local = tcp.local_addr()?;
     // REALITY listener：Go hub.go:558-560 `goreality.NewListener`。
     let reality = reality_server_config(security, security_json)?;

@@ -198,7 +198,7 @@ impl WsConnectionPool {
             (cfg.max_idle_duration, cfg.max_idle_per_key)
         };
         let mut guard = self.inner.lock().await;
-        let Some(entry) = guard.get_mut(key) else { return None };
+        let entry = guard.get_mut(key)?;
         let now = Instant::now();
         // 从头扫除过期（FIFO：先入先过期）。
         while let Some(front) = entry.front() {
@@ -307,7 +307,7 @@ impl AsyncRead for PooledConn {
             Poll::Ready(Err(_)) => this.io_poisoned = true,
             // Ok 且 0 填充 = EOF：对端已关连接（ws close 帧/FIN）——毒标记。
             Poll::Ready(Ok(())) if buf.filled().is_empty() => this.io_poisoned = true,
-            _ => {}
+            _ => {},
         }
         r
     }
@@ -515,7 +515,7 @@ mod tests {
         let conn: Box<dyn Connection> = Box::new(AlwaysErrConn);
         let mut pooled = PooledConn::from_pool(conn, pool.clone(), key1());
         let n = Pin::new(&mut pooled)
-            .poll_write(&mut Context::from_waker(&std::task::Waker::noop()), b"x");
+            .poll_write(&mut Context::from_waker(std::task::Waker::noop()), b"x");
         assert!(matches!(n, Poll::Ready(Err(_))));
         drop(pooled); // Drop：毒标记 → 不归还
         tokio::time::sleep(Duration::from_millis(10)).await; // 等 spawn 的 release（若有）跑完
@@ -554,7 +554,8 @@ mod tests {
         let pool = Arc::new(WsConnectionPool::new(WsPoolConfig::default()));
         // 1) Drop 归还路径：探测拦下 EOF 连接。
         {
-            let pooled = PooledConn::from_pool(Box::new(DuplexConnection::new(a)), pool.clone(), key1());
+            let pooled =
+                PooledConn::from_pool(Box::new(DuplexConnection::new(a)), pool.clone(), key1());
             drop(b); // 对端关闭 → EOF
             tokio::time::sleep(Duration::from_millis(10)).await; // EOF 传播
             drop(pooled);

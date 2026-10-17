@@ -161,9 +161,12 @@ impl HubListener {
         config: Arc<Config>,
         conn_handler: Arc<dyn HubConnHandler>,
     ) -> Result<Self> {
-        let tcp_listener = TokioTcpListener::bind(addr)
-            .await
-            .map_err(|e| SplitHttpError::ListenFailed(e.to_string()))?;
+        let tcp_listener = xray_transport::system_listener::bind_tcp_listener(
+            addr,
+            xray_transport::system_listener::LISTEN_BACKLOG,
+        )
+        .await
+        .map_err(|e| SplitHttpError::ListenFailed(e.to_string()))?;
         let local_addr =
             tcp_listener.local_addr().map_err(|e| SplitHttpError::ListenFailed(e.to_string()))?;
         Ok(Self {

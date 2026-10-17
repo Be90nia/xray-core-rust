@@ -9,7 +9,7 @@
 //! 本 crate 只保留纯业务：counter name 解析、stats 快照结构、observation 快照结构、
 //! 启动编排顺序。
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, net::ToSocketAddrs, sync::Arc};
 
 use parking_lot::Mutex;
 
@@ -411,13 +411,39 @@ impl MetricsHttpServer for TokioHttpServer {
         obs: Option<Arc<dyn ObservationCollector>>,
     ) -> Result<(), MetricsError> {
         // trait 是 sync，但 tokio::TcpListener::bind 是 async。
-        // 用 std::net::TcpListener::bind (sync) + set_nonblocking +
-        // tokio::net::TcpListener::from_std 转换。
-        let std_listener = std::net::TcpListener::bind(listen)
+        // 用 socket2 bind + listen(1024)（bd hjtt：std bind 缺省 backlog 128）
+        // + set_nonblocking + tokio::net::TcpListener::from_std 转换。
+        let addr = listen
+            .to_socket_addrs()
+            .map_err(|e| MetricsError::ListenInvalid(format!("resolve {listen}: {e}")))?
+            .next()
+            .ok_or_else(|| MetricsError::ListenInvalid(format!("resolve {listen}: no address")))?;
+        let domain = if addr.is_ipv4() { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 };
+        let socket =
+            socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+                .map_err(|e| MetricsError::ListenInvalid(format!("socket {listen}: {e}")))?;
+        #[cfg(unix)]
+        // std::net::TcpListener::bind 在 Unix 置 SO_REUSEADDR，保持同款行为。
+        socket
+            .set_reuse_address(true)
+            .map_err(|e| MetricsError::ListenInvalid(format!("reuseaddr {listen}: {e}")))?;
+        socket
+            .bind(&addr.into())
             .map_err(|e| MetricsError::ListenInvalid(format!("bind {listen}: {e}")))?;
-        std_listener
+        socket
+            .listen(1024)
+            .map_err(|e| MetricsError::ListenInvalid(format!("listen {listen}: {e}")))?;
+        socket
             .set_nonblocking(true)
             .map_err(|e| MetricsError::ListenInvalid(format!("set_nonblocking: {e}")))?;
+        #[cfg(unix)]
+        let std_listener = std::net::TcpListener::from(std::os::fd::OwnedFd::from(socket));
+        #[cfg(target_os = "windows")]
+        // SAFETY: socket 持有原始 SOCKET 句柄，转 std TcpListener 夺走所有权。
+        let std_listener = unsafe {
+            use std::os::windows::io::{FromRawSocket, IntoRawSocket};
+            std::net::TcpListener::from_raw_socket(socket.into_raw_socket())
+        };
         let listener = tokio::net::TcpListener::from_std(std_listener)
             .map_err(|e| MetricsError::ListenInvalid(format!("from_std: {e}")))?;
         let shutdown = self.inner.shutdown.clone();

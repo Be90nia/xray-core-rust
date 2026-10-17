@@ -2026,11 +2026,24 @@ pub async fn spawn_inbounds(
         // policy manager（dispatcher 装配时注入，见 start_full_dispatched）：
         // 供 http inbound 按 userLevel 查 handshake 超时等 per-level 策略。
         let policy = dispatcher.as_ref().and_then(|d| d.policy_manager.clone());
-        if let Some(handle) = spawn_one_inbound(ib, per_ohm, policy, shutdown_token.clone()).await?
+        // bd 0z7u：绑定失败带 tag 上下文 ERROR 日志后 fatal（对齐 Go xray
+        // 入站创建失败 → core 启动失败退出；裸 io::Error 无 tag 无法定位）。
+        if let Some(handle) = spawn_one_inbound(ib, per_ohm, policy, shutdown_token.clone())
+            .await
+            .map_err(|e| {
+                tracing::error!(tag = %ib.tag, protocol = %ib.entry.kind, error = %e, "inbound bind failed, aborting startup");
+                std::io::Error::other(format!("inbound `{}` ({}) start failed: {e}", ib.tag, ib.entry.kind))
+            })?
         {
             handles.push(handle);
         }
     }
+    // bd 0z7u：启动结束入站绑定汇总（哪些 tag 成功在监听）。
+    tracing::info!(
+        listening = handles.len(),
+        tags = ?built.inbounds.iter().map(|ib| ib.tag.as_str()).collect::<Vec<_>>(),
+        "inbound bind summary"
+    );
     Ok(handles)
 }
 

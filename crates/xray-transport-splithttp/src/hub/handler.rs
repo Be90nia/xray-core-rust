@@ -1076,9 +1076,11 @@ mod tests {
     #[tokio::test]
     async fn stream_up_sends_x_padding_keepalive() {
         use crate::config::RangeConfig;
-        let mut config = Config::default();
-        config.x_padding_bytes = Some(RangeConfig::new(1, 1));
-        config.sc_stream_up_server_secs = Some(RangeConfig::new(1, 1));
+        let config = Config {
+            x_padding_bytes: Some(RangeConfig::new(1, 1)),
+            sc_stream_up_server_secs: Some(RangeConfig::new(1, 1)),
+            ..Default::default()
+        };
         let ctx = make_ctx_with_config(config);
 
         let req = Request::builder().method(Method::POST).body(Full::new(Bytes::new())).unwrap();
@@ -1103,9 +1105,11 @@ mod tests {
     #[tokio::test]
     async fn stream_up_without_padding_conditions_stays_silent() {
         use crate::config::RangeConfig;
-        let mut config = Config::default();
-        config.x_padding_bytes = Some(RangeConfig::new(1, 1));
-        config.sc_stream_up_server_secs = Some(RangeConfig::new(1, 1));
+        let config = Config {
+            x_padding_bytes: Some(RangeConfig::new(1, 1)),
+            sc_stream_up_server_secs: Some(RangeConfig::new(1, 1)),
+            ..Default::default()
+        };
         let ctx = make_ctx_with_config(config);
 
         let req = Request::builder().method(Method::POST).body(Full::new(Bytes::new())).unwrap();

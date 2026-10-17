@@ -344,7 +344,11 @@ pub async fn listen(
     let expected_path =
         if cfg.service_name.is_empty() { None } else { Some(normalize_grpc_path(&cfg)) };
     let multi_mode = cfg.multi_mode;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = xray_transport::system_listener::bind_tcp_listener(
+        addr,
+        xray_transport::system_listener::LISTEN_BACKLOG,
+    )
+    .await?;
     let local = listener.local_addr()?;
     let tls_cfg = if !settings.security.is_empty() && settings.security != "none" {
         Some(

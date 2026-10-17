@@ -84,7 +84,12 @@ impl WsListener {
         if configs.is_empty() {
             return Err(WsError::InvalidUpgradeRequest { reason: "no WS configs provided".into() });
         }
-        let listener = TokioTcpListener::bind(addr).await.map_err(WsError::Io)?;
+        let listener = xray_transport::system_listener::bind_tcp_listener(
+            addr,
+            xray_transport::system_listener::LISTEN_BACKLOG,
+        )
+        .await
+        .map_err(WsError::Io)?;
         Ok(Self { listener, configs, trusted_x_forwarded_for: Vec::new() })
     }
 
