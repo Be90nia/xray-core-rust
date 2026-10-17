@@ -212,13 +212,14 @@ mod tests {
     }
 
     /// P0-3（bd 6vqk）：modulo bias 回归——range=200（256%200=56 旧实现偏差
-    /// 区）下各值频次须均匀（±10%）。旧 `b % 200` 实现 [0,55] 概率是 [56,199]
-    /// 的 2 倍，必挂此断言。
+    /// 区）下各值频次须均匀（±15%）。旧 `b % 200` 实现 [0,55] 概率是 [56,199]
+    /// 的 2 倍（+100%/−50% 偏差），±15% 轻松抓真 bias；均匀随机 3σ≈5.2%，
+    /// 15% 余量 = 3σ 之外不再 flaky（±10% 曾在 CI 双平台偶挂）。
     #[test]
     fn rand_bytes_between_no_modulo_bias() {
         let range = 200usize;
         let mut freq = vec![0usize; range];
-        let mut buf = [0u8; 200_000];
+        let mut buf = [0u8; 500_000];
         rand_bytes_between(&mut buf, 0, 199);
         for &b in &buf {
             freq[b as usize] += 1;
@@ -227,8 +228,8 @@ mod tests {
         for (v, &f) in freq.iter().enumerate() {
             let dev = f.abs_diff(expect);
             assert!(
-                dev * 10 <= expect,
-                "value {v} freq {f} deviates >10% from uniform {expect} (modulo bias?)"
+                dev * 100 <= expect * 15,
+                "value {v} freq {f} deviates >15% from uniform {expect} (modulo bias?)"
             );
         }
     }
