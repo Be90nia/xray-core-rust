@@ -78,14 +78,17 @@ impl Buffer {
         Self { inner: Inner::Frozen(data), start: 0, end, udp: None }
     }
 
-    /// 从 Vec 构造缓冲区。经 `Bytes::from(Vec)`（零拷贝接管 Vec 分配）+
-    /// `try_into_mut`（刚构造必唯一引用）得 BytesMut——XF-2 零拷贝，无二次拷贝
-    /// （bytes 1.12 无 `From<Vec<u8>> for BytesMut` 直通）。
+    /// 从 Vec 构造缓冲区。经 `Bytes::from(Vec)`（零拷贝接管 Vec 分配）——XF-2
+    /// 零拷贝，无二次拷贝。
+    ///
+    /// ponytail: **必须是 Frozen（非池）来源**——Vec 接管的 BytesMut 容量是原
+    /// Vec 的任意值，若标 Pooled，Drop 会把它按实际 capacity 回池（alloc::release
+    /// 按 capacity 选层、alloc 取层不验容量），小容量假块污染池分层 + TLS_CACHE
+    /// 粘线程，下游拿到后写入触发重分配/行为错乱——节点级选择性死亡
+    /// （2026-10-17 us1 cdn 钉死节点实证）。Frozen 写路径走 COW 转正，读零拷贝。
     pub fn from_vec(data: Vec<u8>) -> Self {
-        let len = data.len();
-        let b = Bytes::from(data);
-        let inner = b.try_into_mut().unwrap_or_else(|shared| BytesMut::from(&shared[..]));
-        Self { inner: Inner::Pooled(inner), start: 0, end: len, udp: None }
+        let end = data.len();
+        Self { inner: Inner::Frozen(Bytes::from(data)), start: 0, end, udp: None }
     }
 
     /// 写路径统一入口：`Frozen` → `Pooled` 写时复制（COW）。
@@ -604,6 +607,20 @@ mod tests {
         let buf = Buffer::from_vec(vec![1, 2, 3, 4, 5]);
         assert_eq!(buf.len(), 5);
         assert_eq!(buf.bytes(), &[1, 2, 3, 4, 5]);
+    }
+
+    /// from_vec 假池污染回归（2026-10-17 us1 cdn 钉死实证）：Vec 接管的
+    /// BytesMut 若标 Pooled，Drop 按 capacity 回池，小容量假块经 TLS_CACHE
+    /// （LIFO）直达下一次 alloc——下游拿到不足额 buffer。Frozen 语义不回池。
+    /// 修复前：drop 17B 假块 → alloc(2048) LIFO 弹出它 → 红；修复后绿。
+    #[test]
+    fn from_vec_does_not_pollute_pool() {
+        {
+            let buf = Buffer::from_vec(vec![7u8; 17]);
+            assert_eq!(buf.bytes(), &[7u8; 17][..]);
+        } // drop——修复前：17 容量假块入池顶
+        let b = crate::alloc::alloc(2048);
+        assert!(b.capacity() >= 2048, "pool returned undersized buffer: {}", b.capacity());
     }
 
     #[test]
