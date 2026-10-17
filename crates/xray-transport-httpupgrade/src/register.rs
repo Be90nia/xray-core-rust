@@ -78,8 +78,12 @@ async fn listen_httpupgrade(
     let config = parse_httpupgrade_config(settings.transport_json.as_ref())?;
     let accept_proxy = config.accept_proxy_protocol;
 
-    // 1. TCP bind
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // 1. TCP bind（bd hjtt：统一 backlog=1024，tokio 缺省 128 生产 overflow）
+    let listener = xray_transport::system_listener::bind_tcp_listener(
+        addr,
+        xray_transport::system_listener::LISTEN_BACKLOG,
+    )
+    .await?;
     let local = listener.local_addr()?;
 
     // 2. TLS 配置（可选）

@@ -31,6 +31,46 @@ use tokio::{
     net::TcpListener as TokioTcpListener,
 };
 
+/// 入站 TCP listener backlog（bd hjtt：tokio/std 缺省 128，生产实测 listen queue
+/// overflow 1402 次 + SYNs dropped 1404）。全仓 listener 创建点统一走此值。
+pub const LISTEN_BACKLOG: i32 = 1024;
+
+/// 指定 backlog 绑定 TCP listener（socket2 bind + listen）。
+///
+/// 全仓 listener 创建点统一入口（bd hjtt）：`std`/`tokio` 的 `bind` 不暴露
+/// backlog（内核缺省 128）。语义对齐 `std::net::TcpListener::bind`：解析
+/// 主机名取首个地址；Unix 置 SO_REUSEADDR、Windows 不置（std 同款行为）。
+///
+/// # Errors
+/// 地址解析失败 / socket 创建 / bind / listen 失败时返回 `io::Error`。
+pub async fn bind_tcp_listener<A: tokio::net::ToSocketAddrs>(
+    addr: A,
+    backlog: i32,
+) -> io::Result<TokioTcpListener> {
+    let addr = tokio::net::lookup_host(addr)
+        .await?
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no addresses resolved"))?;
+    let domain = if addr.is_ipv4() { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 };
+    let socket = Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    #[cfg(unix)]
+    // std::net::TcpListener::bind 在 Unix 上置 SO_REUSEADDR（TIME_WAIT 重绑）；
+    // Windows 上 std 不置，保持同款平台差异。
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(backlog)?;
+    socket.set_nonblocking(true)?;
+    #[cfg(unix)]
+    let std_listener = std::net::TcpListener::from(std::os::fd::OwnedFd::from(socket));
+    #[cfg(target_os = "windows")]
+    // SAFETY: socket 持有原始 SOCKET 句柄，转 std TcpListener 夺走所有权。
+    let std_listener = unsafe {
+        use std::os::windows::io::{FromRawSocket, IntoRawSocket};
+        std::net::TcpListener::from_raw_socket(socket.into_raw_socket())
+    };
+    TokioTcpListener::from_std(std_listener)
+}
+
 #[cfg(unix)]
 use crate::filelocker::FileLocker;
 use crate::{
@@ -81,7 +121,7 @@ impl DefaultListener {
         } else if Self::needs_prelisten_sockopt(&sockopt) {
             Self::bind_with_prelisten_sockopt(addr, &sockopt).await?
         } else {
-            TokioTcpListener::bind(addr).await?
+            bind_tcp_listener(addr, LISTEN_BACKLOG).await?
         };
         // PROXY protocol 开关接线：sockopt.acceptProxyProtocol 自动传入
         // （Go system_listener.go:169-172 按 sockopt 包 proxyproto.Listener；
@@ -188,7 +228,7 @@ impl DefaultListener {
                 .apply(socket.as_raw_socket())?;
             }
         }
-        socket.listen(128)?;
+        socket.listen(LISTEN_BACKLOG)?;
         socket.set_nonblocking(true)?;
         #[cfg(unix)]
         let std_listener = std::net::TcpListener::from(std::os::fd::OwnedFd::from(socket));
@@ -210,7 +250,7 @@ impl DefaultListener {
         addr: SocketAddr,
         _sockopt: &SocketOptions,
     ) -> io::Result<TokioTcpListener> {
-        TokioTcpListener::bind(addr).await
+        bind_tcp_listener(addr, LISTEN_BACKLOG).await
     }
 
     #[cfg(target_os = "linux")]
@@ -238,7 +278,7 @@ impl DefaultListener {
             .apply(socket.as_raw_fd())?;
         }
         socket.bind(&addr.into())?;
-        socket.listen(128)?;
+        socket.listen(LISTEN_BACKLOG)?;
         socket.set_nonblocking(true)?;
         // Socket → OwnedFd → std TcpListener（socket2 无直接转换）。
         let std_listener = std::net::TcpListener::from(std::os::fd::OwnedFd::from(socket));
@@ -434,7 +474,8 @@ impl InboundTcpListener {
     /// # Errors
     /// bind 失败时返回 `io::Error`。
     pub async fn bind(addr: &str, sockopt: SocketOptions) -> io::Result<Self> {
-        Ok(Self { inner: TokioTcpListener::bind(addr).await?, sockopt })
+        // bd hjtt：统一走 backlog=1024 helper（tokio 缺省 128 生产 listen overflow）。
+        Ok(Self { inner: bind_tcp_listener(addr, LISTEN_BACKLOG).await?, sockopt })
     }
 
     /// 监听器本地地址（serve 层日志 / local addr 兜底用）。
