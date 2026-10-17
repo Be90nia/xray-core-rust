@@ -74,6 +74,9 @@ pub async fn dial(
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "grpc dial timeout"))??;
     tcp.set_nodelay(true).ok();
+    // bd 88m0 客户端侧：下行 SO_RCVBUF 缺省 4MB（窗钉修复；失败即拨号失败，
+    // 对齐 dial_system sockopt 语义）。
+    xray_transport::sockopt::apply_client_dial_rcvbuf(&tcp)?;
     let cfg = parse_config(settings)?;
     // gRPC path：`/{service}/{stream}`（Go grpc URI 契约；无前导 '/' 的裸服务名
     // 是非法 h2 URI → RST_STREAM）。防御性规整：service/stream 段为空或缺前导 '/'

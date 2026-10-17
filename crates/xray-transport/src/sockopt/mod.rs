@@ -407,6 +407,19 @@ impl Default for SocketOptions {
 /// （wmem 同理；7p1m 战役 VPS 已调）。
 pub(crate) const TCP_RCVBUF_DEFAULT: i32 = 4 * 1024 * 1024;
 
+/// 客户端裸拨号点（transport 自持 TCP，不经 [`crate::system_dialer::dial_system`]）
+/// 统一应用的 SO_RCVBUF 缺省（bd 88m0 客户端侧收口）。
+///
+/// ws/splithttp/grpc 拨号此前裸 `TcpStream::connect`，下行接收窗钉 64KB
+/// （4 流 × 64KB/RTT 吞吐签名，HttpUpClientDig tr-httpupgrade 14 倍差实证）。
+/// 与 [`apply_outbound_socket_options`] 同常量同语义；这些拨号点无 sockopt
+/// 配置输入（sockopt 在 dial_system 路径消费、不透传 transport dial），故无
+/// 显式值可尊重，恒取 [`TCP_RCVBUF_DEFAULT`]。失败即拨号失败，对齐
+/// dial_system 的 sockopt 应用语义。
+pub fn apply_client_dial_rcvbuf(tcp: &tokio::net::TcpStream) -> std::io::Result<()> {
+    socket2::SockRef::from(tcp).set_recv_buffer_size(TCP_RCVBUF_DEFAULT as usize)
+}
+
 /// 把 [`SocketOptions`] 应用到已建立的 [`Socket`]（TCP 专用）。
 ///
 /// 对应 Go `applyOutboundSocketOptions`（sockopt_linux.go:16-111 / freebsd.go:127-178
@@ -991,6 +1004,25 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    #[tokio::test]
+    async fn client_dial_rcvbuf_raises_rcvbuf_over_kernel_default() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // 对照连接：内核缺省 rcvbuf 回读基线。
+        let plain = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let d_recv = socket2::SockRef::from(&plain).recv_buffer_size().unwrap();
+        // 设置连接：helper 应用后回读不得小于基线（rmem_max 钳制允许缩水，但
+        // 4MB 请求 ≥ 任何标准缺省）。
+        let tuned = tokio::net::TcpStream::connect(addr).await.unwrap();
+        apply_client_dial_rcvbuf(&tuned).unwrap();
+        let got = socket2::SockRef::from(&tuned).recv_buffer_size().unwrap();
+        let _ = listener.accept().await;
+        assert!(
+            got >= d_recv,
+            "rcvbuf must not shrink below kernel default: got={got} default={d_recv}"
+        );
+    }
 
     #[tokio::test]
     async fn apply_socket_options_on_real_tcp_connection() {
