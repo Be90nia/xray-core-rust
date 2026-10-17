@@ -112,6 +112,8 @@ impl TowerService<Uri> for DestTcpConnector {
         Box::pin(async move {
             let tcp = tokio::net::TcpStream::connect((host.as_ref(), port)).await?;
             tcp.set_nodelay(true).ok();
+            // bd 88m0 客户端侧：下行 SO_RCVBUF 缺省 4MB（窗钉修复）。
+            xray_transport::sockopt::apply_client_dial_rcvbuf(&tcp)?;
             Ok(DestTcpStream(TokioIo::new(tcp)))
         })
     }
@@ -243,6 +245,8 @@ impl TowerService<Uri> for SplitConnector {
                     let tcp =
                         tokio::net::TcpStream::connect((dial.host.to_string(), dial.port)).await?;
                     tcp.set_nodelay(true).ok();
+                    // bd 88m0 客户端侧：下行 SO_RCVBUF 缺省 4MB（窗钉修复）。
+                    xray_transport::sockopt::apply_client_dial_rcvbuf(&tcp)?;
                     let conn = xray_tls::utls::u_client(
                         TcpConnection::new(tcp),
                         &dial.sni,

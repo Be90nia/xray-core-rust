@@ -97,6 +97,9 @@ pub async fn dial(
     let port = opts.destination.port().value();
     let tcp = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
     tcp.set_nodelay(true).ok();
+    // bd 88m0 客户端侧：下行 SO_RCVBUF 缺省 4MB（窗钉修复；失败即拨号失败，
+    // 对齐 dial_system sockopt 语义）。
+    xray_transport::sockopt::apply_client_dial_rcvbuf(&tcp)?;
     // Bug-B（bd cqyj）：ws 拨号此前绕过 sockopt（裸 connect 无 keepalive）——
     // NAT/CDN 静默切断后成半开死链。45s 对齐 SocketOptions::default。
     {
