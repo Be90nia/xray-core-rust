@@ -222,6 +222,12 @@ where
         // vision splice：穿透响应头缓冲层克隆裸 TCP（装箱后经 dyn 分发到达这里）。
         self.inner.raw_tcp_clone()
     }
+
+    fn tls_readbuf_size(&self) -> usize {
+        // F3：穿透响应头缓冲层透传 TLS 栈信号（vision 由外层 VisionConn 不
+        // 转发兜底，读批边界语义不变）。
+        self.inner.tls_readbuf_size()
+    }
 }
 
 impl<C> crate::encryption::vision_conn::InnerRawClone for ResponseHeaderReader<C>
