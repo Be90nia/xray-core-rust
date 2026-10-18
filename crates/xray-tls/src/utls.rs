@@ -186,6 +186,12 @@ impl<S: Connection + Unpin> Connection for Conn<S> {
         // 穿透 rustls 层克隆内层流的裸 TCP（vision splice 用）。
         self.inner.get_ref().0.raw_tcp_clone()
     }
+
+    fn tls_readbuf_size(&self) -> usize {
+        // F3：rustls read_tls 每次 recv 吃满内部缓冲、多 record 批量解密，
+        // 64KB 调用方读缓冲减少 poll 往返（harness chain 148→332 MB/s）。
+        64 * 1024
+    }
 }
 
 impl<S: Connection + Unpin> ConnInterface for Conn<S> {
@@ -411,6 +417,14 @@ impl<S: Connection + Unpin> Connection for UConn<S> {
         match &self.inner {
             UConnInner::Rustls(c) => c.raw_tcp_clone(),
             UConnInner::Btls(c) => c.raw_tcp_clone(),
+        }
+    }
+
+    fn tls_readbuf_size(&self) -> usize {
+        match &self.inner {
+            UConnInner::Rustls(c) => c.tls_readbuf_size(),
+            // btls SSL_read 单 record 语义：64KB 缓冲零收益，保持缺省 8KB。
+            UConnInner::Btls(_) => 0,
         }
     }
 }

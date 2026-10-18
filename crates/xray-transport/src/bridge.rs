@@ -321,10 +321,15 @@ where
         .then(|| stream.raw_tcp_clone())
         .flatten()
         .map(new_readv_reader_whole);
+    // F3：rustls 客户端 TLS 流读缓冲放大（Connection::tls_readbuf_size，
+    // 缺省 0 = 池化 8KB 不变；btls SSL_read 单 record 零收益，vision/reality
+    // 包装层不转发即保持批边界语义）。
+    let tls_readbuf = stream.tls_readbuf_size();
     let (s_read_half, mut s_write) = tokio::io::split(stream);
-    let mut s_read: Box<dyn Reader> = match s_read_dup {
-        Some(r) => r,
-        None => new_reader(s_read_half),
+    let mut s_read: Box<dyn Reader> = match (s_read_dup, tls_readbuf) {
+        (Some(r), _) => r,
+        (None, 0) => new_reader(s_read_half),
+        (None, cap) => xray_buf::io::new_reader_with_capacity(s_read_half, cap),
     };
 
     // 512KiB bounded mpsc ×2：容量按条目计（Go pipe 按字节软限，这里
@@ -1752,5 +1757,119 @@ mod tests {
             1,
             "vectored aggregation must survive the split(WriteHalf) indirection"
         );
+    }
+
+    /// F3 接线 mock：包装 duplex、按构造参数返回 tls_readbuf_size。
+    struct LargeReadConn {
+        io: tokio::io::DuplexStream,
+        readbuf: usize,
+    }
+
+    impl tokio::io::AsyncRead for LargeReadConn {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.io).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for LargeReadConn {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.io).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.io).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.io).poll_shutdown(cx)
+        }
+    }
+
+    impl Connection for LargeReadConn {
+        fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+            Ok(None)
+        }
+
+        fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+            Ok(None)
+        }
+
+        fn tls_readbuf_size(&self) -> usize {
+            self.readbuf
+        }
+    }
+
+    /// F3 接线 mock：记录到达 link.writer 的每批字节数。
+    struct RecordingWriter {
+        lens: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    use std::future::Future;
+
+    impl xray_buf::io::Writer for RecordingWriter {
+        fn write_multi_buffer(
+            &mut self,
+            mb: xray_buf::multi::MultiBuffer,
+        ) -> Pin<Box<dyn Future<Output = xray_buf::io::Result<()>> + Send + '_>> {
+            Box::pin(async move {
+                self.lens.lock().unwrap().push(mb.len());
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_tls_readbuf_size_selects_reader_capacity() {
+        // F3：tls_readbuf_size=64KB → 下行单批 20KB 到齐；缺省 0 → 8KB 劈批。
+        // 字节总量与顺序两形态一致（读缓冲只改批形，不改数据）。
+        use std::sync::{Arc, Mutex};
+
+        use xray_buf::io::new_reader;
+
+        for (readbuf, expect_single) in [(64 * 1024, true), (0, false)] {
+            let (mut client, stream_io) = tokio::io::duplex(64 * 1024);
+            let stream: Box<dyn Connection> = Box::new(LargeReadConn { io: stream_io, readbuf });
+            let lens = Arc::new(Mutex::new(Vec::new()));
+            let (up_r, _up_w) = tokio::io::duplex(64);
+            let link = Link::new(
+                new_reader(up_r),
+                Box::new(RecordingWriter { lens: Arc::clone(&lens) })
+                    as Box<dyn xray_buf::io::Writer>,
+            );
+            let policy = TimeoutPolicy::default();
+            let bridge =
+                tokio::spawn(
+                    async move { bridge_link_with_stream_full(link, stream, &policy).await },
+                );
+            client.write_all(&vec![0u8; 20 * 1024]).await.unwrap();
+            drop(client); // EOF → 桥排空下行后结束
+            tokio::time::timeout(std::time::Duration::from_secs(5), bridge)
+                .await
+                .expect("bridge must finish after EOF")
+                .expect("bridge task")
+                .expect("bridge io");
+
+            let got = std::mem::take(&mut *lens.lock().unwrap());
+            assert_eq!(got.iter().sum::<usize>(), 20 * 1024, "字节总量不变 readbuf={readbuf}");
+            if expect_single {
+                assert_eq!(got, vec![20 * 1024], "64KB 读缓冲应单批到齐");
+            } else {
+                assert!(got.iter().all(|&n| n <= 8192), "缺省读缓冲保持 8KB 批上限: {got:?}");
+            }
+        }
     }
 }
