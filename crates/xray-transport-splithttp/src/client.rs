@@ -411,11 +411,12 @@ impl DefaultDialerClient {
         // 必须配，否则 idle_timeout 不生效（hyper-util 已知坑）。
         // bd wz2b C2：hyper-util legacy client h2 全默认（流窗 2MB/连窗 5MB/send
         // 1MB）——packet-up/stream-down 路径下载钉 2MB/RTT（169ms≈11.8MB/s）、上行钉
-        // 1MB/RTT。16/32MB 收窗 + 16MB send 与 stream-one dialer.rs 同批同值。
+        // 1MB/RTT。32/32MB 流窗/连窗 + 16MB send 与 stream-one dialer.rs 同批同值
+        // （bd c9oc F-A 流窗 32MB 同步，理由同 dialer.rs；生产 argo xhttp 走本 builder）。
         let client = Client::builder(TokioExecutor::new())
             .pool_timer(TokioTimer::new())
             .pool_idle_timeout(Some(Duration::from_secs(90)))
-            .http2_initial_stream_window_size(16 * 1024 * 1024)
+            .http2_initial_stream_window_size(32 * 1024 * 1024)
             .http2_initial_connection_window_size(32 * 1024 * 1024)
             .http2_max_send_buf_size(16 * 1024 * 1024)
             // h2 连接级 keep-alive PING：对齐 Go dialer.go http2 分支

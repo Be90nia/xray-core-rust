@@ -560,13 +560,15 @@ where
     // 400KB 是 server 默认，R3 复核勘误）。下载方向在途被钉
     // min(服务端 send_buf, 客户端流窗)/RTT——169ms RTT 下 2MB 窗 ≈ 11.8MB/s 理论上限
     // （公网实测 ~8.8；回环 RTT≈0 测不出）。Go x/net/http2 客户端无此量级钉子
-    // （transportDefaultStreamFlow 4MB 起步且 BDP 自适应）。16MB 流窗 + 32MB 连接窗
-    // 让在途上限回到服务端 send_buf 一侧；上行 1MB→16MB 与服务端对称（bd wz2b：
-    // 服务端收窗放大后 send buf 成次级钉，4MB/RTT@169ms≈23.7MB/s < 25 判据）。
+    // （transportDefaultStreamFlow 4MB 起步且 BDP 自适应）。32MB 流窗 + 32MB 连接窗
+    // （bd c9oc F-A：消费驱动放窗下有效在途 ≈ 标称流窗 62%，16MB 窗平台 ~10MB 钉
+    // argo 族下行 38.5MB/s@260ms；32MB 抬平台）——连接窗不低于流窗即不另成钉；
+    // 上行 1MB→16MB 与服务端对称（bd wz2b：服务端收窗放大后 send buf 成次级钉，
+    // 4MB/RTT@169ms≈23.7MB/s < 25 判据）。
     let mut builder = http2::Builder::new(TokioExecutor::new());
     builder
         .timer(hyper_util::rt::TokioTimer::new())
-        .initial_stream_window_size(16 * 1024 * 1024)
+        .initial_stream_window_size(32 * 1024 * 1024)
         .initial_connection_window_size(32 * 1024 * 1024)
         .max_send_buf_size(16 * 1024 * 1024);
     let (mut sender, conn) = builder
