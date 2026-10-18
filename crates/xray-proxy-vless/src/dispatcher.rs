@@ -518,6 +518,11 @@ impl Connection for EncRetryConn {
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         self.inner.local_addr()
     }
+
+    fn tls_readbuf_size(&self) -> usize {
+        // F3：出站最外层透传 TLS 栈信号到桥层。
+        self.inner.tls_readbuf_size()
+    }
 }
 
 #[cfg(test)]
