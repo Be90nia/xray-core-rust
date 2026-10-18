@@ -160,23 +160,6 @@ pub fn new_reader(r: impl AsyncRead + Unpin + Send + 'static) -> Box<dyn Reader>
     Box::new(crate::reader::SingleReader::new(r))
 }
 
-/// 将 tokio AsyncRead 包装为 Reader，以指定单次读取容量（F3：rustls 客户端
-/// TLS 流读缓冲放大；`capacity == 0` 等价 [`new_reader`] 缺省池化 8KB）。
-pub fn new_reader_with_capacity(
-    r: impl AsyncRead + Unpin + Send + 'static,
-    capacity: usize,
-) -> Box<dyn Reader> {
-    Box::new(crate::reader::SingleReader::with_capacity(r, capacity))
-}
-
-/// 将 tokio AsyncWrite 包装为整批聚合 Writer（F2 服务端 TLS 写聚合）。
-///
-/// 仅非 vision 服务端装配启用；底层 vectored-capable（裸 TCP）或单缓冲写入
-/// 直通 [`crate::writer::SequentialWriter`]，行为与 [`new_writer`] 一致。
-pub fn new_coalescing_writer(w: impl AsyncWrite + Unpin + Send + 'static) -> Box<dyn Writer> {
-    Box::new(crate::writer::CoalescingWriter::new(w))
-}
-
 /// 将 TCP 读半部包装为 Reader，按 `xray.buf.readv` 闸门选择实现。
 ///
 /// 对应 Go `buf.NewReader` 的 readv 分支（io.go:124-140）：TCP socket + env 启用
