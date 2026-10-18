@@ -81,17 +81,6 @@ pub trait Connection: AsyncRead + AsyncWrite + Send + Sync + Unpin {
         false
     }
 
-    /// rustls 客户端 TLS 流的大读缓冲信号（F3）。
-    ///
-    /// rustls `read_tls` 每次 recv 吃满内部缓冲、多 record 批量解密，调用方
-    /// 读缓冲放大到 64KB 减少 poll 往返（harness chain 148→332 MB/s）；
-    /// btls `SSL_read` 单 record 语义零收益，保持缺省 0（池化 8KB 不变）。
-    /// 包装层（vision/VisionConn、reality 等）**不转发**即天然保持读批边界
-    /// 语义（VISIONMAC IsCompleteRecord 依赖批边界，红线）。
-    fn tls_readbuf_size(&self) -> usize {
-        0
-    }
-
     /// 下行多缓冲聚合读的 poll 钩子（bd 2o9l，对应 Go ReadVReader 的
     /// `syscall.RawConn` 通道）。TCP 实现覆写为真 readv——一次系统调用
     /// （Unix `readv(2)` / Windows `WSARecv`）把数据分散填入多个 iovec；
@@ -489,11 +478,6 @@ impl Connection for Box<dyn Connection> {
     fn is_raw_tcp(&self) -> bool {
         // Box 透传：内层是裸 TCP（如 TcpConnection）时保持 splice 准入信号。
         (**self).is_raw_tcp()
-    }
-
-    fn tls_readbuf_size(&self) -> usize {
-        // Box 透传：装箱的 TLS 连接（UConn 等）信号到达桥层（F3）。
-        (**self).tls_readbuf_size()
     }
 
     fn poll_read_multi(

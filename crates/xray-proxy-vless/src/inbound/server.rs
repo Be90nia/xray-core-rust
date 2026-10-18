@@ -27,7 +27,7 @@ use tokio::{
     net::TcpStream,
 };
 use xray_app_dispatcher::{OutboundHandlerManager, default::SimpleOhm};
-use xray_buf::io::{new_coalescing_writer, new_reader, new_writer};
+use xray_buf::io::{new_reader, new_writer};
 use xray_common::net::{destination::Destination, network::Network, port::Port};
 use xray_transport::{link::Link, system_listener::InboundTcpListener};
 
@@ -564,7 +564,6 @@ where
     // testseed：服务端用**本端账号**的 padding 参数（对应 Go EncodeBodyAddons →
     // NewVisionWriter(account.Testseed)——下行 seed 取服务端账户配置，不上 wire）。
     let seed: &[u32] = decoded.user.as_ref().map_or(&[][..], |u| u.account.testseed.as_slice());
-    let is_vision = vision_uuid.is_some();
     let stream: Box<dyn VlessStream> = match (vision_uuid, raw_tcp) {
         (Some(uuid), Some(raw)) => Box::new(
             VisionConn::new_server(tokio::io::join(reader, write_half), uuid, raw)
@@ -576,14 +575,7 @@ where
         (None, _) => Box::new(tokio::io::join(reader, write_half)),
     };
     let (rh, wh) = tokio::io::split(stream);
-    // F2 服务端写聚合：仅 flow=""（非 vision）TCP 分派启用——vision 帧写批
-    // 边界（IsCompleteRecord 语义）逐批原样；UDP/Mux/Rvs 分派不经此处。
-    // 聚合边界 = 单次 write_multi_buffer 调用（wire 写缓冲拼接，非应用帧）。
-    let link = if is_vision {
-        Link::new(new_reader(rh), new_writer(wh))
-    } else {
-        Link::new(new_reader(rh), new_coalescing_writer(wh))
-    };
+    let link = Link::new(new_reader(rh), new_writer(wh));
     let _ = handler.dispatch_with_access(&dest, link, access.clone()).await;
     Ok(())
 }

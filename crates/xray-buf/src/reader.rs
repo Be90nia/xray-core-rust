@@ -27,21 +27,12 @@ use crate::{
 /// 每次读取填充一个 Buffer（最多 8KB），返回包含单个 Buffer 的 MultiBuffer。
 pub struct SingleReader {
     inner: Box<dyn AsyncRead + Unpin + Send>,
-    /// 0 = 缺省池化 8KB；>0 = 每次读取按该容量临时分配（F3 rustls 批量读：
-    /// read_tls 每次 recv 吃满内部缓冲、多 record 批量解密；容量落在池分层
-    /// 外，释放即弃，不污染池）。
-    capacity: usize,
 }
 
 impl SingleReader {
     /// 创建新的 SingleReader
     pub fn new(r: impl AsyncRead + Unpin + Send + 'static) -> Self {
-        Self { inner: Box::new(r), capacity: 0 }
-    }
-
-    /// 以指定单次读取容量创建（每次 read_multi_buffer 临时分配，读毕释放）
-    pub fn with_capacity(r: impl AsyncRead + Unpin + Send + 'static, capacity: usize) -> Self {
-        Self { inner: Box::new(r), capacity }
+        Self { inner: Box::new(r) }
     }
 }
 
@@ -50,11 +41,7 @@ impl Reader for SingleReader {
         &mut self,
     ) -> Pin<Box<dyn Future<Output = Result<MultiBuffer>> + Send + '_>> {
         Box::pin(async move {
-            let mut buf = if self.capacity > 0 {
-                Buffer::with_capacity(self.capacity)
-            } else {
-                Buffer::new()
-            };
+            let mut buf = Buffer::new();
             let writable = buf.writable_bytes();
             match self.inner.read(writable).await {
                 Ok(0) => {
@@ -407,18 +394,5 @@ mod tests {
         let buffer: Vec<u8> = Vec::new();
         let mut writer = crate::io::new_writer(buffer);
         reader.write_to(&mut writer).await.expect("write failed");
-    }
-
-    #[tokio::test]
-    async fn test_single_reader_with_capacity_reads_large_batch() {
-        // F3：64KB 读缓冲一次吃满 20KB 待读数据（缺省 8KB 会被劈成 3 批）。
-        use tokio::io::AsyncWriteExt;
-        let (mut tx, rx) = tokio::io::duplex(64 * 1024);
-        tx.write_all(&vec![0xABu8; 20 * 1024]).await.expect("write failed");
-        drop(tx); // EOF 排空后结束
-
-        let mut reader = SingleReader::with_capacity(rx, 64 * 1024);
-        let mb = reader.read_multi_buffer().await.expect("read failed");
-        assert_eq!(mb.len(), 20 * 1024, "64KB 读缓冲应单批到齐全部待读数据");
     }
 }
