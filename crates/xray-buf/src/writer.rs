@@ -246,6 +246,66 @@ impl Writer for BufferedWriter {
     }
 }
 
+// ========== CoalescingWriter ==========
+
+/// 整批聚合写入器（F2 服务端 TLS 写聚合）。
+///
+/// 底层不支持 vectored（TLS 层 `is_write_vectored()==false`）时，把一次
+/// [`Writer::write_multi_buffer`] 的全部缓冲拼接为**单次** `write_all` 交付：
+/// 8×8KB → 1×64KB，TLS 层产出 4×16KB record 而非 8×8KB，消除逐 record 的
+/// 加密/排队/系统调用固定开销（harness btls 142→228 MB/s）。聚合边界 =
+/// 单次 write_multi_buffer 调用：不跨调用积压、零交互延迟增量；单缓冲与
+/// vectored-capable sink（裸 TCP sendmsg）直通内层，零拷贝零行为变化。
+///
+/// 仅服务端 flow=""（非 vision）装配启用——vision 帧写批边界语义保持原样。
+pub struct CoalescingWriter {
+    inner: SequentialWriter,
+    /// 构造时快照 sink 能力：vectored-capable（裸 TCP）直通内层 iovec 聚合。
+    vectored: bool,
+}
+
+impl CoalescingWriter {
+    /// 创建新的 CoalescingWriter
+    pub fn new(w: impl AsyncWrite + Unpin + Send + 'static) -> Self {
+        let vectored = w.is_write_vectored();
+        Self { inner: SequentialWriter::new(w), vectored }
+    }
+}
+
+impl Writer for CoalescingWriter {
+    fn write_multi_buffer(
+        &mut self,
+        mb: MultiBuffer,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            let buffers = mb.into_buffers();
+            if self.vectored || buffers.len() <= 1 {
+                return self.inner.write_multi_buffer(MultiBuffer::from_buffers(buffers)).await;
+            }
+            let total: usize = buffers.iter().map(|b| b.len()).sum();
+            let mut acc = Vec::with_capacity(total);
+            for buf in &buffers {
+                acc.extend_from_slice(buf.bytes());
+            }
+            for mut buf in buffers {
+                buf.release();
+            }
+            let single = MultiBuffer::from_buffer(Buffer::from_vec(acc));
+            self.inner.write_multi_buffer(single).await
+        })
+    }
+
+    fn shutdown(&self) {
+        // 转发内层（同 BufferedWriter：pipe.Writer 覆写 EOF 通知不被吞）。
+        self.inner.shutdown()
+    }
+
+    fn shutdown_flush(&mut self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
+        // bd VISIONMAC：桥收尾必须排空 TLS 层滞留尾巴，转发 poll_shutdown。
+        self.inner.shutdown_flush()
+    }
+}
+
 // ========== Discard ==========
 
 /// 丢弃所有数据的 Writer
@@ -499,5 +559,106 @@ mod tests {
         use std::sync::atomic::Ordering::Relaxed;
         assert_eq!(*probe.data.lock(), b"aaabbbccc".as_slice(), "部分写必须从断点续写且保序");
         assert_eq!(probe.vectored_calls.load(Relaxed), 3);
+    }
+
+    /// F2 CoalescingWriter 测试用非 vectored sink（TLS 层形态）：记录单次
+    /// poll_write 调用数与全部落盘字节。
+    struct NonVectoredMock {
+        data: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        write_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        shutdown_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl NonVectoredMock {
+        fn new() -> (Self, Self) {
+            fn counters() -> (
+                std::sync::Arc<std::sync::atomic::AtomicUsize>,
+                std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            ) {
+                Default::default()
+            }
+            let (write_calls, shutdown_calls) = counters();
+            let data: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = Default::default();
+            (
+                Self {
+                    data: data.clone(),
+                    write_calls: write_calls.clone(),
+                    shutdown_calls: shutdown_calls.clone(),
+                },
+                Self { data, write_calls, shutdown_calls },
+            )
+        }
+    }
+
+    impl AsyncWrite for NonVectoredMock {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.write_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.data.lock().unwrap().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            false
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.shutdown_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_coalescing_writer_non_vectored_single_write() {
+        // F2：非 vectored sink 上 3 块必须拼成**单次** write_all（8×8KB →
+        // 1×64KB → TLS 层 4×16KB record，替代 8×8KB record）。
+        let (mock, probe) = NonVectoredMock::new();
+        let mut writer = CoalescingWriter::new(mock);
+
+        let mut mb = MultiBuffer::new();
+        mb.push(Buffer::from_vec(b"aaa".to_vec()));
+        mb.push(Buffer::from_vec(b"bbb".to_vec()));
+        mb.push(Buffer::from_vec(b"cc".to_vec()));
+        writer.write_multi_buffer(mb).await.expect("write failed");
+
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(*probe.data.lock().unwrap(), b"aaabbbcc".as_slice(), "聚合写必须保序拼接全部块");
+        assert_eq!(probe.write_calls.load(Relaxed), 1, "3 块应拼成单次 write_all");
+    }
+
+    #[tokio::test]
+    async fn test_coalescing_writer_single_buffer_passthrough() {
+        // 单缓冲直通：同样一次 write_all，不引入拷贝路径行为差异。
+        let (mock, probe) = NonVectoredMock::new();
+        let mut writer = CoalescingWriter::new(mock);
+
+        let mb = MultiBuffer::from_buffer(Buffer::from_vec(b"hello".to_vec()));
+        writer.write_multi_buffer(mb).await.expect("write failed");
+
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(*probe.data.lock().unwrap(), b"hello".as_slice());
+        assert_eq!(probe.write_calls.load(Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_coalescing_writer_shutdown_flush_reaches_sink() {
+        // bd VISIONMAC：桥收尾排空必须穿透包装层到达 sink（poll_shutdown）。
+        let (mock, probe) = NonVectoredMock::new();
+        let mut writer = CoalescingWriter::new(mock);
+
+        let mb = MultiBuffer::from_buffer(Buffer::from_vec(b"tail".to_vec()));
+        writer.write_multi_buffer(mb).await.expect("write failed");
+        writer.shutdown_flush().await.expect("shutdown failed");
+
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(*probe.data.lock().unwrap(), b"tail".as_slice(), "收尾前数据必须已落盘");
+        assert_eq!(probe.shutdown_calls.load(Relaxed), 1, "shutdown_flush 必须转发到 sink");
     }
 }
