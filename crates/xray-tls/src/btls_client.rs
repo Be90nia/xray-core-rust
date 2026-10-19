@@ -1046,7 +1046,33 @@ impl<S: Connection + Unpin> BtlsConn<S> {
             fp_config.connector.configure().map_err(|e| io::Error::other(e.to_string()))?;
         cfg.set_verify_hostname(false);
 
+        // 客户端 TLS session cache（B2，2026-10-19）：connector 自身不同进程
+        // 间共享——每个 dial 重新构建 `FpConfig.connector` = 新 SSL_CTX；
+        // 本模块 cache 用 serialized SSL_SESSION 跨 CTX 传递 PSK 信息。
+        // `enableSessionResumption=false` 走 lookup 早返（与 rustls 路径的
+        // `Resumption::disabled()` 对齐）。从 cfg 抽出 SslContextRef 给
+        // `SSL_SESSION_from_bytes` 用（仅 cipher 校验）。
+        let enable_session_resumption =
+            crate::tls_session_cache::parse_enable_session_resumption(None);
         let mut ssl = cfg.into_ssl(server_name).map_err(|e| io::Error::other(e.to_string()))?;
+        if let Some(session) = crate::tls_session_cache::lookup_for_resume(
+            server_name,
+            fingerprint,
+            ssl.ssl_context(),
+            enable_session_resumption,
+        ) {
+            // SAFETY: SslSession 关联同 fingerprint 的 SSL_CTX（cipher 兼容）；
+            // 调用期间 session 须存活——`session` 绑定到本 if-let scope，离开前
+            // BoringSSL 已 up-ref session，drop 在 scope 末尾释放。
+            if unsafe { ssl.set_session(&session) }.is_err() {
+                debug!(
+                    target: "xray_tls::btls",
+                    fingerprint = ?fingerprint,
+                    server_name,
+                    "btls uTLS: SSL_set_session 失败，将走 full handshake"
+                );
+            }
+        }
 
         // per-connection 配置：key shares 和 ALPS 按指纹不同
         ssl.set_client_key_shares(fp_config.key_shares)
@@ -1082,18 +1108,34 @@ impl<S: Connection + Unpin> BtlsConn<S> {
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e.to_string()))?;
 
+        // 会话复用证据埋点（B2 验收 7）：握手成功后从 ssl 读 `session_reused`
+        // （BoringSSL 内部 = `SSL_session_reused(ssl)`）。True = 本次握手走了
+        // 1-RTT/0-RTT resumption；False = 1-RTT 完整握手（新 server / ticket 过期）。
+        let reused = pinned.ssl().session_reused();
+        debug!(
+            target: "xray_tls::btls",
+            fingerprint = ?fingerprint,
+            server_name,
+            session_reused = reused,
+            "btls uTLS 握手完成"
+        );
+
         // 回接验证：btls 全程 set_verify(NONE)（保 ClientHello 指纹不被
         // 验证回调影响），握手成功后用 rustls verifier 验 peer 链。
         if let Some(v) = verifier.as_deref() {
             verify_peer_certs(pinned.ssl(), server_name, v)?;
         }
 
-        debug!(
-            target: "xray_tls::btls",
-            fingerprint = ?fingerprint,
-            server_name,
-            "btls uTLS 握手完成"
-        );
+        // 把本次 handshake 拿到的 session 入 cache（供后续 dial 复用）。
+        // enableSessionResumption=false 时 store_session 立即返回。
+        if let Some(sess) = pinned.ssl().session() {
+            crate::tls_session_cache::store_session(
+                server_name,
+                fingerprint,
+                sess,
+                enable_session_resumption,
+            );
+        }
 
         Ok(Self { stream: pinned, fingerprint, server_name: server_name.to_string() })
     }

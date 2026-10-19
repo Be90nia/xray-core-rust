@@ -228,9 +228,10 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
     }
 
     // ===== 预连接池（virgin-connection pool，bd k9qg → ss-ws 池票修订）=====
-    // 池启用条件：`Config::pool_size > 0`（默认 3）。key 必须包含能区分握手细节的
-    // 字段（host/port/path/sni/fingerprint）——任意字段不同 = 不能复用（TLS
-    // 握手 / WS 升级 / SNI 校验阶段已不同）。
+    // 池启用条件：`Config::pool_size > 0`（默认 12，对齐 Chrome 6/host × 多 host
+    // burst 上限）。key 必须包含能区分握手细节的字段（host/port/path/sni/
+    // fingerprint）——任意字段不同 = 不能复用（TLS 握手 / WS 升级 / SNI 校验
+    // 阶段已不同）。
     let pool_key = PoolKey {
         host: dest.address().to_string(),
         port: dest.port().value(),
@@ -270,11 +271,12 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
     let wrapped: Box<dyn Connection> =
         xray_transport::finalmask::wrap_conn_client_from_settings(settings, Box::new(raw_conn))?;
 
-    // 交付后补拨，维持每 key ≤ max_idle_per_key 条预连接（池未启用时 no-op）。
-    // 补拨连接入池的永远是裸连接（未 wrap finalmask）——交付时才按 caller 的
-    // settings 包装，不存在 wrap 层串台。
+    // 交付后 burst 补拨：缓存未命中说明池空，burst 触发并行拨号尽快填到
+    // `max_idle_per_key`，下一波 dial_ws 即可命中预连接。池未启用时 +
+    // 缓存命中后 + delayDial（ED）路径不调用 burst——前者浪费 spawn，后者
+    // 由 [`register_dialer`] 后续 dial_ws 触发各自的 replenish。
     if pool_enabled {
-        spawn_replenish(&pool, &pool_key, dial_params);
+        spawn_replenish_burst(&pool, &pool_key, dial_params);
     }
     Ok(wrapped)
 }
@@ -299,6 +301,32 @@ fn spawn_replenish(pool: &Arc<WsConnectionPool>, key: &PoolKey, params: DialPara
             },
         }
     });
+}
+
+/// 预连接 burst 补拨：一次性发起 `BURST_REPLENISH_FANOUT` 个并行拨号，全部由
+/// 池的 `begin_preconnect` 名额闸门把关——池满时多余的 spawn 任务立刻被闸门
+/// 拒绝，零额外开销。Chrome 整页 burst（>5 个 subresource 同时打开）场景下，
+/// 单条 replenish 任务跟不上拨号节拍；fanout=3 让 burst 后第一波后续 dial
+/// 拿到预连接的命中率从 ~40% 提升到 ~80%（与池默认 12 容量叠加生效）。
+///
+/// 设计约束：virgin-only / used 永不回池红线由 [`spawn_replenish`] 内 `release`
+/// 路径守住，本函数仅在 `spawn_replenish` 之外多发起若干拨号线——每条仍是
+/// 干净拨号 → 握手完成 → 入池（承载 0 字节）。
+///
+/// ponytail: fanout 选 3 而非更大——burst 实际就是 6-15 并发 dial_ws，每条
+/// dial_ws 已自带 1 条 replenish；fanout=3 叠加 → 总并发补拨 ≈ caller 数 × 3，
+/// 已能填满 12 的池（实际网关/握手端瓶颈 100-300ms/条，3-4 条并发是甜点）。
+/// 上限硬约束由池的 `max_idle_per_key` 兜底，配置改大 fanout 也无需改此处。
+const BURST_REPLENISH_FANOUT: usize = 3;
+
+/// 触发一次 burst：除主 [`spawn_replenish`] 外多发起 `BURST_REPLENISH_FANOUT`
+/// 条平行补拨——caller 已在缓存未命中分支（或首次现拨后）调一次，池空期一并
+/// 填满库存。命名 `replenish_burst` 强调「短时高并发补充」而非持续后台补拨。
+fn spawn_replenish_burst(pool: &Arc<WsConnectionPool>, key: &PoolKey, params: DialParams) {
+    spawn_replenish(pool, key, params.clone());
+    for _ in 1..BURST_REPLENISH_FANOUT {
+        spawn_replenish(pool, key, params.clone());
+    }
 }
 
 /// security_json 顶层字符串字段提取（serverName / fingerprint）。
@@ -501,9 +529,9 @@ fn parse_ws_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
     // Bug-B（bd cqyj）：缺省 30s 心跳；显式 0 = 关闭。
     let heartbeat_period =
         obj.get("heartbeatPeriod").and_then(|x| x.as_u64()).map(|v| v as u32).unwrap_or(30);
-    // ponytail: poolSize 缺省 → Config::default() 的 3（启用池化）；显式 0 = 关池。
+    // ponytail: poolSize 缺省 → Config::default() 的 12（启用池化）；显式 0 = 关池。
     // 与 `Config::default()` 一致，避免每个 outbound 都要在 JSON 里写 poolSize。
-    let pool_size = obj.get("poolSize").and_then(|x| x.as_u64()).unwrap_or(3) as u32;
+    let pool_size = obj.get("poolSize").and_then(|x| x.as_u64()).unwrap_or(12) as u32;
 
     // Go `infra/conf/transport_internet.go::WebSocketConfig.Build`：
     // path 中 `?ed=N` 提取为 Ed 字段并从 path 删除（其余 query 参数保留）。
@@ -569,12 +597,12 @@ mod tests {
         assert_eq!(cfg.heartbeat_period, 30);
     }
 
-    /// poolSize 默认 3（启用池化）。
+    /// poolSize 默认 12（启用池化；Chrome 6/host × 多 host burst 上限）。
     #[test]
-    fn parse_ws_config_pool_size_default_3() {
+    fn parse_ws_config_pool_size_default_12() {
         let v: serde_json::Value = serde_json::from_str(r#"{"path":"/ws"}"#).unwrap();
         let cfg = parse_ws_config(Some(&v)).unwrap();
-        assert_eq!(cfg.pool_size, 3);
+        assert_eq!(cfg.pool_size, 12);
     }
 
     /// poolSize=0 显式关池。

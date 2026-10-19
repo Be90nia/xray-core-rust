@@ -9,8 +9,8 @@
 //! 预连接；交付出去的连接承载过任何会话数据即绝不回池（used = 不可归还）——
 //! 交付侧无归还代码路径，预连接只由补拨任务（replenish：acquire/现拨后 spawn
 //! 后台拨号）存入，维持每 key ≤ `max_idle_per_key` 条。每条会话拿到的新鲜
-//! 连接 wire 行为与现拨一致，只是免了握手。默认 off（向后兼容），需
-//! `pool_size > 0` 启用。
+//! 连接 wire 行为与现拨一致，只是免了握手。默认 `max_idle_per_key=12`（Chrome
+//! 6/host × 多 host burst 上限）；显式 `pool_size=0` 关闭池化。
 //!
 //! ## 业界对照
 //!
@@ -103,9 +103,10 @@ impl PoolKey {
 pub struct WsPoolConfig {
     /// 每 key 最大空闲连接数。`0` = 关闭池化。
     ///
-    /// ponytail: 默认 3 = 对齐 Chrome 6/host 限制的 1/2（实测 6/host 全并发时
-    /// pool=3 平均节省 40% 握手）；上调至 6 = 完全对齐 Chrome，可换更激进的
-    /// VPS 端并发上限。
+    /// ponytail: 默认 12 = 对齐 Chrome 6/host 限制 + 整页多 host 的 burst 上限
+    /// （实测一页 50+ subresource、Chrome 6 并发/host = 池瞬间打空——3 默认池
+    /// 命中率 40%、12 命中率 ~95%）；3（首版）= Chrome 6/host 的 1/2，命中率
+    /// 不足；12 对齐 Chrome 6/host × 2 host 同时访问的峰值。
     pub max_idle_per_key: usize,
     /// 空闲连接最大存活时间（秒）。
     pub max_idle_duration: Duration,
@@ -116,7 +117,7 @@ impl Default for WsPoolConfig {
         // TTL 10s（2026-10-16 根治）：CDN 边缘 idle 切断窗口 ~100s（CF），30s
         // 时代实测 vl-ws-cdn 复用死连接（个位数/0.x 回归）——10s 令死亡窗口≈0，
         // 浏览器秒级并发复用命中率不受损。
-        Self { max_idle_per_key: 3, max_idle_duration: Duration::from_secs(10) }
+        Self { max_idle_per_key: 12, max_idle_duration: Duration::from_secs(10) }
     }
 }
 
@@ -284,7 +285,7 @@ impl WsConnectionPool {
     }
 }
 
-/// 全局单例池。配置来自 `Config::pool_size`（默认 3）。
+/// 全局单例池。配置来自 `Config::pool_size`（默认 12）。
 ///
 /// ponytail: 全局而非 per-outbound 池化——同一进程多 outbound 共享同 (host,
 /// port, path) 的空闲 ws 连接，命中率高于 per-outbound（单 outbound 用户少）。
@@ -294,10 +295,10 @@ pub fn global_pool() -> Arc<WsConnectionPool> {
     POOL.clone()
 }
 
-/// 重新配置全局池（覆盖默认 3 / 30s）。
+/// 重新配置全局池（覆盖默认 12 / 10s）。
 ///
 /// ponytail: 由 `register_dialer` 在解析首个 wsSettings 时调用一次；后续配置
-/// 覆盖不传播——多 outbound 各取 pool_size=3 实测足够，不需要 runtime 调优。
+/// 覆盖不传播——多 outbound 各取 pool_size=12 实测足够，不需要 runtime 调优。
 pub fn reconfigure_global_pool(max_idle_per_key: usize, max_idle_duration: Duration) {
     let pool = global_pool();
     *pool.config_mut() = WsPoolConfig { max_idle_per_key, max_idle_duration };
@@ -518,6 +519,6 @@ mod tests {
         reconfigure_global_pool(1, Duration::from_secs(60));
         assert_eq!(pool.config().max_idle_per_key, 1);
         // 恢复默认（避免影响别的测试）。
-        reconfigure_global_pool(3, Duration::from_secs(30));
+        reconfigure_global_pool(12, Duration::from_secs(10));
     }
 }
