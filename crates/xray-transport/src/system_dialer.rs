@@ -128,9 +128,9 @@ impl SystemDialer for DefaultSystemDialer {
         sockopt: &'a SocketOptions,
     ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Connection>>> + Send + 'a>> {
         Box::pin(async move {
-            // 域名解析：Domain → IP（tokio lookup_host，使用系统 DNS）
-            let dest_addr = match destination_to_socket_addr(destination) {
-                Ok(addr) => addr,
+            // 域名解析：Domain → IP（tokio lookup_host，使用系统 DNS）。
+            let addrs = match destination_to_socket_addr(destination) {
+                Ok(addr) => vec![addr],
                 Err(_) => {
                     // Domain 地址：tokio DNS 解析
                     let port = destination.port().value();
@@ -143,25 +143,49 @@ impl SystemDialer for DefaultSystemDialer {
                             ));
                         },
                     };
-                    let mut socket_addrs = tokio::net::lookup_host((host, port)).await?;
-                    socket_addrs.next().ok_or_else(|| {
-                        io::Error::new(
+                    let socket_addrs: Vec<SocketAddr> =
+                        tokio::net::lookup_host((host, port)).await?.collect();
+                    if socket_addrs.is_empty() {
+                        return Err(io::Error::new(
                             io::ErrorKind::NotFound,
                             format!("DNS resolve failed: {host}"),
-                        )
-                    })?
+                        ));
+                    }
+                    socket_addrs
                 },
             };
-            let stream = Self::dial_tcp_raw(src, dest_addr, DEFAULT_DIAL_TIMEOUT).await?;
-            // 应用 sockopt（TCP_NODELAY + SO_KEEPALIVE）。
-            let std_stream = stream.into_std()?;
-            let socket = Socket2::from(std_stream);
-            apply_outbound_socket_options(&socket, sockopt, Some(dest_addr))?;
-            // 转回 tokio TcpStream，包装为 Connection。
-            let tokio_stream = TcpStream::from_std(socket.into())?;
-            Ok(Box::new(crate::connection::TcpConnection::new(tokio_stream)) as Box<dyn Connection>)
+            dial_first_reachable(src, &addrs, sockopt).await
         })
     }
+}
+
+/// 多地址顺序拨号（Go `net.Dialer` 的地址回退语义）：首个失败换下一个，
+/// 全部失败返回最后一个错误。`src`/`sockopt` 在每次尝试都生效。
+async fn dial_first_reachable(
+    src: Option<SocketAddr>,
+    addrs: &[SocketAddr],
+    sockopt: &SocketOptions,
+) -> io::Result<Box<dyn Connection>> {
+    let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no address to dial");
+    for &addr in addrs {
+        let stream = match DefaultSystemDialer::dial_tcp_raw(src, addr, DEFAULT_DIAL_TIMEOUT).await
+        {
+            Ok(stream) => stream,
+            Err(e) => {
+                last_err = e;
+                continue;
+            },
+        };
+        // 应用 sockopt（TCP_NODELAY + SO_KEEPALIVE）。配置错误不换地址重试。
+        let std_stream = stream.into_std()?;
+        let socket = Socket2::from(std_stream);
+        apply_outbound_socket_options(&socket, sockopt, Some(addr))?;
+        let tokio_stream = TcpStream::from_std(socket.into())?;
+        return Ok(
+            Box::new(crate::connection::TcpConnection::new(tokio_stream)) as Box<dyn Connection>
+        );
+    }
+    Err(last_err)
 }
 
 /// 全局 effective system dialer。对应 Go `effectiveSystemDialer`。
@@ -780,6 +804,24 @@ mod tests {
         accept_task.await.unwrap();
     }
 
+    /// xqk4：多地址顺序回退——首地址不可达（closed port）→ 次地址（listener）连通。
+    #[tokio::test]
+    async fn dial_first_reachable_falls_back_to_second_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good = listener.local_addr().unwrap();
+        // 取一个当前无人监听的端口（bind 后立即释放）。
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let accept_task = tokio::spawn(async move { listener.accept().await });
+        let conn = dial_first_reachable(None, &[dead, good], &SocketOptions::default())
+            .await
+            .expect("second address should connect after first refused");
+        assert_eq!(conn.remote_addr().unwrap(), Some(good));
+        accept_task.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn default_dialer_resolves_domain_address() {
         // 域名不再被拒绝——dialer 会尝试 tokio DNS 解析。
@@ -1360,20 +1402,21 @@ impl SystemDialer for DnsResolvingDialer {
                     let lookup = format!("{domain}:{port}");
                     tracing::debug!(target = %lookup, "resolving domain via system DNS");
                     match tokio::net::lookup_host(&lookup).await {
-                        Ok(mut addrs) => {
-                            if let Some(resolved) = addrs.next() {
-                                tracing::debug!(target = %lookup, resolved = %resolved, "domain resolved");
-                                let ip_dest = Destination::tcp(
-                                    xray_common::net::address::Address::from(resolved.ip()),
-                                    destination.port(),
-                                );
-                                self.inner.dial(src, &ip_dest, sockopt).await
-                            } else {
-                                Err(io::Error::new(
+                        Ok(addrs) => {
+                            let addrs: Vec<SocketAddr> = addrs.collect();
+                            if addrs.is_empty() {
+                                return Err(io::Error::new(
                                     io::ErrorKind::AddrNotAvailable,
                                     format!("DNS lookup returned no addresses for {domain}"),
-                                ))
+                                ));
                             }
+                            tracing::debug!(
+                                target = %lookup,
+                                addrs = ?addrs,
+                                "domain resolved"
+                            );
+                            // 全部解析地址顺序尝试（首个失败换下一个，Go net.Dialer 语义）。
+                            dial_first_reachable(src, &addrs, sockopt).await
                         },
                         Err(e) => {
                             tracing::warn!(target = %domain, error = %e, "DNS lookup failed");

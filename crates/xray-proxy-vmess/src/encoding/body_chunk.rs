@@ -439,6 +439,90 @@ pub fn decode_chunk_stream<R: Read>(
     }
 }
 
+/// 单 chunk 明文容量上限（UDP 模式 packet 截断预算；与 [`encode_chunk_stream`]
+/// 的 `payload_chunk_size` 同源——tag + size_field + max_padding 全扣）。
+#[must_use]
+pub fn single_chunk_capacity(cipher: &dyn AeadCipher, size_parser: &dyn SizeParser) -> usize {
+    let max_padding = usize::from(size_parser_max_padding_hint(size_parser));
+    DEFAULT_PAYLOAD_SIZE
+        .saturating_sub(cipher.tag_size())
+        .saturating_sub(size_parser.size_bytes())
+        .saturating_sub(max_padding)
+}
+
+// ============================================================================
+// 单 chunk 原语（UDP 模式：chunk 即 packet，Go 非 cone 语义）
+// ============================================================================
+
+/// 从 reader 读取并解码**恰好一个** chunk，返回其明文。
+///
+/// UDP 语义（对齐 Go vmess server `UDPSession`/client 非 cone）：每个 chunk 的
+/// payload 就是一个 UDP 数据报——写侧每次 `poll_write` 一包（复用
+/// [`write_one_chunk`] 构帧），读侧每解一个 chunk 交付一包。
+///
+/// 返回 `Ok(None)`：chunk 边界干净 EOF（流结束）或终止 chunk（空明文）。
+///
+/// # Errors
+///
+/// - IO 错误（截断 chunk）
+/// - AEAD 解密失败
+pub async fn decode_single_chunk_async<R: AsyncRead + Unpin + Send>(
+    reader: &mut R,
+    cipher: &(dyn AeadCipher + Send + Sync),
+    nonce_gen: &mut (dyn ChunkNonce + Send),
+    size_parser: &mut (dyn SizeParser + Send),
+    global_padding: bool,
+) -> std::io::Result<Option<Vec<u8>>> {
+    use tokio::io::AsyncReadExt;
+    // SHAKE128 流顺序对齐 decode_chunk_stream：next_padding_len 先于 decode。
+    let padding_size =
+        if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
+
+    let sb = size_parser.size_bytes();
+    let mut size_field = vec![0u8; sb];
+    match read_size_field_or_eof_async(reader, &mut size_field).await {
+        Ok(true) => {},
+        Ok(false) => return Ok(None), // 干净 EOF = 流结束
+        Err(e) => return Err(e),
+    }
+    let total_size = size_parser.decode(&size_field);
+    if total_size == 0 {
+        return Ok(None); // 终止信号（对齐 Go AuthenticationReader size==0）
+    }
+
+    let ciphertext_size = usize::from(total_size).saturating_sub(padding_size);
+    let mut ciphertext = vec![0u8; usize::from(total_size)];
+    reader.read_exact(&mut ciphertext).await?;
+
+    let nonce = nonce_gen.next();
+    let plaintext = cipher
+        .open(&nonce, &[], &ciphertext[..ciphertext_size])
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    if plaintext.is_empty() {
+        return Ok(None); // 终止 chunk（seal([])）
+    }
+    Ok(Some(plaintext))
+}
+
+/// 把一个明文 packet 编码为**恰好一个** chunk 写入 `std::io::Write`（同步，
+/// 供 poll_write 侧构帧复用）。调用方须保证 `data.len()` 不超过单 chunk 容量
+/// （`DEFAULT_PAYLOAD_SIZE - tag - size_field - max_padding`）。
+///
+/// # Errors
+///
+/// - IO 错误
+/// - AEAD 加密失败
+pub fn encode_single_chunk<W: Write>(
+    writer: &mut W,
+    data: &[u8],
+    cipher: &dyn AeadCipher,
+    nonce_gen: &mut dyn ChunkNonce,
+    size_parser: &mut dyn SizeParser,
+    global_padding: bool,
+) -> std::io::Result<()> {
+    write_one_chunk(writer, data, cipher, nonce_gen, size_parser, global_padding)
+}
+
 // ============================================================================
 // async 版本（tokio::io::AsyncRead/AsyncWrite）
 // ============================================================================

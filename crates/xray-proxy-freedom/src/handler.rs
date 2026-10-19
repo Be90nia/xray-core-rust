@@ -40,11 +40,18 @@ pub struct FreedomHandler {
 
 impl FreedomHandler {
     /// 构造 Freedom Handler，并预构建 final rules。
-    #[must_use]
-    pub fn new(tag: impl Into<String>, config: Config) -> Self {
-        let final_rules =
-            config.final_rules.iter().filter_map(|rc| FinalRule::build(rc).ok()).collect();
-        Self { tag: tag.into(), final_rules, default_rule_type: None, config }
+    ///
+    /// # Errors
+    ///
+    /// 任一 finalRules 条目非法时返回错误（Go `freedom.go:208-214` Init 硬错
+    /// 语义；此前 `.ok()` 静默丢弃非法条目）。
+    pub fn new(tag: impl Into<String>, config: Config) -> Result<Self, String> {
+        let mut final_rules = Vec::with_capacity(config.final_rules.len());
+        for rc in &config.final_rules {
+            final_rules.push(FinalRule::build(rc)
+                .map_err(|e| format!("freedom: failed to build final rule: {e}"))?);
+        }
+        Ok(Self { tag: tag.into(), final_rules, default_rule_type: None, config })
     }
 
     /// 显式设置默认规则类型（覆盖 session 推导）。对应 Go `getDefaultFinalRule`
@@ -269,25 +276,25 @@ mod tests {
 
     #[test]
     fn handler_tag_returns_construction_tag() {
-        let h = FreedomHandler::new("freedom_out", Config::default());
+        let h = FreedomHandler::new("freedom_out", Config::default()).expect("valid config");
         assert_eq!(h.tag(), "freedom_out");
     }
 
     #[test]
     fn can_handle_ipv4_destination() {
-        let h = FreedomHandler::new("direct", Config::default());
+        let h = FreedomHandler::new("direct", Config::default()).expect("valid config");
         assert!(h.can_handle(&make_ip_dest("127.0.0.1", 80)));
     }
 
     #[test]
     fn can_handle_ipv6_destination() {
-        let h = FreedomHandler::new("direct", Config::default());
+        let h = FreedomHandler::new("direct", Config::default()).expect("valid config");
         assert!(h.can_handle(&make_ip_dest("::1", 443)));
     }
 
     #[test]
     fn can_handle_domain_destination() {
-        let h = FreedomHandler::new("direct", Config::default());
+        let h = FreedomHandler::new("direct", Config::default()).expect("valid config");
         assert!(h.can_handle(&make_domain_dest("example.com", 443)));
     }
 
@@ -301,7 +308,7 @@ mod tests {
             let _ = listener.accept().await;
         });
 
-        let h = FreedomHandler::new("test", Config::default());
+        let h = FreedomHandler::new("test", Config::default()).expect("valid config");
         let dest = make_ip_dest("127.0.0.1", addr.port());
         let session = Session::new();
         let result = h.dial(&dest, &session).await;
@@ -329,7 +336,7 @@ mod tests {
             domain_strategy: crate::config::DomainStrategy::UseIPv4 as i32,
             ..Default::default()
         };
-        let h = FreedomHandler::new("test", config);
+        let h = FreedomHandler::new("test", config).expect("valid config");
         let dest = make_domain_dest("dualstack.test", addr.port());
         let session = Session::new();
         let result =
@@ -348,7 +355,7 @@ mod tests {
     #[tokio::test]
     async fn dial_to_invalid_domain_returns_error() {
         // 无效域名：DNS 解析失败
-        let h = FreedomHandler::new("test", Config::default());
+        let h = FreedomHandler::new("test", Config::default()).expect("valid config");
         let dest = make_domain_dest("this-domain-does-not-exist-xyz.invalid", 80);
         let session = Session::new();
         let result =
@@ -382,7 +389,7 @@ mod tests {
         });
 
         // 用 handler.dial 验证拨号（Connection 在 handler 内 drop）
-        let h = FreedomHandler::new("echo-test", Config::default());
+        let h = FreedomHandler::new("echo-test", Config::default()).expect("valid config");
         let dest = make_ip_dest("127.0.0.1", addr.port());
         let session = Session::new();
         h.dial(&dest, &session).await.unwrap();
@@ -411,7 +418,7 @@ mod tests {
             final_rules: vec![rule],
             ..Default::default()
         };
-        let h = FreedomHandler::new("test", config);
+        let h = FreedomHandler::new("test", config).expect("valid config");
         let dest = make_domain_dest("intranet.test", 80);
         let session = Session::new();
         let err = h.dial(&dest, &session).await.expect_err("blocked domain must not dial");
@@ -438,7 +445,7 @@ mod tests {
             domain_strategy: crate::config::DomainStrategy::UseIPv4 as i32,
             ..Default::default()
         };
-        let h = FreedomHandler::new("test", config);
+        let h = FreedomHandler::new("test", config).expect("valid config");
         let dest = make_domain_dest("localhost", addr.port());
         let session = Session::new();
         let result =
@@ -482,7 +489,7 @@ mod tests {
             final_rules: vec![rule],
             ..Default::default()
         };
-        let h = FreedomHandler::new("test", config);
+        let h = FreedomHandler::new("test", config).expect("valid config");
         let dest = make_domain_dest("localhost", addr.port());
         let session = Session::new();
         let result =

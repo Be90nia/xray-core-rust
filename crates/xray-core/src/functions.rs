@@ -19,7 +19,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use xray_app_dispatcher::{
     DefaultDispatcher, OutboundHandlerManager,
-    default::{SimpleOhm, SniffingRequest},
+    default::{AccessContext, SimpleOhm, SniffingRequest},
 };
 use xray_features::FeatureError;
 use xray_transport::link::Link;
@@ -419,11 +419,14 @@ impl xray_app_dns::dial::QueryDialer for DispatcherDnsDialer {
     > {
         // Go nameserver_tcp.go:43-47 / dohnameserver.go:68：dispatcher.Dispatch
         // 完整路由链（无 forced tag，无 sniffing——DNS 查询目标即真实目标）。
+        // SkipDNSResolve=true（Go nameserver_tcp.go:147 / nameserver_doh.go:187）：
+        // 路由层不得再解析目标域名，否则域名 NS + 非 AsIs 策略会递归查询。
         let dispatcher = Arc::clone(&self.dispatcher);
         let dest = dest.clone();
         Box::pin(async move {
+            let access = AccessContext { skip_dns_resolve: true, ..AccessContext::default() };
             let link = dispatcher
-                .dispatch(&dest, &SniffingRequest::default(), None, None)
+                .dispatch_with_access(&dest, &SniffingRequest::default(), None, None, Some(access))
                 .map_err(|e| std::io::Error::other(format!("dns dispatch: {e}")))?;
             let Link { reader, writer } = link;
             Ok(Box::new(xray_app_dns::dial::LinkStream::new(reader, writer))
@@ -478,7 +481,16 @@ impl xray_app_dispatcher::DispatchHandler for DispatcherLinkHandler {
         dest: &xray_common::net::destination::Destination,
         link: xray_transport::link::Link,
     ) -> xray_app_dispatcher::default::PinFuture<()> {
-        let r = self.dispatcher.dispatch_link(dest, link, &SniffingRequest::default(), None, None);
+        // DNS 查询同样置 SkipDNSResolve（Go UDP 直连不经路由；Rust 经路由链，
+        // 置位以保持"DNS 查询不再被解析"的等价语义，防递归）。
+        let access = AccessContext { skip_dns_resolve: true, ..AccessContext::default() };
+        let r = self.dispatcher.dispatch_link(
+            dest,
+            link,
+            &SniffingRequest::default(),
+            Some(access),
+            None,
+        );
         Box::pin(async move {
             if let Err(e) = r {
                 tracing::warn!(tag = "dns", error = %e, "dns udp dispatch link failed");

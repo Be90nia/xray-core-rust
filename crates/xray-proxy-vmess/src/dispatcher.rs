@@ -36,7 +36,9 @@ use crate::{
     account::MemoryAccount,
     encoding::{
         ChunkNonceGenerator, VERSION,
-        body_chunk::{PlainSizeParser, ShakeSizeParserAdapter, SizeParser},
+        body_chunk::{
+            ChunkNonceAdapter, PlainSizeParser, ShakeSizeParserAdapter, SizeParser,
+        },
         client::ClientSession,
         generate_chacha20poly1305_key,
         server::has_aes_gcm_hardware_support,
@@ -228,6 +230,7 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>) -> DialFn {
         let config = Arc::clone(&config);
         let target_addr = dest.address().clone();
         let target_port = dest.port();
+        let is_udp = dest.is_udp();
         Box::pin(async move {
             let server_dest = config.server_destination();
             let sockopt =
@@ -259,10 +262,14 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>) -> DialFn {
             }
             let account = MemoryAccount::new(config.user_uuid.clone()).with_security(security);
             let session = ClientSession::new();
+            // command/network 按 dest.network（Go vmess outbound.go:88-91：
+            // UDP 目标 → RequestCommandUDP）。
+            let command = if is_udp { Command::Udp } else { Command::Tcp };
+            let network = if is_udp { Network::UDP } else { Network::TCP };
             let header = RequestHeader::new(
                 VERSION,
-                Command::Tcp,
-                Destination::new(target_addr, target_port, Network::TCP),
+                command,
+                Destination::new(target_addr, target_port, network),
                 security,
             )
             .with_option(option);
@@ -292,7 +299,23 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>) -> DialFn {
             } else {
                 Box::new(PlainSizeParser)
             };
-            // 7. 返回 VmessConn（内部 spawn 双向 chunk pump；响应头在 down pump 内惰性解码）
+            // 7. UDP：VmessUdpConn（chunk 即 packet，Go 非 cone 语义——packet 边界
+            //    必须保持，duplex 流桥会合并多次 write 破坏边界）；TCP：VmessConn
+            //    （内部 spawn 双向 chunk pump；响应头在 down pump 内惰性解码）。
+            if is_udp {
+                return Ok(Box::new(VmessUdpConn::from_udp_conn(
+                    conn,
+                    session,
+                    req_cipher,
+                    req_iv,
+                    req_size_parser,
+                    use_padding,
+                    resp_cipher,
+                    resp_iv,
+                    resp_size_parser,
+                    use_padding,
+                )) as Box<dyn Connection>);
+            }
             Ok(Box::new(VmessConn::from_conn(
                 conn,
                 session,
@@ -391,6 +414,209 @@ impl AsyncWrite for VmessConn {
 }
 
 impl Connection for VmessConn {
+    fn remote_addr(&self) -> std::io::Result<Option<SocketAddr>> {
+        Ok(None)
+    }
+
+    fn local_addr(&self) -> std::io::Result<Option<SocketAddr>> {
+        Ok(None)
+    }
+}
+
+/// VMess UDP 出站连接：chunk 即 packet（Go 非 cone 语义）。
+///
+/// 上行：每次 [`AsyncWrite::poll_write`] 把传入 buf 编码为**恰好一个** chunk
+/// （AEAD seal，见 [`crate::encoding::body_chunk::encode_single_chunk`]）直写底层
+/// 连接——duplex 流桥会合并多次 write 破坏 packet 边界，故不走 [`VmessConn`]
+/// 的 duplex 泵。下行：spawn task 惰性解响应头后逐 chunk 解密，包经 mpsc 队列
+/// 交付，[`AsyncRead::poll_read`] 每次返回一个 packet。
+struct VmessUdpConn {
+    inner_w: tokio::io::WriteHalf<Box<dyn Connection>>,
+    rx: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    up_nonce: ChunkNonceAdapter,
+    req_cipher: BodyCipher,
+    /// Mutex 仅为 Connection::Sync（poll_write 单线程独占，锁无竞争）；
+    /// ShakeSizeParserAdapter 内部 XofReader 非 Sync，无法裸存。
+    req_size_parser: parking_lot::Mutex<Box<dyn SizeParser + Send>>,
+    req_padding: bool,
+    /// 单 chunk 明文容量上限（packet 超限截断；UDP relay 实际包 ≤ MTU）
+    up_chunk_cap: usize,
+    wpending: Vec<u8>,
+    wpos: usize,
+    _down_task: tokio::task::JoinHandle<()>,
+}
+
+impl VmessUdpConn {
+    /// 从底层连接构造 UDP 模式连接（响应头由 down task 惰性解码）。
+    #[allow(clippy::too_many_arguments)] // 与 Go dial 参数集一一对应
+    fn from_udp_conn(
+        conn: Box<dyn Connection>,
+        session: ClientSession,
+        req_cipher: BodyCipher,
+        req_iv: [u8; 16],
+        req_size_parser: Box<dyn SizeParser + Send>,
+        req_padding: bool,
+        resp_cipher: BodyCipher,
+        resp_iv: [u8; 16],
+        mut resp_size_parser: Box<dyn SizeParser + Send>,
+        resp_padding: bool,
+    ) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let (stream_r, stream_w) = tokio::io::split(conn);
+        let up_chunk_cap =
+            crate::encoding::body_chunk::single_chunk_capacity(&req_cipher, req_size_parser.as_ref());
+        let down_task = tokio::spawn(async move {
+            let mut sr = stream_r;
+            // 响应头惰性解码（Go SetFlushNext：首块下行才 flush，dial 阶段同步
+            // 等待会造成双向死锁——与 VmessConn 同语义）。
+            if let Err(e) = session.decode_response_header_async(&mut sr).await {
+                tracing::debug!(error = %e, "vmess udp decode response header failed");
+                let _ = tx
+                    .send(Err(std::io::Error::other(format!(
+                        "vmess udp response header: {e}"
+                    ))))
+                    .await;
+                return;
+            }
+            let mut nonce_gen = ChunkNonceAdapter::new(&resp_iv, 12);
+            loop {
+                match crate::encoding::body_chunk::decode_single_chunk_async(
+                    &mut sr,
+                    &resp_cipher,
+                    &mut nonce_gen,
+                    resp_size_parser.as_mut(),
+                    resp_padding,
+                )
+                .await
+                {
+                    Ok(Some(pkt)) => {
+                        if tx.send(Ok(pkt)).await.is_err() {
+                            break; // 读端已 drop
+                        }
+                    },
+                    Ok(None) => break, // 终止 chunk / 干净 EOF = 流结束
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        break;
+                    },
+                }
+            }
+        });
+        Self {
+            inner_w: stream_w,
+            rx,
+            up_nonce: ChunkNonceAdapter::new(&req_iv, 12),
+            req_cipher,
+            req_size_parser: parking_lot::Mutex::new(req_size_parser),
+            req_padding,
+            up_chunk_cap,
+            wpending: Vec::new(),
+            wpos: 0,
+            _down_task: down_task,
+        }
+    }
+}
+
+impl AsyncWrite for VmessUdpConn {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = &mut *self;
+        // 排干 pending 帧（一包一帧，不可分）
+        while this.wpos < this.wpending.len() {
+            let n = std::task::ready!(
+                Pin::new(&mut this.inner_w).poll_write(cx, &this.wpending[this.wpos..])
+            )?;
+            if n == 0 {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "vmess udp: frame write stalled",
+                )));
+            }
+            this.wpos += n;
+        }
+        // 一包一 chunk
+        let payload = &buf[..buf.len().min(this.up_chunk_cap)];
+        let mut frame = Vec::with_capacity(payload.len() + 96);
+        crate::encoding::body_chunk::encode_single_chunk(
+            &mut frame,
+            payload,
+            &this.req_cipher,
+            &mut this.up_nonce,
+            this.req_size_parser.lock().as_mut(),
+            this.req_padding,
+        )
+        .map_err(|e| std::io::Error::other(format!("vmess udp encode: {e}")))?;
+        this.wpending = frame;
+        this.wpos = 0;
+        while this.wpos < this.wpending.len() {
+            let n = std::task::ready!(
+                Pin::new(&mut this.inner_w).poll_write(cx, &this.wpending[this.wpos..])
+            )?;
+            if n == 0 {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "vmess udp: frame write stalled",
+                )));
+            }
+            this.wpos += n;
+        }
+        Poll::Ready(Ok(payload.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner_w).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = &mut *self.get_mut();
+        // 写终止 chunk（seal([])）——服务端 decode 看到空明文即流结束
+        if this.wpos >= this.wpending.len() {
+            let mut frame = Vec::with_capacity(96);
+            crate::encoding::body_chunk::encode_single_chunk(
+                &mut frame,
+                &[],
+                &this.req_cipher,
+                &mut this.up_nonce,
+                this.req_size_parser.lock().as_mut(),
+                this.req_padding,
+            )
+            .map_err(|e| std::io::Error::other(format!("vmess udp termination: {e}")))?;
+            this.wpending = frame;
+            this.wpos = 0;
+        }
+        Pin::new(&mut this.inner_w).poll_shutdown(cx)
+    }
+}
+
+impl AsyncRead for VmessUdpConn {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            match std::task::ready!(self.get_mut().rx.poll_recv(cx)) {
+                Some(Ok(pkt)) => {
+                    // 包大于 ReadBuf 时截断剩余（数据报不可分；relay 缓冲 ≥ MTU，
+                    // 与 Go buf 单包上限语义一致）
+                    let n = pkt.len().min(buf.remaining());
+                    buf.put_slice(&pkt[..n]);
+                    return Poll::Ready(Ok(()));
+                },
+                Some(Err(e)) => return Poll::Ready(Err(e)),
+                None => return Poll::Ready(Ok(())), // down task 结束 = 流结束
+            }
+        }
+    }
+}
+
+impl Connection for VmessUdpConn {
     fn remote_addr(&self) -> std::io::Result<Option<SocketAddr>> {
         Ok(None)
     }
@@ -883,6 +1109,123 @@ mod tests {
             body_arrived.load(Ordering::SeqCst),
             "server must receive body without having sent the response header"
         );
+    }
+
+    /// vmess UDP（bd uhg2）：一包一 chunk。写侧 poll_write 边界=packet 边界，
+    /// server 侧逐 chunk 解出恰好两包。
+    #[tokio::test]
+    async fn vmess_udp_conn_write_boundaries() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client_side, mut server_side) = tokio::io::duplex(16384);
+        let mut conn = VmessUdpConn::from_udp_conn(
+            Box::new(xray_transport::connection::DuplexConnection::new(client_side)),
+            ClientSession::new(),
+            BodyCipher::Aes(Aes128Gcm::new(&[0x42u8; 16]).expect("cipher")),
+            [0xAAu8; 16],
+            Box::new(PlainSizeParser),
+            false,
+            BodyCipher::Aes(Aes128Gcm::new(&[0x43u8; 16]).expect("cipher")),
+            [0xBBu8; 16],
+            Box::new(PlainSizeParser),
+            false,
+        );
+
+        conn.write_all(b"ping").await.unwrap();
+        conn.write_all(&[9u8; 600]).await.unwrap();
+        conn.flush().await.unwrap();
+
+        // server 侧：同 key/iv 序列解密，应解出恰好两包
+        let server_cipher = Aes128Gcm::new(&[0x42u8; 16]).expect("cipher");
+        let mut nonce = ChunkNonceAdapter::new(&[0xAAu8; 16], 12);
+        let mut sp = PlainSizeParser;
+        let p1 = crate::encoding::body_chunk::decode_single_chunk_async(
+            &mut server_side,
+            &server_cipher,
+            &mut nonce,
+            &mut sp,
+            false,
+        )
+        .await
+        .expect("decode p1")
+        .expect("p1 non-terminal");
+        assert_eq!(p1, b"ping");
+        let p2 = crate::encoding::body_chunk::decode_single_chunk_async(
+            &mut server_side,
+            &server_cipher,
+            &mut nonce,
+            &mut sp,
+            false,
+        )
+        .await
+        .expect("decode p2")
+        .expect("p2 non-terminal");
+        assert_eq!(p2, vec![9u8; 600]);
+    }
+
+    /// decode_single_chunk_async：两个 chunk 的 wire 逐次解出两包；干净 EOF = None。
+    #[tokio::test]
+    async fn decode_single_chunk_packet_boundaries() {
+        use std::io::Cursor;
+
+        let cipher = Aes128Gcm::new(&[0x42u8; 16]).expect("cipher");
+        let mut nonce = ChunkNonceAdapter::new(&[0xAAu8; 16], 12);
+        let mut sp = PlainSizeParser;
+        let mut wire = Vec::new();
+        crate::encoding::body_chunk::encode_single_chunk(
+            &mut wire,
+            b"hello",
+            &cipher,
+            &mut nonce,
+            &mut sp,
+            false,
+        )
+        .unwrap();
+        crate::encoding::body_chunk::encode_single_chunk(
+            &mut wire,
+            b"world!!",
+            &cipher,
+            &mut nonce,
+            &mut sp,
+            false,
+        )
+        .unwrap();
+
+        let mut cur = Cursor::new(wire);
+        let mut dec_nonce = ChunkNonceAdapter::new(&[0xAAu8; 16], 12);
+        let mut dec_sp = PlainSizeParser;
+        let p1 = crate::encoding::body_chunk::decode_single_chunk_async(
+            &mut cur,
+            &cipher,
+            &mut dec_nonce,
+            &mut dec_sp,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(p1, b"hello");
+        let p2 = crate::encoding::body_chunk::decode_single_chunk_async(
+            &mut cur,
+            &cipher,
+            &mut dec_nonce,
+            &mut dec_sp,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(p2, b"world!!");
+        let eof = crate::encoding::body_chunk::decode_single_chunk_async(
+            &mut cur,
+            &cipher,
+            &mut dec_nonce,
+            &mut dec_sp,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(eof.is_none(), "clean EOF must be None");
     }
 
     /// wire 字节对拍（判别器）：write_one_chunk 输出必须逐字节等于手工
