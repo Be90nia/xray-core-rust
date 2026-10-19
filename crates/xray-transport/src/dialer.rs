@@ -141,7 +141,7 @@ impl StreamSettings {
         for w in removed_feature_warnings(v) {
             xray_common::log::warning(w);
         }
-        let protocol = v.get("network").and_then(|n| n.as_str()).unwrap_or("tcp").to_string();
+        let protocol = v.get("network").or_else(|| v.get("method")).and_then(|n| n.as_str()).unwrap_or("tcp").to_string();
         let security = v.get("security").and_then(|s| s.as_str()).unwrap_or("").to_string();
         // 协议特定配置：尝试 `<protocol>Settings`（如 `wsSettings`/`grpcSettings`/`tcpSettings`）。
         // Go JSON 解析器约定 `network` 值与 settings 字段名对应（`tcp`→`tcpSettings`,
@@ -496,7 +496,7 @@ fn protocol_settings_key(protocol: &str) -> Option<&'static str> {
 /// Rust 保留现有宽容行为：`from_json` 仅 warn 不阻断，协议映射/安全层判定不变。
 fn removed_feature_warnings(v: &serde_json::Value) -> Vec<String> {
     let mut warnings = Vec::new();
-    let protocol = v.get("network").and_then(|n| n.as_str()).unwrap_or("tcp");
+    let protocol = v.get("network").or_else(|| v.get("method")).and_then(|n| n.as_str()).unwrap_or("tcp");
     match protocol.to_ascii_lowercase().as_str() {
         "http" | "h2" | "h3" => warnings.push(removed_feature_message(
             "HTTP transport (without header padding, etc.)",
@@ -1112,6 +1112,23 @@ mod transport_cache_tests {
         assert_eq!(
             s.transport_json.as_ref().unwrap().get("serviceName").and_then(|n| n.as_str()),
             Some("gun")
+        );
+    }
+
+    #[test]
+    fn stream_settings_method_alias_matches_go() {
+        // Go 认 "method" 作 "network" 别名（passwall 生成配置用 method；
+        // Go 26.10.17 实测走 httpupgrade）。只读 network 会降级裸 TCP → 服务端拒绝。
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"method":"httpupgrade","security":"tls","httpupgradeSettings":{"host":"h","path":"/p"},"tlsSettings":{"serverName":"s"}}"#,
+        )
+        .unwrap();
+        let s = StreamSettings::from_json(Some(&v));
+        assert_eq!(s.protocol, "httpupgrade");
+        assert!(s.is_tls());
+        assert_eq!(
+            s.transport_json.as_ref().unwrap().get("path").and_then(|p| p.as_str()),
+            Some("/p")
         );
     }
 

@@ -102,7 +102,8 @@ impl HttpUpgradeClient {
         let leftover =
             if payload_offset < buf.len() { buf[payload_offset..].to_vec() } else { Vec::new() };
 
-        Ok((HttpUpgradeConnection::new(io, None), leftover))
+        // 101 与首包同批到达时，余留字节必须保留，否则上层丢首包（vmess 响应头解密失败）。
+        Ok((HttpUpgradeConnection::new_with_pending(io, None, leftover), Vec::new()))
     }
 
     /// 在已建立的 IO 上执行客户端握手，ed > 0 时延迟读 101 响应（0-RTT）。
@@ -186,8 +187,12 @@ mod tests {
         server_io.write_all(resp).await.unwrap();
         server_io.flush().await.unwrap();
 
-        let (_conn, leftover) = handle.await.unwrap().unwrap();
-        assert_eq!(leftover, b"hello payload");
+        let (mut conn, leftover) = handle.await.unwrap().unwrap();
+        assert!(leftover.is_empty());
+        // 同批到达的 payload 必须由连接首读返回（不得丢弃）。
+        let mut got = [0u8; 13];
+        conn.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"hello payload");
     }
 
     #[tokio::test]
