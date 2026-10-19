@@ -28,9 +28,9 @@ use xray_transport::{
 };
 
 use crate::{
-    client::{DelayDialConn, DialFactory, DialOptions, DialParams, dial, dial_with_params},
+    client::{DelayDialConn, DialFactory, DialParams, dial_with_params},
     config::Config,
-    pool::{PoolKey, PooledConn, global_pool},
+    pool::{PoolKey, WsConnectionPool, global_pool},
 };
 
 /// 注册 WebSocket transport dialer。
@@ -227,7 +227,7 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
         return Ok(Box::new(DelayDialConn::new(ed, factory)));
     }
 
-    // ===== Bug-A ws 客户端连接池（bd k9qg） =====
+    // ===== 预连接池（virgin-connection pool，bd k9qg → ss-ws 池票修订）=====
     // 池启用条件：`Config::pool_size > 0`（默认 3）。key 必须包含能区分握手细节的
     // 字段（host/port/path/sni/fingerprint）——任意字段不同 = 不能复用（TLS
     // 握手 / WS 升级 / SNI 校验阶段已不同）。
@@ -245,49 +245,60 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
     if config.pool_size > 0 && !pool.config_initialized() {
         pool.init_config(config.pool_size as usize);
     }
-    // 池尝试：命中空闲连接（msg 复用 = 跳过 TCP+TLS+WS 握手 500ms）。
-    let pooled = if config.pool_size > 0 && pool.enabled() {
-        pool.try_acquire(&pool_key).await.map(|cached| {
-            // 池命中：用 PooledConn 包装（Drop 时归还到池）。
-            PooledConn::from_pool(cached, pool.clone(), pool_key.clone())
-        })
-    } else {
-        None
-    };
-
-    if let Some(cached_pooled) = pooled {
-        // 池命中：直接包装 finalmask（每 call 应用 per-outbound finalmask_json）。
-        return xray_transport::finalmask::wrap_conn_client_from_settings(
-            settings,
-            Box::new(cached_pooled),
-        );
-    }
-
-    // 池未命中 / 池未启用：拨号新连接。
-    let raw_conn = dial(DialOptions {
-        config: &config,
-        destination: dest,
-        early_data: None,
+    let pool_enabled = config.pool_size > 0 && pool.enabled();
+    let dial_params = DialParams {
+        config,
+        destination: dest.clone(),
         tls_config,
         tls_server_name,
         fingerprint,
         security_json: settings.security_json.clone(),
-    })
-    .await
-    .map_err(io::Error::other)?;
+    };
+
+    if pool_enabled {
+        // 只取预连接（握手完成、零内层字节）；交付即触发后台补拨维持库存。
+        if let Some(cached) = pool.try_acquire(&pool_key).await {
+            spawn_replenish(&pool, &pool_key, dial_params);
+            return xray_transport::finalmask::wrap_conn_client_from_settings(settings, cached);
+        }
+    }
+
+    // 预连接未命中 / 池未启用：现拨（wire 行为与旧路径一致）。
+    let raw_conn = dial_with_params(dial_params.clone(), None).await.map_err(io::Error::other)?;
 
     // 应用 finalmask（per-call per-outbound）。
     let wrapped: Box<dyn Connection> =
         xray_transport::finalmask::wrap_conn_client_from_settings(settings, Box::new(raw_conn))?;
 
-    // 池启用 + 无 finalmask 包装（最常见 case） → 入池供下个 caller 复用。
-    // ponytail: finalmask_json 非空时跳过入池——下个 caller 的 finalmask_json
-    // 可能不同，混用 = wrap 层串台。99% 用户 finalmask_json 空 = 入池生效。
-    if config.pool_size > 0 && pool.enabled() && settings.finalmask_json.is_none() {
-        Ok(Box::new(PooledConn::fresh_releasable(wrapped, pool.clone(), pool_key)))
-    } else {
-        Ok(wrapped)
+    // 交付后补拨，维持每 key ≤ max_idle_per_key 条预连接（池未启用时 no-op）。
+    // 补拨连接入池的永远是裸连接（未 wrap finalmask）——交付时才按 caller 的
+    // settings 包装，不存在 wrap 层串台。
+    if pool_enabled {
+        spawn_replenish(&pool, &pool_key, dial_params);
     }
+    Ok(wrapped)
+}
+
+/// 预连接补拨：spawn 后台拨号（完整 TCP+TLS+ws 握手），成功入池、失败放弃名额。
+///
+/// 预连接尽力而为：补拨失败不影响交付路径（caller 已拿到连接），失败原因
+/// debug 记录；名额在任务内 begin/end 配对，不漏记。
+fn spawn_replenish(pool: &Arc<WsConnectionPool>, key: &PoolKey, params: DialParams) {
+    let pool = pool.clone();
+    let key = key.clone();
+    tokio::spawn(async move {
+        if !pool.begin_preconnect(&key).await {
+            return;
+        }
+        let result = dial_with_params(params, None).await;
+        pool.end_preconnect(&key);
+        match result {
+            Ok(conn) => pool.release(key, Box::new(conn)).await,
+            Err(e) => {
+                tracing::debug!(key = %key.short_label(), error = %e, "ws pool replenish dial failed")
+            },
+        }
+    });
 }
 
 /// security_json 顶层字符串字段提取（serverName / fingerprint）。
@@ -881,5 +892,177 @@ mod tests {
                 },
             }
         }
+    }
+
+    /// 预连接池语义（ss-ws 池复用死会话修复）：dial_ws 交付的连接承载过会话
+    /// 数据后 Drop 绝不回池；池里出现的是补拨（replenish）的 virgin 连接。
+    /// 服务端给每条 echo 回显附上本连接序号——从池取出的连接 roundtrip 得到的
+    /// 序号 ≠ 已用会话的序号，即证明「used 连接不复现」。
+    #[tokio::test]
+    async fn dial_ws_used_connection_never_returns_and_replenish_fires() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use xray_common::net::{address::Address, network::Network, port::Port};
+
+        let settings = StreamSettings {
+            protocol: "websocket".to_string(),
+            transport_json: Some(serde_json::json!({"path": "/ws"})),
+            ..Default::default()
+        };
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_handler = Arc::clone(&accepted);
+        let handler: ConnHandler = Arc::new(move |conn| {
+            let id = accepted_handler.fetch_add(1, Ordering::SeqCst) as u8;
+            tokio::spawn(async move {
+                let mut conn = conn;
+                let mut buf = [0u8; 512];
+                loop {
+                    match conn.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            // 回显带本连接序号：client 用它识别「哪条连接」。
+                            let mut resp = Vec::with_capacity(n + 1);
+                            resp.push(id);
+                            resp.extend_from_slice(&buf[..n]);
+                            if conn.write_all(&resp).await.is_err() {
+                                break;
+                            }
+                        },
+                    }
+                }
+            });
+        });
+        let listener = listen_ws("127.0.0.1:0".parse().unwrap(), &settings, &handler, Vec::new())
+            .await
+            .expect("listen_ws");
+        let port = listener.local_addr().expect("local_addr").port();
+        let dest =
+            Destination::new(Address::new_domain("127.0.0.1"), Port::new(port), Network::TCP);
+
+        // key 与 dial_ws 内部同源构造（path 走同一 parse 路径）。
+        let key = PoolKey::new(
+            "127.0.0.1",
+            port,
+            parse_ws_config(settings.transport_json.as_ref()).expect("parse").normalized_path(),
+            None,
+            None,
+        )
+        .normalized();
+
+        // 写读一轮，返回服务端连接序号。
+        async fn roundtrip(conn: &mut Box<dyn Connection>, marker: &[u8]) -> u8 {
+            use tokio::io::AsyncReadExt;
+            use tokio::io::AsyncWriteExt;
+            conn.write_all(marker).await.expect("write");
+            let mut buf = vec![0u8; marker.len() + 1];
+            tokio::time::timeout(std::time::Duration::from_secs(5), conn.read_exact(&mut buf))
+                .await
+                .expect("echo timeout")
+                .expect("read ok");
+            buf[0]
+        }
+
+        // 轮询等补拨连接入池（后台握手有时延，最多 ~2s）——证明 acquire 后
+        // replenish 被触发且池里出现的是 virgin 连接。
+        async fn wait_preconnection(key: &PoolKey) -> Box<dyn Connection> {
+            for _ in 0..40 {
+                if let Some(c) = global_pool().try_acquire(key).await {
+                    return c;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!("replenished preconnection never arrived in pool (polled {:?})", key);
+        }
+
+        // 会话 #1：池空 → 现拨 → 承载会话数据（服务端序号 0）。
+        let mut session = dial_ws(&dest, &settings).await.expect("dial #1");
+        let id0 = roundtrip(&mut session, b"one").await;
+        assert_eq!(id0, 0, "first dial must land on server connection #0");
+        drop(session); // used 连接：结构性不回池（交付侧无归还路径）。
+
+        // 交付触发的补拨入池；直接从池取出的连接必须是 virgin（序号 ≠ 0）。
+        let mut preconn = wait_preconnection(&key).await;
+        let id1 = roundtrip(&mut preconn, b"two").await;
+        assert_ne!(
+            id1, id0,
+            "pool entry must be a fresh replenished connection, never the used session one"
+        );
+        drop(preconn); // 预连接被用掉 = used：不回池（不经 dial_ws 交付，无补拨）。
+
+        // 顺序两连发（生产 caller 路径）：#2 命中预连接（补拨来得及）或退化为
+        // 现拨——两条路径都必须拿到 virgin 连接。
+        let mut session2 = dial_ws(&dest, &settings).await.expect("dial #2");
+        let id2 = roundtrip(&mut session2, b"three").await;
+        assert_ne!(id2, id0, "second session must never see the first session's connection");
+        assert_ne!(id2, id1, "second session must get a distinct virgin connection");
+        drop(session2);
+
+        let mut session3 = dial_ws(&dest, &settings).await.expect("dial #3");
+        let id3 = roundtrip(&mut session3, b"four").await;
+        assert_ne!(id3, id0, "third session must never see any earlier connection");
+        assert_ne!(id3, id1);
+        assert_ne!(id3, id2);
+        drop(session3);
+    }
+
+    /// 预连接未命中时现拨路径无回归：finalmask 包装照常应用（补拨连接存裸
+    /// 连接、交付时按 caller 包装，不存在 wrap 串台——对应旧入池特判的删除）。
+    #[tokio::test]
+    async fn dial_ws_finalmask_wrapping_untouched_by_pool() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use xray_common::net::{address::Address, network::Network, port::Port};
+
+        let finalmask = serde_json::json!({
+            "tcp": [{"type": "fragment", "settings": {
+                "packets_from": 1, "packets_to": 2,
+                "length": {"from": 8, "to": 16}, "interval": {"from": 0, "to": 0}
+            }}]
+        });
+        let settings = StreamSettings {
+            protocol: "websocket".to_string(),
+            transport_json: Some(serde_json::json!({"path": "/ws"})),
+            finalmask_json: Some(finalmask),
+            ..Default::default()
+        };
+        let handler: ConnHandler = Arc::new(|conn| {
+            tokio::spawn(async move {
+                let mut conn = conn;
+                let mut buf = [0u8; 512];
+                loop {
+                    match conn.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if conn.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        },
+                    }
+                }
+            });
+        });
+        let listener = listen_ws("127.0.0.1:0".parse().unwrap(), &settings, &handler, Vec::new())
+            .await
+            .expect("listen_ws");
+        let port = listener.local_addr().expect("local_addr").port();
+        let dest =
+            Destination::new(Address::new_domain("127.0.0.1"), Port::new(port), Network::TCP);
+
+        let mut conn = dial_ws(&dest, &settings).await.expect("dial_ws with finalmask");
+        conn.write_all(b"fm-roundtrip").await.expect("write");
+        // tcpmask 分片 + echo 按 chunk 回写：循环读满，总预算 5s。
+        let payload = b"fm-roundtrip";
+        let mut got = Vec::with_capacity(payload.len());
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while got.len() < payload.len() {
+            let mut buf = [0u8; 64];
+            let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let n = tokio::time::timeout(budget, conn.read(&mut buf))
+                .await
+                .expect("echo timeout")
+                .expect("read ok");
+            assert!(n > 0, "echo closed early at {}/{} bytes", got.len(), payload.len());
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(&got, payload);
     }
 }
