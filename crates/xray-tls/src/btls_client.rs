@@ -28,7 +28,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use btls::ssl::{KeyShare, SslConnector, SslMethod, SslRef};
+use btls::ssl::{KeyShare, SslConnector, SslContextBuilder, SslMethod, SslRef};
 use rustls::client::danger::ServerCertVerifier;
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -41,6 +41,28 @@ use crate::fingerprint::Fingerprint;
 // ============================================================
 // 指纹配置输出：connector + per-connection 参数
 // ============================================================
+
+/// connector builder 挂 NST 回调：NewSessionTicket 到达即把带票 session 存入
+/// 进程内 cache（[`crate::tls_session_cache`]）。
+///
+/// 根因（bd 0kqj B2 二次修复）：握手完成点 `SSL_get_session()` 拿到的是无
+/// ticket 的 handshake session，`ssl_session_get_type` 判 `kNotResumable`、
+/// `should_offer_psk` 拒绝 → ClientHello 永不发 PSK → 复用恒失败。带票
+/// session 只在 NST 到达时经 `SSL_CTX_sess_set_new_cb` 交付（BoringSSL
+/// `tls13_client.cc::ssl_process_new_session_ticket`）。
+///
+/// `SSL_SESS_CACHE_CLIENT` 是回调触发前提（tls13_client.cc:1151 位测试）；
+/// BoringSSL 客户端内部缓存为 no-op，该位无其他副作用。回调在 CTX 级、拿不到
+/// per-connection `enableSessionResumption`，写入不做门控——读取侧
+/// `lookup_for_resume` 按 flag 门控，false 时只存不读、行为正确。
+fn install_session_cache_hook(builder: &mut SslContextBuilder) {
+    builder.set_session_cache_mode(btls::ssl::SslSessionCacheMode::CLIENT);
+    builder.set_new_session_callback(|ssl, session| {
+        if let Some(name) = ssl.servername(btls::ssl::NameType::HOST_NAME) {
+            crate::tls_session_cache::store_session(name, session);
+        }
+    });
+}
 
 /// 指纹配置：SslConnector + 握手时 per-connection 参数。
 ///
@@ -174,6 +196,7 @@ fn chrome_133_connector_alpn(alpn: &'static [u8]) -> io::Result<SslConnector> {
 
     // 禁用内置 root 验证（xray 自行管理证书验证）
     builder.set_verify(btls::ssl::SslVerifyMode::NONE);
+    install_session_cache_hook(&mut builder);
 
     Ok(builder.build())
 }
@@ -244,6 +267,7 @@ fn chrome_131_connector() -> io::Result<SslConnector> {
 
     // 禁用内置 root 验证（xray 自行管理证书验证）
     builder.set_verify(btls::ssl::SslVerifyMode::NONE);
+    install_session_cache_hook(&mut builder);
 
     Ok(builder.build())
 }
@@ -370,6 +394,7 @@ fn firefox_148_connector() -> io::Result<SslConnector> {
 
     // 禁用内置 root 验证（xray 自行管理证书验证）
     builder.set_verify(btls::ssl::SslVerifyMode::NONE);
+    install_session_cache_hook(&mut builder);
 
     Ok(builder.build())
 }
@@ -423,6 +448,7 @@ fn firefox_120_connector() -> io::Result<SslConnector> {
 
     // 禁用内置 root 验证（xray 自行管理证书验证）
     builder.set_verify(btls::ssl::SslVerifyMode::NONE);
+    install_session_cache_hook(&mut builder);
 
     Ok(builder.build())
 }
@@ -508,6 +534,7 @@ fn safari_26_3_connector() -> io::Result<SslConnector> {
 
     // 禁用内置 root 验证（xray 自行管理证书验证）
     builder.set_verify(btls::ssl::SslVerifyMode::NONE);
+    install_session_cache_hook(&mut builder);
 
     Ok(builder.build())
 }
@@ -610,6 +637,7 @@ fn edge_106_connector() -> io::Result<SslConnector> {
 
     // 禁用内置 root 验证（xray 自行管理证书验证）
     builder.set_verify(btls::ssl::SslVerifyMode::NONE);
+    install_session_cache_hook(&mut builder);
 
     Ok(builder.build())
 }
@@ -682,6 +710,7 @@ fn qihoo_360_11_0_connector() -> io::Result<SslConnector> {
 
     // 禁用内置 root 验证（xray 自行管理证书验证）
     builder.set_verify(btls::ssl::SslVerifyMode::NONE);
+    install_session_cache_hook(&mut builder);
 
     Ok(builder.build())
 }
@@ -775,6 +804,7 @@ fn qq_11_1_connector() -> io::Result<SslConnector> {
 
     // 禁用内置 root 验证（xray 自行管理证书验证）
     builder.set_verify(btls::ssl::SslVerifyMode::NONE);
+    install_session_cache_hook(&mut builder);
 
     Ok(builder.build())
 }
@@ -1056,11 +1086,9 @@ impl<S: Connection + Unpin> BtlsConn<S> {
         let enable_session_resumption =
             crate::tls_session_cache::parse_enable_session_resumption(None);
         let mut ssl = cfg.into_ssl(server_name).map_err(|e| io::Error::other(e.to_string()))?;
-        if let Some(session) = crate::tls_session_cache::lookup_for_resume(
-            server_name,
-            fingerprint,
-            enable_session_resumption,
-        ) {
+        if let Some(session) =
+            crate::tls_session_cache::lookup_for_resume(server_name, enable_session_resumption)
+        {
             // SAFETY: SslSession ref-counted，`session` 绑定到 if-let scope，离开前
             // BoringSSL 已 up-ref session，drop 在 scope 末尾释放。
             if unsafe { ssl.set_session(&session) }.is_err() {
@@ -1125,16 +1153,10 @@ impl<S: Connection + Unpin> BtlsConn<S> {
             verify_peer_certs(pinned.ssl(), server_name, v)?;
         }
 
-        // 把本次 handshake 拿到的 session 入 cache（供后续 dial 复用）。
-        // enableSessionResumption=false 时 store_session 立即返回。
-        if let Some(sess) = pinned.ssl().session() {
-            crate::tls_session_cache::store_session(
-                server_name,
-                fingerprint,
-                sess,
-                enable_session_resumption,
-            );
-        }
+        // session 回写不在此处：握手完成点 `SSL_get_session()` 是无 ticket 的
+        // handshake session（`kNotResumable`，永不发 PSK）——写入已移至 connector
+        // 的 `set_new_session_callback`（NST 到达时交付带票 session，见
+        // [`install_session_cache_hook`]）。
 
         Ok(Self { stream: pinned, fingerprint, server_name: server_name.to_string() })
     }
