@@ -1,24 +1,28 @@
-//! WebSocket transport-level 连接池。
-//!
-//! ## 设计动机（Bug-A 真实赢家, bd Xray-core-rust-k9qg）
+//! WebSocket transport-level 预连接池（virgin-connection pool, bd k9qg → ss-ws 池票修订）。
 //!
 //! 现状：每 outbound 1 条 ws 连接，多并发请求（浏览器 6/host 子资源）必须串行
 //! 通过这条 ws——首包 500ms TCP+TLS+WS 握手后所有并发请求都被钉在 1 条 ws 上。
 //! 整页 50 subresources × 1 RTT/包 = 5-15s 卡死。
 //!
-//! 目标：transport-level 池化（key = host+port+path+SNI+fingerprint），跨
-//! outbound 共享同目的地的 ws 连接；空闲 conn 在 TTL 内被取出复用，busy 期 dial
-//! 新 conn 补充。默认 off（向后兼容），需 `pool_size > 0` 启用。
+//! 目标：transport-level 预连接池（key = host+port+path+SNI+fingerprint），跨
+//! outbound 共享同目的地 ws 连接。**语义**：池内只存「握手完成、零内层字节」的
+//! 预连接；交付出去的连接承载过任何会话数据即绝不回池（used = 不可归还）——
+//! 交付侧无归还代码路径，预连接只由补拨任务（replenish：acquire/现拨后 spawn
+//! 后台拨号）存入，维持每 key ≤ `max_idle_per_key` 条。每条会话拿到的新鲜
+//! 连接 wire 行为与现拨一致，只是免了握手。默认 off（向后兼容），需
+//! `pool_size > 0` 启用。
 //!
 //! ## 业界对照
 //!
 //! - Go xray-core v26.9.9：**无 ws 客户端连接池**（仅 vless testpre 协议级）—— 本仓独立创新空间。
-//! - nginx upstream keepalive / envoy ws filter：按 upstream:port 复用连接。
+//! - nginx upstream keepalive / envoy ws filter：按 upstream:port 复用连接（同
+//!   为「预连接」语义——上游连接归还前必须保证干净）。
 //!
 //! ## Go 兼容生死线
 //!
-//! 仅客户端 outbound 侧池化，wire format 不变，server 端无感（Go xray v26.9.9
-//! 客户端连我们服务端正常工作）。
+//! 仅客户端 outbound 侧池化，wire format 不变，server 端无感（每条会话看到的
+//! 都是一条全新握手完成的连接——与服务端 per-connection 会话状态兼容，ss 等
+//! 单连接单会话语义协议同样安全）。
 //!
 //! ## 与 vless testpre 关系
 //!
@@ -28,7 +32,6 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    io,
     pin::Pin,
     sync::{Arc, LazyLock},
     task::{Context, Poll, Waker},
@@ -36,7 +39,7 @@ use std::{
 };
 
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
+    io::{AsyncRead, ReadBuf},
     sync::Mutex,
 };
 use xray_transport::connection::Connection;
@@ -135,7 +138,12 @@ fn probe_conn_alive(conn: &mut Box<dyn Connection>) -> bool {
     matches!(Pin::new(conn).poll_read(&mut cx, &mut rb), Poll::Pending)
 }
 
-/// WebSocket 连接池：每个 key 一条 `VecDeque<Box<dyn Connection>>`。
+/// 预连接池（virgin-connection pool）：每个 key 一条 `VecDeque<Box<dyn Connection>>`。
+///
+/// 池内只存「握手完成、零内层字节」的预连接；任何承载过会话数据的连接一律
+/// 不回池（used = 不可归还）——交付侧没有任何归还代码路径（无 Drop 归还
+/// wrapper），预连接只经 [`WsConnectionPool::release`] 由补拨任务（replenish）
+/// 存入。try_acquire 只交出未使用连接。
 ///
 /// 锁粒度 = `HashMap<PoolKey, _>` 全锁；通常 outbound key 数 < 100，单次操作
 /// O(1)~O(small) 可接受。需要按 key 锁可后续切片（k9qg 短期不必要）。
@@ -146,6 +154,9 @@ pub struct WsConnectionPool {
     /// 标记 `init_config` 是否已调用过一次（用 `OnceLock` 实现一次性配置）：
     /// 首个 inbound 配置生效，后续 inbound 配置不覆盖（单进程池容量固定）。
     config_init: std::sync::OnceLock<()>,
+    /// 每 key 补拨 in-flight 计数（拨号中、尚未入池的预连接）。
+    /// 与 `inner` 的 idle 条数共同受 `max_idle_per_key` 上限约束。
+    preconnect_inflight: parking_lot::Mutex<HashMap<PoolKey, usize>>,
 }
 
 impl WsConnectionPool {
@@ -154,6 +165,7 @@ impl WsConnectionPool {
             inner: Arc::new(Mutex::new(HashMap::new())),
             config: parking_lot::Mutex::new(config),
             config_init: std::sync::OnceLock::new(),
+            preconnect_inflight: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -221,7 +233,8 @@ impl WsConnectionPool {
 
     /// 归还连接到池。池满则直接 drop（关闭底层 socket）。
     ///
-    /// 调用方在 `Drop` 中调用，异步不影响 drop 时序——归还连接的任务跑不丢。
+    /// 语义（预连接池）：**只由补拨任务（replenish）调用**，存入的是握手完成、
+    /// 零内层字节的预连接；承载过会话数据的连接没有任何归还代码路径。
     pub async fn release(&self, key: PoolKey, conn: Box<dyn Connection>) {
         let max_idle_per_key = {
             let cfg = self.config.lock();
@@ -237,6 +250,37 @@ impl WsConnectionPool {
             return;
         }
         entry.push_back(PoolEntry { conn, last_used: Instant::now() });
+    }
+
+    /// 抢一个预连接补拨名额：`idle + in-flight < max_idle_per_key` 时记账并放行。
+    ///
+    /// 放行后调用方 spawn 拨号任务，任务收尾（无论成败）必须调
+    /// [`Self::end_preconnect`] 释放名额。
+    pub async fn begin_preconnect(&self, key: &PoolKey) -> bool {
+        if !self.enabled() {
+            return false;
+        }
+        // 顺序：tokio await 先行，parking_lot guard 只在同步段持有（guard 跨
+        // await = future 非 Send）。
+        let max_idle_per_key = self.config.lock().max_idle_per_key;
+        let idle = self.inner.lock().await.get(key).map_or(0, VecDeque::len);
+        let mut inflight = self.preconnect_inflight.lock();
+        if idle + inflight.get(key).copied().unwrap_or(0) >= max_idle_per_key {
+            return false;
+        }
+        *inflight.entry(key.clone()).or_default() += 1;
+        true
+    }
+
+    /// 释放一个补拨名额（补拨任务收尾调用，无论拨号成败）。
+    pub fn end_preconnect(&self, key: &PoolKey) {
+        let mut inflight = self.preconnect_inflight.lock();
+        if let Some(n) = inflight.get_mut(key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                inflight.remove(key);
+            }
+        }
     }
 }
 
@@ -259,131 +303,6 @@ pub fn reconfigure_global_pool(max_idle_per_key: usize, max_idle_duration: Durat
     *pool.config_mut() = WsPoolConfig { max_idle_per_key, max_idle_duration };
 }
 
-/// 池化连接 wrapper：`Drop` 时归还到底层池（无池则直接 drop）。
-///
-/// 透明转发 `AsyncRead + AsyncWrite + Connection` 给内层 conn。
-/// caller 拿到的 `Box<dyn Connection>` 即此 wrapper。
-pub struct PooledConn {
-    inner: Option<Box<dyn Connection>>,
-    /// `Some` = Drop 时归还池；`None` = Drop 时直接关。
-    pool_release: Option<(Arc<WsConnectionPool>, PoolKey)>,
-    /// IO 毒标记：任一 read/write/flush/shutdown 返回 Err 即置位。
-    /// 置位后 Drop 不归还池（连接已坏，复用即死连接回归——2026-10-16 根治）。
-    io_poisoned: bool,
-}
-
-impl PooledConn {
-    /// 新拨号的 conn（无池归还）。
-    pub fn new_fresh(conn: Box<dyn Connection>) -> Self {
-        Self { inner: Some(conn), pool_release: None, io_poisoned: false }
-    }
-
-    /// 从池取出的 conn + 池信息（Drop 时归还）。
-    pub fn from_pool(conn: Box<dyn Connection>, pool: Arc<WsConnectionPool>, key: PoolKey) -> Self {
-        Self { inner: Some(conn), pool_release: Some((pool, key)), io_poisoned: false }
-    }
-
-    /// 新拨号 + 标记为池归还（dial 完新 conn 后入池供下个 caller 复用）。
-    /// 内部一次性设置 inner + pool_release，避免 `new_fresh` + `mark_releasable`
-    /// 两步路径。
-    pub fn fresh_releasable(
-        conn: Box<dyn Connection>,
-        pool: Arc<WsConnectionPool>,
-        key: PoolKey,
-    ) -> Self {
-        Self { inner: Some(conn), pool_release: Some((pool, key)), io_poisoned: false }
-    }
-}
-
-impl AsyncRead for PooledConn {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let mut this = self.as_mut();
-        let r = Pin::new(this.inner.as_mut().expect("conn taken by Drop")).poll_read(cx, buf);
-        match r {
-            Poll::Ready(Err(_)) => this.io_poisoned = true,
-            // Ok 且 0 填充 = EOF：对端已关连接（ws close 帧/FIN）——毒标记。
-            Poll::Ready(Ok(())) if buf.filled().is_empty() => this.io_poisoned = true,
-            _ => {},
-        }
-        r
-    }
-}
-
-impl AsyncWrite for PooledConn {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let mut this = self.as_mut();
-        let r = Pin::new(this.inner.as_mut().expect("conn taken by Drop")).poll_write(cx, buf);
-        if matches!(r, Poll::Ready(Err(_))) {
-            this.io_poisoned = true;
-        }
-        r
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut this = self.as_mut();
-        let r = Pin::new(this.inner.as_mut().expect("conn taken by Drop")).poll_flush(cx);
-        if matches!(r, Poll::Ready(Err(_))) {
-            this.io_poisoned = true;
-        }
-        r
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut this = self.as_mut();
-        let r = Pin::new(this.inner.as_mut().expect("conn taken by Drop")).poll_shutdown(cx);
-        if matches!(r, Poll::Ready(Err(_))) {
-            this.io_poisoned = true;
-        }
-        r
-    }
-}
-
-impl Connection for PooledConn {
-    fn remote_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
-        match &self.inner {
-            Some(c) => c.remote_addr(),
-            None => Ok(None),
-        }
-    }
-
-    fn local_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
-        match &self.inner {
-            Some(c) => c.local_addr(),
-            None => Ok(None),
-        }
-    }
-}
-
-impl Drop for PooledConn {
-    fn drop(&mut self) {
-        // 关键：必须在字段 drop 前 take 出 conn —— 否则 conn 在 Drop 中先关
-        // socket，池里拿到一条已死的连接。
-        if let (Some((pool, key)), Some(mut conn)) = (self.pool_release.take(), self.inner.take()) {
-            if self.io_poisoned {
-                // IO 出错的连接直接关，不归还——复用即死连接回归（根治）。
-                return;
-            }
-            if !probe_conn_alive(&mut conn) {
-                // idle/使用间隙收到对端 close 帧（EOF/残留帧）——归还即
-                // "Sending after closing" 事故回归，当场关闭。
-                return;
-            }
-            tokio::spawn(async move {
-                pool.release(key, conn).await;
-            });
-        }
-        // 无 pool_release 时 inner 由字段 drop 自然关闭（option 的 None drop 跳过）。
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -396,7 +315,7 @@ mod tests {
     /// 测试用 duplex conn（用于 mock 一个真实 Connection）。
     /// 2026-10-17：对端 `forget` 保活——真实 ws 连接握手完成后远端是活的；
     /// 之前 `_b` 随函数返回 drop = mock 天生 EOF，probe 正确判死后既有
-    /// 归还/取出测试全挂。EOF 场景由 `eof_conn_not_released_and_discarded_on_acquire`
+    /// 归还/取出测试全挂。EOF 场景由 `probe_admits_alive_and_discards_dead_preconnections`
     /// 专项覆盖。
     fn mock_conn() -> Box<dyn Connection> {
         let (a, b): (DuplexStream, DuplexStream) = tokio::io::duplex(64);
@@ -474,129 +393,67 @@ mod tests {
         assert!(pool.try_acquire(&key1()).await.is_none(), "expired entry must be swept");
     }
 
-    /// 写失败的连接必须不入池（毒标记）——复用坏连接 = CDN 死连接回归根因。
+    /// 补拨名额：idle + in-flight 受 max_idle_per_key 上限约束（virgin-connection
+    /// 池语义——补拨是唯一入池通道，超额即拒）。
     #[tokio::test]
-    async fn io_error_conn_not_released_to_pool() {
-        struct AlwaysErrConn;
-        impl AsyncRead for AlwaysErrConn {
-            fn poll_read(
-                self: Pin<&mut Self>,
-                _cx: &mut Context<'_>,
-                _buf: &mut ReadBuf<'_>,
-            ) -> Poll<io::Result<()>> {
-                Poll::Ready(Err(io::Error::other("broken")))
-            }
-        }
-        impl AsyncWrite for AlwaysErrConn {
-            fn poll_write(
-                self: Pin<&mut Self>,
-                _cx: &mut Context<'_>,
-                _buf: &[u8],
-            ) -> Poll<io::Result<usize>> {
-                Poll::Ready(Err(io::Error::other("broken")))
-            }
-            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-                Poll::Ready(Ok(()))
-            }
-            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-                Poll::Ready(Ok(()))
-            }
-        }
-        impl Connection for AlwaysErrConn {
-            fn remote_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
-                Ok(None)
-            }
-            fn local_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
-                Ok(None)
-            }
-        }
+    async fn begin_preconnect_respects_idle_and_inflight_capacity() {
+        let pool = Arc::new(WsConnectionPool::new(WsPoolConfig {
+            max_idle_per_key: 2,
+            ..Default::default()
+        }));
 
-        let pool = Arc::new(WsConnectionPool::new(WsPoolConfig::default()));
-        let conn: Box<dyn Connection> = Box::new(AlwaysErrConn);
-        let mut pooled = PooledConn::from_pool(conn, pool.clone(), key1());
-        let n = Pin::new(&mut pooled)
-            .poll_write(&mut Context::from_waker(std::task::Waker::noop()), b"x");
-        assert!(matches!(n, Poll::Ready(Err(_))));
-        drop(pooled); // Drop：毒标记 → 不归还
-        tokio::time::sleep(Duration::from_millis(10)).await; // 等 spawn 的 release（若有）跑完
-        assert!(pool.try_acquire(&key1()).await.is_none(), "poisoned conn must NOT re-enter pool");
-    }
+        // 池空 + 无 in-flight → 放行。
+        assert!(pool.begin_preconnect(&key1()).await, "empty pool must admit preconnect");
+        // in-flight=1 → 再抢一个（1+1 < 2）→ 第三个被拒。
+        assert!(pool.begin_preconnect(&key1()).await, "1 idle + 1 inflight < 2 must admit");
+        assert!(!pool.begin_preconnect(&key1()).await, "2 inflight must hit the cap");
 
-    #[tokio::test]
-    async fn pooled_conn_returns_to_pool_on_drop() {
-        let pool = Arc::new(WsConnectionPool::new(WsPoolConfig::default()));
+        // 补拨完成入池（模拟：end + release）→ idle=2 → 名额被 idle 顶满。
+        pool.end_preconnect(&key1());
+        pool.end_preconnect(&key1());
         pool.release(key1(), mock_conn()).await;
-        let conn = pool.try_acquire(&key1()).await.unwrap();
-        let pooled = PooledConn::from_pool(conn, pool.clone(), key1());
-        drop(pooled);
-        // 等归还任务跑完。
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let back = pool.try_acquire(&key1()).await;
-        assert!(back.is_some(), "Drop must release conn back to pool");
+        pool.release(key1(), mock_conn()).await;
+        assert!(!pool.begin_preconnect(&key1()).await, "full idle pool must reject preconnect");
+
+        // 取走一条 → idle=1 → 又可补拨。
+        assert!(pool.try_acquire(&key1()).await.is_some());
+        assert!(pool.begin_preconnect(&key1()).await, "freed slot must admit preconnect");
     }
 
+    /// end_preconnect 释放名额（含重复调用饱和不减）。
     #[tokio::test]
-    async fn pooled_conn_no_pool_drops_normally() {
+    async fn end_preconnect_releases_slot_idempotently() {
         let pool = Arc::new(WsConnectionPool::new(WsPoolConfig::default()));
-        let pooled = PooledConn::new_fresh(mock_conn());
-        drop(pooled);
-        // 池里没东西（fresh conn 无 release 标记）。
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(pool.try_acquire(&key1()).await.is_none());
+        assert!(pool.begin_preconnect(&key1()).await);
+        pool.end_preconnect(&key1());
+        // 重复 end 不下溢（名额计数不出现负值语义）。
+        pool.end_preconnect(&key1());
+        // 池禁用时 begin 恒 false。
+        let disabled =
+            WsConnectionPool::new(WsPoolConfig { max_idle_per_key: 0, ..WsPoolConfig::default() });
+        assert!(!disabled.begin_preconnect(&key1()).await);
     }
 
-    /// 2026-10-17 生产事故回归：idle 期间被对端关闭（read 即 EOF）的连接，
-    /// Drop 归还前探测必须拦下——否则下个 caller 复用即 "Sending after closing"。
+    /// 活预连接不受探测影响；死连接（idle 期间被对端关闭）在取出时被当场丢弃
+    /// ——2026-10-17 生产事故回归（"Sending after closing"）。
     #[tokio::test]
-    async fn eof_conn_not_released_and_discarded_on_acquire() {
-        // b 端持有者 drop 即 EOF 模拟对端 close。
-        let (a, b): (DuplexStream, DuplexStream) = tokio::io::duplex(64);
+    async fn probe_admits_alive_and_discards_dead_preconnections() {
         let pool = Arc::new(WsConnectionPool::new(WsPoolConfig::default()));
-        // 1) Drop 归还路径：探测拦下 EOF 连接。
-        {
-            let pooled =
-                PooledConn::from_pool(Box::new(DuplexConnection::new(a)), pool.clone(), key1());
-            drop(b); // 对端关闭 → EOF
-            tokio::time::sleep(Duration::from_millis(10)).await; // EOF 传播
-            drop(pooled);
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            assert!(
-                pool.try_acquire(&key1()).await.is_none(),
-                "EOF conn must NOT re-enter pool (probe blocks release)"
-            );
-        }
-        // 2) 取出路径：直接 release 进池的死连接，try_acquire 当场丢弃。
+        // 活连接：对端持有 → 无 EOF → probe 放行。
+        let (a, keep): (DuplexStream, DuplexStream) = tokio::io::duplex(64);
+        let _keep = keep;
+        pool.release(key1(), Box::new(DuplexConnection::new(a))).await;
+        assert!(pool.try_acquire(&key1()).await.is_some(), "idle alive conn must survive probe");
+
+        // 死连接：对端已关 → try_acquire 当场丢弃。
         let (c, d): (DuplexStream, DuplexStream) = tokio::io::duplex(64);
         drop(d);
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await; // EOF 传播
         pool.release(key1(), Box::new(DuplexConnection::new(c))).await;
         assert!(
             pool.try_acquire(&key1()).await.is_none(),
             "dead conn in pool must be discarded on acquire"
         );
-    }
-
-    /// 活连接不受探测影响：正常归还/取出照常。
-    #[tokio::test]
-    async fn alive_conn_probe_passes() {
-        let (a, b): (DuplexStream, DuplexStream) = tokio::io::duplex(64);
-        let _keep = b; // 对端持有 → 无 EOF
-        let pool = Arc::new(WsConnectionPool::new(WsPoolConfig::default()));
-        pool.release(key1(), Box::new(DuplexConnection::new(a))).await;
-        assert!(pool.try_acquire(&key1()).await.is_some(), "idle alive conn must survive probe");
-    }
-
-    #[tokio::test]
-    async fn pooled_conn_forward_io() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let (a, mut b) = tokio::io::duplex(64);
-        let conn: Box<dyn Connection> = Box::new(DuplexConnection::new(a));
-        let mut pooled = PooledConn::new_fresh(conn);
-        pooled.write_all(b"hello").await.unwrap();
-        let mut buf = [0u8; 5];
-        b.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"hello");
     }
 
     /// 并发归还：N 条 release 之后只剩 max_idle 条留池（无 race）。
