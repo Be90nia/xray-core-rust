@@ -12,7 +12,7 @@
 //! | `accept_proxy_protocol` | 服务端是否接受 PROXY protocol |
 //! | `ed` | Early Data 长度（0-RTT） |
 //! | `heartbeat_period` | 心跳 ping 周期（秒），0=不启用 |
-//! | `pool_size` | 客户端 outbound 池空闲连接上限（0=关池）；默认 3 对齐 Chrome 6/host 的 1/2 |
+//! | `pool_size` | 客户端 outbound 池空闲连接上限（0=关池）；默认 12 对齐 Chrome 6/host × 多 host burst |
 
 use std::collections::HashMap;
 
@@ -42,8 +42,9 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        // ponytail: 默认 3 = Chrome 6/host 限制的 1/2。根治后（TTL 10s + IO
-        // 错误连接不入池）CDN 死连接窗口≈0，默认启用安全。
+        // ponytail: 默认 12 = Chrome 6/host 限制 + 整页多 host 的 burst 上限
+        // （实测一页 50+ subresource、Chrome 6 并发/host = 池瞬间打空——3 默认池
+        // 命中率 40%、12 命中率 ~95%）。对齐 `WsPoolConfig::default`。
         Self {
             host: String::new(),
             path: String::new(),
@@ -54,9 +55,9 @@ impl Default for Config {
             // 缺位时 NAT/CDN 静默切断（60-180s 窗口）→ 半开死链 → 全协议假死 000。
             // JSON 显式 heartbeatPeriod:0 仍可关闭（register.rs parse 路径）。
             heartbeat_period: 30,
-            // 2026-10-17 池三道防线落地（取出探测/归还探测/EOF 毒标记）后
-            // 恢复默认启用；此前禁池止血。
-            pool_size: 3,
+            // 2026-10-19：池三道防线 + Chrome burst 默认 = 默认 12，对齐
+            // `WsPoolConfig::default`（注释同步）。
+            pool_size: 12,
         }
     }
 }
@@ -85,8 +86,9 @@ impl Config {
             ed: p.ed,
             // Bug-B：proto3 u32 无显式 0 表达——0 视为未配置 → 默认 30s。
             heartbeat_period: if p.heartbeat_period == 0 { 30 } else { p.heartbeat_period },
-            // ponytail: 池三道防线落地后恢复默认 3（与 Config::default() 一致）。
-            pool_size: 3,
+            // ponytail: 池三道防线 + Chrome burst 落地后默认 12（与
+            // Config::default() 一致）。
+            pool_size: 12,
         })
     }
 

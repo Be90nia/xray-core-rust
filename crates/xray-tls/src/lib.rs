@@ -57,4 +57,5 @@ pub mod btls_server;
 pub mod grpc;
 #[cfg(test)]
 mod stress_tests;
+pub mod tls_session_cache;
 pub mod utls;
