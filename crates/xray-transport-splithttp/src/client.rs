@@ -110,9 +110,10 @@ impl TowerService<Uri> for DestTcpConnector {
         let host = std::sync::Arc::clone(&self.host);
         let port = self.port;
         Box::pin(async move {
-            let tcp = tokio::net::TcpStream::connect((host.as_ref(), port)).await?;
+            let tcp =
+                xray_transport::sockopt::dial_client_tcp((host.as_ref(), port)).await?;
             tcp.set_nodelay(true).ok();
-            // bd 88m0 客户端侧：下行 SO_RCVBUF 缺省 4MB（窗钉修复）。
+            // bd 88m0/0kqj 客户端侧：下行 SO_RCVBUF 缺省 16MB（窗钉修复）。
             xray_transport::sockopt::apply_client_dial_rcvbuf(&tcp)?;
             Ok(DestTcpStream(TokioIo::new(tcp)))
         })
@@ -242,10 +243,13 @@ impl TowerService<Uri> for SplitConnector {
                 let dial = dial.clone();
                 Box::pin(async move {
                     // Go dialContext：TCP 恒拨出站 dest，忽略 URI authority。
-                    let tcp =
-                        tokio::net::TcpStream::connect((dial.host.to_string(), dial.port)).await?;
+                    let tcp = xray_transport::sockopt::dial_client_tcp((
+                        dial.host.to_string(),
+                        dial.port,
+                    ))
+                    .await?;
                     tcp.set_nodelay(true).ok();
-                    // bd 88m0 客户端侧：下行 SO_RCVBUF 缺省 4MB（窗钉修复）。
+                    // bd 88m0/0kqj 客户端侧：下行 SO_RCVBUF 缺省 16MB（窗钉修复）。
                     xray_transport::sockopt::apply_client_dial_rcvbuf(&tcp)?;
                     let conn = xray_tls::utls::u_client(
                         TcpConnection::new(tcp),

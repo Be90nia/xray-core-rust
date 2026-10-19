@@ -95,9 +95,9 @@ pub async fn dial(
     // connector=None 时 tungstenite 把传入流当 TLS-ready（Plain 包装）。
     let host = opts.destination.address().to_string();
     let port = opts.destination.port().value();
-    let tcp = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+    let tcp = xray_transport::sockopt::dial_client_tcp((host.as_str(), port)).await?;
     tcp.set_nodelay(true).ok();
-    // bd 88m0 客户端侧：下行 SO_RCVBUF 缺省 4MB（窗钉修复；失败即拨号失败，
+    // bd 88m0/0kqj 客户端侧：下行 SO_RCVBUF 缺省 16MB（窗钉修复；失败即拨号失败，
     // 对齐 dial_system sockopt 语义）。
     xray_transport::sockopt::apply_client_dial_rcvbuf(&tcp)?;
     // Bug-B（bd cqyj）：ws 拨号此前绕过 sockopt（裸 connect 无 keepalive）——
