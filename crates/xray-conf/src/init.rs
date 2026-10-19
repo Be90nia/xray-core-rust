@@ -241,7 +241,7 @@ fn is_known_dest_override(s: &str) -> bool {
 /// （allowInsecure 硬错）、`transport_method.go:759-762`（hysteria transport version）。
 fn check_stream_strictness(kind: &str, tag: &str, ss: &serde_json::Value) -> Result<(), LintError> {
     // 1) network：已移除 → 硬错；弃用未移除 → warn 继续（文案逐字对齐 Go）。
-    let net = ss.get("network").and_then(|v| v.as_str()).unwrap_or("");
+    let net = ss.get("network").or_else(|| ss.get("method")).and_then(|v| v.as_str()).unwrap_or("");
     match net.to_ascii_lowercase().as_str() {
         "http" | "h2" | "h3" => {
             return Err(LintError::Invalid(format!(

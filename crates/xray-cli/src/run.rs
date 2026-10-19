@@ -188,7 +188,10 @@ pub async fn execute(args: RunArgs) -> Result<()> {
 fn config_uses_splithttp(config: &xray_conf::config::Config) -> bool {
     let inbounds = &config.inbound_configs;
     inbounds.iter().any(|ib| {
-        ib.stream_settings.as_ref().and_then(|ss| ss.get("network")).and_then(|v| v.as_str())
+        ib.stream_settings
+                .as_ref()
+                .and_then(|ss| ss.get("network").or_else(|| ss.get("method")))
+                .and_then(|v| v.as_str())
             == Some("splithttp")
     })
 }

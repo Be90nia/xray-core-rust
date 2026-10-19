@@ -143,7 +143,7 @@ pub fn to_memory_stream_config(json: Option<&serde_json::Value>) -> io::Result<M
         return Ok(MemoryStreamConfig { protocol_name: "tcp".to_string(), ..Default::default() });
     };
     let obj = v.as_object().ok_or_else(|| invalid("streamSettings: expected an object"))?;
-    let protocol_name = obj.get("network").and_then(|n| n.as_str()).unwrap_or("tcp").to_string();
+    let protocol_name = obj.get("network").or_else(|| obj.get("method")).and_then(|n| n.as_str()).unwrap_or("tcp").to_string();
     let security_type = obj.get("security").and_then(|s| s.as_str()).unwrap_or("").to_string();
     let finalmask = obj.get("finalmask");
     let tcpmask_manager = parse_tcpmask_manager(finalmask.and_then(|f| f.get("tcp")))?;

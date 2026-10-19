@@ -18,6 +18,8 @@ pub struct HttpUpgradeConnection<C> {
     pub inner: C,
     /// 替换后的对端地址。`Ok(Some(addr))` 时 Connection::remote_addr 返回此值。
     pub remote_addr_override: Option<SocketAddr>,
+    /// 101 响应读取时已消费的余留字节（服务端 101 与首包同批到达时由握手保留）。
+    pending: Vec<u8>,
 }
 
 impl<C: std::fmt::Debug> std::fmt::Debug for HttpUpgradeConnection<C> {
@@ -33,7 +35,13 @@ impl<C> HttpUpgradeConnection<C> {
     /// 构造 wrapper。
     #[must_use]
     pub fn new(inner: C, remote_addr: Option<SocketAddr>) -> Self {
-        Self { inner, remote_addr_override: remote_addr }
+        Self { inner, remote_addr_override: remote_addr, pending: Vec::new() }
+    }
+
+    /// 构造 wrapper，附带握手阶段已读出的余留字节（先于 inner 数据返回）。
+    #[must_use]
+    pub fn new_with_pending(inner: C, remote_addr: Option<SocketAddr>, pending: Vec<u8>) -> Self {
+        Self { inner, remote_addr_override: remote_addr, pending }
     }
 
     /// 拆出内层连接。
@@ -45,7 +53,7 @@ impl<C> HttpUpgradeConnection<C> {
     /// 构造 wrapper，指定 remote_addr。
     #[must_use]
     pub fn with_remote_addr(inner: C, remote_addr: SocketAddr) -> Self {
-        Self { inner, remote_addr_override: Some(remote_addr) }
+        Self { inner, remote_addr_override: Some(remote_addr), pending: Vec::new() }
     }
 }
 
@@ -55,6 +63,12 @@ impl<C: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for HttpUpgradeConnec
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
+        if !self.pending.is_empty() {
+            let n = self.pending.len().min(buf.remaining());
+            buf.put_slice(&self.pending[..n]);
+            self.pending.drain(..n);
+            return std::task::Poll::Ready(Ok(()));
+        }
         std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
