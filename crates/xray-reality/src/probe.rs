@@ -192,8 +192,9 @@ async fn detect_one_inner(
         AlpnId::Http11 | AlpnId::H2 => get_fingerprint("chrome").ok()?,
     };
     let alpn_wire = alpn_wire(alpn);
-    let tls_conn =
-        BtlsConn::connect_with_alpn(conn, server_name, fp, None, None, alpn_wire).await.ok()?;
+    let tls_conn = BtlsConn::connect_with_alpn(conn, server_name, fp, None, None, alpn_wire, false)
+        .await
+        .ok()?;
 
     // 拿底层 TCP 用于写 raw CCS + 读 Alert。`raw_tcp_clone` 与 BoringSSL BIO
     // 共享 fd；握手已结束、BIO 不主动 read，fd 接收缓冲不被消费。
@@ -366,9 +367,10 @@ async fn detect_one_record_lens_inner(
         AlpnId::None => Fingerprint::RandomizedNoAlpn,
         AlpnId::Http11 | AlpnId::H2 => get_fingerprint("chrome").ok()?,
     };
-    let tls_conn = BtlsConn::connect_with_alpn(conn, server_name, fp, None, None, alpn_wire(alpn))
-        .await
-        .ok()?;
+    let tls_conn =
+        BtlsConn::connect_with_alpn(conn, server_name, fp, None, None, alpn_wire(alpn), false)
+            .await
+            .ok()?;
     let mut raw = tls_conn.raw_tcp_clone()?;
 
     let mut data = Vec::new();

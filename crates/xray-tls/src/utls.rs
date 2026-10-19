@@ -590,6 +590,8 @@ where
                     // 否则 webpki/pinned verifier 对 btls peer 链做链+主机名验证。
                     crate::client_config::build_server_cert_verifier(security_json)?,
                     alpn_wire.as_deref(),
+                    // 0-RTT 总闸（幂等首写协议 opt-in，缺省关）。
+                    crate::tls_session_cache::parse_allow_early_data(security_json),
                 )
                 .await
                 {

@@ -17,14 +17,17 @@
 //! 4. 把握手完成的 `WebSocketStream` + early data 包装为 `WsConnWithEarlyData`
 
 use std::{
+    io,
     net::{IpAddr, SocketAddr},
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::Duration,
 };
 
 use base64::Engine;
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpListener as TokioTcpListener,
 };
 use tokio_tungstenite::{
@@ -52,6 +55,48 @@ pub struct AcceptedConn {
     pub early_data: Vec<u8>,
     /// TCP peer 地址。
     pub remote: SocketAddr,
+}
+
+/// TLS 0-RTT early data 前缀流：先吐出 rustls 缓冲的 0-RTT 应用字节，再透传
+/// 内层 TLS 流。仅 accept_tls 在 max_early_data_size>0 时包装；写侧全透传。
+struct EarlyDataPrefixed<S> {
+    prefix: Vec<u8>,
+    offset: usize,
+    inner: S,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for EarlyDataPrefixed<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.offset < self.prefix.len() {
+            let n = buf.remaining().min(self.prefix.len() - self.offset);
+            buf.put_slice(&self.prefix[self.offset..self.offset + n]);
+            self.offset += n;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for EarlyDataPrefixed<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 /// WebSocket 服务端监听器。
@@ -121,6 +166,9 @@ impl WsListener {
     ) -> Result<AcceptedConn> {
         let (mut tcp, remote) = self.listener.accept().await.map_err(WsError::Io)?;
         let local = tcp.local_addr().ok();
+        // 0-RTT 排空开关：allowEarlyData=true 时 rustls ServerConfig 的
+        // max_early_data_size>0（build_server_config 设置），此位即配置透传。
+        let ed_enabled = tls_config.max_early_data_size > 0;
         // Go hub.go:143 http.Server{ReadHeaderTimeout: 4s}——deadline 在 TLS wrap 前
         // 生效，4s 覆盖 PROXY protocol 解析 + TLS 惰性握手全程。整段限时：半开/分片
         // ClientHello 的连接超时丢弃，accept 循环永不被单个连接堵死（串行 accept 下
@@ -145,6 +193,26 @@ impl WsListener {
                 return Err(WsError::HandshakeFailed("tls accept timeout (4s)".into()));
             },
         };
+        // TLS 0-RTT：rustls 把收到的 early data 缓在 ServerConnection 里，标准
+        // 读路径不排空（tokio-rustls accept 直连 ServerConnection、不经 Acceptor
+        // 的 Accepting::early_data()）——不在此取出，客户端随 0-RTT 发来的 ws
+        // upgrade GET 会永远滞留缓冲、握手悬挂。仅在 max_early_data_size>0
+        // （allowEarlyData=true）时走此路径，缺省配置零行为变化。
+        let mut tls_stream = tls_stream;
+        let mut early_bytes = Vec::new();
+        if ed_enabled {
+            if let Some(mut ed) = tls_stream.get_mut().1.early_data() {
+                use std::io::Read as _;
+                let _ = ed.read_to_end(&mut early_bytes);
+            }
+        }
+        if !early_bytes.is_empty() {
+            tracing::info!(
+                target: "xray_transport_ws",
+                bytes = early_bytes.len(),
+                "TLS 0-RTT early data accepted (prefixed to ws handshake)"
+            );
+        }
         // wsh2 修复：ALPN 协商出 h2 时进 h2 拒绝服务，而非把 HTTP/2 帧喂给
         // http/1.1-only 的 ws_handshake（裸断根因：curl --http2 = 000，CF 回源
         // 协商 h2 后 CDN 族全挂）。Go hub.go:158 `http.Server.Serve(tls.NewListener)`
@@ -156,6 +224,24 @@ impl WsListener {
             // 2026-10-15 生产实锤）。Go goroutine 模型即后台并发处理。
             tokio::spawn(Self::serve_h2_reject(tls_stream, self.configs.clone()));
             return Err(WsError::HandshakeFailed("http/2 request rejected".into()));
+        }
+        // 0-RTT 前缀流：有 early data 时先吐缓存字节再接 TLS 流；无 early data
+        // 且开关关闭时保持裸流（缺省配置零变化、零包装）。
+        if ed_enabled || !early_bytes.is_empty() {
+            let stream =
+                EarlyDataPrefixed::<tokio_rustls::server::TlsStream<tokio::net::TcpStream>> {
+                    prefix: early_bytes,
+                    offset: 0,
+                    inner: tls_stream,
+                };
+            return Self::ws_handshake(
+                stream,
+                remote,
+                local,
+                &self.configs,
+                &self.trusted_x_forwarded_for,
+            )
+            .await;
         }
         Self::ws_handshake(tls_stream, remote, local, &self.configs, &self.trusted_x_forwarded_for)
             .await
