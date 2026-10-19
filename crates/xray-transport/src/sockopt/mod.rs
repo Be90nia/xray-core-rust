@@ -293,7 +293,7 @@ pub struct SocketOptions {
     /// `0`=不设置。
     pub tcp_max_seg: i32,
     /// SO_RCVBUF 接收缓冲（字节）。JSON `receiveBufferSize`。`0`=TCP 路径取
-    /// `TCP_RCVBUF_DEFAULT`（16MB，bd 88m0/bd 0kqj B3 默认）。
+    /// `TCP_RCVBUF_DEFAULT`（4MB，bd 88m0/bd 0kqj B3 默认）。
     /// **Go `SocketConfig` 无此字段**（v26.9.9 config.proto
     /// 全字段核对），本仓库 opt-in 运维扩展：显式设置即锁定该 socket 的内核接收
     /// 窗自动调节（Linux `SOCK_RCVBUF_LOCK`，通告窗上限=值×2 字节记账），用于高
@@ -399,14 +399,14 @@ impl Default for SocketOptions {
 /// 接收队列恒空 → rcv_rtt=真实 RTT、space=窗字节数 → rcvbuf 目标恒等于当前值，
 /// 钉死 ~64KB、高 RTT 吞吐=窗/RTT（VPS netem 实测
 /// 413-433KB/s，出生掷签 ~25%；Go 对照同拓扑 10/10 全净靠运行时调度偶然逃逸）。
-/// 显式 16MB 锁定窗上限，为记账上限非预分配，空闲连接零内存代价。显式
+/// 显式 4MB 锁定窗上限，为记账上限非预分配，空闲连接零内存代价。显式
 /// `receiveBufferSize` 配置优先于本默认。
 ///
 /// **Linux 运营者注意**：`setsockopt(SO_RCVBUF)` 受 `net.core.rmem_max` 静默
-/// 钳制（stock 缺省 212992）——要吃满 16MB 需 `sysctl -w net.core.rmem_max=33554432`
-/// （记 ≈33.5MB；16MB 请求内核记账翻倍 → 32MB），VPS net.core.rmem_max 34MB 已在
+/// 钳制（stock 缺省 212992）——要吃满 4MB 需 `sysctl -w net.core.rmem_max=8388608`
+/// （记 8MB；4MB 请求内核记账翻倍 → 8MB），VPS net.core.rmem_max 34MB 已在
 /// 7p1m 战役调好（wmem 同理）。
-pub(crate) const TCP_RCVBUF_DEFAULT: i32 = 16 * 1024 * 1024;
+pub(crate) const TCP_RCVBUF_DEFAULT: i32 = 4 * 1024 * 1024;
 
 /// 客户端裸拨号点（transport 自持 TCP，不经 [`crate::system_dialer::dial_system`]）
 /// 统一应用的 SO_RCVBUF 缺省（bd 88m0 客户端侧收口）。
@@ -436,7 +436,7 @@ pub fn apply_client_dial_rcvbuf(tcp: &tokio::net::TcpStream) -> std::io::Result<
 /// - Windows：Winsock TCP_FASTOPEN=15 / IP_UNICAST_IF / IPV6_UNICAST_IF
 ///
 /// SO_RCVBUF 缺省值见 `TCP_RCVBUF_DEFAULT`；显式 `receiveBufferSize` 优先
-/// （因此 `SocketOptions::default()` 会设置 16MB 接收缓冲——非零副作用，见常量文档）。
+/// （因此 `SocketOptions::default()` 会设置 4MB 接收缓冲——非零副作用，见常量文档）。
 pub fn apply_outbound_socket_options(
     socket: &Socket,
     opts: &SocketOptions,
@@ -448,7 +448,7 @@ pub fn apply_outbound_socket_options(
     if opts.ipv6_only {
         socket.set_only_v6(true)?;
     }
-    // SO_RCVBUF：显式 `receiveBufferSize` 优先；缺省 TCP 默认 16MB（bd 88m0/0kqj，
+    // SO_RCVBUF：显式 `receiveBufferSize` 优先；缺省 TCP 默认 4MB（bd 88m0/0kqj，
     // 862340ff/7p1m 接收侧同族——内核 DRS 对快排空 relay 结构性自稳定，接收窗
     // 钉死 ~64KB、高 RTT 吞吐=窗/RTT，见 [`TCP_RCVBUF_DEFAULT`]）。显式设置
     // 锁定内核接收窗自动调节（Linux SOCK_RCVBUF_LOCK），socket2 跨平台
@@ -547,7 +547,7 @@ pub fn apply_inbound_socket_options(socket: &Socket, opts: &SocketOptions) -> st
     set_keepalive_config(socket, opts)?;
     // SO_RCVBUF：per-accept 设置——Linux accept 出的连接不继承 listener 的
     // SO_RCVBUF 锁定语义，必须在连接 socket 上显式设。显式 `receiveBufferSize`
-    // 优先；缺省 TCP 默认 16MB（bd 88m0/0kqj，862340ff/7p1m 同族，见
+    // 优先；缺省 TCP 默认 4MB（bd 88m0/0kqj，862340ff/7p1m 同族，见
     // [`TCP_RCVBUF_DEFAULT`]）。
     let rcvbuf =
         if opts.receive_buffer_size > 0 { opts.receive_buffer_size } else { TCP_RCVBUF_DEFAULT };
@@ -1014,7 +1014,7 @@ mod tests {
         let plain = tokio::net::TcpStream::connect(addr).await.unwrap();
         let d_recv = socket2::SockRef::from(&plain).recv_buffer_size().unwrap();
         // 设置连接：helper 应用后回读不得小于基线（rmem_max 钳制允许缩水，但
-        // 16MB 请求 ≥ 任何标准缺省）。
+        // 4MB 请求 ≥ 任何标准缺省）。
         let tuned = tokio::net::TcpStream::connect(addr).await.unwrap();
         apply_client_dial_rcvbuf(&tuned).unwrap();
         let got = socket2::SockRef::from(&tuned).recv_buffer_size().unwrap();
@@ -1042,10 +1042,10 @@ mod tests {
         assert!(result.is_ok(), "apply_outbound_socket_options failed: {result:?}");
         // TCP_NODELAY 已设置
         assert_eq!(socket.nodelay().unwrap(), opts.tcp_nodelay);
-        // bd 88m0/0kqj：缺省 SO_RCVBUF 16MB（内核对值记账翻倍/钳制，回读应 ≥ 设置值）。
+        // bd 88m0/0kqj：缺省 SO_RCVBUF 4MB（内核对值记账翻倍/钳制，回读应 ≥ 设置值）。
         assert!(
             socket.recv_buffer_size().unwrap() >= TCP_RCVBUF_DEFAULT as usize,
-            "缺省出站应设 16MB 接收缓冲: got={}",
+            "缺省出站应设 4MB 接收缓冲: got={}",
             socket.recv_buffer_size().unwrap()
         );
         drop(socket);
@@ -1053,7 +1053,7 @@ mod tests {
     }
     #[test]
     fn outbound_explicit_receive_buffer_size_wins_over_default() {
-        // 显式 receiveBufferSize 优先于缺省 16MB（bd 88m0/0kqj 回归锁）。
+        // 显式 receiveBufferSize 优先于缺省 4MB（bd 88m0/0kqj 回归锁）。
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let stream = std::net::TcpStream::connect(addr).unwrap();
@@ -1062,7 +1062,7 @@ mod tests {
         apply_outbound_socket_options(&socket, &opts, None).unwrap();
         assert!(
             socket.recv_buffer_size().unwrap() < TCP_RCVBUF_DEFAULT as usize,
-            "显式 1MB 不应被缺省 16MB 覆盖: got={}",
+            "显式 1MB 不应被缺省 4MB 覆盖: got={}",
             socket.recv_buffer_size().unwrap()
         );
     }
@@ -1288,13 +1288,13 @@ mod tests {
             rcvbuf(&out)
         );
 
-        // 默认 0：TCP 路径取 16MB 缺省（bd 88m0/0kqj——DRS 对快排空 relay 自稳定钉死
+        // 默认 0：TCP 路径取 4MB 缺省（bd 88m0/0kqj——DRS 对快排空 relay 自稳定钉死
         // 接收窗 ~64KB，窗/RTT 吞吐；显式设置锁窗为记账上限，内核翻倍记账）。
         let off = make();
         apply_inbound_socket_options(&off, &SocketOptions::default()).unwrap();
         assert!(
             rcvbuf(&off) >= TCP_RCVBUF_DEFAULT as usize,
-            "默认 0 应设 16MB 接收缓冲: got={} want>={}",
+            "默认 0 应设 4MB 接收缓冲: got={} want>={}",
             rcvbuf(&off),
             TCP_RCVBUF_DEFAULT
         );

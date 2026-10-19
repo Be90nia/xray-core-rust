@@ -1,29 +1,29 @@
 //! 进程内 TLS session cache（bypass-握手复用，bd 2026-10-19 B2）。
 //!
-//! 对齐 Go `tls.Config.ClientSessionCache`：在客户端缓存 (server_name, fingerprint)
-//! 对应的 BoringSSL `SSL_SESSION`，让同一目的地后续 dial 通过 `SSL_set_session`
+//! 对齐 Go `tls.Config.ClientSessionCache`：在客户端缓存 server_name 对应的
+//! BoringSSL `SSL_SESSION`，让同一目的地后续 dial 通过 `SSL_set_session`
 //! 把 PSK 信息塞进 ClientHello 触发 1-RTT resumption（TLS 1.3 新会话票走 at most 1-RTT，
-//! 0-RTT 视服务端策略）。
+//! 0-RTT 视服务端策略）。Go 的 cache key 本就是 host:port 字符串、不分指纹，
+//! 本模块同构（不同指纹的 CTX 间投递 session 由 `SSL_set_session` 的 cipher
+//! 兼容性检查兜底，不兼容即拒、不误握手）。
 //!
-//! ## BoringSSL TLS 1.3 `not_resumable` 陷阱（关键约束，bd 0kqj B2 修复）
+//! ## 根因史：为什么必须用 `SSL_CTX_sess_set_new_cb` 写入（B2 二次修复）
 //!
-//! BoringSSL `SSL_SESSION_to_bytes` 在 TLS 1.3 path 上发现 `SSL_get_session()`
-//! 拿到的 session 有 `not_resumable=true`（握手完成即设 true 防误用），序列化会
-//! 写成 `"NOT RESUMABLE"` 占位符。`SSL_SESSION_from_bytes` 还原后仍是
-//! `not_resumable=true`，`ssl_session_get_type()` 返回 `SSLSessionType::kNotResumable`，
-//! 客户端 ClientHello 不发 PSK 扩展、服务端识别不到 ticket —— 此前 B2 cache 命
-//! 中率 47/47 但 `session_reused=false` 根因。
+//! 第一版在**握手完成点**取 `SSL_get_session()` 存 cache——这个时机拿到的是
+//! **无 ticket 的 handshake session**（TLS 1.3 客户端握手完成时
+//! `established_session` dup 自 `new_session`，NewSessionTicket 尚未到达/处理）。
+//! BoringSSL `ssl_session_get_type` 对「TLS 1.3 + 空 ticket」返回
+//! `kNotResumable`，`should_offer_psk` 直接拒绝 → ClientHello 永不发 PSK
+//! 扩展 → 服务端无从复用（bd 0kqj 症状：cache 47/47 命中但
+//! `session_reused=false`）。此前把 `not_resumable` 归因于 to_der 序列化
+//! 陷阱是误诊——序列化只是暴露问题的通道，直接持有 SslSession 同样无效。
 //!
-//! 修复=BoringSSL `SslSession` 直接缓存，跳过序列化。BoringSSL `SslSession` 是
-//! 引用计数对象（`SslSession_up_ref` 即 bump），`Ssl_set_session` 内部 `up_ref`
-//! 后两方各持一份，独立 drop 也只 free 一次。drop 跟随 Rust `HashMap` +
-//! `Mutex` 自然清理。
-//!
-//! ## BoringSSL 客户端 cache 边界
-//!
-//! BoringSSL 客户端无内置 cache。本模块就是 app 级 cache：握手成功从
-//! `SSL_get_session()` 拿现成 SslSession → 存入 hash map → 下次 dial
-//! 取出 → `SSL_set_session` 投递。
+//! 带 ticket 的 resumption session 只在 NST 到达时由
+//! `SSL_CTX_sess_set_new_cb` 回调交付（BoringSSL `tls13_client.cc`
+//! `ssl_process_new_session_ticket`：`ticket_age_add_valid = true;
+//! not_resumable = false` 后 UpRef 交回调）。修复 = connector builder 挂
+//! [`crate::btls_client`] 的 session cache hook（`set_new_session_callback`
+//! + `SSL_SESS_CACHE_CLIENT`——后者是回调触发前提），本模块只做存取。
 //!
 //! ## 进程内 only 约束
 //!
@@ -31,14 +31,7 @@
 //! 之后才能复用——这与 Rust `r2` build 同启服务端的场景一致（同进程 instance、
 //! cache 热）。重启跨进程不冲击：full handshake 路径本身工作正常。
 //!
-//! ## CTX 不一致
-//!
-//! 不同 fingerprint 是不同 SSL_CTX（`connector_for_fingerprint` 每次返回新 connector）
-//! ——但 BoringSSL 的 `SSL_set_session` 会检查 cipher 是否与 session 里 cipher 兼容，
-//! 不兼容即拒，不会误握手。`enableSessionResumption=false` 直接早返 None 对齐
-//! rustls 路径。
-//!
-//! ponytail: 单进程一份 hash map（`[key](String, Fingerprint)` → `SslSession`+Instant），
+//! ponytail: 单进程一份 hash map（`String`(server_name) → `SslSession`+Instant），
 //! TTL = 24h（远大于 Chrome page-load 间隔；BoringSSL 内置 session_timeout 默认
 //! 24h = server 端 ticket 寿命），超期条目惰性清理（lookup 时比对）。
 
@@ -49,8 +42,6 @@ use std::{
 };
 
 use tracing::{debug, trace};
-
-use crate::fingerprint::Fingerprint;
 
 /// Session cache TTL（24h，对齐 BoringSSL `SSL_SESSION` 默认 timeout）。
 ///
@@ -68,8 +59,9 @@ struct CacheEntry {
     stored_at: Instant,
 }
 
-/// 缓存表类型别名（`clippy::type_complexity` 要求显式 type）。
-type CacheMap = HashMap<(String, Fingerprint), CacheEntry>;
+/// 缓存表类型别名（`clippy::type_complexity` 要求显式 type）。key = server_name
+/// （对齐 Go `tls.Config.ClientSessionCache`，不分指纹）。
+type CacheMap = HashMap<String, CacheEntry>;
 
 /// 进程内单例 cache：`Arc<StdMutex<CacheMap>>`（lookup 极少但须跨 dial
 /// 共享，锁粒度 = 整张表；同 key 并发写 = 后写覆盖，已达成语义）。
@@ -84,11 +76,8 @@ fn cache() -> Arc<StdMutex<CacheMap>> {
 ///
 /// `enable_session_resumption=false` 时直接返回 None（与 rustls 路径的
 /// `Resumption::disabled()` 对齐）。
-///
-/// 不再需要 `SslContextRef`：SslSession 已是 ref-counted，独立持有不影响后续 SSL。
 pub(crate) fn lookup_for_resume(
     server_name: &str,
-    fingerprint: Fingerprint,
     enable_session_resumption: bool,
 ) -> Option<btls::ssl::SslSession> {
     if !enable_session_resumption {
@@ -97,43 +86,30 @@ pub(crate) fn lookup_for_resume(
     let cache = cache();
     let session = {
         let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
-        let entry = guard.get_mut(&(server_name.to_string(), fingerprint))?;
+        let entry = guard.get_mut(server_name)?;
         if entry.stored_at.elapsed() > SESSION_TTL {
-            guard.remove(&(server_name.to_string(), fingerprint));
+            guard.remove(server_name);
             return None;
         }
-        debug!(target: "xray_tls::session_cache", server_name, ?fingerprint, "session resume: 命中 cache");
+        debug!(target: "xray_tls::session_cache", server_name, "session resume: 命中 cache");
         // SslSession 内部 ref-counted，`to_owned` 增量引用计数，调用方 drop 独立 free。
         entry.session.clone()
     };
     Some(session)
 }
 
-/// 握手成功后回写 session 到 cache（无副作用失败）。
-///
-/// `enable_session_resumption=false` 时不做任何事。
-pub(crate) fn store_session(
-    server_name: &str,
-    fingerprint: Fingerprint,
-    session: &btls::ssl::SslSessionRef,
-    enable_session_resumption: bool,
-) {
-    if !enable_session_resumption {
-        return;
-    }
+/// NST 回调入口：NewSessionTicket 到达时写入 cache（此 session 带票、
+/// `not_resumable=false`，是唯一可复用的形态）。后续写入覆盖前写入。
+/// 回调在 SSL_CTX 级、无法感知 per-connection `enableSessionResumption`——
+/// 该 flag 由 [`lookup_for_resume`] 读取侧门控，false 时只存不读、行为正确。
+pub(crate) fn store_session(server_name: &str, session: btls::ssl::SslSession) {
     let cache = cache();
     let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
-    // SslSession 内部 ref-counted，`to_owned` 增量引用计数。
-    let owned = session.to_owned();
-    guard.insert(
-        (server_name.to_string(), fingerprint),
-        CacheEntry { session: owned, stored_at: Instant::now() },
-    );
+    guard.insert(server_name.to_string(), CacheEntry { session, stored_at: Instant::now() });
     trace!(
         target: "xray_tls::session_cache",
         server_name,
-        ?fingerprint,
-        "session stored"
+        "session stored (new_session_cb)"
     );
 }
 
