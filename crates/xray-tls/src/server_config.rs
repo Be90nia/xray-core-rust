@@ -269,7 +269,24 @@ pub fn build_server_config(
     // `NeverProducesTickets` + `send_tls13_tickets=0`（外部 crate 看不到
     // NeverProducesTickets 类型，把 `send_tls13_tickets=0` 当 ticket 关停信号
     // 用：rustls tls13.rs:364-368 在 0 时不走 encrypt 分支，效果等价）。
-    if enable_session_resumption {
+    //
+    // allowEarlyData=true（Rust 扩展字段，Go 忽略）：rustls 0-RTT 只接受
+    // stateful resumption（server/tls13.rs:671 `max_early_data_size > 0 &&
+    // !ticketer.enabled()`）——装 ticketer 时 0-RTT 恒拒。因此开启 early data
+    // 时保持 builder 缺省（NeverProducesTickets + ServerSessionMemoryCache(256)），
+    // NST 走 stateful（随机 32B id 存 session_storage），并在 NST 里宣告
+    // max_early_data_size（tls13.rs:1333-1338）——BoringSSL 客户端据此缓存
+    // 0-RTT-capable session。单次使用语义由调用方防重放（本地 harness/直连
+    // 场景；CF 路径 0-RTT 由 CF 决定，不经此配置）。
+    let allow_early_data = json.get("allowEarlyData").and_then(|v| v.as_bool()).unwrap_or(false);
+    if enable_session_resumption && allow_early_data {
+        config.max_early_data_size = 64 * 1024;
+        tracing::info!(
+            target: "xray_tls::server_config",
+            max_early_data_size = config.max_early_data_size,
+            "TLS 0-RTT enabled (stateful resumption: ticketer off, session_storage=memory(256))"
+        );
+    } else if enable_session_resumption {
         config.ticketer = rustls::crypto::ring::Ticketer::new()
             .map_err(|e| io::Error::other(format!("tls ticketer: {e}")))?;
     } else {
@@ -755,6 +772,32 @@ aZ9A3Sng12a1YFnJcLOELh+loNChRANCAATG2iorYlDeMjaVlb7XdvtKt1Og/t5H
         let default_send =
             build_server_config("tls", Some(&serde_json::json!({}))).unwrap().unwrap();
         assert!(default_send.send_tls13_tickets > 0);
+    }
+
+    /// allowEarlyData=true：0-RTT 接受路径开通——max_early_data_size>0 且
+    /// ticketer 关停（rustls 只接受 stateful resumption 的 0-RTT，
+    /// server/tls13.rs:671）。NST 经 session_storage stateful 发放，BoringSSL
+    /// 客户端可缓存 0-RTT-capable session。
+    #[test]
+    fn allow_early_data_enables_max_early_data_and_disables_ticketer() {
+        install_provider();
+        let cfg = build_server_config("tls", Some(&serde_json::json!({"allowEarlyData": true})))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.max_early_data_size, 64 * 1024);
+        assert!(!cfg.ticketer.enabled(), "0-RTT 要求 stateful resumption：ticketer 必须关");
+        // stateful NST 照发（客户端才有 session 可复用/0-RTT）。
+        assert!(cfg.send_tls13_tickets > 0);
+    }
+
+    /// allowEarlyData 缺省 = 关（max_early_data_size=0），且 ticketer 行为与
+    /// 0-RTT 改动前完全一致（bd0kqj 契约不被波及）。
+    #[test]
+    fn allow_early_data_absent_keeps_default_behavior() {
+        install_provider();
+        let cfg = build_server_config("tls", Some(&serde_json::json!({}))).unwrap().unwrap();
+        assert_eq!(cfg.max_early_data_size, 0);
+        assert!(cfg.ticketer.enabled());
     }
 
     /// 证书级 `oneTimeLoading=true`（Go TLSCertConfig）：Rust 无证书热重载

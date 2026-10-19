@@ -29,6 +29,7 @@ use std::{
 };
 
 use btls::ssl::{KeyShare, SslConnector, SslContextBuilder, SslMethod, SslRef};
+use foreign_types::ForeignTypeRef as _;
 use rustls::client::danger::ServerCertVerifier;
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -1010,6 +1011,151 @@ pub(crate) fn connector_for_fingerprint(fp: &Fingerprint) -> Option<io::Result<F
 }
 
 // ============================================================
+// TLS 1.3 0-RTT (early data)：FFI + 客户端状态机
+// ============================================================
+
+// btls-sys bindings 未生成 early-data 符号（bindgen 清单缺），手动 extern "C"
+// 声明——符号在 BoringSSL ssl.lib 内真实存在（ssl.h:4194-4230），链接期由
+// btls-sys 的静态库解析（同 btls_reality.rs 的 REALITY patch 函数先例）。
+unsafe extern "C" {
+    fn SSL_set_early_data_enabled(ssl: *mut btls_sys::SSL, enabled: i32);
+    fn SSL_in_early_data(ssl: *const btls_sys::SSL) -> i32;
+    fn SSL_early_data_accepted(ssl: *const btls_sys::SSL) -> i32;
+    fn SSL_reset_early_data_reject(ssl: *mut btls_sys::SSL);
+}
+
+/// `SSL_ERROR_EARLY_DATA_REJECTED`（ssl.h:458）——服务端拒绝 0-RTT 时
+/// `SSL_get_error` 的返回值。
+const SSL_ERROR_EARLY_DATA_REJECTED: i32 = 15;
+
+/// 客户端 0-RTT 状态。per-connection 状态，无跨连接共享、无全局锁。
+/// `Default`（=Off）供 `mem::take` 原子换出使用。
+#[derive(Default)]
+enum EarlyData {
+    /// 无 0-RTT：未启用 / 无缓存 session / 已 accept / 已重发完成。
+    #[default]
+    Off,
+    /// 握手停在 0-RTT 写窗（ClientHello 已发出，服务端 flight 未到）：
+    /// 后续应用写走 early data，须缓存已写字节备拒收重发。
+    Offering { written: Vec<u8> },
+    /// 服务端拒绝（`SSL_ERROR_EARLY_DATA_REJECTED`，且已
+    /// `SSL_reset_early_data_reject`）：补完握手后用普通 SSL_write 重发
+    /// `pending[sent..]`，保证应用层数据零丢失、零重复。
+    Replay { pending: Vec<u8>, sent: usize },
+}
+
+impl<S: Connection + Unpin> BtlsConn<S> {
+    /// 取 BoringSSL `SSL*`（`stream` 持有，生命周期覆盖全部调用点）。
+    fn ssl_ptr(&self) -> *mut btls_sys::SSL {
+        self.stream.ssl().as_ptr()
+    }
+
+    /// SSL 是否仍在 0-RTT 写窗（握手停在 ClientHello 后）。
+    fn in_early_data(&self) -> bool {
+        // SAFETY: ssl 指针由 self.stream 持有且握手窗口内有效。
+        unsafe { SSL_in_early_data(self.ssl_ptr()) == 1 }
+    }
+
+    /// 最近一次读/写报错是否 = 服务端拒绝 0-RTT（rwstate 保持该值直至 reset）。
+    fn early_data_rejected(&self) -> bool {
+        // SAFETY: ssl 指针由 self.stream 持有；ret_code 传 -1 读 rwstate。
+        unsafe { btls_sys::SSL_get_error(self.ssl_ptr(), -1) == SSL_ERROR_EARLY_DATA_REJECTED }
+    }
+
+    /// 0-RTT 终态查询（验收/测试用）。`None` = 未提供 0-RTT（未启用/无缓存/
+    /// session 不支持）；`Some(false)` = 提供了但被服务端拒绝；`Some(true)` =
+    /// 被接受。
+    #[must_use]
+    pub fn early_data_accepted(&self) -> Option<bool> {
+        match self.early {
+            EarlyData::Off if self.offered_early_data => {
+                // SAFETY: ssl 指针由 self.stream 持有。
+                Some(unsafe { SSL_early_data_accepted(self.ssl_ptr()) == 1 })
+            },
+            EarlyData::Offering { .. } | EarlyData::Replay { .. } => None,
+            EarlyData::Off => None,
+        }
+    }
+
+    /// 进入拒绝重发路径：reset SSL 0-RTT 状态，把已写 early 字节转入待重发队列。
+    fn begin_replay(&mut self) {
+        let EarlyData::Offering { written } = std::mem::take(&mut self.early) else {
+            return;
+        };
+        // SAFETY: 仅在 rwstate == SSL_ERROR_EARLY_DATA_REJECTED 时调用（ssl.h 契约）。
+        unsafe { SSL_reset_early_data_reject(self.ssl_ptr()) };
+        debug!(
+            target: "xray_tls::btls",
+            server_name = %self.server_name,
+            bytes = written.len(),
+            "early_data_status=REJECTED (0-RTT); replaying buffered request after handshake"
+        );
+        self.early = EarlyData::Replay { pending: written, sent: 0 };
+    }
+
+    /// 0-RTT 写窗自然关闭（读/写驱动握手完成）：报告 accept 结果并落终态。
+    /// accept 时已写字节随 0-RTT 送达，无需重发；reject 不会走到这里
+    /// （reject 以 error 形态报出，走 [`Self::begin_replay`]）。
+    fn finish_offer(&mut self) {
+        let EarlyData::Offering { written } = std::mem::take(&mut self.early) else {
+            return;
+        };
+        // SAFETY: ssl 指针由 self.stream 持有且握手已完成。
+        let accepted = unsafe { SSL_early_data_accepted(self.ssl_ptr()) == 1 };
+        debug!(
+            target: "xray_tls::btls",
+            server_name = %self.server_name,
+            bytes = written.len(),
+            "early_data_status={}", if accepted { "ACCEPTED (0-RTT)" } else { "NOT_USED" }
+        );
+        self.early = EarlyData::Off;
+    }
+
+    /// Replay 阶段驱动：①补完被拒后的握手 ②普通写重发 pending 剩余字节。
+    /// 任一步 Pending 即整体 Pending，状态自持、跨 poll 续跑。
+    fn poll_drive_replay(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            match self.stream.as_mut().poll_do_handshake(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(io::Error::other(e.to_string())));
+                },
+                Poll::Ready(Ok(())) => {},
+            }
+            let EarlyData::Replay { pending, sent } = &mut self.early else {
+                return Poll::Ready(Ok(()));
+            };
+            match self.stream.as_mut().poll_write(cx, &pending[*sent..]) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(n)) => {
+                    *sent += n;
+                    if *sent == pending.len() {
+                        debug!(
+                            target: "xray_tls::btls",
+                            server_name = %self.server_name,
+                            bytes = pending.len(),
+                            "early_data replay complete (1-RTT fallback)"
+                        );
+                        // 拒绝后握手以真实证书链完成：回接验证必须重跑
+                        //（connect 时验证的是 session 预测链）。
+                        if let Some(v) = self.verifier.as_deref() {
+                            if let Err(e) =
+                                verify_peer_certs(self.stream.ssl(), &self.server_name, v)
+                            {
+                                return Poll::Ready(Err(e));
+                            }
+                        }
+                        self.early = EarlyData::Off;
+                        return Poll::Ready(Ok(()));
+                    }
+                },
+            }
+        }
+    }
+}
+
+// ============================================================
 // BtlsConn 包装
 // ============================================================
 
@@ -1022,6 +1168,12 @@ pub struct BtlsConn<S> {
     pub fingerprint: Fingerprint,
     /// 握手时指定的 server_name。
     server_name: String,
+    /// 0-RTT (early data) 状态机（见 [`EarlyData`]）。
+    early: EarlyData,
+    /// connect 是否提供过 0-RTT（区分「未提供」与「提供后被拒」的终态查询）。
+    offered_early_data: bool,
+    /// 回接证书验证器：拒绝重发路径握手重跑后须对真实链重验。
+    verifier: Option<Arc<dyn ServerCertVerifier>>,
 }
 
 impl<S: Connection + Unpin> BtlsConn<S> {
@@ -1041,8 +1193,16 @@ impl<S: Connection + Unpin> BtlsConn<S> {
         ech_config_list: Option<&str>,
         verifier: Option<Arc<dyn ServerCertVerifier>>,
     ) -> io::Result<Self> {
-        Self::connect_with_alpn(stream, server_name, fingerprint, ech_config_list, verifier, None)
-            .await
+        Self::connect_with_alpn(
+            stream,
+            server_name,
+            fingerprint,
+            ech_config_list,
+            verifier,
+            None,
+            false,
+        )
+        .await
     }
 
     /// `connect` 的 ALPN 覆盖版（ws/httpupgrade 出站接线用，md5i）。
@@ -1050,6 +1210,13 @@ impl<S: Connection + Unpin> BtlsConn<S> {
     /// 对应 Go `UConn.WebsocketHandshakeContext`（tls.go:98-133）：保持指纹模板
     /// 其余 ClientHello 形态，仅把 ALPN 扩展重写为 `alpn_wire`（openssl wire
     /// 格式，如 `b"\x08http/1.1"`）；`None` = 保持模板 ALPN（原行为）。
+    ///
+    /// `early_data`：TLS 1.3 0-RTT 总闸（幂等首写协议才开，如 ws upgrade GET）。
+    /// 仅当此前 `SSL_set_session` 命中带 `max_early_data_size` 宣告的缓存
+    /// session 时实际生效（BoringSSL 自门控：无缓存/不支持时该 flag 无效果，
+    /// 行为与 0-RTT 关闭完全一致）。握手停在 0-RTT 写窗时返回的连接处于
+    /// [`EarlyData::Offering`] 态——应用首写以 early data 发出，若服务端拒绝
+    /// 则由 AsyncWrite/AsyncRead 内的重发路径兜底（数据零丢失）。
     pub async fn connect_with_alpn(
         stream: S,
         server_name: &str,
@@ -1057,6 +1224,7 @@ impl<S: Connection + Unpin> BtlsConn<S> {
         ech_config_list: Option<&str>,
         verifier: Option<Arc<dyn ServerCertVerifier>>,
         alpn_wire: Option<&[u8]>,
+        early_data: bool,
     ) -> io::Result<Self> {
         use crate::ech::ApplyEch;
 
@@ -1086,12 +1254,15 @@ impl<S: Connection + Unpin> BtlsConn<S> {
         let enable_session_resumption =
             crate::tls_session_cache::parse_enable_session_resumption(None);
         let mut ssl = cfg.into_ssl(server_name).map_err(|e| io::Error::other(e.to_string()))?;
+        let mut session_set = false;
         if let Some(session) =
             crate::tls_session_cache::lookup_for_resume(server_name, enable_session_resumption)
         {
             // SAFETY: SslSession ref-counted，`session` 绑定到 if-let scope，离开前
             // BoringSSL 已 up-ref session，drop 在 scope 末尾释放。
-            if unsafe { ssl.set_session(&session) }.is_err() {
+            if unsafe { ssl.set_session(&session) }.is_ok() {
+                session_set = true;
+            } else {
                 debug!(
                     target: "xray_tls::btls",
                     fingerprint = ?fingerprint,
@@ -1100,6 +1271,12 @@ impl<S: Connection + Unpin> BtlsConn<S> {
                 );
             }
         }
+        // 0-RTT 总闸：仅在缓存 session 命中时启用（无缓存时开 flag 也无 wire
+        // 效果，但闸门语义保持「未命中=完全不提供 0-RTT」）。BoringSSL 仍会按
+        // session 是否携带 max_early_data_size 宣告自门控：不支持的 session
+        // 直接完整握手，与关闭 0-RTT 行为一致。
+        let early_data_armed = early_data && session_set;
+        let offered_early_data = early_data_armed;
 
         // per-connection 配置：key shares 和 ALPS 按指纹不同
         ssl.set_client_key_shares(fp_config.key_shares)
@@ -1129,11 +1306,30 @@ impl<S: Connection + Unpin> BtlsConn<S> {
 
         // 异步握手（tokio_btls SslStream::connect 需要 Pin<&mut Self>）
         let mut pinned = Box::pin(tls_stream);
+        if early_data_armed {
+            // SAFETY: SSL 指针由 pinned 流持有；握手未开始（connect 未调用），
+            // 0-RTT flag 必须在首个握手字节前设置（ssl.h 契约）。
+            unsafe { SSL_set_early_data_enabled(pinned.ssl().as_ptr(), 1) };
+        }
         pinned
             .as_mut()
             .connect()
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e.to_string()))?;
+
+        // 0-RTT 写窗检测：缓存 session 带 max_early_data_size 宣告时，握手停在
+        // ClientHello 后（handshake.cc:642 early_return），应用首写将以 early
+        // data 发出。未停窗 = 完整握手已在 connect 内完成（原行为，零变化）。
+        let mut early = EarlyData::Off;
+        if unsafe { SSL_in_early_data(pinned.ssl().as_ptr()) == 1 } {
+            debug!(
+                target: "xray_tls::btls",
+                fingerprint = ?fingerprint,
+                server_name,
+                "early_data offered (handshake paused in 0-RTT window)"
+            );
+            early = EarlyData::Offering { written: Vec::new() };
+        }
 
         // 会话复用证据埋点（B2 验收 7）：握手成功后从 ssl 读 `session_reused`
         // （BoringSSL 内部 = `SSL_session_reused(ssl)`）。True = 本次握手走了
@@ -1158,7 +1354,14 @@ impl<S: Connection + Unpin> BtlsConn<S> {
         // 的 `set_new_session_callback`（NST 到达时交付带票 session，见
         // [`install_session_cache_hook`]）。
 
-        Ok(Self { stream: pinned, fingerprint, server_name: server_name.to_string() })
+        Ok(Self {
+            stream: pinned,
+            fingerprint,
+            server_name: server_name.to_string(),
+            early,
+            offered_early_data,
+            verifier,
+        })
     }
 
     /// 从已握手 stream 组装（[`crate::btls_reality::connect_reality`] 用）。
@@ -1167,7 +1370,14 @@ impl<S: Connection + Unpin> BtlsConn<S> {
         fingerprint: Fingerprint,
         server_name: &str,
     ) -> Self {
-        Self { stream, fingerprint, server_name: server_name.to_string() }
+        Self {
+            stream,
+            fingerprint,
+            server_name: server_name.to_string(),
+            early: EarlyData::Off,
+            offered_early_data: false,
+            verifier: None,
+        }
     }
 }
 
@@ -1223,7 +1433,33 @@ impl<S: Connection + Unpin> AsyncRead for BtlsConn<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        self.stream.as_mut().poll_read(cx, buf)
+        let this = &mut *self;
+        loop {
+            // Replay 义务优先：先补握手 + 重发被拒字节，再谈读。
+            if matches!(this.early, EarlyData::Replay { .. }) {
+                std::task::ready!(this.poll_drive_replay(cx))?;
+            }
+            let EarlyData::Offering { .. } = this.early else {
+                return this.stream.as_mut().poll_read(cx, buf);
+            };
+            // 0-RTT 写窗中的读 = 驱动握手完成（BoringSSL 语义，ssl.h:4204）。
+            match this.stream.as_mut().poll_read(cx, buf) {
+                Poll::Ready(Ok(())) => {
+                    if !this.in_early_data() {
+                        this.finish_offer();
+                    }
+                    return Poll::Ready(Ok(()));
+                },
+                Poll::Ready(Err(e)) => {
+                    if this.early_data_rejected() {
+                        this.begin_replay();
+                        continue;
+                    }
+                    return Poll::Ready(Err(e));
+                },
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 }
 
@@ -1233,14 +1469,53 @@ impl<S: Connection + Unpin> AsyncWrite for BtlsConn<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.stream.as_mut().poll_write(cx, buf)
+        let this = &mut *self;
+        loop {
+            // Replay 义务优先：先补握手 + 重发被拒字节，再写本次数据。
+            if matches!(this.early, EarlyData::Replay { .. }) {
+                std::task::ready!(this.poll_drive_replay(cx))?;
+            }
+            let EarlyData::Offering { .. } = this.early else {
+                return this.stream.as_mut().poll_write(cx, buf);
+            };
+            // 0-RTT 写窗中的写 = early data；缓存字节备拒收重发。
+            match this.stream.as_mut().poll_write(cx, buf) {
+                Poll::Ready(Ok(n)) => {
+                    if let EarlyData::Offering { written } = &mut this.early {
+                        written.extend_from_slice(&buf[..n]);
+                    }
+                    // 写超 early data 上限时 BoringSSL 先完成握手再写
+                    //（ssl.h:4166），此处顺带捕捉写窗关闭。
+                    if !this.in_early_data() {
+                        this.finish_offer();
+                    }
+                    return Poll::Ready(Ok(n));
+                },
+                Poll::Ready(Err(e)) => {
+                    if this.early_data_rejected() {
+                        this.begin_replay();
+                        continue;
+                    }
+                    return Poll::Ready(Err(e));
+                },
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Replay 中的 flush 先清重发义务（flush = 排空缓冲语义）。
+        if matches!(self.early, EarlyData::Replay { .. }) {
+            std::task::ready!(self.poll_drive_replay(cx))?;
+        }
         self.stream.as_mut().poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // 关闭前不清重发义务 = 丢数据；先补发再关。
+        if matches!(self.early, EarlyData::Replay { .. }) {
+            std::task::ready!(self.poll_drive_replay(cx))?;
+        }
         self.stream.as_mut().poll_shutdown(cx)
     }
 }
@@ -1363,5 +1638,130 @@ mod tests {
         // 有 ALPN 变体对照：Chrome 133 携带 h2 ALPS
         let with = connector_for_fingerprint(&Fingerprint::Chrome).expect("Some").expect("Ok");
         assert!(!with.alps.is_empty());
+    }
+
+    /// TLS 1.3 0-RTT 三相回环：①首连 full handshake（无 0-RTT）②warm cache
+    /// 重连 → early data 被接受且服务端收到的字节与客户端写出一致 ③对无 0-RTT
+    /// 服务端重连（同 SNI，PSK 解不开）→ REJECTED → reset+重发 → 数据完整。
+    /// 覆盖 AsyncWrite/AsyncRead 状态机的 offer/accept/reject/replay 全路径。
+    #[tokio::test]
+    async fn early_data_accept_reject_replay_roundtrip() {
+        use std::sync::Arc as StdArc;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use xray_transport::connection::TcpConnection;
+
+        let timeout = tokio::time::Duration::from_secs(60);
+        tokio::time::timeout(timeout, async {
+            // 服务端 A：0-RTT 开（stateful + 64K）；服务端 B：缺省（无状态 ticketer）。
+            let cfg_ed = crate::server_config::build_server_config(
+                "tls",
+                Some(&serde_json::json!({"allowEarlyData": true})),
+            )
+            .unwrap()
+            .unwrap();
+            let cfg_plain =
+                crate::server_config::build_server_config("tls", Some(&serde_json::json!({})))
+                    .unwrap()
+                    .unwrap();
+            let acceptor_ed = StdArc::new(tokio_rustls::TlsAcceptor::from(cfg_ed));
+            let acceptor_plain = StdArc::new(tokio_rustls::TlsAcceptor::from(cfg_plain));
+
+            let lsn = StdArc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+            let addr = lsn.local_addr().unwrap();
+
+            // 服务端任务：accept 一条连接 → 排空 early data → 回写 HELLO → 读一段。
+            type Acceptor = StdArc<tokio_rustls::TlsAcceptor>;
+            async fn serve(
+                lsn: StdArc<tokio::net::TcpListener>,
+                acc: Acceptor,
+            ) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+                let (tcp, _) = lsn.accept().await?;
+                let mut tls = acc.accept(tcp).await?;
+                let mut early = Vec::new();
+                if let Some(mut ed) = tls.get_mut().1.early_data() {
+                    use std::io::Read as _;
+                    let _ = ed.read_to_end(&mut early);
+                }
+                let mut tls = tls;
+                tls.write_all(b"HELLO").await?;
+                let mut buf = [0u8; 64];
+                let n = tls.read(&mut buf).await.unwrap_or(0);
+                Ok((early, buf[..n].to_vec()))
+            }
+
+            // ① 首连（无缓存）→ full handshake，不得提供 0-RTT。
+            let s1 = tokio::spawn(serve(lsn.clone(), acceptor_ed.clone()));
+            let tcp1 = TcpConnection::new(tokio::net::TcpStream::connect(addr).await.unwrap());
+            let mut c1 = BtlsConn::connect_with_alpn(
+                tcp1,
+                "localhost",
+                Fingerprint::Chrome,
+                None,
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(c1.early_data_accepted(), None, "首连无缓存：不应有 0-RTT 终态");
+            c1.write_all(b"PING1").await.unwrap();
+            let mut buf = [0u8; 5];
+            c1.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"HELLO");
+            drop(c1);
+            let (early1, got1) = s1.await.unwrap().unwrap();
+            assert!(early1.is_empty(), "首连不应有 early data: {early1:?}");
+            assert_eq!(&got1, b"PING1");
+
+            // ② warm cache 重连（0-RTT 服务端）→ 停窗 → 首写 early data → ACCEPTED。
+            let s2 = tokio::spawn(serve(lsn.clone(), acceptor_ed.clone()));
+            let tcp2 = TcpConnection::new(tokio::net::TcpStream::connect(addr).await.unwrap());
+            let mut c2 = BtlsConn::connect_with_alpn(
+                tcp2,
+                "localhost",
+                Fingerprint::Chrome,
+                None,
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+            c2.write_all(b"PING2").await.unwrap();
+            let mut buf = [0u8; 5];
+            c2.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"HELLO");
+            assert_eq!(c2.early_data_accepted(), Some(true), "warm cache + 0-RTT 服务端必须接受");
+            drop(c2);
+            let (early2, got2) = s2.await.unwrap().unwrap();
+            assert_eq!(early2, b"PING2", "服务端收到的 early 字节须与客户端首写一致");
+            assert!(got2.is_empty(), "accept 场景无重发：后续流不应再有数据");
+
+            // ③ 同 SNI 拨无 0-RTT 服务端 → PSK 解不开 → REJECTED → 重发保数据。
+            let s3 = tokio::spawn(serve(lsn, acceptor_plain));
+            let tcp3 = TcpConnection::new(tokio::net::TcpStream::connect(addr).await.unwrap());
+            let mut c3 = BtlsConn::connect_with_alpn(
+                tcp3,
+                "localhost",
+                Fingerprint::Chrome,
+                None,
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+            c3.write_all(b"PING3").await.unwrap();
+            let mut buf = [0u8; 5];
+            c3.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"HELLO");
+            assert_eq!(c3.early_data_accepted(), Some(false), "被拒后终态必须是 Some(false)");
+            drop(c3);
+            let (early3, got3) = s3.await.unwrap().unwrap();
+            assert!(early3.is_empty(), "拒绝方不应收到 early data: {early3:?}");
+            assert_eq!(&got3, b"PING3", "重发后数据必须完整送达（禁止丢数据）");
+        })
+        .await
+        .expect("early-data roundtrip timed out");
     }
 }

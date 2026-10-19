@@ -125,6 +125,39 @@ pub(crate) fn parse_enable_session_resumption(security_json: Option<&serde_json:
         .unwrap_or(true)
 }
 
+/// 解析 `tlsSettings.allowEarlyData` 缺省 = false（Rust 扩展字段，Go 忽略）。
+///
+/// 0-RTT (early data) 总闸：客户端侧控制 btls 握手是否提供 0-RTT（仅幂等首写
+/// 协议应开，如 ws/httpupgrade upgrade GET）；服务端侧控制 rustls 是否接受
+/// 0-RTT（见 `server_config::build_server_config`）。缺省关闭 = 现行为零变化。
+pub(crate) fn parse_allow_early_data(security_json: Option<&serde_json::Value>) -> bool {
+    security_json
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("allowEarlyData"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod allow_early_data_tests {
+    use super::parse_allow_early_data;
+
+    #[test]
+    fn allow_early_data_defaults_false() {
+        assert!(!parse_allow_early_data(None));
+        assert!(!parse_allow_early_data(Some(&serde_json::json!({}))));
+    }
+
+    #[test]
+    fn allow_early_data_parses_bool() {
+        assert!(parse_allow_early_data(Some(&serde_json::json!({"allowEarlyData": true}))));
+        assert!(!parse_allow_early_data(Some(&serde_json::json!({"allowEarlyData": false}))));
+        // 非 bool 值（字符串/数字）按缺省关处理，不 panic
+        assert!(!parse_allow_early_data(Some(&serde_json::json!({"allowEarlyData": "yes"}))));
+        assert!(!parse_allow_early_data(Some(&serde_json::json!({"allowEarlyData": 1}))));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
