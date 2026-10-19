@@ -14,10 +14,7 @@ use std::{
 use bytes::Bytes;
 use h2::{client, server};
 use http::Request;
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
-    net::TcpStream,
-};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use xray_common::net::destination::Destination;
 use xray_transport::{
     connection::Connection,
@@ -70,11 +67,14 @@ pub async fn dial(
     // r7a9：拨号外层 timeout 包装。Go xray-core system_dialer 用 DefaultSystemDialer
     // 16s 超时；这里与 system_dialer::DEFAULT_DIAL_TIMEOUT 对齐（与 hysteria/quic 拨号同源）。
     // 域名前置（CDN 后端）下 IP 直连极快；DNS hang/路由黑洞下裸 connect 永不返回。
-    let tcp = tokio::time::timeout(std::time::Duration::from_secs(16), TcpStream::connect(&addr))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "grpc dial timeout"))??;
+    let tcp = tokio::time::timeout(
+        std::time::Duration::from_secs(16),
+        xray_transport::sockopt::dial_client_tcp(addr.as_str()),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "grpc dial timeout"))??;
     tcp.set_nodelay(true).ok();
-    // bd 88m0 客户端侧：下行 SO_RCVBUF 缺省 4MB（窗钉修复；失败即拨号失败，
+    // bd 88m0/0kqj 客户端侧：下行 SO_RCVBUF 缺省 16MB（窗钉修复；失败即拨号失败，
     // 对齐 dial_system sockopt 语义）。
     xray_transport::sockopt::apply_client_dial_rcvbuf(&tcp)?;
     let cfg = parse_config(settings)?;
@@ -811,6 +811,8 @@ fn resolve_user_agent(ua: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    use tokio::net::TcpStream;
 
     use super::*;
     #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意

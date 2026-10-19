@@ -421,6 +421,51 @@ pub fn apply_client_dial_rcvbuf(tcp: &tokio::net::TcpStream) -> std::io::Result<
     socket2::SockRef::from(tcp).set_recv_buffer_size(TCP_RCVBUF_DEFAULT as usize)
 }
 
+/// 客户端裸拨号统一入口（[`apply_client_dial_rcvbuf`] 的三个调用点用它取代裸
+/// `TcpStream::connect`）。
+///
+/// Linux 在 connect **之前**设 `TCP_FASTOPEN_CONNECT`：TFO 只对建立前的 socket
+/// 生效（对 ESTABLISHED socket 设置，新内核返回 EINVAL——见
+/// [`apply_outbound_socket_options`] 的测试注释），所以拨号必须由本函数自持
+/// socket 完成。其他平台等价 [`tokio::net::TcpStream::connect`]（Windows 无
+/// TFO 语义，ConnectEx 改造不在此列）。
+///
+/// 默认启用、无配置输入（这些拨号点不消费 sockopt 配置，与 RCVBUF 缺省同源
+/// 理由）。对端不支持 TFO / 无 cookie 时内核自动回退普通握手；setsockopt 本身
+/// 失败（内核 <4.11 / seccomp 限制）只记 debug 不阻断拨号——纯优化项不能成为
+/// 拨号失败原因。多地址回退语义对齐 `TcpStream::connect`（逐个尝试）。
+pub async fn dial_client_tcp<A>(host: A) -> std::io::Result<tokio::net::TcpStream>
+where
+    A: tokio::net::ToSocketAddrs,
+{
+    #[cfg(target_os = "linux")]
+    {
+        let mut last_err = None;
+        for addr in tokio::net::lookup_host(host).await? {
+            let socket = match addr {
+                std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
+                std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
+            }?;
+            // TFO：LinuxSockOpt 出站分支（inbound=false）即 TCP_FASTOPEN_CONNECT。
+            let tfo = linux::LinuxSockOpt { tcp_fast_open: 1, ..Default::default() };
+            if let Err(e) = tfo.apply(socket.as_raw_fd()) {
+                tracing::debug!(error = %e, "TCP_FASTOPEN_CONNECT 不可用，按普通握手拨号");
+            }
+            match socket.connect(addr).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "no address to dial")
+        }))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        tokio::net::TcpStream::connect(host).await
+    }
+}
+
 /// 把 [`SocketOptions`] 应用到已建立的 [`Socket`]（TCP 专用）。
 ///
 /// 对应 Go `applyOutboundSocketOptions`（sockopt_linux.go:16-111 / freebsd.go:127-178
@@ -1023,6 +1068,34 @@ mod tests {
             got >= d_recv,
             "rcvbuf must not shrink below kernel default: got={got} default={d_recv}"
         );
+    }
+
+    /// Linux：`dial_client_tcp` 在 connect 之前设 TCP_FASTOPEN_CONNECT（回读 1）
+    /// 且拨号成功——对 ESTABLISHED socket 设置新内核 EINVAL，故只有 pre-connect
+    /// 顺序能既设上又不炸（顺序见 `apply_outbound_socket_options` 测试注释）。
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn client_dial_tfo_sets_fastopen_connect_before_connect() {
+        use std::os::fd::AsRawFd;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = dial_client_tcp(addr).await.unwrap();
+        let mut val: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: 读 fd 栈上 c_int；len 与类型一致。
+        let ret = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_TCP,
+                libc::TCP_FASTOPEN_CONNECT,
+                &mut val as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        let _ = listener.accept().await;
+        assert_eq!(ret, 0, "getsockopt(TCP_FASTOPEN_CONNECT) failed");
+        assert_eq!(val, 1, "dial_client_tcp 应在 connect 前设 TCP_FASTOPEN_CONNECT");
     }
 
     #[tokio::test]
