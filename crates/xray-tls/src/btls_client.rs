@@ -1046,23 +1046,22 @@ impl<S: Connection + Unpin> BtlsConn<S> {
             fp_config.connector.configure().map_err(|e| io::Error::other(e.to_string()))?;
         cfg.set_verify_hostname(false);
 
-        // 客户端 TLS session cache（B2，2026-10-19）：connector 自身不同进程
-        // 间共享——每个 dial 重新构建 `FpConfig.connector` = 新 SSL_CTX；
-        // 本模块 cache 用 serialized SSL_SESSION 跨 CTX 传递 PSK 信息。
-        // `enableSessionResumption=false` 走 lookup 早返（与 rustls 路径的
-        // `Resumption::disabled()` 对齐）。从 cfg 抽出 SslContextRef 给
-        // `SSL_SESSION_from_bytes` 用（仅 cipher 校验）。
+        // 客户端 TLS session cache（B2，2026-10-19，bd 0kqj 修复）：connector 自身
+        // 不同进程间共享——每个 dial 重新构建 `FpConfig.connector` = 新 SSL_CTX；
+        // 本模块 cache 直接持有 BoringSSL ref-counted `SslSession` 跨 CTX 投递
+        // （早前 to_der/from_der 序列化路径被 `not_resumable=true` 陷阱废——
+        // BoringSSL `SSL_SESSION_to_bytes` 在 TLS 1.3 path 写「NOT RESUMABLE」
+        // 占位符，无法还原 ticket）。`enableSessionResumption=false` 走 lookup
+        // 早返（与 rustls 路径的 `Resumption::disabled()` 对齐）。
         let enable_session_resumption =
             crate::tls_session_cache::parse_enable_session_resumption(None);
         let mut ssl = cfg.into_ssl(server_name).map_err(|e| io::Error::other(e.to_string()))?;
         if let Some(session) = crate::tls_session_cache::lookup_for_resume(
             server_name,
             fingerprint,
-            ssl.ssl_context(),
             enable_session_resumption,
         ) {
-            // SAFETY: SslSession 关联同 fingerprint 的 SSL_CTX（cipher 兼容）；
-            // 调用期间 session 须存活——`session` 绑定到本 if-let scope，离开前
+            // SAFETY: SslSession ref-counted，`session` 绑定到 if-let scope，离开前
             // BoringSSL 已 up-ref session，drop 在 scope 末尾释放。
             if unsafe { ssl.set_session(&session) }.is_err() {
                 debug!(
