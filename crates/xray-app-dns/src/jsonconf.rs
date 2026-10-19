@@ -495,11 +495,13 @@ fn policy_key(ns: &NameServerJson) -> String {
     sb
 }
 
-/// 资源目录（geosite.dat / geoip.dat 查找路径）。对应 Go `XRAY_LOCATION_ASSET`。
+/// 资源目录（geosite.dat / geoip.dat 查找路径）。
+///
+/// 统一走 platform 探测（`XRAY_LOCATION_ASSET` → exe 目录 → 非 Windows 共享
+/// 安装路径，Go others.go:15-32）；此前 env 未设时回退 cwd，非 cwd 启动
+/// （systemd/计划任务）下 DNS `geosite:` 规则会 fail-closed 启动失败。
 fn resolve_asset_dir() -> std::path::PathBuf {
-    std::env::var("XRAY_LOCATION_ASSET")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+    xray_common::platform::get_asset_dir()
 }
 
 /// 本地域 TLD + 无点域名规则（Go `localTLDsAndDotlessDomainsRules`，app/dns/config.go）。

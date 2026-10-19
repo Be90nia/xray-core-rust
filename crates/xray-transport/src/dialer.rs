@@ -161,10 +161,25 @@ impl StreamSettings {
         Self { protocol, security, transport_json, security_json, sockopt_json, finalmask_json }
     }
 
-    /// 是否启用 TLS（`security == "tls"` 或 `security == "reality"`）。
+    /// 是否启用 TLS（`security == "tls"` 或 `security == "reality"`，大小写不敏感
+    /// ——对齐 Go `strings.ToLower(c.Security)`）。
     #[must_use]
     pub fn is_tls(&self) -> bool {
-        matches!(self.security.as_str(), "tls" | "reality")
+        matches!(self.security.to_lowercase().as_str(), "tls" | "reality")
+    }
+
+    /// security 值启动/拨号期校验（对齐 Go `infra/conf/transport_internet.go:100-132`
+    /// Build 语义，大小写归一同 Go ToLower）：`""`/`none`/`tls`/`reality` 合法；
+    /// `xtls` 是已移除特性硬错；其他未知值硬错。此前未知值（含 `xtls`、拼写错误）
+    /// 经 `is_tls()==false` 静默裸连。
+    pub fn validate_security(&self) -> io::Result<()> {
+        match self.security.to_lowercase().as_str() {
+            "" | "none" | "tls" | "reality" => Ok(()),
+            "xtls" => Err(io::Error::other(
+                "Legacy XTLS has been removed, please use xtls-rprx-vision with TLS or REALITY",
+            )),
+            other => Err(io::Error::other(format!("Unknown security \"{other}\"."))),
+        }
     }
 
     /// 启动期 sockopt 数值校验（对齐 Go 解码期硬错）。
@@ -611,6 +626,8 @@ pub async fn dial(
     settings: &StreamSettings,
     sockopt: &SocketOptions,
 ) -> io::Result<Box<dyn Connection>> {
+    // 未知/已移除 security 硬错（Go transport_internet.go Build 语义），覆盖全部 transport。
+    settings.validate_security()?;
     dial_with_settings(&settings.protocol, destination, sockopt, settings).await
 }
 
@@ -626,6 +643,24 @@ mod transport_cache_tests {
 
     fn rfw(json: &str) -> Vec<String> {
         removed_feature_warnings(&serde_json::from_str(json).unwrap())
+    }
+
+    #[test]
+    fn validate_security_accepts_known_values() {
+        for sec in ["", "none", "tls", "reality", "TLS"] {
+            let s = StreamSettings { security: sec.to_string(), ..StreamSettings::tcp() };
+            assert!(s.validate_security().is_ok(), "security={sec:?} must be accepted");
+        }
+    }
+
+    #[test]
+    fn validate_security_rejects_xtls_and_unknown() {
+        let xtls = StreamSettings { security: "xtls".into(), ..StreamSettings::tcp() };
+        let err = xtls.validate_security().unwrap_err().to_string();
+        assert!(err.contains("Legacy XTLS"), "got: {err}");
+        let bogus = StreamSettings { security: "tlss".into(), ..StreamSettings::tcp() };
+        let err = bogus.validate_security().unwrap_err().to_string();
+        assert!(err.contains("Unknown security"), "got: {err}");
     }
 
     #[test]

@@ -1181,6 +1181,83 @@ mod tests {
         assert_eq!(&wire[21..25], b"ping");
     }
 
+    /// e2e（bd 1wq8）：vless 出站 UDP（make_dial_fn + UDP dest → VlessCommand::Udp +
+    /// 长度前缀分帧）→ serve_vless `handle_udp_relay` → freedom → UDP echo 全链路往返。
+    #[tokio::test]
+    async fn vless_outbound_udp_roundtrip_e2e() {
+        use std::time::Duration;
+        use tokio::{net::UdpSocket, time::timeout};
+
+        use crate::dispatcher::{VlessOutboundConfig, make_dial_fn};
+
+        // 1. UDP echo
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, from)) = echo.recv_from(&mut buf).await {
+                let _ = echo.send_to(&buf[..n], from).await;
+            }
+        });
+
+        // 2. serve_vless（freedom UDP 腿 FreedomDispatchBridge，与生产 wiring 一致）
+        let ohm = Arc::new(SimpleOhm::new());
+        let tcp_bridge = Arc::new(DialBridge::new("freedom", make_freedom_dial_fn()));
+        ohm.set_default(
+            Arc::new(xray_proxy_freedom::FreedomDispatchBridge::from_bridge(tcp_bridge))
+                as Arc<dyn xray_app_dispatcher::DispatchHandler>,
+        );
+        let (uuid, validator) = make_validator_with_user_flow("", &[]);
+        let vless_listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        )
+        .await
+        .unwrap();
+        let vless_addr = vless_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = serve_vless(
+                vless_listener,
+                ohm,
+                validator,
+                None,
+                None,
+                Some(VlessInboundOptions::default()),
+            )
+            .await;
+        });
+
+        // 3. 出站：UDP dest
+        let cfg = Arc::new(VlessOutboundConfig::new(
+            uuid,
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(vless_addr.port()),
+        ));
+        let dial = make_dial_fn(cfg);
+        let dest = Destination::new(
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(echo_port),
+            Network::UDP,
+        );
+        let mut conn = timeout(Duration::from_secs(10), dial(&dest))
+            .await
+            .expect("dial timeout")
+            .expect("udp dial");
+
+        // 4. 往返（两包不同尺寸）
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for payload in [&b"ping"[..], &[9u8; 600][..]] {
+            conn.write_all(payload).await.unwrap();
+            conn.flush().await.unwrap();
+            let mut buf = vec![0u8; payload.len()];
+            timeout(Duration::from_secs(10), conn.read_exact(&mut buf))
+                .await
+                .expect("roundtrip timeout")
+                .expect("read");
+            assert_eq!(&buf, payload);
+        }
+    }
+
     /// e2e：make_dial_fn(flow=XRV) ↔ serve_vless 全链路 Vision padding 对拉
     /// （outbound 与 inbound 双端包装，padding 收发互解）。
     #[tokio::test]

@@ -304,6 +304,7 @@ pub fn make_dial_fn_with_handshake_timeout(
             let preconn_once = Arc::clone(&preconn_once);
             let target_addr = dest.address().clone();
             let target_port = dest.port();
+            let is_udp = dest.is_udp();
             Box::pin(async move {
                 if let Some(pool) = pre_conns.as_ref() {
                     let pool = Arc::clone(pool);
@@ -317,6 +318,7 @@ pub fn make_dial_fn_with_handshake_timeout(
                     pre_conns,
                     target_addr,
                     target_port,
+                    is_udp,
                     handshake_timeout,
                 )
                 .await
@@ -345,8 +347,15 @@ async fn establish_conn(
     pre_conns: Option<Arc<PreConns>>,
     target_addr: Address,
     target_port: Port,
+    is_udp: bool,
     handshake_timeout: std::time::Duration,
 ) -> Result<Box<dyn Connection>, String> {
+    // Go outbound.go:303-306 把 XRV flow 的 UDP 转 mux（v1.mux.cool）——Rust mux
+    // 未实现；且 Go 服务端本就拒 XRV+UDP（inbound.go:556 "doesn't support UDP"）。
+    // 早失败给可诊断错误，而不是静默按 TCP 发。
+    if is_udp && config.flow == crate::FLOW_XRV {
+        return Err(format!("{} doesn't support UDP", crate::FLOW_XRV));
+    }
     // 1. 取连接：testpre 池命中（免 TCP 握手）→ 用预连接。Go testpre>0 时
     //    消费端阻塞等池（outbound.go:174-183 `<-h.preConns`），从不自拨； worker 与消费者同
     //    runtime，await 让出即互不阻塞。pop 返回 None 仅在 pool 的 Sender
@@ -379,13 +388,15 @@ async fn establish_conn(
 
     // 2. 写 VLESS 请求头（version + uuid + addons + command + target addr/port）
     // addons.flow 从 config 取（bd vxk）：flow=xtls-rprx-vision 时服务端启用 Vision。
+    // command 按 dest.network（Go outbound.go:214-217：UDP → RequestCommandUDP）。
     let mut addons = empty_addons();
     addons.flow = config.flow.clone();
+    let command = if is_udp { VlessCommand::Udp } else { VlessCommand::Tcp };
     encode_request_header(
         &mut conn,
         VERSION,
         &config.user_uuid,
-        VlessCommand::Tcp,
+        command,
         Some(&target_addr),
         Some(target_port.value()),
         &addons,
@@ -421,8 +432,149 @@ async fn establish_conn(
         conn = Box::new(vision);
     }
 
+    // UDP：长度前缀分帧（Go EncodeBodyAddons UDP → MultiLengthPacketWriter /
+    // DecodeBodyAddons UDP → LengthPacketReader）。write 边界≈packet 边界，
+    // read 剥 2B BE 前缀——inbound `handle_udp_relay` 消费同一 wire 格式。
+    if is_udp {
+        conn = Box::new(VlessUdpFramedConn::new(conn));
+    }
     // conn 现在是 "已握手完成的 TCP"，bridge_link_with_stream 直接用
     Ok(conn)
+}
+
+/// VLESS UDP 长度前缀分帧连接：`poll_write` 每次调用 = 一个 UDP 包
+/// （wire 帧 `[2B BE len][payload]`），`poll_read` 剥前缀按包交付。
+///
+/// 对应 Go `proxy/vless/encoding/addons.go:66-69`（EncodeBodyAddons UDP →
+/// `MultiLengthPacketWriter`）与 :80-82（DecodeBodyAddons UDP →
+/// `LengthPacketReader`）；inbound `handle_udp_relay` 的
+/// `read_length_packet`/`write_length_packet` 消费同一 wire 格式。
+struct VlessUdpFramedConn {
+    inner: Box<dyn Connection>,
+    /// 读侧缓冲：`rview == 0` 时为原始 wire 字节（攒帧），`rview > 0` 时
+    /// `rbuf[..rview]` 为当前包尚未交付的 payload。
+    rbuf: Vec<u8>,
+    rview: usize,
+    /// 待写完的帧（UDP 帧不可分，部分写时缓存剩余）
+    wpending: Vec<u8>,
+    wpos: usize,
+}
+
+impl VlessUdpFramedConn {
+    fn new(inner: Box<dyn Connection>) -> Self {
+        Self { inner, rbuf: Vec::new(), rview: 0, wpending: Vec::new(), wpos: 0 }
+    }
+}
+
+impl AsyncWrite for VlessUdpFramedConn {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        // 先排干 pending 帧（UDP 帧不可分）
+        while this.wpos < this.wpending.len() {
+            let n = std::task::ready!(
+                Pin::new(&mut *this.inner).poll_write(cx, &this.wpending[this.wpos..])
+            )?;
+            if n == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "vless udp: frame write stalled",
+                )));
+            }
+            this.wpos += n;
+        }
+        // 构帧 [2B BE len][payload]。len 前缀 u16 上限截断（Go 对超限包跳过；
+        // UDP relay 实际包 ≤ MTU，截断保下游帧不损坏）。
+        let chunk = &buf[..buf.len().min(usize::from(u16::MAX))];
+        let mut frame = Vec::with_capacity(chunk.len() + 2);
+        frame.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+        frame.extend_from_slice(chunk);
+        this.wpending = frame;
+        this.wpos = 0;
+        while this.wpos < this.wpending.len() {
+            let n = std::task::ready!(
+                Pin::new(&mut *this.inner).poll_write(cx, &this.wpending[this.wpos..])
+            )?;
+            if n == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "vless udp: frame write stalled",
+                )));
+            }
+            this.wpos += n;
+        }
+        Poll::Ready(Ok(chunk.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+impl AsyncRead for VlessUdpFramedConn {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        loop {
+            // 当前包有未交付 payload → 先交付（ReadBuf 满时保留剩余，不丢数据）
+            if this.rview > 0 {
+                let n = this.rview.min(buf.remaining());
+                buf.put_slice(&this.rbuf[..n]);
+                this.rbuf.drain(..n);
+                this.rview -= n;
+                return Poll::Ready(Ok(()));
+            }
+            // 攒帧：够帧头且够 payload → 剥前缀进入交付阶段
+            if this.rbuf.len() >= 2 {
+                let len = usize::from(u16::from_be_bytes([this.rbuf[0], this.rbuf[1]]));
+                if this.rbuf.len() >= 2 + len {
+                    this.rbuf.drain(..2);
+                    this.rview = len;
+                    continue;
+                }
+            }
+            // 不足一帧 → 从 inner 补读
+            let mut tmp = [0u8; 8192];
+            let mut rb = ReadBuf::new(&mut tmp);
+            match Pin::new(&mut *this.inner).poll_read(cx, &mut rb)? {
+                Poll::Ready(()) => {
+                    let filled = rb.filled();
+                    if filled.is_empty() {
+                        return if this.rbuf.is_empty() {
+                            Poll::Ready(Ok(())) // EOF：干净关闭
+                        } else {
+                            Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "vless udp: truncated frame",
+                            )))
+                        };
+                    }
+                    this.rbuf.extend_from_slice(filled);
+                },
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl Connection for VlessUdpFramedConn {
+    fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+        self.inner.remote_addr()
+    }
+
+    fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+        self.inner.local_addr()
+    }
 }
 
 /// 判断错误是否为 0-RTT 票据拒绝（[`crate::encryption::TICKET_REJECTED_MSG`]）。
@@ -531,6 +683,88 @@ mod tests {
     use xray_common::{net::address::Address, uuid::UUID};
 
     use super::*;
+
+    /// VLESS UDP 分帧（bd 1wq8）：write 边界=包边界，wire = `[2B BE len][payload]`，
+    /// 读侧剥前缀按包交付（对齐 Go MultiLengthPacketWriter/LengthPacketReader）。
+    #[tokio::test]
+    async fn vless_udp_framed_conn_roundtrip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client_side, mut server_side) = tokio::io::duplex(4096);
+        let mut framed = VlessUdpFramedConn::new(Box::new(
+            xray_transport::connection::DuplexConnection::new(client_side),
+        ));
+
+        let p1 = b"hello".to_vec();
+        let p2 = vec![7u8; 300];
+        framed.write_all(&p1).await.unwrap();
+        framed.write_all(&p2).await.unwrap();
+        framed.flush().await.unwrap();
+
+        // wire 断言：每帧 [2B BE len][payload]，帧间无分隔
+        framed.shutdown().await.unwrap();
+        let mut wire = Vec::new();
+        server_side.read_to_end(&mut wire).await.unwrap();
+        let mut off = 0usize;
+        for p in [&p1, &p2] {
+            let len = u16::from_be_bytes([wire[off], wire[off + 1]]) as usize;
+            assert_eq!(len, p.len());
+            assert_eq!(&wire[off + 2..off + 2 + len], &p[..]);
+            off += 2 + len;
+        }
+        assert_eq!(off, wire.len(), "no trailing bytes");
+
+        // 读侧：wire 喂回 framed，read() 单次调用按包交付
+        let (mut feed_tx, feed_rx) = tokio::io::duplex(4096);
+        let mut reader = VlessUdpFramedConn::new(Box::new(
+            xray_transport::connection::DuplexConnection::new(feed_rx),
+        ));
+        feed_tx.write_all(&wire).await.unwrap();
+        feed_tx.shutdown().await.unwrap();
+
+        let mut buf = [0u8; 1024];
+        let n = reader.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], &p1[..]);
+        let n = reader.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], &p2[..]);
+        let n = reader.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0, "EOF after last packet");
+    }
+
+    /// XRV flow + UDP 目的地：mux 未实现 → 早失败（Go outbound.go:303-306 转 mux /
+    /// inbound.go:556 服务端拒——不允许静默按 TCP 发）。
+    #[tokio::test]
+    async fn establish_conn_rejects_xrv_udp() {
+        let uuid = UUID::new();
+        let cfg = Arc::new(
+            VlessOutboundConfig::new(
+                uuid,
+                Address::from_ipv4_bytes([127, 0, 0, 1]),
+                Port::new(443),
+            )
+            .with_flow(crate::FLOW_XRV),
+        );
+        let dest = Destination::new(
+            Address::from_ipv4_bytes([8, 8, 8, 8]),
+            Port::new(53),
+            Network::UDP,
+        );
+        let err = match establish_conn(
+            cfg,
+            None,
+            None,
+            dest.address().clone(),
+            dest.port(),
+            true,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("XRV+UDP must be rejected"),
+        };
+        assert!(err.contains("doesn't support UDP"), "got: {err}");
+    }
 
     /// 读一个 Vision padding 块：`[uuid(16, 仅首块)][command(1)][content_len(2 BE)]
     /// [padding_len(2 BE)][content][padding]`。`has_uuid` = 首块（带 uuid 前缀）。

@@ -920,6 +920,80 @@ mod tests {
             other => panic!("expected EOF or connection reset, got {other:?}"),
         }
     }
+    /// e2e（bd uhg2）：vmess 出站 UDP（make_vmess_dial_fn + UDP dest，chunk 即 packet）
+    /// → serve_vmess `pump_udp_session` → freedom → UDP echo 全链路往返。
+    #[tokio::test]
+    async fn vmess_outbound_udp_roundtrip_e2e() {
+        use std::time::Duration;
+        use tokio::{net::UdpSocket, time::timeout};
+
+        use crate::dispatcher::{VmessOutboundConfig, make_vmess_dial_fn};
+
+        // 1. UDP echo
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, from)) = echo.recv_from(&mut buf).await {
+                let _ = echo.send_to(&buf[..n], from).await;
+            }
+        });
+
+        // 2. serve_vmess（freedom UDP 腿，与生产 wiring 一致）
+        let ohm = make_ohm_with_freedom();
+        let (validator, _cmd_key) = make_validator_with_user();
+        let vmess_listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        )
+        .await
+        .unwrap();
+        let vmess_addr = vmess_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = serve_vmess(
+                vmess_listener,
+                ohm,
+                validator,
+                None,
+                xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT,
+            )
+            .await;
+        });
+
+        // 3. 出站：UDP dest（同一 uuid；vmess security 出站自主选择）
+        let uuid = UUID::parse(SAMPLE_UUID_STR).expect("uuid");
+        let cfg = Arc::new(
+            VmessOutboundConfig::new(
+                uuid,
+                Address::ipv4(std::net::Ipv4Addr::LOCALHOST),
+                Port::new(vmess_addr.port()),
+            )
+            .with_security(SecurityType::Aes128Gcm),
+        );
+        let dial = make_vmess_dial_fn(cfg);
+        let dest = Destination::udp(
+            Address::ipv4(std::net::Ipv4Addr::LOCALHOST),
+            Port::new(echo_port),
+        );
+        let mut conn = timeout(Duration::from_secs(10), dial(&dest))
+            .await
+            .expect("dial timeout")
+            .expect("udp dial");
+
+        // 4. 往返（两包不同尺寸）
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for payload in [&b"ping"[..], &[9u8; 600][..]] {
+            conn.write_all(payload).await.unwrap();
+            conn.flush().await.unwrap();
+            let mut buf = vec![0u8; payload.len()];
+            timeout(Duration::from_secs(10), conn.read_exact(&mut buf))
+                .await
+                .expect("roundtrip timeout")
+                .expect("read");
+            assert_eq!(&buf, payload);
+        }
+    }
+
     /// VMess UDP e2e：client Command::Udp → server chunk→packet 转发 → UDP echo → 回包 chunk。
     /// 对应 Go 非 cone 语义（chunk 边界即 packet 边界）。
     #[tokio::test]

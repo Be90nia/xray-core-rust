@@ -448,6 +448,7 @@ async fn serve_mixed(
     socks_cfg: Arc<ServerConfig>,
     http_cfg: Arc<HttpServerConfig>,
     handshake_timeout: Option<std::time::Duration>,
+    udp_idle: std::time::Duration,
 ) -> std::io::Result<()> {
     let handler = ohm
         .get_default_handler()
@@ -501,9 +502,18 @@ async fn serve_mixed(
                             let _ = handler.dispatch(&dest, link).await;
                         }
                     },
-                    Ok(SocksRequest::UdpAssociate(_, _)) => {
-                        // UDP associate 简化:暂不支持(mixed UDP 罕见,跟 socks5 UDP 等价)
-                        tracing::debug!("mixed: udp associate not supported in mixed mode");
+                    Ok(SocksRequest::UdpAssociate(_, relay_socket)) => {
+                        // UDP relay：spawn pump + 保持 TCP 控制连接（对齐独立 socks
+                        // inbound 的 handle_connection UDP 分支与 Go server.go UDP
+                        // 语义——此前丢弃 relay socket = 假成功，bd csya）
+                        let udp_handler = Arc::clone(&handler);
+                        let relay = tokio::spawn(async move {
+                            let _ = handle_udp_associate(relay_socket, udp_handler, udp_idle).await;
+                        });
+                        // 控制连接 EOF/错误（客户端关闭）即终止 relay
+                        let mut drop_buf = [0u8; 64];
+                        let _ = stream.read(&mut drop_buf).await;
+                        relay.abort();
                     },
                     Err(e) => tracing::debug!(error = %e, "mixed socks handshake failed"),
                 }
@@ -633,26 +643,26 @@ async fn handle_plain_http(
     // 2. 创建 pipe 对，构造 dispatch link
     let (up_r, up_w) = xray_buf::pipe::new();
     let (dn_r, dn_w) = xray_buf::pipe::new();
-    let dn_w_cleanup = dn_w.clone();
     let link =
         Link::new(Box::new(up_r) as Box<dyn BufReader>, Box::new(dn_w) as Box<dyn BufWriter>);
 
-    // 3. dispatch：拨号目标 + bridge（up_r → 目标写，目标读 → dn_w）
+    // 3. dispatch：把 link 交给出站。生产 DefaultDispatcher::dispatch_link 内部 spawn
+    //    后台任务后立即返回（link 由后台持有），不能把这里的返回当作桥接结束去
+    //    关闭 dn_w——否则响应还没写下行就被掐断。
+    //    dispatch 无错误返回（PinFuture<()>）：no-handler/后台 dial 失败都表现为
+    //    link 被中断 → 下行零字节结束 → 下方 responded 判据统一回 503 兜底。
     let dest = hs.dest.clone();
-    let h = Arc::clone(&handler);
-    let dispatch_and_cleanup = async move {
-        h.dispatch(&dest, link).await;
-        // dispatch 结束（bridge EOF 或拨号失败）→ 关闭 dn_w 解除 read 阻塞
-        dn_w_cleanup.shutdown();
-    };
+    handler.dispatch(&dest, link).await;
 
     // 4. 拆 client stream：read(body) + write(response) 并发
     let (mut client_read, mut client_write) = tokio::io::split(client);
     let mut up_w = up_w;
     let mut dn_r = dn_r;
+    // write_task 被 abort 时不会执行自身的 up_w.shutdown()，留句柄保证上行 pipe 关闭。
+    let up_w_ctl = up_w.clone();
 
     // 上行：写 request head + copy body → 目标
-    let write_req = async {
+    let write_task = tokio::spawn(async move {
         let mut mb = MultiBuffer::new();
         mb.merge_bytes(&request_head);
         let _ = up_w.write_multi_buffer(mb).await;
@@ -672,11 +682,14 @@ async fn handle_plain_http(
         }
         xray_buf::alloc::release(buf);
         up_w.shutdown(); // EOF → dispatch bridge 关闭目标写半部
-    };
+    });
 
     // 下行：读响应 → 客户端（data 为循环级 scratch，消每轮 to_vec 分配）
     let read_resp = async {
         let mut data = Vec::new();
+        // 写出过任何响应字节后不能再回 503（HTTP 单响应）；零字节即结束 =
+        // 后台 dial 失败/目标无响应 → 503 兜底（Go responseDone err 分支语义）
+        let mut responded = false;
         #[allow(clippy::while_let_loop)] // 存量清零批次
         loop {
             match dn_r.read_multi_buffer().await {
@@ -691,13 +704,23 @@ async fn handle_plain_http(
                     if client_write.write_all(&data).await.is_err() {
                         break;
                     }
+                    responded = true;
                 },
                 Err(_) => break,
             }
         }
+        if !responded {
+            let _ = client_write
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n")
+                .await;
+        }
     };
 
-    tokio::join!(dispatch_and_cleanup, write_req, read_resp);
+    // 只等下行：HTTP/1.1 GET 无 body 时 client_read 永不 EOF，等上行会挂死连接。
+    // 下行结束（目标 connection: close 关闭）即收尾，上行任务 abort + 关闭上行 pipe。
+    read_resp.await;
+    write_task.abort();
+    up_w_ctl.shutdown();
 }
 
 /// Dokodemo TCP inbound per-connection 目标解析选项。
@@ -2761,10 +2784,17 @@ async fn spawn_one_inbound(
             // 嗅探/socks/http 三段握手读共用一个限时；对齐 Go mixed mux 的两个
             // handler（socks/http 均按 policy().Timeouts.Handshake 限时）。
             let handshake_timeout = handshake_timeout_for(&policy, http_cfg.user_level);
+            // mixed socks 分支 UDP relay 空闲时限（同 socks inbound 的 policy 查询，
+            // Go server.go:171-175 ConnectionIdle；UDP 属 socks 域故用 socks_cfg 档）
+            let udp_idle = policy
+                .as_ref()
+                .map(|pm| pm.policy_for_level(socks_cfg.user_level).timeout.connection_idle)
+                .unwrap_or(xray_features::policy::TimeoutPolicy::default().connection_idle);
             let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone()).await?;
             tracing::info!(tag = %ib.tag, addr = %addr, "mixed (socks+http) inbound listening");
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                serve_mixed(listener, ohm, socks_cfg, http_cfg, Some(handshake_timeout)).await
+                serve_mixed(listener, ohm, socks_cfg, http_cfg, Some(handshake_timeout), udp_idle)
+                    .await
             })))
         },
         "vless" => {
@@ -6593,6 +6623,169 @@ mod tests {
                 let _ = writer.write_multi_buffer(mb).await;
             })
         }
+    }
+
+    /// csya：mixed inbound 的 socks 分支 UDP ASSOCIATE 必须真接线（spawn relay
+    /// pump + 保持控制连接）。此前回成功响应后丢弃 relay socket = 假成功，
+    /// UDP 查询黑洞——本测通过 mixed TCP 入口走完整握手 + relay 往返锁死该语义。
+    #[tokio::test]
+    async fn mixed_socks_udp_associate_roundtrip() {
+        let ohm = Arc::new(SimpleOhm::new());
+        ohm.set_default(Arc::new(MarkerUdpDispatch { marker: b"via-mixed-dispatch" })
+            as Arc<dyn xray_app_dispatcher::DispatchHandler>);
+
+        let listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        )
+        .await
+        .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let socks_cfg = Arc::new(parse_socks_server_config(br#"{"udp":true}"#).unwrap());
+        let http_cfg = Arc::new(HttpServerConfig::default());
+        tokio::spawn(async move {
+            let _ = serve_mixed(
+                listener,
+                ohm,
+                socks_cfg,
+                http_cfg,
+                Some(std::time::Duration::from_secs(5)),
+                std::time::Duration::from_secs(300),
+            )
+            .await;
+        });
+
+        // 1. TCP 控制连接：SOCKS5 noauth 握手 + CMD_UDP_ASSOCIATE
+        let mut ctrl = tokio::net::TcpStream::connect(addr).await.unwrap();
+        ctrl.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut method_resp = [0u8; 2];
+        ctrl.read_exact(&mut method_resp).await.unwrap();
+        assert_eq!(method_resp, [0x05, 0x00]);
+        ctrl.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.unwrap();
+        let mut reply = [0u8; 10];
+        ctrl.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], 0x00, "UDP ASSOCIATE must succeed");
+        let relay_addr = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            u16::from_be_bytes([reply[8], reply[9]]),
+        );
+
+        // 2. 往 relay 发 SOCKS5 UDP 帧；MarkerUdpDispatch 标记帧经 relay 返回
+        //    （假成功路径下 relay socket 已被丢弃，此步超时）
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = SocksAddr { host: Host::Ipv4(Ipv4Addr::new(8, 8, 8, 8)), port: 53 };
+        client.send_to(&encode_udp_packet(&target, b"ping"), relay_addr).await.unwrap();
+
+        let mut rbuf = [0u8; 1500];
+        let (n, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), client.recv_from(&mut rbuf))
+                .await
+                .expect("mixed udp relay must roundtrip via dispatcher")
+                .unwrap();
+        let (_src, payload) = decode_udp_packet(&rbuf[..n]).unwrap();
+        assert_eq!(payload, b"via-mixed-dispatch");
+    }
+
+    /// z8i0：plain HTTP 上游被 dispatch 层立即中断（dial 失败/no handler 形态）
+    /// → 客户端收到 503 并关闭（对齐 Go handlePlainHTTP 读不到响应回 503
+    /// Service Unavailable）。
+    #[tokio::test]
+    async fn plain_http_dispatch_error_returns_503() {
+        struct FailingDispatch;
+        impl std::fmt::Debug for FailingDispatch {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("FailingDispatch")
+            }
+        }
+        impl xray_app_dispatcher::DispatchHandler for FailingDispatch {
+            fn tag(&self) -> &str {
+                "failing"
+            }
+            fn dispatch(
+                &self,
+                _dest: &Destination,
+                link: xray_transport::link::Link,
+            ) -> xray_app_dispatcher::default::PinFuture<()> {
+                // dispatcher 错误路径关闭下行（对齐 default.rs missing-tag/reject 的
+                // outbound_writer.shutdown()——pipe Writer 裸 drop 不传播关闭）
+                link.writer.shutdown();
+                drop(link);
+                Box::pin(async {})
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        let hs = HandshakeResult {
+            dest: Destination::tcp(Address::IPv4(Ipv4Addr::new(1, 2, 3, 4)), Port::new(80)),
+            method: "GET".into(),
+            target: "http://1.2.3.4/".into(),
+            headers: HashMap::new(),
+        };
+        tokio::spawn(handle_plain_http(server, hs, Arc::new(FailingDispatch)));
+
+        let mut buf = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.read_to_end(&mut buf))
+            .await
+            .expect("503 within 5s")
+            .unwrap();
+        let resp = String::from_utf8_lossy(&buf);
+        assert!(resp.starts_with("HTTP/1.1 503"), "got: {resp}");
+        assert!(resp.contains("Connection: close"), "got: {resp}");
+    }
+
+    /// z8i0：dispatch Ok 但目标零响应即关闭（后台 dial 失败形态）→ 客户端
+    /// 仍收到 503 兜底；已写出响应字节后断流则不再补 503（HTTP 单响应）。
+    #[tokio::test]
+    async fn plain_http_silent_upstream_returns_503() {
+        struct DropLinkDispatch;
+        impl std::fmt::Debug for DropLinkDispatch {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("DropLinkDispatch")
+            }
+        }
+        impl xray_app_dispatcher::DispatchHandler for DropLinkDispatch {
+            fn tag(&self) -> &str {
+                "drop-link"
+            }
+            fn dispatch(
+                &self,
+                _dest: &Destination,
+                link: xray_transport::link::Link,
+            ) -> xray_app_dispatcher::default::PinFuture<()> {
+                Box::pin(async move {
+                    // bridge 存活片刻（上行请求头写入 pipe），随后不回任何响应即
+                    // 显式关闭下行（pipe Writer 裸 drop 不传播关闭）
+                    let keep = link;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    keep.writer.shutdown();
+                })
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        let hs = HandshakeResult {
+            dest: Destination::tcp(Address::IPv4(Ipv4Addr::new(1, 2, 3, 4)), Port::new(80)),
+            method: "GET".into(),
+            target: "http://1.2.3.4/".into(),
+            headers: HashMap::new(),
+        };
+        tokio::spawn(handle_plain_http(server, hs, Arc::new(DropLinkDispatch)));
+
+        let mut buf = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.read_to_end(&mut buf))
+            .await
+            .expect("503 within 5s")
+            .unwrap();
+        let resp = String::from_utf8_lossy(&buf);
+        assert!(resp.starts_with("HTTP/1.1 503"), "got: {resp}");
     }
 
     /// b2e：SOCKS UDP ASSOCIATE relay 经 dispatcher（UdpDispatchSession）。

@@ -84,6 +84,9 @@ async fn wrap_security(
     settings: &StreamSettings,
     dest: &Destination,
 ) -> io::Result<Box<dyn Connection>> {
+    // 未知/已移除 security 硬错（Go transport_internet.go:129-132），此前 xtls 等
+    // 非法值经 is_tls()==false 静默裸连。
+    settings.validate_security()?;
     // security=none（或空）原样返回。
     if !settings.is_tls() {
         return Ok(conn);

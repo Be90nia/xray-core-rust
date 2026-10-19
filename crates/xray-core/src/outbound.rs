@@ -705,11 +705,14 @@ fn build_protocol_handler(
                 }
                 Vec::new()
             } else {
-                config
-                    .final_rules
-                    .iter()
-                    .filter_map(|rc| xray_proxy_freedom::FinalRule::build(rc).ok())
-                    .collect()
+                // Go freedom.go:208-214 Init：规则构建失败硬错拒启（此前 .ok() 静默丢弃）。
+                let mut rules = Vec::with_capacity(config.final_rules.len());
+                for rc in &config.final_rules {
+                    rules.push(xray_proxy_freedom::FinalRule::build(rc).map_err(|e| {
+                        BuildError::Parse(format!("freedom: failed to build final rule: {e}"))
+                    })?);
+                }
+                rules
             };
             // sockopt.dialerProxy 下沉拨号层（Go freedom.go:58 + dialer.go:270-279 redirect）
             let dial_fn =
@@ -847,14 +850,22 @@ fn build_protocol_handler(
         },
         "hysteria" => {
             let (server_addr, auth, server_name) = parse_hysteria_config(&ob.entry.data)?;
-            let config = HysteriaConfig::new(&server_addr, &auth).with_server_name(&server_name);
-            xray_common::ensure_default_crypto_provider();
-            let tls_config = rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerifier))
-                .with_no_client_auth();
             let stream_settings =
                 xray_transport::dialer::StreamSettings::from_json(ob.stream_settings_json.as_ref());
+            // tlsSettings.serverName 覆盖 settings 推导（Go tls.Config ServerName 优先级）。
+            let server_name = stream_settings
+                .security_json
+                .as_ref()
+                .and_then(|v| v.get("serverName"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map_or_else(|| server_name, str::to_string);
+            let config = HysteriaConfig::new(&server_addr, &auth).with_server_name(&server_name);
+            let tls_config = build_hysteria_tls_config(
+                &stream_settings.security,
+                stream_settings.security_json.as_ref(),
+            )
+            .map_err(|e| format!("hysteria streamSettings: {e}"))?;
             let obfs = xray_transport_hysteria::salamander_socket::parse_udp_obfs(
                 stream_settings.finalmask_json.as_ref(),
             )
@@ -1472,6 +1483,40 @@ fn parse_trojan_config(data: &[u8]) -> std::result::Result<TrojanOutboundConfig,
     )
     .with_level(level)
     .with_email(email))
+}
+
+/// 构造 hysteria 出站 rustls ClientConfig。
+///
+/// 对齐 Go `transport/internet/hysteria/dialer.go:327-330 Dial`：TLS 配置完全来自
+/// streamSettings（`tls.ConfigFromStreamSettings`），`security != "tls"` 时配置为
+/// nil → 硬错。`insecure: true` 显式跳过校验（用户信任决策）；缺省走 webpki-roots
+/// 真实验证（此前恒 NoVerifier 不校验，自签/中间人不可察觉）。
+fn build_hysteria_tls_config(
+    security: &str,
+    tls_json: Option<&serde_json::Value>,
+) -> std::result::Result<rustls::ClientConfig, String> {
+    if !security.eq_ignore_ascii_case("tls") {
+        return Err(format!(
+            "security must be \"tls\" (Go: tls config is nil), got \"{security}\""
+        ));
+    }
+    let insecure = tls_json
+        .and_then(|v| v.get("insecure"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    xray_common::ensure_default_crypto_provider();
+    if insecure {
+        Ok(rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth())
+    } else {
+        let root_store = rustls::RootCertStore {
+            #[allow(clippy::iter_cloned_collect)] // 存量清零批次
+            roots: webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect(),
+        };
+        Ok(rustls::ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth())
+    }
 }
 
 /// 解析 freedom outbound settings JSON → FreedomConfig。
@@ -3823,6 +3868,20 @@ mod tests {
         let json2 = br#"{"domainStrategy":"UseIP","targetStrategy":""}"#;
         let cfg2 = parse_freedom_config(json2).unwrap();
         assert_eq!(cfg2.domain_strategy, 1);
+    }
+
+    /// x2ci：hysteria 出站 TLS 配置按 streamSettings（Go dialer.go:327-330）。
+    #[test]
+    fn build_hysteria_tls_config_validates_security_and_insecure() {
+        // security 非 tls → 硬错（Go "tls config is nil"），缺失/未知值同拒。
+        assert!(build_hysteria_tls_config("", None).is_err());
+        assert!(build_hysteria_tls_config("reality", None).is_err());
+        assert!(build_hysteria_tls_config("xtls", None).is_err());
+        // security=tls：缺省走 webpki 真实验证；insecure=true 显式跳过。
+        let tls_json: serde_json::Value = serde_json::from_str(r#"{"insecure": true}"#).unwrap();
+        assert!(build_hysteria_tls_config("tls", Some(&tls_json)).is_ok());
+        assert!(build_hysteria_tls_config("tls", None).is_ok());
+        assert!(build_hysteria_tls_config("TLS", None).is_ok(), "大小写归一对齐 Go ToLower");
     }
 
     /// vrll①③：settings JSON 坏 / 未知 strategy / finalRules 单条非法 →

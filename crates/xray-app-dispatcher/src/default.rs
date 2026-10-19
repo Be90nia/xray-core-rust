@@ -364,6 +364,12 @@ pub struct AccessContext {
     /// txno④：reverse mux portal 写侧随 New 帧下发 source/local（Go
     /// client.go:268-271 writer 携带 inbound）。空串 = 未提供。
     pub local: String,
+    /// VLESS 路由字节（Go `session.Inbound.VlessRoute`：UUID 第 7<<8|8 字节）；
+    /// 0 = 未提供（Go Port 零值）。vlessRoute 端口规则依赖。
+    pub vless_route: u16,
+    /// DNS 查询标记（Go `session.Content.SkipDNSResolve`）：DNS 模块经路由出站
+    /// 时置位，路由层不再解析目标域名，防止查询递归。
+    pub skip_dns_resolve: bool,
     /// txno-splice：入站侧在 dispatch 前 `dup` 出的裸连接；`None` = 非 raw
     /// 传输或未提供（与 Go nil 等价）。`InboundDispatchHandler` 与 outbound
     /// 间经本字段携带「raw fd 可用性」，freedom 出站桥接判定处消费。
@@ -391,6 +397,8 @@ impl std::fmt::Debug for AccessContext {
             .field("level", &self.level)
             .field("allowed_network", &self.allowed_network)
             .field("local", &self.local)
+            .field("vless_route", &self.vless_route)
+            .field("skip_dns_resolve", &self.skip_dns_resolve)
             .field("conn", &self.conn)
             .field("can_splice_copy", &self.can_splice_copy)
             .field("splice_down_out", &self.splice_down_out.is_some())
@@ -745,7 +753,12 @@ fn override_dest(
     ),
     DispatcherError,
 > {
-    let new_addr = xray_common::net::address::Address::new_domain(domain.to_string());
+    // Go default.go:302/357 `net.ParseAddress(domain)`：嗅探域名若本身是 IP 字面量
+    // （如 HTTP Host: 127.0.0.1），必须保留为 IP——一律域名化会让 ip/geoip 规则失效，
+    // 并把字面量当主机名去解析。
+    let new_addr = domain
+        .parse::<xray_common::net::address::Address>()
+        .unwrap_or_else(|_| xray_common::net::address::Address::new_domain(domain.to_string()));
     let domain_dest =
         xray_common::net::destination::Destination::new(new_addr, dest.port(), dest.network());
     if route_only {
@@ -781,8 +794,11 @@ fn build_routing_context(
 }
 
 /// 从 `from`（`ip:port`）解析源 IP。c10t：让 SourceIpMatcher 规则命中。
+///
+/// IPv6 形态为 `[::1]:80`（SocketAddr Display），需去方括号再解析。
 fn parse_from_ip(from: &str) -> Option<IpAddr> {
-    from.rsplit_once(':').and_then(|(ip_s, _)| ip_s.parse().ok())
+    from.rsplit_once(':')
+        .and_then(|(ip_s, _)| ip_s.trim_start_matches('[').trim_end_matches(']').parse().ok())
 }
 
 /// 从 `from`（`ip:port`）解析源端口。
@@ -970,6 +986,21 @@ impl DefaultDispatcher {
         inbound_tag: Option<&str>,
         outbound_tag: Option<&str>,
     ) -> Result<xray_transport::link::Link, DispatcherError> {
+        self.dispatch_with_access(destination, sniffing_request, inbound_tag, outbound_tag, None)
+    }
+
+    /// 同 [`Self::dispatch`]，额外携带 [`AccessContext`] 进入路由上下文。
+    ///
+    /// DNS 查询经路由出站时用它置 `skip_dns_resolve`（Go nameserver_doh.go:186 /
+    /// nameserver_tcp.go:147），避免路由再解析目标域名造成递归查询。
+    pub fn dispatch_with_access(
+        &self,
+        destination: &xray_common::net::destination::Destination,
+        sniffing_request: &SniffingRequest,
+        inbound_tag: Option<&str>,
+        outbound_tag: Option<&str>,
+        access: Option<AccessContext>,
+    ) -> Result<xray_transport::link::Link, DispatcherError> {
         // ponytail: policy_manager 存在时用 policy_for_level(0) 动态查询策略，
         // 否则回退到 default_policy。per-user level 需 dispatch 签名变更（deferred）。
         let policy = self
@@ -1055,7 +1086,7 @@ impl DefaultDispatcher {
         let inbound = xray_transport::link::Link::new(inbound_reader, inbound_writer);
         let outbound = xray_transport::link::Link::new(outbound_reader, outbound_writer);
         // 启动 outbound handler；dispatch_link 内部 spawn handler.dispatch(outbound)
-        self.dispatch_link(destination, outbound, sniffing_request, None, None)?;
+        self.dispatch_link(destination, outbound, sniffing_request, access, None)?;
         Ok(inbound)
     }
 
@@ -1236,6 +1267,19 @@ impl DefaultDispatcher {
                     if !a.email.is_empty() {
                         ctx = ctx.with_user(a.email.as_str());
                     }
+                    // 本地地址（Go `session.Inbound.Local`）：localIP/localPort 规则依赖。
+                    if let Some(ip) = parse_from_ip(&a.local) {
+                        ctx.local_ips = vec![ip];
+                    }
+                    if let Some(port) = parse_from_port(&a.local) {
+                        ctx.local_port = xray_common::net::port::Port::new(port);
+                    }
+                    // VLESS 路由字节（Go `Inbound.VlessRoute`）：vlessRoute 端口规则依赖。
+                    if a.vless_route != 0 {
+                        ctx.vless_route = a.vless_route.to_string();
+                    }
+                    // DNS 查询防递归（Go `Content.SkipDNSResolve`）。
+                    ctx.skip_dns_resolve = a.skip_dns_resolve;
                 }
                 // routeOnly（Go default.go:311-315）：路由用嗅探域名（route_target），
                 // 拨号保持 final_dest（原 dest）。
@@ -1809,6 +1853,9 @@ impl DispatchHandler for DialBridge {
                 },
                 Err(e) => {
                     tracing::error!(tag = %tag, "dial failed: {e}");
+                    // 拨号失败也必须关下行：pipe Writer 的 drop 不传播 close，
+                    // 对端 reader 会永远挂在 wait_close（批次 A 503 兜底实测挂死）。
+                    link.writer.shutdown();
                 },
             }
         })
@@ -3780,6 +3827,91 @@ mod tests {
         up_w.shutdown();
     }
 
+    /// bvot：AccessContext 的 source/local/vless_route/skip_dns_resolve 进入路由上下文
+    /// （Go routing.Context GetSourceIPs/GetLocalIPs/GetVlessRoute/GetSkipDNSResolve）。
+    #[tokio::test]
+    async fn dispatch_link_backfills_access_local_vless_and_skip() {
+        use xray_common::net::{address::Address, port::Port as CtxPort};
+
+        #[derive(Debug, Default, Clone)]
+        struct Snapshot {
+            source_ips: Vec<std::net::IpAddr>,
+            source_port: u16,
+            local_ips: Vec<std::net::IpAddr>,
+            local_port: u16,
+            vless_route: String,
+            skip: bool,
+        }
+
+        #[derive(Debug)]
+        struct CaptureRouter(Arc<parking_lot::Mutex<Option<Snapshot>>>);
+        impl RoutingRouter for CaptureRouter {
+            fn pick_route(&self, ctx: &dyn RoutingContext) -> Result<Route, DispatcherError> {
+                *self.0.lock() = Some(Snapshot {
+                    source_ips: ctx.get_source_ips().to_vec(),
+                    source_port: ctx.get_source_port().value(),
+                    local_ips: ctx.get_local_ips().to_vec(),
+                    local_port: ctx.get_local_port().value(),
+                    vless_route: ctx.get_vless_route().to_string(),
+                    skip: ctx.get_skip_dns_resolve(),
+                });
+                Ok(Route::new("out-tag"))
+            }
+
+            fn pick_route_resolved<'a>(
+                &'a self,
+                ctx: &'a dyn RoutingContext,
+            ) -> Pin<Box<dyn Future<Output = Result<Route, DispatcherError>> + Send + 'a>>
+            {
+                Box::pin(async move { self.pick_route(ctx) })
+            }
+        }
+
+        let ohm = SimpleOhm::new();
+        let seen = Arc::new(parking_lot::Mutex::new(None));
+        ohm.add(
+            "out-tag",
+            Arc::new(RecordingHandler { tag: "out-tag", seen_dest: Arc::clone(&seen) }),
+        );
+        let captured = Arc::new(parking_lot::Mutex::new(None));
+        let mut d = DefaultDispatcher::new();
+        d.ohm = Some(Arc::new(ohm));
+        d.router = Some(Arc::new(CaptureRouter(Arc::clone(&captured))));
+
+        let dest = xray_common::net::destination::Destination::new(
+            Address::from_ipv4_bytes([8, 8, 8, 8]),
+            CtxPort::new(53),
+            Network::UDP,
+        );
+        let access = AccessContext {
+            from: "198.51.100.9:5555".into(),
+            local: "[2001:db8::1]:443".into(),
+            vless_route: 0x1234,
+            skip_dns_resolve: true,
+            ..Default::default()
+        };
+        let (up_r, up_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let (dn_r, dn_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let outbound = xray_transport::link::Link::new(Box::new(up_r), Box::new(dn_w));
+        d.dispatch_link(&dest, outbound, &SniffingRequest::default(), Some(access), None)
+            .expect("dispatch_link ok");
+
+        for _ in 0..200 {
+            if captured.lock().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let s = captured.lock().clone().expect("router must receive context");
+        assert_eq!(s.source_ips, vec![std::net::IpAddr::from([198, 51, 100, 9])]);
+        assert_eq!(s.source_port, 5555);
+        assert_eq!(s.local_ips, vec!["2001:db8::1".parse::<std::net::IpAddr>().unwrap()]);
+        assert_eq!(s.local_port, 443);
+        assert_eq!(s.vless_route, "4660");
+        assert!(s.skip, "skip_dns_resolve must reach routing context");
+        let _ = (dn_r, up_w);
+    }
+
     /// m9si（Go default.go:384-388）：metadataOnly=true 仅元数据嗅探——不读 payload，
     /// TLS ClientHello 不触发改写，target 保持原 IP 且 metadata 通道为空。
     #[tokio::test]
@@ -3952,6 +4084,43 @@ mod tests {
         );
         assert_eq!(proto.as_deref(), Some("http1"));
         assert!(route_target.is_none());
+    }
+
+    /// 2ppq（Go default.go:302 `net.ParseAddress`）：HTTP Host 是 IP 字面量时
+    /// 嗅探改写仍保留 IP——域名化会让 ip/geoip 规则失效，并把字面量当主机名解析。
+    #[tokio::test]
+    async fn sniff_http_host_ip_literal_keeps_ip_target() {
+        use xray_buf::{io::Writer as _, multi::MultiBuffer};
+        use xray_common::net::address::Address;
+
+        let (r, mut w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(b"GET / HTTP/1.1\r\nHost: 127.0.0.1:18080\r\n\r\n");
+        w.write_multi_buffer(mb).await.unwrap();
+        w.shutdown();
+
+        let mut cr = CachedReader::with_inner(Box::new(r));
+        let req = SniffingRequest {
+            enabled: true,
+            override_destination_for_protocol: vec!["http".to_string()],
+            ..Default::default()
+        };
+        let dest = xray_common::net::destination::Destination::new(
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(18080),
+            Network::TCP,
+        );
+
+        let (final_dest, proto, _) =
+            sniff_connection(&mut cr, &dest, &req, None).await.expect("sniff ok");
+
+        assert_eq!(
+            final_dest.address().ip(),
+            Some(std::net::IpAddr::from([127, 0, 0, 1])),
+            "IP literal Host must stay an IP target",
+        );
+        assert_eq!(final_dest.port().value(), 18080);
+        assert_eq!(proto.as_deref(), Some("http1"));
     }
 
     /// va51④（Go default.go:391）：嗅探预算 200ms 固定——慢首字节在预算耗尽后

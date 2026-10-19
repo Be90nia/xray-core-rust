@@ -42,11 +42,17 @@ pub struct HandshakeResult {
     pub method: String,
     /// 请求行 target 字段（CONNECT = `host:port`，plain HTTP = 绝对 URL 或路径）。
     pub target: String,
-    /// 解析出的 headers（key 全小写）。
-    pub headers: HashMap<String, String>,
+    /// 解析出的 headers（key 全小写）。同名多值保留（对齐 Go `http.Header`
+    /// map[string][]string——双 Cookie 等逐行转发，不折叠丢失）。
+    pub headers: HashMap<String, Vec<String>>,
 }
 
 /// Hop-by-hop headers（RFC 7230 §6.1）+ 代理专有 header——转发时移除。
+///
+/// 注意不含 `transfer-encoding`：本实现不解析请求体，body 的 chunked 帧原样
+/// 透传，剥掉该头目标会按无 body 请求解析 → chunked POST 丢体（bd 04n8）。
+/// Go 的 wire 等价路径：ReadRequest 解码 body 后 `request.Write` 重新 chunked
+/// 编码——保留头 + 原样帧透传与之线路上等价。
 const HOP_BY_HOP_HEADERS: &[&str] = &[
     "connection",
     "keep-alive",
@@ -55,7 +61,6 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
     "proxy-connection",
     "te",
     "trailers",
-    "transfer-encoding",
     "upgrade",
 ];
 
@@ -78,26 +83,29 @@ pub fn extract_request_path(target: &str) -> String {
 
 /// 构建转发给目标服务器的 HTTP 请求（request line + headers）。
 ///
-/// 移除 hop-by-hop headers，强制 `Connection: close`。
+/// 移除 hop-by-hop headers，强制 `Connection: close`；同名多值头逐行写
+/// （Go `request.Write` 语义）。
 /// 对应 Go `handlePlainHTTP` 中 `request.Header.Set("Connection", "close")` + `request.Write`。
 pub fn build_forwarded_request(
     method: &str,
     path: &str,
-    headers: &HashMap<String, String>,
+    headers: &HashMap<String, Vec<String>>,
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(512);
     buf.extend_from_slice(method.as_bytes());
     buf.push(b' ');
     buf.extend_from_slice(path.as_bytes());
     buf.extend_from_slice(b" HTTP/1.1\r\n");
-    for (key, value) in headers {
+    for (key, values) in headers {
         if HOP_BY_HOP_HEADERS.contains(&key.as_str()) {
             continue;
         }
-        buf.extend_from_slice(key.as_bytes());
-        buf.extend_from_slice(b": ");
-        buf.extend_from_slice(value.as_bytes());
-        buf.extend_from_slice(b"\r\n");
+        for value in values {
+            buf.extend_from_slice(key.as_bytes());
+            buf.extend_from_slice(b": ");
+            buf.extend_from_slice(value.as_bytes());
+            buf.extend_from_slice(b"\r\n");
+        }
     }
     buf.extend_from_slice(b"connection: close\r\n\r\n");
     buf
@@ -232,7 +240,7 @@ where
 
     // 2. 读 headers（最多 [`MAX_HTTP_HEADER_LINES`] 行，防无界头部注入；
     // Go http.ReadRequest 语义下请求行+headers 共享 1MB 总预算，此处按行数收紧）
-    let mut headers: HashMap<String, String> = HashMap::new();
+    let mut headers: HashMap<String, Vec<String>> = HashMap::new();
     let mut header_lines = 0usize;
     loop {
         let line = read_http_line(stream).await?;
@@ -246,7 +254,7 @@ where
             )));
         }
         if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            headers.entry(k.trim().to_ascii_lowercase()).or_default().push(v.trim().to_string());
         }
     }
 
@@ -254,6 +262,7 @@ where
     if !config.accounts.is_empty() {
         let auth_ok = headers
             .get("proxy-authorization")
+            .and_then(|vals| vals.first())
             .and_then(|v| parse_basic_auth(v))
             .map(|(user, pass)| config.has_account(&user, &pass))
             .unwrap_or(false);
@@ -274,6 +283,7 @@ where
         // 普通 HTTP 代理从 Host header 提取 dest
         let host = headers
             .get("host")
+            .and_then(|vals| vals.first())
             .ok_or_else(|| HttpProxyError::InvalidRequest("missing Host header".into()))?;
         parse_host_port(host, 80)?
     };
@@ -629,11 +639,11 @@ mod tests {
     #[test]
     fn build_forwarded_request_strips_hop_by_hop() {
         let mut headers = HashMap::new();
-        headers.insert("host".into(), "example.com".into());
-        headers.insert("proxy-connection".into(), "keep-alive".into());
-        headers.insert("connection".into(), "keep-alive".into());
-        headers.insert("user-agent".into(), "curl/8.0".into());
-        headers.insert("proxy-authorization".into(), "Basic abc".into());
+        headers.insert("host".into(), vec!["example.com".into()]);
+        headers.insert("proxy-connection".into(), vec!["keep-alive".into()]);
+        headers.insert("connection".into(), vec!["keep-alive".into()]);
+        headers.insert("user-agent".into(), vec!["curl/8.0".into()]);
+        headers.insert("proxy-authorization".into(), vec!["Basic abc".into()]);
 
         let req = build_forwarded_request("GET", "/path", &headers);
         let req_str = String::from_utf8(req).unwrap();
@@ -649,14 +659,43 @@ mod tests {
     #[test]
     fn build_forwarded_request_post() {
         let mut headers = HashMap::new();
-        headers.insert("host".into(), "api.example.com".into());
-        headers.insert("content-length".into(), "42".into());
+        headers.insert("host".into(), vec!["api.example.com".into()]);
+        headers.insert("content-length".into(), vec!["42".into()]);
 
         let req = build_forwarded_request("POST", "/submit", &headers);
         let req_str = String::from_utf8(req).unwrap();
 
         assert!(req_str.starts_with("POST /submit HTTP/1.1\r\n"));
         assert!(req_str.contains("content-length: 42"));
+    }
+
+    #[test]
+    fn build_forwarded_request_keeps_transfer_encoding() {
+        // bd 04n8：chunked body 原样透传，transfer-encoding 头必须保留——
+        // 剥掉后目标按无 body 解析，chunked 帧被当垃圾丢弃。
+        let mut headers = HashMap::new();
+        headers.insert("host".into(), vec!["echo.example".into()]);
+        headers.insert("transfer-encoding".into(), vec!["chunked".into()]);
+
+        let req = build_forwarded_request("POST", "/upload", &headers);
+        let req_str = String::from_utf8(req).unwrap();
+
+        assert!(req_str.contains("transfer-encoding: chunked\r\n"));
+        assert!(req_str.contains("connection: close\r\n\r\n"));
+    }
+
+    #[test]
+    fn build_forwarded_request_keeps_multi_value_headers() {
+        // bd z8i0：同名多值头（双 Cookie）逐行保留，不折叠丢失（Go request.Write 语义）
+        let mut headers = HashMap::new();
+        headers.insert("host".into(), vec!["api.example.com".into()]);
+        headers.insert("cookie".into(), vec!["a=1".into(), "b=2".into()]);
+
+        let req = build_forwarded_request("GET", "/", &headers);
+        let req_str = String::from_utf8(req).unwrap();
+
+        assert!(req_str.contains("cookie: a=1\r\n"));
+        assert!(req_str.contains("cookie: b=2\r\n"));
     }
 
     #[tokio::test]
@@ -666,8 +705,17 @@ mod tests {
         let hs = result.unwrap();
         assert_eq!(hs.method, "GET");
         assert_eq!(hs.target, "http://example.com/page?q=1");
-        assert_eq!(hs.headers.get("host").unwrap(), "example.com");
-        assert_eq!(hs.headers.get("user-agent").unwrap(), "test");
+        assert_eq!(hs.headers["host"][0], "example.com");
+        assert_eq!(hs.headers["user-agent"][0], "test");
+    }
+
+    #[tokio::test]
+    async fn handshake_preserves_multi_value_headers() {
+        // bd z8i0：同一 header 出现两次（双 Cookie）都保留，按序 push
+        let req = b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nCookie: a=1\r\nCookie: b=2\r\n\r\n";
+        let (_, result) = tcp_handshake(req, ServerConfig::default()).await;
+        let hs = result.unwrap();
+        assert_eq!(hs.headers["cookie"], vec!["a=1".to_string(), "b=2".to_string()]);
     }
 
     // ===== allowTransparent（透明代理）分支 =====

@@ -8,8 +8,7 @@
 //! - `xray_app_router::context::RoutingContext`（router 内部）
 //!
 //! 两者方法几乎一致，唯一差异：dispatcher 端 `get_vless_route() -> &str`，
-//! router 端 `get_vless_route() -> Port`。适配时用 `Port::new(0)` 占位
-//! （VLESS 路由 ID 当前 dispatcher 路径未填充）。
+//! router 端 `get_vless_route() -> Port`。适配时把字符串解析为 Port（空串 → 0）。
 
 use std::{future::Future, net::IpAddr, path::Path, pin::Pin, sync::Arc};
 
@@ -87,9 +86,9 @@ fn bridge_context(ctx: &dyn DispRoutingContext) -> RouterRoutingData {
         source_port: ctx.get_source_port(),
         local_ips: ctx.get_local_ips().to_vec(),
         local_port: ctx.get_local_port(),
-        // dispatcher 端 vless_route 是 &str，router 端是 Port；当前 dispatcher
-        // 路径未填充 vless route id，用 0 占位（VLESS ENC 路由接入后再补全）。
-        vless_route: Port::new(0),
+        // dispatcher 端 vless_route 是 &str（Go `net.Port` 的字符串形态），router 端是 Port。
+        // 未填充（空串）时解析失败回落 0，等价 Go Port 零值。
+        vless_route: ctx.get_vless_route().parse::<u16>().map_or(Port::new(0), Port::new),
         network: ctx.get_network(),
         user: ctx.get_user().to_string(),
         attributes: ctx.get_attributes().clone(),
@@ -104,8 +103,10 @@ fn bridge_context(ctx: &dyn DispRoutingContext) -> RouterRoutingData {
                 data.target_domain.clear();
             },
             None => {
+                // routeOnly（Go default.go:311-315）：RouteTarget 只覆盖域名侧；
+                // GetTargetIPs 仍读原 Target（features/routing/session/context.go:47-57），
+                // 故保留原目标 IP，IP/geoip 规则在 routeOnly 下照常命中。
                 data.target_domain = rt.address().as_domain().unwrap_or("").to_string();
-                data.target_ips.clear();
             },
         }
         data.target_port = rt.port();
@@ -1358,7 +1359,10 @@ pub enum WiringError {
 /// `xray.location.asset`（或 `XRAY_LOCATION_ASSET`）环境变量 → 可执行文件同目录。
 /// 找不到 .dat 文件不影响 loader 创建（load 时 warn skip），仅影响 geoip/geosite 规则匹配。
 fn resolve_asset_dir() -> std::path::PathBuf {
-    xray_common::platform::get_resource_path()
+    // 统一 platform 探测：env → exe 目录 → 非 Windows 共享安装路径（Go
+    // others.go:15-32）。此前只用 env/exe，Linux 标准安装路径下 geoip/geosite
+    // 规则加载 fail-closed 启动失败。
+    xray_common::platform::get_asset_dir()
 }
 
 #[cfg(test)]
@@ -1754,6 +1758,24 @@ mod tests {
         assert_eq!(dns.calls(), 1, "IpIfNonMatch should resolve after first-round miss");
     }
 
+    /// 4jrf：skip_dns_resolve 门控阻断路由侧解析（Go router.go:203-216）——
+    /// DNS 查询出站经路由时必须走此分支，否则域名 NS + 非 AsIs 策略递归查询。
+    #[tokio::test]
+    async fn resolved_skip_dns_resolve_suppresses_lookup() {
+        let json = br#"{"domainStrategy":"IPIfNonMatch","rules":[{"outboundTag":"blocked","ip":["1.2.3.0/24"]}]}"#;
+        let adapter = build_router_adapter_from_json(json).expect("build adapter");
+        let dns = std::sync::Arc::new(CountingDns::new());
+        adapter.set_dns_client(dns.clone());
+
+        let mut ctx = DispatcherContext::new()
+            .with_target_domain("example.com")
+            .with_target_port(Port::new(443));
+        ctx.skip_dns_resolve = true;
+        let res = <RouterAdapter as RoutingRouter>::pick_route_resolved(&adapter, &ctx).await;
+        assert!(res.is_err(), "no domain rule + skip → no route");
+        assert_eq!(dns.calls(), 0, "skip_dns_resolve must suppress routing DNS lookup");
+    }
+
     #[tokio::test]
     async fn resolved_asis_skips_dns() {
         let json =
@@ -1899,6 +1921,45 @@ mod tests {
         let mut plain = DispatcherContext::new().with_target_port(Port::new(443));
         plain.target_ips = vec![std::net::IpAddr::from([1, 2, 3, 4])];
         assert!(<RouterAdapter as RoutingRouter>::pick_route(&adapter, &plain).is_err());
+    }
+
+    /// bvot：sourceIP/localIP 规则经 dispatcher 上下文命中
+    /// （Go `GetSourceIPs`/`GetLocalIPs` → condition.go IP 条件）。
+    #[test]
+    fn pick_route_source_and_local_rules_hit() {
+        let json = br#"{"rules":[{"outboundTag":"lan","source":["198.51.100.0/24"],"localIP":["127.0.0.1"]}]}"#;
+        let adapter = build_router_adapter_from_json(json).expect("build adapter");
+
+        let mut ctx = DispatcherContext::new().with_target_port(Port::new(80));
+        ctx.source_ips = vec![std::net::IpAddr::from([198, 51, 100, 9])];
+        ctx.local_ips = vec![std::net::IpAddr::from([127, 0, 0, 1])];
+        let route = <RouterAdapter as RoutingRouter>::pick_route(&adapter, &ctx)
+            .expect("source+local rule must hit");
+        assert_eq!(route.outbound_tag, "lan");
+
+        // 缺 localIP → 不命中。
+        let mut miss = DispatcherContext::new().with_target_port(Port::new(80));
+        miss.source_ips = vec![std::net::IpAddr::from([198, 51, 100, 9])];
+        assert!(<RouterAdapter as RoutingRouter>::pick_route(&adapter, &miss).is_err());
+    }
+
+    /// bvot：routeOnly（RouteTarget=嗅探域名）时原目标 IP 仍参与 IP 规则匹配
+    /// （Go `GetTargetIPs` 只读 Target；default.go:311-315 不改 Target）。
+    #[test]
+    fn pick_route_route_only_keeps_target_ips_for_ip_rules() {
+        let json = br#"{"rules":[{"outboundTag":"direct-ip","ip":["1.2.3.0/24"]}]}"#;
+        let adapter = build_router_adapter_from_json(json).expect("build adapter");
+
+        let mut ctx = DispatcherContext::new().with_target_port(Port::new(443));
+        ctx.target_ips = vec![std::net::IpAddr::from([1, 2, 3, 4])];
+        ctx.route_target = Some(Destination::new(
+            Address::Domain("sniffed.example.com".into()),
+            Port::new(443),
+            xray_common::net::network::Network::TCP,
+        ));
+        let route = <RouterAdapter as RoutingRouter>::pick_route(&adapter, &ctx)
+            .expect("ip rule must hit while route_target is a domain");
+        assert_eq!(route.outbound_tag, "direct-ip");
     }
 
     // ---- 路由 JSON Go 前缀语法（rs3e）----
