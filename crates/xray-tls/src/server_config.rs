@@ -254,13 +254,25 @@ pub fn build_server_config(
         MasterKeyLogSetting::Off => {},
     }
 
-    // pwh6: enableSessionResumption=false 禁用票据+session cache。
-    // Go `SessionTicketsDisabled=true, SessionCache=nil` 等价语义。
-    // 禁 session cache 用 NoServerSessionStorage (rustls pub)；
-    // 禁 ticket 用 `send_tls13_tickets=0`（rustls 默认 NeverProducesTickets
-    // 已不产 ticket——server/builder.rs:116；外部 crate 看不到该类型，
-    // 但设 0 后 pinger 不会再发 ticket，效果等价）。
-    if !enable_session_resumption {
+    // pwh6 + bd 0kqj B2 修复：enableSessionResumption=true 走默认（rustls builder
+    // 已经装上 ServerSessionMemoryCache(256) + send_tls13_tickets=2）——
+    // 但默认 ticketer 是 NeverProducesTickets (server/builder.rs:116)，
+    // 不发 NewSessionTicket，客户端 cache 永远拿不到 ticket —— 此前 B2 服务端
+    // session_reused=false 的根本原因。修复=装上 `rustls::crypto::ring::Ticketer`
+    // (Chacha20Poly1305 AEAD, 12h lifetime, 6h 轮换)，rustls ticket 格式对外
+    // 是不透明字节，btls 客户端接住 NewSessionTicket 后由 `tls_session_cache` 模
+    // 块把整个 SSL_SESSION 序列化为 BoringSSL 字节供下回 dial 投递。
+    //
+    // enableSessionResumption=false 禁用票据+session cache（Go
+    // `SessionTicketsDisabled=true, SessionCache=nil` 等价语义）：禁 session
+    // cache 用 NoServerSessionStorage (rustls pub)；禁 ticket 用恢复
+    // `NeverProducesTickets` + `send_tls13_tickets=0`（外部 crate 看不到
+    // NeverProducesTickets 类型，把 `send_tls13_tickets=0` 当 ticket 关停信号
+    // 用：rustls tls13.rs:364-368 在 0 时不走 encrypt 分支，效果等价）。
+    if enable_session_resumption {
+        config.ticketer = rustls::crypto::ring::Ticketer::new()
+            .map_err(|e| io::Error::other(format!("tls ticketer: {e}")))?;
+    } else {
         config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
         config.send_tls13_tickets = 0;
     }
@@ -720,6 +732,29 @@ aZ9A3Sng12a1YFnJcLOELh+loNChRANCAATG2iorYlDeMjaVlb7XdvtKt1Og/t5H
         // session_storage 类型应是 NoServerSessionStorage（与默认不同实例）。
         let default_s = build_server_config("tls", Some(&serde_json::json!({}))).unwrap().unwrap();
         assert!(!std::sync::Arc::ptr_eq(&cfg.session_storage, &default_s.session_storage));
+    }
+
+    /// bd 0kqj B2 修复：缺省（enableSessionResumption=true）必须装上真 ticketer
+    /// ——rustls builder 默认 `NeverProducesTickets`（server/builder.rs:116），
+    /// 装上后会构造 `TicketRotator(6h) + ring::AeadTicketer(Chacha20Poly1305)`，
+    /// `cfg.ticketer.enabled() = true` 才能向客户端发 NewSessionTicket，否则
+    /// server_ticket/session_reused 链路恒空（bd 0kqj 客户端 cache 已经命中但
+    /// 服务端 session_reused=false 的根因）。
+    #[test]
+    fn bd0kqj_default_server_installs_real_ticketer() {
+        install_provider();
+        let cfg = build_server_config("tls", Some(&serde_json::json!({}))).unwrap().unwrap();
+        assert!(
+            cfg.ticketer.enabled(),
+            "缺省 enableSessionResumption=true 必须挂上真 ticketer：缺它服务端不发 NewSessionTicket"
+        );
+        // ticketer 寿命 = 12h（外层 lifetime = 6h × 2，对齐 rustls ticketer 文档）。
+        assert!(cfg.ticketer.lifetime() > 0);
+        // 缺省 send_tls13_tickets 保持 rustls 默认 2（让 NewSessionTicket 在客户端
+        // 支持时发两张；不变 88m0/0kqj 既有契约——只补 ticket 机制，不动数量）。
+        let default_send =
+            build_server_config("tls", Some(&serde_json::json!({}))).unwrap().unwrap();
+        assert!(default_send.send_tls13_tickets > 0);
     }
 
     /// 证书级 `oneTimeLoading=true`（Go TLSCertConfig）：Rust 无证书热重载
