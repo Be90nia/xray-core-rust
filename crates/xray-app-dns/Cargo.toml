@@ -32,3 +32,6 @@ serde_json.workspace = true
 
 [dev-dependencies]
 rcgen = "0.13"
+# tokio::time::pause/advance（G13 缺省 5s 兜底的 pause 测试）需要 test-util；
+# 仅测试构建生效，生产构建不含 dev-dependencies。
+tokio = { workspace = true, features = ["test-util"] }

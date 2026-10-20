@@ -637,18 +637,23 @@ impl UdpWorker {
         }
     }
 
-    /// 清理空闲超过 policy timeout 的 UDP session。
-    fn cleanup_inactive(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+    /// UDP NAT 会话无活动回收窗口（bd cjwc G15）：对齐 Go
+    /// `proxyman/inbound/worker.go:397` 硬编码 `2*60`（120s，checker 每分钟扫）。
+    /// Go policy 的 ConnectionIdle 默认 300s（`policy::DEFAULT_CONN_IDLE_TIMEOUT`）
+    /// 是 TCP 连接语义，UDP worker 不消费 policy——此前误用 300s 致 NAT 表膨胀 2.5×。
+    const UDP_SESSION_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-        let mut sessions = self.active_sessions.write();
+    /// UDP NAT 会话空闲回收判定：直译 Go `worker.go:393-406 clean()` 的
+    /// `nowSec-lastActivityTime > 2*60` 分支——超窗 → `setInactive` + 删表项。
+    /// 返回移除数。拆纯函数便于注入墙钟秒做确定性测试（Go 同按秒差判定）。
+    fn reclaim_inactive_sessions(
+        sessions: &mut HashMap<SocketAddr, Arc<UdpSession>>,
+        now_secs: i64,
+        timeout_secs: i64,
+    ) -> usize {
         let before = sessions.len();
-        let timeout_secs = DEFAULT_CONN_IDLE_TIMEOUT.as_secs() as i64;
         sessions.retain(|_addr, s| {
-            let idle_secs = now - s.last_activity_secs();
+            let idle_secs = now_secs - s.last_activity_secs();
             if idle_secs > timeout_secs {
                 s.set_inactive();
                 false
@@ -656,7 +661,24 @@ impl UdpWorker {
                 true
             }
         });
-        let removed = before - sessions.len();
+        before - sessions.len()
+    }
+
+    /// 清理空闲超过 120s 的 UDP session（Go `worker.go:393-406 clean()`；
+    /// 调度周期 60s 与 Go `task.Periodic{Interval: time.Minute}` 一致，见 `start()`）。
+    fn cleanup_inactive(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let mut sessions = self.active_sessions.write();
+        let removed = Self::reclaim_inactive_sessions(
+            &mut sessions,
+            now,
+            Self::UDP_SESSION_IDLE_TIMEOUT.as_secs() as i64,
+        );
+        drop(sessions);
         if removed > 0 {
             info!(tag = %self.tag, removed, "cleaned up inactive UDP sessions");
         }
@@ -992,6 +1014,57 @@ mod tests {
         session.update_activity();
         let after = session.last_activity_secs();
         assert!(after >= before);
+    }
+
+    /// bd cjwc G15：无活动 >120s 的 UDP session 被回收并标记 inactive（对齐 Go
+    /// `worker.go:397` `nowSec-lastActivityTime > 2*60` → setInactive + delete）。
+    #[test]
+    fn udp_cleanup_reclaims_idle_session_after_120s() {
+        let source: SocketAddr = "192.168.1.1:12345".parse().unwrap();
+        let stale_source: SocketAddr = "192.168.1.1:9999".parse().unwrap();
+        let local: SocketAddr = "10.0.0.1:1080".parse().unwrap();
+        let (fresh, _rx1) = UdpSession::new(source, local, None, None);
+        let (stale, _rx2) = UdpSession::new(stale_source, local, None, None);
+
+        let now = fresh.last_activity_secs();
+        stale.last_activity.store(now - 121, Ordering::Relaxed);
+
+        let mut sessions = HashMap::from([(source, fresh), (stale_source, stale.clone())]);
+        let removed = UdpWorker::reclaim_inactive_sessions(
+            &mut sessions,
+            now,
+            UdpWorker::UDP_SESSION_IDLE_TIMEOUT.as_secs() as i64,
+        );
+
+        assert_eq!(removed, 1);
+        assert!(sessions.contains_key(&source));
+        assert!(!sessions.contains_key(&stale_source));
+        assert!(stale.is_inactive());
+    }
+
+    /// bd cjwc G15：恰 120s 与 119s 均保留（Go `> 2*60` 严格大于边界同款）。
+    #[test]
+    fn udp_cleanup_keeps_sessions_within_120s() {
+        let local: SocketAddr = "10.0.0.1:1080".parse().unwrap();
+        let boundary_addr: SocketAddr = "192.168.1.2:1234".parse().unwrap();
+        let recent_addr: SocketAddr = "192.168.1.3:1234".parse().unwrap();
+        let (boundary, _rx1) = UdpSession::new(boundary_addr, local, None, None);
+        let (recent, _rx2) = UdpSession::new(recent_addr, local, None, None);
+
+        let now = boundary.last_activity_secs();
+        boundary.last_activity.store(now - 120, Ordering::Relaxed);
+        recent.last_activity.store(now - 119, Ordering::Relaxed);
+
+        let mut sessions = HashMap::from([(boundary_addr, boundary), (recent_addr, recent)]);
+        let removed = UdpWorker::reclaim_inactive_sessions(
+            &mut sessions,
+            now,
+            UdpWorker::UDP_SESSION_IDLE_TIMEOUT.as_secs() as i64,
+        );
+
+        assert_eq!(removed, 0);
+        assert!(sessions.contains_key(&boundary_addr));
+        assert!(sessions.contains_key(&recent_addr));
     }
 
     /// 入方向：push_inbound 写入的包经 recv 可达消费端（audit ojcy）。
