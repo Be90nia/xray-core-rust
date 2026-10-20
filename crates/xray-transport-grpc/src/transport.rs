@@ -64,19 +64,6 @@ pub async fn dial(
     settings: &StreamSettings,
 ) -> io::Result<Box<dyn Connection>> {
     let addr = format!("{}:{}", dest.address(), dest.port().value());
-    // r7a9：拨号外层 timeout 包装。Go xray-core system_dialer 用 DefaultSystemDialer
-    // 16s 超时；这里与 system_dialer::DEFAULT_DIAL_TIMEOUT 对齐（与 hysteria/quic 拨号同源）。
-    // 域名前置（CDN 后端）下 IP 直连极快；DNS hang/路由黑洞下裸 connect 永不返回。
-    let tcp = tokio::time::timeout(
-        std::time::Duration::from_secs(16),
-        xray_transport::sockopt::dial_client_tcp(addr.as_str()),
-    )
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "grpc dial timeout"))??;
-    tcp.set_nodelay(true).ok();
-    // bd 88m0/0kqj 客户端侧：下行 SO_RCVBUF 缺省 16MB（窗钉修复；失败即拨号失败，
-    // 对齐 dial_system sockopt 语义）。
-    xray_transport::sockopt::apply_client_dial_rcvbuf(&tcp)?;
     let cfg = parse_config(settings)?;
     // gRPC path：`/{service}/{stream}`（Go grpc URI 契约；无前导 '/' 的裸服务名
     // 是非法 h2 URI → RST_STREAM）。防御性规整：service/stream 段为空或缺前导 '/'
@@ -95,7 +82,23 @@ pub async fn dial(
     // Go dial.go:190-202：UA 预设映射（golang → 不发 UA）。
     let user_agent = resolve_user_agent(&cfg.user_agent);
 
-    let conn = if !settings.security.is_empty() && settings.security != "none" {
+    // :authority 伪头：配了 authority 才发完整 URI（h2 由 URI 生成
+    // :scheme/:authority/:path）；未配保持 path-only URI（现状兼容）。
+    // URI 与 TLS 静态件都在退避循环外构建——无效 path/authority/指纹/TLS 配置是
+    // 永久错误，重试不可能修复，必须直接失败（否则退避循环空转）。
+    let use_tls = !settings.security.is_empty() && settings.security != "none";
+    let scheme = if use_tls { "https" } else { "http" };
+    let uri = if authority.is_empty() {
+        path.parse::<http::Uri>().map_err(io_err)?
+    } else {
+        http::Uri::builder()
+            .scheme(scheme)
+            .authority(authority)
+            .path_and_query(path)
+            .build()
+            .map_err(io_err)?
+    };
+    let tls = if use_tls {
         let sni = if server_name.is_empty() { dest.address().to_string() } else { server_name };
         let tls_cfg = xray_tls::client_config::build_client_config(
             &settings.security,
@@ -112,39 +115,150 @@ pub async fn dial(
             .and_then(|m| m.get("fingerprint"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let tcp_conn = xray_transport::connection::TcpConnection::new(tcp);
-        let tls_stream: Box<dyn Connection> = if !fp_name.is_empty() {
-            let fp = xray_tls::fingerprint::get_fingerprint(fp_name).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidInput, format!("invalid fingerprint: {e}"))
-            })?;
-            Box::new(
-                xray_tls::utls::u_client(
-                    tcp_conn,
-                    &sni,
-                    tls_cfg,
-                    fp,
-                    None,
-                    settings.security_json.as_ref(),
-                )
-                .await
-                .map_err(io_err)?,
-            )
+        let fingerprint = if fp_name.is_empty() {
+            None
         } else {
-            Box::new(xray_tls::utls::client(tcp_conn, &sni, tls_cfg).await.map_err(io_err)?)
+            Some(xray_tls::fingerprint::get_fingerprint(fp_name).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("invalid fingerprint: {e}"))
+            })?)
         };
-        dial_h2(tls_stream, &path, &authority, "https", user_agent.as_deref(), &cfg).await
+        Some(TlsDialReady { sni, config: tls_cfg, fingerprint })
     } else {
-        dial_h2(tcp, &path, &authority, "http", user_agent.as_deref(), &cfg).await
-    }?;
-    // Tcpmask（Go grpc/dial.go:129-135：`TcpmaskManager.WrapConnClient`，
-    // security/protocol 栈建立后链式应用 finalmask_json.tcp[]）。
-    xray_transport::finalmask::wrap_conn_client_from_settings(settings, conn)
+        None
+    };
+    let security_json = settings.security_json.as_ref();
+
+    // G8（票 cjwc）：Go dial.go:92-101 `grpc.WithConnectParams`——grpc.ClientConn
+    // 拨号失败按 backoff.Config（BaseDelay 500ms × Multiplier 1.5，Jitter ±20%，
+    // MaxDelay 19s）重连直到 ctx 结束。等价落地：退避后重试；取消 = 调用方
+    // drop/timeout 本 future（循环内无 detached spawn，drop 即停）。
+    // 调用面语义（PM 复核修正）：本入口（TransportDialFn）无 ctx/外层超时，无界
+    // 重试会把「对端不可达」从快速失败变成拨号永久挂起（比 Go Dial 非阻塞返回更
+    // 差）。故**首次建连整体收口在 deadline 内**：退避重试发生在 deadline 之内，
+    // 到期返回 Err(TimedOut)。
+    // shortcut: policy Handshake(60s) 未接线到 transport 层（dial 只见 grpcSettings，
+    // Go 侧 policy 属全局配置层），取 DefaultDialTimeout；接线后此处应优先取 policy 值。
+    let attempt_budget = xray_transport::system_dialer::DEFAULT_DIAL_TIMEOUT;
+    let connected = tokio::time::timeout(attempt_budget, async {
+        let mut attempt: u32 = 0;
+        loop {
+            match connect_once(
+                &addr,
+                &uri,
+                user_agent.as_deref(),
+                &cfg,
+                tls.as_ref(),
+                security_json,
+            )
+            .await
+            {
+                Ok(conn) => break Ok(conn),
+                Err(e) => {
+                    let delay = grpc_backoff_delay(attempt);
+                    attempt = attempt.saturating_add(1);
+                    tracing::debug!(
+                        "grpc dial attempt {attempt} failed ({e}); retrying in {delay:?}"
+                    );
+                    tokio::time::sleep(delay).await;
+                },
+            }
+        }
+    })
+    .await;
+    match connected {
+        Ok(Ok(conn)) => {
+            // Tcpmask（Go grpc/dial.go:129-135：`TcpmaskManager.WrapConnClient`，
+            // security/protocol 栈建立后链式应用 finalmask_json.tcp[]）。
+            xray_transport::finalmask::wrap_conn_client_from_settings(settings, conn)
+        },
+        Ok(Err(e)) => Err(e),
+        Err(_elapsed) => Err(io::Error::new(io::ErrorKind::TimedOut, "grpc dial timeout")),
+    }
 }
+
+/// TLS 拨号静态件（`dial` 一次构建，跨重试复用——`Arc<ClientConfig>` 与指纹模板
+/// 均为 Clone/Copy，重试不重建证书配置）。
+struct TlsDialReady {
+    sni: String,
+    config: Arc<rustls::ClientConfig>,
+    fingerprint: Option<xray_tls::fingerprint::Fingerprint>,
+}
+
+/// 单次拨号尝试（TCP → [TLS] → h2）。Err 一律视为暂时性、由 `dial` 退避循环
+/// 决定重试；永久性错误（配置/指纹/TLS 构建非法/URI 非法）已在 `dial` 进入
+/// 循环前直接返回。
+async fn connect_once(
+    addr: &str,
+    uri: &http::Uri,
+    user_agent: Option<&str>,
+    cfg: &Config,
+    tls: Option<&TlsDialReady>,
+    security_json: Option<&serde_json::Value>,
+) -> io::Result<Box<dyn Connection>> {
+    // r7a9：拨号外层 timeout 包装。Go xray-core system_dialer 用 DefaultSystemDialer
+    // 16s 超时；这里与 system_dialer::DEFAULT_DIAL_TIMEOUT 对齐（与 hysteria/quic 拨号同源）。
+    // 域名前置（CDN 后端）下 IP 直连极快；DNS hang/路由黑洞下裸 connect 永不返回。
+    let tcp = tokio::time::timeout(
+        std::time::Duration::from_secs(16),
+        xray_transport::sockopt::dial_client_tcp(addr),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "grpc dial timeout"))??;
+    tcp.set_nodelay(true).ok();
+    // bd 88m0/0kqj 客户端侧：下行 SO_RCVBUF 缺省 16MB（窗钉修复；失败即拨号失败，
+    // 对齐 dial_system sockopt 语义）。
+    xray_transport::sockopt::apply_client_dial_rcvbuf(&tcp)?;
+    match tls {
+        Some(t) => {
+            let tcp_conn = xray_transport::connection::TcpConnection::new(tcp);
+            let tls_stream: Box<dyn Connection> = match t.fingerprint {
+                Some(fp) => Box::new(
+                    xray_tls::utls::u_client(
+                        tcp_conn,
+                        &t.sni,
+                        Arc::clone(&t.config),
+                        fp,
+                        None,
+                        security_json,
+                    )
+                    .await
+                    .map_err(io_err)?,
+                ),
+                None => Box::new(
+                    xray_tls::utls::client(tcp_conn, &t.sni, Arc::clone(&t.config))
+                        .await
+                        .map_err(io_err)?,
+                ),
+            };
+            dial_h2(tls_stream, uri.clone(), user_agent, cfg).await
+        },
+        None => dial_h2(tcp, uri.clone(), user_agent, cfg).await,
+    }
+}
+
+/// Go dial.go:93-101 `ConnectParams` 退避延迟：BaseDelay(500ms) × Multiplier(1.5)^n
+/// 封顶 MaxDelay(19s)，再乘 (1 + Jitter(0.2) × (2×rand−1)) ∈ [0.8, 1.2]
+/// （grpc-go `backoff.Backoff` 顺序：先封顶后加抖动）。n=0 为首次失败后的延迟。
+fn grpc_backoff_delay(attempt: u32) -> std::time::Duration {
+    const BASE_DELAY: f64 = 0.5;
+    const MULTIPLIER: f64 = 1.5;
+    const JITTER: f64 = 0.2;
+    const MAX_DELAY: f64 = 19.0;
+    // 1.5^60 已远超 MaxDelay，封顶防 powf 巨数
+    let n = f64::from(attempt.min(60));
+    let raw = (BASE_DELAY * MULTIPLIER.powf(n)).min(MAX_DELAY);
+    // 抖动源：SystemTime 纳秒（仅打散重连风暴，非密码学随机——避免为几行加 rand 依赖）
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    let factor = 1.0 + JITTER * ((nanos % 1000) as f64 / 500.0 - 1.0);
+    std::time::Duration::from_secs_f64(raw * factor)
+}
+
 async fn dial_h2<T>(
     conn: T,
-    path: &str,
-    authority: &str,
-    scheme: &str,
+    uri: http::Uri,
     user_agent: Option<&str>,
     cfg: &Config,
 ) -> io::Result<Box<dyn Connection>>
@@ -220,18 +334,6 @@ where
             }
         }
     });
-    // :authority 伪头：配了 authority 才发完整 URI（h2 由 URI 生成
-    // :scheme/:authority/:path）；未配保持 path-only URI（现状兼容）。
-    let uri = if authority.is_empty() {
-        path.parse::<http::Uri>().map_err(io_err)?
-    } else {
-        http::Uri::builder()
-            .scheme(scheme)
-            .authority(authority)
-            .path_and_query(path)
-            .build()
-            .map_err(io_err)?
-    };
     let mut rb = Request::builder()
         .method("POST")
         .uri(uri)
@@ -815,6 +917,21 @@ mod tests {
     use tokio::net::TcpStream;
 
     use super::*;
+
+    /// dial() 的 URI 构造镜像（authority 空 → path-only；否则完整 URI）。
+    fn test_uri(path: &str, authority: &str, scheme: &str) -> http::Uri {
+        if authority.is_empty() {
+            path.parse::<http::Uri>().unwrap()
+        } else {
+            http::Uri::builder()
+                .scheme(scheme)
+                .authority(authority)
+                .path_and_query(path)
+                .build()
+                .unwrap()
+        }
+    }
+
     #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
     fn cfg_single(name: &str) -> Config {
         let mut c = Config::default();
@@ -880,8 +997,13 @@ mod tests {
         cfg.initial_windows_size = 65535;
         let dialer = tokio::spawn(async move {
             let tcp = TcpStream::connect(addr).await.unwrap();
-            dial_h2(tcp, "/GunService/Tun", "auth.example.com", "http", Some("custom/1.0"), &cfg)
-                .await
+            dial_h2(
+                tcp,
+                test_uri("/GunService/Tun", "auth.example.com", "http"),
+                Some("custom/1.0"),
+                &cfg,
+            )
+            .await
         });
         let (server_tcp, _) = listener.accept().await.unwrap();
         let mut h2s = server::handshake(server_tcp).await.unwrap();
@@ -923,8 +1045,9 @@ mod tests {
         // 启动 dial 但 server 立即关闭——dial 不会 panic（down 闭包在 background 处理）。
         let r = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             let tcp = TcpStream::connect(addr).await.unwrap();
-            let d =
-                tokio::spawn(async move { dial_h2(tcp, "/svc/Tun", "", "http", None, &cfg).await });
+            let d = tokio::spawn(async move {
+                dial_h2(tcp, test_uri("/svc/Tun", "", "http"), None, &cfg).await
+            });
             let (server_tcp, _) = listener.accept().await.unwrap();
             drop(server_tcp); // 立即关 server
             d.await.unwrap()
@@ -943,7 +1066,7 @@ mod tests {
         let cfg = Config::default();
         let dialer = tokio::spawn(async move {
             let tcp = TcpStream::connect(addr).await.unwrap();
-            dial_h2(tcp, "/GunService/Tun", "", "http", None, &cfg).await
+            dial_h2(tcp, test_uri("/GunService/Tun", "", "http"), None, &cfg).await
         });
         let (server_tcp, _) = listener.accept().await.unwrap();
         let mut h2s = server::handshake(server_tcp).await.unwrap();
@@ -1091,7 +1214,8 @@ mod tests {
         });
 
         let tcp = TcpStream::connect(addr).await.unwrap();
-        let mut conn = dial_h2(tcp, "/GunService/TunMulti", "", "http", None, &cfg).await.unwrap();
+        let mut conn =
+            dial_h2(tcp, test_uri("/GunService/TunMulti", "", "http"), None, &cfg).await.unwrap();
         conn.write_all(b"ping").await.unwrap();
         // 读侧自然等待 server 收到上行并回帧（慢 runner 上固定 sleep 不是
         // 同步手段；预算放宽到 5s 防 flake）。
@@ -1244,5 +1368,130 @@ mod tests {
         let peer: SocketAddr = "203.0.113.9:4444".parse().unwrap();
         let h = hdrs(&[("X-Real-IP", "x")]);
         assert_eq!(extract_trusted_remote(&h, peer, &["X-Real-IP".to_string()]), peer);
+    }
+
+    /// G8（票 cjwc）：拨号失败按 Go dial.go:93-101 ConnectParams 退避重连
+    /// （连接计数 ≥2），调用方取消（abort = drop/timeout dial future）后不再
+    /// 重连。pause + 显式 advance 驱动。
+    ///
+    /// 失败点选 TLS 握手：h2 client handshake 只写 preface 即返回，accept-then-drop
+    /// 在 dial 层仍是「成功」（实测）；rustls 握手要读 ServerHello，accept 即断 →
+    /// EOF → dial 级 Err，且服务端可见（可计数）。
+    #[tokio::test(start_paused = true)]
+    async fn g8_dial_retries_with_backoff_and_stops_on_cancel() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use xray_common::net::{address::Address, port::Port};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            while let Ok((c, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(c); // accept 即断：客户端 TLS 握手必失败 → 退避重试
+            }
+        });
+
+        let dest =
+            Destination::tcp(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(peer.port()));
+        let settings = StreamSettings {
+            protocol: "grpc".to_string(),
+            security: "tls".to_string(),
+            transport_json: Some(serde_json::json!({"serviceName": "GunService"})),
+            ..StreamSettings::tcp()
+        };
+        let dial_task = tokio::spawn(async move {
+            let _ = dial(&dest, &settings).await;
+        });
+
+        // 首次连接：真实 loopback IO；虚拟时间 1ms 小步推进（advance 的内部
+        // await 让 IO 驱动得到轮询机会）。
+        let mut turns = 0u32;
+        while accepts.load(Ordering::SeqCst) == 0 {
+            turns += 1;
+            assert!(turns < 2000, "first dial never reached the server");
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+        assert_eq!(accepts.load(Ordering::SeqCst), 1);
+
+        // backoff 门：首个重试延迟 ∈ [500×0.8, 500×1.2]ms；累计远小于 400ms
+        // 时不得出现第 2 连（修复前：一次性 dial 失败直接返回，永远到不了 2 连；
+        // 无退避的紧循环则在 100ms 内即可见到第 2 连）。
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert_eq!(accepts.load(Ordering::SeqCst), 1, "reconnect must wait for the backoff delay");
+
+        // 推进跨过首个延迟上界（600ms）→ 第 2 次连接
+        let mut turns = 0u32;
+        while accepts.load(Ordering::SeqCst) < 2 {
+            turns += 1;
+            assert!(turns < 200, "client did not reconnect after backoff");
+            tokio::time::advance(Duration::from_millis(50)).await;
+        }
+        assert!(accepts.load(Ordering::SeqCst) >= 2, "client must reconnect after backoff");
+
+        // 取消：此刻 dial 必在退避 sleep 中（下次尝试 ≥400ms 之外，无在飞 connect）
+        dial_task.abort();
+        let stable = accepts.load(Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(accepts.load(Ordering::SeqCst), stable, "no reconnect after cancellation");
+        let join = dial_task.await;
+        assert!(matches!(&join, Err(e) if e.is_cancelled()), "dial ends by cancel, got {join:?}");
+    }
+
+    /// G8 deadline（PM 复核修正）：首次建连整体收口在 DefaultDialTimeout（16s）内——
+    /// 到期返回 `TimedOut` 且不再重试。无界重试会把「对端不可达」从快速失败变成
+    /// 拨号永久挂起（TransportDialFn 入口无 ctx/外层超时）。
+    #[tokio::test(start_paused = true)]
+    async fn g8_dial_returns_timedout_at_deadline_and_stops_retrying() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use xray_common::net::{address::Address, port::Port};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            while let Ok((c, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(c); // accept 即断：TLS 握手失败 → 退避重试
+            }
+        });
+
+        let dest =
+            Destination::tcp(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(peer.port()));
+        let settings = StreamSettings {
+            protocol: "grpc".to_string(),
+            security: "tls".to_string(),
+            transport_json: Some(serde_json::json!({"serviceName": "GunService"})),
+            ..StreamSettings::tcp()
+        };
+        let dial_task = tokio::spawn(async move { dial(&dest, &settings).await });
+
+        // 1s 步进推进跨过 16s deadline：dial 必须终结并返回 TimedOut
+        let mut turns = 0u32;
+        while !dial_task.is_finished() {
+            turns += 1;
+            assert!(turns < 40, "dial outlived the 16s connect deadline");
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        let r = dial_task.await.unwrap();
+        assert!(
+            matches!(&r, Err(e) if e.kind() == std::io::ErrorKind::TimedOut),
+            "deadline must surface as TimedOut, got {:?}",
+            r.as_ref().err()
+        );
+
+        // 吸收在途 connect 的尾巴 accept（socket 已随 dial 返回被 drop），此后零新连接
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let stable = accepts.load(Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(accepts.load(Ordering::SeqCst), stable, "no retries after deadline");
     }
 }
