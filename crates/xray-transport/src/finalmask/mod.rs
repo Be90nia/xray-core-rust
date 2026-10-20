@@ -728,6 +728,13 @@ fn build_udpmask_entry(entry: &serde_json::Value) -> io::Result<Box<dyn Udpmask>
             let (udp, udp_standalone) = build_custom_udp(&settings)?;
             Ok(Box::new(custom::Config { udp, udp_standalone, ..custom::Config::default() }))
         },
+        // 票 4kq9：Go udphop 是 client-only 连接级包装（udphop/conn.go NewUDPHopConn 需
+        // Dialer 重拨本地 socket），Rust Udpmask seam 无 dialer → 未实现，显式报错。
+        "udphop" => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "finalmask: udphop not implemented in Rust (client-only conn-level port hop, \
+             needs dialer seam; see Go transport/internet/finalmask/udphop)",
+        )),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("finalmask: unsupported udp mask type {other:?}"),
@@ -1658,6 +1665,11 @@ fn build_fragment_config(settings: &serde_json::Value) -> io::Result<fragment::F
             lengths_max.push(to);
         },
     }
+    // Go Build :282-284：末段 LengthsMin==0 硬错（含未提供 lengths/length 的缺省 {0,0}
+    // 情形——Go 走 else 分支同样命中，空 settings 不豁免）。
+    if lengths_min.last() == Some(&0) {
+        return Err(mask_err("finalmask fragment: last lengths entry min can't be 0"));
+    }
     // Go Build :283-291：`delays[]` 非空优先，否则单段 `delay`；proto 简化名 `interval` 兜底。
     let mut delays_min = Vec::new();
     let mut delays_max = Vec::new();
@@ -1803,6 +1815,15 @@ pub fn parse_finalmask_udp_chain(
         let settings = entry.get("settings").cloned().unwrap_or(serde_json::Value::Null);
         match ty {
             "mkcp-legacy" => codecs.push(build_mkcp_legacy_codec(&settings)?),
+            // 票 4kq9：Go udphop 连接级包装非逐包 codec（conn.go 需 Dialer），未实现 →
+            // 显式报错，不用含糊 unsupported。
+            "udphop" => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "finalmask: udphop not implemented in Rust (client-only conn-level port \
+                     hop, needs dialer seam; see Go transport/internet/finalmask/udphop)",
+                ));
+            },
             other => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -2538,7 +2559,7 @@ mod tests {
     #[test]
     fn build_tcpmask_entry_wires_all_types() {
         let json = fm(r#"{"tcp":[
-                {"type":"fragment","settings":{}},
+                {"type":"fragment","settings":{"length":{"from":10,"to":20}}},
                 {"type":"sudoku","settings":{"password":"p"}},
                 {"type":"xmc","settings":{"password":"mc-pass","hostname":"h",
                     "profiles":[{"username":"steve_1","uuid":"069a79f4-44e9-4726-a5be-fca90e38aaf5","texturesValue":"v","texturesSignature":"s"}]}},
@@ -2565,7 +2586,9 @@ mod tests {
         assert_eq!(cfg.delays_max, vec![10]);
         assert_eq!((cfg.max_split_min, cfg.max_split_max), (2, 4));
         // packets 数字 range 字符串走 Go ParseRangeString（"1-3" → from=1, to=3）。
-        let cfg = build_fragment_config(&fm(r#"{"packets":"1-3"}"#)).unwrap();
+        // length 显式给出：Go 下无 length 的 fragment 末段 min==0 本就硬错（Build :282）。
+        let cfg = build_fragment_config(&fm(r#"{"packets":"1-3","length":{"from":100,"to":200}}"#))
+            .unwrap();
         assert_eq!((cfg.packets_from, cfg.packets_to), (1, 3));
         // Go Build :263-264：range 字符串 from==0 硬错。
         let err = build_fragment_config(&fm(r#"{"packets":"0-3"}"#)).unwrap_err();
@@ -2602,6 +2625,45 @@ mod tests {
         assert_eq!(cfg.delays_min, vec![1], "delays[] wins over delay/interval");
         assert_eq!(cfg.delays_max, vec![2]);
         assert_eq!((cfg.max_split_min, cfg.max_split_max), (2, 3), "maxSplit wins over max_split");
+    }
+
+    #[test]
+    fn fragment_config_last_lengths_min_zero_rejected() {
+        // 票 1xb0，Go Build :282-284：末段 min==0 硬错（文案可定位）。
+        let e =
+            build_fragment_config(&fm(r#"{"lengths":[{"from":10,"to":20},{"from":0,"to":5}]}"#))
+                .unwrap_err();
+        assert!(e.to_string().contains("last lengths entry min can't be 0"), "got: {e}");
+        // Go 只查末段：非末段 min==0 合法。
+        build_fragment_config(&fm(r#"{"lengths":[{"from":0,"to":5},{"from":10,"to":20}]}"#))
+            .unwrap();
+        // 未提供 lengths/length → 缺省 {0,0} 末段命中，Go 同样报错（else 分支）。
+        let e = build_fragment_config(&fm("{}")).unwrap_err();
+        assert!(e.to_string().contains("last lengths entry min can't be 0"), "got: {e}");
+        // proto 兼容名单段 length 同受校验。
+        let e = build_fragment_config(&fm(r#"{"length":{"from":0,"to":0}}"#)).unwrap_err();
+        assert!(e.to_string().contains("last lengths entry min can't be 0"), "got: {e}");
+    }
+
+    #[test]
+    fn udphop_mask_type_fails_loud() {
+        // 票 4kq9：Go transport/internet/finalmask/udphop 是 client-only 连接级包装
+        // （conn.go NewUDPHopConn 需 finalmask.Dialer，intervallocal 模式每 hop 重拨
+        // 本地 socket）；Rust Udpmask seam（wrap_packet_conn_client）只收已连接
+        // UdpIo、无 dialer → 显式报错不实现，避免半模式偏离 Go wire 行为。
+        let json = fm(r#"{"udp":[{"type":"udphop","settings":{"mode":"intervalremote",
+                "interval":{"from":30,"to":30},"remotePorts":[10000,10001]}}]}"#);
+        let e = match build_udpmask_manager_from_json(Some(&json)) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected udphop not-implemented error"),
+        };
+        assert!(e.contains("udphop") && e.contains("not implemented"), "got: {e}");
+        // 同步 codec 链路径同样显式（非含糊 unsupported）。
+        let e = match parse_finalmask_udp_chain(Some(&json)) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected udphop not-implemented error"),
+        };
+        assert!(e.contains("udphop") && e.contains("not implemented"), "got: {e}");
     }
 
     #[test]
