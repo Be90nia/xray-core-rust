@@ -83,6 +83,11 @@ const PEER_TERMINATING_TIMEOUT_MS: u32 = 4_000;
 const READY_TO_CLOSE_TIMEOUT_MS: u32 = 15_000;
 /// PingUpdater 默认间隔（对应 Go `5000ms`）。
 const PING_UPDATER_INTERVAL: Duration = Duration::from_millis(5_000);
+/// 数据等待快速自旋次数（Go `connection.go:284` `for i := 0; i < 16`）。
+const DATA_WAIT_SPINS: u32 = 16;
+/// 无 deadline 时单轮数据等待时长（Go `duration := time.Second * 16`）。
+/// rd 为零时到点返回 nil **继续等**下一轮（不是错误）。
+const DATA_WAIT_DEFAULT: Duration = Duration::from_secs(16);
 
 /// KCP 连接（对应 Go `Connection`）。
 ///
@@ -628,11 +633,81 @@ impl Connection {
     }
 }
 
+/// 等待下行数据 / 发送窗口（Go `waitForDataInput`/`waitForDataOutput`，
+/// `connection.go:283-364` 同构）：
+///
+/// 1. 16 次自旋快速路径（Go `dataInput.Wait()` non-blocking + `runtime.Gosched`）；
+/// 2. `duration = 16s` 默认；deadline 非零时取 `deadline - now`，已过期**立即**
+///    返回 [`KcpError::IoTimeout`]；
+/// 3. `select` 数据到达 vs 超时到点。到点时 deadline 已设 → [`KcpError::IoTimeout`]；
+///    未设 → `Ok`（Go 返回 nil，调用方循环重进 = 继续等下一轮）。
+///
+/// 时间读全部走 tokio 时钟（[`tokio::time::Instant`]）：与 `tokio::time::pause`
+/// 确定性测试对齐；生产（无 pause）下与 std 时钟等价。deadline 在等待开始时读取
+/// 一次（Go 同样不因等待中途改 deadline 而唤醒 waiter）。
+async fn wait_for_data(notify: &Notify, deadline: &Mutex<Option<Instant>>) -> Result<()> {
+    // 快速路径：permit 已可用立即返回。自旋期间 permit 迟到也不丢——Notified 已
+    // 注册，落到下方 select 分支照样被唤醒。
+    let mut notified = std::pin::pin!(notify.notified());
+    for _ in 0..DATA_WAIT_SPINS {
+        if notified.as_mut().enable() {
+            return Ok(());
+        }
+        tokio::task::yield_now().await;
+    }
+
+    let rd = *deadline.lock();
+    let rd = rd.map(tokio::time::Instant::from_std);
+    let now = tokio::time::Instant::now();
+    let duration = match rd {
+        // Go: duration = time.Until(rd); duration < 0 → ErrIOTimeout。
+        // 到点判定用 `<=`（Go 为严格 Before）：deadline 恰等于推进后 now 的纳秒级
+        // 锐沿按超时算，使 pause 测试「推进恰好 duration」确定性返回 IoTimeout。
+        Some(rd) if rd <= now => return Err(KcpError::IoTimeout),
+        Some(rd) => rd.saturating_duration_since(now),
+        None => DATA_WAIT_DEFAULT,
+    };
+    tokio::select! {
+        _ = &mut notified => Ok(()),
+        _ = tokio::time::sleep(duration) => match rd {
+            // Go: rd 非零且已过期 → ErrIOTimeout；rd 为零 → nil（继续等）。
+            Some(rd) if rd <= tokio::time::Instant::now() => Err(KcpError::IoTimeout),
+            _ => Ok(()),
+        },
+    }
+}
+
+/// 等待下行数据（Go `waitForDataInput`）。
+async fn wait_for_data_input(inner: &ConnectionInner) -> Result<()> {
+    wait_for_data(&inner.data_input, &inner.read_deadline).await
+}
+
+/// 等待发送窗口（Go `waitForDataOutput`）。
+async fn wait_for_data_output(inner: &ConnectionInner) -> Result<()> {
+    wait_for_data(&inner.data_output, &inner.write_deadline).await
+}
+
+/// KCP 等待错误 → `io::Error`（IoTimeout 必须映射 `TimedOut` kind，上游超时判定依赖）。
+fn kcp_wait_io_error(e: KcpError) -> std::io::Error {
+    match e {
+        KcpError::IoTimeout => {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, KcpError::IoTimeout.to_string())
+        },
+        e => std::io::Error::other(e.to_string()),
+    }
+}
+
+/// 缓存的等待 future（`wait_for_data_input`/`wait_for_data_output`）：唤醒或
+/// 到点后丢弃重建，不捕获 poll 调用参数。
+type CachedWait = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+
 /// KCP `Connection` → `xray_transport::connection::Connection` 异步适配器。
 ///
 /// KCP `Connection` 的 read/write 是同步非阻塞（返回 0 表示暂无数据），
 /// 通过 `Notify`（`data_input`/`data_output`）通知数据就绪。
-/// 本适配器用 `notified().await` 等待 + 同步 read/write 实现异步 IO。
+/// 本适配器缓存 `wait_for_data_input`/`wait_for_data_output` future（Go
+/// `waitForDataInput`/`waitForDataOutput` 等价：deadline 消费 + 16s 默认 + 自旋
+/// 快速路径）+ 同步 read/write 实现异步 IO。
 ///
 /// 缓存的等待 future 不捕获任何 poll 调用参数（buf 大小/数据副本）——对齐 Go
 /// `waitForDataInput`/`waitForDataOutput`（connection.go）：唤醒后用当次 poll
@@ -640,8 +715,8 @@ impl Connection {
 /// （put_slice 溢出 panic / 写出旧数据，bd Xray-core-rust-0mp）。
 pub struct KcpConn {
     inner: Arc<Connection>,
-    read_state: parking_lot::Mutex<Option<Pin<Box<dyn Future<Output = ()> + Send>>>>,
-    write_state: parking_lot::Mutex<Option<Pin<Box<dyn Future<Output = ()> + Send>>>>,
+    read_state: parking_lot::Mutex<Option<CachedWait>>,
+    write_state: parking_lot::Mutex<Option<CachedWait>>,
     /// poll_read 持久 scratch（vision read_tmp 同型）：虚假唤醒重 poll 不再
     /// 逐次堆分配（原 `vec![0u8; remaining]` 每 poll 一次，P1 F7）。
     read_scratch: Vec<u8>,
@@ -702,16 +777,18 @@ impl tokio::io::AsyncRead for KcpConn {
 
             let mut state = this.read_state.lock();
             if state.is_none() {
-                let inner = Arc::clone(&this.inner);
-                *state = Some(Box::pin(async move {
-                    inner.inner.data_input.notified().await;
-                }));
+                let inner = Arc::clone(&this.inner.inner);
+                *state = Some(Box::pin(async move { wait_for_data_input(&inner).await }));
             }
-            if state.as_mut().expect("state set above when None").as_mut().poll(cx).is_pending() {
-                return std::task::Poll::Pending;
-            }
-            // 通知已到达：消费掉缓存的 future（防重 poll 已完成 future），重读
+            let outcome = match state.as_mut().expect("state set above when None").as_mut().poll(cx)
+            {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(outcome) => outcome,
+            };
+            // 唤醒（数据到达，或 rd=None 16s 到点 Go 返回 nil 继续）：消费掉缓存的
+            // future（防重 poll 已完成 future），重读
             *state = None;
+            outcome.map_err(kcp_wait_io_error)?;
         }
     }
 }
@@ -734,15 +811,17 @@ impl tokio::io::AsyncWrite for KcpConn {
 
             let mut state = self.write_state.lock();
             if state.is_none() {
-                let inner = Arc::clone(&self.inner);
-                *state = Some(Box::pin(async move {
-                    inner.inner.data_output.notified().await;
-                }));
+                let inner = Arc::clone(&self.inner.inner);
+                *state = Some(Box::pin(async move { wait_for_data_output(&inner).await }));
             }
-            if state.as_mut().expect("state set above when None").as_mut().poll(cx).is_pending() {
-                return std::task::Poll::Pending;
-            }
+            let outcome = match state.as_mut().expect("state set above when None").as_mut().poll(cx)
+            {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(outcome) => outcome,
+            };
+            // 唤醒（窗口可用，或 wd=None 16s 到点继续）：消费掉缓存的 future，重写
             *state = None;
+            outcome.map_err(kcp_wait_io_error)?;
         }
     }
 
@@ -1225,6 +1304,132 @@ mod tests {
         )
         .await
         .expect("close must leave a wakeup permit on data_output");
+    }
+
+    // ===== G7（票 cjwc G7 = br7l）：deadline 消费语义（Go waitForDataInput/Output）=====
+
+    /// 用 tokio 时钟构造 std deadline：pause 下 std::Instant 不随 advance 走，
+    /// tokio 即时值 into_std 保证比较全程在同一时钟域（零偏移、确定性）。
+    fn deadline_after(secs: u64) -> std::time::Instant {
+        tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(secs))
+            .expect("in range")
+            .into_std()
+    }
+
+    fn deadline_before(secs: u64) -> std::time::Instant {
+        tokio::time::Instant::now()
+            .checked_sub(Duration::from_secs(secs))
+            .expect("in range")
+            .into_std()
+    }
+
+    /// G7-a：无数据 + rd=None → 推进 16s 到点返回 **Ok**（Go 返回 nil 继续等，
+    /// 不是错误；修复前：deadline 字段/setter 存在但读路径从不消费 → 永久挂起）。
+    #[tokio::test(start_paused = true)]
+    async fn g7a_no_deadline_16s_expiry_returns_ok_not_error() {
+        let (conn, _) = make_connection(1);
+        let inner = Arc::clone(&conn.inner);
+        let waiter = tokio::spawn(async move { wait_for_data_input(&inner).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(15)).await;
+        assert!(!waiter.is_finished(), "must still be waiting at 15s");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(waiter.await.unwrap().is_ok(), "16s expiry with no rd returns Ok (Go nil)");
+    }
+
+    /// G7-b：rd = now+3s → 推进过 3s 后返回 `IoTimeout`（Go `rd.Before(now)` →
+    /// ErrIOTimeout）。
+    #[tokio::test(start_paused = true)]
+    async fn g7b_read_deadline_expiry_returns_io_timeout() {
+        let (conn, _) = make_connection(1);
+        conn.set_read_deadline(Some(deadline_after(3))).unwrap();
+        let inner = Arc::clone(&conn.inner);
+        let waiter = tokio::spawn(async move { wait_for_data_input(&inner).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(!waiter.is_finished(), "must still be waiting at 2s (deadline 3s)");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(matches!(waiter.await.unwrap(), Err(KcpError::IoTimeout)));
+    }
+
+    /// G7-c：rd 已过期 → 立即返回 `IoTimeout`，不推进时钟不阻塞。
+    #[tokio::test(start_paused = true)]
+    async fn g7c_expired_deadline_returns_immediately_without_waiting() {
+        let (conn, _) = make_connection(1);
+        conn.set_read_deadline(Some(deadline_before(60))).unwrap();
+        let inner = Arc::clone(&conn.inner);
+        let before = tokio::time::Instant::now();
+        let r = wait_for_data_input(&inner).await;
+        assert!(matches!(r, Err(KcpError::IoTimeout)));
+        assert_eq!(tokio::time::Instant::now(), before, "expired rd must not wait");
+    }
+
+    /// G7-d：数据到达时即使 rd 未过期也立即返回数据（正常路径不被 deadline 吞掉）。
+    #[tokio::test(start_paused = true)]
+    async fn g7d_data_arrival_wins_over_future_deadline() {
+        let (conn, _) = make_connection(1);
+        let conn = Arc::new(conn);
+        conn.set_read_deadline(Some(deadline_after(60))).unwrap();
+        let producer = tokio::spawn({
+            let conn = Arc::clone(&conn);
+            async move {
+                tokio::task::yield_now().await;
+                conn.input(vec![SegmentKind::Data(make_data(1, 0, b"hello"))]);
+            }
+        });
+        let inner = Arc::clone(&conn.inner);
+        wait_for_data_input(&inner).await.expect("data arrival must return Ok, not timeout");
+        let mut buf = [0u8; 16];
+        let n = conn.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hello");
+        producer.await.unwrap();
+    }
+
+    /// G7 补充：set_read_deadline(None) 后必须恢复 16s 默认（不能沿用旧值，
+    /// 也不能变成永久等待）。
+    #[tokio::test(start_paused = true)]
+    async fn g7_clearing_deadline_restores_16s_default_wait() {
+        let (conn, _) = make_connection(1);
+        conn.set_read_deadline(Some(deadline_before(60))).unwrap();
+        conn.set_read_deadline(None).unwrap();
+        let inner = Arc::clone(&conn.inner);
+        let waiter = tokio::spawn(async move { wait_for_data_input(&inner).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(15)).await;
+        assert!(!waiter.is_finished(), "cleared deadline must not expire at old past instant");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(waiter.await.unwrap().is_ok(), "cleared rd waits the 16s default, then Ok");
+    }
+
+    /// G7 写侧同构：wd 已过期 → 立即 `IoTimeout`（Go waitForDataOutput 对称）。
+    #[tokio::test(start_paused = true)]
+    async fn g7_write_deadline_expiry_returns_io_timeout_immediately() {
+        let (conn, _) = make_connection(1);
+        conn.set_write_deadline(Some(deadline_before(60))).unwrap();
+        let inner = Arc::clone(&conn.inner);
+        let before = tokio::time::Instant::now();
+        assert!(matches!(wait_for_data_output(&inner).await, Err(KcpError::IoTimeout)));
+        assert_eq!(tokio::time::Instant::now(), before, "expired wd must not wait");
+    }
+
+    /// G7 接线：AsyncRead 路径把 deadline 到期映射为 `io::ErrorKind::TimedOut`
+    /// + Go `ErrIOTimeout` 文案（上游超时判定依赖 kind）。
+    #[tokio::test(start_paused = true)]
+    async fn g7_poll_read_maps_deadline_expiry_to_timedout_io_error() {
+        use tokio::io::AsyncReadExt as _;
+        let (conn, _) = make_connection(1);
+        let mut kcp = KcpConn::new(Arc::new(conn));
+        kcp.inner().set_read_deadline(Some(deadline_after(2))).unwrap();
+        let reader = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            kcp.read(&mut buf).await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        let err = reader.await.unwrap().expect_err("deadline expiry must error the read");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(err.to_string(), "Read/Write timeout");
     }
 
     /// 票 eapf 验收：并发 close 竞态下挂起读必须及时醒来返回 ClosedConnection，

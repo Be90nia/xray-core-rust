@@ -195,10 +195,12 @@ mod tests {
         assert!(get_transport_dialer("http").is_some());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn dial_grpc_attempts_connection() {
-        // gRPC dialer 现在尝试 h2 连接（不再返回 Unsupported）。
-        // 连接 localhost:443 应失败（无监听）但不返回 Unsupported。
+        // G8 后：dial 按 Go ConnectParams（dial.go:93-101）退避**无限重连**直到
+        // 调用方取消（ctx 结束）。连 localhost:1（无服务）不再快速返回 Err——
+        // 契约改为持续重试；「不再是 Unsupported」由持续尝试承载（连接拒绝被
+        // 退避循环吞掉转下轮，而非终态错误）。
         use std::net::Ipv4Addr;
 
         use xray_common::net::{
@@ -207,7 +209,7 @@ mod tests {
 
         let dest = Destination::new(
             Address::IPv4(Ipv4Addr::LOCALHOST),
-            Port::new(1), // port 1 = 无服务
+            Port::new(1), // port 1 = 无服务（连接拒绝 → 退避重试）
             Network::TCP,
         );
         let settings = StreamSettings {
@@ -215,10 +217,17 @@ mod tests {
             transport_json: Some(serde_json::json!({"serviceName":"GunService"})),
             ..StreamSettings::tcp()
         };
-        let result = dial_grpc(&dest, &settings).await;
-        assert!(result.is_err(), "should fail (no h2 server at localhost:1)");
-        let err = result.err().unwrap();
-        assert!(err.kind() != io::ErrorKind::Unsupported, "should not be Unsupported anymore");
+        let dial_task = tokio::spawn(async move { dial_grpc(&dest, &settings).await });
+        // 跨过 ≥2 个首退避周期（500ms×1.2=600ms 上界；1600ms 足够第 2 轮尝试开始）：
+        // dial 必须仍在重试，不得返回终态错误。
+        tokio::time::advance(std::time::Duration::from_millis(1600)).await;
+        assert!(
+            !dial_task.is_finished(),
+            "dial must keep retrying per ConnectParams backoff, not return a terminal error"
+        );
+        dial_task.abort();
+        let r = dial_task.await;
+        assert!(matches!(&r, Err(e) if e.is_cancelled()), "dial must end by cancellation");
     }
 
     #[test]

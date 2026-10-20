@@ -26,3 +26,7 @@ rustls = { workspace = true }
 [features]
 default = ["register"]
 register = ["dep:xray-tls"]
+
+[dev-dependencies]
+# G8 退避重连确定性测试（tokio::time::pause/advance）
+tokio = { workspace = true, features = ["test-util"] }
