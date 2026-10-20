@@ -1500,10 +1500,8 @@ fn build_hysteria_tls_config(
             "security must be \"tls\" (Go: tls config is nil), got \"{security}\""
         ));
     }
-    let insecure = tls_json
-        .and_then(|v| v.get("insecure"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let insecure =
+        tls_json.and_then(|v| v.get("insecure")).and_then(|v| v.as_bool()).unwrap_or(false);
     xray_common::ensure_default_crypto_provider();
     if insecure {
         Ok(rustls::ClientConfig::builder()
