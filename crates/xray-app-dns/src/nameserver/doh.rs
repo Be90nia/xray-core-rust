@@ -80,6 +80,12 @@ pub struct DohNameServer {
     force_local: bool,
 }
 
+/// h2c authority 取目的地址字符串（bd d881①：空 `server_name` →
+/// `https:///dns-query` 非法 URI → `body(())` Err 静默早退，h2c 全不可用）。
+fn h2c_server_name(ns: &NameServerConfig) -> String {
+    ns.address.to_string()
+}
+
 impl DohNameServer {
     /// 构造。
     #[must_use]
@@ -160,7 +166,7 @@ impl DohNameServer {
         // bd ypsl P2①：server_name 空串 → query_once 构造 `https:///dns-query`
         // 非法 URI → 构造失败被上层吞成 record not found（h2c 完全不可用且报错
         // 误导）。authority 取目的地址字符串（域名或 IP 字面量）。
-        let server_name = ns.address.to_string();
+        let server_name = h2c_server_name(ns);
         let timeout_dur = if ns.timeout_ms > 0 {
             Duration::from_millis(u64::from(ns.timeout_ms))
         } else {
@@ -343,13 +349,22 @@ impl CachedNameserver for DohNameServer {
         if option.ipv4_enable {
             match self.query_once(fqdn, RecordType::A).await {
                 Ok(rec) => outcome.rec_v4 = Some(rec),
-                Err(e) => outcome.errors.push(e),
+                Err(e) => {
+                    // bd d881①：失败路径必须可观察（此前 body(()) Err `?` 静默早退）。
+                    tracing::debug!(target: "xray.dns.doh", server = %self.name, fqdn,
+                        family = "v4", error = %e, "doh: query failed");
+                    outcome.errors.push(e);
+                },
             }
         }
         if option.ipv6_enable {
             match self.query_once(fqdn, RecordType::AAAA).await {
                 Ok(rec) => outcome.rec_v6 = Some(rec),
-                Err(e) => outcome.errors.push(e),
+                Err(e) => {
+                    tracing::debug!(target: "xray.dns.doh", server = %self.name, fqdn,
+                        family = "v6", error = %e, "doh: query failed");
+                    outcome.errors.push(e);
+                },
             }
         }
 
@@ -510,6 +525,108 @@ mod tests {
         );
 
         (addr, client_config, handle)
+    }
+
+    /// bd d881① 回归：h2c 的 server_name 取目的地址——空串会构造
+    /// `https:///dns-query` 非法 URI（Request builder 拒绝 → `?` 静默早退）。
+    #[test]
+    fn h2c_config_yields_valid_query_uri() {
+        let ns = NameServerConfig {
+            address: Address::IPv4(Ipv4Addr::new(192, 0, 2, 1)),
+            ..NameServerConfig::default()
+        };
+        let server_name = h2c_server_name(&ns);
+        let uri = format!("https://{server_name}{DEFAULT_DOH_PATH}");
+        let built = Request::builder()
+            .method(Method::POST)
+            .uri(&uri)
+            .header(CONTENT_TYPE, "application/dns-message")
+            .body(());
+        assert!(built.is_ok(), "h2c URI 必须可构造: {uri}");
+        assert_eq!(built.unwrap().uri().host(), Some("192.0.2.1"));
+
+        // 旧形态锚定：空 server_name 的 URI 必须被拒绝（回归成空串即此形态）。
+        let legacy = Request::builder().uri(format!("https:///{DEFAULT_DOH_PATH}")).body(());
+        assert!(legacy.is_err(), "空 server_name 的 URI 必须非法（bd d881① 回归锚）");
+    }
+
+    /// bd d881① e2e：h2c（明文 HTTP/2）真实查询路径——此前非法 URI 使该形态
+    /// 完全不可用且失败被吞成 record not found。
+    #[tokio::test]
+    async fn h2c_plain_roundtrip_through_query_ip() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut h2_conn = server::handshake(sock).await.unwrap();
+            while let Some(req_result) = h2_conn.accept().await {
+                let Ok((req, mut respond)) = req_result else { break };
+                let mut body = req.into_body();
+                let mut query_buf = Vec::new();
+                while let Some(chunk) = body.data().await {
+                    query_buf.extend_from_slice(&chunk.unwrap());
+                }
+                let query_msg = Message::from_vec(&query_buf).unwrap();
+                let resp_payload = make_a_response(
+                    query_msg.metadata.id,
+                    "h2c.com.",
+                    vec![Ipv4Addr::new(10, 1, 2, 3)],
+                    60,
+                );
+                let resp = Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "application/dns-message")
+                    .body(())
+                    .unwrap();
+                let mut send = respond.send_response(resp, false).unwrap();
+                send.send_data(Bytes::from(resp_payload), true).unwrap();
+            }
+        });
+
+        let ns = NameServerConfig {
+            address: Address::from(addr.ip()),
+            port: addr.port(),
+            timeout_ms: 3000,
+            ..NameServerConfig::default()
+        };
+        let srv = DohNameServer::from_config_h2c(&ns).unwrap();
+        let (ips, _) = srv
+            .query_ip(
+                "h2c.com.",
+                IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },
+            )
+            .await
+            .unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))]);
+    }
+
+    /// bd d881① 失败路径 e2e：上游不回 → h2c 错误原样返回（经 bd d881② 透传），
+    /// 不再被吞成 record not found。
+    #[tokio::test]
+    async fn h2c_failure_error_is_observable() {
+        // 监听但永不 accept：h2c 握手/响应超时。
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let ns = NameServerConfig {
+            address: Address::from(addr.ip()),
+            port: addr.port(),
+            timeout_ms: 150,
+            ..NameServerConfig::default()
+        };
+        let srv = DohNameServer::from_config_h2c(&ns).unwrap();
+        let err = srv
+            .query_ip(
+                "dead.com.",
+                IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(err, DnsError::RecordNotFound),
+            "h2c 失败不得吞成 RecordNotFound, got: {err:?}"
+        );
     }
 
     #[tokio::test]

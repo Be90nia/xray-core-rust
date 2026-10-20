@@ -532,4 +532,59 @@ mod tests {
             "LinkStream 读端未被下行数据唤醒（丢唤醒）：数据在 {elapsed:?} 才交付（等超时轮询）"
         );
     }
+
+    /// 回归（bd d881③）：满管道下经 LinkStream 写入不丢数据。
+    ///
+    /// 写路径直驱 poll 形态（waker 槽跨 poll 存活，bd 34nk）；pipe 写端
+    /// 全有全无消费（Pending 时 `mb` 原样留给调用方，pipe.rs `WriteAction::Wait`
+    /// 不碰数据），tokio `AsyncWrite` 契约下调用方以同一 buf 重试——
+    /// N 字节进，N 字节出。
+    #[tokio::test]
+    async fn link_stream_full_pipe_write_delivers_every_byte() {
+        let (dn_r, _dn_w) = xray_buf::pipe::new();
+        // uplink 管道（LinkStream 写端 → 远端）：4KB 上限制造满管道阻塞。
+        let (mut up_r, up_w) = xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption {
+            limit: 4096,
+            ..Default::default()
+        });
+        let stream = LinkStream::new(Box::new(dn_r), Box::new(up_w));
+
+        const TOTAL: usize = 64 * 1024;
+        let payload: Vec<u8> = (0..TOTAL).map(|i| i as u8).collect();
+        let expected = payload.clone();
+
+        let (_rd, mut wr) = tokio::io::split(stream);
+        let w_task = tokio::spawn(async move {
+            // 8KB 分块：第 2 块起管道已满（>4KB limit），必须走 Pending 重试路径。
+            for chunk in payload.chunks(8 * 1024) {
+                wr.write_all(chunk).await.unwrap();
+            }
+            AsyncWriteExt::shutdown(&mut wr).await.unwrap();
+        });
+        let r_task = tokio::spawn(async move {
+            let mut received = Vec::new();
+            loop {
+                match up_r.read_multi_buffer().await {
+                    Ok(mut mb) => {
+                        let mut tmp = vec![0u8; mb.len()];
+                        let n = mb.read_to(&mut tmp);
+                        received.extend_from_slice(&tmp[..n]);
+                    },
+                    Err(xray_buf::io::Error::Eof) => break,
+                    Err(e) => panic!("uplink read error: {e:?}"),
+                }
+            }
+            received
+        });
+
+        let (w_res, r_res) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(10), w_task),
+            tokio::time::timeout(Duration::from_secs(10), r_task),
+        );
+        w_res.expect("满管道写未在 10s 内完成（疑似丢唤醒挂死）").unwrap();
+        let received =
+            r_res.expect("满管道读未在 10s 内完成（疑似丢唤醒挂死）").expect("reader task failed");
+        assert_eq!(received.len(), TOTAL, "满管道下写入的字节必须全部可达远端");
+        assert_eq!(received, expected, "字节必须逐一致（无丢失/重复/错序）");
+    }
 }
