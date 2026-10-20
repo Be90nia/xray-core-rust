@@ -36,9 +36,7 @@ use crate::{
     account::MemoryAccount,
     encoding::{
         ChunkNonceGenerator, VERSION,
-        body_chunk::{
-            ChunkNonceAdapter, PlainSizeParser, ShakeSizeParserAdapter, SizeParser,
-        },
+        body_chunk::{ChunkNonceAdapter, PlainSizeParser, ShakeSizeParserAdapter, SizeParser},
         client::ClientSession,
         generate_chacha20poly1305_key,
         server::has_aes_gcm_hardware_support,
@@ -463,8 +461,10 @@ impl VmessUdpConn {
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let (stream_r, stream_w) = tokio::io::split(conn);
-        let up_chunk_cap =
-            crate::encoding::body_chunk::single_chunk_capacity(&req_cipher, req_size_parser.as_ref());
+        let up_chunk_cap = crate::encoding::body_chunk::single_chunk_capacity(
+            &req_cipher,
+            req_size_parser.as_ref(),
+        );
         let down_task = tokio::spawn(async move {
             let mut sr = stream_r;
             // 响应头惰性解码（Go SetFlushNext：首块下行才 flush，dial 阶段同步
@@ -472,9 +472,7 @@ impl VmessUdpConn {
             if let Err(e) = session.decode_response_header_async(&mut sr).await {
                 tracing::debug!(error = %e, "vmess udp decode response header failed");
                 let _ = tx
-                    .send(Err(std::io::Error::other(format!(
-                        "vmess udp response header: {e}"
-                    ))))
+                    .send(Err(std::io::Error::other(format!("vmess udp response header: {e}"))))
                     .await;
                 return;
             }
@@ -570,10 +568,7 @@ impl AsyncWrite for VmessUdpConn {
         Pin::new(&mut self.get_mut().inner_w).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = &mut *self.get_mut();
         // 写终止 chunk（seal([])）——服务端 decode 看到空明文即流结束
         if this.wpos >= this.wpending.len() {
@@ -595,6 +590,9 @@ impl AsyncWrite for VmessUdpConn {
 }
 
 impl AsyncRead for VmessUdpConn {
+    // 三臂皆 return：单次 poll 只交付一个 packet，迭代由 down task 的真 loop 与
+    // 调用方 relay 承担（Go 同语义：buf.Copy 是迭代驱动）
+    #[allow(clippy::never_loop)]
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -1173,21 +1171,11 @@ mod tests {
         let mut sp = PlainSizeParser;
         let mut wire = Vec::new();
         crate::encoding::body_chunk::encode_single_chunk(
-            &mut wire,
-            b"hello",
-            &cipher,
-            &mut nonce,
-            &mut sp,
-            false,
+            &mut wire, b"hello", &cipher, &mut nonce, &mut sp, false,
         )
         .unwrap();
         crate::encoding::body_chunk::encode_single_chunk(
-            &mut wire,
-            b"world!!",
-            &cipher,
-            &mut nonce,
-            &mut sp,
-            false,
+            &mut wire, b"world!!", &cipher, &mut nonce, &mut sp, false,
         )
         .unwrap();
 

@@ -971,10 +971,8 @@ mod tests {
             .with_security(SecurityType::Aes128Gcm),
         );
         let dial = make_vmess_dial_fn(cfg);
-        let dest = Destination::udp(
-            Address::ipv4(std::net::Ipv4Addr::LOCALHOST),
-            Port::new(echo_port),
-        );
+        let dest =
+            Destination::udp(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(echo_port));
         let mut conn = timeout(Duration::from_secs(10), dial(&dest))
             .await
             .expect("dial timeout")
