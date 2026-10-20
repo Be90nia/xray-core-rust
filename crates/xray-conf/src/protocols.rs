@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::common::{Address, Int32Range, NetworkList};
+use crate::common::{Address, Int32Range, NetworkList, StringList};
 
 // =========================================================================
 // 入站 settings 强类型
@@ -1164,10 +1164,16 @@ pub struct HysteriaOutboundSettings {
     pub port: Option<u16>,
 }
 
-/// DNS 出站 settings。简化字段保留必要项，对应 dns.go `DNSConfig`。
+/// DNS 出站 settings。
+///
+/// 双方言（票 alwc）：Go `infra/conf/dns_proxy.go:59-69` 的 `DNSOutboundConfig`
+/// 键 + 本仓既有 Rust 扩展方言（`servers`/`queryStrategy` 等，保留向后兼容）。
+/// 本结构是 conf 层接受/校验面；运行时语义在 `xray-core/src/outbound.rs`
+/// 的 `parse_dns_outbound_config`。
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DnsOutboundSettings {
+    // ---- Rust 既有方言（保留，Go dns outbound settings 无这些键）----
     /// DNS 服务器列表。简化为 `Vec<Value>`，允许原始 JSON 形态透传。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub servers: Option<Vec<Value>>,
@@ -1177,6 +1183,93 @@ pub struct DnsOutboundSettings {
     pub disable_cache: Option<bool>,
     #[serde(rename = "disableFallback", skip_serializing_if = "Option::is_none")]
     pub disable_fallback: Option<bool>,
+    // ---- Go 方言（infra/conf/dns_proxy.go:59-71）----
+    /// 重写目标网络（"tcp"/"udp"/"unix"）。对应 Go `rewriteNetwork`。
+    #[serde(rename = "rewriteNetwork", skip_serializing_if = "Option::is_none")]
+    pub rewrite_network: Option<String>,
+    /// 重写目标地址（IP 或域名串）。对应 Go `rewriteAddress`（dns_proxy.go:61）。
+    #[serde(rename = "rewriteAddress", skip_serializing_if = "Option::is_none")]
+    pub rewrite_address: Option<String>,
+    /// 重写目标端口。对应 Go `rewritePort`（dns_proxy.go:62）。
+    #[serde(rename = "rewritePort", skip_serializing_if = "Option::is_none")]
+    pub rewrite_port: Option<u16>,
+    /// legacy 别名：非空时覆盖 `rewriteNetwork`（Go Build dns_proxy.go:74-76）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// legacy 别名：非空时覆盖 `rewriteAddress`（dns_proxy.go:77-79）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// legacy 别名：非零时覆盖 `rewritePort`（dns_proxy.go:80-82）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// 用户等级（policy 查询）。对应 Go `userLevel`（dns_proxy.go:66）。
+    #[serde(rename = "userLevel", skip_serializing_if = "Option::is_none")]
+    pub user_level: Option<u32>,
+    /// DNS 规则列表。对应 Go `rules`（dns_proxy.go:67）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rules: Option<Vec<DnsOutboundRuleSettings>>,
+    /// legacy 非 IP 查询策略（reject/drop/skip）。对应 Go `nonIPQuery`
+    /// （dns_proxy.go:68，todo: remove legacy）。
+    #[serde(rename = "nonIPQuery", skip_serializing_if = "Option::is_none")]
+    pub non_ip_query: Option<String>,
+    /// legacy 屏蔽 qType 列表。对应 Go `blockTypes`（dns_proxy.go:69）。
+    #[serde(rename = "blockTypes", skip_serializing_if = "Option::is_none")]
+    pub block_types: Option<Vec<i32>>,
+}
+
+/// DNS 出站单条规则。对应 Go `DNSOutboundRuleConfig`（dns_proxy.go:14-19）。
+///
+/// `qType` 为 Go `PortList` 形态（`"53"`/`"53,80-853"`/数字）与本仓数组形态
+/// （`[28]`）的并集——conf 层保留原 JSON 形态，展开在运行时解析侧。
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DnsOutboundRuleSettings {
+    /// 动作：direct/drop/return/hijack。对应 Go `action`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// 匹配的 DNS 查询类型（Go PortList 串/数字或 Rust 数组）。对应 Go `qType`。
+    #[serde(rename = "qType", skip_serializing_if = "Option::is_none")]
+    pub q_type: Option<Value>,
+    /// 域名规则（串或串数组，Go StringList 形态）。对应 Go `domain`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<StringList>,
+    /// 返回码（Return 动作，≤65535）。对应 Go `rCode`。
+    #[serde(rename = "rCode", skip_serializing_if = "Option::is_none")]
+    pub r_code: Option<u32>,
+}
+
+/// `dispatch_outbound_settings` dns 臂的未知键告警（alwc：未知键不得静默丢弃）。
+///
+/// 已知键 = Go 方言 + Rust 既有方言全集；其余键 tracing warn 列出。conf 层
+/// 之外，运行时解析（xray-core `parse_dns_outbound_config`）有同语义二次防线。
+pub(crate) fn warn_unknown_dns_outbound_keys(v: &Value) {
+    const KNOWN: &[&str] = &[
+        // Rust 既有方言
+        "servers",
+        "queryStrategy",
+        "disableCache",
+        "disableFallback",
+        // Go 方言（dns_proxy.go:59-69）
+        "rewriteNetwork",
+        "rewriteAddress",
+        "rewritePort",
+        "network",
+        "address",
+        "port",
+        "userLevel",
+        "rules",
+        "nonIPQuery",
+        "blockTypes",
+    ];
+    let Some(map) = v.as_object() else { return };
+    let unknown: Vec<&String> = map.keys().filter(|k| !KNOWN.contains(&k.as_str())).collect();
+    if !unknown.is_empty() {
+        tracing::warn!(
+            target: "xray_conf",
+            keys = ?unknown,
+            "dns outbound settings: unrecognized keys are ignored (must match Go infra/conf/dns_proxy.go names or the Rust legacy dialect)"
+        );
+    }
 }
 
 /// 出站 settings untagged enum。
@@ -1221,7 +1314,10 @@ pub fn dispatch_outbound_settings(
         "blackhole" | "block" => opt::<BlackholeSettings>(v)?.map(OutboundSettings::Blackhole),
         "loopback" => opt::<LoopbackOutboundSettings>(v)?.map(OutboundSettings::Loopback),
         "hysteria" => opt::<HysteriaOutboundSettings>(v)?.map(OutboundSettings::Hysteria),
-        "dns" => opt::<DnsOutboundSettings>(v)?.map(OutboundSettings::Dns),
+        "dns" => {
+            warn_unknown_dns_outbound_keys(&v);
+            opt::<DnsOutboundSettings>(v)?.map(OutboundSettings::Dns)
+        },
         _ => None,
     };
     Ok(out)
@@ -1960,5 +2056,118 @@ mod tests {
         let s: HttpOutboundSettings =
             serde_json::from_str(r#"{"servers":[{"address":"a","port":80}]}"#).unwrap();
         assert!(s.build().unwrap().headers.is_empty());
+    }
+
+    // ===== alwc：dns 出站 settings Go 方言 =====
+
+    /// Go `DNSOutboundConfig` 全键（infra/conf/dns_proxy.go:59-69）原文解析：
+    /// 每键落到对应字段且值非默认。
+    #[test]
+    fn dns_outbound_accepts_go_dialect_keys() {
+        let raw = r#"{
+            "rewriteNetwork": "tcp",
+            "rewriteAddress": "8.8.8.8",
+            "rewritePort": 5353,
+            "network": "udp",
+            "address": "1.1.1.1",
+            "port": 53,
+            "userLevel": 2,
+            "rules": [
+                {"action": "direct", "qType": "1,3,23-24"},
+                {"action": "return", "rCode": 5, "domain": "keyword:example"}
+            ],
+            "nonIPQuery": "drop",
+            "blockTypes": [65, 28]
+        }"#;
+        let s: DnsOutboundSettings = serde_json::from_str(raw).unwrap();
+        assert_eq!(s.rewrite_network.as_deref(), Some("tcp"));
+        assert_eq!(s.rewrite_address.as_deref(), Some("8.8.8.8"));
+        assert_eq!(s.rewrite_port, Some(5353));
+        assert_eq!(s.network.as_deref(), Some("udp"));
+        assert_eq!(s.address.as_deref(), Some("1.1.1.1"));
+        assert_eq!(s.port, Some(53));
+        assert_eq!(s.user_level, Some(2));
+        assert_eq!(s.non_ip_query.as_deref(), Some("drop"));
+        assert_eq!(s.block_types, Some(vec![65, 28]));
+        let rules = s.rules.expect("rules parsed");
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].action.as_deref(), Some("direct"));
+        // qType Go PortList 串形态原样保留（展开在运行时解析侧）。
+        assert_eq!(rules[0].q_type.as_ref().unwrap(), &serde_json::json!("1,3,23-24"));
+        assert_eq!(rules[1].r_code, Some(5));
+        assert_eq!(rules[1].domain.as_ref().unwrap().0, vec!["keyword:example"]);
+
+        // Rust 既有方言（servers/queryStrategy/...）不回归。
+        let s: DnsOutboundSettings =
+            serde_json::from_str(r#"{"servers":[{"address":"1.1.1.1"}],"queryStrategy":"UseIP"}"#)
+                .unwrap();
+        assert!(s.servers.is_some());
+        assert_eq!(s.query_strategy.as_deref(), Some("UseIP"));
+    }
+
+    /// alwc 验收 ③：未知键产生真实 tracing warn（WarnCapture 模式取自 xray-tls）。
+    #[test]
+    fn dns_outbound_unknown_keys_warn() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct WarnCapture(Arc<Mutex<Vec<String>>>);
+        impl tracing::Subscriber for WarnCapture {
+            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+                meta.level() <= &tracing::Level::WARN
+            }
+            fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {
+            }
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct Fmt(String);
+                impl tracing::field::Visit for Fmt {
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        self.0.push_str(&format!("{}={value} ", field.name()));
+                    }
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push_str(&format!("{}={value:?} ", field.name()));
+                    }
+                }
+                let mut v = Fmt(String::new());
+                event.record(&mut v);
+                self.0.lock().unwrap().push(v.0);
+            }
+            fn enter(&self, _span: &tracing::span::Id) {}
+            fn exit(&self, _span: &tracing::span::Id) {}
+        }
+
+        let capture = WarnCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            dispatch_outbound_settings(
+                "dns",
+                serde_json::json!({
+                    "rewritePort": 53, "notARealKey": true
+                }),
+            )
+            .unwrap();
+        });
+        let warns = capture.0.lock().unwrap();
+        assert!(
+            warns.iter().any(|w| w.contains(r#"["notARealKey"]"#)),
+            "unknown key must warn with its name, got: {warns:?}"
+        );
+        // 已知键不触发 warn。
+        let capture = WarnCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            dispatch_outbound_settings(
+                "dns",
+                serde_json::json!({"rewritePort": 53, "rules": [{"action": "drop"}]}),
+            )
+            .unwrap();
+        });
+        assert!(capture.0.lock().unwrap().is_empty(), "known keys must not warn");
     }
 }
