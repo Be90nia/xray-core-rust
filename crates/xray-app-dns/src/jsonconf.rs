@@ -68,6 +68,13 @@ pub struct DnsAppConfig {
     /// 使用系统 hosts 文件。对应 Go `useSystemHosts`。
     #[serde(rename = "useSystemHosts")]
     pub use_system_hosts: Option<bool>,
+    /// Lua 调度脚本。对应 Go `script`（infra/conf/dns.go:158）。
+    /// Rust 无 Lua 运行时——**解析但拒绝**（fail-loud），静默忽略会让查询
+    /// 走普通 nameserver 与用户意图完全不同（本票 alwc 要消灭的行为类）。
+    pub script: Option<String>,
+    /// 未识别的顶层键（alwc：未知键不得静默丢弃，`build` 时 warn 列出）。
+    #[serde(flatten)]
+    pub unknown_keys: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// 单个 nameserver JSON 配置。对应 Go `infra/conf.NameServerConfig`。
@@ -130,6 +137,12 @@ pub struct NameServerJson {
     /// 负缓存 TTL（秒）；None/0 = 禁用。Rust 内部 cache 字段，Go 端无对应 JSON 字段。
     #[serde(rename = "negativeTtlSecs")]
     pub negative_ttl_secs: Option<u32>,
+    /// 服务 id。对应 Go `id`（infra/conf/dns.go:19；Go 侧仅注入 Lua script 桥
+    /// app/dns/lua.go:48,61——Rust 无 script 运行时，解析保留仅作配置兼容）。
+    pub id: Option<String>,
+    /// 未识别的键（alwc：未知键不得静默丢弃，`build` 时 warn 列出）。
+    #[serde(flatten)]
+    pub unknown_keys: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// 单个 server 条目的双形式反序列化：裸字符串等价 `{address: <str>, ..其余字段默认}`，
@@ -164,6 +177,32 @@ impl DnsAppConfig {
     /// 不可构造的 nameserver（如域名地址）被跳过并告警，而非让整个 dns feature
     /// 注册失败——保持 Go 的「尽力而为」语义。
     pub fn build(self) -> Result<DnsServiceConfig, DnsError> {
+        // alwc：未知键不得静默丢弃——顶层 + 逐 server 聚合成一条 warn。
+        // 已知键（含 serde alias `timeout`、Rust 扩展 actPrior/actUnprior/policyID/
+        // negativeTtlSecs）已被字段消费，不会进入 unknown_keys。
+        let mut unknown_report: Vec<String> = unknown_keys_report("dns", &self.unknown_keys, None);
+        for (i, ns) in self.servers.iter().enumerate() {
+            unknown_report.extend(unknown_keys_report(
+                "dns",
+                &ns.unknown_keys,
+                Some(&format!("servers[{i}] (address={:?})", ns.address)),
+            ));
+        }
+        if !unknown_report.is_empty() {
+            tracing::warn!(
+                keys = ?unknown_report,
+                "dns config: unrecognized keys are ignored (must match Go infra/conf/dns.go names or the Rust legacy aliases)"
+            );
+        }
+
+        // Go `script`（infra/conf/dns.go:158）走 Lua 调度引擎；Rust 无该运行时，
+        // 显式拒绝而非静默忽略（静默 = 查询走向与配置意图完全不同）。
+        if self.script.as_deref().is_some_and(|s| !s.is_empty()) {
+            return Err(DnsError::Features(xray_features::dns::DnsError::Other(
+                "dns script (Lua) is not supported by this build; remove the \"script\" key or use per-server \"domains\" routing instead".into(),
+            )));
+        }
+
         let query_strategy = parse_query_strategy(self.query_strategy.as_deref());
         let base_ip_option = ip_option_from_strategy(query_strategy);
 
@@ -291,6 +330,18 @@ impl DnsAppConfig {
             domain_matcher,
             matcher_infos,
         })
+    }
+}
+
+/// 聚合一层未知键为可读列表；`scope` 为 None 表顶层，Some 前缀表嵌套位置。
+fn unknown_keys_report(
+    scope_root: &str,
+    unknown: &std::collections::BTreeMap<String, serde_json::Value>,
+    scope: Option<&str>,
+) -> Vec<String> {
+    match scope {
+        None => unknown.keys().map(|k| format!("{scope_root}.{k}")).collect(),
+        Some(s) => unknown.keys().map(|k| format!("{scope_root}.{s}.{k}")).collect(),
     }
 }
 
@@ -1112,5 +1163,112 @@ mod tests {
 
         let built = cfg.build().unwrap();
         assert_eq!(built.clients.len(), 3, "string entry must build like object");
+    }
+
+    // ===== alwc：Go 方言键补齐 + 未知键不静默 =====
+
+    /// 极简 warn 捕获 subscriber（模式取自 xray-tls WarnCapture）：断言未知键
+    /// 告警真实发出（真实 tracing 事件，非 mock）。
+    #[derive(Clone, Default)]
+    struct WarnCapture(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for WarnCapture {
+        fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+            meta.level() <= &tracing::Level::WARN
+        }
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fmt(String);
+            impl tracing::field::Visit for Fmt {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.push_str(&format!("{}={value} ", field.name()));
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!("{}={value:?} ", field.name()));
+                }
+            }
+            let mut v = Fmt(String::new());
+            event.record(&mut v);
+            self.0.lock().unwrap().push(v.0);
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Go `DNSConfig.script`（infra/conf/dns.go:158）：解析到字段，build 显式
+    /// 拒绝（Rust 无 Lua 运行时，静默忽略 = 查询走向与配置意图不同）。
+    #[test]
+    fn go_script_key_parsed_and_build_rejected() {
+        let cfg: DnsAppConfig = serde_json::from_str(
+            r#"{"servers": ["8.8.8.8"], "script": "function lookup(domain) end"}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.script.as_deref(), Some("function lookup(domain) end"));
+        let err = match cfg.build() {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("non-empty script must fail the build"),
+        };
+        assert!(err.contains("script"), "error must mention script: {err}");
+
+        // 空串 = 未设置（Go `if c.Script != ""`），不拒绝。
+        let cfg: DnsAppConfig = serde_json::from_str(r#"{"script": ""}"#).unwrap();
+        cfg.build().unwrap();
+    }
+
+    /// Go `NameServerConfig.id`（infra/conf/dns.go:19）：Go 侧仅注入 Lua 桥
+    /// （app/dns/lua.go:48,61），Rust 解析保留作配置兼容。
+    #[test]
+    fn go_nameserver_id_key_accepted() {
+        let cfg: DnsAppConfig =
+            serde_json::from_str(r#"{"servers": [{"address": "8.8.8.8", "id": "dns-primary"}]}"#)
+                .unwrap();
+        assert_eq!(cfg.servers[0].id.as_deref(), Some("dns-primary"));
+        assert!(cfg.servers[0].unknown_keys.is_empty(), "id is a known Go key");
+        cfg.build().unwrap();
+    }
+
+    /// alwc 验收 ③：未知键不得静默丢弃——顶层与 servers[] 内未知键均产生
+    /// 真实 tracing warn 且列出键名；已知键（含 Rust 扩展/alias）不误报。
+    #[test]
+    fn unknown_keys_produce_warn_listing_names() {
+        let capture = WarnCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            let cfg: DnsAppConfig = serde_json::from_str(
+                r#"{
+                "servers": [
+                    {"address": "8.8.8.8", "typoKey": 1, "timeout": 4000, "actPrior": true}
+                ],
+                "someUnknownTop": true
+            }"#,
+            )
+            .unwrap();
+            cfg.build().unwrap();
+        });
+        let warns = capture.0.lock().unwrap();
+        for w in warns.iter() {
+            // e2e 取证（--nocapture）：真实 warn 文本。
+            println!("[e2e] warn: {w}");
+        }
+        assert!(
+            warns.iter().any(|w| {
+                w.contains("dns.someUnknownTop")
+                    && w.contains("dns.servers[0] (address=")
+                    && w.contains(".typoKey")
+            }),
+            "warn must list both unknown keys, got: {warns:?}"
+        );
+        // 已知键（alias timeout / Rust 扩展 actPrior）不得出现在 warn 中。
+        assert!(
+            !warns.iter().any(|w| w.contains("timeout") || w.contains("actPrior")),
+            "known keys must not warn, got: {warns:?}"
+        );
     }
 }

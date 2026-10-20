@@ -2313,76 +2313,475 @@ async fn write_or_inline_upstream(
 
 // ========== DNS Outbound 配置解析 ==========
 
-/// 从 outbound entry.data（JSON）解析 dns outbound 配置。
+/// dns outbound settings 已知键全集（票 alwc）：Go `infra/conf/dns_proxy.go:59-69`
+/// 方言 + 本仓既有 Rust 方言（`rule`/`rewriteServer` 等）。
+const DNS_OUTBOUND_KNOWN_KEYS: &[&str] = &[
+    // Rust 既有方言
+    "rule",
+    "rewriteServer",
+    "servers",
+    "queryStrategy",
+    "disableCache",
+    "disableFallback",
+    // Go 方言（dns_proxy.go:59-69）
+    "rules",
+    "rewriteNetwork",
+    "rewriteAddress",
+    "rewritePort",
+    "network",
+    "address",
+    "port",
+    "userLevel",
+    "nonIPQuery",
+    "blockTypes",
+];
+
+/// alwc：未知键不得静默丢弃——Go 默认也忽略未知键，这里至少 warn 留痕。
+fn warn_unknown_dns_outbound_keys(v: &serde_json::Value) {
+    let Some(map) = v.as_object() else { return };
+    let unknown: Vec<&String> =
+        map.keys().filter(|k| !DNS_OUTBOUND_KNOWN_KEYS.contains(&k.as_str())).collect();
+    if !unknown.is_empty() {
+        tracing::warn!(
+            keys = ?unknown,
+            "dns outbound settings: unrecognized keys are ignored (must match Go infra/conf/dns_proxy.go names or the Rust legacy dialect)"
+        );
+    }
+}
+
+/// 类型严格取键（对齐 Go：JSON 类型不匹配 → 整体配置错误拒启，而非静默忽略）。
+fn go_json_str<'a>(
+    v: &'a serde_json::Value,
+    key: &str,
+) -> std::result::Result<Option<&'a str>, String> {
+    match v.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s.as_str())),
+        Some(other) => Err(format!("dns outbound: {key} must be a string, got {other}")),
+    }
+}
+
+fn go_json_u64(v: &serde_json::Value, key: &str) -> std::result::Result<Option<u64>, String> {
+    match v.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("dns outbound: {key} must be a non-negative integer, got {n}")),
+        Some(other) => Err(format!("dns outbound: {key} must be an integer, got {other}")),
+    }
+}
+
+/// Go `Address`（infra/conf/common.go:53-66）：字符串，`env:` 前缀读环境变量；
+/// IPv4/IPv6 呈 Ip 形态，其余按 Domain。空串 → None（无重写地址）。
+fn parse_go_dns_address(s: &str) -> Option<xray_proto::xray::common::net::IpOrDomain> {
+    let raw = match s.strip_prefix("env:") {
+        Some(var) => std::env::var(var).unwrap_or_default(),
+        None => s.to_string(),
+    };
+    use xray_proto::xray::common::net::ip_or_domain::Address as IoD;
+    if let Ok(v4) = raw.parse::<std::net::Ipv4Addr>() {
+        return Some(xray_proto::xray::common::net::IpOrDomain {
+            address: Some(IoD::Ip(v4.octets().to_vec())),
+        });
+    }
+    if let Ok(v6) = raw.parse::<std::net::Ipv6Addr>() {
+        return Some(xray_proto::xray::common::net::IpOrDomain {
+            address: Some(IoD::Ip(v6.octets().to_vec())),
+        });
+    }
+    if raw.is_empty() {
+        None
+    } else {
+        Some(xray_proto::xray::common::net::IpOrDomain { address: Some(IoD::Domain(raw)) })
+    }
+}
+
+/// Go `Network.Build`（infra/conf/common.go:69-80）：大小写不敏感，
+/// tcp/udp/unix → proto 枚举（common/net/network.proto），其余 Unknown。
+fn build_go_dns_network(s: &str) -> i32 {
+    match s.to_ascii_lowercase().as_str() {
+        "tcp" => 2,  // Network_TCP
+        "udp" => 3,  // Network_UDP
+        "unix" => 4, // Network_UNIX
+        _ => 0,      // Network_Unknown → 不覆盖网络形态
+    }
+}
+
+/// Go `PortList`（infra/conf/common.go:233-270）+ 本仓数组方言 → qType 列表。
+/// 形态：`"53"`、`"53,80-853"`（段支持 `env:VAR` 前缀，单段 `-` 分隔区间）、
+/// 数字（0 = 空 → 匹配所有类型，Go `if number != 0`）、数字数组（Rust 方言）。
+fn parse_dns_q_type(v: &serde_json::Value) -> std::result::Result<Vec<i32>, String> {
+    let mut out: Vec<i32> = Vec::new();
+    match v {
+        serde_json::Value::Number(n) => {
+            let p = n.as_u64().ok_or_else(|| format!("invalid port: {v}"))?;
+            // Go PortFromInt：>65535 报错；顶层 0 → 不追加（匹配所有类型）。
+            if p > 65535 {
+                return Err(format!("invalid port: {p}"));
+            }
+            if p != 0 {
+                out.push(p as i32);
+            }
+        },
+        serde_json::Value::String(s) => {
+            for part in s.split(',') {
+                let t = part.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                if t.contains('-') || t.starts_with("env:") {
+                    let (from, to) = parse_go_string_port(t)?;
+                    for q in from..=to {
+                        out.push(q as i32);
+                    }
+                } else {
+                    let p: u32 = t.parse().map_err(|_| format!("invalid port: {t}"))?;
+                    if p > 65535 {
+                        return Err(format!("invalid port: {t}"));
+                    }
+                    out.push(p as i32);
+                }
+            }
+        },
+        // 本仓 Rust 方言：数字数组。
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                let n = item.as_i64().ok_or_else(|| format!("invalid port: {item}"))?;
+                if !(0..=65535).contains(&n) {
+                    return Err(format!("invalid port: {n}"));
+                }
+                out.push(n as i32);
+            }
+        },
+        other => return Err(format!("invalid port: {other}")),
+    }
+    Ok(out)
+}
+
+/// Go `parseStringPort`（infra/conf/common.go:159-181）：`env:VAR` 前缀先解析
+/// 环境变量，再按首个 `-` 拆 from/to；两侧均须 0-65535。
+fn parse_go_string_port(s: &str) -> std::result::Result<(u32, u32), String> {
+    let resolved = match s.strip_prefix("env:") {
+        Some(var) => std::env::var(var).map_err(|_| format!("invalid port range: {s}"))?,
+        None => s.to_string(),
+    };
+    let parse_side = |side: &str| -> std::result::Result<u32, String> {
+        let p: u32 = side.trim().parse().map_err(|_| format!("invalid port range: {resolved}"))?;
+        if p > 65535 {
+            return Err(format!("invalid port range: {resolved}"));
+        }
+        Ok(p)
+    };
+    match resolved.split_once('-') {
+        None => {
+            let p = parse_side(&resolved)?;
+            Ok((p, p))
+        },
+        Some((from, to)) => Ok((parse_side(from)?, parse_side(to)?)),
+    }
+}
+
+/// domain 规则串列表 → proto `DomainRule` 列表。
 ///
-/// JSON（Rust 扩展，Go JSON 侧 dns outbound settings 为空对象）：
-/// `{"rule":[{"action":"drop","qType":[28],"rCode":5}], "rewriteServer":{...}}`
-fn parse_dns_outbound_config(data: &[u8]) -> std::result::Result<xray_proxy_dns::Handler, String> {
+/// 对齐 Go `geodata.ParseDomainRules(*c.Domain, Domain_Substr)`（dns_proxy.go:44-49）：
+/// 每条串按 Substr 默认类型解析；`geosite:` 条目就地展开为具体 Domain 条目
+/// （运行时 `DnsRule::from_config` 无 geo loader，Geosite 变体会被跳过——此处
+/// 展开后端到端可用）。attrs 过滤已在 `load_site_with_attrs` 内完成，展开条目
+/// 不再携带 attribute。解析失败 → 错误拒启（Go 同为 Build error）。
+fn parse_dns_domain_rules(
+    rules: &[String],
+    datadir: &std::path::Path,
+    loader: &xray_geodata::loader::GeoDataLoader,
+) -> std::result::Result<Vec<xray_proto::xray::common::geodata::DomainRule>, String> {
+    use xray_proto::xray::common::geodata::{Domain, domain_rule::Value as PV};
+    let mut out = Vec::new();
+    for s in rules {
+        let pb_rule = xray_geodata::rule_parser::parse_domain_rule(
+            s,
+            xray_geodata::geosite::DomainType::Substr,
+            datadir,
+        )
+        .map_err(|e| format!("parse dns outbound domain rule {s}: {e}"))?;
+        let Some(value) = pb_rule.value else { continue };
+        match value {
+            xray_geodata::pb::domain_rule::Value::Custom(d) => {
+                out.push(xray_proto::xray::common::geodata::DomainRule {
+                    value: Some(PV::Custom(Domain {
+                        r#type: d.r#type,
+                        value: d.value,
+                        attribute: Vec::new(),
+                    })),
+                });
+            },
+            xray_geodata::pb::domain_rule::Value::Geosite(g) => {
+                let file = if g.file.is_empty() { "geosite.dat" } else { &g.file };
+                let site = loader
+                    .load_site_with_attrs(file, &g.code, &g.attrs)
+                    .map_err(|e| format!("load geosite {file}/{}: {e}", g.code))?;
+                for d in site.domain {
+                    out.push(xray_proto::xray::common::geodata::DomainRule {
+                        value: Some(PV::Custom(Domain {
+                            r#type: d.r#type,
+                            value: d.value,
+                            attribute: Vec::new(),
+                        })),
+                    });
+                }
+            },
+        }
+    }
+    Ok(out)
+}
+
+/// rules[]/rule[] 单条 → `DnsRuleConfig`。
+///
+/// 对齐 Go `DNSOutboundRuleConfig.Build`（dns_proxy.go:21-56）：
+/// - action 小写匹配 direct/drop/return/hijack，未知值报错（Go 文案）；
+///   缺省 → Direct（本仓 Rust 方言既有行为，Go 缺省报错——宽松面保留兼容）；
+/// - qType 为 PortList 展开列表；domain 为 geodata 规则；rCode ≤ 65535。
+fn parse_dns_outbound_rule(
+    r: &serde_json::Value,
+    datadir: &std::path::Path,
+    loader: &xray_geodata::loader::GeoDataLoader,
+) -> std::result::Result<xray_proxy_dns::DnsRuleConfig, String> {
+    let action = match r.get("action") {
+        None | Some(serde_json::Value::Null) => xray_proxy_dns::RuleAction::Direct,
+        Some(serde_json::Value::String(s)) => match s.to_ascii_lowercase().as_str() {
+            "direct" => xray_proxy_dns::RuleAction::Direct,
+            "drop" => xray_proxy_dns::RuleAction::Drop,
+            "return" => xray_proxy_dns::RuleAction::Return,
+            "hijack" => xray_proxy_dns::RuleAction::Hijack,
+            _ => return Err(format!("unknown action: {s}")),
+        },
+        Some(other) => {
+            return Err(format!("dns outbound: rule action must be a string, got {other}"));
+        },
+    };
+    let q_type = match r.get("qType") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(v) => parse_dns_q_type(v)?,
+    };
+    let domain = match r.get("domain") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        // Go StringList（infra/conf/common.go:17-34）：单字符串按逗号拆分。
+        Some(serde_json::Value::String(s)) => {
+            let list: Vec<String> = s.split(',').map(str::to_string).collect();
+            parse_dns_domain_rules(&list, datadir, loader)?
+        },
+        Some(serde_json::Value::Array(arr)) => {
+            let mut list = Vec::with_capacity(arr.len());
+            for item in arr {
+                list.push(
+                    item.as_str()
+                        .ok_or_else(|| {
+                            format!("dns outbound: rule domain must be strings, got {item}")
+                        })?
+                        .to_string(),
+                );
+            }
+            parse_dns_domain_rules(&list, datadir, loader)?
+        },
+        Some(other) => {
+            return Err(format!(
+                "dns outbound: rule domain must be a string or array, got {other}"
+            ));
+        },
+    };
+    let r_code = match r.get("rCode") {
+        None | Some(serde_json::Value::Null) => 0,
+        Some(v) => {
+            let n = v
+                .as_u64()
+                .ok_or_else(|| format!("dns outbound: rule rCode must be an integer, got {v}"))?;
+            if n > 65535 {
+                return Err(format!("rCode out of range: {n}"));
+            }
+            n as u32
+        },
+    };
+    Ok(xray_proxy_dns::DnsRuleConfig { action, q_type, domain, r_code })
+}
+
+/// Go legacy `buildLegacyDNSPolicy`（dns_proxy.go:120-168）：
+/// `[blockTypes 规则?] + hijack{qType:[1,28]} + 兜底规则`。
+/// mode：reject → Return+RCode5；drop → Drop；skip → Direct；"" → Return。
+fn build_legacy_dns_policy(
+    non_ip_query: Option<&str>,
+    block_types: Option<Vec<i32>>,
+) -> std::result::Result<Vec<xray_proxy_dns::DnsRuleConfig>, String> {
+    let mode = non_ip_query.unwrap_or("reject");
+    match mode {
+        "" | "reject" | "drop" | "skip" => {},
+        other => return Err(format!("unknown nonIPQuery: {other}")),
+    }
+    let mut rules = Vec::new();
+    if let Some(types) = block_types.filter(|t| !t.is_empty()) {
+        let mut rule = xray_proxy_dns::DnsRuleConfig {
+            action: xray_proxy_dns::RuleAction::Drop,
+            ..Default::default()
+        };
+        if mode == "reject" {
+            rule.action = xray_proxy_dns::RuleAction::Return;
+            rule.r_code = 5;
+        }
+        for q in types {
+            if !(0..=65535).contains(&q) {
+                return Err(format!("legacy blockTypes qType out of range: {q}"));
+            }
+            rule.q_type.push(q);
+        }
+        rules.push(rule);
+    }
+    rules.push(xray_proxy_dns::DnsRuleConfig {
+        action: xray_proxy_dns::RuleAction::Hijack,
+        q_type: vec![1, 28],
+        ..Default::default()
+    });
+    let mut last = xray_proxy_dns::DnsRuleConfig {
+        action: xray_proxy_dns::RuleAction::Return,
+        ..Default::default()
+    };
+    if mode == "reject" {
+        last.r_code = 5;
+    } else if mode == "drop" {
+        last.action = xray_proxy_dns::RuleAction::Drop;
+    } else if mode == "skip" {
+        last.action = xray_proxy_dns::RuleAction::Direct;
+    }
+    rules.push(last);
+    Ok(rules)
+}
+
+/// 从 outbound entry.data（JSON）解析 dns outbound 配置（票 alwc 双方言）。
+///
+/// Go 方言（`infra/conf/dns_proxy.go:59-94`）：`rules[]`（action/qType/domain/
+/// rCode）、`rewriteNetwork`/`rewriteAddress`/`rewritePort`、legacy 别名
+/// `network`/`address`/`port`（非空/非零覆盖 rewrite*）、`userLevel`、legacy
+/// `nonIPQuery`/`blockTypes`（迁移路径，与 rules 混用报错）。
+/// Rust 方言（保留）：`rule[]`（单数）、`rewriteServer` 对象（逐项覆盖）。
+/// 未知键 warn 留痕，不静默。
+fn build_dns_outbound_config(data: &[u8]) -> std::result::Result<xray_proxy_dns::Config, String> {
     let v: serde_json::Value =
         serde_json::from_slice(data).map_err(|e| format!("dns outbound settings JSON: {e}"))?;
+    warn_unknown_dns_outbound_keys(&v);
     let mut config = xray_proxy_dns::Config::default();
 
-    if let Some(rules) = v.get("rule").and_then(|x| x.as_array()) {
-        for r in rules {
-            let action = match r.get("action") {
-                Some(serde_json::Value::String(s)) => match s.to_ascii_lowercase().as_str() {
-                    "drop" => xray_proxy_dns::RuleAction::Drop,
-                    "return" => xray_proxy_dns::RuleAction::Return,
-                    "hijack" => xray_proxy_dns::RuleAction::Hijack,
-                    _ => xray_proxy_dns::RuleAction::Direct,
-                },
-                _ => xray_proxy_dns::RuleAction::Direct,
-            };
-            let q_type = r
-                .get("qType")
-                .and_then(|x| x.as_array())
-                .map(|arr| arr.iter().filter_map(|x| x.as_i64().map(|n| n as i32)).collect())
-                .unwrap_or_default();
-            let r_code = r.get("rCode").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-            config.rule.push(xray_proxy_dns::DnsRuleConfig {
-                action,
-                q_type,
-                r_code,
-                domain: Vec::new(),
-            });
+    // geodata 资源目录（geosite: 展开用；与 xray-app-dns 同源 platform 探测）。
+    let datadir = xray_common::platform::get_asset_dir();
+    let loader = xray_geodata::loader::GeoDataLoader::new(datadir.clone());
+
+    // legacy nonIPQuery/blockTypes：与任一 rules 载体（Go rules / Rust rule）
+    // 混用即拒（Go dns_proxy.go:99-102 文案）。
+    let has_rules = v.get("rules").is_some() || v.get("rule").is_some();
+    let non_ip_query = match v.get("nonIPQuery") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => Some(s.as_str()),
+        Some(other) => {
+            return Err(format!("dns outbound: nonIPQuery must be a string, got {other}"));
+        },
+    };
+    let block_types = match v.get("blockTypes") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Array(arr)) => {
+            let mut list = Vec::with_capacity(arr.len());
+            for item in arr {
+                list.push(item.as_i64().and_then(|n| i32::try_from(n).ok()).ok_or_else(|| {
+                    format!("dns outbound: blockTypes must be integers, got {item}")
+                })?);
+            }
+            Some(list)
+        },
+        Some(other) => {
+            return Err(format!("dns outbound: blockTypes must be an array, got {other}"));
+        },
+    };
+    if non_ip_query.is_some() || block_types.is_some() {
+        if has_rules {
+            return Err("legacy nonIPQuery and blockTypes cannot be mixed with rules".into());
+        }
+        // Go errors.PrintDeprecatedFeatureWarning（feature_errors.go:15-18）。
+        tracing::warn!(
+            "This feature \"nonIPQuery\" and \"blockTypes\" is deprecated, will be removed soon and being migrated to \"rules\". Please update your config(s) according to release note and documentation before removal."
+        );
+        config.rule = build_legacy_dns_policy(non_ip_query, block_types)?;
+    }
+
+    // 新/旧规则载体按序追加（Go rules 优先，Rust rule 兼容在后）。
+    for key in ["rules", "rule"] {
+        let Some(serde_json::Value::Array(arr)) = v.get(key) else { continue };
+        for r in arr {
+            config.rule.push(parse_dns_outbound_rule(r, &datadir, &loader)?);
         }
     }
 
+    // 重写目标（Go Build dns_proxy.go:73-94）：rewrite* 为基，legacy 别名
+    // 非空/非零覆盖；rewriteServer 对象（Rust 方言）逐项再覆盖。
+    let mut endpoint =
+        xray_proto::xray::common::net::Endpoint { network: 0, address: None, port: 0 };
+    let mut rewrite_touched = false;
+    if let Some(n) = go_json_str(&v, "rewriteNetwork")? {
+        endpoint.network = build_go_dns_network(n);
+        rewrite_touched = true;
+    }
+    if let Some(a) = go_json_str(&v, "rewriteAddress")? {
+        endpoint.address = parse_go_dns_address(a);
+        rewrite_touched = true;
+    }
+    if let Some(p) = go_json_u64(&v, "rewritePort")? {
+        endpoint.port = u16::try_from(p)
+            .map_err(|_| format!("dns outbound: rewritePort out of range: {p}"))?
+            as u32;
+        rewrite_touched = true;
+    }
+    // legacy 别名（Go :74-82）。
+    if let Some(n) = go_json_str(&v, "network")? {
+        if !n.is_empty() {
+            endpoint.network = build_go_dns_network(n);
+            rewrite_touched = true;
+        }
+    }
+    if let Some(a) = go_json_str(&v, "address")? {
+        endpoint.address = parse_go_dns_address(a);
+        rewrite_touched = true;
+    }
+    if let Some(p) = go_json_u64(&v, "port")? {
+        if p != 0 {
+            endpoint.port = u16::try_from(p)
+                .map_err(|_| format!("dns outbound: port out of range: {p}"))?
+                as u32;
+            rewrite_touched = true;
+        }
+    }
+    // Rust 方言 rewriteServer 对象（既有行为保留；类型宽松同旧实现）。
     if let Some(rw) = v.get("rewriteServer") {
-        let network = match rw.get("network").and_then(|x| x.as_str()) {
-            Some("tcp") => 2, // xray.common.net.Network.TCP
-            Some("udp") => 3, // xray.common.net.Network.UDP
-            _ => 0,           // Unknown → 不覆盖
-        };
-        let address = rw.get("address").and_then(|x| x.as_str()).and_then(|s| {
-            if let Ok(v4) = s.parse::<std::net::Ipv4Addr>() {
-                Some(xray_proto::xray::common::net::IpOrDomain {
-                    address: Some(xray_proto::xray::common::net::ip_or_domain::Address::Ip(
-                        v4.octets().to_vec(),
-                    )),
-                })
-            } else if let Ok(v6) = s.parse::<std::net::Ipv6Addr>() {
-                Some(xray_proto::xray::common::net::IpOrDomain {
-                    address: Some(xray_proto::xray::common::net::ip_or_domain::Address::Ip(
-                        v6.octets().to_vec(),
-                    )),
-                })
-            } else if !s.is_empty() {
-                Some(xray_proto::xray::common::net::IpOrDomain {
-                    address: Some(xray_proto::xray::common::net::ip_or_domain::Address::Domain(
-                        s.to_string(),
-                    )),
-                })
-            } else {
-                None
-            }
-        });
-        let port = rw.get("port").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-        config.rewrite_server =
-            Some(xray_proto::xray::common::net::Endpoint { network, address, port });
+        rewrite_touched = true;
+        if let Some(n) = rw.get("network").and_then(|x| x.as_str()) {
+            endpoint.network = build_go_dns_network(n);
+        }
+        if let Some(a) = rw.get("address").and_then(|x| x.as_str()) {
+            endpoint.address = parse_go_dns_address(a);
+        }
+        if let Some(p) = rw.get("port").and_then(|x| x.as_u64()) {
+            endpoint.port = p as u32;
+        }
+    }
+    if rewrite_touched {
+        config.rewrite_server = Some(endpoint);
     }
 
-    Ok(xray_proxy_dns::Handler::init(&config))
+    // userLevel（Go dns_proxy.go:66 → dns.Config.UserLevel）。
+    if let Some(level) = go_json_u64(&v, "userLevel")? {
+        config.user_level = u32::try_from(level)
+            .map_err(|_| format!("dns outbound: userLevel out of range: {level}"))?;
+    }
+
+    Ok(config)
+}
+
+/// 从 outbound entry.data（JSON）解析 dns outbound 配置并构造运行时 Handler。
+fn parse_dns_outbound_config(data: &[u8]) -> std::result::Result<xray_proxy_dns::Handler, String> {
+    build_dns_outbound_config(data).map(|cfg| xray_proxy_dns::Handler::init(&cfg))
 }
 
 // ========== AnyTLS 配置解析 ==========
@@ -5244,6 +5643,235 @@ mod tests {
             Box::new(up_w) as Box<dyn xray_buf::io::Writer>,
             Box::new(dn_r) as Box<dyn xray_buf::io::Reader>,
         )
+    }
+
+    // ===== alwc：dns outbound settings Go 方言（解析层单测）=====
+
+    /// Go `DNSOutboundConfig` 全键样例（对齐 Go dns_proxy_test.go:35-44 形态）→
+    /// 运行时 Config 逐字段落位；并打印结构 dump（报告取证，--nocapture）。
+    #[test]
+    fn dns_go_dialect_full_config_parses_and_dumps() {
+        use xray_proto::xray::common::net::ip_or_domain::Address as IoD;
+        let config = build_dns_outbound_config(
+            br#"{
+                "rules": [{
+                    "action": "direct",
+                    "qType": "1,3,23-24",
+                    "domain": ["domain:example.com", "full:api.example.com"]
+                }, {
+                    "action": "hijack",
+                    "qType": 53
+                }],
+                "rewriteNetwork": "tcp",
+                "rewriteAddress": "8.8.8.8",
+                "rewritePort": 5353,
+                "userLevel": 2
+            }"#,
+        )
+        .unwrap();
+        println!("dns outbound Go dialect config dump:\n{config:#?}");
+        assert_eq!(config.user_level, 2);
+        let rw = config.rewrite_server.expect("rewrite server set");
+        assert_eq!(rw.network, 2); // Network_TCP
+        assert_eq!(rw.port, 5353);
+        assert_eq!(
+            rw.address.as_ref().and_then(|a| a.address.as_ref()),
+            Some(&IoD::Ip(vec![8, 8, 8, 8]))
+        );
+        assert_eq!(config.rule.len(), 2);
+        let r0 = &config.rule[0];
+        assert_eq!(r0.action, xray_proxy_dns::RuleAction::Direct);
+        assert_eq!(r0.q_type, vec![1, 3, 23, 24], "PortList range 23-24 must expand");
+        assert_eq!(r0.domain.len(), 2);
+        // "domain:example.com" → proto Domain{type: Domain(2), value}
+        match r0.domain[0].value.as_ref().unwrap() {
+            xray_proto::xray::common::geodata::domain_rule::Value::Custom(d) => {
+                assert_eq!(d.r#type, 2);
+                assert_eq!(d.value, "example.com");
+            },
+            v => panic!("expected custom domain rule, got {v:?}"),
+        }
+        let r1 = &config.rule[1];
+        assert_eq!(r1.action, xray_proxy_dns::RuleAction::Hijack);
+        assert_eq!(r1.q_type, vec![53]);
+    }
+
+    /// Go `StringList` 单字符串按逗号拆分（infra/conf/common.go:17-34）：
+    /// `"domain": "keyword:example,full:a.com"` → 两条规则。
+    #[test]
+    fn dns_go_domain_string_list_comma_splits() {
+        let config = build_dns_outbound_config(
+            br#"{"rules": [{"action": "return", "rCode": 5, "domain": "keyword:example,full:a.com"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(config.rule.len(), 1);
+        assert_eq!(config.rule[0].domain.len(), 2, "comma split must yield 2 rules");
+        match config.rule[0].domain[1].value.as_ref().unwrap() {
+            xray_proto::xray::common::geodata::domain_rule::Value::Custom(d) => {
+                assert_eq!(d.r#type, 3, "full: prefix → Full type");
+                assert_eq!(d.value, "a.com");
+            },
+            v => panic!("expected custom domain rule, got {v:?}"),
+        }
+    }
+
+    /// legacy 别名 `network`/`address`/`port` 非空/非零覆盖 rewrite*（Go
+    /// dns_proxy.go:74-82）；rewriteServer 对象（Rust 方言）逐项再覆盖。
+    #[test]
+    fn dns_go_legacy_aliases_override_rewrite_keys() {
+        use xray_proto::xray::common::net::ip_or_domain::Address as IoD;
+        let config = build_dns_outbound_config(
+            br#"{
+                "rewriteNetwork": "udp", "network": "tcp",
+                "rewritePort": 1, "port": 5353,
+                "rewriteAddress": "9.9.9.9", "address": "dns.example.com"
+            }"#,
+        )
+        .unwrap();
+        let rw = config.rewrite_server.expect("rewrite set");
+        assert_eq!(rw.network, 2, "legacy network must override rewriteNetwork");
+        assert_eq!(rw.port, 5353, "legacy port must override rewritePort");
+        assert_eq!(
+            rw.address.as_ref().and_then(|a| a.address.as_ref()),
+            Some(&IoD::Domain("dns.example.com".into()))
+        );
+
+        // 纯 Rust 方言对象不回归：network 缺省 0、字符串地址走 Domain。
+        let config = build_dns_outbound_config(
+            br#"{"rewriteServer": {"network": "udp", "address": "1.1.1.1", "port": 53}}"#,
+        )
+        .unwrap();
+        let rw = config.rewrite_server.expect("rewrite set");
+        assert_eq!(rw.network, 3); // Network_UDP
+        assert_eq!(rw.port, 53);
+        assert_eq!(
+            rw.address.as_ref().and_then(|a| a.address.as_ref()),
+            Some(&IoD::Ip(vec![1, 1, 1, 1]))
+        );
+    }
+
+    /// legacy `nonIPQuery`/`blockTypes` 迁移路径（Go buildLegacyDNSPolicy
+    /// dns_proxy.go:120-168）：drop/skip/reject 三种模式的规则序列。
+    #[test]
+    fn dns_go_legacy_non_ip_query_builds_policy() {
+        // drop：[Drop(blockTypes), Hijack(1,28), Drop]
+        let config =
+            build_dns_outbound_config(br#"{"nonIPQuery": "drop", "blockTypes": [65, 28]}"#)
+                .unwrap();
+        assert_eq!(config.rule.len(), 3);
+        assert_eq!(config.rule[0].action, xray_proxy_dns::RuleAction::Drop);
+        assert_eq!(config.rule[0].q_type, vec![65, 28]);
+        assert_eq!(config.rule[1].action, xray_proxy_dns::RuleAction::Hijack);
+        assert_eq!(config.rule[1].q_type, vec![1, 28]);
+        assert_eq!(config.rule[2].action, xray_proxy_dns::RuleAction::Drop);
+
+        // reject：兜底规则 Return+RCode5。
+        let config = build_dns_outbound_config(br#"{"nonIPQuery": "reject"}"#).unwrap();
+        assert_eq!(config.rule.len(), 2);
+        let last = config.rule.last().unwrap();
+        assert_eq!(last.action, xray_proxy_dns::RuleAction::Return);
+        assert_eq!(last.r_code, 5);
+
+        // skip：兜底规则 Direct。
+        let config = build_dns_outbound_config(br#"{"nonIPQuery": "skip"}"#).unwrap();
+        assert_eq!(config.rule.last().unwrap().action, xray_proxy_dns::RuleAction::Direct);
+    }
+
+    /// legacy 与 rules 混用 → 拒（Go dns_proxy.go:99-102 文案）。
+    #[test]
+    fn dns_go_legacy_mixed_with_rules_errors() {
+        let err = build_dns_outbound_config(
+            br#"{"rules": [{"action": "direct", "qType": 65}], "blockTypes": [65]}"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("legacy nonIPQuery and blockTypes cannot be mixed with rules"),
+            "got: {err}"
+        );
+    }
+
+    /// Go 硬错面：未知 action / rCode 越界 / qType 越界 / 类型不匹配。
+    #[test]
+    fn dns_go_strict_errors() {
+        // 未知 action（Go "unknown action: "）。
+        let err = build_dns_outbound_config(br#"{"rules": [{"action": "trais", "qType": 1}]}"#)
+            .unwrap_err();
+        assert!(err.contains("unknown action: trais"), "got: {err}");
+        // rCode 越界（Go "rCode out of range: "）。
+        let err =
+            build_dns_outbound_config(br#"{"rules": [{"action": "return", "rCode": 65536}]}"#)
+                .unwrap_err();
+        assert!(err.contains("rCode out of range: 65536"), "got: {err}");
+        // qType 数字越界（Go PortFromInt：>65535 报错）。
+        let err = build_dns_outbound_config(br#"{"rules": [{"action": "drop", "qType": 70000}]}"#)
+            .unwrap_err();
+        assert!(err.contains("invalid port"), "got: {err}");
+        // 类型不匹配（Go unmarshal error）。
+        let err = build_dns_outbound_config(br#"{"rewritePort": "53"}"#).unwrap_err();
+        assert!(err.contains("rewritePort must be an integer"), "got: {err}");
+    }
+
+    /// alwc 验收 ③：未知键产生真实 tracing warn（WarnCapture 模式取自 xray-tls）；
+    /// 已知键（双侧方言）不误报。
+    #[test]
+    fn dns_unknown_key_warns_with_names() {
+        #[derive(Clone, Default)]
+        struct WarnCapture(Arc<parking_lot::Mutex<Vec<String>>>);
+        impl tracing::Subscriber for WarnCapture {
+            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+                meta.level() <= &tracing::Level::WARN
+            }
+            fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {
+            }
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct Fmt(String);
+                impl tracing::field::Visit for Fmt {
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        self.0.push_str(&format!("{}={value} ", field.name()));
+                    }
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push_str(&format!("{}={value:?} ", field.name()));
+                    }
+                }
+                let mut v = Fmt(String::new());
+                event.record(&mut v);
+                self.0.lock().push(v.0);
+            }
+            fn enter(&self, _span: &tracing::span::Id) {}
+            fn exit(&self, _span: &tracing::span::Id) {}
+        }
+
+        let capture = WarnCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            build_dns_outbound_config(br#"{"rules": [], "rewiteServer": {}}"#).unwrap();
+        });
+        let warns = capture.0.lock();
+        for w in warns.iter() {
+            // e2e 取证（--nocapture）：真实 warn 文本。
+            println!("[e2e] warn: {w}");
+        }
+        assert!(
+            warns.iter().any(|w| w.contains(r#"["rewiteServer"]"#)),
+            "unknown key must warn, got: {warns:?}"
+        );
+
+        // 双方言已知键不误报。
+        let capture = WarnCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            build_dns_outbound_config(
+                br#"{"rule": [], "rules": [], "rewriteServer": {}, "userLevel": 1, "nonIPQuery": "drop", "blockTypes": [1]}"#,
+            )
+            .unwrap_err(); // nonIPQuery + rules 混用报错，但 warn 判定不受影响
+        });
+        assert!(capture.0.lock().is_empty(), "known keys must not warn");
     }
 
     /// e2e：UDP Direct 规则 → 原样 query 转发到上游 → 响应回客户端。
