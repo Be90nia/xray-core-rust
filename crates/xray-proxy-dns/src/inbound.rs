@@ -136,8 +136,8 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use tokio::io::AsyncReadExt as _;
     use crate::config::{Config, DnsRuleConfig, RuleAction};
+    use tokio::io::AsyncReadExt as _;
 
     /// 构造最小 DNS A 查询消息（handler.rs tests 中同款）。
     fn make_query_bytes(domain: &str, q_type: u16) -> Vec<u8> {
