@@ -157,16 +157,30 @@ impl TcpRelay {
     }
 
     /// 发送用户数据到 smoltcp TCP socket。
-    async fn send_to_smoltcp(&self, data: &[u8]) {
+    ///
+    /// `send_slice` 只接受 tx 缓冲当前空闲空间（SOCKET_BUF_SIZE=64KB），必须循环
+    /// 写完为止：缓冲满期间释放 netstack 锁等待——driver 定时器 drain_tx 把数据
+    /// 发上线路、worker ingest 对端 ACK 后空间才腾出；不释放会饿死唯一能推进
+    /// 发送的 task。单次调用丢弃残余会让上行恰好在 64KB 处静默截断（票 gmhe）。
+    async fn send_to_smoltcp(&self, mut data: &[u8]) {
         let mut stack = self.netstack.lock().await;
-        stack.poll(smoltcp::time::Instant::now());
-        stack.with_tcp_socket(self.handle, |s| {
-            if s.may_send() {
-                // ponytail: 忽略部分写入——smoltcp send_slice 返回实际写入字节数
-                // 下次 poll 时会继续发送缓冲区中的数据
-                let _ = s.send_slice(data);
+        while !data.is_empty() {
+            stack.poll(smoltcp::time::Instant::now());
+            let (written, active) = stack.with_tcp_socket(self.handle, |s| {
+                let written = if s.may_send() { s.send_slice(data).unwrap_or(0) } else { 0 };
+                (written, s.is_active())
+            });
+            data = &data[written..];
+            if !data.is_empty() && !active {
+                // 对端已复位/关闭：残余无处可去，交由 run 循环的关闭路径收尾
+                return;
             }
-        });
+            if !data.is_empty() {
+                drop(stack);
+                tokio::time::sleep(Duration::from_millis(RELAY_POLL_MS)).await;
+                stack = self.netstack.lock().await;
+            }
+        }
         stack.poll(smoltcp::time::Instant::now());
     }
 
@@ -187,7 +201,10 @@ impl TcpRelay {
         };
 
         if !recv_data.0.is_empty() {
-            let _ = tokio::io::AsyncWriteExt::write(&mut self.to_client, &recv_data.0).await;
+            // 数据已从 smoltcp recv 缓冲 dequeue，半途 partial write = 丢数据；
+            // write_all 阻塞即背压（duplex 满 → smoltcp recv 窗口收窄 → 对端节流），
+            // 对应 Go io.Copy 全量转发语义
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut self.to_client, &recv_data.0).await;
         }
         recv_data.1
     }
