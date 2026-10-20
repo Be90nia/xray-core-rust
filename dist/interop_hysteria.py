@@ -56,9 +56,13 @@ def build_client_outbound(client_bin, P):
         return {"protocol": "hysteria",
                 "settings": {"version": 2, "address": "127.0.0.1", "port": P},
                 "streamSettings": hy_stream_go_cli()}
-    # Rust client: NoVerifier(insecure), auth 在 servers[0]
+    # Rust client: auth 在 servers[0]。Go dialer.go:327-330 语义：无 security=tls
+    # 硬错拒启（2026-10-20 起 Rust 对齐），自签证书显式 insecure 信任。
     return {"protocol": "hysteria",
-            "settings": {"servers": [{"address": "127.0.0.1", "port": P, "auth": AUTH}]}}
+            "settings": {"servers": [{"address": "127.0.0.1", "port": P, "auth": AUTH}]},
+            "streamSettings": {"network": "hysteria", "security": "tls",
+                               "hysteriaSettings": {"version": 2},
+                               "tlsSettings": {"serverName": "localhost", "insecure": True}}}
 
 
 def kill():
