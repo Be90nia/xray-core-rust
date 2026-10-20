@@ -257,7 +257,25 @@ pub async fn fetch<S: CachedNameserver>(
     let (ips, ttl, err) =
         merge_records(option, outcome.rec_v4.as_ref(), outcome.rec_v6.as_ref(), now);
     if let Some(e) = err {
-        return Err(e);
+        // bd d881②：merge 只见 rec（None 一律合成 RecordNotFound，Go
+        // getIPs(nil) 同款）——真实上游错误（超时/连接失败）在 outcome.errors，
+        // 这里透传原始错误；RecordNotFound 只留给真正的「查无此记录」（负缓存
+        // rcode 路径）。聚合形态与 merge_records 一致：同类取首条，异类合并。
+        let mut errs = outcome.errors;
+        return Err(match errs.len() {
+            0 => e,
+            1 => errs.swap_remove(0),
+            _ if errs
+                .iter()
+                .skip(1)
+                .all(|x| std::mem::discriminant(x) == std::mem::discriminant(&errs[0])) =>
+            {
+                errs.swap_remove(0)
+            },
+            _ => DnsError::SystemResolve(
+                errs.iter().map(|x| x.to_string()).collect::<Vec<_>>().join("; "),
+            ),
+        });
     }
 
     let r_ttl: u32 = if ttl > 0 { ttl as u32 } else { 1 };
@@ -514,10 +532,57 @@ mod tests {
         let cache = Arc::new(CacheController::new("test", false, false, 0, 0));
         let server = FailServer { cache: cache.clone() };
         let err = fetch(&server, "fail.example.com.", v4_only_option()).await.unwrap_err();
-        // 单家族 + rec=None → merge_records 立即返回 RecordNotFound（Go 同：
-        // getIPs(nil) = errRecordNotFound）。
-        assert!(matches!(err, DnsError::RecordNotFound), "上游失败应返回 RecordNotFound");
+        // bd d881②：单家族 + rec=None + errors=[原始错误] → 透传原始错误，
+        // 不得吞成 RecordNotFound（超时/网络失败必须对调用方可辨）。
+        assert!(
+            matches!(&err, DnsError::SystemResolve(s) if s == "upstream timeout"),
+            "上游原始错误应透传，got: {err:?}"
+        );
         assert!(cache.is_empty(), "上游失败不得写任何缓存");
+    }
+
+    /// bd d881②：双家族都失败时原始错误透传——同类取首条，异类聚合成
+    /// SystemResolve（与 merge_records 聚合形态一致）。
+    #[tokio::test]
+    async fn upstream_errors_passthrough_dual_family() {
+        struct DualFailServer {
+            cache: Arc<CacheController>,
+        }
+        impl CachedNameserver for DualFailServer {
+            fn cache_controller(&self) -> &CacheController {
+                &self.cache
+            }
+
+            async fn send_query(&self, _fqdn: &str, _option: IpOption) -> QueryOutcome {
+                QueryOutcome {
+                    rec_v4: None,
+                    rec_v6: None,
+                    errors: vec![
+                        DnsError::WireFormat("v4 timeout".into()),
+                        DnsError::EmptyResponse,
+                    ],
+                }
+            }
+        }
+
+        let cache = Arc::new(CacheController::new("test", false, false, 0, 0));
+        let server = DualFailServer { cache };
+        let err = fetch(
+            &server,
+            "dual.example.com.",
+            IpOption { ipv4_enable: true, ipv6_enable: true, fake_enable: false },
+        )
+        .await
+        .unwrap_err();
+        match err {
+            DnsError::SystemResolve(s) => {
+                assert!(
+                    s.contains("v4 timeout") && s.contains("empty response"),
+                    "异类错误应聚合，got: {s}"
+                );
+            },
+            other => panic!("expected aggregated SystemResolve, got {other:?}"),
+        }
     }
 
     #[tokio::test]

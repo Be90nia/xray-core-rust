@@ -618,6 +618,30 @@ mod tests {
         counter.add(512);
         assert_eq!(counter.value(), 512, "injected stats must count for real");
     }
+
+    /// bd d881④ 回归：dns 判定类型与实际产物（DnsService）同型——DnsService
+    /// 在场不得误报 "no dns feature configured" 并注入 DefaultDnsFeature 兜底。
+    #[test]
+    fn essential_dns_check_matches_real_dns_service() {
+        let mut inst = Instance::new();
+        let cfg: xray_app_dns::DnsAppConfig =
+            serde_json::from_str("{}").expect("empty dns config json");
+        inst.add_feature(Arc::new(xray_app_dns::DnsService::new(cfg.build().unwrap()))).unwrap();
+        ensure_essential_features(&mut inst);
+        assert!(inst.get_feature::<xray_app_dns::DnsService>().is_some());
+        assert!(
+            inst.get_feature::<xray_features::dns::DefaultDnsFeature>().is_none(),
+            "DnsService 在场时不得再注入 DefaultDnsFeature（误报修复 bd d881④）"
+        );
+    }
+
+    /// 无 dns app 时仍注入 DefaultDnsFeature 兜底（既有语义保留）。
+    #[test]
+    fn essential_dns_fallback_injected_when_absent() {
+        let mut inst = Instance::new();
+        ensure_essential_features(&mut inst);
+        assert!(inst.get_feature::<xray_features::dns::DefaultDnsFeature>().is_some());
+    }
 }
 
 /// essentialFeatures: 当配置中缺少关键 app 时，注入默认实现。
@@ -630,7 +654,10 @@ fn ensure_essential_features(inst: &mut Instance) {
         dns::DefaultDnsFeature, policy::DefaultPolicyFeature, routing::DefaultRouterFeature,
     };
 
-    if inst.get_feature::<DefaultDnsFeature>().is_none() {
+    // bd d881④：判定类型必须是实际产物 `DnsService`（register.rs dns_factory
+    // 注册的类型）。此前查 `DefaultDnsFeature` 恒 None → 每次启动误报
+    // "no dns feature configured" 并多注入一个兜底。
+    if inst.get_feature::<xray_app_dns::DnsService>().is_none() {
         tracing::info!("no dns feature configured, injecting default");
         inst.add_feature(Arc::new(DefaultDnsFeature)).ok();
     }

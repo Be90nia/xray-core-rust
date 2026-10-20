@@ -449,6 +449,57 @@ mod tests {
         assert_eq!(outcome.errors.len(), 1);
     }
 
+    /// bd d881② e2e：真实 UDP 上游 + 真实 fetch 路径——正常查询通；静默上游
+    /// 的超时错误必须原样透传（不得吞成 RecordNotFound）。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
+    async fn fetch_real_upstream_ok_then_timeout_error_passthrough() {
+        let _slot = DIALER_SLOT_LOCK.lock();
+
+        // 正常：mock 应答 → fetch Ok。
+        let (addr, _h) =
+            spawn_mock_udp_server("e2e.com.", vec![Ipv4Addr::new(7, 7, 7, 7)], 60).await;
+        let ns = UdpNameServer::new(
+            udp_dest(addr),
+            Arc::new(CacheController::new("e2e", true, false, 0, 0)),
+            Vec::new(),
+            Duration::from_secs(2),
+            Arc::new(crate::dial::SystemHostResolver),
+        );
+        let (ips, _) = crate::nameserver::cached::fetch(
+            &ns,
+            "e2e.com.",
+            IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },
+        )
+        .await
+        .unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(7, 7, 7, 7))]);
+
+        // 超时：静默 socket（保持存活，不 drop——端口无监听时 Windows 会以
+        // ICMP 不可达打断 recv，只有存活 socket 才能走确定性的 recv 超时路径）
+        // → fetch 返回原始超时错误（非 RecordNotFound）。
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let saddr = silent.local_addr().unwrap();
+        let ns = UdpNameServer::new(
+            udp_dest(saddr),
+            Arc::new(CacheController::new("e2e-slow", true, false, 0, 0)),
+            Vec::new(),
+            Duration::from_millis(150),
+            Arc::new(crate::dial::SystemHostResolver),
+        );
+        let err = crate::nameserver::cached::fetch(
+            &ns,
+            "slow.com.",
+            IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, DnsError::WireFormat(s) if s.contains("udp recv timeout")),
+            "超时错误必须原样透传，got: {err:?}"
+        );
+    }
+
     /// 4ah3：from_config 消费 NameServerConfig 的 cache 4 字段
     /// （disable_cache/serve_stale/serve_expired_ttl/negative_ttl_secs → CacheController），
     /// 即 Go nameserver.go NewServer 收全量 proto 的语义。serveExpiredTTL 存负值。
