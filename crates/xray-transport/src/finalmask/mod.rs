@@ -1526,10 +1526,8 @@ fn build_fragment_config(settings: &serde_json::Value) -> io::Result<fragment::F
     fn opt_i64(v: &serde_json::Value, key: &str) -> i64 {
         v.get(key).and_then(|x| x.as_i64()).unwrap_or(0)
     }
-    // ponytail: Go `length`/`interval` 是单值 range {from, to}；Rust 端
-    // FragmentConfig 字段是 `Vec<i64>`，单元素 = 单段 range。
-    fn opt_range1(v: &serde_json::Value, key: &str) -> (i64, i64) {
-        let r = v.get(key);
+    // 单个 range 值：Go `Int32Range` JSON（`{"from":x,"to":y}`）；数字宽容为单值。
+    fn range_pair(r: Option<&serde_json::Value>) -> (i64, i64) {
         match r {
             Some(serde_json::Value::Object(o)) => {
                 let from = o.get("from").and_then(|x| x.as_i64()).unwrap_or(0);
@@ -1543,17 +1541,79 @@ fn build_fragment_config(settings: &serde_json::Value) -> io::Result<fragment::F
             _ => (0, 0),
         }
     }
-    let (length_min, length_max) = opt_range1(settings, "length");
-    let (delay_min, delay_max) = opt_range1(settings, "interval");
+    // ponytail: Go `length`/`interval` 是单值 range {from, to}；Rust 端
+    // FragmentConfig 字段是 `Vec<i64>`，单元素 = 单段 range。
+    fn opt_range1(v: &serde_json::Value, key: &str) -> (i64, i64) {
+        range_pair(v.get(key))
+    }
+    // Go `FragmentMask` 键名对齐（transport_finalmask.go:240-247）：Go 原名
+    // `packets`/`lengths[]`/`delays[]`/`maxSplit` 优先；proto 简化名
+    // `packets_from`/`packets_to`/`interval`/`max_split` 向后兼容。
+    let (packets_from, packets_to) = match settings.get("packets").and_then(|x| x.as_str()) {
+        // Go Build :251-254："tlshello" → (0,1)（首包 ClientHello 特殊分片）。
+        Some(s) if s.eq_ignore_ascii_case("tlshello") => (0u64, 1u64),
+        // Go Build :257-264：ParseRangeString；from==0 硬错（0 会误触 tlshello 检测）。
+        Some(s) if !s.is_empty() => {
+            let (from, to) = parse_range_string(s)?;
+            if from == 0 {
+                return Err(mask_err("finalmask fragment: PacketsFrom can't be 0"));
+            }
+            (from as u64, to as u64)
+        },
+        // Go Build :255-256：空串 → (0,0)；键缺省走 proto 名。
+        _ => (opt_u64(settings, "packets_from"), opt_u64(settings, "packets_to")),
+    };
+    // Go Build :267-275：`lengths[]` 非空优先，否则单段 `length`（Go/Rust 同名）。
+    let mut lengths_min = Vec::new();
+    let mut lengths_max = Vec::new();
+    match settings.get("lengths").and_then(|x| x.as_array()) {
+        Some(entries) if !entries.is_empty() => {
+            for r in entries {
+                let (from, to) = range_pair(Some(r));
+                lengths_min.push(from);
+                lengths_max.push(to);
+            }
+        },
+        _ => {
+            let (from, to) = opt_range1(settings, "length");
+            lengths_min.push(from);
+            lengths_max.push(to);
+        },
+    }
+    // Go Build :283-291：`delays[]` 非空优先，否则单段 `delay`；proto 简化名 `interval` 兜底。
+    let mut delays_min = Vec::new();
+    let mut delays_max = Vec::new();
+    match settings.get("delays").and_then(|x| x.as_array()) {
+        Some(entries) if !entries.is_empty() => {
+            for r in entries {
+                let (from, to) = range_pair(Some(r));
+                delays_min.push(from);
+                delays_max.push(to);
+            }
+        },
+        _ => {
+            let (from, to) = match settings.get("delay") {
+                Some(d) if !d.is_null() => range_pair(Some(d)),
+                _ => opt_range1(settings, "interval"),
+            };
+            delays_min.push(from);
+            delays_max.push(to);
+        },
+    }
+    // Go Build :293-294：`maxSplit` 单段；proto 简化名 `max_split`。
+    let (max_split_min, max_split_max) = match settings.get("maxSplit") {
+        Some(m) if !m.is_null() => range_pair(Some(m)),
+        _ => (opt_i64(settings, "max_split"), opt_i64(settings, "max_split")),
+    };
     Ok(fragment::FragmentConfig {
-        packets_from: opt_u64(settings, "packets_from"),
-        packets_to: opt_u64(settings, "packets_to"),
-        max_split_min: opt_i64(settings, "max_split"),
-        max_split_max: opt_i64(settings, "max_split"),
-        lengths_min: vec![length_min],
-        lengths_max: vec![length_max],
-        delays_min: vec![delay_min],
-        delays_max: vec![delay_max],
+        packets_from,
+        packets_to,
+        max_split_min,
+        max_split_max,
+        lengths_min,
+        lengths_max,
+        delays_min,
+        delays_max,
     })
 }
 
@@ -2337,6 +2397,62 @@ mod tests {
             ]}"#);
         let mgr = build_tcpmask_manager_from_json(Some(&json)).unwrap();
         assert_eq!(mgr.tcpmasks.len(), 4);
+    }
+
+    #[test]
+    fn fragment_config_go_style_keys_parse() {
+        // Go FragmentMask 原名（transport_finalmask.go:240-247）：packets 字符串 range /
+        // lengths[] / delays[] / maxSplit。修复前这些键整段被静默丢弃（只读 proto 名）。
+        let cfg = build_fragment_config(&fm(
+            r#"{"packets":"tlshello","lengths":[{"from":10,"to":20},{"from":30,"to":40}],
+                "delays":[{"from":5,"to":10}],"maxSplit":{"from":2,"to":4}}"#,
+        ))
+        .unwrap();
+        println!("go-style fragment dump: {cfg:#?}");
+        assert_eq!((cfg.packets_from, cfg.packets_to), (0, 1));
+        assert_eq!(cfg.lengths_min, vec![10, 30]);
+        assert_eq!(cfg.lengths_max, vec![20, 40]);
+        assert_eq!(cfg.delays_min, vec![5]);
+        assert_eq!(cfg.delays_max, vec![10]);
+        assert_eq!((cfg.max_split_min, cfg.max_split_max), (2, 4));
+        // packets 数字 range 字符串走 Go ParseRangeString（"1-3" → from=1, to=3）。
+        let cfg = build_fragment_config(&fm(r#"{"packets":"1-3"}"#)).unwrap();
+        assert_eq!((cfg.packets_from, cfg.packets_to), (1, 3));
+        // Go Build :263-264：range 字符串 from==0 硬错。
+        let err = build_fragment_config(&fm(r#"{"packets":"0-3"}"#)).unwrap_err();
+        assert!(err.to_string().contains("PacketsFrom can't be 0"), "got: {err}");
+    }
+
+    #[test]
+    fn fragment_config_proto_style_keys_compat() {
+        // proto 简化名（packets_from/packets_to/length/interval/max_split）向后兼容不回归。
+        let cfg = build_fragment_config(&fm(
+            r#"{"packets_from":0,"packets_to":1,"length":{"from":100,"to":200},
+                "interval":{"from":7,"to":9},"max_split":3}"#,
+        ))
+        .unwrap();
+        assert_eq!((cfg.packets_from, cfg.packets_to), (0, 1));
+        assert_eq!(cfg.lengths_min, vec![100]);
+        assert_eq!(cfg.lengths_max, vec![200]);
+        assert_eq!(cfg.delays_min, vec![7]);
+        assert_eq!(cfg.delays_max, vec![9]);
+        assert_eq!((cfg.max_split_min, cfg.max_split_max), (3, 3));
+    }
+
+    #[test]
+    fn fragment_config_go_names_take_priority() {
+        // 双名同现：Go 原名优先（Go FragmentMask 字段语义；proto 名是 Rust 简化名）。
+        let cfg = build_fragment_config(&fm(r#"{"packets":"1-3","packets_from":9,"packets_to":9,
+                "lengths":[{"from":10,"to":10}],"length":{"from":99,"to":99},
+                "delays":[{"from":1,"to":2}],"delay":{"from":3,"to":3},"interval":{"from":8,"to":8},
+                "maxSplit":{"from":2,"to":3},"max_split":7}"#))
+        .unwrap();
+        assert_eq!((cfg.packets_from, cfg.packets_to), (1, 3), "packets wins over proto name");
+        assert_eq!(cfg.lengths_min, vec![10], "lengths[] wins over length");
+        assert_eq!(cfg.lengths_max, vec![10]);
+        assert_eq!(cfg.delays_min, vec![1], "delays[] wins over delay/interval");
+        assert_eq!(cfg.delays_max, vec![2]);
+        assert_eq!((cfg.max_split_min, cfg.max_split_max), (2, 3), "maxSplit wins over max_split");
     }
 
     #[test]
