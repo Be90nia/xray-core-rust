@@ -286,7 +286,11 @@ impl Instance {
         for feat in &self.features {
             feat.start()?;
         }
-        tracing::info!(version = super::version(), "Xray instance started");
+        // 注意：本方法只启动 feature，inbound listener 由调用方随后绑定
+        // （functions.rs::start_full_dispatched → spawn_inbounds）。此日志若写成
+        // "started" 会在 bind 失败前先打出「已启动」，监管方按 stdout 判活会误判
+        // （2026-10-20 bind 冲突现场：先 started、后 bind failed aborting）。
+        tracing::info!(version = super::version(), "Xray instance initialized (features started; inbounds bound by caller)");
         Ok(())
     }
 
