@@ -811,7 +811,8 @@ mod udp_assoc_tests {
                 let mut writer = link.writer;
                 while let Ok(mb) = reader.read_multi_buffer().await {
                     if mb.is_empty() {
-                        continue;
+                        // EOF（空 MultiBuffer 约定）——continue 会自旋（bd 8cry 同类）
+                        break;
                     }
                     if writer.write_multi_buffer(mb).await.is_err() {
                         break;
