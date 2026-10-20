@@ -116,8 +116,12 @@ pub fn create_ipc_request(config: &DeviceConfig) -> String {
             out.push('\n');
         }
 
-        if peer.keep_alive != 0 {
-            out.push_str(&format!("persistent_keepalive_interval={}\n", peer.keep_alive));
+        // Go client.go:190-192：`if peer.KeepAlive != ""` 原样拼接（十进制字符串
+        // 语义在 JSON→proto 层完成，FormatUint 见 infra/conf/wireguard.go:47-48）。
+        if !peer.keep_alive.is_empty() {
+            out.push_str("persistent_keepalive_interval=");
+            out.push_str(&peer.keep_alive);
+            out.push('\n');
         }
     }
 
@@ -253,7 +257,7 @@ mod tests {
                 public_key: "11".repeat(16),
                 pre_shared_key: "22".repeat(16),
                 endpoint: "1.2.3.4:51820".into(),
-                keep_alive: 25,
+                keep_alive: "25".to_string(),
                 allowed_ips: vec!["0.0.0.0/0".into(), "::/0".into()],
                 level: 0,
                 email: String::new(),
@@ -278,7 +282,7 @@ mod tests {
                 public_key: String::new(),     // 空，跳过
                 pre_shared_key: String::new(), // 空，跳过
                 endpoint: String::new(),       // 空，跳过
-                keep_alive: 0,                 // 0，跳过
+                keep_alive: String::new(),     // 空，跳过
                 allowed_ips: vec![],
                 level: 0,
                 email: String::new(),

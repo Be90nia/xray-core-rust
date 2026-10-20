@@ -6470,6 +6470,7 @@ dependencies = [
  "bytes",
  "hex",
  "parking_lot",
+ "prost",
  "rand 0.9.4",
  "serde_json",
  "smoltcp",
