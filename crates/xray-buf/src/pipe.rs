@@ -15,10 +15,9 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    task::{Context, Poll},
     time::Duration,
 };
-
-use tokio::sync::Notify;
 
 use crate::{
     io::{Error, Reader as BufReader, Result, Writer as BufWriter},
@@ -26,32 +25,65 @@ use crate::{
 };
 
 /// 计数信号量：signal 累积 permit，wait 消费 permit。
-/// 对应 Go common/signal/notifier.go：notify_one() 在 tokio::sync::Notify 上不累积，
-/// 多次写只产生 1 个 permit，导致后续读额 read 端锁死。这里在 Notify 之上加一个计数器，
-/// wait 先消费已有 count，未消费才 await notify。
+/// 对应 Go common/signal/notifier.go：多次写产生多个 signal，读端逐次消费
+/// （Go `Notifier.Wait` 的 `Swap(0)>0 return nil chan` 语义）。
+///
+/// **waker 槽（bd 34nk）**：poll-based 等待（读/写端直驱
+/// `poll_read_multi_buffer` / `poll_write_multi_buffer`）下，等待 future 若
+/// 每次 poll 重建，其内部 waiter 注册随 future drop 销毁——后到的 signal 只
+/// 剩计数、不再有任何 waker → 读端永久失唤醒（只能等调用方自己的超时轮询）。
+/// waker 存槽跨 poll 存活，注册持续有效；signal 时取走唤醒。
 struct CountingNotify {
     count: AtomicU64,
-    notify: Notify,
+    /// poll 等待的 waker 槽（跨 poll 存活）。
+    /// 用**列表**而非单槽：pipe 允许多写者/多读者（Go pipe 语义），单槽会让
+    /// 其余等待者永不被唤醒（close 时全体挂起 = 死锁）。
+    wakers: parking_lot::Mutex<Vec<std::task::Waker>>,
 }
 
 impl CountingNotify {
     fn new() -> Self {
-        Self { count: AtomicU64::new(0), notify: Notify::new() }
+        Self { count: AtomicU64::new(0), wakers: parking_lot::Mutex::new(Vec::new()) }
     }
 
-    /// 发一个 signal，计数 +1。多次 signal 会累积。
+    /// 发一个 signal，计数 +1。多次 signal 会累积；首个 signal 唤醒等待者。
     fn signal(&self) {
-        self.count.fetch_add(1, Ordering::SeqCst);
-        self.notify.notify_one();
+        if self.count.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.wake_all();
+        }
     }
 
-    /// 等待 signal：swap 全部 count，如果 >0 立即返回；否则 await notify。
-    /// 对应 Go Notifier.Wait 的 `Swap(0)>0 return nil chan` 语义。
-    async fn wait(&self) {
-        if self.count.swap(0, Ordering::SeqCst) > 0 {
-            return;
+    /// 唤醒全部等待者（signal 与 close 路径共用）。
+    fn wake_all(&self) {
+        let wakers = std::mem::take(&mut *self.wakers.lock());
+        for w in wakers {
+            w.wake();
         }
-        self.notify.notified().await;
+    }
+
+    /// 注册 waker（跨 poll 存活）：同一任务重复 poll 覆盖旧条目，不堆积。
+    fn register(&self, waker: &std::task::Waker) {
+        let mut wakers = self.wakers.lock();
+        match wakers.iter_mut().find(|w| w.will_wake(waker)) {
+            Some(slot) => *slot = waker.clone(),
+            None => wakers.push(waker.clone()),
+        }
+    }
+
+    /// 等待 signal：swap 全部 count，如果 >0 立即返回；否则挂起等唤醒。
+    /// 对应 Go Notifier.Wait 的 `Swap(0)>0 return nil chan` 语义。
+    /// waker 存槽跨 poll 保活（读/写端 poll 直驱的性命攸关语义，见结构注释）。
+    /// 返回 true = 有 signal 待消费。
+    fn poll_wait(&self, cx: &mut Context<'_>) -> bool {
+        if self.count.swap(0, Ordering::SeqCst) > 0 {
+            return true;
+        }
+        self.register(cx.waker());
+        // 双检：注册窗口内到达的 signal 直接消费（防丢唤醒）
+        if self.count.swap(0, Ordering::SeqCst) > 0 {
+            return true;
+        }
+        false
     }
 }
 
@@ -103,9 +135,7 @@ struct PipeShared {
     /// 读端通知写端：缓冲有空间可写。
     write_signal: CountingNotify,
     /// close 信号。false = open，true = closed/errord。
-    /// 用 AtomicBool + Notify：notify_waiters 通知所有 waiter。
     closed: AtomicBool,
-    closed_notify: Notify,
     /// 错误注入槽（ReturnAnError/Recover）。
     /// ponytail: Go 用 buffered channel（阻塞 send），这里用 slot 非阻塞覆盖。
     /// 行为差异：重复 return_an_error 会覆盖（Go 阻塞）。实际使用成对调用，覆盖语义不影响。
@@ -121,24 +151,11 @@ impl PipeShared {
     /// 标记 close 并通知所有等待者。幂等。
     fn mark_closed(&self) {
         if !self.closed.swap(true, Ordering::SeqCst) {
-            self.closed_notify.notify_waiters();
-        }
-    }
-
-    async fn wait_close(shared: Arc<PipeShared>) {
-        if shared.is_closed() {
-            return;
-        }
-        loop {
-            // 先 register notified 再 check，避免 race（notify_waiters 不创建 permit）。
-            let notified = shared.closed_notify.notified();
-            if shared.is_closed() {
-                return;
-            }
-            notified.await;
-            if shared.is_closed() {
-                return;
-            }
+            // 唤醒 poll-based 等待者：close 不是数据 signal，但等待中的读/写端
+            // 必须醒来才能看到状态变化（否则 close 后仍挂到外部超时；多写者
+            // 全挂 = 死锁）。
+            self.read_signal.wake_all();
+            self.write_signal.wake_all();
         }
     }
 }
@@ -161,26 +178,36 @@ pub fn new_with_option(option: PipeOption) -> (Reader, Writer) {
         read_signal: CountingNotify::new(),
         write_signal: CountingNotify::new(),
         closed: AtomicBool::new(false),
-        closed_notify: Notify::new(),
         err_slot: parking_lot::Mutex::new(None),
     });
-    (Reader(shared.clone()), Writer(shared))
+    (Reader { shared: shared.clone(), idle: None }, Writer(shared))
 }
 
 // ========== Reader ==========
 
 /// Pipe 读端。对应 Go `transport/pipe.Reader`。
-#[derive(Clone)]
-pub struct Reader(Arc<PipeShared>);
+pub struct Reader {
+    shared: Arc<PipeShared>,
+    /// idle timeout 定时器（跨 poll 存活；读成功即重置）。
+    /// 必须跨 poll 存活：每次 poll 重建的 sleep 永远等不到超时（poll 不再回来）。
+    idle: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl Clone for Reader {
+    fn clone(&self) -> Self {
+        // 克隆体各自持有独立 idle deadline（读端本就单消费者语义）。
+        Self { shared: self.shared.clone(), idle: None }
+    }
+}
 
 impl Reader {
-    /// 异步读 MultiBuffer。空且未关闭时阻塞；close 后 buffered 读完返回 EOF；
-    /// interrupt 后 buffered 已被丢弃，立即返回错误。
-    pub async fn read_multi_buffer(&mut self) -> Result<MultiBuffer> {
+    /// poll 形态读：waker 注册持久于共享槽（跨 poll 存活）——数据/close 到达
+    /// 即真实唤醒读端，而不是等调用方自己的超时轮询（bd 34nk）。
+    fn poll_read(&mut self, cx: &mut Context<'_>) -> Poll<Result<MultiBuffer>> {
         loop {
             // 取 buffered 数据
             let (data, idle_timeout) = {
-                let mut inner = self.0.inner.lock();
+                let mut inner = self.shared.inner.lock();
                 let data = if !inner.data.is_empty() {
                     std::mem::take(&mut inner.data)
                 } else {
@@ -190,46 +217,63 @@ impl Reader {
             };
 
             if !data.is_empty() {
-                self.0.write_signal.signal();
-                return Ok(data);
+                // 读端腾出空间 → 唤醒等待中的写端
+                self.shared.write_signal.signal();
+                // 读成功 → 重置 idle deadline
+                self.idle = None;
+                return Poll::Ready(Ok(data));
             }
 
             // 空，检查状态
             {
-                let inner = self.0.inner.lock();
+                let inner = self.shared.inner.lock();
                 match inner.state {
                     State::Open => {},
-                    State::Closed => return Err(Error::Eof),
-                    State::Errord => return Err(Error::WriteError("pipe interrupted".into())),
+                    State::Closed => return Poll::Ready(Err(Error::Eof)),
+                    State::Errord => {
+                        return Poll::Ready(Err(Error::WriteError("pipe interrupted".into())));
+                    },
                 }
             }
 
             // 检查错误槽
             {
-                let mut slot = self.0.err_slot.lock();
+                let mut slot = self.shared.err_slot.lock();
                 if let Some(err) = slot.take() {
-                    return Err(err);
+                    return Poll::Ready(Err(err));
                 }
             }
 
-            // 等待任一信号（可选 idle timeout）
-            let shared = self.0.clone();
+            // 等待：注册 waker（持久槽）+ 双检；close 与数据 signal 同源唤醒
+            let sig_fired = self.shared.read_signal.poll_wait(cx);
+            let closed_now = self.shared.is_closed();
+
+            // idle timeout：定时器跨 poll 存活（否则永远等不到超时）
             if let Some(timeout) = idle_timeout {
-                tokio::select! {
-                    _ = self.0.read_signal.wait() => continue,
-                    _ = PipeShared::wait_close(shared) => continue,
-                    _ = tokio::time::sleep(timeout) => {
-                        // idle timeout：读端超时无数据，返回 EOF
-                        return Err(Error::Eof);
-                    }
+                if self.idle.is_none() {
+                    self.idle = Some(Box::pin(tokio::time::sleep(timeout)));
                 }
-            } else {
-                tokio::select! {
-                    _ = self.0.read_signal.wait() => continue,
-                    _ = PipeShared::wait_close(shared) => continue,
+                let fired = match self.idle.as_mut() {
+                    Some(sleep) => sleep.as_mut().poll(cx).is_ready(),
+                    None => false,
+                };
+                if fired {
+                    self.idle = None;
+                    return Poll::Ready(Err(Error::Eof));
                 }
             }
+
+            if sig_fired || closed_now {
+                continue;
+            }
+            return Poll::Pending;
         }
+    }
+
+    /// 异步读 MultiBuffer。空且未关闭时阻塞；close 后 buffered 读完返回 EOF；
+    /// interrupt 后 buffered 已被丢弃，立即返回错误。
+    pub async fn read_multi_buffer(&mut self) -> Result<MultiBuffer> {
+        std::future::poll_fn(|cx| self.poll_read(cx)).await
     }
 
     /// 带超时的读。超时返回 [`Error::TimeoutError`]。
@@ -243,7 +287,7 @@ impl Reader {
     /// 中断 pipe，丢弃所有 buffered data。状态转为 `Errord`。
     /// 后续读返回 `WriteError`，写也返回 `WriteError`。
     pub fn interrupt(&self) {
-        Self::interrupt_shared(&self.0);
+        Self::interrupt_shared(&self.shared);
     }
 
     fn interrupt_shared(shared: &Arc<PipeShared>) {
@@ -264,18 +308,18 @@ impl Reader {
 
     /// 注入一个错误，使下一次 read 返回该错误。
     pub fn return_an_error(&self, err: Error) {
-        let mut slot = self.0.err_slot.lock();
+        let mut slot = self.shared.err_slot.lock();
         *slot = Some(err);
     }
 
     /// 取出注入的错误（如果有）。
     pub fn recover(&self) -> Option<Error> {
-        self.0.err_slot.lock().take()
+        self.shared.err_slot.lock().take()
     }
 
     /// 当前 buffered 字节数。
     pub fn len(&self) -> usize {
-        self.0.inner.lock().data.len()
+        self.shared.inner.lock().data.len()
     }
 
     /// 是否为空。
@@ -285,7 +329,7 @@ impl Reader {
 
     /// 是否已关闭（close 或 interrupt）。
     pub fn is_closed(&self) -> bool {
-        self.0.is_closed()
+        self.shared.is_closed()
     }
 }
 
@@ -294,6 +338,11 @@ impl BufReader for Reader {
         &mut self,
     ) -> Pin<Box<dyn Future<Output = Result<MultiBuffer>> + Send + '_>> {
         Box::pin(async move { Reader::read_multi_buffer(self).await })
+    }
+
+    /// poll 覆写：waker 持久注册于共享槽（丢唤醒修复的落点）。
+    fn poll_read_multi_buffer(&mut self, cx: &mut Context<'_>) -> Poll<Result<MultiBuffer>> {
+        Reader::poll_read(self, cx)
     }
 }
 
@@ -309,19 +358,19 @@ enum WriteAction {
     Done,
     /// 缓冲满，等待读端腾空间。
     Wait,
+    /// 缓冲满且 discard_overflow：丢弃数据。
+    Discard,
     /// pipe 已关闭/中断，丢弃 mb 返回错误。
     Err,
 }
 
 impl Writer {
-    /// 写 MultiBuffer 到 pipe。缓冲满时阻塞，除非 `discard_overflow=true`。
-    /// 关闭后写返回 `WriteError`。
-    pub async fn write_multi_buffer(&mut self, mb: MultiBuffer) -> Result<()> {
+    /// poll 形态写：管道满时挂起并把 waker 持久注册于共享槽——读端腾出空间
+    /// 即真实唤醒写端（bd 34nk）。数据留在 `mb` 里（Pending 不丢数据）。
+    fn poll_write(&mut self, cx: &mut Context<'_>, mb: &mut MultiBuffer) -> Poll<Result<()>> {
         if mb.is_empty() {
-            return Ok(());
+            return Poll::Ready(Ok(()));
         }
-        // 用 Option 持有 mb，merge 时 take。避免 loop 中重复 move。
-        let mut mb_slot = Some(mb);
         loop {
             let action = {
                 let mut inner = self.0.inner.lock();
@@ -329,14 +378,12 @@ impl Writer {
                     State::Open => {
                         if inner.option.is_full(inner.data.len()) {
                             if inner.option.discard_overflow {
-                                if let Some(mut m) = mb_slot.take() {
-                                    m.release();
-                                }
-                                return Ok(());
+                                WriteAction::Discard
+                            } else {
+                                WriteAction::Wait
                             }
-                            WriteAction::Wait
                         } else {
-                            let m = mb_slot.take().expect("mb consumed twice");
+                            let m = std::mem::take(mb);
                             inner.data.merge(m);
                             WriteAction::Done
                         }
@@ -348,28 +395,34 @@ impl Writer {
             match action {
                 WriteAction::Done => {
                     self.0.read_signal.signal();
-                    return Ok(());
+                    return Poll::Ready(Ok(()));
+                },
+                WriteAction::Discard => {
+                    mb.release();
+                    return Poll::Ready(Ok(()));
                 },
                 WriteAction::Err => {
-                    if let Some(mut m) = mb_slot.take() {
-                        m.release();
-                    }
-                    return Err(Error::WriteError("closed pipe".into()));
+                    mb.release();
+                    return Poll::Ready(Err(Error::WriteError("closed pipe".into())));
                 },
                 WriteAction::Wait => {
-                    let shared = self.0.clone();
-                    tokio::select! {
-                        _ = self.0.write_signal.wait() => continue,
-                        _ = PipeShared::wait_close(shared) => {
-                            if let Some(mut m) = mb_slot.take() {
-                                m.release();
-                            }
-                            return Err(Error::WriteError("closed pipe".into()));
-                        }
+                    // 注册写端 waker（持久槽）+ 双检；读端取走数据即 signal
+                    let sig_fired = self.0.write_signal.poll_wait(cx);
+                    let closed_now = self.0.is_closed();
+                    if sig_fired || closed_now {
+                        continue;
                     }
+                    return Poll::Pending;
                 },
             }
         }
+    }
+
+    /// 写 MultiBuffer 到 pipe。缓冲满时阻塞，除非 `discard_overflow=true`。
+    /// 关闭后写返回 `WriteError`。
+    pub async fn write_multi_buffer(&mut self, mb: MultiBuffer) -> Result<()> {
+        let mut mb = mb;
+        std::future::poll_fn(|cx| self.poll_write(cx, &mut mb)).await
     }
 
     /// 关闭 pipe。读端读完 buffered 后返回 EOF。多次调用幂等。
@@ -415,6 +468,15 @@ impl BufWriter for Writer {
         mb: MultiBuffer,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move { Writer::write_multi_buffer(self, mb).await })
+    }
+
+    /// poll 覆写：管道满时 waker 持久注册于共享槽（丢唤醒修复的落点）。
+    fn poll_write_multi_buffer(
+        &mut self,
+        cx: &mut Context<'_>,
+        mb: &mut MultiBuffer,
+    ) -> Poll<Result<()>> {
+        Writer::poll_write(self, cx, mb)
     }
 
     fn shutdown(&self) {
@@ -803,5 +865,89 @@ mod tests {
         let mut r2 = r2;
         let out = r2.read_multi_buffer().await.unwrap();
         assert_eq!(out.to_vec(), b"shared");
+    }
+
+    // ========== poll-once 丢唤醒回归（bd 34nk） ==========
+
+    /// 唤醒计数器：验证「数据到达后读端确实被唤醒」，而不是只靠外部超时轮询。
+    #[derive(Default)]
+    struct WakeCounter {
+        count: AtomicU64,
+    }
+
+    impl std::task::Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// 回归（bd 34nk）：「poll 一次即丢 future」的读法（`LinkStream::poll_read`
+    /// 形态）下，写端写入后读端必须被唤醒。
+    ///
+    /// 修复前：pipe 读端在 `select!` 里 await `Notify::notified()`，注册随
+    /// future 丢弃销毁 → 写端 `signal()` 只剩计数、无 waker 可唤醒 → 读端
+    /// 永久失唤醒（只能等调用方自己的超时轮询）。
+    #[tokio::test]
+    async fn test_poll_once_reader_woken_by_write() {
+        let (mut r, mut w) = new();
+        let counter = Arc::new(WakeCounter::default());
+        let waker = std::task::Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        // 第一次 poll：空管道 → Pending（future 立即丢弃）
+        let got = {
+            let mut fut = BufReader::read_multi_buffer(&mut r);
+            fut.as_mut().poll(&mut cx)
+        };
+        assert!(got.is_pending(), "空管道读端应 Pending");
+
+        // 写端写入 → 读端必须被唤醒
+        w.write_multi_buffer(mb(b"hello")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            counter.count.load(Ordering::SeqCst) > 0,
+            "写端写入后读端未被唤醒（丢唤醒）：数据只能等外部超时轮询才被取走"
+        );
+
+        // 再 poll 一次应拿到数据
+        let got = {
+            let mut fut = BufReader::read_multi_buffer(&mut r);
+            fut.as_mut().poll(&mut cx)
+        };
+        match got {
+            Poll::Ready(Ok(data)) => assert_eq!(data.to_vec(), b"hello"),
+            Poll::Ready(Err(e)) => panic!("期望读到数据，实际错误：{e}"),
+            Poll::Pending => panic!("期望读到数据，实际 Pending"),
+        }
+    }
+
+    /// 回归（bd 34nk）：对称场景——管道满时写端 Pending（future 丢弃），
+    /// 读端取走数据腾出空间后写端必须被唤醒。
+    #[tokio::test]
+    async fn test_poll_once_writer_woken_when_reader_drains() {
+        let opt = PipeOption { limit: 10, ..PipeOption::default() };
+        let (mut r, mut w) = new_with_option(opt);
+        // 填满管道（11 > limit=10）
+        w.write_multi_buffer(mb(&[0u8; 11])).await.unwrap();
+
+        let counter = Arc::new(WakeCounter::default());
+        let waker = std::task::Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        // 写端 poll：管道满 → Pending（future 立即丢弃；本次只验证唤醒语义）
+        let got = {
+            let mut fut = BufWriter::write_multi_buffer(&mut w, mb(b"more"));
+            fut.as_mut().poll(&mut cx)
+        };
+        assert!(got.is_pending(), "满管道写端应 Pending");
+
+        // 读端取走数据 → 写端必须被唤醒
+        let data = r.read_multi_buffer().await.unwrap();
+        assert_eq!(data.len(), 11);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            counter.count.load(Ordering::SeqCst) > 0,
+            "读端腾出空间后写端未被唤醒（丢唤醒）：写入只能等外部超时轮询才推进"
+        );
     }
 }

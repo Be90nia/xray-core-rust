@@ -128,6 +128,11 @@ pub fn set_shared_dialer(dialer: Option<Arc<dyn QueryDialer>>) {
     *SHARED_DIALER.write() = dialer;
 }
 
+/// 测试用：共享 dialer 槽是**进程级全局**，涉槽测试必须串行——全 crate 共用
+/// 这一把锁（各模块各持一把锁 = 槽仍会被别的模块的测试改写，跨模块串扰）。
+#[cfg(test)]
+pub(crate) static DIALER_SLOT_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 /// 惰性取用（DNS app 可能先于 dispatcher 构建）。
 pub fn shared_dialer() -> Option<Arc<dyn QueryDialer>> {
     SHARED_DIALER.read().clone()
@@ -170,10 +175,10 @@ impl AsyncRead for LinkStream {
                 // pending 非空但无字节（全空 buffer）：释放后驱动底层。
                 this.pending.release();
             }
-            let got = {
-                let mut fut = this.reader.read_multi_buffer();
-                fut.as_mut().poll(cx)
-            };
+            // poll 形态直驱：每次 poll 重建并丢弃 read future 会让 pipe 的
+            // waiter 注册随 future 销毁 → 下行数据到达不再唤醒读端（丢唤醒，
+            // bd 34nk）。`poll_read_multi_buffer` 的 waker 注册持久于共享槽。
+            let got = xray_buf::io::Reader::poll_read_multi_buffer(&mut this.reader, cx);
             match got {
                 Poll::Ready(Ok(mb)) => {
                     if mb.is_empty() {
@@ -205,10 +210,8 @@ impl AsyncWrite for LinkStream {
         let this = self.get_mut();
         let mut mb = MultiBuffer::new();
         mb.write_from(buf);
-        let got = {
-            let mut fut = this.writer.write_multi_buffer(mb);
-            fut.as_mut().poll(cx)
-        };
+        // 同 poll_read：写端直驱 poll 形态，管道满时 waker 持久注册（bd 34nk）。
+        let got = xray_buf::io::Writer::poll_write_multi_buffer(&mut this.writer, cx, &mut mb);
         match got {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
             Poll::Ready(Err(xray_buf::io::Error::Eof)) => {
@@ -282,10 +285,7 @@ pub(crate) async fn resolve_dest_addr(
     resolver: &dyn HostResolver,
 ) -> io::Result<SocketAddr> {
     let addrs = resolve_dest_addrs(dest, resolver).await?;
-    addrs
-        .into_iter()
-        .next()
-        .ok_or_else(|| io::Error::other("resolver returned no address"))
+    addrs.into_iter().next().ok_or_else(|| io::Error::other("resolver returned no address"))
 }
 
 /// 建立查询用 TCP 流：共享 dialer 在场经路由出站（Go nameserver.go:41-78
@@ -300,33 +300,32 @@ pub(crate) async fn connect_stream(
     resolver: &dyn HostResolver,
     query_timeout: Duration,
     what: &str,
-    // bd ypsl P0：原 `force_local`——共享拨号器停摆期间语义恒直连；恢复共享拨号
-    // 时改回原名并还原下方被注释的分支。
-    _force_local: bool,
+    force_local: bool,
 ) -> Result<DnsStream, crate::error::DnsError> {
-    // 恢复共享拨号分支（管线根因修复后）：
-    // if !force_local {
-    //     if let Some(dialer) = shared_dialer() {
-    //         return tokio::time::timeout(query_timeout, dialer.dial_tcp(dest))
-    //             .await
-    //             .map_err(|_| crate::error::DnsError::WireFormat(format!(
-    //                 "{what} dial timeout after {query_timeout:?}"
-    //             )))?
-    //             .map_err(|e| crate::error::DnsError::WireFormat(format!("{what} dial: {e}")));
-    //     }
-    // }
-    let addrs = resolve_dest_addrs(dest, resolver)
-        .await
-        .map_err(|e| {
-            tracing::debug!(target: "xray.dns.doh", what = %what, error = %e, "doh: resolve failed");
-            crate::error::DnsError::WireFormat(format!("{what} resolve: {e}"))
-        })?;
+    // 共享 dialer 在场且非 `+local` → 查询经路由出站（Go nameserver.go:41-78
+    // 查询 ctx 带路由语义；bd mcpo）。`+local` 绕过 dialer 强制直连（Go Local
+    // mode 传 nil dispatcher 的等价语义，bd wmdn②）。
+    if !force_local {
+        if let Some(dialer) = shared_dialer() {
+            return tokio::time::timeout(query_timeout, dialer.dial_tcp(dest))
+                .await
+                .map_err(|_| {
+                    crate::error::DnsError::WireFormat(format!(
+                        "{what} dial timeout after {query_timeout:?}"
+                    ))
+                })?
+                .map_err(|e| crate::error::DnsError::WireFormat(format!("{what} dial: {e}")));
+        }
+    }
+    let addrs = resolve_dest_addrs(dest, resolver).await.map_err(|e| {
+        tracing::debug!(target: "xray.dns.doh", what = %what, error = %e, "doh: resolve failed");
+        crate::error::DnsError::WireFormat(format!("{what} resolve: {e}"))
+    })?;
     // 多地址顺序尝试（bd ypsl：解析 v6 优先而本机 v6 不可达时回退后续地址；
     // Go net.Dialer 同语义）。
     let mut last_err: Option<io::Error> = None;
     for sock_addr in &addrs {
-        match tokio::time::timeout(query_timeout, tokio::net::TcpStream::connect(sock_addr)).await
-        {
+        match tokio::time::timeout(query_timeout, tokio::net::TcpStream::connect(sock_addr)).await {
             Ok(Ok(tcp)) => {
                 return Ok(Box::new(xray_transport::connection::TcpConnection::new(tcp)));
             },
@@ -345,9 +344,7 @@ pub(crate) async fn connect_stream(
     Err(crate::error::DnsError::WireFormat(format!(
         "{what} dial failed after {} addr(s): {}",
         addrs.len(),
-        last_err
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "no address attempted".into())
+        last_err.map(|e| e.to_string()).unwrap_or_else(|| "no address attempted".into())
     )))
 }
 
@@ -360,9 +357,8 @@ mod tests {
     use xray_transport::link::Link;
 
     use super::*;
-
-    /// 共享 dialer 槽是进程级全局：涉槽测试须串行（udp.rs DIALER_SLOT_LOCK 同款）。
-    static DIALER_SLOT_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    /// 共享 dialer 槽是进程级全局：涉槽测试须串行（全 crate 共用一把锁）。
+    use crate::dial::DIALER_SLOT_LOCK;
 
     /// 记录调用次数的 dialer：任何拨号都计数并返回错误（走不到真流）。
     struct MarkingDialer {
@@ -391,10 +387,10 @@ mod tests {
         }
     }
 
-    /// bd wmdn② 回归 + ypsl P0：共享 dialer 在场时，`force_local=true` 的查询绕过
-    /// dialer 强制直连（Go nameserver.go:51-61 Local mode 传 nil dispatcher）。
-    /// ypsl P0（doh-h2-deepdive）：管线停摆期间 `force_local=false` 也暂直连——
-    /// 两种取值都不得走共享 dialer（恢复共享拨号时回滚第二段断言）。
+    /// bd wmdn② 回归：共享 dialer 在场时，`force_local=true`（`+local`）的查询
+    /// 绕过 dialer 强制直连（Go nameserver.go:51-61 Local mode 传 nil
+    /// dispatcher）；`force_local=false` 的查询必须经共享 dialer 路由出站
+    /// （bd mcpo 验收②，bd 34nk 回滚 P0 旁路后恢复）。
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
     async fn connect_stream_force_local_bypasses_shared_dialer() {
@@ -414,12 +410,17 @@ mod tests {
         drop(stream);
         assert_eq!(dialer.calls.load(Ordering::SeqCst), 0, "force_local 不得走共享 dialer");
 
-        // force_local=false：P0 期间同样直连成功，dialer 不被调用。
-        let stream = connect_stream(&dest, &resolver, Duration::from_secs(2), "tcp", false)
-            .await
-            .expect("P0 期间非 local 也应直连（IP 目标无需解析）");
-        drop(stream);
-        assert_eq!(dialer.calls.load(Ordering::SeqCst), 0, "P0 期间不得走共享 dialer");
+        // force_local=false：必须走共享 dialer（dialer 故意返回错误 → 查询失败）。
+        let err = match connect_stream(&dest, &resolver, Duration::from_secs(2), "tcp", false).await
+        {
+            Ok(_) => panic!("force_local=false 应走共享 dialer（dialer 返回错误）"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(&err, crate::error::DnsError::WireFormat(s) if s.contains("dialer invoked")),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(dialer.calls.load(Ordering::SeqCst), 1, "非 local 查询必须走共享 dialer");
 
         set_shared_dialer(None);
     }
@@ -495,5 +496,40 @@ mod tests {
         writer_task.await.unwrap();
         assert_eq!(received.len(), 100_000);
         assert!(received.iter().all(|&b| b == 0xA5));
+    }
+
+    /// 回归（bd 34nk）：LinkStream 读端必须被下行 pipe 数据唤醒。
+    ///
+    /// 修复前 `LinkStream::poll_read` 每次 poll 新建并丢弃 read future →
+    /// pipe 读端 `Notify` waiter 注册随 future 丢弃销毁 → 下行数据到达不再
+    /// 唤醒读端（DoH 应答被压到调用方 `query_timeout` 才交付，4s 台阶）。
+    #[tokio::test]
+    async fn link_stream_pipe_read_woken_by_downlink_data() {
+        let (dn_r, mut dn_w) = xray_buf::pipe::new();
+        let (_up_r, up_w) = xray_buf::pipe::new();
+        let mut stream = LinkStream::new(Box::new(dn_r), Box::new(up_w));
+
+        // 下行数据稍后到达（模拟 dispatcher 管线回包）
+        let writer_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let mut mb = MultiBuffer::new();
+            mb.write_from(b"hello");
+            dn_w.write_multi_buffer(mb).await.unwrap();
+        });
+
+        let mut buf = [0u8; 5];
+        // 超时给足（3s）：tokio `Timeout` 先 poll inner 再查 deadline，丢唤醒时
+        // 数据会在 deadline 那一刻才被交付（tokio 的 Timeout 先 poll inner 的
+        // 副作用）——故用「交付时刻」而非「是否拿到数据」判定唤醒是否丢失。
+        let start = std::time::Instant::now();
+        let res = tokio::time::timeout(Duration::from_secs(3), stream.read_exact(&mut buf)).await;
+        let elapsed = start.elapsed();
+        writer_task.await.unwrap();
+        assert!(res.is_ok(), "LinkStream 读端未取到下行数据");
+        assert_eq!(&buf, b"hello");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "LinkStream 读端未被下行数据唤醒（丢唤醒）：数据在 {elapsed:?} 才交付（等超时轮询）"
+        );
     }
 }
