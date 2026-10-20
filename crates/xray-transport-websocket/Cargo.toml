@@ -35,3 +35,5 @@ bytes.workspace = true
 
 [dev-dependencies]
 rcgen = "0.13"
+# start_paused（bd cjwc G2 握手超时测试用暂停时钟做毫秒级验证）。
+tokio = { workspace = true, features = ["full", "test-util"] }
