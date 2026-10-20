@@ -646,6 +646,59 @@ mod tests {
         }
     }
 
+    /// 大响应回归专用 dispatch：写完响应后挂起等放行，保持 link（进而 relay 侧
+    /// smoltcp socket）存活到客户端确认收满。写完即 drop link 会让 relay 收 EOF
+    /// → finish() 在数据仍在途时 close+remove socket，负载下制造关闭竞态。
+    #[derive(Debug)]
+    struct HoldEchoDispatch {
+        tag: String,
+        response: Vec<u8>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl HoldEchoDispatch {
+        fn new(tag: &str, response: &[u8]) -> (Arc<Self>, Arc<tokio::sync::Notify>) {
+            let release = Arc::new(tokio::sync::Notify::new());
+            (
+                Arc::new(Self {
+                    tag: tag.into(),
+                    response: response.to_vec(),
+                    release: Arc::clone(&release),
+                }),
+                release,
+            )
+        }
+    }
+
+    impl DispatchHandler for HoldEchoDispatch {
+        fn tag(&self) -> &str {
+            &self.tag
+        }
+
+        fn dispatch(
+            &self,
+            _dest: &Destination,
+            link: Link,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+            let response = self.response.clone();
+            let release = Arc::clone(&self.release);
+            Box::pin(async move {
+                let mut r = link.reader;
+                let mut w = link.writer;
+                let req = match r.read_multi_buffer().await {
+                    Ok(mb) if !mb.is_empty() => mb,
+                    _ => return,
+                };
+                drop(req); // 请求内容本测试不关心，读完即触发回灌
+                let mut resp = MultiBuffer::new();
+                resp.merge_bytes(&response);
+                let _ = w.write_multi_buffer(resp).await;
+                // 客户端收满 192KB 才 notify；notify_one 的 permit 语义兜底
+                release.notified().await;
+            })
+        }
+    }
+
     /// accept loop 接线：SYN 驱动惰性建听 → 三次握手 → drain → dispatch 被调用。
     #[tokio::test]
     async fn accept_loop_lazy_listen_dispatches_syn() {
@@ -840,13 +893,21 @@ mod tests {
     }
 
     /// 票 gmhe 遗留回归：响应 > smoltcp tx 缓冲（SOCKET_BUF_SIZE=64KB）时
-    /// WgTcpRelay::send_to_smoltcp 必须循环写满不丢字节。EchoDispatch 回灌
-    /// 192KB（3 × 缓冲），client 慢读制造缓冲满，逐字节比对。
+    /// WgTcpRelay::send_to_smoltcp 必须循环写满不丢字节。回灌 192KB（3 × 缓冲），
+    /// client 慢读制造缓冲满，逐字节比对。
     ///
-    /// 已知 flaky：慢读 + 全隧道时序在负载下不稳定（本地 4/5 失败、空载通过）。
-    /// 修复本身的红绿证据见 `reports/night-run-2026-10-20/fix-wg-inbound-sendslice.md`
-    /// （旧实现 57344/196608 截断，新实现全量）。待改确定性后去掉 ignore（bd 见该报告）。
-    #[ignore = "flaky under load: slow-reader tunnel timing; verify with --ignored"]
+    /// 确定性机制（票 odaw，原 `#[ignore]` 已去）：
+    /// ① 流保持打开：HoldEchoDispatch 写完不 drop link，等测试确认收满后放行。
+    ///    原写法 dispatch 写完即 EOF → relay finish() 在数据仍在途时
+    ///    close()+remove_socket()，客户端后续 ACK 撞上无主 socket 被 smoltcp
+    ///    回 RST（iface/interface/tcp.rs 对未命中包即回 RST），尾部 WG 包又已无
+    ///    重传保障 → client 提前 !is_active() 假报截断（空载全靠时序赢）。
+    ///    EOF 推迟到收满之后，关闭竞态整体消失。
+    /// ② 读端确定性节流：固定 4KB/轮；仅零进展轮（等隧道往返）睡 5ms，
+    ///    有进展轮只 yield_now——推进不依赖调度快慢。
+    /// ③ 满缓冲硬断言：client rx 打满 recv_capacity()（= 广告零窗 → 服务端
+    ///    tx 必满 → relay 必经 written==0 停泵重试）且零进展轮 ≥1，缺一即红，
+    ///    防退化成安慰剂绿。
     #[tokio::test]
     async fn tunnel_tcp_inbound_large_response_no_truncation() {
         use std::net::SocketAddr;
@@ -874,7 +935,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let (dispatch, _seen, _access_seen) = EchoDispatch::new("wg-e2e-large", &payload);
+        let (dispatch, release) = HoldEchoDispatch::new("wg-e2e-large", &payload);
         let server = WireguardInboundHandler::new("wg-e2e-large", &server_cfg, udp_port, dispatch)
             .await
             .expect("server construct");
@@ -920,22 +981,29 @@ mod tests {
             h
         };
 
-        // 发请求触发 EchoDispatch 回灌；慢读（4KB/轮）制造 tx 缓冲满。
+        // 发请求触发回灌；确定性慢读（4KB/轮）制造 tx 缓冲满。
         let mut sent = false;
         let mut got: Vec<u8> = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let started = std::time::Instant::now();
+        let mut stall_rounds: u32 = 0;
+        let mut hit_rx_full = false;
         while got.len() < PAYLOAD_LEN {
             assert!(
-                std::time::Instant::now() < deadline,
-                "large response incomplete: got {}/{}",
+                started.elapsed() < Duration::from_secs(60),
+                "large response incomplete: got {}/{} (stall_rounds={stall_rounds})",
                 got.len(),
                 PAYLOAD_LEN
             );
+            let before = got.len();
             let mut closed = false;
             {
                 let mut s = client_ns.lock().await;
                 s.poll(Instant::now());
                 s.with_tcp_socket(handle, |sock| {
+                    // 满缓冲观测点必须在排空之前：poll 后 rx 处于本轮峰值
+                    if sock.recv_queue() == sock.recv_capacity() {
+                        hit_rx_full = true;
+                    }
                     if sock.may_send() && !sent {
                         let _ = sock.send_slice(b"ping");
                         sent = true;
@@ -949,12 +1017,27 @@ mod tests {
             if closed && got.len() < PAYLOAD_LEN {
                 panic!("response truncated: got {}/{}", got.len(), PAYLOAD_LEN);
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            if got.len() == before {
+                stall_rounds += 1;
+                // 零进展 = 在等隧道往返（服务端 tx 满/零窗）：让位而非盲睡
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
         }
+        let elapsed = started.elapsed();
 
+        // 满缓冲必要条件，缺一即红（防止没经过满缓冲的安慰剂绿）
+        assert!(hit_rx_full, "client rx never full: buffer-full path not exercised");
+        assert!(stall_rounds > 0, "no stall rounds: buffer-full path not exercised");
         assert_eq!(got.len(), PAYLOAD_LEN, "byte count");
         assert!(got == payload, "content mismatch");
+        eprintln!(
+            "large-response: {PAYLOAD_LEN}B in {elapsed:?}, stall_rounds={stall_rounds}, hit_rx_full={hit_rx_full}"
+        );
 
+        // 收满后放行 dispatch 任务，relay 走正常关闭路径
+        release.notify_one();
         server.close().await.expect("server close");
     }
 }
