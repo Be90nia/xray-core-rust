@@ -10,6 +10,10 @@ xray-buf = { path = "../xray-buf" }
 xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
 xray-crypto = { path = "../xray-crypto" }
+# xdns ResolverConfig 无损承载 Go ResolverProto 的 tls_config/quic_config 生成类型
+xray-proto = { path = "../xray-proto" }
+# xdns Go wire 互操作测试（proto Config decode/encode）
+prost = { workspace = true }
 thiserror = "1"
 tokio = { workspace = true }
 tracing = { workspace = true }

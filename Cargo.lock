@@ -6599,6 +6599,7 @@ dependencies = [
  "num-integer",
  "num-traits",
  "parking_lot",
+ "prost",
  "rand 0.9.4",
  "reqwest",
  "ring",
@@ -6618,6 +6619,7 @@ dependencies = [
  "xray-common",
  "xray-crypto",
  "xray-features",
+ "xray-proto",
 ]
 
 [[package]]

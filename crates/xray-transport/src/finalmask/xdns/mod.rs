@@ -15,7 +15,8 @@
 //! - `base32`：RFC4648 base32（无 padding）
 //!
 //! bd 2ktp ④：协议对齐 Xray-core fc8f8a45（v26.9.30）。Rust finalmask 栈为
-//! UDP-only：TCP resolver 配置期显式报错（Go 侧为 TypedMessage 分发）。
+//! UDP-only：TCP/DOH resolver 配置期显式报错（Go 侧按 `ResolverProto.type`
+//! 分派 tcp/udp/https，见 `resolver.go NewResolver`）。
 
 pub(crate) mod base32;
 mod client;
@@ -28,6 +29,8 @@ mod server;
 use std::{io, sync::Arc};
 
 use super::{UdpIo, Udpmask};
+use xray_proto::xray::transport::internet::finalmask::xdns::ResolverProto;
+use xray_proto::xray::transport::internet::{QuicParams, tls::Config as TlsConfig};
 
 /// poll 通知队列深度（Go `pollLimit`）。
 pub(crate) const POLL_LIMIT: usize = 16;
@@ -42,11 +45,70 @@ pub struct DomainConfig {
     pub(crate) edns0: i32,
 }
 
-/// resolver 配置（对应 Go `UDPResolverProto`/`TCPResolverProto`）。
-#[derive(Debug, Clone)]
-pub enum ResolverConfig {
-    Udp { addr: String },
-    Tcp { addr: String },
+/// resolver 分派类型（Go `resolver.go NewResolver` 按 `ResolverProto.type` 分派）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolverKind {
+    Udp,
+    Tcp,
+}
+
+/// resolver 配置（对应 Go `ResolverProto`：type/addr/worker/tls_config/quic_config）。
+///
+/// `worker`/`tls_config`/`quic_config` 对 udp/tcp 在 Go 运行时同样不读
+/// （`resolver_udp.go`/`resolver_tcp.go` 只取 Addr，仅 DOH 读 worker/tls/quic），
+/// 此处无损承载以对齐 wire；真正做不到的形态（DOH）在 [`ResolverConfig::from_proto`]
+/// 配置期显式报错。
+#[derive(Clone)]
+pub struct ResolverConfig {
+    pub kind: ResolverKind,
+    pub addr: String,
+    pub worker: i32,
+    pub tls_config: Option<TlsConfig>,
+    pub quic_config: Option<QuicParams>,
+}
+
+impl std::fmt::Debug for ResolverConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // proto 生成类型无 Debug，只打字段存在性
+        f.debug_struct("ResolverConfig")
+            .field("kind", &self.kind)
+            .field("addr", &self.addr)
+            .field("worker", &self.worker)
+            .field("tls_config", &self.tls_config.is_some())
+            .field("quic_config", &self.quic_config.is_some())
+            .finish()
+    }
+}
+
+impl ResolverConfig {
+    /// Go `NewResolver`（resolver.go:17-27）的 `type` 分派：udp/tcp 照常构造；
+    /// https（DOH）Rust 栈未实现 → 配置期显式报错；未知 type 同 Go 报
+    /// "unknown type"。
+    pub fn from_proto(p: &ResolverProto) -> io::Result<Self> {
+        let kind = match p.r#type.as_str() {
+            "udp" => ResolverKind::Udp,
+            "tcp" => ResolverKind::Tcp,
+            "https" => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "xdns: DOH (https) resolver not supported (UDP-only stack)",
+                ));
+            },
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("xdns: unknown resolver type {other:?}"),
+                ));
+            },
+        };
+        Ok(Self {
+            kind,
+            addr: p.addr.clone(),
+            worker: p.worker,
+            tls_config: p.tls_config.clone(),
+            quic_config: p.quic_config.clone(),
+        })
+    }
 }
 
 /// xdns 配置（对应 Go `xdns.Config` protobuf）。
@@ -159,6 +221,74 @@ mod tests {
         );
     }
 
+    /// Go 侧 fixture（Go xray-core config.pb.go proto.Marshal 真实输出，
+    /// protoc v6.33.5 --encode 字节一致交叉锚定）。生成命令：
+    /// `reports/night-run-2026-10-20/tmp/xdnsprobe` 内 `go run . encode`，
+    /// 输入 `xdns.Config{Resolvers: [{Type: "tcp", Addr: "1.1.1.1:53", Worker: 2}]}`。
+    const GO_WIRE_RESOLVERS_TCP_HEX: &str = "12130a03746370120a312e312e312e313a35331802";
+
+    /// Go↔Rust wire 互通（bd o7ns D4）：Go Marshal 字节 → prost 解码逐字段断言
+    /// （type/addr/worker），Rust 重编码必须字节一致（双向同 fixture）。
+    #[test]
+    fn go_wire_fixture_decode_and_roundtrip() {
+        use prost::Message as _;
+        use xray_proto::xray::transport::internet::finalmask::xdns as proto_xdns;
+
+        let bytes = hex::decode(GO_WIRE_RESOLVERS_TCP_HEX).unwrap();
+        let cfg = proto_xdns::Config::decode(&bytes[..]).unwrap();
+        assert!(cfg.domains.is_empty());
+        assert_eq!(cfg.extra_poll, 0);
+        assert_eq!(cfg.resolvers.len(), 1);
+        let r = &cfg.resolvers[0];
+        assert_eq!(r.r#type, "tcp");
+        assert_eq!(r.addr, "1.1.1.1:53");
+        assert_eq!(r.worker, 2);
+        assert!(r.tls_config.is_none());
+        assert!(r.quic_config.is_none());
+
+        let re_encoded = cfg.encode_to_vec();
+        eprintln!("rust_encoded_hex: {}", hex::encode(&re_encoded));
+        assert_eq!(re_encoded, bytes);
+
+        let rc = ResolverConfig::from_proto(r).unwrap();
+        assert_eq!(rc.kind, ResolverKind::Tcp);
+        assert_eq!(rc.addr, "1.1.1.1:53");
+        assert_eq!(rc.worker, 2);
+    }
+
+    /// `from_proto` 按 Go `resolver.go NewResolver` 分派：udp/tcp 构造，
+    /// https 显式报错（Rust 栈未实现），未知 type 报 "unknown"。
+    #[test]
+    fn from_proto_dispatches_and_rejects() {
+        let p = |t: &str| ResolverProto {
+            r#type: t.into(),
+            addr: "1.1.1.1:53".into(),
+            ..Default::default()
+        };
+        assert_eq!(ResolverConfig::from_proto(&p("udp")).unwrap().kind, ResolverKind::Udp);
+        assert_eq!(ResolverConfig::from_proto(&p("tcp")).unwrap().kind, ResolverKind::Tcp);
+        assert!(ResolverConfig::from_proto(&p("https")).is_err());
+        assert!(ResolverConfig::from_proto(&p("quic")).is_err());
+    }
+
+    /// worker/tls_config/quic_config 无损承载（udp 上 Go 运行时同样不读，
+    /// 不得丢弃；对齐 Go conf 缺省 worker=32 的真实形态）。
+    #[test]
+    fn from_proto_carries_worker_tls_quic() {
+        let p = ResolverProto {
+            r#type: "udp".into(),
+            addr: "9.9.9.9:53".into(),
+            worker: 32,
+            tls_config: Some(TlsConfig::default()),
+            quic_config: Some(QuicParams::default()),
+        };
+        let rc = ResolverConfig::from_proto(&p).unwrap();
+        assert_eq!(rc.kind, ResolverKind::Udp);
+        assert_eq!(rc.worker, 32);
+        assert!(rc.tls_config.is_some());
+        assert!(rc.quic_config.is_some());
+    }
+
     /// 双端互通的内存 UDP 管道（模拟 finalmask 隧道），供 loopback e2e 使用。
     struct PipeEnd {
         peer: tokio::sync::mpsc::Sender<(Vec<u8>, SocketAddr)>,
@@ -202,7 +332,13 @@ mod tests {
                 types: vec![16, 1], // TXT + A（随机域/类型覆盖）
                 edns0: 0,
             }],
-            resolvers: vec![ResolverConfig::Udp { addr: "127.0.0.1:53".into() }],
+            resolvers: vec![ResolverConfig {
+                kind: ResolverKind::Udp,
+                addr: "127.0.0.1:53".into(),
+                worker: 0,
+                tls_config: None,
+                quic_config: None,
+            }],
             extra_poll: 0,
         }
     }

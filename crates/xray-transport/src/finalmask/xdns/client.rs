@@ -25,7 +25,7 @@ use rand::RngCore;
 use tokio::sync::{Mutex, mpsc};
 
 use super::{
-    Config, ResolverConfig, UdpIo,
+    Config, ResolverKind, UdpIo,
     dns::{CLASS_IN, Message, Question, RR, RR_TYPE_OPT, message_from_wire_format},
     domain::{Domain, type_map},
     resp::Resp,
@@ -88,13 +88,13 @@ impl XdnsConnClient {
         }
         let mut resolvers = Vec::with_capacity(config.resolvers.len());
         for r in &config.resolvers {
-            let ResolverConfig::Udp { addr } = r else {
+            if r.kind != ResolverKind::Udp {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "xdns: TCP resolver not supported (UDP-only stack)",
                 ));
-            };
-            let addr: SocketAddr = addr.parse().map_err(|e| {
+            }
+            let addr: SocketAddr = r.addr.parse().map_err(|e| {
                 io::Error::new(io::ErrorKind::InvalidInput, format!("invalid resolver addr: {e}"))
             })?;
             resolvers.push(addr);

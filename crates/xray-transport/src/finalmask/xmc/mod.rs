@@ -1,8 +1,10 @@
 //! # XMC Minecraft 协议伪装（对应 Go `transport/internet/finalmask/xmc/`）
 //!
-//! 把代理流量伪装成 Minecraft Java Edition 1.17+ 的 Login 握手——客户端发起
-//! MC Login Start，服务端发 Encryption Request，双方用 RSA + AES-128-CFB8
-//! 协商出对称密钥后透传数据。共享密码通过 RSA 加密的 verify token 验证。
+//! 把代理流量伪装成 Minecraft Java Edition 1.17+ 的 Login + configuration 握手
+//! ——客户端发起 MC Login Start，服务端发 Encryption Request，双方用 RSA +
+//! AES-128-CFB8 协商出对称密钥；Login Success / Login Acknowledged 交换后数据面
+//! 以 configuration custom payload（`xmc:data`）包承载。共享密码通过 RSA 加密
+//! 的 verify token 验证。
 //!
 //! 本模块只支持 TCP（与 Go 一致——`xmc/config.go` 只有 `TCP()` 方法）。
 //!
@@ -26,11 +28,23 @@ use std::io;
 
 use super::{AsyncIo, Tcpmask, UDP_SIZE};
 
+/// 登录档案（对应 Go `loginProfile` / config.proto `Profile`）。
+///
+/// `uuid` 从 Mojang API 按 username 解析；textures 属性从 session server
+/// （`?unsigned=false`）拷贝——Login Success 包按 Go wire 原样回传。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Profile {
+    pub username: String,
+    pub uuid: [u8; 16],
+    pub textures_value: String,
+    pub textures_signature: String,
+}
+
 /// XMC 配置（对应 Go `xmc/Config` protobuf）。
 #[derive(Debug, Clone, Default)]
 pub struct Config {
-    /// 候选用户名列表（客户端随机选一个）。
-    pub usernames: Vec<String>,
+    /// 登录档案（客户端随机选一个；服务端白名单校验）。
+    pub profiles: Vec<Profile>,
     /// 共享密码（写入 verifyToken 后段，服务端校验）。
     pub password: String,
     /// RSA 私钥（PKCS#1 DER）。服务端握手必需；客户端可省略。
@@ -67,6 +81,22 @@ mod tests {
 
     use super::*;
 
+    fn test_config(password: &str, private_der: Vec<u8>, public_der: Vec<u8>) -> Config {
+        Config {
+            profiles: vec![Profile {
+                username: "test_user".into(),
+                uuid: [0x42; 16],
+                textures_value: "textures-value".into(),
+                textures_signature: "textures-signature".into(),
+            }],
+            password: password.into(),
+            rsa_private_key: private_der,
+            rsa_public_key: public_der,
+            hostname: "localhost".into(),
+            padding_disabled: true,
+        }
+    }
+
     /// 单向：client → server（握手 + CFB8 加密）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn client_to_server_roundtrip() {
@@ -77,14 +107,7 @@ mod tests {
         let public_der =
             public_key.to_public_key_der().expect("to_public_key_der").as_bytes().to_vec();
 
-        let config = Config {
-            usernames: vec!["test_user".into()],
-            password: password.into(),
-            rsa_private_key: private_der,
-            rsa_public_key: public_der,
-            hostname: "localhost".into(),
-            padding_disabled: true,
-        };
+        let config = test_config(password, private_der, public_der);
 
         let (client_raw, server_raw) = tokio::io::duplex(UDP_SIZE * 4);
         let wrapped_client: Box<dyn AsyncIo> =
@@ -101,9 +124,11 @@ mod tests {
             cw.write_all(msg).await.unwrap();
             cw.shutdown().await.ok();
         };
+        // read_exact（而非 read_to_end）：bridge 读侧任务在 raw 不断开时保持存活，
+        // caller 半关闭不产生 EOF——按已知 echo 长度读。
         let read_fut = async {
-            let mut got = Vec::new();
-            sr.read_to_end(&mut got).await.unwrap();
+            let mut got = vec![0u8; msg.len()];
+            sr.read_exact(&mut got).await.unwrap();
             assert_eq!(got, msg);
         };
         tokio::join!(write_fut, read_fut);
@@ -119,14 +144,7 @@ mod tests {
         let public_der =
             public_key.to_public_key_der().expect("to_public_key_der").as_bytes().to_vec();
 
-        let config = Config {
-            usernames: vec!["test_user".into()],
-            password: password.into(),
-            rsa_private_key: private_der,
-            rsa_public_key: public_der,
-            hostname: "localhost".into(),
-            padding_disabled: true,
-        };
+        let config = test_config(password, private_der, public_der);
         let (client_raw, server_raw) = tokio::io::duplex(UDP_SIZE * 4);
         let wrapped_client: Box<dyn AsyncIo> =
             config.wrap_conn_client(Box::new(client_raw)).unwrap();
@@ -142,9 +160,10 @@ mod tests {
             sw.write_all(msg).await.unwrap();
             sw.shutdown().await.ok();
         };
+        // 同上：按已知 echo 长度读，不依赖 EOF。
         let read_fut = async {
-            let mut got = Vec::new();
-            cr.read_to_end(&mut got).await.unwrap();
+            let mut got = vec![0u8; msg.len()];
+            cr.read_exact(&mut got).await.unwrap();
             assert_eq!(got, msg);
         };
         tokio::join!(write_fut, read_fut);
@@ -161,22 +180,8 @@ mod tests {
         let public_key = <rsa::RsaPublicKey as From<&rsa::RsaPrivateKey>>::from(&private_key);
         let public_der = public_key.to_public_key_der().unwrap().as_bytes().to_vec();
 
-        let server_cfg = Config {
-            usernames: vec!["test_user".into()],
-            password: pw_server.into(),
-            rsa_private_key: private_der.clone(),
-            rsa_public_key: public_der.clone(),
-            hostname: "localhost".into(),
-            padding_disabled: true,
-        };
-        let client_cfg = Config {
-            usernames: vec!["test_user".into()],
-            password: pw_client.into(),
-            rsa_private_key: vec![],
-            rsa_public_key: public_der,
-            hostname: "localhost".into(),
-            padding_disabled: true,
-        };
+        let server_cfg = test_config(pw_server, private_der.clone(), public_der.clone());
+        let client_cfg = test_config(pw_client, vec![], public_der);
         let (client_raw, server_raw) = tokio::io::duplex(UDP_SIZE * 4);
         let wrapped_client: Box<dyn AsyncIo> =
             client_cfg.wrap_conn_client(Box::new(client_raw)).unwrap();

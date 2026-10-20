@@ -1316,7 +1316,10 @@ fn build_sudoku_config(settings: &serde_json::Value) -> sudoku::SudokuConfig {
 
 /// Go `XDNS.Build` → `xdns::Config`（bd 2ktp ④ 对齐 v26.9.30：domains 为对象
 /// 数组（lenLimit/labelLimit 缺省 255/63），resolvers 为 `{type,settings.addr}`，
-/// extraPoll 0-3；`domain` 键已废弃）。
+/// extraPoll 0-3；`domain` 键已废弃）。resolver `settings` 内 `addr` 以外的键
+/// （worker/tlsConfig/quicConfig 等）本 JSON 层不支持，显式报错不静默丢弃
+/// （Go conf 层由 `XDNSResolver` 展开为 `ResolverProto` 字段，Rust conf 层
+/// 尚未实现该形态，见 bd o7ns D4 能力边界）。
 fn build_xdns_config(settings: &serde_json::Value) -> io::Result<xdns::Config> {
     if settings.get("domain").is_some_and(|x| !x.is_null()) {
         return Err(mask_err(
@@ -1337,18 +1340,40 @@ fn build_xdns_config(settings: &serde_json::Value) -> io::Result<xdns::Config> {
                 .get("type")
                 .and_then(|t| t.as_str())
                 .ok_or_else(|| mask_err("xdns: resolver missing type"))?;
-            let addr = obj
+            let resolver_settings = obj
                 .get("settings")
-                .and_then(|s| s.get("addr"))
+                .and_then(|s| s.as_object())
+                .ok_or_else(|| mask_err("xdns: resolver missing settings"))?;
+            let addr = resolver_settings
+                .get("addr")
                 .and_then(|a| a.as_str())
                 .ok_or_else(|| mask_err("xdns: resolver missing settings.addr"))?;
-            match rtype {
-                "udp" => resolvers.push(xdns::ResolverConfig::Udp { addr: addr.to_string() }),
-                "tcp" => resolvers.push(xdns::ResolverConfig::Tcp { addr: addr.to_string() }),
+            for key in resolver_settings.keys() {
+                if key != "addr" {
+                    return Err(mask_err(format!(
+                        "xdns: resolver setting {key:?} not supported (only addr)"
+                    )));
+                }
+            }
+            let kind = match rtype {
+                "udp" => xdns::ResolverKind::Udp,
+                "tcp" => xdns::ResolverKind::Tcp,
+                "https" => {
+                    return Err(mask_err(
+                        "xdns: DOH (https) resolver not supported (UDP-only stack)",
+                    ));
+                },
                 other => {
                     return Err(mask_err(format!("xdns: unknown resolver type {other:?}")));
                 },
-            }
+            };
+            resolvers.push(xdns::ResolverConfig {
+                kind,
+                addr: addr.to_string(),
+                worker: 0,
+                tls_config: None,
+                quic_config: None,
+            });
         }
     }
     let extra_poll = match settings.get("extraPoll") {
@@ -1480,7 +1505,7 @@ fn build_xmc_config(settings: &serde_json::Value) -> io::Result<xmc::Config> {
     if password.is_empty() {
         return Err(mask_err("xmc: empty password"));
     }
-    let mut usernames = Vec::with_capacity(profiles.len());
+    let mut profiles_out = Vec::with_capacity(profiles.len());
     for p in profiles {
         let username = json_str(p, "username");
         let valid = (3..=16).contains(&username.len())
@@ -1488,13 +1513,20 @@ fn build_xmc_config(settings: &serde_json::Value) -> io::Result<xmc::Config> {
         if !valid {
             return Err(mask_err(format!("invalid minecraft profile username: {username:?}")));
         }
-        json_str(p, "uuid")
+        let uuid = json_str(p, "uuid")
             .parse::<uuid::Uuid>()
             .map_err(|e| mask_err(format!("invalid minecraft profile UUID: {e}")))?;
-        if json_str(p, "texturesValue").is_empty() || json_str(p, "texturesSignature").is_empty() {
+        let textures_value = json_str(p, "texturesValue");
+        let textures_signature = json_str(p, "texturesSignature");
+        if textures_value.is_empty() || textures_signature.is_empty() {
             return Err(mask_err(format!("incomplete minecraft profile textures: {username:?}")));
         }
-        usernames.push(username.to_string());
+        profiles_out.push(xmc::Profile {
+            username: username.to_string(),
+            uuid: *uuid.as_bytes(),
+            textures_value: textures_value.to_string(),
+            textures_signature: textures_signature.to_string(),
+        });
     }
     let private_key = xmc::derivation::derive_rsa_key(password)
         .map_err(|e| mask_err(format!("derive minecraft rsa key: {e}")))?;
@@ -1510,7 +1542,7 @@ fn build_xmc_config(settings: &serde_json::Value) -> io::Result<xmc::Config> {
         .as_bytes()
         .to_vec();
     Ok(xmc::Config {
-        usernames,
+        profiles: profiles_out,
         password: password.to_string(),
         rsa_private_key,
         rsa_public_key,
@@ -2241,10 +2273,8 @@ mod tests {
         assert_eq!(cfg.domains[0].name, "t.example.com");
         assert_eq!((cfg.domains[0].len_limit, cfg.domains[0].label_limit), (255, 63));
         assert_eq!(cfg.domains[0].types, vec![16]);
-        assert!(matches!(
-            cfg.resolvers[0],
-            xdns::ResolverConfig::Udp { ref addr } if addr == "1.1.1.1:53"
-        ));
+        assert_eq!(cfg.resolvers[0].kind, xdns::ResolverKind::Udp);
+        assert_eq!(cfg.resolvers[0].addr, "1.1.1.1:53");
         assert_eq!(cfg.extra_poll, 1);
         // 已废弃 domain 键报错（对齐 Go PrintRemovedFeatureError）
         assert!(build_xdns_config(&fm(r#"{"domain":"x.com"}"#)).is_err());
@@ -2254,6 +2284,20 @@ mod tests {
         assert!(
             build_xdns_config(&fm(
                 r#"{"resolvers":[{"type":"quic","settings":{"addr":"1.1.1.1:53"}}]}"#
+            ))
+            .is_err()
+        );
+        // https（DOH）已知 type 但 Rust 栈未实现 → 显式报错（bd o7ns D4）
+        assert!(
+            build_xdns_config(&fm(
+                r#"{"resolvers":[{"type":"https","settings":{"addr":"dns.google"}}]}"#
+            ))
+            .is_err()
+        );
+        // settings 未知键显式报错，不静默丢弃（bd o7ns D4）
+        assert!(
+            build_xdns_config(&fm(
+                r#"{"resolvers":[{"type":"udp","settings":{"addr":"1.1.1.1:53","worker":8}}]}"#
             ))
             .is_err()
         );
@@ -2305,7 +2349,14 @@ mod tests {
                 "profiles":[{"username":"steve_1","uuid":"069a79f4-44e9-4726-a5be-fca90e38aaf5",
                              "texturesValue":"v","texturesSignature":"s"}]}"#))
         .unwrap();
-        assert_eq!(cfg.usernames, vec!["steve_1".to_string()]);
+        assert_eq!(cfg.profiles.len(), 1);
+        assert_eq!(cfg.profiles[0].username, "steve_1");
+        assert_eq!(
+            cfg.profiles[0].uuid,
+            *uuid::Uuid::parse_str("069a79f4-44e9-4726-a5be-fca90e38aaf5").unwrap().as_bytes()
+        );
+        assert_eq!(cfg.profiles[0].textures_value, "v");
+        assert_eq!(cfg.profiles[0].textures_signature, "s");
         assert_eq!(cfg.password, "mc-pass");
         assert_eq!(cfg.hostname, "mc.example.com");
         assert!(!cfg.rsa_private_key.is_empty());
