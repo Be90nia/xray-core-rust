@@ -7,6 +7,8 @@ option java_package = "com.xray.transport.internet.finalmask.xdns";
 option java_multiple_files = true;
 
 import "common/serial/typed_message.proto";
+import "transport/internet/tls/config.proto";
+import "transport/internet/config.proto";
 
 // 对齐 Go v26.9.30（bd 2ktp ④，Xray-core fc8f8a45）。
 message DomainProto {
@@ -17,16 +19,19 @@ message DomainProto {
   int32 edns0 = 5;
 }
 
+// 对齐 Go config.proto:21-27（bd o7ns D4：恢复 wire 语义，替换误造的
+// TypedMessage resolvers + TCP/UDPResolverProto——wire type 同为
+// length-delimited 解码不报错但字段彻底错位）。
+message ResolverProto {
+  string type = 1;
+  string addr = 2;
+  int32 worker = 3;
+  xray.transport.internet.tls.Config tls_config = 4;
+  xray.transport.internet.QuicParams quic_config = 5;
+}
+
 message Config {
   repeated DomainProto domains = 1;
-  repeated xray.common.serial.TypedMessage resolvers = 2;
+  repeated ResolverProto resolvers = 2;
   int32 extra_poll = 3;
-}
-
-message TCPResolverProto {
-  string addr = 1;
-}
-
-message UDPResolverProto {
-  string addr = 1;
 }

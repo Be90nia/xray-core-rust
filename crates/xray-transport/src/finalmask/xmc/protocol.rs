@@ -133,6 +133,16 @@ pub fn write_i64_be<W: Write>(w: &mut W, v: i64) -> io::Result<()> {
     w.write_all(&v.to_be_bytes())
 }
 
+/// 读 MC Boolean（1 字节，非零为 true，对应 Go `Boolean`）。
+pub fn read_bool<R: Read>(r: &mut R) -> io::Result<bool> {
+    Ok(read_byte(r)? != 0)
+}
+
+/// 写 MC Boolean（1 字节）。
+pub fn write_bool<W: Write>(w: &mut W, v: bool) -> io::Result<()> {
+    w.write_all(&[u8::from(v)])
+}
+
 /// 读 MC UUID（16 字节固定长度）。
 pub fn read_uuid<R: Read>(r: &mut R) -> io::Result<[u8; 16]> {
     let mut buf = [0u8; 16];
