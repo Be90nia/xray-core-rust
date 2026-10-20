@@ -148,6 +148,46 @@
 - **DoH 直连旁路**（bd 34nk 的 P0 止血）：恢复共享拨号器会重启 4s 停顿，需先修管线下行唤醒丢失；
 - **60s 空闲回收**：四内核（含 Go）一致，上游行为。
 
+## 14. 构建口径（target-cpu）核查 + A/B 实测（2026-10-20 15:00-16:00）
+
+用户问「编译用的是 `-C target-cpu=x86-64` 还是 `native`」。权威判据 = **cargo fingerprint**（`target/release/.fingerprint/xray-cli-*/lib-xray_cli.json` 的 `rustflags` 字段）：
+
+| 构建时刻 | rustflags | 对应产物 |
+|---|---|---|
+| 10-18 18:17 | `['-C','target-cpu=x86-64']` | F2F3 矩阵 B_g |
+| 10-20 01:04 | `['-C','native','-C','x86-64']` | 环境变量 + config 双份 |
+| 10-20 11:42 | `['-C','target-cpu=native']` | **v2rayN 现役 10:37 部署件 = native** |
+| 10-20 13:41 / 13:49 | `[]`（无 flag） | **本次修复构建 = rustc 默认 baseline x86-64（等价 `-C target-cpu=x86-64`）** |
+
+**二进制里出现 ymm/zmm 指令 ≠ native**：本产物 19,256 条 AVX2/AVX-512 指令全部来自 aws-lc 加密库的 C/汇编目标文件（`aws_lc_0_46_0_jent_entropy` + .text 内 crypto 实现），rustc 的 target-cpu 不作用于 .S/.c 目标文件；判据只能看 fingerprint。
+
+**`.cargo/config.toml` 写法坑**：用户 15:02 版本把 `CARGO_BUILD_RUSTFLAGS="-C target-cpu=x86-64"` 写在 TOML 顶层 = cargo 忽略的未知键（不报错、不生效）。已改为真正生效的 `[build] rustflags = ["-C","target-cpu=x86-64"]`。
+
+### A/B 同窗交替（节点 home.begonia92.top:2087，CF CDN 族，20MB/50MB 单发）
+
+3 轮 × 20MB：native [4.0, 8.3, 0.0] / generic [3.6, 3.8, 9.5] / go [9.5, 2.4, 4.0] —— 三者中位均 ~4MB/s，Go 对照同窗摆 2.4→9.5，**窗口内路径噪声主导，分不出构建差异**。
+
+6 轮 × 50MB：native [8.3, 0.5, 0.1, 4.4, 14.0, **0.0**] 中位 4.4 / generic [1.6, 1.6, 1.2, 19.2, 9.1, 12.8] 中位 9.1 / go [18.6, 0.9, 8.1, 9.1, 9.8, 9.1] 中位 9.1。
+native 9 次采样里 2 次塌到 ≈0（0.1 / 0.0），generic 与 Go 均未塌（最低 1.2 / 0.9）。
+**归因未分离**：native 与 generic 之间还差「池分层污染修复 + 启动日志」，两变量混用；需同源码 native 重建（flag 单变量）才能定论。
+
+## 15. 「native 会让 CPU 空转」实证核验（2026-10-20 16:40）
+
+复用 10-18 原版 harness（`D:/tmp/dig-pause-mech/repro_cpu.py`，本地回环：socks5 消费者 → xray cli → :12088 xray srv(vless+tls) → freedom → httpd big.bin），**服务端固定**（generic_fixed），只换客户端二进制，`DIGP7LM=0`（关 P7LM 测量税）：
+
+| 客户端二进制 | 吞吐 | >5ms 停顿 | 停顿总时长 | 顶层线程 CPU avg / max |
+|---|---|---|---|---|
+| old_native（10:37 现役生产版） | **12.6 MB/s** | **99** | **4839 ms** | **15.5% / 15.3%**（max 57% / 73%） |
+| native_fixed（今日源码 + native flag） | **54.8 MB/s** | 7 | 818 ms | 8.5% / 5.6%（max 39.7% / 33.3%） |
+| generic_fixed（今日源码 + x86-64） | 41.9 MB/s | 11 | 1146 ms | 6.5% / 5.6%（max 29.7% / 36.3%） |
+
+**裁决**：
+1. **「native 导致 CPU 空转」不成立**。同一份源码下 native 与通用版的顶层线程 CPU 同量级（8.5% vs 6.5%），native 吞吐反而更高（54.8 vs 41.9 MB/s）。与 10-18 报告 §5 结论一致（native 重建 91.6 MB/s 零停顿零烧核，flag 无罪）。
+2. **烧核 + 巨停绑定的是「现役 10:37 生产版」**：两个线程各 ~15% avg、99 次停顿、4.8 秒停顿总量，比今日构建慢 3-4 倍。与 10-18 §4/§5 的因果收敛一致：现象绑定「主树非 HEAD 源内容构建」，与 codegen flag 无关；10-18 的 RIP 直方图已把热点定位到 AEAD 反复重加密的 poll-retry 循环（CRYPTO_chacha_20 / poly1305_finish）。
+3. 因此「整体速度慢」的处置 = 换今日构建（generic x86-64 + 池分层修复 + 准确启动日志），**与 target-cpu 无关**。
+
+口径限制：本地回环（剥公网噪声）；今日本机→CF 直连仅 0.45-0.70 MB/s（窗口劣化，见 §14），公网测速数据今日不可用。native vs 通用 CPU 差为单轮数据，量级相同，不足以支撑「native 空转」结论。
+
 ## 5. 边界与风险
 
 - 未改任何业务代码、未动 `tests/`/`.github/`/`dist/`/`vendor/`；诊断配置与日志留在 `target/tmp-diag/`（构建产物目录）。
