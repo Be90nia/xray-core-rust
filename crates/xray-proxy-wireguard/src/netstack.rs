@@ -81,19 +81,26 @@ impl WgNetStack {
             }
         });
 
-        // 配置默认路由（inbound accept 必需——SYN-ACK 需路由到远端 peer）。
-        // 与 TunNetStack::new 对称：TUN medium 直连模式只需存在默认路由。
-        let has_v4 = local_addrs.iter().any(|c| matches!(c, IpCidr::Ipv4(_)));
-        let has_v6 = local_addrs.iter().any(|c| matches!(c, IpCidr::Ipv6(_)));
+        // AnyIP + 默认路由网关指向本接口地址（bd t8pm：inbound 接受任意 dst）。
+        // smoltcp 对 dst 非本机地址的包，AnyIP 准入还要求 routes.lookup(dst) 的
+        // 下一跳是本机地址（iface/interface/{ipv4,ipv6}.rs 的 "routed locally" 检查）；
+        // 网关 = 自身地址即满足「所有单播 dst 都路由到本栈」。对应 Go 栈对任意 dst
+        // 无条件受理（netstack.go CreateNetTUN：handler 在场即收任意地址的连接）。
+        iface.set_any_ip(true);
+        let self_v4 = local_addrs.iter().find_map(|c| match c {
+            IpCidr::Ipv4(cidr) => Some(cidr.address()),
+            IpCidr::Ipv6(_) => None,
+        });
+        let self_v6 = local_addrs.iter().find_map(|c| match c {
+            IpCidr::Ipv4(_) => None,
+            IpCidr::Ipv6(cidr) => Some(cidr.address()),
+        });
         iface.routes_mut().update(|routes| {
-            if has_v4 {
-                let _ = routes
-                    .push(smoltcp::iface::Route::new_ipv4_gateway(Ipv4Address::new(0, 0, 0, 0)));
+            if let Some(v4) = self_v4 {
+                let _ = routes.push(smoltcp::iface::Route::new_ipv4_gateway(v4));
             }
-            if has_v6 {
-                let _ = routes.push(smoltcp::iface::Route::new_ipv6_gateway(Ipv6Address::new(
-                    0, 0, 0, 0, 0, 0, 0, 0,
-                )));
+            if let Some(v6) = self_v6 {
+                let _ = routes.push(smoltcp::iface::Route::new_ipv6_gateway(v6));
             }
         });
 
@@ -109,10 +116,15 @@ impl WgNetStack {
 
     /// 投递一个解密后的 IP 包到 RX FIFO。driver 在 decapsulate 后调用。
     ///
-    /// 先嗅探 TCP SYN：smoltcp 没有通配监听（listen 对 port 0 恒报 Unaddressable），
+    /// 先按 Go `stack.Input()`（proxy/tun/stack.go:165-172）同款规则滤掉不可转发包
+    /// （loopback / v4-mapped v6 / 未指定 dst / 组播 src——静默吞，不回 RST）。
+    /// 再嗅探 TCP SYN：smoltcp 没有通配监听（listen 对 port 0 恒报 Unaddressable），
     /// 必须在包入栈前按目标 tuple 建好精确监听，poll 时 SYN 才有归宿——
-    /// 对应 Go `tcp.NewForwarder` 的 per-request accept（tun.go:56）。
+    /// 对应 Go 栈 handleTCP 对新 SYN 的 per-connection 受理。
     pub fn ingest_rx(&mut self, pkt: Vec<u8>) {
+        if not_forwardable(&pkt) {
+            return;
+        }
         if let Some((addr, port)) = sniff_tcp_syn(&pkt) {
             self.ensure_listen(IpEndpoint { addr, port });
         }
@@ -208,12 +220,14 @@ impl WgNetStack {
 
     /// 惰性建立精确 tuple 的 TCP 监听（幂等）。
     ///
-    /// 目标端口为 0、同 tuple 已有 pending 监听、目标地址不属于本接口、或监听表
-    /// 已达 [`MAX_PENDING_LISTENS`] 上限时跳过（SYN 由客户端重传兜底）。
+    /// 任意 dst 都建听——Go 栈对非本机地址的连接同样受理（netstack.go CreateNetTUN：
+    /// "the stack takes every connection ... for any address"）；不可转发的 dst 已被
+    /// `not_forwardable`（ingest_rx 入口过滤）挡掉。目标端口为 0、同 tuple 已有
+    /// pending 监听、或监听表已达 [`MAX_PENDING_LISTENS`] 上限时跳过（SYN 由客户端
+    /// 重传兜底）。
     fn ensure_listen(&mut self, local: IpEndpoint) {
         if local.port == 0
             || self.listening.iter().any(|(_, ep)| *ep == local)
-            || !self.iface.has_ip_addr(local.addr)
             || self.listening.len() >= MAX_PENDING_LISTENS
         {
             return;
@@ -298,6 +312,29 @@ fn sniff_tcp_syn(pkt: &[u8]) -> Option<(IpAddress, u16)> {
         return None;
     }
     Some((dst_addr, tcp.dst_port()))
+}
+
+/// Go `stack.Input()`（proxy/tun/stack.go:165-172）同款不可转发判定：
+/// 4in6 双向、loopback 双向、未指定 dst、组播 src——这些地址「stands for this
+/// machine itself or is not a real peer」，隧道对端不应请求；静默吞，不回 RST。
+/// 解析失败的包同样丢弃（Go `parsePacket` 失败即 return）。
+fn not_forwardable(pkt: &[u8]) -> bool {
+    match pkt.first().map_or(0, |b| b >> 4) {
+        4 => Ipv4Packet::new_checked(pkt).is_ok_and(|v4| {
+            v4.src_addr().is_multicast()
+                || v4.src_addr().is_loopback()
+                || v4.dst_addr().is_loopback()
+                || v4.dst_addr().is_unspecified()
+        }),
+        6 => Ipv6Packet::new_checked(pkt).is_ok_and(|v6| {
+            v6.src_addr().to_ipv4_mapped().is_some()
+                || v6.dst_addr().to_ipv4_mapped().is_some()
+                || v6.src_addr().is_loopback()
+                || v6.dst_addr().is_loopback()
+                || v6.dst_addr().is_unspecified()
+        }),
+        _ => true,
+    }
 }
 
 // ===== 事件检测：poll 后检查 socket 状态变化 =====
@@ -613,6 +650,61 @@ mod tests {
         assert_eq!(local.addr, IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 2)));
         assert_eq!(events[0].remote.port, 5555);
         assert_eq!(stack.listening.len(), 1, "同 tuple 补位监听已就位");
+    }
+
+    /// 非本接口地址的 dst 也建听并完成握手（bd t8pm：Go client 打公网 IP 的常见
+    /// 拓扑；修复前此类 SYN 被 has_ip_addr 门吞掉，连接永不建立）。accept 事件的
+    /// local endpoint 即真实 dst——dispatch 侧据此把它交给 outbound。
+    #[test]
+    fn syn_to_non_local_dst_creates_listen_and_completes_handshake() {
+        use crate::netstack::test_packets::{TCP_ACK, TCP_SYN, make_tcp_packet, tcp_seq_number};
+
+        let mut stack = make_stack(); // 本端 10.0.0.2/32
+        stack.ingest_rx(make_tcp_packet(
+            ([10, 0, 0, 1], 5555),
+            ([1, 2, 3, 4], 80),
+            TCP_SYN,
+            1000,
+            0,
+        ));
+        stack.poll(Instant::now());
+
+        let server_seq =
+            stack.drain_tx().iter().find_map(|p| tcp_seq_number(p)).expect("SYN-ACK with seq");
+
+        stack.ingest_rx(make_tcp_packet(
+            ([10, 0, 0, 1], 5555),
+            ([1, 2, 3, 4], 80),
+            TCP_ACK,
+            1001,
+            server_seq + 1,
+        ));
+        stack.poll(Instant::now());
+
+        let events = stack.drain_accepted();
+        assert_eq!(events.len(), 1, "exactly one accepted connection");
+        let local = events[0].local.expect("local endpoint");
+        assert_eq!(local.port, 80);
+        assert_eq!(local.addr, IpAddress::Ipv4(Ipv4Address::new(1, 2, 3, 4)));
+    }
+
+    /// loopback dst 静默吞（Go Input() 同款）：不建听、不产生任何出站包。
+    #[test]
+    fn syn_to_loopback_dst_is_silently_dropped() {
+        use crate::netstack::test_packets::{TCP_SYN, make_tcp_packet};
+
+        let mut stack = make_stack();
+        stack.ingest_rx(make_tcp_packet(
+            ([10, 0, 0, 1], 5555),
+            ([127, 0, 0, 2], 80),
+            TCP_SYN,
+            1000,
+            0,
+        ));
+        stack.poll(Instant::now());
+        assert!(stack.listening.is_empty(), "loopback dst must not create listen");
+        assert!(stack.drain_tx().is_empty(), "loopback dst must be silently dropped");
+        assert!(stack.drain_accepted().is_empty());
     }
 
     /// 同 tuple 的 SYN 重传不产生重复监听（幂等）。
