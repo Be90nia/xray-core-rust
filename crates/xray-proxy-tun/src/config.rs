@@ -122,6 +122,10 @@ pub struct StackOptions {
     /// 自动出口接口。JSON `"autoOutboundsInterface"`；
     /// autoSystemRoutingTable 非空而未指定时归一化为 `"auto"`（Go infra/conf/tun.go:30-32）。
     pub auto_outbounds_interface: Option<String>,
+    /// 系统 DNS 接管开关。JSON `"autoSystemDnsToGateway"`，默认 `false`
+    /// （Go config.proto field 9；Linux/FreeBSD 语义，Windows 运行时忽略——Go 同）。
+    /// Rust proto 镜像为 7 字段（bd v5g）未含此键，仅 JSON 入。
+    pub auto_system_dns_to_gateway: bool,
 }
 
 impl Default for StackOptions {
@@ -138,6 +142,7 @@ impl Default for StackOptions {
             user_level: 0,
             auto_system_routing_table: Vec::new(),
             auto_outbounds_interface: None,
+            auto_system_dns_to_gateway: false,
         }
     }
 }
@@ -181,6 +186,10 @@ impl StackOptions {
         if let Some(s) = v.get("autoOutboundsInterface").and_then(|x| x.as_str()) {
             opts.auto_outbounds_interface = Some(s.to_string());
         }
+        // 系统 DNS 接管开关（Go config.proto field 9；默认 false=不接管）。
+        if let Some(b) = v.get("autoSystemDnsToGateway").and_then(|x| x.as_bool()) {
+            opts.auto_system_dns_to_gateway = b;
+        }
         // idleTimeout：Rust 扩展（Go TunConfig 无此字段）；数字（秒）或 "30s"/"5m"。
         if let Some(val) = v.get("idleTimeout") {
             opts.idle_timeout = parse_duration_value(val, "idleTimeout")?;
@@ -198,6 +207,14 @@ impl StackOptions {
         }
         if opts.mtu == 0 {
             opts.mtu = 1500;
+        }
+        // Go infra/conf/tun.go:62-65：接管需要 gateway（仅 linux/freebsd 校验；
+        // Windows 侧 Go 同样不校验、运行时忽略）。
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        if opts.auto_system_dns_to_gateway && opts.gateway.is_empty() {
+            return Err(TunError::InvalidConfig(
+                "autoSystemDnsToGateway needs gateway to be set".into(),
+            ));
         }
         Ok(opts)
     }
@@ -492,6 +509,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(opts.auto_outbounds_interface.as_deref(), Some("wlan0"));
+    }
+
+    #[test]
+    fn parse_json_dns_takeover_flag() {
+        // 默认 false（Go config.proto field 9 缺省=不接管）
+        let opts = StackOptions::parse_json(br#"{"name":"xray0"}"#).unwrap();
+        assert!(!opts.auto_system_dns_to_gateway);
+        // 显式 true（Go tun_test.go:24-28 同款输入）
+        let opts = StackOptions::parse_json(
+            br#"{"name":"xray0","gateway":["10.0.0.1/24"],"autoSystemDnsToGateway":true}"#,
+        )
+        .unwrap();
+        assert!(opts.auto_system_dns_to_gateway);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn parse_json_dns_takeover_requires_gateway_on_linux() {
+        // Go infra/conf/tun.go:62-65 + tun_test.go:52（错误表 linux/freebsd 行）
+        let err = StackOptions::parse_json(br#"{"autoSystemDnsToGateway":true}"#).unwrap_err();
+        assert!(err.to_string().contains("needs gateway"), "{err}");
+        // 有 gateway 则通过
+        let ok = StackOptions::parse_json(
+            br#"{"gateway":["10.0.0.1/24"],"autoSystemDnsToGateway":true}"#,
+        );
+        assert!(ok.is_ok());
     }
 
     #[test]
