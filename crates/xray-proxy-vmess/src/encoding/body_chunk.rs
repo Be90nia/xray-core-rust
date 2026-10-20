@@ -458,7 +458,7 @@ pub fn single_chunk_capacity(cipher: &dyn AeadCipher, size_parser: &dyn SizePars
 ///
 /// UDP 语义（对齐 Go vmess server `UDPSession`/client 非 cone）：每个 chunk 的
 /// payload 就是一个 UDP 数据报——写侧每次 `poll_write` 一包（复用
-/// [`write_one_chunk`] 构帧），读侧每解一个 chunk 交付一包。
+/// `write_one_chunk` 构帧），读侧每解一个 chunk 交付一包。
 ///
 /// 返回 `Ok(None)`：chunk 边界干净 EOF（流结束）或终止 chunk（空明文）。
 ///

@@ -39,7 +39,7 @@ pub const DEFAULT_DOWNLINK_ONLY_TIMEOUT: Duration = Duration::from_secs(1);
 ///
 /// 对应 Go `defaultBufferSize` 的 GOARCH「其他」分支（x86_64 等）。
 /// buffer size env 桥接已实现（Go 名 `xray.ray.buffer.size` 优先、
-/// `XRAY_BUFSIZE` 兜底，见 [`BUFFER_SIZE_ENV_NAMES`]）：[`BufferPolicy::default`] 经
+/// `XRAY_BUFSIZE` 兜底，见 `BUFFER_SIZE_ENV_NAMES`）：[`BufferPolicy::default`] 经
 /// [`default_buffer_connection_from_env`] 消费 env（Go policy.go:86-116
 /// `defaultBufferSize atomic` + `reloadEnvSettings` 的 init 等价物）。
 pub const DEFAULT_BUFFER_CONNECTION: i32 = 512 * 1024;

@@ -246,7 +246,7 @@ pub fn select_outbound_interface(interfaces: &[Interface], tun_index: u32) -> Op
     best.map(|(iface, _)| iface)
 }
 
-/// A4：按平台生成 DNS 计划（见 [`dns_wanted`] 的平台分派）。
+/// A4：按平台生成 DNS 计划（见 `dns_wanted` 的平台分派）。
 pub fn plan_dns(platform: Platform, options: &StackOptions) -> Result<Option<DnsPlan>> {
     match platform {
         Platform::Linux => {
