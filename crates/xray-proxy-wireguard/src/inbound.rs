@@ -378,14 +378,31 @@ impl WgTcpRelay {
     }
 
     /// 发送用户数据到 smoltcp TCP socket。
-    async fn send_to_smoltcp(&self, data: &[u8]) {
+    ///
+    /// `send_slice` 只接受 tx 缓冲当前空闲空间（SOCKET_BUF_SIZE=64KB），必须循环
+    /// 写完为止：缓冲满期间释放 netstack 锁等待——driver 定时器 drain_tx 把数据
+    /// 发上线路、WG client ACK 后空间才腾出；不释放会饿死唯一能推进发送的 task。
+    /// 单次调用丢弃残余会让下行响应恰好在 64KB 处静默截断（票 gmhe 遗留，同
+    /// dispatcher.rs::TcpRelay 修法；Go server.go:381-386 DispatchLink 全量拷贝无丢弃）。
+    async fn send_to_smoltcp(&self, mut data: &[u8]) {
         let mut stack = self.netstack.lock().await;
-        stack.poll(smoltcp::time::Instant::now());
-        stack.with_tcp_socket(self.handle, |s| {
-            if s.may_send() {
-                let _ = s.send_slice(data);
+        while !data.is_empty() {
+            stack.poll(smoltcp::time::Instant::now());
+            let (written, active) = stack.with_tcp_socket(self.handle, |s| {
+                let written = if s.may_send() { s.send_slice(data).unwrap_or(0) } else { 0 };
+                (written, s.is_active())
+            });
+            data = &data[written..];
+            if !data.is_empty() && !active {
+                // 对端已复位/关闭：残余无处可去，交由 run 循环的关闭路径收尾
+                return;
             }
-        });
+            if !data.is_empty() {
+                drop(stack);
+                tokio::time::sleep(Duration::from_millis(RELAY_POLL_MS)).await;
+                stack = self.netstack.lock().await;
+            }
+        }
         stack.poll(smoltcp::time::Instant::now());
     }
 
@@ -818,6 +835,120 @@ mod tests {
         assert_eq!(ctx.level, 3, "user level 挂接");
         assert!(ctx.from.starts_with("10.0.0.2"), "from = 隧道内源地址，got {}", ctx.from);
         assert_eq!(ctx.inbound_tag, "", "inbound_tag 由生产入口填充");
+
+        server.close().await.expect("server close");
+    }
+
+    /// 票 gmhe 遗留回归：响应 > smoltcp tx 缓冲（SOCKET_BUF_SIZE=64KB）时
+    /// WgTcpRelay::send_to_smoltcp 必须循环写满不丢字节。EchoDispatch 回灌
+    /// 192KB（3 × 缓冲），client 慢读制造缓冲满，逐字节比对。
+    #[tokio::test]
+    async fn tunnel_tcp_inbound_large_response_no_truncation() {
+        use std::net::SocketAddr;
+
+        use smoltcp::{
+            time::Instant,
+            wire::{IpAddress, IpCidr, Ipv4Address},
+        };
+
+        const TUNNEL_TCP_PORT: u16 = 8080;
+        const PAYLOAD_LEN: usize = 192 * 1024;
+        let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i % 251) as u8).collect();
+
+        let (sec_c, pub_c) = make_keypair(0x11);
+        let (sec_s, pub_s) = make_keypair(0x22);
+        let udp_port = free_port().await;
+
+        let server_cfg = DeviceConfig {
+            secret_key: sec_s,
+            endpoint: vec!["10.0.0.1/32".into()],
+            peers: vec![PeerConfig {
+                public_key: pub_c.clone(),
+                allowed_ips: vec!["10.0.0.2/32".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (dispatch, _seen, _access_seen) = EchoDispatch::new("wg-e2e-large", &payload);
+        let server = WireguardInboundHandler::new("wg-e2e-large", &server_cfg, udp_port, dispatch)
+            .await
+            .expect("server construct");
+        server.start().await.expect("server start");
+        server
+            .user_registry()
+            .add_user(
+                "u@wg",
+                3,
+                PeerConfig {
+                    public_key: pub_c,
+                    allowed_ips: vec!["10.0.0.2/32".into()],
+                    ..Default::default()
+                },
+            )
+            .expect("add user");
+
+        let client_cfg = DeviceConfig {
+            secret_key: sec_c,
+            endpoint: vec!["10.0.0.2/32".into()],
+            peers: vec![PeerConfig {
+                public_key: pub_s,
+                endpoint: format!("127.0.0.1:{udp_port}"),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let client_peer = shared_peer(&client_cfg, &client_cfg.peers[0], 0).expect("client peer");
+        let client_sock = bind_udp_socket("127.0.0.1:0").await.expect("client bind");
+        let client_ns = Arc::new(AsyncMutex::new(WgNetStack::new(
+            &[IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 2)), 32)],
+            1420,
+        )));
+        let client = Arc::new(WgDriver::new(client_peer, client_sock, Arc::clone(&client_ns)));
+        client.set_remote(SocketAddr::from(([127, 0, 0, 1], udp_port)));
+        tokio::spawn(Arc::clone(&client).main_loop());
+
+        let handle = {
+            let mut s = client_ns.lock().await;
+            let h = s.add_tcp_socket();
+            s.tcp_connect(h, IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)), TUNNEL_TCP_PORT)
+                .expect("tcp connect");
+            h
+        };
+
+        // 发请求触发 EchoDispatch 回灌；慢读（4KB/轮）制造 tx 缓冲满。
+        let mut sent = false;
+        let mut got: Vec<u8> = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while got.len() < PAYLOAD_LEN {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "large response incomplete: got {}/{}",
+                got.len(),
+                PAYLOAD_LEN
+            );
+            let mut closed = false;
+            {
+                let mut s = client_ns.lock().await;
+                s.poll(Instant::now());
+                s.with_tcp_socket(handle, |sock| {
+                    if sock.may_send() && !sent {
+                        let _ = sock.send_slice(b"ping");
+                        sent = true;
+                    }
+                    let mut buf = [0u8; 4096];
+                    let n = sock.recv_slice(&mut buf).unwrap_or(0);
+                    got.extend_from_slice(&buf[..n]);
+                    closed = !sock.is_active();
+                });
+            }
+            if closed && got.len() < PAYLOAD_LEN {
+                panic!("response truncated: got {}/{}", got.len(), PAYLOAD_LEN);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        assert_eq!(got.len(), PAYLOAD_LEN, "byte count");
+        assert!(got == payload, "content mismatch");
 
         server.close().await.expect("server close");
     }
