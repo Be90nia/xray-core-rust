@@ -82,12 +82,14 @@ impl Handler {
     /// 从配置初始化 Handler。对应 Go `Handler.Init(config, dnsClient, policyManager)`。
     ///
     /// Rust 切片不注入 `dns.Client` + `policy.Manager`（由生产装配层
-    /// `DnsDispatchBridge` 持有 DnsService），超时用固定值。
-    pub fn init(config: &Config) -> Self {
+    /// `DnsDispatchBridge` 持有 DnsService）；`timeout` 由装配层从
+    /// `policy.ForLevel(config.UserLevel).Timeouts.ConnectionIdle` 注入
+    /// （Go dns.go:85），无 policy 时回退 SessionDefault 并 warn。
+    pub fn init(config: &Config, timeout: Duration) -> Self {
         let rules: Vec<DnsRule> = config.rule.iter().map(DnsRule::from_config).collect();
         let rewrite =
             config.rewrite_server.as_ref().map(prost_endpoint_to_overrides).unwrap_or_default();
-        Self { rules, rewrite, timeout: Duration::from_secs(5) }
+        Self { rules, rewrite, timeout }
     }
 
     /// 查找首个匹配的规则，返回 `(action, rCode)`。
@@ -243,9 +245,10 @@ mod tests {
     #[test]
     fn init_empty_config_has_no_rules() {
         let cfg = Config::default();
-        let h = Handler::init(&cfg);
+        let h = Handler::init(&cfg, Duration::from_millis(1500));
         assert_eq!(h.rule_count(), 0);
-        assert_eq!(h.timeout, Duration::from_secs(5));
+        // G14：超时可注入（装配层传 policy ConnectionIdle），不再硬编码。
+        assert_eq!(h.timeout, Duration::from_millis(1500));
     }
 
     #[test]
@@ -258,7 +261,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let h = Handler::init(&cfg);
+        let h = Handler::init(&cfg, Duration::from_secs(5));
         assert_eq!(h.rule_count(), 1);
     }
 
@@ -272,7 +275,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let h = Handler::init(&cfg);
+        let h = Handler::init(&cfg, Duration::from_secs(5));
         // AAAA 匹配 Drop
         assert_eq!(h.match_rules(28, "any.com"), (RuleAction::Drop, 0));
         // A 不匹配规则 → Go 默认 A/AAAA = Hijack（dns.go:148-150）
@@ -297,7 +300,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let h = Handler::init(&cfg);
+        let h = Handler::init(&cfg, Duration::from_secs(5));
         // A 匹配第一条规则（Return + rCode 5 透传）
         assert_eq!(h.match_rules(1, "x.com"), (RuleAction::Return, 5));
         // AAAA 只匹配第一条规则
@@ -316,7 +319,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let h = Handler::init(&cfg);
+        let h = Handler::init(&cfg, Duration::from_secs(5));
         assert_eq!(h.match_rules(1, "a.com"), (RuleAction::Hijack, 0));
         assert_eq!(h.match_rules(28, "b.com"), (RuleAction::Hijack, 0));
         assert_eq!(h.match_rules(255, "c.com"), (RuleAction::Hijack, 0));
@@ -325,7 +328,7 @@ mod tests {
     /// Go applyRules 无匹配默认：A/AAAA → Hijack；其余 → Return。
     #[test]
     fn match_rules_defaults_a_hijack_others_return() {
-        let h = Handler::init(&Config::default());
+        let h = Handler::init(&Config::default(), Duration::from_secs(5));
         assert_eq!(h.match_rules(1, "a.com"), (RuleAction::Hijack, 0));
         assert_eq!(h.match_rules(28, "b.com"), (RuleAction::Hijack, 0));
         assert_eq!(h.match_rules(15, "mx.com"), (RuleAction::Return, 0));
@@ -340,7 +343,7 @@ mod tests {
         let base = Destination::udp(Address::IPv4("8.8.8.8".parse().unwrap()), Port::new(53));
 
         // 未配置 → 原样。
-        let h = Handler::init(&Config::default());
+        let h = Handler::init(&Config::default(), Duration::from_secs(5));
         assert!(!h.has_rewrite());
         assert_eq!(h.rewrite_dest(&base), base);
 
@@ -353,7 +356,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let h = Handler::init(&cfg);
+        let h = Handler::init(&cfg, Duration::from_secs(5));
         assert!(h.has_rewrite());
         let d = h.rewrite_dest(&base);
         assert_eq!(d.port().value(), 5353);
@@ -373,7 +376,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let h = Handler::init(&cfg);
+        let h = Handler::init(&cfg, Duration::from_secs(5));
         let d = h.rewrite_dest(&base);
         assert!(d.is_tcp());
         assert_eq!(d.port().value(), 853);
@@ -389,7 +392,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let h = Handler::init(&cfg);
+        let h = Handler::init(&cfg, Duration::from_secs(5));
         let q = DnsQuestion { name: "example.com".into(), q_type: 1, q_class: 1 };
         assert_eq!(decide_action(&h, &q), RuleAction::Drop);
     }
@@ -436,7 +439,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let h = Handler::init(&cfg);
+        let h = Handler::init(&cfg, Duration::from_secs(5));
         let query = make_query_bytes("example.com", 1);
         let outcome = futures_lite_or_block_on(h.process(&query)).expect("process");
         match outcome {
@@ -458,7 +461,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let h0 = Handler::init(&cfg0);
+        let h0 = Handler::init(&cfg0, Duration::from_secs(5));
         let outcome = futures_lite_or_block_on(h0.process(&query)).expect("process");
         match outcome {
             ProcessOutcome::Respond { response } => {
@@ -481,7 +484,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let h = Handler::init(&cfg);
+        let h = Handler::init(&cfg, Duration::from_secs(5));
         let query = make_query_bytes("x.com", 28);
         let outcome = futures_lite_or_block_on(h.process(&query)).expect("process");
         match outcome {
@@ -493,7 +496,7 @@ mod tests {
     /// 无规则 + A 查询 → 默认 Hijack（Go dns.go:148）。
     #[test]
     fn process_default_a_query_hijacks() {
-        let h = Handler::init(&Config::default());
+        let h = Handler::init(&Config::default(), Duration::from_secs(5));
         let query = make_query_bytes("default.example.com", 1);
         let outcome = futures_lite_or_block_on(h.process(&query)).expect("process");
         assert!(matches!(outcome, ProcessOutcome::Hijack { .. }));
@@ -502,7 +505,7 @@ mod tests {
     /// 无规则 + TXT 查询 → 默认 Return 空响应（Go dns.go:150-151）。
     #[test]
     fn process_default_txt_query_returns_empty() {
-        let h = Handler::init(&Config::default());
+        let h = Handler::init(&Config::default(), Duration::from_secs(5));
         let query = make_query_bytes("default.example.com", 16); // TXT
         let outcome = futures_lite_or_block_on(h.process(&query)).expect("process");
         match outcome {
@@ -526,7 +529,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let h = Handler::init(&cfg);
+        let h = Handler::init(&cfg, Duration::from_secs(5));
         let query = make_query_bytes("hijack.example.com", 1);
         let outcome = futures_lite_or_block_on(h.process(&query)).expect("process");
         match outcome {
@@ -547,7 +550,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let h = Handler::init(&cfg);
+        let h = Handler::init(&cfg, Duration::from_secs(5));
         let query = make_query_bytes("txt.example.com", 16); // TXT
         let outcome = futures_lite_or_block_on(h.process(&query)).expect("process");
         match outcome {
@@ -562,7 +565,7 @@ mod tests {
 
     #[test]
     fn process_invalid_query_returns_parse_error() {
-        let h = Handler::init(&Config::default());
+        let h = Handler::init(&Config::default(), Duration::from_secs(5));
         // 空字节不是合法 DNS 消息
         let err = futures_lite_or_block_on(h.process(&[])).unwrap_err();
         assert!(matches!(err, DnsProxyError::QueryParseFailed(_)));
@@ -592,7 +595,7 @@ mod tests {
 
     #[test]
     fn rewrite_server_none_by_default() {
-        let h = Handler::init(&Config::default());
+        let h = Handler::init(&Config::default(), Duration::from_secs(5));
         assert!(!h.has_rewrite());
     }
 }

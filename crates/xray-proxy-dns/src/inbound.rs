@@ -10,7 +10,9 @@
 //! - TCP：dispatcher accept 连接 → 调 [`DnsInbound::handle_conn`]
 
 use async_trait::async_trait;
+use std::sync::Arc;
 use tokio::{io::AsyncWriteExt, net::TcpStream};
+use xray_common::signal::ActivityTimer;
 use xray_features::inbound::{InboundError, InboundHandler};
 
 use crate::{
@@ -49,27 +51,47 @@ impl DnsInbound {
 
     /// 处理 TCP DNS 连接：循环读取（2B 长度前缀帧）→ 处理 → 写回。
     ///
-    /// 客户端关闭连接（EOF）时正常退出。
+    /// 客户端关闭连接（EOF）时正常退出；静默超过 `handler.timeout`（装配层
+    /// 注入的 policy `ConnectionIdle`）即关闭——对应 Go dns.go:226
+    /// `signal.CancelAfterInactivity`，读帧/写响应均重置窗口，非硬截止总时长。
     ///
     /// # Errors
     /// 透传底层 IO 错误和处理错误。
     pub async fn handle_conn(&self, mut conn: TcpStream) -> Result<()> {
-        loop {
-            let query = match decode_tcp_dns_message(&mut conn).await {
-                Ok(q) => q,
-                // EOF = 客户端关闭，正常退出
-                Err(DnsProxyError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    return Ok(());
-                },
-                Err(e) => return Err(e),
-            };
-            let outcome = self.handler.process(&query).await?;
-            if let Some(resp) = route_outcome(&self.outbound, outcome).await? {
-                let framed = encode_tcp_dns_message(&resp)?;
-                conn.write_all(&framed).await?;
+        // Go CancelAfterInactivity：run 循环 task 与连接循环共享 Arc，
+        // 活动即 update_activity 重置空闲窗口（proxyman worker 同款模式）。
+        let timer = Arc::new(ActivityTimer::new(self.handler.timeout));
+        let mut done = timer.done_signal();
+        let run_timer = Arc::clone(&timer);
+        let ticker = tokio::spawn(async move { run_timer.run().await });
+        let result = async {
+            loop {
+                let query = tokio::select! {
+                    // 静默超窗 → 终止连接（Go terminate → conn.Close()）。
+                    _ = done.wait() => return Ok(()),
+                    q = decode_tcp_dns_message(&mut conn) => match q {
+                        // EOF = 客户端关闭，正常退出
+                        Err(DnsProxyError::Io(e))
+                            if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                        Err(e) => return Err(e),
+                        Ok(q) => {
+                            timer.update_activity();
+                            q
+                        },
+                    },
+                };
+                let outcome = self.handler.process(&query).await?;
+                if let Some(resp) = route_outcome(&self.outbound, outcome).await? {
+                    let framed = encode_tcp_dns_message(&resp)?;
+                    conn.write_all(&framed).await?;
+                    timer.update_activity();
+                }
+                // Drop：不写响应，继续等下一条（不主动关闭）
             }
-            // Drop：不写响应，继续等下一条（不主动关闭）
         }
+        .await;
+        ticker.abort();
+        result
     }
 }
 
@@ -111,8 +133,10 @@ impl InboundHandler for DnsInbound {
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
+    use std::time::Duration;
 
     use super::*;
+    use tokio::io::AsyncReadExt as _;
     use crate::config::{Config, DnsRuleConfig, RuleAction};
 
     /// 构造最小 DNS A 查询消息（handler.rs tests 中同款）。
@@ -135,14 +159,112 @@ mod tests {
     }
 
     fn make_inbound_with_rules(rules: Vec<DnsRuleConfig>) -> DnsInbound {
+        make_inbound_with_timeout(rules, Duration::from_secs(5))
+    }
+
+    fn make_inbound_with_timeout(rules: Vec<DnsRuleConfig>, timeout: Duration) -> DnsInbound {
         let cfg = Config { rule: rules, ..Default::default() };
-        let handler = Handler::init(&cfg);
+        let handler = Handler::init(&cfg, timeout);
         let outbound = DnsOutbound::new_with_servers(
             "test-dns",
             &[(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 5353)],
         )
         .expect("build outbound");
         DnsInbound::new("test-in", handler, outbound)
+    }
+
+    /// 起真实 loopback TCP listener → accept 一条连接交给 handle_conn，
+    /// 返回客户端应连的地址。
+    async fn spawn_handle_conn(inbound: Arc<DnsInbound>) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((conn, _)) = listener.accept().await {
+                let _ = inbound.handle_conn(conn).await;
+            }
+        });
+        addr
+    }
+
+    // ---- G14：handle_conn inactivity 计时（真实时钟） ----
+
+    /// 验收①：注入短超时（200ms）→ 静默连接按时被终止。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handle_conn_idle_timeout_terminates_silent_connection() {
+        let inbound = Arc::new(make_inbound_with_timeout(vec![], Duration::from_millis(200)));
+        let addr = spawn_handle_conn(inbound).await;
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+
+        let start = std::time::Instant::now();
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("EOF 应在 2s 内到达")
+            .expect("read");
+        assert_eq!(n, 0, "静默超窗后服务端应关闭连接（EOF）");
+        assert!(start.elapsed() >= Duration::from_millis(150), "不应早于超时窗口被杀");
+    }
+
+    /// 验收②：注入长超时（5s）→ 200ms 窗口内不误杀（超时可注入生效，
+    /// 不存在更短的硬编码值反向影响）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handle_conn_long_timeout_does_not_kill_within_window() {
+        let inbound = Arc::new(make_inbound_with_timeout(vec![], Duration::from_secs(5)));
+        let addr = spawn_handle_conn(inbound).await;
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+
+        let mut buf = [0u8; 16];
+        match tokio::time::timeout(Duration::from_millis(300), client.read(&mut buf)).await {
+            Err(_) => {}, // 连接仍开 = 正确
+            Ok(Ok(0)) => panic!("5s 超时注入下连接不得在 300ms 内被杀"),
+            Ok(Ok(_)) => panic!("静默期不应有数据"),
+            Ok(Err(e)) => panic!("read error: {e}"),
+        }
+    }
+
+    /// 验收③：持续有读活动时不被 inactivity 计时器杀掉（活动重置窗口）。
+    ///
+    /// 窗口设计（真实时钟，边界必须与杀点分离——首版杀点 1000ms 与存活窗
+    /// 终点 1000ms 贴死，微秒级调度竞态导致 flaky）：
+    /// - idle=500ms，最后写 1350ms → 杀点 1850ms；
+    /// - 存活窗 [1350, 1500]，距杀点 350ms 余量（>10 次调度的累积抖动）；
+    /// - 断言只看 EOF：被杀 = EOF 提前出现；读到数据也证明连接存活
+    ///   （数据内容不属本测试断言范围，Drop 语义下理论无数据）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handle_conn_activity_resets_idle_window() {
+        // 全类型 Drop 规则：查询被静默丢弃，只靠读活动续命，无响应写。
+        let rules = vec![DnsRuleConfig { action: RuleAction::Drop, ..Default::default() }];
+        let inbound = Arc::new(make_inbound_with_timeout(rules, Duration::from_millis(500)));
+        let addr = spawn_handle_conn(inbound).await;
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+
+        // 每 150ms 发一个合法查询帧 × 10：最后写 1350ms，杀点 1350+500=1850ms。
+        let query = make_query_bytes("example.com", 1);
+        let frame = encode_tcp_dns_message(&query).expect("frame");
+        for _ in 0..10 {
+            client.write_all(&frame).await.expect("write");
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+
+        // 存活窗 [1350, 1500]：距杀点 350ms，EOF 若在此出现 = 活动重置失效。
+        let mut buf = [0u8; 16];
+        match tokio::time::timeout(Duration::from_millis(150), client.read(&mut buf)).await {
+            Ok(Ok(0)) => panic!("持续活动下连接不得被 inactivity 计时器杀掉"),
+            Ok(Err(e)) => panic!("read error: {e}"),
+            // 连接仍开（无论有无数据）= 活动重置生效。
+            Err(_) | Ok(Ok(_)) => {},
+        }
+
+        // 停止活动 → 杀点 1850ms：循环读排干直到 EOF（不假设「无残余数据」）。
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if client.read(&mut buf).await.expect("read") == 0 {
+                    return; // EOF = 连接已按超时窗口终止
+                }
+            }
+        })
+        .await
+        .expect("EOF 应在停活动后到达");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -226,7 +348,7 @@ mod tests {
         .expect("build outbound");
 
         // 3. 创建 DnsInbound（无规则 → Direct 转发）
-        let handler = Handler::init(&Config::default());
+        let handler = Handler::init(&Config::default(), Duration::from_secs(5));
         let inbound = DnsInbound::new("test-in", handler, outbound);
 
         // 4. 构造 DNS A 查询 "example.com"

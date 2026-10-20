@@ -3283,7 +3283,11 @@ async fn spawn_one_inbound(
         },
         // dns inbound：UDP+TCP listener → handle_packet/handle_conn
         "dns" => {
-            let (handler, outbound) = parse_dns_inbound_config(&ib.entry.data, &ib.tag)?;
+            // G14（Go dns.go:85）：空闲超时取 policy ConnectionIdle；inbound
+            // settings JSON 无 userLevel 概念，固定 level 0。无 manager 时
+            // dns_idle_timeout_for 内显式回退 SessionDefault 并 warn 一次。
+            let dns_idle = crate::outbound::dns_idle_timeout_for(policy.as_deref(), 0);
+            let (handler, outbound) = parse_dns_inbound_config(&ib.entry.data, &ib.tag, dns_idle)?;
             let inbound = Arc::new(DnsInbound::new(&ib.tag, handler, outbound));
             let udp = UdpSocket::bind(&addr).await?;
             let tcp = InboundTcpListener::bind(&addr, inbound_sockopts.clone()).await?;
@@ -4600,11 +4604,15 @@ fn parse_wireguard_inbound_config(data: &[u8]) -> std::io::Result<(DeviceConfig,
 /// 从 inbound entry.data（JSON）解析 dns inbound 配置。
 ///
 /// JSON 格式：`{"servers":["8.8.8.8:53"]}` 或空对象。
-/// 返回 (Handler, DnsOutbound)。
-fn parse_dns_inbound_config(data: &[u8], tag: &str) -> std::io::Result<(DnsHandler, DnsOutbound)> {
+/// 返回 (Handler, DnsOutbound)。`idle_timeout` 由装配层从 policy 注入（G14）。
+fn parse_dns_inbound_config(
+    data: &[u8],
+    tag: &str,
+    idle_timeout: std::time::Duration,
+) -> std::io::Result<(DnsHandler, DnsOutbound)> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("dns inbound settings JSON: {e}")))?;
-    let handler = DnsHandler::init(&DnsConfig::default());
+    let handler = DnsHandler::init(&DnsConfig::default(), idle_timeout);
     // 解析上游 DNS 服务器列表
     let servers: Vec<(std::net::IpAddr, u16)> = v
         .get("servers")
