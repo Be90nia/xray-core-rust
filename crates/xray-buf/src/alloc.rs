@@ -167,6 +167,15 @@ pub fn alloc(size: usize) -> BytesMut {
 pub fn release(mut buf: BytesMut) {
     let capacity = buf.capacity();
     if let Some(tier) = select_tier(capacity) {
+        // 只回收「容量恰等于层大小」的块：`alloc(tier)` 的调用方按
+        // TIER_SIZES[tier] 使用返回块，任意小容量真池块（Buffer::with_capacity /
+        // from_bytes / Frozen 写时 COW 转正）入池会让下游拿到不足额 buffer
+        // （2026-10-20 实测：8KB 层混入 3KB 块，读窗口缩水）。
+        // 非标准容量直接丢弃 → 归还系统。
+        if capacity != TIER_SIZES[tier] {
+            tracing::trace!(capacity, tier, tier_size = TIER_SIZES[tier], "缓冲池丢弃非标准容量块");
+            return;
+        }
         buf.clear();
 
         // 1. 尝试 TLS 缓存
@@ -332,6 +341,25 @@ mod tests {
             total <= SHARD_MAX_PER_TIER * SHARD_COUNT,
             "全局池必须不超过分片数×每分片上限(实测{total}, 含并发污染)"
         );
+        clear();
+    }
+
+    /// 池只回收「容量恰等于层大小」的块。
+    ///
+    /// 不足额块（Buffer::with_capacity / from_bytes / Frozen 写时 COW 转正的
+    /// 任意容量 BytesMut）一旦入池，`alloc(tier)` 的调用方会拿到比层大小小的
+    /// buffer（2026-10-20 实测：8KB 层混入 KB 级块，读窗口缩水）。修复=release
+    /// 侧按 capacity == TIER_SIZES[tier] 过滤，本测试钉住该不变量。
+    #[test]
+    fn release_discards_off_size_blocks() {
+        let _g = POOL_TEST_LOCK.lock();
+        clear();
+        let off = BytesMut::with_capacity(3000);
+        assert!(off.capacity() < DEFAULT_SIZE, "前置：3000 落在 tier1 区间但不是标准容量");
+        release(off);
+        let got = alloc(DEFAULT_SIZE);
+        assert_eq!(got.capacity(), DEFAULT_SIZE, "不足额块不得入池（否则下游读窗口缩水）");
+        release(got);
         clear();
     }
 
