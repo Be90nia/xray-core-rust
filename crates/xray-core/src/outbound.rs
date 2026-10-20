@@ -3571,10 +3571,7 @@ mod tests {
         })
         .unwrap();
         // level 1 命中配置档位 → 600s
-        assert_eq!(
-            dns_idle_timeout_for(Some(&pm), 1),
-            std::time::Duration::from_secs(600)
-        );
+        assert_eq!(dns_idle_timeout_for(Some(&pm), 1), std::time::Duration::from_secs(600));
         // level 0 未配置 → SessionDefault（300s）
         assert_eq!(
             dns_idle_timeout_for(Some(&pm), 0),
@@ -3604,8 +3601,7 @@ mod tests {
         data: &[u8],
         idle_timeout: std::time::Duration,
     ) -> std::result::Result<xray_proxy_dns::Handler, String> {
-        build_dns_outbound_config(data)
-            .map(|cfg| xray_proxy_dns::Handler::init(&cfg, idle_timeout))
+        build_dns_outbound_config(data).map(|cfg| xray_proxy_dns::Handler::init(&cfg, idle_timeout))
     }
 
     fn mux_outbound(tag: &str, mux_json: serde_json::Value) -> BuiltOutbound {
@@ -5992,7 +5988,8 @@ mod tests {
         };
 
         let svc = make_fakedns_service("fake-in");
-        let handler = parse_dns_outbound_config(b"{}", std::time::Duration::from_secs(300)).unwrap();
+        let handler =
+            parse_dns_outbound_config(b"{}", std::time::Duration::from_secs(300)).unwrap();
         let bridge = DnsDispatchBridge::new("dns-out", handler, Some(svc));
         // dest 无所谓（Hijack 不转发）。
         let dest = Destination::udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(53));
@@ -6205,7 +6202,8 @@ mod tests {
 
         // 无规则（A 默认 Hijack）+ DnsService 带 client tag "self-loop"。
         let svc = make_fakedns_service("self-loop");
-        let handler = parse_dns_outbound_config(b"{}", std::time::Duration::from_secs(300)).unwrap();
+        let handler =
+            parse_dns_outbound_config(b"{}", std::time::Duration::from_secs(300)).unwrap();
         let bridge = DnsDispatchBridge::new("dns-out", handler, Some(svc));
         let dest =
             Destination::udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(addr.port()));
