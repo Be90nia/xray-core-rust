@@ -351,7 +351,15 @@ pub fn new_server_with_config(
         "" => udp::new_classic_name_server(&cfg)?,
         "tcp" => tcp::new_tcp_name_server(&cfg)?,
         "tls" => dot::new_dot_name_server(&cfg, server_name, utls::default_client_config())?,
-        "https" => doh::new_doh_name_server(&cfg, server_name, utls::default_client_config())?,
+        // ypsl：DoH 强制 ALPN h2——default_client_config 无 ALPN，真实 DoH server
+        // （cloudflare/alidns 实测）按 HTTP/1.1 处理 h2 preface → GOAWAY
+        // FRAME_SIZE_ERROR，每次查询 4s 超时回落系统 DNS。范式同 xray-tls
+        // ech_doh DEFAULT_DOH_TLS_CONFIG；DoQ 在 quic.rs 自行覆写 alpn=doq。
+        "https" => {
+            let mut tls_cfg = (*utls::default_client_config()).clone();
+            tls_cfg.alpn_protocols = vec![b"h2".to_vec()];
+            doh::new_doh_name_server(&cfg, server_name, std::sync::Arc::new(tls_cfg))?
+        },
         "h2c" => doh::new_doh_h2c_name_server(&cfg)?,
         "quic" => quic::new_quic_name_server(&cfg, server_name, utls::default_client_config())?,
         _ => unreachable!(),

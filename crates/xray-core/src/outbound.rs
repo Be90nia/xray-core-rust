@@ -4877,12 +4877,17 @@ mod tests {
         let mut mb2 = MultiBuffer::new();
         mb2.merge_bytes(b"should-not-echo");
         up_w2.write_multi_buffer(mb2).await.unwrap();
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(3), dn_r2.read_multi_buffer())
-                .await
-                .is_err(),
-            "AsIs (no strategy) must not resolve domain via DNS service"
-        );
+        // 无回显 = 超时或下行 EOF（拨号失败立即关下行，批次 A 兜底）；
+        // 只有读回数据才证明域名被 DNS 服务解析了。
+        match tokio::time::timeout(std::time::Duration::from_secs(3), dn_r2.read_multi_buffer())
+            .await
+        {
+            Err(_) | Ok(Err(_)) => {},
+            Ok(Ok(buf)) => panic!(
+                "AsIs (no strategy) must not resolve domain via DNS service, got {} bytes",
+                buf.len()
+            ),
+        }
     }
 
     // ===== DialerProxy（bd enk）=====

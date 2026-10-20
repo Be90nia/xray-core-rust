@@ -458,6 +458,8 @@ mod tests {
 
     /// bd mcpo 验收②：dialer 注入后查询经路由出站——dialer 收到查询目标
     /// （dest 原样传递），数据经 dialer 建立的链路往返。
+    /// ypsl P0（doh-h2-deepdive）：共享拨号器管线停摆期间 connect_stream 一律
+    /// 直连——dialer 不被调用（恢复共享拨号时回滚本断言）。
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
     async fn tcp_query_routes_through_dialer() {
@@ -480,13 +482,11 @@ mod tests {
 
         assert_eq!(rec.ips, vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))]);
         let recorded = dialer.recorded.lock();
-        assert_eq!(recorded.len(), 1, "query must dial through the routing dialer");
         assert_eq!(
-            recorded[0].address(),
-            &Address::from(addr.ip()),
-            "dialer must receive the query destination"
+            recorded.len(),
+            0,
+            "P0 期间查询直连，不得走共享拨号器（恢复共享拨号时改回 == 1 并保留 dest 断言）"
         );
-        assert_eq!(recorded[0].port().value(), addr.port());
     }
 
     /// 地址切换解析器：先返回 IP_A 后返回 IP_B（模拟上游 NS 地址变更）。
