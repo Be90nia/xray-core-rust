@@ -22,7 +22,7 @@
 //! - `transport/internet/memory_settings.go:9-20`：`MemoryStreamConfig` 结构
 //! - `transport/internet/memory_settings.go:23-83`：`ToMemoryStreamConfig`
 //! - `transport/internet/config.proto:44-65`：`StreamConfig` proto
-//! - `transport/internet/config.proto:67-87`：`UdpHop` / `QuicParams` proto
+//! - `transport/internet/config.proto:67-95`：`UdpHop` / `QuicParams` proto
 //! - `infra/conf/transport_internet.go:620-635`：`QuicParamsConfig` JSON 字段
 //! - `infra/conf/transport_internet.go:1977-1981`：`FinalMask{tcp, udp, quicParams}`
 //! - `infra/conf/transport_internet.go:2138-2242`：Build() 装配 4 块的语义
