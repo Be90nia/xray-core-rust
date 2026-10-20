@@ -39,6 +39,19 @@ pub fn apply_masquerade_json(
     config.masq_url = get_str("url").to_string();
     config.masq_url_rewrite_host = m.get("rewriteHost").and_then(|x| x.as_bool()).unwrap_or(false);
     config.masq_url_insecure = m.get("insecure").and_then(|x| x.as_bool()).unwrap_or(false);
+    // xForwarded（Go transport_method.go:754）：masquerade proxy 注入
+    // X-Forwarded-For；Rust masquerade proxy 不读该字段（masq_url_x_forwarded
+    // 无运行时消费点）→ true 配置层硬错不静默（票 037f）。
+    match m.get("xForwarded") {
+        None | Some(serde_json::Value::Null) | Some(serde_json::Value::Bool(false)) => {},
+        Some(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "masquerade.xForwarded is not supported by this build (X-Forwarded-For \
+                 injection is not implemented); remove the key",
+            ));
+        },
+    }
     config.masq_string = get_str("content").to_string();
     if let Some(h) = m.get("headers") {
         let Some(hm) = h.as_object() else {
@@ -236,5 +249,22 @@ mod tests {
         let mut out = Config::default();
         m.to_config(&mut out);
         assert_eq!(out, c);
+    }
+
+    /// 票 037f：masquerade.xForwarded=true 配置层硬错（Rust masquerade proxy
+    /// 无 X-Forwarded-For 注入）；false/null/缺省放行。
+    #[test]
+    #[allow(clippy::err_expect)] // 存量清零批次：测试断言期 expect（禁 expect_err）
+    fn masq_x_forwarded_true_rejected_false_passes() {
+        let mut c = Config::default();
+        let err = apply_masquerade_json(&mut c, &serde_json::json!({"xForwarded": true}))
+            .err()
+            .expect("xForwarded:true must reject");
+        assert!(err.to_string().contains("xForwarded"), "got: {err}");
+        for off in [serde_json::json!({"xForwarded": false}), serde_json::json!({})] {
+            let mut c = Config::default();
+            apply_masquerade_json(&mut c, &off)
+                .unwrap_or_else(|e| panic!("{off} must pass, got: {e}"));
+        }
     }
 }

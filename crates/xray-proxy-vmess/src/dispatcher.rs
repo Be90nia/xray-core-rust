@@ -263,6 +263,14 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>) -> DialFn {
                 matches!(security, SecurityType::Aes128Gcm | SecurityType::Chacha20Poly1305);
             if use_masking {
                 option.set(request_option::CHUNK_MASKING);
+            }
+            // 票 037f：xray.vmess.padding env（Go outbound.go:231-236 enablePadding
+            // + shouldEnablePadding 短路项）：env 设置即对全部 security 开
+            // GLOBAL_PADDING；CHUNK_MASKING 仍按 security 判定（Go 同）。
+            if should_set_global_padding(
+                use_masking,
+                xray_common::platform::env::use_vmess_padding(),
+            ) {
                 option.set(request_option::GLOBAL_PADDING);
             }
             let account = MemoryAccount::new(config.user_uuid.clone()).with_security(security);
@@ -631,6 +639,13 @@ impl Connection for VmessUdpConn {
     }
 }
 
+/// GLOBAL_PADDING 判定（Go outbound.go:228-230 `shouldEnablePadding`）：
+/// AEAD 档（CHUNK_MASKING 场景）恒开；`xray.vmess.padding` env 设置时对
+/// 任意 security 开（enablePadding 短路项）。
+fn should_set_global_padding(use_masking: bool, env_padding: bool) -> bool {
+    use_masking || env_padding
+}
+
 /// 解析 security：Auto → 具体算法（与 server 端 `has_aes_gcm_hardware_support` 同语义）。
 fn resolve_security(s: SecurityType) -> Result<SecurityType, VmessError> {
     match s {
@@ -933,6 +948,16 @@ mod tests {
         );
         // 上界对齐既有 freedom 重试测试的 30s 宽限（dial_system 单次可耗 ~2s）。
         assert!(elapsed < std::time::Duration::from_secs(30), "{elapsed:?}");
+    }
+
+    /// 票 037f：GLOBAL_PADDING 判定对齐 Go `shouldEnablePadding`——AEAD 档恒开，
+    /// env（xray.vmess.padding）设置时任意 security 开。
+    #[test]
+    fn global_padding_decision_matches_go() {
+        assert!(should_set_global_padding(true, false), "AEAD 档恒开");
+        assert!(should_set_global_padding(true, true));
+        assert!(should_set_global_padding(false, true), "env 设置即开（Go enablePadding）");
+        assert!(!should_set_global_padding(false, false), "非 AEAD 且未设 env 不开");
     }
 
     #[test]

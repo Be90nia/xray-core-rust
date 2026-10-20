@@ -120,34 +120,55 @@ pub fn parse_enabled_env(value: Option<&str>) -> bool {
     }
 }
 
-/// `xray.vmess.padding`（alt `XRAY_VMESS_PADDING`）— VMess outbound 全局 padding 开关。
+/// 按顺序返回第一个**已设置**（含空串值，对齐 Go `os.LookupEnv` 命中语义）
+/// 的环境变量；全部未设置返回 `None`。
 ///
-/// 对应 Go `platform.UseVmessPadding`（proxy/vmess/outbound/outbound.go:240）。
-/// 当前 Rust VMess padding 由 per-session `GLOBAL_PADDING` flag 驱动；本 binding 暴露
-/// Go 等价 env 入口，便于上层装配或后续 VMess 启用点接入。
-pub fn use_vmess_padding() -> bool {
-    static FLAG: LazyLock<EnvFlag> = LazyLock::new(|| EnvFlag::new("xray.vmess.padding"));
-    FLAG.get_value_as_bool()
+/// bd 037f：跨 Go/Rust 迁移时按 Go 文档设置的 env 名必须生效——各 flag 一律
+/// **Go 原名优先、Rust 历史名兜底**（向后兼容），优先级写在各 flag 文档注释。
+pub fn env_first_set(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|n| std::env::var(n).ok())
 }
 
-/// `xray.xudp.show`（alt `XRAY_XUDP_SHOW`）== "true" 时启用 XUDP 协议层日志。
+/// `xray.vmess.padding`（alt `XRAY_VMESS_PADDING`）— VMess outbound 全局 padding 开关。
 ///
-/// 对应 Go `platform.XUDPLog`（common/xudp/xudp.go:35）。当前 Rust
-/// `xray_xudp::XudpConfig::from_env()` 走 `XUDP_LOG` 环境变量；这里补 Go 等价
-/// `xray.xudp.show` 入口。
+/// 对应 Go `platform.UseVmessPadding`（common/platform/platform.go:20）+
+/// proxy/vmess/outbound/outbound.go:231-236 `reloadEnvSettings`：Go 语义是
+/// **env 被设置即启用**（`!= defaultFlagValue`，值内容无关、空串也算设置）。
+/// 消费点：vmess dispatcher 对非 AEAD security 也置 GLOBAL_PADDING（对齐
+/// Go `shouldEnablePadding` 的 enablePadding 短路项）。LazyLock 进程级解析
+/// 一次（Go 经 RegisterEnvReload 可重载；Rust 无注册机制，变更需重启进程）。
+#[must_use]
+pub fn use_vmess_padding() -> bool {
+    static FLAG: LazyLock<bool> =
+        LazyLock::new(|| env_first_set(&["xray.vmess.padding", "XRAY_VMESS_PADDING"]).is_some());
+    *FLAG
+}
+
+/// `xray.xudp.show`（alt `XRAY_XUDP_SHOW`）== 真值时启用 XUDP 协议层日志。
+///
+/// 对应 Go `platform.XUDPLog`（common/xudp/xudp.go:35）。**Go 名优先**
+/// （`xray.xudp.show` / `XRAY_XUDP_SHOW`），Rust 历史名 `XUDP_LOG` 兜底
+/// （消费点 xray-xudp `XudpConfig::from_env`；bd 037f 前只认旧名）。
+#[must_use]
 pub fn xudp_show() -> bool {
-    static FLAG: LazyLock<EnvFlag> = LazyLock::new(|| EnvFlag::new("xray.xudp.show"));
-    FLAG.get_value_as_bool()
+    static FLAG: LazyLock<bool> = LazyLock::new(|| {
+        env_first_set(&["xray.xudp.show", "XRAY_XUDP_SHOW", "XUDP_LOG"])
+            .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+    });
+    *FLAG
 }
 
 /// `xray.xudp.basekey`（alt `XRAY_XUDP_BASEKEY`）— XUDP BaseKey 原始字符串值。
 ///
-/// 对应 Go `platform.XUDPBaseKey`（common/xudp/xudp.go:42）。调用方负责 Base64
-/// URL-safe 解码及 32 字节校验。
+/// 对应 Go `platform.XUDPBaseKey`（common/xudp/xudp.go:42）。**Go 名优先**
+/// （`xray.xudp.basekey` / `XRAY_XUDP_BASEKEY`），旧名 `XUDP_BASE_KEY` 兜底。
+/// 调用方负责 Base64 URL-safe 解码及 32 字节校验。
 #[must_use]
 pub fn xudp_basekey_raw() -> Option<String> {
-    static FLAG: LazyLock<EnvFlag> = LazyLock::new(|| EnvFlag::new("xray.xudp.basekey"));
-    FLAG.get_value().map(str::to_owned)
+    static FLAG: LazyLock<Option<String>> = LazyLock::new(|| {
+        env_first_set(&["xray.xudp.basekey", "XRAY_XUDP_BASEKEY", "XUDP_BASE_KEY"])
+    });
+    FLAG.clone()
 }
 
 /// `xray.cone.disabled`（alt `XRAY_CONE_DISABLED`）== "true" 时禁用 cone 模式。
@@ -177,6 +198,26 @@ pub fn browser_dialer_address() -> Option<String> {
 pub fn tun_fd_raw() -> Option<String> {
     static FLAG: LazyLock<EnvFlag> = LazyLock::new(|| EnvFlag::new("xray.tun.fd"));
     FLAG.get_value().map(str::to_owned)
+}
+
+/// 启动期扫描「Rust 无消费点」的 Go env：被设置即 warn 指名，不静默丢。
+///
+/// 覆盖（Go common/platform/platform.go:25,29；Rust 侧功能未接线）：
+/// - `xray.browser.dialer`：browser dialer 传输未装配（xray-transport 的
+///   `browser-dialer` 模块存在但无生产启动路径）。
+/// - `xray.tun.fd`：tun 走 tun-rs，android/ios fd 注入为 stub。
+///
+/// 生产接线：bin 启动早期与 [`reload_env_settings`] 同点调用一次。
+pub fn warn_unsupported_env_flags() {
+    for (name, why) in [
+        ("xray.browser.dialer", "the browser dialer transport is not wired in this build"),
+        ("xray.tun.fd", "tun fd passthrough is not implemented in this build"),
+    ] {
+        let alt = name.to_uppercase().replace('.', "_");
+        if env_first_set(&[name, alt.as_str()]).is_some() {
+            tracing::warn!("environment variable {name} is set but {why}; ignoring");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -398,5 +439,52 @@ mod tests {
         unsafe { std::env::set_var(NAME, "disable") };
         reload_env_settings();
         assert!(!use_splice(), "原名命中时优先于 alt");
+    }
+
+    /// bd 037f：Go 名优先 / 历史名兜底的顺序解析（含空串 =「已设置」语义）。
+    #[test]
+    fn env_first_set_go_name_wins_legacy_falls_back() {
+        static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let _g = LOCK.lock();
+
+        const GO: &str = "XRAY_TEST_037F_GO_NAME";
+        const LEGACY: &str = "XRAY_TEST_037F_LEGACY_NAME";
+        let saved = [(GO, std::env::var_os(GO)), (LEGACY, std::env::var_os(LEGACY))];
+        struct Restore([(&'static str, Option<std::ffi::OsString>); 2]);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (name, val) in self.0.iter() {
+                    // SAFETY: 测试持全局锁串行化 env 访问，set_var 窗口封闭
+                    unsafe {
+                        match val {
+                            Some(v) => std::env::set_var(name, v),
+                            None => std::env::remove_var(name),
+                        }
+                    }
+                }
+            }
+        }
+        let _restore = Restore(saved);
+        // SAFETY: 测试持全局锁串行化 env 访问，set_var 窗口封闭
+        unsafe {
+            std::env::remove_var(GO);
+            std::env::remove_var(LEGACY);
+        }
+
+        let names = [GO, LEGACY];
+        // ① 全未设置 → None
+        assert_eq!(env_first_set(&names), None);
+        // ② 只有历史名 → 兜底生效
+        // SAFETY: 测试持全局锁串行化 env 访问，set_var 窗口封闭
+        unsafe { std::env::set_var(LEGACY, "legacy") };
+        assert_eq!(env_first_set(&names).as_deref(), Some("legacy"));
+        // ③ Go 名在场 → 优先于历史名
+        // SAFETY: 测试持全局锁串行化 env 访问，set_var 窗口封闭
+        unsafe { std::env::set_var(GO, "go") };
+        assert_eq!(env_first_set(&names).as_deref(), Some("go"));
+        // ④ 空串 = LookupEnv 命中（Go presence 语义，vmess.padding 依赖）
+        // SAFETY: 测试持全局锁串行化 env 访问，set_var 窗口封闭
+        unsafe { std::env::set_var(GO, "") };
+        assert_eq!(env_first_set(&names).as_deref(), Some(""));
     }
 }

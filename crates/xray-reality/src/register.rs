@@ -212,6 +212,24 @@ fn parse_reality_config(json: Option<&serde_json::Value>) -> io::Result<RealityC
     }
     let (spider_x, spider_y) = parse_spider_x(spider_x_raw);
 
+    // 票 037f：`show`（Go transport_security.go:29）客户端同样消费——
+    // reality.go:102-285 握手期 fmt.Printf debug 打印；Rust 客户端未实现
+    // → true 拒启指名键。masterKeyLog/limitFallback*/type 在 Go 客户端 Build
+    // else 分支（transport_security.go:179-...）不消费（proto 值无客户端读者，
+    // Go 亦 inert），按 Go 语义忽略不在此拒。
+    if let Some(v) = obj.get("show") {
+        match v {
+            serde_json::Value::Null | serde_json::Value::Bool(false) => {},
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "reality: \"show\": true is not supported by this build (client handshake \
+                     debug tracing is not implemented); remove the key",
+                ));
+            },
+        }
+    }
+
     Ok(RealityConfig {
         fingerprint: fingerprint.to_string(),
         server_name: server_name.to_string(),
@@ -350,6 +368,29 @@ mod tests {
     fn parse_reality_config_missing_json_returns_err() {
         let r = parse_reality_config(None);
         assert!(r.is_err());
+    }
+
+    /// 票 037f：客户端 `show: true` 拒启（Go reality.go 客户端握手 debug 打印
+    /// 未实现）；false/缺省放行。
+    #[test]
+    #[allow(clippy::err_expect)] // 存量清零批次：测试断言期 expect（禁 expect_err）
+    fn parse_reality_config_rejects_client_show_true() {
+        let pub_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let mk = |show: serde_json::Value| {
+            serde_json::json!({
+                "serverName": "a.com",
+                "publicKey": pub_b64,
+                "show": show,
+            })
+        };
+        let err = parse_reality_config(Some(&mk(serde_json::json!(true))))
+            .err()
+            .expect("client show:true must reject");
+        assert!(err.to_string().contains("show"), "got: {err}");
+        // false / 缺省放行。
+        parse_reality_config(Some(&mk(serde_json::json!(false)))).expect("show:false must pass");
+        let plain = serde_json::json!({ "serverName": "a.com", "publicKey": pub_b64 });
+        parse_reality_config(Some(&plain)).expect("absent show must pass");
     }
 
     #[test]

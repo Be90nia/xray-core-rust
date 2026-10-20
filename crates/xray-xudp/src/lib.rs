@@ -31,11 +31,8 @@ use xray_common::net::network::Network;
 
 // ========== 环境变量名 ==========
 
-/// XUDP_LOG 环境变量名
-const ENV_XUDP_LOG: &str = "XUDP_LOG";
-
-/// XUDP_BASE_KEY 环境变量名
-const ENV_XUDP_BASE_KEY: &str = "XUDP_BASE_KEY";
+// bd 037f：env 名（`xray.xudp.show` / `xray.xudp.basekey` 及旧名兜底）收敛到
+// `xray_common::platform::env`（xudp_show / xudp_basekey_raw），本地不再维护名表。
 
 /// GlobalID 字节长度
 const GLOBAL_ID_LEN: usize = 8;
@@ -67,14 +64,19 @@ impl XudpConfig {
 
     /// 从环境变量加载配置。
     ///
-    /// - XUDP_LOG: 设为 "1" / "true" / "yes" / "on"（不区分大小写）时启用日志
-    /// - XUDP_BASE_KEY: Base64 URL-safe 无填充编码的 32 字节密钥； 未设置或无效时使用随机密钥
+    /// - `xray.xudp.show`（Go 名优先，旧名 `XUDP_LOG` 兜底）：设为 "1" / "true" /
+    ///   "yes" / "on"（不区分大小写）时启用日志
+    /// - `xray.xudp.basekey`（Go 名优先，旧名 `XUDP_BASE_KEY` 兜底）：Base64
+    ///   URL-safe 无填充编码的 32 字节密钥；未设置或无效时使用随机密钥
+    ///
+    /// env 名解析收敛在 `xray_common::platform::env`（bd 037f：Go 名优先，
+    /// 单一事实源，避免两处 env 名表漂移）。
     #[must_use]
     pub fn from_env() -> Self {
-        let log = parse_env_bool(ENV_XUDP_LOG);
+        let log = xray_common::platform::env::xudp_show();
 
-        let base_key = match std::env::var(ENV_XUDP_BASE_KEY) {
-            Ok(raw) if !raw.is_empty() => match URL_SAFE_NO_PAD.decode(&raw) {
+        let base_key = match xray_common::platform::env::xudp_basekey_raw() {
+            Some(raw) => match URL_SAFE_NO_PAD.decode(&raw) {
                 Ok(bytes) if bytes.len() == BASE_KEY_LEN => {
                     let mut key = [0u8; BASE_KEY_LEN];
                     key.copy_from_slice(&bytes);
@@ -82,18 +84,18 @@ impl XudpConfig {
                 },
                 Ok(bytes) => {
                     tracing::warn!(
-                        "XUDP_BASE_KEY: invalid length {}, expected {} bytes",
+                        "xray.xudp.basekey: invalid length {}, expected {} bytes",
                         bytes.len(),
                         BASE_KEY_LEN
                     );
                     random_base_key()
                 },
                 Err(e) => {
-                    tracing::warn!("XUDP_BASE_KEY: base64 decode failed: {e}");
+                    tracing::warn!("xray.xudp.basekey: base64 decode failed: {e}");
                     random_base_key()
                 },
             },
-            _ => random_base_key(),
+            None => random_base_key(),
         };
 
         Self { log, base_key }
@@ -195,14 +197,6 @@ fn random_base_key() -> [u8; BASE_KEY_LEN] {
     key
 }
 
-/// 解析布尔型环境变量（"1" / "true" / "yes" / "on" → true）
-fn parse_env_bool(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(v) => matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
-        Err(_) => false,
-    }
-}
-
 // ========== 测试 ==========
 
 #[cfg(test)]
@@ -228,9 +222,9 @@ mod tests {
 
     #[test]
     fn test_xudp_config_default_from_env_log_false() {
-        let cfg = XudpConfig::from_env();
-        if std::env::var(ENV_XUDP_LOG).is_err() {
-            assert!(!cfg.log, "log should be false when XUDP_LOG is unset");
+        if !xray_common::platform::env::xudp_show() {
+            let cfg = XudpConfig::from_env();
+            assert!(!cfg.log, "log should follow xray.xudp.show (Go name first)");
         }
     }
 
@@ -239,13 +233,38 @@ mod tests {
         let cfg = XudpConfig::from_env();
         assert!(
             cfg.base_key.iter().any(|&b| b != 0),
-            "base_key should not be all zeros when XUDP_BASE_KEY is unset"
+            "base_key should not be all zeros when xray.xudp.basekey is unset"
         );
     }
 
+    /// bd 037f：Go 名 `xray.xudp.basekey` 优先生效（历史名 `XUDP_BASE_KEY` 兜底
+    /// 由 xray-common env 层测试覆盖）。env 进程全局，持锁串行化。
     #[test]
-    fn test_parse_env_bool_unset() {
-        assert!(!parse_env_bool("XUDP_TEST_BOOL_UNSET_12345"), "unset env should be false");
+    fn test_from_env_reads_go_base_key_name() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap();
+
+        const GO: &str = "xray.xudp.basekey";
+        let saved = std::env::var_os(GO);
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: 测试持锁串行化 env 访问，set_var 窗口封闭
+                unsafe {
+                    match self.0.take() {
+                        Some(v) => std::env::set_var(GO, v),
+                        None => std::env::remove_var(GO),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(saved);
+
+        let key = [7u8; BASE_KEY_LEN];
+        // SAFETY: 测试持锁串行化 env 访问，set_var 窗口封闭
+        unsafe { std::env::set_var(GO, URL_SAFE_NO_PAD.encode(key)) };
+        let cfg = XudpConfig::from_env();
+        assert_eq!(cfg.base_key, key, "Go-name basekey must be consumed");
     }
 
     #[test]
