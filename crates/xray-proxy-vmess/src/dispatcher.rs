@@ -233,14 +233,21 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>) -> DialFn {
             let server_dest = config.server_destination();
             let sockopt =
                 config.stream_settings.as_ref().map(|s| s.socket_options()).unwrap_or_default();
-            let mut conn: Box<dyn Connection> = match &config.stream_settings {
-                Some(s) => xray_transport::dialer::dial(&server_dest, s, &sockopt)
-                    .await
-                    .map_err(|e| format!("vmess dial server ({}): {e}", s.protocol))?,
-                None => xray_transport::system_dialer::dial_system(&server_dest, &sockopt)
-                    .await
-                    .map_err(|e| format!("vmess dial server (tcp): {e}"))?,
-            };
+            // bd cjwc G6（Go proxy/vmess/outbound/outbound.go:71）：连接级退避
+            // ExponentialBackoff(5, 200)。请求头在 dial 成功后才发送，环内无协议字节。
+            let mut conn: Box<dyn Connection> =
+                xray_transport::retry::exponential_backoff(5, 200, || async {
+                    match &config.stream_settings {
+                        Some(s) => xray_transport::dialer::dial(&server_dest, s, &sockopt)
+                            .await
+                            .map_err(|e| format!("vmess dial server ({}): {e}", s.protocol)),
+                        None => xray_transport::system_dialer::dial_system(&server_dest, &sockopt)
+                            .await
+                            .map_err(|e| format!("vmess dial server (tcp): {e}")),
+                    }
+                })
+                .await
+                .map_err(|e| format!("failed to find an available destination: {e}"))?;
 
             // 2. 解析 security：Auto → 具体算法（与 server 端 has_aes_gcm_hardware_support
             //    同语义）。 客户端发送具体 security 字节，服务端直接使用 → 两端 body 算法必一致。
@@ -895,6 +902,38 @@ async fn pump_down<C, R, W>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd cjwc G6（Go outbound.go:71）：dial 拒绝退避重试 5 次。关闭的 listener
+    /// 无 accept 可计数、dial_system 环路带内部定时器（16s connect timeout）污染
+    /// 虚拟时钟 → 真实时钟断言 sleep 阶梯下界（末次失败不再延迟：
+    /// 0+200+400+600=1200ms；单次尝试零 sleep 立即返回，≥1.2s 只可能来自跑满
+    /// 5 次环）+ 最终返回错误。
+    #[tokio::test]
+    async fn dial_to_closed_server_backs_off_five_times() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // 立即关闭 → connect 全拒
+
+        let cfg = Arc::new(VmessOutboundConfig::new(
+            UUID::new(),
+            Address::IPv4(std::net::Ipv4Addr::LOCALHOST),
+            Port::new(port),
+        ));
+        let dial_fn = make_vmess_dial_fn(cfg);
+        let dest = Destination::tcp(Address::new_domain("example.com"), Port::new(80));
+
+        let start = std::time::Instant::now();
+        let r = dial_fn(&dest).await;
+        let elapsed = start.elapsed();
+
+        assert!(r.is_err(), "dial to closed listener must fail");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1200),
+            "5 attempts need the 1200ms backoff ladder, got {elapsed:?}"
+        );
+        // 上界对齐既有 freedom 重试测试的 30s 宽限（dial_system 单次可耗 ~2s）。
+        assert!(elapsed < std::time::Duration::from_secs(30), "{elapsed:?}");
+    }
 
     #[test]
     fn config_server_destination_roundtrip() {
