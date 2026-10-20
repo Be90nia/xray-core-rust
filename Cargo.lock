@@ -2057,6 +2057,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "git+https://github.com/messense/if-addrs?rev=3cdbc8b7cfc70a328102bd8b1efdd3408c5d75b2#3cdbc8b7cfc70a328102bd8b1efdd3408c5d75b2"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5879,6 +5888,7 @@ name = "xray-common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "if-addrs",
  "md-5",
  "parking_lot",
  "prost",

@@ -17,6 +17,10 @@ uuid = { workspace = true }
 rand = { workspace = true }
 md-5 = "0.10"
 sha1 = "0.10"
+# 本机网络接口枚举（对应 Go net.InterfaceAddrs/Interfaces/InterfaceByName）。
+# git 依赖钉 rev（本机/CI 直连 crates.io index 不稳，github 白名单可达；同 btls 惯例），
+# rev = tag v0.15.0 (2026-02-08, PGP verified)
+if-addrs = { git = "https://github.com/messense/if-addrs", rev = "3cdbc8b7cfc70a328102bd8b1efdd3408c5d75b2" }
 parking_lot = { workspace = true }
 xray-buf = { path = "../xray-buf" }
 rustls = { workspace = true }
