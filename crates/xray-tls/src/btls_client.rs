@@ -1234,7 +1234,7 @@ impl<S: Connection + Unpin> BtlsConn<S> {
     /// 仅当此前 `SSL_set_session` 命中带 `max_early_data_size` 宣告的缓存
     /// session 时实际生效（BoringSSL 自门控：无缓存/不支持时该 flag 无效果，
     /// 行为与 0-RTT 关闭完全一致）。握手停在 0-RTT 写窗时返回的连接处于
-    /// [`EarlyData::Offering`] 态——应用首写以 early data 发出，若服务端拒绝
+    /// `EarlyData::Offering` 态——应用首写以 early data 发出，若服务端拒绝
     /// 则由 AsyncWrite/AsyncRead 内的重发路径兜底（数据零丢失）。
     pub async fn connect_with_alpn(
         stream: S,

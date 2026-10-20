@@ -415,7 +415,7 @@ pub(crate) const TCP_RCVBUF_DEFAULT: i32 = 4 * 1024 * 1024;
 /// （4 流 × 64KB/RTT 吞吐签名，HttpUpClientDig tr-httpupgrade 14 倍差实证）。
 /// 与 [`apply_outbound_socket_options`] 同常量同语义；这些拨号点无 sockopt
 /// 配置输入（sockopt 在 dial_system 路径消费、不透传 transport dial），故无
-/// 显式值可尊重，恒取 [`TCP_RCVBUF_DEFAULT`]。失败即拨号失败，对齐
+/// 显式值可尊重，恒取 `TCP_RCVBUF_DEFAULT`。失败即拨号失败，对齐
 /// dial_system 的 sockopt 应用语义。
 pub fn apply_client_dial_rcvbuf(tcp: &tokio::net::TcpStream) -> std::io::Result<()> {
     socket2::SockRef::from(tcp).set_recv_buffer_size(TCP_RCVBUF_DEFAULT as usize)
@@ -509,7 +509,7 @@ pub fn apply_outbound_socket_options(
     }
     // SO_RCVBUF：显式 `receiveBufferSize` 优先；缺省 TCP 默认 4MB（bd 88m0/0kqj，
     // 862340ff/7p1m 接收侧同族——内核 DRS 对快排空 relay 结构性自稳定，接收窗
-    // 钉死 ~64KB、高 RTT 吞吐=窗/RTT，见 [`TCP_RCVBUF_DEFAULT`]）。显式设置
+    // 钉死 ~64KB、高 RTT 吞吐=窗/RTT，见 `TCP_RCVBUF_DEFAULT`）。显式设置
     // 锁定内核接收窗自动调节（Linux SOCK_RCVBUF_LOCK），socket2 跨平台
     // （unix/Winsock SO_RCVBUF）。
     let rcvbuf =
@@ -607,7 +607,7 @@ pub fn apply_inbound_socket_options(socket: &Socket, opts: &SocketOptions) -> st
     // SO_RCVBUF：per-accept 设置——Linux accept 出的连接不继承 listener 的
     // SO_RCVBUF 锁定语义，必须在连接 socket 上显式设。显式 `receiveBufferSize`
     // 优先；缺省 TCP 默认 4MB（bd 88m0/0kqj，862340ff/7p1m 同族，见
-    // [`TCP_RCVBUF_DEFAULT`]）。
+    // `TCP_RCVBUF_DEFAULT`）。
     let rcvbuf =
         if opts.receive_buffer_size > 0 { opts.receive_buffer_size } else { TCP_RCVBUF_DEFAULT };
     socket.set_recv_buffer_size(rcvbuf as usize)?;

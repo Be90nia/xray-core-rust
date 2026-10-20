@@ -50,7 +50,7 @@ pub struct HandshakeResult {
     /// 请求行 target 字段（CONNECT = `host:port`，plain HTTP = 绝对 URL 或路径）。
     pub target: String,
     /// 解析出的 headers（key 全小写）。同名多值保留（对齐 Go `http.Header`
-    /// map[string][]string——双 Cookie 等逐行转发，不折叠丢失）。
+    /// `map[string][]string`——双 Cookie 等逐行转发，不折叠丢失）。
     pub headers: HashMap<String, Vec<String>>,
 }
 
