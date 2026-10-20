@@ -62,14 +62,10 @@ async fn dial_fn_lazy_resolves_domain_server_addr() {
 
     let uuid = Uuid::new_v4();
     let password = "domain-dial-password";
-    // "localhost" 的系统解析首族不定（Windows 先 ::1，Linux 常先 127.0.0.1）；
-    // mock server 按解析首族 bind，保证客户端 ToSocketAddrs 首个地址可连
-    let probe = std::net::ToSocketAddrs::to_socket_addrs(&("localhost", 0u16))
-        .expect("resolve localhost")
-        .next()
-        .expect("non-empty");
-    let bind_addr: std::net::SocketAddr =
-        if probe.is_ipv4() { "127.0.0.1:0".parse().unwrap() } else { "[::1]:0".parse().unwrap() };
+    // quinn 在本机对具体 IPv6 回环地址建 endpoint 会返回 WSAEINVAL（bd ky9z）。
+    // 绑通配 IPv6（dual-stack：bind_udp_endpoint 显式置 IPV6_V6ONLY=0）同时覆盖
+    // ::1 与 127.0.0.1，客户端继续用域名 localhost 走懒解析路径。
+    let bind_addr: std::net::SocketAddr = "[::]:0".parse().unwrap();
     let (server, cert_der) =
         TuicMockServer::bind(bind_addr, "localhost", uuid, password.to_string())
             .await
