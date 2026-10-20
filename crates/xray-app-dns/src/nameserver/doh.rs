@@ -86,6 +86,21 @@ fn h2c_server_name(ns: &NameServerConfig) -> String {
     ns.address.to_string()
 }
 
+/// DoH 查询兜底超时（bd cjwc G13）。
+///
+/// 对齐 Go `app/dns/nameserver_doh.go:166-172`：上层 ctx 带 deadline 时优先，
+/// 否则兜底 `now+5s`。Rust 查询链无 ctx deadline 概念，`ns.timeout_ms > 0`
+/// 为等价的显式 deadline 通道（配置注入优先），缺省 5s。
+/// 结构差异：Go 是整查询总 deadline；Rust 在 `query_once` 按 dial/TLS/h2/
+/// response 分段计时——最小对齐只改兜底数值，不重构分段结构。
+fn effective_query_timeout(timeout_ms: u32) -> Duration {
+    if timeout_ms > 0 {
+        Duration::from_millis(u64::from(timeout_ms))
+    } else {
+        Duration::from_secs(5)
+    }
+}
+
 impl DohNameServer {
     /// 构造。
     #[must_use]
@@ -133,11 +148,7 @@ impl DohNameServer {
         tls_config: Arc<ClientConfig>,
     ) -> Result<Box<dyn Server>, DnsError> {
         let dest = Destination::tcp(ns.address.clone(), Port::new(ns.port));
-        let timeout_dur = if ns.timeout_ms > 0 {
-            Duration::from_millis(u64::from(ns.timeout_ms))
-        } else {
-            Duration::from_millis(4000)
-        };
+        let timeout_dur = effective_query_timeout(ns.timeout_ms);
         let cache = Arc::new(CacheController::new(
             format!("DoH:{}", dest),
             ns.disable_cache.unwrap_or(false),
@@ -167,11 +178,7 @@ impl DohNameServer {
         // 非法 URI → 构造失败被上层吞成 record not found（h2c 完全不可用且报错
         // 误导）。authority 取目的地址字符串（域名或 IP 字面量）。
         let server_name = h2c_server_name(ns);
-        let timeout_dur = if ns.timeout_ms > 0 {
-            Duration::from_millis(u64::from(ns.timeout_ms))
-        } else {
-            Duration::from_millis(4000)
-        };
+        let timeout_dur = effective_query_timeout(ns.timeout_ms);
         let cache = Arc::new(CacheController::new(
             format!("DoH-h2c:{}", dest),
             ns.disable_cache.unwrap_or(false),
@@ -733,5 +740,131 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("http status"), "expected http status error, got: {err}");
+    }
+
+    /// 启动 accept + TLS + h2 握手后不回响应的 mock DoH server（测超时路径）。
+    async fn spawn_hanging_doh_server() -> (SocketAddr, Arc<ClientConfig>) {
+        ensure_crypto_provider();
+        let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = cert_params.self_signed(&key_pair).unwrap();
+        let cert_der = cert.der().to_vec();
+        let key_der = key_pair.serialize_der();
+
+        let key = tokio_rustls::rustls::pki_types::PrivateKeyDer::try_from(key_der).unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![tokio_rustls::rustls::pki_types::CertificateDer::from(cert_der.clone())],
+                key,
+            )
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((sock, _)) = listener.accept().await else { return };
+            let Ok(tls) = acceptor.accept(TcpConnection::new(sock)).await else { return };
+            let Ok(mut h2_conn) = server::handshake(tls).await else { return };
+            // drop Responder 会触发 h2 RST_STREAM（客户端立刻收 "stream no longer
+            // needed" 而非挂到 query timeout）——持有不回，模拟慢上游。
+            let mut hanging_responds = Vec::new();
+            while let Some(req) = h2_conn.accept().await {
+                let Ok((req, respond)) = req else { break };
+                let mut body = req.into_body();
+                while let Some(chunk) = body.data().await {
+                    if chunk.is_err() {
+                        break;
+                    }
+                }
+                hanging_responds.push(respond);
+            }
+        });
+
+        let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
+        root_store.add(tokio_rustls::rustls::pki_types::CertificateDer::from(cert_der)).unwrap();
+        let client_config = Arc::new(
+            ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth(),
+        );
+        (addr, client_config)
+    }
+
+    /// 在 tokio pause 时钟下跑 query_ip，按 100ms 步进推进并返回（累计推进量, 结果）。
+    async fn run_paused_query(
+        srv: Box<dyn Server>,
+        fqdn: &'static str,
+    ) -> (Duration, Result<(Vec<IpAddr>, u32), DnsError>) {
+        tokio::time::pause();
+        let handle = tokio::spawn(async move {
+            srv.query_ip(
+                fqdn,
+                IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },
+            )
+            .await
+        });
+        let mut advanced = Duration::ZERO;
+        let result = loop {
+            if handle.is_finished() {
+                break handle.await.unwrap();
+            }
+            tokio::time::advance(Duration::from_millis(100)).await;
+            advanced += Duration::from_millis(100);
+            assert!(advanced <= Duration::from_secs(30), "no timeout fired within 30s mock time");
+        };
+        (advanced, result)
+    }
+
+    /// bd cjwc G13：`ns.timeout_ms == 0`（等价 Go 上层 ctx 无 deadline）时兜底
+    /// 必须是 5s——Go `nameserver_doh.go:166-172` `else deadline = now.Add(5*time.Second)`。
+    /// 此前 Rust 缺省 4s，慢上游早 1s 被掐。
+    #[tokio::test]
+    async fn doh_fallback_timeout_is_5s_without_explicit_deadline() {
+        let (addr, tls_config) = spawn_hanging_doh_server().await;
+        let ns = NameServerConfig {
+            address: Address::from(addr.ip()),
+            port: addr.port(),
+            timeout_ms: 0,
+            ..NameServerConfig::default()
+        };
+        let srv = DohNameServer::from_config(&ns, "localhost".to_string(), tls_config).unwrap();
+
+        let (advanced, result) = run_paused_query(srv, "hang.com.").await;
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("timeout"), "expected timeout error, got: {err}");
+        // 兜底 5s（旧缺省 4s 会停在 ~4.x s）；dial/TLS/h2 即时完成会消耗少量 mock 时钟。
+        assert!(
+            advanced > Duration::from_secs(4) && advanced <= Duration::from_secs(6),
+            "fallback must be 5s, advanced={advanced:?}"
+        );
+    }
+
+    /// bd cjwc G13：显式配置优先于兜底（等价 Go `ctx.Deadline()` 存在时优先）。
+    #[tokio::test]
+    async fn doh_explicit_timeout_overrides_fallback() {
+        let (addr, tls_config) = spawn_hanging_doh_server().await;
+        let ns = NameServerConfig {
+            address: Address::from(addr.ip()),
+            port: addr.port(),
+            timeout_ms: 2000,
+            ..NameServerConfig::default()
+        };
+        let srv = DohNameServer::from_config(&ns, "localhost".to_string(), tls_config).unwrap();
+
+        let (advanced, result) = run_paused_query(srv, "hang.com.").await;
+        assert!(result.is_err());
+        // 显式 2s 生效（若兜底 5s 泄漏会停在 ~5.x s）。
+        assert!(
+            advanced >= Duration::from_millis(1500) && advanced <= Duration::from_secs(3),
+            "explicit 2s must win over 5s fallback, advanced={advanced:?}"
+        );
+    }
+
+    /// bd cjwc G13：数值契约——缺省 5s，显式值透传。
+    #[test]
+    fn effective_query_timeout_defaults_to_5s() {
+        assert_eq!(effective_query_timeout(0), Duration::from_secs(5));
+        assert_eq!(effective_query_timeout(4000), Duration::from_millis(4000));
+        assert_eq!(effective_query_timeout(12345), Duration::from_millis(12345));
     }
 }

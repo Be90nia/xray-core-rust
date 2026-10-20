@@ -20,8 +20,10 @@ use crate::{
 
 /// HTTP/1.1 请求头读取缓冲初始大小（含 `\r\n\r\n` 终止符）。
 const READ_INITIAL_CAPACITY: usize = 1024;
-/// HTTP/1.1 请求头读取缓冲上限（防恶意客户端发送超大 header）。
-const READ_MAX_CAPACITY: usize = 64 * 1024;
+/// HTTP/1.1 请求头读取上限（bd cjwc G23：对齐 Go `hub.go:53`
+/// `io.LimitReader(conn, 12288)`——注释明言「与 websocket 相同的头限」；
+/// 头总长 ≤ 12288 字节通过，超出即拒）。
+const READ_MAX_CAPACITY: usize = 12 * 1024;
 
 /// HTTPUpgrade 服务端配置。
 #[derive(Debug, Clone)]
@@ -291,5 +293,48 @@ mod tests {
 
         let err = server.handshake_io(&mut server_io).await.unwrap_err();
         assert!(matches!(err, crate::error::HttpUpgradeError::InvalidHttpFormat(_)));
+    }
+
+    /// 构造总长恰 `total_len` 字节的合法 upgrade 请求（X-Pad 填充到目标长度）。
+    fn padded_request(total_len: usize) -> Vec<u8> {
+        let prefix =
+            b"GET /ws HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nX-Pad: ";
+        let fill = total_len - prefix.len() - 4;
+        let mut req = prefix.to_vec();
+        req.resize(prefix.len() + fill, b'x');
+        req.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(req.len(), total_len);
+        req
+    }
+
+    /// bd cjwc G23：头总长恰 12KB（12288 字节）必须通过——Go `hub.go:53`
+    /// `io.LimitReader(conn, 12288)`，头在配额内完成解析即成功。
+    #[tokio::test]
+    async fn handshake_accepts_header_at_12kb_limit() {
+        let server = HttpUpgradeServer::new(make_config("/ws"));
+        let (server_io, mut client_io) = duplex(16 * 1024);
+        client_io.write_all(&padded_request(12 * 1024)).await.unwrap();
+        client_io.flush().await.unwrap();
+
+        let handle = tokio::spawn(async move { server.handshake_io(server_io).await });
+        let mut buf = vec![0u8; 1024];
+        let n = client_io.read(&mut buf).await.unwrap();
+        assert!(std::str::from_utf8(&buf[..n]).unwrap().starts_with("HTTP/1.1 101"));
+
+        let (_conn, leftover) = handle.await.unwrap().unwrap();
+        assert!(leftover.is_empty());
+    }
+
+    /// bd cjwc G23：头总长 12KB+1 必须拒（Go LimitReader 配额耗尽 → 解析失败）。
+    #[tokio::test]
+    async fn handshake_rejects_header_over_12kb() {
+        let server = HttpUpgradeServer::new(make_config("/ws"));
+        let (mut server_io, mut client_io) = duplex(16 * 1024);
+        client_io.write_all(&padded_request(12 * 1024 + 1)).await.unwrap();
+        client_io.flush().await.unwrap();
+
+        let err = server.handshake_io(&mut server_io).await.unwrap_err();
+        assert!(matches!(err, crate::error::HttpUpgradeError::InvalidHttpFormat(_)));
+        assert!(err.to_string().contains("exceeds max"), "got: {err}");
     }
 }
