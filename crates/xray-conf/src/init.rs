@@ -287,6 +287,24 @@ fn check_stream_strictness(kind: &str, tag: &str, ss: &serde_json::Value) -> Res
         )));
     }
 
+    // 2b) useSystemCA（票 5std M4）：tls security 下硬错。Go transport_security.go:319/407
+    //     （UseSystemCa → x509.SystemCertPool）；Rust TLS 栈无系统 CA 装载能力
+    //     （全仓 system_ca|useSystemCA 0 命中），静默忽略 = 实际信任库与配置
+    //     意图不一致（验证结果可能因根证书集差异而变）。非 bool 类型手误按
+    //     "已设置"拒启，不静默丢（bd zl5t 类型错误fail-loud 惯例）。
+    if is_tls
+        && ss.get("tlsSettings").and_then(|t| t.get("useSystemCA")).is_some_and(|v| match v {
+            serde_json::Value::Bool(b) => *b,
+            serde_json::Value::Null => false,
+            _ => true,
+        })
+    {
+        return Err(LintError::Invalid(format!(
+            "{kind} '{tag}': tlsSettings.useSystemCA is not supported by this build; \
+             remove the key (Rust ships its own bundled root store)"
+        )));
+    }
+
     // 3) hysteria transport（hysteriaSettings）：显式 version != 2 → 硬错。
     if net.eq_ignore_ascii_case("hysteria") {
         check_hysteria_version(kind, tag, "hysteriaSettings", ss.get("hysteriaSettings"))?;
@@ -714,6 +732,47 @@ mod tests {
             assert!(msg.contains("allowInsecure"), "{kind}: got: {msg}");
             assert!(msg.contains("removed"), "{kind}: got: {msg}");
         }
+    }
+
+    /// 票 5std M4：tlsSettings.useSystemCA=true 硬错（Rust 无系统 CA 装载能力，
+    /// 静默忽略 = 信任库与配置意图不一致）；false/缺省放行。
+    #[test]
+    #[allow(clippy::err_expect)] // 存量清零批次：测试断言期 expect（Config 无 Debug，禁 expect_err）
+    fn strictness_rejects_use_system_ca() {
+        let _g = TEST_LOCK.lock();
+        clear_stages();
+        register_builtin_stages();
+        let mut cfg = Config {
+            outbound_configs: vec![crate::config::OutboundDetourConfig {
+                protocol: "vless".into(),
+                tag: "ob".into(),
+                stream_settings: Some(json!({
+                    "network": "tcp", "security": "tls",
+                    "tlsSettings": {"serverName": "x", "useSystemCA": true}
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let err = post_process(&mut cfg).err().expect("useSystemCA=true must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("useSystemCA"), "got: {msg}");
+        assert!(msg.contains("not supported"), "got: {msg}");
+
+        // false / 缺省不受影响。
+        let mut cfg = Config {
+            outbound_configs: vec![crate::config::OutboundDetourConfig {
+                protocol: "vless".into(),
+                tag: "ob".into(),
+                stream_settings: Some(json!({
+                    "network": "tcp", "security": "tls",
+                    "tlsSettings": {"serverName": "x", "useSystemCA": false}
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        post_process(&mut cfg).expect("useSystemCA=false must pass");
     }
 
     #[test]

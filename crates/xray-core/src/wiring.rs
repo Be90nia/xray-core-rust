@@ -777,6 +777,23 @@ fn parse_routing_json_to_proto_in(
         cfg.domain_strategy = parse_domain_strategy(s);
     }
 
+    // Go RouterConfig.script（infra/conf/router.go:75）走 Lua 路由脚本引擎；
+    // Rust 无该运行时，非空 script 显式拒绝而非静默忽略（票 5std M3，alwc
+    // fail-loud 模式——静默丢 = 路由走向与配置意图完全不同）。空串/null =
+    // 未设置（Go `if c.Script != ""` 同语义），放行。
+    if let Some(s) = v.get("script") {
+        let requested = match s {
+            serde_json::Value::String(x) => !x.is_empty(),
+            serde_json::Value::Null => false,
+            _ => true,
+        };
+        if requested {
+            return Err(WiringError::JsonParse(
+                "routing script (Lua) is not supported by this build; remove the \"script\" key or use \"rules\" instead".into(),
+            ));
+        }
+    }
+
     if let Some(arr) = v.get("rules").and_then(|r| r.as_array()) {
         for r in arr {
             let outbound_tag = r.get("outboundTag").and_then(|x| x.as_str()).unwrap_or("");
@@ -2216,6 +2233,20 @@ mod tests {
         .err()
         .expect("must reject");
         assert!(err.to_string().contains("domain entry is not a string"), "{err:?}");
+    }
+
+    /// 票 5std M3：routing 顶层 `script`（Go Lua 路由脚本引擎）非空硬错，
+    /// 不再静默丢（alwc fail-loud 模式）；空串 = 未设置，放行。
+    #[test]
+    #[allow(clippy::err_expect)] // 存量清零批次：测试断言期 expect
+    fn routing_script_key_rejected_loudly() {
+        let dir = temp_asset_dir("script-reject");
+        let err = parse_routing_json_to_proto_in(br#"{"script":"route.lua"}"#, &dir)
+            .err()
+            .expect("non-empty script must reject");
+        assert!(err.to_string().contains("script"), "{err:?}");
+        parse_routing_json_to_proto_in(br#"{"script":""}"#, &dir)
+            .expect("empty script = unset, passes");
     }
 
     /// 补票①：inboundTag / protocol 空串条目过滤（Go condition.go:207-215 /
