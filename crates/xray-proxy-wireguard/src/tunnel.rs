@@ -111,18 +111,23 @@ impl Tunnel {
     /// 从 [`crate::config::DeviceConfig`] + [`crate::config::PeerConfig`] 构造。
     ///
     /// 约定：
-    /// - `peer.keep_alive == 0` → 禁用 keepalive
+    /// - `peer.keep_alive` 空串 → 禁用 keepalive（"0" 同效，沿用原 u32 语义）
     /// - `peer.pre_shared_key` 空字符串 → 无 PSK
     /// - `index` 固定用 0（单 peer outbound 模式足够；多 peer 场景需扩展）
     pub fn from_config(
         device: &crate::config::DeviceConfig,
         peer: &crate::config::PeerConfig,
     ) -> Result<Self> {
-        // 防御性：keep_alive 是 u32，boringtun 接受 u16，截断溢出值。
-        let keepalive = if peer.keep_alive == 0 {
+        // Go client.go:190-192：proto keep_alive 原样拼进 ipc 由 wireguard-go 解析，
+        // 非数字串在配置期报错——本侧同语义硬错（u32 时代由类型系统挡住）。
+        let keepalive = if peer.keep_alive.is_empty() {
             None
         } else {
-            Some(peer.keep_alive.min(u32::from(u16::MAX)) as u16)
+            let secs = peer.keep_alive.parse::<u32>().map_err(|_| {
+                WgError::InvalidConfig(format!("keep_alive {:?} is not a number", peer.keep_alive))
+            })?;
+            // 防御性：boringtun 接受 u16，截断溢出值；0 = 禁用。
+            Some(secs.min(u32::from(u16::MAX)) as u16).filter(|v| *v != 0)
         };
         let psk =
             if peer.pre_shared_key.is_empty() { None } else { Some(peer.pre_shared_key.as_str()) };
@@ -461,7 +466,7 @@ mod tests {
         let device = crate::config::DeviceConfig { secret_key: sec_a, ..Default::default() };
         let peer = crate::config::PeerConfig {
             public_key: pub_b,
-            keep_alive: 0,
+            keep_alive: String::new(),
             pre_shared_key: String::new(),
             ..Default::default()
         };
@@ -473,12 +478,12 @@ mod tests {
 
     #[test]
     fn from_config_keepalive_overflow_truncated() {
-        // u32::MAX 应截断为 u16::MAX，不报错
+        // "4294967295"（u32::MAX 的十进制串）应截断为 u16::MAX，不报错
         let (sec, pub_) = make_test_keypair(0x33);
         let device = crate::config::DeviceConfig { secret_key: sec, ..Default::default() };
         let peer = crate::config::PeerConfig {
             public_key: pub_,
-            keep_alive: u32::MAX,
+            keep_alive: "4294967295".to_string(),
             ..Default::default()
         };
         let t = Tunnel::from_config(&device, &peer);

@@ -28,3 +28,5 @@ bytes = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+# Go↔Rust pb 互通 hex fixture 测试用（encode_to_vec/decode 需要 prost::Message trait）
+prost = { workspace = true }

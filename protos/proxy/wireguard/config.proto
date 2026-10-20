@@ -6,11 +6,17 @@ option go_package = "github.com/xtls/xray-core/proxy/wireguard";
 option java_package = "com.xray.proxy.wireguard";
 option java_multiple_files = true;
 
+// Go proxy/wireguard/config.proto:9 同款 import（D2 users 字段依赖）。
+import "common/protocol/user.proto";
+
 message PeerConfig {
   string public_key = 1;
   string pre_shared_key = 2;
   string endpoint = 3;
-  uint32 keep_alive = 4;
+  // Go config.proto:15 `string keep_alive = 4;`（票 o7ns D1：原 uint32 与 Go
+  // wire type 2 冲突）。语义为「数字的十进制字符串」：Go infra/conf/wireguard.go:47-48
+  // strconv.FormatUint 写入，client.go:190-192 按 != "" 判断后原样拼接。
+  string keep_alive = 4;
   repeated string allowed_ips = 5;
 }
 
@@ -18,12 +24,18 @@ message DeviceConfig {
   string secret_key = 1;
   repeated string endpoint = 2;
   repeated PeerConfig peers = 3;
+  // Go config.proto:24 `repeated xray.common.protocol.User users = 5;`（票 o7ns
+  // D2：原 tag 5 被本仓 num_workers 误占，双向解码均报错）。
+  repeated xray.common.protocol.User users = 5;
   int32 mtu = 4;
-  int32 num_workers = 5;
+
   bytes reserved = 6;
   // 7 曾为 domain_strategy（Go efc9e6da 删除：目标域名统一走隧道 DNS + IP 字面量先行）。
   bool is_client = 8;
   bool no_kernel_tun = 9;
   // Go c7e569b0: remoteDNS（隧道内 DNS 服务器；["local"] 已废弃，回落默认隧道 DNS）。
   repeated string DNS = 10;
+  // Rust 扩展：worker 池大小（Go bind.go:94-100 `Open` N 个 receive func，<=0 → CPU 数）。
+  // 原误占 tag 5（票 o7ns D2）挪至 11：Go 已占 1-6/8-10，7 曾用（domain_strategy）避开。
+  int32 num_workers = 11;
 }

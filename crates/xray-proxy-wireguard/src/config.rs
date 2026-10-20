@@ -11,7 +11,8 @@
 //! | `endpoint` | interface 地址（CIDR 或纯 IP） |
 //! | `peers` | 对端配置列表 |
 //! | `mtu` | MTU，默认 1420 |
-//! | `num_workers` | WireGuard 工作线程数 |
+//! | `users` | Go 多用户 inbound 载荷（业务层未消费：解码不报错，票 o7ns D2） |
+//! | `num_workers` | WireGuard 工作线程数（proto tag 11；tag 5 已让位 Go users） |
 //! | `reserved` | WireGuard reserved 字段（3 字节，用于混淆） |
 //! | `is_client` | 客户端（出站）or 服务端（入站） |
 //! | `no_kernel_tun` | 强制使用 userspace TUN（gVisor），不用内核 TUN |
@@ -22,7 +23,7 @@
 //! | `public_key` | 对端公钥（hex 64 字符） |
 //! | `pre_shared_key` | 可选 PSK（hex 64 字符） |
 //! | `endpoint` | 对端地址 `host:port` |
-//! | `keep_alive` | 心跳间隔（秒），0=禁用 |
+//! | `keep_alive` | 心跳间隔（秒）的十进制字符串（Go proto string 语义），空串=禁用 |
 //! | `allowed_ips` | 允许的源 IP CIDR 列表 |
 
 use crate::error::{Result, WgError};
@@ -38,8 +39,9 @@ pub struct PeerConfig {
     pub pre_shared_key: String,
     /// 对端地址 `host:port`。
     pub endpoint: String,
-    /// 心跳间隔（秒）。0=禁用。
-    pub keep_alive: u32,
+    /// 心跳间隔（秒）的十进制字符串。空串=禁用。对齐 Go proto `keep_alive`
+    /// string 语义（infra/conf/wireguard.go:47-48 以 FormatUint 十进制写入）。
+    pub keep_alive: String,
     /// 允许的源 IP CIDR 列表。
     pub allowed_ips: Vec<String>,
     /// 用户等级（per-user policy 分级）。对应 Go `WireGuardPeerConfig.Level`。
@@ -87,6 +89,9 @@ impl DeviceConfig {
     }
 
     /// 从 prost 生成的 proto DeviceConfig 构造。
+    ///
+    /// `users`（Go 多用户 inbound 载荷）暂不承载：业务层多用户 inbound 未实现，
+    /// 解码不报错但丢弃字段值（票 o7ns D2 验收允许「字段存在且能解码」）。
     pub fn from_proto(p: xray_proto::xray::proxy::wireguard::DeviceConfig) -> Result<Self> {
         Ok(Self {
             secret_key: p.secret_key,
@@ -127,11 +132,13 @@ impl DeviceConfig {
                     public_key: peer.public_key.clone(),
                     pre_shared_key: peer.pre_shared_key.clone(),
                     endpoint: peer.endpoint.clone(),
-                    keep_alive: peer.keep_alive,
+                    keep_alive: peer.keep_alive.clone(),
                     allowed_ips: peer.allowed_ips.clone(),
                 })
                 .collect(),
             mtu: self.mtu,
+            // 业务层未建模 users（见 from_proto 注）：序列化恒空。
+            users: Vec::new(),
             num_workers: self.num_workers,
             reserved: self.reserved.clone(),
             is_client: self.is_client,
@@ -208,7 +215,7 @@ mod tests {
                 public_key: "eeff0011".repeat(8),
                 pre_shared_key: String::new(),
                 endpoint: "1.2.3.4:51820".into(),
-                keep_alive: 25,
+                keep_alive: "25".to_string(),
                 allowed_ips: vec!["0.0.0.0/0".into(), "::/0".into()],
                 level: 0,
                 email: String::new(),
@@ -265,5 +272,56 @@ mod tests {
         assert_eq!(cfg.mtu, 0);
         assert!(cfg.endpoint.is_empty());
         assert!(cfg.peers.is_empty());
+    }
+
+    // ===== Go↔Rust pb 互通（票 o7ns D1/D2）=====
+
+    /// Go 编码的 `DeviceConfig` hex fixture：secret_key="aabb"、endpoint=["10.0.0.1"]、
+    /// peers[0]={public_key="ccdd", keep_alive:"25", allowed_ips:["0.0.0.0/0"]}、
+    /// users=[{level:1, email:"user@example.com"}]、mtu=1420、is_client=true。
+    ///
+    /// 由 go1.25.12 `proto.Marshal` 生成（本仓 Go 源 `proxy/wireguard/config.pb.go`、
+    /// `common/protocol/user.pb.go`、`common/serial/typed_message.pb.go` 最小模块），
+    /// 生成程序与重现命令见 `reports/night-run-2026-10-20/fix-o7ns-wireguard.md`。
+    ///
+    /// CI 无 Go 也能回归：本测试同时锁「Go→Rust 解码」与「Rust→Go 编码」（两侧
+    /// proto3 按 tag 序编码，本样例字节一致，已由 go1.25.12 `proto.Unmarshal`
+    /// 真机验证；字节不一致时此处立即失败）。
+    #[test]
+    fn wire_go_interop_hex_fixture() {
+        use prost::Message as _;
+
+        use xray_proto::xray::common::protocol::User as ProtoUser;
+        use xray_proto::xray::proxy::wireguard as pb;
+
+        const GO_ENCODED: &str = "0a0461616262120831302e302e302e311a150a0463636464220232352a09302e302e302e302f30208c0b2a140801121075736572406578616d706c652e636f6d4001";
+
+        // ① Go 编码 → Rust 解码：keep_alive 为字符串 "25"（D1）、users 可解码（D2）。
+        let go_bytes = hex::decode(GO_ENCODED).unwrap();
+        let decoded = pb::DeviceConfig::decode(&go_bytes[..]).unwrap();
+        assert_eq!(decoded.peers[0].keep_alive, "25");
+        assert_eq!(decoded.users.len(), 1);
+        assert_eq!(decoded.users[0].level, 1);
+        assert_eq!(decoded.users[0].email, "user@example.com");
+        assert_eq!(decoded.mtu, 1420);
+        assert!(decoded.is_client);
+        assert_eq!(decoded.num_workers, 0, "Go 侧无 num_workers 字段，解码为默认 0");
+
+        // ② Rust 编码 → 与 fixture 字节级一致（同内容同字节 = Go proto.Unmarshal 已验证）。
+        let device = pb::DeviceConfig {
+            secret_key: "aabb".to_string(),
+            endpoint: vec!["10.0.0.1".into()],
+            peers: vec![pb::PeerConfig {
+                public_key: "ccdd".to_string(),
+                keep_alive: "25".to_string(),
+                allowed_ips: vec!["0.0.0.0/0".into()],
+                ..Default::default()
+            }],
+            users: vec![ProtoUser { level: 1, email: "user@example.com".into(), account: None }],
+            mtu: 1420,
+            is_client: true,
+            ..Default::default()
+        };
+        assert_eq!(device.encode_to_vec(), go_bytes);
     }
 }

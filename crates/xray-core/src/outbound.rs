@@ -2991,12 +2991,15 @@ pub(crate) fn parse_wireguard_config(data: &[u8]) -> std::result::Result<DeviceC
                     Some(s) if !s.is_empty() => parse_wireguard_key(s)?,
                     _ => String::new(),
                 };
-            // Go wireguard.go:47-49 KeepAlive → persistent_keepalive_interval（秒）。
+            // Go wireguard.go:47-49：KeepAlive(uint32) 非零时 strconv.FormatUint
+            // 转十进制字符串写入 proto（票 o7ns D1 string 语义）；0 不写入——
+            // 本侧空串承载，消费端按空串跳过 persistent_keepalive_interval 行。
             let keep_alive = wg_get(p, "keepAlive", "keep_alive")
                 .and_then(|x| x.as_u64())
                 .map(|n| u32::try_from(n).map_err(|_| "keepAlive out of u32 range".to_string()))
                 .transpose()?
-                .unwrap_or(0);
+                .filter(|n| *n != 0)
+                .map_or_else(String::new, |n| n.to_string());
             // Go wireguard.go:50-54 AllowedIPs；缺省（字段缺失）→ 全路由
             // 双栈（Go wireguard.go:53-55 AllowedIPs == nil → 0.0.0.0/0+::0/0，
             // bd 7v0k①）。显式空数组尊重为空。
@@ -3678,7 +3681,7 @@ mod tests {
         let peer = &config.peers[0];
         assert_eq!(peer.public_key, pub_key);
         assert_eq!(peer.pre_shared_key, psk);
-        assert_eq!(peer.keep_alive, 25);
+        assert_eq!(peer.keep_alive, "25");
         assert_eq!(peer.allowed_ips, vec!["0.0.0.0/0", "::/0"]);
         // 既有消费链：解析出的六键能直接构造 Tunnel（PSK/keepalive 进 boringtun）
         xray_proxy_wireguard::Tunnel::from_config(&config, peer)
@@ -3707,7 +3710,7 @@ mod tests {
         let config = parse_wireguard_config(data.as_bytes()).unwrap();
         let peer = &config.peers[0];
         assert_eq!(peer.pre_shared_key, "dd".repeat(32), "base64 PSK normalized to hex");
-        assert_eq!(peer.keep_alive, 15);
+        assert_eq!(peer.keep_alive, "15");
         assert_eq!(peer.allowed_ips, vec!["10.0.0.0/8"]);
     }
 
