@@ -266,3 +266,243 @@ async fn http_plain_proxy_get_forwarded_e2e() {
     assert!(response.starts_with("HTTP/1.1 200"), "expected 200, got: {response}");
     assert!(response.contains("hello world"), "expected body, got: {response}");
 }
+
+// ===== plain HTTP 转发五场景（票 poys 验收）：真实 HttpServer serve 路径 =====
+
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use xray_features::inbound::InboundHandler;
+use xray_proxy_http::server::HttpServer;
+
+/// 起真实 HttpServer（走 handle_connection → handshake → plain 转发的 serve 路径）。
+async fn spawn_http_proxy(config: ServerConfig) -> SocketAddr {
+    let proxy = HttpServer::new("http-plain-e2e", config);
+    proxy.start().await.expect("start http proxy");
+    let port = proxy.bound_port().await;
+    assert!(port > 0, "proxy did not bind");
+    SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+/// 读完整 HTTP 响应（head + content-length body；无 CL 头则读当前已到字节）。
+async fn read_http_response(sock: &mut TcpStream) -> String {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 2048];
+    let head_end = loop {
+        let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut tmp))
+            .await
+            .expect("response timeout")
+            .unwrap();
+        assert!(n > 0, "EOF before response head complete");
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = find_subsequence(&buf, b"\r\n\r\n") {
+            break pos;
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+    if let Some(cl) = head.lines().find_map(|l| l.strip_prefix("content-length:")) {
+        let want: usize = cl.trim().parse().unwrap();
+        while buf.len() < head_end + 4 + want {
+            let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut tmp))
+                .await
+                .expect("body timeout")
+                .unwrap();
+            assert!(n > 0, "EOF before response body complete");
+            buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+    String::from_utf8_lossy(&buf).to_string()
+}
+
+/// 读到 EOF（连接被代理关闭）。返回 EOF 前收到的剩余字节。
+async fn read_to_eof(sock: &mut TcpStream) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 2048];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut tmp))
+            .await
+            .expect("eof timeout (connection not closed by proxy)")
+            .unwrap();
+        if n == 0 {
+            return buf;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
+/// 场景 A：同一连接 2 个 plain HTTP 请求且带 `Proxy-Connection: keep-alive`
+/// → 两个都 200（抓包证明同一四元组，见 tmp/ 捕获报告）。
+#[tokio::test]
+async fn plain_http_keep_alive_two_requests_same_connection_e2e() {
+    // 后端：每请求一条新 upstream 连接（对齐 Go Dispatch 每请求新 link），
+    // 各回 Content-Length 响应
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap();
+    tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut sock, _) = target.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(req.starts_with("GET /"), "upstream got: {req}");
+            assert!(
+                req.contains("connection: close"),
+                "forwarded request must carry Connection: close: {req}"
+            );
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await.unwrap();
+            // 半关 + 排空：立即 drop 带未读数据的 socket 在 Windows 上发 RST，
+            // 会截断 proxy 侧读向（RST 丢弃接收缓冲）
+            let _ = sock.shutdown().await;
+            let mut sink = [0u8; 512];
+            while sock.read(&mut sink).await.unwrap_or(0) > 0 {}
+        }
+    });
+
+    let proxy_addr = spawn_http_proxy(ServerConfig::default()).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let req_tpl = format!(
+        "GET http://127.0.0.1:{}/{{}} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Connection: keep-alive\r\n\r\n",
+        target_addr.port(),
+        target_addr.port(),
+    );
+    // 第 1 个请求
+    client.write_all(req_tpl.replace("{}", "a").as_bytes()).await.unwrap();
+    let resp1 = read_http_response(&mut client).await;
+    assert!(resp1.starts_with("HTTP/1.1 200"), "resp1: {resp1}");
+    assert!(resp1.contains("ok"), "resp1 body: {resp1}");
+    assert!(
+        resp1.to_lowercase().contains("proxy-connection: keep-alive"),
+        "resp1 must keep alive: {resp1}"
+    );
+    assert!(
+        resp1.to_lowercase().contains("keep-alive: timeout=60"),
+        "resp1 must carry Keep-Alive header: {resp1}"
+    );
+    // 第 2 个请求（同一 TCP 连接）
+    client.write_all(req_tpl.replace("{}", "b").as_bytes()).await.unwrap();
+    let resp2 = read_http_response(&mut client).await;
+    assert!(resp2.starts_with("HTTP/1.1 200"), "resp2: {resp2}");
+    assert!(resp2.contains("ok"), "resp2 body: {resp2}");
+}
+
+/// 场景 B：不带 `Proxy-Connection: keep-alive` → 第一个响应后代理关连接
+/// （抓包：一条 FIN，见 tmp/ 捕获报告）。
+#[tokio::test]
+async fn plain_http_without_keep_alive_closes_after_response_e2e() {
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut sock, _) = target.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = sock.read(&mut buf).await.unwrap();
+        sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await.unwrap();
+        // 半关 + 排空（立即 drop 带未读数据 → Windows RST 截断 proxy 读向）
+        let _ = sock.shutdown().await;
+        let mut sink = [0u8; 512];
+        while sock.read(&mut sink).await.unwrap_or(0) > 0 {}
+    });
+
+    let proxy_addr = spawn_http_proxy(ServerConfig::default()).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let req = format!(
+        "GET http://127.0.0.1:{}/only HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+        target_addr.port(),
+        target_addr.port(),
+    );
+    client.write_all(req.as_bytes()).await.unwrap();
+    let resp = read_http_response(&mut client).await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    // 对齐 Go：responseDone 只看 ContentLength，响应头写 keep-alive 三头；
+    // 但 Process 层 keepAlive=false → 不循环 → 关连接
+    assert!(resp.to_lowercase().contains("proxy-connection: keep-alive"), "{resp}");
+    let trailing = read_to_eof(&mut client).await;
+    assert!(trailing.is_empty(), "unexpected trailing bytes: {trailing:?}");
+}
+
+/// 场景 C：上游响应无 Content-Length（chunked）→ 不循环，响应后关连接；
+/// chunk 帧原样透传。
+#[tokio::test]
+async fn plain_http_chunked_response_no_loop_close_e2e() {
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut sock, _) = target.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = sock.read(&mut buf).await.unwrap();
+        sock.write_all(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+              5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        // 半关 + 排空（立即 drop 带未读数据 → Windows RST 截断 proxy 读向，
+        // chunk 透传会中断在第一帧）
+        let _ = sock.shutdown().await;
+        let mut sink = [0u8; 512];
+        while sock.read(&mut sink).await.unwrap_or(0) > 0 {}
+    });
+
+    let proxy_addr = spawn_http_proxy(ServerConfig::default()).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let req = format!(
+        "GET http://127.0.0.1:{}/chunk HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Connection: keep-alive\r\n\r\n",
+        target_addr.port(),
+        target_addr.port(),
+    );
+    client.write_all(req.as_bytes()).await.unwrap();
+    // 即使客户端请求 keep-alive，无 Content-Length 也不循环
+    let mut resp = read_http_response(&mut client).await;
+    resp.push_str(&String::from_utf8_lossy(&read_to_eof(&mut client).await));
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    assert!(resp.to_lowercase().contains("transfer-encoding: chunked"), "{resp}");
+    assert!(resp.to_lowercase().contains("connection: close"), "{resp}");
+    assert!(resp.to_lowercase().contains("proxy-connection: close"), "{resp}");
+    assert!(resp.contains("5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"), "chunk frames: {resp}");
+}
+
+/// 场景 D：allow_transparent=false 且 origin-form（无 host）→ 400 + 两个 close 头。
+#[tokio::test]
+async fn plain_http_origin_form_rejected_400_when_not_transparent_e2e() {
+    let proxy_addr = spawn_http_proxy(ServerConfig::default()).await; // allow_transparent=false
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client.write_all(b"GET /path?q=1 HTTP/1.1\r\nHost: example.com\r\n\r\n").await.unwrap();
+    let resp = read_http_response(&mut client).await;
+    assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+    let lower = resp.to_lowercase();
+    assert!(lower.contains("proxy-connection: close"), "{resp}");
+    assert!(lower.contains("connection: close"), "{resp}");
+    let trailing = read_to_eof(&mut client).await;
+    assert!(trailing.is_empty(), "connection must close: {trailing:?}");
+}
+
+/// 场景 E：上游读响应失败（accept 后立即断开）→ 503 + 双 close 头 + 关连接。
+#[tokio::test]
+async fn plain_http_upstream_failure_returns_503_e2e() {
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (sock, _) = target.accept().await.unwrap();
+        drop(sock); // 不回响应直接断
+    });
+
+    let proxy_addr = spawn_http_proxy(ServerConfig::default()).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let req = format!(
+        "GET http://127.0.0.1:{}/down HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+        target_addr.port(),
+        target_addr.port(),
+    );
+    client.write_all(req.as_bytes()).await.unwrap();
+    let resp = read_http_response(&mut client).await;
+    assert!(resp.starts_with("HTTP/1.1 503"), "{resp}");
+    let lower = resp.to_lowercase();
+    assert!(lower.contains("connection: close"), "{resp}");
+    assert!(lower.contains("proxy-connection: close"), "{resp}");
+    let trailing = read_to_eof(&mut client).await;
+    assert!(trailing.is_empty(), "connection must close: {trailing:?}");
+}

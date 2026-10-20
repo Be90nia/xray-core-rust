@@ -1,15 +1,18 @@
-//! HTTP proxy 服务端切片2——HTTP CONNECT 隧道 + Proxy-Authorization 认证。
+//! HTTP proxy 服务端——HTTP CONNECT 隧道 + plain HTTP 转发（keep-alive 循环）
+//! + Proxy-Authorization 认证。
 //!
-//! 对应 Go `proxy/http/server.go` 的 `Process` + `handleConnect` + `parseBasicAuth`。
+//! 对应 Go `proxy/http/server.go` 的 `Process` + `handleConnect` +
+//! `handlePlainHTTP` + `parseBasicAuth`。
 //!
-//! ## 切片边界（P6-5 切片2）
+//! ## 连接模型（对齐 Go）
 //!
-//! 实现 inbound HTTP CONNECT 请求解析 + 认证 + 200 响应 + CONNECT 隧道双向
-//! 转发 + 每连接读头 deadline（Go `SetReadDeadline(Timeouts.Handshake)` 默认
-//! 60s）。连接模型对齐 Go：**CONNECT 终结性**——tunnel 结束（或 dial 失败）
-//! 即关连接，不回循环（Go `handleConnect` 直接 return）；plain HTTP 代理
-//! （`handlePlainHTTP`，含其 keep-alive）+ dispatcher 接线留切片3——非 CONNECT
-//! 请求直接关闭（转发未实现，keep-alive 无从谈起，需另票）。
+//! - **CONNECT 终结性**：tunnel 结束（或 dial 失败）即关连接，不回循环
+//!   （Go `handleConnect` 直接 return）。
+//! - **plain HTTP**：每请求拨一条新上游连接（对齐 Go `Dispatch` 每请求新
+//!   link），响应后按「客户端 `Proxy-Connection: keep-alive` **且** 上游响应
+//!   Content-Length >= 0」双条件决定回循环读下一请求（Go `goto Start`），
+//!   否则关连接。
+//! - 每轮读头 deadline 60s（Go `SetReadDeadline(Timeouts.Handshake)`）。
 
 use std::{
     collections::HashMap,
@@ -82,6 +85,13 @@ const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const RESPONSE_BAD_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\n\
     Proxy-Connection: close\r\n\
     Connection: close\r\n\
+    Content-Length: 0\r\n\r\n";
+
+/// plain HTTP 读上游响应失败 / 响应头非法的 503 响应（对齐 Go handlePlainHTTP
+/// 503 分支：Close=true + 双 close 头 + Content-Length 0）。
+const RESPONSE_SERVICE_UNAVAILABLE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\n\
+    Connection: close\r\n\
+    Proxy-Connection: close\r\n\
     Content-Length: 0\r\n\r\n";
 
 /// 从请求行 target 提取 path（含 query）。
@@ -219,12 +229,12 @@ impl InboundHandler for HttpServer {
     }
 }
 
-/// 单连接处理：一次读头 + 转发，连接终结性对齐 Go。
+/// 单连接处理：读头 → 转发（CONNECT 隧道 / plain HTTP），连接终结性对齐 Go。
 ///
-/// 对应 Go `Process`（无循环回跳版本）：读头带 handshake deadline（默认 60s，
-/// `policy.go:130`）；**CONNECT 终结性**——tunnel 结束/失败即关连接（Go
-/// `handleConnect` 直接 return，隧道结束后字节流已非 HTTP 边界）；plain HTTP
-/// 转发未实现（切片3），非 CONNECT 请求直接关闭。
+/// 对应 Go `Process`：读头带 handshake deadline（默认 60s，`policy.go:130`）；
+/// **CONNECT 终结性**——tunnel 结束/失败即关连接（Go `handleConnect` 直接
+/// return，隧道结束后字节流已非 HTTP 边界）；plain HTTP 按 keep-alive 双条件
+/// 回循环（见 [`serve_connection`]）。
 async fn handle_connection(
     mut stream: TcpStream,
     config: ServerConfig,
@@ -255,76 +265,384 @@ async fn graceful_close(stream: &mut TcpStream) {
     .await;
 }
 
-/// 单请求处理体（关闭策略见 [`graceful_close`]）。
+/// 单连接处理体（关闭策略见 [`graceful_close`]）。
+///
+/// 对应 Go `Process` 的 `Start` 循环：每轮读头带 handshake deadline（默认 60s，
+/// `policy.go:130`）。CONNECT → 隧道后终结（Go `handleConnect` return）；非
+/// CONNECT → plain HTTP 转发（[`handle_plain_http`]），客户端请求头
+/// `Proxy-Connection: keep-alive` 且上游响应 Content-Length >= 0 时回循环读
+/// 下一请求（Go `goto Start`），否则关连接。
 async fn serve_connection(
     stream: &mut TcpStream,
     config: &ServerConfig,
     tag: &str,
     peer: SocketAddr,
 ) {
-    // 对应 Go Start 段的 handshake read deadline（policy 默认 60s）；
-    // 超时同时覆盖"空闲等待请求头"——Go 无独立空闲超时。
-    let handshake =
-        tokio::time::timeout(REQUEST_HEADER_TIMEOUT, http_server_handshake(stream, config));
-    let hs = match handshake.await {
-        Err(_) => {
-            info!(
-                tag = %tag,
-                peer = %peer,
-                timeout = ?REQUEST_HEADER_TIMEOUT,
-                "HTTP proxy connection idle/header timeout, closing"
-            );
+    loop {
+        // 对应 Go Start 段的 handshake read deadline（policy 默认 60s）；
+        // 超时同时覆盖"空闲等待请求头"——Go 无独立空闲超时。
+        let handshake =
+            tokio::time::timeout(REQUEST_HEADER_TIMEOUT, http_server_handshake(stream, config));
+        let mut hs = match handshake.await {
+            Err(_) => {
+                info!(
+                    tag = %tag,
+                    peer = %peer,
+                    timeout = ?REQUEST_HEADER_TIMEOUT,
+                    "HTTP proxy connection idle/header timeout, closing"
+                );
+                return;
+            },
+            Ok(Err(e)) => {
+                // 400/407 响应已在 handshake 内写回；EOF/解析失败一律关闭
+                warn!(
+                    tag = %tag,
+                    peer = %peer,
+                    error = %e,
+                    "HTTP proxy handshake failed, closing connection"
+                );
+                return;
+            },
+            Ok(Ok(hs)) => hs,
+        };
+        if hs.method != "CONNECT" {
+            // Go Process: keepAlive := TrimSpace(ToLower(Proxy-Connection)) == "keep-alive"
+            let keep_alive_req = request_keep_alive(&hs.headers);
+            match handle_plain_http(stream, &mut hs).await {
+                // Go: err == errWaitAnother → keepAlive ? goto Start : err = nil
+                Ok(PlainOutcome::WaitAnother) if keep_alive_req => continue,
+                Ok(PlainOutcome::WaitAnother) => {},
+                Ok(PlainOutcome::Close) => {},
+                Err(e) => {
+                    warn!(
+                        tag = %tag,
+                        peer = %peer,
+                        method = %hs.method,
+                        error = %e,
+                        "plain HTTP forwarding failed, closing connection"
+                    );
+                },
+            }
             return;
-        },
-        Ok(Err(e)) => {
-            // 400/407 响应已在 handshake 内写回；EOF/解析失败一律关闭
-            warn!(
-                tag = %tag,
-                peer = %peer,
-                error = %e,
-                "HTTP proxy handshake failed, closing connection"
-            );
-            return;
-        },
-        Ok(Ok(hs)) => hs,
-    };
-    if hs.method != "CONNECT" {
-        // plain HTTP 转发留切片3（Go handlePlainHTTP 含 keep-alive 循环，此处
-        // 无从实现）；请求 body 未消费，关闭连接
-        warn!(
-            tag = %tag,
-            peer = %peer,
-            method = %hs.method,
-            "plain HTTP forwarding not implemented (slice 3), closing"
-        );
-        return;
-    }
-    info!(tag = %tag, peer = %peer, dest = ?hs.dest, "HTTP proxy CONNECT established");
-    // CONNECT 终结性（对齐 Go handleConnect → return）：tunnel 成功、dial 失败、
-    // 拷贝错误任一结局都关连接——隧道结束后字节流已非 HTTP 边界。
-    match dial_destination(&hs.dest).await {
-        Err(e) => {
-            warn!(
-                tag = %tag,
-                peer = %peer,
-                dest = ?hs.dest,
-                error = %e,
-                "CONNECT dial failed, closing connection"
-            );
-        },
-        Ok(mut upstream) => {
-            if let Err(e) = tokio::io::copy_bidirectional(stream, &mut upstream).await {
+        }
+        info!(tag = %tag, peer = %peer, dest = ?hs.dest, "HTTP proxy CONNECT established");
+        // CONNECT 终结性（对齐 Go handleConnect → return）：tunnel 成功、dial 失败、
+        // 拷贝错误任一结局都关连接——隧道结束后字节流已非 HTTP 边界。
+        match dial_destination(&hs.dest).await {
+            Err(e) => {
                 warn!(
                     tag = %tag,
                     peer = %peer,
                     dest = ?hs.dest,
                     error = %e,
-                    "CONNECT tunnel copy failed, closing connection"
+                    "CONNECT dial failed, closing connection"
                 );
-                return;
-            }
-            info!(tag = %tag, dest = ?hs.dest, "CONNECT tunnel finished, closing connection");
+            },
+            Ok(mut upstream) => {
+                if let Err(e) = tokio::io::copy_bidirectional(stream, &mut upstream).await {
+                    warn!(
+                        tag = %tag,
+                        peer = %peer,
+                        dest = ?hs.dest,
+                        error = %e,
+                        "CONNECT tunnel copy failed, closing connection"
+                    );
+                    return;
+                }
+                info!(tag = %tag, dest = ?hs.dest, "CONNECT tunnel finished, closing connection");
+            },
+        }
+        return;
+    }
+}
+
+/// plain HTTP 转发结果——对应 Go `handlePlainHTTP` 的返回值语义：
+/// `errWaitAnother`（响应已完成且上游响应可保持连接）或 `nil`（必须关连接）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlainOutcome {
+    /// 响应已完整回写；是否复用客户端连接由调用方按客户端 keep-alive 请求头决定。
+    WaitAnother,
+    /// 必须关连接（上游响应不可定界 / 显式 close / 请求体不支持）。
+    Close,
+}
+
+/// 上游读响应空闲上限。Go 读响应无 deadline（dispatcher 侧 policy 管理）；本
+/// crate 直连无 policy 层，此上限仅兜"上游 accept 后永不响应"的挂死连接——
+/// 正常慢响应（数据持续到达）不受影响。
+const UPSTREAM_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 头里是否声明 chunked 传输编码（请求体/响应体通用判定）。
+fn headers_indicate_chunked(headers: &HashMap<String, Vec<String>>) -> bool {
+    headers
+        .get("transfer-encoding")
+        .is_some_and(|vals| vals.iter().any(|v| v.to_ascii_lowercase().contains("chunked")))
+}
+
+/// plain HTTP 转发（对应 Go `handlePlainHTTP`）。
+///
+/// 每次调用拨一条新上游连接（对齐 Go `Dispatch` 每请求新 link）。请求体按
+/// Content-Length 定长原样透传（不解码不重编码）；chunked 请求体不支持，回
+/// 400 明确报错。响应按上游可定界性分派：
+/// - Content-Length >= 0 → 回写 keep-alive 头，body 定长透传，返回
+///   [`PlainOutcome::WaitAnother`]；
+/// - chunked / close-delimited → 回写 close 头，body 原样透传，返回
+///   [`PlainOutcome::Close`]；
+/// - 读响应失败 → 503 + close 头，返回 [`PlainOutcome::WaitAnother`]（对齐 Go：
+///   503 分支不重置 `result`，`Process` 层仍按客户端 keep-alive 头决定循环）。
+async fn handle_plain_http(
+    client: &mut TcpStream,
+    hs: &mut HandshakeResult,
+) -> Result<PlainOutcome> {
+    // chunked 请求体明确报错（Go 经 ReadRequest 解码支持；本实现原样透传
+    // 无 body 边界解析，静默截断不可接受）
+    if headers_indicate_chunked(&hs.headers) {
+        warn!(method = %hs.method, "chunked request body not supported by plain HTTP forwarding");
+        let _ = client.write_all(RESPONSE_BAD_REQUEST).await;
+        return Ok(PlainOutcome::Close);
+    }
+    let req_body_len = parse_content_length(&hs.headers)?;
+
+    // Go: request.Host = request.URL.Host（绝对 URI 时覆盖 Host 头）
+    if let Some(host) = extract_url_host(&hs.target) {
+        hs.headers.insert("host".into(), vec![host.to_string()]);
+    }
+    let path = extract_request_path(&hs.target);
+
+    // Go: dispatcher.Dispatch(ctx, dest) —— 每请求新上游连接
+    let mut upstream = dial_destination(&hs.dest).await?;
+
+    // requestDone：Connection: close + 请求头 + body 定长透传
+    let forwarded = build_forwarded_request(&hs.method, &path, &hs.headers);
+    upstream.write_all(&forwarded).await?;
+    if let Some(n) = req_body_len {
+        copy_exact_n(client, &mut upstream, n).await?;
+    }
+    // 转发请求带 Connection: close，上游响应完即关——响应读取阶段无独立
+    // half-close 需求；upstream 在本函数返回时 drop（Go defer Close(link.Writer)）。
+
+    // responseDone
+    let resp = match tokio::time::timeout(
+        UPSTREAM_RESPONSE_TIMEOUT,
+        read_response_head(&mut upstream, client),
+    )
+    .await
+    {
+        Err(_) | Ok(Err(_)) => {
+            // 对齐 Go：503 + 双 close 头；result 保持 errWaitAnother
+            let _ = client.write_all(RESPONSE_SERVICE_UNAVAILABLE).await;
+            return Ok(PlainOutcome::WaitAnother);
         },
+        Ok(Ok(resp)) => resp,
+    };
+
+    let chunked_resp = headers_indicate_chunked(&resp.headers);
+    // 非法 Content-Length 属上游协议错 → 同 503 路径
+    let declared_len = match parse_content_length(&resp.headers) {
+        Ok(len) => len,
+        Err(_) => {
+            let _ = client.write_all(RESPONSE_SERVICE_UNAVAILABLE).await;
+            return Ok(PlainOutcome::WaitAnother);
+        },
+    };
+    // HEAD / 204 / 304：有长度声明但无 body（Go http.ReadResponse 语义——
+    // HEAD 无 CL 头时 ContentLength 也按 0 处理，仍走 keep-alive 分支）
+    let bodyless = hs.method == "HEAD" || resp.code == 204 || resp.code == 304;
+
+    if !chunked_resp && (bodyless || declared_len.is_some()) {
+        // Go: response.ContentLength >= 0 → keep-alive 三头 + Close=false，
+        // result 保持 errWaitAnother
+        let head = serialize_response_head(&resp, true);
+        client.write_all(&head).await?;
+        let body_len = if bodyless { 0 } else { declared_len.unwrap_or(0) };
+        copy_exact_n(&mut upstream, client, body_len).await?;
+        return Ok(PlainOutcome::WaitAnother);
+    }
+
+    // Go: response.Close = true; result = nil —— chunked / close-delimited 不循环
+    let head = serialize_response_head(&resp, false);
+    client.write_all(&head).await?;
+    if !bodyless {
+        if chunked_resp {
+            forward_chunked_body(&mut upstream, client).await?;
+        } else if declared_len.is_none() {
+            // close-delimited：透传到上游 EOF
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = upstream.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                client.write_all(&buf[..n]).await?;
+            }
+        }
+    }
+    Ok(PlainOutcome::Close)
+}
+
+/// 从请求/响应头解析 Content-Length（首个值）。缺失 → None；非法值 → 报错
+/// （静默当 0 会截断 body）。
+fn parse_content_length(headers: &HashMap<String, Vec<String>>) -> Result<Option<u64>> {
+    match headers.get("content-length").and_then(|vals| vals.first()) {
+        None => Ok(None),
+        Some(v) => v.trim().parse::<u64>().map(Some).map_err(|_| {
+            HttpProxyError::InvalidRequest(format!("malformed Content-Length: {v:?}"))
+        }),
+    }
+}
+
+/// 客户端请求是否要求代理级 keep-alive。
+///
+/// 对应 Go `Process`：`TrimSpace(ToLower(Get("Proxy-Connection"))) == "keep-alive"`。
+fn request_keep_alive(headers: &HashMap<String, Vec<String>>) -> bool {
+    headers
+        .get("proxy-connection")
+        .and_then(|vals| vals.first())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("keep-alive"))
+}
+
+/// 从请求行 target 提取绝对 URI 的 authority（对齐 Go `request.URL.Host`）。
+///
+/// 仅 `http://`/`https://` 前缀（absolute-form）有 authority；origin-form /
+/// authority-form 返回 `None`（等价 Go `request.URL.Host == ""`）。
+fn extract_url_host(target: &str) -> Option<&str> {
+    let after_scheme =
+        target.strip_prefix("http://").or_else(|| target.strip_prefix("https://"))?;
+    let authority = after_scheme.split('/').next().unwrap_or_default();
+    (!authority.is_empty()).then_some(authority)
+}
+
+/// 上游响应头（解析结果）。
+struct ResponseHead {
+    /// 原始状态行（如 `HTTP/1.1 200 OK`），回写时原样保留。
+    status_line: String,
+    /// 状态码。
+    code: u16,
+    /// 解析出的 headers（key 全小写，同名多值保留）。
+    headers: HashMap<String, Vec<String>>,
+}
+
+/// 读上游响应头。1xx 中间响应头块原样透传给客户端后继续读最终响应
+/// （对齐 Go `readResponseAndHandle100Continue`）。
+async fn read_response_head(
+    upstream: &mut TcpStream,
+    client: &mut TcpStream,
+) -> Result<ResponseHead> {
+    loop {
+        let status_line = read_http_line(upstream).await?;
+        let code = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse::<u16>().ok())
+            .ok_or_else(|| {
+                HttpProxyError::InvalidRequest(format!("malformed status line: {status_line:?}"))
+            })?;
+        let mut headers: HashMap<String, Vec<String>> = HashMap::new();
+        loop {
+            let line = read_http_line(upstream).await?;
+            if line.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = line.split_once(':') {
+                headers
+                    .entry(k.trim().to_ascii_lowercase())
+                    .or_default()
+                    .push(v.trim().to_string());
+            }
+        }
+        if (100..200).contains(&code) {
+            // 1xx：透传头块，继续读最终响应（非代理处理目标）
+            let mut block = format!("{status_line}\r\n");
+            for (k, vals) in &headers {
+                for v in vals {
+                    block.push_str(&format!("{k}: {v}\r\n"));
+                }
+            }
+            block.push_str("\r\n");
+            client.write_all(block.as_bytes()).await?;
+            continue;
+        }
+        return Ok(ResponseHead { status_line, code, headers });
+    }
+}
+
+/// 序列化回写给客户端的响应头：hop-by-hop 头移除后按 keep-alive 分支改写
+/// 连接性头（对齐 Go `RemoveHopByHopHeaders` + `response.Header.Set` 三头/
+/// `response.Close`）。
+fn serialize_response_head(resp: &ResponseHead, keep_alive: bool) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(256);
+    buf.extend_from_slice(resp.status_line.as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    for (key, values) in &resp.headers {
+        if HOP_BY_HOP_HEADERS.contains(&key.as_str()) {
+            continue;
+        }
+        for value in values {
+            buf.extend_from_slice(key.as_bytes());
+            buf.extend_from_slice(b": ");
+            buf.extend_from_slice(value.as_bytes());
+            buf.extend_from_slice(b"\r\n");
+        }
+    }
+    if keep_alive {
+        buf.extend_from_slice(
+            b"proxy-connection: keep-alive\r\n\
+              connection: keep-alive\r\n\
+              keep-alive: timeout=60\r\n\r\n",
+        );
+    } else {
+        buf.extend_from_slice(b"connection: close\r\nproxy-connection: close\r\n\r\n");
+    }
+    buf
+}
+
+/// 定长透传 `n` 字节（请求/响应 body）。上游提前 EOF → 错误（静默截断不可接受）。
+async fn copy_exact_n(from: &mut TcpStream, to: &mut TcpStream, n: u64) -> std::io::Result<()> {
+    let mut buf = [0u8; 8192];
+    let mut remaining = n;
+    while remaining > 0 {
+        let want = buf.len().min(remaining as usize);
+        let read = from.read(&mut buf[..want]).await?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("peer closed with {remaining} body bytes remaining"),
+            ));
+        }
+        to.write_all(&buf[..read]).await?;
+        remaining -= read as u64;
+    }
+    Ok(())
+}
+
+/// chunked 响应体透传：逐帧 size 行/数据/CRLF/trailer 原样转发，到终止块
+/// （size 0 + trailer 结束）为止，不等 EOF——close-delimited 兜底路径才有
+/// EOF 语义。帧字节原样透传（不解码重编码），客户端按原 transfer-encoding 解析。
+async fn forward_chunked_body(upstream: &mut TcpStream, client: &mut TcpStream) -> Result<()> {
+    loop {
+        let size_line = read_http_line(upstream).await?;
+        let size =
+            usize::from_str_radix(size_line.split(';').next().unwrap_or_default().trim(), 16)
+                .map_err(|_| {
+                    HttpProxyError::InvalidRequest(format!("malformed chunk size: {size_line:?}"))
+                })?;
+        client.write_all(size_line.as_bytes()).await?;
+        client.write_all(b"\r\n").await?;
+        if size == 0 {
+            // trailer 段透传到空行（无 trailer 时首行即空）
+            loop {
+                let line = read_http_line(upstream).await?;
+                client.write_all(line.as_bytes()).await?;
+                client.write_all(b"\r\n").await?;
+                if line.is_empty() {
+                    return Ok(());
+                }
+            }
+        }
+        copy_exact_n(upstream, client, size as u64).await?;
+        // 数据帧分隔 CRLF：upstream 侧消费后原样转发（client 侧帧完整性）
+        let mut crlf = [0u8; 2];
+        upstream.read_exact(&mut crlf).await?;
+        client.write_all(&crlf).await?;
     }
 }
 
@@ -634,6 +952,73 @@ mod tests {
         assert_eq!(d.port().value(), 443);
 
         assert!(parse_host_port("", 80).is_err());
+    }
+
+    // ===== plain HTTP 转发辅助函数测试 =====
+
+    #[test]
+    fn extract_url_host_variants() {
+        assert_eq!(extract_url_host("http://example.com/path"), Some("example.com"));
+        assert_eq!(extract_url_host("https://example.com:8443/"), Some("example.com:8443"));
+        assert_eq!(extract_url_host("http://example.com"), Some("example.com"));
+        // origin-form / authority-form 无绝对 URI host（等价 Go request.URL.Host == ""）
+        assert_eq!(extract_url_host("/path?q=1"), None);
+        assert_eq!(extract_url_host("example.com:8080"), None);
+        assert_eq!(extract_url_host("http:///path"), None);
+    }
+
+    #[test]
+    fn parse_content_length_variants() {
+        let mut h: HashMap<String, Vec<String>> = HashMap::new();
+        assert_eq!(parse_content_length(&h).unwrap(), None);
+        h.insert("content-length".into(), vec!["123".into()]);
+        assert_eq!(parse_content_length(&h).unwrap(), Some(123));
+        h.insert("content-length".into(), vec![" 456 ".into()]);
+        assert_eq!(parse_content_length(&h).unwrap(), Some(456));
+        h.insert("content-length".into(), vec!["abc".into()]);
+        assert!(parse_content_length(&h).is_err(), "malformed value must error");
+        h.insert("content-length".into(), vec!["-1".into()]);
+        assert!(parse_content_length(&h).is_err(), "negative must error");
+    }
+
+    #[test]
+    fn request_keep_alive_detection() {
+        let mut h: HashMap<String, Vec<String>> = HashMap::new();
+        assert!(!request_keep_alive(&h));
+        h.insert("proxy-connection".into(), vec!["Keep-Alive".into()]);
+        assert!(request_keep_alive(&h), "case-insensitive");
+        h.insert("proxy-connection".into(), vec![" keep-alive ".into()]);
+        assert!(request_keep_alive(&h), "trimmed");
+        h.insert("proxy-connection".into(), vec!["close".into()]);
+        assert!(!request_keep_alive(&h));
+    }
+
+    #[test]
+    fn serialize_response_head_keep_alive_branch() {
+        let mut headers: HashMap<String, Vec<String>> = HashMap::new();
+        headers.insert("content-type".into(), vec!["text/plain".into()]);
+        headers.insert("connection".into(), vec!["close".into()]); // hop-by-hop，必被移除
+        let resp = ResponseHead { status_line: "HTTP/1.1 200 OK".into(), code: 200, headers };
+        let out = String::from_utf8(serialize_response_head(&resp, true)).unwrap();
+        assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{out}");
+        assert!(out.contains("content-type: text/plain\r\n"), "{out}");
+        assert!(!out.contains("connection: close"), "old hop-by-hop must go: {out}");
+        assert!(out.contains("proxy-connection: keep-alive\r\n"), "{out}");
+        assert!(out.contains("connection: keep-alive\r\n"), "{out}");
+        assert!(out.contains("keep-alive: timeout=60\r\n"), "{out}");
+    }
+
+    #[test]
+    fn serialize_response_head_close_branch() {
+        let resp = ResponseHead {
+            status_line: "HTTP/1.1 200 OK".into(),
+            code: 200,
+            headers: HashMap::new(),
+        };
+        let out = String::from_utf8(serialize_response_head(&resp, false)).unwrap();
+        assert!(out.contains("connection: close\r\n"), "{out}");
+        assert!(out.contains("proxy-connection: close\r\n"), "{out}");
+        assert!(!out.contains("keep-alive"), "{out}");
     }
 
     // ===== TCP 端到端 handshake 测试 =====
