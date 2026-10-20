@@ -141,7 +141,12 @@ impl StreamSettings {
         for w in removed_feature_warnings(v) {
             xray_common::log::warning(w);
         }
-        let protocol = v.get("network").or_else(|| v.get("method")).and_then(|n| n.as_str()).unwrap_or("tcp").to_string();
+        let protocol = v
+            .get("network")
+            .or_else(|| v.get("method"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("tcp")
+            .to_string();
         let security = v.get("security").and_then(|s| s.as_str()).unwrap_or("").to_string();
         // 协议特定配置：尝试 `<protocol>Settings`（如 `wsSettings`/`grpcSettings`/`tcpSettings`）。
         // Go JSON 解析器约定 `network` 值与 settings 字段名对应（`tcp`→`tcpSettings`,
@@ -151,7 +156,19 @@ impl StreamSettings {
         // 字段被丢弃导致 splithttp 配置丢失（host/path/mode 等全部退化为默认 + dest
         // fallback）。
         let transport_json = protocol_settings_key(&protocol)
-            .and_then(|k| v.get(k).cloned())
+            .and_then(|k| {
+                if k == "tcpSettings" {
+                    // Go transport_internet.go:135-136：`rawSettings` 非空时直接覆盖
+                    // `tcpSettings`（`if c.RAWSettings != nil { c.TCPSettings = c.RAWSettings }`）。
+                    // 仅作用于 tcp/raw 协议的 settings 选择，不影响 ws/grpc 等其他 transport。
+                    match v.get("rawSettings") {
+                        Some(raw) if !raw.is_null() => Some(raw.clone()),
+                        _ => v.get(k).cloned(),
+                    }
+                } else {
+                    v.get(k).cloned()
+                }
+            })
             .or_else(|| v.get("xhttpSettings").cloned());
         let security_json =
             v.get("tlsSettings").cloned().or_else(|| v.get("realitySettings").cloned());
@@ -496,7 +513,8 @@ fn protocol_settings_key(protocol: &str) -> Option<&'static str> {
 /// Rust 保留现有宽容行为：`from_json` 仅 warn 不阻断，协议映射/安全层判定不变。
 fn removed_feature_warnings(v: &serde_json::Value) -> Vec<String> {
     let mut warnings = Vec::new();
-    let protocol = v.get("network").or_else(|| v.get("method")).and_then(|n| n.as_str()).unwrap_or("tcp");
+    let protocol =
+        v.get("network").or_else(|| v.get("method")).and_then(|n| n.as_str()).unwrap_or("tcp");
     match protocol.to_ascii_lowercase().as_str() {
         "http" | "h2" | "h3" => warnings.push(removed_feature_message(
             "HTTP transport (without header padding, etc.)",
@@ -1129,6 +1147,54 @@ mod transport_cache_tests {
         assert_eq!(
             s.transport_json.as_ref().unwrap().get("path").and_then(|p| p.as_str()),
             Some("/p")
+        );
+    }
+
+    #[test]
+    fn stream_settings_raw_settings_config_override() {
+        // Go transport_internet.go:135-136：rawSettings 非空直接覆盖 tcpSettings（raw 优先）。
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"network":"raw",
+                "rawSettings":{"header":{"type":"http","request":{"path":["/rawpath"]}}},
+                "tcpSettings":{"header":{"type":"none"}}}"#,
+        )
+        .unwrap();
+        let s = StreamSettings::from_json(Some(&v));
+        let tj = s.transport_json.as_ref().unwrap();
+        assert_eq!(
+            tj.get("header").and_then(|h| h.get("type")).and_then(|t| t.as_str()),
+            Some("http"),
+            "rawSettings must override tcpSettings"
+        );
+        assert_eq!(
+            tj.get("header")
+                .and_then(|h| h.get("request"))
+                .and_then(|r| r.get("path"))
+                .and_then(|p| p.get(0))
+                .and_then(|p| p.as_str()),
+            Some("/rawpath")
+        );
+    }
+
+    #[test]
+    fn stream_settings_tcp_settings_config_still_works() {
+        // 无 rawSettings 时 tcpSettings 原语义不回归。
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"network":"tcp","tcpSettings":{"header":{"type":"http","request":{"version":"1.1"}}}}"#,
+        )
+        .unwrap();
+        let s = StreamSettings::from_json(Some(&v));
+        let tj = s.transport_json.as_ref().unwrap();
+        assert_eq!(
+            tj.get("header").and_then(|h| h.get("type")).and_then(|t| t.as_str()),
+            Some("http")
+        );
+        assert_eq!(
+            tj.get("header")
+                .and_then(|h| h.get("request"))
+                .and_then(|r| r.get("version"))
+                .and_then(|x| x.as_str()),
+            Some("1.1")
         );
     }
 
