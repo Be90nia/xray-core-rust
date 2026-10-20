@@ -90,12 +90,17 @@ impl SocksClient {
     ///
     /// 流程见模块文档。
     pub async fn dial(&self, target: &SocksAddr) -> Result<TcpStream> {
-        let mut stream = TcpStream::connect(&self.config.server_addr).await.map_err(|e| {
-            SocksError::HandshakeFailed(format!(
-                "connect to socks server {}: {e}",
-                self.config.server_addr
-            ))
-        })?;
+        // bd cjwc G6（Go proxy/socks/client.go:66）：连接级退避 ExponentialBackoff(5, 100)。
+        // 只重试 TCP connect；SOCKS5 握手在环外（Go 同），握手字节不重复发。
+        let server_addr = &self.config.server_addr;
+        let mut stream =
+            xray_transport::retry::exponential_backoff(5, 100, || TcpStream::connect(server_addr))
+                .await
+                .map_err(|e| {
+                    SocksError::HandshakeFailed(format!(
+                        "connect to socks server {server_addr}: {e}"
+                    ))
+                })?;
 
         // bd cjwc G4（Go proxy/socks/client.go:104 SetDeadline(now+Handshake)）：
         // 握手阶段（method 协商 + auth + CONNECT 往返）统一 deadline，修复前
@@ -248,6 +253,28 @@ mod tests {
 
     use super::*;
     use crate::{config::ServerConfig, server::socks5_server_handshake};
+
+    /// bd cjwc G6（Go client.go:66）：connect 拒绝退避 5 次。裸 TcpStream::connect
+    /// 无内部定时器 → start_paused 虚拟时钟精确断言 sleep 阶梯
+    /// （末次失败不再延迟：0+100+200+300=600ms）+ 最终错误（握手从不启动，
+    /// 无握手字节重复）。
+    #[tokio::test(start_paused = true)]
+    async fn dial_connect_refused_backs_off_five_times() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // 立即关闭 → connect 全拒
+
+        let client = SocksClient::new(ClientConfig::new_noauth(addr.to_string()));
+        let target = SocksAddr::ipv4(std::net::Ipv4Addr::LOCALHOST, 80);
+
+        let start = tokio::time::Instant::now();
+        let r = client.dial(&target).await;
+        let elapsed = start.elapsed();
+
+        assert!(r.is_err(), "dial to closed listener must fail: {r:?}");
+        let ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        assert!((600..=800).contains(&ms), "5 attempts = 600ms virtual, got {ms}ms");
+    }
 
     /// 启动一个 mock SOCKS5 server：完成 handshake，然后把 client 的流量 echo 给 target。
     /// 用于 e2e 验证 client handshake 正确 + 数据流透传。

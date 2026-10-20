@@ -238,14 +238,21 @@ fn spawn_preconn_workers(config: Arc<VlessOutboundConfig>, pool: Arc<PreConns>, 
 async fn dial_server_conn(config: &VlessOutboundConfig) -> Result<Box<dyn Connection>, String> {
     let server_dest = config.server_destination();
     let sockopt = config.stream_settings.as_ref().map(|s| s.socket_options()).unwrap_or_default();
-    match &config.stream_settings {
-        Some(s) => dial(&server_dest, s, &sockopt)
-            .await
-            .map_err(|e| format!("vless dial server ({}): {e}", s.protocol)),
-        None => xray_transport::system_dialer::dial_system(&server_dest, &sockopt)
-            .await
-            .map_err(|e| format!("vless dial server (tcp): {e}")),
-    }
+    // bd cjwc G6（Go proxy/vless/outbound/outbound.go:190）：连接级退避
+    // ExponentialBackoff(5, 200)。preconn worker 与主路径共用本函数，均纯拨号，
+    // 请求头在 dial 成功后才发送，环内无协议字节。
+    xray_transport::retry::exponential_backoff(5, 200, || async {
+        match &config.stream_settings {
+            Some(s) => dial(&server_dest, s, &sockopt)
+                .await
+                .map_err(|e| format!("vless dial server ({}): {e}", s.protocol)),
+            None => xray_transport::system_dialer::dial_system(&server_dest, &sockopt)
+                .await
+                .map_err(|e| format!("vless dial server (tcp): {e}")),
+        }
+    })
+    .await
+    .map_err(|e| format!("failed to find an available destination: {e}"))
 }
 
 type EstablishFn = Arc<
@@ -683,6 +690,32 @@ mod tests {
     use xray_common::{net::address::Address, uuid::UUID};
 
     use super::*;
+
+    /// bd cjwc G6（Go outbound.go:190）：dial 拒绝退避 5 次。dial_system 带内部
+    /// 16s connect timeout 污染虚拟时钟 → 真实时钟断言 sleep 阶梯下界
+    /// （末次失败不再延迟：0+200+400+600=1200ms）+ 最终返回错误。
+    #[tokio::test]
+    async fn dial_server_conn_backs_off_five_times() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // 立即关闭 → connect 全拒
+
+        let cfg = VlessOutboundConfig::new(
+            UUID::new(),
+            Address::IPv4(std::net::Ipv4Addr::LOCALHOST),
+            Port::new(port),
+        );
+        let start = std::time::Instant::now();
+        let r = dial_server_conn(&cfg).await;
+        let elapsed = start.elapsed();
+
+        assert!(r.is_err(), "dial to closed listener must fail: {}", r.err().unwrap_or_default());
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1200),
+            "5 attempts need the 1200ms backoff ladder, got {elapsed:?}"
+        );
+        assert!(elapsed < std::time::Duration::from_secs(30), "{elapsed:?}");
+    }
 
     /// VLESS UDP 分帧（bd 1wq8）：write 边界=包边界，wire = `[2B BE len][payload]`，
     /// 读侧剥前缀按包交付（对齐 Go MultiLengthPacketWriter/LengthPacketReader）。
