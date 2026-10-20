@@ -11,6 +11,8 @@
 //! variant：`fetch`（splithttp/xhttp）、`nav`（http CONNECT 出站）、
 //! `ws`（websocket/httpupgrade 握手）。
 
+use std::sync::LazyLock;
+
 use rand::Rng;
 
 /// HTTP header 列表的 Set 语义：替换首个同名（大小写不敏感），否则追加。
@@ -72,8 +74,16 @@ fn rng_f64() -> f64 {
 }
 
 /// Chrome 版本（偏态分布，对齐 Go `ChromeVersion`）。
+///
+/// 进程级锚定（对齐 Go 包级 `AnchoredChromeVersion`，browser.go:155）：
+/// 首次调用抽样后恒定，UA 与 Sec-CH-UA 的版本号全进程一致。
 #[must_use]
 pub fn chrome_version() -> i64 {
+    static ANCHORED: LazyLock<i64> = LazyLock::new(sample_chrome_version);
+    *ANCHORED
+}
+
+fn sample_chrome_version() -> i64 {
     // Chrome 144 发布于 2026-01-13。
     let start_version: i64 = 144;
     let time_start: i64 = days_from_civil(2026, 1, 13);
@@ -82,9 +92,15 @@ pub fn chrome_version() -> i64 {
     start_version + time_diff / 35
 }
 
-/// Firefox 版本（对齐 Go `FirefoxVersion`，含其 2024-07-29 锚点）。
+/// Firefox 版本（对齐 Go `FirefoxVersion`，含其 2024-07-29 锚点；进程级
+/// 锚定对齐 Go 包级 `AnchoredFirefoxVersion`）。
 #[must_use]
 pub fn firefox_version() -> i64 {
+    static ANCHORED: LazyLock<i64> = LazyLock::new(sample_firefox_version);
+    *ANCHORED
+}
+
+fn sample_firefox_version() -> i64 {
     // Firefox 128 ESR：Go 代码锚点为 2024-07-29。
     let time_start: i64 = days_from_civil(2024, 7, 29);
     let time_current: i64 = today_unix_days();
@@ -92,9 +108,14 @@ pub fn firefox_version() -> i64 {
     time_diff / 30 + 128
 }
 
-/// curl 版本字符串（对齐 Go `CurlVersion`）。
+/// curl 版本字符串（对齐 Go `CurlVersion`；进程级锚定对齐 Go 包级 `CurlUA`）。
 #[must_use]
 pub fn curl_version() -> String {
+    static ANCHORED: LazyLock<String> = LazyLock::new(sample_curl_version);
+    ANCHORED.clone()
+}
+
+fn sample_curl_version() -> String {
     // curl 8.0.0 发布于 2023-03-20。
     let time_start: i64 = days_from_civil(2023, 3, 20);
     let time_current: i64 = today_unix_days();
@@ -102,9 +123,15 @@ pub fn curl_version() -> String {
     format!("8.{}.0", time_diff / 57)
 }
 
-/// Safari 版本字符串（对齐 Go `SafariVersion`；索引钳位避免 Go 潜在越界）。
+/// Safari 版本字符串（对齐 Go `SafariVersion`；索引钳位避免 Go 潜在越界；
+/// 进程级锚定对齐 Go 包级 `SafariUA`）。
 #[must_use]
 pub fn safari_version() -> String {
+    static ANCHORED: LazyLock<String> = LazyLock::new(sample_safari_version);
+    ANCHORED.clone()
+}
+
+fn sample_safari_version() -> String {
     const SAFARI_MINOR_MAP: [i64; 25] =
         [0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5, 5, 5, 6, 6, 6, 6];
     let now_secs: i64 = std::time::SystemTime::now()
@@ -462,6 +489,88 @@ mod tests {
     fn chrome_version_in_plausible_range() {
         let v = chrome_version();
         assert!((144..=200).contains(&v), "chrome version {v}");
+    }
+
+    /// 提取 UA 中 `Chrome/{major}.0.0.0` 的主版本号。
+    fn ua_chrome_major(ua: &str) -> i64 {
+        ua.split("Chrome/")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no Chrome/ in UA: {ua}"))
+            .split('.')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    /// 提取 Sec-CH-UA 中 `Chromium";v="{major}"` 的主版本号。
+    fn ch_ua_major(ch: &str) -> i64 {
+        ch.split("Chromium\";v=\"")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no Chromium v in Sec-CH-UA: {ch}"))
+            .split('"')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    /// UA 与 Sec-CH-UA 的 Chrome 版本号必须全进程一致（票 daqq：Go 包级
+    /// AnchoredChromeVersion 语义）。修复前 chrome_version() 每次调用重新
+    /// 抽样，两条 header 同请求内版本号即可漂移——本测试在修复前必失败。
+    #[test]
+    fn ua_and_sec_ch_ua_versions_anchored() {
+        for i in 0..50 {
+            let ua = build_user_agent("chrome");
+            let mut h: Vec<(String, String)> = Vec::new();
+            apply_masqueraded_headers(&mut h, "chrome", "fetch");
+            let ch = get(&h, "Sec-CH-UA").expect("Sec-CH-UA must be set");
+            assert_eq!(
+                ua_chrome_major(&ua),
+                ch_ua_major(ch),
+                "iteration {i}: ua={ua} sec-ch-ua={ch}"
+            );
+        }
+        // e2e 取证（--nocapture）：完整 header 值供人眼核对版本号一致。
+        let ua = build_user_agent("chrome");
+        let mut h: Vec<(String, String)> = Vec::new();
+        apply_masqueraded_headers(&mut h, "chrome", "fetch");
+        println!("[e2e] User-Agent  = {}", get(&h, "User-Agent").unwrap_or(""));
+        println!("[e2e] Sec-CH-UA   = {}", get(&h, "Sec-CH-UA").unwrap_or(""));
+        println!("[e2e] build_user_agent direct = {ua}");
+    }
+
+    /// edge 出站同请求内 UA（Chrome/ + Edg/）与 Sec-CH-UA 版本号一致。
+    #[test]
+    fn edge_ua_matches_sec_ch_ua_version() {
+        for i in 0..50 {
+            let ua = build_user_agent("edge");
+            let mut h: Vec<(String, String)> = Vec::new();
+            apply_masqueraded_headers(&mut h, "edge", "fetch");
+            let ch = get(&h, "Sec-CH-UA").expect("Sec-CH-UA must be set");
+            assert_eq!(
+                ua_chrome_major(&ua),
+                ch_ua_major(ch),
+                "iteration {i}: ua={ua} sec-ch-ua={ch}"
+            );
+            let edg_major: i64 =
+                ua.split("Edg/").nth(1).unwrap().split('.').next().unwrap().parse().unwrap();
+            assert_eq!(edg_major, ua_chrome_major(&ua), "ua={ua}");
+        }
+    }
+
+    /// firefox/safari/curl 无请求内双值，但跨调用（grpc vs ws vs xhttp）
+    /// 也必须进程内恒定（Go AnchoredFirefoxVersion/SafariUA/CurlUA 语义）。
+    #[test]
+    fn firefox_safari_curl_ua_stable_within_process() {
+        let f = build_user_agent("firefox");
+        let s = build_user_agent("safari");
+        let c = build_user_agent("curl");
+        for _ in 0..10 {
+            assert_eq!(build_user_agent("firefox"), f);
+            assert_eq!(build_user_agent("safari"), s);
+            assert_eq!(build_user_agent("curl"), c);
+        }
     }
 
     #[test]

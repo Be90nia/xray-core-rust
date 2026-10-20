@@ -809,204 +809,223 @@ fn qq_11_1_connector() -> io::Result<SslConnector> {
 
     Ok(builder.build())
 }
+/// btls 实际生效指纹裁决（票 daqq G8b：消灭「配 A 发 B」静默降级）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FingerprintResolution {
+    /// btls 有该指纹的专属 ClientHello 模板（connector + key shares + ALPS）。
+    Native,
+    /// btls 无该指纹的模板：显式降级，实际发送 `effective` 模板的
+    /// ClientHello。连接建立时 warn（含 configured/effective/支持清单），
+    /// 本枚举即编程查询的诊断入口。
+    Degraded {
+        /// 实际生效（被降级到）的模板指纹。
+        effective: Fingerprint,
+    },
+    /// btls 无模板且无降级映射：dial 硬错 `InvalidData`。
+    Unsupported,
+}
+
+/// 查询配置指纹在 btls 侧实际生效的模板（诊断入口）。
+///
+/// **显式映射表**（票 daqq）：`Fingerprint` 每个变体必须在此处声明裁决
+/// （Native / Degraded / Unsupported），并由 `fingerprint.rs` 的
+/// `fingerprint_resolution_explicit_table` 测试以 exhaustive match 锁死；
+/// 新增枚举变体时该测试编译失败，强制补表——禁止未声明的「配 A 发 B」分支。
+///
+/// btls 能力边界（依 `btls` rev ab7f522 公开 API 调研）：无内置指纹模板
+/// （无 uTLS ClientHelloSpec 等价物），仅有逐字段定制原语（`set_cipher_list`/
+/// `set_curves_list`/`set_sigalgs_list`/`set_extension_permutation`/
+/// `set_grease_enabled`/ALPN/ALPS/key shares）。历史模板须逐字段参数表复刻，
+/// 未复刻的一律显式降级或硬错，不再静默回落。
+#[must_use]
+pub fn effective_fingerprint(fp: &Fingerprint) -> FingerprintResolution {
+    use Fingerprint::*;
+    match fp {
+        // 原生模板（9 组专属 ClientHello 配置，见本文件各 *_connector()）。
+        Chrome | HelloChrome133
+        | HelloChrome131
+        | HelloChrome120
+        | Firefox | HelloFirefox148
+        | HelloFirefox120
+        | Safari | HelloSafari26_3
+        | HelloIos13 // Safari connector + iOS 13 专属 key shares/ALPS
+        | Ios | HelloIos14
+        | Edge | HelloEdge106
+        | Qihoo360 | Hello360_11_0
+        | Qq | HelloQq_11_1 => FingerprintResolution::Native,
+        // 旧 Chrome 族 → Chrome 120（btls 最老 Chrome 实现）
+        HelloChromeAuto
+        | HelloChrome58
+        | HelloChrome62
+        | HelloChrome70
+        | HelloChrome72
+        | HelloChrome83
+        | HelloChrome87
+        | HelloChrome96
+        | HelloChrome100
+        | HelloChrome102
+        | HelloChrome106Shuffle
+        | HelloChrome100Psk
+        | HelloChrome112PskShuf
+        | HelloChrome114PaddingPskShuf
+        | HelloChrome115Pq
+        | HelloChrome115PqPsk
+        | HelloChrome120Pq => FingerprintResolution::Degraded { effective: HelloChrome120 },
+        // 旧 Firefox 族 → Firefox 120
+        HelloFirefoxAuto
+        | HelloFirefox55
+        | HelloFirefox56
+        | HelloFirefox63
+        | HelloFirefox65
+        | HelloFirefox99
+        | HelloFirefox102
+        | HelloFirefox105 => FingerprintResolution::Degraded { effective: HelloFirefox120 },
+        // 旧 iOS/Safari 族 → iOS 13 配置
+        HelloIosAuto
+        | HelloIos11_1
+        | HelloIos12_1
+        | HelloSafari16_0
+        | HelloSafariAuto => FingerprintResolution::Degraded { effective: HelloIos13 },
+        // 旧 Edge 族 → Edge 106
+        HelloEdge85 | HelloEdgeAuto => {
+            FingerprintResolution::Degraded { effective: HelloEdge106 }
+        },
+        // 旧 360/QQ 族 → 现存实现
+        Hello360Auto | Hello360_7_5 => {
+            FingerprintResolution::Degraded { effective: Hello360_11_0 }
+        },
+        HelloQqAuto => FingerprintResolution::Degraded { effective: HelloQq_11_1 },
+        // Android WebView ≈ Chrome
+        Android | HelloAndroid11OkHttp => FingerprintResolution::Degraded { effective: Chrome },
+        // Go stdlib 无 uTLS 指纹 → Chrome 120
+        HelloGolang => FingerprintResolution::Degraded { effective: HelloChrome120 },
+        // 随机化族：btls 无逐字段随机化能力（uTLS 的 cipher/扩展顺序洗牌无
+        // 对应 API），诚实退化为静态 Chrome 133 并告警——不假装随机。
+        Random
+        | Randomized
+        | HelloRandomized
+        | HelloRandomizedAlpn
+        | UniformRandom => FingerprintResolution::Degraded { effective: Chrome },
+        // 无 ALPN 变体：同为 Chrome 133 静态降级；build 侧按配置名走
+        // no-ALPN connector（ALPS 依赖 ALPN 协商，随之一并置空）。
+        RandomizedNoAlpn | HelloRandomizedNoAlpn => {
+            FingerprintResolution::Degraded { effective: Chrome }
+        },
+        // Go 端 `unsafe` 是 InsecureSkipVerify 占位，不是指纹。
+        Unsafe => FingerprintResolution::Unsupported,
+    }
+}
+
+/// 原生支持清单（降级 warn 文本与测试共用引用）。
+const NATIVE_TEMPLATE_LIST: &str = "chrome firefox safari ios edge 360 qq \
+     hellochrome_120/131/133 hellofirefox_120/148 helloios_13/14 \
+     helloedge_106 hellosafari_26_3 hello360_11_0 helloqq_11_1";
+
 /// 根据指纹选择 btls 连接器。
 ///
-/// 返回 `Some(Ok(config))` = btls 支持；`Some(Err(_))` = 清单外指纹（硬错
-/// `InvalidData`，不再静默回退标准 rustls）；函数不再返回 `None`。
+/// 返回 `Some(Ok(config))` = btls 支持（Native 或已告警的显式降级）；
+/// `Some(Err(_))` = 清单外指纹（硬错 `InvalidData`，不再静默回退标准
+/// rustls）；函数不再返回 `None`。
 pub(crate) fn connector_for_fingerprint(fp: &Fingerprint) -> Option<io::Result<FingerprintConfig>> {
-    match fp {
+    let effective = match effective_fingerprint(fp) {
+        FingerprintResolution::Native => *fp,
+        FingerprintResolution::Degraded { effective } => {
+            // 大声降级（票 daqq）：「配 A 发 B」必须可观测——每连接 warn
+            // 带配置指纹、实际生效模板与原生支持清单。
+            tracing::warn!(
+                target: "xray_tls::fingerprint",
+                configured = ?fp,
+                effective = ?effective,
+                "fingerprint not implemented by btls: degraded ClientHello in use; native templates: {NATIVE_TEMPLATE_LIST}; see effective_fingerprint()"
+            );
+            effective
+        },
+        FingerprintResolution::Unsupported => {
+            // 清单外指纹：硬错 InvalidData。配置了指纹说明用户在意 ClientHello
+            // 伪装，静默回退标准 rustls 等于伪装失效（批3 裁决：显式失败）。
+            return Some(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "fingerprint {fp:?} not supported by btls; pick a supported fingerprint (silent rustls fallback removed)"
+                ),
+            )));
+        },
+    };
+    Some(build_fingerprint_config(fp, &effective))
+}
+
+/// 按实际生效模板构建 connector 配置（分支与 [`effective_fingerprint`] 的
+/// Native/Degraded 目标一一对应）。
+fn build_fingerprint_config(
+    configured: &Fingerprint,
+    effective: &Fingerprint,
+) -> io::Result<FingerprintConfig> {
+    // random 族无 ALPN 变体：映射表统一到 Chrome，此处按配置名分流。
+    let no_alpn =
+        matches!(configured, Fingerprint::RandomizedNoAlpn | Fingerprint::HelloRandomizedNoAlpn);
+    match effective {
         Fingerprint::Chrome | Fingerprint::HelloChrome133 => {
-            Some(chrome_133_connector().map(|c| FingerprintConfig {
+            let connector =
+                if no_alpn { chrome_133_connector_no_alpn() } else { chrome_133_connector() };
+            connector.map(|c| FingerprintConfig {
                 connector: c,
                 key_shares: CHROME_133_KEY_SHARES,
-                alps: CHROME_133_ALPS,
-            }))
+                alps: if no_alpn { b"" } else { CHROME_133_ALPS },
+            })
         },
-        Fingerprint::HelloChrome131 => Some(chrome_131_connector().map(|c| FingerprintConfig {
+        Fingerprint::HelloChrome131 => chrome_131_connector().map(|c| FingerprintConfig {
             connector: c,
             key_shares: CHROME_131_KEY_SHARES,
             alps: CHROME_131_ALPS,
-        })),
-        Fingerprint::HelloChrome120 => Some(chrome_120_connector().map(|c| FingerprintConfig {
+        }),
+        Fingerprint::HelloChrome120 => chrome_120_connector().map(|c| FingerprintConfig {
             connector: c,
             key_shares: CHROME_120_KEY_SHARES,
             alps: CHROME_120_ALPS,
-        })),
+        }),
         Fingerprint::Firefox | Fingerprint::HelloFirefox148 => {
-            Some(firefox_148_connector().map(|c| FingerprintConfig {
+            firefox_148_connector().map(|c| FingerprintConfig {
                 connector: c,
                 key_shares: FIREFOX_148_KEY_SHARES,
                 alps: FIREFOX_148_ALPS,
-            }))
+            })
         },
-        Fingerprint::HelloFirefox120 => Some(firefox_120_connector().map(|c| FingerprintConfig {
+        Fingerprint::HelloFirefox120 => firefox_120_connector().map(|c| FingerprintConfig {
             connector: c,
             key_shares: FIREFOX_120_KEY_SHARES,
             alps: FIREFOX_120_ALPS,
-        })),
+        }),
         Fingerprint::Safari | Fingerprint::HelloSafari26_3 => {
-            Some(safari_26_3_connector().map(|c| FingerprintConfig {
+            safari_26_3_connector().map(|c| FingerprintConfig {
                 connector: c,
                 key_shares: SAFARI_26_3_KEY_SHARES,
                 alps: SAFARI_26_3_ALPS,
-            }))
+            })
         },
-        Fingerprint::HelloIos13 => Some(safari_26_3_connector().map(|c| FingerprintConfig {
+        Fingerprint::HelloIos13 => safari_26_3_connector().map(|c| FingerprintConfig {
             connector: c,
             key_shares: IOS_13_KEY_SHARES,
             alps: IOS_13_ALPS,
-        })),
-        Fingerprint::Ios | Fingerprint::HelloIos14 => Some(safari_26_3_connector().map(|c| {
+        }),
+        Fingerprint::Ios | Fingerprint::HelloIos14 => safari_26_3_connector().map(|c| {
             FingerprintConfig { connector: c, key_shares: IOS_14_KEY_SHARES, alps: IOS_14_ALPS }
-        })),
-        Fingerprint::Edge | Fingerprint::HelloEdge106 => Some(edge_106_connector().map(|c| {
+        }),
+        Fingerprint::Edge | Fingerprint::HelloEdge106 => edge_106_connector().map(|c| {
             FingerprintConfig { connector: c, key_shares: EDGE_106_KEY_SHARES, alps: EDGE_106_ALPS }
-        })),
+        }),
         Fingerprint::Qihoo360 | Fingerprint::Hello360_11_0 => {
-            Some(qihoo_360_11_0_connector().map(|c| FingerprintConfig {
+            qihoo_360_11_0_connector().map(|c| FingerprintConfig {
                 connector: c,
                 key_shares: QIHOO_360_11_0_KEY_SHARES,
                 alps: QIHOO_360_11_0_ALPS,
-            }))
+            })
         },
-        Fingerprint::Qq | Fingerprint::HelloQq_11_1 => Some(qq_11_1_connector().map(|c| {
+        Fingerprint::Qq | Fingerprint::HelloQq_11_1 => qq_11_1_connector().map(|c| {
             FingerprintConfig { connector: c, key_shares: QQ_11_1_KEY_SHARES, alps: QQ_11_1_ALPS }
-        })),
-        // Old Chrome variants → Chrome 120 (oldest implemented)
-        Fingerprint::HelloChromeAuto
-        | Fingerprint::HelloChrome58
-        | Fingerprint::HelloChrome62
-        | Fingerprint::HelloChrome70
-        | Fingerprint::HelloChrome72
-        | Fingerprint::HelloChrome83
-        | Fingerprint::HelloChrome87
-        | Fingerprint::HelloChrome96
-        | Fingerprint::HelloChrome100
-        | Fingerprint::HelloChrome102
-        | Fingerprint::HelloChrome106Shuffle
-        | Fingerprint::HelloChrome100Psk
-        | Fingerprint::HelloChrome112PskShuf
-        | Fingerprint::HelloChrome114PaddingPskShuf
-        | Fingerprint::HelloChrome115Pq
-        | Fingerprint::HelloChrome115PqPsk
-        | Fingerprint::HelloChrome120Pq => {
-            tracing::warn!(target: "xray_tls::fingerprint", "old Chrome fingerprint {:?} falling back to Chrome 120", fp);
-            Some(chrome_120_connector().map(|c| FingerprintConfig {
-                connector: c,
-                key_shares: CHROME_120_KEY_SHARES,
-                alps: CHROME_120_ALPS,
-            }))
-        },
-        // Old Firefox variants → Firefox 120
-        Fingerprint::HelloFirefoxAuto
-        | Fingerprint::HelloFirefox55
-        | Fingerprint::HelloFirefox56
-        | Fingerprint::HelloFirefox63
-        | Fingerprint::HelloFirefox65
-        | Fingerprint::HelloFirefox99
-        | Fingerprint::HelloFirefox102
-        | Fingerprint::HelloFirefox105 => {
-            tracing::warn!(target: "xray_tls::fingerprint", "old Firefox fingerprint {:?} falling back to Firefox 120", fp);
-            Some(firefox_120_connector().map(|c| FingerprintConfig {
-                connector: c,
-                key_shares: FIREFOX_120_KEY_SHARES,
-                alps: FIREFOX_120_ALPS,
-            }))
-        },
-        // Old iOS/Safari variants → iOS 13
-        Fingerprint::HelloIosAuto
-        | Fingerprint::HelloIos11_1
-        | Fingerprint::HelloIos12_1
-        | Fingerprint::HelloSafari16_0
-        | Fingerprint::HelloSafariAuto => {
-            tracing::warn!(target: "xray_tls::fingerprint", "old iOS/Safari fingerprint {:?} falling back to Safari 26.3", fp);
-            Some(safari_26_3_connector().map(|c| FingerprintConfig {
-                connector: c,
-                key_shares: IOS_13_KEY_SHARES,
-                alps: IOS_13_ALPS,
-            }))
-        },
-        // Old Edge variants → Edge 106
-        Fingerprint::HelloEdge85 | Fingerprint::HelloEdgeAuto => {
-            tracing::warn!(target: "xray_tls::fingerprint", "old Edge fingerprint {:?} falling back to Edge 106", fp);
-            Some(edge_106_connector().map(|c| FingerprintConfig {
-                connector: c,
-                key_shares: EDGE_106_KEY_SHARES,
-                alps: EDGE_106_ALPS,
-            }))
-        },
-        // Old 360/QQ variants → existing
-        Fingerprint::Hello360Auto | Fingerprint::Hello360_7_5 => {
-            tracing::warn!(target: "xray_tls::fingerprint", "old 360 fingerprint {:?} falling back to 360 11.0", fp);
-            Some(qihoo_360_11_0_connector().map(|c| FingerprintConfig {
-                connector: c,
-                key_shares: QIHOO_360_11_0_KEY_SHARES,
-                alps: QIHOO_360_11_0_ALPS,
-            }))
-        },
-        Fingerprint::HelloQqAuto => {
-            tracing::warn!(target: "xray_tls::fingerprint", "old QQ fingerprint {:?} falling back to QQ 11.1", fp);
-            Some(qq_11_1_connector().map(|c| FingerprintConfig {
-                connector: c,
-                key_shares: QQ_11_1_KEY_SHARES,
-                alps: QQ_11_1_ALPS,
-            }))
-        },
-        // Android → Chrome (Android WebView ≈ Chrome)
-        Fingerprint::Android | Fingerprint::HelloAndroid11OkHttp => {
-            tracing::warn!(target: "xray_tls::fingerprint", "Android fingerprint {:?} falling back to Chrome 133", fp);
-            Some(chrome_133_connector().map(|c| FingerprintConfig {
-                connector: c,
-                key_shares: CHROME_133_KEY_SHARES,
-                alps: CHROME_133_ALPS,
-            }))
-        },
-        // Golang → Chrome 120 (Go stdlib has no uTLS fingerprint)
-        Fingerprint::HelloGolang => {
-            tracing::warn!(target: "xray_tls::fingerprint", "Golang fingerprint falling back to Chrome 120");
-            Some(chrome_120_connector().map(|c| FingerprintConfig {
-                connector: c,
-                key_shares: CHROME_120_KEY_SHARES,
-                alps: CHROME_120_ALPS,
-            }))
-        },
-        // Random → Chrome 133 (most common modern browser)
-        Fingerprint::Random
-        | Fingerprint::Randomized
-        | Fingerprint::HelloRandomized
-        | Fingerprint::HelloRandomizedAlpn => {
-            tracing::debug!(target: "xray_tls::fingerprint", "Random fingerprint → Chrome 133");
-            Some(chrome_133_connector().map(|c| FingerprintConfig {
-                connector: c,
-                key_shares: CHROME_133_KEY_SHARES,
-                alps: CHROME_133_ALPS,
-            }))
-        },
-        // RandomizedNoALPN：uTLS 随机化指纹的无 ALPN 变体。btls 无法复刻
-        // uTLS 的 cipher/扩展顺序随机化，就近映射到无 ALPN 的 Chrome 133
-        // 配置（ALPS 依赖 ALPN 协商，随之一并置空）。
-        Fingerprint::RandomizedNoAlpn | Fingerprint::HelloRandomizedNoAlpn => {
-            Some(chrome_133_connector_no_alpn().map(|c| FingerprintConfig {
-                connector: c,
-                key_shares: CHROME_133_KEY_SHARES,
-                alps: b"",
-            }))
-        },
-        // UniformRandom：uTLS 均匀权重随机化（Go xray 未收录该预设名，Rust
-        // 端按 uTLS 库补全）。btls 无逐字段均匀随机化能力，就近映射 Chrome 133。
-        Fingerprint::UniformRandom => Some(chrome_133_connector().map(|c| FingerprintConfig {
-            connector: c,
-            key_shares: CHROME_133_KEY_SHARES,
-            alps: CHROME_133_ALPS,
-        })),
-        // 清单外指纹：硬错 InvalidData。配置了指纹说明用户在意 ClientHello
-        // 伪装，静默回退标准 rustls 等于伪装失效（批3 裁决：显式失败）。
-        _ => Some(Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "fingerprint {fp:?} not supported by btls; pick a supported fingerprint (silent rustls fallback removed)"
-            ),
-        ))),
+        }),
+        // 穷尽性由 effective_fingerprint 保证（测试锁死），此处不可达；
+        // 显式失败优于悄悄吞。
+        other => unreachable!("unmapped effective fingerprint {other:?}"),
     }
 }
 
@@ -1575,6 +1594,137 @@ impl<S: Connection + Unpin> ConnInterface for BtlsConn<S> {
 mod tests {
     use super::*;
     use crate::fingerprint::get_fingerprint;
+
+    use std::sync::{Arc, Mutex};
+
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Subscriber};
+
+    /// 极简 warn 捕获 subscriber（票 daqq）：断言降级告警真实发出且携带
+    /// configured/effective 字段（真实 tracing 事件，非 mock）。
+    #[derive(Clone, Default)]
+    struct WarnCapture(Arc<Mutex<Vec<String>>>);
+
+    impl Subscriber for WarnCapture {
+        fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+            meta.level() <= &tracing::Level::WARN
+        }
+        fn new_span(&self, _attrs: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+        fn event(&self, event: &Event<'_>) {
+            struct Fmt(String);
+            impl tracing::field::Visit for Fmt {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.push_str(&format!("{}={value} ", field.name()));
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!("{}={value:?} ", field.name()));
+                }
+            }
+            let mut v = Fmt(String::new());
+            event.record(&mut v);
+            self.0.lock().unwrap().push(v.0);
+        }
+        fn enter(&self, _span: &Id) {}
+        fn exit(&self, _span: &Id) {}
+    }
+
+    /// 已知不支持的历史指纹（hellochrome_58）→ 显式降级 Chrome 120：
+    /// warn 必须真实发出且含 configured/effective 两个字段。
+    #[test]
+    fn degraded_fingerprint_warns_with_configured_and_effective() {
+        let capture = WarnCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            let cfg = connector_for_fingerprint(&Fingerprint::HelloChrome58)
+                .expect("Some")
+                .expect("degraded config builds");
+            let _ = cfg;
+        });
+        let warns = capture.0.lock().unwrap();
+        for w in warns.iter() {
+            // e2e 取证（--nocapture）：真实 warn 文本。
+            println!("[e2e] warn: {w}");
+        }
+        assert!(
+            warns.iter().any(|w| {
+                w.contains("configured=HelloChrome58")
+                    && w.contains("effective=HelloChrome120")
+                    && w.contains("not implemented by btls")
+            }),
+            "expected degradation warn, got: {warns:?}"
+        );
+    }
+
+    /// random/randomized 族：btls 无真随机化能力 → 静态 Chrome 133 必须
+    /// **明确告警**（修复前只有 debug!，RUST_LOG=warn 下完全不可见）。
+    #[test]
+    fn random_fingerprint_warns_fixed_degradation() {
+        let capture = WarnCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            let cfg = connector_for_fingerprint(&Fingerprint::Random)
+                .expect("Some")
+                .expect("random degraded config builds");
+            let _ = cfg;
+        });
+        let warns = capture.0.lock().unwrap();
+        assert!(
+            warns
+                .iter()
+                .any(|w| { w.contains("configured=Random") && w.contains("effective=Chrome") }),
+            "expected random degradation warn, got: {warns:?}"
+        );
+    }
+
+    /// randomizednoalpn：降级 Chrome 但走 no-ALPN connector（ALPS 置空），
+    /// 且同样必须告警。
+    #[test]
+    fn randomized_no_alpn_degrades_with_warning() {
+        let capture = WarnCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            let cfg = connector_for_fingerprint(&Fingerprint::RandomizedNoAlpn)
+                .expect("Some")
+                .expect("no-alpn degraded config builds");
+            assert!(cfg.alps.is_empty(), "no-ALPN variant must have empty ALPS");
+        });
+        let warns = capture.0.lock().unwrap();
+        assert!(
+            warns.iter().any(|w| {
+                w.contains("configured=RandomizedNoAlpn") && w.contains("effective=Chrome")
+            }),
+            "expected no-alpn degradation warn, got: {warns:?}"
+        );
+    }
+
+    /// 原生指纹不得触发降级告警（告警只属于「配 A 发 B」）。
+    #[test]
+    fn native_fingerprint_emits_no_warning() {
+        let capture = WarnCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            let _ = connector_for_fingerprint(&Fingerprint::Chrome).expect("Some").expect("ok");
+            let _ = connector_for_fingerprint(&Fingerprint::HelloIos13).expect("Some").expect("ok");
+        });
+        assert!(capture.0.lock().unwrap().is_empty(), "native fingerprints must not warn");
+    }
+
+    /// 清单外指纹（unsafe）：硬错 InvalidData，文本含支持提示（原文保留）。
+    #[test]
+    fn unsupported_fingerprint_hard_errors() {
+        // FingerprintConfig 无 Debug（SslConnector 无 derive），用 match 解构。
+        let err = match connector_for_fingerprint(&Fingerprint::Unsafe) {
+            Some(Ok(_)) => panic!("out-of-list fingerprint must hard-error"),
+            Some(Err(e)) => e,
+            None => panic!("connector_for_fingerprint never returns None"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("not supported by btls"), "got: {err}");
+    }
 
     /// ModernFingerprints 全池 + 补齐清单（android/randomized 家族/
     /// uniformrandom）必须 btls 可用（Some(Ok)），且 fingerprint_supported 同步。
