@@ -304,9 +304,8 @@ mod tests {
 
     use super::*;
     use crate::config::IpOption;
-
-    /// 共享 dialer 槽是进程级全局：涉 dialer 的测试须串行。
-    static DIALER_SLOT_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    /// 共享 dialer 槽是进程级全局：涉 dialer 的测试须串行（全 crate 共用一把锁）。
+    use crate::dial::DIALER_SLOT_LOCK;
 
     fn ip_dest(addr: SocketAddr) -> Destination {
         Destination::tcp(Address::from(addr.ip()), Port::new(addr.port()))
@@ -458,8 +457,8 @@ mod tests {
 
     /// bd mcpo 验收②：dialer 注入后查询经路由出站——dialer 收到查询目标
     /// （dest 原样传递），数据经 dialer 建立的链路往返。
-    /// ypsl P0（doh-h2-deepdive）：共享拨号器管线停摆期间 connect_stream 一律
-    /// 直连——dialer 不被调用（恢复共享拨号时回滚本断言）。
+    /// bd 34nk：回滚 P0 旁路（connect_stream 恢复共享拨号器）后，查询必须
+    /// 重新经共享 dialer 路由出站。
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
     async fn tcp_query_routes_through_dialer() {
@@ -482,10 +481,11 @@ mod tests {
 
         assert_eq!(rec.ips, vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))]);
         let recorded = dialer.recorded.lock();
+        assert_eq!(recorded.len(), 1, "查询必须经共享 dialer 路由出站（bd mcpo 验收②）");
         assert_eq!(
-            recorded.len(),
-            0,
-            "P0 期间查询直连，不得走共享拨号器（恢复共享拨号时改回 == 1 并保留 dest 断言）"
+            recorded[0].port().value(),
+            addr.port(),
+            "dialer 应收到原样 dest（目标地址原样传递）"
         );
     }
 

@@ -3,7 +3,12 @@
 //! 对应 Go 版本 `common/buf` 的 io.go，定义异步 Reader/Writer trait、
 //! 错误类型和工厂函数。所有 IO 操作均为异步，基于 tokio AsyncRead/AsyncWrite。
 
-use std::{future::Future, pin::Pin, time::Duration};
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -76,6 +81,17 @@ pub trait Reader: Send {
     fn read_multi_buffer(
         &mut self,
     ) -> Pin<Box<dyn Future<Output = Result<MultiBuffer>> + Send + '_>>;
+
+    /// poll 形态读取：一次 poll 判定就绪并注册 waker。
+    ///
+    /// 默认实现 = 建 future 轮询一次（等价既有 async 路径「每次 poll 重建
+    /// future」的语义）。**依赖跨 poll 存活的等待注册的实现必须覆写**：默认
+    /// 实现丢弃 future 时其内部 waiter 注册随之销毁，后到的数据不再唤醒读端
+    /// （丢唤醒 → 读端一直挂到外部超时才轮询到数据，bd 34nk）。
+    fn poll_read_multi_buffer(&mut self, cx: &mut Context<'_>) -> Poll<Result<MultiBuffer>> {
+        let mut fut = self.read_multi_buffer();
+        fut.as_mut().poll(cx)
+    }
 }
 
 // ========== Writer trait ==========
@@ -90,6 +106,21 @@ pub trait Writer: Send {
         &mut self,
         mb: MultiBuffer,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+
+    /// poll 形态写入：就地消费 `mb` 直到写完（Ready）或底层阻塞（Pending）。
+    ///
+    /// 默认实现把 `mb` 所有权交给 [`Writer::write_multi_buffer`] 并轮询一次；
+    /// Pending 时数据随 future 丢弃——**需要跨 poll 保活的实现必须覆写**
+    /// （如 `pipe::Writer`：管道满时数据留在 `mb` 里，waker 持久注册于共享槽）。
+    fn poll_write_multi_buffer(
+        &mut self,
+        cx: &mut Context<'_>,
+        mb: &mut MultiBuffer,
+    ) -> Poll<Result<()>> {
+        let owned = std::mem::take(mb);
+        let mut fut = self.write_multi_buffer(owned);
+        fut.as_mut().poll(cx)
+    }
 
     /// 通知读端 EOF（对应 Go pipe.Close）。
     /// 默认空操作；pipe.Writer override 为实际 close。
@@ -119,6 +150,12 @@ impl Reader for Box<dyn Reader> {
     ) -> Pin<Box<dyn Future<Output = Result<MultiBuffer>> + Send + '_>> {
         (**self).read_multi_buffer()
     }
+
+    /// 必须转发到内层：否则经 Box 调用会退回 trait 默认实现，丢掉内层
+    /// （如 `pipe::Reader`）的 poll 覆写 → 又变回「每次 poll 重建 future」。
+    fn poll_read_multi_buffer(&mut self, cx: &mut Context<'_>) -> Poll<Result<MultiBuffer>> {
+        (**self).poll_read_multi_buffer(cx)
+    }
 }
 
 impl Writer for Box<dyn Writer> {
@@ -127,6 +164,15 @@ impl Writer for Box<dyn Writer> {
         mb: MultiBuffer,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         (**self).write_multi_buffer(mb)
+    }
+
+    /// 同 [`Reader::poll_read_multi_buffer`]：转发到内层实现。
+    fn poll_write_multi_buffer(
+        &mut self,
+        cx: &mut Context<'_>,
+        mb: &mut MultiBuffer,
+    ) -> Poll<Result<()>> {
+        (**self).poll_write_multi_buffer(cx, mb)
     }
 
     fn shutdown(&self) {

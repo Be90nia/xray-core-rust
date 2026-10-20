@@ -340,9 +340,8 @@ mod tests {
 
     use super::*;
     use crate::config::IpOption;
-
-    /// 共享 dialer 槽是进程级全局：涉 dialer 的测试须串行。
-    static DIALER_SLOT_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    /// 共享 dialer 槽是进程级全局：涉 dialer 的测试须串行（全 crate 共用一把锁）。
+    use crate::dial::DIALER_SLOT_LOCK;
 
     fn udp_dest(addr: SocketAddr) -> Destination {
         Destination::udp(Address::from(addr.ip()), Port::new(addr.port()))
