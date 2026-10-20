@@ -1047,7 +1047,11 @@ fn build_protocol_handler(
             )
         },
         "dns" => {
-            let handler = parse_dns_outbound_config(&ob.entry.data)?;
+            let cfg = build_dns_outbound_config(&ob.entry.data)?;
+            // G14（Go dns.go:85）：h.timeout = ForLevel(config.UserLevel)
+            // .Timeouts.ConnectionIdle——超时 policy 驱动，无 manager 显式回退 + warn。
+            let dns_idle = dns_idle_timeout_for(policy_manager, cfg.user_level);
+            let handler = xray_proxy_dns::Handler::init(&cfg, dns_idle);
             let bridge = DnsDispatchBridge::new(ob.tag.clone(), handler, dns.cloned());
             Ok((Arc::new(bridge) as Arc<dyn DispatchHandler>, None, None))
         },
@@ -2116,8 +2120,8 @@ async fn dispatch_dns_link(
     }
 
     // ---- TCP：长度前缀帧流，双路 IO loop（Go task.Run(request, response)） ----
-    // Go timeout = policy ConnectionIdle（Level0 = 300s），Rust 侧用同值常量做 idle。
-    const DNS_IDLE: std::time::Duration = std::time::Duration::from_secs(300);
+    // 空闲窗 = 注入的 policy ConnectionIdle（G14；Go dns.go:226 同值语义，
+    // 每轮读超时重置 = inactivity 计时）。
 
     let writer = Arc::new(tokio::sync::Mutex::new(link.writer));
     // lazy 上游写半连接（Go outboundConn：Write 首拨）。读半连接经 channel
@@ -2138,7 +2142,7 @@ async fn dispatch_dns_link(
             let mut frames = Vec::new();
             let mut buf = vec![0u8; 4096];
             loop {
-                let n = match tokio::time::timeout(DNS_IDLE, rh.read(&mut buf)).await {
+                let n = match tokio::time::timeout(timeout, rh.read(&mut buf)).await {
                     Ok(Ok(0)) | Err(_) => return, // EOF / idle 超时
                     Ok(Ok(n)) => n,
                     Ok(Err(e)) => {
@@ -2171,7 +2175,7 @@ async fn dispatch_dns_link(
         let mut decoder = DnsFrameDecoder::new();
         let mut frames = Vec::new();
         loop {
-            let mb = match tokio::time::timeout(DNS_IDLE, link.reader.read_multi_buffer()).await {
+            let mb = match tokio::time::timeout(timeout, link.reader.read_multi_buffer()).await {
                 Ok(Ok(mb)) if !mb.is_empty() => mb,
                 Ok(Ok(_)) | Ok(Err(_)) | Err(_) => return, // EOF / idle 超时 / 断开
             };
@@ -2779,9 +2783,23 @@ fn build_dns_outbound_config(data: &[u8]) -> std::result::Result<xray_proxy_dns:
     Ok(config)
 }
 
-/// 从 outbound entry.data（JSON）解析 dns outbound 配置并构造运行时 Handler。
-fn parse_dns_outbound_config(data: &[u8]) -> std::result::Result<xray_proxy_dns::Handler, String> {
-    build_dns_outbound_config(data).map(|cfg| xray_proxy_dns::Handler::init(&cfg))
+/// G14（Go dns.go:85）：DNS 超时取 `policy.ForLevel(level).Timeouts.ConnectionIdle`。
+/// 无 policy manager 时显式回退 SessionDefault（level0 = 300s）并 warn 一次，不静默。
+pub(crate) fn dns_idle_timeout_for(
+    policy: Option<&dyn xray_features::policy::PolicyManager>,
+    level: u32,
+) -> std::time::Duration {
+    match policy {
+        Some(pm) => pm.policy_for_level(level).timeout.connection_idle,
+        None => {
+            tracing::warn!(
+                level,
+                fallback = ?xray_features::policy::TimeoutPolicy::default().connection_idle,
+                "dns: no policy manager, using SessionDefault ConnectionIdle"
+            );
+            xray_features::policy::TimeoutPolicy::default().connection_idle
+        },
+    }
 }
 
 // ========== AnyTLS 配置解析 ==========
@@ -3526,6 +3544,49 @@ mod tests {
 
     use super::*;
 
+    /// G14：dns_idle_timeout_for 按 level 查 policy 档位；无 manager 显式回退
+    /// SessionDefault 300s（warn 一次，不静默）。
+    #[test]
+    fn dns_idle_timeout_for_reads_policy_level_and_falls_back() {
+        use std::collections::HashMap;
+
+        use xray_proto::xray::app::policy::policy::Timeout as PolicyTimeout;
+        let mut levels = HashMap::new();
+        levels.insert(
+            1u32,
+            xray_proto::xray::app::policy::Policy {
+                timeout: Some(PolicyTimeout {
+                    handshake: None,
+                    connection_idle: Some(xray_proto::xray::app::policy::Second { value: 600 }),
+                    uplink_only: None,
+                    downlink_only: None,
+                }),
+                stats: None,
+                buffer: None,
+            },
+        );
+        let pm = xray_app_policy::PolicyFeature::new(xray_proto::xray::app::policy::Config {
+            level: levels,
+            system: None,
+        })
+        .unwrap();
+        // level 1 命中配置档位 → 600s
+        assert_eq!(
+            dns_idle_timeout_for(Some(&pm), 1),
+            std::time::Duration::from_secs(600)
+        );
+        // level 0 未配置 → SessionDefault（300s）
+        assert_eq!(
+            dns_idle_timeout_for(Some(&pm), 0),
+            xray_features::policy::TimeoutPolicy::default().connection_idle
+        );
+        // 无 policy manager → 显式回退 SessionDefault 300s
+        assert_eq!(
+            dns_idle_timeout_for(None, 0),
+            xray_features::policy::TimeoutPolicy::default().connection_idle
+        );
+    }
+
     fn make_outbound(kind: &str, tag: &str, data: &str) -> BuiltOutbound {
         BuiltOutbound {
             entry: BuiltEntry { kind: kind.to_string(), data: data.as_bytes().to_vec() },
@@ -3536,6 +3597,15 @@ mod tests {
             mux_json: None,
             target_strategy: None,
         }
+    }
+
+    /// 测试 helper：解析 dns outbound 配置并按给定超时构造 Handler。
+    fn parse_dns_outbound_config(
+        data: &[u8],
+        idle_timeout: std::time::Duration,
+    ) -> std::result::Result<xray_proxy_dns::Handler, String> {
+        build_dns_outbound_config(data)
+            .map(|cfg| xray_proxy_dns::Handler::init(&cfg, idle_timeout))
     }
 
     fn mux_outbound(tag: &str, mux_json: serde_json::Value) -> BuiltOutbound {
@@ -5888,8 +5958,11 @@ mod tests {
         let addr = spawn_dns_udp_mock(upstream_resp.clone(), captured.clone()).await;
 
         // Direct 规则（qType A）。
-        let handler =
-            parse_dns_outbound_config(br#"{"rule":[{"action":"direct","qType":[1]}]}"#).unwrap();
+        let handler = parse_dns_outbound_config(
+            br#"{"rule":[{"action":"direct","qType":[1]}]}"#,
+            std::time::Duration::from_secs(300),
+        )
+        .unwrap();
         let bridge = DnsDispatchBridge::new("dns-out", handler, None);
         let dest =
             Destination::udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(addr.port()));
@@ -5919,7 +5992,7 @@ mod tests {
         };
 
         let svc = make_fakedns_service("fake-in");
-        let handler = parse_dns_outbound_config(b"{}").unwrap();
+        let handler = parse_dns_outbound_config(b"{}", std::time::Duration::from_secs(300)).unwrap();
         let bridge = DnsDispatchBridge::new("dns-out", handler, Some(svc));
         // dest 无所谓（Hijack 不转发）。
         let dest = Destination::udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(53));
@@ -6132,7 +6205,7 @@ mod tests {
 
         // 无规则（A 默认 Hijack）+ DnsService 带 client tag "self-loop"。
         let svc = make_fakedns_service("self-loop");
-        let handler = parse_dns_outbound_config(b"{}").unwrap();
+        let handler = parse_dns_outbound_config(b"{}", std::time::Duration::from_secs(300)).unwrap();
         let bridge = DnsDispatchBridge::new("dns-out", handler, Some(svc));
         let dest =
             Destination::udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(addr.port()));
@@ -6166,9 +6239,11 @@ mod tests {
             multi::MultiBuffer,
         };
 
-        let handler =
-            parse_dns_outbound_config(br#"{"rule":[{"action":"return","qType":[16],"rCode":5}]}"#)
-                .unwrap();
+        let handler = parse_dns_outbound_config(
+            br#"{"rule":[{"action":"return","qType":[16],"rCode":5}]}"#,
+            std::time::Duration::from_secs(300),
+        )
+        .unwrap();
         let bridge = DnsDispatchBridge::new("dns-out", handler, None);
         let dest = Destination::udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(53));
         let (mut up_w, mut dn_r) = spawn_dns_bridge(&bridge, &dest, None);
@@ -6227,8 +6302,11 @@ mod tests {
             }
         });
 
-        let handler =
-            parse_dns_outbound_config(br#"{"rule":[{"action":"direct","qType":[1]}]}"#).unwrap();
+        let handler = parse_dns_outbound_config(
+            br#"{"rule":[{"action":"direct","qType":[1]}]}"#,
+            std::time::Duration::from_secs(300),
+        )
+        .unwrap();
         let bridge = DnsDispatchBridge::new("dns-out", handler, None);
         let dest =
             Destination::tcp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(upstream_port));

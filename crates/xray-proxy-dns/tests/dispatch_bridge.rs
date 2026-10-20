@@ -12,6 +12,7 @@
 #![cfg(test)]
 
 use std::net::{IpAddr, Ipv4Addr};
+use std::time::Duration;
 
 use hickory_resolver::proto::{
     op::{Message as HickoryMessage, MessageType, OpCode},
@@ -64,7 +65,7 @@ async fn dns_dispatch_round_trip_through_upstream() {
         &[(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port)],
     )
     .expect("build outbound");
-    let handler = Handler::init(&Config::default());
+    let handler = Handler::init(&Config::default(), Duration::from_secs(5));
     let inbound = DnsInbound::new("dns-in", handler, outbound);
 
     // 3. 构造 DNS A 查询 example.com
@@ -111,7 +112,7 @@ async fn dns_inbound_without_rules_delegates_to_outbound() {
     // 无规则（Direct）——与上一个测试的差异：上游返回 5.6.7.8，
     // 验证响应确实来自 mock 上游而非缓存/预设。
     let cfg = Config::default();
-    let handler = Handler::init(&cfg);
+    let handler = Handler::init(&cfg, Duration::from_secs(5));
     let outbound = DnsOutbound::new_with_servers(
         "fallback",
         &[(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port)],
