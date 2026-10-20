@@ -2287,6 +2287,73 @@ fn parse_reality_config(
     let max_client_ver =
         json.get("maxClientVer").and_then(|x| x.as_str()).map(parse_ver).unwrap_or_default();
 
+    // 票 037f：Go 有 Rust 无的 realitySettings 键——有意图值一律配置层硬错，
+    // 不静默丢（对齐 bd 5std 惯例；关闭值/缺省放行，不破 Go 兼容配置）。
+    // - show（transport_security.go:29）：REALITY 握手 debug 打印
+    //   （transport/internet/reality/reality.go:102-285 fmt.Printf），Rust 无
+    //   等价 trace 点。非 bool 类型手误按「已设置」拒（bd zl5t 惯例）。
+    if let Some(v) = json.get("show") {
+        match v {
+            serde_json::Value::Null | serde_json::Value::Bool(false) => {},
+            _ => {
+                return Err(std::io::Error::other(
+                    "reality: \"show\": true is not supported by this build (REALITY handshake \
+                     debug tracing is not implemented); remove the key",
+                ));
+            },
+        }
+    }
+    // - masterKeyLog（:28）：REALITY acceptor 无 NSS keylog 挂点
+    //   （xray-reality::open_key_log_writer 无生产 caller）。空串/"none" = Go
+    //   KeyLogWriterFromConfig 的关闭语义，放行。
+    if let Some(v) = json.get("masterKeyLog") {
+        let set = match v {
+            serde_json::Value::Null => false,
+            serde_json::Value::String(s) => !s.is_empty() && s != "none",
+            _ => true,
+        };
+        if set {
+            return Err(std::io::Error::other(
+                "reality: \"masterKeyLog\" is not supported by this build (no keylog hook on \
+                 the REALITY acceptor); remove the key (tlsSettings.masterKeyLog works for \
+                 plain TLS)",
+            ));
+        }
+    }
+    // - limitFallbackUpload/Download（:42-43）：fallback 限速器未实现；
+    //   全零对象/缺省 = Go 无限制语义，放行。
+    for lf_key in ["limitFallbackUpload", "limitFallbackDownload"] {
+        if let Some(v) = json.get(lf_key) {
+            let active = v.as_object().is_some_and(|o| {
+                ["afterBytes", "bytesPerSec", "burstBytesPerSec"]
+                    .iter()
+                    .any(|k| o.get(*k).and_then(|x| x.as_u64()).unwrap_or(0) > 0)
+            });
+            if active || (!v.is_null() && !v.is_object()) {
+                return Err(std::io::Error::other(format!(
+                    "reality: \"{lf_key}\" is not supported by this build (fallback rate \
+                     limiting is not implemented); remove the key"
+                )));
+            }
+        }
+    }
+    // - type（:32）与 unix 形态 target/dest（:68-84 '@'/'/' 前缀推导 unix，
+    //   含 Linux @@ 抽象套接字）：Rust reality fallback 拨号仅支持 host:port。
+    if let Some(t) = json.get("type").and_then(|x| x.as_str()) {
+        if !t.eq_ignore_ascii_case("tcp") {
+            return Err(std::io::Error::other(format!(
+                "reality: unsupported \"type\": {t} (only \"tcp\" fallback targets are \
+                 implemented; unix targets are Go-only)"
+            )));
+        }
+    }
+    if fallback_dest.starts_with('@') || fallback_dest.starts_with('/') {
+        return Err(std::io::Error::other(
+            "reality: unix socket fallback targets are not implemented in this build \
+             (target/dest starting with '@' or '/'); use a host:port target",
+        ));
+    }
+
     Ok(RealityInboundConfig {
         server_private_key: key,
         server_names,
@@ -5903,6 +5970,75 @@ mod tests {
             };
             let err = parse_reality_config(&settings).unwrap_err();
             assert!(err.to_string().contains("shortIds"), "expected shortIds error, got: {err}");
+        }
+    }
+
+    /// 票 037f：Go 有 Rust 无的 realitySettings 键——有意图值配置层硬错指名键；
+    /// 关闭值/缺省放行（Go 兼容配置不破）。
+    #[test]
+    fn parse_reality_config_rejects_unsupported_go_keys() {
+        use base64::Engine as _;
+        let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
+        // 有意图值 → 拒，文案指名键。（dest 仅在 target 缺席时被读取，
+        // dest case 需移除基底 target。）
+        let build = |extra: &serde_json::Value, drop_target: bool| {
+            let mut obj = serde_json::json!({
+                "privateKey": key_b64,
+                "serverNames": ["a.com"],
+                "shortIds": ["ab"],
+                "target": "example.com:443",
+            });
+            {
+                let base = obj.as_object_mut().expect("object literal");
+                if drop_target {
+                    base.remove("target");
+                }
+                if let Some(patch) = extra.as_object() {
+                    for (k, v) in patch {
+                        base.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            xray_transport::dialer::StreamSettings {
+                security: "reality".to_string(),
+                security_json: Some(obj),
+                ..xray_transport::dialer::StreamSettings::tcp()
+            }
+        };
+        let cases: Vec<(serde_json::Value, &str, bool)> = vec![
+            (serde_json::json!({ "show": true }), "show", false),
+            (serde_json::json!({ "masterKeyLog": "keys.log" }), "masterKeyLog", false),
+            (
+                serde_json::json!({ "limitFallbackUpload": { "afterBytes": 1024 } }),
+                "limitFallbackUpload",
+                false,
+            ),
+            (
+                serde_json::json!({ "limitFallbackDownload": { "bytesPerSec": 8 } }),
+                "limitFallbackDownload",
+                false,
+            ),
+            (serde_json::json!({ "type": "unix" }), "type", false),
+            (serde_json::json!({ "target": "@@reality-fallback" }), "unix socket", false),
+            (serde_json::json!({ "dest": "/run/reality.sock" }), "unix socket", true),
+        ];
+        for (extra, needle, drop_target) in cases {
+            let err = parse_reality_config(&build(&extra, drop_target))
+                .err()
+                .unwrap_or_else(|| panic!("case {needle:?}: must reject, got Ok"));
+            assert!(err.to_string().contains(needle), "expected error naming {needle}, got: {err}");
+        }
+
+        // 关闭值/缺省 → 放行（Go 兼容配置零回归）。
+        for extra in [
+            serde_json::json!({ "show": false }),
+            serde_json::json!({ "masterKeyLog": "none" }),
+            serde_json::json!({ "limitFallbackUpload": {} }),
+            serde_json::json!({ "type": "tcp" }),
+            serde_json::json!({}),
+        ] {
+            parse_reality_config(&build(&extra, false))
+                .unwrap_or_else(|e| panic!("closed/absent values must pass, got: {e}"));
         }
     }
     use xray_proxy_freedom::make_freedom_dial_fn;

@@ -330,6 +330,8 @@ async fn async_main() -> std::process::ExitCode {
     let command = cli.command.unwrap_or(Command::Run(RunArgs::default()));
     if !matches!(command, Command::Run(_)) {
         run::init_tracing("info");
+        // 票 037f：同 run 路径——未实现的 Go env flag 被设置时指名 warn。
+        xray_common::platform::env::warn_unsupported_env_flags();
         // P3 护栏（tokio #8065/#8120 教训）：启动期一次性抓取 RuntimeMetrics 快照
         // 并以 tracing::info 输出，便于日志归档 worker 行为基线（park/busy/noop/steal）。
         // 失败仅记 warn，不影响主路径。

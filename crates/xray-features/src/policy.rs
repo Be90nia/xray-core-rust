@@ -38,7 +38,8 @@ pub const DEFAULT_DOWNLINK_ONLY_TIMEOUT: Duration = Duration::from_secs(1);
 /// Fallback per-connection pipe buffer limit (512 KiB).
 ///
 /// 对应 Go `defaultBufferSize` 的 GOARCH「其他」分支（x86_64 等）。
-/// `XRAY_BUFSIZE` env 桥接已实现：[`BufferPolicy::default`] 经
+/// buffer size env 桥接已实现（Go 名 `xray.ray.buffer.size` 优先、
+/// `XRAY_BUFSIZE` 兜底，见 [`BUFFER_SIZE_ENV_NAMES`]）：[`BufferPolicy::default`] 经
 /// [`default_buffer_connection_from_env`] 消费 env（Go policy.go:86-116
 /// `defaultBufferSize atomic` + `reloadEnvSettings` 的 init 等价物）。
 pub const DEFAULT_BUFFER_CONNECTION: i32 = 512 * 1024;
@@ -131,15 +132,23 @@ fn parse_xray_bufsize(raw: Option<&str>) -> Option<i64> {
     raw.and_then(|v| v.trim().parse::<i64>().ok())
 }
 
-/// `XRAY_BUFSIZE` → SessionDefault per-connection buffer，进程级一次读取缓存
+/// `xray.ray.buffer.size` → SessionDefault per-connection buffer，进程级一次读取缓存
 /// （对齐 Go `defaultBufferSize atomic.Int32` init 时填充；Rust 无 SIGHUP
 /// reload 机制，进程生命周期内取一次值）。
+///
+/// env 名优先级（bd 037f）：Go 原名 `xray.ray.buffer.size` /
+/// `XRAY_RAY_BUFFER_SIZE` 优先，Rust 历史名 `XRAY_BUFSIZE` 兜底（向后兼容；
+/// Go 部署脚本按 Go 文档设名直接生效）。
 static DEFAULT_BUFFER_CONNECTION_FROM_ENV: std::sync::LazyLock<i32> =
     std::sync::LazyLock::new(|| {
         default_buffer_connection_from_env(parse_xray_bufsize(
-            std::env::var("XRAY_BUFSIZE").ok().as_deref(),
+            xray_common::platform::env::env_first_set(BUFFER_SIZE_ENV_NAMES).as_deref(),
         ))
     });
+
+/// buffer size env 候选名，按优先级排列（Go 名在前，历史名兜底）。
+const BUFFER_SIZE_ENV_NAMES: &[&str] =
+    &["xray.ray.buffer.size", "XRAY_RAY_BUFFER_SIZE", "XRAY_BUFSIZE"];
 
 /// System-level policy.
 ///
@@ -381,16 +390,28 @@ mod tests {
 
     /// env 桥接端到端：BufferPolicy::default().connection 必须等于
     /// `default_buffer_connection_from_env(parse(env))`（sm80⑤ 接线：
-    /// 此前 default 恒 512 KiB，XRAY_BUFSIZE 零消费）。
+    /// 此前 default 恒 512 KiB，buffer size env 零消费）。
     /// 不 set_var：LazyLock 进程级缓存 + 测试并行会互相污染。
+    /// 期望值按 BUFFER_SIZE_ENV_NAMES 顺序解析（bd 037f：Go 名优先），
+    /// 与静态消费点同源。
     #[test]
     fn test_buffer_policy_default_follows_env_bridge() {
-        let env = parse_xray_bufsize(std::env::var("XRAY_BUFSIZE").ok().as_deref());
+        let env = parse_xray_bufsize(
+            xray_common::platform::env::env_first_set(BUFFER_SIZE_ENV_NAMES).as_deref(),
+        );
         assert_eq!(
             BufferPolicy::default().connection,
             default_buffer_connection_from_env(env),
-            "BufferPolicy::default must consume XRAY_BUFSIZE via env bridge"
+            "BufferPolicy::default must consume buffer size env via bridge"
         );
+    }
+
+    /// bd 037f：env 名优先级——Go 原名在前、Rust 历史名兜底（顺序即契约）。
+    #[test]
+    fn test_buffer_size_env_names_go_first_legacy_last() {
+        assert_eq!(BUFFER_SIZE_ENV_NAMES.first(), Some(&"xray.ray.buffer.size"));
+        assert_eq!(BUFFER_SIZE_ENV_NAMES[1], "XRAY_RAY_BUFFER_SIZE");
+        assert_eq!(BUFFER_SIZE_ENV_NAMES.last(), Some(&"XRAY_BUFSIZE"));
     }
 
     // ====== ivst: VMessClosing 行为 + ZeroBuffer 行为单测 ======

@@ -291,6 +291,38 @@ pub(crate) fn parse_splithttp_config(json: Option<&serde_json::Value>) -> io::Re
         },
     };
 
+    // extra（Go transport_method.go:317-326）：整体覆盖配置——以 extra 对象为
+    // 基底重解析，host/path/mode 恒取外层；`extra: null` 视同未设置（Go 侧
+    // RawMessage("null") Unmarshal 后等于零值覆盖，属病态写法，Rust 取宽容
+    // 语义）；嵌套 extra 不递归（Go Build 只解一层）。
+    if let Some(extra) = obj.get("extra") {
+        match extra {
+            serde_json::Value::Null => {},
+            serde_json::Value::Object(extra_obj) => {
+                let mut merged = extra_obj.clone();
+                for key in ["host", "path", "mode"] {
+                    let outer =
+                        obj.get(key).cloned().unwrap_or(serde_json::Value::String(String::new()));
+                    merged.insert(key.to_string(), outer);
+                }
+                merged.remove("extra");
+                return parse_splithttp_config(Some(&serde_json::Value::Object(merged)));
+            },
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "splithttpSettings.extra must be a JSON object matching the \
+                     splithttpSettings schema",
+                ));
+            },
+        }
+    }
+
+    parse_splithttp_fields(obj)
+}
+
+/// splithttp 字段解析（无 extra 合并；入口见 [`parse_splithttp_config`]）。
+fn parse_splithttp_fields(obj: &serde_json::Map<String, serde_json::Value>) -> io::Result<Config> {
     let get_str = |k: &str| obj.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
     // 新键优先、旧键兜底（Go v26.7.28 transport_method.go:269-270 用
     // sessionIDPlacement/sessionIDKey；Rust 早期键 sessionPlacement/sessionKey
@@ -423,13 +455,16 @@ pub(crate) fn parse_splithttp_config(json: Option<&serde_json::Value>) -> io::Re
         },
         no_grpc_header: get_bool("noGRPCHeader"),
         no_sse_header: get_bool("noSSEHeader"),
+        // scMaxEachPostBytes（Go transport_method.go:289 Int32Range；票 037f 前只从
+        // proto 灌、JSON 恒回落默认 1MB）。消费点：client dialer.rs POST 切片阈值 +
+        // server hub/handler.rs:291 413 拒收。
+        sc_max_each_post_bytes: get_range("scMaxEachPostBytes"),
         sc_min_posts_interval_ms: get_range("scMinPostsIntervalMs"),
         sc_max_buffered_posts: get_i64("scMaxBufferedPosts"),
         sc_stream_up_server_secs: get_range("scStreamUpServerSecs"),
         server_max_header_bytes: get_i64("serverMaxHeaderBytes") as i32,
         xmux,
         download_settings,
-        ..Config::default()
     })
 }
 
@@ -547,8 +582,7 @@ mod tests {
                "xmux":{"maxConcurrency":{"from":1,"to":4},"maxConnections":{"from":2,"to":8},
                        "cMaxReuseTimes":{"from":3,"to":3},"hMaxRequestTimes":{"from":5,"to":6},
                        "hMaxReusableSecs":{"from":7,"to":8},"hKeepAlivePeriod":30},
-               "downloadSettings":{"splithttpSettings":{"host":"dl.example.com","path":"/dl"}},
-               "extra":{}}"#,
+               "downloadSettings":{"splithttpSettings":{"host":"dl.example.com","path":"/dl"}}}"#,
         )
         .unwrap();
         let cfg = parse_splithttp_config(Some(&v)).unwrap();
@@ -575,6 +609,75 @@ mod tests {
         let dl = cfg.download_settings.as_ref().unwrap();
         assert_eq!(dl.host, "dl.example.com");
         assert_eq!(dl.path, "/dl");
+    }
+
+    /// 票 037f：scMaxEachPostBytes JSON 灌入（此前只走 proto，JSON 恒默认 1MB）。
+    /// 消费点：client POST 切片阈值 / server 413 拒收。
+    #[test]
+    fn parse_splithttp_sc_max_each_post_bytes_wires_field() {
+        // 对象形态
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"scMaxEachPostBytes":{"from":500000,"to":900000}}"#).unwrap();
+        let cfg = parse_splithttp_config(Some(&v)).unwrap();
+        let r = cfg.sc_max_each_post_bytes.expect("field must be set from JSON");
+        assert_eq!((r.from, r.to), (500_000, 900_000));
+        // 归一化透传（to != 0 不落默认）
+        let n = cfg.normalized_sc_max_each_post_bytes();
+        assert_eq!((n.from, n.to), (500_000, 900_000));
+
+        // 整数形态
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"scMaxEachPostBytes":250000}"#).unwrap();
+        let cfg = parse_splithttp_config(Some(&v)).unwrap();
+        let r = cfg.sc_max_each_post_bytes.expect("integer form");
+        assert_eq!((r.from, r.to), (250_000, 250_000));
+
+        // 缺省 → None → normalized 默认 1MB（Go 同）
+        let cfg = parse_splithttp_config(Some(&serde_json::json!({}))).unwrap();
+        assert!(cfg.sc_max_each_post_bytes.is_none());
+        let n = cfg.normalized_sc_max_each_post_bytes();
+        assert_eq!((n.from, n.to), (1_000_000, 1_000_000));
+    }
+
+    /// 票 037f：extra 整体覆盖（Go transport_method.go:317-326）——extra 字段生效、
+    /// host/path/mode 恒取外层、未覆盖字段被抹掉（Go c = &extra 语义）。
+    #[test]
+    fn parse_splithttp_extra_overrides_keeping_outer_host_path_mode() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"host":"outer.example.com","path":"/outer","mode":"stream-up",
+                "noGRPCHeader":true,"scMaxBufferedPosts":30,
+                "extra":{"noGRPCHeader":false,"scMaxBufferedPosts":99,
+                         "scMaxEachPostBytes":{"from":100000,"to":200000},
+                         "host":"ignored.example.com"}}"#,
+        )
+        .unwrap();
+        let cfg = parse_splithttp_config(Some(&v)).unwrap();
+        // host/path/mode 恒取外层
+        assert_eq!(cfg.host, "outer.example.com");
+        assert_eq!(cfg.path, "/outer");
+        assert_eq!(cfg.mode, "stream-up");
+        // extra 内字段覆盖外层
+        assert!(!cfg.no_grpc_header, "extra.noGRPCHeader=false must override outer true");
+        assert_eq!(cfg.sc_max_buffered_posts, 99);
+        let r = cfg.sc_max_each_post_bytes.expect("extra scMaxEachPostBytes");
+        assert_eq!((r.from, r.to), (100_000, 200_000));
+    }
+
+    /// extra 非对象（Go json.Unmarshal 失败）→ 拒；extra null 视同未设置。
+    #[test]
+    fn parse_splithttp_extra_type_errors_and_null_passthrough() {
+        for bad in [r#""string""#, "42", "[]"] {
+            let v: serde_json::Value =
+                serde_json::from_str(&format!(r#"{{"extra":{bad}}}"#)).unwrap();
+            let err = parse_splithttp_config(Some(&v)).expect_err("non-object extra must reject");
+            assert!(err.to_string().contains("extra"), "got: {err}");
+        }
+        // null：外层字段原样生效
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"path":"/keep","noGRPCHeader":true,"extra":null}"#).unwrap();
+        let cfg = parse_splithttp_config(Some(&v)).unwrap();
+        assert_eq!(cfg.path, "/keep");
+        assert!(cfg.no_grpc_header);
     }
 
     #[test]

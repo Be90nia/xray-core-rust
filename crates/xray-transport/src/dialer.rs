@@ -218,6 +218,24 @@ impl StreamSettings {
                 ));
             }
         }
+        // domainStrategy / addressPortStrategy 非法值（Go transport_sockopt.go:117
+        // "unsupported domain strategy" / :146 同型硬错；票 037f 前静默回退
+        // AsIs/None）。运行时 socket_options 路径保留宽容 warn（programmatic
+        // 构造可达），装配期在此对齐拒启。
+        if let Some(v) = obj.get("domainStrategy").and_then(|v| v.as_str()) {
+            if parse_domain_strategy(v).is_none() {
+                return Err(std::io::Error::other(format!(
+                    "sockopt.domainStrategy: unsupported domain strategy: {v}"
+                )));
+            }
+        }
+        if let Some(v) = obj.get("addressPortStrategy").and_then(|v| v.as_str()) {
+            if parse_address_port_strategy(v).is_none() {
+                return Err(std::io::Error::other(format!(
+                    "sockopt.addressPortStrategy: unsupported address and port strategy: {v}"
+                )));
+            }
+        }
         // int32 数值字段越界（Go json.Unmarshal 硬错；Rust 此前 as i32 回绕）。
         for key in [
             "mark",
@@ -368,14 +386,20 @@ impl StreamSettings {
             }
             opts.happy_eyeballs = Some(cfg);
         }
-        // domainStrategy（bd 5y8，Go infra/conf/transport_internet.go:1082-1108，
-        // 大小写不敏感；Go conf 对非法值硬报错，此 JSON 层宽容回退 AsIs 并 warn）。
+        // domainStrategy（Go transport_sockopt.go:96-116，大小写不敏感；运行时
+        // 路径对未知值宽容回退 AsIs 并 warn——装配期 validate_sockopt_json 硬错）。
         if let Some(v) = obj.get("domainStrategy").and_then(|v| v.as_str()) {
-            opts.domain_strategy = parse_domain_strategy(v);
+            opts.domain_strategy = parse_domain_strategy(v).unwrap_or_else(|| {
+                tracing::warn!(value = v, "unsupported domain strategy, fallback to AsIs");
+                crate::sockopt::DomainStrategy::AsIs
+            });
         }
-        // addressPortStrategy（bd 5y8，transport_internet.go:1124-1142，同上宽容）。
+        // addressPortStrategy（Go transport_sockopt.go:124-146，同上宽容）。
         if let Some(v) = obj.get("addressPortStrategy").and_then(|v| v.as_str()) {
-            opts.address_port_strategy = parse_address_port_strategy(v);
+            opts.address_port_strategy = parse_address_port_strategy(v).unwrap_or_else(|| {
+                tracing::warn!(value = v, "unsupported address port strategy, fallback to None");
+                crate::sockopt::AddressPortStrategy::None
+            });
         }
         // customSockopt（Go `SocketConfig.CustomSockopt` 字段 20，infra/conf
         // transport_sockopt.go:12-19/123-135；全 string 字段原样透传，应用层
@@ -427,44 +451,42 @@ impl StreamSettings {
     }
 }
 
-/// `domainStrategy` 字符串 → 枚举。对应 Go transport_internet.go:1082-1108
-/// 的 `strings.ToLower` switch；未知值 warn + AsIs（Go 在 conf Build 硬报错）。
-fn parse_domain_strategy(s: &str) -> crate::sockopt::DomainStrategy {
+/// `domainStrategy` 字符串 → 枚举。对应 Go transport_sockopt.go:96-116
+/// 的 `strings.ToLower` switch；未知值返回 `None`（Go conf Build 硬错）。
+/// 运行时路径（[`StreamSettings::socket_options`]）对 None 宽容回退 AsIs 并
+/// warn（programmatic 构造可达）；装配期 [`StreamSettings::validate_sockopt_json`]
+/// 对 None 硬错，对齐 Go。
+fn parse_domain_strategy(s: &str) -> Option<crate::sockopt::DomainStrategy> {
     use crate::sockopt::DomainStrategy;
     match s.to_ascii_lowercase().as_str() {
-        "asis" | "" => DomainStrategy::AsIs,
-        "useip" => DomainStrategy::UseIP,
-        "useipv4" => DomainStrategy::UseIPv4,
-        "useipv6" => DomainStrategy::UseIPv6,
-        "useipv4v6" => DomainStrategy::UseIPv4v6,
-        "useipv6v4" => DomainStrategy::UseIPv6v4,
-        "forceip" => DomainStrategy::ForceIP,
-        "forceipv4" => DomainStrategy::ForceIPv4,
-        "forceipv6" => DomainStrategy::ForceIPv6,
-        "forceipv4v6" => DomainStrategy::ForceIPv4v6,
-        "forceipv6v4" => DomainStrategy::ForceIPv6v4,
-        other => {
-            tracing::warn!(value = other, "unsupported domain strategy, fallback to AsIs");
-            DomainStrategy::AsIs
-        },
+        "asis" | "" => Some(DomainStrategy::AsIs),
+        "useip" => Some(DomainStrategy::UseIP),
+        "useipv4" => Some(DomainStrategy::UseIPv4),
+        "useipv6" => Some(DomainStrategy::UseIPv6),
+        "useipv4v6" => Some(DomainStrategy::UseIPv4v6),
+        "useipv6v4" => Some(DomainStrategy::UseIPv6v4),
+        "forceip" => Some(DomainStrategy::ForceIP),
+        "forceipv4" => Some(DomainStrategy::ForceIPv4),
+        "forceipv6" => Some(DomainStrategy::ForceIPv6),
+        "forceipv4v6" => Some(DomainStrategy::ForceIPv4v6),
+        "forceipv6v4" => Some(DomainStrategy::ForceIPv6v4),
+        _ => None,
     }
 }
 
-/// `addressPortStrategy` 字符串 → 枚举。对应 Go transport_internet.go:1124-1142。
-fn parse_address_port_strategy(s: &str) -> crate::sockopt::AddressPortStrategy {
+/// `addressPortStrategy` 字符串 → 枚举。对应 Go transport_sockopt.go:124-146；
+/// 未知值 `None`（Go 硬错），处置同 [`parse_domain_strategy`]。
+fn parse_address_port_strategy(s: &str) -> Option<crate::sockopt::AddressPortStrategy> {
     use crate::sockopt::AddressPortStrategy;
     match s.to_ascii_lowercase().as_str() {
-        "none" | "" => AddressPortStrategy::None,
-        "srvportonly" => AddressPortStrategy::SrvPortOnly,
-        "srvaddressonly" => AddressPortStrategy::SrvAddressOnly,
-        "srvportandaddress" => AddressPortStrategy::SrvPortAndAddress,
-        "txtportonly" => AddressPortStrategy::TxtPortOnly,
-        "txtaddressonly" => AddressPortStrategy::TxtAddressOnly,
-        "txtportandaddress" => AddressPortStrategy::TxtPortAndAddress,
-        other => {
-            tracing::warn!(value = other, "unsupported address port strategy, fallback to None");
-            AddressPortStrategy::None
-        },
+        "none" | "" => Some(AddressPortStrategy::None),
+        "srvportonly" => Some(AddressPortStrategy::SrvPortOnly),
+        "srvaddressonly" => Some(AddressPortStrategy::SrvAddressOnly),
+        "srvportandaddress" => Some(AddressPortStrategy::SrvPortAndAddress),
+        "txtportonly" => Some(AddressPortStrategy::TxtPortOnly),
+        "txtaddressonly" => Some(AddressPortStrategy::TxtAddressOnly),
+        "txtportandaddress" => Some(AddressPortStrategy::TxtPortAndAddress),
+        _ => None,
     }
 }
 
@@ -851,6 +873,72 @@ mod transport_cache_tests {
         // 缺省/null。
         assert!(StreamSettings::validate_sockopt_json(None).is_ok());
         assert!(StreamSettings::validate_sockopt_json(Some(&serde_json::Value::Null)).is_ok());
+    }
+
+    /// 票 037f：domainStrategy / addressPortStrategy 非法值装配期硬错（对齐 Go
+    /// transport_sockopt.go:117/:146 "unsupported ... strategy"）；合法全表 +
+    /// 缺省放行；运行时 socket_options 路径对未知值仍宽容回退（不走此门）。
+    #[test]
+    fn validate_sockopt_json_rejects_unknown_strategies() {
+        use super::StreamSettings;
+        // 非法值 → 拒，指名键 + 值。
+        for (key, bad) in
+            [("domainStrategy", "UseIPv4 "), ("addressPortStrategy", "srvPortOnlyTypo")]
+        {
+            let obj = serde_json::json!({ key: bad });
+            let err = StreamSettings::validate_sockopt_json(Some(&obj))
+                .expect_err("unknown strategy must reject at assembly");
+            let msg = err.to_string();
+            assert!(msg.contains(key) && msg.contains(bad), "key={key} err={msg}");
+        }
+        // 合法全表（Go switch 全集）→ 放行。
+        for s in [
+            "",
+            "asis",
+            "UseIP",
+            "useipv4",
+            "USEIPV6",
+            "useipv4v6",
+            "useipv6v4",
+            "forceip",
+            "forceipv4",
+            "forceipv6",
+            "forceipv4v6",
+            "forceipv6v4",
+        ] {
+            assert!(
+                StreamSettings::validate_sockopt_json(Some(&serde_json::json!({
+                    "domainStrategy": s
+                })))
+                .is_ok(),
+                "domainStrategy={s:?} must pass"
+            );
+        }
+        for s in [
+            "",
+            "none",
+            "srvPortOnly",
+            "srvaddressonly",
+            "SRVPORTANDADDRESS",
+            "txtportonly",
+            "txtaddressonly",
+            "txtportandaddress",
+        ] {
+            assert!(
+                StreamSettings::validate_sockopt_json(Some(&serde_json::json!({
+                    "addressPortStrategy": s
+                })))
+                .is_ok(),
+                "addressPortStrategy={s:?} must pass"
+            );
+        }
+        // 非字符串类型（如数字）不在字符串门内 → 与既有行为一致放行（运行时忽略）。
+        assert!(
+            StreamSettings::validate_sockopt_json(Some(&serde_json::json!({
+                "domainStrategy": 7
+            })))
+            .is_ok()
+        );
     }
 
     /// tproxy 双类型解析（Go transport_sockopt.go:48/:85-93 字符串枚举 +
