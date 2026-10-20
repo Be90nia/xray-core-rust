@@ -4,20 +4,24 @@
 //!
 //! ## 切片边界（P6-5 切片2）
 //!
-//! 实现 inbound HTTP CONNECT 请求解析 + 认证 + 200 响应。
-//! 普通 HTTP 代理（`handlePlainHTTP`）+ keep-alive 循环 + 100 Continue + dispatch
-//! 留切片3（依赖 dispatcher + outbound manager）。
+//! 实现 inbound HTTP CONNECT 请求解析 + 认证 + 200 响应 + CONNECT 隧道双向
+//! 转发 + 每连接读头 deadline（Go `SetReadDeadline(Timeouts.Handshake)` 默认
+//! 60s）。连接模型对齐 Go：**CONNECT 终结性**——tunnel 结束（或 dial 失败）
+//! 即关连接，不回循环（Go `handleConnect` 直接 return）；plain HTTP 代理
+//! （`handlePlainHTTP`，含其 keep-alive）+ dispatcher 接线留切片3——非 CONNECT
+//! 请求直接关闭（转发未实现，keep-alive 无从谈起，需另票）。
 
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::Mutex,
     task::JoinHandle,
 };
@@ -63,6 +67,22 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
     "trailers",
     "upgrade",
 ];
+
+/// 每连接请求头读取超时。对应 Go `Process` 的
+/// `conn.SetReadDeadline(time.Now().Add(s.policy().Timeouts.Handshake))`，
+/// 默认值 60s（Go `features/policy/policy.go:130`）。Go 无独立空闲超时——
+/// 同一 deadline 覆盖「空闲等待请求头」。
+const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 优雅关闭时读向排空的上限——等客户端关写或超时（防 RST 丢最终响应，
+/// 见 [`graceful_close`]）。
+const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// 头解析失败 / 非透明 origin-form 的 400 响应（字节与既有 origin-form 分支一致）。
+const RESPONSE_BAD_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\n\
+    Proxy-Connection: close\r\n\
+    Connection: close\r\n\
+    Content-Length: 0\r\n\r\n";
 
 /// 从请求行 target 提取 path（含 query）。
 ///
@@ -127,6 +147,17 @@ impl HttpServer {
     pub fn new(tag: impl Into<String>, config: ServerConfig) -> Self {
         Self { tag: tag.into(), config, slot: Mutex::new(None) }
     }
+
+    /// 获取监听端口（start 后有效，否则返回 0）。对齐 `xray-proxy-socks` 同名方法。
+    pub async fn bound_port(&self) -> u16 {
+        self.slot
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|(l, _)| l.local_addr().ok())
+            .map(|a| a.port())
+            .unwrap_or(0)
+    }
 }
 
 #[async_trait]
@@ -155,30 +186,11 @@ impl InboundHandler for HttpServer {
         let handle = tokio::spawn(async move {
             loop {
                 match listener_clone.accept().await {
-                    Ok((mut stream, peer)) => {
+                    Ok((stream, peer)) => {
                         let tag = tag.clone();
                         let config = config.clone();
                         tokio::spawn(async move {
-                            match http_server_handshake(&mut stream, &config).await {
-                                Ok(hs) => {
-                                    info!(
-                                        tag = %tag,
-                                        peer = %peer,
-                                        method = %hs.method,
-                                        dest = ?hs.dest,
-                                        "HTTP proxy handshake succeeded"
-                                    );
-                                    // 切片3: dispatch to outbound handler
-                                },
-                                Err(e) => {
-                                    warn!(
-                                        tag = %tag,
-                                        peer = %peer,
-                                        error = %e,
-                                        "HTTP proxy handshake failed"
-                                    );
-                                },
-                            }
+                            handle_connection(stream, config, tag, peer).await;
                         });
                     },
                     Err(e) => {
@@ -207,11 +219,133 @@ impl InboundHandler for HttpServer {
     }
 }
 
+/// 单连接处理：一次读头 + 转发，连接终结性对齐 Go。
+///
+/// 对应 Go `Process`（无循环回跳版本）：读头带 handshake deadline（默认 60s，
+/// `policy.go:130`）；**CONNECT 终结性**——tunnel 结束/失败即关连接（Go
+/// `handleConnect` 直接 return，隧道结束后字节流已非 HTTP 边界）；plain HTTP
+/// 转发未实现（切片3），非 CONNECT 请求直接关闭。
+async fn handle_connection(
+    mut stream: TcpStream,
+    config: ServerConfig,
+    tag: String,
+    peer: SocketAddr,
+) {
+    serve_connection(&mut stream, &config, &tag, peer).await;
+    graceful_close(&mut stream).await;
+}
+
+/// 优雅关闭：先 shutdown 写向（让已写响应先出去），再短排空读向。
+///
+/// Windows 上直接 drop 带未读数据的 socket 会 RST，连带丢弃发送缓冲中的
+/// 最终响应（400 / EOF 前的最后写入）；读空接收缓冲后 close 才是干净 FIN。
+async fn graceful_close(stream: &mut TcpStream) {
+    if stream.shutdown().await.is_err() {
+        return;
+    }
+    let _ = tokio::time::timeout(CLOSE_DRAIN_TIMEOUT, async {
+        let mut sink = [0u8; 4096];
+        loop {
+            match stream.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {},
+            }
+        }
+    })
+    .await;
+}
+
+/// 单请求处理体（关闭策略见 [`graceful_close`]）。
+async fn serve_connection(
+    stream: &mut TcpStream,
+    config: &ServerConfig,
+    tag: &str,
+    peer: SocketAddr,
+) {
+    // 对应 Go Start 段的 handshake read deadline（policy 默认 60s）；
+    // 超时同时覆盖"空闲等待请求头"——Go 无独立空闲超时。
+    let handshake =
+        tokio::time::timeout(REQUEST_HEADER_TIMEOUT, http_server_handshake(stream, config));
+    let hs = match handshake.await {
+        Err(_) => {
+            info!(
+                tag = %tag,
+                peer = %peer,
+                timeout = ?REQUEST_HEADER_TIMEOUT,
+                "HTTP proxy connection idle/header timeout, closing"
+            );
+            return;
+        },
+        Ok(Err(e)) => {
+            // 400/407 响应已在 handshake 内写回；EOF/解析失败一律关闭
+            warn!(
+                tag = %tag,
+                peer = %peer,
+                error = %e,
+                "HTTP proxy handshake failed, closing connection"
+            );
+            return;
+        },
+        Ok(Ok(hs)) => hs,
+    };
+    if hs.method != "CONNECT" {
+        // plain HTTP 转发留切片3（Go handlePlainHTTP 含 keep-alive 循环，此处
+        // 无从实现）；请求 body 未消费，关闭连接
+        warn!(
+            tag = %tag,
+            peer = %peer,
+            method = %hs.method,
+            "plain HTTP forwarding not implemented (slice 3), closing"
+        );
+        return;
+    }
+    info!(tag = %tag, peer = %peer, dest = ?hs.dest, "HTTP proxy CONNECT established");
+    // CONNECT 终结性（对齐 Go handleConnect → return）：tunnel 成功、dial 失败、
+    // 拷贝错误任一结局都关连接——隧道结束后字节流已非 HTTP 边界。
+    match dial_destination(&hs.dest).await {
+        Err(e) => {
+            warn!(
+                tag = %tag,
+                peer = %peer,
+                dest = ?hs.dest,
+                error = %e,
+                "CONNECT dial failed, closing connection"
+            );
+        },
+        Ok(mut upstream) => {
+            if let Err(e) = tokio::io::copy_bidirectional(stream, &mut upstream).await {
+                warn!(
+                    tag = %tag,
+                    peer = %peer,
+                    dest = ?hs.dest,
+                    error = %e,
+                    "CONNECT tunnel copy failed, closing connection"
+                );
+                return;
+            }
+            info!(tag = %tag, dest = ?hs.dest, "CONNECT tunnel finished, closing connection");
+        },
+    }
+}
+
+/// 按 [`Destination`] 拨号 TCP。IP 直连；域名走系统解析（tokio `ToSocketAddrs`）。
+async fn dial_destination(dest: &Destination) -> Result<TcpStream> {
+    let port = dest.port().value();
+    let target = match dest.address().ip() {
+        Some(ip) => SocketAddr::new(ip, port),
+        None => {
+            let domain = dest.address().as_domain().unwrap_or_default();
+            return TcpStream::connect((domain, port)).await.map_err(HttpProxyError::Io);
+        },
+    };
+    TcpStream::connect(target).await.map_err(HttpProxyError::Io)
+}
+
 /// HTTP proxy 服务端握手。解析请求行 + 认证 + 解析目标。
 ///
 /// 返回 [`HandshakeResult`]（含 dest、method、target、headers）。
 /// CONNECT → 回 `200 Connection established`；非 CONNECT → 不回响应（由调用方处理 plain HTTP
-/// 转发）。
+/// 转发）。请求行/头协议格式错 → 回 400 后返回错误；EOF（客户端关闭）直接返回错误不回写。
 ///
 /// ## 流程
 ///
@@ -227,36 +361,16 @@ pub async fn http_server_handshake<RW>(
 where
     RW: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    // 1. 读请求行
-    let request_line = read_http_line(stream).await?;
-    let parts: Vec<&str> = request_line.split_whitespace().collect();
-    if parts.len() < 3 {
-        return Err(HttpProxyError::InvalidRequest(format!(
-            "malformed request line: {request_line:?}"
-        )));
-    }
-    let method = parts[0].to_ascii_uppercase();
-    let target = parts[1].to_string();
-
-    // 2. 读 headers（最多 [`MAX_HTTP_HEADER_LINES`] 行，防无界头部注入；
-    // Go http.ReadRequest 语义下请求行+headers 共享 1MB 总预算，此处按行数收紧）
-    let mut headers: HashMap<String, Vec<String>> = HashMap::new();
-    let mut header_lines = 0usize;
-    loop {
-        let line = read_http_line(stream).await?;
-        if line.is_empty() {
-            break;
-        }
-        header_lines += 1;
-        if header_lines > MAX_HTTP_HEADER_LINES {
-            return Err(HttpProxyError::InvalidRequest(format!(
-                "too many HTTP header lines (>{MAX_HTTP_HEADER_LINES})"
-            )));
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            headers.entry(k.trim().to_ascii_lowercase()).or_default().push(v.trim().to_string());
-        }
-    }
+    // 1+2. 读请求行 + headers；协议格式错 → 400 后关连接；
+    // EOF（客户端正常关闭）不写 400 直接断
+    let (method, target, headers) = match read_request_head(stream).await {
+        Ok(head) => head,
+        Err(e @ HttpProxyError::InvalidRequest(_)) => {
+            let _ = stream.write_all(RESPONSE_BAD_REQUEST).await;
+            return Err(e);
+        },
+        Err(e) => return Err(e),
+    };
 
     // 3. 认证（如配置了 accounts）
     if !config.accounts.is_empty() {
@@ -291,14 +405,7 @@ where
     // `!AllowTransparent && request.URL.Host == ""` → 400 Bad Request）。
     // target 非绝对 URI（无 scheme）等价 Go `request.URL.Host == ""`。
     if method != "CONNECT" && !config.allow_transparent && !target.contains("://") {
-        stream
-            .write_all(
-                b"HTTP/1.1 400 Bad Request\r\n\
-                  Proxy-Connection: close\r\n\
-                  Connection: close\r\n\
-                  Content-Length: 0\r\n\r\n",
-            )
-            .await?;
+        stream.write_all(RESPONSE_BAD_REQUEST).await?;
         return Err(HttpProxyError::InvalidRequest(
             "origin-form request target requires allowTransparent".into(),
         ));
@@ -310,6 +417,49 @@ where
     }
 
     Ok(HandshakeResult { dest, method, target, headers })
+}
+
+/// 读请求行 + headers（握手第 1-2 步）。
+///
+/// 返回 (method 大写, target, headers)；EOF/超长行/超行数/malformed 请求行
+/// 统一报 [`HttpProxyError::InvalidRequest`]（或 IO 错），由调用方决定 400。
+async fn read_request_head<RW>(
+    stream: &mut RW,
+) -> Result<(String, String, HashMap<String, Vec<String>>)>
+where
+    RW: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    // 读请求行
+    let request_line = read_http_line(stream).await?;
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
+    if parts.len() < 3 {
+        return Err(HttpProxyError::InvalidRequest(format!(
+            "malformed request line: {request_line:?}"
+        )));
+    }
+    let method = parts[0].to_ascii_uppercase();
+    let target = parts[1].to_string();
+
+    // 读 headers（最多 [`MAX_HTTP_HEADER_LINES`] 行，防无界头部注入；
+    // Go http.ReadRequest 语义下请求行+headers 共享 1MB 总预算，此处按行数收紧）
+    let mut headers: HashMap<String, Vec<String>> = HashMap::new();
+    let mut header_lines = 0usize;
+    loop {
+        let line = read_http_line(stream).await?;
+        if line.is_empty() {
+            break;
+        }
+        header_lines += 1;
+        if header_lines > MAX_HTTP_HEADER_LINES {
+            return Err(HttpProxyError::InvalidRequest(format!(
+                "too many HTTP header lines (>{MAX_HTTP_HEADER_LINES})"
+            )));
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            headers.entry(k.trim().to_ascii_lowercase()).or_default().push(v.trim().to_string());
+        }
+    }
+    Ok((method, target, headers))
 }
 
 /// 单行（请求行/头部行）字节上限。Go `http.ReadRequest` 对请求行+headers 共享
@@ -328,7 +478,12 @@ async fn read_http_line<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Strin
         let n = reader.read(&mut byte).await.map_err(HttpProxyError::Io)?;
         if n == 0 {
             if buf.is_empty() {
-                return Err(HttpProxyError::InvalidRequest("connection closed".into()));
+                // 客户端正常关闭（EOF）不是协议错误：走 Io/UnexpectedEof，
+                // 上层不回 400 直接断链（读头中途断仍走 malformed → 400）
+                return Err(HttpProxyError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed before request",
+                )));
             }
             break;
         }
@@ -434,7 +589,7 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{net::SocketAddr, time::Duration};
 
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -775,5 +930,192 @@ mod tests {
         if let Ok(Ok(_)) = result {
             panic!("listener should be closed after close()");
         }
+    }
+
+    // ===== 连接终结性测试（对齐 Go：CONNECT 终结，无 keep-alive 循环）=====
+
+    /// 起 HttpServer 并返回 (server, 绑定端口)。server 需保活到断言结束。
+    async fn start_server(config: ServerConfig) -> (HttpServer, u16) {
+        let server = HttpServer::new("test-ka", config);
+        server.start().await.unwrap();
+        let port = server
+            .slot
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|(l, _)| l.local_addr().ok())
+            .map(|a| a.port())
+            .expect("server should bind a port");
+        (server, port)
+    }
+
+    /// 制造一个当前无监听的端口（bind 后立刻 drop；端口被第三方复用的竞态
+    /// 概率可忽略，仅本地测试用）。
+    async fn dead_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        addr.port()
+    }
+
+    /// 回显 TCP 服务：读到什么回什么，EOF 关闭。
+    async fn spawn_echo() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if sock.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            },
+                        }
+                    }
+                });
+            }
+        });
+        (addr, handle)
+    }
+
+    /// 逐字节读到 HTTP 响应头结束（`\r\n\r\n`），返回响应头文本。
+    async fn read_response_head(client: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let n = client.read(&mut byte).await.unwrap();
+            assert!(n > 0, "unexpected EOF while reading response head");
+            buf.push(byte[0]);
+            if buf.ends_with(b"\r\n\r\n") {
+                break;
+            }
+            assert!(buf.len() < 8192, "response head too large");
+        }
+        String::from_utf8(buf).unwrap()
+    }
+
+    async fn read_eof(client: &mut TcpStream) -> usize {
+        let mut byte = [0u8; 1];
+        tokio::time::timeout(Duration::from_secs(5), client.read(&mut byte))
+            .await
+            .unwrap_or(Ok(0))
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn connect_dial_failure_closes_connection() {
+        // 对齐 Go `handleConnect`：dial/DispatchLink 失败 → 错误返回 → 连接关闭。
+        // 200 已回（对齐 Go：200 在 dial 前写），客户端读到 EOF。
+        let dead = dead_port().await;
+        let (_server, port) = start_server(ServerConfig::default()).await;
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client
+            .write_all(format!("CONNECT 127.0.0.1:{dead} HTTP/1.1\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let resp = tokio::time::timeout(Duration::from_secs(5), read_response_head(&mut client))
+            .await
+            .expect("response timeout");
+        assert!(resp.contains("200"), "got: {resp}");
+        assert_eq!(read_eof(&mut client).await, 0, "dial failure must close connection");
+    }
+
+    #[tokio::test]
+    async fn connect_tunnel_echo_then_close() {
+        // 派单验收①"数据正确" + 返工①：CONNECT tunnel 建立后双向转发，echo
+        // 回显逐字节一致；tunnel 结束（客户端写半关）后连接必须关闭
+        // （Go handleConnect → return 语义）。
+        let (echo_addr, echo) = spawn_echo().await;
+        let (_server, port) = start_server(ServerConfig::default()).await;
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client.write_all(format!("CONNECT {echo_addr} HTTP/1.1\r\n\r\n").as_bytes()).await.unwrap();
+        let resp = read_response_head(&mut client).await;
+        assert!(resp.contains("200"), "got: {resp}");
+
+        client.write_all(b"ping-1").await.unwrap();
+        let mut echoed = [0u8; 6];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut echoed))
+            .await
+            .expect("echo roundtrip timeout")
+            .unwrap();
+        assert_eq!(&echoed, b"ping-1");
+
+        // 写半关驱动 tunnel EOF → 服务端终结连接
+        client.shutdown().await.unwrap();
+        assert_eq!(read_eof(&mut client).await, 0, "server should close after tunnel EOF");
+        echo.abort();
+    }
+
+    #[tokio::test]
+    async fn keepalive_connection_close_terminates() {
+        // `Connection: close` 头被容忍且行为不变：200 响应后服务端必须关闭。
+        // （CONNECT 本就终结，close 头不再改变结局——钉住该头不引发异常路径。）
+        let dead = dead_port().await;
+        let (_server, port) = start_server(ServerConfig::default()).await;
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client
+            .write_all(
+                format!("CONNECT 127.0.0.1:{dead} HTTP/1.1\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let resp = tokio::time::timeout(Duration::from_secs(5), read_response_head(&mut client))
+            .await
+            .expect("response timeout");
+        assert!(resp.contains("200"), "got: {resp}");
+        assert_eq!(read_eof(&mut client).await, 0, "server must close after Connection: close");
+    }
+
+    #[tokio::test]
+    async fn connect_proxy_connection_close_terminates() {
+        // `Proxy-Connection: close` 头被容忍且行为不变（CONNECT 本就终结）。
+        let dead = dead_port().await;
+        let (_server, port) = start_server(ServerConfig::default()).await;
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client
+            .write_all(
+                format!("CONNECT 127.0.0.1:{dead} HTTP/1.1\r\nProxy-Connection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let resp = tokio::time::timeout(Duration::from_secs(5), read_response_head(&mut client))
+            .await
+            .expect("response timeout");
+        assert!(resp.contains("200"), "got: {resp}");
+        assert_eq!(
+            read_eof(&mut client).await,
+            0,
+            "server must close after Proxy-Connection: close"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_idle_timeout_closes_connection() {
+        // 连上不发请求 → 60s（Go policy Handshake 默认）后关闭。
+        // start_paused 下 tokio auto-advance 虚拟时钟，测试瞬时完成。
+        let (_server, port) = start_server(ServerConfig::default()).await;
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut byte = [0u8; 1];
+        let n = client.read(&mut byte).await.unwrap_or(0);
+        assert_eq!(n, 0, "server should close connection after idle timeout");
+    }
+
+    #[tokio::test]
+    async fn malformed_request_400_then_close() {
+        // 头解析失败 → 400 → 关连接。
+        let (_server, port) = start_server(ServerConfig::default()).await;
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client.write_all(b"GARBAGE\r\n\r\n").await.unwrap();
+        let resp = tokio::time::timeout(Duration::from_secs(5), read_response_head(&mut client))
+            .await
+            .expect("400 response timeout");
+        assert!(resp.contains("400"), "got: {resp}");
+        assert_eq!(read_eof(&mut client).await, 0, "connection must close after 400");
     }
 }
