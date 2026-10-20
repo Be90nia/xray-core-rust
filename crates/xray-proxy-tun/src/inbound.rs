@@ -81,6 +81,7 @@ use crate::{
         TcpAcceptEvent, TunNetStack, UdpPacketMeta, build_udp_response, parse_tcp_syn_dst,
         parse_udp_packet,
     },
+    sysroute::{self, AppliedSystemChanges},
 };
 
 /// TUN 设备接收缓冲。
@@ -112,6 +113,8 @@ pub struct TunInboundHandler {
     options: StackOptions,
     /// dispatcher handler（TCP accept 后桥接到 outbound）。
     dispatch: Arc<dyn DispatchHandler>,
+    /// 已应用的系统路由/DNS 接管计划（A3/A4，close 时整体回滚；默认 None）。
+    applied_sysroute: ParkMutex<Option<AppliedSystemChanges>>,
 }
 
 impl TunInboundHandler {
@@ -151,6 +154,7 @@ impl TunInboundHandler {
             netstack,
             options,
             dispatch,
+            applied_sysroute: ParkMutex::new(None),
         })
     }
 
@@ -199,6 +203,19 @@ impl InboundHandler for TunInboundHandler {
 
         *self.device.lock() = Some(Arc::clone(&device));
 
+        // A3/A4：系统路由表 + 系统 DNS 接管——默认关闭（配置显式开启才动作）。
+        // 接管失败宁可无 TUN（对齐 Go handler.go:196-205：失败即关设备拒启动）。
+        match sysroute::prepare(cfg) {
+            Ok(applied) => *self.applied_sysroute.lock() = applied,
+            Err(e) => {
+                *self.device.lock() = None;
+                let _ = device.close();
+                return Err(InboundError::ListenError(format!(
+                    "tun system route/dns takeover failed: {e}"
+                )));
+            },
+        }
+
         // spawn driver task
         let netstack = Arc::clone(&self.netstack);
         let dev = Arc::clone(&device);
@@ -217,6 +234,10 @@ impl InboundHandler for TunInboundHandler {
         self.started.store(false, Ordering::SeqCst);
         if let Some(handle) = self.join.lock().take() {
             handle.abort();
+        }
+        // 回滚 A3/A4 系统变更（对齐 Go Close：unsetSystemDNS → unsetSystemRoutes → 设备下线）。
+        if let Some(applied) = self.applied_sysroute.lock().take() {
+            sysroute::revert(&applied);
         }
         if let Some(dev) = self.device.lock().take() {
             let _ = dev.close();
