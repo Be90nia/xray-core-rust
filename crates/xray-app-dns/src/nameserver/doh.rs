@@ -157,6 +157,10 @@ impl DohNameServer {
     /// h2c（明文 HTTP/2）构造。对应 Go `NewDoHNameServer(u, dispatcher, true, ...)`。
     pub fn from_config_h2c(ns: &NameServerConfig) -> Result<Box<dyn Server>, DnsError> {
         let dest = Destination::tcp(ns.address.clone(), Port::new(ns.port));
+        // bd ypsl P2①：server_name 空串 → query_once 构造 `https:///dns-query`
+        // 非法 URI → 构造失败被上层吞成 record not found（h2c 完全不可用且报错
+        // 误导）。authority 取目的地址字符串（域名或 IP 字面量）。
+        let server_name = ns.address.to_string();
         let timeout_dur = if ns.timeout_ms > 0 {
             Duration::from_millis(u64::from(ns.timeout_ms))
         } else {
@@ -173,7 +177,7 @@ impl DohNameServer {
         Ok(Box::new(Arc::new(
             Self::new(
                 dest,
-                String::new(),
+                server_name,
                 xray_tls::utls::default_client_config(),
                 cache,
                 ns.client_ip.clone(),
@@ -201,6 +205,7 @@ impl DohNameServer {
         .await?;
 
         // TLS 握手（h2c 明文跳过）+ HTTP/2 handshake。
+        tracing::debug!(target: "xray.dns.doh", "doh: stream connected");
         let (mut h2, h2_conn): (_, Pin<Box<dyn Future<Output = ()> + Send>>) = if self.plain_h2c {
             let (h2, conn) = timeout(self.query_timeout, client::handshake(stream))
                 .await
@@ -218,12 +223,21 @@ impl DohNameServer {
                 tls_client(stream, &self.server_name, Arc::clone(&self.tls_config)),
             )
             .await
-            .map_err(|_| DnsError::WireFormat("doh tls handshake timeout".to_string()))?
+            .map_err(|_| {
+                tracing::debug!(target: "xray.dns.doh", "doh: TLS handshake TIMEOUT");
+                DnsError::WireFormat("doh tls handshake timeout".to_string())
+            })?
             .map_err(|e| DnsError::WireFormat(format!("doh tls handshake: {e}")))?;
+            tracing::debug!(target: "xray.dns.doh", alpn = ?tls_stream.alpn_protocol(),
+                "doh: tls established");
             let (h2, conn) = timeout(self.query_timeout, client::handshake(tls_stream))
                 .await
-                .map_err(|_| DnsError::WireFormat("doh h2 handshake timeout".to_string()))?
+                .map_err(|_| {
+                    tracing::debug!(target: "xray.dns.doh", "doh: h2 handshake TIMEOUT");
+                    DnsError::WireFormat("doh h2 handshake timeout".to_string())
+                })?
                 .map_err(|e| DnsError::WireFormat(format!("doh h2 handshake: {e}")))?;
+            tracing::debug!(target: "xray.dns.doh", "doh: h2 handshake done");
             (
                 h2,
                 Box::pin(async move {
@@ -236,31 +250,50 @@ impl DohNameServer {
         // 等待 h2 连接 ready（ready 消费 self 后返回 ready 态的 SendRequest）。
         h2 = timeout(self.query_timeout, h2.ready())
             .await
-            .map_err(|_| DnsError::WireFormat("doh h2 ready timeout".to_string()))?
+            .map_err(|_| {
+                tracing::debug!(target: "xray.dns.doh", "doh: h2 ready TIMEOUT");
+                DnsError::WireFormat("doh h2 ready timeout".to_string())
+            })?
             .map_err(|e| DnsError::WireFormat(format!("doh h2 ready: {e}")))?;
+        tracing::debug!(target: "xray.dns.doh", "doh: h2 ready");
 
         // POST /dns-query + Content-Type: application/dns-message
+        // bd ypsl：h2 HEADERS 必须带 :authority——相对形式 uri("/dns-query") 发出的
+        // 请求无 authority，真实 DoH server（cloudflare/alidns 实测）收到后不响应
+        // （resp 4s 超时）。完整 URL 让 h2 拆出 :scheme/:authority/:path。
         let request = Request::builder()
             .method(Method::POST)
-            .uri(DEFAULT_DOH_PATH)
+            .uri(format!("https://{}{}", self.server_name, DEFAULT_DOH_PATH))
             .header(CONTENT_TYPE, "application/dns-message")
             .body(())
             .map_err(|e| DnsError::WireFormat(format!("doh build request: {e}")))?;
 
+        // bd ypsl 追查（临时）：真实环境 4s 无响应，定位请求是否发出/响应是否到达
+        tracing::debug!(target: "xray.dns.doh", uri = ?request.uri(),
+            headers = ?request.headers(), "doh: request built");
+
         let (resp_future, mut send_stream) = h2
             .send_request(request, false)
             .map_err(|e| DnsError::WireFormat(format!("doh send_request: {e}")))?;
+        tracing::debug!(target: "xray.dns.doh", "doh: send_request ok");
 
         // 发送 DNS query body + end_of_stream。
         send_stream
             .send_data(Bytes::from(payload), true)
             .map_err(|e| DnsError::WireFormat(format!("doh send_data: {e}")))?;
+        tracing::debug!(target: "xray.dns.doh", "doh: body sent");
 
         // 读 HTTP 响应。
         let response = timeout(self.query_timeout, resp_future)
             .await
-            .map_err(|_| DnsError::WireFormat("doh response timeout".to_string()))?
+            .map_err(|_| {
+                tracing::debug!(target: "xray.dns.doh", "doh: response TIMEOUT ({}ms)",
+                    self.query_timeout.as_millis());
+                DnsError::WireFormat("doh response timeout".to_string())
+            })?
             .map_err(|e| DnsError::WireFormat(format!("doh response: {e}")))?;
+        tracing::debug!(target: "xray.dns.doh", status = ?response.status(),
+            "doh: response headers received");
 
         if response.status() != StatusCode::OK {
             return Err(DnsError::WireFormat(format!("doh http status: {}", response.status())));

@@ -44,10 +44,11 @@ pub trait HostResolver: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = io::Result<Vec<IpAddr>>> + Send>>;
 }
 
-/// 系统解析器：每查询现解析（hickory TokioResolver，4s 超时）。
+/// 系统解析器：每查询现解析（系统 getaddrinfo，OS 解析栈，4s 超时）。
 ///
 /// 票内"域名 NS 运行期解析"：上游 IP 变更后新查询自然用新 IP，
-/// 无启动期钉死缓存。
+/// 无启动期钉死缓存。bd ypsl：曾用 hickory TokioResolver，其对部分域名
+/// A 响应空返回且 v6-only 让直连撞本机 v6 不可达——见 resolve 内注释。
 pub struct SystemHostResolver;
 
 impl HostResolver for SystemHostResolver {
@@ -56,20 +57,35 @@ impl HostResolver for SystemHostResolver {
         host: String,
     ) -> Pin<Box<dyn Future<Output = io::Result<Vec<IpAddr>>> + Send>> {
         Box::pin(async move {
-            let resolver = hickory_resolver::TokioResolver::builder_tokio()
-                .map_err(|e| io::Error::other(format!("resolver builder: {e}")))?
-                .build()
-                .map_err(|e| io::Error::other(format!("resolver build: {e}")))?;
-            let lookup = tokio::time::timeout(
-                Duration::from_secs(4),
-                resolver.lookup_ip(format!("{host}.")),
-            )
-            .await
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::TimedOut, format!("resolve {host} timeout"))
-            })?
-            .map_err(|e| io::Error::other(format!("resolve {host}: {e}")))?;
-            Ok(lookup.iter().collect())
+            // bd ypsl：曾用 hickory TokioResolver——实测对部分域名的 A 响应空
+            // 返回（上游 114/223.5.5.5/8.8.8.8 手工 wire 查询均正常，纯 hickory
+            // 层问题），v6-only 结果又让直连撞本机 v6 不可达（os error 10051）
+            // → DoH 必挂。改用系统 getaddrinfo（OS 解析栈，python/curl/nslookup
+            // 同路径三方验证可用），双栈结果 v4 优先。
+            let host2 = host.clone();
+            let resolve_fut = tokio::task::spawn_blocking(move || {
+                use std::net::ToSocketAddrs as _;
+                let mut ips: Vec<IpAddr> = (host2.as_str(), 0)
+                    .to_socket_addrs()
+                    .map_err(|e| io::Error::other(format!("getaddrinfo: {e}")))?
+                    .map(|sa| sa.ip())
+                    .collect::<Vec<IpAddr>>();
+                // v4 优先（稳定排序保持族内相对序）：v6 不可达场景常见，先试 v4。
+                ips.sort_by_key(|ip| !matches!(ip, IpAddr::V4(_)));
+                Ok::<Vec<IpAddr>, io::Error>(ips)
+            });
+            let ips = tokio::time::timeout(Duration::from_secs(4), resolve_fut)
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, format!("resolve {host} timeout"))
+                })?
+                .map_err(|e| io::Error::other(format!("getaddrinfo join: {e}")))??;
+            if ips.is_empty() {
+                return Err(io::Error::other(format!(
+                    "resolve {host}: getaddrinfo returned no address"
+                )));
+            }
+            Ok(ips)
         })
     }
 }
@@ -234,14 +250,18 @@ impl Connection for LinkStream {
 
 // ========== 直连兜底辅助 ==========
 
-/// 把 `dest` 解析为可直连的 `SocketAddr`：IP 直返；域名经 resolver 现解析。
-pub(crate) async fn resolve_dest_addr(
+/// 把 `dest` 解析为可直连的 `SocketAddr` **候选列表**：IP 目标返回单地址；域名
+/// 经 resolver 现解析返回全部候选（按 resolver 返回序）。调用方必须按序尝试
+/// connect——v6 优先返回而本机 v6 不可达时靠后续地址回退（bd ypsl 实测：
+/// alidns 解析出 2400:3200::1 优先，本机 v6 无路由 os error 10051，单地址无
+/// 回退致 DoH 必挂；Go net.Dialer 多地址回退同语义）。
+pub(crate) async fn resolve_dest_addrs(
     dest: &Destination,
     resolver: &dyn HostResolver,
-) -> io::Result<SocketAddr> {
+) -> io::Result<Vec<SocketAddr>> {
     let port = dest.port().value();
     if let Some(ip) = dest.address().ip() {
-        return Ok(SocketAddr::new(ip, port));
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
     let host = dest
         .address()
@@ -249,9 +269,22 @@ pub(crate) async fn resolve_dest_addr(
         .ok_or_else(|| io::Error::other("empty destination address"))?
         .to_string();
     let ips = resolver.resolve(host).await?;
-    ips.into_iter()
+    if ips.is_empty() {
+        return Err(io::Error::other("resolver returned no address"));
+    }
+    Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect())
+}
+
+/// 把 `dest` 解析为单个可直连 `SocketAddr`（首候选）。UDP 数据报路径专用
+/// （单 send_to 语义）；TCP 流路径用 [`resolve_dest_addrs`] 多地址回退。
+pub(crate) async fn resolve_dest_addr(
+    dest: &Destination,
+    resolver: &dyn HostResolver,
+) -> io::Result<SocketAddr> {
+    let addrs = resolve_dest_addrs(dest, resolver).await?;
+    addrs
+        .into_iter()
         .next()
-        .map(|ip| SocketAddr::new(ip, port))
         .ok_or_else(|| io::Error::other("resolver returned no address"))
 }
 
@@ -267,32 +300,55 @@ pub(crate) async fn connect_stream(
     resolver: &dyn HostResolver,
     query_timeout: Duration,
     what: &str,
-    force_local: bool,
+    // bd ypsl P0：原 `force_local`——共享拨号器停摆期间语义恒直连；恢复共享拨号
+    // 时改回原名并还原下方被注释的分支。
+    _force_local: bool,
 ) -> Result<DnsStream, crate::error::DnsError> {
-    if !force_local {
-        if let Some(dialer) = shared_dialer() {
-            return tokio::time::timeout(query_timeout, dialer.dial_tcp(dest))
-                .await
-                .map_err(|_| {
-                    crate::error::DnsError::WireFormat(format!(
-                        "{what} dial timeout after {query_timeout:?}"
-                    ))
-                })?
-                .map_err(|e| crate::error::DnsError::WireFormat(format!("{what} dial: {e}")));
+    // 恢复共享拨号分支（管线根因修复后）：
+    // if !force_local {
+    //     if let Some(dialer) = shared_dialer() {
+    //         return tokio::time::timeout(query_timeout, dialer.dial_tcp(dest))
+    //             .await
+    //             .map_err(|_| crate::error::DnsError::WireFormat(format!(
+    //                 "{what} dial timeout after {query_timeout:?}"
+    //             )))?
+    //             .map_err(|e| crate::error::DnsError::WireFormat(format!("{what} dial: {e}")));
+    //     }
+    // }
+    let addrs = resolve_dest_addrs(dest, resolver)
+        .await
+        .map_err(|e| {
+            tracing::debug!(target: "xray.dns.doh", what = %what, error = %e, "doh: resolve failed");
+            crate::error::DnsError::WireFormat(format!("{what} resolve: {e}"))
+        })?;
+    // 多地址顺序尝试（bd ypsl：解析 v6 优先而本机 v6 不可达时回退后续地址；
+    // Go net.Dialer 同语义）。
+    let mut last_err: Option<io::Error> = None;
+    for sock_addr in &addrs {
+        match tokio::time::timeout(query_timeout, tokio::net::TcpStream::connect(sock_addr)).await
+        {
+            Ok(Ok(tcp)) => {
+                return Ok(Box::new(xray_transport::connection::TcpConnection::new(tcp)));
+            },
+            Ok(Err(e)) => {
+                tracing::debug!(target: "xray.dns.doh", what = %what, addr = %sock_addr,
+                    error = %e, "doh: connect failed");
+                last_err = Some(e);
+            },
+            Err(_) => {
+                tracing::debug!(target: "xray.dns.doh", what = %what, addr = %sock_addr,
+                    "doh: connect TIMEOUT");
+                last_err = Some(io::Error::new(io::ErrorKind::TimedOut, "connect timeout"));
+            },
         }
     }
-    let sock_addr = resolve_dest_addr(dest, resolver)
-        .await
-        .map_err(|e| crate::error::DnsError::WireFormat(format!("{what} resolve: {e}")))?;
-    let tcp = tokio::time::timeout(query_timeout, tokio::net::TcpStream::connect(sock_addr))
-        .await
-        .map_err(|_| {
-            crate::error::DnsError::WireFormat(format!(
-                "{what} connect timeout after {query_timeout:?}"
-            ))
-        })?
-        .map_err(|e| crate::error::DnsError::WireFormat(format!("{what} connect: {e}")))?;
-    Ok(Box::new(xray_transport::connection::TcpConnection::new(tcp)))
+    Err(crate::error::DnsError::WireFormat(format!(
+        "{what} dial failed after {} addr(s): {}",
+        addrs.len(),
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "no address attempted".into())
+    )))
 }
 
 #[cfg(test)]
@@ -335,9 +391,10 @@ mod tests {
         }
     }
 
-    /// bd wmdn② 回归：共享 dialer 在场时，`force_local=true` 的查询绕过
-    /// dialer 强制直连（Go nameserver.go:51-61 Local mode 传 nil dispatcher）；
-    /// `force_local=false` 仍走 dialer。
+    /// bd wmdn② 回归 + ypsl P0：共享 dialer 在场时，`force_local=true` 的查询绕过
+    /// dialer 强制直连（Go nameserver.go:51-61 Local mode 传 nil dispatcher）。
+    /// ypsl P0（doh-h2-deepdive）：管线停摆期间 `force_local=false` 也暂直连——
+    /// 两种取值都不得走共享 dialer（恢复共享拨号时回滚第二段断言）。
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
     async fn connect_stream_force_local_bypasses_shared_dialer() {
@@ -357,10 +414,12 @@ mod tests {
         drop(stream);
         assert_eq!(dialer.calls.load(Ordering::SeqCst), 0, "force_local 不得走共享 dialer");
 
-        // force_local=false：走共享 dialer（此处 dialer 报错即证据）。
-        let r = connect_stream(&dest, &resolver, Duration::from_secs(2), "tcp", false).await;
-        assert!(r.is_err(), "共享 dialer 返回错误 → connect_stream 失败");
-        assert_eq!(dialer.calls.load(Ordering::SeqCst), 1, "非 local 应走共享 dialer");
+        // force_local=false：P0 期间同样直连成功，dialer 不被调用。
+        let stream = connect_stream(&dest, &resolver, Duration::from_secs(2), "tcp", false)
+            .await
+            .expect("P0 期间非 local 也应直连（IP 目标无需解析）");
+        drop(stream);
+        assert_eq!(dialer.calls.load(Ordering::SeqCst), 0, "P0 期间不得走共享 dialer");
 
         set_shared_dialer(None);
     }
