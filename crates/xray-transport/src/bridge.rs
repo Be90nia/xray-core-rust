@@ -343,8 +343,10 @@ where
     // 半关闭限窗（对应 Go policy Timeout.UplinkOnly/DownlinkOnly，proxy 层
     // `defer timer.SetTimeout(...)` 语义）：一方向读侧结束后，另一方向在窗口
     // 内无新数据则断开，防止单方向停滞连接永久挂起。窗口按 activity 重置
-    // （读到新数据即续窗）。up 读侧结束 → down 剩余窗口 = uplink_only；
-    // down 读侧结束 → up 剩余窗口 = downlink_only。
+    // （读到新数据即续窗）。Go 方向锚点（ft58 修正，freedom.go:388/427）：
+    // up 读侧结束 → down 剩余窗口 = downlink_only（requestDone defer
+    // SetTimeout(DownlinkOnly)）；down 读侧结束 → up 剩余窗口 = uplink_only
+    // （responseDone defer SetTimeout(UplinkOnly)）。
     let (up_done_tx, up_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
     let (down_done_tx, down_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
 
@@ -370,7 +372,7 @@ where
                 },
                 Some(d) => match timeout(d, reader.read_multi_buffer()).await {
                     Ok(r) => r,
-                    Err(_) => break, // downlink_only 窗口内无数据
+                    Err(_) => break, // uplink_only 窗口内无数据
                 },
             };
             match mb {
@@ -387,7 +389,7 @@ where
                 _ => break,
             }
         }
-        let _ = up_done_tx.send(Some(uplink_only));
+        let _ = up_done_tx.send(Some(downlink_only));
         io::Result::Ok(())
     };
     // 上行 writer：up_rx → stream 写半部聚合写（vectored 批写，y1yx）。只写不读。
@@ -426,7 +428,7 @@ where
                 },
                 Some(d) => match timeout(d, s_read.read_multi_buffer()).await {
                     Ok(r) => r,
-                    Err(_) => break, // uplink_only 窗口内无数据
+                    Err(_) => break, // downlink_only 窗口内无数据
                 },
             };
             match mb {
@@ -441,7 +443,7 @@ where
                 _ => break, // EOF / 读错误
             }
         }
-        let _ = down_done_tx.send(Some(downlink_only));
+        let _ = down_done_tx.send(Some(uplink_only));
         io::Result::Ok(())
     };
 
@@ -579,7 +581,7 @@ where
             }
         }
         let _ = s_write.shutdown().await;
-        let _ = up_done_tx.send(Some(uplink_only));
+        let _ = up_done_tx.send(Some(downlink_only));
         io::Result::Ok(())
     };
 
@@ -603,7 +605,7 @@ where
         // 尾巴（splice 已 arm 时 VisionConn 走 raw 分支半关闭，安全）。
         let _ =
             tokio::time::timeout(std::time::Duration::from_secs(3), writer.shutdown_flush()).await;
-        let _ = down_done_tx.send(Some(downlink_only));
+        let _ = down_done_tx.send(Some(uplink_only));
         res.map(|_| ())
     };
 
@@ -677,7 +679,7 @@ pub async fn bridge_link_with_link(
         // bd VISIONMAC：TLS 链路场景须 flush+shutdown 排空滞留尾巴。
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), b_writer.shutdown_flush())
             .await;
-        let _ = up_done_tx.send(Some(uplink_only));
+        let _ = up_done_tx.send(Some(downlink_only));
         io::Result::Ok(())
     };
 
@@ -717,7 +719,7 @@ pub async fn bridge_link_with_link(
         }
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), a_writer.shutdown_flush())
             .await;
-        let _ = down_done_tx.send(Some(downlink_only));
+        let _ = down_done_tx.send(Some(uplink_only));
         io::Result::Ok(())
     };
 
@@ -1171,7 +1173,7 @@ mod tests {
             Box::new(DuplexConnection::new(stream)) as Box<dyn Connection>,
         ));
 
-        // 上游写完即 EOF → bridge down 进入 uplink_only（1s）窗口
+        // 上游写完即 EOF → bridge down 进入 downlink_only（1s）窗口
         let mut producer = up_w;
         let mut mb = MultiBuffer::new();
         mb.merge_bytes(b"req");
@@ -1210,7 +1212,7 @@ mod tests {
         let (_stream_peer, stream) = tokio::io::duplex(8192);
 
         let start = std::time::Instant::now();
-        // 上游立即 EOF（无数据）→ down 只能靠 uplink_only 窗口超时断开
+        // 上游立即 EOF（无数据）→ down 只能靠 downlink_only 窗口超时断开
         up_w.shutdown();
         let res = bridge_link_with_stream_full_default(
             link,
@@ -1270,6 +1272,94 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "conn_idle too long, possibly fell back to default 300s (elapsed {elapsed:?})"
         );
+        let _ = dn_r;
+    }
+
+    // ---- G11：半关闭限窗方向绑定（非对称 uplinkOnly/downlinkOnly，ft58）----
+    // Go 锚点：freedom.go:388 requestDone（上行 copy）defer SetTimeout(DownlinkOnly)
+    // → 上行结束后下行窗 = DownlinkOnly；freedom.go:427 responseDone（下行 copy）
+    // defer SetTimeout(UplinkOnly) → 下行结束后上行窗 = UplinkOnly。
+    // 非对称 policy（uplink=200ms / downlink=1500ms，conn_idle=5s 兜底不触发）
+    // 下，两个半关闭场景的断开时机必须分别落在对应窗口上，方向互换即失败。
+
+    fn asym_halfclose_policy() -> xray_features::policy::TimeoutPolicy {
+        xray_features::policy::TimeoutPolicy {
+            handshake: std::time::Duration::from_secs(5),
+            connection_idle: std::time::Duration::from_secs(5),
+            uplink_only: std::time::Duration::from_millis(200),
+            downlink_only: std::time::Duration::from_millis(1500),
+        }
+    }
+
+    /// 上行先 EOF、之后无数据 → 断开时机 ≈ downlink_only（1500ms）。
+    #[tokio::test]
+    async fn bridge_stream_full_halfclose_after_up_eof_uses_downlink_only() {
+        use std::time::Duration;
+
+        use xray_buf::io::Writer;
+
+        use crate::link::Link;
+
+        let (up_r, up_w) = xray_buf::pipe::new();
+        let (dn_r, dn_w) = xray_buf::pipe::new();
+        let link = Link::new(Box::new(up_r), Box::new(dn_w));
+        // peer 保留：只走 up EOF 触发半关闭，不走 stream EOF
+        let (_stream_peer, stream) = tokio::io::duplex(8192);
+
+        let start = std::time::Instant::now();
+        up_w.shutdown(); // 上行立即 EOF（Go requestDone 返回）
+        let res = bridge_link_with_stream_full(
+            link,
+            Box::new(DuplexConnection::new(stream)) as Box<dyn Connection>,
+            &asym_halfclose_policy(),
+        )
+        .await;
+        let elapsed = start.elapsed();
+        println!("up_eof_close_elapsed = {elapsed:?}");
+        assert!(res.is_ok(), "bridge must return Ok on half-close window break");
+        assert!(
+            elapsed >= Duration::from_millis(1200),
+            "after up EOF, close must wait downlink_only(1500ms), got {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(4000),
+            "must not reach conn_idle(5s), got {elapsed:?}"
+        );
+        let _ = dn_r;
+    }
+
+    /// 下行先 EOF、之后 client 不发数据 → 断开时机 ≈ uplink_only（200ms）。
+    #[tokio::test]
+    async fn bridge_stream_full_halfclose_after_down_eof_uses_uplink_only() {
+        use std::time::Duration;
+
+        use crate::link::Link;
+
+        let (up_r, up_w) = xray_buf::pipe::new();
+        let (dn_r, dn_w) = xray_buf::pipe::new();
+        let link = Link::new(Box::new(up_r), Box::new(dn_w));
+        let (stream_peer, stream) = tokio::io::duplex(8192);
+
+        let start = std::time::Instant::now();
+        drop(stream_peer); // 下行立即 EOF（Go responseDone 返回）
+        let res = bridge_link_with_stream_full(
+            link,
+            Box::new(DuplexConnection::new(stream)) as Box<dyn Connection>,
+            &asym_halfclose_policy(),
+        )
+        .await;
+        let elapsed = start.elapsed();
+        println!("down_eof_close_elapsed = {elapsed:?}");
+        assert!(res.is_ok(), "bridge must return Ok on half-close window break");
+        assert!(
+            elapsed >= Duration::from_millis(80),
+            "after down EOF, close must wait uplink_only(200ms), got {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1200),
+            "after down EOF, close must NOT wait downlink_only(1500ms), got {elapsed:?}"
+        );
+        let _ = up_w;
         let _ = dn_r;
     }
 

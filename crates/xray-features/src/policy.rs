@@ -25,14 +25,14 @@ pub const DEFAULT_CONN_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Default uplink-only timeout (1 second).
 ///
-/// 对应 Go `SessionDefault().Timeouts.UplinkOnly`（1s）：上行结束后下行方向的
-/// 剩余存活窗口。
+/// 对应 Go `SessionDefault().Timeouts.UplinkOnly`（1s）：下行结束后上行方向的
+/// 剩余存活窗口（Go responseDone defer SetTimeout(UplinkOnly)，freedom.go:427）。
 pub const DEFAULT_UPLINK_ONLY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Default downlink-only timeout (1 second).
 ///
-/// 对应 Go `SessionDefault().Timeouts.DownlinkOnly`（1s）：下行结束后上行方向的
-/// 剩余存活窗口。
+/// 对应 Go `SessionDefault().Timeouts.DownlinkOnly`（1s）：上行结束后下行方向的
+/// 剩余存活窗口（Go requestDone defer SetTimeout(DownlinkOnly)，freedom.go:388）。
 pub const DEFAULT_DOWNLINK_ONLY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Fallback per-connection pipe buffer limit (512 KiB).
