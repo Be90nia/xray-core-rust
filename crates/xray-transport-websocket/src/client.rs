@@ -46,6 +46,10 @@ use crate::{
     ws_bridge::WsConnection,
 };
 
+/// WS 握手超时（Go `transport/internet/websocket/dialer.go:65`
+/// `HandshakeTimeout: time.Second * 8`）。
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// 拨号参数（与 Go `dialWebSocket` 入参对齐）。
 pub struct DialOptions<'a> {
     /// WS 配置（host/path/header/heartbeat）。
@@ -146,8 +150,15 @@ pub async fn dial(
 
     // connector=None 时 tungstenite(native-tls feature)会对流再叠一层 TLS;
     // 我们的 TLS 分支已自管 TLS,必须显式 Plain(仅明文分支也是 Plain 包装)。
-    let (stream, _resp) =
-        client_async_tls_with_config(request, stream, Some(ws_cfg), Some(Connector::Plain)).await?;
+    // bd cjwc G2：握手包 8s deadline（Go dialer.go:65 HandshakeTimeout:
+    // time.Second * 8）；只覆盖 HTTP Upgrade 往返，heartbeat 在成功后另行
+    // 启动，互不干扰。超时前该调用对沉默服务端永久 Pending。
+    let (stream, _resp) = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        client_async_tls_with_config(request, stream, Some(ws_cfg), Some(Connector::Plain)),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "websocket handshake timeout"))??;
 
     // remote/local addr：地址不暴露；调用方需要时通过 dispatcher 注入。
     let mut conn = WsConnection::from_stream(stream, None, None);
@@ -468,6 +479,42 @@ mod tests {
 
     fn dest(host: &str, port: u16) -> Destination {
         Destination::new(Address::new_domain(host), Port::new(port), Network::TCP)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dial_silent_server_times_out_at_handshake_after_8s() {
+        // bd cjwc G2（Go dialer.go:65 HandshakeTimeout 8s）：服务端 accept 后
+        // 不回 HTTP 101，修复前 client_async_tls_with_config 永久 Pending；
+        // 修复后 8s 触发 TimedOut。advance 步进让真实 loopback TCP 拨号先完成，
+        // 再把虚拟时钟推进过 8s deadline。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (_sock, _) = listener.accept().await.unwrap();
+            // 沉默服务端：持有 socket、永不回 101（虚拟 sleep 只为持有）。
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        });
+        let params = DialParams {
+            config: Config::default(),
+            destination: dest("127.0.0.1", port),
+            tls_config: None,
+            tls_server_name: None,
+            fingerprint: None,
+            security_json: None,
+        };
+        let dial_task = tokio::spawn(dial_with_params(params, None));
+        for _ in 0..400 {
+            tokio::time::advance(std::time::Duration::from_millis(50)).await;
+            if dial_task.is_finished() {
+                break;
+            }
+        }
+        let err = dial_task.await.unwrap().err().unwrap();
+        assert!(
+            matches!(&err, WsError::Io(e) if e.kind() == std::io::ErrorKind::TimedOut),
+            "expected handshake timeout, got: {err:?}"
+        );
+        assert!(err.to_string().contains("websocket handshake timeout"), "{err}");
     }
 
     #[test]

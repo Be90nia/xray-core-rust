@@ -133,14 +133,6 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
                 Destination::new(config.server_address.clone(), config.server_port, Network::TCP);
             let sockopt =
                 config.stream_settings.as_ref().map(|s| s.socket_options()).unwrap_or_default();
-            let mut conn: Box<dyn Connection> = match &config.stream_settings {
-                Some(s) => dial(&server_dest, s, &sockopt)
-                    .await
-                    .map_err(|e| format!("http dial proxy ({}): {e}", s.protocol))?,
-                None => xray_transport::system_dialer::dial_system(&server_dest, &sockopt)
-                    .await
-                    .map_err(|e| format!("http dial proxy (tcp): {e}"))?,
-            };
             drop(server_addr);
 
             // 2. 构造 CONNECT 请求
@@ -166,54 +158,77 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
             }
             request.push_str("Proxy-Connection: Keep-Alive\r\n");
             request.push_str("\r\n");
-            // 3. 发送请求
-            conn.write_all(request.as_bytes())
-                .await
-                .map_err(|e| format!("http write CONNECT: {e}"))?;
-            conn.flush().await.map_err(|e| format!("http flush CONNECT: {e}"))?;
 
-            // 4. 读响应头（直到空行 `\r\n\r\n`）
-            let mut buf = vec![0u8; 4096];
-            let mut total = 0usize;
-            let mut found_end = false;
-            while !found_end && total < buf.len() {
-                let n = match conn.read(&mut buf[total..]).await {
-                    Ok(n) => n,
-                    // z9n4：读响应头失败的可观测日志。
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "xray.http.outbound",
-                            proxy = %format!("{}:{}", server_dest.address(), server_dest.port()),
-                            target = %host_port,
-                            error = %e,
-                            "http CONNECT proxy read response header failed"
-                        );
-                        return Err(format!("http read response: {e}"));
-                    },
-                };
-                if n == 0 {
-                    // z9n4：代理在响应前 EOF（连接 reset / 401 challenge 等场景）。
-                    tracing::warn!(
-                        target: "xray.http.outbound",
-                        proxy = %format!("{}:{}", server_dest.address(), server_dest.port()),
-                        target = %host_port,
-                        "http CONNECT proxy closed connection before response"
-                    );
-                    return Err("http proxy closed connection before response".to_string());
-                }
-                total += n;
-                // 检查是否收到完整响应头（`\r\n\r\n`）
-                for i in 0..total.saturating_sub(3) {
-                    if buf[i] == b'\r'
-                        && buf[i + 1] == b'\n'
-                        && buf[i + 2] == b'\r'
-                        && buf[i + 3] == b'\n'
-                    {
-                        found_end = true;
-                        break;
+            // bd cjwc G5（Go proxy/http/client.go:103-119 `retry.ExponentialBackoff(
+            // 5, 100).On(setUpHTTPTunnel...)`）：重试「建隧道」的连接级失败——dial
+            // 拒绝 / 写请求失败 / 响应前 EOF·reset。well-formed 非 200 响应属
+            // 响应内容性失败，不重试——状态码检查留在重试环外（契约收紧：Go 对
+            // 非 200 同样重试，此处按票 cjwc 契约收敛）。
+            let (conn, buf, total) = xray_transport::retry::exponential_backoff(
+                5,
+                100,
+                || async {
+                    let mut conn: Box<dyn Connection> = match &config.stream_settings {
+                        Some(s) => dial(&server_dest, s, &sockopt)
+                            .await
+                            .map_err(|e| format!("http dial proxy ({}): {e}", s.protocol))?,
+                        None => xray_transport::system_dialer::dial_system(&server_dest, &sockopt)
+                            .await
+                            .map_err(|e| format!("http dial proxy (tcp): {e}"))?,
+                    };
+                    // 3. 发送请求
+                    conn.write_all(request.as_bytes())
+                        .await
+                        .map_err(|e| format!("http write CONNECT: {e}"))?;
+                    conn.flush().await.map_err(|e| format!("http flush CONNECT: {e}"))?;
+
+                    // 4. 读响应头（直到空行 `\r\n\r\n`）
+                    let mut buf = vec![0u8; 4096];
+                    let mut total = 0usize;
+                    let mut found_end = false;
+                    while !found_end && total < buf.len() {
+                        let n = match conn.read(&mut buf[total..]).await {
+                            Ok(n) => n,
+                            // z9n4：读响应头失败的可观测日志。
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "xray.http.outbound",
+                                    proxy = %format!("{}:{}", server_dest.address(), server_dest.port()),
+                                    target = %host_port,
+                                    error = %e,
+                                    "http CONNECT proxy read response header failed"
+                                );
+                                return Err(format!("http read response: {e}"));
+                            },
+                        };
+                        if n == 0 {
+                            // z9n4：代理在响应前 EOF（连接 reset / 401 challenge 等场景）。
+                            tracing::warn!(
+                                target: "xray.http.outbound",
+                                proxy = %format!("{}:{}", server_dest.address(), server_dest.port()),
+                                target = %host_port,
+                                "http CONNECT proxy closed connection before response"
+                            );
+                            return Err("http proxy closed connection before response".to_string());
+                        }
+                        total += n;
+                        // 检查是否收到完整响应头（`\r\n\r\n`）
+                        for i in 0..total.saturating_sub(3) {
+                            if buf[i] == b'\r'
+                                && buf[i + 1] == b'\n'
+                                && buf[i + 2] == b'\r'
+                                && buf[i + 3] == b'\n'
+                            {
+                                found_end = true;
+                                break;
+                            }
+                        }
                     }
-                }
-            }
+                    Ok((conn, buf, total))
+                },
+            )
+            .await
+            .map_err(|e| format!("http dial proxy: retries exhausted: {e}"))?;
             // 5. 解析响应行（第一行：`HTTP/1.x STATUS_CODE ...`）
             let header_end = buf[..total]
                 .windows(4)
@@ -389,5 +404,36 @@ mod tests {
             .find(|l| l.starts_with("User-Agent: "))
             .expect("UA header must be present");
         assert!(ua_line.contains("Chrome/"), "UA must masquerade as Chrome: {ua_line}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dial_retried_exactly_five_times_on_dead_proxy() {
+        // bd cjwc G5（Go client.go:103-119 ExponentialBackoff(5, 100)）：代理
+        // accept 后立即断开 = 连接级失败，dial 环节被重试恰好 5 次（accept 计数）；
+        // 修复前仅 1 次。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepts_cl = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else { break };
+                accepts_cl.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(sock); // 立即断开 → 客户端响应前 EOF → 重试
+            }
+        });
+        let cfg = Arc::new(HttpOutboundConfig::new(
+            Address::ipv4(std::net::Ipv4Addr::LOCALHOST),
+            Port::new(port),
+        ));
+        let dial_fn = make_http_dial_fn(cfg);
+        let dest = Destination::tcp(Address::new_domain("target.example.com"), Port::new(443));
+        let err = dial_fn(&dest).await.err().expect("dial must fail after retries");
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "dial must be attempted exactly 5 times"
+        );
+        assert!(err.contains("retries exhausted"), "{err}");
     }
 }

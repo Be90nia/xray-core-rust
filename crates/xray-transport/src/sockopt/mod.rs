@@ -434,7 +434,21 @@ pub fn apply_client_dial_rcvbuf(tcp: &tokio::net::TcpStream) -> std::io::Result<
 /// 理由）。对端不支持 TFO / 无 cookie 时内核自动回退普通握手；setsockopt 本身
 /// 失败（内核 <4.11 / seccomp 限制）只记 debug 不阻断拨号——纯优化项不能成为
 /// 拨号失败原因。多地址回退语义对齐 `TcpStream::connect`（逐个尝试）。
+///
+/// 整个回退序列（非单地址）受 [`crate::system_dialer::DEFAULT_DIAL_TIMEOUT`]
+/// 16s 超时约束（bd cjwc G1，对齐 Go `dial_system` 语义；超时返回
+/// `ErrorKind::TimedOut`，错误文案与 `dial_tcp_raw` 同源）。
 pub async fn dial_client_tcp<A>(host: A) -> std::io::Result<tokio::net::TcpStream>
+where
+    A: tokio::net::ToSocketAddrs,
+{
+    tokio::time::timeout(crate::system_dialer::DEFAULT_DIAL_TIMEOUT, dial_client_tcp_inner(host))
+        .await
+        .unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "dial timeout")))
+}
+
+/// 多地址逐个尝试的拨号本体（超时由 [`dial_client_tcp`] 外层统一施加）。
+async fn dial_client_tcp_inner<A>(host: A) -> std::io::Result<tokio::net::TcpStream>
 where
     A: tokio::net::ToSocketAddrs,
 {
@@ -1050,6 +1064,16 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn client_dial_times_out_against_blackhole_address() {
+        // bd cjwc G1：TEST-NET-1（RFC 5737，保证无监听且不该路由）在带默认路由
+        // 的环境 SYN 出网关后被丢弃 → connect 挂起；暂停时钟自动推进 16s 触发
+        // TimedOut（真实耗时毫秒级）。修复前该调用永久 Pending。
+        let err =
+            dial_client_tcp((std::net::IpAddr::from([192, 0, 2, 1]), 1u16)).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "got: {err}");
+    }
 
     #[tokio::test]
     async fn client_dial_rcvbuf_raises_rcvbuf_over_kernel_default() {

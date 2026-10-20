@@ -27,6 +27,13 @@ use crate::{
     },
 };
 
+/// SOCKS 握手 deadline（Go `proxy/socks/client.go:104`
+/// `conn.SetDeadline(now + p.Timeouts.Handshake)`）。缺省 policy Handshake =
+/// 60s（Go `features/policy/policy.go` `SessionDefault`，注释注明对齐 nginx
+/// client_header_timeout 以免暴露服务端身份）。
+// shortcut: policyManager 未接线，握手超时恒取 policy 缺省 60s；接线后按 level 取值
+const SOCKS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// SOCKS 客户端配置：server 地址 + 可选认证。
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -90,6 +97,28 @@ impl SocksClient {
             ))
         })?;
 
+        // bd cjwc G4（Go proxy/socks/client.go:104 SetDeadline(now+Handshake)）：
+        // 握手阶段（method 协商 + auth + CONNECT 往返）统一 deadline，修复前
+        // 沉默服务端下 read_exact 永久 Pending。Go :117 `SetDeadline(time.Time{})`
+        // 清零语义 = deadline 只约束握手：timeout 作用域仅包握手，成功即失效，
+        // 返回的 stream 数据面读写不受 60s 限制。
+        match tokio::time::timeout(SOCKS_HANDSHAKE_TIMEOUT, self.handshake(&mut stream, target))
+            .await
+        {
+            Ok(handshake) => handshake?,
+            Err(_) => {
+                return Err(SocksError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "socks handshake timeout",
+                )));
+            },
+        }
+        Ok(stream)
+    }
+
+    /// SOCKS5 握手本体（method 协商 → 可选 RFC 1929 auth → CONNECT 往返）。
+    /// deadline 由 [`SocksClient::dial`] 的 timeout 施加，此处不设。
+    async fn handshake(&self, stream: &mut TcpStream, target: &SocksAddr) -> Result<()> {
         // 1. method negotiation
         // Go protocol.go:443-447：按凭据有无二选一只发 1 个 method
         //（带凭据 [05 01 02] / 无凭据 [05 01 00]；发两个 method 的
@@ -120,7 +149,7 @@ impl SocksClient {
                         ));
                     },
                 };
-                Self::auth_password(&mut stream, u, p).await?;
+                Self::auth_password(stream, u, p).await?;
             },
             AUTH_NO_MATCHING_METHOD => {
                 return Err(SocksError::AuthFailed("server returned no matching method".into()));
@@ -172,7 +201,7 @@ impl SocksClient {
         let mut rest = vec![0u8; addr_len + 2];
         stream.read_exact(&mut rest).await?;
 
-        Ok(stream)
+        Ok(())
     }
 
     /// RFC 1929 用户名/密码子协议。
@@ -362,6 +391,60 @@ mod tests {
         let _ = client.dial(&target).await;
         let first = acceptor.await.unwrap();
         assert_eq!(first, [SOCKS5_VERSION, 0x01, AUTH_PASSWORD]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handshake_silent_server_times_out_after_60s() {
+        // bd cjwc G4（Go client.go:104 SetDeadline(now+Handshake)）：服务端
+        // accept 后不回 method 选择，修复前 read_exact 永久 Pending；修复后
+        // 60s（policy 缺省）触发 TimedOut。暂停时钟自动推进，真实耗时毫秒级。
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_sock, _) = listener.accept().await.unwrap();
+            // 沉默服务端：不回 method 选择（虚拟 sleep 只为持有 socket）。
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        });
+        let client = SocksClient::new(ClientConfig::new_noauth(addr.to_string()));
+        let target = SocksAddr::ipv4(std::net::Ipv4Addr::LOCALHOST, 80);
+        let dial_task = tokio::spawn(async move { client.dial(&target).await });
+        let err = dial_task.await.unwrap().unwrap_err();
+        assert!(
+            matches!(&err, SocksError::Io(e) if e.kind() == std::io::ErrorKind::TimedOut),
+            "expected handshake timeout, got: {err:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn data_plane_not_limited_by_handshake_deadline() {
+        // bd cjwc G4（Go client.go:117 SetDeadline(time.Time{})）：握手 deadline
+        // 不得泄漏到数据面——握手成功后，虚拟时间越过 60s，echo 通道仍可用。
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let server = start_echo_socks_server(listener, ServerConfig::default());
+        let client = SocksClient::new(ClientConfig::new_noauth(server_addr.to_string()));
+        let target = SocksAddr::domain("example.com", 443);
+        let dial_task = tokio::spawn(async move { client.dial(&target).await });
+        // advance 步进：给真实 loopback 握手 I/O 完成窗口（10s 虚拟预算，
+        // 远小于 60s deadline）。
+        for _ in 0..1000 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            if dial_task.is_finished() {
+                break;
+            }
+        }
+        let mut stream =
+            dial_task.await.unwrap().expect("handshake must succeed within stepped budget");
+        // 虚拟时间越过 60s deadline（若 deadline 仍作用于数据面，此处即死）。
+        tokio::time::advance(Duration::from_secs(61)).await;
+        stream.write_all(b"after-deadline").await.unwrap();
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+            .await
+            .expect("echo must return")
+            .unwrap();
+        assert_eq!(&buf[..n], b"after-deadline");
+        server.abort();
     }
 
     #[test]
