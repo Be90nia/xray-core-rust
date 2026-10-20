@@ -276,6 +276,7 @@ mod tests {
             "random",
             "randomized",
             "randomizednoalpn",
+            "uniformrandom",
             "unsafe",
         ] {
             assert!(get_fingerprint(key).is_ok(), "preset key {key} should resolve");
@@ -309,6 +310,179 @@ mod tests {
         assert!(get_fingerprint("hellofirefox_55").is_ok());
         assert!(get_fingerprint("hellochrome_120_pq").is_ok());
         assert!(get_fingerprint("hellochrome_114_padding_psk_shuf").is_ok());
+    }
+
+    /// 票 daqq：每个配置名 → 枚举 → btls 实际生效模板的映射必须**显式**
+    /// （Native / Degraded 目标 / Unsupported 三者必居其一，无未声明分支）。
+    /// 新增 `Fingerprint` 变体时下方 `exhaustive_guard` 的 match 编译失败，
+    /// 强制先补 [`crate::btls_client::effective_fingerprint`] 裁决与本表。
+    #[test]
+    fn fingerprint_resolution_explicit_table() {
+        use crate::btls_client::{FingerprintResolution as Res, effective_fingerprint};
+        use Fingerprint as F;
+
+        let n = Res::Native;
+        let d = |e: Fingerprint| Res::Degraded { effective: e };
+        let table: &[(&str, Fingerprint, Res)] = &[
+            // ---- 原生模板（btls 专属 ClientHello 配置）----
+            ("chrome", F::Chrome, n),
+            ("hellochrome_133", F::HelloChrome133, n),
+            ("hellochrome_131", F::HelloChrome131, n),
+            ("hellochrome_120", F::HelloChrome120, n),
+            ("firefox", F::Firefox, n),
+            ("hellofirefox_148", F::HelloFirefox148, n),
+            ("hellofirefox_120", F::HelloFirefox120, n),
+            ("safari", F::Safari, n),
+            ("hellosafari_26_3", F::HelloSafari26_3, n),
+            ("helloios_13", F::HelloIos13, n),
+            ("ios", F::Ios, n),
+            ("helloios_14", F::HelloIos14, n),
+            ("edge", F::Edge, n),
+            ("helloedge_106", F::HelloEdge106, n),
+            ("360", F::Qihoo360, n),
+            ("hello360_11_0", F::Hello360_11_0, n),
+            ("qq", F::Qq, n),
+            ("helloqq_11_1", F::HelloQq_11_1, n),
+            // ---- 旧 Chrome 族 → Chrome 120 ----
+            ("hellochrome_auto", F::HelloChromeAuto, d(F::HelloChrome120)),
+            ("hellochrome_58", F::HelloChrome58, d(F::HelloChrome120)),
+            ("hellochrome_62", F::HelloChrome62, d(F::HelloChrome120)),
+            ("hellochrome_70", F::HelloChrome70, d(F::HelloChrome120)),
+            ("hellochrome_72", F::HelloChrome72, d(F::HelloChrome120)),
+            ("hellochrome_83", F::HelloChrome83, d(F::HelloChrome120)),
+            ("hellochrome_87", F::HelloChrome87, d(F::HelloChrome120)),
+            ("hellochrome_96", F::HelloChrome96, d(F::HelloChrome120)),
+            ("hellochrome_100", F::HelloChrome100, d(F::HelloChrome120)),
+            ("hellochrome_102", F::HelloChrome102, d(F::HelloChrome120)),
+            ("hellochrome_106_shuffle", F::HelloChrome106Shuffle, d(F::HelloChrome120)),
+            ("hellochrome_100_psk", F::HelloChrome100Psk, d(F::HelloChrome120)),
+            ("hellochrome_112_psk_shuf", F::HelloChrome112PskShuf, d(F::HelloChrome120)),
+            (
+                "hellochrome_114_padding_psk_shuf",
+                F::HelloChrome114PaddingPskShuf,
+                d(F::HelloChrome120),
+            ),
+            ("hellochrome_115_pq", F::HelloChrome115Pq, d(F::HelloChrome120)),
+            ("hellochrome_115_pq_psk", F::HelloChrome115PqPsk, d(F::HelloChrome120)),
+            ("hellochrome_120_pq", F::HelloChrome120Pq, d(F::HelloChrome120)),
+            // ---- 旧 Firefox 族 → Firefox 120 ----
+            ("hellofirefox_auto", F::HelloFirefoxAuto, d(F::HelloFirefox120)),
+            ("hellofirefox_55", F::HelloFirefox55, d(F::HelloFirefox120)),
+            ("hellofirefox_56", F::HelloFirefox56, d(F::HelloFirefox120)),
+            ("hellofirefox_63", F::HelloFirefox63, d(F::HelloFirefox120)),
+            ("hellofirefox_65", F::HelloFirefox65, d(F::HelloFirefox120)),
+            ("hellofirefox_99", F::HelloFirefox99, d(F::HelloFirefox120)),
+            ("hellofirefox_102", F::HelloFirefox102, d(F::HelloFirefox120)),
+            ("hellofirefox_105", F::HelloFirefox105, d(F::HelloFirefox120)),
+            // ---- 旧 iOS/Safari 族 → iOS 13 ----
+            ("helloios_auto", F::HelloIosAuto, d(F::HelloIos13)),
+            ("helloios_11_1", F::HelloIos11_1, d(F::HelloIos13)),
+            ("helloios_12_1", F::HelloIos12_1, d(F::HelloIos13)),
+            ("hellosafari_16_0", F::HelloSafari16_0, d(F::HelloIos13)),
+            ("hellosafari_auto", F::HelloSafariAuto, d(F::HelloIos13)),
+            // ---- 旧 Edge 族 → Edge 106 ----
+            ("helloedge_85", F::HelloEdge85, d(F::HelloEdge106)),
+            ("helloedge_auto", F::HelloEdgeAuto, d(F::HelloEdge106)),
+            // ---- 旧 360/QQ 族 ----
+            ("hello360_auto", F::Hello360Auto, d(F::Hello360_11_0)),
+            ("hello360_7_5", F::Hello360_7_5, d(F::Hello360_11_0)),
+            ("helloqq_auto", F::HelloQqAuto, d(F::HelloQq_11_1)),
+            // ---- Android ≈ Chrome ----
+            ("android", F::Android, d(F::Chrome)),
+            ("helloandroid_11_okhttp", F::HelloAndroid11OkHttp, d(F::Chrome)),
+            // ---- Golang → Chrome 120 ----
+            ("hellogolang", F::HelloGolang, d(F::HelloChrome120)),
+            // ---- 随机化族 → 静态 Chrome 133（btls 无随机化能力，诚实降级）----
+            ("random", F::Random, d(F::Chrome)),
+            ("randomized", F::Randomized, d(F::Chrome)),
+            ("hellorandomized", F::HelloRandomized, d(F::Chrome)),
+            ("hellorandomizedalpn", F::HelloRandomizedAlpn, d(F::Chrome)),
+            ("randomizednoalpn", F::RandomizedNoAlpn, d(F::Chrome)),
+            ("hellorandomizednoalpn", F::HelloRandomizedNoAlpn, d(F::Chrome)),
+            ("uniformrandom", F::UniformRandom, d(F::Chrome)),
+            // ---- 显式不支持 ----
+            ("unsafe", F::Unsafe, Res::Unsupported),
+        ];
+        assert_eq!(table.len(), 64, "64 配置名（13 preset + 11 modern + 40 other）全显式");
+        for (name, fp, expected) in table {
+            assert_eq!(
+                get_fingerprint(name).ok().as_ref(),
+                Some(fp),
+                "config name {name} must resolve"
+            );
+            assert_eq!(&effective_fingerprint(fp), expected, "fingerprint {fp:?}");
+        }
+
+        // 编译期完备性闸：新增枚举变体时此 match 非穷尽编译失败——
+        // 强制先补 effective_fingerprint 裁决再入表，禁止未声明分支。
+        for fp in table.iter().map(|(_, fp, _)| *fp) {
+            match fp {
+                F::Chrome
+                | F::Firefox
+                | F::Safari
+                | F::Ios
+                | F::Android
+                | F::Edge
+                | F::Qihoo360
+                | F::Qq
+                | F::Random
+                | F::Randomized
+                | F::RandomizedNoAlpn
+                | F::UniformRandom
+                | F::Unsafe
+                | F::HelloFirefox120
+                | F::HelloFirefox148
+                | F::HelloChrome120
+                | F::HelloChrome131
+                | F::HelloChrome133
+                | F::HelloIos13
+                | F::HelloIos14
+                | F::HelloEdge106
+                | F::HelloSafari26_3
+                | F::Hello360_11_0
+                | F::HelloQq_11_1
+                | F::HelloGolang
+                | F::HelloRandomized
+                | F::HelloRandomizedAlpn
+                | F::HelloRandomizedNoAlpn
+                | F::HelloFirefoxAuto
+                | F::HelloFirefox55
+                | F::HelloFirefox56
+                | F::HelloFirefox63
+                | F::HelloFirefox65
+                | F::HelloFirefox99
+                | F::HelloFirefox102
+                | F::HelloFirefox105
+                | F::HelloChromeAuto
+                | F::HelloChrome58
+                | F::HelloChrome62
+                | F::HelloChrome70
+                | F::HelloChrome72
+                | F::HelloChrome83
+                | F::HelloChrome87
+                | F::HelloChrome96
+                | F::HelloChrome100
+                | F::HelloChrome102
+                | F::HelloChrome106Shuffle
+                | F::HelloIosAuto
+                | F::HelloIos11_1
+                | F::HelloIos12_1
+                | F::HelloAndroid11OkHttp
+                | F::HelloEdge85
+                | F::HelloEdgeAuto
+                | F::HelloSafari16_0
+                | F::HelloSafariAuto
+                | F::Hello360Auto
+                | F::Hello360_7_5
+                | F::HelloQqAuto
+                | F::HelloChrome100Psk
+                | F::HelloChrome112PskShuf
+                | F::HelloChrome114PaddingPskShuf
+                | F::HelloChrome115Pq
+                | F::HelloChrome115PqPsk
+                | F::HelloChrome120Pq => {},
+            }
+        }
     }
 
     #[test]
