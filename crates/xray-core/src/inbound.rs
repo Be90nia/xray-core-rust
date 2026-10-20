@@ -493,13 +493,15 @@ async fn serve_mixed(
                 match hs {
                     Ok(SocksRequest::TcpConnect(addr)) => {
                         let dest = socks_addr_to_destination(&addr, Network::TCP);
+                        // bd 2b1c：access 带 from（process/source 规则 + access log 来源）
+                        let access = http_inbound_access(&stream, peer);
                         // plain TCP：readv 多缓冲聚合读（bd 2o9l，Go NewReader readv 分支）
                         let (read_half, write_half) = stream.into_split();
                         let link = Link::new(new_readv_reader(read_half), new_writer(write_half));
                         if is_mux_destination(&dest) {
                             tokio::spawn(handle_mux_inbound_link(link, handler, None));
                         } else {
-                            let _ = handler.dispatch(&dest, link).await;
+                            let _ = handler.dispatch_with_access(&dest, link, access).await;
                         }
                     },
                     Ok(SocksRequest::UdpAssociate(_, relay_socket)) => {
@@ -531,8 +533,10 @@ async fn serve_mixed(
                     Ok(v) => v,
                     Err(_) => return,
                 };
+                // bd 2b1c：access 带 from（process/source 规则 + access log 来源）
+                let access = http_inbound_access(&stream, peer);
                 if hs.method != "CONNECT" {
-                    handle_plain_http(stream, hs, Arc::clone(&handler)).await;
+                    handle_plain_http(stream, hs, Arc::clone(&handler), access).await;
                 } else {
                     let dest = hs.dest;
                     // plain TCP：readv 多缓冲聚合读（bd 2o9l，Go NewReader readv 分支）
@@ -541,13 +545,12 @@ async fn serve_mixed(
                     if is_mux_destination(&dest) {
                         tokio::spawn(handle_mux_inbound_link(link, handler, None));
                     } else {
-                        let _ = handler.dispatch(&dest, link).await;
+                        let _ = handler.dispatch_with_access(&dest, link, access).await;
                     }
                 }
             } else {
                 tracing::debug!(first_byte = sniff[0], "mixed: unknown first byte, closing");
             }
-            let _ = peer; // 仅用于 closure capture
         });
     }
 }
@@ -569,7 +572,7 @@ pub async fn serve_http(
         .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
     tracing::info!(addr = %listener.local_addr()?, "http proxy inbound listening");
     loop {
-        let (mut stream, _peer) = match listener.accept().await {
+        let (mut stream, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "http accept failed");
@@ -601,8 +604,10 @@ pub async fn serve_http(
                 },
             };
             // 2. Plain HTTP proxy（GET/POST 等）
+            // bd 2b1c：access 必须带 from（process/source 规则 + access log 来源）
+            let access = http_inbound_access(&stream, peer);
             if hs.method != "CONNECT" {
-                handle_plain_http(stream, hs, Arc::clone(&handler)).await;
+                handle_plain_http(stream, hs, Arc::clone(&handler), access).await;
                 return;
             }
             // 3. CONNECT：拆 stream → Link → dispatch
@@ -616,8 +621,26 @@ pub async fn serve_http(
                 tokio::spawn(handle_mux_inbound_link(link, handler, None));
                 return;
             }
-            let _ = handler.dispatch(&dest, link).await;
+            let _ = handler.dispatch_with_access(&dest, link, access).await;
         });
+    }
+}
+
+/// HTTP/mixed inbound 连接元数据 → AccessContext。
+///
+/// bd 2b1c：此前 HTTP 路径 dispatch 不带 access，from 为空 → process/source
+/// 规则永不命中、access log 缺来源。socks 分支同款见 handle_connection。
+fn http_inbound_access(
+    stream: &TcpStream,
+    peer: std::net::SocketAddr,
+) -> xray_app_dispatcher::AccessContext {
+    let conn = stream.splice_raw_clone().map(Arc::new);
+    xray_app_dispatcher::AccessContext {
+        from: peer.to_string(),
+        local: stream.inbound_local().map(|a| a.to_string()).unwrap_or_default(),
+        conn,
+        can_splice_copy: xray_common::platform::splice::CAN_SPLICE_COPY_YES,
+        ..Default::default()
     }
 }
 
@@ -629,6 +652,7 @@ async fn handle_plain_http(
     client: TcpStream,
     hs: HandshakeResult,
     handler: Arc<dyn DispatchHandler>,
+    access: xray_app_dispatcher::AccessContext,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use xray_buf::{
@@ -652,7 +676,7 @@ async fn handle_plain_http(
     //    dispatch 无错误返回（PinFuture<()>）：no-handler/后台 dial 失败都表现为
     //    link 被中断 → 下行零字节结束 → 下方 responded 判据统一回 503 兜底。
     let dest = hs.dest.clone();
-    handler.dispatch(&dest, link).await;
+    handler.dispatch_with_access(&dest, link, access).await;
 
     // 4. 拆 client stream：read(body) + write(response) 并发
     let (mut client_read, mut client_write) = tokio::io::split(client);
@@ -6725,7 +6749,12 @@ mod tests {
             target: "http://1.2.3.4/".into(),
             headers: HashMap::new(),
         };
-        tokio::spawn(handle_plain_http(server, hs, Arc::new(FailingDispatch)));
+        tokio::spawn(handle_plain_http(
+            server,
+            hs,
+            Arc::new(FailingDispatch),
+            xray_app_dispatcher::AccessContext::default(),
+        ));
 
         let mut buf = Vec::new();
         tokio::time::timeout(std::time::Duration::from_secs(5), client.read_to_end(&mut buf))
@@ -6777,7 +6806,12 @@ mod tests {
             target: "http://1.2.3.4/".into(),
             headers: HashMap::new(),
         };
-        tokio::spawn(handle_plain_http(server, hs, Arc::new(DropLinkDispatch)));
+        tokio::spawn(handle_plain_http(
+            server,
+            hs,
+            Arc::new(DropLinkDispatch),
+            xray_app_dispatcher::AccessContext::default(),
+        ));
 
         let mut buf = Vec::new();
         tokio::time::timeout(std::time::Duration::from_secs(5), client.read_to_end(&mut buf))

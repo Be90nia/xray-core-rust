@@ -101,9 +101,14 @@ impl DispatchHandler for BlackholeHandler {
             drop(writer);
 
             // 2. drain reader（Go Process 里 buf.Copy(link.Reader, buf.Discard)）
-            while let Ok(Ok(_)) =
+            // 空.MultiBuffer 是本 crate 的 EOF 约定（readv.rs:289-292）——必须 break，
+            // 否则 EOF 后每次立即 Ready 自旋拖垮调度（bd 8cry 实测整条 inbound 停摆）。
+            while let Ok(Ok(mb)) =
                 tokio::time::timeout(drain_timeout, reader.read_multi_buffer()).await
             {
+                if mb.is_empty() {
+                    break;
+                }
                 // drain 一帧
             }
         })
