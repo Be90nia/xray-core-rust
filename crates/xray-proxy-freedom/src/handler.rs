@@ -48,8 +48,10 @@ impl FreedomHandler {
     pub fn new(tag: impl Into<String>, config: Config) -> Result<Self, String> {
         let mut final_rules = Vec::with_capacity(config.final_rules.len());
         for rc in &config.final_rules {
-            final_rules.push(FinalRule::build(rc)
-                .map_err(|e| format!("freedom: failed to build final rule: {e}"))?);
+            final_rules.push(
+                FinalRule::build(rc)
+                    .map_err(|e| format!("freedom: failed to build final rule: {e}"))?,
+            );
         }
         Ok(Self { tag: tag.into(), final_rules, default_rule_type: None, config })
     }

@@ -744,11 +744,8 @@ mod tests {
             )
             .with_flow(crate::FLOW_XRV),
         );
-        let dest = Destination::new(
-            Address::from_ipv4_bytes([8, 8, 8, 8]),
-            Port::new(53),
-            Network::UDP,
-        );
+        let dest =
+            Destination::new(Address::from_ipv4_bytes([8, 8, 8, 8]), Port::new(53), Network::UDP);
         let err = match establish_conn(
             cfg,
             None,

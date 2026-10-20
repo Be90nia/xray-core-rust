@@ -110,8 +110,7 @@ impl TowerService<Uri> for DestTcpConnector {
         let host = std::sync::Arc::clone(&self.host);
         let port = self.port;
         Box::pin(async move {
-            let tcp =
-                xray_transport::sockopt::dial_client_tcp((host.as_ref(), port)).await?;
+            let tcp = xray_transport::sockopt::dial_client_tcp((host.as_ref(), port)).await?;
             tcp.set_nodelay(true).ok();
             // bd 88m0/0kqj 客户端侧：下行 SO_RCVBUF 缺省 16MB（窗钉修复）。
             xray_transport::sockopt::apply_client_dial_rcvbuf(&tcp)?;

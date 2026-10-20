@@ -475,8 +475,7 @@ pub async fn decode_single_chunk_async<R: AsyncRead + Unpin + Send>(
 ) -> std::io::Result<Option<Vec<u8>>> {
     use tokio::io::AsyncReadExt;
     // SHAKE128 流顺序对齐 decode_chunk_stream：next_padding_len 先于 decode。
-    let padding_size =
-        if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
+    let padding_size = if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
 
     let sb = size_parser.size_bytes();
     let mut size_field = vec![0u8; sb];
