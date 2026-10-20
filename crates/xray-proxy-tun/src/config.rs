@@ -190,6 +190,22 @@ impl StackOptions {
         if let Some(b) = v.get("autoSystemDnsToGateway").and_then(|x| x.as_bool()) {
             opts.auto_system_dns_to_gateway = b;
         }
+        // autoSystemWfpBlockLeak（Go tun.go:28，Windows WFP 防泄漏过滤器，合法值
+        // "dns"/"misconfigtun"）：Rust 无 WFP 能力（票 5std M7），非空显式拒绝而非
+        // 静默忽略——用户以为有防泄漏保护实际裸奔。空数组/null 在 Go 侧同为
+        // 无操作，放行；非数组类型手误按"已设置"拒启（bd zl5t 惯例）。
+        if let Some(w) = v.get("autoSystemWfpBlockLeak") {
+            let requested = match w {
+                serde_json::Value::Array(a) => !a.is_empty(),
+                serde_json::Value::Null => false,
+                _ => true,
+            };
+            if requested {
+                return Err(TunError::InvalidConfig(
+                    "autoSystemWfpBlockLeak is not supported by this build; remove the key (WFP leak blocking is not implemented)".into(),
+                ));
+            }
+        }
         // idleTimeout：Rust 扩展（Go TunConfig 无此字段）；数字（秒）或 "30s"/"5m"。
         if let Some(val) = v.get("idleTimeout") {
             opts.idle_timeout = parse_duration_value(val, "idleTimeout")?;
@@ -522,6 +538,24 @@ mod tests {
         )
         .unwrap();
         assert!(opts.auto_system_dns_to_gateway);
+    }
+
+    /// 票 5std M7：autoSystemWfpBlockLeak 非空硬错（Rust 无 WFP 能力，静默忽略 =
+    /// 用户以为有防泄漏保护实际裸奔）；空数组/null 放行（Go 侧同为无操作）。
+    #[test]
+    #[allow(clippy::err_expect)] // 存量清零批次：测试断言期 expect（StackOptions 无 Debug，禁 expect_err）
+    fn parse_json_wfp_block_leak_rejected_loudly() {
+        // Go tun_test.go:30-32 同款输入（合法值形态）
+        let err = StackOptions::parse_json(br#"{"autoSystemWfpBlockLeak":["dns","misconfigtun"]}"#)
+            .err()
+            .expect("non-empty autoSystemWfpBlockLeak must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("autoSystemWfpBlockLeak"), "{msg}");
+        assert!(msg.contains("not supported"), "{msg}");
+        // 非数组类型手误 → 同样拒启，不静默丢
+        assert!(StackOptions::parse_json(br#"{"autoSystemWfpBlockLeak":"dns"}"#).is_err());
+        // 空数组 = 无操作，放行
+        assert!(StackOptions::parse_json(br#"{"autoSystemWfpBlockLeak":[]}"#).is_ok());
     }
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]

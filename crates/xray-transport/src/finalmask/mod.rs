@@ -1123,6 +1123,22 @@ fn build_custom_udp(
 
 /// Go `NoiseMask.Build` → `noise::NoiseConfig`。
 fn build_noise_config(settings: &serde_json::Value) -> io::Result<noise::NoiseConfig> {
+    // Go NoiseMask.script（transport_finalmask.go:313）走 xlua 编译的噪声脚本；
+    // Rust 无 Lua 运行时，非空 script 显式拒绝而非静默忽略（票 5std M14，alwc
+    // fail-loud 模式——静默丢 = 整个噪声掩码不生效）。空串/null = 未设置
+    // （Go `if c.Script != ""` 同语义），放行。
+    if let Some(s) = settings.get("script") {
+        let requested = match s {
+            serde_json::Value::String(x) => !x.is_empty(),
+            serde_json::Value::Null => false,
+            _ => true,
+        };
+        if requested {
+            return Err(mask_err(
+                "noise script (Lua) is not supported by this build; remove the \"script\" key or use \"noise\" items instead",
+            ));
+        }
+    }
     let (reset_min, reset_max) = json_range(settings, "reset")?;
     let empty: Vec<serde_json::Value> = Vec::new();
     let mut items = Vec::new();
@@ -1442,6 +1458,36 @@ fn build_realm_config(settings: &serde_json::Value) -> io::Result<realm::Config>
         let (h, p) = split_host_port(s)?;
         if h.is_empty() || p.is_none() {
             return Err(mask_err(format!("realm: invalid stunServer {s:?}")));
+        }
+    }
+    // Go RealmConfig.ipMode（transport_finalmask.go:1012；消费 realm/client.go:39、
+    // server.go:63）与 portMapping（:1013，NAT 端口映射）：Rust 端均无对应能力
+    // （票 5std M16/M17），非缺省值显式拒绝而非静默忽略。ipMode=""/null、
+    // portMapping.enabled=false/缺省在 Go 侧同为无操作，放行不构成静默丢。
+    if let Some(m) = settings.get("ipMode") {
+        let requested = match m {
+            serde_json::Value::String(x) => !x.is_empty(),
+            serde_json::Value::Null => false,
+            _ => true,
+        };
+        if requested {
+            return Err(mask_err(
+                "realm: \"ipMode\" is not supported by this build; remove the key",
+            ));
+        }
+    }
+    if let Some(pm) = settings.get("portMapping") {
+        let requested = match pm {
+            serde_json::Value::Object(o) => {
+                o.get("enabled").and_then(|x| x.as_bool()).unwrap_or(false)
+            },
+            serde_json::Value::Null => false,
+            _ => true,
+        };
+        if requested {
+            return Err(mask_err(
+                "realm: \"portMapping\" is not supported by this build; remove the key or set enabled=false",
+            ));
         }
     }
     Ok(realm::Config {
@@ -2245,6 +2291,22 @@ mod tests {
         assert!(parse_noise_exp("<b zzzz>").is_err());
     }
 
+    /// 票 5std M14：noise 顶层 `script`（Go NoiseMask.script，xlua 编译）非空
+    /// 硬错，不再静默丢（静默 = 整个噪声掩码不生效）；空串/null = 未设置，放行。
+    #[test]
+    fn parse_json_noise_script_rejected_loudly() {
+        // Go transport_finalmask_noise_test.go:179 同款输入形态
+        let e = build_noise_config(&fm(r#"{"reset":{"from":30,"to":60},"script":"noise.lua"}"#))
+            .unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("script"), "{msg}");
+        assert!(msg.contains("not supported"), "{msg}");
+        // 类型手误（数字）→ 同样拒启，不静默丢
+        assert!(build_noise_config(&fm(r#"{"script":123}"#)).is_err());
+        // 空串 = 未设置，放行（Go `if c.Script != ""`）
+        build_noise_config(&fm(r#"{"script":""}"#)).unwrap();
+    }
+
     #[test]
     fn parse_json_sudoku_config_fields() {
         let cfg = build_sudoku_config(&fm(r#"{"password":"pw","ascii":"prefer_ascii",
@@ -2341,6 +2403,42 @@ mod tests {
         assert!(!http.use_tls);
         // 缺 stunServers 报错（对齐 Go）
         assert!(build_realm_config(&fm(r#"{"url":"realm://t@h.com/id"}"#)).is_err());
+    }
+
+    /// 票 5std M16/M17：realm `ipMode` / `portMapping` 非缺省值硬错（Rust 无
+    /// 对应能力，静默忽略 = NAT 打洞/IP 模式行为与配置意图不符）；
+    /// ipMode="" 与 portMapping.enabled=false 在 Go 侧同为无操作，放行。
+    #[test]
+    #[allow(clippy::err_expect)] // 存量清零批次：测试断言期 expect（realm::Config 无 Debug，禁 expect_err）
+    fn parse_json_realm_ip_mode_and_port_mapping_rejected_loudly() {
+        let base = r#"{"url":"realm://tok@h.example.com/id","stunServers":["s:1"]}"#;
+        // ipMode 非空 → 拒（Go IPMode 消费点 realm/client.go:39）
+        let e = build_realm_config(&fm(
+            r#"{"url":"realm://tok@h.example.com/id","stunServers":["s:1"],"ipMode":"auto64"}"#,
+        ))
+        .err()
+        .expect("non-empty ipMode must reject");
+        assert!(e.to_string().contains("ipMode"), "{e}");
+        // portMapping.enabled=true → 拒（Go NAT 端口映射）
+        let e = build_realm_config(&fm(
+            r#"{"url":"realm://tok@h.example.com/id","stunServers":["s:1"],"portMapping":{"enabled":true}}"#,
+        ))
+        .err()
+        .expect("portMapping enabled=true must reject");
+        assert!(e.to_string().contains("portMapping"), "{e}");
+        // 非对象类型手误 → 同样拒启，不静默丢
+        let e = build_realm_config(&fm(
+            r#"{"url":"realm://tok@h.example.com/id","stunServers":["s:1"],"portMapping":1}"#,
+        ))
+        .err()
+        .expect("non-object portMapping must reject");
+        assert!(e.to_string().contains("portMapping"), "{e}");
+        // Go 缺省语义放行：ipMode="" / enabled=false / 缺省
+        build_realm_config(&fm(
+            r#"{"url":"realm://tok@h.example.com/id","stunServers":["s:1"],"ipMode":"","portMapping":{"enabled":false}}"#,
+        ))
+        .unwrap();
+        build_realm_config(&fm(base)).unwrap();
     }
 
     #[test]
