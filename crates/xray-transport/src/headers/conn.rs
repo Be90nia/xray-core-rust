@@ -100,7 +100,10 @@ impl<C> HeaderConn<C> {
     }
 }
 
-impl<C: Connection + Unpin> AsyncRead for HeaderConn<C> {
+// IO 层只用 AsyncRead/AsyncWrite（非 Connection 全集）：让裸 TcpStream /
+// rustls TlsStream（无 Connection 实现）也能包装——Go hub.go:106-113 把
+// authConfig.Server 套在 tls.Server 之后，serve 层拿到的是 TLS 流。
+impl<C: AsyncRead + Unpin> AsyncRead for HeaderConn<C> {
     /// 对应 Go `Conn.Read`（http.go:182-203）：one-time 读对端 header，
     /// 回放其后 payload，之后透传。
     fn poll_read(
@@ -171,7 +174,7 @@ impl<C: Connection + Unpin> AsyncRead for HeaderConn<C> {
     }
 }
 
-impl<C: Connection + Unpin> AsyncWrite for HeaderConn<C> {
+impl<C: AsyncWrite + Unpin> AsyncWrite for HeaderConn<C> {
     /// 对应 Go `Conn.Write`（http.go:206-216）：首写先发完 header 前缀再发 payload。
     fn poll_write(
         self: Pin<&mut Self>,
@@ -272,6 +275,67 @@ pub fn wrap_client(conn: Box<dyn Connection>, auth: &HttpAuthenticator) -> Box<d
 /// v.authConfig.Server(conn)`）。
 pub fn wrap_server(conn: Box<dyn Connection>, auth: &HttpAuthenticator) -> Box<dyn Connection> {
     Box::new(HeaderConn::server(conn, auth))
+}
+
+/// 入站单连接按需包装：`Some` → [`HeaderConn::server`]，`None` → 原连接直通。
+///
+/// 供 plain-TCP serve 层使用（Go `hub.go:106-113` 服务端序：TLS/REALITY 解包
+/// **之后** `authConfig.Server`——伪装在 TLS 隧道内）。`None` 分支零包装，
+/// 未配置 `tcpSettings.header` 时与既有路径逐字节一致。
+#[must_use]
+pub fn maybe_wrap_server<C>(conn: C, auth: Option<&HttpAuthenticator>) -> MaybeHeaderConn<C> {
+    match auth {
+        Some(a) => MaybeHeaderConn::Wrapped(HeaderConn::server(conn, a)),
+        None => MaybeHeaderConn::Plain(conn),
+    }
+}
+
+/// [`maybe_wrap_server`] 的返回形态：无伪装头时零包装直通。
+pub enum MaybeHeaderConn<C> {
+    /// 未配置 `tcpSettings.header`：原连接直通（零层包装）。
+    Plain(C),
+    /// 已包 [`HeaderConn::server`]（含 shutdown 前 404/400 错误响应语义）。
+    Wrapped(HeaderConn<C>),
+}
+
+impl<C: AsyncRead + Unpin> AsyncRead for MaybeHeaderConn<C> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(c) => Pin::new(c).poll_read(cx, buf),
+            Self::Wrapped(c) => Pin::new(c).poll_read(cx, buf),
+        }
+    }
+}
+
+impl<C: AsyncWrite + Unpin> AsyncWrite for MaybeHeaderConn<C> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(c) => Pin::new(c).poll_write(cx, buf),
+            Self::Wrapped(c) => Pin::new(c).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(c) => Pin::new(c).poll_flush(cx),
+            Self::Wrapped(c) => Pin::new(c).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(c) => Pin::new(c).poll_shutdown(cx),
+            Self::Wrapped(c) => Pin::new(c).poll_shutdown(cx),
+        }
+    }
 }
 
 // ===== JSON 构建 =====

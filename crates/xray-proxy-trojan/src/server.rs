@@ -463,6 +463,8 @@ pub async fn serve_trojan(
     );
 
     let local = listener.local_addr()?;
+    // tcpSettings.header 伪装头（Go hub.go:85-95 authConfig；TLS 解包后应用）。
+    let header = listener.header_auth().cloned();
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -476,6 +478,7 @@ pub async fn serve_trojan(
         let validator = Arc::clone(&validator);
         let fb_policy = fallbacks.clone();
         let tls = tls.clone();
+        let header = header.clone();
         tokio::spawn(async move {
             if let Some(acc) = tls {
                 match acc.accept(stream).await {
@@ -488,8 +491,15 @@ pub async fn serve_trojan(
                             .alpn_protocol()
                             .map(|p| String::from_utf8_lossy(p).into_owned())
                             .unwrap_or_default();
-                        let recorder =
-                            RecordingStream { inner: tls_stream, buf: Vec::with_capacity(256) };
+                        // Go hub.go:106-113：TLS 解包后 authConfig.Server（recorder 在其内，
+                        // 只见解伪装后的字节——对齐 Go transport 层先解、proxy 后读）。
+                        let recorder = RecordingStream {
+                            inner: xray_transport::headers::conn::maybe_wrap_server(
+                                tls_stream,
+                                header.as_deref(),
+                            ),
+                            buf: Vec::with_capacity(256),
+                        };
                         handle_trojan_connection(
                             recorder,
                             validator,
@@ -506,7 +516,13 @@ pub async fn serve_trojan(
                     Err(e) => warn!(error = %e, "trojan TLS accept failed"),
                 }
             } else {
-                let recorder = RecordingStream { inner: stream, buf: Vec::with_capacity(256) };
+                let recorder = RecordingStream {
+                    inner: xray_transport::headers::conn::maybe_wrap_server(
+                        stream,
+                        header.as_deref(),
+                    ),
+                    buf: Vec::with_capacity(256),
+                };
                 handle_trojan_connection(
                     recorder,
                     validator,

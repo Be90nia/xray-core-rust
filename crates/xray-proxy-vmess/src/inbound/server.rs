@@ -163,6 +163,9 @@ pub async fn serve_vmess(
         "vmess inbound listening"
     );
 
+    // tcpSettings.header 伪装头（Go hub.go:85-95 authConfig；TLS 解包后应用）。
+    let header = listener.header_auth().cloned();
+
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -176,12 +179,18 @@ pub async fn serve_vmess(
         let validator = Arc::clone(&validator);
         let history = Arc::clone(&history);
         let tls = tls.clone();
+        let header = header.clone();
         tokio::spawn(async move {
             let result = if let Some(acc) = tls {
                 match acc.accept(stream).await {
                     Ok(tls_stream) => {
-                        handle_connection(
+                        // Go hub.go:106-113：TLS 解包后 authConfig.Server（伪装在 TLS 隧道内）。
+                        let conn = xray_transport::headers::conn::maybe_wrap_server(
                             tls_stream,
+                            header.as_deref(),
+                        );
+                        handle_connection(
+                            conn,
                             &handler,
                             &validator,
                             &history,
@@ -197,7 +206,9 @@ pub async fn serve_vmess(
                 }
             } else {
                 // Go：裸 TCP/Unix 连接认证失败时 drain 防时序指纹；TLS 连接不 drain
-                handle_connection(stream, &handler, &validator, &history, true, handshake_timeout)
+                let conn =
+                    xray_transport::headers::conn::maybe_wrap_server(stream, header.as_deref());
+                handle_connection(conn, &handler, &validator, &history, true, handshake_timeout)
                     .await
             };
             if let Err(e) = result {

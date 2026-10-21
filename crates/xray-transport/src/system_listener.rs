@@ -466,6 +466,10 @@ pub async fn listen_system(
 pub struct InboundTcpListener {
     inner: TokioTcpListener,
     sockopt: SocketOptions,
+    /// `tcpSettings.header` 伪装头 authenticator（Go hub.go:85-95 `l.authConfig`）。
+    /// plain-TCP 装配由 xray-core 注入；serve 层按 Go keepAccepting 顺序在
+    /// TLS/REALITY 解包后应用。`None` → 不包装（零开销）。
+    header: Option<Arc<crate::headers::http::HttpAuthenticator>>,
 }
 
 impl InboundTcpListener {
@@ -475,7 +479,7 @@ impl InboundTcpListener {
     /// bind 失败时返回 `io::Error`。
     pub async fn bind(addr: &str, sockopt: SocketOptions) -> io::Result<Self> {
         // bd hjtt：统一走 backlog=1024 helper（tokio 缺省 128 生产 listen overflow）。
-        Ok(Self { inner: bind_tcp_listener(addr, LISTEN_BACKLOG).await?, sockopt })
+        Ok(Self { inner: bind_tcp_listener(addr, LISTEN_BACKLOG).await?, sockopt, header: None })
     }
 
     /// 监听器本地地址（serve 层日志 / local addr 兜底用）。
@@ -487,7 +491,26 @@ impl InboundTcpListener {
     /// 与 [`DefaultListener::from_tokio`] 对称。
     #[must_use]
     pub fn from_tokio(inner: TokioTcpListener, sockopt: SocketOptions) -> Self {
-        Self { inner, sockopt }
+        Self { inner, sockopt, header: None }
+    }
+
+    /// 注入 `tcpSettings.header` 伪装头 authenticator（`None` → 清除）。
+    ///
+    /// 对应 Go `hub.go:85-95` `l.authConfig`；serve 层按 Go `keepAccepting`
+    /// （hub.go:106-113）顺序在 TLS 解包后应用。
+    #[must_use]
+    pub fn with_header_auth(
+        mut self,
+        auth: Option<Arc<crate::headers::http::HttpAuthenticator>>,
+    ) -> Self {
+        self.header = auth;
+        self
+    }
+
+    /// 已注入的 `tcpSettings.header` 伪装 authenticator（未配置 → `None`）。
+    #[must_use]
+    pub fn header_auth(&self) -> Option<&Arc<crate::headers::http::HttpAuthenticator>> {
+        self.header.as_ref()
     }
 
     /// accept 一个连接并应用 inbound sockopt（TCP_NODELAY / keepalive 等）。
