@@ -17,13 +17,15 @@
 //!
 //! 需管理员：UAC 提权运行（`Start-Process -Verb RunAs`）。
 
-use std::fs::File;
-use std::io::Write;
-use std::process::Command;
+// wfp 是 Windows 专有：以下 helper 仅 Windows main 消费，非 Windows stub 单元不参与编译。
+#[cfg(target_os = "windows")]
+use std::{fs::File, io::Write, process::Command};
 
 /// 日志写入器（带 flush，便于提权进程运行时外部读取）。
+#[cfg(target_os = "windows")]
 struct Log(File);
 
+#[cfg(target_os = "windows")]
 impl Log {
     fn new(path: &str) -> Self {
         let f = File::create(path).expect("create log file");
@@ -37,6 +39,7 @@ impl Log {
 }
 
 /// 统计 `netsh wfp show filters` 输出里出现我们过滤器显示名的次数。
+#[cfg(target_os = "windows")]
 fn count_our_filters() -> (usize, usize) {
     let out = Command::new("netsh").args(["wfp", "show", "filters"]).output();
     let Ok(out) = out else {

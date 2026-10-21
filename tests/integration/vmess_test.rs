@@ -352,13 +352,8 @@ async fn vmess_e2e_native_udp() {
     let echo_addr: SocketAddr = echo_sock.local_addr().unwrap();
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
-        loop {
-            match echo_sock.recv_from(&mut buf).await {
-                Ok((n, from)) => {
-                    let _ = echo_sock.send_to(&buf[..n], from).await;
-                },
-                Err(_) => break,
-            }
+        while let Ok((n, from)) = echo_sock.recv_from(&mut buf).await {
+            let _ = echo_sock.send_to(&buf[..n], from).await;
         }
     });
 
