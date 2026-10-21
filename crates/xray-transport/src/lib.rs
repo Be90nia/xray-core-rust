@@ -32,6 +32,7 @@ pub mod bridge;
 pub mod cnc;
 pub mod connection;
 pub mod dialer;
+pub mod dns_skip;
 pub mod fallback;
 pub mod link;
 pub mod listener;

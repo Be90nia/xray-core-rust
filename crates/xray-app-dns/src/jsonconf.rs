@@ -1176,17 +1176,22 @@ mod tests {
         fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
             meta.level() <= &tracing::Level::WARN
         }
+
         fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
             tracing::span::Id::from_u64(1)
         }
+
         fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
         fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
         fn event(&self, event: &tracing::Event<'_>) {
             struct Fmt(String);
             impl tracing::field::Visit for Fmt {
                 fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
                     self.0.push_str(&format!("{}={value} ", field.name()));
                 }
+
                 fn record_debug(
                     &mut self,
                     field: &tracing::field::Field,
@@ -1199,7 +1204,9 @@ mod tests {
             event.record(&mut v);
             self.0.lock().unwrap().push(v.0);
         }
+
         fn enter(&self, _span: &tracing::span::Id) {}
+
         fn exit(&self, _span: &tracing::span::Id) {}
     }
 

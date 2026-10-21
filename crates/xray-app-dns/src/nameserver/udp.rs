@@ -179,6 +179,12 @@ impl UdpNameServer {
             .await
             .map_err(|e| DnsError::WireFormat(format!("udp resolve: {e}")))?;
 
+        // TUN 接管的 DNS 服务器：Xray 自身上游查询拒拨（Go localdns
+        // client.go:99-103 同语义），防查询经 TUN 绕回自身。
+        if xray_transport::dns_skip::is_skipped_dns_query(sock_addr) {
+            return Err(DnsError::WireFormat(format!("skipped DNS server {sock_addr}")));
+        }
+
         // 绑定任意本地端口。失败多为系统 fd 限制。
         let sock = UdpSocket::bind("0.0.0.0:0")
             .await

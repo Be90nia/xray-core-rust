@@ -325,6 +325,14 @@ pub(crate) async fn connect_stream(
     // Go net.Dialer 同语义）。
     let mut last_err: Option<io::Error> = None;
     for sock_addr in &addrs {
+        // TUN 接管的 DNS 服务器：Xray 自身上游查询拒拨（Go localdns
+        // client.go:99-103 同语义），跳过该候选试后续地址。
+        if xray_transport::dns_skip::is_skipped_dns_query(*sock_addr) {
+            tracing::debug!(target: "xray.dns.doh", what = %what, addr = %sock_addr,
+                "skipped DNS server");
+            last_err = Some(io::Error::other(format!("skipped DNS server {sock_addr}")));
+            continue;
+        }
         match tokio::time::timeout(query_timeout, tokio::net::TcpStream::connect(sock_addr)).await {
             Ok(Ok(tcp)) => {
                 return Ok(Box::new(xray_transport::connection::TcpConnection::new(tcp)));
@@ -586,5 +594,77 @@ mod tests {
             r_res.expect("满管道读未在 10s 内完成（疑似丢唤醒挂死）").expect("reader task failed");
         assert_eq!(received.len(), TOTAL, "满管道下写入的字节必须全部可达远端");
         assert_eq!(received, expected, "字节必须逐一致（无丢失/重复/错序）");
+    }
+
+    /// dns_skip 测试的进程级集合守卫：测试退出即清除，防串扰其他用例。
+    struct SkipDnsGuard;
+    impl Drop for SkipDnsGuard {
+        fn drop(&mut self) {
+            xray_transport::dns_skip::skip_dns_servers(&[]);
+        }
+    }
+
+    /// TUN 接管场景行为测例（Go localdns client.go:99-103 拒拨语义）：带上游查询
+    /// 标记的直连拨号命中进程级 skip 集合 → 拒拨；集合清除后同目标恢复正常连接
+    /// （默认零影响）。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
+    async fn skipped_dns_server_rejected_on_direct_dial() {
+        let _slot = DIALER_SLOT_LOCK.lock();
+        let _skip = SkipDnsGuard;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = listener.local_addr().unwrap();
+        let dest = Destination::tcp(Address::from(server.ip()), Port::new(server.port()));
+        let resolver = SystemHostResolver;
+        xray_transport::dns_skip::skip_dns_servers(&[server.ip()]);
+
+        // 模拟「DNS 查询经出站发出」：带标记的上游查询 task 直连被 skip 的服务器。
+        // （Ok 值 Box<dyn Connection> 无 Debug，expect_err 不可用，match 形态。）
+        let err = match xray_transport::dns_skip::scope_dns_upstream_query(async {
+            connect_stream(&dest, &resolver, Duration::from_secs(2), "tcp", true).await
+        })
+        .await
+        {
+            Ok(_) => panic!("被 skip 的 DNS 服务器应拒拨"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("skipped DNS server"), "unexpected error: {err}");
+
+        // 集合清除（Go SkipDNSServers(nil) 语义）→ 同目标正常连接。
+        xray_transport::dns_skip::skip_dns_servers(&[]);
+        let stream = xray_transport::dns_skip::scope_dns_upstream_query(async {
+            connect_stream(&dest, &resolver, Duration::from_secs(2), "tcp", true).await
+        })
+        .await
+        .expect("集合清除后同目标应正常连接（默认零影响）");
+        drop(stream);
+    }
+
+    /// task-local 隔离：同一目标同一时刻，带标记 task 拒拨、不带标记 task 正常
+    /// 连接——并发互不串味（用户流量拨 DNS 服务器不受 skip 判定影响）。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
+    async fn dns_skip_scope_isolation_across_tasks() {
+        let _slot = DIALER_SLOT_LOCK.lock();
+        let _skip = SkipDnsGuard;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = listener.local_addr().unwrap();
+        let make_dest =
+            move || Destination::tcp(Address::from(server.ip()), Port::new(server.port()));
+        xray_transport::dns_skip::skip_dns_servers(&[server.ip()]);
+
+        let marked = tokio::spawn(xray_transport::dns_skip::scope_dns_upstream_query(async move {
+            connect_stream(&make_dest(), &SystemHostResolver, Duration::from_secs(2), "tcp", true)
+                .await
+                .is_err()
+        }));
+        let plain = tokio::spawn(async move {
+            connect_stream(&make_dest(), &SystemHostResolver, Duration::from_secs(2), "tcp", true)
+                .await
+                .is_ok()
+        });
+        let (marked, plain) = tokio::join!(marked, plain);
+        assert!(marked.unwrap(), "带标记 task 应拒拨被 skip 服务器");
+        assert!(plain.unwrap(), "不带标记 task 不受影响，应正常连接");
     }
 }

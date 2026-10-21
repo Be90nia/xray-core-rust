@@ -159,8 +159,9 @@ impl StreamSettings {
             .and_then(|k| {
                 if k == "tcpSettings" {
                     // Go transport_internet.go:135-136：`rawSettings` 非空时直接覆盖
-                    // `tcpSettings`（`if c.RAWSettings != nil { c.TCPSettings = c.RAWSettings }`）。
-                    // 仅作用于 tcp/raw 协议的 settings 选择，不影响 ws/grpc 等其他 transport。
+                    // `tcpSettings`（`if c.RAWSettings != nil { c.TCPSettings = c.RAWSettings
+                    // }`）。 仅作用于 tcp/raw 协议的 settings 选择，不影响
+                    // ws/grpc 等其他 transport。
                     match v.get("rawSettings") {
                         Some(raw) if !raw.is_null() => Some(raw.clone()),
                         _ => v.get(k).cloned(),
