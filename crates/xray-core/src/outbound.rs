@@ -5653,11 +5653,13 @@ mod tests {
         let echo_addr = std::env::var("XRAY_ECHO_ADDR").expect("XRAY_ECHO_ADDR");
         let (echo_ip, echo_port) = echo_addr.rsplit_once(':').expect("echo ip:port");
         let echo_port: u16 = echo_port.parse().expect("echo port");
+        let (go_host, go_port) = go_addr.rsplit_once(':').expect("go addr ip:port");
 
         let ob = BuiltOutbound {
             entry: BuiltEntry {
                 kind: "socks".into(),
-                data: format!(r#"{{"servers":[{{"address":"{go_addr}"}}]}}"#).into_bytes(),
+                data: format!(r#"{{"servers":[{{"address":"{go_host}","port":{go_port}}}]}}"#)
+                    .into_bytes(),
             },
             tag: "socks-udp-out".into(),
             send_through: None,
