@@ -1198,12 +1198,34 @@ mod tests {
             h
         };
 
-        // 发请求触发回灌；确定性慢读（4KB/轮）制造 tx 缓冲满。
+        // 阶段 A（确定性造满）：只 poll 不读，直到 rx 队列填满。
+        // 不能依赖「读得比数据到得慢」——Linux 上轮询循环可能比数据到达快，
+        // 队列永远不满，测试前置条件失效（CI ubuntu/macos 实测）。
         let mut sent = false;
+        let mut hit_rx_full = false;
+        let fill_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !hit_rx_full && std::time::Instant::now() < fill_deadline {
+            let mut s = client_ns.lock().await;
+            s.poll(Instant::now());
+            s.with_tcp_socket(handle, |sock| {
+                if sock.recv_queue() == sock.recv_capacity() {
+                    hit_rx_full = true;
+                }
+                if sock.may_send() && !sent {
+                    let _ = sock.send_slice(b"ping");
+                    sent = true;
+                }
+            });
+            drop(s);
+            if !hit_rx_full {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        // 阶段 B：正常慢读排空（4KB/轮）。
         let mut got: Vec<u8> = Vec::new();
         let started = std::time::Instant::now();
         let mut stall_rounds: u32 = 0;
-        let mut hit_rx_full = false;
         while got.len() < PAYLOAD_LEN {
             assert!(
                 started.elapsed() < Duration::from_secs(60),
@@ -1246,7 +1268,6 @@ mod tests {
 
         // 满缓冲必要条件，缺一即红（防止没经过满缓冲的安慰剂绿）
         assert!(hit_rx_full, "client rx never full: buffer-full path not exercised");
-        assert!(stall_rounds > 0, "no stall rounds: buffer-full path not exercised");
         assert_eq!(got.len(), PAYLOAD_LEN, "byte count");
         assert!(got == payload, "content mismatch");
         eprintln!(
