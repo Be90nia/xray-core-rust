@@ -853,9 +853,10 @@ mod tests {
 
         let (advanced, result) = run_paused_query(srv, "hang.com.").await;
         assert!(result.is_err());
-        // 显式 2s 生效（若兜底 5s 泄漏会停在 ~5.x s）。
+        // 显式 2s 生效（若兜底 5s 泄漏会停在 ~5.x s）。上界给到兜底之下：
+        // 负载 runner 上暂停时钟随真实时间爬行，实测可到 3.2s（CI run 39592783255）。
         assert!(
-            advanced >= Duration::from_millis(1500) && advanced <= Duration::from_secs(3),
+            advanced >= Duration::from_millis(1500) && advanced < Duration::from_secs(5),
             "explicit 2s must win over 5s fallback, advanced={advanced:?}"
         );
     }
