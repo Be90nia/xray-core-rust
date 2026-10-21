@@ -216,6 +216,11 @@ where
         }
         // ponytail: 立即 poll_flush 让数据发到 TCP，避免调用方必须显式 flush。
         // WS 代理语义：每条消息对应独立帧，应即时发送（对齐 Go WriteMessage）。
+        // bd dppv 备注：flush Pending 时按缓冲 sink 惯例报 Ready(Ok(len))（buf 已被
+        // tungstenite 写缓冲消费）；此形态在「mask 包住 ws 握手」新层序 + >8KB 载荷
+        // 下有写缓冲积压残留（见 register.rs dial_ws_finalmask_large_payload_roundtrip
+        // 复现床），修法需诚实 Pending + 已入队标记，且重试路径不得二次 start_send
+        // （盲改引入过双发损坏，已回滚）——留给后续票。
         match guard.poll_flush_unpin(cx) {
             Poll::Ready(Ok(())) | Poll::Pending => Poll::Ready(Ok(buf.len())),
             Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),

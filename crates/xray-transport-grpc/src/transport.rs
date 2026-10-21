@@ -138,6 +138,11 @@ pub async fn dial(
     // 到期返回 Err(TimedOut)。
     // shortcut: policy Handshake(60s) 未接线到 transport 层（dial 只见 grpcSettings，
     // Go 侧 policy 属全局配置层），取 DefaultDialTimeout；接线后此处应优先取 policy 值。
+    // finalmask（bd dppv）：Go grpc/dial.go:129-135 WrapConnClient——TCP 建立
+    // 后、TLS/h2 之前套上（首字节 = mask 头而非 HTTP/2 preface）。空 manager = 恒等。
+    let tcpmask = xray_transport::finalmask::build_tcpmask_manager_from_json(
+        settings.finalmask_json.as_ref(),
+    )?;
     let attempt_budget = xray_transport::system_dialer::DEFAULT_DIAL_TIMEOUT;
     let connected = tokio::time::timeout(attempt_budget, async {
         let mut attempt: u32 = 0;
@@ -149,6 +154,7 @@ pub async fn dial(
                 &cfg,
                 tls.as_ref(),
                 security_json,
+                &tcpmask,
             )
             .await
             {
@@ -166,11 +172,8 @@ pub async fn dial(
     })
     .await;
     match connected {
-        Ok(Ok(conn)) => {
-            // Tcpmask（Go grpc/dial.go:129-135：`TcpmaskManager.WrapConnClient`，
-            // security/protocol 栈建立后链式应用 finalmask_json.tcp[]）。
-            xray_transport::finalmask::wrap_conn_client_from_settings(settings, conn)
-        },
+        // finalmask 已在 connect_once 内（TCP 后、TLS/h2 前）套上（bd dppv）。
+        Ok(Ok(conn)) => Ok(conn),
         Ok(Err(e)) => Err(e),
         Err(_elapsed) => Err(io::Error::new(io::ErrorKind::TimedOut, "grpc dial timeout")),
     }
@@ -194,6 +197,7 @@ async fn connect_once(
     cfg: &Config,
     tls: Option<&TlsDialReady>,
     security_json: Option<&serde_json::Value>,
+    tcpmask: &xray_transport::finalmask::TcpmaskManager,
 ) -> io::Result<Box<dyn Connection>> {
     // r7a9：拨号外层 timeout 包装。Go xray-core system_dialer 用 DefaultSystemDialer
     // 16s 超时；这里与 system_dialer::DEFAULT_DIAL_TIMEOUT 对齐（与 hysteria/quic 拨号同源）。
@@ -208,13 +212,18 @@ async fn connect_once(
     // bd 88m0/0kqj 客户端侧：下行 SO_RCVBUF 缺省 16MB（窗钉修复；失败即拨号失败，
     // 对齐 dial_system sockopt 语义）。
     xray_transport::sockopt::apply_client_dial_rcvbuf(&tcp)?;
+    // finalmask（bd dppv）：TCP 建立后、TLS/h2 之前（Go dial.go:129-135 层序，
+    // 首字节 = mask 头而非 HTTP/2 preface）。空 manager = 恒等。
+    let conn: Box<dyn Connection> = xray_transport::finalmask::wrap_conn_client_into_connection(
+        tcpmask,
+        Box::new(xray_transport::connection::TcpConnection::new(tcp)),
+    )?;
     match tls {
         Some(t) => {
-            let tcp_conn = xray_transport::connection::TcpConnection::new(tcp);
             let tls_stream: Box<dyn Connection> = match t.fingerprint {
                 Some(fp) => Box::new(
                     xray_tls::utls::u_client(
-                        tcp_conn,
+                        conn,
                         &t.sni,
                         Arc::clone(&t.config),
                         fp,
@@ -225,14 +234,14 @@ async fn connect_once(
                     .map_err(io_err)?,
                 ),
                 None => Box::new(
-                    xray_tls::utls::client(tcp_conn, &t.sni, Arc::clone(&t.config))
+                    xray_tls::utls::client(conn, &t.sni, Arc::clone(&t.config))
                         .await
                         .map_err(io_err)?,
                 ),
             };
             dial_h2(tls_stream, uri.clone(), user_agent, cfg).await
         },
-        None => dial_h2(tcp, uri.clone(), user_agent, cfg).await,
+        None => dial_h2(conn, uri.clone(), user_agent, cfg).await,
     }
 }
 
@@ -514,30 +523,33 @@ pub async fn listen(
             tcp.set_nodelay(true).ok();
             let h = handler.clone();
             let tls = tls_cfg.clone();
-            let m = Some(tcpmask.clone());
+            let m = tcpmask.clone();
             let ep = expected_path.clone();
             let mm = multi_mode;
             let tr = trusted_for_task.clone();
             tokio::spawn(async move {
+                // finalmask（bd dppv）：Go grpc/hub.go:123-125 WrapListener——mask
+                // 在 TLS/h2 之下、最贴近 wire（首字节 = mask 头而非 HTTP/2
+                // preface）；wrap 失败丢弃该 conn。空 manager = 恒等。
+                let stream: Box<dyn Connection> =
+                    match xray_transport::finalmask::wrap_conn_server_into_connection(
+                        &m,
+                        Box::new(xray_transport::connection::TcpConnection::new(tcp)),
+                    ) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::debug!("grpc tcpmask wrap failed: {e}");
+                            return;
+                        },
+                    };
                 if let Some(tc) = tls {
                     let acc = tokio_rustls::TlsAcceptor::from(tc);
-                    if let Ok(c) = acc.accept(tcp).await {
-                        accept_h2(
-                            c,
-                            h,
-                            m,
-                            ep,
-                            mm,
-                            peer,
-                            &tr,
-                            ka_time,
-                            ka_timeout,
-                            keepalive_enabled,
-                        )
-                        .await
+                    if let Ok(c) = acc.accept(stream).await {
+                        accept_h2(c, h, ep, mm, peer, &tr, ka_time, ka_timeout, keepalive_enabled)
+                            .await
                     }
                 } else {
-                    accept_h2(tcp, h, m, ep, mm, peer, &tr, ka_time, ka_timeout, keepalive_enabled)
+                    accept_h2(stream, h, ep, mm, peer, &tr, ka_time, ka_timeout, keepalive_enabled)
                         .await;
                 }
             });
@@ -550,7 +562,6 @@ pub async fn listen(
 async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
     conn: T,
     handler: ConnHandler,
-    tcpmask: Option<Arc<xray_transport::finalmask::TcpmaskManager>>,
     expected_path: Option<String>,
     multi_mode: bool,
     peer: SocketAddr,
@@ -723,20 +734,9 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
             };
             let _ = tokio::try_join!(s, r);
         });
-        let conn: Box<dyn Connection> = match tcpmask.as_ref() {
-            Some(m) => match xray_transport::finalmask::wrap_conn_server_into_connection(
-                m,
-                Box::new(DuplexConn::with_remote(client, remote_addr)),
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::debug!("grpc tcpmask wrap failed: {e}");
-                    continue;
-                },
-            },
-            None => Box::new(DuplexConn::with_remote(client, remote_addr)),
-        };
-        h2(conn);
+        // finalmask 已在 accept 层（TLS/h2 之前）套上——此处只交付 hunk 管道
+        // （bd dppv）。
+        h2(Box::new(DuplexConn::with_remote(client, remote_addr)));
     }
 }
 
@@ -1383,6 +1383,7 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         };
+
         use xray_common::net::{address::Address, port::Port};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1451,6 +1452,7 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         };
+
         use xray_common::net::{address::Address, port::Port};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

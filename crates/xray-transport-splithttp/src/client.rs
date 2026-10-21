@@ -58,7 +58,7 @@ use tower_service::Service as TowerService;
 use tracing::debug;
 pub use xray_tls::fingerprint::Fingerprint;
 use xray_tls::utls::{ConnInterface, UConn};
-use xray_transport::connection::TcpConnection;
+use xray_transport::connection::{Connection, TcpConnection};
 
 use crate::{
     config::{Config, RequestMeta},
@@ -95,6 +95,9 @@ pub struct DialTarget {
 pub struct DestTcpConnector {
     host: std::sync::Arc<str>,
     port: u16,
+    /// finalmask TCP 伪装（bd dppv；None/空 manager = 恒等）——TCP 后、TLS 前
+    /// 套上（Go splithttp/dialer.go:127-134 dialContext 内 WrapConnClient）。
+    tcpmask: Option<Arc<xray_transport::finalmask::TcpmaskManager>>,
 }
 
 impl TowerService<Uri> for DestTcpConnector {
@@ -109,19 +112,28 @@ impl TowerService<Uri> for DestTcpConnector {
     fn call(&mut self, _uri: Uri) -> Self::Future {
         let host = std::sync::Arc::clone(&self.host);
         let port = self.port;
+        let tcpmask = self.tcpmask.clone();
         Box::pin(async move {
             let tcp = xray_transport::sockopt::dial_client_tcp((host.as_ref(), port)).await?;
             tcp.set_nodelay(true).ok();
             // bd 88m0/0kqj 客户端侧：下行 SO_RCVBUF 缺省 16MB（窗钉修复）。
             xray_transport::sockopt::apply_client_dial_rcvbuf(&tcp)?;
-            Ok(DestTcpStream(TokioIo::new(tcp)))
+            // finalmask（bd dppv）：TCP 后、TLS 前——首字节 = mask 头。
+            let conn: Box<dyn Connection> = match tcpmask.as_ref() {
+                Some(m) => xray_transport::finalmask::wrap_conn_client_into_connection(
+                    m,
+                    Box::new(TcpConnection::new(tcp)),
+                )?,
+                None => Box::new(TcpConnection::new(tcp)),
+            };
+            Ok(DestTcpStream(TokioIo::new(conn)))
         })
     }
 }
 
-/// [`DestTcpConnector`] 的连接类型：tokio TCP 流 + legacy `Connection` 元数据
-/// （HttpInfo 供 `open_stream` 的 remote/local addr 使用，对齐 HttpConnector 行为）。
-pub struct DestTcpStream(TokioIo<tokio::net::TcpStream>);
+/// [`DestTcpConnector`] 的连接类型：finalmask 包装的出站流 + legacy `Connection`
+/// 元数据（HttpInfo 供 `open_stream` 的 remote/local addr 使用，对齐 HttpConnector 行为）。
+pub struct DestTcpStream(TokioIo<Box<dyn Connection>>);
 
 impl hyper::rt::Read for DestTcpStream {
     fn poll_read(
@@ -202,6 +214,8 @@ pub struct BtlsDial {
     /// （allowInsecure/pinned/vcn 语义，见
     /// `xray_tls::client_config::build_server_cert_verifier`）。
     pub security_json: Option<serde_json::Value>,
+    /// finalmask TCP 伪装（bd dppv；None/空 manager = 恒等）——TCP 后、TLS 前。
+    pub tcpmask: Option<Arc<xray_transport::finalmask::TcpmaskManager>>,
 }
 
 /// [`SplitConnector`] 的统一 response 流。满足 hyper-util legacy Client 的
@@ -213,7 +227,7 @@ pub struct BtlsDial {
 pub enum SplitStream {
     Rustls(MaybeHttpsStream<DestTcpStream>),
     Btls {
-        io: TokioIo<UConn<TcpConnection>>,
+        io: TokioIo<UConn<Box<dyn Connection>>>,
         /// ALPN 协商出 `h2` 时 hyper 须走 HTTP/2（`Connected::negotiated_h2`）。
         alpn_h2: bool,
     },
@@ -250,8 +264,16 @@ impl TowerService<Uri> for SplitConnector {
                     tcp.set_nodelay(true).ok();
                     // bd 88m0/0kqj 客户端侧：下行 SO_RCVBUF 缺省 16MB（窗钉修复）。
                     xray_transport::sockopt::apply_client_dial_rcvbuf(&tcp)?;
+                    // finalmask（bd dppv）：TCP 后、指纹 TLS 前——首字节 = mask 头。
+                    let conn: Box<dyn Connection> = match dial.tcpmask.as_ref() {
+                        Some(m) => xray_transport::finalmask::wrap_conn_client_into_connection(
+                            m,
+                            Box::new(TcpConnection::new(tcp)),
+                        )?,
+                        None => Box::new(TcpConnection::new(tcp)),
+                    };
                     let conn = xray_tls::utls::u_client(
-                        TcpConnection::new(tcp),
+                        conn,
                         &dial.sni,
                         dial.config.clone(),
                         dial.fingerprint,
@@ -379,6 +401,7 @@ impl DefaultDialerClient {
         dial: DialTarget,
         fingerprint: Option<Fingerprint>,
         security_json: Option<serde_json::Value>,
+        tcpmask: Option<Arc<xray_transport::finalmask::TcpmaskManager>>,
     ) -> Self {
         // SNI 用 tlsSettings.serverName（Go WithDestination 等价：空回退 dest.host）。
         let sni = if dial.sni.is_empty() { dial.host.clone() } else { dial.sni };
@@ -392,6 +415,7 @@ impl DefaultDialerClient {
                 config: Arc::new(tls_config),
                 fingerprint: fp,
                 security_json,
+                tcpmask,
             })
         } else {
             // clear 只在 rustls 分支：btls 分支的 config 原样传给 u_client
@@ -407,6 +431,7 @@ impl DefaultDialerClient {
             let https = builder.enable_http1().enable_http2().wrap_connector(DestTcpConnector {
                 host: std::sync::Arc::from(dial.host.as_str()),
                 port: dial.port,
+                tcpmask,
             });
             SplitConnector::Rustls(https)
         };
@@ -954,6 +979,7 @@ mod tests {
             DialTarget { host: "127.0.0.1".into(), port: 0, sni: String::new() },
             None,
             None,
+            None,
         );
     }
 
@@ -984,6 +1010,7 @@ mod tests {
             config,
             client_tls(cert),
             DialTarget { host: "127.0.0.1".into(), port, sni: "127.0.0.1".into() },
+            None,
             None,
             None,
         ));
@@ -1035,6 +1062,7 @@ mod tests {
             config,
             client_tls(cert),
             DialTarget { host: "127.0.0.1".into(), port, sni: "127.0.0.1".into() },
+            None,
             None,
             None,
         );

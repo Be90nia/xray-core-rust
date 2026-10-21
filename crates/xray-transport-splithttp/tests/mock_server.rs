@@ -119,6 +119,7 @@ async fn dial_packet_up_end_to_end_via_mock_http1_server() {
         DialTarget { host: "127.0.0.1".into(), port: server_addr.port(), sni: String::new() },
         None,
         None,
+        None,
     ));
 
     let base_uri = format!("http://127.0.0.1:{}/", server_addr.port());
@@ -184,6 +185,7 @@ async fn post_packet_returns_bad_status_on_500() {
         DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
         None,
         None,
+        None,
     ));
     let base_uri = format!("http://127.0.0.1:{}/", addr.port());
 
@@ -227,6 +229,7 @@ async fn open_stream_get_non_200_yields_eof() {
         config,
         tls_config,
         DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
+        None,
         None,
         None,
     ));
@@ -341,6 +344,7 @@ async fn fingerprint_btls_end_to_end_http1() {
         DialTarget { host: "127.0.0.1".into(), port, sni: String::new() },
         Some(Fingerprint::Chrome),
         Some(serde_json::json!({"allowInsecure": true})),
+        None,
     ));
 
     let mut conn = dial_packet_up(
@@ -377,6 +381,7 @@ async fn fingerprint_btls_end_to_end_http2() {
         DialTarget { host: "127.0.0.1".into(), port, sni: String::new() },
         Some(Fingerprint::Chrome),
         Some(serde_json::json!({"allowInsecure": true})),
+        None,
     ));
 
     let mut conn = dial_packet_up(
@@ -452,6 +457,7 @@ async fn conn_drop_terminates_all_http_connections() {
         config,
         make_tls_config(),
         DialTarget { host: "127.0.0.1".into(), port: server_addr.port(), sni: String::new() },
+        None,
         None,
         None,
     ));
@@ -577,6 +583,7 @@ async fn bridge_eof_propagates_without_conn_idle() {
         config,
         make_tls_config(),
         DialTarget { host: "127.0.0.1".into(), port: server_addr.port(), sni: String::new() },
+        None,
         None,
         None,
     ));
@@ -721,6 +728,7 @@ async fn packet_up_end_to_end_tls_h2_via_serve_http_conn() {
         config,
         tls_config,
         DialTarget { host: "127.0.0.1".into(), port: server_addr.port(), sni: "127.0.0.1".into() },
+        None,
         None,
         None,
     ));
