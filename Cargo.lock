@@ -6384,6 +6384,8 @@ dependencies = [
  "tokio",
  "tracing",
  "tun-rs",
+ "uuid",
+ "windows-sys 0.59.0",
  "xray-app-dispatcher",
  "xray-buf",
  "xray-common",

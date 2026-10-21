@@ -27,3 +27,17 @@ async-trait = { workspace = true }
 # 签名可编译，create/recv/send 返回 Unsupported）。
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tun-rs = { workspace = true }
+
+# Windows WFP 泄漏过滤（票 5std M7）：Fwpm* / iphlpapi LUID / SDDL 安全描述符。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_NetworkManagement_Ndis",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_NetworkManagement_WindowsFilteringPlatform",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_SystemInformation",
+  "Win32_System_Rpc",
+] }
+uuid = { workspace = true }
