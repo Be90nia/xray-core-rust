@@ -791,24 +791,36 @@ fn build_protocol_handler(
         },
         "socks" => {
             let (server_addr, auth) = parse_socks_outbound_config(&ob.entry.data)?;
-            let client = Arc::new(match auth {
-                Some((u, p)) => xray_proxy_socks::SocksClient::new(
-                    xray_proxy_socks::ClientConfig::new_with_auth(server_addr, u, p),
-                ),
-                None => xray_proxy_socks::SocksClient::new(
-                    xray_proxy_socks::ClientConfig::new_noauth(server_addr),
-                ),
-            });
+            let udp_cfg = match auth {
+                Some((u, p)) => {
+                    xray_proxy_socks::ClientConfig::new_with_auth(server_addr.clone(), u, p)
+                },
+                None => xray_proxy_socks::ClientConfig::new_noauth(server_addr.clone()),
+            };
+            let client = Arc::new(xray_proxy_socks::SocksClient::new(udp_cfg.clone()));
             let dial_fn = xray_proxy_socks::make_socks_dial_fn(client);
-            wrap_bridge(
-                ob.tag.clone(),
-                dial_fn,
-                &proxy_chain_tag,
-                target_strategy,
-                dns,
-                send_through.as_ref(),
-                policy_manager,
-            )
+            // TCP 走 DialBridge（targetStrategy/sendThrough 经 dial_fn 包装）；
+            // UDP 票 ft58 S2：SocksUdpClient ASSOCIATE 会话 + udp::relay 泵，
+            // 此前 UDP 目的地被 DialBridge 当 TCP 载荷静默降级。
+            let dial_fn = match target_strategy {
+                Some(st) => wrap_dial_with_target_strategy(dial_fn, st, dns.cloned()),
+                None => dial_fn,
+            };
+            let dial_fn = match send_through {
+                Some(spec) => wrap_dial_with_send_through(dial_fn, spec.clone()),
+                None => dial_fn,
+            };
+            let tcp_bridge = Arc::new(DialBridge::new(ob.tag.clone(), dial_fn));
+            if let Some(pm) = policy_manager {
+                tcp_bridge.with_policy(
+                    xray_features::policy::PolicyManager::policy_for_level(pm, 0).timeout,
+                );
+            }
+            let dispatch =
+                SocksUdpDispatch { tag: ob.tag.clone(), tcp: Arc::clone(&tcp_bridge), udp_cfg };
+            let handler = Arc::new(dispatch) as Arc<dyn DispatchHandler>;
+            let bridge_ref = if proxy_chain_tag.is_some() { Some(tcp_bridge) } else { None };
+            Ok((handler, bridge_ref, proxy_chain_tag))
         },
         "mux" => {
             let (concurrency, via_tag) = parse_mux_config(&ob.entry.data)?;
@@ -3179,6 +3191,57 @@ fn dest_default_udp() -> Destination {
     )
 }
 
+// ============ SOCKS UDP dispatch bridge（票 ft58 S2）============
+
+/// SOCKS 出站 dispatch bridge：TCP 走 DialBridge，UDP 走 [`xray_proxy_socks::SocksUdpClient`]
+/// ASSOCIATE 会话（对应 Go `proxy/socks/client.go:112/142-160`；泵 = socks crate
+/// `udp::relay`，XUDP 帧流 ↔ SOCKS5 UDP 数据报）。此前 UDP 目的地被 DialBridge
+/// 当 TCP 载荷静默降级（ft58 S2 病根）。
+struct SocksUdpDispatch {
+    tag: String,
+    tcp: Arc<DialBridge>,
+    /// UDP ASSOCIATE 用配置（server 地址 + 可选认证；与 TCP dial 同源）。
+    udp_cfg: xray_proxy_socks::ClientConfig,
+}
+
+impl std::fmt::Debug for SocksUdpDispatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SocksUdpDispatch").field("tag", &self.tag).finish_non_exhaustive()
+    }
+}
+impl DispatchHandler for SocksUdpDispatch {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    fn dispatch(&self, dest: &Destination, link: Link) -> PinFuture<()> {
+        if dest.network() == xray_common::net::network::Network::UDP {
+            let cfg = self.udp_cfg.clone();
+            let tag = self.tag.clone();
+            let dest = dest.clone();
+            Box::pin(async move {
+                match xray_proxy_socks::SocksUdpClient::associate(&cfg).await {
+                    Ok(client) => {
+                        if let Err(e) = xray_proxy_socks::udp::relay(client, &dest, link).await {
+                            tracing::warn!(tag = %tag, "socks udp relay ended: {e}");
+                        }
+                    },
+                    // ft58 S2：关联失败显式报错并终止 link，不回退 TCP
+                    //（静默降级 = 假成功；link 随 drop 关闭，session 侧见 Ok(None)）。
+                    Err(e) => {
+                        tracing::error!(
+                            tag = %tag, error = %e,
+                            "socks udp associate failed; dropping link (no TCP fallback)"
+                        );
+                    },
+                }
+            })
+        } else {
+            self.tcp.dispatch(dest, link)
+        }
+    }
+}
+
 /// tuic outbound 解析结果（官方 tuic-client relay 配置子集，bd 7p0）。
 ///
 /// 字段与默认值对齐 Itsusinn/tuic（官方 TUIC 实现后继）client config.rs。
@@ -5494,6 +5557,143 @@ mod tests {
             }
         });
         (port, recorded)
+    }
+
+    // ===== SOCKS outbound UDP（ft58 S2）=====
+
+    /// SOCKS5 UDP echo server：no-auth 握手（udp_enabled）→ ASSOCIATE →
+    /// 把收到的 SOCKS5 UDP 帧原样回显（帧头 DST = 帧内目标）。
+    /// `served_cmd` 记录客户端请求的 CMD（ASSOCIATE=3 / CONNECT=1）——
+    /// 「走真 UDP 而非 TCP 降级」的判别器。返回 (端口, cmd 记录)。
+    async fn spawn_socks5_udp_echo() -> (u16, Arc<Mutex<Vec<u8>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served_cmd = Arc::new(Mutex::new(Vec::new()));
+        let cmd_out = Arc::clone(&served_cmd);
+        tokio::spawn(async move {
+            let Ok((mut ctrl, _)) = listener.accept().await else { return };
+            let config = xray_proxy_socks::ServerConfig { udp_enabled: true, ..Default::default() };
+            match xray_proxy_socks::socks5_server_handshake(&mut ctrl, &config).await {
+                Ok(xray_proxy_socks::server::SocksRequest::UdpAssociate(_, relay)) => {
+                    cmd_out.lock().push(xray_proxy_socks::CMD_UDP_ASSOCIATE);
+                    // relay socket 未 connect：必须 recv_from/send_to——connected 语义的
+                    // send 在 Windows 上失败即终止会话（run_udp_echo_server 同款形态）。
+                    let mut buf = vec![0u8; 65535];
+                    if let Ok((n, peer)) = relay.recv_from(&mut buf).await {
+                        if let Ok((dst, payload)) = xray_proxy_socks::decode_udp_packet(&buf[..n]) {
+                            let frame = xray_proxy_socks::encode_udp_packet(&dst, payload);
+                            let _ = relay.send_to(&frame, peer).await;
+                        }
+                    }
+                    // 保活 ctrl 至回包送达（SOCKS UDP 语义：ctrl 断则关联终结）
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                },
+                Ok(xray_proxy_socks::server::SocksRequest::TcpConnect(_)) => {
+                    cmd_out.lock().push(xray_proxy_socks::CMD_TCP_CONNECT);
+                },
+                _ => {},
+            }
+        });
+        (port, served_cmd)
+    }
+
+    /// e2e（ft58 S2）：socks outbound 的 UDP 目的地必须走 UDP ASSOCIATE relay，
+    /// 不得静默降级 TCP。链路：UdpDispatchSession → socks outbound（被测）→
+    /// 本地 SOCKS5 server(udp:true) → UDP 回显。
+    /// 判别器：server 记录到的 CMD 必须是 ASSOCIATE，且载荷经 relay 回显。
+    #[tokio::test]
+    async fn socks_outbound_udp_relays_via_associate_not_tcp_downgrade() {
+        let (socks_port, served_cmd) = spawn_socks5_udp_echo().await;
+        let ob = BuiltOutbound {
+            entry: BuiltEntry {
+                kind: "socks".into(),
+                data: format!(r#"{{"servers":[{{"address":"127.0.0.1","port":{socks_port}}}]}}"#)
+                    .into_bytes(),
+            },
+            tag: "socks-udp-out".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
+        };
+        let handler = build_single_outbound(&ob).expect("build socks outbound");
+
+        let dest = Destination::udp(Address::from_ipv4_bytes([10, 9, 8, 7]), Port::new(5353));
+        let payload = b"socks-udp-echo-ft58";
+        let mut session = xray_app_dispatcher::UdpDispatchSession::new(handler);
+        session.send_packet(&dest, payload).await.expect("send udp via socks outbound");
+
+        let (_, resp) =
+            match tokio::time::timeout(std::time::Duration::from_secs(5), session.recv_packet())
+                .await
+            {
+                Err(_) => panic!("timeout: no UDP echo back (TCP downgrade or associate failure)"),
+                Ok(Err(e)) => panic!("recv io error: {e}"),
+                Ok(Ok(None)) => panic!("udp session closed by outbound (associate failed?)"),
+                Ok(Ok(Some(pair))) => pair,
+            };
+        assert_eq!(resp, payload, "payload must round-trip via SOCKS5 UDP relay");
+        assert_eq!(
+            *served_cmd.lock(),
+            vec![xray_proxy_socks::CMD_UDP_ASSOCIATE],
+            "server must see UDP ASSOCIATE (cmd=3), got TCP CONNECT downgrade"
+        );
+    }
+
+    /// 互通探针（ft58 S2）：Rust socks outbound UDP 全链 ↔ Go xray socks inbound
+    /// (udp:true) → freedom → 本机 UDP echo。`#[ignore]`，由
+    /// `run_socks_udp_go_interop.py` 编排（env：`XRAY_GO_SOCKS_ADDR` / `XRAY_ECHO_ADDR`）。
+    /// 64 包变长 UDP 逐包往返，内容逐包比对；sha256 汇总在编排层（echo 收到的
+    /// 原始包流）打印。
+    #[tokio::test]
+    #[ignore = "needs Go xray socks server + echo（run_socks_udp_go_interop.py 编排）"]
+    async fn socks_outbound_udp_go_server_interop() {
+        let go_addr = std::env::var("XRAY_GO_SOCKS_ADDR").expect("XRAY_GO_SOCKS_ADDR");
+        let echo_addr = std::env::var("XRAY_ECHO_ADDR").expect("XRAY_ECHO_ADDR");
+        let (echo_ip, echo_port) = echo_addr.rsplit_once(':').expect("echo ip:port");
+        let echo_port: u16 = echo_port.parse().expect("echo port");
+
+        let ob = BuiltOutbound {
+            entry: BuiltEntry {
+                kind: "socks".into(),
+                data: format!(r#"{{"servers":[{{"address":"{go_addr}"}}]}}"#).into_bytes(),
+            },
+            tag: "socks-udp-out".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
+        };
+        let handler = build_single_outbound(&ob).expect("build socks outbound");
+        let dest = Destination::udp(
+            Address::from_ipv4_bytes(
+                echo_ip
+                    .split('.')
+                    .map(|o| o.parse().expect("echo octet"))
+                    .collect::<Vec<u8>>()
+                    .try_into()
+                    .expect("ipv4"),
+            ),
+            Port::new(echo_port),
+        );
+
+        let mut session = xray_app_dispatcher::UdpDispatchSession::new(handler);
+        let mut total_bytes = 0usize;
+        for i in 0..64u32 {
+            let payload = format!("socks-udp-go-interop-{i:04}-{}", "x".repeat((i % 512) as usize));
+            session.send_packet(&dest, payload.as_bytes()).await.expect("send udp");
+            let (_, resp) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), session.recv_packet())
+                    .await
+                    .unwrap_or_else(|_| panic!("packet {i}: no echo back (timeout)"))
+                    .expect("packet {i}: udp session closed by outbound")
+                    .unwrap_or_else(|| panic!("packet {i}: relay closed"));
+            assert_eq!(resp, payload.as_bytes(), "packet {i}: payload mismatch");
+            total_bytes += resp.len();
+        }
+        println!("interop ok: 64/64 packets round-trip, {total_bytes} bytes total");
     }
 
     /// e2e（bd enk）：transport 层代理——trojan-out 的底层 TCP 拨号经 socks-out
