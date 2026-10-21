@@ -5,10 +5,10 @@
 //!
 //! - **计划层**（本模块）：输入（接口列表、配置）→ 输出「路由/DNS 变更计划」
 //!   （增/删条目列表，平台无关数据结构 [`RoutePlan`] / [`DnsPlan`]）。
-//! - **执行器层**（[`executor`]）：把计划渲染成平台命令（`ip route` /
-//!   `route.exe` / `netsh` / `resolvectl`）。**渲染面**（`apply`/`rollback` →
-//!   [`Cmd`]）只拼参数不执行；**执行面**（`apply_exec`/`rollback_exec` →
-//!   [`Cmd::run`]）逐条真实 spawn 系统进程——**真实执行需管理员权限**。
+//! - **执行器层**（[`executor`]）：把计划渲染成平台命令（`ip route` / `route.exe` / `netsh` /
+//!   `resolvectl`）。**渲染面**（`apply`/`rollback` →
+//!   [`Cmd`]）只拼参数不执行；**执行面**（`apply_exec`/`rollback_exec` → [`Cmd::run`]）逐条真实
+//!   spawn 系统进程——**真实执行需管理员权限**。
 //!
 //! ## 安全边界
 //!
@@ -19,29 +19,29 @@
 //!
 //! ## 与 Go 的语义对应（file:line 见 docs 报告）
 //!
-//! - 路由：`autoSystemRoutingTable` 每条 CIDR → masked → 挂 TUN 接口
-//!   （Linux `Priority 1`，tun_linux.go:451-458；Windows `Metric 0` + 接口
-//!   metric 0，tun_windows.go:120-150）。失败宁可无 TUN（handler.go:196-205）。
-//! - 出口接口：`findDefaultInterface` 排除回环/未 Up/TUN 自身/索引 0
-//!   （tun_linux.go:545-576）。
-//! - 系统 DNS：`autoSystemDnsToGateway`（默认 false，仅 Linux 语义）→
-//!   源=gateway 首地址、指向=gateway 后继（tun_linux.go:47-64）→
-//!   `resolvectl dns/domain/default-route`，失败 `revert`（tun_linux.go:105-160）。
-//!   Windows 无接管 flag 语义，`dns` 配置写 TUN 适配器自身
+//! - 路由：`autoSystemRoutingTable` 每条 CIDR → masked → 挂 TUN 接口 （Linux `Priority
+//!   1`，tun_linux.go:451-458；Windows `Metric 0` + 接口 metric
+//!   0，tun_windows.go:120-150）。失败宁可无 TUN（handler.go:196-205）。
+//! - 出口接口：`findDefaultInterface` 排除回环/未 Up/TUN 自身/索引 0 （tun_linux.go:545-576）。
+//! - 系统 DNS：`autoSystemDnsToGateway`（默认 false，仅 Linux 语义）→ 源=gateway
+//!   首地址、指向=gateway 后继（tun_linux.go:47-64）→ `resolvectl dns/domain/default-route`，失败
+//!   `revert`（tun_linux.go:105-160）。 Windows 无接管 flag 语义，`dns` 配置写 TUN 适配器自身
 //!   （tun_windows.go:157 SetDNS；Close FlushDNS 只清 TUN，不动物理网卡）。
 
 pub mod executor;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use xray_common::net::interface::{Interface, InterfaceAddr, InterfaceFlags};
-
-use crate::config::{StackOptions, parse_ip_cidr};
-use crate::error::{Result, TunError};
-
 pub use executor::{
     Cmd, DnsExecutor, LinuxDns, LinuxRoutes, Recording, RouteExecutor, WindowsDns, WindowsRoutes,
     default_executors,
+};
+use xray_common::net::interface::{Interface, InterfaceAddr, InterfaceFlags};
+use xray_transport::dns_skip::skip_dns_servers;
+
+use crate::{
+    config::{StackOptions, parse_ip_cidr},
+    error::{Result, TunError},
 };
 
 /// 目标平台——决定 metric 语义与执行器命令渲染面。
@@ -349,7 +349,24 @@ pub(crate) fn prepare(options: &StackOptions) -> Result<Option<AppliedSystemChan
     };
     let (routes, dns) = default_executors();
     apply_changes_exec(&applied, routes.as_deref(), dns.as_deref())?;
+    register_dns_skip(&applied);
     Ok(Some(applied))
+}
+
+/// 把本次接管的 DNS 服务器登记进进程级 skip 集合（Go `internet.SkipDNSServers`，
+/// tun_windows.go:222）：接管后这些服务器经系统路由指向 TUN，Xray 自身对它们的查询
+/// 会绕回 TUN 内，拨号点据此拒拨（`xray_transport::dns_skip::is_skipped_dns_query`）。
+///
+/// 无 DNS 计划（未接管 DNS）→ 零调用，进程级集合保持原样（Go `if len(dns) > 0`）。
+/// 整体替换语义，重复启动幂等（Go 每次 `SkipDNSServers` 覆盖上一轮）。
+fn register_dns_skip(applied: &AppliedSystemChanges) {
+    let Some(plan) = &applied.dns else { return };
+    match &plan.target {
+        // Windows：TUN 适配器 DNS 列表（= 配置 `dns`）。
+        DnsTarget::WindowsAdapterServers { servers } => skip_dns_servers(servers),
+        // Linux：接管指向的地址（gateway 后继，属 TUN 内部）。
+        DnsTarget::LinuxTakeover { dns, .. } => skip_dns_servers(&[*dns]),
+    }
 }
 
 /// 启动侧渲染（审计/DryRun 面）：路由先于 DNS（对应 Go Start → ConfigureSystemDNS），
@@ -457,13 +474,17 @@ pub(crate) fn revert(applied: &AppliedSystemChanges) {
             "tun system route/dns revert FAILED; system state may remain dirty"
         );
     }
+    // Go Close 无条件清除 skip 集合（tun_windows.go:360）：DNS 已不再指向 TUN，
+    // 上一步 revert 失败也照样清（残留 skip 会让 Xray 的查询永久拒拨该服务器）。
+    skip_dns_servers(&[]);
 }
 
 #[cfg(test)]
 mod tests {
+    use xray_common::net::interface::{InterfaceAddr, InterfaceAddrV4};
+
     use super::*;
     use crate::sysroute::executor::{LinuxDns, LinuxRoutes, WindowsDns, WindowsRoutes};
-    use xray_common::net::interface::{InterfaceAddr, InterfaceAddrV4};
 
     const UP: InterfaceFlags = InterfaceFlags::UP;
     const LOOPBACK: InterfaceFlags = InterfaceFlags::LOOPBACK;
@@ -813,5 +834,112 @@ mod tests {
         let applied = plan_changes(Platform::Linux, &tun_and_eth(), &o).unwrap().expect("applied");
         let err = apply_changes_exec(&applied, None, None).unwrap_err();
         assert!(err.to_string().contains("no route executor"), "{err}");
+    }
+
+    /// 进程级 skip 集合是全局态：涉集合的测试必须持锁串行
+    /// （`xray-transport/src/dns_skip.rs` TEST_LOCK 同款先例）。
+    static DNS_SKIP_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// 测试退出即清集合，防串扰同进程其他用例。
+    struct SkipClear;
+    impl Drop for SkipClear {
+        fn drop(&mut self) {
+            skip_dns_servers(&[]);
+        }
+    }
+
+    fn skip_hits(ip: &str) -> bool {
+        let addr = std::net::SocketAddr::new(ip.parse().unwrap(), 53);
+        xray_transport::dns_skip::is_skipped_dns_server(addr)
+    }
+
+    /// Windows 接管计划：TUN 适配器 DNS 列表（= 配置 `dns`）。
+    fn windows_dns_applied(servers: &[&str]) -> AppliedSystemChanges {
+        AppliedSystemChanges {
+            routes: None,
+            dns: Some(DnsPlan {
+                platform: Platform::Windows,
+                interface: "xray0".into(),
+                target: DnsTarget::WindowsAdapterServers {
+                    servers: servers.iter().map(|s| s.parse().unwrap()).collect(),
+                },
+            }),
+        }
+    }
+
+    /// 接管登记 → 命中（含 v4-mapped 归一化、端口无关）；清除（Go Close
+    /// `SkipDNSServers(nil)`，`revert` 同语义）→ 不命中。
+    #[test]
+    fn dns_skip_registered_on_takeover_and_cleared_by_revert() {
+        let _g = DNS_SKIP_TEST_LOCK.lock();
+        let _clear = SkipClear;
+        assert!(!skip_hits("1.1.1.1"));
+
+        register_dns_skip(&windows_dns_applied(&["1.1.1.1", "::ffff:203.0.113.53"]));
+        assert!(skip_hits("1.1.1.1"));
+        assert!(skip_hits("203.0.113.53"), "v4-mapped 声明命中纯 v4 目标");
+        assert!(!skip_hits("8.8.8.8"));
+
+        // revert 的清除语义（Go Close tun_windows.go:360）。
+        skip_dns_servers(&[]);
+        assert!(!skip_hits("1.1.1.1"));
+    }
+
+    /// 整体替换语义：重复启动幂等、不叠加（Go 每次 `SkipDNSServers` 覆盖上一轮）。
+    #[test]
+    fn dns_skip_registration_replaces_and_does_not_accumulate() {
+        let _g = DNS_SKIP_TEST_LOCK.lock();
+        let _clear = SkipClear;
+
+        register_dns_skip(&windows_dns_applied(&["1.1.1.1"]));
+        register_dns_skip(&windows_dns_applied(&["1.1.1.1"]));
+        assert!(skip_hits("1.1.1.1"), "两次同配置启动仍命中");
+
+        // 换一组（模拟重启换了 dns 配置）：旧条目不得残留。
+        register_dns_skip(&windows_dns_applied(&["8.8.8.8"]));
+        assert!(skip_hits("8.8.8.8"));
+        assert!(!skip_hits("1.1.1.1"), "上一轮的服务器必须已被替换掉");
+    }
+
+    /// 未接管 DNS（无 DNS 计划）→ 零调用：既有集合原样保留（Go `if len(dns) > 0`）。
+    #[test]
+    fn dns_skip_untouched_without_dns_plan() {
+        let _g = DNS_SKIP_TEST_LOCK.lock();
+        let _clear = SkipClear;
+
+        skip_dns_servers(&["203.0.113.53".parse().unwrap()]);
+        register_dns_skip(&AppliedSystemChanges {
+            routes: Some(RoutePlan {
+                platform: Platform::Windows,
+                interface_index: 7,
+                interface: "xray0".into(),
+                add: Vec::new(),
+                outbound_interface: None,
+            }),
+            dns: None,
+        });
+        assert!(skip_hits("203.0.113.53"), "无 DNS 计划时不得清空/改动集合");
+        assert!(!skip_hits("1.1.1.1"));
+    }
+
+    /// Linux 接管：登记的是接管指向的地址（gateway 后继，属 TUN 内部）。
+    #[test]
+    fn dns_skip_linux_takeover_registers_gateway_next_hop() {
+        let _g = DNS_SKIP_TEST_LOCK.lock();
+        let _clear = SkipClear;
+
+        register_dns_skip(&AppliedSystemChanges {
+            routes: None,
+            dns: Some(DnsPlan {
+                platform: Platform::Linux,
+                interface: "xray0".into(),
+                target: DnsTarget::LinuxTakeover {
+                    source: "192.168.100.1".parse().unwrap(),
+                    dns: "192.168.100.2".parse().unwrap(),
+                },
+            }),
+        });
+        assert!(skip_hits("192.168.100.2"));
+        assert!(!skip_hits("192.168.100.1"), "源地址不是解析器指向");
     }
 }
