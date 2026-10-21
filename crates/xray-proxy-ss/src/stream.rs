@@ -457,6 +457,13 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     /// - [`SsError::AeadOpen`]：AEAD 解密失败（tag 不匹配 / 数据损坏）。
     /// - [`SsError::Io`]：底层读失败（含 UnexpectedEof）。
     pub async fn read_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+        // SS-2022 响应流读侧由 rekey 状态机接管（resp_salt || fixed || var 布局与
+        // legacy size+payload 不同），legacy 直读会把 server salt 误当 size chunk。
+        if self.response_rekey_2022.is_some() {
+            return Err(SsError::InitDecode(
+                "SS-2022 must use try_open_chunk (pump); read_chunk is legacy-only".to_string(),
+            ));
+        }
         // SS-2022 服务端：variable chunk 尾部携带的请求首段 payload
         //（sing reader.cached 语义）先于 body chunk 交付。
         if !self.plain_prefix.is_empty() {

@@ -12,13 +12,15 @@
 mod interop_helpers;
 
 use interop_helpers::*;
+use tokio::io::AsyncReadExt;
 use xray_common::net::address::Address;
 use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
 use xray_proxy_ss::{
+    Client2022,
     client::Client,
     config::{CipherType, MemoryAccount as SsAccount},
     server::read_request,
-    Client2022,
+    stream::ChunkOut,
 };
 
 // Test password.
@@ -248,13 +250,11 @@ fn random_psk_b64(len: usize) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
 async fn go_ss2022_server_rust_client_aes128gcm() {
     run_go_ss2022_server_rust_client("2022-blake3-aes-128-gcm", 16, 47231).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
 async fn go_ss2022_server_rust_client_chacha20poly1305() {
     run_go_ss2022_server_rust_client("2022-blake3-chacha20-poly1305", 32, 47232).await;
 }
@@ -280,17 +280,31 @@ async fn run_go_ss2022_server_rust_client(method: &'static str, psk_len: usize, 
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        stream
-            .write_chunk(PAYLOAD)
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        stream.write_chunk(PAYLOAD).await.map_err(|e| std::io::Error::other(e.to_string()))?;
         stream.flush().await.map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        let response = stream
-            .read_chunk()
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))?
-            .unwrap_or_default();
+        // SS-2022 响应必须走 pump 语义（try_open_chunk + 手动喂数据）：
+        // 响应线上是 resp_salt || fixed header chunk || var chunk，read_chunk 是
+        // legacy-only，会把 server salt 误当 size chunk（bd vl7v）。
+        let mut pending: Vec<u8> = Vec::new();
+        let mut wire = [0u8; 4096];
+        let response = loop {
+            match stream.try_open_chunk(&mut pending) {
+                Ok(ChunkOut::Message(data)) => break data,
+                Ok(ChunkOut::End) => break Vec::new(),
+                Ok(ChunkOut::NeedMore) => {
+                    let n =
+                        stream.get_mut().read(&mut wire).await.map_err(std::io::Error::other)?;
+                    if n == 0 {
+                        return Err(std::io::Error::other(
+                            "SS-2022 response: EOF before echo payload",
+                        ));
+                    }
+                    pending.extend_from_slice(&wire[..n]);
+                },
+                Err(e) => return Err(std::io::Error::other(e.to_string())),
+            }
+        };
         assert_eq!(
             response.as_slice(),
             PAYLOAD,

@@ -86,7 +86,8 @@ impl Client2022 {
 
     /// 连接到 SS-2022 server，发送 salt + header（fixed + variable），拨号到 target。
     ///
-    /// 返回 `SSStream<TcpStream>`，调用方继续 `write_chunk` 发送 body + `read_chunk` 读响应。
+    /// 返回 `SSStream<TcpStream>`，调用方继续 `write_chunk` 发送 body；响应用
+    /// pump/`try_open_chunk`（`drive_2022_rekey`）消费——`read_chunk` 是 legacy-only。
     ///
     /// # Errors
     /// - [`SsError::Io`]：TCP 连接 / 写失败。
@@ -112,7 +113,8 @@ impl Client2022 {
     /// 请求首写）；无首段数据时由调用方 `flush_pending_client_2022` 兜底发出
     /// （padding 1..900 满足 SIP022 §3.1.4）。
     ///
-    /// 返回 `SSStream<C>`，调用方继续 `write_chunk` 发送 body + `read_chunk` 读响应。
+    /// 返回 `SSStream<C>`，调用方继续 `write_chunk` 发送 body；响应用
+    /// pump/`try_open_chunk`（`drive_2022_rekey`）消费——`read_chunk` 是 legacy-only。
     ///
     /// # Errors
     /// - [`SsError::Io`]：写失败。
