@@ -19,7 +19,9 @@ MANIFEST = PROTOS / ".checksums.json"
 
 
 def sha256_of(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    # 行尾归一化：index 存 LF，Windows 工作树是 CRLF（autocrlf）。
+    # 不归一的话 manifest 在 Windows 生成、在 CI（LF 检出）必 mismatch。
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
 
 
 def scan_protos() -> dict:
