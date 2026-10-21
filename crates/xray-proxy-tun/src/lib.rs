@@ -31,6 +31,7 @@ pub mod inbound;
 pub mod netstack;
 pub mod outbound;
 pub mod sysroute;
+pub mod wfp;
 // TUN 设备实现按平台门控：windows/macos/linux/bsd 走 tun_rs 真实现，
 // android/ios 走 stub（移动端由宿主 App 注入流量，见 device_stub.rs）。
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
