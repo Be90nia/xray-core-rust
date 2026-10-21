@@ -18,6 +18,7 @@ use xray_proxy_ss::{
     client::Client,
     config::{CipherType, MemoryAccount as SsAccount},
     server::read_request,
+    Client2022,
 };
 
 // Test password.
@@ -233,4 +234,77 @@ async fn go_ss_proxy_rust_client_aes128gcm_http() {
     let _ = std::fs::remove_file(&config_path);
 
     result.expect("SS HTTP interop: Go proxy -> Rust client");
+}
+
+// -- SS-2022: Go server -> Rust client（SIP022 wire 互通） --
+// 对应 Go testing/scenarios/shadowsocks_2022_test.go 三方法中的两个缺口方法。
+// PSK 随机生成（base64），Go 单用户 ServerConfig（method + password）。
+
+/// 生成随机 PSK 并 base64 编码（与 ss_test.rs 同实现；跨测试二进制不共享代码）。
+fn random_psk_b64(len: usize) -> String {
+    use base64::Engine as _;
+    let psk: Vec<u8> = (0..len).map(|_| rand::random::<u8>()).collect();
+    base64::engine::general_purpose::STANDARD.encode(psk)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
+async fn go_ss2022_server_rust_client_aes128gcm() {
+    run_go_ss2022_server_rust_client("2022-blake3-aes-128-gcm", 16, 47231).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
+async fn go_ss2022_server_rust_client_chacha20poly1305() {
+    run_go_ss2022_server_rust_client("2022-blake3-chacha20-poly1305", 32, 47232).await;
+}
+
+async fn run_go_ss2022_server_rust_client(method: &'static str, psk_len: usize, ss_port: u16) {
+    let echo_port = spawn_echo_server().await.expect("start echo server");
+    let psk_b64 = random_psk_b64(psk_len);
+
+    let config = XrayConfig {
+        inbounds: vec![ss2022_server_inbound(ss_port, &psk_b64, method)],
+        outbounds: vec![freedom_outbound()],
+    };
+    let config_path = write_config_to_temp(&config, "go-ss2022-server").expect("write config");
+
+    let mut go_proc = start_go_xray(&config_path).await.expect("start Go xray");
+    wait_for_port(ss_port, 5000).await.expect("Go SS2022 port ready");
+
+    let result = async {
+        let client = Client2022::new(method, &[psk_b64], "127.0.0.1", ss_port)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let mut stream = client
+            .dial_target("127.0.0.1", echo_port)
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        stream
+            .write_chunk(PAYLOAD)
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        stream.flush().await.map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        let response = stream
+            .read_chunk()
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?
+            .unwrap_or_default();
+        assert_eq!(
+            response.as_slice(),
+            PAYLOAD,
+            "SS-2022 echo mismatch: got {} bytes, expected {}",
+            response.len(),
+            PAYLOAD.len()
+        );
+        Ok::<(), std::io::Error>(())
+    }
+    .await;
+
+    // Cleanup
+    let _ = go_proc.kill().await;
+    let _ = std::fs::remove_file(&config_path);
+
+    result.expect("SS-2022 interop: Go server -> Rust client");
 }

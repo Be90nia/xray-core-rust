@@ -478,6 +478,24 @@ pub fn ss_server_inbound(port: u16, password: &str, method: &str) -> Inbound {
     }
 }
 
+/// Go xray Shadowsocks-2022 (SIP022) server inbound config.
+/// 2022 cipher 走 Go `infra/conf/shadowsocks.go:56-58` buildShadowsocks2022 路由
+/// （inbound protocol 仍为 "shadowsocks"，单用户 password 即 base64 PSK）。
+pub fn ss2022_server_inbound(port: u16, psk_b64: &str, method: &str) -> Inbound {
+    Inbound {
+        port,
+        protocol: "shadowsocks".into(),
+        listen: Some("127.0.0.1".into()),
+        settings: Some(serde_json::json!({
+            "method": method,
+            "password": psk_b64,
+            "network": "tcp"
+        })),
+        stream_settings: None,
+        tag: "ss2022-in".into(),
+    }
+}
+
 /// Go xray Shadowsocks client outbound config.
 pub fn ss_outbound(server_port: u16, password: &str, method: &str) -> Outbound {
     Outbound {
