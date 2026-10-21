@@ -16,6 +16,7 @@
 //! 中继模式与 `xray-proxy-tun/src/inbound.rs::TunTcpRelay` 一致。
 
 use std::{
+    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -28,11 +29,11 @@ use parking_lot::Mutex as ParkMutex;
 use smoltcp::{iface::SocketHandle, wire::IpEndpoint};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::Mutex as AsyncMutex,
+    sync::{Mutex as AsyncMutex, mpsc},
     task::JoinHandle,
     time::interval,
 };
-use xray_app_dispatcher::{AccessContext, DispatchHandler};
+use xray_app_dispatcher::{AccessContext, DispatchHandler, UdpDispatchSession};
 use xray_buf::io::{new_reader, new_writer};
 use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
 use xray_features::inbound::{InboundError, InboundHandler};
@@ -42,7 +43,7 @@ use crate::{
     config::DeviceConfig,
     driver::{WgDriver, bind_udp_socket},
     error::Result,
-    netstack::WgNetStack,
+    netstack::{WgNetStack, nanos_now},
     peer::shared_peer,
     users::{DriverSlot, WgUserRegistry},
 };
@@ -55,6 +56,17 @@ const ACCEPT_POLL_MS: u64 = 100;
 
 /// 中继轮询间隔（ms）。
 const RELAY_POLL_MS: u64 = 5;
+
+/// 内层 UDP 会话空闲淘汰（秒）——对齐 tun inbound 同款阈值（票 8gr6/p14e）；
+/// Go `CancelAfterInactivity(4min)` 的保守近似（udp_session.rs ponytail 注：
+/// 中央 session 不内置空闲超时，由调用方生命周期管理）。
+const WG_UDP_SESSION_IDLE_SECS: u64 = 60;
+
+/// UDP 会话/监听清扫周期（秒）。
+const WG_UDP_SWEEP_SECS: u64 = 30;
+
+/// 单会话待发数据报队列上限（Go `udpQueueLimit = 1024` 同值，满即丢）。
+const WG_UDP_QUEUE_CAP: usize = 1024;
 
 /// WireGuard 入站 Handler。
 ///
@@ -249,6 +261,31 @@ async fn wg_accept_loop(
     let mut timer = interval(Duration::from_millis(ACCEPT_POLL_MS));
     tracing::debug!("wg accept loop started");
 
+    // 内层 UDP 转发（票 z7ya）：per-源会话表 + 空闲清扫（Go udp forwarder 语义，
+    // 结构对齐 xray-proxy-tun/src/inbound.rs 的 full-cone 会话模型）
+    let udp_sessions: WgUdpSessions = Arc::new(ParkMutex::new(HashMap::new()));
+    let sweep_netstack = Arc::clone(&netstack);
+    let sweep_sessions = Arc::clone(&udp_sessions);
+    tokio::spawn(async move {
+        let mut tick = interval(Duration::from_secs(WG_UDP_SWEEP_SECS));
+        tick.tick().await; // 跳过首个立即 tick（启动时全为新）
+        loop {
+            tick.tick().await;
+            let now = nanos_now();
+            let idle = (WG_UDP_SESSION_IDLE_SECS as i64) * 1_000_000_000;
+            sweep_netstack.lock().await.sweep_udp(now, idle);
+            let mut map = sweep_sessions.lock();
+            let expired: Vec<IpEndpoint> = map
+                .iter()
+                .filter(|(_, s)| now.saturating_sub(s.last_used_nanos) > idle)
+                .map(|(k, _)| *k)
+                .collect();
+            for k in expired {
+                map.remove(&k);
+            }
+        }
+    });
+
     loop {
         timer.tick().await;
         let mut stack = netstack.lock().await;
@@ -312,6 +349,13 @@ async fn wg_accept_loop(
                 dispatch.dispatch_with_access(&dest, link, access).await;
             });
         }
+
+        // 内层 UDP：drain 全部转发监听的待收数据报并路由到 per-源会话。
+        // 锁内只做同步 drain（无 await）；会话 spawn/入队均非阻塞。
+        let now = nanos_now();
+        for (dst, src, payload) in stack.drain_udp(now) {
+            forward_wg_udp_datagram(&udp_sessions, &netstack, &dispatch, dst, src, payload, now);
+        }
     }
 }
 
@@ -323,6 +367,150 @@ fn ip_endpoint_to_destination(local: &Option<IpEndpoint>) -> Option<Destination>
         smoltcp::wire::IpAddress::Ipv6(v6) => Address::IPv6(std::net::Ipv6Addr::from(v6.octets())),
     };
     Some(Destination::new(address, Port::new(ep.port), Network::TCP))
+}
+
+/// smoltcp IpAddress → xray Address（隧道内 endpoint 转换，仅 IP）。
+fn ip_address_to_address(addr: &smoltcp::wire::IpAddress) -> Address {
+    match addr {
+        smoltcp::wire::IpAddress::Ipv4(v4) => Address::IPv4(std::net::Ipv4Addr::from(v4.octets())),
+        smoltcp::wire::IpAddress::Ipv6(v6) => Address::IPv6(std::net::Ipv6Addr::from(v6.octets())),
+    }
+}
+
+/// xray Address（仅 IP）→ smoltcp IpEndpoint；Domain 返回 None（回包无 IP 源）。
+fn address_to_ip_endpoint(address: &Address, port: u16) -> Option<IpEndpoint> {
+    let addr = match address {
+        Address::IPv4(v4) => smoltcp::wire::IpAddress::Ipv4(crate::netstack::to_smoltcp_v4(*v4)),
+        Address::IPv6(v6) => smoltcp::wire::IpAddress::Ipv6(crate::netstack::to_smoltcp_v6(*v6)),
+        Address::Domain(_) => return None,
+    };
+    Some(IpEndpoint { addr, port })
+}
+
+// ===== 内层 UDP 转发（票 z7ya，对应 Go udp forwarder） =====
+
+/// 内层 UDP 会话命令。
+enum WgUdpCmd {
+    Send { dest: Destination, payload: Vec<u8> },
+}
+
+/// per-隧道内源 UDP 会话句柄（full-cone NAT 键 = 源 endpoint）。
+///
+/// 对应 Go `proxy/tun/udp_fullcone.go` 的 `udpConns[src]` 与
+/// `xray-proxy-tun/src/inbound.rs::UdpSessionEntry`：map 只留非阻塞入队口 +
+/// 最近使用时间，owner task 独占 [`UdpDispatchSession`]。sweep/摘除 → cmd_tx
+/// 随 entry drop → task 退出 → session drop → dispatch duplex EOF，outbound 回收。
+struct WgUdpSession {
+    cmd_tx: mpsc::Sender<WgUdpCmd>,
+    last_used_nanos: i64,
+}
+
+/// 会话表（accept loop 与 sweeper 共享）。
+type WgUdpSessions = Arc<ParkMutex<HashMap<IpEndpoint, WgUdpSession>>>;
+
+/// 单个内层 UDP 数据报路由：per-源会话命中即入队转发，未命中建会话。
+///
+/// 对应 Go `udpConnectionHandler.HandlePacket`：按源 endpoint full-cone 分桶，
+/// 队列满丢包（Go `> queue full` 同语义）；首包目标决定 dispatch 链路，后续包
+/// 各带目标由 XUDP 帧头 per-packet 路由。owner task 已退出时摘除死会话、本包
+/// 丢弃，后续包按新会话重建（Go `connectionFinished` 同语义）。
+fn forward_wg_udp_datagram(
+    sessions: &WgUdpSessions,
+    netstack: &Arc<AsyncMutex<WgNetStack>>,
+    dispatch: &Arc<dyn DispatchHandler>,
+    dst: IpEndpoint,
+    src: IpEndpoint,
+    payload: Vec<u8>,
+    now: i64,
+) {
+    let dest = Destination::udp(ip_address_to_address(&dst.addr), Port::new(dst.port));
+    let mut map = sessions.lock();
+    if let Some(entry) = map.get_mut(&src) {
+        entry.last_used_nanos = now;
+        match entry.cmd_tx.try_send(WgUdpCmd::Send { dest, payload }) {
+            Ok(()) => return,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::debug!(src = %src, dst = ?dst, "wg udp: session queue full, packet dropped");
+                return;
+            },
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!(src = %src, "wg udp: session closed by outbound, packet dropped");
+            },
+        }
+        map.remove(&src);
+        return;
+    }
+    let (cmd_tx, cmd_rx) = mpsc::channel(WG_UDP_QUEUE_CAP);
+    tokio::spawn(run_wg_udp_session(
+        Arc::clone(dispatch),
+        cmd_rx,
+        Arc::clone(netstack),
+        src,
+        dest,
+        payload,
+    ));
+    map.insert(src, WgUdpSession { cmd_tx, last_used_nanos: now });
+}
+
+/// 内层 UDP 会话 owner task（per-隧道内源，Go `udpConn` 等价物）。
+///
+/// 独占一个 [`UdpDispatchSession`]：
+/// - 上行：cmd 队列（accept loop 非阻塞入队）→ `send_packet`（XUDP 帧 → dispatcher）
+/// - 下行：`recv_packet` → 从原目标 endpoint 发回 smoltcp（Go `writeUDP(payload,
+///   dst, src)` 语义），driver 定时器 drain_tx 加密发回 WG client。
+///
+/// 退出条件：cmd 口关闭（sweep/摘除）、outbound 关闭（`Ok(None)`）、收发 IO 错。
+async fn run_wg_udp_session(
+    dispatch: Arc<dyn DispatchHandler>,
+    mut cmd_rx: mpsc::Receiver<WgUdpCmd>,
+    netstack: Arc<AsyncMutex<WgNetStack>>,
+    inner_src: IpEndpoint,
+    first_dest: Destination,
+    first_payload: Vec<u8>,
+) {
+    let mut session = UdpDispatchSession::new(dispatch);
+    if let Err(e) = session.send_packet(&first_dest, &first_payload).await {
+        tracing::warn!(error = %e, src = %inner_src, dst = ?first_dest, "wg udp: first send_packet failed");
+        return;
+    }
+    loop {
+        tokio::select! {
+            cmd = cmd_rx.recv() => match cmd {
+                Some(WgUdpCmd::Send { dest, payload }) => {
+                    if let Err(e) = session.send_packet(&dest, &payload).await {
+                        tracing::warn!(error = %e, src = %inner_src, dst = ?dest, "wg udp: send_packet failed");
+                        return;
+                    }
+                },
+                None => {
+                    tracing::debug!(src = %inner_src, "wg udp: session swept");
+                    return;
+                },
+            },
+            resp = session.recv_packet() => match resp {
+                Ok(Some((source, payload))) => {
+                    let Some(reply_src) = address_to_ip_endpoint(source.address(), source.port().value()) else {
+                        tracing::warn!(src = %inner_src, "wg udp: reply source is domain, dropped");
+                        continue;
+                    };
+                    let mut stack = netstack.lock().await;
+                    let sent = stack.udp_send_reply(reply_src, &payload, inner_src, nanos_now());
+                    stack.poll(smoltcp::time::Instant::now());
+                    if !sent {
+                        tracing::warn!(src = %inner_src, reply_src = ?reply_src, "wg udp: reply dropped (socket unavailable)");
+                    }
+                },
+                Ok(None) => {
+                    tracing::debug!(src = %inner_src, "wg udp: outbound closed session");
+                    return;
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, src = %inner_src, "wg udp: recv_packet failed");
+                    return;
+                },
+            },
+        }
+    }
 }
 
 /// smoltcp TCP socket ↔ tokio duplex 中继 task（inbound 方向）。
