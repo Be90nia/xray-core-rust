@@ -230,3 +230,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 tools/check_proto_drift.py --manifest
+
+  # 资产门（G-18）：对齐 Go test.yml:10 check-assets，但语义按本仓架构改写——
+  # 本仓不内置 geodata（运行时下载，crates/xray-app-geodata），无 cache 可恢复，
+  # 故不照搬 Go 的「缺失 sleep 90s」，改为硬门：受控配置一旦引用 geo 资产而
+  # 资产目录无该文件即 fail（否则二进制起得来但路由规则静默失效）。
+  check-assets:
+    name: Asset Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 tools/check_geo_assets.py
