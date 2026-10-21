@@ -168,7 +168,18 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
             // UA 缺省/枚举时补整套浏览器导航伪装头（不覆盖用户自定义头）；
             // Go client.go:226 补 `Proxy-Connection: Keep-Alive`（0w9l：原先
             // 两者皆缺，CONNECT 指纹与 Go 客户端可辨）。
-            let mut headers = config.headers.clone();
+            // Go client.go:157-186 fillRequestHeader：config header 值先按模板
+            // 渲染（{{.Source}}/{{.Target}} 子集），再补默认头——TryDefaultHeadersWith
+            // 追加项不参与渲染。
+            let template_source = template_source_value();
+            let template_target = format!("tcp:{target_host}:{target_port}");
+            let mut headers: Vec<(String, String)> = config
+                .headers
+                .iter()
+                .map(|(k, v)| {
+                    (k.clone(), render_header_value(v, &template_source, &template_target))
+                })
+                .collect();
             xray_common::browser::try_default_headers_with(&mut headers, "nav");
             for (k, v) in &headers {
                 request.push_str(&format!("{k}: {v}\r\n"));
@@ -345,7 +356,16 @@ async fn establish_h2_tunnel(
                         .map_err(|e| format!("h2 Proxy-Authorization encode: {e}"))?;
                 headers.insert(http::header::PROXY_AUTHORIZATION, value);
             }
-            let mut config_headers = config.headers.clone();
+            // Go fillRequestHeader 同 h1 路径：config header 值先渲染再补默认头。
+            let template_source = template_source_value();
+            let template_target = format!("tcp:{target_host}:{target_port}");
+            let mut config_headers: Vec<(String, String)> = config
+                .headers
+                .iter()
+                .map(|(k, v)| {
+                    (k.clone(), render_header_value(v, &template_source, &template_target))
+                })
+                .collect();
             xray_common::browser::try_default_headers_with(&mut config_headers, "nav");
             for (k, v) in &config_headers {
                 let name = http::HeaderName::from_bytes(k.as_bytes())
@@ -488,6 +508,51 @@ impl Connection for H2TunnelConn {
     fn local_addr(&self) -> std::io::Result<Option<std::net::SocketAddr>> {
         Ok(self.local_addr)
     }
+}
+
+/// 渲染 header 值：支持 `{{.Source}}` / `{{ .Source }}` / `{{.Target}}` / `{{ .Target }}`。
+///
+/// Go `text/template` 的刻意子集（proxy/http/client.go:167-205 fillRequestHeader
+/// 只传 `Source`/`Target` 两个字段）：仅替换这两个动作，其余占位符（`{{.Foo}}`、
+/// 管道/函数/条件等）原样保留——Go 对未知字段 Execute 会报错断连，这里刻意更
+/// 宽容：非法模板不应让带自定义头的配置整体不可用。
+fn render_header_value(v: &str, source: &str, target: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    let mut rest = v;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        match after[..end].trim() {
+            ".Source" => out.push_str(source),
+            ".Target" => out.push_str(target),
+            _ => out.push_str(&rest[start..start + end + 4]),
+        }
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `{{.Source}}` 的渲染值，对齐 Go `Destination.String()`（`tcp:` 前缀 +
+/// IPv6 方括号）。Go 的 Source 来自 inbound（client.go:177-181），dial 层拿不到
+/// 端口，PM 裁决取 task-local `DIAL_SRC`（sendThrough 源 IP）且端口段固定 0；
+/// 无 DIAL_SRC 时降级 Go 同款 `net.TCPDestination(net.AnyIP, 0)` = `tcp:0.0.0.0:0`。
+fn template_source_value() -> String {
+    use std::net::IpAddr;
+    let ip = xray_transport::system_dialer::DIAL_SRC
+        .try_with(|v| *v)
+        .ok()
+        .flatten()
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    let host = match ip {
+        IpAddr::V6(v6) => format!("[{v6}]"),
+        v4 => v4.to_string(),
+    };
+    format!("tcp:{host}:0")
 }
 
 /// Base64 编码（RFC 4648）——不依赖 base64 crate，最小实现。
@@ -756,5 +821,150 @@ mod tests {
             "dial must be attempted exactly 5 times"
         );
         assert!(err.contains("retries exhausted"), "{err}");
+    }
+
+    #[test]
+    fn render_header_value_table() {
+        let (src, tgt) = ("tcp:1.2.3.4:0", "tcp:h.example:443");
+        // 无占位原样
+        assert_eq!(render_header_value("plain", src, tgt), "plain");
+        // 两占位符
+        assert_eq!(
+            render_header_value("{{.Source}}|{{.Target}}", src, tgt),
+            format!("{src}|{tgt}")
+        );
+        // 带空格形态
+        assert_eq!(render_header_value("{{ .Target }}", src, tgt), tgt);
+        assert_eq!(render_header_value("{{  .Source  }}", src, tgt), src);
+        // 多处占位
+        assert_eq!(
+            render_header_value("a{{.Target}}b{{.Source}}c{{ .Target }}", src, tgt),
+            format!("a{tgt}b{src}c{tgt}")
+        );
+        // 未知动作 / 未知字段 / 大小写敏感 / 管道与函数 / 未闭合 / 空动作：原样保留
+        assert_eq!(render_header_value("{{.Foo}}", src, tgt), "{{.Foo}}");
+        assert_eq!(render_header_value("{{.source}}", src, tgt), "{{.source}}");
+        assert_eq!(render_header_value("{{if .X}}y{{end}}", src, tgt), "{{if .X}}y{{end}}");
+        assert_eq!(render_header_value("open {{ unclosed", src, tgt), "open {{ unclosed");
+        assert_eq!(render_header_value("{{}}", src, tgt), "{{}}");
+        assert_eq!(render_header_value("", src, tgt), "");
+    }
+
+    #[tokio::test]
+    async fn template_source_value_uses_dial_src_or_anyip_fallback() {
+        // 无 DIAL_SRC scope → Go 降级形态 net.TCPDestination(net.AnyIP, 0)
+        assert_eq!(template_source_value(), "tcp:0.0.0.0:0");
+        // scope 内 → sendThrough 源 IP；dial 层拿不到端口，端口段固定 0
+        let v4: std::net::IpAddr = "127.0.0.2".parse().unwrap();
+        let got = xray_transport::system_dialer::DIAL_SRC
+            .scope(Some(v4), async { template_source_value() })
+            .await;
+        assert_eq!(got, "tcp:127.0.0.2:0");
+        // IPv6 源对齐 Go Address.String()（自带方括号）
+        let v6: std::net::IpAddr = "::1".parse().unwrap();
+        let got6 = xray_transport::system_dialer::DIAL_SRC
+            .scope(Some(v6), async { template_source_value() })
+            .await;
+        assert_eq!(got6, "tcp:[::1]:0");
+    }
+
+    /// dial 级红→绿：headers 带 `{{.Target}}`/`{{.Source}}` 的配置发出 CONNECT 时
+    /// 值已被渲染（Go fillRequestHeader 子集）；未知动作原样保留；默认补头
+    /// （TryDefaultHeadersWith 追加项）不参与渲染。
+    #[tokio::test]
+    async fn connect_request_renders_header_placeholders() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let inspector = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let mut req: Vec<u8> = Vec::new();
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                req.extend_from_slice(&buf[..n]);
+                if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
+            String::from_utf8(req).unwrap()
+        });
+
+        let cfg =
+            HttpOutboundConfig::new(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(port))
+                .with_header("X-Target".to_string(), "{{.Target}}".to_string())
+                .with_header("X-Source".to_string(), "{{.Source}}".to_string())
+                .with_header("X-Mixed".to_string(), "a{{ .Target }}b{{.Source}}c".to_string())
+                .with_header("X-Unknown".to_string(), "{{.Foo}} keep".to_string())
+                .with_header("User-Agent".to_string(), "tpl-{{.Target}}".to_string());
+        let dial_fn = make_http_dial_fn(Arc::new(cfg));
+        let dest = Destination::tcp(Address::new_domain("target.example.com"), Port::new(443));
+        let _conn = dial_fn(&dest).await.expect("tunnel established");
+        drop(_conn);
+
+        let request = inspector.await.unwrap();
+        assert!(request.contains("X-Target: tcp:target.example.com:443\r\n"), "{request}");
+        assert!(request.contains("X-Source: tcp:0.0.0.0:0\r\n"), "{request}");
+        assert!(
+            request.contains("X-Mixed: atcp:target.example.com:443btcp:0.0.0.0:0c\r\n"),
+            "{request}"
+        );
+        assert!(request.contains("X-Unknown: {{.Foo}} keep\r\n"), "{request}");
+        assert!(request.contains("User-Agent: tpl-tcp:target.example.com:443\r\n"), "{request}");
+    }
+
+    /// h2 路径同样渲染（establish_h2_tunnel 发出的 CONNECT 头）。
+    #[tokio::test]
+    async fn h2_connect_renders_header_placeholders() {
+        use http_body_util::Empty;
+        use hyper::{Request, body::Incoming, service::service_fn};
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<(String, String)>>(4);
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let io = TokioIo::new(sock);
+            let service = service_fn(move |req: Request<Incoming>| {
+                let tx = tx.clone();
+                async move {
+                    let hdrs: Vec<(String, String)> = req
+                        .headers()
+                        .iter()
+                        .map(|(k, v)| {
+                            (k.as_str().to_string(), v.to_str().unwrap_or_default().to_string())
+                        })
+                        .collect();
+                    let _ = tx.send(hdrs).await;
+                    Ok::<_, std::convert::Infallible>(
+                        hyper::Response::builder()
+                            .status(hyper::StatusCode::OK)
+                            .body(Empty::<bytes::Bytes>::new())
+                            .unwrap(),
+                    )
+                }
+            });
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
+        });
+
+        let mut cfg =
+            HttpOutboundConfig::new(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(port))
+                .with_header("X-Target".to_string(), "{{.Target}}".to_string())
+                .with_header("X-Source".to_string(), "{{.Source}}".to_string());
+        cfg.h2 = true;
+        let dial_fn = make_http_dial_fn(Arc::new(cfg));
+        let dest = Destination::tcp(Address::new_domain("target.example.com"), Port::new(443));
+        let _conn = dial_fn(&dest).await.expect("h2 CONNECT tunnel must establish");
+        drop(_conn);
+
+        let hdrs = rx.recv().await.unwrap();
+        let get = |name: &str| {
+            hdrs.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("x-target"), Some("tcp:target.example.com:443"));
+        assert_eq!(get("x-source"), Some("tcp:0.0.0.0:0"));
     }
 }
