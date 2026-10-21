@@ -27,12 +27,12 @@ use xray_common::{
 };
 use xray_conf::{BuiltConfig, BuiltInbound};
 use xray_features::inbound::InboundHandler;
-use xray_proto::xray::{
-    common::protocol::User as ProtoUser, core::InboundHandlerConfig as ProtoInboundConfig,
-};
 // zx7: mux inbound 检测
 use xray_mux::client::{MUX_COOL_ADDRESS, MUX_COOL_PORT};
-use xray_proto::xray::proxy::vless::Account as VlessProtoAccount;
+use xray_proto::xray::{
+    common::protocol::User as ProtoUser, core::InboundHandlerConfig as ProtoInboundConfig,
+    proxy::vless::Account as VlessProtoAccount,
+};
 use xray_proxy_blackhole::{BlackholeInboundHandler, ResponseConfig as BlackholeResponseConfig};
 use xray_proxy_dns::{Config as DnsConfig, DnsInbound, DnsOutbound, Handler as DnsHandler};
 use xray_proxy_freedom::FreedomInboundHandler;
@@ -755,8 +755,8 @@ async fn handle_plain_http(
     let request_head = build_forwarded_request(&hs.method, &path, &hs.headers);
 
     // 2. 创建 pipe 对，dispatch：生产 DefaultDispatcher::dispatch_link 内部 spawn
-    //    后台任务后立即返回（link 由后台持有）；no-handler/后台 dial 失败表现为
-    //    下行零字节结束 → 下方统一回 503 兜底。
+    //    后台任务后立即返回（link 由后台持有）；no-handler/后台 dial 失败表现为 下行零字节结束 →
+    //    下方统一回 503 兜底。
     let (up_r, mut up_w) = xray_buf::pipe::new();
     let (mut dn_r, dn_w) = xray_buf::pipe::new();
     let link =
@@ -2885,8 +2885,8 @@ fn parse_reality_config(
     // 票 037f：Go 有 Rust 无的 realitySettings 键——有意图值一律配置层硬错，
     // 不静默丢（对齐 bd 5std 惯例；关闭值/缺省放行，不破 Go 兼容配置）。
     // - show（transport_security.go:29）：REALITY 握手 debug 打印
-    //   （transport/internet/reality/reality.go:102-285 fmt.Printf），Rust 无
-    //   等价 trace 点。非 bool 类型手误按「已设置」拒（bd zl5t 惯例）。
+    //   （transport/internet/reality/reality.go:102-285 fmt.Printf），Rust 无 等价 trace 点。非
+    //   bool 类型手误按「已设置」拒（bd zl5t 惯例）。
     if let Some(v) = json.get("show") {
         match v {
             serde_json::Value::Null | serde_json::Value::Bool(false) => {},
@@ -2915,8 +2915,8 @@ fn parse_reality_config(
             ));
         }
     }
-    // - limitFallbackUpload/Download（:42-43）：fallback 限速器未实现；
-    //   全零对象/缺省 = Go 无限制语义，放行。
+    // - limitFallbackUpload/Download（:42-43）：fallback 限速器未实现； 全零对象/缺省 = Go
+    //   无限制语义，放行。
     for lf_key in ["limitFallbackUpload", "limitFallbackDownload"] {
         if let Some(v) = json.get(lf_key) {
             let active = v.as_object().is_some_and(|o| {
@@ -2932,8 +2932,8 @@ fn parse_reality_config(
             }
         }
     }
-    // - type（:32）与 unix 形态 target/dest（:68-84 '@'/'/' 前缀推导 unix，
-    //   含 Linux @@ 抽象套接字）：Rust reality fallback 拨号仅支持 host:port。
+    // - type（:32）与 unix 形态 target/dest（:68-84 '@'/'/' 前缀推导 unix， 含 Linux @@
+    //   抽象套接字）：Rust reality fallback 拨号仅支持 host:port。
     if let Some(t) = json.get("type").and_then(|x| x.as_str()) {
         if !t.eq_ignore_ascii_case("tcp") {
             return Err(std::io::Error::other(format!(
@@ -3031,7 +3031,8 @@ async fn serve_reality_vless(
     };
 
     loop {
-        let (stream, peer) = match listener.accept().await {
+        // finalmask.tcp 在 accept 后立即套上（wire 最外层，reality 握手在其内）。
+        let (stream, peer) = match listener.accept_masked().await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "reality inbound accept failed");
@@ -3062,7 +3063,9 @@ async fn serve_reality_vless(
             // 帧后切裸 socket 直写（Go proxy.go switchToDirectCopy），服务端无
             // raw 通道 → 从 rustls 安全层读端到端明文 → AEAD open 失败 → fatal
             // bad_record_mac，隧道死。
-            let raw_tcp = xray_transport::connection::dup_tcp_stream(&stream);
+            // mask 生效时 wire 字节非明文，裸 socket 克隆不可直接 splice → None
+            // （splice 关闭，走常规 TLS 读；未配 finalmask 时与原路径逐字节一致）。
+            let raw_tcp = stream.plain().and_then(xray_transport::connection::dup_tcp_stream);
             let framer = xray_transport::record_framer::RecordFramer::new(stream);
             let outcome = if use_btls {
                 #[cfg(not(target_os = "ios"))]
@@ -3213,7 +3216,8 @@ async fn serve_reality_trojan(
     };
 
     loop {
-        let (stream, peer) = match listener.accept().await {
+        // finalmask.tcp 在 accept 后立即套上（wire 最外层，reality 握手在其内）。
+        let (stream, peer) = match listener.accept_masked().await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "trojan+reality inbound accept failed");
@@ -3325,6 +3329,22 @@ fn is_transport_listener_protocol(protocol: &str) -> bool {
             | "splithttp"
             | "xhttp"
     )
+}
+
+/// 裸 TCP 入站的 `finalmask.tcp` 伪装链（Go `tcp/hub.go` WrapListener）。
+///
+/// 未配置 / `tcp` 空数组 → `None`：listener 不注入 mask，accept 路径零包装。
+///
+/// # Errors
+/// mask 配置非法（未知类型 / xmc 派生失败等）时返回 `io::Error`——启动即失败，
+/// 与 Go 配置构建期报错一致（不做静默降级）。
+fn inbound_tcpmask(
+    settings: &xray_transport::dialer::StreamSettings,
+) -> std::io::Result<Option<Arc<xray_transport::finalmask::TcpmaskManager>>> {
+    let mgr = xray_transport::finalmask::build_tcpmask_manager_from_json(
+        settings.finalmask_json.as_ref(),
+    )?;
+    Ok((!mgr.tcpmasks.is_empty()).then(|| Arc::new(mgr)))
 }
 
 /// 经 listener_registry 启动 transport inbound（ws/grpc/kcp/httpupgrade/splithttp）。
@@ -3569,7 +3589,10 @@ async fn spawn_one_inbound(
                 .await
             } else if settings.security == "reality" {
                 // REALITY：server_tls 验证 → Verified 走 VLESS；Invalid fallback 到 dest
-                let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone()).await?;
+                let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone())
+                    .await?
+                    // finalmask.tcp（Go hub.go WrapListener；wire 最外层，reality 之前）
+                    .with_tcpmask_manager(inbound_tcpmask(&settings)?);
                 let reality = parse_reality_config(&settings)?;
                 tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_uuid_count(), fallback = %reality.fallback_dest, "vless+reality inbound listening");
                 Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
@@ -3584,7 +3607,9 @@ async fn spawn_one_inbound(
                     .await?
                     .with_header_auth(xray_transport::headers::conn::auth_from_json(
                         settings.transport_json.as_ref(),
-                    )?);
+                    )?)
+                    // finalmask.tcp（Go hub.go WrapListener；wire 最外层，TLS 之前）
+                    .with_tcpmask_manager(inbound_tcpmask(&settings)?);
                 tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_uuid_count(), tls = tls.is_some(), fallbacks = fallbacks.as_ref().map_or(0, |f| f.len()), enc = decryption.is_some(), "vless inbound listening");
                 Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                     serve_vless(listener, ohm, validator, tls, fallbacks, Some(options)).await
@@ -3652,7 +3677,10 @@ async fn spawn_one_inbound(
                 // REALITY 证书校验必败，trojan header 永远读不到。对齐 Go：
                 // trojan inbound 收到的 iConn 已是 *reality.Conn。）
                 let reality = parse_reality_config(&settings)?;
-                let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone()).await?;
+                let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone())
+                    .await?
+                    // finalmask.tcp（Go hub.go WrapListener；wire 最外层，reality 之前）
+                    .with_tcpmask_manager(inbound_tcpmask(&settings)?);
                 tracing::info!(tag = %ib.tag, addr = %addr, users = users.len(), fallback = %reality.fallback_dest, "trojan+reality inbound listening");
                 Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                     serve_reality_trojan(
@@ -3671,7 +3699,9 @@ async fn spawn_one_inbound(
                     .await?
                     .with_header_auth(xray_transport::headers::conn::auth_from_json(
                         settings.transport_json.as_ref(),
-                    )?);
+                    )?)
+                    // finalmask.tcp（Go hub.go WrapListener；wire 最外层，TLS 之前）
+                    .with_tcpmask_manager(inbound_tcpmask(&settings)?);
                 tracing::info!(tag = %ib.tag, addr = %addr, users = users.len(), tls = tls.is_some(), "trojan inbound listening");
                 Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                     serve_trojan(
@@ -3738,7 +3768,9 @@ async fn spawn_one_inbound(
                     .await?
                     .with_header_auth(xray_transport::headers::conn::auth_from_json(
                         settings.transport_json.as_ref(),
-                    )?);
+                    )?)
+                    // finalmask.tcp（Go hub.go WrapListener；wire 最外层，TLS 之前）
+                    .with_tcpmask_manager(inbound_tcpmask(&settings)?);
                 tracing::info!(tag = %ib.tag, addr = %addr, tls = tls.is_some(), "vmess inbound listening");
                 Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                     serve_vmess(listener, ohm, validator, tls, handshake_timeout_for(&policy, 0))
@@ -7485,8 +7517,8 @@ mod tests {
             u16::from_be_bytes([reply[8], reply[9]]),
         );
 
-        // 2. 往 relay 发 SOCKS5 UDP 帧；MarkerUdpDispatch 标记帧经 relay 返回
-        //    （假成功路径下 relay socket 已被丢弃，此步超时）
+        // 2. 往 relay 发 SOCKS5 UDP 帧；MarkerUdpDispatch 标记帧经 relay 返回 （假成功路径下 relay
+        //    socket 已被丢弃，此步超时）
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target = SocksAddr { host: Host::Ipv4(Ipv4Addr::new(8, 8, 8, 8)), port: 53 };
         client.send_to(&encode_udp_packet(&target, b"ping"), relay_addr).await.unwrap();
@@ -7516,6 +7548,7 @@ mod tests {
             fn tag(&self) -> &str {
                 "failing"
             }
+
             fn dispatch(
                 &self,
                 _dest: &Destination,
@@ -7574,6 +7607,7 @@ mod tests {
             fn tag(&self) -> &str {
                 "drop-link"
             }
+
             fn dispatch(
                 &self,
                 _dest: &Destination,
@@ -7632,6 +7666,7 @@ mod tests {
         fn tag(&self) -> &str {
             "dial"
         }
+
         fn dispatch(
             &self,
             dest: &Destination,

@@ -28,9 +28,11 @@ mod server;
 
 use std::{io, sync::Arc};
 
+use xray_proto::xray::transport::internet::{
+    QuicParams, finalmask::xdns::ResolverProto, tls::Config as TlsConfig,
+};
+
 use super::{UdpIo, Udpmask};
-use xray_proto::xray::transport::internet::finalmask::xdns::ResolverProto;
-use xray_proto::xray::transport::internet::{QuicParams, tls::Config as TlsConfig};
 
 /// poll 通知队列深度（Go `pollLimit`）。
 pub(crate) const POLL_LIMIT: usize = 16;
