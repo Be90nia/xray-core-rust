@@ -70,6 +70,12 @@ pub enum DnsError {
     #[error("dns wire format error: {0}")]
     WireFormat(String),
 
+    /// TUN 接管场景策略性拒拨：该地址是 Xray 自身 DNS 上游，查询拒发防绕回
+    /// （Go localdns client.go:99-103 同语义）。独立于 WireFormat——策略拒绝
+    /// 不是上游协议错误，按类别计数/告警不得误判。
+    #[error("skipped DNS server {0}")]
+    SkipDnsServer(String),
+
     /// 系统 DNS 解析失败（hickory-resolver 错误）。
     #[error("system dns resolution failed: {0}")]
     SystemResolve(String),
@@ -150,6 +156,11 @@ mod tests {
         assert_eq!(
             DnsError::InvalidClientIpLength(7).to_string(),
             "unexpected client ip length: 7"
+        );
+        // 消息保留 Go `skipped DNS server <addr>` 原文（dial 侧断言 grep 此串）。
+        assert_eq!(
+            DnsError::SkipDnsServer("10.0.0.1:53".into()).to_string(),
+            "skipped DNS server 10.0.0.1:53"
         );
     }
 }

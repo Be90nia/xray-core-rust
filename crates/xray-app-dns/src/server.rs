@@ -548,6 +548,7 @@ fn clone_dns_err(e: &DnsError) -> DnsError {
         DnsError::Features(f) => DnsError::Features(f.clone()),
         DnsError::NotImplemented(s) => DnsError::NotImplemented(s),
         DnsError::WireFormat(s) => DnsError::WireFormat(s.clone()),
+        DnsError::SkipDnsServer(s) => DnsError::SkipDnsServer(s.clone()),
         DnsError::SystemResolve(s) => DnsError::SystemResolve(s.clone()),
     }
 }

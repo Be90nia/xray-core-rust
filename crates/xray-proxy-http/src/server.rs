@@ -6,12 +6,11 @@
 //!
 //! ## 连接模型（对齐 Go）
 //!
-//! - **CONNECT 终结性**：tunnel 结束（或 dial 失败）即关连接，不回循环
-//!   （Go `handleConnect` 直接 return）。
-//! - **plain HTTP**：每请求拨一条新上游连接（对齐 Go `Dispatch` 每请求新
-//!   link），响应后按「客户端 `Proxy-Connection: keep-alive` **且** 上游响应
-//!   Content-Length >= 0」双条件决定回循环读下一请求（Go `goto Start`），
-//!   否则关连接。
+//! - **CONNECT 终结性**：tunnel 结束（或 dial 失败）即关连接，不回循环 （Go `handleConnect` 直接
+//!   return）。
+//! - **plain HTTP**：每请求拨一条新上游连接（对齐 Go `Dispatch` 每请求新 link），响应后按「客户端
+//!   `Proxy-Connection: keep-alive` **且** 上游响应 Content-Length >=
+//!   0」双条件决定回循环读下一请求（Go `goto Start`）， 否则关连接。
 //! - 每轮读头 deadline 60s（Go `SetReadDeadline(Timeouts.Handshake)`）。
 
 use std::{
@@ -37,6 +36,23 @@ use crate::{
     error::{HttpProxyError, Result},
 };
 
+/// HTTP 请求行版本（plain HTTP/1.x 仅此两档；解析见 [`parse_http_version`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpVersion {
+    /// `HTTP/1.0`——连接缺省非持久（RFC 7230 §A.1）。
+    H10,
+    /// `HTTP/1.1` 及其它未知版本——缺省持久（未知版本按 1.1 处理是既有
+    /// 行为：此前版本段整段被丢弃不校验，不引入新的拒绝行为）。
+    H11,
+}
+
+/// 请求行第三段 → 版本。仅精确匹配 `HTTP/1.0` 判 1.0（Go `http.ReadRequest`
+/// 只接受 HTTP/1.x，此处保持纯增量：非 1.0 一律按 1.1 语义，不新增拒绝）。
+#[must_use]
+pub fn parse_http_version(token: &str) -> HttpVersion {
+    if token.eq_ignore_ascii_case("HTTP/1.0") { HttpVersion::H10 } else { HttpVersion::H11 }
+}
+
 /// HTTP 握手结果——包含解析出的目标、方法、请求行 target 和 headers。
 ///
 /// CONNECT 隧道只需 `dest` + `method`；plain HTTP 代理需要 `target` + `headers`
@@ -49,6 +65,8 @@ pub struct HandshakeResult {
     pub method: String,
     /// 请求行 target 字段（CONNECT = `host:port`，plain HTTP = 绝对 URL 或路径）。
     pub target: String,
+    /// 请求行版本段（keep-alive 判定按版本分叉，RFC 7230 §A.1）。
+    pub http_version: HttpVersion,
     /// 解析出的 headers（key 全小写）。同名多值保留（对齐 Go `http.Header`
     /// `map[string][]string`——双 Cookie 等逐行转发，不折叠丢失）。
     pub headers: HashMap<String, Vec<String>>,
@@ -383,12 +401,10 @@ fn headers_indicate_chunked(headers: &HashMap<String, Vec<String>>) -> bool {
 /// 每次调用拨一条新上游连接（对齐 Go `Dispatch` 每请求新 link）。请求体按
 /// Content-Length 定长原样透传（不解码不重编码）；chunked 请求体不支持，回
 /// 400 明确报错。响应按上游可定界性分派：
-/// - Content-Length >= 0 → 回写 keep-alive 头，body 定长透传，返回
-///   [`PlainOutcome::WaitAnother`]；
-/// - chunked / close-delimited → 回写 close 头，body 原样透传，返回
-///   [`PlainOutcome::Close`]；
-/// - 读响应失败 → 503 + close 头，返回 [`PlainOutcome::WaitAnother`]（对齐 Go：
-///   503 分支不重置 `result`，`Process` 层仍按客户端 keep-alive 头决定循环）。
+/// - Content-Length >= 0 → 回写 keep-alive 头，body 定长透传，返回 [`PlainOutcome::WaitAnother`]；
+/// - chunked / close-delimited → 回写 close 头，body 原样透传，返回 [`PlainOutcome::Close`]；
+/// - 读响应失败 → 503 + close 头，返回 [`PlainOutcome::WaitAnother`]（对齐 Go： 503 分支不重置
+///   `result`，`Process` 层仍按客户端 keep-alive 头决定循环）。
 async fn handle_plain_http(
     client: &mut TcpStream,
     hs: &mut HandshakeResult,
@@ -681,7 +697,7 @@ where
 {
     // 1+2. 读请求行 + headers；协议格式错 → 400 后关连接；
     // EOF（客户端正常关闭）不写 400 直接断
-    let (method, target, headers) = match read_request_head(stream).await {
+    let (method, target, http_version, headers) = match read_request_head(stream).await {
         Ok(head) => head,
         Err(e @ HttpProxyError::InvalidRequest(_)) => {
             let _ = stream.write_all(RESPONSE_BAD_REQUEST).await;
@@ -734,16 +750,16 @@ where
         stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await?;
     }
 
-    Ok(HandshakeResult { dest, method, target, headers })
+    Ok(HandshakeResult { dest, method, target, http_version, headers })
 }
 
 /// 读请求行 + headers（握手第 1-2 步）。
 ///
-/// 返回 (method 大写, target, headers)；EOF/超长行/超行数/malformed 请求行
+/// 返回 (method 大写, target, 请求行版本, headers)；EOF/超长行/超行数/malformed 请求行
 /// 统一报 [`HttpProxyError::InvalidRequest`]（或 IO 错），由调用方决定 400。
 async fn read_request_head<RW>(
     stream: &mut RW,
-) -> Result<(String, String, HashMap<String, Vec<String>>)>
+) -> Result<(String, String, HttpVersion, HashMap<String, Vec<String>>)>
 where
     RW: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -757,6 +773,7 @@ where
     }
     let method = parts[0].to_ascii_uppercase();
     let target = parts[1].to_string();
+    let http_version = parse_http_version(parts[2]);
 
     // 读 headers（最多 [`MAX_HTTP_HEADER_LINES`] 行，防无界头部注入；
     // Go http.ReadRequest 语义下请求行+headers 共享 1MB 总预算，此处按行数收紧）
@@ -777,7 +794,7 @@ where
             headers.entry(k.trim().to_ascii_lowercase()).or_default().push(v.trim().to_string());
         }
     }
-    Ok((method, target, headers))
+    Ok((method, target, http_version, headers))
 }
 
 /// 单行（请求行/头部行）字节上限。Go `http.ReadRequest` 对请求行+headers 共享
