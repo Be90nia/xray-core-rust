@@ -120,6 +120,12 @@ impl ReverseRegistry {
         self.entries.read().is_empty()
     }
 
+    /// 是否存在 domain 匹配的 portal（outbound bridge 反向目标识别用）。
+    #[must_use]
+    pub fn contains_domain(&self, domain: &str) -> bool {
+        self.entries.read().values().any(|cfg| cfg.domain == domain)
+    }
+
     /// 列出所有已注册的 tag（快照）。
     #[must_use]
     pub fn tags(&self) -> Vec<String> {

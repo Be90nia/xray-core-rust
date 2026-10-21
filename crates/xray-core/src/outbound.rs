@@ -1346,6 +1346,7 @@ fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutboundConfig, S
                     "encryption": v.get("encryption"),
                     "level": v.get("level"),
                     "email": v.get("email"),
+                    "reverse": v.get("reverse"),
                 }],
             }]),
         );
@@ -1397,6 +1398,15 @@ fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutboundConfig, S
     let level = user.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     #[allow(unused_variables)] // 存量清零批次
     let email = user.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    // 反向代理 Bridge 装配（Go infra/conf/vless.go:302-308：`reverse.tag` 挂在 user 上；
+    // 出站侧 `handler.reverse` 由它派生，见 outbound.go:104-125）。tag 指向 portal，
+    // domain 取默认 `v1.rvs.cool`；空 tag（或未配置）→ 普通出站，反向域名拨号会显式报错。
+    let reverse_tag = user
+        .get("reverse")
+        .and_then(|r| r.get("tag"))
+        .and_then(|t| t.as_str())
+        .filter(|t| !t.is_empty())
+        .map(String::from);
     // testseed/testpre（Go infra/conf/vless.go:296-321）：simplified 顶层形式读
     // settings 顶层字段；标准 vnext 形式读 user json。Rust 统一为 user 字段
     // 优先、顶层回退（两分支各自语义等价覆盖）。
@@ -1409,7 +1419,7 @@ fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutboundConfig, S
     let testpre =
         user.get("testpre").or_else(|| v.get("testpre")).and_then(|x| x.as_u64()).unwrap_or(0)
             as u32;
-    Ok(VlessOutboundConfig::new(
+    let config = VlessOutboundConfig::new(
         uuid,
         Address::Domain(address.to_string()),
         Port::new(u16::try_from(port).map_err(|_| "port out of range")?),
@@ -1418,7 +1428,17 @@ fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutboundConfig, S
     .with_encryption(encryption.clone())
     .with_encryption_params(enc_params)
     .with_testseed(testseed)
-    .with_testpre(testpre))
+    .with_testpre(testpre);
+    let Some(tag) = reverse_tag else {
+        return Ok(config);
+    };
+    // portal 注册表：tag → PortalConfig{domain: v1.rvs.cool}。出站拨该域名
+    // （port 0）时 [`outbound_command`] 判为反向 carrier，发 command=Rvs。
+    let registry = xray_proxy_vless::ReverseRegistry::new();
+    registry
+        .add_reverse(xray_proxy_vless::PortalConfig::new(tag))
+        .map_err(|e| format!("vless reverse: {e}"))?;
+    Ok(config.with_reverse(Some(Arc::new(registry))))
 }
 
 /// 解析 trojan outbound settings JSON → TrojanOutboundConfig。
@@ -4045,6 +4065,50 @@ mod tests {
         let config = parse_vless_config(bare.as_bytes()).unwrap();
         assert!(config.testseed.is_empty());
         assert_eq!(config.testpre, 0);
+    }
+
+    /// 反向代理 Bridge 装配（Go infra/conf/vless.go:302-308 → outbound.go:104-125）：
+    /// user `reverse.tag` 注入出站注册表（domain 缺省 `v1.rvs.cool`），无则 None。
+    #[test]
+    fn parse_vless_config_reverse_tag_wires_registry() {
+        // 标准 vnext 形式：reverse 挂在 user 上。
+        let vnext = r#"{
+            "vnext": [{
+                "address": "s.example.com",
+                "port": 443,
+                "users": [{ "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+                            "reverse": { "tag": "portal-tag" } }]
+            }]
+        }"#;
+        let config = parse_vless_config(vnext.as_bytes()).unwrap();
+        let registry = config.reverse.as_ref().expect("reverse tag must wire a portal registry");
+        assert_eq!(registry.len(), 1);
+        assert!(registry.contains("portal-tag"));
+        assert!(registry.contains_domain(xray_proxy_vless::RVS_DOMAIN));
+
+        // 扁平形式：顶层 reverse 同样生效（Go simplified settings）。
+        let flat = r#"{
+            "address": "flat.example.com",
+            "port": 443,
+            "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+            "reverse": { "tag": "portal-flat" }
+        }"#;
+        let config = parse_vless_config(flat.as_bytes()).unwrap();
+        assert!(config.reverse.as_ref().is_some_and(|r| r.contains("portal-flat")));
+
+        // 未配置 reverse（或空 tag）→ 普通出站：反向域名拨号由 dispatcher 报错。
+        let bare = r#"{
+            "vnext": [{ "address": "b.example.com", "port": 443,
+                        "users": [{ "id": "b831381d-6324-4d53-ad4f-8cda48b30811" }] }]
+        }"#;
+        assert!(parse_vless_config(bare.as_bytes()).unwrap().reverse.is_none());
+        let empty_tag = r#"{
+            "address": "b.example.com",
+            "port": 443,
+            "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+            "reverse": { "tag": "" }
+        }"#;
+        assert!(parse_vless_config(empty_tag.as_bytes()).unwrap().reverse.is_none());
     }
 
     #[test]
