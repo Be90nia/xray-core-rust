@@ -269,8 +269,7 @@ async fn http_plain_proxy_get_forwarded_e2e() {
 
 // ===== plain HTTP 转发五场景（票 poys 验收）：真实 HttpServer serve 路径 =====
 
-use std::net::SocketAddr;
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 
 use xray_features::inbound::InboundHandler;
 use xray_proxy_http::server::HttpServer;

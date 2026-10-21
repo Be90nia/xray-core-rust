@@ -153,7 +153,7 @@ impl DoqNameServer {
         // TUN 接管的 DNS 服务器：Xray 自身上游查询拒拨（Go localdns
         // client.go:99-103 同语义），防查询经 TUN 绕回自身。
         if xray_transport::dns_skip::is_skipped_dns_query(self.addr) {
-            return Err(DnsError::WireFormat(format!("skipped DNS server {}", self.addr)));
+            return Err(DnsError::SkipDnsServer(self.addr.to_string()));
         }
 
         let endpoint = self.make_client_endpoint()?;

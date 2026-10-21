@@ -182,7 +182,7 @@ impl UdpNameServer {
         // TUN 接管的 DNS 服务器：Xray 自身上游查询拒拨（Go localdns
         // client.go:99-103 同语义），防查询经 TUN 绕回自身。
         if xray_transport::dns_skip::is_skipped_dns_query(sock_addr) {
-            return Err(DnsError::WireFormat(format!("skipped DNS server {sock_addr}")));
+            return Err(DnsError::SkipDnsServer(sock_addr.to_string()));
         }
 
         // 绑定任意本地端口。失败多为系统 fd 限制。
