@@ -10,6 +10,9 @@
 
 pub mod spec;
 
+#[cfg(windows)]
+pub mod sys;
+
 pub use spec::{
     Condition, Field, FilterSpec, Layer, LeakFilterInput, MatchType, Value, dns_outside_tun,
     leak_filter_specs,
