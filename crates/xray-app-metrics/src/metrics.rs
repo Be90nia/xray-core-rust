@@ -510,7 +510,7 @@ impl MetricsHttpServer for TokioHttpServer {
     }
 }
 
-/// 处理单个 HTTP/1.1 连接：解析请求行，返回 `/metrics` 响应或 404。
+/// 处理单个 HTTP/1.1 连接：解析 method+path 路由到 `/metrics` 与 `/debug/*` 端点，未知返回 404。
 async fn serve_one(
     mut stream: tokio::net::TcpStream,
     stats: Arc<dyn StatsCollector>,
@@ -528,21 +528,44 @@ async fn serve_one(
         },
     };
     let request_line = body.split(|&b| b == b'\n').next().unwrap_or(&[]);
-    let is_metrics = request_line.starts_with(b"GET /metrics ");
-    let response = if is_metrics {
-        let snapshot = stats.collect();
-        let obs_snapshot = obs.as_ref().and_then(|o| o.collect());
-        let body = format_prometheus(&snapshot, obs_snapshot.as_ref());
-        format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body,
-        )
-    } else {
-        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+    let line = String::from_utf8_lossy(request_line);
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    // path 剥离 query（Go /debug/pprof/goroutine?debug=1 形态）
+    let path = parts.next().unwrap_or("").split('?').next().unwrap_or("");
+    let response = match (method, path) {
+        ("GET", "/metrics") => {
+            let snapshot = stats.collect();
+            let obs_snapshot = obs.as_ref().and_then(|o| o.collect());
+            let body = format_prometheus(&snapshot, obs_snapshot.as_ref());
+            ok_response("text/plain; version=0.0.4; charset=utf-8", &body)
+        },
+        ("GET", "/debug/vars") => {
+            ok_response("application/json; charset=utf-8", &crate::debug::expvars_json())
+        },
+        ("GET", "/debug/pprof/goroutine") => {
+            ok_response("text/plain; charset=utf-8", &crate::debug::pprof_goroutine_snapshot())
+        },
+        ("GET", "/debug/pprof") | ("GET", "/debug/pprof/") => {
+            ok_response("text/html; charset=utf-8", &crate::debug::pprof_index())
+        },
+        _ => not_found_response(),
     };
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.shutdown().await;
+}
+
+/// 200 响应模板：Content-Length 按 body 字节数。
+fn ok_response(content_type: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
+    )
+}
+
+/// 404 响应模板（未知路径/未知方法）。
+fn not_found_response() -> String {
+    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
 }
 
 /// 处理从 OutboundListener 接受的 BoxedConn。

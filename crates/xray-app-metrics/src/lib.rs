@@ -23,6 +23,7 @@
 //! 在 Rust 端由 [`MetricsConfig`] 承载，`from_proto` / `to_proto` 提供 prost 互转。
 
 pub mod config;
+pub mod debug;
 pub mod error;
 pub mod feature;
 pub mod metrics;
