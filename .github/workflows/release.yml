@@ -111,6 +111,8 @@ jobs:
     permissions:
       contents: write
     steps:
+      # 随包文档（README.md / LICENSE）来自工作树，故 release job 需要 checkout
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -124,6 +126,13 @@ jobs:
             cp "$d"/* "dist/$name"
           done
           ls -la dist/
+      # 资产门（G-18）在发版前再跑一次：ci.yml 只覆盖分支 push/PR，tag push 不触发，
+      # 若发版分支带来引用 geo 资产的配置而包里没有 dat，二进制起得来但路由静默失效。
+      - name: Check geo assets
+        run: python3 tools/check_geo_assets.py
+      # G-21：产物内 README+LICENSE、zip 打包、md5/sha1/sha256/sha512 dgst
+      - name: Package archives + digests
+        run: python3 tools/package_release.py dist
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
