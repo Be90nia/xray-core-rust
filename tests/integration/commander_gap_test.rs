@@ -146,8 +146,30 @@ fn ss_inbound(port: u16) -> BuiltInbound {
 /// 起真实实例：api app（HandlerService+StatsService）+ policy system stats 门 +
 /// freedom default；按开关追加 dokodemo → echo 与 shadowsocks 入站。
 async fn start_api_instance(with_traffic_path: bool, with_ss_inbound: bool) -> ApiInstance {
-    let api_port = pick_free_port().await;
-    let api_addr = format!("127.0.0.1:{api_port}");
+    // pick_free_port 是 bind-then-drop 的 TOCTOU：并行测试可能在 drop 与真正 bind
+    // 之间抢走端口（Windows os error 10048）。整体重建配置重试几次即可，
+    // 无需改生产装配；非端口类错误立即上抛，不允许被重试掩盖。
+    let mut last = String::new();
+    for _ in 0..5 {
+        match start_api_instance_once(with_traffic_path, with_ss_inbound).await {
+            Ok(v) => return v,
+            Err(e) => {
+                let dbg = format!("{e:?}");
+                if !dbg.contains("10048") && !dbg.contains("address in use") {
+                    panic!("start_full failed (not a port race): {dbg}");
+                }
+                last = dbg;
+            },
+        }
+    }
+    panic!("start_full kept hitting address-in-use after 5 attempts: {last}");
+}
+
+async fn start_api_instance_once(
+    with_traffic_path: bool,
+    with_ss_inbound: bool,
+) -> Result<ApiInstance, String> {
+    let api_addr = format!("127.0.0.1:{}", pick_free_port().await);
 
     let mut built = BuiltConfig::default();
     built.apps.push(BuiltEntry { kind: "policy".into(), data: POLICY_SYSTEM_STATS.to_vec() });
@@ -159,7 +181,7 @@ async fn start_api_instance(with_traffic_path: bool, with_ss_inbound: bool) -> A
             listen: Some(api_addr.clone()),
             services: Some(vec!["HandlerService".to_string(), "StatsService".to_string()]),
         })
-        .unwrap(),
+        .map_err(|e| e.to_string())?,
     });
     let mut dok_port = None;
     if with_traffic_path {
@@ -175,9 +197,9 @@ async fn start_api_instance(with_traffic_path: bool, with_ss_inbound: bool) -> A
         ss_port = Some(port);
     }
     built.outbounds.push(freedom_default());
-    let (instance, _ohm, handles) = start_full(&built).await.unwrap();
+    let (instance, _ohm, handles) = start_full(&built).await.map_err(|e| format!("{e:?}"))?;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    ApiInstance { api: api_addr, dok_port, ss_port, instance, handles }
+    Ok(ApiInstance { api: api_addr, dok_port, ss_port, instance, handles })
 }
 
 /// 连接 commander gRPC（等待 server bind 就绪，最多 ~3s；与 commander_api_test.rs
