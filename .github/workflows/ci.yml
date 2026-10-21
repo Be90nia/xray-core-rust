@@ -130,6 +130,30 @@ jobs:
       - run: cargo test --workspace
       - run: cargo test --workspace --release
 
+  # Windows 平台测试门（ft58 B1 / G-17）：xray-proxy-tun 单 crate。
+  # 依赖闭包实测（cargo tree -e normal,build,dev --target x86_64-pc-windows-msvc）：
+  # 无 btls-sys → 不挂 setup-boringssl、零 BORING_* 环境变量；rustls provider =
+  # ring 0.17（非 aws-lc-sys），windows runner 镜像预装 NASM 自给自足；
+  # 含 prost-build（xray-proto 传递）→ 需要 protoc。
+  test-windows-tun:
+    name: Test (windows, xray-proxy-tun)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # 独立 prefix-key：不与 build job 的 build-v2-2204 缓存互串
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: test-win-tun-v1
+      # 依赖闭包含 xray-proto(prost-build)，测试构建需要 protoc（与 build job Windows 分支同配方）
+      - name: Install protoc
+        shell: pwsh
+        run: |
+          choco install -y protoc 2>&1 | Out-Null
+          echo "C:\ProgramData\chocolatey\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+      - run: cargo test -p xray-proxy-tun --all-targets
+
   # 安全与许可证审计
   audit:
     name: Security & License
@@ -198,3 +222,11 @@ jobs:
             echo "=== $t ==="
             cargo fuzz run "$t" -- -max_total_time=30 -rss_limit_mb=4096 -max_len=8192
           done
+
+  # proto 镜像漂移门：protos/ 只准从 Go 基线 rsync 同步，手改即挂（protos/README.md 纪律）
+  proto-drift:
+    name: Proto Drift Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 tools/check_proto_drift.py --manifest
