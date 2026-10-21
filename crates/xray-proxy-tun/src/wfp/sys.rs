@@ -18,7 +18,6 @@ use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
-use windows_sys::core::{GUID, PWSTR};
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE, LocalFree};
 use windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceIndexToLuid;
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
@@ -28,10 +27,9 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::GetSecurityDescriptorLength;
 use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+use windows_sys::core::{GUID, PWSTR};
 
-use super::spec::{
-    DNS_CLIENT_SID, LeakFilterInput, WINDOWS_DOH_DNS_BUILD, leak_filter_specs,
-};
+use super::spec::{DNS_CLIENT_SID, LeakFilterInput, WINDOWS_DOH_DNS_BUILD, leak_filter_specs};
 
 /// `RPC_C_AUTHN_WINNT`（Go `rpcCAuthnWinNT`，:35）。
 const RPC_C_AUTHN_WINNT: u32 = 10;
@@ -59,7 +57,12 @@ impl Drop for LeakFilterGuard {
 /// # Errors
 ///
 /// 权限不足、引擎打开失败、过滤器添加失败等，返回可诊断错误文本。
-pub fn install(tun_if_index: u32, dns: bool, ipv4: bool, ipv6: bool) -> Result<LeakFilterGuard, String> {
+pub fn install(
+    tun_if_index: u32,
+    dns: bool,
+    ipv4: bool,
+    ipv6: bool,
+) -> Result<LeakFilterGuard, String> {
     let tun_luid = interface_luid(tun_if_index)?;
     install_with_luid(tun_luid, dns, ipv4, ipv6)
 }
@@ -94,18 +97,13 @@ pub fn install_with_luid(
 fn open_engine() -> Result<HANDLE, String> {
     let name = wide("Xray TUN");
     let mut session: wfp::FWPM_SESSION0 = unsafe { std::mem::zeroed() };
-    session.displayData = wfp::FWPM_DISPLAY_DATA0 { name: name.as_ptr() as PWSTR, description: ptr::null_mut() };
+    session.displayData =
+        wfp::FWPM_DISPLAY_DATA0 { name: name.as_ptr() as PWSTR, description: ptr::null_mut() };
     session.flags = wfp::FWPM_SESSION_FLAG_DYNAMIC;
     let mut engine: HANDLE = ptr::null_mut();
     // SAFETY：session/engine 均为有效栈/局部变量，API 只读取 session、写出 engine。
     let status = unsafe {
-        wfp::FwpmEngineOpen0(
-            ptr::null(),
-            RPC_C_AUTHN_WINNT,
-            ptr::null(),
-            &session,
-            &mut engine,
-        )
+        wfp::FwpmEngineOpen0(ptr::null(), RPC_C_AUTHN_WINNT, ptr::null(), &session, &mut engine)
     };
     check(status, "FwpmEngineOpen0")?;
     Ok(engine)
@@ -147,10 +145,14 @@ fn add_sublayer(engine: HANDLE, sublayer_key: GUID) -> Result<(), String> {
     let name = wide("Xray TUN");
     let mut sublayer: wfp::FWPM_SUBLAYER0 = unsafe { std::mem::zeroed() };
     sublayer.subLayerKey = sublayer_key;
-    sublayer.displayData = wfp::FWPM_DISPLAY_DATA0 { name: name.as_ptr() as PWSTR, description: ptr::null_mut() };
+    sublayer.displayData =
+        wfp::FWPM_DISPLAY_DATA0 { name: name.as_ptr() as PWSTR, description: ptr::null_mut() };
     sublayer.weight = 0xffff;
     // SAFETY：sublayer 为有效局部变量。
-    check(unsafe { wfp::FwpmSubLayerAdd0(engine, &sublayer, ptr::null_mut()) }, "FwpmSubLayerAdd0")?;
+    check(
+        unsafe { wfp::FwpmSubLayerAdd0(engine, &sublayer, ptr::null_mut()) },
+        "FwpmSubLayerAdd0",
+    )?;
     Ok(())
 }
 
@@ -175,11 +177,8 @@ fn add_filter(
         Anonymous: wfp::FWP_VALUE0_0 { uint8: spec.weight },
     };
     filter.numFilterConditions = conditions.len() as u32;
-    filter.filterCondition = if conditions.is_empty() {
-        ptr::null_mut()
-    } else {
-        conditions.as_mut_ptr()
-    };
+    filter.filterCondition =
+        if conditions.is_empty() { ptr::null_mut() } else { conditions.as_mut_ptr() };
     filter.action = wfp::FWPM_ACTION0 {
         r#type: match spec.action {
             super::spec::Action::Permit => wfp::FWP_ACTION_PERMIT,
@@ -189,14 +188,15 @@ fn add_filter(
         Anonymous: unsafe { std::mem::zeroed() },
     };
     // SAFETY：filter/conditions/arena 在调用期间均有效（arena 持有所需缓冲）。
-    let status = unsafe {
-        wfp::FwpmFilterAdd0(engine, &filter, ptr::null_mut(), ptr::null_mut())
-    };
+    let status = unsafe { wfp::FwpmFilterAdd0(engine, &filter, ptr::null_mut(), ptr::null_mut()) };
     check(status, &format!("FwpmFilterAdd0({})", spec.name))?;
     Ok(())
 }
 
 /// 条件值需要的稳定内存（blob 数据、u64、16 字节地址）。
+// Box 是**语义必需**：这些指针要存进 FWP union（blob 描述符 / uint64 / addr16），
+// 元素必须地址稳定——`Vec<T>` 会在扩容时搬家，clippy 的 vec_box 建议在此不可采纳。
+#[allow(clippy::vec_box)]
 #[derive(Default)]
 struct CondArena {
     /// blob 数据底座（`Box<[u8]>` 保证地址稳定）。
@@ -325,8 +325,7 @@ fn interface_luid(if_index: u32) -> Result<u64, String> {
 
 /// 本进程 AppID（`FwpmGetAppIdFromFileName0`）。
 fn current_exe_app_id() -> Result<Vec<u8>, String> {
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("current_exe for WFP app id: {e}"))?;
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe for WFP app id: {e}"))?;
     let path = wide_path(&exe);
     let mut blob: *mut wfp::FWP_BYTE_BLOB = ptr::null_mut();
     // SAFETY：path 为有效 UTF-16 缓冲；blob 由 API 写出。

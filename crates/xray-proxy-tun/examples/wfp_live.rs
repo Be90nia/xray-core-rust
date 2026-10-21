@@ -38,9 +38,7 @@ impl Log {
 
 /// 统计 `netsh wfp show filters` 输出里出现我们过滤器显示名的次数。
 fn count_our_filters() -> (usize, usize) {
-    let out = Command::new("netsh")
-        .args(["wfp", "show", "filters"])
-        .output();
+    let out = Command::new("netsh").args(["wfp", "show", "filters"]).output();
     let Ok(out) = out else {
         return (0, 0);
     };
@@ -58,9 +56,8 @@ fn main() {
 #[cfg(target_os = "windows")]
 fn main() {
     let mut args = std::env::args().skip(1);
-    let log_path = args
-        .next()
-        .unwrap_or_else(|| "reports/night-run-2026-10-20/tmp/wfp_live.log".to_string());
+    let log_path =
+        args.next().unwrap_or_else(|| "reports/night-run-2026-10-20/tmp/wfp_live.log".to_string());
     let mut real_luid: Option<u64> = None;
     while let Some(a) = args.next() {
         if a == "--real-luid" {
