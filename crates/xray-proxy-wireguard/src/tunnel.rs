@@ -187,12 +187,9 @@ impl Tunnel {
     ///
     /// driver task 应每隔 ~100ms 调一次。返回需要发送的 WG 数据报（如有）。
     pub fn update_timers(&mut self) -> Result<Vec<Output>> {
-        // 检查是否需要 session key 轮换（每 2 分钟）
-        let should_rekey = self
-            .last_handshake
-            .map(|t| t.elapsed() >= self.session_key_rotation_interval)
-            .unwrap_or(true);
-        if should_rekey {
+        // 检查是否需要 session key 轮换（每 2 分钟）。握手前 last_handshake 为 None
+        // ——没有会话可轮换，不得断言「已触发轮转」（z7ya 排查时这条噪音误导了定位）。
+        if self.last_handshake.is_some_and(|t| t.elapsed() >= self.session_key_rotation_interval) {
             // boringtun 的 update_timers 内部会处理 rekey
             tracing::debug!("wg session key rotation triggered");
         }
