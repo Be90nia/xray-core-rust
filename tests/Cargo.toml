@@ -71,6 +71,23 @@ path = "integration/test_udp_connection.rs"
 [[test]]
 name = "integration_dial_xray"
 path = "integration/test_dial_xray.rs"
+
+[[test]]
+name = "integration_gap_matrix"
+path = "integration/gap_matrix_e2e_test.rs"
+
+[[test]]
+name = "integration_sniffing"
+path = "integration/sniffing_test.rs"
+
+[[test]]
+name = "integration_policy"
+path = "integration/policy_test.rs"
+
+[[test]]
+name = "integration_commander_gap"
+path = "integration/commander_gap_test.rs"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 xray-common = { path = "../crates/xray-common" }
