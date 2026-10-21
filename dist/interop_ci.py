@@ -262,10 +262,15 @@ def build_x(proto, P):
                            "cert": _pem(CERT), "key": _pem(KEY)}}
         # 客户端独立 hysteria outbound,
         # settings JSON 对齐 parse_hysteria_config (outbound.rs:2353): {version, servers[]}.
+        # 2026-10-20 起 dialer 对齐 Go dialer.go:327-330：无 security=tls 硬错拒启，
+        # 测例补 streamSettings（自签证书显式 insecure 信任，Go 语义同款门）。
         co = {"protocol": "hysteria",
               "settings": {"version": 2,
                            "servers": [{"address": "127.0.0.1", "port": P,
-                                        "auth": auth_pw, "serverName": "localhost"}]}}
+                                        "auth": auth_pw, "serverName": "localhost"}]},
+              "streamSettings": {"network": "hysteria", "security": "tls",
+                                 "hysteriaSettings": {"version": 2},
+                                 "tlsSettings": {"serverName": "localhost", "insecure": True}}}
     elif proto == 'anytls':
         # anytls 协议对 dest 行为: 透明代理 (类似 vision); 用本地 echo 当 dest.
         auth_pw = 'anytls-secret'
