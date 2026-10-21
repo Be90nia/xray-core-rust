@@ -290,9 +290,7 @@ mod tests {
     #[test]
     fn wire_go_interop_hex_fixture() {
         use prost::Message as _;
-
-        use xray_proto::xray::common::protocol::User as ProtoUser;
-        use xray_proto::xray::proxy::wireguard as pb;
+        use xray_proto::xray::{common::protocol::User as ProtoUser, proxy::wireguard as pb};
 
         const GO_ENCODED: &str = "0a0461616262120831302e302e302e311a150a0463636464220232352a09302e302e302e302f30208c0b2a140801121075736572406578616d706c652e636f6d4001";
 

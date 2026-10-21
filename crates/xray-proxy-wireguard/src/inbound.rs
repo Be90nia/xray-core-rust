@@ -459,8 +459,11 @@ fn forward_wg_udp_datagram(
 ///
 /// 独占一个 [`UdpDispatchSession`]：
 /// - 上行：cmd 队列（accept loop 非阻塞入队）→ `send_packet`（XUDP 帧 → dispatcher）
-/// - 下行：`recv_packet` → 从原目标 endpoint 发回 smoltcp（Go `writeUDP(payload,
-///   dst, src)` 语义），driver 定时器 drain_tx 加密发回 WG client。
+/// - 下行：`recv_packet` → 从**原目标** endpoint 发回 smoltcp（Go `writeUDP(payload, dst, src)`
+///   语义），driver 定时器 drain_tx 加密发回 WG client。
+///
+/// 回包源取请求的原目标而非 XUDP 帧来源：帧来源是真实应答方，被 freedom override /
+/// 代理链改写后对隧道内客户端不可达（Go `udp_fullcone.go` `Write` 用会话的 `c.dst`）。
 ///
 /// 退出条件：cmd 口关闭（sweep/摘除）、outbound 关闭（`Ok(None)`）、收发 IO 错。
 async fn run_wg_udp_session(
@@ -472,6 +475,8 @@ async fn run_wg_udp_session(
     first_payload: Vec<u8>,
 ) {
     let mut session = UdpDispatchSession::new(dispatch);
+    // 回包源 = 最近一次请求的原目标（会话换目标时跟随；Go 固定用建会话时的 dst）。
+    let mut reply_src = address_to_ip_endpoint(first_dest.address(), first_dest.port().value());
     if let Err(e) = session.send_packet(&first_dest, &first_payload).await {
         tracing::warn!(error = %e, src = %inner_src, dst = ?first_dest, "wg udp: first send_packet failed");
         return;
@@ -480,6 +485,8 @@ async fn run_wg_udp_session(
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
                 Some(WgUdpCmd::Send { dest, payload }) => {
+                    reply_src =
+                        address_to_ip_endpoint(dest.address(), dest.port().value()).or(reply_src);
                     if let Err(e) = session.send_packet(&dest, &payload).await {
                         tracing::warn!(error = %e, src = %inner_src, dst = ?dest, "wg udp: send_packet failed");
                         return;
@@ -492,8 +499,11 @@ async fn run_wg_udp_session(
             },
             resp = session.recv_packet() => match resp {
                 Ok(Some((source, payload))) => {
-                    let Some(reply_src) = address_to_ip_endpoint(source.address(), source.port().value()) else {
-                        tracing::warn!(src = %inner_src, "wg udp: reply source is domain, dropped");
+                    // 原目标仅 IP 包来源（内层数据报目标恒为 IP）；域名才退化为帧来源。
+                    let Some(reply_src) = reply_src
+                        .or_else(|| address_to_ip_endpoint(source.address(), source.port().value()))
+                    else {
+                        tracing::warn!(src = %inner_src, resp = %source, "wg udp: reply source unusable, dropped");
                         continue;
                     };
                     let mut stack = netstack.lock().await;

@@ -21,11 +21,11 @@
 //! - `wg_dataplane_tcp_echo_1mb_three_concurrent` ← Go `testTCPConn(clientPort, 1MB)` ×3
 //! - `wg_dataplane_tcp_echo_1mb_inner_ipv6`       ← Go `testTCPConn(client6Port, 1MB)`
 //! - `wg_dataplane_udp_echo_1kb`                  ← Go `testUDPConn(clientUDPPort, 1KB)`
+//! - `wg_dataplane_udp_echo_loopback_override`    ← 同上拓扑，隧道内 192.0.2.1 + override
 //!
-//! UDP 用例的隧道内目标用本机非回环 IPv4（Go 用 192.0.2.1 + 服务端 override）：
-//! freedom 响应帧携带真实应答方地址，`run_wg_udp_session` 以其作隧道内回包源；
-//! 回环地址会被客户端 `WgNetStack::not_forwardable`（loopback src）静默丢弃
-//! （Go 无此语义——Go 以原始隧道内目标为回包源）。详见 ft58-S8 报告 finding。
+//! UDP 回包源 = 隧道内**原目标**（Go `tun/udp_fullcone.go` `Write` → `c.dst`），故
+//! override 指向回环 echo 时回显照样通（`wg_dataplane_udp_echo_loopback_override`）；
+//! `wg_dataplane_udp_echo_1kb` 的隧道内目标用本机非回环 IPv4（freedom 无 override）。
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
@@ -108,9 +108,7 @@ fn host_lan_v4() -> Option<Ipv4Addr> {
     let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     s.connect("8.8.8.8:80").ok()?;
     match s.local_addr().ok()? {
-        SocketAddr::V4(v4) if !v4.ip().is_loopback() && !v4.ip().is_unspecified() => {
-            Some(*v4.ip())
-        },
+        SocketAddr::V4(v4) if !v4.ip().is_loopback() && !v4.ip().is_unspecified() => Some(*v4.ip()),
         _ => None,
     }
 }
@@ -183,7 +181,13 @@ fn loopback_allow() -> Vec<String> {
 }
 
 /// dokodemo inbound（预定义目标 = 隧道内地址）。
-fn dokodemo_in(port: u16, tag: &str, dest_addr: &str, dest_port: u16, network: &str) -> BuiltInbound {
+fn dokodemo_in(
+    port: u16,
+    tag: &str,
+    dest_addr: &str,
+    dest_port: u16,
+    network: &str,
+) -> BuiltInbound {
     BuiltInbound {
         entry: BuiltEntry {
             kind: "dokodemo".into(),
@@ -428,7 +432,7 @@ async fn wg_dataplane_tcp_echo_1mb_inner_ipv6() {
 /// 回包逐字节相等即通过。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wg_dataplane_udp_echo_1kb() {
-    // 隧道内目标 = 本机非回环 IPv4 : 空闲 UDP 端口（回环会被 not_forwardable 丢弃）
+    // 隧道内目标 = 本机非回环 IPv4 : 空闲 UDP 端口（freedom 无 override，直连）
     init_tracing();
     let lan_ip = host_lan_v4().expect("host must have a non-loopback IPv4 for the udp case");
     let inner_port = pick_free_udp_port().await;
@@ -475,15 +479,15 @@ async fn wg_dataplane_udp_echo_1kb() {
     let mut got: Option<Vec<u8>> = None;
     // 有界重发：握手窗口（首个数据报大概率被吞）+ 调度延迟；20×500ms 上限 10s
     for attempt in 0..20u32 {
-        client
-            .send_to(&payload, ("127.0.0.1", entry_port))
-            .await
-            .expect("client send");
+        client.send_to(&payload, ("127.0.0.1", entry_port)).await.expect("client send");
         let mut buf = vec![0u8; 4096];
         match timeout(Duration::from_millis(500), client.recv_from(&mut buf)).await {
             Ok(Ok((n, _))) => {
                 got = Some(buf[..n].to_vec());
-                println!("[timing] 1KB UDP via wg tunnel: {:?} (attempt {attempt})", started.elapsed());
+                println!(
+                    "[timing] 1KB UDP via wg tunnel: {:?} (attempt {attempt})",
+                    started.elapsed()
+                );
                 break;
             },
             _ => continue,
@@ -493,6 +497,85 @@ async fn wg_dataplane_udp_echo_1kb() {
         got.as_deref(),
         Some(payload.as_slice()),
         "udp echo payload mismatch through wg tunnel"
+    );
+
+    for h in handles_c.into_iter().chain(handles_s) {
+        h.abort();
+    }
+}
+
+// ============================================================
+// 用例 4（Go 拓扑：隧道内 192.0.2.1 + 服务端 override → 回环 echo）
+// ============================================================
+
+/// bd n07t F1：回包源 = **隧道内原目标**（Go `tun/udp_fullcone.go` `Write` → `c.dst`）。
+/// override 后真实应答方是 127.0.0.1，若以其为回包源，客户端 `WgNetStack::not_forwardable`
+/// （loopback src）静默丢弃 → 回显必失。与 Go `TestWireguard` 的 UDP 拓扑一致。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wg_dataplane_udp_echo_loopback_override() {
+    init_tracing();
+    let inner_port = pick_free_udp_port().await;
+    let entry_port = pick_free_port().await;
+    let wg_port = pick_free_port().await;
+    let (sec_c, pub_c) = wg_keypair(0x81);
+    let (sec_s, pub_s) = wg_keypair(0x82);
+
+    // 真实 echo 在回环（freedom override 的终点）
+    spawn_udp_echo(&format!("127.0.0.1:{inner_port}")).await;
+
+    // client：dokodemo UDP → wg-out；隧道内目标 = 192.0.2.1:inner_port
+    let mut client_cfg = BuiltConfig::default();
+    client_cfg.inbounds.push(dokodemo_in(
+        entry_port,
+        "dokodemo-udp",
+        "192.0.2.1",
+        inner_port,
+        "udp",
+    ));
+    client_cfg.outbounds.push(wg_outbound(&sec_c, &pub_s, wg_port, &["10.0.0.2/32"]));
+    let (_inst_c, _ohm_c, handles_c) = start_full(&client_cfg).await.expect("client instance");
+
+    // server：wg-in → freedom lan（override → 回环 echo）
+    let mut server_cfg = BuiltConfig::default();
+    server_cfg.inbounds.push(wg_inbound(
+        &sec_s,
+        &pub_c,
+        wg_port,
+        &["10.0.0.1/32"],
+        &["10.0.0.2/32"],
+    ));
+    let mut allow = loopback_allow();
+    allow.push("192.0.2.1/32".to_string());
+    server_cfg.outbounds.push(freedom_lan(&allow, Some(("127.0.0.1", inner_port))));
+    let (_inst_s, _ohm_s, handles_s) = start_full(&server_cfg).await.expect("server instance");
+
+    tokio::time::sleep(READY_DELAY).await;
+
+    let payload = make_payload(KB, 0xC800);
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+
+    let started = Instant::now();
+    let mut got: Option<Vec<u8>> = None;
+    // 有界重发（同用例 3：握手窗口首个数据报可能被 boringtun 吞）
+    for attempt in 0..20u32 {
+        client.send_to(&payload, ("127.0.0.1", entry_port)).await.expect("client send");
+        let mut buf = vec![0u8; 4096];
+        match timeout(Duration::from_millis(500), client.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) => {
+                got = Some(buf[..n].to_vec());
+                println!(
+                    "[timing] 1KB UDP (loopback override) via wg tunnel: {:?} (attempt {attempt})",
+                    started.elapsed()
+                );
+                break;
+            },
+            _ => continue,
+        }
+    }
+    assert_eq!(
+        got.as_deref(),
+        Some(payload.as_slice()),
+        "udp echo via loopback override must survive: reply source must be the inner target"
     );
 
     for h in handles_c.into_iter().chain(handles_s) {
