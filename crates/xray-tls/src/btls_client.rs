@@ -327,6 +327,9 @@ const FIREFOX_148_CIPHER_LIST: &str = concat!(
 );
 
 /// Firefox 148 signature algorithms。
+/// ponytail (REALITY): Go REALITY 服务端证书/CertificateVerify 用 Ed25519
+/// (0x0807)，真实 Firefox 148 不发送该算法（uTLS HelloFirefox_148 同）但
+/// btls 客户端按声明列表校验 CertificateVerify——与 chrome 模板同款处理，必须加。
 const FIREFOX_148_SIGALGS: &str = concat!(
     "ecdsa_secp256r1_sha256:",
     "rsa_pss_rsae_sha256:",
@@ -337,18 +340,25 @@ const FIREFOX_148_SIGALGS: &str = concat!(
     "rsa_pkcs1_sha384:",
     "ecdsa_secp521r1_sha512:",
     "rsa_pkcs1_sha512:",
+    "ed25519:",
     "rsa_pkcs1_sha1:",
     "ecdsa_sha1"
 );
 
-/// Firefox 148 supported groups：X25519, P-256, P-384, P-521。
-const FIREFOX_148_CURVES: &str = "X25519:P-256:P-384:P-521";
+/// Firefox 148 supported groups：X25519MLKEM768 优先（Firefox 132+ 默认 PQ），
+/// 后接 X25519, P-256, P-384, P-521。key shares 必须是该列表的同序子集
+/// （BoringSSL `SSL_set1_client_key_shares` 校验），故 MLKEM768 须列首位。
+const FIREFOX_148_CURVES: &str = "X25519MLKEM768:X25519:P-256:P-384:P-521";
 
 /// Firefox 148 ALPN。
 const FIREFOX_148_ALPN: &[u8] = b"\x02h2\x08http/1.1";
 
-/// Firefox 148 key shares（仅 X25519，无 PQ）。
-const FIREFOX_148_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519];
+/// Firefox 148 key shares：`[X25519MLKEM768, X25519, P256]`，
+/// 对齐 Go uTLS `HelloFirefox_148`（utls@v1.8.3 u_parrots.go）。REALITY 服务端
+/// （Go `xtls/reality` tls.go、本仓 xray-reality server.rs 同门）要求 ClientHello
+/// 带 MLKEM768 key share，缺则 reject→forward。
+const FIREFOX_148_KEY_SHARES: &[KeyShare] =
+    &[KeyShare::X25519_MLKEM768, KeyShare::X25519, KeyShare::P256];
 
 /// Firefox 148 不使用 ALPS。
 const FIREFOX_148_ALPS: &[u8] = &[];
@@ -410,8 +420,9 @@ const FIREFOX_120_CIPHER_LIST: &str = FIREFOX_148_CIPHER_LIST;
 /// Firefox 120 signature algorithms（与 Firefox 148 相同）。
 const FIREFOX_120_SIGALGS: &str = FIREFOX_148_SIGALGS;
 
-/// Firefox 120 supported groups（与 Firefox 148 相同）。
-const FIREFOX_120_CURVES: &str = FIREFOX_148_CURVES;
+/// Firefox 120 supported groups（无 PQ——ML-KEM 是 Firefox 132 引入，120 不带）。
+/// 独立于 `FIREFOX_148_CURVES`（148 已加 MLKEM768）。
+const FIREFOX_120_CURVES: &str = "X25519:P-256:P-384:P-521";
 
 /// Firefox 120 ALPN（与 Firefox 148 相同）。
 const FIREFOX_120_ALPN: &[u8] = FIREFOX_148_ALPN;
@@ -498,14 +509,18 @@ const SAFARI_26_3_SIGALGS: &str = concat!(
     "ed25519" // BoringSSL 不支持: rsa_pkcs1_sha1, ecdsa_sha1, ed448, rsa_pss_pss_*
 );
 
-/// Safari 26.3 supported groups：X25519, P-256, P-384, P-521。
-const SAFARI_26_3_CURVES: &str = "X25519:P-256:P-384:P-521";
+/// Safari 26.3 supported groups：X25519MLKEM768 优先（iOS 18/macOS 26 默认 PQ），
+/// 后接 X25519, P-256, P-384, P-521。同 Firefox：key shares 须为同序子集。
+const SAFARI_26_3_CURVES: &str = "X25519MLKEM768:X25519:P-256:P-384:P-521";
 
 /// Safari 26.3 ALPN。
 const SAFARI_26_3_ALPN: &[u8] = b"\x02h2\x08http/1.1";
 
-/// Safari 26.3 key shares（仅 X25519）。
-const SAFARI_26_3_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519];
+/// Safari 26.3 key shares：`[X25519MLKEM768, X25519]`。Go uTLS `HelloSafari_26_3`
+/// 原形是 `[GREASE, X25519MLKEM768, X25519]`，GREASE key share 无法在此表达——
+/// BoringSSL `SSL_set1_client_key_shares` 校验 key shares 必须是真实组的同序子集
+/// （GREASE 假组 ID 被拒），降级省略 GREASE 条目，MLKEM768/X25519 保留。
+const SAFARI_26_3_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519_MLKEM768, KeyShare::X25519];
 
 /// Safari 26.3 不使用 ALPS。
 const SAFARI_26_3_ALPS: &[u8] = &[];
