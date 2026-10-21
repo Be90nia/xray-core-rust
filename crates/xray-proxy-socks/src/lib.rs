@@ -20,6 +20,7 @@ pub mod dispatcher;
 pub mod error;
 pub mod protocol;
 pub mod server;
+pub mod udp;
 
 // 顶层 re-export。
 pub use client::{ClientConfig, SocksClient};
@@ -34,3 +35,4 @@ pub use protocol::{
     write_address_port,
 };
 pub use server::{SocksServer, socks_handshake, socks4_handshake, socks5_server_handshake};
+pub use udp::SocksUdpClient;

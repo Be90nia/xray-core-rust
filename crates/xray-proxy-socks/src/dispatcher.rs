@@ -40,7 +40,7 @@ pub fn make_dial_fn(client: Arc<SocksClient>) -> DialFn {
 }
 
 /// Destination → SocksAddr 转换（IPv4 / IPv6 / Domain）。
-fn dest_to_socks(dest: &Destination) -> SocksAddr {
+pub(crate) fn dest_to_socks(dest: &Destination) -> SocksAddr {
     let port = dest.port().value();
     match dest.address() {
         Address::IPv4(ip) => SocksAddr::ipv4(*ip, port),
