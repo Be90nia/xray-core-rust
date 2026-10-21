@@ -780,4 +780,38 @@ mod tests {
             .await
             .expect("full pipeline should complete well under 2 minutes");
     }
+
+    /// 写方向不饿死（bd hjkf 同族复核）：xmc 数据面本就是「每方向各自独立 task +
+    /// 无界通道」，app 不读时回程只堆在回程 task 里，不传染写方向——无需改造成
+    /// fragment 的 spawn 形态。阶梯 16K/64K/256K/512K 写-后-读。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_side_survives_unread_echo_ladder() {
+        let config = test_config();
+        for &size in &[16 * 1024usize, 64 * 1024, 256 * 1024, 512 * 1024] {
+            // inner 缓冲需容纳「上行 + 回程」两向积压（各 ≤512K）。
+            let (client_raw, server_raw) = tokio::io::duplex(4 << 20);
+            let wrapped_client: DynIo = config.wrap_conn_client(Box::new(client_raw)).unwrap();
+            let wrapped_server: DynIo = config.wrap_conn_server(Box::new(server_raw)).unwrap();
+            let (mut sr, mut sw) = tokio::io::split(wrapped_server);
+            let _echo = tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut sr, &mut sw).await;
+            });
+            let (mut cr, mut cw) = tokio::io::split(wrapped_client);
+
+            let payload: Vec<u8> = (0..size).map(|i| (i & 0xFF) as u8).collect();
+            tokio::time::timeout(Duration::from_secs(30), cw.write_all(&payload))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{size}B: write side starved while echo unread (head-of-line blocking)")
+                })
+                .expect("write ok");
+            cw.flush().await.unwrap();
+            let mut got = vec![0u8; payload.len()];
+            tokio::time::timeout(Duration::from_secs(30), cr.read_exact(&mut got))
+                .await
+                .unwrap_or_else(|_| panic!("{size}B: echo stalled after write"))
+                .expect("echo read ok");
+            assert_eq!(got, payload, "{size}B: echo corrupted");
+        }
+    }
 }

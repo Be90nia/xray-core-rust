@@ -17,10 +17,7 @@ use std::{io, sync::Arc};
 use async_trait::async_trait;
 use codec::{Codec, PackedDecoder, PackedEncoder, decode_bytes};
 use table::{Layout, get_tables};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    select,
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{AsyncIo, Tcpmask, UDP_SIZE, UdpIo, Udpmask};
 
@@ -107,11 +104,12 @@ impl Tcpmask for SudokuConfig {
 /// - `is_client=false`：服务端读 pure、写 packed
 async fn tcp_bridge(
     inner: Box<dyn AsyncIo>,
-    mut pipe: tokio::io::DuplexStream,
+    pipe: tokio::io::DuplexStream,
     config: SudokuConfig,
     is_client: bool,
 ) {
     let (mut inner_r, mut inner_w) = tokio::io::split(inner);
+    let (mut pipe_r, mut pipe_w) = tokio::io::split(pipe);
 
     let tables = match get_tables(&config.password, &config.ascii, &config.custom_tables) {
         Ok(t) => t,
@@ -121,18 +119,18 @@ async fn tcp_bridge(
 
     let mut pure_enc = Codec::new(tables.clone(), p_min, p_max);
     let mut packed_enc = PackedEncoder::new(&tables, p_min, p_max);
-    let mut packed_dec = PackedDecoder::default();
-    let mut pure_table_index = 0usize;
-    let mut pure_hint_buf: Vec<u8> = Vec::new();
+
+    // inner → pipe 独立 task：解码（client 读 packed / server 读 pure）。
+    // 对端不读 pipe 时只有本方向阻塞，不传染写方向（bd hjkf：单 task `select!` +
+    // 分支体内 await 会整体饿死写方向）。解码状态只服务本方向，随 task 一起搬走。
     let layouts: Vec<Layout> = tables.iter().map(|t| t.layout.clone()).collect();
-
-    let mut inner_read_buf = vec![0u8; UDP_SIZE];
-    let mut pipe_read_buf = vec![0u8; UDP_SIZE];
-
-    loop {
-        select! {
-            // inner → pipe：解码（client 读 packed / server 读 pure）
-            r = inner_r.read(&mut inner_read_buf) => match r {
+    let back = tokio::spawn(async move {
+        let mut packed_dec = PackedDecoder::default();
+        let mut pure_table_index = 0usize;
+        let mut pure_hint_buf: Vec<u8> = Vec::new();
+        let mut inner_read_buf = vec![0u8; UDP_SIZE];
+        loop {
+            match inner_r.read(&mut inner_read_buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let decoded = if is_client {
@@ -145,33 +143,54 @@ async fn tcp_bridge(
                             std::mem::take(&mut pure_hint_buf),
                             Vec::new(),
                         ) {
-                            Ok((hb, out)) => { pure_hint_buf = hb; Ok(out) }
+                            Ok((hb, out)) => {
+                                pure_hint_buf = hb;
+                                Ok(out)
+                            },
                             Err(e) => Err(e),
                         }
                     };
                     match decoded {
-                        Ok(d) => { if pipe.write_all(&d).await.is_err() { break; } }
+                        Ok(d) => {
+                            if pipe_w.write_all(&d).await.is_err() {
+                                break;
+                            }
+                        },
                         Err(_) => break,
                     }
-                }
-            },
-            // pipe → inner：编码（client 写 pure / server 写 packed）
-            r = pipe.read(&mut pipe_read_buf) => match r {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let encoded = if is_client {
-                        pure_enc.encode(&pipe_read_buf[..n])
-                    } else {
-                        packed_enc.encode(&pipe_read_buf[..n])
-                    };
-                    match encoded {
-                        Ok(e) => { if inner_w.write_all(&e).await.is_err() { break; } }
-                        Err(_) => break,
-                    }
+                },
+            }
+        }
+        let _ = pipe_w.shutdown().await;
+    });
+
+    // pipe → inner 留在本 task：编码（client 写 pure / server 写 packed）。
+    let mut pipe_read_buf = vec![0u8; UDP_SIZE];
+    loop {
+        match pipe_r.read(&mut pipe_read_buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let encoded = if is_client {
+                    pure_enc.encode(&pipe_read_buf[..n])
+                } else {
+                    packed_enc.encode(&pipe_read_buf[..n])
+                };
+                match encoded {
+                    Ok(e) => {
+                        if inner_w.write_all(&e).await.is_err() {
+                            break;
+                        }
+                    },
+                    Err(_) => break,
                 }
             },
         }
     }
+    let _ = inner_w.shutdown().await;
+    // 写侧结束后不再有回程数据可交（与旧单 task 版 break 即整体关闭的语义一致）。
+    // shortcut: 不支持 app 半关后继续读回程（上层从不半关）；真有需求时把 abort
+    // 换成 `let _ = back.await`。
+    back.abort();
 }
 
 // ===== UDP conn =====
@@ -356,6 +375,50 @@ mod tests {
             assert_eq!(got, msg);
         };
         tokio::join!(write_fut, read_fut);
+    }
+
+    /// 写方向饿死回归（bd hjkf）：client↔server 双桥对接，服务端即时回显；
+    /// app 不读期间回程只能堆在 client pipe（8 KiB）里。单 task `select!` + 分支体内
+    /// `await` 会让 inner→pipe 的阻塞传染写方向（app 写满 pipe 后彻底停摆）。
+    ///
+    /// inner 缓冲取 8 MiB：pure 编码 1 字节 → 4 hint（4× 膨胀），需容纳 512K 载荷的
+    /// 编码结果 + 回程 packed 数据，模拟真实 TCP 内核缓冲。阶梯 16K/64K/256K/512K。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bridge_keeps_draining_write_side_while_echo_unread() {
+        use std::time::Duration;
+
+        for &size in &[16 * 1024usize, 64 * 1024, 256 * 1024, 512 * 1024] {
+            let (client_raw, server_raw) = tokio::io::duplex(8 << 20);
+            let config = sample_config();
+            let wrapped_client: Box<dyn AsyncIo> =
+                config.wrap_conn_client(Box::new(client_raw)).unwrap();
+            let wrapped_server: Box<dyn AsyncIo> =
+                config.wrap_conn_server(Box::new(server_raw)).unwrap();
+
+            let (mut sr, mut sw) = tokio::io::split(wrapped_server);
+            let echo = tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut sr, &mut sw).await;
+            });
+
+            let mut app = wrapped_client;
+            let payload: Vec<u8> = (0..size).map(|i| (i & 0xFF) as u8).collect();
+            // 1) 只写不读：写方向不得因回程积压停摆。
+            tokio::time::timeout(Duration::from_secs(5), app.write_all(&payload))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{size}B: write side starved while echo unread (head-of-line blocking)")
+                })
+                .expect("write ok");
+            // 2) 开始读：echo 必须逐字节回齐（编码/解码路径不得丢/重排）。
+            let mut got = vec![0u8; payload.len()];
+            tokio::time::timeout(Duration::from_secs(5), app.read_exact(&mut got))
+                .await
+                .unwrap_or_else(|_| panic!("{size}B: echo stalled after write"))
+                .expect("echo read ok");
+            assert_eq!(got, payload, "{size}B: echo corrupted");
+            drop(app);
+            let _ = echo.await;
+        }
     }
 
     #[tokio::test]
