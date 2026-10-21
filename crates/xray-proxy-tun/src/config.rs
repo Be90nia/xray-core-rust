@@ -647,10 +647,14 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     #[test]
+    #[allow(clippy::err_expect)] // 测试断言期 expect（StackOptions 无 Debug，禁 expect_err/unwrap_err）
     fn parse_json_dns_takeover_requires_gateway_on_linux() {
         // Go infra/conf/tun.go:62-65 + tun_test.go:52（错误表 linux/freebsd 行）
-        let err = StackOptions::parse_json(br#"{"autoSystemDnsToGateway":true}"#).unwrap_err();
-        assert!(err.to_string().contains("needs gateway"), "{err}");
+        let err = StackOptions::parse_json(br#"{"autoSystemDnsToGateway":true}"#)
+            .err()
+            .expect("autoSystemDnsToGateway without gateway must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("needs gateway"), "{msg}");
         // 有 gateway 则通过
         let ok = StackOptions::parse_json(
             br#"{"gateway":["10.0.0.1/24"],"autoSystemDnsToGateway":true}"#,
