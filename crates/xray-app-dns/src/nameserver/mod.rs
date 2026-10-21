@@ -231,7 +231,10 @@ impl Client {
             return Box::pin(async { Err(DnsError::EmptyResponse) });
         }
         let fut = self.server.query_ip(domain, option);
-        Box::pin(async move {
+        // DNS 上游查询打标（xray_transport::dns_skip 设置点）：消费点（上游直连
+        // 拨号）据此把 skip 拒拨限定在 Xray 自身查询，不影响用户流量（TUN 接管
+        // 场景，Go dns_skip.go 语义）。
+        Box::pin(xray_transport::dns_skip::scope_dns_upstream_query(async move {
             let (ips, ttl) = fut.await?;
             if ips.is_empty() {
                 return Err(DnsError::EmptyResponse);
@@ -270,7 +273,7 @@ impl Client {
                 }
             }
             Ok((ips, ttl))
-        })
+        }))
     }
 }
 
