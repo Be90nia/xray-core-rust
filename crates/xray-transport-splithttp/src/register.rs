@@ -133,6 +133,12 @@ async fn dial_splithttp(
         .collect();
     let http_version = dialer::decide_http_version(has_tls, has_reality, &next_protocol);
 
+    // finalmask（bd dppv）：Go splithttp/dialer.go:127-134——h1/h2 路径在
+    // dialContext 内 TCP 后、TLS 前 WrapConnClient（首字节 = mask 头）；h3/QUIC
+    // 无 Tcpmask（Go hub.go:546-549 同款排除）。空 manager = 恒等。
+    let tcpmask = Arc::new(xray_transport::finalmask::build_tcpmask_manager_from_json(
+        settings.finalmask_json.as_ref(),
+    )?);
     let packet_conn = if http_version == "3" {
         if !fp_name.is_empty() {
             tracing::warn!(
@@ -191,6 +197,9 @@ async fn dial_splithttp(
             })?;
             let remote_addr = tcp_conn.remote_addr().ok().flatten();
             let local_addr = tcp_conn.local_addr().ok().flatten();
+            // finalmask（bd dppv）：TCP 后、REALITY TLS 前（Go dialContext 层序）。
+            let tcp_conn =
+                xray_transport::finalmask::wrap_conn_client_into_connection(&tcpmask, tcp_conn)?;
             let tls_stream =
                 xray_reality::register::handshake_over(tcp_conn, settings).await.map_err(|e| {
                     io::Error::new(
@@ -237,6 +246,7 @@ async fn dial_splithttp(
                 dial_target,
                 fingerprint,
                 settings.security_json.clone(),
+                Some(Arc::clone(&tcpmask)),
             ));
             dialer::dial(client, config, scheme, &host, has_reality).await.map_err(|e| {
                 io::Error::new(
@@ -247,14 +257,9 @@ async fn dial_splithttp(
         }
     };
 
-    // Tcpmask（Go splithttp/dialer.go:127-134：仅 h1/h2 路径的 dialContext 内
-    // WrapConnClient；h3/QUIC 无 Tcpmask）。
-    let sync_conn: Box<dyn Connection> = Box::new(packet_conn.into_sync_reader());
-    if http_version == "3" {
-        Ok(sync_conn)
-    } else {
-        xray_transport::finalmask::wrap_conn_client_from_settings(settings, sync_conn)
-    }
+    // finalmask 已在各拨号分支内（TCP 后、TLS 前）套上（bd dppv）；h3/QUIC 无
+    // Tcpmask（Go hub.go:546-549 同款排除）。
+    Ok(Box::new(packet_conn.into_sync_reader()))
 }
 /// 将 [`Destination`] 解析为 [`SocketAddr`]（quinn/H3 需要；域名走系统 DNS）。
 ///

@@ -111,6 +111,10 @@ pub struct WsListener {
     /// 对齐 Go `socketSettings.TrustedXForwardedFor`）。空 = 永不采纳 XFF
     /// （默认不信任，防伪造；Go hub.go:63-68）。
     pub trusted_x_forwarded_for: Vec<String>,
+    /// finalmask TCP 伪装管理器（bd dppv；`None`/空 manager = 恒等，零行为变化）。
+    /// Go hub.go:107-111：`FinalMask.Listen` 替换底层 listener，TLS（`tls.NewListener`）
+    /// 包在其外——mask 在 TLS 与 WS 握手之下，accept 读到的首字节必须是 mask 头。
+    pub tcpmask: Option<Arc<xray_transport::finalmask::TcpmaskManager>>,
 }
 
 impl WsListener {
@@ -135,7 +139,7 @@ impl WsListener {
         )
         .await
         .map_err(WsError::Io)?;
-        Ok(Self { listener, configs, trusted_x_forwarded_for: Vec::new() })
+        Ok(Self { listener, configs, trusted_x_forwarded_for: Vec::new(), tcpmask: None })
     }
 
     /// 本地地址。
@@ -152,7 +156,18 @@ impl WsListener {
         let (mut tcp, remote) = self.listener.accept().await.map_err(WsError::Io)?;
         let local = tcp.local_addr().ok();
         let remote = self.parse_proxy_protocol(&mut tcp, remote).await?;
-        Self::ws_handshake(tcp, remote, local, &self.configs, &self.trusted_x_forwarded_for).await
+        // finalmask（bd dppv）：Go hub.go:107 `FinalMask.Listen` 在 WS 握手前包住
+        // 裸 TCP——读到的首字节必须是 mask 头而非 GET。空 manager = 恒等。
+        let stream: Box<dyn Connection> = match self.tcpmask.as_ref() {
+            Some(m) => xray_transport::finalmask::wrap_conn_server_into_connection(
+                m,
+                Box::new(xray_transport::connection::TcpConnection::new(tcp)),
+            )
+            .map_err(WsError::Io)?,
+            None => Box::new(xray_transport::connection::TcpConnection::new(tcp)),
+        };
+        Self::ws_handshake(stream, remote, local, &self.configs, &self.trusted_x_forwarded_for)
+            .await
     }
 
     /// 接受一条新连接，先做 TLS 握手再 WS 握手。
@@ -169,6 +184,7 @@ impl WsListener {
         // 0-RTT 排空开关：allowEarlyData=true 时 rustls ServerConfig 的
         // max_early_data_size>0（build_server_config 设置），此位即配置透传。
         let ed_enabled = tls_config.max_early_data_size > 0;
+        let tcpmask = self.tcpmask.clone();
         // Go hub.go:143 http.Server{ReadHeaderTimeout: 4s}——deadline 在 TLS wrap 前
         // 生效，4s 覆盖 PROXY protocol 解析 + TLS 惰性握手全程。整段限时：半开/分片
         // ClientHello 的连接超时丢弃，accept 循环永不被单个连接堵死（串行 accept 下
@@ -177,9 +193,20 @@ impl WsListener {
         // HandshakeTimeout），h2 拒绝服务另有 30s 兜底，均在本窗之外不变。
         let (remote, tls_stream) = match tokio::time::timeout(Duration::from_secs(4), async {
             let remote = self.parse_proxy_protocol(&mut tcp, remote).await?;
+            // finalmask（bd dppv）：Go hub.go:107 `FinalMask.Listen` 替换底层
+            // listener、:132 `tls.NewListener` 包其外——mask 在 TLS 之下、最贴近
+            // wire。空 manager = 恒等。
+            let stream: Box<dyn Connection> = match tcpmask.as_ref() {
+                Some(m) => xray_transport::finalmask::wrap_conn_server_into_connection(
+                    m,
+                    Box::new(xray_transport::connection::TcpConnection::new(tcp)),
+                )
+                .map_err(|e| WsError::HandshakeFailed(format!("tcpmask wrap: {e}")))?,
+                None => Box::new(xray_transport::connection::TcpConnection::new(tcp)),
+            };
             let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
             let tls_stream = acceptor
-                .accept(tcp)
+                .accept(stream)
                 .await
                 .map_err(|e| WsError::HandshakeFailed(format!("tls accept: {e}")))?;
             Ok::<_, WsError>((remote, tls_stream))
@@ -228,12 +255,7 @@ impl WsListener {
         // 0-RTT 前缀流：有 early data 时先吐缓存字节再接 TLS 流；无 early data
         // 且开关关闭时保持裸流（缺省配置零变化、零包装）。
         if ed_enabled || !early_bytes.is_empty() {
-            let stream =
-                EarlyDataPrefixed::<tokio_rustls::server::TlsStream<tokio::net::TcpStream>> {
-                    prefix: early_bytes,
-                    offset: 0,
-                    inner: tls_stream,
-                };
+            let stream = EarlyDataPrefixed { prefix: early_bytes, offset: 0, inner: tls_stream };
             return Self::ws_handshake(
                 stream,
                 remote,

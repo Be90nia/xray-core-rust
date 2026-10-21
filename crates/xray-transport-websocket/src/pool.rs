@@ -65,10 +65,13 @@ pub struct PoolKey {
     pub tls_server_name: Option<String>,
     /// TLS 指纹（tlsSettings.fingerprint）。
     pub fingerprint: Option<String>,
+    /// finalmask TCP 伪装（bd dppv）：mask 在 dial 内层（TLS/WS 握手前）套上，
+    /// 入池连接已含 mask——masked/unmasked 出站指向同一 dest 时不得互取池货。
+    pub mask: bool,
 }
 
 impl PoolKey {
-    /// 从 dial 入参构造 key。
+    /// 从 dial 入参构造 key（无 finalmask）。
     #[must_use]
     pub fn new(
         host: impl Into<String>,
@@ -77,7 +80,14 @@ impl PoolKey {
         tls_server_name: Option<String>,
         fingerprint: Option<String>,
     ) -> Self {
-        Self { host: host.into(), port, path: path.into(), tls_server_name, fingerprint }
+        Self {
+            host: host.into(),
+            port,
+            path: path.into(),
+            tls_server_name,
+            fingerprint,
+            mask: false,
+        }
     }
 
     /// 兜底 fingerprint = "" 视为 None（与 `register::security_str` 取空串兼容）。

@@ -69,6 +69,10 @@ pub struct DialOptions<'a> {
     pub fingerprint: Option<String>,
     /// `tlsSettings` 原文（证书验证 verifier 构建 + ALPN 伪装解析用）。
     pub security_json: Option<serde_json::Value>,
+    /// finalmask TCP 伪装管理器（bd dppv；`None`/空 manager = 恒等）。Go
+    /// dialer.go:49-62：`NetDial`/`NetDialTLSContext` 里 `FinalMask.DialTCP` 包
+    /// 裸 TCP，TLS/WS 握手跑在 mask 内——首字节是 mask 头而非 GET。
+    pub tcpmask: Option<&'a xray_transport::finalmask::TcpmaskManager>,
 }
 
 /// 完成 WS 握手并返回字节流包装。
@@ -110,6 +114,15 @@ pub async fn dial(
         let ka = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(45));
         let _ = socket2::SockRef::from(&tcp).set_tcp_keepalive(&ka);
     }
+    let mut stream: Box<dyn xray_transport::connection::Connection> =
+        Box::new(xray_transport::connection::TcpConnection::new(tcp));
+    // finalmask（bd dppv）：Go dialer.go:49-62 `NetDial`/`NetDialTLSContext` 里
+    // `FinalMask.DialTCP` 包裸 TCP，TLS/WS 握手跑在 mask 内——首字节必须是
+    // mask 头而非 GET。空 manager = 恒等。
+    if let Some(m) = opts.tcpmask {
+        stream = xray_transport::finalmask::wrap_conn_client_into_connection(m, stream)
+            .map_err(WsError::Io)?;
+    }
     let stream: Box<dyn xray_transport::connection::Connection> = match opts.tls_config {
         Some(cfg) => {
             // Go dialer.go:79-99：fingerprint 解析成功即走 tls.UClient +
@@ -118,8 +131,7 @@ pub async fn dial(
             // 重写 http/1.1（2026-09-06 回归根因 = chrome 模板 ALPN h2 被 CDN
             // 协商，h1 upgrade 帧解析失败；ALPN 修复见 connect_with_alpn）。
             let sni = opts.tls_server_name.as_deref().unwrap_or(host.as_str());
-            let inner = Box::new(xray_transport::connection::TcpConnection::new(tcp))
-                as Box<dyn xray_transport::connection::Connection>;
+            let inner = stream;
             let tls_stream: Box<dyn xray_transport::connection::Connection> =
                 match xray_tls::fingerprint::get_fingerprint(
                     opts.fingerprint.as_deref().unwrap_or(""),
@@ -145,7 +157,7 @@ pub async fn dial(
                 };
             tls_stream
         },
-        None => Box::new(xray_transport::connection::TcpConnection::new(tcp)),
+        None => stream,
     };
 
     // connector=None 时 tungstenite(native-tls feature)会对流再叠一层 TLS;
@@ -184,8 +196,11 @@ pub struct DialParams {
     pub tls_server_name: Option<String>,
     /// `tlsSettings.fingerprint`（接线语义同 [`DialOptions::fingerprint`]）。
     pub fingerprint: Option<String>,
-    /// `tlsSettings` 原文（verifier 构建 + ALPN 伪装解析）。
+    /// `tlsSettings` 原文（verifier 构建 + ALPN 伪装解析用）。
     pub security_json: Option<serde_json::Value>,
+    /// finalmask TCP 伪装（bd dppv；`None`/空 manager = 恒等）——随拨号进
+    /// [`dial`]，在 TLS/WS 握手前套上（Go dialer.go:49-62 层序）。
+    pub tcpmask: Option<Arc<xray_transport::finalmask::TcpmaskManager>>,
 }
 
 /// 用 owned 参数拨号（内部组 [`DialOptions`] 调 [`dial`]）。
@@ -194,8 +209,15 @@ pub async fn dial_with_params(
     params: DialParams,
     early_data: Option<Vec<u8>>,
 ) -> Result<WsConnection<MaybeTlsStream<Box<dyn xray_transport::connection::Connection>>>> {
-    let DialParams { config, destination, tls_config, tls_server_name, fingerprint, security_json } =
-        params;
+    let DialParams {
+        config,
+        destination,
+        tls_config,
+        tls_server_name,
+        fingerprint,
+        security_json,
+        tcpmask,
+    } = params;
     dial(DialOptions {
         config: &config,
         destination: &destination,
@@ -204,6 +226,7 @@ pub async fn dial_with_params(
         tls_server_name,
         fingerprint,
         security_json,
+        tcpmask: tcpmask.as_deref(),
     })
     .await
 }
@@ -501,6 +524,7 @@ mod tests {
             tls_server_name: None,
             fingerprint: None,
             security_json: None,
+            tcpmask: None,
         };
         let dial_task = tokio::spawn(dial_with_params(params, None));
         for _ in 0..400 {
@@ -685,6 +709,7 @@ mod tests {
             tls_server_name: None,
             fingerprint: None,
             security_json: None,
+            tcpmask: None,
         })
         .await
         .unwrap();
@@ -700,6 +725,7 @@ mod tests {
             tls_server_name: None,
             fingerprint: None,
             security_json: None,
+            tcpmask: None,
         })
         .await
         .unwrap();
@@ -762,6 +788,7 @@ mod tests {
             tls_server_name: Some("localhost".into()),
             fingerprint: fingerprint.map(String::from),
             security_json: Some(sec),
+            tcpmask: None,
         })
         .await;
         assert!(result.is_err(), "capture server drops conn → dial must fail");

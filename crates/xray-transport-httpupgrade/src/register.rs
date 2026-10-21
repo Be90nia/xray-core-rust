@@ -123,6 +123,20 @@ async fn listen_httpupgrade(
                 }
             }
 
+            // finalmask（bd dppv）：Go httpupgrade/hub.go:145-147 WrapListener——
+            // mask 在 TLS/HTTP upgrade 之下、最贴近 wire（首字节 = mask 头而非
+            // GET）；wrap 失败丢弃该 conn 继续 accept。空 manager = 恒等。
+            let conn: Box<dyn Connection> =
+                match xray_transport::finalmask::wrap_conn_server_into_connection(
+                    &tcpmask,
+                    Box::new(xray_transport::connection::TcpConnection::new(tcp)),
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::debug!("HTTPUpgrade tcpmask wrap error: {e}");
+                        continue;
+                    },
+                };
             // Go hub.go:39-41：SetReadDeadline(+4s) 在 TLS wrap 前设置——4s 覆盖
             // TLS 惰性握手 + GET 读取全程（升级完成 defer 清零）。整段限时：
             // 半开/分片 ClientHello 的连接超时丢弃，accept 循环永不被单个连接
@@ -130,21 +144,11 @@ async fn listen_httpupgrade(
             // 生产 P0 实锤：半个 ClientHello 挂死 5 小时）。
             match tokio::time::timeout(
                 std::time::Duration::from_secs(4),
-                do_handshake(tcp, &server, tls_config.clone(), remote),
+                do_handshake(conn, &server, tls_config.clone(), remote),
             )
             .await
             {
-                Ok(Ok(conn)) => {
-                    // Tcpmask wrap 失败 → 丢弃该 conn 继续（Go tcpListener.Accept 语义）。
-                    match xray_transport::finalmask::wrap_conn_server_into_connection(
-                        &tcpmask, conn,
-                    ) {
-                        Ok(masked) => handler(masked),
-                        Err(e) => {
-                            tracing::debug!("HTTPUpgrade tcpmask wrap error: {e}");
-                        },
-                    }
-                },
+                Ok(Ok(conn)) => handler(conn),
                 Ok(Err(e)) => {
                     tracing::debug!("HTTPUpgrade handshake error: {e}");
                 },
@@ -160,21 +164,17 @@ async fn listen_httpupgrade(
 }
 
 async fn do_handshake(
-    tcp: tokio::net::TcpStream,
+    conn: Box<dyn Connection>,
     server: &HttpUpgradeServer,
     tls_config: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
     remote: SocketAddr,
 ) -> io::Result<Box<dyn Connection>> {
     // security=tls：先完成 TLS accept，再在其上做 HTTP upgrade 握手
     // （Go hub.go：tls.Server(conn) 后进 upgrade handler）；非 TLS 直连。
+    // conn 已含 finalmask（bd dppv：mask 在 TLS 之下、最贴近 wire）。
     let wrapped: Box<dyn Connection> = match tls_config {
-        Some(cfg) => {
-            let tls =
-                xray_tls::utls::server(xray_transport::connection::TcpConnection::new(tcp), cfg)
-                    .await?;
-            Box::new(tls)
-        },
-        None => Box::new(xray_transport::connection::TcpConnection::new(tcp)),
+        Some(cfg) => Box::new(xray_tls::utls::server(conn, cfg).await?),
+        None => conn,
     };
     let (conn, _leftover) = server.handshake_io(wrapped).await.map_err(|e| {
         io::Error::new(io::ErrorKind::ConnectionRefused, format!("HTTPUpgrade handshake: {e}"))
@@ -280,6 +280,10 @@ async fn dial_httpupgrade(
 
     // 2. TCP 拨号
     let tcp_conn = xray_transport::system_dialer::dial_system(dest, sockopt).await?;
+    // finalmask（bd dppv）：Go httpupgrade/dialer.go:55-60 WrapConnClient——TCP
+    // 建立后、TLS/HTTP upgrade 之前套上（首字节 = mask 头而非 GET）。空 manager
+    // = 恒等。
+    let tcp_conn = xray_transport::finalmask::wrap_conn_client_from_settings(settings, tcp_conn)?;
 
     // Go httpupgrade/dialer.go：`tls.WithNextProto("http/1.1")`——upgrade 是
     // HTTP/1.1 语义，ALPN 含 "h2" 时 CDN 协商 h2 导致 upgrade 帧解析失败。
@@ -334,11 +338,11 @@ async fn dial_httpupgrade(
         tcp_conn
     };
 
-    // 3. HTTP upgrade 握手
+    // 3. HTTP upgrade 握手（finalmask 已在 TCP 拨号后、TLS 前 套上——直接交付，bd dppv）
     let client = HttpUpgradeClient::new(host, config.clone());
     let ed = config.ed;
 
-    let conn: Box<dyn Connection> = if ed > 0 {
+    if ed > 0 {
         // 0-RTT：延迟读 101 响应，让上层先写 early data
         let httpupgrade_conn = client.dial_over_io_deferred(upgraded_conn).await.map_err(|e| {
             io::Error::new(
@@ -346,7 +350,7 @@ async fn dial_httpupgrade(
                 format!("HTTPUpgrade handshake failed: {e}"),
             )
         })?;
-        Box::new(httpupgrade_conn) as Box<dyn Connection>
+        Ok(Box::new(httpupgrade_conn) as Box<dyn Connection>)
     } else {
         let (httpupgrade_conn, _leftover) =
             client.dial_over_io(upgraded_conn).await.map_err(|e| {
@@ -355,10 +359,8 @@ async fn dial_httpupgrade(
                     format!("HTTPUpgrade handshake failed: {e}"),
                 )
             })?;
-        Box::new(httpupgrade_conn) as Box<dyn Connection>
-    };
-    // Tcpmask（Go httpupgrade/dialer.go:55-60：`TcpmaskManager.WrapConnClient`）。
-    xray_transport::finalmask::wrap_conn_client_from_settings(settings, conn)
+        Ok(Box::new(httpupgrade_conn) as Box<dyn Connection>)
+    }
 }
 
 /// 从 `httpupgradeSettings` JSON 解析为强类型 [`Config`]。

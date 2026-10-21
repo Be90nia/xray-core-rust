@@ -98,11 +98,13 @@ async fn listen_ws(
     // 根据 security 决定是否包装 TLS。
     let use_tls = settings.security != "none" && !settings.security.is_empty();
 
-    // Tcpmask（Go websocket/hub.go:132-134：`TcpmaskManager.WrapListener` →
-    // 每条 accept conn 过 `WrapConnServer` 再进 handler；空 manager = 恒等）。
-    let tcpmask = Arc::new(xray_transport::finalmask::build_tcpmask_manager_from_json(
-        settings.finalmask_json.as_ref(),
-    )?);
+    // finalmask（bd dppv）：Go hub.go:107 `FinalMask.Listen` 替换底层 listener，
+    // TLS/WS 握手跑在 mask 内——由 WsListener 在 ws 握手前 wrap 每条 accept
+    // conn（空 manager = 恒等）。
+    ws_listener.tcpmask =
+        Some(Arc::new(xray_transport::finalmask::build_tcpmask_manager_from_json(
+            settings.finalmask_json.as_ref(),
+        )?));
 
     // spawn accept loop。
     let handler = handler.clone();
@@ -125,20 +127,7 @@ async fn listen_ws(
                     }
                 } => {
                     match result {
-                        Ok(accepted) => {
-                            // Tcpmask wrap 失败 → 丢弃该 conn 继续 accept
-                            // （Go finalmask.go tcpListener.Accept：wrap err →
-                            // conn.Close + 返回 err，accept 循环继续）。
-                            match xray_transport::finalmask::wrap_conn_server_into_connection(
-                                &tcpmask,
-                                accepted.conn,
-                            ) {
-                                Ok(conn) => handler(conn),
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "ws tcpmask wrap failed, dropping conn");
-                                }
-                            }
-                        }
+                        Ok(accepted) => handler(accepted.conn),
                         Err(e) => {
                             let msg = e.to_string();
                             if msg.contains("closed") { break; }
@@ -201,6 +190,12 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
     let tls_server_name = security_str(settings, "serverName");
     let fingerprint = security_str(settings, "fingerprint");
 
+    // finalmask（bd dppv）：manager 随 DialParams 进 dial()，在 TLS/WS 握手前套上
+    // （Go dialer.go:49-62 NetDial 层序，首字节 = mask 头）；空 manager = 恒等。
+    let tcpmask = Arc::new(xray_transport::finalmask::build_tcpmask_manager_from_json(
+        settings.finalmask_json.as_ref(),
+    )?);
+
     // Go dialer.go:24-33 + 168-221 delayDialConn：Ed > 0 时拨号推迟到首次
     // Write，首包 ≤ Ed 以 early data 进握手头（0-RTT），Read 阻塞至拨号完成。
     if config.ed > 0 {
@@ -212,16 +207,13 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
             tls_server_name,
             fingerprint,
             security_json: settings.security_json.clone(),
+            tcpmask: Some(Arc::clone(&tcpmask)),
         };
-        let settings = settings.clone();
         let factory: DialFactory = Arc::new(move |ed_bytes| {
             let params = params.clone();
-            let settings = settings.clone();
             Box::pin(async move {
                 let conn = dial_with_params(params, ed_bytes).await.map_err(io::Error::other)?;
-                // Tcpmask（Go websocket/dialer.go:56-63 WrapConnClient）：
-                // 真实连接建立时应用，delayDialConn 包在最外层。
-                xray_transport::finalmask::wrap_conn_client_from_settings(&settings, Box::new(conn))
+                Ok(Box::new(conn) as Box<dyn Connection>)
             })
         });
         return Ok(Box::new(DelayDialConn::new(ed, factory)));
@@ -238,6 +230,7 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
         path: config.normalized_path(),
         tls_server_name: tls_server_name.clone(),
         fingerprint: fingerprint.clone(),
+        mask: !tcpmask.tcpmasks.is_empty(),
     }
     .normalized();
     let pool = global_pool();
@@ -254,22 +247,21 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
         tls_server_name,
         fingerprint,
         security_json: settings.security_json.clone(),
+        tcpmask: Some(Arc::clone(&tcpmask)),
     };
 
     if pool_enabled {
         // 只取预连接（握手完成、零内层字节）；交付即触发后台补拨维持库存。
         if let Some(cached) = pool.try_acquire(&pool_key).await {
             spawn_replenish(&pool, &pool_key, dial_params);
-            return xray_transport::finalmask::wrap_conn_client_from_settings(settings, cached);
+            // finalmask 已在拨号内（TLS/WS 握手前）套上——直接交付，禁二次 wrap。
+            return Ok(cached);
         }
     }
 
-    // 预连接未命中 / 池未启用：现拨（wire 行为与旧路径一致）。
+    // 预连接未命中 / 池未启用：现拨（finalmask 在 dial 内 TLS/WS 握手前套上，
+    // 首字节 = mask 头，Go dialer.go:49-62 层序）。
     let raw_conn = dial_with_params(dial_params.clone(), None).await.map_err(io::Error::other)?;
-
-    // 应用 finalmask（per-call per-outbound）。
-    let wrapped: Box<dyn Connection> =
-        xray_transport::finalmask::wrap_conn_client_from_settings(settings, Box::new(raw_conn))?;
 
     // 交付后 burst 补拨：缓存未命中说明池空，burst 触发并行拨号尽快填到
     // `max_idle_per_key`，下一波 dial_ws 即可命中预连接。池未启用时 +
@@ -278,7 +270,7 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
     if pool_enabled {
         spawn_replenish_burst(&pool, &pool_key, dial_params);
     }
-    Ok(wrapped)
+    Ok(Box::new(raw_conn))
 }
 
 /// 预连接补拨：spawn 后台拨号（完整 TCP+TLS+ws 握手），成功入池、失败放弃名额。
@@ -929,6 +921,7 @@ mod tests {
     #[tokio::test]
     async fn dial_ws_used_connection_never_returns_and_replenish_fires() {
         use std::sync::atomic::{AtomicUsize, Ordering};
+
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use xray_common::net::{address::Address, network::Network, port::Port};
 
@@ -979,8 +972,7 @@ mod tests {
 
         // 写读一轮，返回服务端连接序号。
         async fn roundtrip(conn: &mut Box<dyn Connection>, marker: &[u8]) -> u8 {
-            use tokio::io::AsyncReadExt;
-            use tokio::io::AsyncWriteExt;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             conn.write_all(marker).await.expect("write");
             let mut buf = vec![0u8; marker.len() + 1];
             tokio::time::timeout(std::time::Duration::from_secs(5), conn.read_exact(&mut buf))
@@ -1033,8 +1025,9 @@ mod tests {
         drop(session3);
     }
 
-    /// 预连接未命中时现拨路径无回归：finalmask 包装照常应用（补拨连接存裸
-    /// 连接、交付时按 caller 包装，不存在 wrap 串台——对应旧入池特判的删除）。
+    /// finalmask 套接层位置回归（bd dppv）：mask 在 dial 内 TCP 后、TLS/WS 握手前
+    /// 套上（首字节 = mask 头）；补拨连接入池时已含 mask，交付直接用、不再二次
+    /// 包装（PoolKey.mask 隔离 masked/unmasked 出站，无 wrap 串台）。
     #[tokio::test]
     async fn dial_ws_finalmask_wrapping_untouched_by_pool() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1092,5 +1085,114 @@ mod tests {
             got.extend_from_slice(&buf[..n]);
         }
         assert_eq!(&got, payload);
+    }
+
+    /// bd dppv 大载荷复现床：fragment mask + ws 双端新层序下大 payload echo。
+    /// 已知残留（#ignore，非回归门）：payload/帧 >8KB 经 mask duplex(3KB) 双向
+    /// 并发写时断流——`WsConnection::poll_write` 诚实背压修复后仍残留，根因在
+    /// finalmask 桥 select 循环的分支内 write_all 头阻塞（xray-transport/finalmask/
+    /// fragment.rs fragment_bridge，属 raw-TCP 代理的 scope）。
+    /// 复现：`REPRO_FM=fragment REPRO_LEN=16384 cargo test -p xray-transport-websocket
+    /// --lib dial_ws_finalmask_large_payload_roundtrip -- --ignored --nocapture`
+    /// （≤8000B 单帧 PASS：REPRO_LEN=8000）。
+    #[tokio::test]
+    #[ignore]
+    async fn dial_ws_finalmask_large_payload_roundtrip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use xray_common::net::{address::Address, network::Network, port::Port};
+
+        let fm_type = std::env::var("REPRO_FM").unwrap_or_else(|_| "fragment".into());
+        let finalmask = if fm_type == "none" {
+            serde_json::Value::Null
+        } else if fm_type == "xmc" {
+            serde_json::json!({
+                "tcp": [{"type": "xmc", "settings": {
+                    "hostname": "mc.example.com", "password": "xmc-interop-password-01",
+                    "profiles": [{"username": "steve_1",
+                                  "uuid": "069a79f4-44e9-4726-a5be-fca90e38aaf5",
+                                  "texturesValue": "v", "texturesSignature": "s"}]
+                }}]
+            })
+        } else {
+            serde_json::json!({
+                "tcp": [{"type": "fragment", "settings": {
+                    "packets_from": 1, "packets_to": 2,
+                    "length": {"from": 8, "to": 16}, "interval": {"from": 0, "to": 0}
+                }}]
+            })
+        };
+        let mut settings = StreamSettings {
+            protocol: "websocket".to_string(),
+            transport_json: Some(serde_json::json!({"path": "/ws"})),
+            ..Default::default()
+        };
+        if !finalmask.is_null() {
+            settings.finalmask_json = Some(finalmask);
+        }
+        let handler: ConnHandler = Arc::new(|conn| {
+            tokio::spawn(async move {
+                let mut conn = conn;
+                let mut buf = vec![0u8; 16384];
+                let mut total = 0usize;
+                loop {
+                    match conn.read(&mut buf).await {
+                        Ok(0) | Err(_) => {
+                            eprintln!("srv handler end at total={total}");
+                            break;
+                        },
+                        Ok(n) => {
+                            total += n;
+                            if total % 65536 < n {
+                                eprintln!("srv handler recv total={total}");
+                            }
+                            if conn.write_all(&buf[..n]).await.is_err() {
+                                eprintln!("srv handler echo write err at total={total}");
+                                break;
+                            }
+                        },
+                    }
+                }
+            });
+        });
+        let listener = listen_ws("127.0.0.1:0".parse().unwrap(), &settings, &handler, Vec::new())
+            .await
+            .expect("listen_ws");
+        let port = listener.local_addr().expect("local_addr").port();
+        let dest =
+            Destination::new(Address::new_domain("127.0.0.1"), Port::new(port), Network::TCP);
+
+        let mut conn = dial_ws(&dest, &settings).await.expect("dial_ws with finalmask");
+        let len: usize =
+            std::env::var("REPRO_LEN").ok().and_then(|v| v.parse().ok()).unwrap_or(131072);
+        let chunk: usize =
+            std::env::var("REPRO_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(16384);
+        let payload: Vec<u8> = (0..len).map(|i| (i & 0xFF) as u8).collect();
+        // 逐块 write 观测上行停点：write_all 是原子的，看不到部分进度。
+        let mut sent = 0usize;
+        while sent < payload.len() {
+            let chunk = &payload[sent..(sent + chunk).min(payload.len())];
+            match tokio::time::timeout(std::time::Duration::from_secs(10), conn.write(chunk)).await
+            {
+                Ok(Ok(n)) => sent += n,
+                Ok(Err(e)) => panic!("write error at {sent}: {e}"),
+                Err(_) => {
+                    panic!("UPSTREAM STALL: write blocked at {sent}/{} bytes", payload.len());
+                },
+            }
+        }
+        eprintln!("write complete: {sent} bytes");
+        let mut got = Vec::with_capacity(payload.len());
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while got.len() < payload.len() {
+            let mut buf = vec![0u8; 16384];
+            let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let n = tokio::time::timeout(budget, conn.read(&mut buf))
+                .await
+                .expect("echo timeout (payload stall)")
+                .expect("read ok");
+            assert!(n > 0, "echo closed early at {}/{} bytes", got.len(), payload.len());
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got.len(), payload.len());
     }
 }

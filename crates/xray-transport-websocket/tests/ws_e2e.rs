@@ -77,6 +77,7 @@ async fn client_server_roundtrip_echo() {
         fingerprint: None,
         security_json: None,
         tls_server_name: None,
+        tcpmask: None,
     };
     let mut client = dial(opts).await.expect("dial");
 
@@ -108,6 +109,7 @@ async fn large_payload_multi_frame_roundtrip() {
         fingerprint: None,
         security_json: None,
         tls_server_name: None,
+        tcpmask: None,
     };
     let mut client = dial(opts).await.expect("dial");
 
@@ -156,6 +158,7 @@ async fn early_data_delivered_to_server_first_read() {
         fingerprint: None,
         security_json: None,
         tls_server_name: None,
+        tcpmask: None,
     };
     let _client = dial(opts).await.expect("dial");
 
@@ -190,6 +193,7 @@ async fn server_rejects_wrong_path() {
         fingerprint: None,
         security_json: None,
         tls_server_name: None,
+        tcpmask: None,
     };
     let result = dial(opts).await;
     assert!(result.is_err(), "client dial should fail with 404");
@@ -228,6 +232,7 @@ async fn server_validates_custom_host_header() {
         fingerprint: None,
         security_json: None,
         tls_server_name: None,
+        tcpmask: None,
     };
     let mut client = dial(opts).await.expect("dial should succeed with matching host");
 
@@ -265,6 +270,7 @@ async fn server_rejects_mismatched_host() {
         fingerprint: None,
         security_json: None,
         tls_server_name: None,
+        tcpmask: None,
     };
     let result = dial(opts).await;
     assert!(result.is_err(), "mismatched host should be rejected");
@@ -297,6 +303,7 @@ async fn delay_dial_early_data_zero_rtt_roundtrip() {
                 tls_server_name: None,
                 fingerprint: None,
                 security_json: None,
+                tcpmask: None,
             })
             .await
             .map_err(std::io::Error::other)?;
