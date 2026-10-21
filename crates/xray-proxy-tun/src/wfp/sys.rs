@@ -1,8 +1,8 @@
 //! WFP 安装层（仅 Windows）——把 [`super::spec`] 的规格翻译成 `Fwpm*` 调用。
 //!
 //! 对应 Go `proxy/tun/tun_windows_wfp.go`：
-//! - `open_engine` ≈ Go `openWFPEngine`（:222）：**动态会话**（`FWPM_SESSION_FLAG_DYNAMIC`），
-//!   关闭 engine 即删除全部过滤器，进程崩溃 Windows 也会清理（Go :197-198 同语义）。
+//! - `open_engine` ≈ Go `openWFPEngine`（:222）：**动态会话**（`FWPM_SESSION_FLAG_DYNAMIC`）， 关闭
+//!   engine 即删除全部过滤器，进程崩溃 Windows 也会清理（Go :197-198 同语义）。
 //! - [`install`] ≈ Go `blockLeaks`（:199）：事务里一次性装好，失败即回滚。
 //! - `add_filter` ≈ Go `addFilter`（:429）。
 //!
@@ -14,20 +14,25 @@
 //!
 //! 规格层（过滤条件/动作/权重）在 [`super::spec`]，本文件只做翻译。
 
-use std::ffi::c_void;
-use std::os::windows::ffi::OsStrExt;
-use std::ptr;
+use std::{ffi::c_void, os::windows::ffi::OsStrExt, ptr};
 
-use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE, LocalFree};
-use windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceIndexToLuid;
-use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
-use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform as wfp;
-use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+use windows_sys::{
+    Win32::{
+        Foundation::{ERROR_SUCCESS, HANDLE, LocalFree},
+        NetworkManagement::{
+            IpHelper::ConvertInterfaceIndexToLuid, Ndis::NET_LUID_LH,
+            WindowsFilteringPlatform as wfp,
+        },
+        Security::{
+            Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+            },
+            GetSecurityDescriptorLength,
+        },
+        System::SystemInformation::OSVERSIONINFOW,
+    },
+    core::{GUID, PWSTR},
 };
-use windows_sys::Win32::Security::GetSecurityDescriptorLength;
-use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
-use windows_sys::core::{GUID, PWSTR};
 
 use super::spec::{DNS_CLIENT_SID, LeakFilterInput, WINDOWS_DOH_DNS_BUILD, leak_filter_specs};
 

@@ -7,10 +7,10 @@
 //! ## 语义（照抄 Go，勿自行发挥）
 //!
 //! 目的：把「本该走 TUN 却从别的网卡漏出去」的流量挡住——
-//! - `dns`：DNS 只允许走 TUN（Windows 11/Server 2022 起 DNS Client 服务还可能
-//!   用 DoH/DoT，故按服务 SID 单独处理）；
-//! - `misconfigtun`：某个 IP 版本没有任何路由指向 TUN 时，禁掉该版本的出站
-//!   （回环、DHCP、IPv6 邻居/组播发现放行）。
+//! - `dns`：DNS 只允许走 TUN（Windows 11/Server 2022 起 DNS Client 服务还可能 用 DoH/DoT，故按服务
+//!   SID 单独处理）；
+//! - `misconfigtun`：某个 IP 版本没有任何路由指向 TUN 时，禁掉该版本的出站 （回环、DHCP、IPv6
+//!   邻居/组播发现放行）。
 //!
 //! 过滤器装在**动态 WFP 会话**里：关掉 engine 即删除，进程退出 Windows 也会删。
 

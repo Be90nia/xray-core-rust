@@ -306,11 +306,10 @@ fn check_stream_strictness(kind: &str, tag: &str, ss: &serde_json::Value) -> Res
     }
 
     // 2c) 票 037f：Go 有 Rust 无的 streamSettings 键——出现即配置层硬错：
-    // - masqueSettings / xdriveSettings（transport_internet.go:68-69）：Rust 无
-    //   对应 transport。
+    // - masqueSettings / xdriveSettings（transport_internet.go:68-69）：Rust 无 对应 transport。
     // - address / port（:51-52）：Go 仅被 xdrive fronting 消费
-    //   （transport/internet/memory_settings.go:39-44），Rust MemoryStreamConfig
-    //   无 destination 字段，出现即静默丢。
+    //   （transport/internet/memory_settings.go:39-44），Rust MemoryStreamConfig 无 destination
+    //   字段，出现即静默丢。
     for key in ["masqueSettings", "xdriveSettings", "address", "port"] {
         if ss.get(key).is_some_and(|v| !v.is_null()) {
             return Err(LintError::Invalid(format!(

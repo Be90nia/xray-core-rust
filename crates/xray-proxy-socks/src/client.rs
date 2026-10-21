@@ -162,7 +162,7 @@ impl SocksClient {
 /// SOCKS5 method 协商 + 可选 RFC 1929 auth（CONNECT / UDP ASSOCIATE 握手共用首段）。
 ///
 /// Go protocol.go:443-447：按凭据有无二选一只发 1 个 method
-///（带凭据 `[05 01 02]` / 无凭据 `[05 01 00]`；发两个 method 的
+/// （带凭据 `[05 01 02]` / 无凭据 `[05 01 00]`；发两个 method 的
 /// `[05 02 00 02]` 是 DPI 可辨的 Rust 指纹，票 g6kn）。
 pub(crate) async fn negotiate(stream: &mut TcpStream, config: &ClientConfig) -> Result<()> {
     let auth_method: u8 = if config.username.is_some() { AUTH_PASSWORD } else { AUTH_NOT_REQUIRED };

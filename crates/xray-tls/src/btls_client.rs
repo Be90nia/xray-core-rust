@@ -1607,13 +1607,15 @@ impl<S: Connection + Unpin> ConnInterface for BtlsConn<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::fingerprint::get_fingerprint;
-
     use std::sync::{Arc, Mutex};
 
-    use tracing::span::{Attributes, Id, Record};
-    use tracing::{Event, Subscriber};
+    use tracing::{
+        Event, Subscriber,
+        span::{Attributes, Id, Record},
+    };
+
+    use super::*;
+    use crate::fingerprint::get_fingerprint;
 
     /// 极简 warn 捕获 subscriber（票 daqq）：断言降级告警真实发出且携带
     /// configured/effective 字段（真实 tracing 事件，非 mock）。
@@ -1624,17 +1626,22 @@ mod tests {
         fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
             meta.level() <= &tracing::Level::WARN
         }
+
         fn new_span(&self, _attrs: &Attributes<'_>) -> Id {
             Id::from_u64(1)
         }
+
         fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
         fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
         fn event(&self, event: &Event<'_>) {
             struct Fmt(String);
             impl tracing::field::Visit for Fmt {
                 fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
                     self.0.push_str(&format!("{}={value} ", field.name()));
                 }
+
                 fn record_debug(
                     &mut self,
                     field: &tracing::field::Field,
@@ -1647,7 +1654,9 @@ mod tests {
             event.record(&mut v);
             self.0.lock().unwrap().push(v.0);
         }
+
         fn enter(&self, _span: &Id) {}
+
         fn exit(&self, _span: &Id) {}
     }
 
@@ -1812,6 +1821,7 @@ mod tests {
     #[tokio::test]
     async fn early_data_accept_reject_replay_roundtrip() {
         use std::sync::Arc as StdArc;
+
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         use xray_transport::connection::TcpConnection;
 

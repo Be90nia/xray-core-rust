@@ -203,8 +203,8 @@ pub fn tun_fd_raw() -> Option<String> {
 /// 启动期扫描「Rust 无消费点」的 Go env：被设置即 warn 指名，不静默丢。
 ///
 /// 覆盖（Go common/platform/platform.go:25,29；Rust 侧功能未接线）：
-/// - `xray.browser.dialer`：browser dialer 传输未装配（xray-transport 的
-///   `browser-dialer` 模块存在但无生产启动路径）。
+/// - `xray.browser.dialer`：browser dialer 传输未装配（xray-transport 的 `browser-dialer`
+///   模块存在但无生产启动路径）。
 /// - `xray.tun.fd`：tun 走 tun-rs，android/ios fd 注入为 stub。
 ///
 /// 生产接线：bin 启动早期与 [`reload_env_settings`] 同点调用一次。

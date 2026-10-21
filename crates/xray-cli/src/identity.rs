@@ -6,11 +6,10 @@
 //!
 //! 字段来源：
 //! - `version`：xray-core 现有版本字符串（运行时常量）
-//! - `git_rev`：编译期 `GIT_REV` 环境注入优先；否则运行时从 exe/cwd 向上探测
-//!   `.git`（含 worktree 的 gitdir 指针文件）读 HEAD + loose ref / packed-refs；
-//!   仍不可得 → `unknown`
-//! - `exe_fingerprint`：对 `current_exe()` 全文件 blake3（仓内既有依赖），取前
-//!   16 字节 hex——blake3 吞吐 GB/s 级，全量哈希毫秒级完成，无需采样
+//! - `git_rev`：编译期 `GIT_REV` 环境注入优先；否则运行时从 exe/cwd 向上探测 `.git`（含 worktree 的
+//!   gitdir 指针文件）读 HEAD + loose ref / packed-refs； 仍不可得 → `unknown`
+//! - `exe_fingerprint`：对 `current_exe()` 全文件 blake3（仓内既有依赖），取前 16 字节 hex——blake3
+//!   吞吐 GB/s 级，全量哈希毫秒级完成，无需采样
 //! - `profile`：debug / release（`cfg!(debug_assertions)`）
 //! - `target_triple`：编译期 `TARGET` 注入优先；缺省用 `std::env::consts` 拼
 

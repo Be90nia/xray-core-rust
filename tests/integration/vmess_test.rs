@@ -394,8 +394,8 @@ async fn vmess_e2e_native_udp() {
         .await
         .expect("decode response header");
 
-    // 5. 发一个 UDP packet chunk（encode_request_body_async 尾部自带终止 chunk，
-    //    触发 inbound 收尾窗口）
+    // 5. 发一个 UDP packet chunk（encode_request_body_async 尾部自带终止 chunk， 触发 inbound
+    //    收尾窗口）
     let payload: Vec<u8> = (0..600u32).map(|i| (i % 251) as u8).collect();
     client_session
         .encode_request_body_async(&header, &payload, &mut client)
@@ -411,7 +411,8 @@ async fn vmess_e2e_native_udp() {
     .expect("vmess native udp roundtrip timeout")
     .expect("decode response body");
     assert_eq!(
-        response, payload,
+        response,
+        payload,
         "vmess 原生 UDP roundtrip 失败: 收到 {} 字节, 期望 {} 字节",
         response.len(),
         payload.len()

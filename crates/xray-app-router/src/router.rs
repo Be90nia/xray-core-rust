@@ -664,6 +664,25 @@ mod tests {
         assert!(result.is_err(), "expected error when geoip rule present but no loader");
     }
 
+    #[test]
+    fn test_geo_rule_with_loader_but_missing_dat_fails_closed() {
+        // bd il49：loader 在、geoip.dat 文件缺失 → GeodataBuild（fail-closed），
+        // 上游（xray-core wiring）据此拒启而非回退降级路由。
+        let dir = unique_dir("missing-dat");
+        let loader = Arc::new(GeoDataLoader::new(dir.clone()));
+
+        let cfg = Config { rule: vec![geoip_rule()], ..Config::default() };
+        let err = Router::init(&cfg, Arc::new(NotImplementedSelector), None, Some(loader))
+            .err()
+            .expect("expected init failure when geoip.dat missing");
+        assert!(
+            matches!(&err, RouterError::GeodataBuild(m) if m.contains("geoip.dat")),
+            "expected GeodataBuild naming geoip.dat, got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── Balancer strategy 装配 ──
     //
     // 验证 build_balancer 不再拒绝 leastping/leastload（h81 修复点）：

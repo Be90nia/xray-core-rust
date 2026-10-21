@@ -5,13 +5,12 @@
 //! 断言 1MB 回环成功。
 //!
 //! 两条独立路径，分别覆盖不同契约：
-//! 1. **VLESS+TLS**（`tls_fingerprint_*`）：验 uTLS 指纹握手 + 数据回显本身，
-//!    服务端为 rustls 自签（`allowInsecure`），不涉及 REALITY key-share 门。
-//! 2. **VLESS+REALITY**（`reality_fingerprint_*`）：验 REALITY 全链。服务端按 Go
-//!    REALITY 语义要求 ClientHello 带 X25519MLKEM768（Go `xtls/reality` tls.go:233-235
-//!    `if peerPub2 == nil { break } // reject outdated/strange Client Hello`，
-//!    本仓 `crates/xray-reality/src/server.rs:385-388` 同门 → `NoKeyShareX25519`
-//!    → reject→forward）。
+//! 1. **VLESS+TLS**（`tls_fingerprint_*`）：验 uTLS 指纹握手 + 数据回显本身， 服务端为 rustls
+//!    自签（`allowInsecure`），不涉及 REALITY key-share 门。
+//! 2. **VLESS+REALITY**（`reality_fingerprint_*`）：验 REALITY 全链。服务端按 Go REALITY 语义要求
+//!    ClientHello 带 X25519MLKEM768（Go `xtls/reality` tls.go:233-235 `if peerPub2 == nil { break }
+//!    // reject outdated/strange Client Hello`， 本仓 `crates/xray-reality/src/server.rs:385-388`
+//!    同门 → `NoKeyShareX25519` → reject→forward）。
 //!
 //! REALITY 无「服务端指纹」配置项（Go `reality.Config.Fingerprint` 是客户端专用字段），
 //! 该门只取决于**客户端**模板的 key share，因此矩阵变量只能是客户端指纹。

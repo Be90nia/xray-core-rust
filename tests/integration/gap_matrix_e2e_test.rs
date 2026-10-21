@@ -3,18 +3,18 @@
 //! 全部走 `xray_core::functions::start_full` 全实例路径（BuiltConfig → start_full →
 //! 真实 inbound/outbound 装配 → 回环客户端验证），对照 Go testing/scenarios：
 //!
-//! - **G-10** `http_test.go TestHttpBasicAuth/TestSocksWithHttpRequest`：
-//!   HTTP outbound 带 users → 假代理断言 `Proxy-Authorization: Basic`；
-//!   HTTP inbound 带 accounts → 缺/错凭据 407、正确凭据放行。
-//! - **G-14** `transport_test.go TestHTTPConnectionHeader`：vmess inbound 侧
-//!   TCP+HTTP 伪装头 e2e（客户端经 `HeaderConn::client` 真实伪装包装）。
+//! - **G-10** `http_test.go TestHttpBasicAuth/TestSocksWithHttpRequest`： HTTP outbound 带 users →
+//!   假代理断言 `Proxy-Authorization: Basic`； HTTP inbound 带 accounts → 缺/错凭据
+//!   407、正确凭据放行。
+//! - **G-14** `transport_test.go TestHTTPConnectionHeader`：vmess inbound 侧 TCP+HTTP 伪装头
+//!   e2e（客户端经 `HeaderConn::client` 真实伪装包装）。
 //! - **G-15** `feature_test.go TestDialerProxy`：outbound 底层拨号经另一 outbound
 //!   （`sockopt.dialerProxy` → SOCKS5 recorder → trojan 服务器）整链 e2e。
-//! - **G-16** `feature_test.go TestForward`：freedom `destinationOverride` 改投
-//!   指定服务器整链 e2e（客户端 CONNECT TEST-NET-3 不可路由地址）。
-//! - **G-04** `socks_test.go TestSocksBridageUDP`：SOCKS5 UDP ASSOCIATE 全链 e2e
-//!   （socks inbound UDP relay → dispatcher → socks outbound ASSOCIATE → 外部
-//!   SOCKS5 UDP 服务器），判别器 = 服务器记录 CMD 必须 3（不得 TCP 降级）。
+//! - **G-16** `feature_test.go TestForward`：freedom `destinationOverride` 改投 指定服务器整链
+//!   e2e（客户端 CONNECT TEST-NET-3 不可路由地址）。
+//! - **G-04** `socks_test.go TestSocksBridageUDP`：SOCKS5 UDP ASSOCIATE 全链 e2e （socks inbound
+//!   UDP relay → dispatcher → socks outbound ASSOCIATE → 外部 SOCKS5 UDP 服务器），判别器 =
+//!   服务器记录 CMD 必须 3（不得 TCP 降级）。
 //!
 //! 仅回环流量；SOCKS5/HTTP 假服务器以原始字节手写（测试自包含，不加依赖）。
 
@@ -24,7 +24,7 @@ use std::{
     time::Duration,
 };
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use serde_json::json;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -42,8 +42,10 @@ use xray_proxy_vmess::{
     account::cmd_key_of,
     encoding::{VERSION as VMESS_VERSION, client::ClientSession as VmessClientSession},
 };
-use xray_transport::connection::{Connection, TcpConnection};
-use xray_transport::headers::conn::{auth_from_json, wrap_client};
+use xray_transport::{
+    connection::{Connection, TcpConnection},
+    headers::conn::{auth_from_json, wrap_client},
+};
 
 /// TCP 测试载荷。
 const PAYLOAD: &[u8] = b"hello gap-matrix e2e!";
@@ -128,8 +130,7 @@ fn socks_inbound(tag: &str, port: u16, data: &'static [u8]) -> BuiltInbound {
 
 /// 启动 xray 实例并等监听就绪。
 async fn start_xray(built: &BuiltConfig) {
-    let (_instance, _ohm, _handles) =
-        start_full(built).await.expect("start_full");
+    let (_instance, _ohm, _handles) = start_full(built).await.expect("start_full");
     tokio::time::sleep(LISTENER_READY_DELAY).await;
 }
 
@@ -272,15 +273,11 @@ async fn spawn_http_connect_proxy() -> (u16, Arc<Mutex<String>>) {
                     .and_then(|l| l.strip_prefix("CONNECT "))
                     .and_then(|rest| rest.split_whitespace().next())
                 else {
-                    let _ = sock
-                        .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-                        .await;
+                    let _ = sock.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
                     return;
                 };
                 let Ok(mut target_sock) = TcpStream::connect(target).await else {
-                    let _ = sock
-                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                        .await;
+                    let _ = sock.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                     return;
                 };
                 let _ = sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await;
@@ -300,10 +297,7 @@ where
     stream.read_exact(&mut hdr).await.map_err(|e| e.to_string())?;
     let mut methods = vec![0u8; usize::from(hdr[1])];
     stream.read_exact(&mut methods).await.map_err(|e| e.to_string())?;
-    stream
-        .write_all(&[0x05, 0x00])
-        .await
-        .map_err(|e| e.to_string())
+    stream.write_all(&[0x05, 0x00]).await.map_err(|e| e.to_string())
 }
 
 /// 读 SOCKS5 请求头：返回 (CMD, 解析后的目标)。只支持 ATYP=IPv4（测试目标恒 IPv4）。
@@ -318,10 +312,8 @@ where
         0x01 => {
             let mut o = [0u8; 6];
             stream.read_exact(&mut o).await.map_err(|e| e.to_string())?;
-            let addr = SocketAddr::from((
-                [o[0], o[1], o[2], o[3]],
-                u16::from_be_bytes([o[4], o[5]]),
-            ));
+            let addr =
+                SocketAddr::from(([o[0], o[1], o[2], o[3]], u16::from_be_bytes([o[4], o[5]])));
             Ok((cmd, addr))
         },
         0x03 => {
@@ -329,8 +321,7 @@ where
             stream.read_exact(&mut l).await.map_err(|e| e.to_string())?;
             let mut rest = vec![0u8; usize::from(l[0]) + 2];
             stream.read_exact(&mut rest).await.map_err(|e| e.to_string())?;
-            let port =
-                u16::from_be_bytes([rest[rest.len() - 2], rest[rest.len() - 1]]);
+            let port = u16::from_be_bytes([rest[rest.len() - 2], rest[rest.len() - 1]]);
             let host = String::from_utf8_lossy(&rest[..rest.len() - 2]).to_string();
             let addr = tokio::net::lookup_host((host.as_str(), port))
                 .await
@@ -400,26 +391,17 @@ async fn g10_http_outbound_sends_proxy_authorization_basic() {
     start_xray(&built).await;
 
     let proxy_addr: SocketAddr = format!("127.0.0.1:{socks_port}").parse().expect("addr");
-    let got = timeout(
-        EXCHANGE_TIMEOUT,
-        socks5_connect_roundtrip(proxy_addr, echo, PAYLOAD),
-    )
-    .await
-    .expect("exchange timeout")
-    .expect("socks5 roundtrip");
+    let got = timeout(EXCHANGE_TIMEOUT, socks5_connect_roundtrip(proxy_addr, echo, PAYLOAD))
+        .await
+        .expect("exchange timeout")
+        .expect("socks5 roundtrip");
     assert_eq!(got, PAYLOAD, "payload must round-trip via CONNECT tunnel");
 
     let req = recorded.lock().expect("recorded lock").clone();
     let expected_line = format!("CONNECT 127.0.0.1:{} HTTP/1.1\r\n", echo.port());
-    assert!(
-        req.starts_with(&expected_line),
-        "request line must CONNECT to echo; got {req:?}"
-    );
+    assert!(req.starts_with(&expected_line), "request line must CONNECT to echo; got {req:?}");
     let expected_auth = format!("Proxy-Authorization: Basic {}\r\n", B64.encode("a:b"));
-    assert!(
-        req.contains(&expected_auth),
-        "missing Proxy-Authorization Basic header; got {req:?}"
-    );
+    assert!(req.contains(&expected_auth), "missing Proxy-Authorization Basic header; got {req:?}");
 }
 
 /// G-10（Go TestHttpBasicAuth inbound 腿）：带 accounts 的 HTTP inbound——
@@ -525,9 +507,8 @@ async fn g14_vmess_inbound_accepts_http_header_camouflaged_stream() {
     start_xray(&built).await;
 
     // 客户端：裸 TCP → Connection → HTTP 伪装包装（客户端首写注入伪装 GET）→ vmess 会话
-    let tcp = TcpStream::connect(format!("127.0.0.1:{vmess_port}"))
-        .await
-        .expect("connect vmess inbound");
+    let tcp =
+        TcpStream::connect(format!("127.0.0.1:{vmess_port}")).await.expect("connect vmess inbound");
     let auth = auth_from_json(Some(&json!({"header": {"type": "http"}})))
         .expect("auth json")
         .expect("http header auth");
@@ -535,12 +516,11 @@ async fn g14_vmess_inbound_accepts_http_header_camouflaged_stream() {
     let mut wrapped = wrap_client(conn, &auth);
 
     let session = VmessClientSession::new();
-    let dest = Destination::tcp(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(echo.port()));
+    let dest =
+        Destination::tcp(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(echo.port()));
     let header = RequestHeader::new(VMESS_VERSION, Command::Tcp, dest, SecurityType::Aes128Gcm);
     let cmd_key = cmd_key_of(&uuid);
-    let sealed = session
-        .encode_request_header(&header, &cmd_key)
-        .expect("encode vmess header");
+    let sealed = session.encode_request_header(&header, &cmd_key).expect("encode vmess header");
     wrapped.write_all(&sealed).await.expect("write camouflaged request");
 
     timeout(EXCHANGE_TIMEOUT, session.decode_response_header_async(&mut wrapped))
@@ -551,10 +531,11 @@ async fn g14_vmess_inbound_accepts_http_header_camouflaged_stream() {
         .encode_request_body_async(&header, PAYLOAD, &mut wrapped)
         .await
         .expect("encode vmess body");
-    let response = timeout(EXCHANGE_TIMEOUT, session.decode_response_body_async(&header, &mut wrapped))
-        .await
-        .expect("vmess body timeout")
-        .expect("decode vmess body");
+    let response =
+        timeout(EXCHANGE_TIMEOUT, session.decode_response_body_async(&header, &mut wrapped))
+            .await
+            .expect("vmess body timeout")
+            .expect("decode vmess body");
     assert_eq!(response, PAYLOAD, "payload must round-trip through camouflaged inbound");
 }
 
@@ -593,13 +574,10 @@ async fn g16_freedom_destination_override_rewrites_socks_target() {
 
     let unroutable: SocketAddr = "203.0.113.1:1".parse().expect("test-net-3 addr");
     let proxy_addr: SocketAddr = format!("127.0.0.1:{socks_port}").parse().expect("addr");
-    let got = timeout(
-        EXCHANGE_TIMEOUT,
-        socks5_connect_roundtrip(proxy_addr, unroutable, PAYLOAD),
-    )
-    .await
-    .expect("exchange timeout (override failed to rewrite target?)")
-    .expect("socks5 roundtrip");
+    let got = timeout(EXCHANGE_TIMEOUT, socks5_connect_roundtrip(proxy_addr, unroutable, PAYLOAD))
+        .await
+        .expect("exchange timeout (override failed to rewrite target?)")
+        .expect("socks5 roundtrip");
     assert_eq!(got, PAYLOAD, "payload must round-trip to overridden echo target");
 }
 
@@ -676,19 +654,17 @@ async fn g15_dialer_proxy_chains_trojan_outbound_dial_via_socks_outbound() {
     start_xray(&client).await;
 
     let proxy_addr: SocketAddr = format!("127.0.0.1:{socks_port}").parse().expect("addr");
-    let got = timeout(
-        EXCHANGE_TIMEOUT,
-        socks5_connect_roundtrip(proxy_addr, echo, PAYLOAD),
-    )
-    .await
-    .expect("exchange timeout")
-    .expect("socks5 roundtrip");
+    let got = timeout(EXCHANGE_TIMEOUT, socks5_connect_roundtrip(proxy_addr, echo, PAYLOAD))
+        .await
+        .expect("exchange timeout")
+        .expect("socks5 roundtrip");
     assert_eq!(got, PAYLOAD, "payload must round-trip through the dialer-proxy chain");
 
     let recs = recorded.lock().expect("recorder lock").clone();
     assert!(
-        recs.iter()
-            .any(|(cmd, addr)| *cmd == 0x01 && addr.port() == trojan_port && addr.ip().is_loopback()),
+        recs.iter().any(|(cmd, addr)| *cmd == 0x01
+            && addr.port() == trojan_port
+            && addr.ip().is_loopback()),
         "recorder must see CONNECT to trojan server (:{trojan_port}); got {recs:?}"
     );
 }
@@ -725,9 +701,8 @@ async fn g04_socks_udp_associate_full_chain_inbound_to_outbound() {
     start_xray(&built).await;
 
     // 1. TCP 控制连接 + no-auth 握手
-    let mut ctrl = TcpStream::connect(format!("127.0.0.1:{socks_port}"))
-        .await
-        .expect("connect socks control");
+    let mut ctrl =
+        TcpStream::connect(format!("127.0.0.1:{socks_port}")).await.expect("connect socks control");
     ctrl.write_all(&[0x05, 0x01, 0x00]).await.expect("greeting");
     let mut method = [0u8; 2];
     ctrl.read_exact(&mut method).await.expect("method reply");
@@ -755,7 +730,11 @@ async fn g04_socks_udp_associate_full_chain_inbound_to_outbound() {
     let (_dst_ip, dst_port, payload) =
         parse_socks_udp_frame(&buf[..n]).expect("reply must be a SOCKS5 UDP frame");
     assert_eq!(payload, UDP_PAYLOAD, "payload must round-trip via UDP relay");
-    assert_eq!((_dst_ip, dst_port), ([10, 9, 8, 7], 5353), "frame DST must echo the request target");
+    assert_eq!(
+        (_dst_ip, dst_port),
+        ([10, 9, 8, 7], 5353),
+        "frame DST must echo the request target"
+    );
 
     // 4. 判别器：外部服务器只见 UDP ASSOCIATE（3），不得 TCP CONNECT 降级（1）
     assert_eq!(

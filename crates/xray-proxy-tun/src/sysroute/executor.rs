@@ -2,14 +2,13 @@
 //!
 //! # 渲染与执行分离
 //!
-//! - **渲染面**（`apply`/`rollback` → `Vec<Cmd>`）：产出结构化命令
-//!   [`Cmd`]（program + args，不经字符串拆分），`Display` 即完整命令行。
-//!   测试与 Recording 走这里——**从不执行**。
-//! - **执行面**（`apply_exec`/`rollback_exec` → trait 默认方法）：逐条
-//!   [`Cmd::run`] 真实 spawn。**全模块唯一执行点**是 [`Cmd::run`]；每条命令
-//!   执行前 `tracing::info!`（program+args），失败 `tracing::error!` 并上抛，
-//!   不吞错——调用方（`sysroute::prepare`）把错误传给 TUN 启动流程，
-//!   接管失败宁可无 TUN（对齐 Go handler.go:196-205）。
+//! - **渲染面**（`apply`/`rollback` → `Vec<Cmd>`）：产出结构化命令 [`Cmd`]（program +
+//!   args，不经字符串拆分），`Display` 即完整命令行。 测试与 Recording 走这里——**从不执行**。
+//! - **执行面**（`apply_exec`/`rollback_exec` → trait 默认方法）：逐条 [`Cmd::run`] 真实
+//!   spawn。**全模块唯一执行点**是 [`Cmd::run`]；每条命令 执行前
+//!   `tracing::info!`（program+args），失败 `tracing::error!` 并上抛，
+//!   不吞错——调用方（`sysroute::prepare`）把错误传给 TUN 启动流程， 接管失败宁可无 TUN（对齐 Go
+//!   handler.go:196-205）。
 //!
 //! 测试**从不**调用执行面；唯一会真实执行的是配置开关显式开启后的实机路径。
 //!
@@ -29,9 +28,7 @@
 //!
 //! 结构化 args 直接传进程（无 shell 解析），接口名含空格也安全，故不再加引号。
 
-use std::fmt;
-use std::process::Command;
-use std::sync::Arc;
+use std::{fmt, process::Command, sync::Arc};
 
 use parking_lot::Mutex as ParkMutex;
 

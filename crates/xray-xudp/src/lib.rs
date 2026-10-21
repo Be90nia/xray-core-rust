@@ -64,10 +64,10 @@ impl XudpConfig {
 
     /// 从环境变量加载配置。
     ///
-    /// - `xray.xudp.show`（Go 名优先，旧名 `XUDP_LOG` 兜底）：设为 "1" / "true" /
-    ///   "yes" / "on"（不区分大小写）时启用日志
-    /// - `xray.xudp.basekey`（Go 名优先，旧名 `XUDP_BASE_KEY` 兜底）：Base64
-    ///   URL-safe 无填充编码的 32 字节密钥；未设置或无效时使用随机密钥
+    /// - `xray.xudp.show`（Go 名优先，旧名 `XUDP_LOG` 兜底）：设为 "1" / "true" / "yes" /
+    ///   "on"（不区分大小写）时启用日志
+    /// - `xray.xudp.basekey`（Go 名优先，旧名 `XUDP_BASE_KEY` 兜底）：Base64 URL-safe 无填充编码的
+    ///   32 字节密钥；未设置或无效时使用随机密钥
     ///
     /// env 名解析收敛在 `xray_common::platform::env`（bd 037f：Go 名优先，
     /// 单一事实源，避免两处 env 名表漂移）。
