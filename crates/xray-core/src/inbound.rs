@@ -8691,6 +8691,55 @@ mod tests {
         }
     }
 
+    /// dokodemo 专用 capture：先等上行 payload 真正落到服务端（≥expect 字节或流
+    /// 提前结束）再回 `ok`。dokodemo 无握手、accept 即 dispatch；若不等 payload，
+    /// `ok` 会在客户端 sudoku 桥接任务（wrap_conn_client 的 spawn+duplex）落盘前
+    /// 回到客户端，wire_sent 断言读到空——高负载下的确定性竞态。因果保证：服务端
+    /// socket 收到字节 ⇒ 同一批字节必已经过客户端 tap 的 poll_write（先记账后落
+    /// socket），wire 断言因此有 happens-before，不靠 sleep。
+    #[derive(Debug)]
+    struct PayloadGateDispatch {
+        expect: usize,
+    }
+
+    impl xray_app_dispatcher::DispatchHandler for PayloadGateDispatch {
+        fn tag(&self) -> &str {
+            "payload-gate"
+        }
+
+        fn dispatch(
+            &self,
+            _dest: &Destination,
+            link: Link,
+        ) -> xray_app_dispatcher::default::PinFuture<()> {
+            let expect = self.expect;
+            Box::pin(async move {
+                let Link { mut writer, mut reader } = link;
+                let mut seen = 0usize;
+                while seen < expect {
+                    match reader.read_multi_buffer().await {
+                        // EOF：照旧回写标记，让 wire 断言失败可见而非挂死
+                        Ok(mb) if mb.is_empty() => break,
+                        Ok(mb) => seen += mb.len(),
+                        Err(_) => break,
+                    }
+                }
+                let marker = b"ok".to_vec();
+                let mut mb = xray_buf::multi::MultiBuffer::new();
+                mb.merge_bytes(&marker);
+                let _ = writer.write_multi_buffer(mb).await;
+                // drain 入站：socket 带未读数据关闭会触发 RST，客户端读标记前连接被重置
+                loop {
+                    match reader.read_multi_buffer().await {
+                        Ok(mb) if mb.is_empty() => break,
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
+                }
+            })
+        }
+    }
+
     /// userLevel 生效：policy_for_level(UserLevel).timeout.handshake → serve_http
     /// 首请求超时断开。对应 Go proxy/http/server.go:47-51 policy() +
     /// :112 SetReadDeadline(Timeouts.Handshake)。
@@ -10083,9 +10132,12 @@ mod tests {
         for masked in [false, true] {
             let listener = masked_listener(masked, &mask).await;
             let addr = listener.local_addr().unwrap();
+            let ohm = Arc::new(SimpleOhm::new());
+            ohm.set_default(Arc::new(PayloadGateDispatch { expect: b"hi".len() })
+                as Arc<dyn xray_app_dispatcher::DispatchHandler>);
             tokio::spawn(serve_dokodemo(
                 listener,
-                capture_ohm(),
+                ohm,
                 DokodemoTcpOptions {
                     dest: Some(Destination::tcp(
                         Address::Domain("example.com".into()),
