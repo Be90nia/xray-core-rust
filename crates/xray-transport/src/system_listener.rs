@@ -562,7 +562,8 @@ impl InboundTcpListener {
     /// accept 一个连接并按 `finalmask.tcp` 链套 server 侧 mask（Go `hub.go`
     /// `WrapListener` → `WrapConnServer`）。
     ///
-    /// 未配置 mask → [`MaybeTcpMaskConn::Plain`]（与 [`Self::accept`] 等价，零包装）。
+    /// 未配置 mask → [`MaybeTcpMaskConn::Plain`](crate::finalmask::MaybeTcpMaskConn::Plain)
+    /// （与 [`Self::accept`] 等价，零包装）。
     /// mask 生效时返回的连接读写已是解伪装后的明文，TLS/REALITY 应在其上再握手。
     ///
     /// # Errors
