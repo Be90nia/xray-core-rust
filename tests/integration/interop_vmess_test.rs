@@ -77,7 +77,8 @@ async fn run_go_server_rust_client(security: SecurityType) {
         inbounds: vec![vmess_server_inbound(vmess_port, SAMPLE_UUID)],
         outbounds: vec![freedom_outbound()],
     };
-    let config_path = write_config_to_temp(&config, "go-vmess-server").expect("write config");
+    let config_path = write_config_to_temp(&config, &format!("go-vmess-server-{security:?}"))
+        .expect("write config");
 
     let mut go_proc = start_go_xray(&config_path).await.expect("start Go xray");
     wait_for_port(vmess_port, 5000).await.expect("Go VMess port ready");
@@ -223,7 +224,8 @@ async fn run_rust_server_go_client(security: SecurityType) {
             tag: Some("vmess-out".into()),
         }],
     };
-    let config_path = write_config_to_temp(&config, "go-vmess-client").expect("write config");
+    let config_path = write_config_to_temp(&config, &format!("go-vmess-client-{security:?}"))
+        .expect("write config");
 
     let mut go_proc = start_go_xray(&config_path).await.expect("start Go xray");
     wait_for_port(socks_port, 5000).await.expect("Go SOCKS5 port ready");
