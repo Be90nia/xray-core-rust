@@ -1969,8 +1969,9 @@ mod tests {
     /// route4/route6 判定：路由计划里存在该 IP 版本的任一路由 → 该版本有路由。
     #[test]
     fn route_families_from_plan() {
-        use crate::sysroute::{Platform, RouteEntry, RoutePlan};
         use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        use crate::sysroute::{Platform, RouteEntry, RoutePlan};
 
         let v4 =
             RouteEntry { destination: IpAddr::V4(Ipv4Addr::UNSPECIFIED), prefix: 0, metric: 0 };

@@ -135,9 +135,11 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use tokio::net::UdpSocket;
-use xray_proxy_ss::protocol::{decode_udp_packet, encode_udp_packet};
-use xray_proxy_ss::validator::MemoryUser;
-use xray_proxy_ss::{Client2022, Ss2022Inbound, Validator};
+use xray_proxy_ss::{
+    Client2022, Ss2022Inbound, Validator,
+    protocol::{decode_udp_packet, encode_udp_packet},
+    validator::MemoryUser,
+};
 
 /// 生成 SS-2022 随机 PSK 并 base64 编码（对应 Go 测试 `rand.Read(password)` +
 /// `base64.StdEncoding.EncodeToString`；PSK 长度 = cipher key 长度）。
@@ -159,8 +161,7 @@ async fn run_ss2022_tcp_e2e(method: &'static str, psk_len: usize) {
     let server_handle = tokio::spawn(async move {
         let (conn, _) = listener.accept().await.unwrap();
         let mut result = inbound.handle_conn(conn).await.expect("handle_conn");
-        let body =
-            result.stream.read_chunk().await.expect("read_chunk").expect("chunk data");
+        let body = result.stream.read_chunk().await.expect("read_chunk").expect("chunk data");
         (result.address, result.port, result.user_email, body)
     });
 
@@ -185,7 +186,8 @@ async fn ss2022_e2e_tcp_aes128gcm() {
     run_ss2022_tcp_e2e("2022-blake3-aes-128-gcm", 16).await;
 }
 
-/// SS-2022 `2022-blake3-chacha20-poly1305` TCP 端到端（32B PSK，Go shadowsocks_2022_test.go:56 子用例）。
+/// SS-2022 `2022-blake3-chacha20-poly1305` TCP 端到端（32B PSK，Go shadowsocks_2022_test.go:56
+/// 子用例）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ss2022_e2e_tcp_chacha20poly1305() {
     run_ss2022_tcp_e2e("2022-blake3-chacha20-poly1305", 32).await;
@@ -231,21 +233,19 @@ async fn run_ss_udp_e2e(ct: CipherType) {
     // client：编码请求包 → 发送 → 收回包 → 解码
     let target_addr = Address::ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8));
     let target_port: u16 = 53;
-    let packet =
-        encode_udp_packet(&client_account, &target_addr, target_port, PAYLOAD).expect("client encode");
+    let packet = encode_udp_packet(&client_account, &target_addr, target_port, PAYLOAD)
+        .expect("client encode");
     client_sock.send_to(&packet, server_addr).await.expect("client send");
 
     // client 侧解码同 wire 格式的回包（对称 AEAD，SS UDP 请求/响应同构）
     let client_validator = Validator::new();
     client_validator.add(MemoryUser::new("alice", client_account.clone())).expect("add user");
     let mut rbuf = vec![0u8; 65535];
-    let (n, _) = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        client_sock.recv_from(&mut rbuf),
-    )
-    .await
-    .expect("recv timeout")
-    .expect("client recv");
+    let (n, _) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), client_sock.recv_from(&mut rbuf))
+            .await
+            .expect("recv timeout")
+            .expect("client recv");
     let (resp_header, resp_payload) =
         decode_udp_packet(&client_validator, &rbuf[..n]).expect("client decode");
 

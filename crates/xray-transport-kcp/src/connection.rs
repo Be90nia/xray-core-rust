@@ -637,10 +637,10 @@ impl Connection {
 /// `connection.go:283-364` 同构）：
 ///
 /// 1. 16 次自旋快速路径（Go `dataInput.Wait()` non-blocking + `runtime.Gosched`）；
-/// 2. `duration = 16s` 默认；deadline 非零时取 `deadline - now`，已过期**立即**
-///    返回 [`KcpError::IoTimeout`]；
-/// 3. `select` 数据到达 vs 超时到点。到点时 deadline 已设 → [`KcpError::IoTimeout`]；
-///    未设 → `Ok`（Go 返回 nil，调用方循环重进 = 继续等下一轮）。
+/// 2. `duration = 16s` 默认；deadline 非零时取 `deadline - now`，已过期**立即** 返回
+///    [`KcpError::IoTimeout`]；
+/// 3. `select` 数据到达 vs 超时到点。到点时 deadline 已设 → [`KcpError::IoTimeout`]； 未设 →
+///    `Ok`（Go 返回 nil，调用方循环重进 = 继续等下一轮）。
 ///
 /// 时间读全部走 tokio 时钟（[`tokio::time::Instant`]）：与 `tokio::time::pause`
 /// 确定性测试对齐；生产（无 pause）下与 std 时钟等价。deadline 在等待开始时读取

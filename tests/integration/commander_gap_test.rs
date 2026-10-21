@@ -26,12 +26,14 @@ use tonic::{Request, transport::Channel};
 use xray_conf::{BuiltConfig, BuiltEntry, BuiltInbound, BuiltOutbound, app_config::ApiConfig};
 use xray_core::functions::start_full;
 use xray_proto::xray::{
-    app::proxyman::command::{
-        AddInboundRequest, AddUserOperation, AlterInboundRequest, GetInboundUserRequest,
-        ListInboundsRequest, RemoveInboundRequest, RemoveUserOperation,
-        handler_service_client::HandlerServiceClient,
+    app::{
+        proxyman::command::{
+            AddInboundRequest, AddUserOperation, AlterInboundRequest, GetInboundUserRequest,
+            ListInboundsRequest, RemoveInboundRequest, RemoveUserOperation,
+            handler_service_client::HandlerServiceClient,
+        },
+        stats::command::{GetStatsRequest, stats_service_client::StatsServiceClient},
     },
-    app::stats::command::{GetStatsRequest, stats_service_client::StatsServiceClient},
     common::{protocol::User, serial::TypedMessage},
     core::InboundHandlerConfig,
 };
@@ -377,7 +379,10 @@ async fn add_inbound_starts_real_listener_and_serves() {
     // 缺 proxy_settings → 明确报错（不静默成功）。
     let no_proxy = handler
         .add_inbound(Request::new(AddInboundRequest {
-            inbound: Some(InboundHandlerConfig { tag: "api-no-proxy".into(), ..Default::default() }),
+            inbound: Some(InboundHandlerConfig {
+                tag: "api-no-proxy".into(),
+                ..Default::default()
+            }),
         }))
         .await
         .unwrap_err();
@@ -408,10 +413,7 @@ async fn remove_inbound_stops_listener() {
 
     // 运行时状态真变：原端口不再接受连接（取消令牌已停 accept loop）。
     tokio::time::sleep(Duration::from_millis(150)).await;
-    assert!(
-        TcpStream::connect(("127.0.0.1", dok_port)).await.is_err(),
-        "移除后入站不应再接受连接"
-    );
+    assert!(TcpStream::connect(("127.0.0.1", dok_port)).await.is_err(), "移除后入站不应再接受连接");
 
     // 重复删 → NotFound（Go HandlerNotFound）。
     let gone = handler

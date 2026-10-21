@@ -318,8 +318,9 @@ mod tests {
     /// 强制先补 [`crate::btls_client::effective_fingerprint`] 裁决与本表。
     #[test]
     fn fingerprint_resolution_explicit_table() {
-        use crate::btls_client::{FingerprintResolution as Res, effective_fingerprint};
         use Fingerprint as F;
+
+        use crate::btls_client::{FingerprintResolution as Res, effective_fingerprint};
 
         let n = Res::Native;
         let d = |e: Fingerprint| Res::Degraded { effective: e };

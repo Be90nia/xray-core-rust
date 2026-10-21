@@ -252,11 +252,7 @@ async fn sniffed_tls_sni_routes_by_domain_marker_a() {
     })))
     .await;
     let (banner, all) = run_connect_and_echo(http_port).await;
-    assert_eq!(
-        banner,
-        b"-A",
-        "嗅探生效时路由应命中域名规则（echo A），实际 banner {banner:?}"
-    );
+    assert_eq!(banner, b"-A", "嗅探生效时路由应命中域名规则（echo A），实际 banner {banner:?}");
     assert_data_plane(&all);
     for h in handles {
         h.abort();
@@ -270,11 +266,7 @@ async fn sniffed_tls_sni_routes_by_domain_marker_a() {
 async fn sniffing_disabled_falls_back_to_ip_rule_marker_b() {
     let (http_port, _instance, handles) = start_topology(None).await;
     let (banner, all) = run_connect_and_echo(http_port).await;
-    assert_eq!(
-        banner,
-        b"-B",
-        "嗅探关闭时路由应命中 IP 规则（echo B），实际 banner {banner:?}"
-    );
+    assert_eq!(banner, b"-B", "嗅探关闭时路由应命中 IP 规则（echo B），实际 banner {banner:?}");
     assert_data_plane(&all);
     for h in handles {
         h.abort();

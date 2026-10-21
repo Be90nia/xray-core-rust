@@ -514,6 +514,12 @@ impl std::fmt::Debug for UdpWorker {
 }
 
 impl UdpWorker {
+    /// UDP NAT 会话无活动回收窗口（bd cjwc G15）：对齐 Go
+    /// `proxyman/inbound/worker.go:397` 硬编码 `2*60`（120s，checker 每分钟扫）。
+    /// Go policy 的 ConnectionIdle 默认 300s（`policy::DEFAULT_CONN_IDLE_TIMEOUT`）
+    /// 是 TCP 连接语义，UDP worker 不消费 policy——此前误用 300s 致 NAT 表膨胀 2.5×。
+    const UDP_SESSION_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
     /// 构造 UDP worker。
     #[allow(clippy::too_many_arguments)] // Go NewUdpWorker 装配面 10 参直译，打包结构属 API 变更
     pub fn new(
@@ -636,12 +642,6 @@ impl UdpWorker {
             });
         }
     }
-
-    /// UDP NAT 会话无活动回收窗口（bd cjwc G15）：对齐 Go
-    /// `proxyman/inbound/worker.go:397` 硬编码 `2*60`（120s，checker 每分钟扫）。
-    /// Go policy 的 ConnectionIdle 默认 300s（`policy::DEFAULT_CONN_IDLE_TIMEOUT`）
-    /// 是 TCP 连接语义，UDP worker 不消费 policy——此前误用 300s 致 NAT 表膨胀 2.5×。
-    const UDP_SESSION_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
     /// UDP NAT 会话空闲回收判定：直译 Go `worker.go:393-406 clean()` 的
     /// `nowSec-lastActivityTime > 2*60` 分支——超窗 → `setInactive` + 删表项。

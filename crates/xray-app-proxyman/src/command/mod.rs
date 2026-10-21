@@ -583,8 +583,9 @@ impl HandlerService for DefaultHandlerService {
 mod tests {
     // 测试构造以字段赋值表意（对齐 Go 逐字段装配），struct update 化反而降低对照度
     #![allow(clippy::field_reassign_with_default)]
-    use parking_lot::Mutex;
     use std::future::Future;
+
+    use parking_lot::Mutex;
 
     use super::*;
 

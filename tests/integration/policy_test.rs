@@ -61,8 +61,10 @@ fn server_cfg(vmess_port: u16, policy_json: &[u8]) -> BuiltConfig {
     cfg.inbounds.push(BuiltInbound {
         entry: BuiltEntry {
             kind: "vmess".into(),
-            data: format!(r#"{{"clients":[{{"id":"{VMESS_UUID}","email":"policy@t","level":0}}]}}"#)
-                .into_bytes(),
+            data: format!(
+                r#"{{"clients":[{{"id":"{VMESS_UUID}","email":"policy@t","level":0}}]}}"#
+            )
+            .into_bytes(),
         },
         tag: "vmess-in".into(),
         port: Some(vmess_port),
@@ -76,7 +78,12 @@ fn server_cfg(vmess_port: u16, policy_json: &[u8]) -> BuiltConfig {
 
 /// client instance：（可选）policy app + dokodemo inbound（rewrite → 业务终点）
 /// + vmess outbound（aes-128-gcm，对应 Go SecurityType_AES128_GCM）。
-fn client_cfg(dok_port: u16, vmess_port: u16, dest_port: u16, policy_json: Option<&[u8]>) -> BuiltConfig {
+fn client_cfg(
+    dok_port: u16,
+    vmess_port: u16,
+    dest_port: u16,
+    policy_json: Option<&[u8]>,
+) -> BuiltConfig {
     let mut cfg = BuiltConfig::default();
     if let Some(p) = policy_json {
         cfg.apps.push(BuiltEntry { kind: "policy".into(), data: p.to_vec() });
@@ -122,9 +129,7 @@ async fn start_pair(
     let (_si, _soh, mut s_handles) =
         start_full(&server_cfg(vmess_port, server_policy)).await.unwrap();
     let (_ci, _coh, mut c_handles) =
-        start_full(&client_cfg(dok_port, vmess_port, dest_port, client_policy))
-            .await
-            .unwrap();
+        start_full(&client_cfg(dok_port, vmess_port, dest_port, client_policy)).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     s_handles.append(&mut c_handles);
     (dok_port, s_handles)

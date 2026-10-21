@@ -8,12 +8,10 @@
 //!
 //! - **ctrl（TCP）**：UDP ASSOCIATE 的关联载体。断开（drop / [`SocksUdpClient::shutdown`]）
 //!   即会话终结——服务端依 ctrl EOF 收割 UDP 会话（Go server.go 同）。
-//! - **relay（UDP）**：connect 到 BND.ADDR/PORT（`0.0.0.0`/`::` 回落 server 地址，
-//!   RFC 1928 §7；BND 为域名时本地解析一次），之后 send/recv 免带地址；
-//!   connect 语义同时过滤非 relay 来源的数据报。
-//! - [`relay`]：与 freedom `relay_policy` 同形态的双向泵入口
-//!   （XUDP 帧流 ↔ SOCKS5 UDP 数据报），供波 3 接线 xray-core 的 socks outbound
-//!   UDP 分支选用；本轮仅库层，不接线。
+//! - **relay（UDP）**：connect 到 BND.ADDR/PORT（`0.0.0.0`/`::` 回落 server 地址， RFC 1928 §7；BND
+//!   为域名时本地解析一次），之后 send/recv 免带地址； connect 语义同时过滤非 relay 来源的数据报。
+//! - [`relay`]：与 freedom `relay_policy` 同形态的双向泵入口 （XUDP 帧流 ↔ SOCKS5 UDP
+//!   数据报），供波 3 接线 xray-core 的 socks outbound UDP 分支选用；本轮仅库层，不接线。
 
 use std::{
     io,
@@ -242,12 +240,11 @@ fn socks_to_destination(addr: SocksAddr) -> Destination {
 
 /// freedom `relay_policy` 同形态入口：XUDP 帧流 ↔ SOCKS5 UDP 数据报双向泵。
 ///
-/// - 请求方向：link.reader 的 XUDP 帧 → `send_frame`（帧内目标；无目标帧回退
-///   `default_dest`，对齐 freedom 的会话默认目标语义）。
-/// - 响应方向：relay recv → 剥 SOCKS5 头 → XUDP 帧（source = 帧内 DST/回包地址）→
-///   link.writer。
-/// - **ctrl 断开** → 中止响应泵、关闭 relay 与会话；请求方向结束（link EOF）→
-///   shutdown ctrl（服务端收割会话）。
+/// - 请求方向：link.reader 的 XUDP 帧 → `send_frame`（帧内目标；无目标帧回退 `default_dest`，对齐
+///   freedom 的会话默认目标语义）。
+/// - 响应方向：relay recv → 剥 SOCKS5 头 → XUDP 帧（source = 帧内 DST/回包地址）→ link.writer。
+/// - **ctrl 断开** → 中止响应泵、关闭 relay 与会话；请求方向结束（link EOF）→ shutdown
+///   ctrl（服务端收割会话）。
 ///
 /// 供波 3 `xray-core` socks outbound UDP 分支接线（本轮仅库层，不接线）。
 pub async fn relay(

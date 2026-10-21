@@ -10,8 +10,10 @@
 //! [`InterfaceFlags::BROADCAST`] / [`InterfaceFlags::MULTICAST`] 恒不置位；
 //! 接线方（TUN 自动路由/系统 DNS）若需真实值须另扩数据源，不得消费哨兵值。
 
-use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::{
+    io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+};
 
 use if_addrs::{IfAddr, get_if_addrs};
 
@@ -86,16 +88,16 @@ impl InterfaceAddr {
 pub struct InterfaceFlags(u16);
 
 impl InterfaceFlags {
-    /// 接口在运行（对应 Go `FlagUp`，来自 oper_status=Up）。
-    pub const UP: Self = Self(1 << 0);
     /// 支持广播（对应 Go `FlagBroadcast`；数据源不提供，恒不置位）。
     pub const BROADCAST: Self = Self(1 << 1);
     /// 回环接口（对应 Go `FlagLoopback`，来自回环地址判定）。
     pub const LOOPBACK: Self = Self(1 << 2);
-    /// 点对点接口（对应 Go `FlagPointToPoint`）。
-    pub const POINT_TO_POINT: Self = Self(1 << 3);
     /// 支持组播（对应 Go `FlagMulticast`；数据源不提供，恒不置位）。
     pub const MULTICAST: Self = Self(1 << 4);
+    /// 点对点接口（对应 Go `FlagPointToPoint`）。
+    pub const POINT_TO_POINT: Self = Self(1 << 3);
+    /// 接口在运行（对应 Go `FlagUp`，来自 oper_status=Up）。
+    pub const UP: Self = Self(1 << 0);
 
     /// 全零标志集。
     #[must_use]
