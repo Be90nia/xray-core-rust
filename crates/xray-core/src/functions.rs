@@ -4683,6 +4683,118 @@ mod tests {
         echo_task.abort();
     }
 
+    /// Go 服务端互通探针（playbook §A-2）：Rust client（socks→vless outbound+mux）
+    /// → carrier（v1.mux.cool:9527，TCP command）→ Go xray vless inbound →
+    /// freedom → 外部 echo。验证 Go 服务端是否认 Rust 的 mux carrier 形态。
+    ///
+    /// `#[ignore]`：需外部编排 Go xray + echo（reports/night-run-2026-10-21/
+    /// scripts/run_mux_go_interop.py），env 传服务端与 echo 地址。
+    #[tokio::test]
+    #[ignore = "needs Go xray server + echo（run_mux_go_interop.py 编排）"]
+    async fn vless_mux_go_server_interop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let go_addr = std::env::var("XRAY_GO_VLESS_ADDR").expect("XRAY_GO_VLESS_ADDR");
+        let echo_addr = std::env::var("XRAY_ECHO_ADDR").expect("XRAY_ECHO_ADDR");
+        let user_id = std::env::var("XRAY_TEST_UUID")
+            .unwrap_or_else(|_| "b831381d-6324-4d53-ad4f-8cda48b30811".into());
+        let (go_host, go_port) = go_addr.rsplit_once(':').expect("addr form host:port");
+        let go_port: u16 = go_port.parse().expect("Go port number");
+        let (echo_host, echo_port) = echo_addr.rsplit_once(':').expect("addr form host:port");
+        let echo_port: u16 = echo_port.parse().expect("echo port number");
+        let echo_ip: std::net::Ipv4Addr = echo_host.parse().expect("echo IPv4 literal");
+
+        // carrier 计数 forwarder：客户端 mux worker → Go vless 的每条 TCP 连接
+        // 过路计数（复用断言观测点；同基线测试形态）。
+        let fwd_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fwd_port = fwd_listener.local_addr().unwrap().port();
+        let carrier_count = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&carrier_count);
+        let go_host = go_host.to_string();
+        let fwd_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut down, _)) = fwd_listener.accept().await else { break };
+                count.fetch_add(1, Ordering::SeqCst);
+                let Ok(mut up) = TcpStream::connect((go_host.as_str(), go_port)).await else {
+                    break;
+                };
+                let _ = tokio::io::copy_bidirectional(&mut down, &mut up).await;
+            }
+        });
+
+        // 客户端：socks inbound + vless outbound（经 forwarder 到 Go）+ mux enabled。
+        let client_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_port = client_probe.local_addr().unwrap().port();
+        drop(client_probe);
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "socks".into(), data: br#"{"auth":"noauth"}"#.to_vec() },
+            tag: "socks-in".into(),
+            port: Some(client_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        client_cfg.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry {
+                kind: "vless".into(),
+                data: format!(
+                    r#"{{"vnext":[{{"address":"127.0.0.1","port":{fwd_port},"users":[{{"id":"{user_id}","encryption":"none"}}]}}]}}"#
+                )
+                .into_bytes(),
+            },
+            tag: "proxy".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: Some(serde_json::json!({"enabled": true, "concurrency": 8})),
+            target_strategy: None,
+        });
+        let (_ci, _co, ch) = start_full(&client_cfg).await.expect("socks+vless+mux client");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 3 个并发会话 → mux 出站 → Go：payload 原样回显即为互通成功。
+        let mut handles = Vec::new();
+        for i in 0..3 {
+            let payload = format!("mux-go-interop-{i}");
+            handles.push(tokio::spawn(async move {
+                let mut c = TcpStream::connect(("127.0.0.1", client_port))
+                    .await
+                    .expect("connect client socks");
+                c.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+                let mut m = [0u8; 2];
+                c.read_exact(&mut m).await.unwrap();
+                assert_eq!(m, [0x05, 0x00], "NoAuth method selected");
+                let mut req = vec![0x05, 0x01, 0x00, 0x01];
+                req.extend_from_slice(&echo_ip.octets());
+                req.extend_from_slice(&echo_port.to_be_bytes());
+                c.write_all(&req).await.unwrap();
+                let mut rep = [0u8; 10];
+                c.read_exact(&mut rep).await.unwrap();
+                assert_eq!(rep[1], 0x00, "socks connect via Go server must succeed");
+                c.write_all(payload.as_bytes()).await.unwrap();
+                let mut buf = vec![0u8; payload.len()];
+                c.read_exact(&mut buf).await.unwrap();
+                assert_eq!(buf, payload.as_bytes(), "echo roundtrip via Go server");
+            }));
+        }
+        for h in handles {
+            h.await.expect("client task join");
+        }
+
+        // 复用断言：3 个会话只建立 1 条 carrier TCP 连接（Go 服务端侧复用）。
+        assert_eq!(
+            carrier_count.load(Ordering::SeqCst),
+            1,
+            "3 mux sessions must reuse a single carrier to the Go server"
+        );
+
+        for h in ch.iter() {
+            h.abort();
+        }
+        fwd_task.abort();
+    }
+
     /// 出站级 mux UDP 数据报端到端（XUDP GlobalID 路径）。
     ///
     /// socks UDP relay → dispatcher UDP relay（dispatch_with_access）→
