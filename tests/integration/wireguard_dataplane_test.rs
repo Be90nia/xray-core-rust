@@ -122,25 +122,20 @@ async fn spawn_tcp_echo() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
     let addr = listener.local_addr().expect("echo addr");
     tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((mut sock, _)) => {
-                    tokio::spawn(async move {
-                        let mut buf = [0u8; 4096];
-                        loop {
-                            match sock.read(&mut buf).await {
-                                Ok(0) | Err(_) => break,
-                                Ok(n) => {
-                                    if sock.write_all(&buf[..n]).await.is_err() {
-                                        break;
-                                    }
-                                },
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if sock.write_all(&buf[..n]).await.is_err() {
+                                break;
                             }
-                        }
-                    });
-                },
-                Err(_) => break,
-            }
+                        },
+                    }
+                }
+            });
         }
     });
     addr
@@ -151,13 +146,8 @@ async fn spawn_udp_echo(bind_addr: &str) {
     let sock = UdpSocket::bind(bind_addr).await.expect("bind udp echo");
     tokio::spawn(async move {
         let mut buf = vec![0u8; 16 * 1024];
-        loop {
-            match sock.recv_from(&mut buf).await {
-                Ok((n, peer)) => {
-                    let _ = sock.send_to(&buf[..n], peer).await;
-                },
-                Err(_) => break,
-            }
+        while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+            let _ = sock.send_to(&buf[..n], peer).await;
         }
     });
 }
