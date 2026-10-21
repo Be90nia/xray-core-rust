@@ -221,6 +221,14 @@ async fn start_full_dispatched(
                         (Some(routing), Some(dns_side))
                     },
                     Err(e) => {
+                        // bd il49：配置引用 geo 规则但资产缺失 → 拒启（对齐 Go
+                        // Build 失败即拒启）。回退 PatternRouter 会把 geosite:/geoip:
+                        // 规则静默降级为永不命中的字面量，分流意图完全丢失。
+                        if let crate::wiring::WiringError::Geodata(msg) = &e {
+                            return Err(CoreFunctionError::InstanceInit(format!(
+                                "router init failed: {msg}"
+                            )));
+                        }
                         tracing::warn!(
                             error = %e,
                             "full Router init failed, falling back to PatternRouter"
