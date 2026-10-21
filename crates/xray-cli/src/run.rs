@@ -138,6 +138,9 @@ pub async fn execute(args: RunArgs) -> Result<()> {
     // 设置时启动期 warn 指名（subscriber 已就绪，不静默丢）。
     xray_common::platform::env::warn_unsupported_env_flags();
     xray_common::runtime_guard::log_runtime_snapshot("startup");
+    // bd qxqw：启动即输出内核身份（version/git rev/二进制指纹/构建画像）——
+    // VERSION_Z 恒定，单靠版本串无法区分部署构建。
+    crate::identity::log_kernel_identity();
 
     // 91vi：`--unix` 启动期校验。splithttp UDS 监听尚未贯通 (M3B 域
     // xray-transport-splithttp transport.rs UDS listener 仍在开发)。

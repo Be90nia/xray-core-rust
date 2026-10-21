@@ -23,6 +23,7 @@ pub mod alloc_stats;
 pub mod commands;
 pub mod distro;
 pub mod error;
+pub mod identity;
 pub mod run;
 pub mod version;
 
