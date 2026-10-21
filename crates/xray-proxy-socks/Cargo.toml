@@ -12,6 +12,8 @@ xray-transport = { path = "../xray-transport" }
 xray-app-dispatcher = { path = "../xray-app-dispatcher" }
 xray-buf = { path = "../xray-buf" }
 xray-proto = { path = "../xray-proto" }
+xray-xudp = { path = "../xray-xudp" }
+rand = { workspace = true }
 async-trait = "0.1"
 thiserror = { workspace = true }
 parking_lot = { workspace = true }

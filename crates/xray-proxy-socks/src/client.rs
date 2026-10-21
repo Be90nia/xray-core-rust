@@ -13,6 +13,8 @@
 //!
 //! [`Connection`]: xray_transport::connection::Connection
 
+use std::net::{Ipv4Addr, Ipv6Addr};
+
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -32,7 +34,7 @@ use crate::{
 /// 60s（Go `features/policy/policy.go` `SessionDefault`，注释注明对齐 nginx
 /// client_header_timeout 以免暴露服务端身份）。
 // shortcut: policyManager 未接线，握手超时恒取 policy 缺省 60s；接线后按 level 取值
-const SOCKS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const SOCKS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// SOCKS 客户端配置：server 地址 + 可选认证。
 #[derive(Debug, Clone)]
@@ -124,47 +126,8 @@ impl SocksClient {
     /// SOCKS5 握手本体（method 协商 → 可选 RFC 1929 auth → CONNECT 往返）。
     /// deadline 由 [`SocksClient::dial`] 的 timeout 施加，此处不设。
     async fn handshake(&self, stream: &mut TcpStream, target: &SocksAddr) -> Result<()> {
-        // 1. method negotiation
-        // Go protocol.go:443-447：按凭据有无二选一只发 1 个 method
-        //（带凭据 [05 01 02] / 无凭据 [05 01 00]；发两个 method 的
-        // [05 02 00 02] 是 DPI 可辨的 Rust 指纹，票 g6kn）。
-        let auth_method: u8 =
-            if self.config.username.is_some() { AUTH_PASSWORD } else { AUTH_NOT_REQUIRED };
-        stream.write_all(&[SOCKS5_VERSION, 0x01, auth_method]).await?;
-
-        let mut resp = [0u8; 2];
-        stream.read_exact(&mut resp).await?;
-        if resp[0] != SOCKS5_VERSION {
-            return Err(SocksError::HandshakeFailed(format!(
-                "invalid SOCKS version in method response: {}",
-                resp[0]
-            )));
-        }
-        let method = resp[1];
-
-        // 2. 处理选定的 method
-        match method {
-            AUTH_NOT_REQUIRED => {},
-            AUTH_PASSWORD => {
-                let (u, p) = match (&self.config.username, &self.config.password) {
-                    (Some(u), Some(p)) => (u.as_str(), p.as_str()),
-                    _ => {
-                        return Err(SocksError::AuthFailed(
-                            "server picked password auth but client provided no credentials".into(),
-                        ));
-                    },
-                };
-                Self::auth_password(stream, u, p).await?;
-            },
-            AUTH_NO_MATCHING_METHOD => {
-                return Err(SocksError::AuthFailed("server returned no matching method".into()));
-            },
-            other => {
-                return Err(SocksError::HandshakeFailed(format!(
-                    "server picked unknown method: {other:#x}"
-                )));
-            },
-        }
+        // 1+2. method negotiation + auth（与 UDP ASSOCIATE 握手共用）
+        negotiate(stream, &self.config).await?;
 
         // 3. CONNECT 请求
         let mut req = vec![SOCKS5_VERSION, CMD_TCP_CONNECT, 0x00];
@@ -187,58 +150,123 @@ impl SocksClient {
             )));
         }
 
-        // 5. 读 BND.ADDR + BND.PORT（按 ATYP 决定长度，丢弃——上层不用）
+        // 5. 读 BND.ADDR + BND.PORT（按 ATYP 决定长度；CONNECT 路径上层不用，
+        // 读掉保持与服务端帧对齐——UDP ASSOCIATE 路径复用同一解析）
         let atyp = resp_header[3];
-        let addr_len = match atyp {
-            ATYP_IPV4 => 4,
-            ATYP_IPV6 => 16,
-            ATYP_DOMAIN => {
-                let mut len_buf = [0u8; 1];
-                stream.read_exact(&mut len_buf).await?;
-                len_buf[0] as usize
-            },
-            other => {
-                return Err(SocksError::InvalidFrame(format!(
-                    "unknown ATYP in connect response: {other:#x}"
-                )));
-            },
-        };
-        let mut rest = vec![0u8; addr_len + 2];
-        stream.read_exact(&mut rest).await?;
+        let _ = read_reply_addr(stream, atyp).await?;
 
         Ok(())
     }
+}
 
-    /// RFC 1929 用户名/密码子协议。
-    async fn auth_password(stream: &mut TcpStream, username: &str, password: &str) -> Result<()> {
-        let ub = username.as_bytes();
-        let pb = password.as_bytes();
-        if ub.len() > 255 || pb.len() > 255 {
-            return Err(SocksError::AuthFailed("username/password exceeds 255 bytes".into()));
-        }
-        let mut buf = Vec::with_capacity(3 + ub.len() + pb.len());
-        buf.push(0x01); // RFC 1929 版本
-        buf.push(ub.len() as u8);
-        buf.extend_from_slice(ub);
-        buf.push(pb.len() as u8);
-        buf.extend_from_slice(pb);
-        stream.write_all(&buf).await?;
+/// SOCKS5 method 协商 + 可选 RFC 1929 auth（CONNECT / UDP ASSOCIATE 握手共用首段）。
+///
+/// Go protocol.go:443-447：按凭据有无二选一只发 1 个 method
+///（带凭据 `[05 01 02]` / 无凭据 `[05 01 00]`；发两个 method 的
+/// `[05 02 00 02]` 是 DPI 可辨的 Rust 指纹，票 g6kn）。
+pub(crate) async fn negotiate(stream: &mut TcpStream, config: &ClientConfig) -> Result<()> {
+    let auth_method: u8 = if config.username.is_some() { AUTH_PASSWORD } else { AUTH_NOT_REQUIRED };
+    stream.write_all(&[SOCKS5_VERSION, 0x01, auth_method]).await?;
 
-        let mut auth_resp = [0u8; 2];
-        stream.read_exact(&mut auth_resp).await?;
-        if auth_resp[0] != 0x01 {
-            return Err(SocksError::AuthFailed(format!(
-                "invalid auth sub-negotiation version: {}",
-                auth_resp[0]
+    let mut resp = [0u8; 2];
+    stream.read_exact(&mut resp).await?;
+    if resp[0] != SOCKS5_VERSION {
+        return Err(SocksError::HandshakeFailed(format!(
+            "invalid SOCKS version in method response: {}",
+            resp[0]
+        )));
+    }
+
+    match resp[1] {
+        AUTH_NOT_REQUIRED => {},
+        AUTH_PASSWORD => {
+            let (u, p) = match (&config.username, &config.password) {
+                (Some(u), Some(p)) => (u.as_str(), p.as_str()),
+                _ => {
+                    return Err(SocksError::AuthFailed(
+                        "server picked password auth but client provided no credentials".into(),
+                    ));
+                },
+            };
+            auth_password(stream, u, p).await?;
+        },
+        AUTH_NO_MATCHING_METHOD => {
+            return Err(SocksError::AuthFailed("server returned no matching method".into()));
+        },
+        other => {
+            return Err(SocksError::HandshakeFailed(format!(
+                "server picked unknown method: {other:#x}"
             )));
-        }
-        if auth_resp[1] != 0x00 {
-            return Err(SocksError::AuthFailed(format!(
-                "auth failed with status: {}",
-                auth_resp[1]
-            )));
-        }
-        Ok(())
+        },
+    }
+    Ok(())
+}
+
+/// RFC 1929 用户名/密码子协议。
+pub(crate) async fn auth_password(
+    stream: &mut TcpStream,
+    username: &str,
+    password: &str,
+) -> Result<()> {
+    let ub = username.as_bytes();
+    let pb = password.as_bytes();
+    if ub.len() > 255 || pb.len() > 255 {
+        return Err(SocksError::AuthFailed("username/password exceeds 255 bytes".into()));
+    }
+    let mut buf = Vec::with_capacity(3 + ub.len() + pb.len());
+    buf.push(0x01); // RFC 1929 版本
+    buf.push(ub.len() as u8);
+    buf.extend_from_slice(ub);
+    buf.push(pb.len() as u8);
+    buf.extend_from_slice(pb);
+    stream.write_all(&buf).await?;
+
+    let mut auth_resp = [0u8; 2];
+    stream.read_exact(&mut auth_resp).await?;
+    if auth_resp[0] != 0x01 {
+        return Err(SocksError::AuthFailed(format!(
+            "invalid auth sub-negotiation version: {}",
+            auth_resp[0]
+        )));
+    }
+    if auth_resp[1] != 0x00 {
+        return Err(SocksError::AuthFailed(format!("auth failed with status: {}", auth_resp[1])));
+    }
+    Ok(())
+}
+
+/// 读取请求响应的 BND.ADDR + BND.PORT（按 ATYP 决定长度）。
+///
+/// CONNECT 路径丢弃返回值（读掉保持与服务端帧对齐）；
+/// UDP ASSOCIATE 路径把返回值用作 relay 地址。
+pub(crate) async fn read_reply_addr(stream: &mut TcpStream, atyp: u8) -> Result<SocksAddr> {
+    match atyp {
+        ATYP_IPV4 => {
+            let mut octets = [0u8; 4];
+            stream.read_exact(&mut octets).await?;
+            let mut port = [0u8; 2];
+            stream.read_exact(&mut port).await?;
+            Ok(SocksAddr::ipv4(Ipv4Addr::from(octets), u16::from_be_bytes(port)))
+        },
+        ATYP_IPV6 => {
+            let mut octets = [0u8; 16];
+            stream.read_exact(&mut octets).await?;
+            let mut port = [0u8; 2];
+            stream.read_exact(&mut port).await?;
+            Ok(SocksAddr::ipv6(Ipv6Addr::from(octets), u16::from_be_bytes(port)))
+        },
+        ATYP_DOMAIN => {
+            let mut len_buf = [0u8; 1];
+            stream.read_exact(&mut len_buf).await?;
+            let dlen = len_buf[0] as usize;
+            let mut rest = vec![0u8; dlen + 2];
+            stream.read_exact(&mut rest).await?;
+            let domain = std::str::from_utf8(&rest[..dlen])
+                .map_err(|e| SocksError::InvalidFrame(format!("bnd domain utf8 error: {e}")))?;
+            let port = u16::from_be_bytes([rest[dlen], rest[dlen + 1]]);
+            Ok(SocksAddr::domain(domain, port))
+        },
+        other => Err(SocksError::InvalidFrame(format!("unknown ATYP in reply: {other:#x}"))),
     }
 }
 
