@@ -2866,7 +2866,7 @@ struct InboundSlot {
 /// 生产 inbound 运行时（bd jezb）：gRPC `HandlerService` 的 inbound 域后端。
 ///
 /// 持有真实 ohm / dispatcher / policy 与实例 shutdown token，使 `AddInbound` 走与
-/// 配置期完全相同的 [`spawn_one_inbound`] 路径起 listener（bind 失败原样上抛），
+/// 配置期完全相同的 `spawn_one_inbound` 路径起 listener（bind 失败原样上抛），
 /// `RemoveInbound` 通过 per-inbound 令牌单独停一个入站。
 pub struct InboundRuntime {
     ohm: Arc<SimpleOhm>,
