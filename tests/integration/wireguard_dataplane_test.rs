@@ -346,16 +346,12 @@ async fn wg_dataplane_tcp_echo_1mb_three_concurrent() {
 
     tokio::time::sleep(READY_DELAY).await;
 
-    // 3 条 1MB 往返，传输阶段并发（Go errgroup 同形态）。连接阶段按 300ms 错开：
-    // 服务端 smoltcp 惰性监听单槽位（无 backlog），同隧道内目标的三只 SYN 同窗到达
-    // 会互撞 RST（finding-5）——Go gVisor forwarder 有连接队列无此限制。错开连接、
-    // 并发传输，负载特征与 Go 用例一致。
+    // 3 条 1MB 往返，连接与传输全并发（Go errgroup 同形态）。连接阶段原按 300ms
+    // 错开规避惰性监听单槽位互撞 RST（bd n07t F5）；修复后同 tuple 监听池化排队
+    // （netstack::MAX_LISTENS_PER_TUPLE），不再错开以锁死并发受理行为。
     let started = Instant::now();
     let mut tasks = JoinSet::new();
     for i in 0u64..3 {
-        if i > 0 {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
         tasks.spawn(tcp_roundtrip(entry_port, MB, 0xA000 + i));
     }
     while let Some(res) = tasks.join_next().await {

@@ -14,7 +14,7 @@
 //! 单线程驱动：driver task 在持锁期间依次执行 ingest_rx → poll → drain_tx。
 //! smoltcp Interface 不是 Sync，必须由 driver task 单点驱动。
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use smoltcp::{
     iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet},
@@ -41,6 +41,14 @@ const UDP_META_SLOTS: usize = 32;
 /// # ponytail: 每 slot ~128KB 缓冲，512 上限最坏 ~64MB；出现端口扫描型内存压力再收紧。
 const MAX_PENDING_LISTENS: usize = 512;
 
+/// 同 tuple 惰性监听并发上限——bd n07t F5 的最小 backlog 等价物。
+///
+/// Go gVisor `tcp.NewForwarder` 对每只 SYN 都建 endpoint（per-request accept，
+/// 无界）；此处按每槽 ~128KB 缓冲给 16 的有界队列：同目标 ≤16 只并发握手/待
+/// accept 连接各占一槽，超出后新 SYN 无 socket 受理，由 smoltcp 回 RST、客户端
+/// 重传退避（与 [`MAX_PENDING_LISTENS`] 溢出语义一致）。
+const MAX_LISTENS_PER_TUPLE: usize = 16;
+
 /// WireGuard 用的 smoltcp 网络栈。
 ///
 /// 内部持有 Interface（不可跨线程共享）+ VirtualDevice（FIFO）+ SocketSet。
@@ -59,8 +67,15 @@ pub struct WgNetStack {
     /// smoltcp `listen` 对 port 0 恒报 Unaddressable，无通配监听语义；Go gVisor 用
     /// `tcp.NewForwarder` 对每个 SYN 走 per-request accept。Rust 等价物：`ingest_rx`
     /// 嗅探隧道内 TCP SYN，按目标 (addr, port) 惰性建听；accept 后同 tuple 补位
-    /// （[`Self::drain_accepted`]）。不变量：同 tuple 至多一个 pending 监听。
+    /// （[`Self::drain_accepted`]）。不变量：同 tuple 至多 [`MAX_LISTENS_PER_TUPLE`]
+    /// 个 pending 监听（bd n07t F5：同目标并发 SYN 各占一槽排队，替代旧单槽位）。
     listening: Vec<(SocketHandle, IpEndpoint)>,
+    /// 已受理 SYN 的 4 元组 (源, 目标)——重传/同 4 元组重复 SYN 不再建槽。
+    ///
+    /// 同步于建槽动作更新（不等 poll），与 `listening` 条目同生命周期：建槽成功
+    /// 插入、drain_accepted accept 时移除。socket 状态在 poll 前不可见（Listen 态
+    /// `tuple` 未置位），不能用作建槽判重依据。
+    syn_seen: HashSet<(IpEndpoint, IpEndpoint)>,
     /// UDP 转发监听表 (handle, 绑定 endpoint, 最近使用 nanos)。
     ///
     /// 对应 TCP 的 `listening`：smoltcp UDP 同样无通配监听，`ingest_rx` 嗅探
@@ -117,6 +132,7 @@ impl WgNetStack {
             sockets: SocketSet::new(Vec::new()),
             next_ephemeral: 0,
             listening: Vec::new(),
+            syn_seen: HashSet::new(),
             udp_listens: Vec::new(),
         }
     }
@@ -132,8 +148,8 @@ impl WgNetStack {
         if not_forwardable(&pkt) {
             return;
         }
-        if let Some((addr, port)) = sniff_tcp_syn(&pkt) {
-            self.ensure_listen(IpEndpoint { addr, port });
+        if let Some((src, dst)) = sniff_tcp_syn(&pkt) {
+            self.ensure_listen(src, dst);
         }
         // UDP 无重传：首个数据报必须能落地，惰性绑定必须在入栈前完成，
         // poll 时该包即被 socket 接收（否则 smoltcp 逐包回 ICMP port-unreachable，
@@ -233,35 +249,47 @@ impl WgNetStack {
         socket.connect(self.iface.context(), (remote, port), local)
     }
 
-    /// 惰性建立精确 tuple 的 TCP 监听（幂等）。
+    /// 惰性建立精确 tuple 的 TCP 监听（4 元组幂等 + per-tuple 并发排队）。
     ///
     /// 任意 dst 都建听——Go 栈对非本机地址的连接同样受理（netstack.go CreateNetTUN：
     /// "the stack takes every connection ... for any address"）；不可转发的 dst 已被
-    /// `not_forwardable`（ingest_rx 入口过滤）挡掉。目标端口为 0、同 tuple 已有
-    /// pending 监听、或监听表已达 [`MAX_PENDING_LISTENS`] 上限时跳过（SYN 由客户端
-    /// 重传兜底）。
-    fn ensure_listen(&mut self, local: IpEndpoint) {
-        if local.port == 0
-            || self.listening.iter().any(|(_, ep)| *ep == local)
+    /// `not_forwardable`（ingest_rx 入口过滤）挡掉。跳过条件：目标端口 0、该 SYN 的
+    /// 4 元组已受理（重传/握手在途/已建立——[`Self::syn_seen`]）、同 tuple pending
+    /// 已达 [`MAX_LISTENS_PER_TUPLE`]、或监听表已达 [`MAX_PENDING_LISTENS`]。
+    fn ensure_listen(&mut self, src: IpEndpoint, dst: IpEndpoint) {
+        if dst.port == 0
+            || self.syn_seen.contains(&(src, dst))
+            || self.tuple_pending(dst) >= MAX_LISTENS_PER_TUPLE
             || self.listening.len() >= MAX_PENDING_LISTENS
         {
             return;
         }
-        self.open_listen(local);
+        if self.open_listen(dst) {
+            self.syn_seen.insert((src, dst));
+        }
     }
 
-    /// 创建并注册一个 listen socket；失败即回收 socket。
-    fn open_listen(&mut self, local: IpEndpoint) {
+    /// 同 tuple 的 pending 监听数（握手在途 + 待 accept 连接 + 空闲补位）。
+    fn tuple_pending(&self, dst: IpEndpoint) -> usize {
+        self.listening.iter().filter(|(_, ep)| *ep == dst).count()
+    }
+
+    /// 创建并注册一个 listen socket；返回是否注册成功（失败已回收 socket）。
+    fn open_listen(&mut self, local: IpEndpoint) -> bool {
         let handle = self.add_tcp_socket();
         let result = self.with_tcp_socket(handle, |s| {
             s.listen(local)
                 .map_err(|e| crate::error::WgError::NetStack(format!("tcp listen {local}: {e:?}")))
         });
         match result {
-            Ok(()) => self.listening.push((handle, local)),
+            Ok(()) => {
+                self.listening.push((handle, local));
+                true
+            },
             Err(e) => {
                 tracing::warn!(error = %e, "wg lazy tcp listen failed");
                 self.remove_socket(handle);
+                false
             },
         }
     }
@@ -284,8 +312,13 @@ impl WgNetStack {
             // 该 socket 已转为连接 socket，从监听表移除
             self.listening.swap_remove(i);
             match remote {
-                Some(remote) => events.push(TcpAcceptEvent { handle, local: Some(local), remote }),
+                Some(remote) => {
+                    // 4 元组槽位已交付 relay，允许同 4 元组后续新连接重新建槽
+                    self.syn_seen.remove(&(remote, local));
+                    events.push(TcpAcceptEvent { handle, local: Some(local), remote });
+                },
                 // Established 却无对端 tuple 理论不可达；防御性回收
+                //（syn_seen 键随条目遗留，理论上不可达路径不设清扫）
                 None => self.remove_socket(handle),
             }
             self.open_listen(local);
@@ -397,25 +430,25 @@ impl WgNetStack {
     }
 }
 
-/// 从解密后的 IP 包嗅探 TCP SYN（不含 ACK），返回目标 (addr, port)。
+/// 从解密后的 IP 包嗅探 TCP SYN（不含 ACK），返回 (源 endpoint, 目标 endpoint)。
 ///
 /// 只认 v4/v6 定长头 + TCP 定长头；非首分片与带扩展头的包直接跳过
 /// （smoltcp 本身不重组分片，这类包无论如何进不了 TCP 层）。
-fn sniff_tcp_syn(pkt: &[u8]) -> Option<(IpAddress, u16)> {
-    let (dst_addr, payload) = match pkt.first()? >> 4 {
+fn sniff_tcp_syn(pkt: &[u8]) -> Option<(IpEndpoint, IpEndpoint)> {
+    let (src_addr, dst_addr, payload) = match pkt.first()? >> 4 {
         4 => {
             let v4 = Ipv4Packet::new_checked(pkt).ok()?;
             if v4.more_frags() || v4.frag_offset() != 0 || v4.next_header() != IpProtocol::Tcp {
                 return None;
             }
-            (IpAddress::Ipv4(v4.dst_addr()), v4.payload())
+            (IpAddress::Ipv4(v4.src_addr()), IpAddress::Ipv4(v4.dst_addr()), v4.payload())
         },
         6 => {
             let v6 = Ipv6Packet::new_checked(pkt).ok()?;
             if v6.next_header() != IpProtocol::Tcp {
                 return None;
             }
-            (IpAddress::Ipv6(v6.dst_addr()), v6.payload())
+            (IpAddress::Ipv6(v6.src_addr()), IpAddress::Ipv6(v6.dst_addr()), v6.payload())
         },
         _ => return None,
     };
@@ -423,7 +456,10 @@ fn sniff_tcp_syn(pkt: &[u8]) -> Option<(IpAddress, u16)> {
     if !tcp.syn() || tcp.ack() {
         return None;
     }
-    Some((dst_addr, tcp.dst_port()))
+    Some((
+        IpEndpoint { addr: src_addr, port: tcp.src_port() },
+        IpEndpoint { addr: dst_addr, port: tcp.dst_port() },
+    ))
 }
 
 /// 从解密后的 IP 包嗅探 UDP 数据报的目标 endpoint。
@@ -682,6 +718,16 @@ pub(crate) mod test_packets {
         }
         let tcp = TcpPacket::new_checked(v4.payload()).ok()?;
         Some(tcp.seq_number().0 as u32)
+    }
+
+    /// 提取 IPv4+TCP 包的 (SYN, ACK, RST) 标志（响应识别用）；非 TCP 包返回 None。
+    pub fn tcp_flags(pkt: &[u8]) -> Option<(bool, bool, bool)> {
+        let v4 = Ipv4Packet::new_checked(pkt).ok()?;
+        if v4.next_header() != smoltcp::wire::IpProtocol::Tcp {
+            return None;
+        }
+        let tcp = TcpPacket::new_checked(v4.payload()).ok()?;
+        Some((tcp.syn(), tcp.ack(), tcp.rst()))
     }
 }
 
@@ -969,11 +1015,41 @@ mod tests {
             ([10, 0, 0, 1], 5555),
             ([10, 0, 0, 2], 443),
             TCP_ACK,
-            1001,
             1000,
+            0,
         ));
         stack.poll(Instant::now());
         assert!(stack.listening.is_empty());
         assert!(stack.drain_accepted().is_empty());
+    }
+
+    /// 同目标并发 SYN（异源）各得一槽、各收 SYN-ACK、无 RST——bd n07t F5 修复钉子：
+    /// 旧「同 tuple 至多一槽」下监听被首只 SYN 占用（SYN-RECEIVED 绑定远端）后，
+    /// 第二只异源 SYN 无 socket 受理被回 RST。
+    #[test]
+    fn concurrent_syns_to_same_dst_each_get_a_slot() {
+        use crate::netstack::test_packets::{TCP_SYN, make_tcp_packet, tcp_flags};
+
+        let mut stack = make_stack(); // 本端 10.0.0.2/32
+        for src_port in [5555u16, 5556, 5557] {
+            stack.ingest_rx(make_tcp_packet(
+                ([10, 0, 0, 1], src_port),
+                ([10, 0, 0, 2], 443),
+                TCP_SYN,
+                1000,
+                0,
+            ));
+        }
+        stack.poll(Instant::now());
+
+        assert_eq!(stack.listening.len(), 3, "每只并发 SYN 各得一槽");
+        let tx = stack.drain_tx();
+        let syn_acks =
+            tx.iter().filter(|p| matches!(tcp_flags(p), Some((true, true, false)))).count();
+        assert_eq!(syn_acks, 3, "三只 SYN 各回一个 SYN-ACK");
+        assert!(
+            tx.iter().all(|p| !matches!(tcp_flags(p), Some((_, _, true)))),
+            "不得对并发 SYN 回 RST"
+        );
     }
 }
