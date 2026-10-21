@@ -57,6 +57,18 @@ fn make_ohm() -> Arc<SimpleOhm> {
     ohm
 }
 
+/// 构造支持 UDP 的 SimpleOhm（生产 wiring 形态，对齐
+/// `xray-core/src/outbound.rs` 与 crate 级 `vmess_inbound_udp_relay_e2e`：
+/// TCP 走 DialBridge，UDP 走 FreedomDispatchBridge → freedom udp::relay XUDP 帧）。
+fn make_ohm_with_udp() -> Arc<SimpleOhm> {
+    let ohm = Arc::new(SimpleOhm::new());
+    let tcp_bridge = Arc::new(DialBridge::new("freedom", make_freedom_dial_fn()));
+    let bridge = Arc::new(xray_proxy_freedom::FreedomDispatchBridge::from_bridge(tcp_bridge))
+        as Arc<dyn DispatchHandler>;
+    ohm.set_default(bridge);
+    ohm
+}
+
 /// 启动 echo server，返回监听端口。
 async fn spawn_echo_server() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -322,6 +334,167 @@ async fn vmess_e2e_authenticated_length() {
     assert_eq!(
         response, PAYLOAD,
         "AUTHENTICATED_LENGTH e2e echo failed: got {response:?}, want {PAYLOAD:?}"
+    );
+}
+
+/// VMess 原生 UDP 端到端（非 mux）：client `Command::Udp` header → inbound
+/// `pump_udp_session`（chunk 即 packet，Go 非 cone 语义）→ `UdpDispatchSession`
+/// → freedom UDP relay → 真实 UDP echo → 回包 chunk + 终止 chunk。
+///
+/// 对应 Go `vmess_test.go:231 TestVMessGCMUDP`；区别于 `vmess_over_mux_udp_e2e`
+/// （仅验证 UDP dest 时 outbound 改写 command=Mux 的协议层契约）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vmess_e2e_native_udp() {
+    use std::net::SocketAddr;
+
+    // 1. 真实 UDP echo server
+    let echo_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr: SocketAddr = echo_sock.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            match echo_sock.recv_from(&mut buf).await {
+                Ok((n, from)) => {
+                    let _ = echo_sock.send_to(&buf[..n], from).await;
+                },
+                Err(_) => break,
+            }
+        }
+    });
+
+    // 2-3. dispatcher（freedom outbound，UDP 能力）+ serve_vmess，形态同 TCP e2e
+    let ohm = make_ohm_with_udp();
+    let (validator, cmd_key) = make_validator();
+    let vmess_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let vmess_addr = vmess_listener.local_addr().unwrap();
+    let ohm_clone = Arc::clone(&ohm);
+    let validator_clone = Arc::clone(&validator);
+    tokio::spawn(async move {
+        let listener = xray_transport::system_listener::InboundTcpListener::from_tokio(
+            vmess_listener,
+            xray_transport::sockopt::SocketOptions::default(),
+        );
+        let _ = serve_vmess(
+            listener,
+            ohm_clone,
+            validator_clone,
+            None,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+    });
+
+    // 4. client：UDP command header 指向 echo
+    let mut client = tokio::net::TcpStream::connect(vmess_addr).await.unwrap();
+    let client_session = ClientSession::new();
+    let dest =
+        Destination::udp(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(echo_addr.port()));
+    let header = RequestHeader::new(VERSION, Command::Udp, dest, SecurityType::Aes128Gcm);
+    let sealed_header =
+        client_session.encode_request_header(&header, &cmd_key).expect("encode header");
+    client.write_all(&sealed_header).await.unwrap();
+
+    let _resp = client_session
+        .decode_response_header_async(&mut client)
+        .await
+        .expect("decode response header");
+
+    // 5. 发一个 UDP packet chunk（encode_request_body_async 尾部自带终止 chunk，
+    //    触发 inbound 收尾窗口）
+    let payload: Vec<u8> = (0..600u32).map(|i| (i % 251) as u8).collect();
+    client_session
+        .encode_request_body_async(&header, &payload, &mut client)
+        .await
+        .expect("encode request body");
+
+    // 6. 读回包：echo packet chunk + 终止 chunk → decode 返回
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client_session.decode_response_body_async(&header, &mut client),
+    )
+    .await
+    .expect("vmess native udp roundtrip timeout")
+    .expect("decode response body");
+    assert_eq!(
+        response, payload,
+        "vmess 原生 UDP roundtrip 失败: 收到 {} 字节, 期望 {} 字节",
+        response.len(),
+        payload.len()
+    );
+}
+
+/// VMess `AuthenticatedLength|NoTerminationSignal` 组合端到端。
+///
+/// 对应 Go `vmess_test.go:977 TestVMessGCMLengthAuthPlusNoTerminationSignal`
+/// （account `TestsEnabled: "AuthenticatedLength|NoTerminationSignal"`）。
+/// 客户端 header 同时置两位：size 字段走 KDF16(auth_len) AEAD 加密（18B），
+/// 且双向不写终止 chunk——请求流以 FIN 结束（`decode_chunk_stream_async`
+/// 对 chunk 边界干净 EOF 视为流结束，Go buf.Copy 吞 EOF 同语义）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vmess_e2e_authenticated_length_plus_no_termination_signal() {
+    // echo server
+    let echo_port = spawn_echo_server().await;
+
+    // dispatcher (freedom outbound)
+    let ohm = make_ohm();
+
+    // validator + serve_vmess
+    let (validator, cmd_key) = make_validator();
+    let vmess_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let vmess_addr = vmess_listener.local_addr().unwrap();
+    let ohm_clone = Arc::clone(&ohm);
+    let validator_clone = Arc::clone(&validator);
+    tokio::spawn(async move {
+        let listener = xray_transport::system_listener::InboundTcpListener::from_tokio(
+            vmess_listener,
+            xray_transport::sockopt::SocketOptions::default(),
+        );
+        let _ = serve_vmess(
+            listener,
+            ohm_clone,
+            validator_clone,
+            None,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+    });
+
+    // 客户端：connect + encode header 同时置 AUTHENTICATED_LENGTH 与
+    // NO_TERMINATION_SIGNAL
+    let mut client = tokio::net::TcpStream::connect(vmess_addr).await.unwrap();
+    let client_session = ClientSession::new();
+    let dest = Destination::tcp(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(echo_port));
+    let mut header = RequestHeader::new(VERSION, Command::Tcp, dest, SecurityType::Aes128Gcm);
+    header.option.set(request_option::AUTHENTICATED_LENGTH);
+    header.option.set(request_option::NO_TERMINATION_SIGNAL);
+
+    let sealed_header =
+        client_session.encode_request_header(&header, &cmd_key).expect("encode header");
+    client.write_all(&sealed_header).await.unwrap();
+
+    let _resp = client_session
+        .decode_response_header_async(&mut client)
+        .await
+        .expect("decode response header");
+
+    // 请求 body：无终止 chunk，写完即 FIN（NoTerminationSignal 语义）
+    client_session
+        .encode_request_body_async(&header, PAYLOAD, &mut client)
+        .await
+        .expect("encode request body");
+    client.shutdown().await.expect("shutdown write half");
+
+    // 响应：服务端同样不写终止 chunk，客户端在干净 EOF 处收尾
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client_session.decode_response_body_async(&header, &mut client),
+    )
+    .await
+    .expect("AuthLen+NoTerm e2e timeout")
+    .expect("decode response body");
+    assert_eq!(
+        response, PAYLOAD,
+        "AuthLen+NoTerm e2e echo failed: got {response:?}, want {PAYLOAD:?}"
     );
 }
 
