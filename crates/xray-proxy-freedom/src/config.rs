@@ -385,15 +385,15 @@ fn json_ip_rules(v: &serde_json::Value) -> Vec<xray_proto::xray::common::geodata
         .into_iter()
         .filter_map(|s| {
             let (ip_str, prefix) = match s.split_once('/') {
-                Some((ip, p)) => (ip, p.parse::<u32>().ok()?),
-                None => (s, 0),
+                Some((ip, p)) => (ip, Some(p.parse::<u32>().ok()?)),
+                None => (s, None),
             };
             let ip: IpAddr = ip_str.parse().ok()?;
-            let prefix = match (ip, prefix) {
-                (IpAddr::V4(_), 0) => 32,
-                (IpAddr::V6(_), 0) => 128,
-                (_, p) => p,
-            };
+            // 无 `/` = 单地址（/32、/128）；显式 `/0` 保留 0（全匹配）。
+            let prefix = prefix.unwrap_or(match ip {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            });
             Some(xray_proto::xray::common::geodata::IpRule {
                 value: Some(ip_rule::Value::Custom(xray_proto::xray::common::geodata::CidrRule {
                     cidr: Some(xray_proto::xray::common::geodata::Cidr {
@@ -1362,6 +1362,82 @@ mod tests {
         ));
         // blockDelay 解析
         assert_eq!(cfg.block_delay.map(|r| (r.min, r.max)), Some((30, 90)));
+    }
+
+    /// 单条 IP 规则 JSON → 运行时规则。
+    fn ip_rule_from_json(ip: &str) -> FinalRule {
+        let cfg = FinalRuleConfig::from_json(&serde_json::json!({"action": "allow", "ip": [ip]}))
+            .expect("valid final rule json");
+        FinalRule::build(&cfg).expect("valid final rule")
+    }
+
+    /// bd 6g7k：CIDR 前缀边界表（含 /0 与主机位非零的归一化）。
+    #[test]
+    fn json_ip_rule_prefix_table() {
+        // (规则, 目标 IP, 期望命中)
+        let cases: &[(&str, &str, bool)] = &[
+            ("0.0.0.0/0", "8.8.8.8", true),
+            ("0.0.0.0/0", "0.0.0.0", true),
+            ("0.0.0.0/0", "255.255.255.255", true),
+            ("0.0.0.1/0", "192.0.2.1", true), // 主机位非零 + /0
+            ("0.0.0.0/1", "127.0.0.1", true),
+            ("0.0.0.0/1", "128.0.0.0", false),
+            ("10.0.0.0/8", "10.255.255.255", true),
+            ("10.0.0.0/8", "11.0.0.0", false),
+            ("192.168.1.5/24", "192.168.1.200", true), // 非对齐地址 → 掩码归一化
+            ("192.168.1.5/24", "192.168.2.1", false),
+            ("192.168.1.5/24", "192.168.0.255", false),
+            ("192.168.1.4/31", "192.168.1.5", true),
+            ("192.168.1.4/31", "192.168.1.6", false),
+            ("192.168.1.5", "192.168.1.5", true), // 裸 IP → /32
+            ("192.168.1.5", "192.168.1.4", false),
+            ("0.0.0.0/31", "0.0.0.1", true),
+            ("0.0.0.0/32", "0.0.0.1", false),
+            ("::/0", "2001:db8::1", true),
+            ("::/0", "::1", true),
+            ("::1/0", "2001:db8::5", true), // 非对齐 + v6 /0
+            ("2001:db8::/32", "2001:db8:ffff::1", true),
+            ("2001:db8::5/32", "2001:db8::1", true), // 非对齐 v6 → 掩码归一化
+            ("2001:db8::/32", "2001:db9::1", false),
+            ("2001:db8::1/127", "2001:db8::1", true),
+            ("2001:db8::1/127", "2001:db8::3", false),
+            ("2001:db8::1", "2001:db8::1", true), // 裸 v6 → /128
+            ("2001:db8::1", "2001:db8::2", false),
+        ];
+        for &(rule_str, ip_str, expected) in cases {
+            let rule = ip_rule_from_json(rule_str);
+            let ip: IpAddr = ip_str.parse().expect("valid test ip");
+            assert_eq!(rule.match_ip(Some(ip)), expected, "rule={rule_str} ip={ip_str}");
+        }
+    }
+
+    /// /0 只覆盖本协议族：v4 /0 不命中 IPv6，v6 /0 不命中 IPv4。
+    #[test]
+    fn json_ip_rule_zero_prefix_stays_in_family() {
+        assert!(!ip_rule_from_json("0.0.0.0/0").match_ip(Some("2001:db8::1".parse().unwrap())));
+        assert!(!ip_rule_from_json("::/0").match_ip(Some("8.8.8.8".parse().unwrap())));
+    }
+
+    /// 逗号字符串形态（Go StringList）同样保留 /0：v4+v6 混合集合两族全放行。
+    #[test]
+    fn json_ip_rule_zero_prefix_string_list_mixed_families() {
+        let cfg = FinalRuleConfig::from_json(
+            &serde_json::json!({"action": "allow", "ip": "0.0.0.0/0, ::/0"}),
+        )
+        .unwrap();
+        let rule = FinalRule::build(&cfg).unwrap();
+        assert!(rule.match_ip(Some("8.8.8.8".parse().unwrap())));
+        assert!(rule.match_ip(Some("2001:db8::1".parse().unwrap())));
+    }
+
+    /// 配置级：`finalRules: [{action: allow, ip: [0.0.0.0/0]}]` 覆盖默认 BlockPrivate。
+    #[test]
+    fn allow_zero_prefix_overrides_default_block_private() {
+        let rule = ip_rule_from_json("0.0.0.0/0");
+        let default = FinalRule::build_default_rule(DefaultRuleType::BlockPrivate);
+        let dest = Destination::tcp(Address::IPv4("10.1.2.3".parse().unwrap()), Port::new(80));
+        let matched = match_final_rules(std::slice::from_ref(&rule), Some(&default), &dest);
+        assert_eq!(matched.map(|r| r.action), Some(RuleAction::Allow));
     }
 
     #[test]
