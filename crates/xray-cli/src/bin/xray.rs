@@ -340,6 +340,8 @@ async fn async_main() -> std::process::ExitCode {
         // 日志缺 worker 基线行。run 路径的对应调用在 run::execute 的
         // init_tracing 之后（run.rs，PM 批准临时纳入 owned）。
         xray_common::runtime_guard::log_runtime_snapshot("startup");
+        // bd qxqw：工具子命令同样输出内核身份（tracing→stderr，不影响 stdout 接口）。
+        xray_cli::identity::log_kernel_identity();
     }
     // HC-1：blocking 池水位周期监控（路线 B 暴露监控，见 spawn_blocking_pool_monitor）。
     spawn_blocking_pool_monitor();
