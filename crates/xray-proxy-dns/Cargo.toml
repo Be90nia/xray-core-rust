@@ -19,3 +19,5 @@ async-trait = { workspace = true }
 [dev-dependencies]
 hickory-resolver = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
+# 伪造 geosite.dat fixture 编码（GeoSiteList::encode_to_vec）
+prost = { workspace = true }

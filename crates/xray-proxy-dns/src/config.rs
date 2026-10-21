@@ -18,7 +18,7 @@ use xray_geodata::matcher::{
     domain::{DomainRule as GeoDomainRule, DomainType as GeoDomainType, parse_domain},
 };
 
-use crate::error::Result;
+use crate::error::{DnsProxyError, Result};
 
 /// DNS 规则动作。对应 proto `RuleAction` 枚举。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -139,50 +139,105 @@ pub struct DnsRule {
     domains: Option<Arc<xray_geodata::matcher::SimpleMatcherGroup>>,
 }
 
+/// proto `Domain.Type` → matcher 域类型。proto 序：Substr=0/Regex=1/Domain=2/Full=3
+/// （与 matcher `DomainType`：Full=0/Domain=1/Substr=2/Regex=3 不同序）。
+fn proto_domain_type(t: i32) -> Option<GeoDomainType> {
+    match t {
+        0 => Some(GeoDomainType::Substr),
+        1 => Some(GeoDomainType::Regex),
+        2 => Some(GeoDomainType::Domain),
+        3 => Some(GeoDomainType::Full),
+        _ => None,
+    }
+}
+
 impl DnsRule {
     /// 从 [`DnsRuleConfig`] 构造运行时规则。
     ///
-    /// - `q_type` → u16 列表；`domain` → 就地编译为匹配器组。
-    /// - proto `geosite` 变体需 geo dat 文件加载器，DNS 代理配置路径未持有 datadir：warn +
-    ///   跳过该条目（对齐 router 无 loader 时的降级）。
-    #[must_use]
-    pub fn from_config(cfg: &DnsRuleConfig) -> Self {
+    /// 对齐 Go `Handler.Init`（proxy/dns/dns.go:104-112）→ `geodata.BuildDomainMatcher`
+    /// （domain_matcher.go:61-98）：编译失败返回错误（Go 为 Init error → 拒启），
+    /// 不再 warn-and-skip 静默丢规则（bd il49 同族）：
+    /// - Custom 条目：未知 proto type / 解析失败 → `Err`（Go BuildMatcher 硬错）；
+    /// - Geosite 条目：经 [`xray_geodata::loader::GeoDataLoader`] 运行期加载 dat 展开 （Go
+    ///   loadSiteMatchers 同语义，geosite 规则真正生效）；dat/code 缺失 →
+    ///   `Err`，信息含文件/code/资产目录/XRAY_LOCATION_ASSET；dat 内单条目解析 失败 → warn
+    ///   跳过该条（Go loadSiteMatchers:183-193 "ignore invalid geosite entry" 同粒度，非致命）。
+    ///
+    /// 资产目录取 [`xray_common::platform::get_asset_dir`]；测试注入用
+    /// [`DnsRule::from_config_in`]。
+    pub fn from_config(cfg: &DnsRuleConfig) -> Result<Self> {
+        Self::from_config_in(cfg, &xray_common::platform::get_asset_dir())
+    }
+
+    /// 同 [`DnsRule::from_config`]，geodata 资产目录显式给定（测试注入）。
+    pub fn from_config_in(cfg: &DnsRuleConfig, datadir: &std::path::Path) -> Result<Self> {
         let mut group = xray_geodata::matcher::SimpleMatcherGroup::new();
+        let loader = xray_geodata::loader::GeoDataLoader::new(datadir.to_path_buf());
         for (i, r) in cfg.domain.iter().enumerate() {
             let Some(value) = r.value.as_ref() else { continue };
             match value {
                 xray_proto::xray::common::geodata::domain_rule::Value::Custom(d) => {
-                    // proto Domain.Type：Substr=0, Regex=1, Domain=2, Full=3
-                    // （与 matcher DomainType：Full=0/Domain=1/Substr=2/Regex=3 不同序）
-                    let dt = match d.r#type {
-                        0 => GeoDomainType::Substr,
-                        1 => GeoDomainType::Regex,
-                        2 => GeoDomainType::Domain,
-                        3 => GeoDomainType::Full,
-                        other => {
-                            tracing::warn!(target: "xray_proxy_dns::config", domain_type = other, "unknown domain rule type, skipping");
-                            continue;
-                        },
-                    };
+                    let dt = proto_domain_type(d.r#type).ok_or_else(|| {
+                        DnsProxyError::InvalidConfig(format!(
+                            "domain rule #{}: unknown domain type {} (valid: 0=substr 1=regex 2=domain 3=full)",
+                            i + 1,
+                            d.r#type
+                        ))
+                    })?;
                     let rule = GeoDomainRule::new(dt, d.value.clone(), (i + 1) as u32);
-                    match parse_domain(&rule) {
-                        Ok(m) => group.add(m, (i + 1) as u32),
-                        Err(e) => {
-                            tracing::error!(target: "xray_proxy_dns::config", error = %e, value = %d.value, "domain rule parse failed; entry skipped");
-                        },
-                    }
+                    let m = parse_domain(&rule).map_err(|e| {
+                        DnsProxyError::InvalidConfig(format!(
+                            "domain rule #{} ({}): {e}",
+                            i + 1,
+                            d.value
+                        ))
+                    })?;
+                    group.add(m, (i + 1) as u32);
                 },
                 xray_proto::xray::common::geodata::domain_rule::Value::Geosite(g) => {
-                    tracing::warn!(target: "xray_proxy_dns::config", file = %g.file, code = %g.code, "geosite domain rule present but no geo_loader on DNS proxy path, skipping");
+                    let file = if g.file.is_empty() { "geosite.dat" } else { g.file.as_str() };
+                    let site = loader.load_site_with_attrs(file, &g.code, &g.attrs).map_err(|e| {
+                        DnsProxyError::InvalidConfig(format!(
+                            "domain rule #{}: load geosite {file}/{} failed: {e}; asset dir: {} (place the .dat file there or set XRAY_LOCATION_ASSET)",
+                            i + 1,
+                            g.code,
+                            datadir.display()
+                        ))
+                    })?;
+                    // Go loadSiteMatchers：dat 内单条目解析失败 → log+skip 该条（非致命）
+                    for d in &site.domain {
+                        let Some(dt) = proto_domain_type(d.r#type) else {
+                            tracing::warn!(target: "xray_proxy_dns::config", domain_type = d.r#type, file = %file, code = %g.code, "invalid geosite entry type, entry skipped");
+                            continue;
+                        };
+                        let rule = GeoDomainRule::new(dt, d.value.clone(), (i + 1) as u32);
+                        match parse_domain(&rule) {
+                            Ok(m) => group.add(m, (i + 1) as u32),
+                            Err(e) => {
+                                tracing::warn!(target: "xray_proxy_dns::config", error = %e, file = %file, code = %g.code, value = %d.value, "invalid geosite entry, entry skipped")
+                            },
+                        }
+                    }
                 },
             }
         }
         let domains = if cfg.domain.is_empty() { None } else { Some(Arc::new(group)) };
-        Self {
+        Ok(Self {
             action: cfg.action,
             q_types: cfg.q_type.iter().map(|&v| v as u16).collect(),
             r_code: cfg.r_code as u16,
             domains,
+        })
+    }
+
+    /// 编译失败占位规则：动作字段保留原配置，匹配器组恒空 → 永不命中
+    /// （fail-closed；不部分保留其余条目——部分保留 = 静默改变匹配范围）。
+    pub(crate) fn inert(cfg: &DnsRuleConfig) -> Self {
+        Self {
+            action: cfg.action,
+            q_types: cfg.q_type.iter().map(|&v| v as u16).collect(),
+            r_code: cfg.r_code as u16,
+            domains: Some(Arc::new(xray_geodata::matcher::SimpleMatcherGroup::new())),
         }
     }
 
@@ -287,7 +342,7 @@ mod tests {
             r_code: 5,
             ..Default::default()
         };
-        let rule = DnsRule::from_config(&cfg);
+        let rule = DnsRule::from_config(&cfg).expect("valid rule config");
         assert_eq!(rule.action, RuleAction::Hijack);
         assert_eq!(rule.q_types, vec![1, 2, 28]);
         assert_eq!(rule.r_code, 5);
@@ -355,6 +410,7 @@ mod tests {
             domain,
             r_code: 0,
         })
+        .expect("valid rule config")
     }
 
     #[test]
@@ -403,20 +459,107 @@ mod tests {
         assert!(rule.apply(1, "Example.com."));
     }
 
+    // ===== 三态：非法配置→编译错误 / 合法配置→正常 / 空配置→正常 =====
+
+    /// 非法配置：未知 proto Domain.Type → 编译错误（此前 warn+skip 静默丢条目）。
     #[test]
-    fn geosite_entry_without_loader_makes_rule_inert() {
-        // geosite 变体无 datadir 加载器：条目跳过；非空 domains 剩空组 →
-        // 永不命中（fail-closed，而非恒真误放大规则范围）
-        let rule = rule_with_domains(vec![xray_proto::xray::common::geodata::DomainRule {
-            value: Some(xray_proto::xray::common::geodata::domain_rule::Value::Geosite(
-                xray_proto::xray::common::geodata::GeoSiteRule {
-                    file: "geosite.dat".into(),
-                    code: "cn".into(),
-                    attrs: String::new(),
-                },
-            )),
-        }]);
-        assert!(!rule.apply(1, "baidu.com"));
+    fn unknown_domain_type_fails_compile() {
+        let cfg = DnsRuleConfig {
+            action: RuleAction::Drop,
+            q_type: vec![],
+            domain: vec![custom_domain(7, "example.com")],
+            r_code: 0,
+        };
+        let err = DnsRule::from_config(&cfg).expect_err("unknown type must fail");
+        assert!(err.to_string().contains("unknown domain type 7"), "unexpected: {err}");
+    }
+
+    /// 非法配置：正则编译失败 → 编译错误（此前 error-log+skip 静默丢条目）。
+    #[test]
+    fn invalid_regex_fails_compile() {
+        let cfg = DnsRuleConfig {
+            action: RuleAction::Drop,
+            q_type: vec![],
+            domain: vec![custom_domain(1, "([bad")],
+            r_code: 0,
+        };
+        let err = DnsRule::from_config(&cfg).expect_err("invalid regex must fail");
+        assert!(err.to_string().contains("domain rule #1"), "unexpected: {err}");
+    }
+
+    /// 独立临时资产目录（进程级唯一，测试间互不干扰）。
+    fn temp_asset_dir(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("xray-proxy-dns-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp asset dir");
+        dir
+    }
+
+    /// 伪造 geosite.dat（GeoSiteList protobuf，code CN）——xray-core wiring.rs 同配方。
+    fn make_geosite_dat() -> Vec<u8> {
+        use prost::Message;
+        use xray_proto::xray::common::geodata::{Domain, GeoSite, GeoSiteList};
+        let cn = GeoSite {
+            code: "CN".into(),
+            domain: vec![
+                Domain { r#type: 2, value: "baidu.com".into(), attribute: vec![] },
+                Domain { r#type: 3, value: "example.cn".into(), attribute: vec![] },
+            ],
+        };
+        GeoSiteList { entry: vec![cn] }.encode_to_vec()
+    }
+
+    fn geosite_rule(file: &str, code: &str) -> DnsRuleConfig {
+        DnsRuleConfig {
+            action: RuleAction::Drop,
+            q_type: vec![],
+            domain: vec![xray_proto::xray::common::geodata::DomainRule {
+                value: Some(xray_proto::xray::common::geodata::domain_rule::Value::Geosite(
+                    xray_proto::xray::common::geodata::GeoSiteRule {
+                        file: file.into(),
+                        code: code.into(),
+                        attrs: String::new(),
+                    },
+                )),
+            }],
+            r_code: 0,
+        }
+    }
+
+    /// 合法配置：geosite 条目运行期加载并生效（此前 warn+skip 使规则永不命中）。
+    #[test]
+    fn geosite_entries_load_and_match() {
+        let dir = temp_asset_dir("geosite-ok");
+        std::fs::write(dir.join("geosite.dat"), make_geosite_dat()).unwrap();
+        let rule = DnsRule::from_config_in(&geosite_rule("geosite.dat", "CN"), &dir)
+            .expect("geosite asset present");
+        assert!(rule.apply(1, "www.baidu.com"), "Domain 类型条目含子域");
+        assert!(rule.apply(1, "example.cn"), "Full 类型条目");
+        assert!(!rule.apply(1, "google.com"));
+    }
+
+    /// 非法配置：geosite 资产缺失 → 编译错误（拒启语义），信息含文件/code/
+    /// 资产目录/XRAY_LOCATION_ASSET（此前 warn+skip 静默丢规则，bd il49 同族）。
+    #[test]
+    fn geosite_missing_asset_fails_compile_with_asset_dir() {
+        let dir = temp_asset_dir("geosite-missing");
+        let err = DnsRule::from_config_in(&geosite_rule("geosite.dat", "CN"), &dir)
+            .expect_err("missing asset must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("geosite.dat"), "missing file in msg: {msg}");
+        assert!(msg.contains("CN"), "missing code in msg: {msg}");
+        assert!(msg.contains("asset dir"), "missing asset dir in msg: {msg}");
+        assert!(msg.contains("XRAY_LOCATION_ASSET"), "missing env hint in msg: {msg}");
+    }
+
+    /// 非法配置：geosite code 不存在 → 编译错误（Go loadSite find 失败 → 硬错）。
+    #[test]
+    fn geosite_missing_code_fails_compile() {
+        let dir = temp_asset_dir("geosite-code");
+        std::fs::write(dir.join("geosite.dat"), make_geosite_dat()).unwrap();
+        let err = DnsRule::from_config_in(&geosite_rule("geosite.dat", "XX"), &dir)
+            .expect_err("missing code must fail");
+        assert!(err.to_string().contains("geosite.dat/XX"), "unexpected: {err}");
     }
 
     #[test]
@@ -426,7 +569,8 @@ mod tests {
             q_type: vec![1], // A only
             domain: vec![custom_domain(3, "example.com")],
             r_code: 0,
-        });
+        })
+        .expect("valid rule config");
         assert!(rule.apply(1, "example.com"));
         assert!(!rule.apply(28, "example.com"), "qType 不匹配直接短路");
     }

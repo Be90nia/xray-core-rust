@@ -7,7 +7,8 @@
 //! ## 切片边界（P6-5 切片2）
 //!
 //! 实现纯逻辑部分：
-//! - [`Handler`] struct + [`Handler::init`] 从 [`Config`] 构建 rules
+//! - [`Handler`] struct + [`Handler::init`] 从 [`Config`] 构建 rules（编译失败 fail-closed 兜底）+
+//!   [`Handler::try_init`] 拒启语义（Go `Handler.Init` 返 err）
 //! - [`Handler::match_rules`] 查找首个匹配规则（qType + domain）
 //!
 //! **不实现** `Process`（依赖 dispatcher + `dns::Client` + `transport::Link`，
@@ -85,11 +86,47 @@ impl Handler {
     /// `DnsDispatchBridge` 持有 DnsService）；`timeout` 由装配层从
     /// `policy.ForLevel(config.UserLevel).Timeouts.ConnectionIdle` 注入
     /// （Go dns.go:85），无 policy 时回退 SessionDefault 并 warn。
+    ///
+    /// 规则编译失败不 panic、不静默跳过：error 日志（含资产目录/env 提示）+
+    /// 该规则 fail-closed（永不命中）。需拒启语义（Go Init 返 err）的装配层
+    /// 用 [`Handler::try_init`]。
     pub fn init(config: &Config, timeout: Duration) -> Self {
-        let rules: Vec<DnsRule> = config.rule.iter().map(DnsRule::from_config).collect();
+        let mut rules = Vec::with_capacity(config.rule.len());
+        for (idx, rc) in config.rule.iter().enumerate() {
+            match DnsRule::from_config(rc) {
+                Ok(rule) => rules.push(rule),
+                Err(e) => {
+                    tracing::error!(
+                        target: "xray_proxy_dns::handler",
+                        rule = idx,
+                        error = %e,
+                        "dns rule compile failed; rule disabled (fail-closed, never matches). Use Handler::try_init to refuse startup (Go Handler.Init returns this error)"
+                    );
+                    rules.push(DnsRule::inert(rc));
+                },
+            }
+        }
         let rewrite =
             config.rewrite_server.as_ref().map(prost_endpoint_to_overrides).unwrap_or_default();
         Self { rules, rewrite, timeout }
+    }
+
+    /// [`Handler::init`] 的 fallible 版：任一规则编译失败即返回错误——拒启语义，
+    /// 对齐 Go `Handler.Init` 返 err → outbound New 失败 → 进程拒启。
+    ///
+    /// 生产装配（xray-core outbound dns 分支，本票禁碰）迁移到本方法后，
+    /// geosite 资产缺失/规则非法即拒启；迁移前 `init` 的 fail-closed 兜底保运行。
+    pub fn try_init(config: &Config, timeout: Duration) -> Result<Self> {
+        let mut rules = Vec::with_capacity(config.rule.len());
+        for (idx, rc) in config.rule.iter().enumerate() {
+            rules.push(
+                DnsRule::from_config(rc)
+                    .map_err(|e| DnsProxyError::InvalidConfig(format!("dns rule[{idx}]: {e}")))?,
+            );
+        }
+        let rewrite =
+            config.rewrite_server.as_ref().map(prost_endpoint_to_overrides).unwrap_or_default();
+        Ok(Self { rules, rewrite, timeout })
     }
 
     /// 查找首个匹配的规则，返回 `(action, rCode)`。
@@ -597,5 +634,80 @@ mod tests {
     fn rewrite_server_none_by_default() {
         let h = Handler::init(&Config::default(), Duration::from_secs(5));
         assert!(!h.has_rewrite());
+    }
+
+    // ===== 三态（Handler 层）：try_init 拒启 / init fail-closed 兜底 / 空配置 =====
+
+    /// 含 custom Full 条目的合法规则。
+    fn rule_with_custom_domain(value: &str) -> DnsRuleConfig {
+        DnsRuleConfig {
+            action: RuleAction::Return,
+            q_type: vec![1],
+            r_code: 5,
+            domain: vec![xray_proto::xray::common::geodata::DomainRule {
+                value: Some(xray_proto::xray::common::geodata::domain_rule::Value::Custom(
+                    xray_proto::xray::common::geodata::Domain {
+                        r#type: 3, // Full
+                        value: value.into(),
+                        ..Default::default()
+                    },
+                )),
+            }],
+        }
+    }
+
+    /// 含未知 proto Domain.Type 条目的非法规则。
+    fn rule_with_unknown_type() -> DnsRuleConfig {
+        DnsRuleConfig {
+            action: RuleAction::Drop,
+            q_type: vec![],
+            r_code: 0,
+            domain: vec![xray_proto::xray::common::geodata::DomainRule {
+                value: Some(xray_proto::xray::common::geodata::domain_rule::Value::Custom(
+                    xray_proto::xray::common::geodata::Domain {
+                        r#type: 7,
+                        value: "bad.example.com".into(),
+                        ..Default::default()
+                    },
+                )),
+            }],
+        }
+    }
+
+    /// 空配置：try_init 正常（0 规则）。
+    #[test]
+    fn try_init_empty_config_ok() {
+        let h = Handler::try_init(&Config::default(), Duration::from_secs(5)).unwrap();
+        assert_eq!(h.rule_count(), 0);
+    }
+
+    /// 合法配置：try_init 与 init 行为一致。
+    #[test]
+    fn try_init_valid_config_matches() {
+        let cfg =
+            Config { rule: vec![rule_with_custom_domain("example.com")], ..Default::default() };
+        let h = Handler::try_init(&cfg, Duration::from_secs(5)).unwrap();
+        assert_eq!(h.match_rules(1, "example.com"), (RuleAction::Return, 5));
+    }
+
+    /// 非法配置：try_init 返回错误（拒启语义，Go Handler.Init 对齐）；
+    /// init 兜底为 fail-closed——坏规则永不命中（落到默认动作），好规则不受影响。
+    #[test]
+    fn bad_rule_try_init_errors_and_init_fails_closed() {
+        let cfg = Config {
+            rule: vec![rule_with_custom_domain("example.com"), rule_with_unknown_type()],
+            ..Default::default()
+        };
+        assert!(
+            Handler::try_init(&cfg, Duration::from_secs(5)).is_err(),
+            "compile error must propagate"
+        );
+
+        let h = Handler::init(&cfg, Duration::from_secs(5));
+        assert_eq!(h.rule_count(), 2, "fail-closed 占位保留规则数");
+        // 好规则仍生效
+        assert_eq!(h.match_rules(1, "example.com"), (RuleAction::Return, 5));
+        // 坏规则 inert 不截胡（若活跃会以 Drop 命中），A 查询落到默认 Hijack
+        assert_eq!(h.match_rules(1, "other.com"), (RuleAction::Hijack, 0));
     }
 }

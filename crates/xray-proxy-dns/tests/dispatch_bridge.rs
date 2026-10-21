@@ -11,8 +11,10 @@
 
 #![cfg(test)]
 
-use std::net::{IpAddr, Ipv4Addr};
-use std::time::Duration;
+use std::{
+    net::{IpAddr, Ipv4Addr},
+    time::Duration,
+};
 
 use hickory_resolver::proto::{
     op::{Message as HickoryMessage, MessageType, OpCode},
