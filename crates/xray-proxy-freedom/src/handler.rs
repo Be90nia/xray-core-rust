@@ -509,4 +509,45 @@ mod tests {
         uninstall();
         server_task.abort();
     }
+
+    /// bd 6g7k：`finalRules: [{action: allow, ip: ["0.0.0.0/0"]}]` 命中所有 IPv4，
+    /// 覆盖默认 BlockPrivate（127.0.0.0/8）→ 真实拨号到本地监听成功。
+    #[tokio::test]
+    async fn dial_allowed_by_zero_prefix_rule_over_default_block_private() {
+        use crate::test_support::{FAKE_DNS_LOCK, FakeDns, install, uninstall};
+        let _g = FAKE_DNS_LOCK.lock();
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let fake = FakeDns::ips(vec![vec![ip], vec![ip]]);
+        install(&fake);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let rule = crate::config::FinalRuleConfig::from_json(
+            &serde_json::json!({"action": "allow", "ip": ["0.0.0.0/0"]}),
+        )
+        .unwrap();
+        let config = Config {
+            domain_strategy: crate::config::DomainStrategy::UseIPv4 as i32,
+            final_rules: vec![rule],
+            ..Default::default()
+        };
+        let h = FreedomHandler::new("test", config)
+            .expect("valid config")
+            .with_default_rule_type(DefaultRuleType::BlockPrivate);
+        let dest = make_domain_dest("localhost", addr.port());
+        let session = Session::new();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), h.dial(&dest, &session)).await;
+        match result {
+            Ok(Ok(())) => {},
+            Ok(Err(e)) => panic!("allow 0.0.0.0/0 应覆盖默认 BlockPrivate: {e}"),
+            Err(_) => panic!("dial timed out"),
+        }
+        uninstall();
+        server_task.abort();
+    }
 }
