@@ -15,16 +15,17 @@
 //!
 //! # 命令面与 Go 的映射（Go 走 API，此处为等价 CLI 形态）
 //!
-//! - Linux 路由：Go `netlink.RouteAdd{LinkIndex, Dst, Priority: 1}`（tun_linux.go:451-458）
-//!   → `ip route add <dst>/<p> metric 1 dev <iface>`。
-//! - Windows 路由：Go `LUID.SetRoutesForFamily{Destination, Metric: 0}`（tun_windows.go:126-149）
-//!   → v4 `route add <dst> mask <mask> metric 0 if <idx>`；
-//!   v6 → `netsh interface ipv6 add route <p>/<len> interface=<name> metric=0`。
-//! - Linux DNS：Go `resolvectl dns/domain/default-route` + 失败 `revert`
-//!   （tun_linux.go:105-160）→ 逐字同形。
-//! - Windows DNS：Go `LUID.SetDNS(family, dns, nil)`（tun_windows.go:157）
-//!   → `netsh interface {ipv4,ipv6} set/add dnsservers`；回滚 = `address=none`
-//!   清空（Go Close 的 `FlushDNS` 等价命令面）。
+//! - Linux 路由：Go `netlink.RouteAdd{LinkIndex, Dst, Priority: 1}`（tun_linux.go:451-458） → `ip
+//!   route add <dst>/<p> metric 1 dev <iface>`。
+//! - Windows 路由：Go `LUID.SetRoutesForFamily{Destination, Metric: 0}`（tun_windows.go:126-149） →
+//!   v4 `route add <dst> mask <mask> metric 0 if <idx>`；
+//!
+//!   v6 `netsh interface ipv6 add route <p>/<len> interface=<name> metric=0`。
+//! - Linux DNS：Go `resolvectl dns/domain/default-route` + 失败 `revert` （tun_linux.go:105-160）→
+//!   逐字同形。
+//! - Windows DNS：Go `LUID.SetDNS(family, dns, nil)`（tun_windows.go:157） → `netsh interface
+//!   {ipv4,ipv6} set/add dnsservers`；回滚 = `address=none` 清空（Go Close 的 `FlushDNS`
+//!   等价命令面）。
 //!
 //! 结构化 args 直接传进程（无 shell 解析），接口名含空格也安全，故不再加引号。
 
