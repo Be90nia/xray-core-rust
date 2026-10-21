@@ -731,9 +731,17 @@ fn build_adapter(
     ohm: Arc<dyn OutboundHandlerSelector>,
     observer: Option<Arc<dyn ObservationProvider>>,
 ) -> Result<Arc<RouterAdapter>, WiringError> {
-    let geo_loader = Some(Arc::new(xray_geodata::loader::GeoDataLoader::new(resolve_asset_dir())));
-    let router = Router::init(&config, ohm, observer, geo_loader)
-        .map_err(|e| WiringError::RouterInit(e.to_string()))?;
+    let datadir = resolve_asset_dir();
+    let geo_loader = Some(Arc::new(GeoDataLoader::new(datadir.clone())));
+    let router = Router::init(&config, ohm, observer, geo_loader).map_err(|e| match e {
+        // proto 变体 geo 规则（GeoSiteRule/GeoIPRule 字段）在 init 期加载 .dat，
+        // 失败同样拒启（bd il49）。
+        RouterError::GeodataBuild(m) => WiringError::Geodata(format!(
+            "{m}; asset dir: {} (place the .dat file there or set XRAY_LOCATION_ASSET)",
+            datadir.display()
+        )),
+        other => WiringError::RouterInit(other.to_string()),
+    })?;
     Ok(Arc::new(RouterAdapter::new(router)))
 }
 
@@ -835,7 +843,9 @@ fn parse_routing_json_to_proto_in(
                     xray_geodata::geosite::DomainType::Substr,
                     datadir,
                 )
-                .map_err(|e| WiringError::JsonParse(format!("routing rule domain '{d}': {e}")))?;
+                .map_err(|e| {
+                    geo_asset_error(format!("routing rule domain '{d}'"), "geosite.dat", datadir, e)
+                })?;
                 domains.push(geodata_domain_rule_to_proto(pb_rule));
             }
             for d in json_str_iter(r.get("domainSuffix")) {
@@ -870,9 +880,11 @@ fn parse_routing_json_to_proto_in(
             // `!` 反向）。解析失败硬错——旧实现 geoip:/非法 CIDR 静默跳过（安全
             // 屏蔽规则失效的根因）。
             let mut ips = Vec::new();
-            for p in
-                xray_geodata::rule_parser::parse_ip_rules(&json_string_list(r.get("ip")), datadir)
-                    .map_err(|e| WiringError::JsonParse(format!("routing rule ip: {e}")))?
+            for p in xray_geodata::rule_parser::parse_ip_rules(
+                &json_string_list(r.get("ip")),
+                datadir,
+            )
+            .map_err(|e| geo_asset_error("routing rule ip".into(), "geoip.dat", datadir, e))?
             {
                 ips.push(geodata_ip_rule_to_proto(p));
             }
@@ -884,8 +896,9 @@ fn parse_routing_json_to_proto_in(
                 &json_string_list(r.get(source_key)),
                 datadir,
             )
-            .map_err(|e| WiringError::JsonParse(format!("routing rule {source_key}: {e}")))?
-            {
+            .map_err(|e| {
+                geo_asset_error(format!("routing rule {source_key}"), "geoip.dat", datadir, e)
+            })? {
                 source_ips.push(geodata_ip_rule_to_proto(p));
             }
 
@@ -895,7 +908,7 @@ fn parse_routing_json_to_proto_in(
                 &json_string_list(r.get("localIP")),
                 datadir,
             )
-            .map_err(|e| WiringError::JsonParse(format!("routing rule localIP: {e}")))?
+            .map_err(|e| geo_asset_error("routing rule localIP".into(), "geoip.dat", datadir, e))?
             {
                 local_ips.push(geodata_ip_rule_to_proto(p));
             }
@@ -1369,6 +1382,31 @@ pub enum WiringError {
     /// Router 初始化失败（重复 tag / geoip 规则缺 loader 等）。
     #[error("router init: {0}")]
     RouterInit(String),
+    /// geo 资产不可用（.dat 缺失 / code 不存在）。fail-closed 拒启——调用方
+    /// 禁止回退 PatternRouter（那会把 geosite:/geoip: 规则静默降级为永不命中的
+    /// 字面量，bd il49）。
+    #[error("geo assets unavailable: {0}")]
+    Geodata(String),
+}
+
+/// geo 资产错误分流：`FileCheckFailed`（.dat 缺失 / code 不存在）→
+/// [`WiringError::Geodata`]（拒启，错误含规则原文 / 默认文件名 / 资产目录）；
+/// 其余解析错误保持 [`WiringError::JsonParse`]。
+fn geo_asset_error(
+    context: String,
+    default_file: &str,
+    datadir: &Path,
+    e: xray_geodata::rule_parser::RuleParserError,
+) -> WiringError {
+    match e {
+        xray_geodata::rule_parser::RuleParserError::FileCheckFailed(m) => {
+            WiringError::Geodata(format!(
+                "{context}: {m}; missing {default_file} in asset dir {} (place the file there or set XRAY_LOCATION_ASSET)",
+                datadir.display()
+            ))
+        },
+        other => WiringError::JsonParse(format!("{context}: {other}")),
+    }
 }
 
 /// 查找 GeoIP/GeoSite .dat 文件目录（对齐 Go `GetOBJPath`）。
@@ -2123,13 +2161,13 @@ mod tests {
         std::fs::write(dir.join("geoip.dat"), make_geoip_dat()).unwrap();
         std::fs::write(dir.join("geosite.dat"), make_geosite_dat()).unwrap();
 
-        // geoip: code 不存在
+        // geoip: code 不存在（文件在，code 缺）→ 资产不可用，同拒启
         let err = parse_routing_json_to_proto_in(
             br#"{"rules":[{"outboundTag":"b","ip":["geoip:nonexistent"]}]}"#,
             &dir,
         )
         .unwrap_err();
-        assert!(matches!(err, WiringError::JsonParse(_)), "{err:?}");
+        assert!(matches!(err, WiringError::Geodata(_)), "{err:?}");
 
         // 非法 IP 字面（旧实现静默 skip 的形态）
         let err = parse_routing_json_to_proto_in(
@@ -2139,13 +2177,13 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, WiringError::JsonParse(_)), "{err:?}");
 
-        // geosite: code 不存在
+        // geosite: code 不存在 → 同拒启
         let err = parse_routing_json_to_proto_in(
             br#"{"rules":[{"outboundTag":"b","domain":["geosite:nonexistent"]}]}"#,
             &dir,
         )
         .unwrap_err();
-        assert!(matches!(err, WiringError::JsonParse(_)), "{err:?}");
+        assert!(matches!(err, WiringError::Geodata(_)), "{err:?}");
 
         // geoip.dat 整体缺失 → 拒启（Go：Build 期 load 失败即拒启）
         let nodat = temp_asset_dir("hard-error-nodat");
@@ -2154,7 +2192,14 @@ mod tests {
             &nodat,
         )
         .unwrap_err();
-        assert!(matches!(err, WiringError::JsonParse(_)), "{err:?}");
+        assert!(matches!(err, WiringError::Geodata(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("geoip.dat")
+                && msg.contains(&nodat.to_string_lossy().to_string())
+                && msg.contains("XRAY_LOCATION_ASSET"),
+            "error must carry file name + asset dir + env hint: {msg}"
+        );
 
         // 对照：无前缀 domain 与纯 CIDR 不需要 geodata 资产
         parse_routing_json_to_proto_in(
@@ -2162,6 +2207,32 @@ mod tests {
             &nodat,
         )
         .expect("plain rules must not require geodata assets");
+    }
+
+    /// bd il49 三态：①引用 geo + 资产缺失 → Err（拒启，错误含文件名/目录/env 提示）；
+    /// ②引用 geo + 资产存在 → Ok；③未引用 geo → Ok 且零资产依赖。
+    #[test]
+    fn routing_geo_assets_three_states() {
+        let json = br#"{"rules":[{"outboundTag":"b","ip":["geoip:private"]}]}"#;
+
+        // ① 引用 + 缺失 → Err
+        let empty = temp_asset_dir("three-missing");
+        let err = parse_routing_json_to_proto_in(json, &empty).unwrap_err();
+        assert!(matches!(err, WiringError::Geodata(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("geoip.dat") && msg.contains("XRAY_LOCATION_ASSET"), "{msg}");
+
+        // ② 引用 + 存在 → Ok
+        std::fs::write(empty.join("geoip.dat"), make_geoip_dat()).unwrap();
+        parse_routing_json_to_proto_in(json, &empty).expect("assets present must parse");
+
+        // ③ 未引用 + 缺失 → Ok（不加载、不报错）
+        let bare = temp_asset_dir("three-unreferenced");
+        parse_routing_json_to_proto_in(
+            br#"{"rules":[{"outboundTag":"b","domain":["ok.example"]}]}"#,
+            &bare,
+        )
+        .expect("unreferenced geo must not require assets");
     }
 
     /// vrll⑤：routing 端口字段解析失败硬错（Go router.go:236-238 解码期拒启）
