@@ -111,6 +111,9 @@ pub async fn serve_vless(
         "vless inbound listening"
     );
 
+    // tcpSettings.header 伪装头（Go hub.go:85-95 authConfig；TLS 解包后应用）。
+    let header = listener.header_auth().cloned();
+
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -125,6 +128,7 @@ pub async fn serve_vless(
         let tls = tls.clone();
         let fallbacks = fallbacks.clone();
         let options = options.clone();
+        let header = header.clone();
         let local = listener.local_addr()?;
         tokio::spawn(async move {
             let result = if let Some(acc) = tls {
@@ -153,9 +157,14 @@ pub async fn serve_vless(
                             o.outer_tls13 = conn.protocol_version()
                                 == Some(xray_transport::rustls::ProtocolVersion::TLSv1_3);
                         }
+                        // Go hub.go:106-113：TLS 解包后 authConfig.Server（伪装在 TLS 隧道内）。
+                        let io = xray_transport::headers::conn::maybe_wrap_server(
+                            tls_stream,
+                            header.as_deref(),
+                        );
                         handle_connection_with_fallback(
-                            tls_stream, &handler, &validator, fallbacks, peer, local, name, alpn,
-                            options, raw_tcp,
+                            io, &handler, &validator, fallbacks, peer, local, name, alpn, options,
+                            raw_tcp,
                         )
                         .await
                     },
@@ -165,8 +174,11 @@ pub async fn serve_vless(
                     },
                 }
             } else {
+                // Go hub.go:106-113：无 TLS 时伪装解包直接套在裸连接上。
+                let io =
+                    xray_transport::headers::conn::maybe_wrap_server(stream, header.as_deref());
                 handle_connection_with_fallback(
-                    stream,
+                    io,
                     &handler,
                     &validator,
                     fallbacks,
