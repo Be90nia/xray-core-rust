@@ -203,38 +203,48 @@ pub trait OperationDecoder: Send + Sync {
 ///
 /// 上层（如 xray-app-commander）通过注入 [`InboundHandlerProvider`] / [`OutboundHandlerProvider`]
 /// 让 service 取到底层 handler。
+///
+/// 方法为 `async`：AddInbound 要真实 bind listener（Go 里是阻塞调用，Rust 侧对应
+/// await），bind 失败必须原样上抛而不是事后打日志。
+#[async_trait::async_trait]
 pub trait HandlerService: Send + Sync {
-    fn add_inbound(&self, req: AddInboundRequest) -> Result<AddInboundResponse, ProxymanError>;
-    fn remove_inbound(
+    async fn add_inbound(
+        &self,
+        req: AddInboundRequest,
+    ) -> Result<AddInboundResponse, ProxymanError>;
+    async fn remove_inbound(
         &self,
         req: RemoveInboundRequest,
     ) -> Result<RemoveInboundResponse, ProxymanError>;
-    fn alter_inbound(
+    async fn alter_inbound(
         &self,
         req: AlterInboundRequest,
     ) -> Result<AlterInboundResponse, ProxymanError>;
-    fn list_inbounds(
+    async fn list_inbounds(
         &self,
         req: ListInboundsRequest,
     ) -> Result<ListInboundsResponse, ProxymanError>;
-    fn get_inbound_users(
+    async fn get_inbound_users(
         &self,
         req: GetInboundUserRequest,
     ) -> Result<GetInboundUserResponse, ProxymanError>;
-    fn get_inbound_users_count(
+    async fn get_inbound_users_count(
         &self,
         req: GetInboundUserRequest,
     ) -> Result<GetInboundUsersCountResponse, ProxymanError>;
-    fn add_outbound(&self, req: AddOutboundRequest) -> Result<AddOutboundResponse, ProxymanError>;
-    fn remove_outbound(
+    async fn add_outbound(
+        &self,
+        req: AddOutboundRequest,
+    ) -> Result<AddOutboundResponse, ProxymanError>;
+    async fn remove_outbound(
         &self,
         req: RemoveOutboundRequest,
     ) -> Result<RemoveOutboundResponse, ProxymanError>;
-    fn alter_outbound(
+    async fn alter_outbound(
         &self,
         req: AlterOutboundRequest,
     ) -> Result<AlterOutboundResponse, ProxymanError>;
-    fn list_outbounds(
+    async fn list_outbounds(
         &self,
         req: ListOutboundsRequest,
     ) -> Result<ListOutboundsResponse, ProxymanError>;
@@ -361,8 +371,12 @@ impl DefaultHandlerService {
     }
 }
 
+#[async_trait::async_trait]
 impl HandlerService for DefaultHandlerService {
-    fn add_inbound(&self, req: AddInboundRequest) -> Result<AddInboundResponse, ProxymanError> {
+    async fn add_inbound(
+        &self,
+        req: AddInboundRequest,
+    ) -> Result<AddInboundResponse, ProxymanError> {
         let registrar = self
             .inbound_registrar
             .as_ref()
@@ -378,7 +392,7 @@ impl HandlerService for DefaultHandlerService {
         Ok(AddInboundResponse {})
     }
 
-    fn remove_inbound(
+    async fn remove_inbound(
         &self,
         req: RemoveInboundRequest,
     ) -> Result<RemoveInboundResponse, ProxymanError> {
@@ -397,7 +411,7 @@ impl HandlerService for DefaultHandlerService {
         Ok(RemoveInboundResponse {})
     }
 
-    fn alter_inbound(
+    async fn alter_inbound(
         &self,
         req: AlterInboundRequest,
     ) -> Result<AlterInboundResponse, ProxymanError> {
@@ -411,7 +425,7 @@ impl HandlerService for DefaultHandlerService {
         Ok(AlterInboundResponse {})
     }
 
-    fn list_inbounds(
+    async fn list_inbounds(
         &self,
         req: ListInboundsRequest,
     ) -> Result<ListInboundsResponse, ProxymanError> {
@@ -442,7 +456,7 @@ impl HandlerService for DefaultHandlerService {
         Ok(resp)
     }
 
-    fn get_inbound_users(
+    async fn get_inbound_users(
         &self,
         req: GetInboundUserRequest,
     ) -> Result<GetInboundUserResponse, ProxymanError> {
@@ -468,7 +482,7 @@ impl HandlerService for DefaultHandlerService {
         Ok(resp)
     }
 
-    fn get_inbound_users_count(
+    async fn get_inbound_users_count(
         &self,
         req: GetInboundUserRequest,
     ) -> Result<GetInboundUsersCountResponse, ProxymanError> {
@@ -485,7 +499,10 @@ impl HandlerService for DefaultHandlerService {
         })
     }
 
-    fn add_outbound(&self, req: AddOutboundRequest) -> Result<AddOutboundResponse, ProxymanError> {
+    async fn add_outbound(
+        &self,
+        req: AddOutboundRequest,
+    ) -> Result<AddOutboundResponse, ProxymanError> {
         let registrar = self
             .outbound_registrar
             .as_ref()
@@ -501,7 +518,7 @@ impl HandlerService for DefaultHandlerService {
         Ok(AddOutboundResponse {})
     }
 
-    fn remove_outbound(
+    async fn remove_outbound(
         &self,
         req: RemoveOutboundRequest,
     ) -> Result<RemoveOutboundResponse, ProxymanError> {
@@ -519,7 +536,7 @@ impl HandlerService for DefaultHandlerService {
         Ok(RemoveOutboundResponse {})
     }
 
-    fn alter_outbound(
+    async fn alter_outbound(
         &self,
         req: AlterOutboundRequest,
     ) -> Result<AlterOutboundResponse, ProxymanError> {
@@ -533,7 +550,7 @@ impl HandlerService for DefaultHandlerService {
         Ok(AlterOutboundResponse {})
     }
 
-    fn list_outbounds(
+    async fn list_outbounds(
         &self,
         _req: ListOutboundsRequest,
     ) -> Result<ListOutboundsResponse, ProxymanError> {
@@ -567,8 +584,14 @@ mod tests {
     // 测试构造以字段赋值表意（对齐 Go 逐字段装配），struct update 化反而降低对照度
     #![allow(clippy::field_reassign_with_default)]
     use parking_lot::Mutex;
+    use std::future::Future;
 
     use super::*;
+
+    /// async service 调用的同步壳（Go 侧 handlerServer 是阻塞调用，测试取其等价形态）。
+    fn block<F: Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
+    }
 
     // ========== 测试 UserManager ==========
 
@@ -792,12 +815,11 @@ mod tests {
         h.um.add_user(MemoryUser { email: "a@x.com".to_string(), level: 0 }).unwrap();
         h.um.add_user(MemoryUser { email: "b@x.com".to_string(), level: 0 }).unwrap();
         let svc = make_service_with_inbound(h.clone());
-        let resp = svc
-            .get_inbound_users(GetInboundUserRequest {
-                tag: "in".to_string(),
-                email: String::new(),
-            })
-            .unwrap();
+        let resp = block(svc.get_inbound_users(GetInboundUserRequest {
+            tag: "in".to_string(),
+            email: String::new(),
+        }))
+        .unwrap();
         assert_eq!(resp.users.len(), 2);
     }
 
@@ -806,12 +828,11 @@ mod tests {
         let h = make_stub_inbound("in");
         h.um.add_user(MemoryUser { email: "x@x.com".to_string(), level: 0 }).unwrap();
         let svc = make_service_with_inbound(h.clone());
-        let resp = svc
-            .get_inbound_users(GetInboundUserRequest {
-                tag: "in".to_string(),
-                email: "x@x.com".to_string(),
-            })
-            .unwrap();
+        let resp = block(svc.get_inbound_users(GetInboundUserRequest {
+            tag: "in".to_string(),
+            email: "x@x.com".to_string(),
+        }))
+        .unwrap();
         assert_eq!(resp.users.len(), 1);
         assert_eq!(resp.users[0].email, "x@x.com");
     }
@@ -822,12 +843,11 @@ mod tests {
         h.um.add_user(MemoryUser { email: "1".to_string(), level: 0 }).unwrap();
         h.um.add_user(MemoryUser { email: "2".to_string(), level: 0 }).unwrap();
         let svc = make_service_with_inbound(h);
-        let resp = svc
-            .get_inbound_users_count(GetInboundUserRequest {
-                tag: "in".to_string(),
-                email: String::new(),
-            })
-            .unwrap();
+        let resp = block(svc.get_inbound_users_count(GetInboundUserRequest {
+            tag: "in".to_string(),
+            email: String::new(),
+        }))
+        .unwrap();
         assert_eq!(resp.count, 2);
     }
 
@@ -842,7 +862,7 @@ mod tests {
             ]),
         });
         let svc = DefaultHandlerService { inbound_provider: Some(provider), ..Default::default() };
-        let resp = svc.list_inbounds(ListInboundsRequest { is_only_tags: true }).unwrap();
+        let resp = block(svc.list_inbounds(ListInboundsRequest { is_only_tags: true })).unwrap();
         assert_eq!(resp.inbounds.len(), 2);
         let tags: Vec<String> = resp.inbounds.into_iter().map(|c| c.tag).collect();
         assert!(tags.contains(&"a".to_string()));
@@ -852,7 +872,7 @@ mod tests {
     #[test]
     fn list_inbounds_without_provider_errors() {
         let svc = DefaultHandlerService::default();
-        match svc.list_inbounds(ListInboundsRequest::default()) {
+        match block(svc.list_inbounds(ListInboundsRequest::default())) {
             Err(ProxymanError::Other(_)) => (),
             Err(e) => panic!("expected Other, got: {e}"),
             Ok(_) => panic!("expected error, got Ok"),
@@ -863,7 +883,7 @@ mod tests {
     fn remove_inbound_unknown_returns_handler_not_found() {
         let h = make_stub_inbound("a");
         let svc = make_service_with_inbound(h);
-        match svc.remove_inbound(RemoveInboundRequest { tag: "ghost".to_string() }) {
+        match block(svc.remove_inbound(RemoveInboundRequest { tag: "ghost".to_string() })) {
             Err(ProxymanError::HandlerNotFound(t)) => assert_eq!(t, "ghost"),
             Err(e) => panic!("expected HandlerNotFound, got: {e}"),
             Ok(_) => panic!("expected error, got Ok"),
@@ -873,7 +893,7 @@ mod tests {
     #[test]
     fn add_inbound_always_returns_other_todo() {
         let svc = DefaultHandlerService::default();
-        match svc.add_inbound(AddInboundRequest::default()) {
+        match block(svc.add_inbound(AddInboundRequest::default())) {
             Err(ProxymanError::Other(_)) => (),
             Err(e) => panic!("expected Other, got: {e}"),
             Ok(_) => panic!("expected error, got Ok"),
@@ -887,7 +907,7 @@ mod tests {
         let mut req = AlterInboundRequest::default();
         req.tag = "a".to_string();
         req.operation = Some(xray_proto::xray::common::serial::TypedMessage::default());
-        match svc.alter_inbound(req) {
+        match block(svc.alter_inbound(req)) {
             Err(ProxymanError::Other(_)) => (),
             Err(e) => panic!("expected Other, got: {e}"),
             Ok(_) => panic!("expected error, got Ok"),
@@ -927,7 +947,7 @@ mod tests {
             inbound_remover: Some(remover.clone()),
             ..Default::default()
         };
-        svc.remove_inbound(RemoveInboundRequest { tag: "in1".into() }).unwrap();
+        block(svc.remove_inbound(RemoveInboundRequest { tag: "in1".into() })).unwrap();
         assert_eq!(remover.removed.lock().len(), 1);
         assert_eq!(remover.removed.lock()[0], "in1");
     }
@@ -937,7 +957,7 @@ mod tests {
         // 无 remover 时仍返回 Ok（兼容只校验存在的场景）
         let h = make_stub_inbound("in2");
         let svc = make_service_with_inbound(h);
-        svc.remove_inbound(RemoveInboundRequest { tag: "in2".into() }).unwrap();
+        block(svc.remove_inbound(RemoveInboundRequest { tag: "in2".into() })).unwrap();
     }
 
     #[test]
@@ -949,7 +969,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let resp = svc.list_inbounds(ListInboundsRequest { is_only_tags: false }).unwrap();
+        let resp = block(svc.list_inbounds(ListInboundsRequest { is_only_tags: false })).unwrap();
         assert_eq!(resp.inbounds.len(), 1);
         let cfg = &resp.inbounds[0];
         assert_eq!(cfg.tag, "full");
@@ -967,7 +987,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let resp = svc.list_inbounds(ListInboundsRequest { is_only_tags: true }).unwrap();
+        let resp = block(svc.list_inbounds(ListInboundsRequest { is_only_tags: true })).unwrap();
         assert_eq!(resp.inbounds.len(), 1);
         assert!(resp.inbounds[0].proxy_settings.is_none());
         assert!(resp.inbounds[0].receiver_settings.is_none());
@@ -1059,7 +1079,7 @@ mod tests {
             outbound_remover: Some(remover.clone()),
             ..Default::default()
         };
-        svc.remove_outbound(RemoveOutboundRequest { tag: "out1".into() }).unwrap();
+        block(svc.remove_outbound(RemoveOutboundRequest { tag: "out1".into() })).unwrap();
         assert_eq!(remover.removed.lock().len(), 1);
         assert_eq!(remover.removed.lock()[0], "out1");
     }
@@ -1070,7 +1090,7 @@ mod tests {
             handlers: Mutex::new(vec![Arc::new(StubOutboundHandler { tag: "out_full".into() })]),
         });
         let svc = DefaultHandlerService { outbound_provider: Some(provider), ..Default::default() };
-        let resp = svc.list_outbounds(ListOutboundsRequest::default()).unwrap();
+        let resp = block(svc.list_outbounds(ListOutboundsRequest::default())).unwrap();
         assert_eq!(resp.outbounds.len(), 1);
         let cfg = &resp.outbounds[0];
         assert_eq!(cfg.tag, "out_full");

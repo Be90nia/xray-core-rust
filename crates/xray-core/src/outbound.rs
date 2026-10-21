@@ -3609,7 +3609,7 @@ fn parse_dokodemo_config(
 }
 
 #[derive(Debug)]
-enum BuildError {
+pub enum BuildError {
     Unsupported(String),
     Parse(String),
 }

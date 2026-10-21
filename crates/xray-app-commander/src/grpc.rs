@@ -154,7 +154,7 @@ impl HandlerService for HandlerServiceImpl {
         // 优先级 1：proxyman 领域 service（Go handlerServer.AddOutbound，
         // command.go:165-170 —— core.AddOutboundHandler）
         if let Some(svc) = &self.proxyman {
-            let resp = svc.add_outbound(request.into_inner()).map_err(proxyman_status)?;
+            let resp = svc.add_outbound(request.into_inner()).await.map_err(proxyman_status)?;
             return Ok(Response::new(resp));
         }
         let req = request.into_inner();
@@ -194,7 +194,7 @@ impl HandlerService for HandlerServiceImpl {
     ) -> Result<Response<RemoveOutboundResponse>, Status> {
         // proxyman 领域 service（Go command.go:172-174 —— ohm.RemoveHandler）
         if let Some(svc) = &self.proxyman {
-            let resp = svc.remove_outbound(request.into_inner()).map_err(proxyman_status)?;
+            let resp = svc.remove_outbound(request.into_inner()).await.map_err(proxyman_status)?;
             return Ok(Response::new(resp));
         }
         let tag = request.into_inner().tag.to_string();
@@ -221,7 +221,7 @@ impl HandlerService for HandlerServiceImpl {
     ) -> Result<Response<ListOutboundsResponse>, Status> {
         // proxyman 领域 service（Go command.go:188-205 —— ohm.ListHandlers）
         if let Some(svc) = &self.proxyman {
-            let resp = svc.list_outbounds(request.into_inner()).map_err(proxyman_status)?;
+            let resp = svc.list_outbounds(request.into_inner()).await.map_err(proxyman_status)?;
             return Ok(Response::new(resp));
         }
         let tags = match self.runtime.as_ref() {
@@ -252,7 +252,7 @@ impl HandlerService for HandlerServiceImpl {
                 "AddInbound requires proxyman HandlerService (not injected)",
             ));
         };
-        let resp = svc.add_inbound(request.into_inner()).map_err(proxyman_status)?;
+        let resp = svc.add_inbound(request.into_inner()).await.map_err(proxyman_status)?;
         Ok(Response::new(resp))
     }
 
@@ -265,7 +265,7 @@ impl HandlerService for HandlerServiceImpl {
                 "RemoveInbound requires proxyman HandlerService (not injected)",
             ));
         };
-        let resp = svc.remove_inbound(request.into_inner()).map_err(proxyman_status)?;
+        let resp = svc.remove_inbound(request.into_inner()).await.map_err(proxyman_status)?;
         Ok(Response::new(resp))
     }
 
@@ -278,7 +278,7 @@ impl HandlerService for HandlerServiceImpl {
                 "AlterInbound requires proxyman HandlerService (not injected)",
             ));
         };
-        let resp = svc.alter_inbound(request.into_inner()).map_err(proxyman_status)?;
+        let resp = svc.alter_inbound(request.into_inner()).await.map_err(proxyman_status)?;
         Ok(Response::new(resp))
     }
 
@@ -291,7 +291,7 @@ impl HandlerService for HandlerServiceImpl {
                 "ListInbounds requires proxyman HandlerService (not injected)",
             ));
         };
-        let resp = svc.list_inbounds(request.into_inner()).map_err(proxyman_status)?;
+        let resp = svc.list_inbounds(request.into_inner()).await.map_err(proxyman_status)?;
         Ok(Response::new(resp))
     }
 
@@ -304,7 +304,7 @@ impl HandlerService for HandlerServiceImpl {
                 "GetInboundUsers requires proxyman HandlerService (not injected)",
             ));
         };
-        let resp = svc.get_inbound_users(request.into_inner()).map_err(proxyman_status)?;
+        let resp = svc.get_inbound_users(request.into_inner()).await.map_err(proxyman_status)?;
         Ok(Response::new(resp))
     }
 
@@ -317,7 +317,8 @@ impl HandlerService for HandlerServiceImpl {
                 "GetInboundUsersCount requires proxyman HandlerService (not injected)",
             ));
         };
-        let resp = svc.get_inbound_users_count(request.into_inner()).map_err(proxyman_status)?;
+        let resp =
+            svc.get_inbound_users_count(request.into_inner()).await.map_err(proxyman_status)?;
         Ok(Response::new(resp))
     }
 
@@ -330,7 +331,7 @@ impl HandlerService for HandlerServiceImpl {
                 "AlterOutbound requires proxyman HandlerService (not injected)",
             ));
         };
-        let resp = svc.alter_outbound(request.into_inner()).map_err(proxyman_status)?;
+        let resp = svc.alter_outbound(request.into_inner()).await.map_err(proxyman_status)?;
         Ok(Response::new(resp))
     }
 }
