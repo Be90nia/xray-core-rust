@@ -5,10 +5,7 @@
 
 use std::{io, time::Duration};
 
-use tokio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    select,
-};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::{AsyncIo, Tcpmask, UDP_SIZE};
 
@@ -79,45 +76,41 @@ impl Tcpmask for FragmentConfig {
 /// 桥接 task：inner ↔ duplex pipe。
 ///
 /// inner→pipe 方向透明透传；pipe→inner 方向走分片逻辑（对应 Go `fragmentConn.Write`）。
-/// 用 `tokio::select!` 并发处理双向，避免手写 `poll_write` 状态机。
+/// 两个方向是独立字节流，各自跑在自己的 task 里——反方向在对端不读时会阻塞在
+/// `pipe` 的写侧，单 task `select!` 会让写方向跟着饿死（bd xuaa：≥64KiB 写-后-读载荷
+/// 上行卡死）。
 async fn fragment_bridge(
     inner: Box<dyn AsyncIo>,
-    mut pipe: tokio::io::DuplexStream,
+    pipe: tokio::io::DuplexStream,
     config: FragmentConfig,
     _server: bool,
 ) {
     let (mut inner_r, mut inner_w) = tokio::io::split(inner);
-    let mut read_buf = vec![0u8; UDP_SIZE];
+    let (mut pipe_r, mut pipe_w) = tokio::io::split(pipe);
+    let back = tokio::spawn(async move {
+        // 读侧结束/出错 → 关掉 pipe 写侧，让对端读到 EOF（错误按流结束传播）。
+        let _ = tokio::io::copy(&mut inner_r, &mut pipe_w).await;
+        let _ = pipe_w.shutdown().await;
+    });
     let mut write_buf = vec![0u8; UDP_SIZE];
     let mut count = 0u64;
     loop {
-        select! {
-            // inner → pipe：读透传
-            r = inner_r.read(&mut read_buf) => {
-                match r {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if pipe.write_all(&read_buf[..n]).await.is_err() { break; }
-                    }
+        match pipe_r.read(&mut write_buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                count += 1;
+                if write_fragmented(&mut inner_w, &write_buf[..n], &config, count).await.is_err() {
+                    break;
                 }
-            }
-            // pipe → inner：写分片
-            r = pipe.read(&mut write_buf) => {
-                match r {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        count += 1;
-                        if write_fragmented(&mut inner_w, &write_buf[..n], &config, count)
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                }
-            }
+            },
         }
     }
+    let _ = inner_w.shutdown().await;
+    // 写侧结束后不再有回程数据可交，反向透传直接收摊（与旧单 task 版 break 即整体
+    // 关闭的语义一致），避免反方向 task 在死连接上滞留。
+    // shortcut: 不支持 app 半关后继续读回程（ws/TLS 上层从不半关，故不成问题）；
+    // 真有半关需求时把 abort 换成 `let _ = back.await`。
+    back.abort();
 }
 
 /// 分片写入（对应 Go `fragmentConn.Write`）。
@@ -250,6 +243,57 @@ mod tests {
         assert!(!c2.merge_tls_hello());
         let c3 = FragmentConfig { delays_max: vec![5], ..Default::default() };
         assert!(!c3.merge_tls_hello());
+    }
+
+    /// 大载荷「写-后-读」（bd xuaa）：对端 echo 在 app 不读期间只能堆积在底层缓冲里，
+    /// 桥必须让两个方向各自独立推进。单 task `select!` + 分支体内 `await` 会把
+    /// 反方向（inner→pipe）的阻塞传染给写方向，app 写满 pipe 后彻底停摆。
+    ///
+    /// inner 用 1 MiB duplex 模拟真实 TCP 的内核收发缓冲（MB 级），
+    /// app 侧 pipe 保持生产容量（`UDP_SIZE * 2` = 8 KiB）——唯一的人工窄口。
+    #[tokio::test]
+    async fn bridge_keeps_draining_write_side_while_echo_unread() {
+        let config = FragmentConfig {
+            packets_from: 1,
+            packets_to: 2,
+            lengths_min: vec![8],
+            lengths_max: vec![16],
+            delays_min: vec![0],
+            delays_max: vec![0],
+            ..Default::default()
+        };
+        let (inner_client, mut inner_peer) = tokio::io::duplex(1 << 20);
+        let mut app = config.wrap_conn_client(Box::new(inner_client)).unwrap();
+        let echo = tokio::spawn(async move {
+            let mut buf = vec![0u8; 16384];
+            loop {
+                match inner_peer.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if inner_peer.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    },
+                }
+            }
+        });
+
+        let payload: Vec<u8> = (0..128 * 1024).map(|i| (i & 0xFF) as u8).collect();
+        // 1) 只写不读：echo 未被消费，写方向不得因此停摆（旧实现卡在 inner→pipe 的 write_all
+        //    上，写方向随之饿死）。
+        tokio::time::timeout(Duration::from_secs(5), app.write_all(&payload))
+            .await
+            .expect("write side starved while echo unread (head-of-line blocking)")
+            .expect("write ok");
+        // 2) 开始读：echo 必须逐字节回齐（碎片路径不得丢/重排）。
+        let mut got = vec![0u8; payload.len()];
+        tokio::time::timeout(Duration::from_secs(5), app.read_exact(&mut got))
+            .await
+            .expect("echo stalled after write")
+            .expect("echo read ok");
+        assert_eq!(got, payload);
+        drop(app);
+        let _ = echo.await;
     }
 
     #[tokio::test]

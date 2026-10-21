@@ -1088,15 +1088,12 @@ mod tests {
     }
 
     /// bd dppv 大载荷复现床：fragment mask + ws 双端新层序下大 payload echo。
-    /// 已知残留（#ignore，非回归门）：fragment mask 下 payload ≥64KB 仍断流。
-    /// `WsConnection::poll_write` 的背压语义已按 AsyncWrite 契约修正（bd mvw2，见
-    /// ws_bridge.rs `poll_write`），断流阈值从 16KB 抬到 64KB；残留根因在 finalmask
-    /// 桥 select 循环的分支内 write_all 头阻塞（xray-transport/finalmask/fragment.rs
-    /// fragment_bridge，属 raw-TCP 代理的 scope）。
-    /// 复现：`REPRO_FM=fragment REPRO_LEN=65536 cargo test -p xray-transport-websocket
+    /// 历史残留已修：`WsConnection::poll_write` 背压语义（bd mvw2）把断流阈值从 16KB
+    /// 抬到 64KB，finalmask 桥的头阻塞（bd xuaa，fragment.rs `fragment_bridge` 改双向
+    /// 独立 task）把 64KB 以上那段也清掉——本床在 fragment 下 64/128/256/512KB 全 PASS。
+    /// 复现：`REPRO_FM=fragment REPRO_LEN=262144 cargo test -p xray-transport-websocket
     /// --lib dial_ws_finalmask_large_payload_roundtrip -- --ignored --nocapture`
-    /// （bd mvw2 实测阶梯：fragment 16KB/32KB PASS、64KB 上行卡在 48KB、128KB 回程超时；
-    /// xmc 与无 mask 128KB 双向 PASS）。
+    /// （`REPRO_FM=none` / `xmc` 作对照；`REPRO_CHUNK` 调上行分块大小）。
     #[tokio::test]
     #[ignore]
     async fn dial_ws_finalmask_large_payload_roundtrip() {
