@@ -8,7 +8,11 @@
 //! ## 桥接语义（对齐 Go gorilla/websocket）
 //!
 //! - **写**：每次 `poll_write` 发一条 `Binary` 消息（与 Go `WriteMessage(BinaryMessage, b)`
-//!   一致）。调用方若需合并小包应在调用前 buffer。
+//!   一致）。调用方若需合并小包应在调用前 buffer。 背压按 `AsyncWrite` 契约诚实上报：帧已交给
+//!   tungstenite 但 flush 未完成时返 回 `Pending`，本次报文长度记在
+//!   `write_queued`；调用方带同一批数据重试时只 推进 flush（不重复入队），flush 完成才回报
+//!   `Ok(len)`。绝不能把未 flush 的 帧报成已写——底层持续背压时会把 tungstenite
+//!   写缓冲积满并永久滞留尾部数据。
 //! - **读**：从下一条 `Binary` 消息的字节流读取。一条消息可能跨多次 `poll_read`，
 //!   多条消息的字节流也不可跨越（每条消息独立消费完才取下一条）。
 //! - 控制帧（`Ping`/`Pong`/`Close`）由 tungstenite 自动处理；`Close` 后返回 EOF。
@@ -50,6 +54,10 @@ pub struct WsConnection<S> {
     pub(crate) write: Arc<Mutex<SplitSinkOwned<S>>>,
     /// 当前未消费完的消息字节（一条 Binary 消息可能跨多次 poll_read）。
     pub(crate) read_buf: VecDeque<u8>,
+    /// 已 `start_send` 进 tungstenite、但对调用方尚未回报的消息长度。
+    /// `Some(len)` = 有在途数据：下次 `poll_write` 只能推进 flush（绝不二次
+    /// `start_send`），flush 完成后按 `len` 回报 `Ok`。见 `poll_write` 步骤 2。
+    pub(crate) write_queued: Option<usize>,
     /// 对端地址（可由 PROXY protocol / X-Forwarded-For 覆盖，对应 Go `remoteAddr`）。
     pub(crate) remote: Option<SocketAddr>,
     /// 本端地址。
@@ -81,6 +89,7 @@ impl<S> WsConnection<S> {
             read,
             write: Arc::new(Mutex::new(write)),
             read_buf: VecDeque::new(),
+            write_queued: None,
             remote,
             local,
             heartbeat_handle: None,
@@ -195,7 +204,21 @@ where
                 return Poll::Pending;
             },
         };
-        // 2. poll_ready → start_send → poll_flush（SinkExt _unpin 方法通过 DerefMut 调用到
+        // 2. 上一批已 start_send 但 flush 未完成：本轮只推进 flush，**绝不二次
+        //    start_send**（同一批字节交给 tungstenite 两次 = 双发损坏）。flush 未完成就诚实
+        //    Pending——`poll_flush` 已注册 waker，调用方会带同一批
+        //    数据重试；完成后按已入队长度回报（数据已交付，调用方不必重写）。
+        if let Some(queued) = this.write_queued {
+            match guard.poll_flush_unpin(cx) {
+                Poll::Ready(Ok(())) => {
+                    this.write_queued = None;
+                    return Poll::Ready(Ok(queued));
+                },
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(io::Error::other(e))),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        // 3. poll_ready → start_send → poll_flush（SinkExt _unpin 方法通过 DerefMut 调用到
         //    SplitKit）。
         match guard.poll_ready_unpin(cx) {
             Poll::Ready(Ok(())) => {},
@@ -214,16 +237,21 @@ where
         if let Err(e) = guard.start_send_unpin(Message::binary(buf.to_vec())) {
             return Poll::Ready(Err(io::Error::other(e)));
         }
-        // ponytail: 立即 poll_flush 让数据发到 TCP，避免调用方必须显式 flush。
-        // WS 代理语义：每条消息对应独立帧，应即时发送（对齐 Go WriteMessage）。
-        // bd dppv 备注：flush Pending 时按缓冲 sink 惯例报 Ready(Ok(len))（buf 已被
-        // tungstenite 写缓冲消费）；此形态在「mask 包住 ws 握手」新层序 + >8KB 载荷
-        // 下有写缓冲积压残留（见 register.rs dial_ws_finalmask_large_payload_roundtrip
-        // 复现床），修法需诚实 Pending + 已入队标记，且重试路径不得二次 start_send
-        // （盲改引入过双发损坏，已回滚）——留给后续票。
+        // 4. 立刻 flush 一次让数据尽快上线（WS 代理语义：每条消息对应独立帧， 对齐 Go WriteMessage
+        //    的即时发送）；未完成则记入队长度并诚实 Pending。
+        //
+        // bd mvw2：此处曾按「缓冲 sink」惯例在 Pending 时也报 `Ready(Ok(len))`——
+        // 调用方以为已交付便继续灌新帧，tungstenite 写缓冲（默认 128 KiB）积压到
+        // 满载后无人再驱动 flush，尾部永久滞留 ⇒ 底层持续背压时断流。
+        // `AsyncWrite` 契约要求 Pending = 本轮未写入，故改为诚实 Pending +
+        // `write_queued` 记账（重试只 flush，不重入队）。
         match guard.poll_flush_unpin(cx) {
-            Poll::Ready(Ok(())) | Poll::Pending => Poll::Ready(Ok(buf.len())),
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
             Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
+            Poll::Pending => {
+                this.write_queued = Some(buf.len());
+                Poll::Pending
+            },
         }
     }
 
@@ -236,6 +264,9 @@ where
                 return Poll::Pending;
             },
         };
+        // 不清 `write_queued`：它记的是「欠调用方一次 Ok(len) 回报」，必须留给
+        // 那次重试的 poll_write 消费（清早了 → 重试会二次 start_send = 双发）。
+        // 这里 flush 成功只是把数据推到下一层，重试路径再 flush 一次是幂等空操作。
         guard.poll_flush_unpin(cx).map_err(io::Error::other)
     }
 
@@ -359,5 +390,78 @@ mod tests {
 
         server.await.unwrap();
         assert!(pings >= 1, "expected at least one ping frame, got {pings}");
+    }
+
+    /// bd mvw2 回归床：底层持续背压（4 KiB duplex）下大载荷必须完整到达。
+    ///
+    /// 旧实现在 `poll_flush` 返回 `Pending` 时仍报 `Ready(Ok(len))`，调用方以为
+    /// 已交付便继续灌新帧，尾部数据烂在 tungstenite 写缓冲里无人驱动 flush →
+    /// 对端永久等不到最后一段（≤8 KiB 单帧看不出，因为缓冲装得下且后续写会
+    /// 顺带 flush）。这里写 256 KiB 且**不显式 flush**，模拟上层 copy 循环——
+    /// 修复前对端收不齐。两种形态各跑一遍：单帧 256 KiB（> tungstenite 默认
+    /// 128 KiB 写缓冲）与 8 KiB 分段（32 次 poll_write，验跨帧顺序与不双发）。
+    #[tokio::test]
+    async fn poll_write_backpressured_large_payload_arrives_complete() {
+        let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+        for chunk in [payload.len(), 8192] {
+            let (got, frames) = transfer_in_chunks(&payload, chunk).await;
+            assert_eq!(got.len(), payload.len(), "chunk={chunk}: payload truncated");
+            assert_eq!(got, payload, "chunk={chunk}: payload corrupted (dup/reorder)");
+            // 每次 poll_write = 一条 Binary 消息：帧数必须恰好等于调用次数。
+            // 多出来的帧 = 重试路径二次 start_send（同一批字节双发）。
+            assert_eq!(
+                frames,
+                payload.len().div_ceil(chunk),
+                "chunk={chunk}: unexpected frame count (duplicate start_send)"
+            );
+        }
+    }
+
+    /// 经 4 KiB duplex 的 ws 对端搬运 `payload`（每片一次 `poll_write`），
+    /// 返回 (`收到的字节`, `收到的 Binary 帧数`)。
+    async fn transfer_in_chunks(payload: &[u8], chunk: usize) -> (Vec<u8>, usize) {
+        use std::time::Duration;
+
+        use tokio::io::AsyncWriteExt;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let len = payload.len();
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            let ws = tokio_tungstenite::accept_async(server_io).await.unwrap();
+            let (_sink, mut read) = ws.split(); // 保 sink 存活，别让对端收到 Close
+            let mut got = Vec::with_capacity(len);
+            let mut frames = 0usize;
+            while got.len() < len {
+                match read.next().await {
+                    Some(Ok(Message::Binary(data))) => {
+                        frames += 1;
+                        got.extend_from_slice(&data);
+                    },
+                    Some(Ok(_)) => {},
+                    Some(Err(e)) => panic!("peer read error at {}/{len}: {e}", got.len()),
+                    None => break,
+                }
+            }
+            (got, frames)
+        });
+
+        let req = "ws://localhost/".into_client_request().unwrap();
+        let (ws, _resp) = tokio_tungstenite::client_async(req, client_io).await.unwrap();
+        let mut conn: WsConnection<tokio::io::DuplexStream> =
+            WsConnection::from_stream(ws, None, None);
+
+        let written = tokio::time::timeout(Duration::from_secs(10), async {
+            for piece in payload.chunks(chunk) {
+                conn.write_all(piece).await.expect("write");
+            }
+        })
+        .await;
+        assert!(written.is_ok(), "write_all stalled: poll_write never drove flush");
+
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("peer never received the tail: data left in ws write buffer")
+            .expect("server task")
     }
 }
