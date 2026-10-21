@@ -125,7 +125,7 @@ pub fn parse_http_config(data: &[u8]) -> Result<HttpOutboundConfig, String> {
 /// 3. 读响应直到找到空行（`\r\n\r\n`），检查 200 OK
 /// 4. 返回连接（隧道已建立，双向透传）
 ///
-/// 配置 `h2=true` 时整体走 [`establish_h2_tunnel`]（HTTP/2 CONNECT 隧道）。
+/// 配置 `h2=true` 时整体走 `establish_h2_tunnel`（HTTP/2 CONNECT 隧道）。
 ///
 /// # Panics
 ///
