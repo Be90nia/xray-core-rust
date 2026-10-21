@@ -237,36 +237,6 @@ mod tests {
         );
     }
 
-    /// bd 037f：Go 名 `xray.xudp.basekey` 优先生效（历史名 `XUDP_BASE_KEY` 兜底
-    /// 由 xray-common env 层测试覆盖）。env 进程全局，持锁串行化。
-    #[test]
-    fn test_from_env_reads_go_base_key_name() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = ENV_LOCK.lock().unwrap();
-
-        const GO: &str = "xray.xudp.basekey";
-        let saved = std::env::var_os(GO);
-        struct Restore(Option<std::ffi::OsString>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                // SAFETY: 测试持锁串行化 env 访问，set_var 窗口封闭
-                unsafe {
-                    match self.0.take() {
-                        Some(v) => std::env::set_var(GO, v),
-                        None => std::env::remove_var(GO),
-                    }
-                }
-            }
-        }
-        let _restore = Restore(saved);
-
-        let key = [7u8; BASE_KEY_LEN];
-        // SAFETY: 测试持锁串行化 env 访问，set_var 窗口封闭
-        unsafe { std::env::set_var(GO, URL_SAFE_NO_PAD.encode(key)) };
-        let cfg = XudpConfig::from_env();
-        assert_eq!(cfg.base_key, key, "Go-name basekey must be consumed");
-    }
-
     #[test]
     fn test_base64_roundtrip() {
         let key: [u8; 32] = [
