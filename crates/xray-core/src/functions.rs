@@ -16,12 +16,25 @@
 
 use std::sync::Arc;
 
+use prost::Message as _;
 use thiserror::Error;
 use xray_app_dispatcher::{
     DefaultDispatcher, OutboundHandlerManager,
     default::{AccessContext, SimpleOhm, SniffingRequest},
 };
+use xray_app_proxyman::ProxymanError;
 use xray_features::FeatureError;
+use xray_proto::xray::{
+    app::proxyman::command::{
+        AddInboundRequest, AddInboundResponse, AddOutboundRequest, AddOutboundResponse,
+        AddUserOperation as ProtoAddUserOp, AlterInboundRequest, AlterInboundResponse,
+        AlterOutboundRequest, AlterOutboundResponse, GetInboundUserRequest, GetInboundUserResponse,
+        GetInboundUsersCountResponse, ListInboundsRequest, ListInboundsResponse,
+        ListOutboundsRequest, ListOutboundsResponse, RemoveInboundRequest, RemoveInboundResponse,
+        RemoveOutboundRequest, RemoveOutboundResponse, RemoveUserOperation as ProtoRemoveUserOp,
+    },
+    common::serial::TypedMessage,
+};
 use xray_transport::link::Link;
 
 use crate::{
@@ -360,10 +373,20 @@ async fn start_full_dispatched(
     for feat in instance.features() {
         feat.init_dependencies(&bag2);
     }
-    // Commander（api）真注入（bd ze3/bg7）：HandlerService 操作生产 SimpleOhm
-    //（proto config → try_build_handler 复用静态注册构建路径），
-    // LoggerService 接 DefaultLogService（LogInstance::restart）。
+    // Commander（api）真注入（bd ze3/bg7/jezb）：HandlerService 操作生产 SimpleOhm
+    //（proto config → try_build_handler 复用静态注册构建路径），inbound 域接
+    // InboundRuntime，LoggerService 接 DefaultLogService（LogInstance::restart）。
     // 对应 Go Commander.Start 中 RequireFeatures(outbound.Manager, log.Instance)。
+
+    // 先 start features（LogInstance 等 handler 就绪）再起 inbound listener——
+    // 对应 Go：logger 是首个启动的 App，addInboundHandlers 在 instance.Start() 之后。
+    // bd jezb：inbound 运行时（gRPC HandlerService 的 inbound 域后端）——
+    // 配置期启动与 gRPC AddInbound 共用同一实例，故先于 commander 注入构造。
+    let inbound_runtime = Arc::new(crate::inbound::InboundRuntime::new(
+        Arc::clone(&ohm),
+        Some(Arc::clone(&dispatcher)),
+        instance.shutdown_token().clone(),
+    ));
     if let Some(commander) = instance.get_feature::<xray_app_commander::Commander>() {
         commander.set_outbound_runtime(Arc::new(crate::outbound::ApiOutboundRuntime::new(
             Arc::clone(&ohm),
@@ -380,25 +403,227 @@ async fn start_full_dispatched(
                 xray_app_stats::command::DefaultStatsService::new(manager),
             ));
         }
+        // bd jezb：inbound 域 7 op 的真实后端（此前无生产调用方 → inbound 命令族
+        // 恒 UNIMPLEMENTED）。outbound 域同源委托 SimpleOhm。
+        commander.set_handler_service(Arc::new(ApiHandlerService {
+            inbounds: Arc::clone(&inbound_runtime),
+            ohm: Arc::clone(&ohm),
+        }));
     }
 
-    // 先 start features（LogInstance 等 handler 就绪）再起 inbound listener——
-    // 对应 Go：logger 是首个启动的 App，addInboundHandlers 在 instance.Start() 之后。
     instance.start()?;
-    let handles = spawn_inbounds(
-        built,
-        Arc::clone(&ohm),
-        Some(dispatcher),
-        instance.shutdown_token().clone(),
-    )
-    .await
-    .map_err(|e| CoreFunctionError::InstanceStart(e.to_string()))?;
+    let handles = spawn_inbounds(built, &inbound_runtime)
+        .await
+        .map_err(|e| CoreFunctionError::InstanceStart(e.to_string()))?;
     tracing::info!(
         inbounds = handles.len(),
         routed = dns_router.is_some(),
         "Xray instance started via DefaultDispatcher (sniffing+stats+routing+accesslog)"
     );
     Ok((Arc::new(instance), ohm, handles))
+}
+
+// ========== gRPC HandlerService 生产实现（bd jezb）==========
+
+/// inbound 的 receiver_settings type_url（Go `xray.app.proxyman.ReceiverConfig`）。
+const RECEIVER_CONFIG_TYPE_URL: &str = "xray.app.proxyman.ReceiverConfig";
+
+/// gRPC `HandlerService` 的生产实现（对应 Go `app/proxyman/command/handlerServer`
+/// 的 ihm/ohm 双 manager）。
+///
+/// inbound 域接 [`crate::inbound::InboundRuntime`]（真实 listener + 用户表），
+/// outbound 域接 [`SimpleOhm`]（与 bd ze3 `ApiOutboundRuntime` 同一构建路径）。
+struct ApiHandlerService {
+    inbounds: Arc<crate::inbound::InboundRuntime>,
+    ohm: Arc<SimpleOhm>,
+}
+
+impl ApiHandlerService {
+    /// 构建并注册 outbound handler（Go `addOutbound`：CreateObject + ohm.AddHandler）。
+    fn register_outbound(
+        &self,
+        cfg: &xray_proto::xray::core::OutboundHandlerConfig,
+    ) -> Result<(), ProxymanError> {
+        if self.ohm.get_handler(&cfg.tag).is_some() {
+            return Err(ProxymanError::ExistingTag(cfg.tag.clone()));
+        }
+        let ob = crate::outbound::built_outbound_from_proto(cfg)
+            .map_err(|e| ProxymanError::Other(format!("add outbound `{}`: {e:?}", cfg.tag)))?;
+        let handler = crate::outbound::build_single_outbound(&ob)
+            .map_err(|e| ProxymanError::Other(format!("add outbound `{}`: {e:?}", cfg.tag)))?;
+        self.ohm.add(&cfg.tag, handler);
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl xray_app_proxyman::command::HandlerService for ApiHandlerService {
+    async fn add_inbound(
+        &self,
+        req: AddInboundRequest,
+    ) -> Result<AddInboundResponse, ProxymanError> {
+        let cfg = req
+            .inbound
+            .ok_or_else(|| ProxymanError::Other("AddInboundRequest.inbound is required".into()))?;
+        if cfg.tag.is_empty() {
+            return Err(ProxymanError::Other("inbound.tag is required".into()));
+        }
+        let ib = crate::inbound::built_inbound_from_proto(&cfg)?;
+        if self.inbounds.contains(&ib.tag) {
+            return Err(ProxymanError::ExistingTag(ib.tag.clone()));
+        }
+        let started = self
+            .inbounds
+            .start_inbound(&ib)
+            .await
+            .map_err(|e| ProxymanError::ListenSocketFailed(e.to_string()))?;
+        if started.is_none() {
+            // 无监听端口的入站（API 语义下等于什么都没起）——不静默成功。
+            let _ = self.inbounds.remove_inbound(&ib.tag);
+            return Err(ProxymanError::ListenSocketFailed(format!(
+                "inbound `{}` ({}) has no listen port",
+                ib.tag, ib.entry.kind
+            )));
+        }
+        tracing::info!(tag = %ib.tag, protocol = %ib.entry.kind, "commander: inbound added via gRPC");
+        Ok(AddInboundResponse {})
+    }
+
+    async fn remove_inbound(
+        &self,
+        req: RemoveInboundRequest,
+    ) -> Result<RemoveInboundResponse, ProxymanError> {
+        self.inbounds.remove_inbound(&req.tag)?;
+        tracing::info!(tag = %req.tag, "commander: inbound removed via gRPC");
+        Ok(RemoveInboundResponse {})
+    }
+
+    async fn alter_inbound(
+        &self,
+        req: AlterInboundRequest,
+    ) -> Result<AlterInboundResponse, ProxymanError> {
+        let op = req.operation.as_ref().ok_or(ProxymanError::UnknownOperation)?;
+        match op.r#type.as_str() {
+            "xray.app.proxyman.command.AddUserOperation" => {
+                let add = ProtoAddUserOp::decode(op.value.as_slice())
+                    .map_err(|e| ProxymanError::UserParse(format!("AddUserOperation: {e}")))?;
+                let user = add.user.ok_or_else(|| {
+                    ProxymanError::UserParse("AddUserOperation requires user".into())
+                })?;
+                self.inbounds.user_manager(&req.tag)?.add_user(&user)?;
+            },
+            "xray.app.proxyman.command.RemoveUserOperation" => {
+                let rm = ProtoRemoveUserOp::decode(op.value.as_slice())
+                    .map_err(|e| ProxymanError::UserParse(format!("RemoveUserOperation: {e}")))?;
+                self.inbounds.user_manager(&req.tag)?.remove_user(&rm.email)?;
+            },
+            other => {
+                return Err(ProxymanError::Other(format!(
+                    "unsupported inbound operation type: {other}"
+                )));
+            },
+        }
+        tracing::info!(tag = %req.tag, op = %op.r#type, "commander: inbound altered via gRPC");
+        Ok(AlterInboundResponse {})
+    }
+
+    async fn list_inbounds(
+        &self,
+        req: ListInboundsRequest,
+    ) -> Result<ListInboundsResponse, ProxymanError> {
+        let mut resp = ListInboundsResponse::default();
+        for (tag, proxy_type_url) in self.inbounds.list() {
+            let mut cfg =
+                xray_proto::xray::core::InboundHandlerConfig { tag, ..Default::default() };
+            if !req.is_only_tags {
+                // 完整 config 需要原始 settings 载荷（Go 存 TypedMessage 原字节）；
+                // 运行时只留 type_url，value 留空（与 bd ze3 outbound 列表同口径）。
+                cfg.receiver_settings = Some(TypedMessage {
+                    r#type: RECEIVER_CONFIG_TYPE_URL.into(),
+                    value: Vec::new(),
+                });
+                cfg.proxy_settings =
+                    Some(TypedMessage { r#type: proxy_type_url, value: Vec::new() });
+            }
+            resp.inbounds.push(cfg);
+        }
+        Ok(resp)
+    }
+
+    async fn get_inbound_users(
+        &self,
+        req: GetInboundUserRequest,
+    ) -> Result<GetInboundUserResponse, ProxymanError> {
+        let um = self.inbounds.user_manager(&req.tag)?;
+        let mut resp = GetInboundUserResponse::default();
+        if req.email.is_empty() {
+            resp.users = um.list_users();
+        } else if let Some(user) = um.get_user(&req.email) {
+            resp.users.push(user);
+        }
+        Ok(resp)
+    }
+
+    async fn get_inbound_users_count(
+        &self,
+        req: GetInboundUserRequest,
+    ) -> Result<GetInboundUsersCountResponse, ProxymanError> {
+        let um = self.inbounds.user_manager(&req.tag)?;
+        Ok(GetInboundUsersCountResponse {
+            count: i64::try_from(um.list_users().len()).unwrap_or(i64::MAX),
+        })
+    }
+
+    async fn add_outbound(
+        &self,
+        req: AddOutboundRequest,
+    ) -> Result<AddOutboundResponse, ProxymanError> {
+        let cfg = req.outbound.ok_or_else(|| {
+            ProxymanError::Other("AddOutboundRequest.outbound is required".into())
+        })?;
+        if cfg.tag.is_empty() {
+            return Err(ProxymanError::Other("outbound.tag is required".into()));
+        }
+        self.register_outbound(&cfg)?;
+        tracing::info!(tag = %cfg.tag, "commander: outbound added via gRPC");
+        Ok(AddOutboundResponse {})
+    }
+
+    async fn remove_outbound(
+        &self,
+        req: RemoveOutboundRequest,
+    ) -> Result<RemoveOutboundResponse, ProxymanError> {
+        if self.ohm.remove(&req.tag) {
+            Ok(RemoveOutboundResponse {})
+        } else {
+            Err(ProxymanError::HandlerNotFound(req.tag))
+        }
+    }
+
+    async fn alter_outbound(
+        &self,
+        req: AlterOutboundRequest,
+    ) -> Result<AlterOutboundResponse, ProxymanError> {
+        // Go 侧 outbound 用户面（AddUser/RemoveUser）依赖各出站自身实现
+        // proxy.UserManager；Rust 出站无此面，明确拒绝而不是静默成功。
+        Err(ProxymanError::Other(format!(
+            "alter_outbound `{}`: outbound user management is not supported",
+            req.tag
+        )))
+    }
+
+    async fn list_outbounds(
+        &self,
+        _req: ListOutboundsRequest,
+    ) -> Result<ListOutboundsResponse, ProxymanError> {
+        let outbounds = self
+            .ohm
+            .list_tags()
+            .into_iter()
+            .map(|tag| xray_proto::xray::core::OutboundHandlerConfig { tag, ..Default::default() })
+            .collect();
+        Ok(ListOutboundsResponse { outbounds })
+    }
 }
 
 // ========== DNS 查询拨号桥（bd mcpo）==========

@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use xray_app_dispatcher::{
     DispatchHandler, OutboundHandlerManager, UdpDispatchSession, default::SimpleOhm,
 };
+use xray_app_proxyman::ProxymanError;
 use xray_buf::io::{Reader, Writer, new_reader, new_readv_reader, new_writer};
 use xray_common::{
     net::{address::Address, destination::Destination, network::Network, port::Port},
@@ -26,6 +27,9 @@ use xray_common::{
 };
 use xray_conf::{BuiltConfig, BuiltInbound};
 use xray_features::inbound::InboundHandler;
+use xray_proto::xray::{
+    common::protocol::User as ProtoUser, core::InboundHandlerConfig as ProtoInboundConfig,
+};
 // zx7: mux inbound 检测
 use xray_mux::client::{MUX_COOL_ADDRESS, MUX_COOL_PORT};
 use xray_proto::xray::proxy::vless::Account as VlessProtoAccount;
@@ -536,7 +540,7 @@ async fn serve_mixed(
                 // bd 2b1c：access 带 from（process/source 规则 + access log 来源）
                 let access = http_inbound_access(&stream, peer);
                 if hs.method != "CONNECT" {
-                    handle_plain_http(stream, hs, Arc::clone(&handler), access).await;
+                    handle_plain_http(&mut stream, &hs, Arc::clone(&handler), access).await;
                 } else {
                     let dest = hs.dest;
                     // plain TCP：readv 多缓冲聚合读（bd 2o9l，Go NewReader readv 分支）
@@ -558,7 +562,9 @@ async fn serve_mixed(
 /// HTTP proxy inbound 服务入口。
 ///
 /// 接受连接 → http_server_handshake → CONNECT 隧道 dispatch 或 plain HTTP 代理转发。
-/// `handshake_timeout` 对应 Go `proxy/http/server.go:112`
+/// plain HTTP 按响应可定界性与客户端 close 语义回循环读下一请求（keep-alive
+/// 复用，Go `Start` 循环）；CONNECT 隧道仍一次即终结。`handshake_timeout` 对应
+/// Go `proxy/http/server.go:112`
 /// `conn.SetReadDeadline(policy().Timeouts.Handshake)`（policy 来自
 /// `ForLevel(UserLevel)`，见 spawn_one_inbound http 分支）；None 时不限时。
 pub async fn serve_http(
@@ -583,45 +589,59 @@ pub async fn serve_http(
         let handler = Arc::clone(&handler);
         let config = Arc::clone(&config);
         tokio::spawn(async move {
-            // 1. handshake（按 userLevel 对应 policy 的 handshake 超时限制，
-            // 超时即断开——对应 Go SetReadDeadline 到期后 ReadRequest 超时错误）
-            let handshake_fut = http_server_handshake(&mut stream, &config);
-            let hs = match handshake_timeout {
-                Some(d) => match tokio::time::timeout(d, handshake_fut).await {
-                    Ok(r) => r,
-                    Err(_) => {
-                        tracing::debug!("http handshake timeout, closing connection");
+            // Go Process 的 Start 循环：keep-alive 连接逐请求回环读请求头。
+            loop {
+                // 1. handshake（按 userLevel 对应 policy 的 handshake 超时限制，
+                // 超时即断开——对应 Go SetReadDeadline 到期后 ReadRequest 超时错误；
+                // Go 每轮回到 Start 重设 deadline，这里每轮请求头读取都限时）
+                let handshake_fut = http_server_handshake(&mut stream, &config);
+                let hs = match handshake_timeout {
+                    Some(d) => match tokio::time::timeout(d, handshake_fut).await {
+                        Ok(r) => r,
+                        Err(_) => {
+                            tracing::debug!("http handshake timeout, closing connection");
+                            return;
+                        },
+                    },
+                    None => handshake_fut.await,
+                };
+                let hs = match hs {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "http handshake failed");
                         return;
                     },
-                },
-                None => handshake_fut.await,
-            };
-            let hs = match hs {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::debug!(error = %e, "http handshake failed");
+                };
+                // 2. Plain HTTP proxy（GET/POST 等）
+                // bd 2b1c：access 必须带 from（process/source 规则 + access log 来源）
+                let access = http_inbound_access(&stream, peer);
+                if hs.method != "CONNECT" {
+                    // ft58 S1 keep-alive：成功转发后不关连接，按响应可定界性与客户端
+                    // close 语义回循环读下一请求（Go server.go Start + errWaitAnother；
+                    // 连接语义为 HTTP/1.1 默认 keep-alive，客户端 close token 收尾关闭）。
+                    // 本改动将由 xray-frame HTTP 插件化继承，届时按插件形态调整。
+                    match handle_plain_http(&mut stream, &hs, Arc::clone(&handler), access).await {
+                        PlainOutcome::NextRequest => continue,
+                        PlainOutcome::Close => return,
+                    }
+                }
+                // 3. CONNECT：拆 stream → Link → dispatch（隧道内不再是 HTTP 请求
+                // 边界，隧道结束即关连接，不回循环——对齐 Go handleConnect return）
+                let dest = hs.dest;
+                // plain TCP：readv 多缓冲聚合读（bd 2o9l，Go NewReader readv 分支）
+                let (read_half, write_half) = stream.into_split();
+                let link = Link::new(new_readv_reader(read_half), new_writer(write_half));
+                // zx7: mux.cool dest 转给 mux ServerWorker（stub）
+                if is_mux_destination(&dest) {
+                    tracing::info!(
+                        "http: mux.cool destination detected, spawning mux inbound handler"
+                    );
+                    tokio::spawn(handle_mux_inbound_link(link, handler, None));
                     return;
-                },
-            };
-            // 2. Plain HTTP proxy（GET/POST 等）
-            // bd 2b1c：access 必须带 from（process/source 规则 + access log 来源）
-            let access = http_inbound_access(&stream, peer);
-            if hs.method != "CONNECT" {
-                handle_plain_http(stream, hs, Arc::clone(&handler), access).await;
+                }
+                let _ = handler.dispatch_with_access(&dest, link, access).await;
                 return;
             }
-            // 3. CONNECT：拆 stream → Link → dispatch
-            let dest = hs.dest;
-            // plain TCP：readv 多缓冲聚合读（bd 2o9l，Go NewReader readv 分支）
-            let (read_half, write_half) = stream.into_split();
-            let link = Link::new(new_readv_reader(read_half), new_writer(write_half));
-            // zx7: mux.cool dest 转给 mux ServerWorker（stub）
-            if is_mux_destination(&dest) {
-                tracing::info!("http: mux.cool destination detected, spawning mux inbound handler");
-                tokio::spawn(handle_mux_inbound_link(link, handler, None));
-                return;
-            }
-            let _ = handler.dispatch_with_access(&dest, link, access).await;
         });
     }
 }
@@ -644,107 +664,446 @@ fn http_inbound_access(
     }
 }
 
-/// 处理 plain HTTP 代理请求（GET/POST 等）。
+/// plain HTTP keep-alive 连接处置（对应 Go `handlePlainHTTP` 返回值语义）。
+enum PlainOutcome {
+    /// 响应已完整回写且可定界、客户端未要求关闭 → 回循环读下一请求
+    /// （Go `errWaitAnother` + `goto Start`）。
+    NextRequest,
+    /// 断链退出（协议错误/客户端断开/响应不可定界/close token）。
+    Close,
+}
+
+/// 请求体形态（下一请求字节不得被吞——吞多吞少都流水线错位）。
+enum RequestBodyPlan {
+    None,
+    Length(u64),
+    Chunked,
+}
+
+/// 判定请求体形态：chunked 声明优先于 Content-Length（对齐 Go ReadRequest）；
+/// CL 非法 → Err（对齐 Go ReadRequest 失败：不回包断链）。
+fn request_body_plan(headers: &HashMap<String, Vec<String>>) -> Result<RequestBodyPlan, ()> {
+    let chunked = headers
+        .get("transfer-encoding")
+        .is_some_and(|vals| vals.iter().any(|v| v.to_ascii_lowercase().contains("chunked")));
+    if chunked {
+        return Ok(RequestBodyPlan::Chunked);
+    }
+    match headers.get("content-length").and_then(|vals| vals.first()) {
+        None => Ok(RequestBodyPlan::None),
+        Some(v) => v.trim().parse::<u64>().map(RequestBodyPlan::Length).map_err(|_| ()),
+    }
+}
+
+/// 客户端是否宣告关闭：Connection / Proxy-Connection 任一含 `close` token
+/// （RFC 7230 §6.6 connection-token，逗号分隔）。已宣告 close 就必须收尾关闭，
+/// 即便响应本身可定界。
+fn wants_close(headers: &HashMap<String, Vec<String>>) -> bool {
+    ["connection", "proxy-connection"].iter().any(|key| {
+        headers.get(*key).is_some_and(|vals| {
+            vals.iter().any(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("close")))
+        })
+    })
+}
+
+/// plain HTTP 读上游响应失败/响应头非法的 503（对齐 Go handlePlainHTTP 503 分支：
+/// Close=true + 双 close 头 + Content-Length 0；字节与 xray-proxy-http server.rs
+/// 同名常量一致）。
+const RESPONSE_SERVICE_UNAVAILABLE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\n\
+    Connection: close\r\n\
+    Proxy-Connection: close\r\n\
+    Content-Length: 0\r\n\r\n";
+
+/// 上游响应头解析结果。
+struct ResponseHead {
+    /// 原始状态行（回写时原样保留）。
+    status_line: String,
+    code: u16,
+    /// headers（key 全小写，同名多值保留）。
+    headers: HashMap<String, Vec<String>>,
+    /// 头块之后已到达的 body 前缀（pipe 按块到达，头后多余字节不可丢弃）。
+    leftover: Vec<u8>,
+}
+
+const MAX_RESPONSE_HEAD_BYTES: usize = 64 * 1024;
+
+/// 处理 plain HTTP 代理请求（GET/POST 等），keep-alive 语义。
 ///
-/// 对应 Go `proxy/http/server.go::handlePlainHTTP`。通过 dispatch 拨号到目标，
-/// 并发转发请求（head + body → 目标）和响应（目标 → 客户端）。
+/// 对应 Go `proxy/http/server.go::handlePlainHTTP`。每请求经 dispatch 拨一条新
+/// 上游链路（Go `Dispatch` per request），转发头强制 `connection: close`（上游
+/// 响应完即关）。请求体按 Content-Length / chunked 边界精确转发（多余字节属
+/// 下一请求）；响应按可定界性回写连接语义头：Content-Length 定界或无 body
+/// （HEAD/204/304）→ 可续连（Go `response.ContentLength >= 0` 分支）；chunked /
+/// close 定界 → close 头断链（Go `response.Close = true`）。返回是否回循环。
 async fn handle_plain_http(
-    client: TcpStream,
-    hs: HandshakeResult,
+    client: &mut TcpStream,
+    hs: &HandshakeResult,
     handler: Arc<dyn DispatchHandler>,
     access: xray_app_dispatcher::AccessContext,
-) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use xray_buf::{
-        io::{Reader as BufReader, Writer as BufWriter},
-        multi::MultiBuffer,
-    };
+) -> PlainOutcome {
+    use xray_buf::io::{Reader as BufReader, Writer as BufWriter};
 
-    // 1. 构建转发请求（绝对 URL → 相对 path，移除 hop-by-hop headers）
+    // 1. 转发请求构建（绝对 URL → 相对 path，移除 hop-by-hop headers，强制 close）
+    let body_plan = match request_body_plan(&hs.headers) {
+        Ok(plan) => plan,
+        Err(()) => {
+            tracing::debug!("http: malformed Content-Length, closing connection");
+            return PlainOutcome::Close;
+        },
+    };
     let path = extract_request_path(&hs.target);
     let request_head = build_forwarded_request(&hs.method, &path, &hs.headers);
 
-    // 2. 创建 pipe 对，构造 dispatch link
-    let (up_r, up_w) = xray_buf::pipe::new();
-    let (dn_r, dn_w) = xray_buf::pipe::new();
+    // 2. 创建 pipe 对，dispatch：生产 DefaultDispatcher::dispatch_link 内部 spawn
+    //    后台任务后立即返回（link 由后台持有）；no-handler/后台 dial 失败表现为
+    //    下行零字节结束 → 下方统一回 503 兜底。
+    let (up_r, mut up_w) = xray_buf::pipe::new();
+    let (mut dn_r, dn_w) = xray_buf::pipe::new();
     let link =
         Link::new(Box::new(up_r) as Box<dyn BufReader>, Box::new(dn_w) as Box<dyn BufWriter>);
-
-    // 3. dispatch：把 link 交给出站。生产 DefaultDispatcher::dispatch_link 内部 spawn
-    //    后台任务后立即返回（link 由后台持有），不能把这里的返回当作桥接结束去
-    //    关闭 dn_w——否则响应还没写下行就被掐断。
-    //    dispatch 无错误返回（PinFuture<()>）：no-handler/后台 dial 失败都表现为
-    //    link 被中断 → 下行零字节结束 → 下方 responded 判据统一回 503 兜底。
     let dest = hs.dest.clone();
     handler.dispatch_with_access(&dest, link, access).await;
 
-    // 4. 拆 client stream：read(body) + write(response) 并发
-    let (mut client_read, mut client_write) = tokio::io::split(client);
-    let mut up_w = up_w;
-    let mut dn_r = dn_r;
-    // write_task 被 abort 时不会执行自身的 up_w.shutdown()，留句柄保证上行 pipe 关闭。
-    let up_w_ctl = up_w.clone();
+    let (mut client_read, mut client_write) = client.split();
 
-    // 上行：写 request head + copy body → 目标
-    let write_task = tokio::spawn(async move {
-        let mut mb = MultiBuffer::new();
-        mb.merge_bytes(&request_head);
-        let _ = up_w.write_multi_buffer(mb).await;
-        let mut buf = xray_buf::alloc::alloc(xray_buf::alloc::DEFAULT_SIZE);
-        buf.resize(xray_buf::alloc::DEFAULT_SIZE, 0);
-        loop {
-            match client_read.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let mut mb = MultiBuffer::new();
-                    mb.merge_bytes(&buf[..n]);
-                    if up_w.write_multi_buffer(mb).await.is_err() {
-                        break;
-                    }
-                },
-            }
-        }
-        xray_buf::alloc::release(buf);
-        up_w.shutdown(); // EOF → dispatch bridge 关闭目标写半部
-    });
+    // 3. requestDone：头 + 请求体边界精确转发
+    let req_ok =
+        forward_request_phase(&mut client_read, &mut up_w, &request_head, body_plan).await.is_ok();
+    // 上游写向收尾（错误路径也关——pipe Writer 裸 drop 不传播 EOF 到 dispatch 桥）；
+    // EOF → dispatch 桥关闭目标写半部，上游按 connection: close 响应完即关。
+    up_w.shutdown();
+    if !req_ok {
+        return PlainOutcome::Close;
+    }
 
-    // 下行：读响应 → 客户端（data 为循环级 scratch，消每轮 to_vec 分配）
-    let read_resp = async {
-        let mut data = Vec::new();
-        // 写出过任何响应字节后不能再回 503（HTTP 单响应）；零字节即结束 =
-        // 后台 dial 失败/目标无响应 → 503 兜底（Go responseDone err 分支语义）
-        let mut responded = false;
-        #[allow(clippy::while_let_loop)] // 存量清零批次
-        loop {
-            match dn_r.read_multi_buffer().await {
-                Ok(mb) => {
-                    if mb.is_empty() {
-                        break;
-                    }
-                    data.clear();
-                    for b in mb.iter() {
-                        data.extend_from_slice(b.bytes());
-                    }
-                    if client_write.write_all(&data).await.is_err() {
-                        break;
-                    }
-                    responded = true;
-                },
-                Err(_) => break,
-            }
-        }
-        if !responded {
-            let _ = client_write
-                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n")
-                .await;
-        }
+    // 4. responseDone
+    relay_response_phase(&mut dn_r, &mut client_write, hs).await
+}
+
+/// 上行阶段：转发请求头 + 请求体（CL 定长 / chunked 逐帧，到边界即止）。
+/// 客户端中途断开/帧错位 → Err。
+async fn forward_request_phase(
+    client_read: &mut tokio::net::tcp::ReadHalf<'_>,
+    up_w: &mut xray_buf::pipe::Writer,
+    request_head: &[u8],
+    body_plan: RequestBodyPlan,
+) -> std::io::Result<()> {
+    pipe_write_all(up_w, request_head).await?;
+    match body_plan {
+        RequestBodyPlan::None => {},
+        RequestBodyPlan::Length(n) => relay_exact_request_body(client_read, up_w, n).await?,
+        RequestBodyPlan::Chunked => relay_chunked_request_body(client_read, up_w).await?,
+    }
+    Ok(())
+}
+
+/// 下行阶段：读响应头（1xx 透传）→ 按可定界性与客户端 close 语义回写头 +
+/// 精确透传 body。零字节断流/读失败 → 503 兜底（Go responseDone err 分支）。
+async fn relay_response_phase(
+    dn_r: &mut xray_buf::pipe::Reader,
+    client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+    hs: &HandshakeResult,
+) -> PlainOutcome {
+    use tokio::io::AsyncWriteExt;
+    let Some(head) = read_response_head(dn_r, client_write).await else {
+        let _ = client_write.write_all(RESPONSE_SERVICE_UNAVAILABLE).await;
+        return PlainOutcome::Close;
     };
 
-    // 只等下行：HTTP/1.1 GET 无 body 时 client_read 永不 EOF，等上行会挂死连接。
-    // 下行结束（目标 connection: close 关闭）即收尾，上行任务 abort + 关闭上行 pipe。
-    read_resp.await;
-    write_task.abort();
-    up_w_ctl.shutdown();
+    // 可定界 = CL 合法声明（含 leftover 不超长——上游超额多发即协议违规不可续）
+    // 或无 body（HEAD/204/304）；chunked / close 定界不可续
+    let cl_ok = match parse_response_content_length(&head.headers) {
+        Ok(Some(n)) => head.leftover.len() as u64 <= n,
+        ok_or_err => ok_or_err.is_ok(),
+    };
+    let bodyless = hs.method == "HEAD" || head.code == 204 || head.code == 304;
+    let reusable = !response_is_chunked(&head.headers)
+        && cl_ok
+        && (bodyless || matches!(parse_response_content_length(&head.headers), Ok(Some(_))));
+    let keep_alive = reusable && !wants_close(&hs.headers);
+    if client_write.write_all(&serialize_response_head(&head, keep_alive)).await.is_err() {
+        return PlainOutcome::Close;
+    }
+
+    let body_ok = if bodyless {
+        true
+    } else if let (true, Ok(Some(n))) = (keep_alive, parse_response_content_length(&head.headers)) {
+        copy_exact_n_from_pipe(dn_r, client_write, n, head.leftover).await.is_ok()
+    } else {
+        // chunked / close 定界：转发头已带 connection: close，上游回完即关，
+        // 透传到断流为止（chunked 帧原样到达，客户端按 transfer-encoding 解析）
+        copy_until_eof_from_pipe(dn_r, client_write, head.leftover).await.is_ok()
+    };
+    if body_ok && keep_alive { PlainOutcome::NextRequest } else { PlainOutcome::Close }
+}
+
+/// 从客户端定长转发 n 字节请求体到上游 pipe。提前 EOF → Err（静默截断不可接受）。
+async fn relay_exact_request_body(
+    client_read: &mut tokio::net::tcp::ReadHalf<'_>,
+    up_w: &mut xray_buf::pipe::Writer,
+    mut remaining: u64,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 8192];
+    while remaining > 0 {
+        let want = buf.len().min(remaining as usize);
+        let read = client_read.read(&mut buf[..want]).await?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "client closed mid request body",
+            ));
+        }
+        pipe_write_all(up_w, &buf[..read]).await?;
+        remaining -= read as u64;
+    }
+    Ok(())
+}
+
+/// chunked 请求体逐帧转发（帧字节原样透传，不解码重编码——转发头保留
+/// transfer-encoding，与 Go ReadRequest 解码 + request.Write 重编码线路上等价）。
+/// 到终止块为止，不多读一字节：多余字节属流水线上的下一请求。
+async fn relay_chunked_request_body(
+    client_read: &mut tokio::net::tcp::ReadHalf<'_>,
+    up_w: &mut xray_buf::pipe::Writer,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncReadExt;
+    loop {
+        let size_line = read_client_line(client_read).await?;
+        let size = u64::from_str_radix(size_line.split(';').next().unwrap_or_default().trim(), 16)
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed chunk size")
+            })?;
+        pipe_write_all(up_w, size_line.as_bytes()).await?;
+        pipe_write_all(up_w, b"\r\n").await?;
+        if size == 0 {
+            // trailer 段透传到空行
+            loop {
+                let line = read_client_line(client_read).await?;
+                pipe_write_all(up_w, line.as_bytes()).await?;
+                pipe_write_all(up_w, b"\r\n").await?;
+                if line.is_empty() {
+                    return Ok(());
+                }
+            }
+        }
+        relay_exact_request_body(client_read, up_w, size).await?;
+        let mut crlf = [0u8; 2];
+        client_read.read_exact(&mut crlf).await?;
+        pipe_write_all(up_w, &crlf).await?;
+    }
+}
+
+/// 读一行（到 CRLF，不含 CRLF）。请求体阶段 EOF 一律错误（半途断开 = 协议失败）。
+async fn read_client_line(
+    client_read: &mut tokio::net::tcp::ReadHalf<'_>,
+) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt;
+    const MAX_LINE_BYTES: usize = 16 * 1024;
+    let mut buf: Vec<u8> = Vec::with_capacity(64);
+    let mut byte = [0u8; 1];
+    loop {
+        if client_read.read(&mut byte).await? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "client closed mid request body",
+            ));
+        }
+        if byte[0] == b'\n' {
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+            return Ok(String::from_utf8_lossy(&buf).into_owned());
+        }
+        if buf.len() >= MAX_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "chunk size line too long",
+            ));
+        }
+        buf.push(byte[0]);
+    }
+}
+
+/// pipe 写入小片段（头行/CRLF 等）。
+async fn pipe_write_all(up_w: &mut xray_buf::pipe::Writer, data: &[u8]) -> std::io::Result<()> {
+    let mut mb = xray_buf::multi::MultiBuffer::new();
+    mb.merge_bytes(data);
+    up_w.write_multi_buffer(mb)
+        .await
+        .map_err(|_| std::io::Error::other("upstream pipe write failed"))
+}
+
+/// 解析头块（不含结尾空行）为 (状态行, 状态码, headers)。状态行非法 → None。
+fn parse_head_block(block: &[u8]) -> Option<(String, u16, HashMap<String, Vec<String>>)> {
+    let text = String::from_utf8_lossy(block);
+    let mut lines = text.split("\r\n");
+    let status_line = lines.next()?.to_string();
+    let code = status_line.split_whitespace().nth(1)?.parse::<u16>().ok()?;
+    let mut headers: HashMap<String, Vec<String>> = HashMap::new();
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            headers.entry(k.trim().to_ascii_lowercase()).or_default().push(v.trim().to_string());
+        }
+    }
+    Some((status_line, code, headers))
+}
+
+/// 从下行 pipe 读响应头（字节精确，头后多余字节随 leftover 返回）。
+/// 1xx 中间响应头块原样透传给客户端后继续读最终响应（对齐 Go
+/// `readResponseAndHandle100Continue`）。零字节断流/头块超限/中途断流/状态行
+/// 非法 → None（调用方 503 兜底）。
+async fn read_response_head(
+    dn_r: &mut xray_buf::pipe::Reader,
+    client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+) -> Option<ResponseHead> {
+    use tokio::io::AsyncWriteExt;
+    let mut acc: Vec<u8> = Vec::with_capacity(1024);
+    loop {
+        if let Some(head_end) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+            let (status_line, code, headers) = parse_head_block(&acc[..head_end])?;
+            if (100..200).contains(&code) {
+                // 1xx：原样透传头块，继续读最终响应
+                client_write.write_all(&acc[..head_end + 4]).await.ok()?;
+                acc.drain(..head_end + 4);
+                continue;
+            }
+            let leftover = acc[head_end + 4..].to_vec();
+            return Some(ResponseHead { status_line, code, headers, leftover });
+        }
+        if acc.len() > MAX_RESPONSE_HEAD_BYTES {
+            return None;
+        }
+        match dn_r.read_multi_buffer().await {
+            Ok(mb) if !mb.is_empty() => {
+                for b in mb.iter() {
+                    acc.extend_from_slice(b.bytes());
+                }
+            },
+            _ => return None, // 零字节断流 / pipe 中断
+        }
+    }
+}
+
+/// 响应 Content-Length（首个值）。缺失 → Ok(None)；非法值 → Err（上游协议错 →
+/// 503 路径；静默当 0 会截断 body）。
+fn parse_response_content_length(
+    headers: &HashMap<String, Vec<String>>,
+) -> Result<Option<u64>, ()> {
+    match headers.get("content-length").and_then(|vals| vals.first()) {
+        None => Ok(None),
+        Some(v) => v.trim().parse::<u64>().map(Some).map_err(|_| ()),
+    }
+}
+
+/// 响应头是否声明 chunked 传输编码。
+fn response_is_chunked(headers: &HashMap<String, Vec<String>>) -> bool {
+    headers
+        .get("transfer-encoding")
+        .is_some_and(|vals| vals.iter().any(|v| v.to_ascii_lowercase().contains("chunked")))
+}
+
+/// 回写响应头序列化：hop-by-hop 头移除后按 keep_alive 改写连接语义头
+/// （对齐 Go `RemoveHopByHopHeaders` + `response.Header.Set` 三头/`response.Close`；
+/// 字节格式与 xray-proxy-http server.rs `serialize_response_head` 同款）。
+fn serialize_response_head(head: &ResponseHead, keep_alive: bool) -> Vec<u8> {
+    const HOP_BY_HOP: &[&str] = &[
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailers",
+        "upgrade",
+    ];
+    let mut buf = Vec::with_capacity(256);
+    buf.extend_from_slice(head.status_line.as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    for (key, values) in &head.headers {
+        if HOP_BY_HOP.contains(&key.as_str()) {
+            continue;
+        }
+        for value in values {
+            buf.extend_from_slice(key.as_bytes());
+            buf.extend_from_slice(b": ");
+            buf.extend_from_slice(value.as_bytes());
+            buf.extend_from_slice(b"\r\n");
+        }
+    }
+    if keep_alive {
+        buf.extend_from_slice(
+            b"proxy-connection: keep-alive\r\n\
+              connection: keep-alive\r\n\
+              keep-alive: timeout=60\r\n\r\n",
+        );
+    } else {
+        buf.extend_from_slice(b"connection: close\r\nproxy-connection: close\r\n\r\n");
+    }
+    buf
+}
+
+/// 定长透传响应 body：先写头块捎带的 leftover 前缀，再从 pipe 读满剩余。
+/// 上游提前断流 → Err（静默截断不可接受）。
+async fn copy_exact_n_from_pipe(
+    dn_r: &mut xray_buf::pipe::Reader,
+    client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+    n: u64,
+    leftover: Vec<u8>,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut remaining = n;
+    let take = leftover.len().min(remaining as usize);
+    client_write.write_all(&leftover[..take]).await?;
+    remaining -= take as u64;
+    while remaining > 0 {
+        match dn_r.read_multi_buffer().await {
+            Ok(mb) if !mb.is_empty() => {
+                for b in mb.iter() {
+                    let bytes = b.bytes();
+                    let take = bytes.len().min(remaining as usize);
+                    client_write.write_all(&bytes[..take]).await?;
+                    remaining -= take as u64;
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+            },
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "upstream closed mid response body",
+                ));
+            },
+        }
+    }
+    Ok(())
+}
+
+/// close/chunked 定界响应透传：leftover 前缀 + 读到断流为止
+/// （转发头已带 connection: close，上游回完即关，EOF 即响应终点）。
+async fn copy_until_eof_from_pipe(
+    dn_r: &mut xray_buf::pipe::Reader,
+    client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+    leftover: Vec<u8>,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    if !leftover.is_empty() {
+        client_write.write_all(&leftover).await?;
+    }
+    while let Ok(mb) = dn_r.read_multi_buffer().await {
+        if mb.is_empty() {
+            break;
+        }
+        let mut data = Vec::new();
+        for b in mb.iter() {
+            data.extend_from_slice(b.bytes());
+        }
+        if client_write.write_all(&data).await.is_err() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Dokodemo TCP inbound per-connection 目标解析选项。
@@ -2037,51 +2396,22 @@ fn sockaddr_storage_to_addr(ss: &libc::sockaddr_storage) -> Option<std::net::Soc
     }
 }
 
-/// 遍历 BuiltConfig 的 inbounds，按协议 spawn listener tasks。
+/// 遍历 BuiltConfig 的 inbounds，经 [`InboundRuntime`] spawn listener tasks。
 ///
-/// 返回每个 inbound 的 JoinHandle（用于优雅关闭）。不支持的协议 warn 跳过。
-///
-/// # 当前支持
-///
-/// - `socks`：SOCKS5 inbound（TCP accept → handshake → dispatch）
-/// - 其他协议（vless/trojan/vmess/http）：warn 跳过（待后续切片）
+/// 返回每个 inbound 的 JoinHandle（用于优雅关闭）。启动失败的入站带 tag 上抛
+/// （对齐 Go：入站创建失败 → core 启动失败退出）。
 pub async fn spawn_inbounds(
     built: &BuiltConfig,
-    ohm: Arc<SimpleOhm>,
-    dispatcher: Option<Arc<xray_app_dispatcher::DefaultDispatcher>>,
-    shutdown_token: CancellationToken,
+    runtime: &Arc<InboundRuntime>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let mut handles = Vec::new();
     for ib in &built.inbounds {
-        // 方案 B：生产链经 DefaultDispatcher（sniffing + stats + routing）。
-        // 每个 inbound 一份 ohm 快照，default 替换为携带该 inbound sniffing 配置
-        // 与 tag 的 wrapper；master ohm 的 default 保持真实出站（避免递归）。
-        // wrapper 外再包 MuxCarrierHandler（Go always.go:89 mux.NewServer 装饰器）：
-        // v1.mux.cool carrier 由 mux ServerWorker 接管，子会话回 wrapper。
-        let per_ohm = dispatcher
-            .as_ref()
-            .map(|d| {
-                let snap = Arc::new(ohm.snapshot());
-                let sniff = crate::wiring::sniffing_request_from_json(ib.sniffing_json.as_ref());
-                let inbound_handler: Arc<dyn xray_app_dispatcher::DispatchHandler> = Arc::new(
-                    crate::wiring::InboundDispatchHandler::new(Arc::clone(d), sniff, &ib.tag),
-                );
-                snap.set_default(Arc::new(crate::wiring::MuxCarrierHandler::new(inbound_handler)));
-                snap
-            })
-            .unwrap_or_else(|| Arc::clone(&ohm));
-        // policy manager（dispatcher 装配时注入，见 start_full_dispatched）：
-        // 供 http inbound 按 userLevel 查 handshake 超时等 per-level 策略。
-        let policy = dispatcher.as_ref().and_then(|d| d.policy_manager.clone());
         // bd 0z7u：绑定失败带 tag 上下文 ERROR 日志后 fatal（对齐 Go xray
         // 入站创建失败 → core 启动失败退出；裸 io::Error 无 tag 无法定位）。
-        if let Some(handle) = spawn_one_inbound(ib, per_ohm, policy, shutdown_token.clone())
-            .await
-            .map_err(|e| {
-                tracing::error!(tag = %ib.tag, protocol = %ib.entry.kind, error = %e, "inbound bind failed, aborting startup");
-                std::io::Error::other(format!("inbound `{}` ({}) start failed: {e}", ib.tag, ib.entry.kind))
-            })?
-        {
+        if let Some(handle) = runtime.start_inbound(ib).await.map_err(|e| {
+            tracing::error!(tag = %ib.tag, protocol = %ib.entry.kind, error = %e, "inbound bind failed, aborting startup");
+            std::io::Error::other(format!("inbound `{}` ({}) start failed: {e}", ib.tag, ib.entry.kind))
+        })? {
             handles.push(handle);
         }
     }
@@ -2092,6 +2422,271 @@ pub async fn spawn_inbounds(
         "inbound bind summary"
     );
     Ok(handles)
+}
+
+/// 单入站的 ohm 视图（方案 B）。
+///
+/// 生产链经 DefaultDispatcher（sniffing + stats + routing）：每个 inbound 一份 ohm
+/// 快照，default 替换为携带该 inbound sniffing 配置与 tag 的 wrapper；master ohm 的
+/// default 保持真实出站（避免递归）。wrapper 外再包 MuxCarrierHandler（Go
+/// always.go:89 mux.NewServer 装饰器）：v1.mux.cool carrier 由 mux ServerWorker 接管，
+/// 子会话回 wrapper。
+fn per_inbound_ohm(
+    ohm: &Arc<SimpleOhm>,
+    dispatcher: Option<&Arc<xray_app_dispatcher::DefaultDispatcher>>,
+    ib: &BuiltInbound,
+) -> Arc<SimpleOhm> {
+    dispatcher
+        .map(|d| {
+            let snap = Arc::new(ohm.snapshot());
+            let sniff = crate::wiring::sniffing_request_from_json(ib.sniffing_json.as_ref());
+            let inbound_handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
+                Arc::new(crate::wiring::InboundDispatchHandler::new(Arc::clone(d), sniff, &ib.tag));
+            snap.set_default(Arc::new(crate::wiring::MuxCarrierHandler::new(inbound_handler)));
+            snap
+        })
+        .unwrap_or_else(|| Arc::clone(ohm))
+}
+
+// ===========================================================================
+// gRPC inbound 运行时（bd jezb）
+// ===========================================================================
+
+/// gRPC inbound 用户管理后端（`AlterInbound` 的 AddUser/RemoveUser 与
+/// `GetInboundUsers` 的协议侧接线点）。
+///
+/// 对应 Go `handler.(proxy.UserManager)`：协议实现了即支持用户增删查，未实现时
+/// 调用方按 [`ProxymanError::NotUserManager`] 明确拒绝（不静默成功）。
+pub trait ApiUserManager: Send + Sync {
+    fn add_user(&self, user: &ProtoUser) -> Result<(), ProxymanError>;
+    fn remove_user(&self, email: &str) -> Result<(), ProxymanError>;
+    fn get_user(&self, email: &str) -> Option<ProtoUser>;
+    fn list_users(&self) -> Vec<ProtoUser>;
+}
+
+/// shadowsocks（legacy AEAD）用户管理适配：委托 [`SsInbound::server`] 的 validator。
+///
+/// validator 的 `Arc` 与 serve loop 共享，运行时增删对后续连接立即生效。
+struct SsUserManager(Arc<SsInbound>);
+
+impl ApiUserManager for SsUserManager {
+    fn add_user(&self, user: &ProtoUser) -> Result<(), ProxymanError> {
+        // Account 载荷沿用仓库既有约定（TypedMessage.value = account JSON，
+        // 与 CLI `api add-user` 一致）。
+        let account = user
+            .account
+            .as_ref()
+            .ok_or_else(|| ProxymanError::UserParse("ss add_user requires account".into()))?;
+        let js: serde_json::Value = serde_json::from_slice(&account.value)
+            .map_err(|e| ProxymanError::UserParse(format!("ss account is not JSON: {e}")))?;
+        let password = js
+            .get("password")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ProxymanError::UserParse("ss account requires password".into()))?;
+        let method =
+            js.get("method").or_else(|| js.get("cipher")).and_then(|v| v.as_str()).unwrap_or("");
+        let cipher = ss_cipher_from_str(method)
+            .ok_or_else(|| ProxymanError::UserParse(format!("unknown ss method: {method}")))?;
+        let account = xray_proxy_ss::config::MemoryAccount::from_proto(
+            &xray_proto::xray::proxy::shadowsocks::Account {
+                password: password.to_string(),
+                cipher_type: cipher.as_i32(),
+                iv_check: false,
+            },
+        )
+        .map_err(|e| ProxymanError::UserParse(e.to_string()))?;
+        self.0
+            .server()
+            .add_user(xray_proxy_ss::validator::MemoryUser {
+                email: user.email.clone(),
+                level: user.level,
+                account,
+            })
+            .map_err(|e| ProxymanError::UserParse(e.to_string()))
+    }
+
+    fn remove_user(&self, email: &str) -> Result<(), ProxymanError> {
+        self.0.server().remove_user(email).map_err(|e| ProxymanError::UserParse(e.to_string()))
+    }
+
+    /// account 不回填：ss validator 不保留原始 account 载荷（email/level 之外
+    /// 无对应关系），GetInboundUsers 因此只回 email+level（Go 回完整 account）。
+    fn get_user(&self, email: &str) -> Option<ProtoUser> {
+        self.0.server().get_user(email).map(|u| user_proto(&u.email, u.level))
+    }
+
+    fn list_users(&self) -> Vec<ProtoUser> {
+        self.0
+            .server()
+            .validator
+            .get_all()
+            .into_iter()
+            .map(|u| user_proto(&u.email, u.level))
+            .collect()
+    }
+}
+
+/// (email, level) → proto `User`（account 不回填，见 [`SsUserManager::get_user`]）。
+fn user_proto(email: &str, level: u32) -> ProtoUser {
+    ProtoUser { level, email: email.to_string(), account: None }
+}
+
+struct InboundSlot {
+    tag: String,
+    /// proxy_settings 的 type_url（`xray.proxy.{kind}.Config`），ListInbounds 回填。
+    proxy_type_url: String,
+    /// 单入站取消令牌——shutdown token 的子令牌，RemoveInbound 只停这一个。
+    cancel: CancellationToken,
+    users: Option<Arc<dyn ApiUserManager>>,
+}
+
+/// 生产 inbound 运行时（bd jezb）：gRPC `HandlerService` 的 inbound 域后端。
+///
+/// 持有真实 ohm / dispatcher / policy 与实例 shutdown token，使 `AddInbound` 走与
+/// 配置期完全相同的 [`spawn_one_inbound`] 路径起 listener（bind 失败原样上抛），
+/// `RemoveInbound` 通过 per-inbound 令牌单独停一个入站。
+pub struct InboundRuntime {
+    ohm: Arc<SimpleOhm>,
+    dispatcher: Option<Arc<xray_app_dispatcher::DefaultDispatcher>>,
+    /// dispatcher 装配时注入的 policy manager（http inbound 按 userLevel 查
+    /// handshake 超时等 per-level 策略）。
+    policy: Option<Arc<dyn xray_features::policy::PolicyManager>>,
+    shutdown: CancellationToken,
+    /// 已启动入站，保持注册顺序（ListInbounds 顺序稳定）。
+    slots: parking_lot::RwLock<Vec<InboundSlot>>,
+}
+
+impl InboundRuntime {
+    #[must_use]
+    pub fn new(
+        ohm: Arc<SimpleOhm>,
+        dispatcher: Option<Arc<xray_app_dispatcher::DefaultDispatcher>>,
+        shutdown: CancellationToken,
+    ) -> Self {
+        let policy = dispatcher.as_ref().and_then(|d| d.policy_manager.clone());
+        Self { ohm, dispatcher, policy, shutdown, slots: parking_lot::RwLock::new(Vec::new()) }
+    }
+
+    /// 启动一个 inbound 并登记（配置期与 gRPC AddInbound 共用同一路径）。
+    ///
+    /// # Errors
+    ///
+    /// tag 已存在或 listener 绑定/协议配置失败——错误原样返回，不静默跳过。
+    pub async fn start_inbound(
+        &self,
+        ib: &BuiltInbound,
+    ) -> std::io::Result<Option<JoinHandle<()>>> {
+        if self.contains(&ib.tag) {
+            return Err(std::io::Error::other(format!("existing tag found: {}", ib.tag)));
+        }
+        let cancel = self.shutdown.child_token();
+        self.slots.write().push(InboundSlot {
+            tag: ib.tag.clone(),
+            proxy_type_url: format!("xray.proxy.{}.Config", ib.entry.kind),
+            cancel: cancel.clone(),
+            users: None,
+        });
+        let per_ohm = per_inbound_ohm(&self.ohm, self.dispatcher.as_ref(), ib);
+        match spawn_one_inbound(ib, per_ohm, self.policy.clone(), cancel, Some(self)).await {
+            Ok(handle) => Ok(handle),
+            Err(e) => {
+                self.slots.write().retain(|s| s.tag != ib.tag);
+                Err(e)
+            },
+        }
+    }
+
+    /// tag 是否已登记（对应 Go `ihm.GetHandler` 的存在性检查）。
+    #[must_use]
+    pub fn contains(&self, tag: &str) -> bool {
+        self.slots.read().iter().any(|s| s.tag == tag)
+    }
+
+    /// 停止并注销一个入站。对应 Go `ihm.RemoveHandler`。
+    ///
+    /// # Errors
+    ///
+    /// tag 不存在 → [`ProxymanError::HandlerNotFound`]。
+    pub fn remove_inbound(&self, tag: &str) -> Result<(), ProxymanError> {
+        let mut slots = self.slots.write();
+        let Some(pos) = slots.iter().position(|s| s.tag == tag) else {
+            return Err(ProxymanError::HandlerNotFound(tag.to_string()));
+        };
+        slots.remove(pos).cancel.cancel();
+        Ok(())
+    }
+
+    /// 已启动入站的 (tag, proxy_settings type_url)，注册顺序。
+    #[must_use]
+    pub fn list(&self) -> Vec<(String, String)> {
+        self.slots.read().iter().map(|s| (s.tag.clone(), s.proxy_type_url.clone())).collect()
+    }
+
+    /// 取入站的用户管理器。
+    ///
+    /// # Errors
+    ///
+    /// tag 不存在 → [`ProxymanError::HandlerNotFound`]；协议不支持用户管理 →
+    /// [`ProxymanError::NotUserManager`]（Go 类型断言失败的等价语义）。
+    pub fn user_manager(&self, tag: &str) -> Result<Arc<dyn ApiUserManager>, ProxymanError> {
+        let slots = self.slots.read();
+        let slot = slots
+            .iter()
+            .find(|s| s.tag == tag)
+            .ok_or_else(|| ProxymanError::HandlerNotFound(tag.to_string()))?;
+        slot.users.clone().ok_or(ProxymanError::NotUserManager)
+    }
+
+    /// 协议 handler 启动时登记用户管理器（当前仅 shadowsocks legacy 走这条）。
+    ///
+    /// 槽位在 spawn 前已插入，缺失说明调用方未登记 tag（编程错误）。
+    fn register_user_manager(&self, tag: &str, users: Arc<dyn ApiUserManager>) {
+        match self.slots.write().iter_mut().find(|s| s.tag == tag) {
+            Some(slot) => slot.users = Some(users),
+            None => tracing::warn!(tag = %tag, "user manager registered for unknown inbound"),
+        }
+    }
+}
+
+/// proto `InboundHandlerConfig`（gRPC AddInbound）→ [`BuiltInbound`]。
+///
+/// TypedMessage 约定与 CLI（`api_exec::build_inbound_configs`）一致：
+/// - `proxy_settings.type`：`xray.proxy.{protocol}.Config`，value = settings JSON
+/// - `receiver_settings.value`：`{"listen","port","streamSettings","sniffing"}` JSON
+pub fn built_inbound_from_proto(cfg: &ProtoInboundConfig) -> Result<BuiltInbound, ProxymanError> {
+    let type_url = cfg.proxy_settings.as_ref().map(|m| m.r#type.as_str()).unwrap_or_default();
+    let kind =
+        type_url.strip_prefix("xray.proxy.").and_then(|s| s.strip_suffix(".Config")).ok_or_else(
+            || ProxymanError::Other(format!("unsupported inbound proxy_settings type: {type_url}")),
+        )?;
+    let settings = cfg.proxy_settings.as_ref().map(|m| m.value.as_slice()).unwrap_or_default();
+    let data = serde_json::to_vec(
+        &serde_json::from_slice::<serde_json::Value>(settings)
+            .map_err(|e| ProxymanError::Other(format!("inbound proxy_settings: {e}")))?,
+    )
+    .map_err(|e| ProxymanError::Other(e.to_string()))?;
+    let receiver: serde_json::Value = match cfg.receiver_settings.as_ref() {
+        Some(m) if !m.value.is_empty() => serde_json::from_slice(&m.value)
+            .map_err(|e| ProxymanError::Other(format!("inbound receiver_settings: {e}")))?,
+        _ => serde_json::Value::Null,
+    };
+    let port = match receiver.get("port") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => Some(
+            v.as_u64()
+                .and_then(|p| u16::try_from(p).ok())
+                .ok_or_else(|| ProxymanError::Other(format!("invalid inbound port: {v}")))?,
+        ),
+    };
+    Ok(BuiltInbound {
+        entry: xray_conf::BuiltEntry { kind: kind.to_string(), data },
+        tag: cfg.tag.clone(),
+        port,
+        listen: receiver.get("listen").and_then(|v| v.as_str()).map(String::from),
+        stream_settings_json: receiver.get("streamSettings").cloned(),
+        sniffing_json: receiver.get("sniffing").cloned(),
+    })
 }
 
 /// spawn 一个 inbound serve task，监听 shutdown_token 实现优雅关闭。
@@ -2787,12 +3382,27 @@ fn handshake_timeout_for(
         .unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT)
 }
 
+/// 把 ss inbound 的 validator 登记进 gRPC 用户管理面。
+///
+/// shortcut: 仅 legacy AEAD 模式（用户表可增删查）；ss2022 单/多用户/中继模式的
+/// 用户面未接线，gRPC 用户操作按 `NotUserManager` 明确拒绝。
+fn register_ss_user_manager(api: Option<&InboundRuntime>, tag: &str, mode: &SsInboundMode) {
+    let (Some(api), SsInboundMode::Legacy(ss)) = (api, mode) else {
+        return;
+    };
+    api.register_user_manager(tag, Arc::new(SsUserManager(Arc::clone(ss))));
+}
+
 /// 按协议种类启动单个 inbound listener。
+///
+/// `api` 非 None 时把协议侧用户管理器登记进 [`InboundRuntime`]（gRPC
+/// AlterInbound/GetInboundUsers 才有的动态用户面）。
 async fn spawn_one_inbound(
     ib: &BuiltInbound,
     ohm: Arc<SimpleOhm>,
     policy: Option<Arc<dyn xray_features::policy::PolicyManager>>,
     shutdown_token: CancellationToken,
+    api: Option<&InboundRuntime>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     // TUN inbound 不需要 port/addr，提前处理
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
@@ -2957,24 +3567,28 @@ async fn spawn_one_inbound(
                     on_conn,
                 )
                 .await
-            } else {
+            } else if settings.security == "reality" {
+                // REALITY：server_tls 验证 → Verified 走 VLESS；Invalid fallback 到 dest
                 let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone()).await?;
-                if settings.security == "reality" {
-                    // REALITY：server_tls 验证 → Verified 走 VLESS；Invalid fallback 到 dest
-                    let reality = parse_reality_config(&settings)?;
-                    tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_uuid_count(), fallback = %reality.fallback_dest, "vless+reality inbound listening");
-                    Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                        serve_reality_vless(listener, ohm, validator, reality, Some(options)).await
-                    })))
-                } else {
-                    let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
-                    // VLESS fallbacks：Go napfb（name→alpn→path→dest+xver）
-                    let fallbacks = build_vless_fallbacks(&ib.entry.data)?;
-                    tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_uuid_count(), tls = tls.is_some(), fallbacks = fallbacks.as_ref().map_or(0, |f| f.len()), enc = decryption.is_some(), "vless inbound listening");
-                    Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                        serve_vless(listener, ohm, validator, tls, fallbacks, Some(options)).await
-                    })))
-                }
+                let reality = parse_reality_config(&settings)?;
+                tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_uuid_count(), fallback = %reality.fallback_dest, "vless+reality inbound listening");
+                Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                    serve_reality_vless(listener, ohm, validator, reality, Some(options)).await
+                })))
+            } else {
+                let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
+                // VLESS fallbacks：Go napfb（name→alpn→path→dest+xver）
+                let fallbacks = build_vless_fallbacks(&ib.entry.data)?;
+                // tcpSettings.header 伪装头（Go hub.go:85-95；无 header → None 零开销）。
+                let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone())
+                    .await?
+                    .with_header_auth(xray_transport::headers::conn::auth_from_json(
+                        settings.transport_json.as_ref(),
+                    )?);
+                tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_uuid_count(), tls = tls.is_some(), fallbacks = fallbacks.as_ref().map_or(0, |f| f.len()), enc = decryption.is_some(), "vless inbound listening");
+                Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+                    serve_vless(listener, ohm, validator, tls, fallbacks, Some(options)).await
+                })))
             }
         },
         "trojan" => {
@@ -3053,7 +3667,11 @@ async fn spawn_one_inbound(
                 })))
             } else {
                 let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
-                let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone()).await?;
+                let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone())
+                    .await?
+                    .with_header_auth(xray_transport::headers::conn::auth_from_json(
+                        settings.transport_json.as_ref(),
+                    )?);
                 tracing::info!(tag = %ib.tag, addr = %addr, users = users.len(), tls = tls.is_some(), "trojan inbound listening");
                 Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                     serve_trojan(
@@ -3116,7 +3734,11 @@ async fn spawn_one_inbound(
                 .await
             } else {
                 let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
-                let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone()).await?;
+                let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone())
+                    .await?
+                    .with_header_auth(xray_transport::headers::conn::auth_from_json(
+                        settings.transport_json.as_ref(),
+                    )?);
                 tracing::info!(tag = %ib.tag, addr = %addr, tls = tls.is_some(), "vmess inbound listening");
                 Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                     serve_vmess(listener, ohm, validator, tls, handshake_timeout_for(&policy, 0))
@@ -3164,9 +3786,18 @@ async fn spawn_one_inbound(
                     follow_redirect: settings.follow_redirect,
                     tls,
                 };
+                // bd jezb：内层 listener task 必须自己感知 shutdown token——旧形态由外层
+                // await 持有 JoinHandle，token cancel 时 drop = detach（accept loop 继续跑，
+                // RemoveInbound 后端口仍可连）。
+                let stop = shutdown_token.clone();
                 handles.push(tokio::spawn(async move {
-                    if let Err(e) = serve_dokodemo(listener, ohm_tcp, opts).await {
-                        tracing::error!(error = %e, "dokodemo TCP inbound stopped");
+                    tokio::select! {
+                        r = serve_dokodemo(listener, ohm_tcp, opts) => {
+                            if let Err(e) = r {
+                                tracing::error!(error = %e, "dokodemo TCP inbound stopped");
+                            }
+                        },
+                        _ = stop.cancelled() => {},
                     }
                 }));
             }
@@ -3185,11 +3816,15 @@ async fn spawn_one_inbound(
                 tracing::info!(tag = %ib.tag, addr = %addr, dest = ?dest, "dokodemo UDP inbound listening");
                 let dest_udp = dest.clone();
                 let follow_redirect = settings.follow_redirect;
+                let stop = shutdown_token.clone();
                 handles.push(tokio::spawn(async move {
-                    if let Err(e) =
-                        serve_dokodemo_udp(bind_addr, dispatch, dest_udp, follow_redirect).await
-                    {
-                        tracing::error!(error = %e, "dokodemo UDP inbound stopped");
+                    tokio::select! {
+                        r = serve_dokodemo_udp(bind_addr, dispatch, dest_udp, follow_redirect) => {
+                            if let Err(e) = r {
+                                tracing::error!(error = %e, "dokodemo UDP inbound stopped");
+                            }
+                        },
+                        _ = stop.cancelled() => {},
                     }
                 }));
             }
@@ -3217,6 +3852,7 @@ async fn spawn_one_inbound(
             // transport 后调用 Process，见 shadowsocks_2022/inbound.go）。
             if is_transport_listener_protocol(&settings.protocol) {
                 let mode = parse_ss_inbound_config(&ib.entry.data)?;
+                register_ss_user_manager(api, &ib.tag, &mode);
                 let handler = ohm.get_default_handler().ok_or_else(|| {
                     std::io::Error::other("no default outbound handler registered")
                 })?;
@@ -3247,6 +3883,7 @@ async fn spawn_one_inbound(
             }
             let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone()).await?;
             let inbound = parse_ss_inbound_config(&ib.entry.data)?;
+            register_ss_user_manager(api, &ib.tag, &inbound);
             tracing::info!(tag = %ib.tag, addr = %addr, "shadowsocks inbound listening");
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                 serve_ss(listener, ohm, inbound, handshake_timeout_for(&policy, 0)).await
@@ -4964,10 +5601,15 @@ mod tests {
             stream_settings_json: None,
             sniffing_json: None,
         };
-        let err =
-            spawn_one_inbound(&ib, Arc::new(SimpleOhm::new()), None, CancellationToken::new())
-                .await
-                .unwrap_err();
+        let err = spawn_one_inbound(
+            &ib,
+            Arc::new(SimpleOhm::new()),
+            None,
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "got: {err}");
     }
 
@@ -4986,10 +5628,15 @@ mod tests {
             stream_settings_json: None,
             sniffing_json: None,
         };
-        let err =
-            spawn_one_inbound(&ib, Arc::new(SimpleOhm::new()), None, CancellationToken::new())
-                .await
-                .unwrap_err();
+        let err = spawn_one_inbound(
+            &ib,
+            Arc::new(SimpleOhm::new()),
+            None,
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "got: {err}");
     }
 
@@ -5037,7 +5684,7 @@ mod tests {
             stream_settings_json: None,
             sniffing_json: None,
         };
-        let handle = spawn_one_inbound(&ib, Arc::clone(&ohm), None, CancellationToken::new())
+        let handle = spawn_one_inbound(&ib, Arc::clone(&ohm), None, CancellationToken::new(), None)
             .await
             .unwrap()
             .expect("uds socks inbound should spawn a serve task");
@@ -6885,7 +7532,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (server, _) = listener.accept().await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
 
         let hs = HandshakeResult {
             dest: Destination::tcp(Address::IPv4(Ipv4Addr::new(1, 2, 3, 4)), Port::new(80)),
@@ -6893,12 +7540,15 @@ mod tests {
             target: "http://1.2.3.4/".into(),
             headers: HashMap::new(),
         };
-        tokio::spawn(handle_plain_http(
-            server,
-            hs,
-            Arc::new(FailingDispatch),
-            xray_app_dispatcher::AccessContext::default(),
-        ));
+        tokio::spawn(async move {
+            handle_plain_http(
+                &mut server,
+                &hs,
+                Arc::new(FailingDispatch),
+                xray_app_dispatcher::AccessContext::default(),
+            )
+            .await;
+        });
 
         let mut buf = Vec::new();
         tokio::time::timeout(std::time::Duration::from_secs(5), client.read_to_end(&mut buf))
@@ -6942,7 +7592,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (server, _) = listener.accept().await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
 
         let hs = HandshakeResult {
             dest: Destination::tcp(Address::IPv4(Ipv4Addr::new(1, 2, 3, 4)), Port::new(80)),
@@ -6950,12 +7600,15 @@ mod tests {
             target: "http://1.2.3.4/".into(),
             headers: HashMap::new(),
         };
-        tokio::spawn(handle_plain_http(
-            server,
-            hs,
-            Arc::new(DropLinkDispatch),
-            xray_app_dispatcher::AccessContext::default(),
-        ));
+        tokio::spawn(async move {
+            handle_plain_http(
+                &mut server,
+                &hs,
+                Arc::new(DropLinkDispatch),
+                xray_app_dispatcher::AccessContext::default(),
+            )
+            .await;
+        });
 
         let mut buf = Vec::new();
         tokio::time::timeout(std::time::Duration::from_secs(5), client.read_to_end(&mut buf))
@@ -6964,6 +7617,378 @@ mod tests {
             .unwrap();
         let resp = String::from_utf8_lossy(&buf);
         assert!(resp.starts_with("HTTP/1.1 503"), "got: {resp}");
+    }
+
+    /// ft58 S1 测试桩：按 dest 真实拨号上游，双向桥接 link ↔ 上游连接。
+    /// 桥接在后台任务跑（对齐生产 dispatch_link 立即返回）；EOF 方向传播必须
+    /// 显式 shutdown（pipe Writer 裸 drop 不传播关闭）。
+    struct DialDispatch;
+    impl std::fmt::Debug for DialDispatch {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("DialDispatch")
+        }
+    }
+    impl xray_app_dispatcher::DispatchHandler for DialDispatch {
+        fn tag(&self) -> &str {
+            "dial"
+        }
+        fn dispatch(
+            &self,
+            dest: &Destination,
+            link: Link,
+        ) -> xray_app_dispatcher::default::PinFuture<()> {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use xray_buf::{
+                io::{Reader as _, Writer as _},
+                multi::MultiBuffer,
+            };
+            let port = dest.port().value();
+            let ip = dest.address().ip().expect("test dest must be an IP");
+            Box::pin(async move {
+                let Ok(upstream) = tokio::net::TcpStream::connect((ip, port)).await else {
+                    link.writer.shutdown();
+                    return;
+                };
+                // 桥接 spawn 后立即返回（对齐生产 dispatch_link——内联 join 会与
+                // handle_plain_http「dispatch 返回后才写请求」互等死锁）
+                tokio::spawn(async move {
+                    let (mut up_r, mut up_w) = upstream.into_split();
+                    let mut lr = link.reader;
+                    let mut lw = link.writer;
+                    let up_task = async {
+                        loop {
+                            match lr.read_multi_buffer().await {
+                                Ok(mb) if mb.is_empty() => break,
+                                Ok(mb) => {
+                                    let mut data = Vec::new();
+                                    for b in mb.iter() {
+                                        data.extend_from_slice(b.bytes());
+                                    }
+                                    if up_w.write_all(&data).await.is_err() {
+                                        break;
+                                    }
+                                },
+                                Err(_) => break,
+                            }
+                        }
+                        let _ = up_w.shutdown().await;
+                    };
+                    let down_task = async {
+                        let mut buf = vec![0u8; 8192];
+                        loop {
+                            match up_r.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    let mut mb = MultiBuffer::new();
+                                    mb.merge_bytes(&buf[..n]);
+                                    if lw.write_multi_buffer(mb).await.is_err() {
+                                        break;
+                                    }
+                                },
+                            }
+                        }
+                        lw.shutdown();
+                    };
+                    tokio::join!(up_task, down_task);
+                });
+            })
+        }
+    }
+
+    /// ft58 S1 测试桩：解析缓冲中的一个完整 HTTP 请求（头 + CL/chunked body）。
+    /// 不完整 → None（调用方继续读）。返回 (方法, path, body, 请求带 close
+    /// token?, 消费字节数)。
+    fn parse_http_request_for_test(acc: &[u8]) -> Option<(String, String, Vec<u8>, bool, usize)> {
+        let head_end = acc.windows(4).position(|w| w == b"\r\n\r\n")?;
+        let head = String::from_utf8_lossy(&acc[..head_end]).into_owned();
+        let mut lines = head.split("\r\n");
+        let request_line = lines.next()?;
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next()?.to_string();
+        let target = parts.next()?.to_string();
+        let mut chunked = false;
+        let mut wants_close = false;
+        let mut content_len = 0usize;
+        for line in lines {
+            let lower = line.to_ascii_lowercase();
+            if let Some(v) = lower.strip_prefix("content-length:") {
+                content_len = v.trim().parse().ok()?;
+            }
+            if lower.starts_with("transfer-encoding:") && lower.contains("chunked") {
+                chunked = true;
+            }
+            for key in ["connection:", "proxy-connection:"] {
+                if let Some(v) = lower.strip_prefix(key) {
+                    if v.split(',').any(|t| t.trim() == "close") {
+                        wants_close = true;
+                    }
+                }
+            }
+        }
+        let path = target
+            .strip_prefix("http://")
+            .and_then(|rest| rest.find('/').map(|i| &rest[i..]))
+            .unwrap_or(&target)
+            .to_string();
+        let mut consumed = head_end + 4;
+        let mut body = Vec::new();
+        if chunked {
+            let mut off = consumed;
+            loop {
+                let rest = acc.get(off..)?;
+                let line_end = rest.windows(2).position(|w| w == b"\r\n")? + off;
+                let size_line = String::from_utf8_lossy(&acc[off..line_end]).into_owned();
+                let size = usize::from_str_radix(
+                    size_line.split(';').next().unwrap_or_default().trim(),
+                    16,
+                )
+                .ok()?;
+                off = line_end + 2;
+                if size == 0 {
+                    // 终止块：trailer 段透传到空行
+                    loop {
+                        let rest = acc.get(off..)?;
+                        let line_end = rest.windows(2).position(|w| w == b"\r\n")? + off;
+                        let empty = line_end == off;
+                        off = line_end + 2;
+                        if empty {
+                            break;
+                        }
+                    }
+                    break;
+                }
+                body.extend_from_slice(acc.get(off..off + size)?);
+                off += size + 2;
+            }
+            consumed = off;
+        } else if content_len > 0 {
+            body.extend_from_slice(acc.get(consumed..consumed + content_len)?);
+            consumed += content_len;
+        }
+        Some((method, path, body, wants_close, consumed))
+    }
+
+    /// ft58 S1 测试桩：本地 HTTP 上游。单连接逐请求解析响应，GET 回 200+path、
+    /// POST 回 200+请求体；请求带 close token 或连接 EOF 时关连接（对齐真实
+    /// 上游收到转发头强制 `connection: close` 后的行为）。返回 (地址, accept 计数)。
+    async fn spawn_http_upstream_for_test()
+    -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conns = Arc::new(AtomicUsize::new(0));
+        let conns_task = Arc::clone(&conns);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                conns_task.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let mut acc: Vec<u8> = Vec::new();
+                    loop {
+                        let (method, path, body, wants_close, consumed) = loop {
+                            if let Some(done) = parse_http_request_for_test(&acc) {
+                                break done;
+                            }
+                            let mut b = [0u8; 4096];
+                            match sock.read(&mut b).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => acc.extend_from_slice(&b[..n]),
+                            }
+                        };
+                        acc.drain(..consumed);
+                        let body = if method == "GET" { path.into_bytes() } else { body };
+                        let resp =
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                        if sock.write_all(resp.as_bytes()).await.is_err()
+                            || sock.write_all(&body).await.is_err()
+                        {
+                            return;
+                        }
+                        if wants_close {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, conns)
+    }
+
+    /// ft58 S1 测试读代理响应：头块 + Content-Length 精确读完（keep-alive 下
+    /// 不能多读一字节）。返回 (状态码, 头文本, body)。
+    async fn read_http_response_for_test(
+        sock: &mut tokio::net::TcpStream,
+    ) -> (u16, String, Vec<u8>) {
+        let mut acc: Vec<u8> = Vec::new();
+        let head_end = loop {
+            if let Some(p) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                break p;
+            }
+            let mut b = [0u8; 4096];
+            let n = sock.read(&mut b).await.unwrap();
+            assert!(n > 0, "EOF while reading response head");
+            acc.extend_from_slice(&b[..n]);
+        };
+        let head = String::from_utf8_lossy(&acc[..head_end]).into_owned();
+        let status: u16 = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("bad status line: {head}"));
+        let content_len: usize = head
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .and_then(|v| v.trim().parse().ok())
+            })
+            .unwrap_or(0);
+        let mut body = acc[head_end + 4..].to_vec();
+        while body.len() < content_len {
+            let mut b = [0u8; 4096];
+            let n = sock.read(&mut b).await.unwrap();
+            assert!(n > 0, "EOF while reading response body");
+            body.extend_from_slice(&b[..n]);
+        }
+        body.truncate(content_len);
+        (status, head, body)
+    }
+
+    /// ft58 S1 公共装配：本地 HTTP 上游 + serve_http 实例。
+    /// 返回 (代理地址, 上游地址, 上游 accept 连接计数)。
+    async fn spawn_http_proxy_harness_for_test()
+    -> (std::net::SocketAddr, std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let (upstream, conns) = spawn_http_upstream_for_test().await;
+        let ohm = Arc::new(SimpleOhm::new());
+        ohm.set_default(Arc::new(DialDispatch) as Arc<dyn xray_app_dispatcher::DispatchHandler>);
+        let listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        )
+        .await
+        .unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_http(
+            listener,
+            ohm,
+            Arc::new(HttpServerConfig::default()),
+            Some(std::time::Duration::from_secs(5)),
+        ));
+        (proxy_addr, upstream, conns)
+    }
+
+    /// ft58 S1：同一客户端连接上连续两个 plain HTTP 代理请求均成功且回包正确
+    /// （keep-alive 复用；改动前每请求即关连接，第二请求必 EOF）；第三个请求带
+    /// `Connection: close` → 响应后服务端收尾关闭（EOF 干净）。
+    #[tokio::test]
+    async fn http_keep_alive_reuses_connection_between_requests() {
+        let (proxy, upstream, upstream_conns) = spawn_http_proxy_harness_for_test().await;
+        let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let upstream_port = upstream.port();
+        let base = format!("http://127.0.0.1:{upstream_port}/");
+
+        client
+            .write_all(
+                format!("GET {base}first HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (status, head, body) = read_http_response_for_test(&mut client).await;
+        assert_eq!(status, 200, "first request: {head}");
+        assert_eq!(body, b"/first");
+
+        // 同一连接第二请求（改动前此处 EOF/断链）
+        client
+            .write_all(
+                format!("GET {base}second HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (status, head, body) = read_http_response_for_test(&mut client).await;
+        assert_eq!(status, 200, "second request: {head}");
+        assert_eq!(body, b"/second");
+
+        // 客户端 close token → 响应可读且随后干净 EOF
+        client
+            .write_all(
+                format!("GET {base}third HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (status, head, body) = read_http_response_for_test(&mut client).await;
+        assert_eq!(status, 200, "third request: {head}");
+        assert_eq!(body, b"/third");
+        assert!(
+            head.to_ascii_lowercase().contains("connection: close"),
+            "close token must be honored in response headers: {head}"
+        );
+        let mut rest = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.read_to_end(&mut rest))
+            .await
+            .expect("server must close after client close token")
+            .unwrap();
+        assert!(rest.is_empty(), "no extra bytes after close: {rest:?}");
+
+        // 上游每请求一条新链路（对齐 Go handlePlainHTTP Dispatch per request）
+        assert_eq!(
+            upstream_conns.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "one fresh upstream connection per request"
+        );
+    }
+
+    /// ft58 S1：Content-Length 请求体必须精确消费后才读下一请求——POST+body 与
+    /// 下一 GET 一次流水线写入，body 若被吞多/吞少第二请求必然错位。
+    #[tokio::test]
+    async fn http_keep_alive_consumes_content_length_body_before_next_request() {
+        let (proxy, upstream, _conns) = spawn_http_proxy_harness_for_test().await;
+        let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let upstream_port = upstream.port();
+        let base = format!("http://127.0.0.1:{upstream_port}/");
+        let payload = "hello-proxy-body";
+        let post = format!(
+            "POST {base}upload HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        );
+        let get =
+            format!("GET {base}after-post HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\r\n");
+        client.write_all(format!("{post}{get}").as_bytes()).await.unwrap();
+
+        let (status, head, body) = read_http_response_for_test(&mut client).await;
+        assert_eq!(status, 200, "post response: {head}");
+        assert_eq!(body, payload.as_bytes(), "upstream must echo the body");
+        let (status, head, body) = read_http_response_for_test(&mut client).await;
+        assert_eq!(status, 200, "request after body must not be misaligned: {head}");
+        assert_eq!(body, b"/after-post");
+    }
+
+    /// ft58 S1：chunked 请求体逐帧消费到终止块后才读下一请求（帧原样转发，
+    /// 转发头保留 transfer-encoding，与 Go ReadRequest 解码 + request.Write
+    /// 重编码线路上等价）。
+    #[tokio::test]
+    async fn http_keep_alive_consumes_chunked_body_before_next_request() {
+        let (proxy, upstream, _conns) = spawn_http_proxy_harness_for_test().await;
+        let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let upstream_port = upstream.port();
+        let base = format!("http://127.0.0.1:{upstream_port}/");
+        // 7 字节 + 2 字节两帧（非整缓冲对齐），终止块带空 trailer
+        let post = format!(
+            "POST {base}chunked HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nTransfer-Encoding: chunked\r\n\r\n7\r\nchunk-1\r\n2\r\nd!\r\n0\r\n\r\n"
+        );
+        let get =
+            format!("GET {base}after-chunked HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\r\n");
+        client.write_all(format!("{post}{get}").as_bytes()).await.unwrap();
+
+        let (status, head, body) = read_http_response_for_test(&mut client).await;
+        assert_eq!(status, 200, "chunked post response: {head}");
+        assert_eq!(body, b"chunk-1d!", "chunked body must be decoded by upstream");
+        let (status, head, body) = read_http_response_for_test(&mut client).await;
+        assert_eq!(status, 200, "request after chunked body must not be misaligned: {head}");
+        assert_eq!(body, b"/after-chunked");
     }
 
     /// b2e：SOCKS UDP ASSOCIATE relay 经 dispatcher（UdpDispatchSession）。

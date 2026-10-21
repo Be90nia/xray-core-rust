@@ -48,6 +48,10 @@ path = "integration/e2e_test.rs"
 name = "integration_e2e_p2"
 path = "integration/e2e_p2_test.rs"
 
+[[test]]
+name = "integration_wireguard_dataplane"
+path = "integration/wireguard_dataplane_test.rs"
+
  [[test]]
  name = "integration_commander_api"
  path = "integration/commander_api_test.rs"
@@ -88,6 +92,10 @@ path = "integration/policy_test.rs"
 name = "integration_commander_gap"
 path = "integration/commander_gap_test.rs"
 
+[[test]]
+name = "integration_fingerprint_matrix"
+path = "integration/fingerprint_matrix_test.rs"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 xray-common = { path = "../crates/xray-common" }
@@ -101,6 +109,8 @@ xray-app-dispatcher = { path = "../crates/xray-app-dispatcher" }
 xray-transport = { path = "../crates/xray-transport" }
 xray-buf = { path = "../crates/xray-buf" }
 xray-proto = { path = "../crates/xray-proto", features = ["grpc-client"] }
+# bd jezb：proxyman command 操作 TypedMessage 的 value 是 protobuf 编码（AddUserOperation）。
+prost = { workspace = true }
 tonic = { workspace = true }
 tonic-reflection = { workspace = true }
 futures = { workspace = true }
@@ -123,4 +133,7 @@ hex = "0.4"
 boringtun = { workspace = true }
 sha2 = "0.10"
 rustls = { workspace = true }
+# ft58 S8：WG 数据面诊断用——测试内装 subscriber 让 driver/dispatcher tracing 事件
+# 落到 libtest 捕获输出（--nocapture 可见）。
+tracing-subscriber = { workspace = true }
 
