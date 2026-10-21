@@ -167,7 +167,8 @@ pub async fn serve_vmess(
     let header = listener.header_auth().cloned();
 
     loop {
-        let (stream, peer) = match listener.accept().await {
+        // finalmask.tcp 在 accept 后立即套上（wire 最外层，TLS 握手在其内）。
+        let (stream, peer) = match listener.accept_masked().await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "vmess accept failed");
@@ -936,6 +937,7 @@ mod tests {
     #[tokio::test]
     async fn vmess_outbound_udp_roundtrip_e2e() {
         use std::time::Duration;
+
         use tokio::{net::UdpSocket, time::timeout};
 
         use crate::dispatcher::{VmessOutboundConfig, make_vmess_dial_fn};

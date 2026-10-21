@@ -470,6 +470,10 @@ pub struct InboundTcpListener {
     /// plain-TCP 装配由 xray-core 注入；serve 层按 Go keepAccepting 顺序在
     /// TLS/REALITY 解包后应用。`None` → 不包装（零开销）。
     header: Option<Arc<crate::headers::http::HttpAuthenticator>>,
+    /// `finalmask.tcp` 伪装链（Go hub.go WrapListener）。plain-TCP 装配由
+    /// xray-core 注入；[`Self::accept_masked`] 在 accept 后立即套上（wire 最外层，
+    /// TLS/REALITY 之前）。`None` → 不包装（零开销）。
+    tcpmask: Option<Arc<crate::finalmask::TcpmaskManager>>,
 }
 
 impl InboundTcpListener {
@@ -479,7 +483,12 @@ impl InboundTcpListener {
     /// bind 失败时返回 `io::Error`。
     pub async fn bind(addr: &str, sockopt: SocketOptions) -> io::Result<Self> {
         // bd hjtt：统一走 backlog=1024 helper（tokio 缺省 128 生产 listen overflow）。
-        Ok(Self { inner: bind_tcp_listener(addr, LISTEN_BACKLOG).await?, sockopt, header: None })
+        Ok(Self {
+            inner: bind_tcp_listener(addr, LISTEN_BACKLOG).await?,
+            sockopt,
+            header: None,
+            tcpmask: None,
+        })
     }
 
     /// 监听器本地地址（serve 层日志 / local addr 兜底用）。
@@ -491,7 +500,7 @@ impl InboundTcpListener {
     /// 与 [`DefaultListener::from_tokio`] 对称。
     #[must_use]
     pub fn from_tokio(inner: TokioTcpListener, sockopt: SocketOptions) -> Self {
-        Self { inner, sockopt, header: None }
+        Self { inner, sockopt, header: None, tcpmask: None }
     }
 
     /// 注入 `tcpSettings.header` 伪装头 authenticator（`None` → 清除）。
@@ -513,6 +522,25 @@ impl InboundTcpListener {
         self.header.as_ref()
     }
 
+    /// 注入 `finalmask.tcp` 伪装链（`None` → 清除；空链等价 `None`）。
+    ///
+    /// 对应 Go `tcp/hub.go` `WrapListener`；由 [`Self::accept_masked`] 在 accept
+    /// 后立即套上——mask 处于 wire 最外层，TLS/REALITY 握手在 mask 之内。
+    #[must_use]
+    pub fn with_tcpmask_manager(
+        mut self,
+        mask: Option<Arc<crate::finalmask::TcpmaskManager>>,
+    ) -> Self {
+        self.tcpmask = mask;
+        self
+    }
+
+    /// 已注入的 `finalmask.tcp` 伪装链（未配置 → `None`）。
+    #[must_use]
+    pub fn tcpmask_manager(&self) -> Option<&Arc<crate::finalmask::TcpmaskManager>> {
+        self.tcpmask.as_ref()
+    }
+
     /// accept 一个连接并应用 inbound sockopt（TCP_NODELAY / keepalive 等）。
     ///
     /// sockopt 应用失败仅 debug log 不拒绝连接（与 [`DefaultListener::accept`]
@@ -529,6 +557,24 @@ impl InboundTcpListener {
             tracing::debug!(error = %e, "failed to apply inbound socket options");
         }
         Ok((tokio::net::TcpStream::from_std(socket.into())?, peer))
+    }
+
+    /// accept 一个连接并按 `finalmask.tcp` 链套 server 侧 mask（Go `hub.go`
+    /// `WrapListener` → `WrapConnServer`）。
+    ///
+    /// 未配置 mask → [`MaybeTcpMaskConn::Plain`]（与 [`Self::accept`] 等价，零包装）。
+    /// mask 生效时返回的连接读写已是解伪装后的明文，TLS/REALITY 应在其上再握手。
+    ///
+    /// # Errors
+    /// accept / sockopt / mask 链构造失败时返回 `io::Error`。
+    pub async fn accept_masked(
+        &self,
+    ) -> io::Result<(crate::finalmask::MaybeTcpMaskConn<tokio::net::TcpStream>, SocketAddr)> {
+        let (stream, peer) = self.accept().await?;
+        match self.tcpmask.as_deref() {
+            Some(mgr) => Ok((crate::finalmask::maybe_mask_server(mgr, stream)?, peer)),
+            None => Ok((crate::finalmask::MaybeTcpMaskConn::Plain(stream), peer)),
+        }
     }
 }
 
@@ -1257,5 +1303,144 @@ mod tests {
         server.await.unwrap();
 
         assert_eq!(*ka_state.lock(), Some(false), "未配置时不应启用 keepalive");
+    }
+}
+
+/// inbound `finalmask.tcp`（bd dppv）：`accept_masked` 的落位与对称性。
+#[cfg(test)]
+mod tcpmask_tests {
+    use sha2::{Digest, Sha256};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+    };
+
+    use super::*;
+    use crate::finalmask::{AsyncIo, TcpmaskManager, build_tcpmask_manager_from_json};
+
+    fn manager(json: serde_json::Value) -> Arc<TcpmaskManager> {
+        Arc::new(build_tcpmask_manager_from_json(Some(&json)).expect("mask 构建"))
+    }
+
+    fn sudoku() -> Arc<TcpmaskManager> {
+        manager(serde_json::json!({"tcp": [{"type": "sudoku", "settings": {}}]}))
+    }
+
+    fn xmc() -> Arc<TcpmaskManager> {
+        manager(serde_json::json!({"tcp": [{"type": "xmc", "settings": {
+            "password": "night-run-shared-secret",
+            "hostname": "localhost",
+            "profiles": [{
+                "username": "NightRunner",
+                "uuid": "b3f5d0e0-1111-4222-8333-444455556666",
+                "texturesValue": "textures-value",
+                "texturesSignature": "textures-signature"
+            }]
+        }}]}))
+    }
+
+    fn payload(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn sha256(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    /// 配了 finalmask → `accept_masked` 返回 `Masked`；裸 TCP 入站与客户端
+    /// 同一 mask 链对打 131072B 双向回显，sha256 一致。
+    async fn roundtrip_131072(mask: Arc<TcpmaskManager>) {
+        let listener = InboundTcpListener::bind("127.0.0.1:0", SocketOptions::default())
+            .await
+            .expect("bind")
+            .with_tcpmask_manager(Some(Arc::clone(&mask)));
+        let addr = listener.local_addr().expect("local_addr");
+
+        let data = payload(131_072);
+        let expect = data.clone();
+        let server = tokio::spawn(async move {
+            let (mut conn, _peer) = listener.accept_masked().await.expect("accept_masked");
+            assert!(conn.plain().is_none(), "配了 finalmask 必须走 Masked");
+            let mut buf = vec![0u8; expect.len()];
+            conn.read_exact(&mut buf).await.expect("server read");
+            assert_eq!(sha256(&buf), sha256(&expect), "server 侧 sha256 必须一致");
+            conn.write_all(&buf).await.expect("server echo");
+            conn.shutdown().await.expect("server shutdown");
+        });
+
+        // 客户端侧同一 mask 链（xray-transport-tcp dialer 同款 client 包装）。
+        let raw = TcpStream::connect(addr).await.expect("connect");
+        let raw: Box<dyn AsyncIo> = Box::new(raw);
+        let mut client = mask.wrap_conn_client(raw).expect("client mask");
+        client.write_all(&data).await.expect("client write");
+        let mut got = vec![0u8; data.len()];
+        client.read_exact(&mut got).await.expect("client read");
+        assert_eq!(sha256(&got), sha256(&data), "客户端 131072B 回显 sha256 必须一致");
+        server.await.expect("server task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn inbound_mask_roundtrip_sudoku_131072() {
+        roundtrip_131072(sudoku()).await;
+    }
+
+    /// 互通：tcp + xmc（生产形态的 padding 未关）131072B 双向。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn inbound_mask_roundtrip_xmc_131072() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), roundtrip_131072(xmc()))
+            .await
+            .expect("xmc 互通超时（mask 握手或 padding 卡住）");
+    }
+
+    /// 反证一：未配 finalmask → `Plain` 直通，明文原样到达（零行为变化）。
+    #[tokio::test]
+    async fn unmasked_inbound_passes_plaintext_through() {
+        let listener =
+            InboundTcpListener::bind("127.0.0.1:0", SocketOptions::default()).await.expect("bind");
+        assert!(listener.tcpmask_manager().is_none());
+        let addr = listener.local_addr().expect("local_addr");
+
+        let server = tokio::spawn(async move {
+            let (mut conn, _peer) = listener.accept_masked().await.expect("accept_masked");
+            assert!(conn.plain().is_some(), "未配 finalmask 必须走 Plain");
+            let mut buf = [0u8; 14];
+            conn.read_exact(&mut buf).await.expect("server read");
+            assert_eq!(&buf, b"vless-header!!");
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client.write_all(b"vless-header!!").await.expect("client write");
+        server.await.expect("server task");
+    }
+
+    /// 反证二：配了 finalmask 时，未伪装的明文不会被原样还原（证明 mask 真的
+    /// 在解伪装，不是 no-op 直通）。
+    #[tokio::test]
+    async fn masked_inbound_does_not_pass_plaintext_through() {
+        let listener = InboundTcpListener::bind("127.0.0.1:0", SocketOptions::default())
+            .await
+            .expect("bind")
+            .with_tcpmask_manager(Some(sudoku()));
+        let addr = listener.local_addr().expect("local_addr");
+
+        let plaintext = b"vless-header!!".to_vec();
+        let expect_len = plaintext.len();
+        let expect = plaintext.clone();
+        let server = tokio::spawn(async move {
+            let (mut conn, _peer) = listener.accept_masked().await.expect("accept_masked");
+            assert!(conn.plain().is_none());
+            let mut buf = vec![0u8; expect_len];
+            // sudoku 每个明文字节解出 4 字节编码，读不满即视为「未原样还原」。
+            let n = tokio::time::timeout(std::time::Duration::from_secs(2), conn.read(&mut buf))
+                .await
+                .expect("read 超时")
+                .expect("read");
+            assert_ne!(&buf[..n], &expect[..], "明文不得原样穿过 mask 入站");
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client.write_all(&plaintext).await.expect("client write");
+        let _ = client.shutdown().await;
+        server.await.expect("server task");
     }
 }

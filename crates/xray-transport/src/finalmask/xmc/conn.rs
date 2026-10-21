@@ -17,20 +17,26 @@
 //!
 //! 握手 + padding 整体受 2 分钟 deadline（对应 Go `deadline.go` handshakeTimeout）。
 
-use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use std::time::Duration;
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use rand::{Rng, RngCore};
-use rsa::pkcs1::DecodeRsaPrivateKey;
-use rsa::pkcs8::DecodePublicKey;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
-use tokio::sync::mpsc;
+use rsa::{pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePublicKey};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf},
+    sync::mpsc,
+};
 
-use super::super::AsyncIo;
-use super::cfb8::{Cfb8Dec, Cfb8Enc};
-use super::{Config, Profile, UDP_SIZE, protocol};
+use super::{
+    super::AsyncIo,
+    Config, Profile, UDP_SIZE,
+    cfb8::{Cfb8Dec, Cfb8Enc},
+    protocol,
+};
 
 type DynIo = Box<dyn AsyncIo>;
 
@@ -306,8 +312,8 @@ where
             io::Error::new(io::ErrorKind::InvalidData, format!("parse rsa public key: {e}"))
         })?;
 
-    // 1. Handshake (0x00)。端口与 Go 缺省一致用 25565（服务端不校验该字段；
-    //    Go 会用 RemoteAddr 实际端口覆盖，Rust 的 Tcpmask 接口拿不到 dest 端口）。
+    // 1. Handshake (0x00)。端口与 Go 缺省一致用 25565（服务端不校验该字段； Go 会用 RemoteAddr
+    //    实际端口覆盖，Rust 的 Tcpmask 接口拿不到 dest 端口）。
     let mut p = Vec::new();
     protocol::write_varint(&mut p, PROTOCOL_VERSION)?;
     protocol::write_string(&mut p, hostname)?;
@@ -462,8 +468,8 @@ where
     let secret16: [u8; SHARED_SECRET_SIZE] =
         shared_secret.as_slice().try_into().expect("length checked above");
 
-    // 6. 启用加密流。密码/白名单校验失败都在加密流上回 Disconnect（对应 Go
-    //    cryptoWriter 启用后的 writeDisconnectPacket）。
+    // 6. 启用加密流。密码/白名单校验失败都在加密流上回 Disconnect（对应 Go cryptoWriter 启用后的
+    //    writeDisconnectPacket）。
     let mut enc = Cfb8Enc::new(&secret16, &secret16);
 
     let received_pw = &decrypted_verify[4..];
@@ -697,8 +703,7 @@ pub(super) async fn tcp_bridge(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::Tcpmask;
-    use super::*;
+    use super::{super::super::Tcpmask, *};
 
     fn test_config() -> Config {
         let password = "super-secure-shared-key-12345";

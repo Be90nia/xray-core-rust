@@ -312,9 +312,9 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>) -> DialFn {
             } else {
                 Box::new(PlainSizeParser)
             };
-            // 7. UDP：VmessUdpConn（chunk 即 packet，Go 非 cone 语义——packet 边界
-            //    必须保持，duplex 流桥会合并多次 write 破坏边界）；TCP：VmessConn
-            //    （内部 spawn 双向 chunk pump；响应头在 down pump 内惰性解码）。
+            // 7. UDP：VmessUdpConn（chunk 即 packet，Go 非 cone 语义——packet 边界 必须保持，duplex
+            //    流桥会合并多次 write 破坏边界）；TCP：VmessConn （内部 spawn 双向 chunk
+            //    pump；响应头在 down pump 内惰性解码）。
             if is_udp {
                 return Ok(Box::new(VmessUdpConn::from_udp_conn(
                     conn,

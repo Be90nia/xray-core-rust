@@ -115,7 +115,8 @@ pub async fn serve_vless(
     let header = listener.header_auth().cloned();
 
     loop {
-        let (stream, peer) = match listener.accept().await {
+        // finalmask.tcp 在 accept 后立即套上（wire 最外层，TLS 握手在其内）。
+        let (stream, peer) = match listener.accept_masked().await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "vless accept failed");
@@ -134,7 +135,9 @@ pub async fn serve_vless(
             let result = if let Some(acc) = tls {
                 // vision splice：TLS accept 消费 socket 前 dup 裸 TCP 克隆，
                 // END/DIRECT 帧后读写直通（Go UnwrapRawConn 等价路径）。
-                let raw_tcp = xray_transport::connection::dup_tcp_stream(&stream);
+                // mask 生效时 wire 字节非明文，裸 socket 克隆不可直接 splice → None
+                // （splice 关闭，走常规 TLS 读；未配 finalmask 时与原路径逐字节一致）。
+                let raw_tcp = stream.plain().and_then(xray_transport::connection::dup_tcp_stream);
                 // 记录对齐读（bd jeu9/e0ni）：rustls deframer 贪婪 recv 会把
                 // 「DIRECT 帧 + 其后端到端裸流」一并拉进 TLS 层（DecryptError
                 // 或半记录滞留，字节不可恢复 → Linux CI 确定性挂）。framer 按
@@ -1198,6 +1201,7 @@ mod tests {
     #[tokio::test]
     async fn vless_outbound_udp_roundtrip_e2e() {
         use std::time::Duration;
+
         use tokio::{net::UdpSocket, time::timeout};
 
         use crate::dispatcher::{VlessOutboundConfig, make_dial_fn};

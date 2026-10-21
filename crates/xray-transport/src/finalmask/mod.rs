@@ -279,6 +279,94 @@ pub fn wrap_conn_server_into_connection(
     Ok(Box::new(AsyncIoConn(wrapped)))
 }
 
+/// 裸 TCP accept 后的连接形态：配了 `finalmask.tcp` 链 → [`Self::Masked`]，
+/// 否则原流 [`Self::Plain`] 直通（零包装、零 dyn 分派）。
+///
+/// 对应 Go `tcp/hub.go` `keepAccepting` 的 `TcpmaskManager.WrapConnServer`：
+/// mask 是 wire 最外层，必须在 TLS/REALITY 握手**之前**套上（TLS 记录跑在 mask 内）。
+pub enum MaybeTcpMaskConn<C> {
+    /// 未配置 finalmask（或 `tcp` 链为空）：原连接直通。
+    Plain(C),
+    /// 已套 server 侧 mask 链（mask 握手在首次读写时完成）。
+    Masked(Box<dyn AsyncIo>),
+}
+
+impl<C> MaybeTcpMaskConn<C> {
+    /// 未 mask 时返回底层裸流——vision splice 的 `dup_tcp_stream` 只能对它做；
+    /// mask 生效时返回 `None`（wire 字节已非明文，裸 socket 克隆不可直接 splice）。
+    #[must_use]
+    pub fn plain(&self) -> Option<&C> {
+        match self {
+            Self::Plain(c) => Some(c),
+            Self::Masked(_) => None,
+        }
+    }
+}
+
+impl<C: AsyncRead + Unpin> AsyncRead for MaybeTcpMaskConn<C> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(c) => std::pin::Pin::new(c).poll_read(cx, buf),
+            Self::Masked(c) => std::pin::Pin::new(c).poll_read(cx, buf),
+        }
+    }
+}
+
+impl<C: AsyncWrite + Unpin> AsyncWrite for MaybeTcpMaskConn<C> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(c) => std::pin::Pin::new(c).poll_write(cx, buf),
+            Self::Masked(c) => std::pin::Pin::new(c).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(c) => std::pin::Pin::new(c).poll_flush(cx),
+            Self::Masked(c) => std::pin::Pin::new(c).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(c) => std::pin::Pin::new(c).poll_shutdown(cx),
+            Self::Masked(c) => std::pin::Pin::new(c).poll_shutdown(cx),
+        }
+    }
+}
+
+/// accept 后按 `finalmask.tcp` 链做 server 侧包装（Go `hub.go` WrapListener）。
+///
+/// 空 manager（未配 finalmask / `tcp` 空数组）→ [`MaybeTcpMaskConn::Plain`]
+/// 原样直通，未配 mask 的既有入站路径逐字节不变。
+///
+/// # Errors
+/// mask 链构造（如 xmc 的 RSA 派生）失败时返回底层 `io::Error`。
+pub fn maybe_mask_server<C: AsyncIo + 'static>(
+    mgr: &TcpmaskManager,
+    conn: C,
+) -> io::Result<MaybeTcpMaskConn<C>> {
+    if mgr.tcpmasks.is_empty() {
+        return Ok(MaybeTcpMaskConn::Plain(conn));
+    }
+    let raw: Box<dyn AsyncIo> = Box::new(conn);
+    Ok(MaybeTcpMaskConn::Masked(apply_tcpmasks(&mgr.tcpmasks, raw, false)?))
+}
+
 /// 便捷入口（TCP 系 transport dial 路径用）：从 `StreamSettings.finalmask_json`
 /// 构建 [`TcpmaskManager`] 并 client 侧包装 conn。
 ///

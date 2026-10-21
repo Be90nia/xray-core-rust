@@ -466,7 +466,8 @@ pub async fn serve_trojan(
     // tcpSettings.header 伪装头（Go hub.go:85-95 authConfig；TLS 解包后应用）。
     let header = listener.header_auth().cloned();
     loop {
-        let (stream, peer) = match listener.accept().await {
+        // finalmask.tcp 在 accept 后立即套上（wire 最外层，TLS 握手在其内）。
+        let (stream, peer) = match listener.accept_masked().await {
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, "trojan accept failed");

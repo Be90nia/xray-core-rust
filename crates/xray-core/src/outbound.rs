@@ -1884,11 +1884,17 @@ fn parse_socks_outbound_config(
 /// None 或非 object 返回 None（走 raw TCP）。
 fn parse_stream_settings(json: &Option<serde_json::Value>) -> Option<StreamSettings> {
     let s = StreamSettings::from_json(json.as_ref());
-    // TCP + 无 security 等于没 streamSettings，返回 None 保持 raw TCP 路径。
-    // 例外（bd enk）：配了 `sockopt` 不折叠——TCP+无 TLS 的 sockopt（如
+    // TCP + 无 security 且无任何 transport 级配置，才等于没 streamSettings
+    // （返回 None 保持既有 raw TCP 路径）。
+    // 例外一（bd enk）：配了 `sockopt` 不折叠——TCP+无 TLS 的 sockopt（如
     // dialerProxy/mark）必须到达 dial_system（Go 中 SocketSettings 存在时
     // sockopt 恒生效，dialer.go:270）。
-    if s.protocol == "tcp" && !s.is_tls() && s.sockopt_json.is_none() { None } else { Some(s) }
+    // 例外二（bd dppv）：`finalmask` / `tcpSettings.header` 是 transport 级伪装，
+    // 折叠成 None 就绕开 tcp transport dialer → mask 与 header 双双静默丢失
+    // （「以为在伪装、实际明文」）。
+    let has_transport_extras =
+        s.sockopt_json.is_some() || s.finalmask_json.is_some() || s.transport_json.is_some();
+    if s.protocol == "tcp" && !s.is_tls() && !has_transport_extras { None } else { Some(s) }
 }
 
 // ========== StubDispatchBridge：协议 stub 注册 ==========
@@ -2573,8 +2579,8 @@ fn parse_dns_domain_rules(
 /// rules[]/rule[] 单条 → `DnsRuleConfig`。
 ///
 /// 对齐 Go `DNSOutboundRuleConfig.Build`（dns_proxy.go:21-56）：
-/// - action 小写匹配 direct/drop/return/hijack，未知值报错（Go 文案）；
-///   缺省 → Direct（本仓 Rust 方言既有行为，Go 缺省报错——宽松面保留兼容）；
+/// - action 小写匹配 direct/drop/return/hijack，未知值报错（Go 文案）； 缺省 → Direct（本仓 Rust
+///   方言既有行为，Go 缺省报错——宽松面保留兼容）；
 /// - qType 为 PortList 展开列表；domain 为 geodata 规则；rCode ≤ 65535。
 fn parse_dns_outbound_rule(
     r: &serde_json::Value,
@@ -4588,6 +4594,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_stream_settings_tcp_finalmask_keeps_some() {
+        // bd dppv：裸 TCP + finalmask 折叠成 None 会绕开 tcp transport dialer，
+        // mask 被静默丢弃（明文上线）。
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{}}]}}"#,
+        )
+        .unwrap();
+        let s = parse_stream_settings(&Some(v)).expect("finalmask must keep Some");
+        assert!(s.finalmask_json.is_some());
+        assert!(!s.is_tls());
+    }
+
+    #[test]
+    fn parse_stream_settings_tcp_header_keeps_some() {
+        // tcpSettings.header 同属 transport 级伪装，折叠会丢 header auth。
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"network":"tcp","tcpSettings":{"header":{"type":"http"}}}"#)
+                .unwrap();
+        let s = parse_stream_settings(&Some(v)).expect("tcpSettings.header must keep Some");
+        assert!(s.transport_json.is_some());
+    }
+
+    #[test]
     fn register_blackhole_parses_response() {
         // 默认 response（空 settings）→ None
         let mut built = BuiltConfig::default();
@@ -6153,18 +6182,23 @@ mod tests {
             fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
                 meta.level() <= &tracing::Level::WARN
             }
+
             fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
                 tracing::span::Id::from_u64(1)
             }
+
             fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
             fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {
             }
+
             fn event(&self, event: &tracing::Event<'_>) {
                 struct Fmt(String);
                 impl tracing::field::Visit for Fmt {
                     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
                         self.0.push_str(&format!("{}={value} ", field.name()));
                     }
+
                     fn record_debug(
                         &mut self,
                         field: &tracing::field::Field,
@@ -6177,7 +6211,9 @@ mod tests {
                 event.record(&mut v);
                 self.0.lock().push(v.0);
             }
+
             fn enter(&self, _span: &tracing::span::Id) {}
+
             fn exit(&self, _span: &tracing::span::Id) {}
         }
 
