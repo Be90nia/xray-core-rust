@@ -27,8 +27,9 @@
 //! - [`inbound`] — [`WireguardInboundHandler`] 实现
 //!   [`InboundHandler`](xray_features::inbound::InboundHandler)
 //!
-//! 当前限制：dispatcher 桥接（smoltcp socket ↔ Xray router）留待后续切片。
-//! dial/start 能创建 socket 与 driver，但实际用户数据拷贝未接入。
+//! 数据面已实装：TCP/UDP 双向经 smoltcp netstack ↔ dispatcher 桥接（`inbound` 收 +
+//! `dispatcher::make_wireguard_dial_fn` 发）。端到端验收见
+//! `tests/integration/wireguard_dataplane_test.rs`。
 
 pub mod config;
 pub mod dispatcher;
