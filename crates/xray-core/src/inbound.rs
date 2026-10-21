@@ -827,18 +827,71 @@ enum RequestBodyPlan {
     Chunked,
 }
 
-/// 判定请求体形态：chunked 声明优先于 Content-Length（对齐 Go ReadRequest）；
-/// CL 非法 → Err（对齐 Go ReadRequest 失败：不回包断链）。
-fn request_body_plan(headers: &HashMap<String, Vec<String>>) -> Result<RequestBodyPlan, ()> {
-    let chunked = headers
-        .get("transfer-encoding")
-        .is_some_and(|vals| vals.iter().any(|v| v.to_ascii_lowercase().contains("chunked")));
+/// 请求定界形态 + 转发用 headers（对齐 Go `fixLength`/`parseTransferEncoding`
+/// 的请求走私加固）：
+/// - 多值 Content-Length 值不一致 / 非纯十进制 / 超 `i64::MAX` → Err（Go `ReadRequest` 报错 →
+///   断链）；
+/// - 值相同的重复 CL → 折叠为一条转发（Go dedupe，issue 16490）；
+/// - chunked 生效 → 转发前删除 CL（RFC 9112 §6.3 中间件义务，即 Go `fixLength` 里的
+///   `header.Del("Content-Length")`），防 CL.TE 走私。
+fn plan_request_framing(
+    headers: &HashMap<String, Vec<String>>,
+) -> Result<(RequestBodyPlan, HashMap<String, Vec<String>>), ()> {
+    let chunked = transfer_encoding_chunked(headers)?;
+    let content_length = framed_content_length(headers)?;
+    let mut forward = headers.clone();
     if chunked {
-        return Ok(RequestBodyPlan::Chunked);
+        forward.remove("content-length");
+        return Ok((RequestBodyPlan::Chunked, forward));
     }
-    match headers.get("content-length").and_then(|vals| vals.first()) {
-        None => Ok(RequestBodyPlan::None),
-        Some(v) => v.trim().parse::<u64>().map(RequestBodyPlan::Length).map_err(|_| ()),
+    let Some(length) = content_length else { return Ok((RequestBodyPlan::None, forward)) };
+    if let Some(values) = forward.get_mut("content-length") {
+        // 值一致性已由 framed_content_length 校验 → 折叠为一条
+        values.truncate(1);
+    }
+    Ok((RequestBodyPlan::Length(length), forward))
+}
+
+/// Transfer-Encoding 是否为 chunked（对齐 Go `parseTransferEncoding`）：只接受
+/// 单个头值且 trim 后等于 `chunked`；多值 / 多编码栈（`gzip, chunked`）/ 未知
+/// 编码 → Err（Go 在该走私敏感面保持严格，报 `unsupportedTEError` 断链）。
+fn transfer_encoding_chunked(headers: &HashMap<String, Vec<String>>) -> Result<bool, ()> {
+    match headers.get("transfer-encoding") {
+        None => Ok(false),
+        Some(values) => match values.as_slice() {
+            [value] if value.trim().eq_ignore_ascii_case("chunked") => Ok(true),
+            _ => Err(()),
+        },
+    }
+}
+
+/// Content-Length 语义值（请求/响应共用）。对齐 Go `parseContentLength`：纯十进制、
+/// 无符号、≤ `i64::MAX`（Go `ParseUint(…, 63)`）；多个头值必须一致（RFC 7230
+/// §3.3.2 走私加固，不一致即拒）。缺失 → `Ok(None)`。
+fn framed_content_length(headers: &HashMap<String, Vec<String>>) -> Result<Option<u64>, ()> {
+    let Some(values) = headers.get("content-length") else { return Ok(None) };
+    let mut length: Option<u64> = None;
+    for value in values {
+        let parsed = parse_content_length_value(value)?;
+        if length.is_some_and(|prev| prev != parsed) {
+            return Err(());
+        }
+        length = Some(parsed);
+    }
+    Ok(length)
+}
+
+/// 单个 Content-Length 值。Go `strconv.ParseUint(value, 10, 63)` 等价：空串 /
+/// 带符号 / 非数字 / 超 `i64::MAX` 全拒（`str::parse::<u64>` 恰好接受 `+5`，
+/// 故先逐字节校验数字）。
+fn parse_content_length_value(value: &str) -> Result<u64, ()> {
+    let value = value.trim();
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(());
+    }
+    match value.parse::<u64>() {
+        Ok(n) if n <= i64::MAX as u64 => Ok(n),
+        _ => Err(()),
     }
 }
 
@@ -894,15 +947,15 @@ where
     use xray_buf::io::{Reader as BufReader, Writer as BufWriter};
 
     // 1. 转发请求构建（绝对 URL → 相对 path，移除 hop-by-hop headers，强制 close）
-    let body_plan = match request_body_plan(&hs.headers) {
+    let (body_plan, forward_headers) = match plan_request_framing(&hs.headers) {
         Ok(plan) => plan,
         Err(()) => {
-            tracing::debug!("http: malformed Content-Length, closing connection");
+            tracing::debug!("http: malformed Content-Length/Transfer-Encoding, closing connection");
             return PlainOutcome::Close;
         },
     };
     let path = extract_request_path(&hs.target);
-    let request_head = build_forwarded_request(&hs.method, &path, &hs.headers);
+    let request_head = build_forwarded_request(&hs.method, &path, &forward_headers);
 
     // 2. 创建 pipe 对，dispatch：生产 DefaultDispatcher::dispatch_link 内部 spawn
     //    后台任务后立即返回（link 由后台持有）；no-handler/后台 dial 失败表现为 下行零字节结束 →
@@ -950,8 +1003,9 @@ where
     Ok(())
 }
 
-/// 下行阶段：读响应头（1xx 透传）→ 按可定界性与客户端 close 语义回写头 +
-/// 精确透传 body。零字节断流/读失败 → 503 兜底（Go responseDone err 分支）。
+/// 下行阶段：读响应头（1xx 透传 / 101 切协议）→ 按可定界性与客户端 close 语义
+/// 回写头 + 精确透传 body。零字节断流 / 头非法 / CL·TE 非法 → 503 兜底
+/// （Go responseDone err 分支）。
 async fn relay_response_phase<W>(
     dn_r: &mut xray_buf::pipe::Reader,
     client_write: &mut W,
@@ -966,24 +1020,40 @@ where
         return PlainOutcome::Close;
     };
 
+    // 101 Switching Protocols：协议已切换，头块原样交客户端（Upgrade /
+    // Connection: Upgrade 是切换的必需语义，RFC 7230 §6.7，不得当 hop-by-hop
+    // 剥掉），随后是裸隧道字节流直至任一端断开（无 HTTP 定界语义）。
+    if head.code == 101 {
+        if client_write.write_all(&serialize_raw_response_head(&head)).await.is_err() {
+            return PlainOutcome::Close;
+        }
+        let _ = copy_until_eof_from_pipe(dn_r, client_write, head.leftover).await;
+        return PlainOutcome::Close;
+    }
+
+    let (content_length, chunked) =
+        match (framed_content_length(&head.headers), transfer_encoding_chunked(&head.headers)) {
+            (Ok(content_length), Ok(chunked)) => (content_length, chunked),
+            // 与请求侧同款走私加固：多值 CL 不一致 / 非法值 / 未知 TE → 503
+            _ => {
+                let _ = client_write.write_all(RESPONSE_SERVICE_UNAVAILABLE).await;
+                return PlainOutcome::Close;
+            },
+        };
+
     // 可定界 = CL 合法声明（含 leftover 不超长——上游超额多发即协议违规不可续）
     // 或无 body（HEAD/204/304）；chunked / close 定界不可续
-    let cl_ok = match parse_response_content_length(&head.headers) {
-        Ok(Some(n)) => head.leftover.len() as u64 <= n,
-        ok_or_err => ok_or_err.is_ok(),
-    };
     let bodyless = hs.method == "HEAD" || head.code == 204 || head.code == 304;
-    let reusable = !response_is_chunked(&head.headers)
-        && cl_ok
-        && (bodyless || matches!(parse_response_content_length(&head.headers), Ok(Some(_))));
+    let cl_ok = content_length.is_none_or(|n| head.leftover.len() as u64 <= n);
+    let reusable = !chunked && cl_ok && (bodyless || content_length.is_some());
     let keep_alive = reusable && !wants_close(&hs.headers);
-    if client_write.write_all(&serialize_response_head(&head, keep_alive)).await.is_err() {
+    if client_write.write_all(&serialize_response_head(&head, keep_alive, chunked)).await.is_err() {
         return PlainOutcome::Close;
     }
 
     let body_ok = if bodyless {
         true
-    } else if let (true, Ok(Some(n))) = (keep_alive, parse_response_content_length(&head.headers)) {
+    } else if let (true, Some(n), false) = (keep_alive, content_length, chunked) {
         copy_exact_n_from_pipe(dn_r, client_write, n, head.leftover).await.is_ok()
     } else {
         // chunked / close 定界：转发头已带 connection: close，上游回完即关，
@@ -1097,7 +1167,9 @@ async fn pipe_write_all(up_w: &mut xray_buf::pipe::Writer, data: &[u8]) -> std::
         .map_err(|_| std::io::Error::other("upstream pipe write failed"))
 }
 
-/// 解析头块（不含结尾空行）为 (状态行, 状态码, headers)。状态行非法 → None。
+/// 解析头块（不含结尾空行）为 (状态行, 状态码, headers)。状态行非法 / 存在无
+/// 冒号的头行 → None（对齐 Go `textproto` 严格语义：坏头行整条响应作废走 503，
+/// 静默跳过会让 `Transfer-Encoding : chunked` 这类畸形行被忽略而按 CL 定界）。
 fn parse_head_block(block: &[u8]) -> Option<(String, u16, HashMap<String, Vec<String>>)> {
     let text = String::from_utf8_lossy(block);
     let mut lines = text.split("\r\n");
@@ -1105,9 +1177,8 @@ fn parse_head_block(block: &[u8]) -> Option<(String, u16, HashMap<String, Vec<St
     let code = status_line.split_whitespace().nth(1)?.parse::<u16>().ok()?;
     let mut headers: HashMap<String, Vec<String>> = HashMap::new();
     for line in lines {
-        if let Some((k, v)) = line.split_once(':') {
-            headers.entry(k.trim().to_ascii_lowercase()).or_default().push(v.trim().to_string());
-        }
+        let (k, v) = line.split_once(':')?;
+        headers.entry(k.trim().to_ascii_lowercase()).or_default().push(v.trim().to_string());
     }
     Some((status_line, code, headers))
 }
@@ -1128,8 +1199,9 @@ where
     loop {
         if let Some(head_end) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
             let (status_line, code, headers) = parse_head_block(&acc[..head_end])?;
-            if (100..200).contains(&code) {
-                // 1xx：原样透传头块，继续读最终响应
+            if (100..200).contains(&code) && code != 101 {
+                // 1xx 中间响应（100-continue/102/103）：原样透传头块，继续读最终响应。
+                // 101 是终态协议切换响应，不是中间响应——走上层裸隧道分支。
                 client_write.write_all(&acc[..head_end + 4]).await.ok()?;
                 acc.drain(..head_end + 4);
                 continue;
@@ -1151,28 +1223,12 @@ where
     }
 }
 
-/// 响应 Content-Length（首个值）。缺失 → Ok(None)；非法值 → Err（上游协议错 →
-/// 503 路径；静默当 0 会截断 body）。
-fn parse_response_content_length(
-    headers: &HashMap<String, Vec<String>>,
-) -> Result<Option<u64>, ()> {
-    match headers.get("content-length").and_then(|vals| vals.first()) {
-        None => Ok(None),
-        Some(v) => v.trim().parse::<u64>().map(Some).map_err(|_| ()),
-    }
-}
-
-/// 响应头是否声明 chunked 传输编码。
-fn response_is_chunked(headers: &HashMap<String, Vec<String>>) -> bool {
-    headers
-        .get("transfer-encoding")
-        .is_some_and(|vals| vals.iter().any(|v| v.to_ascii_lowercase().contains("chunked")))
-}
-
-/// 回写响应头序列化：hop-by-hop 头移除后按 keep_alive 改写连接语义头
+/// 回写响应头序列化：hop-by-hop 头移除 + chunked 时删除 content-length
+/// （RFC 9112 §6.3 / Go `fixLength` 的 `header.Del("Content-Length")`，防把
+/// CL + TE 并存转发给客户端）后按 keep_alive 改写连接语义头
 /// （对齐 Go `RemoveHopByHopHeaders` + `response.Header.Set` 三头/`response.Close`；
 /// 字节格式与 xray-proxy-http server.rs `serialize_response_head` 同款）。
-fn serialize_response_head(head: &ResponseHead, keep_alive: bool) -> Vec<u8> {
+fn serialize_response_head(head: &ResponseHead, keep_alive: bool, chunked: bool) -> Vec<u8> {
     const HOP_BY_HOP: &[&str] = &[
         "connection",
         "keep-alive",
@@ -1187,7 +1243,7 @@ fn serialize_response_head(head: &ResponseHead, keep_alive: bool) -> Vec<u8> {
     buf.extend_from_slice(head.status_line.as_bytes());
     buf.extend_from_slice(b"\r\n");
     for (key, values) in &head.headers {
-        if HOP_BY_HOP.contains(&key.as_str()) {
+        if HOP_BY_HOP.contains(&key.as_str()) || (chunked && key == "content-length") {
             continue;
         }
         for value in values {
@@ -1206,6 +1262,25 @@ fn serialize_response_head(head: &ResponseHead, keep_alive: bool) -> Vec<u8> {
     } else {
         buf.extend_from_slice(b"connection: close\r\nproxy-connection: close\r\n\r\n");
     }
+    buf
+}
+
+/// 101 头块原样回写（不过滤 hop-by-hop、不改连接语义头）：`Upgrade` 与
+/// `Connection: Upgrade` 本身是协议切换的必要载荷（RFC 7230 §6.7），
+/// 剥掉后客户端无法完成升级。
+fn serialize_raw_response_head(head: &ResponseHead) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(256);
+    buf.extend_from_slice(head.status_line.as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    for (key, values) in &head.headers {
+        for value in values {
+            buf.extend_from_slice(key.as_bytes());
+            buf.extend_from_slice(b": ");
+            buf.extend_from_slice(value.as_bytes());
+            buf.extend_from_slice(b"\r\n");
+        }
+    }
+    buf.extend_from_slice(b"\r\n");
     buf
 }
 
@@ -8093,6 +8168,13 @@ mod tests {
     async fn spawn_http_proxy_harness_for_test()
     -> (std::net::SocketAddr, std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
         let (upstream, conns) = spawn_http_upstream_for_test().await;
+        let proxy_addr = spawn_http_proxy_for_test().await;
+        (proxy_addr, upstream, conns)
+    }
+
+    /// serve_http 实例（上游由 DialDispatch 按请求 dest 现拨，脚本化响应桩只需
+    /// 监听自己的地址即可）。
+    async fn spawn_http_proxy_for_test() -> std::net::SocketAddr {
         let ohm = Arc::new(SimpleOhm::new());
         ohm.set_default(Arc::new(DialDispatch) as Arc<dyn xray_app_dispatcher::DispatchHandler>);
         let listener = InboundTcpListener::bind(
@@ -8108,7 +8190,69 @@ mod tests {
             Arc::new(HttpServerConfig::default()),
             Some(std::time::Duration::from_secs(5)),
         ));
-        (proxy_addr, upstream, conns)
+        proxy_addr
+    }
+
+    /// 脚本化上游：按 CL/chunked 定界精确解析一条请求，记录**请求头块原文**
+    /// 后回 `200` + 请求体回显并关闭（转发头强制 connection: close）。
+    /// 返回 (地址, 捕获的请求头块)。
+    async fn spawn_capturing_http_upstream_for_test()
+    -> (std::net::SocketAddr, Arc<std::sync::Mutex<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(std::sync::Mutex::new(String::new()));
+        let cap = Arc::clone(&captured);
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let mut acc: Vec<u8> = Vec::new();
+            let mut head_end: Option<usize> = None;
+            let (_, _, body, _, _) = loop {
+                if head_end.is_none() {
+                    head_end = acc.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4);
+                }
+                if let Some(done) = parse_http_request_for_test(&acc) {
+                    break done;
+                }
+                let mut b = [0u8; 4096];
+                match sock.read(&mut b).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => acc.extend_from_slice(&b[..n]),
+                }
+            };
+            let head_end = head_end.expect("request head must be complete");
+            *cap.lock().unwrap() = String::from_utf8_lossy(&acc[..head_end]).into_owned();
+            let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+            if sock.write_all(resp.as_bytes()).await.is_err()
+                || sock.write_all(&body).await.is_err()
+            {
+                return;
+            }
+            let _ = sock.shutdown().await;
+        });
+        (addr, captured)
+    }
+
+    /// 脚本化上游：读到请求头结束即回写给定原始响应字节，随后关闭。
+    async fn spawn_raw_response_upstream_for_test(response: &'static [u8]) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let mut acc: Vec<u8> = Vec::new();
+            loop {
+                if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                let mut b = [0u8; 4096];
+                match sock.read(&mut b).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => acc.extend_from_slice(&b[..n]),
+                }
+            }
+            let _ = sock.write_all(response).await;
+            let _ = sock.shutdown().await;
+        });
+        addr
     }
 
     /// ft58 S1：同一客户端连接上连续两个 plain HTTP 代理请求均成功且回包正确
@@ -8262,6 +8406,215 @@ mod tests {
         let (status, head, body) = read_http_response_for_test(&mut client).await;
         assert_eq!(status, 200, "request after chunked body must not be misaligned: {head}");
         assert_eq!(body, b"/after-chunked");
+    }
+
+    /// 构造 header map（同名多值逐条 push，模拟线上重复头）。
+    fn framing_headers(pairs: &[(&str, &str)]) -> HashMap<String, Vec<String>> {
+        let mut headers: HashMap<String, Vec<String>> = HashMap::new();
+        for (key, value) in pairs {
+            headers.entry((*key).to_string()).or_default().push((*value).to_string());
+        }
+        headers
+    }
+
+    /// F8：请求定界走私加固（对齐 Go `fixLength`/`parseTransferEncoding`，
+    /// net/http/transfer.go:661）。多值 CL 不一致、非法 CL 值、非单一 chunked
+    /// TE 全部拒绝（Go 侧 `ReadRequest` 报错 → 断链）。
+    #[test]
+    fn request_framing_rejects_conflicting_content_length_and_bad_values() {
+        assert!(
+            plan_request_framing(&framing_headers(&[
+                ("content-length", "5"),
+                ("content-length", "6"),
+            ]))
+            .is_err()
+        );
+        // 空 / 负数 / 带符号 / 非数字 / 超 i64::MAX（Go ParseUint(…, 63) 全拒）
+        for bad in ["", " -1", "+5", "abc", "12a", "9223372036854775808"] {
+            assert!(
+                plan_request_framing(&framing_headers(&[("content-length", bad)])).is_err(),
+                "Content-Length {bad:?} must be rejected"
+            );
+        }
+        // TE：多个头 / 多编码栈 / 未知编码 → 拒绝
+        assert!(
+            plan_request_framing(&framing_headers(&[
+                ("transfer-encoding", "chunked"),
+                ("transfer-encoding", "chunked"),
+            ]))
+            .is_err()
+        );
+        assert!(
+            plan_request_framing(&framing_headers(&[("transfer-encoding", "gzip, chunked")]))
+                .is_err()
+        );
+        assert!(
+            plan_request_framing(&framing_headers(&[("transfer-encoding", "identity")])).is_err()
+        );
+    }
+
+    /// F8：值相同的重复 CL 折叠为一条；chunked 与 CL 并存时 chunked 生效且转发
+    /// 头删除 CL（RFC 9112 §6.3 中间件义务，防 CL.TE 走私；对齐 Go
+    /// `fixLength` 的 `header.Del("Content-Length")`）。
+    #[test]
+    fn request_framing_dedupes_content_length_and_drops_it_for_chunked() {
+        let headers = framing_headers(&[("content-length", "42"), ("content-length", "42")]);
+        let (plan, forward) = plan_request_framing(&headers).unwrap();
+        assert!(matches!(plan, RequestBodyPlan::Length(42)));
+        assert_eq!(forward.get("content-length"), Some(&vec!["42".to_string()]));
+
+        let headers = framing_headers(&[("content-length", "5"), ("transfer-encoding", "chunked")]);
+        let (plan, forward) = plan_request_framing(&headers).unwrap();
+        assert!(matches!(plan, RequestBodyPlan::Chunked));
+        assert!(!forward.contains_key("content-length"), "chunked 生效时 CL 必须删除");
+        assert_eq!(forward.get("transfer-encoding"), Some(&vec!["chunked".to_string()]));
+    }
+
+    /// F8：坏头行（无冒号）不再被静默跳过——整条响应作废走 503（Go textproto
+    /// 严格语义）。静默跳过会让畸形行被忽略而按 CL 定界，留下走私空间。
+    #[test]
+    fn parse_head_block_rejects_header_line_without_colon() {
+        // 头块契约：不含结尾空行（`\r\n\r\n` 已被调用方切掉，最后一行无尾随 CRLF）
+        assert!(parse_head_block(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nbogus").is_none());
+        let (_, code, headers) = parse_head_block(b"HTTP/1.1 200 OK\r\nContent-Length: 5")
+            .expect("well-formed head must parse");
+        assert_eq!(code, 200);
+        assert_eq!(headers.get("content-length"), Some(&vec!["5".to_string()]));
+    }
+
+    /// F8：多值 CL 不一致的请求直接被拒——客户端读到 EOF、零响应字节，且不
+    /// 触发任何上游拨号（对齐 Go `ReadRequest` 失败后不回包断链）。
+    #[tokio::test]
+    async fn http_conflicting_duplicate_content_length_closes_connection() {
+        let (proxy, upstream, upstream_conns) = spawn_http_proxy_harness_for_test().await;
+        let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let upstream_port = upstream.port();
+        client
+            .write_all(
+                format!(
+                    "POST http://127.0.0.1:{upstream_port}/smuggle HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhelloX"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        let mut buf = [0u8; 4096];
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match client.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => resp.extend_from_slice(&buf[..n]),
+                    // Windows：关闭时仍有未读客户端字节（body）→ RST 而非 FIN
+                    // （F6 已知项，不在本修复范围）；协议层判定只看「无响应字节」。
+                    Err(_) => break,
+                }
+            }
+        })
+        .await
+        .expect("malformed request must end the connection");
+        assert!(
+            resp.is_empty(),
+            "no response bytes on framing error: {:?}",
+            String::from_utf8_lossy(&resp)
+        );
+        assert_eq!(
+            upstream_conns.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "framing error must be rejected before dispatch"
+        );
+    }
+
+    /// F8：值相同的重复 CL 转发时只留一条（上游收到的头块里只有一次
+    /// content-length，body 按该长度转发一次）。
+    #[tokio::test]
+    async fn http_identical_duplicate_content_length_is_forwarded_once() {
+        let (upstream, captured) = spawn_capturing_http_upstream_for_test().await;
+        let proxy = spawn_http_proxy_for_test().await;
+        let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let upstream_port = upstream.port();
+        client
+            .write_all(
+                format!(
+                    "POST http://127.0.0.1:{upstream_port}/dup HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (status, head, body) = read_http_response_for_test(&mut client).await;
+        assert_eq!(status, 200, "{head}");
+        assert_eq!(body, b"hello", "body forwarded once per Content-Length");
+
+        let forwarded = captured.lock().unwrap().to_ascii_lowercase();
+        assert_eq!(
+            forwarded.matches("content-length:").count(),
+            1,
+            "duplicate Content-Length must be collapsed: {forwarded}"
+        );
+    }
+
+    /// F8（CL.TE）：CL 与 `Transfer-Encoding: chunked` 并存 → chunked 生效、
+    /// 转发头删除 CL，chunked 帧原样到达上游（不出现「两者都信」）。
+    #[tokio::test]
+    async fn http_content_length_with_chunked_drops_length_on_forward() {
+        let (upstream, captured) = spawn_capturing_http_upstream_for_test().await;
+        let proxy = spawn_http_proxy_for_test().await;
+        let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let upstream_port = upstream.port();
+        client
+            .write_all(
+                format!(
+                    "POST http://127.0.0.1:{upstream_port}/te HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nContent-Length: 999\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (status, head, body) = read_http_response_for_test(&mut client).await;
+        assert_eq!(status, 200, "{head}");
+        assert_eq!(body, b"hello", "chunked body must reach upstream");
+
+        let forwarded = captured.lock().unwrap().to_ascii_lowercase();
+        assert!(forwarded.contains("transfer-encoding: chunked"), "{forwarded}");
+        assert!(
+            !forwarded.contains("content-length"),
+            "Content-Length must be dropped when chunked: {forwarded}"
+        );
+    }
+
+    /// F4：101 Switching Protocols 头块原样交给客户端（`Upgrade` 与
+    /// `Connection: Upgrade` 不被当 hop-by-hop 剥掉，RFC 7230 §6.7），随后是
+    /// 裸隧道字节流直到上游断开。
+    #[tokio::test]
+    async fn http_101_switching_protocols_keeps_upgrade_headers() {
+        let upstream = spawn_raw_response_upstream_for_test(
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n\x00tunnel-bytes",
+        )
+        .await;
+        let proxy = spawn_http_proxy_for_test().await;
+        let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let upstream_port = upstream.port();
+        client
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{upstream_port}/ws HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.read_to_end(&mut resp))
+            .await
+            .expect("101 + tunnel bytes then EOF")
+            .unwrap();
+
+        let text = String::from_utf8_lossy(&resp).to_ascii_lowercase();
+        assert!(text.starts_with("http/1.1 101 switching protocols\r\n"), "{text}");
+        assert!(text.contains("upgrade: websocket"), "Upgrade must survive: {text}");
+        assert!(text.contains("connection: upgrade"), "Connection: Upgrade must survive: {text}");
+        assert!(resp.ends_with(b"\x00tunnel-bytes"), "tunnel bytes must pass through: {resp:?}");
     }
 
     /// b2e：SOCKS UDP ASSOCIATE relay 经 dispatcher（UdpDispatchSession）。
