@@ -224,10 +224,10 @@ async fn pump_request(
 ) -> io::Result<()> {
     let mut accum: Vec<u8> = Vec::new();
     loop {
-        // 尽量从 accum 解析完整帧
-        let mut made_progress = true;
-        while made_progress {
-            made_progress = parse_and_send(
+        // 尽量从 accum 解析完整帧。半帧（UnexpectedEof）= 读边界切开，必须继续
+        // 追加字节而不是当终止帧退出（z7ya：误判会让整条流在突发中途静默死亡）。
+        loop {
+            match parse_and_send(
                 sock,
                 &mut accum,
                 default_target,
@@ -236,11 +236,12 @@ async fn pump_request(
                 skip_noise,
                 resolved,
             )
-            .await?;
-        }
-        // 019n：parse_and_send Ok(false) 但 accum 残留 = 协议层终止帧（Go xudp.go EOF）
-        if !accum.is_empty() {
-            return Ok(());
+            .await?
+            {
+                FrameParse::Progress => {},
+                FrameParse::Terminated => return Ok(()),
+                FrameParse::NeedMore => break,
+            }
         }
         match reader.read_multi_buffer().await {
             Ok(mb) => {
@@ -295,7 +296,18 @@ async fn resolve_udp_domain(
     })
 }
 
-/// 从 accum 前端解析一个 XUDP 帧，逐包应用策略后 send_to，返回 true（有进展）。
+/// 单次帧解析结果（z7ya：区分「半帧」与「协议层终止帧」）。
+///
+/// `Progress`：解析并消费了一帧（已发送或按策略丢弃）；
+/// `NeedMore`：accum 无完整帧（空或半帧）——必须继续读字节，**不是**流结束；
+/// `Terminated`：读到协议层终止帧（019n：非数据帧 / 非法长度头），request 泵退出。
+enum FrameParse {
+    Progress,
+    NeedMore,
+    Terminated,
+}
+
+/// 从 accum 前端解析一个 XUDP 帧，逐包应用策略后 send_to。
 ///
 /// 逐包顺序对齐 Go `PacketWriter.WriteMultiBuffer` :586-656：
 /// 1. override 改写帧目标（:596-601）；
@@ -303,7 +315,7 @@ async fn resolve_udp_domain(
 /// 3. finalRule Block 检查在解析后的 IP 上，命中丢包继续（bd 6x5o，:634-637）；
 /// 4. noises 首包前注入，override 端口 53 时跳过（NoisePacketWriter :668-674）。
 ///
-/// 帧不完整（UnexpectedEof）或 accum 为空返回 false。致命错误返回 Err。
+/// 帧不完整（UnexpectedEof）返回 [`FrameParse::NeedMore`]，致命错误返回 Err。
 async fn parse_and_send(
     sock: &UdpSocket,
     accum: &mut Vec<u8>,
@@ -312,9 +324,9 @@ async fn parse_and_send(
     policy: &UdpPolicy,
     skip_noise: bool,
     resolved: &mut HashMap<String, IpAddr>,
-) -> io::Result<bool> {
+) -> io::Result<FrameParse> {
     if accum.is_empty() {
-        return Ok(false);
+        return Ok(FrameParse::NeedMore);
     }
 
     // 用 Cursor + 同步 PacketReader 解析一帧
@@ -344,7 +356,7 @@ async fn parse_and_send(
                 Some(sa) => sa,
                 None => {
                     let Some(domain) = effective.address().as_domain().map(str::to_string) else {
-                        return Ok(true);
+                        return Ok(FrameParse::Progress);
                     };
                     let ip = match resolved.get(&domain) {
                         Some(ip) => *ip,
@@ -363,7 +375,7 @@ async fn parse_and_send(
                                 // 丢帧继续（Go :627-630 b.Release(); continue；
                                 // Force* 失败同样丢帧——Go :625-628 注释）
                                 tracing::debug!(domain = %domain, "freedom: udp frame dropped, resolve failed: {e}");
-                                return Ok(true);
+                                return Ok(FrameParse::Progress);
                             },
                         },
                     };
@@ -379,7 +391,7 @@ async fn parse_and_send(
                 &effective,
             ) {
                 tracing::debug!(dest = %effective, "freedom: udp packet blocked by final rule");
-                return Ok(true);
+                return Ok(FrameParse::Progress);
             }
             // 首个真实数据报前发送 noises（对齐 Go NoisePacketWriter.WriteMultiBuffer：
             // 噪声包发往同一目标，applyTo 按目标 IP 族过滤，写后按 delay 睡眠；
@@ -390,12 +402,14 @@ async fn parse_and_send(
                 }
             }
             sock.send_to(&data, target).await?;
-            Ok(true)
+            Ok(FrameParse::Progress)
         },
-        Ok(None) => Ok(false), // 流内干净结束，但 accum 可能有残留 → 等更多数据
-        Err(PacketError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Ok(None) => Ok(FrameParse::Terminated), // 019n 终止帧（流内非数据帧）
+        Err(PacketError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            Ok(FrameParse::NeedMore)
+        }, // 半帧：读边界切开，继续读字节而非终止
         // 019n：协议层终止帧
-        Err(PacketError::MetadataTooShort(_)) => Ok(false),
+        Err(PacketError::MetadataTooShort(_)) => Ok(FrameParse::Terminated),
         Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
     }
 }
@@ -815,6 +829,80 @@ mod tests {
             matches!(r, Err(xray_xudp::packet::PacketError::MetadataTooShort(_))),
             "terminator 帧 (body_len<MIN_META_LEN) 应触发 MetadataTooShort, got {r:?}"
         );
+    }
+
+    /// z7ya 回归：帧被读边界切开（半帧）时，request 泵必须继续读字节，
+    /// 不得把半帧误判为协议层终止帧退出——否则该 UDP 流此后全部静默丢包。
+    #[tokio::test]
+    async fn udp_relay_partial_frame_split_across_reads_keeps_pumping() {
+        struct ChunkReader {
+            chunks: Vec<Vec<u8>>,
+            i: usize,
+        }
+        impl Reader for ChunkReader {
+            fn read_multi_buffer(
+                &mut self,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn Future<Output = std::result::Result<MultiBuffer, xray_buf::io::Error>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async move {
+                    let mut mb = MultiBuffer::new();
+                    if self.i < self.chunks.len() {
+                        mb.merge_bytes(&self.chunks[self.i]);
+                        self.i += 1;
+                    }
+                    Ok(mb)
+                })
+            }
+        }
+
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; RECV_BUF_SIZE];
+            let mut got = Vec::new();
+            for _ in 0..2 {
+                match echo.recv_from(&mut buf).await {
+                    Ok((n, _)) => got.push(buf[..n].to_vec()),
+                    Err(_) => break,
+                }
+            }
+            got
+        });
+
+        // 两帧：第一帧 payload 600B（> 300B 切点），第二帧 100B
+        let payload_one = vec![0xABu8; 600];
+        let payload_two = vec![0xCDu8; 100];
+        let dest = udp_dest("127.0.0.1", echo_addr.port());
+        let mut frames = Vec::new();
+        {
+            let mut pw = PacketWriter::new(&mut frames, dest, [7u8; GLOBAL_ID_LEN]);
+            pw.write_packet(&payload_one).unwrap();
+            pw.write_packet(&payload_two).unwrap();
+        }
+        // 第一帧在 300 字节处切断 → 第一次读只有半帧
+        let chunks = vec![frames[..300].to_vec(), frames[300..].to_vec(), Vec::new()];
+
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut reader: Box<dyn Reader> = Box::new(ChunkReader { chunks, i: 0 });
+        let mut noises = None;
+        let policy = UdpPolicy::default();
+        let mut resolved = HashMap::new();
+        pump_request(&sock, echo_addr, &mut reader, &mut noises, &policy, true, &mut resolved)
+            .await
+            .expect("pump ends cleanly at stream EOF");
+
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), echo_task)
+            .await
+            .expect("echo timeout")
+            .expect("echo join");
+        assert_eq!(got.len(), 2, "两帧都必须送达（半帧不得杀掉泵）: {got:?}");
+        assert_eq!(got[0], payload_one, "第一帧（跨读边界）payload 不符");
+        assert_eq!(got[1], payload_two, "第二帧 payload 不符");
     }
 
     // 因原测试依赖 echo socket 关闭驱动 pump_response 退出，但 UDP recv_from 无 EOF 概念
