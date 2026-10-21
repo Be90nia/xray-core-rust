@@ -31,13 +31,23 @@ pub struct HttpOutboundConfig {
     /// 6a5v：servers`0`.headers 解析为 CONNECT 请求附加 header。
     /// 保留插入序（HashMap 默认无序——这里改 Vec 保序）。
     pub headers: Vec<(String, String)>,
+    /// h2 CONNECT（Go proxy/http/client.go:34-46/270-330）：true 时用 HTTP/2 发
+    /// CONNECT 建隧道；false 走 HTTP/1.1 文本 CONNECT。
+    pub h2: bool,
 }
 
 impl HttpOutboundConfig {
     /// 构造配置（无认证，raw TCP）。
     #[must_use]
     pub fn new(server_address: Address, server_port: Port) -> Self {
-        Self { server_address, server_port, auth: None, stream_settings: None, headers: Vec::new() }
+        Self {
+            server_address,
+            server_port,
+            auth: None,
+            stream_settings: None,
+            headers: Vec::new(),
+            h2: false,
+        }
     }
 
     /// 设置认证（builder 风格）。
@@ -103,6 +113,8 @@ pub fn parse_http_config(data: &[u8]) -> Result<HttpOutboundConfig, String> {
             }
         }
     }
+    // h2 CONNECT 开关（缺失=false；Go 侧按 TLS ALPN 协商分流 h1/h2，此处显式配置）。
+    config.h2 = first.get("h2").and_then(|v| v.as_bool()).unwrap_or(false);
     Ok(config)
 }
 /// 构造 HTTP CONNECT 的 DialFn 闭包。
@@ -113,6 +125,8 @@ pub fn parse_http_config(data: &[u8]) -> Result<HttpOutboundConfig, String> {
 /// 3. 读响应直到找到空行（`\r\n\r\n`），检查 200 OK
 /// 4. 返回连接（隧道已建立，双向透传）
 ///
+/// 配置 `h2=true` 时整体走 [`establish_h2_tunnel`]（HTTP/2 CONNECT 隧道）。
+///
 /// # Panics
 ///
 /// 不会 panic；任何错误以 `Err(String)` 返回。
@@ -122,6 +136,9 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
         let target_host = dest.address().to_string();
         let target_port = dest.port().value();
         Box::pin(async move {
+            if config.h2 {
+                return establish_h2_tunnel(Arc::clone(&config), target_host, target_port).await;
+            }
             // 拨号到上游 HTTP 代理
             use xray_common::net::{address::Address, destination::Destination, network::Network};
             let server_addr = match &config.server_address {
@@ -254,6 +271,225 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
     })
 }
 
+/// h2 CONNECT 隧道：h2 客户端直驱 → CONNECT 请求 → SendStream/RecvStream
+/// 适配成 [`Connection`]。
+///
+/// 对齐 Go proxy/http/client.go `connectHTTP2` + `newHTTP2Conn`/`http2Conn`：
+/// `send_request(CONNECT, eos=false)` 的 SendStream = 写端，200 响应的
+/// RecvStream = 读端。不走 hyper 客户端——hyper 1.x 对 CONNECT 不 poll 请求
+/// body（`proto/h2/client.rs` 仅 `!f.is_connect` 才 PipeToSendStream），隧道
+/// 上行无法接线；h2 crate 是 workspace 既有依赖，且与 Go `http2.ClientConn`
+/// 同层（Go 同样绕过 net/http 直接 RoundTrip）。
+/// 请求头同 Go h2 路径（Proxy-Authorization + config.headers + nav 伪装），
+/// 不发 `Proxy-Connection`（连接性头 h2 禁传，Go 仅 connectHTTP1 设置）。
+/// h2 流控窗口对齐 splithttp dialer（缺省 2MB 窗在长肥管道成吞吐钉）。
+///
+/// 失败语义（bd cjwc G5 同 HTTP/1.1 路径）：连接级失败（dial/handshake/
+/// send_request 传输错误）走 `exponential_backoff(5, 100)`；非 200 属响应性
+/// 失败，不重试。
+///
+/// Go 还按 destination 缓存 h2 ClientConn（cachedH2Conns）复用连接；此处每次
+/// 拨号新建 h2 连接（池化留待框架层统一处理）。
+async fn establish_h2_tunnel(
+    config: Arc<HttpOutboundConfig>,
+    target_host: String,
+    target_port: u16,
+) -> Result<Box<dyn Connection>, String> {
+    use xray_common::net::network::Network;
+
+    let server_dest =
+        Destination::new(config.server_address.clone(), config.server_port, Network::TCP);
+    let sockopt = config.stream_settings.as_ref().map(|s| s.socket_options()).unwrap_or_default();
+    let host_port = format!("{target_host}:{target_port}");
+
+    let (send_stream, response, remote_addr, local_addr) =
+        xray_transport::retry::exponential_backoff(5, 100, || async {
+            let conn: Box<dyn Connection> = match &config.stream_settings {
+                Some(s) => dial(&server_dest, s, &sockopt)
+                    .await
+                    .map_err(|e| format!("http dial proxy ({}): {e}", s.protocol))?,
+                None => xray_transport::system_dialer::dial_system(&server_dest, &sockopt)
+                    .await
+                    .map_err(|e| format!("http dial proxy (tcp): {e}"))?,
+            };
+            let remote_addr = conn.remote_addr().ok().flatten();
+            let local_addr = conn.local_addr().ok().flatten();
+
+            let mut builder = h2::client::Builder::new();
+            builder
+                .initial_window_size(32 * 1024 * 1024)
+                .initial_connection_window_size(32 * 1024 * 1024);
+            let (mut h2, conn_driver) = builder
+                .handshake::<Box<dyn Connection>, bytes::Bytes>(conn)
+                .await
+                .map_err(|e| format!("h2 handshake: {e}"))?;
+            tokio::spawn(async move {
+                if let Err(e) = conn_driver.await {
+                    tracing::debug!(
+                        target: "xray.http.outbound",
+                        error = %e,
+                        "h2 connection driver ended"
+                    );
+                }
+            });
+
+            let mut req_builder =
+                http::Request::builder().method(http::Method::CONNECT).uri(host_port.as_str());
+            let headers = req_builder
+                .headers_mut()
+                .ok_or_else(|| format!("h2 CONNECT invalid authority: {host_port}"))?;
+            if let Some(auth) = &config.auth {
+                let credentials = format!("{}:{}", auth.username, auth.password);
+                let value =
+                    http::HeaderValue::from_str(&format!("Basic {}", base64_encode(&credentials)))
+                        .map_err(|e| format!("h2 Proxy-Authorization encode: {e}"))?;
+                headers.insert(http::header::PROXY_AUTHORIZATION, value);
+            }
+            let mut config_headers = config.headers.clone();
+            xray_common::browser::try_default_headers_with(&mut config_headers, "nav");
+            for (k, v) in &config_headers {
+                let name = http::HeaderName::from_bytes(k.as_bytes())
+                    .map_err(|e| format!("h2 header name '{k}': {e}"))?;
+                let value = http::HeaderValue::from_str(v)
+                    .map_err(|e| format!("h2 header '{k}' value '{v}': {e}"))?;
+                headers.insert(name, value);
+            }
+            let request =
+                req_builder.body(()).map_err(|e| format!("h2 build CONNECT request: {e}"))?;
+
+            // eos=false：CONNECT 双向隧道，END_STREAM 由 poll_shutdown 发出
+            // （Go：req.Body = io.Pipe，Close 时 pipe 写端关闭同语义）。
+            let (response, send_stream) =
+                h2.send_request(request, false).map_err(|e| format!("h2 send CONNECT: {e}"))?;
+            let response = response.await.map_err(|e| format!("h2 CONNECT response: {e}"))?;
+            Ok::<_, String>((send_stream, response, remote_addr, local_addr))
+        })
+        .await
+        .map_err(|e| format!("http dial proxy: retries exhausted: {e}"))?;
+
+    if response.status() != http::StatusCode::OK {
+        return Err(format!("http CONNECT proxy returned non-200: {}", response.status()));
+    }
+
+    Ok(Box::new(H2TunnelConn {
+        send_stream,
+        recv_stream: response.into_body(),
+        read_buf: None,
+        remote_addr,
+        local_addr,
+    }))
+}
+
+/// h2 CONNECT 隧道连接（Go proxy/http/client.go `http2Conn` 同构）：
+/// 读 = RecvStream（响应方向），写 = SendStream（请求方向）。
+struct H2TunnelConn {
+    send_stream: h2::SendStream<bytes::Bytes>,
+    recv_stream: h2::RecvStream,
+    /// poll_data 返回的 chunk 超出调用方 ReadBuf 时的存量。
+    read_buf: Option<bytes::Bytes>,
+    remote_addr: Option<std::net::SocketAddr>,
+    local_addr: Option<std::net::SocketAddr>,
+}
+
+impl tokio::io::AsyncRead for H2TunnelConn {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        if let Some(chunk) = this.read_buf.take() {
+            if !chunk.is_empty() {
+                let n = chunk.len().min(buf.remaining());
+                buf.put_slice(&chunk[..n]);
+                this.read_buf = if n < chunk.len() { Some(chunk.slice(n..)) } else { None };
+                return std::task::Poll::Ready(Ok(()));
+            }
+        }
+        match this.recv_stream.poll_data(cx) {
+            std::task::Poll::Ready(Some(Ok(chunk))) => {
+                // 立即归还接收窗：不释放则窗口耗尽服务端停发（h2 背压正确映射）。
+                let _ = this.recv_stream.flow_control().release_capacity(chunk.len());
+                let n = chunk.len().min(buf.remaining());
+                buf.put_slice(&chunk[..n]);
+                if n < chunk.len() {
+                    this.read_buf = Some(chunk.slice(n..));
+                }
+                std::task::Poll::Ready(Ok(()))
+            },
+            // None = 服务端 END_STREAM = 隧道读向关闭；写向独立存活（半关语义，
+            // 同 Go http2Conn：resp.Body 读尽不断 pipe 写端）。
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(())),
+            std::task::Poll::Ready(Some(Err(e))) => {
+                std::task::Poll::Ready(Err(std::io::Error::other(e)))
+            },
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for H2TunnelConn {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = &mut *self;
+        if buf.is_empty() {
+            return std::task::Poll::Ready(Ok(0));
+        }
+        // reserve_capacity 是流式需求量；Pending 时未消费 buf 任何字节，
+        // 调用方以原 buf 重试即可（tokio AsyncWrite 契约），容量到位由
+        // poll_capacity 唤醒——h2 流控窗耗尽时写端自然背压。
+        this.send_stream.reserve_capacity(buf.len());
+        match this.send_stream.poll_capacity(cx) {
+            std::task::Poll::Ready(Some(Ok(cap))) => {
+                let n = cap.min(buf.len());
+                let chunk = bytes::Bytes::copy_from_slice(&buf[..n]);
+                this.send_stream.send_data(chunk, false).map_err(std::io::Error::other)?;
+                std::task::Poll::Ready(Ok(n))
+            },
+            // None = 流已被 reset/关闭
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "h2 send stream closed",
+            ))),
+            std::task::Poll::Ready(Some(Err(e))) => {
+                std::task::Poll::Ready(Err(std::io::Error::other(e)))
+            },
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        // DATA 帧在 reserve/send 时已入 h2 栈，无独立 flush 语义。
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        // 半关：空 DATA + END_STREAM（Go http2Conn.Close 的 pipe 写端关闭同语义）。
+        let this = &mut *self;
+        this.send_stream.send_data(bytes::Bytes::new(), true).map_err(std::io::Error::other)?;
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl Connection for H2TunnelConn {
+    fn remote_addr(&self) -> std::io::Result<Option<std::net::SocketAddr>> {
+        Ok(self.remote_addr)
+    }
+
+    fn local_addr(&self) -> std::io::Result<Option<std::net::SocketAddr>> {
+        Ok(self.local_addr)
+    }
+}
+
 /// Base64 编码（RFC 4648）——不依赖 base64 crate，最小实现。
 fn base64_encode(input: &str) -> String {
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -357,6 +593,23 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn h2_config_parses() {
+        let data = r#"{
+            "servers": [{
+                "address": "proxy.example.com",
+                "port": 443,
+                "h2": true
+            }]
+        }"#;
+        let config = parse_http_config(data.as_bytes()).unwrap();
+        assert!(config.h2, "servers[0].h2=true must parse to h2=true");
+
+        let missing = r#"{ "servers": [{ "address": "proxy.example.com", "port": 443 }] }"#;
+        let config = parse_http_config(missing.as_bytes()).unwrap();
+        assert!(!config.h2, "h2 must default to false when absent");
+    }
+
     #[tokio::test]
     async fn connect_request_carries_chrome_masquerade_and_proxy_connection() {
         // 0w9l（Go client.go:223/226）：CONNECT 无 UA 时补整套 chrome 导航伪装头
@@ -404,6 +657,74 @@ mod tests {
             .find(|l| l.starts_with("User-Agent: "))
             .expect("UA header must be present");
         assert!(ua_line.contains("Chrome/"), "UA must masquerade as Chrome: {ua_line}");
+    }
+
+    /// h2 CONNECT 隧道往返（A-1）：本地 hyper h2 server 只接 CONNECT，200 后双向
+    /// 回显；client 配 `h2=true` 应经 h2 CONNECT 建隧道并多轮往返。
+    #[tokio::test]
+    async fn http_outbound_h2_connect_tunnel_roundtrip() {
+        use http_body_util::Empty;
+        use hyper::{Request, body::Incoming, service::service_fn};
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else { break };
+                let io = TokioIo::new(sock);
+                let service = service_fn(|req: Request<Incoming>| async move {
+                    assert_eq!(
+                        req.method(),
+                        &hyper::Method::CONNECT,
+                        "test h2 server only accepts CONNECT"
+                    );
+                    // hyper h2 服务端对成功 CONNECT 走 upgrade 通道接管流（服务
+                    // 响应 body 被忽略）：隧道 IO 经 hyper::upgrade::on 取出后回环
+                    // （Upgraded 是 hyper Read/Write，TokioIo 适配回 tokio traits）。
+                    tokio::spawn(async move {
+                        if let Ok(upgraded) = hyper::upgrade::on(req).await {
+                            let mut io = TokioIo::new(upgraded);
+                            let mut buf = [0u8; 8192];
+                            loop {
+                                match io.read(&mut buf).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => {
+                                        if io.write_all(&buf[..n]).await.is_err() {
+                                            break;
+                                        }
+                                    },
+                                }
+                            }
+                        }
+                    });
+                    Ok::<_, std::convert::Infallible>(
+                        hyper::Response::builder()
+                            .status(hyper::StatusCode::OK)
+                            .body(Empty::<bytes::Bytes>::new())
+                            .unwrap(),
+                    )
+                });
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(io, service)
+                    .await;
+            }
+        });
+
+        let mut cfg =
+            HttpOutboundConfig::new(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(port));
+        cfg.h2 = true;
+        let dial_fn = make_http_dial_fn(Arc::new(cfg));
+        let dest = Destination::tcp(Address::new_domain("target.example.com"), Port::new(443));
+        let mut conn = dial_fn(&dest).await.expect("h2 CONNECT tunnel must establish");
+
+        for msg in [b"first ping over h2".as_slice(), b"2nd".as_slice()] {
+            conn.write_all(msg).await.unwrap();
+            conn.flush().await.unwrap();
+            let mut buf = vec![0u8; msg.len()];
+            conn.read_exact(&mut buf).await.unwrap();
+            assert_eq!(buf, msg, "h2 tunnel echo roundtrip mismatch");
+        }
     }
 
     #[tokio::test(start_paused = true)]

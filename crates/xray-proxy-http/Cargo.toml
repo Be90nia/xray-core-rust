@@ -18,6 +18,15 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 xray-app-dispatcher = { path = "../xray-app-dispatcher" }
 serde_json = { workspace = true }
+# h2 CONNECT 隧道（A-1）：h2 客户端直驱（hyper 1.x 客户端对 CONNECT 不 poll
+# 请求 body，见 establish_h2_tunnel 注释）；全部为既有 workspace 依赖
+bytes = { workspace = true }
+h2 = { workspace = true }
+http = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+# 测试专用 h2 server（hyper 1.x server 支持 CONNECT）
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
