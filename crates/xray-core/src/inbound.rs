@@ -11,7 +11,7 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncRead, AsyncReadExt, AsyncWrite},
     net::{TcpStream, UdpSocket},
     task::JoinHandle,
 };
@@ -68,7 +68,9 @@ use xray_proxy_vmess::{
     serve_vmess,
 };
 use xray_proxy_wireguard::DeviceConfig;
-use xray_transport::{link::Link, system_listener::InboundTcpListener};
+use xray_transport::{
+    finalmask::MaybeTcpMaskConn, link::Link, system_listener::InboundTcpListener,
+};
 use xray_transport_hysteria::quinn_adapter::QuinnListenerFactory;
 
 /// accept 错误退避：fd 耗尽（EMFILE/ENFILE）时睡眠 500ms 再重试——否则 accept 立即
@@ -114,7 +116,8 @@ pub async fn serve_socks5(
     );
 
     loop {
-        let (stream, peer) = match listener.accept().await {
+        // finalmask.tcp：accept 后立即套上（wire 最外层；未配 mask → Plain 直通）
+        let (stream, peer) = match listener.accept_masked().await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "socks5 accept failed");
@@ -197,6 +200,132 @@ impl InboundConnMeta for Box<dyn xray_transport::connection::Connection> {
         (new_reader(rd), new_writer(wr))
     }
 }
+
+/// finalmask.tcp 包装后的裸 TCP 入站连接（bd dppv 余项：socks/mixed/http/
+/// dokodemo/dns 五类裸 TCP 入站复用同一套 serve 逻辑）。
+///
+/// mask 生效时 wire 字节已非明文：raw fd 克隆会绕过解伪装链，故
+/// [`Self::splice_raw_clone`] / [`Self::is_raw_inbound`] 一律按「不可 splice」；
+/// 读侧退回顺序读（readv 只对真 socket 有意义）。
+impl InboundConnMeta for MaybeTcpMaskConn<TcpStream> {
+    fn splice_raw_clone(&self) -> Option<TcpStream> {
+        xray_transport::connection::dup_tcp_stream(self.plain()?)
+    }
+
+    fn inbound_local(&self) -> Option<SocketAddr> {
+        self.plain()?.local_addr().ok()
+    }
+
+    fn is_raw_inbound(&self) -> bool {
+        self.plain().is_some()
+    }
+
+    fn into_link_io(self) -> (Box<dyn Reader>, Box<dyn Writer>) {
+        match self {
+            Self::Plain(c) => c.into_link_io(),
+            Self::Masked(m) => {
+                let (rd, wr) = tokio::io::split(m);
+                (new_reader(rd), new_writer(wr))
+            },
+        }
+    }
+}
+
+/// 首字节嗅探用的预读包装（mixed 靠第 1 字节分流 socks 与 HTTP）。
+///
+/// mask 生效时底层是密文套壳、拿不到 socket `peek`，故把读到的明文留在
+/// `peeked`、由 [`tokio::io::AsyncRead`] 优先回放；未配 mask 时 peek 直通
+/// `TcpStream::peek`，不产生任何缓冲（行为与 dppv 之前逐字节一致）。
+struct PeekAhead {
+    conn: MaybeTcpMaskConn<TcpStream>,
+    peeked: Vec<u8>,
+}
+
+impl PeekAhead {
+    fn new(conn: MaybeTcpMaskConn<TcpStream>) -> Self {
+        Self { conn, peeked: Vec::new() }
+    }
+
+    /// 预读明文（语义同 `TcpStream::peek`：字节不消费，EOF 返回 0）。
+    async fn peek(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(c) = self.conn.plain() {
+            return c.peek(buf).await;
+        }
+        if self.peeked.is_empty() && !buf.is_empty() {
+            let mut tmp = vec![0u8; buf.len()];
+            let n = self.conn.read(&mut tmp).await?;
+            self.peeked.extend_from_slice(&tmp[..n]);
+        }
+        let n = self.peeked.len().min(buf.len());
+        buf[..n].copy_from_slice(&self.peeked[..n]);
+        Ok(n)
+    }
+}
+
+impl AsyncRead for PeekAhead {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if !this.peeked.is_empty() {
+            let n = this.peeked.len().min(buf.remaining());
+            buf.put_slice(&this.peeked[..n]);
+            this.peeked.drain(..n);
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut this.conn).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for PeekAhead {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().conn).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().conn).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().conn).poll_shutdown(cx)
+    }
+}
+
+impl InboundConnMeta for PeekAhead {
+    fn splice_raw_clone(&self) -> Option<TcpStream> {
+        self.conn.splice_raw_clone()
+    }
+
+    fn inbound_local(&self) -> Option<SocketAddr> {
+        self.conn.inbound_local()
+    }
+
+    fn is_raw_inbound(&self) -> bool {
+        self.conn.is_raw_inbound()
+    }
+
+    fn into_link_io(self) -> (Box<dyn Reader>, Box<dyn Writer>) {
+        if self.peeked.is_empty() {
+            return self.conn.into_link_io();
+        }
+        // 预读过明文：必须连缓冲一起交给读侧回放，不能直接拆底层 conn。
+        let (rd, wr) = tokio::io::split(self);
+        (new_reader(rd), new_writer(wr))
+    }
+}
+
 /// 处理单个 SOCKS 连接：handshake → dispatch（TCP CONNECT）或 UDP relay。
 ///
 /// 泛型流：TcpStream（TCP 监听）与 UDS `Box<dyn Connection>`（vodx unix
@@ -459,7 +588,8 @@ async fn serve_mixed(
         .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
     tracing::info!(addr = %listener.local_addr()?, "mixed (socks+http) inbound listening");
     loop {
-        let (mut stream, peer) = match listener.accept().await {
+        // finalmask.tcp：accept 后立即套上（mask 在协议嗅探之前——嗅探读到的是明文）
+        let (stream, peer) = match listener.accept_masked().await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "mixed accept failed");
@@ -467,6 +597,7 @@ async fn serve_mixed(
                 continue;
             },
         };
+        let mut stream = PeekAhead::new(stream);
         let handler = Arc::clone(&handler);
         let socks_cfg = Arc::clone(&socks_cfg);
         let http_cfg = Arc::clone(&http_cfg);
@@ -499,9 +630,10 @@ async fn serve_mixed(
                         let dest = socks_addr_to_destination(&addr, Network::TCP);
                         // bd 2b1c：access 带 from（process/source 规则 + access log 来源）
                         let access = http_inbound_access(&stream, peer);
-                        // plain TCP：readv 多缓冲聚合读（bd 2o9l，Go NewReader readv 分支）
-                        let (read_half, write_half) = stream.into_split();
-                        let link = Link::new(new_readv_reader(read_half), new_writer(write_half));
+                        // 拆流按连接类型分发（裸 TCP → readv 聚合读；mask 生效 →
+                        // 顺序读，见 InboundConnMeta）
+                        let (reader, writer) = stream.into_link_io();
+                        let link = Link::new(reader, writer);
                         if is_mux_destination(&dest) {
                             tokio::spawn(handle_mux_inbound_link(link, handler, None));
                         } else {
@@ -543,9 +675,8 @@ async fn serve_mixed(
                     handle_plain_http(&mut stream, &hs, Arc::clone(&handler), access).await;
                 } else {
                     let dest = hs.dest;
-                    // plain TCP：readv 多缓冲聚合读（bd 2o9l，Go NewReader readv 分支）
-                    let (read_half, write_half) = stream.into_split();
-                    let link = Link::new(new_readv_reader(read_half), new_writer(write_half));
+                    let (reader, writer) = stream.into_link_io();
+                    let link = Link::new(reader, writer);
                     if is_mux_destination(&dest) {
                         tokio::spawn(handle_mux_inbound_link(link, handler, None));
                     } else {
@@ -578,7 +709,8 @@ pub async fn serve_http(
         .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
     tracing::info!(addr = %listener.local_addr()?, "http proxy inbound listening");
     loop {
-        let (mut stream, peer) = match listener.accept().await {
+        // finalmask.tcp：accept 后立即套上（mask 在 HTTP 握手之前）
+        let (mut stream, peer) = match listener.accept_masked().await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "http accept failed");
@@ -628,9 +760,8 @@ pub async fn serve_http(
                 // 3. CONNECT：拆 stream → Link → dispatch（隧道内不再是 HTTP 请求
                 // 边界，隧道结束即关连接，不回循环——对齐 Go handleConnect return）
                 let dest = hs.dest;
-                // plain TCP：readv 多缓冲聚合读（bd 2o9l，Go NewReader readv 分支）
-                let (read_half, write_half) = stream.into_split();
-                let link = Link::new(new_readv_reader(read_half), new_writer(write_half));
+                let (reader, writer) = stream.into_link_io();
+                let link = Link::new(reader, writer);
                 // zx7: mux.cool dest 转给 mux ServerWorker（stub）
                 if is_mux_destination(&dest) {
                     tracing::info!(
@@ -650,8 +781,8 @@ pub async fn serve_http(
 ///
 /// bd 2b1c：此前 HTTP 路径 dispatch 不带 access，from 为空 → process/source
 /// 规则永不命中、access log 缺来源。socks 分支同款见 handle_connection。
-fn http_inbound_access(
-    stream: &TcpStream,
+fn http_inbound_access<S: InboundConnMeta>(
+    stream: &S,
     peer: std::net::SocketAddr,
 ) -> xray_app_dispatcher::AccessContext {
     let conn = stream.splice_raw_clone().map(Arc::new);
@@ -659,7 +790,12 @@ fn http_inbound_access(
         from: peer.to_string(),
         local: stream.inbound_local().map(|a| a.to_string()).unwrap_or_default(),
         conn,
-        can_splice_copy: xray_common::platform::splice::CAN_SPLICE_COPY_YES,
+        // mask 生效时 wire 已非明文（raw fd 克隆绕过解伪装链）→ 不可 splice
+        can_splice_copy: if stream.is_raw_inbound() {
+            xray_common::platform::splice::CAN_SPLICE_COPY_YES
+        } else {
+            xray_common::platform::splice::CAN_SPLICE_COPY_NEVER
+        },
         ..Default::default()
     }
 }
@@ -735,12 +871,15 @@ const MAX_RESPONSE_HEAD_BYTES: usize = 64 * 1024;
 /// 下一请求）；响应按可定界性回写连接语义头：Content-Length 定界或无 body
 /// （HEAD/204/304）→ 可续连（Go `response.ContentLength >= 0` 分支）；chunked /
 /// close 定界 → close 头断链（Go `response.Close = true`）。返回是否回循环。
-async fn handle_plain_http(
-    client: &mut TcpStream,
+async fn handle_plain_http<S>(
+    client: &mut S,
     hs: &HandshakeResult,
     handler: Arc<dyn DispatchHandler>,
     access: xray_app_dispatcher::AccessContext,
-) -> PlainOutcome {
+) -> PlainOutcome
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     use xray_buf::io::{Reader as BufReader, Writer as BufWriter};
 
     // 1. 转发请求构建（绝对 URL → 相对 path，移除 hop-by-hop headers，强制 close）
@@ -764,7 +903,7 @@ async fn handle_plain_http(
     let dest = hs.dest.clone();
     handler.dispatch_with_access(&dest, link, access).await;
 
-    let (mut client_read, mut client_write) = client.split();
+    let (mut client_read, mut client_write) = tokio::io::split(client);
 
     // 3. requestDone：头 + 请求体边界精确转发
     let req_ok =
@@ -782,12 +921,15 @@ async fn handle_plain_http(
 
 /// 上行阶段：转发请求头 + 请求体（CL 定长 / chunked 逐帧，到边界即止）。
 /// 客户端中途断开/帧错位 → Err。
-async fn forward_request_phase(
-    client_read: &mut tokio::net::tcp::ReadHalf<'_>,
+async fn forward_request_phase<R>(
+    client_read: &mut R,
     up_w: &mut xray_buf::pipe::Writer,
     request_head: &[u8],
     body_plan: RequestBodyPlan,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
     pipe_write_all(up_w, request_head).await?;
     match body_plan {
         RequestBodyPlan::None => {},
@@ -799,11 +941,14 @@ async fn forward_request_phase(
 
 /// 下行阶段：读响应头（1xx 透传）→ 按可定界性与客户端 close 语义回写头 +
 /// 精确透传 body。零字节断流/读失败 → 503 兜底（Go responseDone err 分支）。
-async fn relay_response_phase(
+async fn relay_response_phase<W>(
     dn_r: &mut xray_buf::pipe::Reader,
-    client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+    client_write: &mut W,
     hs: &HandshakeResult,
-) -> PlainOutcome {
+) -> PlainOutcome
+where
+    W: AsyncWrite + Unpin,
+{
     use tokio::io::AsyncWriteExt;
     let Some(head) = read_response_head(dn_r, client_write).await else {
         let _ = client_write.write_all(RESPONSE_SERVICE_UNAVAILABLE).await;
@@ -838,11 +983,14 @@ async fn relay_response_phase(
 }
 
 /// 从客户端定长转发 n 字节请求体到上游 pipe。提前 EOF → Err（静默截断不可接受）。
-async fn relay_exact_request_body(
-    client_read: &mut tokio::net::tcp::ReadHalf<'_>,
+async fn relay_exact_request_body<R>(
+    client_read: &mut R,
     up_w: &mut xray_buf::pipe::Writer,
     mut remaining: u64,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
     use tokio::io::AsyncReadExt;
     let mut buf = [0u8; 8192];
     while remaining > 0 {
@@ -863,10 +1011,13 @@ async fn relay_exact_request_body(
 /// chunked 请求体逐帧转发（帧字节原样透传，不解码重编码——转发头保留
 /// transfer-encoding，与 Go ReadRequest 解码 + request.Write 重编码线路上等价）。
 /// 到终止块为止，不多读一字节：多余字节属流水线上的下一请求。
-async fn relay_chunked_request_body(
-    client_read: &mut tokio::net::tcp::ReadHalf<'_>,
+async fn relay_chunked_request_body<R>(
+    client_read: &mut R,
     up_w: &mut xray_buf::pipe::Writer,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
     use tokio::io::AsyncReadExt;
     loop {
         let size_line = read_client_line(client_read).await?;
@@ -895,9 +1046,10 @@ async fn relay_chunked_request_body(
 }
 
 /// 读一行（到 CRLF，不含 CRLF）。请求体阶段 EOF 一律错误（半途断开 = 协议失败）。
-async fn read_client_line(
-    client_read: &mut tokio::net::tcp::ReadHalf<'_>,
-) -> std::io::Result<String> {
+async fn read_client_line<R>(client_read: &mut R) -> std::io::Result<String>
+where
+    R: AsyncRead + Unpin,
+{
     use tokio::io::AsyncReadExt;
     const MAX_LINE_BYTES: usize = 16 * 1024;
     let mut buf: Vec<u8> = Vec::with_capacity(64);
@@ -953,10 +1105,13 @@ fn parse_head_block(block: &[u8]) -> Option<(String, u16, HashMap<String, Vec<St
 /// 1xx 中间响应头块原样透传给客户端后继续读最终响应（对齐 Go
 /// `readResponseAndHandle100Continue`）。零字节断流/头块超限/中途断流/状态行
 /// 非法 → None（调用方 503 兜底）。
-async fn read_response_head(
+async fn read_response_head<W>(
     dn_r: &mut xray_buf::pipe::Reader,
-    client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-) -> Option<ResponseHead> {
+    client_write: &mut W,
+) -> Option<ResponseHead>
+where
+    W: AsyncWrite + Unpin,
+{
     use tokio::io::AsyncWriteExt;
     let mut acc: Vec<u8> = Vec::with_capacity(1024);
     loop {
@@ -1045,12 +1200,15 @@ fn serialize_response_head(head: &ResponseHead, keep_alive: bool) -> Vec<u8> {
 
 /// 定长透传响应 body：先写头块捎带的 leftover 前缀，再从 pipe 读满剩余。
 /// 上游提前断流 → Err（静默截断不可接受）。
-async fn copy_exact_n_from_pipe(
+async fn copy_exact_n_from_pipe<W>(
     dn_r: &mut xray_buf::pipe::Reader,
-    client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+    client_write: &mut W,
     n: u64,
     leftover: Vec<u8>,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     use tokio::io::AsyncWriteExt;
     let mut remaining = n;
     let take = leftover.len().min(remaining as usize);
@@ -1082,11 +1240,14 @@ async fn copy_exact_n_from_pipe(
 
 /// close/chunked 定界响应透传：leftover 前缀 + 读到断流为止
 /// （转发头已带 connection: close，上游回完即关，EOF 即响应终点）。
-async fn copy_until_eof_from_pipe(
+async fn copy_until_eof_from_pipe<W>(
     dn_r: &mut xray_buf::pipe::Reader,
-    client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+    client_write: &mut W,
     leftover: Vec<u8>,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     use tokio::io::AsyncWriteExt;
     if !leftover.is_empty() {
         client_write.write_all(&leftover).await?;
@@ -1238,8 +1399,15 @@ pub async fn serve_dokodemo(
         tls = opts.tls.is_some(),
         "dokodemo inbound listening"
     );
+    // mask 生效时 conn 的 local_addr 随 TcpStream 进了 dyn 包装，拿不到：
+    // 回退 listener 自身地址（wildcard bind 时略异于 conn 实际地址，够 port_map/
+    // followRedirect 判定用）。
+    // shortcut: masked + wildcard bind 的 local_addr 精度，等 MaybeTcpMaskConn 暴露
+    // 地址再补。
+    let listener_local = listener.local_addr().ok();
     loop {
-        let (stream, _peer) = match listener.accept().await {
+        // finalmask.tcp：accept 后立即套上（mask 在 TLS 握手之前）
+        let (stream, _peer) = match listener.accept_masked().await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "dokodemo accept failed");
@@ -1250,8 +1418,9 @@ pub async fn serve_dokodemo(
         let handler = Arc::clone(&handler);
         let opts = opts.clone();
         tokio::spawn(async move {
-            let local_ip = stream.local_addr().ok().map(|a| a.ip());
-            let local_port = stream.local_addr().ok().map(|a| a.port());
+            let conn_local = stream.plain().and_then(|c| c.local_addr().ok()).or(listener_local);
+            let local_ip = conn_local.map(|a| a.ip());
+            let local_port = conn_local.map(|a| a.port());
 
             // follow_redirect：Linux 下从 accept 的 fd 查 SO_ORIGINAL_DST。
             // Go 由 TPROXY listener 在 transport 层写入 session ctx（Go dokodemo.go
@@ -1265,9 +1434,12 @@ pub async fn serve_dokodemo(
             #[cfg(target_os = "linux")]
             let original_dst = if opts.follow_redirect {
                 use std::os::fd::AsRawFd;
-                xray_transport::sockopt::get_original_dst(stream.as_raw_fd())
-                    .ok()
-                    .filter(|orig| Some(*orig) != stream.local_addr().ok())
+                // mask 生效时 fd 藏在 dyn 包装内（Go 侧 mask conn 同样丢了
+                // syscall.Conn）→ 拿不到原始目标，按无 OriginalDest 处理。
+                stream
+                    .plain()
+                    .and_then(|c| xray_transport::sockopt::get_original_dst(c.as_raw_fd()).ok())
+                    .filter(|orig| Some(*orig) != conn_local)
             } else {
                 None
             };
@@ -1309,10 +1481,9 @@ pub async fn serve_dokodemo(
             } else {
                 match resolve_dokodemo_tcp_dest(&opts, local_ip, local_port, original_dst, None) {
                     Some(dest) => {
-                        // plain TCP（非 TLS 分支）：readv 多缓冲聚合读（bd 2o9l，Go NewReader readv
-                        // 分支）
-                        let (read_half, write_half) = stream.into_split();
-                        let link = Link::new(new_readv_reader(read_half), new_writer(write_half));
+                        // 拆流按连接类型分发（裸 TCP → readv 聚合读；mask 生效 → 顺序读）
+                        let (reader, writer) = stream.into_link_io();
+                        let link = Link::new(reader, writer);
                         let _ = handler.dispatch(&dest, link).await;
                     },
                     None => tracing::warn!(
@@ -2179,7 +2350,8 @@ pub async fn serve_dns(
     let tcp_inbound = Arc::clone(&inbound);
     let tcp_handle = tokio::spawn(async move {
         loop {
-            match tcp.accept().await {
+            // finalmask.tcp：accept 后立即套上（mask 在 DNS 帧之前）
+            match tcp.accept_masked().await {
                 Ok((conn, _peer)) => {
                     let inbound = Arc::clone(&tcp_inbound);
                     tokio::spawn(async move {
@@ -3476,13 +3648,17 @@ async fn spawn_one_inbound(
     // e7le：入站 sockopt（streamSettings.sockopt JSON；缺省 tcp_nodelay=true）
     // 统一喂给 InboundTcpListener——此前 9 处裸 bind+accept 无 nodelay，
     // 与 Go net 默认（NoDelay=true）相反，流式下行每 chunk 受 Nagle 拖累。
-    let inbound_sockopts =
-        xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref())
-            .socket_options();
+    // finalmask.tcp（bd dppv）：裸 TCP 入站统一在 accept 后套 mask（Go hub.go
+    // WrapListener）；未配 → None，accept 路径零包装。
+    let settings =
+        xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref());
+    let inbound_sockopts = settings.socket_options();
 
     match ib.entry.kind.as_str() {
         "socks" => {
-            let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone()).await?;
+            let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone())
+                .await?
+                .with_tcpmask_manager(inbound_tcpmask(&settings)?);
             let config = Arc::new(parse_socks_server_config(&ib.entry.data)?);
             // 握手限时（Go proxy/socks：SetReadDeadline(policy().Timeouts.Handshake)）
             let handshake_timeout = Some(handshake_timeout_for(&policy, config.user_level));
@@ -3511,7 +3687,9 @@ async fn spawn_one_inbound(
                 .as_ref()
                 .map(|pm| pm.policy_for_level(socks_cfg.user_level).timeout.connection_idle)
                 .unwrap_or(xray_features::policy::TimeoutPolicy::default().connection_idle);
-            let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone()).await?;
+            let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone())
+                .await?
+                .with_tcpmask_manager(inbound_tcpmask(&settings)?);
             tracing::info!(tag = %ib.tag, addr = %addr, "mixed (socks+http) inbound listening");
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                 serve_mixed(listener, ohm, socks_cfg, http_cfg, Some(handshake_timeout), udp_idle)
@@ -3786,13 +3964,18 @@ async fn spawn_one_inbound(
             // 无 policy 配置块）时对齐 Go SessionDefault 兜底 60s
             // （features/policy/policy.go:130），不再无限时。
             let handshake_timeout = handshake_timeout_for(&policy, config.user_level);
-            let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone()).await?;
+            let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone())
+                .await?
+                .with_tcpmask_manager(inbound_tcpmask(&settings)?);
             tracing::info!(tag = %ib.tag, addr = %addr, "http inbound listening");
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                 serve_http(listener, ohm, Arc::new(config), Some(handshake_timeout)).await
             })))
         },
         "dokodemo" => {
+            // 先取 finalmask（此处 `settings` 还是 streamSettings，下一行被
+            // dokodemo 自身 settings 遮蔽）
+            let tcpmask = inbound_tcpmask(&settings)?;
             let settings = parse_dokodemo_settings(&ib.entry.data)?;
             let dest = settings.dest.clone();
             // TLS（streamSettings security=tls）：对应 Go tls.NewListener 包裹，
@@ -3809,7 +3992,9 @@ async fn spawn_one_inbound(
             }
             let mut handles = Vec::new();
             if settings.allow_tcp {
-                let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone()).await?;
+                let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone())
+                    .await?
+                    .with_tcpmask_manager(tcpmask);
                 tracing::info!(tag = %ib.tag, addr = %addr, dest = ?dest, tls = tls.is_some(), "dokodemo TCP inbound listening");
                 let ohm_tcp = Arc::clone(&ohm);
                 let opts = DokodemoTcpOptions {
@@ -4026,7 +4211,9 @@ async fn spawn_one_inbound(
             let (handler, outbound) = parse_dns_inbound_config(&ib.entry.data, &ib.tag, dns_idle)?;
             let inbound = Arc::new(DnsInbound::new(&ib.tag, handler, outbound));
             let udp = UdpSocket::bind(&addr).await?;
-            let tcp = InboundTcpListener::bind(&addr, inbound_sockopts.clone()).await?;
+            let tcp = InboundTcpListener::bind(&addr, inbound_sockopts.clone())
+                .await?
+                .with_tcpmask_manager(inbound_tcpmask(&settings)?);
             tracing::info!(tag = %ib.tag, addr = %addr, "dns inbound listening (UDP+TCP)");
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
                 serve_dns(udp, tcp, inbound).await
@@ -9595,5 +9782,323 @@ mod tests {
         // 坏输入显式报错（不静默回落自签）
         assert!(super::tuic_pem_first_cert_der("not a pem").is_err());
         assert!(super::tuic_pem_key_der("not a pem").is_err());
+    }
+
+    // ===== bd dppv 余项：finalmask.tcp 覆盖 socks/mixed/http/dokodemo/dns 裸 TCP 入站 =====
+
+    use std::sync::Mutex;
+
+    use xray_transport::finalmask::{AsyncIo, TcpmaskManager};
+
+    /// sudoku mask（padding 缺省 0 ⇒ 上行 wire 恒为 4 hint 字节/明文字节）。
+    fn sudoku_mask() -> Arc<TcpmaskManager> {
+        Arc::new(
+            xray_transport::finalmask::build_tcpmask_manager_from_json(Some(&serde_json::json!({
+                "tcp": [{ "type": "sudoku", "settings": {} }]
+            })))
+            .expect("sudoku mask 构建"),
+        )
+    }
+
+    /// wire 抓包层：记录真正落到 socket 的字节（发送/接收两向）。
+    ///
+    /// 断言「mask 头是否在 wire 最外层」只能看 socket 字节——协议层的读写都已被
+    /// mask 链解过一层。
+    struct WireTap {
+        inner: tokio::net::TcpStream,
+        sent: Arc<Mutex<Vec<u8>>>,
+        recv: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl AsyncRead for WireTap {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let before = buf.filled().len();
+            let poll = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+            if let std::task::Poll::Ready(Ok(())) = &poll {
+                this.recv.lock().unwrap().extend_from_slice(&buf.filled()[before..]);
+            }
+            poll
+        }
+    }
+
+    impl AsyncWrite for WireTap {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            let poll = std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
+            if let std::task::Poll::Ready(Ok(n)) = &poll {
+                this.sent.lock().unwrap().extend_from_slice(&buf[..*n]);
+            }
+            poll
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    /// 入站测试客户端：`mask` Some 时套客户端同一条 mask 链（等价真实客户端）。
+    struct MaskClient {
+        io: Box<dyn AsyncIo>,
+        sent: Arc<Mutex<Vec<u8>>>,
+        recv: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl MaskClient {
+        async fn write(&mut self, data: &[u8]) {
+            self.io.write_all(data).await.expect("client write");
+        }
+
+        async fn read_exact(&mut self, buf: &mut [u8]) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), self.io.read_exact(buf))
+                .await
+                .expect("client read 超时（mask 或协议握手卡住）")
+                .expect("client read");
+        }
+
+        async fn read_some(&mut self, buf: &mut [u8]) -> usize {
+            tokio::time::timeout(std::time::Duration::from_secs(5), self.io.read(buf))
+                .await
+                .expect("client read 超时（mask 或协议握手卡住）")
+                .expect("client read")
+        }
+
+        fn wire_sent(&self) -> Vec<u8> {
+            self.sent.lock().unwrap().clone()
+        }
+
+        fn wire_recv(&self) -> Vec<u8> {
+            self.recv.lock().unwrap().clone()
+        }
+    }
+
+    async fn connect_tapped(addr: SocketAddr, mask: Option<Arc<TcpmaskManager>>) -> MaskClient {
+        let raw = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let recv = Arc::new(Mutex::new(Vec::new()));
+        let tap = WireTap { inner: raw, sent: Arc::clone(&sent), recv: Arc::clone(&recv) };
+        let io: Box<dyn AsyncIo> = match &mask {
+            Some(m) => m.wrap_conn_client(Box::new(tap)).expect("client mask"),
+            None => Box::new(tap),
+        };
+        MaskClient { io, sent, recv }
+    }
+
+    /// 断言 wire 首部：配 mask → 不是原协议头且被编码扩张；未配 → 逐字节等于协议头。
+    fn assert_wire(wire: &[u8], plain: &[u8], masked: bool, what: &str) {
+        assert!(wire.len() >= plain.len(), "{what}: wire 太短 {wire:02x?}");
+        if masked {
+            assert_ne!(
+                &wire[..plain.len()],
+                plain,
+                "{what}: 配 mask 时 wire 首字节必须是 mask 头（实际 {wire:02x?}）"
+            );
+            assert!(
+                wire.len() > plain.len(),
+                "{what}: sudoku 必须扩张 wire 字节（4 hint/byte），实际 {wire:02x?}"
+            );
+        } else {
+            assert_eq!(&wire[..plain.len()], plain, "{what}: 未配 mask 时 wire 必须是原协议头");
+        }
+    }
+
+    fn capture_ohm() -> Arc<SimpleOhm> {
+        let ohm = Arc::new(SimpleOhm::new());
+        ohm.set_default(Arc::new(DestCaptureDispatch { dest: parking_lot::Mutex::new(None) })
+            as Arc<dyn xray_app_dispatcher::DispatchHandler>);
+        ohm
+    }
+
+    async fn masked_listener(masked: bool, mask: &Arc<TcpmaskManager>) -> InboundTcpListener {
+        InboundTcpListener::bind("127.0.0.1:0", xray_transport::sockopt::SocketOptions::default())
+            .await
+            .expect("bind")
+            .with_tcpmask_manager(masked.then(|| Arc::clone(mask)))
+    }
+
+    /// socks 入站：配 mask → 客户端 mask 解包后握手成功，wire 首字节是 mask 头；
+    /// 不配 mask → wire 首字节就是 0x05 协议头（行为逐字节不变）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn socks_inbound_wears_finalmask() {
+        let mask = sudoku_mask();
+        for masked in [false, true] {
+            let listener = masked_listener(masked, &mask).await;
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(serve_socks5(
+                listener,
+                capture_ohm(),
+                Arc::new(ServerConfig::default()),
+                Some(std::time::Duration::from_secs(5)),
+                std::time::Duration::from_secs(5),
+            ));
+
+            let mut client = connect_tapped(addr, masked.then(|| Arc::clone(&mask))).await;
+            let greeting = [0x05u8, 0x01, 0x00];
+            client.write(&greeting).await;
+            let mut resp = [0u8; 2];
+            client.read_exact(&mut resp).await;
+            assert_eq!(resp, [0x05, 0x00], "socks5 方法协商必须成功（masked={masked}）");
+            assert_wire(&client.wire_sent(), &greeting, masked, "socks 入站");
+            // 回程同样走 mask（sudoku 服务端为 packed 编码，长度非固定倍率）
+            let wire_recv = client.wire_recv();
+            assert!(!wire_recv.is_empty(), "服务端必须有回程字节");
+            if masked {
+                assert_ne!(&wire_recv[..2], &resp, "回程 wire 首字节也必须是 mask 头");
+            } else {
+                assert_eq!(wire_recv, resp.to_vec(), "未配 mask 时回程就是原协议字节");
+            }
+        }
+    }
+
+    /// mixed 入站（peek 首字节分流）：mask 在嗅探之前，明文首字节经 PeekAhead
+    /// 回放给握手——配 mask 握手成功且 wire 首字节是 mask 头。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mixed_inbound_wears_finalmask() {
+        let mask = sudoku_mask();
+        for masked in [false, true] {
+            let listener = masked_listener(masked, &mask).await;
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(serve_mixed(
+                listener,
+                capture_ohm(),
+                Arc::new(ServerConfig::default()),
+                Arc::new(HttpServerConfig::default()),
+                Some(std::time::Duration::from_secs(5)),
+                std::time::Duration::from_secs(5),
+            ));
+
+            let mut client = connect_tapped(addr, masked.then(|| Arc::clone(&mask))).await;
+            let greeting = [0x05u8, 0x01, 0x00];
+            client.write(&greeting).await;
+            let mut resp = [0u8; 2];
+            client.read_exact(&mut resp).await;
+            assert_eq!(resp, [0x05, 0x00], "mixed socks 分支必须成功（masked={masked}）");
+            assert_wire(&client.wire_sent(), &greeting, masked, "mixed 入站");
+        }
+    }
+
+    /// http 入站：配 mask → CONNECT 握手成功且 wire 首字节是 mask 头（'C' 不再是
+    /// wire 首字节）；不配 → wire 直接是 `CONNECT ...`。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn http_inbound_wears_finalmask() {
+        let mask = sudoku_mask();
+        for masked in [false, true] {
+            let listener = masked_listener(masked, &mask).await;
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(serve_http(
+                listener,
+                capture_ohm(),
+                Arc::new(HttpServerConfig::default()),
+                Some(std::time::Duration::from_secs(5)),
+            ));
+
+            let mut client = connect_tapped(addr, masked.then(|| Arc::clone(&mask))).await;
+            let req = b"CONNECT 127.0.0.1:1 HTTP/1.1\r\nHost: h\r\n\r\n";
+            client.write(req).await;
+            let mut resp = [0u8; 64];
+            let n = client.read_some(&mut resp).await;
+            assert!(
+                resp[..n].starts_with(b"HTTP/1.1 200"),
+                "CONNECT 必须回 200（masked={masked}）：{:?}",
+                String::from_utf8_lossy(&resp[..n])
+            );
+            assert_wire(&client.wire_sent(), req, masked, "http 入站");
+        }
+    }
+
+    /// dokodemo 入站（无握手协议，直接 dispatch）：配 mask → dispatch 收到的
+    /// 明文原样，wire 首字节是 mask 头。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dokodemo_inbound_wears_finalmask() {
+        let mask = sudoku_mask();
+        for masked in [false, true] {
+            let listener = masked_listener(masked, &mask).await;
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(serve_dokodemo(
+                listener,
+                capture_ohm(),
+                DokodemoTcpOptions {
+                    dest: Some(Destination::tcp(
+                        Address::Domain("example.com".into()),
+                        Port::new(80),
+                    )),
+                    port_map: HashMap::new(),
+                    follow_redirect: false,
+                    tls: None,
+                },
+            ));
+
+            let mut client = connect_tapped(addr, masked.then(|| Arc::clone(&mask))).await;
+            client.write(b"hi").await;
+            let mut resp = [0u8; 2];
+            client.read_exact(&mut resp).await;
+            assert_eq!(&resp, b"ok", "dispatch 链路必须通（masked={masked}）");
+            assert_wire(&client.wire_sent(), b"hi", masked, "dokodemo 入站");
+        }
+    }
+
+    /// dns 入站 TCP：配 mask → 2B 长度前缀帧循环照常工作（Return 规则应答），
+    /// wire 首字节是 mask 头。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dns_inbound_wears_finalmask() {
+        let mask = sudoku_mask();
+        let mut query = vec![0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        for label in ["example", "com"] {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.push(0);
+        query.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        let mut frame = vec![(query.len() >> 8) as u8, query.len() as u8];
+        frame.extend_from_slice(&query);
+
+        for masked in [false, true] {
+            let cfg = DnsConfig {
+                rule: vec![xray_proxy_dns::DnsRuleConfig {
+                    action: xray_proxy_dns::RuleAction::Return,
+                    q_type: vec![1],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let handler = DnsHandler::init(&cfg, std::time::Duration::from_secs(5));
+            let outbound = DnsOutbound::new_with_servers(
+                "unused",
+                &[(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 5353)],
+            )
+            .expect("dns outbound");
+            let inbound = Arc::new(DnsInbound::new("dns-mask", handler, outbound));
+            let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let listener = masked_listener(masked, &mask).await;
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(serve_dns(udp, listener, inbound));
+
+            let mut client = connect_tapped(addr, masked.then(|| Arc::clone(&mask))).await;
+            client.write(&frame).await;
+            let mut len_buf = [0u8; 2];
+            client.read_exact(&mut len_buf).await;
+            let mut resp = vec![0u8; u16::from_be_bytes(len_buf) as usize];
+            client.read_exact(&mut resp).await;
+            assert_eq!(&resp[..2], &[0xAB, 0xCD], "响应 ID 必须与查询一致（masked={masked}）");
+            assert_wire(&client.wire_sent(), &frame, masked, "dns 入站");
+        }
     }
 }

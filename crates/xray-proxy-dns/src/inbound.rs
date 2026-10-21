@@ -9,9 +9,10 @@
 //! - UDP：dispatcher 接收 UDP 包 → 调 [`DnsInbound::handle_packet`]
 //! - TCP：dispatcher accept 连接 → 调 [`DnsInbound::handle_conn`]
 
-use async_trait::async_trait;
 use std::sync::Arc;
-use tokio::{io::AsyncWriteExt, net::TcpStream};
+
+use async_trait::async_trait;
+use tokio::io::AsyncWriteExt;
 use xray_common::signal::ActivityTimer;
 use xray_features::inbound::{InboundError, InboundHandler};
 
@@ -57,7 +58,10 @@ impl DnsInbound {
     ///
     /// # Errors
     /// 透传底层 IO 错误和处理错误。
-    pub async fn handle_conn(&self, mut conn: TcpStream) -> Result<()> {
+    pub async fn handle_conn<S>(&self, mut conn: S) -> Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         // Go CancelAfterInactivity：run 循环 task 与连接循环共享 Arc，
         // 活动即 update_activity 重置空闲窗口（proxyman worker 同款模式）。
         let timer = Arc::new(ActivityTimer::new(self.handler.timeout));
@@ -132,12 +136,12 @@ impl InboundHandler for DnsInbound {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
-    use std::time::Duration;
+    use std::{net::Ipv4Addr, time::Duration};
+
+    use tokio::{io::AsyncReadExt as _, net::TcpStream};
 
     use super::*;
     use crate::config::{Config, DnsRuleConfig, RuleAction};
-    use tokio::io::AsyncReadExt as _;
 
     /// 构造最小 DNS A 查询消息（handler.rs tests 中同款）。
     fn make_query_bytes(domain: &str, q_type: u16) -> Vec<u8> {
