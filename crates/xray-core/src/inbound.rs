@@ -657,23 +657,33 @@ async fn serve_mixed(
                 }
             } else if sniff[0].is_ascii_alphabetic() {
                 // HTTP 路径(简化版:仅 CONNECT + plain,无 mux 派生)
-                let handshake_fut = http_server_handshake(&mut stream, &http_cfg);
-                let hs = match handshake_timeout {
-                    Some(d) => match tokio::time::timeout(d, handshake_fut).await {
-                        Ok(r) => r,
+                // keep-alive 回环（对齐 serve_http）：首包已 peek 判定为 HTTP，
+                // 第二轮起直接读下一请求头，不再 sniff；CONNECT 升级即终结循环。
+                loop {
+                    let handshake_fut = http_server_handshake(&mut stream, &http_cfg);
+                    let hs = match handshake_timeout {
+                        Some(d) => match tokio::time::timeout(d, handshake_fut).await {
+                            Ok(r) => r,
+                            Err(_) => return,
+                        },
+                        None => handshake_fut.await,
+                    };
+                    let hs = match hs {
+                        Ok(v) => v,
                         Err(_) => return,
-                    },
-                    None => handshake_fut.await,
-                };
-                let hs = match hs {
-                    Ok(v) => v,
-                    Err(_) => return,
-                };
-                // bd 2b1c：access 带 from（process/source 规则 + access log 来源）
-                let access = http_inbound_access(&stream, peer);
-                if hs.method != "CONNECT" {
-                    handle_plain_http(&mut stream, &hs, Arc::clone(&handler), access).await;
-                } else {
+                    };
+                    // bd 2b1c：access 带 from（process/source 规则 + access log 来源）
+                    let access = http_inbound_access(&stream, peer);
+                    if hs.method != "CONNECT" {
+                        // P1-1：此分支此前只处理一个请求就断连，与响应头写出的
+                        // keep-alive 承诺矛盾；plain 处置语义与 serve_http 同款。
+                        match handle_plain_http(&mut stream, &hs, Arc::clone(&handler), access)
+                            .await
+                        {
+                            PlainOutcome::NextRequest => continue,
+                            PlainOutcome::Close => return,
+                        }
+                    }
                     let dest = hs.dest;
                     let (reader, writer) = stream.into_link_io();
                     let link = Link::new(reader, writer);
@@ -682,6 +692,7 @@ async fn serve_mixed(
                     } else {
                         let _ = handler.dispatch_with_access(&dest, link, access).await;
                     }
+                    return;
                 }
             } else {
                 tracing::debug!(first_byte = sniff[0], "mixed: unknown first byte, closing");
@@ -8161,6 +8172,46 @@ mod tests {
             3,
             "one fresh upstream connection per request"
         );
+    }
+
+    /// P1-1：mixed 入站的 HTTP 分支同样要 keep-alive——首包 sniff 判 HTTP 后，
+    /// 同一 TCP 连接上两个 plain 请求都必须成功（改动前单请求即断，第二个 EOF）。
+    #[tokio::test]
+    async fn mixed_http_keep_alive_reuses_connection_between_requests() {
+        let (upstream, _conns) = spawn_http_upstream_for_test().await;
+        let ohm = Arc::new(SimpleOhm::new());
+        ohm.set_default(Arc::new(DialDispatch) as Arc<dyn xray_app_dispatcher::DispatchHandler>);
+        let listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        )
+        .await
+        .unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_mixed(
+            listener,
+            ohm,
+            Arc::new(ServerConfig::default()),
+            Arc::new(HttpServerConfig::default()),
+            Some(std::time::Duration::from_secs(5)),
+            std::time::Duration::from_secs(5),
+        ));
+
+        let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let upstream_port = upstream.port();
+        let base = format!("http://127.0.0.1:{upstream_port}/");
+        for path in ["first", "second"] {
+            client
+                .write_all(
+                    format!("GET {base}{path} HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let (status, head, body) = read_http_response_for_test(&mut client).await;
+            assert_eq!(status, 200, "mixed keep-alive request {path}: {head}");
+            assert_eq!(body, format!("/{path}").as_bytes(), "upstream body echo for {path}");
+        }
     }
 
     /// ft58 S1：Content-Length 请求体必须精确消费后才读下一请求——POST+body 与
