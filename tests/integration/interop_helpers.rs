@@ -65,13 +65,92 @@ pub type Result<T> = std::result::Result<T, InteropError>;
 // -- Go binary path ----------------------------------------------------
 
 /// Resolve Go xray-core binary path.
-// Priority: env var XRAY_GO_BIN, else D:/Project/Xray-core/target/xray-go.exe
-// (d4v3: 旧机盘符 E:\Projcet 残留已移除; 也可用 D:/Project/Xray-core/target/release/xray.exe)
-pub fn go_xray_bin_path() -> PathBuf {
-    std::env::var("XRAY_GO_BIN").map(PathBuf::from).unwrap_or_else(|_| {
-        let d = PathBuf::from(r"D:\Project\Xray-core\target\xray-go.exe");
-        if d.exists() { d } else { PathBuf::from(r"D:\Project\Xray-core\target\release\xray.exe") }
-    })
+///
+/// 查找链（PM 拍板 2026-10-22）：`$XRAY_GO_BIN` → 仓内
+/// `reports/night-run-*/tmp/*/xray-go.exe` → `dist/xray-go.exe`。
+/// 都没有 → `None`，调用方经 [`go_binary_ready`] 打一行 skip 日志后跳过——
+/// 禁静默 return，CI/评审必须能在默认 test output 里看到哪些用例没跑。
+/// `$XRAY_GO_BIN` 显式指定时不做存在性兜底：路径配错要在 spawn 时响
+/// （GoBinaryNotFound），不许把显式配置错配偷偷降级成 skip。
+pub fn go_xray_bin_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("XRAY_GO_BIN") {
+        return Some(PathBuf::from(p));
+    }
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo = manifest.parent()?;
+    if let Some(hit) = first_repo_go_binary(repo) {
+        return Some(hit);
+    }
+    let dist = repo.join("dist").join("xray-go.exe");
+    dist.is_file().then_some(dist)
+}
+
+/// 扫仓内 `reports/night-run-*/tmp/*/xray-go.exe`（排序保证确定性，命中即返）。
+/// 手写三层 `read_dir` 而非引入 glob crate——tests 的 dev-deps 不为此加依赖。
+fn first_repo_go_binary(repo: &std::path::Path) -> Option<PathBuf> {
+    let mut runs: Vec<PathBuf> = std::fs::read_dir(repo.join("reports"))
+        .ok()?
+        .filter_map(std::result::Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("night-run-")))
+        .collect();
+    runs.sort();
+    for run in runs {
+        let Ok(tmps) = std::fs::read_dir(run.join("tmp")) else {
+            continue;
+        };
+        let mut tmps: Vec<PathBuf> =
+            tmps.filter_map(std::result::Result::ok).map(|e| e.path()).collect();
+        tmps.sort();
+        for tmp in tmps {
+            let cand = tmp.join("xray-go.exe");
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// 互通用例的 Go 二进制门槛：缺失时打一行 skip 日志并返回 `false`，调用方
+/// 直接 `return`。禁静默跳过——日志直写 stderr（绕过 libtest 捕获，见
+/// [`force_visible_log`]），评审在默认 `cargo test` 输出里就能看到哪些用例没跑。
+pub fn go_binary_ready() -> bool {
+    match go_xray_bin_path() {
+        Some(_) => true,
+        None => {
+            force_visible_log(
+                "skipping: go xray binary not found (set XRAY_GO_BIN or place dist/xray-go.exe)",
+            );
+            false
+        },
+    }
+}
+
+/// 绕过 libtest 输出捕获直写 stderr。libtest 的捕获是线程局部 OUTPUT_CAPTURE
+/// 替换（OS 层 fd 不动），通过用例的 println/eprintln 默认被吞——只有
+/// `--nocapture` 或失败才回放；跳过必须默认可见，故从 raw fd/handle 重建
+/// `File` 写入。`ManuallyDrop`：所有权不归我们，绝不 close。
+fn force_visible_log(msg: &str) {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        let mut err = std::mem::ManuallyDrop::new(unsafe {
+            std::fs::File::from_raw_fd(std::io::stderr().as_raw_fd())
+        });
+        let _ = err.write_all(msg.as_bytes());
+        let _ = err.write_all(b"\n");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        let mut err = std::mem::ManuallyDrop::new(unsafe {
+            std::fs::File::from_raw_handle(std::io::stderr().as_raw_handle())
+        });
+        let _ = err.write_all(msg.as_bytes());
+        let _ = err.write_all(b"\n");
+    }
 }
 
 // -- Go xray subprocess management -------------------------------------
@@ -79,7 +158,9 @@ pub fn go_xray_bin_path() -> PathBuf {
 /// Start Go xray-core subprocess with the given config file.
 // Returns child handle. kill_on_drop is set so child dies if handle drops.
 pub async fn start_go_xray(config_path: &std::path::Path) -> Result<Child> {
-    let bin = go_xray_bin_path();
+    let Some(bin) = go_xray_bin_path() else {
+        return Err(InteropError::GoBinaryNotFound { path: PathBuf::from("dist/xray-go.exe") });
+    };
     if !bin.exists() {
         return Err(InteropError::GoBinaryNotFound { path: bin });
     }
@@ -96,10 +177,16 @@ pub async fn start_go_xray(config_path: &std::path::Path) -> Result<Child> {
 
     // Drain stdout/stderr to log files in the background. Without this, Go
     // xray blocks once its 64KiB pipe buffer fills (access-log traffic),
-    // which manifests as the Rust client hanging in read calls. Filenames
-    // are unique per config (PID suffix via atomic counter fallback) so
-    // concurrent test binaries don't clobber each other's logs.
-    let log_id = std::process::id();
+    // which manifests as the Rust client hanging in read calls.
+    // Filenames are unique per spawn（PID + 进程内序号）：同一测试进程并行起
+    // 多只 Go 子进程时互不覆盖——此前只有 PID，ss2022 两用例并行时互相截断
+    // 日志，现场取证只剩最后落盘的那只。
+    static NEXT_GO_SPAWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let log_id = format!(
+        "{}_{}",
+        std::process::id(),
+        NEXT_GO_SPAWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let log_dir = std::env::temp_dir().join("xray_interop_go_logs");
     std::fs::create_dir_all(&log_dir).ok();
     if let Some(stdout) = child.stdout.take() {

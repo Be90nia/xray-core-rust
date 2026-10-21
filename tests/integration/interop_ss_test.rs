@@ -6,8 +6,10 @@
 // Note: Rust currently has no SS server (serve_ss), so only Go->Rust direction.
 // Each cipher type (AES-128-GCM, ChaCha20-Poly1305, AES-256-GCM) is tested.
 //
-// All tests are #[ignore] by default: run with `cargo test -- --ignored`.
-// Requires Go xray-core binary at XRAY_GO_BIN or default path.
+// 5 只 SS 用例仍 #[ignore]（run with `cargo test -- --ignored`）；两只 SS-2022
+// 用例常态跑：Go 二进制缺失时打一行 skip 日志后返回（`go_binary_ready`，不静默）。
+// 二进制查找链见 `go_xray_bin_path`：$XRAY_GO_BIN → reports/night-run-*/tmp/*/
+// xray-go.exe → dist/xray-go.exe。
 
 mod interop_helpers;
 
@@ -60,6 +62,9 @@ async fn go_ss_server_rust_client_aes256gcm() {
 }
 
 async fn run_go_ss_server_rust_client(ct: CipherType, go_method: &str, ss_port: u16) {
+    if !go_binary_ready() {
+        return;
+    }
     // Start echo server as target
     let echo_port = spawn_echo_server().await.expect("start echo server");
 
@@ -68,7 +73,8 @@ async fn run_go_ss_server_rust_client(ct: CipherType, go_method: &str, ss_port: 
         inbounds: vec![ss_server_inbound(ss_port, PASSWORD, go_method)],
         outbounds: vec![freedom_outbound()],
     };
-    let config_path = write_config_to_temp(&config, "go-ss-server").expect("write config");
+    let config_path =
+        write_config_to_temp(&config, &format!("go-ss-server-{go_method}")).expect("write config");
 
     let mut go_proc = start_go_xray(&config_path).await.expect("start Go xray");
     wait_for_port(ss_port, 5000).await.expect("Go SS port ready");
@@ -164,6 +170,9 @@ async fn rust_ss_server_reads_go_client_request() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires XRAY_GO_BIN (Go xray-core binary); run with --ignored"]
 async fn go_ss_proxy_rust_client_aes128gcm_http() {
+    if !go_binary_ready() {
+        return;
+    }
     // Start HTTP echo server as target
     let echo_port = spawn_http_echo_server().await.expect("start http echo server");
 
@@ -260,6 +269,9 @@ async fn go_ss2022_server_rust_client_chacha20poly1305() {
 }
 
 async fn run_go_ss2022_server_rust_client(method: &'static str, psk_len: usize, ss_port: u16) {
+    if !go_binary_ready() {
+        return;
+    }
     let echo_port = spawn_echo_server().await.expect("start echo server");
     let psk_b64 = random_psk_b64(psk_len);
 
@@ -267,7 +279,8 @@ async fn run_go_ss2022_server_rust_client(method: &'static str, psk_len: usize, 
         inbounds: vec![ss2022_server_inbound(ss_port, &psk_b64, method)],
         outbounds: vec![freedom_outbound()],
     };
-    let config_path = write_config_to_temp(&config, "go-ss2022-server").expect("write config");
+    let config_path =
+        write_config_to_temp(&config, &format!("go-ss2022-server-{method}")).expect("write config");
 
     let mut go_proc = start_go_xray(&config_path).await.expect("start Go xray");
     wait_for_port(ss_port, 5000).await.expect("Go SS2022 port ready");
