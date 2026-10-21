@@ -11,6 +11,9 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
     "https://github.com/Be90nia/btls", # 核心 REALITY/utls 实现（v0.5.6，gqkk 票固定）
+    # if-addrs 0.15.0 从 messense fork 的固定 rev 取（上游 0.15 未发布该修复；
+    # 见 Cargo.toml 的 if-addrs git 依赖）。rev 已钉死，非浮动源。
+    "https://github.com/messense/if-addrs",
 ]
 
 # ─────────────────────────── advisories ───────────────────────────
