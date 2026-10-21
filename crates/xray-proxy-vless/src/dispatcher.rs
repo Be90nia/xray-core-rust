@@ -70,6 +70,14 @@ pub struct VlessOutboundConfig {
     pub testseed: Vec<u32>,
     /// 预连接数（对应 Go `Handler.testpre`，json `testpre`）。0 = 关闭。
     pub testpre: u32,
+    /// Bridge 端反向代理注册表（对应 Go `Handler.reverse`，outbound.go:104-125）。
+    ///
+    /// `Some` = 本出站承担 reverse Bridge：拨到注册的 portal 域名（默认
+    /// `v1.rvs.cool`、port 0）时按 `command=Rvs` 发出，返回的连接即
+    /// bridge→portal 反向 carrier，由 reverse 服务（mux worker + monitor）接管，
+    /// 不做普通目标透传。
+    /// `None` = 普通出站：反向域名拨号显式报错，绝不静默当 TCP 处理。
+    pub reverse: Option<Arc<crate::inbound::reverse::ReverseRegistry>>,
 }
 
 impl VlessOutboundConfig {
@@ -86,6 +94,7 @@ impl VlessOutboundConfig {
             level: 0,
             testseed: Vec::new(),
             testpre: 0,
+            reverse: None,
             email: String::new(),
         }
     }
@@ -137,6 +146,17 @@ impl VlessOutboundConfig {
     #[must_use]
     pub fn with_testpre(mut self, count: u32) -> Self {
         self.testpre = count;
+        self
+    }
+
+    /// 设置 Bridge 端反向代理注册表（builder 风格，对应 Go outbound user
+    /// `reverse.tag` 派生出的 `Handler.reverse`）。
+    #[must_use]
+    pub fn with_reverse(
+        mut self,
+        registry: Option<Arc<crate::inbound::reverse::ReverseRegistry>>,
+    ) -> Self {
+        self.reverse = registry;
         self
     }
 
@@ -278,6 +298,43 @@ pub fn make_dial_fn(config: Arc<VlessOutboundConfig>) -> DialFn {
     make_dial_fn_with_handshake_timeout(config, ENC_HANDSHAKE_TIMEOUT)
 }
 
+/// VLESS 命令决策（对应 Go `proxy/vless/outbound/outbound.go:209-222`）。
+///
+/// 反向目标 = **reverse registry 注册的 portal 域名**（默认 `v1.rvs.cool`）。
+/// 该拨号是 Bridge→Portal 的反向 carrier：命令为 `Rvs`，连接交给 reverse
+/// 服务，不走普通目标透传。Go 用 `Network_Unknown` 标记该拨号；Rust 的
+/// [`Network`] 没有 Unknown 变体，故按 Go bridge 的拨号形态等价识别——
+/// 域名命中 registry + `port == 0`（Go `bridge.go:118-122`
+/// `Destination{Domain, Port: 0}`，Rust `xray-app-reverse` 的
+/// `BridgeWorker::new` 同形）。
+///
+/// 错误（都禁止静默按 TCP 发）：
+/// - 反向域名但本出站未装配 reverse → 显式配置错误；
+/// - 反向域名带非 0 端口（前向请求撞内部域名）→ `nice try baby`（同 Go）。
+fn outbound_command(
+    config: &VlessOutboundConfig,
+    dest: &Destination,
+) -> Result<VlessCommand, String> {
+    let domain = dest.address().as_domain();
+    let registered =
+        config.reverse.as_ref().is_some_and(|reg| domain.is_some_and(|d| reg.contains_domain(d)));
+    if !registered && domain != Some(crate::RVS_DOMAIN) {
+        return Ok(if dest.is_udp() { VlessCommand::Udp } else { VlessCommand::Tcp });
+    }
+    // 走到这里必然是反向域名：前向请求撞内部域名（带真实端口）按 Go 拒。
+    if dest.port().value() != 0 {
+        return Err("nice try baby".to_string());
+    }
+    if !registered {
+        return Err(format!(
+            "vless reverse: dialing {} needs a reverse proxy config on this outbound (VLESS user \
+             \"reverse\")",
+            crate::RVS_DOMAIN
+        ));
+    }
+    Ok(VlessCommand::Rvs)
+}
+
 /// 显式指定 ENC 握手超时（测试注入短超时；生产走 [`make_dial_fn`] 的 60s 缺省）。
 pub fn make_dial_fn_with_handshake_timeout(
     config: Arc<VlessOutboundConfig>,
@@ -298,11 +355,11 @@ pub fn make_dial_fn_with_handshake_timeout(
         });
     let establish: EstablishFn = {
         let config = Arc::clone(&config);
-        // testpre 预连接（Go `testpre > 0 && reverse == nil`；本 dispatcher 是
-        // 普通 outbound 路径，reverse 是独立 outbound 不经此处）。首次拨号时
-        // 才起 worker（对齐 Go initpre.Do 惰性初始化）。
-        let pre_conns =
-            (config.testpre > 0).then(|| Arc::new(PreConns::new(Duration::from_secs(120))));
+        // testpre 预连接（Go `testpre > 0 && reverse == nil`，outbound.go:163）：
+        // 反向 Bridge 出站不建预连接池。首次拨号时才起 worker（对齐 Go
+        // initpre.Do 惰性初始化）。
+        let pre_conns = (config.testpre > 0 && config.reverse.is_none())
+            .then(|| Arc::new(PreConns::new(Duration::from_secs(120))));
         let preconn_once = Arc::new(std::sync::Once::new());
         Arc::new(move |dest: &Destination| {
             let config = Arc::clone(&config);
@@ -311,8 +368,10 @@ pub fn make_dial_fn_with_handshake_timeout(
             let preconn_once = Arc::clone(&preconn_once);
             let target_addr = dest.address().clone();
             let target_port = dest.port();
-            let is_udp = dest.is_udp();
+            // 命令决策先于拨号：反向域名未装配 reverse / 非法端口在此报错，不开 socket。
+            let command = outbound_command(&config, dest);
             Box::pin(async move {
+                let command = command?;
                 if let Some(pool) = pre_conns.as_ref() {
                     let pool = Arc::clone(pool);
                     let cfg = Arc::clone(&config);
@@ -323,9 +382,9 @@ pub fn make_dial_fn_with_handshake_timeout(
                     config,
                     enc_client,
                     pre_conns,
+                    command,
                     target_addr,
                     target_port,
-                    is_udp,
                     handshake_timeout,
                 )
                 .await
@@ -352,11 +411,12 @@ async fn establish_conn(
     config: Arc<VlessOutboundConfig>,
     enc_client: Option<Arc<crate::encryption::ClientInstance>>,
     pre_conns: Option<Arc<PreConns>>,
+    command: VlessCommand,
     target_addr: Address,
     target_port: Port,
-    is_udp: bool,
     handshake_timeout: std::time::Duration,
 ) -> Result<Box<dyn Connection>, String> {
+    let is_udp = command == VlessCommand::Udp;
     // Go outbound.go:303-306 把 XRV flow 的 UDP 转 mux（v1.mux.cool）——Rust mux
     // 未实现；且 Go 服务端本就拒 XRV+UDP（inbound.go:556 "doesn't support UDP"）。
     // 早失败给可诊断错误，而不是静默按 TCP 发。
@@ -395,21 +455,18 @@ async fn establish_conn(
 
     // 2. 写 VLESS 请求头（version + uuid + addons + command + target addr/port）
     // addons.flow 从 config 取（bd vxk）：flow=xtls-rprx-vision 时服务端启用 Vision。
-    // command 按 dest.network（Go outbound.go:214-217：UDP → RequestCommandUDP）。
+    // command 由 [`outbound_command`] 决策（UDP/反向 Rvs/TCP，Go outbound.go:209-222）；
+    // Mux/Rvs 携带固定域名，不写 address/port（`needs_address`）。
     let mut addons = empty_addons();
     addons.flow = config.flow.clone();
-    let command = if is_udp { VlessCommand::Udp } else { VlessCommand::Tcp };
-    encode_request_header(
-        &mut conn,
-        VERSION,
-        &config.user_uuid,
-        command,
-        Some(&target_addr),
-        Some(target_port.value()),
-        &addons,
-    )
-    .await
-    .map_err(|e| format!("vless encode header: {e}"))?;
+    let (address, port) = if command.needs_address() {
+        (Some(&target_addr), Some(target_port.value()))
+    } else {
+        (None, None)
+    };
+    encode_request_header(&mut conn, VERSION, &config.user_uuid, command, address, port, &addons)
+        .await
+        .map_err(|e| format!("vless encode header: {e}"))?;
 
     // 2b. 响应头消费推迟到读路径（对齐 Go postRequest/getResponse 并发时序：
     //     Go 服务端响应头经 BufferedWriter SetFlushNext 缓冲到首个下行数据
@@ -783,9 +840,9 @@ mod tests {
             cfg,
             None,
             None,
+            VlessCommand::Udp,
             dest.address().clone(),
             dest.port(),
-            true,
             std::time::Duration::from_secs(1),
         )
         .await
@@ -1346,5 +1403,289 @@ mod tests {
             .expect("unexpired second entry must be delivered after skipping expired first");
         drop(got);
         second.await.unwrap().expect("second push delivered");
+    }
+
+    // ==== 反向代理（Portal/Bridge）装配：Go proxy/vless/outbound/outbound.go:220-222 ====
+
+    /// ohm handler：`echo=false` 时只计数（扮演普通出站，读都不读直接返回）；
+    /// `echo=true` 时记录 bridge 发来的字节并原样回显（扮演 portal handler）。
+    #[derive(Debug)]
+    struct ReverseCaptureHandler {
+        tag: &'static str,
+        echo: bool,
+        called: Arc<parking_lot::Mutex<u32>>,
+        got: Arc<parking_lot::Mutex<Vec<u8>>>,
+    }
+
+    impl ReverseCaptureHandler {
+        fn new(tag: &'static str, echo: bool) -> Self {
+            Self {
+                tag,
+                echo,
+                called: Arc::new(parking_lot::Mutex::new(0)),
+                got: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl xray_app_dispatcher::DispatchHandler for ReverseCaptureHandler {
+        fn tag(&self) -> &str {
+            self.tag
+        }
+
+        fn dispatch(
+            &self,
+            _dest: &Destination,
+            link: xray_transport::link::Link,
+        ) -> xray_app_dispatcher::default::PinFuture<()> {
+            *self.called.lock() += 1;
+            if !self.echo {
+                return Box::pin(async {});
+            }
+            let got = Arc::clone(&self.got);
+            Box::pin(async move {
+                let mut reader = link.reader;
+                let mut writer = link.writer;
+                // read_multi_buffer 非阻塞语义（Go buf.ReadMultiBuffer 同款）：轮询到首帧。
+                let bytes = loop {
+                    match reader.read_multi_buffer().await {
+                        Ok(mb) => {
+                            let b = mb.to_vec();
+                            if !b.is_empty() {
+                                break b;
+                            }
+                        },
+                        Err(_) => return,
+                    }
+                };
+                got.lock().extend_from_slice(&bytes);
+                let mut out = xray_buf::multi::MultiBuffer::new();
+                out.merge_bytes(&bytes);
+                let _ = writer.write_multi_buffer(out).await;
+            })
+        }
+    }
+
+    /// 反向 Bridge ↔ Portal 往返（A-3 验收）：bridge 侧出站配好 reverse 后拨
+    /// portal 域名（`v1.rvs.cool`、port 0）→ 线上 `command=Rvs` → portal 侧
+    /// VLESS inbound（enable_reverse + registry + ohm）把连接交给注册的 portal
+    /// handler → handler 收到字节并回显。
+    ///
+    /// 未接线（命令决策退化为 TCP）时该用例红：portal inbound 把连接按普通 TCP
+    /// 转发（目标 `v1.rvs.cool`），落到**默认出站**（不读不回）而不是 portal
+    /// handler → 回显等不到、`forward` 计数为 1。
+    #[tokio::test]
+    async fn vless_reverse_portal_bridge_roundtrip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use xray_app_dispatcher::default::SimpleOhm;
+        use xray_proto::xray::proxy::vless::{Account as ProtoAccount, Reverse as ProtoReverse};
+
+        use crate::{
+            MemoryAccount, MemoryUser, MemoryValidator, Validator,
+            inbound::{
+                reverse::{PortalConfig, ReverseRegistry},
+                server::VlessInboundOptions,
+            },
+        };
+
+        const PAYLOAD: &[u8] = b"reverse-portal-bridge-payload";
+
+        // ---- portal 侧：validator（用户带 reverse.tag）+ registry + ohm handler ----
+        let uuid = UUID::new();
+        let user_reverse = ProtoReverse { tag: "portal-tag".to_string(), sniffing: None };
+        let proto_account = ProtoAccount {
+            id: uuid.to_string(),
+            reverse: Some(user_reverse),
+            ..Default::default()
+        };
+        let account = MemoryAccount::from_proto_account(&proto_account).unwrap();
+        let validator = MemoryValidator::new();
+        validator.add(MemoryUser::new("u", 0, account)).unwrap();
+
+        let portal_registry = Arc::new(ReverseRegistry::new());
+        portal_registry.add_reverse(PortalConfig::new("portal-tag")).unwrap();
+
+        // 默认出站 = 普通转发（不读不回）：反向接线生效时它**不应**被调用。
+        let forward = Arc::new(ReverseCaptureHandler::new("forward-default", false));
+        // portal handler = 回显方（handle_reverse_relay 经 ohm.get_handler(tag) 取到）。
+        let portal = Arc::new(ReverseCaptureHandler::new("reverse-portal", true));
+        let got = Arc::clone(&portal.got);
+        let ohm = Arc::new(SimpleOhm::new());
+        ohm.set_default(Arc::clone(&forward) as Arc<dyn xray_app_dispatcher::DispatchHandler>);
+        ohm.add("portal-tag", Arc::clone(&portal) as Arc<dyn xray_app_dispatcher::DispatchHandler>);
+
+        let listener = xray_transport::system_listener::InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        )
+        .await
+        .unwrap();
+        let portal_addr = listener.local_addr().unwrap();
+        let opts = VlessInboundOptions {
+            enable_reverse: true,
+            reverse_registry: Some(Arc::clone(&portal_registry)),
+            reverse_ohm: Some(Arc::clone(&ohm)),
+            ..Default::default()
+        };
+        tokio::spawn(async move {
+            let _ = crate::inbound::server::serve_vless(
+                listener,
+                ohm,
+                Arc::new(validator) as Arc<dyn Validator>,
+                None,
+                None,
+                Some(opts),
+            )
+            .await;
+        });
+
+        // ---- bridge 侧：VLESS outbound + reverse 注册表 ----
+        let bridge_registry = Arc::new(ReverseRegistry::new());
+        bridge_registry.add_reverse(PortalConfig::new("portal-tag")).unwrap();
+        let cfg = Arc::new(
+            VlessOutboundConfig::new(
+                uuid,
+                Address::from_ipv4_bytes([127, 0, 0, 1]),
+                Port::new(portal_addr.port()),
+            )
+            .with_reverse(Some(bridge_registry)),
+        );
+        let dial = make_dial_fn(cfg);
+        let dest =
+            Destination::new(Address::new_domain(crate::RVS_DOMAIN), Port::new(0), Network::TCP);
+        let mut conn = dial(&dest).await.expect("reverse bridge dial should succeed");
+
+        conn.write_all(PAYLOAD).await.unwrap();
+        // 响应头在首读时被 ResponseHeaderReader 消费，其后是 portal handler 的回显。
+        let mut echoed = vec![0u8; PAYLOAD.len()];
+        tokio::time::timeout(Duration::from_secs(5), conn.read_exact(&mut echoed))
+            .await
+            .expect("portal echo must arrive within 5s")
+            .expect("portal echo read");
+        assert_eq!(echoed, PAYLOAD, "portal handler must echo the bridge payload");
+        assert_eq!(&*got.lock(), PAYLOAD, "portal inbound must receive the bridge bytes");
+        assert_eq!(
+            *forward.called.lock(),
+            0,
+            "Rvs carrier must go to the reverse portal handler, not the default forward outbound"
+        );
+    }
+
+    /// 未装配 reverse 时拨反向域名必须显式报错（禁止静默按 TCP 处理）。
+    #[tokio::test]
+    async fn reverse_dial_without_config_errors() {
+        let cfg = Arc::new(VlessOutboundConfig::new(
+            UUID::new(),
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(9),
+        ));
+        let dial = make_dial_fn(cfg);
+        let dest =
+            Destination::new(Address::new_domain(crate::RVS_DOMAIN), Port::new(0), Network::TCP);
+        let err = match dial(&dest).await {
+            Err(e) => e,
+            Ok(_) => panic!("reverse dial without reverse config must fail, not fall back to TCP"),
+        };
+        assert!(err.contains("reverse"), "error must name the missing reverse config: {err}");
+    }
+
+    /// 反向域名带非 0 端口（前向请求撞内部域名）→ "nice try baby"（Go outbound.go:220-222）。
+    #[tokio::test]
+    async fn reverse_domain_with_port_is_rejected() {
+        let registry = Arc::new(crate::inbound::reverse::ReverseRegistry::new());
+        registry.add_reverse(crate::inbound::reverse::PortalConfig::new("t")).unwrap();
+        let cfg = Arc::new(
+            VlessOutboundConfig::new(
+                UUID::new(),
+                Address::from_ipv4_bytes([127, 0, 0, 1]),
+                Port::new(9),
+            )
+            .with_reverse(Some(registry)),
+        );
+        let dial = make_dial_fn(cfg);
+        let dest =
+            Destination::new(Address::new_domain(crate::RVS_DOMAIN), Port::new(443), Network::TCP);
+        let err = match dial(&dest).await {
+            Err(e) => e,
+            Ok(_) => panic!("reverse domain with non-zero port must be rejected"),
+        };
+        assert_eq!(err, "nice try baby");
+    }
+
+    /// §1.6 方向 A 互通：Rust Bridge → **Go VLESS Portal**。
+    ///
+    /// 需要外部编排（`reports/night-run-2026-10-21/scripts/run_vless_reverse_interop.py`
+    /// 起 Go xray 并注入环境变量），故 `#[ignore]`：
+    /// - `XRAY_GO_PORTAL_ADDR`：Go VLESS inbound `host:port`（client 带 `reverse.tag`）
+    /// - `XRAY_GO_SOCKS_ADDR`：Go socks inbound `host:port`（routing 指向该 reverse tag）
+    /// - `XRAY_TEST_UUID`：Go 侧注册的 VLESS 用户 UUID
+    ///
+    /// 判据：Rust 侧以 command=Rvs 建 carrier 后，经 Go socks 发起一次会话 → Go 把
+    /// 该会话的 mux New 帧推上 carrier → Rust 侧读到 `status=New` 的 mux 帧。
+    #[tokio::test]
+    #[ignore = "needs Go xray portal + socks 编排（见 reports/night-run-2026-10-21/scripts）"]
+    async fn vless_reverse_go_portal_interop() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let portal = std::env::var("XRAY_GO_PORTAL_ADDR").expect("XRAY_GO_PORTAL_ADDR");
+        let socks = std::env::var("XRAY_GO_SOCKS_ADDR").expect("XRAY_GO_SOCKS_ADDR");
+        let uuid = UUID::parse(&std::env::var("XRAY_TEST_UUID").expect("XRAY_TEST_UUID"))
+            .expect("valid uuid");
+        let split = |a: &str| {
+            let (h, p) = a.rsplit_once(':').expect("host:port");
+            (h.to_string(), p.parse::<u16>().expect("port"))
+        };
+        let (portal_host, portal_port) = split(&portal);
+        let (socks_host, socks_port) = split(&socks);
+
+        let registry = Arc::new(crate::inbound::reverse::ReverseRegistry::new());
+        registry.add_reverse(crate::inbound::reverse::PortalConfig::new("rust-bridge")).unwrap();
+        let cfg = Arc::new(
+            VlessOutboundConfig::new(
+                uuid,
+                Address::new_domain(portal_host),
+                Port::new(portal_port),
+            )
+            .with_reverse(Some(registry)),
+        );
+        let dial = make_dial_fn(cfg);
+        let dest =
+            Destination::new(Address::new_domain(crate::RVS_DOMAIN), Port::new(0), Network::TCP);
+        let mut carrier = dial(&dest).await.expect("Go portal must accept command=Rvs");
+
+        // 经 Go socks 发起一次会话：Go 把它 dispatch 到 reverse 出站 → mux New 帧上行。
+        let mut socks_conn = tokio::net::TcpStream::connect((socks_host.as_str(), socks_port))
+            .await
+            .expect("connect Go socks");
+        socks_conn.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut greeting = [0u8; 2];
+        socks_conn.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [0x05, 0x00], "socks no-auth greeting");
+        // CONNECT 127.0.0.1:9（目标不可达无妨：mux New 帧在拨号前发出）
+        socks_conn.write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x00, 0x09]).await.unwrap();
+        let mut reply = [0u8; 10];
+        let _ = socks_conn.read_exact(&mut reply).await;
+
+        // carrier 读：首包先过响应头（ResponseHeaderReader 内部消化），其后是 Go 侧
+        // mux 帧。布局无关判据：Go 把 **socks 会话的目标 127.0.0.1:9** 推上 carrier
+        // （mux metadata 里 port+addrtype+IPv4）；读到即证明 Rvs carrier 被 Go 认作
+        // 反向隧道并承载了真实会话。
+        let mut seen: Vec<u8> = Vec::new();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let mut buf = [0u8; 256];
+                let n = carrier.read(&mut buf).await.expect("carrier read");
+                assert!(n > 0, "carrier closed before Go pushed the socks session");
+                seen.extend_from_slice(&buf[..n]);
+                if seen.windows(4).any(|w| w == [127, 0, 0, 1])
+                    && seen.windows(2).any(|w| w == [0x00, 0x09])
+                {
+                    return;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("Go must push the socks session over the carrier: {seen:?}"));
+        println!("carrier bytes from Go portal: {seen:?}");
     }
 }
