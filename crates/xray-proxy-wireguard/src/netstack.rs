@@ -22,8 +22,8 @@ use smoltcp::{
     socket::{tcp, udp},
     time::Instant,
     wire::{
-        HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpProtocol, Ipv4Address, Ipv4Packet,
-        Ipv6Address, Ipv6Packet, TcpPacket,
+        HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, IpProtocol, Ipv4Address,
+        Ipv4Packet, Ipv6Address, Ipv6Packet, TcpPacket, UdpPacket,
     },
 };
 
@@ -61,6 +61,12 @@ pub struct WgNetStack {
     /// 嗅探隧道内 TCP SYN，按目标 (addr, port) 惰性建听；accept 后同 tuple 补位
     /// （[`Self::drain_accepted`]）。不变量：同 tuple 至多一个 pending 监听。
     listening: Vec<(SocketHandle, IpEndpoint)>,
+    /// UDP 转发监听表 (handle, 绑定 endpoint, 最近使用 nanos)。
+    ///
+    /// 对应 TCP 的 `listening`：smoltcp UDP 同样无通配监听，`ingest_rx` 嗅探
+    /// 隧道内 UDP 数据报的目标 tuple 惰性建 socket——票 z7ya，对应 Go 栈
+    /// `handleUDP` → udp forwarder 的受理点。使用时间供 [`Self::sweep_udp`] 淘汰。
+    udp_listens: Vec<(SocketHandle, IpEndpoint, i64)>,
 }
 impl WgNetStack {
     /// 构造网栈。
@@ -111,6 +117,7 @@ impl WgNetStack {
             sockets: SocketSet::new(Vec::new()),
             next_ephemeral: 0,
             listening: Vec::new(),
+            udp_listens: Vec::new(),
         }
     }
 
@@ -127,6 +134,12 @@ impl WgNetStack {
         }
         if let Some((addr, port)) = sniff_tcp_syn(&pkt) {
             self.ensure_listen(IpEndpoint { addr, port });
+        }
+        // UDP 无重传：首个数据报必须能落地，惰性绑定必须在入栈前完成，
+        // poll 时该包即被 socket 接收（否则 smoltcp 逐包回 ICMP port-unreachable，
+        // 正是票 z7ya B 向黑洞的机理）。
+        if let Some(dst) = sniff_udp_dst(&pkt) {
+            self.ensure_udp_listen(dst);
         }
         self.device.rx_queue.push_back(pkt);
     }
@@ -176,6 +189,8 @@ impl WgNetStack {
 
     /// 移除 socket。
     pub fn remove_socket(&mut self, handle: SocketHandle) {
+        // UDP 监听表以 handle 反查——sweep/防御性回收之外的任意移除路径都不留悬空表项
+        self.udp_listens.retain(|(h, _, _)| *h != handle);
         self.sockets.remove(handle);
     }
 
@@ -283,6 +298,103 @@ impl WgNetStack {
     pub fn iface_mut(&mut self) -> &mut Interface {
         &mut self.iface
     }
+
+    /// 惰性建立精确 tuple 的 UDP 转发监听（幂等）。
+    ///
+    /// 对应 TCP 的 [`Self::ensure_listen`]：任意 dst 都建（AnyIP 受理，票 t8pm）；
+    /// 目标端口为 0、同 tuple 已有监听、或表达 [`MAX_PENDING_LISTENS`] 上限时跳过
+    /// （该包由 smoltcp 按无监听处理）。bind 失败回收 socket 并告警。
+    fn ensure_udp_listen(&mut self, local: IpEndpoint) {
+        if local.port == 0
+            || self.udp_listens.iter().any(|(_, ep, _)| *ep == local)
+            || self.udp_listens.len() >= MAX_PENDING_LISTENS
+        {
+            return;
+        }
+        let handle = self.add_udp_socket();
+        let bound = IpListenEndpoint { addr: Some(local.addr), port: local.port };
+        let result = self.with_udp_socket(handle, |s| {
+            s.bind(bound)
+                .map_err(|e| crate::error::WgError::NetStack(format!("udp bind {local}: {e:?}")))
+        });
+        match result {
+            Ok(()) => self.udp_listens.push((handle, local, nanos_now())),
+            Err(e) => {
+                tracing::warn!(error = %e, "wg lazy udp listen failed");
+                self.remove_socket(handle);
+            },
+        }
+    }
+
+    /// 读取全部 UDP 转发监听的待收数据报。
+    ///
+    /// 返回 (绑定 endpoint = 隧道内目标, 源 endpoint = 隧道内源, payload)。
+    /// accept loop 在 poll 后调用；命中即刷新该监听的使用时间（清扫时间源）。
+    #[must_use]
+    pub fn drain_udp(&mut self, now: i64) -> Vec<(IpEndpoint, IpEndpoint, Vec<u8>)> {
+        let mut out = Vec::new();
+        // 字段级拆借：`with_udp_socket` 是 &mut self 方法，借用 udp_listens 期间
+        // 不可再调（E0499）；sockets 与 udp_listens 是不相交字段，直接拆借。
+        let Self { sockets, udp_listens, .. } = self;
+        for (handle, local, used) in udp_listens.iter_mut() {
+            let socket = sockets.get_mut::<udp::Socket<'static>>(*handle);
+            let mut fresh = false;
+            while let Ok((data, meta)) = socket.recv() {
+                out.push((*local, meta.endpoint, data.to_vec()));
+                fresh = true;
+            }
+            if fresh {
+                *used = now;
+            }
+        }
+        out
+    }
+
+    /// 以隧道内目标 endpoint（= 响应源）向隧道内源发回一个 UDP 数据报。
+    ///
+    /// 对应 Go `stack.writeUDP(payload, src, dst)`：响应以原目标为源地址发回。
+    /// 响应源未绑定监听时惰性补建（同一会话后续包换目标）；表满或 bind 失败
+    /// 返回 false（调用方丢弃该响应并告警）。调用方随后 poll 一次将其发出。
+    pub fn udp_send_reply(
+        &mut self,
+        reply_src: IpEndpoint,
+        payload: &[u8],
+        to_client: IpEndpoint,
+        now: i64,
+    ) -> bool {
+        if reply_src.port == 0 {
+            return false;
+        }
+        self.ensure_udp_listen(reply_src);
+        let Some(entry) = self.udp_listens.iter_mut().find(|(_, ep, _)| *ep == reply_src) else {
+            return false;
+        };
+        let handle = entry.0;
+        entry.2 = now;
+        self.with_udp_socket(handle, |s| s.send_slice(payload, to_client).is_ok())
+    }
+
+    /// 淘汰空闲 UDP 转发监听（无数据报进出超过 `idle_nanos`）。
+    ///
+    /// inbound 侧会话表独立清扫（inbound.rs，同空闲阈值）；监听 socket 与会话
+    /// 的使用时间同在客户端包路径刷新，空闲时两侧一同回收。返回淘汰数。
+    pub fn sweep_udp(&mut self, now: i64, idle_nanos: i64) -> usize {
+        let mut removed = 0usize;
+        let mut i = 0;
+        while i < self.udp_listens.len() {
+            if now.saturating_sub(self.udp_listens[i].2) > idle_nanos {
+                let (handle, _, _) = self.udp_listens.swap_remove(i);
+                self.remove_socket(handle);
+                removed += 1;
+            } else {
+                i += 1;
+            }
+        }
+        if removed > 0 {
+            tracing::debug!(count = removed, "wg udp forwarder listens swept");
+        }
+        removed
+    }
 }
 
 /// 从解密后的 IP 包嗅探 TCP SYN（不含 ACK），返回目标 (addr, port)。
@@ -312,6 +424,39 @@ fn sniff_tcp_syn(pkt: &[u8]) -> Option<(IpAddress, u16)> {
         return None;
     }
     Some((dst_addr, tcp.dst_port()))
+}
+
+/// 从解密后的 IP 包嗅探 UDP 数据报的目标 endpoint。
+///
+/// 与 [`sniff_tcp_syn`] 同款限定：v4/v6 定长头、首分片（smoltcp 不重组分片）；
+/// 目标端口 0 交由 [`WgNetStack::ensure_udp_listen`] 拒绝。
+fn sniff_udp_dst(pkt: &[u8]) -> Option<IpEndpoint> {
+    let (dst_addr, payload) = match pkt.first()? >> 4 {
+        4 => {
+            let v4 = Ipv4Packet::new_checked(pkt).ok()?;
+            if v4.more_frags() || v4.frag_offset() != 0 || v4.next_header() != IpProtocol::Udp {
+                return None;
+            }
+            (IpAddress::Ipv4(v4.dst_addr()), v4.payload())
+        },
+        6 => {
+            let v6 = Ipv6Packet::new_checked(pkt).ok()?;
+            if v6.next_header() != IpProtocol::Udp {
+                return None;
+            }
+            (IpAddress::Ipv6(v6.dst_addr()), v6.payload())
+        },
+        _ => return None,
+    };
+    let udp = UdpPacket::new_checked(payload).ok()?;
+    Some(IpEndpoint { addr: dst_addr, port: udp.dst_port() })
+}
+
+/// 墙钟纳秒——UDP 转发监听/会话空闲清扫的时间源。
+pub(crate) fn nanos_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as i64)
 }
 
 /// Go `stack.Input()`（proxy/tun/stack.go:165-172）同款不可转发判定：
@@ -510,6 +655,25 @@ pub(crate) mod test_packets {
         pkt
     }
 
+    /// 构造 IPv4 + UDP 包（零校验和——RX 不校验，见模块注释）。
+    pub fn make_udp_packet(src: ([u8; 4], u16), dst: ([u8; 4], u16), payload: &[u8]) -> Vec<u8> {
+        let mut pkt = vec![0u8; 28 + payload.len()];
+        let total_len = pkt.len() as u16;
+        let udp_len = (8 + payload.len()) as u16;
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&total_len.to_be_bytes()); // total length
+        pkt[8] = 64; // TTL
+        pkt[9] = 17; // protocol = UDP
+        pkt[12..16].copy_from_slice(&src.0);
+        pkt[16..20].copy_from_slice(&dst.0);
+        pkt[20..22].copy_from_slice(&src.1.to_be_bytes());
+        pkt[22..24].copy_from_slice(&dst.1.to_be_bytes());
+        pkt[24..26].copy_from_slice(&udp_len.to_be_bytes()); // udp length
+        // pkt[26..28] checksum = 0
+        pkt[28..].copy_from_slice(payload);
+        pkt
+    }
+
     /// 提取 IPv4+TCP 包的 seq（SYN-ACK ISN 用）；非 TCP 包返回 None。
     pub fn tcp_seq_number(pkt: &[u8]) -> Option<u32> {
         let v4 = Ipv4Packet::new_checked(pkt).ok()?;
@@ -524,6 +688,7 @@ pub(crate) mod test_packets {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::netstack::test_packets::make_udp_packet;
 
     fn make_stack() -> WgNetStack {
         let local = IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 2)), 32);
@@ -547,6 +712,81 @@ mod tests {
         let mut stack = make_stack();
         let handle = stack.add_udp_socket();
         stack.remove_socket(handle);
+    }
+
+    #[test]
+    fn udp_ingest_lazily_binds_and_drains() {
+        let mut stack = make_stack(); // 本端 10.0.0.2/32
+        stack.ingest_rx(make_udp_packet(([10, 0, 0, 1], 5555), ([1, 2, 3, 4], 53), b"query"));
+        stack.poll(Instant::now());
+
+        let dgrams = stack.drain_udp(nanos_now());
+        assert_eq!(dgrams.len(), 1, "one datagram expected");
+        let (dst, src, payload) = &dgrams[0];
+        assert_eq!(dst.addr, IpAddress::Ipv4(Ipv4Address::new(1, 2, 3, 4)), "AnyIP dst");
+        assert_eq!(dst.port, 53);
+        assert_eq!(src.addr, IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)));
+        assert_eq!(src.port, 5555);
+        assert_eq!(payload, b"query");
+        assert!(stack.drain_udp(nanos_now()).is_empty(), "drain is one-shot");
+    }
+
+    #[test]
+    fn udp_reply_produces_tx_ip_packet() {
+        let mut stack = make_stack();
+        stack.ingest_rx(make_udp_packet(([10, 0, 0, 1], 5555), ([1, 2, 3, 4], 53), b"q"));
+        stack.poll(Instant::now());
+        assert_eq!(stack.drain_udp(nanos_now()).len(), 1);
+
+        let reply_src =
+            IpEndpoint { addr: IpAddress::Ipv4(Ipv4Address::new(1, 2, 3, 4)), port: 53 };
+        let to_client =
+            IpEndpoint { addr: IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)), port: 5555 };
+        assert!(stack.udp_send_reply(reply_src, b"pong", to_client, nanos_now()));
+        stack.poll(Instant::now());
+
+        let tx = stack.drain_tx();
+        assert_eq!(tx.len(), 1, "reply packet expected in tx queue");
+        let v4 = Ipv4Packet::new_checked(&tx[0]).expect("ipv4 packet");
+        assert_eq!(v4.next_header(), IpProtocol::Udp);
+        assert_eq!(v4.src_addr(), Ipv4Address::new(1, 2, 3, 4), "reply src = 原目标");
+        assert_eq!(v4.dst_addr(), Ipv4Address::new(10, 0, 0, 1), "reply dst = 隧道内源");
+        let udp = UdpPacket::new_checked(v4.payload()).expect("udp packet");
+        assert_eq!(udp.src_port(), 53);
+        assert_eq!(udp.dst_port(), 5555);
+        assert_eq!(udp.payload(), b"pong");
+    }
+
+    #[test]
+    fn udp_sweep_removes_idle_listen() {
+        let mut stack = make_stack();
+        stack.ingest_rx(make_udp_packet(([10, 0, 0, 1], 5555), ([1, 2, 3, 4], 53), b"q"));
+        stack.poll(Instant::now());
+        assert_eq!(stack.drain_udp(nanos_now()).len(), 1);
+
+        // 未过空闲期：不淘汰
+        assert_eq!(stack.sweep_udp(nanos_now(), 60_000_000_000), 0);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert_eq!(stack.sweep_udp(nanos_now(), 0), 1, "idle listen removed");
+        assert!(stack.drain_udp(nanos_now()).is_empty(), "socket removed with entry");
+    }
+
+    #[test]
+    fn sniff_udp_dst_rejects_non_udp() {
+        use crate::netstack::test_packets::{TCP_SYN, make_tcp_packet};
+
+        assert_eq!(
+            sniff_udp_dst(&make_tcp_packet(
+                ([10, 0, 0, 1], 5555),
+                ([1, 2, 3, 4], 80),
+                TCP_SYN,
+                1,
+                0
+            )),
+            None,
+            "TCP packet is not sniffed as UDP"
+        );
+        assert_eq!(sniff_udp_dst(&[0u8; 4]), None, "garbage is not sniffed");
     }
 
     #[test]
