@@ -65,6 +65,9 @@ const WG_UDP_SESSION_IDLE_SECS: u64 = 60;
 /// UDP 会话/监听清扫周期（秒）。
 const WG_UDP_SWEEP_SECS: u64 = 30;
 
+/// TCP relay 关闭前等待 FIN/残留数据被确认的上限（票 97ng）。
+const FINISH_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// 单会话待发数据报队列上限（Go `udpQueueLimit = 1024` 同值，满即丢）。
 const WG_UDP_QUEUE_CAP: usize = 1024;
 
@@ -614,11 +617,27 @@ impl WgTcpRelay {
         closed
     }
 
-    /// 关闭 smoltcp socket 并从 SocketSet 移除（FIN 由 driver loop drain_tx 发出）。
+    /// 关闭 smoltcp socket 并从 SocketSet 移除。
+    ///
+    /// 票 97ng：`close()` 只把残留数据 + FIN 排进 tx 队列，慢客户端可能还有最多
+    /// 一个 tx 缓冲（64KB）未 ACK。立即 `remove_socket` 会丢弃这部分数据、且迟到
+    /// ACK 撞上无主 socket 被 smoltcp 回 RST——大响应在关闭瞬间被截断。关闭后继续
+    /// poll（driver 定时器同步 drain_tx 发上线路）直到 FIN 被确认或超时再移除。
     async fn finish(&self) {
         let mut stack = self.netstack.lock().await;
         stack.with_tcp_socket(self.handle, |s| s.close());
-        stack.poll(smoltcp::time::Instant::now());
+        let deadline = std::time::Instant::now() + FINISH_DRAIN_TIMEOUT;
+        loop {
+            stack.poll(smoltcp::time::Instant::now());
+            let active = stack.with_tcp_socket(self.handle, |s| s.is_active());
+            if !active || std::time::Instant::now() >= deadline {
+                break;
+            }
+            // 释放锁让位给 driver 定时器 drain_tx（唯一把 tx 发上线路的 task）
+            drop(stack);
+            tokio::time::sleep(Duration::from_millis(RELAY_POLL_MS)).await;
+            stack = self.netstack.lock().await;
+        }
         stack.remove_socket(self.handle);
     }
 }
@@ -1226,6 +1245,144 @@ mod tests {
 
         // 收满后放行 dispatch 任务，relay 走正常关闭路径
         release.notify_one();
+        server.close().await.expect("server close");
+    }
+
+    /// 票 97ng 回归：dispatch 写完响应**立即** drop link 时，relay 收 EOF 走
+    /// finish()——必须等残留 tx 数据被 ACK 后再摘 socket。
+    ///
+    /// 确定性现场：连接后**先发请求**触发回灌，客户端随后停读 1.5s（smoltcp rx
+    /// 打满 → 广告零窗 → 服务端 tx 缓冲必满），此时 dispatch 已 drop link、
+    /// relay 已进 finish()。修前：立即 remove_socket 丢弃缓冲内未 ACK 数据，
+    /// 客户端恢复读后尾部缺失（`!is_active()` 提前关闭）。修后：等 FIN ACK 再摘。
+    #[tokio::test]
+    async fn tunnel_tcp_inbound_dispatch_eof_flushes_tail() {
+        use std::net::SocketAddr;
+
+        use smoltcp::{
+            time::Instant,
+            wire::{IpAddress, IpCidr, Ipv4Address},
+        };
+
+        const TUNNEL_TCP_PORT: u16 = 8081;
+        const PAYLOAD_LEN: usize = 128 * 1024;
+        let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i % 251) as u8).collect();
+
+        let (sec_c, pub_c) = make_keypair(0x33);
+        let (sec_s, pub_s) = make_keypair(0x44);
+        let udp_port = free_port().await;
+
+        let server_cfg = DeviceConfig {
+            secret_key: sec_s,
+            endpoint: vec!["10.0.0.1/32".into()],
+            peers: vec![PeerConfig {
+                public_key: pub_c.clone(),
+                allowed_ips: vec!["10.0.0.2/32".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (dispatch, release) = HoldEchoDispatch::new("wg-e2e-97ng", &payload);
+        let server = WireguardInboundHandler::new("wg-e2e-97ng", &server_cfg, udp_port, dispatch)
+            .await
+            .expect("server construct");
+        server.start().await.expect("server start");
+        server
+            .user_registry()
+            .add_user(
+                "u@wg",
+                3,
+                PeerConfig {
+                    public_key: pub_c,
+                    allowed_ips: vec!["10.0.0.2/32".into()],
+                    ..Default::default()
+                },
+            )
+            .expect("add user");
+
+        let client_cfg = DeviceConfig {
+            secret_key: sec_c,
+            endpoint: vec!["10.0.0.2/32".into()],
+            peers: vec![PeerConfig {
+                public_key: pub_s,
+                endpoint: format!("127.0.0.1:{udp_port}"),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let client_peer = shared_peer(&client_cfg, &client_cfg.peers[0], 0).expect("client peer");
+        let client_sock = bind_udp_socket("127.0.0.1:0").await.expect("client bind");
+        let client_ns = Arc::new(AsyncMutex::new(WgNetStack::new(
+            &[IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 2)), 32)],
+            1420,
+        )));
+        let client = Arc::new(WgDriver::new(client_peer, client_sock, Arc::clone(&client_ns)));
+        client.set_remote(SocketAddr::from(([127, 0, 0, 1], udp_port)));
+        tokio::spawn(Arc::clone(&client).main_loop());
+
+        let handle = {
+            let mut s = client_ns.lock().await;
+            let h = s.add_tcp_socket();
+            s.tcp_connect(h, IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)), TUNNEL_TCP_PORT)
+                .expect("tcp connect");
+            h
+        };
+
+        // dispatch 写完响应即放行（drop link）——97ng 竞态条件
+        release.notify_one();
+
+        // ① 先把请求发出去触发回灌（握手可能还需重试，轮询到发出为止）
+        let mut sent = false;
+        let send_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !sent && std::time::Instant::now() < send_deadline {
+            let mut s = client_ns.lock().await;
+            s.poll(Instant::now());
+            s.with_tcp_socket(handle, |sock| {
+                if sock.may_send() {
+                    sent = sock.send_slice(b"ping").is_ok();
+                }
+            });
+            drop(s);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(sent, "request never sent: handshake did not complete");
+
+        // ② 停读 1.5s：回灌把客户端 rx 打满 → 服务端 tx 缓冲满 → relay 在此窗口内 finish()
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // ③ 恢复读：修前尾部已丢（提前 !is_active 或收不满）
+        let mut got: Vec<u8> = Vec::new();
+        let started = std::time::Instant::now();
+        while got.len() < PAYLOAD_LEN {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "response incomplete: got {}/{}",
+                got.len(),
+                PAYLOAD_LEN
+            );
+            let before = got.len();
+            let mut closed = false;
+            {
+                let mut s = client_ns.lock().await;
+                s.poll(Instant::now());
+                s.with_tcp_socket(handle, |sock| {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.recv_slice(&mut buf).unwrap_or(0);
+                    got.extend_from_slice(&buf[..n]);
+                    closed = !sock.is_active();
+                });
+            }
+            if closed && got.len() < PAYLOAD_LEN {
+                panic!("response truncated at dispatch EOF: got {}/{}", got.len(), PAYLOAD_LEN);
+            }
+            if got.len() == before {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
+        }
+        assert!(got == payload, "content mismatch");
+
         server.close().await.expect("server close");
     }
 }
