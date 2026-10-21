@@ -126,6 +126,10 @@ pub struct StackOptions {
     /// （Go config.proto field 9；Linux/FreeBSD 语义，Windows 运行时忽略——Go 同）。
     /// Rust proto 镜像为 7 字段（bd v5g）未含此键，仅 JSON 入。
     pub auto_system_dns_to_gateway: bool,
+    /// Windows WFP 泄漏阻断开关。JSON `"autoSystemWfpBlockLeak"`，合法值
+    /// `"dns"` / `"misconfigtun"`（Go infra/conf/tun.go:28,42-49，值统一小写）。
+    /// Rust proto 镜像为 7 字段（bd v5g）未含此键，仅 JSON 入。
+    pub auto_system_wfp_block_leak: Vec<String>,
 }
 
 impl Default for StackOptions {
@@ -143,6 +147,7 @@ impl Default for StackOptions {
             auto_system_routing_table: Vec::new(),
             auto_outbounds_interface: None,
             auto_system_dns_to_gateway: false,
+            auto_system_wfp_block_leak: Vec::new(),
         }
     }
 }
@@ -191,20 +196,48 @@ impl StackOptions {
             opts.auto_system_dns_to_gateway = b;
         }
         // autoSystemWfpBlockLeak（Go tun.go:28，Windows WFP 防泄漏过滤器，合法值
-        // "dns"/"misconfigtun"）：Rust 无 WFP 能力（票 5std M7），非空显式拒绝而非
-        // 静默忽略——用户以为有防泄漏保护实际裸奔。空数组/null 在 Go 侧同为
-        // 无操作，放行；非数组类型手误按"已设置"拒启（bd zl5t 惯例）。
-        if let Some(w) = v.get("autoSystemWfpBlockLeak") {
-            let requested = match w {
-                serde_json::Value::Array(a) => !a.is_empty(),
-                serde_json::Value::Null => false,
-                _ => true,
-            };
-            if requested {
+        // "dns"/"misconfigtun"）：值统一小写，其它值按 Go 同款报错（Go tun.go:42-49）。
+        // 空数组/null 在 Go 侧同为无操作，放行；非数组类型手误按"已设置"拒启
+        // （bd zl5t 惯例）。
+        if let Some(w) = v.get("autoSystemWfpBlockLeak").filter(|x| !x.is_null()) {
+            let arr = w.as_array().ok_or_else(|| {
+                TunError::InvalidConfig("autoSystemWfpBlockLeak: expected string array".into())
+            })?;
+            let raw = str_list(arr, "autoSystemWfpBlockLeak")?;
+            let mut leaks = Vec::with_capacity(raw.len());
+            for value in raw {
+                let leak = value.to_lowercase();
+                if !matches!(leak.as_str(), "dns" | "misconfigtun") {
+                    return Err(TunError::InvalidConfig(format!(
+                        "unknown autoSystemWfpBlockLeak value: {leak}"
+                    )));
+                }
+                leaks.push(leak);
+            }
+            opts.auto_system_wfp_block_leak = leaks;
+        }
+        // 平台交叉校验（Go tun.go:51-60）：Windows 上非空须有 autoSystemRoutingTable，
+        // 含 "dns" 须有 dns 列表。非 Windows：WFP 是 Windows 专有机制，非空即拒
+        // （票 5std M7：静默忽略 = 用户以为有防泄漏保护实际裸奔）。
+        #[cfg(windows)]
+        if !opts.auto_system_wfp_block_leak.is_empty() {
+            if opts.auto_system_routing_table.is_empty() {
                 return Err(TunError::InvalidConfig(
-                    "autoSystemWfpBlockLeak is not supported by this build; remove the key (WFP leak blocking is not implemented)".into(),
+                    "autoSystemWfpBlockLeak needs autoSystemRoutingTable to be set".into(),
                 ));
             }
+            if opts.auto_system_wfp_block_leak.iter().any(|l| l == "dns") && opts.dns.is_empty() {
+                return Err(TunError::InvalidConfig(
+                    "autoSystemWfpBlockLeak \"dns\" needs dns to be set".into(),
+                ));
+            }
+        }
+        #[cfg(not(windows))]
+        if !opts.auto_system_wfp_block_leak.is_empty() {
+            return Err(TunError::InvalidConfig(format!(
+                "autoSystemWfpBlockLeak is only implemented on Windows (current platform={}); remove the key to run without",
+                std::env::consts::OS
+            )));
         }
         // idleTimeout：Rust 扩展（Go TunConfig 无此字段）；数字（秒）或 "30s"/"5m"。
         if let Some(val) = v.get("idleTimeout") {
@@ -540,22 +573,76 @@ mod tests {
         assert!(opts.auto_system_dns_to_gateway);
     }
 
-    /// 票 5std M7：autoSystemWfpBlockLeak 非空硬错（Rust 无 WFP 能力，静默忽略 =
-    /// 用户以为有防泄漏保护实际裸奔）；空数组/null 放行（Go 侧同为无操作）。
+    /// 票 5std M7 后续：autoSystemWfpBlockLeak 由「一律硬错」改为「解析 + 校验」
+    /// （Go infra/conf/tun.go:42-60）。值合法性判定在平台分支之前，故两个平台同款。
     #[test]
     #[allow(clippy::err_expect)] // 存量清零批次：测试断言期 expect（StackOptions 无 Debug，禁 expect_err）
-    fn parse_json_wfp_block_leak_rejected_loudly() {
-        // Go tun_test.go:30-32 同款输入（合法值形态）
-        let err = StackOptions::parse_json(br#"{"autoSystemWfpBlockLeak":["dns","misconfigtun"]}"#)
+    fn parse_json_wfp_block_leak_parses_and_validates() {
+        // 非法值 → Go 同款错误（Go tun.go:47）
+        let err = StackOptions::parse_json(br#"{"autoSystemWfpBlockLeak":["bogus"]}"#)
             .err()
-            .expect("non-empty autoSystemWfpBlockLeak must reject");
+            .expect("unknown autoSystemWfpBlockLeak value must reject");
         let msg = err.to_string();
-        assert!(msg.contains("autoSystemWfpBlockLeak"), "{msg}");
-        assert!(msg.contains("not supported"), "{msg}");
-        // 非数组类型手误 → 同样拒启，不静默丢
+        assert!(msg.contains("unknown autoSystemWfpBlockLeak value: bogus"), "{msg}");
+        // 非数组类型手误 → 拒启，不静默丢
         assert!(StackOptions::parse_json(br#"{"autoSystemWfpBlockLeak":"dns"}"#).is_err());
-        // 空数组 = 无操作，放行
+        // 空数组 / 缺省 = 无操作，放行（Go 侧同为无操作）
         assert!(StackOptions::parse_json(br#"{"autoSystemWfpBlockLeak":[]}"#).is_ok());
+        assert!(StackOptions::parse_json(b"{}").is_ok());
+    }
+
+    /// Windows 平台：合法值 + 必备设置 → 解析成功（值统一小写）。
+    /// Go infra/conf/tun.go:42-49（小写归一）+ :52-60（交叉校验）。
+    #[cfg(windows)]
+    #[test]
+    #[allow(clippy::err_expect)] // 存量清零批次：测试断言期 expect（StackOptions 无 Debug，禁 expect_err）
+    fn parse_json_wfp_block_leak_windows_platform_rules() {
+        // Go tun_test.go:30-32 同款输入（大小写归一 + 两值并存）
+        let opts = StackOptions::parse_json(
+            br#"{"dns":["1.1.1.1"],"autoSystemRoutingTable":["0.0.0.0/0"],"autoSystemWfpBlockLeak":["DNS","MisconfigTun"]}"#,
+        )
+        .unwrap();
+        assert_eq!(opts.auto_system_wfp_block_leak, vec!["dns", "misconfigtun"]);
+        // 仅 misconfigtun：不需 dns 列表
+        let opts = StackOptions::parse_json(
+            br#"{"autoSystemRoutingTable":["0.0.0.0/0"],"autoSystemWfpBlockLeak":["misconfigtun"]}"#,
+        )
+        .unwrap();
+        assert_eq!(opts.auto_system_wfp_block_leak, vec!["misconfigtun"]);
+        // 非空但缺 autoSystemRoutingTable → 拒（Go tun.go:53-55）
+        let err = StackOptions::parse_json(br#"{"autoSystemWfpBlockLeak":["misconfigtun"]}"#)
+            .err()
+            .expect("non-empty without autoSystemRoutingTable must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("autoSystemWfpBlockLeak needs autoSystemRoutingTable to be set"),
+            "{msg}"
+        );
+        // 含 dns 但缺 dns 列表 → 拒（Go tun.go:56-58）
+        let err = StackOptions::parse_json(
+            br#"{"autoSystemRoutingTable":["0.0.0.0/0"],"autoSystemWfpBlockLeak":["dns"]}"#,
+        )
+        .err()
+        .expect("dns leak without dns list must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("autoSystemWfpBlockLeak \"dns\" needs dns to be set"), "{msg}");
+    }
+
+    /// 非 Windows 平台：WFP 是 Windows 专有机制，非空即报错（票 5std M7：
+    /// 静默忽略 = 用户以为有防护实际裸奔）；空数组/缺省仍放行。
+    #[cfg(not(windows))]
+    #[test]
+    #[allow(clippy::err_expect)] // 存量清零批次：测试断言期 expect（StackOptions 无 Debug，禁 expect_err）
+    fn parse_json_wfp_block_leak_rejected_on_non_windows() {
+        let err = StackOptions::parse_json(br#"{"autoSystemWfpBlockLeak":["dns"]}"#)
+            .err()
+            .expect("non-empty autoSystemWfpBlockLeak must reject off Windows");
+        let msg = err.to_string();
+        assert!(msg.contains("only implemented on Windows"), "{msg}");
+        assert!(msg.contains(std::env::consts::OS), "{msg}");
+        // 空数组 / 缺省 = 无操作，放行
+        assert!(StackOptions::parse_json(br#"{"autoSystemWfpBlockLeak":[]}"#).is_ok());
+        assert!(StackOptions::parse_json(b"{}").is_ok());
     }
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
