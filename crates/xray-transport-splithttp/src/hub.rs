@@ -163,7 +163,7 @@ impl HubListener {
     ) -> Result<Self> {
         let tcp_listener = xray_transport::system_listener::bind_tcp_listener(
             addr,
-            xray_transport::system_listener::LISTEN_BACKLOG,
+            xray_transport::system_listener::effective_listen_backlog(),
         )
         .await
         .map_err(|e| SplitHttpError::ListenFailed(e.to_string()))?;

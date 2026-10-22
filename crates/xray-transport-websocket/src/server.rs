@@ -135,7 +135,7 @@ impl WsListener {
         }
         let listener = xray_transport::system_listener::bind_tcp_listener(
             addr,
-            xray_transport::system_listener::LISTEN_BACKLOG,
+            xray_transport::system_listener::effective_listen_backlog(),
         )
         .await
         .map_err(WsError::Io)?;

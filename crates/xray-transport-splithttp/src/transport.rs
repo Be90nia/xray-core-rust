@@ -118,7 +118,7 @@ async fn listen_tcp(
 ) -> io::Result<Box<dyn TransportListener>> {
     let tcp = xray_transport::system_listener::bind_tcp_listener(
         addr,
-        xray_transport::system_listener::LISTEN_BACKLOG,
+        xray_transport::system_listener::effective_listen_backlog(),
     )
     .await?;
     let local = tcp.local_addr()?;
