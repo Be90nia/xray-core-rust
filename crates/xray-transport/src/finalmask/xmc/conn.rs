@@ -26,6 +26,7 @@ use std::{
 
 use rand::{Rng, RngCore};
 use rsa::{pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePublicKey};
+use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf},
     sync::mpsc,
@@ -57,8 +58,19 @@ const PACKET_CHANNEL: &str = "xmc:data";
 const MAX_PACKET_DATA: usize = 24 * 1024;
 const KEEP_ALIVE_PERIOD: Duration = Duration::from_secs(15);
 
+/// nextState=1 status 探测的伪装应答原文（vanilla 26.1.2 服务端原文，对应 Go
+/// `server.go` `statusResponse`——单包主动探测不可区分 vanilla MC）。
+const STATUS_RESPONSE: &str = r#"{"description":"A Minecraft Server","players":{"max":20,"online":0},"version":{"name":"26.1.2","protocol":775},"enforcesSecureChat":true}"#;
+
 fn io_err(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
+}
+
+/// 恒时密码比较（对齐 Go `subtle.ConstantTimeCompare(...) != 1` 三态语义：相等
+/// true / 不等或长度不等 false；长度不等分支非常量时间——与 Go 标准库实现同构，
+/// 不引入 Go 没有的行为）。
+fn ct_password_eq(a: &[u8], b: &[u8]) -> bool {
+    bool::from(a.ct_eq(b))
 }
 
 /// 异步读 Minecraft VarInt（int32，7-bit 编码，最多 5 字节）。
@@ -405,8 +417,7 @@ where
         io::Error::new(io::ErrorKind::InvalidData, format!("parse rsa private key: {e}"))
     })?;
 
-    // 1. 读 Handshake (0x00)。nextState=1 的 status ping 伪装（Go 支持）Rust 未实现，
-    //    明确拒绝——不做静默降级。
+    // 1. 读 Handshake (0x00)。nextState=1 走 status ping 伪装分支（上方），2 走 Login。
     let (packet_id, data) = read_packet_async(raw).await?;
     if packet_id != 0x00 {
         return Err(io_err(format!("bad handshake packet id: {packet_id}")));
@@ -416,10 +427,33 @@ where
     let _addr = protocol::read_string(&mut cursor)?;
     let _port = protocol::read_u16_be(&mut cursor)?;
     let next_state = protocol::read_varint(&mut cursor)?;
+    if next_state == 1 {
+        // status ping 伪装（对应 Go server.go:83-118 nextState==1 分支）：恰好消费
+        // 2 包（Status Request→回静态 statusResponse / Ping→回显 payload，其他 id
+        // 静默消费），随后按 Go 同款以错误关闭连接——主动探测与 vanilla MC 不可区分。
+        for _ in 0..2 {
+            let (packet_id, data) = read_packet_async(raw).await?;
+            match packet_id {
+                0 => {
+                    // Status Request（0x00，无字段）→ 回 statusResponse。
+                    let mut p = Vec::with_capacity(STATUS_RESPONSE.len() + 5);
+                    protocol::write_string(&mut p, STATUS_RESPONSE)?;
+                    write_packet_with_length_async(raw, 0, &p).await?;
+                },
+                1 => {
+                    // Ping：Go readFields(Long) 不足 8 字节报错、多余字节不回传。
+                    if data.len() < 8 {
+                        return Err(io_err("read ping packet: short payload"));
+                    }
+                    write_packet_with_length_async(raw, 1, &data[..8]).await?;
+                },
+                _ => {},
+            }
+        }
+        return Err(io_err("ping"));
+    }
     if next_state != 2 {
-        return Err(io_err(format!(
-            "unsupported next state: {next_state} (status ping masquerade not implemented)"
-        )));
+        return Err(io_err(format!("bad handshake packet: bad next state: {next_state}")));
     }
 
     // 2. 读 Login Start (0x00)
@@ -473,7 +507,7 @@ where
     let mut enc = Cfb8Enc::new(&secret16, &secret16);
 
     let received_pw = &decrypted_verify[4..];
-    if received_pw != password.as_bytes() {
+    if !ct_password_eq(received_pw, password.as_bytes()) {
         write_encrypted_disconnect(
             raw,
             &mut enc,
@@ -585,7 +619,13 @@ pub(super) async fn tcp_bridge(
 ) {
     let (mut dec_reader, ww, mut enc) = match handshake_phase(raw, is_client, &config).await {
         Ok(v) => v,
-        Err(_) => return, // 握手失败/超时：断开 pipe（对端读到 EOF）
+        Err(e) => {
+            // Go 侧握手错误从 Read/Write 冒泡给代理调用方记录；Rust bridge 代为
+            // 记录后断开 pipe（对端读到 EOF）。拒绝类事件（密码错/非白名单/探测）
+            // 由此可观测，不再静默。
+            tracing::warn!(error = %e, is_client, "xmc handshake failed");
+            return;
+        },
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -622,7 +662,11 @@ pub(super) async fn tcp_bridge(
         let mut buf = vec![0u8; MAX_PACKET_DATA];
         loop {
             match pipe_r.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(e) => {
+                    tracing::debug!(error = %e, "xmc bridge proxy-side read failed");
+                    break;
+                },
                 Ok(n) => match encode_custom_payload(local_cp_id, &buf[..n]) {
                     Ok(pkt) => {
                         if tx_data.send(pkt).is_err() {
@@ -644,7 +688,10 @@ pub(super) async fn tcp_bridge(
         loop {
             let (id, data) = match read_packet_async(&mut dec_reader).await {
                 Ok(v) => v,
-                Err(_) => break,
+                Err(e) => {
+                    tracing::debug!(error = %e, "xmc packet stream read failed");
+                    break;
+                },
             };
             if id == remote_cp_id {
                 let mut cur = io::Cursor::new(&data);
@@ -813,5 +860,58 @@ mod tests {
                 .expect("echo read ok");
             assert_eq!(got, payload, "{size}B: echo corrupted");
         }
+    }
+
+    /// 恒时比较语义锁：相等 true / 等长异字节 false / 长度不等 false（对应 Go
+    /// ConstantTimeCompare 三态 1/0/0）。恒时性本身不做 CI 断言——无 dudect 基建，
+    /// 时间断言在共享 CI runner 上必然 flaky。
+    #[test]
+    fn ct_password_eq_semantics() {
+        assert!(ct_password_eq(b"secret-abc", b"secret-abc"));
+        assert!(!ct_password_eq(b"secret-abc", b"secret-XXX"));
+        assert!(!ct_password_eq(b"secret-abc", b"secret-abcd"));
+        assert!(!ct_password_eq(b"", b"x"));
+        assert!(ct_password_eq(b"", b""));
+    }
+
+    /// nextState=1 主动探测（对应 Go server.go:83-118）：Status Request→回静态
+    /// statusResponse、Ping→回显 payload；恰好 2 包后连接按错误关闭——单次探测
+    /// 与 vanilla MC 不可区分，代理侧半管被拆（读到 EOF）。
+    #[tokio::test]
+    async fn status_ping_probe_gets_vanilla_masquerade() {
+        let config = test_config();
+        let (raw_probe, raw_network) = tokio::io::duplex(64 * 1024);
+        let wrapped: DynIo = config.wrap_conn_server(Box::new(raw_network)).unwrap();
+
+        // MC 探测字节：handshake(next=1) + Status Request(0x00) + Ping(0x01)。
+        let mut p = Vec::new();
+        protocol::write_varint(&mut p, PROTOCOL_VERSION).unwrap();
+        protocol::write_string(&mut p, "localhost").unwrap();
+        protocol::write_u16_be(&mut p, 25565).unwrap();
+        protocol::write_varint(&mut p, 1).unwrap();
+
+        let ping_payload = 1_234_567_890_i64.to_be_bytes().to_vec();
+        let mut raw = raw_probe;
+        raw.write_all(&encode_packet(0x00, &p).unwrap()).await.unwrap();
+        raw.write_all(&encode_packet(0x00, &[]).unwrap()).await.unwrap();
+        raw.write_all(&encode_packet(0x01, &ping_payload).unwrap()).await.unwrap();
+
+        // ① statusResponse 原文返回
+        let (id, data) = read_packet_async(&mut raw).await.unwrap();
+        assert_eq!(id, 0, "first reply must be status response");
+        let mut cur = io::Cursor::new(data);
+        let resp = protocol::read_string(&mut cur).unwrap();
+        assert_eq!(resp, STATUS_RESPONSE);
+
+        // ② Ping payload 原样回显
+        let (id, data) = read_packet_async(&mut raw).await.unwrap();
+        assert_eq!(id, 1, "second reply must be ping echo");
+        assert_eq!(data, ping_payload);
+
+        // ③ 恰好 2 包后桥退出：代理侧半管 EOF（Go 以 fmt.Errorf("ping") 关连接）。
+        let mut wrapped = wrapped;
+        let mut drained = Vec::new();
+        let n = wrapped.read_to_end(&mut drained).await.unwrap();
+        assert_eq!(n, 0, "proxy-facing pipe must be torn down after probe");
     }
 }

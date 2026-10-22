@@ -49,3 +49,7 @@ base64 = "0.22"
 tokio = { workspace = true, features = ["test-util"] }
 hex = "0.4"
 
+
+# bd g3cr: 生产代码零 unwrap（测试代码由 clippy.toml allow-unwrap-in-tests 豁免）
+[lints.clippy]
+unwrap_used = "deny"

@@ -499,7 +499,7 @@ fn build_table(password: &str, layout: Layout) -> Result<Table, String> {
     // SHA256 → seed → shuffle order
     let hash = digest::digest(&digest::SHA256, password.as_bytes());
     let hash_ref = hash.as_ref();
-    let seed = i64::from_be_bytes(hash_ref[..8].try_into().unwrap());
+    let seed = i64::from_be_bytes(hash_ref[..8].try_into().expect("sha256 digest is 32 bytes"));
     let mut order: Vec<usize> = (0..patterns.len()).collect();
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed as u64);
     order.shuffle(&mut rng);

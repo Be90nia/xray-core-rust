@@ -409,10 +409,13 @@ mod tests {
 
     use std::sync::Arc;
 
+    /// Mock 记录队列类型（clippy type_complexity：别名收敛长元组容器）。
+    type PacketQueue = Arc<Mutex<Vec<(Vec<u8>, SocketAddr)>>>;
+
     #[tokio::test]
     async fn noise_injects_then_real_packet() {
         // Arc 共享状态：Mock 记录到 Arc，测试直接检查
-        let packets: Arc<Mutex<Vec<(Vec<u8>, SocketAddr)>>> = Arc::new(Mutex::new(vec![]));
+        let packets: PacketQueue = Arc::new(Mutex::new(vec![]));
         let mock = MockUdpIo { packets: packets.clone() };
         let config = NoiseConfig {
             reset_max: 10,
@@ -439,7 +442,7 @@ mod tests {
     // --- Mock UdpIo（Arc 共享状态，测试直接检查发送记录）---
     #[derive(Default)]
     struct MockUdpIo {
-        packets: Arc<Mutex<Vec<(Vec<u8>, SocketAddr)>>>,
+        packets: PacketQueue,
     }
 
     #[async_trait]

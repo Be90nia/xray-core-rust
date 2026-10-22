@@ -16,6 +16,7 @@
 use std::{future::Future, io, pin::Pin, time::Duration};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use xray_common::padding::validate_padding_len;
 
 use super::protocol;
 
@@ -393,7 +394,9 @@ where
     let encoded_length = read_varint_async(reader).await?;
     let header_length = protocol::varint_size(encoded_length) as i32;
     let record_length = encoded_length;
-    if record_length < header_length || record_length > MAX_PADDING_TURN_LENGTH {
+    if record_length < header_length
+        || validate_padding_len(record_length as u64, MAX_PADDING_TURN_LENGTH as u64).is_err()
+    {
         return Err(io_err(format!("invalid padding record length: {record_length}")));
     }
     let total_length = prefix_length + record_length;
@@ -629,5 +632,30 @@ mod tests {
                 .unwrap();
         };
         let _ = tokio::join!(client_fut, server_fut);
+    }
+
+    #[tokio::test]
+    async fn read_rejects_oversized_record_length() {
+        // bd p67v 收敛点：wire 声明 record_length 超 8 MiB 必须在读 padding 前拒绝。
+        let turn = PaddingTurn {
+            direction: PaddingDirection::ClientToServer,
+            min_length: 100,
+            max_length: 200,
+            ..PaddingTurn::default()
+        };
+        let mut payload = Vec::new();
+        protocol::write_varint(&mut payload, MAX_PADDING_TURN_LENGTH + 1).unwrap();
+        let mut sink = Vec::new();
+        let err = run_padding_schedule_with_sleeper(
+            &mut &payload[..],
+            &mut sink,
+            false,
+            0,
+            &[turn],
+            &no_op_sleeper,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid padding record length: 8388609"), "got {err}");
     }
 }

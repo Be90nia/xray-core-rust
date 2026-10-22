@@ -152,6 +152,9 @@ impl Ss2022Inbound {
 ///
 /// 对应 Go `MultiUserInbound` struct（`proxy/shadowsocks_2022/inbound_multi.go`）。
 ///
+/// 多用户表共享句柄：(user, psk_identity(user.psk)) 预计算 identity。
+type UserTable = Arc<Mutex<Vec<(Ss2022User, [u8; 16])>>>;
+
 /// TCP 多用户识别：EIH（identity header）= AES-ECB(identitySubkey(iPSK, salt))，
 /// 解密得 `psk_identity(uPSK)` 查用户表；session key 由命中的 uPSK 派生。
 pub struct MultiUserInbound {
@@ -163,7 +166,7 @@ pub struct MultiUserInbound {
     /// 每项 = (user, psk_identity(user.psk))：identity 在用户装载/添加时
     /// 预计算一次（blake3），EIH 匹配退化为 16B memcmp，消除每连接 ×
     /// 用户数的哈希放大（对齐 Go `identityMap` 语义）。
-    users: Arc<Mutex<Vec<(Ss2022User, [u8; 16])>>>,
+    users: UserTable,
     /// 时间戳容忍窗口（秒）。
     #[allow(dead_code)] // 时间戳校验由 header 时间戳直接比较承担；字段为配置面 Go 对齐保留
     timestamp_tolerance: u64,

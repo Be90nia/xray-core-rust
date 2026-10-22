@@ -1666,12 +1666,14 @@ pub async fn serve_dokodemo_udp(
     handler: Arc<dyn DispatchHandler>,
     dest: Option<Destination>,
     follow_redirect: bool,
+    // finalmask.udp（bd 05js，Go udp/hub.go:61-62 FinalMask.ListenPacket；None = 未配置）
+    udpmask: Option<xray_transport::finalmask::UdpmaskManager>,
 ) -> std::io::Result<()> {
     use xray_transport::udp::hub::ReceiveOriginalDestination;
     let hub = xray_transport::udp::hub::UdpHub::listen(
         bind_addr,
         &[Box::new(ReceiveOriginalDestination(follow_redirect))],
-        None,
+        udpmask,
     )
     .await?;
     serve_dokodemo_udp_on(hub, handler, dest).await
@@ -1970,6 +1972,8 @@ pub async fn serve_ss(
     inbound: SsInboundMode,
     // sm80④：policy Timeouts.Handshake（legacy 与 ss2022 TCP 握手共用）
     handshake_timeout: std::time::Duration,
+    // finalmask.udp（bd 05js，Go udp/hub.go:61-62 FinalMask.ListenPacket；None = 未配置）
+    udpmask: Option<xray_transport::finalmask::UdpmaskManager>,
 ) -> std::io::Result<()> {
     let handler = ohm
         .get_default_handler()
@@ -2003,22 +2007,42 @@ pub async fn serve_ss(
         let port = listener.local_addr()?.port();
         match tokio::net::UdpSocket::bind(("0.0.0.0", port)).await {
             Ok(sock) => {
-                let handler = Arc::clone(&handler);
-                tokio::spawn(async move {
-                    let _ = match flavor {
-                        SsUdpFlavor::Legacy(ib) => serve_ss_udp(Arc::new(sock), ib, handler).await,
-                        SsUdpFlavor::Ss2022 { kind, server_psk, users } => {
-                            serve_ss2022_udp(Arc::new(sock), kind, server_psk, users, handler).await
-                        },
-                    };
-                });
+                // finalmask.udp（bd 05js，Go udp/hub.go:71-77 WrapPacketConnServer）：
+                // recv 侧 decode、回包 send_to 侧 encode；未配置 → 裸 socket 原样。
+                let udp: Option<Arc<dyn xray_transport::finalmask::UdpIo>> = match udpmask {
+                    Some(mgr) if !mgr.udpmasks.is_empty() => {
+                        match mgr.wrap_packet_conn_server(Box::new(sock)) {
+                            Ok(wrapped) => Some(Arc::from(wrapped)),
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e, port, "ss udp mask wrap failed, udp relay disabled"
+                                );
+                                None
+                            },
+                        }
+                    },
+                    _ => Some(Arc::new(sock)),
+                };
+                if let Some(udp) = udp {
+                    let handler = Arc::clone(&handler);
+                    tokio::spawn(async move {
+                        let _ = match flavor {
+                            SsUdpFlavor::Legacy(ib) => serve_ss_udp(udp, ib, handler).await,
+                            SsUdpFlavor::Ss2022 { kind, server_psk, users } => {
+                                serve_ss2022_udp(udp, kind, server_psk, users, handler).await
+                            },
+                        };
+                    });
+                }
             },
             Err(e) => tracing::warn!(error = %e, port, "ss udp bind failed, udp relay disabled"),
         }
     }
     tracing::info!(addr = %listener.local_addr()?, "ss inbound listening");
     loop {
-        let (stream, _peer) = match listener.accept().await {
+        // finalmask.tcp：accept 后立即套上（wire 最外层，ss 握手在其内；
+        // 未配 mask → Plain 直通，与原 accept 路径逐字节一致）
+        let (stream, _peer) = match listener.accept_masked().await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "ss accept failed");
@@ -2172,7 +2196,7 @@ fn sweep_expired_ss2022_sessions(
 /// 回包由 `ss_udp_client_relay` 用发起用户的 account `encode_udp_packet`
 /// 后 send_to 客户端。
 pub async fn serve_ss_udp(
-    udp: Arc<tokio::net::UdpSocket>,
+    udp: Arc<dyn xray_transport::finalmask::UdpIo>,
     ib: Arc<SsInbound>,
     handler: Arc<dyn DispatchHandler>,
 ) -> std::io::Result<()> {
@@ -2220,7 +2244,7 @@ pub async fn serve_ss_udp(
 ///
 /// 60s 双向无活动自动退出（Go `CancelAfterInactivity(1min)`）。
 async fn ss_udp_client_relay(
-    udp: Arc<tokio::net::UdpSocket>,
+    udp: Arc<dyn xray_transport::finalmask::UdpIo>,
     client: SocketAddr,
     mut rx: tokio::sync::mpsc::Receiver<SsUdpItem>,
     handler: Arc<dyn DispatchHandler>,
@@ -2288,7 +2312,7 @@ async fn ss_udp_client_relay(
 ///
 /// `users` 空 = 单用户（AEAD key 直接从 server PSK 派生）。
 pub async fn serve_ss2022_udp(
-    udp: Arc<UdpSocket>,
+    udp: Arc<dyn xray_transport::finalmask::UdpIo>,
     kind: xray_proxy_ss::ss2022::key::CipherKind2022,
     server_psk: Vec<u8>,
     users: Vec<([u8; 16], Vec<u8>)>,
@@ -2386,7 +2410,7 @@ pub async fn serve_ss2022_udp(
 ///
 /// 60s 双向无活动自动退出。
 async fn ss2022_udp_client_relay(
-    udp: Arc<UdpSocket>,
+    udp: Arc<dyn xray_transport::finalmask::UdpIo>,
     mut client: SocketAddr,
     session: Arc<xray_proxy_ss::ss2022::packet::ServerUdpSession2022>,
     mut rx: tokio::sync::mpsc::Receiver<(Destination, Vec<u8>, SocketAddr)>,
@@ -3703,6 +3727,22 @@ fn inbound_tcpmask(
     Ok((!mgr.tcpmasks.is_empty()).then(|| Arc::new(mgr)))
 }
 
+/// UDP relay 入站的 `finalmask.udp` 伪装链（bd 05js，Go udp/hub.go:61-62
+/// `FinalMask.ListenPacket`：UdpHub/裸 socket 在 recv/send 两侧逐包包装）。
+///
+/// 未配置 / `udp` 空数组 → `None`：零包装，行为不变。
+///
+/// # Errors
+/// mask 配置非法时返回 `io::Error`——启动即失败，与 Go 一致（不静默降级）。
+fn inbound_udpmask(
+    settings: &xray_transport::dialer::StreamSettings,
+) -> std::io::Result<Option<xray_transport::finalmask::UdpmaskManager>> {
+    let mgr = xray_transport::finalmask::build_udpmask_manager_from_json(
+        settings.finalmask_json.as_ref(),
+    )?;
+    Ok((!mgr.udpmasks.is_empty()).then_some(mgr))
+}
+
 /// 经 listener_registry 启动 transport inbound（ws/grpc/kcp/httpupgrade/splithttp）。
 ///
 /// 对应 Go `proxyman` worker 对 `internet.ListenTCP` 的调用：TLS/security
@@ -4170,6 +4210,7 @@ async fn spawn_one_inbound(
             // 先取 finalmask（此处 `settings` 还是 streamSettings，下一行被
             // dokodemo 自身 settings 遮蔽）
             let tcpmask = inbound_tcpmask(&settings)?;
+            let udp_mask = inbound_udpmask(&settings)?;
             let settings = parse_dokodemo_settings(&ib.entry.data)?;
             let dest = settings.dest.clone();
             // TLS（streamSettings security=tls）：对应 Go tls.NewListener 包裹，
@@ -4230,7 +4271,7 @@ async fn spawn_one_inbound(
                 let stop = shutdown_token.clone();
                 handles.push(tokio::spawn(async move {
                     tokio::select! {
-                        r = serve_dokodemo_udp(bind_addr, dispatch, dest_udp, follow_redirect) => {
+                        r = serve_dokodemo_udp(bind_addr, dispatch, dest_udp, follow_redirect, udp_mask) => {
                             if let Err(e) = r {
                                 tracing::error!(error = %e, "dokodemo UDP inbound stopped");
                             }
@@ -4292,12 +4333,24 @@ async fn spawn_one_inbound(
                 )
                 .await;
             }
-            let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone()).await?;
+            let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone())
+                .await?
+                // finalmask.tcp（Go tcp/hub.go:50-54 ListenTCP 语义；wire 最外层，ss 握手之前）
+                .with_tcpmask_manager(inbound_tcpmask(&settings)?);
             let inbound = parse_ss_inbound_config(&ib.entry.data)?;
             register_ss_user_manager(api, &ib.tag, &inbound);
+            // finalmask.udp（bd 05js，Go udp/hub.go:61-62）：同端口 UDP relay 装配
+            let inbound_udp_mask = inbound_udpmask(&settings)?;
             tracing::info!(tag = %ib.tag, addr = %addr, "shadowsocks inbound listening");
             Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-                serve_ss(listener, ohm, inbound, handshake_timeout_for(&policy, 0)).await
+                serve_ss(
+                    listener,
+                    ohm,
+                    inbound,
+                    handshake_timeout_for(&policy, 0),
+                    inbound_udp_mask,
+                )
+                .await
             })))
         },
         // hysteria inbound：HysteriaInboundHandler impl InboundHandler（rxw：接 dispatcher）
@@ -4418,7 +4471,11 @@ async fn spawn_one_inbound(
             let inbound_tag = parse_loopback_config(&ib.entry.data)?;
             let _handler = LoopbackHandler::new(
                 &ib.tag,
-                xray_proto::xray::proxy::loopback::Config { inbound_tag },
+                xray_proto::xray::proxy::loopback::Config {
+                    inbound_tag,
+                    sniffing: None, /* Go tag2；JSON 配置面暂不解析（Go Config.Sniffing 仅 gRPC
+                                     * 面使用） */
+                },
             );
             tracing::info!(tag = %ib.tag, "loopback inbound registered (outbound-only)");
             // LoopbackHandler 的 InboundHandler::start 是 no-op，不 spawn task
@@ -10977,6 +11034,271 @@ mod tests {
             client.read_exact(&mut resp).await;
             assert_eq!(&resp[..2], &[0xAB, 0xCD], "响应 ID 必须与查询一致（masked={masked}）");
             assert_wire(&client.wire_sent(), &frame, masked, "dns 入站");
+        }
+    }
+
+    /// bd 7wor：ss 入站 finalmask 端到端（装配注入 → accept 解伪装 → ss 握手 →
+    /// dispatch）。接线前 masked 腿：服务端把 sudoku 编码字节当 ss AEAD 解，
+    /// 握手永不成 → 客户端超时（红）；接线后双腿全通（绿）。masked 腿 wire
+    /// 字节数必须大于明文腿（同逻辑流 sudoku 恒扩张），证 mask 真在 wire 上。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ss_inbound_wears_finalmask() {
+        use xray_proxy_ss::{client::Client, config::MemoryAccount as SsAccount};
+        use xray_transport::finalmask::AsyncIo;
+
+        let mask = sudoku_mask();
+        let users_json =
+            br#"{"users":[{"method":"aes-128-gcm","password":"ss-fm-pass"}]}"#.to_vec();
+        let stream_json = serde_json::json!({
+            "network": "tcp",
+            "finalmask": { "tcp": [ { "type": "sudoku", "settings": {} } ] }
+        });
+
+        let mut wire_lens = [0usize; 2];
+        for (i, masked) in [false, true].into_iter().enumerate() {
+            // 每腿独立空闲端口（serve_ss 会顺手绑同端口 UDP relay，旧腿的
+            // detached UDP task 退出前不释放，复用端口会撞 bind）。
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+
+            let ohm = Arc::new(SimpleOhm::new());
+            let capture = Arc::new(DestCaptureDispatch { dest: parking_lot::Mutex::new(None) });
+            ohm.set_default(Arc::clone(&capture) as Arc<dyn xray_app_dispatcher::DispatchHandler>);
+
+            let ib = BuiltInbound {
+                entry: xray_conf::BuiltEntry {
+                    kind: "shadowsocks".into(),
+                    data: users_json.clone(),
+                },
+                tag: "ss-fm".into(),
+                port: Some(port),
+                listen: Some("127.0.0.1".into()),
+                stream_settings_json: masked.then(|| stream_json.clone()),
+                sniffing_json: None,
+            };
+            let handle = spawn_one_inbound(&ib, ohm, None, CancellationToken::new(), None)
+                .await
+                .unwrap()
+                .expect("ss inbound spawn");
+
+            // 客户端：tap 在 mask 链内层记 wire 字节；客户端按配置套同一条 mask。
+            let raw = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let recv = Arc::new(Mutex::new(Vec::new()));
+            let tap = WireTap { inner: raw, sent: Arc::clone(&sent), recv: Arc::clone(&recv) };
+            let io: Box<dyn AsyncIo> = match masked.then(|| Arc::clone(&mask)) {
+                Some(m) => m.wrap_conn_client(Box::new(tap)).expect("client mask"),
+                None => Box::new(tap),
+            };
+
+            let account = SsAccount::from_proto(&xray_proto::xray::proxy::shadowsocks::Account {
+                password: "ss-fm-pass".into(),
+                cipher_type: SsCipherType::Aes128Gcm.as_i32(),
+                iv_check: false,
+            })
+            .unwrap();
+            let client = Client::new(account, "127.0.0.1".into(), port);
+
+            // 整段限时：红形态 = 服务端解不开 mask → 无响应 → 此处超时。
+            let run = async {
+                let mut ss = client
+                    .dial_target_for_proxy_on(io, &Address::Domain("example.com".into()), 80)
+                    .await
+                    .expect("ss dial_target");
+                ss.write_chunk(b"hi").await.expect("write body");
+                let resp = ss.read_chunk().await.expect("read resp").expect("resp chunk");
+                assert_eq!(&resp, b"ok", "dispatch 回写必须原样到达（masked={masked}）");
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(10), run)
+                .await
+                .expect("ss+finalmask 链路超时（mask 未接线或服务端未解伪装）");
+
+            let dest = capture.dest.lock().clone().expect("dispatch dest captured");
+            assert!(
+                matches!(dest.address(), Address::Domain(d) if d == "example.com"),
+                "dispatch dest 必须是明文目标（masked={masked}）：{dest:?}"
+            );
+            wire_lens[i] = sent.lock().unwrap().len();
+            handle.abort();
+        }
+        assert!(
+            wire_lens[1] > wire_lens[0],
+            "masked wire（{}B）必须大于明文 wire（{}B）：sudoku 恒扩张",
+            wire_lens[1],
+            wire_lens[0]
+        );
+    }
+
+    /// bd 05js：ss UDP relay 入站 finalmask 端到端（装配注入 → 同端口 UDP socket
+    /// WrapPacketConnServer → recv decode → dispatch → 回包 encode → 客户端
+    /// wrap_packet_conn_client decode）。接线前 masked 腿：服务端把 mkcp-legacy
+    /// 帧当 ss AEAD 解，decode 恒败 → 无回包（红 = timeout）；接线后双腿全通。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ss_inbound_udp_wears_finalmask() {
+        use xray_common::net::address::Address;
+        use xray_proxy_ss::{
+            config::MemoryAccount as SsAccount,
+            protocol::{decode_udp_packet, encode_udp_packet},
+            validator::{MemoryUser, Validator},
+        };
+        use xray_transport::finalmask::{UdpIo, build_udpmask_manager_from_json};
+
+        let users_json =
+            br#"{"users":[{"method":"aes-128-gcm","password":"ss-fm-pass"}]}"#.to_vec();
+        let stream_json = serde_json::json!({
+            "network": "tcp",
+            "finalmask": { "udp": [ { "type": "mkcp-legacy", "settings": {} } ] }
+        });
+        let account = SsAccount::from_proto(&xray_proto::xray::proxy::shadowsocks::Account {
+            password: "ss-fm-pass".into(),
+            cipher_type: SsCipherType::Aes128Gcm.as_i32(),
+            iv_check: false,
+        })
+        .unwrap();
+
+        for masked in [false, true] {
+            // 每腿独立空闲端口（serve_ss 同端口绑 UDP relay，旧腿 detached task
+            // 退出前不释放，复用端口会撞 bind）
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+
+            let ohm = Arc::new(SimpleOhm::new());
+            ohm.set_default(Arc::new(MarkerUdpDispatch { marker: b"ss-udp-fm" })
+                as Arc<dyn xray_app_dispatcher::DispatchHandler>);
+
+            let ib = BuiltInbound {
+                entry: xray_conf::BuiltEntry {
+                    kind: "shadowsocks".into(),
+                    data: users_json.clone(),
+                },
+                tag: "ss-udp-fm".into(),
+                port: Some(port),
+                listen: Some("127.0.0.1".into()),
+                stream_settings_json: masked.then(|| stream_json.clone()),
+                sniffing_json: None,
+            };
+            let handle = spawn_one_inbound(&ib, ohm, None, CancellationToken::new(), None)
+                .await
+                .unwrap()
+                .expect("ss inbound spawn");
+            // Windows UDP：服务端 relay 未就绪时发包 → ICMP port unreachable
+            // 滞留，本腿 recv 报 ConnectionReset(10054)。等 UDP relay 绑定完成。
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            // 客户端：masked 腿按同配置 wrap（send encode / recv decode 对称）
+            let raw = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let relay = std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port,
+            );
+            let client_io: Box<dyn UdpIo> = if masked {
+                build_udpmask_manager_from_json(stream_json.get("finalmask"))
+                    .expect("udp manager")
+                    .wrap_packet_conn_client(Box::new(raw))
+                    .expect("client mask")
+            } else {
+                Box::new(raw)
+            };
+
+            let packet = encode_udp_packet(
+                &account,
+                &Address::IPv4(std::net::Ipv4Addr::LOCALHOST),
+                53,
+                b"ping",
+            )
+            .expect("encode udp packet");
+            client_io.send_to(&packet, relay).await.expect("send to ss udp relay");
+
+            // 整段限时：红形态 = 服务端解不开 mask → 无 dispatch 无回包 → 超时。
+            let mut rbuf = vec![0u8; 2048];
+            let (n, _from) = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                client_io.recv_from(&mut rbuf),
+            )
+            .await
+            .expect("ss udp finalmask 链路超时（mask 未接线或服务端未解伪装）")
+            .expect("recv from ss udp relay");
+
+            let validator = Validator::new();
+            validator.add(MemoryUser::new("u@ss.fm", account.clone())).expect("add user");
+            let (_header, data) = decode_udp_packet(&validator, &rbuf[..n]).expect("decode resp");
+            assert_eq!(data, b"ss-udp-fm", "dispatch 回写必须原样到达（masked={masked}）");
+            handle.abort();
+        }
+    }
+
+    /// bd 05js：dokodemo UDP 入站 finalmask 端到端（装配注入 → UdpHub::listen
+    /// WrapPacketConnServer，Go udp/hub.go:61-62 FinalMask.ListenPacket）。接线前
+    /// masked 腿：hub recv 循环把 mkcp-legacy 帧当明文 payload 转发错乱 → 无回包
+    /// （红 = timeout）；接线后双腿全通。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dokodemo_inbound_udp_wears_finalmask() {
+        use xray_transport::finalmask::{UdpIo, build_udpmask_manager_from_json};
+
+        let stream_json = serde_json::json!({
+            "network": "tcp",
+            "finalmask": { "udp": [ { "type": "mkcp-legacy", "settings": {} } ] }
+        });
+
+        for masked in [false, true] {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+
+            let ohm = Arc::new(SimpleOhm::new());
+            ohm.set_default(Arc::new(MarkerUdpDispatch { marker: b"dokodemo-udp-fm" })
+                as Arc<dyn xray_app_dispatcher::DispatchHandler>);
+
+            let ib = BuiltInbound {
+                entry: xray_conf::BuiltEntry {
+                    kind: "dokodemo".into(),
+                    // network:"udp" → 仅 UDP relay（dispatch dest 固定 8.8.8.8:53，
+                    // marker handler 不打真实包）
+                    data: br#"{"address":"8.8.8.8","port":53,"network":"udp"}"#.to_vec(),
+                },
+                tag: "dok-udp-fm".into(),
+                port: Some(port),
+                listen: Some("127.0.0.1".into()),
+                stream_settings_json: masked.then(|| stream_json.clone()),
+                sniffing_json: None,
+            };
+            let handle = spawn_one_inbound(&ib, ohm, None, CancellationToken::new(), None)
+                .await
+                .unwrap()
+                .expect("dokodemo inbound spawn");
+
+            let raw = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let relay = std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port,
+            );
+            let client_io: Box<dyn UdpIo> = if masked {
+                build_udpmask_manager_from_json(stream_json.get("finalmask"))
+                    .expect("udp manager")
+                    .wrap_packet_conn_client(Box::new(raw))
+                    .expect("client mask")
+            } else {
+                Box::new(raw)
+            };
+
+            client_io.send_to(b"query", relay).await.expect("send to dokodemo udp");
+
+            let mut rbuf = vec![0u8; 2048];
+            let (n, _from) = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                client_io.recv_from(&mut rbuf),
+            )
+            .await
+            .expect("dokodemo udp finalmask 链路超时（mask 未接线或服务端未解伪装）")
+            .expect("recv from dokodemo udp");
+            assert_eq!(
+                &rbuf[..n],
+                b"dokodemo-udp-fm",
+                "dispatch 回写必须原样到达（masked={masked}）"
+            );
+            handle.abort();
         }
     }
 

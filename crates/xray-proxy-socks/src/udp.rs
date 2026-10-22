@@ -640,7 +640,10 @@ mod tests {
         let client = SocksUdpClient::associate(&ClientConfig::new_noauth(go_addr))
             .await
             .expect("associate with Go socks server");
-        println!("relay_addr = {}", client.relay_addr());
+        #[allow(clippy::print_stdout)] // interop 取证输出（--nocapture 人眼核对）
+        {
+            println!("relay_addr = {}", client.relay_addr());
+        }
 
         let dest = udp_dest(Ipv4Addr::LOCALHOST, echo_port);
         client.send_frame(&dest, b"interop-ping").await.expect("send_frame");
@@ -651,6 +654,9 @@ mod tests {
         assert_eq!(src, dest, "回包 source 应等于帧 DST");
         assert_eq!(payload, b"interop-ping", "echo 载荷应原样");
         echo_task.await.ok();
-        println!("interop OK: Rust SocksUdpClient <-> Go socks inbound udp:true roundtrip");
+        #[allow(clippy::print_stdout)] // interop 取证输出（--nocapture 人眼核对）
+        {
+            println!("interop OK: Rust SocksUdpClient <-> Go socks inbound udp:true roundtrip");
+        }
     }
 }
