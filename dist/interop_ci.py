@@ -528,6 +528,14 @@ def _start_echo(port, work, idx):
         srv.settimeout(30)
         ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = _ssl.TLSVersion.TLSv1_3
+        # Go REALITY 服务端对认证连接逐记录模仿 dest 的握手记录大小（reality conn.go
+        # "mimic recorded handshakeLen"），服务端自造 EncryptedExtensions 记录 32B
+        # （server_name ack + GCM tag），dest 的 EE 记录小于它时 padding<0 直接断链
+        # （payload[0]: 8, padding: -4 → 客户端 SYSCALL(5) unexpected EOF）。Windows
+        # 本机 Python 的 OpenSSL EE 恰好比该预算小 4B（CI ubuntu/macos 更大，故只在
+        # Windows 复现；Go/Go 同样挂，非 Rust 客户端问题）。协商 ALPN 让 EE 增
+        # 9-13B 过预算；chrome 指纹客户端（btls/uTLS）均提供 h2/http1.1。
+        ctx.set_alpn_protocols(['h2', 'http/1.1'])
         ctx.load_cert_chain(CERT, KEY)
         while True:
             try:
@@ -559,6 +567,63 @@ def _start_echo(port, work, idx):
     t = threading.Thread(target=loop, daemon=True)
     t.start()
     return t
+
+
+def _probe_reality_dest_flight(port, timeout=3.0):
+    """确定性回归 guard: Go REALITY 服务端对认证连接逐记录模仿 dest 的握手记录
+    大小 (xtls/reality conn.go "mimic recorded handshakeLen"), 服务端自造
+    EncryptedExtensions 记录 32B (server_name ack + 1B 内层 type + 16B GCM tag);
+    dest 的 EE 记录 (SH+CCS 后首个 appdata 记录) 小于它时 padding<0 直接断链
+    (show 日志 `payload[0]: 8, padding: -4`, 客户端 SYSCALL(5) unexpected EOF)。
+    本地实测 echo 的 dest flight EE 大小, 不足 32B 即大声告警带修法——防
+    echo/OpenSSL 环境漂移再次静默破坏 reality 用例 (2026-10-23 Windows 根因:
+    Python 3.14/OpenSSL 3.5.7 的 EE 比预算小 4B, CI ubuntu/macos 更大不触发)."""
+    raw = bytearray()
+    import ssl as _ssl
+    try:
+        c_in, c_out = _ssl.MemoryBIO(), _ssl.MemoryBIO()
+        cctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+        cctx.minimum_version = _ssl.TLSVersion.TLSv1_3
+        cctx.check_hostname = False
+        cctx.verify_mode = _ssl.CERT_NONE
+        cctx.set_alpn_protocols(['h2', 'http/1.1'])
+        obj = cctx.wrap_bio(c_in, c_out, server_hostname='localhost')
+        s = socket.create_connection(('127.0.0.1', port), timeout=timeout)
+        try:
+            s.settimeout(timeout)
+            while True:
+                try:
+                    obj.do_handshake()
+                    break
+                except _ssl.SSLWantReadError:
+                    pending = c_out.read()
+                    if pending:
+                        s.sendall(pending)
+                    data = s.recv(16384)
+                    if not data:
+                        raise ConnectionError('dest closed during handshake')
+                    c_in.write(data)
+                    raw += data
+                except _ssl.SSLWantWriteError:
+                    pending = c_out.read()
+                    if pending:
+                        s.sendall(pending)
+        finally:
+            s.close()
+    except (OSError, _ssl.SSLError, ConnectionError) as e:
+        print('!! REALITY dest flight probe failed (echo 未起/握手失败): %r' % e, flush=True)
+        return None
+    off, ccs_seen, ee = 0, False, None
+    while off + 5 <= len(raw):
+        rtype = raw[off]
+        rlen = int.from_bytes(raw[off + 3:off + 5], 'big')
+        if rtype == 20:
+            ccs_seen = True
+        elif ccs_seen and rtype == 23 and ee is None:
+            ee = 5 + rlen  # SH+CCS 后首个 appdata 包装记录 = EncryptedExtensions
+            break
+        off += 5 + rlen
+    return ee
 
 
 def run_x_one(idx, proto, server_bin, client_bin, tag, work, dry=False):
@@ -593,6 +658,10 @@ def run_x_one(idx, proto, server_bin, client_bin, tag, work, dry=False):
         if proto == 'reality':
             echo_t = _start_echo(P - 1, work, idx)
             time.sleep(0.3)  # 等 echo 起来
+            ee = _probe_reality_dest_flight(P - 1)
+            if ee is not None and ee < 32:
+                print('!! REALITY dest flight EE=%dB < 32B mimicry budget: 认证 reality 握手'
+                      '将失败 (padding<0); echo 需协商 ALPN 或加大 dest flight (见 _start_echo 注释)' % ee, flush=True)
         slog = open(os.path.join(work, 's%d.log' % idx), 'wb')
         ps = subprocess.Popen([server_bin, 'run', '-c', scp], stdout=slog,
                               stderr=subprocess.STDOUT, env=env)
