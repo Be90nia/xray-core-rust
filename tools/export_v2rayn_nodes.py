@@ -110,9 +110,16 @@ def build_link(r, cols):
 
     if t == 'ss':
         import base64
-        method = r['Security'] or 'aes-256-gcm'
+        # ss 加密方法在 ProtoExtra.SsMethod（Security 列不存 ss method）
+        method = pe.get('SsMethod') or r['Security'] or 'aes-256-gcm'
         body = base64.urlsafe_b64encode(f'{method}:{pwd}'.encode()).decode().rstrip('=')
         q = {'type': net}
+        if sec and sec != 'none': q['security'] = sec
+        if sni: q['sni'] = sni
+        if fp: q['fp'] = fp
+        if path: q['path'] = path
+        if host: q['host'] = host
+        if alpn: q['alpn'] = alpn
         return f'ss://{body}@{addr}:{port}?{urlencode(q)}#{quote(remark)}'
 
     if t == 'hysteria2':

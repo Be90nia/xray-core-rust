@@ -489,8 +489,8 @@ pub(crate) fn retry_with_backoff(
     false
 }
 
-/// 启动侧接线：设 TUN 适配器属性（[`adapter_props_cmds`]）。失败不致命——
-/// 适配器刚建时 IP 接口条目可能暂不可枚举，重试（[`ADAPTER_PROPS_ATTEMPTS`]）
+/// 启动侧接线：设 TUN 适配器属性（`adapter_props_cmds`）。失败不致命——
+/// 适配器刚建时 IP 接口条目可能暂不可枚举，重试（`ADAPTER_PROPS_ATTEMPTS`）
 /// 仍失败仅记 error 继续启动（完整 startOver 15×1s 致命重试留待后续票）。
 #[cfg(target_os = "windows")]
 pub(crate) fn apply_adapter_props(interface: &str) {
