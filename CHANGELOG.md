@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [26.10.11] - 2026-10-22
 
 ### Fixed
 
@@ -23,15 +23,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - relay `dispatch_via_chain` 补 512 KiB 背压上限（对齐 Go `pipe` + `policy` 默认，防无界蓄洪）（bd exci）
 - app-dns 上游错误不再统一吞成 `record not found`：保留错误种类 + per-server 日志带原因（bd pyl1）
 - listener backlog 改读 `somaxconn`（fallback 1024；Go Linux fallback 为 128，属有意偏离以保住 VPS overflow 战果）（bd hjtt）
+- **Windows TUN 入站此前被 cfg 门整段排除**（bd b8i 显式不支持）→ 开放 Windows：`xray-core` 4 处 cfg gate + `Cargo.toml` 平台依赖声明（`spawn_one_inbound` / `tun_factory` / `parse_tun_inbound_config` / `TunPlaceholder`）。真机实测：适配器 `xray0` Up + `10.66.66.1/30 (Manual)`（bv3w/cv3w）
+- **TUN 出站自绕**：`DialerController` 覆盖全部系统拨号路径（`dial_tcp_raw` 主链 / `dial_client_tcp`（ws/splithttp/grpc/httpupgrade）/ happy_eyeballs 候选 / freedom UDP relay），TUN 经 `autoOutboundsInterface` 选择物理网卡并在 connect 前绑定；优先级对齐 Go（controllers 先、用户显式 `sockopt.interface` 后写覆盖）
+- Windows `netsh interface ipv4 set interface` 参数名错误：`name=` 不是该子命令的参数（正确为位置参数 `interface=<名>`），此前报 “name is not a valid argument”
+- 未知 transport 网络名从**静默接受**改为配置期硬错（文案逐字对齐 Go `Config: unknown transport protocol: <p>`）；`method` 优先于 `network`（Go `transport_internet.go:85-88`）；`xhttpSettings` 回退收窄到 xhttp/splithttp（防 `network:"ws"` 静默吃下 xhttp 配置）
+- TUN UDP：目的组播/广播包不进 relay（SSDP/mDNS 洪泛源）+ relay 失败目的级 5s 冷却（防 ~50ms 一轮重建刷日志）（bd ijn7）
+- `crates/xray-transport/src/headers/` 删除 5 个零引用变体（dtls/srtp/utp/wechat/wireguard，真身在 `finalmask/mkcp/header.rs`）
 
 ### Added
 
 - 启动日志输出 kernel identity：version/git_rev 降级链 + blake3 exe 指纹 + profile/target triple（对齐 Go 版本可诊断性需求）（bd qxqw）
+- **`base64` 子命令族**（`base64 encode|decode [-gzip]`），与 Go `main/commands/all/base64/` 对拍：前缀常量逐字一致、`-`/`stdin:`/output-file 语义一致、错误文本与退出码一致；gzip 与 Go 双向互通（Go 产 Rust 解 / Rust 产 Go 解）
+- transport 级 **unix 监听**入口（`listen_unix` + tcp hub unix accept；此前 transport 注册表只能表达 `SocketAddr`）
+- realm **结构化 tlsConfig**（替代 `use_tls: bool`，对齐 Go realm `tls.Config` 实读字段，缺省行为不变）
+- `tools/export_v2rayn_nodes.py`：从 v2rayN 库导出 share link 节点表（发布前真实节点矩阵用；**不含凭据**，运行时读本机库，输出只落本地临时目录）
 
 ### Changed
 
 - `xray-xudp` env 解析测试迁至独立测试二进制：env 读取是进程级 `LazyLock` 缓存，同进程内被其它测试先触发后 `set_var` 永久无效（CI ubuntu 偶发红灯根因）
+- `dist/run_full32.py` 参数化（`--bin/--uri-file/--work/--url`）并**删除 `taskkill /F /IM xray.exe`**：原脚本会连带杀掉用户 v2rayN 的内核，且 Go/Rust 连跑互踩
 - xdns finalmask 对齐 Go v26.9.30（fc8f8a45）：结构化 DomainProto（lenLimit/labelLimit/types/edns0）+ TypedMessage resolvers + extraPoll；wire 协议重写（poll/small/frag 三形态 + 分片重组 + 攒包下发）；TCP resolver 配置期报错（Rust 栈 UDP-only）（bd 2ktp ④）
+- `DialerController` 签名由 `Fn(&Socket2)` 扩为 `Fn(&Socket2, &SocketAddr)`（对齐 Go `Controllers` 的 address 参数；生产注册方为零，无破坏）
 
 ## [26.10.10] - 2026-10-10
 
