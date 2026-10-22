@@ -316,7 +316,10 @@ pub fn reconfigure_global_pool(max_idle_per_key: usize, max_idle_duration: Durat
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
 
     use tokio::io::DuplexStream;
     use xray_transport::connection::DuplexConnection;
@@ -485,6 +488,104 @@ mod tests {
         }
         let guard = pool.inner.lock().await;
         assert_eq!(guard.get(&key1()).map(VecDeque::len), Some(3));
+    }
+
+    /// 并发取池 miss 计数 = dial_ws 冷拨次数：register.rs 取池未命中即走
+    /// `dial_with_params` 现拨（TCP+TLS+ws 握手），命中即交付——1:1 映射。
+    async fn concurrent_take_misses(pool: Arc<WsConnectionPool>, key: PoolKey, n: usize) -> usize {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let (pool, hits, key) = (pool.clone(), hits.clone(), key.clone());
+                tokio::spawn(async move {
+                    if pool.try_acquire(&key).await.is_some() {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.await.unwrap();
+        }
+        n - hits.load(Ordering::SeqCst)
+    }
+
+    async fn prefill(pool: &WsConnectionPool, key: &PoolKey, n: usize) {
+        for _ in 0..n {
+            pool.release(key.clone(), mock_conn()).await;
+        }
+    }
+
+    /// 修前形态快照（bd lmjw 根因链）：容量 3（k9qg 首版默认）撑不住页面
+    /// burst——12 并发取同 key 有 9 路冷拨（9 次 TCP+TLS+ws 握手），即
+    /// 「页面十几资源 → 池空 → 回退冷拨号」。若有人把默认容量改回 3 本测试即红。
+    #[tokio::test]
+    async fn burst_12_capacity_3_stock_cold_dials_nine() {
+        let pool = Arc::new(WsConnectionPool::new(WsPoolConfig {
+            max_idle_per_key: 3,
+            ..WsPoolConfig::default()
+        }));
+        prefill(&pool, &key1(), 3).await;
+        assert_eq!(concurrent_take_misses(pool, key1(), 12).await, 9);
+    }
+
+    /// 修后形态（bd lmjw B1，容量 12）：整页 burst（Chrome 6/host，整页 ≤12）
+    /// 全部命中库存，0 冷拨。
+    #[tokio::test]
+    async fn burst_12_full_stock_never_cold_dials() {
+        let pool = Arc::new(WsConnectionPool::new(WsPoolConfig::default()));
+        prefill(&pool, &key1(), 12).await;
+        assert_eq!(concurrent_take_misses(pool, key1(), 12).await, 0);
+    }
+
+    /// 票面验收（bd lmjw）：单页 15 连接场景握手 ≤3——12 库存吸收后仅 ≤3 路现拨。
+    #[tokio::test]
+    async fn burst_15_handshakes_within_ticket_budget() {
+        let pool = Arc::new(WsConnectionPool::new(WsPoolConfig::default()));
+        prefill(&pool, &key1(), 12).await;
+        let misses = concurrent_take_misses(pool, key1(), 15).await;
+        assert!(misses <= 3, "15-conn page must cold-dial ≤3, got {misses}");
+    }
+
+    /// 池空行为不回归：冷启动（首用/TTL 过期后）池空，12 并发全冷拨是物理必然
+    /// （库存不存在则无从命中）；随后补拨按 spawn_replenish 的 begin→end→release
+    /// 序补满库存，下一波 12 并发全命中——冷拨回退路径本身不受容量策略影响。
+    #[tokio::test]
+    async fn empty_pool_cold_start_then_replenish_refills_next_wave() {
+        let pool = Arc::new(WsConnectionPool::new(WsPoolConfig::default()));
+        assert_eq!(concurrent_take_misses(pool.clone(), key1(), 12).await, 12);
+        for _ in 0..12 {
+            assert!(pool.begin_preconnect(&key1()).await);
+            pool.end_preconnect(&key1());
+            pool.release(key1(), mock_conn()).await;
+        }
+        assert_eq!(concurrent_take_misses(pool, key1(), 12).await, 0);
+    }
+
+    /// 并发补拨闸门：16 路补拨并发抢名额，放行总数恒 = 容量（idle+inflight
+    /// ≤ max_idle_per_key 不变量在并发下不被击穿），入池恰好 12 条不超额。
+    #[tokio::test]
+    async fn concurrent_replenish_gate_admits_exactly_capacity() {
+        let pool = Arc::new(WsConnectionPool::new(WsPoolConfig::default()));
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let (pool, admitted) = (pool.clone(), admitted.clone());
+                tokio::spawn(async move {
+                    if pool.begin_preconnect(&key1()).await {
+                        admitted.fetch_add(1, Ordering::SeqCst);
+                        pool.end_preconnect(&key1());
+                        pool.release(key1(), mock_conn()).await;
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(admitted.load(Ordering::SeqCst), 12);
+        let guard = pool.inner.lock().await;
+        assert_eq!(guard.get(&key1()).map(VecDeque::len), Some(12));
     }
 
     /// 全局单例同 id 返回同实例。

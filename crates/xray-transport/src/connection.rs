@@ -21,6 +21,7 @@
 //! 不在本会话范围：TLS / WebSocket / KCP 等 Connection 实现，留待各传输协议 crate。
 
 use std::{
+    future::Future,
     io,
     net::SocketAddr,
     pin::Pin,
@@ -31,6 +32,11 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
 };
+
+/// 拨号/accept 统一返回的 boxed future：`Dialer::dial`、`Listener::accept`、
+/// `SystemDialer::dial`、`SystemListener::accept` 共用签名。
+pub(crate) type BoxedConnFuture<'a> =
+    Pin<Box<dyn Future<Output = io::Result<Box<dyn Connection>>> + Send + 'a>>;
 
 /// 网络连接抽象。
 ///

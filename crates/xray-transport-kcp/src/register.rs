@@ -252,18 +252,10 @@ fn parse_kcp_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
         ));
     };
 
-    // `header`/`seed` 已移除（Go infra/conf/transport_internet.go:66-68，
-    // PrintRemovedFeatureError，两键合并为单一文案），伪装配置迁移到
-    // `streamSettings.finalmask.udp`（`mkcp-legacy`）。保留 Rust 现有硬报错行为。
-    if obj.contains_key("header") || obj.contains_key("seed") {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            xray_common::errors::removed_feature_message(
-                "mkcp header & seed",
-                "finalmask/udp header-* & mkcp-original & mkcp-aes128gcm",
-            ),
-        ));
-    }
+    // `header`/`seed`：Go KCPConfig 仍声明两字段但 Build() 不读
+    // （infra/conf/transport_method.go:541-542 + 545-580，无 removed-feature gate、
+    // 无 warn）= 静默忽略；伪装配置的正路是 `streamSettings.finalmask.udp`
+    // （`mkcp-legacy`）。Rust 同样不校验不报错。
 
     let mut config = default_config();
 
@@ -546,32 +538,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_kcp_config_rejects_removed_header() {
-        // Go v26 KCPConfig.Build：header/seed 已移除（PrintRemovedFeatureError，
-        // transport_internet.go:67，header/seed 合并为单一文案）
+    fn parse_kcp_config_ignores_header_like_go() {
+        // Go v26 KCPConfig（transport_method.go:541）：header 字段声明存在但
+        // Build() 不读 = 静默忽略，解析成功。
         let v: serde_json::Value = serde_json::from_str(r#"{"header":{"type":"srtp"}}"#).unwrap();
-        let err = match parse_kcp_config(Some(&v)) {
-            Err(e) => e,
-            Ok(_) => panic!("expected removed-feature error for header"),
-        };
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(
-            err.to_string(),
-            "The feature mkcp header & seed has been removed and migrated to \
-             finalmask/udp header-* & mkcp-original & mkcp-aes128gcm. Please update your \
-             config(s) according to release note and documentation."
-        );
+        let cfg = parse_kcp_config(Some(&v)).expect("header must be silently ignored");
+        assert_eq!(cfg.mtu, default_config().mtu);
+        assert_eq!(cfg.tti, default_config().tti);
     }
 
     #[test]
-    fn parse_kcp_config_rejects_removed_seed() {
+    fn parse_kcp_config_ignores_seed_like_go() {
+        // 同上：seed 静默忽略（Go Build() 不读），不得报错。
         let v: serde_json::Value = serde_json::from_str(r#"{"seed":"pw"}"#).unwrap();
-        let err = match parse_kcp_config(Some(&v)) {
-            Err(e) => e,
-            Ok(_) => panic!("expected removed-feature error for seed"),
-        };
-        // 同一触发点：Go 对 header||seed 用同一文案
-        assert!(err.to_string().contains("The feature mkcp header & seed has been removed"));
+        let cfg = parse_kcp_config(Some(&v)).expect("seed must be silently ignored");
+        assert_eq!(cfg.mtu, default_config().mtu);
     }
 
     // ============= tslk：对齐 Go 硬校验的错误行为测试 =============

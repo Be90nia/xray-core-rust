@@ -34,10 +34,7 @@ use crate::connection::Connection;
 ///   trait。
 pub trait Dialer: Send + Sync {
     /// 向 `dest` 发起连接。返回的 Connection 对象以 trait object 形式交由上层多态使用。
-    fn dial<'a>(
-        &'a self,
-        dest: &'a Destination,
-    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Connection>>> + Send + 'a>>;
+    fn dial<'a>(&'a self, dest: &'a Destination) -> crate::connection::BoxedConnFuture<'a>;
 
     /// 返回该拨号器将使用的出口 IP 地址（对应 Go `DestIpAddress()`）。
     /// Go 原型返回 `net.IP`，可能为 nil。Rust 翻译为 `Option<IpAddr>` 表达 nil 语义。

@@ -409,9 +409,16 @@ async fn handle_plain_http(
     client: &mut TcpStream,
     hs: &mut HandshakeResult,
 ) -> Result<PlainOutcome> {
-    // chunked 请求体明确报错（Go 经 ReadRequest 解码支持；本实现原样透传
-    // 无 body 边界解析，静默截断不可接受）
-    if headers_indicate_chunked(&hs.headers) {
+    // Go net/http transfer.go `parseTransferEncoding`（:631-641，Issue 12785）：
+    // `!protoAtLeast(1, 1)` 时先 `delete(t.Header, "Transfer-Encoding")` 再直接
+    // return——HTTP/1.0 请求声明的 Transfer-Encoding 不参与 body 定界，
+    // 按 Content-Length / 无 body 处理，且该头不转发给上游。对齐后走私防护
+    // 不弱于 Go：TE 声明在 1.0 侧被剥除，1.1 chunked 仍显式拒绝。
+    if hs.http_version == HttpVersion::H10 {
+        hs.headers.remove("transfer-encoding");
+    } else if headers_indicate_chunked(&hs.headers) {
+        // chunked 请求体明确报错（Go 经 ReadRequest 解码支持；本实现原样透传
+        // 无 body 边界解析，静默截断不可接受）
         warn!(method = %hs.method, "chunked request body not supported by plain HTTP forwarding");
         let _ = client.write_all(RESPONSE_BAD_REQUEST).await;
         return Ok(PlainOutcome::Close);
@@ -1519,5 +1526,85 @@ mod tests {
             .expect("400 response timeout");
         assert!(resp.contains("400"), "got: {resp}");
         assert_eq!(read_eof(&mut client).await, 0, "connection must close after 400");
+    }
+
+    // ===== plain HTTP TE 语义（Go net/http transfer.go parseTransferEncoding）=====
+
+    /// 驱动一次 `handle_plain_http`：mock 上游回显收到的请求头 + 固定 200 响应，
+    /// 返回 (上游 task 句柄, 客户端收到的响应头, handler 结论)。提前 return 的
+    /// 路径（如 400）不会拨上游——句柄保持 pending，调用方按需 await。
+    async fn run_plain_http(
+        http_version: HttpVersion,
+        headers: &[(&str, &str)],
+    ) -> (tokio::task::JoinHandle<String>, String, PlainOutcome) {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let (mut sock, _) = upstream_listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                head.extend_from_slice(&buf[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+            String::from_utf8(head).unwrap()
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let server_side = tokio::spawn(async move { proxy_listener.accept().await.unwrap().0 });
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let mut server_stream = server_side.await.unwrap();
+
+        let dest = parse_host_port(&format!("127.0.0.1:{}", upstream_addr.port()), 80).unwrap();
+        let mut hs = HandshakeResult {
+            dest,
+            method: "POST".into(),
+            target: format!("http://127.0.0.1:{}/up", upstream_addr.port()),
+            http_version,
+            headers: headers.iter().map(|(k, v)| (k.to_string(), vec![v.to_string()])).collect(),
+        };
+        let outcome = handle_plain_http(&mut server_stream, &mut hs).await.unwrap();
+        drop(server_stream);
+        client.shutdown().await.unwrap();
+        let mut resp = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut resp)).await;
+        (upstream, String::from_utf8_lossy(&resp).into_owned(), outcome)
+    }
+
+    #[tokio::test]
+    async fn plain_http_h10_transfer_encoding_ignored_like_go() {
+        // Go net/http 对 1.0 忽略 TE（删头、按 CL/无 body 定界）：不 400，
+        // 转发头不含 transfer-encoding。
+        let (upstream, client_resp, outcome) = run_plain_http(
+            HttpVersion::H10,
+            &[("transfer-encoding", "chunked"), ("host", "127.0.0.1")],
+        )
+        .await;
+        let upstream_head = upstream.await.unwrap();
+        assert!(
+            !upstream_head.to_ascii_lowercase().contains("transfer-encoding"),
+            "1.0 TE must be stripped, forwarded head = {upstream_head}"
+        );
+        assert!(client_resp.starts_with("HTTP/1.1 200"), "got: {client_resp}");
+        assert_eq!(outcome, PlainOutcome::WaitAnother);
+    }
+
+    #[tokio::test]
+    async fn plain_http_h11_chunked_still_rejected() {
+        // 1.1 chunked 请求体维持既有 400 拒绝（本实现无 body 帧解析）；
+        // 提前 return 未拨上游（句柄 pending），不 await。
+        let (_upstream, client_resp, outcome) = run_plain_http(
+            HttpVersion::H11,
+            &[("transfer-encoding", "chunked"), ("host", "127.0.0.1")],
+        )
+        .await;
+        assert!(client_resp.starts_with("HTTP/1.1 400"), "got: {client_resp}");
+        assert_eq!(outcome, PlainOutcome::Close);
     }
 }
