@@ -359,9 +359,11 @@ impl StackOptions {
         }
     }
 
-    /// 转换为 prost `Config`（7 字段；`auto_outbounds_interface` None → `""`）。
+    /// 转换为 prost `Config`（10 字段；`auto_outbounds_interface` None → `""`）。
     ///
     /// 已归一化的运行时值（name/mtu 默认、interface "auto"）按当前值写回。
+    /// desc/auto_system_dns_to_gateway/auto_system_wfp_block_leak（Go tag8-10）为
+    /// proto schema 对齐新增，JSON 配置面暂不消费，恒写默认值。
     #[must_use]
     pub fn to_proto(&self) -> ProtoConfig {
         ProtoConfig {
@@ -372,6 +374,9 @@ impl StackOptions {
             user_level: self.user_level,
             auto_system_routing_table: self.auto_system_routing_table.clone(),
             auto_outbounds_interface: self.auto_outbounds_interface.clone().unwrap_or_default(),
+            desc: String::new(),
+            auto_system_dns_to_gateway: false,
+            auto_system_wfp_block_leak: Vec::new(),
         }
     }
 }
@@ -806,7 +811,7 @@ mod tests {
         s.close().unwrap();
     }
 
-    // ===== from_proto/to_proto（bd v5g：proxy.tun.Config 7 字段） =====
+    // ===== from_proto/to_proto（bd v5g：proxy.tun.Config 7 字段 + G7 对齐新增 tag8-10） =====
 
     fn full_proto_config() -> ProtoConfig {
         ProtoConfig {
@@ -817,6 +822,9 @@ mod tests {
             user_level: 1,
             auto_system_routing_table: vec!["60".into()],
             auto_outbounds_interface: "wlan0".into(),
+            desc: String::new(),
+            auto_system_dns_to_gateway: false,
+            auto_system_wfp_block_leak: Vec::new(),
         }
     }
 

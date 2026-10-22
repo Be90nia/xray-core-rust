@@ -333,7 +333,7 @@ mod tests {
     }
 
     fn cfg(tag: &str) -> Config {
-        Config { inbound_tag: tag.to_string() }
+        Config { inbound_tag: tag.to_string(), sniffing: None }
     }
 
     #[test]
@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn loopback_with_empty_tag() {
         // 配置允许空 tag（构造时不校验，由调用方负责）
-        let l = Loopback::new(Config { inbound_tag: String::new() });
+        let l = Loopback::new(Config { inbound_tag: String::new(), sniffing: None });
         assert_eq!(l.inbound_tag(), "");
     }
 
