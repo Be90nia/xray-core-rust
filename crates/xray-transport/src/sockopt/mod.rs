@@ -446,15 +446,16 @@ pub(crate) fn apply_client_tfo_linux(socket: &Socket) {
 /// Linux 在 connect **之前**设 `TCP_FASTOPEN_CONNECT`：TFO 只对建立前的 socket
 /// 生效（对 ESTABLISHED socket 设置，新内核返回 EINVAL——见
 /// [`apply_outbound_socket_options`] 的测试注释），由
-/// [`crate::system_dialer::DefaultSystemDialer::dial_tcp_raw`] 的自持 socket
-/// 经 [`apply_client_tfo_linux`] 完成（AI7 起，同时接入 DialerController）。
+/// `DefaultSystemDialer::dial_tcp_raw` 的自持 socket 经 `apply_client_tfo_linux`
+/// 完成（AI7 起，同时接入 DialerController）。私有项不用 intra-doc 链接，
+/// 否则 `cargo doc` 报 "links to private item"。
 ///
 /// 默认启用、无配置输入（这些拨号点不消费 sockopt 配置，与 RCVBUF 缺省同源
 /// 理由）。对端不支持 TFO / 无 cookie 时内核自动回退普通握手；setsockopt 本身
 /// 失败（内核 <4.11 / seccomp 限制）只记 debug 不阻断拨号——纯优化项不能成为
 /// 拨号失败原因。多地址回退语义对齐 `TcpStream::connect`（逐个尝试）。
 ///
-/// 整个回退序列（非单地址）受 [`crate::system_dialer::DEFAULT_DIAL_TIMEOUT`]
+/// 整个回退序列（非单地址）受 `DEFAULT_DIAL_TIMEOUT`
 /// 16s 超时约束（bd cjwc G1，对齐 Go `dial_system` 语义；超时返回
 /// `ErrorKind::TimedOut`，错误文案与 `dial_tcp_raw` 同源）。
 pub async fn dial_client_tcp<A>(host: A) -> std::io::Result<tokio::net::TcpStream>
