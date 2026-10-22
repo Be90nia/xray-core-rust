@@ -148,15 +148,38 @@ impl Udpmask for Config {
     }
 }
 
-/// JSON 域名对象 → [`DomainConfig`]（默认值对齐 Go conf：lenLimit 0→255、
+/// JSON 域名对象 → [`DomainConfig`] 列表（默认值对齐 Go conf：lenLimit 0→255、
 /// labelLimit 0→63；域名校验在 wrap 期 `Domain::new`）。
-pub(crate) fn build_domain_config(v: &serde_json::Value) -> io::Result<DomainConfig> {
+///
+/// Go `XDNSDomain.Names[]`（transport_finalmask.go:813，Build :841-858）：`names[]`
+/// 每项展开为一条同参域；Rust 旧方言单数 `name` 兜底（Go 不认该键，保留只为
+/// 存量 Rust 配置）。两者皆缺 = 硬错（Go 此处静默产出零域等价于 xdns 失效，
+/// fail-loud 优于静默无效）。
+pub(crate) fn build_domain_config(v: &serde_json::Value) -> io::Result<Vec<DomainConfig>> {
     let Some(obj) = v.as_object() else {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "xdns: domain must be an object"));
     };
-    let Some(name) = obj.get("name").and_then(|x| x.as_str()) else {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "xdns: domain missing name"));
-    };
+    let mut names = Vec::new();
+    match obj.get("names") {
+        Some(serde_json::Value::Array(arr)) => {
+            for n in arr {
+                let s = n.as_str().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "xdns: invalid names entry")
+                })?;
+                names.push(s.to_string());
+            }
+        },
+        Some(_) => {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "xdns: names must be an array"));
+        },
+        None => {},
+    }
+    if names.is_empty() {
+        let name = obj.get("name").and_then(|x| x.as_str()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "xdns: domain missing name")
+        })?;
+        names.push(name.to_string());
+    }
     let len_limit = match obj.get("lenLimit") {
         Some(x) if !x.is_null() => x
             .as_i64()
@@ -194,7 +217,10 @@ pub(crate) fn build_domain_config(v: &serde_json::Value) -> io::Result<DomainCon
             as i32,
         _ => 0,
     };
-    Ok(DomainConfig { name: name.to_string(), len_limit, label_limit, types, edns0 })
+    Ok(names
+        .into_iter()
+        .map(|name| DomainConfig { name, len_limit, label_limit, types: types.clone(), edns0 })
+        .collect())
 }
 
 #[cfg(test)]
@@ -207,10 +233,36 @@ mod tests {
     fn domain_config_defaults_len_and_label_limits() {
         let cfg = build_domain_config(&serde_json::json!({"name": "a.example.com", "types": [16]}))
             .unwrap();
-        assert_eq!(cfg.len_limit, 255);
-        assert_eq!(cfg.label_limit, 63);
-        assert_eq!(cfg.types, vec![16]);
-        assert_eq!(cfg.edns0, 0);
+        assert_eq!(cfg.len(), 1);
+        assert_eq!(cfg[0].len_limit, 255);
+        assert_eq!(cfg[0].label_limit, 63);
+        assert_eq!(cfg[0].types, vec![16]);
+        assert_eq!(cfg[0].edns0, 0);
+    }
+
+    /// Go `XDNSDomain.Names[]`（transport_finalmask.go:813，Build :841-858）：数组
+    /// 每项展开为一条同参域；`name` 旧方言兜底；两者皆缺硬错。
+    #[test]
+    fn domain_config_names_array_expands_per_name() {
+        let cfg = build_domain_config(&serde_json::json!({
+            "names": ["a.example.com", "b.example.com"],
+            "lenLimit": 200, "labelLimit": 50, "types": [1, 16], "edns0": 1232
+        }))
+        .unwrap();
+        assert_eq!(cfg.len(), 2);
+        assert_eq!(cfg[0].name, "a.example.com");
+        assert_eq!(cfg[1].name, "b.example.com");
+        for d in &cfg {
+            assert_eq!(d.len_limit, 200);
+            assert_eq!(d.label_limit, 50);
+            assert_eq!(d.types, vec![1, 16]);
+            assert_eq!(d.edns0, 1232);
+        }
+        // names 非法形态硬错（Go 同样只认 string 数组）。
+        assert!(
+            build_domain_config(&serde_json::json!({"names": "a.com", "types": [16]})).is_err()
+        );
+        assert!(build_domain_config(&serde_json::json!({"names": [1], "types": [16]})).is_err());
     }
 
     #[test]
