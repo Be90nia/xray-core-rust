@@ -821,13 +821,25 @@ async fn run_udp_session(
                         tracing::warn!("udp: response destination is domain, cannot build IP packet");
                         continue;
                     };
-                    let reply = build_udp_response(
+                    let Some(reply) = build_udp_response(
                         resp_ip,
                         resp_src.port().value(),
                         original_src.addr,
                         original_src.port,
                         &payload,
-                    );
+                    ) else {
+                        // 票 x1fz：家族不匹配（v4 客户端会话 ↔ v6 上游响应等）
+                        // 降级丢包——Go sendUDP 对 `srcIP.Is4() != dstIP.Is4()`
+                        // 返回 error 丢包不 crash（proxy/tun/stack.go:347-351）；
+                        // 旧 panic 会杀死 owner task（单 UDP 会话静默死 +
+                        // cmd_tx 僵尸到 sweep）。
+                        tracing::warn!(
+                            upstream = %resp_src.address(),
+                            client = %original_src,
+                            "udp: reply IP family mismatch with client session, packet dropped"
+                        );
+                        continue;
+                    };
                     if matches!(try_enqueue_reply(&reply_tx, reply), ReplyEnqueue::Closed) {
                         return; // 写回端已退出（device 失败）
                     }
@@ -1631,6 +1643,127 @@ mod tests {
             delivered.is_ok(),
             "second packet must reach outbound within 1s while recv is blackholed, got {} bytes",
             req_bytes.load(Ordering::Relaxed)
+        );
+    }
+
+    /// 票 x1fz：真实构造家族不匹配——v4 TUN 客户端会话（src=v4）把请求发往
+    /// v6 上游（destinationOverride 双栈域名解析到 v6 的响应侧拓扑），outbound
+    /// 回帧 source=v6。handler 原样回显请求帧（帧 target=v6 上游）即天然构造
+    /// 出该形态，零手工造帧。旧实现在 build_udp_response panic → owner task
+    /// 死、cmd_tx 僵尸到 sweep；新语义必须：不匹配包丢弃 + 会话存活 +
+    /// 后续请求照常处理。Go 同位：proxy/tun/stack.go:347-351 sendUDP
+    /// `srcIP.Is4() != dstIP.Is4()` → 返回 error 丢包。
+    #[tokio::test]
+    async fn udp_session_survives_cross_family_upstream_reply() {
+        use std::sync::atomic::AtomicUsize;
+
+        #[derive(Debug)]
+        struct EchoReplier {
+            req_bytes: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl DispatchHandler for EchoReplier {
+            fn tag(&self) -> &str {
+                "echo-replier"
+            }
+
+            fn dispatch(
+                &self,
+                _dest: &Destination,
+                link: Link,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                let req_bytes = Arc::clone(&self.req_bytes);
+                Box::pin(async move {
+                    // reader/writer 都 move 进 future：writer 随临时值 drop 会让
+                    // resp 半边 EOF，回声前提被破坏（同 BlackholeHandler 注释）
+                    let mut reader = link.reader;
+                    let mut writer = link.writer;
+                    use xray_buf::io::Writer;
+                    loop {
+                        match reader.read_multi_buffer().await {
+                            Ok(mb) => {
+                                if mb.is_empty() {
+                                    tokio::time::sleep(Duration::from_millis(1)).await;
+                                    continue;
+                                }
+                                req_bytes.fetch_add(mb.len(), Ordering::Relaxed);
+                                // XUDP 首帧需连续字节（P1 收口点，同 dispatcher EchoHandler）
+                                #[allow(clippy::disallowed_methods)]
+                                let bytes = mb.to_vec();
+                                let mut out = xray_buf::multi::MultiBuffer::new();
+                                out.merge_bytes(&bytes);
+                                if writer.write_multi_buffer(out).await.is_err() {
+                                    return;
+                                }
+                            },
+                            Err(_) => return,
+                        }
+                    }
+                })
+            }
+        }
+
+        let req_bytes = Arc::new(AtomicUsize::new(0));
+        let dispatch: Arc<dyn DispatchHandler> =
+            Arc::new(EchoReplier { req_bytes: Arc::clone(&req_bytes) });
+
+        let src = smoltcp::wire::IpEndpoint::new(
+            smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(10, 0, 0, 2)),
+            12345,
+        );
+        // 双栈域名解析到 v6 上游的 destinationOverride 形态：请求 dst 为 v6
+        let dst = smoltcp::wire::IpEndpoint::new(
+            smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::new(
+                0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
+            )),
+            443,
+        );
+        let dest = ip_endpoint_to_udp_destination(&dst).expect("udp dest");
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(UDP_SESSION_QUEUE_CAP);
+        let (reply_tx, mut reply_rx) = mpsc::channel(UDP_SESSION_QUEUE_CAP);
+        let owner = tokio::spawn(run_udp_session(dispatch, cmd_rx, reply_tx, src, dst));
+
+        let payload = bytes::Bytes::from(vec![0xABu8; 100]);
+        cmd_tx
+            .send(SessionCmd::Send { dest: dest.clone(), payload: payload.clone() })
+            .await
+            .expect("send pkt1");
+        // 等回声帧（source=v6）进入 session 家族门：旧代码此处 panic 杀死 owner
+        let frame_min = 2 + payload.len();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while req_bytes.load(Ordering::Relaxed) < frame_min {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first request must reach handler within 1s");
+        tokio::time::sleep(Duration::from_millis(100)).await; // 留出回声处理窗
+
+        assert!(
+            !owner.is_finished(),
+            "owner task must survive a cross-family upstream reply (old code panicked here)"
+        );
+        assert!(
+            reply_rx.try_recv().is_err(),
+            "cross-family reply must be dropped, not written back to tun"
+        );
+
+        // 会话存活的正向证明：第二包照常出站、owner 仍活着、回声仍被丢弃
+        cmd_tx.send(SessionCmd::Send { dest, payload }).await.expect("send pkt2");
+        let two_frames_min = 2 * frame_min;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while req_bytes.load(Ordering::Relaxed) < two_frames_min {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("second request must reach handler within 1s");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!owner.is_finished(), "session must keep serving after the drop");
+        assert!(
+            reply_rx.try_recv().is_err(),
+            "no cross-family datagram may reach the tun write-back"
         );
     }
 

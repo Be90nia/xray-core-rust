@@ -718,9 +718,13 @@ fn parse_syn_dst_from_tcp_header(tcp: &[u8], dst_addr: IpAddress) -> Option<IpEn
 /// 对应 Go `stackGVisor.writeRawUDPPacket`：dispatcher 处理完一包后，把响应
 /// payload 装回 IP+UDP 头，src = 原 dst、dst = 原 src，写回 TUN。
 ///
+/// src/dst 家族不匹配（票 x1fz：v4 TUN 客户端 ↔ v6 上游）→ 返回 `None`，
+/// 调用方降级丢包——Go `stack.sendUDP` 对 `srcIP.Is4() != dstIP.Is4()` 同样
+/// 返回 error 丢包不 crash（proxy/tun/stack.go:347-351）。
+///
 /// # 参数
 ///
-/// - `src_ip` / `dst_ip`：必须同族（IPv4 或 IPv6），调用方保证
+/// - `src_ip` / `dst_ip`：同族（IPv4 或 IPv6），异族返回 `None`
 /// - `src_port` / `dst_port`：UDP 端口
 /// - `payload`：UDP payload
 #[must_use]
@@ -730,7 +734,7 @@ pub fn build_udp_response(
     dst_ip: IpAddress,
     dst_port: u16,
     payload: &[u8],
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     match (src_ip, dst_ip) {
         (IpAddress::Ipv4(s4), IpAddress::Ipv4(d4)) => {
             let udp_repr = UdpRepr { src_port, dst_port };
@@ -753,7 +757,7 @@ pub fn build_udp_response(
                 |buf| buf.copy_from_slice(payload),
                 &smoltcp::phy::ChecksumCapabilities::ignored(),
             );
-            buf
+            Some(buf)
         },
         (IpAddress::Ipv6(s6), IpAddress::Ipv6(d6)) => {
             let udp_repr = UdpRepr { src_port, dst_port };
@@ -776,9 +780,10 @@ pub fn build_udp_response(
                 |buf| buf.copy_from_slice(payload),
                 &smoltcp::phy::ChecksumCapabilities::ignored(),
             );
-            buf
+            Some(buf)
         },
-        _ => panic!("build_udp_response: src/dst IP family mismatch"),
+        // 票 x1fz：家族不匹配降级丢包（Go sendUDP 同位返回 error 不 crash）
+        _ => None,
     }
 }
 
@@ -1026,7 +1031,8 @@ mod tests {
             req_meta.src.addr,
             req_meta.src.port,
             req_payload,
-        );
+        )
+        .expect("same-family build");
         let (resp_meta, resp_payload) = parse_udp_packet(&reply).expect("parse resp");
         // 响应的 src 应是请求的 dst；响应的 dst 应是请求的 src
         assert_eq!(resp_meta.src.addr, req_meta.dst.addr);
@@ -1042,7 +1048,8 @@ mod tests {
         let s6 = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
         let d6 = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
         let reply =
-            build_udp_response(IpAddress::Ipv6(s6), 53, IpAddress::Ipv6(d6), 33333, b"v6-payload");
+            build_udp_response(IpAddress::Ipv6(s6), 53, IpAddress::Ipv6(d6), 33333, b"v6-payload")
+                .expect("same-family build");
         assert!(reply[0] >> 4 == 6, "not IPv6");
         let (meta, payload) = parse_udp_packet(&reply).expect("parse v6 reply");
         assert_eq!(meta.src.addr, IpAddress::Ipv6(s6));
@@ -1050,6 +1057,18 @@ mod tests {
         assert_eq!(meta.src.port, 53);
         assert_eq!(meta.dst.port, 33333);
         assert_eq!(payload, b"v6-payload");
+    }
+
+    /// 票 x1fz：src/dst 家族不匹配必须降级为 `None`（调用方丢包），不得 panic。
+    /// Go 同位：proxy/tun/stack.go:347-351 sendUDP `srcIP.Is4() != dstIP.Is4()`
+    /// → 返回 error 丢包。
+    #[test]
+    fn build_udp_response_family_mismatch_returns_none() {
+        let v4 = IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 2));
+        let v6 = IpAddress::Ipv6(Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        // v4 客户端会话收到 v6 上游响应 / 反向，两个方向都必须 None
+        assert!(build_udp_response(v4, 12345, v6, 443, b"x").is_none());
+        assert!(build_udp_response(v6, 443, v4, 12345, b"x").is_none());
     }
 
     // ===== parse_tcp_syn_dst（bd ipb5） =====
