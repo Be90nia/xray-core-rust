@@ -43,8 +43,8 @@ const SOMAXCONN: i32 = 128;
 /// 生效 backlog。逐平台对齐 Go `net.listenerBacklog()`（net.go:404-407 进程内
 /// 缓存一次，平台实现在 maxListenerBacklog）：
 /// - Linux（sock_linux.go:34-59）：读 `/proc/sys/net/core/somaxconn`；读失败 / 首字段解析失败 /
-///   值为 0 → `syscall.SOMAXCONN`；>65535 交给 `max_ack_backlog` 按内核版本钳制 （backlog
-///   存储宽度 <4.1 为 u16、≥4.1 为 u32，issue 5030/41470）。
+///   值为 0 → `syscall.SOMAXCONN`；>65535 交给 `max_ack_backlog` 按内核版本钳制 （backlog 存储宽度
+///   <4.1 为 u16、≥4.1 为 u32，issue 5030/41470）。
 /// - 非 Linux：`syscall.SOMAXCONN`。BSD/darwin 的 sysctl 读取变体（sock_bsd.go:14-40）
 ///   未复刻——fallback 值与各平台 SOMAXCONN 缺省一致（darwin 缺省 sysctl 即 128）。
 #[must_use]
