@@ -1,28 +1,25 @@
-# x86_64 指令集策略（bd f39e，2026-10-22 实测分离 + 用户拍板「修吧」）
+# x86_64 指令集策略（bd f39e / 新票 f2v-：性能与正确性冲突，**当前取正确性**）
 #
-# 实测（tools/loopback_alloc_bench.py，同机同配置，3 轮，加密链拓扑）：
-#   - 仅 -C target-cpu=x86-64（默认）          ：37.8 / 39.1 / 39.2 MB/s
-#   - +aes,+pclmulqdq,+sse4.1,+sse4.2,+popcnt ：157.9 / 178.1 / 173.6 MB/s
-#   - 仅 +sse4.1,+sse4.2,+popcnt（无 AES）     ：155.0 / 140.1 / 157.2 MB/s
-#   - -C target-cpu=native                     ：159.4 / 183.1 / 189.1 MB/s
+# 性能实测（tools/loopback_alloc_bench.py，同机同配置 3 轮，加密链拓扑）：
+#   - 仅 -C target-cpu=x86-64（当前采用）        ：37.8 / 39.1 / 39.2 MB/s
+#   - +sse4.1,+sse4.2,+popcnt                    ：155 / 140 / 157 MB/s
+#   - +aes,+pclmulqdq,+sse4.1,+sse4.2,+popcnt    ：158 / 178 / 174 MB/s
+#   - -C target-cpu=native                       ：159 / 183 / 189 MB/s
 #
-# **分离结论：4.5 倍差距来自 SSE4/POPCNT 缺失（LLVM 无法向量化 memcpy/缓冲拷贝），
-# 与 AES 无关** —— 加密库（aes 0.8 / polyval / sha2）内部用 cpufeatures 做运行时
-# 探测，老 CPU 自动退回软件实现，因此**不启用 +aes 也不会慢**，且老 CPU 不会 SIGILL。
+# **但 SSE4 构建在真网络 vision 互通上显著劣化正确性**（176 VPS 真链路，
+# vless_vision_tls，Go 服务端 + Rust 客户端，各 5 轮）：
+#   - 纯 x86-64 构建：4/5 与 4/5（合计 8/10）
+#   - SSE4 构建     ：1/5 与 2/5（合计 3/10）
+#   - Go↔Go 对照    ：5/5
+# 判定：SSE4 编译疑似暴露 vision/record-framer 路径的 UB（向量化后触发），
+# 在定位修好前**不得启用 target-feature**。see bd ticket（已开，标 P1）。
 #
-# 保留策略：只启用 SSE4.1 / SSE4.2 / POPCNT（Nehalem 2008+ / AMD Barcelona 2007+）。
-# 兼容性：Windows 11 官方要求 SSE4.2 + POPCNT，故 Win11 机器 100% 安全；仅
-# Core 2 等 2008 年前 CPU（只能跑 Win10 的极老机器）有 SIGILL 风险。
-# 若后续要彻底消除该风险：把热点自己代码改 #[target_feature] 多版本 + 运行时
-# is_x86_feature_detected! 分派（方案 C），加密库已自带分派无需处理。
+# 回退历史：本文件曾于 2026-10-22 夜启用 +sse4.*（性能 4.5x），因上述正确性
+# 证据回退。定位方向：vision/xtls 的 unsafe 读写、RecordFramer 未对齐读取、
+# borrow 越界读，用 `cargo +nightly -Z sanitizer` 或 miri 在 Linux 上复现。
 #
 # 交叉编译安全：本表用 cfg(target_arch = "x86_64") 限定，aarch64/arm 不命中。
 # 临时 native 自测：CARGO_BUILD_RUSTFLAGS="-C target-cpu=native"（勿改本文件）。
 
 [target.'cfg(target_arch = "x86_64")']
-rustflags = [
-    "-C",
-    "target-cpu=x86-64",
-    "-C",
-    "target-feature=+sse4.1,+sse4.2,+popcnt",
-]
+rustflags = ["-C", "target-cpu=x86-64"]
