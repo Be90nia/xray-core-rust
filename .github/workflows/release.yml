@@ -6,10 +6,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # 覆盖 .cargo/config.toml 的 target-cpu=native（bd hxy3）：发行产物给公网
-  # 用户下载，必须通用 target 生成（老机器 SIGILL 防线）；RUSTFLAGS env 完全
   # 覆盖 build.rustflags（cargo 语义）。
-  RUSTFLAGS: ""
+  # 注意：不再用空 RUSTFLAGS 覆盖 .cargo/config.toml——该文件用
+  # cfg(target_arch="x86_64") 分目标声明（bd f39e：AES-NI 等特性），
+  # aarch64/arm 交叉编译天然不命中该 cfg，安全。
   # aws-lc-sys 预编译产物含 glibc 2.38+ 符号（__isoc23_*），VPS Debian 12 (2.36)
   # 跑不动；强制源码编译让本地 gcc 出普通 sscanf 引用（生产换核 a2aae6cf 战役）
   AWS_LC_SYS_PREGENERATING: "false"
