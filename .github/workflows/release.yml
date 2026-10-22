@@ -48,6 +48,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # 兜底（同 ci.yml）：仓库 rust-toolchain.toml 钉 nightly-2026-05-28，实际编译用的
+      # 是该 channel；上游 action 的 with.targets 只对它安装的 stable 生效，交叉目标
+      # （linux-musl / macos-x64）因此缺 std → "can't find crate for `core`"。
+      # 用 rustup target add 走**当前生效**工具链。
+      - name: Ensure target installed for pinned toolchain
+        run: rustup target add ${{ matrix.target }}
       # prefix-key 炸缓存：旧 key 里混着 ubuntu-24.04（glibc 2.39）编的 aws_lc_sys
       # 产物（sscanf→__isoc23_* 重定向），恢复进 22.04 链接必炸——强制全量重编
       - uses: Swatinem/rust-cache@v2
