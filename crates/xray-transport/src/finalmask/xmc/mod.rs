@@ -41,7 +41,7 @@ pub struct Profile {
 }
 
 /// XMC 配置（对应 Go `xmc/Config` protobuf）。
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Config {
     /// 登录档案（客户端随机选一个；服务端白名单校验）。
     pub profiles: Vec<Profile>,
@@ -56,6 +56,21 @@ pub struct Config {
     /// 跳过握手后的方向性 padding 调度（仅测试用——e2e 单向数据流测试没有下游
     /// consumer，padding 双向写入会卡 buffer）。
     pub padding_disabled: bool,
+}
+
+// Debug 脱敏（bd 99kd）：password 是共享认证凭据、rsa_private_key 是服务端私钥，
+// 禁止经 derive(Debug) 落入 tracing/panic 输出。rsa_public_key 为公开材料，保留。
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("profiles", &self.profiles)
+            .field("password", &"[REDACTED]")
+            .field("rsa_private_key", &"[REDACTED]")
+            .field("rsa_public_key", &self.rsa_public_key)
+            .field("hostname", &self.hostname)
+            .field("padding_disabled", &self.padding_disabled)
+            .finish()
+    }
 }
 
 impl Tcpmask for Config {
@@ -203,5 +218,18 @@ mod tests {
             b"data that should not arrive".to_vec(),
             "plaintext should not pass through on handshake failure"
         );
+    }
+
+    /// bd 99kd：Config Debug 不得泄露 password / rsa_private_key；
+    /// rsa_public_key（公开材料）保留可读。
+    #[test]
+    fn debug_redacts_password_and_private_key() {
+        let cfg = test_config("hunter2-secret", vec![0xAB; 32], vec![0x11; 8]);
+        let s = format!("{cfg:?}");
+        assert!(!s.contains("hunter2-secret"), "password leaked: {s}");
+        assert!(!s.contains("171"), "private key bytes leaked: {s}");
+        assert!(s.contains("[REDACTED]"), "secrets must be redacted: {s}");
+        assert!(s.contains("localhost"), "non-secret fields must stay readable: {s}");
+        assert!(s.contains("test_user"), "profiles must stay readable: {s}");
     }
 }

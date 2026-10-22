@@ -8,7 +8,7 @@
 //! 实际握手走 uTLS 等价品（Rust 端待生态成熟或自研后再接，
 //! 见 [`crate::client`] / [`crate::server`] 占位）。
 
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, fmt, time::Duration};
 
 use crate::error::RealityError;
 
@@ -73,7 +73,7 @@ impl LimitFallback {
 ///
 /// 对应 Go `*reality.Config`（由 `Config.GetREALITYConfig()` 从 proto `Config` 构造）。
 /// 字段命名与 Go 端保持一致以方便对照；带「服务端字段」/「客户端字段」注释标注用途。
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RealityConfig {
     pub show: bool,
     pub r#type: String,
@@ -138,6 +138,41 @@ pub struct RealityConfig {
     pub next_protos: Option<Vec<String>>,
     /// 总是 `true`（Go 端硬编码 `SessionTicketsDisabled: true`）。
     pub session_tickets_disabled: bool,
+}
+
+// Debug 脱敏（bd 99kd）：private_key / mldsa65_seed / mldsa65_key 是服务端长期
+// 密钥，禁止经 derive(Debug) 落入 tracing/panic 输出（同 0fd7dd59 MemoryAccount 红线）。
+impl fmt::Debug for RealityConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redacted = "[REDACTED]";
+        f.debug_struct("RealityConfig")
+            .field("show", &self.show)
+            .field("type", &self.r#type)
+            .field("dest", &self.dest)
+            .field("xver", &self.xver)
+            .field("server_names", &self.server_names)
+            .field("private_key", &redacted)
+            .field("short_ids", &self.short_ids)
+            .field("min_client_ver", &self.min_client_ver)
+            .field("max_client_ver", &self.max_client_ver)
+            .field("max_time_diff", &self.max_time_diff)
+            .field("mldsa65_seed", &self.mldsa65_seed.as_ref().map(|_| redacted))
+            .field("mldsa65_key", &self.mldsa65_key.as_ref().map(|_| redacted))
+            .field("limit_fallback_upload", &self.limit_fallback_upload)
+            .field("limit_fallback_download", &self.limit_fallback_download)
+            .field("fingerprint", &self.fingerprint)
+            .field("server_name", &self.server_name)
+            .field("public_key", &self.public_key)
+            .field("short_id", &self.short_id)
+            .field("mldsa65_verify", &self.mldsa65_verify)
+            .field("spider_x", &self.spider_x)
+            .field("spider_y", &self.spider_y)
+            .field("master_key_log", &self.master_key_log)
+            .field("max_useless_records", &self.max_useless_records)
+            .field("next_protos", &self.next_protos)
+            .field("session_tickets_disabled", &self.session_tickets_disabled)
+            .finish()
+    }
 }
 
 impl Default for RealityConfig {
@@ -665,5 +700,22 @@ mod tests {
         // 未知值 / 类型错误硬错
         assert!(ServerAcceptorSetting::from_json(Some(&json!("boring"))).is_err());
         assert!(ServerAcceptorSetting::from_json(Some(&json!(true))).is_err());
+    }
+
+    /// bd 99kd：Debug 输出不得含密钥字节（private_key / mldsa65_seed / mldsa65_key）。
+    #[test]
+    fn debug_redacts_private_key_material() {
+        let mut cfg = RealityConfig::from_proto(&proto_fixture()).unwrap();
+        cfg.private_key = vec![0xAB; 32];
+        cfg.mldsa65_seed = Some(vec![0xCD; 32]);
+        cfg.mldsa65_key = Some(vec![0xEF; 32]);
+        let s = format!("{cfg:?}");
+        assert!(s.contains("[REDACTED]"), "keys must be redacted: {s}");
+        for leaked in ["171", "205", "239"] {
+            assert!(!s.contains(leaked), "secret byte rendering {leaked} leaked: {s}");
+        }
+        // 非敏感字段保留可读（排障需要）。
+        assert!(s.contains("chrome"), "non-secret fields must stay readable: {s}");
+        assert!(s.contains("example.com:443"), "dest must stay readable: {s}");
     }
 }

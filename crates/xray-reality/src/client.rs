@@ -43,7 +43,6 @@ use crate::{config::RealityConfig, crypto, error::RealityError};
 /// REALITY 客户端连接状态（握手前/握手后统一形态）。
 ///
 /// 对应 Go `UConn struct { *utls.UConn; Config; ServerName; AuthKey; Verified }`。
-#[derive(Debug)]
 pub struct UConnState {
     /// 配置引用（含客户端字段：fingerprint/server_name/public_key/...）。
     pub config: RealityConfig,
@@ -58,6 +57,19 @@ pub struct UConnState {
     ///
     /// btls 路径：握手成功返回 = 验证通过（失败即 Err，不返回连接）。
     pub verified: bool,
+}
+
+// Debug 脱敏（bd 99kd）：auth_key 是握手期 ECDH 派生的会话凭据，
+// config 内的服务端密钥由 RealityConfig 自身 Debug 脱敏传导。
+impl std::fmt::Debug for UConnState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UConnState")
+            .field("config", &self.config)
+            .field("server_name", &self.server_name)
+            .field("auth_key", &"[REDACTED]")
+            .field("verified", &self.verified)
+            .finish()
+    }
 }
 
 impl UConnState {
@@ -717,5 +729,29 @@ mod tests {
             Ok(_) => panic!("expected Mldsa65VerifyNeedsBtlsFingerprint"),
         };
         assert!(matches!(err, RealityError::Mldsa65VerifyNeedsBtlsFingerprint));
+    }
+
+    /// bd 99kd：UConnState Debug 不得泄露 auth_key（会话凭据），
+    /// 且其 config 字段经 RealityConfig 脱敏传导——服务端 private_key 不可见。
+    #[test]
+    fn debug_redacts_auth_key_and_inner_private_key() {
+        let mut cfg = make_valid_config();
+        cfg.private_key = vec![0xAB; 32];
+        let state = UConnState {
+            config: cfg,
+            server_name: "example.com".into(),
+            auth_key: vec![0xCD; 32],
+            verified: true,
+        };
+        let s = format!("{state:?}");
+        assert!(s.contains("auth_key: \"[REDACTED]\""), "auth_key must be redacted: {s}");
+        assert!(
+            s.contains("private_key: \"[REDACTED]\""),
+            "inner private_key must be redacted: {s}"
+        );
+        for leaked in ["171", "205"] {
+            assert!(!s.contains(leaked), "secret byte rendering {leaked} leaked: {s}");
+        }
+        assert!(s.contains("example.com"), "non-secret fields must stay readable: {s}");
     }
 }

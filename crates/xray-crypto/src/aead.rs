@@ -96,6 +96,13 @@ pub trait AeadCipher {
     /// Backends that can encrypt in place override this to avoid the
     /// intermediate allocation; the default falls back to [`Self::seal`].
     ///
+    /// # Invariant
+    ///
+    /// On `Err`, `out` is left byte-for-byte as it was before the call —
+    /// nothing is appended. Callers reuse `out` across chunks (SS chunk write,
+    /// VMess body chunk), so a leftover plaintext copy would be sent as if it
+    /// were ciphertext.
+    ///
     /// # Errors
     ///
     /// Same as [`Self::seal`].
@@ -138,6 +145,37 @@ pub trait AeadCipher {
         let plaintext = self.open(nonce, aad, ciphertext)?;
         ciphertext[..plaintext.len()].copy_from_slice(&plaintext);
         Ok(&mut ciphertext[..plaintext.len()])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 追加式 seal 的失败回滚
+// ---------------------------------------------------------------------------
+
+/// 就地加密 `plaintext` 并追加到 `out`；失败时把 `out` 截断回调用前长度。
+///
+/// 不变量（错误返回时 `out` 逐字节等于调用前）：ring 的
+/// `seal_in_place_separate_tag` 只在写入 `in_out` **之前**失败
+/// （`ring-0.17.14/src/aead/gcm.rs:60-68` 的 `Context::new` 检查 in_out 超长），
+/// 失败时 `out[start..]` 仍留着明文副本——留着复用就是「明文当密文上线」。
+/// SS chunk 写（`xray-proxy-ss/src/stream.rs:294-301`）与 VMess body chunk 都复用
+/// 同一个 `out`，因此错误路径必须自清。
+///
+/// Go 侧无此问题：`crypto/cipher.AEAD.Seal` 无错误返回（失败即 panic），
+/// 调用方不可能观察到「部分追加」状态。
+fn seal_append_rollback<T, E>(
+    out: &mut Vec<u8>,
+    plaintext: &[u8],
+    seal: impl FnOnce(&mut [u8]) -> Result<T, E>,
+) -> Result<T, E> {
+    let start = out.len();
+    out.extend_from_slice(plaintext);
+    match seal(&mut out[start..]) {
+        Ok(tag) => Ok(tag),
+        Err(e) => {
+            out.truncate(start);
+            Err(e)
+        },
     }
 }
 
@@ -236,12 +274,10 @@ impl AeadCipher for Aes128Gcm {
         let ring_nonce = Nonce::try_assume_unique_for_key(nonce)
             .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
         let ring_aad = Aad::from(aad);
-        let start = out.len();
-        out.extend_from_slice(plaintext);
-        let tag = self
-            .key
-            .seal_in_place_separate_tag(ring_nonce, ring_aad, &mut out[start..])
-            .map_err(|_| CryptoError::EncryptionError("seal failed".into()))?;
+        let tag = seal_append_rollback(out, plaintext, |buf| {
+            self.key.seal_in_place_separate_tag(ring_nonce, ring_aad, buf)
+        })
+        .map_err(|_| CryptoError::EncryptionError("seal failed".into()))?;
         out.extend_from_slice(tag.as_ref());
         Ok(())
     }
@@ -380,12 +416,10 @@ impl AeadCipher for Aes256Gcm {
         let ring_nonce = Nonce::try_assume_unique_for_key(nonce)
             .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
         let ring_aad = Aad::from(aad);
-        let start = out.len();
-        out.extend_from_slice(plaintext);
-        let tag = self
-            .key
-            .seal_in_place_separate_tag(ring_nonce, ring_aad, &mut out[start..])
-            .map_err(|_| CryptoError::EncryptionError("seal failed".into()))?;
+        let tag = seal_append_rollback(out, plaintext, |buf| {
+            self.key.seal_in_place_separate_tag(ring_nonce, ring_aad, buf)
+        })
+        .map_err(|_| CryptoError::EncryptionError("seal failed".into()))?;
         out.extend_from_slice(tag.as_ref());
         Ok(())
     }
@@ -1073,6 +1107,32 @@ mod tests {
             .concat();
             assert_eq!(out, expected);
         }
+    }
+
+    /// 失败路径不变量（bd bqro）：seal 失败时 `out` 必须逐字节回到调用前。
+    /// ring 的失败点在写入 `in_out` 之前（`gcm.rs` `Context::new`），失败时
+    /// `out[start..]` 仍是明文副本——不截断就是「明文被当密文复用」。
+    #[test]
+    fn seal_append_rollback_leaves_out_untouched_on_error() {
+        let mut out = b"prefix-sentinel".to_vec();
+        let before = out.clone();
+        let res: Result<(), &'static str> =
+            seal_append_rollback(&mut out, b"plaintext-must-not-survive", |_| Err("boom"));
+        assert_eq!(res, Err("boom"));
+        assert_eq!(out, before, "failed seal must leave out byte-identical");
+
+        // 成功路径：明文就地被改写，tag 由闭包返回交给调用方追加。
+        let tag = seal_append_rollback(&mut out, b"payload", |buf| {
+            for b in buf.iter_mut() {
+                *b ^= 0xFF;
+            }
+            Ok::<[u8; 2], &'static str>([0xAA, 0xBB])
+        })
+        .expect("seal ok");
+        assert_eq!(tag, [0xAA, 0xBB]);
+        let mut expected = before;
+        expected.extend(b"payload".iter().map(|b| b ^ 0xFF));
+        assert_eq!(out, expected);
     }
 
     /// open_in_place 必须与 open 产出相同明文（原地返回借用切片），
