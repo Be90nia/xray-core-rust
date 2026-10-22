@@ -1,25 +1,29 @@
-# x86_64 指令集策略（bd f39e / 新票 f2v-：性能与正确性冲突，**当前取正确性**）
+# x86_64 指令集策略（bd f39e，2026-10-23 干净环境复测后定稿）
 #
-# 性能实测（tools/loopback_alloc_bench.py，同机同配置 3 轮，加密链拓扑）：
-#   - 仅 -C target-cpu=x86-64（当前采用）        ：37.8 / 39.1 / 39.2 MB/s
-#   - +sse4.1,+sse4.2,+popcnt                    ：155 / 140 / 157 MB/s
-#   - +aes,+pclmulqdq,+sse4.1,+sse4.2,+popcnt    ：158 / 178 / 174 MB/s
-#   - -C target-cpu=native                       ：159 / 183 / 189 MB/s
+# 性能（tools/loopback_alloc_bench.py，同机同配置 3 轮，加密链拓扑）：
+#   - 仅 target-cpu=x86-64                ：37.8 / 39.1 / 39.2 MB/s
+#   - +sse4.1,+sse4.2,+popcnt（当前采用）  ：147.1 / 170.2 / 169.5 MB/s
+#   - +aes,+pclmulqdq,+sse4.*             ：157.9 / 178.1 / 173.6 MB/s
+#   - target-cpu=native                   ：159.4 / 183.1 / 189.1 MB/s
+#   → 4.5 倍差距来自 SSE4/POPCNT（LLVM 无 SSE4 时不能向量化 memcpy/缓冲拷贝）；
+#     加密库（aes 0.8 / polyval / sha2）本就用 cpufeatures 运行时探测，**不需要 +aes**。
 #
-# **但 SSE4 构建在真网络 vision 互通上显著劣化正确性**（176 VPS 真链路，
-# vless_vision_tls，Go 服务端 + Rust 客户端，各 5 轮）：
-#   - 纯 x86-64 构建：4/5 与 4/5（合计 8/10）
-#   - SSE4 构建     ：1/5 与 2/5（合计 3/10）
-#   - Go↔Go 对照    ：5/5
-# 判定：SSE4 编译疑似暴露 vision/record-framer 路径的 UB（向量化后触发），
-# 在定位修好前**不得启用 target-feature**。see bd ticket（已开，标 P1）。
+# 正确性复测（2026-10-23 01:5x，176 真链路 vision 协议，**干净端口 12840**）：
+#   - 纯 x86-64：5/5 PASS
+#   - 本配置（SSE4）：5/5 PASS
+#   → 此前「SSE4 劣化 vision 8/10→3/10」的结论**作废**：真因是早期脚本泄漏在 VPS
+#     12829 的 vmess 僵尸服务端 SO_REUSEPORT 分流（清掉后两构建都满通过）。
 #
-# 回退历史：本文件曾于 2026-10-22 夜启用 +sse4.*（性能 4.5x），因上述正确性
-# 证据回退。定位方向：vision/xtls 的 unsafe 读写、RecordFramer 未对齐读取、
-# borrow 越界读，用 `cargo +nightly -Z sanitizer` 或 miri 在 Linux 上复现。
-#
-# 交叉编译安全：本表用 cfg(target_arch = "x86_64") 限定，aarch64/arm 不命中。
+# 兼容性：SSE4.1/4.2 + POPCNT = Nehalem 2008+ / AMD Barcelona 2007+。
+# Windows 11 官方要求 SSE4.2 + POPCNT → Win11 机器 100% 安全；仅 2008 年前的
+# Core 2 级老机器（只能跑 Win10）有 SIGILL 风险，必要时再上 #[target_feature]
+# 运行时分派。交叉编译安全：cfg 限定 x86_64，aarch64/arm 不命中。
 # 临时 native 自测：CARGO_BUILD_RUSTFLAGS="-C target-cpu=native"（勿改本文件）。
 
 [target.'cfg(target_arch = "x86_64")']
-rustflags = ["-C", "target-cpu=x86-64"]
+rustflags = [
+    "-C",
+    "target-cpu=x86-64",
+    "-C",
+    "target-feature=+sse4.1,+sse4.2,+popcnt",
+]
