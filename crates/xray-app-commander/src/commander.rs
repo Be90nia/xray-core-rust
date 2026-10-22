@@ -526,9 +526,41 @@ impl Commander {
         match self.listen.as_deref().map(grpc::parse_listen_spec) {
             // TCP listen 模式
             Some(Ok(grpc::ListenSpec::Tcp(addr))) => {
+                // bd 99n3：bind 同步上抛（对齐 Go commander.go:85-91——ListenSystem
+                // 失败 LogErrorInner + return err，即 feature start 失败 = fatal 面；
+                // 此前 bind 藏在 tonic serve 内，spawn 后才异步 ERROR、admin 端口
+                // 被占不上升）。listening INFO 移到 bind 成功后（Go commander.go:92
+                // 同序）。serve_grpc 是同步 fn：std bind + from_std（Feature::start
+                // 契约保证 runtime 上下文；unix 分支 tokio UnixListener::bind 同为
+                // 同步语义）。
+                let std_listener = std::net::TcpListener::bind(addr).map_err(|e| {
+                    CommanderError::InvalidListenAddr {
+                        addr: addr.to_string(),
+                        reason: format!("bind tcp: {e}"),
+                    }
+                })?;
+                std_listener.set_nonblocking(true).map_err(|e| {
+                    CommanderError::InvalidListenAddr {
+                        addr: addr.to_string(),
+                        reason: format!("set nonblocking: {e}"),
+                    }
+                })?;
+                let listener = tokio::net::TcpListener::from_std(std_listener).map_err(|e| {
+                    CommanderError::InvalidListenAddr {
+                        addr: addr.to_string(),
+                        reason: format!("convert tcp listener: {e}"),
+                    }
+                })?;
                 tracing::info!("commander gRPC server listening on {addr} (tag=`{}`)", self.tag);
                 let handle = tokio::spawn(async move {
-                    if let Err(e) = router.serve(addr).await {
+                    if let Err(e) = router
+                        .serve_with_incoming(
+                            tonic::codegen::tokio_stream::wrappers::TcpListenerStream::new(
+                                listener,
+                            ),
+                        )
+                        .await
+                    {
                         tracing::error!("commander gRPC server exited with error: {e}");
                     }
                 });
@@ -1141,11 +1173,10 @@ mod tests {
 
     /// 带 deadline 退避重试的 dial。
     ///
-    /// [`Commander::start`] 的 TCP listen 模式在 `tokio::spawn` 的任务里才
-    /// bind（commander.rs start→grpc::ListenSpec::Tcp 分支），spawn 返回 ≠
-    /// listener 就绪；POSIX 调度下测试立即 dial 会 Connection refused
-    /// （CI macos+ubuntu 首跑实证，Windows 碰巧绿）。禁 sleep 固定等待，
-    /// deadline 内指数退避重试。
+    /// bd 99n3 前：TCP listen 模式在 `tokio::spawn` 的任务里才 bind，spawn 返回
+    /// ≠ listener 就绪（CI macos+ubuntu 首跑 Connection refused 实证）。bind 同步化
+    /// 后 listener 在 start 返回前已 listen，重试仅兜 accept 循环启动窗口——
+    /// 禁 sleep 固定等待，deadline 内指数退避。
     async fn dial_with_retry<T, F, Fut>(mut connect: F, what: &'static str) -> T
     where
         F: FnMut() -> Fut,
@@ -1209,6 +1240,25 @@ mod tests {
         .into_inner();
         assert_eq!(resp.stat.expect("stat").value, 42);
         commander.close().unwrap();
+    }
+
+    /// bd 99n3：admin TCP 端口被占 → `Feature::start` 必 Err 且错误串携带地址
+    /// 与 bind 原因。bind 同步上升 = 与入站同 fatal 面（Go commander.go:85-91
+    /// ListenSystem 失败 return err），不再 spawn 后异步 ERROR 无人上升。
+    #[tokio::test]
+    async fn tcp_bind_failure_escalates_to_start_error() {
+        use xray_features::Feature as _;
+
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let commander = Commander::new("api", Some(format!("127.0.0.1:{port}")));
+
+        let err = commander.start().expect_err("occupied admin port must fail start");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bind tcp") && msg.contains(&port.to_string()),
+            "error must carry addr + bind reason, got: {msg}"
+        );
     }
 
     /// 后端在场但未声明 StatsService → 服务不暴露（UNIMPLEMENTED）。

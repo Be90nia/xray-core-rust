@@ -3057,7 +3057,6 @@ fn build_tls_acceptor(
 /// maxTimeDiff（时间戳容差秒，**0 = 禁用时间窗校验**）。
 /// 来源：Go xtls/reality `tls.go:259` `config.MaxTimeDiff == 0 || time.Since(...).Abs() <=
 /// MaxTimeDiff`。
-#[derive(Debug)]
 struct RealityInboundConfig {
     server_private_key: [u8; 32],
     /// t38j：SNI 白名单（非空，parse 层硬错保证）；精确匹配，供 server_tls 前置门。
@@ -3073,6 +3072,25 @@ struct RealityInboundConfig {
     max_useless_records: xray_reality::MaxUselessRecordsSetting,
     /// bd tce2：TLS acceptor 选择（缺省 Rustls 保持现行为）。
     server_acceptor: xray_reality::ServerAcceptorSetting,
+}
+
+// Debug 脱敏（bd 99kd）：server_private_key 是 REALITY 服务端长期密钥，
+// 禁止经 derive(Debug) 落入 tracing/panic 输出。
+impl std::fmt::Debug for RealityInboundConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RealityInboundConfig")
+            .field("server_private_key", &"[REDACTED]")
+            .field("server_names", &self.server_names)
+            .field("short_ids", &self.short_ids)
+            .field("max_diff", &self.max_diff)
+            .field("fallback_dest", &self.fallback_dest)
+            .field("xver", &self.xver)
+            .field("min_client_ver", &self.min_client_ver)
+            .field("max_client_ver", &self.max_client_ver)
+            .field("max_useless_records", &self.max_useless_records)
+            .field("server_acceptor", &self.server_acceptor)
+            .finish()
+    }
 }
 
 fn parse_reality_config(
@@ -3352,6 +3370,9 @@ async fn serve_reality_vless(
         None
     };
 
+    // tcpSettings.header 伪装头（Go hub.go:85-95 authConfig；reality 解包后应用，
+    // hub.go:106-120）。无 header → None 零开销直通。
+    let header = listener.header_auth().cloned();
     loop {
         // finalmask.tcp 在 accept 后立即套上（wire 最外层，reality 握手在其内）。
         let (stream, peer) = match listener.accept_masked().await {
@@ -3365,6 +3386,7 @@ async fn serve_reality_vless(
         let handler = Arc::clone(&handler);
         let validator = Arc::clone(&validator);
         let options = options.clone();
+        let header = header.clone();
         let key = cfg.server_private_key;
         let names = cfg.server_names.clone();
         let ids = cfg.short_ids.clone();
@@ -3445,8 +3467,12 @@ async fn serve_reality_vless(
                     if let Some(o) = options.as_mut() {
                         o.outer_tls13 = true;
                     }
+                    // Go hub.go:106-120：authConfig.Server 套在 reality 解包之后
+                    // （伪装头消费在 TLS 隧道内、协议层之前）。
+                    let io =
+                        xray_transport::headers::conn::maybe_wrap_server(tls, header.as_deref());
                     if let Err(e) = xray_proxy_vless::handle_vless_connection(
-                        tls,
+                        io,
                         &handler,
                         &validator,
                         options.clone(),
@@ -3537,6 +3563,9 @@ async fn serve_reality_trojan(
         None
     };
 
+    // tcpSettings.header 伪装头（Go hub.go:85-95 authConfig；reality 解包后应用，
+    // hub.go:106-120）。无 header → None 零开销直通。
+    let header = listener.header_auth().cloned();
     loop {
         // finalmask.tcp 在 accept 后立即套上（wire 最外层，reality 握手在其内）。
         let (stream, peer) = match listener.accept_masked().await {
@@ -3550,6 +3579,7 @@ async fn serve_reality_trojan(
         let handler = Arc::clone(&handler);
         let validator = Arc::clone(&validator);
         let fb_policy = fb_policy.clone();
+        let header = header.clone();
         let key = cfg.server_private_key;
         let names = cfg.server_names.clone();
         let ids = cfg.short_ids.clone();
@@ -3607,8 +3637,12 @@ async fn serve_reality_trojan(
             };
             match outcome {
                 Ok(RealityServerOutcome::Verified { tls, .. }) => {
+                    // Go hub.go:106-120：authConfig.Server 套在 reality 解包之后
+                    // （伪装头消费在 TLS 隧道内、协议层之前）。
+                    let io =
+                        xray_transport::headers::conn::maybe_wrap_server(tls, header.as_deref());
                     xray_proxy_trojan::serve_trojan_conn(
-                        tls,
+                        io,
                         validator,
                         handler,
                         fb_policy,
@@ -3919,6 +3953,11 @@ async fn spawn_one_inbound(
                 // REALITY：server_tls 验证 → Verified 走 VLESS；Invalid fallback 到 dest
                 let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone())
                     .await?
+                    // tcpSettings.header 伪装头（Go hub.go:85-95 authConfig；无 header
+                    // → None 零开销；serve 层在 reality 解包后应用，hub.go:106-120）。
+                    .with_header_auth(xray_transport::headers::conn::auth_from_json(
+                        settings.transport_json.as_ref(),
+                    )?)
                     // finalmask.tcp（Go hub.go WrapListener；wire 最外层，reality 之前）
                     .with_tcpmask_manager(inbound_tcpmask(&settings)?);
                 let reality = parse_reality_config(&settings)?;
@@ -4007,6 +4046,11 @@ async fn spawn_one_inbound(
                 let reality = parse_reality_config(&settings)?;
                 let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone())
                     .await?
+                    // tcpSettings.header 伪装头（Go hub.go:85-95 authConfig；无 header
+                    // → None 零开销；serve 层在 reality 解包后应用，hub.go:106-120）。
+                    .with_header_auth(xray_transport::headers::conn::auth_from_json(
+                        settings.transport_json.as_ref(),
+                    )?)
                     // finalmask.tcp（Go hub.go WrapListener；wire 最外层，reality 之前）
                     .with_tcpmask_manager(inbound_tcpmask(&settings)?);
                 tracing::info!(tag = %ib.tag, addr = %addr, users = users.len(), fallback = %reality.fallback_dest, "trojan+reality inbound listening");
@@ -5955,6 +5999,82 @@ mod tests {
 
     use super::*;
 
+    /// bd m1oa：inbound dispatch 失败必须留痕。`DispatchHandler::dispatch`
+    /// 返回 `()`（错误不走返回通道），可观测面在
+    /// [`crate::wiring::InboundDispatchHandler`] 的 `dispatch_link` Err 分支
+    /// ——warn 一行带 inbound tag 与丢弃原因（Go 对照 worker.go:123-125
+    /// `LogInfoInner(ctx, err, "connection ends")`：错误留痕、连接照常关闭）。
+    /// 锁定该行为：dispatcher 无 ohm 的同步失败必产生含 tag 的 warn。
+    #[test]
+    fn dispatch_link_failure_warns_with_tag_and_reason() {
+        // WarnCapture 模式取自 outbound.rs（原始来源 xray-tls）。
+        #[derive(Clone, Default)]
+        struct WarnCapture(Arc<parking_lot::Mutex<Vec<String>>>);
+        impl tracing::Subscriber for WarnCapture {
+            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+                meta.level() <= &tracing::Level::WARN
+            }
+
+            fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+
+            fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+            fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {
+            }
+
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct Fmt(String);
+                impl tracing::field::Visit for Fmt {
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        self.0.push_str(&format!("{}={value} ", field.name()));
+                    }
+
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push_str(&format!("{}={value:?} ", field.name()));
+                    }
+                }
+                let mut v = Fmt(String::new());
+                event.record(&mut v);
+                self.0.lock().push(v.0);
+            }
+
+            fn enter(&self, _span: &tracing::span::Id) {}
+
+            fn exit(&self, _span: &tracing::span::Id) {}
+        }
+
+        let handler = Arc::new(crate::wiring::InboundDispatchHandler::new(
+            Arc::new(xray_app_dispatcher::default::DefaultDispatcher::new()),
+            xray_app_dispatcher::default::SniffingRequest::default(),
+            "ss-in",
+        ));
+        let capture = WarnCapture::default();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        tracing::subscriber::with_default(capture.clone(), || {
+            rt.block_on(async {
+                let dest = Destination::new(
+                    Address::Domain("example.com".into()),
+                    Port::new(443),
+                    Network::TCP,
+                );
+                let (up_r, up_w) = xray_buf::pipe::new();
+                let link = Link::new(Box::new(up_r), Box::new(up_w));
+                handler.dispatch(&dest, link).await;
+            });
+        });
+        let warns = capture.0.lock();
+        assert!(
+            warns.iter().any(|w| w.contains("dispatch_link failed") && w.contains("ss-in")),
+            "dispatch failure must warn with inbound tag + reason, got: {warns:?}"
+        );
+    }
+
     /// bd b8i 对称面：不支持平台（Windows/macOS 等）tun inbound →
     /// `spawn_one_inbound` 返回 Unsupported 硬错误（对齐 Go 不支持平台
     /// NewTun 失败 → inbound 创建失败的 fail-fast 语义）。
@@ -7353,6 +7473,147 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         conn.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, payload, "vless over reality should echo");
+    }
+
+    /// F3（bd 8q0d）：REALITY 入站 `tcpSettings.header` 伪装头接线回归。
+    ///
+    /// 装配处 `with_header_auth` 注入 → serve_reality_vless 读 `header_auth()`
+    /// → Verified 后对 reality 解包流套 `maybe_wrap_server`（Go hub.go:106-120
+    /// `authConfig.Server` 套在 `reality.Server` 之后）。客户端对称 `wrap_client`
+    /// 首写前置伪装 GET。
+    ///
+    /// 修前行为：服务端把伪装 GET 字节直接喂 VLESS 解析（首字节 'G' 非合法
+    /// VLESS version）→ 请求头解码失败连接被关 → `decode_response_header`
+    /// 读 EOF，本测试红。
+    #[tokio::test]
+    async fn vless_reality_inbound_applies_tcp_header_auth() {
+        // rustls 全局 provider（并行测试只装一次）
+        static PROVIDER: std::sync::Once = std::sync::Once::new();
+        PROVIDER.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+        use base64::Engine as _;
+        use xray_proxy_vless::encoding::{
+            VlessCommand,
+            client::{decode_response_header, encode_request_header},
+        };
+        use xray_transport::{
+            dialer::{StreamSettings, dial_with_settings},
+            sockopt::SocketOptions,
+        };
+
+        // 1. echo server（VLESS 数据目标）
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = match echo_listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    },
+                }
+            }
+        });
+
+        // 2. freedom outbound → SimpleOhm
+        let ohm = Arc::new(SimpleOhm::new());
+        let bridge = Arc::new(xray_app_dispatcher::default::DialBridge::new(
+            "freedom",
+            make_freedom_dial_fn(),
+        )) as Arc<dyn xray_app_dispatcher::DispatchHandler>;
+        ohm.set_default(bridge);
+
+        // 3. validator（test UUID）
+        let validator = Arc::new(VlessMemoryValidator::new());
+        let test_uuid = UUID::parse("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
+        let proto_account = VlessProtoAccount {
+            id: "b831381d-6324-4d53-ad4f-8cda48b30811".to_string(),
+            ..Default::default()
+        };
+        let account = VlessMemoryAccount::from_proto_account(&proto_account).unwrap();
+        validator.add(VlessMemoryUser::new("e2e-user", 0, account)).unwrap();
+
+        // 4. serve_reality_vless + tcpSettings.header（默认 chrome 伪装请求）
+        let server_secret = x25519_dalek::StaticSecret::from([0x42u8; 32]);
+        let server_public = x25519_dalek::PublicKey::from(&server_secret);
+        let short_id = [2u8, 4, 6, 8, 1, 3, 5, 7];
+        let reality_cfg = RealityInboundConfig {
+            server_private_key: server_secret.to_bytes(),
+            // 客户端 SNI=reality.local（下方 settings），白名单含它 → SNI 门放行。
+            server_names: vec!["reality.local".to_string()],
+            short_ids: vec![short_id],
+            max_diff: 43200,
+            fallback_dest: format!("127.0.0.1:{}", echo_addr.port()),
+            xver: 0,
+            min_client_ver: Vec::new(),
+            max_client_ver: Vec::new(),
+            max_useless_records: xray_reality::MaxUselessRecordsSetting::Disabled,
+            server_acceptor: xray_reality::ServerAcceptorSetting::Rustls,
+        };
+        let header_json = serde_json::json!({"header": {"type": "http"}});
+        let server_auth =
+            xray_transport::headers::conn::auth_from_json(Some(&header_json)).unwrap().unwrap();
+        let rl = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        )
+        .await
+        .unwrap()
+        .with_header_auth(Some(server_auth));
+        let rl_addr = rl.local_addr().unwrap();
+        let ohm_c = Arc::clone(&ohm);
+        let val_c = Arc::clone(&validator) as Arc<dyn VlessValidator>;
+        tokio::spawn(async move {
+            let _ = serve_reality_vless(rl, ohm_c, val_c, reality_cfg, None).await;
+        });
+
+        // 5. client：tcp+reality dial → wrap_client（首写前置伪装 GET）→ VLESS 请求 → echo
+        let _ = xray_transport_tcp::register::register_dialer();
+        let mut settings = StreamSettings::tcp();
+        settings.security = "reality".to_string();
+        settings.security_json = Some(serde_json::json!({
+            "serverName": "reality.local",
+            "publicKey": base64::engine::general_purpose::STANDARD.encode(server_public.to_bytes()),
+            "shortId": hex::encode(short_id),
+            "fingerprint": "chrome"
+        }));
+        let dest = Destination::tcp(
+            Address::IPv4(std::net::Ipv4Addr::LOCALHOST),
+            Port::new(rl_addr.port()),
+        );
+        let conn = dial_with_settings("tcp", &dest, &SocketOptions::default(), &settings)
+            .await
+            .expect("tcp+reality dial should succeed");
+        let client_auth =
+            xray_transport::headers::conn::auth_from_json(Some(&header_json)).unwrap().unwrap();
+        let mut conn = xray_transport::headers::conn::wrap_client(conn, &client_auth);
+
+        encode_request_header(
+            &mut conn,
+            0,
+            &test_uuid,
+            VlessCommand::Tcp,
+            Some(&Address::IPv4(std::net::Ipv4Addr::LOCALHOST)),
+            Some(echo_addr.port()),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        let _ = decode_response_header(&mut conn, 0).await.unwrap();
+
+        let payload = b"hello vless+reality+header!";
+        conn.write_all(payload).await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        conn.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, payload, "vless over reality with tcpSettings.header should echo");
     }
 
     /// 39824 修 A 回归共享脚手架：REALITY+vision 入站（serve_reality_vless，
@@ -10717,5 +10978,26 @@ mod tests {
             assert_eq!(&resp[..2], &[0xAB, 0xCD], "响应 ID 必须与查询一致（masked={masked}）");
             assert_wire(&client.wire_sent(), &frame, masked, "dns 入站");
         }
+    }
+
+    /// bd 99kd：REALITY inbound 配置 Debug 不得泄露 server_private_key。
+    #[test]
+    fn reality_inbound_config_debug_redacts_private_key() {
+        let cfg = RealityInboundConfig {
+            server_private_key: [0xAB; 32],
+            server_names: vec!["example.com".to_string()],
+            short_ids: vec![[1u8; 8]],
+            max_diff: 0,
+            fallback_dest: "example.com:443".to_string(),
+            xver: 0,
+            min_client_ver: Vec::new(),
+            max_client_ver: Vec::new(),
+            max_useless_records: xray_reality::MaxUselessRecordsSetting::Disabled,
+            server_acceptor: xray_reality::ServerAcceptorSetting::Rustls,
+        };
+        let s = format!("{cfg:?}");
+        assert!(!s.contains("171"), "private key bytes leaked: {s}");
+        assert!(s.contains("server_private_key: \"[REDACTED]\""), "must be redacted: {s}");
+        assert!(s.contains("example.com:443"), "non-secret fields must stay readable: {s}");
     }
 }
