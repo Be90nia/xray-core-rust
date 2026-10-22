@@ -1536,7 +1536,7 @@ fn build_xicmp_config(settings: &serde_json::Value) -> io::Result<xicmp::XicmpCo
 }
 
 /// Go `Realm.Build` → `realm::Config`（URL 形如 `realm://token@host:port/id`；
-/// scheme `realm`→https、`realm+http`→http；Rust 端 TLS 细节由 `use_tls` 简化承载）。
+/// scheme `realm`→https、`realm+http`→http；信令 TLS 为结构化 [`realm::tls::TlsConfig`]）。
 fn build_realm_config(settings: &serde_json::Value) -> io::Result<realm::Config> {
     let url = json_str(settings, "url");
     let (raw_scheme, rest) =
@@ -1611,24 +1611,12 @@ fn build_realm_config(settings: &serde_json::Value) -> io::Result<realm::Config>
             ));
         }
     }
-    // Go RealmConfig.TlsConfig（transport_finalmask.go:1011，Build :1077-1082；
-    // 消费 realm/client.go:65、server.go:89 NewClient(..., TlsConfig) 定形隧道
-    // TLS）：Rust 端 TLS 细节仅由 scheme 承载（use_tls），完整 TLS 配置无对应
-    // 能力——非 null 显式拒绝而非静默忽略；null/缺省 Go 侧同为 nil 无操作，放行。
-    if settings.get("tlsConfig").is_some_and(|x| !x.is_null()) {
-        return Err(mask_err(
-            "realm: \"tlsConfig\" is not supported by this build; remove the key",
-        ));
-    }
-    Ok(realm::Config {
-        scheme: scheme.to_string(),
-        host,
-        port,
-        token,
-        id,
-        stun_servers,
-        use_tls: scheme == "https",
-    })
+    // Go RealmConfig.TlsConfig（transport_finalmask.go:1011，Build :1064-1072；
+    // 消费 realm/http.go:84-90 `tr.TLSClientConfig = tlsConfig.GetTLSConfig()`）：
+    // 解析为结构化 realm::tls::TlsConfig 并在 new_client 应用（字段对齐表见
+    // realm/tls.rs）。缺省/null → None（reqwest 默认 rustls 路径，与旧行为一致）。
+    let tls = realm::tls::parse_tls_config(settings.get("tlsConfig"), &host)?;
+    Ok(realm::Config { scheme: scheme.to_string(), host, port, token, id, stun_servers, tls })
 }
 
 /// `udphop` settings → [`udphop::UdphopConfig`]（对齐 Go `UDPHop.Build`，
@@ -2605,14 +2593,14 @@ mod tests {
         assert_eq!(cfg.port, "8443");
         assert_eq!(cfg.token, "secret+tok"); // percent-decode
         assert_eq!(cfg.id, "peer-id");
-        assert!(cfg.use_tls);
+        assert!(cfg.tls.is_none());
         // realm+http 缺省端口 80
         let http = build_realm_config(&fm(
             r#"{"url":"realm+http://tok@h.example.com/p","stunServers":["s:1"]}"#,
         ))
         .unwrap();
         assert_eq!((http.scheme.as_str(), http.port.as_str()), ("http", "80"));
-        assert!(!http.use_tls);
+        assert!(http.tls.is_none());
         // 缺 stunServers 报错（对齐 Go）
         assert!(build_realm_config(&fm(r#"{"url":"realm://t@h.com/id"}"#)).is_err());
     }
@@ -2781,25 +2769,62 @@ mod tests {
         .unwrap();
     }
 
-    /// Go RealmConfig.TlsConfig（transport_finalmask.go:1011，Build :1077-1082，
-    /// 消费 realm/client.go:65）：Rust 仅 use_tls，非 null 指名键硬错；null/缺省放行。
+    /// Go RealmConfig.TlsConfig（transport_finalmask.go:1011，Build :1064-1072 →
+    /// realm/http.go:84-90 `tr.TLSClientConfig = tlsConfig.GetTLSConfig()`）：
+    /// 结构化解析生效（realm/tls.rs 字段对齐表）；缺省/null → None 向后兼容
+    /// （reqwest 默认路径 = 旧行为）；allowInsecure 按 Go 移除语义硬错；
+    /// serverName 覆盖 ≠ url host 硬错。
     #[test]
-    fn realm_tls_config_rejects_non_null_passes_absent() {
-        let err = match build_udpmask_entry(&fm(
-            r#"{"type":"realm","settings":{"url":"realm://t@h.example.com/i",
-                "stunServers":["s.example.com:3478"],"tlsConfig":{"serverName":"h.example.com"}}}"#,
-        )) {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("expected tlsConfig reject"),
-        };
-        assert!(err.contains("tlsConfig"), "got: {err}");
-        build_udpmask_entry(&fm(
-            r#"{"type":"realm","settings":{"url":"realm://t@h.example.com/i","stunServers":["s.example.com:3478"]}}"#,
+    #[allow(clippy::err_expect)] // 同 parse_json_realm_ip_mode_and_port_mapping_rejected_loudly：realm::Config 无 Debug，禁 expect_err
+    fn realm_tls_config_structured_parses_defaults_pass_and_rejects_loudly() {
+        let absent = build_realm_config(&fm(
+            r#"{"url":"realm://t@h.example.com/i","stunServers":["s.example.com:3478"]}"#,
         ))
         .unwrap();
-        build_udpmask_entry(&fm(r#"{"type":"realm","settings":{"url":"realm://t@h.example.com/i",
-                "stunServers":["s.example.com:3478"],"tlsConfig":null}}"#))
+        assert!(absent.tls.is_none());
+        let null_cfg = build_realm_config(&fm(
+            r#"{"url":"realm://t@h.example.com/i","stunServers":["s.example.com:3478"],"tlsConfig":null}"#,
+        ))
         .unwrap();
+        assert!(null_cfg.tls.is_none());
+
+        // 结构化字段生效（serverName == url host = 无操作放行）
+        let settings = format!(
+            r#"{{"url":"realm://t@h.example.com/i","stunServers":["s.example.com:3478"],
+                "tlsConfig":{{"serverName":"h.example.com","alpn":["h2"],
+                             "disableSystemRoot":true,"minVersion":"1.3",
+                             "pinnedPeerCertSha256":"{}"}}}}"#,
+            "a".repeat(64)
+        );
+        let cfg = build_realm_config(&fm(&settings)).unwrap();
+        let tls = cfg.tls.as_ref().expect("tlsConfig parsed");
+        assert_eq!(tls.alpn, vec!["h2"]);
+        assert_eq!(tls.pinned_peer_cert_sha256, vec![vec![0xaa; 32]]);
+        assert!(tls.disable_system_root);
+        assert_eq!(tls.min_version, Some(realm::tls::MinTlsVersion::Tls13));
+
+        // wrapper 层通透：结构化 tlsConfig 进 udpmask entry 不再指名拒绝
+        build_udpmask_entry(&fm(r#"{"type":"realm","settings":{"url":"realm://t@h.example.com/i",
+                "stunServers":["s.example.com:3478"],"tlsConfig":{"alpn":["h2","http/1.1"]}}}"#))
+        .unwrap();
+
+        // allowInsecure → 硬错（Go transport_security.go:362-364 移除特性）
+        let e = build_realm_config(&fm(
+            r#"{"url":"realm://t@h.example.com/i","stunServers":["s.example.com:3478"],
+                "tlsConfig":{"allowInsecure":true}}"#,
+        ))
+        .err()
+        .expect("allowInsecure must reject");
+        assert!(e.to_string().contains("allowInsecure"), "{e}");
+
+        // serverName 覆盖 ≠ url host → 硬错（reqwest 无法解耦 SNI 与连接主机）
+        let e = build_realm_config(&fm(
+            r#"{"url":"realm://t@h.example.com/i","stunServers":["s.example.com:3478"],
+                "tlsConfig":{"serverName":"other.example.com"}}"#,
+        ))
+        .err()
+        .expect("serverName override must reject");
+        assert!(e.to_string().contains("serverName"), "{e}");
     }
 
     /// Go XDNSDomain.Names[]（transport_finalmask.go:813，Build :841-858）：一项

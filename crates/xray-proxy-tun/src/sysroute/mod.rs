@@ -30,7 +30,10 @@
 
 pub mod executor;
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 pub use executor::{
     Cmd, DnsExecutor, LinuxDns, LinuxRoutes, Recording, RouteExecutor, WindowsDns, WindowsRoutes,
@@ -248,6 +251,83 @@ pub fn select_outbound_interface(interfaces: &[Interface], tun_index: u32) -> Op
     best.map(|(iface, _)| iface)
 }
 
+// ===== 出站接口绑定（Go InterfaceUpdater + RegisterDialerController，handler.go:130-164）=====
+
+/// 出站绑定状态：物理网卡索引。对应 Go `InterfaceUpdater.iface`（config.go:14-21）
+/// 的最小版（只存 index）。Go 在路由/链路变化时 `Update()` 重选，Rust 无监控器，
+/// 仅 Start 时选一次——动态重选留后续票。
+static OUTBOUND_IFACE_INDEX: parking_lot::RwLock<Option<u32>> = parking_lot::RwLock::new(None);
+
+/// controller 进程级只注册一次的闸。Go 每次 Start 追加注册一个读同一包级
+/// `updater` 的闭包；Rust 状态收敛进 [`OUTBOUND_IFACE_INDEX`]，闭包无状态，
+/// 重复注册只添冗余。
+static OUTBOUND_CONTROLLER_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// 更新出站绑定状态。`None` = 解除（TUN 关闭/回滚/换配置重启后，dialer
+/// controller 变 no-op，拨号回归系统路由表）。
+pub(crate) fn set_outbound_iface(index: Option<u32>) {
+    *OUTBOUND_IFACE_INDEX.write() = index;
+}
+
+/// 注册出站绑定 controller（幂等）。对应 Go `internet.RegisterDialerController`
+/// （handler.go:145 同款忽略返回值——当前实现恒 `Ok`）。
+pub(crate) fn ensure_outbound_controller_registered() {
+    if !OUTBOUND_CONTROLLER_REGISTERED.swap(true, Ordering::Relaxed) {
+        let _ =
+            xray_transport::system_dialer::register_dialer_controller(outbound_iface_controller());
+    }
+}
+
+/// 绑定决策（纯函数，测试面）：状态在位且目标非 loopback → 绑定该索引。
+/// loopback 跳过 = Go handler.go:145-147（`addrPort.Addr().IsLoopback()` ||
+/// `"localhost:"` 前缀；Rust 拨号前已解析为 IP，localhost 字符串形态不存在）。
+fn iface_bind_decision(state: Option<u32>, dest: &SocketAddr) -> Option<u32> {
+    if dest.ip().is_loopback() {
+        return None;
+    }
+    state
+}
+
+/// 出站绑定 controller：读 [`OUTBOUND_IFACE_INDEX`]，跳过 loopback，把 socket
+/// 绑到物理网卡（freedom 出站不再绕回 TUN 自身）。Go 关闭后仍绑最后一次
+/// 选中的 iface，此处清零后 no-op——语义差异（更干净）记录于报告。
+fn outbound_iface_controller() -> xray_transport::system_dialer::DialerController {
+    std::sync::Arc::new(move |socket, dest| {
+        match iface_bind_decision(*OUTBOUND_IFACE_INDEX.read(), dest) {
+            None => Ok(()),
+            Some(index) => {
+                xray_transport::sockopt::bind_socket_to_interface(socket, index, dest.is_ipv4())
+            },
+        }
+    })
+}
+
+/// 物理出口接口解析（Go `findOutboundInterface`，tun_windows.go:578 /
+/// tun_linux.go:511）。`"auto"` 走 [`select_outbound_interface`]（排除回环/
+/// 未 Up/TUN 自身/索引 0）；其余值 = 固定网卡名按名查找，命中 TUN 自身拒绝
+/// （Go Linux 语义，tun_linux.go:519-521；Go Windows 缺该校验，Rust 从严）。
+/// 返回 (名字, 索引)。
+pub fn resolve_outbound_interface(
+    interfaces: &[Interface],
+    tun_index: u32,
+    mode: &str,
+) -> Result<(String, u32)> {
+    if mode == "auto" {
+        return select_outbound_interface(interfaces, tun_index)
+            .map(|i| (i.name.clone(), i.index))
+            .ok_or_else(|| TunError::DeviceNotFound("no usable outbound interface found".into()));
+    }
+    let iface = interfaces.iter().find(|i| i.name == mode).ok_or_else(|| {
+        TunError::DeviceNotFound(format!("outbound interface {mode:?} not found"))
+    })?;
+    if iface.index == tun_index {
+        return Err(TunError::InvalidConfig(
+            "outbound interface cannot be the TUN interface".into(),
+        ));
+    }
+    Ok((iface.name.clone(), iface.index))
+}
+
 /// A4：按平台生成 DNS 计划（见 `dns_wanted` 的平台分派）。
 pub fn plan_dns(platform: Platform, options: &StackOptions) -> Result<Option<DnsPlan>> {
     match platform {
@@ -351,6 +431,79 @@ pub(crate) fn prepare(options: &StackOptions) -> Result<Option<AppliedSystemChan
     apply_changes_exec(&applied, routes.as_deref(), dns.as_deref())?;
     register_dns_skip(&applied);
     Ok(Some(applied))
+}
+
+/// Go startOver（tun_windows.go:141-152）的缩范围版：尝试 2 次、间隔 1s。
+#[cfg(target_os = "windows")]
+const ADAPTER_PROPS_ATTEMPTS: u32 = 2;
+#[cfg(target_os = "windows")]
+const ADAPTER_PROPS_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Windows 适配器属性残余项的命令渲染（cv3w 纯函数面，测试断言命令行文本）。
+///
+/// Go `ipif.RouterDiscoveryBehavior = RouterDiscoveryDisabled`（tun_windows.go:180）
+/// 的 CLI 等价；IP/`NLMTU`/`UseAutomaticMetric=false + Metric=0` 已由 tun-rs
+/// builder（`ipv4`/`mtu`/`metric`，`CreateUnicastIpAddressEntry` /
+/// `SetIpInterfaceEntry` API 面）覆盖，无需 netsh 重复。仅 IPv4：IPv6 禁用的
+/// 系统上无 v6 接口条目，命令必败（Go 对该场景显式 skip 该族）。
+///
+/// 结构化 args 直接传进程（无 shell 解析），接口名含空格也安全，不加引号
+/// （与 [`executor`] 的 netsh 渲染约定一致）。
+#[cfg(target_os = "windows")]
+pub(crate) fn adapter_props_cmds(interface: &str) -> Vec<executor::Cmd> {
+    vec![executor::Cmd::new(
+        "netsh",
+        vec![
+            "interface".into(),
+            "ipv4".into(),
+            "set".into(),
+            "interface".into(),
+            // netsh `set interface` 的接口是**位置参数**（`set interface [interface=]<string>`），
+            // 没有 `name=` 参数——用 name= 会报 "name is not a valid argument"。
+            format!("interface={interface}"),
+            "routerdiscovery=disabled".into(),
+        ],
+    )]
+}
+
+/// 重试循环（纯逻辑，[`std::thread::sleep`] 由参数注入以便测试）：至多
+/// `attempts` 次调用 `try_once`，相邻尝试之间 sleep `backoff`；任一次成功即真。
+/// 最后一次失败后不再 sleep。
+pub(crate) fn retry_with_backoff(
+    attempts: u32,
+    backoff: std::time::Duration,
+    mut try_once: impl FnMut() -> bool,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> bool {
+    for attempt in 0..attempts {
+        if try_once() {
+            return true;
+        }
+        if attempt + 1 < attempts {
+            sleep(backoff);
+        }
+    }
+    false
+}
+
+/// 启动侧接线：设 TUN 适配器属性（[`adapter_props_cmds`]）。失败不致命——
+/// 适配器刚建时 IP 接口条目可能暂不可枚举，重试（[`ADAPTER_PROPS_ATTEMPTS`]）
+/// 仍失败仅记 error 继续启动（完整 startOver 15×1s 致命重试留待后续票）。
+#[cfg(target_os = "windows")]
+pub(crate) fn apply_adapter_props(interface: &str) {
+    let cmds = adapter_props_cmds(interface);
+    let ok = retry_with_backoff(
+        ADAPTER_PROPS_ATTEMPTS,
+        ADAPTER_PROPS_BACKOFF,
+        || cmds.iter().all(|cmd| cmd.run().is_ok()),
+        std::thread::sleep,
+    );
+    if !ok {
+        tracing::error!(
+            target: "xray_proxy_tun", interface = %interface,
+            "tun adapter props (routerdiscovery) failed after retries; continuing (non-fatal)"
+        );
+    }
 }
 
 /// 把本次接管的 DNS 服务器登记进进程级 skip 集合（Go `internet.SkipDNSServers`，
@@ -941,5 +1094,143 @@ mod tests {
         });
         assert!(skip_hits("192.168.100.2"));
         assert!(!skip_hits("192.168.100.1"), "源地址不是解析器指向");
+    }
+
+    // ===== cv3w：适配器属性命令渲染 + 重试纯逻辑 =====
+
+    /// 命令构造：netsh routerdiscovery=disabled，结构化 args 无引号（netsh 渲染约定）。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn adapter_props_commands_render_netsh_routerdiscovery() {
+        let cmds = adapter_props_cmds("xray0");
+        assert_eq!(
+            render(&cmds),
+            vec!["netsh interface ipv4 set interface interface=xray0 routerdiscovery=disabled"]
+        );
+    }
+
+    #[test]
+    fn retry_with_backoff_stops_on_first_success_without_sleep() {
+        let mut calls = 0u32;
+        let mut sleeps = Vec::new();
+        let ok = retry_with_backoff(
+            2,
+            std::time::Duration::from_secs(1),
+            || {
+                calls += 1;
+                true
+            },
+            |d| sleeps.push(d),
+        );
+        assert!(ok);
+        assert_eq!(calls, 1);
+        assert!(sleeps.is_empty(), "首次成功不得 sleep");
+    }
+
+    #[test]
+    fn retry_with_backoff_sleeps_between_attempts_then_succeeds() {
+        let mut calls = 0u32;
+        let mut sleeps = Vec::new();
+        let ok = retry_with_backoff(
+            3,
+            std::time::Duration::from_secs(1),
+            || {
+                calls += 1;
+                calls >= 2
+            },
+            |d| sleeps.push(d),
+        );
+        assert!(ok);
+        assert_eq!(calls, 2);
+        assert_eq!(sleeps, vec![std::time::Duration::from_secs(1)]);
+    }
+
+    #[test]
+    fn retry_with_backoff_exhausts_attempts_without_final_sleep() {
+        let mut calls = 0u32;
+        let mut sleeps = Vec::new();
+        let ok = retry_with_backoff(
+            2,
+            std::time::Duration::from_secs(1),
+            || {
+                calls += 1;
+                false
+            },
+            |d| sleeps.push(d),
+        );
+        assert!(!ok);
+        assert_eq!(calls, 2, "至多 attempts 次尝试");
+        assert_eq!(sleeps, vec![std::time::Duration::from_secs(1)], "末次失败后不再 sleep");
+    }
+
+    // ===== AI4：出站接口绑定（Go handler.go:130-164）=====
+
+    /// 验收⑤①（选择层）：auto 模式排除 TUN 自身，选出 Up 的物理网卡 index。
+    #[test]
+    fn resolve_auto_selects_physical_nic_excluding_tun() {
+        let (name, index) =
+            resolve_outbound_interface(&tun_and_eth(), 24, "auto").expect("resolve");
+        assert_eq!((name.as_str(), index), ("eth0", 5));
+    }
+
+    /// auto 模式：除 TUN 外无候选（全回环/未 Up）→ 显式报错（宁可无 TUN）。
+    #[test]
+    fn resolve_auto_without_candidate_errors() {
+        let only_tun = vec![iface(
+            "xray0",
+            24,
+            UP | InterfaceFlags::POINT_TO_POINT,
+            vec![v4_addr([10, 0, 0, 1], 24)],
+        )];
+        assert!(matches!(
+            resolve_outbound_interface(&only_tun, 24, "auto"),
+            Err(TunError::DeviceNotFound(_))
+        ));
+    }
+
+    /// 固定名：按名解析出 index；命中 TUN 自身 / 名字不存在 → 显式报错
+    /// （Go Linux tun_linux.go:519-521 语义；Go Windows 缺 TUN 自查，Rust 从严）。
+    #[test]
+    fn resolve_fixed_name_resolves_and_rejects_tun_self() {
+        assert_eq!(
+            resolve_outbound_interface(&tun_and_eth(), 24, "eth0").expect("resolve"),
+            ("eth0".to_string(), 5)
+        );
+        assert!(matches!(
+            resolve_outbound_interface(&tun_and_eth(), 24, "xray0"),
+            Err(TunError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            resolve_outbound_interface(&tun_and_eth(), 24, "nosuch"),
+            Err(TunError::DeviceNotFound(_))
+        ));
+    }
+
+    /// 验收⑤②：loopback 目标不绑（Go handler.go:145-147）；外部地址返回索引。
+    #[test]
+    fn bind_decision_skips_loopback_and_passes_external() {
+        let v4: SocketAddr = "127.0.0.1:53".parse().unwrap();
+        let v6: SocketAddr = "[::1]:53".parse().unwrap();
+        let ext: SocketAddr = "8.8.8.8:443".parse().unwrap();
+        assert_eq!(iface_bind_decision(Some(5), &v4), None);
+        assert_eq!(iface_bind_decision(Some(5), &v6), None);
+        assert_eq!(iface_bind_decision(Some(5), &ext), Some(5));
+    }
+
+    /// 验收⑤④（前半）：状态清零（TUN 关闭）→ 决策恒 None（controller no-op，
+    /// 拨号回归系统路由表）。
+    #[test]
+    fn bind_decision_cleared_state_is_noop() {
+        let ext: SocketAddr = "8.8.8.8:443".parse().unwrap();
+        assert_eq!(iface_bind_decision(None, &ext), None);
+    }
+
+    /// 验收⑤④（后半）：controller 注册幂等——重复 ensure 不再追加。
+    #[test]
+    fn outbound_controller_registration_is_idempotent() {
+        ensure_outbound_controller_registered();
+        let len = xray_transport::system_dialer::registered_controllers().len();
+        ensure_outbound_controller_registered();
+        assert_eq!(xray_transport::system_dialer::registered_controllers().len(), len);
     }
 }

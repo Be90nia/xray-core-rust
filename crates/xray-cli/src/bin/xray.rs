@@ -184,6 +184,9 @@ enum Command {
     },
 
     /// Encode and decode Base64.
+    // 组 Long 对齐 Go CmdBase64.Long（挂变体 attr：变体 doc 派生的 .long_about(None)
+    // 会清掉 Base64Command enum 层的 about，clap_derive-4.6.1 subcommand.rs 同机制）。
+    #[command(long_about = "xray base64 provides tools to encode and decode arbitrary bytes.")]
     Base64 {
         #[command(subcommand)]
         command: base64::Base64Command,

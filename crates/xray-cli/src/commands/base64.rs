@@ -17,17 +17,49 @@ pub const PREFIX: &str = "base64:";
 /// Go `common/base64.GzipPrefix`。
 pub const GZIP_PREFIX: &str = "base64+gzip:";
 
-/// `xray base64` 子命令组。
+/// `xray base64` 子命令组（help 文案对齐 Go `CmdBase64`；组 Long 见 bin 层 variant attr）。
 #[derive(Subcommand, Debug)]
 pub enum Base64Command {
     /// Encode as Base64.
+    ///
+    /// Go `cmdEncode`：UsageLine/Long 原文见 attrs。attr 必须挂变体：clap_derive 对
+    /// newtype 变体在 `augment_args` 之后再应用变体 doc 派生的 `.long_about(None)`，
+    /// struct 层 `long_about` 会被清掉（clap_derive-4.6.1 subcommand.rs:315-321）。
+    #[command(
+        override_usage = "xray base64 encode [-gzip] <input-file | - | stdin:>",
+        long_about = "\
+Encode input-file as Base64 with the base64: prefix.
+Pass \"-\" or \"stdin:\" to read stdin.
+Use -gzip to compress and output base64+gzip:.
+
+Examples:
+
+\txray base64 encode input.bin
+\txray base64 encode -gzip input.bin"
+    )]
     Encode(EncodeArgs),
 
     /// Decode Base64.
+    ///
+    /// Go `cmdDecode`：UsageLine/Long 原文见 attrs（挂变体原因同上）。
+    #[command(
+        override_usage = "xray base64 decode [-gzip] <value | - | stdin:> [output-file]",
+        long_about = "\
+Decode a Base64 value, or pass \"-\" or \"stdin:\" to read stdin.
+Write to output-file, or stdout if omitted.
+Accepts base64:, base64+gzip:, or no prefix; gzip is enabled by base64+gzip: or -gzip.
+
+Examples:
+
+\txray base64 decode eA== out.bin
+\txray base64 decode -gzip H4sIAAAAAAAC/6sAAIMW3IwBAAAA out.bin"
+    )]
     Decode(DecodeArgs),
 }
 
-/// `xray base64 encode [-gzip] <input-file | - | stdin:>`。
+/// `xray base64 encode` 参数：`<input-file | - | stdin:>`，`-gzip` 开关。
+///
+/// 帮助文案由 `Base64Command::Encode` 变体 attrs 承载（见其注释）。
 #[derive(Args, Debug)]
 pub struct EncodeArgs {
     /// Input file, or `-`/`stdin:` to read stdin.
@@ -38,7 +70,9 @@ pub struct EncodeArgs {
     pub gzip: bool,
 }
 
-/// `xray base64 decode [-gzip] <value | - | stdin:> [output-file]`。
+/// `xray base64 decode` 参数：`<value | - | stdin:>` 与可选 `[output-file]`。
+///
+/// 帮助文案由 `Base64Command::Decode` 变体 attrs 承载（见其注释）。
 #[derive(Args, Debug)]
 pub struct DecodeArgs {
     /// Base64 value (with optional `base64:`/`base64+gzip:` prefix), or `-`/`stdin:`.
@@ -63,18 +97,22 @@ pub fn execute_base64(command: &Base64Command) -> Result<(), CliError> {
 fn execute_encode(args: &EncodeArgs) -> Result<(), CliError> {
     let data = read_input(&args.input)?;
     let value = encode_bytes(&data, args.gzip)
-        .map_err(|e| CliError::InvalidArgument(format!("failed to encode input: {e}")))?;
-    println!("{value}");
+        .map_err(|e| CliError::Fatal(format!("failed to encode input: {e}")))?;
+    // Go Fprintln 后显式查错（BrokenPipe 等 Fatalf exit 1，而非 Rust panic exit 101）。
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{value}")
+        .map_err(|e| CliError::Fatal(format!("failed to write encoded output: {e}")))?;
     Ok(())
 }
 
 fn execute_decode(args: &DecodeArgs) -> Result<(), CliError> {
     let raw = if args.value == "-" || args.value == "stdin:" {
-        let mut buf = String::new();
+        let mut buf = Vec::new();
         std::io::stdin()
-            .read_to_string(&mut buf)
-            .map_err(|e| CliError::InvalidArgument(format!("failed to read input: {e}")))?;
-        buf
+            .read_to_end(&mut buf)
+            .map_err(|e| CliError::Fatal(format!("failed to read input: {e}")))?;
+        // Go string 按字节承载：非法 UTF-8 不在读取层失败，留给 base64 解码报错（同 Go 归宿）。
+        String::from_utf8_lossy(&buf).into_owned()
     } else {
         args.value.clone()
     };
@@ -86,17 +124,12 @@ fn execute_decode(args: &DecodeArgs) -> Result<(), CliError> {
         value.to_string()
     };
     let data = decode_value(&prefixed)
-        .map_err(|e| CliError::InvalidArgument(format!("failed to decode input: {e}")))?;
-    match args.output.as_deref() {
-        Some(out) if out != "-" => std::fs::write(out, data).map_err(|e| {
-            CliError::InvalidArgument(format!("failed to write decoded output: {e}"))
-        })?,
-        _ => {
-            std::io::stdout().write_all(&data).map_err(|e| {
-                CliError::InvalidArgument(format!("failed to write decoded output: {e}"))
-            })?;
-        },
-    }
+        .map_err(|e| CliError::Fatal(format!("failed to decode input: {e}")))?;
+    let written = match args.output.as_deref() {
+        Some(out) if out != "-" => std::fs::write(out, data),
+        _ => std::io::stdout().write_all(&data),
+    };
+    written.map_err(|e| CliError::Fatal(format!("failed to write decoded output: {e}")))?;
     Ok(())
 }
 
@@ -135,11 +168,10 @@ fn read_input(spec: &str) -> Result<Vec<u8>, CliError> {
         let mut buf = Vec::new();
         std::io::stdin()
             .read_to_end(&mut buf)
-            .map_err(|e| CliError::InvalidArgument(format!("failed to read input: {e}")))?;
+            .map_err(|e| CliError::Fatal(format!("failed to read input: {e}")))?;
         Ok(buf)
     } else {
-        std::fs::read(spec)
-            .map_err(|e| CliError::InvalidArgument(format!("failed to read input: {e}")))
+        std::fs::read(spec).map_err(|e| CliError::Fatal(format!("failed to read input: {e}")))
     }
 }
 
@@ -152,6 +184,21 @@ mod tests {
     fn encode_plain_matches_go_prefix_form() {
         assert_eq!(encode_bytes(b"x", false).unwrap(), "base64:eA==");
         assert_eq!(encode_bytes(b"", false).unwrap(), "base64:");
+    }
+
+    /// Go 常量逐字拷贝核对（common/base64/base64.go Prefix/GzipPrefix）。
+    #[test]
+    fn prefixes_match_go_constants_verbatim() {
+        assert_eq!(PREFIX, "base64:");
+        assert_eq!(GZIP_PREFIX, "base64+gzip:");
+    }
+
+    /// 纯文本往返：encode("hello\n") → decode 还原（Go Encode/Decode 对称语义）。
+    #[test]
+    fn plain_roundtrip_hello_newline() {
+        let value = encode_bytes(b"hello\n", false).unwrap();
+        assert_eq!(value, "base64:aGVsbG8K");
+        assert_eq!(decode_value(&value).unwrap(), b"hello\n");
     }
 
     /// gzip 编码带 `base64+gzip:` 前缀且可解回原文（Go Encode(data, true) 语义）。

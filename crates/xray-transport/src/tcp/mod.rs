@@ -11,3 +11,12 @@ pub mod hub;
 pub fn register_tcp_transport() -> std::io::Result<()> {
     crate::listener_registry::register_transport_listener("tcp", hub::tcp_listen_fn())
 }
+
+/// 注册 TCP transport 的 unix 监听（对应 Go 各 hub `port==0` → `net.UnixAddr`）。
+///
+/// 必须在使用 `listener_registry::listen_unix("tcp", ...)` 之前调用。
+/// 重复调用返回 `Err(io::Error(AlreadyExists))`。
+#[cfg(unix)]
+pub fn register_tcp_unix_transport() -> std::io::Result<()> {
+    crate::listener_registry::register_transport_unix_listener("tcp", hub::tcp_unix_listen_fn())
+}

@@ -396,4 +396,40 @@ mod tests {
         assert_eq!(&buf, b"hey");
         echo.await.unwrap();
     }
+
+    /// AI7：tcp_race_dial 每个候选地址经 SystemDialer（→ dial_tcp_raw）过
+    /// DialerController——happy_eyeballs 是 dial_system 的域名预解析分支，
+    /// 不再有独立 socket 创建点；本测试钉住「竞速路径 controller 被调用」。
+    /// 魔数端口过滤隔离并行测试（AI4 同款）。
+    #[tokio::test]
+    async fn tcp_race_dial_runs_controllers() {
+        static SAW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        const PROBE_PORT: u16 = 59995;
+        crate::system_dialer::register_dialer_controller(Arc::new(
+            |_socket: &socket2::Socket, dest: &SocketAddr| {
+                if dest.port() == PROBE_PORT {
+                    SAW.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(())
+            },
+        ))
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", PROBE_PORT)).await.unwrap();
+        let dialer: Arc<dyn SystemDialer> =
+            Arc::new(crate::system_dialer::DefaultSystemDialer::new());
+        let cfg = HappyEyeballsConfig {
+            try_delay_ms: 1,
+            max_concurrent_try: 2,
+            ..HappyEyeballsConfig::default()
+        };
+        let ips = [IpAddr::from([127, 0, 0, 1])];
+        tcp_race_dial(dialer, None, &ips, Port::new(PROBE_PORT), &SocketOptions::default(), &cfg)
+            .await
+            .expect("single candidate race dial should succeed");
+        assert!(
+            SAW.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "controller 未被 happy_eyeballs 竞速路径调用"
+        );
+        drop(listener);
+    }
 }

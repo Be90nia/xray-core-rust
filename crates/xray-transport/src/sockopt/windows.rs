@@ -41,6 +41,21 @@ const IPPROTO_TCP: i32 = 6;
 #[link(name = "ws2_32")]
 unsafe extern "system" {
     fn setsockopt(s: usize, level: i32, optname: i32, optval: *const i32, optlen: i32) -> i32;
+    #[cfg(test)]
+    fn getsockopt(s: usize, level: i32, optname: i32, optval: *mut i32, optlen: *mut i32) -> i32;
+}
+
+/// 读回 int 选项（仅测试断言用：验证 set 真实落底、v4 值 network byte order）。
+#[cfg(test)]
+pub(crate) fn getsockopt_int(s: usize, level: i32, optname: i32) -> io::Result<i32> {
+    let mut val: i32 = 0;
+    let mut len = std::mem::size_of::<i32>() as i32;
+    // SAFETY: val/len 指向合法栈缓冲，选项为 i32 宽度。
+    let ret = unsafe { getsockopt(s, level, optname, &mut val, &mut len) };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(val)
 }
 
 pub(crate) fn setsockopt_int(s: usize, level: i32, optname: i32, val: i32) -> io::Result<()> {
@@ -126,6 +141,20 @@ mod tests {
 
     fn new_socket(ty: socket2::Type, proto: socket2::Protocol) -> socket2::Socket {
         socket2::Socket::new(socket2::Domain::IPV4, ty, Some(proto)).unwrap()
+    }
+
+    /// AI4：`bind_socket_to_interface` 真实落底——index 1（Windows loopback，
+    /// 恒定）写入 IP_UNICAST_IF。SET 要求 network byte order（我们写 0x01000000），
+    /// GET 读回规范化为 host order——round-trip 得 1 恰证明 Windows 把
+    /// network-order 编码解码为 ifindex 1（验收⑤①的 sockopt 层证据）。
+    #[test]
+    fn bind_socket_to_interface_sets_unicast_if_readback() {
+        let sock = new_socket(socket2::Type::STREAM, socket2::Protocol::TCP);
+        super::super::bind_socket_to_interface(&sock, 1, true)
+            .expect("IP_UNICAST_IF accepts loopback index 1");
+        let got = getsockopt_int(sock.as_raw_socket() as usize, IPPROTO_IP, IP_UNICAST_IF)
+            .expect("IP_UNICAST_IF readable after set");
+        assert_eq!(got, 1, "读回 host order = 写入的 network-order 0x01000000 被解码为 ifindex 1");
     }
 
     /// TFO 三态之「未配置」：`-1` 跳过一切 setsockopt，apply 恒 Ok。

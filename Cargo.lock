@@ -6631,6 +6631,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "uuid",
+ "webpki-roots 1.0.8",
  "xray-buf",
  "xray-common",
  "xray-crypto",

@@ -41,6 +41,11 @@ pub enum CliError {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
+    /// Go `base.Fatalf` 对齐：裸错误文本直写 stderr、退出码 1，不带变体前缀
+    /// （base64 等工具子命令的错误文本需与 Go 逐字同类）。
+    #[error("{0}")]
+    Fatal(String),
+
     /// UUID 解析失败。
     #[error("failed to parse UUID: {0}")]
     UuidParseFailed(String),

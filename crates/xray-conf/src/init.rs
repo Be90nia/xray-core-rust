@@ -20,7 +20,10 @@
 //! 本阶段以尽力解析的方式扫描；将来 `xray-app-dns` 强类型化后可改写。
 use std::sync::Arc;
 
-use xray_common::errors::{print_non_removal_deprecated_feature_warning, removed_feature_message};
+use xray_common::{
+    errors::{print_non_removal_deprecated_feature_warning, removed_feature_message},
+    net::transport::is_known_transport_protocol,
+};
 
 use crate::{
     config::Config,
@@ -241,7 +244,9 @@ fn is_known_dest_override(s: &str) -> bool {
 /// （allowInsecure 硬错）、`transport_method.go:759-762`（hysteria transport version）。
 fn check_stream_strictness(kind: &str, tag: &str, ss: &serde_json::Value) -> Result<(), LintError> {
     // 1) network：已移除 → 硬错；弃用未移除 → warn 继续（文案逐字对齐 Go）。
-    let net = ss.get("network").or_else(|| ss.get("method")).and_then(|v| v.as_str()).unwrap_or("");
+    // `method` 优先于 `network`（Go transport_internet.go:85-88：`if c.Method != nil {
+    // c.Network = c.Method }`——method 覆盖 network）。
+    let net = ss.get("method").or_else(|| ss.get("network")).and_then(|v| v.as_str()).unwrap_or("");
     match net.to_ascii_lowercase().as_str() {
         "http" | "h2" | "h3" => {
             return Err(LintError::Invalid(format!(
@@ -264,6 +269,19 @@ fn check_stream_strictness(kind: &str, tag: &str, ss: &serde_json::Value) -> Res
             "HTTPUpgrade transport (with ALPN http/1.1, etc.)",
             "XHTTP H2 & H3",
         ),
+        // 1b) 未知网络名 → 硬错（Go transport_internet.go:45-46 `default: return "",
+        //     errors.New("Config: unknown transport protocol: ", p)`）。Rust 此前**静默接受**
+        //     任意 network 名（`protocol_settings_key` 返 None → transport_json 落空 →
+        //     拨号期才报 "dialer not registered"），配置期无任何提示。已知名集合与
+        //     xray-transport 的 settings 键查找共用
+        //     `xray_common::net::transport::canonical_transport_protocol`（单一表）。
+        //     `net` 为空（network/method 均缺省）→ Go 走默认 "tcp"（同 :74
+        //     `config.ProtocolName = "tcp"`），不报错。
+        _ if !net.is_empty() && !is_known_transport_protocol(net) => {
+            return Err(LintError::Invalid(format!(
+                "{kind} '{tag}': Config: unknown transport protocol: {net}"
+            )));
+        },
         _ => {},
     }
 
@@ -880,6 +898,80 @@ mod tests {
             assert!(msg.contains("removed"), "network {net:?}: got: {msg}");
             assert!(msg.contains("ob"), "network {net:?}: tag missing: {msg}");
         }
+    }
+
+    #[test]
+    fn strictness_rejects_unknown_transport_protocol() {
+        let _g = TEST_LOCK.lock();
+        clear_stages();
+        register_builtin_stages();
+        // Go transport_internet.go:45-46：未知网络名硬错 "Config: unknown transport
+        // protocol: <p>"。Rust 此前静默接受 → 拨号期才报 "dialer not registered"。
+        for net in ["tcpx", "ws2", "nope"] {
+            let mut cfg = Config {
+                outbound_configs: vec![crate::config::OutboundDetourConfig {
+                    protocol: "vless".into(),
+                    tag: "ob".into(),
+                    stream_settings: Some(json!({ "network": net })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let err = post_process(&mut cfg)
+                .err()
+                .unwrap_or_else(|| panic!("network {net:?} must be rejected"));
+            let msg = err.to_string();
+            assert!(msg.contains("unknown transport protocol"), "network {net:?}: got: {msg}");
+            assert!(msg.contains(net), "network {net:?} name missing: {msg}");
+        }
+    }
+
+    #[test]
+    fn strictness_allows_known_transport_protocols() {
+        let _g = TEST_LOCK.lock();
+        clear_stages();
+        register_builtin_stages();
+        // Go transport_internet.go:19-44 的全部已知名（+ Rust 自有别名）必须放行。
+        for net in [
+            "tcp",
+            "raw",
+            "ws",
+            "websocket",
+            "grpc",
+            "httpupgrade",
+            "splithttp",
+            "xhttp",
+            "kcp",
+            "mkcp",
+            "hysteria",
+            "hysteria2",
+            "quic",
+            "domainsocket",
+            "reality",
+        ] {
+            let mut cfg = Config {
+                outbound_configs: vec![crate::config::OutboundDetourConfig {
+                    protocol: "vless".into(),
+                    tag: "ob".into(),
+                    stream_settings: Some(json!({ "network": net })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            post_process(&mut cfg)
+                .unwrap_or_else(|e| panic!("network {net:?} must be allowed: {e}"));
+        }
+        // 缺省（network/method 均无）→ Go 默认 "tcp"（transport_internet.go:74），不报错。
+        let mut cfg = Config {
+            outbound_configs: vec![crate::config::OutboundDetourConfig {
+                protocol: "vless".into(),
+                tag: "ob".into(),
+                stream_settings: Some(json!({ "security": "tls" })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        post_process(&mut cfg).expect("absent network must default to tcp");
     }
 
     #[test]

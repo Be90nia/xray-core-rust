@@ -17,6 +17,7 @@ pub mod conn;
 pub mod http;
 pub mod punch;
 pub mod stun;
+pub mod tls;
 
 pub use conn::{RealmConfig, RealmConnClient, RealmConnServer};
 pub use http::{
@@ -41,11 +42,13 @@ pub use stun::{
 ///   string token = 4;
 ///   string id = 5;
 ///   repeated string stun_servers = 6;
+///   xray.transport.internet.tls.Config tls_config = 7;
 /// }
 /// ```
 ///
-/// Go 端另有 `tls_config` 字段，Rust 端用 `use_tls: bool` 简化——TLS 协商细节
-/// 由 reqwest 默认 rustls connector 处理。
+/// `tls` 为 [`tls::TlsConfig`] 结构化信令 TLS 配置（`tlsConfig` JSON →
+/// `GetTLSConfig` 字段子集，见 `tls.rs` 对齐表）；`None` = 缺省，reqwest 默认
+/// rustls 路径（旧 `use_tls:true` 行为，向后兼容）。
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub scheme: String,
@@ -54,7 +57,7 @@ pub struct Config {
     pub token: String,
     pub id: String,
     pub stun_servers: Vec<String>,
-    pub use_tls: bool,
+    pub tls: Option<tls::TlsConfig>,
 }
 
 impl From<&Config> for RealmConfig {
@@ -66,7 +69,7 @@ impl From<&Config> for RealmConfig {
             token: c.token.clone(),
             id: c.id.clone(),
             stun_servers: c.stun_servers.clone(),
-            use_tls: c.use_tls,
+            tls: c.tls.clone(),
         }
     }
 }
@@ -108,7 +111,7 @@ mod tests {
             token: "tok".into(),
             id: "realm-x".into(),
             stun_servers: vec!["stun.l.google.com:19302".into()],
-            use_tls: true,
+            tls: Some(tls::TlsConfig { alpn: vec!["h2".into()], ..Default::default() }),
         };
         let r: RealmConfig = (&c).into();
         assert_eq!(r.scheme, "https");
@@ -117,7 +120,7 @@ mod tests {
         assert_eq!(r.token, "tok");
         assert_eq!(r.id, "realm-x");
         assert_eq!(r.stun_servers.len(), 1);
-        assert!(r.use_tls);
+        assert_eq!(r.tls.as_ref().map(|t| t.alpn.as_slice()), Some(&["h2".to_string()][..]));
     }
 
     #[test]
@@ -125,6 +128,6 @@ mod tests {
         let c = Config::default();
         let r: RealmConfig = (&c).into();
         assert!(r.scheme.is_empty());
-        assert!(!r.use_tls);
+        assert!(r.tls.is_none());
     }
 }

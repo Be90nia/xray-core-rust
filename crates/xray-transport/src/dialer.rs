@@ -139,8 +139,8 @@ impl StreamSettings {
             xray_common::log::warning(w);
         }
         let protocol = v
-            .get("network")
-            .or_else(|| v.get("method"))
+            .get("method")
+            .or_else(|| v.get("network"))
             .and_then(|n| n.as_str())
             .unwrap_or("tcp")
             .to_string();
@@ -151,7 +151,14 @@ impl StreamSettings {
         // xhttp 网络对应的 JSON 字段是 `xhttpSettings`（与 splithttpSettings
         // 都合法；客户端常混用）。 ponytail: 取两者之一，避免 xhttpSettings JSON
         // 字段被丢弃导致 splithttp 配置丢失（host/path/mode 等全部退化为默认 + dest
-        // fallback）。
+        // fallback）。 ponytail: 回退**仅限 xhttp/splithttp 协议**——Go 侧
+        // `XHTTPSettings` 只进 `splithttp` 的 TransportSettings（transport_internet.go:154-166），
+        // 别的协议拿不到它；此前全局回退会让 `network:"ws"` 且缺 `wsSettings` 的配置
+        // 静默吃下 xhttpSettings（映射串协议）。
+        let is_xhttp = matches!(
+            xray_common::net::transport::canonical_transport_protocol(&protocol),
+            Some(xray_common::net::transport::TransportProtocol::SplitHttp)
+        );
         let transport_json = protocol_settings_key(&protocol)
             .and_then(|k| {
                 if k == "tcpSettings" {
@@ -167,7 +174,7 @@ impl StreamSettings {
                     v.get(k).cloned()
                 }
             })
-            .or_else(|| v.get("xhttpSettings").cloned());
+            .or_else(|| if is_xhttp { v.get("xhttpSettings").cloned() } else { None });
         let security_json =
             v.get("tlsSettings").cloned().or_else(|| v.get("realitySettings").cloned());
         // Socket 选项（`sockopt`）与 finalmask 流量伪装配置。
@@ -505,19 +512,30 @@ fn parse_tproxy(v: &serde_json::Value) -> bool {
 /// 把 `network` 值映射到对应 JSON settings 字段名。
 ///
 /// Go `infra/conf/transport_internet.go::transportConfigCreator` 按字符串名注册 creator，
-/// JSON 字段名约定为 `<proto>Settings`。Rust 端镜像该映射。
+/// JSON 字段名约定为 `<proto>Settings`（Go 侧字段清单见 `transport_internet.go:59-70`：
+/// `rawSettings`/`tcpSettings`/`xhttpSettings`/`splithttpSettings`/`kcpSettings`/
+/// `grpcSettings`/`wsSettings`/`httpupgradeSettings`/`hysteriaSettings`/
+/// `masqueSettings`/`xdriveSettings`）。
+///
+/// 网络名 → 规范协议名的归一走 [`xray_common::net::transport::canonical_transport_protocol`]
+/// （与 xray-conf 的未知名硬错共用同一张表），此处只负责「协议名 → JSON 字段名」。
 fn protocol_settings_key(protocol: &str) -> Option<&'static str> {
-    match protocol {
-        "tcp" | "raw" => Some("tcpSettings"),
-        "kcp" | "mkcp" => Some("kcpSettings"),
-        "ws" | "websocket" => Some("wsSettings"),
-        "http" | "h2" | "grpc" => Some("grpcSettings"),
-        "httpupgrade" => Some("httpupgradeSettings"),
-        "splithttp" | "xhttp" => Some("splithttpSettings"),
-        "quic" => Some("quicSettings"),
-        "hysteria" | "hysteria2" => Some("hysteriaSettings"),
-        "domainsocket" => Some("dsSettings"),
-        _ => None,
+    use xray_common::net::transport::{TransportProtocol, canonical_transport_protocol};
+    match canonical_transport_protocol(protocol)? {
+        TransportProtocol::Tcp => Some("tcpSettings"),
+        TransportProtocol::Mkcp => Some("kcpSettings"),
+        TransportProtocol::Websocket => Some("wsSettings"),
+        TransportProtocol::Grpc => Some("grpcSettings"),
+        TransportProtocol::HttpUpgrade => Some("httpupgradeSettings"),
+        TransportProtocol::SplitHttp => Some("splithttpSettings"),
+        TransportProtocol::Quic => Some("quicSettings"),
+        TransportProtocol::Hysteria => Some("hysteriaSettings"),
+        TransportProtocol::DomainSocket => Some("dsSettings"),
+        TransportProtocol::Masque => Some("masqueSettings"),
+        TransportProtocol::XDrive => Some("xdriveSettings"),
+        // REALITY 在 Go 侧是 security 类型而非网络名（`tls.Config`），无 `<proto>Settings`
+        // 字段；Rust 的 reality transport 配置走 `realitySettings`（security 侧）。
+        TransportProtocol::Reality => None,
     }
 }
 
@@ -534,7 +552,7 @@ fn protocol_settings_key(protocol: &str) -> Option<&'static str> {
 fn removed_feature_warnings(v: &serde_json::Value) -> Vec<String> {
     let mut warnings = Vec::new();
     let protocol =
-        v.get("network").or_else(|| v.get("method")).and_then(|n| n.as_str()).unwrap_or("tcp");
+        v.get("method").or_else(|| v.get("network")).and_then(|n| n.as_str()).unwrap_or("tcp");
     match protocol.to_ascii_lowercase().as_str() {
         "http" | "h2" | "h3" => warnings.push(removed_feature_message(
             "HTTP transport (without header padding, etc.)",

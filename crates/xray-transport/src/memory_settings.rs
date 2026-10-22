@@ -144,8 +144,8 @@ pub fn to_memory_stream_config(json: Option<&serde_json::Value>) -> io::Result<M
     };
     let obj = v.as_object().ok_or_else(|| invalid("streamSettings: expected an object"))?;
     let protocol_name = obj
-        .get("network")
-        .or_else(|| obj.get("method"))
+        .get("method")
+        .or_else(|| obj.get("network"))
         .and_then(|n| n.as_str())
         .unwrap_or("tcp")
         .to_string();

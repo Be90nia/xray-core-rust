@@ -11,7 +11,7 @@ use std::{
     io,
     net::SocketAddr,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, LazyLock, OnceLock},
 };
 
 use parking_lot::RwLock;
@@ -131,6 +131,82 @@ pub async fn listen_tcp(
     }
 }
 
+// ===== Unix transport listen fn（Go tcp_hub.go::ListenUnix 侧）=====
+
+/// Unix domain socket transport 监听函数。
+///
+/// Go `ListenUnix`（tcp_hub.go:31-50）以 `net.Port(0)` 哨兵 + domain 地址复用
+/// `transportListenerCache`；Rust 既有 [`TransportListenFn`] 签名绑定 `SocketAddr`，
+/// 为不改兄弟 crate 的注册点，unix 走平行注册表，入口语义等价（按 protocol 查找调用）。
+pub type UnixTransportListenFn = Arc<
+    dyn Fn(
+            String, // unix 地址：/path、/path,0755、@abstract、@@abstract（system_listener 语义）
+            StreamSettings,
+            SocketOptions,
+            ConnHandler,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn TransportListener>>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Unix transport listener 注册表。
+static TRANSPORT_UNIX_LISTENER_CACHE: LazyLock<
+    RwLock<std::collections::HashMap<String, UnixTransportListenFn>>,
+> = LazyLock::new(|| RwLock::new(std::collections::HashMap::new()));
+
+/// 注册 transport 协议的 unix 监听函数。
+///
+/// 语义对齐 [`register_transport_listener`]：同名重复 → `AlreadyExists`。
+pub fn register_transport_unix_listener(
+    protocol: &str,
+    listen_fn: UnixTransportListenFn,
+) -> io::Result<()> {
+    let mut cache = TRANSPORT_UNIX_LISTENER_CACHE.write();
+    if cache.contains_key(protocol) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{protocol} unix listener already registered"),
+        ));
+    }
+    if cache.len() >= MAX_LISTENER_ENTRIES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("transport unix listener registry full ({MAX_LISTENER_ENTRIES})"),
+        ));
+    }
+    cache.insert(protocol.to_string(), listen_fn);
+    Ok(())
+}
+
+/// 按 protocol 名查找 unix transport listener。
+#[must_use]
+pub fn get_transport_unix_listener(protocol: &str) -> Option<UnixTransportListenFn> {
+    TRANSPORT_UNIX_LISTENER_CACHE.read().get(protocol).cloned()
+}
+
+/// 上层 transport unix 监听入口。对应 Go `transport/internet/tcp_hub.go::ListenUnix`
+/// （:31-50）：按 `settings.protocol` 查注册表调用注册的监听函数。
+///
+/// # 错误
+///
+/// - `NotFound`：protocol 未注册 unix 监听（Go：`"{protocol}  unix listener not registered."`）
+/// - listen_fn 内部错误透传
+pub async fn listen_unix(
+    addr: &str,
+    settings: StreamSettings,
+    sockopt: SocketOptions,
+    handler: ConnHandler,
+) -> io::Result<Box<dyn TransportListener>> {
+    let protocol = &settings.protocol;
+    match get_transport_unix_listener(protocol) {
+        Some(listen_fn) => listen_fn(addr.to_string(), settings, sockopt, handler).await,
+        None => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{protocol} unix listener not registered"),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +245,35 @@ mod tests {
         let sockopt = SocketOptions::default();
         let result = listen_tcp(addr, settings, sockopt, handler).await;
         assert!(matches!(result, Err(e) if e.kind() == io::ErrorKind::NotFound));
+    }
+
+    #[test]
+    fn unix_listen_fn_registers_and_dup_rejects() {
+        let listen_fn: UnixTransportListenFn =
+            Arc::new(|_, _, _, _| Box::pin(async { Err(io::Error::other("test")) }));
+        let _ = register_transport_unix_listener("test-unix-listener-protocol", listen_fn.clone());
+        assert!(get_transport_unix_listener("test-unix-listener-protocol").is_some());
+        let result = register_transport_unix_listener("test-unix-listener-protocol", listen_fn);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn unix_listen_fn_unregistered_returns_none() {
+        assert!(get_transport_unix_listener("nonexistent-unix-listener").is_none());
+    }
+
+    #[tokio::test]
+    async fn listen_unix_unregistered_returns_not_found() {
+        let handler: ConnHandler = Arc::new(|_| {});
+        let settings = StreamSettings::tcp();
+        let sockopt = SocketOptions::default();
+        let result = listen_unix("/nonexistent/xray-test.sock", settings, sockopt, handler).await;
+        let Err(e) = result else { panic!("expected NotFound, got a listener") };
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        assert!(
+            e.to_string().contains("unix listener not registered"),
+            "error text must mirror Go unix listener not registered, got: {e}"
+        );
     }
 }

@@ -191,15 +191,20 @@ const PROXY_OUTBOUND_KINDS: &[&str] = &[
 /// - 其他平台（Windows/macOS 等）：明确 platform 错误。registry 消费方 （instance.rs）对
 ///   StartFailed 是 warn+跳过，非致命。
 fn tun_factory(kind: &'static str) -> FeatureFactory {
-    if cfg!(any(target_os = "linux", target_os = "android", target_os = "freebsd")) {
+    if cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "windows"
+    )) {
         stub_factory(kind)
     } else {
         Arc::new(move |_data: &[u8]| {
             Err(FeatureError::StartFailed {
                 name: kind,
                 message: format!(
-                    "tun: not supported on {} (Rust port supports Linux/Android/FreeBSD; \
-                     Windows/macOS device adaptation pending)",
+                    "tun: not supported on {} (Rust port supports Linux/Android/FreeBSD/Windows; \
+                     macOS device adaptation pending)",
                     std::env::consts::OS
                 ),
             })
@@ -1083,7 +1088,12 @@ mod tests {
         );
         if let Err(FeatureError::StartFailed { name, message }) = result {
             assert_eq!(name, "tun");
-            if cfg!(any(target_os = "linux", target_os = "android", target_os = "freebsd")) {
+            if cfg!(any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "freebsd",
+                target_os = "windows"
+            )) {
                 assert!(message.contains("not yet implemented"), "got: {message}");
             } else {
                 assert!(message.contains("not supported"), "got: {message}");

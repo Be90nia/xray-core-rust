@@ -237,9 +237,34 @@ impl TunInboundHandler {
         if let Some(applied) = self.applied_sysroute.lock().take() {
             sysroute::revert(&applied);
         }
+        sysroute::set_outbound_iface(None);
         *self.device.lock() = None;
         let _ = device.close();
     }
+}
+
+/// 解析 `autoOutboundsInterface` 并登记出站绑定状态（Go handler.go:130-146：
+/// `updater.Update()` + `RegisterDialerController`）。配置缺省 = 清除状态并跳过
+/// （换配置重启不残留上一轮绑定；多 TUN 实例与 Go 同为全局单份，后启动覆盖）。
+fn configure_outbound_iface(
+    device: &Arc<TunDevice>,
+    cfg: &StackOptions,
+) -> std::result::Result<(), String> {
+    let Some(mode) = cfg.auto_outbounds_interface.as_deref() else {
+        sysroute::set_outbound_iface(None);
+        return Ok(());
+    };
+    let tun_index = device.index().map_err(|e| format!("tun device index lookup failed: {e}"))?;
+    let tun_index =
+        u32::try_from(tun_index).map_err(|_| "tun interface index out of range".to_string())?;
+    let interfaces = xray_common::net::interface::interfaces()
+        .map_err(|e| format!("interface enumeration failed: {e}"))?;
+    let (name, index) = sysroute::resolve_outbound_interface(&interfaces, tun_index, mode)
+        .map_err(|e| format!("outbound interface resolution failed: {e}"))?;
+    sysroute::set_outbound_iface(Some(index));
+    sysroute::ensure_outbound_controller_registered();
+    tracing::info!("[tun] outbound interface: {name} (index {index})");
+    Ok(())
 }
 
 #[async_trait]
@@ -280,6 +305,13 @@ impl InboundHandler for TunInboundHandler {
 
         *self.device.lock() = Some(Arc::clone(&device));
 
+        // cv3w：适配器属性残余项（RouterDiscovery=Disabled，Go tun_windows.go:174-199；
+        // IP/MTU/Metric=0 已由 TunDevice::create 的 builder 覆盖）。失败不致命：
+        // 适配器刚建时 IP 接口条目可能暂不可枚举——1s 后重试一次（Go startOver
+        // 15×1s 的缩范围版，完整重试留下一片），仍失败告警继续启动。
+        #[cfg(target_os = "windows")]
+        sysroute::apply_adapter_props(&cfg.name);
+
         // A3/A4：系统路由表 + 系统 DNS 接管——默认关闭（配置显式开启才动作）。
         // 接管失败宁可无 TUN（对齐 Go handler.go:196-205：失败即关设备拒启动）。
         match sysroute::prepare(cfg) {
@@ -290,6 +322,14 @@ impl InboundHandler for TunInboundHandler {
                     "tun system route/dns takeover failed: {e}"
                 )));
             },
+        }
+
+        // autoOutboundsInterface（Go handler.go:130-164）：出站 socket 绑物理
+        // 网卡，freedom 拨号不再命中 TUN 路由自绕。选不出出口 = 数据面必自绕，
+        // 宁可无 TUN（对齐本函数既有的接管失败语义）。
+        if let Err(e) = configure_outbound_iface(&device, cfg) {
+            self.rollback_start(&device);
+            return Err(InboundError::ListenError(e));
         }
 
         // Windows：WFP 泄漏阻断过滤器（Go tun_windows.go:254-272）——系统路由就绪
@@ -369,6 +409,9 @@ impl InboundHandler for TunInboundHandler {
         if let Some(applied) = self.applied_sysroute.lock().take() {
             sysroute::revert(&applied);
         }
+        // 出站绑定状态清零：controller 变 no-op，后续拨号回归系统路由表
+        // （Go Close 不清，语义差异记录于报告；Rust 全局残留会错绑新流量）。
+        sysroute::set_outbound_iface(None);
         // WFP 泄漏过滤器：drop 即关 engine → 动态会话的过滤器随之删除
         // （Go `closeWFPEngine(t.wfp)`，tun_windows.go:350-352）。顺序对齐 Go：
         // flush 路由 → 关 WFP engine → 设备下线。
@@ -406,10 +449,127 @@ const UDP_SESSION_SWEEP_SECS: u64 = 30;
 /// unbounded 的"无上界"为质变，且 owner task 正常消费速率远高于此。
 const UDP_SESSION_QUEUE_CAP: usize = 1024;
 
-/// cmd 队列满丢包计数（进程级累计，票 euv9；运维观测 + 单测断言）。
+/// cmd 队列满丢包计数（进程级累计，票 euv9：运维观测 + 单测断言）。
 static UDP_CMD_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// reply 队列满丢包计数（进程级累计，票 euv9）。
 static UDP_REPLY_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// 目的组播/广播包被丢弃计数（进程级累计，票 ijn7①：观测组播流量规模）。
+static UDP_MULTICAST_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// 处于 relay 失败冷却中的目的地址被丢弃计数（进程级累计，票 ijn7②）。
+static UDP_COOLDOWN_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// relay 失败后的**目的地址级**冷却表：键 = 目的 IP，值 = 冷却截止 wall-clock 纳秒。
+///
+/// 票 ijn7②：relay 失败（出站写失败 / 收包失败）后，同一目的地址在冷却窗内
+/// 不再新建会话与 dispatch——否则失败目的会被立刻重建（实测 Windows 上
+/// WSAENOBUFS 场景 ~50ms 一轮、1 分钟刷 1.2MB access log）。
+///
+/// Go 侧对照：`proxy/tun/udp_fullcone.go` 的 conn 按 src 分桶、失败即
+/// `connectionFinished` 删除（:74-81，注释「Close runs twice per flow; a newer
+/// conn may already own this src」）；Go 不会陷入重建循环，因为组播/广播
+/// 根本没被 OS 路由进 TUN（Rust 侧会收到，见 ijn7①），且 Go 的出站侧给组播
+/// 目标设了 `IP_MULTICAST_IF`（`transport/internet/sockopt_windows.go:51-56`）
+/// 使其发送成功而不报错。
+type FailedDsts = Arc<ParkMutex<HashMap<std::net::IpAddr, i64>>>;
+
+/// relay 失败冷却时长。
+///
+/// 取 5s：足够把「同一失败目的被立刻重建」的忙循环打断（实测重建周期
+/// ~50ms），又不至于让正常业务在失败后长时间不可用。
+const UDP_RELAY_FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// 目的地址是否处于 relay 失败冷却中（命中则不新建会话）。
+///
+/// 冷却到期（`now >= until`）的条目顺手清掉——表按失败目的增长，
+/// 不清理会无界。
+fn in_failure_cooldown(failed: &FailedDsts, dst_ip: std::net::IpAddr, now: i64) -> bool {
+    let mut map = failed.lock();
+    match map.get(&dst_ip) {
+        Some(&until) if now < until => true,
+        Some(_) => {
+            map.remove(&dst_ip);
+            false
+        },
+        None => false,
+    }
+}
+
+/// 记录一次 relay 失败 → 该目的地址进入冷却窗。
+fn note_relay_failure(failed: &FailedDsts, dst_ip: std::net::IpAddr) {
+    let until = now_nanos() + i64::try_from(UDP_RELAY_FAILURE_COOLDOWN.as_nanos()).unwrap_or(0);
+    failed.lock().insert(dst_ip, until);
+}
+
+/// UDP 包被拦在 relay 之外的原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UdpDropReason {
+    /// 目的组播/广播（票 ijn7①）。
+    MulticastOrBroadcast,
+    /// 目的地址处于 relay 失败冷却窗（票 ijn7②）。
+    FailureCooldown,
+}
+
+/// UDP 包是否放行进 relay；不放行时给出原因并计数。
+///
+/// 票 ijn7 的两处拦截点（唯一入口，`handle_udp_packet` 调用）：
+/// - ① 目的组播/广播：SSDP `239.255.255.250:1900`、mDNS `[ff02::1:3]:5355` 等不是可代理流量，进
+///   relay 只会让 freedom 在 Windows 上以 WSAENOBUFS(10055) 失败。
+/// - ② 失败目的冷却：relay 刚失败过的目的地址在冷却窗内不再新建会话， 避免「失败 →
+///   立刻重建」的忙循环（实测 ~50ms 一轮、1 分钟 1.2MB 日志）。
+fn udp_relay_gate(meta: &UdpPacketMeta, failed: &FailedDsts) -> Option<UdpDropReason> {
+    if crate::netstack::is_multicast_or_broadcast_dst(&meta.dst.addr) {
+        UDP_MULTICAST_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        return Some(UdpDropReason::MulticastOrBroadcast);
+    }
+    let dst_ip = match meta.dst.addr {
+        smoltcp::wire::IpAddress::Ipv4(v4) => {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::from(v4.octets()))
+        },
+        smoltcp::wire::IpAddress::Ipv6(v6) => {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(v6.octets()))
+        },
+    };
+    if in_failure_cooldown(failed, dst_ip, now_nanos()) {
+        UDP_COOLDOWN_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        return Some(UdpDropReason::FailureCooldown);
+    }
+    None
+}
+
+/// relay 失败后的收尾：目的地址进入冷却窗 + 会话从 map 摘除。
+///
+/// 摘除 map 条目 = Go `udp_fullcone.go:connectionFinished`（:74-81）的语义：
+/// 连接结束时把它从 `udpConns` 摘掉（注释「a newer conn may already own this
+/// src」——故只摘**本会话自己的**条目，不误删同 src 的新会话）。
+///
+/// 摘除后同一 src 的下一个包会重建会话——但目的地址已在冷却窗内，
+/// `handle_udp_packet` 会直接丢弃，不再进入 relay（票 ijn7② 的防忙重建）。
+fn on_relay_failure(
+    failed: &FailedDsts,
+    sessions: &UdpSessions,
+    entry: &std::sync::Weak<UdpSessionEntry>,
+    original_dst: IpEndpoint,
+) {
+    let dst_ip = match original_dst.addr {
+        smoltcp::wire::IpAddress::Ipv4(v4) => {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::from(v4.octets()))
+        },
+        smoltcp::wire::IpAddress::Ipv6(v6) => {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(v6.octets()))
+        },
+    };
+    note_relay_failure(failed, dst_ip);
+    // 只摘本会话自己的条目（Go 同款「a newer conn may already own this src」）。
+    // 用 Weak：owner task 不得因持有强引用而让 map 条目的 cmd_tx 提前存活
+    // （否则 sweep 摘除条目后 owner task 收不到 channel 关闭 → 会话泄漏）。
+    let Some(entry) = entry.upgrade() else { return };
+    let mut map = sessions.lock();
+    if let Some(current) = map.get(&entry.src) {
+        if Arc::ptr_eq(current, &entry) {
+            map.remove(&entry.src);
+        }
+    }
+}
 
 /// per-source UDP session 存储（full-cone NAT，key = IP+UDP 源端点）。
 ///
@@ -430,6 +590,8 @@ struct UdpSessionEntry {
     /// 客户端包入队口（非阻塞；owner task 顺序消费转发 outbound）。
     /// 票 euv9：bounded——满时由 [`try_enqueue_cmd`] 丢包计数，内存有硬顶。
     cmd_tx: mpsc::Sender<SessionCmd>,
+    /// 本会话的源端点（= map 的键）——失败收尾时据此定位并摘除自己的条目。
+    src: IpEndpoint,
     /// 最近一次命中的 wall-clock 纳秒（std::time::SystemTime 测得）。
     /// sweep 任务对比 `now - last_used > 60s` 决定淘汰。
     last_used_nanos: AtomicI64,
@@ -489,6 +651,8 @@ async fn tun_driver_loop(
     // 均不预先创建 smoltcp socket。
     let udp_sessions: UdpSessions = Arc::new(ParkMutex::new(HashMap::new()));
     let _udp_sweeper = spawn_udp_session_sweeper(Arc::clone(&udp_sessions));
+    // 票 ijn7②：relay 失败的目的地址冷却表（防失败目的被立刻重建）。
+    let failed_dsts: FailedDsts = Arc::new(ParkMutex::new(HashMap::new()));
 
     tracing::debug!("tun driver main loop started");
 
@@ -512,6 +676,7 @@ async fn tun_driver_loop(
                             if let Some((meta, payload)) = parse_udp_packet(pkt) {
                                 handle_udp_packet(
                                     &udp_sessions,
+                                    &failed_dsts,
                                     meta,
                                     payload,
                                     Arc::clone(&dispatch),
@@ -645,29 +810,53 @@ async fn write_tx_back(device: &TunDevice, tx_pkts: Vec<Vec<u8>>) {
 /// recv 完成（票 8gr6：channel 化，收发无互斥）。
 fn handle_udp_packet(
     sessions: &UdpSessions,
+    failed: &FailedDsts,
     meta: UdpPacketMeta,
     payload: &[u8],
     dispatch: Arc<dyn DispatchHandler>,
     device: Arc<TunDevice>,
 ) {
+    // 票 ijn7：目的组播/广播不进 relay；relay 刚失败过的目的地址在冷却窗内
+    // 也不再新建会话（防「失败 → 立刻重建」的忙循环）。判定与计数在
+    // [`udp_relay_gate`]（唯一入口，可单测）。
+    //
+    // 实测（Windows wintun，2026-10-22）：SSDP `239.255.255.250:1900` 与
+    // mDNS `[ff02::1:3]:5355` 被 TUN 收下 → 进 relay → freedom UDP 外发在
+    // Windows 上以 WSAENOBUFS(10055) 失败 → 会话失败 → 每个新源端口重建 →
+    // ~50ms 一轮、1 分钟 1.2MB access log。
+    if let Some(reason) = udp_relay_gate(&meta, failed) {
+        tracing::debug!(src = %meta.src, dst = %meta.dst, ?reason, "tun udp: packet dropped before relay");
+        return;
+    }
+
     // 懒建 session：按 src 找；不在则建（含 owner task 一次性 spawn）。
     // p14e：last_used_nanos 初始化为当前 wall-clock，避免刚建的 session
     // 被下一次 sweep 误判为已空闲 60s。
     let entry = {
         let mut map = sessions.lock();
-        map.entry(meta.src)
-            .or_insert_with(|| {
+        match map.get(&meta.src) {
+            Some(existing) => Arc::clone(existing),
+            None => {
                 let (cmd_tx, cmd_rx) = mpsc::channel(UDP_SESSION_QUEUE_CAP);
+                let entry = Arc::new(UdpSessionEntry {
+                    cmd_tx,
+                    src: meta.src,
+                    last_used_nanos: AtomicI64::new(now_nanos()),
+                });
                 spawn_udp_session_task(
                     Arc::clone(&dispatch),
                     cmd_rx,
                     Arc::clone(&device),
                     meta.src,
                     meta.dst,
+                    Arc::clone(sessions),
+                    Arc::clone(failed),
+                    Arc::downgrade(&entry),
                 );
-                Arc::new(UdpSessionEntry { cmd_tx, last_used_nanos: AtomicI64::new(now_nanos()) })
-            })
-            .clone()
+                map.insert(meta.src, Arc::clone(&entry));
+                entry
+            },
+        }
     };
     // 每次命中刷新最后活跃时间，sweep 据此淘汰。
     entry.last_used_nanos.store(now_nanos(), Ordering::Relaxed);
@@ -762,18 +951,30 @@ fn address_to_smoltcp(addr: &Address) -> Option<smoltcp::wire::IpAddress> {
 ///
 /// task 独占 [`UdpDispatchSession`]，回包装帧后经 channel 交由写回 task 发往
 /// TUN；写回端退出（device 失败）时 abort 会话 task，session drop 关闭 duplex。
+#[allow(clippy::too_many_arguments)] // UDP 会话装配参数集（8gr6/ijn7），打包聚合体属内部 API 变更
 fn spawn_udp_session_task(
     dispatch: Arc<dyn DispatchHandler>,
     cmd_rx: mpsc::Receiver<SessionCmd>,
     device: Arc<TunDevice>,
     original_src: IpEndpoint,
     original_dst: IpEndpoint,
+    sessions: UdpSessions,
+    failed: FailedDsts,
+    entry: std::sync::Weak<UdpSessionEntry>,
 ) {
     // 票 euv9：reply 侧同样 bounded（下行响应由 owner task 产出、写回 task
     // 消费，device.send 慢时积压），满时丢包计数——见 [`try_enqueue_reply`]。
     let (reply_tx, mut reply_rx) = mpsc::channel::<Vec<u8>>(UDP_SESSION_QUEUE_CAP);
-    let session =
-        tokio::spawn(run_udp_session(dispatch, cmd_rx, reply_tx, original_src, original_dst));
+    let session = tokio::spawn(run_udp_session(
+        dispatch,
+        cmd_rx,
+        reply_tx,
+        original_src,
+        original_dst,
+        failed,
+        sessions,
+        entry,
+    ));
     tokio::spawn(async move {
         while let Some(reply) = reply_rx.recv().await {
             if let Err(e) = device.send(&reply).await {
@@ -791,12 +992,16 @@ fn spawn_udp_session_task(
 ///
 /// `cmd_rx` 关闭（sweep 淘汰 / map 侧 drop）→ 返回；`recv_packet()` 返回
 /// `Ok(None)`（outbound 关闭）或 Err → 返回。session drop → duplex 关闭。
+#[allow(clippy::too_many_arguments)] // UDP 会话装配参数集（8gr6/ijn7），打包聚合体属内部 API 变更
 async fn run_udp_session(
     dispatch: Arc<dyn DispatchHandler>,
     mut cmd_rx: mpsc::Receiver<SessionCmd>,
     reply_tx: mpsc::Sender<Vec<u8>>,
     original_src: IpEndpoint,
     original_dst: IpEndpoint,
+    failed: FailedDsts,
+    sessions: UdpSessions,
+    entry: std::sync::Weak<UdpSessionEntry>,
 ) {
     let mut session = UdpDispatchSession::new(dispatch);
     loop {
@@ -805,6 +1010,7 @@ async fn run_udp_session(
                 Some(SessionCmd::Send { dest, payload }) => {
                     if let Err(e) = session.send_packet(&dest, &payload).await {
                         tracing::warn!(error = %e, src = %original_src, dst = %original_dst, "udp: session.send_packet failed");
+                        on_relay_failure(&failed, &sessions, &entry, original_dst);
                         return;
                     }
                 }
@@ -850,6 +1056,7 @@ async fn run_udp_session(
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, src = %original_src, dst = %original_dst, "udp: session.recv_packet failed");
+                    on_relay_failure(&failed, &sessions, &entry, original_dst);
                     return;
                 }
             },
@@ -1336,6 +1543,29 @@ mod tests {
         pkt
     }
 
+    /// 构造测试用 IPv6+UDP 包（无扩展头）。
+    fn make_test_ipv6_udp_packet(
+        src: [u8; 16],
+        src_port: u16,
+        dst: [u8; 16],
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let total = 40 + 8 + payload.len();
+        let mut pkt = vec![0u8; total];
+        pkt[0] = 0x60; // version 6
+        pkt[4..6].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        pkt[6] = 17; // next header = UDP
+        pkt[7] = 64; // hop limit
+        pkt[8..24].copy_from_slice(&src);
+        pkt[24..40].copy_from_slice(&dst);
+        pkt[40..42].copy_from_slice(&src_port.to_be_bytes());
+        pkt[42..44].copy_from_slice(&dst_port.to_be_bytes());
+        pkt[44..46].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        pkt[48..].copy_from_slice(payload);
+        pkt
+    }
+
     /// 构造测试用 IPv4+TCP 包（无校验和——VirtualDevice caps 全 ignored）。
     fn make_test_ipv4_tcp_packet(
         src_ip: [u8; 4],
@@ -1515,6 +1745,12 @@ mod tests {
         // idle entry 绑定一个真实 owner task，验证回收闭环
         let (cmd_tx, cmd_rx) = mpsc::channel(UDP_SESSION_QUEUE_CAP);
         let (reply_tx, _reply_rx) = mpsc::channel(UDP_SESSION_QUEUE_CAP);
+        let failed: FailedDsts = Arc::new(ParkMutex::new(HashMap::new()));
+        let old_entry = Arc::new(UdpSessionEntry {
+            cmd_tx,
+            src: old_ep,
+            last_used_nanos: AtomicI64::new(0), // 远古
+        });
         let owner = tokio::spawn(run_udp_session(
             Arc::clone(&dispatch),
             cmd_rx,
@@ -1524,25 +1760,27 @@ mod tests {
                 smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(8, 8, 8, 8)),
                 53,
             ),
+            Arc::clone(&failed),
+            Arc::clone(&sessions),
+            Arc::downgrade(&old_entry),
         ));
         let (cmd_tx_new, _cmd_rx_new) = mpsc::channel(UDP_SESSION_QUEUE_CAP);
         {
             let mut m = sessions.lock();
-            m.insert(
-                old_ep,
-                Arc::new(UdpSessionEntry {
-                    cmd_tx,
-                    last_used_nanos: AtomicI64::new(0), // 远古
-                }),
-            );
+            m.insert(old_ep, Arc::clone(&old_entry));
             m.insert(
                 new_ep,
                 Arc::new(UdpSessionEntry {
                     cmd_tx: cmd_tx_new,
+                    src: new_ep,
                     last_used_nanos: AtomicI64::new(now_nanos()),
                 }),
             );
         }
+        // 生产路径里 map 是 cmd_tx 的唯一持有者（entry 的局部强引用随
+        // handle_udp_packet 返回而释放）；测试同理——否则 cmd_tx 不会随
+        // sweep 摘除条目而释放，owner task 收不到 channel 关闭。
+        drop(old_entry);
 
         sweep_udp_sessions(&sessions);
 
@@ -1619,7 +1857,23 @@ mod tests {
 
         let (cmd_tx, cmd_rx) = mpsc::channel(UDP_SESSION_QUEUE_CAP);
         let (reply_tx, _reply_rx) = mpsc::channel(UDP_SESSION_QUEUE_CAP);
-        let _owner = tokio::spawn(run_udp_session(dispatch, cmd_rx, reply_tx, src, dst));
+        let failed: FailedDsts = Arc::new(ParkMutex::new(HashMap::new()));
+        let sessions: UdpSessions = Arc::new(ParkMutex::new(HashMap::new()));
+        let entry = Arc::new(UdpSessionEntry {
+            cmd_tx: cmd_tx.clone(),
+            src,
+            last_used_nanos: AtomicI64::new(now_nanos()),
+        });
+        let _owner = tokio::spawn(run_udp_session(
+            dispatch,
+            cmd_rx,
+            reply_tx,
+            src,
+            dst,
+            failed,
+            sessions,
+            Arc::downgrade(&entry),
+        ));
 
         let payload = bytes::Bytes::from(vec![0xABu8; 100]);
         cmd_tx
@@ -1722,7 +1976,23 @@ mod tests {
 
         let (cmd_tx, cmd_rx) = mpsc::channel(UDP_SESSION_QUEUE_CAP);
         let (reply_tx, mut reply_rx) = mpsc::channel(UDP_SESSION_QUEUE_CAP);
-        let owner = tokio::spawn(run_udp_session(dispatch, cmd_rx, reply_tx, src, dst));
+        let failed: FailedDsts = Arc::new(ParkMutex::new(HashMap::new()));
+        let sessions: UdpSessions = Arc::new(ParkMutex::new(HashMap::new()));
+        let entry = Arc::new(UdpSessionEntry {
+            cmd_tx: cmd_tx.clone(),
+            src,
+            last_used_nanos: AtomicI64::new(now_nanos()),
+        });
+        let owner = tokio::spawn(run_udp_session(
+            dispatch,
+            cmd_rx,
+            reply_tx,
+            src,
+            dst,
+            failed,
+            sessions,
+            Arc::downgrade(&entry),
+        ));
 
         let payload = bytes::Bytes::from(vec![0xABu8; 100]);
         cmd_tx
@@ -2122,5 +2392,169 @@ mod tests {
         assert_eq!(route_families(Some(&plan(vec![v4.clone()]))), (true, false));
         assert_eq!(route_families(Some(&plan(vec![v6.clone()]))), (false, true));
         assert_eq!(route_families(Some(&plan(vec![v4, v6]))), (true, true));
+    }
+
+    /// 票 ijn7① 契约：目的组播/广播的 UDP 包**不进 relay**。
+    ///
+    /// 真构造实测中出现的两个包（SSDP `239.255.255.250:1900` 与 mDNS
+    /// `[ff02::1:3]:5355`），过 `parse_udp_packet` → `udp_relay_gate`，
+    /// 断言被拦（`MulticastOrBroadcast`）且计数递增；同一构造器的单播包
+    /// 必须放行（不得误伤正常流量）。
+    #[test]
+    fn multicast_broadcast_udp_destination_never_enters_relay() {
+        let failed: FailedDsts = Arc::new(ParkMutex::new(HashMap::new()));
+        let before = UDP_MULTICAST_DROPPED_TOTAL.load(Ordering::Relaxed);
+
+        // SSDP：IPv4 目的 239.255.255.250:1900
+        let ssdp = make_test_ipv4_udp_packet(
+            [192, 168, 1, 10],
+            55555,
+            [239, 255, 255, 250],
+            1900,
+            b"ssdp",
+        );
+        let (meta, _payload) = parse_udp_packet(&ssdp).expect("ssdp packet must parse");
+        assert_eq!(
+            udp_relay_gate(&meta, &failed),
+            Some(UdpDropReason::MulticastOrBroadcast),
+            "SSDP multicast destination must not enter relay"
+        );
+
+        // mDNS：IPv6 目的 ff02::1:3:5355
+        let mdns = make_test_ipv6_udp_packet(
+            [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            5355,
+            [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3],
+            5355,
+            b"mdns",
+        );
+        let (meta, _payload) = parse_udp_packet(&mdns).expect("mdns packet must parse");
+        assert_eq!(
+            udp_relay_gate(&meta, &failed),
+            Some(UdpDropReason::MulticastOrBroadcast),
+            "mDNS multicast destination must not enter relay"
+        );
+
+        // 受限广播
+        let bcast =
+            make_test_ipv4_udp_packet([192, 168, 1, 10], 55556, [255, 255, 255, 255], 68, b"x");
+        let (meta, _payload) = parse_udp_packet(&bcast).expect("broadcast packet must parse");
+        assert_eq!(udp_relay_gate(&meta, &failed), Some(UdpDropReason::MulticastOrBroadcast));
+
+        // 单播必须放行（不得误伤）
+        let unicast = make_test_ipv4_udp_packet([192, 168, 1, 10], 55557, [8, 8, 8, 8], 53, b"dns");
+        let (meta, _payload) = parse_udp_packet(&unicast).expect("unicast packet must parse");
+        assert_eq!(udp_relay_gate(&meta, &failed), None, "unicast must enter relay");
+
+        assert_eq!(
+            UDP_MULTICAST_DROPPED_TOTAL.load(Ordering::Relaxed),
+            before + 3,
+            "each dropped multicast/broadcast packet must be counted"
+        );
+    }
+
+    /// 票 ijn7② 契约：relay 失败的目的地址进入冷却窗 → 冷却窗内的后续包
+    /// **不再新建会话**（防「失败 → 立刻重建」的忙循环）；冷却到期后恢复。
+    ///
+    /// Go 侧对照：`proxy/tun/udp_fullcone.go:connectionFinished`（:74-81）在
+    /// 连接结束时把它从 `udpConns` 摘掉；Rust 侧额外加目的地址级冷却窗，
+    /// 因为 Windows 上失败目的是**每个新源端口**都会重建（源端口变→新会话），
+    /// 纯摘除会话不足以打断循环。
+    #[test]
+    fn failed_destination_enters_cooldown_and_blocks_rebuild() {
+        let failed: FailedDsts = Arc::new(ParkMutex::new(HashMap::new()));
+        let dst_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 9));
+        let meta = UdpPacketMeta {
+            src: smoltcp::wire::IpEndpoint::new(
+                smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(192, 168, 1, 10)),
+                5000,
+            ),
+            dst: smoltcp::wire::IpEndpoint::new(
+                smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(203, 0, 113, 9)),
+                443,
+            ),
+        };
+
+        // 失败前：放行
+        assert_eq!(udp_relay_gate(&meta, &failed), None, "must relay before any failure");
+
+        // 一次 relay 失败 → 该目的进入冷却
+        note_relay_failure(&failed, dst_ip);
+        assert_eq!(
+            udp_relay_gate(&meta, &failed),
+            Some(UdpDropReason::FailureCooldown),
+            "failed destination must not be rebuilt during cooldown"
+        );
+
+        // 其他目的不受影响
+        let other = UdpPacketMeta {
+            dst: smoltcp::wire::IpEndpoint::new(
+                smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(8, 8, 8, 8)),
+                53,
+            ),
+            ..meta
+        };
+        assert_eq!(udp_relay_gate(&other, &failed), None, "other destinations must be unaffected");
+
+        // 冷却到期 → 恢复放行（表项同时被清掉）
+        let expired =
+            now_nanos() + i64::try_from(UDP_RELAY_FAILURE_COOLDOWN.as_nanos()).unwrap_or(0) + 1;
+        let mut map = failed.lock();
+        let until = *map.get(&dst_ip).expect("cooldown entry must exist");
+        map.insert(
+            dst_ip,
+            until - i64::try_from(UDP_RELAY_FAILURE_COOLDOWN.as_nanos()).unwrap_or(0),
+        );
+        drop(map);
+        assert!(!in_failure_cooldown(&failed, dst_ip, expired), "cooldown must expire");
+        assert_eq!(udp_relay_gate(&meta, &failed), None, "must relay again after cooldown expires");
+    }
+
+    /// 票 ijn7② 契约：relay 失败时，本会话从 map 中被摘除（Go
+    /// `udp_fullcone.go:connectionFinished` 语义），且**只摘自己的**条目——
+    /// 同 src 的新会话不被误删（Go 注释「a newer conn may already own this src」）。
+    #[test]
+    fn relay_failure_removes_only_own_session_entry() {
+        let failed: FailedDsts = Arc::new(ParkMutex::new(HashMap::new()));
+        let sessions: UdpSessions = Arc::new(ParkMutex::new(HashMap::new()));
+        let src = smoltcp::wire::IpEndpoint::new(
+            smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(192, 168, 1, 10)),
+            6000,
+        );
+        let dst = smoltcp::wire::IpEndpoint::new(
+            smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(203, 0, 113, 9)),
+            443,
+        );
+
+        let (cmd_tx, _cmd_rx) = mpsc::channel(UDP_SESSION_QUEUE_CAP);
+        let own =
+            Arc::new(UdpSessionEntry { cmd_tx, src, last_used_nanos: AtomicI64::new(now_nanos()) });
+        let (cmd_tx_new, _cmd_rx_new) = mpsc::channel(UDP_SESSION_QUEUE_CAP);
+        let newer = Arc::new(UdpSessionEntry {
+            cmd_tx: cmd_tx_new,
+            src,
+            last_used_nanos: AtomicI64::new(now_nanos()),
+        });
+        sessions.lock().insert(src, Arc::clone(&own));
+
+        // 本会话失败 → 摘除自己的条目
+        on_relay_failure(&failed, &sessions, &Arc::downgrade(&own), dst);
+        assert!(!sessions.lock().contains_key(&src), "failed session must be removed from the map");
+        assert!(
+            in_failure_cooldown(
+                &failed,
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 9)),
+                now_nanos()
+            ),
+            "failed destination must enter cooldown"
+        );
+
+        // 同 src 的**新**会话在场时，旧会话失败不得误删它
+        sessions.lock().insert(src, Arc::clone(&newer));
+        on_relay_failure(&failed, &sessions, &Arc::downgrade(&own), dst);
+        assert!(
+            sessions.lock().contains_key(&src),
+            "a newer session for the same src must not be removed by the old one's failure"
+        );
     }
 }
