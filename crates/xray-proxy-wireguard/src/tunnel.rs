@@ -275,6 +275,8 @@ fn hex_to_array_32(hex_str: &str, field: &str) -> Result<[u8; 32]> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use boringtun::x25519::{PublicKey, StaticSecret};
 
     use super::*;
@@ -444,6 +446,115 @@ mod tests {
             out.iter().any(|o| matches!(o, Output::Network(_))),
             "expected Network output after handshake: {out:?}"
         );
+    }
+
+    /// 双 tunnel 线上字节交换驱动：把 seed 注入 A→B 方向后反复泵两侧，直到线上
+    /// 无新字节产生。返回 B 解出的 IP 包（按到达序）。B 的网络输出原样回投 A。
+    fn pump_tunnels(a: &mut Tunnel, b: &mut Tunnel, seed: VecDeque<Vec<u8>>) -> Vec<Vec<u8>> {
+        let mut a_to_b = seed;
+        let mut delivered = Vec::new();
+        loop {
+            let mut progress = false;
+            while let Some(wg) = a_to_b.pop_front() {
+                progress = true;
+                for out in b.decapsulate(&wg).expect("B decapsulate") {
+                    match out {
+                        Output::Ip(ip) => delivered.push(ip),
+                        Output::Network(reply) => {
+                            for out2 in a.decapsulate(&reply).expect("A decapsulate") {
+                                match out2 {
+                                    Output::Network(wg2) => a_to_b.push_back(wg2),
+                                    Output::Ip(_) => unreachable!("A 不解出自己的包"),
+                                }
+                            }
+                        },
+                    }
+                }
+            }
+            if !progress {
+                break;
+            }
+        }
+        delivered
+    }
+
+    fn wire_of(outs: Vec<Output>) -> VecDeque<Vec<u8>> {
+        outs.into_iter()
+            .filter_map(|o| match o {
+                Output::Network(wg) => Some(wg),
+                Output::Ip(_) => None,
+            })
+            .collect()
+    }
+
+    /// bd n07t F2：握手期数据报不丢。
+    ///
+    /// boringtun 0.7.1 无会话时 encapsulate 把 IP 包压入内部 `packet_queue`
+    /// （MAX_QUEUE_DEPTH=256，noise/mod.rs:263-267），握手 response 到达后由
+    /// decapsulate 的空输入重调约定 flush（send_queued_packet，noise/mod.rs:284、
+    /// 510-521）——与 wireguard-go 的 staged queue 语义一致（device/send.go
+    /// StagePackets/SendStagedPackets：无 keypair 时只发握手、包留队）。
+    /// 本测试证明：握手完成前单发的数据报不丢，握手完成后自动送达对端。
+    #[test]
+    fn first_datagram_before_handshake_not_lost() {
+        let (sec_a, pub_a) = make_test_keypair(0x11);
+        let (sec_b, pub_b) = make_test_keypair(0x22);
+        let mut a = Tunnel::new(&sec_a, &pub_b, None, None, 0).expect("A tunnel");
+        let mut b = Tunnel::new(&sec_b, &pub_a, None, None, 1).expect("B tunnel");
+
+        // 握手完全未开始：A 单发一只 UDP 数据报（无重发）。
+        let payload = b"first datagram before handshake";
+        let a_out = a.encapsulate(make_ipv4_packet(payload).as_slice()).expect("encapsulate");
+        // 此刻只产出 handshake init——数据包已被 boringtun 排队，不出加密数据报。
+        assert!(
+            a_out.iter().all(|o| matches!(o, Output::Network(_))),
+            "pre-handshake encapsulate must only emit handshake init: {a_out:?}"
+        );
+
+        let delivered = pump_tunnels(&mut a, &mut b, wire_of(a_out));
+        assert!(a.time_since_last_handshake().is_some(), "A handshake incomplete");
+        assert_eq!(delivered.len(), 1, "exactly the queued datagram must arrive");
+        assert!(
+            delivered[0].windows(payload.len()).any(|w| w == payload),
+            "payload mismatch in delivered packet"
+        );
+    }
+
+    /// bd n07t F2 补充：握手 init 在途（is_in_progress）期间持续 encapsulate 的包
+    /// 同样入队——boringtun 不重发 init（Done → Ok 空输出，driver 无需处理），
+    /// 握手完成后按 FIFO 顺序全部送达。
+    #[test]
+    fn datagrams_while_handshake_in_progress_not_lost() {
+        let (sec_a, pub_a) = make_test_keypair(0x11);
+        let (sec_b, pub_b) = make_test_keypair(0x22);
+        let mut a = Tunnel::new(&sec_a, &pub_b, None, None, 0).expect("A tunnel");
+        let mut b = Tunnel::new(&sec_b, &pub_a, None, None, 1).expect("B tunnel");
+
+        let payloads: [&[u8]; 4] = [b"pkt #1", b"pkt #2", b"pkt #3", b"pkt #4"];
+        // 首包触发 handshake init。
+        let a_out = a.encapsulate(make_ipv4_packet(payloads[0]).as_slice()).expect("encap #1");
+        assert!(
+            a_out.iter().any(|o| matches!(o, Output::Network(_))),
+            "init expected from first encapsulate: {a_out:?}"
+        );
+
+        // init 在途期间继续发包：输出为空（不重发 init），包入 packet_queue。
+        let seed = wire_of(a_out);
+        for p in &payloads[1..] {
+            let out = a.encapsulate(make_ipv4_packet(p).as_slice()).expect("encap");
+            assert!(out.is_empty(), "in-progress handshake must not emit output: {out:?}");
+        }
+
+        let delivered = pump_tunnels(&mut a, &mut b, seed);
+        assert!(a.time_since_last_handshake().is_some(), "A handshake incomplete");
+        assert_eq!(delivered.len(), payloads.len(), "all queued datagrams must arrive");
+        for (i, ip) in delivered.iter().enumerate() {
+            let want = payloads[i];
+            assert!(
+                ip.windows(want.len()).any(|w| w == want),
+                "FIFO order/payload mismatch at {i}"
+            );
+        }
     }
 
     #[test]
