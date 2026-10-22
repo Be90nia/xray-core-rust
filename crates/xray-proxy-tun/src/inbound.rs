@@ -2250,6 +2250,116 @@ mod tests {
         assert!(matches!(try_enqueue_reply(&tx, vec![3]), ReplyEnqueue::Closed));
     }
 
+    /// AI10：带 payload 的 IPv4+TCP 数据包（PSH+ACK），独立于
+    /// [`make_test_ipv4_tcp_packet`]（后者无 payload 位，5 个既有调用点不动）。
+    #[allow(clippy::too_many_arguments)] // 包构造器八参直映 IP/TCP 头字段，测试 helper 非生产签名
+    fn make_test_ipv4_tcp_packet_with_payload(
+        src_ip: [u8; 4],
+        src_port: u16,
+        dst_ip: [u8; 4],
+        dst_port: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let total = 40 + payload.len();
+        let mut pkt = vec![0u8; total];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 6; // TCP
+        pkt[12..16].copy_from_slice(&src_ip);
+        pkt[16..20].copy_from_slice(&dst_ip);
+        let tcp = &mut pkt[20..];
+        tcp[0..2].copy_from_slice(&src_port.to_be_bytes());
+        tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
+        tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+        tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+        tcp[12] = 5 << 4;
+        tcp[13] = flags;
+        tcp[14..16].copy_from_slice(&0xFFFFu16.to_be_bytes());
+        pkt[40..].copy_from_slice(payload);
+        pkt
+    }
+
+    /// AI10 回归（accept 后上行转发）：握手 accept 后 TUN 客户端发来的
+    /// PSH+ACK payload 必须被 [`TunTcpRelay`] 从 smoltcp socket 读出、写进
+    /// Link.reader 侧 duplex（dispatch 消费端读到原字节）。真机故障形态回归
+    /// 床：数据滞留 rx 缓冲无人读（curl 经 TUN 超时 0 字节）即本测红。
+    #[tokio::test]
+    async fn relay_forwards_uplink_payload_to_dispatch_reader_after_accept() {
+        use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
+
+        let local = IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)), 24);
+        let netstack: Arc<AsyncMutex<TunNetStack>> =
+            Arc::new(AsyncMutex::new(TunNetStack::new(&[local], 1500)));
+
+        // 真实握手：SYN → SYN-ACK（读 ISN）→ ACK → accept
+        let syn = make_test_ipv4_tcp_packet([10, 0, 0, 2], 40000, [1, 1, 1, 1], 443, 1000, 0, 0x02);
+        let synack_seq = {
+            let mut stack = netstack.lock().await;
+            let (_, tx) = drive_stack_batch(&mut stack, vec![syn.to_vec()]);
+            tx.iter()
+                .find(|p| p.len() >= 34 && p[9] == 6 && (p[20 + 13] & 0x12) == 0x12)
+                .map(|p| u32::from_be_bytes([p[20 + 4], p[20 + 5], p[20 + 6], p[20 + 7]]))
+                .expect("SYN-ACK")
+        };
+        let ack = make_test_ipv4_tcp_packet(
+            [10, 0, 0, 2],
+            40000,
+            [1, 1, 1, 1],
+            443,
+            1001,
+            synack_seq.wrapping_add(1),
+            0x10,
+        );
+        let (accepted, _) = {
+            let mut stack = netstack.lock().await;
+            drive_stack_batch(&mut stack, vec![ack.to_vec()])
+        };
+        assert_eq!(accepted.len(), 1);
+        let handle = accepted[0].handle;
+
+        // 与生产 accept_tcp_connection 同形态建 relay（duplex 对 + 同一把锁）
+        let (client_to_relay, relay_from_client) = tokio::io::duplex(DUPLEX_BUF);
+        let (relay_to_client, mut client_from_relay) = tokio::io::duplex(DUPLEX_BUF);
+        // 保活下行写端：drop 会让 relay.from_client read 到 EOF → relay 提前退出
+        let _writer_keepalive = client_to_relay;
+        let relay = TunTcpRelay {
+            from_client: relay_from_client,
+            to_client: relay_to_client,
+            netstack: Arc::clone(&netstack),
+            handle,
+        };
+        tokio::spawn(relay.run());
+
+        // 上行 payload（ClientHello 形态 517B）：PSH+ACK ingest 进 socket rx
+        let payload: Vec<u8> = (0..517u32).map(|i| (i % 251) as u8).collect();
+        let data_pkt = make_test_ipv4_tcp_packet_with_payload(
+            [10, 0, 0, 2],
+            40000,
+            [1, 1, 1, 1],
+            443,
+            1001,
+            synack_seq.wrapping_add(1),
+            0x18, // PSH|ACK
+            &payload,
+        );
+        {
+            let mut stack = netstack.lock().await;
+            drive_stack_batch(&mut stack, vec![data_pkt]);
+        }
+
+        // relay 轮询（RELAY_POLL_MS）后必须把 payload 送抵消费端，deadline 内逐字节一致
+        let mut received = vec![0u8; payload.len()];
+        tokio::time::timeout(Duration::from_secs(5), client_from_relay.read_exact(&mut received))
+            .await
+            .expect("relay must forward uplink payload within 5s")
+            .expect("read_exact must not fail while relay is forwarding");
+        assert_eq!(received, payload, "uplink payload must arrive byte-exact");
+    }
+
     /// Go tun_windows.go:254-257 映射的表驱动单测。
     ///
     /// 语义：`dns` 需 dns 已配置才阻断；`misconfigtun` 逐版本阻断——该版本
