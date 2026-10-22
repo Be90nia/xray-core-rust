@@ -29,8 +29,9 @@ use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tracing::debug;
 use xray_app_dispatcher::DispatchHandler;
 use xray_buf::io::{new_reader, new_writer};
-use xray_common::net::{
-    address::Address as XAddress, destination::Destination, network::Network, port::Port,
+use xray_common::{
+    net::{address::Address as XAddress, destination::Destination, network::Network, port::Port},
+    padding::validate_padding_len,
 };
 use xray_transport::link::Link;
 
@@ -39,17 +40,18 @@ use crate::{error::Result, socks::SocksAddr};
 /// anytls duplex 缓冲（64 KiB，与 client.rs 一致）。
 const DUPLEX_BUF_SIZE: usize = 64 * 1024;
 
-/// 认证帧 padding0 长度上限（16 KiB）。
+/// 认证帧 padding0 长度上限（16 KiB − 34B 认证头 = 16350）。
 ///
 /// Go 参考实现无显式常量，有效上界来自首包缓冲：anytls-go
-/// `cmd/server/inbound_tcp.go`（`handleTcpConnection`）用 `buf.NewPacket()`
-/// 单次读入（容量 = sing `common/buf` 的 `UDPBufferSize`，standard build 16 KiB），
-/// `b.ReadBytes(paddingLen)` 只在首包缓冲内命中，超出即 err → fallback 拒连。
-/// 即 Go 侧不会按客户端声明值分配内存。
-///
-/// Rust 侧此前直接 `vec![0u8; padding0_len]`，等于让客户端 u16 声明（最大 65535）
-/// 驱动单次分配。取同一量级上限在分配前拒绝，合法 paddingScheme（`0=30-30`）远低于此。
-const MAX_PADDING0_LEN: usize = 16 * 1024;
+/// `cmd/server/inbound_tcp.go`（`handleTcpConnection`）`buf.NewPacket()` 单次
+/// `ReadOnceFrom` 读入（容量 = sing `common/buf/buffer_standard.go` 的
+/// `UDPBufferSize`，standard build 16 KiB），先读 32B password sha256 + 2B
+/// padding0_len 再 `ReadBytes(paddingLen)`，任何一段超出已缓冲内容即 `io.EOF`
+/// → fallback 拒连。即 Go 侧有效上界 = 16384 − 34 = 16350（sing
+/// `with_low_memory` build 的 4096 更小，不取），客户端声明 16351..=16384 必被
+/// Go 拒。Rust 侧读法不同（read_exact 跨段攒），此处按「客户端可声明上限」
+/// 对齐同一判定值。
+const MAX_PADDING0_LEN: usize = 16 * 1024 - 34;
 
 /// AnyTLS mock 服务端句柄，`stop()` 后 listener 关闭。
 pub struct AnytlsMockServer {
@@ -195,7 +197,7 @@ async fn handle_conn(
         }
     }
     let padding0_len = u16::from_be_bytes([auth_head[32], auth_head[33]]) as usize;
-    if padding0_len > MAX_PADDING0_LEN {
+    if validate_padding_len(padding0_len as u64, MAX_PADDING0_LEN as u64).is_err() {
         debug!(
             "anytls mock server: auth rejected (padding0_len {padding0_len} > max \
              {MAX_PADDING0_LEN})"
@@ -440,6 +442,12 @@ async fn bridge(session: Arc<Session>, outbound: TcpStream) -> std::io::Result<(
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    /// Go anytls-go 有效上界：sing standard build 首包缓冲 16384 − 34B 认证头。
+    #[test]
+    fn max_padding0_len_matches_go_effective_bound() {
+        assert_eq!(super::MAX_PADDING0_LEN, 16 * 1024 - 34);
+    }
 
     use rustls::{ClientConfig as RustlsClientConfig, ServerConfig as RustlsServerConfig};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

@@ -55,7 +55,7 @@ pub trait SystemDialer: Send + Sync {
         src: Option<SocketAddr>,
         destination: &'a Destination,
         sockopt: &'a SocketOptions,
-    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Connection>>> + Send + 'a>>;
+    ) -> crate::connection::BoxedConnFuture<'a>;
 
     /// 返回代理服务器 IP（Android 用例：连接前预解析 IP）。默认返回 `None`。
     fn dest_ip_address(&self) -> Option<IpAddr> {

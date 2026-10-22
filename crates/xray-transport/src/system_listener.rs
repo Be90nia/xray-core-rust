@@ -31,45 +31,75 @@ use tokio::{
     net::TcpListener as TokioTcpListener,
 };
 
-/// 入站 TCP listener backlog 兜底值（bd hjtt：tokio/std 缺省 128，生产实测 listen queue
-/// overflow 1402 次 + SYNs dropped 1404）。非 Linux 平台与 Linux 读 somaxconn 失败时
-/// 的生效值。
-pub const LISTEN_BACKLOG: i32 = 1024;
+/// Go `syscall.SOMAXCONN` 的平台值（maxListenerBacklog 各失败分支的 fallback）：
+/// linux amd64 = 0x80 = 128（zerrors_linux_amd64.go:999）、darwin/freebsd 同为 128；
+/// windows = 0x7fffffff（types_windows.go:622——listen backlog 仅是 hint，内核取
+/// "reasonable maximum"，Go sock_windows.go:13-16 同语义）。
+#[cfg(windows)]
+const SOMAXCONN: i32 = 0x7fff_ffff;
+#[cfg(not(windows))]
+const SOMAXCONN: i32 = 128;
 
-/// 生效 backlog。对齐 Go `net.maxListenerBacklog`（D:/Go/src/net/sock_linux.go:43-59，
-/// 由 net.go:404 `listenerBacklog()` 进程内缓存一次）：
-/// Linux 读 `/proc/sys/net/core/somaxconn`，为 0 / 解析失败 / 读失败 → Go 用
-/// `syscall.SOMAXCONN`（linux amd64 = 0x80 = 128，zerrors_linux_amd64.go:999），
-/// 本仓兜底用 [`LISTEN_BACKLOG`]（1024）——比 Go 的 128 高，保住 hjtt 票在
-/// somaxconn 未调优机器上已消化的 overflow；>65535 钳到 65535（Go maxAckBacklog
-/// 内核 ≥4.1 的 32 位上限分支；<4.1 的 16 位钳制随老内核淘汰不复刻）。
-/// 非 Linux：Windows listen backlog 仅是 hint（内核自行放大，Go
-/// sock_windows.go:13-16 同语义），保持 [`LISTEN_BACKLOG`]；BSD sysctl 变体未复刻。
+/// 生效 backlog。逐平台对齐 Go `net.listenerBacklog()`（net.go:404-407 进程内
+/// 缓存一次，平台实现在 maxListenerBacklog）：
+/// - Linux（sock_linux.go:34-59）：读 `/proc/sys/net/core/somaxconn`；读失败 / 首字段解析失败 /
+///   值为 0 → `syscall.SOMAXCONN`；>65535 交给 [`max_ack_backlog`] 按内核版本钳制 （backlog
+///   存储宽度 <4.1 为 u16、≥4.1 为 u32，issue 5030/41470）。
+/// - 非 Linux：`syscall.SOMAXCONN`。BSD/darwin 的 sysctl 读取变体（sock_bsd.go:14-40）
+///   未复刻——fallback 值与各平台 SOMAXCONN 缺省一致（darwin 缺省 sysctl 即 128）。
 #[must_use]
 pub fn effective_listen_backlog() -> i32 {
     *EFFECTIVE_LISTEN_BACKLOG
+}
+
+/// Go sock_linux.go:34-48 `maxListenerBacklog` 的解析段：首字段十进制，0 / 非数字 →
+/// fallback（None）。
+#[cfg(target_os = "linux")]
+fn somaxconn_from_proc(text: &str) -> Option<i32> {
+    text.split_whitespace().next()?.parse::<i32>().ok().filter(|&n| n > 0)
+}
+
+/// Go sock_linux.go:18-31 `maxAckBacklog`：内核 backlog 存储宽度 <4.1 为 u16、
+/// ≥4.1 为 u32；版本解析失败按 16 位钳制（Go `unix.KernelVersion()` 失败返回
+/// (0,0) → 走 16 位分支，同款）。≥4.1 的 u32 上限超出 `i32` 表示域，入参必满足。
+#[cfg(target_os = "linux")]
+fn max_ack_backlog(n: i32, kernel: (u32, u32)) -> i32 {
+    if kernel.0 > 4 || (kernel.0 == 4 && kernel.1 >= 1) { n } else { n.min((1 << 16) - 1) }
+}
+
+/// Go internal/syscall/unix `KernelVersion` 同款：读 `/proc/sys/kernel/osrelease`
+/// 取前两个十进制段（如 `6.6.0-14-generic` → (6, 6)）；读失败/解析不全 → (0, 0)。
+#[cfg(target_os = "linux")]
+fn kernel_version() -> (u32, u32) {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .ok()
+        .and_then(|s| {
+            let mut it = s
+                .split(|c: char| !c.is_ascii_digit())
+                .filter(|seg| !seg.is_empty())
+                .filter_map(|seg| seg.parse::<u32>().ok());
+            Some((it.next()?, it.next()?))
+        })
+        .unwrap_or((0, 0))
 }
 
 #[cfg(target_os = "linux")]
 static EFFECTIVE_LISTEN_BACKLOG: std::sync::LazyLock<i32> = std::sync::LazyLock::new(|| {
     std::fs::read_to_string("/proc/sys/net/core/somaxconn")
         .ok()
-        .and_then(|s| s.split_whitespace().next()?.parse::<i32>().ok())
-        .filter(|&n| n > 0)
-        .map_or(LISTEN_BACKLOG, |n| n.min(65_535))
+        .and_then(|s| somaxconn_from_proc(&s))
+        .map_or(SOMAXCONN, |n| max_ack_backlog(n, kernel_version()))
 });
 
 #[cfg(not(target_os = "linux"))]
-static EFFECTIVE_LISTEN_BACKLOG: std::sync::LazyLock<i32> =
-    std::sync::LazyLock::new(|| LISTEN_BACKLOG);
+static EFFECTIVE_LISTEN_BACKLOG: std::sync::LazyLock<i32> = std::sync::LazyLock::new(|| SOMAXCONN);
 
 /// 指定 backlog 绑定 TCP listener（socket2 bind + listen）。
 ///
 /// 全仓 listener 创建点统一入口（bd hjtt）：`std`/`tokio` 的 `bind` 不暴露
 /// backlog（内核缺省 128）。语义对齐 `std::net::TcpListener::bind`：解析
 /// 主机名取首个地址；Unix 置 SO_REUSEADDR、Windows 不置（std 同款行为）。
-/// 生产调用点传 [`effective_listen_backlog()`]（Go maxListenerBacklog 同款），
-/// `LISTEN_BACKLOG` 常量保留为其兜底值。
+/// 生产调用点传 [`effective_listen_backlog()`]（Go `net.listenerBacklog` 同款）。
 ///
 /// # Errors
 /// 地址解析失败 / socket 创建 / bind / listen 失败时返回 `io::Error`。
@@ -120,9 +150,7 @@ pub type ListenerController = Arc<dyn Fn(&str, &str, &Socket) -> io::Result<()> 
 /// `accept` 返回 `Box<dyn Connection>`，与 `crate::Listener` trait 一致。
 pub trait SystemListener: Send + Sync {
     /// 接受一个入站连接（已应用 inbound sockopt）。
-    fn accept<'a>(
-        &'a self,
-    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Connection>>> + Send + 'a>>;
+    fn accept<'a>(&'a self) -> crate::connection::BoxedConnFuture<'a>;
 
     /// 监听器本地地址。
     fn local_addr(&self) -> io::Result<SocketAddr>;
@@ -906,18 +934,47 @@ pub async fn listen_unix_system(addr: &str, sockopt: SocketOptions) -> io::Resul
 
 #[cfg(test)]
 mod tests {
-    /// hjtt：生效 backlog 对齐 Go `net.maxListenerBacklog`（sock_linux.go:43-59）——
-    /// 正值且不超过 65535 钳制（Go maxAckBacklog 内核 ≥4.1 的 uint32 上限仍有
-    /// issue 5030 的 16 位兼容面）；非 Linux 与读不到 somaxconn 时回落
-    /// [`LISTEN_BACKLOG`]。两次调用一致 = 进程内缓存（Go net.go:404
-    /// listenerBacklogCache 同款）。
+    /// hjtt：两次调用一致 = 进程内缓存（Go net.go:404 listenerBacklogCache 同款）。
     #[test]
-    fn effective_listen_backlog_is_bounded_and_cached() {
+    fn effective_listen_backlog_is_cached() {
         let v = effective_listen_backlog();
-        assert!((1..=65_535).contains(&v), "backlog must be 1..=65535, got {v}");
         assert_eq!(v, effective_listen_backlog(), "backlog lookup must be cached");
-        #[cfg(not(target_os = "linux"))]
-        assert_eq!(v, LISTEN_BACKLOG, "non-linux falls back to LISTEN_BACKLOG");
+    }
+
+    /// 平台生效值对齐 Go maxListenerBacklog：Linux 读 somaxconn（fallback 128）；
+    /// Windows = 0x7fffffff；其余 unix fallback = SOMAXCONN（128）。
+    #[test]
+    fn effective_listen_backlog_matches_go_platform_semantics() {
+        let v = effective_listen_backlog();
+        #[cfg(target_os = "linux")]
+        assert!(v >= 128, "linux must be somaxconn or SOMAXCONN fallback, got {v}");
+        #[cfg(windows)]
+        assert_eq!(v, 0x7fff_ffff, "windows must be syscall.SOMAXCONN");
+        #[cfg(all(not(target_os = "linux"), not(windows)))]
+        assert_eq!(v, 128, "non-linux fallback must be syscall.SOMAXCONN");
+    }
+
+    /// Go sock_linux.go:18-31 maxAckBacklog：backlog 存储宽度随内核版本
+    /// （<4.1 u16 / ≥4.1 u32；版本解析失败 (0,0) 按 u16，同 Go）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn max_ack_backlog_clamps_by_kernel_width() {
+        assert_eq!(super::max_ack_backlog(65_535, (4, 15)), 65_535);
+        assert_eq!(super::max_ack_backlog(65_536, (4, 1)), 65_536); // ≥4.1 u32 宽
+        assert_eq!(super::max_ack_backlog(i32::MAX, (5, 10)), i32::MAX);
+        assert_eq!(super::max_ack_backlog(65_536, (3, 16)), 65_535); // <4.1 u16 钳
+        assert_eq!(super::max_ack_backlog(65_536, (0, 0)), 65_535); // 版本未知按 u16
+    }
+
+    /// Go sock_linux.go:36-48 解析段：首字段十进制，0/非数字 → fallback。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn somaxconn_from_proc_matches_go_parse() {
+        assert_eq!(super::somaxconn_from_proc("4096\n"), Some(4096));
+        assert_eq!(super::somaxconn_from_proc("  2048  \n"), Some(2048));
+        assert_eq!(super::somaxconn_from_proc("0\n"), None);
+        assert_eq!(super::somaxconn_from_proc("abc\n"), None);
+        assert_eq!(super::somaxconn_from_proc(""), None);
     }
 
     use tokio::{

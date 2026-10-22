@@ -14,9 +14,7 @@ use crate::connection::{Connection, TcpConnection};
 /// `Pin<Box<dyn Future>>` 风格（避免 `#[async_trait]`，符合翻译约定 §3）。
 pub trait Listener: Send + Sync {
     /// 接受一个入站连接。返回的连接对象以 trait object 形式交由上层多态使用。
-    fn accept<'a>(
-        &'a self,
-    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Connection>>> + Send + 'a>>;
+    fn accept<'a>(&'a self) -> crate::connection::BoxedConnFuture<'a>;
 
     /// 监听器本地地址。
     fn local_addr(&self) -> io::Result<SocketAddr>;
