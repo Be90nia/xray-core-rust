@@ -11,9 +11,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - MemoryAccount（SS/Trojan/VLESS/VMess）与 `UUID`/`protocol::ID` Debug 脱敏：凭据禁入 tracing/panic 输出（bd 2ktp ③）
 - VMess chunk size u16 溢出 7 处 `unwrap_or(u16::MAX)` 静默替换改显式错误（防收端错位；现行调用面不可达，纯防御）（bd 2ktp ②）
 - REALITY 回贴 Go tls.go:233-235 MLKEM768 key share 门：X25519-only ClientHello reject→forward，`parse_key_shares` 对齐 v26.9.30 单轮扫描语义（bd 2ktp ①）
+- anytls `padding0_len` 缺上界 → 分配前按 16 KiB 拒绝（Go/sing `UDPBufferSize`；Go 从不按客户端声明分配）（bd 8tfh）
+- AEAD 就地 seal 失败路径回滚不变量：AES-128/256-GCM 失败时截断回写，防「残留明文被当密文」在同缓冲复用处上线（bd bqro）
+- PROXY protocol 头读取加上界：v1 107 B / v2 4096 B，超限拒连（Go go-proxyproto v2.go:28 拒绝点）（bd 3ghm）
+- `Debug` 脱敏扩至 REALITY 私钥与 ML-DSA 种子、inbound `server_private_key`、xmc 口令/RSA 私钥、ECH `private_key`（bd 99kd）
+- commander admin TCP bind 失败从 spawn 后异步 ERROR 上升为启动期 fatal（对齐 Go `commander.go:85-92`）（bd 99n3）
+- tun netstack UDP 源/目的家族不匹配：`panic` → 丢弃 + `warn`（对齐 Go `tun/stack.go:347-351`）（bd x1fz）
+- REALITY 入站 `tcpSettings.header` 伪装头接线补齐（vless/trojan 双路，此前静默失效）（bd 8q0d F3）
+- vless enc nonce 轮转对齐 Go：读侧轮转 + `MaxNonce` 回绕 + 写侧「旧钥封→完整记录派生」（bd 8jp6）
+- finalmask 配置 fail-loud：xdns `names[]` 展开为多条同参域、realm `tlsConfig` 非 null 拒绝、salamander `packetSize` 拒绝（bd 037f）
+- relay `dispatch_via_chain` 补 512 KiB 背压上限（对齐 Go `pipe` + `policy` 默认，防无界蓄洪）（bd exci）
+- app-dns 上游错误不再统一吞成 `record not found`：保留错误种类 + per-server 日志带原因（bd pyl1）
+- listener backlog 改读 `somaxconn`（fallback 1024；Go Linux fallback 为 128，属有意偏离以保住 VPS overflow 战果）（bd hjtt）
+
+### Added
+
+- 启动日志输出 kernel identity：version/git_rev 降级链 + blake3 exe 指纹 + profile/target triple（对齐 Go 版本可诊断性需求）（bd qxqw）
 
 ### Changed
 
+- `xray-xudp` env 解析测试迁至独立测试二进制：env 读取是进程级 `LazyLock` 缓存，同进程内被其它测试先触发后 `set_var` 永久无效（CI ubuntu 偶发红灯根因）
 - xdns finalmask 对齐 Go v26.9.30（fc8f8a45）：结构化 DomainProto（lenLimit/labelLimit/types/edns0）+ TypedMessage resolvers + extraPoll；wire 协议重写（poll/small/frag 三形态 + 分片重组 + 攒包下发）；TCP resolver 配置期报错（Rust 栈 UDP-only）（bd 2ktp ④）
 
 ## [26.10.10] - 2026-10-10
