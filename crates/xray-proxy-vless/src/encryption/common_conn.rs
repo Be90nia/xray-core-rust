@@ -4,7 +4,7 @@
 //! - [`CommonConn::poll_write`]：明文分段（≤8192）→ TLS record header + AEAD 加密 → 写底层
 //! - [`CommonConn::poll_read`]：从底层读 → 按 TLS record 切片 → AEAD 解密 → 返回明文
 //!
-//! nonce 达到 MaxNonce 时按 Go 语义重建 AEAD（用当前 header 作 context）。
+//! nonce 达到 MaxNonce 时按 Go 语义换派生 AEAD（以完整 wire 记录为 context）。
 //! 0-RTT：上行 AEAD 构造时给定（context=加密后 ticket）；下行 AEAD 延迟到首次
 //! 读，用 server 首发的 16B 随机数建立（[`CommonConn::new_zero_rtt`]）。
 
@@ -255,7 +255,22 @@ where
                     );
                     let peer_aead =
                         this.peer_aead.as_mut().expect("peer_aead established at loop top");
-                    if let Err(e) = peer_aead.open_in_place(None, &mut this.decrypted, &header) {
+                    // nonce 达 MaxNonce：先以 header||密文 为 context 预派生新 AEAD
+                    // （Go common.go:134-137），旧 AEAD 以回绕后的 nonce 0 解开耗尽记录，
+                    // 解开后换新（Go common.go:138-140：swap 先于错误上抛）。
+                    let mut rotate: Option<Aead> = None;
+                    if peer_aead.is_max() {
+                        let mut ctx =
+                            Vec::with_capacity(TLS_RECORD_HEADER_LEN + this.decrypted.len());
+                        ctx.extend_from_slice(&header);
+                        ctx.extend_from_slice(&this.decrypted);
+                        rotate = Some(Aead::new(&ctx, &this.united_key, this.use_aes));
+                    }
+                    let opened = peer_aead.open_in_place(None, &mut this.decrypted, &header);
+                    if let Some(new_aead) = rotate {
+                        this.peer_aead = Some(new_aead);
+                    }
+                    if let Err(e) = opened {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             e.to_string(),
@@ -358,10 +373,9 @@ where
             let payload_len = u16::try_from(n + TAG_LEN).expect("segment + tag fits in u16");
             write_tls_record_header(&mut header, payload_len);
 
-            // nonce 达 MaxNonce → 重建 AEAD（对齐 Go：context=当前 header, key=UnitedKey）
-            if this.aead.is_max() {
-                this.aead = Aead::new(&header, &this.united_key, this.use_aes);
-            }
+            // nonce 达 MaxNonce：本记录仍以旧 AEAD（回绕 nonce 0）加密，封完后以完整
+            // wire 记录（header||密文||tag）为 context 换新（Go common.go:61-68）。
+            let rotate = this.aead.is_max();
 
             this.write_buf.clear();
             // 首写前缀（Go common.go:69-72）：server 0-RTT 的 16B 明文随机数
@@ -377,6 +391,11 @@ where
                 .seal_in_place(None, &mut this.write_buf[hdr_end..], &header)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             this.write_buf.extend_from_slice(&tag);
+            if rotate {
+                // rec_start 跳过 PreWrite 前缀：Go 的 NewAEAD context 只含本 record。
+                let rec_start = hdr_end - TLS_RECORD_HEADER_LEN;
+                this.aead = Aead::new(&this.write_buf[rec_start..], &this.united_key, this.use_aes);
+            }
             this.write_pending = Some((0, n));
             // continue → 下次迭代进入“发 pending”分支
         }
@@ -530,5 +549,57 @@ mod tests {
         let mut buf2 = [0u8; 6];
         conn_a.read_exact(&mut buf2).await.unwrap();
         assert_eq!(&buf2, b"b-to-a");
+    }
+
+    /// MaxNonce 耗尽边界（票 8jp6，Go common.go:134-141）：双向 nonce 各自钉在
+    /// MAX_NONCE，首个记录须以旧钥（回绕 nonce 0）解开并以该记录换派生新 AEAD；
+    /// 读侧若无轮换，open 以 nonce=MaxNonce 校验 tag 必败。轮换后新 AEAD 继续互通。
+    #[tokio::test]
+    async fn round_trip_rotates_at_max_nonce() {
+        use crate::encryption::aead::MAX_NONCE;
+
+        let (a_io, b_io) = tokio::io::duplex(64 * 1024);
+
+        let mut conn_a = CommonConn::new(
+            a_io,
+            Aead::new(b"ctx", b"k", true),   // A 发（→B）
+            Aead::new(b"ctx-r", b"k", true), // A 收（B→）
+            true,
+            b"k".to_vec(),
+        );
+        let mut conn_b = CommonConn::new(
+            b_io,
+            Aead::new(b"ctx-r", b"k", true), // B 发（→A）
+            Aead::new(b"ctx", b"k", true),   // B 收（A→）
+            true,
+            b"k".to_vec(),
+        );
+
+        // 两个方向各自的发送/接收计数器同步钉满（真实路径需 2^96 条记录）。
+        conn_a.aead.set_nonce_for_test(MAX_NONCE);
+        conn_b.peer_aead.as_mut().unwrap().set_nonce_for_test(MAX_NONCE);
+        conn_b.aead.set_nonce_for_test(MAX_NONCE);
+        conn_a.peer_aead.as_mut().unwrap().set_nonce_for_test(MAX_NONCE);
+
+        // A→B 首记录：耗尽记录旧钥互解 + 双侧换新。
+        conn_a.write_all(b"boundary").await.unwrap();
+        conn_a.flush().await.unwrap();
+        let mut buf = [0u8; 8];
+        conn_b.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"boundary");
+
+        // B→A 首记录：B 侧发送计数器同样耗尽，A 侧接收计数器同步轮换。
+        conn_b.write_all(b"after-rotate").await.unwrap();
+        conn_b.flush().await.unwrap();
+        let mut buf2 = [0u8; 12];
+        conn_a.read_exact(&mut buf2).await.unwrap();
+        assert_eq!(&buf2, b"after-rotate");
+
+        // 轮换后的新 AEAD（nonce 0 起步）继续互通。
+        conn_a.write_all(b"post").await.unwrap();
+        conn_a.flush().await.unwrap();
+        let mut buf3 = [0u8; 4];
+        conn_b.read_exact(&mut buf3).await.unwrap();
+        assert_eq!(&buf3, b"post");
     }
 }

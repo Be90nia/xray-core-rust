@@ -69,20 +69,23 @@ impl Aead {
         self.nonce == MAX_NONCE
     }
 
+    /// 测试专用：直接钉 nonce（MaxNonce 轮换需 2^96 条记录，真实流量无法构造）。
+    #[cfg(test)]
+    pub(crate) fn set_nonce_for_test(&mut self, nonce: [u8; NONCE_LEN]) {
+        self.nonce = nonce;
+    }
+
     /// nonce 小端 +1（对齐 Go `IncreaseNonce`：`nonce[11]++` 进位向 `nonce[0]`）。
     ///
-    /// 已在 MaxNonce 时返回 false（调用方应重新派生 AEAD）。
-    fn increase_nonce(&mut self) -> bool {
-        if self.nonce == MAX_NONCE {
-            return false;
-        }
+    /// MaxNonce（全 0xFF）自然溢出回绕为全 0（Go common.go:184-191 同语义）：
+    /// 耗尽记录以旧钥 nonce 0 收尾，随后由调用方（CommonConn）以该记录换派生新 AEAD。
+    fn increase_nonce(&mut self) {
         for i in (0..NONCE_LEN).rev() {
             self.nonce[i] = self.nonce[i].wrapping_add(1);
             if self.nonce[i] != 0 {
                 break;
             }
         }
-        true
     }
 
     /// 加密：附加密文到 `dst`。`nonce = None` 时先用内部 nonce（递增后再用，对齐 Go）。
@@ -292,6 +295,19 @@ mod tests {
         assert!(!a.is_max());
         a.nonce = MAX_NONCE;
         assert!(a.is_max());
+    }
+
+    /// MaxNonce 时 increase 自然溢出回绕为全 0，再 +1 为 ...01（对齐 Go IncreaseNonce）。
+    #[test]
+    fn increase_nonce_wraps_at_max() {
+        let mut a = Aead::new(b"c", b"k", true);
+        a.nonce = MAX_NONCE;
+        a.increase_nonce();
+        assert_eq!(a.nonce, [0u8; NONCE_LEN]);
+        a.increase_nonce();
+        let mut expect = [0u8; NONCE_LEN];
+        expect[NONCE_LEN - 1] = 1;
+        assert_eq!(a.nonce, expect);
     }
 
     /// 任意字节 context（非 UTF-8）：wire 兼容验证，不应 panic。
