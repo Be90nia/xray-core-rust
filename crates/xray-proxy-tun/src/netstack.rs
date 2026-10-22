@@ -788,8 +788,13 @@ pub fn build_udp_response(
                 hop_limit: 64,
             };
             let mut buf = vec![0u8; ip_repr.buffer_len() + udp_repr.header_len() + payload.len()];
+            // 写回 TUN 的手工包必须带真实校验和：Linux ip_rcv 强验 IPv4 头校验和，
+            // 全零包被内核直接丢弃（真机 tcpdump `bad cksum 0`，dig 经 TUN 超时）。
+            // 此处 ignored() 是 netstack caps=Tx 修复的漏网之鱼——该修复只覆盖
+            // smoltcp TX 路径，UDP 直通设计绕过 smoltcp 在此手工装包。
+            let caps = smoltcp::phy::ChecksumCapabilities::default();
             let mut ip_pkt = Ipv4Packet::new_unchecked(&mut buf);
-            ip_repr.emit(&mut ip_pkt, &smoltcp::phy::ChecksumCapabilities::ignored());
+            ip_repr.emit(&mut ip_pkt, &caps);
             let mut udp_pkt = UdpPacket::new_unchecked(&mut buf[ip_repr.buffer_len()..]);
             udp_repr.emit(
                 &mut udp_pkt,
@@ -797,7 +802,7 @@ pub fn build_udp_response(
                 &IpAddress::Ipv4(d4),
                 payload.len(),
                 |buf| buf.copy_from_slice(payload),
-                &smoltcp::phy::ChecksumCapabilities::ignored(),
+                &caps,
             );
             Some(buf)
         },
@@ -813,6 +818,7 @@ pub fn build_udp_response(
             let mut buf = vec![0u8; ip_repr.buffer_len() + udp_repr.header_len() + payload.len()];
             let mut ip_pkt = Ipv6Packet::new_unchecked(&mut buf);
             ip_repr.emit(&mut ip_pkt);
+            // IPv6 UDP checksum 强制（RFC 2460，全零非法），内核必丢零和包
             let mut udp_pkt = UdpPacket::new_unchecked(&mut buf[ip_repr.buffer_len()..]);
             udp_repr.emit(
                 &mut udp_pkt,
@@ -820,7 +826,7 @@ pub fn build_udp_response(
                 &IpAddress::Ipv6(d6),
                 payload.len(),
                 |buf| buf.copy_from_slice(payload),
-                &smoltcp::phy::ChecksumCapabilities::ignored(),
+                &smoltcp::phy::ChecksumCapabilities::default(),
             );
             Some(buf)
         },
@@ -1127,6 +1133,13 @@ mod tests {
         assert_eq!(resp_meta.dst.addr, req_meta.src.addr);
         assert_eq!(resp_meta.dst.port, req_meta.src.port);
         assert_eq!(resp_payload, b"dns-query");
+        // AI10：IP 头校验和必须真实有效——Linux ip_rcv 强验，全零/坏和包直接丢弃
+        // （真机实证：ignored() 装包 → tcpdump `bad cksum 0` → dig 经 TUN 永远超时）
+        let resp_ip = Ipv4Packet::new_checked(&reply[..]).expect("re-parse resp IPv4");
+        assert!(
+            resp_ip.verify_checksum(),
+            "IPv4 header checksum must verify (zero cksum is dropped by kernel ip_rcv)"
+        );
     }
 
     #[test]
@@ -1144,6 +1157,13 @@ mod tests {
         assert_eq!(meta.src.port, 53);
         assert_eq!(meta.dst.port, 33333);
         assert_eq!(payload, b"v6-payload");
+        // AI10：IPv6 UDP checksum 强制（RFC 2460），全零非法、内核必丢
+        let udp_pkt = UdpPacket::new_checked(&reply[40..]).expect("re-parse resp UDP");
+        assert_ne!(
+            udp_pkt.checksum(),
+            0,
+            "IPv6 UDP checksum is mandatory, zero is invalid and dropped"
+        );
     }
 
     /// 票 x1fz：src/dst 家族不匹配必须降级为 `None`（调用方丢包），不得 panic。
