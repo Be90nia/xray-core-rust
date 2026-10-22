@@ -494,10 +494,11 @@ mod tests {
         tokio::time::advance(Duration::from_secs(61)).await;
         stream.write_all(b"after-deadline").await.unwrap();
         let mut buf = [0u8; 16];
-        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
-            .await
-            .expect("echo must return")
-            .unwrap();
+        // 不套 `tokio::time::timeout`：本测试是 start_paused（虚拟时钟），虚拟超时
+        // 会在真实 loopback I/O 完成前就到期（macOS CI 实测 Elapsed）。契约本身不受
+        // 影响——若 60s deadline 漏到数据面，read 会返回超时/错误（下面的 unwrap）
+        // 而不是正常数据；服务端是本地 echo，不会真挂住。
+        let n = stream.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"after-deadline");
         server.abort();
     }
