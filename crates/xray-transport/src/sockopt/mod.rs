@@ -631,6 +631,8 @@ pub fn bind_socket_to_interface(
     }
     #[cfg(target_os = "linux")]
     {
+        // SO_BINDTODEVICE 与地址族无关（同一条 setsockopt 覆盖 v4/v6），dest_is_ipv4 不用
+        let _ = dest_is_ipv4;
         linux::LinuxSockOpt { bind_if_index: if_index, ..Default::default() }
             .apply(socket.as_raw_fd())
     }

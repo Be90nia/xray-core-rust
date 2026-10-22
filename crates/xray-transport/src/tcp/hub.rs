@@ -294,6 +294,17 @@ impl TcpUnixHubListener {
 }
 
 #[cfg(unix)]
+impl TransportListener for Arc<TcpUnixHubListener> {
+    fn close(&self) -> io::Result<()> {
+        (**self).close()
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        (**self).local_addr()
+    }
+}
+
+#[cfg(unix)]
 impl TransportListener for TcpUnixHubListener {
     fn close(&self) -> io::Result<()> {
         self.close_notify.notify_one();
