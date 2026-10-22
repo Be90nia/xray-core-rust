@@ -173,6 +173,9 @@ pub mod xray {
                 include!(concat!(env!("OUT_DIR"), "/xray.proxy.hysteria.account.rs"));
             }
         }
+        pub mod masque {
+            include!(concat!(env!("OUT_DIR"), "/xray.proxy.masque.rs"));
+        }
     }
 
     pub mod transport {
@@ -263,6 +266,15 @@ pub mod xray {
                         "/xray.transport.internet.finalmask.xicmp.rs"
                     ));
                 }
+                pub mod udphop {
+                    include!(concat!(
+                        env!("OUT_DIR"),
+                        "/xray.transport.internet.finalmask.udphop.rs"
+                    ));
+                }
+                pub mod xmc {
+                    include!(concat!(env!("OUT_DIR"), "/xray.transport.internet.finalmask.xmc.rs"));
+                }
             }
             pub mod httpupgrade {
                 include!(concat!(env!("OUT_DIR"), "/xray.transport.internet.httpupgrade.rs"));
@@ -291,6 +303,12 @@ pub mod xray {
             pub mod websocket {
                 include!(concat!(env!("OUT_DIR"), "/xray.transport.internet.websocket.rs"));
             }
+            pub mod masque {
+                include!(concat!(env!("OUT_DIR"), "/xray.transport.internet.masque.rs"));
+            }
+            pub mod xdrive {
+                include!(concat!(env!("OUT_DIR"), "/xray.transport.internet.xdrive.rs"));
+            }
         }
     }
 }
@@ -304,3 +322,55 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/xray_descriptor.bin"));
 
 pub use xray::*;
+
+/// G7 proto 对齐回归（票 Xray-core-rust-5std）：样本字节由 Go wire 编码器
+/// （protoc --encode，与 Go protobuf 运行时同编码）产出，字段含对账报告
+/// 原「Go→Rust 静默丢」项。解码必须还原字段值，而非报错或静默丢弃。
+#[cfg(test)]
+mod g7_proto_parity_tests {
+    use prost::Message;
+
+    #[test]
+    fn loopback_sniffing_survives_go_wire_decode() {
+        // inbound_tag:"in-loopback" + sniffing{enabled, dest_override:[http,tls], route_only}
+        let wire: &[u8] = &[
+            0x0a, 0x0b, 0x69, 0x6e, 0x2d, 0x6c, 0x6f, 0x6f, 0x70, 0x62, 0x61, 0x63, 0x6b, //
+            0x12, 0x0f, 0x08, 0x01, 0x12, 0x04, 0x68, 0x74, 0x74, 0x70, 0x12, 0x03, 0x74, 0x6c,
+            0x73, 0x28, 0x01,
+        ];
+        let cfg = crate::xray::proxy::loopback::Config::decode(wire).unwrap();
+        assert_eq!(cfg.inbound_tag, "in-loopback");
+        let sniffing = cfg.sniffing.expect("Go tag2 sniffing 必须还原（对齐前静默丢）");
+        assert!(sniffing.enabled);
+        assert_eq!(sniffing.destination_override, vec!["http", "tls"]);
+        assert!(sniffing.route_only);
+    }
+
+    #[test]
+    fn dns_id_and_script_survive_go_wire_decode() {
+        // name_server[0].id:"ns-primary"（tag18）+ script:"lua://handler"（tag15）
+        let wire: &[u8] = &[
+            0x2a, 0x0d, 0x92, 0x01, 0x0a, 0x6e, 0x73, 0x2d, 0x70, 0x72, 0x69, 0x6d, 0x61, 0x72,
+            0x79, 0x7a, 0x0d, 0x6c, 0x75, 0x61, 0x3a, 0x2f, 0x2f, 0x68, 0x61, 0x6e, 0x64, 0x6c,
+            0x65, 0x72,
+        ];
+        let cfg = crate::xray::app::dns::Config::decode(wire).unwrap();
+        assert_eq!(cfg.name_server[0].id, "ns-primary");
+        assert_eq!(cfg.script, "lua://handler");
+    }
+
+    #[test]
+    fn tun_new_fields_survive_go_wire_decode() {
+        // name:"tun0" + desc:"prod-tunnel"(tag8) + auto_system_dns_to_gateway(tag9)
+        // + auto_system_wfp_block_leak:["4242","4243"](tag10)
+        let wire: &[u8] = &[
+            0x0a, 0x04, 0x74, 0x75, 0x6e, 0x30, 0x42, 0x0b, 0x70, 0x72, 0x6f, 0x64, 0x2d, 0x74,
+            0x75, 0x6e, 0x6e, 0x65, 0x6c, 0x48, 0x01, 0x52, 0x04, 0x34, 0x32, 0x34, 0x32, 0x52,
+            0x04, 0x34, 0x32, 0x34, 0x33,
+        ];
+        let cfg = crate::xray::proxy::tun::Config::decode(wire).unwrap();
+        assert_eq!(cfg.desc, "prod-tunnel");
+        assert!(cfg.auto_system_dns_to_gateway);
+        assert_eq!(cfg.auto_system_wfp_block_leak, vec!["4242", "4243"]);
+    }
+}
