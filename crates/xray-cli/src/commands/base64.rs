@@ -8,9 +8,7 @@ use std::io::{Read, Write};
 
 use base64::Engine as _;
 use clap::{Args, Subcommand};
-use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
-use flate2::Compression;
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 
 use crate::error::CliError;
 
@@ -94,9 +92,9 @@ fn execute_decode(args: &DecodeArgs) -> Result<(), CliError> {
             CliError::InvalidArgument(format!("failed to write decoded output: {e}"))
         })?,
         _ => {
-            std::io::stdout()
-                .write_all(&data)
-                .map_err(|e| CliError::InvalidArgument(format!("failed to write decoded output: {e}")))?;
+            std::io::stdout().write_all(&data).map_err(|e| {
+                CliError::InvalidArgument(format!("failed to write decoded output: {e}"))
+            })?;
         },
     }
     Ok(())

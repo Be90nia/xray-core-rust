@@ -19,8 +19,7 @@ pub fn version_string() -> String {
 
 /// clap `Command::version` 注入用的 `'static` 版本串（LazyLock 单次计算，
 /// bin/xray.rs async_main deref 注入）。`&**VERSION` 即 `&'static str`。
-pub static VERSION: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(xray_core::version);
+pub static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(xray_core::version);
 
 /// 打印版本声明到 stdout。对应 Go `printVersion()`。
 pub fn print_version() {
