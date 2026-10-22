@@ -66,6 +66,23 @@ where
 mod tests {
     use super::*;
 
+    /// 契约：`exponential_backoff(n, d, f)` 恰好调用 `f` n 次（Go
+    /// `retry.ExponentialBackoff(5, 100)` 的调用次数语义）。平台无关，
+    /// 是「拨号重试 5 次」的**唯一严格真源**——不要用 TCP accept 次数代理
+    /// （macOS 上 accept 与 close 有竞态，实测 5 次尝试可能只出现 4 次 accept）。
+    #[tokio::test(start_paused = true)]
+    async fn exponential_backoff_attempts_exactly_n_times() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let r = exponential_backoff(5, 100, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err::<(), &'static str>("boom")
+        })
+        .await;
+        assert!(r.is_err(), "全失败必须返回错误");
+        assert_eq!(calls.load(Ordering::SeqCst), 5, "必须恰好尝试 5 次");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn succeeds_first_attempt_without_retry() {
         let mut calls = 0;

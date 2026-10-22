@@ -815,11 +815,13 @@ mod tests {
         let dial_fn = make_http_dial_fn(cfg);
         let dest = Destination::tcp(Address::new_domain("target.example.com"), Port::new(443));
         let err = dial_fn(&dest).await.err().expect("dial must fail after retries");
-        assert_eq!(
-            accepts.load(std::sync::atomic::Ordering::SeqCst),
-            5,
-            "dial must be attempted exactly 5 times"
-        );
+        // 严格契约「恰好 5 次尝试」由 `xray_transport::retry` 的
+        // `exponential_backoff_attempts_exactly_n_times` 钉住。
+        // 这里**不能**用 accept 次数代理尝试次数：假代理 accept 后立即 close，
+        // 客户端某次 connect 可能在对端 accept 完成前就收到 RST/EOF 而计不到
+        // accept（macOS CI 实测 5 次尝试 → 4 次 accept）。故只断言「确实重试过」。
+        let n = accepts.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(n >= 1, "dial must be retried at least once (accepts={n})");
         assert!(err.contains("retries exhausted"), "{err}");
     }
 
