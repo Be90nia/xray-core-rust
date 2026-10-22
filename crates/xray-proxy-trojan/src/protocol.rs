@@ -381,6 +381,9 @@ pub fn parse_udp_packet(buf: &[u8]) -> Result<(Address, u16, &[u8], usize)> {
 
     Ok((addr, port, payload, pos))
 }
+/// 流式解析结果：`Ok(None)` = 数据不足（调用方继续读），`Err` = 致命错误。
+type StreamParseOutcome<'a> = Result<Option<(Address, u16, &'a [u8], usize)>>;
+
 /// 流式解析 UDP 单包：区分「数据不足」与「致命错误」。
 ///
 /// 与 [`parse_udp_packet`] 的区别：数据不足时返回 `Ok(None)`（调用方应继续读），
@@ -390,7 +393,7 @@ pub fn parse_udp_packet(buf: &[u8]) -> Result<(Address, u16, &[u8], usize)> {
 /// # Errors
 /// - [`TrojanError::InvalidRemoteAddress`]：未知地址类型或域名 UTF-8 无效。
 /// - [`TrojanError::OversizePayload`]：payload 长度声明超过 `MAX_LENGTH`。
-pub fn parse_udp_packet_stream(buf: &[u8]) -> Result<Option<(Address, u16, &[u8], usize)>> {
+pub fn parse_udp_packet_stream(buf: &[u8]) -> StreamParseOutcome<'_> {
     // 1. addr + port（保留 InsufficientData / InvalidRemoteAddress 区分）
     let (addr, port, mut pos) = match read_address_port(buf) {
         Ok(v) => v,

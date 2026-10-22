@@ -377,7 +377,7 @@ impl WsListener {
                 let denied = tokio_tungstenite::tungstenite::http::Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .body(Some("no matching host/path".into()))
-                    .unwrap();
+                    .expect("fixed 404 response with fixed body");
                 return Err(denied);
             };
             *matched_cb.lock() = Some(idx);

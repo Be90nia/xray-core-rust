@@ -783,7 +783,7 @@ fn pem_block(label: &str, der: &[u8]) -> String {
     let b64 = base64::engine::general_purpose::STANDARD.encode(der);
     let mut out = format!("-----BEGIN {label}-----\n");
     for chunk in b64.as_bytes().chunks(64) {
-        out.push_str(std::str::from_utf8(chunk).unwrap());
+        out.push_str(std::str::from_utf8(chunk).expect("base64 output is ASCII"));
         out.push('\n');
     }
     out.push_str(&format!("-----END {label}-----\n"));

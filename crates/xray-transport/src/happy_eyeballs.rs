@@ -361,7 +361,10 @@ mod tests {
         let port = v4l.local_addr().unwrap().port();
         // 探测本机是否有 ::1 回环（无则跳过——CI 容器可能禁 v6）。
         if TcpListener::bind(("::1", 0)).await.is_err() {
-            eprintln!("skip: no IPv6 loopback in this environment");
+            #[allow(clippy::print_stderr)] // 测试 skip 需在输出可见原因
+            {
+                eprintln!("skip: no IPv6 loopback in this environment");
+            }
             return;
         }
         let echo = tokio::spawn(async move {

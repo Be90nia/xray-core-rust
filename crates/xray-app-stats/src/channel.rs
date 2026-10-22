@@ -58,6 +58,9 @@ impl ChannelConfig {
     }
 }
 
+/// 订阅列表共享句柄（unique ID + sender）。
+type Subscribers = Arc<Mutex<Vec<(u64, mpsc::Sender<ChannelMessage>)>>>;
+
 /// 统计通道实现。
 ///
 /// 对应 Go `app/stats.Channel`。线程安全。
@@ -67,7 +70,7 @@ impl ChannelConfig {
 pub struct StatsChannel {
     config: ChannelConfig,
     /// 与 worker task 共享（Arc：闭包需 'static）。
-    subscribers: Arc<Mutex<Vec<(u64, mpsc::Sender<ChannelMessage>)>>>,
+    subscribers: Subscribers,
     /// 单 worker fan-out 的发布入口。`start` 时创建，`close` 时 drop
     /// （worker `recv` 返回 None 退出）。
     worker_tx: Mutex<Option<mpsc::Sender<ChannelMessage>>>,

@@ -16,7 +16,7 @@
 
 // 测试编译单元统一豁免（数据面分配纪律见 crate clippy.toml）
 #![allow(clippy::disallowed_methods)]
-
+#![allow(clippy::unwrap_used)] // bd g3cr：测试断言便利豁免（allow-unwrap-in-tests 对 tests/ 目录失效，clippy#13981）；生产禁令不受影响
 use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;

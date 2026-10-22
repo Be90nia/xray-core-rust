@@ -885,7 +885,10 @@ mod tests {
                 assert_eq!(buf, b"btls-self-signed\n");
             },
             Err(e) => {
-                eprintln!("btls 自签证书握手失败: {e}");
+                #[allow(clippy::print_stderr)] // 诊断测试：记录失败而非 panic
+                {
+                    eprintln!("btls 自签证书握手失败: {e}");
+                }
                 // 不 panic——此测试用于诊断，记录失败即可
             },
         }
@@ -963,9 +966,12 @@ mod tests {
         }
 
         if !errors.is_empty() {
-            eprintln!("\n=== btls 全指纹测试失败详情 ===");
-            for e in &errors {
-                eprintln!("  {e}");
+            #[allow(clippy::print_stderr)] // assert 文本引用"见上方详情"，输出是断言的一部分
+            {
+                eprintln!("\n=== btls 全指纹测试失败详情 ===");
+                for e in &errors {
+                    eprintln!("  {e}");
+                }
             }
         }
         assert_eq!(fail, 0, "{fail} 个指纹握手失败（{ok} 成功），见上方详情");

@@ -57,15 +57,16 @@ pub struct TuicUdpAssoc {
 /// （stream 可靠有序，frag_total 恒 1），无需重组器。
 #[derive(Clone)]
 pub(crate) struct UniRespRouter {
-    waiters: Arc<parking_lot::Mutex<HashMap<(u16, u16), tokio::sync::oneshot::Sender<Packet>>>>,
+    waiters: Waiters,
 }
+
+/// (assoc, pkt) → oneshot 应答表共享句柄。
+type Waiters = Arc<parking_lot::Mutex<HashMap<(u16, u16), tokio::sync::oneshot::Sender<Packet>>>>;
 
 impl UniRespRouter {
     /// 在连接建立后调用：spawn per-connection 响应 pump（连接关闭自动退出）。
     pub(crate) fn spawn(conn: quinn::Connection) -> Self {
-        let waiters: Arc<
-            parking_lot::Mutex<HashMap<(u16, u16), tokio::sync::oneshot::Sender<Packet>>>,
-        > = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let waiters: Waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let w = Arc::clone(&waiters);
         tokio::spawn(async move {
             loop {

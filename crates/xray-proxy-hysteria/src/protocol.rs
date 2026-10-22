@@ -7,6 +7,7 @@
 
 use std::io::{self, Read, Write};
 
+use xray_common::padding::validate_padding_len;
 use xray_transport_hysteria::config::{TcpRequestPadding, TcpResponsePadding};
 
 use crate::error::HysteriaProxyError;
@@ -128,9 +129,8 @@ pub fn read_tcp_request<R: Read>(r: &mut R) -> Result<String, HysteriaProxyError
         .map_err(|e| HysteriaProxyError::ProtocolParse(format!("tcp request addr: {e}")))?;
     let padding_len = read_varint(r)
         .map_err(|e| HysteriaProxyError::ProtocolParse(format!("tcp request padding len: {e}")))?;
-    if padding_len > MAX_PADDING_LENGTH {
-        return Err(HysteriaProxyError::ProtocolParse("invalid padding length".into()));
-    }
+    validate_padding_len(padding_len, MAX_PADDING_LENGTH)
+        .map_err(|_| HysteriaProxyError::ProtocolParse("invalid padding length".into()))?;
     if padding_len > 0 {
         discard_exact(r, padding_len)
             .map_err(|e| HysteriaProxyError::ProtocolParse(format!("tcp request padding: {e}")))?;
@@ -179,9 +179,8 @@ pub fn read_tcp_response<R: Read>(r: &mut R) -> Result<(bool, String), HysteriaP
     };
     let padding_len = read_varint(r)
         .map_err(|e| HysteriaProxyError::ProtocolParse(format!("tcp response padding len: {e}")))?;
-    if padding_len > MAX_PADDING_LENGTH {
-        return Err(HysteriaProxyError::ProtocolParse("invalid padding length".into()));
-    }
+    validate_padding_len(padding_len, MAX_PADDING_LENGTH)
+        .map_err(|_| HysteriaProxyError::ProtocolParse("invalid padding length".into()))?;
     if padding_len > 0 {
         discard_exact(r, padding_len)
             .map_err(|e| HysteriaProxyError::ProtocolParse(format!("tcp response padding: {e}")))?;
@@ -568,6 +567,15 @@ mod tests {
         buf.extend(varint_bytes(0));
         let err = read_tcp_response(&mut io::Cursor::new(&buf)).unwrap_err();
         assert!(err.to_string().contains("invalid message length"), "got {err}");
+    }
+
+    #[test]
+    fn tcp_response_rejects_oversize_padding_len() {
+        let mut buf = vec![0u8]; // status
+        buf.extend(varint_bytes(0)); // msg_len
+        buf.extend(varint_bytes(MAX_PADDING_LENGTH + 1));
+        let err = read_tcp_response(&mut io::Cursor::new(&buf)).unwrap_err();
+        assert!(err.to_string().contains("invalid padding length"), "got {err}");
     }
 
     #[test]

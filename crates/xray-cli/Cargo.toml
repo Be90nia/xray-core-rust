@@ -24,6 +24,8 @@ prost = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = "0.22"
+# base64 子命令 -gzip：Go common/base64 用 stdlib compress/gzip；flate2 为 workspace 既有依赖（零新 crate 入图）
+flate2 = { workspace = true }
 blake3 = "1"
 rand = { workspace = true }
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
@@ -47,3 +49,7 @@ mimalloc = ["dep:mimalloc"]
 
 [dev-dependencies]
 tempfile = "3"
+
+# bd g3cr: 生产代码零 unwrap（测试代码由 clippy.toml allow-unwrap-in-tests 豁免）
+[lints.clippy]
+unwrap_used = "deny"

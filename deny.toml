@@ -26,6 +26,12 @@ ignore = [
     "RUSTSEC-2024-0436", # paste 1.0.15 unmaintained，proc-macro only 无 fix（.osv-scanner.toml 同口径）
     "RUSTSEC-2023-0071", # rsa 0.9.10 Marvin Attack timing，无 fix，xmc Minecraft 伪装路径（.osv-scanner.toml 同口径）
     "RUSTSEC-2025-0134", # rustls-pemfile 2.2.0 unmaintained（rustls/pemfile archived 2025-08），迁 pki-types 单票处置（.osv-scanner.toml 同口径）
+    # 以下两条 2026-10-22 显式 risk-accept（bd srlx，用户拍板）：rustls-webpki 0.103.15 /
+    # webpki-roots 1.0.8「distrusted intermediates」——补丁版本已存在，但本机到
+    # index.crates.io / static.crates.io 不可达（实测 3 次超时），升级无法本地验证编译。
+    # revisit：网络恢复后 `cargo update -p rustls-webpki -p webpki-roots@1.0.8` 并删除本两条。
+    "RUSTSEC-2026-0382", # rustls-webpki 0.103.15 certificate verification may accept distrusted intermediates
+    "RUSTSEC-2026-0381", # webpki-roots 1.0.8 bundled roots allow trust in distrusted emSign intermediates
 ]
 
 # ─────────────────────────── licenses ───────────────────────────

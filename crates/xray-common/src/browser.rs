@@ -535,9 +535,12 @@ mod tests {
         let ua = build_user_agent("chrome");
         let mut h: Vec<(String, String)> = Vec::new();
         apply_masqueraded_headers(&mut h, "chrome", "fetch");
-        println!("[e2e] User-Agent  = {}", get(&h, "User-Agent").unwrap_or(""));
-        println!("[e2e] Sec-CH-UA   = {}", get(&h, "Sec-CH-UA").unwrap_or(""));
-        println!("[e2e] build_user_agent direct = {ua}");
+        #[allow(clippy::print_stdout)] // 取证输出是本断言组的有意功能
+        {
+            println!("[e2e] User-Agent  = {}", get(&h, "User-Agent").unwrap_or(""));
+            println!("[e2e] Sec-CH-UA   = {}", get(&h, "Sec-CH-UA").unwrap_or(""));
+            println!("[e2e] build_user_agent direct = {ua}");
+        }
     }
 
     /// edge 出站同请求内 UA（Chrome/ + Edg/）与 Sec-CH-UA 版本号一致。

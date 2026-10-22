@@ -9,6 +9,7 @@
 
 use std::{
     net::IpAddr,
+    num::NonZeroUsize,
     sync::{Arc, LazyLock},
 };
 
@@ -78,7 +79,7 @@ impl Holder {
         Self {
             inner: Mutex::new(HolderInner { domain_to_ip: LruCache::unbounded() }),
             // 暂填一个占位 range，initialize() 才会真正设置。
-            ip_range: "0.0.0.0/32".parse().unwrap(),
+            ip_range: "0.0.0.0/32".parse().expect("placeholder CIDR literal is valid"),
             config: conf,
         }
     }
@@ -115,11 +116,9 @@ impl Holder {
 
         self.ip_range = ip_range;
         let mut inner = self.inner.lock();
+        // ponytail: lru_size 为 0 时退回 1（Go 行为是 panic）。
         inner.domain_to_ip =
-            LruCache::new(std::num::NonZeroUsize::new(lru_size).unwrap_or_else(|| {
-                // ponytail: lru_size 为 0 时退回 1（Go 行为是 panic）。
-                std::num::NonZeroUsize::new(1).unwrap()
-            }));
+            LruCache::new(NonZeroUsize::new(lru_size).unwrap_or(NonZeroUsize::MIN));
         Ok(())
     }
 

@@ -7,6 +7,9 @@
 # 注：per-crate clippy.toml 会替换 root 配置，root 阈值键在此镜像维护。
 cognitive-complexity-threshold = 30
 type-complexity-threshold = 300
+# bd g3cr 镜像（root clippy.toml 同键）：unwrap_used 由本 crate Cargo.toml
+# [lints.clippy] deny，测试代码（cfg(test)/tests/）豁免。
+allow-unwrap-in-tests = true
 
 # 已知未覆盖角落（后续批次补）：
 # - to_owned() / .collect::<Vec<_>>() / Vec::from(&buf[..]) 等价分配形态

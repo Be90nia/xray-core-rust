@@ -388,11 +388,14 @@ impl<E: DnsExecutor> DnsExecutor for Recording<E> {
     }
 }
 
+/// 运行时默认执行器对（routes, dns）。
+type DefaultExecutors = (Option<Box<dyn RouteExecutor>>, Option<Box<dyn DnsExecutor>>);
+
 /// 运行时默认执行器（按编译目标平台选择；具备渲染+真执行能力——
 /// 生产路径 `apply_exec`/`rollback_exec` 只会拿到本平台渲染器，Windows 上
 /// 不可能产出 `ip`/`resolvectl`，反之亦然）。
 #[must_use]
-pub fn default_executors() -> (Option<Box<dyn RouteExecutor>>, Option<Box<dyn DnsExecutor>>) {
+pub fn default_executors() -> DefaultExecutors {
     #[cfg(target_os = "windows")]
     {
         (Some(Box::new(WindowsRoutes)), Some(Box::new(WindowsDns)))

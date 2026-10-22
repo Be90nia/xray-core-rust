@@ -44,3 +44,7 @@ tokio = { workspace = true, features = ["test-util"] }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rcgen = "0.13"
+
+# bd g3cr: 生产代码零 unwrap（测试代码由 clippy.toml allow-unwrap-in-tests 豁免）
+[lints.clippy]
+unwrap_used = "deny"

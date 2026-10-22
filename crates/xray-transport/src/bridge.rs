@@ -1315,7 +1315,6 @@ mod tests {
         )
         .await;
         let elapsed = start.elapsed();
-        println!("up_eof_close_elapsed = {elapsed:?}");
         assert!(res.is_ok(), "bridge must return Ok on half-close window break");
         assert!(
             elapsed >= Duration::from_millis(1200),
@@ -1349,7 +1348,6 @@ mod tests {
         )
         .await;
         let elapsed = start.elapsed();
-        println!("down_eof_close_elapsed = {elapsed:?}");
         assert!(res.is_ok(), "bridge must return Ok on half-close window break");
         assert!(
             elapsed >= Duration::from_millis(80),

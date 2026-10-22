@@ -18,13 +18,14 @@
 //! - `xray api <sub>` — API 命令（23 个子命令，Go main/commands/all/api/api.go）
 //! - `xray tls <sub>` — TLS 工具
 //! - `xray convert <sub>` — 格式转换
+//! - `xray base64 <encode|decode>` — Base64 编解码（Go common/base64 前缀语义）
 //! - `xray x25519`（别名 curve25519）/ `wg` / `mldsa65` / `mlkem768` / `vlessenc` — 密钥生成
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use xray_cli::{
     commands::{
         api_args::*,
-        api_exec, keys,
+        api_exec, base64, keys,
         tool::{self, ConvertCommand, TlsCommand},
     },
     error::CliError,
@@ -34,7 +35,7 @@ use xray_cli::{
 
 /// CLI 顶层结构。
 #[derive(Parser, Debug)]
-#[command(name = "xray", version = "26.7.28", about = "Xray is a platform for building proxies.")]
+#[command(name = "xray", about = "Xray is a platform for building proxies.")]
 struct Cli {
     /// 子命令。未指定时默认 `run`（v4 兼容）。
     #[command(subcommand)]
@@ -181,6 +182,12 @@ enum Command {
         #[command(subcommand)]
         command: ConvertCommand,
     },
+
+    /// Encode and decode Base64.
+    Base64 {
+        #[command(subcommand)]
+        command: base64::Base64Command,
+    },
 }
 
 // bd uf2p: mimalloc 全局分配器（feature 默认开；--no-default-features 回退
@@ -197,7 +204,7 @@ static GLOBAL_ALLOC: xray_cli::alloc_stats::StatsAlloc<mimalloc::MiMalloc> =
 // 启动预检 `xray run -test -c` 即因此阻塞。归一化：已登记长名（含 `-x=v` 形态）
 // 补足双横线；未登记 token（真短参聚合如 `-c`）原样保留。
 const GO_STYLE_LONG_FLAGS: &[&str] =
-    &["config", "confdir", "format", "test", "dump", "unix", "version", "help"];
+    &["config", "confdir", "format", "test", "dump", "unix", "version", "help", "gzip"];
 
 fn normalize_go_style_args(mut argv: Vec<String>) -> Vec<String> {
     // Go v4 兼容（getArgsV4Compatible）：首个 token 若不是子命令、也非顶层
@@ -209,6 +216,7 @@ fn normalize_go_style_args(mut argv: Vec<String>) -> Vec<String> {
         "api",
         "tls",
         "convert",
+        "base64",
         "x25519",
         "curve25519",
         "wg",
@@ -325,7 +333,15 @@ async fn async_main() -> std::process::ExitCode {
     // bd xag3③：env 热路径闸门启动期显式解析一次（对齐 Go reloadEnvSettings；
     // LazyLock 首调兜底，此处为显式语义锚点）。
     xray_common::platform::env::reload_env_settings();
-    let cli = Cli::parse_from(normalize_go_style_args(std::env::args().collect()));
+    // bd vjbq：版本号单一事实源 = xray-core 版本模块。clap 4.6
+    // `Command::version` 按 `IntoResettable<Str>` 收参（Str 仅 From<&'static str>），
+    // derive 属性与运行期 String 均不可入——经 LazyLock 静态量 deref 出
+    // &'static str 注入 builder 后再解析。语义等价 `Cli::parse_from`
+    // （get_matches_from + from_arg_matches，错误同走 clap exit）。
+    let matches = <Cli as CommandFactory>::command()
+        .version(&**version::VERSION)
+        .get_matches_from(normalize_go_style_args(std::env::args().collect()));
+    let cli = <Cli as FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     // v4 兼容：无子命令时默认 run
     let command = cli.command.unwrap_or(Command::Run(RunArgs::default()));
     if !matches!(command, Command::Run(_)) {
@@ -411,6 +427,7 @@ async fn execute(command: Command) -> Result<(), CliError> {
         Command::Api { command } => execute_api(&command).await,
         Command::Tls { command } => tool::execute_tls(&command).await,
         Command::Convert { command } => tool::execute_convert(&command),
+        Command::Base64 { command } => base64::execute_base64(&command),
     }
 }
 

@@ -140,10 +140,10 @@ impl GeodataReloader for NoopReloader {
 /// 真实 AssetDownloader：用 std::net TCP 写最小 HTTP/1.1 GET。
 ///
 /// 对应 Go `downloader` + `idleConn` + `http.Client` 中"实际下字节"的子集：
-/// 不做 HTTPS、不走 dispatcher dial、不做 redirect——这些都可以由 trait
-/// 上层包装或后续替换为 hyper 实现覆盖。当前是 ponytail 最小实现：
+/// 不走 dispatcher dial（Go 走 tagged dialer）——这可由 trait 上层包装覆盖。当前实现：
 ///
-/// - 仅支持 `http://`（https 暂未实现；`download_to` 返回 Io 错即可）
+/// - 支持 `http://` 与 `https://`（rustls + webpki-roots 同步握手）
+/// - 跟随 redirect：Go `CheckRedirect` 语义（目标必须 https，最多 10 跳）
 /// - 单连接一次性 GET，Body 全读到 temp 文件
 /// - 默认 30s 超时（与 Go `idleTimeout` 对齐），可用 `with_timeout` 覆盖
 /// - 状态码非 2xx → `UnexpectedStatus`
@@ -203,6 +203,9 @@ impl RealAssetDownloader {
     }
 }
 
+/// Go `CheckRedirect`：最多跟随 10 跳（第 11 跳报 `TooManyRedirects`）。
+const MAX_REDIRECTS: usize = 10;
+
 struct ParsedUrl {
     scheme: String,
     host: String,
@@ -210,8 +213,41 @@ struct ParsedUrl {
     path: String,
 }
 
-impl AssetDownloader for RealAssetDownloader {
-    fn download_to(&self, url: &str, temp_path: &std::path::Path) -> Result<(), GeodataError> {
+impl ParsedUrl {
+    /// 把响应 `Location` 解析为绝对 URL，并按 Go `CheckRedirect` 校验 scheme。
+    ///
+    /// Go 的 `http.Client` 支持任意相对 URL 解析；这里覆盖绝对 URL 与根相对路径
+    /// （GitHub raw 走绝对 URL），其余相对形态显式报错。
+    fn resolve_location(&self, url: &str, location: &str) -> Result<String, GeodataError> {
+        let loc = location.trim();
+        let absolute = if loc.starts_with("http://") || loc.starts_with("https://") {
+            loc.to_string()
+        } else if loc.starts_with('/') {
+            let default_port = (self.scheme == "https" && self.port == 443)
+                || (self.scheme == "http" && self.port == 80);
+            let port = if default_port { String::new() } else { format!(":{}", self.port) };
+            format!("{}://{}{}{}", self.scheme, self.host, port, loc)
+        } else {
+            return Err(GeodataError::DownloadFailed {
+                url: url.to_string(),
+                reason: format!("unsupported relative redirect location: {loc}"),
+            });
+        };
+        // Go CheckRedirect：`req.URL.Scheme != "https"` 一律拒绝（含 http→http）。
+        if !absolute.starts_with("https://") {
+            return Err(GeodataError::InsecureRedirect(absolute));
+        }
+        Ok(absolute)
+    }
+}
+
+impl RealAssetDownloader {
+    /// 单跳 GET。返回 `Some(下一跳绝对 URL)` = 3xx 重定向（尚未落盘），`None` = 已落盘。
+    fn fetch_once(
+        &self,
+        url: &str,
+        temp_path: &std::path::Path,
+    ) -> Result<Option<String>, GeodataError> {
         let parsed = self.parse_url(url)?;
 
         use std::{io::Write, net::TcpStream, time::Instant};
@@ -235,7 +271,7 @@ impl AssetDownloader for RealAssetDownloader {
             path = parsed.path,
             host = parsed.host,
         );
-        if parsed.scheme == "https" {
+        let redirect = if parsed.scheme == "https" {
             // pn8e: https 路径。rustls::Stream 仅借用 &mut conn + &mut tcp，故
             // ClientConnection 须在 caller 栈上持有以延长 Stream 借用生命周期；
             // https_handshake 内部用 `*conn = ClientConnection::new(...)` 重赋值。
@@ -264,14 +300,33 @@ impl AssetDownloader for RealAssetDownloader {
                 url: url.to_string(),
                 reason: format!("write request (tls): {e}"),
             })?;
-            read_http_body(tls, url, temp_path, Instant::now() + self.timeout)
+            read_http_body(tls, url, temp_path, Instant::now() + self.timeout)?
         } else {
             tcp.write_all(req.as_bytes()).map_err(|e| GeodataError::DownloadFailed {
                 url: url.to_string(),
                 reason: format!("write request: {e}"),
             })?;
-            read_http_body(tcp, url, temp_path, Instant::now() + self.timeout)
+            read_http_body(tcp, url, temp_path, Instant::now() + self.timeout)?
+        };
+        match redirect {
+            Some(location) => Ok(Some(parsed.resolve_location(url, &location)?)),
+            None => Ok(None),
         }
+    }
+}
+
+impl AssetDownloader for RealAssetDownloader {
+    fn download_to(&self, url: &str, temp_path: &std::path::Path) -> Result<(), GeodataError> {
+        let mut current = url.trim().to_string();
+        // Go `http.Client` 自动跟随 redirect（CheckRedirect：目标必须 https、最多 10 跳）。
+        // github.com/.../raw/... 会 302 到 raw.githubusercontent.com，不跟随则恒 UnexpectedStatus。
+        for _ in 0..=MAX_REDIRECTS {
+            match self.fetch_once(&current, temp_path)? {
+                Some(next) => current = next,
+                None => return Ok(()),
+            }
+        }
+        Err(GeodataError::TooManyRedirects)
     }
 
     fn resolve_target(&self, file: &str) -> Result<PathBuf, GeodataError> {
@@ -285,12 +340,14 @@ impl AssetDownloader for RealAssetDownloader {
 ///
 /// 接收任意 `R: Read`：裸 TCP（http） 或 `rustls::Stream<...>`（https）。
 /// 解析状态行 + Content-Length，按协议规定读取 body 到 `temp_path`。
+///
+/// 返回 `Some(Location)` 表示 3xx 需跟跳（未落盘），`None` 表示 body 已落盘。
 fn read_http_body<R: std::io::Read>(
     mut stream: R,
     url: &str,
     temp_path: &std::path::Path,
     deadline: std::time::Instant,
-) -> Result<(), GeodataError> {
+) -> Result<Option<String>, GeodataError> {
     use std::io::Write;
 
     // 读 headers 到 \r\n\r\n。
@@ -341,6 +398,7 @@ fn read_http_body<R: std::io::Read>(
     })?;
 
     let mut content_length: Option<usize> = None;
+    let mut location: Option<String> = None;
     for line in lines {
         if line.is_empty() {
             break;
@@ -348,8 +406,19 @@ fn read_http_body<R: std::io::Read>(
         if let Some((k, v)) = line.split_once(':') {
             if k.trim().eq_ignore_ascii_case("content-length") {
                 content_length = v.trim().parse().ok();
+            } else if k.trim().eq_ignore_ascii_case("location") {
+                location = Some(v.trim().to_string());
             }
         }
+    }
+
+    if (300..400).contains(&status_code) {
+        // Go 客户端自动跟随 redirect；缺 Location 的 3xx 无从跟随 → Go fetch 按
+        // "status < 200 || >= 300" 报 UnexpectedStatus。
+        return match location {
+            Some(loc) => Ok(Some(loc)),
+            None => Err(GeodataError::UnexpectedStatus(status_code)),
+        };
     }
 
     if !(200..300).contains(&status_code) {
@@ -416,7 +485,7 @@ fn read_http_body<R: std::io::Read>(
     if total == 0 {
         return Err(GeodataError::EmptyResponse(url.to_string()));
     }
-    Ok(())
+    Ok(None)
 }
 
 /// rustls 0.23 同步 TLS 握手：吃 std TCP，包成 `rustls::Stream<ClientConnection, TcpStream>`。
@@ -667,5 +736,50 @@ mod tests {
     #[test]
     fn noop_reloader_returns_ok() {
         assert!(NoopReloader.reload().is_ok());
+    }
+
+    fn parsed(scheme: &str, host: &str, port: u16) -> ParsedUrl {
+        ParsedUrl { scheme: scheme.into(), host: host.into(), port, path: "/a".into() }
+    }
+
+    #[test]
+    fn resolve_location_accepts_absolute_https() {
+        let p = parsed("https", "example.com", 443);
+        let got = p.resolve_location("https://ex.com/a", "https://cdn.test/f.dat").unwrap();
+        assert_eq!(got, "https://cdn.test/f.dat");
+    }
+
+    #[test]
+    fn resolve_location_rejects_non_https_target() {
+        // Go CheckRedirect: `req.URL.Scheme != "https"` → 拒绝（http→http 也拒）。
+        let p = parsed("http", "127.0.0.1", 8080);
+        let err =
+            p.resolve_location("http://127.0.0.1:8080/a", "http://127.0.0.1:8080/b").unwrap_err();
+        assert!(matches!(err, GeodataError::InsecureRedirect(_)), "got {err:?}");
+        // http 基址 + 根相对路径 → 解析结果仍是 http → 同样拒绝
+        let err = p.resolve_location("http://127.0.0.1:8080/a", "/b").unwrap_err();
+        assert!(matches!(err, GeodataError::InsecureRedirect(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn resolve_location_builds_root_relative_on_same_origin() {
+        let p = parsed("https", "example.com", 443);
+        assert_eq!(
+            p.resolve_location("https://example.com/a", "/f.dat").unwrap(),
+            "https://example.com/f.dat"
+        );
+        // 非默认端口需带回
+        let p = parsed("https", "example.com", 8443);
+        assert_eq!(
+            p.resolve_location("https://example.com:8443/a", "/f.dat").unwrap(),
+            "https://example.com:8443/f.dat"
+        );
+    }
+
+    #[test]
+    fn resolve_location_rejects_bare_relative() {
+        let p = parsed("https", "example.com", 443);
+        let err = p.resolve_location("https://example.com/a", "f.dat").unwrap_err();
+        assert!(matches!(err, GeodataError::DownloadFailed { .. }), "got {err:?}");
     }
 }

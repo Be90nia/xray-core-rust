@@ -34,7 +34,7 @@ use xray_proto::xray::{
 use super::api_args::*;
 use crate::{commands::api_client::ApiClient, error::CliError};
 
-/// 读取配置参数（文件路径、`stdin:`、或 HTTP URL）。
+/// 读取配置参数（文件路径或 `stdin:`；Go 侧 HTTP URL 远程加载 Rust 未实现）。
 fn load_config(arg: &str) -> Result<Vec<u8>, CliError> {
     if arg == "stdin:" {
         let mut buf = Vec::new();

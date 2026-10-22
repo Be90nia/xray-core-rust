@@ -286,7 +286,10 @@ mod tests {
         assert!(has_v4, "at least one IPv4 address expected");
         // CI 沙箱可能无 IPv6 栈：无 v6 时显式跳过并打印，不静默通过。
         if !has_v6 {
-            eprintln!("SKIP: no IPv6 address on this host (CI sandbox)");
+            #[allow(clippy::print_stderr)] // skip 必须在输出可见原因
+            {
+                eprintln!("SKIP: no IPv6 address on this host (CI sandbox)");
+            }
         }
     }
 
@@ -310,6 +313,7 @@ mod tests {
 
     /// 端到端取证：打印全部接口与地址（`cargo test -p xray-common interface -- --nocapture`）。
     #[test]
+    #[allow(clippy::print_stderr)] // 本测试就是打印取证（--nocapture 手检工具）
     fn dump_all_interfaces_for_manual_inspection() {
         let ifs = interfaces().expect("interface enumeration should not fail");
         assert!(!ifs.is_empty());

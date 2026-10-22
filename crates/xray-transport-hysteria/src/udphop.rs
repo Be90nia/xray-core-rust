@@ -91,19 +91,15 @@ pub type CloseFuture = std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>
 /// `net.PacketConn` 的异步抽象（对应 Go `net.PacketConn`）。
 ///
 /// ponytail: 不引入 async_trait crate，方法返回 `Pin<Box<dyn Future>>`。
+/// PacketConn future（`Pin<Box<dyn Future>>`，ponytail 不引 async_trait）。
+type PacketFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = std::io::Result<T>> + Send + 'a>>;
+
 pub trait PacketConn: Send + Sync {
     /// 接收数据包到 buf，返回 (字节数, 源地址)。
-    fn recv_from<'a>(
-        &'a self,
-        buf: &'a mut [u8],
-    ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<(usize, SocketAddr)>> + Send + 'a>>;
+    fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> PacketFuture<'a, (usize, SocketAddr)>;
 
     /// 发送数据包到指定地址。
-    fn send_to<'a>(
-        &'a self,
-        buf: &'a [u8],
-        addr: SocketAddr,
-    ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<usize>> + Send + 'a>>;
+    fn send_to<'a>(&'a self, buf: &'a [u8], addr: SocketAddr) -> PacketFuture<'a, usize>;
 
     /// 关闭。
     fn close(&self) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>;
@@ -274,7 +270,7 @@ impl UdpHopPacketConn {
         buf[..n].copy_from_slice(&pkt_buf[..n]);
         // buf 归还池，供 recv_loop 复用（对齐 Go ReadFrom 的 pool.Put）。
         self.pool.put(pkt_buf);
-        Ok((n, addr.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap())))
+        Ok((n, addr.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)))))
     }
 
     /// 发送到当前活跃 addr（对应 Go `WriteTo`）。

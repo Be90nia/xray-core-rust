@@ -123,6 +123,13 @@ impl QuicConfig {
     }
 }
 
+/// QUIC conn/stream future（`Pin<Box<dyn Future>>`，ponytail 不引 async_trait）。
+type QuicConnFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Arc<dyn QuicConn>>> + Send>>;
+type QuicStreamFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = std::io::Result<Arc<dyn QuicStream>>> + Send>,
+>;
+
 /// QUIC + HTTP/3 transport 抽象（对应 Go `http3.Transport` + `quic.Transport`）。
 ///
 /// 上层（quinn/h3 adapter）实现此 trait。dialer 内部用此 trait 完成：
@@ -137,17 +144,10 @@ pub trait HysteriaTransport: Send + Sync {
         quic_config: &QuicConfig,
         auth_token: &str,
         brutal_down_bps: u64,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = std::io::Result<Arc<dyn QuicConn>>> + Send>,
-    >;
+    ) -> QuicConnFuture;
 
     /// 在已认证的 conn 上打开新 stream（对应 Go `conn.OpenStream()`）。
-    fn open_stream(
-        &self,
-        conn: &Arc<dyn QuicConn>,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = std::io::Result<Arc<dyn QuicStream>>> + Send>,
-    >;
+    fn open_stream(&self, conn: &Arc<dyn QuicConn>) -> QuicStreamFuture;
 }
 
 /// Dialer 工厂（对应 Go `Dial` 函数）。
