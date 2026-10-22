@@ -799,14 +799,40 @@ fn build_udpmask_entry(entry: &serde_json::Value) -> io::Result<Box<dyn Udpmask>
     let settings = obj.get("settings").cloned().unwrap_or(serde_json::Value::Null);
     match mask_type {
         "mkcp-legacy" => build_mkcp_legacy_udpmask(&settings),
-        "salamander" => Ok(Box::new(salamander::SalamanderConfig {
-            password: settings
-                .get("password")
-                .or_else(|| settings.get("key"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-        })),
+        "salamander" => {
+            // Go Salamander.PacketSize（transport_finalmask.go:747-749，Build :753-760）：
+            // PacketSize 是 Int32Range（common.go:298-311 只收 "a-b" 字符串或纯数字，
+            // 对象/布尔形态 Go 直接 "Invalid integer range" 硬错）。to>0 切
+            // GeckoConfig（QUIC 长头分片原语，wire 不同于普通 salamander）；Rust
+            // gecko 子模式未实现（salamander.rs 模块注释），to>0 显式拒绝——静默
+            // 保持普通 salamander 会伪装成同 wire 而实际对端语义已变。to<=0（Go
+            // 走普通分支）放行。
+            let to = match settings.get("packetSize") {
+                None | Some(serde_json::Value::Null) => 0,
+                Some(serde_json::Value::String(s)) => parse_range_string(s)?.1,
+                Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0),
+                Some(_) => {
+                    return Err(mask_err(
+                        "finalmask: salamander \"packetSize\": invalid integer range, expected \
+                         string of form \"1-2\" or plain integer",
+                    ));
+                },
+            };
+            if to > 0 {
+                return Err(mask_err(
+                    "finalmask: salamander \"packetSize\" (gecko mode) is not supported by this \
+                     build; remove the key",
+                ));
+            }
+            Ok(Box::new(salamander::SalamanderConfig {
+                password: settings
+                    .get("password")
+                    .or_else(|| settings.get("key"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            }))
+        },
         "noise" => build_noise_config(&settings).map(|c| Box::new(c) as Box<dyn Udpmask>),
         "sudoku" => Ok(Box::new(build_sudoku_config(&settings))),
         "xdns" => build_xdns_config(&settings).map(|c| Box::new(c) as Box<dyn Udpmask>),
@@ -1440,7 +1466,7 @@ fn build_xdns_config(settings: &serde_json::Value) -> io::Result<xdns::Config> {
     let mut domains = Vec::new();
     if let Some(serde_json::Value::Array(arr)) = settings.get("domains") {
         for d in arr {
-            domains.push(xdns::build_domain_config(d)?);
+            domains.extend(xdns::build_domain_config(d)?);
         }
     }
     let mut resolvers = Vec::new();
@@ -1584,6 +1610,15 @@ fn build_realm_config(settings: &serde_json::Value) -> io::Result<realm::Config>
                 "realm: \"portMapping\" is not supported by this build; remove the key or set enabled=false",
             ));
         }
+    }
+    // Go RealmConfig.TlsConfig（transport_finalmask.go:1011，Build :1077-1082；
+    // 消费 realm/client.go:65、server.go:89 NewClient(..., TlsConfig) 定形隧道
+    // TLS）：Rust 端 TLS 细节仅由 scheme 承载（use_tls），完整 TLS 配置无对应
+    // 能力——非 null 显式拒绝而非静默忽略；null/缺省 Go 侧同为 nil 无操作，放行。
+    if settings.get("tlsConfig").is_some_and(|x| !x.is_null()) {
+        return Err(mask_err(
+            "realm: \"tlsConfig\" is not supported by this build; remove the key",
+        ));
     }
     Ok(realm::Config {
         scheme: scheme.to_string(),
@@ -2642,6 +2677,78 @@ mod tests {
             ]}"#);
         let mgr = build_udpmask_manager_from_json(Some(&json)).unwrap();
         assert_eq!(mgr.udpmasks.len(), 6);
+    }
+
+    /// Go Salamander.PacketSize（transport_finalmask.go:747-760）：to>0 切 Gecko
+    /// wire 原语，Rust 未实现 → 指名键硬错；to<=0（Go 普通分支）/缺省放行。
+    #[test]
+    fn salamander_packet_size_rejects_gecko_mode_passes_plain() {
+        let err = |v: &str| match build_udpmask_entry(&fm(v)) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected packetSize reject"),
+        };
+        // Int32Range 两种合法形态（字符串 range / 纯数字）均触发 gecko 拒绝。
+        assert!(
+            err(r#"{"type":"salamander","settings":{"password":"p","packetSize":"100-200"}}"#)
+                .contains("packetSize")
+        );
+        assert!(
+            err(r#"{"type":"salamander","settings":{"password":"p","packetSize":1200}}"#)
+                .contains("packetSize")
+        );
+        // 对象/布尔形态：Go Int32Range 直接 "Invalid integer range" 硬错，Rust 同拒。
+        assert!(
+            err(r#"{"type":"salamander","settings":{"password":"p","packetSize":{"from":100}}}"#)
+                .contains("invalid integer range")
+        );
+        // to<=0 / 缺省 / null → Go 走普通 salamander 分支，放行。
+        build_udpmask_entry(&fm(r#"{"type":"salamander","settings":{"password":"p"}}"#)).unwrap();
+        build_udpmask_entry(&fm(
+            r#"{"type":"salamander","settings":{"password":"p","packetSize":null}}"#,
+        ))
+        .unwrap();
+        build_udpmask_entry(&fm(
+            r#"{"type":"salamander","settings":{"password":"p","packetSize":"0-0"}}"#,
+        ))
+        .unwrap();
+    }
+
+    /// Go RealmConfig.TlsConfig（transport_finalmask.go:1011，Build :1077-1082，
+    /// 消费 realm/client.go:65）：Rust 仅 use_tls，非 null 指名键硬错；null/缺省放行。
+    #[test]
+    fn realm_tls_config_rejects_non_null_passes_absent() {
+        let err = match build_udpmask_entry(&fm(
+            r#"{"type":"realm","settings":{"url":"realm://t@h.example.com/i",
+                "stunServers":["s.example.com:3478"],"tlsConfig":{"serverName":"h.example.com"}}}"#,
+        )) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected tlsConfig reject"),
+        };
+        assert!(err.contains("tlsConfig"), "got: {err}");
+        build_udpmask_entry(&fm(
+            r#"{"type":"realm","settings":{"url":"realm://t@h.example.com/i","stunServers":["s.example.com:3478"]}}"#,
+        ))
+        .unwrap();
+        build_udpmask_entry(&fm(r#"{"type":"realm","settings":{"url":"realm://t@h.example.com/i",
+                "stunServers":["s.example.com:3478"],"tlsConfig":null}}"#))
+        .unwrap();
+    }
+
+    /// Go XDNSDomain.Names[]（transport_finalmask.go:813，Build :841-858）：一项
+    /// names 展开多条域；Rust 旧方言 name 兜底。
+    #[test]
+    fn xdns_names_array_expands_domains() {
+        let cfg = build_xdns_config(&fm(r#"{"domains":[
+                {"names":["a.example.com","b.example.com"],"types":[16]},
+                {"name":"c.example.com","types":[1]}
+            ],"resolvers":[{"type":"udp","settings":{"addr":"1.1.1.1:53"}}]}"#))
+        .unwrap();
+        assert_eq!(cfg.domains.len(), 3);
+        assert_eq!(cfg.domains[0].name, "a.example.com");
+        assert_eq!(cfg.domains[1].name, "b.example.com");
+        assert_eq!(cfg.domains[2].name, "c.example.com");
+        // 同参展开：names 两条共享 types。
+        assert_eq!(cfg.domains[1].types, cfg.domains[0].types);
     }
 
     #[test]

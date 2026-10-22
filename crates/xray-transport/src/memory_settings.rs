@@ -210,6 +210,12 @@ pub fn parse_quic_params_config(
     let get_i64 = |k: &str| obj.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
     let get_bool = |k: &str| obj.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
     let udp_hop = parse_udp_hop(obj.get("udpHop"))?;
+    // Go QuicParamsConfig 另有 disableChromeParrot/disableGSO/disableStatelessReset
+    // （transport_finalmask.go:1191,1192,1194；消费 dialer.go/hub.go 的 quic-go
+    // Transport 旋钮）。quinn 无等价旋钮（ChromeParrot 是 quic-go 内部 parrot、
+    // GSO 自动、StatelessResetKey 未设）——true 的意图 Rust 天然满足、false 为
+    // 能力级差异，键级无语义可保（同 xray-transport-hysteria/src/quic_params.rs
+    // 登记口径），故不读取不报错。
     Ok(Some(QuicParamsConfig {
         congestion: get_str("congestion"),
         debug: get_bool("debug"),
