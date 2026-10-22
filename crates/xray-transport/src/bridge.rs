@@ -506,6 +506,13 @@ where
     bridge_link_with_stream_full(link, stream, &policy).await
 }
 
+/// 下行 per-tag 流量统计对（出站, 入站）；提取别名以满足 clippy type_complexity。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+type DownlinkCounters = (
+    Option<std::sync::Arc<dyn xray_features::stats::Counter>>,
+    Option<std::sync::Arc<dyn xray_features::stats::Counter>>,
+);
+
 /// 下行 splice 快路径桥（txno-splice；Go freedom responseDone 的
 /// `proxy.CopyRawConnIfExist` splice 分支等价物，freedom.go:428-436）。
 ///
@@ -523,10 +530,7 @@ pub async fn bridge_link_with_stream_downlink_splice<S>(
     stream: S,
     write_raw: std::sync::Arc<tokio::net::TcpStream>,
     policy: &TimeoutPolicy,
-    down_counters: (
-        Option<std::sync::Arc<dyn xray_features::stats::Counter>>,
-        Option<std::sync::Arc<dyn xray_features::stats::Counter>>,
-    ),
+    down_counters: DownlinkCounters,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Connection,

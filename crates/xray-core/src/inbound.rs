@@ -11286,13 +11286,25 @@ mod tests {
             client_io.send_to(b"query", relay).await.expect("send to dokodemo udp");
 
             let mut rbuf = vec![0u8; 2048];
-            let (n, _from) = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+            // 30s：Linux CI 高负载下 spawn 最重的 inbound 测试，10s 有调度饥饿误报。
+            let recv = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
                 client_io.recv_from(&mut rbuf),
             )
-            .await
-            .expect("dokodemo udp finalmask 链路超时（mask 未接线或服务端未解伪装）")
-            .expect("recv from dokodemo udp");
+            .await;
+            // serve 任务可能在无 tracing subscriber 的测试环境里静默死亡（bind/
+            // 装配失败只见 tracing::error）——裸 timeout 会把这种死亡伪装成链路
+            // 超时。超时时先验尸再报错。
+            let recv = match recv {
+                Ok(r) => r,
+                Err(_) if handle.is_finished() => panic!(
+                    "dokodemo inbound serve task 提前退出（bind/装配失败，Linux CI 资源受限典型），masked={masked}"
+                ),
+                Err(_) => panic!(
+                    "dokodemo udp finalmask 链路超时（mask 未接线或服务端未解伪装），masked={masked}"
+                ),
+            };
+            let (n, _from) = recv.expect("recv from dokodemo udp");
             assert_eq!(
                 &rbuf[..n],
                 b"dokodemo-udp-fm",
