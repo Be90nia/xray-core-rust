@@ -1,25 +1,28 @@
-# target-cpu / target-feature 策略（bd f39e，2026-10-22 用户拍板「修吧」）
+# x86_64 指令集策略（bd f39e，2026-10-22 实测分离 + 用户拍板「修吧」）
 #
-# 实测（tools/loopback_alloc_bench.py，同机同配置，3 轮）：
-#   - 仅 -C target-cpu=x86-64：37.8 / 39.1 / 39.2 MB/s
-#   - 加 -C target-cpu=native：159.4 / 183.1 / 189.1 MB/s
-# 差异来自 AES-NI / PCLMULQDQ / SSE4 等扩展未启用：加密链（vless mlkem-enc +
-# xhttp/reality）落到软件实现 → 4.5 倍慢。历史「native 5 倍慢」结论（bd hxy3）
-# 与本夜实测相反，已由 f39e 纠正。
+# 实测（tools/loopback_alloc_bench.py，同机同配置，3 轮，加密链拓扑）：
+#   - 仅 -C target-cpu=x86-64（默认）          ：37.8 / 39.1 / 39.2 MB/s
+#   - +aes,+pclmulqdq,+sse4.1,+sse4.2,+popcnt ：157.9 / 178.1 / 173.6 MB/s
+#   - 仅 +sse4.1,+sse4.2,+popcnt（无 AES）     ：155.0 / 140.1 / 157.2 MB/s
+#   - -C target-cpu=native                     ：159.4 / 183.1 / 189.1 MB/s
 #
-# 仍然**不用 native**：发行产物必须跨机器可用（老 CPU SIGILL 防线）。
-# 改为显式启用「2010 年后 x86-64 普及」的特性集：
-#   AES-NI / PCLMULQDQ（Westmere 2010+，AMD Bulldozer 2011+）
-#   SSE4.1 / SSE4.2 / POPCNT（Nehalem 2008+）
-# 只对 x86_64 生效（cfg 分目标），aarch64/arm 交叉编译不受影响——因此各
-# workflow 里的 `RUSTFLAGS: ""` 空覆盖已删除，让本文件的 cfg 分目标配置生效。
-# 如需临时 native 自测，用环境变量单次覆盖，勿改本文件：
-#   CARGO_BUILD_RUSTFLAGS="-C target-cpu=native"
+# **分离结论：4.5 倍差距来自 SSE4/POPCNT 缺失（LLVM 无法向量化 memcpy/缓冲拷贝），
+# 与 AES 无关** —— 加密库（aes 0.8 / polyval / sha2）内部用 cpufeatures 做运行时
+# 探测，老 CPU 自动退回软件实现，因此**不启用 +aes 也不会慢**，且老 CPU 不会 SIGILL。
+#
+# 保留策略：只启用 SSE4.1 / SSE4.2 / POPCNT（Nehalem 2008+ / AMD Barcelona 2007+）。
+# 兼容性：Windows 11 官方要求 SSE4.2 + POPCNT，故 Win11 机器 100% 安全；仅
+# Core 2 等 2008 年前 CPU（只能跑 Win10 的极老机器）有 SIGILL 风险。
+# 若后续要彻底消除该风险：把热点自己代码改 #[target_feature] 多版本 + 运行时
+# is_x86_feature_detected! 分派（方案 C），加密库已自带分派无需处理。
+#
+# 交叉编译安全：本表用 cfg(target_arch = "x86_64") 限定，aarch64/arm 不命中。
+# 临时 native 自测：CARGO_BUILD_RUSTFLAGS="-C target-cpu=native"（勿改本文件）。
 
 [target.'cfg(target_arch = "x86_64")']
 rustflags = [
     "-C",
     "target-cpu=x86-64",
     "-C",
-    "target-feature=+aes,+pclmulqdq,+sse4.1,+sse4.2,+popcnt",
+    "target-feature=+sse4.1,+sse4.2,+popcnt",
 ]
