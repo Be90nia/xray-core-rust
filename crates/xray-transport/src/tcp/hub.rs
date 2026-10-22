@@ -546,7 +546,12 @@ mod tests {
         )
         .await
         .expect("listen_unix 失败");
-        assert_ne!(listener.local_addr().expect("local_addr 失败").port(), 0);
+        // unix listener 无 SocketAddr（Go UnixConnWrapper 同理）：local_addr 按契约返回
+        // unspecified，不能像 TCP 那样断言 port != 0。
+        assert_eq!(
+            listener.local_addr().expect("local_addr 失败"),
+            std::net::SocketAddr::from(([0, 0, 0, 0], 0))
+        );
 
         let mut client = tokio::net::UnixStream::connect(&path).await.expect("connect 失败");
         client.write_all(b"ping").await.expect("write 失败");
