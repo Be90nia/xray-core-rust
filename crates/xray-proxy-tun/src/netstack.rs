@@ -544,8 +544,21 @@ impl phy::Device for VirtualDevice {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
         caps.max_transmission_unit = self.mtu;
-        // 关闭校验和卸载：TUN userspace path 自己算
-        caps.checksum = smoltcp::phy::ChecksumCapabilities::ignored();
+        // 校验和：Tx **必须填**（Checksum::Tx），Rx 不校验。
+        //
+        // 此前是 `ignored()`（既不算也不校验），注释称「TUN userspace path 自己算」，
+        // 但实际只有 ICMP 路径手工算过，TCP/UDP 从没算——真机抓包实证：smoltcp 发出的
+        // SYN-ACK 的 IP 头校验和与 TCP 校验和**均为 0**（tcpdump `bad cksum 0`），
+        // 对端内核直接丢包 → TUN 的 TCP 永远建不了连接（Windows wintun 无 vnet 头，
+        // 同样中招）。vnet 头的卸载（NEEDS_CSUM）我们也没置标志，故不能指望内核补。
+        // Rx 侧不校验：包由本机内核产出，校验和本就正确；若内核按卸载语义投递，
+        // 校验会误判丢包。
+        let tx_only = smoltcp::phy::Checksum::Tx;
+        let mut ck = smoltcp::phy::ChecksumCapabilities::ignored();
+        ck.ipv4 = tx_only;
+        ck.udp = tx_only;
+        ck.tcp = tx_only;
+        caps.checksum = ck;
         caps
     }
 }
