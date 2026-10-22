@@ -180,6 +180,10 @@ mod imp {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod tests {
+    // 本模块只在 linux/android 编译，CI 的 `-D warnings` 会在此触发
+    // clippy::unwrap_used（Windows 本地不编译这段，故本地绿、CI 红）。
+    #![allow(clippy::unwrap_used)]
+
     use std::{io, net::SocketAddr};
 
     use tokio::{
