@@ -4269,9 +4269,22 @@ async fn spawn_one_inbound(
                 let dest_udp = dest.clone();
                 let follow_redirect = settings.follow_redirect;
                 let stop = shutdown_token.clone();
+                // bind 提前到 spawn 之前：Go 的 dokodemo 在 handler 构造期同步
+                // ListenUDP（proxy/dokodemo/dokodemo.go），端口占用属于「入站创建
+                // 失败」→ 启动失败。旧形态把 bind 藏在 spawn 出去的任务里：调用方
+                // 返回时端口还没监听（发包早于 bind 会丢包，CI 高负载下必现），且
+                // bind 失败只落 tracing::error（无人订阅时静默死亡）。
+                let hub = xray_transport::udp::hub::UdpHub::listen(
+                    bind_addr,
+                    &[Box::new(xray_transport::udp::hub::ReceiveOriginalDestination(
+                        follow_redirect,
+                    ))],
+                    udp_mask,
+                )
+                .await?;
                 handles.push(tokio::spawn(async move {
                     tokio::select! {
-                        r = serve_dokodemo_udp(bind_addr, dispatch, dest_udp, follow_redirect, udp_mask) => {
+                        r = serve_dokodemo_udp_on(hub, dispatch, dest_udp) => {
                             if let Err(e) = r {
                                 tracing::error!(error = %e, "dokodemo UDP inbound stopped");
                             }
