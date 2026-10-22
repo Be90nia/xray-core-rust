@@ -469,6 +469,9 @@ pub(crate) fn adapter_props_cmds(interface: &str) -> Vec<executor::Cmd> {
 /// 重试循环（纯逻辑，[`std::thread::sleep`] 由参数注入以便测试）：至多
 /// `attempts` 次调用 `try_once`，相邻尝试之间 sleep `backoff`；任一次成功即真。
 /// 最后一次失败后不再 sleep。
+///
+/// 仅 Windows 适配器属性装配与测试使用；其它平台无条件本项会触发 dead_code。
+#[cfg(any(target_os = "windows", test))]
 pub(crate) fn retry_with_backoff(
     attempts: u32,
     backoff: std::time::Duration,
