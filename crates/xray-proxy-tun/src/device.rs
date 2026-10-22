@@ -100,6 +100,17 @@ impl TunDevice {
                 // tun-rs 自动退化为 vnet_hdr=false（见 send/recv_batch）。
                 #[cfg(target_os = "linux")]
                 b.offload(true);
+                // cv3w：Go `UseAutomaticMetric=false + Metric=0`（tun_windows.go:190-191）。
+                // 路由有效 metric = 路由 metric + 接口 metric——自动度量会让 TUN 的
+                // metric-0 路由输给物理网卡。tun-rs 经 SetIpInterfaceEntry 双族设置
+                // （ffi.rs set_interface_metric：Metric + UseAutomaticMetric=false）。
+                #[cfg(target_os = "windows")]
+                b.metric(0);
+                // Windows 启用态无需显式设置：`DeviceBuilder::new()` 默认
+                // `.enable(true)`（builder.rs:902-903）→ `config()` 调
+                // `device.enabled(true)` → `WintunStartSession` 开 ring buffer
+                // （tun/mod.rs:110-137；不启用则 send/recv 全报
+                // "The interface has been disabled"，tun/mod.rs:147-162）。
                 #[cfg(not(target_os = "linux"))]
                 let _ = b;
             })

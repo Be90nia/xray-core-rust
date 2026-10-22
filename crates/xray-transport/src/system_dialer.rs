@@ -77,10 +77,16 @@ impl DefaultSystemDialer {
     }
 
     /// 内部 TCP 拨号实现（不含 sockopt 应用），返回原始 `TcpStream`。
-    async fn dial_tcp_raw(
+    ///
+    /// `client_tfo`：Linux 上 connect 前设 `TCP_FASTOPEN_CONNECT`（AI7：transport
+    /// 裸拨号路径 [`crate::sockopt::dial_client_tcp`] 复用本函数时置 true；
+    /// dial_system 路径的 TFO 走 post-connect sockopt，保持 false 原语义）。
+    pub(crate) async fn dial_tcp_raw(
         src: Option<SocketAddr>,
         dest: SocketAddr,
         timeout: std::time::Duration,
+        bind_if_index: u32,
+        client_tfo: bool,
     ) -> io::Result<TcpStream> {
         // tokio::net::TcpStream::connect 不支持源地址绑定与超时。
         // 用 socket2 构造 socket，绑定本地地址，再 tokio 化。
@@ -92,6 +98,18 @@ impl DefaultSystemDialer {
         // 绑定本地地址（可选）。
         if let Some(local) = src {
             socket.bind(&local.into())?;
+        }
+        // Go system_dialer.go Control 回调：controllers 先于 sockopt 应用，失败即
+        // 拨号失败；sockopt 的接口绑定在后（后写覆盖 = 配置优先，Go 同序）。
+        run_dialer_controllers(&socket, &dest)?;
+        // Go system_dialer.go:144-148：sockopt 的接口绑定在 controllers 之后应用
+        // （后写覆盖 = 配置优先，Go 同序）。IP_UNICAST_IF/SO_BINDTODEVICE 仅对
+        // connect 前的 socket 生效，post-connect 设置无法改变出站接口。
+        if bind_if_index > 0 {
+            crate::sockopt::bind_socket_to_interface(&socket, bind_if_index, dest.is_ipv4())?;
+        }
+        if client_tfo {
+            crate::sockopt::apply_client_tfo_linux(&socket);
         }
         // 设置非阻塞（tokio 要求）。
         socket.set_nonblocking(true)?;
@@ -168,7 +186,14 @@ async fn dial_first_reachable(
 ) -> io::Result<Box<dyn Connection>> {
     let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no address to dial");
     for &addr in addrs {
-        let stream = match DefaultSystemDialer::dial_tcp_raw(src, addr, DEFAULT_DIAL_TIMEOUT).await
+        let stream = match DefaultSystemDialer::dial_tcp_raw(
+            src,
+            addr,
+            DEFAULT_DIAL_TIMEOUT,
+            sockopt.bind_if_index,
+            false,
+        )
+        .await
         {
             Ok(stream) => stream,
             Err(e) => {
@@ -209,11 +234,13 @@ pub fn use_alternative_system_dialer(dialer: Option<Box<dyn SystemDialer>>) {
     *effective().write() = new_dialer;
 }
 
-/// DialerController：在 fd 创建后、连接前调用的回调。对应 Go `Controllers`。
+/// DialerController：在 fd 创建后、连接前调用的回调。对应 Go `Controllers`
+/// （`func(network, address string, c syscall.RawConn) error`）。
 ///
 /// 用于设置 SO_MARK / SO_BINDTODEVICE / TCP_FASTOPEN 等平台特定选项。
-/// 回调接收 [`Socket2`] 引用，可调用 socket2 API 修改 fd。
-pub type DialerController = Arc<dyn Fn(&Socket2) -> io::Result<()> + Send + Sync>;
+/// 回调接收 [`Socket2`] 引用 + 拨号目标地址（Go 的 `address` 参数；TUN 出站
+/// 绑定 controller 据此跳过 loopback——Go proxy/tun/handler.go:145-147）。
+pub type DialerController = Arc<dyn Fn(&Socket2, &SocketAddr) -> io::Result<()> + Send + Sync>;
 
 /// 全局 DialerController 列表。对应 Go `Controllers` + `ControllersLock`。
 static CONTROLLERS: OnceLock<Mutex<Vec<DialerController>>> = OnceLock::new();
@@ -235,6 +262,51 @@ pub fn register_dialer_controller(controller: DialerController) -> io::Result<()
 #[must_use]
 pub fn registered_controllers() -> Vec<DialerController> {
     controllers().lock().clone()
+}
+
+/// 对刚创建、未 connect 的 socket 执行全部已注册 controller。
+///
+/// 对应 Go `DefaultSystemDialer.Dial` TCP/UDP 两个 Control 回调内的 controllers
+/// 循环（main 分支 system_dialer.go TCP `dialer.Control` / UDP `lc.Control`）：
+/// 任一错误即拨号失败。常态空列表零开销（一次锁判空，无堆分配）；仅 TUN 等
+/// 注册方存在时才克隆快照。Go 语义锚点：controllers 全部执行完才轮到
+/// `applyOutboundSocketOptions`（含 `SocketConfig.Interface` 绑定）——后写覆盖，
+/// 用户显式 interface 配置优先，controller 无需自行检测。
+pub(crate) fn run_dialer_controllers(socket: &Socket2, dest: &SocketAddr) -> io::Result<()> {
+    if !controllers().lock().is_empty() {
+        for ctl in registered_controllers() {
+            ctl(socket, dest)?;
+        }
+    }
+    Ok(())
+}
+
+/// UDP 出站 PacketConn：bind `bind_addr` → controllers → 返回**未 connect** 的
+/// socket。对应 Go `DefaultSystemDialer.Dial` 的 UDP 分支（system_dialer.go:52-102）：
+/// `lc.ListenPacket` 阶段 controllers 收 `destAddr` 而非本地地址（Go 源注释：
+/// ListenPacket supplies a local address; dialer controllers need the destination）；
+/// 返回 PacketConn 不 connect——per-packet 目标由调用方 `send_to`（Go
+/// `PacketConnWrapper` 同）。controller 错误即失败（Go :74-77 同语义）。
+///
+/// freedom UDP relay 与 [`crate::udp::relay::UdpRelay`] 复用本函数（Go 中两者
+/// 均经 `DialSystem` UDP 分支），保证 TUN 出站绑定等注册方对 UDP 同样生效。
+///
+/// # Errors
+/// socket 创建 / bind / controller 失败时返回 `io::Error`。
+pub async fn dial_udp_packet_conn(
+    bind_addr: SocketAddr,
+    dest: SocketAddr,
+) -> io::Result<tokio::net::UdpSocket> {
+    let socket = Socket2::new(
+        socket2::Domain::for_address(bind_addr),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    socket.bind(&socket2::SockAddr::from(bind_addr))?;
+    run_dialer_controllers(&socket, &dest)?;
+    socket.set_nonblocking(true)?;
+    let std_sock: std::net::UdpSocket = socket.into();
+    tokio::net::UdpSocket::from_std(std_sock)
 }
 
 /// sendThrough 源地址规格。对应 Go `proxyman.SenderConfig` 的 `Via`/`ViaCidr`
@@ -854,9 +926,60 @@ mod tests {
     #[test]
     fn register_controller_appends_to_list() {
         let initial = registered_controllers().len();
-        let controller: DialerController = Arc::new(|_socket: &Socket2| Ok(()));
+        let controller: DialerController = Arc::new(|_socket: &Socket2, _dest: &SocketAddr| Ok(()));
         register_dialer_controller(controller).unwrap();
         assert_eq!(registered_controllers().len(), initial + 1);
+    }
+
+    #[tokio::test]
+    async fn controllers_run_pre_connect_with_destination() {
+        // loopback 目标：controller 在 connect 前被调用且拿到 dest；绑不绑由
+        // controller 决策（TUN 侧跳 loopback），dialer 只负责传递（Go handler.go:145）。
+        // 端口大概率关闭，connect 失败可接受——断言的是 controller 已先运行。
+        static SAW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        const PROBE_PORT: u16 = 59998;
+        register_dialer_controller(Arc::new(|_socket: &Socket2, dest: &SocketAddr| {
+            if dest.port() == PROBE_PORT {
+                SAW.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        }))
+        .unwrap();
+        let dest: SocketAddr = format!("127.0.0.1:{PROBE_PORT}").parse().unwrap();
+        let _ = DefaultSystemDialer::dial_tcp_raw(
+            None,
+            dest,
+            std::time::Duration::from_millis(500),
+            0,
+            false,
+        )
+        .await;
+        assert_eq!(SAW.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn controller_error_aborts_dial() {
+        // controller 失败 = 拨号失败（Go system_dialer.go:137-141 同语义）。
+        // 只对魔数端口生效，避免污染同进程并行测试的其他拨号。
+        const PROBE_PORT: u16 = 59999;
+        register_dialer_controller(Arc::new(|_socket: &Socket2, dest: &SocketAddr| {
+            if dest.port() == PROBE_PORT {
+                return Err(io::Error::other("controller boom"));
+            }
+            Ok(())
+        }))
+        .unwrap();
+        let dest: SocketAddr = format!("127.0.0.1:{PROBE_PORT}").parse().unwrap();
+        let err = DefaultSystemDialer::dial_tcp_raw(
+            None,
+            dest,
+            std::time::Duration::from_millis(500),
+            0,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("controller boom"), "got: {err}");
     }
 
     #[tokio::test]

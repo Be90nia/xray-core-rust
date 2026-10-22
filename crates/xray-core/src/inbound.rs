@@ -56,7 +56,12 @@ use xray_proxy_trojan::{
     fallback::{Fallback, FallbackPolicy},
     serve_trojan,
 };
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
 use xray_proxy_tun::{StackOptions, Tun, TunInboundHandler};
 use xray_proxy_vless::{
     MemoryAccount as VlessMemoryAccount, MemoryUser as VlessMemoryUser,
@@ -3821,7 +3826,14 @@ async fn spawn_one_inbound(
     api: Option<&InboundRuntime>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     // TUN inbound 不需要 port/addr，提前处理
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+    // Windows 侧设备（tun-rs wintun）、netstack（smoltcp）、路由/DNS（sysroute）、
+    // WFP 泄漏阻断均已实现并真机验证（bd cv3w/ijn7），故与 Go `tun_windows.go` 对齐开放。
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "windows"
+    ))]
     if ib.entry.kind.as_str() == "tun" {
         let options = parse_tun_inbound_config(&ib.entry.data)?;
         let dispatch = ohm.get_default_handler().ok_or_else(|| {
@@ -3838,11 +3850,16 @@ async fn spawn_one_inbound(
         });
         return Ok(Some(handle));
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "windows"
+    )))]
     if ib.entry.kind.as_str() == "tun" {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "TUN inbound is only supported on Linux/Android/FreeBSD",
+            "TUN inbound is only supported on Linux/Android/FreeBSD/Windows",
         ));
     }
     // sockopt 数值/类型启动期硬错（Go 解码期语义；tcp/unix 监听分支共用）。
@@ -5984,10 +6001,20 @@ fn tuic_pem_key_der(pem: &str) -> std::io::Result<Vec<u8>> {
 /// TunInboundHandler::new 校验 options.tun.is_some()，但 start() 内部
 /// 直接 TunDevice::create 硬编码参数，不使用 options.tun 的设备。
 /// 因此配置解析阶段只需提供占位。
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
 struct TunPlaceholder;
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
 impl Tun for TunPlaceholder {
     fn start(&self) -> xray_proxy_tun::Result<()> {
         Ok(())
@@ -6011,7 +6038,12 @@ impl Tun for TunPlaceholder {
 /// JSON 字段与默认值对齐 Go `infra/conf/tun.go::TunConfig.Build`
 /// （name/mtu/gateway/dns/userLevel/autoSystemRoutingTable/autoOutboundsInterface
 /// + Rust 扩展 idleTimeout）；解析实现在 `xray_proxy_tun::config`（全平台可测）。
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
 fn parse_tun_inbound_config(data: &[u8]) -> std::io::Result<StackOptions> {
     let mut opts = StackOptions::parse_json(data)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))?;
@@ -6149,7 +6181,13 @@ mod tests {
     /// `spawn_one_inbound` 返回 Unsupported 硬错误（对齐 Go 不支持平台
     /// NewTun 失败 → inbound 创建失败的 fail-fast 语义）。
     /// 支持平台分支见 outbound.rs `register_tun_outbound`（Linux 侧对称）。
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+    // Windows 已支持（bd cv3w）：仅 macOS/iOS/其它平台走 Unsupported fail-fast。
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "windows"
+    )))]
     #[tokio::test]
     async fn tun_inbound_rejected_on_unsupported_platform() {
         let ib = BuiltInbound {

@@ -232,6 +232,118 @@ pub fn tcp_listen_fn() -> crate::listener_registry::TransportListenFn {
     )
 }
 
+// ===== Unix 监听（Go tcp/hub.go:44 `port == net.Port(0)` 分支）=====
+
+/// TCP hub unix listener。持有 system_listener [`crate::system_listener::UnixListener`]
+/// （路径/abstract/权限语义全复用）+ accept 循环。对应 Go tcp Listener 在
+/// `port==0` 时 `net.UnixAddr` + `internet.ListenSystem` 路径。
+#[cfg(unix)]
+pub struct TcpUnixHubListener {
+    inner: crate::system_listener::UnixListener,
+    add_conn: ConnHandler,
+    close_notify: Arc<Notify>,
+}
+
+#[cfg(unix)]
+impl TcpUnixHubListener {
+    /// 绑定 unix domain socket 并构造 listener。
+    pub async fn listen(
+        path: &str,
+        sockopt: &SocketOptions,
+        add_conn: ConnHandler,
+    ) -> io::Result<Self> {
+        let inner = crate::system_listener::UnixListener::bind(path, sockopt.clone()).await?;
+        Ok(Self { inner, add_conn, close_notify: Arc::new(Notify::new()) })
+    }
+
+    /// Spawn accept 循环到独立 tokio task（对齐 [`TcpHubListener::spawn_accept_loop`]）。
+    pub fn spawn_accept_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            this.keep_accepting().await;
+        })
+    }
+
+    /// Accept 循环：accept → `add_conn`（Go keepAccepting 的 unix 载体，无
+    /// header/finalmask 包装——Go unix 分支同样不走 WrapListener 的 tcp 语义）。
+    async fn keep_accepting(&self) {
+        loop {
+            let accept_fut = self.inner.accept();
+            tokio::pin!(accept_fut);
+            tokio::select! {
+                result = &mut accept_fut => {
+                    match result {
+                        Ok(conn) => (self.add_conn)(conn),
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            if err_str.contains("closed") {
+                                break;
+                            }
+                            tracing::warn!(error = %e, "failed to accept unix connection");
+                            if err_str.contains("too many") {
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                _ = self.close_notify.notified() => break,
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl TransportListener for TcpUnixHubListener {
+    fn close(&self) -> io::Result<()> {
+        self.close_notify.notify_one();
+        Ok(())
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        // unix socket 无 SocketAddr，返回 unspecified（对齐 UnixConnection / Go UnixConnWrapper）
+        Ok(SocketAddr::from(([0, 0, 0, 0], 0)))
+    }
+}
+
+/// TCP 协议的 unix 监听实现（对应 Go `ListenTCP` 的 `port==0` unix 分支）。
+///
+/// Go 该分支支持 `FinalMask.Listen(ctx, unixAddr)`；Rust tcpmask 为 TCP 语义
+/// 载体，unix 上无对应能力——非空显式拒绝而非静默忽略（对齐本模块 finalmask
+/// 拒绝惯例）。
+#[cfg(unix)]
+pub async fn listen_unix_impl(
+    path: String,
+    settings: crate::dialer::StreamSettings,
+    sockopt: SocketOptions,
+    handler: ConnHandler,
+) -> io::Result<Box<dyn TransportListener>> {
+    if settings.finalmask_json.as_ref().is_some_and(|v| !v.is_null()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "finalmask is not supported on unix listeners; remove the finalmask key",
+        ));
+    }
+    let listener = TcpUnixHubListener::listen(&path, &sockopt, handler).await?;
+    let listener = Arc::new(listener);
+    let _accept_loop = listener.spawn_accept_loop();
+    Ok(Box::new(listener) as Box<dyn TransportListener>)
+}
+
+/// 创建 TCP 协议的 unix `UnixTransportListenFn`（注册到 unix 注册表）。
+#[cfg(unix)]
+#[must_use]
+pub fn tcp_unix_listen_fn() -> crate::listener_registry::UnixTransportListenFn {
+    Arc::new(
+        |path: String,
+         settings: crate::dialer::StreamSettings,
+         sockopt: SocketOptions,
+         handler: ConnHandler| {
+            Box::pin(async move { listen_unix_impl(path, settings, sockopt, handler).await })
+        },
+    )
+}
+
 // ===== 旧 API 兼容 =====
 //
 // 保留 `register_tcp_listener` / `take_tcp_listener` 向后兼容，
@@ -384,6 +496,57 @@ mod tests {
         .expect("listen_tcp 失败");
         let addr = listener.local_addr().expect("local_addr 失败");
         assert_ne!(addr.port(), 0);
+    }
+
+    /// ③ transport 级 ListenUnix：注册 → listen_unix 真监听 → UnixStream 连入
+    /// 回环（Go tcp_hub.go ListenUnix + tcp/hub.go port==0 分支）。unix-only。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listen_unix_tcp_hub_roundtrip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 注册（同进程其他测试可能已注册，容忍 AlreadyExists）。
+        let _ = crate::tcp::register_tcp_unix_transport();
+
+        let path = std::env::temp_dir().join(format!(
+            "xray-transport-unix-hub-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let path_str = path.to_str().expect("temp path utf8");
+
+        let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<Box<dyn Connection>>(4);
+        let handler: ConnHandler = Arc::new(move |mut conn| {
+            let conn_tx = conn_tx.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4];
+                if conn.read_exact(&mut buf).await.is_ok() {
+                    let _ = conn.write_all(&buf).await;
+                    let _ = conn_tx.send(conn).await;
+                }
+            });
+        });
+
+        let listener = crate::listener_registry::listen_unix(
+            path_str,
+            crate::dialer::StreamSettings::tcp(),
+            SocketOptions::default(),
+            handler,
+        )
+        .await
+        .expect("listen_unix 失败");
+        assert_ne!(listener.local_addr().expect("local_addr 失败").port(), 0);
+
+        let mut client = tokio::net::UnixStream::connect(&path).await.expect("connect 失败");
+        client.write_all(b"ping").await.expect("write 失败");
+        let mut buf = [0u8; 4];
+        client.read_exact(&mut buf).await.expect("read 失败");
+        assert_eq!(&buf, b"ping");
+        assert!(conn_rx.recv().await.is_some(), "handler must receive the connection");
+
+        listener.close().expect("close 失败");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path_str}.lock"));
     }
 
     #[tokio::test]

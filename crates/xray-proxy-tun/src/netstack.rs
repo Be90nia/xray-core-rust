@@ -574,6 +574,35 @@ pub struct UdpPacketMeta {
     pub dst: IpEndpoint,
 }
 
+/// 目的地址是组播（multicast）或广播（broadcast）→ 不应进 relay。
+///
+/// - IPv4：组播 `224.0.0.0/4`（含 SSDP `239.255.255.250`）+ 受限广播
+///   `255.255.255.255`；子网定向广播（如 `192.168.1.255`）需知前缀长度，
+///   本层无从判定，故不在此列（Go 侧同样不判）。
+/// - IPv6：组播 `ff00::/8`（含 mDNS `[ff02::1:3]`）。
+///
+/// # Go 侧参照
+///
+/// Go 的 TUN stack 在包入口过滤的是**源**组播（`proxy/tun/stack.go:172`
+/// `p.src.IsMulticast()`），**不**丢目的组播——它让目的组播走正常出站，
+/// 并在 socket 层补组播接口（`transport/internet/sockopt_windows.go:51-56`
+/// 设 `IP_MULTICAST_IF`、`:60-65` 设 `IPV6_MULTICAST_IF`），同时把本地
+/// 组播发现留在 LAN 侧（`proxy/tun/tun_windows_wfp.go:390-415` 放行 IPv6
+/// 邻居/组播监听发现）。
+///
+/// Rust 侧没有该 sockopt 通路：组播外发在 Windows 上直接 WSAENOBUFS(10055)
+/// 失败（实测），故在**进 relay 之前**丢弃目的组播/广播（票 ijn7）。
+#[must_use]
+pub fn is_multicast_or_broadcast_dst(addr: &IpAddress) -> bool {
+    match addr {
+        IpAddress::Ipv4(v4) => {
+            let o = v4.octets();
+            o[0] & 0xF0 == 0xE0 || o == [255, 255, 255, 255]
+        },
+        IpAddress::Ipv6(v6) => v6.octets()[0] == 0xFF,
+    }
+}
+
 /// 从原始 IP 包解析 UDP 4 元组 + payload。
 ///
 /// 对应 Go `stackGVisor.Start` 的 UDP handler：从 IP+UDP 头读取 src/dst，
@@ -837,6 +866,51 @@ mod tests {
         let mut stack = make_stack();
         let drained = stack.drain_tx();
         assert!(drained.is_empty());
+    }
+
+    /// 票 ijn7①：目的组播/广播判定——组播/广播为真，单播为假。
+    ///
+    /// 覆盖实测中出现的两个真实目的（SSDP `239.255.255.250`、mDNS `ff02::1:3`）
+    /// 与受限广播 `255.255.255.255`，以及不应被误伤的单播地址。
+    #[test]
+    fn multicast_or_broadcast_dst_detection() {
+        let v4 = |o: [u8; 4]| IpAddress::Ipv4(Ipv4Address::from(o));
+        let v6 = |o: [u8; 16]| IpAddress::Ipv6(Ipv6Address::from(o));
+
+        // 组播（IPv4 224.0.0.0/4 全段 + IPv6 ff00::/8 全段）
+        assert!(is_multicast_or_broadcast_dst(&v4([239, 255, 255, 250])), "SSDP 组播");
+        assert!(is_multicast_or_broadcast_dst(&v4([224, 0, 0, 0])), "组播下界");
+        assert!(is_multicast_or_broadcast_dst(&v4([239, 255, 255, 255])), "组播上界");
+        assert!(
+            is_multicast_or_broadcast_dst(&v6([
+                0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+            ])),
+            "mDNS 组播"
+        );
+        assert!(
+            is_multicast_or_broadcast_dst(&v6([0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])),
+            "IPv6 组播下界"
+        );
+
+        // 受限广播
+        assert!(is_multicast_or_broadcast_dst(&v4([255, 255, 255, 255])), "受限广播");
+
+        // 单播不得被误伤（含 223.255.255.255 组播上界之下 / 240.0.0.0 之上）
+        assert!(!is_multicast_or_broadcast_dst(&v4([8, 8, 8, 8])), "单播 DNS");
+        assert!(!is_multicast_or_broadcast_dst(&v4([223, 255, 255, 255])), "组播下界之下");
+        assert!(!is_multicast_or_broadcast_dst(&v4([240, 0, 0, 0])), "组播上界之上");
+        assert!(
+            !is_multicast_or_broadcast_dst(&v6([
+                0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+            ])),
+            "链路本地单播"
+        );
+        assert!(
+            !is_multicast_or_broadcast_dst(&v6([
+                0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+            ])),
+            "全局单播"
+        );
     }
 
     #[test]

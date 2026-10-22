@@ -31,6 +31,7 @@ use crate::finalmask::{
             expand_symmetric_nat_candidates, is_stun_message, parse_addr_ports,
             parse_stun_binding_response, resolve_stun_servers,
         },
+        tls,
     },
 };
 
@@ -39,8 +40,8 @@ const CHANNEL_BUFFER: usize = 64;
 
 /// realm 共享配置（对应 Go `realm.Config`）。
 ///
-/// Go 端 `TlsConfig *tls.Config` 字段在 Rust 用 `use_tls: bool` 简化，
-/// TLS 协商细节由 reqwest 默认 rustls connector 处理。
+/// `tls` = [`tls::TlsConfig`]（Go `TlsConfig *tls.Config` → `GetTLSConfig()` 消费
+/// 的字段子集，见 `tls.rs` 对齐表）；`None` = reqwest 默认 rustls 路径。
 #[derive(Debug, Clone, Default)]
 pub struct RealmConfig {
     pub scheme: String,
@@ -49,7 +50,7 @@ pub struct RealmConfig {
     pub token: String,
     pub id: String,
     pub stun_servers: Vec<String>,
-    pub use_tls: bool,
+    pub tls: Option<tls::TlsConfig>,
 }
 
 /// STUN 反射事件（dispatcher → init task）。
@@ -288,7 +289,7 @@ async fn client_init(
         &config.host,
         &config.port,
         &config.token,
-        config.use_tls,
+        config.tls.as_ref(),
     )?;
     let local_ip = shared.raw.local_addr().ok().map(|sa| sa.ip());
     let servers = resolve_stun_servers(local_ip, &config.stun_servers);
@@ -406,7 +407,7 @@ async fn server_loop(
         &config.host,
         &config.port,
         &config.token,
-        config.use_tls,
+        config.tls.as_ref(),
     ) {
         Ok(c) => c,
         Err(_) => return,
@@ -576,7 +577,7 @@ mod tests {
             token: "tok".into(),
             id: "test".into(),
             stun_servers: vec![],
-            use_tls: false,
+            tls: None,
         };
         let raw: Box<dyn UdpIo> =
             Box::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -602,6 +603,6 @@ mod tests {
         let c = RealmConfig::default();
         assert!(c.scheme.is_empty());
         assert!(c.stun_servers.is_empty());
-        assert!(!c.use_tls);
+        assert!(c.tls.is_none());
     }
 }

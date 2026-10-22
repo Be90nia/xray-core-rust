@@ -81,8 +81,8 @@ tokio = { workspace = true, features = ["macros", "rt"] }
 serde_json = { workspace = true }
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 # TUN 设备代理——仅 Linux/Android/FreeBSD 自动编译
-# macOS/Windows 不编译（需 wintun.dll/utun 权限，用户可手动加回）
-[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))'.dependencies]
+# macOS 不编译（需 utun 权限）；Windows 已支持（wintun.dll 放 exe 旁即用，bd cv3w/ijn7）
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "windows"))'.dependencies]
 xray-proxy-tun = { path = "../xray-proxy-tun" }
 
 # DNS UDP recvmmsg 批收（bd yblz）——仅 Linux gnu：musl/uclibc 的 libc 未导出 recvmmsg 函数。

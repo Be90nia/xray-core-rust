@@ -113,21 +113,26 @@ impl std::fmt::Display for StatusError {
 
 impl std::error::Error for StatusError {}
 
-/// 构造 Client（对应 Go `NewClient`）。
+/// 构造 Client（对应 Go `NewClient`——`tlsConfig != nil` 时以自定义 TLS 配置
+/// 构造 Transport；Rust 等价 = 预配置 rustls `ClientConfig` 灌入 reqwest）。
 ///
-/// `use_tls = true` 时启用 rustls 后端；否则仍由 `scheme` 决定 http/https。
+/// `tls = None` 或无可应用字段时走 reqwest 默认 rustls 路径（向后兼容）。
 pub fn new_client(
     scheme: &str,
     host: &str,
     port: &str,
     token: &str,
-    use_tls: bool,
+    tls: Option<&crate::finalmask::realm::tls::TlsConfig>,
 ) -> io::Result<Client> {
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10));
-    if !use_tls {
-        builder = builder.https_only(false);
+    let preconfig = match tls {
+        Some(t) => crate::finalmask::realm::tls::build_rustls_client_config(t)?,
+        None => None,
+    };
+    if let Some(cfg) = preconfig {
+        builder = builder.use_preconfigured_tls(Some(cfg));
     }
     let http = builder.build().map_err(io::Error::other)?;
     Ok(Client { base_url: format!("{scheme}://{host}:{port}"), token: token.to_string(), http })

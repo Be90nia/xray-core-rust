@@ -421,14 +421,33 @@ pub fn apply_client_dial_rcvbuf(tcp: &tokio::net::TcpStream) -> std::io::Result<
     socket2::SockRef::from(tcp).set_recv_buffer_size(TCP_RCVBUF_DEFAULT as usize)
 }
 
+/// Linux connect 前的 TFO（`TCP_FASTOPEN_CONNECT`，出站）——transport 裸拨号路径
+/// 专用（[`dial_client_tcp`] 复用 `dial_tcp_raw` 时经此接线）。尽力而为：失败只记
+/// debug 不阻断拨号（纯优化项不能成为拨号失败原因）。非 Linux 无 TFO 语义，恒空。
+pub(crate) fn apply_client_tfo_linux(socket: &Socket) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        // TFO：LinuxSockOpt 出站分支（inbound=false）即 TCP_FASTOPEN_CONNECT。
+        let tfo = linux::LinuxSockOpt { tcp_fast_open: 1, ..Default::default() };
+        if let Err(e) = tfo.apply(socket.as_raw_fd()) {
+            tracing::debug!(error = %e, "TCP_FASTOPEN_CONNECT 不可用，按普通握手拨号");
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = socket;
+    }
+}
+
 /// 客户端裸拨号统一入口（[`apply_client_dial_rcvbuf`] 的三个调用点用它取代裸
 /// `TcpStream::connect`）。
 ///
 /// Linux 在 connect **之前**设 `TCP_FASTOPEN_CONNECT`：TFO 只对建立前的 socket
 /// 生效（对 ESTABLISHED socket 设置，新内核返回 EINVAL——见
-/// [`apply_outbound_socket_options`] 的测试注释），所以拨号必须由本函数自持
-/// socket 完成。其他平台等价 [`tokio::net::TcpStream::connect`]（Windows 无
-/// TFO 语义，ConnectEx 改造不在此列）。
+/// [`apply_outbound_socket_options`] 的测试注释），由
+/// [`crate::system_dialer::DefaultSystemDialer::dial_tcp_raw`] 的自持 socket
+/// 经 [`apply_client_tfo_linux`] 完成（AI7 起，同时接入 DialerController）。
 ///
 /// 默认启用、无配置输入（这些拨号点不消费 sockopt 配置，与 RCVBUF 缺省同源
 /// 理由）。对端不支持 TFO / 无 cookie 时内核自动回退普通握手；setsockopt 本身
@@ -448,36 +467,33 @@ where
 }
 
 /// 多地址逐个尝试的拨号本体（超时由 [`dial_client_tcp`] 外层统一施加）。
+///
+/// AI7 改经 `dial_tcp_raw` 复用其成熟 connect 序列（socket2 自持 → controllers →
+/// connect → SO_ERROR 检查）——DialerController（TUN 出站绑定等）必须在 connect
+/// 前作用于 fd（Go system_dialer.go TCP `dialer.Control` 同序）。本路径无 sockopt
+/// 配置输入，controller 结果即最终绑定，不存在用户 interface 配置覆盖问题。
 async fn dial_client_tcp_inner<A>(host: A) -> std::io::Result<tokio::net::TcpStream>
 where
     A: tokio::net::ToSocketAddrs,
 {
-    #[cfg(target_os = "linux")]
-    {
-        let mut last_err = None;
-        for addr in tokio::net::lookup_host(host).await? {
-            let socket = match addr {
-                std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
-                std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
-            }?;
-            // TFO：LinuxSockOpt 出站分支（inbound=false）即 TCP_FASTOPEN_CONNECT。
-            let tfo = linux::LinuxSockOpt { tcp_fast_open: 1, ..Default::default() };
-            if let Err(e) = tfo.apply(socket.as_raw_fd()) {
-                tracing::debug!(error = %e, "TCP_FASTOPEN_CONNECT 不可用，按普通握手拨号");
-            }
-            match socket.connect(addr).await {
-                Ok(stream) => return Ok(stream),
-                Err(e) => last_err = Some(e),
-            }
+    let mut last_err = None;
+    for addr in tokio::net::lookup_host(host).await? {
+        match crate::system_dialer::DefaultSystemDialer::dial_tcp_raw(
+            None,
+            addr,
+            crate::system_dialer::DEFAULT_DIAL_TIMEOUT,
+            0,
+            true,
+        )
+        .await
+        {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_err = Some(e),
         }
-        Err(last_err.unwrap_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "no address to dial")
-        }))
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        tokio::net::TcpStream::connect(host).await
-    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "no address to dial")
+    }))
 }
 
 /// 把 [`SocketOptions`] 应用到已建立的 [`Socket`]（TCP 专用）。
@@ -585,6 +601,47 @@ pub fn apply_outbound_socket_options(
     #[cfg(not(target_os = "freebsd"))]
     apply_custom_sockopt(socket, opts)?;
     Ok(())
+}
+
+/// 出站 socket 绑定网络接口索引（**必须 connect 前调用**，post-connect 设置
+/// 无法改变出站接口）。dialer controller（TUN `autoOutboundsInterface`，
+/// Go proxy/tun/handler.go:130-164）的绑定原语。
+///
+/// - Windows：IP_UNICAST_IF / IPV6_UNICAST_IF（Go tun_windows.go:553-577 的 TCP 分支；v4 值 network
+///   byte order——复用 [`windows::WindowsSockOpt`]， TFO 位保持未配置不触碰）。
+/// - Linux：SO_BINDTODEVICE（Go tun_linux.go:403 `unix.BindToDevice`；复用
+///   [`linux::LinuxSockOpt`]，其余字段全缺省 = 零副作用）。
+/// - 其余平台：`Unsupported`（Go 无 setinterface 的平台同样无此机制）。
+///
+/// 多播分支（Go 的 IP_MULTICAST_IF / IPV6_MULTICAST_IF）不在此处：系统拨号器
+/// 当前仅 TCP（UDP 拨号属后续切片）。
+pub fn bind_socket_to_interface(
+    socket: &Socket,
+    if_index: u32,
+    dest_is_ipv4: bool,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::WindowsSockOpt {
+            tcp_fast_open: -1,
+            bind_if_index: if_index,
+            is_ipv4: dest_is_ipv4,
+        }
+        .apply(socket.as_raw_socket())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::LinuxSockOpt { bind_if_index: if_index, ..Default::default() }
+            .apply(socket.as_raw_fd())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        let _ = (if_index, dest_is_ipv4);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "bind socket to interface not supported on this platform",
+        ))
+    }
 }
 
 /// 把 [`SocketOptions`] 应用到入站**已接受连接**。对应 Go `applyInboundSocketOptions`
@@ -1068,6 +1125,32 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    /// AI7：dial_client_tcp（transport 裸拨号统一入口，ws/splithttp/grpc 等
+    /// transport 自持 TCP 路径）必须过 DialerController——Go 全局语义是
+    /// controllers 挂在**所有**系统拨号上，漏接 = TUN 模式下经这些传输到
+    /// 代理出站的连接自绕回 TUN。魔数端口过滤隔离并行测试（AI4 同款）。
+    #[tokio::test]
+    async fn dial_client_tcp_runs_controllers() {
+        static SAW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        const PROBE_PORT: u16 = 59997;
+        crate::system_dialer::register_dialer_controller(std::sync::Arc::new(
+            |_socket: &Socket, dest: &std::net::SocketAddr| {
+                if dest.port() == PROBE_PORT {
+                    SAW.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(())
+            },
+        ))
+        .unwrap();
+        // 无 listener：connect 可能 refused，但 controller 在 connect 前已被调用
+        //（断言对象是「controller 跑过该路径」，与 system_dialer.rs AI4 探针同款）。
+        let _ = dial_client_tcp(("127.0.0.1", PROBE_PORT)).await;
+        assert!(
+            SAW.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "controller 未被 dial_client_tcp 调用"
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn client_dial_times_out_against_blackhole_address() {

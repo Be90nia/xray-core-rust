@@ -101,8 +101,10 @@ pub async fn relay_policy(
         Some(s) if s.port == 53
     );
 
-    // 2. 绑定 UDP socket：sendThrough 源地址优先（bd 7zc，对齐 Go
-    // system_dialer.go:59-84 ListenPacket 绑 srcAddr），否则与目标同族通配。
+    // 2. 绑定 UDP socket：sendThrough 源地址优先（bd 7zc，对齐 Go system_dialer.go:59-84
+    //    ListenPacket 绑 srcAddr），否则与目标同族通配。 经 dial_udp_packet_conn 过
+    //    DialerController（AI7：Go 走 DialSystem UDP 分支同样过 controllers——TUN 出站绑定对 UDP
+    //    生效的关键接线）。
     let src_ip = xray_transport::system_dialer::DIAL_SRC.try_with(|v| *v).ok().flatten();
     let bind_addr = match src_ip {
         Some(ip) => SocketAddr::new(ip, 0),
@@ -111,7 +113,9 @@ pub async fn relay_policy(
             SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0),
         },
     };
-    let sock = Arc::new(UdpSocket::bind(bind_addr).await?);
+    let sock = Arc::new(
+        xray_transport::system_dialer::dial_udp_packet_conn(bind_addr, default_target).await?,
+    );
 
     // 3. GlobalID（随机 8 字节，对应 Go xudp.NewPacketWriter 的 GlobalID）
     let global_id: [u8; GLOBAL_ID_LEN] = rand::random();
@@ -524,6 +528,72 @@ mod tests {
     fn udp_dest(ip: &str, port: u16) -> Destination {
         let addr = Address::from_ipv4_bytes(ip.parse::<std::net::Ipv4Addr>().unwrap().octets());
         Destination::new(addr, Port::new(port), Network::UDP)
+    }
+
+    /// AI7：freedom UDP 出站 socket（TUN UDP 流量的真实出站，Go 走 DialSystem
+    /// UDP 分支过 controllers）必须过 DialerController——relay_policy 的 bind
+    /// 走 `dial_udp_packet_conn`。魔数端口过滤隔离并行测试。
+    #[tokio::test]
+    async fn udp_relay_policy_runs_dialer_controllers() {
+        static SAW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        const PROBE_PORT: u16 = 59996;
+        // 闭包参数类型经 DialerController 注解推断（freedom 不依赖 socket2）。
+        let ctl: xray_transport::system_dialer::DialerController =
+            std::sync::Arc::new(|_socket, dest| {
+                if dest.port() == PROBE_PORT {
+                    SAW.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(())
+            });
+        xray_transport::system_dialer::register_dialer_controller(ctl).unwrap();
+        // echo 固定魔数端口（controller 按它过滤）；端口被占即跳过（环境冲突）。
+        let echo = match UdpSocket::bind(("127.0.0.1", PROBE_PORT)).await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let echo_port = echo.local_addr().unwrap().port();
+        let echo_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; RECV_BUF_SIZE];
+            while let Ok((n, peer)) = echo.recv_from(&mut buf).await {
+                let _ = echo.send_to(&buf[..n], peer).await;
+            }
+        });
+
+        let pipe_opt = xray_buf::pipe::PipeOption::default();
+        let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
+        let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
+        let link = Link::new(Box::new(up_r) as Box<dyn Reader>, Box::new(dn_w) as Box<dyn Writer>);
+        let dest = udp_dest("127.0.0.1", echo_port);
+        let relay_task = tokio::spawn(async move { relay(&dest, link).await });
+
+        // client 写一帧 XUDP → relay bind（controller 在此被调）→ send → echo 回包。
+        let mut client_writer = Box::new(up_w) as Box<dyn Writer>;
+        let mut frame = Vec::new();
+        {
+            let mut pw = PacketWriter::new(&mut frame, udp_dest("127.0.0.1", echo_port), [9u8; 8]);
+            pw.write_packet(b"ctl-probe").unwrap();
+        }
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(&frame);
+        client_writer.write_multi_buffer(mb).await.unwrap();
+
+        let mut client_reader = Box::new(dn_r) as Box<dyn Reader>;
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_reader.read_multi_buffer(),
+        )
+        .await
+        .expect("timeout waiting echo")
+        .expect("read ok");
+        assert!(!resp.to_vec().is_empty(), "echo 回包应为空帧之外的非空数据");
+        assert!(
+            SAW.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "controller 未被 freedom UDP 出站路径调用"
+        );
+
+        drop(client_writer);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), relay_task).await;
+        echo_task.abort();
     }
 
     /// 端到端：freedom UDP relay 把 XUDP 帧 → UDP echo server → XUDP 帧回写。

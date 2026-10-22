@@ -31,6 +31,9 @@ futures-util = "0.3"
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 ring = { workspace = true }
+# realm tlsConfig 自定义 CA + 非 disableSystemRoot 时的信任根（Go getCertPool 系统根
+# 的既有 webpki-roots 等价决策；workspace 已有同版本，无新增外部包）
+webpki-roots = { workspace = true }
 # realm (finalmask NAT 穿透伪装)：HTTP REST + SSE + SHA-256 + hex 编码
 # 全仓零 `reqwest::blocking` 调用，删除 blocking feature。
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }

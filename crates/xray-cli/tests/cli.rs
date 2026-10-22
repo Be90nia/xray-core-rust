@@ -215,3 +215,125 @@ fn cli_invalid_input_prints_go_message() {
         );
     }
 }
+
+// ==================== base64 子命令（Go main/commands/all/base64 对拍） ====================
+
+/// 带 stdin 的真跑 helper：piped stdin/stdout/stderr。
+fn run_xray_with_stdin(args: &[&str], stdin: &[u8]) -> std::process::Output {
+    use std::{io::Write as _, process::Stdio};
+    let mut child = Command::new(xray_bin())
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn xray");
+    child.stdin.as_mut().expect("stdin piped").write_all(stdin).expect("write stdin");
+    child.wait_with_output().expect("wait xray")
+}
+
+/// encode 文件：`echo hello > t.txt && xray base64 encode t.txt` → `base64:aGVsbG8K`；
+/// 输出回喂 decode 还原原文（Go Encode/Decode 对称）。
+#[test]
+fn cli_base64_encode_file_then_decode_roundtrip() {
+    let file = tempfile::NamedTempFile::new().expect("temp file");
+    std::fs::write(file.path(), b"hello\n").expect("write input");
+    let path = file.path().to_str().expect("utf8 path");
+
+    let encoded = run_xray_with_stdin(&["base64", "encode", path], b"");
+    assert!(encoded.status.success(), "encode should exit 0");
+    assert_eq!(
+        String::from_utf8_lossy(&encoded.stdout),
+        "base64:aGVsbG8K\n",
+        "encode output must match Go base64.StdEncoding form"
+    );
+
+    let decoded = run_xray_with_stdin(&["base64", "decode", "base64:aGVsbG8K"], b"");
+    assert!(decoded.status.success(), "decode should exit 0");
+    assert_eq!(decoded.stdout, b"hello\n", "decode must restore original bytes");
+}
+
+/// `echo hi | xray base64 encode -gzip -`：带 `base64+gzip:` 前缀，decode 还原 `hi`。
+#[test]
+fn cli_base64_gzip_stdin_roundtrip() {
+    let encoded = run_xray_with_stdin(&["base64", "encode", "-gzip", "-"], b"hi\n");
+    assert!(encoded.status.success(), "gzip encode should exit 0");
+    let value = String::from_utf8_lossy(&encoded.stdout);
+    assert!(value.starts_with("base64+gzip:"), "gzip encode must carry Go GzipPrefix: {value}");
+
+    let decoded = run_xray_with_stdin(&["base64", "decode", value.trim_end()], b"");
+    assert!(decoded.status.success(), "gzip decode should exit 0");
+    assert_eq!(decoded.stdout, b"hi\n", "gzip decode must restore stdin bytes");
+}
+
+/// decode 第二位置参数 output-file：字节写入文件而非 stdout。
+#[test]
+fn cli_base64_decode_writes_output_file() {
+    let out = tempfile::NamedTempFile::new().expect("temp output");
+    let out_path = out.path().to_str().expect("utf8 path");
+    let result = run_xray_with_stdin(&["base64", "decode", "base64:eA==", out_path], b"");
+    assert!(result.status.success(), "decode to file should exit 0");
+    assert!(result.stdout.is_empty(), "stdout must stay empty when output-file given");
+    assert_eq!(std::fs::read(out_path).expect("read output file"), b"x");
+}
+
+/// 非法 base64：Go Fatalf 文本 `failed to decode input: ...` + 退出码 1。
+#[test]
+fn cli_base64_invalid_value_errors_like_go() {
+    let output = run_xray_with_stdin(&["base64", "decode", "!!!"], b"");
+    assert_eq!(output.status.code(), Some(1), "Go Fatalf exits 1");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to decode input"),
+        "stderr must carry Go Fatalf text: {stderr}"
+    );
+}
+
+/// 输入文件不存在：`failed to read input: ...` + 退出码 1。
+#[test]
+fn cli_base64_missing_input_file_errors_like_go() {
+    let output = run_xray_with_stdin(&["base64", "encode", "no-such-file-xyz-9q"], b"");
+    assert_eq!(output.status.code(), Some(1), "Go Fatalf exits 1");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to read input"), "stderr must carry Go Fatalf text: {stderr}");
+}
+
+/// 帮助对齐：`base64 encode --help` 携带 Go UsageLine 与示例原文；裸 `base64`
+/// 无子命令退出 2（Go PrintUsage + SetExitStatus(2) 同码）。
+#[test]
+fn cli_base64_help_matches_go_usage_lines() {
+    let encode_help = run_xray_with_stdin(&["base64", "encode", "--help"], b"");
+    assert!(encode_help.status.success());
+    let encode_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&encode_help.stdout),
+        String::from_utf8_lossy(&encode_help.stderr)
+    );
+    for needle in [
+        "xray base64 encode [-gzip] <input-file | - | stdin:>",
+        "Encode input-file as Base64 with the base64: prefix.",
+        "Use -gzip to compress and output base64+gzip:.",
+        "\txray base64 encode input.bin",
+        "\txray base64 encode -gzip input.bin",
+    ] {
+        assert!(encode_text.contains(needle), "encode help must contain {needle:?}: {encode_text}");
+    }
+
+    let decode_help = run_xray_with_stdin(&["base64", "decode", "--help"], b"");
+    assert!(decode_help.status.success());
+    let decode_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&decode_help.stdout),
+        String::from_utf8_lossy(&decode_help.stderr)
+    );
+    for needle in [
+        "xray base64 decode [-gzip] <value | - | stdin:> [output-file]",
+        "Accepts base64:, base64+gzip:, or no prefix; gzip is enabled by base64+gzip: or -gzip.",
+        "\txray base64 decode eA== out.bin",
+    ] {
+        assert!(decode_text.contains(needle), "decode help must contain {needle:?}: {decode_text}");
+    }
+
+    let bare = run_xray_with_stdin(&["base64"], b"");
+    assert_eq!(bare.status.code(), Some(2), "bare `xray base64` must exit 2 like Go PrintUsage");
+}

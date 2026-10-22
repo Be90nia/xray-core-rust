@@ -98,11 +98,18 @@ impl UdpRelay {
                 *s.last_refresh.lock() = Instant::now();
                 Arc::clone(&s.sock)
             } else {
-                let bind_addr: &str = match dest {
-                    SocketAddr::V4(_) => "0.0.0.0:0",
-                    SocketAddr::V6(_) => "[::]:0",
+                // 预留路径对齐 Go：UDP 出站 socket 也过 DialerController（AI7，
+                // 与 freedom UDP relay 同款，防未来接线时带病上线）。bind 与目标
+                // 同族通配（原 "0.0.0.0:0"/"[::]:0" 语义）。
+                let bind_addr = match dest {
+                    SocketAddr::V4(_) => {
+                        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
+                    },
+                    SocketAddr::V6(_) => {
+                        SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
+                    },
                 };
-                let sock = UdpSocket::bind(bind_addr).await?;
+                let sock = crate::system_dialer::dial_udp_packet_conn(bind_addr, dest).await?;
                 sock.connect(dest).await?;
                 let sock = Arc::new(sock);
                 let last_refresh = Arc::new(parking_lot::Mutex::new(Instant::now()));
