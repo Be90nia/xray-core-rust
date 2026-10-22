@@ -304,7 +304,11 @@ def build_x(proto, P):
         # TUIC v5 over QUIC; dest 行为: UDP+TCP 代理; 需 QUIC stack 双向兼容.
         uuid = UUID
         _tuic_pw = 'tuic-pw'
-        ss_cli = {"network": "tuic", "security": "tls",
+        # network 不写 "tuic"：tuic 是**协议**不是传输名（Go/Rust 的 transport
+        # 白名单里都没有它）；配置期未知网络名会硬错（lfrg ⑤），此前靠"静默接受"
+        # 才漏过。tuic 出站只读 streamSettings.tlsSettings（outbound.rs:941），
+        # 传输层由协议自身 QUIC 承担。
+        ss_cli = {"security": "tls",
                   "tuicSettings": {"users": [{"uuid": uuid, "password": _tuic_pw}],
                                    "server": "127.0.0.1", "server_port": P,
                                    "congestion_control": "cubic"},
