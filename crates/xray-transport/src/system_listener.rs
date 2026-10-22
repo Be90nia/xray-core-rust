@@ -31,15 +31,45 @@ use tokio::{
     net::TcpListener as TokioTcpListener,
 };
 
-/// 入站 TCP listener backlog（bd hjtt：tokio/std 缺省 128，生产实测 listen queue
-/// overflow 1402 次 + SYNs dropped 1404）。全仓 listener 创建点统一走此值。
+/// 入站 TCP listener backlog 兜底值（bd hjtt：tokio/std 缺省 128，生产实测 listen queue
+/// overflow 1402 次 + SYNs dropped 1404）。非 Linux 平台与 Linux 读 somaxconn 失败时
+/// 的生效值。
 pub const LISTEN_BACKLOG: i32 = 1024;
+
+/// 生效 backlog。对齐 Go `net.maxListenerBacklog`（D:/Go/src/net/sock_linux.go:43-59，
+/// 由 net.go:404 `listenerBacklog()` 进程内缓存一次）：
+/// Linux 读 `/proc/sys/net/core/somaxconn`，为 0 / 解析失败 / 读失败 → Go 用
+/// `syscall.SOMAXCONN`（linux amd64 = 0x80 = 128，zerrors_linux_amd64.go:999），
+/// 本仓兜底用 [`LISTEN_BACKLOG`]（1024）——比 Go 的 128 高，保住 hjtt 票在
+/// somaxconn 未调优机器上已消化的 overflow；>65535 钳到 65535（Go maxAckBacklog
+/// 内核 ≥4.1 的 32 位上限分支；<4.1 的 16 位钳制随老内核淘汰不复刻）。
+/// 非 Linux：Windows listen backlog 仅是 hint（内核自行放大，Go
+/// sock_windows.go:13-16 同语义），保持 [`LISTEN_BACKLOG`]；BSD sysctl 变体未复刻。
+#[must_use]
+pub fn effective_listen_backlog() -> i32 {
+    *EFFECTIVE_LISTEN_BACKLOG
+}
+
+#[cfg(target_os = "linux")]
+static EFFECTIVE_LISTEN_BACKLOG: std::sync::LazyLock<i32> = std::sync::LazyLock::new(|| {
+    std::fs::read_to_string("/proc/sys/net/core/somaxconn")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse::<i32>().ok())
+        .filter(|&n| n > 0)
+        .map_or(LISTEN_BACKLOG, |n| n.min(65_535))
+});
+
+#[cfg(not(target_os = "linux"))]
+static EFFECTIVE_LISTEN_BACKLOG: std::sync::LazyLock<i32> =
+    std::sync::LazyLock::new(|| LISTEN_BACKLOG);
 
 /// 指定 backlog 绑定 TCP listener（socket2 bind + listen）。
 ///
 /// 全仓 listener 创建点统一入口（bd hjtt）：`std`/`tokio` 的 `bind` 不暴露
 /// backlog（内核缺省 128）。语义对齐 `std::net::TcpListener::bind`：解析
 /// 主机名取首个地址；Unix 置 SO_REUSEADDR、Windows 不置（std 同款行为）。
+/// 生产调用点传 [`effective_listen_backlog()`]（Go maxListenerBacklog 同款），
+/// `LISTEN_BACKLOG` 常量保留为其兜底值。
 ///
 /// # Errors
 /// 地址解析失败 / socket 创建 / bind / listen 失败时返回 `io::Error`。
@@ -121,7 +151,7 @@ impl DefaultListener {
         } else if Self::needs_prelisten_sockopt(&sockopt) {
             Self::bind_with_prelisten_sockopt(addr, &sockopt).await?
         } else {
-            bind_tcp_listener(addr, LISTEN_BACKLOG).await?
+            bind_tcp_listener(addr, effective_listen_backlog()).await?
         };
         // PROXY protocol 开关接线：sockopt.acceptProxyProtocol 自动传入
         // （Go system_listener.go:169-172 按 sockopt 包 proxyproto.Listener；
@@ -228,7 +258,7 @@ impl DefaultListener {
                 .apply(socket.as_raw_socket())?;
             }
         }
-        socket.listen(LISTEN_BACKLOG)?;
+        socket.listen(effective_listen_backlog())?;
         socket.set_nonblocking(true)?;
         #[cfg(unix)]
         let std_listener = std::net::TcpListener::from(std::os::fd::OwnedFd::from(socket));
@@ -250,7 +280,7 @@ impl DefaultListener {
         addr: SocketAddr,
         _sockopt: &SocketOptions,
     ) -> io::Result<TokioTcpListener> {
-        bind_tcp_listener(addr, LISTEN_BACKLOG).await
+        bind_tcp_listener(addr, effective_listen_backlog()).await
     }
 
     #[cfg(target_os = "linux")]
@@ -278,7 +308,7 @@ impl DefaultListener {
             .apply(socket.as_raw_fd())?;
         }
         socket.bind(&addr.into())?;
-        socket.listen(LISTEN_BACKLOG)?;
+        socket.listen(effective_listen_backlog())?;
         socket.set_nonblocking(true)?;
         // Socket → OwnedFd → std TcpListener（socket2 无直接转换）。
         let std_listener = std::net::TcpListener::from(std::os::fd::OwnedFd::from(socket));
@@ -484,7 +514,7 @@ impl InboundTcpListener {
     pub async fn bind(addr: &str, sockopt: SocketOptions) -> io::Result<Self> {
         // bd hjtt：统一走 backlog=1024 helper（tokio 缺省 128 生产 listen overflow）。
         Ok(Self {
-            inner: bind_tcp_listener(addr, LISTEN_BACKLOG).await?,
+            inner: bind_tcp_listener(addr, effective_listen_backlog()).await?,
             sockopt,
             header: None,
             tcpmask: None,
@@ -876,6 +906,20 @@ pub async fn listen_unix_system(addr: &str, sockopt: SocketOptions) -> io::Resul
 
 #[cfg(test)]
 mod tests {
+    /// hjtt：生效 backlog 对齐 Go `net.maxListenerBacklog`（sock_linux.go:43-59）——
+    /// 正值且不超过 65535 钳制（Go maxAckBacklog 内核 ≥4.1 的 uint32 上限仍有
+    /// issue 5030 的 16 位兼容面）；非 Linux 与读不到 somaxconn 时回落
+    /// [`LISTEN_BACKLOG`]。两次调用一致 = 进程内缓存（Go net.go:404
+    /// listenerBacklogCache 同款）。
+    #[test]
+    fn effective_listen_backlog_is_bounded_and_cached() {
+        let v = effective_listen_backlog();
+        assert!((1..=65_535).contains(&v), "backlog must be 1..=65535, got {v}");
+        assert_eq!(v, effective_listen_backlog(), "backlog lookup must be cached");
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(v, LISTEN_BACKLOG, "non-linux falls back to LISTEN_BACKLOG");
+    }
+
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpStream,

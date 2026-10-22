@@ -460,7 +460,7 @@ pub async fn listen(
     let multi_mode = cfg.multi_mode;
     let listener = xray_transport::system_listener::bind_tcp_listener(
         addr,
-        xray_transport::system_listener::LISTEN_BACKLOG,
+        xray_transport::system_listener::effective_listen_backlog(),
     )
     .await?;
     let local = listener.local_addr()?;
@@ -1495,5 +1495,24 @@ mod tests {
         let stable = accepts.load(Ordering::SeqCst);
         tokio::time::advance(Duration::from_secs(30)).await;
         assert_eq!(accepts.load(Ordering::SeqCst), stable, "no retries after deadline");
+    }
+
+    /// bd lfeu 回归：对端发完 h2 preface 即静默/hard-close 时，accept_h2 的
+    /// handshake 30s 兜底必须切断（hyper 对此无限等待 → N-1 fd 泄漏族，
+    /// 同 724cc20 ws serve_h2_reject 形态）。paused 时间下快进 31s 验证任务
+    /// 终结；修前（无 timeout 包裹）handshake 永挂，本测试挂死。
+    #[tokio::test(start_paused = true)]
+    async fn accept_h2_handshake_times_out_on_silent_peer() {
+        let handler: ConnHandler = Arc::new(|_conn| {
+            panic!("handler must not be called when handshake times out");
+        });
+        // 持住 client 半不写不关：hyper 读完前置等待（无 EOF 无数据）→ 挂起。
+        let (_client, server) = tokio::io::duplex(64 * 1024);
+        let peer: std::net::SocketAddr = "127.0.0.1:65000".parse().unwrap();
+        let serve =
+            tokio::spawn(accept_h2(server, handler, None, false, peer, &[], 7200, 20, false));
+        // paused：显式快进越过 30s 兜底窗，timeout Elapsed → accept_h2 返回。
+        tokio::time::advance(Duration::from_secs(31)).await;
+        serve.await.expect("accept_h2 must return after handshake timeout");
     }
 }

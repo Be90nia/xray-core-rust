@@ -151,7 +151,7 @@ impl InboundHandler for NaiveInboundHandler {
         }
         let listener = xray_transport::system_listener::bind_tcp_listener(
             self.bind_addr,
-            xray_transport::system_listener::LISTEN_BACKLOG,
+            xray_transport::system_listener::effective_listen_backlog(),
         )
         .await
         .map_err(|e| InboundError::ListenError(format!("naive bind {}: {e}", self.bind_addr)))?;

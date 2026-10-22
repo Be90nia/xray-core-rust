@@ -988,6 +988,26 @@ mod tests {
     }
 
     #[test]
+    fn sc_min_posts_interval_ms_zero_falls_back_to_30() {
+        // Go config.go:151-160 GetNormalizedScMinPostsIntervalMs：To == 0 → {30,30}
+        // （7b0j trap 语义对齐：显式 0 视为未配置，不产生 0ms 限流旁路）。
+        let cfg =
+            Config { sc_min_posts_interval_ms: Some(RangeConfig::new(0, 0)), ..Default::default() };
+        let r = cfg.normalized_sc_min_posts_interval_ms();
+        assert_eq!((r.from, r.to), (30, 30));
+    }
+
+    #[test]
+    fn sc_min_posts_interval_ms_explicit_value_honored() {
+        // 7b0j 用户侧修复路径：{"scMinPostsIntervalMs": {"from": 1, "to": 1}}
+        // 必须 1:1 生效（不被 30ms 缺省覆盖，dialer.go:506-508 按 From>0 门控 sleep）。
+        let cfg =
+            Config { sc_min_posts_interval_ms: Some(RangeConfig::new(1, 1)), ..Default::default() };
+        let r = cfg.normalized_sc_min_posts_interval_ms();
+        assert_eq!((r.from, r.to), (1, 1));
+    }
+
+    #[test]
     fn sc_max_buffered_posts_default_30() {
         assert_eq!(Config::default().normalized_sc_max_buffered_posts(), 30);
     }

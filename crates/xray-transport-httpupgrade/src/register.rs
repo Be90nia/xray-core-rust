@@ -81,7 +81,7 @@ async fn listen_httpupgrade(
     // 1. TCP bind（bd hjtt：统一 backlog=1024，tokio 缺省 128 生产 overflow）
     let listener = xray_transport::system_listener::bind_tcp_listener(
         addr,
-        xray_transport::system_listener::LISTEN_BACKLOG,
+        xray_transport::system_listener::effective_listen_backlog(),
     )
     .await?;
     let local = listener.local_addr()?;
