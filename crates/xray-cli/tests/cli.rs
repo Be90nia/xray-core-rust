@@ -50,7 +50,10 @@ fn cli_wg_output_passwall_awk_extractable() {
     assert!(lines[1].starts_with("Password (PublicKey): "), "line 2 prefix: {}", lines[1]);
     // base64 StdEncoding：44 字符（32 字节）且含 `=` padding。
     assert_eq!(private.len(), 44, "std b64 of 32B: {private}");
-    assert!(private.ends_with('=') && public.ends_with('='), "std b64 padding: {private} / {public}");
+    assert!(
+        private.ends_with('=') && public.ends_with('='),
+        "std b64 padding: {private} / {public}"
+    );
 }
 
 #[test]
