@@ -638,7 +638,7 @@ pub fn bind_socket_to_interface(
     }
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
-        let _ = (if_index, dest_is_ipv4);
+        let _ = (socket, if_index, dest_is_ipv4);
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "bind socket to interface not supported on this platform",
