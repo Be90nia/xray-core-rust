@@ -13,7 +13,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: ""
+  # 注意：不再用空 RUSTFLAGS 覆盖 .cargo/config.toml——该文件用
+  # cfg(target_arch="x86_64") 分目标声明（bd f39e：AES-NI 等特性），
+  # aarch64/arm 交叉编译天然不命中该 cfg，安全。
   AWS_LC_SYS_PREGENERATING: "false"
 
 jobs:

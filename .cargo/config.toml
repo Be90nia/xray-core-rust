@@ -1,0 +1,25 @@
+# target-cpu / target-feature 策略（bd f39e，2026-10-22 用户拍板「修吧」）
+#
+# 实测（tools/loopback_alloc_bench.py，同机同配置，3 轮）：
+#   - 仅 -C target-cpu=x86-64：37.8 / 39.1 / 39.2 MB/s
+#   - 加 -C target-cpu=native：159.4 / 183.1 / 189.1 MB/s
+# 差异来自 AES-NI / PCLMULQDQ / SSE4 等扩展未启用：加密链（vless mlkem-enc +
+# xhttp/reality）落到软件实现 → 4.5 倍慢。历史「native 5 倍慢」结论（bd hxy3）
+# 与本夜实测相反，已由 f39e 纠正。
+#
+# 仍然**不用 native**：发行产物必须跨机器可用（老 CPU SIGILL 防线）。
+# 改为显式启用「2010 年后 x86-64 普及」的特性集：
+#   AES-NI / PCLMULQDQ（Westmere 2010+，AMD Bulldozer 2011+）
+#   SSE4.1 / SSE4.2 / POPCNT（Nehalem 2008+）
+# 只对 x86_64 生效（cfg 分目标），aarch64/arm 交叉编译不受影响——因此各
+# workflow 里的 `RUSTFLAGS: ""` 空覆盖已删除，让本文件的 cfg 分目标配置生效。
+# 如需临时 native 自测，用环境变量单次覆盖，勿改本文件：
+#   CARGO_BUILD_RUSTFLAGS="-C target-cpu=native"
+
+[target.'cfg(target_arch = "x86_64")']
+rustflags = [
+    "-C",
+    "target-cpu=x86-64",
+    "-C",
+    "target-feature=+aes,+pclmulqdq,+sse4.1,+sse4.2,+popcnt",
+]

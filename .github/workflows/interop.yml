@@ -10,9 +10,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # 覆盖 .cargo/config.toml 的 target-cpu=native（bd hxy3）：交叉/发行构建保持
-  # 通用 target 生成；RUSTFLAGS env 完全覆盖 build.rustflags（cargo 语义）。
-  RUSTFLAGS: ""
+  # 注意：不再用空 RUSTFLAGS 覆盖 .cargo/config.toml——该文件用
+  # cfg(target_arch="x86_64") 分目标声明（bd f39e：AES-NI 等特性），
+  # aarch64/arm 交叉编译天然不命中该 cfg，安全。
 
 jobs:
   interop:
