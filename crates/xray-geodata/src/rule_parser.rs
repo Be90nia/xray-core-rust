@@ -306,11 +306,13 @@ fn parse_geo_site_rule(rule: &str, datadir: &Path) -> Result<DomainRule, RulePar
 
     check_file(datadir, file, &code)?;
 
+    // attrs 归一化为小写（Go rule_parser.go:221 strings.ToLower）——dat 内
+    // attr key 为小写且匹配层精确相等，@TLS 原样保留会静默不命中。
     Ok(DomainRule {
         value: Some(DomainRuleValue::Geosite(GeoSiteRule {
             file: file.to_string(),
             code,
-            attrs: attrs.to_string(),
+            attrs: attrs.to_lowercase(),
         })),
     })
 }
@@ -442,6 +444,46 @@ mod tests {
             matches!(rule, Err(RuleParserError::FileCheckFailed(_))),
             "ext-site: 前缀应路由进 geosite 解析，而非落字面量 keyword"
         );
+    }
+
+    // ── geosite_attrs_case_insensitive_matches_go ───────────────
+    // bd wp4g：Go rule_parser.go:221 对 attrs 做 strings.ToLower，dat 内
+    // attr key 为小写（geodat_loader.go:198 精确相等）。Rust 修复前 attrs
+    // 保留原大小写，`ext-site:...@TLS` 静默不命中。
+    #[test]
+    fn geosite_attrs_case_insensitive_matches_go() {
+        use crate::{
+            geosite::DomainAttribute,
+            pb::{GeoSite, GeoSiteList},
+        };
+
+        let dir = std::env::temp_dir().join(format!("xray_geodata_attrs_{}", std::process::id()));
+        let domain =
+            Domain::domain("example.com").with_attribute(DomainAttribute::bool_attr("tls", true));
+        let list = GeoSiteList::new().with_entry(GeoSite::new("CN").with_domain(domain));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("geosite.dat"), prost::Message::encode_to_vec(&list)).unwrap();
+
+        // @TLS（大写）与 @tls（小写）行为一致，对齐 Go ToLower
+        for rule in ["ext-site:geosite.dat:cn@TLS", "ext-site:geosite.dat:cn@tls"] {
+            let parsed = parse_geo_site_rule(rule, &dir).unwrap();
+            match parsed.value {
+                Some(DomainRuleValue::Geosite(g)) => {
+                    assert_eq!(g.attrs, "tls", "{rule}: attrs 应归一化为小写");
+                    assert_eq!(g.code, "CN");
+
+                    // 端到端命中：rule.rs 消费路径 load_site_with_attrs →
+                    // AllAttrsMatcher 精确相等过滤，归一化后两种写法都命中
+                    let loader = GeoDataLoader::new(dir.clone());
+                    let site = loader.load_site_with_attrs(&g.file, &g.code, &g.attrs).unwrap();
+                    assert_eq!(site.domain.len(), 1, "{rule}: @TLS/@tls 应命中 tls 属性 domain");
+                    assert_eq!(site.domain[0].value, "example.com");
+                },
+                _ => panic!("期望 Geosite: {rule}"),
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
