@@ -19,6 +19,40 @@ fn cli_version_outputs_version_string() {
     assert!(stdout.contains("26."), "output should contain version 26.x: {stdout}");
 }
 
+/// bd vjbq：顶层 `-version`（Go 风格单横线，normalize 归一为 `--version`）必须与
+/// `version` 子命令报告同一版本号——此前 clap 硬编码 "26.7.28" 与
+/// version_statement 漂移，该误导字符串曾致三起内核身份误认。
+#[test]
+fn cli_dash_version_matches_version_subcommand() {
+    let ver = xray_cli::version::version_string();
+    for arg in ["-version", "--version"] {
+        let output = Command::new(xray_bin()).arg(arg).output().expect("failed to run xray");
+        assert!(output.status.success(), "xray {arg} should exit 0");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains(&ver), "xray {arg} must report {ver}, got: {stdout}");
+    }
+}
+
+/// passwall api.lua:2181 契约：`xray wg | awk -F ': ' '{print $2}'` 后
+/// s[1]=私钥、s[2]=公钥——要求第 1/2 行分别是 `PrivateKey: <k>` 与
+/// `Password (PublicKey): <k>`（`: ` 分隔，字段 2 可提取）。base64 Std 形态。
+#[test]
+fn cli_wg_output_passwall_awk_extractable() {
+    let output = Command::new(xray_bin()).arg("wg").output().expect("failed to run xray wg");
+    assert!(output.status.success(), "xray wg should exit 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(lines.len() >= 2, "wg must print at least 2 lines: {stdout}");
+    // awk -F ': ' 字段 2 提取（Go 同款 `: ` 分隔；StdEncoding 含 padding 字符）。
+    let private = lines[0].split_once(": ").map(|(_, v)| v).expect("line 1 must carry ': '");
+    let public = lines[1].split_once(": ").map(|(_, v)| v).expect("line 2 must carry ': '");
+    assert!(lines[0].starts_with("PrivateKey: "), "line 1 prefix: {}", lines[0]);
+    assert!(lines[1].starts_with("Password (PublicKey): "), "line 2 prefix: {}", lines[1]);
+    // base64 StdEncoding：44 字符（32 字节）且含 `=` padding。
+    assert_eq!(private.len(), 44, "std b64 of 32B: {private}");
+    assert!(private.ends_with('=') && public.ends_with('='), "std b64 padding: {private} / {public}");
+}
+
 #[test]
 fn cli_uuid_outputs_valid_uuid_v4() {
     let output = Command::new(xray_bin()).arg("uuid").output().expect("failed to run xray uuid");

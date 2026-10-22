@@ -18,7 +18,7 @@ use std::{
 
 use bytes::Bytes;
 use futures_util::TryStreamExt;
-use http::HeaderMap;
+use http::{HeaderMap, HeaderValue};
 use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
 use hyper::{Method, Request, Response, StatusCode, body::Frame};
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
@@ -342,8 +342,8 @@ where
         .status(StatusCode::OK)
         .body(body)
         .unwrap_or_else(|_| status_response(StatusCode::INTERNAL_SERVER_ERROR));
-    resp.headers_mut().insert("X-Accel-Buffering", "no".parse().unwrap());
-    resp.headers_mut().insert("Cache-Control", "no-store".parse().unwrap());
+    resp.headers_mut().insert("X-Accel-Buffering", HeaderValue::from_static("no"));
+    resp.headers_mut().insert("Cache-Control", HeaderValue::from_static("no-store"));
     resp
 }
 
@@ -419,13 +419,13 @@ where
 
     // 返回 streaming response（连接持续到 body stream 结束）
     let mut resp = Response::builder().status(StatusCode::OK);
-    let headers = resp.headers_mut().unwrap();
-    headers.insert("X-Accel-Buffering", "no".parse().unwrap());
-    headers.insert("Cache-Control", "no-store".parse().unwrap());
+    let headers = resp.headers_mut().expect("builder not yet consumed before body()");
+    headers.insert("X-Accel-Buffering", HeaderValue::from_static("no"));
+    headers.insert("Cache-Control", HeaderValue::from_static("no-store"));
     if !ctx.config.no_sse_header {
-        headers.insert("Content-Type", "text/event-stream".parse().unwrap());
+        headers.insert("Content-Type", HeaderValue::from_static("text/event-stream"));
     }
-    resp.body(body).unwrap()
+    resp.body(body).expect("fixed status + valid header/body parts")
 }
 
 // ===== 辅助函数 =====
@@ -706,7 +706,7 @@ fn base64url_decode(s: &str) -> Result<Vec<u8>, ()> {
 
 /// 构造空 body 状态响应。
 fn status_response(status: StatusCode) -> Response<BoxBody<Bytes, io::Error>> {
-    Response::builder().status(status).body(empty_body()).unwrap()
+    Response::builder().status(status).body(empty_body()).expect("fixed status + empty body")
 }
 
 fn empty_body() -> BoxBody<Bytes, io::Error> {

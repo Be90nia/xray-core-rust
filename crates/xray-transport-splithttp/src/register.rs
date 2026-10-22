@@ -207,8 +207,9 @@ async fn dial_splithttp(
                         format!("splithttp reality handshake: {e}"),
                     )
                 })?;
-            let remote = remote_addr.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-            let local = local_addr.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+            let remote =
+                remote_addr.unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+            let local = local_addr.unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
             // base_uri 必须拼 config.path — 否则 splithttp request URL 是 host/ 而不是 host/path,
             // 服务端 REALITY handler 找不到 path 返回 404（fix-reality-xhttp-11 子代理 25min
             // 调研结论）。 用 normalized_path() 自动补前导 / + 加末尾 /，与 dial() 函数

@@ -590,7 +590,7 @@ impl MPHMatcherGroup {
 
     /// 添加精确全匹配规则。
     ///
-    /// 模式会被转为小写存储。
+    /// 模式转为小写存储（对齐 Go `matchergroup_mph.go:84`）；查询输入不被转换。
     pub fn add_full_matcher(&mut self, pattern: &str, value: u32) {
         let pattern = pattern.to_lowercase();
         self.add_pattern(0, "", &pattern, MatcherType::Full, value);
@@ -773,15 +773,17 @@ impl MatcherGroup for MPHMatcherGroup {
             return Vec::new();
         }
 
-        let input_lower = input.to_lowercase();
+        // 大小写敏感：Go 只在 Add 侧 lowercase 模式（matchergroup_mph.go:84），
+        // 输入侧原样比较，lowercase 由调用方负责（router/condition.go:60、dns/hosts.go:98）。
         let mut matches: Vec<Vec<u32>> = Vec::with_capacity(5);
         let mut hash: u32 = 0;
 
-        let bytes = input_lower.as_bytes();
+        let bytes = input.as_bytes();
         for i in (0..bytes.len()).rev() {
             hash = hash.wrapping_mul(PRIME_RK).wrapping_add(u32::from(bytes[i]));
             if bytes[i] == b'.' {
-                let mph_idx = self.lookup(hash, &input_lower[i..]);
+                // 只有 '.' 位置是 UTF-8 字符边界（续字节 >= 0x80），切片安全
+                let mph_idx = self.lookup(hash, &input[i..]);
                 if mph_idx != 0 {
                     matches.push(self.values[mph_idx as usize].clone());
                 }
@@ -789,7 +791,7 @@ impl MatcherGroup for MPHMatcherGroup {
         }
 
         // 检查完整输入
-        let mph_idx = self.lookup(hash, &input_lower);
+        let mph_idx = self.lookup(hash, input);
         if mph_idx != 0 {
             matches.push(self.values[mph_idx as usize].clone());
         }
@@ -803,18 +805,17 @@ impl MatcherGroup for MPHMatcherGroup {
             return false;
         }
 
-        let input_lower = input.to_lowercase();
         let mut hash: u32 = 0;
 
-        let bytes = input_lower.as_bytes();
+        let bytes = input.as_bytes();
         for i in (0..bytes.len()).rev() {
             hash = hash.wrapping_mul(PRIME_RK).wrapping_add(u32::from(bytes[i]));
-            if bytes[i] == b'.' && self.lookup(hash, &input_lower[i..]) != 0 {
+            if bytes[i] == b'.' && self.lookup(hash, &input[i..]) != 0 {
                 return true;
             }
         }
 
-        self.lookup(hash, &input_lower) != 0
+        self.lookup(hash, input) != 0
     }
 }
 
@@ -841,14 +842,16 @@ mod tests_mph {
         assert!(group.match_any("example.com"));
     }
 
+    // Go 只在 Add 侧 lowercase 模式（matchergroup_mph.go:84），Match 输入侧大小写敏感
     #[test]
-    fn test_mph_full_matcher_case_insensitive() {
+    fn test_mph_full_matcher_lowercases_pattern_not_input() {
         let mut group = MPHMatcherGroup::new();
         group.add_full_matcher("Example.COM", 1);
         group.build().unwrap();
 
         assert_eq!(group.match_str("example.com"), vec![1]);
-        assert_eq!(group.match_str("EXAMPLE.COM"), vec![1]);
+        assert!(group.match_str("EXAMPLE.COM").is_empty());
+        assert!(!group.match_any("EXAMPLE.COM"));
     }
 
     #[test]

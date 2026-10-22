@@ -31,3 +31,7 @@ serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 rcgen = "0.13"
 rustls = { workspace = true, default-features = false, features = ["ring"] }
+
+# bd g3cr: 生产代码零 unwrap（测试代码由 clippy.toml allow-unwrap-in-tests 豁免）
+[lints.clippy]
+unwrap_used = "deny"

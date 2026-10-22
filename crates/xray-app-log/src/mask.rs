@@ -65,10 +65,11 @@ pub fn parse_mask_address(spec: &str) -> Result<(i32, i32), LogError> {
 }
 
 static IPV4_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(\d{1,3}\.){3}\d{1,3}").unwrap());
+    LazyLock::new(|| Regex::new(r"(\d{1,3}\.){3}\d{1,3}").expect("valid static regex"));
 
-static IPV6_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?:[0-9a-fA-F]{0,4}:[0-9a-fA-F]{0,4}){2,7}").unwrap());
+static IPV6_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:[0-9a-fA-F]{0,4}:[0-9a-fA-F]{0,4}){2,7}").expect("valid static regex")
+});
 
 /// 对输入字符串中的 IPv4 / IPv6 地址做掩码处理。
 ///

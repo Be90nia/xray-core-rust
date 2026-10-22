@@ -5,6 +5,7 @@
 //! - cache 第二次查询命中（不再走网络）
 //! - EDNS0 client_ip 选项正确附加（通过 query bytes 验证）
 
+#![allow(clippy::unwrap_used)] // bd g3cr：测试断言便利豁免（allow-unwrap-in-tests 对 tests/ 目录失效，clippy#13981）；生产禁令不受影响
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,

@@ -32,3 +32,7 @@ thiserror = { workspace = true }
 base64 = "0.22"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 rand = "0.9"
+
+# bd g3cr: 生产代码零 unwrap（测试代码由 clippy.toml allow-unwrap-in-tests 豁免）
+[lints.clippy]
+unwrap_used = "deny"

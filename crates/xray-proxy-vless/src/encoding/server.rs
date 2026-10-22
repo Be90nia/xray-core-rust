@@ -114,12 +114,14 @@ pub async fn decode_request_header<R: AsyncRead + Unpin>(
     // ---- 6. 根据 command 决定地址 ----
     match command {
         VlessCommand::Mux => {
-            decoded.address =
-                Some(Address::Domain(VlessCommand::Mux.fixed_domain().unwrap().to_string()));
+            decoded.address = Some(Address::Domain(
+                VlessCommand::Mux.fixed_domain().expect("Mux carries fixed domain").to_string(),
+            ));
         },
         VlessCommand::Rvs => {
-            decoded.address =
-                Some(Address::Domain(VlessCommand::Rvs.fixed_domain().unwrap().to_string()));
+            decoded.address = Some(Address::Domain(
+                VlessCommand::Rvs.fixed_domain().expect("Rvs carries fixed domain").to_string(),
+            ));
         },
         VlessCommand::Tcp | VlessCommand::Udp => {
             let (addr, port) = read_address_port(reader).await?;

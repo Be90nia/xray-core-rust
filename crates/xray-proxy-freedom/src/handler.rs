@@ -347,7 +347,12 @@ mod tests {
         match result {
             Ok(Ok(())) => {},
             Ok(Err(e)) => panic!("dial via dial-layer resolution failed: {e}"),
-            Err(_) => eprintln!("SKIP: dial timed out"),
+            Err(_) => {
+                #[allow(clippy::print_stderr)] // 测试 skip 需在输出可见原因
+                {
+                    eprintln!("SKIP: dial timed out");
+                }
+            },
         }
 
         uninstall();
@@ -367,7 +372,10 @@ mod tests {
             Ok(Ok(())) => panic!("expected error for invalid domain"),
             Err(_) => {
                 // DNS 超时也算失败（NXDOMAIN 应该很快返回）
-                eprintln!("SKIP: DNS resolution timed out for invalid domain");
+                #[allow(clippy::print_stderr)] // 测试 skip 需在输出可见原因
+                {
+                    eprintln!("SKIP: DNS resolution timed out for invalid domain");
+                }
             },
         }
     }
@@ -455,7 +463,12 @@ mod tests {
         match result {
             Ok(Ok(())) => {},
             Ok(Err(e)) => panic!("dial should succeed: {e}"),
-            Err(_) => eprintln!("SKIP: dial timed out"),
+            Err(_) => {
+                #[allow(clippy::print_stderr)] // 测试 skip 需在输出可见原因
+                {
+                    eprintln!("SKIP: dial timed out");
+                }
+            },
         }
         assert_eq!(
             fake.query_count(),
@@ -499,7 +512,12 @@ mod tests {
         match result {
             Ok(Ok(())) => {},
             Ok(Err(e)) => panic!("dial should succeed: {e}"),
-            Err(_) => eprintln!("SKIP: dial timed out"),
+            Err(_) => {
+                #[allow(clippy::print_stderr)] // 测试 skip 需在输出可见原因
+                {
+                    eprintln!("SKIP: dial timed out");
+                }
+            },
         }
         assert_eq!(
             fake.query_count(),

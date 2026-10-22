@@ -39,6 +39,8 @@ hex = "0.4"
 # xmc (finalmask Minecraft 伪装)：AES-CFB8 + RSA-1024 PKCS1v15 + 确定性素数派生
 aes = "0.9"
 rsa = "0.9"
+# xmc 服务端密码恒时比较（对齐 Go xmc/server.go subtle.ConstantTimeCompare；已在 lockfile 传递依赖）
+subtle = { version = "2", default-features = false }
 # num-bigint 全仓零引用；rsa 内部使用 num-bigint-dig(BigUint 实现)。
 num-traits = "0.2"
 num-integer = "0.1"
@@ -53,3 +55,7 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 [features]
 default = []
 browser-dialer = []
+
+# bd g3cr: 生产代码零 unwrap（测试代码由 clippy.toml allow-unwrap-in-tests 豁免）
+[lints.clippy]
+unwrap_used = "deny"

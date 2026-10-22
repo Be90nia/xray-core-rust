@@ -1096,6 +1096,7 @@ mod tests {
     /// （`REPRO_FM=none` / `xmc` 作对照；`REPRO_CHUNK` 调上行分块大小）。
     #[tokio::test]
     #[ignore]
+    #[allow(clippy::print_stderr)] // 复现工具：进度/停点诊断输出是本测试的功能
     async fn dial_ws_finalmask_large_payload_roundtrip() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use xray_common::net::{address::Address, network::Network, port::Port};

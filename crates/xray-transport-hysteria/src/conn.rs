@@ -20,6 +20,7 @@ use std::{
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
 use tokio::sync::{Mutex as TokioMutex, mpsc};
+use xray_common::padding::validate_padding_len;
 
 use crate::{
     config::{IDLE_CLEANUP_INTERVAL, TcpRequestPadding, UDP_MESSAGE_CHAN_SIZE},
@@ -149,7 +150,7 @@ pub(crate) async fn read_tcp_response_stream(stream: &dyn QuicStream) -> io::Res
         read_exact_stream(stream, &mut msg).await?;
     }
     let pad_len = read_varint_exact_stream(stream).await?;
-    if pad_len > MAX_PAD {
+    if validate_padding_len(pad_len, MAX_PAD).is_err() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("hysteria tcp response pad_len {pad_len} > {MAX_PAD}"),
@@ -1128,5 +1129,74 @@ mod tests {
         conn.touch();
         let after = conn.last_active();
         assert!(after > before);
+    }
+
+    /// 测试用 QuicStream：从缓冲顺序喂字节（read_exact_stream 数据源）。
+    #[derive(Debug)]
+    struct FeedStream {
+        data: std::sync::Mutex<Vec<u8>>,
+        local: SocketAddr,
+        remote: SocketAddr,
+    }
+    impl QuicStream for FeedStream {
+        fn read<'a>(
+            &'a self,
+            buf: &'a mut [u8],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                let mut data = self.data.lock().unwrap();
+                let n = buf.len().min(data.len());
+                buf[..n].copy_from_slice(&data[..n]);
+                data.drain(..n);
+                Ok(n)
+            })
+        }
+
+        fn write<'a>(
+            &'a self,
+            buf: &'a [u8],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send + 'a>>
+        {
+            let len = buf.len();
+            Box::pin(async move { Ok(len) })
+        }
+
+        fn poll_write(
+            &self,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn cancel_read(&self, _code: u64) {}
+
+        fn close(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            self.local
+        }
+
+        fn remote_addr(&self) -> SocketAddr {
+            self.remote
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_response_stream_rejects_oversize_pad_len() {
+        // bd p67v 收敛点：pad_len 声明值超 4096 必须在读 padding 前拒绝。
+        let mut frame = vec![0u8]; // status=0
+        frame.extend(encode_varint(0)); // msg_len=0
+        frame.extend(encode_varint(4097)); // pad_len 超界
+        let local: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let stream = FeedStream { data: std::sync::Mutex::new(frame), local, remote: local };
+        let err = read_tcp_response_stream(&stream).await.unwrap_err();
+        assert!(err.to_string().contains("pad_len 4097 > 4096"), "got {err}");
     }
 }

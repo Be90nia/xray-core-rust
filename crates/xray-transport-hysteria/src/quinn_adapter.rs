@@ -986,7 +986,7 @@ impl HysteriaHttp3Server for QuinnHttp3Server {
                                     )
                                     .header(config::CommonHeaderPadding, &auth_resp.padding)
                                     .body(())
-                                    .unwrap();
+                                    .expect("fixed status + trusted-config header values");
                                 let _ = stream.send_response(resp).await;
                             } else {
                                 // Masquerade
@@ -998,7 +998,9 @@ impl HysteriaHttp3Server for QuinnHttp3Server {
                                 for (k, v) in &headers {
                                     builder = builder.header(k.as_str(), v.as_str());
                                 }
-                                let resp = builder.body(()).unwrap();
+                                let resp = builder
+                                    .body(())
+                                    .expect("masquerade headers are trusted config values");
                                 let _ = stream.send_response(resp).await;
                                 let _ = stream.send_data(bytes::Bytes::from(body)).await;
                             }

@@ -627,7 +627,7 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
             },
         };
         if req.method() != "POST" {
-            let r = http::Response::builder().status(404).body(()).unwrap();
+            let r = http::Response::builder().status(404).body(()).expect("fixed 404 response");
             let _ = respond.send_response(r, true);
             continue;
         }
@@ -636,7 +636,7 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
         // 缺此校验=任意 content-type 一律 200，主动探测面与 Go 可区分。
         let req_ct = req.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
         if !req_ct.starts_with("application/grpc") {
-            let r = http::Response::builder().status(415).body(()).unwrap();
+            let r = http::Response::builder().status(415).body(()).expect("fixed 415 response");
             let _ = respond.send_response(r, true);
             continue;
         }
@@ -654,7 +654,7 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
                     .header("grpc-status", "12")
                     .header("grpc-message", "unknown service")
                     .body(())
-                    .unwrap();
+                    .expect("fixed trailers-only response");
                 let _ = respond.send_response(r, true);
                 continue;
             }
@@ -667,7 +667,7 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
                 // content-type"）
                 .header("content-type", "application/grpc")
                 .body(())
-                .unwrap(),
+                .expect("fixed response"),
             false,
         ) {
             Ok(s) => s,

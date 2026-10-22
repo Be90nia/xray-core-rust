@@ -1260,8 +1260,8 @@ mod tests {
             cfg.build().unwrap();
         });
         let warns = capture.0.lock().unwrap();
+        #[allow(clippy::print_stdout)] // e2e 取证输出（--nocapture 人眼核对）
         for w in warns.iter() {
-            // e2e 取证（--nocapture）：真实 warn 文本。
             println!("[e2e] warn: {w}");
         }
         assert!(

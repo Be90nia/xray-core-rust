@@ -22,5 +22,13 @@ id = "RUSTSEC-2025-0134"
 reason = "rustls-pemfile 2.2.0 unmaintained (rustls/pemfile archived 2025-08); 迁 rustls-pki-types 0.10 跨多调用点，单票治理中"
 
 [[IgnoredVulns]]
+id = "RUSTSEC-2026-0382"
+reason = "rustls-webpki 0.103.15 distrusted intermediates; 补丁版本存在但本机 crates.io 不可达无法验证编译（bd srlx，2026-10-22 用户拍板 risk-accept）；网络恢复后升级并移除"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0381"
+reason = "webpki-roots 1.0.8 emSign intermediates; 同上，升级被网络阻塞（bd srlx）；网络恢复后升级并移除"
+
+[[IgnoredVulns]]
 id = "RUSTSEC-2024-0449"
 reason = "unsafe-libyaml 0.2.11 unmaintained (dtolnay 已停更); serde_yaml→yaml-rust2 迁移跨仓评估中"

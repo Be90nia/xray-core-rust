@@ -37,3 +37,7 @@ bytes.workspace = true
 rcgen = "0.13"
 # start_paused（bd cjwc G2 握手超时测试用暂停时钟做毫秒级验证）。
 tokio = { workspace = true, features = ["full", "test-util"] }
+
+# bd g3cr: 生产代码零 unwrap（测试代码由 clippy.toml allow-unwrap-in-tests 豁免）
+[lints.clippy]
+unwrap_used = "deny"

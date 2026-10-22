@@ -12,7 +12,10 @@ use std::{
     time::Duration,
 };
 
-use xray_app_geodata::downloader::{AssetDownloader, RealAssetDownloader};
+use xray_app_geodata::{
+    GeodataError,
+    downloader::{AssetDownloader, RealAssetDownloader},
+};
 
 /// 一次性 HTTP 服务器：accept 一个连接，回写固定 response。
 struct OneShotServer {
@@ -145,6 +148,81 @@ fn real_downloader_resolve_rejects_empty() {
     let dir = unique_dir("resolve_empty");
     let dl = RealAssetDownloader::new(dir);
     assert!(dl.resolve_target("").is_err());
+}
+
+#[test]
+fn real_downloader_follows_redirect_to_next_hop() {
+    // 302 → https://127.0.0.1:1/f.dat：证明循环真按 Location 重新拨号（端口 1 必被拒）。
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: https://127.0.0.1:1/f.dat\r\nContent-Length: 0\r\n\r\n",
+                )
+                .unwrap();
+            stream.flush().ok();
+        }
+    });
+    let dir = unique_dir("redirect_follow");
+    let dl = RealAssetDownloader::new(dir.clone()).with_timeout(Duration::from_millis(500));
+    let url = format!("http://{}/x.dat", addr);
+    let temp = dir.join("x.tmp");
+    let err = dl.download_to(&url, &temp).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("connect 127.0.0.1:1"), "expected second-hop dial, got: {msg}");
+    assert!(!temp.exists(), "redirect must not write temp file");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn real_downloader_rejects_insecure_redirect() {
+    // Go CheckRedirect：目标 scheme != https → InsecureRedirect（http→http 也拒）。
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf);
+            let resp = format!(
+                "HTTP/1.1 301 Moved\r\nLocation: http://{addr}/plain.dat\r\nContent-Length: 0\r\n\r\n"
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().ok();
+        }
+    });
+    let dir = unique_dir("redirect_insecure");
+    let dl = RealAssetDownloader::new(dir.clone());
+    let url = format!("http://{}/x.dat", addr);
+    let temp = dir.join("x.tmp");
+    let err = dl.download_to(&url, &temp).unwrap_err();
+    assert!(matches!(err, GeodataError::InsecureRedirect(_)), "got {err:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn real_downloader_rejects_redirect_without_location() {
+    // 无 Location 的 3xx 无从跟随 → Go fetch 的 ">= 300 → unexpected status" 语义。
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf);
+            stream.write_all(b"HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n").unwrap();
+            stream.flush().ok();
+        }
+    });
+    let dir = unique_dir("redirect_no_location");
+    let dl = RealAssetDownloader::new(dir.clone());
+    let url = format!("http://{}/x.dat", addr);
+    let temp = dir.join("x.tmp");
+    let err = dl.download_to(&url, &temp).unwrap_err();
+    assert!(matches!(err, GeodataError::UnexpectedStatus(304)), "got {err:?}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

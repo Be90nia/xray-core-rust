@@ -801,11 +801,11 @@ mod tests {
     }
 
     #[test]
-    fn test_mph_domain_matcher_case_insensitive() {
+    fn test_mph_domain_matcher_lowercases_pattern_not_input() {
         let rules = vec![DomainRule::full("Example.COM", 1)];
         let matcher = MphDomainMatcher::build(&rules).unwrap();
         assert!(matcher.match_any("example.com"));
-        assert!(matcher.match_any("EXAMPLE.COM"));
+        assert!(!matcher.match_any("EXAMPLE.COM"));
     }
 
     // ----- CompactDomainMatcher 测试 -----

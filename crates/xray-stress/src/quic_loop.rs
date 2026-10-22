@@ -59,7 +59,7 @@ pub async fn start_quic_echo_server() -> Result<SocketAddr> {
     let listener = loop {
         match factory
             .listen(
-                format!("127.0.0.1:{quic_port}").parse().unwrap(),
+                SocketAddr::from(([127, 0, 0, 1], quic_port)),
                 Arc::new(ProtoConfig::default()),
                 Arc::new(xray_proto::xray::transport::internet::QuicParams::default()),
                 MasqType::NotFound,
@@ -140,7 +140,7 @@ pub async fn s3_quic_reconnect_loop(
         .with_custom_certificate_verifier(Arc::new(NoVerifier))
         .with_no_client_auth();
     let transport: Arc<QuinnHysteriaTransport> = Arc::new(
-        QuinnHysteriaTransport::new(client_tls, "0.0.0.0:0".parse().unwrap())
+        QuinnHysteriaTransport::new(client_tls, SocketAddr::from(([0, 0, 0, 0], 0)))
             .expect("quic transport"),
     );
     let dest = DialDestination { udp_addr: server_addr, host: "localhost".into() };

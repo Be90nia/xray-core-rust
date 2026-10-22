@@ -393,14 +393,17 @@ pub trait HysteriaRequestHandler: Send + Sync {
     fn masquerade(&self) -> Arc<dyn MasqueradeHandler>;
 }
 
+/// QUIC conn/listener future（`Pin<Box<dyn Future>>`，ponytail 不引 async_trait）。
+type QuicConnFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Arc<dyn QuicConn>>> + Send>>;
+type HysteriaListenFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Arc<dyn HysteriaQuicListener>>> + Send>,
+>;
+
 /// QUIC listener 抽象（对应 Go `*quic.Listener` + `quic.Transport`）。
 pub trait HysteriaQuicListener: Send + Sync {
     /// 接受下一个 QUIC conn（对应 Go `listener.Accept(ctx)`）。
-    fn accept(
-        &self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = std::io::Result<Arc<dyn QuicConn>>> + Send>,
-    >;
+    fn accept(&self) -> QuicConnFuture;
 
     /// 本地地址（对应 Go `listener.Addr()`）。
     fn local_addr(&self) -> SocketAddr;
@@ -426,9 +429,7 @@ pub trait HysteriaListenerFactory: Send + Sync {
         // auth 后每个新 UDP session（4B session id 首包触发，对应 Go udpSessionManager.addConn）。
         // None = 不启用 UDP 数据面。
         on_new_udp_session: Option<Arc<dyn Fn(Arc<InterConn>) + Send + Sync>>,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Arc<dyn HysteriaQuicListener>>> + Send>,
-    >;
+    ) -> HysteriaListenFuture;
 }
 
 /// Hysteria Listener（对应 Go `*Listener`）。

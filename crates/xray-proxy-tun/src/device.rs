@@ -246,6 +246,7 @@ mod tests {
     ///
     /// 对应 Go `tun_windows.go::NewTun`（49-72）+ `tun_linux.go::NewTun` 创建流程。
     #[tokio::test]
+    #[allow(clippy::print_stderr)] // TUN 无权限环境 skip 探针 + 非致命错误诊断
     async fn device_create_drop() {
         // 平台特定设备名：Linux 自由命名；macOS 用 utun 前缀；Windows 由 wintun 自动分配 GUID。
         let device_name = if cfg!(target_os = "linux") {
@@ -283,6 +284,7 @@ mod tests {
     ///
     /// 对应 Go `tun_windows.go::WritePacket`（223-247）+ `ReadPacket`（249-270）。
     #[tokio::test]
+    #[allow(clippy::print_stderr)] // TUN 无权限环境 skip 探针 + 非致命错误诊断
     async fn send_recv_roundtrip_via_try() {
         let device_name = if cfg!(target_os = "linux") {
             format!("xray_io_{}", std::process::id() % 1000)

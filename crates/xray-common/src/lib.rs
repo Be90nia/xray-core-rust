@@ -16,6 +16,7 @@ pub mod errors;
 pub mod log;
 pub mod net;
 pub mod ocsp;
+pub mod padding;
 pub mod peer;
 pub mod platform;
 pub mod protocol;

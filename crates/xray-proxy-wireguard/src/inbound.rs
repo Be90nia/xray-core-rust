@@ -796,20 +796,19 @@ mod tests {
     struct EchoDispatch {
         tag: String,
         response: Vec<u8>,
-        seen: Arc<ParkMutex<Vec<(Destination, Vec<u8>)>>>,
+        seen: SeenLog,
         access_seen: Arc<ParkMutex<Vec<AccessContext>>>,
     }
+
+    /// (dest, 请求 payload) 记录表共享句柄。
+    type SeenLog = Arc<ParkMutex<Vec<(Destination, Vec<u8>)>>>;
 
     impl EchoDispatch {
         #[allow(clippy::type_complexity)] // 签名类型即业务语义，抽 type alias 反而更晦涩
         fn new(
             tag: &str,
             response: &[u8],
-        ) -> (
-            Arc<Self>,
-            Arc<ParkMutex<Vec<(Destination, Vec<u8>)>>>,
-            Arc<ParkMutex<Vec<AccessContext>>>,
-        ) {
+        ) -> (Arc<Self>, SeenLog, Arc<ParkMutex<Vec<AccessContext>>>) {
             let seen = Arc::new(ParkMutex::new(Vec::new()));
             let access_seen = Arc::new(ParkMutex::new(Vec::new()));
             (
@@ -1126,6 +1125,7 @@ mod tests {
     ///    tx 必满 → relay 必经 written==0 停泵重试）且零进展轮 ≥1，缺一即红，
     ///    防退化成安慰剂绿。
     #[tokio::test]
+    #[allow(clippy::print_stderr)] // 吞吐/停轮诊断输出（assert 语义的一部分）
     async fn tunnel_tcp_inbound_large_response_no_truncation() {
         use std::net::SocketAddr;
 

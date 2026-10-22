@@ -1686,6 +1686,9 @@ mod tests {
         })
         .await
         .unwrap_or_else(|_| panic!("Go must push the socks session over the carrier: {seen:?}"));
-        println!("carrier bytes from Go portal: {seen:?}");
+        #[allow(clippy::print_stdout)] // interop 取证输出（--nocapture 人眼核对）
+        {
+            println!("carrier bytes from Go portal: {seen:?}");
+        }
     }
 }

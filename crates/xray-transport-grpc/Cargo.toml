@@ -30,3 +30,7 @@ register = ["dep:xray-tls"]
 [dev-dependencies]
 # G8 退避重连确定性测试（tokio::time::pause/advance）
 tokio = { workspace = true, features = ["test-util"] }
+
+# bd g3cr: 生产代码零 unwrap（测试代码由 clippy.toml allow-unwrap-in-tests 豁免）
+[lints.clippy]
+unwrap_used = "deny"

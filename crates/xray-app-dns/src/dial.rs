@@ -99,24 +99,26 @@ pub trait UdpPacketSession: Send {
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>>;
 
     /// `Ok(None)` = 会话已关闭。
-    fn recv_packet(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = io::Result<Option<Vec<u8>>>> + Send + '_>>;
+    fn recv_packet(&mut self) -> UdpRecvFuture<'_>;
 }
+
+/// UDP 会话收包 future（`Ok(None)` = 会话已关闭）。
+type UdpRecvFuture<'a> = Pin<Box<dyn Future<Output = io::Result<Option<Vec<u8>>>> + Send + 'a>>;
+
+/// DNS 流式链路 future（Go nameserver_tcp.go:43-47 / dohnameserver.go:68）。
+type DnsStreamFuture<'a> = Pin<Box<dyn Future<Output = io::Result<DnsStream>> + Send + 'a>>;
+
+/// DNS UDP 会话 future（Go nameserver_udp.go:134）。
+type UdpSessionFuture<'a> =
+    Pin<Box<dyn Future<Output = io::Result<Box<dyn UdpPacketSession>>> + Send + 'a>>;
 
 /// DNS 查询拨号器（Go `routing.Dispatcher` 在 DNS 查询场景的用法）。
 pub trait QueryDialer: Send + Sync {
     /// 建立到 `dest` 的流式链路（Go nameserver_tcp.go:43-47 / dohnameserver.go:68）。
-    fn dial_tcp(
-        &self,
-        dest: &Destination,
-    ) -> Pin<Box<dyn Future<Output = io::Result<DnsStream>> + Send + '_>>;
+    fn dial_tcp(&self, dest: &Destination) -> DnsStreamFuture<'_>;
 
     /// 建立 UDP 数据报会话（Go nameserver_udp.go:134）。
-    fn dial_udp(
-        &self,
-        dest: &Destination,
-    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn UdpPacketSession>>> + Send + '_>>;
+    fn dial_udp(&self, dest: &Destination) -> UdpSessionFuture<'_>;
 }
 
 // ========== 进程级共享槽（fakedns 9vu4 同模式） ==========

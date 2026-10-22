@@ -91,9 +91,13 @@ pub async fn dial(
     // 4. Endpoint + connect（外层 timeout 覆盖 DNS+握手+鉴权整段）。
     // GSO 默认开（quinn-udp 构造期探测 UDP_SEGMENT，内核不支持自动回退单段）；
     // disableGSO=true 时经 NoGsoSocket 钳单段（见 udp_gso 模块 doc）。
-    let endpoint =
-        crate::udp_gso::make_endpoint(None, "0.0.0.0:0".parse().unwrap(), qc.disable_gso, sockopt)
-            .map_err(|e| io::Error::other(format!("quinn bind: {e}")))?;
+    let endpoint = crate::udp_gso::make_endpoint(
+        None,
+        std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+        qc.disable_gso,
+        sockopt,
+    )
+    .map_err(|e| io::Error::other(format!("quinn bind: {e}")))?;
     let connecting = endpoint
         .connect_with(client_config, socket_addr, &sni)
         .map_err(|e| io::Error::other(format!("quinn connect initiate: {e}")))?;
