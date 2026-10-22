@@ -1061,6 +1061,10 @@ pub fn resolve_interface_index(name: &str) -> std::io::Result<u32> {
 
 #[cfg(test)]
 mod tests {
+    // clippy 的 print_stderr 检查不认 `#[cfg(test)]` 模块里被 `#[cfg(target_os)]`
+    // 再门一道的函数（Linux CI 才编译），skip 提示会被当成库代码的 eprintln 报错。
+    #![allow(clippy::print_stderr)]
+
     use tokio::net::TcpListener;
 
     use super::*;
