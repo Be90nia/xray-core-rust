@@ -91,7 +91,7 @@ pub fn derive_identity_subkey(ipsk: &[u8], salt: &[u8], kind: CipherKind2022) ->
 /// PSK 的 identity：`blake3::hash(psk)[0..16]`（SIP023 identity header 明文）。
 pub fn psk_identity(psk: &[u8]) -> [u8; IDENTITY_HEADER_LEN] {
     let h = blake3::hash(psk);
-    h.as_bytes()[..IDENTITY_HEADER_LEN].try_into().unwrap()
+    h.as_bytes()[..IDENTITY_HEADER_LEN].try_into().expect("blake3 output is 32 bytes")
 }
 
 /// 加密 EIH：AES-ECB 单块（SIP023 TCP identity_header）。

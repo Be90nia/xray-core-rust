@@ -39,6 +39,7 @@ pub mod realm;
 pub mod salamander;
 pub mod salamander_gecko;
 pub mod sudoku;
+pub mod udphop;
 pub mod xdns;
 pub mod xicmp;
 pub mod xmc;
@@ -415,7 +416,7 @@ pub fn wrap_packet_conn_server_into_connection(
 ) -> io::Result<Box<dyn crate::connection::Connection>> {
     // ponytail: server 方向无法确定 peer；接口签名保留 remote_hint 仅为对称 client 路径，
     // 实际 `remote_addr()` 返回 Ok(None)。若未来要识别 peer，根据 `_remote_hint` 改进。
-    Ok(Box::new(PacketIoConn::new(udpio, "0.0.0.0:0".parse().unwrap())))
+    Ok(Box::new(PacketIoConn::new(udpio, SocketAddr::from(([0, 0, 0, 0], 0)))))
 }
 
 /// 把 `&[Box<dyn Tcpmask>]` 按 client/server 方向链式包装到 `raw`。
@@ -764,6 +765,9 @@ pub fn build_udpmask_manager(config: &FinalmaskConfig) -> io::Result<UdpmaskMana
 /// - `xdns` —— `xdns::Config{ domains, resolvers, extra_poll }`（DNS-over-UDP 隧道，v26.9.30 形态）
 /// - `xicmp` —— `XicmpConfig{ ips, dgram }`（wrap 时仅允许最外层）
 /// - `realm` —— `realm::Config`（STUN/HTTP NAT 穿透，settings 从 `url` 解析）
+/// - `udphop` —— `udphop::UdphopConfig`（UDP 端口跳跃，client-only；Go 三模式
+///   intervallocal/intervalremote/perconnremote + remoteIPs 前缀随机 + remotePorts
+///   轮换，interval>=5s 双层校验）
 /// - `header-custom` —— `custom::Config`（自定义 UDP 头，`mode`=prefix/standalone）
 ///
 /// 未知 mask 类型返回 `InvalidInput`（不静默丢配置）。`None` 或空 `udp` 数组返回
@@ -842,13 +846,9 @@ fn build_udpmask_entry(entry: &serde_json::Value) -> io::Result<Box<dyn Udpmask>
             let (udp, udp_standalone) = build_custom_udp(&settings)?;
             Ok(Box::new(custom::Config { udp, udp_standalone, ..custom::Config::default() }))
         },
-        // 票 4kq9：Go udphop 是 client-only 连接级包装（udphop/conn.go NewUDPHopConn 需
-        // Dialer 重拨本地 socket），Rust Udpmask seam 无 dialer → 未实现，显式报错。
-        "udphop" => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "finalmask: udphop not implemented in Rust (client-only conn-level port hop, \
-             needs dialer seam; see Go transport/internet/finalmask/udphop)",
-        )),
+        // 票 4kq9：client-only 连接级包装（Go udphop/config.go WrapPacketConnServer
+        // 报 client only，server 侧同构拒绝；interval>=5 双层校验在模块内）。
+        "udphop" => build_udphop_config(&settings).map(|c| Box::new(c) as Box<dyn Udpmask>),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("finalmask: unsupported udp mask type {other:?}"),
@@ -1631,6 +1631,74 @@ fn build_realm_config(settings: &serde_json::Value) -> io::Result<realm::Config>
     })
 }
 
+/// `udphop` settings → [`udphop::UdphopConfig`]（对齐 Go `UDPHop.Build`，
+/// infra/conf/transport_finalmask.go:1105-1148）。
+fn build_udphop_config(settings: &serde_json::Value) -> io::Result<udphop::UdphopConfig> {
+    // mode：逗号分隔的 intervallocal / intervalremote / perconnremote（Go 不 trim，
+    // 带空格的段直接 invalid mode）。
+    let mut local = false;
+    let mut remote = false;
+    let mut remote_once = false;
+    for m in json_str(settings, "mode").split(',') {
+        match m.to_ascii_lowercase().as_str() {
+            "intervallocal" => local = true,
+            "intervalremote" => remote = true,
+            "perconnremote" => remote_once = true,
+            other => {
+                return Err(mask_err(format!("finalmask udphop: invalid mode {other:?}")));
+            },
+        }
+    }
+    // interval：0/0 缺省 30-30；from<5 拒绝（Go "interval must be at least 5"）。
+    let (interval_from, interval_to) = match settings.get("interval") {
+        None | Some(serde_json::Value::Null) => (30, 30),
+        Some(_) => json_range(settings, "interval")?,
+    };
+    if interval_from < 5 {
+        return Err(mask_err("finalmask udphop: interval must be at least 5"));
+    }
+    // remoteIPs：前缀 "10.0.0.0/24" 或裸 IP（补全长 /32、/128，Go ParseAddr→PrefixFrom）。
+    let mut remote_ips = Vec::new();
+    for ip in json_str_vec(settings, "remoteIPs") {
+        remote_ips.push(parse_ip_prefix(&ip)?);
+    }
+    let remote_ports: Vec<u32> = settings
+        .get("remotePorts")
+        .and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect())
+        .unwrap_or_default();
+    Ok(udphop::UdphopConfig {
+        local,
+        remote,
+        remote_once,
+        interval_min: interval_from,
+        interval_max: interval_to,
+        remote_ips,
+        remote_ports,
+    })
+}
+
+/// `"10.0.0.0/24"` → `(10.0.0.0, 24)`；裸 IP → 全长前缀 `/32`、`/128`（对齐 Go
+/// `UDPHop.Build` 的 ParsePrefix / ParseAddr+PrefixFrom 双形态）。
+fn parse_ip_prefix(s: &str) -> io::Result<(std::net::IpAddr, u8)> {
+    let invalid = || mask_err(format!("finalmask udphop: invalid ip {s:?}"));
+    match s.split_once('/') {
+        Some((addr, bits)) => {
+            let addr: std::net::IpAddr = addr.parse().map_err(|_| invalid())?;
+            let bits: u8 = bits.parse().map_err(|_| invalid())?;
+            let max = if addr.is_ipv4() { 32 } else { 128 };
+            if bits > max {
+                return Err(invalid());
+            }
+            Ok((addr, bits))
+        },
+        None => {
+            let addr: std::net::IpAddr = s.parse().map_err(|_| invalid())?;
+            Ok((addr, if addr.is_ipv4() { 32 } else { 128 }))
+        },
+    }
+}
+
 /// `[v6]:port` / `host:port` / `host`（port 可缺省，调用方按需校验）。
 fn split_host_port(s: &str) -> io::Result<(String, Option<String>)> {
     if let Some(rest) = s.strip_prefix('[') {
@@ -1938,13 +2006,13 @@ pub fn parse_finalmask_udp_chain(
         let settings = entry.get("settings").cloned().unwrap_or(serde_json::Value::Null);
         match ty {
             "mkcp-legacy" => codecs.push(build_mkcp_legacy_codec(&settings)?),
-            // 票 4kq9：Go udphop 连接级包装非逐包 codec（conn.go 需 Dialer），未实现 →
-            // 显式报错，不用含糊 unsupported。
+            // 票 4kq9：udphop 是连接级包装（UdpmaskManager 路径，见 build_udpmask_entry），
+            // 结构上非逐包 codec，CodecChain 无处安放——显式指路而非含糊 unsupported。
             "udphop" => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "finalmask: udphop not implemented in Rust (client-only conn-level port \
-                     hop, needs dialer seam; see Go transport/internet/finalmask/udphop)",
+                    "finalmask: udphop is a conn-level wrapper, not a per-packet codec; \
+                     it only applies via UdpmaskManager (wrap_packet_conn_client)",
                 ));
             },
             other => {
@@ -2773,7 +2841,6 @@ mod tests {
                 "delays":[{"from":5,"to":10}],"maxSplit":{"from":2,"to":4}}"#,
         ))
         .unwrap();
-        println!("go-style fragment dump: {cfg:#?}");
         assert_eq!((cfg.packets_from, cfg.packets_to), (0, 1));
         assert_eq!(cfg.lengths_min, vec![10, 30]);
         assert_eq!(cfg.lengths_max, vec![20, 40]);
@@ -2841,24 +2908,74 @@ mod tests {
     }
 
     #[test]
-    fn udphop_mask_type_fails_loud() {
-        // 票 4kq9：Go transport/internet/finalmask/udphop 是 client-only 连接级包装
-        // （conn.go NewUDPHopConn 需 finalmask.Dialer，intervallocal 模式每 hop 重拨
-        // 本地 socket）；Rust Udpmask seam（wrap_packet_conn_client）只收已连接
-        // UdpIo、无 dialer → 显式报错不实现，避免半模式偏离 Go wire 行为。
+    fn udphop_mask_type_registers_and_configures() {
+        // 票 4kq9：Go infra/conf/transport_finalmask.go:92 注册 udphop；Build（:1105-1148）
+        // 三模式 + interval 缺省 30-30 + from<5 拒绝 + remoteIPs 前缀/裸 IP 双形态。
+        let json =
+            fm(r#"{"udp":[{"type":"udphop","settings":{"mode":"intervallocal,intervalremote",
+                "interval":{"from":30,"to":30},"remoteIPs":["10.0.0.0/24","1.2.3.4"],
+                "remotePorts":[10000,10001]}}]}"#);
+        let mgr = build_udpmask_manager_from_json(Some(&json)).expect("udphop must register now");
+        assert_eq!(mgr.udpmasks.len(), 1);
+
+        // interval 缺省 30-30（Go Build :1128-1131）；装配不报错即走通。
+        let json = fm(r#"{"udp":[{"type":"udphop","settings":{"mode":"perconnremote"}}]}"#);
+        build_udpmask_manager_from_json(Some(&json)).expect("default interval must pass");
+
+        // from<5：Go Build :1132-1134 "interval must be at least 5"（mode 先于
+        // interval 校验，用例必须带合法 mode——空 mode 在 Go 是更早的 invalid mode）。
+        let err = build_udpmask_manager_from_json(Some(&fm(
+            r#"{"udp":[{"type":"udphop","settings":{"mode":"intervallocal","interval":3}}]}"#,
+        )))
+        .err()
+        .expect("interval<5 must fail at Build");
+        assert!(err.to_string().contains("interval must be at least 5"), "got: {err}");
+
+        // 空/缺 mode：Go Split("", ",") → [""] → default → invalid mode（同构报错）。
+        let err = build_udpmask_manager_from_json(Some(&fm(
+            r#"{"udp":[{"type":"udphop","settings":{"interval":30}}]}"#,
+        )))
+        .err()
+        .expect("empty mode must fail like Go");
+        assert!(err.to_string().contains("invalid mode"), "got: {err}");
+
+        // 非法 mode（Go Build :1113-1115）与非法 IP（:1118-1133）显式报错。
+        let err = build_udpmask_manager_from_json(Some(&fm(
+            r#"{"udp":[{"type":"udphop","settings":{"mode":"bogus"}}]}"#,
+        )))
+        .err()
+        .expect("bad mode must fail");
+        assert!(err.to_string().contains("invalid mode"), "got: {err}");
+        let err = build_udpmask_manager_from_json(Some(&fm(
+            r#"{"udp":[{"type":"udphop","settings":{"mode":"intervallocal","remoteIPs":["not-an-ip"]}}]}"#,
+        )))
+        .err()
+        .expect("bad ip must fail");
+        assert!(err.to_string().contains("invalid ip"), "got: {err}");
+
+        // codec 链路径（KCP 同步栈）：udphop 是连接级 wrapper，结构上非逐包 codec，
+        // 显式指路而非含糊 unsupported。
         let json = fm(r#"{"udp":[{"type":"udphop","settings":{"mode":"intervalremote",
                 "interval":{"from":30,"to":30},"remotePorts":[10000,10001]}}]}"#);
-        let e = match build_udpmask_manager_from_json(Some(&json)) {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("expected udphop not-implemented error"),
-        };
-        assert!(e.contains("udphop") && e.contains("not implemented"), "got: {e}");
-        // 同步 codec 链路径同样显式（非含糊 unsupported）。
-        let e = match parse_finalmask_udp_chain(Some(&json)) {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("expected udphop not-implemented error"),
-        };
-        assert!(e.contains("udphop") && e.contains("not implemented"), "got: {e}");
+        let e = parse_finalmask_udp_chain(Some(&json)).err().expect("codec chain must reject");
+        assert!(e.to_string().contains("conn-level wrapper"), "got: {e}");
+    }
+
+    /// 票 4kq9 验收 3：TCP/UDP 链式装配——同一 finalmask JSON 下 tcp(fragment) 与
+    /// udp(udphop) 两 manager 同时装配成功。
+    #[test]
+    fn tcp_udp_chain_assembly_with_udphop() {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","length":100}}],
+                "udp":[{"type":"udphop","settings":{"mode":"intervallocal,intervalremote",
+                    "interval":"30-30","remoteIPs":["10.0.0.0/24"],
+                    "remotePorts":[10000,10001]}}]}"#,
+        )
+        .unwrap();
+        let tcp = build_tcpmask_manager_from_json(Some(&json)).expect("tcp manager");
+        let udp = build_udpmask_manager_from_json(Some(&json)).expect("udp manager");
+        assert_eq!(tcp.tcpmasks.len(), 1);
+        assert_eq!(udp.udpmasks.len(), 1);
     }
 
     #[test]

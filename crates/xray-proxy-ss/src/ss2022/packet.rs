@@ -455,8 +455,10 @@ impl ClientUdpSession2022 {
                 .expect("pkt.len() >= PACKET_HEADER_LEN + MIN_PLAINTEXT checked above"),
             false,
         )?;
-        let session_id = u64::from_be_bytes(hdr[..8].try_into().unwrap());
-        let packet_id = u64::from_be_bytes(hdr[8..].try_into().unwrap());
+        let session_id =
+            u64::from_be_bytes(hdr[..8].try_into().expect("hdr is the 16B ecb_block output"));
+        let packet_id =
+            u64::from_be_bytes(hdr[8..].try_into().expect("hdr is the 16B ecb_block output"));
 
         let mut st = self.remote.lock();
         let slot = route_remote_generation(&mut st, session_id)?;
@@ -677,8 +679,10 @@ pub fn server_decode_header<'a>(
             .expect("pkt.len() >= PACKET_HEADER_LEN + eih_len + MIN_PLAINTEXT checked above"),
         false,
     )?;
-    let session_id = u64::from_be_bytes(hdr[..8].try_into().unwrap());
-    let packet_id = u64::from_be_bytes(hdr[8..].try_into().unwrap());
+    let session_id =
+        u64::from_be_bytes(hdr[..8].try_into().expect("hdr is the 16B ecb_block output"));
+    let packet_id =
+        u64::from_be_bytes(hdr[8..].try_into().expect("hdr is the 16B ecb_block output"));
 
     let aead_psk = if users.is_empty() {
         server_psk

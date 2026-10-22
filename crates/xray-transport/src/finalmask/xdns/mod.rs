@@ -301,7 +301,6 @@ mod tests {
         assert!(r.quic_config.is_none());
 
         let re_encoded = cfg.encode_to_vec();
-        eprintln!("rust_encoded_hex: {}", hex::encode(&re_encoded));
         assert_eq!(re_encoded, bytes);
 
         let rc = ResolverConfig::from_proto(r).unwrap();

@@ -151,7 +151,7 @@ impl InboundHandler for DokodemoServer {
         }
         // 切片2 固定绑定 127.0.0.1:0（端口由 OS 分配），与 socks/trojan/http 切片2 一致。
         // 切片3 从 config 读取 bind 地址。
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 0));
         let listener =
             TcpListener::bind(addr).await.map_err(|e| InboundError::ListenError(e.to_string()))?;
         *guard = Some(listener);
