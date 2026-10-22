@@ -39,6 +39,18 @@ use crate::{error::Result, socks::SocksAddr};
 /// anytls duplex 缓冲（64 KiB，与 client.rs 一致）。
 const DUPLEX_BUF_SIZE: usize = 64 * 1024;
 
+/// 认证帧 padding0 长度上限（16 KiB）。
+///
+/// Go 参考实现无显式常量，有效上界来自首包缓冲：anytls-go
+/// `cmd/server/inbound_tcp.go`（`handleTcpConnection`）用 `buf.NewPacket()`
+/// 单次读入（容量 = sing `common/buf` 的 `UDPBufferSize`，standard build 16 KiB），
+/// `b.ReadBytes(paddingLen)` 只在首包缓冲内命中，超出即 err → fallback 拒连。
+/// 即 Go 侧不会按客户端声明值分配内存。
+///
+/// Rust 侧此前直接 `vec![0u8; padding0_len]`，等于让客户端 u16 声明（最大 65535）
+/// 驱动单次分配。取同一量级上限在分配前拒绝，合法 paddingScheme（`0=30-30`）远低于此。
+const MAX_PADDING0_LEN: usize = 16 * 1024;
+
 /// AnyTLS mock 服务端句柄，`stop()` 后 listener 关闭。
 pub struct AnytlsMockServer {
     pub local_addr: SocketAddr,
@@ -183,6 +195,13 @@ async fn handle_conn(
         }
     }
     let padding0_len = u16::from_be_bytes([auth_head[32], auth_head[33]]) as usize;
+    if padding0_len > MAX_PADDING0_LEN {
+        debug!(
+            "anytls mock server: auth rejected (padding0_len {padding0_len} > max \
+             {MAX_PADDING0_LEN})"
+        );
+        return;
+    }
     if padding0_len > 0 {
         let mut pad0 = vec![0u8; padding0_len];
         if let Err(e) = tls.read_exact(&mut pad0).await {
@@ -604,6 +623,38 @@ mod tests {
             },
         }
         client.close().await.ok();
+        server.stop().await;
+    }
+
+    /// bd 8tfh：padding0_len 由客户端 u16 控制（最大 65535），超上限必须在
+    /// `vec![0u8; padding0_len]` 分配前拒绝——用裸 TLS 直连绕过 AnytlsClient。
+    #[tokio::test]
+    async fn oversized_padding0_len_rejected() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (server, cert_der) = start_server_with_password(Some("s3cret")).await;
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(cert_der.into()).unwrap();
+        let tls = Arc::new(
+            RustlsClientConfig::builder().with_root_certificates(root_store).with_no_client_auth(),
+        );
+        let connector = tokio_rustls::TlsConnector::from(tls);
+        let tcp = TcpStream::connect(server.local_addr).await.expect("tcp connect");
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut tls_stream = connector.connect(server_name, tcp).await.expect("tls handshake");
+
+        // 认证帧：正确 sha256(password) + padding0_len = u16::MAX（不跟随 padding 字节）。
+        let mut frame = Vec::with_capacity(34);
+        frame.extend_from_slice(&Sha256::digest(b"s3cret"));
+        frame.extend_from_slice(&u16::MAX.to_be_bytes());
+        tls_stream.write_all(&frame).await.expect("write auth head");
+
+        // 断言点：服务端在上限校验处直接丢弃连接，不等 65535 字节 padding。
+        let mut buf = [0u8; 1];
+        match tokio::time::timeout(Duration::from_secs(2), tls_stream.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => {}, // EOF / 连接重置 = 拒绝
+            Ok(Ok(n)) => panic!("server sent {n} byte(s) instead of dropping the connection"),
+            Err(_) => panic!("oversized padding0_len connection stayed open (2s timeout)"),
+        }
         server.stop().await;
     }
 }

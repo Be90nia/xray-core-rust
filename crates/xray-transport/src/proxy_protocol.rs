@@ -12,6 +12,23 @@ use std::{
 
 use tokio::io::AsyncReadExt;
 
+/// PROXY protocol v2 头负载长度上限（16 字节定长前缀之后的地址块 + TLV）。
+///
+/// Go 依据：`go-proxyproto` v0.15.0（Xray `go.mod:17`）`v2.go:28`
+/// `var MaxV2HeaderSize uint16 = 4096`——注释明示「parseVersion2 allocates this
+/// many bytes before reading, so a lower limit mitigates memory-allocation DoS
+/// from untrusted peers」；检查点 `v2.go:168-170`（`length > MaxV2HeaderSize`
+/// → `ErrInvalidLength`）。协议 16 位长度字段允许 65535，Rust 侧沿用同一缺省值，
+/// 超限拒绝而不是按客户端声明预分配。
+const MAX_V2_HEADER_SIZE: usize = 4096;
+
+/// PROXY protocol v1 行长度上限（含 `PROXY ` 前缀与 CRLF）。
+///
+/// Go 依据：`go-proxyproto` v0.15.0 `v1.go:49-106`——spec 最坏情况
+/// `PROXY UNKNOWN <ip6> <ip6> 65535 65535\r\n` = 107 字节，第 107 字节仍无换行
+/// 即 `ErrVersion1HeaderTooLong`（防「无换行大流量」DoS）。
+const MAX_V1_HEADER_SIZE: usize = 107;
+
 /// 读 PROXY protocol v1/v2 header，返回真实客户端地址。
 ///
 /// 在 listener accept 后，若 `accept_proxy_protocol == true`，
@@ -32,6 +49,18 @@ pub async fn read_proxy_protocol<R: AsyncReadExt + Unpin>(
         reader.read_exact(&mut rest).await?;
         let fam = rest[7];
         let length = u16::from_be_bytes([rest[8], rest[9]]) as usize;
+        // 先在分配前拒绝超限长度（Go v2.go:168-170 MaxV2HeaderSize 同语义）。
+        if length > MAX_V2_HEADER_SIZE {
+            tracing::warn!(
+                length,
+                max = MAX_V2_HEADER_SIZE,
+                "PROXY protocol v2 header length exceeds cap; rejecting connection"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("proxy protocol v2 header too long: {length} > {MAX_V2_HEADER_SIZE}"),
+            ));
+        }
         let mut payload = vec![0u8; length];
         reader.read_exact(&mut payload).await?;
 
@@ -66,7 +95,7 @@ pub async fn read_proxy_protocol<R: AsyncReadExt + Unpin>(
             if line.ends_with(b"\r\n") {
                 break;
             }
-            if line.len() > 107 {
+            if line.len() > MAX_V1_HEADER_SIZE {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "proxy protocol v1 too long",
@@ -238,6 +267,59 @@ mod tests {
         let mut reader = &header[..];
         let result = read_proxy_protocol(&mut reader).await;
         assert!(result.is_err());
+    }
+
+    /// bd 3ghm：v2 length 字段超 4096（Go MaxV2HeaderSize 缺省）必须在分配前拒绝。
+    /// 65535 是 16 位字段最大值——修复前会 `vec![0u8; 65535]` 预分配。
+    #[tokio::test]
+    async fn read_proxy_protocol_v2_oversized_length_rejected() {
+        let header = [
+            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, 0x21,
+            0x11, // af(1=INET)+proto(STREAM)
+            0xFF, 0xFF, // length = 65535 > MAX_V2_HEADER_SIZE
+        ];
+        let mut reader = &header[..];
+        let err =
+            read_proxy_protocol(&mut reader).await.expect_err("oversized v2 must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("too long"), "unexpected error: {err}");
+    }
+
+    /// 边界：恰好 4096 仍接受（Go `> MaxV2HeaderSize` 才拒，本地同口径），
+    /// 且读取按 length 精确消费。
+    #[tokio::test]
+    async fn read_proxy_protocol_v2_at_cap_accepted() {
+        let mut header = vec![
+            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, 0x21,
+            0x11, // af(1=INET)+proto(STREAM)
+            0x10, 0x00, // length = 4096 == MAX_V2_HEADER_SIZE
+        ];
+        let mut payload = vec![0u8; 4096];
+        payload[0] = 1;
+        payload[1] = 2;
+        payload[2] = 3;
+        payload[3] = 4;
+        payload[8] = 0x04;
+        payload[9] = 0xD2;
+        header.extend_from_slice(&payload);
+        header.extend_from_slice(b"body");
+        let mut reader = &header[..];
+        let addr = read_proxy_protocol(&mut reader).await.unwrap();
+        assert_eq!(addr, Some("1.2.3.4:1234".parse::<SocketAddr>().unwrap()));
+        // 只消费 header，业务数据留给调用方。
+        assert_eq!(reader, &b"body"[..]);
+    }
+
+    /// bd 3ghm：v1 行超过 107 字节仍无 CRLF 必须立即 Err（不得无限读）。
+    #[tokio::test]
+    async fn read_proxy_protocol_v1_too_long_rejected() {
+        let mut header = Vec::from(&b"PROXY TCP4 1.2.3.4 "[..]);
+        header.extend_from_slice(&[b'x'; 200]); // 无 CRLF
+        let mut reader = &header[..];
+        let err =
+            read_proxy_protocol(&mut reader).await.expect_err("over-long v1 must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("too long"), "unexpected error: {err}");
     }
 
     #[test]

@@ -29,12 +29,23 @@ use crate::error::TlsError;
 /// 解析后的单个 ECH key。
 ///
 /// 对应 Go `tls.EncryptedClientHelloKey`。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EncryptedClientHelloKey {
     /// ECH config（公开部分，会出现在 DNS HTTPS RR 中）。
     pub config: Vec<u8>,
     /// 对应的私钥。
     pub private_key: Vec<u8>,
+}
+
+// Debug 脱敏（bd 99kd 同类）：private_key 是服务端 ECH 长期私钥，
+// 禁止经 derive(Debug) 落入 tracing/panic 输出；config 是公开材料，保留。
+impl std::fmt::Debug for EncryptedClientHelloKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptedClientHelloKey")
+            .field("config", &self.config)
+            .field("private_key", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// 二进制格式：`[key_len:u16][key][config_len:u16][config]`，多个 key 顺序拼接。
@@ -554,6 +565,19 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0].private_key, b"sk1");
         assert_eq!(keys[1].private_key, b"sk2");
+    }
+
+    /// bd 99kd 同类：Debug 不得泄露 ECH 私钥，config（公开材料）保留。
+    #[test]
+    fn debug_redacts_ech_private_key() {
+        let key = EncryptedClientHelloKey {
+            config: b"cfg".to_vec(),
+            private_key: b"super-secret-ech-key".to_vec(),
+        };
+        let s = format!("{key:?}");
+        assert!(!s.contains("super-secret-ech-key"), "ech private key leaked: {s}");
+        assert!(s.contains("private_key: \"[REDACTED]\""), "must be redacted: {s}");
+        assert!(s.contains("config: [99, 102, 103]"), "public config must stay readable: {s}");
     }
 
     #[test]
