@@ -608,9 +608,9 @@ pub fn apply_outbound_socket_options(
 /// Go proxy/tun/handler.go:130-164）的绑定原语。
 ///
 /// - Windows：IP_UNICAST_IF / IPV6_UNICAST_IF（Go tun_windows.go:553-577 的 TCP 分支；v4 值 network
-///   byte order——复用 [`windows::WindowsSockOpt`]， TFO 位保持未配置不触碰）。
+///   byte order——复用 `WindowsSockOpt`， TFO 位保持未配置不触碰）。
 /// - Linux：SO_BINDTODEVICE（Go tun_linux.go:403 `unix.BindToDevice`；复用
-///   [`linux::LinuxSockOpt`]，其余字段全缺省 = 零副作用）。
+///   `LinuxSockOpt`，其余字段全缺省 = 零副作用）。
 /// - 其余平台：`Unsupported`（Go 无 setinterface 的平台同样无此机制）。
 ///
 /// 多播分支（Go 的 IP_MULTICAST_IF / IPV6_MULTICAST_IF）不在此处：系统拨号器
