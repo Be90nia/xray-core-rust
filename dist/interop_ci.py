@@ -16,8 +16,15 @@ REALITY 配置需 Python `cryptography` 包 (X25519 keypair); CI workflow 已装
 
 用法: python3 dist/interop_ci.py [--rust PATH] [--go PATH] [--work DIR]
            [--suites rust,go,rust_to_go,extra] [--cross-protos <list>]
-           [--extra-protos <list>] [--dry-run]
+           [--extra-protos <list>] [--upstream URL|local] [--dry-run]
 --go-protos 是 --cross-protos 的 deprecated alias (兼容旧 CI 调用).
+
+--upstream: 每条用例环回验收 curl 的目标, 默认 https://www.youtube.com/ (CI 可达).
+  --upstream local = 脚本内起一个 1KB HTTP echo server 并指向它, 验收链路 hermetic
+  (流量仍穿被测隧道, 只是不依赖外网); 受审查网络/离线环境的唯一可跑形态.
+  其它 URL = 换真上游, 此时不校验固定标记, 只校验 body 体积.
+教训: 整套用例"均匀全超时"先查上游可达性 (本机曾 43/43 皆因 youtube 不可达),
+  不是协议回归 —— 判别法: 换 --upstream local 后转绿即上游问题.
 """
 import argparse
 import base64
@@ -56,6 +63,12 @@ EXE = '.exe' if IS_WIN else ''
 
 CERT = KEY = None
 PIN = None  # leaf DER sha256, Go/Rust client 通用
+
+# 验收上游配置. 默认 = youtube (CI 可达); --upstream 可换 URL 或 local (脚本内 echo).
+# MARKER = None 表示不校验固定标记, 只校验 body 体积.
+UPSTREAM_URL = 'https://www.youtube.com/'
+UPSTREAM_MARKER = b'YouTube'
+UPSTREAM_MIN_BODY = 5000
 
 OPENSSL_CNF = """[req]
 distinguished_name = dn
@@ -385,6 +398,46 @@ def log_tail(work, idx, err):
     return err
 
 
+def body_verdict(bp):
+    """验收判据: body 体积超阈值, 有标记时还须真含标记 (排除错误页/拦截页).
+    返回 (体积, 是否 PASS)."""
+    bs = os.path.getsize(bp) if os.path.exists(bp) else 0
+    body = open(bp, 'rb').read(200000) if bs else b''
+    ok = bs > UPSTREAM_MIN_BODY and (UPSTREAM_MARKER is None or UPSTREAM_MARKER in body)
+    return bs, ok
+
+
+def start_local_upstream():
+    """--upstream local: 起脚本内 HTTP echo (固定 1KB body, 含标记) 并把它设为验收上游.
+    端口由内核选空闲口; 流量仍穿被测隧道 (server 侧 freedom 回拨 127.0.0.1), 仅去掉外网依赖.
+    返回 server 供收尾 shutdown."""
+    import http.server
+    import threading
+
+    # shortcut: 单进程单连接串行 HTTP/1.0 够了 (验收只管"有没有真实 body 过隧道"),
+    # 要并发/keep-alive 压测时换 ThreadingHTTPServer.
+    body = b'XRAY-ECHO-OK\n' + b'x' * (1024 - 13)
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt, *a):
+            pass
+
+    srv = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    global UPSTREAM_URL, UPSTREAM_MARKER, UPSTREAM_MIN_BODY
+    UPSTREAM_URL = 'http://127.0.0.1:%d/' % srv.server_address[1]
+    UPSTREAM_MARKER = b'XRAY-ECHO-OK'
+    UPSTREAM_MIN_BODY = 1000  # body 恰 1KB, 阈值留余量
+    return srv
+
+
 def run_one(idx, proto, server_bin, client_bin, tag, work, dry=False):
     P = BASE_PORT + idx * 2
     S = P + 1
@@ -433,13 +486,14 @@ def run_one(idx, proto, server_bin, client_bin, tag, work, dry=False):
             else:
                 wait_port(S, 15)
                 bp = os.path.join(work, 'b%d.body' % idx)
+                if os.path.exists(bp):
+                    os.remove(bp)  # 残留 body: curl 失败不截断, 上一轮结果会被当本轮
                 try:
                     r = subprocess.run(['curl', '-sS', '--max-time', '15', '-x', 'socks5h://127.0.0.1:%d' % S,
-                                        'https://www.youtube.com/', '-o', bp, '-w', 'HTTP:%{http_code}'],
+                                        UPSTREAM_URL, '-o', bp, '-w', 'HTTP:%{http_code}'],
                                        capture_output=True, text=True, timeout=20)
-                    bs = os.path.getsize(bp) if os.path.exists(bp) else 0
-                    marker = b'YouTube' in open(bp, 'rb').read(200000) if bs else False
-                    flag = 'PASS' if (bs > 5000 and marker) else 'FAIL'
+                    bs, ok_body = body_verdict(bp)
+                    flag = 'PASS' if ok_body else 'FAIL'
                     err = r.stderr.strip()[:60]
                 except Exception as e:
                     flag, bs, err = 'FAIL', 0, str(e)[:60]
@@ -554,15 +608,16 @@ def run_x_one(idx, proto, server_bin, client_bin, tag, work, dry=False):
             else:
                 wait_port(S, 15)
                 bp = os.path.join(work, 'b%d.body' % idx)
+                if os.path.exists(bp):
+                    os.remove(bp)  # 残留 body: curl 失败不截断, 上一轮结果会被当本轮
                 try:
                     r = subprocess.run(['curl', '-sS', '--max-time', '15',
                                         '-x', 'socks5h://127.0.0.1:%d' % S,
-                                        'https://www.youtube.com/', '-o', bp, '-w',
+                                        UPSTREAM_URL, '-o', bp, '-w',
                                         'HTTP:%{http_code}'],
                                        capture_output=True, text=True, timeout=20)
-                    bs = os.path.getsize(bp) if os.path.exists(bp) else 0
-                    marker = b'YouTube' in open(bp, 'rb').read(200000) if bs else False
-                    flag = 'PASS' if (bs > 5000 and marker) else 'FAIL'
+                    bs, ok_body = body_verdict(bp)
+                    flag = 'PASS' if ok_body else 'FAIL'
                     err = r.stderr.strip()[:60]
                 except Exception as e:
                     flag, bs, err = 'FAIL', 0, str(e)[:60]
@@ -612,6 +667,7 @@ def _probe_go_supports_xproto(go_bin, work):
 
 
 def main():
+    global CERT, KEY, PIN, UPSTREAM_URL, UPSTREAM_MARKER
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ap = argparse.ArgumentParser(description='跨平台互通矩阵: Rust<->Rust 12 测 + Go 双向 + 新协议'
                                 '\n默认套件 rust,go,rust_to_go,extra = 12+12+12+18 = 54 测 (Go 全支持口径).'
@@ -628,6 +684,9 @@ def main():
                     help='deprecated alias for --cross-protos (兼容旧 CI 调用)')
     ap.add_argument('--extra-protos', default=','.join(EXTRA_PROTOS),
                     help='新协议套件协议列表 (默认 splithttp,grpc,reality,hysteria2,anytls,tuic)')
+    ap.add_argument('--upstream', default=None,
+                    help='环回验收 curl 的目标: URL 或 local (脚本内 1KB HTTP echo, 离线可跑);'
+                         ' 默认 %s' % UPSTREAM_URL)
     ap.add_argument('--dry-run', action='store_true', help='只生成证书与配置, 不起进程')
     args = ap.parse_args()
     # 兼容旧 flag: --go-protos 覆盖 --cross-protos
@@ -636,7 +695,14 @@ def main():
 
     work = os.path.abspath(args.work)
     os.makedirs(work, exist_ok=True)
-    global CERT, KEY, PIN
+    local_upstream = None
+    if args.upstream == 'local':
+        local_upstream = start_local_upstream()
+        print('== 上游: local echo %s (hermetic, 不依赖外网) ==' % UPSTREAM_URL, flush=True)
+    elif args.upstream:
+        UPSTREAM_URL = args.upstream
+        UPSTREAM_MARKER = None  # 自定义上游无固定标记, 只校验体积
+        print('== 上游: %s ==' % UPSTREAM_URL, flush=True)
     CERT = os.path.join(work, 'interop_cert.pem')
     KEY = os.path.join(work, 'interop_key.pem')
     try:
@@ -718,9 +784,13 @@ def main():
     print('== 互通 CI: rust=%s go=%s work=%s dry=%s suites=%s ==' % (
         rust, go, work, args.dry_run, args.suites), flush=True)
     results = []
-    for i, (tag, proto, srv, cli, is_x) in enumerate(plan):
-        runner = run_x_one if is_x else run_one
-        results.append(runner(i + 1, proto, srv, cli, tag, work, dry=args.dry_run))
+    try:
+        for i, (tag, proto, srv, cli, is_x) in enumerate(plan):
+            runner = run_x_one if is_x else run_one
+            results.append(runner(i + 1, proto, srv, cli, tag, work, dry=args.dry_run))
+    finally:
+        if local_upstream:
+            local_upstream.shutdown()
     if args.dry_run:
         print('\n=== 干跑 %d 用例, 配置与证书已生成 %s ===' % (len(results), work))
         return
