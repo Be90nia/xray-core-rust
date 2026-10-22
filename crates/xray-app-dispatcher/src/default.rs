@@ -1898,8 +1898,19 @@ impl DialBridge {
                 return;
             };
 
-            // 用两对 pipe 代替 duplex，与 DefaultDispatcher::dispatch 一致
-            let pipe_opt = xray_buf::pipe::PipeOption::default();
+            // 用两对 pipe 代替 duplex，与 DefaultDispatcher::dispatch 一致。
+            // 选项对齐 Go transport/pipe.OptionsFromContext（pipe.go:47-61）：
+            // buffer.PerConnection → WithSizeLimit 背压上限。Go 全部 relay pipe
+            // 均出自 getLink（default.go:140-143）带界；此前此处用
+            // PipeOption::default()（limit=-1 无界）是 exci 票的蓄洪缺口。
+            // DialBridge 只注入 TimeoutPolicy（bd 4-6），buffer 档与 dispatcher
+            // 无 policy_manager 时的 default_policy 同源（Policy::default() →
+            // BufferPolicy::default()，env 桥接 512KiB）。
+            let pipe_opt = xray_buf::pipe::PipeOption {
+                limit: xray_features::policy::BufferPolicy::default().connection as i64,
+                idle_timeout: Some(policy.connection_idle),
+                ..xray_buf::pipe::PipeOption::default()
+            };
             let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
             let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
 
@@ -2585,6 +2596,97 @@ mod tests {
     }
 
     use xray_features::stats::Manager as _;
+
+    /// exci：dispatch_via_chain 的两对 pipe 必须带 BufferPolicy 背压上限——
+    /// Go 全部 relay pipe 出自 getLink（app/dispatcher/default.go:140-143，
+    /// transport/pipe/pipe.go:47-61 OptionsFromContext → limit=PerConnection，
+    /// 默认 512KiB）。行为证明：chained handler 灌 50×64KiB=3.2MiB 下行，桥泵
+    /// 出口（4KiB 有界 link.writer、无消费）把泵卡死后，剩余洪峰超过 512KiB
+    /// 上限 → 写端阻塞，2s 窗口内灌不完。
+    /// 注意 pipe 满判定是「写前 cur>limit」且读者一次 take 全部缓冲（软背压，
+    /// Go pipe 同款）：泵卡死前能搬走 ~589KiB，故洪峰量必须远超 limit+泵末次
+    /// 搬运量——20 块 (1.28MiB) 实测会被逐次 take 放行灌完（本测试初版教训）。
+    /// 修复前 PipeOption::default()（limit=-1 无界）时泵无限搬、洪峰永不卡
+    /// （write_done=true，红）。
+    #[tokio::test]
+    async fn chained_bridge_pipe_applies_backpressure_limit() {
+        use std::{
+            sync::atomic::{AtomicBool, Ordering},
+            time::Duration,
+        };
+
+        #[derive(Debug)]
+        struct FloodingHandler {
+            started: Arc<AtomicBool>,
+            write_done: Arc<AtomicBool>,
+        }
+        impl DispatchHandler for FloodingHandler {
+            fn tag(&self) -> &str {
+                "flooding-chain"
+            }
+
+            fn dispatch(
+                &self,
+                _dest: &Destination,
+                mut link: xray_transport::link::Link,
+            ) -> PinFuture<()> {
+                let started = Arc::clone(&self.started);
+                let write_done = Arc::clone(&self.write_done);
+                Box::pin(async move {
+                    started.store(true, Ordering::SeqCst);
+                    drop(link.reader);
+                    // 50×64KiB=3.2MiB ≫ 512KiB 上限 + 泵末次 take 量（~589KiB）：
+                    // 泵被 4KiB 死出口卡死后，剩余洪峰必触发写端阻塞。
+                    let chunk = vec![0u8; 64 * 1024];
+                    for _ in 0..50 {
+                        let mut mb = xray_buf::multi::MultiBuffer::new();
+                        mb.merge_bytes(&chunk);
+                        if link.writer.write_multi_buffer(mb).await.is_err() {
+                            return; // pipe 关闭/Errord 同样视为未灌完
+                        }
+                    }
+                    write_done.store(true, Ordering::SeqCst);
+                })
+            }
+        }
+
+        let started = Arc::new(AtomicBool::new(false));
+        let write_done = Arc::new(AtomicBool::new(false));
+        let ohm = SimpleOhm::new();
+        ohm.add(
+            "flooding-chain",
+            Arc::new(FloodingHandler {
+                started: Arc::clone(&started),
+                write_done: Arc::clone(&write_done),
+            }),
+        );
+        let dial: DialFn = Arc::new(|_dest: &Destination| {
+            Box::pin(async { Err("unused: chain never dials".to_string()) })
+        });
+        let bridge = Arc::new(DialBridge::new("bridge-flood", dial));
+        bridge.set_proxy_chain("flooding-chain", Arc::new(ohm));
+
+        let dest =
+            Destination::new(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(1), Network::TCP);
+        // 出口 pipe 有界且无人消费：卡死桥泵，制造确定性背压链。
+        let bounded =
+            || xray_buf::pipe::PipeOption { limit: 4096, ..xray_buf::pipe::PipeOption::default() };
+        let (up_r, _up_w) = xray_buf::pipe::new_with_option(bounded());
+        let (_dn_r, dn_w) = xray_buf::pipe::new_with_option(bounded());
+        let link = xray_transport::link::Link::new(
+            Box::new(up_r) as Box<dyn xray_buf::io::Reader>,
+            Box::new(dn_w) as Box<dyn xray_buf::io::Writer>,
+        );
+        tokio::spawn(bridge.dispatch(&dest, link));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(started.load(Ordering::SeqCst), "chained task must have started");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !write_done.load(Ordering::SeqCst),
+            "1280KiB flood must NOT complete through a bounded pipe without a consumer"
+        );
+    }
 
     #[tokio::test]
     async fn pick_route_resolved_default_degenerates_to_sync() {
