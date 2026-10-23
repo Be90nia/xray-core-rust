@@ -105,6 +105,7 @@ cargo doc --workspace --no-deps
 ### 3.5.3 分层纪律边界
 
 - **地基/骨架不引 Xray 类型**（提炼判据：零 xray 类型 = 全泛型/trait）——这是血肉能上浮的前提
+- **udf-frame 只放「大部分软件框架通用」的功能；xray-frame 是我们项目的框架**（用户口供 2026-10-23）——**带领域方向的件不进 udf-frame**（即使零 xray 类型）：网络（accept 循环纪律 `accept_policy.rs` 留主仓 xray-transport）/文件/加密/协议等方向件，留主仓最近消费方；udf 只收无方向进程级机制（cache/retry/clock/id/logx/compose 族）
 - **血肉不复制骨架功能**（§3.5.2）；需求差异用**组合/特化**解决，不靠复制
 - **骨架不感知血肉**（不因某协议需求污染地基语义）
 - **改 udf 仓走提炼回路**：独立 PR + CI 三平台绿 + xray-frame 换依赖复测 32/32
