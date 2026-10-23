@@ -75,6 +75,23 @@ impl ConfError {
 /// crate 级 Result 别名。
 pub type Result<T> = std::result::Result<T, ConfError>;
 
+impl From<std_ext::json::JsonParseError> for ConfError {
+    /// udf json 解析错误映射：带位置（line>0）→ `Parse`；无位置（读取失败/超限/UTF-8）
+    /// → `ParseSimple`。错误类型留仓（Xray 语义），udf 不感知。
+    fn from(e: std_ext::json::JsonParseError) -> Self {
+        if e.line == 0 {
+            ConfError::ParseSimple { format: "json", message: e.message }
+        } else {
+            ConfError::Parse {
+                format: "json",
+                line: e.line as usize,
+                column: e.column as usize,
+                message: e.message,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -16,3 +16,4 @@ serde_yaml = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+udf-std-ext = { path = "../udf-frame/std-ext" }

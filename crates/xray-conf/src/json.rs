@@ -1,118 +1,59 @@
-//! JSON 配置解码器。
+//! JSON 配置解码器（薄封装）。
+//!
+//! 实体机制——RFC 8259 严格解码 / 注释容忍 / 64MiB 输入上限 / 行列位置错误——
+//! 已提炼上浮 udf `std-ext::json`（P1-9，udf-promotion-candidate 终态落位）；
+//! 本文件只留 Xray 语义：env 切 strict（`xray_common::platform::use_strict_json`）
+//! 与 `Config` 装配。
 //!
 //! 对应 Go `infra/conf/serial.DecodeJSONConfig` / `DecodeJSONConfigStrict`。
-//!
-//! Go 区分两个版本：`DecodeJSONConfig` 容忍 JSON5/JSONC 注释（via 自定义 reader），
-//! `DecodeJSONConfigStrict` 严格 RFC 8259。Rust 的 `serde_json` 默认就是 strict，
-//! 所以当前两个函数等价；保留独立函数以便将来引入 `json5` 支持注释时分叉实现。
-//!
-//! `serde_json::Error` 自带 `line()` / `column()`，不需要像 Go 那样手写 `findOffset`。
+//! Go 兼容序列化（`to_json_string`，`JSONMarshalWithoutEscape` + 4 空格缩进）
+//! 属 Xray 语义，留 `serial.rs` 不上浮。
 
 use std::io::Read;
+
+use std_ext::json::{self, JsonMode};
 
 use crate::{
     config::Config,
     error::{ConfError, Result},
 };
 
+/// strict env（`xray.json.strict` / `XRAY_JSON_STRICT`，对应 Go `platform.UseStrictJSON`）
+/// 选择解码模式。
+fn json_mode() -> JsonMode {
+    if xray_common::platform::use_strict_json() { JsonMode::Strict } else { JsonMode::Tolerant }
+}
+
+/// udf 解码结果装配为 [`Config`]（解码目标类型留仓）。
+fn config_from_value(value: serde_json::Value) -> Result<Config> {
+    serde_json::from_value(value).map_err(|e| ConfError::from_json("json", e))
+}
+
 /// 从 reader 解析 JSON 配置（默认容忍 // 和 /* */ 注释）。
 ///
-/// `xray.json.strict`（或 `XRAY_JSON_STRICT`）== "true" 时跳过注释剥离，
-/// 按严格 RFC 8259 解析（对应 Go `platform.UseStrictJSON`）。
+/// `xray.json.strict`（或 `XRAY_JSON_STRICT`）== "true" 时按严格 RFC 8259 解析
+/// （对应 Go `platform.UseStrictJSON`）。
 pub fn decode_json(reader: impl Read) -> Result<Config> {
-    let mut buf = String::new();
-    reader
-        .take(64 * 1024 * 1024)
-        .read_to_string(&mut buf)
-        .map_err(|e| ConfError::Read(format!("read JSON: {e}")))?;
-    decode_json_from_str(&buf)
+    config_from_value(json::decode(reader, json_mode())?)
 }
 
 /// 从 reader 解析严格 RFC 8259 JSON 配置。
 ///
 /// 用于远程源（HTTP）等机器生成、不应含注释的场景。
 pub fn decode_json_strict(reader: impl Read) -> Result<Config> {
-    let mut buf = String::new();
-    reader
-        .take(64 * 1024 * 1024)
-        .read_to_string(&mut buf)
-        .map_err(|e| ConfError::Read(format!("read JSON: {e}")))?;
-    serde_json::from_str(&buf).map_err(|e| ConfError::from_json("json", e))
+    config_from_value(json::decode(reader, JsonMode::Strict)?)
 }
 
 /// 从字符串切片解析 JSON 配置（容忍注释，strict env 可关）。
 pub fn decode_json_from_str(s: &str) -> Result<Config> {
-    if xray_common::platform::use_strict_json() {
-        return serde_json::from_str(s).map_err(|e| ConfError::from_json("json", e));
-    }
-    let stripped = strip_json_comments(s);
-    serde_json::from_str(&stripped).map_err(|e| ConfError::from_json("json", e))
+    config_from_value(json::decode_str(s, json_mode())?)
 }
 
 /// 从字节切片解析 JSON 配置（容忍注释，strict env 可关）。
 pub fn decode_json_from_slice(s: &[u8]) -> Result<Config> {
-    let s = std::str::from_utf8(s)
-        .map_err(|e| ConfError::ParseSimple { format: "json", message: format!("UTF-8: {e}") })?;
-    decode_json_from_str(s)
+    config_from_value(json::decode_slice(s, json_mode())?)
 }
 
-/// 剥离 JSON 配置中的 `//` 行注释和 `/* */` 块注释。
-///
-/// 字符串字面量内的注释标记被保留（对应 Go `infra/conf/json_reader.go`）。
-fn strip_json_comments(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let chars: Vec<char> = input.chars().collect();
-    let mut i = 0;
-    let mut in_string = false;
-    while i < chars.len() {
-        let c = chars[i];
-        if in_string {
-            out.push(c);
-            if c == '\\' && i + 1 < chars.len() {
-                // 转义字符：保留下一字符
-                out.push(chars[i + 1]);
-                i += 2;
-                continue;
-            }
-            if c == '"' {
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-        // 不在字符串中
-        if c == '"' {
-            in_string = true;
-            out.push(c);
-            i += 1;
-            continue;
-        }
-        // 行注释 //
-        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
-            // 跳到行尾
-            i += 2;
-            while i < chars.len() && chars[i] != '\n' {
-                i += 1;
-            }
-            continue;
-        }
-        // 块注释 /* */
-        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
-            i += 2;
-            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
-                i += 1;
-            }
-            i += 2; // skip */
-            if i > chars.len() {
-                i = chars.len();
-            }
-            continue;
-        }
-        out.push(c);
-        i += 1;
-    }
-    out
-}
 #[cfg(test)]
 mod tests {
     use super::*;
