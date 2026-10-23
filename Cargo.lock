@@ -6475,6 +6475,7 @@ dependencies = [
  "xray-buf",
  "xray-common",
  "xray-features",
+ "xray-frame",
  "xray-proto",
  "xray-transport",
 ]
