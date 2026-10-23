@@ -31,6 +31,8 @@ pub mod dispatcher;
 pub mod error;
 pub mod inbound;
 pub mod outbound;
+// P2 批次 D 插件化：AnytlsPlugin + AnytlsLifecycle。
+pub mod plugin;
 pub mod server;
 pub mod socks;
 
@@ -39,5 +41,6 @@ pub use dispatcher::{AnytlsConnection, make_dial_fn as make_anytls_dial_fn};
 pub use error::{AnytlsError, Result};
 pub use inbound::AnytlsInboundHandler;
 pub use outbound::AnytlsOutboundHandler;
+pub use plugin::{AnytlsLifecycle, AnytlsPlugin};
 pub use server::AnytlsMockServer;
 pub use socks::SocksAddr;

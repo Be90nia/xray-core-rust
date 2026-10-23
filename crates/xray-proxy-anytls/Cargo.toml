@@ -18,6 +18,11 @@ anytls = { workspace = true }
 sha2 = "0.10"
 tracing = { workspace = true }
 xray-features = { path = "../xray-features" }
+# P2 批次 D 插件化：L1/L4 面来自装配框架（src/plugin.rs impl xray_frame::Plugin
+# 是生产代码——cargo 模型下必须生产依赖；xray-frame 不依赖协议 crate，无环）。
+xray-frame = { path = "../xray-frame" }
+# plugin.rs 段路由 JSON 解析（settings.password）。
+serde_json = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
 
