@@ -1,0 +1,68 @@
+name: 'Fetch udf-frame'
+description: >-
+  双向依赖模型（不锁 rev）：克隆 udf-frame main 最新到 crates/udf-frame 并导出
+  UDF_HEAD（供 rust-cache 键注入，防旧 udf 产物跨 run 复用造成假绿）；随后按上游
+  check-runs 闸门拒绝消费 udf CI 红的 commit；API 不可用/无 check run 时降级为
+  本地 cargo test -p udf-skeleton --lib（PM 拍板双保险）。所有分支打印判定依据。
+
+runs:
+  using: composite
+  steps:
+    - name: Fetch udf-frame (unpinned main)
+      shell: bash
+      run: |
+        git clone --depth 1 https://github.com/Be90nia/udf-frame crates/udf-frame
+        UDF_HEAD=$(git -C crates/udf-frame rev-parse HEAD)
+        echo "UDF_HEAD=${UDF_HEAD}" >> "$GITHUB_ENV"
+        {
+          echo "### udf-frame 拉料（不锁 rev，消费 main 最新）"
+          echo "- udf HEAD: \`${UDF_HEAD}\`（版本锚 = 本 run 的 Cargo.lock 自然记录）"
+          echo "- 本 run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          echo "- udf runs: https://github.com/Be90nia/udf-frame/actions"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upstream CI gate (check-runs)
+      shell: bash
+      run: |
+        : "${UDF_HEAD:?UDF_HEAD 未注入，拉料步骤异常}"
+        gate_json="$(mktemp)"
+        verdict=degrade
+        curl_rc=0
+        curl -sS --fail -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/Be90nia/udf-frame/commits/${UDF_HEAD}/check-runs" \
+            -o "$gate_json" || curl_rc=$?
+        if [ "${curl_rc}" -eq 0 ]; then
+          echo "上游 check-runs 判定依据（udf ${UDF_HEAD}）:"
+          jq -r '.check_runs[] | "  check: \(.name)  conclusion=\(.conclusion)"' "$gate_json"
+          # 判定输入解析失败（坏 JSON）→ verdict 落空 → 走降级闸
+          verdict="$(jq -r '
+            ([.check_runs[]? | select(.conclusion == "failure" or .conclusion == "timed_out"
+                  or .conclusion == "cancelled" or .conclusion == "action_required")] | length) as $bad
+            | (if (.total_count // 0) == 0 then "degrade"
+               elif $bad > 0 then "red"
+               else "pass" end)
+          ' "$gate_json" 2>/dev/null || true)"
+          jq -r '.check_runs[]? | select(.conclusion == "failure" or .conclusion == "timed_out"
+                or .conclusion == "cancelled" or .conclusion == "action_required")
+                | "  RED: \(.name) conclusion=\(.conclusion)"' "$gate_json"
+          pending="$(jq '[.check_runs[]? | select(.conclusion == null)] | length' "$gate_json" 2>/dev/null || echo 0)"
+          if [ "${pending}" -gt 0 ]; then
+            echo "  WARN: ${pending} 条 check 尚未完成（conclusion=null），按契约只拦红项不等待"
+          fi
+        else
+          echo "降级依据: check-runs API 请求失败（curl 退出码 ${curl_rc}；含限流/网络/无记录）"
+        fi
+        rm -f "$gate_json"
+        case "${verdict}" in
+          pass)
+            echo "闸门 PASS: udf ${UDF_HEAD} 上游 check-runs 无红项，放行消费"
+            ;;
+          red)
+            echo "::error::udf-frame ${UDF_HEAD} 上游 CI 有红项（见上方 RED 行）——按双向依赖模型闸门拒绝消费；请等 udf main CI 修复后再触发本仓 CI（udf runs: https://github.com/Be90nia/udf-frame/actions）"
+            exit 1
+            ;;
+          *)
+            echo "降级闸（verdict=${verdict:-空}）: API 不可用/无 check run/输出无法识别，改跑本地快速子集（PM 拍板双保险）"
+            cargo test -p udf-skeleton --lib
+            ;;
+        esac

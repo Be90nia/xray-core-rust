@@ -23,6 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # udf-frame 拉料（不锁 rev 消费 main 最新；含上游 CI 闸，依据见 action 头）
+      - uses: ./.github/actions/fetch-udf
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -34,10 +36,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # udf-frame 拉料（不锁 rev 消费 main 最新；含上游 CI 闸，依据见 action 头）
+      - uses: ./.github/actions/fetch-udf
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # udf 是 path 依赖且不锁 rev、Cargo.lock 无版本记录：不把 UDF_HEAD 注入
+      # 缓存键 = 旧 udf 产物跨 run 复用（缓存串味假绿通道，拍板清单 §9 P0-9.4）
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.UDF_HEAD }}
       # workspace 依赖图含 xray-proto(prost-build)，构建需要 protoc
       - name: Install protoc
         run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
@@ -64,6 +72,8 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v4
+      # udf-frame 拉料（不锁 rev 消费 main 最新；含上游 CI 闸，依据见 action 头）
+      - uses: ./.github/actions/fetch-udf
       - uses: dtolnay/rust-toolchain@stable
       # dtolnay/rust-toolchain v2 with.targets 失效兜底;host runner 默认 target 通常装好,
       # 但显式 add 保持与 release.yml / mobile.yml 一致,防未来 runner 镜像变化
@@ -74,6 +84,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: build-v2-2204
+          key: ${{ env.UDF_HEAD }}
       # workspace 依赖图含 xray-proto(prost-build)，构建需要 protoc（runner 镜像已不再预装）
       - name: Install protoc
         shell: pwsh
@@ -114,8 +125,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # udf-frame 拉料（不锁 rev 消费 main 最新；含上游 CI 闸，依据见 action 头）
+      - uses: ./.github/actions/fetch-udf
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.UDF_HEAD }}
       # workspace 依赖图含 xray-proto(prost-build)，test 构建需要 protoc
       - name: Install protoc
         run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
@@ -140,11 +155,14 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      # udf-frame 拉料（workspace manifest 解析需 crates/udf-frame 存在，tun 才是测试目标）
+      - uses: ./.github/actions/fetch-udf
       - uses: dtolnay/rust-toolchain@stable
       # 独立 prefix-key：不与 build job 的 build-v2-2204 缓存互串
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: test-win-tun-v1
+          key: ${{ env.UDF_HEAD }}
       # 依赖闭包含 xray-proto(prost-build)，测试构建需要 protoc（与 build job Windows 分支同配方）
       - name: Install protoc
         shell: pwsh
@@ -159,6 +177,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # udf-frame 拉料：cargo-deny 需解析 workspace manifest，缺料即红
+      - uses: ./.github/actions/fetch-udf
       - uses: EmbarkStudios/cargo-deny-action@v2
       # osv-scanner：GHSA/CVE 基线扫描（gqkk 供应链票，与 cargo-deny 的 RustSec 面
       # 互补）。当前基线含票外命中（hickory-resolver/lru/paste/rsa 等 2026-10-13
@@ -178,8 +198,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # udf-frame 拉料（不锁 rev 消费 main 最新；含上游 CI 闸，依据见 action 头）
+      - uses: ./.github/actions/fetch-udf
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.UDF_HEAD }}
       - name: Install protoc
         run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
       # btls-sys bindings 含注入符号（bd mygg/z32z）；rustdoc 构建依赖同样过 btls-sys
