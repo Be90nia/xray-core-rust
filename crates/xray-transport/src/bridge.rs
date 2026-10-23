@@ -269,6 +269,19 @@ where
     Ok(())
 }
 
+/// 埋点开关解析（bd 7p1m）：未设 → 关；显式假值（`0`/`false`/`off`/`no`/空）→ 关；其余 → 开。
+///
+/// 修正历史语义：旧实现用 `env::var(..).is_ok()`，导致 `XRAY_P7LM_TRACE=0` 也开启逐批
+/// `warn!` 埋点——该埋点的 trace 税曾把 F2/F3 优化实测毒化成伪影（约 36% 吞吐）。
+fn p7lm_trace_enabled(raw: Option<&str>) -> bool {
+    match raw {
+        None => false,
+        Some(v) => {
+            !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "off" | "no")
+        },
+    }
+}
+
 /// 双向桥接 dispatcher [`Link`] 与 AsyncRead+AsyncWrite stream。
 ///
 /// 与 [`bridge_link_with_stream`] 区别：两个方向独立运行到都完成，任一方向
@@ -302,7 +315,7 @@ where
     let uplink_only = policy.uplink_only;
     let downlink_only = policy.downlink_only;
     // bd 7p1m 专项埋点：XRAY_P7LM_TRACE=1 时逐批输出读/写字节数（warn 级穿透 loglevel）。
-    let p7lm_trace = std::env::var("XRAY_P7LM_TRACE").is_ok();
+    let p7lm_trace = p7lm_trace_enabled(std::env::var("XRAY_P7LM_TRACE").ok().as_deref());
 
     let Link { mut reader, mut writer } = link;
     // tokio::io::split（out_f1 33Mbps 实证拓扑，无锁）。自研 BiLock 轮转锁在
@@ -748,6 +761,19 @@ mod tests {
 
     use super::*;
     use crate::connection::TcpConnection;
+
+    /// bd 7p1m：`XRAY_P7LM_TRACE=0` 必须视为关闭（旧 `.is_ok()` 语义会误开埋点，
+    /// 曾把 F2/F3 优化实测毒化成伪影）。
+    #[test]
+    fn p7lm_trace_env_semantics() {
+        assert!(!p7lm_trace_enabled(None), "未设必须关闭");
+        for off in ["", "0", "false", "OFF", " no ", "False"] {
+            assert!(!p7lm_trace_enabled(Some(off)), "{off:?} 必须视为关闭");
+        }
+        for on in ["1", "true", "enable", "yes"] {
+            assert!(p7lm_trace_enabled(Some(on)), "{on:?} 必须视为开启");
+        }
+    }
 
     /// 创建两对 loopback TCP 连接：(client_a ↔ server_a) 和 (client_b ↔ server_b)。
     /// bridge(server_a, server_b) 后：
