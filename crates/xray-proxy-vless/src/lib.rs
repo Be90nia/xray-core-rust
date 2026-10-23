@@ -27,6 +27,9 @@ pub mod encryption;
 pub mod error;
 pub mod inbound;
 pub mod outbound;
+// P2 批次 B 插件化（差异表 §2.2 第 1 行）：L1/L4 面，encoding/encryption/inbound/outbound wire
+// 零改动。
+pub mod plugin;
 pub mod validator;
 
 pub use account::{MemoryAccount, Reverse};
@@ -39,6 +42,7 @@ pub use inbound::{
         handle_connection_with_fallback, serve_vless,
     },
 };
+pub use plugin::{VlessLifecycle, VlessPlugin};
 pub use validator::{MemoryUser, MemoryValidator, Validator};
 
 /// Flow 常量（对应 Go 的 `vless.None` / `vless.XRV`）。

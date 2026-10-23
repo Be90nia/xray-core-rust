@@ -12,6 +12,9 @@ xray-proto = { path = "../xray-proto" }
 xray-buf = { path = "../xray-buf" }
 xray-transport = { path = "../xray-transport" }
 xray-app-dispatcher = { path = "../xray-app-dispatcher" }
+# P2 批次 B 插件化：L1/L4 面来自装配框架（src/plugin.rs impl xray_frame::Plugin
+# 是生产代码——cargo 模型下必须生产依赖；xray-frame 不依赖协议 crate，无环）。
+xray-frame = { path = "../xray-frame" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -30,6 +33,9 @@ chacha20poly1305 = "0.11.0-rc.3"
 aes = "0.9"
 ctr = "0.10"
 base64 = "0.22"
+# plugin.rs 段路由解析（settings → VlessFace，同规 xray-core parse_vless_config /
+# build_vless_validator / build_vless_decryption / build_vless_fallbacks）。
+serde_json = { workspace = true }
 
 [dev-dependencies]
 xray-xudp = { path = "../xray-xudp" }
