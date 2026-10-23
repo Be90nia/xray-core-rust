@@ -12,10 +12,15 @@ xray-proto = { path = "../xray-proto" }
 xray-transport = { path = "../xray-transport" }
 xray-app-dispatcher = { path = "../xray-app-dispatcher" }
 xray-buf = { path = "../xray-buf" }
+# P1-8 插件化：L1/L4 面来自装配框架（src/plugin.rs impl xray_frame::Plugin 是
+# 生产代码——同 blackhole P1-7：xray-frame 单向不引协议 crate，无环，拍板 P2.1）。
+xray-frame = { path = "../xray-frame" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
+# plugin.rs 段路由 JSON 解析（settings.inboundTag）。
+serde_json = { workspace = true }
 
 [dev-dependencies]
 xray-buf = { path = "../xray-buf" }

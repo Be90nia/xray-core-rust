@@ -27,6 +27,15 @@ use xray_features::{
 };
 use xray_proto::xray::proxy::loopback::Config;
 
+// P1-8 插件化（五层强约束第二个全层试点，骨架复用 blackhole 样板）：
+// LoopbackPlugin + LoopbackLifecycle；出/入站 handler 构建权威切到插件工厂
+// （LoopbackPlugin::handler），既有构造入口保留至 P2 ohm 注册路径切换
+// （同 blackhole P1-7 的 make_blackhole_handler 保留）。转发/dial/dispatch
+// 面零改动（LB-1 / 坑约束 12）。
+pub mod plugin;
+
+pub use plugin::{LoopbackLifecycle, LoopbackPlugin};
+
 /// Loopback 错误。
 #[derive(Debug, Error)]
 pub enum LoopbackError {
