@@ -3,8 +3,8 @@
 //! [`Framework`] 门面收口（契约任务书 P0-5；模型 §2.2 L5 装配门 + L2 能力注入）。
 //!
 //! - **fail-visible**：任一步失败 → 整链 `Err`，无半启动态外泄。build 阶段失败时 零
-//!   init/start（无回滚对象）；bring_up 失败复用 [`bring_up`](crate::lifecycle::bring_up)
-//!   的逆序回滚语义（不另写一套）， `started` 保持 `None`（[`Framework::is_running`] 观察锚）。
+//!   init/start（无回滚对象）；bring_up 失败复用 [`bring_up`] 的逆序回滚语义（不另写一套），
+//!   `started` 保持 `None`（[`Framework::is_running`] 观察锚）。
 //! - **三段式停机（PM 拍板 2026-10-23：异步排空隔离在第③段）**：① `fx.close()`（拒新 spawn）→ ②
 //!   `coordinator.shutdown()`（插件停机闭包， 注册序 =
 //!   逆启动序，同步快收：只发关闭信号不等排空，否则停机被拖成串行 等待）→ ③
@@ -94,7 +94,7 @@ impl Framework {
         self.started.is_some()
     }
 
-    /// 阶段③：init/start 拓扑序编排。复用 [`bring_up`](crate::lifecycle::bring_up)
+    /// 阶段③：init/start 拓扑序编排。复用 [`bring_up`]
     /// 全部语义（逐插件 init→start 交替、任一步失败逆序回滚、stop 闭包按逆启动序
     /// 注册进 coordinator）；失败 → 已启动者回滚 + `started` 保持 `None`。
     /// 失败后本实例为终态（插件不保证 init 幂等，禁重试；`shutdown` 仍安全）。
@@ -126,7 +126,8 @@ impl Framework {
         // ② 插件停机闭包：注册序 = 逆启动序，同步快收（异步排空隔离在第③段）。
         let report = self.started.take().map(StartedPlugins::tear_down).unwrap_or_default();
         // ③ 在途排空：abort + 超时兜底（剩余集 Drop=abort，零残留）。超时留痕
-        // fail-visible（报告类型不含 fx 面；逐组件超时接线归 P0-8 深化）。
+        // fail-visible（报告类型不含 fx 面；插件闭包超时档 = coordinator 默认档，
+        // P0-8：`FrameworkOptions.shutdown_timeout` 透传见 `FrameworkBuilder::new`）。
         if self.fx.shutdown_timeout(self.shutdown_timeout).await.is_err() {
             LogFacade::new("assembly", vec![])
                 .warn("framework shutdown: fx drain timed out; residual tasks force-aborted");

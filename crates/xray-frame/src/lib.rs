@@ -8,9 +8,10 @@
 //! 实施计划：`docs/architecture/xray-frame-impl-plan-2026-10-19.md`（P0-P4）。
 //!
 //! 本文件承载**接线冒烟**（udf 依赖面可解析、继承面编译期可见）与 P0 骨架
-//! 模块挂载。P0-1..P0-5/7 已落（plugin/error/context/logging/registry/lifecycle
-//! 及 assembly 装配组合根：register→build(ctx)→bring_up→shutdown 三段式）；
-//! shutdown 逐组件超时接线随 P0-8 派单深化。
+//! 模块挂载。P0-1..P0-8 均已落（plugin/error/context/logging/registry/lifecycle
+//! 及 assembly 装配组合根：register→build(ctx)→bring_up→shutdown 三段式 +
+//! P0-8 装配门：deps 拓扑校验、per-plugin ctx 路由、停机超时接线）；
+//! 后续为 P1 通用件。
 
 /// 契约层词汇直呼（继承面 A 类：`use skeleton::`——包名 udf-skeleton 的 lib 名）。
 pub use skeleton::EffectId;

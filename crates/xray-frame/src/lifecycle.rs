@@ -1,5 +1,5 @@
 //! P0-4 生命周期三相状态机：init→start 按 deps 拓扑序编排 + 失败逆序回滚 +
-//! 停机闭包编入 [`ShutdownCoordinator`](skeleton_infra::shutdown::ShutdownCoordinator)
+//! 停机闭包编入 [`ShutdownCoordinator`]
 //! 次序（模型 §2.2 L5 启动期相位硬校验；坑约束 #6 stop 必经编排器、#8 panic 不逃逸）。
 //!
 //! 编排语义（契约任务书 P0-4，PM 拍板 v0.1 全同步）：
@@ -13,8 +13,10 @@
 //!   [`PluginError::Lifecycle`]（坑约束 #8）；tear_down 路径的 stop 由 coordinator
 //!   编排面自带装甲捕获记 `Failed`。
 //!
-//! 停机闭包的 Framework 层生产接线（超时档位、FxScope 排空）归 P0-8；本件
-//! 只对**传入的** coordinator 落注册与 tear_down 语义。
+//! Framework 层生产接线已落（P0-8）：默认超时档经
+//! `FrameworkOptions.shutdown_timeout` 透传 `with_default_timeout`、FxScope 排空
+//! 在 `Framework::shutdown` 第③段（assembly.rs）；本件对**传入的** coordinator
+//! 落注册与 tear_down 语义。
 
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},

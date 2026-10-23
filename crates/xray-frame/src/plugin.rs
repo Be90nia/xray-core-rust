@@ -59,7 +59,7 @@ pub trait Lifecycle: Send + Sync {
 }
 
 /// L1 必选方法集（模型 §2.5 v0.1 形态落码）。能力只经
-/// [`PluginContext`](crate::context::PluginContext) 取（L2），build 期不做
+/// [`PluginContext`] 取（L2），build 期不做
 /// IO 连接类副作用。
 ///
 /// # 编译期强制（L1）
