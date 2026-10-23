@@ -5707,11 +5707,14 @@ dependencies = [
 name = "xray-app-log"
 version = "0.1.0"
 dependencies = [
+ "log",
  "parking_lot",
  "regex",
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
+ "tracing-subscriber",
+ "udf-skeleton-infra",
  "xray-common",
  "xray-features",
  "xray-proto",
@@ -5919,6 +5922,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "if-addrs",
+ "log",
  "md-5",
  "parking_lot",
  "prost",
@@ -5930,6 +5934,8 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "udf-skeleton-infra",
  "uuid",
  "xray-buf",
 ]
@@ -6220,12 +6226,14 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "libc",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "xray-app-dispatcher",
  "xray-common",
  "xray-features",
+ "xray-frame",
  "xray-proto",
  "xray-transport",
 ]
@@ -6246,6 +6254,7 @@ dependencies = [
  "xray-buf",
  "xray-common",
  "xray-features",
+ "xray-frame",
  "xray-geodata",
  "xray-proto",
  "xray-transport",
@@ -6271,6 +6280,7 @@ dependencies = [
  "xray-buf",
  "xray-common",
  "xray-features",
+ "xray-frame",
  "xray-proto",
  "xray-transport",
  "xray-transport-splithttp",
@@ -6307,6 +6317,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "parking_lot",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6314,6 +6325,7 @@ dependencies = [
  "xray-buf",
  "xray-common",
  "xray-features",
+ "xray-frame",
  "xray-proto",
  "xray-transport",
 ]
@@ -6325,6 +6337,7 @@ dependencies = [
  "async-trait",
  "parking_lot",
  "rand 0.9.4",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6332,6 +6345,7 @@ dependencies = [
  "xray-buf",
  "xray-common",
  "xray-features",
+ "xray-frame",
  "xray-proto",
  "xray-transport",
  "xray-xudp",
@@ -6401,6 +6415,7 @@ dependencies = [
  "xray-common",
  "xray-crypto",
  "xray-features",
+ "xray-frame",
  "xray-proto",
  "xray-proxy-freedom",
  "xray-tls",

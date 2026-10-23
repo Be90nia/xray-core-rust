@@ -19,6 +19,8 @@ pub mod error;
 pub mod fragment;
 pub mod handler;
 pub mod inbound;
+// P2 批次 B 插件化（差异表 §2.2 第 8 行）：L1/L4 面，wire/splice/finalRules 语义零改动。
+pub mod plugin;
 pub mod udp;
 
 #[cfg(test)]
@@ -37,3 +39,4 @@ pub use dispatcher::{
 pub use error::{FreedomError, Result};
 pub use handler::FreedomHandler;
 pub use inbound::FreedomInboundHandler;
+pub use plugin::FreedomPlugin;
