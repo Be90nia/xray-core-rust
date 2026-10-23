@@ -64,6 +64,62 @@ cargo doc --workspace --no-deps
 | **`docs/audit-*.md`** | 5 维审计 6 份 + 综合 + 立项级 |
 | **`D:/tmp/audit-*.md`** | PM 工具链产物（审计上下文 + 9 票审视 + 框架前瞻债 v1/v2）|
 | **`bd list --status open`** | 当前活跃票面（label=audit/framework/standards 等）|
+| **`docs/architecture/xray-frame-强约束插件模型-2026-10-23.md`** | **框架纪律核心**——三层定位 + 五层强制约束 L1-L5 + 协议坑约束表 12 条（造件/评审必读）|
+| `docs/architecture/xray-frame-派生件全景与工作列表-2026-10-23.md` | 继承面全表 + 派生面 8 件 + 差距分析 + P0-P4 工作列表（本地规划文档，未入库）|
+| `docs/architecture/xray-frame-契约级任务书-*.md` | P0 / P1-P4 契约级任务书（可派单形态，本地文档）|
+| `docs/research/xray-frame-*.md` | 盘点底料：主仓 53 crate 能力盘点 / udf 机制差距 / 池化归 udf / DNS 面 / inbound-outbound 面（本地文档）|
+
+---
+
+## 3.5 三层定位与继承派生纪律（硬约束）
+
+### 3.5.1 三层比喻（用户 2026-10-23 定调：udf 是地基，udf-frame 是骨架，xray-frame 是硬装血肉）
+
+| 层 | 载体 | 定位 | 边界 |
+|---|---|---|---|
+| **地基** | `udf-frame` 仓的 `skeleton`（契约层，零依赖）/ `skeleton-infra`（实现层）/ `std-ext`（十三域散件） | 零业务语义的**地基**：机制、契约、标准件、踩坑沉淀 | 不含任何 Xray 语义；不引业务类型 |
+| **骨架** | `udf-frame` 仓整体（独立仓 `github.com/Be90nia/udf-frame`，跨项目复用） | **骨架**：机制/契约/规范的整理与演进场所，给派生层装 | 不含 Xray 语义；不做产品装配 |
+| **硬装血肉** | 主仓 `crates/xray-frame`（装配与插件骨架）+ 各 `xray-proxy-*` / `xray-app-*`（Xray 特有） | Xray 特有的**硬装血肉**：协议插件、装配、硬连接入 | 依赖骨架与地基；**禁复制骨架已有的功能**（§3.5.2） |
+
+**依赖方向单向**：硬装血肉 → 骨架 → 地基。反向只走**提炼回路**：血肉里的通用件提炼上浮骨架/地基 → udf 发版 → 血肉换依赖并删本地副本。**不锁版本**（Cargo.lock 自然记录实际 commit）。
+
+### 3.5.2 禁重复造轮子（评审打回项）
+
+1. **造件前必查三处**：udf 三 crate（地基+骨架）→ 主仓 `crates/xray-frame` → 主仓既有 crate 是否已有同功能件。查法：serena-cli 查符号与 API 面（禁凭印象写"这个 udf 没有"）。
+2. **udf 已有等价功能时，只允许三种做法**：
+   - **直接用**（A 类接线）
+   - **继承派生**（B 类：实现 udf 契约 / 组合其组合件——如 `impl PoolManaged` + `PoolBase` 公共逻辑白拿）
+   - **回灌提炼**（C 类：件成熟后提炼上浮 udf，再换依赖删本地副本）
+   - **禁止**：在主仓复制一份同类实现（"我先写着，以后再说"= 打回项）。
+3. **确需例外**（语义/性能/红线冲突）：件头必须写一行「udf 为什么不适用」的判定 + 标注提炼候选（`udf-promotion-candidate` 注释），并经 review 认可。
+4. **审计口径**：任何"新增功能"类改动，review 必查"udf 是否已有等价件"；命中重复即打回。
+5. **常用白拿清单**（免得重新发明——核对最新签名以 udf 源码为准）：
+   - 池化：`skeleton::pool::PoolManaged`（resize/metrics/subscribe_audit 三挂点）｜`skeleton_infra::pool::PoolBase`（校验/水位线/审计环/溢出计数/借还记账）｜`ThreadPool`（core/max/queue_cap、零自旋、优雅缩容）｜`RejectPolicy` 四件套（Abort/CallerRuns/Discard/DiscardOldest）｜`skeleton_infra::memgov::{MemoryPool, BoundedRegistry, CountingAllocator, LeakGuard}`
+   - 异步与停机：`skeleton_infra::fx::FxScope`（spawn 唯一托管口）｜`skeleton_infra::shutdown::ShutdownCoordinator`（注册窗+编排窗+超时/panic 隔离）
+   - 日志观测：`skeleton_infra::logx`（唯一入口 + `mask_secrets`）｜`log-embed` 埋点规范（target `xray_frame::<域>`）
+   - 缓存/重试/调度/时钟：`std_ext::cache::{LruCache, TtlCache}`（⚠️ **单线程 `&mut self`**，并发面另批）｜`std_ext::retry::{RetryPolicy, retry, retry_if, Sleeper}`｜`std_ext::scheduler::Scheduler`（after/every/close/`panic_count`/优雅 join）｜`skeleton::clock::{Clock, MockClock}`
+   - 配置/JSON：`skeleton::config::{ConfigPort, EnvSource, StdEnv, MockEnv}`｜`skeleton_infra::config::ConfigFile<C>`（`config-json`/`config-toml` feature：分层折叠 `layer`/`default_layer`/`file_layer` + `load`/`save`，真相不静默丢）｜`skeleton_infra::parse_mock`（解析测试替身）
+   - 契约与测试替身：`skeleton::{Reducer, Store, EffectBuf, JournalPort, Driver, Subscription}`｜`skeleton_infra::compose::combine`｜`skeleton_infra::testing::{TestStore, ScriptedRuntime, MockEnv}`｜`parse_mock`
+
+### 3.5.3 分层纪律边界
+
+- **地基/骨架不引 Xray 类型**（提炼判据：零 xray 类型 = 全泛型/trait）——这是血肉能上浮的前提
+- **血肉不复制骨架功能**（§3.5.2）；需求差异用**组合/特化**解决，不靠复制
+- **骨架不感知血肉**（不因某协议需求污染地基语义）
+- **改 udf 仓走提炼回路**：独立 PR + CI 三平台绿 + xray-frame 换依赖复测 32/32
+
+### 3.5.4 归一化面（主仓已自造、但属通用件 → **必须提炼回 udf**，主仓不得留副本）
+
+这些是"血肉里已长出的通用骨架"——按 §3.5.2 纪律，它们**不该待在主仓**，应提炼上浮 udf 后主仓换依赖删本地副本：
+
+| 面 | 主仓现状 | 归一化目标 | 备注 |
+|---|---|---|---|
+| **JSON 工具壳** | `xray-conf/src/json.rs`：`decode_json_strict`（严格 RFC 8259，Go `platform.UseStrictJSON` 对齐）/`decode_json`（容忍注释）/`decode_json_from_str`/`_from_slice`（按 env 切 strict）+ **64MB 输入上限**（`json.rs:25`）+ 带行列的解析错误 | 提炼到 udf（严格解码 + 输入上限 + 位置错误 = 通用件） | Go 兼容的**序列化**语义（`serial.rs:171 to_json_string` 的 `JSONMarshalWithoutEscape` + 4 空格缩进）属 Xray 特有，**留主仓**；但**解析**必须用 udf 版 |
+| **配置 lint 阶段编排** | `xray-conf/src/lint.rs`：`LintStage` trait + 全局注册表 `register_stage`(:95)/`clear_stages`/`registered_stages` + `post_process`(:117，**阶段在锁外执行**，避免回调注册表时死锁) | 提炼到 udf（"端口 + 注册表 + 阶段编排"模式，与 `JournalPort`/`ConfigPort`/`ShutdownCoordinator` 同族） | 阶段内容（Xray 配置语义）留主仓，编排机制上浮 |
+| **日志 Handler 分发 + 双写** | `xray-common/src/log/mod.rs`：`Severity`/`Message`/`Record` + 全局 `HANDLERS: RwLock<Vec<Arc<dyn Handler>>>` + `register_handler`(:80)/`log`(:85 扇出) + `debug/info/warning/error`(:92-114，**tracing 双写**) + `general_logger`（通道缓冲） | 分发机制与埋点规范归 udf `logx` + `log-embed`（唯一入口、target `xray_frame::<域>`、`mask_secrets`）；**双写**收敛为单入口 | Go 级别名（`Severity::as_str`）与 Go 消息语义留主仓（Xray 特有） |
+| **配置装配** | `xray-conf`：`confloader.rs:145`/`serial.rs:512`/`protocols.rs:2180`/`init.rs:1125`/`built.rs:741 BuiltConfig` | 分层装载/端口/测试替身归 udf `ConfigFile<C>`/`ConfigPort`/`MockEnv`/`parse_mock` | `BuiltConfig` 中间态 + proto 双向属 Xray 语义，留主仓 |
+
+> **判定口径**：件内**无 Xray 语义**（Go 兼容语义算 Xray 语义）→ 可提炼；机制与内容分离时**机制上浮、内容留仓**。提炼走 §3.5.3 回路，件头标注 `udf-promotion-candidate`。
 
 ---
 
@@ -80,6 +136,7 @@ cargo doc --workspace --no-deps
 | `protos/` | Go proto 镜像——**只读** |
 | `cloudflared` 配置 + cert / sing-box 二进制 | 用户自管红线 |
 | `feature/framework` 分支起点 `f242e67b` | 框架资产**先验证再合 master**（d820547f 教训）|
+| **udf 已有功能的重复实现** | 继承派生时禁自造轮子（§3.5.2）——评审打回项 |
 
 **13 红线来源**：`docs/audit-架构-2026-10-12.md` §13.1
 
@@ -169,7 +226,8 @@ bd update <id> --append-notes "..."  # 追加，不删历史
 ## 10. 给未来协作者的最快路径
 
 1. **读完本文**（10 min）
-2. **读 `docs/ARCHITECTURE.md` §0.1 三层隐喻**（30 min）—— 宪法骨架
+2. **读 §3.5 三层定位与继承派生纪律**（10 min）——造件前必读，禁重复造轮子
+3. **读 `docs/ARCHITECTURE.md` §0.1 三层隐喻**（30 min）—— 宪法骨架
 3. **读 `docs/refs/oracle-framing-v3.md`**（1h）—— MVVM 增补裁决
 4. **读 `docs/audit-立项级别-2026-10-12.md`**（30 min）—— 立项决议
 5. **跑 §1 上手命令**（5 min）
