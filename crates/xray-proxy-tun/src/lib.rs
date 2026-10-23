@@ -30,6 +30,7 @@ pub mod error;
 pub mod inbound;
 pub mod netstack;
 pub mod outbound;
+pub mod plugin;
 pub mod sysroute;
 pub mod wfp;
 // TUN 设备实现按平台门控：windows/macos/linux/bsd 走 tun_rs 真实现，
@@ -49,3 +50,4 @@ pub use error::{Result, TunError};
 pub use inbound::TunInboundHandler;
 pub use netstack::{TcpAcceptEvent, TunNetStack, UdpRecvEvent};
 pub use outbound::make_tun_dial_fn;
+pub use plugin::{TunLifecycle, TunPlugin};
