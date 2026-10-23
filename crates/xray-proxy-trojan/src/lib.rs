@@ -26,6 +26,7 @@ pub mod config;
 pub mod dispatcher;
 pub mod error;
 pub mod fallback;
+pub mod plugin;
 pub mod protocol;
 pub mod server;
 pub mod validator;
@@ -37,6 +38,7 @@ pub use config::{
 };
 pub use dispatcher::{TrojanOutboundConfig, make_dial_fn as make_trojan_dial_fn};
 pub use error::{Result, TrojanError};
+pub use plugin::{TrojanLifecycle, TrojanPlugin};
 pub use protocol::{
     COMMAND_TCP, COMMAND_UDP, CRLF, MAX_LENGTH, MD5_KEY_LEN, Network, V2_VERSION, addr_type,
     is_v1_hex_prefix, parse_request_header, parse_request_header_v2, parse_udp_packet,

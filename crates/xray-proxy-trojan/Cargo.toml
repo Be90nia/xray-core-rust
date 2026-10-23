@@ -35,6 +35,12 @@ crc = "2"
 # - rand：随机 nonce / session id
 md-5 = "0.10"
 rand = { workspace = true }
+# P2 批次 B 插件化：L1/L4 面来自装配框架（src/plugin.rs impl xray_frame::Plugin
+# 是生产代码——cargo 模型下必须生产依赖；xray-frame 不依赖协议 crate，无环，
+# 拍板 P2.1 的"防环"由 xray-frame 单向不引协议 crate 保证）。
+xray-frame = { path = "../xray-frame" }
+# plugin.rs 段路由解析（settings → Validator/fallbacks，同规 xray-core build_trojan_*）。
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
@@ -42,4 +48,3 @@ xray-tls = { path = "../xray-tls" }
 tokio-tungstenite = { workspace = true }
 futures-util = "0.3"
 xray-proxy-freedom = { path = "../xray-proxy-freedom" }
-serde_json = { workspace = true }
