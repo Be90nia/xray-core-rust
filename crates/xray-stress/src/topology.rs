@@ -80,8 +80,10 @@ pub async fn start_echo() -> std::net::SocketAddr {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 },
                 Err(e) => {
-                    tracing::warn!("echo accept fatal, stopping echo: {e}");
-                    break;
+                    // 形态对齐（accept_policy 铁律：错误永不退出）——退出即 listener
+                    // 永久死亡，该场景所有连接 refused 风暴（run 35587906510 实锤教训）
+                    tracing::warn!("echo accept error, backing off and continuing: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 },
             }
         }

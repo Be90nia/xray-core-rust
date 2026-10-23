@@ -28,6 +28,7 @@
 // 将 Pin<Box<dyn Future>> 判为已 must_use → double_must_use 误报；宏行为非本 crate 可控。
 #![allow(clippy::double_must_use)]
 
+pub mod accept_policy;
 pub mod bridge;
 pub mod cnc;
 pub mod connection;

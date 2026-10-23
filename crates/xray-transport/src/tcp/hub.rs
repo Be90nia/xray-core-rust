@@ -15,6 +15,7 @@ use std::{io, net::SocketAddr, sync::Arc};
 use tokio::sync::Notify;
 
 use crate::{
+    accept_policy::{AcceptErrorKind, backoff_if_resource, classify, supervise_accept_loop},
     connection::Connection,
     listener_registry::{ConnHandler, TransportListener},
     sockopt::SocketOptions,
@@ -73,8 +74,15 @@ impl TcpHubListener {
     /// 返回 `JoinHandle`，调用方可 await 等待循环结束。
     pub fn spawn_accept_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let this = Arc::clone(self);
+        let local = self.local_addr().map_or_else(|e| e.to_string(), |a| a.to_string());
+        // 监控包裹：内层跑 accept 循环，外层 await 其句柄做意外退出留痕。
+        // JoinHandle 不可 Clone，返回外层句柄——await / drop-detach 语义与直接
+        // 返回循环句柄一致；panic 留痕见 accept_policy::supervise_accept_loop。
         tokio::spawn(async move {
-            this.keep_accepting().await;
+            let loop_handle = tokio::spawn(async move {
+                this.keep_accepting().await;
+            });
+            supervise_accept_loop("tcp", local, loop_handle).await;
         })
     }
 
@@ -86,10 +94,10 @@ impl TcpHubListener {
     /// 3. auth wrapping（stub）
     /// 4. 调用 `add_conn(conn)`
     ///
-    /// accept 错误处理与 Go 一致：
-    /// - "closed" 错误 → break（监听器关闭）
-    /// - "too many" 错误 → sleep 500ms 后 continue
-    /// - 其他错误 → log + continue
+    /// accept 错误处置走 [`crate::accept_policy`]（grpc transport.rs 样板）：资源类
+    /// warn + 退避 500ms + 继续；单连接级 debug + 继续；未知 warn + 继续。错误永不
+    /// 退出——循环唯一出口是 close_notify 分支（单连接级错误文本常含 "closed"，曾
+    /// 命中旧 `contains("closed") => break` 静默杀死监听）。
     async fn keep_accepting(&self) {
         loop {
             let accept_fut = self.inner.accept();
@@ -124,20 +132,24 @@ impl TcpHubListener {
                             (self.add_conn)(conn);
                         }
                         Err(e) => {
-                            let err_str = e.to_string();
-                            if err_str.contains("closed") {
-                                break;
+                            match classify(&e) {
+                                AcceptErrorKind::Resource => {
+                                    let local = self.local_addr().map_or_else(|err| err.to_string(), |a| a.to_string());
+                                    tracing::warn!(tag = "tcp", local = %local, error = %e, "tcp inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续");
+                                    backoff_if_resource(&e).await;
+                                }
+                                AcceptErrorKind::Connection => {
+                                    tracing::debug!(tag = "tcp", error = %e, "tcp inbound: 单连接级 accept 错误，继续监听");
+                                }
+                                AcceptErrorKind::Unknown => {
+                                    tracing::warn!(tag = "tcp", error = %e, "tcp inbound: accept 错误（未知类别），继续监听");
+                                }
                             }
-                            tracing::warn!(error = %e, "failed to accept raw connection");
-                            if err_str.contains("too many") {
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                            }
-                            continue;
                         }
                     }
                 }
                 _ = self.close_notify.notified() => {
-                    // 收到关闭信号，退出循环。
+                    // 收到关闭信号，退出循环（唯一出口）。
                     break;
                 }
             }
@@ -242,6 +254,9 @@ pub struct TcpUnixHubListener {
     inner: crate::system_listener::UnixListener,
     add_conn: ConnHandler,
     close_notify: Arc<Notify>,
+    /// unix socket 路径——意外退出 error! 日志标识 inbound 用（unix 无有意义的
+    /// local_addr，`local_addr()` 返回全零占位）。
+    path: String,
 }
 
 #[cfg(unix)]
@@ -253,19 +268,26 @@ impl TcpUnixHubListener {
         add_conn: ConnHandler,
     ) -> io::Result<Self> {
         let inner = crate::system_listener::UnixListener::bind(path, sockopt.clone()).await?;
-        Ok(Self { inner, add_conn, close_notify: Arc::new(Notify::new()) })
+        Ok(Self { inner, add_conn, close_notify: Arc::new(Notify::new()), path: path.to_string() })
     }
 
     /// Spawn accept 循环到独立 tokio task（对齐 [`TcpHubListener::spawn_accept_loop`]）。
     pub fn spawn_accept_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let this = Arc::clone(self);
+        let path = self.path.clone();
+        // 监控包裹（同 tcp 循环）：panic 静默杀监听——error! 兜底发声。
         tokio::spawn(async move {
-            this.keep_accepting().await;
+            let loop_handle = tokio::spawn(async move {
+                this.keep_accepting().await;
+            });
+            supervise_accept_loop("tcp-unix", path, loop_handle).await;
         })
     }
 
     /// Accept 循环：accept → `add_conn`（Go keepAccepting 的 unix 载体，无
     /// header/finalmask 包装——Go unix 分支同样不走 WrapListener 的 tcp 语义）。
+    /// 错误处置与 [`TcpHubListener::keep_accepting`] 一致（accept_policy：错误永不
+    /// 退出，唯一出口是 close_notify 分支）。
     async fn keep_accepting(&self) {
         loop {
             let accept_fut = self.inner.accept();
@@ -275,15 +297,18 @@ impl TcpUnixHubListener {
                     match result {
                         Ok(conn) => (self.add_conn)(conn),
                         Err(e) => {
-                            let err_str = e.to_string();
-                            if err_str.contains("closed") {
-                                break;
+                            match classify(&e) {
+                                AcceptErrorKind::Resource => {
+                                    tracing::warn!(tag = "tcp-unix", path = %self.path, error = %e, "unix inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续");
+                                    backoff_if_resource(&e).await;
+                                }
+                                AcceptErrorKind::Connection => {
+                                    tracing::debug!(tag = "tcp-unix", path = %self.path, error = %e, "unix inbound: 单连接级 accept 错误，继续监听");
+                                }
+                                AcceptErrorKind::Unknown => {
+                                    tracing::warn!(tag = "tcp-unix", path = %self.path, error = %e, "unix inbound: accept 错误（未知类别），继续监听");
+                                }
                             }
-                            tracing::warn!(error = %e, "failed to accept unix connection");
-                            if err_str.contains("too many") {
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                            }
-                            continue;
                         }
                     }
                 }
@@ -731,5 +756,50 @@ mod header_wrap_tests {
         let text = String::from_utf8_lossy(&got[..n]).to_string();
         assert!(text.starts_with("HTTP/1.1 200"), "应注入 response header，实际 {text:?}");
         assert!(text.ends_with("resp"), "payload 应跟随 header，实际 {text:?}");
+    }
+}
+
+#[cfg(test)]
+mod accept_error_tests {
+    use super::*;
+
+    // tcp / unix 两个 accept 循环共用 `crate::accept_policy::classify`。这里锁定
+    // accept 场景的关键分类决策（"退出"不在 AcceptErrorKind 表示域内——任何错误
+    // 分类都不产生退出动作，循环唯一出口是 close_notify 分支）。
+
+    #[test]
+    fn accept_queue_abort_is_connection_class() {
+        // Linux：连接在 accept 完成前被客户端中止（ECONNABORTED）——单连接级
+        assert_eq!(
+            classify(&io::Error::from(io::ErrorKind::ConnectionAborted)),
+            AcceptErrorKind::Connection
+        );
+        // Windows：客户端握手前重置（WSAECONNRESET）
+        assert_eq!(
+            classify(&io::Error::from(io::ErrorKind::ConnectionReset)),
+            AcceptErrorKind::Connection
+        );
+    }
+
+    #[test]
+    fn emfile_enfile_backs_off_regardless_of_text_case() {
+        // glibc 文本 "Too many open files" 大写 T——旧 `contains("too many")` 大小写
+        // 敏感永不命中的静默失效，由 kind 分级 + 大小写不敏感兜底消除
+        assert_eq!(classify(&io::Error::other("Too many open files")), AcceptErrorKind::Resource);
+        assert_eq!(classify(&io::Error::other("too many open files")), AcceptErrorKind::Resource);
+    }
+
+    #[test]
+    fn closed_text_still_never_maps_to_exit() {
+        // 回归锁：单连接级 "closed" 文本（生产杀手）不再触发退出——分类为
+        // Connection / Unknown 都只是记录 + 继续
+        assert_eq!(
+            classify(&io::Error::other("Connection closed normally")),
+            AcceptErrorKind::Unknown
+        );
+        assert_eq!(
+            classify(&io::Error::from(io::ErrorKind::ConnectionAborted)),
+            AcceptErrorKind::Connection
+        );
     }
 }
