@@ -18,6 +18,7 @@ pub mod client;
 pub mod config;
 pub mod dispatcher;
 pub mod error;
+pub mod plugin;
 pub mod protocol;
 pub mod server;
 pub mod udp;
@@ -27,6 +28,7 @@ pub use client::{ClientConfig, SocksClient};
 pub use config::{Account, AuthType, ClientConfig as ProtoClientConfig, ServerConfig};
 pub use dispatcher::make_dial_fn as make_socks_dial_fn;
 pub use error::{Result, SocksError};
+pub use plugin::{SocksLifecycle, SocksPlugin};
 pub use protocol::{
     ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, AUTH_NO_MATCHING_METHOD, AUTH_NOT_REQUIRED, AUTH_PASSWORD,
     CMD_TCP_BIND, CMD_TCP_CONNECT, CMD_UDP_ASSOCIATE, Host, SOCKS4_REQUEST_GRANTED,
