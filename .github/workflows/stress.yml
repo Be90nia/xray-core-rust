@@ -38,6 +38,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # udf-frame 拉料（workspace manifest 解析需 crates/udf-frame 存在，缺料即红）
+      - uses: ./.github/actions/fetch-udf
       - uses: dtolnay/rust-toolchain@stable
       # 泄漏门禁脚本（tools/check_stress_leak.py）需要 python；setup-python 三平台统一提供
       - uses: actions/setup-python@v5

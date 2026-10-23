@@ -24,12 +24,17 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+      # udf-frame 拉料（不锁 rev 消费 main 最新；含上游 CI 闸，依据见 action 头）
+      - uses: ./.github/actions/fetch-udf
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
+      # udf 是 path 依赖且不锁 rev、Cargo.lock 无版本记录：不把 UDF_HEAD 注入
+      # 缓存键 = 旧 udf 产物跨 run 复用（缓存串味假绿通道，拍板清单 §9 P0-9.4）
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "musl-probe-v1"
+          key: ${{ env.UDF_HEAD }}
       - name: Install cargo-zigbuild (zig as musl cross C/C++ toolchain)
         uses: taiki-e/install-action@v2
         with:

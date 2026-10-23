@@ -45,6 +45,8 @@ jobs:
             bin: xray
     steps:
       - uses: actions/checkout@v4
+      # udf-frame 拉料（不锁 rev 消费 main 最新；含上游 CI 闸，依据见 action 头）
+      - uses: ./.github/actions/fetch-udf
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -56,9 +58,13 @@ jobs:
         run: rustup target add ${{ matrix.target }}
       # prefix-key 炸缓存：旧 key 里混着 ubuntu-24.04（glibc 2.39）编的 aws_lc_sys
       # 产物（sscanf→__isoc23_* 重定向），恢复进 22.04 链接必炸——强制全量重编
+
+      # udf 是 path 依赖且不锁 rev、Cargo.lock 无版本记录：不把 UDF_HEAD 注入
+      # 缓存键 = 旧 udf 产物跨 run 复用（缓存串味假绿通道，拍板清单 §9 P0-9.4）
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v2-gcc22-glibc235"
+          key: ${{ env.UDF_HEAD }}
       - name: Prepare patched boringssl
         uses: ./.github/actions/setup-boringssl
       - name: Install protoc

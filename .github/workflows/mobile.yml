@@ -23,6 +23,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      # udf-frame 拉料（workspace manifest 解析需 crates/udf-frame 存在，缺料即红）
+      - uses: ./.github/actions/fetch-udf
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
@@ -67,6 +69,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      # udf-frame 拉料（workspace manifest 解析需 crates/udf-frame 存在，缺料即红）
+      - uses: ./.github/actions/fetch-udf
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios
