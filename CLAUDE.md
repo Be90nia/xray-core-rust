@@ -68,6 +68,7 @@ cargo doc --workspace --no-deps
 | `docs/architecture/xray-frame-派生件全景与工作列表-2026-10-23.md` | 继承面全表 + 派生面 8 件 + 差距分析 + P0-P4 工作列表（本地规划文档，未入库）|
 | `docs/architecture/xray-frame-契约级任务书-*.md` | P0 / P1-P4 契约级任务书（可派单形态，本地文档）|
 | `docs/research/xray-frame-*.md` | 盘点底料：主仓 53 crate 能力盘点 / udf 机制差距 / 池化归 udf / DNS 面 / inbound-outbound 面（本地文档）|
+| **`docs/architecture/xray-frame-udf功能域全景-2026-10-23.md`** | **udf 32 域全景 × 主仓覆盖对照**——udf 有什么/没什么/主仓哪些面能接管/10 个未接线高价值域/3 条反模式（造件选依托件前先查）|
 
 ---
 
