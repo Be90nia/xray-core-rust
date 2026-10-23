@@ -6,7 +6,7 @@
 //!   lifecycle/build），缺一编译不过。
 //! - **L2**：能力只经 `PluginContext` 取——build 期 `ctx.section()` 读 per-plugin 段（缺段
 //!   fail-fast，坑约束 7 装配半边）；loopback 不取 `ctx.pool()`（转发
-//!   面零改动，池纪律条款按"全适用"声明、能力暂不消费，见 [`LOOPBACK_CONTRACT`]）。
+//!   面零改动，池纪律条款按"全适用"声明、能力暂不消费，见 `LOOPBACK_CONTRACT`）。
 //! - **L3**：无裸能力（无 println/裸 spawn/裸 sleep）。
 //! - **L4**：`assert_plugin_contract!(LoopbackPlugin)`（tests/plugin_contract.rs）。
 //! - **L5**：装配门——缺段 / 缺 `inboundTag` → build `Err` → 整链 fail-visible。

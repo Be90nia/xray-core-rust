@@ -105,10 +105,10 @@ fn parse_overrides(get: impl Fn(&str) -> Option<String>) -> (PoolParams, Vec<Str
 /// 互喂池：worker 内借缓冲 → 跑 → RAII 还。
 ///
 /// 构造参数逐项对应 udf 真实签名：
-/// - [`PooledThreadPool::new(mem, threads, borrow_timeout)`]
+/// - `PooledThreadPool::new(mem, threads, borrow_timeout)`
 ///   （`crates/udf-frame/skeleton-infra/src/pooled_thread_pool.rs`）
-/// - [`ThreadPool::new(ThreadPoolTuning)`]（同目录 `pool.rs`）
-/// - [`ThreadPoolTuning::new(core, max, queue_cap)`]（同上）
+/// - `ThreadPool::new(ThreadPoolTuning)`（同目录 `pool.rs`）
+/// - `ThreadPoolTuning::new(core, max, queue_cap)`（同上）
 pub struct GeodataLoadPool {
     pool: PooledThreadPool<Vec<u8>, fn() -> Vec<u8>>,
 }

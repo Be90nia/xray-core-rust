@@ -5,13 +5,13 @@
 //!   lifecycle/build），缺一编译不过。
 //! - **L2**：能力只经 [`PluginContext`] 取——build 期 `ctx.section()` 读 per-plugin 段（缺段
 //!   fail-fast，坑约束 7 装配半边）；blackhole 不取 `ctx.pool()`（坑约束 4 按 N/A 声明，见
-//!   [`BLACKHOLE_CONTRACT`]）。
+//!   `BLACKHOLE_CONTRACT`）。
 //! - **L3**：无裸能力（无 println/裸 spawn/裸 sleep）。
 //! - **L4**：`assert_plugin_contract!(BlackholePlugin)`（tests/plugin_contract.rs）。
 //! - **L5**：装配门——缺段 / 未知 response type / base64 解码失败 → build `Err` → 整链
 //!   fail-visible（tests/plugin_assembly.rs）。
 //!
-//! wire 零改动：响应体构造仍走 `response.rs`（[`HTTP_403_RESPONSE`] 常量与
+//! wire 零改动：响应体构造仍走 `response.rs`（`HTTP_403_RESPONSE` 常量与
 //! [`get_internal_response`] 解析语义原样复用），Http403 字节形态逐字节不变。
 
 use std::sync::OnceLock;
