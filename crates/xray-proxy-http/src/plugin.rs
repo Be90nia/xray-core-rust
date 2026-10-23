@@ -30,9 +30,12 @@ use xray_frame::{
 
 use crate::{config::ServerConfig, server::HttpServer};
 
-/// 通用条款适用子集（差异表 §2.2 第 6 行：3/5/6/7/8/9/10/12 适用；
+/// 通用条款适用子集（差异表 §2.2 第 6 行：3/5/6/7/8/9/10/12 适用 + 条款 1
+/// 按 PM 拍板（2026-10-24）归 clauses——http inbound 有 407 认证失败分类
+/// （`server.rs` handshake → `HttpProxyError::AuthFailed`）且代码已满足；
 /// 2/4/11 走 [`HTTP_NOT_APPLICABLE`]）。
 static HTTP_CLAUSES: &[ClauseId] = &[
+    ClauseId::AuthErrorClassified,
     ClauseId::ConnIdPresent,
     ClauseId::SpawnManaged,
     ClauseId::StopRegistered,

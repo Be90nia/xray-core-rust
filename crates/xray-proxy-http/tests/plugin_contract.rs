@@ -32,8 +32,9 @@ fn contract_macro_holds_for_http() {
     assert_plugin_contract!(HttpPlugin);
 }
 
-/// 契约面内容断言：差异表 §2.2 第 6 行——8 条适用、2/4/11 走 N/A（理由非空）、
-/// HTTP-H2W 协议专属（h2 窗钉不得改回默认 400KB）。
+/// 契约面内容断言：差异表 §2.2 第 6 行——9 条适用（3/5/6/7/8/9/10/12 + 条款 1
+/// 按 PM 拍板归 clauses）、2/4/11 走 N/A（理由非空）、HTTP-H2W 协议专属
+/// （h2 窗钉不得改回默认 400KB）。
 #[test]
 fn contract_surface_declares_subset_na_and_extra() {
     let plugin = HttpPlugin::default();
@@ -45,6 +46,7 @@ fn contract_surface_declares_subset_na_and_extra() {
     assert!(deps.is_empty(), "http 无依赖插件");
 
     let expected: &[ClauseId] = &[
+        ClauseId::AuthErrorClassified,
         ClauseId::ConnIdPresent,
         ClauseId::SpawnManaged,
         ClauseId::StopRegistered,
@@ -54,7 +56,11 @@ fn contract_surface_declares_subset_na_and_extra() {
         ClauseId::LogDiscipline,
         ClauseId::HotPathFreeze,
     ];
-    assert_eq!(contract.clauses.len(), expected.len(), "http 适用 8 条（差异表 §2.2 第 6 行）");
+    assert_eq!(
+        contract.clauses.len(),
+        expected.len(),
+        "http 适用 9 条（差异表 §2.2 第 6 行 + 条款 1 PM 拍板）"
+    );
     for clause in expected {
         assert!(contract.clauses.contains(clause), "缺条款 {clause:?}");
     }
