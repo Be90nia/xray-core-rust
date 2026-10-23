@@ -93,7 +93,19 @@ pub fn build_rule(
     balancers: &std::collections::HashMap<String, Arc<Balancer>>,
     geo_loader: Option<&GeoDataLoader>,
 ) -> Result<Rule, RouterError> {
-    let cond = build_condition(proto, geo_loader)?;
+    build_rule_with_pool(proto, balancers, geo_loader, None)
+}
+
+/// [`build_rule`] 的互喂变体（xray-frame 任务书 P3-5）：`pool` 传 `Some` 时
+/// domain matcher 构建在 [`RouterBuildPool`] worker 内执行；`None` 时与
+/// [`build_rule`] 完全同路。匹配语义零变化。
+pub fn build_rule_with_pool(
+    proto: &RoutingRule,
+    balancers: &std::collections::HashMap<String, Arc<Balancer>>,
+    geo_loader: Option<&GeoDataLoader>,
+    pool: Option<&RouterBuildPool>,
+) -> Result<Rule, RouterError> {
+    let cond = build_condition_with_pool(proto, geo_loader, pool)?;
 
     // 解析 target_tag oneof
     let (mut tag, mut balancer) = (String::new(), None);
@@ -125,6 +137,18 @@ pub fn build_condition(
     proto: &RoutingRule,
     geo_loader: Option<&GeoDataLoader>,
 ) -> Result<Box<dyn Condition>, RouterError> {
+    build_condition_with_pool(proto, geo_loader, None)
+}
+
+/// [`build_condition`] 的互喂变体（xray-frame 任务书 P3-5）：`pool` 传 `Some`
+/// 时 domain matcher 构建走 [`RouterBuildPool`]（构建才是 CPU 密集面；
+/// `apply()` 数据面热路径零改动——契约坑约束 12）。`None` 时与
+/// [`build_condition`] 完全同路。
+pub fn build_condition_with_pool(
+    proto: &RoutingRule,
+    geo_loader: Option<&GeoDataLoader>,
+    pool: Option<&RouterBuildPool>,
+) -> Result<Box<dyn Condition>, RouterError> {
     let mut chan = ConditionChan::new();
 
     // LocalOS（Go a12801c1：BuildCondition 首个条件，运行时 OS 恒定 → 构造期解析）
@@ -135,7 +159,11 @@ pub fn build_condition(
         // hn4i：parse_proto_domain_rules 现可返回 Err（fail-closed）。
         let rules = parse_proto_domain_rules(&proto.domain, geo_loader)?;
         if !rules.is_empty() {
-            chan.add(Box::new(DomainMatcherCondition::new(rules)?));
+            let cond = match pool {
+                Some(p) => DomainMatcherCondition::new_pooled(p, rules)?,
+                None => DomainMatcherCondition::new(rules)?,
+            };
+            chan.add(Box::new(cond));
         }
     }
 

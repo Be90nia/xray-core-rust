@@ -23,10 +23,11 @@ use xray_proto::xray::app::router::{BalancingRule, Config, RoutingRule};
 
 use crate::{
     balancing::{Balancer, BalancingStrategy, ObservationProvider, OutboundHandlerSelector},
+    condition::RouterBuildPool,
     config::DomainStrategy,
     context::RoutingContext,
     error::RouterError,
-    rule::{Rule, build_rule},
+    rule::{Rule, build_rule_with_pool},
 };
 
 /// 路由结果。对应 Go `router.Route`。
@@ -53,6 +54,11 @@ pub struct Router {
     geo_loader: Option<Arc<GeoDataLoader>>,
     /// DNS 解析能力（domainStrategy IpOnDemand/IpIfNonMatch 用）。
     dns: RwLock<Option<Arc<dyn xray_features::dns::DnsClient>>>,
+    /// P3-5 互喂池（启动期/热更期 matcher 构建；热更复用同一池，拍板清单
+    /// §4 P3-5.1）。`Router` 释放时随 [`skeleton_infra::pool::ThreadPool`]
+    /// 的 Drop 走优雅关闭（线程排空后自退役，无泄漏）。`empty()`（测试面）
+    /// 为 `None` → 构建走原串行路径。
+    build_pool: Option<RouterBuildPool>,
 }
 
 impl Router {
@@ -78,11 +84,13 @@ impl Router {
             }
         }
 
-        // 2. 构建规则
+        // 2. 构建规则（P3-5：domain matcher 构建走互喂池；池随 Router 存活，
+        // 热更 add_rule/reload_rules 复用同一池——拍板清单 §4 P3-5.1）
+        let build_pool = RouterBuildPool::from_env();
         let mut rules: Vec<Arc<Rule>> = Vec::with_capacity(config.rule.len());
         let mut seen_rule_tags = std::collections::HashSet::new();
         for rr in &config.rule {
-            let r = build_rule(rr, &balancers, geo_loader.as_deref())?;
+            let r = build_rule_with_pool(rr, &balancers, geo_loader.as_deref(), Some(&build_pool))?;
             if !r.rule_tag.is_empty() && !seen_rule_tags.insert(r.rule_tag.clone()) {
                 return Err(RouterError::DuplicateRuleTag(r.rule_tag.clone()));
             }
@@ -97,6 +105,7 @@ impl Router {
             observer: RwLock::new(observer),
             geo_loader,
             dns: RwLock::new(None),
+            build_pool: Some(build_pool),
         }))
     }
 
@@ -114,6 +123,7 @@ impl Router {
             observer: RwLock::new(observer),
             geo_loader: None,
             dns: RwLock::new(None),
+            build_pool: None,
         })
     }
 
@@ -232,7 +242,12 @@ impl Router {
         let balancers = self.balancers.read();
         let mut proto = proto;
         proto.rule_tag = rule_tag.clone();
-        let r = build_rule(&proto, &balancers, self.geo_loader.as_deref())?;
+        let r = build_rule_with_pool(
+            &proto,
+            &balancers,
+            self.geo_loader.as_deref(),
+            self.build_pool.as_ref(),
+        )?;
         rules.push(Arc::new(r));
         Ok(())
     }
@@ -261,7 +276,12 @@ impl Router {
         let mut new_rules = Vec::with_capacity(protos.len());
         let mut seen = std::collections::HashSet::new();
         for p in protos {
-            let r = build_rule(p, &balancers, self.geo_loader.as_deref())?;
+            let r = build_rule_with_pool(
+                p,
+                &balancers,
+                self.geo_loader.as_deref(),
+                self.build_pool.as_ref(),
+            )?;
             if !r.rule_tag.is_empty() && !seen.insert(r.rule_tag.clone()) {
                 return Err(RouterError::DuplicateRuleTag(r.rule_tag.clone()));
             }

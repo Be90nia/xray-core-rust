@@ -13,9 +13,19 @@
 //! - ProcessNameMatcher 的 `find_process`：跨平台进程反查（Linux /proc、Windows iphelper）
 //! - GeoSite 文件加载（domain rule 的 GeoSiteRule 变体）走 rule.rs 调用 geodata loader
 
-use std::{collections::HashMap, net::IpAddr};
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    sync::{Arc, mpsc},
+    time::Duration,
+};
 
 use regex::Regex;
+use skeleton_infra::{
+    memgov::MemoryPool,
+    pool::{RejectedTask, ThreadPool, ThreadPoolTuning},
+    pooled_thread_pool::PooledThreadPool,
+};
 use xray_common::net::{
     network::Network,
     port::{MemoryPortList, Port},
@@ -108,6 +118,43 @@ impl DomainMatcherCondition {
         use xray_geodata::matcher::domain::MphDomainMatcher;
         let matcher = MphDomainMatcher::build(&rules)
             .map_err(|e| RouterError::GeodataBuild(e.to_string()))?;
+        Ok(Self { matcher: Box::new(matcher) })
+    }
+
+    /// 互喂版构建（xray-frame 任务书 P3-5）：`MphDomainMatcher::build` 在
+    /// [`RouterBuildPool`] worker 内执行（worker 借缓冲 → 跑纯内存 CPU 活 →
+    /// RAII 还），调用线程只等结果。与 [`Self::new`] 调同一 build 函数，同输入
+    /// 匹配行为逐位等价。
+    ///
+    /// 规则集经 `Arc` 共享：常规路径零拷贝；提交侧拒绝（队列满/shutdown）时
+    /// 池任务原样退还，本线程用同一 `Arc` 内联补位（CallerRuns 等价，不 panic）。
+    /// worker 内 panic 的任务不回传结果 → `recv` 报错上抛 = fail-visible（同
+    /// P1-2 geodata loader 收集面语义）。
+    pub fn new_pooled(
+        pool: &RouterBuildPool,
+        rules: Vec<GeoDomainRule>,
+    ) -> Result<Self, RouterError> {
+        use xray_geodata::matcher::domain::MphDomainMatcher;
+        let shared = Arc::new(rules);
+        let (tx, rx) = mpsc::channel();
+        let submitted = pool.submit({
+            let shared = Arc::clone(&shared);
+            let tx = tx.clone();
+            move |_buf: &mut Vec<u8>| {
+                let _ = tx.send(
+                    MphDomainMatcher::build(shared.as_slice())
+                        .map_err(|e| RouterError::GeodataBuild(e.to_string())),
+                );
+            }
+        });
+        drop(tx);
+        let matcher = match submitted {
+            Ok(()) => rx.recv().map_err(|_| {
+                RouterError::GeodataBuild("matcher build task lost: pool worker died".into())
+            })??,
+            Err(_) => MphDomainMatcher::build(shared.as_slice())
+                .map_err(|e| RouterError::GeodataBuild(e.to_string()))?,
+        };
         Ok(Self { matcher: Box::new(matcher) })
     }
 }
@@ -1159,6 +1206,92 @@ impl ProcessNameMatcherCondition {
 impl Condition for ProcessNameMatcherCondition {
     fn apply(&self, ctx: &dyn RoutingContext) -> bool {
         ProcessNameMatcherCondition::apply(self, ctx)
+    }
+}
+
+// ── RouterBuildPool（P3-5 互喂池壳）───────────────────────────
+
+// PM 拍板（拍板清单 §4 P3-5.1）：热更（add_rule/reload_rules）复用 Router 持有
+// 的同一池，不每次新建线程池。池参数固定默认 + env 覆盖（同 P1-2 拍板形态）。
+// 默认 core=1：构建触发频率远低于 geodata 加载，保活成本压到最低。
+const DEFAULT_CORE: usize = 1;
+const DEFAULT_MAX: usize = 2;
+const DEFAULT_QUEUE_CAP: usize = 8;
+const DEFAULT_BORROW_TIMEOUT_MS: usize = 10_000;
+
+/// 池参数 env 覆盖项：worker 保活数。
+pub const ENV_CORE: &str = "XRAY_ROUTER_POOL_CORE";
+/// 池参数 env 覆盖项：worker 上限（同时决定内存池缓冲上限）。
+pub const ENV_MAX: &str = "XRAY_ROUTER_POOL_MAX";
+/// 池参数 env 覆盖项：中央队列容量（溢出 = 提交侧 `RejectedTask` 退还 → 调用
+/// 线程内联补位，不 panic）。
+pub const ENV_QUEUE_CAP: &str = "XRAY_ROUTER_POOL_QUEUE_CAP";
+/// 池参数 env 覆盖项：worker 借缓冲超时（毫秒）。
+pub const ENV_BORROW_TIMEOUT_MS: &str = "XRAY_ROUTER_POOL_BORROW_TIMEOUT_MS";
+
+/// 路由 matcher 构建互喂池：[`PooledThreadPool`] 薄壳（P1-2 `GeodataLoadPool`
+/// 同款形态；壳属消费 crate 本地件，批量上浮 udf 列 P4 提炼候选）。
+///
+/// 硬边界：只接启动期/热更期 matcher 构建（CPU 密集、纯内存、不持 IO）；
+/// 数据面 `apply` 与持 socket 任务禁入（契约坑约束 12）。
+pub struct RouterBuildPool {
+    pool: PooledThreadPool<Vec<u8>, fn() -> Vec<u8>>,
+}
+
+impl RouterBuildPool {
+    /// 显式参数组装。非法组合（0 值 / `core > max`）由 udf 构造期 fail-fast
+    /// panic（恒不合法 = 调用方 bug，同 udf 纪律）。内存池上限 = `max`：每
+    /// worker 至多持 1 块缓冲，恒不借空。
+    pub fn new(core: usize, max: usize, queue_cap: usize, borrow_timeout: Duration) -> Self {
+        let mem = Arc::new(MemoryPool::<Vec<u8>>::new(max, max, Vec::new));
+        let threads = ThreadPool::new(ThreadPoolTuning::new(core, max, queue_cap));
+        Self { pool: PooledThreadPool::new(mem, threads, borrow_timeout) }
+    }
+
+    /// 固定默认 + env 覆盖装配。非法 env 值 `tracing::warn` 后回落默认/修正，
+    /// 不 panic（启动配置打错字不炸进程，也不静默吞掉）。
+    pub fn from_env() -> Self {
+        let num = |name: &str, default: usize| -> usize {
+            match std::env::var(name) {
+                Err(_) => default,
+                Ok(raw) => match raw.trim().parse::<usize>() {
+                    Ok(v) if v > 0 => v,
+                    _ => {
+                        tracing::warn!("invalid {name}={raw:?}; falling back to default {default}");
+                        default
+                    },
+                },
+            }
+        };
+        let (core, max) = (num(ENV_CORE, DEFAULT_CORE), num(ENV_MAX, DEFAULT_MAX));
+        let (core, max) = if core > max {
+            tracing::warn!("{ENV_CORE}={core} > {ENV_MAX}={max}; clamping core to max");
+            (max, max)
+        } else {
+            (core, max)
+        };
+        Self::new(
+            core,
+            max,
+            num(ENV_QUEUE_CAP, DEFAULT_QUEUE_CAP),
+            Duration::from_millis(num(ENV_BORROW_TIMEOUT_MS, DEFAULT_BORROW_TIMEOUT_MS) as u64),
+        )
+    }
+
+    /// 提交一个构建任务（worker 内借缓冲 → 跑 → RAII 还）。
+    /// `Err(RejectedTask)` = 提交侧拒绝（队列满/shutdown），任务原样退还，
+    /// 不 panic；调用方应内联补位（CallerRuns 等价）。
+    pub fn submit(
+        &self,
+        f: impl FnOnce(&mut Vec<u8>) + Send + 'static,
+    ) -> Result<(), RejectedTask> {
+        self.pool.submit(f)
+    }
+
+    /// 停机面：停止接收新任务 → 排空已入队任务 → 等 worker 退役。幂等。
+    pub fn shutdown_join(&self) {
+        self.pool.threads().shutdown();
+        self.pool.threads().join();
     }
 }
 

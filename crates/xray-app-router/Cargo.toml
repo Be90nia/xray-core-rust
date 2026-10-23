@@ -10,6 +10,9 @@ xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
 xray-geodata = { path = "../xray-geodata" }
 xray-proto = { path = "../xray-proto" }
+# P3-5 互喂：启动期/热更期路由 matcher 构建走 udf PooledThreadPool（pool 默认
+# feature 连带 memgov；发布名 udf-skeleton-infra，lib 名 skeleton_infra）。
+udf-skeleton-infra = { path = "../udf-frame/skeleton-infra" }
 
 thiserror = { workspace = true }
 tokio = { workspace = true }

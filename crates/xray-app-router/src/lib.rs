@@ -53,7 +53,7 @@ pub mod weight;
 pub use balancing::{
     Balancer, BalancingStrategy, MemoryObservationProvider, RoundRobinStrategy, SimpleSelector,
 };
-pub use condition::Condition;
+pub use condition::{Condition, RouterBuildPool};
 pub use config::DomainStrategy;
 pub use context::{RoutingContext, RoutingData};
 pub use error::RouterError;
