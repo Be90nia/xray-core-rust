@@ -23,9 +23,19 @@ tracing = { workspace = true }
 # udf-skeleton-infra（log feature → tracing-log）在树内；直接依赖仅为引用
 # log::LevelFilter 类型（logging::init_from_env 签名），零新第三方引入。
 log = "0.4"
+# P1-1 缓冲池接缝：payload 面（bytes::BytesMut，拍板②）+ xray-buf 适配
+#（alloc/release 原样调用、外侧记账——分配路径零改动，坑约束 12）。
+bytes = { workspace = true }
+xray-buf = { path = "../xray-buf" }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+# pool_isolation：裸 xray_buf 同参对照 + PluginContext 组装配方
+#（FxScope/Clock/MockEnv）+ 配置字面量。
+xray-buf = { path = "../xray-buf" }
+udf-skeleton = { path = "../udf-frame/skeleton" }
+udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio"] }
+serde_json = { workspace = true }
 
 [lints.clippy]
 # disallowed_methods 旧形态属 restriction 组（默认 allow）；本仓工具链

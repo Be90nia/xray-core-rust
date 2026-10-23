@@ -21,7 +21,7 @@ use skeleton::{
 use skeleton_infra::fx::{CancelToken, FxScope, ScopeClosed, Spawned};
 use std_ext::{hash::stable64, id::IdGen};
 
-use crate::{error::PluginError, logging::LogFacade};
+use crate::{error::PluginError, logging::LogFacade, pool::BufferPool};
 
 /// 进程指纹派生（PM 拍板 2026-10-23）：有主监听地址 → `stable64(地址串)`；
 /// 无地址 → `stable64(pid-启动时刻纳秒)`。指纹需进程内唯一且可复现
@@ -73,6 +73,9 @@ pub struct PluginContext {
     /// 全局配置值面（段路由底座）。
     config_root: serde_json::Value,
     log: LogFacade,
+    /// 缓冲池能力句柄（P1-1 Context 扩容件）：装配根经 `set_pool` 接线；
+    /// 缺省未接线 → `pool()` fail-visible panic（装配门 L5 语义）。
+    pool: Option<Arc<dyn BufferPool>>,
     /// 擦除登记表（原型 xray-core/src/instance.rs:60 feature_typed）。
     handlers: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
 }
@@ -97,6 +100,7 @@ impl PluginContext {
             env,
             config_root,
             log,
+            pool: None,
             handlers: HashMap::new(),
         }
     }
@@ -173,6 +177,29 @@ impl PluginContext {
             section.get("settings").and_then(|s| s.as_object()).or_else(|| section.as_object());
         let combined = SectionEnv { section: kv, fallback: &*self.env };
         port.load(&combined).map_err(PluginError::Config)
+    }
+
+    // ── 缓冲池（坑约束 4/9 唯一取池口；P1-1 Context 扩容件）──
+    /// 装配根接线点：装配时注入调好参的池（`ManagedBufferPool<XrayBufPool>`
+    /// 或等价 `BufferPool` 实现）；构造后、插件 `build` 前调用。
+    pub fn set_pool(&mut self, pool: Arc<dyn BufferPool>) {
+        self.pool = Some(pool);
+    }
+
+    /// 缓冲池能力句柄（坑约束 4：插件只经此取池，裸 `xray_buf::alloc` 由
+    /// P2 批次 per-crate clippy.toml `disallowed-methods` 拦——规范源 §2.3 第 10 条）。
+    ///
+    /// # Panics
+    ///
+    /// 装配根未接线（`set_pool` 未调）→ fail-visible panic（装配门 L5：
+    /// 能力缺失启动期炸，禁运行期静默）。
+    pub fn pool(&self) -> &dyn BufferPool {
+        self.pool.as_deref().unwrap_or_else(|| {
+            panic!(
+                "pool capability not wired: assembler must set_pool before plugins build (plugin {})",
+                self.plugin_name
+            )
+        })
     }
 
     // ── handler 登记面（缺口 #6；插件层产出 → 查表分发的登记半边）──

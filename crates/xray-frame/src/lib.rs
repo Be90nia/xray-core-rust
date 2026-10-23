@@ -11,7 +11,8 @@
 //! 模块挂载。P0-1..P0-8 均已落（plugin/error/context/logging/registry/lifecycle
 //! 及 assembly 装配组合根：register→build(ctx)→bring_up→shutdown 三段式 +
 //! P0-8 装配门：deps 拓扑校验、per-plugin ctx 路由、停机超时接线）；
-//! 后续为 P1 通用件。
+//! P1 通用件已起步：P1-1 pool（缓冲池接缝 + xray-buf 外侧适配 + PoolBase
+//! 管理面白拿，分配路径零改动）。
 
 /// 契约层词汇直呼（继承面 A 类：`use skeleton::`——包名 udf-skeleton 的 lib 名）。
 pub use skeleton::EffectId;
@@ -25,6 +26,7 @@ pub mod error;
 pub mod lifecycle;
 pub mod logging;
 pub mod plugin;
+pub mod pool;
 pub mod registry;
 
 pub use assembly::{Framework, FrameworkBuilder, FrameworkOptions};
@@ -33,6 +35,7 @@ pub use error::{LifecyclePhase, PluginError};
 pub use lifecycle::{Phase, StartedPlugins, bring_up};
 pub use logging::{LogFacade, init_from_env};
 pub use plugin::{ClauseId, Lifecycle, Plugin, PluginContract, PluginDep};
+pub use pool::{BufferPool, ManagedBufferPool, PoolError, PooledBuffer, XrayBufPool};
 pub use registry::PluginRegistry;
 
 #[cfg(test)]
