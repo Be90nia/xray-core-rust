@@ -25,6 +25,12 @@
 //! [`assert_log_fields`](crate::assert_log_fields)（坑约束 3/10/11：target
 //! 前缀 + 四元组 + secrets 掩码）、[`assert_pool_discipline`](crate::assert_pool_discipline)
 //! （坑约束 4/9：借 N 还 N 配平）。正/负用例见 `tests/l4_fixtures.rs`。
+//!
+//! **默认构造确定性**：[`contract_test_context`] 用固定指纹
+//! [`DETERMINISTIC_FINGERPRINT`] + MockClock 冻结于 ms=1——`next_conn_id()`
+//! 连发恒不撞 IdGen 同毫秒 fail-closed 配额臂（每毫秒配额 ≈2553 个），序列
+//! 跨运行逐位可回放。调用方 crate **不要**再写 catch_unwind 重掷指纹的重试
+//! helper；自定义时钟/指纹走 [`contract_test_context_with`]。
 
 use std::{
     future::Future,
@@ -33,30 +39,53 @@ use std::{
 };
 
 use skeleton::{
-    clock::{Clock, SystemClock},
+    clock::{Clock, MockClock, SystemClock},
     config::StdEnv,
     pool::PoolMetrics,
 };
 use skeleton_infra::fx::FxScope;
 
 use crate::{
-    context::{PluginContext, derive_fingerprint},
+    context::PluginContext,
     deadline::{HandshakeDeadline, with_deadline},
     logging::LogFacade,
     plugin::{Plugin, PluginContract},
     pool::{BufferPool, ManagedBufferPool},
 };
 
-/// 宏辅助：构造 lifecycle 三相调用可用的最小 [`PluginContext`]（空配置根——
-/// 三相本体契约上不消费段数据；段路由/配置解析走 build 期，不在此覆盖）。
+/// 夹具默认指纹（确定性拍板）：counter 基址 = `(0xC0FFEE >> 13) & 0xFFF` =
+/// 0x607 = 1543 → 每毫秒 id 配额 4096 − 1543 ≈ **2553 个**，`assert_conn_id_present!`
+/// 的 n 连发（乃至多测试并行累计）恒不撞 IdGen 同毫秒 fail-closed 配额臂。
+/// 协议 crate 侧无需知道本值；需要自定指纹时走
+/// [`contract_test_context_with`]。
 #[doc(hidden)]
-pub fn contract_test_context(plugin_name: &'static str) -> PluginContext {
-    contract_test_context_with(plugin_name, Arc::new(SystemClock), derive_fingerprint(None))
+pub const DETERMINISTIC_FINGERPRINT: u64 = 0xC0FFEE;
+
+/// 夹具默认时钟起点（确定性拍板）：MockClock 推进到 ms=1——首调即走 IdGen
+/// 跨毫秒臂（counter 满额重置），时间戳字段非零，跨运行逐位可回放。
+fn deterministic_test_clock() -> Arc<dyn Clock> {
+    let clock = MockClock::new();
+    clock.advance(Duration::from_millis(1));
+    Arc::new(clock)
 }
 
-/// 宏辅助：[`contract_test_context`] 的确定性变体——注入时钟与固定指纹
-/// （conn_id 夹具用：MockClock 冻结时间线 + 固定指纹 → 序列可回放；指纹须
-/// 避开 IdGen counter 基址 0xFFF 的同毫秒 fail-closed 臂，见 `std_ext::id`）。
+/// 宏辅助：构造 lifecycle 三相调用可用的最小 [`PluginContext`]（空配置根——
+/// 三相本体契约上不消费段数据；段路由/配置解析走 build 期，不在此覆盖）。
+///
+/// **默认构造是确定性的**（固定指纹 [`DETERMINISTIC_FINGERPRINT`] + MockClock
+/// 冻结于 ms=1）：`next_conn_id()` 连发 N=64（及远超此数）恒不撞 IdGen 同毫秒
+/// 配额臂，跨运行序列逐位可回放。**不要在调用方 crate 里写重试/catch_unwind
+/// 重掷指纹的 helper**——配额风险已在构造侧消除；确需自定义时钟/指纹时改用
+/// [`contract_test_context_with`]。
+#[doc(hidden)]
+pub fn contract_test_context(plugin_name: &'static str) -> PluginContext {
+    contract_test_context_with(plugin_name, deterministic_test_clock(), DETERMINISTIC_FINGERPRINT)
+}
+
+/// 宏辅助：显式口子——自定义时钟与指纹（例如需要推进时钟验证跨毫秒序列、
+/// 或复用生产指纹）。不传本变体即得确定性默认构造（见
+/// [`contract_test_context`]）；指纹须避开 IdGen counter 基址 0xFFF 邻域的
+/// 同毫秒 fail-closed 臂（见 `std_ext::id`）。
 #[doc(hidden)]
 pub fn contract_test_context_with(
     plugin_name: &'static str,

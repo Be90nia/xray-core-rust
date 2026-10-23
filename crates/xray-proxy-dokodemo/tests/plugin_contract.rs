@@ -171,3 +171,67 @@ fn tproxy_gate_is_runtime_semantics_not_compiled_away() {
         assert!(err.to_string().contains("!linux"), "实际: {err}");
     }
 }
+
+// ── L4 行为夹具接线（P1-L4：每协议 crate 必调，缺=CI 红）──
+// 按 contract() 声明面（src/plugin.rs DOKODEMO_CLAUSES / DOKODEMO_NOT_APPLICABLE）：
+// 跑 conn_id(3) / log(10) / pool(4)；跳过 deadline(2)——dokodemo 无协议握手
+// （连接建立即按 rewrite/followRedirect 目标转发，无首包 deadline 面）；
+// log(11) N/A → secrets 表传空（仍断 target/四元组）。
+
+/// 夹具一（坑约束 3）：conn_id 非零/唯一/单调——无例外条款。
+///
+/// 执行面：`contract_test_context` 的指纹随进程掷点（`derive_fingerprint(None)`），
+/// 基址落 0xFFF 邻域时同毫秒 64 连发会撞 IdGen fail-closed 配额臂（约 1.5%/掷点，
+/// panic 消息含「配额耗尽」）——夹具整体在 catch_unwind 内彩排，撞配额臂则重掷
+/// 指纹重跑（8 连败联合概率 ~1e-15），其余 panic 原样上抛。成功返回 = 宏断言在
+/// 本 ctx 上真实执行且通过。
+fn l4_run_conn_id_fixture(plugin: &'static str) {
+    use std::any::Any;
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+
+    let mut last: Option<Box<dyn Any + Send>> = None;
+    for _ in 0..8 {
+        let ctx = xray_frame::contract_assert::contract_test_context(plugin);
+        match catch_unwind(AssertUnwindSafe(|| xray_frame::assert_conn_id_present!(ctx, 64))) {
+            Ok(()) => return,
+            Err(payload) => {
+                let quota = payload.downcast_ref::<String>().is_some_and(|m| m.contains("配额耗尽"))
+                    || payload
+                        .downcast_ref::<&'static str>()
+                        .is_some_and(|m| m.contains("配额耗尽"));
+                if !quota {
+                    resume_unwind(payload);
+                }
+                last = Some(payload);
+            }
+        }
+    }
+    resume_unwind(last.expect("重掷循环至少记录一次失败 payload"));
+}
+
+#[test]
+fn l4_conn_id_present() {
+    l4_run_conn_id_fixture("dokodemo-door");
+}
+
+/// 夹具三（坑约束 10；11 N/A → secrets 表传空）：target 前缀
+/// `xray_frame::dokodemo-door` + conn_id/stage/peer/dest 四元组齐全。
+/// 无认证凭据/密钥面，无掩码断言项。
+#[test]
+fn l4_log_fields() {
+    xray_frame::assert_log_fields!(
+        domain: "dokodemo-door",
+        conn_id: 0x1234u128,
+        stage: "Accept",
+        peer: "203.0.113.7:443",
+        dest: "example.com:80",
+    );
+}
+
+/// 夹具四（坑约束 4/9）：借 N 还 N → PoolMetrics 配平（borrowed=0 且零溢出丢弃）。
+/// 条款 4 适用（PM 拍板 2026-10-24：转发数据面走 buf，受 BufferPool 接缝约束）。
+#[test]
+fn l4_pool_discipline() {
+    let pool = xray_frame::pool::ManagedBufferPool::new(xray_frame::pool::XrayBufPool::new(8, 8), 8, 8);
+    xray_frame::assert_pool_discipline!(pool, 4);
+}

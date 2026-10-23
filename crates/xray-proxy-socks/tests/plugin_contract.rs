@@ -140,3 +140,71 @@ async fn inbound_handler_produced_by_plugin() {
 
     framework.shutdown().await;
 }
+
+// ── L4 行为夹具接线（P1-L4：每协议 crate 必调，缺=CI 红）──
+// 按 contract() 声明面（src/plugin.rs SOCKS_CLAUSES，12 条全适用）：
+// 跑 conn_id(3) / deadline(2) / log(10,11) / pool(4)，无跳过项。
+
+/// 夹具一（坑约束 3）：conn_id 非零/唯一/单调——无例外条款。
+///
+/// 执行面：`contract_test_context` 的指纹随进程掷点（`derive_fingerprint(None)`），
+/// 基址落 0xFFF 邻域时同毫秒 64 连发会撞 IdGen fail-closed 配额臂（约 1.5%/掷点，
+/// panic 消息含「配额耗尽」）——夹具整体在 catch_unwind 内彩排，撞配额臂则重掷
+/// 指纹重跑（8 连败联合概率 ~1e-15），其余 panic 原样上抛。成功返回 = 宏断言在
+/// 本 ctx 上真实执行且通过。
+fn l4_run_conn_id_fixture(plugin: &'static str) {
+    use std::any::Any;
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+
+    let mut last: Option<Box<dyn Any + Send>> = None;
+    for _ in 0..8 {
+        let ctx = xray_frame::contract_assert::contract_test_context(plugin);
+        match catch_unwind(AssertUnwindSafe(|| xray_frame::assert_conn_id_present!(ctx, 64))) {
+            Ok(()) => return,
+            Err(payload) => {
+                let quota = payload.downcast_ref::<String>().is_some_and(|m| m.contains("配额耗尽"))
+                    || payload
+                        .downcast_ref::<&'static str>()
+                        .is_some_and(|m| m.contains("配额耗尽"));
+                if !quota {
+                    resume_unwind(payload);
+                }
+                last = Some(payload);
+            }
+        }
+    }
+    resume_unwind(last.expect("重掷循环至少记录一次失败 payload"));
+}
+
+#[test]
+fn l4_conn_id_present() {
+    l4_run_conn_id_fixture("socks");
+}
+
+/// 夹具二（坑约束 2）：deadline 双入口（with_deadline / HandshakeDeadline::guard）
+/// 期限内 Ok、永不完成 Err(Elapsed) 且真超时。d 钉 100ms 上限（CI 慢机安全）。
+#[tokio::test]
+async fn l4_deadline_effective() {
+    xray_frame::assert_deadline_effective!(std::time::Duration::from_millis(100), || async {}).await;
+}
+
+/// 夹具三（坑约束 10/11）：target 前缀 `xray_frame::socks` + conn_id/stage/
+/// peer/dest 四元组齐全 + secrets 掩码（条款 11 适用 → 表传真实形态凭据样例）。
+#[test]
+fn l4_log_fields() {
+    xray_frame::assert_log_fields!(
+        domain: "socks",
+        conn_id: 0x1234u128,
+        stage: "Accept",
+        peer: "203.0.113.7:443",
+        dest: "example.com:80",
+        secrets: ["socks-credential-sample"],
+    );
+}
+
+/// 夹具四（坑约束 4/9）：借 N 还 N → PoolMetrics 配平（borrowed=0 且零溢出丢弃）。
+#[test]
+fn l4_pool_discipline() {
+    let pool = xray_frame::pool::ManagedBufferPool::new(xray_frame::pool::XrayBufPool::new(8, 8), 8, 8);
+    xray_frame::assert_pool_discipline!(pool, 4);
+}

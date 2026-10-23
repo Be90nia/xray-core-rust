@@ -186,3 +186,57 @@ fn observface_before_build_fails_visible() {
     assert!(plugin.built_outbound().is_err());
     assert!(plugin.dial_fn().is_err());
 }
+
+// ── L4 行为夹具（P1-L4：声明面之外的「跑起来验证」；对照 contract() 声明
+// ——vmess 12 条全适用 → 四夹具全接）──
+
+/// 夹具一 conn_id（坑约束 3 / ConnIdPresent）：宏形取单枚验非零；唯一/单调
+/// 面用逐 id 跨毫秒 drip——协议 crate 不直依赖 skeleton，无法注入固定指纹，
+/// `contract_test_context` 随机指纹下宏形 n 连取有 (n−1)/4096 同毫秒配额
+/// fail-closed flake（std_ext::id：每毫秒配额 = 4096 − 基址，基址随机）；
+/// 逐毫秒领取配额下界恒 1 = 零 flake（挂钟回拨走停走 armor，保序不变）。
+#[test]
+fn l4_behavior_conn_id_present_unique_monotonic() {
+    let ctx = xray_frame::contract_assert::contract_test_context("vmess");
+    xray_frame::assert_conn_id_present!(ctx, 1);
+    let ids: Vec<u128> = (0..8)
+        .map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            ctx.next_conn_id()
+        })
+        .collect();
+    xray_frame::contract_assert::assert_conn_id_sequence("vmess", ids);
+}
+
+/// 夹具二 deadline（坑约束 2 / HandshakeDeadline）：双入口期限内 Ok +
+/// pending 任务掐断 Err(Elapsed) 真超时（d = 100ms 派单上限）。
+#[tokio::test]
+async fn l4_behavior_deadline_effective() {
+    xray_frame::assert_deadline_effective!(std::time::Duration::from_millis(100), || async {
+        tokio::task::yield_now().await;
+    })
+    .await;
+}
+
+/// 夹具三 日志字段（坑约束 3/10/11 / LogDiscipline + SecretMasking）：log 域
+/// 约定 = 插件名 → target = xray_frame::vmess，四元组齐全 + secrets 掩码。
+#[test]
+fn l4_behavior_log_fields_quadruple_masked() {
+    xray_frame::assert_log_fields!(
+        domain: "vmess",
+        conn_id: 0x1234u128,
+        stage: "Handshake",
+        peer: "203.0.113.7:443",
+        dest: "example.com:80",
+        secrets: ["vmess-uuid-redacted"]
+    );
+}
+
+/// 夹具四 池纪律（坑约束 4/9 / PoolDiscipline）：借 4 还 4 终态配平
+/// （borrowed = 0 且零溢出丢弃）。
+#[test]
+fn l4_behavior_pool_discipline_balances() {
+    let pool =
+        xray_frame::pool::ManagedBufferPool::new(xray_frame::pool::XrayBufPool::new(8, 8), 8, 8);
+    xray_frame::assert_pool_discipline!(pool, 4);
+}

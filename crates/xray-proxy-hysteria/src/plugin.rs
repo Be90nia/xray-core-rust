@@ -14,8 +14,7 @@
 //! （QUIC stream/datagram pump 桥）、`inbound.rs` / `outbound.rs`（两 Handler）、
 //! `config.rs`（配置类型）一行不动。插件只做配置注入与构建接缝：
 //! - 入站面：settings → [`HysteriaInboundConfig`]（既有构造 + 既有 `validate`）；
-//! - 出站面：settings → [`HysteriaConfig`] （既有构造 + 既有
-//!   `validate`）；
+//! - 出站面：settings → [`HysteriaConfig`] （既有构造 + 既有 `validate`）；
 //! - handler 产出需运行期句柄（QUIC transport / listener factory / dispatcher）， build
 //!   期不可得——由装配侧携句柄调用 [`outbound_handler`](HysteriaPlugin::outbound_handler) /
 //!   [`inbound_handler`](HysteriaPlugin::inbound_handler)（P3 入口收口接线； 句柄借用纪律见

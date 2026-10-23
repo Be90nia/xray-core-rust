@@ -190,3 +190,60 @@ impl DispatchHandler for NoopDispatch {
         Box::pin(async {})
     }
 }
+
+// ── L4 行为夹具（P1-L4：声明面之外的「跑起来验证」；对照 contract() 声明
+// ——tun 10 条适用（条款 2 落定适用 → deadline 夹具接）；条款 11 N/A → log
+// 夹具不带 secrets 表。四夹具全部只验证框架缝（ctx/LogFacade/池/deadline
+// 语义件），零插件实例化、零 start()、零 OS 设备触碰（派单红线）──
+
+/// 夹具一 conn_id（坑约束 3 / ConnIdPresent）：宏形取单枚验非零；唯一/单调
+/// 面用逐 id 跨毫秒 drip——协议 crate 不直依赖 skeleton，无法注入固定指纹，
+/// `contract_test_context` 随机指纹下宏形 n 连取有 (n−1)/4096 同毫秒配额
+/// fail-closed flake（std_ext::id：每毫秒配额 = 4096 − 基址，基址随机）；
+/// 逐毫秒领取配额下界恒 1 = 零 flake（挂钟回拨走停走 armor，保序不变）。
+#[test]
+fn l4_behavior_conn_id_present_unique_monotonic() {
+    let ctx = xray_frame::contract_assert::contract_test_context("tun");
+    xray_frame::assert_conn_id_present!(ctx, 1);
+    let ids: Vec<u128> = (0..8)
+        .map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            ctx.next_conn_id()
+        })
+        .collect();
+    xray_frame::contract_assert::assert_conn_id_sequence("tun", ids);
+}
+
+/// 夹具二 deadline（坑约束 2 / HandshakeDeadline，条款 2 适用：smoltcp
+/// netstack 三次握手内聚存在）：双入口期限内 Ok + pending 任务掐断
+/// Err(Elapsed) 真超时（d = 100ms 派单上限）。夹具自造 work，不触设备。
+#[tokio::test]
+async fn l4_behavior_deadline_effective() {
+    xray_frame::assert_deadline_effective!(std::time::Duration::from_millis(100), || async {
+        tokio::task::yield_now().await;
+    })
+    .await;
+}
+
+/// 夹具三 日志字段（坑约束 3/10 / LogDiscipline）：log 域约定 = 插件名 →
+/// target = xray_frame::tun，四元组齐全；不带 secrets 表——条款 11
+/// （SecretMasking）N/A（plugin.rs：「TUN 无密钥材料」）。
+#[test]
+fn l4_behavior_log_fields_quadruple() {
+    xray_frame::assert_log_fields!(
+        domain: "tun",
+        conn_id: 0x1234u128,
+        stage: "Accept",
+        peer: "203.0.113.7:443",
+        dest: "example.com:80",
+    );
+}
+
+/// 夹具四 池纪律（坑约束 4/9 / PoolDiscipline，判据 = inbound.rs:71 xray-buf
+/// io 接缝）：借 4 还 4 终态配平（borrowed = 0 且零溢出丢弃）。
+#[test]
+fn l4_behavior_pool_discipline_balances() {
+    let pool =
+        xray_frame::pool::ManagedBufferPool::new(xray_frame::pool::XrayBufPool::new(8, 8), 8, 8);
+    xray_frame::assert_pool_discipline!(pool, 4);
+}

@@ -17,29 +17,36 @@ use xray_frame::{
     assert_conn_id_present, assert_deadline_effective, assert_log_fields, assert_pool_discipline,
     context::PluginContext,
     contract_assert::{
-        CapturedLog, assert_conn_id_sequence, assert_log_fields_emitted,
-        assert_log_fields_in_captures, assert_pool_settled, contract_test_context_with,
+        CapturedLog, DETERMINISTIC_FINGERPRINT, assert_conn_id_sequence, assert_log_fields_emitted,
+        assert_log_fields_in_captures, assert_pool_settled, contract_test_context,
+        contract_test_context_with,
     },
     pool::{BufferPool, ManagedBufferPool, XrayBufPool},
 };
 
-/// conn_id 固定指纹：counter 基址 = (FP >> 13) & 0xFFF = 0x607 ≠ 0xFFF——
-/// 避开 IdGen「基址即配额」的同毫秒 fail-closed 臂（`std_ext::id` 文档）。
-const FINGERPRINT: u64 = 0xC0FFEE;
-
-/// MockClock + 固定指纹的最小 ctx（conn_id 确定性序列；同指纹进程级注册表
-/// 跨测试共享权威——各测试序列内严格递增的断言不受影响）。
+/// MockClock + 夹具默认指纹的最小 ctx（显式口子路径：需要时钟句柄推进时间线
+/// 时用本 helper；不需要推进时钟就直接 `contract_test_context`）。
 fn mock_ctx(plugin: &'static str) -> (Arc<MockClock>, PluginContext) {
     let clock = Arc::new(MockClock::new());
+    clock.advance(Duration::from_millis(1)); // 对齐默认构造起点：首调走跨毫秒臂
     let ctx = contract_test_context_with(
         plugin,
         clock.clone() as Arc<dyn skeleton::clock::Clock>,
-        FINGERPRINT,
+        DETERMINISTIC_FINGERPRINT,
     );
     (clock, ctx)
 }
 
 // ── 夹具一：conn_id ──
+
+/// 正（PM 回归点）：**默认构造**直接连取 64 个 id 不 panic——固定指纹 +
+/// MockClock ms=1 起点已把同毫秒配额风险从构造侧消除，调用方 crate 不需要
+/// 也不应写 catch_unwind 重掷指纹的重试 helper。
+#[test]
+fn default_context_takes_64_ids_without_panic() {
+    let ctx = contract_test_context("l4-default-ctx");
+    assert_conn_id_present!(ctx, 64);
+}
 
 /// 正：宏从 ctx 连续取 64 个 id，全部非零且严格递增（唯一性蕴含）。
 #[test]

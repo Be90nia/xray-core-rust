@@ -208,3 +208,53 @@ async fn handlers_produced_by_plugin() {
 
     framework.shutdown().await;
 }
+
+// ── L4 行为夹具（P1-L4：声明面之外的「跑起来验证」；对照 contract() 声明
+// ——dns 9 条适用（3,4,5,6,7,8,9,10,12）；条款 2 N/A → deadline 夹具按声明
+// 跳过；条款 11 N/A → log 夹具不带 secrets 表）──
+
+/// 夹具一 conn_id（坑约束 3 / ConnIdPresent）：宏形取单枚验非零；唯一/单调
+/// 面用逐 id 跨毫秒 drip——协议 crate 不直依赖 skeleton，无法注入固定指纹，
+/// `contract_test_context` 随机指纹下宏形 n 连取有 (n−1)/4096 同毫秒配额
+/// fail-closed flake（std_ext::id：每毫秒配额 = 4096 − 基址，基址随机）；
+/// 逐毫秒领取配额下界恒 1 = 零 flake（挂钟回拨走停走 armor，保序不变）。
+#[test]
+fn l4_behavior_conn_id_present_unique_monotonic() {
+    let ctx = xray_frame::contract_assert::contract_test_context("dns");
+    xray_frame::assert_conn_id_present!(ctx, 1);
+    let ids: Vec<u128> = (0..8)
+        .map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            ctx.next_conn_id()
+        })
+        .collect();
+    xray_frame::contract_assert::assert_conn_id_sequence("dns", ids);
+}
+
+// 夹具二 deadline：**按声明跳过**——条款 2（HandshakeDeadline）N/A（
+// plugin.rs DNS_NOT_APPLICABLE：「DNS 无会话握手：UDP 单包查询、TCP 2B
+// 长度帧直读，无协商轮次与首包 deadline 面」）。声明与夹具矛盾时按派单
+// 约束两侧都不改，仅记录跳过。
+
+/// 夹具三 日志字段（坑约束 3/10 / LogDiscipline）：log 域约定 = 插件名 →
+/// target = xray_frame::dns，四元组齐全；不带 secrets 表——条款 11
+/// （SecretMasking）N/A（plugin.rs：「DNS 无密钥材料」）。
+#[test]
+fn l4_behavior_log_fields_quadruple() {
+    xray_frame::assert_log_fields!(
+        domain: "dns",
+        conn_id: 0x1234u128,
+        stage: "Accept",
+        peer: "203.0.113.7:443",
+        dest: "example.com:80",
+    );
+}
+
+/// 夹具四 池纪律（坑约束 4/9 / PoolDiscipline）：借 4 还 4 终态配平
+/// （borrowed = 0 且零溢出丢弃）。
+#[test]
+fn l4_behavior_pool_discipline_balances() {
+    let pool =
+        xray_frame::pool::ManagedBufferPool::new(xray_frame::pool::XrayBufPool::new(8, 8), 8, 8);
+    xray_frame::assert_pool_discipline!(pool, 4);
+}
