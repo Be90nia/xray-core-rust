@@ -28,7 +28,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      # 不能用 `cargo fmt --all`：它会把 crates/udf-frame（workspace excluded 的
+      # path 依赖，CI 拉的是上游 main 最新）也纳入格式化面，排版责任属上游仓、
+      # 且本仓 rustfmt.toml 会覆盖其排版 → 恒红。按 workspace 成员逐个检查
+      # （metadata --no-deps 只列成员，天然排除 udf-*）。
+      - name: Format check (workspace members)
+        run: |
+          set -euo pipefail
+          for c in $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name'); do
+            cargo fmt -p "$c" -- --check
+          done
 
   # Clippy 静态分析
   clippy:
