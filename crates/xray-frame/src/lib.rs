@@ -24,12 +24,17 @@ pub use skeleton::EffectId;
 // L2 能力句柄（context）+ 装配日志唯一入口（logging）+ 插件注册表（registry）+
 // 生命周期三相编排（lifecycle）+ 装配组合根（assembly）。
 pub mod assembly;
+// P3-2 per-plugin 配置段路由（坑约束 7）：PluginConfig::section 无实例段路由 +
+// build_plugins_from_config 配置驱动选择性 build。
+pub mod config;
 // L4 契约测试夹具（P1-7 A 块）：assert_plugin_contract! 宏 + #[doc(hidden)]
 // 最小辅助面；宏经 #[macro_export] 挂根。
 pub mod context;
 pub mod contract_assert;
 // P1 即件：超时唯一入口（坑约束 2）+ 握手/空闲限时（P1-4）。
 pub mod deadline;
+// P3-1 S1 旁路查表面（dispatcher 中央 match 臂退役的查表骨架，契约 §P3-1）。
+pub mod dispatch;
 pub mod error;
 pub mod lifecycle;
 pub mod logging;
@@ -43,8 +48,10 @@ pub mod registry;
 pub mod reload;
 
 pub use assembly::{Framework, FrameworkBuilder, FrameworkOptions};
+pub use config::{PluginConfig, build_plugins_from_config};
 pub use context::{PluginContext, derive_fingerprint};
 pub use deadline::{DEFAULT_LIMIT, HandshakeDeadline, IdleDeadline, with_deadline};
+pub use dispatch::{HandlerCapability, Lookup, lookup};
 pub use error::{LifecyclePhase, PluginError};
 pub use lifecycle::{Phase, StartedPlugins, bring_up};
 pub use logging::{LogFacade, init_from_env};

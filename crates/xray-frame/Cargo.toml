@@ -17,6 +17,7 @@ udf-skeleton = { path = "../udf-frame/skeleton" }
 udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio", "log"] }
 udf-std-ext = { path = "../udf-frame/std-ext" }
 tokio = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 # B6 取证（2026-10-23 `cargo tree -p xray-frame -i log`）：log v0.4.33 已经

@@ -227,7 +227,11 @@ impl FrameworkBuilder {
 /// build 阶段装甲：`Err` 原样上抛（同 bring_up 的 ctx 构建失败语义——插件错误
 /// 自带归属，不重包）；panic 提取 payload 转 `Other`（坑约束 #8 不逃逸）。
 /// 不复用 `lifecycle::guarded`：其 `LifecyclePhase` 无 build 相，冻结面只消费。
-fn guarded_build(plugin: &Arc<dyn Plugin>, ctx: &mut PluginContext) -> Result<(), PluginError> {
+/// `pub(crate)`：P3-2 config.rs 的配置驱动 build 复用同一装甲（不造第二份）。
+pub(crate) fn guarded_build(
+    plugin: &Arc<dyn Plugin>,
+    ctx: &mut PluginContext,
+) -> Result<(), PluginError> {
     let name = plugin.name();
     match catch_unwind(AssertUnwindSafe(|| plugin.build(ctx))) {
         Ok(Ok(())) => Ok(()),

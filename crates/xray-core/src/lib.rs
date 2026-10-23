@@ -51,6 +51,9 @@ pub mod instance;
 pub mod outbound;
 pub mod register;
 pub mod router;
+// P3-2 对拍测试（cfg(test)）：旧解析面 vs 插件 build 管线逐字段相等。
+#[cfg(test)]
+mod tests_config_parity;
 pub mod version;
 pub mod wiring;
 

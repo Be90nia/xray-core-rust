@@ -1560,7 +1560,8 @@ fn build_hysteria_tls_config(
 ///
 /// JSON 解析失败 / domainStrategy 未知值 / finalRules 单条非法 → 硬错
 /// （对齐 Go `FreedomConfig.Build` 解码期拒启），空 settings 走缺省。
-fn parse_freedom_config(data: &[u8]) -> std::io::Result<FreedomConfig> {
+/// `pub(crate)`：P3-2 对拍测试（tests_config_parity）跨模块消费，语义零变化。
+pub(crate) fn parse_freedom_config(data: &[u8]) -> std::io::Result<FreedomConfig> {
     #[allow(unused_imports)] // 存量清零批次
     use xray_proxy_freedom::{DomainStrategy, Fragment, Noise};
     if data.iter().all(|b| b.is_ascii_whitespace()) {
@@ -1822,7 +1823,9 @@ fn parse_freedom_noise(v: &serde_json::Value) -> Option<Noise> {
 /// - `{ "response": { "type": "http" } }` → Http403
 /// - `{ "response": { "type": "custom", "customResponseData": "<base64>" } }` → Custom （Go
 ///   :38-42：base64 标准解码，失败即 Build 硬错）
-fn parse_blackhole_response(
+///
+/// `pub(crate)`：P3-2 对拍测试（tests_config_parity）跨模块消费，语义零变化。
+pub(crate) fn parse_blackhole_response(
     data: &[u8],
 ) -> std::result::Result<xray_proxy_blackhole::ResponseConfig, String> {
     use base64::Engine as _;

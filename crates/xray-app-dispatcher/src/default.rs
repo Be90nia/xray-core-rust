@@ -1230,8 +1230,16 @@ impl DefaultDispatcher {
                 (dest.clone(), None, None)
             };
             // ---- Phase 2: Forced tag 旁路（Go default.go:443-454）----
+            // P3-1 S0：请求 tag 捕获（关 flag = 零代码）；hit 路径在链尾公共点记录，
+            // miss 路径（提前 return）在各自分支点记录。
+            #[cfg(feature = "dispatcher-dual-write")]
+            let mut dw_tag: Option<String> = None;
             let (handler, routed_pick) = if !forced_tag.as_deref().unwrap_or_default().is_empty() {
                 let tag = forced_tag.clone().unwrap_or_default();
+                #[cfg(feature = "dispatcher-dual-write")]
+                {
+                    dw_tag = Some(tag.clone());
+                }
                 match ohm.get_handler(&tag) {
                     Some(h) => {
                         tracing::debug!(tag = %tag, "taking platform initialized detour for [%final_dest]");
@@ -1240,6 +1248,8 @@ impl DefaultDispatcher {
                     None => {
                         // Go DO NOT CHANGE 注释：指定 tag 不存在时不得落到默认出站
                         tracing::error!(tag = %tag, "non existing tag for platform initialized detour");
+                        #[cfg(feature = "dispatcher-dual-write")]
+                        dual_write::record(&final_dest.to_string(), dw_tag.clone(), None);
                         outbound_writer.shutdown();
                         // outbound_reader 随 drop 关闭上行
                         return;
@@ -1287,22 +1297,39 @@ impl DefaultDispatcher {
                     ctx.route_target = Some(rt.clone());
                 }
                 match r.pick_route_resolved(&ctx).await {
-                    Ok(route) => match ohm.get_handler(&route.outbound_tag) {
-                        Some(h) => (Some(h), true),
-                        None => {
-                            // Go default.go:469-470 DO NOT CHANGE：路由指定的 outboundTag
-                            // 不存在时不得落默认出站（如 VLESS Reverse Proxy）。
-                            tracing::warn!(tag = %route.outbound_tag, "non existing outTag");
-                            outbound_writer.shutdown();
-                            // outbound_reader 随 drop 关闭上行
-                            return;
-                        },
+                    Ok(route) => {
+                        #[cfg(feature = "dispatcher-dual-write")]
+                        {
+                            dw_tag = Some(route.outbound_tag.clone());
+                        }
+                        match ohm.get_handler(&route.outbound_tag) {
+                            Some(h) => (Some(h), true),
+                            None => {
+                                // Go default.go:469-470 DO NOT CHANGE：路由指定的 outboundTag
+                                // 不存在时不得落默认出站（如 VLESS Reverse Proxy）。
+                                tracing::warn!(tag = %route.outbound_tag, "non existing outTag");
+                                #[cfg(feature = "dispatcher-dual-write")]
+                                dual_write::record(&final_dest.to_string(), dw_tag.clone(), None);
+                                outbound_writer.shutdown();
+                                // outbound_reader 随 drop 关闭上行
+                                return;
+                            },
+                        }
                     },
                     Err(_) => (ohm.get_default_handler(), false),
                 }
             } else {
                 (ohm.get_default_handler(), false)
             };
+
+            // P3-1 S0：公共记录点——forced-hit / routed-hit / 默认出站 / 默认缺失
+            // 全经此落账（miss 分支已在各自 return 前记录，不经过此点）。
+            #[cfg(feature = "dispatcher-dual-write")]
+            dual_write::record(
+                &final_dest.to_string(),
+                dw_tag.clone(),
+                handler.as_ref().map(|h| h.tag().to_string()),
+            );
 
             let Some(handler) = handler else {
                 // 无可用出站 → Rejected（Go 此处仅 errors log 后 return，bd 4uu 扩展记录）
@@ -2029,6 +2056,139 @@ impl OutboundHandlerManager for SimpleOhm {
 
     fn get_default_handler(&self) -> Option<Arc<dyn DispatchHandler>> {
         self.default.read().clone()
+    }
+}
+
+// ═══ P3-1 S0/S2：dispatcher 双写对照面（feature `dispatcher-dual-write` 门控）═══
+// 契约源：docs/architecture/xray-frame-契约级任务书-P1P4.md §P3-1。
+// S0：旧中央 match 臂的选择半边单独可调（baseline_select）+ 生产 dispatch
+//     逐请求记录 (dest, tag, chosen_handler_tag)（dispatch_link 各结果点 hook）。
+// S1：查表面在 xray-frame（xray_frame::dispatch::lookup），旁路并存，不接线。
+// S2：双写对照——回放样本上新旧两路同时求值，差异经 compare_sample 计数
+//     （可观测），差异率必须为 0（tests/dual_write_parity.rs）。
+// S3 切查表 / S4 删旧臂不在本单。关 flag = 本模块整体不存在，生产零影响。
+#[cfg(feature = "dispatcher-dual-write")]
+pub mod dual_write {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::OutboundHandlerManager;
+
+    /// 一次 dispatch 的选择记录（S0 基线样本，契约 `(dest, tag, chosen_handler_tag)`）。
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SelectionRecord {
+        /// 嗅探后的最终目的地（`Destination` Display 形态）。
+        pub dest: String,
+        /// 请求 tag：forced tag / 路由 outboundTag；`None` = 默认出站路径。
+        pub tag: Option<String>,
+        /// 旧臂实际选中的 handler tag；`None` = 未命中（fail-visible 链路被弃）。
+        pub chosen_handler_tag: Option<String>,
+    }
+
+    static SAMPLES: AtomicU64 = AtomicU64::new(0);
+    static DIFFS: AtomicU64 = AtomicU64::new(0);
+
+    /// 记录环上限（长跑防无界增长；满后丢最旧——基线采样滑动窗语义）。
+    const RECORD_CAP: usize = 10_000;
+    static RECORDS: parking_lot::Mutex<Vec<SelectionRecord>> = parking_lot::Mutex::new(Vec::new());
+
+    /// 生产 hook（dispatch_link 各选择结果点调用）：仅追加记录，零行为影响。
+    pub(crate) fn record(dest: &str, tag: Option<String>, chosen_handler_tag: Option<String>) {
+        let mut q = RECORDS.lock();
+        if q.len() == RECORD_CAP {
+            q.remove(0);
+        }
+        q.push(SelectionRecord { dest: dest.to_string(), tag, chosen_handler_tag });
+    }
+
+    /// 排干记录（测试/巡检面；按 dest/tag 过滤归调用方——并行测试共享进程内环）。
+    pub fn take_records() -> Vec<SelectionRecord> {
+        std::mem::take(&mut *RECORDS.lock())
+    }
+
+    /// 非破坏快照（轮询等待用）：不消费环内容，读方自行按 dest/tag 过滤。
+    /// 与 [`take_records`] 的分工：轮询等待用快照（drain 会偷走并行用例的记录），
+    /// 终态断言用 drain。
+    pub fn snapshot_records() -> Vec<SelectionRecord> {
+        RECORDS.lock().clone()
+    }
+
+    /// 旧中央 match 臂的选择半边（数据面零接触，语义逐条对位 dispatch_link 臂）：
+    /// - forced 非空：`get_handler` → `Chosen` | `Missing`（禁落默认，Go default.go:449-454）；
+    /// - forced 空 + route 有：`get_handler(route)` → `Chosen` | `Missing` （Go default.go:469-470
+    ///   DO NOT CHANGE）；
+    /// - forced 空 + route 无（无 router / 路由失败）：默认 handler → `Default`。
+    pub fn baseline_select(
+        ohm: &dyn OutboundHandlerManager,
+        forced_tag: Option<&str>,
+        route_tag: Option<&str>,
+    ) -> BaselineChoice {
+        if let Some(tag) = forced_tag.filter(|t| !t.is_empty()) {
+            return select_by_tag(ohm, tag);
+        }
+        if let Some(tag) = route_tag {
+            return select_by_tag(ohm, tag);
+        }
+        BaselineChoice::Default(ohm.get_default_handler().map(|h| h.tag().to_string()))
+    }
+
+    fn select_by_tag(ohm: &dyn OutboundHandlerManager, tag: &str) -> BaselineChoice {
+        match ohm.get_handler(tag) {
+            Some(h) => {
+                BaselineChoice::Chosen { tag: tag.to_string(), handler_tag: h.tag().to_string() }
+            },
+            None => BaselineChoice::Missing { tag: tag.to_string() },
+        }
+    }
+
+    /// `baseline_select` 的结果（旧臂三出口）。
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum BaselineChoice {
+        /// forced/路由 tag 命中。
+        Chosen {
+            /// 请求 tag。
+            tag: String,
+            /// 命中 handler 自报的 tag。
+            handler_tag: String,
+        },
+        /// forced/路由 tag 未命中 → fail-visible（**不**落默认）。
+        Missing {
+            /// 请求 tag。
+            tag: String,
+        },
+        /// 默认出站（`None` = 无默认可用）。
+        Default(Option<String>),
+    }
+
+    /// S2 双写对照求值：同一样本上新旧两路各自算出的选中 handler tag 比对。
+    /// 返回是否差异；差异计数可观测（[`diff_count`]），差异即 `tracing::error!`
+    /// 留痕（禁静默吞）。测试/回放驱动；S3 切查表后同签名升生产 in-vivo 面。
+    pub fn compare_sample(
+        requested_tag: &str,
+        old_chosen: Option<&str>,
+        new_chosen: Option<&str>,
+    ) -> bool {
+        SAMPLES.fetch_add(1, Ordering::Relaxed);
+        let diff = old_chosen != new_chosen;
+        if diff {
+            DIFFS.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                tag = %requested_tag,
+                old = ?old_chosen,
+                new = ?new_chosen,
+                "dual-write parity DIFF"
+            );
+        }
+        diff
+    }
+
+    /// 已对照样本数。
+    pub fn sample_count() -> u64 {
+        SAMPLES.load(Ordering::Relaxed)
+    }
+
+    /// 累计差异数（S2 验收指标：回放样本上必须为 0）。
+    pub fn diff_count() -> u64 {
+        DIFFS.load(Ordering::Relaxed)
     }
 }
 
@@ -4379,6 +4539,197 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(default_hit.lock().is_none(), "must not fall back to default outbound");
         drop(up_w);
+    }
+
+    // ═══ P3-1 S0：双写对照基线的 in-vivo 记录验证（feature 门控）═══
+    // 全局记录环被并行测试共享：各用例先 take_records 排干、用独占 dest 过滤。
+
+    /// forced 命中 + 无 router 默认路径：两路 dispatch 各落一条
+    /// `(dest, tag, chosen_handler_tag)`（公共记录点覆盖 hit/default 两出口）。
+    #[cfg(feature = "dispatcher-dual-write")]
+    #[tokio::test]
+    async fn dual_write_records_forced_hit_and_default_paths() {
+        use xray_buf::pipe;
+        use xray_common::net::address::Address;
+
+        let called = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ohm = SimpleOhm::new();
+        ohm.set_default(Arc::new(SignalingHandler {
+            tag: "dw-direct".into(),
+            signal: Arc::clone(&called),
+        }));
+        ohm.add(
+            "dw-forced-out",
+            Arc::new(SignalingHandler { tag: "dw-forced-out".into(), signal: Arc::clone(&called) }),
+        );
+        let mut d = DefaultDispatcher::new();
+        d.init(
+            &crate::Config::default(),
+            Arc::new(ohm),
+            None,
+            xray_features::policy::Policy::default(),
+            None,
+        );
+
+        let _ = dual_write::snapshot_records(); // 预热（断言按独占 dest 过滤，陈旧记录无碍）
+
+        // dispatch①：forced 命中。
+        let dest1 = Destination::new(
+            Address::from_ipv4_bytes([10, 9, 9, 1]),
+            Port::new(47001),
+            Network::TCP,
+        );
+        let (r1, w1) = pipe::new();
+        let link1 = xray_transport::link::Link::new(
+            Box::new(r1) as Box<dyn xray_buf::io::Reader>,
+            Box::new(w1) as Box<dyn xray_buf::io::Writer>,
+        );
+        d.dispatch_link(&dest1, link1, &SniffingRequest::default(), None, Some("dw-forced-out"))
+            .expect("dispatch_link ok");
+
+        // dispatch②：无 forced 无 router → 默认出站。
+        let dest2 = Destination::new(
+            Address::from_ipv4_bytes([10, 9, 9, 2]),
+            Port::new(47002),
+            Network::TCP,
+        );
+        let (r2, w2) = pipe::new();
+        let link2 = xray_transport::link::Link::new(
+            Box::new(r2) as Box<dyn xray_buf::io::Reader>,
+            Box::new(w2) as Box<dyn xray_buf::io::Writer>,
+        );
+        d.dispatch_link(&dest2, link2, &SniffingRequest::default(), None, None)
+            .expect("dispatch_link ok");
+
+        // 两次 dispatch 的 handler 均被调 ⇒ 记录点（先于 handler.dispatch）已落账。
+        for _ in 0..100 {
+            if called.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let records = dual_write::snapshot_records();
+        let forced = records.iter().find(|rec| rec.tag.as_deref() == Some("dw-forced-out"));
+        assert_eq!(
+            forced.map(|rec| (rec.dest.as_str(), rec.chosen_handler_tag.as_deref())),
+            Some(("tcp:10.9.9.1:47001", Some("dw-forced-out"))),
+            "forced 命中记录不符：{records:?}"
+        );
+        let default = records.iter().find(|rec| rec.dest == "tcp:10.9.9.2:47002");
+        assert_eq!(
+            default.map(|rec| (rec.tag.as_deref(), rec.chosen_handler_tag.as_deref())),
+            Some((None, Some("dw-direct"))),
+            "默认路径记录不符：{records:?}"
+        );
+    }
+
+    /// 路由命中 + 路由未命中：hit 落 `(dest, route tag, handler tag)`；
+    /// miss 落 `(dest, route tag, None)` 且不产生 default 记录
+    /// （Go default.go:469-470 DO NOT CHANGE 的记录面 pin）。
+    #[cfg(feature = "dispatcher-dual-write")]
+    #[tokio::test]
+    async fn dual_write_records_routed_hit_and_miss() {
+        use xray_buf::pipe;
+        use xray_common::net::address::Address;
+
+        #[derive(Debug)]
+        struct FixedRouter(&'static str);
+        impl RoutingRouter for FixedRouter {
+            fn pick_route(&self, _ctx: &dyn RoutingContext) -> Result<Route, DispatcherError> {
+                Ok(Route::new(self.0))
+            }
+
+            fn pick_route_resolved<'a>(
+                &'a self,
+                _ctx: &'a dyn RoutingContext,
+            ) -> Pin<Box<dyn Future<Output = Result<Route, DispatcherError>> + Send + 'a>>
+            {
+                Box::pin(async move { Ok(Route::new(self.0)) })
+            }
+        }
+
+        let called = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ohm = SimpleOhm::new();
+        ohm.add(
+            "dw-proxy",
+            Arc::new(SignalingHandler { tag: "dw-proxy".into(), signal: Arc::clone(&called) }),
+        );
+        let mut d = DefaultDispatcher::new();
+        d.ohm = Some(Arc::new(ohm));
+        d.router = Some(Arc::new(FixedRouter("dw-proxy")));
+
+        let _ = dual_write::snapshot_records(); // 预热（断言按独占 tag 过滤，陈旧记录无碍）
+
+        // dispatch①：路由命中。
+        let dest1 = Destination::new(
+            Address::from_ipv4_bytes([10, 9, 9, 3]),
+            Port::new(47003),
+            Network::TCP,
+        );
+        let (r1, w1) = pipe::new();
+        let link1 = xray_transport::link::Link::new(
+            Box::new(r1) as Box<dyn xray_buf::io::Reader>,
+            Box::new(w1) as Box<dyn xray_buf::io::Writer>,
+        );
+        d.dispatch_link(&dest1, link1, &SniffingRequest::default(), None, None)
+            .expect("dispatch_link ok");
+        for _ in 0..100 {
+            if called.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // dispatch②：路由未命中（同 dest 家族不同端口过滤）。
+        d.router = Some(Arc::new(FixedRouter("dw-ghost")));
+        let dest2 = Destination::new(
+            Address::from_ipv4_bytes([10, 9, 9, 4]),
+            Port::new(47004),
+            Network::TCP,
+        );
+        let (r2, w2) = pipe::new();
+        let link2 = xray_transport::link::Link::new(
+            Box::new(r2) as Box<dyn xray_buf::io::Reader>,
+            Box::new(w2) as Box<dyn xray_buf::io::Writer>,
+        );
+        d.dispatch_link(&dest2, link2, &SniffingRequest::default(), None, None)
+            .expect("dispatch_link ok");
+        // miss 路径：record 在 shutdown 之前同步落账；spawn 任务需被调度——
+        // 有界轮询两条记录（并行测试负载下固定 sleep 会 flake；轮询上界 2s，
+        // 真不落账仍必红）。
+        let mut hit_rec = None;
+        let mut miss_rec = None;
+        for _ in 0..200 {
+            let records = dual_write::snapshot_records();
+            if hit_rec.is_none() {
+                hit_rec =
+                    records.iter().find(|rec| rec.tag.as_deref() == Some("dw-proxy")).cloned();
+            }
+            if miss_rec.is_none() {
+                miss_rec =
+                    records.iter().find(|rec| rec.tag.as_deref() == Some("dw-ghost")).cloned();
+            }
+            if hit_rec.is_some() && miss_rec.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let records_note = || format!("hit={hit_rec:?} miss={miss_rec:?}");
+        assert_eq!(
+            hit_rec.as_ref().map(|rec| (rec.dest.as_str(), rec.chosen_handler_tag.as_deref())),
+            Some(("tcp:10.9.9.3:47003", Some("dw-proxy"))),
+            "路由命中记录不符：{}",
+            records_note()
+        );
+        assert_eq!(
+            miss_rec.as_ref().map(|rec| (rec.dest.as_str(), rec.chosen_handler_tag.as_deref())),
+            Some(("tcp:10.9.9.4:47004", None)),
+            "路由未命中必须记录 chosen=None（fail-visible）：{}",
+            records_note()
+        );
     }
 
     /// set_fdns 注入（对应 Go dispatcher.fdns）。

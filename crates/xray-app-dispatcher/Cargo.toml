@@ -22,3 +22,12 @@ ring.workspace = true
 
 [dev-dependencies]
 xray-app-stats = { path = "../xray-app-stats" }
+# P3-1 S2 双写对照（tests/dual_write_parity.rs）：新旧路径比对新路 = xray-frame
+# 查表（dispatch::lookup）；仅测试面消费，生产依赖图零变化。
+xray-frame = { path = "../xray-frame" }
+
+[features]
+# P3-1 S0/S2 对照基线开关：default 关（生产路径零新增代码）；开 = dispatch_link
+# 逐请求记录 (dest, tag, chosen_handler_tag) + 旧臂选择半边单独可调 +
+# 双写对照计数面。S3 切查表 / S4 删臂另单。
+dispatcher-dual-write = []

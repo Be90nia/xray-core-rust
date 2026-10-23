@@ -223,6 +223,15 @@ impl PluginContext {
         Ok(())
     }
 
+    /// 登记面只读半边（P3-1 S1 查表 `crate::dispatch::lookup` 的取数口）：
+    /// 非消费 clone（Arc 计数 +1），register/take 语义零改动。
+    pub(crate) fn peek_handler_erased(
+        &self,
+        type_id: &TypeId,
+    ) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.handlers.get(type_id).cloned()
+    }
+
     /// 登记面消费半边：未登记/型不匹配 → `Err(Handler)`（取走即移除）。
     /// `pub(crate)`：消费边界在 P0-8 registry（同 crate）。曾为集成验收升格
     /// `pub`，覆盖迁入本文件单元测后收回（P0 审计打回项）。

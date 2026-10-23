@@ -4888,7 +4888,8 @@ async fn spawn_unix_inbound(
 /// `{"auth":"password","users":[{"user":"u","pass":"p"}],"udp":true,"userLevel":0}`。
 /// `users`/`accounts` 同义（Go 两个字段都收）；`ip`（Go `Host`，UDP relay 绑定
 /// 地址，`xray-proxy-socks` UDP ASSOCIATE 消费）解析为 proto `IPOrDomain`。
-fn parse_socks_server_config(data: &[u8]) -> std::io::Result<ServerConfig> {
+/// `pub(crate)`：P3-2 对拍测试（tests_config_parity）跨模块消费，语义零变化。
+pub(crate) fn parse_socks_server_config(data: &[u8]) -> std::io::Result<ServerConfig> {
     if data.is_empty() {
         return Ok(ServerConfig::default());
     }

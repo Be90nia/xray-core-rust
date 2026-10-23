@@ -5648,6 +5648,7 @@ dependencies = [
  "xray-buf",
  "xray-common",
  "xray-features",
+ "xray-frame",
  "xray-proto",
  "xray-transport",
  "xray-xudp",
@@ -5999,6 +6000,7 @@ dependencies = [
  "xray-conf",
  "xray-crypto",
  "xray-features",
+ "xray-frame",
  "xray-geodata",
  "xray-mux",
  "xray-proto",
@@ -6068,6 +6070,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "log",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

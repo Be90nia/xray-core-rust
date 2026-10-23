@@ -80,6 +80,8 @@ uuid = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 serde_json = { workspace = true }
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+# P3-2 对拍测试：插件 build 管线（build_plugins_from_config）vs 旧 core 解析面。
+xray-frame = { path = "../xray-frame" }
 # TUN 设备代理——仅 Linux/Android/FreeBSD 自动编译
 # macOS 不编译（需 utun 权限）；Windows 已支持（wintun.dll 放 exe 旁即用，bd cv3w/ijn7）
 [target.'cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "windows"))'.dependencies]
