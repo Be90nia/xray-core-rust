@@ -12,7 +12,8 @@
 //! 及 assembly 装配组合根：register→build(ctx)→bring_up→shutdown 三段式 +
 //! P0-8 装配门：deps 拓扑校验、per-plugin ctx 路由、停机超时接线）；
 //! P1 通用件已起步：P1-1 pool（缓冲池接缝 + xray-buf 外侧适配 + PoolBase
-//! 管理面白拿，分配路径零改动）。
+//! 管理面白拿，分配路径零改动）；P1-4 deadline（超时唯一入口即件 + 握手/
+//! 空闲限时配置面）。
 
 /// 契约层词汇直呼（继承面 A 类：`use skeleton::`——包名 udf-skeleton 的 lib 名）。
 pub use skeleton::EffectId;
@@ -22,6 +23,8 @@ pub use skeleton::EffectId;
 // 生命周期三相编排（lifecycle）+ 装配组合根（assembly）。
 pub mod assembly;
 pub mod context;
+// P1 即件：超时唯一入口（坑约束 2）+ 握手/空闲限时（P1-4）。
+pub mod deadline;
 pub mod error;
 pub mod lifecycle;
 pub mod logging;
@@ -31,6 +34,7 @@ pub mod registry;
 
 pub use assembly::{Framework, FrameworkBuilder, FrameworkOptions};
 pub use context::{PluginContext, derive_fingerprint};
+pub use deadline::{DEFAULT_LIMIT, HandshakeDeadline, IdleDeadline, with_deadline};
 pub use error::{LifecyclePhase, PluginError};
 pub use lifecycle::{Phase, StartedPlugins, bring_up};
 pub use logging::{LogFacade, init_from_env};

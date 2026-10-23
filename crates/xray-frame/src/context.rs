@@ -126,8 +126,10 @@ impl PluginContext {
     // ── 超时（能力②；坑约束 2 唯一入口）──
     /// `tokio::time::timeout` 包装；禁裸 sleep 由 P0-6 L3 拦。
     /// 返回具体类型 `Timeout<F>`（不借 `self`，任务可 'static 移交）。
+    /// P1-4：实现委托 `crate::deadline::timeout`（构造形态，语义零变化）；
+    /// 带 clock 记账的 await 形态见 `crate::deadline::with_deadline`。
     pub fn with_deadline<F: Future>(&self, fut: F, d: Duration) -> tokio::time::Timeout<F> {
-        tokio::time::timeout(d, fut)
+        crate::deadline::timeout(fut, d)
     }
 
     // ── 时钟（能力③）/ 标识（能力④）──
