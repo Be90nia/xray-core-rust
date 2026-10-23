@@ -24,3 +24,12 @@ if-addrs = { git = "https://github.com/messense/if-addrs", rev = "3cdbc8b7cfc70a
 parking_lot = { workspace = true }
 xray-buf = { path = "../xray-buf" }
 rustls = { workspace = true }
+# P1-10-b 日志分发收敛：log::Level/LevelFilter 仅是类型轴引用——log crate 已在
+# 树内（tracing 依赖），零新第三方（同 xray-frame B6 取证口径）。
+log = "0.4"
+# 分发机制单入口 = udf logx 多通道 ChannelRegistry（general/access/dns）。
+udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["log"] }
+
+[dev-dependencies]
+# 双写收敛断言需要 capture 订阅者（workspace.dependencies 已有条目）。
+tracing-subscriber = { workspace = true }

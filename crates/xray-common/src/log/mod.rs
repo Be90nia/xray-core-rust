@@ -1,11 +1,21 @@
 //! 日志基础设施
 //!
-//! 对应 Go 版本 `common/log` 包，提供日志级别、消息类型、处理器接口和全局注册表。
+//! 对应 Go 版本 `common/log` 包，提供日志级别、消息类型与全局通道注册表。
+//!
+//! 分发机制（P1-10-b）：旧 `HANDLERS` 无差别扇出 + `tracing` 双写已收敛为
+//! udf `logx::ChannelRegistry` **单入口**——general/access/dns 三固定通道，
+//! 每通道独立 sink 与 level（`channels()`/`register_channel` 装配期注册，
+//! 未注册通道 emit 静默，写失败计数可观测）。便捷入口（[`debug`]/[`info`]/
+//! [`warning`]/[`error`]）只走 general 通道一路，不再直发 tracing。
+//! Go 级别别名（[`Severity::as_str`]）与消息语义留仓不动。
 //! 带通道缓冲的通用 Logger 见 [`general_logger`]。
 
 use std::{fmt, sync::Arc};
 
-use parking_lot::RwLock;
+use skeleton_infra::logx::{Channel, ChannelError, ChannelRegistry, ChannelSink};
+
+/// general 通道落样 target（埋点规范 `xray_frame::<域>`，域 = `log`）。
+const GENERAL_TARGET: &str = "xray_frame::log";
 
 /// 日志严重级别。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -24,6 +34,17 @@ impl Severity {
             Self::Info => "info",
             Self::Warning => "warning",
             Self::Error => "error",
+        }
+    }
+
+    /// 通道扇出的级别轴（`log::Level`）；Go 级别别名 [`Self::as_str`] 不受影响。
+    fn to_log_level(self) -> log::Level {
+        match self {
+            Self::Debug => log::Level::Debug,
+            Self::Info => log::Level::Info,
+            // log 门面无 "warning"，Go 别名文案由 sink 侧还原（见 general_logger）。
+            Self::Warning => log::Level::Warn,
+            Self::Error => log::Level::Error,
         }
     }
 }
@@ -50,12 +71,6 @@ impl Message {
     }
 }
 
-/// 日志处理器 trait。
-pub trait Handler: Send + Sync {
-    /// 处理一条日志消息。
-    fn handle(&self, message: &Message);
-}
-
 /// 带时间戳的日志记录。
 #[derive(Debug, Clone)]
 pub struct Record {
@@ -72,54 +87,51 @@ impl Record {
     }
 }
 
-/// 全局处理器列表。
-static HANDLERS: std::sync::LazyLock<RwLock<Vec<Arc<dyn Handler>>>> =
-    std::sync::LazyLock::new(|| RwLock::new(Vec::new()));
+/// 全局通道注册表：general/access/dns 三固定通道的单入口分发（替代旧
+/// `HANDLERS` 无差别扇出）。未注册通道 emit 静默（udf 默认静默纪律）；
+/// 同通道重复注册 fail-visible；装配期注册一次，进程生命期使用。
+static CHANNELS: std::sync::LazyLock<ChannelRegistry> =
+    std::sync::LazyLock::new(ChannelRegistry::new);
 
-/// 注册全局日志处理器。
-pub fn register_handler(handler: Arc<dyn Handler>) {
-    HANDLERS.write().push(handler);
+/// 全局通道注册表（装配期注册 sink / 配置密钥掩码 `set_secrets` / 观测丢弃
+/// 计数 `dropped_total`）。
+pub fn channels() -> &'static ChannelRegistry {
+    &CHANNELS
 }
 
-/// 通过所有已注册的处理器记录消息。
+/// 注册全局通道 sink（同通道二次注册 = Err，fail-visible，原 sink 不动）。
+pub fn register_channel(sink: Arc<dyn ChannelSink>) -> Result<(), ChannelError> {
+    CHANNELS.register(sink)
+}
+
+/// 通过 general 通道记录消息（单入口；无双写）。
 pub fn log(message: Message) {
-    for handler in HANDLERS.read().iter() {
-        handler.handle(&message);
-    }
+    CHANNELS.emit(
+        Channel::General,
+        message.severity.to_log_level(),
+        GENERAL_TARGET,
+        &message.content,
+    );
 }
 
 /// 记录 Debug 级别日志。
 pub fn debug(content: impl Into<String>) {
-    let msg = content.into();
-    tracing::debug!("{}", msg);
-    log(Message::new(Severity::Debug, msg));
+    log(Message::new(Severity::Debug, content));
 }
 
 /// 记录 Info 级别日志。
 pub fn info(content: impl Into<String>) {
-    let msg = content.into();
-    tracing::info!("{}", msg);
-    log(Message::new(Severity::Info, msg));
+    log(Message::new(Severity::Info, content));
 }
 
 /// 记录 Warning 级别日志。
 pub fn warning(content: impl Into<String>) {
-    let msg = content.into();
-    tracing::warn!("{}", msg);
-    log(Message::new(Severity::Warning, msg));
+    log(Message::new(Severity::Warning, content));
 }
 
 /// 记录 Error 级别日志。
 pub fn error(content: impl Into<String>) {
-    let msg = content.into();
-    tracing::error!("{}", msg);
-    log(Message::new(Severity::Error, msg));
-}
-
-/// 清除所有已注册的处理器（仅用于测试）。
-#[cfg(test)]
-fn clear_handlers() {
-    HANDLERS.write().clear();
+    log(Message::new(Severity::Error, content));
 }
 
 /// 带通道缓冲的通用 Logger，对应 Go `common/log/logger.go::generalLogger`。
@@ -169,55 +181,64 @@ mod tests {
         assert!(record.timestamp.elapsed().is_ok());
     }
 
-    /// 测试用处理器，收集消息到共享向量中。
-    struct TestHandler {
-        messages: Mutex<Vec<Message>>,
+    /// 测试用通道 sink，捕获 (级别, target, 内容) 到共享向量。
+    struct TestSink {
+        channel: Channel,
+        records: Mutex<Vec<(log::Level, String, String)>>,
     }
 
-    impl TestHandler {
-        fn new() -> Self {
-            Self { messages: Mutex::new(Vec::new()) }
+    impl TestSink {
+        fn new(channel: Channel) -> Arc<Self> {
+            Arc::new(Self { channel, records: Mutex::new(Vec::new()) })
         }
 
-        fn messages(&self) -> Vec<Message> {
-            self.messages.lock().clone()
-        }
-    }
-
-    impl Handler for TestHandler {
-        fn handle(&self, message: &Message) {
-            self.messages.lock().push(message.clone());
+        fn records(&self) -> Vec<(log::Level, String, String)> {
+            self.records.lock().clone()
         }
     }
 
-    /// 全局 `HANDLERS` 在测试间会互相污染（clear → register → log 中段
-    /// 被另一测试 clear 掉，断言长度失败）。用 mutex 串行化测试。
-    static HANDLER_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    impl ChannelSink for TestSink {
+        fn channel(&self) -> Channel {
+            self.channel
+        }
+
+        fn level(&self) -> log::LevelFilter {
+            log::LevelFilter::Trace
+        }
+
+        fn write(&self, level: log::Level, target: &str, message: &str) {
+            self.records.lock().push((level, target.to_string(), message.to_string()));
+        }
+
+        fn dropped_lines(&self) -> u64 {
+            0
+        }
+    }
+
+    /// 全局 `CHANNELS` 在测试间共享且无注销面（udf 装配期一次性纪律），
+    /// 用 mutex 串行化触碰全局注册表的测试。
+    static CHANNEL_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     #[test]
-    fn test_convenience_functions() {
-        let _guard = HANDLER_TEST_LOCK.lock();
-        clear_handlers();
+    fn test_convenience_functions_route_to_general_channel() {
+        let _guard = CHANNEL_TEST_LOCK.lock();
 
-        let handler = Arc::new(TestHandler::new());
-        let messages_ptr = {
-            let h = Arc::downgrade(&handler);
-            register_handler(handler);
-            h.upgrade().expect("handler should exist")
-        };
+        let sink = TestSink::new(Channel::General);
+        register_channel(sink.clone()).expect("首注恒 Ok（单测试二进制内仅此一处注册 General）");
 
         debug("debug msg");
         info("info msg");
         warning("warn msg");
         error("error msg");
 
-        let msgs = messages_ptr.messages();
-        assert_eq!(msgs.len(), 4);
-        assert_eq!(msgs[0].severity, Severity::Debug);
-        assert_eq!(msgs[1].severity, Severity::Info);
-        assert_eq!(msgs[2].severity, Severity::Warning);
-        assert_eq!(msgs[3].severity, Severity::Error);
-
-        clear_handlers();
+        let records = sink.records();
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].0, log::Level::Debug);
+        assert_eq!(records[1].0, log::Level::Info);
+        assert_eq!(records[2].0, log::Level::Warn);
+        assert_eq!(records[3].0, log::Level::Error);
+        for (_, target, _) in &records {
+            assert_eq!(target, "xray_frame::log", "埋点 target 规范 xray_frame::<域>");
+        }
     }
 }

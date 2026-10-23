@@ -9,13 +9,23 @@
 //!
 //! Rust 端口用 `tokio::sync::mpsc::channel(128)` + 单一后台 `tokio::spawn` task
 //! + `tokio::time::interval(60s)` + `parking_lot::Mutex<bool>` 充当 Go semaphore 单 token。
+//! P1-10-b：对外实现 udf `logx::ChannelSink`（General 通道），输出文案
+//! `[severity] content` 逐字不变；缓冲满/写失败丢弃计数可观测。
 
-use std::{io, sync::Arc, time::Duration};
+use std::{
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    },
+    time::Duration,
+};
 
 use parking_lot::Mutex;
+use skeleton_infra::logx::{Channel, ChannelSink};
 use tokio::{sync::mpsc, task::JoinHandle};
 
-use super::{Handler, Message};
+use super::Message;
 
 /// 通用日志写入器 trait，对应 Go `common/log.Writer` 接口。
 pub trait Writer: Send + Sync {
@@ -85,17 +95,24 @@ const CHANNEL_BUFFER: usize = 128;
 /// 共享后台 task 状态。
 ///
 /// `running` 等价于 Go `semaphore.Instance(1)` 的 token：未持 token 时可 CAS 持，
-/// task 退出时释放。
+/// task 退出时释放。通道承载已格式化行（[`ChannelSink::write`] 进来的即文本，
+/// `handle_message` 在入队前格式化）。
 struct Inner {
-    tx: Option<mpsc::Sender<Message>>,
+    tx: Option<mpsc::Sender<String>>,
     handle: Option<JoinHandle<()>>,
     running: bool,
 }
 
 /// 通用 Logger，对应 Go `generalLogger`。
+///
+/// P1-10-b：实现 udf [`ChannelSink`]（General 通道），Go 语义不变——缓冲满
+/// 丢弃改为计数可观测（[`ChannelSink::dropped_lines`]，禁静默）。
 pub struct GeneralLogger {
     inner: Arc<Mutex<Inner>>,
     creator: Arc<dyn WriterCreator>,
+    /// 入队失败（通道满/已关闭）与 writer 写失败的累计丢弃行数；Arc 为与
+    /// 后台 task 共享（writer 失败发生在 run_loop 内）。
+    dropped: Arc<AtomicU64>,
 }
 
 impl GeneralLogger {
@@ -105,6 +122,7 @@ impl GeneralLogger {
         Self {
             inner: Arc::new(Mutex::new(Inner { tx: None, handle: None, running: false })),
             creator,
+            dropped: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -119,25 +137,39 @@ impl GeneralLogger {
         if g.running {
             return;
         }
-        let (tx, rx) = mpsc::channel::<Message>(CHANNEL_BUFFER);
+        let (tx, rx) = mpsc::channel::<String>(CHANNEL_BUFFER);
         g.tx = Some(tx);
         g.running = true;
 
         let creator = Arc::clone(&self.creator);
         let inner = Arc::clone(&self.inner);
+        let dropped = Arc::clone(&self.dropped);
         let handle = tokio::spawn(async move {
-            run_loop(creator, inner.clone(), rx).await;
+            run_loop(creator, inner, dropped, rx).await;
         });
         g.handle = Some(handle);
     }
 
-    /// 写入一条消息；满则丢。对应 Go `Handle` 的 `select { default }`。
-    pub fn handle_message(&self, message: &Message) {
+    /// 入队一行；满/已关则丢并计数。对应 Go `Handle` 的 `select { default }`，
+    /// 丢弃口径从静默改为可观测（close 后无 tx 同样计丢）。
+    fn enqueue_line(&self, line: String) {
         self.ensure_running();
         let tx = self.inner.lock().tx.clone();
-        if let Some(tx) = tx {
-            let _ = tx.try_send(message.clone());
+        match tx {
+            Some(tx) => {
+                if tx.try_send(line).is_err() {
+                    self.dropped.fetch_add(1, Relaxed);
+                }
+            },
+            None => {
+                self.dropped.fetch_add(1, Relaxed);
+            },
         }
+    }
+
+    /// 写入一条消息；满则丢（计数）。
+    pub fn handle_message(&self, message: &Message) {
+        self.enqueue_line(format_message(message));
     }
 
     /// 主动关闭（对应 Go `Close`）：drop tx → task 退出 → join。
@@ -161,7 +193,8 @@ impl GeneralLogger {
 async fn run_loop(
     creator: Arc<dyn WriterCreator>,
     inner: Arc<Mutex<Inner>>,
-    mut rx: mpsc::Receiver<Message>,
+    dropped: Arc<AtomicU64>,
+    mut rx: mpsc::Receiver<String>,
 ) {
     let writer = match creator.create() {
         Some(w) => w,
@@ -182,9 +215,10 @@ async fn run_loop(
             biased;
             maybe = rx.recv() => {
                 match maybe {
-                    Some(msg) => {
-                        let line = format_message(&msg);
-                        let _ = writer.write(&line);
+                    Some(line) => {
+                        if writer.write(&line).is_err() {
+                            dropped.fetch_add(1, Relaxed);
+                        }
                         let _ = writer.flush();
                         data_written = true;
                     }
@@ -204,9 +238,34 @@ async fn run_loop(
     inner.lock().running = false;
 }
 
-impl Handler for GeneralLogger {
-    fn handle(&self, message: &Message) {
-        self.handle_message(message);
+/// `log::Level` → Go 级别别名（`Severity::as_str` 口径）。`Warn` 还原为
+/// "warning"（log 门面与 Go 别名的唯一错位点）；`Trace` 在 Severity 映射下
+/// 不可达（见 `Severity::to_log_level`），兜底取最低 Go 别名。
+fn go_level_str(level: log::Level) -> &'static str {
+    match level {
+        log::Level::Error => "error",
+        log::Level::Warn => "warning",
+        log::Level::Info => "info",
+        log::Level::Debug | log::Level::Trace => "debug",
+    }
+}
+
+impl ChannelSink for GeneralLogger {
+    fn channel(&self) -> Channel {
+        Channel::General
+    }
+
+    fn level(&self) -> log::LevelFilter {
+        // GeneralLogger 自身无级别面（Go 同）：全量接收，过滤交给上层。
+        log::LevelFilter::Trace
+    }
+
+    fn write(&self, level: log::Level, _target: &str, message: &str) {
+        self.enqueue_line(format!("[{}] {}", go_level_str(level), message));
+    }
+
+    fn dropped_lines(&self) -> u64 {
+        self.dropped.load(Relaxed)
     }
 }
 
@@ -353,5 +412,54 @@ mod tests {
         logger.close().await;
         // 状态可观察：running 已被释放。
         assert!(!logger.inner.lock().running);
+    }
+
+    /// P1-10-b：ChannelSink::write 路径——`Level::Warn` 还原 Go 别名
+    /// "warning"，文案 `[severity] content` 与 handle_message 路径逐字一致。
+    #[tokio::test(flavor = "current_thread")]
+    async fn sink_write_restores_go_level_alias() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let logger = GeneralLogger::new(Arc::new(CollectingCreator { lines: Arc::clone(&lines) }));
+
+        logger.write(log::Level::Warn, "xray_frame::log", "x");
+        logger.write(log::Level::Info, "xray_frame::log", "y");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        logger.close().await;
+
+        let captured = lines.lock().clone();
+        assert_eq!(captured, vec!["[warning] x".to_string(), "[info] y".to_string()]);
+        assert_eq!(logger.dropped_lines(), 0);
+    }
+
+    /// P1-10-b：通道满丢弃计数可观测，不 panic；close 后 write 走既有重启
+    /// 语义（ensure_running 起新 task，行照写、不计丢）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn sink_drops_are_counted_not_silent() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let logger = GeneralLogger::new(Arc::new(CollectingCreator { lines: Arc::clone(&lines) }));
+
+        logger.close().await;
+        logger.write(log::Level::Error, "t", "after-close");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        {
+            let captured = lines.lock();
+            assert!(
+                captured.iter().any(|l| l == "[error] after-close"),
+                "close 后 write 重启 task 照写（既有语义）: {:?}",
+                *captured
+            );
+        }
+        assert_eq!(logger.dropped_lines(), 0, "重启路径不计丢弃");
+
+        for i in 0..200 {
+            logger.write(log::Level::Info, "t", &format!("m{i}"));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        logger.close().await;
+
+        let captured = lines.lock();
+        assert!(captured.len() <= 129, "chan cap=128 + 重启首行 but got {}", captured.len());
+        assert!(logger.dropped_lines() > 0, "缓冲满丢弃必须计数");
     }
 }

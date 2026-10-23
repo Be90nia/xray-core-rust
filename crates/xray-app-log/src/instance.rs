@@ -7,11 +7,15 @@ use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     io::Write,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use parking_lot::{Mutex, RwLock};
+use skeleton_infra::logx::{Channel, ChannelRegistry, ChannelSink};
 
 use crate::{
     config::{LogConfig, LogFormat, LogType, SeverityLevel},
@@ -244,11 +248,20 @@ pub struct HandlerCreatorOptions {
     pub format: LogFormat,
 }
 
-/// LogHandler trait：实际写日志的处理器（file/console/none）。
+/// LogHandler trait：实际写日志的处理器（console/file）。
 ///
-/// 对应 Go `log.Handler` interface。
+/// 对应 Go `log.Handler` interface。P1-10-b：分发改走 udf 通道
+/// （[`ChannelRegistry`]，general/access/dns）后，handler 只见已格式化的行
+/// ——entry → 掩码 → `format_with` 在 [`LogInstance::handle`] 完成，输出体
+/// 只负责落 stdout（tracing）/文件，输出文本与改前逐字一致。
 pub trait LogHandler: Send + Sync {
-    fn handle(&self, entry: &LogEntry);
+    /// 写一条已格式化的行（换行由实现补）。
+    fn write_line(&self, level: log::Level, target: &str, line: &str);
+
+    /// 累计丢弃行数（写失败口径，禁静默；console 台面（tracing）恒 0）。
+    fn dropped_lines(&self) -> u64 {
+        0
+    }
 }
 
 /// Handler 工厂函数 trait。
@@ -320,31 +333,42 @@ impl HandlerCreator for NoneHandlerCreator {
     }
 }
 
-/// Console handler：通过 tracing 宏输出日志到 stdout。
+/// Console handler：经 tracing 宏输出日志行。
 ///
 /// 对应 Go consoleLogWriter（`common/log/logger.go`）：Go v26.6.1 中
 /// `LogType_Console` creator 一律用 `CreateStdoutLogWriter`（access 与 error
 /// 都写 stdout，`CreateStderrLogWriter` 未被 app/log 使用），此处保持一致不分流。
-pub struct ConsoleHandler {
-    format: LogFormat,
-}
+/// 级别→宏的映射沿用改前 General 匹配臂口径（`Unknown` 落 Info），target 由
+/// emit 侧给定（与改前逐字同值），行文本在 emit 侧已按改前口径格式化。
+pub struct ConsoleHandler;
 
 impl LogHandler for ConsoleHandler {
-    fn handle(&self, entry: &LogEntry) {
-        match entry {
-            LogEntry::General(m) => match m.severity {
-                SeverityLevel::Error => tracing::error!(target: "xray", "{}", m.content),
-                SeverityLevel::Warning => tracing::warn!(target: "xray", "{}", m.content),
-                SeverityLevel::Info => tracing::info!(target: "xray", "{}", m.content),
-                SeverityLevel::Debug => tracing::debug!(target: "xray", "{}", m.content),
-                _ => tracing::info!(target: "xray", "{}", m.content),
+    fn write_line(&self, level: log::Level, target: &str, line: &str) {
+        // tracing callsite 的 target/level 必须编译期常量（tracing-0.1.44
+        // macros.rs:885，同 xray-frame logging.rs E0435 实证）：运行期 target
+        // 折回 emit 侧固定三字面量分派，宏内逐字重写同值。
+        match (target, level) {
+            ("xray", log::Level::Error) => tracing::error!(target: "xray", "{line}"),
+            ("xray", log::Level::Warn) => tracing::warn!(target: "xray", "{line}"),
+            ("xray", log::Level::Info) => tracing::info!(target: "xray", "{line}"),
+            ("xray", _) => tracing::debug!(target: "xray", "{line}"),
+            ("xray.access", _) => tracing::info!(target: "xray.access", "{line}"),
+            ("xray.dns", _) => tracing::info!(target: "xray.dns", "{line}"),
+            // 散装 general 通道（`xray_common::log::*` 的 target；宏的 target 需
+            // 编译期字面量，无法引用那侧常量——值漂移由
+            // tests/general_visibility.rs 的 target 断言兜住）。
+            ("xray_frame::log", log::Level::Error) => {
+                tracing::error!(target: "xray_frame::log", "{line}")
             },
-            LogEntry::Access(_) => {
-                tracing::info!(target: "xray.access", "{}", entry.format_with(self.format))
+            ("xray_frame::log", log::Level::Warn) => {
+                tracing::warn!(target: "xray_frame::log", "{line}")
             },
-            LogEntry::Dns(_) => {
-                tracing::info!(target: "xray.dns", "{}", entry.format_with(self.format))
+            ("xray_frame::log", log::Level::Info) => {
+                tracing::info!(target: "xray_frame::log", "{line}")
             },
+            ("xray_frame::log", _) => tracing::debug!(target: "xray_frame::log", "{line}"),
+            // emit 侧目标集固定四值；未知 target 兜底 "xray"（防御臂，不可达）。
+            (_, _) => tracing::info!(target: "xray", "{line}"),
         }
     }
 }
@@ -356,9 +380,9 @@ impl HandlerCreator for ConsoleHandlerCreator {
     fn create(
         &self,
         _log_type: LogType,
-        options: &HandlerCreatorOptions,
+        _options: &HandlerCreatorOptions,
     ) -> Result<Option<Arc<dyn LogHandler>>, LogError> {
-        Ok(Some(Arc::new(ConsoleHandler { format: options.format })))
+        Ok(Some(Arc::new(ConsoleHandler)))
     }
 }
 
@@ -373,7 +397,9 @@ impl HandlerCreator for ConsoleHandlerCreator {
 pub struct FileHandler {
     path: String,
     format: LogFormat,
-    // inner 及其字段仅在 unix 分支的 handle() 中读写；Windows 分支走
+    /// 写失败（open/writeln）累计丢弃行数（P1-10-b 可观测口径）。
+    dropped: AtomicU64,
+    // inner 及其字段仅在 unix 分支的 write_line() 中读写；Windows 分支走
     // per-write open，不经过该状态，故非 unix 平台下 allow dead_code。
     #[cfg_attr(not(unix), allow(dead_code))]
     inner: Mutex<FileHandleState>,
@@ -390,22 +416,27 @@ impl FileHandler {
         Self {
             path,
             format: LogFormat::Console,
+            dropped: AtomicU64::new(0),
             inner: Mutex::new(FileHandleState { file: None, open_inode: 0 }),
         }
     }
 
     /// 组装带前缀的输出行：Console 加 Go 风格时间戳，Json 原样。
-    fn timestamped_line(&self, entry: &LogEntry) -> String {
-        let body = entry.format_with(self.format);
+    fn timestamped_line(&self, body: &str) -> String {
         match self.format {
             LogFormat::Console => format!("{}{}", log_timestamp_prefix(), body),
-            LogFormat::Json => body,
+            LogFormat::Json => body.to_string(),
         }
     }
 
     /// 带输出格式构造。
     pub fn with_format(path: String, format: LogFormat) -> Self {
-        Self { path, format, inner: Mutex::new(FileHandleState { file: None, open_inode: 0 }) }
+        Self {
+            path,
+            format,
+            dropped: AtomicU64::new(0),
+            inner: Mutex::new(FileHandleState { file: None, open_inode: 0 }),
+        }
     }
 }
 
@@ -439,11 +470,11 @@ fn inode_of(md: &std::fs::Metadata) -> u64 {
 
 impl LogHandler for FileHandler {
     #[cfg(unix)]
-    fn handle(&self, entry: &LogEntry) {
+    fn write_line(&self, _level: log::Level, _target: &str, line: &str) {
         // 4d7t：对齐 Go fileLogWriter（common/log/logger.go:176）——Console 行带
         // 日期时间前缀（access.log 无时间戳则事件排序/审计不可用）。Json 行保持
         // 纯 JSON（Rust 扩展格式，机器可读优先）。
-        let line = self.timestamped_line(entry);
+        let full = self.timestamped_line(line);
         let mut state = self.inner.lock();
         let path = std::path::Path::new(&self.path);
         let current_inode = std::fs::metadata(path).map(|m| inode_of(&m)).unwrap_or(0);
@@ -454,25 +485,41 @@ impl LogHandler for FileHandler {
                     state.file = Some(file);
                     state.open_inode = current_inode;
                 },
-                Err(_) => return,
+                Err(_) => {
+                    self.dropped.fetch_add(1, Relaxed);
+                    return;
+                },
             }
         }
-        if let Some(f) = state.file.as_mut() {
-            let _ = writeln!(f, "{line}");
+        if let Some(f) = state.file.as_mut()
+            && writeln!(f, "{full}").is_err()
+        {
+            self.dropped.fetch_add(1, Relaxed);
         }
     }
 
     #[cfg(not(unix))]
-    fn handle(&self, entry: &LogEntry) {
+    fn write_line(&self, _level: log::Level, _target: &str, line: &str) {
         // ponytail: Windows 无稳定 inode API 探测 rename；保持 Go 兼容的 per-write
         // open 行为。高 QPS 写放大场景仍依赖 ReopenMutex<File> 升级——见
         // xray-app-log/src/instance.rs unix 分支；Windows 升级路径：
         // 1) 用 GetFileInformationByHandle 比 ByHandleFileInformation.nFileIndexHigh/Low
         // 2) 引入 winapi/windows-sys 依赖,FOkens 代价大，保留现状。
-        let line = self.timestamped_line(entry);
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&self.path) {
-            let _ = writeln!(f, "{line}");
+        let full = self.timestamped_line(line);
+        match OpenOptions::new().create(true).append(true).open(&self.path) {
+            Ok(mut f) => {
+                if writeln!(f, "{full}").is_err() {
+                    self.dropped.fetch_add(1, Relaxed);
+                }
+            },
+            Err(_) => {
+                self.dropped.fetch_add(1, Relaxed);
+            },
         }
+    }
+
+    fn dropped_lines(&self) -> u64 {
+        self.dropped.load(Relaxed)
     }
 }
 
@@ -494,6 +541,130 @@ impl HandlerCreator for FileHandlerCreator {
     }
 }
 
+/// 通道 emit target：与改前 ConsoleHandler 的 tracing target 逐字同值
+/// （RUST_LOG 按 target 过滤的行为面保留）。
+const TARGET_GENERAL: &str = "xray";
+const TARGET_ACCESS: &str = "xray.access";
+const TARGET_DNS: &str = "xray.dns";
+
+/// GeneralMessage severity → tracing 级别（改前 ConsoleHandler 匹配臂口径；
+/// `Unknown` 落 `_` 臂 = Info）。
+fn general_message_level(severity: SeverityLevel) -> log::Level {
+    match severity {
+        SeverityLevel::Error => log::Level::Error,
+        SeverityLevel::Warning => log::Level::Warn,
+        SeverityLevel::Info | SeverityLevel::Unknown => log::Level::Info,
+        SeverityLevel::Debug => log::Level::Debug,
+    }
+}
+
+/// 通道 sink 适配壳：把 LogHandler 输出体挂到 udf 通道（P1-10-b）。
+///
+/// write 原样转交 `write_line`（文本已由 [`LogInstance::handle`] 按改前
+/// handler 口径格式化）→ 输出逐字不变；级别/开关门在 handle 侧（config
+/// 语义），sink 全量接收；丢弃计数透传内层 handler。
+struct HandlerSink {
+    channel: Channel,
+    inner: Arc<dyn LogHandler>,
+}
+
+impl ChannelSink for HandlerSink {
+    fn channel(&self) -> Channel {
+        self.channel
+    }
+
+    fn level(&self) -> log::LevelFilter {
+        log::LevelFilter::Trace
+    }
+
+    fn write(&self, level: log::Level, target: &str, message: &str) {
+        self.inner.write_line(level, target, message);
+    }
+
+    fn dropped_lines(&self) -> u64 {
+        self.inner.dropped_lines()
+    }
+}
+
+/// 进程级 general 落样壳：`xray_common::log::channels()` 的 General 槽注册一次
+/// 后无注销面（udf 装配期纪律），故壳常驻、内部出口集随 `LogInstance` 激活期
+/// 整体换/清——restart 免重注，close 后 emit 静默。
+///
+/// 出口集由 [`LogInstance::start`] 装配：Console 配置 → 台面一路；File 配置 →
+/// 台面 + 文件两路；None/Event → 空集（`loglevel: "none"` 全静默）。
+struct GlobalGeneralSink {
+    /// 当前激活期出口集（空 = 未激活）。`Arc` 快照读 → 锁内无 IO。
+    outlets: RwLock<Arc<Vec<Arc<dyn LogHandler>>>>,
+    /// 等级门（`error_log_level` 口径；registry 侧滤，不计丢弃）。
+    level: RwLock<log::LevelFilter>,
+}
+
+impl GlobalGeneralSink {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            outlets: RwLock::new(Arc::new(Vec::new())),
+            level: RwLock::new(log::LevelFilter::Off),
+        })
+    }
+
+    /// 换本激活期出口集与等级门。
+    fn install(&self, outlets: Vec<Arc<dyn LogHandler>>, level: log::LevelFilter) {
+        *self.level.write() = level;
+        *self.outlets.write() = Arc::new(outlets);
+    }
+}
+
+impl ChannelSink for GlobalGeneralSink {
+    fn channel(&self) -> Channel {
+        Channel::General
+    }
+
+    fn level(&self) -> log::LevelFilter {
+        *self.level.read()
+    }
+
+    fn write(&self, level: log::Level, target: &str, message: &str) {
+        let outlets = self.outlets.read().clone();
+        for outlet in outlets.iter() {
+            outlet.write_line(level, target, message);
+        }
+    }
+
+    fn dropped_lines(&self) -> u64 {
+        self.outlets.read().iter().map(|o| o.dropped_lines()).sum()
+    }
+}
+
+/// 进程级 general 落样壳（初始化即注册进 global General 槽；本进程唯一注册点）。
+/// 注册 Err = 他处已占用该槽：fail-visible 告警后保留他处 sink，禁静默覆盖。
+static GLOBAL_GENERAL_SINK: std::sync::LazyLock<Arc<GlobalGeneralSink>> =
+    std::sync::LazyLock::new(|| {
+        let sink = GlobalGeneralSink::new();
+        let as_sink: Arc<dyn ChannelSink> = sink.clone();
+        if let Err(e) = xray_common::log::register_channel(as_sink) {
+            at_warning(&LogError::HandlerCreate(format!(
+                "global general sink register failed: {e}"
+            )));
+        }
+        sink
+    });
+
+fn global_general_sink() -> &'static Arc<GlobalGeneralSink> {
+    &GLOBAL_GENERAL_SINK
+}
+
+/// `error_log_level` → registry 等级门。`log::Level` 与 `SeverityLevel` 的详细度
+/// 同向（Error < Warn < Info < Debug），直接逐档对齐；`Unknown`（proto 零值 /
+/// 未配置）按 Error 处理——日志宁少勿多。
+fn general_level_filter(level: SeverityLevel) -> log::LevelFilter {
+    match level {
+        SeverityLevel::Unknown | SeverityLevel::Error => log::LevelFilter::Error,
+        SeverityLevel::Warning => log::LevelFilter::Warn,
+        SeverityLevel::Info => log::LevelFilter::Info,
+        SeverityLevel::Debug => log::LevelFilter::Debug,
+    }
+}
+
 /// 注册默认 handler creators（None/Console/File）到 registry。
 ///
 /// 对应 Go `init()` 中注册 `handlerCreatorMap` 的行为。
@@ -505,22 +676,182 @@ pub fn register_default_creators(registry: &HandlerCreatorRegistry) -> Result<()
     Ok(())
 }
 
-/// 把 handler 包装一层，对 entry 内容做 mask 处理后再转发。
+/// LogInstance：主编排类，对应 Go `app/log.Instance`。
 ///
-/// 对应 Go `MaskedMsgWrapper`：当 mask != (32, 128) 时，对 LogEntry 的所有
-/// String 字段执行 IP 掩码替换。
-pub struct MaskingHandler {
-    inner: Arc<dyn LogHandler>,
+/// 持有 config + 通道注册表 + 状态字段，编排（P1-10-b，分发走 udf 通道）：
+///   - `start()`：用注册表创建 access/error handler，按 general/access/dns 三通道注册
+///     sink（每激活期一枚新 registry，close 即弃 → restart 免重注）
+///   - `start()` 同时接管进程级 general 槽出口（散装 `xray_common::log::*` 消息）
+///   - `handle(entry)`：掩码 + 格式化后 emit 到对应通道
+///   - `close()`：弃通道注册表 + 清 global General 出口集（后续散装消息静默）
+pub struct LogInstance {
+    config: LogConfig,
     mask4: i32,
     mask6: i32,
+    inner: RwLock<InstanceInner>,
 }
 
-impl MaskingHandler {
-    pub fn new(inner: Arc<dyn LogHandler>, mask4: i32, mask6: i32) -> Self {
-        Self { inner, mask4, mask6 }
+struct InstanceInner {
+    active: bool,
+    channels: Option<ChannelRegistry>,
+}
+
+impl LogInstance {
+    /// 用配置 + mask 解析结果构造（已外部解析过 mask）。
+    pub fn new_with_mask(config: LogConfig, mask4: i32, mask6: i32) -> Self {
+        Self {
+            config,
+            mask4,
+            mask6,
+            inner: RwLock::new(InstanceInner { active: false, channels: None }),
+        }
     }
 
-    fn apply(&self, entry: &LogEntry) -> LogEntry {
+    /// 用配置构造，自动解析 mask_address。
+    pub fn new(config: LogConfig) -> Result<Self, LogError> {
+        let (m4, m6) = crate::mask::parse_mask_address(&config.mask_address)?;
+        Ok(Self::new_with_mask(config, m4, m6))
+    }
+
+    pub fn config(&self) -> &LogConfig {
+        &self.config
+    }
+
+    pub fn mask4(&self) -> i32 {
+        self.mask4
+    }
+
+    pub fn mask6(&self) -> i32 {
+        self.mask6
+    }
+
+    /// Start：用 registry 创建 handler，按三通道注册 sink 并标记 active。
+    pub fn start(&self, registry: &HandlerCreatorRegistry) -> Result<(), LogError> {
+        let mut g = self.inner.write();
+        if g.active {
+            return Ok(());
+        }
+
+        let channels = ChannelRegistry::new();
+
+        let access_opts = HandlerCreatorOptions {
+            path: self.config.access_log_path.clone(),
+            format: self.config.format,
+        };
+        match registry.create(self.config.access_log_type, &access_opts) {
+            Ok(Some(h)) => {
+                // 每激活期新表，首注不可能重复（expect 带证据，非静默吞错）。
+                channels
+                    .register(Arc::new(HandlerSink {
+                        channel: Channel::Access,
+                        inner: Arc::clone(&h),
+                    }))
+                    .expect("fresh per-activation registry: Access 首注恒 Ok");
+                if self.config.enable_dns_log {
+                    // DNS 与 Access 同汇：改前 Dns 路由到 access_logger（Go 同）。
+                    channels
+                        .register(Arc::new(HandlerSink { channel: Channel::Dns, inner: h }))
+                        .expect("fresh per-activation registry: Dns 首注恒 Ok");
+                }
+            },
+            Ok(None) => {},
+            Err(e) => {
+                at_warning(&LogError::HandlerCreate(format!("access logger init failed: {e}")));
+            },
+        }
+
+        let error_opts = HandlerCreatorOptions {
+            path: self.config.error_log_path.clone(),
+            format: self.config.format,
+        };
+        // 散装 general 消息（`xray_common::log::*`）的全局出口集：File 配置下
+        // 台面仍恢复（改前那些消息恒走 tracing 台面，与 error_log_type 无关），
+        // 文件另加一路；None/Event 留空集 = 静默。
+        let mut outlets: Vec<Arc<dyn LogHandler>> = Vec::new();
+        match registry.create(self.config.error_log_type, &error_opts) {
+            Ok(Some(h)) => {
+                if self.config.error_log_type == LogType::File {
+                    outlets.push(Arc::new(ConsoleHandler));
+                }
+                outlets.push(Arc::clone(&h));
+                channels
+                    .register(Arc::new(HandlerSink { channel: Channel::General, inner: h }))
+                    .expect("fresh per-activation registry: General 首注恒 Ok");
+            },
+            Ok(None) => {},
+            Err(e) => {
+                at_warning(&LogError::HandlerCreate(format!("error logger init failed: {e}")));
+            },
+        }
+        global_general_sink().install(outlets, general_level_filter(self.config.error_log_level));
+
+        g.channels = Some(channels);
+        g.active = true;
+        Ok(())
+    }
+
+    /// Close：标记 inactive + 弃通道注册表 + 清散装 general 出口。
+    pub fn close(&self) {
+        let mut g = self.inner.write();
+        if !g.active {
+            return;
+        }
+        g.active = false;
+        g.channels = None;
+        // 进程级槽只能清不能注销：出口集清空 + 等级门 Off = 后续 emit 静默。
+        global_general_sink().install(Vec::new(), log::LevelFilter::Off);
+    }
+
+    /// 是否已启动。
+    pub fn is_active(&self) -> bool {
+        self.inner.read().active
+    }
+
+    /// 全部通道丢弃计数总和（可观测面：File handler 写失败等；udf
+    /// `dropped_total` 口径）。散装 general 出口不在本表内——查
+    /// `xray_common::log::channels().dropped_total()`。
+    pub fn dropped_total(&self) -> u64 {
+        self.inner.read().channels.as_ref().map(ChannelRegistry::dropped_total).unwrap_or(0)
+    }
+
+    /// 处理一条日志：掩码 + 格式化后按通道分发。
+    ///
+    /// - Access → Access 通道（target `xray.access`）
+    /// - Dns → Dns 通道（`enable_dns_log` 门；通道未注册 = 静默，同改前无 handler）
+    /// - General → General 通道（severity > error_log_level 在 emit 前滤掉）
+    pub fn handle(&self, entry: &LogEntry) {
+        let g = self.inner.read();
+        let Some(channels) = g.channels.as_ref() else {
+            return; // 未激活：无通道表，静默丢弃（同改前 inactive 分支）
+        };
+        let (channel, level, target, line) = match entry {
+            LogEntry::Access(_) => {
+                (Channel::Access, log::Level::Info, TARGET_ACCESS, self.entry_line(entry))
+            },
+            LogEntry::Dns(_) => {
+                if !self.config.enable_dns_log {
+                    return;
+                }
+                (Channel::Dns, log::Level::Info, TARGET_DNS, self.entry_line(entry))
+            },
+            LogEntry::General(m) => {
+                if m.severity > self.config.error_log_level {
+                    return;
+                }
+                (
+                    Channel::General,
+                    general_message_level(m.severity),
+                    TARGET_GENERAL,
+                    self.general_line(m),
+                )
+            },
+        };
+        channels.emit(channel, level, target, &line);
+    }
+
+    /// entry 字段 IP 掩码（改前 `MaskingHandler` 的字段级口径原样前移；
+    /// 32/128 全宽直通）。对应 Go `MaskedMsgWrapper`。
+    fn mask_entry(&self, entry: &LogEntry) -> LogEntry {
         if self.mask4 == 32 && self.mask6 == 128 {
             return entry.clone();
         }
@@ -548,155 +879,22 @@ impl MaskingHandler {
             }),
         }
     }
-}
 
-impl LogHandler for MaskingHandler {
-    fn handle(&self, entry: &LogEntry) {
-        let masked = self.apply(entry);
-        self.inner.handle(&masked);
+    /// Access/Dns 行文本：掩码后按格式序列化（改前 handler 侧 format_with 口径）。
+    fn entry_line(&self, entry: &LogEntry) -> String {
+        self.mask_entry(entry).format_with(self.config.format)
     }
-}
 
-/// LogInstance：主编排类，对应 Go `app/log.Instance`。
-///
-/// 持有 config + access_logger + error_logger + 状态字段，编排：
-///   - `start()`：用注册表创建 access/error handler
-///   - `handle(entry)`：按消息类型路由（access / dns / error）
-///   - `close()`：丢弃 handler
-pub struct LogInstance {
-    config: LogConfig,
-    mask4: i32,
-    mask6: i32,
-    inner: RwLock<InstanceInner>,
-}
-
-struct InstanceInner {
-    active: bool,
-    access_logger: Option<Arc<dyn LogHandler>>,
-    error_logger: Option<Arc<dyn LogHandler>>,
-}
-
-impl LogInstance {
-    /// 用配置 + mask 解析结果构造（已外部解析过 mask）。
-    pub fn new_with_mask(config: LogConfig, mask4: i32, mask6: i32) -> Self {
-        Self {
-            config,
-            mask4,
-            mask6,
-            inner: RwLock::new(InstanceInner {
-                active: false,
-                access_logger: None,
-                error_logger: None,
-            }),
+    /// General 行文本：改前双 handler 口径本就分叉，逐字保留——
+    /// Console 台面 = 掩码后裸 content（旧 ConsoleHandler 经 tracing 级别宏
+    /// 直印 content，无 `[i32]` 前缀、无视 format）；File 台面 =
+    /// `[i32] content`（旧 FileHandler `format_with`，Go `Message.String()`
+    /// 等价；json 时 to_json）。
+    fn general_line(&self, m: &GeneralMessage) -> String {
+        if self.config.error_log_type == LogType::File {
+            return self.mask_entry(&LogEntry::General(m.clone())).format_with(self.config.format);
         }
-    }
-
-    /// 用配置构造，自动解析 mask_address。
-    pub fn new(config: LogConfig) -> Result<Self, LogError> {
-        let (m4, m6) = crate::mask::parse_mask_address(&config.mask_address)?;
-        Ok(Self::new_with_mask(config, m4, m6))
-    }
-
-    pub fn config(&self) -> &LogConfig {
-        &self.config
-    }
-
-    pub fn mask4(&self) -> i32 {
-        self.mask4
-    }
-
-    pub fn mask6(&self) -> i32 {
-        self.mask6
-    }
-
-    /// Start：用 registry 创建 handler 并标记 active。
-    pub fn start(&self, registry: &HandlerCreatorRegistry) -> Result<(), LogError> {
-        let mut g = self.inner.write();
-        if g.active {
-            return Ok(());
-        }
-
-        let access_opts = HandlerCreatorOptions {
-            path: self.config.access_log_path.clone(),
-            format: self.config.format,
-        };
-        match registry.create(self.config.access_log_type, &access_opts) {
-            Ok(h) => g.access_logger = h.map(|h| self.wrap_with_mask(h)),
-            Err(e) => {
-                at_warning(&LogError::HandlerCreate(format!("access logger init failed: {e}")));
-            },
-        }
-
-        let error_opts = HandlerCreatorOptions {
-            path: self.config.error_log_path.clone(),
-            format: self.config.format,
-        };
-        match registry.create(self.config.error_log_type, &error_opts) {
-            Ok(h) => g.error_logger = h.map(|h| self.wrap_with_mask(h)),
-            Err(e) => {
-                at_warning(&LogError::HandlerCreate(format!("error logger init failed: {e}")));
-            },
-        }
-
-        g.active = true;
-        Ok(())
-    }
-
-    fn wrap_with_mask(&self, handler: Arc<dyn LogHandler>) -> Arc<dyn LogHandler> {
-        if self.mask4 == 32 && self.mask6 == 128 {
-            handler
-        } else {
-            Arc::new(MaskingHandler::new(handler, self.mask4, self.mask6))
-        }
-    }
-
-    /// Close：标记 inactive + 清空 handler。
-    pub fn close(&self) {
-        let mut g = self.inner.write();
-        if !g.active {
-            return;
-        }
-        g.active = false;
-        g.access_logger = None;
-        g.error_logger = None;
-    }
-
-    /// 是否已启动。
-    pub fn is_active(&self) -> bool {
-        self.inner.read().active
-    }
-
-    /// 处理一条日志：按类型分发。
-    ///
-    /// - Access → access_logger（若注册）
-    /// - Dns → 仅当 enable_dns_log && access_logger（若注册）
-    /// - General → error_logger（若注册 且 severity <= error_log_level）
-    pub fn handle(&self, entry: &LogEntry) {
-        let g = self.inner.read();
-        if !g.active {
-            return;
-        }
-        match entry {
-            LogEntry::Access(_) => {
-                if let Some(h) = &g.access_logger {
-                    h.handle(entry);
-                }
-            },
-            LogEntry::Dns(_) => {
-                if self.config.enable_dns_log {
-                    if let Some(h) = &g.access_logger {
-                        h.handle(entry);
-                    }
-                }
-            },
-            LogEntry::General(m) => {
-                if m.severity <= self.config.error_log_level {
-                    if let Some(h) = &g.error_logger {
-                        h.handle(entry);
-                    }
-                }
-            },
-        }
+        mask_addresses(&m.content, self.mask4, self.mask6)
     }
 
     /// 重启：close + start。
@@ -714,7 +912,7 @@ mod tests {
 
     use super::*;
 
-    /// 测试用 LogHandler：把 entry format 后追加到共享 Vec。
+    /// 测试用 LogHandler：把落行追加到共享 Vec。
     struct CapturingHandler {
         recorded: Mutex<Vec<String>>,
     }
@@ -730,8 +928,8 @@ mod tests {
     }
 
     impl LogHandler for CapturingHandler {
-        fn handle(&self, entry: &LogEntry) {
-            self.recorded.lock().push(entry.format());
+        fn write_line(&self, _level: log::Level, _target: &str, line: &str) {
+            self.recorded.lock().push(line.to_string());
         }
     }
 
@@ -844,13 +1042,14 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let h = FileHandler::with_format(path.to_string_lossy().into_owned(), LogFormat::Json);
-        h.handle(&LogEntry::Access(AccessMessage {
+        let entry = LogEntry::Access(AccessMessage {
             from: "1.1.1.1".into(),
             to: "tcp:2.2.2.2:443".into(),
             detour: "direct".into(),
             status: Some(AccessStatus::Accepted),
             ..Default::default()
-        }));
+        });
+        h.write_line(log::Level::Info, "xray.access", &entry.format_with(LogFormat::Json));
         let content = std::fs::read_to_string(&path).unwrap();
         let j: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
         assert_eq!(j["detour"], "direct");
@@ -868,13 +1067,14 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let h = FileHandler::with_format(path.to_string_lossy().into_owned(), LogFormat::Console);
-        h.handle(&LogEntry::Access(AccessMessage {
+        let entry = LogEntry::Access(AccessMessage {
             from: "1.1.1.1".into(),
             to: "tcp:2.2.2.2:443".into(),
             detour: "direct".into(),
             status: Some(AccessStatus::Accepted),
             ..Default::default()
-        }));
+        });
+        h.write_line(log::Level::Info, "xray.access", &entry.format_with(LogFormat::Console));
         let content = std::fs::read_to_string(&path).unwrap();
         // 前缀形如 `2026/09/12 08:09:10.123456 `：10 位日期 + 空格 + 15 位时间 + 空格。
         let prefix = content.chars().take(27).collect::<String>();
@@ -901,10 +1101,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let h = FileHandler::new(path.to_string_lossy().into_owned());
-        h.handle(&LogEntry::General(GeneralMessage {
-            severity: SeverityLevel::Info,
-            content: "before-rotate".into(),
-        }));
+        h.write_line(log::Level::Info, "xray", "[3] before-rotate");
         let before = std::fs::read_to_string(&path).unwrap();
         assert!(before.contains("before-rotate"));
 
@@ -913,10 +1110,7 @@ mod tests {
         std::fs::rename(&path, &rotated).unwrap();
         std::fs::write(&path, b"").unwrap();
 
-        h.handle(&LogEntry::General(GeneralMessage {
-            severity: SeverityLevel::Info,
-            content: "after-rotate".into(),
-        }));
+        h.write_line(log::Level::Info, "xray", "[3] after-rotate");
 
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains("after-rotate"), "new entry must land in new file: {after}");
@@ -1233,12 +1427,25 @@ mod tests {
         assert_eq!(snap.snapshot().len(), 1);
     }
 
+    /// 字段级 IP 掩码经通道分发后仍生效（P1-10-b：MaskingHandler 掩码逻辑
+    /// 前移到 LogInstance::handle，断言口径不变）。
     #[test]
-    fn masking_handler_applies_mask() {
+    fn instance_applies_field_mask_on_channel_path() {
         let h = CapturingHandler::new();
         let snap = h.clone();
-        let masked: Arc<dyn LogHandler> = Arc::new(MaskingHandler::new(h, 0, 128));
-        masked.handle(&LogEntry::General(GeneralMessage {
+        let r = HandlerCreatorRegistry::new();
+        r.register(LogType::Console, Arc::new(FixedCreator { handler: h })).unwrap();
+
+        let cfg = LogConfig {
+            error_log_type: LogType::Console,
+            error_log_level: SeverityLevel::Debug, // Info 不得被级别门滤掉
+            ..LogConfig::default()
+        };
+        // mask4=0：IPv4 全掩码（等价旧 MaskingHandler::new(h, 0, 128)）。
+        let inst = LogInstance::new_with_mask(cfg, 0, 128);
+        inst.start(&r).unwrap();
+
+        inst.handle(&LogEntry::General(GeneralMessage {
             severity: SeverityLevel::Info,
             content: "from 192.168.1.1".into(),
         }));
@@ -1247,12 +1454,23 @@ mod tests {
         assert!(!s[0].contains("192.168.1.1"));
     }
 
+    /// 32/128 全宽直通不掩码（等价旧 MaskingHandler::new(h, 32, 128)）。
     #[test]
-    fn masking_handler_no_mask_passthrough() {
+    fn instance_no_mask_passthrough() {
         let h = CapturingHandler::new();
         let snap = h.clone();
-        let masked: Arc<dyn LogHandler> = Arc::new(MaskingHandler::new(h, 32, 128));
-        masked.handle(&LogEntry::General(GeneralMessage {
+        let r = HandlerCreatorRegistry::new();
+        r.register(LogType::Console, Arc::new(FixedCreator { handler: h })).unwrap();
+
+        let cfg = LogConfig {
+            error_log_type: LogType::Console,
+            error_log_level: SeverityLevel::Debug,
+            ..LogConfig::default()
+        };
+        let inst = LogInstance::new_with_mask(cfg, 32, 128);
+        inst.start(&r).unwrap();
+
+        inst.handle(&LogEntry::General(GeneralMessage {
             severity: SeverityLevel::Info,
             content: "from 192.168.1.1".into(),
         }));
@@ -1301,6 +1519,89 @@ mod tests {
         _assert::<LogInstance>();
         _assert::<Arc<dyn LogHandler>>();
         _assert::<Arc<dyn HandlerCreator>>();
-        _assert::<MaskingHandler>();
+    }
+
+    /// P1-10-b 契约验收①：三通道不串道——Access/Dns/General 各自落到对应
+    /// 通道（target 与行文本 = 改前快照逐字口径：General 裸 content、
+    /// Access/Dns 走 format_with）。
+    #[test]
+    fn instance_channels_route_without_crosstalk() {
+        /// 记录 (target, line) 的共享 handler（access/error 槽共用，按 target 区分通道）。
+        struct RecordingHandler {
+            lines: Mutex<Vec<(String, String)>>,
+        }
+
+        impl LogHandler for RecordingHandler {
+            fn write_line(&self, _level: log::Level, target: &str, line: &str) {
+                self.lines.lock().push((target.to_string(), line.to_string()));
+            }
+        }
+
+        let recorder = Arc::new(RecordingHandler { lines: Mutex::new(Vec::new()) });
+        let r = HandlerCreatorRegistry::new();
+        r.register(LogType::Console, Arc::new(FixedCreator { handler: recorder.clone() })).unwrap();
+
+        let cfg = LogConfig {
+            access_log_type: LogType::Console,
+            error_log_type: LogType::Console,
+            enable_dns_log: true,
+            error_log_level: SeverityLevel::Debug,
+            ..LogConfig::default()
+        };
+        let inst = LogInstance::new(cfg).unwrap();
+        inst.start(&r).unwrap();
+
+        inst.handle(&LogEntry::Access(AccessMessage {
+            from: "1.1.1.1".into(),
+            to: "tcp:2.2.2.2:443".into(),
+            status: Some(AccessStatus::Accepted),
+            ..Default::default()
+        }));
+        inst.handle(&LogEntry::Dns(DnsLog {
+            domain: "d.io".into(),
+            result: "9.9.9.9".into(),
+            ..Default::default()
+        }));
+        inst.handle(&LogEntry::General(GeneralMessage {
+            severity: SeverityLevel::Warning,
+            content: "G-CONTENT".into(),
+        }));
+
+        let lines = recorder.lines.lock().clone();
+        assert_eq!(
+            lines,
+            vec![
+                ("xray.access".to_string(), "from 1.1.1.1 accepted tcp:2.2.2.2:443".to_string()),
+                ("xray.dns".to_string(), "got answer: d.io -> [9.9.9.9]".to_string()),
+                ("xray".to_string(), "G-CONTENT".to_string()),
+            ],
+            "三事件各进对应通道，target/行文本逐字 = 改前 ConsoleHandler 口径: {lines:?}"
+        );
+    }
+
+    /// P1-10-b 契约验收③：通道写失败 → 丢弃计数可观测且不 panic（File
+    /// handler 打不开路径 → dropped_total 递增）。
+    #[test]
+    fn instance_dropped_total_on_file_write_failure() {
+        let bad = std::env::temp_dir()
+            .join(format!("p110-no-such-dir-{}", std::process::id()))
+            .join("a.log");
+        let cfg = LogConfig {
+            access_log_type: LogType::File,
+            access_log_path: bad.to_string_lossy().into_owned(),
+            ..LogConfig::default()
+        };
+        let inst = LogInstance::new(cfg).unwrap();
+        let r = HandlerCreatorRegistry::new();
+        register_default_creators(&r).unwrap();
+        inst.start(&r).unwrap();
+        assert_eq!(inst.dropped_total(), 0);
+
+        inst.handle(&LogEntry::Access(AccessMessage {
+            from: "1.1.1.1".into(),
+            ..Default::default()
+        }));
+
+        assert!(inst.dropped_total() >= 1, "写失败必须计入 dropped_total（udf 可观测面）");
     }
 }
