@@ -23,6 +23,7 @@ use xray_buf::{
     io::{Reader as BufReader, Writer as BufWriter},
     multi::MultiBuffer,
 };
+use xray_frame::observe::{ObserveSink, Stage};
 use xray_transport::{connection::Connection, link::Link};
 
 use crate::{
@@ -50,6 +51,44 @@ pub fn now_unix_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
+/// P3-3 统一观测流落点：每条探测结果经 `xray_frame::observe` 四元组
+/// （conn_id/stage=Forward/peer/dest）单行发 `xray_frame::observatory` 事件；
+/// `observe` 为 None（未接线，既有测试路径）零开销跳过。peer = 探测 URL 的
+/// host:port（socket 对端），dest = 完整探测 URL。
+fn emit_probe_event(
+    observe: Option<&ObserveSink>,
+    peer: &str,
+    dest: &str,
+    tag: &str,
+    result: &ProbeResult,
+) {
+    if let Some(o) = observe {
+        let reason = if result.last_error_reason.is_empty() {
+            String::new()
+        } else {
+            format!(" reason={}", result.last_error_reason)
+        };
+        o.emit(
+            Stage::Forward,
+            peer.to_string(),
+            dest.to_string(),
+            &format!(
+                "observatory probe tag={tag} alive={} delay={}ms{reason}",
+                result.alive, result.delay
+            ),
+        );
+    }
+}
+
+/// 探测事件的 peer/dest：dest = 原始 URL；peer = URL 解析出的 host:port
+/// （解析失败回退原串——观测面自身禁因探测 URL 形态异常而 panic）。
+fn probe_peer_dest(probe_url: &str) -> (String, String) {
+    match parse_url_host_port(probe_url) {
+        Ok((host, port, _tls)) => (format!("{host}:{port}"), probe_url.to_string()),
+        Err(_) => (probe_url.to_string(), probe_url.to_string()),
+    }
+}
+
 /// 对给定 tag 集合探测一轮（阻塞调用线程直到全部完成），返回是否任一存活。
 ///
 /// 对应 Go `Observer.background()` 单轮探测部分（observer.go:81-110）。
@@ -63,7 +102,10 @@ fn probe_round_blocking(
     status: &StatusStore,
     enable_concurrency: bool,
     now: i64,
+    observe: Option<&ObserveSink>,
+    probe_url: &str,
 ) -> bool {
+    let (peer, dest) = probe_peer_dest(probe_url);
     let mut any_alive = false;
     if enable_concurrency {
         let results = std::thread::scope(|s| {
@@ -85,12 +127,14 @@ fn probe_round_blocking(
         });
         for (tag, result) in results.into_iter().flatten() {
             any_alive |= result.alive;
+            emit_probe_event(observe, &peer, &dest, &tag, &result);
             status.update_with_probe_result(&tag, &result, now);
         }
     } else {
         for tag in tags {
             let result = executor.probe(tag);
             any_alive |= result.alive;
+            emit_probe_event(observe, &peer, &dest, tag, &result);
             status.update_with_probe_result(tag, &result, now);
         }
     }
@@ -115,6 +159,9 @@ pub struct Observer {
     config: ObservatoryConfig,
     status: Arc<StatusStore>,
     state: Mutex<ObserverState>,
+    /// P3-3 统一观测流出口：Some 时每条探测结果发 `xray_frame::observatory`
+    /// 事件（xray_frame::observe::ObserveSink）；None = 零开销静默（缺省）。
+    observe: Option<Arc<ObserveSink>>,
 }
 
 struct ObserverState {
@@ -128,7 +175,16 @@ impl Observer {
             config,
             status: Arc::new(StatusStore::new()),
             state: Mutex::new(ObserverState { started: false, cancel_tx: None }),
+            observe: None,
         }
+    }
+
+    /// 接线统一观测流出口（P3-3：复用 `xray_frame::observe` 四元组与
+    /// `LogFacade` 落点）。builder 形态——既有 `new` 构造面零变化。
+    #[must_use]
+    pub fn with_observe(mut self, sink: Arc<ObserveSink>) -> Self {
+        self.observe = Some(sink);
+        self
     }
 
     pub fn config(&self) -> &ObservatoryConfig {
@@ -170,6 +226,8 @@ impl Observer {
         let subject_selector = self.config.subject_selector.clone();
         let status = self.status.clone();
         let enable_concurrency = self.config.enable_concurrency;
+        let observe = self.observe.clone();
+        let probe_url = self.config.effective_probe_url().to_string();
         tokio::spawn(async move {
             let mut cancel_rx = cancel_rx;
             let mut fail_streak: u32 = 0;
@@ -182,9 +240,19 @@ impl Observer {
                         // runtime）。此前逐 tag 串行直调，async task 所在的
                         let exec = executor.clone();
                         let st = status.clone();
+                        let ob = observe.clone();
+                        let url = probe_url.clone();
                         let tags_empty = tags.is_empty();
                         let any_alive = tokio::task::spawn_blocking(move || {
-                            probe_round_blocking(&tags, exec.as_ref(), &st, enable_concurrency, now)
+                            probe_round_blocking(
+                                &tags,
+                                exec.as_ref(),
+                                &st,
+                                enable_concurrency,
+                                now,
+                                ob.as_deref(),
+                                &url,
+                            )
                         })
                         .await
                         .unwrap_or_else(|e| {
@@ -268,12 +336,16 @@ impl Observer {
             &self.status,
             self.config.enable_concurrency,
             now_unix_secs(),
+            self.observe.as_deref(),
+            self.config.effective_probe_url(),
         );
     }
 
     /// 仅探测单个 tag（用于按需触发）。
     pub fn probe_one(&self, tag: &str, executor: &dyn ProbeExecutor) {
         let result = executor.probe(tag);
+        let (peer, dest) = probe_peer_dest(self.config.effective_probe_url());
+        emit_probe_event(self.observe.as_deref(), &peer, &dest, tag, &result);
         self.status.update_with_probe_result(tag, &result, now_unix_secs());
     }
 

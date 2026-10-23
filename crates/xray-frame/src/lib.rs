@@ -55,7 +55,7 @@ pub use dispatch::{HandlerCapability, Lookup, lookup};
 pub use error::{LifecyclePhase, PluginError};
 pub use lifecycle::{Phase, StartedPlugins, bring_up};
 pub use logging::{LogFacade, init_from_env};
-pub use observe::{ObserveFields, Stage, emit};
+pub use observe::{ObserveFields, ObserveSink, Stage, emit};
 pub use plugin::{ClauseId, Lifecycle, Plugin, PluginContract, PluginDep};
 pub use pool::{BufferPool, ManagedBufferPool, PoolError, PooledBuffer, XrayBufPool};
 pub use registry::PluginRegistry;

@@ -37,8 +37,14 @@ pub struct ObservatoryFeature {
 
 impl ObservatoryFeature {
     /// 从配置创建 ObservatoryFeature。
+    ///
+    /// P3-3：默认接通统一观测流出口（`xray_frame::observe::ObserveSink`，
+    /// target `xray_frame::observatory`，secrets 空——探测事件 tag/URL/delay
+    /// 不含密钥面）。conn_id 指纹命名空间 = `stable64("observatory")`，与装配
+    /// 根监听地址派生的指纹空间分离。
     pub fn new(config: ObservatoryConfig) -> Self {
-        Self { observer: Observer::new(config), io: RwLock::new(None) }
+        let sink = Arc::new(xray_frame::observe::ObserveSink::new("observatory", Vec::new()));
+        Self { observer: Observer::new(config).with_observe(sink), io: RwLock::new(None) }
     }
 
     /// 获取内部 Observer 引用（读观测快照 / 上层桥接 ObservationProvider）。

@@ -14,6 +14,8 @@ xray-buf = { path = "../xray-buf" }
 xray-transport = { path = "../xray-transport" }
 xray-app-dispatcher = { path = "../xray-app-dispatcher" }
 xray-tls = { path = "../xray-tls" }
+# P3-3：观测事件复用 xray_frame::observe 统一四元组与 LogFacade 落点。
+xray-frame = { path = "../xray-frame" }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
@@ -21,4 +23,8 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 async-trait = "0.1"
+
+[dev-dependencies]
+# observe_stream 集成测试的事件捕获（P1-5 同款 set_default + with_writer）。
+tracing-subscriber = { workspace = true }
 
