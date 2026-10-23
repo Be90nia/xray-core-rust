@@ -30,10 +30,11 @@ use xray_frame::{
 
 use crate::{config::Config, handler::Handler, inbound::DnsInbound, outbound::DnsOutbound};
 
-/// 通用条款适用子集（差异表 §2.2 第 16 行：3,5,6,7,8,9,10,12；2/11 走
-/// [`DNS_NOT_APPLICABLE`]——DNS 无会话握手、无密钥）。
+/// 通用条款适用子集（差异表 §2.2 第 16 行 + PM 拍板 2026-10-24：3,4,5,6,7,8,9,10,12；
+/// 1/2/11 走 [`DNS_NOT_APPLICABLE`]——DNS 无认证面、无会话握手、无密钥）。
 static DNS_CLAUSES: &[ClauseId] = &[
     ClauseId::ConnIdPresent,
+    ClauseId::PoolDiscipline,
     ClauseId::SpawnManaged,
     ClauseId::StopRegistered,
     ClauseId::ConfigSectionOnly,
@@ -49,8 +50,10 @@ static DNS_EXTRA: &[(&str, &str)] = &[
     ("DNS-ANTILOOP", "fakedns 与真实 DNS 回环防护语义不变"),
 ];
 
-/// N/A 声明（P1-7 拍板 P2.2：允许声明不适用但必须带非空理由）。
+/// N/A 声明（P1-7 拍板 P2.2：允许声明不适用但必须带非空理由；条款 1 为
+/// PM 拍板 2026-10-24 补齐，同 freedom 先例）。
 static DNS_NOT_APPLICABLE: &[(ClauseId, &str)] = &[
+    (ClauseId::AuthErrorClassified, "DNS 无凭证/无认证协商"),
     (
         ClauseId::HandshakeDeadline,
         "DNS 无会话握手：UDP 单包查询、TCP 2B 长度帧直读，无协商轮次与首包 deadline 面",
@@ -86,12 +89,14 @@ impl DnsPlugin {
 
     /// 插件产出：规则核 [`Handler`]（qType + domain 匹配决策面）。
     ///
-    /// 生产同构走 [`Handler::init`]（fail-closed：单规则编译失败 → 该规则
-    /// inert 永不命中，xray-core outbound dns 分支同款）；拒启变体 `try_init`
-    /// 的切换留装配层拍板。timeout 对应 Go dns.go:85 policy ConnectionIdle
-    /// （装配层注入）。
+    /// PM 拍板 2026-10-24：走 [`Handler::try_init`] fail-visible 拒启——任一
+    /// 规则编译失败（geosite 资产缺失/规则非法）→ `Err(PluginError::Other)`
+    /// → L5 装配门报错，不允许 fail-closed 半启动（crate 既有 Result API，
+    /// 无 panic 路径，无需 catch_unwind）。timeout 对应 Go dns.go:85 policy
+    /// ConnectionIdle（装配层注入）。
     pub fn rule_handler(&self, timeout: Duration) -> Result<Handler, PluginError> {
-        Ok(Handler::init(self.built_config()?, timeout))
+        Handler::try_init(self.built_config()?, timeout)
+            .map_err(|e| PluginError::Other(format!("dns: {e}").into()))
     }
 
     /// 插件产出：入站 handler（`InboundHandler` 实现不变，[`DnsInbound::new`]

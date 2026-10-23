@@ -1,4 +1,4 @@
-//! P2 批次 D 验收：L4 契约夹具（8 条适用 + 2 N/A + DNS-U16 / DNS-ANTILOOP
+//! P2 批次 D 验收：L4 契约夹具（9 条适用 + 3 N/A + DNS-U16 / DNS-ANTILOOP
 //! 协议专属）+ 装配链 register → build → bring_up → shutdown（`is_clean()`）
 //! + 装配门负向 + DNS-U16 行为断言 + handler 工厂产出。
 //!
@@ -32,8 +32,9 @@ fn contract_macro_holds_for_dns() {
     assert_plugin_contract!(DnsPlugin);
 }
 
-/// 契约面内容断言：差异表 §2.2 第 16 行——8 条适用（3,5,6,7,8,9,10,12）、
-/// 2/11 走 N/A（理由非空）、DNS-U16 / DNS-ANTILOOP 协议专属。
+/// 契约面内容断言：差异表 §2.2 第 16 行 + PM 拍板 2026-10-24——9 条适用
+/// （3,4,5,6,7,8,9,10,12；4 = 转发面走 buf 受 BufferPool 接缝约束）、1/2/11
+/// 走 N/A（理由非空，条款 1 同 freedom 先例）、DNS-U16 / DNS-ANTILOOP 协议专属。
 #[test]
 fn contract_surface_declares_subset_na_and_extra() {
     let plugin = DnsPlugin::default();
@@ -46,6 +47,7 @@ fn contract_surface_declares_subset_na_and_extra() {
 
     let expected: &[ClauseId] = &[
         ClauseId::ConnIdPresent,
+        ClauseId::PoolDiscipline,
         ClauseId::SpawnManaged,
         ClauseId::StopRegistered,
         ClauseId::ConfigSectionOnly,
@@ -54,13 +56,18 @@ fn contract_surface_declares_subset_na_and_extra() {
         ClauseId::LogDiscipline,
         ClauseId::HotPathFreeze,
     ];
-    assert_eq!(contract.clauses.len(), expected.len(), "dns 适用 8 条（差异表 §2.2 第 16 行）");
+    assert_eq!(
+        contract.clauses.len(),
+        expected.len(),
+        "dns 适用 9 条（差异表 §2.2 第 16 行 + PM 拍板条款 4）"
+    );
     for clause in expected {
         assert!(contract.clauses.contains(clause), "缺条款 {clause:?}");
     }
 
-    let na: &[ClauseId] = &[ClauseId::HandshakeDeadline, ClauseId::SecretMasking];
-    assert_eq!(contract.not_applicable.len(), na.len(), "dns 声明 2 条 N/A");
+    let na: &[ClauseId] =
+        &[ClauseId::AuthErrorClassified, ClauseId::HandshakeDeadline, ClauseId::SecretMasking];
+    assert_eq!(contract.not_applicable.len(), na.len(), "dns 声明 3 条 N/A");
     for clause in na {
         let reason = contract
             .not_applicable
