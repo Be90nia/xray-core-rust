@@ -7,11 +7,26 @@
 //! 继承派生规划：`docs/architecture/udf-frame继承派生规划-2026-10-23.md`；
 //! 实施计划：`docs/architecture/xray-frame-impl-plan-2026-10-19.md`（P0-P4）。
 //!
-//! 本文件当前只承载**接线冒烟**：证明 udf 依赖面在本仓可解析、继承面编译期
-//! 可见。P0 骨架（Plugin trait + Registry + Context + error）随后续派单填充。
+//! 本文件承载**接线冒烟**（udf 依赖面可解析、继承面编译期可见）与 P0 骨架
+//! 模块挂载。P0-1/2/3/7 已落（plugin/error/context/logging/registry）；
+//! lifecycle 编排、assembly、shutdown 随 P0-4/5/8 派单填充。
 
 /// 契约层词汇直呼（继承面 A 类：`use skeleton::`——包名 udf-skeleton 的 lib 名）。
 pub use skeleton::EffectId;
+
+// P0 骨架五件（2026-10-23 派单）：L1 契约（plugin）+ L5 统一错误（error）+
+// L2 能力句柄（context）+ 装配日志唯一入口（logging）+ 插件注册表（registry）。
+pub mod context;
+pub mod error;
+pub mod logging;
+pub mod plugin;
+pub mod registry;
+
+pub use context::{PluginContext, derive_fingerprint};
+pub use error::{LifecyclePhase, PluginError};
+pub use logging::{LogFacade, init_from_env};
+pub use plugin::{ClauseId, Lifecycle, Plugin, PluginContract, PluginDep};
+pub use registry::PluginRegistry;
 
 #[cfg(test)]
 mod wiring_smoke_tests {

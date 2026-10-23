@@ -1,0 +1,22 @@
+# P0-6 L3 静态闸（契约任务书 §P0-6 + 探针结论 2026-10-23）：异步托管唯一口 =
+# PluginContext::spawn（透传 skeleton_infra::fx::FxScope），裸 spawn 失管（坑约束 #5）
+# 在本 crate 归零。CI 宽门 clippy -D warnings 使 warn 升级为红线。
+# 注：`path` 是被禁方法的 def path，不是源码 glob——glob 写进 path 不报 fatal 但
+# 禁令静默无效（探针 1 实测），落地禁用该形态。
+#
+# 注：per-crate clippy.toml 会替换 root 配置（探针 2b 覆盖语义实测），
+# root 阈值键在此镜像维护。
+# bd g3cr 镜像（root clippy.toml 同键）：unwrap_used 由测试代码
+#（cfg(test)/tests/）豁免，生产代码零 unwrap。
+allow-unwrap-in-tests = true
+
+# P0-7 强约束映射顺带落（同文件同机制，零新增探针成本）：日志唯一入口 =
+# LogFacade / PluginContext::log（坑约束 #10）。宏禁令用 disallowed-macros
+#（disallowed-methods 的宏对应键）。
+disallowed-methods = [
+    { path = "tokio::spawn", reason = "裸 spawn 逃逸 FxScope 生命周期记账（坑约束 #5）：一律走 PluginContext::spawn；确需豁免时 #[allow(clippy::disallowed_methods)] + 理由注释登记" },
+]
+disallowed-macros = [
+    { path = "std::println", reason = "禁直印 stdout：日志走 LogFacade（PluginContext::log，P0-7 target 规范）" },
+    { path = "std::eprintln", reason = "禁直印 stderr：日志走 LogFacade（PluginContext::log，P0-7 target 规范）" },
+]

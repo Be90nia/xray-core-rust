@@ -6,11 +6,32 @@ license.workspace = true
 description = "Xray-core-rust assembly framework layer: plugins and shared facilities derived from udf-frame"
 publish = false
 
-# 继承派生（PM 规划 2026-10-23，docs/architecture/udf-frame继承派生规划-2026-10-23.md）：
-# 开发期 path 依赖指向仓内 crates/udf-frame（联调即改即用）；udf CI 绿后切
-# git dependency + rev 锁定（主线规划 §4），届时仅改本文件三行。
+# 继承派生（双向依赖模型 §1.2，契约任务书 P0-9）：path 依赖指向仓内
+# crates/udf-frame 是唯一形态——不锁 rev、不动 Cargo.lock 手写 pin，版本锚
+# 只有 Cargo.lock 自然记录的构建时 commit。CI 由 .github/actions/fetch-udf
+# 拉 udf main 最新 + check-runs 上游闸 + UDF_HEAD 注入 rust-cache 键；
+# 本地开发即仓内 crates/udf-frame 工作副本（path 即改即用）。
 # lib 名纪律：import 用 udf 包的 lib 名（skeleton / skeleton_infra / std_ext）。
 [dependencies]
 udf-skeleton = { path = "../udf-frame/skeleton" }
 udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio", "log"] }
 udf-std-ext = { path = "../udf-frame/std-ext" }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+# B6 取证（2026-10-23 `cargo tree -p xray-frame -i log`）：log v0.4.33 已经
+# udf-skeleton-infra（log feature → tracing-log）在树内；直接依赖仅为引用
+# log::LevelFilter 类型（logging::init_from_env 签名），零新第三方引入。
+log = "0.4"
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+
+[lints.clippy]
+# disallowed_methods 旧形态属 restriction 组（默认 allow）；本仓工具链
+#（nightly-2026-05-28，clippy 0.1.97）已 warn-by-default（探针结论 2026-10-23，
+# 上游 clippy_lints/disallowed_methods.rs 自述 warn-by-default），此显式声明降级为
+# 防御性：防上游回改默认级别、对旧工具链（真 restriction-allow 形态）可移植。
+# 主仓 CI `cargo clippy --workspace --all-targets -- -D warnings` 把 warn 升级为
+# 失败，故 warn 即拦截（udf 先例：skeleton-infra/Cargo.toml:102-109）。
+disallowed_methods = "warn"
