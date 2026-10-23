@@ -120,10 +120,28 @@ async fn listen_hysteria(
     let quic_listener = listener.clone();
 
     let accept_task = tokio::spawn(async move {
+        use xray_transport::accept_policy::{AcceptErrorKind, backoff_if_resource, classify};
         loop {
             let conn = match listener.accept().await {
                 Ok(c) => c,
-                Err(_) => break,
+                // 错误永不退出（accept_policy 铁律）：退出唯一来源是 close() 的
+                // abort 句柄——原 `Err(_) => break` 会因任何 accept 错误（含单连接
+                // 级）静默杀死整个 hysteria 监听，无退避、无日志。
+                Err(e) => {
+                    match classify(&e) {
+                        AcceptErrorKind::Resource => {
+                            tracing::warn!(tag = "hysteria", local = %local, error = %e, "hysteria inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续");
+                            backoff_if_resource(&e).await;
+                        },
+                        AcceptErrorKind::Connection => {
+                            tracing::debug!(tag = "hysteria", error = %e, "hysteria inbound: 单连接级 accept 错误，继续监听");
+                        },
+                        AcceptErrorKind::Unknown => {
+                            tracing::warn!(tag = "hysteria", local = %local, error = %e, "hysteria inbound: accept 错误（未知类别），继续监听");
+                        },
+                    }
+                    continue;
+                },
             };
             let h = handler.clone();
             tokio::spawn(async move {
@@ -131,12 +149,16 @@ async fn listen_hysteria(
             });
         }
     });
+    let abort = accept_task.abort_handle();
+    // 意外退出监控：循环只应经 close() 的 abort 退出；panic 会静默杀掉监听——
+    // error! 兜底发声。
+    tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
+        "hysteria",
+        local.to_string(),
+        accept_task,
+    ));
 
-    Ok(Box::new(HysteriaTransportListener {
-        local,
-        listener: quic_listener,
-        abort: accept_task.abort_handle(),
-    }))
+    Ok(Box::new(HysteriaTransportListener { local, listener: quic_listener, abort }))
 }
 
 /// 单条 QUIC conn 内的 accept_bi 循环：把 client-initiated bi-stream 桥到 handler。

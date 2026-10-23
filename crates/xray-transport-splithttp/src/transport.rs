@@ -154,10 +154,28 @@ async fn listen_tcp(
     tracing::info!(%local, "listening TCP for XHTTP");
 
     let accept_task = tokio::spawn(async move {
+        use xray_transport::accept_policy::{AcceptErrorKind, backoff_if_resource, classify};
         loop {
             let (stream, peer) = match tcp.accept().await {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(e) => {
+                    // 分类日志 + 资源类退避（原 `Err(_) => continue` 无退避无日志，
+                    // EMFILE 时忙旋烧 CPU）；错误永不退出——退出唯一来源是
+                    // close() 的 abort 句柄。
+                    match classify(&e) {
+                        AcceptErrorKind::Resource => {
+                            tracing::warn!(tag = "splithttp", local = %local, error = %e, "splithttp inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续");
+                            backoff_if_resource(&e).await;
+                        },
+                        AcceptErrorKind::Connection => {
+                            tracing::debug!(tag = "splithttp", error = %e, "splithttp inbound: 单连接级 accept 错误，继续监听");
+                        },
+                        AcceptErrorKind::Unknown => {
+                            tracing::warn!(tag = "splithttp", local = %local, error = %e, "splithttp inbound: accept 错误（未知类别），继续监听");
+                        },
+                    }
+                    continue;
+                },
             };
             let _ = stream.set_nodelay(true);
             // Tcpmask wrap（Go hub.go:546-549 WrapListener：mask 在 TLS/REALITY
@@ -186,11 +204,14 @@ async fn listen_tcp(
             });
         }
     });
-    Ok(Box::new(SplithttpListener {
-        local,
-        tcp_abort: Some(accept_task.abort_handle()),
-        h3_endpoint: None,
-    }))
+    let tcp_abort = accept_task.abort_handle();
+    // 意外退出监控：循环只应经 close() 的 abort 退出；panic 会静默杀掉监听。
+    tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
+        "splithttp",
+        local.to_string(),
+        accept_task,
+    ));
+    Ok(Box::new(SplithttpListener { local, tcp_abort: Some(tcp_abort), h3_endpoint: None }))
 }
 
 /// 单个已 accept 的流：REALITY / TLS 包装 → h1+h2c HTTP 服务。

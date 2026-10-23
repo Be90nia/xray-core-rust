@@ -102,11 +102,26 @@ async fn listen_httpupgrade(
     // accept task 的 abort 句柄：close() 直接取消 task，parked 在 accept() 上的
     // 循环被确定性解除，TcpListener drop 即释放端口（对齐 Go hub.go Close()）。
     let accept_task = tokio::spawn(async move {
+        use xray_transport::accept_policy::{AcceptErrorKind, backoff_if_resource, classify};
         loop {
             let (mut tcp, mut remote) = match listener.accept().await {
                 Ok(pair) => pair,
                 Err(e) => {
-                    tracing::debug!("HTTPUpgrade accept error: {e}");
+                    // 分类日志 + 资源类退避（原无条件 debug+continue 在 EMFILE 时
+                    // 构成忙旋烧 CPU）；错误永不退出——退出唯一来源是 close() 的
+                    // abort 句柄。
+                    match classify(&e) {
+                        AcceptErrorKind::Resource => {
+                            tracing::warn!(tag = "httpupgrade", local = %local, error = %e, "httpupgrade inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续");
+                            backoff_if_resource(&e).await;
+                        },
+                        AcceptErrorKind::Connection => {
+                            tracing::debug!(tag = "httpupgrade", error = %e, "httpupgrade inbound: 单连接级 accept 错误，继续监听");
+                        },
+                        AcceptErrorKind::Unknown => {
+                            tracing::warn!(tag = "httpupgrade", local = %local, error = %e, "httpupgrade inbound: accept 错误（未知类别），继续监听");
+                        },
+                    }
                     continue;
                 },
             };
@@ -159,8 +174,15 @@ async fn listen_httpupgrade(
         }
     });
 
-    Ok(Box::new(HttpUpgradeListener { local, abort: accept_task.abort_handle() })
-        as Box<dyn TransportListener>)
+    let abort = accept_task.abort_handle();
+    // 意外退出监控：循环只应经 close() 的 abort 退出；panic 会静默杀掉监听。
+    tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
+        "httpupgrade",
+        local.to_string(),
+        accept_task,
+    ));
+
+    Ok(Box::new(HttpUpgradeListener { local, abort }) as Box<dyn TransportListener>)
 }
 
 async fn do_handshake(

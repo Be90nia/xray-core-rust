@@ -20,6 +20,7 @@ use std::{io, net::SocketAddr, sync::Arc};
 
 use xray_common::net::destination::Destination;
 use xray_transport::{
+    accept_policy::{AcceptErrorKind, backoff_if_resource, supervise_accept_loop},
     connection::Connection,
     dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
     listener_registry::{
@@ -30,6 +31,7 @@ use xray_transport::{
 use crate::{
     client::{DelayDialConn, DialFactory, DialParams, dial_with_params},
     config::Config,
+    error::WsError,
     pool::{PoolKey, WsConnectionPool, global_pool},
 };
 
@@ -116,11 +118,11 @@ async fn listen_ws(
     } else {
         None
     };
-    tokio::spawn(async move {
+    let accept_loop_handle = tokio::spawn(async move {
         loop {
             tokio::select! {
                 result = async {
-                    if let Some(ref tls_cfg) = tls_config {
+                    if let Some(tls_cfg) = &tls_config {
                         ws_listener.accept_tls(tls_cfg.clone()).await
                     } else {
                         ws_listener.accept().await
@@ -128,14 +130,27 @@ async fn listen_ws(
                 } => {
                     match result {
                         Ok(accepted) => handler(accepted.conn),
+                        // 错误永不退出（accept_policy 铁律）：退出唯一来源是
+                        // close_notify 分支。生产杀手链：TLS 握手成功后客户端断开 →
+                        // rustls PeerClosed（"peer closed connection without sending
+                        // TLS alert"）→ tungstenite Error::Io → WsError::Tungstenite，
+                        // 文本含小写 "closed" 曾命中旧 contains("closed") => break，
+                        // 整个 443 监听静默消失且日志零线索。
                         Err(e) => {
-                            let msg = e.to_string();
-                            if msg.contains("closed") { break; }
-                            // ponytail: too many open files 时 sleep 重试，其他错误继续
-                            if msg.contains("too many") {
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            match accept_kind(&e) {
+                                AcceptErrorKind::Resource => {
+                                    tracing::warn!(tag = "ws", local = %local_addr, error = %e, "ws inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续");
+                                    if let WsError::Io(io_err) = &e {
+                                        backoff_if_resource(io_err).await;
+                                    }
+                                }
+                                AcceptErrorKind::Connection => {
+                                    tracing::debug!(tag = "ws", error = %e, "ws inbound: 单连接级 accept 错误，继续监听");
+                                }
+                                AcceptErrorKind::Unknown => {
+                                    tracing::warn!(tag = "ws", local = %local_addr, error = %e, "ws inbound: accept 错误（未知类别），继续监听");
+                                }
                             }
-                            continue;
                         }
                     }
                 }
@@ -143,6 +158,9 @@ async fn listen_ws(
             }
         }
     });
+    // 意外退出监控：循环只应经 close_notify 分支退出；panic（如 handler 回调
+    // panic 沿任务栈炸掉 accept task）会静默杀掉监听——error! 兜底发声。
+    tokio::spawn(supervise_accept_loop("ws", local_addr.to_string(), accept_loop_handle));
 
     Ok(Box::new(WsTransportListener { local_addr, close_notify }))
 }
@@ -562,6 +580,23 @@ fn parse_headers(
         // 非 string 值跳过（与 Go proto JSON 解析对未知字段的容忍一致）。
     }
     Some(map)
+}
+
+/// [`WsError`] → 共享 accept 分类（`xray_transport::accept_policy`）。
+///
+/// 非 `Io` 变体都发生在已 accept 的连接上（TLS/WS 握手、升级请求、帧解析——含
+/// 生产杀手链「TLS 握手成功后对端断开」的 rustls `UnexpectedEof`/
+/// "peer closed ... close_notify" 文本两条落地路径：tungstenite `Error::Io` 包装
+/// 与 `HandshakeFailed("tls accept: ...")`），一律单连接级；`Io` 再按 kind 细分。
+fn accept_kind(e: &WsError) -> AcceptErrorKind {
+    match e {
+        WsError::HandshakeFailed(_)
+        | WsError::InvalidUpgradeRequest { .. }
+        | WsError::InvalidOpcode(_)
+        | WsError::FrameTooLarge(_)
+        | WsError::Tungstenite(_) => AcceptErrorKind::Connection,
+        WsError::Io(io_err) => xray_transport::accept_policy::classify(io_err),
+    }
 }
 
 #[cfg(test)]
@@ -1194,5 +1229,74 @@ mod tests {
             got.extend_from_slice(&buf[..n]);
         }
         assert_eq!(got.len(), payload.len());
+    }
+}
+
+#[cfg(test)]
+mod accept_kind_tests {
+    use super::*;
+
+    // 生产杀手（443 静默死亡）：两步客户端——TLS 握手成功后立刻断开（≤11 秒即可
+    // 打死监听）。rustls PeerClosed 的 Display 含小写 "closed"，旧
+    // `contains("closed") => break` 命中即整个 443 监听消失、进程仍活、其余 inbound
+    // 正常、日志零线索。以下断言：这类单连接级错误分类为 Connection（debug + 继续）；
+    // "退出"不在动作表示域内（accept_policy 铁律 1，退出只来自 close_notify 分支）。
+
+    #[test]
+    fn tungstenite_connection_closed_maps_to_connection() {
+        let e = WsError::Tungstenite(tokio_tungstenite::tungstenite::Error::ConnectionClosed);
+        assert!(e.to_string().contains("closed"), "前置：文本须命中旧触发条件: {e}");
+        assert_eq!(accept_kind(&e), AcceptErrorKind::Connection);
+    }
+
+    #[test]
+    fn rustls_peer_closed_via_tungstenite_io_maps_to_connection() {
+        // 生产触发链（本仓 vendored rustls）：TLS 握手成功后对端断开 → conn.rs 的
+        // UNEXPECTED_EOF_MESSAGE（"peer closed connection without sending TLS
+        // close_notify: ..."，ErrorKind::UnexpectedEof）→ tokio-rustls 透传 →
+        // tungstenite Error::Io → WsError::Tungstenite（上游 rustls 同义错误为
+        // Error::PeerClosed "peer closed connection without sending TLS alert"；
+        // 两者文本都含小写 "closed"）
+        let e = WsError::Tungstenite(tokio_tungstenite::tungstenite::Error::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify",
+        )));
+        assert!(e.to_string().contains("closed"), "前置：文本须命中旧触发条件: {e}");
+        assert_eq!(accept_kind(&e), AcceptErrorKind::Connection);
+    }
+
+    #[test]
+    fn tls_accept_handshake_failed_path_maps_to_connection() {
+        // rustls 错误的另一条落地路径：accept_tls 把失败包装成
+        // HandshakeFailed("tls accept: ...")
+        let e = WsError::HandshakeFailed(
+            "tls accept: IO error: peer closed connection without sending TLS alert".into(),
+        );
+        assert!(e.to_string().contains("closed"));
+        assert_eq!(accept_kind(&e), AcceptErrorKind::Connection);
+    }
+
+    #[test]
+    fn listener_level_io_errors_classify_resource_with_any_case() {
+        // EMFILE/ENFILE：glibc "Too many open files" 大写开头——退避判定大小写不敏感
+        let emfile = WsError::Io(io::Error::other("Too many open files"));
+        assert_eq!(accept_kind(&emfile), AcceptErrorKind::Resource);
+        let lower = WsError::Io(io::Error::other("too many open files"));
+        assert_eq!(accept_kind(&lower), AcceptErrorKind::Resource);
+    }
+
+    #[test]
+    fn connection_dropped_mid_handshake_maps_to_connection() {
+        // 客户端在 PROXY protocol / WS 握手读取中途断开 → 继续，绝不杀监听
+        for kind in [
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+        ] {
+            assert_eq!(
+                accept_kind(&WsError::Io(io::Error::from(kind))),
+                AcceptErrorKind::Connection
+            );
+        }
     }
 }
