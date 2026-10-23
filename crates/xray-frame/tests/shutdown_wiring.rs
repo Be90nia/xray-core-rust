@@ -120,7 +120,7 @@ fn fake(name: &'static str, deps: &'static [PluginDep], probe: &Probe) -> FakePl
     FakePlugin {
         name,
         deps,
-        contract: PluginContract { clauses: &[], extra: &[] },
+        contract: PluginContract { clauses: &[], extra: &[], not_applicable: &[] },
         body: LifecycleBody { name, probe: probe.clone(), panic_stop: false, slow_stop: None },
     }
 }

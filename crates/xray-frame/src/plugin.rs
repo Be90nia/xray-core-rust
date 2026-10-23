@@ -35,13 +35,19 @@ pub enum ClauseId {
     HotPathFreeze,
 }
 
-/// 条款声明：适用通用条款集 + 协议专属条款（v0.1，PM 拍板 2026-10-23 锁定：
-/// 枚举可穷举校验，`extra` 自由文本留协议专属空间——mux 域名判据、vmess u16
-/// 边界等；后续新增通用条款 = 加枚举变体，可回溯）。
+/// 条款声明：适用通用条款集 + 协议专属条款 + N/A 声明（v0.1，PM 拍板
+/// 2026-10-23 锁定：枚举可穷举校验，`extra` 自由文本留协议专属空间——mux
+/// 域名判据、vmess u16 边界等；后续新增通用条款 = 加枚举变体，可回溯）。
+///
+/// `not_applicable`（P1-7 加法扩展，拍板 P2.2）：通用条款适用性判定为
+/// **不适用**的声明面——`ClauseId` 必须配非空理由（L4 夹具
+/// `assert_plugin_contract!` 校验理由非空且与 `clauses` 不重叠）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PluginContract {
     pub clauses: &'static [ClauseId],
     pub extra: &'static [(&'static str, &'static str)],
+    /// N/A 声明：`(条款, 理由)`。理由必须非空；条款不得同时出现在 `clauses`。
+    pub not_applicable: &'static [(ClauseId, &'static str)],
 }
 
 /// 依赖声明（P0-2 注册表拓扑排序的输入）。
@@ -113,7 +119,7 @@ mod tests {
 
     impl Stub {
         fn bare() -> Self {
-            Self { contract: PluginContract { clauses: &[], extra: &[] } }
+            Self { contract: PluginContract { clauses: &[], extra: &[], not_applicable: &[] } }
         }
     }
 
@@ -149,11 +155,18 @@ mod tests {
         let contract = PluginContract {
             clauses: &[ClauseId::SpawnManaged, ClauseId::LogDiscipline],
             extra: &[("mux_carrier", "destination 域名判据，不校验 command")],
+            not_applicable: &[(ClauseId::PoolDiscipline, "桩零缓冲分配")],
         };
-        let stub =
-            Stub { contract: PluginContract { clauses: contract.clauses, extra: contract.extra } };
+        let stub = Stub {
+            contract: PluginContract {
+                clauses: contract.clauses,
+                extra: contract.extra,
+                not_applicable: contract.not_applicable,
+            },
+        };
         assert_eq!(stub.contract().clauses, &[ClauseId::SpawnManaged, ClauseId::LogDiscipline]);
         assert_eq!(stub.contract().extra[0].0, "mux_carrier");
+        assert_eq!(stub.contract().not_applicable[0].0, ClauseId::PoolDiscipline);
     }
 
     #[test]

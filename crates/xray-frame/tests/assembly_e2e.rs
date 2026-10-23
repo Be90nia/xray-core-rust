@@ -94,7 +94,8 @@ impl Plugin for FakePlugin {
     }
 
     fn contract(&self) -> &PluginContract {
-        static EMPTY: PluginContract = PluginContract { clauses: &[], extra: &[] };
+        static EMPTY: PluginContract =
+            PluginContract { clauses: &[], extra: &[], not_applicable: &[] };
         &EMPTY
     }
 

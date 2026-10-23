@@ -47,7 +47,8 @@ impl Plugin for Stub {
     }
 
     fn contract(&self) -> &PluginContract {
-        const EMPTY: PluginContract = PluginContract { clauses: &[], extra: &[] };
+        const EMPTY: PluginContract =
+            PluginContract { clauses: &[], extra: &[], not_applicable: &[] };
         &EMPTY
     }
 

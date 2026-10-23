@@ -145,6 +145,9 @@ pub struct FrameworkBuilder {
     fingerprint: u64,
     shutdown_timeout: Duration,
     ctxs: HashMap<&'static str, PluginContext>,
+    /// 全局配置值面（段路由底座；P1-7 加法扩展：`with_config` 注入——缺省
+    /// 空对象，真实配置文件接入归 P3-2）。
+    config_root: serde_json::Value,
 }
 
 impl FrameworkBuilder {
@@ -159,7 +162,16 @@ impl FrameworkBuilder {
             fingerprint: opts.id_fingerprint.unwrap_or_else(|| derive_fingerprint(None)),
             shutdown_timeout,
             ctxs: HashMap::new(),
+            config_root: serde_json::json!({}),
         })
+    }
+
+    /// 注入全局配置值面（段路由底座）。缺省空对象；插件 `ctx.section()` 按
+    /// `outbounds[]/inbounds[]` 内 `protocol` 字段路由（坑约束 7）。
+    #[must_use]
+    pub fn with_config(mut self, config_root: serde_json::Value) -> Self {
+        self.config_root = config_root;
+        self
     }
 
     /// 阶段①注册：透传 [`PluginRegistry::register`]（重名不覆盖、满 → Err）。
@@ -178,7 +190,15 @@ impl FrameworkBuilder {
             guarded_build(&plugin, &mut ctx)?;
             self.ctxs.insert(plugin.name(), ctx);
         }
-        let Self { registry, fx, coordinator, shutdown_timeout, ctxs, fingerprint: _ } = self;
+        let Self {
+            registry,
+            fx,
+            coordinator,
+            shutdown_timeout,
+            ctxs,
+            fingerprint: _,
+            config_root: _,
+        } = self;
         Ok(Framework {
             registry,
             coordinator,
@@ -189,8 +209,8 @@ impl FrameworkBuilder {
         })
     }
 
-    /// ctx 构造（每插件一份；log 域约定 = 插件名；config 根空对象——真实配置
-    /// 文件接入归 P3-2，段路由此刻退化为环境回落）。
+    /// ctx 构造（每插件一份；log 域约定 = 插件名；配置根经 `with_config` 注入，
+    /// 缺省空对象——真实配置文件接入归 P3-2，段路由此刻走注入面）。
     fn new_ctx(&self, plugin_name: &'static str) -> PluginContext {
         PluginContext::new(
             plugin_name,
@@ -198,7 +218,7 @@ impl FrameworkBuilder {
             Arc::new(SystemClock),
             self.fingerprint,
             Arc::new(StdEnv),
-            serde_json::json!({}),
+            self.config_root.clone(),
             LogFacade::new(plugin_name, vec![]),
         )
     }

@@ -21,10 +21,13 @@
 pub mod dispatcher;
 pub mod handler;
 pub mod inbound;
+// P1-7 插件化（五层强约束首个实证件）：BlackholePlugin + BlackholeLifecycle。
+pub mod plugin;
 pub mod response;
 
 pub use dispatcher::{BlackholeHandler, make_blackhole_handler};
 pub use handler::{BlackholeError, Handler};
 pub use inbound::BlackholeInboundHandler;
+pub use plugin::{BlackholeLifecycle, BlackholePlugin};
 pub use response::{ResponseConfig, get_internal_response, proto_response};
 pub use xray_proto::xray::proxy::blackhole::{Config, Response};

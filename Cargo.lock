@@ -5675,6 +5675,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "udf-skeleton",
+ "udf-skeleton-infra",
  "uuid",
  "xray-buf",
  "xray-common",
@@ -6183,6 +6184,8 @@ name = "xray-proxy-blackhole"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6190,6 +6193,7 @@ dependencies = [
  "xray-buf",
  "xray-common",
  "xray-features",
+ "xray-frame",
  "xray-proto",
  "xray-transport",
 ]

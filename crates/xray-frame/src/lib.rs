@@ -24,7 +24,10 @@ pub use skeleton::EffectId;
 // L2 能力句柄（context）+ 装配日志唯一入口（logging）+ 插件注册表（registry）+
 // 生命周期三相编排（lifecycle）+ 装配组合根（assembly）。
 pub mod assembly;
+// L4 契约测试夹具（P1-7 A 块）：assert_plugin_contract! 宏 + #[doc(hidden)]
+// 最小辅助面；宏经 #[macro_export] 挂根。
 pub mod context;
+pub mod contract_assert;
 // P1 即件：超时唯一入口（坑约束 2）+ 握手/空闲限时（P1-4）。
 pub mod deadline;
 pub mod error;
