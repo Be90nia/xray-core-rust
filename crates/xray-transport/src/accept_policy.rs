@@ -58,7 +58,7 @@ pub fn classify(e: &io::Error) -> AcceptErrorKind {
     }
 }
 
-/// 资源类错误退避 [`BACKOFF`] 后返回；其他错误立即返回（循环 continue 前调用）。
+/// 资源类错误退避 500ms 后返回；其他错误立即返回（循环 continue 前调用）。
 pub async fn backoff_if_resource(e: &io::Error) {
     if matches!(classify(e), AcceptErrorKind::Resource) {
         tokio::time::sleep(BACKOFF).await;

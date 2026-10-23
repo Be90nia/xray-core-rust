@@ -29,6 +29,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - 未知 transport 网络名从**静默接受**改为配置期硬错（文案逐字对齐 Go `Config: unknown transport protocol: <p>`）；`method` 优先于 `network`（Go `transport_internet.go:85-88`）；`xhttpSettings` 回退收窄到 xhttp/splithttp（防 `network:"ws"` 静默吃下 xhttp 配置）
 - TUN UDP：目的组播/广播包不进 relay（SSDP/mDNS 洪泛源）+ relay 失败目的级 5s 冷却（防 ~50ms 一轮重建刷日志）（bd ijn7）
 - `crates/xray-transport/src/headers/` 删除 5 个零引用变体（dtls/srtp/utp/wechat/wireguard，真身在 `finalmask/mkcp/header.rs`）
+- **inbound 监听静默死亡**（生产 P1，bd wsiq）：accept 循环按**错误文本** `contains("closed")` 决定退出，而单条连接的 TLS/WS 握手失败（对端握手成功后断开）文本含 "closed" → 整个 inbound 监听循环退出 → `TcpListener` 被 drop → **端口不再 listen 而进程存活**（日志零线索）→ Cloudflare 回源 connection refused → 节点 521 / -1。根因是复刻把 TLS/WS 握手内联进 accept 循环（Go 的 keepAccepting 把握手放在每连接 goroutine 内，故同样的文本匹配在 Go 侧安全）。全仓 accept 错误处理收敛为统一分级（新增 `xray-transport::accept_policy`）：资源/瞬时类 warn + 退避 500ms + 继续、单连接级 debug + 继续、未知 warn + 继续，**错误永不作为退出条件**（唯一出口是显式 close），循环意外退出打 error 日志；覆盖 ws / tcp / unix / hysteria / httpupgrade / splithttp 6 处
 
 ### Added
 
