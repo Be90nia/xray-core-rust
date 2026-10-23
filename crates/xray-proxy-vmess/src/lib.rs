@@ -38,6 +38,8 @@ pub mod encoding;
 pub mod error;
 pub mod inbound;
 pub mod outbound;
+// P2 批次 B 插件化（差异表 §2.2 第 2 行）：L1/L4 面，aead/encoding wire 零改动。
+pub mod plugin;
 pub mod validator;
 
 pub use account::MemoryAccount;
@@ -45,6 +47,7 @@ pub use dispatcher::{VmessOutboundConfig, make_vmess_dial_fn, parse_vmess_config
 pub use encoding::server::SessionHistory;
 pub use error::{Result, VmessError};
 pub use inbound::{serve_vmess, server::handle_connection as handle_vmess_connection};
+pub use plugin::{VmessLifecycle, VmessPlugin};
 pub use validator::{MemoryUser, TimedUserValidator, Validator};
 
 /// VMess 协议版本号（对应 Go 的 `encoding.Version` 常量）。
