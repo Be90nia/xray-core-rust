@@ -27,6 +27,7 @@ use bytes::Bytes;
 use h2::client;
 use hickory_proto::rr::RecordType;
 use http::{Method, Request, StatusCode, header::CONTENT_TYPE};
+use skeleton_infra::fx::{FxScope, ScopeClosed};
 use tokio::time::timeout;
 use tokio_rustls::rustls::ClientConfig;
 use xray_common::net::{destination::Destination, port::Port};
@@ -156,7 +157,7 @@ impl DohNameServer {
             ns.serve_expired_ttl.unwrap_or(0),
             ns.negative_ttl_secs.unwrap_or(0),
         ));
-        cache.start_cleanup_task(crate::cache_controller::CLEANUP_INTERVAL);
+        // P1-11：cleanup 不在配置期 spawn——启动期经 Server::start_managed_tasks 注册。
         Ok(Box::new(Arc::new(
             Self::new(
                 dest,
@@ -186,7 +187,7 @@ impl DohNameServer {
             ns.serve_expired_ttl.unwrap_or(0),
             ns.negative_ttl_secs.unwrap_or(0),
         ));
-        cache.start_cleanup_task(crate::cache_controller::CLEANUP_INTERVAL);
+        // P1-11：cleanup 不在配置期 spawn——启动期经 Server::start_managed_tasks 注册。
         Ok(Box::new(Arc::new(
             Self::new(
                 dest,
@@ -203,6 +204,17 @@ impl DohNameServer {
 
     /// 发送单次 DNS 查询（DoH），等待响应。
     async fn query_once(&self, fqdn: &str, record_type: RecordType) -> Result<IpRecord, DnsError> {
+        // P1-11：h2 conn 驱动的托管口先验——未注单（实例未 start）或已关
+        // （停机中）快速失败，不发起新上游连接，不裸 spawn（坑约束 5）。
+        let fx = self.cache.fx_scope().ok_or_else(|| {
+            DnsError::WireFormat(
+                "doh: fx scope not attached (dns instance not started)".to_string(),
+            )
+        })?;
+        if fx.is_closed() {
+            return Err(DnsError::WireFormat("doh: fx scope closed (shutting down)".to_string()));
+        }
+
         let req_id = self.id_gen.next_id();
         let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
 
@@ -258,7 +270,12 @@ impl DohNameServer {
                 }),
             )
         };
-        tokio::spawn(h2_conn);
+        // h2 连接驱动迁 FxScope 托管（P1-11 坑约束 5）——闸关（查询过入口检查
+        // 后才被 close 的竞态窗）拒新：连接驱动随之丢弃，本次查询按错误收场，
+        // 不裸 spawn、不 panic。
+        let _spawned = fx
+            .spawn(h2_conn)
+            .map_err(|_: ScopeClosed| DnsError::WireFormat("doh: fx scope closed".to_string()))?;
 
         // 等待 h2 连接 ready（ready 消费 self 后返回 ready 态的 SendRequest）。
         h2 = timeout(self.query_timeout, h2.ready())
@@ -390,6 +407,10 @@ impl Server for Arc<DohNameServer> {
 
     fn is_serve_stale(&self) -> bool {
         self.cache.serve_stale
+    }
+
+    fn start_managed_tasks(&self, fx: &Arc<FxScope>) {
+        self.cache.start_managed(fx, crate::cache_controller::CLEANUP_INTERVAL);
     }
 
     fn query_ip<'a>(
@@ -597,6 +618,8 @@ mod tests {
             ..NameServerConfig::default()
         };
         let srv = DohNameServer::from_config_h2c(&ns).unwrap();
+        // P1-11：查询前启动期注册（生产等价 = 实例 start）。
+        srv.start_managed_tasks(&Arc::new(skeleton_infra::fx::FxScope::new()));
         let (ips, _) = srv
             .query_ip(
                 "h2c.com.",
@@ -623,6 +646,8 @@ mod tests {
             ..NameServerConfig::default()
         };
         let srv = DohNameServer::from_config_h2c(&ns).unwrap();
+        // P1-11：查询前启动期注册（生产等价 = 实例 start）。
+        srv.start_managed_tasks(&Arc::new(skeleton_infra::fx::FxScope::new()));
         let err = srv
             .query_ip(
                 "dead.com.",
@@ -636,6 +661,35 @@ mod tests {
         );
     }
 
+    /// P1-11 验收①：scope 已关（停机中）DoH 查询快速失败——不发起新上游
+    /// 连接、不裸 spawn、不 panic（入口先验于任何 IO）。
+    #[tokio::test]
+    async fn doh_query_after_scope_close_fails_fast() {
+        let cache = Arc::new(CacheController::new("test", true, false, 0, 0));
+        let fx = Arc::new(skeleton_infra::fx::FxScope::new());
+        cache.attach_scope(&fx);
+        fx.close();
+
+        ensure_crypto_provider();
+        let tls_config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(tokio_rustls::rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let ns = DohNameServer::new(
+            ip_dest(SocketAddr::from(([127, 0, 0, 1], 1))),
+            "localhost".to_string(),
+            tls_config,
+            cache,
+            Vec::new(),
+            Duration::from_secs(1),
+            true, // h2c：入口先验先于任何 IO，空根证书库不会被触达
+        );
+        let err = ns.query_once("closed.com.", RecordType::A).await.unwrap_err();
+        assert!(err.to_string().contains("fx scope"), "got: {err}");
+        assert_eq!(fx.in_flight(), 0, "closed scope must not gain new tasks");
+    }
+
     #[tokio::test]
     async fn doh_query_once_returns_a_record() {
         let (addr, tls_config, _h) =
@@ -645,7 +699,12 @@ mod tests {
             ip_dest(addr),
             "localhost".to_string(),
             tls_config,
-            Arc::new(CacheController::new("test", true, false, 0, 0)),
+            {
+                // P1-11：查询前注单托管 scope（生产等价 = 实例 start）。
+                let cache = Arc::new(CacheController::new("test", true, false, 0, 0));
+                cache.attach_scope(&Arc::new(skeleton_infra::fx::FxScope::new()));
+                cache
+            },
             Vec::new(),
             Duration::from_secs(5),
             false,
@@ -665,7 +724,12 @@ mod tests {
             ip_dest(addr),
             "localhost".to_string(),
             tls_config,
-            Arc::new(CacheController::new("test", true, false, 0, 0)),
+            {
+                // P1-11：查询前注单托管 scope（生产等价 = 实例 start）。
+                let cache = Arc::new(CacheController::new("test", true, false, 0, 0));
+                cache.attach_scope(&Arc::new(skeleton_infra::fx::FxScope::new()));
+                cache
+            },
             Vec::new(),
             Duration::from_secs(5),
             false,
@@ -731,7 +795,12 @@ mod tests {
             ip_dest(addr),
             "localhost".to_string(),
             tls_config,
-            Arc::new(CacheController::new("test", true, false, 0, 0)),
+            {
+                // P1-11：查询前注单托管 scope（生产等价 = 实例 start）。
+                let cache = Arc::new(CacheController::new("test", true, false, 0, 0));
+                cache.attach_scope(&Arc::new(skeleton_infra::fx::FxScope::new()));
+                cache
+            },
             Vec::new(),
             Duration::from_secs(5),
             false,
@@ -828,6 +897,8 @@ mod tests {
             ..NameServerConfig::default()
         };
         let srv = DohNameServer::from_config(&ns, "localhost".to_string(), tls_config).unwrap();
+        // P1-11：查询前启动期注册（生产等价 = 实例 start）。
+        srv.start_managed_tasks(&Arc::new(skeleton_infra::fx::FxScope::new()));
 
         let (advanced, result) = run_paused_query(srv, "hang.com.").await;
         let err = result.unwrap_err();
@@ -850,6 +921,8 @@ mod tests {
             ..NameServerConfig::default()
         };
         let srv = DohNameServer::from_config(&ns, "localhost".to_string(), tls_config).unwrap();
+        // P1-11：查询前启动期注册（生产等价 = 实例 start）。
+        srv.start_managed_tasks(&Arc::new(skeleton_infra::fx::FxScope::new()));
 
         let (advanced, result) = run_paused_query(srv, "hang.com.").await;
         assert!(result.is_err());

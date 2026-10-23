@@ -8,8 +8,9 @@
 //! - `Client` 结构体 + `new_client` 构造逻辑：完整翻译。
 //! - `new_server` 工厂：占位（依赖 transport / routing / DoH/QUIC 客户端等 IO 边界）。
 
-use std::{future::Future, net::IpAddr, pin::Pin, time::Duration};
+use std::{future::Future, net::IpAddr, pin::Pin, sync::Arc, time::Duration};
 
+use skeleton_infra::fx::FxScope;
 use xray_common::net::address::Address;
 use xray_tls::utls;
 
@@ -43,6 +44,11 @@ pub trait Server: Send + Sync {
     fn is_serve_stale(&self) -> bool {
         false
     }
+
+    /// 启动期注册托管后台任务（P1-11）：唯一合法 spawn 时机 = 实例 start；
+    /// 配置期零 spawn。默认无后台任务；缓存型 nameserver 覆写（cleanup →
+    /// `CacheController::start_managed` → 实例 `FxScope` 托管）。
+    fn start_managed_tasks(&self, _fx: &Arc<FxScope>) {}
 
     /// 查询域名对应的 IP。
     ///

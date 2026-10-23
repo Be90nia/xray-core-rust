@@ -22,6 +22,7 @@ use std::{
 };
 
 use hickory_proto::rr::RecordType;
+use skeleton_infra::fx::FxScope;
 use tokio::{net::UdpSocket, time::timeout};
 use xray_common::net::{destination::Destination, port::Port};
 
@@ -122,7 +123,7 @@ impl UdpNameServer {
             ns.serve_expired_ttl.unwrap_or(0),
             ns.negative_ttl_secs.unwrap_or(0),
         ));
-        cache.start_cleanup_task(crate::cache_controller::CLEANUP_INTERVAL);
+        // P1-11：cleanup 不在配置期 spawn——启动期经 Server::start_managed_tasks 注册。
         Ok(Self::new(
             dest,
             cache,
@@ -312,6 +313,10 @@ impl Server for Arc<UdpNameServer> {
 
     fn is_serve_stale(&self) -> bool {
         self.cache.serve_stale
+    }
+
+    fn start_managed_tasks(&self, fx: &Arc<FxScope>) {
+        self.cache.start_managed(fx, crate::cache_controller::CLEANUP_INTERVAL);
     }
 
     fn query_ip<'a>(

@@ -286,11 +286,39 @@ pub async fn fetch<S: CachedNameserver>(
 /// 8s 兜底超时；并发去重由 `fetch` 的 singleflight 天然承担（同 key 在途时
 /// 后续 pull 合并为等待者，不重复打上游）。
 ///
-/// ponytail: 用 `tokio::spawn` fire-and-forget。
+/// P1-11：spawn 走实例 `FxScope` 托管（坑约束 5）——scope 未注单（实例未
+/// start 的直连/测试路径）跳过留 debug 痕；已关（停机中）拒新留 warn 痕。
+/// 均不裸 spawn、不 panic。
 pub fn pull<S: CachedNameserver + 'static>(server: Arc<S>, fqdn: String, option: IpOption) {
-    tokio::spawn(async move {
-        let _ = tokio::time::timeout(PULL_TIMEOUT, fetch(server.as_ref(), &fqdn, option)).await;
+    let cache = server.cache_controller();
+    let fx = cache.fx_scope().cloned();
+    let server_name = cache.name.clone();
+    let spawned = fx.map(|fx| {
+        let task_fqdn = fqdn.clone();
+        fx.spawn(async move {
+            let _ = tokio::time::timeout(PULL_TIMEOUT, fetch(server.as_ref(), &task_fqdn, option))
+                .await;
+        })
     });
+    match spawned {
+        Some(Ok(_)) => {},
+        Some(Err(_)) => {
+            tracing::warn!(
+                target: "xray.dns",
+                server = %server_name,
+                fqdn = %fqdn,
+                "dns serveStale pull dropped: fx scope closed"
+            );
+        },
+        None => {
+            tracing::debug!(
+                target: "xray.dns",
+                server = %server_name,
+                fqdn = %fqdn,
+                "dns serveStale pull skipped: fx scope not attached (instance not started)"
+            );
+        },
+    }
 }
 
 /// 订阅缓存广播通道的便捷封装。对应 Go `registerSubscribers`。
@@ -411,6 +439,8 @@ mod tests {
 
         // serve_stale = true。
         let cache = Arc::new(CacheController::new("test", false, true, 0, 0));
+        // P1-11：pull 经实例 scope 托管 spawn——测试注单等价实例 start。
+        cache.attach_scope(&Arc::new(skeleton_infra::fx::FxScope::new()));
         // 预置已过期记录（expire = now - 30s）。
         let expired = ip_record(
             1,
@@ -602,6 +632,43 @@ mod tests {
         }
     }
 
+    /// P1-11 验收①/②：serveStale pull 托管化边界——未注单跳过（不 panic
+    /// 不 spawn）、已关闭拒新（warn 留痕，in_flight 不增）、开放 scope 任务
+    /// 入集且排空后 expect_idle 过。
+    #[tokio::test]
+    async fn pull_requires_attached_open_scope() {
+        // 未注单：跳过。
+        let cache = Arc::new(CacheController::new("probe", false, true, 30, 0));
+        let server = Arc::new(HangServer {
+            cache: cache.clone(),
+            hang: std::sync::atomic::AtomicBool::new(true),
+        });
+        pull(server, "stale.com.".to_string(), v4_only_option());
+        assert!(cache.fx_scope().is_none(), "unattached scope must stay unattached");
+
+        // 已关闭：拒新，in_flight 不增。
+        let fx = Arc::new(skeleton_infra::fx::FxScope::new());
+        cache.attach_scope(&fx);
+        fx.close();
+        let server = Arc::new(HangServer {
+            cache: cache.clone(),
+            hang: std::sync::atomic::AtomicBool::new(true),
+        });
+        pull(server, "stale.com.".to_string(), v4_only_option());
+        assert_eq!(fx.in_flight(), 0, "closed scope must not gain new tasks");
+
+        // 开放 scope：pull 任务入集；排空后在途归零。
+        let cache2 = Arc::new(CacheController::new("probe2", false, true, 30, 0));
+        let fx_open = Arc::new(skeleton_infra::fx::FxScope::new());
+        cache2.attach_scope(&fx_open);
+        let server2 =
+            Arc::new(HangServer { cache: cache2, hang: std::sync::atomic::AtomicBool::new(true) });
+        pull(server2, "stale.com.".to_string(), v4_only_option());
+        assert_eq!(fx_open.in_flight(), 1, "open scope must host the pull task");
+        fx_open.shutdown().await;
+        skeleton_infra::fx::expect_idle(&fx_open);
+    }
+
     /// 可控挂起的 Server：`hang=true` 时 send_query 循环等待，false 时返回成功。
     struct HangServer {
         cache: Arc<CacheController>,
@@ -731,6 +798,8 @@ mod tests {
         }
 
         let cache = Arc::new(CacheController::new("test", false, true, 0, 0));
+        // P1-11：pull 经实例 scope 托管 spawn——测试注单等价实例 start。
+        cache.attach_scope(&Arc::new(skeleton_infra::fx::FxScope::new()));
         let expired = ip_record(
             1,
             vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))],

@@ -22,6 +22,7 @@ use std::{
 
 use hickory_proto::rr::RecordType;
 use quinn::{ClientConfig as QuinnClientConfig, Endpoint, crypto::rustls::QuicClientConfig};
+use skeleton_infra::fx::FxScope;
 use tokio::time::timeout;
 use tokio_rustls::rustls::ClientConfig;
 use xray_common::net::address::Address;
@@ -110,7 +111,7 @@ impl DoqNameServer {
             ns.serve_expired_ttl.unwrap_or(0),
             ns.negative_ttl_secs.unwrap_or(0),
         ));
-        cache.start_cleanup_task(crate::cache_controller::CLEANUP_INTERVAL);
+        // P1-11：cleanup 不在配置期 spawn——启动期经 Server::start_managed_tasks 注册。
         Ok(Box::new(Arc::new(Self::new(
             socket_addr,
             server_name,
@@ -244,6 +245,10 @@ impl Server for Arc<DoqNameServer> {
 
     fn is_serve_stale(&self) -> bool {
         self.cache.serve_stale
+    }
+
+    fn start_managed_tasks(&self, fx: &Arc<FxScope>) {
+        self.cache.start_managed(fx, crate::cache_controller::CLEANUP_INTERVAL);
     }
 
     fn query_ip<'a>(

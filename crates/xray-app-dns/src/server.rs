@@ -20,6 +20,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
+use skeleton_infra::fx::FxScope;
 use xray_features::{Feature, dns::DnsError as FeaturesDnsError};
 
 use crate::{
@@ -73,6 +74,10 @@ pub struct DnsServiceConfig {
 /// 顶层 DNS 服务。对应 Go `DNS` struct。
 pub struct DnsService {
     cfg: DnsServiceConfig,
+    /// 实例托管 scope（P1-11）：构造即建（零 spawn）；`Feature::start` 经
+    /// `Server::start_managed_tasks` 逐 NS 注单并 spawn cleanup 托管任务。
+    /// 停机闸 = `Feature::close`（拒新）；在途排空由宿主 `scope().shutdown()`。
+    fx: Arc<FxScope>,
     /// 域名匹配器（option，对应 Go `domainMatcher geodata.DomainMatcher`）。
     /// ponytail: 当前 `StaticHosts` 内部已持有 matcher，此处保留独立 matcher
     /// 仅为 `sort_clients` 用，等 xray-geodata 暴露 `build_many` API 后接入。
@@ -87,7 +92,20 @@ impl DnsService {
     pub fn new(mut cfg: DnsServiceConfig) -> Self {
         let domain_matcher = cfg.domain_matcher.take();
         let matcher_infos = std::mem::take(&mut cfg.matcher_infos);
-        Self { cfg, matcher: Mutex::new(domain_matcher), matcher_infos: Mutex::new(matcher_infos) }
+        Self {
+            cfg,
+            fx: Arc::new(FxScope::new()),
+            matcher: Mutex::new(domain_matcher),
+            matcher_infos: Mutex::new(matcher_infos),
+        }
+    }
+
+    /// 实例托管 scope（宿主/测试用）：停机排空走 `scope().shutdown().await`
+    /// （`expect_idle` 断言在途归零）；close 语义留在 `Feature::close`。
+    /// 形态对齐 xray-frame 装配根 `Framework::scope()`。
+    #[must_use]
+    pub fn scope(&self) -> &Arc<FxScope> {
+        &self.fx
     }
 
     /// 注入域名匹配器（用于 `sort_clients`）。
@@ -283,6 +301,25 @@ impl DnsService {
 impl Feature for DnsService {
     fn feature_name(&self) -> &'static str {
         "dns"
+    }
+
+    /// 启动期注册（P1-11）：cleanup 托管任务统一在此 spawn——配置期
+    /// （`DnsAppConfig::build`/`DnsService::new`）零 spawn。逐 NS 经
+    /// `Server::start_managed_tasks` 注单实例 scope；scope 已关/无 runtime
+    /// 由 `CacheController::start_managed` 留痕处理（不 panic、不致命）。
+    fn start(&self) -> xray_features::Result<()> {
+        for client in &self.cfg.clients {
+            client.server.start_managed_tasks(&self.fx);
+        }
+        Ok(())
+    }
+
+    /// 停机闸（P1-11）：关闭 spawn——cleanup 不再新增、serveStale pull 与
+    /// DoH h2 conn 拒新（调用方留痕/错误归类）。在途排空由宿主经
+    /// [`DnsService::scope`] await `FxScope::shutdown`（abort+join 至归零）。
+    fn close(&self) -> xray_features::Result<()> {
+        self.fx.close();
+        Ok(())
     }
 }
 
@@ -1655,5 +1692,34 @@ mod tests {
         // 实际 debug! 输出由 tracing subscriber 决定；这里只验证不 panic 且
         // 函数签名可被外部 crate 调用（pub fn）。
         log_decision("example.com", &["google", "cloudflare"]);
+    }
+
+    /// P1-11 生命周期验收：③配置期零 spawn → 启动期逐 NS 注册 cleanup 托管
+    /// 任务 → ②停机排空 in_flight 归零（expect_idle）→ ①scope 关闭后再
+    /// start：spawn 拒新（留痕不 panic 不新增）。
+    #[tokio::test]
+    async fn managed_lifecycle_config_no_spawn_then_start_then_drain() {
+        let json = r#"{"servers":[{"address":"8.8.8.8","port":53}]}"#;
+        let cfg: crate::jsonconf::DnsAppConfig = serde_json::from_str(json).unwrap();
+        let svc = DnsService::new(cfg.build().unwrap());
+
+        // ③ 配置期（DnsAppConfig::build / DnsService::new）零 spawn。
+        assert_eq!(svc.scope().in_flight(), 0, "config phase must not spawn cleanup");
+
+        // 启动期注册：每 NS 一条 cleanup 托管任务入实例 scope。
+        svc.start().unwrap();
+        assert!(
+            svc.scope().in_flight() >= 1,
+            "instance start must register cleanup tasks into fx scope"
+        );
+
+        // ② 停机排空：abort + join 至在途归零。
+        svc.scope().shutdown().await;
+        skeleton_infra::fx::expect_idle(svc.scope());
+
+        // ① scope 已关：再 start 拒新，留痕不 panic、不新增。
+        assert!(svc.scope().is_closed());
+        svc.start().unwrap();
+        assert_eq!(svc.scope().in_flight(), 0, "closed scope must not gain new tasks");
     }
 }

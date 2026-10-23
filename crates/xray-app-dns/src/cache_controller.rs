@@ -5,16 +5,18 @@
 //! - 缓存数据结构 + cleanup 逻辑 + 内存收缩策略：完整翻译。
 //! - `pubsub.Service` / `singleflight.Group`：Rust 端用 `tokio::sync::broadcast` + `Mutex<HashMap>`
 //!   简化模拟；真实订阅/去重逻辑见 `nameserver/cached.rs`。
-//! - `task.Periodic`：用 `tokio::time::interval` + `tokio::spawn`，在 `start_cleanup_task` 启动。
+//! - `task.Periodic`：用 `tokio::time::interval`，经 `start_managed` 在**启动期** 注册进实例
+//!   `FxScope` 托管（P1-11：配置期零 spawn，坑约束 5）。
 
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
 use parking_lot::RwLock;
 use skeleton::clock::{Clock, SystemClock};
+use skeleton_infra::fx::FxScope;
 use tokio::sync::broadcast;
 
 use crate::{
@@ -56,6 +58,10 @@ pub struct CacheController {
     /// 时间源契约（P1-12）：TTL/stale 判定与清理节奏统一走 `skeleton::clock::Clock`。
     /// 生产 `SystemClock`；测试注入 `MockClock` 得确定性时间线（零真等）。
     clock: Arc<dyn Clock>,
+    /// 实例托管 scope（P1-11）：启动期经 `start_managed` 注单（配置期为空 =
+    /// 零 spawn）；serveStale pull（`nameserver/cached.rs`）与 DoH h2 conn 驱动
+    /// （`nameserver/doh.rs`）经 `fx_scope` 取用同一 scope。
+    fx: OnceLock<Arc<FxScope>>,
 }
 
 /// 广播事件。对应 Go `pubsub` 中的 `*IPRecord` 消息。
@@ -121,6 +127,7 @@ impl CacheController {
             tx,
             single_flight: tokio::sync::Mutex::new(HashMap::new()),
             clock,
+            fx: OnceLock::new(),
         }
     }
 
@@ -269,24 +276,42 @@ impl CacheController {
         (has_expired, shrunk)
     }
 
-    /// 启动后台 cleanup tokio task，按 `interval` 周期执行 [`Self::run_cleanup`]。
-    ///
-    /// 返回 `JoinHandle`，调用方可保留以便 shutdown。生产调用点传
-    /// [`CLEANUP_INTERVAL`]；测试传短周期。
+    /// 实例托管 scope（P1-11 注单后可见）：serveStale pull（`cached.rs::pull`）
+    /// 与 DoH h2 conn 驱动（`doh.rs::query_once`）的 spawn 口。
+    #[must_use]
+    pub(crate) fn fx_scope(&self) -> Option<&Arc<FxScope>> {
+        self.fx.get()
+    }
+
+    /// 注单实例 scope（仅附着，不 spawn）。测试直连路径用；生产经
+    /// [`Self::start_managed`]。首注单为准（重复 start 不换 scope，与读侧一致）。
+    pub(crate) fn attach_scope(&self, fx: &Arc<FxScope>) {
+        let _ = self.fx.set(Arc::clone(fx));
+    }
+
+    /// 启动期注册：注单实例 [`FxScope`] + spawn 后台 cleanup 托管任务。
     /// 对应 Go `cacheCleanup.Start()`。
     ///
-    /// 当前线程无 tokio runtime 时返回 `None`（同步上下文构建配置/单测），
-    /// 不 spawn——后台任务本就无处运行。
+    /// P1-11：**配置期不得调用**（配置期无 runtime 托管面 = 生命周期错位）——
+    /// 生产唯一调用点 = 实例 start（`DnsService` 的 `Feature::start`，经
+    /// `Server::start_managed_tasks` 逐 NS 下发）。
     ///
-    /// 清理时间取 [`Clock::now_instant`]（P1-12：与 TTL/stale 判定同一时钟源，
-    /// 测试注入 `MockClock` 后可确定性推进）。
-    pub fn start_cleanup_task(
-        self: &Arc<Self>,
-        interval: Duration,
-    ) -> Option<tokio::task::JoinHandle<()>> {
-        let handle = tokio::runtime::Handle::try_current().ok()?;
+    /// - 无 tokio runtime（同步上下文/纯结构测试）→ 跳过 spawn 留 debug 痕
+    ///   （后台任务本就无处运行，同旧 `Handle::try_current` None 语义）。
+    /// - scope 已关（停机中）→ 拒新 spawn 留 warn 痕，不 panic（坑约束 5： spawn
+    ///   失败按错误归类上报）。
+    ///
+    /// 任务归 scope 生命周期集托管：停机 `FxScope::shutdown` abort 兜底，
+    /// `expect_idle` 在途归零可断言。清理时间取 [`Clock::now_instant`]
+    /// （P1-12：与 TTL/stale 判定同一时钟源，单钟语义不变）。
+    pub fn start_managed(self: &Arc<Self>, fx: &Arc<FxScope>, interval: Duration) {
+        self.attach_scope(fx);
+        if tokio::runtime::Handle::try_current().is_err() {
+            tracing::debug!(server = %self.name, "dns cleanup task skipped: no tokio runtime");
+            return;
+        }
         let ctrl = Arc::clone(self);
-        Some(handle.spawn(async move {
+        let spawned = fx.spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.tick().await; // 跳过首次立即触发
             loop {
@@ -302,7 +327,10 @@ impl CacheController {
                     );
                 }
             }
-        }))
+        });
+        if spawned.is_err() {
+            tracing::warn!(server = %self.name, "dns cleanup task not started: fx scope closed");
+        }
     }
 
     /// 计算考虑 `serve_stale` 后的“有效当前时间”。
@@ -479,7 +507,7 @@ mod tests {
         assert!(c.find_records("example.com.").is_none());
     }
 
-    /// 生产接线验证：start_cleanup_task 周期执行 run_cleanup。
+    /// 生产接线验证：start_managed 周期执行 run_cleanup（FxScope 托管）。
     ///
     /// P1-12 确定性化（零真等）：时钟注入 [`MockClock`]（判定时间线显式
     /// `advance` 推进）+ tokio `start_paused`（调度时间线虚拟推进）——
@@ -501,7 +529,9 @@ mod tests {
         );
         c.upsert("live.com.", true, live);
 
-        let _handle = c.start_cleanup_task(Duration::from_millis(20));
+        let fx = Arc::new(skeleton_infra::fx::FxScope::new());
+        c.start_managed(&fx, Duration::from_millis(20));
+        assert_eq!(fx.in_flight(), 1, "start_managed must host the cleanup task");
         // MockClock 冻结时 expire==now 不判过期（严格 <）；推过过期点后，
         // 下一个 cleanup tick（20ms 虚拟时刻）即清理。
         clock.advance(Duration::from_secs(1));
@@ -512,6 +542,28 @@ mod tests {
             "expired entry must be removed by cleanup task"
         );
         assert!(c.find_records("live.com.").is_some(), "live entry must survive");
+
+        // P1-11：任务归 scope 生命周期集托管——排空后在途归零。
+        fx.shutdown().await;
+        skeleton_infra::fx::expect_idle(&fx);
+    }
+
+    /// P1-11 验收①：scope 已关（停机中）再 start_managed——spawn 拒新
+    /// （warn 留痕），不得 panic、不得新增在途任务。
+    #[test]
+    fn start_managed_after_close_is_rejected_without_panic() {
+        let c = Arc::new(CacheController::new("test", false, false, 0, 0));
+        let fx = Arc::new(skeleton_infra::fx::FxScope::new());
+        fx.close();
+        c.start_managed(&fx, CLEANUP_INTERVAL);
+        assert!(fx.is_closed());
+        assert_eq!(fx.in_flight(), 0, "closed scope must not gain new tasks");
+        // 无 runtime 同步上下文：仅附着、不 spawn（旧 Handle::try_current None 语义）。
+        let fx_open = Arc::new(skeleton_infra::fx::FxScope::new());
+        c.start_managed(&fx_open, CLEANUP_INTERVAL);
+        assert_eq!(fx_open.in_flight(), 0, "sync context must not spawn");
+        // 首注单为准：第二次 start_managed 不换 scope（仍指最早注单的 fx）。
+        assert_eq!(c.fx_scope().map(|s| Arc::ptr_eq(s, &fx)), Some(true));
     }
     /// ① MockClock 推过期秒 → 缓存立即过期（零真等）。
     ///
