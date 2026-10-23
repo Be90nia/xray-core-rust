@@ -3,10 +3,11 @@
 //! 业务核心独立可测，仅依赖 `xray_geodata::matcher::domain::{DomainMatcher,
 //! DomainRule, DomainType, MphDomainMatcher}`。
 //!
-//! ygxy：matcher 用 `MphDomainMatcher` + `DomainType::Domain` 规则构建——注册
-//! `example.com` 的条目应同时匹配 `example.com` / `foo.example.com` /
-//! `a.b.example.com`（后缀匹配，对齐 Go `MphDomainMatcher.Match` 的
-//! Domain 语义）。旧 `InMemoryMatcher` 仅 exact match 导致子域漏配。
+//! P2-16：无前缀 key 注册为 `DomainType::Full` **精确匹配**，与 Go 对齐——
+//! Go hosts key 统一过 `geodata.ParseDomainRule(rule, geodata.Domain_Full)`
+//! （config: `infra/conf/dns.go:263`；系统 hosts: `dns.go:461`），无前缀落
+//! `domain.Type = defaultType`（`common/geodata/rule_parser.go:258`）。
+//! `domain:` 等前缀分流语义不变（`rule_parser.go:234-236` Domain_Domain）。
 
 use std::net::IpAddr;
 
@@ -23,7 +24,7 @@ use crate::{config::IpOption, error::DnsError};
 /// - 否则为重定向目标域名。
 #[derive(Debug, Clone)]
 pub struct HostMapping {
-    /// 匹配的源域名（`matcher_rules` 为空时按 Domain 后缀匹配注册）。
+    /// 匹配的源域名（`matcher_rules` 为空时按 Domain_Full 精确匹配注册）。
     pub domain: String,
     /// 匹配返回的 IP 列表（与 `proxied_domain` 互斥）。
     pub ips: Vec<IpAddr>,
@@ -85,17 +86,18 @@ impl StaticHosts {
             responses.push(reps);
         }
 
-        // 构造 matcher：每个 hosts 条目用 `DomainType::Domain`（后缀匹配）
-        // 注册——注册 `example.com` 同时匹配 `example.com` / `foo.example.com`
-        // 等所有子域（对齐 Go `MphDomainMatcher.Match` 的 Domain 语义）。
-        // 旧 `InMemoryMatcher` 仅 exact match 导致子域漏配（ygxy）。
+        // 构造 matcher：无 `matcher_rules` 的条目（系统 hosts / 直构裸域名）按
+        // `DomainType::Full` 精确匹配注册——与 Go 对齐：Go hosts key 统一过
+        // `ParseDomainRule(rule, geodata.Domain_Full)`（infra/conf/dns.go:263
+        // config / dns.go:461 系统 hosts），无前缀落 defaultType（rule_parser.go:258），
+        // Full 等值判定 = map 查 `matchers[input]`（geodata/strmatcher/matcherset_full.go:21-23）。
         let rules: Vec<DomainRule> = mappings
             .iter()
             .enumerate()
             .flat_map(|(i, m)| {
                 if m.matcher_rules.is_empty() {
-                    // 无前缀 key：Domain 后缀匹配（example.com 匹配自身与全部子域）。
-                    vec![DomainRule::domain(m.domain.to_lowercase(), i as u32)]
+                    // 无前缀 key：Domain_Full 精确匹配（example.com 仅命中自身）。
+                    vec![DomainRule::full(m.domain.to_lowercase(), i as u32)]
                 } else {
                     m.matcher_rules
                         .iter()
@@ -243,10 +245,8 @@ fn filter_ip_entries(entries: &[&ResponseEntry], option: IpOption) -> Vec<Addres
     out
 }
 
-/// ygxy：hosts 表语义上"前缀键"= 子域匹配。`example.com` 条目同时匹配
-/// `example.com` / `foo.example.com` / `a.b.example.com`，由
-/// `MphDomainMatcher` 配合 `DomainType::Domain` 规则承担。删除旧的 exact-only
-/// `InMemoryMatcher`（见 commit 之前逻辑）。
+/// P2-16：hosts 无前缀 key = Domain_Full 精确匹配（Go infra/conf/dns.go:263/:461
+/// 统一 `ParseDomainRule(rule, Domain_Full)`）；`domain:` 前缀键子域语义不变。
 // Address 构造辅助。
 trait AddressExt {
     fn ipv4_or_v6(ip: IpAddr) -> Self;
@@ -398,24 +398,40 @@ mod tests {
         assert!(mappings.iter().all(|m| m.domain != "skip.me"));
     }
 
-    /// ygxy：hosts 表"前缀键"= 子域匹配。注册 `example.com` 应同时匹配
-    /// `example.com` / `foo.example.com` / `a.b.example.com`（对齐 Go
-    /// `MphDomainMatcher.Match` 的 Domain 语义）。旧 `InMemoryMatcher`
-    /// 仅 exact match 导致子域漏配。
+    /// P2-16 Go 行为对拍 fixture（Xray-core v26.10.17）：
+    /// - hosts key 统一 `geodata.ParseDomainRule(rule, geodata.Domain_Full)`： config
+    ///   `infra/conf/dns.go:263`、系统 hosts `dns.go:461`；无前缀落 `domain.Type =
+    ///   defaultType`（`common/geodata/rule_parser.go:258`）。
+    /// - `domain:` 前缀 → Domain_Domain（`rule_parser.go:234-236`）。
+    /// - Full 等值判定 = map 查 `matchers[input]`
+    ///   （`common/geodata/strmatcher/matcherset_full.go:21-23`）。
+    /// - 查询侧小写化（`app/dns/hosts.go:98`）。
+    /// - Go 自家 fixture：`app/dns/hosts_test.go:21`（Domain_Full "example.com"） 与
+    ///   `:39`+`:103`（Domain_Domain "example.cn" → "www.example.cn" 命中）。
     #[test]
-    fn lookup_matches_subdomains_via_domain_rule() {
+    fn lookup_full_exact_match_semantics() {
+        // ① 无前缀 key（兜底路径，Go = Domain_Full 精确）。
         let h = StaticHosts::new(vec![mapping_ip("example.com", &["1.2.3.4"])]).unwrap();
-        for q in ["example.com", "foo.example.com", "a.b.example.com"] {
-            let out = h.lookup(q, IpOption::all()).unwrap().unwrap();
-            assert_eq!(out.len(), 1, "query {q} should match");
-            match &out[0] {
-                Address::IPv4(v) => assert_eq!(*v, Ipv4Addr::new(1, 2, 3, 4)),
-                other => panic!("expected IPv4 for {q}, got {other:?}"),
-            }
+        for (q, want) in [
+            ("example.com", true),      // apex 精确命中（Go hosts_test.go:21+64）
+            ("EXAMPLE.COM", true),      // 查询侧小写化（Go hosts.go:98）
+            ("sub.example.com", false), // 子域不命中（Domain_Full 精确）
+            ("a.b.example.com", false),
+            ("notexample.com", false), // 不同顶级域不命中
+        ] {
+            let out = h.lookup(q, IpOption::all()).unwrap();
+            assert_eq!(out.is_some(), want, "query {q}: want hit={want}, got {out:?}");
         }
-        // 非子域（不同顶级域）仍应未命中。
-        let out = h.lookup("notexample.com", IpOption::all()).unwrap();
-        assert!(out.is_none(), "non-suffix must miss");
+        // ② 前缀分流键保持自身语义（零回归）：`domain:example.cn` → Domain 子域匹配。
+        let mut m = mapping_ip("example.cn", &["2.2.2.2"]);
+        m.matcher_rules =
+            vec![(xray_geodata::matcher::domain::DomainType::Domain, "example.cn".into())];
+        let h = StaticHosts::new(vec![m]).unwrap();
+        for q in ["example.cn", "www.example.cn"] {
+            // Go hosts_test.go:103
+            assert!(h.lookup(q, IpOption::all()).unwrap().is_some(), "domain: prefix {q} must hit");
+        }
+        assert!(h.lookup("example.org", IpOption::all()).unwrap().is_none());
     }
 
     /// kzmx：hosts 命中但按 IP 族过滤后为空 → 返回 `Some(vec![])`（"命中但
