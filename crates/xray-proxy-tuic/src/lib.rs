@@ -28,6 +28,7 @@ pub mod client;
 pub mod dispatcher;
 pub mod error;
 pub mod inbound;
+pub mod plugin;
 pub mod pool;
 pub mod protocol;
 pub mod server;
@@ -39,6 +40,7 @@ pub use dispatcher::{
 };
 pub use error::{Result, TuicError};
 pub use inbound::{TuicInboundConfig, TuicInboundHandler};
+pub use plugin::{TuicLifecycle, TuicPlugin};
 pub use pool::{MultiplexedConnection, PoolKey, QuinnConnectionPool, ReconnectingConnection};
 pub use protocol::{Address, Command, FragmentAssembler, Packet, TOKEN_LEN, VERSION};
 pub use server::TuicMockServer;
