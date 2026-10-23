@@ -24,6 +24,7 @@ pub mod downloader;
 pub mod error;
 pub mod feature;
 pub mod instance;
+pub mod loader;
 pub mod scheduler;
 pub mod swap;
 pub use config::{GeodataAsset, GeodataConfig};
@@ -34,4 +35,5 @@ pub use downloader::{
 pub use error::{GeodataError, at_error, at_warning};
 pub use feature::GeodataFeature;
 pub use instance::{GeodataInstance, NoopScheduler, ScheduleHandle, Scheduler};
+pub use loader::{GeodataLoadPool, LoadKind, LoadRequest, LoadedEntry, download_assets_parallel};
 pub use scheduler::CronScheduler;

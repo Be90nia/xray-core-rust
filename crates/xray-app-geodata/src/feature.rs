@@ -20,6 +20,7 @@ use crate::{
     config::GeodataConfig,
     downloader::{AssetDownloader, GeodataReloader},
     instance::{GeodataInstance, Scheduler},
+    loader::GeodataLoadPool,
 };
 
 /// Geodata app Feature 实现。
@@ -27,27 +28,44 @@ use crate::{
 /// 持有 `Arc<GeodataInstance>` + scheduler/downloader/reloader 三个 trait object。
 /// `start()` 把真正的 `execute()` 闭包传给 `GeodataInstance::start_with_callback`，
 /// 不再用 `|| {}` 占位。
+///
+/// P1-2 起装配互喂池 [`GeodataLoadPool`]（L2 能力句柄：启动期加载/低频更新
+/// 走池，禁自建线程；经 [`Self::load_pool`] 取用）。
 pub struct GeodataFeature {
     instance: Arc<GeodataInstance>,
     scheduler: Arc<dyn Scheduler>,
     downloader: Arc<dyn AssetDownloader>,
     reloader: Arc<dyn GeodataReloader>,
+    load_pool: GeodataLoadPool,
 }
 
 impl GeodataFeature {
     /// 从配置 + 注入的 scheduler/downloader/reloader 构造。
+    ///
+    /// 互喂池按固定默认值 + env 覆盖装配（PM 拍板 §2 P1-2.1）。
     pub fn new(
         config: GeodataConfig,
         scheduler: Arc<dyn Scheduler>,
         downloader: Arc<dyn AssetDownloader>,
         reloader: Arc<dyn GeodataReloader>,
     ) -> Self {
-        Self { instance: Arc::new(GeodataInstance::new(config)), scheduler, downloader, reloader }
+        Self {
+            instance: Arc::new(GeodataInstance::new(config)),
+            scheduler,
+            downloader,
+            reloader,
+            load_pool: GeodataLoadPool::from_env(),
+        }
     }
 
     /// 暴露内部 instance（测试与探针用）。
     pub fn instance(&self) -> &Arc<GeodataInstance> {
         &self.instance
+    }
+
+    /// 互喂池句柄（启动期 geodata 加载/低频更新专用；数据面 IO 禁入）。
+    pub fn load_pool(&self) -> &GeodataLoadPool {
+        &self.load_pool
     }
 }
 

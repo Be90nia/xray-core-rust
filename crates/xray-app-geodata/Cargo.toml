@@ -10,6 +10,9 @@ xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
 xray-proto = { path = "../xray-proto" }
 xray-geodata = { path = "../xray-geodata" }
+# P1-2 互喂试点：启动期 geodata 加载走 udf PooledThreadPool（默认 feature 已含
+# pool→memgov，PooledThreadPool 为根导出；零新增第三方依赖）。
+udf-skeleton-infra = { path = "../udf-frame/skeleton-infra" }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
