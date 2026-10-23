@@ -33,10 +33,12 @@ use crate::{
     server::DokodemoServer,
 };
 
-/// 通用条款适用子集（差异表 §2.2 第 7 行：3,5,6,7,8,9,10,12；**2/11 N/A**
-/// 见 [`DOKODEMO_NOT_APPLICABLE`]——dokodemo 无协议握手、无认证凭据/密钥）。
+/// 通用条款适用子集（差异表 §2.2 第 7 行 3,5,6,7,8,9,10,12 + PM 拍板 2026-10-24
+/// 补 **4 适用**——转发数据面走 buf，受 BufferPool 接缝约束；**1/2/11 N/A**
+/// 见 [`DOKODEMO_NOT_APPLICABLE`]——dokodemo 无认证、无协议握手、无密钥）。
 static DOKODEMO_CLAUSES: &[ClauseId] = &[
     ClauseId::ConnIdPresent,
+    ClauseId::PoolDiscipline,
     ClauseId::SpawnManaged,
     ClauseId::StopRegistered,
     ClauseId::ConfigSectionOnly,
@@ -50,8 +52,10 @@ static DOKODEMO_CLAUSES: &[ClauseId] = &[
 static DOKODEMO_EXTRA: &[(&str, &str)] =
     &[("DKD-TPROXY", "TPROXY 路径仅 Linux，平台门控不得在非 Linux 编译期裁掉语义测试")];
 
-/// N/A 声明（P1-7 拍板 P2.2：允许声明不适用但必须带非空理由）。
+/// N/A 声明（P1-7 拍板 P2.2：允许声明不适用但必须带非空理由；条款 1 为 PM
+/// 拍板 2026-10-24 补齐）。
 static DOKODEMO_NOT_APPLICABLE: &[(ClauseId, &str)] = &[
+    (ClauseId::AuthErrorClassified, "dokodemo 无认证/无凭证，认证失败分类不适用"),
     (
         ClauseId::HandshakeDeadline,
         "dokodemo 无协议握手——连接建立即按 rewrite/followRedirect 目标转发，无首包 deadline 面",

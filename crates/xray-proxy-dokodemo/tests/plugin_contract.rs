@@ -34,8 +34,9 @@ fn contract_macro_holds_for_dokodemo() {
     assert_plugin_contract!(DokodemoPlugin);
 }
 
-/// 契约面内容断言：适用子集 8 条（差异表 §2.2 第 7 行 3,5,6,7,8,9,10,12）、
-/// 2/11 N/A + 非空理由、DKD-TPROXY 协议专属、协议名 `dokodemo-door`。
+/// 契约面内容断言：适用子集 9 条（差异表 §2.2 第 7 行 3,5,6,7,8,9,10,12 +
+/// PM 拍板 2026-10-24 补 4）、1/2/11 N/A + 非空理由、DKD-TPROXY 协议专属、
+/// 协议名 `dokodemo-door`。
 #[test]
 fn contract_surface_declares_subset_na_and_extra() {
     let plugin = DokodemoPlugin::default();
@@ -48,6 +49,7 @@ fn contract_surface_declares_subset_na_and_extra() {
 
     let expected: &[ClauseId] = &[
         ClauseId::ConnIdPresent,
+        ClauseId::PoolDiscipline,
         ClauseId::SpawnManaged,
         ClauseId::StopRegistered,
         ClauseId::ConfigSectionOnly,
@@ -56,13 +58,14 @@ fn contract_surface_declares_subset_na_and_extra() {
         ClauseId::LogDiscipline,
         ClauseId::HotPathFreeze,
     ];
-    assert_eq!(contract.clauses.len(), expected.len(), "适用子集 8 条");
+    assert_eq!(contract.clauses.len(), expected.len(), "适用子集 9 条（含 PM 拍板补的 4）");
     for clause in expected {
         assert!(contract.clauses.contains(clause), "缺条款 {clause:?}");
     }
 
-    assert_eq!(contract.not_applicable.len(), 2, "2/11 N/A（差异表 §2.2 第 7 行）");
+    assert_eq!(contract.not_applicable.len(), 3, "1/2/11 N/A");
     let na: Vec<ClauseId> = contract.not_applicable.iter().map(|(c, _)| *c).collect();
+    assert!(na.contains(&ClauseId::AuthErrorClassified), "1 无认证 → N/A（PM 拍板 2026-10-24）");
     assert!(na.contains(&ClauseId::HandshakeDeadline), "2 无握手 → N/A");
     assert!(na.contains(&ClauseId::SecretMasking), "11 无密钥 → N/A");
     for (_, reason) in contract.not_applicable {
