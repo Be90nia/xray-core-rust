@@ -22,10 +22,13 @@
 pub mod client;
 pub mod config;
 pub mod error;
+// P2 批次 B 插件化（A1）：L1/L4 面，wire 零改动。
+pub mod plugin;
 pub mod server;
 
 // 顶层 re-export。
 pub use client::{HttpOutboundConfig, make_http_dial_fn, parse_http_config};
 pub use config::{Account, ClientConfig, Header, ServerConfig};
 pub use error::{HttpProxyError, Result};
+pub use plugin::HttpPlugin;
 pub use server::HttpServer;
