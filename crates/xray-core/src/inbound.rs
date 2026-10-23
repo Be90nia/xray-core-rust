@@ -3050,14 +3050,28 @@ fn spawn_inbound_serve(
     fut: impl Future<Output = std::io::Result<()>> + Send + 'static,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        tokio::select! {
-            r = fut => {
-                if let Err(e) = r {
-                    tracing::error!(tag = %tag, error = %e, "inbound stopped");
+        // 监控包裹：serve future panic → 该 future 持有的 listener 随 drop 释放
+        // → 端口不再 listen 而进程存活(与 bd wsiq 同类静默失效)。这里 await 内层
+        // 句柄把 panic 转成 error! 留痕(tag + 端口上下文)，不再只留一行裸 panic。
+        let tag_inner = tag.clone();
+        let inner = tokio::spawn(async move {
+            tokio::select! {
+                r = fut => {
+                    if let Err(e) = r {
+                        tracing::error!(tag = %tag_inner, error = %e, "inbound stopped");
+                    }
+                }
+                _ = shutdown_token.cancelled() => {
+                    tracing::info!(tag = %tag_inner, "inbound shutting down (graceful)");
                 }
             }
-            _ = shutdown_token.cancelled() => {
-                tracing::info!(tag = %tag, "inbound shutting down (graceful)");
+        });
+        if let Err(join_err) = inner.await {
+            if join_err.is_panic() {
+                tracing::error!(
+                    tag = %tag,
+                    "inbound serve task panicked — 监听已停止，该端口不再接受连接"
+                );
             }
         }
     })
@@ -11384,5 +11398,18 @@ mod tests {
         assert!(!s.contains("171"), "private key bytes leaked: {s}");
         assert!(s.contains("server_private_key: \"[REDACTED]\""), "must be redacted: {s}");
         assert!(s.contains("example.com:443"), "non-secret fields must stay readable: {s}");
+    }
+
+    /// bd wsiq 同类失效兜底：serve future panic → 该 future 持有的 listener 随
+    /// drop 释放 → 端口不再 listen 而进程存活（原始 panic 行之外无结构化痕迹）。
+    /// 监控包裹后：panic 被转成 error! 留痕，且外层句柄正常结束（不挂死）。
+    #[tokio::test]
+    async fn spawn_inbound_serve_survives_panicking_future() {
+        let token = CancellationToken::new();
+        let handle = spawn_inbound_serve("panic-probe".to_string(), token, async {
+            panic!("simulated panic inside inbound serve");
+        });
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        assert!(joined.is_ok(), "serve 句柄不应挂死（panic 后必须收敛）");
     }
 }
