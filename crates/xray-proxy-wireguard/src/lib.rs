@@ -39,6 +39,7 @@ pub mod inbound;
 pub mod netstack;
 pub mod outbound;
 pub mod peer;
+pub mod plugin;
 pub mod tunnel;
 pub mod users;
 pub mod wireguard;
@@ -52,6 +53,7 @@ pub use inbound::WireguardInboundHandler;
 pub use netstack::{TcpAcceptEvent, VirtualDevice, WgNetStack};
 pub use outbound::WireguardOutboundHandler;
 pub use peer::{PeerSession, SharedPeer};
+pub use plugin::{WireguardBuiltConfig, WireguardLifecycle, WireguardPlugin};
 pub use tunnel::{Output as TunnelOutput, Tunnel};
 pub use users::{WgUser, WgUserRegistry};
 pub use wireguard::{
