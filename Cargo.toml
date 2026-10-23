@@ -78,7 +78,14 @@ members = [
 
     # 压测 harness（独立二进制，只消费现有 API；PM 授权的唯一新增 member）
     "crates/xray-stress",
+
+    # 装配框架层（udf-frame 继承派生，P0-P4；PM 引进 2026-10-23）
+    "crates/xray-frame",
 ]
+
+# udf-frame 仓内工作副本（独立 git 仓；本地开发 path 依赖源，CI 由拉料步骤生成）——
+# 必须排除：path 依赖落在 workspace 目录内会被 cargo 自动纳入 member。
+exclude = ["crates/udf-frame"]
 
 [workspace.package]
 version = "0.1.0"
