@@ -8,15 +8,17 @@
 //! 实施计划：`docs/architecture/xray-frame-impl-plan-2026-10-19.md`（P0-P4）。
 //!
 //! 本文件承载**接线冒烟**（udf 依赖面可解析、继承面编译期可见）与 P0 骨架
-//! 模块挂载。P0-1/2/3/4/7 已落（plugin/error/context/logging/registry/lifecycle）；
-//! assembly、shutdown 接线随 P0-5/8 派单填充。
+//! 模块挂载。P0-1..P0-5/7 已落（plugin/error/context/logging/registry/lifecycle
+//! 及 assembly 装配组合根：register→build(ctx)→bring_up→shutdown 三段式）；
+//! shutdown 逐组件超时接线随 P0-8 派单深化。
 
 /// 契约层词汇直呼（继承面 A 类：`use skeleton::`——包名 udf-skeleton 的 lib 名）。
 pub use skeleton::EffectId;
 
-// P0 骨架六件（2026-10-23 派单）：L1 契约（plugin）+ L5 统一错误（error）+
+// P0 骨架七件（2026-10-23 派单）：L1 契约（plugin）+ L5 统一错误（error）+
 // L2 能力句柄（context）+ 装配日志唯一入口（logging）+ 插件注册表（registry）+
-// 生命周期三相编排（lifecycle）。
+// 生命周期三相编排（lifecycle）+ 装配组合根（assembly）。
+pub mod assembly;
 pub mod context;
 pub mod error;
 pub mod lifecycle;
@@ -24,6 +26,7 @@ pub mod logging;
 pub mod plugin;
 pub mod registry;
 
+pub use assembly::{Framework, FrameworkBuilder, FrameworkOptions};
 pub use context::{PluginContext, derive_fingerprint};
 pub use error::{LifecyclePhase, PluginError};
 pub use lifecycle::{Phase, StartedPlugins, bring_up};
