@@ -1,0 +1,16 @@
+[package]
+name = "xray-frame"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Xray-core-rust assembly framework layer: plugins and shared facilities derived from udf-frame"
+publish = false
+
+# 继承派生（PM 规划 2026-10-23，docs/architecture/udf-frame继承派生规划-2026-10-23.md）：
+# 开发期 path 依赖指向仓内 crates/udf-frame（联调即改即用）；udf CI 绿后切
+# git dependency + rev 锁定（主线规划 §4），届时仅改本文件三行。
+# lib 名纪律：import 用 udf 包的 lib 名（skeleton / skeleton_infra / std_ext）。
+[dependencies]
+udf-skeleton = { path = "../udf-frame/skeleton" }
+udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio", "log"] }
+udf-std-ext = { path = "../udf-frame/std-ext" }

@@ -78,6 +78,9 @@ members = [
 
     # 压测 harness（独立二进制，只消费现有 API；PM 授权的唯一新增 member）
     "crates/xray-stress",
+
+    # 装配框架层（udf-frame 继承派生，P0-P4；PM 引进 2026-10-23）
+    "crates/xray-frame",
 ]
 
 [workspace.package]
