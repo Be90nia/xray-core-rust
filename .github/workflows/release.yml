@@ -124,8 +124,13 @@ jobs:
           path: artifacts
       # 四平台二进制同叫 xray/xray.exe，artifacts/** 直接上传会同名互相覆盖
       # （v26.9.9 首发实锤只剩 2 个文件）——先拍平重命名为 artifact 名。
+      # 必须先清空 dist/：仓库里 dist/ 还入库了 interop 脚本（interop_*.py /
+      # run_all.py / uriclient.py，interop.yml 在用），package_release.py 会给
+      # dist/ 里每个文件都打 zip+dgst，`files: dist/**` 再全量上传 —— v26.10.11-rust.1
+      # 发布页因此混进 48 个脚本资产。发布目录只允许本次构建出的二进制。
       - name: Rename artifacts
         run: |
+          rm -rf dist
           mkdir -p dist
           for d in artifacts/*/; do
             name=$(basename "$d")

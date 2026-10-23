@@ -10,7 +10,7 @@
 
 容量公式：`receiveBufferSize ≥ BDP = 目标带宽 × RTT / 8`。4MB @ 322ms 理论支撑 ~99Mbps，实测 31-40Mbps（瓶颈在腿上其它环节，窗已不设限）。
 
-## 1. 症状与定量（床 199.115.231.188，netem 161ms×2 腿 ≈ 322ms RTT，REALITY+vless vision 上行 16MB）
+## 1. 症状与定量（床 VPS-OLD，netem 161ms×2 腿 ≈ 322ms RTT，REALITY+vless vision 上行 16MB）
 
 | 配置 | 轮次 | 结果 |
 |---|---|---|
@@ -145,7 +145,7 @@ sysctl -w net.ipv4.tcp_rmem="4096 8388608 34603008"
 
 ## 8. VPS 床复现（固化配方）
 
-床：`ssh -p 26617 root@199.115.231.188`，配方目录 `/tmp/repro8sum/r2/`。
+床：`ssh -p SSHPORT root@VPS-OLD`，配方目录 `/tmp/repro8sum/r2/`。
 
 ```bash
 # 默认即修复态（CFG=fix → srv_fix.json/cli_fix.json，sockopt 4MB）

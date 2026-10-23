@@ -6,7 +6,7 @@
 ## 1. 核心数据（同机、同节点、同窗口）
 
 节点配置取自 v2rayN 真实测速配置（`binConfigs/configTest*`，trojan×xhttp@443 / httpupgrade@8443，
-`home.begonia92.top`，path 与 v2rayN 逐字一致）。下载目标 = VPS 自建文件源（`176.122.139.45:18999`，
+`home.begonia92.top`，path 与 v2rayN 逐字一致）。下载目标 = VPS 自建文件源（`VPS-US1:18999`，
 经 CF 链路），curl 单连接 100-315MB，CPU 用 `Get-Process.TotalProcessorTime` 前后差。
 
 | 场景 | 吞吐 | CPU 消耗 | **MB / CPU-秒** |

@@ -73,7 +73,7 @@
 | 客户端备份 | `D:/tmp/xray-8780187e.exe`(2bfd7a58) / `D:/tmp/xray-3156f08d.exe`(d45cbc12) / Go=`D:/tmp/ab-cdn/go-xray.exe`(d4ca1c66) |
 | 实验脚本 | `D:/tmp/ab-ss/{conc_same,storm_ss,conc_hs}.py` + `cdn_12829/13829/14829.json`（端口错开的同款 ss 配置） |
 | ss 节点凭据（脱敏指针） | `D:/tmp/ssdig_20261018/cdn.json`、`argo.json`；v2rayN DB=`guiConfigs/guiNDB.db` |
-| 服务端部署配方 | gh artifact zip → ssh `-p 26617 root@176.122.139.45`（免密）→ `/root/agsbx/xray` + `systemctl restart xr`，验 `md5sum` + `ss -tlnp | grep -c xray`（应 26） |
+| 服务端部署配方 | gh artifact zip → ssh `-p SSHPORT root@VPS-US1`（免密）→ `/root/agsbx/xray` + `systemctl restart xr`，验 `md5sum` + `ss -tlnp | grep -c xray`（应 26） |
 | CI artifact（3156f08d Linux） | run `39179020228` |
 
 ## 5. 环境警告（血泪）
