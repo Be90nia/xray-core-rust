@@ -13,7 +13,8 @@
 //! P0-8 装配门：deps 拓扑校验、per-plugin ctx 路由、停机超时接线）；
 //! P1 通用件已起步：P1-1 pool（缓冲池接缝 + xray-buf 外侧适配 + PoolBase
 //! 管理面白拿，分配路径零改动）；P1-4 deadline（超时唯一入口即件 + 握手/
-//! 空闲限时配置面）。
+//! 空闲限时配置面）；P1-5 observe（观测字段模板 conn_id/stage/peer/dest
+//! 四元组 + Stage 枚举 + 统一落点 emit 挂 P0-7 LogFacade）。
 
 /// 契约层词汇直呼（继承面 A 类：`use skeleton::`——包名 udf-skeleton 的 lib 名）。
 pub use skeleton::EffectId;
@@ -28,6 +29,8 @@ pub mod deadline;
 pub mod error;
 pub mod lifecycle;
 pub mod logging;
+// P1 观测字段模板（坑约束 3/10/11 的字段面，P1-5）。
+pub mod observe;
 pub mod plugin;
 pub mod pool;
 pub mod registry;
@@ -38,6 +41,7 @@ pub use deadline::{DEFAULT_LIMIT, HandshakeDeadline, IdleDeadline, with_deadline
 pub use error::{LifecyclePhase, PluginError};
 pub use lifecycle::{Phase, StartedPlugins, bring_up};
 pub use logging::{LogFacade, init_from_env};
+pub use observe::{ObserveFields, Stage, emit};
 pub use plugin::{ClauseId, Lifecycle, Plugin, PluginContract, PluginDep};
 pub use pool::{BufferPool, ManagedBufferPool, PoolError, PooledBuffer, XrayBufPool};
 pub use registry::PluginRegistry;
