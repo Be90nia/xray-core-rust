@@ -14,7 +14,8 @@
 //! P1 通用件已起步：P1-1 pool（缓冲池接缝 + xray-buf 外侧适配 + PoolBase
 //! 管理面白拿，分配路径零改动）；P1-4 deadline（超时唯一入口即件 + 握手/
 //! 空闲限时配置面）；P1-5 observe（观测字段模板 conn_id/stage/peer/dest
-//! 四元组 + Stage 枚举 + 统一落点 emit 挂 P0-7 LogFacade）。
+//! 四元组 + Stage 枚举 + 统一落点 emit 挂 P0-7 LogFacade）；P1-6 reload
+//! （配置热更回滚语义件 Stage/ReloadTx/swap_all/ConfigReloadListener）。
 
 /// 契约层词汇直呼（继承面 A 类：`use skeleton::`——包名 udf-skeleton 的 lib 名）。
 pub use skeleton::EffectId;
@@ -34,6 +35,9 @@ pub mod observe;
 pub mod plugin;
 pub mod pool;
 pub mod registry;
+// P1-6 配置热更回滚语义件（Stage/ReloadTx/swap_all + ConfigReloadListener）。
+// 本件 Stage 与 observe::Stage 同名不同型：观测枚举挂根，本件的走 reload:: 路径。
+pub mod reload;
 
 pub use assembly::{Framework, FrameworkBuilder, FrameworkOptions};
 pub use context::{PluginContext, derive_fingerprint};
@@ -45,6 +49,11 @@ pub use observe::{ObserveFields, Stage, emit};
 pub use plugin::{ClauseId, Lifecycle, Plugin, PluginContract, PluginDep};
 pub use pool::{BufferPool, ManagedBufferPool, PoolError, PooledBuffer, XrayBufPool};
 pub use registry::PluginRegistry;
+// reload::Stage 不挂根（与 observe::Stage 撞名），走 xray_frame::reload::Stage。
+pub use reload::{
+    ConfigChange, ConfigReloadListener, ConfigSource, ReloadError, ReloadTx, Swap, clean, swap_all,
+    swap_one,
+};
 
 #[cfg(test)]
 mod wiring_smoke_tests {
