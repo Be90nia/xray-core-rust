@@ -5694,6 +5694,7 @@ dependencies = [
  "rustls-pki-types",
  "thiserror 2.0.18",
  "tracing",
+ "udf-skeleton-infra",
  "webpki-roots 1.0.8",
  "xray-common",
  "xray-features",

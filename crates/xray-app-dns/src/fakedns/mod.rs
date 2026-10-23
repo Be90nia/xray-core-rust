@@ -8,6 +8,7 @@
 //! [`set_shared_multi`] 显式注册共享引擎（见其文档）。
 
 use std::{
+    collections::HashMap,
     net::IpAddr,
     num::NonZeroUsize,
     sync::{Arc, LazyLock},
@@ -70,6 +71,7 @@ pub struct Holder {
 
 struct HolderInner {
     domain_to_ip: LruCache<String, IpAddr>,
+    ip_to_domain: HashMap<IpAddr, String>,
 }
 
 impl Holder {
@@ -77,7 +79,10 @@ impl Holder {
     #[must_use]
     pub fn with_config(conf: FakeDnsPool) -> Self {
         Self {
-            inner: Mutex::new(HolderInner { domain_to_ip: LruCache::unbounded() }),
+            inner: Mutex::new(HolderInner {
+                domain_to_ip: LruCache::unbounded(),
+                ip_to_domain: HashMap::new(),
+            }),
             // 暂填一个占位 range，initialize() 才会真正设置。
             ip_range: "0.0.0.0/32".parse().expect("placeholder CIDR literal is valid"),
             config: conf,
@@ -119,6 +124,8 @@ impl Holder {
         // ponytail: lru_size 为 0 时退回 1（Go 行为是 panic）。
         inner.domain_to_ip =
             LruCache::new(NonZeroUsize::new(lru_size).unwrap_or(NonZeroUsize::MIN));
+        // 值→键反查索引与主表同步重建（池重建不得残留旧映射）。
+        inner.ip_to_domain.clear();
         Ok(())
     }
 
@@ -150,7 +157,7 @@ impl Holder {
         let mut ts = now_millis() & ((1u64 << self.rooms()) - 1);
         let mut ip = self.ts_to_ip(ts);
         // 跳过已占用的 IP。
-        while inner.domain_to_ip.iter().any(|(_, v)| *v == ip) {
+        while inner.ip_to_domain.contains_key(&ip) {
             ts = ts.wrapping_add(1) & ((1u64 << self.rooms()) - 1);
             ip = self.ts_to_ip(ts);
             if ip == self.ip_range.network() {
@@ -158,7 +165,13 @@ impl Holder {
                 break;
             }
         }
-        inner.domain_to_ip.put(domain.to_string(), ip);
+        // put 前已确认 domain 未占用（上方 get 早退），仅新键路径。
+        // 用 `push` 而非 `put`：lru 0.18 的 put 淘汰时不回传被逐条目，
+        // 拿不到 (k, v) 就无法同步摘除值→键索引（对齐 Go lru.Put 双表同临界区维护）。
+        if let Some((_, evicted_ip)) = inner.domain_to_ip.push(domain.to_string(), ip) {
+            inner.ip_to_domain.remove(&evicted_ip);
+        }
+        inner.ip_to_domain.insert(ip, domain.to_string());
         vec![ip]
     }
 
@@ -180,8 +193,8 @@ impl Holder {
         if !self.is_ip_in_pool(ip) {
             return None;
         }
-        let inner = self.inner.lock();
-        inner.domain_to_ip.iter().find(|(_, v)| **v == ip).map(|(k, _)| k.clone())
+        // O(1) 值→键索引（Go cache.Lru.GetKeyFromValue 同款 valueToElement 面）。
+        self.inner.lock().ip_to_domain.get(&ip).cloned()
     }
 
     /// 当前池类型（IPv4/IPv6）。
@@ -195,6 +208,12 @@ impl Holder {
     #[allow(clippy::len_without_is_empty)] // len 语义为条目计数
     pub fn len(&self) -> usize {
         self.inner.lock().domain_to_ip.len()
+    }
+
+    /// 值→键反查索引条目数，与 `len()` 对账用（仅测试可见）。
+    #[cfg(test)]
+    fn reverse_index_len(&self) -> usize {
+        self.inner.lock().ip_to_domain.len()
     }
 
     /// 子网地址位数。
@@ -425,5 +444,68 @@ mod tests {
             Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
         );
         assert_eq!(address_to_ip(&Address::Domain("x".to_string())), None);
+    }
+
+    #[test]
+    fn reverse_lookup_round_trips_all_entries_and_index_accounting() {
+        // 大池（rooms=28）：把「ts 回绕落到 network 且被占用」的退化相位
+        // （skip-loop break 不查占用，先于本任务存在）压到统计上不可触发，
+        // 保证断言不依赖墙钟相位。
+        let mut h = Holder::with_config(FakeDnsPool {
+            ip_pool: "240.0.0.0/4".to_string(),
+            lru_size: 10_000,
+        });
+        h.initialize().unwrap();
+        let domains: Vec<String> = (0..10_000).map(|i| format!("host{i}.example.com")).collect();
+        let ips: Vec<IpAddr> = domains.iter().map(|d| h.get_fake_ip_for_domain(d)[0]).collect();
+        assert_eq!(h.len(), 10_000);
+        assert_eq!(h.reverse_index_len(), 10_000, "值→键索引必须与主表条数一致");
+        for (d, ip) in domains.iter().zip(&ips) {
+            assert_eq!(h.get_domain_from_fake_dns(*ip).as_deref(), Some(d.as_str()));
+        }
+    }
+
+    #[test]
+    fn recycled_entry_misses_reverse_lookup() {
+        // 大池 + 容量 2：淘汰路径确定（第三个分配按 LRU 逐出 a.com），
+        // 且 rooms=28 使回绕相位彩票统计上不可触发（见 10k 测试注释）。
+        let mut h =
+            Holder::with_config(FakeDnsPool { ip_pool: "240.0.0.0/4".to_string(), lru_size: 2 });
+        h.initialize().unwrap();
+        let recycled_ip = h.get_fake_ip_for_domain("a.com")[0];
+        let b_ip = h.get_fake_ip_for_domain("b.com")[0];
+        let _c_ip = h.get_fake_ip_for_domain("c.com")[0];
+        assert_eq!(h.len(), 2);
+        assert_eq!(h.reverse_index_len(), 2, "回收（LRU 淘汰）后索引必须同步摘除");
+        assert_eq!(h.get_domain_from_fake_dns(recycled_ip), None, "回收后反查不命中");
+        assert_eq!(h.get_domain_from_fake_dns(b_ip).as_deref(), Some("b.com"));
+    }
+
+    #[test]
+    fn pool_rebuild_clears_reverse_index() {
+        let mut h = Holder::new_default().unwrap();
+        let old_ip = h.get_fake_ip_for_domain("example.com")[0];
+        assert!(h.get_domain_from_fake_dns(old_ip).is_some());
+        h.initialize().unwrap();
+        assert_eq!(h.len(), 0);
+        assert_eq!(h.reverse_index_len(), 0, "池重建后索引不得残留");
+        assert_eq!(h.get_domain_from_fake_dns(old_ip), None);
+        let new_ip = h.get_fake_ip_for_domain("example.com")[0];
+        assert_eq!(h.get_domain_from_fake_dns(new_ip).as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn holder_multi_reverse_lookup_resolves_each_pool() {
+        // 双 v4 池验证索引按 holder 隔离（v6 池分配路径存在先于本任务的
+        // `1u64 << rooms` 溢出问题（rooms ≥ 64 时 debug panic），不在本票范围）。
+        let multi = unwrap_multi(HolderMulti::new(vec![
+            FakeDnsPool { ip_pool: "240.0.0.0/12".to_string(), lru_size: 64 },
+            FakeDnsPool { ip_pool: "100.64.0.0/24".to_string(), lru_size: 64 },
+        ]));
+        let ips = multi.get_fake_ip_for_domain("x.com");
+        assert_eq!(ips.len(), 2, "双池各出一个 fake IP");
+        for ip in ips {
+            assert_eq!(multi.get_domain_from_fake_dns(ip).as_deref(), Some("x.com"));
+        }
     }
 }

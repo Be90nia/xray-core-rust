@@ -14,6 +14,7 @@ use std::{
 };
 
 use parking_lot::RwLock;
+use skeleton::clock::{Clock, SystemClock};
 use tokio::sync::broadcast;
 
 use crate::{
@@ -52,6 +53,9 @@ pub struct CacheController {
     pub single_flight: tokio::sync::Mutex<
         HashMap<(String, bool, bool), broadcast::Sender<crate::nameserver::cached::QueryOutcome>>,
     >,
+    /// 时间源契约（P1-12）：TTL/stale 判定与清理节奏统一走 `skeleton::clock::Clock`。
+    /// 生产 `SystemClock`；测试注入 `MockClock` 得确定性时间线（零真等）。
+    clock: Arc<dyn Clock>,
 }
 
 /// 广播事件。对应 Go `pubsub` 中的 `*IPRecord` 消息。
@@ -70,6 +74,9 @@ pub enum CacheEvent {
 
 impl CacheController {
     /// 创建新控制器。对应 Go `NewCacheController`。
+    ///
+    /// 时间源默认 [`SystemClock`]；测试注入 [`skeleton::clock::MockClock`]
+    /// 走 [`Self::with_clock`]（P1-12：TTL/stale 判定可确定性测试）。
     #[must_use]
     pub fn new(
         name: impl Into<String>,
@@ -77,6 +84,30 @@ impl CacheController {
         serve_stale: bool,
         serve_expired_ttl: u32,
         negative_ttl_secs: u32,
+    ) -> Self {
+        Self::with_clock(
+            name,
+            disable_cache,
+            serve_stale,
+            serve_expired_ttl,
+            negative_ttl_secs,
+            Arc::new(SystemClock),
+        )
+    }
+
+    /// 创建新控制器（可注入时间源）。对应 Go `NewCacheController` + 时钟注入口。
+    ///
+    /// P1-12：TTL/stale/清理节奏统一走 [`Clock`] 契约——生产 [`SystemClock`]
+    /// 直通真实时间；测试注入 `MockClock` 后过期路径零真等（`advance` 显式
+    /// 推进，时间线逐纳秒可断言）。
+    #[must_use]
+    pub fn with_clock(
+        name: impl Into<String>,
+        disable_cache: bool,
+        serve_stale: bool,
+        serve_expired_ttl: u32,
+        negative_ttl_secs: u32,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         let (tx, _) = broadcast::channel(256);
         Self {
@@ -89,7 +120,15 @@ impl CacheController {
             high_watermark: RwLock::new(0),
             tx,
             single_flight: tokio::sync::Mutex::new(HashMap::new()),
+            clock,
         }
+    }
+
+    /// 缓存时间源（P1-12）：`query_ip`/`fetch` 的 TTL 判定与后台清理共用
+    /// 同一时钟，保证过期判定单源一致。
+    #[must_use]
+    pub(crate) fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
     }
 
     /// 当前缓存条目数。
@@ -238,6 +277,9 @@ impl CacheController {
     ///
     /// 当前线程无 tokio runtime 时返回 `None`（同步上下文构建配置/单测），
     /// 不 spawn——后台任务本就无处运行。
+    ///
+    /// 清理时间取 [`Clock::now_instant`]（P1-12：与 TTL/stale 判定同一时钟源，
+    /// 测试注入 `MockClock` 后可确定性推进）。
     pub fn start_cleanup_task(
         self: &Arc<Self>,
         interval: Duration,
@@ -249,7 +291,7 @@ impl CacheController {
             ticker.tick().await; // 跳过首次立即触发
             loop {
                 ticker.tick().await;
-                let now = Instant::now();
+                let now = ctrl.clock.now_instant();
                 let (cleaned, shrunk) = ctrl.run_cleanup(now);
                 if cleaned || shrunk {
                     tracing::debug!(
@@ -297,6 +339,8 @@ impl CacheController {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
+    use skeleton::clock::MockClock;
+
     use super::*;
     use crate::dnscommon::ip_record;
 
@@ -315,7 +359,7 @@ mod tests {
     #[test]
     fn upsert_then_find_returns_record() {
         let c = make_ctrl();
-        let now = Instant::now();
+        let now = c.clock().now_instant();
         let rec =
             ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(60), 0, now);
         c.upsert("example.com.", true, rec);
@@ -328,7 +372,7 @@ mod tests {
     #[test]
     fn upsert_separate_v4_v6_into_same_entry() {
         let c = make_ctrl();
-        let now = Instant::now();
+        let now = c.clock().now_instant();
         let rec4 =
             ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(60), 0, now);
         let rec6 = ip_record(
@@ -348,7 +392,7 @@ mod tests {
     #[test]
     fn collect_expired_keys_returns_only_expired() {
         let c = make_ctrl();
-        let now = Instant::now();
+        let now = c.clock().now_instant();
         let expired =
             ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(0), 0, now);
         let live = ip_record(
@@ -370,7 +414,7 @@ mod tests {
     #[test]
     fn run_cleanup_removes_expired_and_returns_cleaned() {
         let c = make_ctrl();
-        let now = Instant::now();
+        let now = c.clock().now_instant();
         let expired =
             ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(0), 0, now);
         c.upsert("gone.com.", true, expired);
@@ -383,7 +427,7 @@ mod tests {
     #[test]
     fn run_cleanup_returns_false_when_nothing_expired() {
         let c = make_ctrl();
-        let now = Instant::now();
+        let now = c.clock().now_instant();
         let live =
             ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(120), 0, now);
         c.upsert("live.com.", true, live);
@@ -394,7 +438,7 @@ mod tests {
     #[test]
     fn cleanup_high_watermark_tracks_peak() {
         let c = make_ctrl();
-        let now = Instant::now();
+        let now = c.clock().now_instant();
         let live =
             ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(120), 0, now);
         c.upsert("a.com.", true, live.clone());
@@ -411,7 +455,7 @@ mod tests {
         let c = CacheController::new("test", false, true, 30, 0);
         assert_eq!(c.serve_expired_ttl_secs, -30);
         // effective_now 应当 now + 30s（Go: now.Add(-30s) 后与 expire 比较）。
-        let now = Instant::now();
+        let now = c.clock().now_instant();
         let expired_under_normal =
             ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(10), 0, now);
         c.upsert("gone.com.", true, expired_under_normal);
@@ -427,7 +471,7 @@ mod tests {
     #[test]
     fn upsert_no_op_when_disable_cache() {
         let c = CacheController::new("test", true, false, 0, 0);
-        let now = Instant::now();
+        let now = c.clock().now_instant();
         let rec =
             ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(60), 0, now);
         c.upsert("example.com.", true, rec);
@@ -435,10 +479,16 @@ mod tests {
         assert!(c.find_records("example.com.").is_none());
     }
 
-    #[tokio::test]
+    /// 生产接线验证：start_cleanup_task 周期执行 run_cleanup。
+    ///
+    /// P1-12 确定性化（零真等）：时钟注入 [`MockClock`]（判定时间线显式
+    /// `advance` 推进）+ tokio `start_paused`（调度时间线虚拟推进）——
+    /// 原实现真等 200ms 等 ticker。
+    #[tokio::test(start_paused = true)]
     async fn cleanup_task_removes_expired_entries() {
-        let c = Arc::new(CacheController::new("test", false, false, 0, 0));
-        let now = Instant::now();
+        let clock = Arc::new(MockClock::new());
+        let c = Arc::new(CacheController::with_clock("test", false, false, 0, 0, clock.clone()));
+        let now = clock.now_instant();
         let expired =
             ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(0), 0, now);
         c.upsert("gone.com.", true, expired);
@@ -451,8 +501,10 @@ mod tests {
         );
         c.upsert("live.com.", true, live);
 
-        // 生产接线验证：start_cleanup_task 周期执行 run_cleanup。
         let _handle = c.start_cleanup_task(Duration::from_millis(20));
+        // MockClock 冻结时 expire==now 不判过期（严格 <）；推过过期点后，
+        // 下一个 cleanup tick（20ms 虚拟时刻）即清理。
+        clock.advance(Duration::from_secs(1));
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         assert!(
@@ -460,5 +512,109 @@ mod tests {
             "expired entry must be removed by cleanup task"
         );
         assert!(c.find_records("live.com.").is_some(), "live entry must survive");
+    }
+    /// ① MockClock 推过期秒 → 缓存立即过期（零真等）。
+    ///
+    /// 同时钉死严格 `<` 边界：expire == effective_now 不判过期（Go
+    /// `expire.Before(now)` 同款），推满 TTL 整 60s 仍存活，再推 1s 才清。
+    #[test]
+    fn mock_clock_advance_expires_entry_without_real_wait() {
+        let clock = Arc::new(MockClock::new());
+        let c = CacheController::with_clock("test", false, false, 0, 0, clock.clone());
+        let now = clock.now_instant();
+        c.upsert(
+            "a.com.",
+            true,
+            ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(60), 0, now),
+        );
+
+        // 虚拟时间冻结：同刻不清。
+        let (cleaned, _) = c.run_cleanup(clock.now_instant());
+        assert!(!cleaned);
+        assert!(c.find_records("a.com.").is_some());
+
+        // 恰满 TTL（expire == now）：严格 < 不判过期。
+        clock.advance(Duration::from_secs(60));
+        let (cleaned, _) = c.run_cleanup(clock.now_instant());
+        assert!(!cleaned, "expire == effective_now 不得判过期（Go Before 语义）");
+
+        // 推过 TTL 1s → 立即过期。
+        clock.advance(Duration::from_secs(1));
+        let (cleaned, _) = c.run_cleanup(clock.now_instant());
+        assert!(cleaned);
+        assert!(c.find_records("a.com.").is_none());
+    }
+
+    /// ② stale 宽限边界：宽限内仍可服务（不清理），恰在边界保留，超出即弃。
+    #[test]
+    fn stale_grace_boundary_within_served_beyond_discarded() {
+        // serve_stale = true + 宽限 30s（Go serveExpiredTTL=30）。
+        let clock = Arc::new(MockClock::new());
+        let c = CacheController::with_clock("test", false, true, 30, 0, clock.clone());
+        let now = clock.now_instant();
+        // TTL 10s：真实过期点 = t0 + 10s。
+        c.upsert(
+            "g.com.",
+            true,
+            ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(10), 0, now),
+        );
+
+        // 过期后 10s（宽限内）：effective_now = now - 30s < expire → 保留可服务。
+        clock.advance(Duration::from_secs(20));
+        assert!(c.collect_expired_keys(clock.now_instant()).is_empty(), "宽限内不得清理");
+        assert!(c.find_records("g.com.").is_some(), "宽限内记录仍可服务");
+
+        // 恰在宽限边界（expire == effective_now）：严格 < 保留。
+        clock.advance(Duration::from_secs(20));
+        assert!(
+            c.collect_expired_keys(clock.now_instant()).is_empty(),
+            "宽限边界（expire == effective_now）不得判过期"
+        );
+
+        // 超出宽限 1s：即弃。
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(c.collect_expired_keys(clock.now_instant()), vec!["g.com.".to_string()]);
+        let (cleaned, _) = c.run_cleanup(clock.now_instant());
+        assert!(cleaned);
+        assert!(c.find_records("g.com.").is_none());
+    }
+
+    /// ③ 双族 TTL 各自独立生效：A 先过独立 TTL 只清 A 槽，AAAA 存活；条目
+    /// 随 AAAA 过期才整条消失（缓存键与每 NS 一缓存前提不受影响）。
+    #[test]
+    fn dual_family_ttl_independent() {
+        let clock = Arc::new(MockClock::new());
+        let c = CacheController::with_clock("test", false, false, 0, 0, clock.clone());
+        let now = clock.now_instant();
+        c.upsert(
+            "d.com.",
+            true,
+            ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(10), 0, now),
+        );
+        c.upsert(
+            "d.com.",
+            false,
+            ip_record(
+                2,
+                vec![IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)],
+                Duration::from_secs(120),
+                0,
+                now,
+            ),
+        );
+
+        // t0+20s：A（TTL 10s）已过期，AAAA（TTL 120s）存活。
+        clock.advance(Duration::from_secs(20));
+        let (cleaned, _) = c.run_cleanup(clock.now_instant());
+        assert!(cleaned);
+        let r = c.find_records("d.com.").expect("AAAA 存活则条目不得整条删除");
+        assert!(r.a.is_none(), "A 槽按自身 TTL 清空");
+        assert!(r.aaaa.is_some(), "AAAA 按自身 TTL 存活");
+
+        // t0+121s：AAAA 也过期 → 两槽空 → 整条移除。
+        clock.advance(Duration::from_secs(101));
+        let (cleaned, _) = c.run_cleanup(clock.now_instant());
+        assert!(cleaned);
+        assert!(c.find_records("d.com.").is_none());
     }
 }

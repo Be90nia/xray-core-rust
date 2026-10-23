@@ -114,7 +114,7 @@ pub async fn query_ip<S: CachedNameserver + 'static>(
 
     if !cache.disable_cache {
         if let Some(rec) = cache.find_records(fqdn_owned) {
-            let now = Instant::now();
+            let now = cache.clock().now_instant();
             let (ips, ttl, err) = merge_records(option, rec.a.as_ref(), rec.aaaa.as_ref(), now);
             // Go nameserver_cached.go:27-32：err 非 RecordNotFound 且 ttl>0
             // 即 cache HIT——含负缓存（rcode/空答案）在 TTL 内直接返回，不打
@@ -232,7 +232,7 @@ pub async fn fetch<S: CachedNameserver>(
             outcome
         }
     };
-    let now = Instant::now();
+    let now = cache.clock().now_instant();
 
     // 缓存结果。仅写入上游真实响应（含 NXDOMAIN 的 rcode=3 记录，TTL 取响应
     // TTL）；上游超时/失败（rec=None）不写任何缓存——Go 从不缓存失败，修复前
