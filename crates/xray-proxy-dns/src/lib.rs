@@ -28,6 +28,7 @@ pub mod error;
 pub mod handler;
 pub mod inbound;
 pub mod outbound;
+pub mod plugin;
 
 // 顶层 re-export。
 pub use config::{Config, DnsRule, DnsRuleConfig, RuleAction};
@@ -41,3 +42,4 @@ pub use handler::{
 };
 pub use inbound::DnsInbound;
 pub use outbound::{DnsOutbound, forward_tcp_raw, forward_udp_raw, resolve_dest_socket_addr};
+pub use plugin::DnsPlugin;
