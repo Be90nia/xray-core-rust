@@ -59,15 +59,22 @@ impl Packet {
     /// 序列化（不含 VER + TYPE，由调用方先写）。
     ///
     /// 布局：`ASSOC_ID(2) + PKT_ID(2) + FRAG_TOTAL(1) + FRAG_ID(1) + SIZE(2) + ADDR + DATA`。
-    pub fn write_payload<B: BufMut>(&self, buf: &mut B) {
+    ///
+    /// # Errors
+    ///
+    /// - [`TuicError::PacketTooLarge`]：`data.len()` 超过 u16 可编码上限（65535）， SIZE
+    ///   字段无法如实表达 → 拒绝写出（历史饱和截断会静默丢尾）。
+    pub fn write_payload<B: BufMut>(&self, buf: &mut B) -> Result<()> {
+        let size = u16::try_from(self.data.len())
+            .map_err(|_| TuicError::PacketTooLarge(self.data.len()))?;
         buf.put_u16(self.assoc_id);
         buf.put_u16(self.pkt_id);
         buf.put_u8(self.frag_total);
         buf.put_u8(self.frag_id);
-        let size = u16::try_from(self.data.len()).unwrap_or(u16::MAX);
         buf.put_u16(size);
         self.addr.write_to(buf);
-        buf.put_slice(&self.data[..size as usize]);
+        buf.put_slice(&self.data);
+        Ok(())
     }
 
     /// 序列化所需字节数（含 VER + TYPE 头部 2 字节）。
@@ -220,7 +227,7 @@ mod tests {
         let mut buf = Vec::with_capacity(pkt.encoded_len());
         buf.put_u8(VERSION);
         buf.put_u8(crate::protocol::command::type_code::PACKET);
-        pkt.write_payload(&mut buf);
+        pkt.write_payload(&mut buf).expect("encode");
         assert_eq!(buf.len(), pkt.encoded_len());
 
         // 解析：先消费 VER+TYPE
@@ -277,6 +284,51 @@ mod tests {
         // VER+TYPE(2) + ASSOC(2) + PKT(2) + FRAG_TOTAL(1) + FRAG_ID(1) + SIZE(2)
         // + ADDR(1+4+2=7) + DATA(50) = 67
         assert_eq!(pkt.encoded_len(), 2 + 2 + 2 + 1 + 1 + 2 + 7 + 50);
+    }
+
+    /// u16 清偿边界钉：合法值（512/1332/65535 上限）字节与改前快照逐字节一致。
+    /// 帧布局 = ASSOC(2)+PKT(2)+FRAG_TOTAL(1)+FRAG_ID(1)+SIZE(2) + ADDR(Ipv4=7) + DATA。
+    #[test]
+    fn write_payload_u16_boundary_bytes() {
+        for payload_len in [512usize, 1332, 65535] {
+            let data = Bytes::from(vec![0x5Au8; payload_len]);
+            let pkt = Packet::new(
+                0x1122,
+                0x3344,
+                Address::Ipv4(Ipv4Addr::new(1, 2, 3, 4), 53),
+                data.clone(),
+            );
+            let mut buf = Vec::new();
+            pkt.write_payload(&mut buf).expect("encode");
+            let mut expected = Vec::new();
+            expected.extend_from_slice(&0x1122u16.to_be_bytes());
+            expected.extend_from_slice(&0x3344u16.to_be_bytes());
+            expected.push(1); // FRAG_TOTAL
+            expected.push(0); // FRAG_ID
+            expected.extend_from_slice(&(payload_len as u16).to_be_bytes());
+            expected.push(0x01); // ATYP_IPV4
+            expected.extend_from_slice(&[1, 2, 3, 4]);
+            expected.extend_from_slice(&53u16.to_be_bytes());
+            expected.extend_from_slice(&data);
+            assert_eq!(buf, expected, "payload_len={payload_len}");
+            // encoded_len 含 VER+TYPE 2 字节，write_payload 产出不含
+            assert_eq!(buf.len() + 2, pkt.encoded_len());
+        }
+    }
+
+    /// 65536 → 显式 Err（非截断、非 panic），且不产出脏帧。
+    #[test]
+    fn write_payload_over_u16_rejected() {
+        let pkt = Packet::new(
+            0x1122,
+            0x3344,
+            Address::Ipv4(Ipv4Addr::new(1, 2, 3, 4), 53),
+            Bytes::from(vec![0u8; 65536]),
+        );
+        let mut buf = Vec::new();
+        let err = pkt.write_payload(&mut buf).unwrap_err();
+        assert!(matches!(err, TuicError::PacketTooLarge(65536)));
+        assert!(buf.is_empty(), "failed encode must not leave partial bytes");
     }
 
     #[test]
@@ -406,7 +458,7 @@ mod tests {
 
         // 序列化 f0
         let mut buf = vec![VERSION, crate::protocol::command::type_code::PACKET];
-        f0.write_payload(&mut buf);
+        f0.write_payload(&mut buf).expect("encode fragment");
         let mut cur = &buf[..];
         let _ = crate::protocol::parse_header(&mut cur).unwrap();
         let p0 = Packet::read_payload(&mut cur).unwrap();
@@ -416,7 +468,7 @@ mod tests {
 
         // 序列化 f1
         let mut buf = vec![VERSION, crate::protocol::command::type_code::PACKET];
-        f1.write_payload(&mut buf);
+        f1.write_payload(&mut buf).expect("encode fragment");
         let mut cur = &buf[..];
         let _ = crate::protocol::parse_header(&mut cur).unwrap();
         let p1 = Packet::read_payload(&mut cur).unwrap();

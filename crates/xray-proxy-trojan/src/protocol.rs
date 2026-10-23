@@ -318,7 +318,10 @@ pub fn parse_request_header(buf: &[u8]) -> Result<(Network, Address, u16, usize)
 /// 对应 Go `PacketWriter.writePacket`。返回写入的总字节数。
 ///
 /// # Errors
-/// 地址编码失败（域名超 255 字节）→ [`TrojanError::WriteAddress`]。
+/// - 地址编码失败（域名超 255 字节）→ [`TrojanError::WriteAddress`]。
+/// - [`TrojanError::OversizePayload`]：`payload.len()` 超过 u16 可编码上限（65535），
+///   长度字段无法如实表达 → 拒绝写出（Go 写侧 `uint16(length)` 为回绕截断且无检查，
+///   此处显式硬错；合法 ≤65535 输入字节形态不变）。
 ///
 /// # 注意
 /// 调用方应保证 `payload.len() <= MAX_LENGTH`（与 Go 端一致，不在此强制）。
@@ -328,9 +331,10 @@ pub fn write_udp_packet(
     port: u16,
     payload: &[u8],
 ) -> Result<usize> {
+    let len = u16::try_from(payload.len())
+        .map_err(|_| TrojanError::OversizePayload(payload.len(), u16::MAX as usize))?;
     let start = out.len();
     write_address_port(out, addr, port)?;
-    let len = u16::try_from(payload.len()).unwrap_or(u16::MAX);
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(&CRLF);
     out.extend_from_slice(payload);
@@ -630,6 +634,36 @@ mod tests {
         assert_eq!(a, addr);
         assert_eq!(p, 443);
         assert_eq!(pp, payload);
+    }
+
+    #[test]
+    fn test_udp_packet_write_u16_boundary() {
+        // u16 清偿边界钉：合法值（含 65535 上限）字节形态 = [ATyp+addr+port][2B BE
+        // length][CRLF][payload] （IPv4 前导 7 字节），长度字段如实编码 payload 长度。
+        let addr = Address::IPv4(Ipv4Addr::new(127, 0, 0, 1));
+        for payload_len in [512usize, 1332, 65535] {
+            let payload = vec![0xA5u8; payload_len];
+            let mut buf = Vec::new();
+            let n = write_udp_packet(&mut buf, &addr, 8443, &payload).expect("encode");
+            let mut expected = vec![addr_type::IPV4, 127, 0, 0, 1];
+            expected.extend_from_slice(&8443u16.to_be_bytes());
+            expected.extend_from_slice(&(payload_len as u16).to_be_bytes());
+            expected.extend_from_slice(&CRLF);
+            expected.extend_from_slice(&payload);
+            assert_eq!(buf, expected, "payload_len={payload_len}");
+            assert_eq!(n, expected.len());
+        }
+    }
+
+    #[test]
+    fn test_udp_packet_write_over_u16_rejected() {
+        // 65536 → 显式 Err（非截断、非 panic），且不产出脏帧
+        let addr = Address::IPv4(Ipv4Addr::new(127, 0, 0, 1));
+        let payload = vec![0u8; 65536];
+        let mut buf = Vec::new();
+        let err = write_udp_packet(&mut buf, &addr, 8443, &payload).unwrap_err();
+        assert!(matches!(err, TrojanError::OversizePayload(65536, 65535)));
+        assert!(buf.is_empty(), "failed encode must not leave partial bytes");
     }
 
     // --------------------------------------------------------------------

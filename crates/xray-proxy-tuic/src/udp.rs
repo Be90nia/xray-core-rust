@@ -113,7 +113,7 @@ impl UniRespRouter {
         let key = (pkt.assoc_id, pkt.pkt_id);
         let recv = async {
             let mut uni = conn.open_uni().await?;
-            uni.write_all(Self::encode_frame(pkt).as_ref()).await?;
+            uni.write_all(Self::encode_frame(pkt)?.as_ref()).await?;
             let _ = uni.finish();
             rx.await.map_err(|_| TuicError::UnexpectedEof("udp resp router dropped"))
         };
@@ -129,12 +129,15 @@ impl UniRespRouter {
     }
 
     /// 将 Packet 帧序列化为 wire 格式（VER + TYPE + payload）。
-    fn encode_frame(pkt: &Packet) -> BytesMut {
+    ///
+    /// # Errors
+    /// 透传 [`Packet::write_payload`]（`data.len()` 超 u16 上限 → `PacketTooLarge`）。
+    fn encode_frame(pkt: &Packet) -> Result<BytesMut> {
         let mut buf = BytesMut::with_capacity(pkt.encoded_len() + 2);
         buf.put_u8(VERSION);
         buf.put_u8(type_code::PACKET);
-        pkt.write_payload(&mut buf);
-        buf
+        pkt.write_payload(&mut buf)?;
+        Ok(buf)
     }
 }
 
@@ -197,7 +200,7 @@ impl TuicUdpAssoc {
         let data = Bytes::copy_from_slice(data);
         for pkt in build_native_fragments(self.assoc_id, pkt_id, target, data, frag_payload)? {
             self.conn
-                .send_datagram(UniRespRouter::encode_frame(&pkt).freeze())
+                .send_datagram(UniRespRouter::encode_frame(&pkt)?.freeze())
                 .map_err(TuicError::QuinnSendDatagram)?;
         }
         Ok(())

@@ -403,7 +403,7 @@ impl ReplySink {
         let mut out = BytesMut::with_capacity(pkt.encoded_len());
         out.put_u8(crate::protocol::VERSION);
         out.put_u8(type_code::PACKET);
-        pkt.write_payload(&mut out);
+        pkt.write_payload(&mut out)?;
         match self {
             ReplySink::Dgram(c) => {
                 c.send_datagram(out.freeze()).map_err(TuicError::QuinnSendDatagram)?;
@@ -1027,7 +1027,7 @@ mod udp_assoc_tests {
         let mut buf = bytes::BytesMut::with_capacity(pkt.encoded_len() + 2);
         buf.put_u8(VERSION);
         buf.put_u8(type_code::PACKET);
-        pkt.write_payload(&mut buf);
+        pkt.write_payload(&mut buf).expect("encode packet");
         #[allow(unused_imports)] // 存量清零批次
         use tokio::io::AsyncWriteExt as _;
         send.write_all(&buf.freeze()).await.expect("write bi packet");
