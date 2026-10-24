@@ -130,16 +130,21 @@ def _cfg_impl(uri, socks_port=11080):
         return {"protocol":"anytls","tag":tag,"settings":sv}
     if u.startswith("hysteria2://"):
         # hysteria2://password@host:port?sni=&alpn=h3&congestion_control=cubic
+        # 配置形态按 Go：settings 扁平 {version,address,port}（infra/conf/hysteria.go），
+        # auth 在 streamSettings.hysteriaSettings.auth，TLS 由 streamSettings 提供
+        # （Go dialer.go 缺 tls config 即硬错 "tls config is nil"）。
         pw = up.unquote(p.password or p.username or "")
         host = p.hostname; port = p.port or 443
-        sv = {"address": host, "port": port,
-              "auth": pw,
-              "serverName": q.get("sni") or q.get("serverName") or host,
-              "alpn": [a for a in q.get("alpn", "").split(",") if a],
-              "congestion_control": q.get("congestion_control", "bbr")}
+        sni = q.get("sni") or q.get("serverName") or host
+        tls = {"serverName": sni,
+               "alpn": [a for a in q.get("alpn", "").split(",") if a]}
         if q.get("insecure", q.get("allow_insecure", "false")).lower() == "true":
-            sv["insecure"] = True
-        return {"protocol": "hysteria", "tag": tag, "settings": {"servers": [sv]}}
+            tls["allowInsecure"] = True
+        return {"protocol": "hysteria", "tag": tag,
+                "settings": {"version": 2, "address": host, "port": port},
+                "streamSettings": {"network": "hysteria", "security": "tls",
+                                   "tlsSettings": tls,
+                                   "hysteriaSettings": {"version": 2, "auth": pw}}}
     if u.startswith("naive+https://"):
         # naive+https://user:pass@host:port?security=tls&type=tcp&headerType=none
         user = up.unquote(p.username or "")

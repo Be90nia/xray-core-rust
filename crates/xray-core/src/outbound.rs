@@ -864,6 +864,19 @@ fn build_protocol_handler(
             let (server_addr, auth, server_name) = parse_hysteria_config(&ob.entry.data)?;
             let stream_settings =
                 xray_transport::dialer::StreamSettings::from_json(ob.stream_settings_json.as_ref());
+            // Go 客户端 settings 不含 auth：它在 streamSettings.hysteriaSettings.auth
+            // （infra/conf/transport_method.go HysteriaConfig）。
+            let auth = if auth.is_empty() {
+                ob.stream_settings_json
+                    .as_ref()
+                    .and_then(|v| v.get("hysteriaSettings"))
+                    .and_then(|v| v.get("auth"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            } else {
+                auth
+            };
             // tlsSettings.serverName 覆盖 settings 推导（Go tls.Config ServerName 优先级）。
             let server_name = stream_settings
                 .security_json
@@ -2956,10 +2969,12 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 
 /// 解析 hysteria outbound settings JSON → (server_addr, auth, server_name)。
 ///
-/// JSON 格式：`{"version":2,"servers":[{"address":"...","port":443,
-/// "auth"|"password":"...","serverName"|"sni":"..."}]}`。
+/// 两种 JSON 格式都接受：
+/// - Go `infra/conf/hysteria.go:13-19`：扁平 `{"version":2,"address":"...","port":443}`
+///   （auth 在 `streamSettings.hysteriaSettings.auth`，由调用方注入）；
+/// - 单端点数组 `{"servers":[{"address":...,"port":...,"auth"|"password":...}]}`。
 ///
-/// `version` 字段对齐 Go `infra/conf/hysteria.go:13-31`：缺省 = 2，v1 硬报错。
+/// `version` 字段对齐 Go `infra/conf/hysteria.go:20-22`：缺省 = 2，v1 硬报错。
 fn parse_hysteria_config(data: &[u8]) -> std::result::Result<(String, String, String), String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
     // 强制 version == 2（Go 端 hysteria.go:20-22 行为镜像）
@@ -2968,11 +2983,10 @@ fn parse_hysteria_config(data: &[u8]) -> std::result::Result<(String, String, St
             return Err(format!("hysteria version {ver} not supported (only version 2)"));
         }
     }
-    let servers = v
-        .get("servers")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| "missing servers array".to_string())?;
-    let first = servers.first().ok_or_else(|| "servers array is empty".to_string())?;
+    let first = match v.get("servers").and_then(|v| v.as_array()) {
+        Some(servers) => servers.first().ok_or_else(|| "servers array is empty".to_string())?,
+        None => &v,
+    };
     let address = first
         .get("address")
         .and_then(|v| v.as_str())
@@ -4470,6 +4484,23 @@ mod tests {
         let json2 = br#"{"domainStrategy":"UseIP","targetStrategy":""}"#;
         let cfg2 = parse_freedom_config(json2).unwrap();
         assert_eq!(cfg2.domain_strategy, 1);
+    }
+
+    /// Go `infra/conf/hysteria.go`：客户端 settings 是扁平 `{version,address,port}`，
+    /// 不是单端点数组（v2rayN 生成的正是扁平形态；auth 在 streamSettings）。
+    #[test]
+    fn parse_hysteria_config_accepts_go_flat_shape() {
+        let flat = br#"{"address":"example.com","port":39622,"version":2}"#;
+        let (addr, auth, sni) = parse_hysteria_config(flat).unwrap();
+        assert_eq!(addr, "example.com:39622");
+        assert_eq!(auth, "", "扁平原生不带 auth，由 streamSettings 注入");
+        assert_eq!(sni, "example.com");
+        // 单端点数组形态仍受支持（既有 dist 配置生成器用这个）。
+        let arr = br#"{"servers":[{"address":"a.com","port":443,"auth":"pw","sni":"b.com"}]}"#;
+        let (addr, auth, sni) = parse_hysteria_config(arr).unwrap();
+        assert_eq!((addr.as_str(), auth.as_str(), sni.as_str()), ("a.com:443", "pw", "b.com"));
+        // version != 2 仍硬错。
+        assert!(parse_hysteria_config(br#"{"address":"a.com","port":443,"version":1}"#).is_err());
     }
 
     /// x2ci：hysteria 出站 TLS 配置按 streamSettings（Go dialer.go:327-330）。
