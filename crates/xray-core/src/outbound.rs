@@ -2970,8 +2970,8 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 /// 解析 hysteria outbound settings JSON → (server_addr, auth, server_name)。
 ///
 /// 两种 JSON 格式都接受：
-/// - Go `infra/conf/hysteria.go:13-19`：扁平 `{"version":2,"address":"...","port":443}`
-///   （auth 在 `streamSettings.hysteriaSettings.auth`，由调用方注入）；
+/// - Go `infra/conf/hysteria.go:13-19`：扁平 `{"version":2,"address":"...","port":443}` （auth 在
+///   `streamSettings.hysteriaSettings.auth`，由调用方注入）；
 /// - 单端点数组 `{"servers":[{"address":...,"port":...,"auth"|"password":...}]}`。
 ///
 /// `version` 字段对齐 Go `infra/conf/hysteria.go:20-22`：缺省 = 2，v1 硬报错。

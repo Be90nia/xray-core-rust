@@ -195,8 +195,10 @@ async fn unknown_response_type_fails_build() {
 /// 指纹重跑（8 连败联合概率 ~1e-15），其余 panic 原样上抛。成功返回 = 宏断言在
 /// 本 ctx 上真实执行且通过。
 fn l4_run_conn_id_fixture(plugin: &'static str) {
-    use std::any::Any;
-    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+    use std::{
+        any::Any,
+        panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    };
 
     let mut last: Option<Box<dyn Any + Send>> = None;
     for _ in 0..8 {
@@ -204,15 +206,16 @@ fn l4_run_conn_id_fixture(plugin: &'static str) {
         match catch_unwind(AssertUnwindSafe(|| xray_frame::assert_conn_id_present!(ctx, 64))) {
             Ok(()) => return,
             Err(payload) => {
-                let quota = payload.downcast_ref::<String>().is_some_and(|m| m.contains("配额耗尽"))
-                    || payload
-                        .downcast_ref::<&'static str>()
-                        .is_some_and(|m| m.contains("配额耗尽"));
+                let quota =
+                    payload.downcast_ref::<String>().is_some_and(|m| m.contains("配额耗尽"))
+                        || payload
+                            .downcast_ref::<&'static str>()
+                            .is_some_and(|m| m.contains("配额耗尽"));
                 if !quota {
                     resume_unwind(payload);
                 }
                 last = Some(payload);
-            }
+            },
         }
     }
     resume_unwind(last.expect("重掷循环至少记录一次失败 payload"));
@@ -227,7 +230,8 @@ fn l4_conn_id_present() {
 /// 期限内 Ok、永不完成 Err(Elapsed) 且真超时。d 钉 100ms 上限（CI 慢机安全）。
 #[tokio::test]
 async fn l4_deadline_effective() {
-    xray_frame::assert_deadline_effective!(std::time::Duration::from_millis(100), || async {}).await;
+    xray_frame::assert_deadline_effective!(std::time::Duration::from_millis(100), || async {})
+        .await;
 }
 
 /// 夹具三（坑约束 10/11）：target 前缀 `xray_frame::blackhole` + conn_id/stage/

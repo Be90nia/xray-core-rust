@@ -186,8 +186,10 @@ fn tproxy_gate_is_runtime_semantics_not_compiled_away() {
 /// 指纹重跑（8 连败联合概率 ~1e-15），其余 panic 原样上抛。成功返回 = 宏断言在
 /// 本 ctx 上真实执行且通过。
 fn l4_run_conn_id_fixture(plugin: &'static str) {
-    use std::any::Any;
-    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+    use std::{
+        any::Any,
+        panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    };
 
     let mut last: Option<Box<dyn Any + Send>> = None;
     for _ in 0..8 {
@@ -195,15 +197,16 @@ fn l4_run_conn_id_fixture(plugin: &'static str) {
         match catch_unwind(AssertUnwindSafe(|| xray_frame::assert_conn_id_present!(ctx, 64))) {
             Ok(()) => return,
             Err(payload) => {
-                let quota = payload.downcast_ref::<String>().is_some_and(|m| m.contains("配额耗尽"))
-                    || payload
-                        .downcast_ref::<&'static str>()
-                        .is_some_and(|m| m.contains("配额耗尽"));
+                let quota =
+                    payload.downcast_ref::<String>().is_some_and(|m| m.contains("配额耗尽"))
+                        || payload
+                            .downcast_ref::<&'static str>()
+                            .is_some_and(|m| m.contains("配额耗尽"));
                 if !quota {
                     resume_unwind(payload);
                 }
                 last = Some(payload);
-            }
+            },
         }
     }
     resume_unwind(last.expect("重掷循环至少记录一次失败 payload"));
@@ -232,6 +235,7 @@ fn l4_log_fields() {
 /// 条款 4 适用（PM 拍板 2026-10-24：转发数据面走 buf，受 BufferPool 接缝约束）。
 #[test]
 fn l4_pool_discipline() {
-    let pool = xray_frame::pool::ManagedBufferPool::new(xray_frame::pool::XrayBufPool::new(8, 8), 8, 8);
+    let pool =
+        xray_frame::pool::ManagedBufferPool::new(xray_frame::pool::XrayBufPool::new(8, 8), 8, 8);
     xray_frame::assert_pool_discipline!(pool, 4);
 }
