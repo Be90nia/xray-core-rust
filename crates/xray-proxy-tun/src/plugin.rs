@@ -255,7 +255,10 @@ mod tests {
 
     #[test]
     fn section_full_fields() {
-        let opts = parse_tun_section(&json!({
+        // autoSystemWfpBlockLeak 是 Windows 专有机制（config.rs 平台分支），
+        // 非 Windows 传非空值必须拒启 → 全字段用例按平台裁剪，Linux CI 才能过
+        // （run 40050627499 实证：无条件带上该键 → xray-proxy-tun lib 测试红）。
+        let mut settings = json!({
             "name": "utun10",
             "desc": "TestDesc",
             "mtu": 1280,
@@ -264,10 +267,12 @@ mod tests {
             "userLevel": 2,
             "autoSystemRoutingTable": ["60"],
             "autoOutboundsInterface": "auto",
-            "autoSystemDnsToGateway": true,
-            "autoSystemWfpBlockLeak": ["dns"]
-        }))
-        .expect("full settings");
+            "autoSystemDnsToGateway": true
+        });
+        if cfg!(windows) {
+            settings["autoSystemWfpBlockLeak"] = json!(["dns"]);
+        }
+        let opts = parse_tun_section(&settings).expect("full settings");
         assert_eq!(opts.name, "utun10");
         assert_eq!(opts.desc, "TestDesc");
         assert_eq!(opts.mtu, 1280);
@@ -277,7 +282,11 @@ mod tests {
         assert_eq!(opts.auto_system_routing_table, vec!["60".to_string()]);
         assert_eq!(opts.auto_outbounds_interface.as_deref(), Some("auto"));
         assert!(opts.auto_system_dns_to_gateway);
-        assert_eq!(opts.auto_system_wfp_block_leak, vec!["dns".to_string()]);
+        if cfg!(windows) {
+            assert_eq!(opts.auto_system_wfp_block_leak, vec!["dns".to_string()]);
+        } else {
+            assert!(opts.auto_system_wfp_block_leak.is_empty(), "非 Windows 平台该键不可用");
+        }
     }
 
     #[test]
