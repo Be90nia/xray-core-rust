@@ -38,6 +38,8 @@ rand = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+# 安全 F1 日志掩码断言需要 capture 订阅者（workspace 依赖已有条目）。
+tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 xray-tls = { path = "../xray-tls" }
 tokio-tungstenite = { workspace = true }

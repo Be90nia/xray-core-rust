@@ -414,4 +414,67 @@ mod tests {
         assert!(!looks_like_host_port(":9000"));
         assert!(!looks_like_host_port("a:b:c"));
     }
+    /// 安全 F1 捕获测试：skip-duplicate 警告（`error = %e` 链）不得带
+    /// password 原文。手写 subscriber（同 xray-conf 模式，零新依赖）；
+    /// set_default + rebuild 防 callsite 缓存恒捕 0（log_single_entry 先例）。
+    #[test]
+    fn duplicate_user_warn_carries_no_password() {
+        use std::sync::{Arc, Mutex};
+
+        struct WarnCapture(Arc<Mutex<Vec<String>>>);
+        impl tracing::Subscriber for WarnCapture {
+            fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+
+            fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+            fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {
+            }
+
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct Fmt(String);
+                impl tracing::field::Visit for Fmt {
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        self.0.push_str(&format!("{}={value} ", field.name()));
+                    }
+
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push_str(&format!("{}={value:?} ", field.name()));
+                    }
+                }
+                let mut v = Fmt(String::new());
+                event.record(&mut v);
+                self.0.lock().unwrap().push(v.0);
+            }
+
+            fn enter(&self, _span: &tracing::span::Id) {}
+
+            fn exit(&self, _span: &tracing::span::Id) {}
+        }
+
+        let capture = Arc::new(Mutex::new(Vec::new()));
+        let guard = tracing::subscriber::set_default(WarnCapture(Arc::clone(&capture)));
+        tracing::callsite::rebuild_interest_cache();
+        let section = json!({
+            "clients": [
+                { "password": "trojan-secret-alpha", "email": "dup@example.com" },
+                { "password": "trojan-secret-beta", "email": "dup@example.com" }
+            ]
+        });
+        let _ = parse_users(&section);
+        drop(guard);
+        let lines = capture.lock().unwrap().join("\n");
+        assert!(lines.contains("skip duplicate user"), "捕获必须咬到事件: {lines:?}");
+        assert!(!lines.contains("trojan-secret-alpha"), "password 原文禁入日志: {lines:?}");
+        assert!(!lines.contains("trojan-secret-beta"), "password 原文禁入日志: {lines:?}");
+    }
 }

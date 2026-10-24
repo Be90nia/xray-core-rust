@@ -12,6 +12,7 @@
 //! 实现注记：VMess 编解码内部使用 `Box<dyn AeadCipher>`（非 Send），
 //! 不能跨 `tokio::spawn` 边界；server/client 在同一 task 内用 `tokio::join!` 并发。
 
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros))] // 测试脚手架：spawn 起停被测服务/回环 echo、直印进度；非生产托管面
 use std::sync::Arc;
 
 use tokio::{

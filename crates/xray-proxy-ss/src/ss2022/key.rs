@@ -298,4 +298,79 @@ mod tests {
         let psk = vec![0u8; 8];
         assert!(derive_psk(&psk, CipherKind2022::Aes128Gcm).is_err());
     }
+    /// 安全 F1：`InvalidPassword` 错误链（两个构造点）不得含 PSK 原文。
+    /// 现载荷均为安全诊断文本（长度/base64 解码错误），本测试钉住该不变式。
+    #[test]
+    fn invalid_password_chain_has_no_psk_raw() {
+        let secret = "c2VjcmV0!!!";
+        let b64_err = psk_from_base64(secret).expect_err("非 base64 输入必须报错");
+        let s = b64_err.to_string();
+        assert!(s.contains("invalid password/PSK"), "错误链口径保留: {s}");
+        assert!(!s.contains("c2VjcmV0"), "PSK 原文禁入错误链: {s}");
+
+        let short_err =
+            derive_psk(b"c2VjcmV0!", CipherKind2022::Aes128Gcm).expect_err("短 PSK 必须报错");
+        let s = short_err.to_string();
+        assert!(!s.contains("c2VjcmV0"), "PSK 原文禁入错误链: {s}");
+        assert!(s.contains("PSK length"), "长度诊断保留: {s}");
+    }
+
+    /// 安全 F1 捕获测试：生产日志形态（dispatcher.rs:672
+    /// `ss2022 udp session init: {e}`）携错误链时不得带 PSK 原文。
+    /// 手写 subscriber（同 xray-conf 模式，零新依赖）；set_default + rebuild
+    /// 防 callsite 缓存恒捕 0（log_single_entry 先例）。
+    #[test]
+    fn session_init_log_shape_carries_no_psk_raw() {
+        use std::sync::{Arc, Mutex};
+
+        struct WarnCapture(Arc<Mutex<Vec<String>>>);
+        impl tracing::Subscriber for WarnCapture {
+            fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+
+            fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+            fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {
+            }
+
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct Fmt(String);
+                impl tracing::field::Visit for Fmt {
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        self.0.push_str(&format!("{}={value} ", field.name()));
+                    }
+
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push_str(&format!("{}={value:?} ", field.name()));
+                    }
+                }
+                let mut v = Fmt(String::new());
+                event.record(&mut v);
+                self.0.lock().unwrap().push(v.0);
+            }
+
+            fn enter(&self, _span: &tracing::span::Id) {}
+
+            fn exit(&self, _span: &tracing::span::Id) {}
+        }
+
+        let err = psk_from_base64("c2VjcmV0!!!").expect_err("非 base64 输入必须报错");
+        let capture = Arc::new(Mutex::new(Vec::new()));
+        let guard = tracing::subscriber::set_default(WarnCapture(Arc::clone(&capture)));
+        tracing::callsite::rebuild_interest_cache();
+        tracing::debug!("ss2022 udp session init: {err}");
+        drop(guard);
+        let lines = capture.lock().unwrap().join("\n");
+        assert!(lines.contains("ss2022 udp session init"), "捕获必须咬到事件: {lines:?}");
+        assert!(!lines.contains("c2VjcmV0"), "PSK 原文禁入日志: {lines:?}");
+    }
 }

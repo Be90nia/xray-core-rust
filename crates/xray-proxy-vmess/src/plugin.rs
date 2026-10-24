@@ -222,13 +222,13 @@ fn parse_inbound_validator(
                 .and_then(|x| x.as_i64().or_else(|| x.as_str().and_then(|s| s.parse::<i64>().ok())))
                 .unwrap_or(0);
             if alter_id != 0 {
-                tracing::warn!(alter_id, id, "vmess inbound: legacy VMess is not supported");
+                tracing::warn!(alter_id, "vmess inbound: legacy VMess is not supported");
                 return Err(PluginError::Other(
                     VmessError::UnsupportedLegacyAlterId(alter_id).to_string().into(),
                 ));
             }
-            let uuid = UUID::parse(id)
-                .ok_or_else(|| PluginError::Other(format!("vmess invalid uuid: {id}").into()))?;
+            let uuid =
+                UUID::parse(id).ok_or_else(|| PluginError::Other("vmess invalid uuid".into()))?;
             let user = MemoryUser::new(email, MemoryAccount::new(uuid)).with_level(level);
             if let Err(e) = Validator::add(&validator, user) {
                 tracing::warn!(error = %e, "skip vmess user during validator build");
@@ -334,5 +334,58 @@ mod tests {
             ]
         }));
         assert!(err.to_string().contains("one and only one"), "实际: {err}");
+    }
+
+    // ── 安全 F1（bd 0rtm）：UUID 掩码 ──
+    /// 日志捕获闭环 writer（同 xray-frame/tests/log_discipline.rs 配方）。
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl SharedBuf {
+        fn snapshot(&self) -> String {
+            String::from_utf8(self.0.lock().expect("no poison").clone()).expect("utf8")
+        }
+    }
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("no poison").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `set_default` 重建 callsite interest（换订阅者后首评估不残留 never）。
+    fn capture_log(buf: SharedBuf) -> tracing::subscriber::DefaultGuard {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || buf.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        guard
+    }
+
+    #[test]
+    fn legacy_and_invalid_uuid_paths_never_leak_raw_uuid() {
+        let log = SharedBuf::default();
+        let _guard = capture_log(log.clone());
+
+        let err = parse_err(&json!({ "clients": [{ "id": UUID_A, "alterId": 64 }] })).to_string();
+        assert!(err.contains("legacy VMess"), "错误链: {err}");
+        assert!(!err.contains(UUID_A), "错误链泄露 UUID: {err}");
+
+        let bad_id = "x".repeat(40);
+        let err = parse_err(&json!({ "clients": [{ "id": bad_id }] })).to_string();
+        assert!(err.contains("invalid uuid"), "错误链: {err}");
+        assert!(!err.contains(&bad_id), "错误链泄露 UUID: {err}");
+
+        let out = log.snapshot();
+        assert!(out.contains("legacy VMess"), "warn 必须仍有诊断信息: {out}");
+        assert!(!out.contains(UUID_A), "日志泄露 UUID: {out}");
     }
 }

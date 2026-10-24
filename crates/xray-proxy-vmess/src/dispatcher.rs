@@ -376,6 +376,10 @@ impl VmessConn {
     ) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF);
         let (stream_r, stream_w) = tokio::io::split(conn);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         let pump = tokio::spawn(async move {
             let (server_r, mut server_w) = tokio::io::split(server_io);
             // up: 明文 duplex → chunk 加密 → wire（请求 body）
@@ -480,6 +484,10 @@ impl VmessUdpConn {
             &req_cipher,
             req_size_parser.as_ref(),
         );
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         let down_task = tokio::spawn(async move {
             let mut sr = stream_r;
             // 响应头惰性解码（Go SetFlushNext：首块下行才 flush，dial 阶段同步

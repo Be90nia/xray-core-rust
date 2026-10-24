@@ -181,6 +181,10 @@ pub async fn serve_vmess(
         let history = Arc::clone(&history);
         let tls = tls.clone();
         let header = header.clone();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         tokio::spawn(async move {
             let result = if let Some(acc) = tls {
                 match acc.accept(stream).await {
