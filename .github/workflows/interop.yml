@@ -6,7 +6,7 @@ name: Interop
 on:
   workflow_dispatch:
   push:
-    branches: [master, main, dev]
+    branches: [master, main, dev, 'feature/**']
 
 env:
   CARGO_TERM_COLOR: always
