@@ -30,6 +30,7 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use parking_lot::{Mutex, RwLock};
+use skeleton_infra::fx::{FxScope, Spawned};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UdpSocket,
@@ -127,7 +128,7 @@ impl DialedUdp {
         let d = Arc::clone(&self);
         #[allow(
             clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+            reason = "热路径豁免（B6 t975）：每包泵——WG 数据报读循环（连接级读 goroutine，Go bind.go:126-166 同构），热路径零改动（坑约束 12）；托管接线归 P1 插件装配"
         )]
         tokio::spawn(async move {
             d.read_loop(read).await;
@@ -260,6 +261,9 @@ pub struct WgDriver {
     /// 原始 WG 数据报队列（Go `netBind.readQueue`）。
     queue_tx: mpsc::Sender<WgDatagram>,
     queue_rx: AsyncMutex<Option<mpsc::Receiver<WgDatagram>>>,
+    /// 组件内自持托管 scope（B6，bd t975）：`spawn` 主任务经此托管——
+    /// 生命周期记账 + driver 释放兜底 abort；不接 close，闸关不可达。
+    fx: Arc<FxScope>,
 }
 
 impl WgDriver {
@@ -312,6 +316,7 @@ impl WgDriver {
             num_workers: 0,
             queue_tx: tx,
             queue_rx: AsyncMutex::new(Some(rx)),
+            fx: Arc::new(FxScope::new()),
         }
     }
 
@@ -491,18 +496,21 @@ impl WgDriver {
         0 // fallback
     }
 
-    /// 启动 driver。返回 JoinHandle——调用方可丢弃以停止。
+    /// 启动 driver。返回托管句柄（[`Spawned`]）——调用方可丢弃（detach，
+    /// drop 不 abort）或 [`Spawned::abort`]（与原 JoinHandle 语义一致）。
     ///
     /// 内部由 [`WgDriver::main_loop`] 编排：读 task + N 个 worker task + 定时器循环。
-    pub async fn spawn(self: Arc<Self>) -> Result<tokio::task::JoinHandle<()>> {
+    /// B6（bd t975）：主任务归 driver 自持 [`FxScope`] 托管（生命周期记账 +
+    /// driver 释放兜底 abort）；scope 不接 close，`Err` 仅防编程错误。
+    pub async fn spawn(self: Arc<Self>) -> Result<Spawned<()>> {
         let driver = Arc::clone(&self);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-        )]
-        let handle = tokio::spawn(async move {
+        let main_task = async move {
             driver.main_loop().await;
-        });
+        };
+        let handle = self
+            .fx
+            .spawn(main_task)
+            .map_err(|e| WgError::Driver(format!("wg driver scope closed: {e}")))?;
         Ok(handle)
     }
 
@@ -543,7 +551,7 @@ impl WgDriver {
                 let mut shut = shut_rx.clone();
                 #[allow(
                     clippy::disallowed_methods,
-                    reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+                    reason = "热路径豁免（B6 t975）：每包泵——Direct 传输 recv_from 读循环，热路径零改动（坑约束 12）；托管接线归 P1 插件装配"
                 )]
                 tokio::spawn(async move {
                     direct_read_loop(sock, tx, &mut shut).await;
@@ -559,7 +567,7 @@ impl WgDriver {
             let shut = shut_rx.clone();
             #[allow(
                 clippy::disallowed_methods,
-                reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+                reason = "热路径豁免（B6 t975）：每包泵——readQueue worker 消费循环 ×N（Go Open 返回 N 个 receive func 同构），热路径零改动（坑约束 12）；托管接线归 P1 插件装配"
             )]
             tokio::spawn(async move {
                 driver.worker_loop(rx, shut).await;

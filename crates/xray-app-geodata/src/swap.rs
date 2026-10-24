@@ -1,288 +1,86 @@
-//! 文件原子交换：stage → swap → tx(rollback/commit) → clean。
+//! 文件原子交换：geodata 侧薄委托到 [`xray_frame::reload`]（B6 / bd vmaz 收敛）。
 //!
-//! 对应 Go `app/geodata/download.go` 的 stage/swap/tx/clean 类型与函数。
-//! 业务核心可独立测试（在临时目录中跑完整流程）。
+//! 语义唯一实现 = `xray_frame::reload`（Stage/ReloadTx/swap_one/swap_all/clean，
+//! 对齐 Go `app/geodata/download.go` 的 stage/swap/tx/clean）。本模块只保留
+//! geodata 的对外形状——无 log 参数的调用式（`swap_all(&stages)` 等，供
+//! downloader/loader/测试原样使用）——加 [`GeodataError`] 归类映射。
+//!
+//! 日志面：swap/回滚路径留痕走 [`LogFacade`]（target = `xray_frame::geodata`，
+//! 坑约束 10）。错误面：frame 的 [`ReloadError`] 逐变体映射回 geodata 同名变体；
+//! 无同名者（Multiple/RollbackFailed/Apply*/WriteFailed）落 `Other` 并保留
+//! Display 全文——回滚失败计数不丢。
 
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::LazyLock,
 };
 
-use crate::error::{GeodataError, at_error, at_warning};
+pub use xray_frame::reload::{ReloadTx as Tx, Stage, Swap};
+use xray_frame::{
+    LogFacade,
+    reload::{self, ReloadError},
+};
 
-/// Stage：一次下载暂存（target 是最终路径，temp 是临时文件路径）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Stage {
-    pub target: PathBuf,
-    pub temp: PathBuf,
+use crate::error::GeodataError;
+
+/// geodata 域日志门面（target = `xray_frame::geodata`；进程内单例）。
+///
+/// `pub(crate)`：`ReloadTx::rollback` 需要门面入参（日志不留白），downloader
+/// 的回滚编排复用同一门面，禁另造第二个同域门面。
+pub(crate) fn log() -> &'static LogFacade {
+    static LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("geodata", Vec::new()));
+    &LOG
 }
 
-/// Swap：一次原子替换的备份信息（用于回滚）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Swap {
-    pub target: PathBuf,
-    pub backup: PathBuf,
-    pub had_original: bool,
-}
-
-/// Transaction：累积多个 swap，提供 rollback / commit。
-pub struct Tx {
-    swaps: Vec<Swap>,
-}
-
-impl Tx {
-    pub fn new() -> Self {
-        Self { swaps: Vec::new() }
-    }
-
-    pub fn push(&mut self, swap: Swap) {
-        self.swaps.push(swap);
-    }
-
-    pub fn len(&self) -> usize {
-        self.swaps.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.swaps.is_empty()
-    }
-
-    /// 回滚：逆序恢复每个 swap。
-    pub fn rollback(self) -> Result<(), GeodataError> {
-        let mut errs: Vec<GeodataError> = Vec::new();
-        for swap in self.swaps.into_iter().rev() {
-            if let Err(e) = rollback_swap(&swap) {
-                errs.push(e);
-            }
-        }
-        combine_errs(errs)
-    }
-
-    /// 提交：删除所有 backup（保留新文件）。
-    pub fn commit(self) -> Result<(), GeodataError> {
-        let mut errs: Vec<GeodataError> = Vec::new();
-        for swap in self.swaps {
-            if let Err(e) = fs::remove_file(&swap.backup) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    errs.push(GeodataError::RemoveFailed {
-                        path: swap.backup.to_string_lossy().into_owned(),
-                        reason: e.to_string(),
-                    });
-                }
-            }
-        }
-        combine_errs(errs)
-    }
-}
-
-impl Default for Tx {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// 合并多个错误为单个（首个 + "and N more"）。
-fn combine_errs(errs: Vec<GeodataError>) -> Result<(), GeodataError> {
-    if errs.is_empty() {
-        Ok(())
-    } else if errs.len() == 1 {
-        Err(errs.into_iter().next().expect("len == 1 branch: non-empty"))
-    } else {
-        let first = errs.into_iter().next().expect("else branch: len > 1");
-        Err(GeodataError::Other(format!("{first}").into()))
+/// frame 错误归类 → geodata 同类变体（无同类者保 Display 全文落 `Other`）。
+pub(crate) fn map_err(e: ReloadError) -> GeodataError {
+    match e {
+        ReloadError::MkdirFailed { path, reason } => GeodataError::MkdirFailed { path, reason },
+        ReloadError::TempFileCreate { dir, reason } => {
+            GeodataError::TempFileCreate { target: dir, reason }
+        },
+        ReloadError::InvalidFilePath(path) => GeodataError::InvalidFilePath(path),
+        ReloadError::RenameFailed { from, to, reason } => {
+            GeodataError::RenameFailed { from, to, reason }
+        },
+        ReloadError::RemoveFailed { path, reason } => GeodataError::RemoveFailed { path, reason },
+        other => GeodataError::Other(Box::new(other)),
     }
 }
 
 /// 创建 target 目录下的临时文件，返回 (file, path)。
 ///
-/// 对应 Go `tempFile`：在 target 同目录建 `.basename.*suffix` 临时文件。
+/// 对应 Go `tempFile`：在 target 同目录建暂存文件（命名/建目录纪律的实现在
+/// `xray_frame::reload::temp_file`）。
 pub fn temp_file(target: &Path, suffix: &str) -> Result<(fs::File, PathBuf), GeodataError> {
-    let dir = target.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(dir).map_err(|e| GeodataError::MkdirFailed {
-        path: dir.to_string_lossy().into_owned(),
-        reason: e.to_string(),
-    })?;
-
-    let base = target
-        .file_name()
-        .ok_or_else(|| GeodataError::InvalidFilePath(target.to_string_lossy().into()))?
-        .to_string_lossy()
-        .into_owned();
-    let prefix = format!(".{base}.*{suffix}");
-
-    let (file, path) = tempfile_in(dir, &prefix)?;
-    Ok((file, path))
-}
-
-/// 在 dir 中创建名为 `{prefix}{random}` 的临时文件。
-fn tempfile_in(dir: &Path, prefix: &str) -> Result<(fs::File, PathBuf), GeodataError> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    // Windows 不允许 * / ? 等特殊字符，sanitize prefix
-    let safe_prefix: String = prefix
-        .chars()
-        .map(|c| match c {
-            '*' | '/' | '\\' | ':' | '"' | '<' | '>' | '|' | '?' => '_',
-            _ => c,
-        })
-        .collect();
-    let mut counter: u64 = 0;
-    for _ in 0..16 {
-        counter += 1;
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.subsec_nanos() as u64 + counter)
-            .unwrap_or(counter);
-        let pid = std::process::id();
-        let name = format!("{safe_prefix}{pid}{nanos}");
-        let path = dir.join(&name);
-        match fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path) {
-            Ok(f) => return Ok((f, path)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => {
-                return Err(GeodataError::TempFileCreate {
-                    target: dir.to_string_lossy().into_owned(),
-                    reason: e.to_string(),
-                });
-            },
-        }
-    }
-    Err(GeodataError::TempFileCreate {
-        target: dir.to_string_lossy().into_owned(),
-        reason: "16 collisions".into(),
-    })
+    reload::temp_file(target, suffix).map_err(map_err)
 }
 
 /// 创建一个备用路径名（同目录），不创建文件。
 ///
-/// 对应 Go `backupFile`：建临时文件 → 关闭 → 删除，留路径名。
+/// 对应 Go `backupFile`：建暂存文件 → 关闭 → 删除，留路径名。
 pub fn backup_file(target: &Path) -> Result<PathBuf, GeodataError> {
-    let (file, path) = temp_file(target, ".bak")?;
-    drop(file);
-    fs::remove_file(&path).map_err(|e| GeodataError::RemoveFailed {
-        path: path.to_string_lossy().into_owned(),
-        reason: e.to_string(),
-    })?;
-    Ok(path)
+    reload::backup_file(target).map_err(map_err)
 }
 
 /// 把单个 stage 的 temp 替换 target，返回 Swap（含 backup 信息）。
 ///
-/// 流程：
-/// 1. backup_file(target) → backup path
-/// 2. rename(target, backup)：成功 → had_original=true；NotFound → 继续；其他 → Err
-/// 3. rename(temp, target)：失败 → 若 had_original，restore backup；返回 Err
+/// 流程（实现见 `xray_frame::reload::swap_one`）：backup 占名 →
+/// rename(target, backup)（NotFound = 首次创建）→ rename(temp, target)；
+/// 后者失败且 had_original 时先恢复 backup，恢复失败 `error!` 留痕。
 pub fn swap_one(stage: &Stage) -> Result<Swap, GeodataError> {
-    let backup = backup_file(&stage.target)?;
-
-    let mut swap =
-        Swap { target: stage.target.clone(), backup: backup.clone(), had_original: false };
-
-    match fs::rename(&stage.target, &backup) {
-        Ok(()) => swap.had_original = true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // target 原本不存在，删除 backup 空文件名占位
-            let _ = fs::remove_file(&backup);
-        },
-        Err(e) => {
-            return Err(GeodataError::RenameFailed {
-                from: stage.target.to_string_lossy().into_owned(),
-                to: backup.to_string_lossy().into_owned(),
-                reason: e.to_string(),
-            });
-        },
-    }
-
-    if let Err(e) = fs::rename(&stage.temp, &stage.target) {
-        if swap.had_original {
-            if let Err(restore_err) = fs::rename(&backup, &stage.target) {
-                at_error(&GeodataError::RenameFailed {
-                    from: backup.to_string_lossy().into_owned(),
-                    to: stage.target.to_string_lossy().into_owned(),
-                    reason: restore_err.to_string(),
-                });
-                return Err(GeodataError::RenameFailed {
-                    from: stage.temp.to_string_lossy().into_owned(),
-                    to: stage.target.to_string_lossy().into_owned(),
-                    reason: format!("{}: {e}", restore_err),
-                });
-            }
-        }
-        return Err(GeodataError::RenameFailed {
-            from: stage.temp.to_string_lossy().into_owned(),
-            to: stage.target.to_string_lossy().into_owned(),
-            reason: e.to_string(),
-        });
-    }
-
-    Ok(swap)
+    reload::swap_one(stage, log()).map_err(map_err)
 }
 
-/// 顺序交换所有 stage，任一失败则 rollback 已成功的 swap。
+/// 顺序交换所有 stage，任一失败则回滚已成功者并返回该错误。
 pub fn swap_all(stages: &[Stage]) -> Result<Tx, GeodataError> {
-    let mut tx = Tx::new();
-    for stage in stages {
-        match swap_one(stage) {
-            Ok(s) => tx.push(s),
-            Err(e) => {
-                if !tx.is_empty() {
-                    if let Err(rb_err) = tx.rollback() {
-                        at_warning(&rb_err);
-                    }
-                }
-                return Err(e);
-            },
-        }
-    }
-    Ok(tx)
+    reload::swap_all(stages, log()).map_err(map_err)
 }
 
-/// 回滚单个 swap：删除 target + 恢复 backup（若有）。
-fn rollback_swap(swap: &Swap) -> Result<(), GeodataError> {
-    let mut errs: Vec<GeodataError> = Vec::new();
-
-    if let Err(e) = fs::remove_file(&swap.target) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            errs.push(GeodataError::RemoveFailed {
-                path: swap.target.to_string_lossy().into_owned(),
-                reason: e.to_string(),
-            });
-        }
-    }
-
-    if swap.had_original {
-        if let Err(e) = fs::rename(&swap.backup, &swap.target) {
-            errs.push(GeodataError::RenameFailed {
-                from: swap.backup.to_string_lossy().into_owned(),
-                to: swap.target.to_string_lossy().into_owned(),
-                reason: e.to_string(),
-            });
-        }
-    } else if let Err(e) = fs::remove_file(&swap.backup) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            errs.push(GeodataError::RemoveFailed {
-                path: swap.backup.to_string_lossy().into_owned(),
-                reason: e.to_string(),
-            });
-        }
-    }
-
-    combine_errs(errs)
-}
-
-/// 清理所有 stage 的 temp 文件（容忍 NotFound）。
+/// 清理所有 stage 的 temp 文件（容忍 NotFound；其余失败 warn 留痕）。
 pub fn clean(stages: &[Stage]) {
-    for stage in stages {
-        if !stage.temp.as_os_str().is_empty() {
-            if let Err(e) = fs::remove_file(&stage.temp) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    at_warning(&GeodataError::RemoveFailed {
-                        path: stage.temp.to_string_lossy().into_owned(),
-                        reason: e.to_string(),
-                    });
-                }
-            }
-        }
-    }
+    reload::clean(stages, log());
 }
 
 #[cfg(test)]
@@ -384,9 +182,6 @@ mod tests {
         let mut tx = Tx::new();
         tx.push(swap_one(&stage).unwrap());
 
-        // backup 应存在（rename 留下的）
-        assert!(tx.swaps.first().unwrap().backup.exists() || true); // had_original
-
         tx.commit().unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "new");
 
@@ -408,7 +203,7 @@ mod tests {
         // 现在 target = "new"
         assert_eq!(fs::read_to_string(&target).unwrap(), "new");
 
-        tx.rollback().unwrap();
+        tx.rollback(log()).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "original");
 
         let _ = fs::remove_dir_all(&dir);
@@ -426,7 +221,7 @@ mod tests {
         tx.push(swap_one(&stage).unwrap());
         assert!(target.exists());
 
-        tx.rollback().unwrap();
+        tx.rollback(log()).unwrap();
         assert!(!target.exists());
 
         let _ = fs::remove_dir_all(&dir);
@@ -476,25 +271,6 @@ mod tests {
     }
 
     #[test]
-    fn combine_errs_empty_is_ok() {
-        assert!(combine_errs(vec![]).is_ok());
-    }
-
-    #[test]
-    fn combine_errs_single_returns_first() {
-        let v = vec![GeodataError::IdleTimeout];
-        let err = combine_errs(v).unwrap_err();
-        assert!(matches!(err, GeodataError::IdleTimeout));
-    }
-
-    #[test]
-    fn combine_errs_multiple_returns_other() {
-        let v = vec![GeodataError::IdleTimeout, GeodataError::TooManyRedirects];
-        let err = combine_errs(v).unwrap_err();
-        assert!(matches!(err, GeodataError::Other(_)));
-    }
-
-    #[test]
     fn tx_default_is_empty() {
         let tx = Tx::default();
         assert!(tx.is_empty());
@@ -517,5 +293,88 @@ mod tests {
         let s1 = Stage { target: PathBuf::from("/a"), temp: PathBuf::from("/a.tmp") };
         let s2 = s1.clone();
         assert_eq!(s1, s2);
+    }
+
+    // ── B6（bd vmaz）语义差约束：收敛到 xray_frame::reload 后必须全部满足 ──
+
+    /// 语义差 D1（回滚错误聚合）：多处回滚同时失败时，报错必须保留**失败计数**
+    /// 与首个失败的 target。原型 `combine_errs` 只留首个、丢总数。
+    #[test]
+    fn rollback_multiple_failures_keeps_total_count() {
+        let dir = unique_dir("rollback_multi_err");
+        let mut tx = Tx::new();
+        // target 均不存在（remove 容忍 NotFound）+ backup 均缺失 → restore rename 必败
+        for name in ["a.dat", "b.dat"] {
+            tx.push(Swap {
+                target: dir.join(name),
+                backup: dir.join(format!("ghost-{name}.bak")),
+                had_original: true,
+            });
+        }
+        let err = tx.rollback(log()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("2 errors"), "回滚聚合保留失败计数: {msg}");
+        assert!(msg.contains("b.dat"), "回滚逆序 → 首个失败是最后一个 swap: {msg}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 语义差 D2（回滚路径错误面）：单处回滚失败归类的错误里必须带 target 路径
+    /// （日志留痕由 xray-frame tests/reload_rollback.rs 例④统一覆盖）。
+    #[test]
+    fn rollback_failure_error_carries_target_path() {
+        let dir = unique_dir("rollback_err_path");
+        let target = dir.join("a.dat");
+        write_file(&target, "current");
+        let mut tx = Tx::new();
+        tx.push(Swap { target: target.clone(), backup: dir.join("ghost.bak"), had_original: true });
+        let err = tx.rollback(log()).unwrap_err();
+        assert!(err.to_string().contains("a.dat"), "回滚错误含 target 路径: {err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 语义约束：swap_all 第 2 个 stage 失败 → 第 1 个已交换者恢复原内容，
+    /// 失败 stage 的 target 不被触碰，失败归类 RenameFailed。
+    #[test]
+    fn swap_all_partial_failure_rolls_back_earlier_stage() {
+        let dir = unique_dir("swap_all_partial");
+        let t1 = dir.join("one.dat");
+        let t2 = dir.join("two.dat");
+        write_file(&t1, "old1");
+        write_file(&t2, "old2");
+        let temp1 = dir.join("one.new");
+        write_file(&temp1, "new1");
+        let stages = [
+            Stage { target: t1.clone(), temp: temp1 },
+            Stage { target: t2.clone(), temp: dir.join("two.missing") },
+        ];
+
+        let err = match swap_all(&stages) {
+            Ok(_) => panic!("第 2 个 stage temp 缺失 → 整体 Err"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, GeodataError::RenameFailed { .. }), "归类 RenameFailed: {err:?}");
+        assert_eq!(fs::read_to_string(&t1).unwrap(), "old1", "已交换者回滚恢复原内容");
+        assert_eq!(fs::read_to_string(&t2).unwrap(), "old2", "失败 stage 的 target 未被触碰");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 错误映射约束：frame 侧归类必须落到 geodata 的同名变体（API 面稳定）。
+    #[test]
+    fn frame_error_variants_map_to_geodata_variants() {
+        let dir = unique_dir("map_err");
+        // 根路径无文件名成分（Windows/Linux 均 file_name()==None）
+        let err = temp_file(Path::new("/"), ".tmp").unwrap_err();
+        assert!(
+            matches!(err, GeodataError::InvalidFilePath(_)),
+            "无文件名成分 → InvalidFilePath: {err:?}"
+        );
+
+        let err =
+            swap_one(&Stage { target: dir.join("x.dat"), temp: dir.join("gone.tmp") }).unwrap_err();
+        assert!(
+            matches!(err, GeodataError::RenameFailed { .. }),
+            "temp 缺失 → RenameFailed: {err:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

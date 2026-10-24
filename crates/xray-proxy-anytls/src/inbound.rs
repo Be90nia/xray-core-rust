@@ -22,7 +22,8 @@ use std::{
 };
 
 use async_trait::async_trait;
-use tokio::{sync::Mutex, task::JoinHandle};
+use skeleton_infra::fx::{FxScope, Spawned};
+use tokio::sync::Mutex;
 use tracing::info;
 use xray_app_dispatcher::DispatchHandler;
 use xray_features::inbound::{InboundError, InboundHandler};
@@ -45,13 +46,16 @@ pub struct AnytlsInboundHandler {
     local_port: AtomicU16,
     /// server 句柄 + accept 任务，close 时 stop。
     slot: Mutex<Option<InboundSlot>>,
+    /// 组件内自持托管 scope（B6，app 家族同款；不接 close，闸关不可达）。
+    /// keep-alive 任务经此托管（坑约束 5）；close abort，scope 随 handler drop 兜底。
+    fx: Arc<FxScope>,
 }
 
 struct InboundSlot {
     /// MockServer 句柄（保持存活；stop 时消费）。
     server: AnytlsMockServer,
     /// accept 循环任务句柄（close 时 abort 兜底）。
-    _accept_task: JoinHandle<()>,
+    _accept_task: Spawned<()>,
 }
 
 impl AnytlsInboundHandler {
@@ -69,6 +73,7 @@ impl AnytlsInboundHandler {
             password: None,
             local_port: AtomicU16::new(0),
             slot: Mutex::new(None),
+            fx: Arc::new(FxScope::new()),
         }
     }
 
@@ -119,17 +124,16 @@ impl InboundHandler for AnytlsInboundHandler {
         let tag = self.tag.clone();
 
         // spawn 一个 keep-alive 任务，持有 server 句柄直到 close 被调用
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-        )]
-        let accept_task = tokio::spawn(async move {
-            // 该任务仅保持存活，实际 serve 逻辑在 MockServer 内部
-            // close 时通过 stop_tx 触发退出
-            info!(tag = %tag, addr = %local_addr, "anytls inbound listener started");
-            // 永远等待，直到 task 被 abort
-            std::future::pending::<()>().await;
-        });
+        let accept_task = self
+            .fx
+            .spawn(async move {
+                // 该任务仅保持存活，实际 serve 逻辑在 MockServer 内部
+                // close 时通过 stop_tx 触发退出
+                info!(tag = %tag, addr = %local_addr, "anytls inbound listener started");
+                // 永远等待，直到 task 被 abort
+                std::future::pending::<()>().await;
+            })
+            .expect("internal FxScope is never closed");
 
         *slot = Some(InboundSlot { server, _accept_task: accept_task });
         Ok(())

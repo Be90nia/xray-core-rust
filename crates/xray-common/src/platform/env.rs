@@ -202,21 +202,31 @@ pub fn tun_fd_raw() -> Option<String> {
 
 /// 启动期扫描「Rust 无消费点」的 Go env：被设置即 warn 指名，不静默丢。
 ///
-/// 覆盖（Go common/platform/platform.go:25,29；Rust 侧功能未接线）：
+/// 覆盖（Go common/platform/platform.go:25,29）：
 /// - `xray.browser.dialer`：browser dialer 传输未装配（xray-transport 的 `browser-dialer`
 ///   模块存在但无生产启动路径）。
-/// - `xray.tun.fd`：tun 走 tun-rs，android/ios fd 注入为 stub。
+/// - `xray.tun.fd`：仅 Linux 有 fd 继承消费点（xray-proxy-tun `tun_fd`）；Linux 上设置
+///   不告警（值非法由 tun 侧建设备时报错），其余平台无该能力，设置即指名告警 （tun 侧 `create`
+///   会硬错，这里提前给运维线索）。
 ///
 /// 生产接线：bin 启动早期与 [`reload_env_settings`] 同点调用一次。
 pub fn warn_unsupported_env_flags() {
-    for (name, why) in [
-        ("xray.browser.dialer", "the browser dialer transport is not wired in this build"),
-        ("xray.tun.fd", "tun fd passthrough is not implemented in this build"),
-    ] {
-        let alt = name.to_uppercase().replace('.', "_");
-        if env_first_set(&[name, alt.as_str()]).is_some() {
-            tracing::warn!("environment variable {name} is set but {why}; ignoring");
-        }
+    // `xray.browser.dialer`：无消费点，被设置即指名。
+    if env_first_set(&["xray.browser.dialer", "XRAY_BROWSER_DIALER"]).is_some() {
+        tracing::warn!(
+            "environment variable xray.browser.dialer is set but the browser dialer \
+             transport is not wired in this build; ignoring"
+        );
+    }
+
+    // `xray.tun.fd` 不进上表：Linux 有消费点（值非法由 tun 侧建设备时报错），告警条件按平台分流。
+    #[cfg(not(target_os = "linux"))]
+    if env_first_set(&["xray.tun.fd", "XRAY_TUN_FD"]).is_some() {
+        tracing::warn!(
+            "environment variable xray.tun.fd is set but TUN fd inheritance is not \
+             supported on {} in this build; ignoring",
+            std::env::consts::OS
+        );
     }
 }
 

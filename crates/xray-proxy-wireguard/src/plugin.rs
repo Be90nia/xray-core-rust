@@ -67,7 +67,8 @@ static WG_CONTRACT: PluginContract =
 static WG_LIFECYCLE: WireguardLifecycle = WireguardLifecycle;
 
 /// build 产物：设备配置（同规 xray-core `parse_wireguard_config`）+ 入站 UDP
-/// 监听端口（段级 `port`，缺省 51820）。
+/// 监听端口（settings 级 `port`，缺省 51820；同规 xray-core
+/// `parse_wireguard_inbound_config`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireguardBuiltConfig {
     /// WG 设备（服务端形态，`is_client = false`）。
@@ -79,7 +80,7 @@ pub struct WireguardBuiltConfig {
 /// WireGuard 协议插件（L1 必选方法集全量）。
 ///
 /// `build(ctx)` 从 per-plugin 段（`inbounds[]/outbounds[]` 内
-/// `protocol == "wireguard"` 的元素）解析 `settings` + 段级 `port` →
+/// `protocol == "wireguard"` 的元素）解析 `settings`（含 settings 级 `port`）→
 /// [`WireguardBuiltConfig`] 并持有；入站 handler 经
 /// [`inbound_handler`](WireguardPlugin::inbound_handler) 由插件产出（tag 与
 /// dispatcher handler 属实例注册期信息，不在 build 期定）。
@@ -165,16 +166,16 @@ impl Lifecycle for WireguardLifecycle {
 /// per-plugin 段 → [`WireguardBuiltConfig`]。
 ///
 /// 同规 xray-core `outbound.rs::parse_wireguard_config`（权威生产解析）+
-/// `inbound.rs::parse_wireguard_inbound_config`（段级 `port`：缺省 51820，
-/// u16 溢出显式拒绝禁饱和）。与 xray-core 解析面的收敛属 P3 入口收口，此处
-/// 不回头改 core。
+/// `inbound.rs::parse_wireguard_inbound_config`（settings 级 `port`：缺省
+/// 51820，u16 溢出显式拒绝禁饱和）。与 xray-core 解析面的收敛属 P3 入口收口，
+/// 此处不回头改 core。
 fn parse_wireguard_section(
     section: &serde_json::Value,
 ) -> Result<WireguardBuiltConfig, PluginError> {
     let settings = section.get("settings").unwrap_or(section);
     let device = parse_device_settings(settings)
         .map_err(|e| PluginError::Other(format!("wireguard: {e}").into()))?;
-    let port = section.get("port").and_then(|x| x.as_u64()).unwrap_or(51820);
+    let port = settings.get("port").and_then(|x| x.as_u64()).unwrap_or(51820);
     let listen_port = u16::try_from(port)
         .map_err(|_| PluginError::Other("wireguard: inbound port out of u16 range".into()))?;
     Ok(WireguardBuiltConfig { device, listen_port })
@@ -374,9 +375,9 @@ mod tests {
                     "email": "u1@example.com",
                     "level": 2
                 }],
-                "reserved": [2, 5, 1]
-            },
-            "port": 18443
+                "reserved": [2, 5, 1],
+                "port": 18443
+            }
         }))
         .expect("full section");
         let peer = &cfg.device.peers[0];
@@ -385,7 +386,7 @@ mod tests {
         assert_eq!(peer.pre_shared_key, "33".repeat(32));
         assert_eq!((peer.level, peer.email.as_str()), (2, "u1@example.com"));
         assert_eq!(cfg.device.reserved, vec![2, 5, 1]);
-        assert_eq!(cfg.listen_port, 18443, "段级 port 显式");
+        assert_eq!(cfg.listen_port, 18443, "settings 级 port 显式");
     }
 
     #[test]
@@ -401,7 +402,7 @@ mod tests {
         assert!(err.to_string().contains("reserved"), "{err}");
 
         let err = parse_wireguard_section(&json!({
-            "settings": { "secretKey": hex_key(0x11) }, "port": 70000
+            "settings": { "secretKey": hex_key(0x11), "port": 70000 }
         }))
         .expect_err("port u16 溢出");
         assert!(err.to_string().contains("u16"), "{err}");

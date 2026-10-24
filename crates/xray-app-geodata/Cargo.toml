@@ -13,6 +13,10 @@ xray-geodata = { path = "../xray-geodata" }
 # P1-2 互喂试点：启动期 geodata 加载走 udf PooledThreadPool（默认 feature 已含
 # pool→memgov，PooledThreadPool 为根导出；零新增第三方依赖）。
 udf-skeleton-infra = { path = "../udf-frame/skeleton-infra" }
+# B6（bd vmaz）：swap/回滚语义收敛到装配层唯一实现 xray_frame::reload（禁本地
+# 第二份 stage/swap/tx 实现）。依赖方向 = 血肉→骨架（xray-frame 零 xray-app
+# 依赖，无环）；日志走其 LogFacade（坑约束 10）。
+xray-frame = { path = "../xray-frame" }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }

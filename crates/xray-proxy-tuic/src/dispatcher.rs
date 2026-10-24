@@ -211,7 +211,7 @@ impl TuicConnection {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
         #[allow(
             clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+            reason = "热路径豁免（B6 t975）：每帧泵——QUIC bi stream ↔ duplex 双向搬运，数据面热路径零改动（坑约束 12）；托管接线归 P1 插件装配"
         )]
         let pump = tokio::spawn(pump_streams(conn.send, conn.recv, server_io));
         Self { inner: client_io, _pump: pump }

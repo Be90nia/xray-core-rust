@@ -23,6 +23,7 @@ use std::{
 };
 
 use bytes::{BufMut, BytesMut};
+use skeleton_infra::fx::{FxScope, Spawned};
 use uuid::Uuid;
 
 use crate::{
@@ -151,6 +152,9 @@ pub struct TuicClient {
     password: String,
     /// quic 模式 UDP 响应路由（per-connection uni-stream pump）。
     router: UniRespRouter,
+    /// 组件内自持托管 scope（B6，bd t975）：心跳等后台任务经此 spawn——
+    /// 生命周期记账 + client 释放兜底 abort；不接 close，闸关不可达。
+    fx: Arc<FxScope>,
 }
 
 /// TUIC TCP relay 流（双向，分两半）。
@@ -268,7 +272,15 @@ impl TuicClient {
         // 按 (assoc_id, pkt_id) 配对给等待中的请求（TUIC v5 SPEC uni-stream 模型）
         let router = UniRespRouter::spawn(multiplexed.pooled.conn.clone());
 
-        Ok(Self { multiplexed, pool, key, uuid, password: password.to_string(), router })
+        Ok(Self {
+            multiplexed,
+            pool,
+            key,
+            uuid,
+            password: password.to_string(),
+            router,
+            fx: Arc::new(FxScope::new()),
+        })
     }
 
     /// 内部：新建 QUIC 连接（无池复用路径）。
@@ -351,25 +363,22 @@ impl TuicClient {
     ///
     /// 任务每 `period` 发送一次 Heartbeat（uni stream），连接关闭后自动退出。
     /// 官方 tuic client 默认 3s（`heartbeat` 配置项），此处由调用方传入。
-    /// 返回 JoinHandle 供需要取消时 abort。
-    pub fn start_heartbeat(
-        self: &Arc<Self>,
-        period: std::time::Duration,
-    ) -> tokio::task::JoinHandle<()> {
+    /// 返回 [`Spawned`] 句柄供需要取消时 abort（B6，bd t975：任务归 client
+    /// 自持 [`FxScope`] 托管——生命周期记账 + client 释放兜底 abort；drop
+    /// 句柄不 abort，与原 JoinHandle 语义一致）。
+    pub fn start_heartbeat(self: &Arc<Self>, period: std::time::Duration) -> Spawned<()> {
         let client = Arc::clone(self);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-        )]
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(period).await;
-                if let Err(e) = client.heartbeat().await {
-                    tracing::debug!("tuic heartbeat stopped: {e}");
-                    break;
+        self.fx
+            .spawn(async move {
+                loop {
+                    tokio::time::sleep(period).await;
+                    if let Err(e) = client.heartbeat().await {
+                        tracing::debug!("tuic heartbeat stopped: {e}");
+                        break;
+                    }
                 }
-            }
-        })
+            })
+            .expect("internal FxScope is never closed")
     }
 
     /// 关闭底层 QUIC 连接。

@@ -171,7 +171,10 @@ fn combine_errs(errs: Vec<ReloadError>) -> Result<(), ReloadError> {
 
 /// 在 target 同目录创建 `.{name}.{pid}{nanos}{counter}{suffix}` 暂存文件，
 /// 返回 (file, path)。对齐原型 swap.rs:95 temp_file（16 次撞名重试）。
-fn temp_file(target: &Path, suffix: &str) -> Result<(fs::File, PathBuf), ReloadError> {
+///
+/// 公开：下载面（如 geodata 的 asset 下载）在 swap 之前需要自己先把内容落到
+/// 暂存件——暂存件命名/建目录纪律的唯一实现在此，消费方不得另造一份。
+pub fn temp_file(target: &Path, suffix: &str) -> Result<(fs::File, PathBuf), ReloadError> {
     let dir = target.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(dir).map_err(|e| ReloadError::MkdirFailed {
         path: dir.display().to_string(),
@@ -207,7 +210,7 @@ fn temp_file(target: &Path, suffix: &str) -> Result<(fs::File, PathBuf), ReloadE
 }
 
 /// 取一个 backup 路径名（同目录），不保留文件。对齐原型 swap.rs:154 backup_file。
-fn backup_file(target: &Path) -> Result<PathBuf, ReloadError> {
+pub fn backup_file(target: &Path) -> Result<PathBuf, ReloadError> {
     let (file, path) = temp_file(target, ".bak")?;
     drop(file);
     fs::remove_file(&path).map_err(|e| ReloadError::RemoveFailed {

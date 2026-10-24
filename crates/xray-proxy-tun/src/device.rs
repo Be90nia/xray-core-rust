@@ -6,6 +6,8 @@
 //! 平台支持：
 //! - **Linux/macOS/FreeBSD**：`build_async()` 真机创建设备（需 root/CAP_NET_ADMIN）
 //! - **Windows**：动态加载 `wintun.dll`，未安装则 `build_async()` 返 `DeviceCreateFailed`
+//! - **fd 继承**：env `xray.tun.fd`/`XRAY_TUN_FD` 给了已开 TUN fd 时走 [`crate::tun_fd`]。
+//! - fd 继承仅 Linux 支持；其他平台设置该 env 即显式报错，不回退直开。
 
 use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
 #[cfg(target_os = "linux")]
@@ -82,6 +84,9 @@ impl TunDevice {
     /// - `name`：设备名（Linux 自由命名；macOS 用 `utun` 前缀；Windows 由 wintun 决定）
     /// - `ipv4_addr`/`ipv4_prefix`：IPv4 地址与掩码长度（如 `("10.0.0.1", 24)`）
     /// - `mtu`：MTU，常见 1500
+    ///
+    /// env 给了已打开 TUN fd（`xray.tun.fd`）时接管该 fd，地址/MTU 参数不生效；
+    /// 非 Linux 平台直接报错。
     pub fn create(
         name: impl Into<String>,
         ipv4_addr: &str,
@@ -89,6 +94,15 @@ impl TunDevice {
         mtu: u16,
     ) -> Result<Self> {
         let name_str = name.into();
+        // Go NewTun 首行（tun_linux.go:202 → openFromEnv）：env 给了既开 TUN fd 即
+        // 走继承路径，校验失败/Owner 语义全按 Go——绝不回退直开设备。
+        #[cfg(target_os = "linux")]
+        if let Some(dev) = Self::from_inherited_env(&name_str, mtu)? {
+            return Ok(dev);
+        }
+        #[cfg(not(target_os = "linux"))]
+        crate::tun_fd::refuse_unsupported()?;
+
         let dev = DeviceBuilder::new()
             .name(&name_str)
             .layer(Layer::L3)
@@ -123,6 +137,34 @@ impl TunDevice {
             #[cfg(target_os = "linux")]
             send_free: parking_lot::Mutex::new(hdr_free_list::HdrFreeList::new(VIRTIO_NET_HDR_LEN)),
         })
+    }
+
+    /// 接管 env 交来的已打开 TUN fd（Go `tun_linux.go:246-289` `openFromEnv`）。
+    ///
+    /// 与直开路径的差别（等价 Go `ownsTun=false`）：不建接口、不设地址/MTU、不动
+    /// 链路状态——设备面全归宿主进程，Xray 只读写这颗 fd。env 未设置返回 `None`
+    /// （调用方照常直开）；env 设置但校验失败即错误返回，不回退直开。
+    #[cfg(target_os = "linux")]
+    fn from_inherited_env(expected_name: &str, mtu: u16) -> Result<Option<Self>> {
+        let Some(inherited) = crate::tun_fd::inherit_from_env(expected_name)? else {
+            return Ok(None);
+        };
+        // SAFETY: fd 已由 tun_fd::inherit_from_env 校验为 IFF_TUN|IFF_NO_PI 的 TUN
+        // 设备并置非阻塞；所有权自此移交 AsyncDevice（Drop 关闭，宿主不再持有）。
+        // vnet_hdr 面：tun-rs `from_fd` 硬编码 vnet_hdr=false，带 IFF_VNET_HDR 的
+        // fd 已在 tun_fd 里显式拒绝（见该模块文档的窄化说明）。
+        let dev = unsafe { tun_rs::AsyncDevice::from_fd(inherited.fd) }.map_err(|e| {
+            TunError::DeviceCreateFailed(format!(
+                "xray.tun.fd: adopt fd {} failed: {e}",
+                inherited.fd
+            ))
+        })?;
+        Ok(Some(Self {
+            dev,
+            name: inherited.name,
+            mtu,
+            send_free: parking_lot::Mutex::new(hdr_free_list::HdrFreeList::new(VIRTIO_NET_HDR_LEN)),
+        }))
     }
 
     /// 异步读 IP 包到 buf。返回读取字节数。

@@ -644,7 +644,7 @@ where
     let relay = make(relay_from_client, relay_to_client);
     #[allow(
         clippy::disallowed_methods,
-        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        reason = "热路径豁免（B6 t975）：数据面泵——duplex ↔ TCP/UDP 中继字节搬运，热路径零改动（坑约束 12）；托管接线归 P1 插件装配"
     )]
     tokio::spawn(async move {
         relay.run().await;

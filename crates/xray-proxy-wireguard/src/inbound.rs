@@ -26,11 +26,11 @@ use std::{
 
 use async_trait::async_trait;
 use parking_lot::Mutex as ParkMutex;
+use skeleton_infra::fx::{FxScope, Spawned};
 use smoltcp::{iface::SocketHandle, wire::IpEndpoint};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::{Mutex as AsyncMutex, mpsc},
-    task::JoinHandle,
     time::interval,
 };
 use xray_app_dispatcher::{AccessContext, DispatchHandler, UdpDispatchSession};
@@ -80,8 +80,12 @@ pub struct WireguardInboundHandler {
     started: AtomicBool,
     /// driver 句柄槽——start() 后消费；与 registry 共享（动态热插）。
     driver: DriverSlot,
-    /// join handle——close() 用以终止 task。
-    join: ParkMutex<Option<JoinHandle<()>>>,
+    /// join handle——close() 用以终止 task。任务归组件自持 [`FxScope`] 托管
+    /// （B6，bd t975；scope 不接 close，闸关不可达，组件释放兜底 abort）。
+    join: ParkMutex<Option<Spawned<()>>>,
+    /// 组件内自持托管 scope（B6，app 家族同款）：start 主任务与 accept 循环内
+    /// 的 sweep/dispatch 托管面任务统一经此 spawn。
+    fx: Arc<FxScope>,
     /// smoltcp 网栈句柄（与 driver 共享）。
     netstack: Arc<AsyncMutex<WgNetStack>>,
     /// dispatcher handler（TCP accept 后桥接到 outbound）。
@@ -148,6 +152,7 @@ impl WireguardInboundHandler {
             driver: driver_slot,
             registry,
             join: ParkMutex::new(None),
+            fx: Arc::new(FxScope::new()),
             netstack,
             dispatch,
         })
@@ -181,17 +186,18 @@ impl WireguardInboundHandler {
         let registry = Arc::clone(&self.registry);
         let dispatch = Arc::clone(&self.dispatch);
 
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-        )]
-        let handle = tokio::spawn(async move {
+        // B6（bd t975）：主任务（driver + accept loop select!）经组件自持 scope
+        // 托管；close 显式 abort 语义不变，组件释放兜底 abort。
+        // 接收者（self.fx）与被 future 捕获的绑定（fx）分离，规避 E0505。
+        let fx = Arc::clone(&self.fx);
+        let main_task = async move {
             // driver loop 与 accept loop 在同一 task 内 select! 并发
             tokio::select! {
                 _ = driver.main_loop() => {}
-                _ = wg_accept_loop(netstack, registry, dispatch) => {}
+                _ = wg_accept_loop(netstack, registry, dispatch, fx) => {}
             }
-        });
+        };
+        let handle = self.fx.spawn(main_task).expect("internal FxScope is never closed");
         *self.join.lock() = Some(handle);
         tracing::info!(tag = %self.tag, port = self.port, "wireguard inbound started");
         Ok(())
@@ -264,6 +270,7 @@ async fn wg_accept_loop(
     netstack: Arc<AsyncMutex<WgNetStack>>,
     registry: Arc<WgUserRegistry>,
     dispatch: Arc<dyn DispatchHandler>,
+    fx: Arc<FxScope>,
 ) {
     let mut timer = interval(Duration::from_millis(ACCEPT_POLL_MS));
     tracing::debug!("wg accept loop started");
@@ -273,29 +280,29 @@ async fn wg_accept_loop(
     let udp_sessions: WgUdpSessions = Arc::new(ParkMutex::new(HashMap::new()));
     let sweep_netstack = Arc::clone(&netstack);
     let sweep_sessions = Arc::clone(&udp_sessions);
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-    )]
-    tokio::spawn(async move {
-        let mut tick = interval(Duration::from_secs(WG_UDP_SWEEP_SECS));
-        tick.tick().await; // 跳过首个立即 tick（启动时全为新）
-        loop {
-            tick.tick().await;
-            let now = nanos_now();
-            let idle = (WG_UDP_SESSION_IDLE_SECS as i64) * 1_000_000_000;
-            sweep_netstack.lock().await.sweep_udp(now, idle);
-            let mut map = sweep_sessions.lock();
-            let expired: Vec<IpEndpoint> = map
-                .iter()
-                .filter(|(_, s)| now.saturating_sub(s.last_used_nanos) > idle)
-                .map(|(k, _)| *k)
-                .collect();
-            for k in expired {
-                map.remove(&k);
+    // B6（bd t975）：sweep 定时任务经组件自持 scope 托管（与 accept loop 同生命周期）。
+    let fx_sweep = Arc::clone(&fx);
+    fx_sweep
+        .spawn(async move {
+            let mut tick = interval(Duration::from_secs(WG_UDP_SWEEP_SECS));
+            tick.tick().await; // 跳过首个立即 tick（启动时全为新）
+            loop {
+                tick.tick().await;
+                let now = nanos_now();
+                let idle = (WG_UDP_SESSION_IDLE_SECS as i64) * 1_000_000_000;
+                sweep_netstack.lock().await.sweep_udp(now, idle);
+                let mut map = sweep_sessions.lock();
+                let expired: Vec<IpEndpoint> = map
+                    .iter()
+                    .filter(|(_, s)| now.saturating_sub(s.last_used_nanos) > idle)
+                    .map(|(k, _)| *k)
+                    .collect();
+                for k in expired {
+                    map.remove(&k);
+                }
             }
-        }
-    });
+        })
+        .expect("internal FxScope is never closed");
 
     loop {
         timer.tick().await;
@@ -338,7 +345,7 @@ async fn wg_accept_loop(
             };
             #[allow(
                 clippy::disallowed_methods,
-                reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+                reason = "热路径豁免（B6 t975）：数据面泵——smoltcp socket ↔ duplex 字节搬运，热路径零改动（坑约束 12）；托管接线归 P1 插件装配"
             )]
             tokio::spawn(relay.run());
 
@@ -360,13 +367,13 @@ async fn wg_accept_loop(
                 ..Default::default()
             };
             let dispatch = Arc::clone(&dispatch);
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-            )]
-            tokio::spawn(async move {
-                dispatch.dispatch_with_access(&dest, link, access).await;
-            });
+            // B6（bd t975）：per-conn dispatch 任务经组件自持 scope 托管。
+            let fx_dispatch = Arc::clone(&fx);
+            fx_dispatch
+                .spawn(async move {
+                    dispatch.dispatch_with_access(&dest, link, access).await;
+                })
+                .expect("internal FxScope is never closed");
         }
 
         // 内层 UDP：drain 全部转发监听的待收数据报并路由到 per-源会话。
@@ -462,7 +469,7 @@ fn forward_wg_udp_datagram(
     let (cmd_tx, cmd_rx) = mpsc::channel(WG_UDP_QUEUE_CAP);
     #[allow(
         clippy::disallowed_methods,
-        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        reason = "热路径豁免（B6 t975）：UDP 快路——per-源会话任务（首包路径 spawn，Go udp forwarder 语义），热路径零改动（坑约束 12）；托管接线归 P1 插件装配"
     )]
     tokio::spawn(run_wg_udp_session(
         Arc::clone(dispatch),
@@ -950,7 +957,12 @@ mod tests {
             Arc::new(AsyncMutex::new(WgNetStack::new(&[local], 1420)));
         let (dispatch, calls) = make_dispatch();
         let registry = test_registry();
-        tokio::spawn(wg_accept_loop(Arc::clone(&netstack), registry, dispatch));
+        tokio::spawn(wg_accept_loop(
+            Arc::clone(&netstack),
+            registry,
+            dispatch,
+            Arc::new(skeleton_infra::fx::FxScope::new()),
+        ));
 
         // 隧道内 client 10.0.0.2:5555 → server 10.0.0.1:80 的 SYN
         {

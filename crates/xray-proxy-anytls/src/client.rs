@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio_rustls::TlsConnector;
 use xray_common::net::{address::Address, destination::Destination, port::Port};
+use xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT;
 use xray_transport::sockopt::SocketOptions;
 
 use crate::{error::Result, socks::SocksAddr};
@@ -91,6 +92,10 @@ pub struct ClientConfig {
     /// 拨号 sockopt（mark/dialerProxy/happyEyeballs/domainStrategy 等）。
     /// 经 `dial_system` 生效；对齐 anytls-go 可注入 `SystemDialer` 语义。
     pub sockopt: SocketOptions,
+    /// 握手/首包限时：覆盖 dial_out 全程（TCP + TLS + 认证帧）与 `dial()`
+    /// 建流（含 anytls-rs 对 `open_stream` 失败的内部 3 次重试循环）。
+    /// 缺省对齐 policy `Timeouts.Handshake`（Go SessionDefault 60s 同源）。
+    pub handshake_timeout: Duration,
 }
 
 impl ClientConfig {
@@ -111,6 +116,7 @@ impl ClientConfig {
             idle_timeout: Duration::from_secs(60),
             min_idle_sessions: 0,
             sockopt: SocketOptions::default(),
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         }
     }
 
@@ -120,11 +126,20 @@ impl ClientConfig {
         self.sockopt = sockopt;
         self
     }
+
+    /// 指定握手/首包限时（测试注入短超时；生产走 60s policy 缺省）。
+    #[must_use]
+    pub fn with_handshake_timeout(mut self, handshake_timeout: Duration) -> Self {
+        self.handshake_timeout = handshake_timeout;
+        self
+    }
 }
 
 /// AnyTLS 客户端，复用 TLS 会话池。
 pub struct AnytlsClient {
     inner: AnytlsClientInner,
+    /// 握手/首包限时（`ClientConfig::handshake_timeout`；`dial()` 建流兜底用）。
+    handshake_timeout: Duration,
 }
 
 impl AnytlsClient {
@@ -144,6 +159,7 @@ impl AnytlsClient {
         // domainStrategy 等）生效，对齐 anytls-go 可注入 SystemDialer 语义（bd n65u）。
         let dial_padding = padding.clone();
         let dial_sockopt = config.sockopt.clone();
+        let dial_handshake_timeout = config.handshake_timeout;
         let dial_out: DialOutFunc = Box::new(move || {
             let server_addr = server_addr.clone();
             let sni = sni.clone();
@@ -152,18 +168,34 @@ impl AnytlsClient {
             let sockopt = dial_sockopt.clone();
             Box::pin(async move {
                 let dest = server_destination(&server_addr)?;
-                let tcp = xray_transport::system_dialer::dial_system(&dest, &sockopt).await?;
-                let connector = TlsConnector::from(tls_config);
-                let server_name = rustls::pki_types::ServerName::try_from(sni.clone())
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-                let mut tls = connector.connect(server_name, tcp).await?;
-                let padding_len = {
-                    let factory = padding.read().await;
-                    factory.generate_record_payload_sizes(0).first().copied().unwrap_or(0) as u16
-                };
-                let auth_frame = build_auth_frame(&password_sha256, padding_len);
-                tls.write_all(&auth_frame).await?;
-                Ok(Box::new(tls) as Box<dyn AsyncReadWrite>)
+                tokio::time::timeout(dial_handshake_timeout, async {
+                    let tcp = xray_transport::system_dialer::dial_system(&dest, &sockopt).await?;
+                    let connector = TlsConnector::from(tls_config);
+                    let server_name = rustls::pki_types::ServerName::try_from(sni.clone())
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                    let mut tls = connector.connect(server_name, tcp).await?;
+                    let padding_len = {
+                        let factory = padding.read().await;
+                        factory.generate_record_payload_sizes(0).first().copied().unwrap_or(0)
+                            as u16
+                    };
+                    let auth_frame = build_auth_frame(&password_sha256, padding_len);
+                    tls.write_all(&auth_frame).await?;
+                    Ok(Box::new(tls) as Box<dyn AsyncReadWrite>)
+                })
+                .await
+                .map_err(|_| {
+                    // 对端不回应（TCP 连上但 TLS/认证无响应）→ 显式超时错误，
+                    // 禁静默重试（anytls-rs 对 open_stream 失败会内部重试，
+                    // 本限时由 dial() 外层兜底砍掉整个重试循环）。
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "anytls handshake timeout after {dial_handshake_timeout:?}: \
+                             server unresponsive"
+                        ),
+                    )
+                })?
             })
         });
 
@@ -174,14 +206,27 @@ impl AnytlsClient {
             config.idle_timeout,
             config.min_idle_sessions,
         );
-        Self { inner }
+        Self { inner, handshake_timeout: config.handshake_timeout }
     }
 
     /// 拨号到目标地址。返回的 `AnytlsConn` 实现 `AsyncRead + AsyncWrite + Unpin`。
     ///
     /// 流程：create_stream → 写 SOCKS5 目标 → spawn pump → 返回 duplex 包装。
+    /// 建流全程受 `handshake_timeout` 限时：`create_stream` 内部对 `open_stream`
+    /// 失败会静默重试 3 次（anytls-rs 0.3.x），对端不回应时整个循环挂死——
+    /// 外层超时兜底砍掉，返回显式超时错误。
     pub async fn dial(&self, target: &SocksAddr) -> Result<AnytlsConn> {
-        let stream = self.inner.create_stream().await?;
+        let stream = tokio::time::timeout(self.handshake_timeout, self.inner.create_stream())
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "anytls dial timeout after {:?}: server unresponsive",
+                        self.handshake_timeout
+                    ),
+                )
+            })??;
         // 补发 cmdSYN：anytls-rs 0.3.x 单流模式不再自动发 SYN，但 sing-box/anytls-go
         // server 为多路复用语义——须收到 cmdSYN(sid=1) 才打开流，否则 Psh 被静默忽略。
         // 帧序 Settings → SYN → PSH(socks target)，对齐 protocol.md packet 1 定义。
@@ -371,5 +416,47 @@ mod tests {
         // 坏端口 / 缺端口显式报错
         assert!(server_destination("host:notaport").is_err());
         assert!(server_destination("host_without_port").is_err());
+    }
+
+    /// bd v57c：对端 accept 后不回包（TLS ClientHello 无响应）→ dial 在注入的
+    /// 短超时内返回显式超时错误（禁静默重试、禁永久挂起）。
+    #[tokio::test]
+    async fn dial_timeout_when_server_silent() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // 静默对端：accept 后持有 socket 不读不写（dial_system connect 成功，
+        // TLS connect 等 ServerHello 挂住 → 注入超时触发）。整体持有 sock——
+        // into_split 后 write half 绑 `_` 会立即 drop 产生 FIN，破坏静默语义。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((sock, _)) = listener.accept().await else { return };
+            let _silent_sock = sock;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let tls = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let config = ClientConfig::new(silent_addr.to_string(), "localhost", "pw", tls)
+            .with_handshake_timeout(Duration::from_millis(300));
+        let client = AnytlsClient::new(config);
+
+        let started = std::time::Instant::now();
+        let res = client.dial(&SocksAddr::from_socket("127.0.0.1:9".parse().unwrap())).await;
+        let elapsed = started.elapsed();
+
+        let msg = match res {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("dial against silent server must fail with timeout"),
+        };
+        assert!(msg.contains("timeout"), "error must mention timeout, got: {msg}");
+        assert!(msg.contains("server unresponsive"), "error must name the cause, got: {msg}");
+        // 触发在注入窗口（≥250ms 容忍调度抖动），而非 60s 缺省
+        assert!(elapsed >= Duration::from_millis(250), "fired too early: {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "must fire at injected 300ms, took {elapsed:?}");
+        client.close().await.ok();
     }
 }

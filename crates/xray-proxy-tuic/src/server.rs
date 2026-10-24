@@ -17,6 +17,7 @@ use std::{
 
 use bytes::{BufMut, Bytes, BytesMut};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
+use skeleton_infra::fx::FxScope;
 use tokio::io::AsyncWriteExt as _;
 use uuid::Uuid;
 use xray_app_dispatcher::{DispatchHandler, UdpDispatchSession};
@@ -54,6 +55,9 @@ pub struct TuicMockServer {
     expected_uuid: Uuid,
     password: String,
     cert_der: Vec<u8>,
+    /// 组件内自持托管 scope（B6，bd t975）：accept/per-conn/per-flow/UDP 会话
+    /// 任务统一经此 spawn；scope 随 server 释放兜底 abort，不接 close。
+    fx: Arc<FxScope>,
 }
 
 impl TuicMockServer {
@@ -100,7 +104,13 @@ impl TuicMockServer {
         )?;
 
         Ok((
-            Self { endpoint, expected_uuid: uuid, password, cert_der: tls.cert_der.clone() },
+            Self {
+                endpoint,
+                expected_uuid: uuid,
+                password,
+                cert_der: tls.cert_der.clone(),
+                fx: Arc::new(FxScope::new()),
+            },
             tls.cert_der,
         ))
     }
@@ -126,21 +136,23 @@ impl TuicMockServer {
     pub async fn run(self) -> Result<()> {
         let password = self.password.clone();
         let uuid = self.expected_uuid;
+        // B6（bd t975）：per-conn 任务经组件自持 scope 托管（接收者与被捕获
+        // 绑定分离，规避 E0505；scope 随 server 释放兜底 abort）。
+        let fx = Arc::clone(&self.fx);
         loop {
             let incoming = self.endpoint.accept().await;
             let Some(incoming) = incoming else {
                 break;
             };
             let pwd = password.clone();
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-            )]
-            tokio::spawn(async move {
-                if let Err(e) = handle_connection(incoming, uuid, &pwd).await {
-                    tracing::warn!("tuic mock server connection error: {e:?}");
-                }
-            });
+            let fx_task = Arc::clone(&fx);
+            self.fx
+                .spawn(async move {
+                    if let Err(e) = handle_connection(incoming, uuid, &pwd, &fx_task).await {
+                        tracing::warn!("tuic mock server connection error: {e:?}");
+                    }
+                })
+                .expect("internal FxScope is never closed");
         }
         Ok(())
     }
@@ -150,6 +162,7 @@ async fn handle_connection(
     incoming: quinn::Incoming,
     expected_uuid: Uuid,
     password: &str,
+    fx: &Arc<FxScope>,
 ) -> Result<()> {
     let conn = incoming.await?;
 
@@ -177,7 +190,7 @@ async fn handle_connection(
     // accept_bi + accept_uni + read_datagram 三路循环（bd 8hb + 7ry/1ur）：
     // Heartbeat/Dissociate 走 uni stream；UDP 包可走 bi-stream（quic 模式）
     // 或 QUIC DATAGRAM（native 模式，spec：datagram 承载完整 Packet 命令帧）。
-    let mut udp_table = UdpAssocTable::new(None);
+    let mut udp_table = UdpAssocTable::new(None, Arc::clone(fx));
     loop {
         tokio::select! {
             bi = conn.accept_bi() => {
@@ -186,7 +199,7 @@ async fn handle_connection(
                     Err(quinn::ConnectionError::ApplicationClosed(_)) => break,
                     Err(e) => return Err(e.into()),
                 };
-                handle_bi_frame(send_bi, recv_bi).await;
+                handle_bi_frame(send_bi, recv_bi, fx).await;
             }
             uni = conn.accept_uni() => {
                 let uni = match uni {
@@ -230,22 +243,26 @@ fn handle_datagram(dg: &bytes::Bytes, conn: &quinn::Connection, table: &mut UdpA
 /// 处理一条 bi stream：读 Connect 帧并 spawn relay。
 ///
 /// spec：bi stream 只承载 Connect（Packet 走 uni/datagram，票 d1zr）。
-async fn handle_bi_frame(send_bi: quinn::SendStream, recv_bi: quinn::RecvStream) {
+async fn handle_bi_frame(
+    send_bi: quinn::SendStream,
+    recv_bi: quinn::RecvStream,
+    fx: &Arc<FxScope>,
+) {
     match read_frame_from_recv(recv_bi, 256).await {
         Ok((Command::Connect(addr), recv_bi, initial_bytes)) => {
             let Some(target) = addr_to_socket_addr(&addr) else {
                 tracing::warn!("tuic server: addr not ip literal: {addr:?}");
                 return;
             };
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-            )]
-            tokio::spawn(async move {
-                if let Err(e) = relay_to_tcp(target, send_bi, recv_bi, initial_bytes).await {
-                    tracing::debug!("tuic relay {target}: {e:?}");
-                }
-            });
+            // B6（bd t975）：per-flow relay 任务经组件自持 scope 托管。
+            let fx_relay = Arc::clone(fx);
+            fx_relay
+                .spawn(async move {
+                    if let Err(e) = relay_to_tcp(target, send_bi, recv_bi, initial_bytes).await {
+                        tracing::debug!("tuic relay {target}: {e:?}");
+                    }
+                })
+                .expect("internal FxScope is never closed");
         },
         Ok((_, _, _)) => {},
         Err(e) => {
@@ -440,11 +457,13 @@ pub(crate) struct UdpAssocTable {
     sessions: HashMap<u16, tokio::sync::mpsc::Sender<UdpAssocItem>>,
     /// per-assoc 分片重组器（bd 2x5 分片实装）。
     frags: HashMap<u16, crate::protocol::FragmentAssembler>,
+    /// 组件自持托管 scope（B6，bd t975）：per-assoc 会话任务经此 spawn。
+    fx: Arc<FxScope>,
 }
 
 impl UdpAssocTable {
-    pub(crate) fn new(dispatcher: Option<Arc<dyn DispatchHandler>>) -> Self {
-        Self { dispatcher, sessions: HashMap::new(), frags: HashMap::new() }
+    pub(crate) fn new(dispatcher: Option<Arc<dyn DispatchHandler>>, fx: Arc<FxScope>) -> Self {
+        Self { dispatcher, sessions: HashMap::new(), frags: HashMap::new(), fx }
     }
 
     /// 路由一个客户端 Packet 到其 assoc 会话；无则新建。
@@ -488,11 +507,10 @@ impl UdpAssocTable {
         let tx = self.sessions.entry(assoc_id).or_insert_with(|| {
             let (tx, rx) = tokio::sync::mpsc::channel(16);
             let dispatcher = self.dispatcher.clone();
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-            )]
-            tokio::spawn(udp_assoc_task(assoc_id, dispatcher, rx));
+            // B6（bd t975）：per-assoc 会话任务经组件自持 scope 托管。
+            self.fx
+                .spawn(udp_assoc_task(assoc_id, dispatcher, rx))
+                .expect("internal FxScope is never closed");
             tx
         });
         if tx.try_send(item).is_err() {

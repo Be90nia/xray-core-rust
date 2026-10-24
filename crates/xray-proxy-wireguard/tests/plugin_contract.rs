@@ -24,13 +24,14 @@ fn framework_options() -> FrameworkOptions {
 }
 
 /// 段形态：inbounds[] 按 protocol 路由（坑约束 7；wireguard 生产形态入站/出站
-/// 皆可，段级 `port` 随元素进 build 期读（UDP 监听端口，缺省 51820））。
-fn wg_section_config(settings: serde_json::Value, port: u16) -> serde_json::Value {
+/// 皆可，settings 级 `port` 随 settings 进 build 期读（UDP 监听端口，缺省
+/// 51820；同规 xray-core `parse_wireguard_inbound_config`））。
+fn wg_section_config(mut settings: serde_json::Value, port: u16) -> serde_json::Value {
+    settings["port"] = json!(port);
     json!({ "inbounds": [
         {
             "protocol": "wireguard",
             "tag": "wg-in",
-            "port": port,
             "settings": settings
         }
     ] })
@@ -114,7 +115,7 @@ async fn wireguard_assembles_bring_up_and_shuts_down_clean() {
     assert!(report.is_clean(), "健康链停机报告必须干净");
 
     let cfg = plugin.built_config().expect("built");
-    assert_eq!(cfg.listen_port, 18443, "段级 port 显式");
+    assert_eq!(cfg.listen_port, 18443, "settings 级 port 显式");
     assert_eq!(cfg.device.secret_key, "11".repeat(32), "hex 私钥直通");
     assert_eq!(cfg.device.effective_mtu(), 1420);
     assert_eq!(cfg.device.reserved, vec![2, 5, 1]);

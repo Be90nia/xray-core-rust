@@ -554,7 +554,10 @@ async fn serve_one(
             ok_response("text/plain; version=0.0.4; charset=utf-8", &body)
         },
         ("GET", "/debug/vars") => {
-            ok_response("application/json; charset=utf-8", &crate::debug::expvars_json())
+            let snapshot = stats.collect();
+            let obs_snapshot = obs.as_ref().and_then(|o| o.collect());
+            let body = crate::debug::expvars_json(&snapshot, obs_snapshot.as_ref());
+            ok_response("application/json; charset=utf-8", &body)
         },
         ("GET", "/debug/pprof/goroutine") => {
             ok_response("text/plain; charset=utf-8", &crate::debug::pprof_goroutine_snapshot())

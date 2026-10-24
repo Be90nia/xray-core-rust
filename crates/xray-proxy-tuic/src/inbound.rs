@@ -13,7 +13,8 @@ use std::{
 
 use async_trait::async_trait;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
-use tokio::{sync::Mutex, task::JoinHandle};
+use skeleton_infra::fx::{FxScope, Spawned};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 use xray_features::inbound::{InboundError, InboundHandler};
 
@@ -81,8 +82,12 @@ pub struct TuicInboundHandler {
     config: TuicInboundConfig,
     /// 出站 dispatch（Some 时 Connect 走 dispatcher/router；None 直连目标——mock 场景）。
     dispatch: Option<Arc<dyn xray_app_dispatcher::DispatchHandler>>,
-    /// listener + accept 任务句柄，close 时 abort。
+    /// listener + accept 任务句柄，close 时 abort。任务归组件自持 [`FxScope`]
+    /// 托管（B6，bd t975；scope 不接 close，闸关不可达，组件释放兜底 abort）。
     slot: Mutex<Option<InboundSlot>>,
+    /// 组件内自持托管 scope（B6，app 家族同款；accept/per-conn/per-flow 任务
+    /// 统一经此 spawn——生命周期记账 + 停机兜底 abort）。
+    fx: Arc<FxScope>,
     /// 自签证书 DER（start 时生成，供 client trust store）。
     cert_der: parking_lot::Mutex<Option<Vec<u8>>>,
     /// 实际监听端口（start 后有效；listen 配置 0 时由 OS 分配）。
@@ -91,7 +96,7 @@ pub struct TuicInboundHandler {
 
 struct InboundSlot {
     endpoint: Arc<quinn::Endpoint>,
-    _accept_task: JoinHandle<()>,
+    _accept_task: Spawned<()>,
 }
 
 impl TuicInboundHandler {
@@ -103,6 +108,7 @@ impl TuicInboundHandler {
             config,
             dispatch: None,
             slot: Mutex::new(None),
+            fx: Arc::new(FxScope::new()),
             cert_der: parking_lot::Mutex::new(None),
             local_port: std::sync::atomic::AtomicU16::new(0),
         })
@@ -221,11 +227,12 @@ impl InboundHandler for TuicInboundHandler {
         let endpoint_for_accept = Arc::clone(&endpoint);
 
         let dispatch = self.dispatch.clone();
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-        )]
-        let accept_task = tokio::spawn(async move {
+        // B6（bd t975）：accept/per-conn 任务经组件自持 scope 托管（生命周期记账 +
+        // 组件释放兜底 abort；scope 不接 close，闸关不可达）。
+        // 接收者与被捕获绑定分离（外层接收者 = self.fx，内层接收者 = 外层捕获的
+        // fx 本体，future 各捕获独立 clone），规避 E0505。
+        let fx = Arc::clone(&self.fx);
+        let accept_loop = async move {
             loop {
                 let incoming = endpoint_for_accept.accept().await;
                 let Some(incoming) = incoming else {
@@ -234,17 +241,18 @@ impl InboundHandler for TuicInboundHandler {
                 let pwd = password.clone();
                 let t = tag.clone();
                 let dispatch = dispatch.clone();
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-                )]
-                tokio::spawn(async move {
-                    if let Err(e) = handle_connection(incoming, uuid, &pwd, dispatch).await {
+                let fx_task = Arc::clone(&fx);
+                fx.spawn(async move {
+                    if let Err(e) =
+                        handle_connection(incoming, uuid, &pwd, dispatch, &fx_task).await
+                    {
                         tracing::debug!(tag = %t, error = ?e, "tuic inbound connection error");
                     }
-                });
+                })
+                .expect("internal FxScope is never closed");
             }
-        });
+        };
+        let accept_task = self.fx.spawn(accept_loop).expect("internal FxScope is never closed");
 
         let mut slot = self.slot.lock().await;
         *slot = Some(InboundSlot { endpoint, _accept_task: accept_task });
@@ -273,6 +281,7 @@ async fn handle_connection(
     expected_uuid: Uuid,
     password: &str,
     dispatch: Option<Arc<dyn xray_app_dispatcher::DispatchHandler>>,
+    fx: &Arc<FxScope>,
 ) -> Result<()> {
     let conn = incoming.await?;
     // 生成 expected_token (对齐官方 tuic v5: label=UUID 16字节)
@@ -301,7 +310,7 @@ async fn handle_connection(
     // Heartbeat/Dissociate 走 uni stream；UDP 包可走 bi-stream（quic 模式）
     // 或 QUIC DATAGRAM（native 模式，spec：datagram 承载完整 Packet 命令帧）。
     // UDP 会话表注入 dispatch（with_dispatch 生产路径；None 回退 mock 直连）。
-    let mut udp_table = UdpAssocTable::new(dispatch.clone());
+    let mut udp_table = UdpAssocTable::new(dispatch.clone(), Arc::clone(fx));
     loop {
         tokio::select! {
             bi = conn.accept_bi() => {
@@ -310,7 +319,7 @@ async fn handle_connection(
                     Err(quinn::ConnectionError::ApplicationClosed(_)) => break,
                     Err(e) => return Err(e.into()),
                 };
-                handle_bi_frame(send_bi, recv_bi, dispatch.clone()).await;
+                handle_bi_frame(send_bi, recv_bi, dispatch.clone(), fx).await;
             }
             uni = conn.accept_uni() => {
                 let uni = match uni {
@@ -358,6 +367,7 @@ async fn handle_bi_frame(
     send_bi: quinn::SendStream,
     recv_bi: quinn::RecvStream,
     dispatch: Option<Arc<dyn xray_app_dispatcher::DispatchHandler>>,
+    fx: &Arc<FxScope>,
 ) {
     match read_frame_from_recv(recv_bi, 256).await {
         Ok((Command::Connect(addr), recv_bi, initial_bytes)) => {
@@ -369,13 +379,13 @@ async fn handle_bi_frame(
                         xray_buf::io::new_reader(InitialedReader::new(initial_bytes, recv_bi)),
                         xray_buf::io::new_writer(send_bi),
                     );
-                    #[allow(
-                        clippy::disallowed_methods,
-                        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-                    )]
-                    tokio::spawn(async move {
-                        let _ = handler.dispatch(&dest, link).await;
-                    });
+                    // B6（bd t975）：per-flow dispatch 任务经组件 scope 托管。
+                    let fx_flow = Arc::clone(fx);
+                    fx_flow
+                        .spawn(async move {
+                            let _ = handler.dispatch(&dest, link).await;
+                        })
+                        .expect("internal FxScope is never closed");
                 } else {
                     tracing::warn!("tuic inbound: unsupported addr: {addr:?}");
                 }
@@ -385,15 +395,15 @@ async fn handle_bi_frame(
                     tracing::warn!("tuic inbound: addr not ip literal: {addr:?}");
                     return;
                 };
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-                )]
-                tokio::spawn(async move {
-                    if let Err(e) = relay_to_tcp(target, send_bi, recv_bi, initial_bytes).await {
-                        tracing::debug!("tuic relay {target}: {e:?}");
-                    }
-                });
+                let fx_relay = Arc::clone(fx);
+                fx_relay
+                    .spawn(async move {
+                        if let Err(e) = relay_to_tcp(target, send_bi, recv_bi, initial_bytes).await
+                        {
+                            tracing::debug!("tuic relay {target}: {e:?}");
+                        }
+                    })
+                    .expect("internal FxScope is never closed");
             }
         },
         Ok((_, _, _)) => {},

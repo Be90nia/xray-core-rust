@@ -110,10 +110,11 @@ pub fn reload_with_update<D: AssetDownloader + ?Sized, R: GeodataReloader + ?Siz
     };
 
     match reloader.reload() {
-        Ok(()) => tx.commit(),
+        Ok(()) => tx.commit().map_err(crate::swap::map_err),
         Err(reload_err) => {
             crate::error::at_error(&reload_err);
-            let rollback_err = tx.rollback();
+            // 回滚走 frame 唯一实现（每次回滚失败由 ReloadTx::rollback 内 error! 留痕）。
+            let rollback_err = tx.rollback(crate::swap::log());
             match rollback_err {
                 Ok(()) => Err(reload_err),
                 Err(rb) => Err(GeodataError::Other(format!("{reload_err}; rollback: {rb}").into())),

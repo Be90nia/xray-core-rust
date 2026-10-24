@@ -21,6 +21,7 @@ use anytls::{
     runtime::DefaultPaddingFactory,
 };
 use sha2::{Digest, Sha256};
+use skeleton_infra::fx::{FxScope, Spawned};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream},
     net::{TcpListener, TcpStream},
@@ -40,6 +41,20 @@ use crate::{error::Result, socks::SocksAddr};
 /// anytls duplex 缓冲（64 KiB，与 client.rs 一致）。
 const DUPLEX_BUF_SIZE: usize = 64 * 1024;
 
+/// 服务端握手/首包限时（绝对 deadline，从 accept 起算，覆盖 TLS 握手、认证帧
+/// 读取、session 启动与 SOCKS5 target 首包）。产品缺省对齐 policy
+/// `Timeouts.Handshake`（Go SessionDefault 60s 同源）；cfg(test) 收短为 100ms
+/// （vless inbound 先例，静默连接超时测试可在秒级完成）。
+#[cfg(not(test))]
+fn handshake_timeout() -> std::time::Duration {
+    xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT
+}
+
+#[cfg(test)]
+fn handshake_timeout() -> std::time::Duration {
+    std::time::Duration::from_millis(100)
+}
+
 /// 认证帧 padding0 长度上限（16 KiB − 34B 认证头 = 16350）。
 ///
 /// Go 参考实现无显式常量，有效上界来自首包缓冲：anytls-go
@@ -56,8 +71,13 @@ const MAX_PADDING0_LEN: usize = 16 * 1024 - 34;
 /// AnyTLS mock 服务端句柄，`stop()` 后 listener 关闭。
 pub struct AnytlsMockServer {
     pub local_addr: SocketAddr,
-    join: tokio::task::JoinHandle<()>,
+    join: Spawned<()>,
     stop_tx: tokio::sync::oneshot::Sender<()>,
+    /// 组件内自持托管 scope（B6，坑约束 5）：serve_loop/每连接/每会话任务记账，
+    /// scope 随 MockServer drop 兜底 abort 在途任务（数据面 pump 同账本）。
+    #[allow(dead_code)]
+    // 仅经 drop glue 生效（JoinSet 随 drop abort），无直接读取——app 家族 B6 先例
+    fx: Arc<FxScope>,
 }
 
 impl AnytlsMockServer {
@@ -88,24 +108,24 @@ impl AnytlsMockServer {
         let listener = TcpListener::bind(bind_addr).await?;
         let local_addr = listener.local_addr()?;
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-        )]
-        let join = tokio::spawn(serve_loop(
-            listener,
-            tls_acceptor,
-            dispatch,
-            expected_password_sha256,
-            stop_rx,
-        ));
-        Ok(Self { local_addr, join, stop_tx })
+        let fx = Arc::new(FxScope::new());
+        let join = fx
+            .spawn(serve_loop(
+                listener,
+                tls_acceptor,
+                dispatch,
+                expected_password_sha256,
+                stop_rx,
+                Arc::clone(&fx),
+            ))
+            .expect("internal FxScope is never closed");
+        Ok(Self { local_addr, join, stop_tx, fx })
     }
 
     /// 停止 server 并等待 task 结束。
     pub async fn stop(self) {
         let _ = self.stop_tx.send(());
-        let _ = self.join.await;
+        let _ = self.join.join().await;
     }
 }
 
@@ -115,6 +135,7 @@ async fn serve_loop(
     dispatch: Option<Arc<dyn DispatchHandler>>,
     expected_password_sha256: Option<[u8; 32]>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+    fx: Arc<FxScope>,
 ) {
     loop {
         tokio::select! {
@@ -123,13 +144,16 @@ async fn serve_loop(
                 let Ok((tcp, _peer)) = res else { continue };
                 let tls_acceptor = tls_acceptor.clone();
                 let dispatch = dispatch.clone();
-                #[allow(clippy::disallowed_methods, reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）")]
-                tokio::spawn(handle_conn(
+                // 预制克隆传入 handle_conn：避免参数 move 与 spawn 接收者借用冲突（E0505）
+                let fx_conn = Arc::clone(&fx);
+                fx.spawn(handle_conn(
                     tcp,
                     tls_acceptor,
                     dispatch,
                     expected_password_sha256,
-                ));
+                    fx_conn,
+                ))
+                .expect("internal FxScope is never closed");
             }
         }
     }
@@ -140,6 +164,7 @@ async fn handle_conn(
     tls_acceptor: TlsAcceptor,
     dispatch: Option<Arc<dyn DispatchHandler>>,
     expected_password_sha256: Option<[u8; 32]>,
+    fx: Arc<FxScope>,
 ) {
     // socket kill 通道：anytls-rs Session 不暴露底层连接，其 terminate() 是纯
     // 本地标记（不关 TLS socket、不唤醒阻塞在 TLS read 的 recv_loop）——没有它
@@ -171,28 +196,42 @@ async fn handle_conn(
         },
     };
     let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-    )]
-    tokio::spawn(async move {
+    fx.spawn(async move {
         if kill_rx.await.is_ok() {
             let _ = kill_sock.shutdown(std::net::Shutdown::Both);
         }
-    });
-    let mut tls: TlsStream<TcpStream> = match tls_acceptor.accept(tcp).await {
-        Ok(t) => t,
-        Err(e) => {
-            debug!("anytls mock server TLS accept failed: {e}");
-            return;
-        },
-    };
+    })
+    .expect("internal FxScope is never closed");
+    // 握手/首包绝对 deadline：对端 accept 后不发数据（或 TLS 后不发认证帧）时，
+    // 到期关闭连接，防止静默连接永久占住任务与 fd（bd v57c）。
+    let handshake_deadline = tokio::time::Instant::now() + handshake_timeout();
+    let mut tls: TlsStream<TcpStream> =
+        match tokio::time::timeout_at(handshake_deadline, tls_acceptor.accept(tcp)).await {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => {
+                debug!("anytls mock server TLS accept failed: {e}");
+                return;
+            },
+            Err(_) => {
+                debug!(
+                    "anytls mock server: handshake timeout after {:?}, closing silent \
+                     connection (TLS accept)",
+                    handshake_timeout()
+                );
+                return;
+            },
+        };
     // 读取并校验客户端认证帧（protocol.md Authentication）：
     // `sha256(password)`(32B) || padding0 长度（BE u16）|| padding0。
     // expected 为 None 时不校验密码，但仍必须按帧格式读掉，
     // 否则 auth 字节会被 session loop 误解析为 session frame。
     let mut auth_head = [0u8; 34];
-    if let Err(e) = tls.read_exact(&mut auth_head).await {
+    if let Err(e) = tokio::time::timeout_at(handshake_deadline, tls.read_exact(&mut auth_head))
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "anytls auth head timeout"))
+        })
+    {
         debug!("anytls mock server: read auth head failed: {e}");
         return;
     }
@@ -215,7 +254,12 @@ async fn handle_conn(
     }
     if padding0_len > 0 {
         let mut pad0 = vec![0u8; padding0_len];
-        if let Err(e) = tls.read_exact(&mut pad0).await {
+        if let Err(e) = tokio::time::timeout_at(handshake_deadline, tls.read_exact(&mut pad0))
+            .await
+            .unwrap_or_else(|_| {
+                Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "anytls padding0 timeout"))
+            })
+        {
             debug!("anytls mock server: read padding0 failed: {e}");
             return;
         }
@@ -224,45 +268,72 @@ async fn handle_conn(
     // Fn 闭包不能 move out kill_tx：用 take 单次取出（回调单次触发由
     // anytls 单流模式的 handler_started 保护保证）。
     let kill_tx_cell = parking_lot::Mutex::new(Some(kill_tx));
+    // 闭包用独立克隆：fx 本体留给下方 session_run spawn（E0382）
+    let fx_session = Arc::clone(&fx);
     let on_new_session: Box<dyn Fn(Arc<Session>) + Send + Sync> = Box::new(move |session| {
         let dispatch = dispatch.clone();
         let kill_tx = kill_tx_cell.lock().take();
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-        )]
-        tokio::spawn(handle_session(session, dispatch, kill_tx));
+        let fx = Arc::clone(&fx_session);
+        fx.spawn(handle_session(session, dispatch, kill_tx, handshake_deadline))
+            .expect("internal FxScope is never closed");
     });
     let session = Arc::new(
-        new_server_session(Box::new(tls) as Box<dyn AsyncReadWrite>, on_new_session, padding).await,
+        match tokio::time::timeout_at(
+            handshake_deadline,
+            new_server_session(Box::new(tls) as Box<dyn AsyncReadWrite>, on_new_session, padding),
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(_) => {
+                debug!(
+                    "anytls mock server: handshake timeout after {:?}, closing silent \
+                     connection (session setup)",
+                    handshake_timeout()
+                );
+                return;
+            },
+        },
     );
-    if let Err(e) = session.ensure_started().await {
+    if let Err(e) = tokio::time::timeout_at(handshake_deadline, session.ensure_started())
+        .await
+        .unwrap_or_else(|_| Err(std::io::Error::other("anytls ensure_started timeout")))
+    {
         debug!("anytls mock server: session ensure_started failed: {e}");
         return;
     }
     // spawn run 循环——主循环结束后 session 自然清理
     let session_run = session.clone();
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-    )]
-    tokio::spawn(async move {
+    fx.spawn(async move {
         let _ = session_run.run().await;
-    });
+    })
+    .expect("internal FxScope is never closed");
 }
 
 /// 处理一个 incoming session：读 SOCKS5 target → 直连或 dispatcher 桥接。
+///
+/// SOCKS5 target 首包受 `first_packet_deadline` 限时（与握手段共用的绝对
+/// deadline）：对端认证通过后不发首包，到期发 FIN + shutdown 关闭连接（bd v57c）。
 async fn handle_session(
     session: Arc<Session>,
     dispatch: Option<Arc<dyn DispatchHandler>>,
     kill_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    first_packet_deadline: tokio::time::Instant,
 ) {
     // 1. 读 SOCKS5 target（首帧 application data）
     let mut buf = vec![0u8; 1024];
-    let n = match session.read(&mut buf).await {
-        Ok(n) => n,
-        Err(e) => {
+    let n = match tokio::time::timeout_at(first_packet_deadline, session.read(&mut buf)).await {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => {
             debug!("anytls mock server: read socks5 target failed: {e}");
+            return;
+        },
+        Err(_) => {
+            debug!(
+                "anytls mock server: first packet timeout, closing silent connection \
+                 (deadline elapsed)"
+            );
+            finish_session(&session, kill_tx).await;
             return;
         },
     };
@@ -684,6 +755,41 @@ mod tests {
             Ok(Ok(n)) => panic!("server sent {n} byte(s) instead of dropping the connection"),
             Err(_) => panic!("oversized padding0_len connection stayed open (2s timeout)"),
         }
+        server.stop().await;
+    }
+
+    /// bd v57c：TLS 握手完成后不发认证帧（静默对端）→ 服务端握手限时到期
+    /// 关闭连接，客户端读到 EOF/RST，连接不永久挂起。cfg(test) 下限时收短
+    /// 为 100ms（见 handshake_timeout()）。
+    #[tokio::test]
+    async fn server_closes_connection_after_first_packet_timeout() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (server, cert_der) = start_server_with_password(Some("s3cret")).await;
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(cert_der.into()).unwrap();
+        let tls = Arc::new(
+            RustlsClientConfig::builder().with_root_certificates(root_store).with_no_client_auth(),
+        );
+        let connector = tokio_rustls::TlsConnector::from(tls);
+        let tcp = TcpStream::connect(server.local_addr).await.expect("tcp connect");
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut tls_stream = connector.connect(server_name, tcp).await.expect("tls handshake");
+
+        // 故意不发认证帧，保持静默；断言服务端在限时内关闭连接。
+        let started = std::time::Instant::now();
+        let mut buf = [0u8; 1];
+        match tokio::time::timeout(Duration::from_secs(5), tls_stream.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => {}, // EOF / RST = 服务端按期关闭
+            Ok(Ok(n)) => panic!("server sent {n} byte(s) instead of closing"),
+            Err(_) => {
+                panic!("silent connection stayed open beyond 5s (elapsed {:?})", started.elapsed())
+            },
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "close must fire at the injected handshake timeout, took {:?}",
+            started.elapsed()
+        );
         server.stop().await;
     }
 }

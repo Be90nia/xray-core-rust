@@ -44,6 +44,53 @@ async fn start_server() -> (std::net::SocketAddr, TokioHttpServer) {
     (addr, server)
 }
 
+/// 带计数数据的 StatsCollector stub：模拟 xray-core `AppStatsFeature`（register.rs
+/// impl StatsCollector）经 visit_counters 聚合现有 stats manager 后喂给的快照。
+struct PopulatedStats;
+impl StatsCollector for PopulatedStats {
+    fn collect(&self) -> StatsSnapshot {
+        xray_app_metrics::aggregate_counters([
+            ("inbound>>>in_tag>>>traffic>>>uplink", 100),
+            ("inbound>>>in_tag>>>traffic>>>downlink", 200),
+        ])
+    }
+}
+
+/// bd chnz 验收：`/debug/vars` 携带 Go handleDebugVars 形态的 stats/observatory key
+/// （Go app/metrics/metrics.go:128-146；stats 三类 key 恒在 :160-164）。
+#[tokio::test]
+async fn get_debug_vars_serves_go_shaped_stats_and_observatory() {
+    let addr = pick_port();
+    let server = TokioHttpServer::new();
+    let stats: Arc<dyn StatsCollector> = Arc::new(PopulatedStats);
+    server.start_http_listen(&addr.to_string(), stats, None).expect("start_http_listen");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let resp = http_get(addr, "/debug/vars").await;
+    assert!(
+        resp.starts_with("HTTP/1.1 200 OK\r\n"),
+        "expected 200 OK, got: {}",
+        resp.split("\r\n").next().unwrap_or("")
+    );
+    let parsed: serde_json::Value = serde_json::from_str(body_of(&resp)).expect("valid json body");
+    assert_eq!(
+        parsed["stats"]["inbound"]["in_tag"]["uplink"], 100,
+        "stats.inbound[tag].uplink missing: {parsed}"
+    );
+    assert_eq!(parsed["stats"]["inbound"]["in_tag"]["downlink"], 200);
+    assert!(
+        parsed["stats"].get("outbound").and_then(|v| v.as_object()).is_some(),
+        "stats.outbound must exist even when empty: {parsed}"
+    );
+    assert!(
+        parsed["stats"].get("user").and_then(|v| v.as_object()).is_some(),
+        "stats.user must exist even when empty: {parsed}"
+    );
+    assert!(parsed["observatory"].is_null(), "observatory null without feature: {parsed}");
+
+    server.shutdown().await;
+}
+
 fn body_of(resp: &str) -> &str {
     resp.split("\r\n\r\n").nth(1).unwrap_or("")
 }

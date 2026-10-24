@@ -15,7 +15,8 @@
 //!
 //! ## 核心业务
 //!
-//! - [`swap`] 模块：纯文件系统操作（Stage/Swap/Tx/swap_all/clean），可在临时目录完整测试
+//! - [`swap`] 模块：stage/swap/tx/clean 的 geodata 门面——语义唯一实现在 `xray_frame::reload`（B6
+//!   收敛，禁本地第二份）；错误归一回 [`GeodataError`]
 //! - [`downloader::reload_with_update`]：download → swap → reload → commit/rollback 编排
 //! - [`instance::GeodataInstance`]：start/execute/close 生命周期
 
