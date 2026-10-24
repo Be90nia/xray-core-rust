@@ -600,7 +600,9 @@ mod linux_impl {
             let sock =
                 Socket::new(Domain::IPV4, Type::from(libc::SOCK_RAW), Some(Protocol::ICMPV4))?;
             sock.set_nonblocking(true)?;
-            let fd = AsyncFd::new(sock)?;
+            // tokio 1.54 起 AsyncFd::new 因 I/O safety 缺陷废弃（RUSTSEC-2026-0386），
+            // 改 unsafe register：sock 所有权随 AsyncFd 转移，fd 生命周期内恒有效且不变。
+            let fd = unsafe { AsyncFd::register(sock) }.map_err(|e| e.into_parts().1)?;
             Ok(Self { _fd: fd })
         }
 
@@ -609,7 +611,9 @@ mod linux_impl {
             let sock =
                 Socket::new(Domain::IPV6, Type::from(libc::SOCK_RAW), Some(Protocol::ICMPV6))?;
             sock.set_nonblocking(true)?;
-            let fd = AsyncFd::new(sock)?;
+            // tokio 1.54 起 AsyncFd::new 因 I/O safety 缺陷废弃（RUSTSEC-2026-0386），
+            // 改 unsafe register：sock 所有权随 AsyncFd 转移，fd 生命周期内恒有效且不变。
+            let fd = unsafe { AsyncFd::register(sock) }.map_err(|e| e.into_parts().1)?;
             Ok(Self { _fd: fd })
         }
     }

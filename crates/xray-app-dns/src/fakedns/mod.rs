@@ -153,18 +153,17 @@ impl Holder {
             return vec![*ip];
         }
 
-        // 用时间戳映射到 IP（与 Go 一致）。
-        let mut ts = now_millis() & ((1u64 << self.rooms()) - 1);
-        let mut ip = self.ts_to_ip(ts);
-        // 跳过已占用的 IP。
-        while inner.ip_to_domain.contains_key(&ip) {
-            ts = ts.wrapping_add(1) & ((1u64 << self.rooms()) - 1);
-            ip = self.ts_to_ip(ts);
-            if ip == self.ip_range.network() {
-                // 轮回一圈，跳出。
-                break;
-            }
+        // 用时间戳映射到 IP（与 Go 一致）。Go fake.go:146-150：只有 rooms < 64 才把
+        // 时间戳取模折进子网；rooms >= 64（如 fc00::/12 = 116）在 Go 里不取模——
+        // Rust 侧 `1u64 << rooms` 在 rooms >= 64 时 debug panic / release 静默错移。
+        let rooms = self.rooms();
+        let mut ts = now_millis();
+        if rooms < 64 {
+            ts %= 1u64 << rooms;
         }
+        let ip = acquire_slot(&self.ip_range, ts_to_ip(&self.ip_range, ts), |cand| {
+            inner.ip_to_domain.contains_key(&cand)
+        });
         // put 前已确认 domain 未占用（上方 get 早退），仅新键路径。
         // 用 `push` 而非 `put`：lru 0.18 的 put 淘汰时不回传被逐条目，
         // 拿不到 (k, v) 就无法同步摘除值→键索引（对齐 Go lru.Put 双表同临界区维护）。
@@ -220,22 +219,49 @@ impl Holder {
     fn rooms(&self) -> u32 {
         subnet_rooms(&self.ip_range)
     }
+}
 
-    /// 时间戳偏移生成 IP。
-    fn ts_to_ip(&self, ts: u64) -> IpAddr {
-        match self.ip_range.network() {
-            IpAddr::V4(v) => {
-                let base = u32::from(v);
-                let new = base.wrapping_add(ts as u32);
-                IpAddr::V4(std::net::Ipv4Addr::from(new))
-            },
-            IpAddr::V6(v) => {
-                let mut octets = v.octets();
-                add_to_be_bytes(&mut octets, ts);
-                IpAddr::V6(std::net::Ipv6Addr::from(octets))
-            },
-        }
+/// 时间戳偏移生成 IP（对齐 Go `fake.go` 的 `bigIntIP = network + ts`）。
+fn ts_to_ip(range: &IpNet, ts: u64) -> IpAddr {
+    match range.network() {
+        IpAddr::V4(v) => {
+            let base = u32::from(v);
+            let new = base.wrapping_add(ts as u32);
+            IpAddr::V4(std::net::Ipv4Addr::from(new))
+        },
+        IpAddr::V6(v) => {
+            let mut octets = v.octets();
+            add_to_be_bytes(&mut octets, ts);
+            IpAddr::V6(std::net::Ipv6Addr::from(octets))
+        },
     }
+}
+
+/// 池内 +1，越界回绕到子网基址（Go `if !ipRange.Contains(bigIntIP) { bigIntIP = network }`）。
+fn next_ip_in_pool(range: &IpNet, ip: IpAddr) -> IpAddr {
+    let incremented = match ip {
+        IpAddr::V4(v) => IpAddr::V4(std::net::Ipv4Addr::from(u32::from(v).wrapping_add(1))),
+        IpAddr::V6(v) => {
+            let mut octets = v.octets();
+            add_to_be_bytes(&mut octets, 1);
+            IpAddr::V6(std::net::Ipv6Addr::from(octets))
+        },
+    };
+    if range.contains(&incremented) { incremented } else { range.network() }
+}
+
+/// 从 `start` 起找第一个未占用槽位。Go `fake.go:152-165` 同款：**每轮顶部查占用**，
+/// 越界回绕到子网基址后继续查（旧实现在回绕处直接 break，会返回已被占用的地址）。
+///
+/// 不会死循环：`initialize` 保证 `lru_size < 2^rooms`，占用数恒小于池容量。
+fn acquire_slot(range: &IpNet, start: IpAddr, occupied: impl Fn(IpAddr) -> bool) -> IpAddr {
+    let mut ip = start;
+    while occupied(ip) {
+        let next = next_ip_in_pool(range, ip);
+        debug_assert_ne!(next, ip, "池容量必须大于占用数（initialize 已校验 lru < 2^rooms）");
+        ip = next;
+    }
+    ip
 }
 
 /// 多池 holder。对应 Go `HolderMulti`。
@@ -507,5 +533,51 @@ mod tests {
         for ip in ips {
             assert_eq!(multi.get_domain_from_fake_dns(ip).as_deref(), Some("x.com"));
         }
+    }
+
+    /// bd 8s84：rooms >= 64 的 v6 池（fc00::/12 → rooms=116）分配不得溢出——
+    /// 旧实现 `1u64 << rooms` debug panic / release 静默错移（shift mod 64）。
+    #[test]
+    fn v6_pool_with_rooms_ge_64_allocates_unique_in_pool() {
+        let mut h =
+            Holder::with_config(FakeDnsPool { ip_pool: "fc00::/12".to_string(), lru_size: 100 });
+        h.initialize().unwrap();
+        assert!(h.is_v6_pool());
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..60 {
+            let ip = h.get_fake_ip_for_domain(&format!("d{i}.example.com"))[0];
+            assert!(ip.is_ipv6(), "v6 池必须产出 v6 地址");
+            assert!(h.is_ip_in_pool(ip), "分配结果必须落在池内: {ip}");
+            assert!(seen.insert(ip), "重复分配: {ip}");
+        }
+        assert_eq!(h.reverse_index_len(), 60);
+    }
+
+    /// bd xkpb：回绕到子网基址后必须继续查占用（Go fake.go:152-165 循环顶部查）。
+    /// 旧实现在回绕处直接 break，会返回已被占用的基址。
+    #[test]
+    fn acquire_slot_skips_occupied_network_address_on_wrap() {
+        let range: IpNet = "10.0.0.0/30".parse().unwrap();
+        let occupied = [
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), // 子网基址（回绕目标）
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)), // 起点
+        ];
+        let slot = acquire_slot(&range, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)), |ip| {
+            occupied.contains(&ip)
+        });
+        assert_eq!(
+            slot,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            "回绕过占用基址后必须落到 .1（不是已占用的 .0）"
+        );
+    }
+
+    /// 池内 +1 越界即回绕基址（Go `!ipRange.Contains` 分支）。
+    #[test]
+    fn next_ip_in_pool_wraps_at_range_end() {
+        let range: IpNet = "10.0.0.0/30".parse().unwrap();
+        let from = |a: u8| IpAddr::V4(Ipv4Addr::new(10, 0, 0, a));
+        assert_eq!(next_ip_in_pool(&range, from(1)), from(2));
+        assert_eq!(next_ip_in_pool(&range, from(3)), from(0), "/30 边界回绕到基址");
     }
 }
