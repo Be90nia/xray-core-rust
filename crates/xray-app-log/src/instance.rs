@@ -656,11 +656,12 @@ fn global_general_sink() -> &'static Arc<GlobalGeneralSink> {
 
 /// `error_log_level` → registry 等级门。`log::Level` 与 `SeverityLevel` 的详细度
 /// 同向（Error < Warn < Info < Debug），直接逐档对齐；`Unknown`（proto 零值 /
-/// 未配置）按 Error 处理——日志宁少勿多。
+/// 未配置）按 Go 缺省 Warning 门处理——warning 及以上可见（bd 8zs12），与
+/// [`LogInstance::handle`] 的 General 门同口径。
 fn general_level_filter(level: SeverityLevel) -> log::LevelFilter {
     match level {
-        SeverityLevel::Unknown | SeverityLevel::Error => log::LevelFilter::Error,
-        SeverityLevel::Warning => log::LevelFilter::Warn,
+        SeverityLevel::Error => log::LevelFilter::Error,
+        SeverityLevel::Unknown | SeverityLevel::Warning => log::LevelFilter::Warn,
         SeverityLevel::Info => log::LevelFilter::Info,
         SeverityLevel::Debug => log::LevelFilter::Debug,
     }
@@ -819,7 +820,7 @@ impl LogInstance {
     ///
     /// - Access → Access 通道（target `xray.access`）
     /// - Dns → Dns 通道（`enable_dns_log` 门；通道未注册 = 静默，同改前无 handler）
-    /// - General → General 通道（severity > error_log_level 在 emit 前滤掉）
+    /// - General → General 通道（severity 门在 emit 前滤掉；Unknown 归一见 general_level_filter）
     pub fn handle(&self, entry: &LogEntry) {
         let g = self.inner.read();
         let Some(channels) = g.channels.as_ref() else {
@@ -836,7 +837,13 @@ impl LogInstance {
                 (Channel::Dns, log::Level::Info, TARGET_DNS, self.entry_line(entry))
             },
             LogEntry::General(m) => {
-                if m.severity > self.config.error_log_level {
+                // 未配置（proto 零值）按 Go 缺省 Warning 门（bd 8zs12），与
+                // general_level_filter 同口径；否则 Unknown 门会滤空全部消息。
+                let gate = match self.config.error_log_level {
+                    SeverityLevel::Unknown => SeverityLevel::Warning,
+                    configured => configured,
+                };
+                if m.severity > gate {
                     return;
                 }
                 (

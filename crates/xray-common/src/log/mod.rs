@@ -5,7 +5,7 @@
 //! 分发机制（P1-10-b）：旧 `HANDLERS` 无差别扇出 + `tracing` 双写已收敛为
 //! udf `logx::ChannelRegistry` **单入口**——general/access/dns 三固定通道，
 //! 每通道独立 sink 与 level（`channels()`/`register_channel` 装配期注册，
-//! 未注册通道 emit 静默，写失败计数可观测）。便捷入口（[`debug`]/[`info`]/
+//! 未注册通道 emit 首次告警一行后静默，写失败计数可观测）。便捷入口（[`debug`]/[`info`]/
 //! [`warning`]/[`error`]）只走 general 通道一路，不再直发 tracing。
 //! Go 级别别名（[`Severity::as_str`]）与消息语义留仓不动。
 //! 带通道缓冲的通用 Logger 见 [`general_logger`]。
@@ -88,10 +88,18 @@ impl Record {
 }
 
 /// 全局通道注册表：general/access/dns 三固定通道的单入口分发（替代旧
-/// `HANDLERS` 无差别扇出）。未注册通道 emit 静默（udf 默认静默纪律）；
+/// `HANDLERS` 无差别扇出）。未注册通道 emit 首次告警一行后静默（bd 8zs12：
+/// 「日志写了没人看见」必须留痕；告警走 tracing，不递归走本通道）；
 /// 同通道重复注册 fail-visible；装配期注册一次，进程生命期使用。
 static CHANNELS: std::sync::LazyLock<ChannelRegistry> =
     std::sync::LazyLock::new(ChannelRegistry::new);
+
+/// General 槽已注册标记（[`register_channel`] 落笔；未注册告警的判定面）。
+static GENERAL_REGISTERED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// 未注册告警已发标记（进程级只告警一次）。
+static UNREGISTERED_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// 全局通道注册表（装配期注册 sink / 配置密钥掩码 `set_secrets` / 观测丢弃
 /// 计数 `dropped_total`）。
@@ -101,16 +109,40 @@ pub fn channels() -> &'static ChannelRegistry {
 
 /// 注册全局通道 sink（同通道二次注册 = Err，fail-visible，原 sink 不动）。
 pub fn register_channel(sink: Arc<dyn ChannelSink>) -> Result<(), ChannelError> {
-    CHANNELS.register(sink)
+    let is_general = sink.channel() == Channel::General;
+    let result = CHANNELS.register(sink);
+    if result.is_ok() && is_general {
+        GENERAL_REGISTERED.store(true, std::sync::atomic::Ordering::Release);
+    }
+    result
 }
 
-/// 通过 general 通道记录消息（单入口；无双写）。
+/// 通过 general 通道记录消息（单入口；无双写）。General 槽未注册时首次
+/// 告警一行（fail-visible），消息本身仍静默丢弃（udf 装配期纪律不变）。
 pub fn log(message: Message) {
+    warn_once_if_general_unregistered();
     CHANNELS.emit(
         Channel::General,
         message.severity.to_log_level(),
         GENERAL_TARGET,
         &message.content,
+    );
+}
+
+/// 未注册 General 槽的 emit 首次告警一行后静默（bd 8zs12：日志基础设施自身
+/// 缺装配时，「写了没人看见」必须留痕；生产 xray-cli 启动即装 tracing 订阅者，
+/// 告警可见）。告警走 tracing 直发，不经本通道——递归无意义且槽正是缺的那路。
+fn warn_once_if_general_unregistered() {
+    if GENERAL_REGISTERED.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    if UNREGISTERED_WARNED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    tracing::warn!(
+        target: GENERAL_TARGET,
+        "general log channel has no sink registered; messages are dropped \
+         (warn once; register via xray_common::log::register_channel)"
     );
 }
 

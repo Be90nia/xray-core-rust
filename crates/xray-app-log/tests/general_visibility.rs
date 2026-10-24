@@ -119,3 +119,48 @@ fn none_config_stays_quiet() {
     instance.close();
     assert!(!buf.text().contains("[test] none-config"), "None 配置仍输出: {}", buf.text());
 }
+
+/// 默认配置（无 loglevel → Warning 门）：warning 可见、info 被滤——Go 同语义
+/// （infra/conf/log.go Build 缺省 Severity_Warning；bd 8zs12 钉子：默认配置下
+/// general info 不可见是 Go 一致行为，等级映射本身无缺陷）。
+#[test]
+fn default_gate_shows_warning_hides_info() {
+    let _serial = serial();
+    let buf = capture();
+    buf.clear();
+
+    let instance = LogInstance::new(LogConfig::default()).expect("default mask parses");
+    instance.start(&registry()).expect("console handler: start Ok");
+
+    xray_common::log::info("[test] default-gated info");
+    xray_common::log::warning("[test] default-gated warning");
+
+    instance.close();
+    let text = buf.text();
+    assert!(text.contains("[test] default-gated warning"), "默认 Warning 门应放行 warning: {text}");
+    assert!(!text.contains("[test] default-gated info"), "默认 Warning 门应滤掉 info: {text}");
+}
+
+/// 未配置（proto 零值 Unknown）按 Go 缺省 Warning 门：warning 可见、info 滤掉
+/// （bd 8zs12：改前 Unknown 按 Error 门，warning 也被滤）。
+#[test]
+fn unknown_level_gate_shows_warning_hides_info() {
+    let _serial = serial();
+    let buf = capture();
+    buf.clear();
+
+    let instance = LogInstance::new(LogConfig {
+        error_log_level: SeverityLevel::Unknown,
+        ..LogConfig::default()
+    })
+    .expect("default mask parses");
+    instance.start(&registry()).expect("console handler: start Ok");
+
+    xray_common::log::info("[test] unknown-gated info");
+    xray_common::log::warning("[test] unknown-gated warning");
+
+    instance.close();
+    let text = buf.text();
+    assert!(text.contains("[test] unknown-gated warning"), "Unknown 门应按 Warning 放行: {text}");
+    assert!(!text.contains("[test] unknown-gated info"), "Unknown 门应滤掉 info: {text}");
+}

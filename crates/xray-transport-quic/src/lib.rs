@@ -27,5 +27,6 @@ pub mod congestion_swappable;
 pub mod register;
 pub mod transport;
 mod udp_gso;
+pub mod zero_rtt;
 
 pub use config::QuicConfig;

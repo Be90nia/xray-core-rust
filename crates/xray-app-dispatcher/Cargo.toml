@@ -31,3 +31,6 @@ xray-frame = { path = "../xray-frame" }
 # 逐请求记录 (dest, tag, chosen_handler_tag) + 旧臂选择半边单独可调 +
 # 双写对照计数面。S3 切查表 / S4 删臂另单。
 dispatcher-dual-write = []
+# B4 S3 回退开关（默认关）：与 dispatcher-dual-write 同开时，选择面回退旧臂
+# `get_handler`（不查影子表）；单独开 = 无操作。仅影响选择面解析，不动记录/对照。
+legacy-arm-select = []
