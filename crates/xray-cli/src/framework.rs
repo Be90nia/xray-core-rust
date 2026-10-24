@@ -1,29 +1,59 @@
 #![allow(clippy::print_stderr)] // 启停报告走 stderr 直写：产品接口（对齐 run.rs 文件级豁免理由）
-//! B5：`xray-frame` `Framework` 组合根启动路径 + handler 桥（feature `framework-assembly`）。
+//! B5：`xray-frame` `Framework` 组合根启动路径 + 配置驱动协议插件桥（feature
+//! `framework-assembly`）。
 //!
-//! 装配链：`register → build(ctx) → bring_up → 等信号 → shutdown → 停机报告`；
-//! handler 桥：`OutboundProvider`（插件产出 handler 的声明面）→
-//! [`HandlerBridge`]（tag → `Arc<dyn DispatchHandler>` 查表，dispatcher 消费面
-//! 的最小就位形态——真 dispatch_link 接线与 inbound/outbound 装配门留后）。
-//! 段路由：装配根 `with_config(config_root)`（`Config::to_json_value()` 同源投影，
-//! 禁从原文件二次解析），插件 build 期经 `ctx.section()` 取自己那段。
+//! 装配链：`derive → register → build(ctx) → bring_up → 桥填表 → 等信号 →
+//! shutdown → 停机报告`。
 //!
-//! 插件集当前仅含装配探针（[`AssemblyProbe`]），16 族协议插件逐族实现
-//! [`OutboundProvider`] 即入桥；配置前置与生产路径共享（run.rs `execute` 在
-//! `built` 之后才分叉），此处不复制任何配置解析。
+//! - **配置派生注册**（禁硬编码协议清单）：从 `BuiltConfig` 的 `outbounds[]/inbounds[]` 轮出
+//!   `protocol` 名，经族目录（[`family_catalog`]， 只提供构造器）注册进 xray-frame
+//!   `PluginRegistry`；目录未覆盖的族 （shadowsocks 等未迁移族）记账不注册、不静默。
+//! - **handler 桥**：从已 build 的插件族把每个配置条目转成 dispatcher 可调 handler（出站 =
+//!   插件产出的 `DispatchHandler`/`DialBridge` 包装；入站 = `InboundDispatchHandler`，生产同款 tag
+//!   面），填 [`HandlerBridge`] 查表。 转换失败逐条计数 + 日志（成功几个算几个），重复 tag
+//!   拒绝（不覆盖）。
+//! - **段路由**：装配根 `with_config(config_root)`（`Config::to_json_value()`
+//!   同源投影，禁从原文件二次解析），插件 build 期经 `ctx.section()` 取自己 那段（缺段
+//!   fail-fast，L5）。
+//!
+//! 探针（[`AssemblyProbe`]）恒注册：装配链贯通的金丝雀。v0.1 已知限制：同
+//! protocol 多实例条目只转换首个（xray-frame v0.1 每 protocol 只 build 首段，
+//! 余者记账失败）；listener/accept 面与 dispatcher 真接线（ohm 注入）留后续批。
 
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
 
-use xray_app_dispatcher::{DispatchHandler, PinFuture};
+use xray_app_dispatcher::{
+    DispatchHandler,
+    default::{DefaultDispatcher, DialBridge, DialFn},
+};
+use xray_conf::{BuiltConfig, BuiltOutbound};
+use xray_core::wiring::{InboundDispatchHandler, sniffing_request_from_json};
 use xray_frame::{
     Framework, FrameworkOptions,
     context::PluginContext,
     error::PluginError,
     plugin::{Lifecycle, Plugin, PluginContract},
 };
+use xray_proxy_anytls::AnytlsPlugin;
+use xray_proxy_blackhole::BlackholePlugin;
+use xray_proxy_dns::DnsPlugin;
+use xray_proxy_dokodemo::DokodemoPlugin;
+use xray_proxy_freedom::{
+    FinalRule, FreedomDispatchBridge, FreedomPlugin, make_freedom_dial_fn_with_config,
+};
+use xray_proxy_http::HttpPlugin;
+use xray_proxy_hysteria::HysteriaPlugin;
+use xray_proxy_loopback::LoopbackPlugin;
+use xray_proxy_socks::SocksPlugin;
+use xray_proxy_trojan::TrojanPlugin;
+use xray_proxy_tuic::TuicPlugin;
+use xray_proxy_tun::TunPlugin;
+use xray_proxy_vless::VlessPlugin;
+use xray_proxy_vmess::VmessPlugin;
+use xray_proxy_wireguard::WireguardPlugin;
 
 use crate::error::{CliError, Result};
 
@@ -42,6 +72,7 @@ const PROBE_CONTRACT: PluginContract =
     PluginContract { clauses: &[], extra: &[], not_applicable: &[] };
 
 impl AssemblyProbe {
+    #[cfg(test)] // 测试观察锚（断言段路由投影值）；生产 build 不编译
     fn section_seen(&self) -> Arc<Mutex<Option<serde_json::Value>>> {
         Arc::clone(&self.section_seen)
     }
@@ -92,65 +123,186 @@ impl Lifecycle for AssemblyProbeLifecycle {
     }
 }
 
-/// 插件产出出站 handler 的声明面：实现本 trait 的插件，其 handler 经
-/// [`HandlerBridge::collect`] 以 `plugin.name()` 为 tag 入桥表，dispatcher 侧
-/// 即可按 tag 查询调用。协议插件逐族实现即完成入桥（16 族接线留后）。
-trait OutboundProvider: Plugin {
-    fn outbound_handler(&self) -> Arc<dyn DispatchHandler>;
+/// 出站桥转换缝：插件族已 build → 配置出站条目 → dispatcher 可调 handler。
+/// `Err` = 该条目入不了桥（[`fill_bridge`] 记账 + 日志，不静默）。
+type OutboundConvert = Arc<
+    dyn Fn(&BuiltOutbound) -> std::result::Result<Arc<dyn DispatchHandler>, String> + Send + Sync,
+>;
+
+/// 一个协议族的注册形态：插件实例（注册进 Framework，build 期状态被出站转换
+/// 消费——同一 Arc）+ 可选的出站桥转换缝（无 = 该族暂无 dispatcher 可调出站
+/// handler，如仅入站面的插件）。
+struct RegisteredFamily {
+    protocol: &'static str,
+    plugin: Arc<dyn Plugin>,
+    outbound: Option<OutboundConvert>,
 }
 
-/// 探针出站 handler：dispatcher 可调用形态的最小实现——dispatch 即关闭 link
-/// （协议语义归协议插件族；本面只证明 tag 查询与调用路径贯通）。
-#[derive(Debug)]
-struct ProbeOutbound {
-    tag: &'static str,
+/// 入站面族：插件产出 inbound server（listener 面消费，下一批）；桥面 =
+/// [`InboundDispatchHandler`]（tag 派生，不依赖插件状态，[`fill_bridge`] 直造）。
+fn inbound_only<P: Plugin + Default + 'static>(protocol: &'static str) -> RegisteredFamily {
+    RegisteredFamily { protocol, plugin: Arc::new(P::default()), outbound: None }
 }
 
-impl DispatchHandler for ProbeOutbound {
-    fn tag(&self) -> &str {
-        self.tag
-    }
-
-    fn dispatch(
-        &self,
-        _dest: &xray_common::net::destination::Destination,
-        link: xray_transport::link::Link,
-    ) -> PinFuture<()> {
-        Box::pin(async move {
-            drop(link);
-            Ok(())
-        })
+/// `dial_fn` 形态出站族（vmess/vless）：插件暴露 `DialFn`（既有拨号语义全量），
+/// 经 dispatcher 自家的 [`DialBridge`] 适配成 `DispatchHandler`。
+fn dial_fn_family<P, F>(protocol: &'static str, dial: F) -> RegisteredFamily
+where
+    P: Plugin + Default + 'static,
+    F: Fn(&P) -> std::result::Result<DialFn, PluginError> + Send + Sync + 'static,
+{
+    let plugin = Arc::new(P::default());
+    let p = Arc::clone(&plugin);
+    RegisteredFamily {
+        protocol,
+        outbound: Some(Arc::new(move |ob| {
+            let dial_fn = dial(&p).map_err(|e| e.to_string())?;
+            Ok(Arc::new(DialBridge::new(ob.tag.clone(), dial_fn)) as Arc<dyn DispatchHandler>)
+        })),
+        plugin,
     }
 }
 
-impl OutboundProvider for AssemblyProbe {
-    fn outbound_handler(&self) -> Arc<dyn DispatchHandler> {
-        Arc::new(ProbeOutbound { tag: self.name() })
+/// freedom 出站族：`make_dial_fn_with_config`（拨号路径语义：fragment/
+/// destinationOverride/proxyProtocol/domainStrategy/sockopt/bd 7p1m RCVBUF）+
+/// [`FreedomDispatchBridge`]（dispatch 路径语义：finalRules Block 检查、noises、
+/// UDP relay 策略）+ 生产同款 splice 标记（Go freedom.go:260）。
+fn freedom_family() -> RegisteredFamily {
+    let plugin = Arc::new(FreedomPlugin::default());
+    let p = Arc::clone(&plugin);
+    RegisteredFamily {
+        protocol: "freedom",
+        outbound: Some(Arc::new(move |ob| {
+            let cfg = p.built_config().map_err(|e| e.to_string())?.clone();
+            let dial_bridge = Arc::new(DialBridge::new(
+                ob.tag.clone(),
+                make_freedom_dial_fn_with_config(cfg.clone()),
+            ));
+            dial_bridge.set_splice_outbound(true);
+            let final_rules = cfg
+                .final_rules
+                .iter()
+                .map(FinalRule::build)
+                .collect::<xray_proxy_freedom::Result<Vec<_>>>()
+                .map_err(|e| format!("freedom finalRule: {e}"))?;
+            let handler = FreedomDispatchBridge::from_bridge(dial_bridge)
+                .with_noises(cfg.noises.clone())
+                .with_destination_override(cfg.destination_override.clone())
+                .with_domain_strategy(cfg.domain_strategy)
+                .with_final_rules(final_rules);
+            Ok(Arc::new(handler) as Arc<dyn DispatchHandler>)
+        })),
+        plugin,
     }
+}
+
+/// blackhole 出站族：插件自家 `dispatch_handler`（[`xray_proxy_blackhole`]
+/// `BlackholeHandler` 已是 `DispatchHandler`）。
+fn blackhole_family() -> RegisteredFamily {
+    let plugin = Arc::new(BlackholePlugin::default());
+    let p = Arc::clone(&plugin);
+    RegisteredFamily {
+        protocol: "blackhole",
+        outbound: Some(Arc::new(move |ob| {
+            let handler = p.dispatch_handler(&ob.tag).map_err(|e| e.to_string())?;
+            Ok(Arc::new(handler) as Arc<dyn DispatchHandler>)
+        })),
+        plugin,
+    }
+}
+
+/// loopback 出站族：插件自家 `handler`（`LoopbackHandler` 已是 `DispatchHandler`，
+/// 回环目标 = build 期段里的 `inboundTag`）。
+fn loopback_family() -> RegisteredFamily {
+    let plugin = Arc::new(LoopbackPlugin::default());
+    let p = Arc::clone(&plugin);
+    RegisteredFamily {
+        protocol: "loopback",
+        outbound: Some(Arc::new(move |ob| {
+            let handler = p.handler(&ob.tag).map_err(|e| e.to_string())?;
+            Ok(Arc::new(handler) as Arc<dyn DispatchHandler>)
+        })),
+        plugin,
+    }
+}
+
+/// 协议目录：配置 `protocol` 串 → 插件族构造。目录只提供**构造器**，注册集 =
+/// 配置引用集（禁硬编码清单）；目录未覆盖 = 未迁移（shadowsocks）/未知族 →
+/// [`derive_families`] 记账不注册。族名与 xray-conf `BuiltEntry.kind` /
+/// `Config::to_json_value()` 的 `protocol` 字段逐字对齐（插件 `name()` 同源）。
+fn family_catalog(protocol: &str) -> Option<RegisteredFamily> {
+    let family = match protocol {
+        "socks" => inbound_only::<SocksPlugin>("socks"),
+        "http" => inbound_only::<HttpPlugin>("http"),
+        "dokodemo-door" => inbound_only::<DokodemoPlugin>("dokodemo-door"),
+        "trojan" => inbound_only::<TrojanPlugin>("trojan"),
+        "tuic" => inbound_only::<TuicPlugin>("tuic"),
+        "anytls" => inbound_only::<AnytlsPlugin>("anytls"),
+        "hysteria" => inbound_only::<HysteriaPlugin>("hysteria"),
+        "wireguard" => inbound_only::<WireguardPlugin>("wireguard"),
+        "tun" => inbound_only::<TunPlugin>("tun"),
+        "dns" => inbound_only::<DnsPlugin>("dns"),
+        "freedom" => freedom_family(),
+        "vmess" => dial_fn_family::<VmessPlugin, _>("vmess", |p| p.dial_fn()),
+        "vless" => dial_fn_family::<VlessPlugin, _>("vless", |p| p.dial_fn()),
+        "blackhole" => blackhole_family(),
+        "loopback" => loopback_family(),
+        _ => return None,
+    };
+    Some(family)
+}
+
+/// 配置派生的注册计划。
+struct FamilyPlan {
+    families: Vec<RegisteredFamily>,
+    /// 目录未覆盖、未注册的 protocol（去重、首现序）——调用方记账上抛。
+    unregistered: Vec<String>,
+}
+
+/// 从 `BuiltConfig` 的 inbound/outbound 段轮出协议族（首现去重）：注册集 =
+/// 配置引用集，禁硬编码清单。
+fn derive_families(built: &BuiltConfig) -> FamilyPlan {
+    let mut plan = FamilyPlan { families: Vec::new(), unregistered: Vec::new() };
+    let push_family = |kind: &str, plan: &mut FamilyPlan| {
+        if plan.families.iter().any(|f| f.protocol == kind)
+            || plan.unregistered.iter().any(|u| u == kind)
+        {
+            return;
+        }
+        match family_catalog(kind) {
+            Some(family) => plan.families.push(family),
+            None => plan.unregistered.push(kind.to_string()),
+        }
+    };
+    for ob in &built.outbounds {
+        push_family(&ob.entry.kind, &mut plan);
+    }
+    for ib in &built.inbounds {
+        push_family(&ib.entry.kind, &mut plan);
+    }
+    plan
 }
 
 /// handler 桥：tag → `Arc<dyn DispatchHandler>` 查表（构造后只读，克隆廉价）。
-/// dispatcher 消费面的最小就位形态——`get(tag)` 即未来 `SimpleOhm` 查表替换点。
+/// dispatcher 消费面的就位形态——`get(tag)` 即未来 `SimpleOhm` 查表替换点。
 #[derive(Debug, Default)]
 struct HandlerBridge {
-    handlers: HashMap<&'static str, Arc<dyn DispatchHandler>>,
+    handlers: HashMap<String, Arc<dyn DispatchHandler>>,
 }
 
 impl HandlerBridge {
-    /// 从插件集构造：每个 provider 的 handler 以其插件名入表（同名后到覆盖
-    /// 先到——装配根注册链 v0.1 每插件一个 handler，重复名属装配 bug，由
-    /// `PluginRegistry` 的重名拒绝先行拦截）。
-    fn collect(providers: &[Arc<dyn OutboundProvider>]) -> Self {
-        let mut handlers = HashMap::with_capacity(providers.len());
-        for provider in providers {
-            handlers.insert(provider.name(), provider.outbound_handler());
-        }
-        Self { handlers }
+    fn insert(&mut self, tag: String, handler: Arc<dyn DispatchHandler>) {
+        self.handlers.insert(tag, handler);
     }
 
-    /// 按 tag 查询 handler（dispatcher 调用面）。
-    fn get(&self, tag: &str) -> Option<&Arc<dyn DispatchHandler>> {
+    /// 按 tag 查询 handler（dispatcher 消费缝：P3 真接线 `SimpleOhm` 替换点，
+    /// 集成面 API——当前 e2e/未来 dispatcher 两侧共用）。
+    pub fn get(&self, tag: &str) -> Option<&Arc<dyn DispatchHandler>> {
         self.handlers.get(tag)
+    }
+
+    fn contains_key(&self, tag: &str) -> bool {
+        self.handlers.contains_key(tag)
     }
 
     fn len(&self) -> usize {
@@ -158,51 +310,178 @@ impl HandlerBridge {
     }
 }
 
-/// 注册插件集 → build。fail-visible：装配期任一步失败原样上抛为 CLI 错误。
+/// 桥填表结果：成功 handler 计数 + 逐条失败（tag, 原因）——调用方记账上抛。
+struct BridgeFill {
+    bridge: HandlerBridge,
+    ok: usize,
+    failed: Vec<(String, String)>,
+}
+
+/// 出站条目的生产装配前置（framework 桥 v0 未接的面在场 → 拒，不静默丢语义）：
+/// proxySettings 代理链 / mux 包装 / sendThrough / streamSettings 传输层。
+fn guard_outbound_entry(ob: &BuiltOutbound) -> std::result::Result<(), String> {
+    if ob.proxy_settings_json.is_some() {
+        return Err("proxy chain (proxySettings) not wired in framework bridge".into());
+    }
+    if ob.mux_json.is_some() {
+        return Err("mux wrapping not wired in framework bridge".into());
+    }
+    if ob.send_through.is_some() {
+        return Err("sendThrough not wired in framework bridge".into());
+    }
+    if ob.stream_settings_json.is_some() {
+        return Err("transport streamSettings not wired in framework bridge".into());
+    }
+    Ok(())
+}
+
+/// 把配置条目转成 dispatcher 可调 handler 填表：出站 = 族转换缝（缺缝/失败/
+/// 重复 tag 逐条记账）；入站 = [`InboundDispatchHandler`]（生产同款 tag 面，
+/// sniffing 解析复用 xray-core 权威实现）。
+fn fill_bridge(
+    built: &BuiltConfig,
+    families: &[RegisteredFamily],
+    dispatcher: &Arc<DefaultDispatcher>,
+) -> BridgeFill {
+    let mut fill = BridgeFill { bridge: HandlerBridge::default(), ok: 0, failed: Vec::new() };
+    // v0.1：同 protocol 多实例只转换首个（xray-frame 每 protocol 只 build 首段）；
+    // 仅成功转换才占位，失败后同 protocol 后继条目仍可重试。
+    let mut converted_protocols: Vec<&'static str> = Vec::new();
+    let record_failure = |fill: &mut BridgeFill, tag: &str, reason: String| {
+        fill.failed.push((tag.to_string(), reason));
+    };
+
+    for ob in &built.outbounds {
+        if fill.bridge.contains_key(&ob.tag) {
+            record_failure(&mut fill, &ob.tag, "duplicate tag".into());
+            continue;
+        }
+        let Some(family) = families.iter().find(|f| f.protocol == ob.entry.kind) else {
+            record_failure(
+                &mut fill,
+                &ob.tag,
+                format!(
+                    "protocol {:?} not registered (family unmigrated or unknown)",
+                    ob.entry.kind
+                ),
+            );
+            continue;
+        };
+        let Some(convert) = &family.outbound else {
+            record_failure(
+                &mut fill,
+                &ob.tag,
+                format!(
+                    "protocol {:?} exposes inbound-face plugin only; no framework outbound conversion",
+                    ob.entry.kind
+                ),
+            );
+            continue;
+        };
+        if let Err(reason) = guard_outbound_entry(ob) {
+            record_failure(&mut fill, &ob.tag, reason);
+            continue;
+        }
+        if converted_protocols.contains(&family.protocol) {
+            record_failure(
+                &mut fill,
+                &ob.tag,
+                "duplicate protocol entry: xray-frame v0.1 builds the first section only".into(),
+            );
+            continue;
+        }
+        match convert(ob) {
+            Ok(handler) => {
+                fill.bridge.insert(ob.tag.clone(), handler);
+                converted_protocols.push(family.protocol);
+                fill.ok += 1;
+            },
+            Err(reason) => record_failure(&mut fill, &ob.tag, reason),
+        }
+    }
+
+    for ib in &built.inbounds {
+        if fill.bridge.contains_key(&ib.tag) {
+            record_failure(&mut fill, &ib.tag, "duplicate tag".into());
+            continue;
+        }
+        let sniffing = sniffing_request_from_json(ib.sniffing_json.as_ref());
+        let handler = InboundDispatchHandler::new(Arc::clone(dispatcher), sniffing, &ib.tag);
+        fill.bridge.insert(ib.tag.clone(), Arc::new(handler));
+        fill.ok += 1;
+    }
+    fill
+}
+
+/// 注册插件集（探针 + 配置派生族）→ build。fail-visible：装配期任一步失败原
+/// 样上抛为 CLI 错误。
 ///
 /// `config_root`：`Config::to_json_value()` 同源投影（run.rs 分叉点已持有唯一
 /// 解析产物），经 `with_config` 注入 per-plugin `ctx.section()` 段路由底座。
-fn assemble(
-    config_root: serde_json::Value,
-    providers: &[Arc<dyn OutboundProvider>],
-) -> Result<Framework> {
-    // registry_cap=16：探针 1 个 + 预留 16 族协议插件位；id_fingerprint/shutdown_timeout
-    // 走框架默认（派生 fingerprint + 5s 停机超时，P0-8 拍板）。
-    let options =
-        FrameworkOptions { registry_cap: 16, id_fingerprint: None, shutdown_timeout: None };
+fn assemble(config_root: serde_json::Value, families: &[RegisteredFamily]) -> Result<Framework> {
+    let options = FrameworkOptions {
+        registry_cap: 1 + families.len(), // 探针金丝雀 + 配置派生族
+        id_fingerprint: None,             // 框架派生 fingerprint
+        shutdown_timeout: None,           // 框架默认 5s（P0-8 拍板）
+    };
     Framework::builder(options)
         .and_then(|builder| {
-            let mut builder = builder.with_config(config_root);
-            for provider in providers {
-                // trait upcast：dyn OutboundProvider → dyn Plugin（supertrait）。
-                let plugin: Arc<dyn Plugin> = Arc::clone(provider);
-                builder = builder.register(plugin)?;
+            let mut builder =
+                builder.with_config(config_root).register(Arc::new(AssemblyProbe::default()))?;
+            for family in families {
+                builder = builder.register(Arc::clone(&family.plugin))?;
             }
             builder.build()
         })
         .map_err(|e| CliError::StartFailed(format!("framework assemble failed: {e}")))
 }
 
-/// 框架路径主流程：装配（含段路由注入）→ bring_up → 桥就位 → 等信号 → 停机报告。
+/// 框架路径主流程：配置派生注册 → 装配 build → bring_up → 桥填表 → 等信号 →
+/// 停机报告。
 ///
-/// `config_root`：`Config::to_json_value()` 投影（与生产同一份解析产物，禁从
-/// 原文件二次解析）；`_built`：listener/dispatcher 接线后按段消费（P3 后续）。
+/// `built`：配置唯一解析产物（族派生源 + 桥条目源）；`config_root`：
+/// `Config::to_json_value()` 投影（段路由底座，禁从原文件二次解析）。
 pub(crate) async fn run_framework(
-    _built: &xray_conf::BuiltConfig,
+    built: &xray_conf::BuiltConfig,
     config_root: serde_json::Value,
 ) -> Result<()> {
-    // 插件注册链（本步 = 探针；16 族协议插件逐族追加）。同一份实例双面共享：
-    // 注册进 Framework（生命周期）+ collect 进桥（dispatcher 查询面）。
-    let providers: Vec<Arc<dyn OutboundProvider>> = vec![Arc::new(AssemblyProbe::default())];
-    let bridge = HandlerBridge::collect(&providers);
+    // ① 配置派生（禁硬编码清单）：未迁移族记账不静默。
+    let plan = derive_families(built);
+    for name in &plan.unregistered {
+        crate::LOG.warn(format!(
+            "framework: protocol {name:?} has no plugin family (unmigrated); its entries will not reach the bridge"
+        ));
+    }
+    crate::LOG.info(format!(
+        "framework: derived plugin families from config: {:?}",
+        plan.families.iter().map(|f| f.protocol).collect::<Vec<_>>()
+    ));
 
-    let mut framework = assemble(config_root, &providers)?;
+    // ② 装配 + build + bring_up（插件 build 期经 ctx.section() 取段，缺段 fail-fast）。
+    let mut framework = assemble(config_root, &plan.families)?;
     framework
         .bring_up()
         .map_err(|e| CliError::StartFailed(format!("framework bring_up failed: {e}")))?;
     // 启动可见：Debug 手写面含运行态与插件数（assembly.rs）。
     eprintln!("[framework] bring_up ok: {framework:?}");
-    eprintln!("[framework] handler bridge ready: {} outbound handler(s)", bridge.len());
+
+    // ③ 桥：插件 → dispatcher 可调 handler 填表（失败逐条计数 + 日志）。
+    let dispatcher = Arc::new(DefaultDispatcher::new());
+    let fill = fill_bridge(built, &plan.families, &dispatcher);
+    for (tag, reason) in &fill.failed {
+        crate::LOG.warn(format!("framework: bridge conversion failed tag={tag:?}: {reason}"));
+    }
+    eprintln!(
+        "[framework] handler bridge ready: {} handler(s), {} failed",
+        fill.bridge.len(),
+        fill.failed.len()
+    );
+    // 启动可见：桥内容逐条（tag ↔ handler tag），操作者核对路由表。
+    for tag in built.outbounds.iter().map(|o| &o.tag).chain(built.inbounds.iter().map(|i| &i.tag)) {
+        if let Some(handler) = fill.bridge.get(tag) {
+            crate::LOG.info(format!("framework: bridge {tag:?} → handler {}", handler.tag()));
+        }
+    }
 
     crate::run::wait_for_signal().await;
 
@@ -222,18 +501,36 @@ pub(crate) async fn run_framework(
 mod tests {
     use std::{future::Future, pin::Pin};
 
+    use xray_conf::{BuiltEntry, BuiltInbound, BuiltOutbound};
+
     use super::*;
 
-    fn probe_providers() -> Vec<Arc<dyn OutboundProvider>> {
-        vec![Arc::new(AssemblyProbe::default())]
+    /// 配置 JSON → (BuiltConfig, 投影, 派生计划)——e2e 测试共用前置。
+    fn plan_from_json(json: &str) -> (xray_conf::BuiltConfig, serde_json::Value, FamilyPlan) {
+        let config = xray_conf::Config::from_json_str(json).unwrap();
+        let built = config.build().unwrap();
+        let root = config.to_json_value().unwrap();
+        let plan = derive_families(&built);
+        (built, root, plan)
+    }
+
+    fn outbound_entry(kind: &str, tag: &str, data: &[u8]) -> BuiltOutbound {
+        BuiltOutbound {
+            entry: BuiltEntry { kind: kind.to_string(), data: data.to_vec() },
+            tag: tag.to_string(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
+        }
     }
 
     #[test]
     fn framework_bring_up_then_shutdown_reports_clean() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let mut framework =
-                assemble(serde_json::json!({}), &probe_providers()).expect("assemble");
+            let mut framework = assemble(serde_json::json!({}), &[]).expect("assemble");
             framework.bring_up().expect("bring_up");
             assert!(framework.is_running(), "bring_up succeeded but is_running=false");
 
@@ -266,8 +563,7 @@ mod tests {
 
         let probe = Arc::new(AssemblyProbe::default());
         let seen = probe.section_seen();
-        let plugins: Vec<Arc<dyn Plugin>> =
-            probe_providers().iter().map(|p| Arc::clone(p) as Arc<dyn Plugin>).collect();
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(&probe) as Arc<dyn Plugin>];
 
         let built =
             xray_frame::config::build_plugins_from_config(&root, &plugins).expect("config build");
@@ -295,27 +591,112 @@ mod tests {
         assert!(seen.lock().unwrap().is_none(), "no section must be recorded");
     }
 
-    /// handler 桥验收②：构造（collect）→ 查询（get/tag）→ 调用一次最小路径
-    /// （dispatch 即关 link，协议语义归协议插件族）。
+    /// B5 第三步最小 e2e：socks inbound + freedom outbound 配置 → 配置派生注册
+    /// → 装配 build/bring_up → 桥里两个 tag 都查得到 handler（freedom = 真协议
+    /// 转换缝；socks = 生产同款 InboundDispatchHandler tag 面）。
     #[test]
-    fn handler_bridge_collect_query_and_dispatch_minimal() {
-        let bridge = HandlerBridge::collect(&probe_providers());
-        assert_eq!(bridge.len(), 1);
-        assert!(bridge.get("nonexistent").is_none(), "unknown tag → None");
+    fn e2e_socks_inbound_freedom_outbound_both_tags_in_bridge() {
+        let (built, root, plan) = plan_from_json(
+            r#"{
+            "inbounds": [{"protocol": "socks", "tag": "socks-in", "port": 10808, "listen": "127.0.0.1", "settings": {}}],
+            "outbounds": [{"protocol": "freedom", "tag": "freedom-out", "settings": {}}]
+        }"#,
+        );
+        // ① 配置派生：两族都从配置轮出并注册（配置没有的族不注册）。
+        assert_eq!(plan.families.len(), 2, "socks + freedom derived from config");
+        assert!(plan.unregistered.is_empty(), "unregistered: {:?}", plan.unregistered);
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let handler = bridge.get("assembly-probe").expect("probe handler");
-            assert_eq!(handler.tag(), "assembly-probe");
+            // ② 装配链：register → build（真插件 ctx.section() 解析 settings）→ bring_up。
+            let mut framework = assemble(root, &plan.families).expect("assemble");
+            framework.bring_up().expect("bring_up");
+            assert!(framework.is_running());
 
-            let dest =
-                xray_common::net::destination::Destination::tcp("127.0.0.1".parse().unwrap(), 8080);
-            let link = xray_transport::link::Link::new(Box::new(NullReader), Box::new(NullWriter));
-            handler.dispatch(&dest, link).await.expect("minimal dispatch");
+            // ③ 桥填表：两个 tag 都查得到 handler。
+            let dispatcher = Arc::new(DefaultDispatcher::new());
+            let fill = fill_bridge(&built, &plan.families, &dispatcher);
+            assert!(fill.failed.is_empty(), "unexpected conversion failures: {:?}", fill.failed);
+            assert_eq!(fill.ok, 2);
+            assert_eq!(fill.bridge.get("socks-in").expect("socks tag").tag(), "socks-in");
+            assert_eq!(fill.bridge.get("freedom-out").expect("freedom tag").tag(), "freedom-out");
+
+            let report = framework.shutdown().await;
+            assert!(report.is_clean(), "shutdown unclean: {report:?}");
         });
     }
 
-    // ── Link mock：dispatch 签名要求的 reader/writer 占位（探针不读写）──
+    /// 失败记账：未迁移族（shadowsocks）出站条目 → 桥转换逐条计数失败（不静默
+    /// 覆盖、不伪造成功）；入站面照常（InboundDispatchHandler tag 面不依赖族）。
+    #[test]
+    fn bridge_fill_counts_failures_for_unmigrated_family() {
+        let mut built = xray_conf::BuiltConfig::default();
+        built.outbounds.push(outbound_entry("shadowsocks", "ss-out", b"{}"));
+        built.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "socks".to_string(), data: b"{}".to_vec() },
+            tag: "socks-in".to_string(),
+            port: Some(10808),
+            listen: Some("127.0.0.1".to_string()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+
+        let plan = derive_families(&built);
+        assert_eq!(plan.families.len(), 1, "only socks has a plugin family");
+        assert_eq!(plan.unregistered, vec!["shadowsocks".to_string()]);
+
+        let dispatcher = Arc::new(DefaultDispatcher::new());
+        let fill = fill_bridge(&built, &plan.families, &dispatcher);
+        assert_eq!(fill.ok, 1, "only the socks inbound converts");
+        assert_eq!(fill.failed.len(), 1);
+        assert_eq!(fill.failed[0].0, "ss-out");
+        assert!(
+            fill.failed[0].1.contains("shadowsocks"),
+            "failure reason must name the family: {}",
+            fill.failed[0].1
+        );
+        assert!(fill.bridge.get("socks-in").is_some());
+        assert!(fill.bridge.get("ss-out").is_none(), "failed conversion must not fake an entry");
+    }
+
+    /// 真协议 handler 最小 dispatch：blackhole 桥 handler（插件产出）dispatch 即
+    /// 关 link——查询与调用路径贯通，无网络依赖。
+    #[test]
+    fn blackhole_bridge_handler_dispatch_closes_link() {
+        let config = xray_conf::Config::from_json_str(
+            r#"{"outbounds": [{"protocol": "blackhole", "tag": "block", "settings": {}}]}"#,
+        )
+        .unwrap();
+        let built = config.build().unwrap();
+        let root = config.to_json_value().unwrap();
+        let plan = derive_families(&built);
+        assert_eq!(plan.families.len(), 1);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut framework = assemble(root, &plan.families).expect("assemble");
+            framework.bring_up().expect("bring_up");
+
+            let dispatcher = Arc::new(DefaultDispatcher::new());
+            let fill = fill_bridge(&built, &plan.families, &dispatcher);
+            assert!(fill.failed.is_empty(), "unexpected failures: {:?}", fill.failed);
+            let handler = fill.bridge.get("block").expect("block handler");
+            assert_eq!(handler.tag(), "block");
+
+            let dest = xray_common::net::destination::Destination::tcp(
+                "127.0.0.1".parse().unwrap(),
+                xray_common::net::port::Port::new(8080),
+            );
+            let link = xray_transport::link::Link::new(Box::new(NullReader), Box::new(NullWriter));
+            // DispatchHandler::dispatch 契约 Output = ()：fire-and-forget 语义，
+            // blackhole 收敛即成功（读错误不冒泡）。
+            handler.dispatch(&dest, link).await;
+
+            framework.shutdown().await;
+        });
+    }
+
+    // ── Link mock：dispatch 签名要求的 reader/writer 占位（blackhole 不读写）──
 
     struct NullReader;
 
@@ -324,13 +705,10 @@ mod tests {
             &mut self,
         ) -> Pin<
             Box<
-                dyn Future<
-                        Output = std::result::Result<xray_buf::multi::MultiBuffer, xray_buf::Error>,
-                    > + Send
-                    + '_,
+                dyn Future<Output = xray_buf::io::Result<xray_buf::multi::MultiBuffer>> + Send + '_,
             >,
         > {
-            Box::pin(std::future::ready(Err(xray_buf::Error::ReadError("null reader".into()))))
+            Box::pin(std::future::ready(Err(xray_buf::io::Error::ReadError("null reader".into()))))
         }
     }
 
@@ -340,9 +718,8 @@ mod tests {
         fn write_multi_buffer(
             &mut self,
             _mb: xray_buf::multi::MultiBuffer,
-        ) -> Pin<Box<dyn Future<Output = std::result::Result<(), xray_buf::Error>> + Send + '_>>
-        {
-            Box::pin(std::future::ready(Err(xray_buf::Error::WriteError("null writer".into()))))
+        ) -> Pin<Box<dyn Future<Output = xray_buf::io::Result<()>> + Send + '_>> {
+            Box::pin(std::future::ready(Err(xray_buf::io::Error::WriteError("null writer".into()))))
         }
     }
 }

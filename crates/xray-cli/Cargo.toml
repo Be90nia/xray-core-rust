@@ -51,6 +51,23 @@ xray-app-dispatcher = { path = "../xray-app-dispatcher", optional = true }
 # trait 三面均已在 default 闭包（xray-core 非可选依赖），optional 仅控命名空间。
 xray-transport = { path = "../xray-transport", optional = true }
 xray-buf = { path = "../xray-buf", optional = true }
+# B5 第三步：协议插件族（P2 批次 A/B 已插件化的 15 族；ss 未插件化故不在列）。
+# 均已在 default 闭包（xray-core 依赖），optional 仅控命名空间，default 依赖图零变化。
+xray-proxy-socks = { path = "../xray-proxy-socks", optional = true }
+xray-proxy-http = { path = "../xray-proxy-http", optional = true }
+xray-proxy-dokodemo = { path = "../xray-proxy-dokodemo", optional = true }
+xray-proxy-trojan = { path = "../xray-proxy-trojan", optional = true }
+xray-proxy-tuic = { path = "../xray-proxy-tuic", optional = true }
+xray-proxy-anytls = { path = "../xray-proxy-anytls", optional = true }
+xray-proxy-hysteria = { path = "../xray-proxy-hysteria", optional = true }
+xray-proxy-wireguard = { path = "../xray-proxy-wireguard", optional = true }
+xray-proxy-tun = { path = "../xray-proxy-tun", optional = true }
+xray-proxy-dns = { path = "../xray-proxy-dns", optional = true }
+xray-proxy-vless = { path = "../xray-proxy-vless", optional = true }
+xray-proxy-vmess = { path = "../xray-proxy-vmess", optional = true }
+xray-proxy-freedom = { path = "../xray-proxy-freedom", optional = true }
+xray-proxy-blackhole = { path = "../xray-proxy-blackhole", optional = true }
+xray-proxy-loopback = { path = "../xray-proxy-loopback", optional = true }
 
 [features]
 default = ["mimalloc"]
@@ -59,7 +76,26 @@ dual-write = ["dep:xray-app-dispatcher", "xray-app-dispatcher/dispatcher-dual-wr
 # B5：xray-frame `Framework` 组合根启动路径 + handler 桥（默认关）。xray-frame 已是
 # 非 optional 依赖（T3.2a LogFacade），本 feature 只门控新路径代码（src/framework.rs
 # + run.rs 分叉），关闭时依赖图与生产行为零变化。
-framework-assembly = ["dep:xray-app-dispatcher", "dep:xray-transport", "dep:xray-buf"]
+framework-assembly = [
+    "dep:xray-app-dispatcher",
+    "dep:xray-transport",
+    "dep:xray-buf",
+    "dep:xray-proxy-socks",
+    "dep:xray-proxy-http",
+    "dep:xray-proxy-dokodemo",
+    "dep:xray-proxy-trojan",
+    "dep:xray-proxy-tuic",
+    "dep:xray-proxy-anytls",
+    "dep:xray-proxy-hysteria",
+    "dep:xray-proxy-wireguard",
+    "dep:xray-proxy-tun",
+    "dep:xray-proxy-dns",
+    "dep:xray-proxy-vless",
+    "dep:xray-proxy-vmess",
+    "dep:xray-proxy-freedom",
+    "dep:xray-proxy-blackhole",
+    "dep:xray-proxy-loopback",
+]
 
 [dev-dependencies]
 tempfile = "3"
