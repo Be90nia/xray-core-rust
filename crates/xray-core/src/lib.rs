@@ -50,6 +50,9 @@ pub mod inbound;
 pub mod instance;
 pub mod outbound;
 pub mod register;
+// T1.1：Instance::close 停机编排桥（feature 门 `shutdown-coordinator`，默认开；关=旧逆序循环）。
+#[cfg(feature = "shutdown-coordinator")]
+mod shutdown_bridge;
 pub mod router;
 // P3-2 对拍测试（cfg(test)）：旧解析面 vs 插件 build 管线逐字段相等。
 #[cfg(test)]

@@ -1354,7 +1354,8 @@ fn parse_mux_config(data: &[u8]) -> std::result::Result<(u32, Option<String>), S
 /// 解析 vless outbound settings JSON → VlessOutboundConfig。
 ///
 /// JSON 格式：`{ "vnext": [{ "address": "...", "port": 443, "users": [{ "id": "uuid" }] }] }`
-fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutboundConfig, String> {
+/// `pub(crate)`：P3-2 对拍测试（tests_config_parity）跨模块消费，语义零变化。
+pub(crate) fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutboundConfig, String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
     // Go infra/conf/vless.go:263-271 扁平形式：顶层 address 非空 → 以顶层
     // id/flow/encryption/level/email 构造 vnext[0]（覆盖显式 vnext 数组）。
@@ -2719,7 +2720,8 @@ fn build_legacy_dns_policy(
 /// `nonIPQuery`/`blockTypes`（迁移路径，与 rules 混用报错）。
 /// Rust 方言（保留）：`rule[]`（单数）、`rewriteServer` 对象（逐项覆盖）。
 /// 未知键 warn 留痕，不静默。
-fn build_dns_outbound_config(data: &[u8]) -> std::result::Result<xray_proxy_dns::Config, String> {
+/// `pub(crate)`：P3-2 对拍测试（tests_config_parity）跨模块消费，语义零变化。
+pub(crate) fn build_dns_outbound_config(data: &[u8]) -> std::result::Result<xray_proxy_dns::Config, String> {
     let v: serde_json::Value =
         serde_json::from_slice(data).map_err(|e| format!("dns outbound settings JSON: {e}"))?;
     warn_unknown_dns_outbound_keys(&v);
@@ -2862,7 +2864,8 @@ pub(crate) fn dns_idle_timeout_for(
 ///
 /// JSON 格式：`{ "server": "...", "server_port": 443, "sni": "...", "insecure": false, "password":
 /// "..." }`
-fn parse_anytls_config(
+/// `pub(crate)`：P3-2 对拍测试（tests_config_parity）跨模块消费，语义零变化。
+pub(crate) fn parse_anytls_config(
     data: &[u8],
 ) -> std::result::Result<xray_proxy_anytls::ClientConfig, String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
@@ -2975,7 +2978,8 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 /// - 单端点数组 `{"servers":[{"address":...,"port":...,"auth"|"password":...}]}`。
 ///
 /// `version` 字段对齐 Go `infra/conf/hysteria.go:20-22`：缺省 = 2，v1 硬报错。
-fn parse_hysteria_config(data: &[u8]) -> std::result::Result<(String, String, String), String> {
+/// `pub(crate)`：P3-2 对拍测试（tests_config_parity）跨模块消费，语义零变化。
+pub(crate) fn parse_hysteria_config(data: &[u8]) -> std::result::Result<(String, String, String), String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
     // 强制 version == 2（Go 端 hysteria.go:20-22 行为镜像）
     if let Some(ver) = v.get("version").and_then(|x| x.as_i64()) {
@@ -3593,7 +3597,8 @@ pub(crate) fn parse_wireguard_config(data: &[u8]) -> std::result::Result<DeviceC
 /// `LoopbackConfig`（infra/conf/loopback.go:9-12）；sniffing 复用 inbound 的
 /// [`crate::wiring::sniffing_request_from_json`] 转换（Go
 /// `proxyman.BuildSniffingRequest`，由 `Loopback.init` loopback.go:56-62 注入）。
-fn parse_loopback_config(data: &[u8]) -> std::result::Result<(String, SniffingRequest), String> {
+/// `pub(crate)`：P3-2 对拍测试（tests_config_parity）跨模块消费，语义零变化。
+pub(crate) fn parse_loopback_config(data: &[u8]) -> std::result::Result<(String, SniffingRequest), String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
     let inbound_tag = v
         .get("inboundTag")

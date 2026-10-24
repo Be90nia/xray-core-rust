@@ -5089,7 +5089,8 @@ fn apply_unix_abstract_padding(dest: &str) -> String {
 /// JSON 格式：`{"clients":[{"password":"...","email":""}]}` 或 `{"users":[...]}`。
 /// 对每个 client：`MemoryAccount::new(password)`（内部计算 hex(sha224)）→ MemoryUser → key_hash
 /// 入表。
-fn build_trojan_users(data: &[u8]) -> std::io::Result<HashMap<String, TrojanMemoryUser>> {
+/// `pub(crate)`：P3-2 对拍测试（tests_config_parity）跨模块消费，语义零变化。
+pub(crate) fn build_trojan_users(data: &[u8]) -> std::io::Result<HashMap<String, TrojanMemoryUser>> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("trojan inbound settings JSON: {e}")))?;
     let mut users = HashMap::new();
@@ -5122,7 +5123,9 @@ fn build_trojan_users(data: &[u8]) -> std::io::Result<HashMap<String, TrojanMemo
 ///   NUL padding），`host:port` → tcp；
 /// - dest 缺失/null 且 `type` 也缺省 → 报错（:196-198；不再回退 127.0.0.1:80）， 与 Go
 ///   一致：fallbacks 配置错误 = inbound 启动失败。
-fn build_trojan_fallbacks(data: &[u8]) -> std::io::Result<Option<std::sync::Arc<FallbackPolicy>>> {
+///
+/// `pub(crate)`：P3-2 对拍测试（tests_config_parity）跨模块消费，语义零变化。
+pub(crate) fn build_trojan_fallbacks(data: &[u8]) -> std::io::Result<Option<std::sync::Arc<FallbackPolicy>>> {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(data) else {
         return Ok(None);
     };
@@ -5282,7 +5285,8 @@ fn build_vless_fallbacks(
 /// `users`/`accounts` 同义（Go http.go:26-27 两个字段都收），users 优先。
 /// 字段名/零值默认对齐 Go
 /// infra/conf/http.go:25-30（Transparent→AllowTransparent、UserLevel→UserLevel）。
-fn parse_http_config(data: &[u8]) -> std::io::Result<HttpServerConfig> {
+/// `pub(crate)`：P3-2 对拍测试（tests_config_parity）跨模块消费，语义零变化。
+pub(crate) fn parse_http_config(data: &[u8]) -> std::io::Result<HttpServerConfig> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("http inbound settings JSON: {e}")))?;
     let mut config = HttpServerConfig::default();
@@ -5379,7 +5383,8 @@ fn parse_dokodemo_settings(data: &[u8]) -> std::io::Result<DokodemoInboundSettin
 /// 现代 VMess (AEAD) 不用 alterId：Go v26 已删除该字段，legacy 请求在服务端死于
 /// "invalid user"。本实现保留兼容字段但 alterId≠0 直接拒绝（fail-fast），
 /// 不静默忽略。`id` 解析为 `UUID` → `MemoryAccount::new(uuid)`。
-fn build_vmess_validator(data: &[u8]) -> std::io::Result<std::sync::Arc<VmessTimedUserValidator>> {
+/// `pub(crate)`：P3-2 对拍测试（tests_config_parity）跨模块消费，语义零变化。
+pub(crate) fn build_vmess_validator(data: &[u8]) -> std::io::Result<std::sync::Arc<VmessTimedUserValidator>> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("vmess inbound settings JSON: {e}")))?;
     let validator = VmessTimedUserValidator::new();
@@ -5805,7 +5810,8 @@ fn parse_naive_inbound_settings(
 /// infra/conf/wireguard.go inbound/outbound 共用 Build：base64/hex 密钥、
 /// allowedIPs 缺省全路由、address 缺省 bogon 双栈、PSK/keepAlive/level/email，
 /// bd ttni）；inbound 额外读 `port`（UDP 监听端口，缺省 51820）。
-fn parse_wireguard_inbound_config(data: &[u8]) -> std::io::Result<(DeviceConfig, u16)> {
+/// `pub(crate)`：P3-2 对拍测试（tests_config_parity）跨模块消费，语义零变化。
+pub(crate) fn parse_wireguard_inbound_config(data: &[u8]) -> std::io::Result<(DeviceConfig, u16)> {
     let config = crate::outbound::parse_wireguard_config(data)
         .map_err(|e| std::io::Error::other(format!("wireguard inbound settings: {e}")))?;
     let v: serde_json::Value = serde_json::from_slice(data)
@@ -6053,13 +6059,15 @@ impl Tun for TunPlaceholder {
 /// JSON 字段与默认值对齐 Go `infra/conf/tun.go::TunConfig.Build`
 /// （name/mtu/gateway/dns/userLevel/autoSystemRoutingTable/autoOutboundsInterface
 /// + Rust 扩展 idleTimeout）；解析实现在 `xray_proxy_tun::config`（全平台可测）。
+///
+/// `pub(crate)`：P3-2 对拍测试（tests_config_parity）跨模块消费，语义零变化。
 #[cfg(any(
     target_os = "linux",
     target_os = "android",
     target_os = "freebsd",
     target_os = "windows"
 ))]
-fn parse_tun_inbound_config(data: &[u8]) -> std::io::Result<StackOptions> {
+pub(crate) fn parse_tun_inbound_config(data: &[u8]) -> std::io::Result<StackOptions> {
     let mut opts = StackOptions::parse_json(data)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))?;
     opts.tun = Some(Box::new(TunPlaceholder));

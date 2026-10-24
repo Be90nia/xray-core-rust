@@ -306,6 +306,11 @@ impl Instance {
     ///
     /// 关闭后实例不可重启（与 Go 一致）。即使部分 feature close 失败，
     /// 仍会尝试关闭其余 feature，最终把所有错误聚合返回。
+    ///
+    /// 编排双路（feature `shutdown-coordinator`，默认开）：开 = udf
+    /// `ShutdownCoordinator` 编排——组件默认 5s 超时（对齐 xray-frame
+    /// `DEFAULT_SHUTDOWN_TIMEOUT`，P0-8）、panic 隔离、outcome 全量入报告、
+    /// 非 clean 行走 general 通道 warn；关 = 旧逆序循环（无超时/无隔离）。
     pub fn close(&mut self) -> Result<()> {
         let _guard = self.state_lock.lock();
         if !self.running {
@@ -314,25 +319,34 @@ impl Instance {
         self.running = false;
         // 取消 shutdown token，通知所有监听此 token 的连接/任务主动终止。
         self.shutdown_token.cancel();
-        let mut errors: Vec<FeatureError> = Vec::new();
-        // 逆序关闭：后注册的先关闭，模拟栈式生命周期。
-        for feat in self.features.iter().rev() {
-            if let Err(e) = feat.close() {
-                tracing::warn!(
-                    name = feat.feature_name(),
-                    error = %e,
-                    "feature close failed"
-                );
-                errors.push(e);
-            }
+
+        #[cfg(feature = "shutdown-coordinator")]
+        {
+            crate::shutdown_bridge::close_features(&self.features)
         }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            // 聚合错误：用第一个错误作主因，其余记入日志已记录。
-            // 设计权衡：返回 Vec<FeatureError> 会破坏单一错误型 API；用 anyhow!
-            // 字符串拼接丢失类型信息。这里折中返回第一个错误，已通过 tracing 记录全部。
-            Err(errors.into_iter().next().expect("non-empty errors"))
+
+        #[cfg(not(feature = "shutdown-coordinator"))]
+        {
+            let mut errors: Vec<FeatureError> = Vec::new();
+            // 逆序关闭：后注册的先关闭，模拟栈式生命周期。
+            for feat in self.features.iter().rev() {
+                if let Err(e) = feat.close() {
+                    tracing::warn!(
+                        name = feat.feature_name(),
+                        error = %e,
+                        "feature close failed"
+                    );
+                    errors.push(e);
+                }
+            }
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                // 聚合错误：用第一个错误作主因，其余记入日志已记录。
+                // 设计权衡：返回 Vec<FeatureError> 会破坏单一错误型 API；用 anyhow!
+                // 字符串拼接丢失类型信息。这里折中返回第一个错误，已通过 tracing 记录全部。
+                Err(errors.into_iter().next().expect("non-empty errors"))
+            }
         }
     }
 }
@@ -595,6 +609,140 @@ mod tests {
         inst.close().unwrap();
         // 二次 close 应短路返回 Ok（running=false）。
         inst.close().unwrap();
+    }
+    /// T1.1 panic 隔离：close 中 panic 的 feature 不再炸穿 close；其余 feature
+    /// 照常关闭；API 返回 CloseFailed（fail-visible）。
+    #[test]
+    fn close_panicking_feature_is_isolated_and_others_still_closed() {
+        let mut inst = Instance::new();
+        let close_a = Arc::new(AtomicUsize::new(0));
+        let close_c = Arc::new(AtomicUsize::new(0));
+        // 注册序 A → B(panic) → C；关闭序 C → B → A。
+        inst.add_feature(Arc::new(CountingFeature {
+            name: "close-panicking-a",
+            start_count: Arc::new(AtomicUsize::new(0)),
+            close_count: Arc::clone(&close_a),
+            start_fails: false,
+        }))
+        .unwrap();
+        inst.add_feature(Arc::new(PanickyClose)).unwrap();
+        inst.add_feature(Arc::new(CountingFeature {
+            name: "close-panicking-c",
+            start_count: Arc::new(AtomicUsize::new(0)),
+            close_count: Arc::clone(&close_c),
+            start_fails: false,
+        }))
+        .unwrap();
+        inst.start().unwrap();
+        let err = inst.close().unwrap_err();
+        assert!(matches!(err, FeatureError::CloseFailed { .. }), "{err}");
+        // panic 不阻断后续关闭：C（panic 前已关）与 A（panic 后仍关）各 1 次。
+        assert_eq!(close_c.load(Ordering::SeqCst), 1);
+        assert_eq!(close_a.load(Ordering::SeqCst), 1);
+    }
+
+    /// T1.1 panic 隔离载体：close 即 panic。
+    struct PanickyClose;
+
+    impl Feature for PanickyClose {
+        fn feature_name(&self) -> &'static str {
+            "panicky-close"
+        }
+
+        fn close(&self) -> Result<()> {
+            panic!("injected close panic");
+        }
+    }
+
+    /// T1.1 超时：挂死组件被协调器放弃等待（watchdog 线程照跑），API 返回
+    /// CloseFailed；短超时档由桥注入参数提供（生产恒 5s 默认）。
+    #[test]
+    fn close_timeout_abandons_stuck_feature_and_returns_err() {
+        let features: Vec<Arc<dyn Feature>> = vec![Arc::new(StuckClose)];
+        let err = crate::shutdown_bridge::close_features_with_timeout(
+            &features,
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(matches!(err, FeatureError::CloseFailed { .. }), "{err}");
+        // detach 的 watchdog 线程自行睡到期结束，测试不 join（libtest 语义）。
+    }
+        /// T1.1 报告可见性（注入面断言）：close() 编排的逐组件 outcome（clean=info、
+    /// 非 clean=warning）与汇总行内容严格断言（级别 + 文案双断言）。
+    ///
+    /// 取证面选择：general 通道是**进程级一通道一 sink、二次注册即拒且不可注销**
+    /// （udf `logx::ChannelRegistry`）——同二进制内任一测试经 app-log 占用 General
+    /// 槽后，全局捕获即失真（实测全量跑捕获 0 行、单跑假绿）。故断言直驱桥的
+    /// 报告注入面（与生产 close 同一编排实现，仅输出目标不同）：零全局依赖、
+    /// 无并发竞态、全量跑确定性。
+    #[cfg(feature = "shutdown-coordinator")]
+    #[test]
+    fn close_emits_per_component_outcomes_on_report_sink() {
+        use std::sync::Mutex as StdMutex;
+        let captured: Arc<StdMutex<Vec<(xray_common::log::Severity, String)>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let sink = {
+            let captured = Arc::clone(&captured);
+            move |severity: xray_common::log::Severity, message: String| {
+                captured
+                    .lock()
+                    .expect("capture ledger")
+                    .push((severity, message));
+            }
+        };
+        let mut inst = Instance::new();
+        inst.add_feature(Arc::new(CountingFeature {
+            name: "report-a",
+            start_count: Arc::new(AtomicUsize::new(0)),
+            close_count: Arc::new(AtomicUsize::new(0)),
+            start_fails: false,
+        }))
+        .unwrap();
+        inst.add_feature(Arc::new(PanickyClose)).unwrap();
+        inst.start().unwrap();
+        // 直驱报告注入面：与生产 close 同一编排实现（仅输出目标不同）。
+        let err = crate::shutdown_bridge::close_features_with_sink(
+            &inst.features,
+            std::time::Duration::from_secs(5),
+            &sink,
+        )
+        .unwrap_err();
+        assert!(matches!(err, FeatureError::CloseFailed { .. }), "{err}");
+
+        let captured = captured.lock().expect("capture ledger");
+        let has = |sev: xray_common::log::Severity, needle: &str| {
+            captured.iter().any(|(s, m)| *s == sev && m.contains(needle))
+        };
+        assert!(
+            has(xray_common::log::Severity::Info, "report-a stopped"),
+            "clean outcome info line missing: {captured:?}"
+        );
+        assert!(
+            has(xray_common::log::Severity::Warning, "panicky-close")
+                && has(xray_common::log::Severity::Warning, "close panicked (isolated)"),
+            "failed outcome warn line missing: {captured:?}"
+        );
+        assert!(
+            has(
+                xray_common::log::Severity::Info,
+                "instance close report: 2 components (1 stopped, 1 tainted)"
+            ),
+            "summary line missing: {captured:?}"
+        );
+    }
+
+    /// T1.1 超时载体：close 长睡（1s ≫ 50ms 测试超时档）。
+    struct StuckClose;
+
+    impl Feature for StuckClose {
+        fn feature_name(&self) -> &'static str {
+            "stuck-close"
+        }
+
+        fn close(&self) -> Result<()> {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            Ok(())
+        }
     }
 
     #[test]

@@ -25,7 +25,7 @@ use std::{
 use skeleton::{clock::SystemClock, config::StdEnv};
 use skeleton_infra::{
     fx::FxScope,
-    shutdown::{ShutdownCoordinator, ShutdownReport},
+    shutdown::{ComponentOutcome, OutcomeKind, ShutdownCoordinator, ShutdownReport},
 };
 
 use crate::{
@@ -118,19 +118,25 @@ impl Framework {
     }
 
     /// 优雅停机三段（坑约束 #6 停机链唯一出口）。消费所有权——重复 shutdown
-    /// 编译期阻止。返回插件停机闭包全量报告；未启动链 = 空报告（合法，
-    /// `is_clean()==true`）。
+    /// 编译期阻止。返回插件停机闭包全量报告；fx 排空（第③段）超时则在报告
+    /// 末尾追加 `fx_drain` 行（`OutcomeKind::TimedOut`）——`is_clean()` 因此
+    /// 同时覆盖插件闭包与 fx 排空两面（T1.3）；未启动且排空干净 = 空报告
+    /// （合法，`is_clean()==true`）。
     pub async fn shutdown(mut self) -> ShutdownReport {
         // ① 拒新 spawn（闸关；在途不受影响，插件 stop 闭包可安全发停机信号）。
         self.fx.close();
         // ② 插件停机闭包：注册序 = 逆启动序，同步快收（异步排空隔离在第③段）。
-        let report = self.started.take().map(StartedPlugins::tear_down).unwrap_or_default();
+        let mut report = self.started.take().map(StartedPlugins::tear_down).unwrap_or_default();
         // ③ 在途排空：abort + 超时兜底（剩余集 Drop=abort，零残留）。超时留痕
-        // fail-visible（报告类型不含 fx 面；插件闭包超时档 = coordinator 默认档，
-        // P0-8：`FrameworkOptions.shutdown_timeout` 透传见 `FrameworkBuilder::new`）。
+        // fail-visible 且并入报告末行（T1.3：is_clean() 覆盖 fx 面；插件闭包
+        // 超时档 = coordinator 默认档，P0-8：`FrameworkOptions.shutdown_timeout`
+        // 透传见 `FrameworkBuilder::new`）。
         if self.fx.shutdown_timeout(self.shutdown_timeout).await.is_err() {
             LogFacade::new("assembly", vec![])
                 .warn("framework shutdown: fx drain timed out; residual tasks force-aborted");
+            report
+                .per_component
+                .push(ComponentOutcome { name: "fx_drain".into(), kind: OutcomeKind::TimedOut });
         }
         report
     }
@@ -282,5 +288,43 @@ mod tests {
             Ok(_) => panic!("cap 0 must fail"),
         };
         assert!(matches!(err, PluginError::Full { cap: 0 }), "{err}");
+    }
+
+    /// T1.3：fx 排空超时必须并入返回报告。hold = future 内 block_in_place 阻塞段
+    /// （poll 中不可丢弃，abort_all 打不掉 = 「不可 abort 段依赖自终止」契约面；
+    /// block_in_place 让出 worker → driver 迁移，tokio 计时器存活有保障）。
+    /// 50ms 超时档必触发 → 报告携带 `fx_drain` TimedOut 行、`is_clean()==false`
+    /// （并入前该分支只 warn 不入报告，排空超时被漏报）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_report_carries_fx_drain_timeout() {
+        let fw = Framework::builder(opts(4, Some(Duration::from_millis(50))))
+            .expect("cap 4")
+            .build()
+            .expect("empty");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        fw.scope()
+            .spawn(async move {
+                tokio::task::block_in_place(|| {
+                    let _ = entered_tx.send(());
+                    // 阻塞 300ms ≫ 50ms 超时档：确定性超时；shutdown 返回后
+                    // runtime 收尾等它退出（测试墙钟 ~0.3s，无 flake 面）。
+                    std::thread::sleep(Duration::from_millis(300));
+                })
+            })
+            .expect("spawn before shutdown");
+        // 握手：send 与 sleep 同一 poll 内——收到即保证任务已入阻塞段（并行负载
+        // 下「未被 poll 即被 abort_all 清场」的竞态被此闸封死）。
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .expect("hold task entered blocking section in time")
+            .ok();
+        let report = fw.shutdown().await;
+        assert!(!report.is_clean(), "fx drain timeout must taint the report");
+        let row = report
+            .per_component
+            .iter()
+            .find(|o| o.name == "fx_drain")
+            .expect("fx drain outcome must be reported");
+        assert_eq!(row.kind, OutcomeKind::TimedOut);
     }
 }
