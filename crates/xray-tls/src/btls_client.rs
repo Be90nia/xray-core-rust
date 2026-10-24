@@ -1825,6 +1825,15 @@ mod tests {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         use xray_transport::connection::TcpConnection;
 
+        // 进程级 session cache（tls_session_cache::CACHE）key = SNI 字符串、
+        // 同 key 后写覆盖；全量并发下其他 "localhost" 握手测试（utls/btls_server/
+        // stress 等）的 NST 回调会在 ①→② 窗口内外来 session 覆盖本测试条目，
+        // ② 带外来 PSK 发 0-RTT 必被服务端拒（Some(false) 非 None；6 进程并发
+        // 复现 3/6 红）。唯一 SNI = 独占 cache key，测试间不共享；未知 SNI 走
+        // SniCertResolver 兜底（reject_unknown=false → certs[0]），握手不受影响。
+        // 断言不放宽。
+        const SNI: &str = "early-data-roundtrip-reserved.test";
+
         let timeout = tokio::time::Duration::from_secs(60);
         tokio::time::timeout(timeout, async {
             // 服务端 A：0-RTT 开（stateful + 64K）；服务端 B：缺省（无状态 ticketer）。
@@ -1867,17 +1876,10 @@ mod tests {
             // ① 首连（无缓存）→ full handshake，不得提供 0-RTT。
             let s1 = tokio::spawn(serve(lsn.clone(), acceptor_ed.clone()));
             let tcp1 = TcpConnection::new(tokio::net::TcpStream::connect(addr).await.unwrap());
-            let mut c1 = BtlsConn::connect_with_alpn(
-                tcp1,
-                "localhost",
-                Fingerprint::Chrome,
-                None,
-                None,
-                None,
-                true,
-            )
-            .await
-            .unwrap();
+            let mut c1 =
+                BtlsConn::connect_with_alpn(tcp1, SNI, Fingerprint::Chrome, None, None, None, true)
+                    .await
+                    .unwrap();
             assert_eq!(c1.early_data_accepted(), None, "首连无缓存：不应有 0-RTT 终态");
             c1.write_all(b"PING1").await.unwrap();
             let mut buf = [0u8; 5];
@@ -1891,17 +1893,10 @@ mod tests {
             // ② warm cache 重连（0-RTT 服务端）→ 停窗 → 首写 early data → ACCEPTED。
             let s2 = tokio::spawn(serve(lsn.clone(), acceptor_ed.clone()));
             let tcp2 = TcpConnection::new(tokio::net::TcpStream::connect(addr).await.unwrap());
-            let mut c2 = BtlsConn::connect_with_alpn(
-                tcp2,
-                "localhost",
-                Fingerprint::Chrome,
-                None,
-                None,
-                None,
-                true,
-            )
-            .await
-            .unwrap();
+            let mut c2 =
+                BtlsConn::connect_with_alpn(tcp2, SNI, Fingerprint::Chrome, None, None, None, true)
+                    .await
+                    .unwrap();
             c2.write_all(b"PING2").await.unwrap();
             let mut buf = [0u8; 5];
             c2.read_exact(&mut buf).await.unwrap();
@@ -1915,17 +1910,10 @@ mod tests {
             // ③ 同 SNI 拨无 0-RTT 服务端 → PSK 解不开 → REJECTED → 重发保数据。
             let s3 = tokio::spawn(serve(lsn, acceptor_plain));
             let tcp3 = TcpConnection::new(tokio::net::TcpStream::connect(addr).await.unwrap());
-            let mut c3 = BtlsConn::connect_with_alpn(
-                tcp3,
-                "localhost",
-                Fingerprint::Chrome,
-                None,
-                None,
-                None,
-                true,
-            )
-            .await
-            .unwrap();
+            let mut c3 =
+                BtlsConn::connect_with_alpn(tcp3, SNI, Fingerprint::Chrome, None, None, None, true)
+                    .await
+                    .unwrap();
             c3.write_all(b"PING3").await.unwrap();
             let mut buf = [0u8; 5];
             c3.read_exact(&mut buf).await.unwrap();
