@@ -866,3 +866,12 @@ pub(crate) fn tun_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResult {
         ctx.send_through,
     )
 }
+
+/// 非 linux 平台的 `tun` 拒绝（原 match 内 cfg(not(...)) 臂一行错误字面量：
+/// 错误变体与文案逐字搬迁，平台门控与 arm_builders 表注册一致）。
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+pub(crate) fn tun_entry<'a, 'b>(_ctx: OutboundCtx<'a, 'b>) -> OutboundResult {
+    Err(BuildError::Unsupported(
+        "TUN outbound is only supported on Linux/Android/FreeBSD".to_string(),
+    ))
+}

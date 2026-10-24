@@ -74,9 +74,6 @@ use xray_transport::{
 };
 use xray_transport_hysteria::quinn_adapter::QuinnListenerFactory;
 
-// T4.2 phase 1：协议臂构造函数（match 臂 → 一行 builder 调用）。
-use crate::arm_builders::inbound as builders;
-
 /// accept 错误退避：fd 耗尽（EMFILE/ENFILE）时睡眠 500ms 再重试——否则 accept 立即
 /// 失败-continue 构成忙旋 + warn 日志洪水（audit 高并发 HC-2，意图对齐 0bb4176d 与
 /// ws register.rs 样板）。判别用大小写不敏感 `contains("too many")`：样板的小写匹配
@@ -3907,10 +3904,8 @@ pub(crate) async fn spawn_one_inbound(
     let settings =
         xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref());
 
-    // T4.2 phase 2：arm-lookup 开启时构造走查表（默认关）。表与 match 到达同一
-    // phase 1 构造函数（等价性测试：arm_builders::tests）；未命中回落 match，
-    // wildcard warn 语义不变。
-    #[cfg(feature = "arm-lookup")]
+    // T4.2 phase 4：构造走表（唯一路径，旧 match 已删）。表值转发 phase 1 同一
+    // 构造函数；表未命中 = 未支持协议，显式 warn 跳过（不静默构造）。
     if let Some(builder) = crate::arm_builders::lookup_inbound_builder(ib.entry.kind.as_str()) {
         return builder(crate::arm_builders::InboundCtx {
             ib,
@@ -3923,70 +3918,12 @@ pub(crate) async fn spawn_one_inbound(
         })
         .await;
     }
-
-    match_one_inbound(ib, ohm, policy, shutdown_token, &addr, &settings, api).await
-}
-
-/// phase 1 抽臂后的 match 本体（arm-lookup 关闭路径；`arm_builders::tests` 经
-/// [`spawn_one_inbound`] 与表查路径对照）。
-async fn match_one_inbound(
-    ib: &BuiltInbound,
-    ohm: Arc<SimpleOhm>,
-    policy: Option<Arc<dyn xray_features::policy::PolicyManager>>,
-    shutdown_token: CancellationToken,
-    addr: &str,
-    settings: &xray_transport::dialer::StreamSettings,
-    api: Option<&InboundRuntime>,
-) -> std::io::Result<Option<JoinHandle<()>>> {
-    match ib.entry.kind.as_str() {
-        "socks" => {
-            builders::build_socks_inbound(ib, ohm, policy, shutdown_token, &addr, &settings).await
-        },
-        "mixed" => {
-            builders::build_mixed_inbound(ib, ohm, policy, shutdown_token, &addr, &settings).await
-        },
-        "vless" => builders::build_vless_inbound(ib, ohm, policy, shutdown_token, &addr).await,
-        "trojan" => builders::build_trojan_inbound(ib, ohm, policy, shutdown_token, &addr).await,
-        "vmess" => builders::build_vmess_inbound(ib, ohm, policy, shutdown_token, &addr).await,
-        "http" => {
-            builders::build_http_inbound(ib, ohm, policy, shutdown_token, &addr, &settings).await
-        },
-        "dokodemo" => {
-            builders::build_dokodemo_inbound(ib, ohm, shutdown_token, &addr, &settings).await
-        },
-        // shadowsocks inbound：SsInbound + serve_ss accept loop
-        "shadowsocks" => {
-            builders::build_shadowsocks_inbound(ib, ohm, policy, shutdown_token, &addr, api).await
-        },
-        // hysteria inbound：HysteriaInboundHandler impl InboundHandler（rxw：接 dispatcher）
-        "hysteria" | "hysteria2" => {
-            builders::build_hysteria_inbound(ib, ohm, shutdown_token, &addr).await
-        },
-        // anytls inbound：AnytlsInboundHandler impl InboundHandler
-        "anytls" => builders::build_anytls_inbound(ib, shutdown_token, &addr).await,
-        // tuic inbound：QUIC listener + auth + Connect → dispatcher/router 分发
-        "tuic" => builders::build_tuic_inbound(ib, ohm, shutdown_token, &addr).await,
-        // naive inbound：TLS + h2 CONNECT（naiveproxy 服务端语义，bd 88vp）
-        "naive" => builders::build_naive_inbound(ib, ohm, shutdown_token, &addr).await,
-        // wireguard inbound：WireguardInboundHandler impl InboundHandler
-        "wireguard" => builders::build_wireguard_inbound(ib, ohm, shutdown_token).await,
-        // dns inbound：UDP+TCP listener → handle_packet/handle_conn
-        "dns" => builders::build_dns_inbound(ib, policy, shutdown_token, &addr, &settings).await,
-        // loopback inbound：LoopbackHandler 注册（outbound-only，start/close no-op）
-        "loopback" => builders::build_loopback_inbound(ib).await,
-        // blackhole inbound：accept 连接后静默关闭/写 403 后关闭
-        "blackhole" => builders::build_blackhole_inbound(ib, shutdown_token, &addr).await,
-        // freedom inbound：accept 连接后 dial 预定义目标并双向转发
-        "freedom" => builders::build_freedom_inbound(ib, ohm, shutdown_token, &addr).await,
-        other => {
-            tracing::warn!(
-                tag = %ib.tag,
-                protocol = %other,
-                "inbound protocol not yet supported, skipping"
-            );
-            Ok(None)
-        },
-    }
+    tracing::warn!(
+        tag = %ib.tag,
+        protocol = %ib.entry.kind,
+        "inbound protocol not yet supported, skipping"
+    );
+    Ok(None)
 }
 
 /// listen 地址是否为 unix domain socket 路径。

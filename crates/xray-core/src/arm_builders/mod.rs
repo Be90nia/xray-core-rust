@@ -1,13 +1,14 @@
-//! 协议臂构造函数（T4.2 五阶段法 phase 1 抽臂 + phase 2 构造侧查表）。
+//! 协议臂构造函数 + 构造表（T4.2 五阶段法 phase 1 抽臂 / phase 2 建表 /
+//! phase 4 删旧 match）。
 //!
 //! phase 1：`crate::inbound::spawn_one_inbound` 与 `crate::outbound::build_protocol_handler`
 //! 的 match 协议臂构造逻辑原样搬迁至此，臂内只留一行调用。入参/出参类型、错误
 //! 变体、日志文案、注册顺序、失败语义与拆分前逐字段一致（行为零变化）。
 //!
-//! phase 2：本模块持有**构造表** `(协议名, 方向) → builder fn`。表本体始终编译
-//! （等价性测试在默认构建即可运行）；feature `arm-lookup`（默认关）只门控
-//! 构造入口的**切换点**——开 = 入口先查表，未命中/关闭走原 match。表值适配器
-//! 只做参数解包，转发到 phase 1 同一构造函数，两路到达同一实现。
+//! phase 4：本模块的**构造表** `(协议名, 方向) → builder fn` 是唯一构造路径——
+//! 入口经表 lookup 命中即构造，未命中即显式失败（inbound warn+skip、outbound
+//! `BuildError::Unsupported`），旧 match 与回退 feature 已删。表值适配器只做
+//! 参数解包，转发到 phase 1 同一构造函数。
 //!
 //! ## 表实现选型：BTreeMap + 显式注册（不用 xray-frame PluginRegistry）
 //!
@@ -37,24 +38,14 @@ use xray_proxy_freedom::DomainStrategy;
 
 use crate::outbound::BuildError;
 
-// 适配器模块级 dead_code 豁免：适配器仅表与 cfg(test) 等价性测试消费
-// （理由同查表形态节；phase 1 构造函数有生产调用方，allow 对其惰性）。
-#[allow(dead_code)]
 pub(crate) mod inbound;
-#[allow(dead_code)]
 pub(crate) mod outbound;
 
-// ============ 查表形态（T4.2 phase 2） ============
-//
-// dead_code 豁免纪律（lib.rs deny(warnings)：显式 allow + 理由）：下列表装置
-// 仅 feature `arm-lookup` 切换点与 cfg(test) 等价性测试消费，默认 lib 构建
-// 无生产调用方；表须随默认构建编译，等价性测试才能在两 feature 态下运行
-// （任务书：默认走 match，不删臂不改默认）。
+// ============ 构造表（T4.2 phase 2 建表 / phase 4 唯一构造路径） ============
 
 /// inbound 构造上下文：spawn_one_inbound 前置逻辑（tun 早退/sockopt 硬错/unix
-/// 分派/port 解析/addr+settings 派生）产物按原样打包，表路径与 match 路径消费
-/// 同一前置换算结果。
-#[allow(dead_code)] // 见上：默认态仅 cfg(test) 消费
+/// 分派/port 解析/addr+settings 派生）产物按原样打包，入口与表值消费同一份
+/// 前置换算结果。
 pub(crate) struct InboundCtx<'a> {
     pub(crate) ib: &'a BuiltInbound,
     pub(crate) ohm: Arc<SimpleOhm>,
@@ -67,16 +58,13 @@ pub(crate) struct InboundCtx<'a> {
 
 /// inbound 构造 future（async fn 匿名 future 无法作 fn 指针值，统一装箱；
 /// 构造属启动路径非数据面热路径）。
-#[allow(dead_code)] // 默认态仅 cfg(test) 消费（表装置豁免，理由见查表形态节）
 pub(crate) type InboundBuildFut<'a> =
     Pin<Box<dyn Future<Output = std::io::Result<Option<JoinHandle<()>>>> + Send + 'a>>;
 
-#[allow(dead_code)] // 默认态仅 cfg(test) 消费（表装置豁免）
 pub(crate) type InboundBuilder = for<'a> fn(InboundCtx<'a>) -> InboundBuildFut<'a>;
 
 /// outbound 构造上下文：build_protocol_handler 臂前公共前解析产物 + 装配参数
-/// 原样打包（各协议消费子集，未消费字段随 ctx 丢弃，与 match 臂未消费局部一致）。
-#[allow(dead_code)] // 默认态仅 cfg(test) 消费（表装置豁免）
+/// 原样打包（各协议消费子集，未消费字段随 ctx 丢弃，与拆分前臂未消费局部一致）。
 pub(crate) struct OutboundCtx<'a, 'b> {
     pub(crate) ob: &'a BuiltOutbound,
     pub(crate) loopback_sink: Option<Arc<dyn xray_proxy_loopback::LoopbackSink>>,
@@ -90,17 +78,14 @@ pub(crate) struct OutboundCtx<'a, 'b> {
     pub(crate) send_through: Option<&'a xray_transport::system_dialer::SendThroughSpec>,
 }
 
-#[allow(dead_code)] // 默认态仅 cfg(test) 消费（表装置豁免）
 #[allow(clippy::type_complexity)]
 pub(crate) type OutboundResult = std::result::Result<
     (Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>),
     BuildError,
 >;
 
-#[allow(dead_code)] // 默认态仅 cfg(test) 消费（表装置豁免）
 pub(crate) type OutboundBuilder = for<'a, 'b> fn(OutboundCtx<'a, 'b>) -> OutboundResult;
 
-#[allow(dead_code)] // 默认态仅 cfg(test) 消费（表装置豁免）
 static INBOUND_TABLE: LazyLock<BTreeMap<&'static str, InboundBuilder>> = LazyLock::new(|| {
     let mut m: BTreeMap<&'static str, InboundBuilder> = BTreeMap::new();
     m.insert("socks", inbound::socks_entry);
@@ -111,8 +96,8 @@ static INBOUND_TABLE: LazyLock<BTreeMap<&'static str, InboundBuilder>> = LazyLoc
     m.insert("http", inbound::http_entry);
     m.insert("dokodemo", inbound::dokodemo_entry);
     m.insert("shadowsocks", inbound::shadowsocks_entry);
-    // match 臂为 `"hysteria" | "hysteria2"` 双键——表同样双键指向同一适配器，
-    // 否则 feature 开启时 hysteria2 配置会漏查回落 wildcard。
+    // 原 match 臂为 `"hysteria" | "hysteria2"` 双键——表同样双键指向同一适配器，
+    // 否则 hysteria2 配置会漏查落到「未支持协议」分支。
     m.insert("hysteria", inbound::hysteria_entry);
     m.insert("hysteria2", inbound::hysteria_entry);
     m.insert("anytls", inbound::anytls_entry);
@@ -126,7 +111,6 @@ static INBOUND_TABLE: LazyLock<BTreeMap<&'static str, InboundBuilder>> = LazyLoc
     m
 });
 
-#[allow(dead_code)] // 默认态仅 cfg(test) 消费（表装置豁免）
 static OUTBOUND_TABLE: LazyLock<BTreeMap<&'static str, OutboundBuilder>> = LazyLock::new(|| {
     let mut m: BTreeMap<&'static str, OutboundBuilder> = BTreeMap::new();
     m.insert("freedom", outbound::freedom_entry);
@@ -146,20 +130,18 @@ static OUTBOUND_TABLE: LazyLock<BTreeMap<&'static str, OutboundBuilder>> = LazyL
     m.insert("http", outbound::http_entry);
     m.insert("naive", outbound::naive_entry);
     m.insert("dokodemo", outbound::dokodemo_entry);
-    // tun 与 match 臂同 cfg 门控：非 linux 平台表内同样无键（两侧对称缺席）。
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+    // tun 恒有键：非 linux 平台的值是拒绝臂（错误变体/文案与删除前 cfg(not) 臂
+    // 逐字一致），与 linux 的构造臂同样经表分派。
     m.insert("tun", outbound::tun_entry);
     m
 });
 
-/// inbound 构造入口查表（feature `arm-lookup` 切换点消费；表常编译供等价性测试）。
-#[allow(dead_code)] // 默认态仅 cfg(test) 消费（表装置豁免）
+/// inbound 构造入口查表（未命中 = 未支持协议，入口显式 warn+skip）。
 pub(crate) fn lookup_inbound_builder(protocol: &str) -> Option<InboundBuilder> {
     INBOUND_TABLE.get(protocol).copied()
 }
 
-/// outbound 构造入口查表（feature `arm-lookup` 切换点消费；表常编译供等价性测试）。
-#[allow(dead_code)] // 默认态仅 cfg(test) 消费（表装置豁免）
+/// outbound 构造入口查表（未命中 = 未支持协议，入口显式 `Unsupported` 错误）。
 pub(crate) fn lookup_outbound_builder(protocol: &str) -> Option<OutboundBuilder> {
     OUTBOUND_TABLE.get(protocol).copied()
 }

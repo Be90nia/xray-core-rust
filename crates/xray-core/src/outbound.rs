@@ -56,9 +56,6 @@ use xray_proxy_vless::VlessOutboundConfig;
 use xray_proxy_wireguard::DeviceConfig;
 use xray_transport::{dialer::StreamSettings, link::Link};
 
-// T4.2 phase 1：协议臂构造函数（match 臂 → 一行 builder 调用）。
-use crate::arm_builders::outbound as builders;
-
 /// Dispatcher → LoopbackSink 桥接。
 ///
 /// `DefaultDispatcher` 定义在 `xray-app-dispatcher`，`LoopbackSink` trait 在
@@ -646,7 +643,7 @@ fn outbound_mux_udp443_skip(ob: &BuiltOutbound) -> bool {
 /// - `handler`: 注册到 Ohm 的 DispatchHandler
 /// - `dial_bridge_ref`: 如果是 DialBridge 类型，保留 Arc 引用以便 Phase 2 设置代理链
 #[allow(clippy::type_complexity)] // 返回三组件装配形态
-fn build_protocol_handler(
+pub(crate) fn build_protocol_handler(
     ob: &BuiltOutbound,
     loopback_sink: Option<Arc<dyn LoopbackSink>>,
     mux_bridges: &mut Vec<(Arc<MuxBridge>, Option<String>)>,
@@ -672,10 +669,8 @@ fn build_protocol_handler(
     xray_transport::dialer::StreamSettings::validate_sockopt_json(ob.stream_settings_json.as_ref())
         .map_err(|e| BuildError::Parse(e.to_string()))?;
 
-    // T4.2 phase 2：arm-lookup 开启时构造走查表（默认关）。表与 match 到达同一
-    // phase 1 构造函数（等价性测试：arm_builders::tests）；未命中回落 match，
-    // 未知协议 Unsupported 语义不变。
-    #[cfg(feature = "arm-lookup")]
+    // T4.2 phase 4：构造走表（唯一路径，旧 match 已删）。表值转发 phase 1 同一
+    // 构造函数；表未命中 = 未支持协议，显式 Unsupported（不静默构造）。
     if let Some(builder) = crate::arm_builders::lookup_outbound_builder(ob.entry.kind.as_str()) {
         return builder(crate::arm_builders::OutboundCtx {
             ob,
@@ -689,167 +684,7 @@ fn build_protocol_handler(
             send_through: send_through.as_ref(),
         });
     }
-
-    match_protocol_handler(
-        ob,
-        loopback_sink,
-        mux_bridges,
-        dns,
-        inbound_default_rules,
-        policy_manager,
-        proxy_chain_tag,
-        target_strategy,
-        send_through,
-    )
-}
-
-/// phase 1 抽臂后的 match 本体（arm-lookup 关闭路径；`arm_builders::tests` 经此
-/// 与表查路径对照——该函数不经 feature 门，两态下均为真 match）。
-#[allow(clippy::too_many_arguments)] // 9 参直译拆分前 prelude+match 形态（tuic_frame_relay 先例）
-pub(crate) fn match_protocol_handler(
-    ob: &BuiltOutbound,
-    loopback_sink: Option<Arc<dyn LoopbackSink>>,
-    mux_bridges: &mut Vec<(Arc<MuxBridge>, Option<String>)>,
-    dns: Option<&Arc<xray_app_dns::DnsService>>,
-    // 入站 tag → 默认 final rule 类型（freedom 默认规则按入站协议名推导，
-    // Go getDefaultFinalRule；API 单构建路径传空表 = 无默认规则）
-    inbound_default_rules: &std::collections::HashMap<String, xray_proxy_freedom::DefaultRuleType>,
-    // sm80③/czwu：session policy manager（Go freedom.go:393/222-225）。
-    // freedom 按 settings.userLevel 查档位，其余协议固定 level 0。
-    policy_manager: Option<&dyn xray_features::policy::PolicyManager>,
-    proxy_chain_tag: Option<String>,
-    target_strategy: Option<DomainStrategy>,
-    // owned：臂内 `send_through.as_ref()` 文本与拆分前逐字一致（勿改 & 形参）。
-    send_through: Option<xray_transport::system_dialer::SendThroughSpec>,
-) -> std::result::Result<
-    (Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>),
-    BuildError,
-> {
-    match ob.entry.kind.as_str() {
-        "freedom" => builders::build_freedom_outbound(
-            ob,
-            proxy_chain_tag,
-            target_strategy,
-            dns,
-            inbound_default_rules,
-            policy_manager,
-            send_through.as_ref(),
-        ),
-        "vless" => builders::build_vless_outbound(
-            ob,
-            proxy_chain_tag,
-            target_strategy,
-            dns,
-            policy_manager,
-            send_through.as_ref(),
-        ),
-        "trojan" => builders::build_trojan_outbound(
-            ob,
-            proxy_chain_tag,
-            target_strategy,
-            dns,
-            policy_manager,
-            send_through.as_ref(),
-        ),
-        "blackhole" => builders::build_blackhole_outbound(ob),
-        "socks" => builders::build_socks_outbound(
-            ob,
-            proxy_chain_tag,
-            target_strategy,
-            dns,
-            policy_manager,
-            send_through.as_ref(),
-        ),
-        "mux" => builders::build_mux_outbound(ob, mux_bridges),
-        "vmess" => builders::build_vmess_outbound(
-            ob,
-            proxy_chain_tag,
-            target_strategy,
-            dns,
-            policy_manager,
-            send_through.as_ref(),
-        ),
-        "shadowsocks" => builders::build_shadowsocks_outbound(
-            ob,
-            proxy_chain_tag,
-            target_strategy,
-            dns,
-            policy_manager,
-            send_through.as_ref(),
-        ),
-        "hysteria" => builders::build_hysteria_outbound(
-            ob,
-            proxy_chain_tag,
-            target_strategy,
-            dns,
-            policy_manager,
-            send_through.as_ref(),
-        ),
-        "anytls" => builders::build_anytls_outbound(
-            ob,
-            proxy_chain_tag,
-            target_strategy,
-            dns,
-            policy_manager,
-            send_through.as_ref(),
-        ),
-        "tuic" => builders::build_tuic_outbound(
-            ob,
-            proxy_chain_tag,
-            target_strategy,
-            dns,
-            policy_manager,
-            send_through.as_ref(),
-        ),
-        "wireguard" => builders::build_wireguard_outbound(
-            ob,
-            proxy_chain_tag,
-            target_strategy,
-            dns,
-            policy_manager,
-            send_through.as_ref(),
-        ),
-        "dns" => builders::build_dns_outbound(ob, dns, policy_manager),
-        "loopback" => builders::build_loopback_outbound(ob, loopback_sink),
-        "http" => builders::build_http_outbound(
-            ob,
-            proxy_chain_tag,
-            target_strategy,
-            dns,
-            policy_manager,
-            send_through.as_ref(),
-        ),
-        "naive" => builders::build_naive_outbound(
-            ob,
-            proxy_chain_tag,
-            target_strategy,
-            dns,
-            policy_manager,
-            send_through.as_ref(),
-        ),
-        "dokodemo" => builders::build_dokodemo_outbound(
-            ob,
-            proxy_chain_tag,
-            target_strategy,
-            dns,
-            policy_manager,
-            send_through.as_ref(),
-        ),
-        #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
-        "tun" => builders::build_tun_outbound(
-            ob,
-            proxy_chain_tag,
-            target_strategy,
-            dns,
-            policy_manager,
-            send_through.as_ref(),
-        ),
-        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
-        "tun" => Err(BuildError::Unsupported(
-            "TUN outbound is only supported on Linux/Android/FreeBSD".to_string(),
-        )),
-        _ => Err(BuildError::Unsupported(ob.entry.kind.clone())),
-    }
+    Err(BuildError::Unsupported(ob.entry.kind.clone()))
 }
 
 /// Mux outbound handler（mbc/nww）。

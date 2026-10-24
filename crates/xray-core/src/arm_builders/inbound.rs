@@ -60,7 +60,7 @@ pub(crate) async fn build_socks_inbound(
     settings: &xray_transport::dialer::StreamSettings,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let inbound_sockopts = settings.socket_options();
-    let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone())
+    let listener = InboundTcpListener::bind(addr, inbound_sockopts.clone())
         .await?
         .with_tcpmask_manager(inbound_tcpmask(settings)?);
     let config = Arc::new(parse_socks_server_config(&ib.entry.data)?);
@@ -100,7 +100,7 @@ pub(crate) async fn build_mixed_inbound(
         .as_ref()
         .map(|pm| pm.policy_for_level(socks_cfg.user_level).timeout.connection_idle)
         .unwrap_or(xray_features::policy::TimeoutPolicy::default().connection_idle);
-    let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone())
+    let listener = InboundTcpListener::bind(addr, inbound_sockopts.clone())
         .await?
         .with_tcpmask_manager(inbound_tcpmask(settings)?);
     tracing::info!(tag = %ib.tag, addr = %addr, "mixed (socks+http) inbound listening");
@@ -175,7 +175,7 @@ pub(crate) async fn build_vless_inbound(
             .await
     } else if settings.security == "reality" {
         // REALITY：server_tls 验证 → Verified 走 VLESS；Invalid fallback 到 dest
-        let listener = InboundTcpListener::bind(&addr, settings.socket_options())
+        let listener = InboundTcpListener::bind(addr, settings.socket_options())
             .await?
             // tcpSettings.header 伪装头（Go hub.go:85-95 authConfig；无 header
             // → None 零开销；serve 层在 reality 解包后应用，hub.go:106-120）。
@@ -194,7 +194,7 @@ pub(crate) async fn build_vless_inbound(
         // VLESS fallbacks：Go napfb（name→alpn→path→dest+xver）
         let fallbacks = build_vless_fallbacks(&ib.entry.data)?;
         // tcpSettings.header 伪装头（Go hub.go:85-95；无 header → None 零开销）。
-        let listener = InboundTcpListener::bind(&addr, settings.socket_options())
+        let listener = InboundTcpListener::bind(addr, settings.socket_options())
             .await?
             .with_header_auth(xray_transport::headers::conn::auth_from_json(
                 settings.transport_json.as_ref(),
@@ -265,7 +265,7 @@ pub(crate) async fn build_trojan_inbound(
         // REALITY 证书校验必败，trojan header 永远读不到。对齐 Go：
         // trojan inbound 收到的 iConn 已是 *reality.Conn。）
         let reality = parse_reality_config(&settings)?;
-        let listener = InboundTcpListener::bind(&addr, settings.socket_options())
+        let listener = InboundTcpListener::bind(addr, settings.socket_options())
             .await?
             // tcpSettings.header 伪装头（Go hub.go:85-95 authConfig；无 header
             // → None 零开销；serve 层在 reality 解包后应用，hub.go:106-120）。
@@ -288,7 +288,7 @@ pub(crate) async fn build_trojan_inbound(
         })))
     } else {
         let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
-        let listener = InboundTcpListener::bind(&addr, settings.socket_options())
+        let listener = InboundTcpListener::bind(addr, settings.socket_options())
             .await?
             .with_header_auth(xray_transport::headers::conn::auth_from_json(
                 settings.transport_json.as_ref(),
@@ -346,7 +346,7 @@ pub(crate) async fn build_vmess_inbound(
             .await
     } else {
         let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
-        let listener = InboundTcpListener::bind(&addr, settings.socket_options())
+        let listener = InboundTcpListener::bind(addr, settings.socket_options())
             .await?
             .with_header_auth(xray_transport::headers::conn::auth_from_json(
                 settings.transport_json.as_ref(),
@@ -376,7 +376,7 @@ pub(crate) async fn build_http_inbound(
     // 无 policy 配置块）时对齐 Go SessionDefault 兜底 60s
     // （features/policy/policy.go:130），不再无限时。
     let handshake_timeout = handshake_timeout_for(&policy, config.user_level);
-    let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone())
+    let listener = InboundTcpListener::bind(addr, inbound_sockopts.clone())
         .await?
         .with_tcpmask_manager(inbound_tcpmask(settings)?);
     tracing::info!(tag = %ib.tag, addr = %addr, "http inbound listening");
@@ -413,7 +413,7 @@ pub(crate) async fn build_dokodemo_inbound(
     }
     let mut handles = Vec::new();
     if settings.allow_tcp {
-        let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone())
+        let listener = InboundTcpListener::bind(addr, inbound_sockopts.clone())
             .await?
             .with_tcpmask_manager(tcpmask);
         tracing::info!(tag = %ib.tag, addr = %addr, dest = ?dest, tls = tls.is_some(), "dokodemo TCP inbound listening");
@@ -529,7 +529,7 @@ pub(crate) async fn build_shadowsocks_inbound(
         .await;
     }
     let inbound_sockopts = settings.socket_options();
-    let listener = InboundTcpListener::bind(&addr, inbound_sockopts.clone())
+    let listener = InboundTcpListener::bind(addr, inbound_sockopts.clone())
         .await?
         // finalmask.tcp（Go tcp/hub.go:50-54 ListenTCP 语义；wire 最外层，ss 握手之前）
         .with_tcpmask_manager(inbound_tcpmask(&settings)?);
@@ -673,7 +673,7 @@ pub(crate) async fn build_dns_inbound(
     let (handler, outbound) = parse_dns_inbound_config(&ib.entry.data, &ib.tag, dns_idle)?;
     let inbound = Arc::new(DnsInbound::new(&ib.tag, handler, outbound));
     let udp = UdpSocket::bind(addr).await?;
-    let tcp = InboundTcpListener::bind(&addr, inbound_sockopts.clone())
+    let tcp = InboundTcpListener::bind(addr, inbound_sockopts.clone())
         .await?
         .with_tcpmask_manager(inbound_tcpmask(settings)?);
     tracing::info!(tag = %ib.tag, addr = %addr, "dns inbound listening (UDP+TCP)");

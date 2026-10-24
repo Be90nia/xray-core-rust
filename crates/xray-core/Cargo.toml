@@ -11,10 +11,6 @@ rust-version.workspace = true
 # default-features = false 避开 runtime/pool 默认档拖入运行时面。
 default = ["shutdown-coordinator"]
 shutdown-coordinator = ["dep:udf-skeleton-infra", "dep:xray-frame"]
-# T4.2 phase 2：构造侧查表（默认关）。开 = inbound/outbound 构造入口先经
-# arm_builders 查表分派（表与 match 到达同一 phase 1 构造函数；等价性测试
-# arm_builders::tests）。默认仍走 match，臂零删改、默认行为零变化。
-arm-lookup = []
 
 [dependencies]
 xray-common = { path = "../xray-common" }
