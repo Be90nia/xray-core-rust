@@ -319,7 +319,7 @@ async fn hysteria_quic_loopback_udp_relay_roundtrip() {
         full3.extend_from_slice(&[0u8; 4]);
         full3.extend_from_slice(&buf[..fn2]);
         let m = UdpMessage::parse(&full3).expect("server parse frag");
-        if let Some(done) = server_df.feed(&m) {
+        if let Some(done) = server_df.feed(m) {
             defragged = Some(done);
         }
     }

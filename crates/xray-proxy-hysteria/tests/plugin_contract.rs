@@ -119,7 +119,8 @@ async fn hysteria_outbound_assembles_and_parses_config() {
     let mut framework = Framework::builder(framework_options())
         .expect("registry cap")
         .with_config(hysteria_outbound_section(json!({
-            "address": "us1.example.com:443",
+            "address": "us1.example.com",
+            "port": 443,
             "auth": "tok-456"
         })))
         .register(Arc::clone(&plugin) as Arc<dyn Plugin>)
@@ -131,7 +132,7 @@ async fn hysteria_outbound_assembles_and_parses_config() {
     assert!(report.is_clean(), "健康链停机报告必须干净");
 
     let config = plugin.built_outbound().expect("built outbound");
-    assert_eq!(config.server_addr, "us1.example.com:443");
+    assert_eq!(config.server_addr, "us1.example.com:443", "address:port 合成（Go 语义）");
     assert_eq!(config.server_name, "us1.example.com", "SNI 默认 = address host 部分");
     assert_eq!(config.auth, "tok-456");
     assert_eq!(config.alpn, vec!["hysteria".to_string(), "h3".to_string()]);

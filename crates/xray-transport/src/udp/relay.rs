@@ -24,6 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use skeleton_infra::fx::{FxScope, Spawned};
 use tokio::{
     net::UdpSocket,
     sync::{Mutex, mpsc},
@@ -46,7 +47,7 @@ pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 struct Session {
     sock: Arc<UdpSocket>,
     reader: JoinHandle<()>,
-    timer: JoinHandle<()>,
+    timer: Spawned<()>,
     last_refresh: Arc<parking_lot::Mutex<Instant>>,
 }
 
@@ -60,6 +61,10 @@ pub struct UdpRelay {
     sessions: Mutex<HashMap<SocketAddr, Session>>,
     /// 空闲超时；`Duration::ZERO` = 禁用空闲淘汰（永久持有）。
     idle_timeout: Duration,
+    /// B6（bd t975）：per-dest idle timer 唯一托管口（坑约束 5）。reader 为
+    /// 数据面泵热路径豁免（约束⑫）；scope 随 relay drop 兜底 abort，
+    /// 显式停机走 [`Self::close`]。
+    fx: Arc<FxScope>,
 }
 
 impl UdpRelay {
@@ -76,6 +81,7 @@ impl UdpRelay {
             self_weak: weak.clone(),
             sessions: Mutex::new(HashMap::new()),
             idle_timeout,
+            fx: Arc::new(FxScope::new()),
         })
     }
 
@@ -120,6 +126,7 @@ impl UdpRelay {
                     Weak::clone(&self.self_weak),
                     self.idle_timeout,
                     Arc::clone(&last_refresh),
+                    &self.fx,
                 );
                 sessions
                     .insert(dest, Session { sock: Arc::clone(&sock), reader, timer, last_refresh });
@@ -176,12 +183,14 @@ fn spawn_session(
     relay: Weak<UdpRelay>,
     idle_timeout: Duration,
     last_refresh: Arc<parking_lot::Mutex<Instant>>,
-) -> (JoinHandle<()>, JoinHandle<()>) {
+    scope: &FxScope,
+) -> (JoinHandle<()>, Spawned<()>) {
     let last_refresh_for_reader = Arc::clone(&last_refresh);
     let sock_for_timer = Arc::clone(&sock);
 
     // reader: 持续 recv，recv 出错 → 退出；每次成功 recv 刷新 last_refresh。
     // reader 退出时不主动改 map——交给 timer task 统一回收（避免并发删除）。
+    // 数据面泵热路径豁免（约束⑫）：recv→channel 转发循环不加托管口。
     let reader = tokio::spawn(async move {
         let mut buf = vec![0u8; RECV_BUF];
         loop {
@@ -201,28 +210,33 @@ fn spawn_session(
     // 继续睡；真超时后统一回收：升级 weak → 锁 map → 若 entry 仍是本 sock 则移除
     // + `abort reader`（reader 任务内本地 sock Arc 立即 drop，关闭 socket）。
     // `Arc::ptr_eq` 防 close→新建同名 dest 后被旧 timer 误删（移除前 ptr 比对）。
-    let timer = tokio::spawn(async move {
-        loop {
-            let since = last_refresh.lock().elapsed();
-            if since >= idle_timeout {
-                break;
+    // 闸关不可达：scope 归 UdpRelay 独占，无 close 调用（停机走 close/timer 自回收）。
+    let timer = scope
+        .spawn(async move {
+            loop {
+                let since = last_refresh.lock().elapsed();
+                if since >= idle_timeout {
+                    break;
+                }
+                tokio::time::sleep(idle_timeout - since).await;
             }
-            tokio::time::sleep(idle_timeout - since).await;
-        }
-        if let Some(relay) = relay.upgrade() {
-            let mut sessions = relay.sessions.lock().await;
-            // 仅当 entry 仍是本 session 的 sock 时才回收——防 close→新建同名
-            // dest 后被旧 timer 误删（移除前 ptr 比对）。
-            let entry = match sessions.get(&dest) {
-                Some(entry) if Arc::ptr_eq(&entry.sock, &sock_for_timer) => sessions.remove(&dest),
-                _ => None,
-            };
-            drop(sessions);
-            if let Some(entry) = entry {
-                entry.reader.abort();
+            if let Some(relay) = relay.upgrade() {
+                let mut sessions = relay.sessions.lock().await;
+                // 仅当 entry 仍是本 session 的 sock 时才回收——防 close→新建同名
+                // dest 后被旧 timer 误删（移除前 ptr 比对）。
+                let entry = match sessions.get(&dest) {
+                    Some(entry) if Arc::ptr_eq(&entry.sock, &sock_for_timer) => {
+                        sessions.remove(&dest)
+                    },
+                    _ => None,
+                };
+                drop(sessions);
+                if let Some(entry) = entry {
+                    entry.reader.abort();
+                }
             }
-        }
-    });
+        })
+        .expect("internal FxScope is never closed");
 
     (reader, timer)
 }

@@ -262,22 +262,27 @@ pub fn encode_chunk_stream<W: Write>(
 
     // 分块编码
     let mut start = 0usize;
+    let mut frame = Vec::with_capacity(DEFAULT_PAYLOAD_SIZE);
     while start < data.len() {
         let end = (start + payload_chunk_size).min(data.len());
         let chunk = &data[start..end];
-        write_one_chunk(writer, chunk, cipher, nonce_gen, size_parser, global_padding)?;
+        write_one_chunk(writer, chunk, cipher, nonce_gen, size_parser, global_padding, &mut frame)?;
         start = end;
     }
 
     // 写入终止 chunk：seal 空数据（带 tag）。NoTerminationSignal 时跳过。
     if !no_termination {
-        write_one_chunk(writer, &[], cipher, nonce_gen, size_parser, global_padding)?;
+        write_one_chunk(writer, &[], cipher, nonce_gen, size_parser, global_padding, &mut frame)?;
         writer.flush()?;
     }
     Ok(())
 }
 
 /// 写单个 chunk：[size_field][encrypted][padding]。
+///
+/// `frame` 由调用方跨 chunk 复用（零中间 Vec：sealed/padding 追加进 frame，
+/// size_field 前缀预留后回填，整 chunk 单次 `write_all`——对齐 dispatcher.rs
+/// pump 侧同名函数形态）。
 fn write_one_chunk<W: Write>(
     writer: &mut W,
     data: &[u8],
@@ -285,31 +290,30 @@ fn write_one_chunk<W: Write>(
     nonce_gen: &mut dyn ChunkNonce,
     size_parser: &mut dyn SizeParser,
     global_padding: bool,
+    frame: &mut Vec<u8>,
 ) -> std::io::Result<()> {
+    // SHAKE128 流消费顺序：next_padding_len → encode（与 decode 侧对称）
     let nonce = nonce_gen.next();
-    let sealed = cipher
-        .seal(&nonce, &[], data)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-
+    let sb = size_parser.size_bytes();
     let padding_size = if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
-    let encrypted_size = sealed.len(); // = data.len() + TAG_SIZE
-    let size_value = u16::try_from(encrypted_size + padding_size).map_err(|_| {
+    frame.clear();
+    frame.resize(sb, 0);
+    cipher
+        .seal_into(&nonce, &[], data, frame)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    if padding_size > 0 {
+        use rand::RngCore;
+        let start = frame.len();
+        frame.resize(start + padding_size, 0);
+        // 随机 padding（ ponytail: 用 rand 直接，不引 crate）
+        rand::rng().fill_bytes(&mut frame[start..]);
+    }
+    // size 字段 u16：超出即显式报错（静默回退 u16::MAX 会致收端按 65535 读、错位）
+    let size_value = u16::try_from(frame.len() - sb).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "vmess chunk size exceeds u16")
     })?;
-
-    let sb = size_parser.size_bytes();
-    let mut size_field = vec![0u8; sb];
-    size_parser.encode(size_value, &mut size_field);
-    writer.write_all(&size_field)?;
-    writer.write_all(&sealed)?;
-    if padding_size > 0 {
-        let mut pad = vec![0u8; padding_size];
-        // 随机 padding（ ponytail: 用 rand 直接，不引 crate）
-        use rand::RngCore;
-        rand::rng().fill_bytes(&mut pad);
-        writer.write_all(&pad)?;
-    }
-    Ok(())
+    size_parser.encode(size_value, &mut frame[..sb]);
+    writer.write_all(frame)
 }
 
 // ============================================================================
@@ -390,6 +394,10 @@ pub fn decode_chunk_stream<R: Read>(
     global_padding: bool,
 ) -> std::io::Result<Vec<u8>> {
     let mut output = Vec::new();
+    // size_field/ciphertext 跨 chunk 复用；open_in_place 就地解密，消每 chunk
+    // 的 size_field/ciphertext/plaintext 三个中间分配
+    let mut size_field = Vec::new();
+    let mut ciphertext = Vec::new();
     loop {
         // SHAKE128 流顺序对齐 Go auth.go:127-131 readSize：先 NextPaddingLen 再 Decode。
         // ShakeSizeParser 的 SHAKE128 流必须 encoder/decoder 同序消费，否则流错位。
@@ -398,7 +406,8 @@ pub fn decode_chunk_stream<R: Read>(
             if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
 
         let sb = size_parser.size_bytes();
-        let mut size_field = vec![0u8; sb];
+        size_field.clear();
+        size_field.resize(sb, 0);
         match read_size_field_or_eof(reader, &mut size_field) {
             Ok(true) => {},
             Ok(false) => {
@@ -418,16 +427,14 @@ pub fn decode_chunk_stream<R: Read>(
 
         let ciphertext_size = usize::from(total_size).saturating_sub(padding_size);
 
-        let mut ciphertext = vec![0u8; usize::from(total_size)];
+        ciphertext.clear();
+        ciphertext.resize(usize::from(total_size), 0);
         reader.read_exact(&mut ciphertext)?;
-
-        // padding 跟在 ciphertext 之后
-        let ciphertext_only = &ciphertext[..ciphertext_size];
 
         // 终止 chunk：ciphertext 是 seal([]) → 解密后为空
         let nonce = nonce_gen.next();
         let plaintext = cipher
-            .open(&nonce, &[], ciphertext_only)
+            .open_in_place(&nonce, &[], &mut ciphertext[..ciphertext_size])
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
         // 终止 chunk：解密后 plaintext 为空 → 流结束
@@ -435,7 +442,7 @@ pub fn decode_chunk_stream<R: Read>(
         if plaintext.is_empty() {
             return Ok(output);
         }
-        output.extend_from_slice(&plaintext);
+        output.extend_from_slice(plaintext);
     }
 }
 
@@ -519,7 +526,9 @@ pub fn encode_single_chunk<W: Write>(
     size_parser: &mut dyn SizeParser,
     global_padding: bool,
 ) -> std::io::Result<()> {
-    write_one_chunk(writer, data, cipher, nonce_gen, size_parser, global_padding)
+    // 单次调用无法跨包复用，就地构帧；仍消 sealed/size_field/pad 三个中间 Vec
+    let mut frame = Vec::with_capacity(DEFAULT_PAYLOAD_SIZE);
+    write_one_chunk(writer, data, cipher, nonce_gen, size_parser, global_padding, &mut frame)
 }
 
 // ============================================================================
@@ -558,22 +567,42 @@ pub async fn encode_chunk_stream_async<W: AsyncWrite + Unpin>(
     }
 
     let mut start = 0usize;
+    let mut frame = Vec::with_capacity(DEFAULT_PAYLOAD_SIZE);
     while start < data.len() {
         let end = (start + payload_chunk_size).min(data.len());
         let chunk = &data[start..end];
-        write_one_chunk_async(writer, chunk, cipher, nonce_gen, size_parser, global_padding)
-            .await?;
+        write_one_chunk_async(
+            writer,
+            chunk,
+            cipher,
+            nonce_gen,
+            size_parser,
+            global_padding,
+            &mut frame,
+        )
+        .await?;
         start = end;
     }
 
     if !no_termination {
-        write_one_chunk_async(writer, &[], cipher, nonce_gen, size_parser, global_padding).await?;
+        write_one_chunk_async(
+            writer,
+            &[],
+            cipher,
+            nonce_gen,
+            size_parser,
+            global_padding,
+            &mut frame,
+        )
+        .await?;
         writer.flush().await?;
     }
     Ok(())
 }
 
 /// 写单个 chunk（async 版）：[size_field][encrypted][padding]。
+///
+/// `frame` 由调用方跨 chunk 复用，语义与同步版 [`write_one_chunk`] 一致。
 async fn write_one_chunk_async<W: AsyncWrite + Unpin>(
     writer: &mut W,
     data: &[u8],
@@ -581,30 +610,29 @@ async fn write_one_chunk_async<W: AsyncWrite + Unpin>(
     nonce_gen: &mut dyn ChunkNonce,
     size_parser: &mut dyn SizeParser,
     global_padding: bool,
+    frame: &mut Vec<u8>,
 ) -> std::io::Result<()> {
+    // SHAKE128 流消费顺序：next_padding_len → encode（与 decode 侧对称）
     let nonce = nonce_gen.next();
-    let sealed = cipher
-        .seal(&nonce, &[], data)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-
+    let sb = size_parser.size_bytes();
     let padding_size = if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
-    let encrypted_size = sealed.len();
-    let size_value = u16::try_from(encrypted_size + padding_size).map_err(|_| {
+    frame.clear();
+    frame.resize(sb, 0);
+    cipher
+        .seal_into(&nonce, &[], data, frame)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    if padding_size > 0 {
+        use rand::RngCore;
+        let start = frame.len();
+        frame.resize(start + padding_size, 0);
+        // 随机 padding（ ponytail: 用 rand 直接，不引 crate）
+        rand::rng().fill_bytes(&mut frame[start..]);
+    }
+    let size_value = u16::try_from(frame.len() - sb).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "vmess chunk size exceeds u16")
     })?;
-
-    let sb = size_parser.size_bytes();
-    let mut size_field = vec![0u8; sb];
-    size_parser.encode(size_value, &mut size_field);
-    writer.write_all(&size_field).await?;
-    writer.write_all(&sealed).await?;
-    if padding_size > 0 {
-        let mut pad = vec![0u8; padding_size];
-        use rand::RngCore;
-        rand::rng().fill_bytes(&mut pad);
-        writer.write_all(&pad).await?;
-    }
-    Ok(())
+    size_parser.encode(size_value, &mut frame[..sb]);
+    writer.write_all(frame).await
 }
 
 /// 从 reader 异步读取 chunk 流并解码，返回拼接后的所有明文。
@@ -624,12 +652,16 @@ pub async fn decode_chunk_stream_async<R: AsyncRead + Unpin>(
     global_padding: bool,
 ) -> std::io::Result<Vec<u8>> {
     let mut output = Vec::new();
+    // size_field/ciphertext 跨 chunk 复用；open_in_place 就地解密（与同步版一致）
+    let mut size_field = Vec::new();
+    let mut ciphertext = Vec::new();
     loop {
         let padding_size =
             if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
 
         let sb = size_parser.size_bytes();
-        let mut size_field = vec![0u8; sb];
+        size_field.clear();
+        size_field.resize(sb, 0);
         match read_size_field_or_eof_async(reader, &mut size_field).await {
             Ok(true) => {},
             Ok(false) => {
@@ -647,20 +679,19 @@ pub async fn decode_chunk_stream_async<R: AsyncRead + Unpin>(
 
         let ciphertext_size = usize::from(total_size).saturating_sub(padding_size);
 
-        let mut ciphertext = vec![0u8; usize::from(total_size)];
+        ciphertext.clear();
+        ciphertext.resize(usize::from(total_size), 0);
         reader.read_exact(&mut ciphertext).await?;
-
-        let ciphertext_only = &ciphertext[..ciphertext_size];
 
         let nonce = nonce_gen.next();
         let plaintext = cipher
-            .open(&nonce, &[], ciphertext_only)
+            .open_in_place(&nonce, &[], &mut ciphertext[..ciphertext_size])
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
         if plaintext.is_empty() {
             return Ok(output);
         }
-        output.extend_from_slice(&plaintext);
+        output.extend_from_slice(plaintext);
     }
 }
 
@@ -1060,5 +1091,247 @@ mod tests {
         let decoded = decode_chunk_stream(&mut &buf[..], &cipher_r, &mut nr, &mut sp_r, true)
             .expect("decode");
         assert_eq!(decoded, data);
+    }
+
+    /// golden wire 对拍（改前/改后判别器）：encode_chunk_stream 输出必须逐字节等于
+    /// 分配式 seal 版本的产物（改前锁定）——in-place/组帧单写不得改 wire。
+    /// nonce 为确定性流（固定 IV），无 pad 场景输出可复现；padding 随机字节面由
+    /// roundtrip 测试保障。
+    #[test]
+    fn golden_wire_unchanged() {
+        let cipher = make_cipher();
+        let mut nonce_gen = make_nonce_gen();
+        let mut sp = PlainSizeParser;
+        let mut buf = Vec::new();
+        encode_chunk_stream(
+            &mut buf,
+            b"golden wire bytes",
+            &cipher,
+            &mut nonce_gen,
+            &mut sp,
+            false,
+            false,
+        )
+        .expect("encode");
+        let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "0021369c0c0754a1c339a23a916ac1b7d844d7d1bf1e1137a0f5a7418f6750aa03a5950010ec7f18424f3905ca37eb170e0fb1e44a",
+            "wire bytes drifted from pre-change allocation-based encoder"
+        );
+    }
+
+    // ===== B7 判别器：组帧单写 + 分配预算（改前/改后硬指标）=====
+
+    /// 线程局部分配计数探针：`measure` 区间内只计当前线程的 alloc/realloc 调用，
+    /// libtest 并发下其他测试线程不计数。TLS 析构期 with 会 panic，分配器内必须
+    /// try_with（分配器内 panic = abort）。
+    mod alloc_probe {
+        use std::{
+            alloc::{GlobalAlloc, Layout, System},
+            cell::Cell,
+        };
+
+        thread_local! {
+            static COUNT: Cell<u64> = const { Cell::new(0) };
+            static ARMED: Cell<bool> = const { Cell::new(false) };
+        }
+
+        fn bump() {
+            let _ = ARMED.try_with(|a| {
+                if a.get() {
+                    let _ = COUNT.try_with(|c| c.set(c.get() + 1));
+                }
+            });
+        }
+
+        pub struct CountingAlloc;
+        unsafe impl GlobalAlloc for CountingAlloc {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                bump();
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) }
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                bump();
+                unsafe { System.realloc(ptr, layout, new_size) }
+            }
+        }
+
+        #[global_allocator]
+        static GLOBAL: CountingAlloc = CountingAlloc;
+
+        /// 统计 `f` 执行期间本线程的 alloc/realloc 次数（Drop guard 保证 panic 时复位）。
+        pub fn measure<T>(f: impl FnOnce() -> T) -> (u64, T) {
+            struct Guard;
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    ARMED.with(|a| a.set(false));
+                }
+            }
+            ARMED.with(|a| a.set(true));
+            COUNT.with(|c| c.set(0));
+            let _guard = Guard;
+            let out = f();
+            (COUNT.with(|c| c.get()), out)
+        }
+    }
+
+    /// write_all 计数 sink（零分配；write/flush 消费丢弃，仅记账）。
+    struct CountingWriter {
+        calls: std::cell::Cell<usize>,
+    }
+    impl CountingWriter {
+        fn new() -> Self {
+            Self { calls: std::cell::Cell::new(0) }
+        }
+    }
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn write_all(&mut self, _buf: &[u8]) -> std::io::Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 判别器（A3 组帧单写）：每 chunk 恰好 1 次 `write_all`（改前 pad=0 为 2 次、
+    /// pad>0 为 3 次）。wire 字节等价由 roundtrip + golden 测试保障。
+    #[test]
+    fn encode_chunk_stream_single_write_per_chunk() {
+        let cipher = make_cipher();
+        let mut nonce_gen = make_nonce_gen();
+        let mut sp = PlainSizeParser;
+        let mut w = CountingWriter::new();
+
+        // PlainSizeParser max_padding_hint=64 → payload_chunk_size = 8192-16-2-64 = 8110；
+        // 24430B = 3 满 chunk + 1 尾 chunk(100B) + 1 终止 chunk
+        let payload = vec![7u8; 8110 * 3 + 100];
+        encode_chunk_stream(&mut w, &payload, &cipher, &mut nonce_gen, &mut sp, false, false)
+            .expect("encode");
+        assert_eq!(w.calls.get(), 5, "3 full + 1 tail + 1 termination, one write_all each");
+
+        // pad>0 场景（Shake parser + global_padding）：改前 3 写/chunk，改后恒 1
+        let mut nonce_gen2 = make_nonce_gen();
+        let mut sp2 = ShakeSizeParserAdapter::new(&[0x11u8; 16]);
+        let mut w2 = CountingWriter::new();
+        encode_chunk_stream(
+            &mut w2,
+            b"padded payload",
+            &cipher,
+            &mut nonce_gen2,
+            &mut sp2,
+            true,
+            false,
+        )
+        .expect("encode padded");
+        assert_eq!(w2.calls.get(), 2, "1 data chunk + 1 termination");
+    }
+
+    /// 判别器（A1 写侧分配预算）：稳态每 chunk 仅 nonce 1 次分配（ChunkNonce trait
+    /// 返回 Vec，pub API 面限制）+ frame 首次分配。改前每 chunk 4 次
+    /// （sealed + size_field + pad + nonce）。
+    #[test]
+    fn encode_chunk_stream_alloc_budget() {
+        let cipher = make_cipher();
+        let mut nonce_gen = make_nonce_gen();
+        let mut sp = PlainSizeParser;
+        let mut w = CountingWriter::new();
+
+        let payload = vec![9u8; 8110 * 4]; // 4 数据 chunk + 1 终止
+        let (allocs, ()) = alloc_probe::measure(|| {
+            encode_chunk_stream(&mut w, &payload, &cipher, &mut nonce_gen, &mut sp, false, false)
+                .expect("encode");
+        });
+        // 构成：frame with_capacity 1 次 + nonce 5 次（4 数据 + 1 终止）
+        assert_eq!(allocs, 6, "1 frame + 5 nonce; got {allocs}");
+    }
+
+    /// 判别器（A1 读侧分配预算）：size_field/ciphertext 复用 + open_in_place 就地，
+    /// 消每 chunk 的 plaintext 中间分配。改前每 chunk 3 次（size_field+ciphertext+
+    /// plaintext）+ nonce；改后稳态 nonce 1 次/chunk + 缓冲首次分配。
+    #[test]
+    fn decode_chunk_stream_alloc_budget() {
+        // 先正常 encode 出 wire（measure 区间外）
+        let cipher_w = make_cipher();
+        let mut nonce_gen = make_nonce_gen();
+        let mut sp_w = PlainSizeParser;
+        let payload = vec![5u8; 8110 * 2 + 300];
+        let mut buf = Vec::new();
+        encode_chunk_stream(&mut buf, &payload, &cipher_w, &mut nonce_gen, &mut sp_w, false, false)
+            .expect("encode");
+
+        let cipher_r = Aes128Gcm::new(&[0x42u8; 16]).expect("aes");
+        let mut nr = make_nonce_gen();
+        let mut sp_r = PlainSizeParser;
+        let mut src = &buf[..];
+        let (allocs, decoded) = alloc_probe::measure(|| {
+            decode_chunk_stream(&mut src, &cipher_r, &mut nr, &mut sp_r, false).expect("decode")
+        });
+        assert_eq!(decoded.len(), payload.len());
+        // 构成（实测锁定）：nonce 4 次（3 数据 + 1 终止）+ size_field/ciphertext
+        // 复用缓冲首次各 1 + output Vec 增长 3 次（8110→16220→16520 doubling）
+        assert_eq!(allocs, 9, "4 nonce + 2 buffers + 3 output growth; got {allocs}");
+    }
+
+    // ===== NF-1 判别器：vmess UDP poll_write 单包构帧分配预算（改前/改后）=====
+
+    /// 判别器（NF-1）：UDP 单包构帧的每包堆分配数。
+    ///
+    /// 改前（`VmessUdpConn::poll_write`）：每包 `Vec::with_capacity` 新建 frame，
+    /// 加上 `encode_single_chunk` 的内部 frame 与 `nonce.next()` 各 1 → 3 alloc/包。
+    /// 改后：持久 frame、`next_ref()`、`dispatcher::encode_frame_into` → 0 alloc/包。
+    ///
+    /// 与 TCP 泵 `write_one_chunk` 是同一构帧函数，wire 不变由
+    /// `dispatcher::tests::write_one_chunk_wire_parity` 与 UDP 包边界测试钉住。
+    #[test]
+    fn udp_single_packet_frame_alloc_budget() {
+        const PACKETS: u64 = 8;
+        let cipher = make_cipher();
+        let payload = [7u8; 1200];
+
+        // 改前形态：每包新建 frame + 分配式构帧
+        let run_before = |nonce: &mut ChunkNonceAdapter, sp: &mut PlainSizeParser| {
+            let mut frame = Vec::with_capacity(payload.len() + 96);
+            encode_single_chunk(&mut frame, &payload, &cipher, nonce, sp, false).expect("encode");
+            std::hint::black_box(frame);
+        };
+        let mut nonce = make_nonce_gen();
+        let mut sp = PlainSizeParser;
+        run_before(&mut nonce, &mut sp); // 预热：一次性内部缓冲分配落在计数窗外
+        let (before, ()) = alloc_probe::measure(|| {
+            for _ in 0..PACKETS {
+                run_before(&mut nonce, &mut sp);
+            }
+        });
+        assert_eq!(before, PACKETS * 3, "改前 3 alloc/包（frame+内部 frame+nonce）; got {before}");
+
+        // 改后形态：持久 frame + next_ref + 共享构帧
+        let mut frame = Vec::with_capacity(payload.len() + 96);
+        let mut nonce = ChunkNonceGenerator::new(&[0xAAu8; 16], 12);
+        let mut sp = PlainSizeParser;
+        let run_after =
+            |frame: &mut Vec<u8>, nonce: &mut ChunkNonceGenerator, sp: &mut PlainSizeParser| {
+                let n = nonce.next_ref();
+                crate::dispatcher::encode_frame_into(frame, &payload, &cipher, n, sp, false)
+                    .expect("encode");
+            };
+        run_after(&mut frame, &mut nonce, &mut sp); // 预热（同上）
+        let (after, ()) = alloc_probe::measure(|| {
+            for _ in 0..PACKETS {
+                run_after(&mut frame, &mut nonce, &mut sp);
+            }
+        });
+        assert_eq!(after, 0, "改后 0 alloc/包（持久缓冲 + next_ref）; got {after}");
     }
 }

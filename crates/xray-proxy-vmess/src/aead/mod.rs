@@ -470,17 +470,46 @@ pub fn open_vmess_aead_header<R: std::io::Read>(
 // AuthIDDecoderHolder（对应 Go `aead/authid.go::AuthIDDecoderHolder`）
 // ============================================================================
 
+// 测试专用：AuthID key schedule 构造计数（线程局部，避开并行测试串扰）。
+//
+// 钉住"AES key schedule 只在 `add_user` 建一次"，防止退化回每次匹配重算。
+#[cfg(test)]
+thread_local! {
+    static DECODER_INITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// AuthID 单块解密器 —— crate 内唯一的 AES key schedule 构造口。
+///
+/// 存在理由是"可数"：构造一次 = 建一次 key schedule。`AuthIDDecoderItem::new`
+/// 建的那一次由 `holder_builds_decoder_once_per_user_not_per_match` 钉住；
+/// 若有人把构造挪进 `decode`（每次匹配重建），计数立刻偏离。
+struct AuthIdCipher(Aes128);
+
+impl AuthIdCipher {
+    fn new(decoder_key: &[u8; 16]) -> Self {
+        let derived = kdf16(decoder_key, &[consts::AUTH_ID_ENCRYPTION_KEY]);
+        #[cfg(test)]
+        DECODER_INITS.with(|c| c.set(c.get() + 1));
+        Self(Aes128::new(GenericArray::from_slice(&derived)))
+    }
+
+    fn decrypt_block(&self, data: &mut [u8; 16]) {
+        let mut block = GenericArray::clone_from_slice(data);
+        self.0.decrypt_block(&mut block);
+        data.copy_from_slice(&block);
+    }
+}
+
 /// 单个用户的 AuthID 解码器项。
 pub struct AuthIDDecoderItem {
     decoder_key: [u8; 16],
-    aes: Aes128,
+    aes: AuthIdCipher,
 }
 
 impl AuthIDDecoderItem {
     /// 创建解码器项。`decoder_key` 是用户的 cmd_key。
     pub fn new(decoder_key: [u8; 16]) -> Self {
-        let derived = kdf16(&decoder_key, &[consts::AUTH_ID_ENCRYPTION_KEY]);
-        let aes = Aes128::new(GenericArray::from_slice(&derived));
+        let aes = AuthIdCipher::new(&decoder_key);
         Self { decoder_key, aes }
     }
 
@@ -488,14 +517,11 @@ impl AuthIDDecoderItem {
     ///
     /// 对应 Go `AuthIDDecoder.Decode`。调用方应检查前 12 字节的 CRC32 是否等于后 4 字节。
     pub fn decode(&self, auth_id: &[u8; 16]) -> (i64, u32, i32, [u8; 16]) {
-        let mut block = GenericArray::clone_from_slice(auth_id);
-        self.aes.decrypt_block(&mut block);
-        let data: [u8; 16] = block.into();
-        let t = i64::from_be_bytes([
-            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-        ]);
-        let rand_val = i32::from_be_bytes([data[8], data[9], data[10], data[11]]);
-        let crc = u32::from_be_bytes([data[12], data[13], data[14], data[15]]);
+        let mut data = *auth_id;
+        self.aes.decrypt_block(&mut data);
+        let t = i64::from_be_bytes(data[0..8].try_into().expect("slice len 8"));
+        let rand_val = i32::from_be_bytes(data[8..12].try_into().expect("slice len 4"));
+        let crc = u32::from_be_bytes(data[12..16].try_into().expect("slice len 4"));
         (t, crc, rand_val, data)
     }
 
@@ -775,6 +801,31 @@ mod tests {
         let auth_id = create_auth_id(&cmd_key, now_unix()).expect("create");
         let matched = holder.match_auth_id(&auth_id).expect("match");
         assert_eq!(matched, cmd_key);
+    }
+
+    fn decoder_inits() -> u64 {
+        DECODER_INITS.with(std::cell::Cell::get)
+    }
+
+    /// 钉住 Go `AuthIDDecoderHolder` 的预解码形态：`kdf16` + `Aes128::new`
+    /// 只在 `add_user` 建一次，匹配路径纯 `decrypt_block` 复用。
+    /// 若把 key schedule 挪进 `decode`（每连接×每用户重算），本测试红。
+    #[test]
+    fn holder_builds_decoder_once_per_user_not_per_match() {
+        let cmd_key = sample_cmd_key();
+        let holder = AuthIDDecoderHolder::new();
+
+        let before = decoder_inits();
+        holder.add_user(cmd_key);
+        assert_eq!(decoder_inits() - before, 1, "add_user 必须建一次 key schedule");
+
+        let after_add = decoder_inits();
+        // 时间戳递增 40s（在 ±120s 窗内）保证 40 个不同 authID 不触发重放。
+        for offset in 0..40i64 {
+            let auth_id = create_auth_id(&cmd_key, now_unix() + offset).expect("create");
+            holder.match_auth_id(&auth_id).expect("match");
+        }
+        assert_eq!(decoder_inits() - after_add, 0, "匹配路径不得重建 key schedule");
     }
 
     #[test]

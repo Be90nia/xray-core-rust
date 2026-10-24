@@ -19,6 +19,7 @@ use std::{
 };
 
 use parking_lot::RwLock;
+use skeleton_infra::fx::FxScope;
 use tokio::sync::Notify;
 
 struct Inner {
@@ -34,6 +35,12 @@ struct Inner {
 /// 对应 Go `signal.CancelAfterInactivity(ctx, cancel, timeout)`。
 pub struct InactivityTimer {
     inner: Arc<Inner>,
+    /// B6（bd t975）：run 循环唯一托管口（坑约束 5）。置于外层结构（非 Inner）：
+    /// 任务经 `Arc<Inner>` 自持会钉死 scope 永不 drop——放外层则 timer drop 时
+    /// JoinSet 兜底 abort（旧实现孤儿循环要跑满窗口才自灭）。
+    // fx 仅经 drop glue 生效（JoinSet 兜底 abort），无显式读点。
+    #[allow(dead_code)]
+    fx: Arc<FxScope>,
 }
 
 impl InactivityTimer {
@@ -48,9 +55,10 @@ impl InactivityTimer {
             on_timeout: Box::new(on_timeout),
         });
 
+        let fx = Arc::new(FxScope::new());
         let run_inner = Arc::clone(&inner);
-        #[allow(clippy::disallowed_methods, reason = "sliding window deadline 循环；FxScope 未接线（T3.1b 登记）")]
-        tokio::spawn(async move {
+        // 闸关不可达：内部 scope 无 close 调用（停机走 stop_rx 协作退出）。
+        fx.spawn(async move {
             // sliding window：deadline = 最近一次 update + 当前 timeout
             loop {
                 let timeout = *run_inner.timeout.read();
@@ -67,9 +75,10 @@ impl InactivityTimer {
                     _ = stop_rx.changed() => break,
                 }
             }
-        });
+        })
+        .expect("internal FxScope is never closed");
 
-        Arc::new(Self { inner })
+        Arc::new(Self { inner, fx })
     }
 
     /// 活动信号：重置超时窗口（多次合并为一次，同 Go buffered chan(1)）。

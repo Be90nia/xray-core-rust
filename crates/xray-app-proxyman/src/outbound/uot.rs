@@ -40,12 +40,13 @@
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
 };
 
+use skeleton_infra::fx::{FxScope, Spawned};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UdpSocket,
-    task::JoinHandle,
 };
 use xray_transport::connection::{Connection, DuplexConnection};
 
@@ -203,9 +204,16 @@ fn try_parse_packet(
 /// `Drop` 自动 abort 两个 pump task 并关闭 UDP socket。`Connection::close`
 /// 同理。
 pub struct UotServerConn {
+    /// B6（bd t975）：pump 任务托管口（坑约束 5）。声明序在 pump 句柄之前——
+    /// 结构体 drop 时先弃 scope（JoinSet 兜底 abort 两泵 + 释放 UDP socket），
+    /// 再弃句柄（已 abort 幂等 no-op）。落实下方「Drop 自动 abort」契约。
+    // fx 仅经 drop glue 生效（JoinSet 兜底 abort），无显式读点——同 TcpWorker
+    // 的 future-feature 字段先例。
+    #[allow(dead_code)]
+    fx: Arc<FxScope>,
     /// Pump task 句柄。Drop 时自动 abort，保证 UDP socket 不被泄漏。
-    _pump_input: JoinHandle<()>,
-    _pump_output: JoinHandle<()>,
+    _pump_input: Spawned<()>,
+    _pump_output: Spawned<()>,
 }
 
 impl UotServerConn {
@@ -218,21 +226,18 @@ impl UotServerConn {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
         let (server_r, server_w) = tokio::io::split(server_io);
 
+        // 闸关不可达：内部 scope 无 close 调用（drop 兜底 abort）。
+        let fx = Arc::new(FxScope::new());
         // pump_input: 从 server_r 读帧 → UDP send_to
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "UoT pump_input 泵（帧→UDP 发送，句柄随结构体存活）；FxScope 未接线（T3.1b 登记）"
-        )]
-        let pump_input = tokio::spawn(pump_input(server_r, udp_a, version));
+        let pump_input = fx
+            .spawn(pump_input(server_r, udp_a, version))
+            .expect("internal FxScope is never closed");
         // pump_output: 从 UDP recv_from → 写帧到 server_w
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "UoT pump_output 泵（UDP→帧写回，句柄随结构体存活）；FxScope 未接线（T3.1b 登记）"
-        )]
-        let pump_output = tokio::spawn(pump_output(server_w, udp_b));
+        let pump_output =
+            fx.spawn(pump_output(server_w, udp_b)).expect("internal FxScope is never closed");
 
         let conn: Box<dyn Connection> = Box::new(DuplexConnection::new(client_io));
-        Ok((conn, Self { _pump_input: pump_input, _pump_output: pump_output }))
+        Ok((conn, Self { fx, _pump_input: pump_input, _pump_output: pump_output }))
     }
 }
 

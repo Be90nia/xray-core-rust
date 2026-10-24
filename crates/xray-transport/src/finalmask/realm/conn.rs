@@ -18,6 +18,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use skeleton_infra::fx::FxScope;
 use tokio::sync::{Mutex, mpsc};
 
 use crate::finalmask::{
@@ -73,9 +74,22 @@ struct Shared {
     punch_channels: Mutex<HashMap<PunchMetadata, mpsc::Sender<PunchEvent>>>,
     data_tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
     cancel: Arc<AtomicBool>,
+    /// B6（bd t975）：dispatcher/init/punch/heartbeat 后台任务唯一托管口
+    /// （坑约束 5）。scope 归 Client/Server conn 持有，conn drop 兜底 abort；
+    /// 协作停机仍走 `cancel`。
+    fx: Arc<FxScope>,
 }
 
 impl Shared {
+    /// 托管 spawn 唯一口：内部 scope 无 close 调用（fail-visible 不可达分支）。
+    fn spawn<F, T>(&self, fut: F) -> skeleton_infra::fx::Spawned<T>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.fx.spawn(fut).expect("internal FxScope is never closed")
+    }
+
     /// dispatcher 是否应退出。
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Acquire)
@@ -108,14 +122,15 @@ impl RealmConnClient {
             punch_channels: Mutex::new(HashMap::new()),
             data_tx,
             cancel: Arc::clone(&cancel),
+            fx: Arc::new(FxScope::new()),
         });
 
-        tokio::spawn(dispatcher_loop(Arc::clone(&shared)));
+        shared.spawn(dispatcher_loop(Arc::clone(&shared)));
 
         let shared_init = Arc::clone(&shared);
         let peer_init = Arc::clone(&peer);
         let config_init = config.clone();
-        tokio::spawn(async move {
+        shared.spawn(async move {
             let _ = client_init(shared_init, stun_rx, config_init, peer_init).await;
             // init 失败：peer 保持 None；send_to 后续返回 NotConnected
         });
@@ -184,14 +199,15 @@ impl RealmConnServer {
             punch_channels: Mutex::new(HashMap::new()),
             data_tx,
             cancel: Arc::clone(&cancel),
+            fx: Arc::new(FxScope::new()),
         });
 
-        tokio::spawn(dispatcher_loop(Arc::clone(&shared)));
+        shared.spawn(dispatcher_loop(Arc::clone(&shared)));
 
         let shared_init = Arc::clone(&shared);
         let config_init = config.clone();
         let cancel_clone = Arc::clone(&cancel);
-        tokio::spawn(async move {
+        shared.spawn(async move {
             server_loop(shared_init, stun_rx, config_init, cancel_clone).await;
         });
 
@@ -346,7 +362,7 @@ async fn client_init(
 
     let raw = Arc::clone(&shared.raw);
     let meta_loop = meta.clone();
-    tokio::spawn(client_punch_loop(raw, meta_loop, expanded, punch_rx, peer));
+    shared.spawn(client_punch_loop(raw, meta_loop, expanded, punch_rx, peer));
     Ok(())
 }
 
@@ -446,7 +462,7 @@ async fn server_loop(
         let config_hb = config.clone();
         let sid_hb = session_id.clone();
         let session_cancel_hb = Arc::clone(&session_cancel);
-        tokio::spawn(async move {
+        shared.spawn(async move {
             heartbeat_loop(client_hb, config_hb, sid_hb, ttl, session_cancel_hb).await;
         });
 

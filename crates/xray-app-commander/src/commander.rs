@@ -22,7 +22,7 @@ use std::sync::{
 };
 
 use parking_lot::{Mutex, RwLock};
-use tokio::task::JoinHandle;
+use skeleton_infra::fx::{FxScope, Spawned};
 use xray_features::{Feature, FeatureError};
 
 use crate::{
@@ -253,8 +253,12 @@ pub struct Commander {
     outbound_registrar: Option<Arc<dyn crate::outbound::HandlerManager>>,
     /// HandlerService gRPC 操作的共享 handler 注册中心。
     handler_registry: Arc<OutboundHandlerRegistry>,
-    /// gRPC server 后台 task 的 JoinHandle（listen 模式启动后持有，close 时 abort）。
-    grpc_task: Mutex<Option<JoinHandle<()>>>,
+    /// gRPC server 后台 task 句柄（listen 模式启动后持有，close 时 abort）。
+    /// B6（bd t975）：任务经 FxScope 托管（坑约束 5），句柄为 Spawned（abort 语义同）。
+    grpc_task: Mutex<Option<Spawned<()>>>,
+    /// B6（bd t975）：gRPC serve 任务唯一托管口（坑约束 5）。scope 随 Commander
+    /// drop 兜底 abort；显式停机仍走 close() 的 handle.abort()（语义不变）。
+    fx: Arc<FxScope>,
     /// 可选的 StatsService gRPC 后端（注入后、且 `services` 声明了 StatsService
     /// 时注册到 tonic server）。`RwLock` 支持上层在 `Arc<Commander>` 上注入。
     stats_service: RwLock<Option<Arc<dyn xray_app_stats::command::StatsService>>>,
@@ -292,6 +296,7 @@ impl Commander {
             outbound_registrar: None,
             handler_registry: Arc::new(OutboundHandlerRegistry::new()),
             grpc_task: Mutex::new(None),
+            fx: Arc::new(FxScope::new()),
             stats_service: RwLock::new(None),
             routing_service: RwLock::new(None),
             observatory_service: RwLock::new(None),
@@ -552,19 +557,22 @@ impl Commander {
                     }
                 })?;
                 tracing::info!("commander gRPC server listening on {addr} (tag=`{}`)", self.tag);
-                #[allow(clippy::disallowed_methods, reason = "gRPC UDS 模式 tonic Server serve 主循环（server 自管连接任务）；FxScope 未接线（T3.1b 登记）")]
-                let handle = tokio::spawn(async move {
-                    if let Err(e) = router
-                        .serve_with_incoming(
-                            tonic::codegen::tokio_stream::wrappers::TcpListenerStream::new(
-                                listener,
-                            ),
-                        )
-                        .await
-                    {
-                        tracing::error!("commander gRPC server exited with error: {e}");
-                    }
-                });
+                // 闸关不可达：内部 scope 无 close 调用（停机走 close() 的 handle.abort）。
+                let handle = self
+                    .fx
+                    .spawn(async move {
+                        if let Err(e) = router
+                            .serve_with_incoming(
+                                tonic::codegen::tokio_stream::wrappers::TcpListenerStream::new(
+                                    listener,
+                                ),
+                            )
+                            .await
+                        {
+                            tracing::error!("commander gRPC server exited with error: {e}");
+                        }
+                    })
+                    .expect("internal FxScope is never closed");
                 *self.grpc_task.lock() = Some(handle);
                 Ok(())
             },
@@ -586,19 +594,22 @@ impl Commander {
                     "commander gRPC server listening on unix:{path} (tag=`{}`)",
                     self.tag
                 );
-                #[allow(clippy::disallowed_methods, reason = "gRPC TCP 模式 tonic Server serve 主循环（server 自管连接任务）；FxScope 未接线（T3.1b 登记）")]
-                let handle = tokio::spawn(async move {
-                    if let Err(e) = router
-                        .serve_with_incoming(
-                            tonic::codegen::tokio_stream::wrappers::UnixListenerStream::new(
-                                listener,
-                            ),
-                        )
-                        .await
-                    {
-                        tracing::error!("commander gRPC server exited with error: {e}");
-                    }
-                });
+                // 闸关不可达：内部 scope 无 close 调用（停机走 close() 的 handle.abort）。
+                let handle = self
+                    .fx
+                    .spawn(async move {
+                        if let Err(e) = router
+                            .serve_with_incoming(
+                                tonic::codegen::tokio_stream::wrappers::UnixListenerStream::new(
+                                    listener,
+                                ),
+                            )
+                            .await
+                        {
+                            tracing::error!("commander gRPC server exited with error: {e}");
+                        }
+                    })
+                    .expect("internal FxScope is never closed");
                 *self.grpc_task.lock() = Some(handle);
                 Ok(())
             },
@@ -643,12 +654,15 @@ impl Commander {
                     "commander gRPC server serving via outbound handler (tag=`{}`)",
                     self.tag
                 );
-                #[allow(clippy::disallowed_methods, reason = "gRPC inbound 模式 tonic Server serve 主循环（server 自管连接任务）；FxScope 未接线（T3.1b 登记）")]
-                let handle = tokio::spawn(async move {
-                    if let Err(e) = router.serve_with_incoming(incoming).await {
-                        tracing::error!("commander gRPC server exited with error: {e}");
-                    }
-                });
+                // 闸关不可达：内部 scope 无 close 调用（停机走 close() 的 handle.abort）。
+                let handle = self
+                    .fx
+                    .spawn(async move {
+                        if let Err(e) = router.serve_with_incoming(incoming).await {
+                            tracing::error!("commander gRPC server exited with error: {e}");
+                        }
+                    })
+                    .expect("internal FxScope is never closed");
                 *self.outbound_listener.write() = Some(listener);
                 *self.grpc_task.lock() = Some(handle);
                 Ok(())
@@ -1106,7 +1120,10 @@ mod tests {
             Port::new(0),
             Network::TCP,
         );
-        #[allow(clippy::disallowed_methods, reason = "dispatch 与调用方解耦的后台投递（Go dispatch goroutine 直译）；FxScope 未接线（T3.1b 登记）")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "dispatch 与调用方解耦的后台投递（Go dispatch goroutine 直译）；FxScope 未接线（T3.1b 登记）"
+        )]
         tokio::spawn(async move {
             handler.dispatch(&dest, link).await;
         });

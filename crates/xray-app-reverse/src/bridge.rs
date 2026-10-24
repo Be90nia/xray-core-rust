@@ -113,6 +113,7 @@ pub type SharedPortal = Arc<dyn Portal>;
 
 use std::time::Duration;
 
+use skeleton_infra::fx::FxScope;
 use tokio::sync::watch;
 use xray_common::net::destination::Destination;
 
@@ -263,6 +264,9 @@ pub struct RuntimeBridge {
     /// monitor 停止信号（close 发 true 并摘除 sender；重启建新信道——旧循环
     /// 盯旧信道必然退出，close/start 往返不会叠加 monitor 循环）。
     stop_tx: parking_lot::Mutex<Option<watch::Sender<bool>>>,
+    /// B6（bd t975）：monitor 循环唯一托管口（坑约束 5）。scope 随 Self drop
+    /// 兜底 abort；协作停机仍走 stop_rx（与 Go monitorTask.Close 语义一致）。
+    fx: Arc<FxScope>,
 }
 
 impl RuntimeBridge {
@@ -278,6 +282,7 @@ impl RuntimeBridge {
             domain: config.domain.clone(),
             workers: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             stop_tx: parking_lot::Mutex::new(None),
+            fx: Arc::new(FxScope::new()),
         })
     }
 
@@ -328,18 +333,20 @@ impl Bridge for RuntimeBridge {
         let domain = self.domain.clone();
         let tag = self.tag.clone();
         let workers = std::sync::Arc::clone(&self.workers);
-        #[allow(clippy::disallowed_methods, reason = "bridge monitor 周期循环；FxScope 未接线（T3.1b 登记）")]
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = tokio::time::sleep(BRIDGE_MONITOR_INTERVAL) => {}
-                    _ = wait_stop(&mut stop_rx) => break,
+        // 闸关不可达：内部 scope 无 close 调用（停机走 stop_rx 协作退出）。
+        self.fx
+            .spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(BRIDGE_MONITOR_INTERVAL) => {}
+                        _ = wait_stop(&mut stop_rx) => break,
+                    }
+                    if Self::monitor_step(&dispatcher, &domain, &tag, &workers).await.is_err() {
+                        break;
+                    }
                 }
-                if Self::monitor_step(&dispatcher, &domain, &tag, &workers).await.is_err() {
-                    break;
-                }
-            }
-        });
+            })
+            .expect("internal FxScope is never closed");
         Ok(())
     }
 
@@ -381,6 +388,9 @@ pub struct RuntimePortal {
     picker: std::sync::Arc<StaticMuxPicker<std::sync::Arc<PortalWorker>>>,
     /// picker 清理循环停止信号（语义同 [`RuntimeBridge::stop_tx`]）。
     stop_tx: parking_lot::Mutex<Option<watch::Sender<bool>>>,
+    /// B6（bd t975）：picker cleanup 循环唯一托管口（坑约束 5）。scope 随 Self
+    /// drop 兜底 abort；协作停机仍走 stop_rx。
+    fx: Arc<FxScope>,
 }
 
 impl RuntimePortal {
@@ -396,6 +406,7 @@ impl RuntimePortal {
             domain: config.domain.clone(),
             picker: std::sync::Arc::new(StaticMuxPicker::new()),
             stop_tx: parking_lot::Mutex::new(None),
+            fx: Arc::new(FxScope::new()),
         })
     }
 
@@ -423,16 +434,18 @@ impl Portal for RuntimePortal {
         *guard = Some(stop_tx);
         drop(guard);
         let picker = std::sync::Arc::clone(&self.picker);
-        #[allow(clippy::disallowed_methods, reason = "picker cleanup 周期循环；FxScope 未接线（T3.1b 登记）")]
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = tokio::time::sleep(PICKER_CLEANUP_INTERVAL) => {}
-                    _ = wait_stop(&mut stop_rx) => break,
+        // 闸关不可达：内部 scope 无 close 调用（停机走 stop_rx 协作退出）。
+        self.fx
+            .spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(PICKER_CLEANUP_INTERVAL) => {}
+                        _ = wait_stop(&mut stop_rx) => break,
+                    }
+                    picker.cleanup();
                 }
-                picker.cleanup();
-            }
-        });
+            })
+            .expect("internal FxScope is never closed");
         Ok(())
     }
 

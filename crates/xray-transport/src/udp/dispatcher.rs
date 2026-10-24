@@ -18,7 +18,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::{sync::Mutex, task::JoinHandle};
+use skeleton_infra::fx::{FxScope, Spawned};
+use tokio::sync::Mutex;
 
 /// UDP NAT 会话超时（对应 Go `udp.Dispatcher.cleanupInterval = 1min`）。
 const UDP_NAT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -88,21 +89,30 @@ pub struct UdpDispatcher {
     /// NAT 表：(source, destination) → ConnEntry。
     entries: Arc<Mutex<HashMap<NatKey, ConnEntry>>>,
     /// 清理 task handle。
-    cleanup_handle: Option<JoinHandle<()>>,
+    cleanup_handle: Option<Spawned<()>>,
+    /// B6（bd t975）：清理 task 唯一托管口（坑约束 5）。scope 随 dispatcher
+    /// drop 兜底 abort；显式停机走 [`Self::close`]。
+    // fx 仅经 drop glue 生效（JoinSet 兜底 abort），无显式读点——同 uot/TcpWorker 先例。
+    #[allow(dead_code)]
+    fx: Arc<FxScope>,
 }
 
 impl UdpDispatcher {
     /// 创建新的 UDP Dispatcher。
     pub fn new() -> Self {
         let entries: Arc<Mutex<HashMap<NatKey, ConnEntry>>> = Arc::new(Mutex::new(HashMap::new()));
+        let fx = Arc::new(FxScope::new());
 
         // 启动清理 task。
         let entries_clone = Arc::clone(&entries);
-        let handle = tokio::spawn(async move {
-            Self::cleanup_loop(entries_clone).await;
-        });
+        // 闸关不可达：内部 scope 无 close 调用（停机走 close/超时清理循环自终止）。
+        let handle = fx
+            .spawn(async move {
+                Self::cleanup_loop(entries_clone).await;
+            })
+            .expect("internal FxScope is never closed");
 
-        Self { entries, cleanup_handle: Some(handle) }
+        Self { entries, cleanup_handle: Some(handle), fx }
     }
 
     /// 注册或刷新一个 NAT 会话。
@@ -188,6 +198,8 @@ impl UdpDispatcher {
         if let Some(handle) = self.cleanup_handle.take() {
             handle.abort();
         }
+        // accepting 闸关：close 后拒新托管 spawn（当前无其他 spawn 点，防御性收口）。
+        self.fx.close();
     }
 
     /// 清理循环。

@@ -182,11 +182,13 @@ async fn pump_hysteria_udp(
     let up = async move {
         let mut accum: Vec<u8> = Vec::new();
         let mut buf = vec![0u8; 8 * 1024];
+        // wire 帧缓冲随 pump 持久化（clear + 复用容量），消每包一次堆分配
+        let mut wire: Vec<u8> = Vec::new();
         loop {
             // 先把 accum 里所有完整帧消费掉
             let mut progress = true;
             while progress {
-                match parse_and_forward(&up_conn, &mut accum, &default_addr).await {
+                match parse_and_forward(&up_conn, &mut accum, &default_addr, &mut wire).await {
                     Ok(made) => progress = made,
                     Err(e) => {
                         tracing::debug!("hysteria udp up forward error: {e}");
@@ -211,6 +213,9 @@ async fn pump_hysteria_udp(
         let mut df = Defragger::new();
         let global_id: [u8; GLOBAL_ID_LEN] = rand::random();
         let mut buf = vec![0u8; RECV_BUF_SIZE];
+        // 收发缓冲随 pump 持久化（clear + 复用容量），消每包 full/frame 两次分配
+        let mut full = Vec::with_capacity(4 + RECV_BUF_SIZE);
+        let mut frame = Vec::with_capacity(RECV_BUF_SIZE + 64);
         loop {
             let n = match conn.read(&mut buf).await {
                 Ok(n) => n,
@@ -224,26 +229,27 @@ async fn pump_hysteria_udp(
             }
             // UdpSessionManager 投递时已剥除 4B session id 信封（Go 由
             // ParseUDPMessage 读出、本桥不消费）→ 前补哑元对齐 8B 头布局
-            let mut full = Vec::with_capacity(4 + n);
+            full.clear();
             full.extend_from_slice(&[0u8; 4]);
             full.extend_from_slice(&buf[..n]);
             // Go UDPReader.ReadFrom：解析/重组失败 continue 跳过
             let Ok(msg) = UdpMessage::parse(&full) else {
                 continue;
             };
-            let Some(msg) = df.feed(&msg) else {
+            let Some(msg) = df.feed(msg) else {
                 continue;
             };
             let Some(source) = parse_udp_source(&msg.addr) else {
                 continue;
             };
             // 回包帧来源 = UdpMessage.addr（与 freedom pump_response 同款 per-packet 帧）
-            let mut frame = Vec::with_capacity(msg.data.len() + 64);
-            let mut pw = PacketWriter::new(&mut frame, source, global_id);
-            if pw.write_packet(&msg.data).is_err() {
-                break;
+            frame.clear();
+            {
+                let mut pw = PacketWriter::new(&mut frame, source, global_id);
+                if pw.write_packet(&msg.data).is_err() {
+                    break;
+                }
             }
-            drop(pw);
             if wr.write_all(&frame).await.is_err() {
                 break; // client 侧已关闭
             }
@@ -266,6 +272,7 @@ async fn parse_and_forward(
     conn: &Arc<InterConn>,
     accum: &mut Vec<u8>,
     default_addr: &str,
+    wire: &mut Vec<u8>,
 ) -> io::Result<bool> {
     if accum.is_empty() {
         return Ok(false);
@@ -290,7 +297,7 @@ async fn parse_and_forward(
                 addr,
                 data,
             };
-            if let Err(e) = write_udp_message(conn, &msg).await {
+            if let Err(e) = write_udp_message(conn, &msg, wire).await {
                 // 对齐 Go UDPWriter（client.go:209-223）：DatagramTooLarge 属可恢复
                 // 错误——丢弃本包继续（UDP 语义），不杀 relay 会话。
                 tracing::debug!("hysteria udp up forward error: {e}");
@@ -311,20 +318,36 @@ pub(crate) const MAX_DATAGRAM_PAYLOAD: usize = 1200 - 4 - 9;
 
 /// 序列化 UdpMessage 并经 InterConn 写出；超 MTU 时自动分片。
 /// 写入 body 已剥 4B session_id 字段（InterConn::write 注入真实 id 信封）。
-pub(crate) async fn write_udp_message(conn: &Arc<InterConn>, msg: &UdpMessage) -> io::Result<()> {
-    let frags = if msg.size() > MAX_DATAGRAM_PAYLOAD {
-        crate::protocol::frag_udp_message(msg, MAX_DATAGRAM_PAYLOAD)
-    } else {
-        std::slice::from_ref(msg).to_vec()
-    };
-    for frag in &frags {
-        let mut wire = vec![0u8; frag.size()];
-        let n = frag.serialize(&mut wire);
-        if n == 0 {
-            continue; // 序列化超上限（不应发生）
+///
+/// `wire` 由调用方在 pump 循环外持久持有（clear + 复用容量）——非 frag 快路
+/// 直接就地序列化 `msg`，不再 `to_vec()` 克隆整个 UdpMessage。
+pub(crate) async fn write_udp_message(
+    conn: &Arc<InterConn>,
+    msg: &UdpMessage,
+    wire: &mut Vec<u8>,
+) -> io::Result<()> {
+    if msg.size() > MAX_DATAGRAM_PAYLOAD {
+        for frag in crate::protocol::frag_udp_message(msg, MAX_DATAGRAM_PAYLOAD) {
+            write_one_frame(conn, &frag, wire).await?;
         }
-        conn.write(&wire[4..n]).await?;
+        return Ok(());
     }
+    write_one_frame(conn, msg, wire).await
+}
+
+/// 单个 UdpMessage 帧 → `InterConn::write`。
+async fn write_one_frame(
+    conn: &Arc<InterConn>,
+    msg: &UdpMessage,
+    wire: &mut Vec<u8>,
+) -> io::Result<()> {
+    wire.clear();
+    wire.resize(msg.size(), 0);
+    let n = msg.serialize(wire);
+    if n == 0 {
+        return Ok(()); // 序列化超上限（不应发生）
+    }
+    conn.write(&wire[4..n]).await?;
     Ok(())
 }
 
@@ -723,5 +746,189 @@ mod tests {
         assert!(parse_udp_source("no-port").is_none());
         assert!(parse_udp_source("host:notaport").is_none());
         assert!(parse_udp_source("").is_none());
+    }
+
+    // ===== NF-2 判别器：hysteria2 UDP relay 非 frag 快路每包分配预算 =====
+
+    /// 线程局部分配计数探针（与 vmess body_chunk 判别器同款）：只计当前线程，
+    /// libtest 并发下其他测试线程不计数。分配器内必须 try_with——TLS 析构期
+    /// with 会 panic，而分配器内 panic = abort。
+    mod alloc_probe {
+        use std::{
+            alloc::{GlobalAlloc, Layout, System},
+            cell::Cell,
+        };
+
+        thread_local! {
+            static COUNT: Cell<u64> = const { Cell::new(0) };
+            static ARMED: Cell<bool> = const { Cell::new(false) };
+        }
+
+        fn bump() {
+            let _ = ARMED.try_with(|a| {
+                if a.get() {
+                    let _ = COUNT.try_with(|c| c.set(c.get() + 1));
+                }
+            });
+        }
+
+        pub struct CountingAlloc;
+        unsafe impl GlobalAlloc for CountingAlloc {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                bump();
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) }
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                bump();
+                unsafe { System.realloc(ptr, layout, new_size) }
+            }
+        }
+
+        #[global_allocator]
+        static GLOBAL: CountingAlloc = CountingAlloc;
+
+        /// 开窗：开始计数并清零（Drop 复位，panic 安全）。
+        pub fn arm() -> Guard {
+            ARMED.with(|a| a.set(true));
+            COUNT.with(|c| c.set(0));
+            Guard
+        }
+
+        pub struct Guard;
+
+        impl Guard {
+            #[must_use]
+            pub fn count(&self) -> u64 {
+                COUNT.with(|c| c.get())
+            }
+        }
+
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                ARMED.with(|a| a.set(false));
+            }
+        }
+    }
+
+    fn no_alloc_write_conn() -> Arc<InterConn> {
+        let conn = Arc::new(InterConn::new(
+            "127.0.0.1:1000".parse().expect("local"),
+            "127.0.0.1:2000".parse().expect("remote"),
+            7,
+            8,
+        ));
+        conn.set_write_fn(|_payload: Bytes| async { Ok::<(), std::io::Error>(()) });
+        conn
+    }
+
+    fn sample_udp_msg() -> UdpMessage {
+        UdpMessage {
+            session_id: 0,
+            packet_id: 0,
+            frag_id: 0,
+            frag_count: 1,
+            addr: "8.8.8.8:53".into(),
+            data: vec![0x5Au8; 900],
+        }
+    }
+
+    /// 判别器（NF-2 上行）：非 frag 快路每包堆分配数。
+    ///
+    /// 分两段度量，避免把未改动的 transport 信封混进 A/B 差值：
+    /// - 消息侧（本条被改的组成）：改前 = 整包 clone `from_ref(msg).to_vec()` （Vec 外壳 + data Vec
+    ///   + addr String）+ 每包 `vec![0u8; size]` wire； 改后 = 借用 `msg` 就地序列化 + pump 持久
+    ///   `wire` → 0 alloc/包。
+    /// - 生产路径（真实 `write_udp_message`）：改后应只剩 `InterConn::write` 的 BytesMut 信封。
+    #[tokio::test]
+    async fn udp_non_frag_write_alloc_budget() {
+        const PACKETS: u64 = 8;
+        let conn = no_alloc_write_conn();
+        let msg = sample_udp_msg();
+
+        // 改前消息侧：整包 clone + 每包新 wire（预热一次，让一次性缓冲分配落在窗外）
+        let before_frame = || {
+            let frags = std::slice::from_ref(&msg).to_vec();
+            for frag in &frags {
+                let mut wire = vec![0u8; frag.size()];
+                std::hint::black_box(frag.serialize(&mut wire));
+            }
+        };
+        before_frame();
+        let before = {
+            let g = alloc_probe::arm();
+            for _ in 0..PACKETS {
+                before_frame();
+            }
+            g.count()
+        };
+
+        // 改后消息侧：借用 + 持久 wire（与 write_one_frame 的帧构造逐行等价）
+        let mut wire = Vec::new();
+        let after_frame = |wire: &mut Vec<u8>| {
+            wire.clear();
+            wire.resize(msg.size(), 0);
+            std::hint::black_box(msg.serialize(wire));
+        };
+        after_frame(&mut wire);
+        let after = {
+            let g = alloc_probe::arm();
+            for _ in 0..PACKETS {
+                after_frame(&mut wire);
+            }
+            g.count()
+        };
+
+        // 生产路径：首包在窗外预热后，只剩 transport 信封
+        write_udp_message(&conn, &msg, &mut wire).await.expect("warm");
+        let prod = {
+            let g = alloc_probe::arm();
+            for _ in 0..PACKETS {
+                write_udp_message(&conn, &msg, &mut wire).await.expect("改后 write");
+            }
+            g.count()
+        };
+
+        assert!(
+            before == PACKETS * 4 && after == 0 && prod == PACKETS * 2,
+            "NF-2 分配预算：before={before} after={after} prod={prod}（PACKETS={PACKETS}）"
+        );
+    }
+
+    /// 判别器（NF-2 下行）：`Defragger::feed` 非 frag 快路零分配。
+    ///
+    /// 改前 `Some(m.clone())`（data Vec + addr String = 2 alloc/包）；改后按值
+    /// 交还原消息 = 0（frag 路径也不再 clone，分片直接收进重组表）。
+    #[test]
+    fn defragger_non_frag_feed_alloc_budget() {
+        const PACKETS: u64 = 8;
+        let msg = sample_udp_msg();
+        let before = {
+            let g = alloc_probe::arm();
+            for _ in 0..PACKETS {
+                std::hint::black_box(msg.clone());
+            }
+            g.count()
+        };
+
+        // 入参在计数窗外预先备好（按值传入，clone 成本不计入 feed 本身）
+        let owned: Vec<UdpMessage> = (0..PACKETS).map(|_| msg.clone()).collect();
+        let mut df = Defragger::new();
+        let after = {
+            let g = alloc_probe::arm();
+            for m in owned {
+                let out = df.feed(m).expect("non-frag 直通");
+                assert_eq!(out.frag_count, 1);
+                std::hint::black_box(out);
+            }
+            g.count()
+        };
+
+        assert_eq!(before, PACKETS * 2, "改前 clone = data Vec + addr String; got {before}");
+        assert_eq!(after, 0, "改后按值直通 0 alloc; got {after}");
     }
 }

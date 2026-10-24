@@ -450,7 +450,7 @@ impl Connection for VmessConn {
 struct VmessUdpConn {
     inner_w: tokio::io::WriteHalf<Box<dyn Connection>>,
     rx: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
-    up_nonce: ChunkNonceAdapter,
+    up_nonce: ChunkNonceGenerator,
     req_cipher: BodyCipher,
     /// Mutex 仅为 Connection::Sync（poll_write 单线程独占，锁无竞争）；
     /// ShakeSizeParserAdapter 内部 XofReader 非 Sync，无法裸存。
@@ -526,12 +526,12 @@ impl VmessUdpConn {
         Self {
             inner_w: stream_w,
             rx,
-            up_nonce: ChunkNonceAdapter::new(&req_iv, 12),
+            up_nonce: ChunkNonceGenerator::new(&req_iv, 12),
             req_cipher,
             req_size_parser: parking_lot::Mutex::new(req_size_parser),
             req_padding,
             up_chunk_cap,
-            wpending: Vec::new(),
+            wpending: Vec::with_capacity(up_chunk_cap + 96),
             wpos: 0,
             _down_task: down_task,
         }
@@ -558,19 +558,18 @@ impl AsyncWrite for VmessUdpConn {
             }
             this.wpos += n;
         }
-        // 一包一 chunk
+        // 一包一 chunk：与 TCP 泵同款持久缓冲 + next_ref + seal_into（稳态零分配）
         let payload = &buf[..buf.len().min(this.up_chunk_cap)];
-        let mut frame = Vec::with_capacity(payload.len() + 96);
-        crate::encoding::body_chunk::encode_single_chunk(
-            &mut frame,
+        let nonce = this.up_nonce.next_ref();
+        encode_frame_into(
+            &mut this.wpending,
             payload,
             &this.req_cipher,
-            &mut this.up_nonce,
+            nonce,
             this.req_size_parser.lock().as_mut(),
             this.req_padding,
         )
         .map_err(|e| std::io::Error::other(format!("vmess udp encode: {e}")))?;
-        this.wpending = frame;
         this.wpos = 0;
         while this.wpos < this.wpending.len() {
             let n = std::task::ready!(
@@ -595,17 +594,16 @@ impl AsyncWrite for VmessUdpConn {
         let this = &mut *self.get_mut();
         // 写终止 chunk（seal([])）——服务端 decode 看到空明文即流结束
         if this.wpos >= this.wpending.len() {
-            let mut frame = Vec::with_capacity(96);
-            crate::encoding::body_chunk::encode_single_chunk(
-                &mut frame,
+            let nonce = this.up_nonce.next_ref();
+            encode_frame_into(
+                &mut this.wpending,
                 &[],
                 &this.req_cipher,
-                &mut this.up_nonce,
+                nonce,
                 this.req_size_parser.lock().as_mut(),
                 this.req_padding,
             )
             .map_err(|e| std::io::Error::other(format!("vmess udp termination: {e}")))?;
-            this.wpending = frame;
             this.wpos = 0;
         }
         Pin::new(&mut this.inner_w).poll_shutdown(cx)
@@ -842,29 +840,45 @@ where
     W: AsyncWrite + Unpin,
     C: AeadCipher,
 {
-    // SHAKE128 流消费顺序：next_padding_len → encode（与 decode 侧对称）
+    let nonce = nonce_gen.next_ref();
+    encode_frame_into(chunk_buf, data, cipher, nonce, size_parser, global_padding)?;
+    writer.write_all(chunk_buf).await
+}
+
+/// 把一帧 `[size_field][sealed][padding]` 构进调用方复用的缓冲（同步、零中间 Vec）。
+///
+/// TCP 泵 [`write_one_chunk`] 与 UDP [`VmessUdpConn::poll_write`] 共用——两侧
+/// 构帧语义必须同一份（SHAKE128 流消费顺序：next_padding_len → encode，与
+/// decode 侧对称），否则 wire 会漂移。`pub(crate)`：供同 crate 的分配预算判别器直测。
+pub(crate) fn encode_frame_into(
+    frame: &mut Vec<u8>,
+    data: &[u8],
+    cipher: &dyn AeadCipher,
+    nonce: &[u8],
+    size_parser: &mut (dyn SizeParser + Send),
+    global_padding: bool,
+) -> std::io::Result<()> {
     let sb = size_parser.size_bytes();
     let padding_size = if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
-    // 零中间 Vec：sealed/padding 追加进复用的 chunk_buf，size_field 前缀
-    // 预留后回填，整 chunk 单次 write_all。
-    let nonce = nonce_gen.next_ref();
-    chunk_buf.clear();
-    chunk_buf.resize(sb, 0);
+    // 零中间 Vec：sealed/padding 追加进复用的 frame，size_field 前缀
+    // 预留后回填。
+    frame.clear();
+    frame.resize(sb, 0);
     cipher
-        .seal_into(nonce, &[], data, chunk_buf)
+        .seal_into(nonce, &[], data, frame)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     if padding_size > 0 {
         use rand::RngCore;
-        let start = chunk_buf.len();
-        chunk_buf.resize(start + padding_size, 0);
-        rand::rng().fill_bytes(&mut chunk_buf[start..]);
+        let start = frame.len();
+        frame.resize(start + padding_size, 0);
+        rand::rng().fill_bytes(&mut frame[start..]);
     }
     // size 字段 u16：超出即显式报错（静默回退 u16::MAX 会致收端按 65535 读、错位）
-    let size_value = u16::try_from(chunk_buf.len() - sb).map_err(|_| {
+    let size_value = u16::try_from(frame.len() - sb).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "vmess chunk size exceeds u16")
     })?;
-    size_parser.encode(size_value, &mut chunk_buf[..sb]);
-    writer.write_all(chunk_buf).await
+    size_parser.encode(size_value, &mut frame[..sb]);
+    Ok(())
 }
 
 /// 下行 pump：从 wire 读 VMess 响应 body chunk 流 → 解密为明文写入 duplex。
@@ -1231,6 +1245,35 @@ mod tests {
         .expect("decode p2")
         .expect("p2 non-terminal");
         assert_eq!(p2, vec![9u8; 600]);
+    }
+
+    /// 判别器（NF-1）：UDP poll_write 复用持久帧缓冲——改前每包新建
+    /// `Vec::with_capacity(payload+96)`，改后容量在构造期一次预留、写包不再扩容
+    /// （与 TCP 泵 `chunk_buf` 同形）。每包分配数见
+    /// `encoding::body_chunk::tests::udp_single_packet_frame_alloc_budget`。
+    #[tokio::test]
+    async fn vmess_udp_conn_reuses_frame_buffer() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client_side, _server_side) = tokio::io::duplex(16384);
+        let mut conn = VmessUdpConn::from_udp_conn(
+            Box::new(xray_transport::connection::DuplexConnection::new(client_side)),
+            ClientSession::new(),
+            BodyCipher::Aes(Aes128Gcm::new(&[0x42u8; 16]).expect("cipher")),
+            [0xAAu8; 16],
+            Box::new(PlainSizeParser),
+            false,
+            BodyCipher::Aes(Aes128Gcm::new(&[0x43u8; 16]).expect("cipher")),
+            [0xBBu8; 16],
+            Box::new(PlainSizeParser),
+            false,
+        );
+        let cap = conn.wpending.capacity();
+        assert_eq!(cap, conn.up_chunk_cap + 96, "帧缓冲构造期一次预留");
+        for _ in 0..8 {
+            conn.write_all(&[7u8; 1200]).await.unwrap();
+        }
+        assert_eq!(conn.wpending.capacity(), cap, "每包不得重建/扩容帧缓冲");
     }
 
     /// decode_single_chunk_async：两个 chunk 的 wire 逐次解出两包；干净 EOF = None。

@@ -348,29 +348,32 @@ impl Defragger {
 
     /// 投入一个分片，若所有分片齐备返回完整消息。
     ///
-    /// 对应 Go `Defragger.Feed`。
-    pub fn feed(&mut self, m: &UdpMessage) -> Option<UdpMessage> {
+    /// 对应 Go `Defragger.Feed`（入参按值传入：非 frag 快路原样交还，分片路径
+    /// 直接收进重组表——两条路径都不留 clone）。
+    pub fn feed(&mut self, m: UdpMessage) -> Option<UdpMessage> {
         // 无分片或单分片直接返回
         if m.frag_count <= 1 {
-            return Some(m.clone());
+            return Some(m);
         }
-        if m.frag_id >= m.frag_count {
+        let (packet_id, frag_count, session_id) = (m.packet_id, m.frag_count, m.session_id);
+        if m.frag_id >= frag_count {
             return None;
         }
         // 新 packet_id 或 frag_count 不匹配 -> 重置
-        if m.packet_id != self.pkt_id || m.frag_count as usize != self.frags.len() {
-            self.pkt_id = m.packet_id;
-            self.frags = vec![None; m.frag_count as usize];
+        if packet_id != self.pkt_id || frag_count as usize != self.frags.len() {
+            self.pkt_id = packet_id;
+            self.frags = vec![None; frag_count as usize];
             self.count = 0;
             self.data_size = 0;
         }
-        if self.frags[m.frag_id as usize].is_none() {
-            self.frags[m.frag_id as usize] = Some(m.clone());
-            self.count = self.count.saturating_add(1);
+        let frag_id = m.frag_id as usize;
+        if self.frags[frag_id].is_none() {
             self.data_size += m.data.len();
+            self.frags[frag_id] = Some(m);
+            self.count = self.count.saturating_add(1);
         }
         // 所有分片齐备
-        if self.count == m.frag_count {
+        if self.count == frag_count {
             let mut data = Vec::with_capacity(self.data_size);
             let mut addr = String::new();
             for f in self.frags.iter().flatten() {
@@ -379,14 +382,8 @@ impl Defragger {
                     addr = f.addr.clone();
                 }
             }
-            let result = UdpMessage {
-                session_id: m.session_id,
-                packet_id: m.packet_id,
-                frag_id: 0,
-                frag_count: 1,
-                addr,
-                data,
-            };
+            let result =
+                UdpMessage { session_id, packet_id, frag_id: 0, frag_count: 1, addr, data };
             // 重置状态
             self.frags.clear();
             self.count = 0;
@@ -485,7 +482,7 @@ mod tests {
         assert!(frags.len() > 1, "should fragment");
         let mut defrag = Defragger::new();
         let mut result = None;
-        for frag in &frags {
+        for frag in frags {
             if let Some(complete) = defrag.feed(frag) {
                 result = Some(complete);
             }
@@ -506,7 +503,7 @@ mod tests {
             data: vec![1],
         };
         let mut d = Defragger::new();
-        let r = d.feed(&m).expect("single frag should return");
+        let r = d.feed(m).expect("single frag should return");
         assert_eq!(r.data, vec![1]);
     }
 

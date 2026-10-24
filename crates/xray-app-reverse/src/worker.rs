@@ -98,6 +98,7 @@ use std::{
 
 use parking_lot::{Mutex, RwLock};
 use prost::Message as _;
+use skeleton_infra::fx::FxScope;
 use xray_buf::{
     io::{Reader as IoReader, Writer as IoWriter},
     multi::MultiBuffer,
@@ -162,6 +163,12 @@ pub struct PortalWorker {
     draining: AtomicBool,
     counter: AtomicU8,
     timer: Arc<InactivityTimer>,
+    /// B6（bd t975）：控制 dispatch + 心跳循环唯一托管口（坑约束 5）。心跳任务
+    /// 自持 Arc<Self>（scope 随之存活），循环靠 heartbeat 错误自终止（Go
+    /// task.Periodic Execute 出错即停同语义）。
+    // fx 仅经 drop glue 生效（JoinSet 兜底 abort），无显式读点。
+    #[allow(dead_code)]
+    fx: Arc<FxScope>,
 }
 
 impl PortalWorker {
@@ -179,10 +186,12 @@ impl PortalWorker {
 
         let dest = internal_control_destination();
         let c = Arc::clone(&client);
-        #[allow(clippy::disallowed_methods, reason = "控制连接 dispatch（Go pipe reader 立即返回语义等价）；FxScope 未接线（T3.1b 登记）")]
-        tokio::spawn(async move {
+        let fx = Arc::new(FxScope::new());
+        // 闸关不可达：内部 scope 无 close 调用（任务随控制会话结束自终止）。
+        fx.spawn(async move {
             c.dispatch(&dest, MuxLink { reader: Box::new(up_r), writer: Box::new(dn_w) }).await;
-        });
+        })
+        .expect("internal FxScope is never closed");
 
         let timer_client = Arc::clone(&client);
         let timer = InactivityTimer::new(PORTAL_IDLE_TIMEOUT, move || {
@@ -196,18 +205,20 @@ impl PortalWorker {
             draining: AtomicBool::new(false),
             counter: AtomicU8::new(0),
             timer,
+            fx: Arc::clone(&fx),
         });
 
         let hb_worker = Arc::clone(&worker);
-        #[allow(clippy::disallowed_methods, reason = "portal 心跳循环（Go task.Periodic 2s 直译）；FxScope 未接线（T3.1b 登记）")]
-        tokio::spawn(async move {
+        // 闸关不可达：内部 scope 无 close 调用（心跳 Execute 出错即停）。
+        fx.spawn(async move {
             loop {
                 tokio::time::sleep(PORTAL_HEARTBEAT_INTERVAL).await;
                 if hb_worker.heartbeat().await.is_err() {
                     break; // Go task.Periodic：Execute 出错即停
                 }
             }
-        });
+        })
+        .expect("internal FxScope is never closed");
 
         Ok(worker)
     }
@@ -309,6 +320,9 @@ pub struct BridgeWorker {
     state: AtomicU8,
     timer: RwLock<Option<Arc<InactivityTimer>>>,
     self_ref: RwLock<Option<std::sync::Weak<Self>>>,
+    /// B6（bd t975）：帧循环/internal conn/inbound dispatch 唯一托管口（坑约束
+    /// 5）。scope 随 Self drop 兜底 abort；帧循环靠 process_frame EOF 自终止。
+    fx: Arc<FxScope>,
 }
 
 /// mux [`ServerWorker`] 的 dispatcher 适配（Weak 拆环）。
@@ -357,6 +371,7 @@ impl BridgeWorker {
         let dest =
             Destination::new(Address::new_domain(domain.to_string()), Port::new(0), Network::TCP);
         let carrier = dispatcher.dispatch(&dest, Some(tag)).await?;
+        let fx = Arc::new(FxScope::new());
 
         let me = Arc::new(Self {
             tag: tag.to_string(),
@@ -365,6 +380,7 @@ impl BridgeWorker {
             state: AtomicU8::new(ControlState::Active as u8),
             timer: RwLock::new(None),
             self_ref: RwLock::new(None),
+            fx,
         });
         *me.self_ref.write() = Some(Arc::downgrade(&me));
 
@@ -386,12 +402,14 @@ impl BridgeWorker {
             Arc::new(tokio::sync::Mutex::new(Some(carrier.writer)));
         let monitor_h = server.spawn_monitor(Arc::clone(&link_writer));
         let frame_server = Arc::clone(&server);
-        #[allow(clippy::disallowed_methods, reason = "server 帧处理循环（monitor abort 收尾）；FxScope 未接线（T3.1b 登记）")]
-        tokio::spawn(async move {
-            while let Ok(true) = frame_server.process_frame(&mut reader, &link_writer).await {}
-            frame_server.close();
-            monitor_h.abort();
-        });
+        // 闸关不可达：内部 scope 无 close 调用（循环随 carrier EOF 自终止）。
+        me.fx
+            .spawn(async move {
+                while let Ok(true) = frame_server.process_frame(&mut reader, &link_writer).await {}
+                frame_server.close();
+                monitor_h.abort();
+            })
+            .expect("internal FxScope is never closed");
 
         Ok(me)
     }
@@ -535,11 +553,13 @@ impl xray_mux::worker::Dispatcher for BridgeWorker {
         let (dn_r, dn_w) = pipe::new_with_option(control_pipe_option());
         // up_w 随控制流任务存活（Go Link{Writer: uplinkWriter} 被 goroutine 持有），
         // 任务结束 drop → up_r EOF → mux session 收尾。
-        #[allow(clippy::disallowed_methods, reason = "internal conn 处理（句柄回收 up_w）；FxScope 未接线（T3.1b 登记）")]
-        tokio::spawn(async move {
-            Self::handle_internal_conn(me, Box::new(dn_r)).await;
-            drop(up_w);
-        });
+        // 闸关不可达：内部 scope 无 close 调用（任务随控制流 EOF 自终止）。
+        self.fx
+            .spawn(async move {
+                Self::handle_internal_conn(me, Box::new(dn_r)).await;
+                drop(up_w);
+            })
+            .expect("internal FxScope is never closed");
         Ok(MuxLink { reader: Box::new(up_r), writer: Box::new(dn_w) })
     }
 
@@ -563,25 +583,27 @@ impl xray_mux::worker::Dispatcher for BridgeWorker {
         let (read_b, write_b) = pipe::new_with_option(control_pipe_option());
         let transport_link = TransportLink::new(Box::new(read_b), Box::new(write_a));
         let dispatcher = Arc::clone(&self.dispatcher);
-        #[allow(clippy::disallowed_methods, reason = "inbound dispatch_link_inbound 后台；FxScope 未接线（T3.1b 登记）")]
-        tokio::spawn(async move {
-            if let Err(e) = dispatcher
-                .dispatch_link_inbound(
-                    &dest,
-                    transport_link,
-                    Some(tag.as_str()),
-                    source.as_ref(),
-                    local.as_ref(),
-                )
-                .await
-            {
-                tracing::info!(
-                    target: "xray_app_reverse",
-                    error = %e,
-                    "reverse bridge inbound dispatch failed"
-                );
-            }
-        });
+        // 闸关不可达：内部 scope 无 close 调用（错误留痕后任务自终止）。
+        self.fx
+            .spawn(async move {
+                if let Err(e) = dispatcher
+                    .dispatch_link_inbound(
+                        &dest,
+                        transport_link,
+                        Some(tag.as_str()),
+                        source.as_ref(),
+                        local.as_ref(),
+                    )
+                    .await
+                {
+                    tracing::info!(
+                        target: "xray_app_reverse",
+                        error = %e,
+                        "reverse bridge inbound dispatch failed"
+                    );
+                }
+            })
+            .expect("internal FxScope is never closed");
         Ok(MuxLink { reader: Box::new(read_a), writer: Box::new(write_b) })
     }
 }
@@ -836,7 +858,10 @@ mod entity_tests {
         let link_writer: std::sync::Arc<tokio::sync::Mutex<Option<Box<dyn IoWriter>>>> =
             std::sync::Arc::new(tokio::sync::Mutex::new(Some(Box::new(s_write))));
         let monitor_h = server.spawn_monitor(link_writer.clone());
-        #[allow(clippy::disallowed_methods, reason = "server 帧处理循环（process_frame 至 EOF）；FxScope 未接线（T3.1b 登记）")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "server 帧处理循环（process_frame 至 EOF）；FxScope 未接线（T3.1b 登记）"
+        )]
         tokio::spawn(async move {
             while let Ok(true) = server.process_frame(&mut reader, &link_writer).await {}
             server.close();

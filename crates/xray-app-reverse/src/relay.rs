@@ -29,6 +29,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use skeleton_infra::fx::FxScope;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{mpsc, oneshot},
@@ -55,6 +56,11 @@ type CompatTcp = Compat<TcpStream>;
 pub struct YamuxBridge {
     /// 向驱动 task 发送 open-stream 请求。
     open_tx: mpsc::Sender<oneshot::Sender<io::Result<MuxStream>>>,
+    /// B6（bd t975）：drive_bridge 驱动任务唯一托管口（坑约束 5）。scope 随
+    /// Self drop 兜底 abort；协作收尾仍走 open_tx 关闭（驱动见 None 自退）。
+    // fx 仅经 drop glue 生效（JoinSet 兜底 abort），无显式读点。
+    #[allow(dead_code)]
+    fx: Arc<FxScope>,
 }
 
 impl YamuxBridge {
@@ -70,9 +76,10 @@ impl YamuxBridge {
         let conn =
             yamux::Connection::new(tcp.compat(), yamux::Config::default(), yamux::Mode::Client);
         let (open_tx, open_rx) = mpsc::channel(64);
-        #[allow(clippy::disallowed_methods, reason = "drive_bridge 驱动任务（bridge 生命周期随 Self）；FxScope 未接线（T3.1b 登记）")]
-        tokio::spawn(drive_bridge(conn, open_rx));
-        Ok(Self { open_tx })
+        // 闸关不可达：内部 scope 无 close 调用（驱动随 open_tx 关闭自退）。
+        let fx = Arc::new(FxScope::new());
+        fx.spawn(drive_bridge(conn, open_rx)).expect("internal FxScope is never closed");
+        Ok(Self { open_tx, fx })
     }
 
     /// 在 yamux 会话上打开一个新子流。
@@ -160,7 +167,10 @@ where
         tcp.set_nodelay(true).ok();
 
         let cb = Arc::clone(&on_stream);
-        #[allow(clippy::disallowed_methods, reason = "portal yamux 服务端会话 accept；FxScope 未接线（T3.1b 登记）")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "portal yamux 服务端会话 accept；FxScope 未接线（T3.1b 登记）"
+        )]
         tokio::spawn(async move {
             tracing::debug!(peer = %peer, "portal bridge connected");
             let conn =
@@ -186,7 +196,10 @@ where
             },
             Some(Ok(stream)) => {
                 let cb = Arc::clone(&on_stream);
-                #[allow(clippy::disallowed_methods, reason = "portal 子流回调派发（on_stream 回调）；FxScope 未接线（T3.1b 登记）")]
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "portal 子流回调派发（on_stream 回调）；FxScope 未接线（T3.1b 登记）"
+                )]
                 tokio::spawn(async move {
                     cb(stream.compat()).await;
                 });

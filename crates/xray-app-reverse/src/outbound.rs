@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use skeleton_infra::fx::FxScope;
 use xray_app_dispatcher::{DispatchHandler, default::SimpleOhm};
 use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
 use xray_mux::{
@@ -111,6 +112,9 @@ pub struct PortalOutbound {
     tag: String,
     picker: Arc<StaticMuxPicker<Arc<PortalWorker>>>,
     domain: String,
+    /// B6（bd t975）：client dispatch 后台任务唯一托管口（坑约束 5）。scope 随
+    /// Self drop 兜底 abort（RuntimePortal::close 摘除注册即回收）。
+    fx: Arc<FxScope>,
 }
 
 impl PortalOutbound {
@@ -120,7 +124,7 @@ impl PortalOutbound {
         picker: Arc<StaticMuxPicker<Arc<PortalWorker>>>,
         domain: String,
     ) -> Self {
-        Self { tag, picker, domain }
+        Self { tag, picker, domain, fx: Arc::new(FxScope::new()) }
     }
 
     /// 对应 Go `Portal.HandleConnection`（portal.go:67-101）。
@@ -160,18 +164,20 @@ impl PortalOutbound {
         let worker = self.picker.pick_available()?;
         let d = dest.clone();
         let inbound = reverse_mux_inbound(access);
-        #[allow(clippy::disallowed_methods, reason = "client dispatch 后台任务；FxScope 未接线（T3.1b 登记）")]
-        tokio::spawn(async move {
-            worker
-                .client()
-                .dispatch_with_source(
-                    &d,
-                    MuxLink { reader: link.reader, writer: link.writer },
-                    None,
-                    inbound,
-                )
-                .await;
-        });
+        // 闸关不可达：内部 scope 无 close 调用（任务随 dispatch 会话结束自终止）。
+        self.fx
+            .spawn(async move {
+                worker
+                    .client()
+                    .dispatch_with_source(
+                        &d,
+                        MuxLink { reader: link.reader, writer: link.writer },
+                        None,
+                        inbound,
+                    )
+                    .await;
+            })
+            .expect("internal FxScope is never closed");
         Ok(())
     }
 }
@@ -217,9 +223,10 @@ impl DispatchHandler for PortalOutbound {
         let tag = self.tag.clone();
         let picker = Arc::clone(&self.picker);
         let domain = self.domain.clone();
+        let fx = Arc::clone(&self.fx);
         let dest = dest.clone();
         Box::pin(async move {
-            let outbound = PortalOutbound { tag, picker, domain };
+            let outbound = PortalOutbound { tag, picker, domain, fx };
             if let Err(e) = outbound
                 .handle_connection(&dest, link, &xray_app_dispatcher::AccessContext::default())
                 .await

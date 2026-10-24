@@ -22,7 +22,9 @@
 //!
 //! 段 schema（P3-2 配置解析接注册链前的壳层自持形态）：入站
 //! `{"bind","users":[{"email","auth","level"}],"serverName","alpn","udpIdleTimeout",
-//! "masquerade"}`；出站 `{"address","auth","serverName","alpn","udpIdleTimeout"}`。
+//! "masquerade"}`；出站 `{"address","port","auth","serverName","alpn","udpIdleTimeout"}`
+//! （`address`=host、`port`=独立字段，Go `infra/conf/hysteria.go:13-17`；拨号目标
+//! 由二者合成 `host:port`）。
 //! transport 层深键（quicParams / masquerade 展开 / brutal 带宽）属 xray-conf
 //! 解析面，随 P3-2 收口，本壳不解析。
 //!
@@ -266,7 +268,18 @@ fn parse_outbound_config(settings: &serde_json::Value) -> Result<HysteriaConfig,
         settings.get("address").and_then(|a| a.as_str()).filter(|a| !a.is_empty()).ok_or_else(
             || PluginError::Other("hysteria outbound settings: address missing/empty".into()),
         )?;
-    let mut config = HysteriaConfig::new(address, str_field(settings, "auth").unwrap_or_default());
+    // Go `infra/conf/hysteria.go:13-17`：`address`=host、`port`=独立字段，
+    // 拨号目标由二者合成 host:port（Go `protocol.NewServerSpecFromPB` →
+    // `TCPDestination(address, port)`）。生产面 `parse_hysteria_config` 同形；
+    // 插件面缺拼接会让 B5 接线后拨号打错端口（缺端口 → 解析失败/错端口）。
+    let port = settings
+        .get("port")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| PluginError::Other("hysteria outbound settings: port missing".into()))?;
+    let mut config = HysteriaConfig::new(
+        format!("{address}:{port}"),
+        str_field(settings, "auth").unwrap_or_default(),
+    );
     if let Some(sni) = str_field(settings, "serverName") {
         config = config.with_server_name(sni);
     }
@@ -317,18 +330,27 @@ mod tests {
     #[test]
     fn outbound_settings_parse_defaults() {
         let face = parse_section(
-            &json!({ "settings": { "address": "us1.example.com:443", "auth": "tok" } }),
+            &json!({ "settings": { "address": "us1.example.com", "port": 443, "auth": "tok" } }),
         )
         .expect("outbound face");
         let config = match face {
             HysteriaFace::Outbound(config) => config,
             HysteriaFace::Inbound(_) => panic!("expected outbound face"),
         };
-        assert_eq!(config.server_addr, "us1.example.com:443");
+        assert_eq!(config.server_addr, "us1.example.com:443", "address:port 合成（Go 语义）");
         assert_eq!(config.server_name, "us1.example.com", "SNI 默认 = address host 部分");
         assert_eq!(config.auth, "tok");
         assert_eq!(config.alpn, vec!["hysteria".to_string(), "h3".to_string()]);
         assert_eq!(config.udp_idle_timeout_secs, HysteriaConfig::DEFAULT_UDP_IDLE_TIMEOUT);
+    }
+
+    /// 缺 `port` 硬错（Go `infra/conf/hysteria.go:16` 独立 port 字段；缺端口的
+    /// 拨号目标无意义——装配期 fail-visible，禁拼出无端口地址）。
+    #[test]
+    fn outbound_settings_missing_port_fails_fast() {
+        let err = parse_section(&json!({ "settings": { "address": "us1.example.com" } }))
+            .expect_err("port missing must fail");
+        assert!(err.to_string().contains("port missing"), "实际: {err}");
     }
 
     #[test]
@@ -391,7 +413,7 @@ mod tests {
     #[test]
     fn non_string_alpn_fails_fast() {
         let err = parse_section(&json!({
-            "settings": { "address": "h:1", "alpn": ["hysteria", 3] }
+            "settings": { "address": "h", "port": 1, "alpn": ["hysteria", 3] }
         }))
         .expect_err("non-string alpn must fail");
         assert!(err.to_string().contains("alpn must be a string array"), "实际: {err}");

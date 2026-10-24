@@ -17,6 +17,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use skeleton_infra::fx::FxScope;
 use tokio::{
     sync::{Mutex, watch},
     time::Duration,
@@ -141,6 +142,9 @@ pub struct IncrementalWorkerPicker {
     /// Arc 化：周期清理 task 持 `Weak` 引用，picker drop 后 task 自行退出（无孤儿）。
     workers: Arc<Mutex<Vec<Arc<ClientWorker>>>>,
     cleanup_started: AtomicBool,
+    /// B6（bd t975）：清理 task 唯一托管口（坑约束 5）。scope 随 picker drop
+    /// 兜底 abort；task 本身持 `Weak`，正常路径先于 scope 退出。
+    fx: Arc<FxScope>,
 }
 
 impl IncrementalWorkerPicker {
@@ -150,6 +154,7 @@ impl IncrementalWorkerPicker {
             factory,
             workers: Arc::new(Mutex::new(Vec::new())),
             cleanup_started: AtomicBool::new(false),
+            fx: Arc::new(FxScope::new()),
         }
     }
 
@@ -226,22 +231,25 @@ impl IncrementalWorkerPicker {
     /// task 随即退出——清理任务生命周期不超过 picker 自身，无孤儿 task。
     fn spawn_cleanup_task(&self) {
         let workers = Arc::downgrade(&self.workers);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(PICKER_CLEANUP_INTERVAL).await;
-                let Some(workers) = workers.upgrade() else {
-                    return; // picker 已 drop，无需再清理
-                };
-                let mut list = workers.lock().await;
-                let before = list.len();
-                list.retain(|w| !w.is_closed());
-                let removed = before - list.len();
-                drop(list);
-                if removed > 0 {
-                    debug!("periodic cleanup removed {removed} closed workers");
+        // 闸关不可达：内部 scope 无 close 调用（task 持 Weak，picker drop 后自退出）。
+        self.fx
+            .spawn(async move {
+                loop {
+                    tokio::time::sleep(PICKER_CLEANUP_INTERVAL).await;
+                    let Some(workers) = workers.upgrade() else {
+                        return; // picker 已 drop，无需再清理
+                    };
+                    let mut list = workers.lock().await;
+                    let before = list.len();
+                    list.retain(|w| !w.is_closed());
+                    let removed = before - list.len();
+                    drop(list);
+                    if removed > 0 {
+                        debug!("periodic cleanup removed {removed} closed workers");
+                    }
                 }
-            }
-        });
+            })
+            .expect("internal FxScope is never closed");
     }
 
     /// 获取 Worker 数量。
@@ -280,6 +288,9 @@ pub struct ClientWorker {
     strategy: ClientStrategy,
     /// carrier 写端共享槽：全部 session 的 [`MuxWriter`] 经 [`SharedWriter`] 共写。
     link_writer: Arc<Mutex<Option<Box<dyn Writer>>>>,
+    /// B6（bd t975）：monitor 管理任务唯一托管口（坑约束 5）。scope 随 worker
+    /// drop 兜底 abort；读循环（fetch_output/fetch_input）为数据面泵热路径豁免。
+    fx: Arc<FxScope>,
 }
 
 impl ClientWorker {
@@ -296,13 +307,19 @@ impl ClientWorker {
             done_rx,
             strategy,
             link_writer: Arc::new(Mutex::new(Some(link.writer))),
+            fx: Arc::new(FxScope::new()),
         });
 
         let w = Arc::clone(&worker);
+        // 数据面泵热路径豁免（约束⑫）：carrier 读循环不加托管口。
         tokio::spawn(async move { w.fetch_output(BufferedReader::new(link.reader)).await });
 
         let w = Arc::clone(&worker);
-        tokio::spawn(async move { w.monitor().await });
+        // 闸关不可达：内部 scope 无 close 调用（停机走 worker.close 协作面）。
+        worker
+            .fx
+            .spawn(async move { w.monitor().await })
+            .expect("internal FxScope is never closed");
 
         worker
     }
@@ -782,6 +799,8 @@ pub struct DialingWorkerFactory {
     pub strategy: ClientStrategy,
     /// 底层 outbound（carrier 建立者）
     underlying: UnderlyingSlot,
+    /// B6（bd t975）：carrier 结束监视任务唯一托管口（坑约束 5）。
+    fx: Arc<FxScope>,
 }
 
 impl DialingWorkerFactory {
@@ -790,13 +809,17 @@ impl DialingWorkerFactory {
         underlying: Arc<dyn xray_app_dispatcher::DispatchHandler>,
         strategy: ClientStrategy,
     ) -> Self {
-        Self { strategy, underlying: Arc::new(parking_lot::RwLock::new(Some(underlying))) }
+        Self {
+            strategy,
+            underlying: Arc::new(parking_lot::RwLock::new(Some(underlying))),
+            fx: Arc::new(FxScope::new()),
+        }
     }
 
     /// 以共享槽创建（延迟注入底层 handler，注册流程 Phase 2 用）。
     #[must_use]
     pub fn with_slot(underlying: UnderlyingSlot, strategy: ClientStrategy) -> Self {
-        Self { strategy, underlying }
+        Self { strategy, underlying, fx: Arc::new(FxScope::new()) }
     }
 }
 
@@ -828,18 +851,21 @@ impl ClientWorkerFactory for DialingWorkerFactory {
         );
         let dest = ClientWorker::mux_destination();
         let w = Arc::clone(&worker);
-        tokio::spawn(async move {
-            let done = w.done_rx();
-            tokio::select! {
-                // carrier 结束（underlying.dispatch 返回）→ Go client.go:164 c.Close()
-                _ = underlying.dispatch(&dest, carrier) => {}
-                // worker 关闭（空闲/外部 close）→ 中断管道，终结 underlying
-                _ = wait_done(done.clone()) => {}
-            }
-            w.close();
-            uplink_writer.interrupt();
-            downlink_writer.interrupt();
-        });
+        // 闸关不可达：内部 scope 无 close 调用（任务随 carrier 断开/worker 关闭自终止）。
+        self.fx
+            .spawn(async move {
+                let done = w.done_rx();
+                tokio::select! {
+                    // carrier 结束（underlying.dispatch 返回）→ Go client.go:164 c.Close()
+                    _ = underlying.dispatch(&dest, carrier) => {}
+                    // worker 关闭（空闲/外部 close）→ 中断管道，终结 underlying
+                    _ = wait_done(done.clone()) => {}
+                }
+                w.close();
+                uplink_writer.interrupt();
+                downlink_writer.interrupt();
+            })
+            .expect("internal FxScope is never closed");
 
         worker
     }

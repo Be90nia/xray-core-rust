@@ -7,7 +7,6 @@ use parking_lot::Mutex;
 
 use crate::config::{DEAD_DELAY_MS, OutboundStatus, ProbeResult};
 
-
 /// 状态表硬上界（有界背板）：正常配置的 outbound tag 数远小于此值；触达即淘汰
 /// 最久未探测项——已配置 tag 每轮刷新 last_try_time 不会落入淘汰候选，查询
 /// 语义与无界版一致（防 tag 流失面失控的防御性上界）。

@@ -19,10 +19,10 @@ use std::{
 };
 
 use parking_lot::RwLock;
+use skeleton_infra::fx::{FxScope, Spawned};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::{Notify, mpsc},
-    task::JoinHandle,
 };
 use tracing::{info, warn};
 use xray_common::{
@@ -235,6 +235,9 @@ pub struct TcpWorker {
     listener: Mutex<Option<Box<dyn TransportListener>>>,
     close_notify: Arc<Notify>,
     closed: AtomicBool,
+    /// B6（bd t975）：conn/timer 任务唯一托管口（坑约束 5）。scope 随 worker
+    /// drop 兜底 abort；协作停机仍走 close_notify（与 Go worker.Close 语义一致）。
+    fx: Arc<FxScope>,
 }
 
 impl std::fmt::Debug for TcpWorker {
@@ -279,6 +282,7 @@ impl TcpWorker {
             listener: Mutex::new(None),
             close_notify: Arc::new(Notify::new()),
             closed: AtomicBool::new(false),
+            fx: Arc::new(FxScope::new()),
         }
     }
 
@@ -288,18 +292,17 @@ impl TcpWorker {
 
     /// 启动单连接处理。`idle_timeout` 为测试缝（生产取 policy 默认值）。
     ///
-    /// 返回 JoinHandle 供测试等待连接任务结束；`on_conn` 生产路径丢弃之。
+    /// 返回 Spawned 句柄供测试等待连接任务结束；`on_conn` 生产路径丢弃之
+    /// （Drop 不 abort，任务归 scope 生命周期集托管）。
     fn spawn_conn(
         self: &Arc<Self>,
         conn: Box<dyn Connection>,
         idle_timeout: Duration,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> Spawned<()> {
         if self.closed.load(Ordering::SeqCst) {
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "closed 短路：返回空 JoinHandle 占位（无实际任务体）；FxScope 未接线（T3.1b 登记）"
-            )]
-            return tokio::spawn(async {});
+            // 闸关不可达：内部 scope 无 close 调用（closed 走本短路，不关 scope）。
+            // closed 短路：返回立即结束的占位句柄（无实际任务体）。
+            return self.fx.spawn(async {}).expect("internal FxScope is never closed");
         }
 
         let tag = self.tag.clone();
@@ -324,13 +327,12 @@ impl TcpWorker {
         let mut done_signal = activity_timer.done_signal();
 
         let timer_loop = Arc::clone(&activity_timer);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "ActivityTimer 心跳循环托管；FxScope 未接线（T3.1b 登记）"
-        )]
-        tokio::spawn(async move {
-            timer_loop.run().await;
-        });
+        // 闸关不可达：内部 scope 无 close 调用（停机走 close_notify）。
+        self.fx
+            .spawn(async move {
+                timer_loop.run().await;
+            })
+            .expect("internal FxScope is never closed");
 
         // IO 活动装饰器：每次读/写就绪即重置空闲窗口（Go 代理 IO 循环 Update）。
         // proxy 是黑盒 trait，活动信号在 Connection 层拦截——有 IO 即有活动。
@@ -340,28 +342,27 @@ impl TcpWorker {
         // worker close 唤醒后连接 task 随 select 退出——无孤儿。
         let close_notify = Arc::clone(&self.close_notify);
 
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "TCP 连接处理任务（proxy.process + select 停机）；FxScope 未接线（T3.1b 登记）"
-        )]
-        tokio::spawn(async move {
-            let inbound_conn = InboundConn::Tcp(tracked);
-            tokio::select! {
-                result = proxy.process(Network::TCP, inbound_conn, session, dispatcher) => {
-                    if let Err(e) = result {
-                        warn!(tag = %tag, error = %e, "proxy process failed");
+        // 闸关不可达：内部 scope 无 close 调用（停机走 close_notify）。
+        self.fx
+            .spawn(async move {
+                let inbound_conn = InboundConn::Tcp(tracked);
+                tokio::select! {
+                    result = proxy.process(Network::TCP, inbound_conn, session, dispatcher) => {
+                        if let Err(e) = result {
+                            warn!(tag = %tag, error = %e, "proxy process failed");
+                        }
+                        // 正常结束，无需额外操作
                     }
-                    // 正常结束，无需额外操作
+                    _ = done_signal.wait() => {
+                        // 不活动超时，连接被半关闭
+                        warn!(tag = %tag, timeout = ?idle_timeout, "connection cancelled after inactivity");
+                    }
+                    _ = close_notify.notified() => {
+                        // worker close：结构化收尾
+                    }
                 }
-                _ = done_signal.wait() => {
-                    // 不活动超时，连接被半关闭
-                    warn!(tag = %tag, timeout = ?idle_timeout, "connection cancelled after inactivity");
-                }
-                _ = close_notify.notified() => {
-                    // worker close：结构化收尾
-                }
-            }
-        })
+            })
+            .expect("internal FxScope is never closed")
     }
 }
 
@@ -510,8 +511,11 @@ pub struct UdpWorker {
     active_sessions: RwLock<HashMap<SocketAddr, Arc<UdpSession>>>,
     close_notify: Arc<Notify>,
     closed: AtomicBool,
-    recv_handle: Mutex<Option<JoinHandle<()>>>,
-    cleanup_handle: Mutex<Option<JoinHandle<()>>>,
+    recv_handle: Mutex<Option<Spawned<()>>>,
+    cleanup_handle: Mutex<Option<Spawned<()>>>,
+    /// B6（bd t975）：recv/cleanup/session/pump 任务唯一托管口（坑约束 5）。
+    /// scope 随 worker drop 兜底 abort；协作停机仍走 close_notify。
+    fx: Arc<FxScope>,
 }
 
 impl std::fmt::Debug for UdpWorker {
@@ -563,6 +567,7 @@ impl UdpWorker {
             closed: AtomicBool::new(false),
             recv_handle: Mutex::new(None),
             cleanup_handle: Mutex::new(None),
+            fx: Arc::new(FxScope::new()),
         }
     }
 
@@ -613,53 +618,51 @@ impl UdpWorker {
         let pump_session = Arc::clone(&session);
         // bd mvsc：process task 挂 close_notify，worker close 时随 select 退出
         let close_notify = Arc::clone(&self.close_notify);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "UDP 会话处理任务（proxy.process）；FxScope 未接线（T3.1b 登记）"
-        )]
-        tokio::spawn(async move {
-            let inbound_conn = InboundConn::Udp(session);
-            tokio::select! {
-                r = proxy.process(Network::UDP, inbound_conn, session_ctx, dispatcher) => {
-                    if let Err(e) = r {
-                        warn!(tag = %tag, error = %e, "UDP proxy process failed");
+        // 闸关不可达：内部 scope 无 close 调用（停机走 close_notify）。
+        self.fx
+            .spawn(async move {
+                let inbound_conn = InboundConn::Udp(session);
+                tokio::select! {
+                    r = proxy.process(Network::UDP, inbound_conn, session_ctx, dispatcher) => {
+                        if let Err(e) = r {
+                            warn!(tag = %tag, error = %e, "UDP proxy process failed");
+                        }
+                    }
+                    _ = close_notify.notified() => {
+                        // worker close：结构化收尾
                     }
                 }
-                _ = close_notify.notified() => {
-                    // worker close：结构化收尾
-                }
-            }
-        });
+            })
+            .expect("internal FxScope is never closed");
 
         // 响应泵（Go worker.go `for p := range conn.writing { hub.WriteTo }`）：
         // proxy write_packet → 本循环 → hub.send_to(session.source) 回客户端。
         let hub = self.hub.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(Arc::clone);
         if let Some(hub) = hub {
             let close_notify = Arc::clone(&self.close_notify);
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "UDP outbound 回包泵（close_notify 停机面）；FxScope 未接线（T3.1b 登记）"
-            )]
-            tokio::spawn(async move {
-                let mut outbound_rx = outbound_rx;
-                loop {
-                    tokio::select! {
-                        resp = outbound_rx.recv() => {
-                            match resp {
-                                Some(data) => {
-                                    if let Err(e) = hub.send_to(&data, pump_session.source()).await {
-                                        warn!(error = %e, "UDP hub send_to failed");
+            // 闸关不可达：内部 scope 无 close 调用（停机走 close_notify）。
+            self.fx
+                .spawn(async move {
+                    let mut outbound_rx = outbound_rx;
+                    loop {
+                        tokio::select! {
+                            resp = outbound_rx.recv() => {
+                                match resp {
+                                    Some(data) => {
+                                        if let Err(e) = hub.send_to(&data, pump_session.source()).await {
+                                            warn!(error = %e, "UDP hub send_to failed");
+                                        }
                                     }
+                                    None => break,
                                 }
-                                None => break,
+                            }
+                            _ = close_notify.notified() => {
+                                break;
                             }
                         }
-                        _ = close_notify.notified() => {
-                            break;
-                        }
                     }
-                }
-            });
+                })
+                .expect("internal FxScope is never closed");
         }
     }
 
@@ -733,48 +736,48 @@ impl Worker for UdpWorker {
         let close_notify = Arc::clone(&self.close_notify);
         let this = Arc::clone(&self);
 
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "UDP 包接收循环（会话分发）；FxScope 未接线（T3.1b 登记）"
-        )]
-        let recv_handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    packet = rx.recv() => {
-                        match packet {
-                            Some(p) => {
-                                this.on_packet(&p, local_addr);
+        // 闸关不可达：内部 scope 无 close 调用（停机走 close_notify）。
+        let recv_handle = self
+            .fx
+            .spawn(async move {
+                loop {
+                    tokio::select! {
+                        packet = rx.recv() => {
+                            match packet {
+                                Some(p) => {
+                                    this.on_packet(&p, local_addr);
+                                }
+                                None => break,
                             }
-                            None => break,
+                        }
+                        _ = close_notify.notified() => {
+                            break;
                         }
                     }
-                    _ = close_notify.notified() => {
-                        break;
-                    }
                 }
-            }
-        });
+            })
+            .expect("internal FxScope is never closed");
 
         // Spawn cleanup task (every 60s)
         let close_notify2 = Arc::clone(&self.close_notify);
         let this2 = Arc::clone(&self);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "UDP 空闲会话 60s 清理循环（Go task.Periodic 对齐）；FxScope 未接线（T3.1b 登记）"
-        )]
-        let cleanup_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        this2.cleanup_inactive();
-                    }
-                    _ = close_notify2.notified() => {
-                        break;
+        // 闸关不可达：内部 scope 无 close 调用（停机走 close_notify）。
+        let cleanup_handle = self
+            .fx
+            .spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            this2.cleanup_inactive();
+                        }
+                        _ = close_notify2.notified() => {
+                            break;
+                        }
                     }
                 }
-            }
-        });
+            })
+            .expect("internal FxScope is never closed");
 
         *self.recv_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(recv_handle);
         *self.cleanup_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(cleanup_handle);
@@ -1400,7 +1403,7 @@ mod tests {
         // proxy 不做任何 IO → 空闲窗口到期 → done 分支 → 连接任务结束。
         // 旧实现此路径 select 恒等 done_signal 且 timer 无人重置——行为相同；
         // 本测试锁定"无 IO 被杀"语义在 spawn_conn 拆分后仍然成立。
-        tokio::time::timeout(Duration::from_secs(2), handle)
+        tokio::time::timeout(Duration::from_secs(2), handle.join())
             .await
             .expect("idle connection was not cancelled")
             .expect("task join");
@@ -1430,7 +1433,7 @@ mod tests {
         assert!(!handle.is_finished(), "active connection killed despite continuous IO");
 
         drop(client); // EOF → proxy 退出 → 连接任务结束
-        tokio::time::timeout(Duration::from_secs(2), handle)
+        tokio::time::timeout(Duration::from_secs(2), handle.join())
             .await
             .expect("conn task hang after EOF")
             .expect("task join");

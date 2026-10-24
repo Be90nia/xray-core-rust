@@ -21,6 +21,7 @@ use std::{collections::HashMap, net::SocketAddr, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
 use prost::Message as _;
+use skeleton_infra::fx::FxScope;
 use tonic::{Request, Response, Status, transport::Server};
 use xray_app_stats::Channel as StatsChannelOps;
 use xray_common::net::port::Port;
@@ -536,12 +537,15 @@ pub struct RoutingServiceImpl {
     /// Go `routingServer.routingStats`（stats.Channel）。生产装配恒 None
     /// （Go command.go:145 `NewRoutingServer(router, nil)`），测试/嵌入可注入。
     routing_stats: Option<Arc<xray_app_stats::StatsChannel>>,
+    /// B6（bd t975）：订阅广播泵唯一托管口（坑约束 5）。Clone 共享同一 scope
+    /// （Arc）；泵随订阅流结束自终止（tx 关闭 break / sub 关闭 recv None）。
+    fx: Arc<FxScope>,
 }
 
 impl RoutingServiceImpl {
     #[must_use]
     pub fn new(service: Arc<xray_app_router::command::RoutingService>) -> Self {
-        Self { service, routing_stats: None }
+        Self { service, routing_stats: None, fx: Arc::new(FxScope::new()) }
     }
 
     /// 注入 routingStats channel（Go `NewRoutingServer` 第二参；测试/嵌入用）。
@@ -587,20 +591,23 @@ impl ProtoRoutingService for RoutingServiceImpl {
             tokio::sync::mpsc::channel::<std::result::Result<prouter::RoutingContext, Status>>(16);
         // 发布契约：channel 消息为 Arc<xray_proto RoutingContext>（Go 端为
         // routing.Route；本仓路由发布方尚未接线，此处固定消息类型）。
-        #[allow(clippy::disallowed_methods, reason = "订阅广播泵后台循环（pubsub 消息扇出）；FxScope 未接线（T3.1b 登记）")]
-        tokio::spawn(async move {
-            while let Some(msg) = sub.recv().await {
-                let Some(rc) = msg.downcast_ref::<prouter::RoutingContext>() else {
-                    let _ =
-                        tx.send(Err(Status::unknown("Upstream sent malformed statistics."))).await;
-                    return;
-                };
-                let out = project_routing_context(&selectors, rc, Some(&rc.outbound_tag));
-                if tx.send(Ok(out)).await.is_err() {
-                    break;
+        // 闸关不可达：内部 scope 无 close 调用（泵随订阅流结束自终止）。
+        self.fx
+            .spawn(async move {
+                while let Some(msg) = sub.recv().await {
+                    let Some(rc) = msg.downcast_ref::<prouter::RoutingContext>() else {
+                        let _ = tx
+                            .send(Err(Status::unknown("Upstream sent malformed statistics.")))
+                            .await;
+                        return;
+                    };
+                    let out = project_routing_context(&selectors, rc, Some(&rc.outbound_tag));
+                    if tx.send(Ok(out)).await.is_err() {
+                        break;
+                    }
                 }
-            }
-        });
+            })
+            .expect("internal FxScope is never closed");
         Ok(Response::new(tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 

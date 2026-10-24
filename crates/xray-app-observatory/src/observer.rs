@@ -13,6 +13,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
+use skeleton_infra::fx::FxScope;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::TcpStream,
@@ -162,6 +163,9 @@ pub struct Observer {
     /// P3-3 统一观测流出口：Some 时每条探测结果发 `xray_frame::observatory`
     /// 事件（xray_frame::observe::ObserveSink）；None = 零开销静默（缺省）。
     observe: Option<Arc<ObserveSink>>,
+    /// B6（bd t975）：后台观察循环唯一托管口（坑约束 5）。scope 随 Observer
+    /// drop 兜底 abort；协作停机仍走 cancel_rx（与 Go Task.Close 语义一致）。
+    fx: Arc<FxScope>,
 }
 
 struct ObserverState {
@@ -176,6 +180,7 @@ impl Observer {
             status: Arc::new(StatusStore::new()),
             state: Mutex::new(ObserverState { started: false, cancel_tx: None }),
             observe: None,
+            fx: Arc::new(FxScope::new()),
         }
     }
 
@@ -228,8 +233,9 @@ impl Observer {
         let enable_concurrency = self.config.enable_concurrency;
         let observe = self.observe.clone();
         let probe_url = self.config.effective_probe_url().to_string();
-        #[allow(clippy::disallowed_methods, reason = "观察循环后台任务（周期探测，cancel_rx 停机面）；FxScope 未接线（T3.1b 登记）")]
-        tokio::spawn(async move {
+        let fx = Arc::clone(&self.fx);
+        // 闸关不可达：内部 scope 无 close 调用（停机走 cancel_rx 协作退出）。
+        fx.spawn(async move {
             let mut cancel_rx = cancel_rx;
             let mut fail_streak: u32 = 0;
             loop {
@@ -283,7 +289,8 @@ impl Observer {
                     _ = tokio::time::sleep(delay) => {}
                 }
             }
-        });
+        })
+        .expect("internal FxScope is never closed");
 
         Ok(())
     }

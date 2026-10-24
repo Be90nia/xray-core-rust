@@ -23,7 +23,7 @@ use std::{
 
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf},
-    net::{TcpStream, UdpSocket},
+    net::UdpSocket,
     task::JoinHandle,
 };
 use xray_app_dispatcher::default::DialFn;
@@ -435,7 +435,7 @@ pub fn make_ss_dial_fn(config: Arc<SsOutboundConfig>) -> DialFn {
         Box::pin(async move {
             match network {
                 // TCP：先建到 SS 服务器的传输连接（streamSettings 走 transport
-                // dialer（ws+tls/...），否则裸 TCP），再在其上跑 SS 协议握手
+                // dialer（ws+tls/...），否则 dial_system），再在其上跑 SS 协议握手
                 Network::TCP => {
                     let host = match &config.server_address {
                         Address::Domain(d) => d.clone(),
@@ -467,22 +467,15 @@ pub fn make_ss_dial_fn(config: Arc<SsOutboundConfig>) -> DialFn {
                                 Some(s) => xray_transport::dialer::dial(&server_dest, s, &sockopt)
                                     .await
                                     .map_err(|e| format!("ss dial server ({}): {e}", s.protocol)),
-                                None => {
-                                    let sa =
-                                        resolve_server(&config.server_address, config.server_port)
-                                            .await
-                                            .map_err(|e| format!("ss resolve server: {e}"))?;
-                                    let tcp = TcpStream::connect(sa)
-                                        .await
-                                        .map_err(|e| format!("ss dial server (tcp): {e}"))?;
-                                    tcp.set_nodelay(true).ok();
-                                    Ok(
-                                        Box::new(xray_transport::connection::TcpConnection::new(
-                                            tcp,
-                                        ))
-                                            as Box<dyn Connection>,
-                                    )
-                                },
+                                // bd 81ed NF-3：与 vmess/trojan 同位置一致走 dial_system
+                                // （多地址回退 + Happy Eyeballs + dialer controllers/DNS
+                                // 语义），不再本地 lookup_host().next() 后裸连。
+                                None => xray_transport::system_dialer::dial_system(
+                                    &server_dest,
+                                    &sockopt,
+                                )
+                                .await
+                                .map_err(|e| format!("ss dial server (tcp): {e}")),
                             }
                         })
                         .await
@@ -864,9 +857,11 @@ mod tests {
     }
 
     /// bd cjwc G6（Go client.go:64 / ss2022 outbound.go:90 共用环）：dial 拒绝退避
-    /// 5 次。None 分支走裸 TcpStream::connect（无内部定时器）→ start_paused 虚拟
-    /// 时钟精确断言 sleep 阶梯（末次失败不再延迟：0+100+200+300=600ms）+ 最终错误。
-    #[tokio::test(start_paused = true)]
+    /// 5 次。None 分支自 bd 81ed NF-3 起走 dial_system，其环路带内部定时器
+    /// （16s connect timeout）污染虚拟时钟 → 真实时钟断言 sleep 阶梯下界
+    /// （末次失败不再延迟：0+100+200+300=600ms；单次尝试零 sleep 立即失败，
+    /// ≥600ms 只可能来自跑满 5 次环）+ 最终错误。
+    #[tokio::test]
     async fn dial_to_closed_server_backs_off_five_times() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -880,13 +875,107 @@ mod tests {
         let dial_fn = make_ss_dial_fn(cfg);
         let dest = Destination::tcp(Address::new_domain("example.com"), Port::new(80));
 
-        let start = tokio::time::Instant::now();
+        let start = std::time::Instant::now();
         let r = dial_fn(&dest).await;
         let elapsed = start.elapsed();
 
         assert!(r.is_err(), "dial to closed listener must fail");
-        let ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-        assert!((600..=800).contains(&ms), "5 attempts = 600ms virtual, got {ms}ms");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(600),
+            "5 attempts need the 600ms backoff ladder, got {elapsed:?}"
+        );
+        // 上界对齐既有 vmess/freedom 重试测试的 30s 宽限（dial_system 单次可耗 ~2s）。
+        assert!(elapsed < std::time::Duration::from_secs(30), "{elapsed:?}");
+    }
+
+    /// bd 81ed NF-3 契约：TCP 拨号经 `dial_system`，不再是本地
+    /// `lookup_host().next()` + 裸 `TcpStream::connect`。
+    ///
+    /// 断言面：注入探针 `SystemDialer` 截获 `dial_system` 下发的目标。服务器
+    /// 地址用域名 `localhost`——若 ss 仍本地解析后裸连，探针一条记录都不会有；
+    /// 探针收到 `Address::Domain("localhost")` 即证明解析/多地址回退语义已下沉到
+    /// dial_system（vmess/trojan 同位置形态），随后的 SS 握手 + 加解密 echo 往返
+    /// 证明这条拨号出来的连接真实可用。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dial_routes_through_dial_system() {
+        use std::{future::Future, net::SocketAddr, pin::Pin};
+
+        use tokio::net::TcpListener;
+        use xray_transport::{
+            sockopt::SocketOptions,
+            system_dialer::{DefaultSystemDialer, SystemDialer, use_alternative_system_dialer},
+        };
+
+        use crate::inbound::SsInbound;
+
+        /// 探针拨号器：记录目标后委托默认实现（真实建链不变）。
+        struct ProbeDialer {
+            seen: Arc<std::sync::Mutex<Vec<Destination>>>,
+            inner: DefaultSystemDialer,
+        }
+
+        impl SystemDialer for ProbeDialer {
+            fn dial<'a>(
+                &'a self,
+                src: Option<SocketAddr>,
+                destination: &'a Destination,
+                sockopt: &'a SocketOptions,
+            ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Connection>>> + Send + 'a>>
+            {
+                self.seen.lock().unwrap().push(destination.clone());
+                self.inner.dial(src, destination, sockopt)
+            }
+        }
+
+        // 1. SS 服务器端：握手 → 读一段 body → 原样回声
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind inbound");
+        let inbound_addr = listener.local_addr().unwrap();
+        let ib = Arc::new(SsInbound::new(make_account(), "u@dial.local"));
+        let server = tokio::spawn(async move {
+            let (conn, _) = listener.accept().await.expect("inbound accept");
+            let (_header, mut ss) = ib.handle_conn(conn).await.expect("handshake");
+            let body = ss.read_chunk().await.expect("read body").expect("non-empty");
+            ss.write_chunk(&body).await.expect("echo back");
+            ss.flush().await.expect("flush echo");
+        });
+
+        // 2. 客户端：服务器地址是域名 → 解析只可能发生在 dial_system 内
+        let seen: Arc<std::sync::Mutex<Vec<Destination>>> = Arc::default();
+        use_alternative_system_dialer(Some(Box::new(ProbeDialer {
+            seen: Arc::clone(&seen),
+            inner: DefaultSystemDialer::new(),
+        })));
+        let dial_result = async {
+            let cfg = Arc::new(SsOutboundConfig::new(
+                make_account(),
+                Address::new_domain("localhost"),
+                inbound_addr.port(),
+            ));
+            let dial_fn = make_ss_dial_fn(cfg);
+            let dest = Destination::tcp(Address::new_domain("example.com"), Port::new(80));
+            let mut conn = dial_fn(&dest).await?;
+
+            let payload = b"hello dial_system!";
+            conn.write_all(payload).await.map_err(|e| e.to_string())?;
+            conn.flush().await.map_err(|e| e.to_string())?;
+            let mut got = vec![0u8; payload.len()];
+            conn.read_exact(&mut got).await.map_err(|e| e.to_string())?;
+            Ok::<_, String>(got == payload)
+        }
+        .await;
+        use_alternative_system_dialer(None); // 复原全局拨号器
+
+        assert!(dial_result.expect("ss dial + echo roundtrip"), "echo payload mismatch");
+        server.await.expect("server task join");
+
+        // 3. 契约断言：dial_system 收到未解析的服务器域名 + 端口
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|d| d.address() == &Address::new_domain("localhost")
+                && d.port().value() == inbound_addr.port()),
+            "ss TCP dial must route through dial_system with the unresolved server domain, \
+             seen: {seen:?}"
+        );
     }
 
     #[test]

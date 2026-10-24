@@ -19,6 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use skeleton_infra::fx::{FxScope, Spawned};
 use tokio::sync::{Mutex, RwLock, watch};
 use tracing::debug;
 use xray_buf::{io::Writer as _, reader::BufferedReader, writer::BufferedWriter};
@@ -660,14 +661,21 @@ pub struct XUDPManager {
     /// 条目映射表。
     entries: Arc<parking_lot::RwLock<HashMap<[u8; 8], XUDP>>>,
     /// 清理任务句柄。
-    cleanup_handle: Option<tokio::task::JoinHandle<()>>,
+    cleanup_handle: Option<Spawned<()>>,
+    /// B6（bd t975）：清理/中断任务唯一托管口（坑约束 5）。scope 随 manager
+    /// drop 兜底 abort（Drop 先显式 abort 清理任务）。
+    fx: Arc<FxScope>,
 }
 
 impl XUDPManager {
     /// 创建新的 XUDP 管理器。
     #[must_use]
     pub fn new() -> Self {
-        Self { entries: Arc::new(parking_lot::RwLock::new(HashMap::new())), cleanup_handle: None }
+        Self {
+            entries: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            cleanup_handle: None,
+            fx: Arc::new(FxScope::new()),
+        }
     }
 
     /// 启动清理任务。
@@ -675,38 +683,45 @@ impl XUDPManager {
     /// 每 60 秒清理一次过期的 XUDP 条目。
     pub fn start_cleanup(&mut self) {
         let entries = Arc::clone(&self.entries);
-        let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                let now = Instant::now();
-                // 写锁仅在清理窗口内持锁；xudp.interrupt() 在 spawn 中独立运行，
-                // 不再在持锁状态下跨 .await，避免 multi_thread runtime 下的锁迁移。
-                let expired: Vec<(XUDP, [u8; 8])> = {
-                    let mut guard = entries.write();
-                    let mut out = Vec::new();
-                    let ids: Vec<[u8; 8]> = guard
-                        .iter()
-                        .filter(|(_, x)| x.status == XudpStatus::Expiring && now >= x.expire)
-                        .map(|(id, _)| {
-                            debug!("XUDP del: {:?}", id);
-                            *id
-                        })
-                        .collect();
-                    for id in ids {
-                        if let Some(x) = guard.remove(&id) {
-                            out.push((x, id));
+        let fx = Arc::clone(&self.fx);
+        // 闸关不可达：内部 scope 无 close 调用（Drop 显式 abort 清理任务）。
+        let handle = self
+            .fx
+            .spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    let now = Instant::now();
+                    // 写锁仅在清理窗口内持锁；xudp.interrupt() 在 spawn 中独立运行，
+                    // 不再在持锁状态下跨 .await，避免 multi_thread runtime 下的锁迁移。
+                    let expired: Vec<(XUDP, [u8; 8])> = {
+                        let mut guard = entries.write();
+                        let mut out = Vec::new();
+                        let ids: Vec<[u8; 8]> = guard
+                            .iter()
+                            .filter(|(_, x)| x.status == XudpStatus::Expiring && now >= x.expire)
+                            .map(|(id, _)| {
+                                debug!("XUDP del: {:?}", id);
+                                *id
+                            })
+                            .collect();
+                        for id in ids {
+                            if let Some(x) = guard.remove(&id) {
+                                out.push((x, id));
+                            }
                         }
+                        out
+                    };
+                    for (xudp, _id) in expired {
+                        // 闸关不可达：同上（中断子任务随 scope 收口）。
+                        fx.spawn(async move {
+                            xudp.interrupt().await;
+                        })
+                        .expect("internal FxScope is never closed");
                     }
-                    out
-                };
-                for (xudp, _id) in expired {
-                    tokio::spawn(async move {
-                        xudp.interrupt().await;
-                    });
                 }
-            }
-        });
+            })
+            .expect("internal FxScope is never closed");
         self.cleanup_handle = Some(handle);
     }
 

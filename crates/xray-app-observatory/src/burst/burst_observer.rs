@@ -30,6 +30,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
+use skeleton_infra::fx::FxScope;
 
 use super::{HealthPingRtts, HealthPingSettings, RTT_FAILED};
 use crate::{
@@ -68,6 +69,9 @@ pub struct BurstObserver {
     cancel_pending: AtomicPtr<()>,
     /// scheduler 句柄。None 表示未启动。
     scheduler: Mutex<Option<SchedulerHandle>>,
+    /// B6（bd t975）：后台 ticker 唯一托管口（坑约束 5）。scope 随 Self drop
+    /// 兜底 abort；协作停机仍走 shutdown_rx（与 Go StopScheduler 语义一致）。
+    fx: Arc<FxScope>,
 }
 
 impl BurstObserver {
@@ -86,6 +90,7 @@ impl BurstObserver {
             validity_nanos,
             cancel_pending: AtomicPtr::new(std::ptr::null_mut()),
             scheduler: Mutex::new(None),
+            fx: Arc::new(FxScope::new()),
         }
     }
 
@@ -169,8 +174,9 @@ impl BurstObserver {
         let observer = self.clone();
         let selector_for_loop = selector.clone();
         let executor_for_loop = executor.clone();
-        #[allow(clippy::disallowed_methods, reason = "burst 观察循环后台 ticker（shutdown_rx 停机面）；FxScope 未接线（T3.1b 登记）")]
-        tokio::spawn(async move {
+        let fx = Arc::clone(&self.fx);
+        // 闸关不可达：内部 scope 无 close 调用（停机走 shutdown_rx 协作退出）。
+        fx.spawn(async move {
             let mut shutdown_rx = shutdown_rx;
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -197,7 +203,8 @@ impl BurstObserver {
                     }
                 }
             }
-        });
+        })
+        .expect("internal FxScope is never closed");
     }
 
     /// 停止后台调度循环（对应 Go `healthping.go:138-145`）。

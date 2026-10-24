@@ -29,7 +29,7 @@ use std::{
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use rand::{Rng, RngCore};
-use tokio::task::AbortHandle;
+use skeleton_infra::fx::{FxScope, Spawned};
 
 use super::{UDP_SIZE, UdpIo, Udpmask, salamander::SalamanderObfuscator};
 
@@ -177,7 +177,12 @@ pub struct GeckoConn {
     max_pkt: usize,
     msg_id: AtomicU32,
     state: Arc<Mutex<GeckoState>>,
-    gc_abort: AbortHandle,
+    gc_abort: Spawned<()>,
+    /// B6（bd t975）：GC task 唯一托管口（坑约束 5）。abort 走 `gc_abort`，
+    /// scope 随 conn drop 兜底 abort（双保险）。
+    // fx 仅经 drop glue 生效（JoinSet 兜底 abort），无显式读点——同 uot/TcpWorker 先例。
+    #[allow(dead_code)]
+    fx: Arc<FxScope>,
 }
 
 impl GeckoConn {
@@ -203,7 +208,8 @@ impl GeckoConn {
             ));
         }
         let state = Arc::new(Mutex::new(GeckoState::default()));
-        let gc_abort = spawn_gc_task(state.clone());
+        let fx = Arc::new(FxScope::new());
+        let gc_abort = spawn_gc_task(state.clone(), &fx);
         Ok(Self {
             inner: raw,
             obfs,
@@ -212,6 +218,7 @@ impl GeckoConn {
             msg_id: AtomicU32::new(0),
             state,
             gc_abort,
+            fx,
         })
     }
 
@@ -453,26 +460,28 @@ fn evict_oldest(state: &mut GeckoState) {
 }
 
 /// 后台 GC task：周期性扫描过期 entry（对应 Go `gcLoop`）。
-fn spawn_gc_task(state: Arc<Mutex<GeckoState>>) -> AbortHandle {
-    let handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(GECKO_GC_INTERVAL);
-        interval.tick().await; // 跳过立即触发的首次
-        loop {
-            interval.tick().await;
-            let mut s = state.lock();
-            let now = Instant::now();
-            let expired: Vec<ReassemblyKey> = s
-                .reassembly
-                .iter()
-                .filter(|(_, e)| now > e.deadline)
-                .map(|(k, _)| k.clone())
-                .collect();
-            for k in expired {
-                drop_entry(&mut s, &k);
+fn spawn_gc_task(state: Arc<Mutex<GeckoState>>, scope: &FxScope) -> Spawned<()> {
+    // 闸关不可达：scope 归 GeckoConn 独占，无 close 调用（abort 走 gc_abort）。
+    scope
+        .spawn(async move {
+            let mut interval = tokio::time::interval(GECKO_GC_INTERVAL);
+            interval.tick().await; // 跳过立即触发的首次
+            loop {
+                interval.tick().await;
+                let mut s = state.lock();
+                let now = Instant::now();
+                let expired: Vec<ReassemblyKey> = s
+                    .reassembly
+                    .iter()
+                    .filter(|(_, e)| now > e.deadline)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for k in expired {
+                    drop_entry(&mut s, &k);
+                }
             }
-        }
-    });
-    handle.abort_handle()
+        })
+        .expect("internal FxScope is never closed")
 }
 
 #[cfg(test)]

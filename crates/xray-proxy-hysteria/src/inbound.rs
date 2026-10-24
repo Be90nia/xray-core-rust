@@ -454,6 +454,9 @@ async fn handle_udp_session(
     let mut session = UdpDispatchSession::new(dispatcher);
     let mut df = Defragger::new();
     let mut buf = vec![0u8; 65535];
+    // 缓冲随会话持久化（clear + 复用容量）：full 挪哑元前缀、wire 序列化出站帧
+    let mut full = Vec::with_capacity(4 + buf.len());
+    let mut wire: Vec<u8> = Vec::new();
     loop {
         tokio::select! {
             // 上行：client datagram（已剥 4B session id 信封）→ 解码重组 → dispatch
@@ -463,14 +466,14 @@ async fn handle_udp_session(
                     break;
                 }
                 // feed 剥了 4B 信封 → 前补哑元对齐 UdpMessage 的 8B 头布局
-                let mut full = Vec::with_capacity(4 + n);
+                full.clear();
                 full.extend_from_slice(&[0u8; 4]);
                 full.extend_from_slice(&buf[..n]);
                 // Go UDPReader.ReadFrom：解析/重组/地址解析失败 continue 跳过
                 let Ok(msg) = UdpMessage::parse(&full) else {
                     continue;
                 };
-                let Some(msg) = df.feed(&msg) else {
+                let Some(msg) = df.feed(msg) else {
                     continue;
                 };
                 let Some(dest) = crate::dispatcher::parse_udp_source(&msg.addr) else {
@@ -491,7 +494,7 @@ async fn handle_udp_session(
                             data: payload,
                         };
                         // 超 MTU 自动分片（对端 UDPReader+Defragger 重组）
-                        crate::dispatcher::write_udp_message(&sess, &msg).await?;
+                        crate::dispatcher::write_udp_message(&sess, &msg, &mut wire).await?;
                     }
                     Ok(None) => break, // outbound 关闭
                     Err(e) => {

@@ -12,6 +12,7 @@
 use std::{collections::HashMap, net::ToSocketAddrs, sync::Arc};
 
 use parking_lot::Mutex;
+use skeleton_infra::fx::{FxScope, Spawned};
 
 use crate::{
     config::MetricsConfig,
@@ -372,7 +373,10 @@ pub struct TokioHttpServer {
 
 struct TokioHttpServerInner {
     shutdown: Arc<tokio::sync::Notify>,
-    join_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// B6（bd t975）：后台任务唯一托管口（坑约束 5）。本 crate 不在此处 close——
+    /// 停机走 `shutdown()`（Notify + join 排空），scope 随 server drop 兜底 abort。
+    fx: Arc<FxScope>,
+    join_handles: Mutex<Vec<Spawned<()>>>,
 }
 
 impl TokioHttpServer {
@@ -381,6 +385,7 @@ impl TokioHttpServer {
         Self {
             inner: Arc::new(TokioHttpServerInner {
                 shutdown: Arc::new(tokio::sync::Notify::new()),
+                fx: Arc::new(FxScope::new()),
                 join_handles: Mutex::new(Vec::new()),
             }),
         }
@@ -392,7 +397,7 @@ impl TokioHttpServer {
         let handles: Vec<_> = self.inner.join_handles.lock().drain(..).collect();
         let timeout = std::time::Duration::from_secs(5);
         for h in handles {
-            let _ = tokio::time::timeout(timeout, h).await;
+            let _ = tokio::time::timeout(timeout, h.join()).await;
         }
     }
 }
@@ -447,28 +452,31 @@ impl MetricsHttpServer for TokioHttpServer {
         let listener = tokio::net::TcpListener::from_std(std_listener)
             .map_err(|e| MetricsError::ListenInvalid(format!("from_std: {e}")))?;
         let shutdown = self.inner.shutdown.clone();
-        #[allow(clippy::disallowed_methods, reason = "HTTP accept 主循环（Prometheus 抓取服务，JoinSet 收割）；FxScope 未接线（T3.1b 登记）")]
-        let handle = tokio::spawn(async move {
-            // 每连接 task 由本 task 内的 JoinSet 持有：完成即收割（join_next 分支），
-            // 不再 push 到共享 Vec——否则句柄簿记随抓取次数线性增长（票 fu4y）。
-            let mut conn_tasks = tokio::task::JoinSet::new();
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = shutdown.notified() => break,
-                    Some(_) = conn_tasks.join_next(), if !conn_tasks.is_empty() => {}
-                    accept = listener.accept() => {
-                        let Ok((stream, _)) = accept else { continue; };
-                        let stats = stats.clone();
-                        let obs = obs.clone();
-                        let shutdown = shutdown.clone();
-                        conn_tasks.spawn(serve_one(stream, stats, obs, shutdown));
+        let fx = Arc::clone(&self.inner.fx);
+        // 闸关不可达：内部 scope 无 close 调用（停机走 Notify + join 排空）。
+        let handle = fx
+            .spawn(async move {
+                // 每连接 task 由本 task 内的 JoinSet 持有：完成即收割（join_next 分支），
+                // 不再 push 到共享 Vec——否则句柄簿记随抓取次数线性增长（票 fu4y）。
+                let mut conn_tasks = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.notified() => break,
+                        Some(_) = conn_tasks.join_next(), if !conn_tasks.is_empty() => {}
+                        accept = listener.accept() => {
+                            let Ok((stream, _)) = accept else { continue; };
+                            let stats = stats.clone();
+                            let obs = obs.clone();
+                            let shutdown = shutdown.clone();
+                            conn_tasks.spawn(serve_one(stream, stats, obs, shutdown));
+                        }
                     }
                 }
-            }
-            // 关闭：等待残留连接任务退出
-            while conn_tasks.join_next().await.is_some() {}
-        });
+                // 关闭：等待残留连接任务退出
+                while conn_tasks.join_next().await.is_some() {}
+            })
+            .expect("internal FxScope is never closed");
         // 仅 accept-loop 自身的 handle 入共享簿记（shutdown 时等待其退出）
         self.inner.join_handles.lock().push(handle);
         Ok(())
@@ -482,31 +490,34 @@ impl MetricsHttpServer for TokioHttpServer {
     ) -> Result<(), MetricsError> {
         let shutdown = self.inner.shutdown.clone();
         let listener = outbound.listener_clone();
-        #[allow(clippy::disallowed_methods, reason = "outbound listener accept 主循环（JoinSet 收割每连接任务）；FxScope 未接线（T3.1b 登记）")]
-        let handle = tokio::spawn(async move {
-            // 每连接 task 由本 task 内的 JoinSet 持有：完成即收割（票 fu4y）
-            let mut conn_tasks = tokio::task::JoinSet::new();
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = shutdown.notified() => break,
-                    Some(_) = conn_tasks.join_next(), if !conn_tasks.is_empty() => {}
-                    conn = tokio::task::spawn_blocking({
-                        let l = listener.clone();
-                        move || l.accept()
-                    }) => {
-                        let Ok(boxed) = conn else { continue; };
-                        let Ok(conn) = boxed else { break; };
-                        let stats = stats.clone();
-                        let obs = obs.clone();
-                        let shutdown = shutdown.clone();
-                        conn_tasks.spawn(serve_boxed_conn(conn, stats, obs, shutdown));
+        let fx = Arc::clone(&self.inner.fx);
+        // 闸关不可达：内部 scope 无 close 调用（停机走 Notify + join 排空）。
+        let handle = fx
+            .spawn(async move {
+                // 每连接 task 由本 task 内的 JoinSet 持有：完成即收割（票 fu4y）
+                let mut conn_tasks = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.notified() => break,
+                        Some(_) = conn_tasks.join_next(), if !conn_tasks.is_empty() => {}
+                        conn = tokio::task::spawn_blocking({
+                            let l = listener.clone();
+                            move || l.accept()
+                        }) => {
+                            let Ok(boxed) = conn else { continue; };
+                            let Ok(conn) = boxed else { break; };
+                            let stats = stats.clone();
+                            let obs = obs.clone();
+                            let shutdown = shutdown.clone();
+                            conn_tasks.spawn(serve_boxed_conn(conn, stats, obs, shutdown));
+                        }
                     }
                 }
-            }
-            // 关闭：等待残留连接任务退出
-            while conn_tasks.join_next().await.is_some() {}
-        });
+                // 关闭：等待残留连接任务退出
+                while conn_tasks.join_next().await.is_some() {}
+            })
+            .expect("internal FxScope is never closed");
         self.inner.join_handles.lock().push(handle);
         Ok(())
     }

@@ -18,6 +18,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use skeleton_infra::fx::FxScope;
 use tokio::sync::{Mutex, mpsc};
 
 use super::{
@@ -91,6 +92,12 @@ pub(crate) struct XdnsConnServer {
     state: Arc<ServerState>,
     closed: Arc<AtomicBool>,
     read_rx: Mutex<mpsc::Receiver<Packet>>,
+    /// B6（bd t975）：maintain_loop 唯一托管口（坑约束 5）。recv/send/dr 为
+    /// 数据面泵热路径豁免（约束⑫）；scope 随 conn drop 兜底 abort，
+    /// 协作停机仍走 `closed`。
+    // fx 仅经 drop glue 生效（JoinSet 兜底 abort），无显式读点——同 uot/TcpWorker 先例。
+    #[allow(dead_code)]
+    fx: Arc<FxScope>,
 }
 
 impl XdnsConnServer {
@@ -130,12 +137,23 @@ impl XdnsConnServer {
             dr_tx,
         });
 
+        let this = Self {
+            state: Arc::clone(&state),
+            closed: Arc::clone(&closed),
+            read_rx: Mutex::new(read_rx),
+            fx: Arc::new(FxScope::new()),
+        };
+
+        // 数据面泵热路径豁免（约束⑫）：recv/send/dr 三循环不加托管口。
         tokio::spawn(recv_loop(state.clone(), closed.clone()));
         tokio::spawn(send_loop(state.clone(), rec_rx, closed.clone()));
         tokio::spawn(dr_loop(state.clone(), dr_rx, closed.clone()));
-        tokio::spawn(maintain_loop(frag, send_mgr, closed.clone()));
+        // 闸关不可达：内部 scope 无 close 调用（分片维护管理任务随 scope 收口）。
+        this.fx
+            .spawn(maintain_loop(frag, send_mgr, closed))
+            .expect("internal FxScope is never closed");
 
-        Ok(Self { state, closed, read_rx: Mutex::new(read_rx) })
+        Ok(this)
     }
 }
 
