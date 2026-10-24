@@ -165,23 +165,39 @@ pub async fn execute(args: RunArgs) -> Result<()> {
         return Ok(());
     }
 
-    // 直接用调用方(main 的 #[tokio::main])提供的 runtime;本函数自身再
-    // Runtime::new().block_on 会触发"Cannot start a runtime from within a
-    // runtime"(嵌套 runtime panic,release 冒烟实测)。
-    // start_full 注册传输 + outbound + spawn inbound,返回 (instance, ohm, handles)
-    let (instance, _ohm, handles) =
-        xray_core::start_full(&built).await.map_err(|e| CliError::StartFailed(e.to_string()))?;
-
-    // 等待 Ctrl-C / SIGTERM 信号
-    wait_for_signal().await;
-
-    // 优雅关闭:close() 取消 shutdown_token → 所有 inbound serve task 收到 cancel 通知。
-    close_if_sole_owner(instance)?;
-    for h in handles {
-        let _ = h.await;
+    // B5 第二步：feature 开 → xray-frame Framework 组合根路径（装配 + handler 桥，
+    // dispatcher/inbound-outbound 接线留后）；关 → 生产权威 start_full 路径，行为
+    // 一行不变。config_root = 唯一解析产物 Config 的 JSON 投影（段路由底座，
+    // 禁从原文件二次解析）。
+    #[cfg(feature = "framework-assembly")]
+    {
+        let config_root = config
+            .to_json_value()
+            .map_err(|e| CliError::StartFailed(format!("config projection failed: {e}")))?;
+        return crate::framework::run_framework(&built, config_root).await;
     }
-    crate::LOG.info("xray instance shutdown");
-    Ok(())
+
+    #[cfg(not(feature = "framework-assembly"))]
+    {
+        // 直接用调用方(main 的 #[tokio::main])提供的 runtime;本函数自身再
+        // Runtime::new().block_on 会触发"Cannot start a runtime from within a
+        // runtime"(嵌套 runtime panic,release 冒烟实测)。
+        // start_full 注册传输 + outbound + spawn inbound,返回 (instance, ohm, handles)
+        let (instance, _ohm, handles) = xray_core::start_full(&built)
+            .await
+            .map_err(|e| CliError::StartFailed(e.to_string()))?;
+
+        // 等待 Ctrl-C / SIGTERM 信号
+        wait_for_signal().await;
+
+        // 优雅关闭:close() 取消 shutdown_token → 所有 inbound serve task 收到 cancel 通知。
+        close_if_sole_owner(instance)?;
+        for h in handles {
+            let _ = h.await;
+        }
+        crate::LOG.info("xray instance shutdown");
+        Ok(())
+    }
 }
 
 /// 检查 Config 中是否有 inbound 使用 splithttp (XHTTP) transport。
@@ -204,7 +220,8 @@ fn config_uses_splithttp(config: &xray_conf::config::Config) -> bool {
 ///
 /// 对应 Go `main/run.go:100-104` 的 `signal.Notify` + `<-osSignals`。
 /// Windows 等价于 Ctrl-C；Unix 额外监听 SIGTERM（systemd 默认 stop 信号）。
-async fn wait_for_signal() {
+/// `pub(crate)`：framework.rs 组合根路径复用同一信号面（禁复制）。
+pub(crate) async fn wait_for_signal() {
     let ctrl_c = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
             crate::LOG.warn(format!("error={e} ctrl_c handler error"));

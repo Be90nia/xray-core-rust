@@ -44,10 +44,22 @@ ml-dsa = { version = "0.1", default-features = false, features = ["alloc"] }
 # bd uf2p: mimalloc 全局分配器。feature 默认开启（发行构建零参数吃到收益）；
 # A/B 回退用 --no-default-features。仅影响 xray bin，lib/测试不受影响。
 mimalloc = { version = "0.1", optional = true }
+# B2 T2.1 双写对照长跑取证：把 dispatcher 的 dispatcher-dual-write 开关转发到
+# 发行二进制（关闭时依赖不参与、生产路径零新增代码）。
+xray-app-dispatcher = { path = "../xray-app-dispatcher", optional = true }
+# B5 第二步 handler 桥（framework-assembly 拉起）：DispatchHandler/Link/xray_buf io
+# trait 三面均已在 default 闭包（xray-core 非可选依赖），optional 仅控命名空间。
+xray-transport = { path = "../xray-transport", optional = true }
+xray-buf = { path = "../xray-buf", optional = true }
 
 [features]
 default = ["mimalloc"]
 mimalloc = ["dep:mimalloc"]
+dual-write = ["dep:xray-app-dispatcher", "xray-app-dispatcher/dispatcher-dual-write"]
+# B5：xray-frame `Framework` 组合根启动路径 + handler 桥（默认关）。xray-frame 已是
+# 非 optional 依赖（T3.2a LogFacade），本 feature 只门控新路径代码（src/framework.rs
+# + run.rs 分叉），关闭时依赖图与生产行为零变化。
+framework-assembly = ["dep:xray-app-dispatcher", "dep:xray-transport", "dep:xray-buf"]
 
 [dev-dependencies]
 tempfile = "3"
