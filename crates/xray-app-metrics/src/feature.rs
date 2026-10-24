@@ -4,8 +4,8 @@
 //!
 //! ## `Feature::start` 编排（对应 Go `MetricsHandler.Start`，metrics.go:87-123）
 //!
-//! 1. 若 `MetricsConfig::listen` 非空：`TokioHttpServer::start_http_listen` 绑端口 并
-//!    经 FxScope 托管 spawn accept loop（坑约束 5），处理 `GET /metrics` 返回 Prometheus 文本。
+//! 1. 若 `MetricsConfig::listen` 非空：`TokioHttpServer::start_http_listen` 绑端口 并 经 FxScope
+//!    托管 spawn accept loop（坑约束 5），处理 `GET /metrics` 返回 Prometheus 文本。
 //! 2. 创建 `Outbound`（`OutboundListener` + tag）并经 registrar add。
 //! 3. 幂等：第二次 `start` 仅返回 `Ok(())`，不重复 spawn。
 //!

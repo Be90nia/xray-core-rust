@@ -23,6 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use skeleton_infra::fx::FxScope;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use xray_app_dispatcher::default::DialFn;
 use xray_common::{
@@ -232,17 +233,19 @@ impl PreConns {
 /// testpre 预拨号 worker（对应 Go `initpre.Do` 起的 `testpre` 个 goroutine）：
 /// 循环拨服务器 → 入池（池满阻塞等消费腾位，空闲零新拨号）→ sleep 200ms
 /// （Go TODO: customize & randomize）。拨号失败记日志重试（Go LogWarning +
-/// continue）。任务随 handler 存活（Go 同为无退出循环），handler 释放后
-/// push 报 Err 退出（Go 是 goroutine 挂在 chan 上泄漏，此处更干净）。
-fn spawn_preconn_workers(config: Arc<VlessOutboundConfig>, pool: Arc<PreConns>, count: u32) {
+/// continue）。任务归调用方传入的 [`FxScope`] 托管（B6，bd t975：scope 由
+/// dial 闭包自持、与 handler 同生命周期；闭包释放即 abort 在途拨号收摊，
+/// 语义对齐原 push-Err 自退出；scope 不接 close，闸关不可达）。
+fn spawn_preconn_workers(
+    fx: &Arc<FxScope>,
+    config: Arc<VlessOutboundConfig>,
+    pool: Arc<PreConns>,
+    count: u32,
+) {
     for _ in 0..count {
         let config = Arc::clone(&config);
         let pool = Arc::clone(&pool);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-        )]
-        tokio::spawn(async move {
+        fx.spawn(async move {
             loop {
                 match dial_server_conn(&config).await {
                     Ok(conn) => {
@@ -254,7 +257,8 @@ fn spawn_preconn_workers(config: Arc<VlessOutboundConfig>, pool: Arc<PreConns>, 
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
-        });
+        })
+        .expect("internal FxScope is never closed");
     }
 }
 
@@ -365,11 +369,16 @@ pub fn make_dial_fn_with_handshake_timeout(
         let pre_conns = (config.testpre > 0 && config.reverse.is_none())
             .then(|| Arc::new(PreConns::new(Duration::from_secs(120))));
         let preconn_once = Arc::new(std::sync::Once::new());
+        // B6（bd t975）：preconn worker 托管 scope——闭包自持（与 dial fn 同生命
+        // 周期，handler 释放即随闭包丢弃并 abort 在途拨号收摊）；scope 不接 close，
+        // 闸关不可达（spawn 点 expect 只防编程错误）。
+        let preconn_fx = Arc::new(FxScope::new());
         Arc::new(move |dest: &Destination| {
             let config = Arc::clone(&config);
             let enc_client = enc_client.clone();
             let pre_conns = pre_conns.clone();
             let preconn_once = Arc::clone(&preconn_once);
+            let preconn_fx = Arc::clone(&preconn_fx);
             let target_addr = dest.address().clone();
             let target_port = dest.port();
             // 命令决策先于拨号：反向域名未装配 reverse / 非法端口在此报错，不开 socket。
@@ -380,7 +389,9 @@ pub fn make_dial_fn_with_handshake_timeout(
                     let pool = Arc::clone(pool);
                     let cfg = Arc::clone(&config);
                     let count = cfg.testpre;
-                    preconn_once.call_once(move || spawn_preconn_workers(cfg, pool, count));
+                    let fx_workers = Arc::clone(&preconn_fx);
+                    preconn_once
+                        .call_once(move || spawn_preconn_workers(&fx_workers, cfg, pool, count));
                 }
                 establish_conn(
                     config,

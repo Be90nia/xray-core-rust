@@ -42,6 +42,7 @@ pub mod json;
 pub mod lint;
 pub mod outbound_security;
 pub mod protocols;
+pub mod secrets;
 pub mod serial;
 pub mod toml_config;
 pub mod vformat;
@@ -58,5 +59,6 @@ pub use outbound_security::validate_outbound_transport_security;
 pub use protocols::{
     InboundSettings, OutboundSettings, dispatch_inbound_settings, dispatch_outbound_settings,
 };
+pub use secrets::collect_secrets;
 pub use serial::{build_config, merge_config_from_files, merge_configs};
 pub use vformat::Format;

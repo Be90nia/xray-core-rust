@@ -8,9 +8,13 @@
 //! - `ResponseConfig::None`：accept 后直接 drop 连接（静默关闭）。
 //! - `ResponseConfig::Http403`：写 HTTP 403 响应后关闭。
 
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU16, Ordering},
+};
 
 use async_trait::async_trait;
+use skeleton_infra::fx::FxScope;
 use tokio::net::TcpListener;
 use xray_features::inbound::{InboundError, InboundHandler};
 
@@ -28,6 +32,10 @@ pub struct BlackholeInboundHandler {
     cached_port: AtomicU16,
     /// 是否已启动。
     started: AtomicBool,
+    /// 组件内自持托管 scope（B6，app 家族同款；不接 close，闸关不可达）。
+    /// accept 循环与每连接任务经此托管（坑约束 5）；scope 随 handler drop
+    /// 兜底 abort 在途任务。
+    fx: Arc<FxScope>,
 }
 
 impl BlackholeInboundHandler {
@@ -43,6 +51,7 @@ impl BlackholeInboundHandler {
             listen_addr: listen_addr.into(),
             cached_port: AtomicU16::new(0),
             started: AtomicBool::new(false),
+            fx: Arc::new(FxScope::new()),
         }
     }
 }
@@ -64,12 +73,11 @@ impl InboundHandler for BlackholeInboundHandler {
         self.cached_port.store(port, Ordering::SeqCst);
         let response = self.response.clone();
         let tag = self.tag.clone();
-        // spawn accept 循环
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-        )]
-        tokio::spawn(async move {
+        // spawn accept 循环（FxScope 托管，坑约束 5）
+        let fx = Arc::clone(&self.fx);
+        // 预制克隆源：避免 async move 块自捕获 fx 与 spawn 接收者借用冲突（E0505）。
+        let fx_conns = Arc::clone(&fx);
+        fx.spawn(async move {
             loop {
                 let (stream, _peer) = match listener.accept().await {
                     Ok(v) => v,
@@ -79,11 +87,8 @@ impl InboundHandler for BlackholeInboundHandler {
                     },
                 };
                 let response = response.clone();
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-                )]
-                tokio::spawn(async move {
+                let fx = Arc::clone(&fx_conns);
+                fx.spawn(async move {
                     match &response {
                         ResponseConfig::None => {
                             // 静默关闭：直接 drop 连接
@@ -113,9 +118,11 @@ impl InboundHandler for BlackholeInboundHandler {
                             let _ = stream.shutdown().await;
                         },
                     }
-                });
+                })
+                .expect("internal FxScope is never closed");
             }
-        });
+        })
+        .expect("internal FxScope is never closed");
         tracing::info!(tag = %self.tag, port = port, "blackhole inbound started");
         Ok(())
     }

@@ -667,7 +667,7 @@ mod tests {
         assert!(matches!(err, FeatureError::CloseFailed { .. }), "{err}");
         // detach 的 watchdog 线程自行睡到期结束，测试不 join（libtest 语义）。
     }
-        /// T1.1 报告可见性（注入面断言）：close() 编排的逐组件 outcome（clean=info、
+    /// T1.1 报告可见性（注入面断言）：close() 编排的逐组件 outcome（clean=info、
     /// 非 clean=warning）与汇总行内容严格断言（级别 + 文案双断言）。
     ///
     /// 取证面选择：general 通道是**进程级一通道一 sink、二次注册即拒且不可注销**
@@ -684,10 +684,7 @@ mod tests {
         let sink = {
             let captured = Arc::clone(&captured);
             move |severity: xray_common::log::Severity, message: String| {
-                captured
-                    .lock()
-                    .expect("capture ledger")
-                    .push((severity, message));
+                captured.lock().expect("capture ledger").push((severity, message));
             }
         };
         let mut inst = Instance::new();

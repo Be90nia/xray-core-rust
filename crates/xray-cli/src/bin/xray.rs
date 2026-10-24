@@ -493,7 +493,7 @@ mod go_flag_tests {
 
 #[cfg(test)]
 mod blocking_pool_tests {
-    use super::{max_blocking_threads_from, pool_budget_at_risk, DEFAULT_MAX_BLOCKING_THREADS};
+    use super::{DEFAULT_MAX_BLOCKING_THREADS, max_blocking_threads_from, pool_budget_at_risk};
 
     #[test]
     fn max_blocking_threads_parse_falls_back_on_bad_input() {

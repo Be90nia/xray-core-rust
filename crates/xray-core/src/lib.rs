@@ -42,6 +42,8 @@
 //! instance.close().unwrap();
 //! ```
 
+// T4.2 五阶段法 phase 1：协议臂构造函数（inbound/outbound match 臂抽取件）。
+mod arm_builders;
 pub mod config;
 pub mod context;
 pub mod functions;
@@ -51,9 +53,9 @@ pub mod instance;
 pub mod outbound;
 pub mod register;
 // T1.1：Instance::close 停机编排桥（feature 门 `shutdown-coordinator`，默认开；关=旧逆序循环）。
+pub mod router;
 #[cfg(feature = "shutdown-coordinator")]
 mod shutdown_bridge;
-pub mod router;
 // P3-2 对拍测试（cfg(test)）：旧解析面 vs 插件 build 管线逐字段相等。
 #[cfg(test)]
 mod tests_config_parity;

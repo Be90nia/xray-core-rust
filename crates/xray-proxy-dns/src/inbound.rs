@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use skeleton_infra::fx::FxScope;
 use tokio::io::AsyncWriteExt;
 use xray_common::signal::ActivityTimer;
 use xray_features::inbound::{InboundError, InboundHandler};
@@ -33,12 +34,16 @@ pub struct DnsInbound {
     tag: String,
     handler: Handler,
     outbound: DnsOutbound,
+    /// 组件内自持托管 scope（B6，app 家族同款；不接 close，闸关不可达）。
+    /// per-conn inactivity ticker 经此托管（坑约束 5）；连接结束 abort，
+    /// scope 随 handler drop 兜底 abort 残余。
+    fx: Arc<FxScope>,
 }
 
 impl DnsInbound {
     /// 创建 DNS inbound。
     pub fn new(tag: impl Into<String>, handler: Handler, outbound: DnsOutbound) -> Self {
-        Self { tag: tag.into(), handler, outbound }
+        Self { tag: tag.into(), handler, outbound, fx: Arc::new(FxScope::new()) }
     }
 
     /// 处理 UDP DNS 包：返回响应字节（`None` 表示 Drop，不响应）。
@@ -67,11 +72,10 @@ impl DnsInbound {
         let timer = Arc::new(ActivityTimer::new(self.handler.timeout));
         let mut done = timer.done_signal();
         let run_timer = Arc::clone(&timer);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-        )]
-        let ticker = tokio::spawn(async move { run_timer.run().await });
+        let ticker = self
+            .fx
+            .spawn(async move { run_timer.run().await })
+            .expect("internal FxScope is never closed");
         let result = async {
             loop {
                 let query = tokio::select! {

@@ -378,7 +378,7 @@ impl VmessConn {
         let (stream_r, stream_w) = tokio::io::split(conn);
         #[allow(
             clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+            reason = "热路径豁免（B6 t975）：每帧泵——明文 duplex ↔ chunk AEAD wire 双向搬运，热路径零改动（坑约束 12）；托管接线归 P1 插件装配"
         )]
         let pump = tokio::spawn(async move {
             let (server_r, mut server_w) = tokio::io::split(server_io);
@@ -486,7 +486,7 @@ impl VmessUdpConn {
         );
         #[allow(
             clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+            reason = "热路径豁免（B6 t975）：每帧泵——UDP 模式响应头惰性解码 + chunk 解密下行泵，热路径零改动（坑约束 12）；托管接线归 P1 插件装配"
         )]
         let down_task = tokio::spawn(async move {
             let mut sr = stream_r;

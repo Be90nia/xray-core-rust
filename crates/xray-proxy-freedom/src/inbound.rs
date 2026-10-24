@@ -14,6 +14,7 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
+use skeleton_infra::fx::FxScope;
 use tokio::net::TcpListener;
 use xray_app_dispatcher::{OutboundHandlerManager, default::SimpleOhm};
 use xray_common::net::destination::Destination;
@@ -33,6 +34,10 @@ pub struct FreedomInboundHandler {
     cached_port: AtomicU16,
     /// 是否已启动。
     started: AtomicBool,
+    /// 组件内自持托管 scope（B6，app 家族同款；不接 close，闸关不可达）。
+    /// accept 循环与每连接任务经此托管（坑约束 5）；scope 随 handler drop
+    /// 兜底 abort 在途任务。
+    fx: Arc<FxScope>,
 }
 
 impl FreedomInboundHandler {
@@ -50,6 +55,7 @@ impl FreedomInboundHandler {
             ohm,
             cached_port: AtomicU16::new(0),
             started: AtomicBool::new(false),
+            fx: Arc::new(FxScope::new()),
         }
     }
 }
@@ -82,12 +88,11 @@ impl InboundHandler for FreedomInboundHandler {
         self.cached_port.store(port, Ordering::SeqCst);
         let dest = self.dest.clone();
         let tag = self.tag.clone();
-        // spawn accept 循环
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-        )]
-        tokio::spawn(async move {
+        // spawn accept 循环（FxScope 托管，坑约束 5）
+        let fx = Arc::clone(&self.fx);
+        // 预制克隆源：避免 async move 块自捕获 fx 与 spawn 接收者借用冲突（E0505）。
+        let fx_conns = Arc::clone(&fx);
+        fx.spawn(async move {
             loop {
                 let (stream, _peer) = match listener.accept().await {
                     Ok(v) => v,
@@ -98,19 +103,18 @@ impl InboundHandler for FreedomInboundHandler {
                 };
                 let handler = Arc::clone(&handler);
                 let dest = dest.clone();
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-                )]
-                tokio::spawn(async move {
+                let fx = Arc::clone(&fx_conns);
+                fx.spawn(async move {
                     use xray_buf::io::{new_reader, new_writer};
                     use xray_transport::link::Link;
                     let (read_half, write_half) = tokio::io::split(stream);
                     let link = Link::new(new_reader(read_half), new_writer(write_half));
                     let _ = handler.dispatch(&dest, link).await;
-                });
+                })
+                .expect("internal FxScope is never closed");
             }
-        });
+        })
+        .expect("internal FxScope is never closed");
         tracing::info!(tag = %self.tag, port = port, "freedom inbound started");
         Ok(())
     }

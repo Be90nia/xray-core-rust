@@ -127,6 +127,36 @@ impl From<xray_conf::ConfError> for CoreFunctionError {
     }
 }
 
+/// 装配期已装入日志掩码表的凭据全集（进程级）。
+///
+/// udf `ChannelRegistry::set_secrets` 是**替换**语义：多次装配（配置重载 /
+/// 多实例）时若只留最后一次，先前凭据会失去掩码。此处保留并集（只增不减）——
+/// 陈旧凭据继续被打码属安全侧（漏掩码才是泄露侧）。
+static INSTALLED_SECRETS: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+
+/// 装配期凭据注入日志掩码表（T1.5）。
+///
+/// 把配置里四族凭据（vmess/vless id、trojan password、ss method+password）
+/// 装进 udf 通道注册表的掩码表——`ChannelRegistry::set_secrets` 是掩码唯一布点
+/// （emit 写前统一过 `mask_secrets`）。装表后，任何经通道落样的日志行中的凭据
+/// 原文都被打码。
+///
+/// **只影响日志输出**：不改任何 settings 值，转发路径零影响（掩码表是日志侧
+/// 的旁路数据，与协议解析/转发无关）。
+fn install_secret_masking(built: &xray_conf::BuiltConfig) {
+    let secrets = xray_conf::collect_secrets(built);
+    if secrets.is_empty() {
+        return;
+    }
+    let mut installed = INSTALLED_SECRETS.lock();
+    for secret in secrets {
+        if !installed.contains(&secret) {
+            installed.push(secret);
+        }
+    }
+    xray_common::log::channels().set_secrets(installed.clone());
+}
+
 /// 从已构建的 `BuiltConfig` 启动新实例。
 ///
 /// 内部步骤：`Instance::new_from_built(built)` → `instance.start()` → 包装为 `Arc<Instance>`。
@@ -136,6 +166,7 @@ impl From<xray_conf::ConfError> for CoreFunctionError {
 pub fn start_from_built(
     built: &xray_conf::BuiltConfig,
 ) -> Result<Arc<Instance>, CoreFunctionError> {
+    install_secret_masking(built);
     register_all_features();
     register_all_transports();
     let mut instance = Instance::new_from_built(built)?;
@@ -189,6 +220,7 @@ async fn start_full_dispatched(
     // 外部注入路由器（`start_full_with_router` 路径）；None 时按 routing app 自动装配。
     routing_override: Option<Arc<dyn DispatchRouter>>,
 ) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
+    install_secret_masking(built);
     register_all_features();
     register_all_transports();
     let mut instance = Instance::new_from_built(built)?;
@@ -816,6 +848,77 @@ mod tests {
     /// 127.0.0.0/8）——回环 echo 会被黑洞。Go 语义下配置 finalRules 先于默认
     /// 规则匹配（matchFinalRule），显式 allow 即逃生门。
     const FREEDOM_ALLOW_ALL_SETTINGS: &[u8] = br#"{"finalRules":[{"action":"allow"}]}"#;
+
+    /// 捕获 sink：把落样文本收进共享账本（断言用）。
+    struct CaptureSink {
+        lines: StdArc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    impl xray_common::log::ChannelSink for CaptureSink {
+        fn channel(&self) -> xray_common::log::Channel {
+            xray_common::log::Channel::Access
+        }
+
+        fn level(&self) -> xray_common::log::LevelFilter {
+            xray_common::log::LevelFilter::Trace
+        }
+
+        fn write(&self, _level: xray_common::log::Level, _target: &str, message: &str) {
+            self.lines.lock().push(message.to_string());
+        }
+
+        fn dropped_lines(&self) -> u64 {
+            0
+        }
+    }
+
+    const TROJAN_PASSWORD: &str = "trojan-pass-1";
+    /// 落样 marker：同二进制并行测试可能落其他行，断言按 marker 隔离。
+    const MARKER: &str = "T15-MASK-MARKER";
+
+    /// 含凭据的最小配置（trojan 入站；出站 freedom 免明文出站禁令）。
+    fn credential_config() -> xray_conf::Config {
+        let json = serde_json::json!({
+            "inbounds": [
+                { "protocol": "trojan", "port": 10003, "tag": "trojan-in",
+                  "settings": { "clients": [{ "password": TROJAN_PASSWORD }] } },
+            ],
+            "outbounds": [{ "protocol": "freedom", "tag": "direct" }],
+        });
+        xray_conf::load_str(xray_conf::Format::Json, &serde_json::to_string(&json).unwrap())
+            .expect("含凭据配置解析成功")
+    }
+
+    /// 契约验收（T1.5）：装配期装表后，含凭据原文的日志行经通道落样被打码。
+    ///
+    /// 落样通道取 Access（全局 General 槽在生产由 app-log 占用；掩码表是
+    /// **注册表级**的，三通道同表，故观测通道不影响被测行为）。
+    #[test]
+    fn installed_secret_masking_masks_credential_in_channel_output() {
+        let built = credential_config().build().expect("含凭据配置构建成功");
+        let lines = StdArc::new(parking_lot::Mutex::new(Vec::new()));
+        xray_common::log::register_channel(StdArc::new(CaptureSink {
+            lines: StdArc::clone(&lines),
+        }))
+        .expect("全局 Access 槽首注恒 Ok");
+
+        // 装配期装表（生产同一条路径）。
+        install_secret_masking(&built);
+
+        xray_common::log::channels().emit(
+            xray_common::log::Channel::Access,
+            xray_common::log::Level::Info,
+            "xray.access",
+            &format!("{MARKER} credential=trojan-pass-1 in log line"),
+        );
+
+        // 按 marker 过滤（同二进制并行测试可能落其他行）。
+        let seen: Vec<String> =
+            lines.lock().iter().filter(|line| line.contains(MARKER)).cloned().collect();
+        assert_eq!(seen.len(), 1, "marker 落样恰一条: {seen:?}");
+        assert!(seen[0].contains("credential=*** in log line"), "凭据原文必须被打码: {}", seen[0]);
+        assert!(!seen[0].contains(TROJAN_PASSWORD), "凭据原文不得出现");
+    }
 
     /// 探测端口 TOCTOU 加固：`bind(:0)`→drop→InstanceStart 之间并行测试
     /// 可能抢占同端口（os error 98，run 35218583839 ubuntu Workspace lib

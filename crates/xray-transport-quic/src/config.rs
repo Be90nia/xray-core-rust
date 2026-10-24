@@ -397,10 +397,7 @@ mod tests {
             let v = serde_json::json!({ "initialMtu": bad });
             let err = QuicConfig::from_json(Some(&v)).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-            assert!(
-                err.to_string().contains("initialMtu must be 0"),
-                "got: {err}"
-            );
+            assert!(err.to_string().contains("initialMtu must be 0"), "got: {err}");
         }
     }
 

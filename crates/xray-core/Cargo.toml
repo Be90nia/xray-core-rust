@@ -10,13 +10,22 @@ rust-version.workspace = true
 # close 循环（无超时/无 panic 隔离）。shutdown 域 std-only 零 feature——
 # default-features = false 避开 runtime/pool 默认档拖入运行时面。
 default = ["shutdown-coordinator"]
-shutdown-coordinator = ["dep:udf-skeleton-infra"]
+shutdown-coordinator = ["dep:udf-skeleton-infra", "dep:xray-frame"]
+# T4.2 phase 2：构造侧查表（默认关）。开 = inbound/outbound 构造入口先经
+# arm_builders 查表分派（表与 match 到达同一 phase 1 构造函数；等价性测试
+# arm_builders::tests）。默认仍走 match，臂零删改、默认行为零变化。
+arm-lookup = []
 
 [dependencies]
 xray-common = { path = "../xray-common" }
 # T1.1 停机编排桥依赖（经 feature 门启用；依赖形态对齐 xray-frame 注释约定：
 # path 指向仓内 crates/udf-frame 唯一形态，不锁 rev）。
 udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", optional = true, default-features = false }
+# bd 8zs12 停机报告出口（随 shutdown-coordinator feature 门）：报告走 xray-frame
+# LogFacade（tracing 门面）——`xray_common::log` general 出口受 LogInstance::close
+# gate=Off 控制而吞报告（真机实证）；tracing 进程级订阅器不随 feature 关闭。
+# 依赖方向合规：xray-frame 零 xray-core 依赖（骨架不感知血肉），无环。
+xray-frame = { path = "../xray-frame", optional = true }
 base64 = "0.22"
 hex = "0.4"
 xray-features = { path = "../xray-features" }

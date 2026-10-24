@@ -3,22 +3,21 @@
 //! Go quic-go `Transport.DialEarly` 在客户端具备会话票时以 0-RTT 发出 early data，
 //! 无票时等同普通拨号。Rust 侧对应机制分两半，都在本模块：
 //!
-//! 1. **会话票存储**（[`session_store`] / [`enable_client_session_resumption`]）：
-//!    rustls 0.23 `ClientConfig` 每实例自带独立票缓存，连接间不复用 → 0-RTT 永不
-//!    命中。挂进程级共享缓存后，同一 server 第二连起具备 TLS 1.3 PSK 票。该函数
-//!    同时设 `enable_early_data = true`（本仓 vendor rustls 默认 false，不设则
-//!    恢复会话不发 early_data 扩展，quinn `has_0rtt()` 恒 false）。
+//! 1. **会话票存储**（[`session_store`] / [`enable_client_session_resumption`]）： rustls 0.23
+//!    `ClientConfig` 每实例自带独立票缓存，连接间不复用 → 0-RTT 永不 命中。挂进程级共享缓存后，同一
+//!    server 第二连起具备 TLS 1.3 PSK 票。该函数 同时设 `enable_early_data = true`（本仓 vendor
+//!    rustls 默认 false，不设则 恢复会话不发 early_data 扩展，quinn `has_0rtt()` 恒 false）。
 //! 2. **0-RTT 拨号**（[`start_0rtt`]）：quinn `Connecting::into_0rtt`——无票返回
-//!    `Err(connecting)`（原样还回继续普通握手）；有票返回
-//!    `(Connection, ZeroRttAccepted)`，early data 立即可发。
+//!    `Err(connecting)`（原样还回继续普通握手）；有票返回 `(Connection, ZeroRttAccepted)`，early
+//!    data 立即可发。
 //!
 //! # 降级保证（任务红线：不得因 0-RTT 失败而断连）
 //!
-//! - **无票**（首连 / 票过期）：`into_0rtt` 失败 → [`ZeroRttDial::FullHandshake`]，
-//!   调用方对还回的 `Connecting` 普通 `await`，即 Go 无票 DialEarly 的行为。
-//! - **被拒**（server 票密钥轮换 / server 禁 0-RTT）：server 以 1-RTT 完成握手，
-//!   quinn 把已缓冲的 early data 自动转 1-RTT 重发，[`quinn::ZeroRttAccepted`]
-//!   解析 `false`——连接照常建立，数据不丢（quinn 官方 seamless fallback 语义）。
+//! - **无票**（首连 / 票过期）：`into_0rtt` 失败 → [`ZeroRttDial::FullHandshake`]， 调用方对还回的
+//!   `Connecting` 普通 `await`，即 Go 无票 DialEarly 的行为。
+//! - **被拒**（server 票密钥轮换 / server 禁 0-RTT）：server 以 1-RTT 完成握手， quinn 把已缓冲的
+//!   early data 自动转 1-RTT 重发，[`quinn::ZeroRttAccepted`] 解析
+//!   `false`——连接照常建立，数据不丢（quinn 官方 seamless fallback 语义）。
 //!
 //! # 重放风险（安全门槛，bd fgzb 明示）
 //!
@@ -28,8 +27,10 @@
 //! 禁用。重放后果：代理请求包重复投递（server 端 session seq 冲突报错），无资金 /
 //! 副作用语义；若上游把本机制用于非幂等 API，必须先关开关。
 
-use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock, Mutex},
+};
 
 use rustls::client::{ClientSessionMemoryCache, ClientSessionStore, Resumption};
 
@@ -122,8 +123,7 @@ pub fn start_0rtt(connecting: quinn::Connecting) -> ZeroRttDial {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
     use super::{ZeroRttDial, session_store, start_0rtt};
 
@@ -177,12 +177,12 @@ mod tests {
             sni,
             Arc::try_unwrap(tls_arc).unwrap_or_else(|a| (*a).clone()),
         );
-        let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("QuicClientConfig");
+        let quic =
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("QuicClientConfig");
         let mut cfg = quinn::ClientConfig::new(Arc::new(quic));
         // 1s idle timeout：泄漏连接快速回收，不让测试进程挂着 QUIC 状态。
         let mut transport = quinn::TransportConfig::default();
-        transport
-            .max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(1_000))));
+        transport.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(1_000))));
         cfg.transport_config(Arc::new(transport));
         let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("client bind");
         ep.set_default_client_config(cfg);
@@ -263,10 +263,7 @@ mod tests {
             match start_0rtt(ep.connect(addr, "zt-hits.test").unwrap()) {
                 ZeroRttDial::EarlyData(conn, accepted) => break (conn, accepted),
                 ZeroRttDial::FullHandshake(_) => {
-                    assert!(
-                        tries < 20,
-                        "session ticket never became available for 0-RTT"
-                    );
+                    assert!(tries < 20, "session ticket never became available for 0-RTT");
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 },
             }

@@ -220,8 +220,7 @@ pub(crate) async fn run_framework(
 
 #[cfg(test)]
 mod tests {
-    use std::future::Future;
-    use std::pin::Pin;
+    use std::{future::Future, pin::Pin};
 
     use super::*;
 
@@ -309,14 +308,9 @@ mod tests {
             let handler = bridge.get("assembly-probe").expect("probe handler");
             assert_eq!(handler.tag(), "assembly-probe");
 
-            let dest = xray_common::net::destination::Destination::tcp(
-                "127.0.0.1".parse().unwrap(),
-                8080,
-            );
-            let link = xray_transport::link::Link::new(
-                Box::new(NullReader),
-                Box::new(NullWriter),
-            );
+            let dest =
+                xray_common::net::destination::Destination::tcp("127.0.0.1".parse().unwrap(), 8080);
+            let link = xray_transport::link::Link::new(Box::new(NullReader), Box::new(NullWriter));
             handler.dispatch(&dest, link).await.expect("minimal dispatch");
         });
     }
@@ -329,7 +323,12 @@ mod tests {
         fn read_multi_buffer(
             &mut self,
         ) -> Pin<
-            Box<dyn Future<Output = std::result::Result<xray_buf::multi::MultiBuffer, xray_buf::Error>> + Send + '_>,
+            Box<
+                dyn Future<
+                        Output = std::result::Result<xray_buf::multi::MultiBuffer, xray_buf::Error>,
+                    > + Send
+                    + '_,
+            >,
         > {
             Box::pin(std::future::ready(Err(xray_buf::Error::ReadError("null reader".into()))))
         }
@@ -341,7 +340,8 @@ mod tests {
         fn write_multi_buffer(
             &mut self,
             _mb: xray_buf::multi::MultiBuffer,
-        ) -> Pin<Box<dyn Future<Output = std::result::Result<(), xray_buf::Error>> + Send + '_>> {
+        ) -> Pin<Box<dyn Future<Output = std::result::Result<(), xray_buf::Error>> + Send + '_>>
+        {
             Box::pin(std::future::ready(Err(xray_buf::Error::WriteError("null writer".into()))))
         }
     }

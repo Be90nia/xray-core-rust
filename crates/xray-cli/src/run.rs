@@ -37,7 +37,7 @@ use crate::error::{CliError, Result};
 /// 9tk4：`default_directive` 由配置 `log.loglevel` 推导（见 `loglevel_directive`），
 /// 使直连 tracing 日志受 loglevel 单一事实源门控；工具子命令传固定 "info"。
 pub fn init_tracing(default_directive: &str) {
-    use tracing_subscriber::{fmt, EnvFilter};
+    use tracing_subscriber::{EnvFilter, fmt};
     let _ = fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_directive)),
@@ -230,7 +230,7 @@ pub(crate) async fn wait_for_signal() {
 
     #[cfg(unix)]
     let terminate = async {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         match signal(SignalKind::terminate()) {
             Ok(mut s) => {
                 let _ = s.recv().await;

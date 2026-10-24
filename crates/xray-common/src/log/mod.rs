@@ -12,7 +12,12 @@
 
 use std::{fmt, sync::Arc};
 
-use skeleton_infra::logx::{Channel, ChannelError, ChannelRegistry, ChannelSink};
+// udf 通道类型的宿主侧可见性：实现 `ChannelSink` 需命名 trait 与 `Channel`/
+// `log::Level`/`LevelFilter`（udf trait 签名用到），不 re-export 则宿主只能
+// 依赖 udf 仓直连（第二套依赖面）。此处只做**转发**，不新增机制。
+pub use ::log::{Level, LevelFilter};
+pub use skeleton_infra::logx::{Channel, ChannelSink};
+use skeleton_infra::logx::{ChannelError, ChannelRegistry};
 
 /// general 通道落样 target（埋点规范 `xray_frame::<域>`，域 = `log`）。
 const GENERAL_TARGET: &str = "xray_frame::log";

@@ -39,6 +39,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use bytes::{Buf, Bytes};
@@ -66,6 +67,117 @@ pub type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 
 /// h3 RequestStream 类型别名。
 pub type H3RequestStream = h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+
+/// 缺省空闲超时（Go `common/net/net.go:14` `ConnIdleTimeout = 300s`；H3 dialer
+/// `dialer.go:174-176` 在 `quicParams.maxIdleTimeout == 0` 时兜底此值）。
+///
+/// quinn 缺省 idle 仅 30s——长下载/长空闲会话被早抬重付握手。
+const DEFAULT_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// 缺省 keep-alive 周期（Go `common/net/net.go:17` `QuicgoH3KeepAlivePeriod = 10s`；
+/// H3 dialer `dialer.go:177-183` 在 quicParams 与 xmux 都未给值时兜底此值）。
+const DEFAULT_KEEP_ALIVE_PERIOD: Duration = Duration::from_secs(10);
+
+/// H3 QUIC 0-RTT 开关环境变量（bd fgzb）：设为 `0`/`false`/`off`/`no` 禁用，
+/// 未设或其他值 = 开启（对齐 Go `dialer.go:243` `tr.DialEarly`）。
+const ZERO_RTT_ENV: &str = "XRAY_H3_ZERO_RTT";
+
+/// [`ZERO_RTT_ENV`] 取值解析（纯函数，单测钉语义）。
+///
+/// 0-RTT 的 early data 无防重放保证（见 `xray_transport_quic::zero_rtt` 模块文档）；
+/// transport 层无法判断请求幂等性（packet-up 是 POST 代理数据流），故给运行时开关，
+/// 默认开。
+fn zero_rtt_flag(env: Option<&str>) -> bool {
+    !env.map(str::trim).is_some_and(|v| {
+        matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
+    })
+}
+
+/// 0-RTT 是否启用（进程级缓存 env 读取，连接建立属冷路径）。
+fn h3_zero_rtt_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| zero_rtt_flag(std::env::var(ZERO_RTT_ENV).ok().as_deref()));
+    *ENABLED
+}
+
+/// H3 连接空闲超时（Go `dialer.go:174-176` 语义）。
+///
+/// - `quicParams.maxIdleTimeout != 0` → 该值（负数 = 禁用 idle 超时）
+/// - 0/缺省 → [`DEFAULT_MAX_IDLE_TIMEOUT`]
+fn h3_max_idle_timeout(
+    quic_params: Option<&xray_transport::memory_settings::QuicParamsConfig>,
+) -> Option<Duration> {
+    let secs = quic_params.map_or(0, |qp| qp.max_idle_timeout);
+    let secs = if secs == 0 { DEFAULT_MAX_IDLE_TIMEOUT.as_secs() as i64 } else { secs };
+    (secs > 0).then(|| Duration::from_secs(secs.unsigned_abs()))
+}
+
+/// H3 keep-alive 周期（Go `dialer.go:177-183` 三级兜底语义）。
+///
+/// - `quicParams.keepAlivePeriod != 0` → 该值（负数 = 禁用）
+/// - 0 + `xmux.hKeepAlivePeriod != 0` → xmux 值（负数 = 禁用）
+/// - 0 + 0 → [`DEFAULT_KEEP_ALIVE_PERIOD`]
+fn h3_keep_alive_period(
+    config: &Config,
+    quic_params: Option<&xray_transport::memory_settings::QuicParamsConfig>,
+) -> Option<Duration> {
+    let mut secs = quic_params.map_or(0, |qp| qp.keep_alive_period);
+    if secs == 0 {
+        secs = config.xmux.as_ref().map_or(0, |x| x.h_keep_alive_period);
+    }
+    let secs = if secs == 0 { DEFAULT_KEEP_ALIVE_PERIOD.as_secs() as i64 } else { secs };
+    (secs > 0).then(|| Duration::from_secs(secs.unsigned_abs()))
+}
+
+/// 构造 H3 客户端 quinn `TransportConfig`（窗口 + idle + keepalive + CC）。
+///
+/// 抽出为纯函数以便单测钉住缺省值（quinn `TransportConfig` 无 getter）。
+///
+/// # Errors
+///
+/// - 窗口 / idle 超时超出 quinn `VarInt` 边界
+/// - CC 配置非法（见 [`apply_splithttp_cc`]）
+fn build_h3_transport_config(
+    config: &Config,
+    quic_params: Option<&xray_transport::memory_settings::QuicParamsConfig>,
+) -> Result<quinn::TransportConfig> {
+    // bd wz2b W4：None/0（quicParams 缺省）原不设 → quinn 缺省流收窗 1.25MB
+    // （STREAM_RWND）高 BDP 钉 1.25MB/RTT@169ms≈7.4MB/s。缺省显式 16/32MB
+    // （quic crate config.rs 同款），quicParams 显式值仍优先。
+    let (mut stream_win, mut conn_win) = (16u64 * 1024 * 1024, 32u64 * 1024 * 1024);
+    if let Some(qp) = quic_params {
+        if qp.init_stream_receive_window > 0 {
+            stream_win = qp.init_stream_receive_window;
+        }
+        if qp.init_connection_receive_window > 0 {
+            conn_win = qp.init_connection_receive_window;
+        }
+    }
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.stream_receive_window(
+        quinn::VarInt::from_u64(stream_win)
+            .map_err(|e| SplitHttpError::Hyper(format!("stream_window VarInt: {e}")))?,
+    );
+    transport_config.receive_window(
+        quinn::VarInt::from_u64(conn_win)
+            .map_err(|e| SplitHttpError::Hyper(format!("conn_window VarInt: {e}")))?,
+    );
+    // bd zru2：Go H3 缺省 idle 300s / keep-alive 10s（quinn 缺省 idle 30s 且无 PING，
+    // 长下载被早抬重付握手）。负数走 None = quinn 禁用。
+    match h3_max_idle_timeout(quic_params) {
+        Some(d) => transport_config.max_idle_timeout(Some(
+            quinn::IdleTimeout::try_from(d)
+                .map_err(|e| SplitHttpError::Hyper(format!("maxIdleTimeout: {e}")))?,
+        )),
+        None => transport_config.max_idle_timeout(None),
+    };
+    transport_config.keep_alive_interval(h3_keep_alive_period(config, quic_params));
+    // CC 接线（Go dialer.go:161-164 + 239-246）：quicParams 缺省也默认 BBR。
+    let cc_slot =
+        xray_transport_quic::congestion_swappable::install_swappable_cc(&mut transport_config);
+    apply_splithttp_cc(&cc_slot, quic_params)?;
+    Ok(transport_config)
+}
 
 /// 按 splithttp H3 语义应用拥塞控制（对应 Go `splithttp/dialer.go:161-164` nil 兜底 +
 /// `:239-246` congestion switch；conf 层校验语义来自 `infra/conf/transport_internet.go:217-254`，
@@ -172,12 +284,21 @@ impl H3Conn {
     /// v26.3.27 PR #5711）：装可热切换 CC 工厂后按 `apply_splithttp_cc` 语义应用
     /// ——`quicParams` 缺省也默认 BBR(standard)，对齐 Go H3 默认 BBR。
     ///
-    /// 窗口/idle 等 `QuicParamsConfig` 字段映射 quinn [`quinn::TransportConfig`]：
+    /// 窗口/idle/keepalive 等 `QuicParamsConfig` 字段映射 quinn [`quinn::TransportConfig`]：
     ///
     /// - `init_stream_receive_window` / `init_connection_receive_window` → 流/连接初始接收窗口
+    /// - `max_idle_timeout` → `max_idle_timeout`（秒；0 缺省 300s）
+    /// - `keep_alive_period` → `keep_alive_interval`（秒；0 时取 `xmux.hKeepAlivePeriod`，
+    ///   两者都 0 缺省 10s；负数 = 禁用）
     ///
     /// `None`/字段 0 时窗口缺省显式 16MB 流窗/32MB 连接窗（bd wz2b W4，quinn 默认
-    /// 流收窗 1.25MB 高 BDP 钉）；CC 默认 BBR、其余用 quinn 默认值。
+    /// 流收窗 1.25MB 高 BDP 钉）；idle/keepalive 缺省 300s/10s（bd zru2，对齐 Go
+    /// `common/net/net.go:14,17`——quinn 缺省 idle 30s 且无 PING）；CC 默认 BBR。
+    ///
+    /// 0-RTT（bd fgzb，Go `tr.DialEarly` 对位）：进程级共享会话票缓存 +
+    /// quinn `into_0rtt`，同一 server 第二连起尝试 early data；无票转普通握手、
+    /// 被拒自动降级 1-RTT，均不断连。early data 无防重放保证，`XRAY_H3_ZERO_RTT=
+    /// 0|false|off|no` 禁用（默认开，机制详见 `xray_transport_quic::zero_rtt`）。
     ///
     /// 注：`UdpHop`（端口轮换）等需要自管 UDP socket 的特性本切片不接入——
     /// splithttp H3 路径继承 register.rs 的 quinn Endpoint 创建，不做包级劫持。
@@ -199,38 +320,18 @@ impl H3Conn {
         #[allow(clippy::disallowed_methods)] // ALPN 冷路径一次性构造，非数据面热路径
         let alpn_h3 = b"h3".to_vec();
         tls.alpn_protocols = vec![alpn_h3];
+        // 0-RTT 前置：进程级共享票缓存 + enable_early_data + **同一语义配置复用
+        // 同一 Arc<ClientConfig>**（rustls 票与 verifier 实例身份绑定，见
+        // zero_rtt::shared_client_config 文档——不复用则 0-RTT 永不命中）。
+        // 必须在 try_from 前调用。
+        let tls = xray_transport_quic::zero_rtt::shared_client_config(server_name, tls);
         let mut quic_cfg = quinn::ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls))
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls)
                 .map_err(|e| SplitHttpError::Hyper(format!("QuicClientConfig: {e}")))?,
         ));
 
-        // 把 QuicParamsConfig 注入 quinn::TransportConfig。
-        // bd wz2b W4：None/0（quicParams 缺省）原不设 → quinn 缺省流收窗 1.25MB
-        // （STREAM_RWND）高 BDP 钉 1.25MB/RTT@169ms≈7.4MB/s。缺省显式 16/32MB
-        // （quic crate config.rs 同款），quicParams 显式值仍优先。
-        let (mut stream_win, mut conn_win) = (16u64 * 1024 * 1024, 32u64 * 1024 * 1024);
-        if let Some(qp) = quic_params {
-            if qp.init_stream_receive_window > 0 {
-                stream_win = qp.init_stream_receive_window;
-            }
-            if qp.init_connection_receive_window > 0 {
-                conn_win = qp.init_connection_receive_window;
-            }
-        }
-        let mut transport_config = quinn::TransportConfig::default();
-        transport_config.stream_receive_window(
-            quinn::VarInt::from_u64(stream_win)
-                .map_err(|e| SplitHttpError::Hyper(format!("stream_window VarInt: {e}")))?,
-        );
-        transport_config.receive_window(
-            quinn::VarInt::from_u64(conn_win)
-                .map_err(|e| SplitHttpError::Hyper(format!("conn_window VarInt: {e}")))?,
-        );
-        // CC 接线（Go dialer.go:161-164 + 239-246）：quicParams 缺省也默认 BBR。
-        let cc_slot =
-            xray_transport_quic::congestion_swappable::install_swappable_cc(&mut transport_config);
-        apply_splithttp_cc(&cc_slot, quic_params)?;
-        quic_cfg.transport_config(Arc::new(transport_config));
+        // 把 QuicParamsConfig 注入 quinn::TransportConfig（窗口 + idle + keepalive + CC）。
+        quic_cfg.transport_config(Arc::new(build_h3_transport_config(&config, quic_params)?));
 
         let bind: SocketAddr = if addr.is_ipv4() {
             "0.0.0.0:0".parse().expect("valid bind addr")
@@ -248,11 +349,42 @@ impl H3Conn {
         .map_err(|e| SplitHttpError::Hyper(format!("quinn Endpoint: {e}")))?;
         endpoint.set_default_client_config(quic_cfg);
 
-        let conn = endpoint
+        // 0-RTT 拨号（Go dialer.go:243 `tr.DialEarly` 对位）：
+        // - 有票 → early data 立即可发；被拒时 quinn 把缓冲 early data 自动转
+        //   1-RTT 重发（ZeroRttAccepted=false），连接照常建立。
+        // - 无票 → FullHandshake 分支对还回的 Connecting 普通 await。
+        // 两条降级路径都不断连（红线）；重放风险与开关见 XRAY_H3_ZERO_RTT。
+        let connecting = endpoint
             .connect(addr, server_name)
-            .map_err(|e| SplitHttpError::Hyper(format!("quinn connect initiate: {e}")))?
-            .await
-            .map_err(|e| SplitHttpError::Hyper(format!("quinn connect: {e}")))?;
+            .map_err(|e| SplitHttpError::Hyper(format!("quinn connect initiate: {e}")))?;
+        let conn = if h3_zero_rtt_enabled() {
+            match xray_transport_quic::zero_rtt::start_0rtt(connecting) {
+                xray_transport_quic::zero_rtt::ZeroRttDial::EarlyData(conn, accepted) => {
+                    // ZeroRttAccepted 是纯观察 future，后台 task 只记日志；server_name
+                    // 转 owned 以满足 spawn 的 'static（&str 参数活不过函数体）。
+                    let server_name = server_name.to_string();
+                    tokio::spawn(async move {
+                        let accepted = accepted.await;
+                        debug!(
+                            target: "splithttp-h3",
+                            zero_rtt_accepted = accepted,
+                            %addr, %server_name,
+                            "QUIC 0-RTT outcome"
+                        );
+                    });
+                    conn
+                },
+                xray_transport_quic::zero_rtt::ZeroRttDial::FullHandshake(connecting) => {
+                    connecting
+                        .await
+                        .map_err(|e| SplitHttpError::Hyper(format!("quinn connect: {e}")))?
+                },
+            }
+        } else {
+            connecting
+                .await
+                .map_err(|e| SplitHttpError::Hyper(format!("quinn connect: {e}")))?
+        };
 
         let quinn_conn = h3_quinn::Connection::new(conn.clone());
         let (mut driver, send_req) = h3::client::new(quinn_conn)
@@ -656,9 +788,14 @@ mod tests {
     // H3 端到端测试在 tests/mock_h3_server.rs 集成测试覆盖（mock h3::server）。
     // 单元测试需要真实网络 + QUIC + TLS，留集成测试。
 
+    use std::time::Duration;
+
     use xray_transport_quic::congestion_swappable::HysteriaCCSlot;
 
-    use super::apply_splithttp_cc;
+    use super::{
+        apply_splithttp_cc, build_h3_transport_config, h3_keep_alive_period, h3_max_idle_timeout,
+    };
+    use crate::config::{Config, XmuxConfig};
 
     /// 从 finalmask.quicParams JSON 形态解析 QuicParamsConfig（走生产同款解析）。
     fn qp_from_json(
@@ -807,5 +944,77 @@ mod tests {
         assert!(max_v.is_ok(), "max VarInt must succeed");
         let overflow = quinn::VarInt::from_u64(1u64 << 63);
         assert!(overflow.is_err(), "VarInt overflow must fail");
+    }
+
+    /// bd zru2：缺省 idle 300s / keepalive 10s（Go `common/net/net.go:14,17` + H3
+    /// dialer `dialer.go:174-183`）。quicParams 存在但两字段 0 时同样走缺省。
+    #[test]
+    fn h3_idle_and_keepalive_defaults() {
+        let cfg = Config::default();
+        assert_eq!(h3_max_idle_timeout(None), Some(Duration::from_secs(300)));
+        assert_eq!(h3_keep_alive_period(&cfg, None), Some(Duration::from_secs(10)));
+
+        let qp = qp_from_json("bbr", "");
+        assert_eq!(h3_max_idle_timeout(Some(&qp)), Some(Duration::from_secs(300)));
+        assert_eq!(h3_keep_alive_period(&cfg, Some(&qp)), Some(Duration::from_secs(10)));
+    }
+
+    /// Go dialer.go:174-183 覆盖优先级：quicParams 优先；keepalive 次取
+    /// `xmux.hKeepAlivePeriod`；负数 = 禁用（quinn `None`）。
+    #[test]
+    fn h3_idle_and_keepalive_overrides() {
+        let xmux30 = Some(XmuxConfig { h_keep_alive_period: 30, ..Default::default() });
+        let cfg = Config { xmux: xmux30, ..Default::default() };
+
+        let qp = qp_from_json("bbr", r#","maxIdleTimeout":60,"keepAlivePeriod":20"#);
+        assert_eq!(h3_max_idle_timeout(Some(&qp)), Some(Duration::from_secs(60)));
+        assert_eq!(
+            h3_keep_alive_period(&cfg, Some(&qp)),
+            Some(Duration::from_secs(20)),
+            "quicParams.keepAlivePeriod 优先于 xmux"
+        );
+
+        // quicParams keepAlivePeriod 缺省 → 落 xmux 30s
+        let qp_no_ka = qp_from_json("bbr", r#","maxIdleTimeout":60"#);
+        assert_eq!(h3_keep_alive_period(&cfg, Some(&qp_no_ka)), Some(Duration::from_secs(30)));
+
+        // 负数 = 禁用
+        let qp_neg = qp_from_json("bbr", r#","maxIdleTimeout":-1,"keepAlivePeriod":-1"#);
+        assert_eq!(h3_max_idle_timeout(Some(&qp_neg)), None);
+        assert_eq!(h3_keep_alive_period(&cfg, Some(&qp_neg)), None);
+
+        let cfg_neg = Config {
+            xmux: Some(XmuxConfig { h_keep_alive_period: -1, ..Default::default() }),
+            ..Default::default()
+        };
+        assert_eq!(h3_keep_alive_period(&cfg_neg, None), None, "xmux 负数 = 禁用");
+    }
+
+    /// 缺省值必须真的落到 quinn `TransportConfig`（无 getter，用 Debug 输出回读字段）。
+    #[test]
+    fn h3_transport_config_wires_idle_and_keepalive() {
+        let cfg = Config::default();
+
+        let dbg = format!("{:?}", build_h3_transport_config(&cfg, None).unwrap());
+        assert!(dbg.contains("max_idle_timeout: Some(300000)"), "{dbg}");
+        assert!(dbg.contains("keep_alive_interval: Some(10s)"), "{dbg}");
+
+        let qp = qp_from_json("bbr", r#","maxIdleTimeout":60,"keepAlivePeriod":20"#);
+        let dbg = format!("{:?}", build_h3_transport_config(&cfg, Some(&qp)).unwrap());
+        assert!(dbg.contains("max_idle_timeout: Some(60000)"), "{dbg}");
+        assert!(dbg.contains("keep_alive_interval: Some(20s)"), "{dbg}");
+    }
+
+    /// bd fgzb：`XRAY_H3_ZERO_RTT` 开关语义——未设/空/其他值 = 开（对齐 Go
+    /// DialEarly），显式 `0|false|off|no`（含空白）= 禁。
+    #[test]
+    fn zero_rtt_flag_semantics() {
+        assert!(super::zero_rtt_flag(None), "unset = enabled");
+        assert!(super::zero_rtt_flag(Some("")), "empty = enabled");
+        assert!(super::zero_rtt_flag(Some("1")), "1 = enabled");
+        assert!(super::zero_rtt_flag(Some("true")), "true = enabled");
+        for off in ["0", "false", "off", "no", " 0 ", "FALSE"] {
+            assert!(!super::zero_rtt_flag(Some(off)), "{off:?} = disabled");
+        }
     }
 }

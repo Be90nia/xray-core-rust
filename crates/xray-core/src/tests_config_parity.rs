@@ -3,10 +3,13 @@
 //! 全量 `assert_eq!`；freedom 的 fragment/noises 两键 core 面 parse-then-drop、
 //! 插件面接全——已知差异单列断言钉住，不混进全量对拍）。
 //!
-//! T5.1 扩面（2026-10-24）：3 族 → 16 族全覆盖（缺口：ss/dokodemo/tuic 无对拍
-//! 能力，单列不伪造通过；已知差异 3 处以 freedom fragment/noises 同款「钉子」
-//! 测试记录：vless 出站 level/email 生产面丢、hysteria 出站 server_addr 插件面
-//! 缺 port 拼接、wireguard 入站 port 键位置 settings 级 vs 段级）。
+//! T5.1 扩面（2026-10-24）：3 族 → 16 族全覆盖。已知差异 2 处「钉子」已收口为
+//! 一致断言：vless 出站 level/email 生产面接线、wireguard 入站 port 键位收敛
+//! settings 级（本日 B5 前置）。hysteria 出站 server_addr 插件面缺 port 拼接
+//! 一处已收口——插件面按 Go `infra/conf/hysteria.go:13-17` 合成 host:port，与
+//! 生产面逐字相等（见 `hysteria_parity_outbound_server_addr_port`）。
+//! 剩余缺口仅 `ss`（无 Plugin 实现，纯 handler 架构），登记见
+//! `ss_parity_gap_no_plugin_implementation`。
 //!
 //! 本模块 `#[cfg(test)]`，零生产语义；旧 parse 函数原文未动（「本单不删旧
 //! 解析面」红线）。
@@ -18,12 +21,14 @@ use xray_frame::{Plugin, build_plugins_from_config};
 use xray_proxy_anytls::AnytlsPlugin;
 use xray_proxy_blackhole::{BlackholePlugin, ResponseConfig};
 use xray_proxy_dns::DnsPlugin;
+use xray_proxy_dokodemo::{DokodemoPlugin, Network as DokodemoNetwork, PredefinedAddress};
 use xray_proxy_freedom::FreedomPlugin;
-use xray_proxy_hysteria::HysteriaPlugin;
 use xray_proxy_http::HttpPlugin;
+use xray_proxy_hysteria::HysteriaPlugin;
 use xray_proxy_loopback::LoopbackPlugin;
 use xray_proxy_socks::SocksPlugin;
 use xray_proxy_trojan::TrojanPlugin;
+use xray_proxy_tuic::TuicPlugin;
 use xray_proxy_tun::TunPlugin;
 use xray_proxy_vless::VlessPlugin;
 use xray_proxy_vmess::{Validator as VmessValidatorTrait, VmessPlugin};
@@ -250,12 +255,12 @@ fn missing_section_fails_fast_not_global_fallback() {
 // 无 PartialEq → decide 行为探针；vmess/vless validator 无按 email 查询 API →
 // count + behavior_seed（用户 id 集合敏感））。
 //
-// **缺口清单（不伪造通过，P3 入口收口时回补）**：
-// - `ss`：xray-proxy-ss 无 Plugin 实现（框架侧缺），无从对拍。
-// - `dokodemo`：入站生产面 `DokodemoInboundSettings` 私有 struct+私有字段，
-//   字段级对比不可达；出站面插件无观察面（插件只有入站 Config）。
-// - `tuic`：生产面 `TuicInboundSettings` 私有 struct+私有字段，插件
-//   `TuicInboundConfig` 字段无法与生产对拍。
+// **缺口清单（不伪造通过）**：
+// - `ss`：xray-proxy-ss 无 Plugin 实现（纯 handler 架构），无从对拍——登记 锚点
+//   `ss_parity_gap_no_plugin_implementation`。
+// - ~~`dokodemo`/`tuic`~~（已收口，本日 B5 前置）：生产面 struct+解析 fn 放宽
+//   `pub(crate)`（先例注释同 `parse_wireguard_inbound_config`），对拍见
+//   `dokodemo_parity_inbound_full_fields` / `tuic_parity_inbound_full_fields`。
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ── vless：出站字段级（core `parse_vless_config` ↔ VlessPlugin built_outbound）──
@@ -292,15 +297,15 @@ fn vless_parity_outbound_vnext_fields() {
     assert_eq!(p.testseed, core.testseed);
     assert_eq!(p.testpre, core.testpre);
     assert!(p.stream_settings.is_none() && core.stream_settings.is_none());
-    // level/email 两侧不比：生产 `parse_vless_config` 读但未接进 config
-    // （`#[allow(unused_variables)]` 存量清零批次），见下方 known-divergence 钉子。
+    assert_eq!(p.level, core.level);
+    assert_eq!(p.email, core.email);
 }
 
-/// 已知差异钉子（freedom fragment/noises 同款）：vless 出站 `level`/`email`
-/// 生产面读但丢（core 恒 0/空串）、插件面接全。P3 入口收口时收敛任一侧后此
-/// 测试即红，提醒更新主对拍。
+/// vless 出站 `level`/`email` 对拍（原 known-divergence 钉子，已收口）：生产
+/// `parse_vless_config` 接线 `with_level`/`with_email`（Go
+/// `infra/conf/vless.go:247-249` outbound user 语义），与插件面逐字段相等。
 #[test]
-fn vless_known_divergence_outbound_level_email_core_drops() {
+fn vless_parity_outbound_level_email() {
     let settings = json!({
         "vnext": [{
             "address": "server.example.com",
@@ -320,13 +325,9 @@ fn vless_known_divergence_outbound_level_email_core_drops() {
         &[Arc::clone(&plugin) as Arc<dyn Plugin>],
     )
     .expect("plugin build");
-    assert_eq!(
-        (core.level, core.email.as_str()),
-        (0, ""),
-        "生产面现状：level/email 读但丢（收口后本断言翻红）"
-    );
+    assert_eq!((core.level, core.email.as_str()), (1, "cli@x"), "生产面接线（非 0/空串缺省）");
     let p = plugin.built_outbound().expect("built");
-    assert_eq!((p.level, p.email.as_str()), (1, "cli@x"), "插件面接全");
+    assert_eq!((p.level, p.email.as_str()), (core.level, core.email.as_str()), "两侧一致");
 }
 
 // ── vmess：入站 validator（core `build_vmess_validator` ↔ VmessPlugin）──
@@ -469,14 +470,18 @@ fn hysteria_parity_outbound_flat_fields() {
     let p = plugin.built_outbound().expect("built");
     assert_eq!(p.auth, core.1, "auth");
     assert_eq!(p.server_name, core.2, "server_name/sni");
-    // server_addr 不比：插件面存 address 原样（缺 `:{port}` 拼接），见下方钉子。
+    // server_addr（address:port 拼接）见下方 `hysteria_parity_outbound_server_addr_port`。
 }
 
-/// 已知差异钉子：hysteria 出站 `server_addr` 生产面拼 `address:port`、插件面存
-/// address 原样（缺端口）。P3 出站接线（拨号面）前必须收敛插件侧，否则拨号
-/// 目标错端口；收敛后本测试翻红，提醒更新主对拍。
+/// hysteria 出站 `server_addr` 对拍：插件面与生产面**逐字相等**。
+///
+/// Go `infra/conf/hysteria.go:13-17`：`address`=host、`port`=独立字段，拨号
+/// 目标由二者合成 `host:port`（Go `protocol.NewServerSpecFromPB` →
+/// `TCPDestination(address, port)`）；生产面 `parse_hysteria_config` 与插件面
+/// `parse_outbound_config` 同形。插件面若只存 host 原样，B5 切组合根后拨号
+/// 会打错端口。
 #[test]
-fn hysteria_known_divergence_outbound_server_addr_port() {
+fn hysteria_parity_outbound_server_addr_port() {
     let settings = json!({
         "address": "example.com",
         "port": 39622,
@@ -494,7 +499,7 @@ fn hysteria_known_divergence_outbound_server_addr_port() {
     .expect("plugin build");
     assert_eq!(core.0, "example.com:39622", "生产面：address:port 拼接");
     let p = plugin.built_outbound().expect("built");
-    assert_eq!(p.server_addr, "example.com", "插件面现状：address 原样（收口后翻红）");
+    assert_eq!(p.server_addr, core.0, "插件面：address:port 拼接（与生产面一致）");
 }
 
 // ── anytls：出站字段级（core `parse_anytls_config` ↔ built_password）──
@@ -531,7 +536,7 @@ fn wireguard_parity_inbound_device_fields() {
         "secretKey": "aa".repeat(32),
         "port": 51821,
     });
-    let (core_device, _) =
+    let (core_device, core_port) =
         crate::inbound::parse_wireguard_inbound_config(&serde_json::to_vec(&settings).unwrap())
             .expect("core parse");
     let plugin = Arc::new(WireguardPlugin::default());
@@ -543,16 +548,14 @@ fn wireguard_parity_inbound_device_fields() {
     assert_eq!(built, ["wireguard"]);
     let p = plugin.built_config().expect("built");
     assert_eq!(p.device, core_device, "device 全量相等（PartialEq derive）");
-    // listen_port 不比：键位置两侧不同（生产读 settings 内 `port`、插件读段级
-    // `port`），同一份 settings 内样本必然两侧不一致，见下方钉子。
+    assert_eq!(p.listen_port, core_port, "settings 级 port 两侧一致");
 }
 
-/// 已知差异钉子：wireguard 入站 `port` 键位置——生产
-/// `parse_wireguard_inbound_config` 读 settings 内 `port`（Go 对齐），插件
-/// `parse_wireguard_section` 读段级（条目顶层）`port`。settings 内同值两侧必
-/// 一侧缺省。P3 入口收口收敛位置后本测试翻红，提醒更新主对拍。
+/// wireguard 入站 `port` 对拍（原 known-divergence 钉子，已收口）：生产
+/// `parse_wireguard_inbound_config` 与插件 `parse_wireguard_section` 均读
+/// settings 级 `port`（键位收敛，缺省同 51820）。
 #[test]
-fn wireguard_known_divergence_port_key_location() {
+fn wireguard_parity_inbound_port_settings_level() {
     let settings = json!({ "secretKey": "aa".repeat(32), "port": 51821 });
     let (_, core_port) =
         crate::inbound::parse_wireguard_inbound_config(&serde_json::to_vec(&settings).unwrap())
@@ -565,7 +568,7 @@ fn wireguard_known_divergence_port_key_location() {
     )
     .expect("plugin build");
     let p = plugin.built_config().expect("built");
-    assert_eq!(p.listen_port, 51820, "插件面现状：settings 内 port 被忽略（收口后翻红）");
+    assert_eq!(p.listen_port, 51821, "插件面：settings 级 port 生效（与生产同键位）");
 }
 
 // ── loopback：出站 tag（core `outbound::parse_loopback_config` ↔ built_inbound_tag）──
@@ -600,9 +603,8 @@ fn tun_parity_inbound_stack_options_fields() {
         "userLevel": 2,
         "autoSystemRoutingTable": ["t0"],
     });
-    let core =
-        crate::inbound::parse_tun_inbound_config(&serde_json::to_vec(&settings).unwrap())
-            .expect("core parse");
+    let core = crate::inbound::parse_tun_inbound_config(&serde_json::to_vec(&settings).unwrap())
+        .expect("core parse");
     let plugin = Arc::new(TunPlugin::default());
     let built = build_plugins_from_config(
         &root_inbound_with("tun", settings),
@@ -621,4 +623,102 @@ fn tun_parity_inbound_stack_options_fields() {
     assert_eq!(p.auto_system_routing_table, core.auto_system_routing_table);
     assert_eq!(p.auto_outbounds_interface, core.auto_outbounds_interface);
     assert!(p.tun.is_some() && core.tun.is_some(), "占位设备注入两侧一致");
+}
+
+// ── ss：缺口登记（非钉子，不伪造通过）──
+
+/// ss 族对拍**未覆盖**：xray-proxy-ss 为纯 handler 架构——无 `Plugin` 实现、
+/// 无 build 管线产物可观察（`impl Plugin for` 于该 crate 零命中），同规面只剩
+/// 「core 解析 ↔ core handler 自建」自对拍，无跨面差异可断言。收口条件：ss
+/// 接入 xray-frame 插件形态（有 build 观察面）后补对拍。
+#[test]
+fn ss_parity_gap_no_plugin_implementation() {
+    // 登记性锚点（grep "ss_parity" 可达）：无断言语义可写，保持空体。
+}
+
+// ── dokodemo：入站全字段（core `parse_dokodemo_settings` ↔ DokodemoPlugin built_config）──
+
+/// 字段模型差异的语义映射：core 面 `allow_tcp`/`allow_udp` 双 bool ↔ 插件面
+/// `allowed_networks`（`allows_network` 探针）；core 面 `dest` ↔ 插件面
+/// `rewrite_address`+`rewrite_port`；`port_map`/`follow_redirect` 同型直比。
+#[test]
+fn dokodemo_parity_inbound_full_fields() {
+    let settings = json!({
+        "address": "1.2.3.4",
+        "port": 8080,
+        "network": "tcp,udp",
+        "portMap": { "80": "192.168.99.1:9090" },
+    });
+    let core = crate::inbound::parse_dokodemo_settings(&serde_json::to_vec(&settings).unwrap())
+        .expect("core parse");
+    let plugin = Arc::new(DokodemoPlugin::default());
+    let built = build_plugins_from_config(
+        &root_inbound_with("dokodemo-door", settings),
+        &[Arc::clone(&plugin) as Arc<dyn Plugin>],
+    )
+    .expect("plugin build");
+    assert_eq!(built, ["dokodemo-door"]);
+    let p = plugin.built_config().expect("built");
+    // 网络面（core 双 bool ↔ 插件 allowed_networks）。
+    assert!(core.allow_tcp && core.allow_udp, "样本 tcp,udp → 两侧双放行");
+    assert!(p.allows_network(DokodemoNetwork::Tcp), "插件 TCP 放行");
+    assert!(p.allows_network(DokodemoNetwork::Udp), "插件 UDP 放行");
+    // 预定义目标（core dest ↔ 插件 rewrite_address + rewrite_port）。
+    let dest = core.dest.expect("address 在场 → dest Some");
+    let Some(PredefinedAddress::Ip(ip)) = p.predefined_address() else {
+        panic!("rewrite_address 应解析为 IP");
+    };
+    assert_eq!(
+        dest.address(),
+        &xray_common::net::address::Address::from_ipv4_bytes([1, 2, 3, 4]),
+        "core dest.address ↔ 插件 rewrite_address"
+    );
+    assert_eq!(ip, std::net::Ipv4Addr::new(1, 2, 3, 4));
+    assert_eq!(
+        dest.port().value(),
+        u16::try_from(p.rewrite_port).expect("rewrite_port u16"),
+        "core dest.port ↔ 插件 rewrite_port"
+    );
+    assert_eq!(core.follow_redirect, p.follow_redirect);
+    assert_eq!(core.port_map, p.port_map);
+}
+
+// ── tuic：入站全字段（core `parse_tuic_inbound_settings` ↔ TuicPlugin built_config）──
+
+/// bind_addr 两侧来源不同（core 面由装配层传 listener 地址串；插件面从段级
+/// `listen`+`port` 合成），样本对齐成同一 SocketAddr 后逐字段比。sockopt 不比
+/// （core 面由装配层 streamSettings 注入，解析面样本无此输入）。
+#[test]
+fn tuic_parity_inbound_full_fields() {
+    let settings = json!({
+        "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+        "password": "pw1",
+        "serverName": "relay.example.com",
+        "congestion_control": "hysteria_bbr",
+        "brutal_up_bps": 0,
+    });
+    let config = json!({ "inbounds": [{
+        "protocol": "tuic",
+        "listen": "127.0.0.1",
+        "port": 8443,
+        "settings": settings,
+    }] });
+    let core = crate::inbound::parse_tuic_inbound_settings(
+        &serde_json::to_vec(&settings).unwrap(),
+        "127.0.0.1:8443",
+    )
+    .expect("core parse");
+    let plugin = Arc::new(TuicPlugin::default());
+    let built = build_plugins_from_config(&config, &[Arc::clone(&plugin) as Arc<dyn Plugin>])
+        .expect("plugin build");
+    assert_eq!(built, ["tuic"]);
+    let p = plugin.built_config().expect("built");
+    assert_eq!(core.bind_addr, p.listen);
+    assert_eq!(core.server_name, p.server_name);
+    assert_eq!(core.uuid, p.uuid);
+    assert_eq!(core.password, p.password);
+    assert_eq!(core.cert_der, p.cert_der, "无 certificate → 两侧 None（自签延迟到 start）");
+    assert_eq!(core.key_der, p.key_der);
+    assert_eq!(core.congestion_control, p.congestion_control);
+    assert_eq!(core.brutal_up_bps, p.brutal_up_bps);
 }

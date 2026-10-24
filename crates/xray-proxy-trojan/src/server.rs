@@ -20,11 +20,11 @@ use std::{
     task::{Context, Poll},
 };
 
+use skeleton_infra::fx::{FxScope, Spawned};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::TcpListener,
     sync::Mutex,
-    task::JoinHandle,
 };
 use tracing::{debug, info, warn};
 use xray_app_dispatcher::{OutboundHandlerManager, default::SimpleOhm};
@@ -93,14 +93,23 @@ pub struct TrojanServer {
     /// Fallback 决策树（可选）。
     fallbacks: Option<Arc<FallbackPolicy>>,
     /// 监听器 + accept loop 任务句柄。close 时 abort 任务取消 accept().
-    slot: Mutex<Option<(Arc<TcpListener>, JoinHandle<()>)>>,
+    /// 任务经 FxScope 托管（坑约束 5）；scope 随 handler drop 兜底 abort 在途任务。
+    slot: Mutex<Option<(Arc<TcpListener>, Spawned<()>)>>,
+    /// 组件内自持托管 scope（B6，app 家族同款；不接 close，闸关不可达）。
+    fx: Arc<FxScope>,
 }
 
 impl TrojanServer {
     /// 创建新 Trojan 服务器。
     #[must_use]
     pub fn new(tag: impl Into<String>, validator: Arc<Validator>) -> Self {
-        Self { tag: tag.into(), validator, fallbacks: None, slot: Mutex::new(None) }
+        Self {
+            tag: tag.into(),
+            validator,
+            fallbacks: None,
+            slot: Mutex::new(None),
+            fx: Arc::new(FxScope::new()),
+        }
     }
 
     /// 设置 fallback 决策树。
@@ -146,31 +155,30 @@ impl InboundHandler for TrojanServer {
         // sm80④：独立 Handler 路径无装配层注入，SessionDefault 60s 兜底。
         let handshake_timeout = xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT;
         let listener_clone = Arc::clone(&listener);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-        )]
-        let handle = tokio::spawn(async move {
-            loop {
-                match listener_clone.accept().await {
-                    Ok((stream, peer)) => {
-                        let tag = tag.clone();
-                        let validator = validator.clone();
-                        let fallbacks = fallbacks.clone();
-                        #[allow(
-                            clippy::disallowed_methods,
-                            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-                        )]
-                        tokio::spawn(async move {
-                            let mut recorder =
-                                RecordingStream { inner: stream, buf: Vec::with_capacity(256) };
-                            match trojan_server_handshake(
-                                &mut recorder,
-                                &validator,
-                                handshake_timeout,
-                            )
-                            .await
-                            {
+        let fx = Arc::clone(&self.fx);
+        // 预制克隆源：避免 async move 块自捕获 fx 与 spawn 接收者借用冲突（E0505）。
+        let fx_conns = Arc::clone(&fx);
+        let handle = fx
+            .spawn(async move {
+                loop {
+                    match listener_clone.accept().await {
+                        Ok((stream, peer)) => {
+                            let tag = tag.clone();
+                            let validator = validator.clone();
+                            let fallbacks = fallbacks.clone();
+                            let fx = Arc::clone(&fx_conns);
+                            fx.spawn(async move {
+                                let mut recorder = RecordingStream {
+                                    inner: stream,
+                                    buf: Vec::with_capacity(256),
+                                };
+                                match trojan_server_handshake(
+                                    &mut recorder,
+                                    &validator,
+                                    handshake_timeout,
+                                )
+                                .await
+                                {
                                 Ok((network, addr, port, user)) => {
                                     debug!(
                                         tag = %tag,
@@ -203,15 +211,17 @@ impl InboundHandler for TrojanServer {
                                     }
                                 },
                             }
-                        });
-                    },
-                    Err(e) => {
-                        warn!(tag = %tag, error = %e, "accept failed");
-                        break;
-                    },
+                            })
+                            .expect("internal FxScope is never closed");
+                        },
+                        Err(e) => {
+                            warn!(tag = %tag, error = %e, "accept failed");
+                            break;
+                        },
+                    }
                 }
-            }
-        });
+            })
+            .expect("internal FxScope is never closed");
 
         *self.slot.lock().await = Some((listener, handle));
         Ok(())

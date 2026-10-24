@@ -166,11 +166,7 @@ pub struct TlsCertArgs {
 impl TlsCertArgs {
     /// 有效域名列表（domains 非空直接用，否则用占位 `localhost` 通过 rcgen 校验）。
     pub fn effective_domains(&self) -> Vec<String> {
-        if self.domains.is_empty() {
-            vec!["localhost".to_string()]
-        } else {
-            self.domains.clone()
-        }
+        if self.domains.is_empty() { vec!["localhost".to_string()] } else { self.domains.clone() }
     }
 
     /// `--file` 优先，否则 `--out`（历史 Rust 简写）。
@@ -483,7 +479,7 @@ pub fn execute_hash(args: &TlsHashArgs) -> Result<String, CliError> {
 pub fn execute_cert(args: &TlsCertArgs) -> Result<(), CliError> {
     use std::time::Duration;
 
-    use xray_tls::certificate::{generate_self_signed_cert_with_options, CertOptions};
+    use xray_tls::certificate::{CertOptions, generate_self_signed_cert_with_options};
 
     let expire = parse_duration_human(&args.expire).map_err(|e| {
         CliError::InvalidArgument(format!(
@@ -613,7 +609,7 @@ async fn ping_once(ip: std::net::IpAddr, port: u16, sni: Option<&str>) -> Result
 
     use rustls_pki_types::ServerName;
     use tokio::net::TcpStream;
-    use tokio_rustls::{rustls::ClientConfig, TlsConnector};
+    use tokio_rustls::{TlsConnector, rustls::ClientConfig};
 
     let tcp = TcpStream::connect(std::net::SocketAddr::new(ip, port))
         .await
@@ -724,11 +720,7 @@ fn extract_dns_sans(der: &[u8]) -> Option<Vec<String>> {
             _ => None,
         })
         .collect();
-    if names.is_empty() {
-        None
-    } else {
-        Some(names)
-    }
+    if names.is_empty() { None } else { Some(names) }
 }
 
 // ---------------------------------------------------------------------------

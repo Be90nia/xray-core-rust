@@ -50,12 +50,14 @@ use xray_mux::session::ClientStrategy;
 use xray_proto::xray::core::OutboundHandlerConfig as OutboundHandlerConfigProto;
 use xray_proxy_freedom::{Config as FreedomConfig, DomainStrategy, Fragment, Noise};
 // 补全协议注册
-use xray_proxy_hysteria::HysteriaConfig;
 use xray_proxy_loopback::{LoopbackError, LoopbackFuture, LoopbackSink};
 use xray_proxy_trojan::{MemoryAccount, TrojanOutboundConfig};
 use xray_proxy_vless::VlessOutboundConfig;
 use xray_proxy_wireguard::DeviceConfig;
 use xray_transport::{dialer::StreamSettings, link::Link};
+
+// T4.2 phase 1：协议臂构造函数（match 臂 → 一行 builder 调用）。
+use crate::arm_builders::outbound as builders;
 
 /// Dispatcher → LoopbackSink 桥接。
 ///
@@ -342,7 +344,7 @@ fn parse_send_through(
 /// `dialer.go:228-235`（DialSystem 读 `ob.Gateway` 传 src）。代理链 dispatch
 /// 不经 dial_fn（DialBridge::dispatch_via_chain），天然等价 Go
 /// `SetOutboundGateway` 的 `!ProxySettings.HasTag()` 门控。
-fn wrap_dial_with_send_through(
+pub(crate) fn wrap_dial_with_send_through(
     dial: xray_app_dispatcher::default::DialFn,
     spec: xray_transport::system_dialer::SendThroughSpec,
 ) -> xray_app_dispatcher::default::DialFn {
@@ -367,7 +369,7 @@ fn wrap_dial_with_send_through(
 /// `target_strategy` 有效（非 AsIs）时先经 [`wrap_dial_with_target_strategy`]
 /// 包装 dial_fn（bd bqm）。
 #[allow(clippy::type_complexity)] // 返回类型即三组件装配形态
-fn wrap_bridge(
+pub(crate) fn wrap_bridge(
     tag: String,
     dial_fn: xray_app_dispatcher::default::DialFn,
     proxy_chain_tag: &Option<String>,
@@ -669,485 +671,179 @@ fn build_protocol_handler(
     // sockopt 数值/类型启动期硬错（Go 解码期语义）。
     xray_transport::dialer::StreamSettings::validate_sockopt_json(ob.stream_settings_json.as_ref())
         .map_err(|e| BuildError::Parse(e.to_string()))?;
+
+    // T4.2 phase 2：arm-lookup 开启时构造走查表（默认关）。表与 match 到达同一
+    // phase 1 构造函数（等价性测试：arm_builders::tests）；未命中回落 match，
+    // 未知协议 Unsupported 语义不变。
+    #[cfg(feature = "arm-lookup")]
+    if let Some(builder) = crate::arm_builders::lookup_outbound_builder(ob.entry.kind.as_str()) {
+        return builder(crate::arm_builders::OutboundCtx {
+            ob,
+            loopback_sink,
+            mux_bridges,
+            dns,
+            inbound_default_rules,
+            policy_manager,
+            proxy_chain_tag,
+            target_strategy,
+            send_through: send_through.as_ref(),
+        });
+    }
+
+    match_protocol_handler(
+        ob,
+        loopback_sink,
+        mux_bridges,
+        dns,
+        inbound_default_rules,
+        policy_manager,
+        proxy_chain_tag,
+        target_strategy,
+        send_through,
+    )
+}
+
+/// phase 1 抽臂后的 match 本体（arm-lookup 关闭路径；`arm_builders::tests` 经此
+/// 与表查路径对照——该函数不经 feature 门，两态下均为真 match）。
+#[allow(clippy::too_many_arguments)] // 9 参直译拆分前 prelude+match 形态（tuic_frame_relay 先例）
+pub(crate) fn match_protocol_handler(
+    ob: &BuiltOutbound,
+    loopback_sink: Option<Arc<dyn LoopbackSink>>,
+    mux_bridges: &mut Vec<(Arc<MuxBridge>, Option<String>)>,
+    dns: Option<&Arc<xray_app_dns::DnsService>>,
+    // 入站 tag → 默认 final rule 类型（freedom 默认规则按入站协议名推导，
+    // Go getDefaultFinalRule；API 单构建路径传空表 = 无默认规则）
+    inbound_default_rules: &std::collections::HashMap<String, xray_proxy_freedom::DefaultRuleType>,
+    // sm80③/czwu：session policy manager（Go freedom.go:393/222-225）。
+    // freedom 按 settings.userLevel 查档位，其余协议固定 level 0。
+    policy_manager: Option<&dyn xray_features::policy::PolicyManager>,
+    proxy_chain_tag: Option<String>,
+    target_strategy: Option<DomainStrategy>,
+    // owned：臂内 `send_through.as_ref()` 文本与拆分前逐字一致（勿改 & 形参）。
+    send_through: Option<xray_transport::system_dialer::SendThroughSpec>,
+) -> std::result::Result<
+    (Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>),
+    BuildError,
+> {
     match ob.entry.kind.as_str() {
-        "freedom" => {
-            let config = parse_freedom_config(&ob.entry.data)
-                .map_err(|e| BuildError::Parse(e.to_string()))?;
-            let noises = config.noises.clone();
-            let destination_override = config.destination_override.clone();
-            let domain_strategy = config.domain_strategy;
-            // czwu③：freedom settings.userLevel → 出站腿 policy 档位
-            // （Go freedom.go:222-225 policyManager.ForLevel(config.UserLevel)）
-            let bridge_policy = policy_manager.map(|pm| {
-                xray_features::policy::PolicyManager::policy_for_level(pm, config.user_level)
-                    .timeout
-            });
-            // #6742（Go freedom.go:193-198 Init 早退 + :263-265 defaultRule=nil）：
-            // dialerProxy（sockopt.dialerProxy，含 transportLayer 注入）或 proxy_chain
-            // （proxySettings.tag）时 freedom 非最终出站——finalRules 不构建（配了则
-            // warn），入站默认规则不注入（TCP/UDP 的 defaultRule 恒 None）。
-            let stream_dialer_proxy = ob
-                .stream_settings_json
-                .as_ref()
-                .and_then(|v| v.get("sockopt"))
-                .and_then(|v| v.get("dialerProxy"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let uses_dialer_proxy = proxy_chain_tag.is_some() || !stream_dialer_proxy.is_empty();
-            // finalRules 预构建（Go Handler.Init :199-207；构建失败的项跳过）
-            let final_rules: Vec<xray_proxy_freedom::FinalRule> = if uses_dialer_proxy {
-                if !config.final_rules.is_empty() {
-                    tracing::warn!(
-                        tag = %ob.tag,
-                        "The \"finalRules\" setting is ignored when \"sockopt.dialerProxy\" is set, since freedom is not the final outbound."
-                    );
-                }
-                Vec::new()
-            } else {
-                // Go freedom.go:208-214 Init：规则构建失败硬错拒启（此前 .ok() 静默丢弃）。
-                let mut rules = Vec::with_capacity(config.final_rules.len());
-                for rc in &config.final_rules {
-                    rules.push(xray_proxy_freedom::FinalRule::build(rc).map_err(|e| {
-                        BuildError::Parse(format!("freedom: failed to build final rule: {e}"))
-                    })?);
-                }
-                rules
-            };
-            // sockopt.dialerProxy 下沉拨号层（Go freedom.go:58 + dialer.go:270-279 redirect）
-            let dial_fn =
-                xray_proxy_freedom::make_freedom_dial_fn_with_sockopt(config, stream_dialer_proxy);
-            let dial_fn = match target_strategy {
-                Some(s) => wrap_dial_with_target_strategy(dial_fn, s, dns.cloned()),
-                None => dial_fn,
-            };
-            // sendThrough：TCP 分支经 dial_fn 包装（每次拨号设 DIAL_SRC scope）
-            let dial_fn = match &send_through {
-                Some(spec) => wrap_dial_with_send_through(dial_fn, spec.clone()),
-                None => dial_fn,
-            };
-            // TCP 走 DialBridge（fragment/override/proxyProtocol 经 DialFn 消费），UDP 走
-            // FreedomDispatchBridge（noises + override + finalRules + 入站默认规则）
-            let tcp_bridge = Arc::new(DialBridge::new(ob.tag.clone(), dial_fn));
-            if let Some(p) = bridge_policy {
-                tcp_bridge.with_policy(p.clone());
-            }
-            // txno-splice：freedom 是 Go `ob.CanSpliceCopy = 1`（freedom.go:260）
-            // 的唯一置 1 点——DialBridge 桥接判定处据此放行 splice 快路径准入。
-            tcp_bridge.set_splice_outbound(true);
-            let mut bridge =
-                xray_proxy_freedom::FreedomDispatchBridge::from_bridge(Arc::clone(&tcp_bridge))
-                    .with_noises(noises)
-                    .with_destination_override(destination_override)
-                    .with_final_rules(final_rules)
-                    .with_domain_strategy(domain_strategy);
-            if !uses_dialer_proxy {
-                bridge = bridge.with_inbound_default_rules(inbound_default_rules.clone());
-            }
-            if let Some(spec) = &send_through {
-                bridge = bridge.with_send_through(spec.clone());
-            }
-            let handler = Arc::new(bridge) as Arc<dyn DispatchHandler>;
-            let bridge_ref = if proxy_chain_tag.is_some() { Some(tcp_bridge) } else { None };
-            Ok((handler, bridge_ref, proxy_chain_tag))
-        },
-        "vless" => {
-            let config = parse_vless_config(&ob.entry.data)?;
-            let config =
-                config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
-            let dial_fn = xray_proxy_vless::make_vless_dial_fn(Arc::new(config));
-            wrap_bridge(
-                ob.tag.clone(),
-                dial_fn,
-                &proxy_chain_tag,
-                target_strategy,
-                dns,
-                send_through.as_ref(),
-                policy_manager,
-            )
-        },
-        "trojan" => {
-            let config = parse_trojan_config(&ob.entry.data)?;
-            let config =
-                config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
-            let dial_fn = xray_proxy_trojan::make_trojan_dial_fn(Arc::new(config));
-            wrap_bridge(
-                ob.tag.clone(),
-                dial_fn,
-                &proxy_chain_tag,
-                target_strategy,
-                dns,
-                send_through.as_ref(),
-                policy_manager,
-            )
-        },
-        "blackhole" => {
-            let response = parse_blackhole_response(&ob.entry.data)?;
-            let handler = Arc::new(xray_proxy_blackhole::BlackholeHandler::with_response(
-                ob.tag.clone(),
-                response,
-            )) as Arc<dyn DispatchHandler>;
-            Ok((handler, None, None))
-        },
-        "socks" => {
-            let (server_addr, auth) = parse_socks_outbound_config(&ob.entry.data)?;
-            let udp_cfg = match auth {
-                Some((u, p)) => {
-                    xray_proxy_socks::ClientConfig::new_with_auth(server_addr.clone(), u, p)
-                },
-                None => xray_proxy_socks::ClientConfig::new_noauth(server_addr.clone()),
-            };
-            let client = Arc::new(xray_proxy_socks::SocksClient::new(udp_cfg.clone()));
-            let dial_fn = xray_proxy_socks::make_socks_dial_fn(client);
-            // TCP 走 DialBridge（targetStrategy/sendThrough 经 dial_fn 包装）；
-            // UDP 票 ft58 S2：SocksUdpClient ASSOCIATE 会话 + udp::relay 泵，
-            // 此前 UDP 目的地被 DialBridge 当 TCP 载荷静默降级。
-            let dial_fn = match target_strategy {
-                Some(st) => wrap_dial_with_target_strategy(dial_fn, st, dns.cloned()),
-                None => dial_fn,
-            };
-            let dial_fn = match send_through {
-                Some(spec) => wrap_dial_with_send_through(dial_fn, spec.clone()),
-                None => dial_fn,
-            };
-            let tcp_bridge = Arc::new(DialBridge::new(ob.tag.clone(), dial_fn));
-            if let Some(pm) = policy_manager {
-                tcp_bridge.with_policy(
-                    xray_features::policy::PolicyManager::policy_for_level(pm, 0).timeout,
-                );
-            }
-            let dispatch =
-                SocksUdpDispatch { tag: ob.tag.clone(), tcp: Arc::clone(&tcp_bridge), udp_cfg };
-            let handler = Arc::new(dispatch) as Arc<dyn DispatchHandler>;
-            let bridge_ref = if proxy_chain_tag.is_some() { Some(tcp_bridge) } else { None };
-            Ok((handler, bridge_ref, proxy_chain_tag))
-        },
-        "mux" => {
-            let (concurrency, via_tag) = parse_mux_config(&ob.entry.data)?;
-            let (bridge, _slot) = MuxBridge::new(ob.tag.clone(), concurrency);
-            let bridge = Arc::new(bridge);
-            mux_bridges.push((Arc::clone(&bridge), via_tag));
-            let handler = bridge as Arc<dyn DispatchHandler>;
-            Ok((handler, None, None))
-        },
-        "vmess" => {
-            let config = xray_proxy_vmess::parse_vmess_config(&ob.entry.data)?;
-            let config =
-                config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
-            let dial_fn = xray_proxy_vmess::make_vmess_dial_fn(Arc::new(config));
-            wrap_bridge(
-                ob.tag.clone(),
-                dial_fn,
-                &proxy_chain_tag,
-                target_strategy,
-                dns,
-                send_through.as_ref(),
-                policy_manager,
-            )
-        },
-        "shadowsocks" => {
-            let config = xray_proxy_ss::parse_ss_config(&ob.entry.data)?;
-            let config =
-                config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
-            let dial_fn = xray_proxy_ss::make_ss_dial_fn(Arc::new(config));
-            wrap_bridge(
-                ob.tag.clone(),
-                dial_fn,
-                &proxy_chain_tag,
-                target_strategy,
-                dns,
-                send_through.as_ref(),
-                policy_manager,
-            )
-        },
-        "hysteria" => {
-            let (server_addr, auth, server_name) = parse_hysteria_config(&ob.entry.data)?;
-            let stream_settings =
-                xray_transport::dialer::StreamSettings::from_json(ob.stream_settings_json.as_ref());
-            // Go 客户端 settings 不含 auth：它在 streamSettings.hysteriaSettings.auth
-            // （infra/conf/transport_method.go HysteriaConfig）。
-            let auth = if auth.is_empty() {
-                ob.stream_settings_json
-                    .as_ref()
-                    .and_then(|v| v.get("hysteriaSettings"))
-                    .and_then(|v| v.get("auth"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string()
-            } else {
-                auth
-            };
-            // tlsSettings.serverName 覆盖 settings 推导（Go tls.Config ServerName 优先级）。
-            let server_name = stream_settings
-                .security_json
-                .as_ref()
-                .and_then(|v| v.get("serverName"))
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map_or_else(|| server_name, str::to_string);
-            let config = HysteriaConfig::new(&server_addr, &auth).with_server_name(&server_name);
-            let tls_config = build_hysteria_tls_config(
-                &stream_settings.security,
-                stream_settings.security_json.as_ref(),
-            )
-            .map_err(|e| format!("hysteria streamSettings: {e}"))?;
-            let obfs = xray_transport_hysteria::salamander_socket::parse_udp_obfs(
-                stream_settings.finalmask_json.as_ref(),
-            )
-            .map_err(|e| format!("hysteria finalmask: {e}"))?;
-            // streamSettings.finalmask.quicParams → HysteriaConfig（brutal/CC/windows/keepAlive）
-            let quic_params = xray_transport_hysteria::quic_params::parse_quic_params(
-                stream_settings.finalmask_json.as_ref(),
-            )
-            .map_err(|e| format!("hysteria quicParams: {e}"))?
-            .unwrap_or_else(xray_transport_hysteria::quic_params::default_hysteria_quic_params);
-            let config = config.with_quic_params(quic_params);
-            let transport =
-                xray_transport_hysteria::hysteria_transport::QuinnHysteriaTransport::new(
-                    tls_config,
-                    "0.0.0.0:0".parse().map_err(|e| format!("bind addr: {e}"))?,
-                )
-                .map_err(|e| format!("hysteria transport: {e}"))?
-                // QUIC 端点缓冲：streamSettings.sockopt（缺省 = 8MB 下限语义）。
-                .with_sockopt(stream_settings.socket_options())
-                .with_obfs(obfs);
-            let dial_fn = xray_proxy_hysteria::make_hysteria_dial_fn(config, Arc::new(transport));
-            wrap_bridge(
-                ob.tag.clone(),
-                dial_fn,
-                &proxy_chain_tag,
-                target_strategy,
-                dns,
-                send_through.as_ref(),
-                policy_manager,
-            )
-        },
-        "anytls" => {
-            let config = parse_anytls_config(&ob.entry.data)?;
-            // streamSettings.sockopt → dial_system（mark/dialerProxy/happyEyeballs/
-            // domainStrategy，bd n65u）；network/security 段由 anytls 协议自持
-            // TLS，不消费。
-            let sockopt =
-                xray_transport::dialer::StreamSettings::from_json(ob.stream_settings_json.as_ref())
-                    .socket_options();
-            let client =
-                Arc::new(xray_proxy_anytls::AnytlsClient::new(config.with_sockopt(sockopt)));
-            let dial_fn = xray_proxy_anytls::make_anytls_dial_fn(client);
-            wrap_bridge(
-                ob.tag.clone(),
-                dial_fn,
-                &proxy_chain_tag,
-                target_strategy,
-                dns,
-                send_through.as_ref(),
-                policy_manager,
-            )
-        },
-        "tuic" => {
-            let s = parse_tuic_config(&ob.entry.data)?;
-            // streamSettings.tlsSettings.pinnedPeerCertSha256 → 证书钉扎验证器
-            // （tuic 自持 QUIC TLS，不经 transport 层 xray-tls 客户端装配，需在
-            // 此接线；interop #36：自签服务端以 pin 验证替代 webpki 链验证）。
-            let pinned_verifier = if s.insecure {
-                None
-            } else {
-                let tls_json =
-                    ob.stream_settings_json.as_ref().and_then(|ss| ss.get("tlsSettings"));
-                // 非 string（数组等手误）置 true，让 build_server_cert_verifier →
-                // parse_pinned_hashes 报类型错拒启，而非静默丢 pin（bd zl5t）。
-                let has_pins = tls_json
-                    .and_then(|j| j.get("pinnedPeerCertSha256"))
-                    .is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|s| !s.is_empty()));
-                if has_pins {
-                    xray_tls::client_config::build_server_cert_verifier(tls_json)
-                        .map_err(|e| format!("tuic pinned verifier: {e}"))?
-                } else {
-                    None
-                }
-            };
-            let rustls_config = build_tuic_rustls_config(
-                &s.alpn,
-                s.reduce_rtt,
-                s.insecure,
-                s.certificate.as_deref(),
-                pinned_verifier,
-            )?;
-            let options = xray_proxy_tuic::TuicConnectOptions {
-                congestion_control: s.congestion_control,
-                heartbeat: s.heartbeat,
-                udp_relay_mode: s.udp_relay_mode,
-                brutal_up_bps: s.brutal_up_bps,
-                // QUIC 端点缓冲：streamSettings.sockopt（缺省 = 8MB 下限语义）。
-                sockopt: xray_transport::dialer::StreamSettings::from_json(
-                    ob.stream_settings_json.as_ref(),
-                )
-                .socket_options(),
-            };
-            let dial_fn = xray_proxy_tuic::make_tuic_dial_fn_lazy(
-                s.server_addr.clone(),
-                s.server_name.clone(),
-                s.uuid,
-                s.password.clone(),
-                Arc::clone(&rustls_config),
-                options.clone(),
-            );
-            // TCP 走 DialBridge（targetStrategy/sendThrough 经 dial_fn 包装）；
-            // UDP 票 z9gp：XUDP 帧 ↔ TuicUdpAssoc（quic uni-stream / native datagram
-            // 按 udp_relay_mode），对齐 freedom/hysteria 出站 UDP 形态。
-            let dial_fn = match target_strategy {
-                Some(st) => wrap_dial_with_target_strategy(dial_fn, st, dns.cloned()),
-                None => dial_fn,
-            };
-            let dial_fn = match send_through {
-                Some(spec) => wrap_dial_with_send_through(dial_fn, spec.clone()),
-                None => dial_fn,
-            };
-            let tcp_bridge = Arc::new(DialBridge::new(ob.tag.clone(), dial_fn));
-            if let Some(pm) = policy_manager {
-                tcp_bridge.with_policy(
-                    xray_features::policy::PolicyManager::policy_for_level(pm, 0).timeout,
-                );
-            }
-            let udp_params = Arc::new(TuicUdpParams {
-                server_addr: s.server_addr,
-                server_name: s.server_name,
-                uuid: s.uuid,
-                password: s.password,
-                rustls_config,
-                options,
-            });
-            let dispatch = TuicUdpDispatch {
-                tag: ob.tag.clone(),
-                tcp: Arc::clone(&tcp_bridge),
-                params: udp_params,
-            };
-            let handler = Arc::new(dispatch) as Arc<dyn DispatchHandler>;
-            let bridge_ref = if proxy_chain_tag.is_some() { Some(tcp_bridge) } else { None };
-            Ok((handler, bridge_ref, proxy_chain_tag))
-        },
-        "wireguard" => {
-            let config = parse_wireguard_config(&ob.entry.data)?;
-            // Go handler.go:242 把 Handler 自身作为 internet.Dialer 传给
-            // proxy.Process；handler.go:274-302——ProxySettings.Tag 非空时 WG
-            // 自身 UDP 经 chained outbound（如 socks）拨号（pipe + Dispatch）。
-            // Rust 经 DIALER_PROXY_HOOK 同构管道：sockopt.dialer_proxy=tag →
-            // dial_system 重定向到 tag 对应 handler（register_outbounds 注册）。
-            let system_dialer: Option<xray_app_dispatcher::default::DialFn> =
-                proxy_chain_tag.as_ref().map(|chain_tag| {
-                    let tag = chain_tag.clone();
-                    Arc::new(move |dest: &Destination| {
-                        let dest = dest.clone();
-                        let tag = tag.clone();
-                        Box::pin(async move {
-                            let sockopt = xray_transport::sockopt::SocketOptions {
-                                dialer_proxy: tag,
-                                ..Default::default()
-                            };
-                            xray_transport::system_dialer::dial_system(&dest, &sockopt)
-                                .await
-                                .map_err(|e| format!("wireguard chain dial: {e}"))
-                        })
-                            as std::pin::Pin<
-                                Box<
-                                    dyn Future<
-                                            Output = std::result::Result<
-                                                Box<dyn xray_transport::connection::Connection>,
-                                                String,
-                                            >,
-                                        > + Send,
-                                >,
-                            >
-                    }) as xray_app_dispatcher::default::DialFn
-                });
-            let dial_fn =
-                xray_proxy_wireguard::make_wireguard_dial_fn(config, dns.cloned(), system_dialer);
-            wrap_bridge(
-                ob.tag.clone(),
-                dial_fn,
-                &proxy_chain_tag,
-                target_strategy,
-                dns,
-                send_through.as_ref(),
-                policy_manager,
-            )
-        },
-        "dns" => {
-            let cfg = build_dns_outbound_config(&ob.entry.data)?;
-            // G14（Go dns.go:85）：h.timeout = ForLevel(config.UserLevel)
-            // .Timeouts.ConnectionIdle——超时 policy 驱动，无 manager 显式回退 + warn。
-            let dns_idle = dns_idle_timeout_for(policy_manager, cfg.user_level);
-            let handler = xray_proxy_dns::Handler::init(&cfg, dns_idle);
-            let bridge = DnsDispatchBridge::new(ob.tag.clone(), handler, dns.cloned());
-            Ok((Arc::new(bridge) as Arc<dyn DispatchHandler>, None, None))
-        },
-        "loopback" => {
-            // Go loopback.go:56-62：sniffing 经 BuildSniffingRequest 注入重分发；
-            // sink 由生产装配注入（functions.rs），per-handler sniffing 透传到
-            // DispatcherLoopbackSink → dispatch_link。
-            let (inbound_tag, sniffing) = parse_loopback_config(&ob.entry.data)?;
-            let handler =
-                xray_proxy_loopback::LoopbackHandler::with_inbound_tag(ob.tag.clone(), inbound_tag)
-                    .with_sniffing_request(sniffing);
-            let handler = match loopback_sink {
-                Some(sink) => handler.with_sink(sink),
-                None => handler,
-            };
-            Ok((Arc::new(handler) as Arc<dyn DispatchHandler>, None, None))
-        },
-        "http" => {
-            let config = xray_proxy_http::parse_http_config(&ob.entry.data)?;
-            let config =
-                config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
-            let dial_fn = xray_proxy_http::make_http_dial_fn(Arc::new(config));
-            wrap_bridge(
-                ob.tag.clone(),
-                dial_fn,
-                &proxy_chain_tag,
-                target_strategy,
-                dns,
-                send_through.as_ref(),
-                policy_manager,
-            )
-        },
-        "naive" => {
-            let config = parse_naive_config(&ob.entry.data)?;
-            let dial_fn = xray_transport_naive::make_naive_dial_fn(config);
-            wrap_bridge(
-                ob.tag.clone(),
-                dial_fn,
-                &proxy_chain_tag,
-                target_strategy,
-                dns,
-                send_through.as_ref(),
-                policy_manager,
-            )
-        },
-        "dokodemo" => {
-            let config = parse_dokodemo_config(&ob.entry.data)?;
-            let dial_fn = xray_proxy_dokodemo::make_dokodemo_dial_fn(config);
-            wrap_bridge(
-                ob.tag.clone(),
-                dial_fn,
-                &proxy_chain_tag,
-                target_strategy,
-                dns,
-                send_through.as_ref(),
-                policy_manager,
-            )
-        },
+        "freedom" => builders::build_freedom_outbound(
+            ob,
+            proxy_chain_tag,
+            target_strategy,
+            dns,
+            inbound_default_rules,
+            policy_manager,
+            send_through.as_ref(),
+        ),
+        "vless" => builders::build_vless_outbound(
+            ob,
+            proxy_chain_tag,
+            target_strategy,
+            dns,
+            policy_manager,
+            send_through.as_ref(),
+        ),
+        "trojan" => builders::build_trojan_outbound(
+            ob,
+            proxy_chain_tag,
+            target_strategy,
+            dns,
+            policy_manager,
+            send_through.as_ref(),
+        ),
+        "blackhole" => builders::build_blackhole_outbound(ob),
+        "socks" => builders::build_socks_outbound(
+            ob,
+            proxy_chain_tag,
+            target_strategy,
+            dns,
+            policy_manager,
+            send_through.as_ref(),
+        ),
+        "mux" => builders::build_mux_outbound(ob, mux_bridges),
+        "vmess" => builders::build_vmess_outbound(
+            ob,
+            proxy_chain_tag,
+            target_strategy,
+            dns,
+            policy_manager,
+            send_through.as_ref(),
+        ),
+        "shadowsocks" => builders::build_shadowsocks_outbound(
+            ob,
+            proxy_chain_tag,
+            target_strategy,
+            dns,
+            policy_manager,
+            send_through.as_ref(),
+        ),
+        "hysteria" => builders::build_hysteria_outbound(
+            ob,
+            proxy_chain_tag,
+            target_strategy,
+            dns,
+            policy_manager,
+            send_through.as_ref(),
+        ),
+        "anytls" => builders::build_anytls_outbound(
+            ob,
+            proxy_chain_tag,
+            target_strategy,
+            dns,
+            policy_manager,
+            send_through.as_ref(),
+        ),
+        "tuic" => builders::build_tuic_outbound(
+            ob,
+            proxy_chain_tag,
+            target_strategy,
+            dns,
+            policy_manager,
+            send_through.as_ref(),
+        ),
+        "wireguard" => builders::build_wireguard_outbound(
+            ob,
+            proxy_chain_tag,
+            target_strategy,
+            dns,
+            policy_manager,
+            send_through.as_ref(),
+        ),
+        "dns" => builders::build_dns_outbound(ob, dns, policy_manager),
+        "loopback" => builders::build_loopback_outbound(ob, loopback_sink),
+        "http" => builders::build_http_outbound(
+            ob,
+            proxy_chain_tag,
+            target_strategy,
+            dns,
+            policy_manager,
+            send_through.as_ref(),
+        ),
+        "naive" => builders::build_naive_outbound(
+            ob,
+            proxy_chain_tag,
+            target_strategy,
+            dns,
+            policy_manager,
+            send_through.as_ref(),
+        ),
+        "dokodemo" => builders::build_dokodemo_outbound(
+            ob,
+            proxy_chain_tag,
+            target_strategy,
+            dns,
+            policy_manager,
+            send_through.as_ref(),
+        ),
         #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
-        "tun" => {
-            let dial_fn = xray_proxy_tun::make_tun_dial_fn();
-            wrap_bridge(
-                ob.tag.clone(),
-                dial_fn,
-                &proxy_chain_tag,
-                target_strategy,
-                dns,
-                send_through.as_ref(),
-                policy_manager,
-            )
-        },
+        "tun" => builders::build_tun_outbound(
+            ob,
+            proxy_chain_tag,
+            target_strategy,
+            dns,
+            policy_manager,
+            send_through.as_ref(),
+        ),
         #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
         "tun" => Err(BuildError::Unsupported(
             "TUN outbound is only supported on Linux/Android/FreeBSD".to_string(),
@@ -1345,7 +1041,7 @@ impl DispatchHandler for MuxBridge {
 }
 
 /// JSON 格式：`{"concurrency": 8, "via": "proxy-out"}`（concurrency 缺省 8）。
-fn parse_mux_config(data: &[u8]) -> std::result::Result<(u32, Option<String>), String> {
+pub(crate) fn parse_mux_config(data: &[u8]) -> std::result::Result<(u32, Option<String>), String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
     let concurrency = v.get("concurrency").and_then(|x| x.as_u64()).unwrap_or(8) as u32;
     let via = v.get("via").and_then(|x| x.as_str()).filter(|s| !s.is_empty()).map(String::from);
@@ -1420,9 +1116,7 @@ pub(crate) fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutbou
     if enc_params.is_none() && !encryption.is_empty() && encryption != "none" {
         return Err(format!(r#"VLESS users: unsupported "encryption": {encryption}"#));
     }
-    #[allow(unused_variables)] // 存量清零批次
     let level = user.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    #[allow(unused_variables)] // 存量清零批次
     let email = user.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
     // 反向代理 Bridge 装配（Go infra/conf/vless.go:302-308：`reverse.tag` 挂在 user 上；
     // 出站侧 `handler.reverse` 由它派生，见 outbound.go:104-125）。tag 指向 portal，
@@ -1454,7 +1148,9 @@ pub(crate) fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutbou
     .with_encryption(encryption.clone())
     .with_encryption_params(enc_params)
     .with_testseed(testseed)
-    .with_testpre(testpre);
+    .with_testpre(testpre)
+    .with_level(level)
+    .with_email(email);
     let Some(tag) = reverse_tag else {
         return Ok(config);
     };
@@ -1470,7 +1166,9 @@ pub(crate) fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutbou
 /// 解析 trojan outbound settings JSON → TrojanOutboundConfig。
 ///
 /// JSON 格式：`{ "servers": [{ "address": "...", "port": 443, "password": "..." }] }`
-fn parse_trojan_config(data: &[u8]) -> std::result::Result<TrojanOutboundConfig, String> {
+pub(crate) fn parse_trojan_config(
+    data: &[u8],
+) -> std::result::Result<TrojanOutboundConfig, String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
     // Go infra/conf/trojan.go:45-56 扁平形式：顶层 address 非空 → 以顶层
     // password/level/email/flow 构造 servers[0]（覆盖显式 servers 数组）。
@@ -1541,7 +1239,7 @@ fn parse_trojan_config(data: &[u8]) -> std::result::Result<TrojanOutboundConfig,
 /// streamSettings（`tls.ConfigFromStreamSettings`），`security != "tls"` 时配置为
 /// nil → 硬错。`insecure: true` 显式跳过校验（用户信任决策）；缺省走 webpki-roots
 /// 真实验证（此前恒 NoVerifier 不校验，自签/中间人不可察觉）。
-fn build_hysteria_tls_config(
+pub(crate) fn build_hysteria_tls_config(
     security: &str,
     tls_json: Option<&serde_json::Value>,
 ) -> std::result::Result<rustls::ClientConfig, String> {
@@ -1751,7 +1449,7 @@ async fn lookup_for_ip(
 /// - `content.SkipDNSResolve` 门控未实现（Go handler.go:184）
 /// - UDP `GetDynamicStrategy(origTargetAddr)` 动态策略未实现（Go handler.go:186-188）； UDP
 ///   域名目标按原策略解析
-fn wrap_dial_with_target_strategy(
+pub(crate) fn wrap_dial_with_target_strategy(
     inner: xray_app_dispatcher::default::DialFn,
     strategy: DomainStrategy,
     dns: Option<Arc<xray_app_dns::DnsService>>,
@@ -1867,7 +1565,7 @@ pub(crate) fn parse_blackhole_response(
 ///
 /// JSON 格式（Go `proxy/socks/config.go`）：
 /// `{ "servers": [{ "address": "...", "port": 1080, "users": [{ "user": "u", "pass": "p" }] }] }`
-fn parse_socks_outbound_config(
+pub(crate) fn parse_socks_outbound_config(
     data: &[u8],
 ) -> std::result::Result<(String, Option<(String, String)>), String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
@@ -1899,7 +1597,7 @@ fn parse_socks_outbound_config(
 /// 从 outbound 的 stream_settings_json 构造 StreamSettings。
 ///
 /// None 或非 object 返回 None（走 raw TCP）。
-fn parse_stream_settings(json: &Option<serde_json::Value>) -> Option<StreamSettings> {
+pub(crate) fn parse_stream_settings(json: &Option<serde_json::Value>) -> Option<StreamSettings> {
     let s = StreamSettings::from_json(json.as_ref());
     // TCP + 无 security 且无任何 transport 级配置，才等于没 streamSettings
     // （返回 None 保持既有 raw TCP 路径）。
@@ -1973,7 +1671,7 @@ impl DispatchHandler for StubDispatchBridge {
 ///   可触发 FakeDNS）/ Direct（原样字节转发到 rewrite 后的 dest）
 /// - UDP 单请求-响应；TCP 双路 IO loop（request 帧 → 决策，response 帧 → 回写）
 /// DNS 不走标准 DialBridge（无 dial 语义），而是直接实现 DispatchHandler。
-struct DnsDispatchBridge {
+pub(crate) struct DnsDispatchBridge {
     tag: String,
     /// 规则匹配 Handler（qType + domain → action + rCode）。
     handler: xray_proxy_dns::Handler,
@@ -1982,7 +1680,7 @@ struct DnsDispatchBridge {
 }
 
 impl DnsDispatchBridge {
-    fn new(
+    pub(crate) fn new(
         tag: impl Into<String>,
         handler: xray_proxy_dns::Handler,
         dns_service: Option<Arc<xray_app_dns::server::DnsService>>,
@@ -2721,7 +2419,9 @@ fn build_legacy_dns_policy(
 /// Rust 方言（保留）：`rule[]`（单数）、`rewriteServer` 对象（逐项覆盖）。
 /// 未知键 warn 留痕，不静默。
 /// `pub(crate)`：P3-2 对拍测试（tests_config_parity）跨模块消费，语义零变化。
-pub(crate) fn build_dns_outbound_config(data: &[u8]) -> std::result::Result<xray_proxy_dns::Config, String> {
+pub(crate) fn build_dns_outbound_config(
+    data: &[u8],
+) -> std::result::Result<xray_proxy_dns::Config, String> {
     let v: serde_json::Value =
         serde_json::from_slice(data).map_err(|e| format!("dns outbound settings JSON: {e}"))?;
     warn_unknown_dns_outbound_keys(&v);
@@ -2907,7 +2607,7 @@ pub(crate) fn parse_anytls_config(
 ///
 /// JSON 格式（uriclient.py 生成）：
 /// `{ "server": "...", "port": 443, "sni": "...", "username": "...", "password": "..." }`
-fn parse_naive_config(
+pub(crate) fn parse_naive_config(
     data: &[u8],
 ) -> std::result::Result<xray_transport_naive::NaiveConfig, String> {
     let v: serde_json::Value =
@@ -2979,7 +2679,9 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 ///
 /// `version` 字段对齐 Go `infra/conf/hysteria.go:20-22`：缺省 = 2，v1 硬报错。
 /// `pub(crate)`：P3-2 对拍测试（tests_config_parity）跨模块消费，语义零变化。
-pub(crate) fn parse_hysteria_config(data: &[u8]) -> std::result::Result<(String, String, String), String> {
+pub(crate) fn parse_hysteria_config(
+    data: &[u8],
+) -> std::result::Result<(String, String, String), String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
     // 强制 version == 2（Go 端 hysteria.go:20-22 行为镜像）
     if let Some(ver) = v.get("version").and_then(|x| x.as_i64()) {
@@ -3018,22 +2720,22 @@ static TUIC_ASSOC_ID: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU1
 /// TUIC UDP relay 懒连接参数（TCP dial_fn 与 UDP 分支各自持连接；TUIC server
 /// 同端口多连接合法。ponytail: 与 TCP 共享连接池需重构 dial_fn 闭包捕获，
 /// UDP 场景占比低，暂独立）。
-struct TuicUdpParams {
-    server_addr: String,
-    server_name: String,
-    uuid: uuid::Uuid,
-    password: String,
-    rustls_config: Arc<rustls::ClientConfig>,
-    options: xray_proxy_tuic::TuicConnectOptions,
+pub(crate) struct TuicUdpParams {
+    pub(crate) server_addr: String,
+    pub(crate) server_name: String,
+    pub(crate) uuid: uuid::Uuid,
+    pub(crate) password: String,
+    pub(crate) rustls_config: Arc<rustls::ClientConfig>,
+    pub(crate) options: xray_proxy_tuic::TuicConnectOptions,
 }
 
 /// TUIC 出站 dispatch bridge：TCP 走 DialBridge，UDP 从 link 读 XUDP 帧 →
 /// [`xray_proxy_tuic::TuicUdpAssoc`] → 响应装 XUDP 帧写回（对应 Go tuic
 /// outbound 的 UDP relay；此此前 UDP 分派被 DialBridge 当 TCP 载荷静默发出）。
-struct TuicUdpDispatch {
-    tag: String,
-    tcp: Arc<DialBridge>,
-    params: Arc<TuicUdpParams>,
+pub(crate) struct TuicUdpDispatch {
+    pub(crate) tag: String,
+    pub(crate) tcp: Arc<DialBridge>,
+    pub(crate) params: Arc<TuicUdpParams>,
 }
 
 impl std::fmt::Debug for TuicUdpDispatch {
@@ -3224,11 +2926,11 @@ fn dest_default_udp() -> Destination {
 /// ASSOCIATE 会话（对应 Go `proxy/socks/client.go:112/142-160`；泵 = socks crate
 /// `udp::relay`，XUDP 帧流 ↔ SOCKS5 UDP 数据报）。此前 UDP 目的地被 DialBridge
 /// 当 TCP 载荷静默降级（ft58 S2 病根）。
-struct SocksUdpDispatch {
-    tag: String,
-    tcp: Arc<DialBridge>,
+pub(crate) struct SocksUdpDispatch {
+    pub(crate) tag: String,
+    pub(crate) tcp: Arc<DialBridge>,
     /// UDP ASSOCIATE 用配置（server 地址 + 可选认证；与 TCP dial 同源）。
-    udp_cfg: xray_proxy_socks::ClientConfig,
+    pub(crate) udp_cfg: xray_proxy_socks::ClientConfig,
 }
 
 impl std::fmt::Debug for SocksUdpDispatch {
@@ -3272,30 +2974,30 @@ impl DispatchHandler for SocksUdpDispatch {
 /// tuic outbound 解析结果（官方 tuic-client relay 配置子集，bd 7p0）。
 ///
 /// 字段与默认值对齐 Itsusinn/tuic（官方 TUIC 实现后继）client config.rs。
-struct TuicOutboundSettings {
+pub(crate) struct TuicOutboundSettings {
     /// `host:port` 或 `ip:port` 原样保留；域名在 dial 时由 ToSocketAddrs 解析。
-    server_addr: String,
-    server_name: String,
-    uuid: uuid::Uuid,
-    password: String,
+    pub(crate) server_addr: String,
+    pub(crate) server_name: String,
+    pub(crate) uuid: uuid::Uuid,
+    pub(crate) password: String,
     /// 拥塞控制（官方默认 bbr）。
-    congestion_control: xray_proxy_tuic::CongestionControl,
+    pub(crate) congestion_control: xray_proxy_tuic::CongestionControl,
     /// Brutal 上行带宽（bps）；仅 hysteria_brutal 消费，0 = 未配置（解析层拒绝）。
-    brutal_up_bps: u64,
+    pub(crate) brutal_up_bps: u64,
     /// ALPN 列表；空 → 默认 ["h3","tuic"]。
-    alpn: Vec<Vec<u8>>,
+    pub(crate) alpn: Vec<Vec<u8>>,
     /// 0-RTT（官方名 zero_rtt_handshake）。注意：quinn 0-RTT 须显式
     /// `Connection::into_0rtt`，会话恢复不会自动启用 0-RTT；本仓 reduce_rtt
     /// 实际仅启用 TLS 会话恢复（session resumption），与官方 Rust 客户端行为一致。
-    reduce_rtt: bool,
+    pub(crate) reduce_rtt: bool,
     /// UDP relay 模式（官方默认 native）。
-    udp_relay_mode: xray_proxy_tuic::UdpRelayMode,
+    pub(crate) udp_relay_mode: xray_proxy_tuic::UdpRelayMode,
     /// 心跳周期（官方默认 3s）。
-    heartbeat: std::time::Duration,
+    pub(crate) heartbeat: std::time::Duration,
     /// 跳过证书验证（显式 opt-in）。
-    insecure: bool,
+    pub(crate) insecure: bool,
     /// 信任的服务端证书 PEM（自签 CA 场景）。
-    certificate: Option<String>,
+    pub(crate) certificate: Option<String>,
 }
 
 /// 解析 tuic outbound settings JSON。
@@ -3304,7 +3006,7 @@ struct TuicOutboundSettings {
 /// "server_name":"...","congestion_control":"bbr","alpn":["h3"],
 /// "reduce_rtt":false,"udp_relay_mode":"native","heartbeat":3,
 /// "insecure":false,"certificate":"<PEM>"}]}`。
-fn parse_tuic_config(data: &[u8]) -> std::result::Result<TuicOutboundSettings, String> {
+pub(crate) fn parse_tuic_config(data: &[u8]) -> std::result::Result<TuicOutboundSettings, String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
     let servers = v
         .get("servers")
@@ -3401,7 +3103,7 @@ fn parse_tuic_config(data: &[u8]) -> std::result::Result<TuicOutboundSettings, S
 /// 对齐 Go `tls.Config{InsecureSkipVerify}` 语义——仅 `insecure=true` 显式跳过。
 /// `pinned_verifier`（来自 streamSettings.tlsSettings.pinnedPeerCertSha256）
 /// 优先于 `certificate` CA：pin 命中即信任，替代整链验证。
-fn build_tuic_rustls_config(
+pub(crate) fn build_tuic_rustls_config(
     alpn: &[Vec<u8>],
     reduce_rtt: bool,
     insecure: bool,
@@ -3598,7 +3300,9 @@ pub(crate) fn parse_wireguard_config(data: &[u8]) -> std::result::Result<DeviceC
 /// [`crate::wiring::sniffing_request_from_json`] 转换（Go
 /// `proxyman.BuildSniffingRequest`，由 `Loopback.init` loopback.go:56-62 注入）。
 /// `pub(crate)`：P3-2 对拍测试（tests_config_parity）跨模块消费，语义零变化。
-pub(crate) fn parse_loopback_config(data: &[u8]) -> std::result::Result<(String, SniffingRequest), String> {
+pub(crate) fn parse_loopback_config(
+    data: &[u8],
+) -> std::result::Result<(String, SniffingRequest), String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
     let inbound_tag = v
         .get("inboundTag")
@@ -3613,7 +3317,7 @@ pub(crate) fn parse_loopback_config(data: &[u8]) -> std::result::Result<(String,
 ///
 /// JSON 格式：`{ "address": "1.2.3.4", "port": 443 }`。
 /// address 支持域名和 IP；port 必须 0-65535。
-fn parse_dokodemo_config(
+pub(crate) fn parse_dokodemo_config(
     data: &[u8],
 ) -> std::result::Result<xray_proxy_dokodemo::DokodemoOutboundConfig, String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;

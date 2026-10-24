@@ -17,6 +17,9 @@ xray-xudp = { path = "../xray-xudp" }
 # 是生产代码——cargo 模型下必须生产依赖；xray-frame 不依赖协议 crate，无环，
 # 拍板 P2.1 的"防环"由 xray-frame 单向不引协议 crate 保证）。
 xray-frame = { path = "../xray-frame" }
+# B6（bd t975）：spawn 托管面走 udf skeleton_infra::fx::FxScope（坑约束 5）。
+# path 形态同 xray-app-dns（udf-frame 仓内工作副本即改即用；CI 由 fetch-udf 拉料，不锁 rev）。
+udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio"] }
 # plugin.rs 段路由解析（settings → ServerConfig，同规 xray-core parse_socks_server_config）。
 serde_json = { workspace = true }
 rand = { workspace = true }

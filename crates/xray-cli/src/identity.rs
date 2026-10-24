@@ -138,11 +138,7 @@ fn fingerprint_file(path: &Path) -> std::io::Result<String> {
 }
 
 fn build_profile() -> &'static str {
-    if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    }
+    if cfg!(debug_assertions) { "debug" } else { "release" }
 }
 
 fn target_triple() -> String {
