@@ -452,9 +452,25 @@ mod tests {
         // ① 提交 N 个任务后 borrow_rejected()==0 且借还计数归零（RAII 归还）。
         pool.shutdown_join();
         assert_eq!(pool.borrow_rejected(), 0);
-        let m = pool.mem_pool().metrics();
-        assert_eq!(m.core.borrowed, 0, "buffers must all be returned");
-        assert_eq!(m.core.idle, m.core.max, "all buffers back in pool");
+        // worker 的缓冲在任务闭包返回时归还，而结果 `tx.send` 在闭包体内先发生 →
+        // `join()` 之后的瞬间仍可能落在「send 已发、guard 尚未 drop」窗口
+        // （CI release run 40054602144 偶发：idle=1/max=2）。按 udf 抖动治理惯例
+        // 用墙钟截止轮询等窗口闭合——真泄漏（永不归还）到点仍必红，断言不放松。
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let m = pool.mem_pool().metrics();
+            if m.core.borrowed == 0 && m.core.idle == m.core.max {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "buffers not returned after shutdown_join: borrowed={} idle={} max={}",
+                m.core.borrowed,
+                m.core.idle,
+                m.core.max
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
