@@ -13,6 +13,7 @@
 //! （dispatcher.rs `Network::UDP` 注释；Go shadowsocks_2022 无 uot 消费点），
 //! 因此本测试同时证明 uot 字段在场不改变多用户 UDP wire 行为。
 
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros))] // 测试脚手架：spawn 起停被测服务/回环 echo、直印进度；非生产托管面
 use std::{sync::Arc, time::Duration};
 
 use base64::Engine as _;

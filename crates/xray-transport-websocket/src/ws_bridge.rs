@@ -38,7 +38,7 @@ use tokio::{
     sync::Mutex,
     task::JoinHandle,
 };
-use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
+use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 use xray_transport::connection::Connection;
 
 /// 桥接 WebSocket 帧流为字节流。

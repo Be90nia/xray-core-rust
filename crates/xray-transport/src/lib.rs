@@ -28,6 +28,11 @@
 // 将 Pin<Box<dyn Future>> 判为已 must_use → double_must_use 误报；宏行为非本 crate 可控。
 #![allow(clippy::double_must_use)]
 
+/// T3.2a 日志统一入口：域规范 target = `xray_frame::transport`（热路径豁免清单见
+/// reports/framework-audit-2026-10-24/T3.2a-log-transport-cli.md）。
+pub(crate) static LOG: std::sync::LazyLock<xray_frame::logging::LogFacade> =
+    std::sync::LazyLock::new(|| xray_frame::logging::LogFacade::new("transport", vec![]));
+
 pub mod accept_policy;
 pub mod bridge;
 pub mod cnc;

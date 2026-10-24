@@ -16,8 +16,8 @@
 use std::{
     alloc::{GlobalAlloc, Layout},
     sync::{
-        OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -61,11 +61,9 @@ pub fn init() {
     // init 期前置条件，fail-fast：dump 线程起不来 = 计数无法观测，静默继续没有意义。
     std::thread::Builder::new()
         .name("alloc-stats".into())
-        .spawn(move || {
-            loop {
-                std::thread::sleep(interval);
-                dump();
-            }
+        .spawn(move || loop {
+            std::thread::sleep(interval);
+            dump();
         })
         .expect("spawn alloc-stats dumper thread");
 }

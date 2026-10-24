@@ -9,6 +9,7 @@
 //! 不依赖 xray_transport（SS crate 未引入），用裸 TcpStream 直接拨号到 echo，
 //! 等价于 freedom outbound 对 IP 目标的行为。
 
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros))] // 测试脚手架：spawn 起停被测服务/回环 echo、直印进度；非生产托管面
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},

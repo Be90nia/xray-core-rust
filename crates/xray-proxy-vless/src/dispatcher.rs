@@ -238,6 +238,10 @@ fn spawn_preconn_workers(config: Arc<VlessOutboundConfig>, pool: Arc<PreConns>, 
     for _ in 0..count {
         let config = Arc::clone(&config);
         let pool = Arc::clone(&pool);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         tokio::spawn(async move {
             loop {
                 match dial_server_conn(&config).await {

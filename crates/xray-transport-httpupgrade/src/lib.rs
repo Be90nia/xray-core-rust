@@ -30,6 +30,13 @@
 //!   实际 TCP/TLS 监听 + `keepAccepting` 循环 + PROXY protocol 解析留 follow-up
 //!   （依赖 `xray-transport::Dialer` impl + `k9t reality-s2` 的 uTLS 决策）。
 
+/// T3.2a 日志统一入口：域规范 target = `xray_frame::transport::httpupgrade`（热路径豁免清单见
+/// reports/framework-audit-2026-10-24/T3.2a-log-transport-cli.md）。
+pub(crate) static LOG: std::sync::LazyLock<xray_frame::logging::LogFacade> =
+    std::sync::LazyLock::new(|| {
+        xray_frame::logging::LogFacade::new("transport::httpupgrade", vec![])
+    });
+
 pub mod client;
 pub mod config;
 pub mod connection;
@@ -47,7 +54,7 @@ pub use deferred::DeferredResponseReader;
 pub use dialer::{build_upgrade_request, parse_upgrade_response};
 pub use error::{HttpUpgradeError, Result};
 pub use hub::{
-    UpgradeRequest, apply_trusted_x_forwarded_for, build_upgrade_response, parse_upgrade_request,
-    parse_x_forwarded_for,
+    apply_trusted_x_forwarded_for, build_upgrade_response, parse_upgrade_request,
+    parse_x_forwarded_for, UpgradeRequest,
 };
 pub use register::{register_dialer, register_listener};

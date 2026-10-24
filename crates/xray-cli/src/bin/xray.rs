@@ -305,17 +305,13 @@ fn spawn_blocking_pool_monitor() {
             let pinned = xray_transport_kcp::pinned_recv_loops();
             let cap = max_blocking_threads();
             if pool_budget_at_risk(pinned, cap) {
-                tracing::warn!(
-                    pinned_recv_loops = pinned,
-                    max_blocking_threads = cap,
-                    "mKCP pinned recv loops reached half the blocking pool cap; spawn_blocking budget at risk"
-                );
+                xray_cli::LOG.warn(format!(
+                    "pinned_recv_loops={pinned} max_blocking_threads={cap} mKCP pinned recv loops reached half the blocking pool cap; spawn_blocking budget at risk"
+                ));
             } else {
-                tracing::debug!(
-                    pinned_recv_loops = pinned,
-                    max_blocking_threads = cap,
-                    "blocking pool headroom ok"
-                );
+                xray_cli::LOG.debug(format!(
+                    "pinned_recv_loops={pinned} max_blocking_threads={cap} blocking pool headroom ok"
+                ));
             }
         }
     });
@@ -497,7 +493,7 @@ mod go_flag_tests {
 
 #[cfg(test)]
 mod blocking_pool_tests {
-    use super::{DEFAULT_MAX_BLOCKING_THREADS, max_blocking_threads_from, pool_budget_at_risk};
+    use super::{max_blocking_threads_from, pool_budget_at_risk, DEFAULT_MAX_BLOCKING_THREADS};
 
     #[test]
     fn max_blocking_threads_parse_falls_back_on_bad_input() {

@@ -83,6 +83,10 @@ impl InboundHandler for FreedomInboundHandler {
         let dest = self.dest.clone();
         let tag = self.tag.clone();
         // spawn accept 循环
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         tokio::spawn(async move {
             loop {
                 let (stream, _peer) = match listener.accept().await {
@@ -94,6 +98,10 @@ impl InboundHandler for FreedomInboundHandler {
                 };
                 let handler = Arc::clone(&handler);
                 let dest = dest.clone();
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+                )]
                 tokio::spawn(async move {
                     use xray_buf::io::{new_reader, new_writer};
                     use xray_transport::link::Link;

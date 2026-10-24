@@ -70,6 +70,7 @@ impl YamuxBridge {
         let conn =
             yamux::Connection::new(tcp.compat(), yamux::Config::default(), yamux::Mode::Client);
         let (open_tx, open_rx) = mpsc::channel(64);
+        #[allow(clippy::disallowed_methods, reason = "drive_bridge 驱动任务（bridge 生命周期随 Self）；FxScope 未接线（T3.1b 登记）")]
         tokio::spawn(drive_bridge(conn, open_rx));
         Ok(Self { open_tx })
     }
@@ -159,6 +160,7 @@ where
         tcp.set_nodelay(true).ok();
 
         let cb = Arc::clone(&on_stream);
+        #[allow(clippy::disallowed_methods, reason = "portal yamux 服务端会话 accept；FxScope 未接线（T3.1b 登记）")]
         tokio::spawn(async move {
             tracing::debug!(peer = %peer, "portal bridge connected");
             let conn =
@@ -184,6 +186,7 @@ where
             },
             Some(Ok(stream)) => {
                 let cb = Arc::clone(&on_stream);
+                #[allow(clippy::disallowed_methods, reason = "portal 子流回调派发（on_stream 回调）；FxScope 未接线（T3.1b 登记）")]
                 tokio::spawn(async move {
                     cb(stream.compat()).await;
                 });

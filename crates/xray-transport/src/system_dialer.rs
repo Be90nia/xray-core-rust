@@ -454,7 +454,9 @@ pub async fn lookup_for_ip(
     }
     // Resolve fallback（dialer.go:96-103）：首查空/错 + 有回退 + 无 local_addr 约束。
     if (ips.is_empty() || err.is_some()) && strategy.has_fallback() && local_addr.is_none() {
-        tracing::debug!(domain, ?err, "lookup_for_ip falling back to fallback family");
+        crate::LOG.debug(format!(
+            "domain={domain} err={err:?} lookup_for_ip falling back to fallback family"
+        ));
         match client
             .lookup_ip(
                 domain,
@@ -518,12 +520,12 @@ impl SystemSrvTxtResolver {
                 Ok(builder) => match builder.build() {
                     Ok(r) => Some(r),
                     Err(e) => {
-                        tracing::warn!(error = %e, "build system DNS resolver failed");
+                        crate::LOG.warn(format!("error={e} build system DNS resolver failed"));
                         None
                     },
                 },
                 Err(e) => {
-                    tracing::warn!(error = %e, "read system DNS config failed");
+                    crate::LOG.warn(format!("error={e} read system DNS config failed"));
                     None
                 },
             });
@@ -621,7 +623,7 @@ pub(crate) async fn check_address_port_strategy_with(
         let service = &parts[0][1..];
         let proto = &parts[1][1..];
         let name = parts[2];
-        tracing::debug!(domain, "querying SRV record for address port strategy");
+        crate::LOG.debug(format!("domain={domain} querying SRV record for address port strategy"));
         let records = resolver
             .lookup_srv(service, proto, name)
             .await
@@ -639,7 +641,7 @@ pub(crate) async fn check_address_port_strategy_with(
     }
 
     // TXT（Go dialer.go:197-221）。
-    tracing::debug!(domain, "querying TXT record for address port strategy");
+    crate::LOG.debug(format!("domain={domain} querying TXT record for address port strategy"));
     let txts = resolver
         .lookup_txt(domain)
         .await
@@ -712,15 +714,13 @@ pub async fn dial_system(
     let mut dest = destination.clone();
     match check_address_port_strategy(&dest, sockopt).await {
         Ok(Some(new_dest)) => {
-            tracing::info!(
-                from = %destination,
-                to = %new_dest,
-                "replace destination with SRV/TXT record"
-            );
+            crate::LOG.info(format!(
+                "from={destination} to={new_dest} replace destination with SRV/TXT record"
+            ));
             dest = new_dest;
         },
         Ok(None) => {},
-        Err(e) => tracing::warn!(error = %e, "address port strategy lookup failed"),
+        Err(e) => crate::LOG.warn(format!("error={e} address port strategy lookup failed")),
     }
 
     // ponytail: clone Arc 后 drop guard，避免 RwLockReadGuard 跨 await 点
@@ -758,10 +758,10 @@ pub async fn dial_system(
                 // Go dialer.go:262-264：随机取一 IP 改写目标（dice.Roll）。
                 let ip = ips[rand::random_range(0..ips.len())];
                 dest = Destination::new(Address::from(ip), dest.port(), dest.network());
-                tracing::info!(to = %dest, "replace destination with resolved ip");
+                crate::LOG.info(format!("to={dest} replace destination with resolved ip"));
             },
             Err(e) => {
-                tracing::warn!(domain, error = %e, "failed to resolve ip");
+                crate::LOG.warn(format!("domain={domain} error={e} failed to resolve ip"));
                 if strategy.force_ip() {
                     // Go dialer.go:258-261：ForceIP 解析失败即失败。
                     return Err(e);
@@ -1523,7 +1523,7 @@ impl SystemDialer for DnsResolvingDialer {
                 xray_common::net::address::Address::Domain(domain) => {
                     let port = destination.port().value();
                     let lookup = format!("{domain}:{port}");
-                    tracing::debug!(target = %lookup, "resolving domain via system DNS");
+                    crate::LOG.debug(format!("target={lookup} resolving domain via system DNS"));
                     match tokio::net::lookup_host(&lookup).await {
                         Ok(addrs) => {
                             let addrs: Vec<SocketAddr> = addrs.collect();
@@ -1533,16 +1533,13 @@ impl SystemDialer for DnsResolvingDialer {
                                     format!("DNS lookup returned no addresses for {domain}"),
                                 ));
                             }
-                            tracing::debug!(
-                                target = %lookup,
-                                addrs = ?addrs,
-                                "domain resolved"
-                            );
+                            crate::LOG
+                                .debug(format!("target={lookup} addrs={addrs:?} domain resolved"));
                             // 全部解析地址顺序尝试（首个失败换下一个，Go net.Dialer 语义）。
                             dial_first_reachable(src, &addrs, sockopt).await
                         },
                         Err(e) => {
-                            tracing::warn!(target = %domain, error = %e, "DNS lookup failed");
+                            crate::LOG.warn(format!("target={domain} error={e} DNS lookup failed"));
                             Err(io::Error::new(
                                 io::ErrorKind::AddrNotAvailable,
                                 format!("DNS lookup failed for {domain}: {e}"),
@@ -1567,5 +1564,5 @@ impl SystemDialer for DnsResolvingDialer {
 pub fn init_system_dialer(dns_client: Option<Arc<dyn DnsClient>>) {
     set_dns_client(dns_client);
     use_alternative_system_dialer(Some(Box::new(DnsResolvingDialer::new())));
-    tracing::info!("system dialer initialized with DNS resolution");
+    crate::LOG.info("system dialer initialized with DNS resolution");
 }

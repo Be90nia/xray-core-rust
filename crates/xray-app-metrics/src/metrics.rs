@@ -447,6 +447,7 @@ impl MetricsHttpServer for TokioHttpServer {
         let listener = tokio::net::TcpListener::from_std(std_listener)
             .map_err(|e| MetricsError::ListenInvalid(format!("from_std: {e}")))?;
         let shutdown = self.inner.shutdown.clone();
+        #[allow(clippy::disallowed_methods, reason = "HTTP accept 主循环（Prometheus 抓取服务，JoinSet 收割）；FxScope 未接线（T3.1b 登记）")]
         let handle = tokio::spawn(async move {
             // 每连接 task 由本 task 内的 JoinSet 持有：完成即收割（join_next 分支），
             // 不再 push 到共享 Vec——否则句柄簿记随抓取次数线性增长（票 fu4y）。
@@ -481,6 +482,7 @@ impl MetricsHttpServer for TokioHttpServer {
     ) -> Result<(), MetricsError> {
         let shutdown = self.inner.shutdown.clone();
         let listener = outbound.listener_clone();
+        #[allow(clippy::disallowed_methods, reason = "outbound listener accept 主循环（JoinSet 收割每连接任务）；FxScope 未接线（T3.1b 登记）")]
         let handle = tokio::spawn(async move {
             // 每连接 task 由本 task 内的 JoinSet 持有：完成即收割（票 fu4y）
             let mut conn_tasks = tokio::task::JoinSet::new();

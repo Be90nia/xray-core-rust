@@ -8,7 +8,7 @@
 //!       → echo server（TCP 全链路回声）。
 
 #![cfg(test)]
-
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros))] // 测试脚手架：spawn 起停被测服务/回环 echo、直印进度；非生产托管面
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use tokio::{

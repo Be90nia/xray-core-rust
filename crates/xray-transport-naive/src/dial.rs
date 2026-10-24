@@ -16,12 +16,12 @@ use std::{
     io,
     pin::Pin,
     sync::{Arc, Mutex},
-    task::{Context, Poll, ready},
+    task::{ready, Context, Poll},
 };
 
-use base64::{Engine, engine::general_purpose::STANDARD as B64};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use bytes::Bytes;
-use http::{Method, StatusCode, header::HeaderValue};
+use http::{header::HeaderValue, Method, StatusCode};
 use hyper::{
     client::conn::http2,
     upgrade::{OnUpgrade, Upgraded},
@@ -34,7 +34,7 @@ use xray_transport::{connection::Connection, sockopt::SocketOptions, system_dial
 
 use crate::{
     padding::{
-        FIRST_PADDINGS, PaddingDecoder, encode_frame, random_padding_header, random_padding_size,
+        encode_frame, random_padding_header, random_padding_size, PaddingDecoder, FIRST_PADDINGS,
     },
     uri::NaiveConfig,
 };
@@ -94,7 +94,7 @@ pub async fn dial_naive(
     // h2 连接驱动：hyper 的 conn future 必须被持续 poll（后台任务 1）。
     let driver = tokio::spawn(async move {
         if let Err(e) = conn.await {
-            tracing::debug!(target: "naive", error = %e, "h2 connection driver ended");
+            crate::LOG.debug(format!("error={e} h2 connection driver ended"));
         }
     });
 
@@ -130,7 +130,7 @@ pub async fn dial_naive(
         reader: PaddingReader::new(rd, padded),
         writer: PaddingWriter::new(wr, padded),
     };
-    tracing::debug!(target: "naive", %authority, padded, "naive tunnel established");
+    crate::LOG.debug(format!("authority={authority} padded={padded} naive tunnel established"));
     Ok(Box::new(tunnel))
 }
 

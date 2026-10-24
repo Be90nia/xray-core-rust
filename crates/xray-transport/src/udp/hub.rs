@@ -20,6 +20,8 @@ use tokio::{
     sync::{Notify, mpsc},
 };
 
+// log-hot-path-exempt: UDP hub recv 循环内每包收发错误/缓存满记录 ——
+// 数据面泵/每包循环内的诊断留痕，LogFacade emit（Mutex+掩码）开销不可入热路径，保留原样
 /// UDP 收包缓冲区大小（对应 Go `finalmask.UDPSize = 4096`）。
 const UDP_BUFFER_SIZE: usize = 4096;
 

@@ -9,6 +9,8 @@ rust-version.workspace = true
 xray-buf = { path = "../xray-buf" }
 xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
+# T3.2a 日志收敛：LogFacade（target = xray_frame::transport）统一入口
+xray-frame = { path = "../xray-frame" }
 xray-crypto = { path = "../xray-crypto" }
 # xdns ResolverConfig 无损承载 Go ResolverProto 的 tls_config/quic_config 生成类型
 xray-proto = { path = "../xray-proto" }

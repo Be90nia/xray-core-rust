@@ -3,6 +3,7 @@
 //! 验证完整代理链路：客户端通过 SOCKS5 代理连接 echo 服务器，数据双向流通。
 //! 这是 SystemDialer/SystemListener/bridge_connections/freedom/socks 协同工作的端到端证明。
 
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros))] // 测试脚手架：spawn 起停被测服务/回环 echo、直印进度；非生产托管面
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},

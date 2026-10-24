@@ -221,6 +221,10 @@ impl InboundHandler for TuicInboundHandler {
         let endpoint_for_accept = Arc::clone(&endpoint);
 
         let dispatch = self.dispatch.clone();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         let accept_task = tokio::spawn(async move {
             loop {
                 let incoming = endpoint_for_accept.accept().await;
@@ -230,6 +234,10 @@ impl InboundHandler for TuicInboundHandler {
                 let pwd = password.clone();
                 let t = tag.clone();
                 let dispatch = dispatch.clone();
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+                )]
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(incoming, uuid, &pwd, dispatch).await {
                         tracing::debug!(tag = %t, error = ?e, "tuic inbound connection error");
@@ -361,6 +369,10 @@ async fn handle_bi_frame(
                         xray_buf::io::new_reader(InitialedReader::new(initial_bytes, recv_bi)),
                         xray_buf::io::new_writer(send_bi),
                     );
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+                    )]
                     tokio::spawn(async move {
                         let _ = handler.dispatch(&dest, link).await;
                     });
@@ -373,6 +385,10 @@ async fn handle_bi_frame(
                     tracing::warn!("tuic inbound: addr not ip literal: {addr:?}");
                     return;
                 };
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+                )]
                 tokio::spawn(async move {
                     if let Err(e) = relay_to_tcp(target, send_bi, recv_bi, initial_bytes).await {
                         tracing::debug!("tuic relay {target}: {e:?}");

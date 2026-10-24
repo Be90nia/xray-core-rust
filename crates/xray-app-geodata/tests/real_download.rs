@@ -3,6 +3,9 @@
 //! 对应 Go `downloader.download` — 用 std::net TCP 写最小 HTTP/1.1 GET。
 //! 测试环境：loopback TcpListener 返回固定响应。
 
+// 集成测试夹具不在 `#[test]` 函数体内，根 clippy.toml 的 allow-unwrap-in-tests 覆盖不到。
+#![allow(clippy::unwrap_used, reason = "集成测试夹具不在 #[test] 函数体内")]
+
 use std::{
     io::{Read, Write},
     net::TcpListener,

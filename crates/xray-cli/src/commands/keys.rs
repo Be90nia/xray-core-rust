@@ -6,8 +6,8 @@
 //! 编码与 `-i` 语义），Rust 端 `xray x25519` 以 clap alias `curve25519` 提供双别名。
 
 use base64::{
-    Engine,
     engine::general_purpose::{GeneralPurpose, STANDARD, URL_SAFE_NO_PAD},
+    Engine,
 };
 use clap::Args;
 

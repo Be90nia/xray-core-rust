@@ -11,6 +11,7 @@
 //! 验证完整 bridge+dispatcher wiring + yamux echo 双端（覆盖现有 relay 单测之外的
 //! 切片3真实装配：LinkDispatch + Ohm + Bridge/Portal 端到端）。
 
+#![allow(clippy::disallowed_methods)] // T3.1b：e2e mock 拓扑裸 spawn（echo server/portal accept 循环）自管 runtime，测试环境无 FxScope；生产禁令不受影响
 #![cfg(test)]
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};

@@ -92,6 +92,10 @@ impl HysteriaConnection {
     /// 从 InterStreamConn 构造：spawn pump 桥接，返回 duplex 客户端包装。
     fn from_stream(stream: Arc<InterStreamConn>) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         let pump = tokio::spawn(pump_hysteria_stream(stream, server_io));
         Self { inner: client_io, _pump: pump }
     }
@@ -101,6 +105,10 @@ impl HysteriaConnection {
     /// 从 InterConn（UDP session）构造：spawn XUDP↔UdpMessage 桥接 pump。
     fn from_udp(conn: Arc<InterConn>, default_dest: Destination) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         let pump = tokio::spawn(pump_hysteria_udp(conn, server_io, default_dest));
         Self { inner: client_io, _pump: pump }
     }

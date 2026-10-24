@@ -146,6 +146,10 @@ impl InboundHandler for TrojanServer {
         // sm80④：独立 Handler 路径无装配层注入，SessionDefault 60s 兜底。
         let handshake_timeout = xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT;
         let listener_clone = Arc::clone(&listener);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         let handle = tokio::spawn(async move {
             loop {
                 match listener_clone.accept().await {
@@ -153,6 +157,10 @@ impl InboundHandler for TrojanServer {
                         let tag = tag.clone();
                         let validator = validator.clone();
                         let fallbacks = fallbacks.clone();
+                        #[allow(
+                            clippy::disallowed_methods,
+                            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+                        )]
                         tokio::spawn(async move {
                             let mut recorder =
                                 RecordingStream { inner: stream, buf: Vec::with_capacity(256) };
@@ -480,6 +488,10 @@ pub async fn serve_trojan(
         let fb_policy = fallbacks.clone();
         let tls = tls.clone();
         let header = header.clone();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         tokio::spawn(async move {
             if let Some(acc) = tls {
                 match acc.accept(stream).await {

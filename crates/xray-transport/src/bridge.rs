@@ -21,6 +21,8 @@ use xray_features::policy::TimeoutPolicy;
 use crate::connection::DuplexConnection;
 use crate::{connection::Connection, link::Link};
 
+// log-hot-path-exempt: splice 选择 + p7lm trace 门内每包/每 flush 记录 ——
+// 数据面泵/每包循环内的诊断留痕，LogFacade emit（Mutex+掩码）开销不可入热路径，保留原样
 /// 双向桥接两个 [`Connection`]。
 ///
 /// 内部用 [`tokio::io::split`] 拆分每个连接的读写半部，然后用

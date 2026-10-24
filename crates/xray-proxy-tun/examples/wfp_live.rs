@@ -17,6 +17,10 @@
 //!
 //! 需管理员：UAC 提权运行（`Start-Process -Verb RunAs`）。
 
+#![allow(
+    clippy::disallowed_macros,
+    reason = "手工诊断 example：进度直印 stderr 是其唯一输出通道（非生产代码路径）"
+)]
 // wfp 是 Windows 专有：以下 helper 仅 Windows main 消费，非 Windows stub 单元不参与编译。
 #[cfg(target_os = "windows")]
 use std::{fs::File, io::Write, process::Command};

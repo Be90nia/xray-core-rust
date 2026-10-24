@@ -161,7 +161,7 @@ impl HysteriaTransport for QuinnHysteriaTransport {
                 .map_err(|e| io::Error::other(format!("quinn connect initiate: {e}")))?;
             let conn = match connecting.into_0rtt() {
                 Ok((conn, _zero_rtt)) => {
-                    tracing::debug!("hysteria dialing with 0-RTT attempt");
+                    crate::LOG.debug("hysteria dialing with 0-RTT attempt");
                     conn
                 },
                 Err(connecting) => {
@@ -183,7 +183,9 @@ impl HysteriaTransport for QuinnHysteriaTransport {
                 h3_keepalive.cc_rx_down,
                 quic_cfg.brutal_disable_loss_compensation,
             ) {
-                tracing::warn!(error = %e, "hysteria congestion negotiation failed, keeping default");
+                crate::LOG.warn(format!(
+                    "error={e} hysteria congestion negotiation failed, keeping default"
+                ));
             }
 
             // 4. 包装返回：endpoint 必须保活（drop 会关闭 QUIC 连接），h3 保活项挂在 conn 上。

@@ -30,6 +30,13 @@
 //!
 //! 不在本切片：TcpmaskManager / PROXY protocol 解析 / X-Forwarded-For / 多 path 路由。
 
+/// T3.2a 日志统一入口：域规范 target = `xray_frame::transport::websocket`（热路径豁免清单见
+/// reports/framework-audit-2026-10-24/T3.2a-log-transport-cli.md）。
+pub(crate) static LOG: std::sync::LazyLock<xray_frame::logging::LogFacade> =
+    std::sync::LazyLock::new(|| {
+        xray_frame::logging::LogFacade::new("transport::websocket", vec![])
+    });
+
 pub mod client;
 pub mod config;
 pub mod error;
@@ -41,8 +48,8 @@ pub mod ws_bridge;
 // 顶层 re-export。
 pub use config::Config;
 pub use error::{Result, WsError};
-pub use handshake::{Opcode, WS_GUID, compute_accept_key, generate_client_key_for_testing};
-pub use pool::{PoolKey, WsConnectionPool, WsPoolConfig, global_pool, reconfigure_global_pool};
+pub use handshake::{compute_accept_key, generate_client_key_for_testing, Opcode, WS_GUID};
+pub use pool::{global_pool, reconfigure_global_pool, PoolKey, WsConnectionPool, WsPoolConfig};
 pub use register::{register_dialer, register_listener};
 pub use server::{AcceptedConn, WsListener};
 pub use ws_bridge::WsConnection;

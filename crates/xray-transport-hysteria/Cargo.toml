@@ -12,6 +12,8 @@ xray-proto = { path = "../xray-proto" }
 xray-transport = { path = "../xray-transport" }
 xray-transport-quic = { path = "../xray-transport-quic" }
 xray-tls = { path = "../xray-tls" }
+# T3.2a 日志收敛：LogFacade（target = xray_frame::transport::hysteria）统一入口
+xray-frame = { path = "../xray-frame" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

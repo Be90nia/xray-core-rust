@@ -46,7 +46,7 @@ pub async fn tcp_race_dial(
     cfg: &HappyEyeballsConfig,
 ) -> io::Result<Box<dyn Connection>> {
     let sorted = sort_ips(ips, cfg.prioritize_ipv6, cfg.interleave);
-    tracing::debug!(domain_ips = ?sorted, "happy eyeballs racing dial");
+    crate::LOG.debug(format!("domain_ips={sorted:?} happy eyeballs racing dial"));
     let addrs: Vec<SocketAddr> =
         sorted.iter().map(|ip| SocketAddr::new(*ip, port.value())).collect();
     let sockopt = sockopt.clone();
@@ -107,7 +107,7 @@ where
                     Some(Ok((idx, Ok(v)))) => {
                         active -= 1;
                         if winner.is_none() {
-                            tracing::debug!(index = idx, addr = %addrs[idx], "happy eyeballs: connection established");
+                            crate::LOG.debug(format!("index={idx} addr={} happy eyeballs: connection established", addrs[idx]));
                             winner = Some(v);
                             // 对齐 Go cancel()：立即中止其余在飞尝试。
                             inflight.abort_all();
@@ -116,7 +116,7 @@ where
                     }
                     Some(Ok((idx, Err(e)))) => {
                         active -= 1;
-                        tracing::debug!(index = idx, addr = %addrs[idx], error = %e, "happy eyeballs: attempt failed");
+                        crate::LOG.debug(format!("index={idx} addr={} error={e} happy eyeballs: attempt failed", addrs[idx]));
                         last_err = Some(e);
                         if winner.is_none() && next < addrs.len() {
                             // 失败立即补充下一个（Go timer.Reset(0)）。

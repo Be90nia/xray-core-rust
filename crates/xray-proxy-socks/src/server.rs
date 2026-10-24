@@ -104,12 +104,20 @@ impl InboundHandler for SocksServer {
         let tag = self.tag.clone();
         let config = self.config.clone();
         let listener_clone = Arc::clone(&listener);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         let handle = tokio::spawn(async move {
             loop {
                 match listener_clone.accept().await {
                     Ok((mut stream, peer)) => {
                         let tag = tag.clone();
                         let config = config.clone();
+                        #[allow(
+                            clippy::disallowed_methods,
+                            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+                        )]
                         tokio::spawn(async move {
                             match socks_handshake(&mut stream, &config).await {
                                 Ok(addr) => {

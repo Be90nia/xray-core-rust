@@ -76,9 +76,9 @@ pub async fn supervise_accept_loop(tag: &str, local: String, handle: tokio::task
     if let Err(join_err) = handle.await {
         if join_err.is_panic() {
             let detail = panic_brief(join_err.into_panic());
-            tracing::error!(
+            crate::LOG.error(format!(
                 "[{tag}] inbound accept loop exited WITHOUT close signal — 监听已停止，该端口不再接受连接 (local: {local}, panic: {detail})"
-            );
+            ));
         }
     }
 }

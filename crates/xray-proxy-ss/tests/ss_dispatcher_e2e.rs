@@ -4,6 +4,7 @@
 //! 本测试聚焦适配器层：`SsOutbound::process` + `SsInbound::handle_conn` 能否正确组合，
 //! 即 dispatcher 接入方按照 `process → handle_conn → 桥接 link` 的契约调用时一切正常。
 
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros))] // 测试脚手架：spawn 起停被测服务/回环 echo、直印进度；非生产托管面
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},

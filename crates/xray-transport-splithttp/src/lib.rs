@@ -36,6 +36,13 @@
 // 断言扁平化属测试便利；生产代码禁令不受影响。
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
+/// T3.2a 日志统一入口：域规范 target = `xray_frame::transport::splithttp`（热路径豁免清单见
+/// reports/framework-audit-2026-10-24/T3.2a-log-transport-cli.md）。
+pub(crate) static LOG: std::sync::LazyLock<xray_frame::logging::LogFacade> =
+    std::sync::LazyLock::new(|| {
+        xray_frame::logging::LogFacade::new("transport::splithttp", vec![])
+    });
+
 pub mod batched_upload;
 pub mod browser_client;
 pub mod client;

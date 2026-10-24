@@ -20,15 +20,14 @@ use std::path::{Path, PathBuf};
 pub fn log_kernel_identity() {
     let git_rev = git_rev();
     let exe_fingerprint = exe_fingerprint();
-    tracing::info!(
-        target: "xray_kernel_identity",
-        version = %xray_core::version(),
-        git_rev = %git_rev,
-        exe_fingerprint = %exe_fingerprint,
-        profile = %build_profile(),
-        target_triple = %target_triple(),
-        "xray kernel identity"
-    );
+    crate::LOG.info(format!(
+        "version={} git_rev={} exe_fingerprint={} profile={} target_triple={} xray kernel identity",
+        xray_core::version(),
+        git_rev,
+        exe_fingerprint,
+        build_profile(),
+        target_triple()
+    ));
 }
 
 /// git rev：编译期注入优先，其次运行时 `.git` 探测，最后 `unknown`。
@@ -41,10 +40,7 @@ fn git_rev() -> String {
     match discover_git_rev() {
         Some(rev) => rev,
         None => {
-            tracing::debug!(
-                target: "xray_kernel_identity",
-                "git rev unavailable: no .git found near exe/cwd"
-            );
+            crate::LOG.debug("git rev unavailable: no .git found near exe/cwd");
             "unknown".to_owned()
         },
     }
@@ -117,22 +113,15 @@ fn exe_fingerprint() -> String {
     let path = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
-            tracing::debug!(
-                target: "xray_kernel_identity",
-                error = %e,
-                "binary fingerprint unavailable: current_exe failed"
-            );
+            crate::LOG
+                .debug(format!("error={e} binary fingerprint unavailable: current_exe failed"));
             return "unknown".to_owned();
         },
     };
     match fingerprint_file(&path) {
         Ok(hex) => hex,
         Err(e) => {
-            tracing::debug!(
-                target: "xray_kernel_identity",
-                error = %e,
-                "binary fingerprint unavailable"
-            );
+            crate::LOG.debug(format!("error={e} binary fingerprint unavailable"));
             "unknown".to_owned()
         },
     }
@@ -149,7 +138,11 @@ fn fingerprint_file(path: &Path) -> std::io::Result<String> {
 }
 
 fn build_profile() -> &'static str {
-    if cfg!(debug_assertions) { "debug" } else { "release" }
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    }
 }
 
 fn target_triple() -> String {

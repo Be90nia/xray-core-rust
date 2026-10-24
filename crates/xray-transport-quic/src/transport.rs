@@ -287,7 +287,7 @@ struct QuicListener {
 
 impl TransportListener for QuicListener {
     fn close(&self) -> io::Result<()> {
-        tracing::info!("QUIC listener close addr={}", self.local);
+        crate::LOG.info(format!("QUIC listener close addr={}", self.local));
         // 立即关闭 QUIC 栈：accept 循环收到 None 退出，活跃连接全部断开，
         // UDP socket 释放（对齐 Go hysteria/hub.go Close=listener+transport+pktConn）。
         self.endpoint.close(quinn::VarInt::from_u32(0), b"listener closed");

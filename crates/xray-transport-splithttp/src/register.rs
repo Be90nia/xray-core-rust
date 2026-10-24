@@ -141,10 +141,9 @@ async fn dial_splithttp(
     )?);
     let packet_conn = if http_version == "3" {
         if !fp_name.is_empty() {
-            tracing::warn!(
-                target: "xray_transport_splithttp",
+            crate::LOG.warn(format!(
                 "tlsSettings.fingerprint={fp_name} not supported on quinn (HTTP/3) stack; using default rustls ClientHello"
-            );
+            ));
         }
         // HTTP/3 over QUIC path（对应 Go `createHTTPClient` 中 `httpVersion=="3"` 分支）。
         // quinn 需要 `SocketAddr`（不做 DNS），域名走 `tokio::net::lookup_host` 解析。

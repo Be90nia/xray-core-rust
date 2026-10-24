@@ -132,6 +132,10 @@ impl TuicMockServer {
                 break;
             };
             let pwd = password.clone();
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+            )]
             tokio::spawn(async move {
                 if let Err(e) = handle_connection(incoming, uuid, &pwd).await {
                     tracing::warn!("tuic mock server connection error: {e:?}");
@@ -233,6 +237,10 @@ async fn handle_bi_frame(send_bi: quinn::SendStream, recv_bi: quinn::RecvStream)
                 tracing::warn!("tuic server: addr not ip literal: {addr:?}");
                 return;
             };
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+            )]
             tokio::spawn(async move {
                 if let Err(e) = relay_to_tcp(target, send_bi, recv_bi, initial_bytes).await {
                     tracing::debug!("tuic relay {target}: {e:?}");
@@ -480,6 +488,10 @@ impl UdpAssocTable {
         let tx = self.sessions.entry(assoc_id).or_insert_with(|| {
             let (tx, rx) = tokio::sync::mpsc::channel(16);
             let dispatcher = self.dispatcher.clone();
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+            )]
             tokio::spawn(udp_assoc_task(assoc_id, dispatcher, rx));
             tx
         });

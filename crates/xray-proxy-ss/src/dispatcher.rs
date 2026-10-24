@@ -65,6 +65,10 @@ impl SsConnection {
     #[must_use]
     pub fn new(stream: SSStream<Box<dyn Connection>>) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         let pump = tokio::spawn(pump_ss_stream(stream, server_io));
         Self { inner: client_io, _pump: pump }
     }
@@ -75,6 +79,10 @@ impl SsConnection {
     /// spawn XUDP 帧 ↔ SS UDP 数据报 pump（[`pump_ss_udp`]）。
     fn new_udp(sock: UdpSocket, account: MemoryAccount, default_dest: Destination) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         let pump = tokio::spawn(pump_ss_udp(sock, account, server_io, default_dest));
         Self { inner: client_io, _pump: pump }
     }
@@ -85,6 +93,10 @@ impl SsConnection {
     /// spawn XUDP 帧 ↔ SS-2022 UDP 会话帧 pump（[`pump_ss2022_udp`]）。
     fn new_udp_2022(sock: UdpSocket, params: Ss2022DialParams, default_dest: Destination) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         let pump = tokio::spawn(pump_ss2022_udp(sock, params, server_io, default_dest));
         Self { inner: client_io, _pump: pump }
     }

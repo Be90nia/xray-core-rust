@@ -12,6 +12,8 @@ xray-tls = { path = "../xray-tls" }
 xray-app-dispatcher = { path = "../xray-app-dispatcher" }
 xray-features = { path = "../xray-features" }
 xray-buf = { path = "../xray-buf" }
+# T3.2a 日志收敛：LogFacade（target = xray_frame::transport::naive）统一入口
+xray-frame = { path = "../xray-frame" }
 async-trait = { workspace = true }
 tokio-rustls = { workspace = true }
 subtle = "2"

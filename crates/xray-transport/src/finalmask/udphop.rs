@@ -178,7 +178,7 @@ async fn hop_once_shared(s: &HopShared) {
         Ok(sock) => sock,
         Err(e) => {
             // Go：dial 失败还原 addr + 记 "hop err"，保持当前 socket。
-            tracing::warn!(target = %new_target, error = %e, "xmc udphop hop dial failed");
+            crate::LOG.warn(format!("target={new_target} error={e} xmc udphop hop dial failed"));
             return;
         },
     };

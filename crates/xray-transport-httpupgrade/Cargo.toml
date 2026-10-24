@@ -11,6 +11,8 @@ xray-common = { path = "../xray-common" }
 xray-transport = { path = "../xray-transport" }
 xray-tls = { path = "../xray-tls" }
 xray-proto = { path = "../xray-proto" }
+# T3.2a 日志收敛：LogFacade（target = xray_frame::transport::httpupgrade）统一入口
+xray-frame = { path = "../xray-frame" }
 serde_json = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }

@@ -7,6 +7,8 @@ rust-version.workspace = true
 
 [dependencies]
 xray-core = { path = "../xray-core" }
+# T3.2a 日志收敛：LogFacade（target = xray_frame::cli）统一入口
+xray-frame = { path = "../xray-frame" }
 xray-transport-kcp = { path = "../xray-transport-kcp" }
 xray-common = { path = "../xray-common" }
 xray-conf = { path = "../xray-conf" }

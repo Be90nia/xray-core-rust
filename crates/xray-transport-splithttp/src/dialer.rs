@@ -568,9 +568,9 @@ where
     let mut builder = http2::Builder::new(TokioExecutor::new());
     builder
         .timer(hyper_util::rt::TokioTimer::new())
-        .initial_stream_window_size(32 * 1024 * 1024)
-        .initial_connection_window_size(32 * 1024 * 1024)
-        .max_send_buf_size(16 * 1024 * 1024);
+        .initial_stream_window_size(crate::transport::H2_INITIAL_STREAM_WINDOW)
+        .initial_connection_window_size(crate::transport::H2_INITIAL_CONNECTION_WINDOW)
+        .max_send_buf_size(crate::transport::H2_MAX_SEND_BUF_SIZE);
     let (mut sender, conn) = builder
         .handshake::<_, ReqBody>(io)
         .await

@@ -269,8 +269,8 @@ impl InboundHandler for HysteriaInboundHandler {
         // on_new_conn 回调：每个新 QUIC stream 触发
         // 若有 dispatcher 则 spawn 异步任务处理 TCP 请求帧，否则仅 log
         let dispatcher = self.dispatcher.clone();
-        let on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync> =
-            Arc::new(move |stream: Arc<InterStreamConn>| {
+        let on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync> = Arc::new(
+            move |stream: Arc<InterStreamConn>| {
                 let remote = stream.remote_addr();
                 let local = stream.local_addr();
                 tracing::debug!(
@@ -282,13 +282,18 @@ impl InboundHandler for HysteriaInboundHandler {
                 if let Some(ref disp) = dispatcher {
                     let disp = Arc::clone(disp);
                     let stream_clone = Arc::clone(&stream);
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+                    )]
                     tokio::spawn(async move {
                         if let Err(e) = handle_tcp_stream(stream_clone, disp).await {
                             tracing::warn!(error = %e, "hysteria inbound tcp stream error");
                         }
                     });
                 }
-            });
+            },
+        );
 
         // on_new_udp_session 回调：auth 后每个新 UDP session（首包 4B session id）触发。
         // 对应 Go server.go UDP 分支——每个 session 当一条虚拟连接 dispatch。
@@ -297,6 +302,7 @@ impl InboundHandler for HysteriaInboundHandler {
             .map(|disp| {
                 Arc::new(move |sess: Arc<InterConn>| {
                     let disp = Arc::clone(&disp);
+                    #[allow(clippy::disallowed_methods, reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）")]
                     tokio::spawn(async move {
                         if let Err(e) = handle_udp_session(sess, disp).await {
                             tracing::warn!(error = %e, "hysteria inbound udp session error");
@@ -333,6 +339,10 @@ impl InboundHandler for HysteriaInboundHandler {
         let listener_clone = Arc::clone(&listener);
         let quic_clone = Arc::clone(&quic_listener);
         let tag = self.tag.clone();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         let accept_task = tokio::spawn(async move {
             listener_clone.start(quic_clone).await;
             info!(tag = %tag, "hysteria inbound listener started");

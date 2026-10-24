@@ -5,6 +5,10 @@
 //! ④有界提交 的单测面在 `src/loader.rs` `#[cfg(test)]`，此处以真实 dat 文件
 //! 端到端复证。
 
+// 集成测试夹具（`fn make_*`/`unique_dir` 等）不在 `#[test]` 函数体内，根 clippy.toml
+// 的 allow-unwrap-in-tests 覆盖不到；夹具失败即测试失败，锁/IO 无 poison 面。
+#![allow(clippy::unwrap_used, reason = "集成测试夹具不在 #[test] 函数体内")]
+
 use std::{
     path::{Path, PathBuf},
     sync::mpsc,

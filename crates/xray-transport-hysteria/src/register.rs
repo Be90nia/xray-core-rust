@@ -130,14 +130,14 @@ async fn listen_hysteria(
                 Err(e) => {
                     match classify(&e) {
                         AcceptErrorKind::Resource => {
-                            tracing::warn!(tag = "hysteria", local = %local, error = %e, "hysteria inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续");
+                            crate::LOG.warn(format!("tag=hysteria local={local} error={e} hysteria inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续"));
                             backoff_if_resource(&e).await;
                         },
                         AcceptErrorKind::Connection => {
-                            tracing::debug!(tag = "hysteria", error = %e, "hysteria inbound: 单连接级 accept 错误，继续监听");
+                            crate::LOG.debug(format!("tag=hysteria error={e} hysteria inbound: 单连接级 accept 错误，继续监听"));
                         },
                         AcceptErrorKind::Unknown => {
-                            tracing::warn!(tag = "hysteria", local = %local, error = %e, "hysteria inbound: accept 错误（未知类别），继续监听");
+                            crate::LOG.warn(format!("tag=hysteria local={local} error={e} hysteria inbound: accept 错误（未知类别），继续监听"));
                         },
                     }
                     continue;
@@ -210,7 +210,7 @@ impl TransportListener for HysteriaTransportListener {
     }
 
     fn close(&self) -> io::Result<()> {
-        tracing::info!("hysteria listener close addr={}", self.local);
+        crate::LOG.info(format!("hysteria listener close addr={}", self.local));
         self.abort.abort();
         // trait close 是 async（内部 ep.close 同步生效）；TransportListener::close
         // 是同步 fn，spawn 之。调用方均在 runtime 上下文（生产 instance close / 测试）。

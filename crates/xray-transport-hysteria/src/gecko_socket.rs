@@ -49,6 +49,7 @@ use xray_transport::finalmask::{
     salamander_gecko::{GeckoConfig, GeckoConn},
 };
 
+// log-hot-path-exempt: gecko 每包收发队列满记录 —— 数据面每包路径，保留原样
 /// 发送队列容量：driver 消费不及时丢新包（QUIC 容忍），杜绝无界增长。
 /// 对齐 `finalmask::PACKET_QUEUE_CAP` 的 UDP 语义先例。
 const SEND_QUEUE_CAP: usize = 128;

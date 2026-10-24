@@ -26,6 +26,7 @@ use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::error::{Result, SplitHttpError};
 
+// log-hot-path-exempt: split upload 每包 seq 失序丢弃 trace —— 数据面每包路径，保留原样
 /// 单个上传分包。对应 Go `uploadQueue.Packet`。
 #[derive(Debug, Clone)]
 pub struct Packet {

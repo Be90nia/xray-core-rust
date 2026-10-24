@@ -431,7 +431,7 @@ pub(crate) fn apply_client_tfo_linux(socket: &Socket) {
         // TFO：LinuxSockOpt 出站分支（inbound=false）即 TCP_FASTOPEN_CONNECT。
         let tfo = linux::LinuxSockOpt { tcp_fast_open: 1, ..Default::default() };
         if let Err(e) = tfo.apply(socket.as_raw_fd()) {
-            tracing::debug!(error = %e, "TCP_FASTOPEN_CONNECT 不可用，按普通握手拨号");
+            crate::LOG.debug(format!("error={e} TCP_FASTOPEN_CONNECT 不可用，按普通握手拨号"));
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -826,7 +826,7 @@ impl UdpBufDir {
 fn tune_udp_buffer(sock: &Socket, explicit: i32, dir: UdpBufDir) {
     if explicit > 0 {
         if let Err(e) = dir.set(sock, explicit as usize) {
-            tracing::warn!(?dir, explicit, "UDP buffer setsockopt failed (kernel may clamp): {e}");
+            crate::LOG.warn(format!("dir={dir:?} explicit={explicit} UDP buffer setsockopt failed (kernel may clamp): {e}"));
         }
         return;
     }
@@ -841,12 +841,9 @@ fn tune_udp_buffer(sock: &Socket, explicit: i32, dir: UdpBufDir) {
     if dir.force(sock, QUIC_UDP_MIN_BUFFER).is_ok() {
         return;
     }
-    tracing::warn!(
-        ?dir,
-        "failed to raise UDP socket buffer to {} bytes (need CAP_NET_ADMIN for FORCE on Linux); \
-         consider net.core.rmem_max/wmem_max",
-        QUIC_UDP_MIN_BUFFER
-    );
+    crate::LOG.warn(format!(
+        "dir={dir:?} failed to raise UDP socket buffer to {QUIC_UDP_MIN_BUFFER} bytes (need CAP_NET_ADMIN for FORCE on Linux); consider net.core.rmem_max/wmem_max"
+    ));
 }
 
 /// 应用 [`SocketOptions::custom_sockopt`]。对应 Go 各平台 apply*SocketOptions 的

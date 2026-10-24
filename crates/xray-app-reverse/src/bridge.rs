@@ -328,6 +328,7 @@ impl Bridge for RuntimeBridge {
         let domain = self.domain.clone();
         let tag = self.tag.clone();
         let workers = std::sync::Arc::clone(&self.workers);
+        #[allow(clippy::disallowed_methods, reason = "bridge monitor 周期循环；FxScope 未接线（T3.1b 登记）")]
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -422,6 +423,7 @@ impl Portal for RuntimePortal {
         *guard = Some(stop_tx);
         drop(guard);
         let picker = std::sync::Arc::clone(&self.picker);
+        #[allow(clippy::disallowed_methods, reason = "picker cleanup 周期循环；FxScope 未接线（T3.1b 登记）")]
         tokio::spawn(async move {
             loop {
                 tokio::select! {

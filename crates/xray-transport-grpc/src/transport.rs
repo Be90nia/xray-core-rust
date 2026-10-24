@@ -5,8 +5,8 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     },
     task::{Context, Poll},
 };
@@ -162,9 +162,9 @@ pub async fn dial(
                 Err(e) => {
                     let delay = grpc_backoff_delay(attempt);
                     attempt = attempt.saturating_add(1);
-                    tracing::debug!(
+                    crate::LOG.debug(format!(
                         "grpc dial attempt {attempt} failed ({e}); retrying in {delay:?}"
-                    );
+                    ));
                     tokio::time::sleep(delay).await;
                 },
             }
@@ -320,10 +320,10 @@ where
         let mut tick = tokio::time::interval(period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await; // 首跳立即返回
-        // a9p7 短期治本：h2 client::Connection 没有显式 poll_closed API，靠
-        // future 完成触发（peer GOAWAY / EOF / 错误）。下面 select 的
-        // `_ = &mut h2_conn => break` 即 GOAWAY 隐式监听——peer 发 GOAWAY
-        // 后 h2 库会让 conn future 完成。
+                           // a9p7 短期治本：h2 client::Connection 没有显式 poll_closed API，靠
+                           // future 完成触发（peer GOAWAY / EOF / 错误）。下面 select 的
+                           // `_ = &mut h2_conn => break` 即 GOAWAY 隐式监听——peer 发 GOAWAY
+                           // 后 h2 库会让 conn future 完成。
         loop {
             tokio::select! {
                 _ = tick.tick() => {
@@ -337,7 +337,7 @@ where
                     // a9p7：peer 主动 GOAWAY / TCP EOF → 立即断链（h2 库自动
                     // 状态机：GOAWAY 后 send_data 返 Err，up 闭包错误经
                     // cancel_tx 通知 DuplexConn reader）。
-                    tracing::debug!("grpc h2 conn closed: {:?}", res.as_ref().err());
+                    crate::LOG.debug(format!("grpc h2 conn closed: {:?}", res.as_ref().err()));
                     break;
                 },
             }
@@ -514,7 +514,7 @@ pub async fn listen(
                     {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     } else {
-                        tracing::debug!("gRPC accept error: {e}");
+                        crate::LOG.debug(format!("gRPC accept error: {e}"));
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
                     continue;
@@ -538,7 +538,7 @@ pub async fn listen(
                     ) {
                         Ok(c) => c,
                         Err(e) => {
-                            tracing::debug!("grpc tcpmask wrap failed: {e}");
+                            crate::LOG.debug(format!("grpc tcpmask wrap failed: {e}"));
                             return;
                         },
                     };
@@ -622,7 +622,7 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
         let (req, mut respond) = match r {
             Ok(v) => v,
             Err(e) => {
-                tracing::debug!("grpc h2 server accept error (peer GOAWAY?): {e}");
+                crate::LOG.debug(format!("grpc h2 server accept error (peer GOAWAY?): {e}"));
                 continue;
             },
         };
@@ -762,7 +762,7 @@ fn extract_trusted_remote(
         }
         return peer;
     }
-    tracing::warn!(xff = val, "ignored potentially forged \"X-Forwarded-For\"");
+    crate::LOG.warn(format!("xff={val} ignored potentially forged \"X-Forwarded-For\""));
     peer
 }
 
@@ -884,7 +884,11 @@ pub(crate) fn normalize_grpc_path(cfg: &Config) -> String {
         format!("/{raw_service}")
     };
     let stream = if raw_stream.is_empty() {
-        if cfg.multi_mode { "TunMulti".to_string() } else { "Tun".to_string() }
+        if cfg.multi_mode {
+            "TunMulti".to_string()
+        } else {
+            "Tun".to_string()
+        }
     } else if raw_stream.starts_with('/') {
         raw_stream
     } else {
@@ -1380,8 +1384,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn g8_dial_retries_with_backoff_and_stops_on_cancel() {
         use std::sync::{
-            Arc,
             atomic::{AtomicUsize, Ordering},
+            Arc,
         };
 
         use xray_common::net::{address::Address, port::Port};
@@ -1449,8 +1453,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn g8_dial_returns_timedout_at_deadline_and_stops_retrying() {
         use std::sync::{
-            Arc,
             atomic::{AtomicUsize, Ordering},
+            Arc,
         };
 
         use xray_common::net::{address::Address, port::Port};

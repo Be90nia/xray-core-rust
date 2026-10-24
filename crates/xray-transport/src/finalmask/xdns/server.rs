@@ -31,6 +31,8 @@ use super::{
     resp::{Resp, SendManager},
 };
 
+// log-hot-path-exempt: xdns 每包读路径错误记录 —— 数据面泵/每包循环内的诊断留痕，LogFacade
+// emit（Mutex+掩码）开销不可入热路径，保留原样
 const MAX_RESPONSE_DELAY: Duration = Duration::from_secs(1);
 const REC_QUEUE_CAP: usize = 255;
 const UDP_READ_BUF: usize = 4096;

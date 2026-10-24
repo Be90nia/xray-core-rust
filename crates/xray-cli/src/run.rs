@@ -37,7 +37,7 @@ use crate::error::{CliError, Result};
 /// 9tk4：`default_directive` 由配置 `log.loglevel` 推导（见 `loglevel_directive`），
 /// 使直连 tracing 日志受 loglevel 单一事实源门控；工具子命令传固定 "info"。
 pub fn init_tracing(default_directive: &str) {
-    use tracing_subscriber::{EnvFilter, fmt};
+    use tracing_subscriber::{fmt, EnvFilter};
     let _ = fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_directive)),
@@ -154,11 +154,9 @@ pub async fn execute(args: RunArgs) -> Result<()> {
                  currently no UDS listener consumes this flag — see Xray-core-rust-91vi"
             )));
         }
-        tracing::warn!(
-            unix_socket = %uds_path,
-            "--unix accepted but splithttp UDS listener is not yet wired through \
-             xray-core::start_full; flag is consumed at config-validation time only"
-        );
+        crate::LOG.warn(format!(
+            "unix_socket={uds_path} --unix accepted but splithttp UDS listener is not yet wired through xray-core::start_full; flag is consumed at config-validation time only"
+        ));
     }
 
     // `-test` 模式：仅验证配置可加载 + build，不启动服务。对应 Go `main/run.go:85-88`。
@@ -182,7 +180,7 @@ pub async fn execute(args: RunArgs) -> Result<()> {
     for h in handles {
         let _ = h.await;
     }
-    tracing::info!("xray instance shutdown");
+    crate::LOG.info("xray instance shutdown");
     Ok(())
 }
 
@@ -209,19 +207,21 @@ fn config_uses_splithttp(config: &xray_conf::config::Config) -> bool {
 async fn wait_for_signal() {
     let ctrl_c = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
-            tracing::warn!(error = %e, "ctrl_c handler error");
+            crate::LOG.warn(format!("error={e} ctrl_c handler error"));
         }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        use tokio::signal::unix::{SignalKind, signal};
+        use tokio::signal::unix::{signal, SignalKind};
         match signal(SignalKind::terminate()) {
             Ok(mut s) => {
                 let _ = s.recv().await;
             },
             Err(e) => {
-                tracing::warn!(error = %e, "install SIGTERM handler failed; falling back to ctrl_c only");
+                crate::LOG.warn(format!(
+                    "error={e} install SIGTERM handler failed; falling back to ctrl_c only"
+                ));
                 std::future::pending::<()>().await;
             },
         }
@@ -231,8 +231,8 @@ async fn wait_for_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => tracing::info!("received Ctrl-C, shutting down"),
-        _ = terminate => tracing::info!("received SIGTERM, shutting down"),
+        _ = ctrl_c => crate::LOG.info("received Ctrl-C, shutting down"),
+        _ = terminate => crate::LOG.info("received SIGTERM, shutting down"),
     }
 }
 
@@ -246,10 +246,10 @@ pub fn close_if_sole_owner(instance: Arc<xray_core::Instance>) -> Result<()> {
             inst.close().map_err(|e| CliError::StartFailed(format!("instance close failed: {e}")))
         },
         Err(arc) => {
-            tracing::warn!(
-                strong_count = Arc::strong_count(&arc),
-                "Arc<Instance> has multiple holders; skipping graceful close"
-            );
+            crate::LOG.warn(format!(
+                "strong_count={} Arc<Instance> has multiple holders; skipping graceful close",
+                Arc::strong_count(&arc)
+            ));
             Ok(())
         },
     }

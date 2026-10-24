@@ -272,7 +272,10 @@ impl<C> VisionConn<C> {
         }
     }
 }
-
+#[allow(
+    clippy::disallowed_macros,
+    reason = "存量债：XRAY_FRDBG 诊断分支直印 stderr；vision 热路径禁改语义故仅登记，诊断改走 logx 归第二批禁令"
+)]
 impl<C> AsyncRead for VisionConn<C>
 where
     C: AsyncRead + AsyncWrite + Unpin + InnerRawClone,

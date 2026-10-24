@@ -68,6 +68,10 @@ impl UniRespRouter {
     pub(crate) fn spawn(conn: quinn::Connection) -> Self {
         let waiters: Waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let w = Arc::clone(&waiters);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         tokio::spawn(async move {
             loop {
                 let mut uni = match conn.accept_uni().await {

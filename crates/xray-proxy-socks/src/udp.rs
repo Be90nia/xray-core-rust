@@ -258,6 +258,10 @@ pub async fn relay(
     let global_id: [u8; GLOBAL_ID_LEN] = rand::random();
 
     // 响应泵：relay recv → XUDP 帧 → link.writer（FRAG 计数器随任务走）
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+    )]
     let resp_task =
         tokio::spawn(pump_response(Arc::clone(&relay), global_id, frag_dropped, writer));
 

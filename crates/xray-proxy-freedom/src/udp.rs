@@ -124,6 +124,10 @@ pub async fn relay_policy(
     let resp_sock = Arc::clone(&sock);
     let resp_global_id = global_id;
     let resp_policy = policy.clone();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+    )]
     let resp_task = tokio::spawn(async move {
         pump_response(&resp_sock, resp_global_id, &mut writer, &resp_policy).await
     });

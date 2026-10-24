@@ -552,6 +552,7 @@ impl Commander {
                     }
                 })?;
                 tracing::info!("commander gRPC server listening on {addr} (tag=`{}`)", self.tag);
+                #[allow(clippy::disallowed_methods, reason = "gRPC UDS 模式 tonic Server serve 主循环（server 自管连接任务）；FxScope 未接线（T3.1b 登记）")]
                 let handle = tokio::spawn(async move {
                     if let Err(e) = router
                         .serve_with_incoming(
@@ -585,6 +586,7 @@ impl Commander {
                     "commander gRPC server listening on unix:{path} (tag=`{}`)",
                     self.tag
                 );
+                #[allow(clippy::disallowed_methods, reason = "gRPC TCP 模式 tonic Server serve 主循环（server 自管连接任务）；FxScope 未接线（T3.1b 登记）")]
                 let handle = tokio::spawn(async move {
                     if let Err(e) = router
                         .serve_with_incoming(
@@ -641,6 +643,7 @@ impl Commander {
                     "commander gRPC server serving via outbound handler (tag=`{}`)",
                     self.tag
                 );
+                #[allow(clippy::disallowed_methods, reason = "gRPC inbound 模式 tonic Server serve 主循环（server 自管连接任务）；FxScope 未接线（T3.1b 登记）")]
                 let handle = tokio::spawn(async move {
                     if let Err(e) = router.serve_with_incoming(incoming).await {
                         tracing::error!("commander gRPC server exited with error: {e}");
@@ -1103,6 +1106,7 @@ mod tests {
             Port::new(0),
             Network::TCP,
         );
+        #[allow(clippy::disallowed_methods, reason = "dispatch 与调用方解耦的后台投递（Go dispatch goroutine 直译）；FxScope 未接线（T3.1b 登记）")]
         tokio::spawn(async move {
             handler.dispatch(&dest, link).await;
         });

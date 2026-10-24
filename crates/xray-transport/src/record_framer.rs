@@ -36,6 +36,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::connection::Connection;
 
+// log-hot-path-exempt: XRAY_FRDBG 门内每 TLS record 帧排空记录 ——
+// 数据面泵/每包循环内的诊断留痕，LogFacade emit（Mutex+掩码）开销不可入热路径，保留原样
 /// TLS 记录头长度：type(1) + version(2) + length(2)。
 const HEADER_LEN: usize = 5;
 

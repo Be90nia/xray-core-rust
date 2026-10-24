@@ -65,6 +65,10 @@ impl InboundHandler for BlackholeInboundHandler {
         let response = self.response.clone();
         let tag = self.tag.clone();
         // spawn accept 循环
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         tokio::spawn(async move {
             loop {
                 let (stream, _peer) = match listener.accept().await {
@@ -75,6 +79,10 @@ impl InboundHandler for BlackholeInboundHandler {
                     },
                 };
                 let response = response.clone();
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+                )]
                 tokio::spawn(async move {
                     match &response {
                         ResponseConfig::None => {

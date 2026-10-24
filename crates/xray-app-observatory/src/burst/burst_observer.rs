@@ -169,6 +169,7 @@ impl BurstObserver {
         let observer = self.clone();
         let selector_for_loop = selector.clone();
         let executor_for_loop = executor.clone();
+        #[allow(clippy::disallowed_methods, reason = "burst 观察循环后台 ticker（shutdown_rx 停机面）；FxScope 未接线（T3.1b 登记）")]
         tokio::spawn(async move {
             let mut shutdown_rx = shutdown_rx;
             let mut ticker = tokio::time::interval(interval);

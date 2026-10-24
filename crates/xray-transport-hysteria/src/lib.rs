@@ -42,6 +42,11 @@
 //! [`conn::QuicConn`] / [`conn::QuicStream`]，让 hysteria interConn / UdpSessionManager
 //! 直接复用 quinn QUIC 栈。不含 transport（dial+auth）和 congestion controller 适配。
 
+/// T3.2a 日志统一入口：域规范 target = `xray_frame::transport::hysteria`（热路径豁免清单见
+/// reports/framework-audit-2026-10-24/T3.2a-log-transport-cli.md）。
+pub(crate) static LOG: std::sync::LazyLock<xray_frame::logging::LogFacade> =
+    std::sync::LazyLock::new(|| xray_frame::logging::LogFacade::new("transport::hysteria", vec![]));
+
 pub mod config;
 pub use xray_transport_quic::congestion_swappable as congestion;
 pub mod conn;

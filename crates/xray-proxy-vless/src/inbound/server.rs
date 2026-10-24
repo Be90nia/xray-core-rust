@@ -131,6 +131,10 @@ pub async fn serve_vless(
         let options = options.clone();
         let header = header.clone();
         let local = listener.local_addr()?;
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         tokio::spawn(async move {
             let result = if let Some(acc) = tls {
                 // vision splice：TLS accept 消费 socket 前 dup 裸 TCP 克隆，
@@ -641,6 +645,10 @@ where
     // cancel-safe，不能直接进 select!（对齐 vmess pump 的 up/relay 拆分）。
     // 读到包交 channel；EOF/Err 即退出（客户端方向结束，tx drop 唤醒 relay）。
     let (up_tx, mut up_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+    )]
     let uplink = tokio::spawn(async move {
         // while let：Ok 继续、Err（EOF/IO）即退出（clippy while_let_loop 同构改写）
         while let Ok(pkt) = read_length_packet(&mut reader).await {

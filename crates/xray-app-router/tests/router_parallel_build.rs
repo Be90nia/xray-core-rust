@@ -5,6 +5,7 @@
 //! 2. 池化批量构建耗时 ≤ 串行 × 1.05（3 轮中位数，不得更慢）；
 //! 3. 提交侧拒绝（队列满）路径显式内联补位，不 panic。
 
+#![allow(clippy::disallowed_macros)] // T3.1b：基准对照测试 println 输出对比数字（集成测试 crate 无 lib 层 cfg_attr(test) 豁免）；生产禁令不受影响
 use std::{
     sync::mpsc,
     time::{Duration, Instant},

@@ -318,7 +318,7 @@ impl DefaultListener {
         let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
         // TCP_MPTCP 必须在 listen 前设置；失败（如内核未编译 MPTCP）静默回退普通 TCP。
         if let Err(e) = crate::sockopt::try_set_mptcp(&socket) {
-            tracing::debug!(error = %e, "MPTCP unavailable, falling back to TCP");
+            crate::LOG.debug(format!("error={e} MPTCP unavailable, falling back to TCP"));
         }
         // 顺路复用 prelisten 路径处理 TFO/REUSEPORT。
         if sockopt.reuse_port {
@@ -382,7 +382,7 @@ impl SystemListener for DefaultListener {
 
             // 应用 inbound sockopt（TCP_NODELAY + keepalive）。
             if let Err(e) = apply_inbound_socket_options(&socket, &self.sockopt) {
-                tracing::debug!(error = %e, "failed to apply inbound socket options");
+                crate::LOG.debug(format!("error={e} failed to apply inbound socket options"));
             }
 
             // 应用 fd 控制器。
@@ -394,7 +394,7 @@ impl SystemListener for DefaultListener {
                 .unwrap_or_default();
             for ctl in &self.controllers {
                 if let Err(e) = ctl("tcp", &local_addr, &socket) {
-                    tracing::debug!(error = %e, "listener controller failed");
+                    crate::LOG.debug(format!("error={e} listener controller failed"));
                 }
             }
 
@@ -405,11 +405,13 @@ impl SystemListener for DefaultListener {
                 let mut stream = tcp_stream;
                 match crate::proxy_protocol::read_proxy_protocol(&mut stream).await {
                     Ok(Some(real_peer)) => {
-                        tracing::debug!(proxy_peer = %real_peer, tcp_peer = %peer, "PROXY protocol resolved");
+                        crate::LOG.debug(format!(
+                            "proxy_peer={real_peer} tcp_peer={peer} PROXY protocol resolved"
+                        ));
                         Box::new(ProxiedConnection::new(TcpConnection::new(stream), real_peer))
                     },
                     Ok(None) => {
-                        tracing::debug!(tcp_peer = %peer, "PROXY protocol UNKNOWN");
+                        crate::LOG.debug(format!("tcp_peer={peer} PROXY protocol UNKNOWN"));
                         Box::new(TcpConnection::new(stream))
                     },
                     Err(e) => return Err(e),
@@ -612,7 +614,7 @@ impl InboundTcpListener {
         let std_stream = stream.into_std()?;
         let socket = Socket::from(std_stream);
         if let Err(e) = apply_inbound_socket_options(&socket, &self.sockopt) {
-            tracing::debug!(error = %e, "failed to apply inbound socket options");
+            crate::LOG.debug(format!("error={e} failed to apply inbound socket options"));
         }
         Ok((tokio::net::TcpStream::from_std(socket.into())?, peer))
     }

@@ -20,19 +20,19 @@ use std::{io, net::SocketAddr, sync::Arc};
 
 use xray_common::net::destination::Destination;
 use xray_transport::{
-    accept_policy::{AcceptErrorKind, backoff_if_resource, supervise_accept_loop},
+    accept_policy::{backoff_if_resource, supervise_accept_loop, AcceptErrorKind},
     connection::Connection,
-    dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
+    dialer::{register_transport_dialer, StreamSettings, TransportDialFn},
     listener_registry::{
-        ConnHandler, TransportListenFn, TransportListener, register_transport_listener,
+        register_transport_listener, ConnHandler, TransportListenFn, TransportListener,
     },
 };
 
 use crate::{
-    client::{DelayDialConn, DialFactory, DialParams, dial_with_params},
+    client::{dial_with_params, DelayDialConn, DialFactory, DialParams},
     config::Config,
     error::WsError,
-    pool::{PoolKey, WsConnectionPool, global_pool},
+    pool::{global_pool, PoolKey, WsConnectionPool},
 };
 
 /// 注册 WebSocket transport dialer。
@@ -139,16 +139,16 @@ async fn listen_ws(
                         Err(e) => {
                             match accept_kind(&e) {
                                 AcceptErrorKind::Resource => {
-                                    tracing::warn!(tag = "ws", local = %local_addr, error = %e, "ws inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续");
+                                    crate::LOG.warn(format!("tag=ws local={local_addr} error={e} ws inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续"));
                                     if let WsError::Io(io_err) = &e {
                                         backoff_if_resource(io_err).await;
                                     }
                                 }
                                 AcceptErrorKind::Connection => {
-                                    tracing::debug!(tag = "ws", error = %e, "ws inbound: 单连接级 accept 错误，继续监听");
+                                    crate::LOG.debug(format!("tag=ws error={e} ws inbound: 单连接级 accept 错误，继续监听"));
                                 }
                                 AcceptErrorKind::Unknown => {
-                                    tracing::warn!(tag = "ws", local = %local_addr, error = %e, "ws inbound: accept 错误（未知类别），继续监听");
+                                    crate::LOG.warn(format!("tag=ws local={local_addr} error={e} ws inbound: accept 错误（未知类别），继续监听"));
                                 }
                             }
                         }
@@ -306,9 +306,10 @@ fn spawn_replenish(pool: &Arc<WsConnectionPool>, key: &PoolKey, params: DialPara
         pool.end_preconnect(&key);
         match result {
             Ok(conn) => pool.release(key, Box::new(conn)).await,
-            Err(e) => {
-                tracing::debug!(key = %key.short_label(), error = %e, "ws pool replenish dial failed")
-            },
+            Err(e) => crate::LOG.debug(format!(
+                "key={} error={e} ws pool replenish dial failed",
+                key.short_label()
+            )),
         }
     });
 }

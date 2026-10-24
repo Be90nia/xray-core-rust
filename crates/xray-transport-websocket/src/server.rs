@@ -216,7 +216,7 @@ impl WsListener {
             Ok(Ok((remote, tls_stream))) => (remote, tls_stream),
             Ok(Err(e)) => return Err(e),
             Err(_) => {
-                tracing::debug!("ws TLS accept timeout (4s, Go ReadHeaderTimeout)");
+                crate::LOG.debug("ws TLS accept timeout (4s, Go ReadHeaderTimeout)");
                 return Err(WsError::HandshakeFailed("tls accept timeout (4s)".into()));
             },
         };
@@ -234,11 +234,10 @@ impl WsListener {
             }
         }
         if !early_bytes.is_empty() {
-            tracing::info!(
-                target: "xray_transport_ws",
-                bytes = early_bytes.len(),
-                "TLS 0-RTT early data accepted (prefixed to ws handshake)"
-            );
+            crate::LOG.info(format!(
+                "bytes={} TLS 0-RTT early data accepted (prefixed to ws handshake)",
+                early_bytes.len()
+            ));
         }
         // wsh2 修复：ALPN 协商出 h2 时进 h2 拒绝服务，而非把 HTTP/2 帧喂给
         // http/1.1-only 的 ws_handshake（裸断根因：curl --http2 = 000，CF 回源
@@ -486,13 +485,11 @@ fn extract_xff_trusted(headers: &HeaderMap, trusted: &[String]) -> Option<IpAddr
         return first.parse::<IpAddr>().ok();
     }
     if trusted.is_empty() {
-        tracing::warn!(
-            xff = val,
-            "received \"X-Forwarded-For\" but \"sockopt.trustedXForwardedFor\" is not configured; \
-             ignoring it and using the real remote address"
-        );
+        crate::LOG.warn(format!(
+            "xff={val} received \"X-Forwarded-For\" but \"sockopt.trustedXForwardedFor\" is not configured; ignoring it and using the real remote address"
+        ));
     } else {
-        tracing::warn!(xff = val, "ignored potentially forged \"X-Forwarded-For\"");
+        crate::LOG.warn(format!("xff={val} ignored potentially forged \"X-Forwarded-For\""));
     }
     None
 }

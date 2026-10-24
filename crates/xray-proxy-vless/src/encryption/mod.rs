@@ -853,6 +853,10 @@ impl ServerInstance {
         // 过期 ticket；`closed` 置位后任务退出（Go Closed bool）。
         if self.seconds_from > 0 || self.seconds_to > 0 {
             let store = std::sync::Arc::clone(&self.sessions);
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+            )]
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
                 interval.tick().await; // 首次 tick 立即返回，跳过

@@ -228,6 +228,7 @@ impl Observer {
         let enable_concurrency = self.config.enable_concurrency;
         let observe = self.observe.clone();
         let probe_url = self.config.effective_probe_url().to_string();
+        #[allow(clippy::disallowed_methods, reason = "观察循环后台任务（周期探测，cancel_rx 停机面）；FxScope 未接线（T3.1b 登记）")]
         tokio::spawn(async move {
             let mut cancel_rx = cancel_rx;
             let mut fail_streak: u32 = 0;

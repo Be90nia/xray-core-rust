@@ -28,9 +28,9 @@ use std::{io, net::SocketAddr, sync::Arc};
 use xray_common::net::destination::Destination;
 use xray_transport::{
     connection::Connection,
-    dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
+    dialer::{register_transport_dialer, StreamSettings, TransportDialFn},
     listener_registry::{
-        ConnHandler, TransportListenFn, TransportListener, register_transport_listener,
+        register_transport_listener, ConnHandler, TransportListenFn, TransportListener,
     },
 };
 

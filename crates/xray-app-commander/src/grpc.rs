@@ -587,6 +587,7 @@ impl ProtoRoutingService for RoutingServiceImpl {
             tokio::sync::mpsc::channel::<std::result::Result<prouter::RoutingContext, Status>>(16);
         // 发布契约：channel 消息为 Arc<xray_proto RoutingContext>（Go 端为
         // routing.Route；本仓路由发布方尚未接线，此处固定消息类型）。
+        #[allow(clippy::disallowed_methods, reason = "订阅广播泵后台循环（pubsub 消息扇出）；FxScope 未接线（T3.1b 登记）")]
         tokio::spawn(async move {
             while let Some(msg) = sub.recv().await {
                 let Some(rc) = msg.downcast_ref::<prouter::RoutingContext>() else {

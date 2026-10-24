@@ -15,14 +15,14 @@ use std::{
     convert::Infallible,
     net::SocketAddr,
     sync::{
-        Arc, Mutex,
         atomic::{AtomicBool, AtomicU16, Ordering},
+        Arc, Mutex,
     },
 };
 
-use base64::{Engine, engine::general_purpose::STANDARD as B64};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use bytes::Bytes;
-use http::{Method, StatusCode, header::PROXY_AUTHORIZATION};
+use http::{header::PROXY_AUTHORIZATION, Method, StatusCode};
 use hyper::{body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use subtle::ConstantTimeEq;
@@ -33,8 +33,9 @@ use xray_common::net::{address::Address, destination::Destination, network::Netw
 use xray_features::inbound::{InboundError, InboundHandler};
 use xray_transport::link::Link;
 
-use crate::{PaddingReader, PaddingWriter, padding::random_padding_header};
+use crate::{padding::random_padding_header, PaddingReader, PaddingWriter};
 
+// log-hot-path-exempt: echo dispatch 伪装回显每包读循环内失败记录 —— 数据面每包路径，保留原样
 /// 统一响应 body：CONNECT 200 / 404 / 407 均为空 body。
 ///
 /// hyper server 对 h2 CONNECT 强制 success 响应 body 为空（非零 content-length
@@ -174,7 +175,7 @@ impl InboundHandler for NaiveInboundHandler {
                             let tls = match acceptor.accept(tcp).await {
                                 Ok(t) => t,
                                 Err(e) => {
-                                    tracing::debug!(target: "naive", error = %e, "tls accept failed");
+                                    crate::LOG.debug(format!("error={e} tls accept failed"));
                                     return;
                                 },
                             };
@@ -192,19 +193,20 @@ impl InboundHandler for NaiveInboundHandler {
                                     .serve_connection(TokioIo::new(tls), service)
                                     .await
                             {
-                                tracing::debug!(target: "naive", error = %e, "h2 connection ended");
+                                crate::LOG.debug(format!("error={e} h2 connection ended"));
                             }
                         });
                     },
                     Err(e) => {
-                        tracing::debug!(target: "naive", error = %e, "accept failed");
+                        crate::LOG.debug(format!("error={e} accept failed"));
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     },
                 }
             }
         });
         *self.lock_slot() = Some(InboundSlot { _accept_task: accept_task });
-        tracing::info!(tag = %self.tag, addr = %self.bind_addr, "naive inbound listening");
+        crate::LOG
+            .info(format!("tag={} addr={} naive inbound listening", self.tag, self.bind_addr));
         Ok(())
     }
 
@@ -234,14 +236,14 @@ async fn handle_request(
     // fallback：非 CONNECT 一律 404 空响应（naiveproxy probe-resistance——
     // 主动探测看到的是普通 404 站点，不暴露代理身份）
     if req.method() != Method::CONNECT {
-        tracing::debug!(target: "naive", method = %req.method(), "fallback 404");
+        crate::LOG.debug(format!("method={} fallback 404", req.method()));
         return Ok(response_status(StatusCode::NOT_FOUND));
     }
 
     // 认证：Proxy-Authorization: Basic base64(user:pass)，失败 407
     // （Caddy forwardproxy / sing-box naive 语义）
     if let Err(reason) = check_proxy_auth(req.headers(), &auth) {
-        tracing::debug!(target: "naive", reason, "auth rejected");
+        crate::LOG.debug(format!("reason={reason} auth rejected"));
         let mut resp = response_status(StatusCode::PROXY_AUTHENTICATION_REQUIRED);
         resp.headers_mut().insert(
             http::header::PROXY_AUTHENTICATE,
@@ -252,11 +254,11 @@ async fn handle_request(
 
     // CONNECT authority-form：目标必有端口，缺失按畸形请求拒绝
     let Some(authority) = req.uri().authority() else {
-        tracing::debug!(target: "naive", "CONNECT without authority");
+        crate::LOG.debug("CONNECT without authority");
         return Ok(response_status(StatusCode::BAD_REQUEST));
     };
     let Some(port) = authority.port_u16() else {
-        tracing::debug!(target: "naive", authority = %authority, "CONNECT without port");
+        crate::LOG.debug(format!("authority={authority} CONNECT without port"));
         return Ok(response_status(StatusCode::BAD_REQUEST));
     };
     let host = authority.host().to_string();
@@ -279,7 +281,7 @@ async fn handle_request(
                 let upgraded = match upgrade.await {
                     Ok(u) => u,
                     Err(e) => {
-                        tracing::debug!(target: "naive", error = %e, "tunnel upgrade failed");
+                        crate::LOG.debug(format!("error={e} tunnel upgrade failed"));
                         return;
                     },
                 };
@@ -301,7 +303,7 @@ async fn handle_request(
         builder = builder.header("padding", random_padding_header());
     }
     let resp = builder.body(RespBody::new()).expect("static response parts are valid");
-    tracing::debug!(target: "naive", host, port, padded, "naive tunnel established");
+    crate::LOG.debug(format!("host={host} port={port} padded={padded} naive tunnel established"));
     Ok(resp)
 }
 
@@ -348,14 +350,15 @@ async fn relay_mock_direct(
     let target = match tokio::net::TcpStream::connect((host.as_str(), port)).await {
         Ok(t) => t,
         Err(e) => {
-            tracing::debug!(target: "naive", %host, port, error = %e, "mock upstream dial failed");
+            crate::LOG
+                .debug(format!("host={host} port={port} error={e} mock upstream dial failed"));
             return;
         },
     };
     let upgraded = match upgrade.await {
         Ok(u) => u,
         Err(e) => {
-            tracing::debug!(target: "naive", error = %e, "mock tunnel upgrade failed");
+            crate::LOG.debug(format!("error={e} mock tunnel upgrade failed"));
             return;
         },
     };

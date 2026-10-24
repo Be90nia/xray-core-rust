@@ -6,7 +6,7 @@
 - 采集窗口 = 窗口前采样 → 末次采样，alloc/MB = Δalloc_bytes / 下载字节
 
 用法:
-  python tools/loopback_alloc_bench.py --tag r1 --xray <exe> [--runs 3] [--alloc-stats]
+  python tools/loopback_alloc_bench.py --tag r1 --xray <exe> [--runs 3] [--alloc-stats] [--floor N]
 输出: 每轮 curl speed 行 + 窗口 alloc/MB 汇总（stdout，直接贴 baseline.md）。
 """
 import argparse, json, os, re, subprocess, sys, time
@@ -76,6 +76,8 @@ def main():
     ap.add_argument('--tag', required=True)
     ap.add_argument('--runs', type=int, default=3)
     ap.add_argument('--alloc-stats', action='store_true')
+    ap.add_argument('--floor', type=float, default=120.0,
+                    help='min acceptable throughput MB/s (best run); below -> exit 1')
     args = ap.parse_args()
 
     dec, enc, rpriv, rpub = read_keys()
@@ -140,11 +142,13 @@ def main():
     print(f'window_start_srv={json.dumps(start_srv)}')
     print(f'window_start_cli={json.dumps(start_cli)}')
     total_bytes = 0
+    speeds = []
     try:
         url = f'http://127.0.0.1:{HTTP_PORT}/big.bin'
         for i in range(args.runs):
             speed, size, total = curl(url, socks=f'socks5h://127.0.0.1:{CLI_SOCKS}')
             total_bytes += size
+            speeds.append(speed)
             print(f'[via-enc-chain] #{i+1}: speed={speed} B/s ({speed/1e6:.1f} MB/s) '
                   f'size={size} time={total}s', flush=True)
     finally:
@@ -165,6 +169,13 @@ def main():
         d_n = end['alloc_n'] - start['alloc_n']
         print(f'alloc/MB[{name}] = {d_bytes / mb:.0f} '
               f'(Δalloc_bytes={d_bytes}, Δalloc_n={d_n}, {mb:.1f} MiB)')
+
+    if speeds:
+        best = max(speeds) / 1e6
+        print(f'floor check: best={best:.1f} MB/s vs floor={args.floor} MB/s')
+        if best < args.floor:
+            print(f'FLOOR FAIL: best {best:.1f} < floor {args.floor} MB/s', file=sys.stderr)
+            sys.exit(1)
 
 
 if __name__ == '__main__':

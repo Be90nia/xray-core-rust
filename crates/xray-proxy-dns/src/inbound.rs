@@ -67,6 +67,10 @@ impl DnsInbound {
         let timer = Arc::new(ActivityTimer::new(self.handler.timeout));
         let mut done = timer.done_signal();
         let run_timer = Arc::clone(&timer);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         let ticker = tokio::spawn(async move { run_timer.run().await });
         let result = async {
             loop {

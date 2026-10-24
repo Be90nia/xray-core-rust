@@ -10,6 +10,8 @@ xray-buf = { path = "../xray-buf" }
 xray-common = { path = "../xray-common" }
 xray-transport = { path = "../xray-transport" }
 xray-tls = { path = "../xray-tls" }
+# T3.2a 日志收敛：LogFacade（target = xray_frame::transport::quic）统一入口
+xray-frame = { path = "../xray-frame" }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

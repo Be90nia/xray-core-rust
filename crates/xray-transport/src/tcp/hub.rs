@@ -122,7 +122,7 @@ impl TcpHubListener {
                                 ) {
                                     Ok(c) => c,
                                     Err(e) => {
-                                        tracing::warn!(error = %e, "tcpmask wrap failed");
+                                        crate::LOG.warn(format!("error={e} tcpmask wrap failed"));
                                         // auth-wrapped conn 已丢失原始 conn——此处吞错
                                         unreachable!("tcpmask wrap failed but conn was moved by auth wrap")
                                     }
@@ -135,14 +135,14 @@ impl TcpHubListener {
                             match classify(&e) {
                                 AcceptErrorKind::Resource => {
                                     let local = self.local_addr().map_or_else(|err| err.to_string(), |a| a.to_string());
-                                    tracing::warn!(tag = "tcp", local = %local, error = %e, "tcp inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续");
+                                    crate::LOG.warn(format!("tag=tcp local={local} error={e} tcp inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续"));
                                     backoff_if_resource(&e).await;
                                 }
                                 AcceptErrorKind::Connection => {
-                                    tracing::debug!(tag = "tcp", error = %e, "tcp inbound: 单连接级 accept 错误，继续监听");
+                                    crate::LOG.debug(format!("tag=tcp error={e} tcp inbound: 单连接级 accept 错误，继续监听"));
                                 }
                                 AcceptErrorKind::Unknown => {
-                                    tracing::warn!(tag = "tcp", error = %e, "tcp inbound: accept 错误（未知类别），继续监听");
+                                    crate::LOG.warn(format!("tag=tcp error={e} tcp inbound: accept 错误（未知类别），继续监听"));
                                 }
                             }
                         }
@@ -299,14 +299,14 @@ impl TcpUnixHubListener {
                         Err(e) => {
                             match classify(&e) {
                                 AcceptErrorKind::Resource => {
-                                    tracing::warn!(tag = "tcp-unix", path = %self.path, error = %e, "unix inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续");
+                                    crate::LOG.warn(format!("tag=tcp-unix path={} error={e} unix inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续", self.path));
                                     backoff_if_resource(&e).await;
                                 }
                                 AcceptErrorKind::Connection => {
-                                    tracing::debug!(tag = "tcp-unix", path = %self.path, error = %e, "unix inbound: 单连接级 accept 错误，继续监听");
+                                    crate::LOG.debug(format!("tag=tcp-unix path={} error={e} unix inbound: 单连接级 accept 错误，继续监听", self.path));
                                 }
                                 AcceptErrorKind::Unknown => {
-                                    tracing::warn!(tag = "tcp-unix", path = %self.path, error = %e, "unix inbound: accept 错误（未知类别），继续监听");
+                                    crate::LOG.warn(format!("tag=tcp-unix path={} error={e} unix inbound: accept 错误（未知类别），继续监听", self.path));
                                 }
                             }
                         }

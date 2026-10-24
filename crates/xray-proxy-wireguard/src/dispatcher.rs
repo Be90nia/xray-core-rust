@@ -642,6 +642,10 @@ where
     let (relay_to_client, client_from_relay) = tokio::io::duplex(DUPLEX_BUF);
     let conn = WireguardConnection::new(client_from_relay, client_to_relay);
     let relay = make(relay_from_client, relay_to_client);
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+    )]
     tokio::spawn(async move {
         relay.run().await;
     });

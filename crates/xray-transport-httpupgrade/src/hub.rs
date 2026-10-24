@@ -171,13 +171,11 @@ pub fn apply_trusted_x_forwarded_for(
         return first.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, 0));
     }
     if trusted.is_empty() {
-        tracing::warn!(
-            xff = value,
-            "received \"X-Forwarded-For\" but \"sockopt.trustedXForwardedFor\" is not configured; \
-             ignoring it and using the real remote address"
-        );
+        crate::LOG.warn(format!(
+            "xff={value} received \"X-Forwarded-For\" but \"sockopt.trustedXForwardedFor\" is not configured; ignoring it and using the real remote address"
+        ));
     } else {
-        tracing::warn!(xff = value, "ignored potentially forged \"X-Forwarded-For\"");
+        crate::LOG.warn(format!("xff={value} ignored potentially forged \"X-Forwarded-For\""));
     }
     None
 }

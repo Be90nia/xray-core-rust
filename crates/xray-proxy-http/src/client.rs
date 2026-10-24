@@ -334,6 +334,10 @@ async fn establish_h2_tunnel(
                 .handshake::<Box<dyn Connection>, bytes::Bytes>(conn)
                 .await
                 .map_err(|e| format!("h2 handshake: {e}"))?;
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+            )]
             tokio::spawn(async move {
                 if let Err(e) = conn_driver.await {
                     tracing::debug!(

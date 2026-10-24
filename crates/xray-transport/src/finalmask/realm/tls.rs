@@ -151,10 +151,9 @@ pub fn parse_tls_config(
         Some("1.2") => Some(MinTlsVersion::Tls12),
         Some("1.3") => Some(MinTlsVersion::Tls13),
         Some(v @ ("1.0" | "1.1")) => {
-            tracing::warn!(
-                target: "xray_transport::realm::tls",
+            crate::LOG.warn(format!(
                 "realm tlsConfig: minVersion {v:?} is below the rustls floor (TLS 1.2); ignored"
-            );
+            ));
             None
         },
         _ => None,
@@ -176,11 +175,9 @@ pub fn parse_tls_config(
     let ignored: Vec<&str> =
         IGNORED.iter().copied().filter(|k| obj.get(*k).is_some_and(|v| !v.is_null())).collect();
     if !ignored.is_empty() {
-        tracing::warn!(
-            target: "xray_transport::realm::tls",
-            "realm tlsConfig: fields {ignored:?} are read by Go GetTLSConfig but not applied \
-             by this build; ignored"
-        );
+        crate::LOG.warn(format!(
+            "realm tlsConfig: fields {ignored:?} are read by Go GetTLSConfig but not applied by this build; ignored"
+        ));
     }
 
     Ok(Some(TlsConfig {

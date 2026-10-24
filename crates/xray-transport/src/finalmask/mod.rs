@@ -31,6 +31,8 @@ use tokio::{
     task::JoinHandle,
 };
 
+// log-hot-path-exempt: PacketIoConn 每包收发队列满/关闭记录 ——
+// 数据面泵/每包循环内的诊断留痕，LogFacade emit（Mutex+掩码）开销不可入热路径，保留原样
 pub mod custom;
 pub mod fragment;
 pub mod mkcp;
@@ -2775,7 +2777,8 @@ mod tests {
     /// （reqwest 默认路径 = 旧行为）；allowInsecure 按 Go 移除语义硬错；
     /// serverName 覆盖 ≠ url host 硬错。
     #[test]
-    #[allow(clippy::err_expect)] // 同 parse_json_realm_ip_mode_and_port_mapping_rejected_loudly：realm::Config 无 Debug，禁 expect_err
+    #[allow(clippy::err_expect)] // 同 parse_json_realm_ip_mode_and_port_mapping_rejected_loudly：realm::Config 无 Debug，禁
+    // expect_err
     fn realm_tls_config_structured_parses_defaults_pass_and_rejects_loudly() {
         let absent = build_realm_config(&fm(
             r#"{"url":"realm://t@h.example.com/i","stunServers":["s.example.com:3478"]}"#,

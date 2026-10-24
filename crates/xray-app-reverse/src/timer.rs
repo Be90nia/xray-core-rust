@@ -49,6 +49,7 @@ impl InactivityTimer {
         });
 
         let run_inner = Arc::clone(&inner);
+        #[allow(clippy::disallowed_methods, reason = "sliding window deadline 循环；FxScope 未接线（T3.1b 登记）")]
         tokio::spawn(async move {
             // sliding window：deadline = 最近一次 update + 当前 timeout
             loop {

@@ -17,6 +17,11 @@
 //! 配置仅消费 TLS 层（[`xray_tls::client_config`] / [`xray_tls::server_config`]），
 //! quicSettings 的 KeepAlive / 拥塞控制等参数留 follow-up。
 
+/// T3.2a 日志统一入口：域规范 target = `xray_frame::transport::quic`（热路径豁免清单见
+/// reports/framework-audit-2026-10-24/T3.2a-log-transport-cli.md）。
+pub(crate) static LOG: std::sync::LazyLock<xray_frame::logging::LogFacade> =
+    std::sync::LazyLock::new(|| xray_frame::logging::LogFacade::new("transport::quic", vec![]));
+
 pub mod config;
 pub mod congestion_swappable;
 pub mod register;

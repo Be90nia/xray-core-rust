@@ -61,6 +61,16 @@ const SERVE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// 上游两次拒绝（#6422/#6755），勿再引入。
 pub(crate) const H2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(45);
 
+/// bd wz2b C2 + bd c9oc F-A h2 窗钉修复常量（commit 8780187e，防回档）：
+/// client.rs 主 builder 与 dialer.rs stream-one 共用（同批同值）。削弱任一值
+/// 必红 client.rs `h2_window_pins_match_wz2b_c9oc`。
+pub(crate) const H2_INITIAL_STREAM_WINDOW: u32 = 32 * 1024 * 1024;
+/// 连接窗不低于流窗即不另成钉（bd c9oc F-A）。
+pub(crate) const H2_INITIAL_CONNECTION_WINDOW: u32 = 32 * 1024 * 1024;
+/// h2 每流发送缓冲（bd wz2b：服务端收窗放大后 send buf 成次级钉；回档 1MB =
+/// 上行钉 1MB/RTT）。
+pub(crate) const H2_MAX_SEND_BUF_SIZE: usize = 16 * 1024 * 1024;
+
 /// SplitHTTP 监听入口（listener registry 注册的目标）。
 ///
 /// 镜像 Go `ListenXH`：isH3（alpn==["h3"]）走 QUIC，其余走 TCP + TLS/REALITY 包装。
@@ -143,7 +153,8 @@ async fn listen_tcp(
                 "tcp".to_string(),
                 rc.xver,
             );
-            tracing::info!(dest = %rc.fallback_dest, "reality maxUselessRecords probe started");
+            crate::LOG
+                .info(format!("dest={} reality maxUselessRecords probe started", rc.fallback_dest));
             Arc::new(xray_reality::server::ProbeContext {
                 table,
                 dest: rc.fallback_dest.clone(),
@@ -151,7 +162,7 @@ async fn listen_tcp(
             })
         });
     let ctx = build_context(config, local, handler);
-    tracing::info!(%local, "listening TCP for XHTTP");
+    crate::LOG.info(format!("{local} listening TCP for XHTTP"));
 
     let accept_task = tokio::spawn(async move {
         use xray_transport::accept_policy::{AcceptErrorKind, backoff_if_resource, classify};
@@ -164,14 +175,14 @@ async fn listen_tcp(
                     // close() 的 abort 句柄。
                     match classify(&e) {
                         AcceptErrorKind::Resource => {
-                            tracing::warn!(tag = "splithttp", local = %local, error = %e, "splithttp inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续");
+                            crate::LOG.warn(format!("tag=splithttp local={local} error={e} splithttp inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续"));
                             backoff_if_resource(&e).await;
                         },
                         AcceptErrorKind::Connection => {
-                            tracing::debug!(tag = "splithttp", error = %e, "splithttp inbound: 单连接级 accept 错误，继续监听");
+                            crate::LOG.debug(format!("tag=splithttp error={e} splithttp inbound: 单连接级 accept 错误，继续监听"));
                         },
                         AcceptErrorKind::Unknown => {
-                            tracing::warn!(tag = "splithttp", local = %local, error = %e, "splithttp inbound: accept 错误（未知类别），继续监听");
+                            crate::LOG.warn(format!("tag=splithttp local={local} error={e} splithttp inbound: accept 错误（未知类别），继续监听"));
                         },
                     }
                     continue;
@@ -188,7 +199,7 @@ async fn listen_tcp(
                     ) {
                         Ok(c) => c,
                         Err(e) => {
-                            tracing::debug!(error = %e, "XHTTP tcpmask wrap failed");
+                            crate::LOG.debug(format!("error={e} XHTTP tcpmask wrap failed"));
                             continue;
                         },
                     }
@@ -589,14 +600,17 @@ async fn serve_reality_conn<S>(
         Ok(RealityServerOutcome::Verified { tls, max_useless_records }) => {
             // bd frxi：探测值随连接交付（rustls 无 record 层消费点，
             // mygg 后握手记录模仿落地前仅可观察）。
-            tracing::debug!(peer = %peer, max_useless_records, "reality verified with probe result");
+            crate::LOG.debug(format!("peer={peer} max_useless_records={max_useless_records} reality verified with probe result"));
             serve_http_conn(tls, peer, ctx).await
         },
         Ok(RealityServerOutcome::Invalid { conn, record, reason }) => {
-            tracing::debug!(error = ?reason, dest = %rc.fallback_dest, "splithttp reality fallback");
+            crate::LOG.debug(format!(
+                "error={reason:?} dest={} splithttp reality fallback",
+                rc.fallback_dest
+            ));
             let _ = fallback_to_dest(conn, &record, &rc.fallback_dest, peer, local, rc.xver).await;
         },
-        Err(e) => tracing::warn!(error = %e, "splithttp reality handshake error"),
+        Err(e) => crate::LOG.warn(format!("error={e} splithttp reality handshake error")),
     }
 }
 
@@ -638,7 +652,7 @@ async fn listen_h3(
     let local = endpoint.local_addr()?;
     // endpoint clone 给 listener 句柄；本体 move 进 accept task。
     let ctx = build_context(config, local, handler);
-    tracing::info!(%local, "listening QUIC for XHTTP/3");
+    crate::LOG.info(format!("{local} listening QUIC for XHTTP/3"));
 
     let listener_endpoint = endpoint.clone();
     let _accept_task = tokio::spawn(async move {
@@ -879,7 +893,7 @@ impl TransportListener for SplithttpListener {
     }
 
     fn close(&self) -> io::Result<()> {
-        tracing::info!("splithttp listener close addr={}", self.local);
+        crate::LOG.info(format!("splithttp listener close addr={}", self.local));
         if let Some(task) = &self.tcp_abort {
             task.abort();
         }

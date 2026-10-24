@@ -7,6 +7,11 @@ use parking_lot::Mutex;
 
 use crate::config::{DEAD_DELAY_MS, OutboundStatus, ProbeResult};
 
+
+/// 状态表硬上界（有界背板）：正常配置的 outbound tag 数远小于此值；触达即淘汰
+/// 最久未探测项——已配置 tag 每轮刷新 last_try_time 不会落入淘汰候选，查询
+/// 语义与无界版一致（防 tag 流失面失控的防御性上界）。
+const MAX_STATUSES: usize = 1024;
 /// StatusStore：线程安全的 outbound 状态集合。
 pub struct StatusStore {
     inner: Mutex<Vec<OutboundStatus>>,
@@ -42,7 +47,7 @@ impl StatusStore {
     ///
     /// 对应 Go `updateStatusForResult`：
     /// - 若 outbound 已存在 → 更新现有
-    /// - 否则 → 创建新 entry 追加
+    /// - 否则 → 创建新 entry 追加（触顶时先淘汰最久未探测项，上界 MAX_STATUSES）
     /// - alive → 更新 delay + last_seen_time
     /// - !alive → delay = DEAD_DELAY_MS + last_error_reason
     pub fn update_with_probe_result(
@@ -58,6 +63,15 @@ impl StatusStore {
         let idx = match idx {
             Some(i) => i,
             None => {
+                // 有界背板：满时逐 last_try_time 最小（最久未探测）项，并列取
+                // 下标最小（最早入表）确定序。已存在 tag 的更新路径永不触发淘汰。
+                if g.len() >= MAX_STATUSES {
+                    let stale_idx =
+                        g.iter().enumerate().min_by_key(|(_, s)| s.last_try_time).map(|(i, _)| i);
+                    if let Some(i) = stale_idx {
+                        g.remove(i);
+                    }
+                }
                 g.push(OutboundStatus::default());
                 g.len() - 1
             },
@@ -244,6 +258,25 @@ mod tests {
         snap[0].delay = 999;
         // 原始 store 不变
         assert_eq!(s.snapshot()[0].delay, 1);
+    }
+    #[test]
+    fn status_store_caps_at_max_and_evicts_stalest() {
+        // 有界背板：触顶后长度钉在上界；淘汰走「最久未探测」（last_try_time
+        // 最小），刚刷新的 tag 永不被逐——已配置 tag 每轮刷新 last_try_time，
+        // 正常配置（tag 数远小于上界）行为与无界版完全一致。
+        let s = StatusStore::new();
+        for i in 0..1024 {
+            s.update_with_probe_result(&format!("tag{i}"), &result_alive(50), 1_000);
+        }
+        assert_eq!(s.len(), 1024);
+
+        // tag0 刷新为最新，再溢入新 tag → 被逐的必须是未刷新的 tag1。
+        s.update_with_probe_result("tag0", &result_alive(60), 2_000);
+        s.update_with_probe_result("overflow", &result_alive(50), 2_000);
+        assert_eq!(s.len(), 1024, "触顶后长度不再增长");
+        assert!(s.find_location("tag0").is_some(), "刚刷新的 tag 不被逐");
+        assert!(s.find_location("overflow").is_some(), "新 tag 仍可入表");
+        assert!(s.find_location("tag1").is_none(), "最久未探测项被逐");
     }
 
     #[test]

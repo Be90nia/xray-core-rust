@@ -51,11 +51,9 @@ pub async fn read_proxy_protocol<R: AsyncReadExt + Unpin>(
         let length = u16::from_be_bytes([rest[8], rest[9]]) as usize;
         // 先在分配前拒绝超限长度（Go v2.go:168-170 MaxV2HeaderSize 同语义）。
         if length > MAX_V2_HEADER_SIZE {
-            tracing::warn!(
-                length,
-                max = MAX_V2_HEADER_SIZE,
-                "PROXY protocol v2 header length exceeds cap; rejecting connection"
-            );
+            crate::LOG.warn(format!(
+                "length={length} max={MAX_V2_HEADER_SIZE} PROXY protocol v2 header length exceeds cap; rejecting connection"
+            ));
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("proxy protocol v2 header too long: {length} > {MAX_V2_HEADER_SIZE}"),

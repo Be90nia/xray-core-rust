@@ -209,6 +209,10 @@ impl TuicConnection {
     /// 从 TuicConn 构造：拆 send/recv，spawn pump，返回 duplex 客户端包装。
     fn from_conn(conn: TuicConn) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         let pump = tokio::spawn(pump_streams(conn.send, conn.recv, server_io));
         Self { inner: client_io, _pump: pump }
     }

@@ -14,6 +14,8 @@ xray-reality = { path = "../xray-reality" }
 xray-tls = { path = "../xray-tls" }
 # H3 CC 接线：复用 congestion_swappable BBR/Brutal 桥（TUIC 同款）
 xray-transport-quic = { path = "../xray-transport-quic" }
+# T3.2a 日志收敛：LogFacade（target = xray_frame::transport::splithttp）统一入口
+xray-frame = { path = "../xray-frame" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
@@ -48,6 +50,8 @@ hex = "0.4"
 [dev-dependencies]
 rcgen = "0.13"
 xray-features = { path = "../xray-features" }
+# bd 88m0 防回档测试：完整 connector 后回读 SO_RCVBUF（socket2 是唯一回读口）
+socket2 = { workspace = true }
 
 # bd g3cr: 生产代码零 unwrap（测试代码由 clippy.toml allow-unwrap-in-tests 豁免）
 [lints.clippy]

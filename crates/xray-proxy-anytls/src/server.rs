@@ -88,6 +88,10 @@ impl AnytlsMockServer {
         let listener = TcpListener::bind(bind_addr).await?;
         let local_addr = listener.local_addr()?;
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         let join = tokio::spawn(serve_loop(
             listener,
             tls_acceptor,
@@ -119,6 +123,7 @@ async fn serve_loop(
                 let Ok((tcp, _peer)) = res else { continue };
                 let tls_acceptor = tls_acceptor.clone();
                 let dispatch = dispatch.clone();
+                #[allow(clippy::disallowed_methods, reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）")]
                 tokio::spawn(handle_conn(
                     tcp,
                     tls_acceptor,
@@ -166,6 +171,10 @@ async fn handle_conn(
         },
     };
     let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+    )]
     tokio::spawn(async move {
         if kill_rx.await.is_ok() {
             let _ = kill_sock.shutdown(std::net::Shutdown::Both);
@@ -218,6 +227,10 @@ async fn handle_conn(
     let on_new_session: Box<dyn Fn(Arc<Session>) + Send + Sync> = Box::new(move |session| {
         let dispatch = dispatch.clone();
         let kill_tx = kill_tx_cell.lock().take();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         tokio::spawn(handle_session(session, dispatch, kill_tx));
     });
     let session = Arc::new(
@@ -229,6 +242,10 @@ async fn handle_conn(
     }
     // spawn run 循环——主循环结束后 session 自然清理
     let session_run = session.clone();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+    )]
     tokio::spawn(async move {
         let _ = session_run.run().await;
     });
@@ -270,6 +287,10 @@ async fn handle_session(
         let dest = socks_to_destination(&target);
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
         let (rd_half, wr_half) = tokio::io::split(client_io);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         tokio::spawn(pump_session_to_duplex(session.clone(), server_io));
         let reader = new_reader(InitialedReader::new(buf[consumed..n].to_vec(), rd_half));
         let writer = new_writer(wr_half);

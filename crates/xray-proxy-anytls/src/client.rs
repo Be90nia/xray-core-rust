@@ -191,6 +191,10 @@ impl AnytlsClient {
         stream.write(&socks_bytes).await?;
 
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         let pump = tokio::spawn(pump_stream(stream, server_io));
 
         Ok(AnytlsConn { inner: client_io, _pump: pump })

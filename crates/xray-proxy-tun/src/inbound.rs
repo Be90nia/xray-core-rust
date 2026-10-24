@@ -390,6 +390,10 @@ impl InboundHandler for TunInboundHandler {
         let netstack = Arc::clone(&self.netstack);
         let dev = Arc::clone(&device);
         let dispatch = Arc::clone(&self.dispatch);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         let handle = tokio::spawn(async move {
             tun_driver_loop(dev, netstack, dispatch).await;
         });
@@ -885,6 +889,10 @@ fn now_nanos() -> i64 {
 /// p14e：周期性扫描 idle 60s+ 的 UDP session 并从 map 淘汰（票 8gr6 重构：
 /// 无 try_lock 探测——owner task 独占 session，map 移除即可回收）。
 /// 后台 spawn，无关主 driver loop。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "存量债：未接 PluginContext 托管句柄（tail 表达式位无法就地登记），接线归 P1 插件装配（B3 T3.1）"
+)]
 fn spawn_udp_session_sweeper(sessions: UdpSessions) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = interval(Duration::from_secs(UDP_SESSION_SWEEP_SECS));
@@ -965,6 +973,10 @@ fn spawn_udp_session_task(
     // 票 euv9：reply 侧同样 bounded（下行响应由 owner task 产出、写回 task
     // 消费，device.send 慢时积压），满时丢包计数——见 [`try_enqueue_reply`]。
     let (reply_tx, mut reply_rx) = mpsc::channel::<Vec<u8>>(UDP_SESSION_QUEUE_CAP);
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+    )]
     let session = tokio::spawn(run_udp_session(
         dispatch,
         cmd_rx,
@@ -975,6 +987,10 @@ fn spawn_udp_session_task(
         sessions,
         entry,
     ));
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+    )]
     tokio::spawn(async move {
         while let Some(reply) = reply_rx.recv().await {
             if let Err(e) = device.send(&reply).await {
@@ -1148,10 +1164,18 @@ async fn accept_tcp_connection(
         netstack: Arc::clone(netstack),
         handle: event.handle,
     };
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+    )]
     tokio::spawn(relay.run());
 
     // spawn dispatch（link → outbound）
     let dispatch = Arc::clone(dispatch);
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+    )]
     tokio::spawn(async move {
         dispatch.dispatch(&dest, link).await;
     });

@@ -14,13 +14,18 @@
 //! - `dial`：TCP → btls TLS → h2 CONNECT → padding 隧道
 //! - `dispatcher`：`make_naive_dial_fn`（xray-core 接线）
 
+/// T3.2a 日志统一入口：域规范 target = `xray_frame::transport::naive`（热路径豁免清单见
+/// reports/framework-audit-2026-10-24/T3.2a-log-transport-cli.md）。
+pub(crate) static LOG: std::sync::LazyLock<xray_frame::logging::LogFacade> =
+    std::sync::LazyLock::new(|| xray_frame::logging::LogFacade::new("transport::naive", vec![]));
+
 mod dial;
 mod dispatcher;
 mod inbound;
 mod padding;
 pub mod uri;
 
-pub use dial::{NaiveConn, PaddingReader, PaddingWriter, dial_naive};
+pub use dial::{dial_naive, NaiveConn, PaddingReader, PaddingWriter};
 pub use dispatcher::make_naive_dial_fn;
 pub use inbound::{NaiveInboundConfig, NaiveInboundHandler};
-pub use uri::{NaiveConfig, parse_naive_uri};
+pub use uri::{parse_naive_uri, NaiveConfig};

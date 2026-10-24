@@ -20,9 +20,9 @@ use std::{io, net::SocketAddr, sync::Arc};
 use xray_common::net::destination::Destination;
 use xray_transport::{
     connection::Connection,
-    dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
+    dialer::{register_transport_dialer, StreamSettings, TransportDialFn},
     listener_registry::{
-        ConnHandler, TransportListenFn, TransportListener, register_transport_listener,
+        register_transport_listener, ConnHandler, TransportListenFn, TransportListener,
     },
     sockopt::SocketOptions,
 };
@@ -102,7 +102,7 @@ async fn listen_httpupgrade(
     // accept task 的 abort 句柄：close() 直接取消 task，parked 在 accept() 上的
     // 循环被确定性解除，TcpListener drop 即释放端口（对齐 Go hub.go Close()）。
     let accept_task = tokio::spawn(async move {
-        use xray_transport::accept_policy::{AcceptErrorKind, backoff_if_resource, classify};
+        use xray_transport::accept_policy::{backoff_if_resource, classify, AcceptErrorKind};
         loop {
             let (mut tcp, mut remote) = match listener.accept().await {
                 Ok(pair) => pair,
@@ -112,14 +112,14 @@ async fn listen_httpupgrade(
                     // abort 句柄。
                     match classify(&e) {
                         AcceptErrorKind::Resource => {
-                            tracing::warn!(tag = "httpupgrade", local = %local, error = %e, "httpupgrade inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续");
+                            crate::LOG.warn(format!("tag=httpupgrade local={local} error={e} httpupgrade inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续"));
                             backoff_if_resource(&e).await;
                         },
                         AcceptErrorKind::Connection => {
-                            tracing::debug!(tag = "httpupgrade", error = %e, "httpupgrade inbound: 单连接级 accept 错误，继续监听");
+                            crate::LOG.debug(format!("tag=httpupgrade error={e} httpupgrade inbound: 单连接级 accept 错误，继续监听"));
                         },
                         AcceptErrorKind::Unknown => {
-                            tracing::warn!(tag = "httpupgrade", local = %local, error = %e, "httpupgrade inbound: accept 错误（未知类别），继续监听");
+                            crate::LOG.warn(format!("tag=httpupgrade local={local} error={e} httpupgrade inbound: accept 错误（未知类别），继续监听"));
                         },
                     }
                     continue;
@@ -132,7 +132,7 @@ async fn listen_httpupgrade(
                     Ok(Some(real_addr)) => remote = real_addr,
                     Ok(None) => {},
                     Err(e) => {
-                        tracing::debug!("HTTPUpgrade PROXY protocol parse error: {e}");
+                        crate::LOG.debug(format!("HTTPUpgrade PROXY protocol parse error: {e}"));
                         continue;
                     },
                 }
@@ -148,7 +148,7 @@ async fn listen_httpupgrade(
                 ) {
                     Ok(c) => c,
                     Err(e) => {
-                        tracing::debug!("HTTPUpgrade tcpmask wrap error: {e}");
+                        crate::LOG.debug(format!("HTTPUpgrade tcpmask wrap error: {e}"));
                         continue;
                     },
                 };
@@ -165,10 +165,10 @@ async fn listen_httpupgrade(
             {
                 Ok(Ok(conn)) => handler(conn),
                 Ok(Err(e)) => {
-                    tracing::debug!("HTTPUpgrade handshake error: {e}");
+                    crate::LOG.debug(format!("HTTPUpgrade handshake error: {e}"));
                 },
                 Err(_) => {
-                    tracing::debug!("HTTPUpgrade handshake timeout (4s, Go SetReadDeadline)");
+                    crate::LOG.debug("HTTPUpgrade handshake timeout (4s, Go SetReadDeadline)");
                 },
             }
         }

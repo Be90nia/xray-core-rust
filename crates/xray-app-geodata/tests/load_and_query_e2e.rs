@@ -4,6 +4,9 @@
 //! （O(log n) 是 Go 原版目标；当前 IPSet 与 Go 原版一致采用前缀排序 + early short-circuit
 //!  on /0 catch-all，本质 O(n) 但实际命中提前退出。MPH domain matcher 为 O(1) 查询。）
 
+// 集成测试夹具不在 `#[test]` 函数体内，根 clippy.toml 的 allow-unwrap-in-tests 覆盖不到。
+#![allow(clippy::unwrap_used, reason = "集成测试夹具不在 #[test] 函数体内")]
+
 use std::{
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,

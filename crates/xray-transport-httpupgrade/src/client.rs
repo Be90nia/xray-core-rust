@@ -136,7 +136,7 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use tokio::io::{AsyncReadExt, duplex};
+    use tokio::io::{duplex, AsyncReadExt};
 
     use super::*;
 

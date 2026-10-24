@@ -116,7 +116,8 @@ impl TowerService<Uri> for DestTcpConnector {
         Box::pin(async move {
             let tcp = xray_transport::sockopt::dial_client_tcp((host.as_ref(), port)).await?;
             tcp.set_nodelay(true).ok();
-            // bd 88m0/0kqj 客户端侧：下行 SO_RCVBUF 缺省 16MB（窗钉修复）。
+            // bd 88m0/0kqj 客户端侧：下行 SO_RCVBUF 缺省 4MB（窗钉修复，
+            // TCP_RCVBUF_DEFAULT）。
             xray_transport::sockopt::apply_client_dial_rcvbuf(&tcp)?;
             // finalmask（bd dppv）：TCP 后、TLS 前——首字节 = mask 头。
             let conn: Box<dyn Connection> = match tcpmask.as_ref() {
@@ -262,7 +263,8 @@ impl TowerService<Uri> for SplitConnector {
                     ))
                     .await?;
                     tcp.set_nodelay(true).ok();
-                    // bd 88m0/0kqj 客户端侧：下行 SO_RCVBUF 缺省 16MB（窗钉修复）。
+                    // bd 88m0/0kqj 客户端侧：下行 SO_RCVBUF 缺省 4MB（窗钉修复，
+                    // TCP_RCVBUF_DEFAULT）。
                     xray_transport::sockopt::apply_client_dial_rcvbuf(&tcp)?;
                     // finalmask（bd dppv）：TCP 后、指纹 TLS 前——首字节 = mask 头。
                     let conn: Box<dyn Connection> = match dial.tcpmask.as_ref() {
@@ -439,14 +441,14 @@ impl DefaultDialerClient {
         // 必须配，否则 idle_timeout 不生效（hyper-util 已知坑）。
         // bd wz2b C2：hyper-util legacy client h2 全默认（流窗 2MB/连窗 5MB/send
         // 1MB）——packet-up/stream-down 路径下载钉 2MB/RTT（169ms≈11.8MB/s）、上行钉
-        // 1MB/RTT。32/32MB 流窗/连窗 + 16MB send 与 stream-one dialer.rs 同批同值
+        // 1MB/RTT。32/32MB 流窗/连窗 + 16MiB send 与 stream-one dialer.rs 同批同值
         // （bd c9oc F-A 流窗 32MB 同步，理由同 dialer.rs；生产 argo xhttp 走本 builder）。
         let client = Client::builder(TokioExecutor::new())
             .pool_timer(TokioTimer::new())
             .pool_idle_timeout(Some(Duration::from_secs(90)))
-            .http2_initial_stream_window_size(32 * 1024 * 1024)
-            .http2_initial_connection_window_size(32 * 1024 * 1024)
-            .http2_max_send_buf_size(16 * 1024 * 1024)
+            .http2_initial_stream_window_size(crate::transport::H2_INITIAL_STREAM_WINDOW)
+            .http2_initial_connection_window_size(crate::transport::H2_INITIAL_CONNECTION_WINDOW)
+            .http2_max_send_buf_size(crate::transport::H2_MAX_SEND_BUF_SIZE)
             // h2 连接级 keep-alive PING：对齐 Go dialer.go http2 分支
             // ReadIdleTimeout = ChromeH2KeepAlivePeriod 45s（net.go:20）；
             // timeout 15s = Go http2.PingTimeout 缺省。对抗 CDN 100s idle 切断
@@ -830,6 +832,60 @@ mod tests {
             .http2_keep_alive_timeout(Duration::from_secs(15));
     }
 
+    /// 8780187e 防回档钉子（wp9o 形态：Builder 无 getter——断言常量值 + setter
+    /// 链可调用；不 build 不拨号）：h2 初始流窗/连窗 32MB + 每流 send buf
+    /// 16MiB（bd wz2b C2 上行钉 / bd c9oc F-A 在途平台钉，argo xhttp 增益）。
+    /// 削弱常量 = 本测试红；builder 回退内联字面量 = 常量失引用，clippy dead_code 红。
+    #[test]
+    fn h2_window_pins_match_wz2b_c9oc() {
+        assert_eq!(
+            crate::transport::H2_INITIAL_STREAM_WINDOW,
+            32 * 1024 * 1024,
+            "流窗回档 <32MB：bd c9oc F-A 在途平台跌回 ~10MB 钉，argo 下行必劣化"
+        );
+        assert_eq!(
+            crate::transport::H2_INITIAL_CONNECTION_WINDOW,
+            32 * 1024 * 1024,
+            "连窗不得低于流窗（bd c9oc F-A：低于即另成钉）"
+        );
+        assert_eq!(
+            crate::transport::H2_MAX_SEND_BUF_SIZE,
+            16 * 1024 * 1024,
+            "send buf 回档 1MB：上行钉 1MB/RTT（bd wz2b）"
+        );
+        let _builder = Client::builder(TokioExecutor::new())
+            .http2_initial_stream_window_size(crate::transport::H2_INITIAL_STREAM_WINDOW)
+            .http2_initial_connection_window_size(crate::transport::H2_INITIAL_CONNECTION_WINDOW)
+            .http2_max_send_buf_size(crate::transport::H2_MAX_SEND_BUF_SIZE);
+    }
+
+    /// 1f43481b 防回档：完整 TCP connector（[`DestTcpConnector`] =
+    /// dial_client_tcp + apply_client_dial_rcvbuf）走完后，底层 socket
+    /// SO_RCVBUF 回读 >= 4MB（TCP_RCVBUF_DEFAULT，bd 88m0 客户端侧窗钉修复）。
+    /// 摘除接线 = 本测试红。
+    #[tokio::test]
+    async fn dest_connector_dials_with_4mb_recvbuf() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let mut connector =
+            DestTcpConnector { host: std::sync::Arc::from("127.0.0.1"), port, tcpmask: None };
+        let uri: Uri = "http://127.0.0.1/xh/".parse().unwrap();
+        let stream = connector.call(uri).await.unwrap();
+        // DestTcpStream(TokioIo<Box<dyn Connection>>)：取内层连接克隆裸 socket 回读
+        // （测试子模块可见私有字段；raw_tcp_clone 经 Box 透传到 TcpConnection 的 dup）。
+        let conn = stream.0.into_inner();
+        let tcp = conn.raw_tcp_clone().expect("connector 无 tcpmask 时产物应是 TcpConnection");
+        drop(conn);
+        accept.await.unwrap();
+        let got = socket2::SockRef::from(&tcp).recv_buffer_size().unwrap();
+        assert!(
+            got >= 4 * 1024 * 1024,
+            "bd 88m0/1f43481b 防回档：完整 connector 后 SO_RCVBUF 应 >= 4MB: got={got}"
+        );
+    }
     #[test]
     fn build_request_basic_get() {
         let meta = RequestMeta {

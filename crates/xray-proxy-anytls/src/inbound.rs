@@ -119,6 +119,10 @@ impl InboundHandler for AnytlsInboundHandler {
         let tag = self.tag.clone();
 
         // spawn 一个 keep-alive 任务，持有 server 句柄直到 close 被调用
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         let accept_task = tokio::spawn(async move {
             // 该任务仅保持存活，实际 serve 逻辑在 MockServer 内部
             // close 时通过 stop_tx 触发退出

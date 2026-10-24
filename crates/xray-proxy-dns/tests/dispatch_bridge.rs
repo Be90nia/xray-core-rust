@@ -10,7 +10,7 @@
 //! 验证：完整 DNS query → 决策 → 转发到上游 → 收到响应 → 解码验证 A 记录。
 
 #![cfg(test)]
-
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros))] // 测试脚手架：spawn 起停被测服务/回环 echo、直印进度；非生产托管面
 use std::{
     net::{IpAddr, Ipv4Addr},
     time::Duration,

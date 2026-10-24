@@ -366,12 +366,9 @@ impl StreamSettings {
             use crate::sockopt::resolve_interface_index;
             match resolve_interface_index(v) {
                 Ok(idx) => opts.bind_if_index = idx,
-                Err(e) => tracing::warn!(
-                    target: "xray_transport",
-                    interface = v,
-                    error = %e,
-                    "failed to resolve interface name to index (Go sockopt rejects); ignoring sockopt.interface"
-                ),
+                Err(e) => crate::LOG.warn(format!(
+                    "interface={v} error={e} failed to resolve interface name to index (Go sockopt rejects); ignoring sockopt.interface"
+                )),
             }
         }
         // Happy Eyeballs（bd 0ko，Go `SocketConfig.HappyEyeballs`）。
@@ -395,14 +392,15 @@ impl StreamSettings {
         // 路径对未知值宽容回退 AsIs 并 warn——装配期 validate_sockopt_json 硬错）。
         if let Some(v) = obj.get("domainStrategy").and_then(|v| v.as_str()) {
             opts.domain_strategy = parse_domain_strategy(v).unwrap_or_else(|| {
-                tracing::warn!(value = v, "unsupported domain strategy, fallback to AsIs");
+                crate::LOG.warn(format!("value={v} unsupported domain strategy, fallback to AsIs"));
                 crate::sockopt::DomainStrategy::AsIs
             });
         }
         // addressPortStrategy（Go transport_sockopt.go:124-146，同上宽容）。
         if let Some(v) = obj.get("addressPortStrategy").and_then(|v| v.as_str()) {
             opts.address_port_strategy = parse_address_port_strategy(v).unwrap_or_else(|| {
-                tracing::warn!(value = v, "unsupported address port strategy, fallback to None");
+                crate::LOG
+                    .warn(format!("value={v} unsupported address port strategy, fallback to None"));
                 crate::sockopt::AddressPortStrategy::None
             });
         }

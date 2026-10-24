@@ -125,6 +125,10 @@ impl DialedUdp {
         let conn = (self.dialer)(&self.dest).await?;
         let (read, write) = tokio::io::split(conn);
         let d = Arc::clone(&self);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         tokio::spawn(async move {
             d.read_loop(read).await;
         });
@@ -492,6 +496,10 @@ impl WgDriver {
     /// 内部由 [`WgDriver::main_loop`] 编排：读 task + N 个 worker task + 定时器循环。
     pub async fn spawn(self: Arc<Self>) -> Result<tokio::task::JoinHandle<()>> {
         let driver = Arc::clone(&self);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         let handle = tokio::spawn(async move {
             driver.main_loop().await;
         });
@@ -533,6 +541,10 @@ impl WgDriver {
                 let sock = Arc::clone(sock);
                 let tx = self.queue_tx.clone();
                 let mut shut = shut_rx.clone();
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+                )]
                 tokio::spawn(async move {
                     direct_read_loop(sock, tx, &mut shut).await;
                 });
@@ -545,6 +557,10 @@ impl WgDriver {
             let driver = Arc::clone(&self);
             let rx = Arc::clone(&rx);
             let shut = shut_rx.clone();
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+            )]
             tokio::spawn(async move {
                 driver.worker_loop(rx, shut).await;
             });

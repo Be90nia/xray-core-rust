@@ -39,6 +39,8 @@ use super::{
     protocol,
 };
 
+// log-hot-path-exempt: xmc 伪装桥读循环内每包失败记录 —— 数据面泵/每包循环内的诊断留痕，LogFacade
+// emit（Mutex+掩码）开销不可入热路径，保留原样
 type DynIo = Box<dyn AsyncIo>;
 
 /// 共享密钥长度（AES-128 key，同时也是 IV）。
@@ -623,7 +625,7 @@ pub(super) async fn tcp_bridge(
             // Go 侧握手错误从 Read/Write 冒泡给代理调用方记录；Rust bridge 代为
             // 记录后断开 pipe（对端读到 EOF）。拒绝类事件（密码错/非白名单/探测）
             // 由此可观测，不再静默。
-            tracing::warn!(error = %e, is_client, "xmc handshake failed");
+            crate::LOG.warn(format!("error={e} is_client={is_client} xmc handshake failed"));
             return;
         },
     };

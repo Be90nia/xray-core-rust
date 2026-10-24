@@ -179,6 +179,7 @@ impl PortalWorker {
 
         let dest = internal_control_destination();
         let c = Arc::clone(&client);
+        #[allow(clippy::disallowed_methods, reason = "控制连接 dispatch（Go pipe reader 立即返回语义等价）；FxScope 未接线（T3.1b 登记）")]
         tokio::spawn(async move {
             c.dispatch(&dest, MuxLink { reader: Box::new(up_r), writer: Box::new(dn_w) }).await;
         });
@@ -198,6 +199,7 @@ impl PortalWorker {
         });
 
         let hb_worker = Arc::clone(&worker);
+        #[allow(clippy::disallowed_methods, reason = "portal 心跳循环（Go task.Periodic 2s 直译）；FxScope 未接线（T3.1b 登记）")]
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(PORTAL_HEARTBEAT_INTERVAL).await;
@@ -384,6 +386,7 @@ impl BridgeWorker {
             Arc::new(tokio::sync::Mutex::new(Some(carrier.writer)));
         let monitor_h = server.spawn_monitor(Arc::clone(&link_writer));
         let frame_server = Arc::clone(&server);
+        #[allow(clippy::disallowed_methods, reason = "server 帧处理循环（monitor abort 收尾）；FxScope 未接线（T3.1b 登记）")]
         tokio::spawn(async move {
             while let Ok(true) = frame_server.process_frame(&mut reader, &link_writer).await {}
             frame_server.close();
@@ -532,6 +535,7 @@ impl xray_mux::worker::Dispatcher for BridgeWorker {
         let (dn_r, dn_w) = pipe::new_with_option(control_pipe_option());
         // up_w 随控制流任务存活（Go Link{Writer: uplinkWriter} 被 goroutine 持有），
         // 任务结束 drop → up_r EOF → mux session 收尾。
+        #[allow(clippy::disallowed_methods, reason = "internal conn 处理（句柄回收 up_w）；FxScope 未接线（T3.1b 登记）")]
         tokio::spawn(async move {
             Self::handle_internal_conn(me, Box::new(dn_r)).await;
             drop(up_w);
@@ -559,6 +563,7 @@ impl xray_mux::worker::Dispatcher for BridgeWorker {
         let (read_b, write_b) = pipe::new_with_option(control_pipe_option());
         let transport_link = TransportLink::new(Box::new(read_b), Box::new(write_a));
         let dispatcher = Arc::clone(&self.dispatcher);
+        #[allow(clippy::disallowed_methods, reason = "inbound dispatch_link_inbound 后台；FxScope 未接线（T3.1b 登记）")]
         tokio::spawn(async move {
             if let Err(e) = dispatcher
                 .dispatch_link_inbound(
@@ -831,6 +836,7 @@ mod entity_tests {
         let link_writer: std::sync::Arc<tokio::sync::Mutex<Option<Box<dyn IoWriter>>>> =
             std::sync::Arc::new(tokio::sync::Mutex::new(Some(Box::new(s_write))));
         let monitor_h = server.spawn_monitor(link_writer.clone());
+        #[allow(clippy::disallowed_methods, reason = "server 帧处理循环（process_frame 至 EOF）；FxScope 未接线（T3.1b 登记）")]
         tokio::spawn(async move {
             while let Ok(true) = server.process_frame(&mut reader, &link_writer).await {}
             server.close();

@@ -508,6 +508,25 @@ mod tests {
     }
 
     #[test]
+    fn lru_hit_promotes_recency_so_eviction_skips_recent() {
+        // 钉住淘汰序语义（Go cache.Lru 同款）：命中读提升 recency——
+        // cap=2 时 a,b 入表后读 a，再入 c 必须逐 b（未被刷新的最旧项）而非 a。
+        let mut h =
+            Holder::with_config(FakeDnsPool { ip_pool: "240.0.0.0/4".to_string(), lru_size: 2 });
+        h.initialize().unwrap();
+        let a_ip = h.get_fake_ip_for_domain("a.com")[0];
+        let b_ip = h.get_fake_ip_for_domain("b.com")[0];
+        // 命中 a：返回同 IP 且 recency 提到最新。
+        assert_eq!(h.get_fake_ip_for_domain("a.com")[0], a_ip);
+        let c_ip = h.get_fake_ip_for_domain("c.com")[0];
+        assert_eq!(h.len(), 2);
+        assert_eq!(h.get_domain_from_fake_dns(a_ip).as_deref(), Some("a.com"), "命中刷新后 a 存活");
+        assert_eq!(h.get_domain_from_fake_dns(b_ip), None, "未被刷新的 b 被逐");
+        assert_eq!(h.get_domain_from_fake_dns(c_ip).as_deref(), Some("c.com"));
+        assert_eq!(h.reverse_index_len(), 2, "反查索引与主表同步");
+    }
+
+    #[test]
     fn pool_rebuild_clears_reverse_index() {
         let mut h = Holder::new_default().unwrap();
         let old_ip = h.get_fake_ip_for_domain("example.com")[0];

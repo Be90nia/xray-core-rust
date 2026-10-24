@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 
 use base64::Engine as _;
 use clap::{Args, Subcommand};
-use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 
 use crate::error::CliError;
 

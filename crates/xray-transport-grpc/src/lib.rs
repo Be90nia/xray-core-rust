@@ -31,6 +31,11 @@
 //!
 //! 实际 HTTP/2 + TLS 拨号/监听留 follow-up（依赖 tonic/h2 决策，由
 //! `k9t reality-s2` 等 TLS 切片解锁后统一接入）。
+/// T3.2a 日志统一入口：域规范 target = `xray_frame::transport::grpc`（热路径豁免清单见
+/// reports/framework-audit-2026-10-24/T3.2a-log-transport-cli.md）。
+pub(crate) static LOG: std::sync::LazyLock<xray_frame::logging::LogFacade> =
+    std::sync::LazyLock::new(|| xray_frame::logging::LogFacade::new("transport::grpc", vec![]));
+
 pub mod client;
 pub mod config;
 pub mod encoding;

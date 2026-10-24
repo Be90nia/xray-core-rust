@@ -19,6 +19,11 @@
 //! 切片2 待办：完整 `run` 启动路径 + gRPC client 接入（API 命令真实调用）
 //! + 信号处理（SIGINT/SIGTERM）。
 
+/// T3.2a 日志统一入口：域规范 target = `xray_frame::cli`（热路径豁免清单见
+/// reports/framework-audit-2026-10-24/T3.2a-log-transport-cli.md）。
+pub static LOG: std::sync::LazyLock<xray_frame::logging::LogFacade> =
+    std::sync::LazyLock::new(|| xray_frame::logging::LogFacade::new("cli", vec![]));
+
 pub mod alloc_stats;
 pub mod commands;
 pub mod distro;

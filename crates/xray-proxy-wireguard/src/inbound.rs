@@ -181,6 +181,10 @@ impl WireguardInboundHandler {
         let registry = Arc::clone(&self.registry);
         let dispatch = Arc::clone(&self.dispatch);
 
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        )]
         let handle = tokio::spawn(async move {
             // driver loop 与 accept loop 在同一 task 内 select! 并发
             tokio::select! {
@@ -269,6 +273,10 @@ async fn wg_accept_loop(
     let udp_sessions: WgUdpSessions = Arc::new(ParkMutex::new(HashMap::new()));
     let sweep_netstack = Arc::clone(&netstack);
     let sweep_sessions = Arc::clone(&udp_sessions);
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+    )]
     tokio::spawn(async move {
         let mut tick = interval(Duration::from_secs(WG_UDP_SWEEP_SECS));
         tick.tick().await; // 跳过首个立即 tick（启动时全为新）
@@ -328,6 +336,10 @@ async fn wg_accept_loop(
                 netstack: Arc::clone(&netstack),
                 handle: event.handle,
             };
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+            )]
             tokio::spawn(relay.run());
 
             // spawn dispatch（link → outbound），挂 per-user 上下文
@@ -348,6 +360,10 @@ async fn wg_accept_loop(
                 ..Default::default()
             };
             let dispatch = Arc::clone(&dispatch);
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+            )]
             tokio::spawn(async move {
                 dispatch.dispatch_with_access(&dest, link, access).await;
             });
@@ -444,6 +460,10 @@ fn forward_wg_udp_datagram(
         return;
     }
     let (cmd_tx, cmd_rx) = mpsc::channel(WG_UDP_QUEUE_CAP);
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+    )]
     tokio::spawn(run_wg_udp_session(
         Arc::clone(dispatch),
         cmd_rx,

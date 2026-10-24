@@ -124,12 +124,10 @@ impl UdpDispatcher {
             let before = entries.len();
             entries.retain(|_, e| !e.is_expired());
             let removed = before - entries.len();
-            tracing::debug!(
-                before,
-                removed,
-                after = entries.len(),
-                "UDP NAT table full, cleaned expired entries"
-            );
+            crate::LOG.debug(format!(
+                "before={before} removed={removed} after={} UDP NAT table full, cleaned expired entries",
+                entries.len()
+            ));
 
             if entries.len() >= MAX_NAT_ENTRIES {
                 return Err(io::Error::new(
@@ -203,12 +201,10 @@ impl UdpDispatcher {
             let removed = before - guard.len();
 
             if removed > 0 {
-                tracing::debug!(
-                    before,
-                    removed,
-                    after = guard.len(),
-                    "UDP NAT cleanup: removed expired entries"
-                );
+                crate::LOG.debug(format!(
+                    "before={before} removed={removed} after={} UDP NAT cleanup: removed expired entries",
+                    guard.len()
+                ));
             }
         }
     }

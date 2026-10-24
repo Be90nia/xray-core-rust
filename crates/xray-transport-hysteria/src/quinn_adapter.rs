@@ -32,6 +32,7 @@ use crate::{
     salamander_socket::UdpObfs,
 };
 
+// log-hot-path-exempt: quic 流/帧每包循环内失败记录 —— 数据面每包路径，保留原样
 /// quinn 双向 stream 包装为 [`QuicStream`]。
 ///
 /// quinn 的 bi stream 拆成 `SendStream` + `RecvStream` 两个独立半边，
@@ -251,7 +252,7 @@ impl crate::congestion::utils::CongestionSetter for QuinnQuicConn {
     fn set_congestion_control(&self, cc: Box<dyn crate::congestion::types::CongestionControl>) {
         match &self.cc_slot {
             Some(slot) => slot.set_congestion_control(cc),
-            None => tracing::warn!("QuinnQuicConn has no cc_slot, congestion control not set"),
+            None => crate::LOG.warn("QuinnQuicConn has no cc_slot, congestion control not set"),
         }
     }
 }
@@ -531,11 +532,14 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
                                     .await;
                                 },
                                 Err(e) => {
-                                    tracing::debug!(error = ?e, "hysteria quic handshake failed");
+                                    crate::LOG.debug(format!(
+                                        "error={e:?} hysteria quic handshake failed"
+                                    ));
                                 },
                             },
                             Err(e) => {
-                                tracing::debug!(error = ?e, "hysteria quic accept failed");
+                                crate::LOG
+                                    .debug(format!("error={e:?} hysteria quic accept failed"));
                             },
                         }
                     });
@@ -578,12 +582,12 @@ async fn serve_hysteria_connection(
     let auth_down = match h3_auth(&conn, &validator, &quic_params, &masq, &static_auth).await {
         Some(down) => down,
         None => {
-            tracing::debug!(%remote, "hysteria h3 auth phase ended without auth");
+            crate::LOG.debug(format!("{remote} hysteria h3 auth phase ended without auth"));
             conn.close(VarInt::from_u32(0), b"");
             return;
         },
     };
-    tracing::info!(%remote, "hysteria client authenticated");
+    crate::LOG.info(format!("{remote} hysteria client authenticated"));
 
     // Phase 1.5: CC 协商（Go hub.go:75-86 switch）
     if let Err(e) = crate::congestion::quinn_bridge::apply_negotiated(
@@ -594,7 +598,9 @@ async fn serve_hysteria_connection(
         auth_down,
         quic_params.brutal_disable_loss_compensation,
     ) {
-        tracing::warn!(error = %e, %remote, "hysteria congestion negotiation failed, keeping default");
+        crate::LOG.warn(format!(
+            "error={e} {remote} hysteria congestion negotiation failed, keeping default"
+        ));
     }
 
     // Phase 1.6: UDP relay 数据面（对应 Go hub 的 udpSessionManager + go run()/clean()）。
@@ -614,7 +620,9 @@ async fn serve_hysteria_connection(
                 let frame_type = match crate::conn::read_varint_stream(&qs).await {
                     Ok(value) => value,
                     Err(error) => {
-                        tracing::debug!(error = ?error, %remote, "hysteria stream frame type read failed");
+                        crate::LOG.debug(format!(
+                            "error={error:?} {remote} hysteria stream frame type read failed"
+                        ));
                         continue;
                     },
                 };
@@ -626,7 +634,7 @@ async fn serve_hysteria_connection(
                 on_new_conn(isc);
             },
             Err(e) => {
-                tracing::debug!(error = ?e, %remote, "hysteria bidi stream loop ended");
+                crate::LOG.debug(format!("error={e:?} {remote} hysteria bidi stream loop ended"));
                 break;
             },
         }
@@ -775,7 +783,7 @@ async fn h3_auth(
         match h3::server::Connection::new(AuthH3Conn::new(conn.clone())).await {
             Ok(s) => s,
             Err(e) => {
-                tracing::debug!(error = ?e, "h3 server init failed");
+                crate::LOG.debug(format!("error={e:?} h3 server init failed"));
                 return None;
             },
         };
@@ -891,7 +899,7 @@ async fn h3_auth(
             },
             Ok(None) => bail!(),
             Err(e) => {
-                tracing::debug!(error = ?e, "h3 accept ended");
+                crate::LOG.debug(format!("error={e:?} h3 accept ended"));
                 bail!();
             },
         }

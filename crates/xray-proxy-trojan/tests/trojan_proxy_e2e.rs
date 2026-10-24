@@ -2,6 +2,7 @@
 //!
 //! 验证 Trojan 代理完整链路：客户端通过 Trojan 协议连接 echo 服务器。
 
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros))] // 测试脚手架：spawn 起停被测服务/回环 echo、直印进度；非生产托管面
 use std::sync::Arc;
 
 use tokio::{

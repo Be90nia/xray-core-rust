@@ -31,6 +31,8 @@ use super::{
     resp::Resp,
 };
 
+// log-hot-path-exempt: xdns 每包 send/编码路径错误记录 —— 数据面泵/每包循环内的诊断留痕，LogFacade
+// emit（Mutex+掩码）开销不可入热路径，保留原样
 const INIT_POLL_DELAY: Duration = Duration::from_millis(500);
 const MAX_POLL_DELAY: Duration = Duration::from_secs(10);
 const SEND_QUEUE_CAP: usize = 16;

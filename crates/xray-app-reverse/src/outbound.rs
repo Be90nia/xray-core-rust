@@ -160,6 +160,7 @@ impl PortalOutbound {
         let worker = self.picker.pick_available()?;
         let d = dest.clone();
         let inbound = reverse_mux_inbound(access);
+        #[allow(clippy::disallowed_methods, reason = "client dispatch 后台任务；FxScope 未接线（T3.1b 登记）")]
         tokio::spawn(async move {
             worker
                 .client()
