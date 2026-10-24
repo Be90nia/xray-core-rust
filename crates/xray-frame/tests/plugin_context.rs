@@ -139,7 +139,12 @@ fn load_config_section_overrides_env_and_env_backfills() {
             {"protocol": "freedom", "settings": {"port": "10808"}}
         ]
     });
-    let env = Arc::new(MockEnv::new().with("port", "9999").with("log_level", "warn"));
+    let env = Arc::new(
+        MockEnv::new()
+            .with("port", "9999")
+            .with("log_level", "ignored")
+            .with("XRAY_PLUGIN_FREEDOM_LOG_LEVEL", "warn"),
+    );
     let ctx = PluginContext::new(
         "freedom",
         Arc::new(FxScope::new()),
@@ -151,7 +156,10 @@ fn load_config_section_overrides_env_and_env_backfills() {
     );
     let (port, level) = ctx.load_config(TwoKeysPort).expect("combined source");
     assert_eq!(port, "10808", "段值压过 env 值");
-    assert_eq!(level, "warn", "env 兜底生效");
+    assert_eq!(
+        level, "warn",
+        "命名空间键 XRAY_PLUGIN_FREEDOM_LOG_LEVEL 兜底生效（裸 log_level 被忽略）"
+    );
 }
 
 #[test]

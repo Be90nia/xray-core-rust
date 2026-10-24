@@ -41,9 +41,42 @@ pub fn derive_fingerprint(listen_addr: Option<&str>) -> u64 {
 
 /// 组合环境源：插件段值优先、装配注入的环境回落（坑约束 7 组合源半边）。
 /// 段面只承载字符串值（JSON object）；非字符串段值跳过段面回落环境。
+///
+/// **回落只认命名空间键** `XRAY_PLUGIN_<NAME>_<KEY>`（security F10：裸同名
+/// env 会让外部环境给插件注入它没在配置里写的 settings 键）。`<NAME>`/`<KEY>`
+/// 归一规则固定为：转大写、非 `[A-Z0-9]` 字符替换 `_`（`vmess-in` + `web.port`
+/// → `XRAY_PLUGIN_VMESS_IN_WEB_PORT`）。不构造小写变体、不做多形态回退——
+/// 唯一规范形态在 Windows（键不分大小写）与 Unix（区分）上同解。
 struct SectionEnv<'a> {
+    /// 插件名（命名空间前缀源）。
+    plugin: &'static str,
     section: Option<&'a serde_json::Map<String, serde_json::Value>>,
     fallback: &'a dyn EnvSource,
+}
+
+impl SectionEnv<'_> {
+    /// 回落键的规范形态（规则见结构体文档）。
+    fn env_key(&self, key: &str) -> String {
+        let mut out = String::with_capacity(self.plugin.len() + key.len() + 13);
+        out.push_str("XRAY_PLUGIN_");
+        push_normalized(&mut out, self.plugin);
+        out.push('_');
+        push_normalized(&mut out, key);
+        out
+    }
+}
+
+/// 大写 + 非字母数字 → `_`。
+fn push_normalized(out: &mut String, raw: &str) {
+    out.extend(raw.chars().map(|c| {
+        if c.is_ascii_uppercase() || c.is_ascii_digit() {
+            c
+        } else if c.is_ascii_lowercase() {
+            c.to_ascii_uppercase()
+        } else {
+            '_'
+        }
+    }));
 }
 
 impl EnvSource for SectionEnv<'_> {
@@ -54,7 +87,7 @@ impl EnvSource for SectionEnv<'_> {
         {
             return Ok(text.to_owned());
         }
-        self.fallback.get(key)
+        self.fallback.get(&self.env_key(key))
     }
 }
 
@@ -177,7 +210,7 @@ impl PluginContext {
         let section = self.section()?;
         let kv =
             section.get("settings").and_then(|s| s.as_object()).or_else(|| section.as_object());
-        let combined = SectionEnv { section: kv, fallback: &*self.env };
+        let combined = SectionEnv { plugin: self.plugin_name, section: kv, fallback: &*self.env };
         port.load(&combined).map_err(PluginError::Config)
     }
 
@@ -296,5 +329,80 @@ mod tests {
             "型不匹配（u32 登记取 u64）→ Err(Handler)"
         );
         assert_eq!(*ctx.take_handler::<u32>().expect("u32 unaffected"), 9);
+    }
+
+    /// env 回落键探针：缺键 → `None`（插件 settings 缺省键的语义）。
+    struct KeyProbe(&'static str);
+
+    impl ConfigPort for KeyProbe {
+        type Config = Option<String>;
+
+        fn load(&self, env: &dyn EnvSource) -> Result<Self::Config, ConfigError> {
+            match env.get(self.0) {
+                Ok(value) => Ok(Some(value)),
+                Err(EnvError::Missing) => Ok(None),
+                Err(e) => {
+                    Err(ConfigError::Invalid { key: self.0.to_string(), reason: e.to_string() })
+                },
+            }
+        }
+    }
+
+    fn ctx_with_env(
+        plugin: &'static str,
+        settings: serde_json::Value,
+        env: MockEnv,
+    ) -> PluginContext {
+        PluginContext::new(
+            plugin,
+            Arc::new(FxScope::new()),
+            Arc::new(SystemClock),
+            derive_fingerprint(Some(FIXED_ADDR)),
+            Arc::new(env),
+            json!({ "inbounds": [{ "protocol": plugin, "settings": settings }] }),
+            LogFacade::new(plugin, vec![]),
+        )
+    }
+
+    /// security F10：裸同名 env 是注入面——不得喂入插件 settings 缺省键。
+    #[test]
+    fn bare_env_key_does_not_fall_through() {
+        let ctx = ctx_with_env(
+            "vmess-in",
+            json!({}),
+            MockEnv::new().with("PORT", "6666").with("web.port", "7777"),
+        );
+        assert_eq!(ctx.load_config(KeyProbe("PORT")).expect("load"), None, "裸 PORT 不回落");
+        assert_eq!(
+            ctx.load_config(KeyProbe("web.port")).expect("load"),
+            None,
+            "裸 web.port 不回落"
+        );
+    }
+
+    /// 命名空间键（大写 + 非字母数字 → `_`）回落生效；段值优先于环境。
+    #[test]
+    fn namespaced_env_key_falls_through_and_section_wins() {
+        let ctx = ctx_with_env(
+            "vmess-in",
+            json!({ "PORT": "1080" }),
+            MockEnv::new().with("XRAY_PLUGIN_VMESS_IN_PORT", "6666"),
+        );
+        assert_eq!(
+            ctx.load_config(KeyProbe("PORT")).expect("load").as_deref(),
+            Some("1080"),
+            "段值优先于回落环境"
+        );
+
+        let ctx = ctx_with_env(
+            "vmess-in",
+            json!({}),
+            MockEnv::new().with("XRAY_PLUGIN_VMESS_IN_WEB_PORT", "7777"),
+        );
+        assert_eq!(
+            ctx.load_config(KeyProbe("web.port")).expect("load").as_deref(),
+            Some("7777"),
+            "vmess-in + web.port → XRAY_PLUGIN_VMESS_IN_WEB_PORT"
+        );
     }
 }

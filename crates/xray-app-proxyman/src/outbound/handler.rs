@@ -144,8 +144,6 @@ pub struct OutboundHandlerEntry {
     socket_options: SocketOptions,
     /// 代理链目标 tag（对应 Go `senderSettings.ProxySettings.Tag`）
     proxy_chain_tag: Option<String>,
-    /// 出站管理器引用（代理链拨号时查找 chained handler）
-    outbound_manager: Option<Arc<crate::outbound::OutboundManager>>,
 }
 
 impl std::fmt::Debug for OutboundHandlerEntry {
@@ -209,7 +207,6 @@ impl OutboundHandlerEntry {
             stream_settings: StreamSettings::tcp(),
             socket_options: SocketOptions::default(),
             proxy_chain_tag: None,
-            outbound_manager: None,
         }
     }
 
@@ -285,11 +282,6 @@ impl OutboundHandlerEntry {
         self.proxy_chain_tag = tag;
     }
 
-    /// 设置出站管理器引用
-    pub fn set_outbound_manager(&mut self, manager: Option<Arc<crate::outbound::OutboundManager>>) {
-        self.outbound_manager = manager;
-    }
-
     /// 获取 UoT (UDP over TCP) 连接。
     ///
     /// 对应 Go `Handler.getUoTConnection(ctx, dest)`。
@@ -358,7 +350,6 @@ impl OutboundHandler for OutboundHandlerEntry {
             stream_settings: self.stream_settings.clone(),
             socket_options: self.socket_options.clone(),
             proxy_chain_tag: self.proxy_chain_tag.clone(),
-            outbound_manager: self.outbound_manager.clone(),
         });
 
         Box::pin(async move {
@@ -399,45 +390,16 @@ impl OutboundHandler for OutboundHandlerEntry {
         let settings = self.stream_settings.clone();
         let sockopt = self.socket_options.clone();
         let proxy_tag = self.proxy_chain_tag.clone();
-        let outbound_manager = self.outbound_manager.clone();
         let dest = dest.clone();
 
         Box::pin(async move {
-            // 1. 代理链：如果 senderSettings.ProxySettings.HasTag()，通过 chained handler 拨号
+            // 1. 代理链：生产链路由 xray-core 经 dispatcher `OutboundHandlerManager` 装配
+            // （本 crate 无注册表）；有 tag 却没有链 = 显式失败，禁静默直拨。
             if let Some(tag) = proxy_tag {
-                match outbound_manager.as_ref() {
-                    Some(manager) if manager.get_handler(&tag).is_some() => {
-                        // 创建 duplex pipe：client 端返回给调用者，proxy 端桥接到 chained handler
-                        // Go: 通过 chained handler 的 dial() 建立真实连接，然后双向桥接
-                        let handler =
-                            manager.get_handler(&tag).expect("match arm guard above ensures Some");
-                        let mut chained_conn = handler.dial(&dest).await?;
-
-                        // 创建 pipe pair 做双向桥接
-                        let (client_stream, mut proxy_stream) = tokio::io::duplex(64 * 1024);
-
-                        // spawn 双向桥接：proxy_stream ↔ chained_conn
-                        tokio::spawn(async move {
-                            let _ =
-                                tokio::io::copy_bidirectional(&mut proxy_stream, &mut chained_conn)
-                                    .await;
-                        });
-
-                        let conn: Box<dyn xray_transport::connection::Connection> = Box::new(
-                            xray_transport::connection::DuplexConnection::new(client_stream),
-                        );
-                        return Ok(conn);
-                    },
-                    _ => {
-                        // proxy chain tag configured but manager/handler missing
-                        return Err(io::Error::new(
-                            io::ErrorKind::NotConnected,
-                            format!(
-                                "chained proxy to tag '{tag}' has no outbound manager or handler"
-                            ),
-                        ));
-                    },
-                }
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    format!("chained proxy to tag '{tag}' is not wired in this crate"),
+                ));
             }
 
             // 2. SendThrough/Via：生产实现在 xray-core try_build_handler（bd 7zc，
@@ -456,22 +418,17 @@ struct HandlerDialer {
     stream_settings: StreamSettings,
     socket_options: SocketOptions,
     proxy_chain_tag: Option<String>,
-    outbound_manager: Option<Arc<crate::outbound::OutboundManager>>,
 }
 
 #[async_trait]
 impl OutboundDialer for HandlerDialer {
     async fn dial(&self, dest: &Destination) -> io::Result<Box<dyn Connection>> {
-        // 1. 代理链
+        // 1. 代理链（链装配在 xray-core；此处有 tag 即显式失败，禁静默直拨）
         if let Some(tag) = &self.proxy_chain_tag {
-            if let Some(manager) = self.outbound_manager.as_ref() {
-                if manager.get_handler(tag).is_some() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        format!("chained proxy to tag '{tag}' not yet implemented"),
-                    ));
-                }
-            }
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("chained proxy to tag '{tag}' is not wired in this crate"),
+            ));
         }
         // 2. 直接拨号
         dial(dest, &self.stream_settings, &self.socket_options).await
@@ -820,7 +777,6 @@ mod tests {
         assert!(entry.proxy.is_none());
         assert_eq!(entry.stream_settings.protocol, "tcp");
         assert!(entry.proxy_chain_tag.is_none());
-        assert!(entry.outbound_manager.is_none());
     }
 
     #[test]

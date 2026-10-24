@@ -386,6 +386,7 @@ impl HandlerCreator for ConsoleHandlerCreator {
     }
 }
 
+// udf-promotion-candidate: 轮转面若第二消费方出现则上浮 logx FileSink
 /// File handler：追加写入文件。
 ///
 /// 对应 Go `log.FileHandler`。持有一个由 `Mutex<File>` 守护的可重用句柄，

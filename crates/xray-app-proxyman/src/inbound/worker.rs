@@ -295,6 +295,10 @@ impl TcpWorker {
         idle_timeout: Duration,
     ) -> tokio::task::JoinHandle<()> {
         if self.closed.load(Ordering::SeqCst) {
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "closed 短路：返回空 JoinHandle 占位（无实际任务体）；FxScope 未接线（T3.1b 登记）"
+            )]
             return tokio::spawn(async {});
         }
 
@@ -320,6 +324,10 @@ impl TcpWorker {
         let mut done_signal = activity_timer.done_signal();
 
         let timer_loop = Arc::clone(&activity_timer);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "ActivityTimer 心跳循环托管；FxScope 未接线（T3.1b 登记）"
+        )]
         tokio::spawn(async move {
             timer_loop.run().await;
         });
@@ -332,6 +340,10 @@ impl TcpWorker {
         // worker close 唤醒后连接 task 随 select 退出——无孤儿。
         let close_notify = Arc::clone(&self.close_notify);
 
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "TCP 连接处理任务（proxy.process + select 停机）；FxScope 未接线（T3.1b 登记）"
+        )]
         tokio::spawn(async move {
             let inbound_conn = InboundConn::Tcp(tracked);
             tokio::select! {
@@ -601,6 +613,10 @@ impl UdpWorker {
         let pump_session = Arc::clone(&session);
         // bd mvsc：process task 挂 close_notify，worker close 时随 select 退出
         let close_notify = Arc::clone(&self.close_notify);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "UDP 会话处理任务（proxy.process）；FxScope 未接线（T3.1b 登记）"
+        )]
         tokio::spawn(async move {
             let inbound_conn = InboundConn::Udp(session);
             tokio::select! {
@@ -620,6 +636,10 @@ impl UdpWorker {
         let hub = self.hub.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(Arc::clone);
         if let Some(hub) = hub {
             let close_notify = Arc::clone(&self.close_notify);
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "UDP outbound 回包泵（close_notify 停机面）；FxScope 未接线（T3.1b 登记）"
+            )]
             tokio::spawn(async move {
                 let mut outbound_rx = outbound_rx;
                 loop {
@@ -713,6 +733,10 @@ impl Worker for UdpWorker {
         let close_notify = Arc::clone(&self.close_notify);
         let this = Arc::clone(&self);
 
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "UDP 包接收循环（会话分发）；FxScope 未接线（T3.1b 登记）"
+        )]
         let recv_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -734,6 +758,10 @@ impl Worker for UdpWorker {
         // Spawn cleanup task (every 60s)
         let close_notify2 = Arc::clone(&self.close_notify);
         let this2 = Arc::clone(&self);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "UDP 空闲会话 60s 清理循环（Go task.Periodic 对齐）；FxScope 未接线（T3.1b 登记）"
+        )]
         let cleanup_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {

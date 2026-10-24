@@ -268,7 +268,7 @@ pub trait OutboundHandlerProvider: Send + Sync {
     fn list_outbound_tags(&self) -> Vec<(String, Option<String>, String)>;
 }
 
-/// Inbound 添加器（让 HandlerService 能调用 InboundManager.add_handler）
+/// Inbound 添加器（让 HandlerService 能注册新 inbound handler）
 pub trait InboundRegistrar: Send + Sync {
     /// 注册一个新 inbound handler（Go `core.AddInboundHandler`）
     fn add_inbound_handler(&self, handler: Arc<dyn InboundHandler>) -> Result<(), ProxymanError>;

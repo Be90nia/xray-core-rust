@@ -1,6 +1,16 @@
 #![deny(warnings)]
 // 治理红线（bd 75rv ②）：任何 rustc warning 即构建失败；豁免一律显式 allow + 理由
-#![cfg_attr(test, allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr))] // 测试目标统一豁免（print 宏断言便利），生产禁令不受影响
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        clippy::disallowed_macros,
+        clippy::print_stdout,
+        clippy::print_stderr
+    )
+)]
+// 测试目标统一豁免（print 宏断言 + 测试内裸 spawn 自管 runtime，bd g3cr
+// 家规扩展；生产禁令不受影响）
 #![warn(clippy::print_stdout, clippy::print_stderr)]
 // 库代码禁直写控制台（诊断走 tracing）；豁免面见各文件 allow 与 clippy.toml 注释
 //! 代理管理器应用服务
@@ -11,8 +21,6 @@
 //!
 //! 业务核心（独立可测）：
 //! - [`config::SniffingRequest`] 与 [`config::build_sniffing_request`] — 嗅探配置解析
-//! - [`inbound::InboundManager`] / [`outbound::OutboundManager`] — handler 注册表（HashMap +
-//!   RwLock）
 //! - [`inbound::AlwaysOnInboundHandler`] / [`outbound::OutboundHandlerEntry`] — handler 配置载体
 //! - [`outbound::parse_random_ip`] — CIDR 子网随机 IP
 //! - 流量计数器命名规则（[`stats::counter_name`]）
@@ -41,12 +49,12 @@ pub mod stats;
 pub use config::{SniffingRequest, build_sniffing_request};
 pub use error::ProxymanError;
 pub use inbound::{
-    AlwaysOnInboundHandler, InboundHandler, InboundManager, PinFuture,
+    AlwaysOnInboundHandler, InboundHandler, PinFuture,
     worker::{DsWorker, InboundConn, ProxyInbound, TcpWorker, UdpSession, UdpWorker, Worker},
 };
 pub use outbound::{
-    OutboundDialer, OutboundHandler, OutboundHandlerEntry, OutboundManager, ProxyOutbound,
-    UotVersion, parse_random_ip,
+    OutboundDialer, OutboundHandler, OutboundHandlerEntry, ProxyOutbound, UotVersion,
+    parse_random_ip,
     uot::{UotClientConn, UotServerConn},
 };
 pub use stats::{Counter, HandlerKind, NoopStatsProvider, StatsProvider, TrafficDirection};

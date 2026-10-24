@@ -219,8 +219,16 @@ impl UotServerConn {
         let (server_r, server_w) = tokio::io::split(server_io);
 
         // pump_input: 从 server_r 读帧 → UDP send_to
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "UoT pump_input 泵（帧→UDP 发送，句柄随结构体存活）；FxScope 未接线（T3.1b 登记）"
+        )]
         let pump_input = tokio::spawn(pump_input(server_r, udp_a, version));
         // pump_output: 从 UDP recv_from → 写帧到 server_w
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "UoT pump_output 泵（UDP→帧写回，句柄随结构体存活）；FxScope 未接线（T3.1b 登记）"
+        )]
         let pump_output = tokio::spawn(pump_output(server_w, udp_b));
 
         let conn: Box<dyn Connection> = Box::new(DuplexConnection::new(client_io));

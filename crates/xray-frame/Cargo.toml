@@ -46,3 +46,5 @@ serde_json = { workspace = true }
 # 主仓 CI `cargo clippy --workspace --all-targets -- -D warnings` 把 warn 升级为
 # 失败，故 warn 即拦截（udf 先例：skeleton-infra/Cargo.toml:102-109）。
 disallowed_methods = "warn"
+# bd g3cr / T0.3：生产零 unwrap；测试面豁免由根 clippy.toml allow-unwrap-in-tests 承担。
+unwrap_used = "deny"

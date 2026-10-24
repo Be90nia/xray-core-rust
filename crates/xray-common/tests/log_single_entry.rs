@@ -5,6 +5,10 @@
 //! dispatcher，触发 callsite 缓存重建，规避线程局部 with_default 恒捕 0 的
 //! 缓存陷阱）。
 
+// 夹具 impl（CaptureSink/CaptureLog）不在 `#[test]` 函数体内，根 clippy.toml 的
+// allow-unwrap-in-tests 只覆盖测试函数体；本文件 Mutex 锁无 poison 面（单测试进程串行）。
+#![allow(clippy::unwrap_used, reason = "测试夹具锁 poison 面为零，夹具 impl 不在 #[test] 函数体内")]
+
 use std::{
     io::Write,
     sync::{

@@ -27,3 +27,8 @@ webpki-roots = { workspace = true }
 [dev-dependencies]
 xray-geodata = { path = "../xray-geodata" }
 prost = { workspace = true }
+
+[lints.clippy]
+# bd g3cr / T0.3 基线段（模板同 xray-frame）：生产零 unwrap；
+# 测试面豁免由根 clippy.toml allow-unwrap-in-tests 承担。
+unwrap_used = "deny"
