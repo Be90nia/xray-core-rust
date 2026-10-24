@@ -8,29 +8,36 @@
 //! - **配置派生注册**（禁硬编码协议清单）：从 `BuiltConfig` 的 `outbounds[]/inbounds[]` 轮出
 //!   `protocol` 名，经族目录（[`family_catalog`]， 只提供构造器）注册进 xray-frame
 //!   `PluginRegistry`；目录未覆盖的族 （shadowsocks 等未迁移族）记账不注册、不静默。
-//! - **handler 桥**：从已 build 的插件族把每个配置条目转成 dispatcher 可调 handler（出站 =
-//!   插件产出的 `DispatchHandler`/`DialBridge` 包装；入站 = `InboundDispatchHandler`，生产同款 tag
-//!   面），填 [`HandlerBridge`] 查表。 转换失败逐条计数 + 日志（成功几个算几个），重复 tag
-//!   拒绝（不覆盖）。
+//! - **handler 桥**：从已 build 的插件族把每个配置条目转成 dispatcher 可调 handler，填
+//!   [`HandlerBridge`] 查表。出站两条路：插件缝族（freedom/vmess/vless/blackhole/loopback， 插件
+//!   build 态 → `dispatch_handler`/`dial_fn`/`handler`）与 core 单出站构建族
+//!   （trojan/http/socks/tuic/hysteria/anytls/wireguard/dns/tun——客户端解析在 xray-core 内部，经
+//!   pub `outbound::build_single_outbound` 复用）；入站 = `InboundDispatchHandler` （生产同款 tag
+//!   面）。转换失败逐条计数 + 日志（成功几个算几个），重复 tag 拒绝（不覆盖）；
+//!   该族消费不了的条目级面（[`EntryFacet`]：proxyChain / mux / sendThrough）在场即拒。
 //! - **段路由**：装配根 `with_config(config_root)`（`Config::to_json_value()`
 //!   同源投影，禁从原文件二次解析），插件 build 期经 `ctx.section()` 取自己 那段（缺段
 //!   fail-fast，L5）。
 //!
 //! 探针（[`AssemblyProbe`]）恒注册：装配链贯通的金丝雀。v0.1 已知限制：同
 //! protocol 多实例条目只转换首个（xray-frame v0.1 每 protocol 只 build 首段，
-//! 余者记账失败）；listener/accept 面与 dispatcher 真接线（ohm 注入）留后续批。
+//! 余者记账失败）；loopback 出站缺回注 sink（需 xray-core 注入点交出 dispatcher）；
+//! 代理链与 mux 包装属 `register_outbounds` 内接线，框架注入臂未接。
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use xray_app_dispatcher::{
     DispatchHandler,
-    default::{DefaultDispatcher, DialBridge, DialFn},
+    default::{DefaultDispatcher, DialBridge, DialFn, SniffingRequest},
 };
 use xray_conf::{BuiltConfig, BuiltOutbound};
-use xray_core::wiring::{InboundDispatchHandler, sniffing_request_from_json};
+use xray_core::{
+    outbound::BuildError as OutboundBuildError,
+    wiring::{InboundDispatchHandler, sniffing_request_from_json},
+};
 use xray_frame::{
     Framework, FrameworkOptions,
     context::PluginContext,
@@ -46,7 +53,7 @@ use xray_proxy_freedom::{
 };
 use xray_proxy_http::HttpPlugin;
 use xray_proxy_hysteria::HysteriaPlugin;
-use xray_proxy_loopback::LoopbackPlugin;
+use xray_proxy_loopback::{LoopbackError, LoopbackPlugin, LoopbackSink};
 use xray_proxy_socks::SocksPlugin;
 use xray_proxy_trojan::TrojanPlugin;
 use xray_proxy_tuic::TuicPlugin;
@@ -54,6 +61,7 @@ use xray_proxy_tun::TunPlugin;
 use xray_proxy_vless::VlessPlugin;
 use xray_proxy_vmess::VmessPlugin;
 use xray_proxy_wireguard::WireguardPlugin;
+use xray_transport::dialer::StreamSettings;
 
 use crate::error::{CliError, Result};
 
@@ -131,32 +139,189 @@ type OutboundConvert = Arc<
 
 /// 一个协议族的注册形态：插件实例（注册进 Framework，build 期状态被出站转换
 /// 消费——同一 Arc）+ 可选的出站桥转换缝（无 = 该族暂无 dispatcher 可调出站
-/// handler，如仅入站面的插件）。
+/// handler，如仅入站面的插件）+ 该族转换缝**不消费**的出站条目级配置面
+/// （[`EntryFacet`]：在场即拒，不静默丢语义）。
 struct RegisteredFamily {
     protocol: &'static str,
     plugin: Arc<dyn Plugin>,
     outbound: Option<OutboundConvert>,
+    unhandled: &'static [EntryFacet],
+    /// loopback 专用：回注 sink 的 late-bind 槽（其余族 `None`）。handler 构造期
+    /// 生产 sink 尚不存在（dispatcher 在注入点内才就绪），装配返回后回填。
+    loopback_slot: Option<LoopbackSlot>,
 }
 
-/// 入站面族：插件产出 inbound server（listener 面消费，下一批）；桥面 =
-/// [`InboundDispatchHandler`]（tag 派生，不依赖插件状态，[`fill_bridge`] 直造）。
+/// loopback 回注缝的 late-bind 槽：桥填表时随 handler 注入
+/// [`DeferredLoopbackSink`] 占位，`start_full_with_outbound_handlers` 返回生产
+/// sink（`DispatcherLoopbackSink`）后由 [`run_framework_until`] 回填。
+type LoopbackSlot = Arc<OnceLock<Arc<dyn LoopbackSink>>>;
+
+/// loopback 条目的重分发 sniffing：`settings.sniffing` → xray-core wiring 权威
+/// 解析（`sniffing_request_from_json`，destOverride 别名归一 / 排除表的 geodata
+/// 语义都在那）——同生产 `parse_loopback_config` 的 sniffing 半边；tag 半边由
+/// 插件 `built_inbound_tag` 提供。无配置 = 零值请求（不嗅探，同 Go）。
+fn loopback_sniffing(ob: &BuiltOutbound) -> SniffingRequest {
+    let settings = serde_json::from_slice::<serde_json::Value>(&ob.entry.data).ok();
+    sniffing_request_from_json(settings.as_ref().and_then(|v| v.get("sniffing")))
+}
+
+/// 回注 sink 占位：转发到槽内生产 sink；未绑定即命中 = 装配时序 bug，显式
+/// `SinkNotInjected`（LoopbackHandler 侧 warn + 断链，不静默黑洞）。
+#[derive(Debug)]
+struct DeferredLoopbackSink {
+    slot: LoopbackSlot,
+}
+
+impl LoopbackSink for DeferredLoopbackSink {
+    fn dispatch_loopback(
+        &self,
+        inbound_tag: String,
+        destination: xray_common::net::destination::Destination,
+        sniffing: SniffingRequest,
+        link: xray_transport::link::Link,
+    ) -> xray_proxy_loopback::LoopbackFuture<std::result::Result<(), LoopbackError>> {
+        match self.slot.get() {
+            Some(sink) => sink.dispatch_loopback(inbound_tag, destination, sniffing, link),
+            None => Box::pin(async move { Err(LoopbackError::SinkNotInjected) }),
+        }
+    }
+}
+
+/// 出站条目级配置面中**仍有族消费不了**的部分（生产 `register_outbounds`
+/// 消费的面；`streamSettings` 已全族解封——插件缝经 `with_stream_settings`、
+/// core 单构建族原生消费、blackhole/loopback 生产同样忽略——故不入本枚举）。
+#[derive(Clone, Copy)]
+enum EntryFacet {
+    /// 代理链：`proxySettings.tag` 与 `streamSettings.sockopt.dialerProxy` 是 Go
+    /// 同一条"非最终出站"判据（freedom.go:193-198）。两者都要出站表 Phase 2
+    /// （`DialBridge::set_proxy_chain` 的 `OutboundHandlerManager` / 全局
+    /// `set_dialer_proxy_hook`），只在 `register_outbounds` 内接线——框架注入臂
+    /// 既无出站表也不装钩子。
+    ProxyChain,
+    /// `mux` 包装（`MuxBridge` 承载会话复用）。
+    Mux,
+    /// `sendThrough`（源地址/CIDR 解析 + `DIAL_SRC` 拨号包装）。
+    SendThrough,
+}
+
+impl EntryFacet {
+    /// 该面在条目上是否在场（在场 = 转换会丢语义）。
+    fn present(self, ob: &BuiltOutbound) -> bool {
+        match self {
+            Self::ProxyChain => {
+                ob.proxy_settings_json.is_some()
+                    || ob
+                        .stream_settings_json
+                        .as_ref()
+                        .and_then(|s| s.get("sockopt"))
+                        .and_then(|s| s.get("dialerProxy"))
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|tag| !tag.is_empty())
+            },
+            Self::Mux => ob.mux_json.is_some(),
+            Self::SendThrough => ob.send_through.is_some(),
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::ProxyChain => {
+                "proxy chain (proxySettings.tag / sockopt.dialerProxy) needs the outbound-table \
+                 phase 2 owned by register_outbounds (set_proxy_chain / dialer-proxy hook); the \
+                 framework injection arm has neither"
+            },
+            Self::Mux => "mux wrapping (MuxBridge) is not applied by this family's conversion",
+            Self::SendThrough => {
+                "sendThrough (parse_send_through / wrap_dial_with_send_through) is xray-core \
+                 pub(crate); this family's conversion cannot honour it"
+            },
+        }
+    }
+}
+
+/// 插件缝族（freedom/vmess/vless）：transport 已接（`with_stream_settings`），
+/// 其余条目级面未接。
+const PLUGIN_SEAM_UNHANDLED: &[EntryFacet] =
+    &[EntryFacet::ProxyChain, EntryFacet::Mux, EntryFacet::SendThrough];
+
+/// `xray-core` 单出站构建族：原生消费 `streamSettings`/`sendThrough`/`mux`，
+/// 但 `build_single_outbound` 丢弃 `proxy_chain_tag`（三组件装配形态的第二元），
+/// 故代理链仍需守卫。
+const CORE_SINGLE_UNHANDLED: &[EntryFacet] = &[EntryFacet::ProxyChain];
+
+/// 入站面族：插件产出 inbound server（listener 面由 `spawn_inbounds` 消费）；
+/// 桥面 = [`InboundDispatchHandler`]（tag 派生，不依赖插件状态，[`fill_bridge`]
+/// 直造）。
 fn inbound_only<P: Plugin + Default + 'static>(protocol: &'static str) -> RegisteredFamily {
-    RegisteredFamily { protocol, plugin: Arc::new(P::default()), outbound: None }
+    RegisteredFamily {
+        protocol,
+        plugin: Arc::new(P::default()),
+        outbound: None,
+        unhandled: &[],
+        loopback_slot: None,
+    }
 }
 
-/// `dial_fn` 形态出站族（vmess/vless）：插件暴露 `DialFn`（既有拨号语义全量），
-/// 经 dispatcher 自家的 [`DialBridge`] 适配成 `DispatchHandler`。
+/// `xray-core` 单出站构建族（trojan/http/socks/tuic/hysteria/anytls/wireguard/
+/// dns/tun）：这些族的客户端配置解析在 xray-core 内部（`pub(crate)`
+/// `parse_*_config` + `wrap_bridge`），P2 插件化只迁移了入站解析面；桥内重写解析
+/// = 第二份生产语义（漂移风险）。故复用 xray-core 的 **pub** 单出站构建入口
+/// [`xray_core::outbound::build_single_outbound`]（API 动态 AddOutbound 同款，
+/// 逐协议构造函数与 `register_outbounds` 同源）。
+fn core_outbound_family<P: Plugin + Default + 'static>(protocol: &'static str) -> RegisteredFamily {
+    RegisteredFamily {
+        protocol,
+        plugin: Arc::new(P::default()),
+        unhandled: CORE_SINGLE_UNHANDLED,
+        loopback_slot: None,
+        outbound: Some(Arc::new(|ob| {
+            xray_core::outbound::build_single_outbound(ob).map_err(|e| match e {
+                // Unsupported 携带的是协议名或平台拒绝文案（如非 Linux 的 TUN），
+                // 原样透出让失败记账可读。
+                OutboundBuildError::Unsupported(reason) => {
+                    format!("xray-core outbound builder rejected the entry: {reason}")
+                },
+                OutboundBuildError::Parse(e) => e,
+            })
+        })),
+    }
+}
+
+/// 出站条目 transport：`StreamSettings::from_json` + 生产折叠规则（裸 TCP、无
+/// TLS、无 `sockopt`/`finalmask`/transport 级配置 = 无 streamSettings）。与
+/// xray-core `outbound::parse_stream_settings`（`pub(crate)`）逐条同规。
+fn stream_settings(ob: &BuiltOutbound) -> Option<StreamSettings> {
+    let settings = StreamSettings::from_json(ob.stream_settings_json.as_ref());
+    let transport_extras = settings.sockopt_json.is_some()
+        || settings.finalmask_json.is_some()
+        || settings.transport_json.is_some();
+    if settings.protocol == "tcp" && !settings.is_tls() && !transport_extras {
+        None
+    } else {
+        Some(settings)
+    }
+}
+
+/// `dial_fn` 形态出站族（vmess/vless）：插件暴露已解析的出站配置（`built_outbound`）
+/// + `DialFn`（既有拨号语义全量）；桥补条目级 transport（生产
+/// `build_vmess_outbound`/`build_vless_outbound` 同款 `with_stream_settings`），
+/// 再经 dispatcher 自家的 [`DialBridge`] 适配成 `DispatchHandler`。
 fn dial_fn_family<P, F>(protocol: &'static str, dial: F) -> RegisteredFamily
 where
     P: Plugin + Default + 'static,
-    F: Fn(&P) -> std::result::Result<DialFn, PluginError> + Send + Sync + 'static,
+    F: Fn(&P, Option<StreamSettings>) -> std::result::Result<DialFn, PluginError>
+        + Send
+        + Sync
+        + 'static,
 {
     let plugin = Arc::new(P::default());
     let p = Arc::clone(&plugin);
     RegisteredFamily {
         protocol,
+        unhandled: PLUGIN_SEAM_UNHANDLED,
+        loopback_slot: None,
         outbound: Some(Arc::new(move |ob| {
-            let dial_fn = dial(&p).map_err(|e| e.to_string())?;
+            let dial_fn = dial(&p, stream_settings(ob)).map_err(|e| e.to_string())?;
             Ok(Arc::new(DialBridge::new(ob.tag.clone(), dial_fn)) as Arc<dyn DispatchHandler>)
         })),
         plugin,
@@ -172,6 +337,8 @@ fn freedom_family() -> RegisteredFamily {
     let p = Arc::clone(&plugin);
     RegisteredFamily {
         protocol: "freedom",
+        unhandled: PLUGIN_SEAM_UNHANDLED,
+        loopback_slot: None,
         outbound: Some(Arc::new(move |ob| {
             let cfg = p.built_config().map_err(|e| e.to_string())?.clone();
             let dial_bridge = Arc::new(DialBridge::new(
@@ -203,6 +370,10 @@ fn blackhole_family() -> RegisteredFamily {
     let p = Arc::clone(&plugin);
     RegisteredFamily {
         protocol: "blackhole",
+        // 生产构造器不消费这些面：代理链/sendThrough/streamSettings 生产同样
+        // 忽略；mux 包装对本族无语义（流量全丢）。
+        unhandled: &[],
+        loopback_slot: None,
         outbound: Some(Arc::new(move |ob| {
             let handler = p.dispatch_handler(&ob.tag).map_err(|e| e.to_string())?;
             Ok(Arc::new(handler) as Arc<dyn DispatchHandler>)
@@ -212,14 +383,26 @@ fn blackhole_family() -> RegisteredFamily {
 }
 
 /// loopback 出站族：插件自家 `handler`（`LoopbackHandler` 已是 `DispatchHandler`，
-/// 回环目标 = build 期段里的 `inboundTag`）。
+/// 回环目标 = build 期段里的 `inboundTag`）+ 回注 sink 的 late-bind 缝：构造期
+/// 注入 [`DeferredLoopbackSink`] 占位，装配返回生产 `DispatcherLoopbackSink` 后
+/// 由 [`run_framework_until`] 经 [`LoopbackSlot`] 回填（票 rdcc；此前无 sink =
+/// `error!` + drop 黑洞）。
 fn loopback_family() -> RegisteredFamily {
     let plugin = Arc::new(LoopbackPlugin::default());
     let p = Arc::clone(&plugin);
+    let slot: LoopbackSlot = Arc::new(OnceLock::new());
     RegisteredFamily {
         protocol: "loopback",
+        // 生产构造器只消费 inboundTag/sniffing：代理链/sendThrough/streamSettings
+        // 生产同样忽略；mux 包装对本族无语义（链接回注即重新选路）。
+        unhandled: &[],
+        loopback_slot: Some(Arc::clone(&slot)),
         outbound: Some(Arc::new(move |ob| {
-            let handler = p.handler(&ob.tag).map_err(|e| e.to_string())?;
+            let handler = p
+                .handler(&ob.tag)
+                .map_err(|e| e.to_string())?
+                .with_sniffing_request(loopback_sniffing(ob))
+                .with_sink(Arc::new(DeferredLoopbackSink { slot: Arc::clone(&slot) }));
             Ok(Arc::new(handler) as Arc<dyn DispatchHandler>)
         })),
         plugin,
@@ -232,19 +415,28 @@ fn loopback_family() -> RegisteredFamily {
 /// `Config::to_json_value()` 的 `protocol` 字段逐字对齐（插件 `name()` 同源）。
 fn family_catalog(protocol: &str) -> Option<RegisteredFamily> {
     let family = match protocol {
-        "socks" => inbound_only::<SocksPlugin>("socks"),
-        "http" => inbound_only::<HttpPlugin>("http"),
+        // 入站面 + xray-core 单出站构建（客户端解析在 xray-core 内部）。
+        "socks" => core_outbound_family::<SocksPlugin>("socks"),
+        "http" => core_outbound_family::<HttpPlugin>("http"),
+        "trojan" => core_outbound_family::<TrojanPlugin>("trojan"),
+        "tuic" => core_outbound_family::<TuicPlugin>("tuic"),
+        "anytls" => core_outbound_family::<AnytlsPlugin>("anytls"),
+        "hysteria" => core_outbound_family::<HysteriaPlugin>("hysteria"),
+        "wireguard" => core_outbound_family::<WireguardPlugin>("wireguard"),
+        "tun" => core_outbound_family::<TunPlugin>("tun"),
+        "dns" => core_outbound_family::<DnsPlugin>("dns"),
+        // 纯入站协议（无出站形态；xray-core 出站构造表键为 "dokodemo"，与配置
+        // protocol 名 "dokodemo-door" 不同源，故不走单出站构建）。
         "dokodemo-door" => inbound_only::<DokodemoPlugin>("dokodemo-door"),
-        "trojan" => inbound_only::<TrojanPlugin>("trojan"),
-        "tuic" => inbound_only::<TuicPlugin>("tuic"),
-        "anytls" => inbound_only::<AnytlsPlugin>("anytls"),
-        "hysteria" => inbound_only::<HysteriaPlugin>("hysteria"),
-        "wireguard" => inbound_only::<WireguardPlugin>("wireguard"),
-        "tun" => inbound_only::<TunPlugin>("tun"),
-        "dns" => inbound_only::<DnsPlugin>("dns"),
         "freedom" => freedom_family(),
-        "vmess" => dial_fn_family::<VmessPlugin, _>("vmess", |p| p.dial_fn()),
-        "vless" => dial_fn_family::<VlessPlugin, _>("vless", |p| p.dial_fn()),
+        "vmess" => dial_fn_family::<VmessPlugin, _>("vmess", |p, stream| {
+            let config = (**p.built_outbound()?).clone().with_stream_settings(stream);
+            Ok(xray_proxy_vmess::make_vmess_dial_fn(Arc::new(config)))
+        }),
+        "vless" => dial_fn_family::<VlessPlugin, _>("vless", |p, stream| {
+            let config = (**p.built_outbound()?).clone().with_stream_settings(stream);
+            Ok(xray_proxy_vless::make_vless_dial_fn(Arc::new(config)))
+        }),
         "blackhole" => blackhole_family(),
         "loopback" => loopback_family(),
         _ => return None,
@@ -314,24 +506,21 @@ struct BridgeFill {
     /// 出站 handler（配置序，仅成功转换）——listener 面经
     /// `start_full_with_outbound_handlers` 灌入 ohm（首个 = default，S4 影子表镜像）。
     outbound_handlers: Vec<Arc<dyn DispatchHandler>>,
+    /// 本桥 loopback handler 的回注 late-bind 槽——装配返回生产 sink 后回填。
+    loopback_slots: Vec<LoopbackSlot>,
 }
 
-/// 出站条目的生产装配前置（framework 桥 v0 未接的面在场 → 拒，不静默丢语义）：
-/// proxySettings 代理链 / mux 包装 / sendThrough / streamSettings 传输层。
-fn guard_outbound_entry(ob: &BuiltOutbound) -> std::result::Result<(), String> {
-    if ob.proxy_settings_json.is_some() {
-        return Err("proxy chain (proxySettings) not wired in framework bridge".into());
-    }
-    if ob.mux_json.is_some() {
-        return Err("mux wrapping not wired in framework bridge".into());
-    }
-    if ob.send_through.is_some() {
-        return Err("sendThrough not wired in framework bridge".into());
-    }
-    if ob.stream_settings_json.is_some() {
-        return Err("transport streamSettings not wired in framework bridge".into());
-    }
-    Ok(())
+/// 出站条目的转换前守卫：该族转换缝**不消费**的条目级面在场 → 拒（不静默丢
+/// 语义）。各族消费能力见 [`EntryFacet`] 与 [`family_catalog`] 的族装配。
+fn guard_outbound_entry(
+    ob: &BuiltOutbound,
+    family: &RegisteredFamily,
+) -> std::result::Result<(), String> {
+    family
+        .unhandled
+        .iter()
+        .find(|facet| facet.present(ob))
+        .map_or(Ok(()), |facet| Err(facet.reason().to_string()))
 }
 
 /// 把配置条目转成 dispatcher 可调 handler 填表：出站 = 族转换缝（缺缝/失败/
@@ -347,6 +536,10 @@ fn fill_bridge(
         ok: 0,
         failed: Vec::new(),
         outbound_handlers: Vec::new(),
+        loopback_slots: families
+            .iter()
+            .filter_map(|family| family.loopback_slot.as_ref().map(Arc::clone))
+            .collect(),
     };
     // v0.1：同 protocol 多实例只转换首个（xray-frame 每 protocol 只 build 首段）；
     // 仅成功转换才占位，失败后同 protocol 后继条目仍可重试。
@@ -382,7 +575,7 @@ fn fill_bridge(
             );
             continue;
         };
-        if let Err(reason) = guard_outbound_entry(ob) {
+        if let Err(reason) = guard_outbound_entry(ob, family) {
             record_failure(&mut fill, &ob.tag, reason);
             continue;
         }
@@ -483,7 +676,7 @@ pub(crate) async fn run_framework_until(
 
     // ③ 桥：插件 → dispatcher 可调 handler 填表（失败逐条计数 + 日志）。
     let dispatcher = Arc::new(DefaultDispatcher::new());
-    let BridgeFill { bridge, ok, failed, outbound_handlers } =
+    let BridgeFill { bridge, ok, failed, outbound_handlers, loopback_slots } =
         fill_bridge(built, &plan.families, &dispatcher);
     for (tag, reason) in &failed {
         crate::LOG.warn(format!("framework: bridge conversion failed tag={tag:?}: {reason}"));
@@ -500,11 +693,26 @@ pub(crate) async fn run_framework_until(
     // sniffing/stats/access-log 与 start_full 同一条路，per-inbound
     // InboundDispatchHandler+MuxCarrier 由 spawn_inbounds 既有机制承担），唯一差异 =
     // 出站 handler 由本桥灌入（feature 门控注入点，禁第二套 dispatcher）。
-    let (instance, _ohm, handles) =
+    let (instance, _ohm, handles, loopback_sink) =
         xray_core::functions::start_full_with_outbound_handlers(built, outbound_handlers)
             .await
             .map_err(|e| CliError::StartFailed(format!("framework inbound start failed: {e}")))?;
     crate::LOG.info(format!("framework: {} inbound listener(s) serving", handles.len()));
+
+    // ⑤ loopback 回注 sink late-bind（票 rdcc）：桥 handler 构造期拿不到生产 sink
+    // （dispatcher 在注入点内才就绪），持 `DeferredLoopbackSink` 占位；此刻生产
+    // `DispatcherLoopbackSink` 随返回值就绪，回填后回注走生产 dispatch_link 全序
+    // （routing/sniffing/stats/access-log）。绑定前的极小窗口内命中 loopback 的
+    // 连接得到显式 `SinkNotInjected`（warn + 断链，非静默）。
+    for slot in &loopback_slots {
+        let _ = slot.set(Arc::clone(&loopback_sink));
+    }
+    if !loopback_slots.is_empty() {
+        crate::LOG.info(format!(
+            "framework: loopback re-injection sink bound ({} slot(s))",
+            loopback_slots.len()
+        ));
+    }
 
     shutdown_signal.await;
 
@@ -692,6 +900,211 @@ mod tests {
         assert!(fill.bridge.get("ss-out").is_none(), "failed conversion must not fake an entry");
     }
 
+    /// A：出站族逐族构造断言。10 族的客户端配置解析在 xray-core 内部
+    /// （`pub(crate) parse_*_config`），桥经 pub 单出站构建入口
+    /// `outbound::build_single_outbound` 消费；不能转换的族给出明确原因，不伪造
+    /// 成功条目。
+    #[test]
+    fn core_outbound_families_convert_or_fail_per_family() {
+        const UUID: &str = "f2b3c1d4-1234-4abc-9def-0123456789ab";
+        let wireguard = format!(
+            r#"{{"secretKey":"{}","peers":[{{"publicKey":"{}","endpoint":"127.0.0.1:51820"}}]}}"#,
+            "aa".repeat(32),
+            "bb".repeat(32)
+        );
+        let tuic = format!(
+            r#"{{"servers":[{{"address":"127.0.0.1","port":443,"uuid":"{UUID}","password":"pw"}}]}}"#
+        );
+        // (protocol, settings, streamSettings, 期望) —— Ok = 真转换；Err(关键词) = 记账失败。
+        let cases: &[(&str, &str, Option<&str>, std::result::Result<(), &str>)] = &[
+            (
+                "trojan",
+                r#"{"servers":[{"address":"127.0.0.1","port":443,"password":"pw"}]}"#,
+                None,
+                Ok(()),
+            ),
+            ("http", r#"{"servers":[{"address":"127.0.0.1","port":8080}]}"#, None, Ok(())),
+            ("socks", r#"{"servers":[{"address":"127.0.0.1","port":1080}]}"#, None, Ok(())),
+            ("tuic", &tuic, None, Ok(())),
+            (
+                "hysteria",
+                r#"{"address":"example.com","port":39622}"#,
+                Some(r#"{"security":"tls","tlsSettings":{"serverName":"example.com"}}"#),
+                Ok(()),
+            ),
+            (
+                "anytls",
+                r#"{"server":"127.0.0.1","server_port":443,"password":"pw","insecure":true}"#,
+                None,
+                Ok(()),
+            ),
+            ("wireguard", &wireguard, None, Ok(())),
+            ("dns", "{}", None, Ok(())),
+            (
+                "tun",
+                "{}",
+                None,
+                if cfg!(any(target_os = "linux", target_os = "android", target_os = "freebsd")) {
+                    Ok(())
+                } else {
+                    Err("TUN outbound is only supported")
+                },
+            ),
+            // 纯入站协议：插件只暴露入站面，不入出站桥（不伪造 handler）。
+            ("dokodemo-door", "{}", None, Err("inbound-face plugin only")),
+        ];
+
+        // anytls/hysteria 的客户端构造需要 tokio 反应器（anytls 会话池、QUIC 端点）。
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _enter = runtime.enter();
+        let dispatcher = Arc::new(DefaultDispatcher::new());
+        for (protocol, settings, stream, expected) in cases {
+            let family = family_catalog(protocol).expect("family catalog entry");
+            let tag = format!("{protocol}-out");
+            let mut built = xray_conf::BuiltConfig::default();
+            let mut ob = outbound_entry(protocol, &tag, settings.as_bytes());
+            ob.stream_settings_json =
+                stream.map(|s| serde_json::from_str(s).expect("stream settings json"));
+            built.outbounds.push(ob);
+
+            let fill = fill_bridge(&built, &[family], &dispatcher);
+            match expected {
+                Ok(()) => {
+                    assert!(
+                        fill.failed.is_empty(),
+                        "{protocol}: unexpected failure {:?}",
+                        fill.failed
+                    );
+                    assert_eq!(fill.bridge.get(&tag).expect("bridge handler").tag(), tag);
+                    assert_eq!(
+                        fill.outbound_handlers.len(),
+                        1,
+                        "{protocol}: converted handler must reach the injection list"
+                    );
+                },
+                Err(keyword) => {
+                    assert_eq!(fill.ok, 0, "{protocol}: must not fabricate a handler");
+                    assert_eq!(fill.failed.len(), 1, "{protocol}: exactly one recorded failure");
+                    assert!(
+                        fill.failed[0].1.contains(keyword),
+                        "{protocol}: reason {:?} must mention {keyword:?}",
+                        fill.failed[0].1
+                    );
+                    assert!(
+                        fill.bridge.get(&tag).is_none(),
+                        "{protocol}: failed entry must stay out"
+                    );
+                },
+            }
+        }
+    }
+
+    /// C：四面守卫按族能力表判定。插件缝族（vmess/vless/freedom）只接了 transport，
+    /// 其余条目级面仍拒；core 单构建族原生消费 streamSettings/sendThrough/mux，只拒
+    /// 代理链（`build_single_outbound` 丢弃 chain tag）；blackhole/loopback 生产同样
+    /// 忽略这些面（无拨号腿），故不拒。
+    #[test]
+    fn guard_facets_follow_family_capability_table() {
+        let plugin_seam = family_catalog("vless").expect("vless family");
+        let core_route = family_catalog("trojan").expect("trojan family");
+        let ignoring = family_catalog("blackhole").expect("blackhole family");
+
+        let with = |f: fn(&mut BuiltOutbound)| {
+            let mut ob = outbound_entry("x", "entry", b"{}");
+            f(&mut ob);
+            ob
+        };
+        let proxy_chain = with(|ob| {
+            ob.proxy_settings_json = Some(serde_json::json!({"tag": "chain-out"}));
+        });
+        let dialer_proxy = with(|ob| {
+            ob.stream_settings_json = Some(serde_json::json!({"sockopt": {"dialerProxy": "hop"}}));
+        });
+        let mux = with(|ob| ob.mux_json = Some(serde_json::json!({"enabled": true})));
+        let send_through = with(|ob| ob.send_through = Some("127.0.0.1".into()));
+        let stream = with(|ob| {
+            ob.stream_settings_json = Some(serde_json::json!({"network": "ws", "security": "tls"}));
+        });
+
+        // 插件缝：仅 transport 解封。
+        assert!(guard_outbound_entry(&proxy_chain, &plugin_seam).is_err());
+        assert!(guard_outbound_entry(&dialer_proxy, &plugin_seam).is_err());
+        assert!(guard_outbound_entry(&mux, &plugin_seam).is_err());
+        assert!(guard_outbound_entry(&send_through, &plugin_seam).is_err());
+        assert!(guard_outbound_entry(&stream, &plugin_seam).is_ok());
+
+        // core 单构建：transport / sendThrough / mux 原生消费，代理链仍拒。
+        assert!(guard_outbound_entry(&stream, &core_route).is_ok());
+        assert!(guard_outbound_entry(&send_through, &core_route).is_ok());
+        assert!(guard_outbound_entry(&mux, &core_route).is_ok());
+        assert!(guard_outbound_entry(&proxy_chain, &core_route).is_err());
+        assert!(guard_outbound_entry(&dialer_proxy, &core_route).is_err());
+
+        // 生产同样忽略这些面（无拨号腿/无回环腿）：不拒。
+        for ob in [&proxy_chain, &dialer_proxy, &mux, &send_through, &stream] {
+            assert!(guard_outbound_entry(ob, &ignoring).is_ok());
+        }
+    }
+
+    /// transport 折叠规则与生产 `outbound::parse_stream_settings`（pub(crate)）同规：
+    /// 裸 TCP 无 TLS 无 transport 级配置 = 无 streamSettings；sockopt/finalmask/
+    /// tcpSettings.header 在场或带 TLS/ws 时不折叠（折叠会静默丢伪装与 sockopt）。
+    #[test]
+    fn stream_settings_fold_matches_production() {
+        let fold = |json: serde_json::Value| {
+            let mut ob = outbound_entry("x", "entry", b"{}");
+            ob.stream_settings_json = Some(json);
+            stream_settings(&ob)
+        };
+        assert!(fold(serde_json::json!({"network": "tcp"})).is_none());
+        assert!(fold(serde_json::json!({"sockopt": {"mark": 1}})).is_some());
+        assert!(fold(serde_json::json!({"tcpSettings": {"header": {"type": "http"}}})).is_some());
+        assert!(fold(serde_json::json!({"network": "ws"})).is_some());
+        assert!(fold(serde_json::json!({"security": "tls"})).is_some());
+    }
+
+    /// 插件缝族的 transport 解封端到端：vless/vmess 出站配 streamSettings（ws+TLS）
+    /// → 配置派生 → 装配 build（插件解析 vnext）→ 桥转换成功（旧行为一律拒）。
+    #[test]
+    fn plugin_seam_stream_settings_reaches_bridge() {
+        let (built, root, plan) = plan_from_json(
+            r#"{
+            "outbounds": [{
+                "protocol": "vless",
+                "tag": "vless-out",
+                "settings": {"vnext": [{"address": "127.0.0.1", "port": 443,
+                    "users": [{"id": "f2b3c1d4-1234-4abc-9def-0123456789ab", "encryption": "none"}]}]},
+                "streamSettings": {"network": "ws", "security": "tls",
+                    "wsSettings": {"path": "/ray"}, "tlsSettings": {"serverName": "example.com"}}
+            }, {
+                "protocol": "vmess",
+                "tag": "vmess-out",
+                "settings": {"vnext": [{"address": "127.0.0.1", "port": 8443,
+                    "users": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811", "security": "auto"}]}]},
+                "streamSettings": {"network": "grpc", "security": "tls",
+                    "grpcSettings": {"serviceName": "svc"}, "tlsSettings": {"serverName": "example.com"}}
+            }]
+        }"#,
+        );
+        assert_eq!(plan.families.len(), 2);
+        assert!(plan.unregistered.is_empty(), "unregistered: {:?}", plan.unregistered);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut framework = assemble(root, &plan.families).expect("assemble");
+            framework.bring_up().expect("bring_up");
+
+            let dispatcher = Arc::new(DefaultDispatcher::new());
+            let fill = fill_bridge(&built, &plan.families, &dispatcher);
+            assert!(fill.failed.is_empty(), "unexpected failures: {:?}", fill.failed);
+            assert_eq!(fill.bridge.get("vless-out").expect("vless handler").tag(), "vless-out");
+            assert_eq!(fill.bridge.get("vmess-out").expect("vmess handler").tag(), "vmess-out");
+            assert_eq!(fill.outbound_handlers.len(), 2);
+
+            assert!(framework.shutdown().await.is_clean());
+        });
+    }
+
     /// B5 step4 优雅停机确定性验收（agent 环境控制台 CTRL_C 投递不可靠——
     /// default 二进制实测同样不退）：真实 socks listener 起真端口 → curl 语义
     /// 连接可建立 → 注入停机触发器 → close→join→插件停机 → 端口关闭 → Ok
@@ -790,6 +1203,108 @@ mod tests {
             handler.dispatch(&dest, link).await;
 
             framework.shutdown().await;
+        });
+    }
+
+    /// B5 loopback 回注 sink e2e：socks 入站 + loopback 出站（配置序首个 =
+    /// default）+ freedom + 路由规则（inboundTag "loopback-return" → freedom）。
+    /// 客户端 → socks-in → 无规则命中 → default = loopback-out（桥 handler，持
+    /// `DeferredLoopbackSink` 占位）→ 注入点返回生产 `DispatcherLoopbackSink` 后
+    /// late-bind → 回注（access.inboundTag = "loopback-return"）→ 规则命中
+    /// freedom-out → 本机 echo 回显。判别力：late-bind 失败 = SinkNotInjected
+    /// 断链（读超时）；回注丢 tag = 再落 default loopback → 无限回环（读超时）。
+    /// 双向 payload 逐字节相等 = 回注贯通。
+    #[test]
+    fn loopback_outbound_reinjection_round_trips_through_framework_bridge() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            // 本机 echo 终点（freedom 落地点）。
+            let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let echo_addr = echo.local_addr().unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((sock, _)) = echo.accept().await else { return };
+                    tokio::spawn(async move {
+                        let (mut r, mut w) = tokio::io::split(sock);
+                        let _ = tokio::io::copy(&mut r, &mut w).await;
+                    });
+                }
+            });
+
+            const SOCKS_PORT: u16 = 12837;
+            let config = xray_conf::Config::from_json_str(&format!(
+                r#"{{
+                "inbounds": [{{"protocol": "socks", "tag": "socks-in", "listen": "127.0.0.1", "port": {SOCKS_PORT}, "settings": {{}}}}],
+                "outbounds": [
+                    {{"protocol": "loopback", "tag": "loopback-out", "settings": {{"inboundTag": "loopback-return"}}}},
+                    {{"protocol": "freedom", "tag": "freedom-out", "settings": {{}}}}
+                ],
+                "routing": {{"rules": [{{"type": "field", "inboundTag": ["loopback-return"], "outboundTag": "freedom-out"}}]}}
+            }}"#
+            ))
+            .unwrap();
+            let built = config.build().unwrap();
+            let root = config.to_json_value().unwrap();
+
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let serve = crate::framework::run_framework_until(&built, root, async move {
+                let _ = rx.await;
+            });
+            tokio::pin!(serve);
+
+            // listener 真实可连（同 graceful 停机测试的轮询形态）。
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut connected = false;
+            while std::time::Instant::now() < deadline {
+                tokio::select! {
+                    biased;
+                    res = serve.as_mut() => panic!("serve finished before listener came up: {res:?}"),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                        if tokio::net::TcpStream::connect(("127.0.0.1", SOCKS_PORT)).await.is_ok() {
+                            connected = true;
+                            break;
+                        }
+                    },
+                }
+            }
+            assert!(connected, "socks listener never accepted within 10s");
+
+            // SOCKS5 no-auth 握手 → CONNECT echo。
+            let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", SOCKS_PORT)).await.unwrap();
+            sock.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+            let mut greeting = [0u8; 2];
+            sock.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [0x05, 0x00], "socks must accept no-auth");
+
+            let ip = match echo_addr.ip() {
+                std::net::IpAddr::V4(v4) => v4.octets(),
+                other => panic!("test assumes v4 echo target, got {other:?}"),
+            };
+            let mut request = vec![0x05, 0x01, 0x00, 0x01];
+            request.extend_from_slice(&ip);
+            request.extend_from_slice(&echo_addr.port().to_be_bytes());
+            sock.write_all(&request).await.unwrap();
+            let mut reply = [0u8; 10]; // VER REP RSV ATYP + IPv4 + port
+            sock.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply[1], 0x00, "socks CONNECT must succeed: {reply:?}");
+
+            // payload 回环往返：socks-in → loopback-out（回注）→ freedom-out → echo。
+            let payload = b"loopback-reinjection-round-trip";
+            sock.write_all(payload).await.unwrap();
+            let mut echoed = vec![0u8; payload.len()];
+            tokio::time::timeout(std::time::Duration::from_secs(10), sock.read_exact(&mut echoed))
+                .await
+                .expect("round trip within 10s (timeout = sink not bound or tag lost)")
+                .expect("echo connection must stay open until payload returns");
+            assert_eq!(&echoed, payload, "echo must match byte-for-byte");
+
+            tx.send(()).expect("shutdown trigger receiver alive");
+            let result = tokio::time::timeout(std::time::Duration::from_secs(15), serve.as_mut())
+                .await
+                .expect("graceful shutdown exceeded 15s");
+            assert!(result.is_ok(), "run_framework_until returned Err: {result:?}");
         });
     }
 

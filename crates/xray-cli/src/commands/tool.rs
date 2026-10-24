@@ -13,7 +13,10 @@ use prost::Message as _;
 use xray_proto::xray::{common::serial::TypedMessage, core::Config as ProtoConfig};
 
 use crate::{
-    commands::api_exec::{build_inbound_configs, build_outbound_configs},
+    commands::{
+        api_exec::{build_inbound_configs, build_outbound_configs},
+        remote_config,
+    },
     error::CliError,
 };
 
@@ -313,9 +316,45 @@ fn read_input(spec: &str) -> Result<Vec<u8>, CliError> {
         std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)
             .map_err(|e| CliError::InvalidArgument(format!("read stdin: {e}")))?;
         Ok(buf)
+    } else if remote_config::is_remote_source(spec) {
+        // Go json.go:49：输入经 confloader.LoadConfig——URL 原生支持。
+        remote_config::fetch_http_content(spec)
     } else {
         std::fs::read(spec).map_err(|e| CliError::InvalidArgument(format!("read {spec}: {e}")))
     }
+}
+
+/// 装载 `convert pb` 输入并合并为 `Config`。对齐 Go protobuf.go:48
+/// `core.LoadConfig("auto", unnamedArgs)`：每个输入（文件/`stdin:`/URL）经
+/// confloader 语义装载，`auto` 按扩展名定格式（`stdin:` 固定 json，Go
+/// core/config.go:131-134），逐个 override 合并。
+fn load_convert_inputs(specs: &[String]) -> Result<xray_conf::Config, CliError> {
+    let mut merged: Option<xray_conf::Config> = None;
+    for spec in specs {
+        tracing::info!(target: "xray_conf", "Reading config: {spec}");
+        let config = if spec == "stdin:" {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)
+                .map_err(|e| CliError::InvalidArgument(format!("read stdin: {e}")))?;
+            xray_conf::load_reader(xray_conf::Format::Json, &buf[..])
+                .map_err(|e| CliError::ConfigLoadFailed(format!("failed to load config: {e}")))?
+        } else if remote_config::is_remote_source(spec) {
+            let bytes = remote_config::fetch_http_content(spec)?;
+            let format = remote_config::spec_format(spec).ok_or_else(|| {
+                CliError::ConfigLoadFailed(format!("Failed to get format of {spec}"))
+            })?;
+            xray_conf::load_reader(format, &bytes[..])
+                .map_err(|e| CliError::ConfigLoadFailed(format!("failed to load config: {e}")))?
+        } else {
+            xray_conf::load_file(std::path::Path::new(spec))
+                .map_err(|e| CliError::ConfigLoadFailed(format!("failed to load config: {e}")))?
+        };
+        match &mut merged {
+            None => merged = Some(config),
+            Some(m) => m.override_with(config, spec),
+        }
+    }
+    merged.ok_or_else(|| CliError::InvalidArgument("invalid config list length: 0".into()))
 }
 
 /// `convert pb` 执行（Go protobuf.go:43-106）。
@@ -339,8 +378,8 @@ fn execute_convert_pb(args: &ConvertPbArgs) -> Result<(), CliError> {
         )));
     }
 
-    let paths: Vec<std::path::PathBuf> = args.inputs.iter().map(std::path::PathBuf::from).collect();
-    let merged = xray_conf::merge_config_from_files(&paths)
+    let merged = load_convert_inputs(&args.inputs)?
+        .to_json_string()
         .map_err(|e| CliError::ConfigLoadFailed(format!("failed to load config: {e}")))?;
 
     if args.debug {
@@ -1321,5 +1360,45 @@ mod convert_tests {
         };
         let err = execute_convert_pb(&args).unwrap_err();
         assert!(err.to_string().contains("-outpbfile followed by a possible original config."));
+    }
+
+    /// Go 对照：convert json 输入支持 URL（json.go:49 `confloader.LoadConfig`）。
+    #[test]
+    fn convert_json_via_http_url() {
+        let body = br#"{"type":"xray.proxy.shadowsocks.Account","value":"CgMxMTEQBg=="}"#;
+        let len = body.len().to_string();
+        let addr = remote_config::test_support::spawn(vec![remote_config::test_support::response(
+            "HTTP/1.1 200 OK",
+            &[("Content-Length", len.as_str())],
+            body,
+        )]);
+        let args = ConvertJsonArgs { inject_type: true, input: format!("http://{addr}/tm.json") };
+        let out = convert_json_output(&args).unwrap();
+        assert!(out.contains("CgMxMTEQBg=="), "got: {out}");
+    }
+
+    /// Go 对照：convert pb 输入支持 URL（protobuf.go:48 `core.LoadConfig("auto",…)`）。
+    #[test]
+    fn convert_pb_via_http_url() {
+        let body = br#"{"log":{},"inbounds":[],"outbounds":[]}"#;
+        let len = body.len().to_string();
+        let addr = remote_config::test_support::spawn(vec![remote_config::test_support::response(
+            "HTTP/1.1 200 OK",
+            &[("Content-Length", len.as_str())],
+            body,
+        )]);
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("from_url.pb");
+        let args = ConvertPbArgs {
+            out: Some(out_path.to_str().unwrap().to_string()),
+            debug: false,
+            inject_type: false,
+            inputs: vec![format!("http://{addr}/config.json")],
+        };
+        execute_convert_pb(&args).unwrap();
+        let bytes = std::fs::read(&out_path).unwrap();
+        let decoded = ProtoConfig::decode(bytes.as_slice()).unwrap();
+        // log/dispatcher/proxyman In/Out 恒在（json_config_to_proto_config 容器层）。
+        assert!(decoded.app.len() >= 4, "app len: {}", decoded.app.len());
     }
 }

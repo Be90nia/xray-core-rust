@@ -190,7 +190,10 @@ pub fn start_from_built(
 pub async fn start_full(
     built: &xray_conf::BuiltConfig,
 ) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
-    start_full_dispatched(built, None, None).await
+    // 生产路径自持 loopback sink（register_outbounds 内已喂给 loopback handler），
+    // 调用方无需取用。
+    let (instance, ohm, handles, _loopback_sink) = start_full_dispatched(built, None, None).await?;
+    Ok((instance, ohm, handles))
 }
 
 /// 带路由的完整启动路径：Instance + SimpleOhm + outbounds + router + inbounds。
@@ -202,7 +205,9 @@ pub async fn start_full_with_router(
     built: &xray_conf::BuiltConfig,
     router: Arc<dyn DispatchRouter>,
 ) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
-    start_full_dispatched(built, Some(router), None).await
+    let (instance, ohm, handles, _loopback_sink) =
+        start_full_dispatched(built, Some(router), None).await?;
+    Ok((instance, ohm, handles))
 }
 
 /// feature `framework-assembly` 注入点（B5 step4）：生产装配序列**完整复用**
@@ -212,12 +217,24 @@ pub async fn start_full_with_router(
 /// 配置派生）灌入：首个 = default（对齐 Go proxyman/outbound:109-111，与
 /// register_outbounds 同序语义），逐个 `add`（镜像 S4 影子选择面）。
 ///
+/// 第四个返回值 = loopback 出站回注 sink（票 rdcc）：handler 由调用方**先于**本
+/// 函数构造，而 sink 依赖本函数内才就绪的 dispatcher，故调用方以 late-bind 缝
+/// （如 `OnceLock` 占位 sink）接收并回填。
+///
 /// default 构建下本函数不存在（cfg 门控），生产行为零变化；禁第二套 dispatcher。
 #[cfg(feature = "framework-assembly")]
 pub async fn start_full_with_outbound_handlers(
     built: &xray_conf::BuiltConfig,
     handlers: Vec<Arc<dyn xray_app_dispatcher::DispatchHandler>>,
-) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
+) -> Result<
+    (
+        Arc<Instance>,
+        Arc<SimpleOhm>,
+        Vec<tokio::task::JoinHandle<()>>,
+        Arc<dyn xray_proxy_loopback::LoopbackSink>,
+    ),
+    CoreFunctionError,
+> {
     start_full_dispatched(built, None, Some(handlers)).await
 }
 
@@ -238,7 +255,17 @@ async fn start_full_dispatched(
     // B5 framework 注入（仅 feature 路径产 Some）：出站 handler 由调用方灌入，
     // 跳过 register_outbounds 生产构建；None = 生产路径，行为不变。
     external_outbounds: Option<Vec<Arc<dyn xray_app_dispatcher::DispatchHandler>>>,
-) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
+) -> Result<
+    (
+        Arc<Instance>,
+        Arc<SimpleOhm>,
+        Vec<tokio::task::JoinHandle<()>>,
+        // loopback 出站回注 sink（票 rdcc）：dispatcher 就绪处构造，生产臂喂
+        // register_outbounds，framework 注入臂交调用方 late-bind。
+        Arc<dyn xray_proxy_loopback::LoopbackSink>,
+    ),
+    CoreFunctionError,
+> {
     install_secret_masking(built);
     register_all_features();
     register_all_transports();
@@ -385,17 +412,18 @@ async fn start_full_dispatched(
     // loopback 的连接在 handler 侧静默 drop（黑洞）。
     // 出站源二选一（B5 framework 注入点）：生产 = register_outbounds（权威构建）；
     // 外部 = 桥 handler 灌入，同序语义（首个成功者 = default，Go
-    // proxyman/outbound:109-111）+ add 镜像影子表（S4 唯一选择路径）。
+    // proxyman/outbound:109-111）+ add 镜像影子表（S4 唯一选择路径）。两条臂共用
+    // 同一 sink 实例；framework 臂把它随返回值交给调用方 late-bind。
+    let loopback_sink: Arc<dyn xray_proxy_loopback::LoopbackSink> =
+        Arc::new(crate::outbound::DispatcherLoopbackSink::new(Arc::clone(&dispatcher)));
     match external_outbounds {
         None => {
-            let loopback_sink: Arc<dyn xray_proxy_loopback::LoopbackSink> =
-                Arc::new(crate::outbound::DispatcherLoopbackSink::new(Arc::clone(&dispatcher)));
             // DNS service 同步注入出站（bd bqm）：targetStrategy 域名解析经此生效
             // （对应 Go 全局 internet.dnsClient 由 app/dns 初始化）。
             register_outbounds(
                 built,
                 &ohm,
-                Some(loopback_sink),
+                Some(Arc::clone(&loopback_sink)),
                 instance.get_feature::<xray_app_dns::DnsService>(),
                 policy_manager,
             )?;
@@ -494,7 +522,7 @@ async fn start_full_dispatched(
         routed = dns_router.is_some(),
         "Xray instance started via DefaultDispatcher (sniffing+stats+routing+accesslog)"
     );
-    Ok((Arc::new(instance), ohm, handles))
+    Ok((Arc::new(instance), ohm, handles, loopback_sink))
 }
 
 // ========== gRPC HandlerService 生产实现（bd jezb）==========

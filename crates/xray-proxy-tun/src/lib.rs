@@ -34,6 +34,7 @@
 //! TCP/UDP/ICMP 包处理 + UDP fullcone NAT。
 
 pub mod config;
+pub mod dns_verify;
 pub mod error;
 pub mod inbound;
 pub mod netstack;
@@ -55,6 +56,7 @@ pub mod device;
 // 顶层 re-export。
 pub use config::{Stack, StackOptions, Tun, score};
 pub use device::TunDevice;
+pub use dns_verify::{DnsRoutingProbe, register_dns_probe, verify_dns_routing};
 pub use error::{Result, TunError};
 pub use inbound::TunInboundHandler;
 pub use netstack::{TcpAcceptEvent, TunNetStack, UdpRecvEvent};

@@ -313,8 +313,9 @@ impl InboundHandler for TunInboundHandler {
         sysroute::apply_adapter_props(&cfg.name);
 
         // A3/A4：系统路由表 + 系统 DNS 接管——默认关闭（配置显式开启才动作）。
-        // 接管失败宁可无 TUN（对齐 Go handler.go:196-205：失败即关设备拒启动）。
-        match sysroute::prepare(cfg) {
+        // 接管前跑防环路验证（dns_verify），接管失败宁可无 TUN（对齐 Go
+        // handler.go:196-205：失败即关设备拒启动）。
+        match sysroute::prepare(cfg, &self.tag) {
             Ok(applied) => *self.applied_sysroute.lock() = applied,
             Err(e) => {
                 self.rollback_start(&device);

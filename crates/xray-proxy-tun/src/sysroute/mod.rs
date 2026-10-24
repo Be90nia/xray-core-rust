@@ -24,9 +24,11 @@
 //!   0，tun_windows.go:120-150）。失败宁可无 TUN（handler.go:196-205）。
 //! - 出口接口：`findDefaultInterface` 排除回环/未 Up/TUN 自身/索引 0 （tun_linux.go:545-576）。
 //! - 系统 DNS：`autoSystemDnsToGateway`（默认 false，仅 Linux 语义）→ 源=gateway
-//!   首地址、指向=gateway 后继（tun_linux.go:47-64）→ `resolvectl dns/domain/default-route`，失败
-//!   `revert`（tun_linux.go:105-160）。 Windows 无接管 flag 语义，`dns` 配置写 TUN 适配器自身
-//!   （tun_windows.go:157 SetDNS；Close FlushDNS 只清 TUN，不动物理网卡）。
+//!   首地址、指向=gateway 后继（tun_linux.go:47-64）→ **应用前防环路验证**
+//!   （`dns_verify::verify_dns_routing`，tun_system_dns.go:29-96；验证不过拒启）→ `resolvectl
+//!   dns/domain/default-route`，失败 `revert`（tun_linux.go:105-160）。 Windows 无接管 flag
+//!   语义，`dns` 配置写 TUN 适配器自身 （tun_windows.go:157 SetDNS；Close FlushDNS 只清
+//!   TUN，不动物理网卡；无验证语义， 显式记日志跳过）。
 
 pub mod executor;
 
@@ -44,6 +46,7 @@ use xray_transport::dns_skip::skip_dns_servers;
 
 use crate::{
     config::{StackOptions, parse_ip_cidr},
+    dns_verify::{DnsRoutingProbe, verify_dns_routing},
     error::{Result, TunError},
 };
 
@@ -416,17 +419,60 @@ pub(crate) fn v4_mask(prefix: u8) -> Ipv4Addr {
     Ipv4Addr::from(bits)
 }
 
-/// 启动侧接线：按配置门控 → 枚举真实接口 → 生成计划 → **真实执行**。
+/// DNS 接管计划的防环路验证门（Go `ConfigureSystemDNS` 内 verifyDNSRouting 调用点，
+/// tun_linux.go:131 / tun_freebsd.go:360；本函数为判定分派，验证语义在
+/// [`crate::dns_verify`]）。
+///
+/// - `LinuxTakeover`（指向 = TUN 内 gateway 后继）：全量验证；探针未注册（core 接线未落）=
+///   无法证明安全 → fail-closed 拒启，不静默放行（Go 对 feature 缺失同款拒绝精神）。
+/// - `WindowsAdapterServers`：指向真实上游、无「接管进 TUN」语义（Go build tag 不含
+///   windows，本就无此验证；环路防护在 dial 点 `dns_skip`）→ 显式记日志跳过。
+fn verify_dns_plan(
+    inbound_tag: &str,
+    plan: &DnsPlan,
+    probe: Option<&dyn DnsRoutingProbe>,
+) -> Result<()> {
+    match &plan.target {
+        DnsTarget::LinuxTakeover { source, dns } => {
+            let Some(probe) = probe else {
+                return Err(TunError::InvalidConfig(format!(
+                    "cannot verify DNS routing for {dns}:53: no DNS routing probe registered \
+                     (core wiring pending); refusing system DNS takeover to avoid a resolution loop"
+                )));
+            };
+            verify_dns_routing(probe, inbound_tag, &source.to_string(), &dns.to_string())
+                .map_err(|e| TunError::InvalidConfig(format!("no DNS path at {dns}:53: {e}")))
+        },
+        DnsTarget::WindowsAdapterServers { servers } => {
+            tracing::info!(
+                target: "xray_proxy_tun", servers = ?servers,
+                "tun system dns: adapter servers set; loop verification not applicable on \
+                 this platform (no takeover-into-TUN semantics; loop prevention via dial-point dns skip)"
+            );
+            Ok(())
+        },
+    }
+}
+
+/// 启动侧接线：按配置门控 → 枚举真实接口 → 生成计划 → 防环路验证 → **真实执行**。
 ///
 /// 默认关闭：直接 `Ok(None)`，**不枚举接口、不生成任何计划、不执行任何命令**。
-/// 执行失败（任一命令 spawn 失败/非零退出，或平台无执行器）→ 错误上抛 →
-/// 调用方关设备拒启动（对齐 Go handler.go:196-205 "宁可无 TUN"）。
-pub(crate) fn prepare(options: &StackOptions) -> Result<Option<AppliedSystemChanges>> {
+/// 验证/执行失败（DNS 环路风险、任一命令 spawn 失败/非零退出，或平台无执行器）→
+/// 错误上抛 → 调用方关设备拒启动（对齐 Go handler.go:196-205 "宁可无 TUN"）。
+pub(crate) fn prepare(
+    options: &StackOptions,
+    inbound_tag: &str,
+) -> Result<Option<AppliedSystemChanges>> {
     let Some(applied) =
         plan_changes(Platform::current(), &xray_common::net::interface::interfaces()?, options)?
     else {
         return Ok(None);
     };
+    // 防环路验证先于任何系统变更落盘（Go ConfigureSystemDNS：verify → resolvectl）。
+    if let Some(plan) = &applied.dns {
+        let probe = crate::dns_verify::dns_probe();
+        verify_dns_plan(inbound_tag, plan, probe.as_deref())?;
+    }
     let (routes, dns) = default_executors();
     apply_changes_exec(&applied, routes.as_deref(), dns.as_deref())?;
     register_dns_skip(&applied);
@@ -1235,5 +1281,69 @@ mod tests {
         let len = xray_transport::system_dialer::registered_controllers().len();
         ensure_outbound_controller_registered();
         assert_eq!(xray_transport::system_dialer::registered_controllers().len(), len);
+    }
+
+    // ===== bd uwt1：DNS 接管防环路验证门（verify_dns_plan）=====
+
+    /// 恒报环路风险的假探针（验证门分派测试用；判定语义本体在 dns_verify 测试面）。
+    struct RefusingProbe;
+
+    impl crate::dns_verify::DnsRoutingProbe for RefusingProbe {
+        fn system_resolver_use(&self) -> Option<crate::dns_verify::SystemResolverUse> {
+            Some(crate::dns_verify::SystemResolverUse::DnsFeature)
+        }
+
+        fn route_for_dns(&self, _: &str, _: IpAddr, _: IpAddr) -> crate::dns_verify::RouteProbe {
+            crate::dns_verify::RouteProbe::NoRoute
+        }
+
+        fn outbound_dns(&self, _: &str) -> crate::dns_verify::DnsCapability {
+            crate::dns_verify::DnsCapability::NotDns
+        }
+    }
+
+    /// Linux 接管计划标准形：gateway `10.0.0.1/30` → 接管地址 `10.0.0.2`（自身子树）。
+    fn linux_takeover_plan() -> DnsPlan {
+        DnsPlan {
+            platform: Platform::Linux,
+            interface: "xray0".into(),
+            target: DnsTarget::LinuxTakeover {
+                source: "10.0.0.1".parse().unwrap(),
+                dns: "10.0.0.2".parse().unwrap(),
+            },
+        }
+    }
+
+    /// 探针未注册（core 接线未落）= 无法证明安全 → fail-closed 拒启，
+    /// 错误明确说明接线缺口，不静默放行。
+    #[test]
+    fn takeover_without_probe_refuses_fail_closed() {
+        let err = verify_dns_plan("tun-in", &linux_takeover_plan(), None)
+            .expect_err("must refuse without probe");
+        let msg = err.to_string();
+        assert!(msg.contains("no DNS routing probe registered"), "{msg}");
+        assert!(msg.contains("10.0.0.2:53"), "{msg}");
+    }
+
+    /// 验证不过（探针判定环路风险）→ 拒启，错误含 Go 包装文案 + 根因。
+    #[test]
+    fn takeover_with_failing_probe_refuses_wrapped() {
+        let err = verify_dns_plan("tun-in", &linux_takeover_plan(), Some(&RefusingProbe))
+            .expect_err("must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("no DNS path at 10.0.0.2:53"), "{msg}");
+        assert!(msg.contains("system resolver"), "{msg}");
+    }
+
+    /// Windows 适配器 DNS：无接管进 TUN 语义（Go build tag 不含 windows）→
+    /// 显式跳过验证（info 日志）不拒启。
+    #[test]
+    fn windows_adapter_plan_skips_verification() {
+        let plan = DnsPlan {
+            platform: Platform::Windows,
+            interface: "xray0".into(),
+            target: DnsTarget::WindowsAdapterServers { servers: vec!["1.1.1.1".parse().unwrap()] },
+        };
+        verify_dns_plan("tun-in", &plan, None).expect("windows plan skips verification");
     }
 }
