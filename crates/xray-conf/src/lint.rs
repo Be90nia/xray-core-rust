@@ -107,6 +107,14 @@ pub fn registered_stages() -> Vec<&'static str> {
     REGISTRY.lock().keys().copied().collect()
 }
 
+/// 注册类测试的作用域守卫（`#[cfg(test)]`）：拿 [`tests::TEST_LOCK`] 并
+/// [`clear_stages`]；Drop 时再清一次并释放锁——同 crate 测试模块（如
+/// `secrets::tests`）可复用，确保进程级 registry 不泄漏测试阶段。
+#[cfg(test)]
+pub(crate) fn lint_test_guard() -> impl Drop {
+    lint_tests::RegistryGuard::new()
+}
+
 /// 顺序执行所有已注册阶段。对应 Go `PostProcessConfigureFile`：
 /// 任一阶段返回 `Err` 即中止并包装为 `LintError::Stage { stage, message }`。
 ///
@@ -188,18 +196,38 @@ mod lint_tests {
         }
     }
 
+    /// 注册类测试的作用域守卫：拿 `TEST_LOCK` 并清空注册表；Drop 时再清一次
+    /// 并释放锁——无论断言成功/失败，注册表都被复位，不会向进程级 registry
+    /// 泄漏 Boom 等测试阶段（此前泄漏会令后续任何 `Config::build()` 在
+    /// `post_process` 处炸出 "boom: kaboom"）。
+    pub(crate) struct RegistryGuard {
+        _lock: parking_lot::MutexGuard<'static, ()>,
+    }
+
+    impl RegistryGuard {
+        pub(crate) fn new() -> Self {
+            let lock = TEST_LOCK.lock();
+            super::clear_stages();
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for RegistryGuard {
+        fn drop(&mut self) {
+            super::clear_stages();
+        }
+    }
+
     #[test]
     fn post_process_with_no_stages_is_ok() {
-        let _g = TEST_LOCK.lock();
-        super::clear_stages();
+        let _g = RegistryGuard::new();
         let mut cfg = Config::default();
         super::post_process(&mut cfg).unwrap();
     }
 
     #[test]
     fn post_process_runs_all_stages_in_order() {
-        let _g = TEST_LOCK.lock();
-        super::clear_stages();
+        let _g = RegistryGuard::new();
         let hits_a = std::sync::Arc::new(parking_lot::Mutex::new(0));
         let hits_b = std::sync::Arc::new(parking_lot::Mutex::new(0));
         super::register_stage(Arc::new(CounterA { hits: hits_a.clone() }));
@@ -212,8 +240,7 @@ mod lint_tests {
 
     #[test]
     fn post_process_short_circuits_on_error() {
-        let _g = TEST_LOCK.lock();
-        super::clear_stages();
+        let _g = RegistryGuard::new();
         let hits = std::sync::Arc::new(parking_lot::Mutex::new(0));
         super::register_stage(Arc::new(Boom));
         super::register_stage(Arc::new(CounterA { hits: hits.clone() }));
@@ -229,8 +256,7 @@ mod lint_tests {
 
     #[test]
     fn register_overrides_same_name() {
-        let _g = TEST_LOCK.lock();
-        super::clear_stages();
+        let _g = RegistryGuard::new();
         super::register_stage(Arc::new(Boom));
         // 同名覆盖 — Boom (name="boom") → CounterA (name="counter-a")：不同名，
         // 应并存。改为两次注册 Boom 后断言只剩一个。
@@ -244,8 +270,7 @@ mod lint_tests {
         // 与同模块其它 registry 测试同锁——本测试曾漏锁，CI macOS 并行下
         // clear+注册 Boom 与 built.rs 的 cfg.build() 测试竞态（bd 5x41 同族，
         // CI run 35087312070 Workspace lib 步实证）。
-        let _g = TEST_LOCK.lock();
-        super::clear_stages();
+        let _g = RegistryGuard::new();
         // 注册乱序 → 应按字典序返回
         super::register_stage(Arc::new(CounterB {
             hits: std::sync::Arc::new(parking_lot::Mutex::new(0)),
@@ -266,8 +291,7 @@ mod lint_tests {
 
     #[test]
     fn post_process_can_mutate_config() {
-        let _g = TEST_LOCK.lock();
-        super::clear_stages();
+        let _g = RegistryGuard::new();
         // 验证 LintStage::process 拿到的确实是 &mut Config（FakeDNS 阶段会写）。
         struct WriteFake;
         impl LintStage for WriteFake {

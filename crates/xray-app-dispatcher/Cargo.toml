@@ -27,10 +27,7 @@ xray-app-stats = { path = "../xray-app-stats" }
 xray-frame = { path = "../xray-frame" }
 
 [features]
-# P3-1 S0/S2 对照基线开关：default 关（生产路径零新增代码）；开 = dispatch_link
-# 逐请求记录 (dest, tag, chosen_handler_tag) + 旧臂选择半边单独可调 +
-# 双写对照计数面。S3 切查表 / S4 删臂另单。
+# P3-1 S0/S2 对照基线开关：default 关。S4 后本 flag 只门「对照/记录面」
+# （record 环 + in-vivo 对照器 + 注入自检）；出站选择面（影子查表）无条件编译
+# ——S4 删旧臂后它是唯一选择路径。
 dispatcher-dual-write = []
-# B4 S3 回退开关（默认关）：与 dispatcher-dual-write 同开时，选择面回退旧臂
-# `get_handler`（不查影子表）；单独开 = 无操作。仅影响选择面解析，不动记录/对照。
-legacy-arm-select = []

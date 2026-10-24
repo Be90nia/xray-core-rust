@@ -20,19 +20,19 @@ use std::{io, net::SocketAddr, sync::Arc};
 
 use xray_common::net::destination::Destination;
 use xray_transport::{
-    accept_policy::{backoff_if_resource, supervise_accept_loop, AcceptErrorKind},
+    accept_policy::{AcceptErrorKind, backoff_if_resource, supervise_accept_loop},
     connection::Connection,
-    dialer::{register_transport_dialer, StreamSettings, TransportDialFn},
+    dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
     listener_registry::{
-        register_transport_listener, ConnHandler, TransportListenFn, TransportListener,
+        ConnHandler, TransportListenFn, TransportListener, register_transport_listener,
     },
 };
 
 use crate::{
-    client::{dial_with_params, DelayDialConn, DialFactory, DialParams},
+    client::{DelayDialConn, DialFactory, DialParams, dial_with_params},
     config::Config,
     error::WsError,
-    pool::{global_pool, PoolKey, WsConnectionPool},
+    pool::{PoolKey, WsConnectionPool, global_pool},
 };
 
 /// 注册 WebSocket transport dialer。

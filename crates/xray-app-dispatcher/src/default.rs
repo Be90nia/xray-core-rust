@@ -435,30 +435,16 @@ pub trait OutboundHandlerManager: Send + Sync + Debug {
 
     /// 默认 handler。
     fn get_default_handler(&self) -> Option<Arc<dyn DispatchHandler>>;
-}
 
-/// S3 选择面：按 tag 解析 handler。
-///
-/// `dispatcher-dual-write` 开且未开回退开关 feature `legacy-arm-select` 时走
-/// 影子查表（S3 生产形态）；其余组合走旧臂 `get_handler`。未命中 = `None`，
-/// 由调用点按旧臂未命中语义处置（禁回落旧登记表、禁落默认——Go
-/// `default.go:469-470` DO NOT CHANGE）。
-#[cfg(all(feature = "dispatcher-dual-write", not(feature = "legacy-arm-select")))]
-fn select_by_tag_face(
-    ohm: &dyn OutboundHandlerManager,
-    tag: &str,
-) -> Option<Arc<dyn DispatchHandler>> {
-    let _ = ohm; // S3 态不读旧登记表；参数保留以维持两态调用点同形
-    crate::default::dual_write::shadow_get_handler(tag)
-}
-
-/// S3 选择面（回退态）：`legacy-arm-select` 开或 flag 关时走旧臂 `get_handler`。
-#[cfg(not(all(feature = "dispatcher-dual-write", not(feature = "legacy-arm-select"))))]
-fn select_by_tag_face(
-    ohm: &dyn OutboundHandlerManager,
-    tag: &str,
-) -> Option<Arc<dyn DispatchHandler>> {
-    ohm.get_handler(tag)
+    /// S4 出站选择面：按 tag 解析 handler（影子查表）。
+    ///
+    /// 默认实现等价 [`Self::get_handler`]；`SimpleOhm` 覆写为**实例内**影子表
+    /// （与 `tagged` 同源于 `add`/`remove`）。未命中 = `None`，由调用点按
+    /// fail-visible 语义处置（禁落默认——Go `default.go:469-470` DO NOT CHANGE）。
+    /// 实例级归属是硬约束：进程级全局表会让多 Instance/多测试同名 tag 互踩。
+    fn select_handler(&self, tag: &str) -> Option<Arc<dyn DispatchHandler>> {
+        self.get_handler(tag)
+    }
 }
 
 /// Boxed future 别名（手写风格，不依赖 `async_trait`）
@@ -916,6 +902,11 @@ pub struct DefaultDispatcher {
     /// 后台 dispatch task 收口（bd mvsc）：dispatch_link spawn 的处理 task
     /// 全部入 set，宿主 drop 时 JoinSet abort 在途 task。
     background_tasks: BackgroundTasks,
+    /// B4 对照自检注入（**实例级**，行为修饰符故随实例；计数器/记录环为聚合
+    /// 观测量保持进程级）：`DW_INJECT_DIFF` 环境变量在 `new` 时读入作初值，
+    /// 测试经 [`Self::set_dual_write_inject`] 覆写。
+    #[cfg(feature = "dispatcher-dual-write")]
+    dual_write_inject: std::sync::Arc<parking_lot::Mutex<Option<String>>>,
 }
 
 impl Debug for DefaultDispatcher {
@@ -951,7 +942,20 @@ impl DefaultDispatcher {
             udp443_policies: std::sync::Arc::new(HashMap::new()),
             access_sink: None,
             background_tasks: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
+            #[cfg(feature = "dispatcher-dual-write")]
+            dual_write_inject: Arc::new(parking_lot::Mutex::new(
+                std::env::var("DW_INJECT_DIFF").ok().and_then(dual_write::normalize_inject_tag),
+            )),
         }
+    }
+
+    /// B4 对照自检注入（实例级）：`Some(tag)` 对该请求 tag 的对照侧故意给错值，
+    /// `None` 关闭。与 `DW_INJECT_DIFF` 环境变量同语法（前缀 `half:`/`lookup:`
+    /// 剥掉后同义）。
+    #[cfg(feature = "dispatcher-dual-write")]
+    pub fn set_dual_write_inject(&self, tag: Option<&str>) {
+        *self.dual_write_inject.lock() =
+            tag.map(str::to_owned).and_then(dual_write::normalize_inject_tag);
     }
 
     /// 初始化。对应 Go `(*DefaultDispatcher).Init(config, om, router, pm, sm)`。
@@ -1186,7 +1190,7 @@ impl DefaultDispatcher {
         // （Go default.go:449-454 tag 不存在直接丢弃链路，DO NOT CHANGE 注释；
         // Rust 侧提升为同步错误，语义等价且调用方可提前感知）
         if !forced_tag.as_deref().unwrap_or_default().is_empty()
-            && select_by_tag_face(&**ohm, forced_tag.as_deref().unwrap_or_default()).is_none()
+            && ohm.select_handler(forced_tag.as_deref().unwrap_or_default()).is_none()
         {
             return Err(DispatcherError::HandlerNotFound(forced_tag.unwrap_or_default()));
         }
@@ -1220,6 +1224,9 @@ impl DefaultDispatcher {
         let udp443_policies = self.udp443_policies.clone(); // Arc 浅拷贝（bd xag3①）
         let ohm = Arc::clone(ohm);
         let access_sink = self.access_sink.clone();
+        // B4：实例级对照注入（flag-on 才存在；行为修饰符随实例）。
+        #[cfg(feature = "dispatcher-dual-write")]
+        let dw_inject = Arc::clone(&self.dual_write_inject);
         // per-user policy 层级（Go d.policy.ForLevel(user.Level)，default.go:162）：
         // access.level 缺省 0，无用户信息时与既有行为一致。
         let user_level = access.as_ref().map_or(0, |a| a.level);
@@ -1264,7 +1271,7 @@ impl DefaultDispatcher {
                 {
                     dw_tag = Some(tag.clone());
                 }
-                match select_by_tag_face(&*ohm, &tag) {
+                match ohm.select_handler(&tag) {
                     Some(h) => {
                         tracing::debug!(tag = %tag, "taking platform initialized detour for [%final_dest]");
                         (Some(h), false)
@@ -1278,6 +1285,7 @@ impl DefaultDispatcher {
                             &final_dest.to_string(),
                             dw_tag.clone(),
                             None,
+                            dw_inject.lock().as_deref(),
                         );
                         outbound_writer.shutdown();
                         // outbound_reader 随 drop 关闭上行
@@ -1331,7 +1339,7 @@ impl DefaultDispatcher {
                         {
                             dw_tag = Some(route.outbound_tag.clone());
                         }
-                        match select_by_tag_face(&*ohm, &route.outbound_tag) {
+                        match ohm.select_handler(&route.outbound_tag) {
                             Some(h) => (Some(h), true),
                             None => {
                                 // Go default.go:469-470 DO NOT CHANGE：路由指定的 outboundTag
@@ -1343,6 +1351,7 @@ impl DefaultDispatcher {
                                     &final_dest.to_string(),
                                     dw_tag.clone(),
                                     None,
+                                    dw_inject.lock().as_deref(),
                                 );
                                 outbound_writer.shutdown();
                                 // outbound_reader 随 drop 关闭上行
@@ -1364,6 +1373,7 @@ impl DefaultDispatcher {
                 &final_dest.to_string(),
                 dw_tag.clone(),
                 handler.as_ref().map(|h| h.tag().to_string()),
+                dw_inject.lock().as_deref(),
             );
 
             let Some(handler) = handler else {
@@ -2015,6 +2025,11 @@ impl DialBridge {
 pub struct SimpleOhm {
     default: parking_lot::RwLock<Option<Arc<dyn DispatchHandler>>>,
     tagged: parking_lot::RwLock<std::collections::HashMap<String, Arc<dyn DispatchHandler>>>,
+    /// S4 出站选择面（**实例级**影子表）：与 `tagged` 同源于 `add`/`remove`，
+    /// 经 [`OutboundHandlerManager::select_handler`] 供 dispatch_link 解析。
+    /// 进程级全局表会让多 Instance/多测试同名 tag 互踩（实测
+    /// integration_sniffing 成对互串），故归属实例。
+    shadow: parking_lot::RwLock<std::collections::HashMap<String, Arc<dyn DispatchHandler>>>,
 }
 
 impl SimpleOhm {
@@ -2023,6 +2038,7 @@ impl SimpleOhm {
         Self {
             default: parking_lot::RwLock::new(None),
             tagged: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            shadow: parking_lot::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -2030,7 +2046,7 @@ impl SimpleOhm {
         *self.default.write() = Some(handler);
     }
 
-    /// 浅快照：共享全部 tagged/default handler（Arc clone），后续对快照的
+    /// 浅快照：共享全部 tagged/default/shadow handler（Arc clone），后续对快照的
     /// `set_default` 不影响原 ohm。
     ///
     /// 生产接线（`xray-core` 方案 B）用：每个 inbound 一份快照，default 替换为
@@ -2042,6 +2058,7 @@ impl SimpleOhm {
         Self {
             default: parking_lot::RwLock::new(self.default.read().clone()),
             tagged: parking_lot::RwLock::new(self.tagged.read().clone()),
+            shadow: parking_lot::RwLock::new(self.shadow.read().clone()),
         }
     }
 
@@ -2049,9 +2066,10 @@ impl SimpleOhm {
     /// 显式调用方仅 xray-app-reverse bridge 的备用注册路径——保留 API 完整性。
     #[allow(dead_code)] // reverse bridge 备用注册路径生产可达性待接线，API 对位 Go AddHandler
     pub fn add(&self, tag: &str, handler: Arc<dyn DispatchHandler>) {
-        // B4 phase1-2：影子查表与生产注册同源派生（同一次 add 调用），无第二套清单。
-        #[cfg(feature = "dispatcher-dual-write")]
-        dual_write::shadow_insert(tag, Arc::clone(&handler));
+        // S3/S4：影子选择面与生产注册同源派生（同一次 add 调用），无第二套清单。
+        // 顺序契约：先影子后旧表——影子是生产选择面，先入可保证「生产可见性」
+        // 不晚于旧表（错序会出现「旧表有、生产拒」的瞬时回归）。
+        self.shadow.write().insert(tag.to_string(), Arc::clone(&handler));
         self.tagged.write().insert(tag.to_string(), handler);
     }
 
@@ -2062,8 +2080,7 @@ impl SimpleOhm {
         let Some(_old) = self.tagged.write().remove(tag) else {
             return false;
         };
-        #[cfg(feature = "dispatcher-dual-write")]
-        dual_write::shadow_remove(tag);
+        self.shadow.write().remove(tag);
         let default_matches = self.default.read().as_ref().is_some_and(|h| h.tag() == tag);
         if default_matches {
             *self.default.write() = None;
@@ -2074,6 +2091,19 @@ impl SimpleOhm {
     /// 列出全部 tagged handler 的 tag（动态 AddOutbound/ListOutbounds 用）。
     pub fn list_tags(&self) -> Vec<String> {
         self.tagged.read().keys().cloned().collect()
+    }
+
+    /// 测试/巡检面：**只**写实例影子表（绕过 `add` 的旧表同步）——
+    /// 用于证明选择面读影子且不回落旧表（见 select_face 无兜底测试）。
+    #[cfg(test)]
+    pub(crate) fn shadow_insert_only(&self, tag: &str, handler: Arc<dyn DispatchHandler>) {
+        self.shadow.write().insert(tag.to_string(), handler);
+    }
+
+    /// 测试/巡检面：**只**删实例影子表（旧表保持不动），用途同上。
+    #[cfg(test)]
+    pub(crate) fn shadow_remove_only(&self, tag: &str) -> bool {
+        self.shadow.write().remove(tag).is_some()
     }
 }
 
@@ -2097,6 +2127,10 @@ impl OutboundHandlerManager for SimpleOhm {
     fn get_default_handler(&self) -> Option<Arc<dyn DispatchHandler>> {
         self.default.read().clone()
     }
+
+    fn select_handler(&self, tag: &str) -> Option<Arc<dyn DispatchHandler>> {
+        self.shadow.read().get(tag).cloned()
+    }
 }
 
 // ═══ P3-1 S0/S2：dispatcher 双写对照面（feature `dispatcher-dual-write` 门控）═══
@@ -2118,15 +2152,17 @@ impl OutboundHandlerManager for SimpleOhm {
 //     其余组合走旧臂 `get_handler`；未命中语义由调用点保持逐字一致（无新增兜底）。
 //     对照器语义随切改为：生产（影子） vs 旧臂重估（`get_handler`），维度名沿用
 //     `arm_vs_lookup`（主判据）。旧臂代码保留不删（S4 才删）。
-// S4 删旧臂不在本单。关 flag = 本模块整体不存在，生产零影响。
+// B4 S4（删旧臂）：`legacy-arm-select` 与旧臂选择路径删除；影子选择面
+//     （`select_face` 模块）无条件编译成为唯一选择路径，镜像灌入 hook 同转无条件。
+//     对照面收缩为单维 `arm_vs_lookup` = 生产（影子） vs 旧登记表读数
+//     （`get_handler`）——两表 hook 同步的漂移监控；`arm_vs_half` 维度随臂退役
+//     （回放面 compare_sample 保留，供 dual_write_parity 回归）。
+// S4 收尾后本模块 = 纯对照/记录面；flag 关 = 无对照记录，选择面照常工作。
 #[cfg(feature = "dispatcher-dual-write")]
 pub mod dual_write {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    };
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{DispatchHandler, OutboundHandlerManager};
+    use super::OutboundHandlerManager;
 
     /// 一次 dispatch 的选择记录（S0 基线样本，契约 `(dest, tag, chosen_handler_tag)`）。
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2135,35 +2171,21 @@ pub mod dual_write {
         pub dest: String,
         /// 请求 tag：forced tag / 路由 outboundTag；`None` = 默认出站路径。
         pub tag: Option<String>,
-        /// 旧臂实际选中的 handler tag；`None` = 未命中（fail-visible 链路被弃）。
+        /// 生产选择面实际选中的 handler tag；`None` = 未命中（fail-visible 链路被弃）。
         pub chosen_handler_tag: Option<String>,
     }
 
+    /// 回放面样本/差异数（`compare_sample`，dual_write_parity 消费）。
     static SAMPLES: AtomicU64 = AtomicU64::new(0);
     static DIFFS: AtomicU64 = AtomicU64::new(0);
-    /// 影子查表维度的样本/差异数（`arm_vs_lookup`；与 `arm_vs_half` 分池，禁混算）。
+    /// S4 后唯一 in-vivo 维度：生产选择（影子查表）vs 旧登记表读数
+    /// （`get_handler`）——两表 hook 同步的**漂移监控**，主判据。
     static LOOKUP_SAMPLES: AtomicU64 = AtomicU64::new(0);
     static LOOKUP_DIFFS: AtomicU64 = AtomicU64::new(0);
     /// 不可对照样本（请求 tag 缺失 = 默认出站分支：默认选择是策略半边、不是查表
-    /// 键，两侧同源无对照意义）。显式计数——否则「SAMPLES=0 且 DIFFS=0」会被误读
+    /// 键，两侧同源无对照意义）。显式计数——否则「样本=0 且差异=0」会被误读
     /// 成「无差异」。
     static SKIPPED: AtomicU64 = AtomicU64::new(0);
-
-    /// 影子查表（B4 phase1-2 旁路登记表）：键 = 出站 tag（`dispatch_link` 选择半边
-    /// 的唯一查询键），值 = 注册路径灌入的 handler。灌入点 = [`super::SimpleOhm`]
-    /// 的 `add`/`remove`——与生产同一次注册调用派生，**无第二套协议清单**。
-    ///
-    /// 键形说明：任务书建议 `(协议名, 网络, 出站 tag)` 三元键——协议/网络是 handler
-    /// 的**属性**，选择臂从不按它们查询（查询键只有 tag）；把它们塞进键需要另养一份
-    /// 协议清单来填值，恰是禁令项。故收敛为 tag 单键。
-    ///
-    /// 为何不用 `xray_frame`：`PluginRegistry` 值型是 `Arc<dyn Plugin>`（强制每个
-    /// handler 背一份 stub Lifecycle/contract，污染插件语义）；`dispatch::lookup` 按
-    /// `TypeId` 键，一型只能承载一个 tag（T2.1 F2），动态 tag 集合不可表达。影子表
-    /// 用选择键本身（tag）做键，S3 换解析面时键形零改动。
-    static SHADOW: std::sync::LazyLock<
-        parking_lot::Mutex<std::collections::HashMap<String, Arc<dyn DispatchHandler>>>,
-    > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
     /// 记录环上限（长跑防无界增长；满后丢最旧——基线采样滑动窗语义）。
     const RECORD_CAP: usize = 10_000;
@@ -2194,31 +2216,8 @@ pub mod dual_write {
         RECORDS.lock().iter().cloned().collect()
     }
 
-    /// 影子表写入（[`super::SimpleOhm`] 的 `add` 调用；生产注册路径的镜像）。
-    /// 同 tag 重复 add = 覆盖（与 SimpleOhm 的 HashMap insert 语义一致）。
-    pub(crate) fn shadow_insert(tag: &str, handler: Arc<dyn DispatchHandler>) {
-        SHADOW.lock().insert(tag.to_string(), handler);
-    }
-
-    /// 影子表移除（[`super::SimpleOhm`] 的 `remove` 调用）。返回 tag 是否存在。
-    pub(crate) fn shadow_remove(tag: &str) -> bool {
-        SHADOW.lock().remove(tag).is_some()
-    }
-
-    /// 影子查表（S3 生产选择面）：取 handler 本体。未命中 → `None`，
-    /// 由调用点按旧臂未命中语义处置（禁回落 `get_handler`，禁落默认）。
-    /// 仅 S3 组合（flag 开、回退关）消费——回退态选择面走旧登记表。
-    #[cfg(all(feature = "dispatcher-dual-write", not(feature = "legacy-arm-select")))]
-    pub(crate) fn shadow_get_handler(tag: &str) -> Option<Arc<dyn DispatchHandler>> {
-        SHADOW.lock().get(tag).cloned()
-    }
-
-    /// 影子表当前 tag 集（测试/巡检面；无序）。
-    pub fn shadow_tags() -> Vec<String> {
-        SHADOW.lock().keys().cloned().collect()
-    }
-
-    /// 旧中央 match 臂的选择半边（数据面零接触，语义逐条对位 dispatch_link 臂）：
+    /// 旧选择臂的**可执行规格**（S4 后生产路径不再调用，仅 dual_write_parity
+    /// 回放面作对照 oracle 消费——语义逐条对位已删的 dispatch_link 臂）：
     /// - forced 非空：`get_handler` → `Chosen` | `Missing`（禁落默认，Go default.go:449-454）；
     /// - forced 空 + route 有：`get_handler(route)` → `Chosen` | `Missing` （Go default.go:469-470
     ///   DO NOT CHANGE）；
@@ -2270,90 +2269,40 @@ pub mod dual_write {
     // 的发行二进制跑真实流量时 SAMPLES/DIFFS 恒 0。本节把对照接进真实 dispatch
     // 路径（`dispatch_link` 各选择出口 → [`record_in_vivo`]）。
 
-    /// 仪器自检注入：对对照侧 face 故意给出**错误**值，用于 red-green 证明差异
-    /// 计数非哑（否则 0 差异不可信）。生产二进制走环境变量 `DW_INJECT_DIFF`，
-    /// 测试走 [`set_inject_diff`]。值形（B4 起分维度）：`half:<tag>` 只注入
-    /// `arm_vs_half` 对照侧（提取半边）；`lookup:<tag>` 只注入 `arm_vs_lookup`
-    /// 对照侧（旧臂重估）；裸 `<tag>` 两维都注入（向后兼容）。
-    static INJECT_DIFF: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
-    static INJECT_INIT: std::sync::Once = std::sync::Once::new();
-
     /// 计数出口间隔（对照样本数）：首样本 + 每 N 样本一行 info 日志。
     const REPORT_EVERY: u64 = 64;
 
-    /// 注入维度（作用对象 = 对应维度的对照侧 face）。
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum InjectDim {
-        /// 仅 `arm_vs_half` 对照侧（提取半边）。
-        Half,
-        /// 仅 `arm_vs_lookup` 对照侧（旧臂重估）。
-        Lookup,
-        /// 两维都注入（裸 tag 的向后兼容语义）。
-        Both,
+    /// 注入值归一（历史前缀 `half:` / `lookup:` 剥掉后同义；空串 → None）。
+    /// env 初值与 setter 都必须过这里——S4 修复实录：env 路径漏剥前缀导致
+    /// `DW_INJECT_DIFF=lookup:<tag>` 静默不生效（对照侧与请求 tag 字面不等）。
+    pub(crate) fn normalize_inject_tag(raw: String) -> Option<String> {
+        let stripped = raw.strip_prefix("half:").or_else(|| raw.strip_prefix("lookup:"));
+        let tag = stripped.unwrap_or(&raw).to_owned();
+        Some(tag).filter(|t| !t.is_empty())
     }
 
-    fn injected_diff() -> Option<(InjectDim, String)> {
-        INJECT_INIT.call_once(|| {
-            if let Ok(tag) = std::env::var("DW_INJECT_DIFF") {
-                if !tag.is_empty() {
-                    *INJECT_DIFF.lock() = Some(tag);
-                }
-            }
-        });
-        let raw = INJECT_DIFF.lock().clone()?;
-        if let Some(tag) = raw.strip_prefix("half:") {
-            return Some((InjectDim::Half, tag.to_string()));
-        }
-        if let Some(tag) = raw.strip_prefix("lookup:") {
-            return Some((InjectDim::Lookup, tag.to_string()));
-        }
-        Some((InjectDim::Both, raw))
-    }
-
-    /// 程序化设置注入值（`None` 关闭）；值形与 `DW_INJECT_DIFF` 同语法。
-    pub fn set_inject_diff(value: Option<&str>) {
-        INJECT_INIT.call_once(|| {}); // 先吃掉 env 初值，避免随后被 env 覆盖
-        *INJECT_DIFF.lock() = value.map(str::to_owned);
-    }
-
-    /// 对照侧两个 face（S3 态：生产选择 = 影子查表，`chosen` 即生产结果）。
-    /// 注入（[`injected_diff`]）作用于对照侧 face，使差异可被 red-green 复现：
-    /// - half = [`select_by_tag`]（旧臂提取半边，读旧登记表）；
-    /// - arm  = 旧臂本体重估（`get_handler`）——`arm_vs_lookup`（主判据）的对照侧。
-    fn comparison_faces(
+    /// `arm_vs_lookup` 对照侧 face：旧登记表读数（`get_handler` → handler tag）。
+    /// `inject_tag`（实例级注入，已过 [`normalize_inject_tag`] 归一）命中本 tag 时
+    /// 故意给出**错误**值，red-green 证明差异计数非哑。
+    fn comparison_face(
         ohm: &dyn OutboundHandlerManager,
         requested_tag: &str,
-    ) -> (Option<String>, Option<String>) {
-        let inj = injected_diff();
-        let hits = |dim: InjectDim| {
-            inj.as_ref().is_some_and(|(d, tag)| {
-                tag == requested_tag && (*d == dim || *d == InjectDim::Both)
-            })
-        };
-        let half = if hits(InjectDim::Half) {
-            Some(format!("{requested_tag}#injected-diff"))
-        } else {
-            match select_by_tag(ohm, requested_tag) {
-                BaselineChoice::Chosen { handler_tag, .. } => Some(handler_tag),
-                // select_by_tag 不产出 Default；与 Missing 同归「未命中」。
-                BaselineChoice::Missing { .. } | BaselineChoice::Default(_) => None,
-            }
-        };
-        let arm = if hits(InjectDim::Lookup) {
-            Some(format!("{requested_tag}#injected-diff-lookup"))
-        } else {
-            ohm.get_handler(requested_tag).map(|h| h.tag().to_string())
-        };
-        (half, arm)
+        inject_tag: Option<&str>,
+    ) -> Option<String> {
+        if inject_tag.is_some_and(|tag| tag == requested_tag) {
+            return Some(format!("{requested_tag}#injected-diff"));
+        }
+        ohm.get_handler(requested_tag).map(|h| h.tag().to_string())
     }
 
     /// 生产 in-vivo 对照器：`dispatch_link` 每个选择出口调用一次。
     ///
     /// 落环语义与 [`record`] 完全一致（S0 不变），另外即时对照：
     /// - 请求 tag 缺失（默认出站分支）：两侧同源不可比较 ⇒ 只累加 [`skipped_count`]，**不**计入
-    ///   SAMPLES（禁把跳过记成 0 差异）；
-    /// - 请求 tag 存在：新旧两路都可比较 ⇒ SAMPLES+1，差异则 DIFFS+1（error 留痕）。
+    ///   样本（禁把跳过记成 0 差异）；
+    /// - 请求 tag 存在：两表都可比较 ⇒ 样本+1，差异则 `arm_vs_lookup`+1（error 留痕）。
     ///
+    /// `inject_tag` = 实例级注入（[`DefaultDispatcher::set_dual_write_inject`]）。
     /// 返回是否差异（测试用；生产调用点忽略）。
     ///
     /// 解析面读同一 registry（生产启动后不可变）；若 registry 在途变更，
@@ -2363,6 +2312,7 @@ pub mod dual_write {
         dest: &str,
         requested_tag: Option<String>,
         chosen_handler_tag: Option<String>,
+        inject_tag: Option<&str>,
     ) -> bool {
         record(dest, requested_tag.clone(), chosen_handler_tag.clone());
         let Some(tag) = requested_tag else {
@@ -2370,26 +2320,21 @@ pub mod dual_write {
             report_counts();
             return false;
         };
-        // S3 态：chosen = 生产选择（影子查表）结果；对照侧 = 旧臂本体 + 提取半边。
-        let (half, arm) = comparison_faces(ohm, &tag);
-        let old = chosen_handler_tag.as_deref();
-        let diff_half = compare_sample(&tag, old, half.as_deref());
-        let diff_lookup = compare_lookup_sample(&tag, old, arm.as_deref());
+        // S4：chosen = 生产选择（实例影子表）结果；对照侧 = 旧登记表读数（漂移监控）。
+        let face = comparison_face(ohm, &tag, inject_tag);
+        let diff = compare_lookup_sample(&tag, chosen_handler_tag.as_deref(), face.as_deref());
         report_counts();
-        diff_half || diff_lookup
+        diff
     }
 
     /// 计数可观测出口（周期日志行，不 spawn 后台任务——托管归 FxScope，此处不值当）。
-    /// 两维度分池打印：`arm_vs_half` / `arm_vs_lookup`，禁混算。
     fn report_counts() {
-        let samples = SAMPLES.load(Ordering::Relaxed);
+        let samples = LOOKUP_SAMPLES.load(Ordering::Relaxed);
         let skipped = SKIPPED.load(Ordering::Relaxed);
         let total = samples + skipped;
         if total == 1 || total % REPORT_EVERY == 0 {
             tracing::info!(
                 samples,
-                lookup_samples = LOOKUP_SAMPLES.load(Ordering::Relaxed),
-                arm_vs_half = DIFFS.load(Ordering::Relaxed),
                 arm_vs_lookup = LOOKUP_DIFFS.load(Ordering::Relaxed),
                 skipped,
                 "dual-write parity in-vivo"
@@ -2422,9 +2367,9 @@ pub mod dual_write {
         diff
     }
 
-    /// `arm_vs_half` 维度求值：生产选择结果 vs 旧臂提取半边（[`select_by_tag`]，
-    /// 读旧登记表——S3 态下它兼作旧登记表的第二只读面）。回放面
-    /// （tests/dual_write_parity.rs）与生产 in-vivo 面（[`record_in_vivo`]）共用。
+    /// 回放面对照求值（`arm_vs_half` 维度）：旧选择臂规格（[`baseline_select`]
+    /// 提取半边）vs 查表面——**S4 后仅 dual_write_parity 回放驱动消费**，生产
+    /// in-vivo 已收缩为 [`compare_lookup_sample`] 单维。
     pub fn compare_sample(
         requested_tag: &str,
         old_chosen: Option<&str>,
@@ -2433,9 +2378,10 @@ pub mod dual_write {
         compare_counting(requested_tag, old_chosen, new_chosen, &SAMPLES, &DIFFS, "arm_vs_half")
     }
 
-    /// `arm_vs_lookup` 维度求值——**S3 后主判据**：生产选择（影子查表）vs 旧臂本体
-    /// 重估（`get_handler`）。与 [`compare_sample`] 同判据、**独立计数池**（禁混算）。
-    /// `legacy-arm-select` 回退态下两侧同源，退化为恒 0（记录面保留，便于对比）。
+    /// `arm_vs_lookup` 维度求值——**S4 后唯一 in-vivo 维度**：生产选择（影子查表）
+    /// vs 旧登记表读数（`get_handler`）。两表由 add/remove hook 同步，本对照即
+    /// 镜像漂移监控（必须恒 0；非 0 = 存在绕过 hook 的登记路径）。与
+    /// [`compare_sample`] 同判据、独立计数池（禁混算）。
     pub fn compare_lookup_sample(
         requested_tag: &str,
         old_chosen: Option<&str>,
@@ -2451,12 +2397,13 @@ pub mod dual_write {
         )
     }
 
-    /// 已对照样本数。
+    /// 回放面已对照样本数（S4 后 `SAMPLES`/`DIFFS` 仅由 dual_write_parity 回放
+    /// 驱动累加；生产 in-vivo 不再进入本池）。
     pub fn sample_count() -> u64 {
         SAMPLES.load(Ordering::Relaxed)
     }
 
-    /// 累计差异数（S2 验收指标：回放样本 + 真实流量上必须为 0）。
+    /// 回放面累计差异数（S2 验收指标：回放样本上必须为 0）。
     pub fn diff_count() -> u64 {
         DIFFS.load(Ordering::Relaxed)
     }
@@ -2466,12 +2413,12 @@ pub mod dual_write {
         SKIPPED.load(Ordering::Relaxed)
     }
 
-    /// `arm_vs_lookup` 维度已对照样本数。
+    /// `arm_vs_lookup`（S4 后唯一 in-vivo 维度）已对照样本数。
     pub fn lookup_sample_count() -> u64 {
         LOOKUP_SAMPLES.load(Ordering::Relaxed)
     }
 
-    /// `arm_vs_lookup` 维度累计差异数（影子模式验收指标：真实流量上必须为 0）。
+    /// `arm_vs_lookup` 累计差异数（生产选择 vs 旧登记表读数的漂移计数，必须为 0）。
     pub fn lookup_diff_count() -> u64 {
         LOOKUP_DIFFS.load(Ordering::Relaxed)
     }
@@ -5017,10 +4964,11 @@ mod tests {
         );
     }
 
-    /// B4 前置：生产 in-vivo 对照器（`record_in_vivo`）——真实 dispatch 路径上
-    /// 样本/跳过两计数器都动，且注入差异必被检出（证明 0 差异不是哑仪器）。
+    /// B4 前置（S4 收缩后）：生产 in-vivo 对照器（`record_in_vivo`）——单维
+    /// `arm_vs_lookup`（生产选择 vs 旧登记表读数的漂移监控）真实 dispatch 路径上
+    /// 样本/跳过计数器都动，且注入差异必被检出（证明 0 差异不是哑仪器）。
     /// 全局计数被并行用例共享 ⇒ 归因断言只取「单调下界 + 返回布尔」，
-    /// 差异面可严格归因（非注入样本结构性 0 差异）。
+    /// 差异面可严格归因（注入是唯一差异源）。
     #[cfg(feature = "dispatcher-dual-write")]
     #[tokio::test]
     async fn dual_write_in_vivo_comparator_is_wired_and_detects_injected_diff() {
@@ -5055,33 +5003,31 @@ mod tests {
             Arc::new(SignalingHandler { tag: "dw-ivu-out".into(), signal: Arc::clone(&silent) }),
         );
 
-        let samples0 = dual_write::sample_count();
-        let diffs0 = dual_write::diff_count();
         let skipped0 = dual_write::skipped_count();
         let lookup_samples0 = dual_write::lookup_sample_count();
         let lookup_diffs0 = dual_write::lookup_diff_count();
 
-        // 命中且两侧一致 → 计入样本，不计差异、不算跳过。
+        // 命中且两表一致（影子生产 vs 旧登记表读数）→ 计入样本，不计差异、不算跳过。
         assert!(
             !dual_write::record_in_vivo(
                 &ohm,
                 "tcp:10.9.9.11:47101",
                 Some("dw-ivu-out".into()),
                 Some("dw-ivu-out".into()),
+                None,
             ),
             "一致样本不得报差异"
         );
-        assert!(dual_write::sample_count() > samples0, "对照样本未累加");
-        assert!(dual_write::lookup_sample_count() > lookup_samples0, "影子查表样本未累加");
-        assert_eq!(dual_write::diff_count(), diffs0, "一致样本不得计差异");
-        assert_eq!(dual_write::lookup_diff_count(), lookup_diffs0, "查表一致样本不得计差异");
+        assert!(dual_write::lookup_sample_count() > lookup_samples0, "对照样本未累加");
+        assert_eq!(dual_write::lookup_diff_count(), lookup_diffs0, "一致样本不得计差异");
         assert_eq!(dual_write::skipped_count(), skipped0, "可比较样本不得计跳过");
 
-        // 未命中：旧臂 None vs 新路 Missing → 口径同一，仍是可比较的 0 差异样本。
+        // 未命中：生产 None vs 旧登记表 None → 口径同一，仍是可比较的 0 差异样本。
         assert!(!dual_write::record_in_vivo(
             &ohm,
             "tcp:10.9.9.12:47102",
             Some("dw-ivu-ghost".into()),
+            None,
             None,
         ));
 
@@ -5092,35 +5038,34 @@ mod tests {
                 "tcp:10.9.9.13:47103",
                 None,
                 Some("dw-ivu-default".into()),
+                None,
             ),
             "跳过样本不得报差异"
         );
         assert!(dual_write::skipped_count() > skipped0, "跳过样本未显式计数");
 
-        // 注入差异（裸 tag = 两维都注入）→ 必被检出（red-green：0 差异不是哑仪器）。
-        dual_write::set_inject_diff(Some("dw-ivu-out"));
-        let injected = dual_write::record_in_vivo(
-            &ohm,
-            "tcp:10.9.9.14:47104",
-            Some("dw-ivu-out".into()),
-            Some("dw-ivu-out".into()),
-        );
-        dual_write::set_inject_diff(None);
-        assert!(injected, "注入差异未被检出（对照器哑）");
-        assert!(dual_write::diff_count() > diffs0, "arm_vs_half 差异计数未增长");
-        assert!(dual_write::lookup_diff_count() > lookup_diffs0, "arm_vs_lookup 差异计数未增长");
+        // 注入差异（实例级）→ 必被检出（red-green：0 差异不是哑仪器）。
+        // 注入是唯一差异源，差异数可严格归因。
+        for inject in [None, Some("dw-ivu-out")] {
+            let injected = dual_write::record_in_vivo(
+                &ohm,
+                "tcp:10.9.9.14:47104",
+                Some("dw-ivu-out".into()),
+                Some("dw-ivu-out".into()),
+                inject,
+            );
+            assert_eq!(
+                injected,
+                inject.is_some(),
+                "注入（{inject:?}）检出结果不符（对照器哑或误报）"
+            );
+        }
+        assert_eq!(dual_write::lookup_diff_count(), lookup_diffs0 + 1, "一次注入必须计一次差异");
 
-        // 维度隔离：lookup: 前缀只注入查表维——arm_vs_half 必须保持不动（禁混算）。
-        dual_write::set_inject_diff(Some("lookup:dw-ivu-out"));
-        let lookup_only = dual_write::record_in_vivo(
-            &ohm,
-            "tcp:10.9.9.16:47106",
-            Some("dw-ivu-out".into()),
-            Some("dw-ivu-out".into()),
-        );
-        dual_write::set_inject_diff(None);
-        assert!(lookup_only, "lookup 维度注入未被检出");
-        assert_eq!(dual_write::diff_count(), diffs0 + 1, "lookup 维注入不得污染 arm_vs_half");
+        // setter 剥历史前缀：`lookup:` / `half:` 与裸 tag 同义。
+        let probe = DefaultDispatcher::new();
+        probe.set_dual_write_inject(Some("lookup:dw-ivu-out"));
+        assert_eq!(probe.dual_write_inject.lock().as_deref(), Some("dw-ivu-out"), "注入前缀未剥离");
 
         // ── ② 接线面：真实 dispatch_link 出口走同一对照器 ──
         let called = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -5137,7 +5082,7 @@ mod tests {
         d.ohm = Some(Arc::new(dispatch_ohm));
         d.router = Some(Arc::new(FixedRouter("dw-ivu-routed")));
 
-        let wired_samples0 = dual_write::sample_count();
+        let wired_samples0 = dual_write::lookup_sample_count();
         let dest = Destination::new(
             Address::from_ipv4_bytes([10, 9, 9, 15]),
             Port::new(47105),
@@ -5161,7 +5106,7 @@ mod tests {
             let seen = dual_write::snapshot_records()
                 .iter()
                 .any(|rec| rec.tag.as_deref() == Some("dw-ivu-routed"));
-            if seen && dual_write::sample_count() > wired_samples0 {
+            if seen && dual_write::lookup_sample_count() > wired_samples0 {
                 landed = true;
                 break;
             }
@@ -5172,25 +5117,22 @@ mod tests {
     }
 
     /// B4 phase1-2：影子查表与 SimpleOhm 注册**同源派生**——add/remove 镜像、
-    /// 同 tag 覆盖语义一致、remove 后查表维与旧臂同为未命中（禁 false diff）。
+    /// 同 tag 覆盖语义一致、remove 后查表维与旧登记表同为未命中（禁 false diff）。
     #[cfg(feature = "dispatcher-dual-write")]
     #[test]
     fn dual_write_shadow_table_mirrors_simple_ohm_registration() {
         let silent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let ohm = SimpleOhm::new();
-        assert!(
-            !dual_write::shadow_tags().iter().any(|t| t == "dw-sh-a"),
-            "影子表预置污染：dw-sh-a 不应存在"
-        );
+        assert!(ohm.select_handler("dw-sh-a").is_none(), "影子表预置污染：dw-sh-a 不应存在");
 
         ohm.add(
             "dw-sh-a",
             Arc::new(SignalingHandler { tag: "dw-sh-a".into(), signal: Arc::clone(&silent) }),
         );
-        assert!(dual_write::shadow_tags().iter().any(|t| t == "dw-sh-a"), "add 未镜像进影子表");
+        assert!(ohm.select_handler("dw-sh-a").is_some(), "add 未镜像进影子表");
 
         // 同 tag 重复 add = 覆盖（与 SimpleOhm 的 HashMap insert 一致）：
-        // 旧臂与影子表必须同解，查表维不得误报。
+        // 旧登记表与影子表必须同解，漂移监控不得误报。
         ohm.add(
             "dw-sh-a",
             Arc::new(SignalingHandler { tag: "dw-sh-b".into(), signal: Arc::clone(&silent) }),
@@ -5203,30 +5145,36 @@ mod tests {
                 "tcp:10.9.9.21:47111",
                 Some("dw-sh-a".into()),
                 Some("dw-sh-b".into()),
+                None,
             ),
             "影子表与新 handler 不同解（镜像滞后）"
         );
-        assert_eq!(dual_write::lookup_diff_count(), l0, "镜像覆盖后查表维不得误报差异");
+        assert_eq!(dual_write::lookup_diff_count(), l0, "镜像覆盖后漂移监控不得误报差异");
 
         // remove 镜像：两侧同步转未命中（fail-visible 口径同一，仍是 0 差异样本）。
         assert!(ohm.remove("dw-sh-a"), "remove 应命中");
         assert!(!ohm.remove("dw-sh-a"), "重复 remove 应为 no-op");
         let l1 = dual_write::lookup_diff_count();
         assert!(
-            !dual_write::record_in_vivo(&ohm, "tcp:10.9.9.22:47112", Some("dw-sh-a".into()), None,),
+            !dual_write::record_in_vivo(
+                &ohm,
+                "tcp:10.9.9.22:47112",
+                Some("dw-sh-a".into()),
+                None,
+                None,
+            ),
             "remove 后两侧未命中不得报差异"
         );
-        assert_eq!(dual_write::lookup_diff_count(), l1, "remove 后查表维不得误报差异");
+        assert_eq!(dual_write::lookup_diff_count(), l1, "remove 后漂移监控不得误报差异");
     }
 
-    /// B4 S3：生产选择面 = 影子查表（无兜底）。
-    /// ① 只进影子表（绕过 ohm.add）→ forced dispatch 命中（旧臂会同步 Err）；
+    /// B4 S3/S4：生产选择面 = 实例影子表（无兜底，唯一路径）。
+    /// ① 只进影子表（绕过 ohm.add 旧表）→ forced dispatch 命中（get_handler 会同步 Err）；
     /// ② 只删影子表 → forced dispatch 同步 Err（fail-visible 不变）；
     /// ③ ohm.add 进旧表但影子表删除 → 仍必须 Err（决定性证明选择面**不回落**
-    ///    `get_handler`）。仅 S3 组合（flag 开、回退关）下有意义。
-    #[cfg(all(feature = "dispatcher-dual-write", not(feature = "legacy-arm-select")))]
+    ///    `get_handler`）。
     #[tokio::test]
-    async fn dual_write_s3_select_face_uses_shadow_without_fallback() {
+    async fn simple_ohm_shadow_select_no_fallback() {
         use xray_buf::pipe;
         use xray_common::net::address::Address;
 
@@ -5242,8 +5190,8 @@ mod tests {
             )
         };
 
-        // ① 影子表独有 tag：S3 选择面命中（旧登记表无此 tag，旧臂会同步 Err）。
-        dual_write::shadow_insert(
+        // ① 影子表独有 tag：选择面命中（旧登记表无此 tag，get_handler 会同步 Err）。
+        ohm.shadow_insert_only(
             "dw-s3-x",
             Arc::new(SignalingHandler { tag: "dw-s3-x".into(), signal: Arc::clone(&called) }),
         );
@@ -5267,7 +5215,7 @@ mod tests {
         );
 
         // ② 只删影子表：预检查同步 Err（fail-visible 口径不变，不落默认）。
-        assert!(dual_write::shadow_remove("dw-s3-x"));
+        assert!(ohm.shadow_remove_only("dw-s3-x"));
         let dest2 = Destination::new(
             Address::from_ipv4_bytes([10, 9, 9, 32]),
             Port::new(47122),
@@ -5285,7 +5233,7 @@ mod tests {
             "dw-s3-y",
             Arc::new(SignalingHandler { tag: "dw-s3-y".into(), signal: Arc::clone(&called) }),
         );
-        assert!(dual_write::shadow_remove("dw-s3-y"), "影子表应含 dw-s3-y（add 镜像）");
+        assert!(ohm.shadow_remove_only("dw-s3-y"), "影子表应含 dw-s3-y（add 镜像）");
         let dest3 = Destination::new(
             Address::from_ipv4_bytes([10, 9, 9, 33]),
             Port::new(47123),
@@ -5300,6 +5248,80 @@ mod tests {
         assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), 1, "回落命中会误分发 handler");
     }
 
+    /// S4 根因修复回归：影子表**实例级**——两个 dispatcher 各自注册同名 tag 指向
+    /// 不同 handler，必须分别命中各自的 handler（进程级全局表时代会串台：
+    /// integration_sniffing 成对互串 / `tag-out` 跨测试互踩即此根因）。
+    #[tokio::test]
+    async fn dual_write_instances_do_not_share_shadow_table() {
+        use xray_buf::pipe;
+        use xray_common::net::address::Address;
+
+        let hit_a = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hit_b = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let ohm_a = SimpleOhm::new();
+        ohm_a.add(
+            "dw-shared",
+            Arc::new(SignalingHandler { tag: "dw-a".into(), signal: Arc::clone(&hit_a) }),
+        );
+        let ohm_b = SimpleOhm::new();
+        ohm_b.add(
+            "dw-shared",
+            Arc::new(SignalingHandler { tag: "dw-b".into(), signal: Arc::clone(&hit_b) }),
+        );
+
+        let mut da = DefaultDispatcher::new();
+        da.ohm = Some(Arc::new(ohm_a));
+        let mut db = DefaultDispatcher::new();
+        db.ohm = Some(Arc::new(ohm_b));
+
+        let mk_link = || {
+            let (r, w) = pipe::new();
+            xray_transport::link::Link::new(
+                Box::new(r) as Box<dyn xray_buf::io::Reader>,
+                Box::new(w) as Box<dyn xray_buf::io::Writer>,
+            )
+        };
+        let dest = Destination::new(
+            Address::from_ipv4_bytes([10, 9, 9, 41]),
+            Port::new(47131),
+            Network::TCP,
+        );
+
+        da.dispatch_link(&dest, mk_link(), &SniffingRequest::default(), None, Some("dw-shared"))
+            .expect("实例 A dispatch");
+        db.dispatch_link(&dest, mk_link(), &SniffingRequest::default(), None, Some("dw-shared"))
+            .expect("实例 B dispatch");
+        for _ in 0..100 {
+            if hit_a.load(std::sync::atomic::Ordering::SeqCst) >= 1
+                && hit_b.load(std::sync::atomic::Ordering::SeqCst) >= 1
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            hit_a.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "实例 A 必须命中自己的 handler（dw-a）"
+        );
+        assert_eq!(
+            hit_b.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "实例 B 必须命中自己的 handler（dw-b）——全局表时代会两笔都落到同一 handler"
+        );
+    }
+
+    /// S4 修复回归：注入值归一覆盖 env 与 setter 两条路（前缀剥除 + 空串 None）。
+    #[cfg(feature = "dispatcher-dual-write")]
+    #[test]
+    fn dual_write_normalize_inject_tag_strips_prefixes() {
+        assert_eq!(dual_write::normalize_inject_tag("lookup:a".into()), Some("a".into()));
+        assert_eq!(dual_write::normalize_inject_tag("half:b".into()), Some("b".into()));
+        assert_eq!(dual_write::normalize_inject_tag("c".into()), Some("c".into()));
+        assert_eq!(dual_write::normalize_inject_tag(String::new()), None);
+    }
+
     /// set_fdns 注入（对应 Go dispatcher.fdns）。
     #[test]
     fn set_fdns_stores_engine() {
@@ -5312,6 +5334,7 @@ mod tests {
 
     /// oz1t：per-tag 计数器在 policy gate（stats.user_uplink/user_downlink）
     /// 关闭时不懒注册、不包装——默认 Policy 默认 false → 计数器不存在。
+    /// （tag 用本测试专名：影子选择面是进程级全局表，跨测试同 tag 会互踩。）
     #[tokio::test]
     async fn dispatch_link_skips_per_tag_counters_when_policy_gate_off() {
         let (stats, d) = build_oz1t_dispatcher(false);

@@ -223,6 +223,8 @@ mod tests {
     /// 契约验收①：四族凭据齐备的配置 → secrets 集非空且含四类值。
     #[test]
     fn collect_secrets_covers_four_credential_families() {
+        // build() 会跑 lint 注册表（post_process），必须串行化且不留测试阶段。
+        let _guard = crate::lint::lint_test_guard();
         let built = four_family_config().build().expect("config builds");
         let secrets = collect_secrets(&built);
 
@@ -244,6 +246,7 @@ mod tests {
     /// 无凭据配置 → 空集（掩码表空 = 透传零分配）。
     #[test]
     fn collect_secrets_empty_for_credential_free_config() {
+        let _guard = crate::lint::lint_test_guard();
         let json = serde_json::json!({
             "inbounds": [
                 { "protocol": "socks", "port": 10005, "tag": "socks-in", "settings": {} },

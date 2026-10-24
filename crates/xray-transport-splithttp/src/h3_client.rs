@@ -88,9 +88,8 @@ const ZERO_RTT_ENV: &str = "XRAY_H3_ZERO_RTT";
 /// transport 层无法判断请求幂等性（packet-up 是 POST 代理数据流），故给运行时开关，
 /// 默认开。
 fn zero_rtt_flag(env: Option<&str>) -> bool {
-    !env.map(str::trim).is_some_and(|v| {
-        matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
-    })
+    !env.map(str::trim)
+        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
 }
 
 /// 0-RTT 是否启用（进程级缓存 env 读取，连接建立属冷路径）。
@@ -288,8 +287,8 @@ impl H3Conn {
     ///
     /// - `init_stream_receive_window` / `init_connection_receive_window` → 流/连接初始接收窗口
     /// - `max_idle_timeout` → `max_idle_timeout`（秒；0 缺省 300s）
-    /// - `keep_alive_period` → `keep_alive_interval`（秒；0 时取 `xmux.hKeepAlivePeriod`，
-    ///   两者都 0 缺省 10s；负数 = 禁用）
+    /// - `keep_alive_period` → `keep_alive_interval`（秒；0 时取 `xmux.hKeepAlivePeriod`， 两者都 0
+    ///   缺省 10s；负数 = 禁用）
     ///
     /// `None`/字段 0 时窗口缺省显式 16MB 流窗/32MB 连接窗（bd wz2b W4，quinn 默认
     /// 流收窗 1.25MB 高 BDP 钉）；idle/keepalive 缺省 300s/10s（bd zru2，对齐 Go
@@ -350,8 +349,8 @@ impl H3Conn {
         endpoint.set_default_client_config(quic_cfg);
 
         // 0-RTT 拨号（Go dialer.go:243 `tr.DialEarly` 对位）：
-        // - 有票 → early data 立即可发；被拒时 quinn 把缓冲 early data 自动转
-        //   1-RTT 重发（ZeroRttAccepted=false），连接照常建立。
+        // - 有票 → early data 立即可发；被拒时 quinn 把缓冲 early data 自动转 1-RTT
+        //   重发（ZeroRttAccepted=false），连接照常建立。
         // - 无票 → FullHandshake 分支对还回的 Connecting 普通 await。
         // 两条降级路径都不断连（红线）；重放风险与开关见 XRAY_H3_ZERO_RTT。
         let connecting = endpoint
@@ -374,16 +373,12 @@ impl H3Conn {
                     });
                     conn
                 },
-                xray_transport_quic::zero_rtt::ZeroRttDial::FullHandshake(connecting) => {
-                    connecting
-                        .await
-                        .map_err(|e| SplitHttpError::Hyper(format!("quinn connect: {e}")))?
-                },
+                xray_transport_quic::zero_rtt::ZeroRttDial::FullHandshake(connecting) => connecting
+                    .await
+                    .map_err(|e| SplitHttpError::Hyper(format!("quinn connect: {e}")))?,
             }
         } else {
-            connecting
-                .await
-                .map_err(|e| SplitHttpError::Hyper(format!("quinn connect: {e}")))?
+            connecting.await.map_err(|e| SplitHttpError::Hyper(format!("quinn connect: {e}")))?
         };
 
         let quinn_conn = h3_quinn::Connection::new(conn.clone());

@@ -1,7 +1,7 @@
 //! `naive+https://` 分享链接解析 + xray outbound settings JSON 解析。
 
 use serde_json::Value;
-use xray_tls::fingerprint::{get_fingerprint, Fingerprint};
+use xray_tls::fingerprint::{Fingerprint, get_fingerprint};
 
 /// naive 出站配置。
 #[derive(Debug, Clone)]

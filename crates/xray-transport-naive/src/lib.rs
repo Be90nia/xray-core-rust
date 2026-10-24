@@ -25,7 +25,7 @@ mod inbound;
 mod padding;
 pub mod uri;
 
-pub use dial::{dial_naive, NaiveConn, PaddingReader, PaddingWriter};
+pub use dial::{NaiveConn, PaddingReader, PaddingWriter, dial_naive};
 pub use dispatcher::make_naive_dial_fn;
 pub use inbound::{NaiveInboundConfig, NaiveInboundHandler};
-pub use uri::{parse_naive_uri, NaiveConfig};
+pub use uri::{NaiveConfig, parse_naive_uri};

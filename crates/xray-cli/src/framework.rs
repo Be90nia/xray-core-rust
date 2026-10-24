@@ -304,10 +304,6 @@ impl HandlerBridge {
     fn contains_key(&self, tag: &str) -> bool {
         self.handlers.contains_key(tag)
     }
-
-    fn len(&self) -> usize {
-        self.handlers.len()
-    }
 }
 
 /// 桥填表结果：成功 handler 计数 + 逐条失败（tag, 原因）——调用方记账上抛。
@@ -315,6 +311,9 @@ struct BridgeFill {
     bridge: HandlerBridge,
     ok: usize,
     failed: Vec<(String, String)>,
+    /// 出站 handler（配置序，仅成功转换）——listener 面经
+    /// `start_full_with_outbound_handlers` 灌入 ohm（首个 = default，S4 影子表镜像）。
+    outbound_handlers: Vec<Arc<dyn DispatchHandler>>,
 }
 
 /// 出站条目的生产装配前置（framework 桥 v0 未接的面在场 → 拒，不静默丢语义）：
@@ -343,7 +342,12 @@ fn fill_bridge(
     families: &[RegisteredFamily],
     dispatcher: &Arc<DefaultDispatcher>,
 ) -> BridgeFill {
-    let mut fill = BridgeFill { bridge: HandlerBridge::default(), ok: 0, failed: Vec::new() };
+    let mut fill = BridgeFill {
+        bridge: HandlerBridge::default(),
+        ok: 0,
+        failed: Vec::new(),
+        outbound_handlers: Vec::new(),
+    };
     // v0.1：同 protocol 多实例只转换首个（xray-frame 每 protocol 只 build 首段）；
     // 仅成功转换才占位，失败后同 protocol 后继条目仍可重试。
     let mut converted_protocols: Vec<&'static str> = Vec::new();
@@ -392,7 +396,8 @@ fn fill_bridge(
         }
         match convert(ob) {
             Ok(handler) => {
-                fill.bridge.insert(ob.tag.clone(), handler);
+                fill.bridge.insert(ob.tag.clone(), Arc::clone(&handler));
+                fill.outbound_handlers.push(handler);
                 converted_protocols.push(family.protocol);
                 fill.ok += 1;
             },
@@ -445,6 +450,17 @@ pub(crate) async fn run_framework(
     built: &xray_conf::BuiltConfig,
     config_root: serde_json::Value,
 ) -> Result<()> {
+    run_framework_until(built, config_root, crate::run::wait_for_signal()).await
+}
+
+/// 同 [`run_framework`]，停机信号源参数化（生产 = [`crate::run::wait_for_signal`]；
+/// 集成测试注入确定性触发器——agent 环境控制台 CTRL_C 投递不可靠，实测
+/// default 二进制同样不退，e2e 优雅停机验收经此确定性证明）。
+pub(crate) async fn run_framework_until(
+    built: &xray_conf::BuiltConfig,
+    config_root: serde_json::Value,
+    shutdown_signal: impl Future<Output = ()>,
+) -> Result<()> {
     // ① 配置派生（禁硬编码清单）：未迁移族记账不静默。
     let plan = derive_families(built);
     for name in &plan.unregistered {
@@ -467,23 +483,37 @@ pub(crate) async fn run_framework(
 
     // ③ 桥：插件 → dispatcher 可调 handler 填表（失败逐条计数 + 日志）。
     let dispatcher = Arc::new(DefaultDispatcher::new());
-    let fill = fill_bridge(built, &plan.families, &dispatcher);
-    for (tag, reason) in &fill.failed {
+    let BridgeFill { bridge, ok, failed, outbound_handlers } =
+        fill_bridge(built, &plan.families, &dispatcher);
+    for (tag, reason) in &failed {
         crate::LOG.warn(format!("framework: bridge conversion failed tag={tag:?}: {reason}"));
     }
-    eprintln!(
-        "[framework] handler bridge ready: {} handler(s), {} failed",
-        fill.bridge.len(),
-        fill.failed.len()
-    );
+    eprintln!("[framework] handler bridge ready: {} handler(s), {} failed", ok, failed.len());
     // 启动可见：桥内容逐条（tag ↔ handler tag），操作者核对路由表。
     for tag in built.outbounds.iter().map(|o| &o.tag).chain(built.inbounds.iter().map(|i| &i.tag)) {
-        if let Some(handler) = fill.bridge.get(tag) {
+        if let Some(handler) = bridge.get(tag) {
             crate::LOG.info(format!("framework: bridge {tag:?} → handler {}", handler.tag()));
         }
     }
 
-    crate::run::wait_for_signal().await;
+    // ④ listener/accept 面：xray-core 生产装配序列**完整复用**（Instance/routing/
+    // sniffing/stats/access-log 与 start_full 同一条路，per-inbound
+    // InboundDispatchHandler+MuxCarrier 由 spawn_inbounds 既有机制承担），唯一差异 =
+    // 出站 handler 由本桥灌入（feature 门控注入点，禁第二套 dispatcher）。
+    let (instance, _ohm, handles) =
+        xray_core::functions::start_full_with_outbound_handlers(built, outbound_handlers)
+            .await
+            .map_err(|e| CliError::StartFailed(format!("framework inbound start failed: {e}")))?;
+    crate::LOG.info(format!("framework: {} inbound listener(s) serving", handles.len()));
+
+    shutdown_signal.await;
+
+    // 停机顺序：listener 先停（close = cancel shutdown_token → serve 任务收 cancel
+    // 通知，与 default 路径同语义），排空后插件停机报告。
+    crate::run::close_if_sole_owner(instance)?;
+    for h in handles {
+        let _ = h.await;
+    }
 
     let report = framework.shutdown().await;
     for outcome in &report.per_component {
@@ -620,6 +650,9 @@ mod tests {
             assert_eq!(fill.ok, 2);
             assert_eq!(fill.bridge.get("socks-in").expect("socks tag").tag(), "socks-in");
             assert_eq!(fill.bridge.get("freedom-out").expect("freedom tag").tag(), "freedom-out");
+            // listener 面灌入序：出站 handler 配置序、tag 相符（首个 = default）。
+            assert_eq!(fill.outbound_handlers.len(), 1);
+            assert_eq!(fill.outbound_handlers[0].tag(), "freedom-out");
 
             let report = framework.shutdown().await;
             assert!(report.is_clean(), "shutdown unclean: {report:?}");
@@ -657,6 +690,70 @@ mod tests {
         );
         assert!(fill.bridge.get("socks-in").is_some());
         assert!(fill.bridge.get("ss-out").is_none(), "failed conversion must not fake an entry");
+    }
+
+    /// B5 step4 优雅停机确定性验收（agent 环境控制台 CTRL_C 投递不可靠——
+    /// default 二进制实测同样不退）：真实 socks listener 起真端口 → curl 语义
+    /// 连接可建立 → 注入停机触发器 → close→join→插件停机 → 端口关闭 → Ok
+    /// （run_framework_until 非clean即 Err，Ok = 停机报告 clean）。
+    #[test]
+    fn framework_graceful_shutdown_stops_listener_and_reports_clean() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let config = xray_conf::Config::from_json_str(
+                r#"{
+                "inbounds": [{"protocol": "socks", "tag": "socks-in", "listen": "127.0.0.1", "port": 12836, "settings": {}}],
+                "outbounds": [{"protocol": "freedom", "tag": "freedom-out", "settings": {}}]
+            }"#,
+            )
+            .unwrap();
+            let built = config.build().unwrap();
+            let root = config.to_json_value().unwrap();
+
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let serve = crate::framework::run_framework_until(&built, root, async move {
+                let _ = rx.await;
+            });
+            tokio::pin!(serve);
+
+            // listener 真实可连（spawn_inbounds 生产机制起 bind；serve 并发驱动）。
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut connected = false;
+            while std::time::Instant::now() < deadline {
+                tokio::select! {
+                    biased;
+                    res = serve.as_mut() => {
+                        panic!("serve finished before listener came up: {res:?}");
+                    },
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                        if tokio::net::TcpStream::connect("127.0.0.1:12836").await.is_ok() {
+                            connected = true;
+                            break;
+                        }
+                    },
+                }
+            }
+            assert!(connected, "socks listener never accepted within 10s");
+
+            // 注入停机信号：与生产 wait_for_signal 同一停机序（close→join→插件停机）。
+            tx.send(()).expect("shutdown trigger receiver alive");
+            let result = tokio::time::timeout(std::time::Duration::from_secs(15), serve.as_mut())
+                .await
+                .expect("graceful shutdown exceeded 15s");
+            assert!(result.is_ok(), "run_framework_until returned Err: {result:?}");
+
+            // listener 已停（端口拒连）。
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut refused = false;
+            while std::time::Instant::now() < deadline {
+                if tokio::net::TcpStream::connect("127.0.0.1:12836").await.is_err() {
+                    refused = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(refused, "listener port still accepting after shutdown");
+        });
     }
 
     /// 真协议 handler 最小 dispatch：blackhole 桥 handler（插件产出）dispatch 即

@@ -77,6 +77,7 @@ dual-write = ["dep:xray-app-dispatcher", "xray-app-dispatcher/dispatcher-dual-wr
 # 非 optional 依赖（T3.2a LogFacade），本 feature 只门控新路径代码（src/framework.rs
 # + run.rs 分叉），关闭时依赖图与生产行为零变化。
 framework-assembly = [
+    "xray-core/framework-assembly",
     "dep:xray-app-dispatcher",
     "dep:xray-transport",
     "dep:xray-buf",

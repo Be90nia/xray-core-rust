@@ -190,7 +190,7 @@ pub fn start_from_built(
 pub async fn start_full(
     built: &xray_conf::BuiltConfig,
 ) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
-    start_full_dispatched(built, None).await
+    start_full_dispatched(built, None, None).await
 }
 
 /// 带路由的完整启动路径：Instance + SimpleOhm + outbounds + router + inbounds。
@@ -202,7 +202,23 @@ pub async fn start_full_with_router(
     built: &xray_conf::BuiltConfig,
     router: Arc<dyn DispatchRouter>,
 ) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
-    start_full_dispatched(built, Some(router)).await
+    start_full_dispatched(built, Some(router), None).await
+}
+
+/// feature `framework-assembly` 注入点（B5 step4）：生产装配序列**完整复用**
+/// （Instance/routing/sniffing/stats/access-log/policy/observatory 与
+/// [`start_full`] 同一条路），唯一差异 = 出站 handler 不经
+/// [`register_outbounds`] 生产构建，而是调用方（xray-cli framework 桥，插件
+/// 配置派生）灌入：首个 = default（对齐 Go proxyman/outbound:109-111，与
+/// register_outbounds 同序语义），逐个 `add`（镜像 S4 影子选择面）。
+///
+/// default 构建下本函数不存在（cfg 门控），生产行为零变化；禁第二套 dispatcher。
+#[cfg(feature = "framework-assembly")]
+pub async fn start_full_with_outbound_handlers(
+    built: &xray_conf::BuiltConfig,
+    handlers: Vec<Arc<dyn xray_app_dispatcher::DispatchHandler>>,
+) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
+    start_full_dispatched(built, None, Some(handlers)).await
 }
 
 /// 共用装配路径（方案 B）：Instance + SimpleOhm + outbounds + DefaultDispatcher + inbounds。
@@ -219,6 +235,9 @@ async fn start_full_dispatched(
     built: &xray_conf::BuiltConfig,
     // 外部注入路由器（`start_full_with_router` 路径）；None 时按 routing app 自动装配。
     routing_override: Option<Arc<dyn DispatchRouter>>,
+    // B5 framework 注入（仅 feature 路径产 Some）：出站 handler 由调用方灌入，
+    // 跳过 register_outbounds 生产构建；None = 生产路径，行为不变。
+    external_outbounds: Option<Vec<Arc<dyn xray_app_dispatcher::DispatchHandler>>>,
 ) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
     install_secret_masking(built);
     register_all_features();
@@ -364,17 +383,32 @@ async fn start_full_dispatched(
     // 生产装配持 init 完成的 DefaultDispatcher 构造 sink；loopback outbound 命中
     // 路由后经 dispatch_link 回注 inboundTag 对应入站。此前恒传 None = 任何命中
     // loopback 的连接在 handler 侧静默 drop（黑洞）。
-    let loopback_sink: Arc<dyn xray_proxy_loopback::LoopbackSink> =
-        Arc::new(crate::outbound::DispatcherLoopbackSink::new(Arc::clone(&dispatcher)));
-    // DNS service 同步注入出站（bd bqm）：targetStrategy 域名解析经此生效
-    // （对应 Go 全局 internet.dnsClient 由 app/dns 初始化）。
-    register_outbounds(
-        built,
-        &ohm,
-        Some(loopback_sink),
-        instance.get_feature::<xray_app_dns::DnsService>(),
-        policy_manager,
-    )?;
+    // 出站源二选一（B5 framework 注入点）：生产 = register_outbounds（权威构建）；
+    // 外部 = 桥 handler 灌入，同序语义（首个成功者 = default，Go
+    // proxyman/outbound:109-111）+ add 镜像影子表（S4 唯一选择路径）。
+    match external_outbounds {
+        None => {
+            let loopback_sink: Arc<dyn xray_proxy_loopback::LoopbackSink> =
+                Arc::new(crate::outbound::DispatcherLoopbackSink::new(Arc::clone(&dispatcher)));
+            // DNS service 同步注入出站（bd bqm）：targetStrategy 域名解析经此生效
+            // （对应 Go 全局 internet.dnsClient 由 app/dns 初始化）。
+            register_outbounds(
+                built,
+                &ohm,
+                Some(loopback_sink),
+                instance.get_feature::<xray_app_dns::DnsService>(),
+                policy_manager,
+            )?;
+        },
+        Some(handlers) => {
+            for handler in handlers {
+                if ohm.get_default_handler().is_none() {
+                    ohm.set_default(Arc::clone(&handler));
+                }
+                ohm.add(handler.tag(), Arc::clone(&handler));
+            }
+        },
+    }
     // soqc：observatory/burst 探测执行体切 RealOutboundProbeExecutor——经
     // dispatcher forced-tag 拨号 + rustls 完整 HTTPS GET（对齐 Go
     // observer.go:130-159 tagged.Dialer + http.Client）。此前 init_dependencies

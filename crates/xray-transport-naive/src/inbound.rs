@@ -15,14 +15,14 @@ use std::{
     convert::Infallible,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, AtomicU16, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, AtomicU16, Ordering},
     },
 };
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use bytes::Bytes;
-use http::{header::PROXY_AUTHORIZATION, Method, StatusCode};
+use http::{Method, StatusCode, header::PROXY_AUTHORIZATION};
 use hyper::{body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use subtle::ConstantTimeEq;
@@ -33,7 +33,7 @@ use xray_common::net::{address::Address, destination::Destination, network::Netw
 use xray_features::inbound::{InboundError, InboundHandler};
 use xray_transport::link::Link;
 
-use crate::{padding::random_padding_header, PaddingReader, PaddingWriter};
+use crate::{PaddingReader, PaddingWriter, padding::random_padding_header};
 
 // log-hot-path-exempt: echo dispatch 伪装回显每包读循环内失败记录 —— 数据面每包路径，保留原样
 /// 统一响应 body：CONNECT 200 / 404 / 407 均为空 body。

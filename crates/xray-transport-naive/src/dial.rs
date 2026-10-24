@@ -16,12 +16,12 @@ use std::{
     io,
     pin::Pin,
     sync::{Arc, Mutex},
-    task::{ready, Context, Poll},
+    task::{Context, Poll, ready},
 };
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use bytes::Bytes;
-use http::{header::HeaderValue, Method, StatusCode};
+use http::{Method, StatusCode, header::HeaderValue};
 use hyper::{
     client::conn::http2,
     upgrade::{OnUpgrade, Upgraded},
@@ -34,7 +34,7 @@ use xray_transport::{connection::Connection, sockopt::SocketOptions, system_dial
 
 use crate::{
     padding::{
-        encode_frame, random_padding_header, random_padding_size, PaddingDecoder, FIRST_PADDINGS,
+        FIRST_PADDINGS, PaddingDecoder, encode_frame, random_padding_header, random_padding_size,
     },
     uri::NaiveConfig,
 };

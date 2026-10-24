@@ -20,9 +20,9 @@ use std::{io, net::SocketAddr, sync::Arc};
 use xray_common::net::destination::Destination;
 use xray_transport::{
     connection::Connection,
-    dialer::{register_transport_dialer, StreamSettings, TransportDialFn},
+    dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
     listener_registry::{
-        register_transport_listener, ConnHandler, TransportListenFn, TransportListener,
+        ConnHandler, TransportListenFn, TransportListener, register_transport_listener,
     },
     sockopt::SocketOptions,
 };
@@ -102,7 +102,7 @@ async fn listen_httpupgrade(
     // accept task 的 abort 句柄：close() 直接取消 task，parked 在 accept() 上的
     // 循环被确定性解除，TcpListener drop 即释放端口（对齐 Go hub.go Close()）。
     let accept_task = tokio::spawn(async move {
-        use xray_transport::accept_policy::{backoff_if_resource, classify, AcceptErrorKind};
+        use xray_transport::accept_policy::{AcceptErrorKind, backoff_if_resource, classify};
         loop {
             let (mut tcp, mut remote) = match listener.accept().await {
                 Ok(pair) => pair,

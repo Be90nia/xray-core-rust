@@ -11,6 +11,9 @@ rust-version.workspace = true
 # default-features = false 避开 runtime/pool 默认档拖入运行时面。
 default = ["shutdown-coordinator"]
 shutdown-coordinator = ["dep:udf-skeleton-infra", "dep:xray-frame"]
+# B5 step4：framework 注入点（`start_full_with_outbound_handlers`，出站 handler 由
+# xray-cli framework 桥灌入）——仅门控该函数的存在，default 构建下不可见，行为零变化。
+framework-assembly = []
 
 [dependencies]
 xray-common = { path = "../xray-common" }

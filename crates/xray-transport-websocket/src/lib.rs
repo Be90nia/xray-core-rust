@@ -48,8 +48,8 @@ pub mod ws_bridge;
 // 顶层 re-export。
 pub use config::Config;
 pub use error::{Result, WsError};
-pub use handshake::{compute_accept_key, generate_client_key_for_testing, Opcode, WS_GUID};
-pub use pool::{global_pool, reconfigure_global_pool, PoolKey, WsConnectionPool, WsPoolConfig};
+pub use handshake::{Opcode, WS_GUID, compute_accept_key, generate_client_key_for_testing};
+pub use pool::{PoolKey, WsConnectionPool, WsPoolConfig, global_pool, reconfigure_global_pool};
 pub use register::{register_dialer, register_listener};
 pub use server::{AcceptedConn, WsListener};
 pub use ws_bridge::WsConnection;

@@ -525,7 +525,7 @@ pub trait HunkStream: Send {
 
     /// 发送一个 Hunk（自动加 frame 头）。
     fn send_hunk(&mut self, data: Vec<u8>)
-        -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+    -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
 
     /// 关闭发送方向（客户端表示请求结束）。
     fn close_send(&mut self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;

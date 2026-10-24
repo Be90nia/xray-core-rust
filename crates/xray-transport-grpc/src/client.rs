@@ -67,11 +67,7 @@ impl GrpcClient {
     /// 返回当前选择的 stream 名（multi_mode ? multi : tun）。
     #[must_use]
     pub fn active_stream_name(&self) -> &str {
-        if self.multi_mode {
-            &self.tun_multi_stream_name
-        } else {
-            &self.tun_stream_name
-        }
+        if self.multi_mode { &self.tun_multi_stream_name } else { &self.tun_stream_name }
     }
 }
 
