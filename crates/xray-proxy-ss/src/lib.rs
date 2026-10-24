@@ -27,6 +27,7 @@ pub mod dispatcher;
 pub mod error;
 pub mod inbound;
 pub mod outbound;
+pub mod plugin;
 pub mod protocol;
 pub mod server;
 pub mod ss2022;
@@ -40,6 +41,7 @@ pub use dispatcher::{
 pub use error::{Result, SsError};
 pub use inbound::SsInbound;
 pub use outbound::SsOutbound;
+pub use plugin::{SsFace, SsPlugin};
 pub use ss2022::{
     CipherKind2022, Client2022, InboundResult, MultiUserInbound, RelayDestination, RelayInbound,
     Ss2022Inbound, Ss2022Outbound, Ss2022OutboundConfig, Ss2022User, UdpOverTcpConfig,

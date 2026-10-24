@@ -14,15 +14,19 @@
 //!   （trojan/http/socks/tuic/hysteria/anytls/wireguard/dns/tun——客户端解析在 xray-core 内部，经
 //!   pub `outbound::build_single_outbound` 复用）；入站 = `InboundDispatchHandler` （生产同款 tag
 //!   面）。转换失败逐条计数 + 日志（成功几个算几个），重复 tag 拒绝（不覆盖）；
-//!   该族消费不了的条目级面（[`EntryFacet`]：proxyChain / mux / sendThrough）在场即拒。
+//!   该族消费不了的条目级面（[`EntryFacet`]）在场即拒。代理链拆两态：应用层
+//!   （`proxySettings.tag`）插件缝族经 [`ChainSlot`] 装配后 late-bind（生产 `register_outbounds`
+//!   Phase 2 同款）；传输层（`sockopt.dialerProxy`）与 mux / sendThrough 仍拒（见
+//!   [`EntryFacet::reason`]）。
 //! - **段路由**：装配根 `with_config(config_root)`（`Config::to_json_value()`
 //!   同源投影，禁从原文件二次解析），插件 build 期经 `ctx.section()` 取自己 那段（缺段
 //!   fail-fast，L5）。
 //!
 //! 探针（[`AssemblyProbe`]）恒注册：装配链贯通的金丝雀。v0.1 已知限制：同
 //! protocol 多实例条目只转换首个（xray-frame v0.1 每 protocol 只 build 首段，
-//! 余者记账失败）；loopback 出站缺回注 sink（需 xray-core 注入点交出 dispatcher）；
-//! 代理链与 mux 包装属 `register_outbounds` 内接线，框架注入臂未接。
+//! 余者记账失败）；传输层代理链与 mux 包装属 `register_outbounds` 内接线（全局
+//! 钩子 / MuxBridge），框架注入臂未接；core 单构建族的应用层代理链被
+//! `build_single_outbound` 丢参守卫。
 
 use std::{
     collections::HashMap,
@@ -55,6 +59,7 @@ use xray_proxy_http::HttpPlugin;
 use xray_proxy_hysteria::HysteriaPlugin;
 use xray_proxy_loopback::{LoopbackError, LoopbackPlugin, LoopbackSink};
 use xray_proxy_socks::SocksPlugin;
+use xray_proxy_ss::SsPlugin;
 use xray_proxy_trojan::TrojanPlugin;
 use xray_proxy_tuic::TuicPlugin;
 use xray_proxy_tun::TunPlugin;
@@ -149,12 +154,32 @@ struct RegisteredFamily {
     /// loopback 专用：回注 sink 的 late-bind 槽（其余族 `None`）。handler 构造期
     /// 生产 sink 尚不存在（dispatcher 在注入点内才就绪），装配返回后回填。
     loopback_slot: Option<LoopbackSlot>,
+    /// 代理链 late-bind 槽（插件缝族有，其余 `None`）：填表时收集 chained
+    /// `DialBridge` + tag，装配返回出站表后回填 `set_proxy_chain`。
+    chain_slot: Option<ChainSlot>,
 }
 
 /// loopback 回注缝的 late-bind 槽：桥填表时随 handler 注入
 /// [`DeferredLoopbackSink`] 占位，`start_full_with_outbound_handlers` 返回生产
 /// sink（`DispatcherLoopbackSink`）后由 [`run_framework_until`] 回填。
 type LoopbackSlot = Arc<OnceLock<Arc<dyn LoopbackSink>>>;
+
+/// 代理链 late-bind 槽（[`LoopbackSlot`] 同族）：桥填表时随 handler 收集
+/// `(DialBridge, chain_tag)`，装配返回出站表（`Arc<SimpleOhm>`）后由
+/// [`run_framework_until`] 回填 `set_proxy_chain`——生产 `register_outbounds`
+/// Phase 2 同款（表就绪前 chained dispatch 查无 manager）。
+type ChainSlot = Arc<Mutex<Vec<(Arc<DialBridge>, String)>>>;
+
+/// `proxySettings.tag` 非空 tag 提取（生产 `parse_proxy_chain_tag` 同规：缺失/
+/// 空串 = 无链；tagless proxySettings 生产视为 inert，不拒）。
+fn proxy_chain_tag(ob: &BuiltOutbound) -> Option<String> {
+    ob.proxy_settings_json
+        .as_ref()
+        .and_then(|v| v.get("tag"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_string)
+}
 
 /// loopback 条目的重分发 sniffing：`settings.sniffing` → xray-core wiring 权威
 /// 解析（`sniffing_request_from_json`，destOverride 别名归一 / 排除表的 geodata
@@ -192,12 +217,18 @@ impl LoopbackSink for DeferredLoopbackSink {
 /// core 单构建族原生消费、blackhole/loopback 生产同样忽略——故不入本枚举）。
 #[derive(Clone, Copy)]
 enum EntryFacet {
-    /// 代理链：`proxySettings.tag` 与 `streamSettings.sockopt.dialerProxy` 是 Go
-    /// 同一条"非最终出站"判据（freedom.go:193-198）。两者都要出站表 Phase 2
-    /// （`DialBridge::set_proxy_chain` 的 `OutboundHandlerManager` / 全局
-    /// `set_dialer_proxy_hook`），只在 `register_outbounds` 内接线——框架注入臂
-    /// 既无出站表也不装钩子。
-    ProxyChain,
+    /// 应用层代理链（`proxySettings.tag` 非空）：dispatch 经 chained handler
+    /// （`DialBridge::set_proxy_chain` + `OutboundHandlerManager` 查表）。插件缝族
+    /// 已解封：族自有 [`ChainSlot`]，装配返回出站表后 late-bind（生产
+    /// `register_outbounds` Phase 2 同款）。core 单构建族仍拒——
+    /// `build_single_outbound` 丢弃三组件装配形态的 bridge ref + tag，框架看不
+    /// 见 `DialBridge` 就无法 late-bind。
+    ProxyChainTag,
+    /// 传输层代理链（`sockopt.dialerProxy` 非空）：拨号重定向走全局
+    /// `DIALER_PROXY_HOOK`（pipe + chained Dispatch，Go dialer.go:270-279），
+    /// 安装点在 `register_outbounds` 尾部；框架注入臂不装钩子（xray-core 未
+    /// 暴露 pub 安装入口），sockopts 兄弟键覆盖与否均同拒。
+    DialerProxy,
     /// `mux` 包装（`MuxBridge` 承载会话复用）。
     Mux,
     /// `sendThrough`（源地址/CIDR 解析 + `DIAL_SRC` 拨号包装）。
@@ -208,16 +239,14 @@ impl EntryFacet {
     /// 该面在条目上是否在场（在场 = 转换会丢语义）。
     fn present(self, ob: &BuiltOutbound) -> bool {
         match self {
-            Self::ProxyChain => {
-                ob.proxy_settings_json.is_some()
-                    || ob
-                        .stream_settings_json
-                        .as_ref()
-                        .and_then(|s| s.get("sockopt"))
-                        .and_then(|s| s.get("dialerProxy"))
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|tag| !tag.is_empty())
-            },
+            Self::ProxyChainTag => proxy_chain_tag(ob).is_some(),
+            Self::DialerProxy => ob
+                .stream_settings_json
+                .as_ref()
+                .and_then(|s| s.get("sockopt"))
+                .and_then(|s| s.get("dialerProxy"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|tag| !tag.is_empty()),
             Self::Mux => ob.mux_json.is_some(),
             Self::SendThrough => ob.send_through.is_some(),
         }
@@ -225,10 +254,16 @@ impl EntryFacet {
 
     fn reason(self) -> &'static str {
         match self {
-            Self::ProxyChain => {
-                "proxy chain (proxySettings.tag / sockopt.dialerProxy) needs the outbound-table \
-                 phase 2 owned by register_outbounds (set_proxy_chain / dialer-proxy hook); the \
-                 framework injection arm has neither"
+            Self::ProxyChainTag => {
+                "proxySettings.tag chain needs the outbound-table phase 2 (DialBridge \
+                 set_proxy_chain), but xray-core build_single_outbound drops the DialBridge \
+                 reference and chain tag (three-component shape is pub(crate)); the framework \
+                 cannot late-bind what it cannot see"
+            },
+            Self::DialerProxy => {
+                "sockopt.dialerProxy redirects the transport dial through the global \
+                 DIALER_PROXY_HOOK, which only register_outbounds installs; the framework \
+                 injection arm has no hook (xray-core exposes no public hook installer)"
             },
             Self::Mux => "mux wrapping (MuxBridge) is not applied by this family's conversion",
             Self::SendThrough => {
@@ -239,15 +274,15 @@ impl EntryFacet {
     }
 }
 
-/// 插件缝族（freedom/vmess/vless）：transport 已接（`with_stream_settings`），
-/// 其余条目级面未接。
+/// 插件缝族（freedom/vmess/vless）：transport 与应用层代理链已接（后者经
+/// [`ChainSlot`] late-bind），其余条目级面未接。
 const PLUGIN_SEAM_UNHANDLED: &[EntryFacet] =
-    &[EntryFacet::ProxyChain, EntryFacet::Mux, EntryFacet::SendThrough];
+    &[EntryFacet::DialerProxy, EntryFacet::Mux, EntryFacet::SendThrough];
 
 /// `xray-core` 单出站构建族：原生消费 `streamSettings`/`sendThrough`/`mux`，
-/// 但 `build_single_outbound` 丢弃 `proxy_chain_tag`（三组件装配形态的第二元），
-/// 故代理链仍需守卫。
-const CORE_SINGLE_UNHANDLED: &[EntryFacet] = &[EntryFacet::ProxyChain];
+/// 但 `build_single_outbound` 丢弃 `proxy_chain_tag` 与 DialBridge 引用（三组件
+/// 装配形态的第二、三元），两类代理链仍拒。
+const CORE_SINGLE_UNHANDLED: &[EntryFacet] = &[EntryFacet::ProxyChainTag, EntryFacet::DialerProxy];
 
 /// 入站面族：插件产出 inbound server（listener 面由 `spawn_inbounds` 消费）；
 /// 桥面 = [`InboundDispatchHandler`]（tag 派生，不依赖插件状态，[`fill_bridge`]
@@ -259,6 +294,7 @@ fn inbound_only<P: Plugin + Default + 'static>(protocol: &'static str) -> Regist
         outbound: None,
         unhandled: &[],
         loopback_slot: None,
+        chain_slot: None,
     }
 }
 
@@ -274,6 +310,7 @@ fn core_outbound_family<P: Plugin + Default + 'static>(protocol: &'static str) -
         plugin: Arc::new(P::default()),
         unhandled: CORE_SINGLE_UNHANDLED,
         loopback_slot: None,
+        chain_slot: None,
         outbound: Some(Arc::new(|ob| {
             xray_core::outbound::build_single_outbound(ob).map_err(|e| match e {
                 // Unsupported 携带的是协议名或平台拒绝文案（如非 Linux 的 TUN），
@@ -304,8 +341,8 @@ fn stream_settings(ob: &BuiltOutbound) -> Option<StreamSettings> {
 
 /// `dial_fn` 形态出站族（vmess/vless）：插件暴露已解析的出站配置（`built_outbound`）
 /// + `DialFn`（既有拨号语义全量）；桥补条目级 transport（生产
-/// `build_vmess_outbound`/`build_vless_outbound` 同款 `with_stream_settings`），
-/// 再经 dispatcher 自家的 [`DialBridge`] 适配成 `DispatchHandler`。
+///   `build_vmess_outbound`/`build_vless_outbound` 同款 `with_stream_settings`）， 再经 dispatcher
+///   自家的 [`DialBridge`] 适配成 `DispatchHandler`。
 fn dial_fn_family<P, F>(protocol: &'static str, dial: F) -> RegisteredFamily
 where
     P: Plugin + Default + 'static,
@@ -316,13 +353,23 @@ where
 {
     let plugin = Arc::new(P::default());
     let p = Arc::clone(&plugin);
+    let chain_slot: ChainSlot = Arc::new(Mutex::new(Vec::new()));
+    let slots = Arc::clone(&chain_slot);
     RegisteredFamily {
         protocol,
         unhandled: PLUGIN_SEAM_UNHANDLED,
         loopback_slot: None,
+        chain_slot: Some(chain_slot),
         outbound: Some(Arc::new(move |ob| {
             let dial_fn = dial(&p, stream_settings(ob)).map_err(|e| e.to_string())?;
-            Ok(Arc::new(DialBridge::new(ob.tag.clone(), dial_fn)) as Arc<dyn DispatchHandler>)
+            let bridge = Arc::new(DialBridge::new(ob.tag.clone(), dial_fn));
+            if let Some(chain_tag) = proxy_chain_tag(ob) {
+                slots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((Arc::clone(&bridge), chain_tag));
+            }
+            Ok(bridge as Arc<dyn DispatchHandler>)
         })),
         plugin,
     }
@@ -335,10 +382,13 @@ where
 fn freedom_family() -> RegisteredFamily {
     let plugin = Arc::new(FreedomPlugin::default());
     let p = Arc::clone(&plugin);
+    let chain_slot: ChainSlot = Arc::new(Mutex::new(Vec::new()));
+    let slots = Arc::clone(&chain_slot);
     RegisteredFamily {
         protocol: "freedom",
         unhandled: PLUGIN_SEAM_UNHANDLED,
         loopback_slot: None,
+        chain_slot: Some(chain_slot),
         outbound: Some(Arc::new(move |ob| {
             let cfg = p.built_config().map_err(|e| e.to_string())?.clone();
             let dial_bridge = Arc::new(DialBridge::new(
@@ -346,12 +396,31 @@ fn freedom_family() -> RegisteredFamily {
                 make_freedom_dial_fn_with_config(cfg.clone()),
             ));
             dial_bridge.set_splice_outbound(true);
-            let final_rules = cfg
-                .final_rules
-                .iter()
-                .map(FinalRule::build)
-                .collect::<xray_proxy_freedom::Result<Vec<_>>>()
-                .map_err(|e| format!("freedom finalRule: {e}"))?;
+            let chain_tag = proxy_chain_tag(ob);
+            // 链上 freedom 非最终出站：finalRules 不构建（配了则 warn），Go
+            // freedom.go:193-198 + 生产 build_freedom_outbound 同款（生产同文本）。
+            let final_rules = if chain_tag.is_some() {
+                if !cfg.final_rules.is_empty() {
+                    crate::LOG.warn(format!(
+                        "framework: freedom tag={:?}: The \"finalRules\" setting is ignored when \
+                         \"sockopt.dialerProxy\" is set, since freedom is not the final outbound.",
+                        ob.tag
+                    ));
+                }
+                Vec::new()
+            } else {
+                cfg.final_rules
+                    .iter()
+                    .map(FinalRule::build)
+                    .collect::<xray_proxy_freedom::Result<Vec<_>>>()
+                    .map_err(|e| format!("freedom finalRule: {e}"))?
+            };
+            if let Some(chain_tag) = chain_tag {
+                slots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((Arc::clone(&dial_bridge), chain_tag));
+            }
             let handler = FreedomDispatchBridge::from_bridge(dial_bridge)
                 .with_noises(cfg.noises.clone())
                 .with_destination_override(cfg.destination_override.clone())
@@ -374,6 +443,7 @@ fn blackhole_family() -> RegisteredFamily {
         // 忽略；mux 包装对本族无语义（流量全丢）。
         unhandled: &[],
         loopback_slot: None,
+        chain_slot: None,
         outbound: Some(Arc::new(move |ob| {
             let handler = p.dispatch_handler(&ob.tag).map_err(|e| e.to_string())?;
             Ok(Arc::new(handler) as Arc<dyn DispatchHandler>)
@@ -397,6 +467,7 @@ fn loopback_family() -> RegisteredFamily {
         // 生产同样忽略；mux 包装对本族无语义（链接回注即重新选路）。
         unhandled: &[],
         loopback_slot: Some(Arc::clone(&slot)),
+        chain_slot: None,
         outbound: Some(Arc::new(move |ob| {
             let handler = p
                 .handler(&ob.tag)
@@ -436,6 +507,10 @@ fn family_catalog(protocol: &str) -> Option<RegisteredFamily> {
         "vless" => dial_fn_family::<VlessPlugin, _>("vless", |p, stream| {
             let config = (**p.built_outbound()?).clone().with_stream_settings(stream);
             Ok(xray_proxy_vless::make_vless_dial_fn(Arc::new(config)))
+        }),
+        "shadowsocks" => dial_fn_family::<SsPlugin, _>("shadowsocks", |p, stream| {
+            let config = (**p.built_outbound()?).clone().with_stream_settings(stream);
+            Ok(xray_proxy_ss::make_ss_dial_fn(Arc::new(config)))
         }),
         "blackhole" => blackhole_family(),
         "loopback" => loopback_family(),
@@ -508,6 +583,8 @@ struct BridgeFill {
     outbound_handlers: Vec<Arc<dyn DispatchHandler>>,
     /// 本桥 loopback handler 的回注 late-bind 槽——装配返回生产 sink 后回填。
     loopback_slots: Vec<LoopbackSlot>,
+    /// 本桥插件缝族的代理链 late-bind 槽——装配返回出站表后回填。
+    chain_slots: Vec<ChainSlot>,
 }
 
 /// 出站条目的转换前守卫：该族转换缝**不消费**的条目级面在场 → 拒（不静默丢
@@ -539,6 +616,10 @@ fn fill_bridge(
         loopback_slots: families
             .iter()
             .filter_map(|family| family.loopback_slot.as_ref().map(Arc::clone))
+            .collect(),
+        chain_slots: families
+            .iter()
+            .filter_map(|family| family.chain_slot.as_ref().map(Arc::clone))
             .collect(),
     };
     // v0.1：同 protocol 多实例只转换首个（xray-frame 每 protocol 只 build 首段）；
@@ -634,6 +715,24 @@ fn assemble(config_root: serde_json::Value, families: &[RegisteredFamily]) -> Re
         .map_err(|e| CliError::StartFailed(format!("framework assemble failed: {e}")))
 }
 
+/// 代理链 late-bind（生产 `register_outbounds` Phase 2 同款）：出站表就绪后为
+/// 各 chained [`DialBridge`] 回填 `(chain_tag, manager)`。返回回填对数。
+fn bind_proxy_chains(
+    chain_slots: &[ChainSlot],
+    manager: Arc<dyn xray_app_dispatcher::OutboundHandlerManager>,
+) -> usize {
+    let mut bound = 0;
+    for slot in chain_slots {
+        for (bridge, chain_tag) in
+            slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).drain(..)
+        {
+            bridge.set_proxy_chain(chain_tag, Arc::clone(&manager));
+            bound += 1;
+        }
+    }
+    bound
+}
+
 /// 框架路径主流程：配置派生注册 → 装配 build → bring_up → 桥填表 → 等信号 →
 /// 停机报告。
 ///
@@ -676,7 +775,7 @@ pub(crate) async fn run_framework_until(
 
     // ③ 桥：插件 → dispatcher 可调 handler 填表（失败逐条计数 + 日志）。
     let dispatcher = Arc::new(DefaultDispatcher::new());
-    let BridgeFill { bridge, ok, failed, outbound_handlers, loopback_slots } =
+    let BridgeFill { bridge, ok, failed, outbound_handlers, loopback_slots, chain_slots } =
         fill_bridge(built, &plan.families, &dispatcher);
     for (tag, reason) in &failed {
         crate::LOG.warn(format!("framework: bridge conversion failed tag={tag:?}: {reason}"));
@@ -693,7 +792,7 @@ pub(crate) async fn run_framework_until(
     // sniffing/stats/access-log 与 start_full 同一条路，per-inbound
     // InboundDispatchHandler+MuxCarrier 由 spawn_inbounds 既有机制承担），唯一差异 =
     // 出站 handler 由本桥灌入（feature 门控注入点，禁第二套 dispatcher）。
-    let (instance, _ohm, handles, loopback_sink) =
+    let (instance, ohm, handles, loopback_sink) =
         xray_core::functions::start_full_with_outbound_handlers(built, outbound_handlers)
             .await
             .map_err(|e| CliError::StartFailed(format!("framework inbound start failed: {e}")))?;
@@ -712,6 +811,15 @@ pub(crate) async fn run_framework_until(
             "framework: loopback re-injection sink bound ({} slot(s))",
             loopback_slots.len()
         ));
+    }
+
+    // 代理链 late-bind（生产 register_outbounds Phase 2 同款）：出站表此刻已就绪，
+    // 回填 chained DialBridge 的 (chain_tag, manager)。回填前的极小窗口内 chained
+    // 出站按未配链直拨（DialBridge dispatch 先判 chain_tag）——与 loopback 回注
+    // 窗同源；零窗口需 dispatcher 拆分 tag/manager setter（本轮不动 xray-core）。
+    let chain_bound = bind_proxy_chains(&chain_slots, ohm);
+    if chain_bound > 0 {
+        crate::LOG.info(format!("framework: proxy chains bound ({chain_bound} chain(s))"));
     }
 
     shutdown_signal.await;
@@ -916,7 +1024,10 @@ mod tests {
             r#"{{"servers":[{{"address":"127.0.0.1","port":443,"uuid":"{UUID}","password":"pw"}}]}}"#
         );
         // (protocol, settings, streamSettings, 期望) —— Ok = 真转换；Err(关键词) = 记账失败。
-        let cases: &[(&str, &str, Option<&str>, std::result::Result<(), &str>)] = &[
+        // clippy type_complexity 拆型（用例原文不动；settings 两行借用本地 format!）。
+        type CoreFamilyCase<'a> =
+            (&'a str, &'a str, Option<&'a str>, std::result::Result<(), &'a str>);
+        let cases: &[CoreFamilyCase<'_>] = &[
             (
                 "trojan",
                 r#"{"servers":[{"address":"127.0.0.1","port":443,"password":"pw"}]}"#,
@@ -999,10 +1110,11 @@ mod tests {
         }
     }
 
-    /// C：四面守卫按族能力表判定。插件缝族（vmess/vless/freedom）只接了 transport，
-    /// 其余条目级面仍拒；core 单构建族原生消费 streamSettings/sendThrough/mux，只拒
-    /// 代理链（`build_single_outbound` 丢弃 chain tag）；blackhole/loopback 生产同样
-    /// 忽略这些面（无拨号腿），故不拒。
+    /// C：守卫按族能力表判定。插件缝族（vmess/vless/freedom）接了 transport +
+    /// 应用层代理链（`proxySettings.tag` → [`ChainSlot`] late-bind，本测试只看
+    /// 守卫放行），传输层代理链/mux/sendThrough 仍拒；core 单构建族原生消费
+    /// streamSettings/sendThrough/mux，两类代理链拒（`build_single_outbound`
+    /// 丢参）；blackhole/loopback 生产同样忽略这些面（无拨号腿），故不拒。
     #[test]
     fn guard_facets_follow_family_capability_table() {
         let plugin_seam = family_catalog("vless").expect("vless family");
@@ -1026,14 +1138,14 @@ mod tests {
             ob.stream_settings_json = Some(serde_json::json!({"network": "ws", "security": "tls"}));
         });
 
-        // 插件缝：仅 transport 解封。
-        assert!(guard_outbound_entry(&proxy_chain, &plugin_seam).is_err());
+        // 插件缝：transport + 应用层代理链解封（后者 late-bind）。
+        assert!(guard_outbound_entry(&proxy_chain, &plugin_seam).is_ok());
         assert!(guard_outbound_entry(&dialer_proxy, &plugin_seam).is_err());
         assert!(guard_outbound_entry(&mux, &plugin_seam).is_err());
         assert!(guard_outbound_entry(&send_through, &plugin_seam).is_err());
         assert!(guard_outbound_entry(&stream, &plugin_seam).is_ok());
 
-        // core 单构建：transport / sendThrough / mux 原生消费，代理链仍拒。
+        // core 单构建：transport / sendThrough / mux 原生消费，两类代理链仍拒。
         assert!(guard_outbound_entry(&stream, &core_route).is_ok());
         assert!(guard_outbound_entry(&send_through, &core_route).is_ok());
         assert!(guard_outbound_entry(&mux, &core_route).is_ok());
@@ -1044,6 +1156,145 @@ mod tests {
         for ob in [&proxy_chain, &dialer_proxy, &mux, &send_through, &stream] {
             assert!(guard_outbound_entry(ob, &ignoring).is_ok());
         }
+    }
+
+    /// B5 守卫收尾（proxyChain 解封）：应用层代理链（`proxySettings.tag`）端到端
+    /// late-bind——vmess 链到 blackhole 的配置转换成功、链对随 [`ChainSlot`]
+    /// 收集、出站表就绪后 `bind_proxy_chains` 回填（生产 Phase 2 等价形态）且
+    /// 链目标在表中可查。
+    #[test]
+    fn proxy_chain_tag_late_binds_after_outbound_table() {
+        use xray_app_dispatcher::OutboundHandlerManager;
+
+        let (built, root, plan) = plan_from_json(
+            r#"{
+            "outbounds": [{
+                "protocol": "blackhole", "tag": "block", "settings": {}
+            }, {
+                "protocol": "vmess", "tag": "vmess-out",
+                "settings": {"vnext": [{"address": "127.0.0.1", "port": 8443,
+                    "users": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811", "security": "auto"}]}]},
+                "proxySettings": {"tag": "block"}
+            }]
+        }"#,
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut framework = assemble(root, &plan.families).expect("assemble");
+            framework.bring_up().expect("bring_up");
+
+            let dispatcher = Arc::new(DefaultDispatcher::new());
+            let fill = fill_bridge(&built, &plan.families, &dispatcher);
+            assert!(fill.failed.is_empty(), "unexpected failures: {:?}", fill.failed);
+            assert_eq!(fill.bridge.get("vmess-out").expect("vmess handler").tag(), "vmess-out");
+            assert_eq!(fill.chain_slots.len(), 1, "vmess family exposes one chain slot");
+
+            // 链对收集：tag 来自 proxySettings，bridge 与 handler 同源。
+            let (chained_bridge, chain_tag) = {
+                let pairs =
+                    fill.chain_slots[0].lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert_eq!(pairs.len(), 1, "one chained entry collected: {:?}", *pairs);
+                (Arc::clone(&pairs[0].0), pairs[0].1.clone())
+            };
+            assert_eq!(chain_tag, "block", "chain tag parsed from proxySettings");
+            assert!(!chained_bridge.has_proxy_chain(), "must stay unbound before the table exists");
+
+            // late-bind：出站表就绪形态（SimpleOhm 灌入两 handler，首个 = default，
+            // 与 start_full_with_outbound_handlers 注入序同构）→ 回填成功。
+            let ohm = Arc::new(xray_app_dispatcher::SimpleOhm::new());
+            for handler in &fill.outbound_handlers {
+                if ohm.get_default_handler().is_none() {
+                    ohm.set_default(Arc::clone(handler));
+                }
+                ohm.add(handler.tag(), Arc::clone(handler));
+            }
+            assert!(
+                ohm.get_handler("block").is_some(),
+                "chain target must resolve in the outbound table"
+            );
+            assert_eq!(
+                bind_proxy_chains(
+                    &fill.chain_slots,
+                    Arc::clone(&ohm) as Arc<dyn OutboundHandlerManager>
+                ),
+                1,
+                "exactly one chain pair bound"
+            );
+            assert!(chained_bridge.has_proxy_chain(), "late-bind must configure the bridge");
+            assert!(
+                fill.chain_slots[0]
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty(),
+                "slots drained after bind"
+            );
+
+            framework.shutdown().await;
+        });
+    }
+
+    /// 传输层代理链（`sockopt.dialerProxy`）仍守卫：拒绝理由点名全局钩子与安装
+    /// 点；sockopt 兄弟键覆盖在场同拒（同机制，与覆盖无关）。
+    #[test]
+    fn dialer_proxy_stays_guarded_with_hook_reason() {
+        let vless = family_catalog("vless").expect("vless family");
+        let mut ob = outbound_entry("vless", "vless-out", b"{}");
+        ob.stream_settings_json =
+            Some(serde_json::json!({"sockopt": {"dialerProxy": "hop", "mark": 42}}));
+        let err = guard_outbound_entry(&ob, &vless).expect_err("dialerProxy must stay rejected");
+        assert!(err.contains("DIALER_PROXY_HOOK"), "reason must name the hook: {err}");
+        assert!(err.contains("register_outbounds"), "reason must name the installer: {err}");
+    }
+
+    /// core 单构建族应用层代理链守卫：`build_single_outbound` 丢 DialBridge 引用
+    /// 与 tag，框架无法 late-bind，理由点名丢参。
+    #[test]
+    fn core_single_family_proxy_chain_tag_stays_guarded() {
+        let trojan = family_catalog("trojan").expect("trojan family");
+        let mut ob = outbound_entry("trojan", "trojan-out", b"{}");
+        ob.proxy_settings_json = Some(serde_json::json!({"tag": "hop"}));
+        let err = guard_outbound_entry(&ob, &trojan)
+            .expect_err("proxySettings.tag must stay rejected on core families");
+        assert!(err.contains("build_single_outbound"), "reason must name the dropped ref: {err}");
+    }
+
+    /// freedom 链上形态（Go freedom.go:193-198 镜像）：配 finalRules + 链 →
+    /// 转换成功（规则不构建，warn 记账）且链对入槽；无链时同配置照常构建。
+    #[test]
+    fn freedom_chained_entry_converts_and_skips_final_rules() {
+        let (built, root, plan) = plan_from_json(
+            r#"{
+            "outbounds": [{
+                "protocol": "blackhole", "tag": "block", "settings": {}
+            }, {
+                "protocol": "freedom", "tag": "freedom-out",
+                "settings": {"finalRules": [{"action": "allow"}]},
+                "proxySettings": {"tag": "block"}
+            }]
+        }"#,
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut framework = assemble(root, &plan.families).expect("assemble");
+            framework.bring_up().expect("bring_up");
+
+            let dispatcher = Arc::new(DefaultDispatcher::new());
+            let fill = fill_bridge(&built, &plan.families, &dispatcher);
+            assert!(fill.failed.is_empty(), "unexpected failures: {:?}", fill.failed);
+            assert_eq!(
+                fill.bridge.get("freedom-out").expect("freedom handler").tag(),
+                "freedom-out"
+            );
+            let pairs = fill
+                .chain_slots
+                .iter()
+                .flat_map(|s| s.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone())
+                .collect::<Vec<_>>();
+            assert_eq!(pairs.len(), 1, "freedom chain pair collected: {pairs:?}");
+            assert_eq!(pairs[0].1, "block");
+
+            framework.shutdown().await;
+        });
     }
 
     /// transport 折叠规则与生产 `outbound::parse_stream_settings`（pub(crate)）同规：

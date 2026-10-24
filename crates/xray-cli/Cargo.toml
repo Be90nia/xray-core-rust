@@ -68,6 +68,7 @@ xray-proxy-vmess = { path = "../xray-proxy-vmess", optional = true }
 xray-proxy-freedom = { path = "../xray-proxy-freedom", optional = true }
 xray-proxy-blackhole = { path = "../xray-proxy-blackhole", optional = true }
 xray-proxy-loopback = { path = "../xray-proxy-loopback", optional = true }
+xray-proxy-ss = { path = "../xray-proxy-ss", optional = true }
 
 [features]
 default = ["mimalloc"]
@@ -96,6 +97,7 @@ framework-assembly = [
     "dep:xray-proxy-freedom",
     "dep:xray-proxy-blackhole",
     "dep:xray-proxy-loopback",
+    "dep:xray-proxy-ss",
 ]
 
 [dev-dependencies]

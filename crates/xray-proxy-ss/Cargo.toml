@@ -21,6 +21,10 @@ xray-proto = { path = "../xray-proto" }
 xray-transport = { path = "../xray-transport" }
 xray-app-dispatcher = { path = "../xray-app-dispatcher" }
 xray-xudp = { path = "../xray-xudp" }
+# P2 ss 插件化：L1/L4 面来自装配框架（src/plugin.rs impl xray_frame::Plugin
+# 是生产代码——cargo 模型下必须生产依赖；xray-frame 不依赖协议 crate，无环，
+# 拍板 P2.1 的"防环"由 xray-frame 单向不引协议 crate 保证）。
+xray-frame = { path = "../xray-frame" }
 serde_json = { workspace = true }
 # - aes-gcm：AES-128-GCM / AES-256-GCM
 # - chacha20poly1305：ChaCha20-Poly1305 / XChaCha20-Poly1305
