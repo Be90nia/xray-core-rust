@@ -109,9 +109,16 @@ jobs:
           } elseif ($env:RUNNER_OS -eq "macOS") {
             brew install protobuf
           } else {
-            # choco 包名是 protoc（protobuf 包不存在）；装到 C:\ProgramData\chocolatey\bin
-            choco install -y protoc 2>&1 | Out-Null
-            echo "C:\ProgramData\chocolatey\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+            # choco 的 protoc 包 exit 0 但 shim 不落 C:\ProgramData\chocolatey\bin
+            # （2026-10-24 run 40048205742 实证：Install 步绿，cargo 仍报
+            #  Could not find `protoc`）→ 直接取官方 win64 zip，与 Linux 分支同版本。
+            $ver = "25.1"
+            Invoke-WebRequest -UseBasicParsing `
+              -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$ver/protoc-$ver-win64.zip" `
+              -OutFile "$env:RUNNER_TEMP\protoc.zip"
+            Expand-Archive -Path "$env:RUNNER_TEMP\protoc.zip" -DestinationPath "$env:RUNNER_TEMP\protoc" -Force
+            echo "$env:RUNNER_TEMP\protoc\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+            & "$env:RUNNER_TEMP\protoc\bin\protoc.exe" --version
           }
       # btls-sys bindings 含注入符号（bd mygg/z32z），与 interop/mobile 同源
       # 配方；顺序须在 rust-cache 之后（action 尾部清理恢复的旧 btls-sys 产物）
@@ -172,12 +179,18 @@ jobs:
         with:
           prefix-key: test-win-tun-v1
           key: ${{ env.UDF_HEAD }}
-      # 依赖闭包含 xray-proto(prost-build)，测试构建需要 protoc（与 build job Windows 分支同配方）
+      # 依赖闭包含 xray-proto(prost-build)，测试构建需要 protoc（与 build job Windows 分支同配方：
+      # choco 的 protoc 包不落 shim，改取官方 win64 zip）
       - name: Install protoc
         shell: pwsh
         run: |
-          choco install -y protoc 2>&1 | Out-Null
-          echo "C:\ProgramData\chocolatey\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          $ver = "25.1"
+          Invoke-WebRequest -UseBasicParsing `
+            -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$ver/protoc-$ver-win64.zip" `
+            -OutFile "$env:RUNNER_TEMP\protoc.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\protoc.zip" -DestinationPath "$env:RUNNER_TEMP\protoc" -Force
+          echo "$env:RUNNER_TEMP\protoc\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          & "$env:RUNNER_TEMP\protoc\bin\protoc.exe" --version
       - run: cargo test -p xray-proxy-tun --all-targets
 
   # 安全与许可证审计
@@ -230,6 +243,10 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
+      # fuzz 工作区依赖主 workspace 的 manifest（xray-* path 依赖要能解析），
+      # 而 crates/xray-common 等已接 udf crate → 缺料即 setup-boringssl 阶段
+      # 报 `failed to get udf-skeleton-infra`（2026-10-24 run 40048205742 实证）。
+      - uses: ./.github/actions/fetch-udf
       - uses: dtolnay/rust-toolchain@nightly
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
