@@ -147,6 +147,9 @@ fn invalid(msg: impl Into<String>) -> io::Error {
 }
 
 /// NAT-PMP 网关客户端（绑定本机临时端口，请求/响应走同一 socket）。
+///
+/// socket 在构造时 `connect` 到网关：内核只向上投递**该网关地址:5351** 的应答，
+/// 同 LAN 的伪造响应（含嗅探到源端口后的抢答）在 syscall 层被丢弃，不进解析器。
 #[derive(Debug)]
 pub struct Client {
     sock: UdpSocket,
@@ -165,6 +168,8 @@ impl Client {
         }
         let bind = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
         let sock = UdpSocket::bind(bind).await?;
+        // 源过滤在连接层做：非网关的应答内核直接丢弃（不再逐包比对 peer）
+        sock.connect(SocketAddr::V4(server)).await?;
         Ok(Self { sock, server, timeout })
     }
 
@@ -214,14 +219,14 @@ impl Client {
         let mut last_error: Option<io::Error> = None;
         let mut buf = [0u8; RESPONSE_BUF_LEN];
         loop {
-            self.sock.send_to(&request, self.server).await?;
+            self.sock.send(&request).await?;
             attempt += 1;
             let round_end = (Instant::now() + backoff).min(deadline);
-            match timeout_at(round_end, self.sock.recv_from(&mut buf)).await {
+            match timeout_at(round_end, self.sock.recv(&mut buf)).await {
                 // 超时或 ICMP 不可达（Windows 在网关不监听时报 ECONNRESET）= 本轮无应答
                 Err(_elapsed) => {},
                 Ok(Err(e)) => last_error = Some(e),
-                Ok(Ok((n, _peer))) => return parse(&buf[..n]),
+                Ok(Ok(n)) => return parse(&buf[..n]),
             }
             if attempt >= RETRANSMIT_MAX || Instant::now() >= deadline {
                 let detail = match last_error {
@@ -300,6 +305,28 @@ mod tests {
         let err = parse_mapping_response(&packet).unwrap_err();
         assert!(err.to_string().contains("result code 2"), "{err}");
         assert!(err.to_string().contains("not authorized"), "{err}");
+    }
+
+    /// 伪造应答（源地址不是网关）必须被丢：connect 的源过滤在内核做，
+    /// 抢答者即便拿到客户端源端口也改写不了控制面。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forged_response_from_other_source_is_ignored() {
+        // 网关保持静默（只记账），伪造应答从另一个 socket 投向客户端真实源端口
+        let stub = NatPmpStub::spawn(|_| None).await;
+        let client = Client::connect(stub.addr, Duration::from_millis(900)).await.expect("connect");
+        let rogue = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind rogue");
+        let forged = response(OP_PUBLIC_ADDRESS, 0, &[6, 6, 6, 6]);
+        let probe = tokio::spawn(async move { client.external_address().await });
+        let deadline = Instant::now() + Duration::from_millis(800);
+        while Instant::now() < deadline {
+            for peer in stub.peers() {
+                let _ = rogue.send_to(&forged, peer).await;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let err = probe.await.expect("join").expect_err("forged source must not be accepted");
+        assert!(err.to_string().contains("no response from"), "{err}");
+        assert!(stub.request_count() > 0, "client must have retransmitted");
     }
 
     #[test]

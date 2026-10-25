@@ -1052,6 +1052,15 @@ impl xray_transport::listener_registry::TransportListener for GrpcListener {
     }
 }
 
+impl Drop for GrpcListener {
+    fn drop(&mut self) {
+        // v7nqa：停机只 drop 监听句柄 → 不通知则 accept 循环继续持有 socket
+        // （Go worker.close 显式 hub.Close()，worker.go:151-158；grpc 侧
+        // hub.go:45-48 `Close()` = `s.Stop()`）。
+        let _ = xray_transport::listener_registry::TransportListener::close(self);
+    }
+}
+
 /// gRPC 路径规整：`/{service}/{stream}`（Go `TunCustomName` 等价）。
 pub(crate) fn normalize_grpc_path(cfg: &Config) -> String {
     let (raw_service, raw_stream) = if cfg.multi_mode {

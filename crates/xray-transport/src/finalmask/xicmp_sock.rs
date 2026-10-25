@@ -27,7 +27,8 @@
 //!   EPERM）/ Administrator（Windows）。
 //! - v6 打不开（如 ping_group_range 关闭且无 CAP_NET_RAW）→ 降级为 `None`：v4 照常 工作，v6
 //!   收发时报明确错误。**偏差**：Go 双 socket 任一失败即整体失败；Rust 放宽 为 v4 必须、v6
-//!   可降级（默认 sysctl 下 Go 的 dgram 模式同样开不出 v6 socket）。
+//!   可降级（默认 sysctl 下 Go 的 dgram 模式同样开不出 v6 socket）。降级时 `warn` 留痕（原始错误
+//!   + 后果：v6 目标 100% 丢包），否则操作者只能从 v6 send 的 PermissionDenied 反推（bd zww2b）。
 //!
 //! ## dgram（ping socket）内核行为（实测）
 //!
@@ -43,6 +44,9 @@
 //!   `IPV6_CHECKSUM` offset=2）。
 //! - v4 recv 带 IP 头（实测 ihl=20），按 IHL 剥离后才投给上层——[`IcmpRawSocket`] 契约恒为纯 ICMP
 //!   帧。
+//! - 畸形 IP 头（version≠4 / IHL 越界）**整帧丢弃、recv 继续**（unix 与 Windows 同语义，debug
+//!   留痕）。对齐 Go `icmp.ParseMessage` 出错即 `continue`：v4 raw socket 收全机 ICMP，混入一帧
+//!   坏头若不丢帧而是上抛错误，`spawn_recv_task` 会直接退出 = 整个连接静默死（bd jhktt）。
 //!
 //! ## 已知偏差（wire 不变）
 //!
@@ -75,7 +79,7 @@ pub(super) fn open_client(cfg: &XicmpConfig) -> io::Result<Box<dyn UdpIo>> {
     let (v6, dgram_v6) = match open_family(cfg.dgram, false) {
         Ok(x) => (Some(x.0), x.1),
         // 降级：ping_group_range 关闭且无 CAP_NET_RAW 时 v4-only 照常工作（偏差见模块文档）
-        Err(_) => (None, false),
+        Err(e) => degrade_v6("client", &e),
     };
     let ips = parse_ips(cfg)?;
     let raw: Arc<dyn IcmpRawSocket> = Arc::new(PlatformIcmpSocket::new(Some(v4), v6));
@@ -95,11 +99,11 @@ pub(super) fn open_server(cfg: &XicmpConfig) -> io::Result<Box<dyn UdpIo>> {
     let (v4, _) = open_family(false, true)?;
     let (v6, _) = match open_family(false, false) {
         Ok(x) => (Some(x.0), x.1),
-        Err(_) => (None, false),
+        Err(e) => degrade_v6("server", &e),
     };
-    let _ = parse_ips(cfg)?; // ips 白名单语义属连接层（现状未实装），此处仅校验可解析
+    let ips = parse_ips(cfg)?; // server 来源白名单（Go NewConnServer c.IPs），空=不过滤
     let raw: Arc<dyn IcmpRawSocket> = Arc::new(PlatformIcmpSocket::new(Some(v4), v6));
-    Ok(Box::new(XicmpPassthroughConn::new_server(raw)))
+    Ok(Box::new(XicmpPassthroughConn::new_server(raw, ips)))
 }
 
 fn parse_ips(cfg: &XicmpConfig) -> io::Result<Vec<IpAddr>> {
@@ -172,6 +176,17 @@ fn v6_unavailable() -> io::Error {
         io::ErrorKind::PermissionDenied,
         "xicmp: IPv6 socket unavailable (needs net.ipv4.ping_group_range or CAP_NET_RAW)",
     )
+}
+
+/// v6 打开失败 → 降级 v4-only（偏差见模块文档），但必须留运行时痕迹：降级后 v6 目标
+/// 100% 丢包，无痕迹时操作者只能从 v6 send 的 [`v6_unavailable`] 反推（bd zww2b）。
+fn degrade_v6(role: &str, err: &io::Error) -> (Option<IcmpSock>, bool) {
+    tracing::warn!(
+        error = %err,
+        role,
+        "xicmp: IPv6 socket unavailable, degrading to IPv4-only; IPv6 destinations will fail"
+    );
+    (None, false)
 }
 
 #[async_trait::async_trait]
@@ -273,9 +288,18 @@ mod sys {
                     Ok(r) => {
                         let (n, src) = r?;
                         let pkt = if self.strip_v4_header {
-                            strip_v4_header_if_needed(&buf[..n]).ok_or_else(|| {
-                                io::Error::new(io::ErrorKind::InvalidData, "xicmp: bad IPv4 header")
-                            })?
+                            match strip_v4_header_if_needed(&buf[..n]) {
+                                Some(p) => p,
+                                None => {
+                                    // 坏 IP 头 = 整帧丢弃、continue（Go ParseMessage 出错即
+                                    // continue；上抛 Err 会让 recv 任务退出 = 连接静默死）
+                                    tracing::debug!(
+                                        bytes = n,
+                                        "xicmp: dropped frame with malformed IPv4 header"
+                                    );
+                                    continue;
+                                },
+                            }
                         } else {
                             &buf[..n]
                         };
@@ -284,6 +308,18 @@ mod sys {
                     Err(_would_block) => continue,
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    impl IcmpSock {
+        /// 测试替身：普通 UDP socket 伪装成 v4 raw ICMP socket——无 root 也能验证 recv 的
+        /// 帧级剥离/丢帧语义（真 ICMP socket 收不到测试可控的帧）。
+        pub(super) fn from_udp_for_test(udp: UdpSocket, strip_v4_header: bool) -> io::Result<Self> {
+            udp.set_nonblocking(true)?;
+            // SAFETY: 同 `open`——udp 所有权随 AsyncFd 转移
+            let fd = unsafe { AsyncFd::register(udp) }.map_err(|e| e.into_parts().1)?;
+            Ok(Self { fd, strip_v4_header })
         }
     }
 }
@@ -376,7 +412,14 @@ mod sys {
                     let pkt = if strip {
                         match strip_v4_header_if_needed(&buf[..n]) {
                             Some(p) => p,
-                            None => continue,
+                            None => {
+                                // 与 unix 同语义（Go ParseMessage 出错即 continue）：丢弃本帧
+                                tracing::debug!(
+                                    bytes = n,
+                                    "xicmp: dropped frame with malformed IPv4 header"
+                                );
+                                continue;
+                            },
                         }
                     } else {
                         &buf[..n]
@@ -445,7 +488,9 @@ use sys::IcmpSock;
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "linux")]
-    use std::{net::SocketAddr, time::Duration};
+    use std::net::SocketAddr;
+    #[cfg(unix)]
+    use std::{net::UdpSocket, time::Duration};
 
     use super::*;
 
@@ -468,6 +513,46 @@ mod tests {
         assert_eq!(strip_v4_header_if_needed(&[0x46, 0, 0, 0]), None);
         // 过短
         assert_eq!(strip_v4_header_if_needed(&[0x45; 10]), None);
+    }
+
+    /// jhktt：v4 raw socket 收全机 ICMP，混入一帧畸形 IP 头不得杀死 recv
+    /// （Go `icmp.ParseMessage` 出错即 `continue`；Windows `recv_loop` 同语义）。
+    ///
+    /// UDP socket 伪装成 raw ICMP socket（`strip_v4_header=true`）：坏头帧在前、合法帧在后，
+    /// recv 必须跳过坏帧返回好帧——旧 unix 实现上抛 `InvalidData` 使 `spawn_recv_task`
+    /// 直接退出 = 连接静默死。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recv_skips_malformed_ipv4_header_frame() {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dst = sock.local_addr().unwrap();
+        let icmp = IcmpSock::from_udp_for_test(sock, true).unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        // version=4 但 IHL=15(60B) 远超包长 → 畸形头
+        let mut bad = vec![0x4fu8, 0, 0, 0];
+        bad.extend_from_slice(&[0u8; 16]);
+        // 合法 v4 头（IHL=5）：剥 20B 后为纯 ICMP 帧
+        let mut good = vec![0x45u8, 0, 0, 0];
+        good.extend_from_slice(&[0u8; 16]);
+        good.extend_from_slice(b"icmp-frame");
+        peer.send_to(&bad, dst).unwrap();
+        peer.send_to(&good, dst).unwrap();
+
+        let (pkt, _src) = tokio::time::timeout(Duration::from_secs(5), icmp.recv())
+            .await
+            .expect("坏帧应被丢弃、好帧应到达")
+            .unwrap();
+        assert_eq!(pkt, b"icmp-frame");
+    }
+
+    /// zww2b：v6 降级必须走 warn 留痕路径且不 panic，语义仍是 v4-only `(None, false)`。
+    #[test]
+    fn v6_degradation_warns_and_returns_none() {
+        let err = io::Error::new(io::ErrorKind::PermissionDenied, "simulated EACCES");
+        let (sock, dgram) = degrade_v6("client", &err);
+        assert!(sock.is_none(), "降级后 v6 socket 必须缺席");
+        assert!(!dgram, "降级后不得声称 v6 是 ping socket");
     }
 
     /// 真实收发往返（loopback，需 root / CAP_NET_RAW）。

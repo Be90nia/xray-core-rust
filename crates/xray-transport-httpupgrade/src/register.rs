@@ -391,6 +391,15 @@ impl TransportListener for HttpUpgradeListener {
     }
 }
 
+impl Drop for HttpUpgradeListener {
+    fn drop(&mut self) {
+        // v7nqa：停机只 drop 监听句柄 → 不 abort 则 accept task 继续持有 socket
+        // （Go worker.close 显式 hub.Close()，worker.go:151-158；httpupgrade 侧
+        // hub.go:30-32 `Close()` = `innnerListener.Close()`）。
+        let _ = TransportListener::close(self);
+    }
+}
+
 /// HTTP `Host` 三级回退（Go dialer.go:83-89）：
 /// `config.host` → `tlsSettings.serverName`（仅 TLS 配置时参与）→ 拨号地址。
 ///
@@ -1191,6 +1200,42 @@ mod tests {
                     assert!(
                         tokio::time::Instant::now() < deadline,
                         "close 后端口仍接受连接（僵尸 listener 未解除）"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                },
+            }
+        }
+    }
+
+    /// v7nqa 回归锚：停机只 drop 监听句柄、不显式 close()——无 `Drop → close`
+    /// 兜底时 accept task 继续持有 socket，端口在进程内继续 accept（改前必挂）。
+    #[tokio::test]
+    async fn drop_without_close_rejects_new_connections() {
+        use std::time::Duration;
+        let settings =
+            StreamSettings { protocol: "httpupgrade".to_string(), ..StreamSettings::tcp() };
+        let handler: ConnHandler = Arc::new(|_| {});
+        let listener = listen_httpupgrade(
+            "127.0.0.1:0".parse().unwrap(),
+            &settings,
+            &SocketOptions::default(),
+            handler,
+        )
+        .await
+        .expect("listen_httpupgrade");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::net::TcpStream::connect(addr).await.expect("drop 前应可连接");
+
+        drop(listener); // 只 drop，不调 close——走 Drop 兜底
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match tokio::net::TcpStream::connect(addr).await {
+                Err(_) => break,
+                Ok(_) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "drop 后端口仍接受连接（Drop→close 未生效/accept task 未终止）"
                     );
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 },

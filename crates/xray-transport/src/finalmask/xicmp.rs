@@ -19,6 +19,13 @@
 //!
 //! 平台真 socket 收发实装在同目录的 `xicmp_sock` 模块（Linux/macOS ping/raw socket +
 //! Windows raw socket）。
+//!
+//! ## 安全边界
+//!
+//! mask 层无认证、无防注入：ICMP echo 对 on-path 观察者可读可伪造（id/seq/clientID
+//! 均非秘密），安全上等价于裸 ICMP/UDP 传输——机密性与完整性由内层协议（ss/vless
+//! AEAD 等）保证，id/seq/clientID 不得用作任何授权判断依据（审计 F14）。服务端
+//! `ips` 白名单只是收窄喂帧面（非白名单源整包丢弃，Go `server.go` 同语义），不构成认证。
 
 use std::{
     collections::HashMap,
@@ -50,7 +57,8 @@ const ICMP_ECHO_REPLY_V6: u8 = 129;
 /// xICMP 配置（对应 Go `xicmp.Config` protobuf）。
 #[derive(Debug, Clone, Default)]
 pub struct XicmpConfig {
-    /// 目标 IP 列表（client 用于轮换伪装源 IP）。
+    /// IP 列表（Go `c.IPs` 双语义）：client=出站伪装源轮换池；server=来源白名单
+    /// （配置了则仅接收该列表内源地址的帧，空 = 未配置 = 不过滤，Go `len(c.ips) > 0`）。
     pub ips: Vec<String>,
     /// 是否用 ICMP-over-UDP（DGRAM mode，对应 Go `c.DGRAM`）。
     pub dgram: bool,
@@ -249,17 +257,20 @@ struct XicmpShared {
 ///
 /// 内部封装 `Arc<dyn IcmpRawSocket>` + 后台 recv 任务 + 模式特有状态：
 /// - Client：`client_id`（8B 随机）+ `id` + 自增 `seq`；
-/// - Server：`rec` map（clientID → 记录的 id/seq/最后时间）。
+/// - Server：`rec` map（clientID → 记录的 id/seq/最后时间）+ 独立清理任务 （周期驱逐空闲记录，Go
+///   `clean()` goroutine）。
 pub struct XicmpPassthroughConn {
     mode: XicmpMode,
     raw: Arc<dyn IcmpRawSocket>,
     shared: TokioMutex<XicmpShared>,
     client_state: Option<Mutex<XicmpClientState>>,
-    server_state: Option<Mutex<XicmpServerState>>,
+    server_state: Option<Arc<Mutex<XicmpServerState>>>,
     closed: Mutex<bool>,
     /// 后台 recv 任务句柄；Drop 时 abort（对应 Go `Close()` 关闭 icmp4/icmp6 使
     /// 阻塞中的 recv goroutine 立即退出——否则任务要等下一个包到达才发现退出）。
     recv_task: Mutex<Option<JoinHandle<()>>>,
+    /// 后台 rec 清理任务句柄（仅 Server 构造，Go `clean()` goroutine）；Drop 时 abort。
+    clean_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,6 +292,7 @@ struct XicmpClientState {
     /// v6 socket 实际为 ping socket 模式（语义同上）。
     dgram_v6: bool,
 }
+#[derive(Default)]
 struct XicmpServerState {
     /// clientID → record（Go `rec map[string]record` 的 Rust 对应）。
     /// key 用 clientID 字节序列的 hex 字符串（与 Go `cAddr.String()` 对齐）。
@@ -307,8 +319,9 @@ impl XicmpPassthroughConn {
         dgram_v4: bool,
         dgram_v6: bool,
     ) -> Self {
-        // client 仅放行 echo reply（v4 type=0 / v6 type=129）
-        let (rx, task) = spawn_recv_task(raw.clone(), true);
+        // client 仅放行 echo reply（v4 type=0 / v6 type=129）；ips 是出站轮换池，
+        // 不做 recv 源过滤（Go client 的 c.ips 同样只用于 WriteTo 路由）
+        let (rx, task) = spawn_recv_task(raw.clone(), true, Arc::from([]));
         Self {
             mode: XicmpMode::Client,
             raw,
@@ -324,49 +337,72 @@ impl XicmpPassthroughConn {
             server_state: None,
             closed: Mutex::new(false),
             recv_task: Mutex::new(Some(task)),
+            clean_task: Mutex::new(None),
         }
     }
 
-    /// 构造服务端连接。
-    pub fn new_server(raw: Arc<dyn IcmpRawSocket>) -> Self {
+    /// 构造服务端连接。`ips` 为来源白名单（Go `NewConnServer` 的 `c.IPs`）：
+    /// 空列表 = 未配置 = 不过滤（Go 默认行为），非空则仅接收列表内源地址的帧。
+    pub fn new_server(raw: Arc<dyn IcmpRawSocket>, ips: Vec<IpAddr>) -> Self {
         // server 仅放行 echo request（v4 type=8 / v6 type=128）
-        let (rx, task) = spawn_recv_task(raw.clone(), false);
+        let (rx, task) = spawn_recv_task(raw.clone(), false, ips.into());
+        let state = Arc::new(Mutex::new(XicmpServerState::default()));
+        let clean_task = spawn_clean_task(state.clone());
         Self {
             mode: XicmpMode::Server,
             raw,
             shared: TokioMutex::new(XicmpShared { rx }),
             client_state: None,
-            server_state: Some(Mutex::new(XicmpServerState { rec: HashMap::new() })),
+            server_state: Some(state),
             closed: Mutex::new(false),
             recv_task: Mutex::new(Some(task)),
+            clean_task: Mutex::new(Some(clean_task)),
         }
     }
 }
 
-/// spawn 后台 recv 任务：循环 `raw.recv()` → type-filter → 投 bounded channel。
+/// spawn 后台 recv 任务：循环 `raw.recv()` → 长度闸 → 源白名单 → type-filter → 投 bounded
+/// channel。
 ///
 /// 类型过滤在任务内完成（client 仅 echo reply / server 仅 echo request），应用层
 /// `recv_from` 拿到的都是过滤后的包。`send().await` 阻塞式发送（满时 park），
 /// 语义对齐 Go `select { case readCh <- p; case <-closedCh }`（Go 无缓冲 channel
 /// 发送阻塞 + 内核缓冲蓄洪，见 [`RECV_CHANNEL_CAP`]）；接收端 drop 后 send 返回
 /// Err，任务退出。
+///
+/// `allowed_src` 为 server 来源白名单（Go `server.go:154-161/234-241`：配置了
+/// `ips` 则非白名单源整包丢弃，空 = 未配置 = 不过滤）；client 传空。过滤位置与
+/// Go 一致——在 readCh 投递之前，非白名单包不占用户态通道槽位。
 fn spawn_recv_task(
     raw: Arc<dyn IcmpRawSocket>,
     is_client: bool,
+    allowed_src: Arc<[IpAddr]>,
 ) -> (mpsc::Receiver<(Vec<u8>, SocketAddr)>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(RECV_CHANNEL_CAP);
     let task = tokio::spawn(async move {
         loop {
             let (pkt, src) = match raw.recv().await {
                 Ok(p) => p,
-                Err(_) => return,
+                Err(e) => {
+                    // Go recv4/recv6 对真实读错误同样 `LogErrorInner` 后退出（连接随之不可用）；
+                    // 畸形帧由平台层丢帧继续，走不到这里——无日志退出 = 后续包静默丢光（jhktt）
+                    tracing::warn!(error = %e, is_client, "xicmp: raw socket recv failed, closing");
+                    return;
+                },
             };
+            // 长度先于 pkt[0] 索引：畸短帧直接丢，不杀死 recv 任务
+            if pkt.len() < 8 {
+                continue;
+            }
+            if !allowed_src.is_empty() && !allowed_src.contains(&src.ip()) {
+                continue; // Go server.go:154-161/234-241 非白名单源丢弃
+            }
             let pass = if is_client {
                 pkt[0] == ICMP_ECHO_REPLY_V4 || pkt[0] == ICMP_ECHO_REPLY_V6
             } else {
                 pkt[0] == ICMP_ECHO_V4 || pkt[0] == ICMP_ECHO_V6
             };
-            if pkt.len() >= 8 && pass && tx.send((pkt, src)).await.is_err() {
+            if pass && tx.send((pkt, src)).await.is_err() {
                 return; // 接收端已 drop（连接关闭）
             }
         }
@@ -374,11 +410,47 @@ fn spawn_recv_task(
     (rx, task)
 }
 
+/// rec 记录空闲 TTL：超过即被清理任务驱逐
+/// （Go `server.go:97` `now.Sub(r.last) > time.Minute` 删）。
+const SERVER_REC_TTL: Duration = Duration::from_secs(60);
+/// 独立清理 ticker 周期（Go `server.go:75` `time.NewTicker(time.Minute / 2)`）。
+const SERVER_CLEAN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// spawn 独立 rec 清理任务（Go `server.go:74,91-107` `clean()` goroutine）：
+/// 每 30s 扫一遍 rec，驱逐空闲超 60s 的记录——清理节奏独立于收发包路径，
+/// 单向 echo 洪水（只 insert、永不触发 send 路径）不再无界增长（bd 8kaea）。
+fn spawn_clean_task(state: Arc<Mutex<XicmpServerState>>) -> JoinHandle<()> {
+    spawn_clean_task_with(state, SERVER_CLEAN_INTERVAL, SERVER_REC_TTL)
+}
+
+/// [`spawn_clean_task`] 的周期/TTL 可注入版——仅测试用，生产恒走 Go 对齐常量。
+fn spawn_clean_task_with(
+    state: Arc<Mutex<XicmpServerState>>,
+    interval: Duration,
+    ttl: Duration,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // Delay：错过 tick 顺延，不补发（Go time.Ticker 丢错过 tick 同语义）
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let now = Instant::now();
+            state.lock().rec.retain(|_, r| now.duration_since(r.last) <= ttl);
+        }
+    })
+}
+
 impl Drop for XicmpPassthroughConn {
     fn drop(&mut self) {
         // 对应 Go Close() 关闭 icmp4/icmp6：立即终止阻塞中的 recv 任务，
         // 不等下一个包到达。abort 对已完成的任务是 no-op。
         if let Some(handle) = self.recv_task.lock().take() {
+            handle.abort();
+        }
+        // 独立清理任务一并终止（Go clean() 经 closeCh 退出）；否则任务持有
+        // Arc<ServerState> 永续 tick，连接关闭后泄漏。
+        if let Some(handle) = self.clean_task.lock().take() {
             handle.abort();
         }
     }
@@ -481,12 +553,11 @@ impl XicmpPassthroughConn {
         let key = addr.to_string();
         let (id, seq, dst) = {
             let mut s = state_arc.lock();
-            // GC：清理 1 分钟以上未访问的记录
-            let now = Instant::now();
-            s.rec.retain(|_, r| now.duration_since(r.last) < Duration::from_secs(60));
+            // 清扫已上移独立清理任务（Go server.go:91-107）——Go WriteTo 同样不做
+            // GC，rec 命中与否只看条目存在性；这里去掉原热路径 O(n) retain。
             match s.rec.get_mut(&key) {
                 Some(r) => {
-                    r.last = now;
+                    r.last = Instant::now();
                     (r.id, r.seq, r.src)
                 },
                 None => return Ok(0), // Go: log + drop
@@ -521,8 +592,11 @@ impl XicmpPassthroughConn {
                 Some(t) => t,
                 None => continue,
             };
-            if rdata.len() < 8 {
-                continue; // 不足 8B clientID，丢弃
+            // Go server.go:150-152 `len(echo.Data) <= 8 { continue }`：剥掉 8B clientID
+            // 后 payload 至少 1 字节——8B 包会产出 0 长度读（上层可能误当 EOF），
+            // 且让洪水占 rec 条目更廉价。
+            if rdata.len() <= 8 {
+                continue;
             }
             let mut client_id = [0u8; 8];
             client_id.copy_from_slice(&rdata[..8]);
@@ -820,7 +894,7 @@ mod tests {
     /// `recv_polls` 计数 recv() 轮询次数——观测后台 recv 任务是否已退出。
     struct MockIcmpRawSocket {
         sent: TestMutex<Vec<(Vec<u8>, SocketAddr)>>,
-        recv_queue: TestMutex<VecDeque<Vec<u8>>>,
+        recv_queue: TestMutex<VecDeque<(Vec<u8>, SocketAddr)>>,
         recv_polls: std::sync::atomic::AtomicU64,
     }
 
@@ -830,9 +904,14 @@ mod tests {
 
     impl MockIcmpRawSocket {
         fn new(seed_recv: Vec<Vec<u8>>) -> Self {
+            Self::new_with_srcs(seed_recv.into_iter().map(|p| (p, MOCK_SRC)).collect())
+        }
+
+        /// 预设队列时逐包指定伪造源地址（供来源白名单测试用）。
+        fn new_with_srcs(seed_recv: VecDeque<(Vec<u8>, SocketAddr)>) -> Self {
             Self {
                 sent: TestMutex::new(Vec::new()),
-                recv_queue: TestMutex::new(seed_recv.into()),
+                recv_queue: TestMutex::new(seed_recv),
                 recv_polls: std::sync::atomic::AtomicU64::new(0),
             }
         }
@@ -854,8 +933,8 @@ mod tests {
             // 对应 Linux 实现：AsyncFd readable().await + read。
             loop {
                 self.recv_polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if let Some(p) = self.recv_queue.lock().pop_front() {
-                    return Ok((p, MOCK_SRC));
+                if let Some((p, src)) = self.recv_queue.lock().pop_front() {
+                    return Ok((p, src));
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
@@ -977,7 +1056,7 @@ mod tests {
         let request = marshal_echo(ICMP_ECHO_V4, 0x5555, 7, &data);
 
         let mock = Arc::new(MockIcmpRawSocket::new(vec![request]));
-        let conn = XicmpPassthroughConn::new_server(mock.clone());
+        let conn = XicmpPassthroughConn::new_server(mock.clone(), vec![]);
 
         let mut buf = [0u8; 64];
         let (n, addr) = conn.recv_from(&mut buf).await.unwrap();
@@ -1001,7 +1080,7 @@ mod tests {
         let request = marshal_echo(ICMP_ECHO_V4, 0x7777, 9, &data);
 
         let mock = Arc::new(MockIcmpRawSocket::new(vec![request]));
-        let conn = XicmpPassthroughConn::new_server(mock.clone());
+        let conn = XicmpPassthroughConn::new_server(mock.clone(), vec![]);
 
         // 触发 server 收一次以建立 rec
         let mut buf = [0u8; 16];
@@ -1172,5 +1251,152 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let p2 = mock.recv_polls();
         assert_eq!(p1, p2, "空队列下 drop 后 recv 任务应退出");
+    }
+
+    /// 构造 server 侧 echo request：data = `[8B clientID][payload]`。
+    fn request_pkt(client_id: [u8; 8], id: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&client_id);
+        data.extend_from_slice(payload);
+        marshal_echo(ICMP_ECHO_V4, id, seq, &data)
+    }
+
+    #[tokio::test]
+    async fn server_whitelist_accepts_configured_source() {
+        // bd mmtbf：配置了 ips 白名单时，白名单内源的 echo request 正常投递。
+        let client_id = [0x81u8; 8];
+        let request = request_pkt(client_id, 0x6001, 1, b"allowed");
+        let mock = Arc::new(MockIcmpRawSocket::new(vec![request]));
+        // 白名单 = MOCK_SRC 的 IP（203.0.113.7）
+        let ips = vec![IpAddr::from([203, 0, 113, 7])];
+        let conn = XicmpPassthroughConn::new_server(mock.clone(), ips);
+
+        let mut buf = [0u8; 64];
+        let (n, addr) = conn.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"allowed", "白名单内源应正常投递");
+        assert_eq!(addr_to_client_id(&addr).unwrap(), client_id);
+    }
+
+    #[tokio::test]
+    async fn server_whitelist_drops_non_configured_source() {
+        // bd mmtbf：白名单外源的包整包丢弃（Go server.go:154-161）——不投递、不建 rec。
+        let request = request_pkt([0x82u8; 8], 0x6002, 1, b"intruder");
+        let mock = Arc::new(MockIcmpRawSocket::new(vec![request]));
+        let ips = vec!["198.51.100.9".parse::<IpAddr>().unwrap()]; // ≠ MOCK_SRC
+        let conn = XicmpPassthroughConn::new_server(mock.clone(), ips);
+
+        let mut buf = [0u8; 64];
+        let res = tokio::time::timeout(Duration::from_millis(150), conn.recv_from(&mut buf)).await;
+        assert!(res.is_err(), "白名单外源的包应被丢弃而不是投递");
+        assert_eq!(mock.recv_queue.lock().len(), 0, "包已被 recv 任务消费并丢弃");
+        assert!(
+            conn.server_state.as_ref().unwrap().lock().rec.is_empty(),
+            "被丢的包不得建立 rec 条目"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_rotation_ips_are_not_recv_filter() {
+        // client 的 ips 是出站轮换池（Go client 的 c.ips 只用于 WriteTo 路由），
+        // 不得被误用作 recv 源过滤——回包源不在 ips 内仍正常投递。
+        let client_id = [0x83u8; 8];
+        let mock = Arc::new(MockIcmpRawSocket::new(vec![reply_pkt(0x7777, 1, b"ok")]));
+        let conn = XicmpPassthroughConn::new_client(
+            client_id,
+            0x7777,
+            mock.clone(),
+            vec!["10.9.9.9".parse().unwrap()],
+            false,
+            false,
+        );
+
+        let mut buf = [0u8; 64];
+        let (n, _) = conn.recv_from(&mut buf).await.unwrap();
+        assert!(buf[..n].ends_with(b"ok"), "client 不做源过滤，回包应投递");
+    }
+
+    #[tokio::test]
+    async fn recv_task_survives_short_frames() {
+        // P3：长度判定先于 pkt[0] 索引——畸短帧丢弃且不杀死 recv 任务。
+        let client_id = [0x84u8; 8];
+        let good = reply_pkt(0x3210, 1, b"still alive");
+        let mock = Arc::new(MockIcmpRawSocket::new(vec![vec![1, 2, 3], good]));
+        let conn =
+            XicmpPassthroughConn::new_client(client_id, 0x3210, mock.clone(), vec![], false, false);
+
+        let mut buf = [0u8; 64];
+        let (n, _) = conn.recv_from(&mut buf).await.unwrap();
+        assert!(buf[..n].ends_with(b"still alive"), "短帧后 recv 任务应仍存活");
+    }
+
+    #[tokio::test]
+    async fn server_drops_data_len_at_or_below_eight() {
+        // P3：Go server.go:150-152 `len(echo.Data) <= 8 { continue }`——data 恰 8B
+        // （只有 clientID、零 payload）丢弃，9B 正常投递。
+        let cid_only = request_pkt([0x85u8; 8], 0x6003, 1, b"");
+        let with_payload = request_pkt([0x86u8; 8], 0x6003, 2, b"x");
+        let mock = Arc::new(MockIcmpRawSocket::new(vec![cid_only, with_payload]));
+        let conn = XicmpPassthroughConn::new_server(mock.clone(), vec![]);
+
+        let mut buf = [0u8; 64];
+        let (n, addr) = conn.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"x", "8B data 包应被丢，9B 包投递");
+        assert_eq!(addr_to_client_id(&addr).unwrap(), [0x86u8; 8]);
+    }
+
+    #[tokio::test]
+    async fn server_rec_evicted_by_independent_clean_task() {
+        // bd 8kaea：rec 清理节奏独立于收发包路径（Go server.go:91-107 clean goroutine）。
+        // 注入短周期/TTL 驱动同一机制（生产常量 30s/60s 无法在单测窗口内观察）。
+        let seeds: Vec<Vec<u8>> = (0..64u16)
+            .map(|i| {
+                let mut cid = [0x50u8; 8];
+                cid[7] = i as u8;
+                request_pkt(cid, 0x6004, i, b"flood")
+            })
+            .collect();
+        let mock = Arc::new(MockIcmpRawSocket::new(seeds));
+        let conn = XicmpPassthroughConn::new_server(mock.clone(), vec![]);
+        assert!(conn.clean_task.lock().is_some(), "server 构造必须挂上独立清理任务");
+
+        // 64 个不同 clientID 的单向包 → 64 条 rec
+        let mut buf = [0u8; 64];
+        for _ in 0..64 {
+            conn.recv_from(&mut buf).await.unwrap();
+        }
+        let state = conn.server_state.as_ref().unwrap().clone();
+        assert_eq!(state.lock().rec.len(), 64, "每包一条 rec 条目");
+
+        // 清理周期过后：空闲条目全部回收；期间无新包，条目只减不增（不发包不泄漏）
+        let _clean = spawn_clean_task_with(
+            state.clone(),
+            Duration::from_millis(20),
+            Duration::from_millis(50),
+        );
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(state.lock().rec.len(), 0, "空闲超 TTL 的条目应被独立清理任务回收");
+    }
+
+    #[tokio::test]
+    async fn server_rec_fresh_entries_survive_clean() {
+        // 清理只驱逐空闲超 TTL 的条目，不误杀新鲜条目（Go `now.Sub(r.last) > time.Minute`）。
+        let cid = [0x51u8; 8];
+        let pkt = request_pkt(cid, 0x6005, 1, b"fresh");
+        let mock = Arc::new(MockIcmpRawSocket::new(vec![pkt]));
+        let conn = XicmpPassthroughConn::new_server(mock.clone(), vec![]);
+        let mut buf = [0u8; 64];
+        let (_n, vaddr) = conn.recv_from(&mut buf).await.unwrap();
+
+        let state = conn.server_state.as_ref().unwrap().clone();
+        let _clean = spawn_clean_task_with(
+            state.clone(),
+            Duration::from_millis(20),
+            Duration::from_millis(10_000),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(state.lock().rec.len(), 1, "新鲜条目不得被清理任务驱逐");
+        // rec 命中：回包正常发出（条目仍在）
+        let n = conn.send_to(b"reply", vaddr).await.unwrap();
+        assert_eq!(n, 5, "新鲜条目应可回包（rec 命中）");
     }
 }

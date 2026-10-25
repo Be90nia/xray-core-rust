@@ -71,7 +71,7 @@ pub async fn backoff_if_resource(e: &io::Error) {
 ///
 /// 用法：spawn accept 循环后，把循环句柄 move 交给本函数再 spawn 一个监控 task
 /// （`JoinHandle` 不可 Clone——还须向外返回句柄的调用点用「监控包裹」结构，见
-/// `xray-transport/src/tcp/hub.rs` 的 `spawn_accept_loop`）。
+/// `xray-transport/src/tcp/hub.rs` 的 `TcpHubListener::listen`）。
 pub async fn supervise_accept_loop(tag: &str, local: String, handle: tokio::task::JoinHandle<()>) {
     if let Err(join_err) = handle.await {
         if join_err.is_panic() {

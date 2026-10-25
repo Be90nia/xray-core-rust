@@ -315,14 +315,42 @@ mod tests {
         let req = http::Request::builder()
             .method("POST")
             .uri("http://localhost/GunService/Tun")
+            .header("content-type", "application/grpc")
             .body(())
             .unwrap();
         let (resp, _tx) = client.send_request(req, false).expect("send_request 失败");
         let resp =
             tokio::time::timeout(std::time::Duration::from_secs(5), resp).await.expect("响应超时");
-        // 服务端 h2 层真实应答（grpc 语义：200 + grpc-status，或 404）。
-        let status = resp.expect("h2 响应错误").status();
-        assert!(status.is_informational() || status.as_u16() >= 200, "bad status: {status}");
+        // 服务端 h2 层真实应答（bd lnhfn）：注册 path + application/grpc → 200
+        // + grpc content-type。旧断言 `is_informational() || >= 200` 恒真——服务端
+        // 恒回 415/500 也绿。
+        let resp = resp.expect("h2 响应错误");
+        assert_eq!(resp.status().as_u16(), 200, "注册 path 必须 200，实际 {}", resp.status());
+        assert_eq!(
+            resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            Some("application/grpc"),
+            "gRPC 响应必须带 content-type"
+        );
+
+        // 反例控制（同测试内建的红线）：未知 path → Trailers-Only（:status 200 +
+        // grpc-status 12）。路由失效（一律 200 无 grpc-status / 一律 404）时必红。
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/GunService/Unknown")
+            .header("content-type", "application/grpc")
+            .body(())
+            .unwrap();
+        let (resp, _tx) = client.send_request(req, false).expect("send_request 失败");
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), resp)
+            .await
+            .expect("响应超时")
+            .expect("h2 响应错误");
+        assert_eq!(
+            resp.headers().get("grpc-status").and_then(|v| v.to_str().ok()),
+            Some("12"),
+            "未知 path 必须回 grpc-status 12（Unimplemented），实际 {:?}",
+            resp.headers().get("grpc-status")
+        );
 
         listener.close().expect("close 失败");
         // close 后 socket 释放，新连接被拒（close_rejects 同款轮询）。
@@ -340,6 +368,39 @@ mod tests {
             }
         }
         let _ = std::fs::remove_file(&path_str);
+    }
+
+    /// v7nqa 回归锚：停机只 drop 监听句柄、不显式 close()——无 `Drop → close`
+    /// 兜底时 accept 循环继续持有 socket，端口在进程内继续 accept（改前必挂）。
+    #[tokio::test]
+    async fn drop_without_close_rejects_new_connections() {
+        let settings = StreamSettings {
+            protocol: "grpc".to_string(),
+            transport_json: Some(serde_json::json!({"serviceName":"GunService"})),
+            ..StreamSettings::tcp()
+        };
+        let handler: ConnHandler = Arc::new(|_| {});
+        let listener = listen_grpc("127.0.0.1:0".parse().unwrap(), &settings, handler, Vec::new())
+            .await
+            .expect("listen_grpc");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::net::TcpStream::connect(addr).await.expect("drop 前应可连接");
+
+        drop(listener); // 只 drop，不调 close——走 Drop 兜底
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match tokio::net::TcpStream::connect(addr).await {
+                Err(_) => break,
+                Ok(_) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "drop 后端口仍接受连接（Drop→close 未生效/循环未退出）"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                },
+            }
+        }
     }
 
     /// unix 监听 finalmask 拒绝路径（对齐其余三 hub unix 惯例）。

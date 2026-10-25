@@ -4,7 +4,8 @@
 //!
 //! ## 架构
 //!
-//! - `TcpHubListener` — 持有 `DefaultListener` + `ConnHandler`，spawn accept 循环
+//! - `TcpHubListener` — bind 后 spawn accept 循环（socket 归循环所有，Go `go
+//!   l.keepAccepting()`）；close/Drop → 循环 break → 端口释放
 //! - `listen_tcp_impl` — `TransportListenFn` 实现，注册到全局 listener 注册表
 //! - `keep_accepting` — accept 循环：accept → header auth wrap → `add_conn` （Go hub.go:125-127）
 //!
@@ -16,7 +17,6 @@ use tokio::sync::Notify;
 
 use crate::{
     accept_policy::{AcceptErrorKind, backoff_if_resource, classify, supervise_accept_loop},
-    connection::Connection,
     listener_registry::{ConnHandler, TransportListener},
     sockopt::SocketOptions,
     system_listener::{DefaultListener, SystemListener},
@@ -24,24 +24,19 @@ use crate::{
 
 /// TCP hub listener。对应 Go `tcp/hub.go::Listener` struct。
 ///
-/// 持有 `DefaultListener`（底层 TCP bind + accept + sockopt）+ `ConnHandler`（新连接回调）。
-/// `keep_accepting` 在独立 tokio task 中运行，accept 后调用 `add_conn`。
+/// socket 所有权已在 [`TcpHubListener::listen`] 内移入 accept 循环（Go
+/// `go l.keepAccepting()` 同形，hub.go:86）：本结构只持 `local` + close 通知。
+/// `close()`/`Drop` → 循环 break → socket drop → 端口即时释放（Go `Close()` =
+/// `listener.Close()`，hub.go:128-130；`Accept` 返回错误退出，hub.go:90-97）。
 pub struct TcpHubListener {
-    inner: DefaultListener,
-    add_conn: ConnHandler,
+    /// bind 结果（Go `Listener.Addr()`——socket 已归循环，无法再向内核查询）。
+    local: SocketAddr,
     close_notify: Arc<Notify>,
-    /// header 伪装 authenticator（Go hub.go:24 `authConfig internet.ConnectionAuthenticator`）。
-    /// `None` = 未配置（type none/缺失）→ accept 后不包装。
-    auth: Option<Arc<crate::headers::http::HttpAuthenticator>>,
-    /// Tcpmask 伪装管理器（Go hub.go:68 `WrapListener`），accept 后对每条连接做
-    /// `WrapConnServer` 链式包装；`None` 或 `tcpmasks` 为空 → 跳过。
-    tcpmask_manager: Option<crate::finalmask::TcpmaskManager>,
 }
 
 impl TcpHubListener {
-    /// 创建 TCP hub listener 并 spawn accept 循环。
-    ///
-    /// 对应 Go `ListenTCP()`：bind → spawn `keepAccepting` → return。
+    /// 绑定 `addr` 并 spawn accept 循环（对应 Go `ListenTCP()`：bind →
+    /// `go l.keepAccepting()` → return）。
     ///
     /// # 参数
     ///
@@ -50,6 +45,8 @@ impl TcpHubListener {
     /// - `add_conn`：新连接回调
     ///
     /// # 错误
+    ///
+    /// bind 失败时返回 `io::Error`。
     pub async fn listen(
         addr: SocketAddr,
         sockopt: &SocketOptions,
@@ -58,107 +55,92 @@ impl TcpHubListener {
         tcpmask_manager: Option<crate::finalmask::TcpmaskManager>,
     ) -> io::Result<Self> {
         let inner = DefaultListener::bind(addr, sockopt.clone()).await?;
+        let local = inner.local_addr()?;
         let close_notify = Arc::new(Notify::new());
-
-        let listener = Self { inner, add_conn, close_notify, auth, tcpmask_manager };
-
-        // ponytail: 暂不 spawn accept 循环——由调用方显式调用 `keep_accepting`
-        // 或通过 `spawn_accept_loop` 启动。这避免在构造函数中隐式 spawn，
-        // 让测试可以控制 accept 时机。
-        Ok(listener)
+        let loop_handle = tokio::spawn(keep_accepting(
+            inner,
+            local,
+            add_conn,
+            auth,
+            tcpmask_manager,
+            Arc::clone(&close_notify),
+        ));
+        // 意外退出监控：循环只应经 close_notify 分支退出；panic 会静默杀掉
+        // 监听（端口不再 listen 而进程存活），error! 兜底发声。
+        tokio::spawn(supervise_accept_loop("tcp", local.to_string(), loop_handle));
+        Ok(Self { local, close_notify })
     }
+}
 
-    /// Spawn accept 循环到独立 tokio task。
-    ///
-    /// 对应 Go `go l.keepAccepting()`。
-    /// 返回 `JoinHandle`，调用方可 await 等待循环结束。
-    pub fn spawn_accept_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
-        let this = Arc::clone(self);
-        let local = self.local_addr().map_or_else(|e| e.to_string(), |a| a.to_string());
-        // 监控包裹：内层跑 accept 循环，外层 await 其句柄做意外退出留痕。
-        // JoinHandle 不可 Clone，返回外层句柄——await / drop-detach 语义与直接
-        // 返回循环句柄一致；panic 留痕见 accept_policy::supervise_accept_loop。
-        tokio::spawn(async move {
-            let loop_handle = tokio::spawn(async move {
-                this.keep_accepting().await;
-            });
-            supervise_accept_loop("tcp", local, loop_handle).await;
-        })
-    }
+/// Accept 循环。对应 Go `keepAccepting()`（hub.go:90-121）。
+///
+/// `inner` 按值传入 = socket 归循环所有（v7nqa）：close/drop 触发 break →
+/// `inner` drop → 端口释放。
+///
+/// 对每个新连接：header 伪装包装（Go hub.go:125-127）→ tcpmask 包装（Go
+/// hub.go:67-69）→ `add_conn`。TLS/REALITY wrapping 不在 hub（生产 TLS 由
+/// xray-core inbound 各协议层包装）。
+///
+/// accept 错误处置走 [`crate::accept_policy`]：资源类 warn + 退避 500ms + 继续；
+/// 单连接级 debug + 继续；未知 warn + 继续。错误永不退出——循环唯一出口是
+/// close_notify 分支（单连接级错误文本常含 "closed"，旧 `contains("closed") =>
+/// break` 曾静默杀死监听）。
+async fn keep_accepting(
+    inner: DefaultListener,
+    local: SocketAddr,
+    add_conn: ConnHandler,
+    auth: Option<Arc<crate::headers::http::HttpAuthenticator>>,
+    tcpmask_manager: Option<crate::finalmask::TcpmaskManager>,
+    close_notify: Arc<Notify>,
+) {
+    loop {
+        let accept_fut = inner.accept();
+        tokio::pin!(accept_fut);
 
-    /// Accept 循环。对应 Go `keepAccepting()`。
-    ///
-    /// 循环调用 `inner.accept()`，对每个新连接：
-    /// 1. TLS wrapping（stub — 等对应 crate 集成）
-    /// 2. REALITY wrapping（stub）
-    /// 3. auth wrapping（stub）
-    /// 4. 调用 `add_conn(conn)`
-    ///
-    /// accept 错误处置走 [`crate::accept_policy`]（grpc transport.rs 样板）：资源类
-    /// warn + 退避 500ms + 继续；单连接级 debug + 继续；未知 warn + 继续。错误永不
-    /// 退出——循环唯一出口是 close_notify 分支（单连接级错误文本常含 "closed"，曾
-    /// 命中旧 `contains("closed") => break` 静默杀死监听）。
-    async fn keep_accepting(&self) {
-        loop {
-            let accept_fut = self.inner.accept();
-            tokio::pin!(accept_fut);
-
-            tokio::select! {
-                result = &mut accept_fut => {
-                    match result {
-                        Ok(conn) => {
-                            // ponytail: TLS/REALITY wrapping 留待对应 crate 集成
-                            //（生产 TLS 在 xray-core inbound 各协议层包装）。
-                            // header 伪装包装（Go hub.go:125-127 authConfig.Server）：
-                            let conn = match &self.auth {
-                                Some(a) => crate::headers::conn::wrap_server(conn, a),
-                                None => conn,
-                            };
-                            // Tcpmask 包装（Go hub.go:67-69 WrapListener → WrapConnServer）：
-                            // 优先于 add_conn；manager 为空 → 跳过。
-                            let conn = match self.tcpmask_manager.as_ref() {
-                                Some(mgr) => match crate::finalmask::wrap_conn_server_into_connection(
-                                    mgr, conn,
-                                ) {
-                                    Ok(c) => c,
-                                    Err(e) => {
-                                        crate::LOG.warn(format!("error={e} tcpmask wrap failed"));
-                                        // auth-wrapped conn 已丢失原始 conn——此处吞错
-                                        unreachable!("tcpmask wrap failed but conn was moved by auth wrap")
-                                    }
-                                },
-                                None => conn,
-                            };
-                            (self.add_conn)(conn);
-                        }
-                        Err(e) => {
-                            match classify(&e) {
-                                AcceptErrorKind::Resource => {
-                                    let local = self.local_addr().map_or_else(|err| err.to_string(), |a| a.to_string());
-                                    crate::LOG.warn(format!("tag=tcp local={local} error={e} tcp inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续"));
-                                    backoff_if_resource(&e).await;
+        tokio::select! {
+            result = &mut accept_fut => {
+                match result {
+                    Ok(conn) => {
+                        let conn = match auth.as_ref() {
+                            Some(a) => crate::headers::conn::wrap_server(conn, a),
+                            None => conn,
+                        };
+                        let conn = match tcpmask_manager.as_ref() {
+                            Some(mgr) => match crate::finalmask::wrap_conn_server_into_connection(
+                                mgr, conn,
+                            ) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    crate::LOG.warn(format!("error={e} tcpmask wrap failed"));
+                                    // auth-wrapped conn 已丢弃原始 conn，无法重试。
+                                    continue;
                                 }
-                                AcceptErrorKind::Connection => {
-                                    crate::LOG.debug(format!("tag=tcp error={e} tcp inbound: 单连接级 accept 错误，继续监听"));
-                                }
-                                AcceptErrorKind::Unknown => {
-                                    crate::LOG.warn(format!("tag=tcp error={e} tcp inbound: accept 错误（未知类别），继续监听"));
-                                }
+                            },
+                            None => conn,
+                        };
+                        (add_conn)(conn);
+                    }
+                    Err(e) => {
+                        match classify(&e) {
+                            AcceptErrorKind::Resource => {
+                                crate::LOG.warn(format!("tag=tcp local={local} error={e} tcp inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续"));
+                                backoff_if_resource(&e).await;
+                            }
+                            AcceptErrorKind::Connection => {
+                                crate::LOG.debug(format!("tag=tcp error={e} tcp inbound: 单连接级 accept 错误，继续监听"));
+                            }
+                            AcceptErrorKind::Unknown => {
+                                crate::LOG.warn(format!("tag=tcp error={e} tcp inbound: accept 错误（未知类别），继续监听"));
                             }
                         }
                     }
                 }
-                _ = self.close_notify.notified() => {
-                    // 收到关闭信号，退出循环（唯一出口）。
-                    break;
-                }
+            }
+            _ = close_notify.notified() => {
+                // 收到关闭信号，退出循环（唯一出口）→ inner（socket）随 drop 释放。
+                break;
             }
         }
-    }
-
-    /// Accept 单个连接（不进入循环）。用于测试或自定义 accept 逻辑。
-    pub async fn accept_one(&self) -> io::Result<Box<dyn Connection>> {
-        self.inner.accept().await
     }
 }
 
@@ -167,23 +149,20 @@ impl TransportListener for TcpHubListener {
         // notify_one 存一个 permit：close 与 accept 循环重新注册 notified() 之间的
         // 窗口内到达的 close 不会丢失（notify_waiters 只唤醒已注册 waiter）。
         self.close_notify.notify_one();
-        // ponytail: 底层 TcpListener 在 Arc drop 时关闭。
-        // 如果需要立即释放端口，需在 DefaultListener 上加 close() 方法。
         Ok(())
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.local_addr()
+        Ok(self.local)
     }
 }
 
-impl TransportListener for Arc<TcpHubListener> {
-    fn close(&self) -> io::Result<()> {
-        (**self).close()
-    }
-
-    fn local_addr(&self) -> io::Result<SocketAddr> {
-        (**self).local_addr()
+impl Drop for TcpHubListener {
+    fn drop(&mut self) {
+        // v7nqa：inbound 停机只 drop 监听句柄、不显式调 close——不通知则循环
+        // 继续持有 socket，端口在进程内继续 accept（Go worker.close 显式
+        // hub.Close()，proxyman/inbound/worker.go:151-158）。
+        let _ = TransportListener::close(self);
     }
 }
 
@@ -222,12 +201,8 @@ pub async fn listen_tcp_impl(
     let mgr = crate::finalmask::build_tcpmask_manager_from_json(settings.finalmask_json.as_ref())?;
     let mgr = if mgr.tcpmasks.is_empty() { None } else { Some(mgr) };
     let listener = TcpHubListener::listen(addr, &sockopt, handler, auth, mgr).await?;
-    // Go hub.go ListenTCP：bind 后 `go l.keepAccepting()`——registry 契约要求
-    // TransportListenFn 内部 spawn accept 循环（listener_registry.rs:34；对齐
-    // ws/httpupgrade/kcp 同层实现）。listener 升 Arc 与循环共享；返回的 Box
-    // 经上方 Arc 转发 impl 仍可 close/local_addr（close → notify → 循环退出）。
-    let listener = Arc::new(listener);
-    let _accept_loop = listener.spawn_accept_loop();
+    // Go hub.go:86：bind 后 `go l.keepAccepting()`——循环已在 listen 内 spawn，
+    // socket 归循环所有（close/drop → 循环 break → 端口释放）。
     Ok(Box::new(listener) as Box<dyn TransportListener>)
 }
 
@@ -246,86 +221,74 @@ pub fn tcp_listen_fn() -> crate::listener_registry::TransportListenFn {
 
 // ===== Unix 监听（Go tcp/hub.go:44 `port == net.Port(0)` 分支）=====
 
-/// TCP hub unix listener。持有 system_listener [`crate::system_listener::UnixListener`]
-/// （路径/abstract/权限语义全复用）+ accept 循环。对应 Go tcp Listener 在
-/// `port==0` 时 `net.UnixAddr` + `internet.ListenSystem` 路径。
+/// TCP hub unix listener。socket 与 accept 循环同 [`TcpHubListener`]：bind 在
+/// [`TcpUnixHubListener::listen`] 内完成并随循环所有权移动，本结构只持 close
+/// 通知。对应 Go tcp Listener 在 `port==0` 时 `net.UnixAddr` +
+/// `internet.ListenSystem` 路径。
 #[cfg(unix)]
 pub struct TcpUnixHubListener {
-    inner: crate::system_listener::UnixListener,
-    add_conn: ConnHandler,
     close_notify: Arc<Notify>,
-    /// unix socket 路径——意外退出 error! 日志标识 inbound 用（unix 无有意义的
-    /// local_addr，`local_addr()` 返回全零占位）。
-    path: String,
 }
 
 #[cfg(unix)]
 impl TcpUnixHubListener {
-    /// 绑定 unix domain socket 并构造 listener。
+    /// 绑定 unix domain socket 并 spawn accept 循环（socket 所有权随循环移动，
+    /// 同 [`TcpHubListener::listen`]）。
     pub async fn listen(
         path: &str,
         sockopt: &SocketOptions,
         add_conn: ConnHandler,
     ) -> io::Result<Self> {
         let inner = crate::system_listener::UnixListener::bind(path, sockopt.clone()).await?;
-        Ok(Self { inner, add_conn, close_notify: Arc::new(Notify::new()), path: path.to_string() })
+        let close_notify = Arc::new(Notify::new());
+        let loop_handle = tokio::spawn(keep_accepting_unix(
+            inner,
+            path.to_string(),
+            add_conn,
+            Arc::clone(&close_notify),
+        ));
+        // 意外退出监控（同 tcp 循环）：panic 静默杀监听——error! 兜底发声。
+        tokio::spawn(supervise_accept_loop("tcp-unix", path.to_string(), loop_handle));
+        Ok(Self { close_notify })
     }
+}
 
-    /// Spawn accept 循环到独立 tokio task（对齐 [`TcpHubListener::spawn_accept_loop`]）。
-    pub fn spawn_accept_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
-        let this = Arc::clone(self);
-        let path = self.path.clone();
-        // 监控包裹（同 tcp 循环）：panic 静默杀监听——error! 兜底发声。
-        tokio::spawn(async move {
-            let loop_handle = tokio::spawn(async move {
-                this.keep_accepting().await;
-            });
-            supervise_accept_loop("tcp-unix", path, loop_handle).await;
-        })
-    }
-
-    /// Accept 循环：accept → `add_conn`（Go keepAccepting 的 unix 载体，无
-    /// header/finalmask 包装——Go unix 分支同样不走 WrapListener 的 tcp 语义）。
-    /// 错误处置与 [`TcpHubListener::keep_accepting`] 一致（accept_policy：错误永不
-    /// 退出，唯一出口是 close_notify 分支）。
-    async fn keep_accepting(&self) {
-        loop {
-            let accept_fut = self.inner.accept();
-            tokio::pin!(accept_fut);
-            tokio::select! {
-                result = &mut accept_fut => {
-                    match result {
-                        Ok(conn) => (self.add_conn)(conn),
-                        Err(e) => {
-                            match classify(&e) {
-                                AcceptErrorKind::Resource => {
-                                    crate::LOG.warn(format!("tag=tcp-unix path={} error={e} unix inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续", self.path));
-                                    backoff_if_resource(&e).await;
-                                }
-                                AcceptErrorKind::Connection => {
-                                    crate::LOG.debug(format!("tag=tcp-unix path={} error={e} unix inbound: 单连接级 accept 错误，继续监听", self.path));
-                                }
-                                AcceptErrorKind::Unknown => {
-                                    crate::LOG.warn(format!("tag=tcp-unix path={} error={e} unix inbound: accept 错误（未知类别），继续监听", self.path));
-                                }
+/// Accept 循环：accept → `add_conn`（Go keepAccepting 的 unix 载体，无
+/// header/finalmask 包装——Go unix 分支同样不走 WrapListener 的 tcp 语义）。
+/// 错误处置与 [`keep_accepting`] 一致（accept_policy：错误永不退出，唯一出口是
+/// close 分支）。`inner` 归循环所有 → 退出即释放 socket。
+#[cfg(unix)]
+async fn keep_accepting_unix(
+    inner: crate::system_listener::UnixListener,
+    path: String,
+    add_conn: ConnHandler,
+    close_notify: Arc<Notify>,
+) {
+    loop {
+        let accept_fut = inner.accept();
+        tokio::pin!(accept_fut);
+        tokio::select! {
+            result = &mut accept_fut => {
+                match result {
+                    Ok(conn) => (add_conn)(conn),
+                    Err(e) => {
+                        match classify(&e) {
+                            AcceptErrorKind::Resource => {
+                                crate::LOG.warn(format!("tag=tcp-unix path={path} error={e} unix inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续"));
+                                backoff_if_resource(&e).await;
+                            }
+                            AcceptErrorKind::Connection => {
+                                crate::LOG.debug(format!("tag=tcp-unix path={path} error={e} unix inbound: 单连接级 accept 错误，继续监听"));
+                            }
+                            AcceptErrorKind::Unknown => {
+                                crate::LOG.warn(format!("tag=tcp-unix path={path} error={e} unix inbound: accept 错误（未知类别），继续监听"));
                             }
                         }
                     }
                 }
-                _ = self.close_notify.notified() => break,
             }
+            _ = close_notify.notified() => break,
         }
-    }
-}
-
-#[cfg(unix)]
-impl TransportListener for Arc<TcpUnixHubListener> {
-    fn close(&self) -> io::Result<()> {
-        (**self).close()
-    }
-
-    fn local_addr(&self) -> io::Result<SocketAddr> {
-        (**self).local_addr()
     }
 }
 
@@ -339,6 +302,14 @@ impl TransportListener for TcpUnixHubListener {
     fn local_addr(&self) -> io::Result<SocketAddr> {
         // unix socket 无 SocketAddr，返回 unspecified（对齐 UnixConnection / Go UnixConnWrapper）
         Ok(SocketAddr::from(([0, 0, 0, 0], 0)))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TcpUnixHubListener {
+    fn drop(&mut self) {
+        // v7nqa：停机只 drop 监听句柄 → 不通知则 UDS 继续 accept。
+        let _ = TransportListener::close(self);
     }
 }
 
@@ -361,8 +332,7 @@ pub async fn listen_unix_impl(
         ));
     }
     let listener = TcpUnixHubListener::listen(&path, &sockopt, handler).await?;
-    let listener = Arc::new(listener);
-    let _accept_loop = listener.spawn_accept_loop();
+    // 同 tcp：accept 循环已在 listen 内 spawn，socket 归循环所有。
     Ok(Box::new(listener) as Box<dyn TransportListener>)
 }
 
@@ -430,7 +400,11 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_hub_listener_bind_and_accept() {
-        let handler: ConnHandler = Arc::new(|_| {});
+        let handler: ConnHandler = Arc::new(|mut conn| {
+            tokio::spawn(async move {
+                conn.write_all(b"pong").await.expect("write 失败");
+            });
+        });
         let listener = TcpHubListener::listen(
             "127.0.0.1:0".parse().unwrap(),
             &SocketOptions::default(),
@@ -442,17 +416,10 @@ mod tests {
         .expect("listen 失败");
         let addr = listener.local_addr().expect("local_addr 失败");
 
-        let server = tokio::spawn(async move {
-            let mut conn = listener.accept_one().await.expect("accept 失败");
-            conn.write_all(b"pong").await.expect("write 失败");
-        });
-
         let mut client = TcpStream::connect(addr).await.expect("connect 失败");
         let mut buf = [0u8; 4];
         client.read_exact(&mut buf).await.expect("read 失败");
         assert_eq!(&buf, b"pong");
-
-        server.await.expect("server task panic");
     }
 
     #[tokio::test]
@@ -482,20 +449,16 @@ mod tests {
             count_clone.fetch_add(1, Ordering::SeqCst);
         });
 
-        let listener = Arc::new(
-            TcpHubListener::listen(
-                "127.0.0.1:0".parse().unwrap(),
-                &SocketOptions::default(),
-                handler,
-                None,
-                None,
-            )
-            .await
-            .expect("listen 失败"),
-        );
+        let listener = TcpHubListener::listen(
+            "127.0.0.1:0".parse().unwrap(),
+            &SocketOptions::default(),
+            handler,
+            None,
+            None,
+        )
+        .await
+        .expect("listen 失败");
         let addr = listener.local_addr().expect("local_addr 失败");
-
-        let accept_handle = listener.spawn_accept_loop();
 
         // 连接 3 个客户端。
         for _ in 0..3 {
@@ -507,11 +470,9 @@ mod tests {
 
         assert_eq!(count.load(Ordering::SeqCst), 3);
 
-        // 关闭 listener 让 accept 循环退出。
+        // close → accept 循环退出（tcp_hub_listener_bind_and_accept 反向锚：
+        // 停机后不再接新连）。
         listener.close().ok();
-        // drop listener 触发 closed 错误退出循环。
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let _ = accept_handle.await;
     }
 
     #[tokio::test]
@@ -540,6 +501,8 @@ mod tests {
     #[tokio::test]
     async fn listen_unix_tcp_hub_roundtrip() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        use crate::connection::Connection;
 
         // 注册（同进程其他测试可能已注册，容忍 AlreadyExists）。
         let _ = crate::tcp::register_tcp_unix_transport();
@@ -586,6 +549,19 @@ mod tests {
         assert!(conn_rx.recv().await.is_some(), "handler must receive the connection");
 
         listener.close().expect("close 失败");
+        // UDS 同 TCP：close → 循环 break → UnixListener drop → 新连接被拒
+        // （v7nqa：循环持有 socket 时 .sock 持续 accept）。
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if tokio::net::UnixStream::connect(&path).await.is_err() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "close 后 unix socket 仍接受连接（循环未退出/socket 未释放）"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path_str}.lock"));
     }
@@ -635,35 +611,49 @@ mod tests {
         settings.transport_json = Some(serde_json::json!({ "acceptProxyProtocol": "yes" }));
         assert!(!accept_proxy_protocol_from_tcp_settings(&settings));
     }
-    /// 竞态窗回归锚（票 n8k8）：close 发生在 accept 循环注册 notified() 之前。
-    /// notify_one 存 permit，循环首次注册即被唤醒退出；旧 notify_waiters 语义下
-    /// 通知蒸发，循环 parked 在 accept() 永不退出——本测试必挂。
-    #[tokio::test]
-    async fn close_before_spawn_loop_exits_immediately() {
-        let handler: ConnHandler = Arc::new(|_| {});
-        let listener = Arc::new(
-            TcpHubListener::listen(
-                "127.0.0.1:0".parse().unwrap(),
-                &SocketOptions::default(),
-                handler,
-                None,
-                None,
-            )
-            .await
-            .expect("listen 失败"),
-        );
-        // 先 close 再 spawn：循环首次注册 notified() 时 close 已发生。
-        listener.close().expect("close 失败");
-        let handle = listener.spawn_accept_loop();
-        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
-            .await
-            .expect("accept 循环必须在 pre-spawn close 后退出（permit 语义）")
-            .expect("循环 task panic");
+    /// 轮询直至 `addr` 不再接受新连接（close/drop → 循环 break → socket drop
+    /// 是异步的，Go 侧 `Accept` 返回错误也非瞬时）。
+    async fn assert_tcp_port_closed(addr: SocketAddr) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if tokio::net::TcpStream::connect(addr).await.is_err() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "listener 关闭后端口仍接受连接（close 通知丢失/循环未退出）"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
-    /// close + drop 后端口释放，新连接被拒（票 n8k8 端口滞留修复的行为面）。
+    /// close() 即释放端口（Go hub.go:128-130 `Close()` = `listener.Close()`，
+    /// hub.go:90-97 `Accept` 报错退出），不需要等 drop。
     #[tokio::test]
-    async fn close_then_drop_rejects_new_connections() {
+    async fn close_rejects_new_connections() {
+        let handler: ConnHandler = Arc::new(|_| {});
+        let listener = TcpHubListener::listen(
+            "127.0.0.1:0".parse().unwrap(),
+            &SocketOptions::default(),
+            handler,
+            None,
+            None,
+        )
+        .await
+        .expect("listen 失败");
+        let addr = listener.local_addr().expect("local_addr 失败");
+        // 前置：关闭前端口在听（否则下面断言恒真）。
+        TcpStream::connect(addr).await.expect("close 前应可连接");
+
+        listener.close().expect("close 失败");
+        assert_tcp_port_closed(addr).await;
+    }
+
+    /// v7nqa 回归锚：inbound 停机只 drop 监听句柄、不显式 close()。
+    /// 无 `Drop → close` 兜底时 accept 循环继续持有 socket，端口在进程内继续
+    /// accept（改前本测试必挂）。
+    #[tokio::test]
+    async fn drop_without_close_rejects_new_connections() {
         let handler: ConnHandler = Arc::new(|_| {});
         let listener: Box<dyn TransportListener> = Box::new(
             TcpHubListener::listen(
@@ -677,20 +667,10 @@ mod tests {
             .expect("listen 失败"),
         );
         let addr = listener.local_addr().expect("local_addr 失败");
-        listener.close().expect("close 失败");
-        drop(listener); // socket 随最后一个 Arc 释放
+        TcpStream::connect(addr).await.expect("drop 前应可连接");
 
-        // 循环 task 退出是异步的：轮询直至 connect 被拒。
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            match tokio::net::TcpStream::connect(addr).await {
-                Err(_) => break,
-                Ok(_) => {
-                    assert!(tokio::time::Instant::now() < deadline, "close+drop 后端口仍接受连接");
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                },
-            }
-        }
+        drop(listener); // 只 drop，不调 close——走 Drop 兜底
+        assert_tcp_port_closed(addr).await;
     }
 }
 
@@ -702,6 +682,7 @@ mod header_wrap_tests {
     };
 
     use super::*;
+    use crate::connection::Connection;
 
     /// inbound header 装配（Go tcp/hub.go:85-95 构建 + 125-127 accept 后包装）：
     /// `header.type=http` → add_conn 收到的连接已被 server 包装——
@@ -723,19 +704,16 @@ mod header_wrap_tests {
         .expect("json 构建")
         .expect("type http → Some");
 
-        let listener = Arc::new(
-            TcpHubListener::listen(
-                "127.0.0.1:0".parse().unwrap(),
-                &SocketOptions::default(),
-                handler,
-                Some(auth),
-                None,
-            )
-            .await
-            .expect("listen 失败"),
-        );
+        let listener = TcpHubListener::listen(
+            "127.0.0.1:0".parse().unwrap(),
+            &SocketOptions::default(),
+            handler,
+            Some(auth),
+            None,
+        )
+        .await
+        .expect("listen 失败");
         let addr = listener.local_addr().expect("local_addr 失败");
-        let _loop = listener.spawn_accept_loop();
 
         // 原始 client：手发 request header + payload。
         let mut client = TcpStream::connect(addr).await.expect("connect 失败");

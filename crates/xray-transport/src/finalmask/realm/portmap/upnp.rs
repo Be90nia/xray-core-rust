@@ -7,6 +7,13 @@
 //!
 //! 限制（IGD v1 规范面）：没有「查询本映射实际外部端口」的 action，外部端口即
 //! 请求端口（与 Go go-nat 的 UPnP 后端同做法）；租期由 `NewLeaseDuration` 给出。
+//!
+//! 不可信输入收口（SSDP 应答方是攻击者可控的）：
+//! - SSDP 应答源必须是本机、默认网关或与网关同 /16 的主机（[`ssdp_peer_allowed`]）；
+//! - description URL 的 host 必须是 IP 字面量，且与 SSDP 应答源同一个 host；
+//! - `<URLBase>`/`controlURL` 不得把控制面搬到别的 host（host 必须等于 description host）；
+//! - 不跟 HTTP 重定向（一次 302 就能把抓取导去任意内网主机）；
+//! - description / SOAP 响应体流式读取，超上限立即中止（不先读完再校验）。
 
 use std::{
     io,
@@ -40,6 +47,8 @@ const PORT_MAPPING_DESCRIPTION: &str = "hysteria-realm";
 const SSDP_BUF_LEN: usize = 2048;
 /// device description 上限（设备 XML 通常几 KB，防 OOM）。
 const MAX_DESCRIPTION_SIZE: usize = 256 * 1024;
+/// SOAP 响应上限（AddPortMapping 答复是空元素，fault 体 <1KB）。
+const MAX_SOAP_RESPONSE_SIZE: usize = 64 * 1024;
 /// SSDP 无应答时兜底候选端口（miniupnpd 缺省 5000；UPnP 标准端口段 49152/49153）。
 const FALLBACK_PORTS: [u16; 3] = [5000, 49152, 49153];
 
@@ -166,32 +175,70 @@ impl Client {
         timeout: Duration,
         fallbacks: &[String],
     ) -> io::Result<Self> {
-        let location = match ssdp_location(search_addr, timeout).await {
-            Ok(location) => location,
-            Err(ssdp_err) => {
-                let mut attempts = Vec::new();
-                for url in fallbacks {
-                    match Self::from_description_url(url, timeout).await {
-                        Ok(client) => return Ok(client),
-                        Err(e) => attempts.push(format!("{url}: {e}")),
-                    }
-                }
-                if attempts.is_empty() {
-                    return Err(ssdp_err);
-                }
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("{ssdp_err}; description fallbacks failed: {}", attempts.join("; ")),
-                ));
+        let ssdp_err = match ssdp_location(search_addr, timeout).await {
+            // SSDP 应答源即该 description 的唯一可信 host（防抢答者把抓取导去别处）
+            Ok((location, peer)) => {
+                return Self::from_pinned_description(&location, peer, timeout).await;
             },
+            Err(e) => e,
         };
-        Self::from_description_url(&location, timeout).await
+        let mut attempts = Vec::new();
+        for url in fallbacks {
+            match Self::from_description_url(url, timeout).await {
+                Ok(client) => return Ok(client),
+                Err(e) => attempts.push(format!("{url}: {e}")),
+            }
+        }
+        if attempts.is_empty() {
+            return Err(ssdp_err);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{ssdp_err}; description fallbacks failed: {}", attempts.join("; ")),
+        ))
     }
 
     /// 已知 description URL 直建客户端（跳过 SSDP；兜底路径与真机取证用）。
+    ///
+    /// host 必须是 IP 字面量且通过 [`ssdp_peer_allowed`]：兜底候选由
+    /// [`fallback_description_urls`] 用默认网关构造，此处把「调用方传进来的任意
+    /// URL」也钉在同一白名单上。
     pub async fn from_description_url(location: &str, timeout: Duration) -> io::Result<Self> {
+        let host = description_host(location)?;
+        if !ssdp_peer_allowed(host, super::default_ipv4_gateway().ok()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "UPnP: description url host {host} is neither this host, the default gateway, \
+                     nor on its /16"
+                ),
+            ));
+        }
+        Self::from_pinned_description(location, host, timeout).await
+    }
+
+    /// `expected_host` = 该 description 唯一可信的 host（SSDP 路径 = 应答源 IP，
+    /// 兜底路径 = description URL 的 IP 字面量）；`<URLBase>`/`controlURL` 都不得
+    /// 把控制面搬到别的 host。
+    async fn from_pinned_description(
+        location: &str,
+        expected_host: Ipv4Addr,
+        timeout: Duration,
+    ) -> io::Result<Self> {
+        let host = description_host(location)?;
+        if host != expected_host {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "UPnP: description url {location:?} points at {host}, not the SSDP responder \
+                     {expected_host}"
+                ),
+            ));
+        }
         let http = reqwest::Client::builder()
             .timeout(timeout)
+            // 不跟重定向：一次 302 就能把 description 抓取导去任意内网主机
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| io::Error::other(format!("UPnP: build http client failed: {e}")))?;
         let description = fetch_description(&http, location).await?;
@@ -208,6 +255,21 @@ impl Client {
                 format!("UPnP: bad control url {control:?}: {e}"),
             )
         })?;
+        let control_host = url_host_ipv4(&control_url).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("UPnP: control url {control:?} must carry an IPv4 literal host"),
+            )
+        })?;
+        if control_host != expected_host {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "UPnP: control url {control:?} points at {control_host}, not the description \
+                     host {expected_host}"
+                ),
+            ));
+        }
         let local_ip = local_ipv4_towards(&control_url).await?;
         Ok(Self { http, control_url, service_type, local_ip })
     }
@@ -308,10 +370,9 @@ impl Client {
             .await
             .map_err(|e| io::Error::other(format!("UPnP {action}: {e}")))?;
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| io::Error::other(format!("UPnP {action}: read body failed: {e}")))?;
+        let body =
+            read_body_capped(response, MAX_SOAP_RESPONSE_SIZE, &format!("UPnP {action} response"))
+                .await?;
         if !status.is_success() {
             return Err(soap_failure(action, status.as_u16(), &body));
         }
@@ -347,13 +408,63 @@ pub(crate) fn fallback_description_urls() -> Vec<String> {
     FALLBACK_PORTS.iter().map(|port| format!("http://{gateway}:{port}/rootDesc.xml")).collect()
 }
 
-/// SSDP 搜索：并向各 search target，等首个带 LOCATION 的 200。
-async fn ssdp_location(search_addr: SocketAddrV4, timeout: Duration) -> io::Result<String> {
+/// SSDP 应答源是否可信：本机（单测 stub / 同机 IGD）、默认网关，或与网关同网段。
+///
+/// 拦的是「任何主机都能应答 1900」这一面：抢答者此后也只能让我们访问**它自己**
+/// （description/control 的 host 钉在应答源上），无法把我们导去第三方内网主机。
+///
+/// shortcut: 同网段判定按 /16 前缀（不读接口掩码），覆盖 /16~/24 的常见局域网
+/// （含本机实测的 192.168.88.0/23：网关 .88.1、IGD .89.249）；/8 级跨 /16 的
+/// IGD 会被拒，症状是 SSDP 静默、走默认网关兜底候选（fail-visible，不静默成功）。
+/// 取不到默认路由的平台（macOS）退化为「只收私有源」。升级点=按路由表 on-link
+/// 掩码判定。
+fn ssdp_peer_allowed(peer: Ipv4Addr, gateway: Option<Ipv4Addr>) -> bool {
+    if peer.is_loopback() {
+        return true;
+    }
+    let Some(gateway) = gateway else {
+        // 取不到默认路由（macOS 未实现网关查询）→ 退化为「只收私有源」：盲 SSRF 仍关闭
+        // （description/control 的 host 钉在应答源上，应答方最多能让我们访问它自己），
+        // 只是少了「必须是本段」这一层。
+        return peer.is_private();
+    };
+    peer == gateway || peer.octets()[..2] == gateway.octets()[..2]
+}
+
+/// URL 的 host 当且仅当是 IPv4 字面量才返回值（域名可 rebinding，一律拒）。
+fn url_host_ipv4(url: &reqwest::Url) -> Option<Ipv4Addr> {
+    url.host_str()?.parse().ok()
+}
+
+/// description URL 的 host（必须是 IPv4 字面量）。
+fn description_host(location: &str) -> io::Result<Ipv4Addr> {
+    let url = reqwest::Url::parse(location).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("UPnP: bad description url {location:?}: {e}"),
+        )
+    })?;
+    url_host_ipv4(&url).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("UPnP: description url {location:?} must carry an IPv4 literal host"),
+        )
+    })
+}
+
+/// SSDP 搜索：并向各 search target，等首个「源可信且带 LOCATION」的 200。
+///
+/// 返回 `(description URL, 应答源 IPv4)`：应答源是后续抓取的唯一可信 host。
+async fn ssdp_location(
+    search_addr: SocketAddrV4,
+    timeout: Duration,
+) -> io::Result<(String, Ipv4Addr)> {
     let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
     for target in SSDP_SEARCH_TARGETS {
         let message = build_msearch(target);
         sock.send_to(message.as_bytes(), SocketAddr::V4(search_addr)).await?;
     }
+    let gateway = super::default_ipv4_gateway().ok();
     let deadline = Instant::now() + timeout;
     let mut buf = vec![0u8; SSDP_BUF_LEN];
     while Instant::now() < deadline {
@@ -365,9 +476,20 @@ async fn ssdp_location(search_addr: SocketAddrV4, timeout: Duration) -> io::Resu
                 crate::LOG.debug(format!("UPnP: SSDP recv error (ignored): {e}"));
                 tokio::time::sleep(Duration::from_millis(50)).await;
             },
-            Ok(Ok((n, _peer))) => {
+            Ok(Ok((n, addr))) => {
+                let SocketAddr::V4(peer) = addr else {
+                    continue; // IGD 面只走 IPv4
+                };
+                if !ssdp_peer_allowed(*peer.ip(), gateway) {
+                    crate::LOG.debug(format!(
+                        "UPnP: ignoring SSDP response from {} (not this host, the default gateway, \
+                         nor on its /16)",
+                        peer.ip()
+                    ));
+                    continue;
+                }
                 if let Some(location) = parse_ssdp_location(&String::from_utf8_lossy(&buf[..n])) {
-                    return Ok(location);
+                    return Ok((location, *peer.ip()));
                 }
             },
         }
@@ -378,7 +500,7 @@ async fn ssdp_location(search_addr: SocketAddrV4, timeout: Duration) -> io::Resu
     ))
 }
 
-/// 抓 device description（带体积上限，超限显式报错而非截断解析）。
+/// 抓 device description（体积上限走流式读，超限即中止解析）。
 async fn fetch_description(http: &reqwest::Client, location: &str) -> io::Result<String> {
     let response = http.get(location).send().await.map_err(|e| {
         io::Error::other(format!("UPnP: fetch description {location:?} failed: {e}"))
@@ -390,28 +512,31 @@ async fn fetch_description(http: &reqwest::Client, location: &str) -> io::Result
             status.as_u16()
         )));
     }
-    if let Some(len) = response.content_length()
-        && len > MAX_DESCRIPTION_SIZE as u64
+    read_body_capped(response, MAX_DESCRIPTION_SIZE, &format!("description {location:?}")).await
+}
+
+/// 流式读响应体，超过 `cap` 立即中止（Content-Length 可被 chunked 或谎报绕过，
+/// 先读完再校验 = 恶意响应直接 OOM）。
+async fn read_body_capped(
+    mut response: reqwest::Response,
+    cap: usize,
+    what: &str,
+) -> io::Result<String> {
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| io::Error::other(format!("UPnP: read {what} failed: {e}")))?
     {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "UPnP: description at {location:?} is {len} bytes, over the {MAX_DESCRIPTION_SIZE} cap"
-            ),
-        ));
+        if body.len() + chunk.len() > cap {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("UPnP: {what} exceeds the {cap} byte cap"),
+            ));
+        }
+        body.extend_from_slice(&chunk);
     }
-    let body = response.text().await.map_err(|e| {
-        io::Error::other(format!("UPnP: read description {location:?} failed: {e}"))
-    })?;
-    if body.len() > MAX_DESCRIPTION_SIZE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "UPnP: description at {location:?} exceeds the {MAX_DESCRIPTION_SIZE} byte cap"
-            ),
-        ));
-    }
-    Ok(body)
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// 本机通往控制端点的 IPv4（SOAP `NewInternalClient` 用）。
@@ -490,6 +615,8 @@ fn xml_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
     use crate::finalmask::realm::portmap::test_support::{DESCRIPTION_XML, HttpStub, SsdpStub};
 
@@ -609,6 +736,132 @@ mod tests {
         assert_eq!(err.code, "718");
         assert_eq!(err.description, "ConflictInMappingEntry");
         assert!(parse_soap_error("<ok/>").is_none());
+    }
+
+    #[test]
+    fn ssdp_peer_allowlist_pins_gateway_subnet() {
+        let gateway = Ipv4Addr::new(192, 168, 88, 1);
+        assert!(ssdp_peer_allowed(Ipv4Addr::LOCALHOST, Some(gateway)), "本机 stub / 同机 IGD");
+        assert!(ssdp_peer_allowed(gateway, Some(gateway)), "默认网关");
+        assert!(ssdp_peer_allowed(Ipv4Addr::new(192, 168, 88, 77), Some(gateway)), "同 /24");
+        // /23 拓扑（本机实测：网关 .88.1、IGD .89.249）必须放行
+        assert!(ssdp_peer_allowed(Ipv4Addr::new(192, 168, 89, 249), Some(gateway)), "同 /16");
+        assert!(!ssdp_peer_allowed(Ipv4Addr::new(10, 9, 9, 9), Some(gateway)), "异私有段");
+        assert!(!ssdp_peer_allowed(Ipv4Addr::new(203, 0, 113, 7), Some(gateway)), "公网源");
+        // 无网关锚点（macOS 面）：只收私有源，公网源仍拒
+        assert!(ssdp_peer_allowed(Ipv4Addr::new(10, 9, 9, 9), None), "无锚点：私有源放行");
+        assert!(!ssdp_peer_allowed(Ipv4Addr::new(203, 0, 113, 7), None), "无锚点：公网源拒绝");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ssdp_location_pointing_away_from_responder_is_rejected() {
+        // 应答源 = 127.0.0.1，LOCATION 却指向别的主机 → 必须拒（盲 SSRF 入口），
+        // 且根本不许发出那个 GET
+        let ssdp = SsdpStub::spawn("http://10.9.9.9:5000/rootDesc.xml".to_string()).await;
+        let err = Client::discover(ssdp.addr, Duration::from_secs(2))
+            .await
+            .err()
+            .expect("foreign LOCATION host must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("not the SSDP responder 127.0.0.1"), "{msg}");
+        assert!(msg.contains("10.9.9.9"), "{msg}");
+        // 兜底入口（任意 URL）同样钉在白名单上
+        let err = Client::from_description_url(
+            "http://10.9.9.9:5000/rootDesc.xml",
+            Duration::from_secs(2),
+        )
+        .await
+        .err()
+        .expect("off-allowlist description host must be rejected");
+        assert!(err.to_string().contains("is neither this host, the default gateway"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_url_must_stay_on_description_host() {
+        // `<URLBase>` 指到别的内网主机 → controlURL 被搬过去 → 必须拒
+        let description = format!("<URLBase>http://10.9.9.9:5000/</URLBase>{DESCRIPTION_XML}");
+        let http = HttpStub::spawn(move |req| match req.path.as_str() {
+            "/rootDesc.xml" => (200, description.clone()),
+            _ => (404, "<nope/>".to_string()),
+        })
+        .await;
+        let ssdp = SsdpStub::spawn(format!("http://{}/rootDesc.xml", http.addr)).await;
+        let err = Client::discover(ssdp.addr, Duration::from_secs(2))
+            .await
+            .err()
+            .expect("control url off the description host must be rejected");
+        assert!(err.to_string().contains("not the description host"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redirects_are_not_followed() {
+        // 302 指向自己另一条路径：一次跳转就能把抓取导去任意内网主机，必须不跟
+        let http = HttpStub::spawn(|req| match req.path.as_str() {
+            "/rootDesc.xml" => (302, String::new()),
+            _ => (200, DESCRIPTION_XML.to_string()),
+        })
+        .await;
+        let location = format!("http://{}/rootDesc.xml", http.addr);
+        let err = Client::from_description_url(&location, Duration::from_secs(2))
+            .await
+            .err()
+            .expect("302 must not be followed");
+        assert!(err.to_string().contains("HTTP 302"), "{err}");
+        let gets: Vec<_> = http.requests().into_iter().filter(|r| r.method == "GET").collect();
+        assert_eq!(gets.len(), 1, "no follow-up request: {gets:?}");
+    }
+
+    /// 超上限即中止（流式）：stub 声明 10MB、只灌 300KB 后挂住不关。
+    /// 「先读完再校验」在这种响应上只能干等 timeout，流式上限立刻报 cap。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oversized_description_aborts_mid_stream() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind");
+        let addr = listener.local_addr().expect("stub addr");
+        tokio::spawn(async move {
+            let Ok((mut sock, _peer)) = listener.accept().await else {
+                return;
+            };
+            // 先读完请求头（真实服务端形态；不读就先写会让 Windows loopback 直接 RST）
+            let mut req = Vec::new();
+            let mut chunk = [0u8; 512];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                match sock.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => req.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\n\r\n",
+                10 * MAX_DESCRIPTION_SIZE
+            );
+            if sock.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            // 灌过上限后就挂住：不关连接、不再发
+            if sock.write_all(&vec![b'a'; 300 * 1024]).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let location = format!("http://{addr}/rootDesc.xml");
+        let err = Client::from_description_url(&location, Duration::from_secs(5))
+            .await
+            .err()
+            .expect("over-cap description must abort");
+        assert!(err.to_string().contains("byte cap"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oversized_soap_response_aborts() {
+        let http = HttpStub::spawn(|req| match req.path.as_str() {
+            "/rootDesc.xml" => (200, DESCRIPTION_XML.to_string()),
+            _ => (200, "x".repeat(MAX_SOAP_RESPONSE_SIZE + 1)),
+        })
+        .await;
+        let ssdp = SsdpStub::spawn(format!("http://{}/rootDesc.xml", http.addr)).await;
+        let client = Client::discover(ssdp.addr, Duration::from_secs(2)).await.expect("discover");
+        let err = client.add_udp_mapping(8080, 60).await.expect_err("over-cap soap must abort");
+        assert!(err.to_string().contains("byte cap"), "{err}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -868,8 +1121,9 @@ mod tests {
 
         // 1) 前提：该网络 SSDP 静默（路由器 1900 端口被其他服务占用，实测 0 应答）
         match ssdp_location(SSDP_ADDR, timeout).await {
-            Ok(location) => panic!(
-                "SSDP unexpectedly answered with {location}; the 'SSDP silent' premise no longer holds"
+            Ok((location, peer)) => panic!(
+                "SSDP unexpectedly answered from {peer} with {location}; the 'SSDP silent' premise \
+                 no longer holds"
             ),
             Err(e) => println!("SSDP silent as expected: {e}"),
         }

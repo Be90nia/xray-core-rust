@@ -263,6 +263,16 @@ impl TransportListener for WsTransportListener {
     }
 }
 
+impl Drop for WsTransportListener {
+    fn drop(&mut self) {
+        // v7nqa：inbound 停机只 drop 监听句柄、不显式调 close——不通知则 accept
+        // 循环继续持有 WsListener（含 socket），端口在进程内继续 accept（Go
+        // worker.close 显式 hub.Close()，proxyman/inbound/worker.go:151-158；
+        // ws 侧 hub.go:154-156 `Close()` = `listener.Close()`）。
+        let _ = TransportListener::close(self);
+    }
+}
+
 /// 实际拨号：解析 wsSettings → tls config → 池查询/拨号 → 包装为 Connection。
 async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Box<dyn Connection>> {
     let config = parse_ws_config(settings.transport_json.as_ref())?;
@@ -1021,6 +1031,36 @@ mod tests {
                     assert!(
                         tokio::time::Instant::now() < deadline,
                         "close 后端口仍接受连接（close 通知丢失/循环未退出）"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                },
+            }
+        }
+    }
+
+    /// v7nqa 回归锚：停机只 drop 监听句柄、不显式 close()——无 `Drop → close`
+    /// 兜底时 accept 循环继续持有 WsListener（含 socket），端口在进程内继续
+    /// accept（改前本测试必挂）。
+    #[tokio::test]
+    async fn drop_without_close_rejects_new_connections() {
+        let settings = StreamSettings { protocol: "websocket".into(), ..Default::default() };
+        let handler: ConnHandler = Arc::new(|_| {});
+        let listener = listen_ws("127.0.0.1:0".parse().unwrap(), &settings, &handler, Vec::new())
+            .await
+            .expect("listen_ws");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::net::TcpStream::connect(addr).await.expect("drop 前应可连接");
+
+        drop(listener); // 只 drop，不调 close——走 Drop 兜底
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match tokio::net::TcpStream::connect(addr).await {
+                Err(_) => break,
+                Ok(_) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "drop 后端口仍接受连接（Drop→close 未生效/循环未退出）"
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 },

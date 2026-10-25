@@ -116,6 +116,19 @@ pub fn register_all_transports() {
     // REALITY
     let _ = xray_reality::register::register_dialer();
 
+    // transport 级 Unix socket 监听（Go system_listener.go UnixAddr 分支）。
+    // 与 TCP listener 平行的一张注册表（`register_transport_unix_listener`）：
+    // 不注册则 unix 路径 listen 查表即 NotFound——e2e 测试若自注册会掩盖此缺口，
+    // 故此处必须显式注册（审计 finding F2 / bd yubhp）。
+    #[cfg(unix)]
+    {
+        let _ = xray_transport::tcp::register_tcp_unix_transport();
+        let _ = xray_transport_websocket::register::register_unix_listener();
+        let _ = xray_transport_httpupgrade::register::register_unix_listener();
+        let _ = xray_transport_splithttp::register::register_unix_listener();
+        let _ = xray_transport_grpc::register::register_unix_listener();
+    }
+
     tracing::info!("all transport dialers + listeners registered");
 }
 
@@ -1021,6 +1034,21 @@ fn simple_feature_factory(kind: &'static str) -> FeatureFactory {
 
 #[cfg(test)]
 mod tests {
+    /// 回归钉子（审计 F2 / bd yubhp）：`register_all_transports` 之后，
+    /// 五个 transport 的 unix 监听必须在注册表里可查——生产路径不得依赖
+    /// e2e 测试的自注册。Windows 无 unix 监听面，跳过。
+    #[cfg(unix)]
+    #[test]
+    fn register_all_transports_registers_unix_listeners() {
+        super::register_all_transports();
+        for proto in ["tcp", "ws", "httpupgrade", "splithttp", "grpc"] {
+            assert!(
+                xray_transport::listener_registry::get_transport_unix_listener(proto).is_some(),
+                "unix listener for {proto:?} not registered by register_all_transports"
+            );
+        }
+    }
+
     use super::*;
 
     /// uasr①：policy levels 非数字键 / 损坏 JSON 拒启（Go policy.go:73

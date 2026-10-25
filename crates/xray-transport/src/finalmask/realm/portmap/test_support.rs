@@ -61,6 +61,7 @@ pub const DESCRIPTION_XML: &str = r#"<?xml version="1.0"?>
 pub struct NatPmpStub {
     pub addr: SocketAddrV4,
     requests: Arc<Mutex<Vec<Vec<u8>>>>,
+    peers: Arc<Mutex<Vec<SocketAddr>>>,
 }
 
 impl NatPmpStub {
@@ -71,22 +72,30 @@ impl NatPmpStub {
             SocketAddr::V6(_) => unreachable!("stub binds IPv4"),
         };
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let peers = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&requests);
+        let froms = Arc::clone(&peers);
         tokio::spawn(async move {
             let mut buf = [0u8; 64];
             while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
                 let packet = buf[..n].to_vec();
                 seen.lock().expect("natpmp stub lock").push(packet.clone());
+                froms.lock().expect("natpmp stub lock").push(peer);
                 if let Some(response) = respond(&packet) {
                     let _ = sock.send_to(&response, peer).await;
                 }
             }
         });
-        Self { addr, requests }
+        Self { addr, requests, peers }
     }
 
     pub fn requests(&self) -> Vec<Vec<u8>> {
         self.requests.lock().expect("natpmp stub lock").clone()
+    }
+
+    /// 客户端源地址（伪造应答用例据此把包投向真实源端口）。
+    pub fn peers(&self) -> Vec<SocketAddr> {
+        self.peers.lock().expect("natpmp stub lock").clone()
     }
 
     pub fn request_count(&self) -> usize {

@@ -1044,6 +1044,16 @@ impl TransportListener for SplithttpListener {
         Ok(())
     }
 }
+
+impl Drop for SplithttpListener {
+    fn drop(&mut self) {
+        // v7nqa：停机只 drop 监听句柄 → 不关则 accept task / QUIC endpoint 继续
+        // 持有 socket（Go worker.close 显式 hub.Close()，worker.go:151-158；
+        // splithttp 侧 hub.go:588-591）。
+        let _ = TransportListener::close(self);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1281,6 +1291,39 @@ mod tests {
                     assert!(
                         tokio::time::Instant::now() < deadline,
                         "close 后端口仍接受连接（accept task 未终止）"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                },
+            }
+        }
+    }
+
+    /// v7nqa 回归锚：停机只 drop 监听句柄、不显式 close()——无 `Drop → close`
+    /// 兜底时 accept task 继续持有 TcpListener，端口在进程内继续 accept。
+    #[tokio::test]
+    async fn drop_without_close_rejects_new_tcp_connections() {
+        let (handler, _count) = greeting_handler();
+        let listener = listen_splithttp(
+            "127.0.0.1:0".parse().unwrap(),
+            &plain_settings(),
+            &SocketOptions::default(),
+            handler,
+        )
+        .await
+        .expect("listen");
+        let addr = listener.local_addr().unwrap();
+        TcpStream::connect(addr).await.expect("drop 前应可连接");
+
+        drop(listener); // 只 drop，不调 close——走 Drop 兜底
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match TcpStream::connect(addr).await {
+                Err(_) => break,
+                Ok(_) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "drop 后端口仍接受连接（Drop→close 未生效/accept task 未终止）"
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 },

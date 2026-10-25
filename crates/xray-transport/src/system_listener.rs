@@ -719,19 +719,120 @@ pub struct UnixListener {
     _locker: Option<FileLocker>,
 }
 
+/// UDS socket 文件缺省权限（bd c4qff 安全收口）：0700 owner-only，与 umask 无关。
+/// libc 缺省 = `0777 & ~umask`（umask 0 时裸 0777，本地任意用户可连）；需要跨
+/// 用户共享时显式 `/path,0755` 覆盖。
+#[cfg(unix)]
+const DEFAULT_UNIX_SOCKET_MODE: u32 = 0o700;
+
+/// bind 前的陈旧 socket 判定（bd 45t3k）。
+///
+/// Go 语义 = bind 撞现存文件报错、仅 Close 时 unlink、从不预删；本仓保留预删是
+/// 崩溃残留的运维补偿，但只在「确认无人监听的 socket 文件」时删：
+/// - 可连接 → 有活监听（无论谁起的）→ 禁删，报 `AddrInUse`；
+/// - `ConnectionRefused` → 监听已死；**但 Linux 对「路径存在而非 socket」同样回
+///   ECONNREFUSED**（af_unix unix_find_other），删除前必须 `S_ISSOCK` 复核， 普通文件/symlink
+///   一律拒绝；
+/// - `NotFound` → 本就无文件；
+/// - 其余（EACCES=他人 0700 socket、backlog 满=WoulBlock 等）→ 状态未知不删、 原样上抛。
+///
+/// 残余窗口：探测→删除→bind 之间有 TOCTOU，本仓多实例由 `.lock` flock 串行化，
+/// 非本仓进程的竞态不在本收口范围。
+#[cfg(unix)]
+fn ensure_stale_or_absent(socket_path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    match std::os::unix::net::UnixStream::connect(socket_path) {
+        Ok(_probe) => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "unix socket {} is live (connectable); refusing to replace a listening socket",
+                socket_path.display()
+            ),
+        )),
+        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+            // symlink_metadata 不跟随 symlink：symlink 占位 ≠ 我们的 socket 文件。
+            match std::fs::symlink_metadata(socket_path) {
+                Ok(md) if md.file_type().is_socket() => {
+                    std::fs::remove_file(socket_path)?;
+                    Ok(())
+                },
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{} exists and is not a socket file; refusing to remove it",
+                        socket_path.display()
+                    ),
+                )),
+                // 探测期间文件自行消失（无害竞态）→ 直接走后续 bind
+                Err(e2) if e2.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e2) => Err(e2),
+            }
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// 记录 UDS 对端凭据（bd c4qff）。Linux/Android 经 SO_PEERCRED 拿 peer
+/// uid/pid/gid 记 debug 日志；其余平台无对应接口，显式日志说明不可用。
+#[cfg(unix)]
+fn log_peer_credentials(stream: &UnixStream) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::fd::AsRawFd;
+        let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: cred/len 是有效可写缓冲，getsockopt 以 len 为上界写入。
+        let ret = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        };
+        if ret == 0 {
+            tracing::debug!(
+                pid = cred.pid,
+                uid = cred.uid,
+                gid = cred.gid,
+                "uds peer credentials (SO_PEERCRED)"
+            );
+        } else {
+            tracing::debug!(
+                error = %io::Error::last_os_error(),
+                "uds peer credentials unavailable: SO_PEERCRED getsockopt failed"
+            );
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = stream;
+        tracing::debug!(
+            "uds peer credentials unavailable: SO_PEERCRED not supported on this platform"
+        );
+    }
+}
+
 #[cfg(unix)]
 impl UnixListener {
     /// 绑定 Unix domain socket。对应 Go `DefaultListener.Listen` 的 Unix 分支。
     ///
     /// 地址格式：
-    /// - `/path/to/socket` — 普通路径（FileLocker + 残留文件清理）
-    /// - `/path/to/socket,0755` — 路径 + 八进制权限（bind 后 chmod）
-    /// - `@name` — Linux abstract socket（无 FileLocker，Go system_listener.go:119）
+    /// - `/path/to/socket` — 普通路径（FileLocker + 陈旧 socket 清理 + 权限）
+    /// - `/path/to/socket,0755` — 路径 + 八进制权限（bind 后 chmod）。**缺省 0700 owner-only**（bd
+    ///   c4qff，与 umask 无关；Go 缺省 `0777 & ~umask` 在 umask 0 时裸
+    ///   0777）。**本地多用户风险**：显式放宽（如 `,0755`）即允许其他本地 用户连接此
+    ///   socket，需自行评估
+    /// - `@name` — Linux abstract socket（无 FileLocker、**无文件权限位**，任何
+    ///   本地进程知道名字即可连接，Go system_listener.go:119）
     /// - `@@name` — abstract socket + haproxy padding（名字零填充到 108 字节， Go
     ///   system_listener.go:121-126）
     ///
     /// # Errors
-    /// FileLocker 获取失败 / bind 失败 / 权限设置失败 / abstract 名超长时返回 `io::Error`。
+    /// FileLocker 获取失败 / bind 失败 / 权限设置失败 / abstract 名超长 / 路径被
+    /// 活动监听或非 socket 文件占用（bd 45t3k，不偷换）时返回 `io::Error`。
     pub async fn bind(addr: &str, sockopt: SocketOptions) -> io::Result<Self> {
         match parse_unix_addr(addr)? {
             #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -754,15 +855,31 @@ impl UnixListener {
                 let mut lk = FileLocker::new(format!("{}.lock", socket_path.display()));
                 lk.acquire()?;
 
-                // 删除可能残留的旧 socket 文件（Go 标准库 net.ListenUnix 也这样做）
-                let _ = std::fs::remove_file(&socket_path);
+                // bd 45t3k：不再无条件预删（旧注释「Go net.ListenUnix 也这样做」
+                // 不实——Go 是 bind 撞活文件报 EADDRINUSE、仅在 Close 时 unlink）。
+                // 预删作为崩溃残留的运维补偿保留，但收紧为只清「确认无人监听的
+                // 陈旧 socket」；活动监听报 AddrInUse，普通文件绝不删。
+                ensure_stale_or_absent(&socket_path)?;
                 let inner = TokioUnixListener::bind(&socket_path)?;
 
-                // bind 后设置权限
-                if let Some(mode) = perm {
+                // bd c4qff：bind 后固定权限（与 umask 无关）。缺省 0700
+                // owner-only；显式 `,mode` 覆盖。abstract socket 无文件权限位，
+                // 该面风险已在 bind 文档声明。
+                let mode = perm.unwrap_or(DEFAULT_UNIX_SOCKET_MODE);
+                {
                     use std::os::unix::fs::PermissionsExt;
                     std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(mode))
                         .map_err(|e| io::Error::other(format!("failed to set permission: {e}")))?;
+                }
+                if perm.is_none() {
+                    let mode_str = format!("{mode:o}");
+                    tracing::info!(
+                        path = %socket_path.display(),
+                        mode = %mode_str,
+                        "uds socket permission defaulted to owner-only (Go default \
+                         0777&~umask is too permissive); append ',mode' (e.g. \
+                         /path,0755) to allow other local users, at your own risk"
+                    );
                 }
 
                 Ok(Self { inner, sockopt, controllers: Vec::new(), _locker: Some(lk) })
@@ -783,6 +900,7 @@ impl SystemListener for UnixListener {
     ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Connection>>> + Send + 'a>> {
         Box::pin(async move {
             let (stream, _) = self.inner.accept().await?;
+            log_peer_credentials(&stream);
             Ok(Box::new(UnixConnection::new(stream)) as Box<dyn Connection>)
         })
     }
@@ -1407,6 +1525,123 @@ mod tests {
         server.await.unwrap();
 
         assert_eq!(*ka_state.lock(), Some(false), "未配置时不应启用 keepalive");
+    }
+
+    // ===== bd c4qff / bd 45t3k：UDS 缺省权限 + 预删策略（unix 真跑，WSL 验收）=====
+
+    /// 缺省（无 `,perm`）→ socket 文件 0700 owner-only，与 umask 无关。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uds_default_mode_is_owner_only() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("xray_test_uds_mode_{}.sock", std::process::id()));
+        let lock = format!("{}.lock", path.display());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&lock);
+
+        let listener = UnixListener::bind(path.to_str().unwrap(), SocketOptions::default())
+            .await
+            .expect("bind 失败");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).expect("stat socket").permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "缺省必须 0700 owner-only（bd c4qff）");
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 显式 `,perm` 覆盖仍生效（放宽路径是文档化逃生门，兼容不破坏）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uds_explicit_perm_still_applies() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("xray_test_uds_perm_{}.sock", std::process::id()));
+        let lock = format!("{}.lock", path.display());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&lock);
+
+        let listener =
+            UnixListener::bind(&format!("{},0755", path.display()), SocketOptions::default())
+                .await
+                .expect("bind 失败");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).expect("stat socket").permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "显式 ,0755 必须生效");
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 活动监听占位 → 拒绝（AddrInUse），socket 文件原样保留、原监听不被偷换。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uds_bind_refuses_live_listener() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("xray_test_uds_live_{}.sock", std::process::id()));
+        let lock = format!("{}.lock", path.display());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&lock);
+
+        // 真实存活的第三方监听（std，不持我们的 .lock）。
+        let live = std::os::unix::net::UnixListener::bind(&path).expect("std bind");
+
+        // UnixListener 未实现 Debug，不能用 expect_err。
+        let err = match UnixListener::bind(path.to_str().unwrap(), SocketOptions::default()).await {
+            Ok(_) => panic!("活监听必须拒绝（bd 45t3k）"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        assert!(path.exists(), "活动 socket 文件不得被删除");
+        assert!(
+            std::os::unix::net::UnixStream::connect(&path).is_ok(),
+            "原监听必须仍可连接（未被偷换）"
+        );
+
+        drop(live);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 崩溃残留（文件在、监听已死）→ 自动清走并成功绑定（运维补偿保留）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uds_bind_removes_stale_socket() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("xray_test_uds_stale_{}.sock", std::process::id()));
+        let lock = format!("{}.lock", path.display());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&lock);
+
+        // 制造残留：std bind 后直接 drop（std 不 unlink，文件留下、监听已死）。
+        {
+            let _dead = std::os::unix::net::UnixListener::bind(&path).expect("std bind");
+        }
+        assert!(path.exists(), "前置：残留文件应存在");
+
+        let listener = UnixListener::bind(path.to_str().unwrap(), SocketOptions::default())
+            .await
+            .expect("陈旧残留应被清理并成功绑定");
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 普通文件占位（非 socket）→ 拒绝且内容原样保留（绝不删非 socket 文件；
+    /// Linux 对非 socket 文件 connect 也回 ECONNREFUSED，必须 S_ISSOCK 复核）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uds_bind_refuses_regular_file_placeholder() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("xray_test_uds_reg_{}.sock", std::process::id()));
+        let lock = format!("{}.lock", path.display());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&lock);
+        std::fs::write(&path, b"user-data").expect("写占位文件");
+
+        let result = UnixListener::bind(path.to_str().unwrap(), SocketOptions::default()).await;
+        assert!(result.is_err(), "普通文件占位必须拒绝");
+        assert_eq!(
+            std::fs::read(&path).expect("读回").as_slice(),
+            b"user-data",
+            "占位文件不得被删/截断（bd 45t3k 安全收口）"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
 
