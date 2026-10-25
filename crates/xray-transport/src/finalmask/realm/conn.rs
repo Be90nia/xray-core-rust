@@ -25,6 +25,7 @@ use crate::finalmask::{
     UDP_SIZE, UdpIo,
     realm::{
         http::{self, Client, ConnectRequest},
+        portmap::{PortMapConfig, PortMapper, PortMapping, port_map_loop},
         punch::{PunchMetadata, PunchPacketType, decode_punch_packet, encode_punch_packet},
         stun::{
             DEFAULT_PUNCH_INTERVAL, DEFAULT_PUNCH_TIMEOUT, DEFAULT_STUN_TIMEOUT, TransactionId,
@@ -43,6 +44,7 @@ const CHANNEL_BUFFER: usize = 64;
 ///
 /// `tls` = [`tls::TlsConfig`]（Go `TlsConfig *tls.Config` → `GetTLSConfig()` 消费
 /// 的字段子集，见 `tls.rs` 对齐表）；`None` = reqwest 默认 rustls 路径。
+/// `port_mapping` = 网关 UDP 端口映射（Go `Config.PortMapping`）；`None` = 不开。
 #[derive(Debug, Clone, Default)]
 pub struct RealmConfig {
     pub scheme: String,
@@ -52,6 +54,7 @@ pub struct RealmConfig {
     pub id: String,
     pub stun_servers: Vec<String>,
     pub tls: Option<tls::TlsConfig>,
+    pub port_mapping: Option<PortMapping>,
 }
 
 /// STUN 反射事件（dispatcher → init task）。
@@ -362,17 +365,28 @@ async fn client_init(
 
     let raw = Arc::clone(&shared.raw);
     let meta_loop = meta.clone();
-    shared.spawn(client_punch_loop(raw, meta_loop, expanded, punch_rx, peer));
+    shared.spawn(client_punch_loop(
+        Arc::clone(&shared),
+        raw,
+        meta_loop,
+        expanded,
+        punch_rx,
+        peer,
+        config.port_mapping,
+    ));
     Ok(())
 }
 
-/// 客户端 punch 循环：周期性发 Hello，收到任意 punch 包则确定 peer 退出。
+/// 客户端 punch 循环：周期性发 Hello，收到任意 punch 包则确定 peer 退出；
+/// punch 成功后按配置启动网关端口映射续租循环（Go `client.go:123-124` 同序）。
 async fn client_punch_loop(
+    shared: Arc<Shared>,
     raw: Arc<dyn UdpIo>,
     meta: PunchMetadata,
     peers: Vec<SocketAddr>,
     mut punch_rx: mpsc::Receiver<PunchEvent>,
     peer: Arc<tokio::sync::OnceCell<SocketAddr>>,
+    port_mapping: Option<PortMapping>,
 ) {
     let deadline = tokio::time::Instant::now() + DEFAULT_PUNCH_TIMEOUT;
     let mut ticker = tokio::time::interval(DEFAULT_PUNCH_INTERVAL);
@@ -405,6 +419,51 @@ async fn client_punch_loop(
             }
         }
     }
+    if peer.get().is_some()
+        && let Some(port_mapping) = port_mapping
+        && port_mapping.enabled
+    {
+        start_port_mapping(&shared, port_mapping);
+    }
+}
+
+/// 网关端口映射：初始化失败只记 warn、不中断连接（Go `client.go:52-54`）；
+/// 成功后进入续租循环，conn cancel 时删映射。
+///
+/// `shortcut:` conn 被 drop（FxScope abort）时不会发删除报文，映射留待网关按
+/// lifetime 到期回收；升级点 = 需要「drop 即回收」时改由显式 shutdown 路径 await close。
+fn start_port_mapping(shared: &Arc<Shared>, port_mapping: PortMapping) {
+    let config =
+        match PortMapConfig::from_secs(port_mapping.timeout_secs, port_mapping.lifetime_secs) {
+            Ok(config) => config,
+            Err(e) => {
+                crate::LOG.warn(format!("[realm] [port mapping] config rejected: {e}"));
+                return;
+            },
+        };
+    let local_port = match shared.raw.local_addr() {
+        Ok(addr) => addr.port(),
+        Err(e) => {
+            crate::LOG.warn(format!("[realm] [port mapping] local addr unavailable: {e}"));
+            return;
+        },
+    };
+    let cancel = Arc::clone(&shared.cancel);
+    shared.spawn(async move {
+        match PortMapper::new(local_port, config).await {
+            Ok(mapper) => {
+                crate::LOG.debug(format!(
+                    "[realm] [port mapping] [{local_port}] gateway {}, external {:?}",
+                    mapper.gateway_type(),
+                    mapper.external_addr()
+                ));
+                port_map_loop(&mapper, &cancel).await;
+            },
+            Err(e) => {
+                crate::LOG.warn(format!("[realm] [port mapping] [{local_port}] init failed: {e}"))
+            },
+        }
+    });
 }
 
 /// 服务端主循环：register → heartbeat/events/punch 并发 → 失败重连。
@@ -594,6 +653,7 @@ mod tests {
             id: "test".into(),
             stun_servers: vec![],
             tls: None,
+            port_mapping: None,
         };
         let raw: Box<dyn UdpIo> =
             Box::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());

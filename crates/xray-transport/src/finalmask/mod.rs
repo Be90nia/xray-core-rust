@@ -44,6 +44,7 @@ pub mod sudoku;
 pub mod udphop;
 pub mod xdns;
 pub mod xicmp;
+mod xicmp_sock;
 pub mod xmc;
 
 /// UDP 读缓冲区大小（对应 Go `finalmask.UDPSize = 4096`）。
@@ -766,7 +767,8 @@ pub fn build_udpmask_manager(config: &FinalmaskConfig) -> io::Result<UdpmaskMana
 /// - `sudoku` —— `SudokuConfig`（UDP/TCP 共用同一配置形态）
 /// - `xdns` —— `xdns::Config{ domains, resolvers, extra_poll }`（DNS-over-UDP 隧道，v26.9.30 形态）
 /// - `xicmp` —— `XicmpConfig{ ips, dgram }`（wrap 时仅允许最外层）
-/// - `realm` —— `realm::Config`（STUN/HTTP NAT 穿透，settings 从 `url` 解析）
+/// - `realm` —— `realm::Config`（STUN/HTTP NAT 穿透，settings 从 `url` 解析； `tlsConfig` 结构化
+///   TLS，`portMapping` 网关 UDP 端口映射）
 /// - `udphop` —— `udphop::UdphopConfig`（UDP 端口跳跃，client-only；Go 三模式
 ///   intervallocal/intervalremote/perconnremote + remoteIPs 前缀随机 + remotePorts
 ///   轮换，interval>=5s 双层校验）
@@ -1584,9 +1586,8 @@ fn build_realm_config(settings: &serde_json::Value) -> io::Result<realm::Config>
         }
     }
     // Go RealmConfig.ipMode（transport_finalmask.go:1012；消费 realm/client.go:39、
-    // server.go:63）与 portMapping（:1013，NAT 端口映射）：Rust 端均无对应能力
-    // （票 5std M16/M17），非缺省值显式拒绝而非静默忽略。ipMode=""/null、
-    // portMapping.enabled=false/缺省在 Go 侧同为无操作，放行不构成静默丢。
+    // server.go:63）：Rust 端无 IP 族选择能力（票 5std M16），非缺省值显式拒绝而非
+    // 静默忽略。ipMode=""/null 在 Go 侧为无操作，放行不构成静默丢。
     if let Some(m) = settings.get("ipMode") {
         let requested = match m {
             serde_json::Value::String(x) => !x.is_empty(),
@@ -1599,26 +1600,66 @@ fn build_realm_config(settings: &serde_json::Value) -> io::Result<realm::Config>
             ));
         }
     }
-    if let Some(pm) = settings.get("portMapping") {
-        let requested = match pm {
-            serde_json::Value::Object(o) => {
-                o.get("enabled").and_then(|x| x.as_bool()).unwrap_or(false)
-            },
-            serde_json::Value::Null => false,
-            _ => true,
-        };
-        if requested {
-            return Err(mask_err(
-                "realm: \"portMapping\" is not supported by this build; remove the key or set enabled=false",
-            ));
-        }
-    }
+    // Go RealmConfig.PortMapping（transport_finalmask.go:1013，proto 字段 9；
+    // 消费 realm/client.go:47-56 + portmap.go NPortMapper，见 realm/portmap）：
+    // enabled/timeout/lifetime（秒，proto int64）；非对象或字段类型不符 → 硬错，
+    // 不静默丢配置。负数在运行期由 PortMapConfig 拒绝（Go withDefaults 同语义：
+    // 配置可过、映射初始化失败并记日志）。
+    let port_mapping = parse_realm_port_mapping(settings.get("portMapping"))?;
     // Go RealmConfig.TlsConfig（transport_finalmask.go:1011，Build :1064-1072；
     // 消费 realm/http.go:84-90 `tr.TLSClientConfig = tlsConfig.GetTLSConfig()`）：
     // 解析为结构化 realm::tls::TlsConfig 并在 new_client 应用（字段对齐表见
     // realm/tls.rs）。缺省/null → None（reqwest 默认 rustls 路径，与旧行为一致）。
     let tls = realm::tls::parse_tls_config(settings.get("tlsConfig"), &host)?;
-    Ok(realm::Config { scheme: scheme.to_string(), host, port, token, id, stun_servers, tls })
+    Ok(realm::Config {
+        scheme: scheme.to_string(),
+        host,
+        port,
+        token,
+        id,
+        stun_servers,
+        tls,
+        port_mapping,
+    })
+}
+
+/// JSON `portMapping` → [`realm::PortMapping`]（Go proto 字段 9；缺省/null = `None`）。
+///
+/// `timeout`/`lifetime` 单位为秒（proto int64）。字段类型不符报错而非取默认值——
+/// Go protojson 同样会拒绝错类型。
+fn parse_realm_port_mapping(
+    value: Option<&serde_json::Value>,
+) -> io::Result<Option<realm::PortMapping>> {
+    let object = match value {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::Object(object)) => object,
+        Some(other) => {
+            return Err(mask_err(format!("realm: \"portMapping\" must be an object, got {other}")));
+        },
+    };
+    let enabled = match object.get("enabled") {
+        None => false,
+        Some(serde_json::Value::Bool(enabled)) => *enabled,
+        Some(other) => {
+            return Err(mask_err(format!(
+                "realm: \"portMapping.enabled\" must be a boolean, got {other}"
+            )));
+        },
+    };
+    let secs = |key: &str| -> io::Result<i64> {
+        match object.get(key) {
+            None => Ok(0),
+            Some(serde_json::Value::Number(number)) => number.as_i64().ok_or_else(|| {
+                mask_err(format!("realm: \"portMapping.{key}\" must be an integer, got {number}"))
+            }),
+            Some(other) => Err(mask_err(format!(
+                "realm: \"portMapping.{key}\" must be an integer, got {other}"
+            ))),
+        }
+    };
+    let timeout_secs = secs("timeout")?;
+    let lifetime_secs = secs("lifetime")?;
+    Ok(Some(realm::PortMapping { enabled, timeout_secs, lifetime_secs }))
 }
 
 /// `udphop` settings → [`udphop::UdphopConfig`]（对齐 Go `UDPHop.Build`，
@@ -2607,12 +2648,11 @@ mod tests {
         assert!(build_realm_config(&fm(r#"{"url":"realm://t@h.com/id"}"#)).is_err());
     }
 
-    /// 票 5std M16/M17：realm `ipMode` / `portMapping` 非缺省值硬错（Rust 无
-    /// 对应能力，静默忽略 = NAT 打洞/IP 模式行为与配置意图不符）；
-    /// ipMode="" 与 portMapping.enabled=false 在 Go 侧同为无操作，放行。
+    /// realm `ipMode`（Rust 无 IP 族能力）非缺省值硬错；`portMapping`（本仓已实装，
+    /// 见 realm/portmap）解析为结构化字段，字段类型不符仍硬错不静默丢。
     #[test]
     #[allow(clippy::err_expect)] // 存量清零批次：测试断言期 expect（realm::Config 无 Debug，禁 expect_err）
-    fn parse_json_realm_ip_mode_and_port_mapping_rejected_loudly() {
+    fn parse_json_realm_ip_mode_rejected_and_port_mapping_parsed() {
         let base = r#"{"url":"realm://tok@h.example.com/id","stunServers":["s:1"]}"#;
         // ipMode 非空 → 拒（Go IPMode 消费点 realm/client.go:39）
         let e = build_realm_config(&fm(
@@ -2621,20 +2661,40 @@ mod tests {
         .err()
         .expect("non-empty ipMode must reject");
         assert!(e.to_string().contains("ipMode"), "{e}");
-        // portMapping.enabled=true → 拒（Go NAT 端口映射）
-        let e = build_realm_config(&fm(
-            r#"{"url":"realm://tok@h.example.com/id","stunServers":["s:1"],"portMapping":{"enabled":true}}"#,
+        // portMapping.enabled=true → 解析生效（Go NAT 端口映射，本仓 realm/portmap）
+        let cfg = build_realm_config(&fm(
+            r#"{"url":"realm://tok@h.example.com/id","stunServers":["s:1"],
+                "portMapping":{"enabled":true,"timeout":5,"lifetime":120}}"#,
         ))
-        .err()
-        .expect("portMapping enabled=true must reject");
-        assert!(e.to_string().contains("portMapping"), "{e}");
-        // 非对象类型手误 → 同样拒启，不静默丢
+        .unwrap();
+        let pm = cfg.port_mapping.expect("portMapping parsed");
+        assert!(pm.enabled);
+        assert_eq!((pm.timeout_secs, pm.lifetime_secs), (5, 120));
+        // 缺省值语义：enabled 缺省 false、timeout/lifetime 缺省 0（→ 运行期取 Go 缺省）
+        let cfg = build_realm_config(&fm(
+            r#"{"url":"realm://tok@h.example.com/id","stunServers":["s:1"],"portMapping":{}}"#,
+        ))
+        .unwrap();
+        let pm = cfg.port_mapping.expect("empty object still yields a struct");
+        assert!(!pm.enabled && pm.timeout_secs == 0 && pm.lifetime_secs == 0);
+        // 非对象类型手误 → 拒启，不静默丢
         let e = build_realm_config(&fm(
             r#"{"url":"realm://tok@h.example.com/id","stunServers":["s:1"],"portMapping":1}"#,
         ))
         .err()
         .expect("non-object portMapping must reject");
         assert!(e.to_string().contains("portMapping"), "{e}");
+        // 字段类型不符 → 拒启（protojson 同款）
+        for bad in [
+            r#"{"url":"realm://t@h.com/id","stunServers":["s:1"],"portMapping":{"enabled":"yes"}}"#,
+            r#"{"url":"realm://t@h.com/id","stunServers":["s:1"],"portMapping":{"timeout":"5"}}"#,
+            r#"{"url":"realm://t@h.com/id","stunServers":["s:1"],"portMapping":{"lifetime":1.5}}"#,
+        ] {
+            assert!(
+                build_realm_config(&fm(bad)).is_err(),
+                "must reject malformed portMapping: {bad}"
+            );
+        }
         // Go 缺省语义放行：ipMode="" / enabled=false / 缺省
         build_realm_config(&fm(
             r#"{"url":"realm://tok@h.example.com/id","stunServers":["s:1"],"ipMode":"","portMapping":{"enabled":false}}"#,
@@ -2777,7 +2837,7 @@ mod tests {
     /// （reqwest 默认路径 = 旧行为）；allowInsecure 按 Go 移除语义硬错；
     /// serverName 覆盖 ≠ url host 硬错。
     #[test]
-    #[allow(clippy::err_expect)] // 同 parse_json_realm_ip_mode_and_port_mapping_rejected_loudly：realm::Config 无 Debug，禁
+    #[allow(clippy::err_expect)] // 同 parse_json_realm_ip_mode_rejected_and_port_mapping_parsed：realm::Config 无 Debug，禁
     // expect_err
     fn realm_tls_config_structured_parses_defaults_pass_and_rejects_loudly() {
         let absent = build_realm_config(&fm(

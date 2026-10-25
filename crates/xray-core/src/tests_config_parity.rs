@@ -18,19 +18,22 @@
 //!
 //! 覆盖出口 = `parity_roster_covers_all_families`（名称清单 + 总数断言）：
 //! 有 tun 编译面平台（linux/android/freebsd/windows，`Cargo.toml:105-106` target
-//! 条件依赖）严格 16 族 31 用例；macOS（需 utun 权限，tun 不编译）15 族 30 用例，
+//! 条件依赖）严格 16 族 32 用例；macOS（需 utun 权限，tun 不编译）15 族 31 用例，
 //! 断言消息写明——两平台都不许 `>=`/静默。CI 宽门已含本模块——
 //! `cargo test --workspace`（`.github/workflows/ci.yml:160`）跑 lib 测试目标，
 //! 无需单列 workflow。
 //!
-//! 新登记已知差异 1 处（**只报告不修**，见
-//! `reports/wsl-2026-10-25/parity-16.md`）：ss2022 中继 `destinations[]` 旧形的
-//! `server` 为 IP 字面量时，core 面硬写 `Address::Domain`、插件面走
-//! `parse_address_str` → `Address::IPv4`，见
-//! `ss_known_divergence_relay_destinations_address_typing`。
+//! bd pfe8q 收口（2026-10-25）：hw6w 登记的 ss2022 中继 `destinations[]` 旧形
+//! 地址类型差异已收敛——core 面原硬写 `Address::Domain`，现两侧同走
+//! `parse_address_str`（Go 真值：`infra/conf/shadowsocks.go:176`
+//! `user.Address.Build()` ← `infra/conf/common.go:60` `net.ParseAddress` ←
+//! `common/net/address.go:91-94` IP 字面量 → `IPAddress`），见
+//! `ss_parity_relay_destinations_ip_literal` /
+//! `ss_parity_relay_destinations_domain_literal`；差异登记原文见
+//! `reports/wsl-2026-10-25/parity-16.md`。
 //!
-//! 本模块 `#[cfg(test)]`，零生产语义；旧 parse 函数原文未动（「本单不删旧
-//! 解析面」红线）。
+//! 本模块 `#[cfg(test)]`，零生产语义（pfe8q 另在 `inbound.rs` 收敛 relay
+//! destinations 地址类型一行）。
 
 use std::sync::Arc;
 
@@ -854,14 +857,12 @@ async fn ss_parity_ss2022_relay_go_form() {
     assert_eq!(core_target, (Address::IPv4(ip), 8388));
 }
 
-/// 新登记已知差异（**只报告不修**，见 `reports/wsl-2026-10-25/parity-16.md`）：
-/// ss2022 中继 `destinations[]` **旧形**的 `server` 为 IP 字面量时——core 解析面
-/// 硬写 `Address::Domain`（`xray-core/src/inbound.rs` destinations 分支），插件面
-/// 走 `parse_address_str` → `Address::IPv4`。域名形态两侧一致（`users[].address`
-/// 的 Go 形分支见 `ss_parity_ss2022_relay_go_form`）。功能上等价（Domain(IP) 仍
-/// 解析到同一 IP），但按 domain 匹配的路由规则可能分叉。
+/// ss2022 中继 `destinations[]` **旧形**（IP 字面量）：两侧同走
+/// `parse_address_str` → `Address::IPv4`（bd pfe8q 收敛，原 core 面硬写
+/// `Address::Domain`；Go 真值 `infra/conf/shadowsocks.go:176` + `common.go:60` +
+/// `common/net/address.go:91-94`：IP 字面量 → `IPAddress`）。
 #[tokio::test]
-async fn ss_known_divergence_relay_destinations_address_typing() {
+async fn ss_parity_relay_destinations_ip_literal() {
     let (server, dest_key) = (b64_psk(0x11), b64_psk(0x22));
     let settings = json!({
         "method": "2022-blake3-aes-128-gcm",
@@ -886,8 +887,40 @@ async fn ss_known_divergence_relay_destinations_address_typing() {
     let core_target = relay_target(&core_relay, kind, &server, &dest_key).await;
     let plugin_target = relay_target(plugin_relay, kind, &server, &dest_key).await;
     let ip: std::net::Ipv4Addr = "10.0.0.7".parse().expect("ipv4");
-    assert_eq!(core_target, (Address::Domain("10.0.0.7".into()), 8388), "core 面域名包装");
-    assert_eq!(plugin_target, (Address::IPv4(ip), 8388), "插件面解析成 IPv4");
+    assert_eq!(plugin_target, core_target, "两侧 destination 一致");
+    assert_eq!(core_target, (Address::IPv4(ip), 8388), "两侧同为 IPv4 字面量");
+}
+
+/// ss2022 中继 `destinations[]` **旧形**（域名）：非 IP 字面量两侧同为
+/// `Address::Domain`——`parse_address_str` 的 Domain 落点，防收敛成硬编码
+/// IPv4 的回归。
+#[tokio::test]
+async fn ss_parity_relay_destinations_domain_literal() {
+    let (server, dest_key) = (b64_psk(0x11), b64_psk(0x22));
+    let settings = json!({
+        "method": "2022-blake3-aes-128-gcm",
+        "password": server.clone(),
+        "destinations": [{
+            "password": dest_key.clone(),
+            "email": "d@y",
+            "server": "relay.example.com",
+            "server_port": 8388,
+        }],
+    });
+    let core = crate::inbound::parse_ss_inbound_config(&serde_json::to_vec(&settings).unwrap())
+        .expect("core parse");
+    let plugin = build_ss_plugin(&settings);
+    let crate::inbound::SsInboundMode::Ss2022Relay(core_relay) = core else {
+        panic!("core 面应为 Ss2022Relay");
+    };
+    let SsFace::Ss2022Relay(plugin_relay) = plugin.face().expect("built") else {
+        panic!("plugin 面应为 Ss2022Relay");
+    };
+    let kind = CipherKind2022::Aes128Gcm;
+    let core_target = relay_target(&core_relay, kind, &server, &dest_key).await;
+    let plugin_target = relay_target(plugin_relay, kind, &server, &dest_key).await;
+    assert_eq!(plugin_target, core_target, "两侧 destination 一致");
+    assert_eq!(core_target, (Address::Domain("relay.example.com".into()), 8388), "两侧同为 Domain");
 }
 
 #[test]
@@ -1004,8 +1037,8 @@ fn tuic_parity_inbound_full_fields() {
 // （新增/删除用例而不更新本表 → 红）。
 //
 // tun 族按 `Cargo.toml:105-106` 的 target 条件依赖同门：4-OS 编译面
-// （linux/android/freebsd/windows）= 16 族 31 用例；macOS（utun 权限）不编译
-// tun = 15 族 30 用例——两种平台各自对上严格数，禁 `>=`/静默。
+// （linux/android/freebsd/windows）= 16 族 32 用例；macOS（utun 权限）不编译
+// tun = 15 族 31 用例——两种平台各自对上严格数，禁 `>=`/静默。
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// 16 族覆盖表（有 tun 编译面平台）；macOS 走 [`parity_families`] 的 15 族形态。
@@ -1073,7 +1106,7 @@ fn parity_families() -> Vec<(&'static str, &'static [&'static str])> {
     ))]
     parity_families_tun(&mut families);
     // 显式类型标注：数组字面量各元素分别 coerce 到 &[&str]（无标注时整体被
-    // 首元素的 &[&str; 7] 统一，其余元素 E0308）。
+    // 首元素的 &[&str; 8] 统一，其余元素 E0308）。
     let tail: [(&'static str, &'static [&'static str]); 3] = [
         (
             "ss",
@@ -1083,7 +1116,8 @@ fn parity_families() -> Vec<(&'static str, &'static [&'static str])> {
                 "ss_parity_ss2022_single_user",
                 "ss_parity_ss2022_multi_users",
                 "ss_parity_ss2022_relay_go_form",
-                "ss_known_divergence_relay_destinations_address_typing",
+                "ss_parity_relay_destinations_ip_literal",
+                "ss_parity_relay_destinations_domain_literal",
                 "ss_parity_errors_fail_fast",
             ],
         ),
@@ -1104,7 +1138,7 @@ fn parity_roster_covers_all_families() {
         target_os = "freebsd",
         target_os = "windows"
     ));
-    let (expected_families, expected_cases) = if tun_compiles { (16, 31) } else { (15, 30) };
+    let (expected_families, expected_cases) = if tun_compiles { (16, 32) } else { (15, 31) };
     let families = parity_families();
     assert_eq!(
         families.len(),

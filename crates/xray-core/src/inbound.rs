@@ -4899,7 +4899,9 @@ fn parse_ss2022_inbound_config(
                 .map_err(|e| std::io::Error::other(format!("ss2022 relay PSK: {e}")))?;
             destinations.push(RelayDestination {
                 key: psk,
-                address: xray_common::net::address::Address::Domain(addr_str.to_string()),
+                // Go 真值：conf 层 `net.ParseAddress` 对 IP 字面量产 `IPAddress`
+                // （infra/conf/shadowsocks.go:176 + common/net/address.go:91-94）。
+                address: parse_address_str(addr_str),
                 port,
                 email,
                 level,

@@ -58,6 +58,14 @@ udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# realm 端口映射（finalmask/realm/portmap）：NAT-PMP 必须发往默认网关，
+# Windows 用 GetIpForwardTable 取路由表（workspace 既有 crate，无新增版本）。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_NetworkManagement_IpHelper",
+] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 [features]

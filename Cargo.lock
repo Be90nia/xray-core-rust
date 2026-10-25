@@ -6761,6 +6761,7 @@ dependencies = [
  "udf-skeleton-infra",
  "uuid",
  "webpki-roots 1.0.8",
+ "windows-sys 0.59.0",
  "xray-buf",
  "xray-common",
  "xray-crypto",

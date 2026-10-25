@@ -1,9 +1,14 @@
 //! 入站 worker 实现
 //!
-//! 对应 Go `app/proxyman/inbound/worker.go`：tcpWorker / udpWorker / dsWorker。
+//! 对应 Go `app/proxyman/inbound/worker.go`：tcpWorker / udpWorker。
 //!
-//! 每个 worker 持有一个 transport listener（TCP/UDP/Unix），accept 后构造
-//! `Session` 并调用 `ProxyInbound::process()` 交给具体代理协议处理。
+//! Go 的第三类 worker `dsWorker`（Unix domain socket）在本仓**不在本 crate**：
+//! 生产 UDS 入站由 `xray-core::inbound::spawn_unix_inbound` 直接接线
+//! （`inbound.rs` 的 `is_unix_listen_path` 分派 → `listen_unix_system`），
+//! 故本模块不提供 dsWorker 变体（保留只会是一条无调用方的第二套 UDS 路径）。
+//!
+//! 每个 worker 持有一个 transport listener，accept 后构造 `Session` 并调用
+//! `ProxyInbound::process()` 交给具体代理协议处理。
 
 use std::{
     collections::HashMap,
@@ -821,49 +826,6 @@ impl Worker for UdpWorker {
     }
 }
 
-// ===== DsWorker =====
-
-/// Unix domain socket 入站 worker。对应 Go `dsWorker`。
-///
-/// 当前为 stub——Unix domain socket 监听需要平台特定实现。
-pub struct DsWorker {
-    tag: String,
-    closed: AtomicBool,
-}
-
-impl std::fmt::Debug for DsWorker {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DsWorker")
-            .field("tag", &self.tag)
-            .field("closed", &self.closed.load(Ordering::SeqCst))
-            .finish()
-    }
-}
-
-impl DsWorker {
-    /// 构造 Unix domain socket worker。
-    pub fn new(tag: impl Into<String>) -> Self {
-        Self { tag: tag.into(), closed: AtomicBool::new(false) }
-    }
-}
-
-#[async_trait::async_trait]
-impl Worker for DsWorker {
-    async fn start(self: Arc<Self>) -> Result<(), ProxymanError> {
-        // ponytail: Unix domain socket not yet supported, stub
-        Err(ProxymanError::ListenSocketFailed("Unix domain socket not yet supported".to_string()))
-    }
-
-    async fn close(&self) -> Result<(), ProxymanError> {
-        self.closed.store(true, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn port(&self) -> u16 {
-        0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
@@ -982,34 +944,6 @@ mod tests {
         );
         let debug = format!("{worker:?}");
         assert!(debug.contains("udp-tag"));
-    }
-
-    #[test]
-    fn ds_worker_construction() {
-        let worker = DsWorker::new("unix-in");
-        assert_eq!(worker.port(), 0);
-        assert!(!worker.closed.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn ds_worker_start_returns_error() {
-        let worker = DsWorker::new("unix-in");
-        let result = Arc::new(worker).start().await;
-        assert!(result.is_err());
-        match result {
-            Err(ProxymanError::ListenSocketFailed(msg)) => {
-                assert!(msg.contains("Unix domain socket"));
-            },
-            Err(e) => panic!("expected ListenSocketFailed, got: {e}"),
-            Ok(_) => panic!("expected error, got Ok"),
-        }
-    }
-
-    #[tokio::test]
-    async fn ds_worker_close_ok() {
-        let worker = DsWorker::new("unix-in");
-        assert!(worker.close().await.is_ok());
-        assert!(worker.closed.load(Ordering::SeqCst));
     }
 
     #[test]

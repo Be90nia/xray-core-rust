@@ -42,7 +42,7 @@ pub use config::{SniffingRequest, build_sniffing_request};
 pub use error::ProxymanError;
 pub use inbound::{
     AlwaysOnInboundHandler, InboundHandler, PinFuture,
-    worker::{DsWorker, InboundConn, ProxyInbound, TcpWorker, UdpSession, UdpWorker, Worker},
+    worker::{InboundConn, ProxyInbound, TcpWorker, UdpSession, UdpWorker, Worker},
 };
 pub use outbound::{
     OutboundDialer, OutboundHandler, OutboundHandlerEntry, ProxyOutbound, UotVersion,

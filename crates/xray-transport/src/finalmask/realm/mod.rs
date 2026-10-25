@@ -7,6 +7,7 @@
 //! - [`punch`]：UDP 打洞包协议
 //! - [`stun`]：STUN 客户端 + NAT 端口预测
 //! - [`http`]：HTTP REST + SSE 客户端
+//! - [`portmap`]：UPnP IGD / NAT-PMP 网关端口映射（NAT-PMP 优先，UPnP 回退）
 //! - [`conn`]：RealmConnClient/Server + UdpIo 桥接
 
 use std::io;
@@ -15,6 +16,7 @@ use crate::finalmask::{UdpIo, Udpmask};
 
 pub mod conn;
 pub mod http;
+pub mod portmap;
 pub mod punch;
 pub mod stun;
 pub mod tls;
@@ -24,6 +26,7 @@ pub use http::{
     Client, ConnectRequest, ConnectResponse, ErrorResponse, HeartbeatRequest, HeartbeatResponse,
     PunchEvent, RegisterResponse, StatusError,
 };
+pub use portmap::{PortMapConfig, PortMapper, PortMapping, port_map_loop};
 pub use punch::{PunchMetadata, PunchPacket, PunchPacketType};
 pub use stun::{
     addr_port_strings, build_binding_request, candidate_punch_addrs,
@@ -43,12 +46,17 @@ pub use stun::{
 ///   string id = 5;
 ///   repeated string stun_servers = 6;
 ///   xray.transport.internet.tls.Config tls_config = 7;
+///   string IPMode = 8;
+///   PortMapping port_mapping = 9;
 /// }
 /// ```
 ///
 /// `tls` 为 [`tls::TlsConfig`] 结构化信令 TLS 配置（`tlsConfig` JSON →
 /// `GetTLSConfig` 字段子集，见 `tls.rs` 对齐表）；`None` = 缺省，reqwest 默认
 /// rustls 路径（旧 `use_tls:true` 行为，向后兼容）。
+///
+/// `port_mapping` = 网关 UDP 端口映射（[`portmap`]）；`None`/`enabled=false` = 不开。
+/// `IPMode`（Go 字段 8）Rust 无对应能力，配置期显式拒绝（`finalmask` 构建处）。
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub scheme: String,
@@ -58,6 +66,7 @@ pub struct Config {
     pub id: String,
     pub stun_servers: Vec<String>,
     pub tls: Option<tls::TlsConfig>,
+    pub port_mapping: Option<portmap::PortMapping>,
 }
 
 impl From<&Config> for RealmConfig {
@@ -70,6 +79,7 @@ impl From<&Config> for RealmConfig {
             id: c.id.clone(),
             stun_servers: c.stun_servers.clone(),
             tls: c.tls.clone(),
+            port_mapping: c.port_mapping,
         }
     }
 }
@@ -112,6 +122,11 @@ mod tests {
             id: "realm-x".into(),
             stun_servers: vec!["stun.l.google.com:19302".into()],
             tls: Some(tls::TlsConfig { alpn: vec!["h2".into()], ..Default::default() }),
+            port_mapping: Some(portmap::PortMapping {
+                enabled: true,
+                timeout_secs: 5,
+                lifetime_secs: 60,
+            }),
         };
         let r: RealmConfig = (&c).into();
         assert_eq!(r.scheme, "https");
@@ -121,6 +136,7 @@ mod tests {
         assert_eq!(r.id, "realm-x");
         assert_eq!(r.stun_servers.len(), 1);
         assert_eq!(r.tls.as_ref().map(|t| t.alpn.as_slice()), Some(&["h2".to_string()][..]));
+        assert_eq!(r.port_mapping, c.port_mapping);
     }
 
     #[test]

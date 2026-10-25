@@ -1,7 +1,10 @@
 //! 入站代理管理
 //!
 //! 对应 Go `app/proxyman/inbound/`：`inbound.go`（Manager）+ `always.go`（AlwaysOnInboundHandler）+
-//! `worker.go`（tcpWorker/udpWorker/dsWorker）。
+//! `worker.go`（tcpWorker/udpWorker）。
+//!
+//! Go 的 `dsWorker`（Unix domain socket）不对应本 crate 的 worker 变体：生产 UDS 入站
+//! 由 `xray-core::inbound::spawn_unix_inbound` 接线（见 [`worker`] 模块文档）。
 //!
 //! ## 当前实现范围
 //!
@@ -12,7 +15,7 @@
 //!
 //!
 //! IO 边界：
-//! - worker 创建（tcpWorker/udpWorker/dsWorker）— 已在 [`worker`] 模块实现
+//! - worker 创建（tcpWorker/udpWorker）— 已在 [`worker`] 模块实现
 //! - `AlwaysOnInboundHandler::start` / `close` — 迭代 workers 启停
 //! - proxy.Process — 依赖具体代理 crate + Dispatcher
 
