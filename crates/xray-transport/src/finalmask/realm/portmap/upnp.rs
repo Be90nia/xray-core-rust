@@ -9,7 +9,7 @@
 //! 请求端口（与 Go go-nat 的 UPnP 后端同做法）；租期由 `NewLeaseDuration` 给出。
 //!
 //! 不可信输入收口（SSDP 应答方是攻击者可控的）：
-//! - SSDP 应答源必须是本机、默认网关或与网关同 /16 的主机（[`ssdp_peer_allowed`]）；
+//! - SSDP 应答源必须是本机、默认网关或与网关同 /16 的主机（`ssdp_peer_allowed`）；
 //! - description URL 的 host 必须是 IP 字面量，且与 SSDP 应答源同一个 host；
 //! - `<URLBase>`/`controlURL` 不得把控制面搬到别的 host（host 必须等于 description host）；
 //! - 不跟 HTTP 重定向（一次 302 就能把抓取导去任意内网主机）；
@@ -200,8 +200,8 @@ impl Client {
 
     /// 已知 description URL 直建客户端（跳过 SSDP；兜底路径与真机取证用）。
     ///
-    /// host 必须是 IP 字面量且通过 [`ssdp_peer_allowed`]：兜底候选由
-    /// [`fallback_description_urls`] 用默认网关构造，此处把「调用方传进来的任意
+    /// host 必须是 IP 字面量且通过 `ssdp_peer_allowed`：兜底候选由
+    /// `fallback_description_urls` 用默认网关构造，此处把「调用方传进来的任意
     /// URL」也钉在同一白名单上。
     pub async fn from_description_url(location: &str, timeout: Duration) -> io::Result<Self> {
         let host = description_host(location)?;
@@ -765,15 +765,32 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("not the SSDP responder 127.0.0.1"), "{msg}");
         assert!(msg.contains("10.9.9.9"), "{msg}");
-        // 兜底入口（任意 URL）同样钉在白名单上
+        // 兜底入口（任意 URL）同样钉在白名单上：公网 host 在所有平台都必须拒
+        // （macOS 取不到默认网关时会放宽私有源，但公网源恒拒——这是 SSRF 底线）。
         let err = Client::from_description_url(
-            "http://10.9.9.9:5000/rootDesc.xml",
+            "http://203.0.113.7:5000/rootDesc.xml",
             Duration::from_secs(2),
         )
         .await
         .err()
-        .expect("off-allowlist description host must be rejected");
+        .expect("public description host must be rejected");
         assert!(err.to_string().contains("is neither this host, the default gateway"), "{err}");
+
+        // 私有但非本段的 host：仅在有默认网关锚点的平台才拒。
+        // macOS 未实现网关查询 → `ssdp_peer_allowed(.., None)` 退化为「只收私有源」，
+        // 此处放行后靠 host 钉死（description/control 必须等于该 host）兜住 SSRF。
+        // 详见 `ssdp_peer_allowed` 的退化分支注释。
+        #[cfg(not(target_os = "macos"))]
+        {
+            let err = Client::from_description_url(
+                "http://10.9.9.9:5000/rootDesc.xml",
+                Duration::from_secs(2),
+            )
+            .await
+            .err()
+            .expect("off-subnet private description host must be rejected where a gateway anchor exists");
+            assert!(err.to_string().contains("is neither this host, the default gateway"), "{err}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
