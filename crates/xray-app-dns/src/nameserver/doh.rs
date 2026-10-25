@@ -28,7 +28,7 @@ use h2::client;
 use hickory_proto::rr::RecordType;
 use http::{Method, Request, StatusCode, header::CONTENT_TYPE};
 use skeleton_infra::fx::{FxScope, ScopeClosed};
-use tokio::time::timeout;
+use tokio::time::timeout_at;
 use tokio_rustls::rustls::ClientConfig;
 use xray_common::net::{destination::Destination, port::Port};
 use xray_tls::utls::client as tls_client;
@@ -71,7 +71,7 @@ pub struct DohNameServer {
     cache: Arc<CacheController>,
     /// EDNS0 client subnet。
     client_ip: Vec<u8>,
-    /// 单次查询超时。
+    /// 单次查询总超时（整条查询共享的绝对 deadline）。
     query_timeout: Duration,
     /// 请求 ID 生成器。
     id_gen: AtomicReqIdGen,
@@ -89,11 +89,16 @@ fn h2c_server_name(ns: &NameServerConfig) -> String {
 
 /// DoH 查询兜底超时（bd cjwc G13）。
 ///
-/// 对齐 Go `app/dns/nameserver_doh.go:166-172`：上层 ctx 带 deadline 时优先，
-/// 否则兜底 `now+5s`。Rust 查询链无 ctx deadline 概念，`ns.timeout_ms > 0`
-/// 为等价的显式 deadline 通道（配置注入优先），缺省 5s。
-/// 结构差异：Go 是整查询总 deadline；Rust 在 `query_once` 按 dial/TLS/h2/
-/// response 分段计时——最小对齐只改兜底数值，不重构分段结构。
+/// 对齐 Go `app/dns/nameserver_doh.go:167-172`：上层 ctx 带 deadline 时优先，
+/// 否则兜底 `now+5s`——**一个绝对时刻覆盖整条查询**（dial/TLS/h2/response 共享
+/// 同一预算，`context.WithDeadline`（:194）把同一 `deadline` 传给每个 req）。
+/// Rust 查询链无 ctx deadline 概念，`ns.timeout_ms > 0` 为等价的显式 deadline
+/// 通道（配置注入优先），缺省 5s。
+///
+/// 结构对齐（bd ezrg4）：`query_once` 全部等待点共用查询入口算出的绝对
+/// deadline（`timeout_at`），而非各段独立满额计时——分段制下慢握手会把
+/// response 段的 5s 起点推后，整条查询可远超 5s（macOS CI 实测 7.5s）；Go
+/// 语义是查询自入口 5s 必有结论。
 fn effective_query_timeout(timeout_ms: u32) -> Duration {
     if timeout_ms > 0 {
         Duration::from_millis(u64::from(timeout_ms))
@@ -218,21 +223,33 @@ impl DohNameServer {
         let req_id = self.id_gen.next_id();
         let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
 
+        // bd ezrg4：兜底 deadline 在查询入口算一次（Go nameserver_doh.go:167-172
+        // 绝对时刻），dial/TLS/h2/response 共享，慢握手不推出新预算。
+        let deadline = tokio::time::Instant::now() + self.query_timeout;
+
         // 经路由出站或直连兜底（域名每查询现解析）——Go dohnameserver.go:68
-        // dispatcher.Dispatch 语义。
-        let stream = crate::dial::connect_stream(
-            &self.dest,
-            self.resolver.as_ref(),
-            self.query_timeout,
-            "doh",
-            self.force_local,
+        // dispatcher.Dispatch 语义。connect_stream 内部仍按单次拨号计预算，
+        // 总量由外层整查询 deadline 封顶。
+        let stream = timeout_at(
+            deadline,
+            crate::dial::connect_stream(
+                &self.dest,
+                self.resolver.as_ref(),
+                self.query_timeout,
+                "doh",
+                self.force_local,
+            ),
         )
-        .await?;
+        .await
+        .map_err(|_| {
+            tracing::debug!(target: "xray.dns.doh", "doh: dial TIMEOUT (query deadline)");
+            DnsError::WireFormat("doh dial timeout".to_string())
+        })??;
 
         // TLS 握手（h2c 明文跳过）+ HTTP/2 handshake。
         tracing::debug!(target: "xray.dns.doh", "doh: stream connected");
         let (mut h2, h2_conn): (_, Pin<Box<dyn Future<Output = ()> + Send>>) = if self.plain_h2c {
-            let (h2, conn) = timeout(self.query_timeout, client::handshake(stream))
+            let (h2, conn) = timeout_at(deadline, client::handshake(stream))
                 .await
                 .map_err(|_| DnsError::WireFormat("doh h2c handshake timeout".to_string()))?
                 .map_err(|e| DnsError::WireFormat(format!("doh h2c handshake: {e}")))?;
@@ -243,8 +260,8 @@ impl DohNameServer {
                 }),
             )
         } else {
-            let tls_stream = timeout(
-                self.query_timeout,
+            let tls_stream = timeout_at(
+                deadline,
                 tls_client(stream, &self.server_name, Arc::clone(&self.tls_config)),
             )
             .await
@@ -255,7 +272,7 @@ impl DohNameServer {
             .map_err(|e| DnsError::WireFormat(format!("doh tls handshake: {e}")))?;
             tracing::debug!(target: "xray.dns.doh", alpn = ?tls_stream.alpn_protocol(),
                 "doh: tls established");
-            let (h2, conn) = timeout(self.query_timeout, client::handshake(tls_stream))
+            let (h2, conn) = timeout_at(deadline, client::handshake(tls_stream))
                 .await
                 .map_err(|_| {
                     tracing::debug!(target: "xray.dns.doh", "doh: h2 handshake TIMEOUT");
@@ -278,7 +295,7 @@ impl DohNameServer {
             .map_err(|_: ScopeClosed| DnsError::WireFormat("doh: fx scope closed".to_string()))?;
 
         // 等待 h2 连接 ready（ready 消费 self 后返回 ready 态的 SendRequest）。
-        h2 = timeout(self.query_timeout, h2.ready())
+        h2 = timeout_at(deadline, h2.ready())
             .await
             .map_err(|_| {
                 tracing::debug!(target: "xray.dns.doh", "doh: h2 ready TIMEOUT");
@@ -314,7 +331,7 @@ impl DohNameServer {
         tracing::debug!(target: "xray.dns.doh", "doh: body sent");
 
         // 读 HTTP 响应。
-        let response = timeout(self.query_timeout, resp_future)
+        let response = timeout_at(deadline, resp_future)
             .await
             .map_err(|_| {
                 tracing::debug!(target: "xray.dns.doh", "doh: response TIMEOUT ({}ms)",
@@ -333,7 +350,7 @@ impl DohNameServer {
         let mut body = response.into_body();
         let mut buf = Vec::new();
         loop {
-            match timeout(self.query_timeout, body.data()).await {
+            match timeout_at(deadline, body.data()).await {
                 Ok(Some(chunk)) => {
                     let chunk =
                         chunk.map_err(|e| DnsError::WireFormat(format!("doh body: {e}")))?;
@@ -813,6 +830,14 @@ mod tests {
 
     /// 启动 accept + TLS + h2 握手后不回响应的 mock DoH server（测超时路径）。
     async fn spawn_hanging_doh_server() -> (SocketAddr, Arc<ClientConfig>) {
+        spawn_hanging_doh_server_delayed(Duration::ZERO).await
+    }
+
+    /// 同上，但 accept 前先 mock 时钟 sleep `pre_accept_delay`——模拟慢握手
+    /// （bd ezrg4：macOS CI 负载下握手链消耗 ~2.5s mock 时钟的场景）。
+    async fn spawn_hanging_doh_server_delayed(
+        pre_accept_delay: Duration,
+    ) -> (SocketAddr, Arc<ClientConfig>) {
         ensure_crypto_provider();
         let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         let key_pair = rcgen::KeyPair::generate().unwrap();
@@ -833,6 +858,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         xray_common::testing::spawn("spawn-hanging-doh-server-accept", async move {
+            if !pre_accept_delay.is_zero() {
+                tokio::time::sleep(pre_accept_delay).await;
+            }
             let Ok((sock, _)) = listener.accept().await else { return };
             let Ok(tls) = acceptor.accept(TcpConnection::new(sock)).await else { return };
             let Ok(mut h2_conn) = server::handshake(tls).await else { return };
@@ -903,10 +931,41 @@ mod tests {
         let (advanced, result) = run_paused_query(srv, "hang.com.").await;
         let err = result.unwrap_err();
         assert!(err.to_string().contains("timeout"), "expected timeout error, got: {err}");
-        // 兜底 5s（旧缺省 4s 会停在 ~4.x s）；dial/TLS/h2 即时完成会消耗少量 mock 时钟。
+        // 整查询 deadline 下失败点 = entry(~0.1s) + 预算 + 观测收敛(~0.2s)，
+        // Windows/WSL 实测 5.3s 稳定。[4.8, 6.0] 双侧 ≥0.5s 余量：下界抓历史
+        // 4s 回退（observed 4.3s 必红），上界防负载下观测周期数漂移（分段制
+        // 泄漏的判别由下方 doh_total_deadline_covers_slow_handshake 承担）。
         assert!(
-            advanced > Duration::from_secs(4) && advanced <= Duration::from_secs(6),
+            advanced >= Duration::from_millis(4800) && advanced <= Duration::from_millis(6000),
             "fallback must be 5s, advanced={advanced:?}"
+        );
+    }
+
+    /// bd ezrg4 回归钉：兜底 deadline 覆盖**整条查询**——即使握手链消耗 2s
+    /// mock 时钟（模拟 macOS CI 负载下真实 IO 只随 advance 步进推进、实测
+    /// advanced=7.5s 的场景），整条查询仍须自入口 5s 收场。分段独立预算制下
+    /// 本场景停在 ~7.2s（response 段另起 5s），此测试即钉死 Go 语义。
+    #[tokio::test]
+    async fn doh_total_deadline_covers_slow_handshake() {
+        let (addr, tls_config) = spawn_hanging_doh_server_delayed(Duration::from_secs(2)).await;
+        let ns = NameServerConfig {
+            address: Address::from(addr.ip()),
+            port: addr.port(),
+            timeout_ms: 0,
+            ..NameServerConfig::default()
+        };
+        let srv = DohNameServer::from_config(&ns, "localhost".to_string(), tls_config).unwrap();
+        // P1-11：查询前启动期注册（生产等价 = 实例 start）。
+        srv.start_managed_tasks(&Arc::new(skeleton_infra::fx::FxScope::new()));
+
+        let (advanced, result) = run_paused_query(srv, "hang.com.").await;
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("timeout"), "expected timeout error, got: {err}");
+        // 整查询 deadline：握手 2s 不推出额外预算，observed 与无延迟同（5.3s）；
+        // 分段制回退 = 2s 延迟 + response 段另起 5s ≈ 7.3s 必红（余量 1.3s）。
+        assert!(
+            advanced >= Duration::from_millis(4800) && advanced <= Duration::from_millis(6000),
+            "total query deadline must be 5s even with slow handshake, advanced={advanced:?}"
         );
     }
 
