@@ -2,7 +2,7 @@
 //!
 //! 验证 Trojan 代理完整链路：客户端通过 Trojan 协议连接 echo 服务器。
 
-#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros))] // 测试脚手架：spawn 起停被测服务/回环 echo、直印进度；非生产托管面
+#![cfg_attr(test, allow(clippy::disallowed_macros))] // 测试脚手架：直印进度；spawn 走 xray_common::testing（L3 闸不豁免）
 use std::sync::Arc;
 
 use tokio::{
@@ -29,7 +29,7 @@ async fn trojan_proxy_to_echo_target_e2e() {
     // ===== 1. echo 目标服务器 =====
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo_listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("trojan-echo-target", async move {
         let (sock, _) = echo_listener.accept().await.unwrap();
         let (mut rd, mut wr) = tokio::io::split(sock);
         tokio::io::copy(&mut rd, &mut wr).await.unwrap();
@@ -48,7 +48,7 @@ async fn trojan_proxy_to_echo_target_e2e() {
     validator.add(user).expect("add user");
 
     let validator_clone = Arc::clone(&validator);
-    tokio::spawn(async move {
+    xray_common::testing::spawn("trojan-server", async move {
         let (mut client_stream, _) = proxy_listener.accept().await.unwrap();
         let (network, addr, port, _user) = trojan_server_handshake(
             &mut client_stream,
@@ -102,7 +102,7 @@ async fn trojan_proxy_to_echo_target_e2e() {
 async fn trojan_invalid_user_rejected_e2e() {
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo_listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("trojan-echo-target", async move {
         let (sock, _) = echo_listener.accept().await.unwrap();
         let (mut rd, mut wr) = tokio::io::split(sock);
         tokio::io::copy(&mut rd, &mut wr).await.unwrap();
@@ -120,7 +120,7 @@ async fn trojan_invalid_user_rejected_e2e() {
     validator.add(user).unwrap();
     let validator_clone = Arc::clone(&validator);
 
-    tokio::spawn(async move {
+    xray_common::testing::spawn("trojan-server-reject-bad-password", async move {
         let (mut client_stream, _) = proxy_listener.accept().await.unwrap();
         // 用错误密码握手 → 应失败
         let result = trojan_server_handshake(
@@ -162,7 +162,7 @@ async fn trojan_v2_proxy_to_echo_target_e2e() {
     // ===== 1. echo 目标服务器 =====
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo_listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("trojan-echo-target", async move {
         let (sock, _) = echo_listener.accept().await.unwrap();
         let (mut rd, mut wr) = tokio::io::split(sock);
         tokio::io::copy(&mut rd, &mut wr).await.unwrap();
@@ -180,7 +180,7 @@ async fn trojan_v2_proxy_to_echo_target_e2e() {
     validator.add(user).expect("add user");
 
     let validator_clone = Arc::clone(&validator);
-    tokio::spawn(async move {
+    xray_common::testing::spawn("trojan-server-v2", async move {
         let (mut client_stream, _) = proxy_listener.accept().await.unwrap();
         let (network, addr, port, _user) = trojan_server_handshake(
             &mut client_stream,

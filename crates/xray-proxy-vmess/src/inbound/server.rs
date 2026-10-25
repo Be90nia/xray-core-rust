@@ -784,7 +784,7 @@ mod tests {
     async fn spawn_echo_server() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("spawn-echo-server-accept", async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut buf = [0u8; 1024];
             loop {
@@ -832,7 +832,7 @@ mod tests {
         let vmess_addr = vmess_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
-        tokio::spawn(async move {
+        xray_common::testing::spawn("run-vmess-e2e", async move {
             let _ = serve_vmess(
                 vmess_listener,
                 ohm_clone,
@@ -903,7 +903,7 @@ mod tests {
         let vmess_addr = vmess_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
-        tokio::spawn(async move {
+        xray_common::testing::spawn("vmess-inbound-rejects-unknown-user", async move {
             let _ = serve_vmess(
                 vmess_listener,
                 ohm_clone,
@@ -949,7 +949,7 @@ mod tests {
         // 1. UDP echo
         let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let echo_port = echo.local_addr().unwrap().port();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("vmess-outbound-udp-roundtrip-e2e-echo", async move {
             let mut buf = [0u8; 2048];
             while let Ok((n, from)) = echo.recv_from(&mut buf).await {
                 let _ = echo.send_to(&buf[..n], from).await;
@@ -966,7 +966,7 @@ mod tests {
         .await
         .unwrap();
         let vmess_addr = vmess_listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("vmess-outbound-udp-roundtrip-e2e", async move {
             let _ = serve_vmess(
                 vmess_listener,
                 ohm,
@@ -1018,7 +1018,7 @@ mod tests {
         // 1. UDP echo server
         let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let echo_addr = echo.local_addr().unwrap();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("vmess-inbound-udp-relay-e2e-echo", async move {
             let mut buf = [0u8; 1500];
             while let Ok((n, from)) = echo.recv_from(&mut buf).await {
                 let _ = echo.send_to(&buf[..n], from).await;
@@ -1037,7 +1037,7 @@ mod tests {
         let vmess_addr = vmess_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
-        tokio::spawn(async move {
+        xray_common::testing::spawn("vmess-inbound-udp-relay-e2e", async move {
             let _ = serve_vmess(
                 vmess_listener,
                 ohm_clone,
@@ -1092,17 +1092,18 @@ mod tests {
 
         // 对端只写 8 字节（不足 16B auth_id）后沉默 → decode 在 60s deadline 终止
         let (mut client, server) = tokio::io::duplex(64);
-        let server_task = tokio::spawn(async move {
-            handle_connection(
-                server,
-                &handler,
-                &validator,
-                &history,
-                true,
-                xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT,
-            )
-            .await
-        });
+        let server_task =
+            xray_common::testing::spawn("vmess-inbound-handshake-read-timeout", async move {
+                handle_connection(
+                    server,
+                    &handler,
+                    &validator,
+                    &history,
+                    true,
+                    xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT,
+                )
+                .await
+            });
         client.write_all(&[0u8; 8]).await.unwrap();
 
         let started = std::time::Instant::now();

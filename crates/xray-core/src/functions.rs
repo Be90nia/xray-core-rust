@@ -833,17 +833,14 @@ struct DnsUdpSessionAdapter {
 }
 
 impl xray_app_dns::dial::UdpPacketSession for DnsUdpSessionAdapter {
-    fn send_packet(
-        &mut self,
-        dest: &xray_common::net::destination::Destination,
-        payload: &[u8],
-    ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
-        #[allow(unused_mut)] // 存量清零批次
-        let mut session = &mut self.session;
-        // 调用参引用生命周期短于返回 future 的 '_，clone 进 async move
-        let dest = dest.clone();
-        let payload = payload.to_vec();
-        Box::pin(async move { session.send_packet(&dest, &payload).await })
+    fn send_packet<'s>(
+        &'s mut self,
+        dest: &'s xray_common::net::destination::Destination,
+        payload: &'s [u8],
+    ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 's>> {
+        let session = &mut self.session;
+        // 借用随 future 流动（trait 统一生命周期），免 clone/to_vec（NF-7）。
+        Box::pin(async move { session.send_packet(dest, payload).await })
     }
 
     fn recv_packet(

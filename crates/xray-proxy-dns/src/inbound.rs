@@ -190,7 +190,7 @@ mod tests {
     async fn spawn_handle_conn(inbound: Arc<DnsInbound>) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
-        tokio::spawn(async move {
+        xray_common::testing::spawn("dns-accept-handle-conn", async move {
             if let Ok((conn, _)) = listener.accept().await {
                 let _ = inbound.handle_conn(conn).await;
             }
@@ -336,7 +336,7 @@ mod tests {
         // 1. 启动 mock UDP DNS server——收到 A 查询返回 1.2.3.4
         let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
         let server_port = sock.local_addr().expect("addr").port();
-        let server = tokio::spawn(async move {
+        let server = xray_common::testing::spawn("mock-udp-dns-server", async move {
             let mut buf = [0u8; 1500];
             let (len, client) = sock.recv_from(&mut buf).await.expect("recv");
             let req = HickoryMessage::from_vec(&buf[..len]).expect("parse query");

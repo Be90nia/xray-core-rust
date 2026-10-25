@@ -281,6 +281,10 @@ mod tests {
         let mut handles = Vec::new();
         for i in 0..8 {
             let m2 = Arc::clone(&m);
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "并发安全测试用多 OS 线程压同步 map（无异步面）；无 PluginContext 可穿，按 clippy.toml 指引逐处登记"
+            )]
             handles.push(thread::spawn(move || {
                 for j in 0..100 {
                     let ip = format!("10.{i}.{j}.1");

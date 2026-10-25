@@ -1,4 +1,4 @@
-#![allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)] // FRDBG/VCDBG 临时诊断埋点（VISIONMAC 战役），随战役收官票清除
+#![allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)] // 仅测试诊断（tap2/tap3/chop 现场打印），生产路径无 print
 //! XTLS-Vision 连接包装（对应 Go `proxy/proxy.go` 的 VisionReader/VisionWriter）。
 //!
 //! 在 [`CommonConn`]（AEAD 加密层）之上提供 Vision padding：
@@ -116,23 +116,14 @@ pub struct VisionConn<C> {
     /// 上线。commit（flush Ready → `uplink_padding=false`）之前 branch 2
     /// 不可达——未成帧明文永不逃逸，switch 帧绝不丢失。
     end_commit: bool,
-    /// 角色标记（new=client / new_server=server），预留诊断。
-    #[allow(dead_code)] // 角色标记预留诊断埋点（FRDBG 类），当前仅构造赋值
+    /// 角色标记（new=client / new_server=server）：写侧 TLS 过滤按角色选
+    /// 流量状态（client 过滤下行 / server 过滤上行）。
     is_server: bool,
     /// raw 写入起步闸：arm 后首个 raw 写延迟 RAW_WRITE_ARM_DELAY，等对端
     /// 读完 DIRECT 帧（其 rustls 的同 recv 过读会把紧随的 raw 字节当隧道
     /// 记录解密 → BadRecordMac fatal alert → 双端皆死，macOS #08 实测）。
     /// 定时器到期后清 None，后续 raw 写零开销。
     raw_write_gate: Option<Pin<Box<tokio::time::Sleep>>>,
-    /// [VISIONMAC 诊断] XRAY_FRDBG 读路径轮询计数（临时埋点）。
-    frdbg_polls: u64,
-}
-
-fn frdbg_micros() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() % 1_000_000_000)
-        .unwrap_or(0)
 }
 
 /// 上行待写帧：padded 帧字节 + 已写偏移 + 该帧对应的 caller 消费量 + 提交闸类别。
@@ -196,7 +187,6 @@ where
             end_commit: false,
             is_server: false,
             raw_write_gate: None,
-            frdbg_polls: 0,
         }
     }
 
@@ -239,7 +229,6 @@ where
             end_commit: false,
             is_server: true,
             raw_write_gate: None,
-            frdbg_polls: 0,
         }
     }
 
@@ -272,10 +261,7 @@ impl<C> VisionConn<C> {
         }
     }
 }
-#[allow(
-    clippy::disallowed_macros,
-    reason = "存量债：XRAY_FRDBG 诊断分支直印 stderr；vision 热路径禁改语义故仅登记，诊断改走 logx 归第二批禁令"
-)]
+
 impl<C> AsyncRead for VisionConn<C>
 where
     C: AsyncRead + AsyncWrite + Unpin + InnerRawClone,
@@ -307,35 +293,7 @@ where
                 if let Some(raw) = this.raw_fallback.as_mut() {
                     return Pin::new(raw).poll_read(cx, buf);
                 }
-                let res = Pin::new(&mut this.inner).poll_read(cx, buf);
-                if std::env::var("XRAY_FRDBG").is_ok() {
-                    this.frdbg_polls += 1;
-                    match &res {
-                        Poll::Pending => {
-                            if this.frdbg_polls % 4096 == 0 {
-                                eprintln!(
-                                    "[VCDBG:{}MS] raw-inner Pending polls={}",
-                                    frdbg_micros(),
-                                    this.frdbg_polls
-                                );
-                            }
-                        },
-                        Poll::Ready(Ok(())) => {
-                            let n = buf.filled().len();
-                            if n == 0 {
-                                eprintln!(
-                                    "[VCDBG:{}MS] raw-inner EOF polls={}",
-                                    frdbg_micros(),
-                                    this.frdbg_polls
-                                );
-                            }
-                        },
-                        Poll::Ready(Err(e)) => {
-                            eprintln!("[VCDBG:{}MS] raw-inner ERR {e}", frdbg_micros());
-                        },
-                    }
-                }
-                return res;
+                return Pin::new(&mut this.inner).poll_read(cx, buf);
             }
             // 3. padding 模式 → CommonConn read + unpadding。临时缓冲提升为 struct
             //    字段（read_tmp）避免每 poll_read 16KB 栈帧；栈帧不被 编译器复用 →
@@ -376,9 +334,6 @@ where
                         && this.downlink_state.remaining_padding <= 0
                         && cmd != 0;
                     if frames_done {
-                        if std::env::var("XRAY_FRDBG").is_ok() {
-                            eprintln!("[VCDBG:{}MS] frame done cmd={}", frdbg_micros(), cmd);
-                        }
                         if cmd == COMMAND_PADDING_END as i32 {
                             this.downlink_padding = false;
                         } else if cmd == COMMAND_PADDING_DIRECT as i32 {
@@ -1236,7 +1191,7 @@ mod tests {
         let mut chunk = rec(&vec![0xA0u8; 8103]);
         chunk.extend_from_slice(&rec(&[0xB7u8; 79]));
         assert_eq!(chunk.len(), 8192);
-        let pump = tokio::spawn(async move {
+        let pump = xray_common::testing::spawn("inner-raw-tcp-clone", async move {
             for _ in 0..6u8 {
                 server.write_all(&chunk).await.expect("pump write");
                 server.flush().await.expect("pump flush");
@@ -1630,7 +1585,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let uuid_srv = uuid.clone();
-        let server = tokio::spawn(async move {
+        let server = xray_common::testing::spawn("supported-verify-schemes-accept", async move {
             let (stream, _) = listener.accept().await.unwrap();
             let raw = dup_tcp_stream(&stream).unwrap();
             let framer = xray_transport::record_framer::RecordFramer::new(stream);
@@ -1812,7 +1767,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let uuid_srv = uuid.clone();
-        let server = tokio::spawn(async move {
+        let server = xray_common::testing::spawn("supported-verify-schemes-accept", async move {
             let (stream, _) = listener.accept().await.unwrap();
             let raw = dup_tcp_stream(&stream).unwrap();
             let framer = xray_transport::record_framer::RecordFramer::new(stream);
@@ -1825,7 +1780,7 @@ mod tests {
             let (mut sr, mut sw) = tokio::io::split(vision);
             // 上行汇：并发读 VisionConn 读半（含 DIRECT 后 raw 切换），防止客户端
             // 上行无汇导致的缓冲填满假死
-            let sink = tokio::spawn(async move {
+            let sink = xray_common::testing::spawn("supported-verify-schemes", async move {
                 let mut tmp = [0u8; 16384];
                 let mut total = 0usize;
                 let dl = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -1870,7 +1825,7 @@ mod tests {
         cvision.downlink_traffic.is_tls12_or_above = true;
 
         let (mut cr, mut cw) = tokio::io::split(cvision);
-        let upump = tokio::spawn(async move {
+        let upump = xray_common::testing::spawn("supported-verify-schemes", async move {
             for _ in 0..3u8 {
                 let chunk = make_chunk(0x40);
                 cw.write_all(&chunk).await.expect("cli uplink write");
@@ -2000,7 +1955,7 @@ mod tests {
 
         // 真 TLS 服务端：End 模式（plain content，写侧早 End 后裸 payload 直出）。
         let uuid_srv = uuid.clone();
-        let server = tokio::spawn(async move {
+        let server = xray_common::testing::spawn("supported-verify-schemes-accept", async move {
             let (stream, _) = back.accept().await.unwrap();
             let raw = dup_tcp_stream(&stream).unwrap();
             let framer = xray_transport::record_framer::RecordFramer::new(stream);
@@ -2025,38 +1980,39 @@ mod tests {
         });
 
         // 切碎器：front←accept / back←connect 裸字节搬运。上行直通；下行随机小片 + 微停顿。
-        let front_conn = tokio::spawn(async move {
-            let (sock_front, _) = front.accept().await.unwrap();
-            let sock_back = tokio::net::TcpStream::connect(back_addr).await.unwrap();
-            let (mut fr, mut fw) = tokio::io::split(sock_front);
-            let (mut br, mut bw) = tokio::io::split(sock_back);
-            // 上行直通
-            tokio::spawn(async move {
-                let _ = tokio::io::copy(&mut fr, &mut bw).await;
-            });
-            // 下行切碎
-            let mut rng = StdRng::seed_from_u64(0xC0FFEE);
-            let mut buf = vec![0u8; 65536];
-            loop {
-                let n = match br.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => n,
-                };
-                let mut off = 0;
-                while off < n {
-                    let piece = rng.random_range(200..=3000).min(n - off);
-                    if fw.write_all(&buf[off..off + piece]).await.is_err() {
-                        return;
+        let front_conn =
+            xray_common::testing::spawn("supported-verify-schemes-accept", async move {
+                let (sock_front, _) = front.accept().await.unwrap();
+                let sock_back = tokio::net::TcpStream::connect(back_addr).await.unwrap();
+                let (mut fr, mut fw) = tokio::io::split(sock_front);
+                let (mut br, mut bw) = tokio::io::split(sock_back);
+                // 上行直通
+                xray_common::testing::spawn("supported-verify-schemes-echo", async move {
+                    let _ = tokio::io::copy(&mut fr, &mut bw).await;
+                });
+                // 下行切碎
+                let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    let n = match br.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    let mut off = 0;
+                    while off < n {
+                        let piece = rng.random_range(200..=3000).min(n - off);
+                        if fw.write_all(&buf[off..off + piece]).await.is_err() {
+                            return;
+                        }
+                        let _ = fw.flush().await;
+                        tokio::time::sleep(std::time::Duration::from_micros(
+                            rng.random_range(80..=400),
+                        ))
+                        .await;
+                        off += piece;
                     }
-                    let _ = fw.flush().await;
-                    tokio::time::sleep(std::time::Duration::from_micros(
-                        rng.random_range(80..=400),
-                    ))
-                    .await;
-                    off += piece;
                 }
-            }
-        });
+            });
 
         let csock = tokio::net::TcpStream::connect(front_addr).await.unwrap();
         // 等 TLS 服务端就绪：chopper 已把 front↔back 桥好，直连 back_addr 的
@@ -2129,7 +2085,7 @@ mod tests {
         let cvision_box: Box<dyn xray_transport::connection::Connection> =
             Box::new(ConnShim(cvision));
         // 桥任务独立运行，测试以读侧进度判定，JoinHandle 即弃（detached）。
-        tokio::spawn(async move {
+        xray_common::testing::spawn("local-addr", async move {
             let policy = xray_features::policy::TimeoutPolicy::default();
             xray_transport::bridge::bridge_link_with_stream_full(link, cvision_box, &policy).await
         });

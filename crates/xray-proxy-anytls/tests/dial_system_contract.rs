@@ -6,7 +6,7 @@
 //! 返回 127.0.0.1 完成真实建链——fake.seen 记录即 sockopt 可观测证据。
 
 #![cfg(test)]
-#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros))] // 测试脚手架：spawn 起停被测服务/回环 echo、直印进度；非生产托管面
+#![cfg_attr(test, allow(clippy::disallowed_macros))] // 测试脚手架：直印进度；spawn 走 xray_common::testing（L3 闸不豁免）
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -47,10 +47,10 @@ impl DnsClient for FakeDns {
 async fn start_echo_server() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("anytls-echo-accept-loop", async move {
         loop {
             let Ok((mut sock, _)) = listener.accept().await else { break };
-            tokio::spawn(async move {
+            xray_common::testing::spawn("anytls-echo-conn", async move {
                 let mut buf = vec![0u8; 4096];
                 loop {
                     match sock.read(&mut buf).await {

@@ -1,14 +1,8 @@
 #![deny(warnings)]
 // 治理红线（bd 75rv ②）：任何 rustc warning 即构建失败；豁免一律显式 allow + 理由
-#![cfg_attr(
-    test,
-    allow(
-        clippy::disallowed_methods,
-        clippy::disallowed_macros,
-        clippy::print_stdout,
-        clippy::print_stderr
-    )
-)] // 测试目标统一豁免（脚手架 spawn/print 断言便利），生产禁令不受影响
+#![cfg_attr(test, allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr))]
+// 测试目标统一豁免（print 断言便利）；spawn 走 xray_common::testing（L3
+// 闸不豁免），生产禁令不受影响
 #![warn(clippy::print_stdout, clippy::print_stderr)]
 // 库代码禁直写控制台（诊断走 tracing）；豁免面见各文件 allow 与 clippy.toml 注释
 //! # xray-proxy-hysteria
@@ -49,6 +43,7 @@ pub mod inbound;
 pub mod outbound;
 pub mod plugin;
 pub mod protocol;
+pub mod servers;
 
 pub use config::{
     ClientConfig, HYSTERIA_ACCOUNT_TYPE_URL, HysteriaConfig, HysteriaInboundConfig, HysteriaUser,
@@ -60,3 +55,4 @@ pub use inbound::{HysteriaInboundHandler, StaticAuthValidator, TcpDispatcher};
 pub use outbound::HysteriaOutboundHandler;
 pub use plugin::{HysteriaFace, HysteriaLifecycle, HysteriaPlugin};
 pub use protocol::{Defragger, UdpMessage};
+pub use servers::{HysteriaServerSelection, select_server};

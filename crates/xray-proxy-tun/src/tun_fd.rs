@@ -13,13 +13,11 @@
 //! - **其他平台**（Windows/macOS/BSD）：未实现 fd 继承。
 //! - 这些平台 env 设置即由 [`refuse_unsupported`] 显式报错，禁静默回退直开。
 //!
-//! 窄化（与 Go 的唯一差异，显式报错而非静默）：Go 接受带 `IFF_VNET_HDR` 的继承
-//! fd；本 crate 的设备 IO 走 tun-rs，其 `AsyncDevice::from_fd` 硬编码
-//! `vnet_hdr=false`，进去会把 virtio 头当 IP 包读。故带 `IFF_VNET_HDR` 的 fd
-//! 直接报错拒绝，只接管裸包 fd（Android `VpnService` 形态即此类）。
-//!
-//! shortcut: 继承 fd 的 vnet_hdr 面不支持，需要时给 tun-rs 提 `from_fd` 带 vnet
-//! 尺寸的构造口。
+//! vnet_hdr 面（bd y93up，对齐 Go）：带 `IFF_VNET_HDR` 的继承 fd 照常接管。
+//! tun-rs 的 `from_fd` 把设备记成裸包模式（读写原语 = 裸 read/write），因此
+//! virtio 头的剥除/垫放由 [`crate::device::TunDevice`] 层处理（复用其垫头
+//! free list）；[`clear_offload`] 在接管时清设备级 offload mask，保证继承读
+//! 路径只见单包、不会收到内核 GRO 聚合大包。
 
 use crate::error::{Result, TunError};
 
@@ -97,6 +95,9 @@ pub struct InheritedTun {
     pub fd: TunFd,
     /// 设备实际接口名（`TUNGETIFF` 回的 `ifr_name`）。
     pub name: String,
+    /// fd 携带 `IFF_VNET_HDR`（bd y93up）：接管方须剥头/垫头并先清 offload mask
+    /// （[`clear_offload`]）。
+    pub vnet_hdr: bool,
 }
 
 /// 继承路径入口（Linux）：读 env → 解析 → 校验 fd。
@@ -109,6 +110,14 @@ pub fn inherit_from_env(expected_name: &str) -> Result<Option<InheritedTun>> {
         return Ok(None);
     };
     linux::verify(fd, expected_name).map(Some)
+}
+
+/// 清继承 fd 所在 TUN 设备的 offload mask（`TUNSETOFFLOAD(0)`，Linux）。
+///
+/// 接管带 `IFF_VNET_HDR` 的 fd 时必须在首个读之前调用——见 [`InheritedTun::vnet_hdr`]。
+#[cfg(target_os = "linux")]
+pub fn clear_offload(fd: TunFd) -> Result<()> {
+    linux::clear_offload(fd)
 }
 
 #[cfg(target_os = "linux")]
@@ -176,12 +185,7 @@ mod linux {
         if flags & IFF_NO_PI == 0 {
             return Err(device_err(format!("fd {fd} TUN device must use IFF_NO_PI")));
         }
-        if flags & IFF_VNET_HDR != 0 {
-            return Err(device_err(format!(
-                "fd {fd} has IFF_VNET_HDR set; inherited fds carrying virtio-net headers are \
-                 not supported by this build (adopt a raw-packet fd instead)"
-            )));
-        }
+        let vnet_hdr = flags & IFF_VNET_HDR != 0;
         let actual = ifreq_name(&req);
         if !expected_name.is_empty() && actual != expected_name {
             return Err(device_err(format!(
@@ -190,7 +194,27 @@ mod linux {
             )));
         }
         set_nonblocking(fd)?;
-        Ok(super::InheritedTun { fd, name: actual })
+        Ok(super::InheritedTun { fd, name: actual, vnet_hdr })
+    }
+
+    /// 清继承 fd 所在 TUN 设备的 offload mask（`TUNSETOFFLOAD(0)`）。
+    ///
+    /// 内核 offload mask 是设备级状态、跨 detach 残留：前主进程协商过 offload
+    /// 时，掩码非零会让继承读路径收到内核 GRO 聚合大包，单包读会把聚合包读坏。
+    /// 与 tun-rs 直开路径协商 `offload=false` 时的显式重置行为一致；vnet fd 上
+    /// 该 ioctl 恒合法，失败即报错（继承路径禁静默降级）。
+    pub(super) fn clear_offload(fd: TunFd) -> Result<()> {
+        const TUNSETOFFLOAD: c_ulong = 0x4004_54d0; // _IOW('T', 208, unsigned int)
+        // SAFETY: 可变参数为 c_uint（4 字节），与 _IOW 声明的尺寸一致；fd 是已
+        // 验证的 vnet TUN 设备，本调用只改设备 offload 掩码，不触用户内存。
+        let rc = unsafe { ioctl(fd, TUNSETOFFLOAD, 0u32) };
+        if rc < 0 {
+            return Err(device_err(format!(
+                "fd {fd} TUNSETOFFLOAD(0) failed: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        Ok(())
     }
 
     /// `ifr_name`（NUL 结尾、最长 16 字节）。
@@ -222,13 +246,14 @@ mod linux {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// 环境变量是进程级共享状态：本模块内所有改 env 的测试串行，避免互相覆盖。
+    /// device.rs 的继承集成测试共用此锁（env 设了必须被 create 消费的窗口）。
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn lock_env() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 

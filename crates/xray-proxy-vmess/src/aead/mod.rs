@@ -292,29 +292,15 @@ pub fn seal_vmess_aead_header(
         u16::try_from(data.len()).map_err(|_| SealHeaderError::PayloadTooLarge(data.len()))?;
     let len_plain = header_payload_data_len.to_be_bytes();
 
-    // KDF path 用字节切片（Go 端用 string(byte_slice)，非 UTF-8 也合法）
-    let path_segments: [Vec<u8>; 3] = [
-        auth_id.to_vec(),
-        connection_nonce.to_vec(),
-        Vec::new(), // 占位，下面按需填充
-    ];
-
-    // 加密 length
+    // KDF path 用字节切片（Go 端用 string(byte_slice)，非 UTF-8 也合法）；
+    // auth_id/nonce 本就是栈上定长数组，直传切片免每握手堆分配。
     let len_key = kdf16_paths(
         cmd_key,
-        &[
-            consts::VMESS_HEADER_PAYLOAD_LENGTH_AEAD_KEY.as_bytes(),
-            &path_segments[0],
-            &path_segments[1],
-        ],
+        &[consts::VMESS_HEADER_PAYLOAD_LENGTH_AEAD_KEY.as_bytes(), &auth_id, &connection_nonce],
     );
     let len_iv_full = kdf_paths(
         cmd_key,
-        &[
-            consts::VMESS_HEADER_PAYLOAD_LENGTH_AEAD_IV.as_bytes(),
-            &path_segments[0],
-            &path_segments[1],
-        ],
+        &[consts::VMESS_HEADER_PAYLOAD_LENGTH_AEAD_IV.as_bytes(), &auth_id, &connection_nonce],
     );
     let len_nonce = &len_iv_full[..12];
     let len_cipher = Aes128Gcm::new(&len_key)?;
@@ -323,11 +309,11 @@ pub fn seal_vmess_aead_header(
     // 加密 payload
     let payload_key = kdf16_paths(
         cmd_key,
-        &[consts::VMESS_HEADER_PAYLOAD_AEAD_KEY.as_bytes(), &path_segments[0], &path_segments[1]],
+        &[consts::VMESS_HEADER_PAYLOAD_AEAD_KEY.as_bytes(), &auth_id, &connection_nonce],
     );
     let payload_iv_full = kdf_paths(
         cmd_key,
-        &[consts::VMESS_HEADER_PAYLOAD_AEAD_IV.as_bytes(), &path_segments[0], &path_segments[1]],
+        &[consts::VMESS_HEADER_PAYLOAD_AEAD_IV.as_bytes(), &auth_id, &connection_nonce],
     );
     let payload_nonce = &payload_iv_full[..12];
     let payload_cipher = Aes128Gcm::new(&payload_key)?;

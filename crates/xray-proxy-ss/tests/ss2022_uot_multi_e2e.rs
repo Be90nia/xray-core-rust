@@ -13,7 +13,7 @@
 //! （dispatcher.rs `Network::UDP` 注释；Go shadowsocks_2022 无 uot 消费点），
 //! 因此本测试同时证明 uot 字段在场不改变多用户 UDP wire 行为。
 
-#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros))] // 测试脚手架：spawn 起停被测服务/回环 echo、直印进度；非生产托管面
+#![cfg_attr(test, allow(clippy::disallowed_macros))] // 测试脚手架：直印进度；spawn 走 xray_common::testing（L3 闸不豁免）
 use std::{sync::Arc, time::Duration};
 
 use base64::Engine as _;
@@ -43,7 +43,7 @@ async fn spawn_multi_user_udp_server(sock: UdpSocket) {
     let ipsk = IPSK.to_vec();
     let upsk = UPSK.to_vec();
     let users = vec![(psk_identity(&upsk), upsk)];
-    tokio::spawn(async move {
+    xray_common::testing::spawn("ss2022-uot-server", async move {
         let mut buf = vec![0u8; 65_535];
         while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
             let Ok(hdr) = server_decode_header(KIND, &ipsk, &users, &buf[..n]) else {

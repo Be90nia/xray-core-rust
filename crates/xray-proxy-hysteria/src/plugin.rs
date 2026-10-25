@@ -24,7 +24,9 @@
 //! `{"bind","users":[{"email","auth","level"}],"serverName","alpn","udpIdleTimeout",
 //! "masquerade"}`；出站 `{"address","port","auth","serverName","alpn","udpIdleTimeout"}`
 //! （`address`=host、`port`=独立字段，Go `infra/conf/hysteria.go:13-17`；拨号目标
-//! 由二者合成 `host:port`）。
+//! 由二者合成 `host:port`）；另有 Rust 方言 `{"servers":[{...}]}` 数组形态
+//! （`servers[0]` 选择，收口 [`crate::servers::select_server`]，与生产面
+//! `xray-core` `parse_hysteria_config` 同语义）。
 //! transport 层深键（quicParams / masquerade 展开 / brutal 带宽）属 xray-conf
 //! 解析面，随 P3-2 收口，本壳不解析。
 //!
@@ -72,8 +74,9 @@ static HYSTERIA_CONTRACT: PluginContract =
 
 static HYSTERIA_LIFECYCLE: HysteriaLifecycle = HysteriaLifecycle;
 
-/// 段解析产物：一份 hysteria 段只可能是入站（`users`）或出站（`address`）之一
-/// （Go `proxy/hysteria` 两侧配置面互斥）；两键并存/全缺均硬错，禁静默择一。
+/// 段解析产物：一份 hysteria 段只可能是入站（`users`）或出站（`address` /
+/// `servers[]`）之一（Go `proxy/hysteria` 两侧配置面互斥）；两键并存/全缺均硬错，
+/// 禁静默择一。
 #[derive(Debug)]
 pub enum HysteriaFace {
     /// 入站服务端配置（[`HysteriaInboundHandler::with_inbound_config`] 消费）。
@@ -202,22 +205,24 @@ impl Lifecycle for HysteriaLifecycle {
 }
 
 /// per-plugin 段 → 面判定 + 解析。入站/出站互斥：`users` 在场（非 null）→ 入站；
-/// `address` 非空 → 出站；并存/全缺硬错（fail-visible，面歧义禁静默择一）。
+/// `address` 非空或 `servers[]` 在场 → 出站；并存/全缺硬错（fail-visible，面歧义
+/// 禁静默择一）。
 fn parse_section(section: &serde_json::Value) -> Result<HysteriaFace, PluginError> {
     let settings = section.get("settings").unwrap_or(section);
     let has_users = settings.get("users").is_some_and(|u| !u.is_null());
     let has_address =
         settings.get("address").and_then(|a| a.as_str()).is_some_and(|a| !a.is_empty());
-    match (has_users, has_address) {
+    let has_servers = settings.get("servers").and_then(serde_json::Value::as_array).is_some();
+    match (has_users, has_address || has_servers) {
         (true, true) => Err(PluginError::Other(
-            "hysteria settings ambiguous: users and address both present".into(),
+            "hysteria settings ambiguous: users and address/servers both present".into(),
         )),
         (true, false) => parse_inbound_config(settings).map(|c| HysteriaFace::Inbound(Arc::new(c))),
         (false, true) => {
             parse_outbound_config(settings).map(|c| HysteriaFace::Outbound(Arc::new(c)))
         },
         (false, false) => Err(PluginError::Other(
-            "hysteria settings: neither users (inbound) nor address (outbound)".into(),
+            "hysteria settings: neither users (inbound) nor address/servers (outbound)".into(),
         )),
     }
 }
@@ -260,29 +265,18 @@ fn parse_inbound_config(
     Ok(config)
 }
 
-/// 出站 settings → [`HysteriaConfig`]
-/// （既有 `validate` 收口；auth 空 = 客户端将被服务端拒，同 Go dial 配置形态，
-/// 不在此加码）。
+/// 出站 settings → [`HysteriaConfig`]。
+///
+/// 服务器选择（扁平 / `servers[]` 双形态）收口 [`crate::servers::select_server`]
+/// ——与生产面 `xray-core` `parse_hysteria_config` 同一语义的共享实现（错误文案
+/// 逐字一致，对拍口径）。既有 `validate` 收口；auth 空 = 客户端将被服务端拒，
+/// 同 Go dial 配置形态，不在此加码。
 fn parse_outbound_config(settings: &serde_json::Value) -> Result<HysteriaConfig, PluginError> {
-    let address =
-        settings.get("address").and_then(|a| a.as_str()).filter(|a| !a.is_empty()).ok_or_else(
-            || PluginError::Other("hysteria outbound settings: address missing/empty".into()),
-        )?;
-    // Go `infra/conf/hysteria.go:13-17`：`address`=host、`port`=独立字段，
-    // 拨号目标由二者合成 host:port（Go `protocol.NewServerSpecFromPB` →
-    // `TCPDestination(address, port)`）。生产面 `parse_hysteria_config` 同形；
-    // 插件面缺拼接会让 B5 接线后拨号打错端口（缺端口 → 解析失败/错端口）。
-    let port = settings
-        .get("port")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| PluginError::Other("hysteria outbound settings: port missing".into()))?;
-    let mut config = HysteriaConfig::new(
-        format!("{address}:{port}"),
-        str_field(settings, "auth").unwrap_or_default(),
-    );
-    if let Some(sni) = str_field(settings, "serverName") {
-        config = config.with_server_name(sni);
-    }
+    let sel = crate::servers::select_server(settings).map_err(|e| PluginError::Other(e.into()))?;
+    // with_server_name 无条件应用（生产消费形态 `arm_builders/outbound.rs` 同型）；
+    // 缺省时 sel.server_name = address host，与 `HysteriaConfig::new` 自推导等值。
+    let mut config =
+        HysteriaConfig::new(sel.server_addr, sel.auth).with_server_name(sel.server_name);
     if let Some(alpn) = alpn_field(settings)? {
         config = config.with_alpn(alpn);
     }
@@ -345,12 +339,69 @@ mod tests {
     }
 
     /// 缺 `port` 硬错（Go `infra/conf/hysteria.go:16` 独立 port 字段；缺端口的
-    /// 拨号目标无意义——装配期 fail-visible，禁拼出无端口地址）。
+    /// 拨号目标无意义——装配期 fail-visible，文案与生产面 `parse_hysteria_config`
+    /// 逐字一致）。
     #[test]
     fn outbound_settings_missing_port_fails_fast() {
         let err = parse_section(&json!({ "settings": { "address": "us1.example.com" } }))
             .expect_err("port missing must fail");
-        assert!(err.to_string().contains("port missing"), "实际: {err}");
+        assert!(err.to_string().contains("missing servers[0].port"), "实际: {err}");
+    }
+
+    /// `servers[]` 多服务器形态：构造成功 + `servers[0]` 选择（与生产面一致）。
+    #[test]
+    fn outbound_settings_servers_array_selects_first() {
+        let face = parse_section(&json!({ "settings": {
+            "servers": [
+                { "address": "a.example.com", "port": 443, "auth": "tok-a", "sni": "a-sni.example.com" },
+                { "address": "b.example.com", "port": 8443, "auth": "tok-b" }
+            ],
+            "udpIdleTimeout": 45
+        } }))
+        .expect("servers face");
+        let config = match face {
+            HysteriaFace::Outbound(config) => config,
+            HysteriaFace::Inbound(_) => panic!("expected outbound face"),
+        };
+        assert_eq!(config.server_addr, "a.example.com:443", "servers[0] 选择（生产同序）");
+        assert_eq!(config.auth, "tok-a", "auth 别名照常解析");
+        assert_eq!(config.server_name, "a-sni.example.com", "sni 别名解析");
+        assert_eq!(config.udp_idle_timeout_secs, 45, "段级可选键照常生效");
+    }
+
+    /// `servers[]` 缺字段 / 空数组 → fail-visible（文案与生产面一致）。
+    #[test]
+    fn outbound_settings_servers_array_invalid_fails_visible() {
+        for (settings, expect) in [
+            (json!({ "servers": [] }), "servers array is empty"),
+            (json!({ "servers": [{ "port": 443 }] }), "missing servers[0].address"),
+            (json!({ "servers": [{ "address": "a.com" }] }), "missing servers[0].port"),
+            (
+                json!({ "servers": [{ "address": "a.com", "port": 1 }], "version": 1 }),
+                "not supported (only version 2)",
+            ),
+        ] {
+            let err = parse_section(&json!({ "settings": settings }))
+                .expect_err("invalid servers[] must fail");
+            assert!(err.to_string().contains(expect), "实际: {err}");
+        }
+    }
+
+    /// `servers[]` 在场即出站面标记（无扁平 address 也可判定）；
+    /// users + servers 并存 = 面歧义硬错。
+    #[test]
+    fn face_detection_accepts_servers_marker() {
+        let face = parse_section(&json!(
+            { "settings": { "servers": [{ "address": "a.com", "port": 443 }] } }
+        ))
+        .expect("servers-only outbound face");
+        assert!(matches!(face, HysteriaFace::Outbound(_)), "实际: {face:?}");
+
+        let err = parse_section(&json!(
+            { "settings": { "users": [{ "auth": "t" }], "servers": [] } }
+        ))
+        .expect_err("users+servers must be ambiguous");
+        assert!(err.to_string().contains("hysteria settings"), "实际: {err}");
     }
 
     #[test]

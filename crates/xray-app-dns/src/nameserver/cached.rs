@@ -694,10 +694,11 @@ mod tests {
         let server = Arc::new(HangServer { cache, hang: std::sync::atomic::AtomicBool::new(true) });
 
         // 领导者：进入 fetch 后停在挂起的 send_query 上。
-        let leader = tokio::spawn({
-            let server = server.clone();
-            async move { fetch(&*server, "a.com.", v4_only_option()).await }
-        });
+        let leader =
+            xray_common::testing::spawn("singleflight-leader-abort-does-not-leak-and-key-reco", {
+                let server = server.clone();
+                async move { fetch(&*server, "a.com.", v4_only_option()).await }
+            });
         // 等领导者注册条目。
         loop {
             if server.cache.single_flight.lock().await.len() == 1 {
@@ -706,10 +707,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         // 等待者：进入等待者路径（recv 广播）。
-        let waiter = tokio::spawn({
-            let server = server.clone();
-            async move { fetch(&*server, "a.com.", v4_only_option()).await }
-        });
+        let waiter =
+            xray_common::testing::spawn("singleflight-leader-abort-does-not-leak-and-key-reco", {
+                let server = server.clone();
+                async move { fetch(&*server, "a.com.", v4_only_option()).await }
+            });
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         // 解除挂起并中止领导者：guard Drop 必须移除条目，等待者收到
@@ -754,11 +756,11 @@ mod tests {
         let cache = Arc::new(CacheController::new("test", false, false, 0, 0));
         let server =
             Arc::new(CountingServer { cache, calls: std::sync::atomic::AtomicUsize::new(0) });
-        let f1 = tokio::spawn({
+        let f1 = xray_common::testing::spawn("send-query", {
             let server = server.clone();
             async move { fetch(&*server, "dup.com.", v4_only_option()).await }
         });
-        let f2 = tokio::spawn({
+        let f2 = xray_common::testing::spawn("send-query", {
             let server = server.clone();
             async move { fetch(&*server, "dup.com.", v4_only_option()).await }
         });

@@ -382,7 +382,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let fqdn_owned = fqdn.to_string();
 
-        let handle = tokio::spawn(async move {
+        let handle = xray_common::testing::spawn("spawn-mock-dot-server-accept", async move {
             let (sock, _) = listener.accept().await.unwrap();
             let tcp = TcpConnection::new(sock);
             let mut tls = acceptor.accept(tcp).await.unwrap();

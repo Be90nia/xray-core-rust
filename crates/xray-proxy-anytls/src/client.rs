@@ -429,7 +429,7 @@ mod tests {
         // into_split 后 write half 绑 `_` 会立即 drop 产生 FIN，破坏静默语义。
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let silent_addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("dial-timeout-when-server-silent-accept", async move {
             let Ok((sock, _)) = listener.accept().await else { return };
             let _silent_sock = sock;
             tokio::time::sleep(Duration::from_secs(30)).await;

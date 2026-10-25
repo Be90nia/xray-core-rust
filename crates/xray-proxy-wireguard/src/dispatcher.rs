@@ -1054,16 +1054,17 @@ mod tests {
     async fn tunnel_dns_resolves_via_smoltcp_stack() {
         let netstack = Arc::new(AsyncMutex::new(WgNetStack::new(&[udp_ip_cidr()], 1420)));
         let ns_for_resolver = Arc::clone(&netstack);
-        let resolver = tokio::spawn(async move {
-            resolve_domain_in_tunnel(
-                &ns_for_resolver,
-                "example.invalid",
-                true,
-                false,
-                &TUNNEL_DNS_SERVERS,
-            )
-            .await
-        });
+        let resolver =
+            xray_common::testing::spawn("tunnel-dns-resolves-via-smoltcp-stack", async move {
+                resolve_domain_in_tunnel(
+                    &ns_for_resolver,
+                    "example.invalid",
+                    true,
+                    false,
+                    &TUNNEL_DNS_SERVERS,
+                )
+                .await
+            });
 
         // 驱动栈：捕获查询（dst 1.1.1.1:53）→ 构造响应 → ingest 回栈
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);

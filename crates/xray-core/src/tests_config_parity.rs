@@ -8,8 +8,23 @@
 //! settings 级（本日 B5 前置）。hysteria 出站 server_addr 插件面缺 port 拼接
 //! 一处已收口——插件面按 Go `infra/conf/hysteria.go:13-17` 合成 host:port，与
 //! 生产面逐字相等（见 `hysteria_parity_outbound_server_addr_port`）。
-//! 剩余缺口仅 `ss`（无 Plugin 实现，纯 handler 架构），登记见
-//! `ss_parity_gap_no_plugin_implementation`。
+//!
+//! bd hw6w 收口（2026-10-25）：`ss` 从「缺口登记」转为**真对拍**——P2 补课后
+//! `xray-proxy-ss` 已有 `impl Plugin`（`SsPlugin`，产物观察面 `face()`），入站
+//! 五形态（legacy 单/多用户 → ss2022 单/多/中继）core 解析面 vs 插件解析面逐
+//! 字段 + 逐行为比，见 `ss_parity_*`。`ss` 出站面**刻意不对拍**：生产装配
+//! （`arm_builders/outbound.rs:287`）与插件出站分支调同一个
+//! `xray_proxy_ss::parse_ss_config`，同函数自比无信息量。
+//!
+//! 16/16 族的可观测出口 = `parity_roster_covers_all_16_families`（名称清单 +
+//! 总数断言）；CI 宽门已含本模块——`cargo test --workspace`
+//! （`.github/workflows/ci.yml:160`）跑 lib 测试目标，无需单列 workflow。
+//!
+//! 新登记已知差异 1 处（**只报告不修**，见
+//! `reports/wsl-2026-10-25/parity-16.md`）：ss2022 中继 `destinations[]` 旧形的
+//! `server` 为 IP 字面量时，core 面硬写 `Address::Domain`、插件面走
+//! `parse_address_str` → `Address::IPv4`，见
+//! `ss_known_divergence_relay_destinations_address_typing`。
 //!
 //! 本模块 `#[cfg(test)]`，零生产语义；旧 parse 函数原文未动（「本单不删旧
 //! 解析面」红线）。
@@ -17,6 +32,8 @@
 use std::sync::Arc;
 
 use serde_json::{Value, json};
+use tokio::io::AsyncWriteExt;
+use xray_common::net::address::Address;
 use xray_frame::{Plugin, build_plugins_from_config};
 use xray_proxy_anytls::AnytlsPlugin;
 use xray_proxy_blackhole::{BlackholePlugin, ResponseConfig};
@@ -27,6 +44,13 @@ use xray_proxy_http::HttpPlugin;
 use xray_proxy_hysteria::HysteriaPlugin;
 use xray_proxy_loopback::LoopbackPlugin;
 use xray_proxy_socks::SocksPlugin;
+use xray_proxy_ss::{
+    CipherKind2022, RelayInbound, SsFace, SsInbound, SsPlugin, psk_from_base64,
+    ss2022::{
+        derive_psk,
+        key::{derive_identity_subkey, ecb_block, psk_identity},
+    },
+};
 use xray_proxy_trojan::TrojanPlugin;
 use xray_proxy_tuic::TuicPlugin;
 use xray_proxy_tun::TunPlugin;
@@ -256,8 +280,9 @@ fn missing_section_fails_fast_not_global_fallback() {
 // count + behavior_seed（用户 id 集合敏感））。
 //
 // **缺口清单（不伪造通过）**：
-// - `ss`：xray-proxy-ss 无 Plugin 实现（纯 handler 架构），无从对拍——登记 锚点
-//   `ss_parity_gap_no_plugin_implementation`。
+// - ~~`ss`~~（bd hw6w 收口，2026-10-25）：P2 补课后 `xray-proxy-ss` 已有 `impl Plugin`（产物观察面
+//   `face()`），入站五形态真对拍见 `ss_parity_*`；
+//   出站面两侧同函数（`parse_ss_config`）刻意不对拍。
 // - ~~`dokodemo`/`tuic`~~（已收口，本日 B5 前置）：生产面 struct+解析 fn 放宽
 //   `pub(crate)`（先例注释同 `parse_wireguard_inbound_config`），对拍见
 //   `dokodemo_parity_inbound_full_fields` / `tuic_parity_inbound_full_fields`。
@@ -625,15 +650,245 @@ fn tun_parity_inbound_stack_options_fields() {
     assert!(p.tun.is_some() && core.tun.is_some(), "占位设备注入两侧一致");
 }
 
-// ── ss：缺口登记（非钉子，不伪造通过）──
+// ── ss：入站五形态（core `parse_ss_inbound_config` ↔ SsPlugin build `face()`）──
+//
+// 出站面不在对拍范围：生产装配 `arm_builders/outbound.rs:287` 与插件
+// `plugin.rs` 出站分支调的是**同一个** `xray_proxy_ss::parse_ss_config`，同函数
+// 自比无信息量（面判别本身由 `xray-proxy-ss/tests/plugin_contract.rs` 覆盖）。
+// 入站面才是两套独立解析实现（`core/inbound.rs` vs `ss/plugin.rs`）。
 
-/// ss 族对拍**未覆盖**：xray-proxy-ss 为纯 handler 架构——无 `Plugin` 实现、
-/// 无 build 管线产物可观察（`impl Plugin for` 于该 crate 零命中），同规面只剩
-/// 「core 解析 ↔ core handler 自建」自对拍，无跨面差异可断言。收口条件：ss
-/// 接入 xray-frame 插件形态（有 build 观察面）后补对拍。
+/// 16 字节 PSK 的 base64（ss2022 aes-128-gcm 的 key 长度）。
+fn b64_psk(byte: u8) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode([byte; 16])
+}
+
+/// 建 ss 插件（inbounds 段形态）并返回句柄：`face()` 借用插件内 OnceLock，
+/// 句柄须在测试作用域内存活。
+fn build_ss_plugin(settings: &Value) -> Arc<SsPlugin> {
+    let plugin = Arc::new(SsPlugin::default());
+    let built = build_plugins_from_config(
+        &root_inbound_with("shadowsocks", settings.clone()),
+        &[Arc::clone(&plugin) as Arc<dyn Plugin>],
+    )
+    .expect("plugin build");
+    assert_eq!(built, ["shadowsocks"]);
+    plugin
+}
+
+/// legacy 用户表逐字段比（`Validator::get_all` 是唯一公开用户观察面）。
+/// 凭据走 bool 断言，失败面不打印密码/key。
+fn assert_legacy_users_eq(core: &SsInbound, plugin: &SsInbound) {
+    let (c, p) = (core.validator().get_all(), plugin.validator().get_all());
+    assert_eq!(c.len(), p.len(), "用户数");
+    for (i, (cu, pu)) in c.iter().zip(p.iter()).enumerate() {
+        assert_eq!(cu.email, pu.email, "user {i} email");
+        assert_eq!(cu.level, pu.level, "user {i} level");
+        assert_eq!(cu.account.cipher_type, pu.account.cipher_type, "user {i} cipher");
+        assert_eq!(cu.account.iv_check, pu.account.iv_check, "user {i} iv_check");
+        assert!(cu.account.password == pu.account.password, "user {i} password");
+        assert!(cu.account.key == pu.account.key, "user {i} key");
+    }
+}
+
+/// relay destination 观察面：`RelayInbound` 只公开 `destinations_count()`，
+/// address/port 仅能经 `handle_conn_relay` 的 identity 匹配返回面看到——送
+/// `[salt][EIH]` 后取回 (地址, 端口)。
+async fn relay_target(
+    relay: &RelayInbound,
+    kind: CipherKind2022,
+    server_psk_b64: &str,
+    dest_key_b64: &str,
+) -> (Address, u16) {
+    let server_psk = derive_psk(&psk_from_base64(server_psk_b64).expect("server psk"), kind)
+        .expect("derive server psk");
+    let dest_key = psk_from_base64(dest_key_b64).expect("dest psk");
+    let salt = vec![0x5Au8; kind.key_size()];
+    let subkey = derive_identity_subkey(&server_psk, &salt, kind);
+    let eih = ecb_block(kind, &subkey, &psk_identity(&dest_key), true).expect("eih");
+    let mut wire = salt;
+    wire.extend_from_slice(&eih);
+    let (mut client, server) = tokio::io::duplex(64);
+    client.write_all(&wire).await.expect("write relay wire");
+    drop(client);
+    let (addr, port, _, _) = relay.handle_conn_relay(server).await.expect("relay identity match");
+    (addr, port)
+}
+
 #[test]
-fn ss_parity_gap_no_plugin_implementation() {
-    // 登记性锚点（grep "ss_parity" 可达）：无断言语义可写，保持空体。
+fn ss_parity_legacy_single_user() {
+    // 扁平 password + method：两侧都产 Legacy 单用户，email 同缺省 `u@ss.local`。
+    let settings = json!({"method": "aes-256-gcm", "password": "pw-single"});
+    let core = crate::inbound::parse_ss_inbound_config(&serde_json::to_vec(&settings).unwrap())
+        .expect("core parse");
+    let plugin = build_ss_plugin(&settings);
+    let crate::inbound::SsInboundMode::Legacy(core_in) = core else {
+        panic!("core 面应为 Legacy");
+    };
+    let SsFace::LegacyInbound(plugin_in) = plugin.face().expect("built") else {
+        panic!("plugin 面应为 LegacyInbound");
+    };
+    assert_legacy_users_eq(&core_in, plugin_in);
+    assert_eq!(core_in.validator().get_all()[0].email, "u@ss.local");
+}
+
+#[test]
+fn ss_parity_legacy_multi_users_and_clients_alias() {
+    // 逐用户 method（第二项缺 method → 两侧同缺省 aes-128-gcm）；`users` 主键、
+    // `clients` 旧名回退（Go shadowsocks.go:46-47）。
+    let users = json!([
+        {"method": "aes-256-gcm", "password": "pw1", "email": "a@x"},
+        {"password": "pw2", "email": "b@x"},
+    ]);
+    for key in ["users", "clients"] {
+        let mut settings = json!({"method": "aes-128-gcm"});
+        settings[key] = users.clone();
+        let core = crate::inbound::parse_ss_inbound_config(&serde_json::to_vec(&settings).unwrap())
+            .expect("core parse");
+        let plugin = build_ss_plugin(&settings);
+        let crate::inbound::SsInboundMode::Legacy(core_in) = core else {
+            panic!("core 面应为 Legacy（{key}）");
+        };
+        let SsFace::LegacyInbound(plugin_in) = plugin.face().expect("built") else {
+            panic!("plugin 面应为 LegacyInbound（{key}）");
+        };
+        assert_legacy_users_eq(&core_in, plugin_in);
+        assert_eq!(plugin_in.validator().count(), 2, "{key} 用户数");
+    }
+}
+
+#[test]
+fn ss_parity_ss2022_single_user() {
+    let settings = json!({"method": "2022-blake3-aes-128-gcm", "password": b64_psk(0x11)});
+    let core = crate::inbound::parse_ss_inbound_config(&serde_json::to_vec(&settings).unwrap())
+        .expect("core parse");
+    let plugin = build_ss_plugin(&settings);
+    let crate::inbound::SsInboundMode::Ss2022(core_in) = core else {
+        panic!("core 面应为 Ss2022");
+    };
+    let SsFace::Ss2022(plugin_in) = plugin.face().expect("built") else {
+        panic!("plugin 面应为 Ss2022");
+    };
+    assert_eq!(plugin_in.kind(), core_in.kind());
+    assert!(plugin_in.psk() == core_in.psk(), "server PSK");
+}
+
+#[test]
+fn ss_parity_ss2022_multi_users() {
+    let (server, user_a, user_b) = (b64_psk(0x11), b64_psk(0x22), b64_psk(0x33));
+    let settings = json!({
+        "method": "2022-blake3-aes-128-gcm",
+        "password": server,
+        "users": [
+            {"password": user_a, "email": "a@y", "level": 2},
+            {"password": user_b, "email": "b@y", "level": 0},
+        ],
+    });
+    let core = crate::inbound::parse_ss_inbound_config(&serde_json::to_vec(&settings).unwrap())
+        .expect("core parse");
+    let plugin = build_ss_plugin(&settings);
+    let crate::inbound::SsInboundMode::Ss2022Multi(core_in) = core else {
+        panic!("core 面应为 Ss2022Multi");
+    };
+    let SsFace::Ss2022Multi(plugin_in) = plugin.face().expect("built") else {
+        panic!("plugin 面应为 Ss2022Multi");
+    };
+    assert_eq!(plugin_in.kind(), core_in.kind());
+    assert!(plugin_in.server_psk() == core_in.server_psk(), "server PSK");
+    assert_eq!(plugin_in.users_count(), 2);
+    assert_eq!(plugin_in.users_count(), core_in.users_count());
+    // udp_user_table = (psk identity, psk) 有序表（配置序）：覆盖两用户 PSK 与
+    // identity 预计算；bool 比较（失败面不打印 PSK）。
+    assert!(plugin_in.udp_user_table() == core_in.udp_user_table(), "identity/PSK 表");
+}
+
+/// ss2022 中继（Go 形 `users[].address`）：两侧同判 relay，destination 的
+/// address/port 经行为探针逐字相等（两侧都走 `parse_address_str`）。
+#[tokio::test]
+async fn ss_parity_ss2022_relay_go_form() {
+    let (server, dest_key) = (b64_psk(0x11), b64_psk(0x22));
+    let settings = json!({
+        "method": "2022-blake3-aes-128-gcm",
+        "password": server.clone(),
+        "users": [{
+            "password": dest_key.clone(),
+            "email": "relay@y",
+            "level": 3,
+            "address": "10.0.0.7",
+            "port": 8388,
+        }],
+    });
+    let core = crate::inbound::parse_ss_inbound_config(&serde_json::to_vec(&settings).unwrap())
+        .expect("core parse");
+    let plugin = build_ss_plugin(&settings);
+    let crate::inbound::SsInboundMode::Ss2022Relay(core_relay) = core else {
+        panic!("core 面应为 Ss2022Relay");
+    };
+    let SsFace::Ss2022Relay(plugin_relay) = plugin.face().expect("built") else {
+        panic!("plugin 面应为 Ss2022Relay");
+    };
+    assert_eq!(core_relay.destinations_count(), 1);
+    assert_eq!(plugin_relay.destinations_count(), core_relay.destinations_count());
+    let kind = CipherKind2022::Aes128Gcm;
+    let core_target = relay_target(&core_relay, kind, &server, &dest_key).await;
+    assert_eq!(relay_target(plugin_relay, kind, &server, &dest_key).await, core_target);
+    let ip: std::net::Ipv4Addr = "10.0.0.7".parse().expect("ipv4");
+    assert_eq!(core_target, (Address::IPv4(ip), 8388));
+}
+
+/// 新登记已知差异（**只报告不修**，见 `reports/wsl-2026-10-25/parity-16.md`）：
+/// ss2022 中继 `destinations[]` **旧形**的 `server` 为 IP 字面量时——core 解析面
+/// 硬写 `Address::Domain`（`xray-core/src/inbound.rs` destinations 分支），插件面
+/// 走 `parse_address_str` → `Address::IPv4`。域名形态两侧一致（`users[].address`
+/// 的 Go 形分支见 `ss_parity_ss2022_relay_go_form`）。功能上等价（Domain(IP) 仍
+/// 解析到同一 IP），但按 domain 匹配的路由规则可能分叉。
+#[tokio::test]
+async fn ss_known_divergence_relay_destinations_address_typing() {
+    let (server, dest_key) = (b64_psk(0x11), b64_psk(0x22));
+    let settings = json!({
+        "method": "2022-blake3-aes-128-gcm",
+        "password": server.clone(),
+        "destinations": [{
+            "password": dest_key.clone(),
+            "email": "d@y",
+            "server": "10.0.0.7",
+            "server_port": 8388,
+        }],
+    });
+    let core = crate::inbound::parse_ss_inbound_config(&serde_json::to_vec(&settings).unwrap())
+        .expect("core parse");
+    let plugin = build_ss_plugin(&settings);
+    let crate::inbound::SsInboundMode::Ss2022Relay(core_relay) = core else {
+        panic!("core 面应为 Ss2022Relay");
+    };
+    let SsFace::Ss2022Relay(plugin_relay) = plugin.face().expect("built") else {
+        panic!("plugin 面应为 Ss2022Relay");
+    };
+    let kind = CipherKind2022::Aes128Gcm;
+    let core_target = relay_target(&core_relay, kind, &server, &dest_key).await;
+    let plugin_target = relay_target(plugin_relay, kind, &server, &dest_key).await;
+    let ip: std::net::Ipv4Addr = "10.0.0.7".parse().expect("ipv4");
+    assert_eq!(core_target, (Address::Domain("10.0.0.7".into()), 8388), "core 面域名包装");
+    assert_eq!(plugin_target, (Address::IPv4(ip), 8388), "插件面解析成 IPv4");
+}
+
+#[test]
+fn ss_parity_errors_fail_fast() {
+    // 三处硬错两侧同判（禁静默回落）：未知 cipher / 缺 password / ss2022 缺 server PSK。
+    for settings in [
+        json!({"method": "no-such-cipher", "password": "pw"}),
+        json!({"method": "aes-128-gcm"}),
+        json!({"method": "2022-blake3-aes-128-gcm"}),
+    ] {
+        let core = crate::inbound::parse_ss_inbound_config(&serde_json::to_vec(&settings).unwrap());
+        assert!(core.is_err(), "core 面应硬错: {settings}");
+        let plugin = Arc::new(SsPlugin::default());
+        let built = build_plugins_from_config(
+            &root_inbound_with("shadowsocks", settings.clone()),
+            &[Arc::clone(&plugin) as Arc<dyn Plugin>],
+        );
+        assert!(built.is_err(), "插件面应硬错: {settings}");
+    }
 }
 
 // ── dokodemo：入站全字段（core `parse_dokodemo_settings` ↔ DokodemoPlugin built_config）──
@@ -721,4 +976,85 @@ fn tuic_parity_inbound_full_fields() {
     assert_eq!(core.key_der, p.key_der);
     assert_eq!(core.congestion_control, p.congestion_control);
     assert_eq!(core.brutal_up_bps, p.brutal_up_bps);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 16 族覆盖出口（bd hw6w）：名称清单 + 总数断言。
+//
+// 表内每条 = 「族 → 该族的对拍用例名」；用例名即 cargo test 输出里的可 grep
+// 面。本表与实现同步由两条断言保证：族数 16、用例名总数与模块内对拍用例数
+// 一致（新增/删除用例而不更新本表 → 红）。
+// ═══════════════════════════════════════════════════════════════════════════
+
+const PARITY_FAMILIES: [(&str, &[&str]); 16] = [
+    (
+        "socks",
+        &[
+            "socks_parity_password_auth_full_fields",
+            "socks_parity_defaults_when_settings_empty",
+            "socks_parity_inbounds_layout_users_alias",
+        ],
+    ),
+    (
+        "freedom",
+        &[
+            "freedom_parity_strategy_override_and_final_rules",
+            "freedom_parity_target_strategy_priority",
+            "freedom_known_divergence_fragment_noises",
+        ],
+    ),
+    (
+        "blackhole",
+        &[
+            "blackhole_parity_http_response",
+            "blackhole_parity_custom_response_base64",
+            "blackhole_parity_missing_response_is_none",
+        ],
+    ),
+    ("vless", &["vless_parity_outbound_vnext_fields", "vless_parity_outbound_level_email"]),
+    ("vmess", &["vmess_parity_inbound_validator_users"]),
+    ("trojan", &["trojan_parity_inbound_validator_and_fallbacks"]),
+    ("http", &["http_parity_inbound_users_alias_transparent_level"]),
+    ("dns", &["dns_parity_outbound_rule_and_rewrite"]),
+    (
+        "hysteria",
+        &["hysteria_parity_outbound_flat_fields", "hysteria_parity_outbound_server_addr_port"],
+    ),
+    ("anytls", &["anytls_parity_outbound_password_and_server"]),
+    (
+        "wireguard",
+        &["wireguard_parity_inbound_device_fields", "wireguard_parity_inbound_port_settings_level"],
+    ),
+    ("loopback", &["loopback_parity_outbound_inbound_tag"]),
+    ("tun", &["tun_parity_inbound_stack_options_fields"]),
+    (
+        "ss",
+        &[
+            "ss_parity_legacy_single_user",
+            "ss_parity_legacy_multi_users_and_clients_alias",
+            "ss_parity_ss2022_single_user",
+            "ss_parity_ss2022_multi_users",
+            "ss_parity_ss2022_relay_go_form",
+            "ss_known_divergence_relay_destinations_address_typing",
+            "ss_parity_errors_fail_fast",
+        ],
+    ),
+    ("dokodemo", &["dokodemo_parity_inbound_full_fields"]),
+    ("tuic", &["tuic_parity_inbound_full_fields"]),
+];
+
+#[test]
+fn parity_roster_covers_all_16_families() {
+    assert_eq!(PARITY_FAMILIES.len(), 16, "16 族全覆盖");
+    let mut families = std::collections::BTreeSet::new();
+    let mut cases = Vec::new();
+    for (family, tests) in PARITY_FAMILIES {
+        assert!(families.insert(family), "{family} 重复登记");
+        assert!(!tests.is_empty(), "{family} 缺对拍用例");
+        cases.extend_from_slice(tests);
+    }
+    let unique: std::collections::BTreeSet<_> = cases.iter().copied().collect();
+    assert_eq!(unique.len(), cases.len(), "用例名重复登记");
+    // 族内用例总数（本表外的 2 个 #[test]：缺段 fail-fast 反向控制 + 本表自身）。
+    assert_eq!(unique.len(), 31, "16 族对拍用例总数");
 }

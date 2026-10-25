@@ -1028,7 +1028,7 @@ mod tests {
     async fn multi_chunk_split_roundtrip() {
         let (mut client, mut server) = roundtrip_pair(CipherType::Aes128Gcm).await;
 
-        let reader = tokio::spawn(async move {
+        let reader = xray_common::testing::spawn("multi-chunk-split-roundtrip", async move {
             let mut received = Vec::new();
             for _ in 0..3 {
                 let chunk = server.read_chunk().await.expect("read").expect("chunk");

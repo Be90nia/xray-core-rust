@@ -10,7 +10,7 @@
 //! ```
 
 #![cfg(test)]
-#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros))] // 测试脚手架：spawn 起停被测服务/回环 echo、直印进度；非生产托管面
+#![cfg_attr(test, allow(clippy::disallowed_macros))] // 测试脚手架：直印进度；spawn 走 xray_common::testing（L3 闸不豁免）
 use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
@@ -27,7 +27,7 @@ use xray_proxy_tuic::{
 async fn start_udp_echo_server() -> SocketAddr {
     let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp echo");
     let addr = sock.local_addr().expect("local_addr");
-    tokio::spawn(async move {
+    xray_common::testing::spawn("tuic-udp-echo-server", async move {
         let mut buf = vec![0u8; 64 * 1024];
         while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
             if sock.send_to(&buf[..n], peer).await.is_err() {
@@ -66,7 +66,7 @@ async fn udp_loopback_echo_works() {
     .await
     .expect("mock server bind");
     let server_addr = server.local_addr();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("tuic-server", async move {
         let _ = server.run().await;
     });
 
@@ -121,7 +121,7 @@ async fn udp_loopback_multiple_packets() {
     .await
     .expect("mock server bind");
     let server_addr = server.local_addr();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("tuic-server", async move {
         let _ = server.run().await;
     });
 

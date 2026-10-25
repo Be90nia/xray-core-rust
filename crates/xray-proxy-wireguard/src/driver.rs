@@ -972,7 +972,10 @@ mod tests {
         let server_ns = Arc::new(AsyncMutex::new(WgNetStack::new(&[v4_cidr(10, 0, 0, 1)], 1420)));
         let server =
             Arc::new(WgDriver::new(server_peer, server_sock, server_ns).with_num_workers(2));
-        tokio::spawn(Arc::clone(&server).main_loop());
+        xray_common::testing::spawn(
+            "driver-pair-handshake-with-multiple-workers",
+            Arc::clone(&server).main_loop(),
+        );
 
         let client_cfg = DeviceConfig {
             secret_key: sec_c,
@@ -990,7 +993,10 @@ mod tests {
         let client =
             Arc::new(WgDriver::new(client_peer, client_sock, client_ns).with_num_workers(2));
         client.set_remote(server_addr);
-        tokio::spawn(Arc::clone(&client).main_loop());
+        xray_common::testing::spawn(
+            "driver-pair-handshake-with-multiple-workers",
+            Arc::clone(&client).main_loop(),
+        );
 
         // 触发握手：client netstack UDP socket 发往 10.0.0.1:53 → tx →
         // timer encapsulate 产生 handshake init（tunnel.rs setup_handshake 模式）

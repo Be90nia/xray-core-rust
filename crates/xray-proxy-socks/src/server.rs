@@ -572,10 +572,11 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let config = ServerConfig::default();
 
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            socks5_server_handshake(&mut sock, &config).await
-        });
+        let server =
+            xray_common::testing::spawn("handshake-noauth-ipv4-succeeds-accept", async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                socks5_server_handshake(&mut sock, &config).await
+            });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
         socks5_client_noauth_connect(&mut client, "1.2.3.4:80").await.unwrap();
@@ -601,10 +602,11 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let config = ServerConfig::default();
 
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            socks5_server_handshake(&mut sock, &config).await
-        });
+        let server =
+            xray_common::testing::spawn("handshake-noauth-domain-succeeds-accept", async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                socks5_server_handshake(&mut sock, &config).await
+            });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
         socks5_client_noauth_connect(&mut client, "example.com:443").await.unwrap();
@@ -630,10 +632,11 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let config = ServerConfig::default();
 
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            socks5_server_handshake(&mut sock, &config).await
-        });
+        let server =
+            xray_common::testing::spawn("handshake-wrong-version-rejected-accept", async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                socks5_server_handshake(&mut sock, &config).await
+            });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
         // 发 [VER=4 (SOCKS4), NMETHODS=1, NoAuth]
@@ -649,10 +652,11 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let config = ServerConfig::default();
 
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            socks5_server_handshake(&mut sock, &config).await
-        });
+        let server =
+            xray_common::testing::spawn("handshake-unsupported-cmd-rejected-accept", async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                socks5_server_handshake(&mut sock, &config).await
+            });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
         // NoAuth
@@ -722,10 +726,13 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let config = ServerConfig { udp_enabled: true, ..Default::default() };
 
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            socks5_server_handshake(&mut sock, &config).await
-        });
+        let server = xray_common::testing::spawn(
+            "handshake-udp-associate-returns-relay-addr-accept",
+            async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                socks5_server_handshake(&mut sock, &config).await
+            },
+        );
 
         let mut client = TcpStream::connect(addr).await.unwrap();
         // NoAuth negotiation
@@ -784,10 +791,13 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let config = ServerConfig::default();
 
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            socks_handshake(&mut sock, &config).await
-        });
+        let server = xray_common::testing::spawn(
+            "socks4-handshake-ipv4-connect-succeeds-accept",
+            async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                socks_handshake(&mut sock, &config).await
+            },
+        );
 
         let mut client = TcpStream::connect(addr).await.unwrap();
         socks4_client_connect(&mut client, [1, 2, 3, 4], 8080, "").await;
@@ -817,10 +827,13 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let config = ServerConfig::default();
 
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            socks_handshake(&mut sock, &config).await
-        });
+        let server = xray_common::testing::spawn(
+            "socks4a-handshake-domain-connect-succeeds-accept",
+            async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                socks_handshake(&mut sock, &config).await
+            },
+        );
 
         let mut client = TcpStream::connect(addr).await.unwrap();
         // SOCKS4a: DSTIP = 0.0.0.1 标记域名模式
@@ -856,10 +869,13 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let config = ServerConfig::default();
-            let server = tokio::spawn(async move {
-                let (mut sock, _) = listener.accept().await.unwrap();
-                socks_handshake(&mut sock, &config).await
-            });
+            let server = xray_common::testing::spawn(
+                "socks-handshake-routes-socks5-and-socks4-accept",
+                async move {
+                    let (mut sock, _) = listener.accept().await.unwrap();
+                    socks_handshake(&mut sock, &config).await
+                },
+            );
             let mut client = TcpStream::connect(addr).await.unwrap();
             socks5_client_noauth_connect(&mut client, "5.6.7.8:9999").await.unwrap();
             let r = server.await.unwrap().unwrap();
@@ -870,10 +886,13 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let config = ServerConfig::default();
-            let server = tokio::spawn(async move {
-                let (mut sock, _) = listener.accept().await.unwrap();
-                socks_handshake(&mut sock, &config).await
-            });
+            let server = xray_common::testing::spawn(
+                "socks-handshake-routes-socks5-and-socks4-accept",
+                async move {
+                    let (mut sock, _) = listener.accept().await.unwrap();
+                    socks_handshake(&mut sock, &config).await
+                },
+            );
             let mut client = TcpStream::connect(addr).await.unwrap();
             socks4_client_connect(&mut client, [9, 9, 9, 9], 53, "user").await;
             let mut reply = [0u8; 8];
@@ -901,10 +920,13 @@ mod tests {
         let mut config = ServerConfig { auth_type: AuthType::Password, ..Default::default() };
         config.accounts.insert("u".into(), "p".into());
 
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            socks5_server_handshake(&mut sock, &config).await
-        });
+        let server = xray_common::testing::spawn(
+            "handshake-noauth-method-rejected-when-password-confi-accept",
+            async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                socks5_server_handshake(&mut sock, &config).await
+            },
+        );
 
         let mut client = TcpStream::connect(addr).await.unwrap();
         // 客户端只声明 NoAuth（0x00）——配置密码时必须回 0xFF 拒绝
@@ -929,10 +951,13 @@ mod tests {
         let mut config = ServerConfig { auth_type: AuthType::Password, ..Default::default() };
         config.accounts.insert("u".into(), "p".into());
 
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            socks5_server_handshake(&mut sock, &config).await
-        });
+        let server = xray_common::testing::spawn(
+            "handshake-password-auth-still-succeeds-when-configur-accept",
+            async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                socks5_server_handshake(&mut sock, &config).await
+            },
+        );
 
         let mut client = TcpStream::connect(addr).await.unwrap();
         client.write_all(&[SOCKS5_VERSION, 1, AUTH_PASSWORD]).await.unwrap();
@@ -963,14 +988,17 @@ mod tests {
         let mut config = ServerConfig { auth_type: AuthType::Password, ..Default::default() };
         config.accounts.insert("u".into(), "p".into());
 
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let r = socks_handshake(&mut sock, &config).await;
-            // 拒绝后服务端仍有未读请求字节，立即 drop 会发 RST 吞掉在途拒绝帧——
-            // 留时间让客户端读完（Windows loopback RST 竞态，见 v49 教训）
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            r
-        });
+        let server = xray_common::testing::spawn(
+            "socks4-rejected-when-password-configured-accept",
+            async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let r = socks_handshake(&mut sock, &config).await;
+                // 拒绝后服务端仍有未读请求字节，立即 drop 会发 RST 吞掉在途拒绝帧——
+                // 留时间让客户端读完（Windows loopback RST 竞态，见 v49 教训）
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                r
+            },
+        );
 
         let mut client = TcpStream::connect(addr).await.unwrap();
         socks4_client_connect(&mut client, [1, 2, 3, 4], 8080, "u").await;
@@ -988,14 +1016,17 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let config = ServerConfig::default(); // udp_enabled: false（默认）
 
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let r = socks5_server_handshake(&mut sock, &config).await;
-            // 拒绝后服务端仍有未读地址字节，立即 drop 会发 RST 吞掉在途拒绝帧——
-            // 留时间让客户端读完（Windows loopback RST 竞态，见 v49 教训）
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            r
-        });
+        let server = xray_common::testing::spawn(
+            "udp-associate-rejected-when-udp-disabled-accept",
+            async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let r = socks5_server_handshake(&mut sock, &config).await;
+                // 拒绝后服务端仍有未读地址字节，立即 drop 会发 RST 吞掉在途拒绝帧——
+                // 留时间让客户端读完（Windows loopback RST 竞态，见 v49 教训）
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                r
+            },
+        );
 
         let mut client = TcpStream::connect(addr).await.unwrap();
         client.write_all(&[SOCKS5_VERSION, 1, AUTH_NOT_REQUIRED]).await.unwrap();
@@ -1038,10 +1069,13 @@ mod tests {
             ..Default::default()
         };
 
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            socks5_server_handshake(&mut sock, &config).await
-        });
+        let server = xray_common::testing::spawn(
+            "udp-associate-binds-configured-address-accept",
+            async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                socks5_server_handshake(&mut sock, &config).await
+            },
+        );
 
         let mut client = TcpStream::connect(addr).await.unwrap();
         client.write_all(&[SOCKS5_VERSION, 1, AUTH_NOT_REQUIRED]).await.unwrap();

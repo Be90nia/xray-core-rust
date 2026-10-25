@@ -121,6 +121,7 @@ mod tests {
         let handles: Vec<_> = (0..8)
             .map(|i| {
                 let c = c.clone();
+                #[allow(clippy::disallowed_methods, reason = "测试脚手架 OS 线程（thread_safe_concurrent_submit）；无 PluginContext 可穿，按 clippy.toml 指引逐处登记")]
                 thread::spawn(move || {
                     c.submit(format!("err{i}"));
                 })

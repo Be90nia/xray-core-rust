@@ -284,6 +284,17 @@ fn p7lm_trace_enabled(raw: Option<&str>) -> bool {
     }
 }
 
+/// 开关进程级缓存：env 只在首次桥接时解析一次，之后每连接/每批只读 `bool`
+/// （`env::var` 每调用一次都查进程环境表，桥接泵属数据面热路径）。首值即
+/// 定案，进程运行中改 env 不生效——trace 开关不承诺运行期热切换。
+static P7LM_TRACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    p7lm_trace_enabled(std::env::var("XRAY_P7LM_TRACE").ok().as_deref())
+});
+
+fn p7lm_trace() -> bool {
+    *P7LM_TRACE
+}
+
 /// 双向桥接 dispatcher [`Link`] 与 AsyncRead+AsyncWrite stream。
 ///
 /// 与 [`bridge_link_with_stream`] 区别：两个方向独立运行到都完成，任一方向
@@ -317,7 +328,7 @@ where
     let uplink_only = policy.uplink_only;
     let downlink_only = policy.downlink_only;
     // bd 7p1m 专项埋点：XRAY_P7LM_TRACE=1 时逐批输出读/写字节数（warn 级穿透 loglevel）。
-    let p7lm_trace = p7lm_trace_enabled(std::env::var("XRAY_P7LM_TRACE").ok().as_deref());
+    let p7lm_trace = p7lm_trace();
 
     let Link { mut reader, mut writer } = link;
     // tokio::io::split（out_f1 33Mbps 实证拓扑，无锁）。自研 BiLock 轮转锁在
@@ -775,6 +786,16 @@ mod tests {
         for on in ["1", "true", "enable", "yes"] {
             assert!(p7lm_trace_enabled(Some(on)), "{on:?} 必须视为开启");
         }
+    }
+
+    /// 缓存口（p7lm_trace → LazyLock）与直解口必须同判——缓存初始化走的解析
+    /// 与纯函数语义若有分叉（如缓存侧单独改了解析），此断言红。
+    #[test]
+    fn p7lm_trace_cached_matches_direct_parse() {
+        assert_eq!(
+            p7lm_trace(),
+            p7lm_trace_enabled(std::env::var("XRAY_P7LM_TRACE").ok().as_deref())
+        );
     }
 
     /// 创建两对 loopback TCP 连接：(client_a ↔ server_a) 和 (client_b ↔ server_b)。

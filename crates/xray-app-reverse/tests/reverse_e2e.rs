@@ -11,7 +11,6 @@
 //! 验证完整 bridge+dispatcher wiring + yamux echo 双端（覆盖现有 relay 单测之外的
 //! 切片3真实装配：LinkDispatch + Ohm + Bridge/Portal 端到端）。
 
-#![allow(clippy::disallowed_methods)]
 // T3.1b：e2e mock 拓扑裸 spawn（echo server/portal accept 循环）自管 runtime，测试环境无
 // FxScope；生产禁令不受影响
 #![cfg(test)]
@@ -34,12 +33,12 @@ use xray_common::net::{address::Address, destination::Destination, network::Netw
 async fn start_echo_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("reverse-echo-accept-loop", async move {
         loop {
             let Ok((mut sock, _)) = listener.accept().await else {
                 break;
             };
-            tokio::spawn(async move {
+            xray_common::testing::spawn("reverse-echo-conn", async move {
                 let mut buf = vec![0u8; 4096];
                 loop {
                     match sock.read(&mut buf).await {
@@ -111,7 +110,7 @@ async fn reverse_yamux_bridge_to_portal_echo_full_chain() {
     //    echo。
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let portal_addr = listener.local_addr().unwrap();
-    let _portal_task = tokio::spawn(async move {
+    let _portal_task = xray_common::testing::spawn("reverse-portal", async move {
         let (tcp, _) = match listener.accept().await {
             Ok(v) => v,
             Err(_) => return,
@@ -124,7 +123,7 @@ async fn reverse_yamux_bridge_to_portal_echo_full_chain() {
                 Some(Err(_)) | None => break,
             };
             let mut stream = stream.compat();
-            tokio::spawn(async move {
+            xray_common::testing::spawn("reverse-bridge-conn", async move {
                 let mut buf = vec![0u8; 4096];
                 loop {
                     match stream.read(&mut buf).await {

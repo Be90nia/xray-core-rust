@@ -6,7 +6,8 @@
 //! 平台支持：
 //! - **Linux/macOS/FreeBSD**：`build_async()` 真机创建设备（需 root/CAP_NET_ADMIN）
 //! - **Windows**：动态加载 `wintun.dll`，未安装则 `build_async()` 返 `DeviceCreateFailed`
-//! - **fd 继承**：env `xray.tun.fd`/`XRAY_TUN_FD` 给了已开 TUN fd 时走 [`crate::tun_fd`]。
+//! - **fd 继承**：env `xray.tun.fd`/`XRAY_TUN_FD` 给了已开 TUN fd 时走 [`crate::tun_fd`]。 带
+//!   `IFF_VNET_HDR` 的继承 fd 由本层剥头/垫头（bd y93up），语义对齐 Go。
 //! - fd 继承仅 Linux 支持；其他平台设置该 env 即显式报错，不回退直开。
 
 use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
@@ -71,6 +72,10 @@ pub struct TunDevice {
     dev: AsyncDevice,
     name: String,
     mtu: u16,
+    /// 继承 fd 携带 `IFF_VNET_HDR`（bd y93up）：读写路径在本层剥头/垫头。
+    /// 直开设备恒 false——vnet 面由 tun-rs 内部处理，两层互不相干。
+    #[cfg(target_os = "linux")]
+    vnet_hdr: bool,
     /// 票 0qef：`send`/`send_batch` 垫头缓冲池（仅 Linux 批量路径使用）。
     #[cfg(target_os = "linux")]
     send_free: parking_lot::Mutex<hdr_free_list::HdrFreeList>,
@@ -135,6 +140,8 @@ impl TunDevice {
             name: name_str,
             mtu,
             #[cfg(target_os = "linux")]
+            vnet_hdr: false,
+            #[cfg(target_os = "linux")]
             send_free: parking_lot::Mutex::new(hdr_free_list::HdrFreeList::new(VIRTIO_NET_HDR_LEN)),
         })
     }
@@ -149,10 +156,15 @@ impl TunDevice {
         let Some(inherited) = crate::tun_fd::inherit_from_env(expected_name)? else {
             return Ok(None);
         };
+        if inherited.vnet_hdr {
+            // 掩码是设备级残留状态：前主进程协商过 offload 时不清零，继承读
+            // 路径会收到内核 GRO 聚合大包并被单包读读坏。失败即报错。
+            crate::tun_fd::clear_offload(inherited.fd)?;
+        }
         // SAFETY: fd 已由 tun_fd::inherit_from_env 校验为 IFF_TUN|IFF_NO_PI 的 TUN
         // 设备并置非阻塞；所有权自此移交 AsyncDevice（Drop 关闭，宿主不再持有）。
-        // vnet_hdr 面：tun-rs `from_fd` 硬编码 vnet_hdr=false，带 IFF_VNET_HDR 的
-        // fd 已在 tun_fd 里显式拒绝（见该模块文档的窄化说明）。
+        // vnet_hdr 面（bd y93up）：tun-rs `from_fd` 把设备记成裸包模式，带
+        // IFF_VNET_HDR 的 fd 由本层剥头/垫头（见 recv/send 系方法），语义对齐 Go。
         let dev = unsafe { tun_rs::AsyncDevice::from_fd(inherited.fd) }.map_err(|e| {
             TunError::DeviceCreateFailed(format!(
                 "xray.tun.fd: adopt fd {} failed: {e}",
@@ -163,6 +175,7 @@ impl TunDevice {
             dev,
             name: inherited.name,
             mtu,
+            vnet_hdr: inherited.vnet_hdr,
             send_free: parking_lot::Mutex::new(hdr_free_list::HdrFreeList::new(VIRTIO_NET_HDR_LEN)),
         }))
     }
@@ -170,8 +183,20 @@ impl TunDevice {
     /// 异步读 IP 包到 buf。返回读取字节数。
     ///
     /// 0 表示设备关闭。
+    ///
+    /// # 平台语义（bd y93up 标注）
+    /// 继承 vnet fd：剥除内核附着的 virtio 头，返回纯 IP 包；直开设备与
+    /// 其余平台行为不变。
     pub async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.dev.recv(buf).await
+        #[cfg(target_os = "linux")]
+        {
+            let n = self.dev.recv(buf).await?;
+            self.strip_vnet(buf, n)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.dev.recv(buf).await
+        }
     }
 
     /// 非阻塞读 IP 包。空队列时返回 `Err(WouldBlock)`。
@@ -179,17 +204,29 @@ impl TunDevice {
     /// 对应 Go `tun_windows.go::ReadPacket`（249-270，`ERROR_NO_MORE_ITEMS → ErrQueueEmpty`）。
     ///
     /// # 平台语义（iq1o⑧ 标注）
-    /// Linux（vnet_hdr 已协商）单包读返回**带 12 字节 virtio 头前缀**的原始
+    /// Linux（vnet_hdr 已协商）单包读返回**带 VIRTIO_NET_HDR_LEN（实测 10，
+    /// tun-rs 文档误标 12）字节 virtio 头前缀**的原始
     /// 数据（其余平台为纯 IP 包）——生产收包路径走 `recv_batch`（内部按段
     /// 拆包），不应依赖本 API 的 Linux 返回布局。
+    /// 继承 vnet fd 例外（bd y93up）：本层剥头，返回纯 IP 包（见 [`Self::recv`]）。
     pub fn try_recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.dev.try_recv(buf)
+        #[cfg(target_os = "linux")]
+        {
+            let n = self.dev.try_recv(buf)?;
+            self.strip_vnet(buf, n)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.dev.try_recv(buf)
+        }
     }
 
     /// 异步发送 IP 包。
     ///
     /// Linux（vnet_hdr 已开）：自动垫 virtio 头后走批量写路径——内核按带
-    /// vnet 头解析写入数据，裸写会把前 12 字节当头吞掉。其余平台为裸 write。
+    /// vnet 头解析写入数据，裸写会把包头前 VIRTIO_NET_HDR_LEN 字节当头吞掉。
+    /// 其余平台为裸 write。
+    /// 继承 vnet fd（bd y93up）：同样垫头，且 offset=0 让内核从头解析垫头。
     pub async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
         #[cfg(target_os = "linux")]
         {
@@ -198,7 +235,10 @@ impl TunDevice {
             // 两分支语义（与 send_batch 同路径）。
             let mut pkt = [self.send_free.lock().pack(buf)];
             let mut gro = GROTable::default();
-            let sent = self.dev.send_multiple(&mut gro, &mut pkt, VIRTIO_NET_HDR_LEN).await;
+            // 垫头已在 buf 头部：继承 vnet fd 从头写（内核解析垫头）；直开设备
+            // 的垫头空间归 tun-rs GRO 写头，从垫头之后写。
+            let off = if self.vnet_hdr { 0 } else { VIRTIO_NET_HDR_LEN };
+            let sent = self.dev.send_multiple(&mut gro, &mut pkt, off).await;
             self.send_free.lock().recycle(pkt);
             sent
         }
@@ -214,9 +254,41 @@ impl TunDevice {
     ///
     /// # 平台语义（iq1o⑧ 标注）
     /// Linux（vnet_hdr 已协商）下本 API **不自动垫 virtio 头**——裸写会被内核
-    /// 把前 12 字节当 vnet 头吞掉；生产发包路径走 `send`/`send_batch`（自动垫头）。
+    /// 把包头前 VIRTIO_NET_HDR_LEN 字节当 vnet 头吞掉；生产发包路径走
+    /// `send`/`send_batch`（自动垫头）。
+    /// 继承 vnet fd 例外（bd y93up）：本层垫头后写（内核按带 vnet 头解析）。
     pub fn try_send(&self, buf: &[u8]) -> std::io::Result<usize> {
-        self.dev.try_send(buf)
+        #[cfg(target_os = "linux")]
+        {
+            if !self.vnet_hdr {
+                return self.dev.try_send(buf);
+            }
+            let padded = self.send_free.lock().pack(buf);
+            self.dev.try_send(&padded)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.dev.try_send(buf)
+        }
+    }
+
+    /// 继承 vnet fd（bd y93up）：剥除内核附着的每包 virtio 头，包数据原地前移。
+    ///
+    /// offload mask 已在接管时清零 → 头恒为全零 GSO_NONE，无需解字段；读出
+    /// 长度 `<= VIRTIO_NET_HDR_LEN` 视为协议错误（对齐 tun-rs recv_multiple
+    /// 的同类检查）；`n == 0`（设备关闭语义）原样放行。
+    #[cfg(target_os = "linux")]
+    fn strip_vnet(&self, buf: &mut [u8], n: usize) -> std::io::Result<usize> {
+        if n == 0 || !self.vnet_hdr {
+            return Ok(n);
+        }
+        if n <= VIRTIO_NET_HDR_LEN {
+            return Err(std::io::Error::other(format!(
+                "tun vnet packet {n} bytes <= virtio header {VIRTIO_NET_HDR_LEN}"
+            )));
+        }
+        buf.copy_within(VIRTIO_NET_HDR_LEN..n, 0);
+        Ok(n - VIRTIO_NET_HDR_LEN)
     }
 
     /// 设备 MTU（Linux 批量读侧按此分配拆分段缓冲）。
@@ -226,6 +298,8 @@ impl TunDevice {
 
     /// Linux 批量读：一次 syscall 读出内核 GRO 聚合大包并拆成 ≤MTU 的段，
     /// 返回实际包数；vnet_hdr 未协商时 tun-rs 内部退化为单包读（返回 0 或 1）。
+    /// 继承 vnet fd（bd y93up）：单包读出 `[virtio 头|IP 包]`，本层剥头后包
+    /// 数据回到 `bufs[0][..sizes[0]]`。
     ///
     /// - `original_buffer`：GSO 聚合包落点，建议 `VIRTIO_NET_HDR_LEN + 65535`
     /// - `bufs`/`sizes`：等长；`bufs[i]` ≥ MTU，包数据写入 `bufs[i][..sizes[i]]`
@@ -236,7 +310,11 @@ impl TunDevice {
         bufs: &mut [Vec<u8>],
         sizes: &mut [usize],
     ) -> std::io::Result<usize> {
-        self.dev.recv_multiple(original_buffer, bufs, sizes, 0).await
+        let n = self.dev.recv_multiple(original_buffer, bufs, sizes, 0).await?;
+        if self.vnet_hdr && n == 1 {
+            sizes[0] = self.strip_vnet(&mut bufs[0], sizes[0])?;
+        }
+        Ok(n)
     }
 
     /// Linux 批量写：GRO 合并同流 TCP/UDP 小包后尽量少的 write 次数发出；
@@ -256,10 +334,12 @@ impl TunDevice {
             return Ok(0);
         }
         // vnet_hdr 布局：每包前垫 VIRTIO_NET_HDR_LEN 字节供 GRO 写头；
-        // offset=VIRTIO_NET_HDR_LEN 在 vnet 开/关两个分支下语义均正确。
+        // offset=VIRTIO_NET_HDR_LEN 在 vnet 开/关两个分支下语义均正确；
+        // 继承 vnet fd（bd y93up）从头写，让内核解析垫头。
         // ponytail: GROTable 每批现造（3 个小 Vec 分配），profile 说贵再复用
         let mut gro = GROTable::default();
-        let sent = self.dev.send_multiple(&mut gro, &mut bufs, VIRTIO_NET_HDR_LEN).await;
+        let off = if self.vnet_hdr { 0 } else { VIRTIO_NET_HDR_LEN };
+        let sent = self.dev.send_multiple(&mut gro, &mut bufs, off).await;
         self.send_free.lock().recycle(bufs);
         sent
     }
@@ -438,7 +518,7 @@ mod trait_tests {
 mod free_list_tests {
     use super::hdr_free_list::{HDR_FREE_MAX, HdrFreeList};
 
-    const HDR: usize = 12; // == Linux VIRTIO_NET_HDR_LEN，平台无关测试用字面值
+    const HDR: usize = 10; // == tun_rs::VIRTIO_NET_HDR_LEN 实测值（其文档误标 12）
 
     #[test]
     fn pack_writes_zero_header_then_payload() {
@@ -485,5 +565,253 @@ mod free_list_tests {
         assert_eq!(b.len(), HDR + 1400);
         assert!(b[..HDR].iter().all(|&x| x == 0), "复用后头区必须清零");
         assert_eq!(&b[HDR..], &[1u8; 1400][..]);
+    }
+}
+
+/// Linux 真机继承测试（bd y93up）：`/dev/net/tun` 自建 virtual TUN（带/不带
+/// `IFF_VNET_HDR` 两种），fd 经 env 走继承路径，用内核路由做双向 UDP 流量：
+/// - 内核 → 设备：UDP socket 发包路由出 TUN，断言继承路径读到逐字节对齐的 纯 IP 包（vnet
+///   时证明剥头正确）；
+/// - 设备 → 内核：`send` 注入定向回包，本地 UDP socket 完整收到即证明垫头 长度与包完整性正确（垫错
+///   → 内核解析出坏包头 → 丢包超时）。
+///
+/// 需要 root/CAP_NET_ADMIN + iproute2；无权限/无 `/dev/net/tun` 环境跳过。
+#[cfg(all(test, target_os = "linux"))]
+#[allow(clippy::unwrap_used)]
+#[allow(clippy::print_stderr)] // TUN 无权限环境 skip 探针（对齐既有真机测试）
+mod inherit_vnet_tests {
+    use std::{
+        ffi::{c_int, c_ulong},
+        net::{Ipv4Addr, SocketAddr},
+        os::fd::AsRawFd,
+        process::Command,
+        time::Duration,
+    };
+
+    use super::*;
+    use crate::tun_fd::TUN_FD_KEYS;
+
+    // 与 tun_fd::linux 同款手写 ioctl（测试自建 TUN 设备用）。
+    const TUNSETIFF: c_ulong = 0x4004_54ca; // _IOW('T', 202, int)
+    const IFF_TUN: u16 = 0x0001;
+    const IFF_NO_PI: u16 = 0x1000;
+    const IFF_VNET_HDR: u16 = 0x4000;
+
+    #[repr(C)]
+    union IfReqUnion {
+        flags: u16,
+        _align: [u64; 3],
+    }
+    #[repr(C)]
+    struct IfReq {
+        name: [u8; 16],
+        union: IfReqUnion,
+    }
+    // 内核按 sizeof(struct ifreq) = 40 拷贝；布局漂移即 ioctl 越界写。
+    const _: () = assert!(std::mem::size_of::<IfReq>() == 40);
+
+    unsafe extern "C" {
+        fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+    }
+
+    /// 自建 TUN 设备，返回（控制 fd，接口名）。vnet 旗标的生效性就地断言。
+    fn open_tun_dev(vnet: bool) -> std::io::Result<(std::fs::File, String)> {
+        let ctrl = std::fs::OpenOptions::new().read(true).write(true).open("/dev/net/tun")?;
+        let name = format!("xryvt{}{}", std::process::id() % 100_000, u8::from(vnet));
+        let mut req = IfReq { name: [0; 16], union: IfReqUnion { _align: [0; 3] } };
+        req.name[..name.len()].copy_from_slice(name.as_bytes());
+        // SAFETY: req 为 40 字节 ifreq（上方 assert 钉死布局）；fd 是刚打开的
+        // tun 控制设备，TUNSETIFF 按内核 ifreq 约定读 ifr_flags、读写
+        // ifr_name，不越过 req 边界。
+        let rc = unsafe {
+            req.union.flags = IFF_TUN | IFF_NO_PI | if vnet { IFF_VNET_HDR } else { 0 };
+            ioctl(ctrl.as_raw_fd(), TUNSETIFF, &mut req as *mut IfReq)
+        };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // 内核回写生效旗标：vnet 请求必须如实落盘（「有 vnet_hdr」情形的前提）。
+        let eff = unsafe { req.union.flags };
+        assert_eq!(eff & IFF_VNET_HDR != 0, vnet, "TUNSETIFF vnet 旗标未生效");
+        assert_eq!(
+            String::from_utf8_lossy(&req.name).trim_end_matches('\0'),
+            name.as_str(),
+            "内核未使用请求的接口名"
+        );
+        Ok((ctrl, name))
+    }
+
+    /// 配接口地址并拉起；false = 缺 iproute2/权限 → 上层跳过。
+    fn config_iface(name: &str, cidr: &str) -> bool {
+        let run = |args: &[&str]| {
+            Command::new("ip").args(args).status().map(|s| s.success()).unwrap_or(false)
+        };
+        run(&["addr", "add", cidr, "dev", name]) && run(&["link", "set", name, "up"])
+    }
+
+    /// RFC 1071 16 位反码和（已取反）。
+    fn csum16(data: &[u8]) -> u16 {
+        let mut sum = 0u32;
+        let mut i = 0;
+        while i + 1 < data.len() {
+            sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < data.len() {
+            sum += u16::from_be_bytes([data[i], 0]) as u32;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    /// 构造 UDP-over-IPv4 完整包（IP/UDP 校验和均实算——内核本地投递要验）。
+    fn udp_ip_packet(
+        src: Ipv4Addr,
+        sport: u16,
+        dst: Ipv4Addr,
+        dport: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let udp_len = 8 + payload.len() as u16;
+        let mut pkt = vec![0u8; 20 + udp_len as usize];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&(20 + udp_len).to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 17;
+        pkt[12..16].copy_from_slice(&src.octets());
+        pkt[16..20].copy_from_slice(&dst.octets());
+        let ip_csum = csum16(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+        let u = 20;
+        pkt[u..u + 2].copy_from_slice(&sport.to_be_bytes());
+        pkt[u + 2..u + 4].copy_from_slice(&dport.to_be_bytes());
+        pkt[u + 4..u + 6].copy_from_slice(&udp_len.to_be_bytes());
+        pkt[u + 8..].copy_from_slice(payload);
+        let mut pseudo = Vec::with_capacity(12 + udp_len as usize);
+        pseudo.extend_from_slice(&src.octets());
+        pseudo.extend_from_slice(&dst.octets());
+        pseudo.extend_from_slice(&[0, 17]);
+        pseudo.extend_from_slice(&udp_len.to_be_bytes());
+        pseudo.extend_from_slice(&pkt[u..]);
+        let uc = csum16(&pseudo);
+        pkt[u + 6..u + 8].copy_from_slice(&uc.to_be_bytes());
+        pkt
+    }
+
+    /// 内核在 link up 时会经 TUN 发出 ICMPv6 RS/NS/MLD（首字节 0x60）——滤掉，
+    /// 等到我们的 IPv4 UDP 包；整段共享 5s 截止。
+    async fn recv_until_ipv4(dev: &TunDevice, buf: &mut [u8]) -> usize {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let n = tokio::time::timeout_at(deadline, dev.recv(buf))
+                .await
+                .expect("timeout waiting for routed IPv4 packet（路由或剥头坏？）")
+                .expect("recv");
+            if n >= 20 && buf[0] >> 4 == 4 {
+                return n;
+            }
+            // 内核 IPv6 邻居发现噪声，丢弃继续等。
+        }
+    }
+
+    async fn inherit_roundtrip(vnet: bool) {
+        // 子网按 pid + 分支唯一化：与并行测试/既有真机测试互不串扰。
+        let o2 = (std::process::id() % 200 + 3) as u8;
+        let o3: u8 = if vnet { 41 } else { 43 };
+        let tun_ip = Ipv4Addr::new(10, o2, o3, 1);
+        let peer_ip = Ipv4Addr::new(10, o2, o3, 2);
+
+        let (tun_file, name) = match open_tun_dev(vnet) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("SKIP: /dev/net/tun unavailable: {e}");
+                return;
+            },
+        };
+        if !config_iface(&name, &format!("{tun_ip}/24")) {
+            eprintln!("SKIP: iproute2 unavailable or lacking CAP_NET_ADMIN");
+            return;
+        }
+
+        // env → 接管：窗口持 tun_fd 的 env 锁，锁内不得 await。
+        let guard = crate::tun_fd::tests::lock_env();
+        // SAFETY（edition 2024 set_var 为 unsafe）：测试进程内单键独占（持锁）。
+        unsafe { std::env::set_var(TUN_FD_KEYS[0], tun_file.as_raw_fd().to_string()) };
+        let dev = TunDevice::create(&name, &tun_ip.to_string(), 24, 1500)
+            .expect("继承 fd 必须被接管（bd y93up）");
+        unsafe { std::env::remove_var(TUN_FD_KEYS[0]) };
+        drop(guard);
+        // fd 所有权已移交 AsyncDevice（Drop 关闭）：测试侧 File 退出时不得重复关。
+        std::mem::forget(tun_file);
+
+        assert_eq!(dev.name().unwrap(), name, "接管后设备名必须一致");
+
+        let payload: &[u8] = if vnet { b"y93up-vnet-roundtrip" } else { b"y93up-raw-roundtrip" };
+        let expect_len = 20 + 8 + payload.len();
+
+        // 方向 1：内核 → 设备。UDP 发包路由出 TUN（connected /24），继承路径
+        // 读到完整 IP/UDP 包——vnet 时必须已剥头。
+        let udp = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        udp.send_to(payload, SocketAddr::from((peer_ip, 51001))).await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        let n = recv_until_ipv4(&dev, &mut buf).await;
+        assert_eq!(n, expect_len, "剥头后必须恰为完整 IP/UDP 包");
+        assert_eq!(buf[0] >> 4, 4, "首字节必须是 IPv4 版本号（virtio 头已剥除）");
+        assert_eq!(&buf[28..n], payload, "payload 必须逐字节对齐");
+
+        // 方向 2：设备 → 内核。send 注入定向回包（vnet 时内核按垫头解析），
+        // 本地 UDP socket 完整收到即证明垫头正确。
+        let listener = tokio::net::UdpSocket::bind(SocketAddr::from((tun_ip, 51999)))
+            .await
+            .expect("bind tun address");
+        let pkt = udp_ip_packet(peer_ip, 51002, tun_ip, 51999, payload);
+        let sent = dev.send(&pkt).await.expect("send into tun");
+        assert!(sent >= pkt.len(), "send 至少写出整包（垫头由内核消耗）");
+        let mut rbuf = vec![0u8; 2048];
+        let (rn, from) =
+            tokio::time::timeout(Duration::from_secs(5), listener.recv_from(&mut rbuf))
+                .await
+                .expect("timeout waiting for injected packet（垫头或路由坏？）")
+                .expect("recv_from");
+        assert_eq!(&rbuf[..rn], payload, "注入包必须完整投递");
+        assert_eq!(from, SocketAddr::from((peer_ip, 51002)));
+
+        // 方向 1 走生产热路径 recv_batch：剥头是独立代码分支，单独断言。
+        if vnet {
+            udp.send_to(payload, SocketAddr::from((peer_ip, 51001))).await.unwrap();
+            let mut obuf = vec![0u8; 70_000];
+            let mut bbufs = vec![vec![0u8; 2048]; 8];
+            let mut bsizes = vec![0usize; 8];
+            let batch_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let (cnt, batch_len) = loop {
+                let cnt = tokio::time::timeout_at(
+                    batch_deadline,
+                    dev.recv_batch(&mut obuf, &mut bbufs, &mut bsizes),
+                )
+                .await
+                .expect("recv_batch timeout")
+                .expect("recv_batch");
+                if cnt == 1 && bsizes[0] >= 20 && bbufs[0][0] >> 4 == 4 {
+                    break (cnt, bsizes[0]);
+                }
+                // 内核 IPv6 邻居发现噪声，丢弃继续等。
+            };
+            assert_eq!(cnt, 1, "继承 vnet 设备退化为单包读，一批 1 包");
+            assert_eq!(batch_len, expect_len, "recv_batch 剥头后长度必须一致");
+            assert_eq!(bbufs[0][0] >> 4, 4, "recv_batch 首字节必须是 IPv4 版本号");
+            assert_eq!(&bbufs[0][28..bsizes[0]], payload, "recv_batch payload 必须逐字节对齐");
+        }
+    }
+
+    #[tokio::test]
+    async fn inherited_vnet_fd_roundtrip() {
+        inherit_roundtrip(true).await;
+    }
+
+    #[tokio::test]
+    async fn inherited_raw_fd_roundtrip() {
+        inherit_roundtrip(false).await;
     }
 }

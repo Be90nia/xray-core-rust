@@ -299,16 +299,19 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let server = tokio::spawn(async move {
-            let (conn, _) = listener.accept().await.unwrap();
-            let result = inbound.handle_conn(conn).await.unwrap();
-            // 首个 chunk = variable chunk 尾部首段 payload，第二个 chunk = 常规 body
-            let mut stream = result.stream;
-            let head = stream.read_chunk().await.unwrap().expect("early payload chunk");
-            assert_eq!(head, b"GET / HTTP early", "initial payload must ride the var chunk");
-            let got = stream.read_chunk().await.unwrap().expect("body chunk");
-            assert_eq!(got, b"second");
-        });
+        let server = xray_common::testing::spawn(
+            "dial-target-on-merges-initial-payload-into-first-wri-accept",
+            async move {
+                let (conn, _) = listener.accept().await.unwrap();
+                let result = inbound.handle_conn(conn).await.unwrap();
+                // 首个 chunk = variable chunk 尾部首段 payload，第二个 chunk = 常规 body
+                let mut stream = result.stream;
+                let head = stream.read_chunk().await.unwrap().expect("early payload chunk");
+                assert_eq!(head, b"GET / HTTP early", "initial payload must ride the var chunk");
+                let got = stream.read_chunk().await.unwrap().expect("body chunk");
+                assert_eq!(got, b"second");
+            },
+        );
 
         let client = Client2022::new(
             "2022-blake3-aes-256-gcm",
@@ -344,14 +347,17 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let server = tokio::spawn(async move {
-            let (conn, _) = listener.accept().await.unwrap();
-            let result = inbound.handle_conn(conn).await.unwrap();
-            assert_eq!(
-                result.address,
-                xray_common::net::address::Address::Domain("empty.example".into())
-            );
-        });
+        let server = xray_common::testing::spawn(
+            "dial-target-on-flush-pending-sends-header-without-pa-accept",
+            async move {
+                let (conn, _) = listener.accept().await.unwrap();
+                let result = inbound.handle_conn(conn).await.unwrap();
+                assert_eq!(
+                    result.address,
+                    xray_common::net::address::Address::Domain("empty.example".into())
+                );
+            },
+        );
 
         let client = Client2022::new(
             "2022-blake3-aes-256-gcm",

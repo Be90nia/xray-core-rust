@@ -9,7 +9,7 @@
 //! 不依赖 xray_transport（SS crate 未引入），用裸 TcpStream 直接拨号到 echo，
 //! 等价于 freedom outbound 对 IP 目标的行为。
 
-#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros))] // 测试脚手架：spawn 起停被测服务/回环 echo、直印进度；非生产托管面
+#![cfg_attr(test, allow(clippy::disallowed_macros))] // 测试脚手架：直印进度；spawn 走 xray_common::testing（L3 闸不豁免）
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -46,7 +46,7 @@ async fn ss_proxy_to_echo_target_e2e() {
     // ===== 1. echo 目标服务器 =====
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
     let echo_addr = echo_listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("ss-echo-target", async move {
         let (sock, _) = echo_listener.accept().await.expect("echo accept");
         let (mut rd, mut wr) = tokio::io::split(sock);
         let _ = tokio::io::copy(&mut rd, &mut wr).await;
@@ -60,7 +60,7 @@ async fn ss_proxy_to_echo_target_e2e() {
     let proxy_addr = proxy_listener.local_addr().unwrap();
 
     let server_account = account.clone();
-    let server_handle = tokio::spawn(async move {
+    let server_handle = xray_common::testing::spawn("ss-inbound-accept", async move {
         let (conn, _) = proxy_listener.accept().await.expect("proxy accept");
 
         // 读 IV + 解密首帧（addr+port）→ 返回 SSStream（继续 read_chunk 读 body）

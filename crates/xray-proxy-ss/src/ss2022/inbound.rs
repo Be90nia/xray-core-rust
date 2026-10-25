@@ -779,16 +779,17 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            for (email, fill) in [("alice", 0x77u8), ("bob", 0x88u8)] {
-                let (conn, _) = listener.accept().await.unwrap();
-                let mut result = inbound.handle_conn(conn).await.unwrap();
-                assert_eq!(result.user_email, email, "EIH must identify the right user");
-                let payload = vec![fill; 64];
-                let got = result.stream.read_chunk().await.unwrap().expect("body chunk");
-                assert_eq!(got, payload, "{email} body must decrypt with its own PSK context");
-            }
-        });
+        let server =
+            xray_common::testing::spawn("multi-user-two-clients-roundtrip-accept", async move {
+                for (email, fill) in [("alice", 0x77u8), ("bob", 0x88u8)] {
+                    let (conn, _) = listener.accept().await.unwrap();
+                    let mut result = inbound.handle_conn(conn).await.unwrap();
+                    assert_eq!(result.user_email, email, "EIH must identify the right user");
+                    let payload = vec![fill; 64];
+                    let got = result.stream.read_chunk().await.unwrap().expect("body chunk");
+                    assert_eq!(got, payload, "{email} body must decrypt with its own PSK context");
+                }
+            });
 
         for (psk, fill) in [(&alice_psk, 0x77u8), (&bob_psk, 0x88u8)] {
             let client = Client2022::new(
@@ -826,12 +827,13 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let ib = std::sync::Arc::clone(&inbound);
-        let server = tokio::spawn(async move {
-            for _ in 0..2 {
-                let (conn, _) = listener.accept().await.unwrap();
-                let _ = tx.send(ib.handle_conn(conn).await);
-            }
-        });
+        let server =
+            xray_common::testing::spawn("salt-replay-rejected-single-user-accept", async move {
+                for _ in 0..2 {
+                    let (conn, _) = listener.accept().await.unwrap();
+                    let _ = tx.send(ib.handle_conn(conn).await);
+                }
+            });
 
         let wire = build_request_wire(CipherKind2022::Aes256Gcm, &[0xAAu8; 32], None, &psk, &[]);
         let mut c1 = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -872,12 +874,13 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let ib = std::sync::Arc::clone(&inbound);
-        let server = tokio::spawn(async move {
-            for _ in 0..2 {
-                let (conn, _) = listener.accept().await.unwrap();
-                let _ = tx.send(ib.handle_conn(conn).await);
-            }
-        });
+        let server =
+            xray_common::testing::spawn("salt-replay-rejected-multi-user-accept", async move {
+                for _ in 0..2 {
+                    let (conn, _) = listener.accept().await.unwrap();
+                    let _ = tx.send(ib.handle_conn(conn).await);
+                }
+            });
 
         let wire = build_request_wire(
             CipherKind2022::Aes256Gcm,
@@ -921,7 +924,7 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
+        let server = xray_common::testing::spawn("multi-user-eih-roundtrip-accept", async move {
             let (conn, _) = listener.accept().await.unwrap();
             inbound.handle_conn(conn).await
         });
@@ -965,10 +968,11 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (conn, _) = listener.accept().await.unwrap();
-            inbound.handle_conn(conn).await
-        });
+        let server =
+            xray_common::testing::spawn("multi-user-eih-rejects-unknown-user-accept", async move {
+                let (conn, _) = listener.accept().await.unwrap();
+                inbound.handle_conn(conn).await
+            });
 
         let client = Client2022::new(
             "2022-blake3-aes-256-gcm",
@@ -996,10 +1000,10 @@ mod tests {
         // 0. 真实 echo 目标
         let echo_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_port = echo_listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("relay-tunnel-roundtrip-accept", async move {
             loop {
                 let Ok((mut c, _)) = echo_listener.accept().await else { break };
-                tokio::spawn(async move {
+                xray_common::testing::spawn("relay-tunnel-roundtrip-echo", async move {
                     let (mut r, mut w) = c.split();
                     let _ = tokio::io::copy(&mut r, &mut w).await;
                 });
@@ -1014,11 +1018,11 @@ mod tests {
         );
         let dest_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dest_port = dest_listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("relay-tunnel-roundtrip-accept", async move {
             loop {
                 let Ok((conn, _)) = dest_listener.accept().await else { break };
                 let ib = std::sync::Arc::clone(&dest_inbound);
-                tokio::spawn(async move {
+                xray_common::testing::spawn("relay-tunnel-roundtrip", async move {
                     let Ok(result) = ib.handle_conn(conn).await else { return };
                     // 读一个 body chunk（请求 AEAD 续接 header nonce 序列，
                     // continue_read_nonce 后 body 首帧在 [2,0..] 解）。
@@ -1073,11 +1077,11 @@ mod tests {
         );
         let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let relay_port = relay_listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("test-task-accept", async move {
             loop {
                 let Ok((conn, _)) = relay_listener.accept().await else { break };
                 let relay = std::sync::Arc::clone(&relay);
-                tokio::spawn(async move {
+                xray_common::testing::spawn("test-task", async move {
                     let Ok((_addr, _port, salt, client)) = relay.handle_conn_relay(conn).await
                     else {
                         return;
@@ -1189,19 +1193,22 @@ mod tests {
             std::sync::Arc::new(Ss2022Inbound::new("2022-blake3-aes-128-gcm", &b64, "u1").unwrap());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (conn, _) = listener.accept().await.unwrap();
-            let mut r = inbound.handle_conn(conn).await.unwrap();
-            assert_eq!(r.address, Address::Domain("example.com".to_string()));
-            // ① 首段 payload 先于 body chunk 交付
-            let first = r.stream.read_chunk().await.unwrap().expect("first payload");
-            assert_eq!(first, b"GET / one".to_vec(), "variable chunk 尾部首段 payload");
-            let second = r.stream.read_chunk().await.unwrap().expect("body chunk");
-            assert_eq!(second, b"BODY".to_vec(), "后续 body chunk nonce 续接");
-            // ② 下行首写触发 writeResponse 响应头
-            r.stream.write_chunk(b"RESP").await.unwrap();
-            r.stream.flush().await.unwrap();
-        });
+        let server = xray_common::testing::spawn(
+            "sing-semantics-first-payload-and-response-header-accept",
+            async move {
+                let (conn, _) = listener.accept().await.unwrap();
+                let mut r = inbound.handle_conn(conn).await.unwrap();
+                assert_eq!(r.address, Address::Domain("example.com".to_string()));
+                // ① 首段 payload 先于 body chunk 交付
+                let first = r.stream.read_chunk().await.unwrap().expect("first payload");
+                assert_eq!(first, b"GET / one".to_vec(), "variable chunk 尾部首段 payload");
+                let second = r.stream.read_chunk().await.unwrap().expect("body chunk");
+                assert_eq!(second, b"BODY".to_vec(), "后续 body chunk nonce 续接");
+                // ② 下行首写触发 writeResponse 响应头
+                r.stream.write_chunk(b"RESP").await.unwrap();
+                r.stream.flush().await.unwrap();
+            },
+        );
 
         let wire = build_request_wire(CipherKind2022::Aes128Gcm, &salt, None, &psk, b"GET / one");
         let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();

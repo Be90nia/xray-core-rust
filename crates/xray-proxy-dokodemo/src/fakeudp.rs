@@ -143,8 +143,8 @@ mod tests {
     /// 两种结果都合法（透明 bind 本机回环地址+随机端口在有权限时应成功）。
     /// CI 无 root，故只断言「成功 socket 或权限错误」，不冒进。
     #[cfg(target_os = "linux")]
-    #[test]
-    fn fake_udp_linux_socket_or_permission_error() {
+    #[tokio::test]
+    async fn fake_udp_linux_socket_or_permission_error() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         match fake_udp(addr, 0) {
             Ok(sock) => {

@@ -322,6 +322,10 @@ mod tests {
         // 跨线程：启动 accept，等待其阻塞后 close，应唤醒并返回 Err
         let l = Arc::new(OutboundListener::new());
         let l2 = l.clone();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "测试用阻塞 accept 的 OS 线程验证 unblock 时序；无 PluginContext 可穿，按 clippy.toml 指引逐处登记"
+        )]
         let handle = std::thread::spawn(move || l2.accept());
         // 给 worker 时间进入等待
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -334,6 +338,10 @@ mod tests {
     fn accept_blocks_until_add_unblocks() {
         let l = Arc::new(OutboundListener::new());
         let l2 = l.clone();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "测试用阻塞 accept 的 OS 线程验证 add 解除阻塞；无 PluginContext 可穿，按 clippy.toml 指引逐处登记"
+        )]
         let handle = std::thread::spawn(move || l2.accept());
         std::thread::sleep(std::time::Duration::from_millis(50));
         l.try_add(boxed(42));

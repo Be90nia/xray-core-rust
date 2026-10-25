@@ -237,7 +237,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        tokio::spawn(async move {
+        xray_common::testing::spawn("portal-echo-single-stream-echo", async move {
             serve_portal(listener, |sock| async move {
                 let (mut rd, mut wr) = tokio::io::split(sock);
                 tokio::io::copy(&mut rd, &mut wr).await.ok();
@@ -260,7 +260,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        tokio::spawn(async move {
+        xray_common::testing::spawn("portal-multiplex-multiple-streams-echo", async move {
             serve_portal(listener, |sock| async move {
                 let (mut rd, mut wr) = tokio::io::split(sock);
                 tokio::io::copy(&mut rd, &mut wr).await.ok();
@@ -275,14 +275,17 @@ mod tests {
         let mut handles = Vec::new();
         for i in 0u8..3 {
             let b = Arc::clone(&bridge);
-            handles.push(tokio::spawn(async move {
-                let mut sock = b.open_stream().await.expect("open_stream");
-                let payload = vec![i + 1; 128];
-                sock.write_all(&payload).await.expect("write");
-                let mut buf = vec![0u8; 128];
-                sock.read_exact(&mut buf).await.expect("read");
-                assert_eq!(buf, payload, "stream {i} echo mismatch");
-            }));
+            handles.push(xray_common::testing::spawn(
+                "portal-multiplex-multiple-streams-echo",
+                async move {
+                    let mut sock = b.open_stream().await.expect("open_stream");
+                    let payload = vec![i + 1; 128];
+                    sock.write_all(&payload).await.expect("write");
+                    let mut buf = vec![0u8; 128];
+                    sock.read_exact(&mut buf).await.expect("read");
+                    assert_eq!(buf, payload, "stream {i} echo mismatch");
+                },
+            ));
         }
         for h in handles {
             h.await.unwrap();
@@ -302,7 +305,7 @@ mod tests {
         let tc = Arc::clone(&tcp_count);
 
         // 手动 accept 循环：计数 TCP 连接，每条建立 yamux server 会话。
-        tokio::spawn(async move {
+        xray_common::testing::spawn("portal-streams-share-one-tcp-accept", async move {
             loop {
                 let (tcp, _) = match listener.accept().await {
                     Ok(v) => v,
@@ -314,7 +317,10 @@ mod tests {
                     yamux::Config::default(),
                     yamux::Mode::Server,
                 );
-                tokio::spawn(drive_portal(conn, Arc::new(echo_fn)));
+                xray_common::testing::spawn(
+                    "portal-streams-share-one-tcp-echo",
+                    drive_portal(conn, Arc::new(echo_fn)),
+                );
             }
         });
 

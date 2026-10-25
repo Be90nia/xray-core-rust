@@ -2,7 +2,7 @@
 //!
 //! 验证 HTTP 代理完整链路：客户端通过 HTTP CONNECT 代理连接 echo 服务器。
 
-#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros))] // 测试脚手架：spawn 起停被测服务/回环 echo、直印进度；非生产托管面
+#![cfg_attr(test, allow(clippy::disallowed_macros))] // 测试脚手架：直印进度；spawn 走 xray_common::testing（L3 闸不豁免）
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -19,7 +19,7 @@ async fn http_connect_proxy_to_echo_target_e2e() {
     // ===== 1. echo 目标服务器 =====
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo_listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("http-echo-target", async move {
         let (sock, _) = echo_listener.accept().await.unwrap();
         let (mut rd, mut wr) = tokio::io::split(sock);
         tokio::io::copy(&mut rd, &mut wr).await.unwrap();
@@ -30,7 +30,7 @@ async fn http_connect_proxy_to_echo_target_e2e() {
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let echo_ip = echo_addr.ip();
     let echo_port = echo_addr.port();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("http-proxy-connect", async move {
         let (mut client_stream, _) = proxy_listener.accept().await.unwrap();
         let config = ServerConfig::default();
         let hs = http_server_handshake(&mut client_stream, &config).await.expect("handshake");
@@ -74,7 +74,7 @@ async fn http_plain_proxy_chunked_and_content_length_post_e2e() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target_listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("http-target-post", async move {
         for _ in 0..2 {
             let (mut sock, _) = target_listener.accept().await.unwrap();
             let (head, body) = read_http_request(&mut sock).await;
@@ -102,7 +102,7 @@ async fn http_plain_proxy_chunked_and_content_length_post_e2e() {
         // 代理：模拟 handle_plain_http 核心逻辑（handshake → 重建请求 → dial → 双向 bridge）
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("http-proxy-post", async move {
             let (mut client_stream, _) = proxy_listener.accept().await.unwrap();
             let config = ServerConfig::default();
             let hs = http_server_handshake(&mut client_stream, &config).await.expect("handshake");
@@ -221,7 +221,7 @@ async fn http_plain_proxy_get_forwarded_e2e() {
     let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target_listener.local_addr().unwrap();
     let target_port = target_addr.port();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("http-target-get", async move {
         let (mut sock, _) = target_listener.accept().await.unwrap();
         let mut buf = vec![0u8; 4096];
         let _ = sock.read(&mut buf).await.unwrap();
@@ -232,7 +232,7 @@ async fn http_plain_proxy_get_forwarded_e2e() {
     // ===== 2. HTTP proxy（模拟 handle_plain_http 核心逻辑） =====
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("http-proxy-get", async move {
         let (mut client_stream, _) = proxy_listener.accept().await.unwrap();
         let config = ServerConfig::default();
         let hs = http_server_handshake(&mut client_stream, &config).await.expect("handshake");
@@ -338,7 +338,7 @@ async fn plain_http_keep_alive_two_requests_same_connection_e2e() {
     // 各回 Content-Length 响应
     let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target.local_addr().unwrap();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("http-target-keepalive", async move {
         for _ in 0..2 {
             let (mut sock, _) = target.accept().await.unwrap();
             let mut buf = [0u8; 4096];
@@ -392,7 +392,7 @@ async fn plain_http_keep_alive_two_requests_same_connection_e2e() {
 async fn plain_http_without_keep_alive_closes_after_response_e2e() {
     let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target.local_addr().unwrap();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("http-target-no-keepalive", async move {
         let (mut sock, _) = target.accept().await.unwrap();
         let mut buf = [0u8; 4096];
         let _ = sock.read(&mut buf).await.unwrap();
@@ -427,7 +427,7 @@ async fn plain_http_without_keep_alive_closes_after_response_e2e() {
 async fn plain_http_chunked_response_no_loop_close_e2e() {
     let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target.local_addr().unwrap();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("http-target-chunked", async move {
         let (mut sock, _) = target.accept().await.unwrap();
         let mut buf = [0u8; 4096];
         let _ = sock.read(&mut buf).await.unwrap();
@@ -484,7 +484,7 @@ async fn plain_http_origin_form_rejected_400_when_not_transparent_e2e() {
 async fn plain_http_upstream_failure_returns_503_e2e() {
     let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target.local_addr().unwrap();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("http-target-drops-conn", async move {
         let (sock, _) = target.accept().await.unwrap();
         drop(sock); // 不回响应直接断
     });

@@ -941,19 +941,26 @@ mod tests {
         let account = MemoryAccount::from_proto_account(&proto_account).unwrap();
         validator.add(MemoryUser::new("u", 0, account)).unwrap();
 
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let decoded =
-                decode_request_header(false, &mut None, &mut sock, &validator).await.unwrap();
-            // 回响应头（version + addon_len）
-            crate::encoding::server::encode_response_header(&mut sock, VERSION, &empty_addons())
+        let server = xray_common::testing::spawn(
+            "make-dial-fn-sends-flow-in-request-header-accept",
+            async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let decoded =
+                    decode_request_header(false, &mut None, &mut sock, &validator).await.unwrap();
+                // 回响应头（version + addon_len）
+                crate::encoding::server::encode_response_header(
+                    &mut sock,
+                    VERSION,
+                    &empty_addons(),
+                )
                 .await
                 .unwrap();
-            // drain 剩余（如果有）
-            let mut buf = [0u8; 64];
-            let _ = sock.read(&mut buf).await;
-            decoded.addons.flow
-        });
+                // drain 剩余（如果有）
+                let mut buf = [0u8; 64];
+                let _ = sock.read(&mut buf).await;
+                decoded.addons.flow
+            },
+        );
 
         // client：make_dial_fn（flow=xtls-rprx-vision）
         let cfg = Arc::new(
@@ -1004,27 +1011,31 @@ mod tests {
         let account = MemoryAccount::from_proto_account(&proto_account).unwrap();
         validator.add(MemoryUser::new("u", 0, account)).unwrap();
 
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let _ = decode_request_header(false, &mut None, &mut sock, &validator).await.unwrap();
-            // 注：此处不回 VLESS 响应头——本测试只验证上行 wire 形态，client
-            // 不读；若先写响应头，client 关闭时接收队列有未读数据 → Windows
-            // 以 RST 代 FIN → server 后续 read_exact 以 10053 中断。
-            // 首块：uuid-only padding
-            let (uuid1, cmd1, content1, _) = read_vision_block(&mut sock, true).await;
-            assert_eq!(
-                uuid1.as_deref(),
-                Some(server_uuid.as_slice()),
-                "first block must start with user uuid"
-            );
-            assert_eq!(cmd1, COMMAND_PADDING_CONTINUE, "data frame command");
-            assert!(content1.is_empty(), "uuid-only block carries no content");
-            // 第二块：业务 payload（uuid 写一次后不再出现）
-            let (uuid2, cmd2, content2, _) = read_vision_block(&mut sock, false).await;
-            assert!(uuid2.is_none(), "uuid must be written exactly once");
-            assert_eq!(cmd2, COMMAND_PADDING_CONTINUE, "data frame command");
-            content2
-        });
+        let server = xray_common::testing::spawn(
+            "make-dial-fn-wraps-conn-with-vision-when-flow-xrv-accept",
+            async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let _ =
+                    decode_request_header(false, &mut None, &mut sock, &validator).await.unwrap();
+                // 注：此处不回 VLESS 响应头——本测试只验证上行 wire 形态，client
+                // 不读；若先写响应头，client 关闭时接收队列有未读数据 → Windows
+                // 以 RST 代 FIN → server 后续 read_exact 以 10053 中断。
+                // 首块：uuid-only padding
+                let (uuid1, cmd1, content1, _) = read_vision_block(&mut sock, true).await;
+                assert_eq!(
+                    uuid1.as_deref(),
+                    Some(server_uuid.as_slice()),
+                    "first block must start with user uuid"
+                );
+                assert_eq!(cmd1, COMMAND_PADDING_CONTINUE, "data frame command");
+                assert!(content1.is_empty(), "uuid-only block carries no content");
+                // 第二块：业务 payload（uuid 写一次后不再出现）
+                let (uuid2, cmd2, content2, _) = read_vision_block(&mut sock, false).await;
+                assert!(uuid2.is_none(), "uuid must be written exactly once");
+                assert_eq!(cmd2, COMMAND_PADDING_CONTINUE, "data frame command");
+                content2
+            },
+        );
 
         // client：make_dial_fn（flow=xtls-rprx-vision）
         let cfg = Arc::new(
@@ -1082,42 +1093,50 @@ mod tests {
         // 「响应头 + vision padding 块（echo 业务内容）」
         let payload: Vec<u8> = b"inner-clienthello".to_vec();
         let server_payload = payload.clone();
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let _ = decode_request_header(false, &mut None, &mut sock, &validator).await.unwrap();
-            // 首块：uuid-only padding（此时尚未回响应头——dial 必须已先行返回）
-            let (uuid1, cmd1, content1, _) = read_vision_block(&mut sock, true).await;
-            assert_eq!(
-                uuid1.as_deref(),
-                Some(server_uuid.as_slice()),
-                "server must see uuid-prefixed block"
-            );
-            assert_eq!(cmd1, COMMAND_PADDING_CONTINUE);
-            assert!(content1.is_empty());
-            // 业务块：client 首个 payload
-            let (uuid2, _, content2, _) = read_vision_block(&mut sock, false).await;
-            assert!(uuid2.is_none());
-            assert_eq!(content2, server_payload, "server must receive the business payload");
-            // 首块下行数据触发响应头 flush（Go SetFlushNext 语义）
-            crate::encoding::server::encode_response_header(&mut sock, VERSION, &empty_addons())
+        let server = xray_common::testing::spawn(
+            "vision-dial-returns-before-deferred-response-header-accept",
+            async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let _ =
+                    decode_request_header(false, &mut None, &mut sock, &validator).await.unwrap();
+                // 首块：uuid-only padding（此时尚未回响应头——dial 必须已先行返回）
+                let (uuid1, cmd1, content1, _) = read_vision_block(&mut sock, true).await;
+                assert_eq!(
+                    uuid1.as_deref(),
+                    Some(server_uuid.as_slice()),
+                    "server must see uuid-prefixed block"
+                );
+                assert_eq!(cmd1, COMMAND_PADDING_CONTINUE);
+                assert!(content1.is_empty());
+                // 业务块：client 首个 payload
+                let (uuid2, _, content2, _) = read_vision_block(&mut sock, false).await;
+                assert!(uuid2.is_none());
+                assert_eq!(content2, server_payload, "server must receive the business payload");
+                // 首块下行数据触发响应头 flush（Go SetFlushNext 语义）
+                crate::encoding::server::encode_response_header(
+                    &mut sock,
+                    VERSION,
+                    &empty_addons(),
+                )
                 .await
                 .unwrap();
-            let mut uuid_opt = Some(server_uuid.clone());
-            let mut rng = rand::rngs::StdRng::from_os_rng();
-            let mut block = Vec::new();
-            xtls_padding(
-                Some(&content2),
-                COMMAND_PADDING_CONTINUE,
-                &mut uuid_opt,
-                false,
-                &crate::encryption::vision::DEFAULT_PADDING_SEED,
-                &mut rng,
-                &mut block,
-            );
-            sock.write_all(&block).await.unwrap();
-            sock.flush().await.unwrap();
-            content2
-        });
+                let mut uuid_opt = Some(server_uuid.clone());
+                let mut rng = rand::rngs::StdRng::from_os_rng();
+                let mut block = Vec::new();
+                xtls_padding(
+                    Some(&content2),
+                    COMMAND_PADDING_CONTINUE,
+                    &mut uuid_opt,
+                    false,
+                    &crate::encryption::vision::DEFAULT_PADDING_SEED,
+                    &mut rng,
+                    &mut block,
+                );
+                sock.write_all(&block).await.unwrap();
+                sock.flush().await.unwrap();
+                content2
+            },
+        );
 
         let cfg = Arc::new(
             VlessOutboundConfig::new(
@@ -1381,9 +1400,15 @@ mod tests {
 
         // 第 1 条入缓冲即完成；第 2 条挂起（Go worker 休息在 send 上）。
         let p1 = Arc::clone(&pool);
-        let push1 = tokio::spawn(async move { p1.push(mk_nop_conn()).await });
+        let push1 =
+            xray_common::testing::spawn("preconn-push-blocks-until-consumer-arrives", async move {
+                p1.push(mk_nop_conn()).await
+            });
         let p2 = Arc::clone(&pool);
-        let push2 = tokio::spawn(async move { p2.push(mk_nop_conn()).await });
+        let push2 =
+            xray_common::testing::spawn("preconn-push-blocks-until-consumer-arrives", async move {
+                p2.push(mk_nop_conn()).await
+            });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(push1.is_finished(), "first push fills the buffer slot");
         assert!(
@@ -1404,11 +1429,13 @@ mod tests {
         let pool = Arc::new(PreConns::new(Duration::from_millis(5)));
         // 第一条挂起在 send 上，50ms（> ttl）后交付即过期 → 弃。
         let p1 = Arc::clone(&pool);
-        tokio::spawn(async move { p1.push(mk_nop_conn()).await });
+        xray_common::testing::spawn("preconn-expired-entry-skipped", async move {
+            p1.push(mk_nop_conn()).await
+        });
         tokio::time::sleep(Duration::from_millis(50)).await;
         // 第二条在消费等待中 push（未过期）→ 被交付。
         let p2 = Arc::clone(&pool);
-        let second = tokio::spawn(async move {
+        let second = xray_common::testing::spawn("preconn-expired-entry-skipped", async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
             p2.push(mk_nop_conn()).await
         });
@@ -1542,7 +1569,7 @@ mod tests {
             reverse_ohm: Some(Arc::clone(&ohm)),
             ..Default::default()
         };
-        tokio::spawn(async move {
+        xray_common::testing::spawn("vless-reverse-portal-bridge-roundtrip", async move {
             let _ = crate::inbound::server::serve_vless(
                 listener,
                 ohm,

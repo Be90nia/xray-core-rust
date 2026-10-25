@@ -292,6 +292,10 @@ mod tests {
         let mut handles = Vec::new();
         for i in 0..10 {
             let v = Arc::clone(&v);
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "并发安全测试用多 OS 线程压同步计数器（无异步面）；无 PluginContext 可穿，按 clippy.toml 指引逐处登记"
+            )]
             handles.push(thread::spawn(move || {
                 let email = format!("user{i}@x.com");
                 v.add(user(&email, &format!("pass{i}"))).expect("add");

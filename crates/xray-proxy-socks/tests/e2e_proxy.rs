@@ -3,7 +3,7 @@
 //! 验证完整代理链路：客户端通过 SOCKS5 代理连接 echo 服务器，数据双向流通。
 //! 这是 SystemDialer/SystemListener/bridge_connections/freedom/socks 协同工作的端到端证明。
 
-#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros))] // 测试脚手架：spawn 起停被测服务/回环 echo、直印进度；非生产托管面
+#![cfg_attr(test, allow(clippy::disallowed_macros))] // 测试脚手架：直印进度；spawn 走 xray_common::testing（L3 闸不豁免）
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -26,7 +26,7 @@ async fn socks5_proxy_to_echo_target_e2e() {
     // ===== 1. 启动 echo 目标服务器 =====
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo_listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("socks-echo-target", async move {
         let (sock, _) = echo_listener.accept().await.unwrap();
         let (mut rd, mut wr) = tokio::io::split(sock);
         // 简单 echo：把读到的数据原样写回
@@ -38,7 +38,7 @@ async fn socks5_proxy_to_echo_target_e2e() {
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let echo_ip = echo_addr.ip();
     let echo_port = echo_addr.port();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("socks5-server", async move {
         let (mut client_stream, _) = proxy_listener.accept().await.unwrap();
         // SOCKS5 handshake（NoAuth）
         let config = ServerConfig { auth_type: AuthType::NoAuth, ..Default::default() };

@@ -931,7 +931,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind inbound");
         let inbound_addr = listener.local_addr().unwrap();
         let ib = Arc::new(SsInbound::new(make_account(), "u@dial.local"));
-        let server = tokio::spawn(async move {
+        let server = xray_common::testing::spawn("dial-accept", async move {
             let (conn, _) = listener.accept().await.expect("inbound accept");
             let (_header, mut ss) = ib.handle_conn(conn).await.expect("handshake");
             let body = ss.read_chunk().await.expect("read body").expect("non-empty");
@@ -1102,11 +1102,14 @@ mod tests {
         // 1. echo server
         let echo_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
         let echo_addr = echo_listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (sock, _) = echo_listener.accept().await.expect("echo accept");
-            let (mut rd, mut wr) = tokio::io::split(sock);
-            let _ = tokio::io::copy(&mut rd, &mut wr).await;
-        });
+        xray_common::testing::spawn(
+            "ss-connection-pump-roundtrips-through-inbound-echo-accept",
+            async move {
+                let (sock, _) = echo_listener.accept().await.expect("echo accept");
+                let (mut rd, mut wr) = tokio::io::split(sock);
+                let _ = tokio::io::copy(&mut rd, &mut wr).await;
+            },
+        );
 
         // 2. SS inbound：handle_conn 握手 → read_chunk body → echo → write_chunk 回响
         let inbound_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind inbound");
@@ -1119,21 +1122,24 @@ mod tests {
         };
         let echo_socket = SocketAddr::new(IpAddr::V4(echo_v4), echo_addr.port());
 
-        let server_handle = tokio::spawn({
-            let ib = std::sync::Arc::clone(&ib);
-            async move {
-                let (conn, _) = inbound_listener.accept().await.expect("inbound accept");
-                let (_header, mut ss_stream) = ib.handle_conn(conn).await.expect("handshake");
-                let body = ss_stream.read_chunk().await.expect("read body").expect("non-empty");
-                let mut ec = TcpStream::connect(echo_socket).await.expect("connect echo");
-                ec.write_all(&body).await.expect("fwd echo");
-                ec.flush().await.expect("flush echo");
-                let mut echoed = vec![0u8; body.len()];
-                ec.read_exact(&mut echoed).await.expect("read echo back");
-                ss_stream.write_chunk(&echoed).await.expect("write resp chunk");
-                ss_stream.flush().await.expect("flush resp");
-            }
-        });
+        let server_handle = xray_common::testing::spawn(
+            "ss-connection-pump-roundtrips-through-inbound-echo-accept",
+            {
+                let ib = std::sync::Arc::clone(&ib);
+                async move {
+                    let (conn, _) = inbound_listener.accept().await.expect("inbound accept");
+                    let (_header, mut ss_stream) = ib.handle_conn(conn).await.expect("handshake");
+                    let body = ss_stream.read_chunk().await.expect("read body").expect("non-empty");
+                    let mut ec = TcpStream::connect(echo_socket).await.expect("connect echo");
+                    ec.write_all(&body).await.expect("fwd echo");
+                    ec.flush().await.expect("flush echo");
+                    let mut echoed = vec![0u8; body.len()];
+                    ec.read_exact(&mut echoed).await.expect("read echo back");
+                    ss_stream.write_chunk(&echoed).await.expect("write resp chunk");
+                    ss_stream.flush().await.expect("flush resp");
+                }
+            },
+        );
 
         // 3. client：dial_target（写 IV + 首帧）→ SsConnection::new → AsyncRead/Write
         let client = Client::new(account, inbound_addr.ip().to_string(), inbound_addr.port());
@@ -1182,7 +1188,7 @@ mod tests {
         let srv_account = make_account();
         let validator = Validator::new();
         validator.add(MemoryUser::new("srv", srv_account.clone())).expect("add user");
-        tokio::spawn(async move {
+        xray_common::testing::spawn("ss-udp-dial-fn-roundtrips-through-udp-echo-udp", async move {
             let mut b = [0u8; 65_535];
             while let Ok((n, from)) = server.recv_from(&mut b).await {
                 let Ok((header, payload)) = decode_udp_packet(&validator, &b[..n]) else {

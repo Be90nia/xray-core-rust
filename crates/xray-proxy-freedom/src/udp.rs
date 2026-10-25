@@ -556,19 +556,25 @@ mod tests {
             Err(_) => return,
         };
         let echo_port = echo.local_addr().unwrap().port();
-        let echo_task = tokio::spawn(async move {
-            let mut buf = vec![0u8; RECV_BUF_SIZE];
-            while let Ok((n, peer)) = echo.recv_from(&mut buf).await {
-                let _ = echo.send_to(&buf[..n], peer).await;
-            }
-        });
+        let echo_task = xray_common::testing::spawn(
+            "udp-relay-policy-runs-dialer-controllers-echo",
+            async move {
+                let mut buf = vec![0u8; RECV_BUF_SIZE];
+                while let Ok((n, peer)) = echo.recv_from(&mut buf).await {
+                    let _ = echo.send_to(&buf[..n], peer).await;
+                }
+            },
+        );
 
         let pipe_opt = xray_buf::pipe::PipeOption::default();
         let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
         let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
         let link = Link::new(Box::new(up_r) as Box<dyn Reader>, Box::new(dn_w) as Box<dyn Writer>);
         let dest = udp_dest("127.0.0.1", echo_port);
-        let relay_task = tokio::spawn(async move { relay(&dest, link).await });
+        let relay_task = xray_common::testing::spawn(
+            "udp-relay-policy-runs-dialer-controllers-echo",
+            async move { relay(&dest, link).await },
+        );
 
         // client 写一帧 XUDP → relay bind（controller 在此被调）→ send → echo 回包。
         let mut client_writer = Box::new(up_w) as Box<dyn Writer>;
@@ -606,7 +612,7 @@ mod tests {
         // 1. 启动 UDP echo server
         let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let echo_addr = echo.local_addr().unwrap();
-        let echo_task = tokio::spawn(async move {
+        let echo_task = xray_common::testing::spawn("udp-relay-echo-roundtrip-echo", async move {
             let mut buf = vec![0u8; RECV_BUF_SIZE];
             while let Ok((n, peer)) = echo.recv_from(&mut buf).await {
                 let _ = echo.send_to(&buf[..n], peer).await;
@@ -621,7 +627,9 @@ mod tests {
         let link = Link::new(Box::new(up_r) as Box<dyn Reader>, Box::new(dn_w) as Box<dyn Writer>);
 
         let dest = udp_dest("127.0.0.1", echo_addr.port());
-        let relay_task = tokio::spawn(async move { relay(&dest, link).await });
+        let relay_task = xray_common::testing::spawn("udp-relay-echo-roundtrip", async move {
+            relay(&dest, link).await
+        });
 
         // 3. client 写一个 XUDP 帧
         let mut client_writer = Box::new(up_w) as Box<dyn Writer>;
@@ -666,12 +674,13 @@ mod tests {
     async fn udp_relay_multiple_packets() {
         let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let echo_addr = echo.local_addr().unwrap();
-        let echo_task = tokio::spawn(async move {
-            let mut buf = vec![0u8; RECV_BUF_SIZE];
-            while let Ok((n, peer)) = echo.recv_from(&mut buf).await {
-                let _ = echo.send_to(&buf[..n], peer).await;
-            }
-        });
+        let echo_task =
+            xray_common::testing::spawn("udp-relay-multiple-packets-echo", async move {
+                let mut buf = vec![0u8; RECV_BUF_SIZE];
+                while let Ok((n, peer)) = echo.recv_from(&mut buf).await {
+                    let _ = echo.send_to(&buf[..n], peer).await;
+                }
+            });
 
         let pipe_opt = xray_buf::pipe::PipeOption::default();
         let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
@@ -679,7 +688,10 @@ mod tests {
         let link = Link::new(Box::new(up_r) as Box<dyn Reader>, Box::new(dn_w) as Box<dyn Writer>);
 
         let dest = udp_dest("127.0.0.1", echo_addr.port());
-        let relay_task = tokio::spawn(async move { relay(&dest, link).await });
+        let relay_task =
+            xray_common::testing::spawn("udp-relay-multiple-packets-echo", async move {
+                relay(&dest, link).await
+            });
 
         let mut client_writer = Box::new(up_w) as Box<dyn Writer>;
         let global_id: [u8; GLOBAL_ID_LEN] = [0xAA; GLOBAL_ID_LEN];
@@ -766,7 +778,10 @@ mod tests {
         let (_dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
         let link = Link::new(Box::new(up_r) as Box<dyn Reader>, Box::new(dn_w) as Box<dyn Writer>);
         let dest = udp_dest("127.0.0.1", a_port);
-        let relay_task = tokio::spawn(async move { relay_policy(&dest, link, &[], &policy).await });
+        let relay_task =
+            xray_common::testing::spawn("udp-per-packet-override-rewrites-target", async move {
+                relay_policy(&dest, link, &[], &policy).await
+            });
 
         let mut client_writer = Box::new(up_w) as Box<dyn Writer>;
         let mut frame = Vec::new();
@@ -814,7 +829,10 @@ mod tests {
         let (_dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
         let link = Link::new(Box::new(up_r) as Box<dyn Reader>, Box::new(dn_w) as Box<dyn Writer>);
         let dest = udp_dest("127.0.0.1", echo_port);
-        let relay_task = tokio::spawn(async move { relay_policy(&dest, link, &[], &policy).await });
+        let relay_task =
+            xray_common::testing::spawn("udp-request-blocked-by-final-rule-echo", async move {
+                relay_policy(&dest, link, &[], &policy).await
+            });
 
         let mut client_writer = Box::new(up_w) as Box<dyn Writer>;
         let mut frame = Vec::new();
@@ -861,7 +879,9 @@ mod tests {
         let link = Link::new(Box::new(up_r) as Box<dyn Reader>, Box::new(dn_w) as Box<dyn Writer>);
         let dest = udp_dest("127.0.0.1", 53001);
         let relay_task =
-            tokio::spawn(async move { relay_policy(&dest, link, &noises, &policy).await });
+            xray_common::testing::spawn("udp-noise-skipped-when-override-port-53", async move {
+                relay_policy(&dest, link, &noises, &policy).await
+            });
 
         let mut client_writer = Box::new(up_w) as Box<dyn Writer>;
         let mut frame = Vec::new();
@@ -936,7 +956,7 @@ mod tests {
 
         let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let echo_addr = echo.local_addr().unwrap();
-        let echo_task = tokio::spawn(async move {
+        let echo_task = xray_common::testing::spawn("read-multi-buffer-echo", async move {
             let mut buf = vec![0u8; RECV_BUF_SIZE];
             let mut got = Vec::new();
             for _ in 0..2 {
@@ -996,17 +1016,20 @@ mod tests {
         // UDP echo server：域名帧解析出的真实目标
         let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let echo_port = echo.local_addr().unwrap().port();
-        let echo_task = tokio::spawn(async move {
-            let mut buf = vec![0u8; RECV_BUF_SIZE];
-            let mut got = Vec::new();
-            for _ in 0..3 {
-                if let Ok((n, peer)) = echo.recv_from(&mut buf).await {
-                    got.push(buf[..n].to_vec());
-                    let _ = echo.send_to(&buf[..n], peer).await;
+        let echo_task = xray_common::testing::spawn(
+            "udp-domain-frames-resolved-per-frame-with-cache-echo",
+            async move {
+                let mut buf = vec![0u8; RECV_BUF_SIZE];
+                let mut got = Vec::new();
+                for _ in 0..3 {
+                    if let Ok((n, peer)) = echo.recv_from(&mut buf).await {
+                        got.push(buf[..n].to_vec());
+                        let _ = echo.send_to(&buf[..n], peer).await;
+                    }
                 }
-            }
-            got
-        });
+                got
+            },
+        );
 
         // 会话默认目标 = 无监听端口（修复前域名帧 fallback 到这里 → 静默错投）
         let closed = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1021,7 +1044,10 @@ mod tests {
             domain_strategy: xray_transport::sockopt::DomainStrategy::UseIP,
             ..Default::default()
         };
-        let relay_task = tokio::spawn(async move { relay_policy(&dest, link, &[], &policy).await });
+        let relay_task = xray_common::testing::spawn(
+            "udp-domain-frames-resolved-per-frame-with-cache",
+            async move { relay_policy(&dest, link, &[], &policy).await },
+        );
 
         // 三帧：a.test / b.test / a.test（第三次应命中缓存，不再查询）
         let mut client_writer = Box::new(up_w) as Box<dyn Writer>;

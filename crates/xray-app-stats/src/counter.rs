@@ -140,6 +140,10 @@ mod tests {
         let mut handles = Vec::new();
         for _ in 0..8 {
             let c2 = Arc::clone(&c);
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "并发安全测试用多 OS 线程压同步计数器（无异步面）；无 PluginContext 可穿，按 clippy.toml 指引逐处登记"
+            )]
             handles.push(thread::spawn(move || {
                 for _ in 0..1000 {
                     c2.add(1);

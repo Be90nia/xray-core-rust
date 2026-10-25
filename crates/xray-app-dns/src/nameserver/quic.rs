@@ -333,7 +333,7 @@ mod tests {
         let addr = endpoint.local_addr().unwrap();
         let fqdn_owned = fqdn.to_string();
 
-        let handle = tokio::spawn(async move {
+        let handle = xray_common::testing::spawn("spawn-mock-doq-server-accept", async move {
             if let Some(incoming) = endpoint.accept().await {
                 let conn = match incoming.await {
                     Ok(c) => c,

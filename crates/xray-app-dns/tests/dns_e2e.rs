@@ -5,7 +5,7 @@
 //! - cache 第二次查询命中（不再走网络）
 //! - EDNS0 client_ip 选项正确附加（通过 query bytes 验证）
 
-#![allow(clippy::unwrap_used, clippy::disallowed_methods)] // bd g3cr：测试断言便利豁免（allow-unwrap-in-tests 对 tests/ 目录失效，clippy#13981）+ T3.1b 测试内 mock server 裸 spawn 自管 runtime；生产禁令不受影响
+#![allow(clippy::unwrap_used)] // bd g3cr：测试断言便利豁免（allow-unwrap-in-tests 对 tests/ 目录失效，clippy#13981）+ T3.1b 测试内 mock server 裸 spawn 自管 runtime；生产禁令不受影响
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
@@ -65,7 +65,7 @@ async fn spawn_udp_echo_server(
 ) -> SocketAddr {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = sock.local_addr().unwrap();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("dns-udp-echo-server", async move {
         let mut buf = vec![0u8; 4096];
         let (n, peer) = sock.recv_from(&mut buf).await.unwrap();
         let query_bytes = buf[..n].to_vec();
@@ -228,7 +228,7 @@ async fn tcp_query_returns_a_record() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let fqdn = "tcp.example.".to_string();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("dns-tcp-server", async move {
         let (mut sock, _) = listener.accept().await.unwrap();
         let mut len_buf = [0u8; 2];
         sock.read_exact(&mut len_buf).await.unwrap();

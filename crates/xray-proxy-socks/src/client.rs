@@ -310,10 +310,10 @@ mod tests {
         listener: TcpListener,
         server_config: ServerConfig,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
+        xray_common::testing::spawn("start-echo-socks-server-accept", async move {
             while let Ok((mut sock, _)) = listener.accept().await {
                 let cfg = server_config.clone();
-                tokio::spawn(async move {
+                xray_common::testing::spawn("start-echo-socks-server-echo", async move {
                     // 1. handshake 解析 client 想连哪
                     let target = match socks5_server_handshake(&mut sock, &cfg).await {
                         Ok(t) => t,
@@ -430,12 +430,15 @@ mod tests {
         // 必须 [05 01 02]；此前发 [05 02 00 02]（nmethods=2）是 DPI 可辨指纹。
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
-        let acceptor = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut first = [0u8; 3];
-            sock.read_exact(&mut first).await.unwrap();
-            first
-        });
+        let acceptor = xray_common::testing::spawn(
+            "dial-with-credentials-sends-single-method-0x02-accept",
+            async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut first = [0u8; 3];
+                sock.read_exact(&mut first).await.unwrap();
+                first
+            },
+        );
         let client = SocksClient::new(ClientConfig::new_with_auth(
             server_addr.to_string(),
             "user1",
@@ -455,14 +458,20 @@ mod tests {
         // 60s（policy 缺省）触发 TimedOut。暂停时钟自动推进，真实耗时毫秒级。
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (_sock, _) = listener.accept().await.unwrap();
-            // 沉默服务端：不回 method 选择（虚拟 sleep 只为持有 socket）。
-            tokio::time::sleep(Duration::from_secs(3600)).await;
-        });
+        xray_common::testing::spawn(
+            "handshake-silent-server-times-out-after-60s-accept",
+            async move {
+                let (_sock, _) = listener.accept().await.unwrap();
+                // 沉默服务端：不回 method 选择（虚拟 sleep 只为持有 socket）。
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            },
+        );
         let client = SocksClient::new(ClientConfig::new_noauth(addr.to_string()));
         let target = SocksAddr::ipv4(std::net::Ipv4Addr::LOCALHOST, 80);
-        let dial_task = tokio::spawn(async move { client.dial(&target).await });
+        let dial_task = xray_common::testing::spawn(
+            "handshake-silent-server-times-out-after-60s",
+            async move { client.dial(&target).await },
+        );
         let err = dial_task.await.unwrap().unwrap_err();
         assert!(
             matches!(&err, SocksError::Io(e) if e.kind() == std::io::ErrorKind::TimedOut),
@@ -479,7 +488,10 @@ mod tests {
         let server = start_echo_socks_server(listener, ServerConfig::default());
         let client = SocksClient::new(ClientConfig::new_noauth(server_addr.to_string()));
         let target = SocksAddr::domain("example.com", 443);
-        let dial_task = tokio::spawn(async move { client.dial(&target).await });
+        let dial_task = xray_common::testing::spawn(
+            "data-plane-not-limited-by-handshake-deadline",
+            async move { client.dial(&target).await },
+        );
         // advance 步进：给真实 loopback 握手 I/O 完成窗口（10s 虚拟预算，
         // 远小于 60s deadline）。
         for _ in 0..1000 {

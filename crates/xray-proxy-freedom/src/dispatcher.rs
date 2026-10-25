@@ -435,7 +435,7 @@ mod tests {
         // echo server
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("dispatcher-e2e-freedom-to-echo-accept", async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut buf = vec![0u8; 4096];
             loop {
@@ -492,12 +492,13 @@ mod tests {
         // 1. UDP echo server
         let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let echo_addr = echo.local_addr().unwrap();
-        let echo_task = tokio::spawn(async move {
-            let mut buf = vec![0u8; 65535];
-            while let Ok((n, peer)) = echo.recv_from(&mut buf).await {
-                let _ = echo.send_to(&buf[..n], peer).await;
-            }
-        });
+        let echo_task =
+            xray_common::testing::spawn("dispatcher-e2e-freedom-udp-direct-echo", async move {
+                let mut buf = vec![0u8; 65535];
+                while let Ok((n, peer)) = echo.recv_from(&mut buf).await {
+                    let _ = echo.send_to(&buf[..n], peer).await;
+                }
+            });
 
         // 2. dispatcher + FreedomDispatchBridge（TCP DialBridge + UDP relay）
         let tcp_bridge = Arc::new(DialBridge::new("freedom-out", make_dial_fn()));
@@ -558,15 +559,18 @@ mod tests {
         let echo_addr = echo.local_addr().unwrap();
         let peer_ip = Arc::new(parking_lot::Mutex::new(None::<IpAddr>));
         let recorder = Arc::clone(&peer_ip);
-        let echo_task = tokio::spawn(async move {
-            let mut buf = vec![0u8; 65535];
-            while let Ok((n, peer)) = echo.recv_from(&mut buf).await {
-                if recorder.lock().is_none() {
-                    *recorder.lock() = Some(peer.ip());
+        let echo_task = xray_common::testing::spawn(
+            "dispatcher-e2e-freedom-udp-send-through-binds-source-echo",
+            async move {
+                let mut buf = vec![0u8; 65535];
+                while let Ok((n, peer)) = echo.recv_from(&mut buf).await {
+                    if recorder.lock().is_none() {
+                        *recorder.lock() = Some(peer.ip());
+                    }
+                    let _ = echo.send_to(&buf[..n], peer).await;
                 }
-                let _ = echo.send_to(&buf[..n], peer).await;
-            }
-        });
+            },
+        );
 
         // 2. FreedomDispatchBridge + sendThrough 指定源。127.0.0.2 仅 Linux
         // 隐式可用（macOS/FreeBSD lo0 默认只配 127.0.0.1，bind 报
@@ -628,23 +632,26 @@ mod tests {
         // echo server：全量回显并保留收到的原始字节
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut all = Vec::new();
-            let mut buf = [0u8; 4096];
-            loop {
-                match sock.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        all.extend_from_slice(&buf[..n]);
-                        if sock.write_all(&buf[..n]).await.is_err() {
-                            break;
-                        }
-                    },
+        let server = xray_common::testing::spawn(
+            "dispatcher-tcp-fragment-tlshello-e2e-accept",
+            async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut all = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            all.extend_from_slice(&buf[..n]);
+                            if sock.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        },
+                    }
                 }
-            }
-            all
-        });
+                all
+            },
+        );
 
         let config = Config {
             fragment: Some(Fragment {
@@ -718,11 +725,14 @@ mod tests {
         let echo_addr = listener.local_addr().unwrap();
         let conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let conns_srv = Arc::clone(&conns);
-        tokio::spawn(async move {
-            while let Ok((_, _)) = listener.accept().await {
-                conns_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-        });
+        xray_common::testing::spawn(
+            "tcp-block-rule-blackholes-without-dialing-accept",
+            async move {
+                while let Ok((_, _)) = listener.accept().await {
+                    conns_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+        );
 
         let rule_cfg = crate::config::FinalRuleConfig::from_json(&serde_json::json!({
             "action": "block", "ip": ["127.0.0.0/8"], "blockDelay": {"from": 0, "to": 0}
@@ -746,7 +756,10 @@ mod tests {
             Box::new(up_r) as Box<dyn Reader>,
             Box::new(dn_w) as Box<dyn Writer>,
         );
-        let task = tokio::spawn(async move { bridge.dispatch(&dest, link).await });
+        let task =
+            xray_common::testing::spawn("tcp-block-rule-blackholes-without-dialing", async move {
+                bridge.dispatch(&dest, link).await
+            });
 
         // 客户端写数据后关闭 → blackhole drain 读到 EOF 提前返回
         let mut w = Box::new(up_w) as Box<dyn Writer>;
@@ -770,21 +783,24 @@ mod tests {
         // echo server（记录连接数）
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 4096];
-                loop {
-                    match sock.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if sock.write_all(&buf[..n]).await.is_err() {
-                                break;
-                            }
-                        },
+        xray_common::testing::spawn(
+            "inbound-default-rule-map-derives-block-private-accept",
+            async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if sock.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            },
+                        }
                     }
                 }
-            }
-        });
+            },
+        );
 
         let make_bridge = || {
             FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new(
@@ -823,7 +839,10 @@ mod tests {
                 ..Default::default()
             };
             let bridge = make_bridge();
-            let task = tokio::spawn(bridge.dispatch_with_access(&dest, link, access));
+            let task = xray_common::testing::spawn(
+                "inbound-default-rule-map-derives-block-private",
+                bridge.dispatch_with_access(&dest, link, access),
+            );
             let mut mb = MultiBuffer::new();
             mb.merge_bytes(b"probe");
             up_w.write_multi_buffer(mb).await.unwrap();
@@ -839,7 +858,10 @@ mod tests {
                 ..Default::default()
             };
             let bridge = make_bridge();
-            let task = tokio::spawn(bridge.dispatch_with_access(&dest, link, access));
+            let task = xray_common::testing::spawn(
+                "inbound-default-rule-map-derives-block-private-echo",
+                bridge.dispatch_with_access(&dest, link, access),
+            );
             let mut mb = MultiBuffer::new();
             mb.merge_bytes(b"echo-me");
             up_w.write_multi_buffer(mb).await.unwrap();
@@ -863,34 +885,37 @@ mod tests {
         // 消除「macOS loopback 把 header 与 payload 分两段送达、单次 read 只
         // 见头→rest 为空→不回显→5s 超时」竞态。
         let (header_ready_tx, header_ready_rx) = tokio::sync::oneshot::channel::<()>();
-        let server = tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut header = Vec::with_capacity(64);
-            loop {
-                let mut one = [0u8; 1];
-                let n = sock.read(&mut one).await.unwrap_or(0);
-                if n == 0 {
-                    panic!("server: conn closed before PROXY header terminator");
+        let server = xray_common::testing::spawn(
+            "proxy-protocol-header-written-when-source-available-accept",
+            async move {
+                use tokio::io::AsyncWriteExt;
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut header = Vec::with_capacity(64);
+                loop {
+                    let mut one = [0u8; 1];
+                    let n = sock.read(&mut one).await.unwrap_or(0);
+                    if n == 0 {
+                        panic!("server: conn closed before PROXY header terminator");
+                    }
+                    header.push(one[0]);
+                    if header.ends_with(b"\r\n") {
+                        break;
+                    }
                 }
-                header.push(one[0]);
-                if header.ends_with(b"\r\n") {
-                    break;
+                assert!(
+                    header.starts_with(b"PROXY "),
+                    "first bytes must be PROXY header, got: {:?}",
+                    String::from_utf8_lossy(&header)
+                );
+                // 通知测试线程：header 已消费完，可安全写 payload
+                let _ = header_ready_tx.send(());
+                // 等 payload 全部到达后再回显（payload 长度固定 20B；read_exact 等满）
+                let mut payload = [0u8; 20];
+                if sock.read_exact(&mut payload).await.is_ok() {
+                    let _ = sock.write_all(&payload).await;
                 }
-            }
-            assert!(
-                header.starts_with(b"PROXY "),
-                "first bytes must be PROXY header, got: {:?}",
-                String::from_utf8_lossy(&header)
-            );
-            // 通知测试线程：header 已消费完，可安全写 payload
-            let _ = header_ready_tx.send(());
-            // 等 payload 全部到达后再回显（payload 长度固定 20B；read_exact 等满）
-            let mut payload = [0u8; 20];
-            if sock.read_exact(&mut payload).await.is_ok() {
-                let _ = sock.write_all(&payload).await;
-            }
-        });
+            },
+        );
 
         // proxyProtocol=1 进 dial_fn（生产 parse_freedom_config 路径等价）
         let config = Config { proxy_protocol: 1, ..Default::default() };
@@ -915,7 +940,10 @@ mod tests {
             from: "198.51.100.7:4444".into(),
             ..Default::default()
         };
-        let task = tokio::spawn(bridge.dispatch_with_access(&dest, link, access));
+        let task = xray_common::testing::spawn(
+            "proxy-protocol-header-written-when-source-available",
+            bridge.dispatch_with_access(&dest, link, access),
+        );
 
         // 等服务端确认 header 已读完 → 再写 payload（payload 经 bridge → conn
         // → 服务端 read_exact 收齐）。
@@ -950,7 +978,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("dial-fn-useipv4-resolves-only-ipv4-accept", async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut buf = [0u8; 256];
             let _ = sock.read(&mut buf).await;
@@ -993,13 +1021,16 @@ mod tests {
         let conn_count = std::sync::Arc::new(AtomicUsize::new(0));
         let accept_task = {
             let (listener, count) = (listener, std::sync::Arc::clone(&conn_count));
-            tokio::spawn(async move {
-                loop {
-                    if listener.accept().await.is_ok() {
-                        count.fetch_add(1, Ordering::SeqCst);
+            xray_common::testing::spawn(
+                "domain-resolving-to-private-ip-blocked-accept",
+                async move {
+                    loop {
+                        if listener.accept().await.is_ok() {
+                            count.fetch_add(1, Ordering::SeqCst);
+                        }
                     }
-                }
-            })
+                },
+            )
         };
 
         // 生产解析路径：block + 10.0.0.0/8 + blockDelay 0s（黑洞即刻放行 EOF）
@@ -1035,11 +1066,10 @@ mod tests {
             Port::new(echo_port),
             Network::TCP,
         );
-        let task = tokio::spawn(bridge.dispatch_with_access(
-            &dest,
-            link,
-            xray_app_dispatcher::AccessContext::default(),
-        ));
+        let task = xray_common::testing::spawn(
+            "domain-resolving-to-private-ip-blocked",
+            bridge.dispatch_with_access(&dest, link, xray_app_dispatcher::AccessContext::default()),
+        );
 
         // 上行写一点数据后关闭 → 黑洞 drain 见 EOF → 即刻关下行
         // （xray-buf pipe 无 Drop 关闭——显式 shutdown 才有 EOF）

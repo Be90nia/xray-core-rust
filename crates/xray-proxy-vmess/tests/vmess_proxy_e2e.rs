@@ -12,7 +12,7 @@
 //! 实现注记：VMess 编解码内部使用 `Box<dyn AeadCipher>`（非 Send），
 //! 不能跨 `tokio::spawn` 边界；server/client 在同一 task 内用 `tokio::join!` 并发。
 
-#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros))] // 测试脚手架：spawn 起停被测服务/回环 echo、直印进度；非生产托管面
+#![cfg_attr(test, allow(clippy::disallowed_macros))] // 测试脚手架：直印进度；spawn 走 xray_common::testing（L3 闸不豁免）
 use std::sync::Arc;
 
 use tokio::{
@@ -58,7 +58,7 @@ async fn vmess_proxy_to_echo_target_e2e() {
     // ===== 1. echo 目标服务器 =====
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
     let echo_addr = echo_listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("vmess-echo-target", async move {
         let (sock, _) = echo_listener.accept().await.expect("echo accept");
         let (mut rd, mut wr) = tokio::io::split(sock);
         // 简单回环：读到什么写回什么
@@ -211,10 +211,10 @@ async fn vmess_multichunk_production_roundtrip_e2e() {
     // echo server
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
     let echo_port = echo_listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("vmess-echo-accept-loop", async move {
         loop {
             let Ok((sock, _)) = echo_listener.accept().await else { break };
-            tokio::spawn(async move {
+            xray_common::testing::spawn("vmess-echo-conn", async move {
                 let (mut rd, mut wr) = tokio::io::split(sock);
                 let _ = tokio::io::copy(&mut rd, &mut wr).await;
             });
@@ -241,7 +241,7 @@ async fn vmess_multichunk_production_roundtrip_e2e() {
     let vmess_addr = vmess_listener.local_addr().unwrap();
     let ohm2 = Arc::clone(&ohm);
     let validator2 = Arc::clone(&validator);
-    tokio::spawn(async move {
+    xray_common::testing::spawn("vmess-server", async move {
         // sm80④：测试装配传短握手超时（与 serve_vmess 其他测试用例一致）。
         let _ =
             serve_vmess(vmess_listener, ohm2, validator2, None, std::time::Duration::from_secs(10))

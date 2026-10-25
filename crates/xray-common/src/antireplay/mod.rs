@@ -8,6 +8,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use skeleton::clock::{Clock, SystemClock};
+
 /// 防重放过滤器 trait。
 ///
 /// `check` 返回 `true` 表示新值（未见过），`false` 表示重放（已见过）。
@@ -21,14 +23,18 @@ pub trait ReplayFilter<T>: Send + Sync {
 /// 双池时间换代：间隔 `interval` 秒后 poolB ← poolA（旧一代），poolA 清空
 /// （新一代）；判重查两池，因此任意值在 `[interval, 2*interval)` 秒内必被拒，
 /// 超过 `2*interval` 秒后可复用。池无容量上限——旧条目不会被新连接挤出。
-pub struct MapFilter<T: Hash + Eq + Clone + Send + Sync> {
+pub struct MapFilter<T: Hash + Eq + Clone + Send + Sync, C: Clock = SystemClock> {
     pool_a: HashSet<T>,
     pool_b: HashSet<T>,
     interval: Duration,
     last_clean: Instant,
+    /// 时间源契约（bd bf92）：生产 `SystemClock`（std 直通，行为零变化）；
+    /// 测试注入 `MockClock` 得确定性换代时间线。泛型静态分发——`check` 是
+    /// vmess authID 反重放热路径（逐连接逐次取时），禁动态分发开销。
+    clock: C,
 }
 
-impl<T: Hash + Eq + Clone + Send + Sync> MapFilter<T> {
+impl<T: Hash + Eq + Clone + Send + Sync> MapFilter<T, SystemClock> {
     /// 创建过滤器，`interval_secs` 为换代间隔秒数（Go `NewMapFilter(interval)`）。
     #[must_use]
     pub fn new(interval_secs: u64) -> Self {
@@ -37,13 +43,28 @@ impl<T: Hash + Eq + Clone + Send + Sync> MapFilter<T> {
             pool_b: HashSet::new(),
             interval: Duration::from_secs(interval_secs),
             last_clean: Instant::now(),
+            clock: SystemClock,
         }
     }
 }
 
-impl<T: Hash + Eq + Clone + Send + Sync> ReplayFilter<T> for MapFilter<T> {
+impl<T: Hash + Eq + Clone + Send + Sync, C: Clock> MapFilter<T, C> {
+    /// 指定时间源构造（测试注入 `MockClock`）。
+    #[must_use]
+    pub fn with_clock(interval_secs: u64, clock: C) -> Self {
+        Self {
+            pool_a: HashSet::new(),
+            pool_b: HashSet::new(),
+            interval: Duration::from_secs(interval_secs),
+            last_clean: clock.now_instant(),
+            clock,
+        }
+    }
+}
+
+impl<T: Hash + Eq + Clone + Send + Sync, C: Clock> ReplayFilter<T> for MapFilter<T, C> {
     fn check(&mut self, value: &T) -> bool {
-        let now = Instant::now();
+        let now = self.clock.now_instant();
         if now.duration_since(self.last_clean) >= self.interval {
             self.pool_b = std::mem::take(&mut self.pool_a);
             self.last_clean = now;
@@ -57,7 +78,7 @@ impl<T: Hash + Eq + Clone + Send + Sync> ReplayFilter<T> for MapFilter<T> {
     }
 }
 
-impl<T: Hash + Eq + Clone + Send + Sync> Default for MapFilter<T> {
+impl<T: Hash + Eq + Clone + Send + Sync> Default for MapFilter<T, SystemClock> {
     /// 默认 120 秒——vmess authID 反重放的生产值（Go authid.go:71 `NewMapFilter(120)`）。
     fn default() -> Self {
         Self::new(120)
@@ -125,5 +146,24 @@ mod tests {
         assert!(filter.check(&1));
         assert!(!filter.check(&1), "previous generation sits in poolB");
         assert!(filter.check(&1), "forgotten after both pools rotated past it");
+    }
+
+    /// bd bf92：换代节奏跟随注入钟（MockClock 确定性时间线，零 sleep）。
+    /// 真实钟下 `last_clean` 锚真实 Instant，无法呈现「恰好 59_999ms 不换代 /
+    /// +1ms 换代」——注入即被证明；`with_clock` 缺省路径（`new`）行为零变化
+    /// （SystemClock = `Instant::now()` std 直通，上方既有测试全体守护）。
+    #[test]
+    fn rotation_follows_injected_clock() {
+        use skeleton::clock::MockClock;
+        let mut filter = MapFilter::with_clock(60, MockClock::new());
+        assert!(filter.check(&1));
+        filter.clock.advance(Duration::from_millis(59_999));
+        assert!(filter.check(&2), "未到换代间隔：新值照过");
+        assert!(!filter.check(&1), "未换代：旧代 poolA 命中");
+        filter.clock.advance(Duration::from_millis(1)); // 累计 60s → 换代
+        assert!(!filter.check(&1), "换代后 1 落 poolB 仍拒");
+        assert!(!filter.check(&2), "换代后 2 落 poolB 仍拒");
+        filter.clock.advance(Duration::from_secs(60)); // 第二次换代 → 可复用
+        assert!(filter.check(&1), "超过 2×interval 可复用");
     }
 }

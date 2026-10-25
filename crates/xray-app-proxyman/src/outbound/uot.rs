@@ -58,6 +58,9 @@ const DUPLEX_BUF_SIZE: usize = 64 * 1024;
 /// UoT 包最大负载（对应 Go sing `uot` `len:u16` 上限 = u16::MAX = 65535）。
 const UOT_MAX_PAYLOAD: usize = u16::MAX as usize;
 
+/// 读轮 chunk（保持既有 1 KiB 读粒度，wire 不变；仅消除每报文堆分配）。
+const UOT_READ_CHUNK: usize = 1024;
+
 /// UDP `recv_from` 临时缓冲（64 KiB）。
 const UDP_RECV_BUF: usize = 64 * 1024;
 
@@ -400,6 +403,10 @@ pub struct UotClientConn {
     inner: Box<dyn Connection>,
     is_connect: bool,
     destination: SocketAddr,
+    /// 读积累缓冲（跨 `read_from` 复用，免每报文重建 acc）。
+    read_buf: Vec<u8>,
+    /// 写帧缓冲（跨 `write_to` 复用，免每报文建 frame）。
+    write_buf: Vec<u8>,
 }
 
 impl UotClientConn {
@@ -423,7 +430,13 @@ impl UotClientConn {
                 .map_err(|e| io::Error::other(format!("uot: write request: {e}")))?;
             conn.flush().await.map_err(|e| io::Error::other(format!("uot: flush request: {e}")))?;
         }
-        Ok(Self { inner: conn, is_connect, destination })
+        Ok(Self {
+            inner: conn,
+            is_connect,
+            destination,
+            read_buf: Vec::with_capacity(2048),
+            write_buf: Vec::new(),
+        })
     }
 
     /// 发送一个 UDP 数据报到指定目标。
@@ -434,15 +447,16 @@ impl UotClientConn {
         if payload.len() > UOT_MAX_PAYLOAD {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "uot: payload > 65535"));
         }
-        let mut frame = Vec::with_capacity(payload.len() + 32);
+        let frame = &mut self.write_buf;
+        frame.clear();
         if !self.is_connect {
-            encode_socksaddr(&mut frame, dest)?;
+            encode_socksaddr(frame, dest)?;
         }
         let len = payload.len() as u16;
         frame.extend_from_slice(&len.to_be_bytes());
         frame.extend_from_slice(payload);
         self.inner
-            .write_all(&frame)
+            .write_all(frame)
             .await
             .map_err(|e| io::Error::other(format!("uot: write frame: {e}")))?;
         self.inner.flush().await.map_err(|e| io::Error::other(format!("uot: flush frame: {e}")))?;
@@ -453,21 +467,24 @@ impl UotClientConn {
     ///
     /// 返回 `(source, payload)`：connect 模式下 `source` 为构造时传入的固定 destination。
     pub async fn read_from(&mut self) -> io::Result<(SocketAddr, Vec<u8>)> {
-        let mut acc = Vec::with_capacity(2048);
+        let buf = &mut self.read_buf;
+        buf.clear();
         loop {
-            let mut chunk = [0u8; 1024];
+            // 直读进积累缓冲尾段：免 1 KiB 栈 chunk 的中转拷贝；容量跨调用保持高水位。
+            let start = buf.len();
+            buf.resize(start + UOT_READ_CHUNK, 0);
             let n = self
                 .inner
-                .read(&mut chunk)
+                .read(&mut buf[start..])
                 .await
                 .map_err(|e| io::Error::other(format!("uot: read frame: {e}")))?;
             if n == 0 {
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "uot: stream closed"));
             }
-            acc.extend_from_slice(&chunk[..n]);
-            match try_parse_packet(&acc, self.is_connect) {
+            buf.truncate(start + n);
+            match try_parse_packet(buf, self.is_connect) {
                 Ok(Some((parsed_dest, payload_offset, payload_len))) => {
-                    let payload = acc[payload_offset..payload_offset + payload_len].to_vec();
+                    let payload = buf[payload_offset..payload_offset + payload_len].to_vec();
                     let dest = if self.is_connect { self.destination } else { parsed_dest };
                     return Ok((dest, payload));
                 },
@@ -749,5 +766,43 @@ mod tests {
 
         drop(server_ctrl);
         drop(stream_conn);
+    }
+
+    /// NF-6：`read_from` 跨调用复用积累缓冲——大包撑起的高水位容量在后续
+    /// 小包读取时保持（旧实现每报文 `Vec::with_capacity(2048)` 重建会退回）。
+    #[tokio::test]
+    async fn client_conn_read_from_reuses_accumulator() {
+        let (mut client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
+        let conn: Box<dyn Connection> = Box::new(DuplexConnection::new(server_io));
+        let dest: SocketAddr = "192.0.2.42:65000".parse().unwrap();
+        let mut client = UotClientConn::new(conn, false, dest, UotVersion::Legacy).await.unwrap();
+
+        let write_frame = |payload: &[u8]| -> Vec<u8> {
+            let mut frame = Vec::new();
+            encode_socksaddr(&mut frame, dest).unwrap();
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            frame.extend_from_slice(payload);
+            frame
+        };
+
+        // 大包（> 初始 2048 容量）：把缓冲容量撑到高水位。
+        let big = vec![0xABu8; 5000];
+        client_io.write_all(&write_frame(&big)).await.unwrap();
+        client_io.flush().await.unwrap();
+        let (_, got) = client.read_from().await.unwrap();
+        assert_eq!(got, big);
+        let high_water = client.read_buf.capacity();
+        assert!(high_water >= big.len() + 9, "capacity must cover frame: {high_water}");
+
+        // 小包：缓冲 clear 复用，容量保持高水位不回落。
+        client_io.write_all(&write_frame(b"tiny")).await.unwrap();
+        client_io.flush().await.unwrap();
+        let (_, got) = client.read_from().await.unwrap();
+        assert_eq!(got, b"tiny");
+        assert_eq!(
+            client.read_buf.capacity(),
+            high_water,
+            "accumulator must be reused across read_from calls"
+        );
     }
 }

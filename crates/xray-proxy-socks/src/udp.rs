@@ -448,7 +448,10 @@ mod tests {
         let server_addr = listener.local_addr().unwrap();
         let (tx, rx) = oneshot::channel();
         let config = ServerConfig { udp_enabled: true, ..Default::default() };
-        let server = tokio::spawn(run_udp_echo_server(listener, config, false, tx));
+        let server = xray_common::testing::spawn(
+            "socks-outbound-udp-associate-roundtrip-echo",
+            run_udp_echo_server(listener, config, false, tx),
+        );
 
         let client = SocksUdpClient::associate(&ClientConfig::new_noauth(server_addr.to_string()))
             .await
@@ -478,7 +481,10 @@ mod tests {
         let server_addr = listener.local_addr().unwrap();
         let (tx, _rx) = oneshot::channel();
         let config = ServerConfig { udp_enabled: true, ..Default::default() };
-        let server = tokio::spawn(run_udp_echo_server(listener, config, true, tx));
+        let server = xray_common::testing::spawn(
+            "fragmented-frames-dropped-and-counted-echo",
+            run_udp_echo_server(listener, config, true, tx),
+        );
 
         let client = SocksUdpClient::associate(&ClientConfig::new_noauth(server_addr.to_string()))
             .await
@@ -503,19 +509,22 @@ mod tests {
         let server_addr = listener.local_addr().unwrap();
         let mock_relay = UdpSocket::bind("127.0.0.1:0").await.expect("bind relay");
         let relay_port = mock_relay.local_addr().unwrap().port();
-        let server = tokio::spawn(async move {
-            let (mut s, _) = listener.accept().await.expect("accept");
-            let mut m = [0u8; 3]; // method 请求 [05 01 00] 共 3 字节
-            s.read_exact(&mut m).await.expect("method req");
-            s.write_all(&[0x05, 0x00]).await.expect("method reply");
-            let mut req = [0u8; 10];
-            s.read_exact(&mut req).await.expect("associate req");
-            assert_eq!(req[1], CMD_UDP_ASSOCIATE, "客户端应发 UDP ASSOCIATE");
-            // BND.ADDR = 0.0.0.0, BND.PORT = mock relay 端口
-            let mut reply = vec![0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0];
-            reply.extend_from_slice(&relay_port.to_be_bytes());
-            s.write_all(&reply).await.expect("associate reply");
-        });
+        let server = xray_common::testing::spawn(
+            "associate-falls-back-to-server-addr-when-bnd-unspeci-accept",
+            async move {
+                let (mut s, _) = listener.accept().await.expect("accept");
+                let mut m = [0u8; 3]; // method 请求 [05 01 00] 共 3 字节
+                s.read_exact(&mut m).await.expect("method req");
+                s.write_all(&[0x05, 0x00]).await.expect("method reply");
+                let mut req = [0u8; 10];
+                s.read_exact(&mut req).await.expect("associate req");
+                assert_eq!(req[1], CMD_UDP_ASSOCIATE, "客户端应发 UDP ASSOCIATE");
+                // BND.ADDR = 0.0.0.0, BND.PORT = mock relay 端口
+                let mut reply = vec![0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0];
+                reply.extend_from_slice(&relay_port.to_be_bytes());
+                s.write_all(&reply).await.expect("associate reply");
+            },
+        );
 
         let client = SocksUdpClient::associate(&ClientConfig::new_noauth(server_addr.to_string()))
             .await
@@ -549,27 +558,29 @@ mod tests {
         let server_addr = listener.local_addr().unwrap();
         let config = ServerConfig { udp_enabled: true, ..Default::default() };
         let (tx, rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut ctrl, _) = listener.accept().await.expect("accept");
-            let relay = Arc::new(match socks5_server_handshake(&mut ctrl, &config).await {
-                Ok(SocksRequest::UdpAssociate(_, relay)) => relay,
-                Ok(other) => panic!("expected UdpAssociate, got {other:?}"),
-                Err(e) => panic!("handshake: {e}"),
+        let server =
+            xray_common::testing::spawn("ctrl-disconnect-closes-session-accept", async move {
+                let (mut ctrl, _) = listener.accept().await.expect("accept");
+                let relay = Arc::new(match socks5_server_handshake(&mut ctrl, &config).await {
+                    Ok(SocksRequest::UdpAssociate(_, relay)) => relay,
+                    Ok(other) => panic!("expected UdpAssociate, got {other:?}"),
+                    Err(e) => panic!("handshake: {e}"),
+                });
+                // ctrl EOF 监视（独立任务持续读，EOF 时通知）
+                let eof =
+                    xray_common::testing::spawn("ctrl-disconnect-closes-session", async move {
+                        let mut sink = [0u8; 64];
+                        while matches!(ctrl.read(&mut sink).await, Ok(n) if n > 0) {}
+                        let _ = tx.send(());
+                    });
+                // relay 上回显一帧，证明会话已建立
+                let mut buf = vec![0u8; 2048];
+                let (n, peer) = relay.recv_from(&mut buf).await.expect("relay recv");
+                let (dest, payload) = decode_udp_packet(&buf[..n]).expect("decode");
+                let resp = encode_udp_packet(&dest, payload);
+                let _ = relay.send_to(&resp, peer).await;
+                eof.await.ok();
             });
-            // ctrl EOF 监视（独立任务持续读，EOF 时通知）
-            let eof = tokio::spawn(async move {
-                let mut sink = [0u8; 64];
-                while matches!(ctrl.read(&mut sink).await, Ok(n) if n > 0) {}
-                let _ = tx.send(());
-            });
-            // relay 上回显一帧，证明会话已建立
-            let mut buf = vec![0u8; 2048];
-            let (n, peer) = relay.recv_from(&mut buf).await.expect("relay recv");
-            let (dest, payload) = decode_udp_packet(&buf[..n]).expect("decode");
-            let resp = encode_udp_packet(&dest, payload);
-            let _ = relay.send_to(&resp, peer).await;
-            eof.await.ok();
-        });
 
         let mut client =
             SocksUdpClient::associate(&ClientConfig::new_noauth(server_addr.to_string()))
@@ -597,11 +608,14 @@ mod tests {
     async fn associate_rejected_when_udp_disabled() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let server_addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut s, _) = listener.accept().await.expect("accept");
-            // udp_enabled=false → handshake 自动回 CMD not supported 并 Err
-            let _ = socks5_server_handshake(&mut s, &ServerConfig::default()).await;
-        });
+        let server = xray_common::testing::spawn(
+            "associate-rejected-when-udp-disabled-accept",
+            async move {
+                let (mut s, _) = listener.accept().await.expect("accept");
+                // udp_enabled=false → handshake 自动回 CMD not supported 并 Err
+                let _ = socks5_server_handshake(&mut s, &ServerConfig::default()).await;
+            },
+        );
         let r = SocksUdpClient::associate(&ClientConfig::new_noauth(server_addr.to_string())).await;
         assert!(r.is_err(), "udp disabled 时 associate 必须失败");
         server.abort();
@@ -635,11 +649,12 @@ mod tests {
         // 测试进程内 UDP echo target（Go freedom 把数据报送回这里）
         let echo = UdpSocket::bind("127.0.0.1:0").await.expect("bind echo");
         let echo_port = echo.local_addr().unwrap().port();
-        let echo_task = tokio::spawn(async move {
-            let mut buf = [0u8; 2048];
-            let (n, peer) = echo.recv_from(&mut buf).await.expect("echo recv");
-            let _ = echo.send_to(&buf[..n], peer).await;
-        });
+        let echo_task =
+            xray_common::testing::spawn("interop-go-socks-inbound-udp-echo-echo", async move {
+                let mut buf = [0u8; 2048];
+                let (n, peer) = echo.recv_from(&mut buf).await.expect("echo recv");
+                let _ = echo.send_to(&buf[..n], peer).await;
+            });
 
         let client = SocksUdpClient::associate(&ClientConfig::new_noauth(go_addr))
             .await

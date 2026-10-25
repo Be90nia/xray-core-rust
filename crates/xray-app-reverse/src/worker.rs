@@ -922,9 +922,12 @@ mod entity_tests {
             let c = Arc::clone(worker.client());
             let d = user_dest.clone();
             let (r, w) = pipe::new();
-            tokio::spawn(async move {
-                c.dispatch(&d, MuxLink { reader: Box::new(r), writer: Box::new(w) }).await;
-            });
+            xray_common::testing::spawn(
+                "portal-worker-drains-over-threshold-and-disposes",
+                async move {
+                    c.dispatch(&d, MuxLink { reader: Box::new(r), writer: Box::new(w) }).await;
+                },
+            );
         }
 
         // 下一心跳（≤4s）：DRAIN Control 经既有 control session 的 Keep 帧送达

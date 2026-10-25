@@ -507,7 +507,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let fqdn_owned = fqdn.to_string();
 
-        let handle = tokio::spawn(async move {
+        let handle = xray_common::testing::spawn("spawn-mock-doh-server-accept", async move {
             let (sock, _) = listener.accept().await.unwrap();
             let tcp = TcpConnection::new(sock);
             let tls = acceptor.accept(tcp).await.unwrap();
@@ -584,7 +584,7 @@ mod tests {
     async fn h2c_plain_roundtrip_through_query_ip() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("h2c-plain-roundtrip-through-query-ip-accept", async move {
             let (sock, _) = listener.accept().await.unwrap();
             let mut h2_conn = server::handshake(sock).await.unwrap();
             while let Some(req_result) = h2_conn.accept().await {
@@ -767,7 +767,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        tokio::spawn(async move {
+        xray_common::testing::spawn("doh-query-http-status-error-accept", async move {
             let (sock, _) = listener.accept().await.unwrap();
             let tcp = TcpConnection::new(sock);
             let tls = acceptor.accept(tcp).await.unwrap();
@@ -832,7 +832,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("spawn-hanging-doh-server-accept", async move {
             let Ok((sock, _)) = listener.accept().await else { return };
             let Ok(tls) = acceptor.accept(TcpConnection::new(sock)).await else { return };
             let Ok(mut h2_conn) = server::handshake(tls).await else { return };
@@ -865,7 +865,7 @@ mod tests {
         fqdn: &'static str,
     ) -> (Duration, Result<(Vec<IpAddr>, u32), DnsError>) {
         tokio::time::pause();
-        let handle = tokio::spawn(async move {
+        let handle = xray_common::testing::spawn("run-paused-query", async move {
             srv.query_ip(
                 fqdn,
                 IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },

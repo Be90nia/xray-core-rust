@@ -889,7 +889,7 @@ mod tests {
         // 1. echo server
         let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_port = echo_listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("vless-inbound-to-freedom-outbound-e2e-accept", async move {
             let (mut sock, _) = echo_listener.accept().await.unwrap();
             let mut buf = [0u8; 1024];
             loop {
@@ -922,7 +922,7 @@ mod tests {
         let vless_addr = vless_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
-        tokio::spawn(async move {
+        xray_common::testing::spawn("vless-inbound-to-freedom-outbound-e2e-echo", async move {
             let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None, None, None).await;
         });
 
@@ -972,7 +972,7 @@ mod tests {
         let vless_addr = vless_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
-        tokio::spawn(async move {
+        xray_common::testing::spawn("vless-inbound-rejects-unknown-user", async move {
             let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None, None, None).await;
         });
 
@@ -1012,24 +1012,30 @@ mod tests {
         // echo server（accept 循环：两个合法连接各回显一次）
         let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_port = echo_listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = echo_listener.accept().await else { break };
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 1024];
-                    loop {
-                        match sock.read(&mut buf).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => {
-                                if sock.write_all(&buf[..n]).await.is_err() {
-                                    break;
+        xray_common::testing::spawn(
+            "vless-inbound-authenticates-two-email-less-clients-accept",
+            async move {
+                loop {
+                    let Ok((mut sock, _)) = echo_listener.accept().await else { break };
+                    xray_common::testing::spawn(
+                        "vless-inbound-authenticates-two-email-less-clients",
+                        async move {
+                            let mut buf = [0u8; 1024];
+                            loop {
+                                match sock.read(&mut buf).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => {
+                                        if sock.write_all(&buf[..n]).await.is_err() {
+                                            break;
+                                        }
+                                    },
                                 }
-                            },
-                        }
-                    }
-                });
-            }
-        });
+                            }
+                        },
+                    );
+                }
+            },
+        );
 
         // 2 个无 email 用户（模拟生产 settings.clients 无 email 字段）
         let ids = ["b831381d-6324-4d53-ad4f-8cda48b30811", "66ad4540-b58c-4ad2-9926-ea63445a9b57"];
@@ -1061,9 +1067,12 @@ mod tests {
         .await
         .unwrap();
         let vless_addr = vless_listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = serve_vless(vless_listener, ohm, validator, None, None, None).await;
-        });
+        xray_common::testing::spawn(
+            "vless-inbound-authenticates-two-email-less-clients-echo",
+            async move {
+                let _ = serve_vless(vless_listener, ohm, validator, None, None, None).await;
+            },
+        );
 
         // 两个合法 UUID：握手（响应头）+ echo 回环均通过
         for id in ids {
@@ -1121,7 +1130,7 @@ mod tests {
     ) -> (std::net::SocketAddr, u16, UUID) {
         let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_port = echo_listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("spawn-vless-proxy-with-echo-accept", async move {
             let (mut sock, _) = echo_listener.accept().await.unwrap();
             let mut buf = [0u8; 1024];
             loop {
@@ -1147,7 +1156,7 @@ mod tests {
         .await
         .unwrap();
         let vless_addr = vless_listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("spawn-vless-proxy-with-echo", async move {
             let _ = serve_vless(
                 vless_listener,
                 ohm,
@@ -1217,7 +1226,7 @@ mod tests {
         // 1. UDP echo
         let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let echo_port = echo.local_addr().unwrap().port();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("vless-outbound-udp-roundtrip-e2e-echo", async move {
             let mut buf = [0u8; 2048];
             while let Ok((n, from)) = echo.recv_from(&mut buf).await {
                 let _ = echo.send_to(&buf[..n], from).await;
@@ -1239,7 +1248,7 @@ mod tests {
         .await
         .unwrap();
         let vless_addr = vless_listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("vless-outbound-udp-roundtrip-e2e", async move {
             let _ = serve_vless(
                 vless_listener,
                 ohm,
@@ -1368,9 +1377,9 @@ mod tests {
         // 多连接 echo（testpre worker 会预拨 + 补货，单 accept 不够）。
         let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_port = echo_listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("vless-testpre-preconnect-e2e-roundtrip-accept", async move {
             while let Ok((mut sock, _)) = echo_listener.accept().await {
-                tokio::spawn(async move {
+                xray_common::testing::spawn("vless-testpre-preconnect-e2e-roundtrip", async move {
                     let mut buf = [0u8; 1024];
                     loop {
                         match sock.read(&mut buf).await {
@@ -1398,7 +1407,7 @@ mod tests {
         .await
         .unwrap();
         let vless_addr = vless_listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("vless-testpre-preconnect-e2e-roundtrip", async move {
             let _ = serve_vless(vless_listener, ohm, validator, None, None, None).await;
         });
 
@@ -1549,7 +1558,7 @@ mod tests {
         let vless_addr = vless_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
-        tokio::spawn(async move {
+        xray_common::testing::spawn("vless-inbound-udp-relay-e2e", async move {
             let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None, None, None).await;
         });
 
@@ -1644,13 +1653,15 @@ mod tests {
         let validator: Arc<dyn Validator> = validator;
 
         let (mut client, server_stream) = tokio::io::duplex(64 * 1024);
-        let server = tokio::spawn({
-            let handler_for_task = handler.clone();
-            let validator = validator.clone();
-            async move {
-                handle_connection(server_stream, &handler_for_task, &validator, None, None).await
-            }
-        });
+        let server =
+            xray_common::testing::spawn("vless-handshake-timeout-closes-silent-connection", {
+                let handler_for_task = handler.clone();
+                let validator = validator.clone();
+                async move {
+                    handle_connection(server_stream, &handler_for_task, &validator, None, None)
+                        .await
+                }
+            });
 
         // 静默不发任何字节：跳过握手限时（cfg(test) 下为 100ms）。
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -1753,9 +1764,13 @@ mod tests {
         let vless_addr = vless_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
-        tokio::spawn(async move {
-            let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None, None, None).await;
-        });
+        xray_common::testing::spawn(
+            "vless-inbound-mux-command-dispatches-real-new-frame",
+            async move {
+                let _ =
+                    serve_vless(vless_listener, ohm_clone, validator_clone, None, None, None).await;
+            },
+        );
 
         // 真实 mux New 帧：new session 1 → TCP 127.0.0.1:8080
         let new_frame: &[u8] = &[
@@ -1837,7 +1852,7 @@ mod tests {
             handshake_timeout: None,
             allowed_network: None,
         };
-        tokio::spawn(async move {
+        xray_common::testing::spawn("vless-inbound-rvs-disabled-warns-and-skips", async move {
             let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None, None, Some(opts))
                 .await;
         });
@@ -1903,10 +1918,14 @@ mod tests {
             outer_tls13: false,
             allowed_network: None,
         };
-        tokio::spawn(async move {
-            let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None, None, Some(opts))
-                .await;
-        });
+        xray_common::testing::spawn(
+            "vless-inbound-rvs-enabled-with-registry-uses-registr",
+            async move {
+                let _ =
+                    serve_vless(vless_listener, ohm_clone, validator_clone, None, None, Some(opts))
+                        .await;
+            },
+        );
 
         let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
         encode_request_header(
@@ -2214,7 +2233,7 @@ mod tests {
         let handler_for_task = Arc::clone(&handler);
         let decoded_for_task = decoded.clone();
 
-        let relay = tokio::spawn(async move {
+        let relay = xray_common::testing::spawn("udp-relay-no-head-of-line-block", async move {
             handle_udp_relay(
                 server_read,
                 server_write,

@@ -194,7 +194,8 @@ impl UdpNameServer {
             .await
             .map_err(|e| DnsError::WireFormat(format!("udp send: {e}")))?;
 
-        let mut buf = vec![0u8; UDP_RECV_BUF];
+        // 栈上收包缓冲（4 KiB）：免每查询堆分配（NF-7）。
+        let mut buf = [0u8; UDP_RECV_BUF];
         let n = timeout(self.query_timeout, sock.recv(&mut buf))
             .await
             .map_err(|_| {
@@ -379,7 +380,7 @@ mod tests {
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = sock.local_addr().unwrap();
         let fqdn_owned = fqdn.to_string();
-        let handle = tokio::spawn(async move {
+        let handle = xray_common::testing::spawn("spawn-mock-udp-server-udp", async move {
             let mut buf = vec![0u8; 4096];
             let (n, peer) = sock.recv_from(&mut buf).await.unwrap();
             // 解析 query 取 ID。
@@ -583,14 +584,13 @@ mod tests {
     }
 
     impl crate::dial::UdpPacketSession for ConnectedUdpSession {
-        fn send_packet(
-            &mut self,
+        fn send_packet<'s>(
+            &'s mut self,
             _dest: &Destination,
-            payload: &[u8],
-        ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            payload: &'s [u8],
+        ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 's>> {
             let sock = &self.sock;
-            let payload = payload.to_vec();
-            Box::pin(async move { sock.send(&payload).await.map(|_| ()) })
+            Box::pin(async move { sock.send(payload).await.map(|_| ()) })
         }
 
         fn recv_packet(

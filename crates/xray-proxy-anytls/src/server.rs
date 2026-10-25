@@ -551,10 +551,10 @@ mod tests {
     async fn start_echo_server() -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("start-echo-server-accept", async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else { break };
-                tokio::spawn(async move {
+                xray_common::testing::spawn("start-echo-server", async move {
                     let mut buf = vec![0u8; 4096];
                     loop {
                         match sock.read(&mut buf).await {
@@ -641,12 +641,12 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let active_spawn = active.clone();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("start-tracked-echo-server-accept", async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else { break };
                 active_spawn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let counter = active_spawn.clone();
-                tokio::spawn(async move {
+                xray_common::testing::spawn("start-tracked-echo-server", async move {
                     let mut buf = vec![0u8; 4096];
                     loop {
                         match sock.read(&mut buf).await {

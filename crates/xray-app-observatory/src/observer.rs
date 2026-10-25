@@ -9,10 +9,11 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use parking_lot::Mutex;
+use skeleton::clock::{Clock, SystemClock};
 use skeleton_infra::fx::FxScope;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
@@ -47,9 +48,14 @@ pub trait ProbeExecutor: Send + Sync {
     fn probe(&self, outbound_tag: &str) -> ProbeResult;
 }
 
+/// Clock 契约取秒（挂钟展示面）——status 时间戳统一入口（bd bf92 时钟扩面）。
+fn unix_secs_of(clock: &dyn Clock) -> i64 {
+    clock.now_system().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
 /// 当前 Unix 时间（秒），用于 status 时间戳。
 pub fn now_unix_secs() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+    unix_secs_of(&SystemClock)
 }
 
 /// P3-3 统一观测流落点：每条探测结果经 `xray_frame::observe` 四元组
@@ -166,6 +172,9 @@ pub struct Observer {
     /// B6（bd t975）：后台观察循环唯一托管口（坑约束 5）。scope 随 Observer
     /// drop 兜底 abort；协作停机仍走 cancel_rx（与 Go Task.Close 语义一致）。
     fx: Arc<FxScope>,
+    /// 时间源契约（bd bf92）：status 时间戳走 `skeleton::clock`。生产
+    /// `SystemClock`；测试注入 `MockClock` 得确定性时间线。
+    clock: Arc<dyn Clock>,
 }
 
 struct ObserverState {
@@ -181,6 +190,7 @@ impl Observer {
             state: Mutex::new(ObserverState { started: false, cancel_tx: None }),
             observe: None,
             fx: Arc::new(FxScope::new()),
+            clock: Arc::new(SystemClock),
         }
     }
 
@@ -189,6 +199,14 @@ impl Observer {
     #[must_use]
     pub fn with_observe(mut self, sink: Arc<ObserveSink>) -> Self {
         self.observe = Some(sink);
+        self
+    }
+
+    /// 接线时间源（bd bf92）：测试注入 `MockClock` 后 status 时间戳确定性
+    /// 可断言。builder 形态——既有 `new` 构造面零变化（P1-12 同款）。
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
         self
     }
 
@@ -234,6 +252,7 @@ impl Observer {
         let observe = self.observe.clone();
         let probe_url = self.config.effective_probe_url().to_string();
         let fx = Arc::clone(&self.fx);
+        let clock = Arc::clone(&self.clock);
         // 闸关不可达：内部 scope 无 close 调用（停机走 cancel_rx 协作退出）。
         fx.spawn(async move {
             let mut cancel_rx = cancel_rx;
@@ -242,7 +261,7 @@ impl Observer {
                 let round_failed = match selector.select(&subject_selector) {
                     Ok(tags) => {
                         status.clear_removed(&tags);
-                        let now = now_unix_secs();
+                        let now = unix_secs_of(clock.as_ref());
                         // 4j5m：probe 是同步阻塞契约（内部自建线程 + 独立
                         // runtime）。此前逐 tag 串行直调，async task 所在的
                         let exec = executor.clone();
@@ -343,7 +362,7 @@ impl Observer {
             executor,
             &self.status,
             self.config.enable_concurrency,
-            now_unix_secs(),
+            unix_secs_of(self.clock.as_ref()),
             self.observe.as_deref(),
             self.config.effective_probe_url(),
         );
@@ -354,7 +373,7 @@ impl Observer {
         let result = executor.probe(tag);
         let (peer, dest) = probe_peer_dest(self.config.effective_probe_url());
         emit_probe_event(self.observe.as_deref(), &peer, &dest, tag, &result);
-        self.status.update_with_probe_result(tag, &result, now_unix_secs());
+        self.status.update_with_probe_result(tag, &result, unix_secs_of(self.clock.as_ref()));
     }
 
     /// 返回当前观测快照。
@@ -596,6 +615,24 @@ mod tests {
         assert_eq!(obs.status[0].outbound_tag, "a");
     }
 
+    /// bd bf92：status 时间戳跟随注入钟。MockClock 挂钟面 = UNIX_EPOCH + 虚拟
+    /// 偏移，偏移 0 → `last_try_time` = 0——真实钟恒 ≈1.7e9，注入即被证明；
+    /// 缺省 SystemClock 路径行为零变化（其余既有测试守护）。
+    #[test]
+    fn probe_one_timestamp_follows_injected_clock() {
+        use skeleton::clock::MockClock;
+        let clock = Arc::new(MockClock::new());
+        let o = Observer::new(cfg_with_selector(&["a"])).with_clock(clock);
+        let executor = FixedProbeExecutor::new().with_result(
+            "a",
+            ProbeResult { alive: true, delay: 10, last_error_reason: String::new() },
+        );
+        o.probe_one("a", &executor);
+        let st = o.status_store().snapshot();
+        assert_eq!(st[0].outbound_tag, "a");
+        assert_eq!(st[0].last_try_time, 0, "ts 必须取注入钟挂钟面（UNIX_EPOCH + 0 偏移）");
+    }
+
     #[test]
     fn clear_removed_drops_unlisted() {
         let o = Observer::new(cfg_with_selector(&["a", "b"]));
@@ -698,16 +735,21 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 512];
-            let n = sock.read(&mut buf).await.unwrap();
-            // 任何 HTTP/1.1 请求 → 返 200 即可。
-            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+        let server = xray_common::testing::spawn(
+            "http-probe-executor-runs-against-echo-server-accept",
+            async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 512];
+                let n = sock.read(&mut buf).await.unwrap();
+                // 任何 HTTP/1.1 请求 → 返 200 即可。
+                sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                )
                 .await
                 .unwrap();
-            let _ = n;
-        });
+                let _ = n;
+            },
+        );
 
         let exec = HttpProbeExecutor::new(format!("http://{addr}/"), "GET".to_string(), 5_000);
         let result = tokio::task::spawn_blocking(move || exec.probe("test-tag"))
@@ -823,6 +865,10 @@ mod tests {
         let mock_addr = listener.local_addr().unwrap();
         let mock_ip = mock_addr.ip().to_string();
         let mock_port = mock_addr.port();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "测试脚手架 OS 线程（real_outbound_probe_two_tags_diverge）；无 PluginContext 可穿，按 clippy.toml 指引逐处登记"
+        )]
         std::thread::spawn(move || {
             if let Ok((mut sock, _)) = listener.accept() {
                 use std::io::{Read as _, Write as _};
@@ -907,6 +953,10 @@ mod tests {
         let mock_addr = listener.local_addr().unwrap();
         let mock_ip = mock_addr.ip().to_string();
         let mock_port = mock_addr.port();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "测试脚手架 OS 线程（tls_probe_rejects_syn_ack_only_target）；无 PluginContext 可穿，按 clippy.toml 指引逐处登记"
+        )]
         std::thread::spawn(move || {
             let _ = listener.accept();
         });
@@ -1620,7 +1670,7 @@ mod link_conn_tests {
         // 服务端：读请求 → 回响应 → 显式 shutdown 写端。
         // pipe 写端 drop 不触发 close（buf pipe 无 Drop impl）——不 shutdown
         // 读端永远 Pending。
-        tokio::spawn(async move {
+        xray_common::testing::spawn("link-conn-echo-server", async move {
             use xray_buf::io::Writer as _;
             let mut w = s_w;
             let mut r = s_r;

@@ -321,21 +321,22 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().unwrap().port();
         let server_account = account.clone();
-        let server_handle = tokio::spawn(async move {
-            let (conn, _) = listener.accept().await.expect("accept");
-            let (header, mut stream) =
-                read_request(conn, &server_account, "u@x.com", 0).await.expect("read_request");
+        let server_handle =
+            xray_common::testing::spawn("client-server-loopback-aes-128-accept", async move {
+                let (conn, _) = listener.accept().await.expect("accept");
+                let (header, mut stream) =
+                    read_request(conn, &server_account, "u@x.com", 0).await.expect("read_request");
 
-            // 读 body chunk
-            let body = stream.read_chunk().await.expect("read body").expect("body");
+                // 读 body chunk
+                let body = stream.read_chunk().await.expect("read body").expect("body");
 
-            // 写响应
-            let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
-            stream.write_chunk(resp).await.expect("write resp");
-            stream.flush().await.expect("flush resp");
+                // 写响应
+                let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+                stream.write_chunk(resp).await.expect("write resp");
+                stream.flush().await.expect("flush resp");
 
-            (header, body)
-        });
+                (header, body)
+            });
 
         // client: dial_target + send body + read response
         let client = Client::new(account, "127.0.0.1".to_string(), port);
@@ -369,15 +370,16 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().unwrap().port();
         let server_account = account.clone();
-        let server_handle = tokio::spawn(async move {
-            let (conn, _) = listener.accept().await.expect("accept");
-            let (_h, mut stream) =
-                read_request(conn, &server_account, "u@x.com", 0).await.expect("read_request");
-            let body = stream.read_chunk().await.expect("read").expect("body");
-            stream.write_chunk(b"resp").await.expect("write");
-            stream.flush().await.expect("flush");
-            body
-        });
+        let server_handle =
+            xray_common::testing::spawn("client-server-loopback-aes-256-accept", async move {
+                let (conn, _) = listener.accept().await.expect("accept");
+                let (_h, mut stream) =
+                    read_request(conn, &server_account, "u@x.com", 0).await.expect("read_request");
+                let body = stream.read_chunk().await.expect("read").expect("body");
+                stream.write_chunk(b"resp").await.expect("write");
+                stream.flush().await.expect("flush");
+                body
+            });
 
         let client = Client::new(account, "127.0.0.1".to_string(), port);
         let target = Address::Domain("test.com".to_string());

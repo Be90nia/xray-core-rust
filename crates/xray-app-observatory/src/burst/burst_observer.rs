@@ -26,10 +26,11 @@ use std::{
         Arc,
         atomic::{AtomicPtr, Ordering},
     },
-    time::Duration,
+    time::{Duration, UNIX_EPOCH},
 };
 
 use parking_lot::Mutex;
+use skeleton::clock::{Clock, SystemClock};
 use skeleton_infra::fx::FxScope;
 
 use super::{HealthPingRtts, HealthPingSettings, RTT_FAILED};
@@ -38,10 +39,17 @@ use crate::{
     observer::ProbeExecutor,
 };
 
+/// Clock 契约取纳秒（挂钟展示面）——healthping 时间戳统一入口（bd bf92）。
+fn unix_nanos_of(clock: &dyn Clock) -> i64 {
+    clock.now_system().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0)
+}
+
 /// 当前 Unix 时间（纳秒），与 healthping_stats 时间单位一致。
+/// bd bf92 后生产调用点全部走 [`unix_nanos_of`]（注入钟）；本 fn 仅测试面
+/// 对照用（SystemClock 直通 = 旧行为）。
+#[cfg(test)]
 fn now_unix_nanos() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0)
+    unix_nanos_of(&SystemClock)
 }
 
 /// Scheduler 状态：start_scheduler 后填充，stop_scheduler 后清空。
@@ -72,6 +80,9 @@ pub struct BurstObserver {
     /// B6（bd t975）：后台 ticker 唯一托管口（坑约束 5）。scope 随 Self drop
     /// 兜底 abort；协作停机仍走 shutdown_rx（与 Go StopScheduler 语义一致）。
     fx: Arc<FxScope>,
+    /// 时间源契约（bd bf92）：样本/快照时间戳走 `skeleton::clock`。生产
+    /// `SystemClock`；测试注入 `MockClock` 得确定性时间线。
+    clock: Arc<dyn Clock>,
 }
 
 impl BurstObserver {
@@ -91,7 +102,16 @@ impl BurstObserver {
             cancel_pending: AtomicPtr::new(std::ptr::null_mut()),
             scheduler: Mutex::new(None),
             fx: Arc::new(FxScope::new()),
+            clock: Arc::new(SystemClock),
         }
+    }
+
+    /// 接线时间源（bd bf92）：测试注入 `MockClock` 后样本/快照时间戳确定性
+    /// 可断言。builder 形态——既有 `new` 构造面零变化。
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// 获取归一化后的运行时设置（对应 Go `HealthPing.Settings`）。
@@ -108,7 +128,7 @@ impl BurstObserver {
         if tags.is_empty() {
             return HashMap::new(); // Go healthping.go:149-151：空 tags no-op
         }
-        let now = now_unix_nanos();
+        let now = unix_nanos_of(self.clock.as_ref());
         // 锁外探测（对齐 Go doCheck：MeasureDelay 不持 access 锁）。
         let mut results = Vec::with_capacity(tags.len());
         for tag in tags {
@@ -242,7 +262,7 @@ impl BurstObserver {
         // 记录入口时的 cancel-pending 标记，逐轮比对：
         // 若被覆盖则提前退出（对应 Go healthping.go:217-229）。
         let entry_cancel = self.cancel_pending.load(Ordering::Acquire);
-        let now = now_unix_nanos();
+        let now = unix_nanos_of(self.clock.as_ref());
         // 锁外探测：收集 (tag, samples)，probe 不持 rtts 锁。
         let mut collected: Vec<(String, Vec<i64>)> = Vec::with_capacity(tags.len());
         let mut cancelled = false;
@@ -310,7 +330,7 @@ impl BurstObserver {
     /// - `health_ping` 含 All/Fail/Deviation/Average/Max/Min 6 字段 （Go burstobserver.go:50-57）
     /// - `last_seen_time` / `last_try_time` / `last_error_reason` 留默认（Go 端恒为 0/""）
     pub fn create_result(&self) -> Vec<OutboundStatus> {
-        let now = now_unix_nanos();
+        let now = unix_nanos_of(self.clock.as_ref());
         let g = self.rtts.lock();
         let mut result = Vec::with_capacity(g.len());
         for (name, value) in g.iter() {
@@ -527,6 +547,33 @@ mod tests {
             obs.rtts.lock().get("a").expect("a should have samples").statistics(now_unix_nanos());
         assert_eq!(a_stats.all, 3);
         assert_eq!(a_stats.fail, 0);
+    }
+
+    /// bd bf92：样本时间戳跟随注入钟。MockClock 挂钟面 = UNIX_EPOCH + 偏移：
+    /// 偏移 0 时采样 ts=0，推进 245s（> validity 240s = interval×count×2）后
+    /// 样本必过期——真实钟下 ts≈1.7e18 永不可能呈现此形态，注入即被证明；
+    /// 缺省 SystemClock 路径行为零变化（上方既有测试全体守护）。
+    #[test]
+    fn check_timestamps_follow_injected_clock() {
+        use skeleton::clock::MockClock;
+        let clock = Arc::new(MockClock::new());
+        let settings = HealthPingSettings {
+            interval: 60_000_000_000,
+            sampling_count: 2,
+            ..HealthPingSettings::default()
+        };
+        // validity = interval × count × 2 = 240s
+        let obs = BurstObserver::new(settings).with_clock(clock.clone());
+        let executor = FixedProbeExecutor::new().with_result("a", alive(1_000_000));
+        obs.check(&["a".to_string()], &executor);
+        clock.advance(Duration::from_millis(245_000));
+        let stats = obs
+            .rtts
+            .lock()
+            .get("a")
+            .expect("a should have samples")
+            .statistics(unix_nanos_of(clock.as_ref()));
+        assert_eq!(stats.all, 0, "样本 ts = 注入钟 0 点，推进 245s（> validity 240s）后必过期");
     }
 
     #[test]

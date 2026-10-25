@@ -736,7 +736,7 @@ mod udp_assoc_tests {
     async fn start_udp_echo() -> SocketAddr {
         let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind echo");
         let addr = sock.local_addr().expect("local_addr");
-        tokio::spawn(async move {
+        xray_common::testing::spawn("start-udp-echo-udp", async move {
             let mut buf = vec![0u8; 65_536];
             loop {
                 let Ok((n, peer)) = sock.recv_from(&mut buf).await else { break };
@@ -752,7 +752,7 @@ mod udp_assoc_tests {
     async fn start_udp_meta_echo() -> SocketAddr {
         let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind meta echo");
         let addr = sock.local_addr().expect("local_addr");
-        tokio::spawn(async move {
+        xray_common::testing::spawn("start-udp-meta-echo-udp", async move {
             let mut buf = vec![0u8; 65_536];
             loop {
                 let Ok((n, peer)) = sock.recv_from(&mut buf).await else { break };
@@ -786,7 +786,7 @@ mod udp_assoc_tests {
         .await
         .expect("mock server bind");
         let server_addr = server.local_addr();
-        let task = tokio::spawn(async move {
+        let task = xray_common::testing::spawn("connect-mock", async move {
             let _ = server.run().await;
         });
         let client = tokio::time::timeout(
@@ -1140,7 +1140,7 @@ mod tls_connect_tests {
         .await
         .expect("mock server bind");
         let addr = server.local_addr();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("verifying-client-rejects-self-signed", async move {
             let _ = server.run().await;
         });
 
@@ -1185,7 +1185,7 @@ mod tls_connect_tests {
         .await
         .expect("mock server bind");
         let addr = server.local_addr();
-        tokio::spawn(async move {
+        xray_common::testing::spawn("connect-with-bbr-and-custom-alpn-ok", async move {
             let _ = server.run().await;
         });
 

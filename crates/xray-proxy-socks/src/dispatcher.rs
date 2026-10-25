@@ -117,33 +117,42 @@ mod tests {
         // 启动 echo socks server
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            // accept Err 时保持轮询（mock listener 生命周期内 Err 仅瞬时；while let 会提前退出）
-            #[allow(clippy::while_let_loop)] // mock accept Err 瞬时需保持轮询，loop+if let 即语义
-            loop {
-                if let Ok((mut sock, _)) = listener.accept().await {
-                    tokio::spawn(async move {
-                        let _target =
-                            socks5_server_handshake(&mut sock, &ServerConfig::default()).await;
-                        // echo
-                        let mut buf = [0u8; 256];
-                        loop {
-                            match sock.read(&mut buf).await {
-                                Ok(0) | Err(_) => break,
-                                Ok(n) => {
-                                    if sock.write_all(&buf[..n]).await.is_err() {
-                                        break;
+        let server = xray_common::testing::spawn(
+            "make-dial-fn-e2e-through-mock-socks-server-accept",
+            async move {
+                // accept Err 时保持轮询（mock listener 生命周期内 Err 仅瞬时；while let
+                // 会提前退出）
+                #[allow(clippy::while_let_loop)]
+                // mock accept Err 瞬时需保持轮询，loop+if let 即语义
+                loop {
+                    if let Ok((mut sock, _)) = listener.accept().await {
+                        xray_common::testing::spawn(
+                            "make-dial-fn-e2e-through-mock-socks-server-echo",
+                            async move {
+                                let _target =
+                                    socks5_server_handshake(&mut sock, &ServerConfig::default())
+                                        .await;
+                                // echo
+                                let mut buf = [0u8; 256];
+                                loop {
+                                    match sock.read(&mut buf).await {
+                                        Ok(0) | Err(_) => break,
+                                        Ok(n) => {
+                                            if sock.write_all(&buf[..n]).await.is_err() {
+                                                break;
+                                            }
+                                        },
                                     }
-                                },
-                            }
-                        }
-                        let _ = sock;
-                    });
-                } else {
-                    break;
+                                }
+                                let _ = sock;
+                            },
+                        );
+                    } else {
+                        break;
+                    }
                 }
-            }
-        });
+            },
+        );
 
         // 构造 DialFn
         let client = Arc::new(SocksClient::new(ClientConfig::new_noauth(server_addr.to_string())));

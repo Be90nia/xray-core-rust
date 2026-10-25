@@ -957,12 +957,15 @@ mod tests {
             Arc::new(AsyncMutex::new(WgNetStack::new(&[local], 1420)));
         let (dispatch, calls) = make_dispatch();
         let registry = test_registry();
-        tokio::spawn(wg_accept_loop(
-            Arc::clone(&netstack),
-            registry,
-            dispatch,
-            Arc::new(skeleton_infra::fx::FxScope::new()),
-        ));
+        xray_common::testing::spawn(
+            "accept-loop-lazy-listen-dispatches-syn",
+            wg_accept_loop(
+                Arc::clone(&netstack),
+                registry,
+                dispatch,
+                Arc::new(skeleton_infra::fx::FxScope::new()),
+            ),
+        );
 
         // 隧道内 client 10.0.0.2:5555 → server 10.0.0.1:80 的 SYN
         {
@@ -1078,7 +1081,10 @@ mod tests {
         )));
         let client = Arc::new(WgDriver::new(client_peer, client_sock, Arc::clone(&client_ns)));
         client.set_remote(SocketAddr::from(([127, 0, 0, 1], udp_port)));
-        tokio::spawn(Arc::clone(&client).main_loop());
+        xray_common::testing::spawn(
+            "tunnel-tcp-end-to-end-echoes",
+            Arc::clone(&client).main_loop(),
+        );
 
         // 隧道内 TCP connect 10.0.0.1:8080
         let handle = {
@@ -1220,7 +1226,10 @@ mod tests {
         )));
         let client = Arc::new(WgDriver::new(client_peer, client_sock, Arc::clone(&client_ns)));
         client.set_remote(SocketAddr::from(([127, 0, 0, 1], udp_port)));
-        tokio::spawn(Arc::clone(&client).main_loop());
+        xray_common::testing::spawn(
+            "tunnel-tcp-inbound-large-response-no-truncation",
+            Arc::clone(&client).main_loop(),
+        );
 
         let handle = {
             let mut s = client_ns.lock().await;
@@ -1381,7 +1390,10 @@ mod tests {
         )));
         let client = Arc::new(WgDriver::new(client_peer, client_sock, Arc::clone(&client_ns)));
         client.set_remote(SocketAddr::from(([127, 0, 0, 1], udp_port)));
-        tokio::spawn(Arc::clone(&client).main_loop());
+        xray_common::testing::spawn(
+            "tunnel-tcp-inbound-dispatch-eof-flushes-tail",
+            Arc::clone(&client).main_loop(),
+        );
 
         let handle = {
             let mut s = client_ns.lock().await;

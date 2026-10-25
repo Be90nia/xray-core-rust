@@ -10,7 +10,7 @@
 //! 验证：完整 DNS query → 决策 → 转发到上游 → 收到响应 → 解码验证 A 记录。
 
 #![cfg(test)]
-#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros))] // 测试脚手架：spawn 起停被测服务/回环 echo、直印进度；非生产托管面
+#![cfg_attr(test, allow(clippy::disallowed_macros))] // 测试脚手架：直印进度；spawn 走 xray_common::testing（L3 闸不豁免）
 use std::{
     net::{IpAddr, Ipv4Addr},
     time::Duration,
@@ -46,7 +46,7 @@ async fn dns_dispatch_round_trip_through_upstream() {
     // 1. 起 mock UDP DNS server — 任何 A 查询返回 1.2.3.4
     let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
     let server_port = sock.local_addr().expect("addr").port();
-    let server = tokio::spawn(async move {
+    let server = xray_common::testing::spawn("mock-udp-dns-server", async move {
         let mut buf = [0u8; 1500];
         let (len, client) = sock.recv_from(&mut buf).await.expect("recv");
         let req = HickoryMessage::from_vec(&buf[..len]).expect("parse query");
@@ -97,7 +97,7 @@ async fn dns_inbound_without_rules_delegates_to_outbound() {
     // 仍需保留 outbound 路径可在后续测试复用；此测试确认与 mock 通信一次成功。
     let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
     let server_port = sock.local_addr().expect("addr").port();
-    let server = tokio::spawn(async move {
+    let server = xray_common::testing::spawn("mock-udp-dns-server", async move {
         let mut buf = [0u8; 1500];
         let (len, client) = sock.recv_from(&mut buf).await.expect("recv");
         let req = HickoryMessage::from_vec(&buf[..len]).expect("parse");

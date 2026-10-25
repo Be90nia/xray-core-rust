@@ -4,7 +4,7 @@
 //! 本测试聚焦适配器层：`SsOutbound::process` + `SsInbound::handle_conn` 能否正确组合，
 //! 即 dispatcher 接入方按照 `process → handle_conn → 桥接 link` 的契约调用时一切正常。
 
-#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros))] // 测试脚手架：spawn 起停被测服务/回环 echo、直印进度；非生产托管面
+#![cfg_attr(test, allow(clippy::disallowed_macros))] // 测试脚手架：直印进度；spawn 走 xray_common::testing（L3 闸不豁免）
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -48,7 +48,7 @@ async fn outbound_inbound_handshake_metadata_matches() {
     let target_addr = Address::Domain("example.com".to_string());
     let target_port = 443u16;
 
-    let server_handle = tokio::spawn(async move {
+    let server_handle = xray_common::testing::spawn("ss-inbound-accept", async move {
         let (conn, _peer) = inbound_listener.accept().await.expect("inbound accept");
         ib_for_server.handle_conn(conn).await
     });
@@ -83,7 +83,7 @@ async fn outbound_inbound_full_chain_to_echo_roundtrip() {
     // ===== 1. echo 目标服务器 =====
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
     let echo_addr = echo_listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("ss-echo-target", async move {
         let (sock, _) = echo_listener.accept().await.expect("echo accept");
         let (mut rd, mut wr) = tokio::io::split(sock);
         let _ = tokio::io::copy(&mut rd, &mut wr).await;
@@ -103,7 +103,7 @@ async fn outbound_inbound_full_chain_to_echo_roundtrip() {
     let echo_socket_addr =
         std::net::SocketAddr::new(std::net::IpAddr::V4(echo_v4), echo_addr.port());
 
-    let server_handle = tokio::spawn({
+    let server_handle = xray_common::testing::spawn("ss-inbound-accept", {
         let ib = ib.clone();
         async move {
             let (conn, _) = inbound_listener.accept().await.expect("inbound accept");

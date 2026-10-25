@@ -29,6 +29,8 @@ rustls = { workspace = true }
 log = "0.4"
 # 分发机制单入口 = udf logx 多通道 ChannelRegistry（general/access/dns）。
 udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["log"] }
+# bd bf92：antireplay MapFilter 时间源走 skeleton::clock（热路径泛型静态分发）。
+udf-skeleton = { path = "../udf-frame/skeleton" }
 
 [dev-dependencies]
 # 双写收敛断言需要 capture 订阅者（workspace.dependencies 已有条目）。

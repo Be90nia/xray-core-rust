@@ -15,7 +15,7 @@
 //! 拨号到 echo server → echo 返回 → 经 anytls 反向 → 回到 reader。
 
 #![cfg(test)]
-#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros))] // 测试脚手架：spawn 起停被测服务/回环 echo、直印进度；非生产托管面
+#![cfg_attr(test, allow(clippy::disallowed_macros))] // 测试脚手架：直印进度；spawn 走 xray_common::testing（L3 闸不豁免）
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use rustls::{ClientConfig as RustlsClientConfig, ServerConfig as RustlsServerConfig};
@@ -37,12 +37,12 @@ use xray_proxy_anytls::{
 async fn start_echo_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("anytls-echo-accept-loop", async move {
         loop {
             let Ok((mut sock, _)) = listener.accept().await else {
                 break;
             };
-            tokio::spawn(async move {
+            xray_common::testing::spawn("anytls-echo-conn", async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = vec![0u8; 4096];
                 loop {

@@ -24,6 +24,7 @@ pub mod serial;
 pub mod session;
 pub mod signal;
 pub mod singbridge;
+pub mod testing;
 pub mod units;
 pub mod uuid;
 

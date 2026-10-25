@@ -158,10 +158,11 @@ mod tests {
 
         let ib_arc = std::sync::Arc::new(ib);
         let ib_clone = ib_arc.clone();
-        let server_handle = tokio::spawn(async move {
-            let (conn, _) = listener.accept().await.expect("accept");
-            ib_clone.handle_conn(conn).await
-        });
+        let server_handle =
+            xray_common::testing::spawn("inbound-handle-conn-rejects-garbage-accept", async move {
+                let (conn, _) = listener.accept().await.expect("accept");
+                ib_clone.handle_conn(conn).await
+            });
 
         // 发送 64 字节垃圾数据（够长确保 IV 读取不 EOF，但解密必然失败）
         let mut bad = tokio::net::TcpStream::connect(listener_addr).await.expect("connect");

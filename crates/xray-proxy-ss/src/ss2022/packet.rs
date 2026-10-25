@@ -1165,7 +1165,7 @@ mod tests {
         let client = ClientUdpSession2022::new(kind, vec![ipsk.clone(), upsk.clone()]).unwrap();
 
         // server 侧：收包 → 解头/解体 → 回包 encode → send_to
-        let server = tokio::spawn(async move {
+        let server = xray_common::testing::spawn("udp-socket-roundtrip-e2e-udp", async move {
             let mut buf = vec![0u8; 65_535];
             let (n, peer) = server_sock.recv_from(&mut buf).await.unwrap();
             let hdr = server_decode_header(kind, &ipsk, &users, &buf[..n]).unwrap();

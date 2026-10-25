@@ -1776,19 +1776,22 @@ mod tests {
             src: old_ep,
             last_used_nanos: AtomicI64::new(0), // 远古
         });
-        let owner = tokio::spawn(run_udp_session(
-            Arc::clone(&dispatch),
-            cmd_rx,
-            reply_tx,
-            old_ep,
-            smoltcp::wire::IpEndpoint::new(
-                smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(8, 8, 8, 8)),
-                53,
+        let owner = xray_common::testing::spawn(
+            "dispatch",
+            run_udp_session(
+                Arc::clone(&dispatch),
+                cmd_rx,
+                reply_tx,
+                old_ep,
+                smoltcp::wire::IpEndpoint::new(
+                    smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(8, 8, 8, 8)),
+                    53,
+                ),
+                Arc::clone(&failed),
+                Arc::clone(&sessions),
+                Arc::downgrade(&old_entry),
             ),
-            Arc::clone(&failed),
-            Arc::clone(&sessions),
-            Arc::downgrade(&old_entry),
-        ));
+        );
         let (cmd_tx_new, _cmd_rx_new) = mpsc::channel(UDP_SESSION_QUEUE_CAP);
         {
             let mut m = sessions.lock();
@@ -1889,16 +1892,19 @@ mod tests {
             src,
             last_used_nanos: AtomicI64::new(now_nanos()),
         });
-        let _owner = tokio::spawn(run_udp_session(
-            dispatch,
-            cmd_rx,
-            reply_tx,
-            src,
-            dst,
-            failed,
-            sessions,
-            Arc::downgrade(&entry),
-        ));
+        let _owner = xray_common::testing::spawn(
+            "dispatch",
+            run_udp_session(
+                dispatch,
+                cmd_rx,
+                reply_tx,
+                src,
+                dst,
+                failed,
+                sessions,
+                Arc::downgrade(&entry),
+            ),
+        );
 
         let payload = bytes::Bytes::from(vec![0xABu8; 100]);
         cmd_tx
@@ -2008,16 +2014,19 @@ mod tests {
             src,
             last_used_nanos: AtomicI64::new(now_nanos()),
         });
-        let owner = tokio::spawn(run_udp_session(
-            dispatch,
-            cmd_rx,
-            reply_tx,
-            src,
-            dst,
-            failed,
-            sessions,
-            Arc::downgrade(&entry),
-        ));
+        let owner = xray_common::testing::spawn(
+            "dispatch",
+            run_udp_session(
+                dispatch,
+                cmd_rx,
+                reply_tx,
+                src,
+                dst,
+                failed,
+                sessions,
+                Arc::downgrade(&entry),
+            ),
+        );
 
         let payload = bytes::Bytes::from(vec![0xABu8; 100]);
         cmd_tx
@@ -2189,16 +2198,19 @@ mod tests {
             netstack: Arc::clone(&netstack),
             handle,
         };
-        tokio::spawn(relay.run());
+        xray_common::testing::spawn("concurrent-batch-drive-and-relay-no-deadlock", relay.run());
         // 消费端保活：relay_to_client 的对端不被 drop → relay 收方向不 EOF
-        let _relay_sink = tokio::spawn(async move {
-            let mut sink = vec![0u8; 64];
-            while let Ok(n) = client_from_relay.read(&mut sink).await {
-                if n == 0 {
-                    break;
+        let _relay_sink = xray_common::testing::spawn(
+            "concurrent-batch-drive-and-relay-no-deadlock",
+            async move {
+                let mut sink = vec![0u8; 64];
+                while let Ok(n) = client_from_relay.read(&mut sink).await {
+                    if n == 0 {
+                        break;
+                    }
                 }
-            }
-        });
+            },
+        );
 
         // driver 侧：循环批驱动（锁内 poll+drain），检到 payload 包置位。
         // 空批 drive = 纯 timer tick 形态，与 relay 轮询交错抢锁。
@@ -2206,21 +2218,24 @@ mod tests {
         let driver = {
             let netstack = Arc::clone(&netstack);
             let tx_has_payload = Arc::clone(&tx_has_payload);
-            tokio::spawn(async move {
-                let empty: Vec<Vec<u8>> = Vec::new();
-                for _ in 0..500 {
-                    let (accepted, tx) = {
-                        let mut stack = netstack.lock().await;
-                        drive_stack_batch(&mut stack, empty.clone())
-                    };
-                    debug_assert!(accepted.is_empty());
-                    if tx.iter().any(|p| p.len() > 40) {
-                        tx_has_payload.store(true, Ordering::SeqCst);
-                        return;
+            xray_common::testing::spawn(
+                "concurrent-batch-drive-and-relay-no-deadlock",
+                async move {
+                    let empty: Vec<Vec<u8>> = Vec::new();
+                    for _ in 0..500 {
+                        let (accepted, tx) = {
+                            let mut stack = netstack.lock().await;
+                            drive_stack_batch(&mut stack, empty.clone())
+                        };
+                        debug_assert!(accepted.is_empty());
+                        if tx.iter().any(|p| p.len() > 40) {
+                            tx_has_payload.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
                     }
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            })
+                },
+            )
         };
 
         // 用户数据经 relay 写入 smoltcp socket（relay.send_to_smoltcp 抢锁）
@@ -2357,7 +2372,10 @@ mod tests {
             netstack: Arc::clone(&netstack),
             handle,
         };
-        tokio::spawn(relay.run());
+        xray_common::testing::spawn(
+            "relay-forwards-uplink-payload-to-dispatch-reader-aft",
+            relay.run(),
+        );
 
         // 上行 payload（ClientHello 形态 517B）：PSH+ACK ingest 进 socket rx
         let payload: Vec<u8> = (0..517u32).map(|i| (i % 251) as u8).collect();

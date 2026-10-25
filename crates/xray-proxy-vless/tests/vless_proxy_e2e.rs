@@ -3,7 +3,7 @@
 //! 验证 VLESS 协议完整链路（无加密层，FLOW_NONE 模式）：
 //! 客户端 encode_request_header → 服务端 decode_request_header → dial → bridge → echo。
 
-#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros))] // 测试脚手架：spawn 起停被测服务/回环 echo、直印进度；非生产托管面
+#![cfg_attr(test, allow(clippy::disallowed_macros))] // 测试脚手架：直印进度；spawn 走 xray_common::testing（L3 闸不豁免）
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -37,7 +37,7 @@ async fn vless_proxy_to_echo_target_e2e() {
     // ===== 1. echo 目标服务器 =====
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo_listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("vless-proxy-to-echo-target-e2e-accept", async move {
         let (sock, _) = echo_listener.accept().await.unwrap();
         let (mut rd, mut wr) = tokio::io::split(sock);
         tokio::io::copy(&mut rd, &mut wr).await.unwrap();
@@ -66,7 +66,7 @@ async fn vless_proxy_to_echo_target_e2e() {
 
     let validator = std::sync::Arc::new(validator);
     let validator_clone = std::sync::Arc::clone(&validator);
-    tokio::spawn(async move {
+    xray_common::testing::spawn("vless-proxy-to-echo-target-e2e-accept", async move {
         let (mut client_stream, _) = proxy_listener.accept().await.unwrap();
 
         // 解码 VLESS 请求头
@@ -134,7 +134,7 @@ async fn vless_proxy_to_echo_target_e2e() {
 async fn vless_invalid_uuid_rejected_e2e() {
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo_listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    xray_common::testing::spawn("vless-invalid-uuid-rejected-e2e-accept", async move {
         let (sock, _) = echo_listener.accept().await.unwrap();
         let (mut rd, mut wr) = tokio::io::split(sock);
         tokio::io::copy(&mut rd, &mut wr).await.unwrap();
@@ -162,7 +162,7 @@ async fn vless_invalid_uuid_rejected_e2e() {
 
     let validator = std::sync::Arc::new(validator);
     let validator_clone = std::sync::Arc::clone(&validator);
-    tokio::spawn(async move {
+    xray_common::testing::spawn("vless-invalid-uuid-rejected-e2e-accept", async move {
         let (mut client_stream, _) = proxy_listener.accept().await.unwrap();
         let result =
             decode_request_header(false, &mut None, &mut client_stream, &*validator_clone).await;

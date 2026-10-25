@@ -305,10 +305,11 @@ mod tests {
         // 启动本地 TCP 服务器（接受连接后立即关闭）
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server_task = tokio::spawn(async move {
-            // 接受一个连接即可（dial_system 建立后 drop，服务器端 accept 到后关闭）
-            let _ = listener.accept().await;
-        });
+        let server_task =
+            xray_common::testing::spawn("dial-to-local-tcp-server-succeeds-accept", async move {
+                // 接受一个连接即可（dial_system 建立后 drop，服务器端 accept 到后关闭）
+                let _ = listener.accept().await;
+            });
 
         let h = FreedomHandler::new("test", Config::default()).expect("valid config");
         let dest = make_ip_dest("127.0.0.1", addr.port());
@@ -330,9 +331,12 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server_task = tokio::spawn(async move {
-            let _ = listener.accept().await;
-        });
+        let server_task = xray_common::testing::spawn(
+            "dial-to-domain-resolves-at-dial-layer-and-dials-accept",
+            async move {
+                let _ = listener.accept().await;
+            },
+        );
 
         let config = Config {
             domain_strategy: crate::config::DomainStrategy::UseIPv4 as i32,
@@ -388,15 +392,16 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let server_task = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            // 简单 echo：读一个字节写回
-            let mut buf = [0u8; 1];
-            use tokio::io::AsyncReadExt;
-            if sock.read_exact(&mut buf).await.is_ok() {
-                let _ = sock.write_all(&buf).await;
-            }
-        });
+        let server_task =
+            xray_common::testing::spawn("dial-and-write-to-echo-server-accept", async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                // 简单 echo：读一个字节写回
+                let mut buf = [0u8; 1];
+                use tokio::io::AsyncReadExt;
+                if sock.read_exact(&mut buf).await.is_ok() {
+                    let _ = sock.write_all(&buf).await;
+                }
+            });
 
         // 用 handler.dial 验证拨号（Connection 在 handler 内 drop）
         let h = FreedomHandler::new("echo-test", Config::default()).expect("valid config");
@@ -447,9 +452,12 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server_task = tokio::spawn(async move {
-            let _ = listener.accept().await;
-        });
+        let server_task = xray_common::testing::spawn(
+            "dial-domain-without-rules-skips-precheck-resolution-accept",
+            async move {
+                let _ = listener.accept().await;
+            },
+        );
 
         let config = Config {
             domain_strategy: crate::config::DomainStrategy::UseIPv4 as i32,
@@ -491,9 +499,12 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server_task = tokio::spawn(async move {
-            let _ = listener.accept().await;
-        });
+        let server_task = xray_common::testing::spawn(
+            "dial-domain-with-rules-prechecks-then-dials-accept",
+            async move {
+                let _ = listener.accept().await;
+            },
+        );
 
         let rule = crate::config::FinalRuleConfig::from_json(
             &serde_json::json!({"action": "allow", "port": "53"}),
@@ -540,9 +551,12 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server_task = tokio::spawn(async move {
-            let _ = listener.accept().await;
-        });
+        let server_task = xray_common::testing::spawn(
+            "dial-allowed-by-zero-prefix-rule-over-default-block--accept",
+            async move {
+                let _ = listener.accept().await;
+            },
+        );
 
         let rule = crate::config::FinalRuleConfig::from_json(
             &serde_json::json!({"action": "allow", "ip": ["0.0.0.0/0"]}),

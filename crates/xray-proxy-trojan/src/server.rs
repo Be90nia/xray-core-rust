@@ -1008,20 +1008,23 @@ mod tests {
         // 1. 起 echo server
         let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_addr = echo_listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (mut sock, _) = echo_listener.accept().await.unwrap();
-            let mut buf = [0u8; 1024];
-            loop {
-                match sock.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if sock.write_all(&buf[..n]).await.is_err() {
-                            break;
-                        }
-                    },
+        xray_common::testing::spawn(
+            "serve-trojan-dispatches-to-echo-via-freedom-accept",
+            async move {
+                let (mut sock, _) = echo_listener.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if sock.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        },
+                    }
                 }
-            }
-        });
+            },
+        );
 
         // 2. 配置 dispatcher：freedom outbound → SimpleOhm default
         let ohm = Arc::new(SimpleOhm::new());
@@ -1044,7 +1047,7 @@ mod tests {
         .unwrap();
         let trojan_addr = trojan_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
-        tokio::spawn(async move {
+        xray_common::testing::spawn("serve-trojan-dispatches-to-echo-via-freedom", async move {
             let _ = serve_trojan(
                 trojan_listener,
                 ohm_clone,
@@ -1114,12 +1117,15 @@ mod tests {
         // 1. UDP echo server
         let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let echo_addr = echo.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 2048];
-            while let Ok((n, src)) = echo.recv_from(&mut buf).await {
-                let _ = echo.send_to(&buf[..n], src).await;
-            }
-        });
+        xray_common::testing::spawn(
+            "serve-trojan-udp-relay-dispatches-via-freedom-echo",
+            async move {
+                let mut buf = [0u8; 2048];
+                while let Ok((n, src)) = echo.recv_from(&mut buf).await {
+                    let _ = echo.send_to(&buf[..n], src).await;
+                }
+            },
+        );
 
         // 2. dispatcher：freedom（TCP+UDP dispatch）外裹计数器
         let ohm = Arc::new(SimpleOhm::new());
@@ -1145,7 +1151,7 @@ mod tests {
         .unwrap();
         let trojan_addr = trojan_listener.local_addr().unwrap();
         let ohm_clone = Arc::clone(&ohm);
-        tokio::spawn(async move {
+        xray_common::testing::spawn("serve-trojan-udp-relay-dispatches-via-freedom", async move {
             let _ = serve_trojan(
                 trojan_listener,
                 ohm_clone,

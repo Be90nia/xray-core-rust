@@ -420,10 +420,11 @@ mod tests {
         let l = Arc::new(OutboundListenerImpl::new());
         let l2 = l.clone();
         // 后台 50ms 后 close
-        let handle = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            l2.close().unwrap();
-        });
+        let handle =
+            xray_common::testing::spawn("listener-accept-blocks-until-close-accept", async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                l2.close().unwrap();
+            });
         let result = l.accept().await;
         assert!(result.is_none(), "accept must return None after close");
         handle.await.unwrap();

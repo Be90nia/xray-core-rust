@@ -92,11 +92,13 @@ impl HostResolver for SystemHostResolver {
 
 /// UDP 数据报会话（Go nameserver_udp.go:134 `udpServer.Dispatch` 包粒度语义）。
 pub trait UdpPacketSession: Send {
-    fn send_packet(
-        &mut self,
-        dest: &Destination,
-        payload: &[u8],
-    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>>;
+    /// dest/payload 借用生命周期与返回 future 统一（`'s`），实现方可零拷贝
+    /// 流转发包——免 async move 所有权要求的 `to_vec`/`clone`（NF-7）。
+    fn send_packet<'s>(
+        &'s mut self,
+        dest: &'s Destination,
+        payload: &'s [u8],
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 's>>;
 
     /// `Ok(None)` = 会话已关闭。
     fn recv_packet(&mut self) -> UdpRecvFuture<'_>;
@@ -497,7 +499,7 @@ mod tests {
         let mut stream = LinkStream::new(reader, writer);
 
         let payload = vec![0xA5u8; 100_000];
-        let writer_task = tokio::spawn(async move {
+        let writer_task = xray_common::testing::spawn("link-stream-large-payload", async move {
             dn_w.write_all(&payload).await.unwrap();
             drop(dn_w);
         });
@@ -520,12 +522,15 @@ mod tests {
         let mut stream = LinkStream::new(Box::new(dn_r), Box::new(up_w));
 
         // 下行数据稍后到达（模拟 dispatcher 管线回包）
-        let writer_task = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let mut mb = MultiBuffer::new();
-            mb.write_from(b"hello");
-            dn_w.write_multi_buffer(mb).await.unwrap();
-        });
+        let writer_task = xray_common::testing::spawn(
+            "link-stream-pipe-read-woken-by-downlink-data",
+            async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let mut mb = MultiBuffer::new();
+                mb.write_from(b"hello");
+                dn_w.write_multi_buffer(mb).await.unwrap();
+            },
+        );
 
         let mut buf = [0u8; 5];
         // 超时给足（3s）：tokio `Timeout` 先 poll inner 再查 deadline，丢唤醒时
@@ -564,28 +569,34 @@ mod tests {
         let expected = payload.clone();
 
         let (_rd, mut wr) = tokio::io::split(stream);
-        let w_task = tokio::spawn(async move {
-            // 8KB 分块：第 2 块起管道已满（>4KB limit），必须走 Pending 重试路径。
-            for chunk in payload.chunks(8 * 1024) {
-                wr.write_all(chunk).await.unwrap();
-            }
-            AsyncWriteExt::shutdown(&mut wr).await.unwrap();
-        });
-        let r_task = tokio::spawn(async move {
-            let mut received = Vec::new();
-            loop {
-                match up_r.read_multi_buffer().await {
-                    Ok(mut mb) => {
-                        let mut tmp = vec![0u8; mb.len()];
-                        let n = mb.read_to(&mut tmp);
-                        received.extend_from_slice(&tmp[..n]);
-                    },
-                    Err(xray_buf::io::Error::Eof) => break,
-                    Err(e) => panic!("uplink read error: {e:?}"),
+        let w_task = xray_common::testing::spawn(
+            "link-stream-full-pipe-write-delivers-every-byte",
+            async move {
+                // 8KB 分块：第 2 块起管道已满（>4KB limit），必须走 Pending 重试路径。
+                for chunk in payload.chunks(8 * 1024) {
+                    wr.write_all(chunk).await.unwrap();
                 }
-            }
-            received
-        });
+                AsyncWriteExt::shutdown(&mut wr).await.unwrap();
+            },
+        );
+        let r_task = xray_common::testing::spawn(
+            "link-stream-full-pipe-write-delivers-every-byte",
+            async move {
+                let mut received = Vec::new();
+                loop {
+                    match up_r.read_multi_buffer().await {
+                        Ok(mut mb) => {
+                            let mut tmp = vec![0u8; mb.len()];
+                            let n = mb.read_to(&mut tmp);
+                            received.extend_from_slice(&tmp[..n]);
+                        },
+                        Err(xray_buf::io::Error::Eof) => break,
+                        Err(e) => panic!("uplink read error: {e:?}"),
+                    }
+                }
+                received
+            },
+        );
 
         let (w_res, r_res) = tokio::join!(
             tokio::time::timeout(Duration::from_secs(10), w_task),
@@ -655,16 +666,32 @@ mod tests {
             move || Destination::tcp(Address::from(server.ip()), Port::new(server.port()));
         xray_transport::dns_skip::skip_dns_servers(&[server.ip()]);
 
-        let marked = tokio::spawn(xray_transport::dns_skip::scope_dns_upstream_query(async move {
-            connect_stream(&make_dest(), &SystemHostResolver, Duration::from_secs(2), "tcp", true)
+        let marked = xray_common::testing::spawn(
+            "dns-skip-scope-isolation-across-tasks",
+            xray_transport::dns_skip::scope_dns_upstream_query(async move {
+                connect_stream(
+                    &make_dest(),
+                    &SystemHostResolver,
+                    Duration::from_secs(2),
+                    "tcp",
+                    true,
+                )
                 .await
                 .is_err()
-        }));
-        let plain = tokio::spawn(async move {
-            connect_stream(&make_dest(), &SystemHostResolver, Duration::from_secs(2), "tcp", true)
+            }),
+        );
+        let plain =
+            xray_common::testing::spawn("dns-skip-scope-isolation-across-tasks", async move {
+                connect_stream(
+                    &make_dest(),
+                    &SystemHostResolver,
+                    Duration::from_secs(2),
+                    "tcp",
+                    true,
+                )
                 .await
                 .is_ok()
-        });
+            });
         let (marked, plain) = tokio::join!(marked, plain);
         assert!(marked.unwrap(), "带标记 task 应拒拨被 skip 服务器");
         assert!(plain.unwrap(), "不带标记 task 不受影响，应正常连接");

@@ -2514,37 +2514,16 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 ///
 /// `version` 字段对齐 Go `infra/conf/hysteria.go:20-22`：缺省 = 2，v1 硬报错。
 /// `pub(crate)`：P3-2 对拍测试（tests_config_parity）跨模块消费，语义零变化。
+///
+/// 服务器选择收口 [`xray_proxy_hysteria::servers::select_server`]（与插件面
+/// 同一份实现，禁第二份语义分叉）；本函数仅为 JSON 字节入口的薄壳，签名
+/// 不变（调用点 `arm_builders/outbound.rs` 与 tests_config_parity 零影响）。
 pub(crate) fn parse_hysteria_config(
     data: &[u8],
 ) -> std::result::Result<(String, String, String), String> {
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
-    // 强制 version == 2（Go 端 hysteria.go:20-22 行为镜像）
-    if let Some(ver) = v.get("version").and_then(|x| x.as_i64()) {
-        if ver != 2 {
-            return Err(format!("hysteria version {ver} not supported (only version 2)"));
-        }
-    }
-    let first = match v.get("servers").and_then(|v| v.as_array()) {
-        Some(servers) => servers.first().ok_or_else(|| "servers array is empty".to_string())?,
-        None => &v,
-    };
-    let address = first
-        .get("address")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "missing servers[0].address".to_string())?;
-    let port = first
-        .get("port")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| "missing servers[0].port".to_string())?;
-    let auth =
-        first.get("auth").or_else(|| first.get("password")).and_then(|v| v.as_str()).unwrap_or("");
-    let server_name = first
-        .get("serverName")
-        .or_else(|| first.get("server_name"))
-        .or_else(|| first.get("sni"))
-        .and_then(|v| v.as_str())
-        .unwrap_or(address);
-    Ok((format!("{address}:{port}"), auth.to_string(), server_name.to_string()))
+    let sel = xray_proxy_hysteria::servers::select_server(&v)?;
+    Ok((sel.server_addr, sel.auth, sel.server_name))
 }
 
 // ============ TUIC UDP dispatch bridge（票 z9gp）============

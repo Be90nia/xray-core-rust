@@ -139,6 +139,56 @@ async fn hysteria_outbound_assembles_and_parses_config() {
     assert!(plugin.built_inbound().is_err(), "出站段 → 入站观察面 fail-visible");
 }
 
+/// 出站面 `servers[]` 形态（Rust 方言；生产 `parse_hysteria_config` 同语义）：
+/// 多服务器构造 → `servers[0]` 选择 + 装配链干净。
+#[tokio::test]
+async fn hysteria_outbound_servers_array_assembles_and_selects_first() {
+    let plugin = Arc::new(HysteriaPlugin::default());
+    let mut framework = Framework::builder(framework_options())
+        .expect("registry cap")
+        .with_config(hysteria_outbound_section(json!({
+            "servers": [
+                { "address": "a.example.com", "port": 443, "auth": "tok-a", "sni": "a-sni.example.com" },
+                { "address": "b.example.com", "port": 8443, "auth": "tok-b" }
+            ],
+            "udpIdleTimeout": 45
+        })))
+        .register(Arc::clone(&plugin) as Arc<dyn Plugin>)
+        .expect("register")
+        .build()
+        .expect("build phase");
+    framework.bring_up().expect("bring_up: init/start 三相");
+    let report = framework.shutdown().await;
+    assert!(report.is_clean(), "健康链停机报告必须干净");
+
+    let config = plugin.built_outbound().expect("built outbound");
+    assert_eq!(config.server_addr, "a.example.com:443", "servers[0] 选择（生产同序）");
+    assert_eq!(config.auth, "tok-a");
+    assert_eq!(config.server_name, "a-sni.example.com", "sni 别名解析");
+    assert_eq!(config.udp_idle_timeout_secs, 45, "段级可选键照常生效");
+    assert!(plugin.built_inbound().is_err(), "出站段 → 入站观察面 fail-visible");
+}
+
+/// L5 装配门负向：空 `servers[]` / `servers[0]` 缺字段 → build `Err`
+/// （fail-visible，文案与生产面 `parse_hysteria_config` 逐字一致）。
+#[tokio::test]
+async fn hysteria_outbound_servers_array_invalid_fails_fast_at_build() {
+    for (settings, expect) in [
+        (json!({ "servers": [] }), "servers array is empty"),
+        (json!({ "servers": [{ "port": 443 }] }), "missing servers[0].address"),
+        (json!({ "servers": [{ "address": "a.com" }] }), "missing servers[0].port"),
+    ] {
+        let err = Framework::builder(framework_options())
+            .expect("registry cap")
+            .with_config(hysteria_outbound_section(settings))
+            .register(Arc::new(HysteriaPlugin::default()) as Arc<dyn Plugin>)
+            .expect("register")
+            .build()
+            .expect_err("空/非法 servers[] 必须 fail-fast");
+        assert!(err.to_string().contains(expect), "实际: {err}");
+    }
+}
+
 /// L5 装配门负向：缺段 fail-fast（坑约束 7 装配半边），
 /// build 失败 → 无 Framework 产出（无半启动态）。
 #[tokio::test]

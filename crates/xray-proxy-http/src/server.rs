@@ -1067,7 +1067,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let server = tokio::spawn(async move {
+        let server = xray_common::testing::spawn("tcp-handshake-accept", async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             http_server_handshake(&mut stream, &config).await
         });
@@ -1382,9 +1382,9 @@ mod tests {
     async fn spawn_echo() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let handle = tokio::spawn(async move {
+        let handle = xray_common::testing::spawn("spawn-echo-accept", async move {
             while let Ok((mut sock, _)) = listener.accept().await {
-                tokio::spawn(async move {
+                xray_common::testing::spawn("spawn-echo", async move {
                     let mut buf = [0u8; 4096];
                     loop {
                         match sock.read(&mut buf).await {
@@ -1550,7 +1550,7 @@ mod tests {
     ) -> (tokio::task::JoinHandle<String>, String, PlainOutcome) {
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
-        let upstream = tokio::spawn(async move {
+        let upstream = xray_common::testing::spawn("run-plain-http-accept", async move {
             let (mut sock, _) = upstream_listener.accept().await.unwrap();
             let mut head = Vec::new();
             let mut buf = [0u8; 1024];
@@ -1567,7 +1567,9 @@ mod tests {
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
-        let server_side = tokio::spawn(async move { proxy_listener.accept().await.unwrap().0 });
+        let server_side = xray_common::testing::spawn("run-plain-http-accept", async move {
+            proxy_listener.accept().await.unwrap().0
+        });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
         let mut server_stream = server_side.await.unwrap();

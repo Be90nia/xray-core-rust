@@ -685,20 +685,23 @@ mod tests {
         //（TryDefaultHeadersWith "nav"）+ Proxy-Connection: Keep-Alive。
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let inspector = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 4096];
-            let mut req: Vec<u8> = Vec::new();
-            loop {
-                let n = sock.read(&mut buf).await.unwrap();
-                req.extend_from_slice(&buf[..n]);
-                if req.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
+        let inspector = xray_common::testing::spawn(
+            "connect-request-carries-chrome-masquerade-and-proxy--accept",
+            async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let mut req: Vec<u8> = Vec::new();
+                loop {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    req.extend_from_slice(&buf[..n]);
+                    if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
                 }
-            }
-            sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
-            String::from_utf8(req).unwrap()
-        });
+                sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
+                String::from_utf8(req).unwrap()
+            },
+        );
 
         let cfg = Arc::new(HttpOutboundConfig::new(
             Address::ipv4(std::net::Ipv4Addr::LOCALHOST),
@@ -738,47 +741,53 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            loop {
-                let Ok((sock, _)) = listener.accept().await else { break };
-                let io = TokioIo::new(sock);
-                let service = service_fn(|req: Request<Incoming>| async move {
-                    assert_eq!(
-                        req.method(),
-                        &hyper::Method::CONNECT,
-                        "test h2 server only accepts CONNECT"
-                    );
-                    // hyper h2 服务端对成功 CONNECT 走 upgrade 通道接管流（服务
-                    // 响应 body 被忽略）：隧道 IO 经 hyper::upgrade::on 取出后回环
-                    // （Upgraded 是 hyper Read/Write，TokioIo 适配回 tokio traits）。
-                    tokio::spawn(async move {
-                        if let Ok(upgraded) = hyper::upgrade::on(req).await {
-                            let mut io = TokioIo::new(upgraded);
-                            let mut buf = [0u8; 8192];
-                            loop {
-                                match io.read(&mut buf).await {
-                                    Ok(0) | Err(_) => break,
-                                    Ok(n) => {
-                                        if io.write_all(&buf[..n]).await.is_err() {
-                                            break;
+        xray_common::testing::spawn(
+            "http-outbound-h2-connect-tunnel-roundtrip-accept",
+            async move {
+                loop {
+                    let Ok((sock, _)) = listener.accept().await else { break };
+                    let io = TokioIo::new(sock);
+                    let service = service_fn(|req: Request<Incoming>| async move {
+                        assert_eq!(
+                            req.method(),
+                            &hyper::Method::CONNECT,
+                            "test h2 server only accepts CONNECT"
+                        );
+                        // hyper h2 服务端对成功 CONNECT 走 upgrade 通道接管流（服务
+                        // 响应 body 被忽略）：隧道 IO 经 hyper::upgrade::on 取出后回环
+                        // （Upgraded 是 hyper Read/Write，TokioIo 适配回 tokio traits）。
+                        xray_common::testing::spawn(
+                            "http-outbound-h2-connect-tunnel-roundtrip",
+                            async move {
+                                if let Ok(upgraded) = hyper::upgrade::on(req).await {
+                                    let mut io = TokioIo::new(upgraded);
+                                    let mut buf = [0u8; 8192];
+                                    loop {
+                                        match io.read(&mut buf).await {
+                                            Ok(0) | Err(_) => break,
+                                            Ok(n) => {
+                                                if io.write_all(&buf[..n]).await.is_err() {
+                                                    break;
+                                                }
+                                            },
                                         }
-                                    },
+                                    }
                                 }
-                            }
-                        }
+                            },
+                        );
+                        Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                                .status(hyper::StatusCode::OK)
+                                .body(Empty::<bytes::Bytes>::new())
+                                .unwrap(),
+                        )
                     });
-                    Ok::<_, std::convert::Infallible>(
-                        hyper::Response::builder()
-                            .status(hyper::StatusCode::OK)
-                            .body(Empty::<bytes::Bytes>::new())
-                            .unwrap(),
-                    )
-                });
-                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                    .serve_connection(io, service)
-                    .await;
-            }
-        });
+                    let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(io, service)
+                        .await;
+                }
+            },
+        );
 
         let mut cfg =
             HttpOutboundConfig::new(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(port));
@@ -805,13 +814,16 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let accepts_cl = Arc::clone(&accepts);
-        tokio::spawn(async move {
-            loop {
-                let Ok((sock, _)) = listener.accept().await else { break };
-                accepts_cl.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                drop(sock); // 立即断开 → 客户端响应前 EOF → 重试
-            }
-        });
+        xray_common::testing::spawn(
+            "dial-retried-exactly-five-times-on-dead-proxy-accept",
+            async move {
+                loop {
+                    let Ok((sock, _)) = listener.accept().await else { break };
+                    accepts_cl.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    drop(sock); // 立即断开 → 客户端响应前 EOF → 重试
+                }
+            },
+        );
         let cfg = Arc::new(HttpOutboundConfig::new(
             Address::ipv4(std::net::Ipv4Addr::LOCALHOST),
             Port::new(port),
@@ -881,20 +893,23 @@ mod tests {
     async fn connect_request_renders_header_placeholders() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let inspector = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 4096];
-            let mut req: Vec<u8> = Vec::new();
-            loop {
-                let n = sock.read(&mut buf).await.unwrap();
-                req.extend_from_slice(&buf[..n]);
-                if req.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
+        let inspector = xray_common::testing::spawn(
+            "connect-request-renders-header-placeholders-accept",
+            async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let mut req: Vec<u8> = Vec::new();
+                loop {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    req.extend_from_slice(&buf[..n]);
+                    if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
                 }
-            }
-            sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
-            String::from_utf8(req).unwrap()
-        });
+                sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
+                String::from_utf8(req).unwrap()
+            },
+        );
 
         let cfg =
             HttpOutboundConfig::new(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(port))
@@ -929,7 +944,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<(String, String)>>(4);
-        tokio::spawn(async move {
+        xray_common::testing::spawn("h2-connect-renders-header-placeholders-accept", async move {
             let (sock, _) = listener.accept().await.unwrap();
             let io = TokioIo::new(sock);
             let service = service_fn(move |req: Request<Incoming>| {

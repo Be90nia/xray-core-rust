@@ -337,7 +337,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let fqdn_owned = fqdn.to_string();
-        let handle = tokio::spawn(async move {
+        let handle = xray_common::testing::spawn("spawn-mock-tcp-server-accept", async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             // 读 2 字节长度 + payload。
             let mut len_buf = [0u8; 2];
@@ -567,7 +567,7 @@ mod tests {
 
     /// 在指定 listener 上 accept 一次并回 A 记录响应。
     fn spawn_echo_server(listener: TcpListener, reply_ip: Ipv4Addr) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
+        xray_common::testing::spawn("spawn-echo-server-accept", async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut len_buf = [0u8; 2];
             use tokio::io::AsyncReadExt;

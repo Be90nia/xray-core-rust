@@ -1143,6 +1143,10 @@ mod tests {
         let body_arrived = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&body_arrived);
 
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "测试脚手架起阻塞 OS 线程持 accept（Go set_flush_next 语义回归探针）；无 PluginContext 可穿，按 clippy.toml 指引逐处登记"
+        )]
         std::thread::spawn(move || {
             let (mut sock, _) = listener.accept().expect("accept");
             let uuid = UUID::parse("66ad4540-b58c-4ad2-9926-ea63445a9b57").expect("uuid");

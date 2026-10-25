@@ -1,6 +1,8 @@
 """黄金窗口自动测速（schtasks 明早 05:00 触发）
 5 轮 10MB 下载（走 us1:39824 raw+reality），中位数判据：
-  >=25 PASS / >=20 CONDITIONAL / <20 FAIL（fail 自动带 FRDBG 现场日志）
+  >=25 PASS / >=20 CONDITIONAL / <20 FAIL
+失败现场日志 = 各轮 xray stdout/stderr（gw-N.log，恒落盘）；诊断开关用
+XRAY_P7LM_TRACE=1（旧 XRAY_FRDBG 埋点已随 bd wslmc 删除）。
 结果落 D:/Project/Xray-core-rust/reports/golden-window-2026-10-13.log
 """
 import subprocess, time, os, datetime
@@ -12,7 +14,6 @@ URL = "https://speed.cloudflare.com/__down?bytes=10485760"
 OUT = r"D:\Project\Xray-core-rust\reports\golden-window-2026-10-13.log"
 
 env = dict(os.environ)
-env["XRAY_FRDBG"] = "1"
 
 lines = [f"# golden window test @ {datetime.datetime.now():%Y-%m-%d %H:%M:%S}"]
 results = []

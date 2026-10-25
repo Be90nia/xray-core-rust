@@ -1,4 +1,3 @@
-#![allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)] // FRDBG 临时诊断埋点（VISIONMAC 战役），随战役收官票清除
 //! TLS 记录对齐读包装（record-framer）。
 //!
 //! rustls 的 deframer 每次读底层 socket 是贪婪的（`DeframerVecBuffer::read`
@@ -36,8 +35,6 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::connection::Connection;
 
-// log-hot-path-exempt: XRAY_FRDBG 门内每 TLS record 帧排空记录 ——
-// 数据面泵/每包循环内的诊断留痕，LogFacade emit（Mutex+掩码）开销不可入热路径，保留原样
 /// TLS 记录头长度：type(1) + version(2) + length(2)。
 const HEADER_LEN: usize = 5;
 
@@ -52,13 +49,6 @@ pub struct RecordFramer<S> {
     have: usize,
     /// 当前记录体尚未消费的字节数；0 表示不在记录体中。
     body_remaining: usize,
-}
-
-fn micros() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() % 1_000_000_000)
-        .unwrap_or(0)
 }
 
 impl<S> RecordFramer<S> {
@@ -106,12 +96,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for RecordFramer<S> {
             let mut rb = ReadBuf::new(&mut this.hdr[this.have..]);
             match Pin::new(&mut this.sock).poll_read(cx, &mut rb) {
                 Poll::Ready(Ok(())) => {},
-                other => {
-                    if std::env::var("XRAY_FRDBG").is_ok() && other.is_pending() {
-                        eprintln!("[FRDBG:{}MS] hdr Pending have={}", micros(), this.have);
-                    }
-                    return other;
-                },
+                other => return other,
             }
             let n = rb.filled().len();
             if n == 0 {
@@ -136,17 +121,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for RecordFramer<S> {
         let mut rb = ReadBuf::new(&mut unfilled[..want]);
         match Pin::new(&mut this.sock).poll_read(cx, &mut rb) {
             Poll::Ready(Ok(())) => {},
-            other => {
-                if std::env::var("XRAY_FRDBG").is_ok() && other.is_pending() {
-                    eprintln!("[FRDBG:{}MS] body Pending rem={}", micros(), this.body_remaining);
-                }
-                return other;
-            },
+            other => return other,
         }
         let n = rb.filled().len();
-        if std::env::var("XRAY_FRDBG").is_ok() && n == 0 {
-            eprintln!("[FRDBG:{}MS] body ZERO-READ rem={}", micros(), this.body_remaining);
-        }
         buf.advance(n);
         this.body_remaining -= n;
         Poll::Ready(Ok(()))
