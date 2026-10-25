@@ -3,7 +3,8 @@
 //! realm 是 UDP 打洞方案，NAT 不给面子时需要网关替我们把本地 UDP 端口映射到公网：
 //!
 //! - 后端 A [`natpmp`]：RFC 6886（UDP 5351），**优先**——报文最小、无 XML；
-//! - 后端 B [`upnp`]：SSDP 发现 + device description + SOAP，NAT-PMP 不可用时回退。
+//! - 后端 B [`upnp`]：SSDP 发现（无应答时回退直取默认路由网关的 description URL）
+//!   + device description + SOAP，NAT-PMP 不可用时回退。
 //!
 //! 语义对齐 Go：
 //! - 缺省 timeout 10s / lifetime 10min；0 = 缺省，负数 = 配置错误（`from_secs`）；
@@ -98,6 +99,8 @@ impl Gateway {
 pub(crate) struct Endpoints {
     natpmp: Result<SocketAddrV4, String>,
     ssdp: SocketAddrV4,
+    /// SSDP 无应答时依次直取的 UPnP description URL（生产 = 默认路由网关推导）。
+    upnp_fallbacks: Vec<String>,
 }
 
 impl Endpoints {
@@ -107,6 +110,7 @@ impl Endpoints {
                 .map(|gateway| SocketAddrV4::new(gateway, natpmp::NATPMP_PORT))
                 .map_err(|e| format!("{e}")),
             ssdp: upnp::SSDP_ADDR,
+            upnp_fallbacks: upnp::fallback_description_urls(),
         }
     }
 }
@@ -144,7 +148,13 @@ impl PortMapper {
             Err(reason) => format!("NAT-PMP: {reason}"),
         };
         // 2) UPnP 回退；两路都失败 → 一条错误带两边原因
-        let upnp = upnp::Client::discover(endpoints.ssdp, config.timeout).await.map_err(|e| {
+        let upnp = upnp::Client::discover_with_fallbacks(
+            endpoints.ssdp,
+            config.timeout,
+            &endpoints.upnp_fallbacks,
+        )
+        .await
+        .map_err(|e| {
             io::Error::other(format!(
                 "port mapping: no usable gateway ({natpmp_reason}; UPnP: {e})"
             ))
@@ -517,6 +527,7 @@ wlan0\t00000000\t0102A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0
             natpmp: Ok(stub.addr),
             // SSDP 指向死端点：一旦回退到这里就会失败，从而证明走的是 NAT-PMP
             ssdp: dead_udp_addr().await,
+            upnp_fallbacks: Vec::new(),
         };
         let mapper =
             PortMapper::new_with(8080, PortMapConfig::from_secs(1, 600).expect("cfg"), endpoints)
@@ -563,7 +574,11 @@ wlan0\t00000000\t0102A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0
             Some(natpmp_response(0, &ip))
         })
         .await;
-        let endpoints = Endpoints { natpmp: Ok(stub.addr), ssdp: dead_udp_addr().await };
+        let endpoints = Endpoints {
+            natpmp: Ok(stub.addr),
+            ssdp: dead_udp_addr().await,
+            upnp_fallbacks: Vec::new(),
+        };
         let mapper =
             PortMapper::new_with(9000, PortMapConfig::from_secs(1, 600).expect("cfg"), endpoints)
                 .await
@@ -578,7 +593,11 @@ wlan0\t00000000\t0102A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0
     async fn mapper_falls_back_to_upnp_when_natpmp_silent() {
         let http = upnp_http_stub().await;
         let ssdp = SsdpStub::spawn(format!("http://{}/rootDesc.xml", http.addr)).await;
-        let endpoints = Endpoints { natpmp: Ok(dead_udp_addr().await), ssdp: ssdp.addr };
+        let endpoints = Endpoints {
+            natpmp: Ok(dead_udp_addr().await),
+            ssdp: ssdp.addr,
+            upnp_fallbacks: Vec::new(),
+        };
         let mapper =
             PortMapper::new_with(8080, PortMapConfig::from_secs(1, 600).expect("cfg"), endpoints)
                 .await
@@ -597,7 +616,8 @@ wlan0\t00000000\t0102A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mapper_no_gateway_is_fail_visible() {
         let ssdp = dead_udp_addr().await;
-        let endpoints = Endpoints { natpmp: Ok(ssdp), ssdp };
+        // SSDP 与兜底候选全空：两路都必须失败（真网关可达也不能救活这条错误路径）
+        let endpoints = Endpoints { natpmp: Ok(ssdp), ssdp, upnp_fallbacks: Vec::new() };
         let err =
             PortMapper::new_with(8080, PortMapConfig::from_secs(1, 600).expect("cfg"), endpoints)
                 .await
@@ -612,7 +632,11 @@ wlan0\t00000000\t0102A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn renew_loop_renews_then_deletes_on_cancel() {
         let stub = NatPmpStub::spawn(natpmp_responder).await;
-        let endpoints = Endpoints { natpmp: Ok(stub.addr), ssdp: dead_udp_addr().await };
+        let endpoints = Endpoints {
+            natpmp: Ok(stub.addr),
+            ssdp: dead_udp_addr().await,
+            upnp_fallbacks: Vec::new(),
+        };
         // lifetime 1s → 续租间隔 500ms
         let mapper =
             PortMapper::new_with(8080, PortMapConfig::from_secs(1, 1).expect("cfg"), endpoints)

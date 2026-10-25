@@ -136,43 +136,19 @@ pub(crate) async fn build_vless_inbound(
         // transport 分支（ws/grpc/kcp/httpupgrade/splithttp）：listener_registry
         // 承载监听，TLS/security 在 transport hub 内部终结——勿再叠
         // build_tls_acceptor（双重握手）。
-        let handler = ohm
-            .get_default_handler()
-            .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
-        let fallbacks = build_vless_fallbacks(&ib.entry.data)?;
         let bind_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
         })?;
-        tracing::info!(tag = %ib.tag, addr = %addr, network = %settings.protocol, security = %settings.security, users = validator.get_uuid_count(), "vless transport inbound listening");
-        let on_conn: xray_transport::listener_registry::ConnHandler = Arc::new(move |conn| {
-            let handler = Arc::clone(&handler);
-            let validator = Arc::clone(&validator);
-            let fallbacks = fallbacks.clone();
-            let options = options.clone();
-            tokio::spawn(async move {
-                let (peer, local) = transport_conn_addrs(conn.as_ref(), bind_addr);
-                // TLS 已在 transport hub 内终结，name/alpn 不可得
-                if let Err(e) = xray_proxy_vless::handle_connection_with_fallback(
-                    conn,
-                    &handler,
-                    &validator,
-                    fallbacks,
-                    peer,
-                    local,
-                    String::new(),
-                    String::new(),
-                    Some(options),
-                    None,
-                )
-                .await
-                {
-                    // Go vless inbound.go:522：拒绝 AtInfo + RemoteAddr。
-                    tracing::info!(peer = %peer, error = %e, "vless transport connection ended with error");
-                }
-            });
-        });
-        spawn_transport_listener_inbound(&ib.tag, bind_addr, settings, shutdown_token, on_conn)
-            .await
+        let on_conn =
+            vless_transport_on_conn(ib, &ohm, &settings, validator, options, bind_addr, addr)?;
+        return spawn_transport_listener_inbound(
+            &ib.tag,
+            bind_addr,
+            settings,
+            shutdown_token,
+            on_conn,
+        )
+        .await;
     } else if settings.security == "reality" {
         // REALITY：server_tls 验证 → Verified 走 VLESS；Invalid fallback 到 dest
         let listener = InboundTcpListener::bind(addr, settings.socket_options())
@@ -223,42 +199,20 @@ pub(crate) async fn build_trojan_inbound(
         xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref());
     if is_transport_listener_protocol(&settings.protocol) {
         // transport 分支：listener_registry 承载，TLS 在 hub 内终结。
-        let handler = ohm
-            .get_default_handler()
-            .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
-        let validator = Arc::new(xray_proxy_trojan::Validator::new());
-        for (_, user) in users {
-            if let Err(e) = validator.add(user) {
-                tracing::warn!(error = %e, "skip duplicate user during trojan transport inbound init");
-            }
-        }
         let bind_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
         })?;
-        tracing::info!(tag = %ib.tag, addr = %addr, network = %settings.protocol, security = %settings.security, users = validator.get_key_count(), "trojan transport inbound listening");
-        let hs_timeout = handshake_timeout_for(&policy, 0);
-        let on_conn: xray_transport::listener_registry::ConnHandler = Arc::new(move |conn| {
-            let validator = Arc::clone(&validator);
-            let handler = Arc::clone(&handler);
-            let fb_policy = fallbacks.clone();
-            tokio::spawn(async move {
-                let (peer, local) = transport_conn_addrs(conn.as_ref(), bind_addr);
-                xray_proxy_trojan::serve_trojan_conn(
-                    conn,
-                    validator,
-                    handler,
-                    fb_policy,
-                    peer,
-                    local,
-                    String::new(),
-                    String::new(),
-                    hs_timeout,
-                )
-                .await;
-            });
-        });
-        spawn_transport_listener_inbound(&ib.tag, bind_addr, settings, shutdown_token, on_conn)
-            .await
+        let on_conn = trojan_transport_on_conn(
+            ib, &ohm, &policy, &settings, users, fallbacks, bind_addr, addr,
+        )?;
+        return spawn_transport_listener_inbound(
+            &ib.tag,
+            bind_addr,
+            settings,
+            shutdown_token,
+            on_conn,
+        )
+        .await;
     } else if settings.security == "reality" {
         // REALITY：server_tls 验证 → Verified 走 Trojan；Invalid fallback 到 dest。
         // （39436 修复：此前误走 build_tls_acceptor 标准 rustls——客户端
@@ -315,35 +269,19 @@ pub(crate) async fn build_vmess_inbound(
         xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref());
     if is_transport_listener_protocol(&settings.protocol) {
         // transport 分支：listener_registry 承载，TLS 在 hub 内终结。
-        let handler = ohm
-            .get_default_handler()
-            .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
-        let history = Arc::new(xray_proxy_vmess::SessionHistory::new());
-        // transport 层无 TLS 时维持裸 TCP 的 drain 防指纹语义（Go：!isTLS → drain）
-        let is_drain = !settings.is_tls();
         let bind_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
         })?;
-        tracing::info!(tag = %ib.tag, addr = %addr, network = %settings.protocol, security = %settings.security, "vmess transport inbound listening");
-        let hs_timeout = handshake_timeout_for(&policy, 0);
-        let on_conn: xray_transport::listener_registry::ConnHandler = Arc::new(move |conn| {
-            let handler = Arc::clone(&handler);
-            let validator = Arc::clone(&validator);
-            let history = Arc::clone(&history);
-            tokio::spawn(async move {
-                let (peer, _local) = transport_conn_addrs(conn.as_ref(), bind_addr);
-                if let Err(e) = xray_proxy_vmess::handle_vmess_connection(
-                    conn, &handler, &validator, &history, is_drain, hs_timeout,
-                )
-                .await
-                {
-                    // Go vmess inbound.go:250：拒绝 AtInfo + RemoteAddr。
-                    tracing::info!(peer = %peer, error = %e, "vmess transport connection ended with error");
-                }
-            });
-        });
-        spawn_transport_listener_inbound(&ib.tag, bind_addr, settings, shutdown_token, on_conn)
-            .await
+        let on_conn =
+            vmess_transport_on_conn(ib, &ohm, &policy, &settings, validator, bind_addr, addr)?;
+        return spawn_transport_listener_inbound(
+            &ib.tag,
+            bind_addr,
+            settings,
+            shutdown_token,
+            on_conn,
+        )
+        .await;
     } else {
         let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
         let listener = InboundTcpListener::bind(addr, settings.socket_options())
@@ -502,23 +440,10 @@ pub(crate) async fn build_shadowsocks_inbound(
     // 多用户/中继）统一接线，对齐 Go proxyman 语义（streamSettings 包好
     // transport 后调用 Process，见 shadowsocks_2022/inbound.go）。
     if is_transport_listener_protocol(&settings.protocol) {
-        let mode = parse_ss_inbound_config(&ib.entry.data)?;
-        register_ss_user_manager(api, &ib.tag, &mode);
-        let handler = ohm
-            .get_default_handler()
-            .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
         let bind_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
         })?;
-        tracing::info!(tag = %ib.tag, addr = %addr, network = %settings.protocol, security = %settings.security, "ss transport inbound listening");
-        let hs_timeout = handshake_timeout_for(&policy, 0);
-        let on_conn: xray_transport::listener_registry::ConnHandler = Arc::new(move |conn| {
-            let mode = mode.clone();
-            let handler = Arc::clone(&handler);
-            tokio::spawn(async move {
-                ss_mode_conn_pipeline(mode, handler, conn, hs_timeout).await;
-            });
-        });
+        let on_conn = ss_transport_on_conn(ib, &ohm, &policy, api, &settings, addr)?;
         return spawn_transport_listener_inbound(
             &ib.tag,
             bind_addr,
@@ -731,6 +656,168 @@ pub(crate) async fn build_freedom_inbound(
         std::future::pending::<()>().await;
         Ok(())
     })))
+}
+
+// ============ transport 分支 ConnHandler 共享构造（bd lfrg） ============
+//
+// TCP（`spawn_transport_listener_inbound`）与 unix（`spawn_unix_transport_inbound`）
+// 两条监听路径共用同一份 per-协议 on_conn 构造——unix 路径禁另写一份。
+// `fallback_addr` 作 peer/local 解析兜底：TCP = bind 地址，unix = 0.0.0.0:0
+// （对齐 Go UnixConnWrapper.RemoteAddr）。
+
+/// vless transport 分支 ConnHandler（ws/grpc/kcp/httpupgrade/splithttp）。
+pub(crate) fn vless_transport_on_conn(
+    ib: &BuiltInbound,
+    ohm: &Arc<SimpleOhm>,
+    settings: &xray_transport::dialer::StreamSettings,
+    validator: Arc<dyn VlessValidator>,
+    mut options: VlessInboundOptions,
+    fallback_addr: std::net::SocketAddr,
+    ident: &str,
+) -> std::io::Result<xray_transport::listener_registry::ConnHandler> {
+    // splithttp 入站 AllowedNetwork（Go proxyman inbound.go:177-179）
+    if settings.protocol == "splithttp" {
+        options.allowed_network = Some(Network::UDP);
+    }
+    let handler = ohm
+        .get_default_handler()
+        .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
+    let fallbacks = build_vless_fallbacks(&ib.entry.data)?;
+    tracing::info!(tag = %ib.tag, addr = %ident, network = %settings.protocol, security = %settings.security, users = validator.get_uuid_count(), "vless transport inbound listening");
+    Ok(Arc::new(move |conn| {
+        let handler = Arc::clone(&handler);
+        let validator = Arc::clone(&validator);
+        let fallbacks = fallbacks.clone();
+        let options = options.clone();
+        tokio::spawn(async move {
+            let (peer, local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
+            // TLS 已在 transport hub 内终结，name/alpn 不可得
+            if let Err(e) = xray_proxy_vless::handle_connection_with_fallback(
+                conn,
+                &handler,
+                &validator,
+                fallbacks,
+                peer,
+                local,
+                String::new(),
+                String::new(),
+                Some(options),
+                None,
+            )
+            .await
+            {
+                // Go vless inbound.go:522：拒绝 AtInfo + RemoteAddr。
+                tracing::info!(peer = %peer, error = %e, "vless transport connection ended with error");
+            }
+        });
+    }))
+}
+
+/// trojan transport 分支 ConnHandler。
+#[allow(clippy::too_many_arguments)] // 8 参 = TCP/unix 双路径直译签名，打包聚合体属内部 API 变更
+pub(crate) fn trojan_transport_on_conn(
+    ib: &BuiltInbound,
+    ohm: &Arc<SimpleOhm>,
+    policy: &Option<Arc<dyn xray_features::policy::PolicyManager>>,
+    settings: &xray_transport::dialer::StreamSettings,
+    users: std::collections::HashMap<String, xray_proxy_trojan::MemoryUser>,
+    fallbacks: Option<Arc<xray_proxy_trojan::fallback::FallbackPolicy>>,
+    fallback_addr: std::net::SocketAddr,
+    ident: &str,
+) -> std::io::Result<xray_transport::listener_registry::ConnHandler> {
+    let handler = ohm
+        .get_default_handler()
+        .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
+    let validator = Arc::new(xray_proxy_trojan::Validator::new());
+    for (_, user) in users {
+        if let Err(e) = validator.add(user) {
+            tracing::warn!(error = %e, "skip duplicate user during trojan transport inbound init");
+        }
+    }
+    tracing::info!(tag = %ib.tag, addr = %ident, network = %settings.protocol, security = %settings.security, users = validator.get_key_count(), "trojan transport inbound listening");
+    let hs_timeout = handshake_timeout_for(policy, 0);
+    Ok(Arc::new(move |conn| {
+        let validator = Arc::clone(&validator);
+        let handler = Arc::clone(&handler);
+        let fb_policy = fallbacks.clone();
+        tokio::spawn(async move {
+            let (peer, local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
+            xray_proxy_trojan::serve_trojan_conn(
+                conn,
+                validator,
+                handler,
+                fb_policy,
+                peer,
+                local,
+                String::new(),
+                String::new(),
+                hs_timeout,
+            )
+            .await;
+        });
+    }))
+}
+
+/// vmess transport 分支 ConnHandler。
+pub(crate) fn vmess_transport_on_conn(
+    ib: &BuiltInbound,
+    ohm: &Arc<SimpleOhm>,
+    policy: &Option<Arc<dyn xray_features::policy::PolicyManager>>,
+    settings: &xray_transport::dialer::StreamSettings,
+    validator: Arc<xray_proxy_vmess::TimedUserValidator>,
+    fallback_addr: std::net::SocketAddr,
+    ident: &str,
+) -> std::io::Result<xray_transport::listener_registry::ConnHandler> {
+    let handler = ohm
+        .get_default_handler()
+        .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
+    let history = Arc::new(xray_proxy_vmess::SessionHistory::new());
+    // transport 层无 TLS 时维持裸 TCP 的 drain 防指纹语义（Go：!isTLS → drain）
+    let is_drain = !settings.is_tls();
+    tracing::info!(tag = %ib.tag, addr = %ident, network = %settings.protocol, security = %settings.security, "vmess transport inbound listening");
+    let hs_timeout = handshake_timeout_for(policy, 0);
+    Ok(Arc::new(move |conn| {
+        let handler = Arc::clone(&handler);
+        let validator = Arc::clone(&validator);
+        let history = Arc::clone(&history);
+        tokio::spawn(async move {
+            let (peer, _local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
+            if let Err(e) = xray_proxy_vmess::handle_vmess_connection(
+                conn, &handler, &validator, &history, is_drain, hs_timeout,
+            )
+            .await
+            {
+                // Go vmess inbound.go:250：拒绝 AtInfo + RemoteAddr。
+                tracing::info!(peer = %peer, error = %e, "vmess transport connection ended with error");
+            }
+        });
+    }))
+}
+
+/// shadowsocks transport 分支 ConnHandler（Legacy 与 SS2022 统一；含 gRPC
+/// 用户管理面登记，对齐 Go proxyman 语义）。
+pub(crate) fn ss_transport_on_conn(
+    ib: &BuiltInbound,
+    ohm: &Arc<SimpleOhm>,
+    policy: &Option<Arc<dyn xray_features::policy::PolicyManager>>,
+    api: Option<&crate::inbound::InboundRuntime>,
+    settings: &xray_transport::dialer::StreamSettings,
+    ident: &str,
+) -> std::io::Result<xray_transport::listener_registry::ConnHandler> {
+    let mode = parse_ss_inbound_config(&ib.entry.data)?;
+    register_ss_user_manager(api, &ib.tag, &mode);
+    let handler = ohm
+        .get_default_handler()
+        .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
+    tracing::info!(tag = %ib.tag, addr = %ident, network = %settings.protocol, security = %settings.security, "ss transport inbound listening");
+    let hs_timeout = handshake_timeout_for(policy, 0);
+    Ok(Arc::new(move |conn| {
+        let mode = mode.clone();
+        let handler = Arc::clone(&handler);
+        tokio::spawn(async move {
+            ss_mode_conn_pipeline(mode, handler, conn, hs_timeout).await;
+        });
+    }))
 }
 
 // ============ T4.2 phase 2：查表入口适配器（表值 → phase 1 同一构造函数） ============

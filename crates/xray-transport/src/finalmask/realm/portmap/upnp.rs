@@ -1,8 +1,9 @@
 //! # UPnP IGD 客户端（SSDP 发现 → device description → SOAP；NAT-PMP 不可用时回退）
 //!
 //! 零新依赖：SSDP 走 tokio `UdpSocket`，description/SOAP 走仓内既有 `reqwest`。
-//! 只覆盖 IGD 的 UDP 端口映射三件（AddPortMapping / DeletePortMapping /
-//! GetExternalIPAddress）；消息构造与解析都是纯函数，测试可直接喂合成字节。
+//! 只覆盖 IGD 的 UDP 端口映射面：AddPortMapping / DeletePortMapping /
+//! GetSpecificPortMappingEntry / GetExternalIPAddress；消息构造与解析都是纯函数，
+//! 测试可直接喂合成字节。
 //!
 //! 限制（IGD v1 规范面）：没有「查询本映射实际外部端口」的 action，外部端口即
 //! 请求端口（与 Go go-nat 的 UPnP 后端同做法）；租期由 `NewLeaseDuration` 给出。
@@ -39,6 +40,8 @@ const PORT_MAPPING_DESCRIPTION: &str = "hysteria-realm";
 const SSDP_BUF_LEN: usize = 2048;
 /// device description 上限（设备 XML 通常几 KB，防 OOM）。
 const MAX_DESCRIPTION_SIZE: usize = 256 * 1024;
+/// SSDP 无应答时兜底候选端口（miniupnpd 缺省 5000；UPnP 标准端口段 49152/49153）。
+const FALLBACK_PORTS: [u16; 3] = [5000, 49152, 49153];
 
 /// 构造 M-SEARCH 请求（UPnP Device Architecture §1.3.2）。
 #[must_use]
@@ -118,6 +121,17 @@ pub struct SoapError {
     pub description: String,
 }
 
+/// `GetSpecificPortMappingEntry` 答复（按外部端口查现存映射详情）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MappingEntry {
+    pub internal_port: u16,
+    pub internal_client: Ipv4Addr,
+    pub enabled: bool,
+    /// 网关回显的描述文本（XML 转义态）。
+    pub description: String,
+    pub lease_duration: u32,
+}
+
 /// 从 SOAP 响应体提取 UPnPError；非 fault 体 → `None`。
 #[must_use]
 pub fn parse_soap_error(body: &str) -> Option<SoapError> {
@@ -136,16 +150,53 @@ pub struct Client {
 impl Client {
     /// SSDP 发现 + description 解析 + 本机 LAN 地址探测。
     ///
+    /// 只走 SSDP：网关 1900 端口被局域网其他服务占用时永远收不到应答（实测存在），
+    /// 需要兜底用 `discover_with_fallbacks`（`PortMapper` 生产路径已接线）。
+    ///
     /// `search_addr` 可注入（单测指向本地 stub；生产为 [`SSDP_ADDR`] 组播）。
     pub async fn discover(search_addr: SocketAddrV4, timeout: Duration) -> io::Result<Self> {
-        let location = ssdp_location(search_addr, timeout).await?;
+        Self::discover_with_fallbacks(search_addr, timeout, &[]).await
+    }
+
+    /// [`Client::discover`] 加 SSDP 无应答兜底：依次直取 `fallbacks` 里的
+    /// description URL，首个成功即用；全失败 → 一条错误保留 SSDP 失败原文 +
+    /// 每个候选的结果（fail-visible）。
+    pub(crate) async fn discover_with_fallbacks(
+        search_addr: SocketAddrV4,
+        timeout: Duration,
+        fallbacks: &[String],
+    ) -> io::Result<Self> {
+        let location = match ssdp_location(search_addr, timeout).await {
+            Ok(location) => location,
+            Err(ssdp_err) => {
+                let mut attempts = Vec::new();
+                for url in fallbacks {
+                    match Self::from_description_url(url, timeout).await {
+                        Ok(client) => return Ok(client),
+                        Err(e) => attempts.push(format!("{url}: {e}")),
+                    }
+                }
+                if attempts.is_empty() {
+                    return Err(ssdp_err);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{ssdp_err}; description fallbacks failed: {}", attempts.join("; ")),
+                ));
+            },
+        };
+        Self::from_description_url(&location, timeout).await
+    }
+
+    /// 已知 description URL 直建客户端（跳过 SSDP；兜底路径与真机取证用）。
+    pub async fn from_description_url(location: &str, timeout: Duration) -> io::Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(timeout)
             .build()
             .map_err(|e| io::Error::other(format!("UPnP: build http client failed: {e}")))?;
-        let description = fetch_description(&http, &location).await?;
+        let description = fetch_description(&http, location).await?;
         let (service_type, control) =
-            parse_control_url(&description, &location).ok_or_else(|| {
+            parse_control_url(&description, location).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("UPnP: no WANIPConnection/WANPPPConnection service in {location}"),
@@ -206,6 +257,44 @@ impl Client {
         })
     }
 
+    /// 按外部端口查询现存 UDP 映射（IGD `GetSpecificPortMappingEntry`）。
+    ///
+    /// 映射不存在 → 网关 SOAP fault（miniupnpd 714 NoSuchEntry）→ `Err`：
+    /// 删除后复查 714 即「映射确实删净」的带内证据。
+    pub async fn get_udp_mapping(&self, external_port: u16) -> io::Result<MappingEntry> {
+        let args = [
+            ("NewRemoteHost", String::new()),
+            ("NewExternalPort", external_port.to_string()),
+            ("NewProtocol", "UDP".to_string()),
+        ];
+        let body = self.soap("GetSpecificPortMappingEntry", &args).await?;
+        let missing = |tag: &str| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("UPnP: GetSpecificPortMappingEntry response missing {tag}"),
+            )
+        };
+        let internal_port = extract_tag(&body, "NewInternalPort")
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| missing("NewInternalPort"))?;
+        let internal_client = extract_tag(&body, "NewInternalClient")
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| missing("NewInternalClient"))?;
+        let enabled = extract_tag(&body, "NewEnabled").ok_or_else(|| missing("NewEnabled"))?;
+        let description = extract_tag(&body, "NewPortMappingDescription")
+            .ok_or_else(|| missing("NewPortMappingDescription"))?;
+        let lease_duration = extract_tag(&body, "NewLeaseDuration")
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| missing("NewLeaseDuration"))?;
+        Ok(MappingEntry {
+            internal_port,
+            internal_client,
+            enabled: enabled == "1",
+            description,
+            lease_duration,
+        })
+    }
+
     /// 发一次 SOAP 动作；HTTP 非 2xx 或 fault 体一律 `Err`（带网关错误码）。
     async fn soap(&self, action: &str, args: &[(&str, String)]) -> io::Result<String> {
         let envelope = build_soap_envelope(&self.service_type, action, args);
@@ -245,6 +334,17 @@ fn soap_failure(action: &str, status: u16, body: &str) -> io::Error {
         )),
         None => io::Error::other(format!("UPnP {action} failed: HTTP {status}")),
     }
+}
+
+/// SSDP 无应答时的兜底候选：默认路由网关的常见 IGD description 端点。
+///
+/// 平台取不到默认路由（显式 `Unsupported` 等）→ 空表：错误文案如实表现为
+/// 无候选，不猜网关地址。
+pub(crate) fn fallback_description_urls() -> Vec<String> {
+    let Ok(gateway) = super::default_ipv4_gateway() else {
+        return Vec::new();
+    };
+    FALLBACK_PORTS.iter().map(|port| format!("http://{gateway}:{port}/rootDesc.xml")).collect()
 }
 
 /// SSDP 搜索：并向各 search target，等首个带 LOCATION 的 200。
@@ -610,5 +710,228 @@ mod tests {
             .err()
             .expect("no SSDP responder must fail");
         assert!(err.to_string().contains("no SSDP response"), "{err}");
+    }
+
+    /// 死 SSDP 端点（绑定后立刻释放：无任何应答）。
+    async fn silent_ssdp_addr() -> SocketAddrV4 {
+        let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind");
+        match sock.local_addr().expect("addr") {
+            SocketAddr::V4(v4) => v4,
+            SocketAddr::V6(_) => unreachable!("v4 bind"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discover_fallback_first_success_wins_and_client_works() {
+        let http = HttpStub::spawn(|req| match req.path.as_str() {
+            "/gw.xml" | "/gw2.xml" => (200, DESCRIPTION_XML.to_string()),
+            "/ctl/IPConn" => (
+                200,
+                "<s:Envelope><s:Body><u:AddPortMappingResponse/></s:Body></s:Envelope>".to_string(),
+            ),
+            _ => (404, "<nope/>".to_string()),
+        })
+        .await;
+        let first = format!("http://{}/gw.xml", http.addr);
+        let second = format!("http://{}/gw2.xml", http.addr);
+        let client = Client::discover_with_fallbacks(
+            silent_ssdp_addr().await,
+            Duration::from_secs(2),
+            &[first.clone(), second],
+        )
+        .await
+        .expect("first fallback candidate must win");
+        // 首个成功即用：第二个候选一个请求都不该发
+        let gets: Vec<_> = http.requests().into_iter().filter(|r| r.method == "GET").collect();
+        assert_eq!(gets.len(), 1, "{gets:?}");
+        assert_eq!(gets[0].path, "/gw.xml");
+        // 兜底得到的客户端 SOAP 照常可用
+        client.add_udp_mapping(8080, 60).await.expect("add via fallback client");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discover_fallback_all_fail_reports_ssdp_and_each_candidate() {
+        let http = HttpStub::spawn(|req| match req.path.as_str() {
+            "/missing.xml" => (404, "<nope/>".to_string()),
+            _ => (500, "<err/>".to_string()),
+        })
+        .await;
+        let not_found = format!("http://{}/missing.xml", http.addr);
+        // 已关闭的 TCP 端口（绑定后立刻释放）→ 连接拒绝
+        let refused = {
+            let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            drop(listener);
+            format!("http://127.0.0.1:{port}/rootDesc.xml")
+        };
+        let err = Client::discover_with_fallbacks(
+            silent_ssdp_addr().await,
+            Duration::from_secs(2),
+            &[not_found.clone(), refused.clone()],
+        )
+        .await
+        .err()
+        .expect("all candidates dead must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("no SSDP response from"), "SSDP original: {msg}");
+        assert!(msg.contains(&not_found) && msg.contains("HTTP 404"), "{msg}");
+        assert!(msg.contains(&refused), "{msg}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_udp_mapping_entry_then_714_after_delete() {
+        // 删除后把查询切换为 714 fault（模拟 miniupnpd NoSuchEntry）
+        let deleted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&deleted);
+        let http = HttpStub::spawn(move |req| match req.path.as_str() {
+            "/rootDesc.xml" => (200, DESCRIPTION_XML.to_string()),
+            "/ctl/IPConn" => {
+                let action = req.header("SOAPAction").unwrap_or_default();
+                if action.contains("GetSpecificPortMappingEntry") {
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        (
+                            200,
+                            "<s:Envelope><s:Body><s:Fault><detail><UPnPError>\
+                             <errorCode>714</errorCode>\
+                             <errorDescription>NoSuchEntry</errorDescription>\
+                             </UPnPError></detail></s:Fault></s:Body></s:Envelope>"
+                                .to_string(),
+                        )
+                    } else {
+                        (
+                            200,
+                            "<s:Envelope><s:Body><u:GetSpecificPortMappingEntryResponse>\
+                             <NewInternalPort>8080</NewInternalPort>\
+                             <NewInternalClient>127.0.0.1</NewInternalClient>\
+                             <NewEnabled>1</NewEnabled>\
+                             <NewPortMappingDescription>hysteria-realm</NewPortMappingDescription>\
+                             <NewLeaseDuration>600</NewLeaseDuration>\
+                             </u:GetSpecificPortMappingEntryResponse></s:Body></s:Envelope>"
+                                .to_string(),
+                        )
+                    }
+                } else if action.contains("DeletePortMapping") {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    (
+                        200,
+                        "<s:Envelope><s:Body><u:DeletePortMappingResponse/></s:Body></s:Envelope>"
+                            .to_string(),
+                    )
+                } else {
+                    (500, "<err/>".to_string())
+                }
+            },
+            _ => (404, "<nope/>".to_string()),
+        })
+        .await;
+        let ssdp = SsdpStub::spawn(format!("http://{}/rootDesc.xml", http.addr)).await;
+        let client = Client::discover(ssdp.addr, Duration::from_secs(2)).await.expect("discover");
+
+        let entry = client.get_udp_mapping(8080).await.expect("entry");
+        assert_eq!(
+            entry,
+            MappingEntry {
+                internal_port: 8080,
+                internal_client: Ipv4Addr::LOCALHOST,
+                enabled: true,
+                description: "hysteria-realm".to_string(),
+                lease_duration: 600,
+            }
+        );
+
+        client.delete_udp_mapping(8080).await.expect("delete");
+        let err = client.get_udp_mapping(8080).await.expect_err("gone after delete");
+        assert!(err.to_string().contains("714"), "{err}");
+        assert!(err.to_string().contains("NoSuchEntry"), "{err}");
+    }
+
+    /// 真机网关闭环（默认 `#[ignore]`）：SSDP 静默取证 → 直取 description URL →
+    /// 生产兜底发现 → 建映射（可挂起供路由器侧核对）→ 删映射 → 复查 714=删净。
+    /// 跑法：`XRAY_UPNP_REAL_GW=<网关 IPv4> cargo test -p xray-transport --lib \
+    /// real_gateway_add_delete_roundtrip -- --ignored --nocapture`
+    /// 可选 `XRAY_UPNP_REAL_GW_HOLD_SECS=<秒>`：add 后挂起，供 ssh 网关侧核对。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires a real IGD gateway; set XRAY_UPNP_REAL_GW=<ipv4>"]
+    #[allow(clippy::print_stdout)] // 真机取证输出（--nocapture 人眼核对）
+    async fn real_gateway_add_delete_roundtrip() {
+        let gateway: Ipv4Addr =
+            match std::env::var("XRAY_UPNP_REAL_GW").ok().and_then(|v| v.parse().ok()) {
+                Some(gateway) => gateway,
+                None => {
+                    println!("set XRAY_UPNP_REAL_GW=<gateway IPv4> to run; skipping");
+                    return;
+                },
+            };
+        let timeout = Duration::from_secs(3);
+        // 临时测试端口（34560-34599 段）；租期 120s：即使异常残留网关也自动过期
+        const PORT: u16 = 34567;
+
+        // 1) 前提：该网络 SSDP 静默（路由器 1900 端口被其他服务占用，实测 0 应答）
+        match ssdp_location(SSDP_ADDR, timeout).await {
+            Ok(location) => panic!(
+                "SSDP unexpectedly answered with {location}; the 'SSDP silent' premise no longer holds"
+            ),
+            Err(e) => println!("SSDP silent as expected: {e}"),
+        }
+        // 2) SSDP-only discover 必须失败（兜底前的现状缺口取证）
+        let err = Client::discover(SSDP_ADDR, timeout)
+            .await
+            .err()
+            .expect("SSDP-only discover must fail on this network");
+        println!("SSDP-only discover failed as expected: {err}");
+        // 3) 直取 description URL 构造（新兜底入口）
+        let direct =
+            Client::from_description_url(&format!("http://{gateway}:5000/rootDesc.xml"), timeout)
+                .await
+                .expect("direct description url");
+        println!("direct client: service={}, control={}", direct.service_type, direct.control_url);
+        println!("external address = {}", direct.get_external_address().await.expect("ext ip"));
+        // 4) 生产兜底路径（PortMapper 生产用的同一入口）：以环境网关推候选， 端口序 =
+        //    FALLBACK_PORTS（首个成功即用，:49152/49153 拒绝快速跳过）
+        let candidates: Vec<String> = FALLBACK_PORTS
+            .iter()
+            .map(|port| format!("http://{gateway}:{port}/rootDesc.xml"))
+            .collect();
+        let client = Client::discover_with_fallbacks(SSDP_ADDR, timeout, &candidates)
+            .await
+            .expect("production fallback discovery via env gateway");
+        println!(
+            "fallback client: service={}, control={}",
+            client.service_type, client.control_url
+        );
+        // 5) 建映射 + 带内 MATCH 确认（此后到删除之间只做查询/打印/挂起）
+        let external = client.add_udp_mapping(PORT, 120).await.expect("add mapping");
+        println!("added UDP mapping: internal {PORT} -> external {external}");
+        let entry = client.get_udp_mapping(PORT).await.expect("query mapping");
+        println!("router reports mapping: {entry:?}");
+        assert_eq!(entry.internal_port, PORT);
+        assert_eq!(entry.internal_client, client.local_ip);
+        assert_eq!(entry.description, "hysteria-realm");
+        if let Ok(secs) =
+            std::env::var("XRAY_UPNP_REAL_GW_HOLD_SECS").map(|v| v.parse::<u64>().unwrap_or(0))
+        {
+            if secs > 0 {
+                println!("holding mapping for {secs}s for router-side inspection...");
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+            }
+        }
+        // 6) 删映射 + 复查 714：查询已删映射必须 NoSuchEntry（映射确实删净； 本机 miniupnpd 对
+        //    delete-nonexistent 回 200，带内判据只能用查询）
+        client.delete_udp_mapping(PORT).await.expect("delete mapping");
+        println!("deleted mapping {PORT}");
+        let err =
+            client.get_udp_mapping(PORT).await.expect_err("deleted mapping must not be queryable");
+        println!("re-query after removal: {err}");
+        assert!(err.to_string().contains("714"), "expected 714 NoSuchEntry, got: {err}");
+        // 7) 默认路由推导候选（fallback_description_urls 的生产形态）：非致命——
+        //    本机默认路由是主网关（IGD 在 .249 非默认路由位），失败属拓扑事实
+        match Client::discover_with_fallbacks(SSDP_ADDR, timeout, &fallback_description_urls())
+            .await
+        {
+            Ok(_) => println!("default-route-derived fallback: ok"),
+            Err(e) => println!(
+                "default-route-derived fallback failed (IGD is not the default-route gateway on this host): {e}"
+            ),
+        }
     }
 }

@@ -120,6 +120,9 @@ pub async fn listen_splithttp(
 /// [`listen_splithttp`] 的底层连接源（Go splithttp/hub.go:526-531
 /// `port == net.Port(0)` unix 分支）。unix 侧无 PROXY protocol/finalmask，
 /// 对齐 Go system_listener UnixAddr 分支。
+// UnixListener 明显大于 TcpListener；本枚举每 listener 只构造一次，
+// 体积差异不进入 accept 热路径，Box 化只增一次间接寻址与维护面。
+#[allow(clippy::large_enum_variant)]
 enum XhSource {
     Tcp(tokio::net::TcpListener),
     #[cfg(unix)]

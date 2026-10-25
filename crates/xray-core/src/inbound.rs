@@ -3893,7 +3893,7 @@ pub(crate) async fn spawn_one_inbound(
     // listener；端口语义不适用，须在 port 解析前分派。判别与 xray-conf
     // Address::is_unix_path 一致（'/' 绝对路径 / '@' abstract）。
     if is_unix_listen_path(listen) {
-        return spawn_unix_inbound(ib, ohm, policy, shutdown_token, listen).await;
+        return spawn_unix_inbound(ib, ohm, policy, shutdown_token, listen, api).await;
     }
     let port = match ib.port {
         Some(p) => p,
@@ -3999,10 +3999,14 @@ async fn serve_unix_listener(
 ///
 /// 对应 Go `DefaultListener.Listen` 的 `*net.UnixAddr` 分支
 /// （transport/internet/system_listener.go:118）。Go 侧 TCP 类代理经
-/// `net.Conn` 抽象天然支持 UDS；Rust 侧 serve 层为 TcpStream 特化，故仅
-/// 接线已有泛型/`Connection` 入口的协议（socks/vless/vmess/trojan/ss 的
-/// 裸 TCP 路径），其余协议显式报错，不静默错绑。security=tls/reality 与
-/// transport 协议（ws/grpc/kcp/…）的终结层不支持 UDS，同样显式报错。
+/// `net.Conn` 抽象天然支持 UDS。
+///
+/// transport 协议（ws/grpc/kcp/…）经 [`spawn_unix_transport_inbound`] 分派到
+/// listener_registry unix 注册表，security 同 TCP 路径一样由 hub 内部完成。
+/// 裸 TCP 协议的 serve 层为 TcpStream 特化，仅接线已有泛型/`Connection`
+/// 入口的协议（socks/vless/vmess/trojan/ss），其余显式报错；该 serve 栈无
+/// TLS accept 层，security=tls/reality 在此形态不可行——只对该形态显式报
+/// 错（Go unix listen 可包 TLS 的语义由 hub 路径提供）。
 #[cfg(unix)]
 async fn spawn_unix_inbound(
     ib: &BuiltInbound,
@@ -4010,19 +4014,23 @@ async fn spawn_unix_inbound(
     policy: Option<Arc<dyn xray_features::policy::PolicyManager>>,
     shutdown_token: CancellationToken,
     listen: &str,
+    api: Option<&InboundRuntime>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     use xray_transport::system_listener::listen_unix_system;
 
     let settings =
         xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref());
     if is_transport_listener_protocol(&settings.protocol) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            format!(
-                "uds inbound '{}': transport protocol '{}' not supported over unix socket",
-                ib.tag, settings.protocol
-            ),
-        ));
+        return spawn_unix_transport_inbound(
+            ib,
+            ohm,
+            policy,
+            shutdown_token,
+            listen,
+            settings,
+            api,
+        )
+        .await;
     }
     match settings.security.as_str() {
         "" | "none" => {},
@@ -4235,6 +4243,86 @@ async fn spawn_unix_inbound(
     Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, serve)))
 }
 
+/// transport 协议 + unix 路径 inbound（bd lfrg 收尾）。
+///
+/// 对应 Go `tcp_hub.go::ListenUnix`（:31-50）：unix listen 后 security 仍由
+/// transport hub 内部完成（`build_tls_config`/accept 循环与 TCP 监听共用同一
+/// 份代码，TLS 同样可包，以 Go 为准不设「security != none 即拒」门）；on_conn
+/// 复用 [`crate::arm_builders::inbound`] 各协议 transport 分支的唯一构造。
+/// listener 移入 pending future 保活（与 [`spawn_transport_listener_inbound`]
+/// 同骨架），shutdown abort 时随 task drop。
+///
+/// 协议覆盖 = arm_builders 有 transport 分支的四种 inbound（vless/trojan/
+/// vmess/shadowsocks）；其余 kind 显式 Unsupported。未注册 unix 监听的
+/// transport 协议（如 kcp）由 listener_registry 报 Go 对齐的 NotFound。
+#[cfg(unix)]
+async fn spawn_unix_transport_inbound(
+    ib: &BuiltInbound,
+    ohm: Arc<SimpleOhm>,
+    policy: Option<Arc<dyn xray_features::policy::PolicyManager>>,
+    shutdown_token: CancellationToken,
+    listen: &str,
+    settings: xray_transport::dialer::StreamSettings,
+    api: Option<&InboundRuntime>,
+) -> std::io::Result<Option<JoinHandle<()>>> {
+    use crate::arm_builders::inbound::{
+        ss_transport_on_conn, trojan_transport_on_conn, vless_transport_on_conn,
+        vmess_transport_on_conn,
+    };
+
+    // UDS 无 SocketAddr；对齐 Go UnixConnWrapper.RemoteAddr 的 0.0.0.0:0。
+    let fallback_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+    let on_conn = match ib.entry.kind.as_str() {
+        "vless" => {
+            let validator: Arc<dyn VlessValidator> = build_vless_validator(&ib.entry.data)?;
+            let decryption = build_vless_decryption(&ib.entry.data)?;
+            let options = VlessInboundOptions {
+                decryption: decryption.clone(),
+                handshake_timeout: Some(handshake_timeout_for(&policy, 0)),
+                ..Default::default()
+            };
+            vless_transport_on_conn(ib, &ohm, &settings, validator, options, fallback_addr, listen)
+        },
+        "trojan" => {
+            let users = build_trojan_users(&ib.entry.data)?;
+            let fallbacks = build_trojan_fallbacks(&ib.entry.data)?;
+            trojan_transport_on_conn(
+                ib,
+                &ohm,
+                &policy,
+                &settings,
+                users,
+                fallbacks,
+                fallback_addr,
+                listen,
+            )
+        },
+        "vmess" => {
+            let validator = build_vmess_validator(&ib.entry.data)?;
+            vmess_transport_on_conn(ib, &ohm, &policy, &settings, validator, fallback_addr, listen)
+        },
+        "shadowsocks" => ss_transport_on_conn(ib, &ohm, &policy, api, &settings, listen),
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "uds inbound '{}': transport protocol '{}' not supported for inbound kind '{other}' over unix socket",
+                ib.tag, settings.protocol
+            ),
+        )),
+    }?;
+    // sockopt 先取（trustedXForwardedFor 等，Go socketSettings 对 unix 分支
+    // 同样生效）；settings 随后移入 registry。
+    let sockopt = settings.socket_options();
+    let listener =
+        xray_transport::listener_registry::listen_unix(listen, settings, sockopt, on_conn).await?;
+    tracing::info!(tag = %ib.tag, path = %listen, "transport inbound listening (unix)");
+    Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+        let _listener = listener;
+        std::future::pending::<()>().await;
+        Ok(())
+    })))
+}
+
 /// 非 unix 平台：unix 路径监听显式 Unsupported（vodx 验收：Windows 断言），
 /// 不静默回落 TCP bind。
 #[cfg(not(unix))]
@@ -4244,8 +4332,9 @@ async fn spawn_unix_inbound(
     policy: Option<Arc<dyn xray_features::policy::PolicyManager>>,
     shutdown_token: CancellationToken,
     listen: &str,
+    api: Option<&InboundRuntime>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
-    let _ = (ohm, policy, shutdown_token, listen);
+    let _ = (ohm, policy, shutdown_token, listen, api);
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         format!("unix socket inbound '{}' is only supported on unix platforms", ib.tag),
@@ -5722,6 +5811,422 @@ mod tests {
         client.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, payload, "should receive echo through uds proxy");
 
+        handle.abort();
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    // ===== bd lfrg：transport 协议 unix 监听接入生产 inbound 路径 =====
+
+    /// TCP echo server（freedom 出站的真实目的地）。
+    #[cfg(unix)]
+    async fn spawn_echo_server() -> std::net::SocketAddr {
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = echo_listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    },
+                }
+            }
+        });
+        echo_addr
+    }
+
+    /// freedom 出站 SimpleOhm（与 [`unix_socket_socks_inbound_e2e`] 同装配）。
+    #[cfg(unix)]
+    fn freedom_ohm() -> Arc<SimpleOhm> {
+        let ohm = Arc::new(SimpleOhm::new());
+        ohm.set_default(Arc::new(xray_app_dispatcher::default::DialBridge::new(
+            "freedom",
+            xray_proxy_freedom::make_freedom_dial_fn(),
+        )) as Arc<dyn xray_app_dispatcher::DispatchHandler>);
+        ohm
+    }
+
+    #[cfg(unix)]
+    const VLESS_TEST_UUID: &str = "d342d11e-d424-4583-b36e-524ab1f0afa4";
+
+    /// vless inbound settings：单用户 + decryption none。
+    #[cfg(unix)]
+    fn vless_entry_data() -> Vec<u8> {
+        format!(r#"{{"clients":[{{"id":"{VLESS_TEST_UUID}"}}],"decryption":"none"}}"#).into_bytes()
+    }
+
+    /// 生产 VLESS 客户端编码器穿任意 IO：请求头 → 响应头 → 载荷 echo 往返
+    /// （freedom → echo server）。httpupgrade/TLS 流等已升级后的字节流直接用。
+    #[cfg(unix)]
+    async fn vless_echo_roundtrip<S>(mut stream: S, dest: std::net::SocketAddr)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use xray_common::net::address::Address;
+        let uuid = xray_common::uuid::UUID::parse(VLESS_TEST_UUID).unwrap();
+        let v4 = match dest.ip() {
+            std::net::IpAddr::V4(v4) => Address::from_ipv4_bytes(v4.octets()),
+            _ => unreachable!("echo binds ipv4"),
+        };
+        xray_proxy_vless::encoding::client::encode_request_header(
+            &mut stream,
+            xray_proxy_vless::encoding::VERSION,
+            &uuid,
+            xray_proxy_vless::encoding::VlessCommand::Tcp,
+            Some(&v4),
+            Some(dest.port()),
+            &xray_proxy_vless::encoding::empty_addons(),
+        )
+        .await
+        .unwrap();
+        let addons = xray_proxy_vless::encoding::decode_response_header(
+            &mut stream,
+            xray_proxy_vless::encoding::VERSION,
+        )
+        .await
+        .unwrap();
+        assert_eq!(addons.flow, "", "no flow addons expected");
+        let payload = b"uds roundtrip payload";
+        stream.write_all(payload).await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        stream.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, payload, "echo through unix transport inbound");
+    }
+
+    /// 测试用 RFC6455 客户端（binary 帧）：握手 accept key 校验复用 ws hub
+    /// 同一 handshake 模块；[`Self::recv`] 聚合分帧（容忍服务端响应头/数据合帧）。
+    #[cfg(unix)]
+    struct TestWsClient<S> {
+        inner: S,
+        pending: Vec<u8>,
+    }
+
+    #[cfg(unix)]
+    impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> TestWsClient<S> {
+        async fn handshake(mut inner: S, path: &str) -> Self {
+            use xray_transport_websocket::handshake::{
+                compute_accept_key, generate_client_key_for_testing,
+            };
+            let key = generate_client_key_for_testing();
+            let req = format!(
+                "GET {path} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n\
+                 Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
+                 Sec-WebSocket-Key: {key}\r\n\r\n"
+            );
+            inner.write_all(req.as_bytes()).await.unwrap();
+            let mut buf: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 512];
+            loop {
+                let n = inner.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "EOF during ws handshake");
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..pos]).into_owned();
+                    assert!(head.starts_with("HTTP/1.1 101"), "ws handshake failed: {head}");
+                    assert!(
+                        head.contains(&compute_accept_key(&key)),
+                        "Sec-WebSocket-Accept mismatch: {head}"
+                    );
+                    break;
+                }
+            }
+            Self { inner, pending: Vec::new() }
+        }
+
+        async fn send(&mut self, data: &[u8]) {
+            assert!(data.len() < 126, "test-only: short frames");
+            let mask = [0x2au8, 0x4b, 0x19, 0x7e];
+            let mut frame = Vec::with_capacity(6 + data.len());
+            frame.push(0x82); // FIN | binary
+            frame.push(0x80 | data.len() as u8); // MASK | len
+            frame.extend_from_slice(&mask);
+            frame.extend(data.iter().zip(mask.iter().cycle()).map(|(b, m)| b ^ m));
+            self.inner.write_all(&frame).await.unwrap();
+        }
+
+        /// 读恰好 `want` 字节（服务器帧不掩码；首字节 = vless 响应头时按流聚合）。
+        async fn recv(&mut self, want: usize) -> Vec<u8> {
+            while self.pending.len() < want {
+                let mut hdr = [0u8; 2];
+                self.inner.read_exact(&mut hdr).await.unwrap();
+                assert_eq!(hdr[0] & 0x0f, 0x2, "expected binary frame, got {:#x}", hdr[0]);
+                assert_eq!(hdr[1] & 0x80, 0, "server frames must be unmasked");
+                let mut len = (hdr[1] & 0x7f) as usize;
+                if len == 126 {
+                    let mut ext = [0u8; 2];
+                    self.inner.read_exact(&mut ext).await.unwrap();
+                    len = u16::from_be_bytes(ext) as usize;
+                }
+                let mut payload = vec![0u8; len];
+                self.inner.read_exact(&mut payload).await.unwrap();
+                self.pending.extend_from_slice(&payload);
+            }
+            self.pending.drain(..want).collect()
+        }
+    }
+
+    /// bd lfrg（unix 端到端）：vless + ws 经 `spawn_one_inbound` unix 分派 →
+    /// `listen_unix`（ws hub，生产 on_conn）→ RFC6455 握手 → vless 握手 →
+    /// freedom → echo 收发字节。证明 transport-unix 接线被主分派入口真实调用。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_vless_ws_inbound_e2e() {
+        xray_transport_websocket::register::register_unix_listener().unwrap();
+
+        let echo_addr = spawn_echo_server().await;
+        let ohm = freedom_ohm();
+        let sock_path =
+            std::env::temp_dir().join(format!("xray-uds-vless-ws-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+        let ib = BuiltInbound {
+            entry: xray_conf::BuiltEntry { kind: "vless".to_string(), data: vless_entry_data() },
+            tag: "vless-ws-uds".to_string(),
+            port: None,
+            listen: Some(sock_path.to_string_lossy().into_owned()),
+            stream_settings_json: Some(serde_json::json!({
+                "network": "ws",
+                "security": "none",
+                "wsSettings": { "path": "/ws" }
+            })),
+            sniffing_json: None,
+        };
+        let handle = spawn_one_inbound(&ib, ohm, None, CancellationToken::new(), None)
+            .await
+            .unwrap()
+            .expect("vless+ws unix inbound should spawn");
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let uds = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+            let mut ws = TestWsClient::handshake(uds, "/ws").await;
+
+            // vless 请求头（生产编码器）→ 响应头 → 载荷 echo 往返
+            let uuid = xray_common::uuid::UUID::parse(VLESS_TEST_UUID).unwrap();
+            let mut req = Vec::new();
+            let v4 = match echo_addr.ip() {
+                std::net::IpAddr::V4(v4) => v4.octets(),
+                _ => unreachable!("echo binds ipv4"),
+            };
+            xray_proxy_vless::encoding::client::encode_request_header(
+                &mut req,
+                xray_proxy_vless::encoding::VERSION,
+                &uuid,
+                xray_proxy_vless::encoding::VlessCommand::Tcp,
+                Some(&xray_common::net::address::Address::from_ipv4_bytes(v4)),
+                Some(echo_addr.port()),
+                &xray_proxy_vless::encoding::empty_addons(),
+            )
+            .await
+            .unwrap();
+            ws.send(&req).await;
+            assert_eq!(ws.recv(2).await, vec![0, 0], "vless response [ver=0][addons=0]");
+            ws.send(b"hello vless-ws-uds!").await;
+            assert_eq!(ws.recv(19).await, b"hello vless-ws-uds!".to_vec());
+        })
+        .await
+        .expect("vless+ws unix e2e timed out");
+        handle.abort();
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    /// bd lfrg（unix 端到端）：vless + httpupgrade 同路径分派 →
+    /// `listen_unix`（httpupgrade hub）→ 生产 [`HttpUpgradeClient`] 握手 →
+    /// 生产 vless on_conn → freedom → echo。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_vless_httpupgrade_inbound_e2e() {
+        xray_transport_httpupgrade::register::register_unix_listener().unwrap();
+
+        let echo_addr = spawn_echo_server().await;
+        let ohm = freedom_ohm();
+        let sock_path =
+            std::env::temp_dir().join(format!("xray-uds-vless-hu-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+        let ib = BuiltInbound {
+            entry: xray_conf::BuiltEntry { kind: "vless".to_string(), data: vless_entry_data() },
+            tag: "vless-hu-uds".to_string(),
+            port: None,
+            listen: Some(sock_path.to_string_lossy().into_owned()),
+            stream_settings_json: Some(serde_json::json!({
+                "network": "httpupgrade",
+                "security": "none",
+                "httpupgradeSettings": { "path": "/hu", "host": "localhost" }
+            })),
+            sniffing_json: None,
+        };
+        let handle = spawn_one_inbound(&ib, ohm, None, CancellationToken::new(), None)
+            .await
+            .unwrap()
+            .expect("vless+httpupgrade unix inbound should spawn");
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let uds = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+            let client = xray_transport_httpupgrade::client::HttpUpgradeClient::new(
+                "localhost".to_string(),
+                xray_transport_httpupgrade::config::Config {
+                    path: "/hu".into(),
+                    ..Default::default()
+                },
+            );
+            let (conn, _leftover) = client.dial_over_io(uds).await.expect("httpupgrade 握手失败");
+            vless_echo_roundtrip(conn, echo_addr).await;
+        })
+        .await
+        .expect("vless+httpupgrade unix e2e timed out");
+        handle.abort();
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    /// bd lfrg（unix + TLS 端到端）：security=tls 的 unix 监听不再被
+    /// 「security != none 即拒」门拦截，TLS accept 由 hub 内部完成（对齐 Go
+    /// unix listen 照样可包 TLS）：自签证书 → vless+ws+TLS over UDS 全链路。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_vless_ws_tls_inbound_e2e() {
+        xray_transport_websocket::register::register_unix_listener().unwrap();
+        xray_common::ensure_default_crypto_provider();
+
+        // 自签证书落盘（Go certificates[].certificateFile/keyFile 形态）
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_path =
+            std::env::temp_dir().join(format!("xray-uds-tls-cert-{}.pem", std::process::id()));
+        let key_path =
+            std::env::temp_dir().join(format!("xray-uds-tls-key-{}.pem", std::process::id()));
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+
+        let echo_addr = spawn_echo_server().await;
+        let ohm = freedom_ohm();
+        let sock_path =
+            std::env::temp_dir().join(format!("xray-uds-vless-ws-tls-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+        let ib = BuiltInbound {
+            entry: xray_conf::BuiltEntry { kind: "vless".to_string(), data: vless_entry_data() },
+            tag: "vless-ws-tls-uds".to_string(),
+            port: None,
+            listen: Some(sock_path.to_string_lossy().into_owned()),
+            stream_settings_json: Some(serde_json::json!({
+                "network": "ws",
+                "security": "tls",
+                "tlsSettings": { "certificates": [{
+                    "certificateFile": cert_path.to_string_lossy(),
+                    "keyFile": key_path.to_string_lossy(),
+                }] },
+                "wsSettings": { "path": "/wstls" }
+            })),
+            sniffing_json: None,
+        };
+        let handle = spawn_one_inbound(&ib, ohm, None, CancellationToken::new(), None)
+            .await
+            .unwrap()
+            .expect("vless+ws+tls unix inbound should spawn (security gate removed)");
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            // UDS → rustls（信任自签证书）→ WS 升级 → vless
+            let uds = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(cert.cert.der().clone()).unwrap();
+            let mut client_cfg =
+                rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+            client_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let connector: tokio_rustls::TlsConnector = Arc::new(client_cfg).into();
+            let tls = connector
+                .connect("localhost".try_into().unwrap(), uds)
+                .await
+                .expect("tls handshake over uds failed");
+            let mut ws = TestWsClient::handshake(tls, "/wstls").await;
+
+            let uuid = xray_common::uuid::UUID::parse(VLESS_TEST_UUID).unwrap();
+            let mut req = Vec::new();
+            let v4 = match echo_addr.ip() {
+                std::net::IpAddr::V4(v4) => v4.octets(),
+                _ => unreachable!("echo binds ipv4"),
+            };
+            xray_proxy_vless::encoding::client::encode_request_header(
+                &mut req,
+                xray_proxy_vless::encoding::VERSION,
+                &uuid,
+                xray_proxy_vless::encoding::VlessCommand::Tcp,
+                Some(&xray_common::net::address::Address::from_ipv4_bytes(v4)),
+                Some(echo_addr.port()),
+                &xray_proxy_vless::encoding::empty_addons(),
+            )
+            .await
+            .unwrap();
+            ws.send(&req).await;
+            assert_eq!(ws.recv(2).await, vec![0, 0], "vless response [ver=0][addons=0]");
+            ws.send(b"hello vless-ws-tls-uds!").await;
+            assert_eq!(ws.recv(23).await, b"hello vless-ws-tls-uds!".to_vec());
+        })
+        .await
+        .expect("vless+ws+tls unix e2e timed out");
+        handle.abort();
+        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    /// bd lfrg（接线证明 + fail-visible 文案）：transport 协议 + unix 分派确已
+    /// 进入 `listener_registry::listen_unix`——未注册 unix 监听的协议（kcp；
+    /// Go kcp hub 为 UDP 面，同样无 unix 监听）返回 Go 对齐的 NotFound 文案。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_transport_unregistered_protocol_fail_visible() {
+        let ohm = freedom_ohm();
+        let ib = BuiltInbound {
+            entry: xray_conf::BuiltEntry { kind: "vless".to_string(), data: vless_entry_data() },
+            tag: "vless-kcp-uds".to_string(),
+            port: None,
+            listen: Some("/tmp/xray-uds-vless-kcp.sock".into()),
+            stream_settings_json: Some(serde_json::json!({
+                "network": "kcp",
+                "security": "none"
+            })),
+            sniffing_json: None,
+        };
+        let err =
+            spawn_one_inbound(&ib, ohm, None, CancellationToken::new(), None).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "got: {err}");
+        assert!(
+            err.to_string().contains("kcp unix listener not registered"),
+            "error must mirror Go unix-not-registered text, got: {err}"
+        );
+    }
+
+    /// bd lfrg（接线面）：vless + grpc unix → `listen_unix` 命中 grpc hub 的
+    /// unix 注册（grpc/h2/http 同 fn 注册），h2 server 真实建立——spawn 成功
+    /// 证配置面进到已注册 unix hub；gRPC 数据面客户端需 h2 依赖（不在本批
+    /// 依赖面），数据面证据见 xray-transport-grpc 自有 unix 往返测试。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_vless_grpc_inbound_spawns() {
+        xray_transport_grpc::register::register_unix_listener().unwrap();
+
+        let ohm = freedom_ohm();
+        let sock_path =
+            std::env::temp_dir().join(format!("xray-uds-vless-grpc-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+        let ib = BuiltInbound {
+            entry: xray_conf::BuiltEntry { kind: "vless".to_string(), data: vless_entry_data() },
+            tag: "vless-grpc-uds".to_string(),
+            port: None,
+            listen: Some(sock_path.to_string_lossy().into_owned()),
+            stream_settings_json: Some(serde_json::json!({
+                "network": "grpc",
+                "security": "none",
+                "grpcSettings": { "serviceName": "GunService" }
+            })),
+            sniffing_json: None,
+        };
+        let handle = spawn_one_inbound(&ib, ohm, None, CancellationToken::new(), None)
+            .await
+            .unwrap()
+            .expect("vless+grpc unix inbound should spawn via registered hub");
+        // listener 已 bind：UDS 建连被受理。
+        let _uds = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
         handle.abort();
         let _ = std::fs::remove_file(&sock_path);
     }

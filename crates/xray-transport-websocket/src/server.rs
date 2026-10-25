@@ -100,6 +100,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for EarlyDataPrefixed<S> {
 }
 
 /// [`WsListener`] 的底层连接源。TCP 与 unix 二选一（Go `hub.go:100-104`）。
+// UnixListener 明显大于 TokioTcpListener；本枚举每 listener 只构造一次，
+// 体积差异不进入 accept 热路径，Box 化只增一次间接寻址与维护面。
+#[allow(clippy::large_enum_variant)]
 enum ListenerSource {
     Tcp(TokioTcpListener),
     /// system_listener [`xray_transport::system_listener::UnixListener`]——路径
