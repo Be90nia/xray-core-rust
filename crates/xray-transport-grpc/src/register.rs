@@ -76,6 +76,31 @@ pub fn register_listener() -> io::Result<()> {
     Ok(())
 }
 
+/// 注册 gRPC transport 的 unix 监听（对应 Go grpc/hub.go:57-65 + 107-112
+/// `port==0` → `net.UnixAddr` 分支）。
+///
+/// 协议名同时注册 `"grpc"` / `"h2"` / `"http"`，与 [`register_listener`] 一致。
+/// 必须在使用 `listener_registry::listen_unix("grpc", ...)` 之前调用。
+/// 幂等：重复调用忽略 `AlreadyExists`。
+#[cfg(unix)]
+pub fn register_unix_listener() -> io::Result<()> {
+    use xray_transport::listener_registry::{
+        UnixTransportListenFn, register_transport_unix_listener,
+    };
+    let listen_fn: UnixTransportListenFn = Arc::new(move |path, settings, sockopt, handler| {
+        // H13：XFF 信任名单（同 listen_grpc）。
+        let trusted = sockopt.trusted_x_forwarded_for.clone();
+        Box::pin(async move {
+            crate::transport::listen_unix(path, settings, sockopt, handler, trusted).await
+        })
+    });
+    // ponytail: 重复注册忽略——主代理与测试可能并发触发注册。
+    let _ = register_transport_unix_listener("grpc", listen_fn.clone());
+    let _ = register_transport_unix_listener("h2", listen_fn.clone());
+    let _ = register_transport_unix_listener("http", listen_fn);
+    Ok(())
+}
+
 /// 实际监听：解析 grpcSettings → 返回 Unsupported。
 ///
 /// 当前返回 `Unsupported`：HTTP/2 server 监听依赖 h2/tonic 集成。
@@ -228,6 +253,116 @@ mod tests {
         dial_task.abort();
         let r = dial_task.await;
         assert!(matches!(&r, Err(e) if e.is_cancelled()), "dial must end by cancellation");
+    }
+
+    /// ③ transport 级 unix 监听 roundtrip（bd lfrg③）：注册 → listen_unix →
+    /// UDS 建连 → 真实 h2 握手（`h2::client::handshake` over UDS）→
+    /// send_request → 服务端 h2 层应答。对应 Go grpc/hub.go:57-65 + 107-112
+    /// `port == net.Port(0)` 分支。unix-only。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listen_unix_grpc_roundtrip() {
+        use tokio::io::AsyncReadExt;
+
+        let _ = register_unix_listener();
+
+        let path = std::env::temp_dir().join(format!(
+            "xray-grpc-unix-hub-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let path_str = path.to_str().unwrap().to_string();
+        let _ = std::fs::remove_file(&path_str);
+
+        let handler: ConnHandler = Arc::new(|conn| {
+            // 服务端 stream 语义对齐 Go Tun：conn 交给 handler 后无人写即挂住
+            // 等对端；此处直接持住不 echo（gRPC stream 不是字节 echo 语义）。
+            tokio::spawn(async move {
+                let mut conn = conn;
+                let mut buf = [0u8; 64];
+                loop {
+                    if conn.read(&mut buf).await.unwrap_or(0) == 0 {
+                        break;
+                    }
+                }
+            });
+        });
+        let settings = StreamSettings {
+            protocol: "grpc".to_string(),
+            transport_json: Some(serde_json::json!({"serviceName":"GunService"})),
+            ..StreamSettings::tcp()
+        };
+        let listener = xray_transport::listener_registry::listen_unix(
+            &path_str,
+            settings,
+            xray_transport::sockopt::SocketOptions::default(),
+            handler,
+        )
+        .await
+        .expect("listen_unix(grpc) 失败");
+        // unix listener 无 SocketAddr：全零占位（对齐 tcp/ws/httpupgrade/splithttp 契约）。
+        assert_eq!(
+            listener.local_addr().expect("local_addr 失败"),
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        );
+
+        // 客户端：UDS 建连 → 真实 h2 握手 → 请求注册 path。
+        let uds = tokio::net::UnixStream::connect(&path_str).await.expect("UDS connect 失败");
+        let (mut client, conn_task) = h2::client::handshake(uds).await.expect("h2 握手失败");
+        tokio::spawn(async move {
+            let _ = conn_task.await;
+        });
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/GunService/Tun")
+            .body(())
+            .unwrap();
+        let (resp, _tx) = client.send_request(req, false).expect("send_request 失败");
+        let resp =
+            tokio::time::timeout(std::time::Duration::from_secs(5), resp).await.expect("响应超时");
+        // 服务端 h2 层真实应答（grpc 语义：200 + grpc-status，或 404）。
+        let status = resp.expect("h2 响应错误").status();
+        assert!(status.is_informational() || status.as_u16() >= 200, "bad status: {status}");
+
+        listener.close().expect("close 失败");
+        // close 后 socket 释放，新连接被拒（close_rejects 同款轮询）。
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match tokio::net::UnixStream::connect(&path_str).await {
+                Err(_) => break,
+                Ok(_) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "close 后 unix socket 仍接受连接（shutdown 标志丢失/循环未退出）"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                },
+            }
+        }
+        let _ = std::fs::remove_file(&path_str);
+    }
+
+    /// unix 监听 finalmask 拒绝路径（对齐其余三 hub unix 惯例）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listen_unix_grpc_rejects_finalmask() {
+        let settings = StreamSettings {
+            protocol: "grpc".to_string(),
+            finalmask_json: Some(serde_json::json!({"enabled": true})),
+            ..StreamSettings::tcp()
+        };
+        let handler: ConnHandler = Arc::new(|_| {});
+        let result = crate::transport::listen_unix(
+            "/tmp/xray-grpc-unix-finalmask-reject.sock".into(),
+            settings,
+            xray_transport::sockopt::SocketOptions::default(),
+            handler,
+            Vec::new(),
+        )
+        .await;
+        let Err(e) = result else { panic!("expected finalmask rejection, got a listener") };
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(e.to_string().contains("finalmask is not supported on unix listeners"));
     }
 
     #[test]

@@ -99,13 +99,25 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for EarlyDataPrefixed<S> {
     }
 }
 
+/// [`WsListener`] 的底层连接源。TCP 与 unix 二选一（Go `hub.go:100-104`）。
+enum ListenerSource {
+    Tcp(TokioTcpListener),
+    /// system_listener [`xray_transport::system_listener::UnixListener`]——路径
+    /// /abstract/权限/FileLocker 语义全复用（与 tcp hub unix 同源）。
+    #[cfg(unix)]
+    Unix(xray_transport::system_listener::UnixListener),
+}
+
 /// WebSocket 服务端监听器。
 ///
 /// 对应 Go `Listener`（`hub.go`）。本结构持有 TcpListener + WS 配置；
 /// TLS 包装由调用方在 `accept` 后注入（ponytail：避免 listener 持 TLS acceptor
 /// 让数据流走 trait object）。
 pub struct WsListener {
-    listener: TokioTcpListener,
+    /// 底层连接源：TCP（`port!=0`）或 unix domain socket（Go hub.go:100-104
+    /// `port == net.Port(0)` 分支；unix 侧无 PROXY protocol，对齐 Go
+    /// system_listener.go:114 UnixAddr 分支）。
+    source: ListenerSource,
     configs: Vec<Arc<Config>>,
     /// 可信 XFF header 名单（来自 `sockopt.trustedXForwardedFor`，listener 级，
     /// 对齐 Go `socketSettings.TrustedXForwardedFor`）。空 = 永不采纳 XFF
@@ -139,13 +151,81 @@ impl WsListener {
         )
         .await
         .map_err(WsError::Io)?;
-        Ok(Self { listener, configs, trusted_x_forwarded_for: Vec::new(), tcpmask: None })
+        Ok(Self {
+            source: ListenerSource::Tcp(listener),
+            configs,
+            trusted_x_forwarded_for: Vec::new(),
+            tcpmask: None,
+        })
+    }
+
+    /// 绑定 unix domain socket（Go hub.go:100-104 `port == net.Port(0)` 分支，
+    /// `net.UnixAddr` → `internet.ListenSystem`）。
+    ///
+    /// 地址格式（`/path,0755`、`@abstract`、`@@abstract`）与 FileLocker/权限语义
+    /// 全部复用 `system_listener::UnixListener::bind`（与 tcp hub unix 同源）。
+    #[cfg(unix)]
+    #[allow(clippy::result_large_err)] // WsError::Tungstenite 136B；Box 化属类型变更，超出行为零变更契约
+    pub async fn bind_unix(
+        path: &str,
+        sockopt: xray_transport::sockopt::SocketOptions,
+        configs: Vec<Arc<Config>>,
+    ) -> Result<Self> {
+        if configs.is_empty() {
+            return Err(WsError::InvalidUpgradeRequest { reason: "no WS configs provided".into() });
+        }
+        let listener = xray_transport::system_listener::UnixListener::bind(path, sockopt)
+            .await
+            .map_err(WsError::Io)?;
+        Ok(Self {
+            source: ListenerSource::Unix(listener),
+            configs,
+            trusted_x_forwarded_for: Vec::new(),
+            tcpmask: None,
+        })
     }
 
     /// 本地地址。
     #[allow(clippy::result_large_err)] // WsError 136B；Box 化属类型变更，超出行为零变更契约
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.listener.local_addr().map_err(WsError::Io)
+        match &self.source {
+            ListenerSource::Tcp(l) => l.local_addr().map_err(WsError::Io),
+            // unix socket 无 SocketAddr：全零占位（对齐 tcp hub unix / Go UnixConnWrapper）
+            #[cfg(unix)]
+            ListenerSource::Unix(_) => Ok(SocketAddr::from(([0, 0, 0, 0], 0))),
+        }
+    }
+
+    /// 接受一条底层连接并完成传输层包装（PROXY protocol + finalmask，仅 TCP 分支）。
+    /// 返回 `(流, remote, local)`；unix 分支直接给出 `Box<dyn Connection>`
+    /// （`UnixConnection`，无 PROXY protocol/finalmask——对齐 Go system_listener
+    /// UnixAddr 分支），remote/local 为全零占位。
+    #[allow(clippy::result_large_err)] // WsError::Tungstenite 136B；Box 化属类型变更，超出行为零变更契约
+    async fn accept_conn(&self) -> Result<(Box<dyn Connection>, SocketAddr, Option<SocketAddr>)> {
+        match &self.source {
+            ListenerSource::Tcp(l) => {
+                let (mut tcp, remote) = l.accept().await.map_err(WsError::Io)?;
+                let local = tcp.local_addr().ok();
+                let remote = self.parse_proxy_protocol(&mut tcp, remote).await?;
+                // finalmask（bd dppv）：Go hub.go:107 `FinalMask.Listen` 在 WS 握手
+                // 前包住裸 TCP——读到的首字节必须是 mask 头而非 GET。空 manager = 恒等。
+                let stream: Box<dyn Connection> = match self.tcpmask.as_ref() {
+                    Some(m) => xray_transport::finalmask::wrap_conn_server_into_connection(
+                        m,
+                        Box::new(xray_transport::connection::TcpConnection::new(tcp)),
+                    )
+                    .map_err(WsError::Io)?,
+                    None => Box::new(xray_transport::connection::TcpConnection::new(tcp)),
+                };
+                Ok((stream, remote, local))
+            },
+            #[cfg(unix)]
+            ListenerSource::Unix(l) => {
+                use xray_transport::system_listener::SystemListener as _;
+                let conn = l.accept().await.map_err(WsError::Io)?;
+                Ok((conn, SocketAddr::from(([0, 0, 0, 0], 0)), None))
+            },
+        }
     }
 
     /// 接受一条新连接，完成 WS 握手 + 校验 host/path + 提取 early data。
@@ -153,19 +233,7 @@ impl WsListener {
     /// **不支持 TLS**：明文 ws:// only。TLS 场景请用 [`accept_tls`](Self::accept_tls)。
     #[allow(clippy::result_large_err)] // WsError::Tungstenite 136B；Box 化属类型变更，超出行为零变更契约
     pub async fn accept(&self) -> Result<AcceptedConn> {
-        let (mut tcp, remote) = self.listener.accept().await.map_err(WsError::Io)?;
-        let local = tcp.local_addr().ok();
-        let remote = self.parse_proxy_protocol(&mut tcp, remote).await?;
-        // finalmask（bd dppv）：Go hub.go:107 `FinalMask.Listen` 在 WS 握手前包住
-        // 裸 TCP——读到的首字节必须是 mask 头而非 GET。空 manager = 恒等。
-        let stream: Box<dyn Connection> = match self.tcpmask.as_ref() {
-            Some(m) => xray_transport::finalmask::wrap_conn_server_into_connection(
-                m,
-                Box::new(xray_transport::connection::TcpConnection::new(tcp)),
-            )
-            .map_err(WsError::Io)?,
-            None => Box::new(xray_transport::connection::TcpConnection::new(tcp)),
-        };
+        let (stream, remote, local) = self.accept_conn().await?;
         Self::ws_handshake(stream, remote, local, &self.configs, &self.trusted_x_forwarded_for)
             .await
     }
@@ -179,47 +247,34 @@ impl WsListener {
         &self,
         tls_config: Arc<tokio_rustls::rustls::ServerConfig>,
     ) -> Result<AcceptedConn> {
-        let (mut tcp, remote) = self.listener.accept().await.map_err(WsError::Io)?;
-        let local = tcp.local_addr().ok();
         // 0-RTT 排空开关：allowEarlyData=true 时 rustls ServerConfig 的
         // max_early_data_size>0（build_server_config 设置），此位即配置透传。
         let ed_enabled = tls_config.max_early_data_size > 0;
-        let tcpmask = self.tcpmask.clone();
         // Go hub.go:143 http.Server{ReadHeaderTimeout: 4s}——deadline 在 TLS wrap 前
         // 生效，4s 覆盖 PROXY protocol 解析 + TLS 惰性握手全程。整段限时：半开/分片
         // ClientHello 的连接超时丢弃，accept 循环永不被单个连接堵死（串行 accept 下
         // 无超时的 rustls accept 即瘫痪全 inbound，httpupgrade P0 同族：半个
         // ClientHello 挂死 5 小时）。WS 升级握手另有自身 4s 超时（H14，
         // HandshakeTimeout），h2 拒绝服务另有 30s 兜底，均在本窗之外不变。
-        let (remote, tls_stream) = match tokio::time::timeout(Duration::from_secs(4), async {
-            let remote = self.parse_proxy_protocol(&mut tcp, remote).await?;
-            // finalmask（bd dppv）：Go hub.go:107 `FinalMask.Listen` 替换底层
-            // listener、:132 `tls.NewListener` 包其外——mask 在 TLS 之下、最贴近
-            // wire。空 manager = 恒等。
-            let stream: Box<dyn Connection> = match tcpmask.as_ref() {
-                Some(m) => xray_transport::finalmask::wrap_conn_server_into_connection(
-                    m,
-                    Box::new(xray_transport::connection::TcpConnection::new(tcp)),
-                )
-                .map_err(|e| WsError::HandshakeFailed(format!("tcpmask wrap: {e}")))?,
-                None => Box::new(xray_transport::connection::TcpConnection::new(tcp)),
+        let (remote, tls_stream, local) =
+            match tokio::time::timeout(Duration::from_secs(4), async {
+                let (stream, remote, local) = self.accept_conn().await?;
+                let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+                let tls_stream = acceptor
+                    .accept(stream)
+                    .await
+                    .map_err(|e| WsError::HandshakeFailed(format!("tls accept: {e}")))?;
+                Ok::<_, WsError>((remote, tls_stream, local))
+            })
+            .await
+            {
+                Ok(Ok((remote, tls_stream, local))) => (remote, tls_stream, local),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    crate::LOG.debug("ws TLS accept timeout (4s, Go ReadHeaderTimeout)");
+                    return Err(WsError::HandshakeFailed("tls accept timeout (4s)".into()));
+                },
             };
-            let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
-            let tls_stream = acceptor
-                .accept(stream)
-                .await
-                .map_err(|e| WsError::HandshakeFailed(format!("tls accept: {e}")))?;
-            Ok::<_, WsError>((remote, tls_stream))
-        })
-        .await
-        {
-            Ok(Ok((remote, tls_stream))) => (remote, tls_stream),
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                crate::LOG.debug("ws TLS accept timeout (4s, Go ReadHeaderTimeout)");
-                return Err(WsError::HandshakeFailed("tls accept timeout (4s)".into()));
-            },
-        };
         // TLS 0-RTT：rustls 把收到的 early data 缓在 ServerConnection 里，标准
         // 读路径不排空（tokio-rustls accept 直连 ServerConnection、不经 Acceptor
         // 的 Accepting::early_data()）——不在此取出，客户端随 0-RTT 发来的 ws

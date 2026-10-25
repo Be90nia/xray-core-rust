@@ -67,5 +67,8 @@ pub use config::{
     PLACEMENT_QUERY, PLACEMENT_QUERY_IN_HEADER,
 };
 pub use error::{Result, SplitHttpError};
+#[cfg(not(unix))]
 pub use register::{register_dialer, register_listener};
+#[cfg(unix)]
+pub use register::{register_dialer, register_listener, register_unix_listener};
 pub use upload_queue::{Packet, UploadQueue};

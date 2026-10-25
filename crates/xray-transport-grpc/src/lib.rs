@@ -50,5 +50,7 @@ pub mod register;
 pub use config::Config;
 pub use encoding::CompressionEncoding;
 pub use error::{GrpcError, Result};
-#[cfg(feature = "register")]
+#[cfg(all(feature = "register", not(unix)))]
 pub use register::{register_dialer, register_listener};
+#[cfg(all(feature = "register", unix))]
+pub use register::{register_dialer, register_listener, register_unix_listener};

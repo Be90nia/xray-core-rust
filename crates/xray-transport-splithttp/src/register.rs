@@ -51,6 +51,28 @@ pub fn register_listener() -> io::Result<()> {
     Ok(())
 }
 
+/// 注册 SplitHTTP transport 的 unix 监听（对应 Go splithttp/hub.go:526-531
+/// `port==0` → `net.UnixAddr` 分支）。
+///
+/// 协议名同时注册 `"splithttp"` 和 `"xhttp"`，与 [`register_listener`] 一致。
+/// 必须在使用 `listener_registry::listen_unix("splithttp", ...)` 之前调用。
+/// 幂等：重复调用忽略 `AlreadyExists`。
+#[cfg(unix)]
+pub fn register_unix_listener() -> io::Result<()> {
+    use xray_transport::listener_registry::{
+        UnixTransportListenFn, register_transport_unix_listener,
+    };
+    let listen_fn: UnixTransportListenFn = Arc::new(move |path, settings, sockopt, handler| {
+        Box::pin(async move {
+            crate::transport::listen_unix_splithttp(path, settings, sockopt, handler).await
+        })
+    });
+    // ponytail: 重复注册忽略——主代理与测试可能并发触发注册。
+    let _ = register_transport_unix_listener("splithttp", listen_fn.clone());
+    let _ = register_transport_unix_listener("xhttp", listen_fn);
+    Ok(())
+}
+
 /// 实际拨号：解析配置 → 构建 TLS client → 调用 [`dialer::dial`] → 包装为 `Box<dyn Connection>`。
 async fn dial_splithttp(
     dest: &Destination,
@@ -851,6 +873,104 @@ mod tests {
         let cfg = parse_splithttp_config(Some(&v)).expect("parse ok");
         let r = cfg.session_id_length.expect("some");
         assert_eq!((r.from, r.to), (12, 12));
+    }
+
+    /// ③ transport 级 unix 监听 roundtrip（bd lfrg③）：注册 → listen_unix →
+    /// UDS 建连 → 真实 HTTP 服务处理（GET 错误 path → 立即 404，host/path
+    /// 校验链真实执行）→ close 后 socket 释放新连接被拒。对应 Go
+    /// splithttp/hub.go:526-531 `port == net.Port(0)` 分支。unix-only。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listen_unix_splithttp_roundtrip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use xray_transport::listener_registry::ConnHandler;
+
+        let _ = register_unix_listener();
+
+        let path = std::env::temp_dir().join(format!(
+            "xray-xh-unix-hub-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let path_str = path.to_str().unwrap().to_string();
+        let _ = std::fs::remove_file(&path_str);
+
+        let handler: ConnHandler = Arc::new(|_| {});
+        let settings = StreamSettings {
+            protocol: "splithttp".to_string(),
+            transport_json: Some(serde_json::json!({"path": "/xh"})),
+            ..StreamSettings::tcp()
+        };
+        let listener = xray_transport::listener_registry::listen_unix(
+            &path_str,
+            settings,
+            xray_transport::sockopt::SocketOptions::default(),
+            handler,
+        )
+        .await
+        .expect("listen_unix(splithttp) 失败");
+        // unix listener 无 SocketAddr：全零占位（对齐 tcp/ws/httpupgrade hub unix 契约）。
+        assert_eq!(
+            listener.local_addr().expect("local_addr 失败"),
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        );
+
+        // 客户端：UDS 建连 → 真实 HTTP GET（校验过的 path，无 session → 400/404
+        // 级错误响应；服务端 HTTP 层真实处理而非裸 socket echo）。
+        let mut uds = tokio::net::UnixStream::connect(&path_str).await.expect("UDS connect 失败");
+        uds.write_all(b"GET /xh HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("write 失败");
+        let mut buf = vec![0u8; 2048];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), uds.read(&mut buf))
+            .await
+            .expect("HTTP 响应超时")
+            .expect("read 失败");
+        assert!(n > 0, "服务端无响应");
+        let head = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(head.starts_with("HTTP/1.1 "), "expected HTTP/1.1 response, got: {head}");
+
+        listener.close().expect("close 失败");
+        // close 后 socket 释放，新连接被拒（close_rejects 同款轮询）。
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match tokio::net::UnixStream::connect(&path_str).await {
+                Err(_) => break,
+                Ok(_) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "close 后 unix socket 仍接受连接（abort 通知丢失/循环未退出）"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                },
+            }
+        }
+        let _ = std::fs::remove_file(&path_str);
+    }
+
+    /// unix 监听 finalmask 拒绝路径（对齐 tcp/ws/httpupgrade hub unix 惯例）。
+    /// 错误在 bind 前返回——但被测函数本身 cfg(unix)，测试随行。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listen_unix_splithttp_rejects_finalmask() {
+        use xray_transport::listener_registry::ConnHandler;
+
+        let settings = StreamSettings {
+            protocol: "splithttp".to_string(),
+            finalmask_json: Some(serde_json::json!({"enabled": true})),
+            ..StreamSettings::tcp()
+        };
+        let handler: ConnHandler = Arc::new(|_| {});
+        let result = crate::transport::listen_unix_splithttp(
+            "/tmp/xray-xh-unix-finalmask-reject.sock".into(),
+            settings,
+            xray_transport::sockopt::SocketOptions::default(),
+            handler,
+        )
+        .await;
+        let Err(e) = result else { panic!("expected finalmask rejection, got a listener") };
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(e.to_string().contains("finalmask is not supported on unix listeners"));
     }
 
     /// Tcpmask round-trip（o54c，Go splithttp/dialer.go:127-134 + hub.go:547-549）：

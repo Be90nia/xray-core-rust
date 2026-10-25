@@ -16,6 +16,8 @@ use h2::{client, server};
 use http::Request;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use xray_common::net::destination::Destination;
+#[cfg(unix)]
+use xray_transport::sockopt::SocketOptions;
 use xray_transport::{
     connection::Connection,
     dialer::StreamSettings,
@@ -483,8 +485,6 @@ pub async fn listen(
     // ijk1：GrpcListener close 真正停 accept 循环；共享 AtomicBool 给 spawned task。
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
-    let listener = Arc::new(listener);
-    let listener_for_task = Arc::clone(&listener);
     // H13：Go hub.go:86-93——仅当 IdleTimeout>0 或 HealthCheckTimeout>0 时启用
     // keepalive ServerParameters（Time=IdleTimeout，Timeout=HealthCheckTimeout）；
     // 零值超时回退 grpc-go defaults（server Time=2h / Timeout=20s）。
@@ -497,6 +497,9 @@ pub async fn listen(
     };
     let keepalive_enabled = cfg.idle_timeout > 0 || cfg.health_check_timeout > 0;
     let trusted_for_task = Arc::new(trusted);
+    let close_notify = Arc::new(tokio::sync::Notify::new());
+    let close_notify_loop = Arc::clone(&close_notify);
+    let source = GrpcSource::Tcp(Arc::new(listener));
     tokio::spawn(async move {
         loop {
             // 关闭：跳出循环 → spawned task 结束 → listener drop → 端口释放（Go hub.go:62-64
@@ -504,7 +507,63 @@ pub async fn listen(
             if shutdown_clone.load(Ordering::Relaxed) {
                 break;
             }
-            let (tcp, peer) = match listener_for_task.accept().await {
+            let accept_fut = accept_grpc_conn(&source, &tcpmask);
+            tokio::pin!(accept_fut);
+            let accepted = tokio::select! {
+                result = &mut accept_fut => result,
+                // lfrg③：close 即时唤醒（原语义只在本轮 accept 返回后才检查
+                // shutdown 标志——无新连接时 close 永不生效）。
+                _ = close_notify_loop.notified() => break,
+            };
+            let Some((stream, peer)) = accepted else {
+                continue;
+            };
+            let h = handler.clone();
+            let tls = tls_cfg.clone();
+            let ep = expected_path.clone();
+            let mm = multi_mode;
+            let tr = trusted_for_task.clone();
+            tokio::spawn(async move {
+                serve_grpc_conn(
+                    stream,
+                    h,
+                    tls,
+                    ep,
+                    mm,
+                    peer,
+                    tr,
+                    ka_time,
+                    ka_timeout,
+                    keepalive_enabled,
+                )
+                .await;
+            });
+        }
+    });
+    Ok(Box::new(GrpcListener { local, shutdown, close_notify }))
+}
+
+/// [`listen`] 的底层连接源（Go grpc/hub.go:57-65 + 107-112 `port == net.Port(0)`
+/// unix 分支）。unix 侧无 PROXY protocol/finalmask，对齐 Go system_listener
+/// UnixAddr 分支。
+#[derive(Clone)]
+enum GrpcSource {
+    Tcp(Arc<tokio::net::TcpListener>),
+    #[cfg(unix)]
+    Unix(Arc<xray_transport::system_listener::UnixListener>),
+}
+
+/// 连接获取 + 传输层包装（set_nodelay + finalmask，仅 TCP 分支）。
+///
+/// 返回 `None` = 该连接丢弃/accept 瞬时错误已退避，循环继续（错误永不退出
+/// ——退出唯一来源是 close() 写 shutdown 标志，ijk1）。
+async fn accept_grpc_conn(
+    source: &GrpcSource,
+    tcpmask: &Arc<xray_transport::finalmask::TcpmaskManager>,
+) -> Option<(Box<dyn Connection>, SocketAddr)> {
+    match source {
+        GrpcSource::Tcp(listener) => {
+            let (tcp, peer) = match listener.accept().await {
                 Ok(v) => v,
                 Err(e) => {
                     // ijk1：EMFILE/临时错误退避后重试，无条件 continue=EMFILE 时活锁烧 CPU。
@@ -517,45 +576,165 @@ pub async fn listen(
                         crate::LOG.debug(format!("gRPC accept error: {e}"));
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
-                    continue;
+                    return None;
                 },
             };
             tcp.set_nodelay(true).ok();
+            // finalmask（bd dppv）：Go grpc/hub.go:123-125 WrapListener——mask
+            // 在 TLS/h2 之下、最贴近 wire（首字节 = mask 头而非 HTTP/2
+            // preface）；wrap 失败丢弃该 conn。空 manager = 恒等。
+            let stream: Box<dyn Connection> =
+                match xray_transport::finalmask::wrap_conn_server_into_connection(
+                    tcpmask,
+                    Box::new(xray_transport::connection::TcpConnection::new(tcp)),
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        crate::LOG.debug(format!("grpc tcpmask wrap failed: {e}"));
+                        return None;
+                    },
+                };
+            Some((stream, peer))
+        },
+        #[cfg(unix)]
+        GrpcSource::Unix(listener) => {
+            use xray_transport::system_listener::SystemListener as _;
+            let stream = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    // 同 TCP 分处置（EMFILE 退避，其余 debug 短歇）。
+                    if matches!(e.kind(), io::ErrorKind::OutOfMemory | io::ErrorKind::ResourceBusy)
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    } else {
+                        crate::LOG.debug(format!("gRPC unix accept error: {e}"));
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    return None;
+                },
+            };
+            Some((stream, SocketAddr::from(([0, 0, 0, 0], 0))))
+        },
+    }
+}
+
+/// 单条已 accept 连接：TLS（可选）→ h2 服务分发。TCP 与 unix 共用。
+#[allow(clippy::too_many_arguments)] // 同 accept_h2：Go 装配 API 参数面直译，打包结构属 API 变更
+async fn serve_grpc_conn(
+    stream: Box<dyn Connection>,
+    h: ConnHandler,
+    tls: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
+    ep: Option<String>,
+    mm: bool,
+    peer: SocketAddr,
+    tr: Arc<Vec<String>>,
+    ka_time: u64,
+    ka_timeout: u64,
+    keepalive_enabled: bool,
+) {
+    if let Some(tc) = tls {
+        let acc = tokio_rustls::TlsAcceptor::from(tc);
+        if let Ok(c) = acc.accept(stream).await {
+            accept_h2(c, h, ep, mm, peer, &tr, ka_time, ka_timeout, keepalive_enabled).await
+        }
+    } else {
+        accept_h2(stream, h, ep, mm, peer, &tr, ka_time, ka_timeout, keepalive_enabled).await;
+    }
+}
+
+/// unix 路径 gRPC 监听（对应 Go grpc/hub.go:57-65 + 107-112 `port==0` 分支：
+/// `net.UnixAddr` → `internet.ListenSystem`，TLS/h2 服务层全复用）。
+///
+/// Go 该分支支持 `FinalMask.Listen(ctx, unixAddr)`；Rust tcpmask 为 TCP 语义
+/// 载体，unix 上无对应能力——非空显式拒绝而非静默忽略（对齐 tcp/ws/httpupgrade/
+/// splithttp hub unix finalmask 拒绝惯例）。
+#[cfg(unix)]
+pub async fn listen_unix(
+    path: String,
+    settings: StreamSettings,
+    sockopt: SocketOptions,
+    handler: ConnHandler,
+    trusted: Vec<String>,
+) -> io::Result<Box<dyn TransportListener>> {
+    if settings.finalmask_json.as_ref().is_some_and(|v| !v.is_null()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "finalmask is not supported on unix listeners; remove the finalmask key",
+        ));
+    }
+    let cfg = parse_config(&settings)?;
+    let expected_path =
+        if cfg.service_name.is_empty() { None } else { Some(normalize_grpc_path(&cfg)) };
+    let multi_mode = cfg.multi_mode;
+    let listener =
+        xray_transport::system_listener::UnixListener::bind(&path, sockopt.clone()).await?;
+    // unix socket 无 SocketAddr：全零占位（对齐 tcp/ws/httpupgrade/splithttp
+    // hub unix 契约）。
+    let local = SocketAddr::from(([0, 0, 0, 0], 0));
+    let tls_cfg = if !settings.security.is_empty() && settings.security != "none" {
+        Some(
+            xray_tls::server_config::build_server_config(
+                &settings.security,
+                settings.security_json.as_ref(),
+            )?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "TLS server config None"))?,
+        )
+    } else {
+        None
+    };
+    // 恒等 manager 占位（unix 无 finalmask，入口已拒绝非空配置）。
+    let tcpmask = Arc::new(xray_transport::finalmask::TcpmaskManager::new(Vec::new()));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = Arc::clone(&shutdown);
+    let source = GrpcSource::Unix(Arc::new(listener));
+    let (ka_time, ka_timeout) = {
+        (
+            if cfg.idle_timeout > 0 { cfg.idle_timeout as u64 } else { 7200 },
+            if cfg.health_check_timeout > 0 { cfg.health_check_timeout as u64 } else { 20 },
+        )
+    };
+    let keepalive_enabled = cfg.idle_timeout > 0 || cfg.health_check_timeout > 0;
+    let trusted_for_task = Arc::new(trusted);
+    let close_notify = Arc::new(tokio::sync::Notify::new());
+    let close_notify_loop = Arc::clone(&close_notify);
+    tokio::spawn(async move {
+        loop {
+            if shutdown_clone.load(Ordering::Relaxed) {
+                break;
+            }
+            let accept_fut = accept_grpc_conn(&source, &tcpmask);
+            tokio::pin!(accept_fut);
+            let accepted = tokio::select! {
+                result = &mut accept_fut => result,
+                // lfrg③：close 即时唤醒（同 TCP 分支注释）。
+                _ = close_notify_loop.notified() => break,
+            };
+            let Some((stream, peer)) = accepted else {
+                continue;
+            };
             let h = handler.clone();
             let tls = tls_cfg.clone();
-            let m = tcpmask.clone();
             let ep = expected_path.clone();
             let mm = multi_mode;
             let tr = trusted_for_task.clone();
             tokio::spawn(async move {
-                // finalmask（bd dppv）：Go grpc/hub.go:123-125 WrapListener——mask
-                // 在 TLS/h2 之下、最贴近 wire（首字节 = mask 头而非 HTTP/2
-                // preface）；wrap 失败丢弃该 conn。空 manager = 恒等。
-                let stream: Box<dyn Connection> =
-                    match xray_transport::finalmask::wrap_conn_server_into_connection(
-                        &m,
-                        Box::new(xray_transport::connection::TcpConnection::new(tcp)),
-                    ) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            crate::LOG.debug(format!("grpc tcpmask wrap failed: {e}"));
-                            return;
-                        },
-                    };
-                if let Some(tc) = tls {
-                    let acc = tokio_rustls::TlsAcceptor::from(tc);
-                    if let Ok(c) = acc.accept(stream).await {
-                        accept_h2(c, h, ep, mm, peer, &tr, ka_time, ka_timeout, keepalive_enabled)
-                            .await
-                    }
-                } else {
-                    accept_h2(stream, h, ep, mm, peer, &tr, ka_time, ka_timeout, keepalive_enabled)
-                        .await;
-                }
+                serve_grpc_conn(
+                    stream,
+                    h,
+                    tls,
+                    ep,
+                    mm,
+                    peer,
+                    tr,
+                    ka_time,
+                    ka_timeout,
+                    keepalive_enabled,
+                )
+                .await;
             });
         }
     });
-    Ok(Box::new(GrpcListener { local, listener, shutdown }))
+    Ok(Box::new(GrpcListener { local, shutdown, close_notify }))
 }
 
 #[allow(clippy::too_many_arguments)] // Go 装配 API 参数面直译，打包结构属 API 变更
@@ -848,19 +1027,23 @@ impl Connection for DuplexConn {
 
 struct GrpcListener {
     local: SocketAddr,
-    // ijk1：Arc 持有 listener 让 close 即可 drop 释放端口（共享给 spawned task）。
-    #[allow(dead_code)] // listener Arc 由 spawned task 共享，字段持主句柄保 close 即释放端口
-    listener: Arc<tokio::net::TcpListener>,
     // ijk1：close 写 true，spawned accept 循环检测后退出。
     shutdown: Arc<AtomicBool>,
+    // lfrg③：close 即时唤醒挂起在 accept 上的循环（原语义只在 accept 返回后
+    // 才能看到 shutdown 标志——无新连接时 close 永不生效，unix socket 文件
+    // 持续接收新连接；tcp-unix / ws / httpupgrade / splithttp 四 hub 的 close
+    // 均即时生效，本处对齐）。listener 所有权 move 进 task（对齐其余三 hub）：
+    // 循环 break → listener drop → 端口/socket 释放。
+    close_notify: Arc<tokio::sync::Notify>,
 }
 
 impl xray_transport::listener_registry::TransportListener for GrpcListener {
     fn close(&self) -> io::Result<()> {
         // 1. 通知 spawned accept 循环退出（i++; e=true; break;）。
         self.shutdown.store(true, Ordering::Relaxed);
-        // 2. drop listener Arc：spawned task 持有一份，主句柄 drop 后计数归零 → listener drop →
-        //    端口释放。 （Go hub.go:62-64 Close→Stop 等价语义）
+        // 2. 唤醒挂起在 accept 上的循环（无新连接时也能即时退出 → listener drop → 端口/socket
+        //    释放；Go hub.go:62-64 Close→Stop 等价）。
+        self.close_notify.notify_one();
         Ok(())
     }
 

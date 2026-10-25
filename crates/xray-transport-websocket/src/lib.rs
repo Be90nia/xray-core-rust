@@ -50,6 +50,9 @@ pub use config::Config;
 pub use error::{Result, WsError};
 pub use handshake::{Opcode, WS_GUID, compute_accept_key, generate_client_key_for_testing};
 pub use pool::{PoolKey, WsConnectionPool, WsPoolConfig, global_pool, reconfigure_global_pool};
+#[cfg(not(unix))]
 pub use register::{register_dialer, register_listener};
+#[cfg(unix)]
+pub use register::{register_dialer, register_listener, register_unix_listener};
 pub use server::{AcceptedConn, WsListener};
 pub use ws_bridge::WsConnection;

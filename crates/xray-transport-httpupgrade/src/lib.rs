@@ -57,4 +57,7 @@ pub use hub::{
     UpgradeRequest, apply_trusted_x_forwarded_for, build_upgrade_response, parse_upgrade_request,
     parse_x_forwarded_for,
 };
+#[cfg(not(unix))]
 pub use register::{register_dialer, register_listener};
+#[cfg(unix)]
+pub use register::{register_dialer, register_listener, register_unix_listener};

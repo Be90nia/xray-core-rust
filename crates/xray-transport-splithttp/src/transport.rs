@@ -117,6 +117,88 @@ pub async fn listen_splithttp(
     }
 }
 
+/// [`listen_splithttp`] 的底层连接源（Go splithttp/hub.go:526-531
+/// `port == net.Port(0)` unix 分支）。unix 侧无 PROXY protocol/finalmask，
+/// 对齐 Go system_listener UnixAddr 分支。
+enum XhSource {
+    Tcp(tokio::net::TcpListener),
+    #[cfg(unix)]
+    Unix(xray_transport::system_listener::UnixListener),
+}
+
+/// accept 错误分类处置（Resource 退避 / 单连接 debug / 未知 warn），永不退出。
+async fn log_xh_accept_err(e: &io::Error, tag: &str, log_ident: &str) {
+    use xray_transport::accept_policy::{AcceptErrorKind, backoff_if_resource, classify};
+    match classify(e) {
+        AcceptErrorKind::Resource => {
+            crate::LOG.warn(format!("tag={tag} local={log_ident} error={e} splithttp inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续"));
+            backoff_if_resource(e).await;
+        },
+        AcceptErrorKind::Connection => {
+            crate::LOG.debug(format!(
+                "tag={tag} error={e} splithttp inbound: 单连接级 accept 错误，继续监听"
+            ));
+        },
+        AcceptErrorKind::Unknown => {
+            crate::LOG.warn(format!("tag={tag} local={log_ident} error={e} splithttp inbound: accept 错误（未知类别），继续监听"));
+        },
+    }
+}
+
+/// 连接获取 + Tcpmask wrap（仅 TCP 分支）。
+///
+/// 返回 `None` = 该连接丢弃/accept 瞬时错误已分类退避，循环继续（错误永不
+/// 退出——退出唯一来源是 close() 的 abort 句柄）。
+async fn accept_xh_conn(
+    source: &XhSource,
+    tcpmask: Option<&Arc<xray_transport::finalmask::TcpmaskManager>>,
+    tag: &str,
+    log_ident: &str,
+) -> Option<(Box<dyn xray_transport::connection::Connection>, SocketAddr)> {
+    match source {
+        XhSource::Tcp(tcp) => {
+            let (stream, peer) = match tcp.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    log_xh_accept_err(&e, tag, log_ident).await;
+                    return None;
+                },
+            };
+            let _ = stream.set_nodelay(true);
+            // Tcpmask wrap（Go hub.go:546-549 WrapListener：mask 在 TLS/REALITY
+            // 之内、最贴近 wire；wrap 失败丢连接继续 accept）。
+            let stream: Box<dyn xray_transport::connection::Connection> = match tcpmask.as_ref() {
+                Some(m) => {
+                    match xray_transport::finalmask::wrap_conn_server_into_connection(
+                        m,
+                        Box::new(xray_transport::connection::TcpConnection::new(stream)),
+                    ) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            crate::LOG.debug(format!("error={e} XHTTP tcpmask wrap failed"));
+                            return None;
+                        },
+                    }
+                },
+                None => Box::new(xray_transport::connection::TcpConnection::new(stream)),
+            };
+            Some((stream, peer))
+        },
+        #[cfg(unix)]
+        XhSource::Unix(listener) => {
+            use xray_transport::system_listener::SystemListener as _;
+            let stream = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    log_xh_accept_err(&e, tag, log_ident).await;
+                    return None;
+                },
+            };
+            Some((stream, SocketAddr::from(([0, 0, 0, 0], 0))))
+        },
+    }
+}
+
 async fn listen_tcp(
     addr: SocketAddr,
     security: &str,
@@ -132,6 +214,7 @@ async fn listen_tcp(
     )
     .await?;
     let local = tcp.local_addr()?;
+    let source = XhSource::Tcp(tcp);
     // REALITY listener：Go hub.go:558-560 `goreality.NewListener`。
     let reality = reality_server_config(security, security_json)?;
     // bd frxi：配置启用探测时 spawn CCS 探测写 ProbeTable（Go tcp/hub.go:79
@@ -165,46 +248,13 @@ async fn listen_tcp(
     crate::LOG.info(format!("{local} listening TCP for XHTTP"));
 
     let accept_task = tokio::spawn(async move {
-        use xray_transport::accept_policy::{AcceptErrorKind, backoff_if_resource, classify};
         loop {
-            let (stream, peer) = match tcp.accept().await {
-                Ok(v) => v,
-                Err(e) => {
-                    // 分类日志 + 资源类退避（原 `Err(_) => continue` 无退避无日志，
-                    // EMFILE 时忙旋烧 CPU）；错误永不退出——退出唯一来源是
-                    // close() 的 abort 句柄。
-                    match classify(&e) {
-                        AcceptErrorKind::Resource => {
-                            crate::LOG.warn(format!("tag=splithttp local={local} error={e} splithttp inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续"));
-                            backoff_if_resource(&e).await;
-                        },
-                        AcceptErrorKind::Connection => {
-                            crate::LOG.debug(format!("tag=splithttp error={e} splithttp inbound: 单连接级 accept 错误，继续监听"));
-                        },
-                        AcceptErrorKind::Unknown => {
-                            crate::LOG.warn(format!("tag=splithttp local={local} error={e} splithttp inbound: accept 错误（未知类别），继续监听"));
-                        },
-                    }
-                    continue;
-                },
-            };
-            let _ = stream.set_nodelay(true);
-            // Tcpmask wrap（Go hub.go:546-549 WrapListener：mask 在 TLS/REALITY
-            // 之内、最贴近 wire；wrap 失败丢连接继续 accept）。
-            let stream: Box<dyn xray_transport::connection::Connection> = match tcpmask.as_ref() {
-                Some(m) => {
-                    match xray_transport::finalmask::wrap_conn_server_into_connection(
-                        m,
-                        Box::new(xray_transport::connection::TcpConnection::new(stream)),
-                    ) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            crate::LOG.debug(format!("error={e} XHTTP tcpmask wrap failed"));
-                            continue;
-                        },
-                    }
-                },
-                None => Box::new(xray_transport::connection::TcpConnection::new(stream)),
+            // 连接获取 + Tcpmask wrap（仅 TCP 分支）；None = 丢弃继续（accept
+            // 瞬时错误已分类退避）。
+            let Some((stream, peer)) =
+                accept_xh_conn(&source, tcpmask.as_ref(), "splithttp", &local.to_string()).await
+            else {
+                continue;
             };
             let ctx = Arc::clone(&ctx);
             let tls = tls_cfg.clone();
@@ -223,6 +273,94 @@ async fn listen_tcp(
         accept_task,
     ));
     Ok(Box::new(SplithttpListener { local, tcp_abort: Some(tcp_abort), h3_endpoint: None }))
+}
+
+/// unix 路径 SplitHTTP 监听（对应 Go splithttp/hub.go:526-531 `port==0` 分支：
+/// `net.UnixAddr` → `internet.ListenSystem`，TLS/REALITY/h1+h2c 服务层全复用）。
+///
+/// Go 该分支支持 `FinalMask.Listen(ctx, unixAddr)`；Rust tcpmask 为 TCP 语义
+/// 载体，unix 上无对应能力——非空显式拒绝而非静默忽略（对齐 tcp/ws/httpupgrade
+/// hub unix finalmask 拒绝惯例）。H3（QUIC）无 unix 载体，不在本入口范围。
+#[cfg(unix)]
+pub async fn listen_unix_splithttp(
+    path: String,
+    settings: StreamSettings,
+    sockopt: SocketOptions,
+    handler: ConnHandler,
+) -> io::Result<Box<dyn TransportListener>> {
+    if settings.finalmask_json.as_ref().is_some_and(|v| !v.is_null()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "finalmask is not supported on unix listeners; remove the finalmask key",
+        ));
+    }
+    let config =
+        Arc::new(crate::register::parse_splithttp_config(settings.transport_json.as_ref())?);
+    let tls_cfg = xray_tls::server_config::build_server_config(
+        &settings.security,
+        settings.security_json.as_ref(),
+    )?;
+
+    let listener =
+        xray_transport::system_listener::UnixListener::bind(&path, sockopt.clone()).await?;
+    // unix socket 无 SocketAddr：全零占位（对齐 tcp/ws/httpupgrade hub unix 契约）。
+    let local = SocketAddr::from(([0, 0, 0, 0], 0));
+    let source = XhSource::Unix(listener);
+    let reality = reality_server_config(&settings.security, settings.security_json.as_ref())?;
+    let reality_probe =
+        reality.as_ref().filter(|rc| rc.max_useless_records.is_enabled()).map(|rc| {
+            let table = xray_reality::probe::ProbeTable::new();
+            xray_reality::probe::detect_max_useless_records(
+                table.clone(),
+                rc.fallback_dest.clone(),
+                rc.server_names.clone(),
+                "unix".to_string(),
+                rc.xver,
+            );
+            xray_reality::probe::detect_post_handshake_record_lens(
+                table.clone(),
+                rc.fallback_dest.clone(),
+                rc.server_names.clone(),
+                "unix".to_string(),
+                rc.xver,
+            );
+            crate::LOG
+                .info(format!("dest={} reality maxUselessRecords probe started", rc.fallback_dest));
+            Arc::new(xray_reality::server::ProbeContext {
+                table,
+                dest: rc.fallback_dest.clone(),
+                fallback: rc.max_useless_records,
+            })
+        });
+    let ctx = build_context(&config, local, handler);
+    crate::LOG.info(format!("{path} listening unix for XHTTP"));
+
+    // 恒等 manager 占位（unix 无 finalmask，入口已拒绝非空配置）。
+    let tcpmask = Some(Arc::new(xray_transport::finalmask::TcpmaskManager::new(Vec::new())));
+    let log_ident = path.clone();
+    let accept_task = tokio::spawn(async move {
+        loop {
+            let Some((stream, peer)) =
+                accept_xh_conn(&source, tcpmask.as_ref(), "splithttp-unix", &log_ident).await
+            else {
+                continue;
+            };
+            let ctx = Arc::clone(&ctx);
+            let tls = tls_cfg.clone();
+            let rc = reality.clone();
+            let probe = reality_probe.clone();
+            tokio::spawn(async move {
+                handle_accepted_stream(stream, peer, local, tls, rc, probe, ctx).await;
+            });
+        }
+    });
+    let abort = accept_task.abort_handle();
+    tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
+        "splithttp-unix",
+        path,
+        accept_task,
+    ));
+    Ok(Box::new(SplithttpListener { local, tcp_abort: Some(abort), h3_endpoint: None }))
 }
 
 /// 单个已 accept 的流：REALITY / TLS 包装 → h1+h2c HTTP 服务。

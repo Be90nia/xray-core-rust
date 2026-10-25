@@ -75,6 +75,26 @@ pub fn register_listener() -> io::Result<()> {
     Ok(())
 }
 
+/// 注册 WebSocket transport 的 unix 监听（对应 Go hub.go:100-104 `port==0`
+/// → `net.UnixAddr` 分支）。
+///
+/// 协议名同时注册 `"ws"` 和 `"websocket"`，与 [`register_listener`] 一致。
+/// 必须在使用 `listener_registry::listen_unix("ws", ...)` 之前调用。
+/// 幂等：重复调用忽略 `AlreadyExists`。
+#[cfg(unix)]
+pub fn register_unix_listener() -> io::Result<()> {
+    use xray_transport::listener_registry::{
+        UnixTransportListenFn, register_transport_unix_listener,
+    };
+    let listen_fn: UnixTransportListenFn = Arc::new(move |path, settings, sockopt, handler| {
+        Box::pin(async move { listen_unix_ws(path, settings, sockopt, handler).await })
+    });
+    // ponytail: 重复注册忽略——主代理与测试可能并发触发注册。
+    let _ = register_transport_unix_listener("ws", listen_fn.clone());
+    let _ = register_transport_unix_listener("websocket", listen_fn);
+    Ok(())
+}
+
 /// 实际监听：解析 wsSettings → bind WsListener → spawn accept loop。
 ///
 /// `trusted` = `sockopt.trustedXForwardedFor`（Go hub.go:117-121 socketSettings
@@ -92,14 +112,6 @@ async fn listen_ws(
         crate::server::WsListener::bind(addr, ws_config.clone()).await.map_err(io::Error::other)?;
     ws_listener.trusted_x_forwarded_for = trusted;
 
-    let local_addr = ws_listener.local_addr().map_err(io::Error::other)?;
-
-    let close_notify = Arc::new(tokio::sync::Notify::new());
-    let close_notify_clone = close_notify.clone();
-
-    // 根据 security 决定是否包装 TLS。
-    let use_tls = settings.security != "none" && !settings.security.is_empty();
-
     // finalmask（bd dppv）：Go hub.go:107 `FinalMask.Listen` 替换底层 listener，
     // TLS/WS 握手跑在 mask 内——由 WsListener 在 ws 握手前 wrap 每条 accept
     // conn（空 manager = 恒等）。
@@ -108,17 +120,83 @@ async fn listen_ws(
             settings.finalmask_json.as_ref(),
         )?));
 
-    // spawn accept loop。
-    let handler = handler.clone();
-    let tls_config = if use_tls {
-        xray_tls::server_config::build_server_config(
-            &settings.security,
-            settings.security_json.as_ref(),
-        )?
-    } else {
-        None
-    };
+    let local_addr = ws_listener.local_addr().map_err(io::Error::other)?;
+    let tls_config = build_tls_config(settings)?;
+    Ok(spawn_ws_accept_loop(
+        ws_listener,
+        tls_config,
+        handler.clone(),
+        "ws",
+        local_addr.to_string(),
+        local_addr,
+    ))
+}
+
+/// unix 路径 WS 监听（对应 Go hub.go:100-104 `port == net.Port(0)` 分支：
+/// `net.UnixAddr` → `internet.ListenSystem`，TLS/WS 握手层全复用）。
+///
+/// Go 该分支支持 `FinalMask.Listen(ctx, unixAddr)`；Rust tcpmask 为 TCP 语义
+/// 载体，unix 上无对应能力——非空显式拒绝而非静默忽略（对齐 tcp hub unix
+/// finalmask 拒绝惯例）。
+#[cfg(unix)]
+async fn listen_unix_ws(
+    path: String,
+    settings: StreamSettings,
+    sockopt: xray_transport::sockopt::SocketOptions,
+    handler: ConnHandler,
+) -> io::Result<Box<dyn TransportListener>> {
+    if settings.finalmask_json.as_ref().is_some_and(|v| !v.is_null()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "finalmask is not supported on unix listeners; remove the finalmask key",
+        ));
+    }
+    let config = parse_ws_config(settings.transport_json.as_ref())?;
+    // trusted 来自 sockopt（Go socketSettings.TrustedXForwardedFor 同样作用于 unix）。
+    let trusted = sockopt.trusted_x_forwarded_for.clone();
+    let mut ws_listener =
+        crate::server::WsListener::bind_unix(&path, sockopt, vec![Arc::new(config)])
+            .await
+            .map_err(io::Error::other)?;
+    ws_listener.trusted_x_forwarded_for = trusted;
+
+    let local_addr = ws_listener.local_addr().map_err(io::Error::other)?;
+    let tls_config = build_tls_config(&settings)?;
+    Ok(spawn_ws_accept_loop(ws_listener, tls_config, handler, "ws-unix", path, local_addr))
+}
+
+/// 按 security 构造可选 TLS acceptor（TCP 与 unix 监听共用）。
+///
+/// `build_server_config` 自洽：非 `tls`/`reality`（含 `"none"`/空）返回
+/// `Ok(None)`——对应 Go hub.go:126-132 `tls.ConfigFromStreamSettings` 判空，
+/// unix listener 同样可包。
+fn build_tls_config(
+    settings: &StreamSettings,
+) -> io::Result<Option<Arc<tokio_rustls::rustls::ServerConfig>>> {
+    xray_tls::server_config::build_server_config(
+        &settings.security,
+        settings.security_json.as_ref(),
+    )
+}
+
+/// spawn ws accept 循环（TCP 与 unix 监听共用）：TLS 可选 + accept_policy
+/// 错误处置（错误永不退出，唯一出口 close_notify）+ 意外退出监控。
+///
+/// `ident` 进日志标识监听（TCP = local_addr；unix = socket 路径，unix 无有
+/// 意义的 local_addr）。
+fn spawn_ws_accept_loop(
+    ws_listener: crate::server::WsListener,
+    tls_config: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
+    handler: ConnHandler,
+    tag: &'static str,
+    ident: String,
+    local_addr: SocketAddr,
+) -> Box<dyn TransportListener> {
+    let close_notify = Arc::new(tokio::sync::Notify::new());
+    let close_notify_clone = close_notify.clone();
+    let log_ident = ident.clone();
     let accept_loop_handle = tokio::spawn(async move {
+        let ident = log_ident;
         loop {
             tokio::select! {
                 result = async {
@@ -139,16 +217,16 @@ async fn listen_ws(
                         Err(e) => {
                             match accept_kind(&e) {
                                 AcceptErrorKind::Resource => {
-                                    crate::LOG.warn(format!("tag=ws local={local_addr} error={e} ws inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续"));
+                                    crate::LOG.warn(format!("tag={tag} local={ident} error={e} ws inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续"));
                                     if let WsError::Io(io_err) = &e {
                                         backoff_if_resource(io_err).await;
                                     }
                                 }
                                 AcceptErrorKind::Connection => {
-                                    crate::LOG.debug(format!("tag=ws error={e} ws inbound: 单连接级 accept 错误，继续监听"));
+                                    crate::LOG.debug(format!("tag={tag} error={e} ws inbound: 单连接级 accept 错误，继续监听"));
                                 }
                                 AcceptErrorKind::Unknown => {
-                                    crate::LOG.warn(format!("tag=ws local={local_addr} error={e} ws inbound: accept 错误（未知类别），继续监听"));
+                                    crate::LOG.warn(format!("tag={tag} local={ident} error={e} ws inbound: accept 错误（未知类别），继续监听"));
                                 }
                             }
                         }
@@ -160,9 +238,9 @@ async fn listen_ws(
     });
     // 意外退出监控：循环只应经 close_notify 分支退出；panic（如 handler 回调
     // panic 沿任务栈炸掉 accept task）会静默杀掉监听——error! 兜底发声。
-    tokio::spawn(supervise_accept_loop("ws", local_addr.to_string(), accept_loop_handle));
+    tokio::spawn(supervise_accept_loop(tag, ident, accept_loop_handle));
 
-    Ok(Box::new(WsTransportListener { local_addr, close_notify }))
+    Box::new(WsTransportListener { local_addr, close_notify })
 }
 
 /// WebSocket `TransportListener` wrapper。只持有 local_addr + close 通知。
@@ -948,6 +1026,128 @@ mod tests {
                 },
             }
         }
+    }
+
+    /// ③ transport 级 unix 监听 roundtrip（bd lfrg③）：注册 → listen_unix →
+    /// UDS 建连 → 真实 WS 握手（tungstenite client_async over UDS）→ 文本帧
+    /// echo 往返 → close 后 socket 释放新连接被拒。对应 Go hub.go:100-104
+    /// `port == net.Port(0)` 分支。unix-only。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listen_unix_ws_roundtrip() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let _ = register_unix_listener();
+
+        let path = std::env::temp_dir().join(format!(
+            "xray-ws-unix-hub-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let path_str = path.to_str().unwrap().to_string();
+        let _ = std::fs::remove_file(&path_str);
+
+        // echo 服务端：WsConnection 对 handler 透明为字节流（帧编解码在桥层）；
+        // 循环读（单次 read 在桥层缓冲分片下可能拿不全，已验证形态同 tcpmask 测试）。
+        let handler: ConnHandler = Arc::new(|mut conn| {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                loop {
+                    match conn.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if conn.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                            let _ = conn.flush().await;
+                        },
+                    }
+                }
+            });
+        });
+
+        let settings = StreamSettings { protocol: "websocket".into(), ..Default::default() };
+        let listener = xray_transport::listener_registry::listen_unix(
+            &path_str,
+            settings,
+            xray_transport::sockopt::SocketOptions::default(),
+            handler,
+        )
+        .await
+        .expect("listen_unix(ws) 失败");
+        // unix listener 无 SocketAddr：全零占位（对齐 tcp hub unix 契约）。
+        assert_eq!(
+            listener.local_addr().expect("local_addr 失败"),
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        );
+
+        // 客户端：UDS 建连 → 真实 WS upgrade 握手 → 文本帧往返。
+        let uds = tokio::net::UnixStream::connect(&path_str).await.expect("UDS connect 失败");
+        let ws_request = http::Request::builder()
+            .method("GET")
+            .uri("ws://localhost/")
+            .header("Host", "localhost")
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .body(())
+            .unwrap();
+        let (mut ws_client, resp) =
+            tokio_tungstenite::client_async(ws_request, uds).await.expect("WS 握手失败");
+        assert_eq!(resp.status(), http::StatusCode::SWITCHING_PROTOCOLS);
+
+        // WsConnection 桥层只支持 binary 帧（Xray WS = 字节流，Go gorilla 同语义）。
+        ws_client.send(Message::binary("ping-unix")).await.expect("send 失败");
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws_client.next())
+            .await
+            .expect("echo 超时")
+            .expect("流提前结束")
+            .expect("帧错误");
+        assert_eq!(msg, Message::binary("ping-unix"));
+
+        listener.close().expect("close 失败");
+        // close 后 socket 释放，新连接被拒（close_rejects_new_connections 同款轮询）。
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match tokio::net::UnixStream::connect(&path_str).await {
+                Err(_) => break,
+                Ok(_) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "close 后 unix socket 仍接受连接（close 通知丢失/循环未退出）"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                },
+            }
+        }
+        let _ = std::fs::remove_file(&path_str);
+    }
+
+    /// unix 监听的 finalmask 拒绝路径（对齐 tcp hub unix 惯例：非空显式拒绝，
+    /// 不静默忽略）。错误在 bind 前返回，不触 unix API——但被测函数本身
+    /// cfg(unix)，测试随行。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listen_unix_ws_rejects_finalmask() {
+        let settings = StreamSettings {
+            protocol: "websocket".into(),
+            finalmask_json: Some(serde_json::json!({"enabled": true})),
+            ..Default::default()
+        };
+        let handler: ConnHandler = Arc::new(|_| {});
+        let result = listen_unix_ws(
+            "/tmp/xray-ws-unix-finalmask-reject.sock".into(),
+            settings,
+            xray_transport::sockopt::SocketOptions::default(),
+            handler,
+        )
+        .await;
+        let Err(e) = result else { panic!("expected finalmask rejection, got a listener") };
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(e.to_string().contains("finalmask is not supported on unix listeners"));
     }
 
     /// 预连接池语义（ss-ws 池复用死会话修复）：dial_ws 交付的连接承载过会话
