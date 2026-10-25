@@ -17,8 +17,8 @@
 //! - ring seq 比较
 //! - passthrough 连接层（client/server 状态机，跑在 [`IcmpRawSocket`] 抽象上）
 //!
-//! 平台真 socket 收发实装在 [`super::xicmp_sock`]（Linux ping/raw socket + Windows
-//! raw socket）。
+//! 平台真 socket 收发实装在同目录的 `xicmp_sock` 模块（Linux/macOS ping/raw socket +
+//! Windows raw socket）。
 
 use std::{
     collections::HashMap,
@@ -223,7 +223,7 @@ impl Udpmask for XicmpConfig {
 /// - Windows：`SOCK_RAW`+`IPPROTO_ICMP`（需 Administrator）
 /// - 测试：`MockIcmpRawSocket`
 ///
-/// 实装见 [`super::xicmp_sock`]。
+/// 实装见同目录的 `xicmp_sock` 模块。
 #[async_trait]
 pub trait IcmpRawSocket: Send + Sync {
     /// 发一帧完整 ICMP 包（含 8B echo 头部 + data）到 `dst`。
@@ -296,7 +296,7 @@ struct XicmpServerRecord {
 }
 
 impl XicmpPassthroughConn {
-    /// 构造客户端连接。`raw` 由调用方注入（生产走 [`super::xicmp_sock`]，测试走 mock）。
+    /// 构造客户端连接。`raw` 由调用方注入（生产走 `xicmp_sock` 平台实现，测试走 mock）。
     ///
     /// `ips`/`dgram_v4`/`dgram_v6` 由生产侧按 socket 实际打开模式传入（Go `c.ips`/`c.udp`）。
     pub fn new_client(

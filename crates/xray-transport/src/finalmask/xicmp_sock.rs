@@ -5,9 +5,12 @@
 //!
 //! - **Linux**：`SOCK_DGRAM`+`IPPROTO_ICMP` ping socket（免 root，优）+ `SOCK_RAW` 兜底； v6
 //!   同族（ping6 socket / ICMPv6 raw）。
+//! - **macOS/BSD**（unix）：同 Linux 实现路径，ping socket 可用性由内核决定，失败自动 回退 raw（Go
+//!   在 darwin 的 server 亦走 raw `ip4:icmp`/`ip6:ipv6-icmp`）。
 //! - **Windows**：`SOCK_RAW`+`IPPROTO_ICMP`（需 Administrator；无提升权限时 fail-visible）。 不采用
 //!   `IcmpSendEcho2`：id/seq 由 OS 指定且为阻塞逐请求模型，无法表达 client 的 id/seq 记账与 async
 //!   send/recv 拆分。
+//! - **其余平台**：fail-visible 占位（构造即报「平台不支持 xicmp raw socket」）。
 //!
 //! socket2 只负责创建（raw/dgram + 协议族，`Type::RAW` 在 0.5 被 all 门控所以走
 //! `From<c_int>`），创建后立即转 `std::net::UdpSocket` 做全部 IO——std 的
@@ -211,7 +214,13 @@ fn strip_v4_header_if_needed(packet: &[u8]) -> Option<&[u8]> {
 
 // ===== 平台 socket 内核（同名 API：open/send/recv）=====
 
-#[cfg(target_os = "linux")]
+/// unix（Linux/macOS/BSD）：非阻塞 socket + AsyncFd。
+///
+/// Linux：ping socket 免 root 但需 `net.ipv4.ping_group_range` 覆盖进程组（内核
+/// `ping_init_sock` 不查 CAP_NET_RAW，root 也被默认 `1 0` 拦下），raw 需 CAP_NET_RAW。
+/// macOS/BSD：dgram ICMP socket 可用性由内核决定，失败自动回退 raw（Go 在 darwin 的
+/// server 同样走 raw `ip4:icmp`/`ip6:ipv6-icmp`）。
+#[cfg(unix)]
 mod sys {
     use std::net::{SocketAddr, UdpSocket};
 
@@ -397,9 +406,40 @@ mod sys {
     }
 }
 
-#[cfg(target_os = "linux")]
-use sys::IcmpSock;
-#[cfg(windows)]
+/// 其余平台（既非 unix 也非 windows）：fail-visible 占位——构造即报「平台不支持」，
+/// 不静默、不 panic。
+#[cfg(not(any(unix, windows)))]
+mod sys {
+    use std::net::SocketAddr;
+
+    use super::io;
+
+    pub(super) struct IcmpSock;
+
+    impl IcmpSock {
+        pub(super) fn open(_dgram: bool, _is_v4: bool) -> io::Result<Self> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "xicmp: raw ICMP socket is not supported on this platform",
+            ))
+        }
+
+        pub(super) async fn send(&self, _packet: &[u8], _dst: SocketAddr) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "xicmp: raw ICMP socket is not supported on this platform",
+            ))
+        }
+
+        pub(super) async fn recv(&self) -> io::Result<(Vec<u8>, SocketAddr)> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "xicmp: raw ICMP socket is not supported on this platform",
+            ))
+        }
+    }
+}
+
 use sys::IcmpSock;
 
 #[cfg(test)]
