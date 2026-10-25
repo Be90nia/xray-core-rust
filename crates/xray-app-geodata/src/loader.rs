@@ -452,22 +452,32 @@ mod tests {
         // ① 提交 N 个任务后 borrow_rejected()==0 且借还计数归零（RAII 归还）。
         pool.shutdown_join();
         assert_eq!(pool.borrow_rejected(), 0);
-        // worker 的缓冲在任务闭包返回时归还，而结果 `tx.send` 在闭包体内先发生 →
-        // `join()` 之后的瞬间仍可能落在「send 已发、guard 尚未 drop」窗口
-        // （CI release run 40054602144 偶发：idle=1/max=2）。按 udf 抖动治理惯例
-        // 用墙钟截止轮询等窗口闭合——真泄漏（永不归还）到点仍必红，断言不放松。
+        // 泄漏判据 = 池宇宙账本闭合，不是「池长满」：MemoryPool 槽件只有三个
+        // 去处——idle 槽 / guard 借出 / 溢出丢弃（各自计数）。borrowed==0
+        // （两条 acquire 路径都先 note_borrow 再交 guard，guard 在途 ⟹
+        // borrowed>0；join 后 worker 在 catch_unwind 内跑完任务才回环，guard
+        // 必已 drop）+ dropped_overflow==0（无件离开池宇宙；本负载无 resize）
+        // + idle≥1（至少一次完整借还闭环）⟹ idle == created，件件有账。
+        // 原 `idle == max` 断的是懒创建池「必长满 2 件」：少核 CI 上 8 个微秒
+        // 级任务被串行清空时第二件从未被创建（CI run 40054602144 /
+        // 40161183439 的 borrowed=0 idle=1 max=2 = 健康终态，非泄漏）。墙钟
+        // 截止轮询保留：真泄漏（borrowed 恒 >0 / dropped_overflow>0）到点必红，
+        // 断言不放松。
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
             let m = pool.mem_pool().metrics();
-            if m.core.borrowed == 0 && m.core.idle == m.core.max {
+            if m.core.borrowed == 0 && m.core.dropped_overflow == 0 && m.core.idle >= 1 {
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "buffers not returned after shutdown_join: borrowed={} idle={} max={}",
+                "buffers not returned after shutdown_join: borrowed={} idle={} max={} \
+                 dropped_overflow={} watermark={}",
                 m.core.borrowed,
                 m.core.idle,
-                m.core.max
+                m.core.max,
+                m.core.dropped_overflow,
+                m.core.watermark
             );
             std::thread::sleep(Duration::from_millis(5));
         }

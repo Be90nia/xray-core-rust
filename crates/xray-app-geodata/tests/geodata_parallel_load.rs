@@ -156,7 +156,9 @@ fn pooled_startup_load_is_not_slower_than_serial() {
     assert_eq!(pool.borrow_rejected(), 0);
     let m = pool.mem_pool().metrics();
     assert_eq!(m.core.borrowed, 0);
-    assert_eq!(m.core.idle, m.core.max);
+    // 泄漏判据=账本闭合（见 loader.rs balance 测试注释）：懒创建池不承诺长满。
+    assert_eq!(m.core.dropped_overflow, 0);
+    assert!(m.core.idle >= 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -212,7 +214,9 @@ fn parallel_load_end_to_end_balance_and_panic_isolation() {
     assert_eq!(pool.borrow_rejected(), 0);
     let m = pool.mem_pool().metrics();
     assert_eq!(m.core.borrowed, 0, "panic task must not leak its buffer");
-    assert_eq!(m.core.idle, m.core.max);
+    // 泄漏判据=账本闭合（见 loader.rs balance 测试注释）：懒创建池不承诺长满。
+    assert_eq!(m.core.dropped_overflow, 0);
+    assert!(m.core.idle >= 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
