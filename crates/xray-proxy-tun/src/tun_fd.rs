@@ -9,14 +9,14 @@
 //! - 末步置非阻塞（Go `unix.SetNonblock`）：tokio `AsyncFd` 的前提。
 //!
 //! 平台面：
-//! - **Linux**：完整实现（`linux` 子模块 + [`inherit_from_env`]）。
+//! - **Linux**：完整实现（`linux` 子模块 + `inherit_from_env`）。
 //! - **其他平台**（Windows/macOS/BSD）：未实现 fd 继承。
-//! - 这些平台 env 设置即由 [`refuse_unsupported`] 显式报错，禁静默回退直开。
+//! - 这些平台 env 设置即由 `refuse_unsupported` 显式报错，禁静默回退直开。
 //!
 //! vnet_hdr 面（bd y93up，对齐 Go）：带 `IFF_VNET_HDR` 的继承 fd 照常接管。
 //! tun-rs 的 `from_fd` 把设备记成裸包模式（读写原语 = 裸 read/write），因此
 //! virtio 头的剥除/垫放由 [`crate::device::TunDevice`] 层处理（复用其垫头
-//! free list）；[`clear_offload`] 在接管时清设备级 offload mask，保证继承读
+//! free list）；`clear_offload` 在接管时清设备级 offload mask，保证继承读
 //! 路径只见单包、不会收到内核 GRO 聚合大包。
 
 use crate::error::{Result, TunError};
@@ -24,7 +24,7 @@ use crate::error::{Result, TunError};
 /// Go `platform.TunFdKey` + 归一化名（`platform.NormalizeEnvName`）。
 pub const TUN_FD_KEYS: [&str; 2] = ["xray.tun.fd", "XRAY_TUN_FD"];
 
-/// 进程间传递的文件描述符编号（Windows 上无此语义，见 [`refuse_unsupported`]）。
+/// 进程间传递的文件描述符编号（Windows 上无此语义，见 `refuse_unsupported`）。
 pub type TunFd = i32;
 
 fn invalid(msg: String) -> TunError {

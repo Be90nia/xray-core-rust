@@ -164,7 +164,7 @@ pub struct PortalWorker {
     counter: AtomicU8,
     timer: Arc<InactivityTimer>,
     /// B6（bd t975）：控制 dispatch + 心跳循环唯一托管口（坑约束 5）。心跳任务
-    /// 自持 Arc<Self>（scope 随之存活），循环靠 heartbeat 错误自终止（Go
+    /// 自持 `Arc<Self>`（scope 随之存活），循环靠 heartbeat 错误自终止（Go
     /// task.Periodic Execute 出错即停同语义）。
     // fx 仅经 drop glue 生效（JoinSet 兜底 abort），无显式读点。
     #[allow(dead_code)]

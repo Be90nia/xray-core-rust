@@ -26,6 +26,14 @@ use xray_common::{
     uuid::UUID,
 };
 use xray_conf::{BuiltConfig, BuiltInbound};
+// trait 唯一消费点是下方 TUN 臂的 `handler.start()`——随该臂同门控，否则
+// darwin 等无 TUN 平台 trait 无消费者 → unused_imports 在 deny(warnings) 下硬错。
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
 use xray_features::inbound::InboundHandler;
 // zx7: mux inbound 检测
 use xray_mux::client::{MUX_COOL_ADDRESS, MUX_COOL_PORT};

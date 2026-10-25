@@ -88,8 +88,8 @@ pub enum SsFace {
 ///
 /// `build(ctx)` 从 per-plugin 段（`inbounds[]/outbounds[]` 内
 /// `protocol == "shadowsocks"` 的元素）解析 `settings` 并持有；出站拨号闭包经
-/// [`dial_fn`](SsPlugin::dial_fn)、全量产物经
-/// [`built_face`](SsPlugin::built_face) 由插件产出（tag/listen 属实例注册期
+/// [`dial_fn`](SsPlugin::dial_fn)、全量产物经私有方法
+/// `built_face`（公开面为 [`face`](Self::face)）由插件产出（tag/listen 属实例注册期
 /// 信息，不在 build 期定）。
 #[derive(Default)]
 pub struct SsPlugin {

@@ -79,7 +79,7 @@ static SHARED_CONFIGS: LazyLock<Mutex<HashMap<String, Arc<rustls::ClientConfig>>
 /// 若上游引入热重载，必须同步失效本缓存。
 ///
 /// 首次见到某 domain 时改造入参（挂共享票缓存 + enable_early_data）并入缓存；
-/// 缓存满（[`SHARED_CONFIG_CAP`]）时返回新建 Arc，该连接退化为普通 1-RTT。
+/// 缓存满（`SHARED_CONFIG_CAP`）时返回新建 Arc，该连接退化为普通 1-RTT。
 pub fn shared_client_config(
     domain: &str,
     mut tls: rustls::ClientConfig,
