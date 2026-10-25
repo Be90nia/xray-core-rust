@@ -16,9 +16,12 @@
 //! （`arm_builders/outbound.rs:287`）与插件出站分支调同一个
 //! `xray_proxy_ss::parse_ss_config`，同函数自比无信息量。
 //!
-//! 16/16 族的可观测出口 = `parity_roster_covers_all_16_families`（名称清单 +
-//! 总数断言）；CI 宽门已含本模块——`cargo test --workspace`
-//! （`.github/workflows/ci.yml:160`）跑 lib 测试目标，无需单列 workflow。
+//! 覆盖出口 = `parity_roster_covers_all_families`（名称清单 + 总数断言）：
+//! 有 tun 编译面平台（linux/android/freebsd/windows，`Cargo.toml:105-106` target
+//! 条件依赖）严格 16 族 31 用例；macOS（需 utun 权限，tun 不编译）15 族 30 用例，
+//! 断言消息写明——两平台都不许 `>=`/静默。CI 宽门已含本模块——
+//! `cargo test --workspace`（`.github/workflows/ci.yml:160`）跑 lib 测试目标，
+//! 无需单列 workflow。
 //!
 //! 新登记已知差异 1 处（**只报告不修**，见
 //! `reports/wsl-2026-10-25/parity-16.md`）：ss2022 中继 `destinations[]` 旧形的
@@ -53,6 +56,14 @@ use xray_proxy_ss::{
 };
 use xray_proxy_trojan::TrojanPlugin;
 use xray_proxy_tuic::TuicPlugin;
+// `xray-proxy-tun` 是 target 条件依赖（`Cargo.toml:105-106`：macOS 需 utun 权限
+// 不编译），与 `inbound.rs` 的导入同门。
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
 use xray_proxy_tun::TunPlugin;
 use xray_proxy_vless::VlessPlugin;
 use xray_proxy_vmess::{Validator as VmessValidatorTrait, VmessPlugin};
@@ -616,7 +627,14 @@ fn loopback_parity_outbound_inbound_tag() {
 }
 
 // ── tun：入站 StackOptions 字段级（core `parse_tun_inbound_config` ↔ built_config）──
-
+// 与上面的 `use xray_proxy_tun` 同门（macOS 不编译该依赖）；无 tun 平台该族
+// 不存在，覆盖表按平台走 16/15（见 `parity_roster_covers_all_families`）。
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
 #[test]
 fn tun_parity_inbound_stack_options_fields() {
     let settings = json!({
@@ -982,79 +1000,127 @@ fn tuic_parity_inbound_full_fields() {
 // 16 族覆盖出口（bd hw6w）：名称清单 + 总数断言。
 //
 // 表内每条 = 「族 → 该族的对拍用例名」；用例名即 cargo test 输出里的可 grep
-// 面。本表与实现同步由两条断言保证：族数 16、用例名总数与模块内对拍用例数
-// 一致（新增/删除用例而不更新本表 → 红）。
+// 面。本表与实现同步由两条断言保证：族数、用例名总数与模块内对拍用例数一致
+// （新增/删除用例而不更新本表 → 红）。
+//
+// tun 族按 `Cargo.toml:105-106` 的 target 条件依赖同门：4-OS 编译面
+// （linux/android/freebsd/windows）= 16 族 31 用例；macOS（utun 权限）不编译
+// tun = 15 族 30 用例——两种平台各自对上严格数，禁 `>=`/静默。
 // ═══════════════════════════════════════════════════════════════════════════
 
-const PARITY_FAMILIES: [(&str, &[&str]); 16] = [
-    (
-        "socks",
-        &[
-            "socks_parity_password_auth_full_fields",
-            "socks_parity_defaults_when_settings_empty",
-            "socks_parity_inbounds_layout_users_alias",
-        ],
-    ),
-    (
-        "freedom",
-        &[
-            "freedom_parity_strategy_override_and_final_rules",
-            "freedom_parity_target_strategy_priority",
-            "freedom_known_divergence_fragment_noises",
-        ],
-    ),
-    (
-        "blackhole",
-        &[
-            "blackhole_parity_http_response",
-            "blackhole_parity_custom_response_base64",
-            "blackhole_parity_missing_response_is_none",
-        ],
-    ),
-    ("vless", &["vless_parity_outbound_vnext_fields", "vless_parity_outbound_level_email"]),
-    ("vmess", &["vmess_parity_inbound_validator_users"]),
-    ("trojan", &["trojan_parity_inbound_validator_and_fallbacks"]),
-    ("http", &["http_parity_inbound_users_alias_transparent_level"]),
-    ("dns", &["dns_parity_outbound_rule_and_rewrite"]),
-    (
-        "hysteria",
-        &["hysteria_parity_outbound_flat_fields", "hysteria_parity_outbound_server_addr_port"],
-    ),
-    ("anytls", &["anytls_parity_outbound_password_and_server"]),
-    (
-        "wireguard",
-        &["wireguard_parity_inbound_device_fields", "wireguard_parity_inbound_port_settings_level"],
-    ),
-    ("loopback", &["loopback_parity_outbound_inbound_tag"]),
-    ("tun", &["tun_parity_inbound_stack_options_fields"]),
-    (
-        "ss",
-        &[
-            "ss_parity_legacy_single_user",
-            "ss_parity_legacy_multi_users_and_clients_alias",
-            "ss_parity_ss2022_single_user",
-            "ss_parity_ss2022_multi_users",
-            "ss_parity_ss2022_relay_go_form",
-            "ss_known_divergence_relay_destinations_address_typing",
-            "ss_parity_errors_fail_fast",
-        ],
-    ),
-    ("dokodemo", &["dokodemo_parity_inbound_full_fields"]),
-    ("tuic", &["tuic_parity_inbound_full_fields"]),
-];
+/// 16 族覆盖表（有 tun 编译面平台）；macOS 走 [`parity_families`] 的 15 族形态。
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
+fn parity_families_tun(families: &mut Vec<(&'static str, &'static [&'static str])>) {
+    families.push(("tun", &["tun_parity_inbound_stack_options_fields"]));
+}
+
+/// 族 → 对拍用例名清单（顺序即登记序；tun 位由 cfg 决定在/不在）。
+fn parity_families() -> Vec<(&'static str, &'static [&'static str])> {
+    let mut families: Vec<(&'static str, &'static [&'static str])> = vec![
+        (
+            "socks",
+            &[
+                "socks_parity_password_auth_full_fields",
+                "socks_parity_defaults_when_settings_empty",
+                "socks_parity_inbounds_layout_users_alias",
+            ],
+        ),
+        (
+            "freedom",
+            &[
+                "freedom_parity_strategy_override_and_final_rules",
+                "freedom_parity_target_strategy_priority",
+                "freedom_known_divergence_fragment_noises",
+            ],
+        ),
+        (
+            "blackhole",
+            &[
+                "blackhole_parity_http_response",
+                "blackhole_parity_custom_response_base64",
+                "blackhole_parity_missing_response_is_none",
+            ],
+        ),
+        ("vless", &["vless_parity_outbound_vnext_fields", "vless_parity_outbound_level_email"]),
+        ("vmess", &["vmess_parity_inbound_validator_users"]),
+        ("trojan", &["trojan_parity_inbound_validator_and_fallbacks"]),
+        ("http", &["http_parity_inbound_users_alias_transparent_level"]),
+        ("dns", &["dns_parity_outbound_rule_and_rewrite"]),
+        (
+            "hysteria",
+            &["hysteria_parity_outbound_flat_fields", "hysteria_parity_outbound_server_addr_port"],
+        ),
+        ("anytls", &["anytls_parity_outbound_password_and_server"]),
+        (
+            "wireguard",
+            &[
+                "wireguard_parity_inbound_device_fields",
+                "wireguard_parity_inbound_port_settings_level",
+            ],
+        ),
+        ("loopback", &["loopback_parity_outbound_inbound_tag"]),
+    ];
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "windows"
+    ))]
+    parity_families_tun(&mut families);
+    // 显式类型标注：数组字面量各元素分别 coerce 到 &[&str]（无标注时整体被
+    // 首元素的 &[&str; 7] 统一，其余元素 E0308）。
+    let tail: [(&'static str, &'static [&'static str]); 3] = [
+        (
+            "ss",
+            &[
+                "ss_parity_legacy_single_user",
+                "ss_parity_legacy_multi_users_and_clients_alias",
+                "ss_parity_ss2022_single_user",
+                "ss_parity_ss2022_multi_users",
+                "ss_parity_ss2022_relay_go_form",
+                "ss_known_divergence_relay_destinations_address_typing",
+                "ss_parity_errors_fail_fast",
+            ],
+        ),
+        ("dokodemo", &["dokodemo_parity_inbound_full_fields"]),
+        ("tuic", &["tuic_parity_inbound_full_fields"]),
+    ];
+    families.extend(tail);
+    families
+}
 
 #[test]
-fn parity_roster_covers_all_16_families() {
-    assert_eq!(PARITY_FAMILIES.len(), 16, "16 族全覆盖");
-    let mut families = std::collections::BTreeSet::new();
-    let mut cases = Vec::new();
-    for (family, tests) in PARITY_FAMILIES {
-        assert!(families.insert(family), "{family} 重复登记");
+fn parity_roster_covers_all_families() {
+    // 16 族是合同口径；tun 仅在 4-OS 编译面存在（Cargo.toml target 条件依赖，
+    // macOS 需 utun 权限）→ 无 tun 平台 15。两平台都断言各自的严格数。
+    let tun_compiles = cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "windows"
+    ));
+    let (expected_families, expected_cases) = if tun_compiles { (16, 31) } else { (15, 30) };
+    let families = parity_families();
+    assert_eq!(
+        families.len(),
+        expected_families,
+        "族数：有 tun 编译面平台必须严格 16；无 tun 平台（macOS）=15（utun 权限，\
+         见 crates/xray-core/Cargo.toml:105-106）——多/缺族即表账不符"
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    let mut cases: Vec<&str> = Vec::new();
+    for (family, tests) in families {
+        assert!(seen.insert(family), "{family} 重复登记");
         assert!(!tests.is_empty(), "{family} 缺对拍用例");
         cases.extend_from_slice(tests);
     }
     let unique: std::collections::BTreeSet<_> = cases.iter().copied().collect();
     assert_eq!(unique.len(), cases.len(), "用例名重复登记");
     // 族内用例总数（本表外的 2 个 #[test]：缺段 fail-fast 反向控制 + 本表自身）。
-    assert_eq!(unique.len(), 31, "16 族对拍用例总数");
+    assert_eq!(unique.len(), expected_cases, "族内对拍用例总数");
 }
