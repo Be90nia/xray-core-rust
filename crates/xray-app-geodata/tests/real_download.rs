@@ -32,6 +32,7 @@ fn spawn_server(body: Vec<u8>) -> OneShotServer {
     let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let log_clone = Arc::clone(&log);
     let body_for_thread = body.clone();
+    #[allow(clippy::disallowed_methods, reason = "测试：本地 HTTP stub 服务器线程，随进程退出回收")]
     thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
             let mut buf = [0u8; 1024];
@@ -96,6 +97,7 @@ fn real_downloader_fetches_via_loopback_http() {
 fn real_downloader_errors_on_non_2xx() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    #[allow(clippy::disallowed_methods, reason = "测试：本地 HTTP stub 服务器线程，随进程退出回收")]
     thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
             let mut buf = [0u8; 256];
@@ -158,6 +160,7 @@ fn real_downloader_follows_redirect_to_next_hop() {
     // 302 → https://127.0.0.1:1/f.dat：证明循环真按 Location 重新拨号（端口 1 必被拒）。
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    #[allow(clippy::disallowed_methods, reason = "测试：本地 HTTP stub 服务器线程，随进程退出回收")]
     thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
             let mut buf = [0u8; 512];
@@ -186,6 +189,7 @@ fn real_downloader_rejects_insecure_redirect() {
     // Go CheckRedirect：目标 scheme != https → InsecureRedirect（http→http 也拒）。
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    #[allow(clippy::disallowed_methods, reason = "测试：本地 HTTP stub 服务器线程，随进程退出回收")]
     thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
             let mut buf = [0u8; 512];
@@ -211,6 +215,7 @@ fn real_downloader_rejects_redirect_without_location() {
     // 无 Location 的 3xx 无从跟随 → Go fetch 的 ">= 300 → unexpected status" 语义。
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    #[allow(clippy::disallowed_methods, reason = "测试：本地 HTTP stub 服务器线程，随进程退出回收")]
     thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
             let mut buf = [0u8; 512];
@@ -232,6 +237,7 @@ fn real_downloader_rejects_redirect_without_location() {
 fn real_downloader_respects_request_timeout() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    #[allow(clippy::disallowed_methods, reason = "测试：本地 HTTP stub 服务器线程，随进程退出回收")]
     let h = thread::spawn(move || {
         if let Ok((stream, _)) = listener.accept() {
             std::thread::sleep(Duration::from_secs(5));
@@ -242,6 +248,7 @@ fn real_downloader_respects_request_timeout() {
     let dl = RealAssetDownloader::new(dir.clone()).with_timeout(Duration::from_millis(300));
     let url = format!("http://{}/x.dat", addr);
     let temp = dir.join("x.tmp");
+    #[allow(clippy::disallowed_methods, reason = "测试：timeout 断言计时起点")]
     let start = std::time::Instant::now();
     let res = dl.download_to(&url, &temp);
     let elapsed = start.elapsed();

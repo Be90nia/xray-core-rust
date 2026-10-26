@@ -366,6 +366,7 @@ pub(crate) async fn build_dokodemo_inbound(
         // await 持有 JoinHandle，token cancel 时 drop = detach（accept loop 继续跑，
         // RemoveInbound 后端口仍可连）。
         let stop = shutdown_token.clone();
+        #[allow(clippy::disallowed_methods, reason = "数据面 inbound serve 常驻任务（dokodemo TCP listener）；迁 FxScope 待 bd 39hko")]
         handles.push(tokio::spawn(async move {
             tokio::select! {
                 r = serve_dokodemo(listener, ohm_tcp, opts) => {
@@ -399,6 +400,7 @@ pub(crate) async fn build_dokodemo_inbound(
             udp_mask,
         )
         .await?;
+        #[allow(clippy::disallowed_methods, reason = "数据面 inbound serve 常驻任务（dokodemo UDP）；迁 FxScope 待 bd 39hko")]
         handles.push(tokio::spawn(async move {
             tokio::select! {
                 r = serve_dokodemo_udp_on(hub, dispatch, dest_udp) => {
@@ -689,6 +691,7 @@ pub(crate) fn vless_transport_on_conn(
         let validator = Arc::clone(&validator);
         let fallbacks = fallbacks.clone();
         let options = options.clone();
+        #[allow(clippy::disallowed_methods, reason = "inbound 连接处理任务（vless fallback，每连接）；迁 FxScope 待 bd 39hko")]
         tokio::spawn(async move {
             let (peer, local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
             // TLS 已在 transport hub 内终结，name/alpn 不可得
@@ -740,6 +743,7 @@ pub(crate) fn trojan_transport_on_conn(
         let validator = Arc::clone(&validator);
         let handler = Arc::clone(&handler);
         let fb_policy = fallbacks.clone();
+        #[allow(clippy::disallowed_methods, reason = "inbound 连接处理任务（trojan fallback，每连接）；迁 FxScope 待 bd 39hko")]
         tokio::spawn(async move {
             let (peer, local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
             xray_proxy_trojan::serve_trojan_conn(
@@ -780,6 +784,7 @@ pub(crate) fn vmess_transport_on_conn(
         let handler = Arc::clone(&handler);
         let validator = Arc::clone(&validator);
         let history = Arc::clone(&history);
+        #[allow(clippy::disallowed_methods, reason = "inbound 连接处理任务（vmess，每连接）；迁 FxScope 待 bd 39hko")]
         tokio::spawn(async move {
             let (peer, _local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
             if let Err(e) = xray_proxy_vmess::handle_vmess_connection(
@@ -814,6 +819,7 @@ pub(crate) fn ss_transport_on_conn(
     Ok(Arc::new(move |conn| {
         let mode = mode.clone();
         let handler = Arc::clone(&handler);
+        #[allow(clippy::disallowed_methods, reason = "inbound 连接处理任务（ss/ss2022，每连接）；迁 FxScope 待 bd 39hko")]
         tokio::spawn(async move {
             ss_mode_conn_pipeline(mode, handler, conn, hs_timeout).await;
         });

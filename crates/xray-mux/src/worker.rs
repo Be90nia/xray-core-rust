@@ -86,6 +86,7 @@ impl Dispatcher for DispatchHandlerAdapter {
 
         let handler = Arc::clone(&self.handler);
         let dest_clone = dest.clone();
+        #[allow(clippy::disallowed_methods, reason = "数据面连接任务（每连接 dispatch 泵）；迁 FxScope 待 bd 39hko")]
         tokio::spawn(async move {
             handler.dispatch(&dest_clone, dispatch_link).await;
         });
@@ -205,6 +206,7 @@ impl ServerWorker {
         let done_rx = self.done_rx.clone();
         let done_tx = self.done_tx.clone();
         let closed = Arc::clone(&self.closed);
+        #[allow(clippy::disallowed_methods, reason = "常驻监控任务（JoinHandle 返回给调用方托管）；迁 FxScope 待 bd 39hko")]
         tokio::spawn(async move {
             // Go time.Ticker 首 tick 在 60s 后；interval_at 对齐
             let mut ticker = tokio::time::interval_at(
@@ -287,6 +289,7 @@ impl ServerWorker {
         };
         let os = session.clone();
         let ow = link_writer.clone();
+        #[allow(clippy::disallowed_methods, reason = "数据面会话输出泵（每连接）；迁 FxScope 待 bd 39hko")]
         tokio::spawn(async move {
             Self::handle_session_output(os, ow).await;
         });
@@ -381,6 +384,7 @@ impl ServerWorker {
         xmgr.register(xudp).await;
         let os = session.clone();
         let ow = link_writer.clone();
+        #[allow(clippy::disallowed_methods, reason = "数据面会话输出泵（每连接）；迁 FxScope 待 bd 39hko")]
         tokio::spawn(async move {
             Self::handle_session_output(os, ow).await;
         });
@@ -436,6 +440,7 @@ impl ServerWorker {
         self.xudp_manager.register(xudp.clone()).await;
         let os = session.clone();
         let ow = link_writer.clone();
+        #[allow(clippy::disallowed_methods, reason = "数据面会话输出泵（每连接）；迁 FxScope 待 bd 39hko")]
         tokio::spawn(async move {
             Self::handle_session_output(os, ow).await;
         });
@@ -791,6 +796,8 @@ mod tests {
     /// bd lahx：ServerWorker 构造即接线 XUDP 常驻清理任务（Go init goroutine
     /// 语义），Expiring 过期条目被周期回收。
     #[tokio::test(start_paused = true)]
+    // 赋值表达式语句位挂属性在本工具链 E0658（无 stmt_expr_attributes），故挂 fn 位。
+    #[allow(clippy::disallowed_methods, reason = "测试：过期条目构造（1 处 Instant::now）")]
     async fn server_worker_wires_xudp_periodic_cleanup() {
         let worker = Arc::new(ServerWorker::new(Arc::new(MockDispatcher)));
         let mut xudp = crate::session::XUDP::new([9u8; 8]);
@@ -903,6 +910,7 @@ mod tests {
 
         let link_writer: Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>> =
             Arc::new(tokio::sync::Mutex::new(Some(Box::new(StalledWriter))));
+        #[allow(clippy::disallowed_methods, reason = "测试：卡死泵任务")]
         tokio::spawn(ServerWorker::handle_session_output(Arc::clone(&session), link_writer));
         // 等泵进入写 pending（修复前此处泵仍持 input 锁）
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1161,6 +1169,7 @@ mod tests {
                 Arc::new(AsyncMutex::new(Some(Box::new(s_write))));
             let monitor_h = server.spawn_monitor(Arc::clone(&link_writer));
             let frame_server = Arc::clone(&server);
+            #[allow(clippy::disallowed_methods, reason = "测试：帧服务处理泵")]
             tokio::spawn(async move {
                 while let Ok(true) = frame_server.process_frame(&mut reader, &link_writer).await {}
                 frame_server.close();
@@ -1214,6 +1223,7 @@ mod tests {
 
             let w = Arc::clone(&client);
             let d = udp_target();
+            #[allow(clippy::disallowed_methods, reason = "测试：udp dispatch 任务")]
             let task = tokio::spawn(async move {
                 w.dispatch_with_source(
                     &d,
@@ -1423,6 +1433,7 @@ mod tests {
                 Arc::new(AsyncMutex::new(Some(Box::new(s_write))));
             let monitor_h = server.spawn_monitor(Arc::clone(&link_writer));
             let frame_server = Arc::clone(&server);
+            #[allow(clippy::disallowed_methods, reason = "测试：帧服务处理泵")]
             tokio::spawn(async move {
                 while let Ok(true) = frame_server.process_frame(&mut reader, &link_writer).await {}
                 frame_server.close();
@@ -1441,6 +1452,7 @@ mod tests {
 
             let w = Arc::clone(&client);
             let d = tcp_target();
+            #[allow(clippy::disallowed_methods, reason = "测试：tcp dispatch 任务")]
             let task = tokio::spawn(async move {
                 w.dispatch_with_source(
                     &d,

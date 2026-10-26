@@ -113,6 +113,7 @@ fn pooled_startup_load_is_not_slower_than_serial() {
     let pool = GeodataLoadPool::new(2, 2, 32, Duration::from_secs(10));
 
     let timed_serial = |reqs: &[LoadRequest]| -> Duration {
+        #[allow(clippy::disallowed_methods, reason = "测试：perf 对照断言计时")]
         let t0 = Instant::now();
         let rs = run_serial(&dir, reqs);
         let elapsed = t0.elapsed();
@@ -123,6 +124,7 @@ fn pooled_startup_load_is_not_slower_than_serial() {
         elapsed
     };
     let timed_pooled = |pool: &GeodataLoadPool, reqs: &[LoadRequest]| -> Duration {
+        #[allow(clippy::disallowed_methods, reason = "测试：perf 对照断言计时")]
         let t0 = Instant::now();
         let rs = pool.load_parallel(&dir, reqs);
         let elapsed = t0.elapsed();

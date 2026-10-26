@@ -312,6 +312,7 @@ impl ClientWorker {
 
         let w = Arc::clone(&worker);
         // 数据面泵热路径豁免（约束⑫）：carrier 读循环不加托管口。
+        #[allow(clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）：carrier 读循环泵，FxScope 记账会落每 chunk 开销")]
         tokio::spawn(async move { w.fetch_output(BufferedReader::new(link.reader)).await });
 
         let w = Arc::clone(&worker);
@@ -448,6 +449,7 @@ impl ClientWorker {
         let s = Arc::clone(&session);
         let writer_slot = Arc::clone(&self.link_writer);
         let target = dest.clone();
+        #[allow(clippy::disallowed_methods, reason = "数据面连接任务（fetch_input 泵）；迁 FxScope 待 bd 39hko")]
         tokio::spawn(
             async move { Self::fetch_input(s, target, writer_slot, global_id, inbound).await },
         );
@@ -1062,6 +1064,7 @@ mod tests {
         let mut handles = Vec::new();
         for _ in 0..N {
             let picker = Arc::clone(&picker);
+            #[allow(clippy::disallowed_methods, reason = "测试：并发 picker 压测任务")]
             handles.push(tokio::spawn(async move {
                 let _ = picker.pick_internal().await;
             }));
@@ -1108,6 +1111,7 @@ mod tests {
         let link = Link { reader: Box::new(req_rd), writer: Box::new(resp_wr) };
         let w = Arc::clone(worker);
         let dest = dest.clone();
+        #[allow(clippy::disallowed_methods, reason = "测试：dispatch 任务句柄")]
         let handle = tokio::spawn(async move { w.dispatch(&dest, link).await });
 
         let mut req_wr = req_wr;
@@ -1151,6 +1155,7 @@ mod tests {
             async fn dispatch(&self, _dest: Destination) -> Result<Link, DispatchError> {
                 let (r_up, w_up) = pipe::new();
                 let (r_down, w_down) = pipe::new();
+                #[allow(clippy::disallowed_methods, reason = "测试：EchoDispatcher 回显泵")]
                 tokio::spawn(async move {
                     let mut r = r_up;
                     let mut w = w_down;
@@ -1272,6 +1277,7 @@ mod tests {
             Arc::new(Mutex::new(Some(Box::new(s_write))));
         let monitor_h = server.spawn_monitor(Arc::clone(&link_writer));
         let frame_server = Arc::clone(&server);
+        #[allow(clippy::disallowed_methods, reason = "测试：帧服务处理泵")]
         tokio::spawn(async move {
             while let Ok(true) = frame_server.process_frame(&mut reader, &link_writer).await {}
             frame_server.close();
@@ -1288,6 +1294,7 @@ mod tests {
         );
         let w = Arc::clone(&client);
         let d = dest.clone();
+        #[allow(clippy::disallowed_methods, reason = "测试：dispatch 任务句柄")]
         let dispatch_task = tokio::spawn(async move {
             w.dispatch(&d, Link { reader: Box::new(req_rd), writer: Box::new(resp_wr) }).await
         });
@@ -1346,6 +1353,7 @@ mod tests {
             let link = Link { reader: Box::new(up_r), writer: Box::new(dn_w) };
             let w = Arc::clone(&worker);
             let d = dest.clone();
+            #[allow(clippy::disallowed_methods, reason = "测试：并发 dispatch 任务")]
             dispatches.push(tokio::spawn(async move { w.dispatch(&d, link).await }));
             up_w.write_multi_buffer(MultiBuffer::from_buffer(Buffer::from_vec(vec![b'x'; 64])))
                 .await

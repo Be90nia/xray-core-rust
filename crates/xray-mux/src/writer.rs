@@ -479,6 +479,7 @@ mod tests {
         for sid in 1..=SESSIONS {
             let shared = Arc::clone(&shared);
             let fill = FILL[(sid - 1) as usize];
+            #[allow(clippy::disallowed_methods, reason = "测试：并发 MuxWriter 压测任务")]
             writers.push(tokio::spawn(async move {
                 let mut mw = MuxWriter::new(
                     sid,

@@ -1,3 +1,5 @@
+// L3 静态闸存量登记（bd a5r4j/lzzja 切片）：本文件 79 处（74 tokio::spawn + 5 Instant）>20 → 按分层规则挂文件级；FxScope/Clock 迁移收口 bd 39hko。
+#![allow(clippy::disallowed_methods, reason = "inbound.rs 存量 79 处（74 tokio::spawn + 5 std Instant），>20 处/文件按分层规则挂文件级，迁移收口见 bd 39hko")]
 //! SOCKS5 inbound listener：接收连接 → SOCKS5 握手 → dispatcher 分发。
 //!
 //! 对应 Go `app/proxyman/inbound/always.go::handle_connection` + `proxy/socks/server.go`。

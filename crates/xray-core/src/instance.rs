@@ -373,7 +373,9 @@ mod tests {
     async fn spawned_task_panic_is_contained_and_visible() {
         install_panic_hook();
         // task panic 只取消该 task（JoinError），进程与其余 task 存活
+        #[allow(clippy::disallowed_methods, reason = "测试：panic 隔离断言任务（panicked）")]
         let panicked = tokio::spawn(async { panic!("boom") });
+        #[allow(clippy::disallowed_methods, reason = "测试：panic 隔离对照任务（healthy）")]
         let healthy = tokio::spawn(async { 42 });
         assert!(panicked.await.is_err(), "panic surfaces as JoinError");
         assert_eq!(healthy.await.unwrap(), 42, "other tasks unaffected");

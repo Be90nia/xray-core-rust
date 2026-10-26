@@ -1,3 +1,5 @@
+// L3 静态闸存量登记（bd a5r4j/lzzja 切片）：本文件 46 处 tokio::spawn（测试拓扑泵族为主，cfg(test) @886 之后）>20 → 按分层规则挂文件级；FxScope 迁移收口 bd 39hko。
+#![allow(clippy::disallowed_methods, reason = "functions.rs 存量 46 处 tokio::spawn，>20 处/文件按分层规则挂文件级，迁移收口见 bd 39hko")]
 //! 外部 API —— Xray 实例构造与启动入口。
 //!
 //! 对应 Go `core/functions.go`。Go 端 `StartInstance(configFormat, configBytes)`

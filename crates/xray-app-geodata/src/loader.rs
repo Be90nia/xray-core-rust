@@ -435,6 +435,9 @@ mod tests {
     }
 
     #[test]
+    // 本测试 fn 内 2 处 Instant::now（墙钟截止轮询，断言不放松）：测试理由归类，
+    // Clock 注入待 bd 39hko。
+    #[allow(clippy::disallowed_methods, reason = "测试：墙钟截止轮询断言，Clock 注入待 bd 39hko")]
     fn load_parallel_balances_borrow_and_return() {
         let dir = fixture_dir("balance", 8, 40, 40);
         let pool = GeodataLoadPool::new(2, 2, 8, Duration::from_secs(10));

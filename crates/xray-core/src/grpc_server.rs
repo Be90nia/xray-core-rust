@@ -55,6 +55,7 @@ where
 ///
 /// 如果地址解析失败，立即返回错误（不 spawn task）。
 #[allow(clippy::type_complexity)] // 返回类型即 spawn 句柄形态
+#[allow(clippy::disallowed_methods, reason = "常驻基础设施任务（metrics gRPC server，句柄返回调用方托管）；迁 FxScope 待 bd 39hko")]
 pub fn spawn_grpc<F>(
     addr: &str,
     register: F,

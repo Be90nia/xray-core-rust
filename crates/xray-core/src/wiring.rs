@@ -473,6 +473,7 @@ impl MuxCarrierHandler {
         access: Option<AccessContext>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
         if is_mux_carrier(dest) {
+            #[allow(clippy::disallowed_methods, reason = "数据面 mux carrier 连接任务（每 carrier）；迁 FxScope 待 bd 39hko")]
             tokio::spawn(crate::inbound::handle_mux_inbound_link(
                 link,
                 Arc::clone(&self.inner),
