@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+> 范围：`feature/framework` 框架支线实质变更（领先 master 695 commit，核对基准 `7b336a12`；发版收敛由 PM 负责）。互通红线不变：全部改动过 32/32 真机互通 + interop 12/12。
+
+### Added
+
+- **框架装配骨架 `crates/xray-frame`**：强约束插件模型五层落地——`Plugin` 必选方法集 + `PluginContract`（`ClauseId` 12 条款）+ `PluginContext` 能力句柄 + 生命周期编排 + 启动期装配门（deps 缺失/成环 fail-visible）；L3 lint 层 = per-crate `clippy.toml` 禁令（现 33 个 crate）
+- **协议插件化**：29 个 crate 接入 `xray-frame`；16 个协议 crate 带 `tests/plugin_contract.rs` 契约测试进 CI（`assert_plugin_contract!` L4 行为夹具）
+- **中央协议臂表化**：`xray-core/src/arm_builders/` BTreeMap 构造表成为唯一构造路径（未命中显式失败；旧巨型 match 删除；unix 变体 4 臂残留待收口）
+- **udf-frame 地基接线（首批）**：25 个 crate 消费 udf——`std_ext::json`（RFC 8259 严格解码 + 64MiB 输入上限 + 行列位置错误）、`logx::ChannelRegistry`（general/access/dns 三通道单入口 + 密钥掩码）、`FxScope` spawn 托管（协议/app 族先行；传输/核心面收口在途）、`skeleton::clock` / `std_ext::scheduler` 时钟调度；CI 经 `.github/actions/fetch-udf` 拉取 udf main 最新 + 上游 CI 状态闸（红项拒绝消费）
+- TUN `IFF_VNET_HDR` 继承 fd 支持（Linux 真机双向流量实测）；xicmp raw socket 真收发（WSL root 取证）；UPnP/NAT-PMP 端口映射（SSDP 兜底 + 真机 IGD 验证）；ws/httpupgrade/splithttp/grpc 四 hub transport 级 Unix 监听 + `spawn_unix_inbound` 生产接线（vless/trojan/vmess/shadowsocks 四协议覆盖）
+
+### Changed
+
+- **CLAUDE.md 升格为项目宪法载体**：三层定位（udf=地基 / udf-frame=骨架 / xray-frame=血肉）+ §3.5 继承派生纪律（禁重复造轮子、方向件留主仓判据）+ §3.5.4 归一化面追踪
+- **accept 面定形**：accept 框架不落 xray-frame（P1-3 裁决作废），统一收口于 `xray-transport::accept_policy`（错误分级 + 退避；网络方向件留主仓）
+- 配置解析收敛：`xray-conf/src/json.rs` 降为 Xray 语义薄壳（实体机制上浮 udf `std_ext::json`，主仓随版受益）；日志分发收敛为 `logx::ChannelRegistry` 单入口（旧 `HANDLERS` 无差别扇出 + tracing 双写删除）
+- 测试面 spawn 纳入 L3 闸：`xray_common::testing::spawn` 单入口，14+ crate `src/**` 测试面裸 spawn 收口（约 159 处）+ 18 个 `tests/*.rs` 60 处迁移
+
 ## [26.10.11] - 2026-10-22
 
 ### Fixed

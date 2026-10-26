@@ -77,7 +77,7 @@ flowchart TB
 | dispatcher | 【现状】DefaultDispatcher + 装饰链（SizeStat/Cached/EndpointOverride）+ splice 准入闸（Go `CanSpliceCopy` 1/2/3 语义）。【规划】装饰链 poll 直通：每层 1 box → 0 分配 |
 | 连接引擎 | 【规划·P2.5（v2）】RelayEngine = DialBridge 泛化：统一 5 处分裂泵；RelayFilter 三回调（poll_decode/poll_encode/on_event）；首迁 vmess inbound |
 | 注册表 | 【规划·P2.0（v3）】FactoryRegistry 显式注册 + config tag 选择：outbound/inbound 中央 match 臂退化为零逻辑注册行，臂内构造逻辑随臂回血肉（BuildCtx 显式化环境依赖） |
-| 统一 accept | 【现状】各 transport 手写循环 + 点状 4s timeout（httpupgrade/websocket 各自手抄）；串行 accept 残留（慢 ClientHello 占 accept 位）；httpupgrade 的 PROXY protocol 读取在超时窗外。【规划】`accept_loop` + `AcceptLimits` + `StreamHandshake` 泛型握手回调（单态化零 box）；QUIC/UDP 另立薄模板，不强统一 |
+| 统一 accept | 【现状】各 transport 手写循环 + 点状 4s timeout（httpupgrade/websocket 各自手抄）；串行 accept 残留（慢 ClientHello 占 accept 位）；httpupgrade 的 PROXY protocol 读取在超时窗外。【规划】`accept_loop` + `AcceptLimits` + `StreamHandshake` 泛型握手回调（单态化零 box）；QUIC/UDP 另立薄模板，不强统一。**【2026-10-23 PM 裁决：本行【规划】部分作废——accept 框架不落 xray-frame（P1-3 作废），见 §1.2 注记】** |
 | 观测 | 【现状】stats 计数 + debug log，薄。【规划】per-stage 原子计数 + 定期 tracing（accept 速率/握手延迟直方图/超时数/active conns）、relay 积压水位；不引 metrics 框架 |
 | 调参面 | 【现状】窗口/超时为硬编码常量（88m0 收窗钉、enc8x h2 窗钉两次战役均需改码→CI→换核，约 4 小时一轮）。【规划】常量进配置：TCP SO_RCVBUF 缺省、h2 STREAM_WINDOW/max_send_buf、hyper send_buf、bridge idle（300s/1s）、握手 timeout |
 
@@ -154,6 +154,7 @@ pub trait Reader: Send {
 - 验收判据：计数分配器证明 hyper `Bytes` → MultiBuffer → relay 全程 0 拷贝；loopback 矩阵 ≥ 基线 154-167MB/s；装饰链 alloc/MB 下降可读数。
 
 **P2 承诺：accept 托管。**
+> **2026-10-23 PM 裁决（P1-3 作废）**：accept 框架（`AcceptLimits`/`StreamHandshake`/`accept_loop`）**不落 xray-frame**（三符号全仓零定义，下方草图仅为历史裁决输入）；accept 面只保留 `xray-transport::accept_policy`（错误分级 + 退避）——网络方向件留主仓（CLAUDE.md §3.5.3）。
 - 现状锚点：`xray-transport-httpupgrade/src/register.rs:100-151`（串行循环逐 conn await）、`:111-114`（PROXY protocol 读取在超时窗外——残留 P0）、`:123-150`（点状 4s）、`:98-100,205-208`（abort_handle 模式=框架生命周期雏形）；`xray-transport-websocket/src/server.rs:119-125`（同型 4s）。
 - 规划草图（oracle §3.2 原样转述）：
 
@@ -224,6 +225,8 @@ pub fn accept_loop<H: StreamHandshake>(listener: TcpListener, hs: H, limits: Acc
 ### 2.1 TL;DR
 
 本节是 §1 义务边界的反面论证：**Rust 容易踩的坑必须由框架吃掉，血肉（协议）作者踩不到**。每收口一条，血肉作者的坑表就短一截；本表同时是 P1/P2 的验收对照（收口判定 = 所有「现状：是」翻成「否」）。
+
+> **2026-10-23 PM 裁决（P1-3 作废）**：accept 框架（`AcceptLimits`/`StreamHandshake`/`accept_loop`）不落 xray-frame——坑 1/2/8 的【规划】机制接口栏随裁决失效（**现状栏仍准**）；accept 面只保留 `xray-transport::accept_policy`（错误分级 + 退避）。
 
 | # | 坑（事故史） | 框架吃掉机制 | 血肉作者还会遇到吗 |
 |---|---|---|---|
@@ -355,6 +358,8 @@ fn decode_frame(src: &mut MultiBuffer) -> Result<Option<Buffer>> { /* split_to �
 
 ### 3.7 Step 5——inbound 接线与 accept
 
+> **2026-10-23 PM 裁决（P1-3 作废）**：accept 框架（`AcceptLimits`/`StreamHandshake`/`accept_loop`）不落 xray-frame；accept 面只保留 `xray-transport::accept_policy`（错误分级 + 退避）。本节【规划 P2】`StreamHandshake` 字样随裁决作废；过渡期 4s 握手超时纪律仍有效。
+
 固定模式（TUIC 样板，架构定型⑥）：
 
 ```text
@@ -456,8 +461,8 @@ InboundHandler::with_dispatch(Arc<dyn DispatchHandler>)   // builder 注入分�
 ### 4.3 详细——commander API 现有端点清单
 
 - **暴露形态**：gRPC（tonic）；listen 为 TCP（`127.0.0.1:port`）或 Unix socket（commander.rs:43-46）；**声明制**——`ApiConfig.services` 列举的服务才暴露（commander.rs:191-194，对齐 Go Commander.Start）。
-- **HandlerService**（proxyman 命令面，grpc.rs:39-47,88-92,244）：inbound 7 op + outbound add/remove/list 共 10 op。三级后端优先级：proxyman 领域 service（ihm/ohm 双 manager）> `OutboundRuntime`（SimpleOhm，bd ze3，仅 outbound 三 op）> stub；未注入 → UNIMPLEMENTED 明示。
-- **StatsService**（grpc.rs:51）、**LoggerService**（RestartLogger，grpc.rs:36-37,364-368）、**RoutingService**（TestRoute 支持 FieldSelectors 投影 / GetBalancerInfo / SubscribeRoutingStats，grpc.rs:15-17）、**ObservatoryService**（grpc.rs:57-59）。
+- **HandlerService**（proxyman 命令面，`xray-app-commander/src/grpc.rs` 的 `HandlerServiceImpl`）：inbound 7 op + outbound add/remove/list 共 10 op。三级后端优先级：proxyman 领域 service（ihm/ohm 双 manager）> `OutboundRuntime`（SimpleOhm，bd ze3，仅 outbound 三 op）> stub；未注入 → UNIMPLEMENTED 明示。
+- **StatsService**（同文件 `StatsServiceImpl`）、**LoggerService**（RestartLogger，`LoggerServiceImpl`）、**RoutingService**（TestRoute 支持 FieldSelectors 投影 / GetBalancerInfo / SubscribeRoutingStats，`RoutingServiceImpl`）、**ObservatoryService**（`ObservatoryServiceImpl`）。
 - **注入点**：`xray-core/src/functions.rs:364-367`（bd ze3/bg7：HandlerService 操作生产 SimpleOhm，LoggerService 接 LogInstance::restart，对齐 Go Commander.Start RequireFeatures）。
 - **变更程序**：proto 变更走 `xray-proto`；对外语义变更过 §6 转正门槛；**平行世界禁令**——proxyman crate 的平行装配不接入皮囊，皮囊只走生产路径。
 - **v3 状态绑定纪律（add-only 名册）**：计数名/端点名/日志字段名 = View 契约（`outbound>>>tag>>>traffic>>>downlink` 已被外部工具消费，default.rs:376 注释在用）——**新增随便，改名/删除永远禁止**（退役标 deprecated 留壳）。演进规则：新观测项=VM 层（stats/log）加聚合与暴露，血肉侧至多加一个 `ctx.counter()`/`ctx.event()` 调用点；**端点定义权只在 VM 层**，血肉不定义 gRPC 面。机械化：CI 枚举全部注册计数名与 gRPC 方法名 diff 快照即红（P0 扩展三件之一，T0.7）。
@@ -470,13 +475,13 @@ InboundHandler::with_dispatch(Arc<dyn DispatchHandler>)   // builder 注入分�
 
 ### 5.1 TL;DR
 
-总纪律：每阶段出口 = CI 九门 + bench 护栏非回归 + 网络面改动走**真实端点同窗配对 A/B**（localhost 测不出窗钉与网络路径回归）。护栏工具链现成：loopback 吞吐矩阵（基线 154–167MB/s）、stress.yml、xray-stress 场景 s5–s12、clippy 宽门镜像。依赖：P0 → P1 → {P2 ∥ P2.0 ∥ P3} → P2.5 → P4；**P2.0（注册表）先于 P2.5（引擎从注册表取工厂，顺序反了必返工）**；P3 的超时项依赖 P2 的 AcceptLimits 落点。
+总纪律：每阶段出口 = CI 十门 + bench 护栏非回归 + 网络面改动走**真实端点同窗配对 A/B**（localhost 测不出窗钉与网络路径回归）。护栏工具链现成：loopback 吞吐矩阵（基线 154–167MB/s）、stress.yml、xray-stress 场景 s5–s12、clippy 宽门镜像。依赖：P0 → P1 → {P2 ∥ P2.0 ∥ P3} → P2.5 → P4；**P2.0（注册表）先于 P2.5（引擎从注册表取工厂，顺序反了必返工）**；~~P3 的超时项依赖 P2 的 AcceptLimits 落点~~（P1-3 已裁决移出，该依赖作废）。
 
 | 阶段 | 交付 | 可证伪出口判据 |
 |---|---|---|
 | P0 护栏先行 | 计数分配器（feature `bench-alloc`）；clippy 禁令清单；loopback + 三协议真实端点基线 | 三份基线数字落档。**没有 P0 数字，后续一切「无回归」都是口头声明** |
 | P1 数据面收口 | `from_bytes_frozen`；io.rs 去 box + 装饰链直通；splithttp 四处 to_vec 关闭、grpc 双拷贝、kcp scratch、vision 收尾 | 三协议 alloc/MB 改善 + 吞吐非回归 + grep 证明热路径 to_vec 清零 |
-| P2 accept 框架 | `accept_loop`/`AcceptLimits`/`StreamHandshake`（PROXY protocol 进超时窗）；ws/httpupgrade/tcp 迁移并删手写循环；per-stage 计数；QUIC/UDP 薄模板；slowloris/慢读/flood conformance 进 CI | `grep -r "listener.accept" crates/` 仅剩框架与 QUIC 模板；三类攻击用例绿 |
+| P2 accept 框架 | **已裁决移出（2026-10-23 PM，P1-3 作废）**：`accept_loop`/`AcceptLimits`/`StreamHandshake` 不落 xray-frame（accept 面只保留 `xray-transport::accept_policy`）；ws/httpupgrade/tcp 迁移与 QUIC/UDP 薄模板随骨架移出；**在途（未开工）**：per-stage 计数、slowloris/慢读/flood conformance | 原 `grep -r "listener.accept" crates/` 出口判据随裁决作废；三类攻击用例判据保留 |
 | P3 调参 + 观测 | 窗口/超时常量进配置；relay 积压水位 + per-tag 错误计数 | 一次真实调参全程不碰 cargo；挂死演练从发现到定位 <5 分钟 |
 | P4 API 转正 | recipe 文档；API stable 标记；Go↔Rust 映射表 + PR porting note 字段 | 下一真实新协议按 recipe 落地：零框架外分配、零手写 accept |
 
@@ -497,16 +502,16 @@ InboundHandler::with_dispatch(Arc<dyn DispatchHandler>)   // builder 注入分�
 - T1.1 `Buffer::from_bytes_frozen` + MultiBuffer 兼容（内部 enum Frozen|Pooled）。验收：hyper Bytes→relay 全程 0 拷贝（计数分配器证明）。
 - T1.2 io.rs trait poll 化 + 具名 future + `BoxedReader` 边界适配。验收：loopback ≥ 基线；UDP 小包 relay bench。
 - T1.3 装饰链直通：SizeStat/Cached/EndpointOverride 改 poll 转发。验收：装饰链 alloc/MB 归零（N box→0，最大单笔收益）。
-- T1.4 splithttp F1/F2/F3/F15 关闭（dialer.rs:92,374 / h3_client.rs:386 / hub/handler.rs:328 / upload_queue.rs:165，Packet payload 统一 `Bytes` 化）。护栏：splithttp 既有 interop + e2e + 真实端点同窗 A/B。
+- T1.4 splithttp F1/F2/F3/F15 关闭（锚点按 crate 限定符号定位：`grep -rn "to_vec" crates/xray-transport-splithttp/src/dialer.rs crates/xray-transport-splithttp/src/h3_client.rs` 与 `hub/handler.rs` Packet payload `Bytes` 化；原 file:line 锚点已因跨文件名冲突——`xray-transport/src/dialer.rs` 与 splithttp 同名文件——及行号漂移弃用）。护栏：splithttp 既有 interop + e2e + 真实端点同窗 A/B。
 - T1.5 grpc F4/F5 关闭（hunk 序列化单次成型 + down 泵借用解码直写消 drain）。护栏：grpc interop 双向 + 多帧粘包单测。
 - T1.6 kcp F6/F7（writer 持久 scratch + poll_read scratch 字段化，对齐 Go output.go:32-35）+ vision 收尾（poll_write_vectored 按既定结论，splice 闸门不动）。护栏：kcp tests `--test-threads=1`；vision 真实端点 A/B（3.3-3.8 → 池化预估 10-15MB/s，实测为准）。
 
-**P2 accept 框架**（5 票，不依赖 P1；T2.2/T2.3/T2.4 依赖 T2.1，T2.5 依赖 T2.2）：
-- T2.1 `accept_loop` + `AcceptLimits` + `StreamHandshake` 骨架（PROXY protocol 进超时窗）。验收：超时/信号量/close-abort 单测。
-- T2.2 ws/httpupgrade/tcp 三 transport 迁移，删除各自手写循环与点状 4s 补丁。验收：`grep -r "listener.accept" crates/` 仅剩框架与 QUIC 模板。
-- T2.3 per-stage 计数 + gauge（accept 速率/握手延迟直方图/超时数/active conns，定期 tracing）。验收：flood 下 inbound 存活，观测数字与测试断言联动。
-- T2.4 QUIC/UDP 薄模板（复用 limits + 观测，含 open_bi 首包语义）。验收：tuic/hysteria 既有 e2e 全绿。
-- T2.5 slowloris/慢读/flood conformance 进 CI。验收：max_pending 占满时新连接排队非拒绝、超时 permit 释放、三类用例绿。
+**P2 accept 框架**（原 5 票；**2026-10-23 PM 裁决：P1-3 作废**——accept 框架（`AcceptLimits`/`StreamHandshake`/`accept_loop`）不落 xray-frame，accept 面只保留 `xray-transport::accept_policy`（错误分级 + 退避），网络方向件留主仓（CLAUDE.md §3.5.3）；三符号全仓零定义核实于 `7b336a12`）：
+- T2.1 **已裁决移出**（P1-3 作废；实际落地形态为 `xray-transport/src/accept_policy.rs`）。
+- T2.2 **随 T2.1 移出**（迁移目标不存在；各 transport 手写循环维持现状 + 4s 握手超时纪律，见 §3.7）。
+- T2.3 **在途（未开工）**：per-stage 计数 + gauge（accept 速率/握手延迟直方图/超时数/active conns，定期 tracing）——不依赖被裁件，仍有效。验收：flood 下 inbound 存活，观测数字与测试断言联动。
+- T2.4 **随 T2.1 移出**（limits 薄模板无依托）。
+- T2.5 **随 T2.1/T2.2 移出**（验收判据引用 max_pending 信号量）。
 
 **P2.0 注册表改造**（【规划·v3】新增槽位；与 P1/P2 并行，**先于 P2.5**）：
 - 每协议一个 PR：`build_protocol_handler`（outbound.rs:650 起）/ inbound 同型的中央 match 臂内构造逻辑**原样搬家**进 `OutboundFactory::build`（BuildCtx 显式化环境依赖：policy/dns/mux_bridges/inbound_default_rules，v3 §3.1 签名），中央文件退化为 wiring.rs 零逻辑注册行（`reg.outbound(FreedomFactory); …`——只有行，没有逻辑）。工厂 trait 双方法：`tag()`（也作 config tag）+ `build(&BuildEntry, &mut BuildCtx)`。
@@ -556,7 +561,7 @@ InboundHandler::with_dispatch(Arc<dyn DispatchHandler>)   // builder 注入分�
 ```text
 # 目标     一句话；引用宪法章节号（如「实现 §3.4 Step 2 注册臂」）
 # 红线     本票不得触碰的锚点（如 §1.1 义务边界、逃生舱、既有豁免清单）
-# 现状锚点 本票涉及的 file:line（派单前 grep 过的）
+# 现状锚点 符号名 + 所属 crate + 可跑定位命令（如 grep -n "fn dispatch_via_chain" crates/xray-app-dispatcher/src/default.rs）；精确 file:line 仅限带 rev 的审计快照——行号随树漂移，已多轮实证
 # 验收     可证伪判据（引用 §5.2 任务号或 §3.9 checklist 项）；含要跑的门（§6.2）
 # 禁止     把【规划】写成已实现；新增 Box::pin/to_vec/手写 accept；跨窗对比数据
 ```

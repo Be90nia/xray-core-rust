@@ -8,7 +8,7 @@
 
 ## 0. 项目一句话
 
-**Xray-core-rust** = Go Xray-core v26.9.9 Rust 复刻，私有仓 `github.com/Be90nia/xray-core-rust`，master `87d72569`，CI 9 绿，32/32 协议全通，7 万行 Rust，20+ crate。
+**Xray-core-rust** = Go Xray-core v26.9.9 Rust 复刻，私有仓 `github.com/Be90nia/xray-core-rust`，master `ceb6a487`（`feature/framework` 领先 695 commit，`7b336a12` 实测），CI 10 门，32/32 协议全通，crates/ 下 804 个 `.rs` ≈ 36.4 万行 Rust，55 个 crate 条目（54 自建 + `udf-frame` 外部仓工作副本）。
 
 ---
 
@@ -18,7 +18,7 @@
 # 1. 构建（btls-sys 冷编坑——见 §6 踩坑；PROTOC/LIBCLANG 缺任一即构建/测试链挂）
 cmd /c "set BORING_BSSL_ASSUME_PATCHED=1&& set BORING_BSSL_SOURCE_PATH=D:\Project\Xray-core-rust\target\boringssl-patched&& set PROTOC=D:/Project/tools/bin/protoc.exe&& set LIBCLANG_PATH=D:\Program Files\llvm\bin&& cargo build --release -p xray-cli"
 
-# 2. 测试（CI 9 宽门镜像）
+# 2. 测试（CI 10 门宽门镜像）
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
@@ -35,7 +35,7 @@ cargo doc --workspace --no-deps
 
 ---
 
-## 2. 当前状态（2026-10-12 立项级审计后）
+## 2. 状态快照（2026-10-12 立项级审计——**历史快照，非当前状态**：其后 `feature/framework` 已累积数百 commit，评分与票面均过期）
 
 | 维度 | 评分 | 报告 |
 |---|---|---|
@@ -46,11 +46,7 @@ cargo doc --workspace --no-deps
 | 9 票架构审视（专项）| 4.3/5 | `D:/tmp/audit-bd-arch-report.md` |
 | **综合** | **3.5/5** | `docs/audit-立项级别-2026-10-12.md` **GO-WITH-CONDITIONS** |
 
-**9 open bd 票**（15 票里 1 根 + 7 独立可做 + 3 框架依赖 + 6 前瞻债）：
-- 根票：`6su8` epic(framework) 五阶段立项
-- 独立可做 5 张：`2ktp` M2 / `fzir` M1 / `75rv` M6 / `sf5b` M7 / `syvm` tls-fork
-- 框架依赖 3 张：`mc11` M3 / `akqh` M4 / `8pne` M5
-- 前瞻债：`9h06` prereq-debt / `w20a` runtime-debt / `0jnp` longterm-debt / 3 张规划项承接
+**当前活跃票面**：以 `bd list --status open` 实时输出为准（上表审计时点的票号 `6su8`/`2ktp`/`fzir`/`75rv`/`sf5b`/`syvm`/`mc11`/`akqh`/`8pne` 均已 CLOSED，快照不写死票号）。
 
 ---
 
@@ -116,15 +112,17 @@ cargo doc --workspace --no-deps
 
 | 面 | 主仓现状 | 归一化目标 | 备注 |
 |---|---|---|---|
-| **JSON 工具壳** | `xray-conf/src/json.rs`：`decode_json_strict`（严格 RFC 8259，Go `platform.UseStrictJSON` 对齐）/`decode_json`（容忍注释）/`decode_json_from_str`/`_from_slice`（按 env 切 strict）+ **64MB 输入上限**（`json.rs:25`）+ 带行列的解析错误 | 提炼到 udf（严格解码 + 输入上限 + 位置错误 = 通用件） | Go 兼容的**序列化**语义（`serial.rs:171 to_json_string` 的 `JSONMarshalWithoutEscape` + 4 空格缩进）属 Xray 特有，**留主仓**；但**解析**必须用 udf 版 |
+| **JSON 工具壳** ✅ 已归一化（P1-9） | 实体机制（RFC 8259 严格解码 / 注释容忍 / 64MiB 输入上限 / 行列位置错误）已上浮 udf `std_ext::json`（`decode`/`decode_str`/`decode_slice` + `JsonMode`）；主仓 `xray-conf/src/json.rs` 只剩 Xray 语义薄壳：4 个 `decode_json*` 按 env 切 strict 后转调 udf | ——（已完成，无剩余动作） | Go 兼容的**序列化**语义（`serial.rs` `to_json_string` 的 `JSONMarshalWithoutEscape` + 4 空格缩进）属 Xray 特有，**留主仓** |
 | **配置 lint 阶段编排** | `xray-conf/src/lint.rs`：`LintStage` trait + 全局注册表 `register_stage`(:95)/`clear_stages`/`registered_stages` + `post_process`(:117，**阶段在锁外执行**，避免回调注册表时死锁) | 提炼到 udf（"端口 + 注册表 + 阶段编排"模式，与 `JournalPort`/`ConfigPort`/`ShutdownCoordinator` 同族） | 阶段内容（Xray 配置语义）留主仓，编排机制上浮 |
-| **日志 Handler 分发 + 双写** | `xray-common/src/log/mod.rs`：`Severity`/`Message`/`Record` + 全局 `HANDLERS: RwLock<Vec<Arc<dyn Handler>>>` + `register_handler`(:80)/`log`(:85 扇出) + `debug/info/warning/error`(:92-114，**tracing 双写**) + `general_logger`（通道缓冲） | 分发机制与埋点规范归 udf `logx` + `log-embed`（唯一入口、target `xray_frame::<域>`、`mask_secrets`）；**双写**收敛为单入口 | Go 级别名（`Severity::as_str`）与 Go 消息语义留主仓（Xray 特有）。⚠️ **udf 侧缺口**：`skeleton_infra::logx` 现为**单 sink**（`init_tracing_default`/`init_tracing_from_env`/`init_with_file` + `FileSink`/`FileSinkWriter`/`mask_secrets`/`DefaultPathResolver`），**无 general/access/dns 多通道扇出**——归一化前须先在 udf 扩展多通道 sink（通道注册/各通道独立 sink 与 level/丢弃计数/路径解析） |
+| **日志 Handler 分发 + 双写** ✅ 已归一化（P1-10-b） | 旧 `HANDLERS` 扇出 + tracing 双写已删；主仓 `xray-common/src/log/mod.rs` 收敛为 udf `logx::ChannelRegistry` 单入口：general/access/dns 三通道，`register_channel` 装配期注册（同通道二次注册 fail-visible），`Channel`/`ChannelSink` re-export，便捷入口 `debug`/`info`/`warning`/`error` 只走 general 通道 | ——（已完成；udf 侧多通道 sink 缺口已由 udf `2f586c1` 补上并被主仓消费，原「单 sink 缺口」警示作废） | Go 级别名（`Severity::as_str`）与 Go 消息语义留主仓 |
 | **配置装配** | `xray-conf`：`confloader.rs:18 load_file`/`serial.rs:185 merge_configs`+`:211 build_config`/`protocols.rs:35`（各协议 settings 结构体集）/`init.rs:34 register_builtin_stages`/`built.rs:86 BuiltConfig` | 分层装载/端口/测试替身归 udf `ConfigFile<C>`/`ConfigPort`/`MockEnv`/`parse_mock` | `BuiltConfig` 中间态 + proto 双向属 Xray 语义，留主仓 |
-| **注册表族**（四套并存） | 生产 outbound 表 = dispatcher `SimpleOhm`（`xray-app-dispatcher/src/default.rs:1953`）；生产 inbound 表 = xray-core `InboundRuntime`（`xray-core/src/inbound.rs:~2960`，slots `RwLock<Vec>`，**O(n) 线性扫**）；`xray-app-proxyman` 的 `InboundManager`/`OutboundManager`/`TcpWorker`/`UdpWorker` **生产零消费**（`lib.rs:13` 自称注册表=文档漂移） | 走 udf `BoundedRegistry`（fail-closed insert/确定序 iter/泄漏断言）或 xray-frame `PluginRegistry` 查表 | ⚠️ **反模式警示**：注册表≠池深借还模型，`borrowed` 恒 0 = **假同构**——**禁把注册表整面 impl `PoolManaged`** |
-| **中央 match 臂** | `xray-core/src/inbound.rs:3898`（16+ 协议臂）+ unix 变体第二份 `:4678`；`xray-core/src/outbound.rs:672`（18 臂） | 迁 xray-frame `PluginRegistry` 查表（5 阶段可回滚：拆文件→旁路表→双写对照差异率 0→切查表→删臂） | wire 语义与协议特化臂 |
-| **任务托管 / 停机编排** | dispatcher `background_tasks` 单把 async Mutex + 收割债（`default.rs:850`/`:857`）；停机三风格并存（`worker.rs:461` vs `:757` vs `inbound.rs:3047`）；`Instance.close` 逆序无超时无报告（`instance.rs:296`） | `FxScope`（spawn 唯一托管口）+ `ShutdownCoordinator`（注册窗/编排窗/超时/panic 隔离/报告） | 组件内容与停机顺序的业务语义 |
+| **注册表族** | 生产 outbound 表 = dispatcher `SimpleOhm`（定位：`grep -n "pub struct SimpleOhm" crates/xray-app-dispatcher/src/default.rs`）；生产 inbound 表 = xray-core `InboundRuntime`（slots `RwLock<Vec>`，**O(n) 线性扫**，定位：`grep -n "pub struct InboundRuntime" crates/xray-core/src/inbound.rs`）；proxyman 只提供 handler 载体与 gRPC 命令编排（`lib.rs` 的 pub use 导出面），**无** `InboundManager`/`OutboundManager` 类型（全仓 grep 0 命中）；`TcpWorker`/`UdpWorker` 存在但生产零消费 | 走 udf `BoundedRegistry`（fail-closed insert/确定序 iter/泄漏断言）或 xray-frame `PluginRegistry` 查表 | ⚠️ **反模式警示**：注册表≠池深借还模型，`borrowed` 恒 0 = **假同构**——**禁把注册表整面 impl `PoolManaged`** |
+| **中央 match 臂** ✅ 已落地（T4.2 phase 4） | 主路径已表化：`xray-core/src/arm_builders/`（BTreeMap + 显式注册，构造表 = 唯一构造路径——inbound 入口 `lookup_inbound_builder`、outbound 入口 `lookup_outbound_builder`；未命中显式失败：inbound warn+skip / outbound `BuildError::Unsupported`；旧 match 与回退 feature 已删） | 残留 = inbound unix 变体 4 臂（定位：`grep -n "match ib.entry.kind.as_str" crates/xray-core/src/inbound.rs`），收口方式 = 复用 `arm_builders::inbound` 构造函数 | **明确不用** `xray-frame::PluginRegistry`（`arm_builders/mod.rs` 「表实现选型」节：`PluginRegistry` 值类型 `Arc<dyn Plugin>` 与裸 fn 表不匹配，34 个 fn 伪造全套 Plugin 语义零增益）；wire 语义与协议特化臂 |
+| **任务托管 / 停机编排** | dispatcher `background_tasks` 单把 async Mutex + 收割债（定位：`grep -n "background_tasks" crates/xray-app-dispatcher/src/default.rs`）；停机多风格并存（各组件自持停机路径，现场为准：`grep -rn "shutdown" crates/xray-core/src/inbound.rs`）；`Instance.close` 逆序无超时无隔离（定位：`grep -n "pub fn close" crates/xray-core/src/instance.rs`） | `FxScope`（spawn 唯一托管口）+ `ShutdownCoordinator`（注册窗/编排窗/超时/panic 隔离/报告） | 组件内容与停机顺序的业务语义 |
 
 > **判定口径**：件内**无 Xray 语义**（Go 兼容语义算 Xray 语义）→ 可提炼；机制与内容分离时**机制上浮、内容留仓**。提炼走 §3.5.3 回路，件头标注 `udf-promotion-candidate`。
+>
+> **锚点纪律（pzjpj）**：本文档只写**符号名 + 所属 crate**；精确行号仅允许出现在**带 rev 的审计快照**里（行号随树漂移，已多轮实证腐烂）。需要定位时跑可复现命令，如 `grep -n "pub struct SimpleOhm" crates/xray-app-dispatcher/src/default.rs`。
 
 ---
 

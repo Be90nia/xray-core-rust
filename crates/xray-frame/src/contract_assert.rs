@@ -34,11 +34,19 @@
 //!
 //! # 条款声明态（B6 审计标注，bd 7dce，2026-10-24）
 //!
-//! 12 条坑约束的「声明 vs 断言」现状三态：**已实现**（有通用行为夹具，接线即
-//! 断言；协议性不适用走 `not_applicable` 逐 crate 登记）、**部分**（断言面只
-//! 覆盖条款子面，或无通用夹具、靠部分 crate 自写测试补位）、**仅声明**（只有
+//! 12 条坑约束的「声明 vs 断言」现状三态：**已实现**（有通用行为夹具；注意
+//! 「已实现」只指通用断言面存在——多数 crate 的夹具跑在框架原语上，不等于
+//! 插件真实接线已验，见下方接线现状。协议性不适用走 `not_applicable` 逐
+//! crate 登记）、**部分**（断言面只覆盖条款子面，或无通用夹具、靠部分
+//! crate 自写测试补位）、**仅声明**（只有
 //! [`ClauseId`](crate::plugin::ClauseId) 枚举位，无任何执行断言面——补夹具
 //! 前，条款声明不得当作「已受约束」）。
+//!
+//! 接线现状（bd 2zi1o，2026-10-26 复核）：16 个协议 crate 的
+//! `tests/plugin_contract.rs` 中仅 vless/ss/trojan 3 crate 各有 1 条真实插件
+//! 实例夹具（含条款 6 的执行面断言），其余 13 crate 仍是框架原语夹具（bd
+//! wkemq「装配链契约测试对 stop 未注册零鉴别力」：空 `ShutdownReport` 的
+//! `is_clean()` 恒 true）。
 //!
 //! | 条款 | 声明态 | 断言面与缺口 |
 //! |---|---|---|
@@ -47,7 +55,7 @@
 //! | 3 ConnIdPresent | 已实现 | [`assert_conn_id_present`](crate::assert_conn_id_present)（非零 / 严格递增） |
 //! | 4 PoolDiscipline | 部分 | [`assert_pool_discipline`](crate::assert_pool_discipline) 管借还配平；N/A 豁免口已启用（先例 blackhole 零缓冲桩）——覆盖依赖 crate 诚实声明 |
 //! | 5 SpawnManaged | 仅声明 | 无协议 crate 通用夹具（框架自测 `tests/fx_managed_spawn.rs` 管托管机制本身，不验插件接线） |
-//! | 6 StopRegistered | 仅声明 | 停机注册归 L5 装配门（P0-8）管辖，L4 无运行期夹具 |
+//! | 6 StopRegistered | 部分 | 通用夹具无运行期断言面；vless/ss/trojan 真实实例夹具有执行面断言（bd 2zi1o），其余 13 crate 无（bd wkemq：is_clean() 对空 ShutdownReport 恒 true） |
 //! | 7 ConfigSectionOnly | 部分 | 无通用夹具；blackhole/vmess 以 crate 自写装配门负向测试补位，覆盖不统一 |
 //! | 8 ErrorClassifiedNoPanicEscape | 仅声明 | 无通用夹具——错误归类与 panic 隔离语义无执行断言面 |
 //! | 9 BoundedResources | 部分 | 仅经 [`assert_pool_discipline`](crate::assert_pool_discipline) 覆盖借还记账面；「资源上有界」本身（容量/内存上限）无通用断言 |
@@ -55,8 +63,9 @@
 //! | 11 SecretMasking | 已实现 | [`assert_log_fields`](crate::assert_log_fields)（secrets 表不可见）；协议性 N/A 先例：freedom 无协议凭据 |
 //! | 12 HotPathFreeze | 仅声明 | review 门 + 装配门（人工/装配期），无运行期夹具——条款文档自述 |
 //!
-//! 已知未接线实例：`xray-proxy-ss` 无 `impl Plugin` 面，豁免清单见该 crate
-//! `tests/plugin_contract.rs` 头注释。
+//! 历史注记（bd 7dce 时点）：当时 `xray-proxy-ss` 尚无 `impl Plugin` 面；现已
+//! 在该 crate `src/plugin.rs` 落地并接真实实例夹具（bd 2zi1o）。crate 内条款
+//! 豁免清单见该 crate `tests/plugin_contract.rs` 头注释。
 
 use std::{
     future::Future,
