@@ -34,6 +34,7 @@ use xray_app_dispatcher::{
     default::{DialBridge, SimpleOhm},
 };
 use xray_conf::{BuiltInbound, BuiltOutbound};
+use xray_frame::PluginContext;
 use xray_proxy_freedom::DomainStrategy;
 
 use crate::outbound::BuildError;
@@ -54,6 +55,9 @@ pub(crate) struct InboundCtx<'a> {
     pub(crate) addr: &'a str,
     pub(crate) settings: &'a xray_transport::dialer::StreamSettings,
     pub(crate) api: Option<&'a crate::inbound::InboundRuntime>,
+    /// L2 能力句柄（nn8os 2b 装配期注入：按协议 kind 经
+    /// [`arm_plugin_ctx`] 构造，handler 收编 spawn/log/audit 面）。
+    pub(crate) plugin_ctx: PluginContext,
 }
 
 /// inbound 构造 future（async fn 匿名 future 无法作 fn 指针值，统一装箱；
@@ -76,6 +80,34 @@ pub(crate) struct OutboundCtx<'a, 'b> {
     pub(crate) proxy_chain_tag: Option<String>,
     pub(crate) target_strategy: Option<DomainStrategy>,
     pub(crate) send_through: Option<&'a xray_transport::system_dialer::SendThroughSpec>,
+    /// L2 能力句柄（nn8os 2b 装配期注入，语义同 [`InboundCtx::plugin_ctx`]）。
+    pub(crate) plugin_ctx: PluginContext,
+}
+
+/// 运行期协议 kind 串 → `'static` 键冻结（进程级 intern 表，一次写缓存）。
+///
+/// `PluginContext`/`LogFacade` 的域参数是 `'static` 契约（框架冻结面，根治 =
+/// 签名改 `Arc<str>`，W1 §6 遗留决策点）；本表把动态 kind 串按**种类**去重
+/// 冻结——上界 = 协议构造表条目数（~17），非实例数。禁喂 per-instance tag。
+pub(crate) fn intern_protocol_kind(kind: &str) -> &'static str {
+    static INTERN: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<String, &'static str>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut table = INTERN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(frozen) = table.get(kind) {
+        return frozen;
+    }
+    // 上界=协议表大小的一次性冻结（同 W1 feature_framework intern 表先例）。
+    let frozen: &'static str = Box::leak(kind.to_string().into_boxed_str());
+    table.insert(kind.to_string(), frozen);
+    frozen
+}
+
+/// 臂构造的 L2 ctx 配方：协议 kind → 独立 [`PluginContext`]（自持 scope +
+/// 系统钟 + 独享审计环；nn8os 2b）。scope 随收编 handler 的 drop 兜底 abort
+/// （blackhole B6 生命周期等价）；未被消费的字段随臂丢弃（OutboundCtx 同语义）。
+pub(crate) fn arm_plugin_ctx(kind: &str) -> PluginContext {
+    PluginContext::for_plugin(intern_protocol_kind(kind))
 }
 
 #[allow(clippy::type_complexity)]

@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use tokio::{net::TcpListener, sync::Mutex};
 use xray_common::net::{address::Address, destination::Destination, port::Port};
 use xray_features::inbound::{InboundError, InboundHandler};
+use xray_frame::PluginContext;
 
 use crate::config::{Config, Network, PredefinedAddress};
 
@@ -34,6 +35,8 @@ pub struct DokodemoServer {
     config: Config,
     /// tokio 监听器。`None` 表示未启动或已关闭。
     listener: Arc<Mutex<Option<TcpListener>>>,
+    /// L2 能力句柄（nn8os 2b：日志只经 ctx——坑约束 10）。
+    ctx: Arc<PluginContext>,
 }
 
 /// 将 [`PredefinedAddress`] 转为 [`Address`]。
@@ -51,8 +54,8 @@ fn predefined_to_address(addr: PredefinedAddress) -> Address {
 impl DokodemoServer {
     /// 构造服务端实例。不立即监听——监听在 [`InboundHandler::start`] 时触发。
     #[must_use]
-    pub fn new(tag: impl Into<String>, config: Config) -> Self {
-        Self { tag: tag.into(), config, listener: Arc::new(Mutex::new(None)) }
+    pub fn new(ctx: Arc<PluginContext>, tag: impl Into<String>, config: Config) -> Self {
+        Self { tag: tag.into(), config, listener: Arc::new(Mutex::new(None)), ctx }
     }
 
     // build_destination 族与 is_network_allowed 属 Go Process 的 dest 构造
@@ -71,12 +74,11 @@ impl DokodemoServer {
         // 启动期 / 首次分发时记 warn 让排障一目了然。
         #[cfg(not(target_os = "linux"))]
         if self.config.follow_redirect {
-            tracing::warn!(
-                target: "xray.dokodemo",
-                tag = %self.tag,
+            self.ctx.log().warn(format!(
                 "follow_redirect is a no-op on this platform (Linux-only SO_ORIGINAL_DST); \
-                 inbound will silently fall back to rewrite_address"
-            );
+                 inbound will silently fall back to rewrite_address tag={}",
+                self.tag
+            ));
         }
 
         if self.config.follow_redirect {
@@ -155,7 +157,7 @@ impl InboundHandler for DokodemoServer {
         let listener =
             TcpListener::bind(addr).await.map_err(|e| InboundError::ListenError(e.to_string()))?;
         *guard = Some(listener);
-        tracing::info!(tag = %self.tag, "dokodemo inbound started");
+        self.ctx.log().info(format!("dokodemo inbound started tag={}", self.tag));
 
         Ok(())
     }
@@ -167,7 +169,7 @@ impl InboundHandler for DokodemoServer {
         }
         // drop listener 即关闭监听
         *guard = None;
-        tracing::info!(tag = %self.tag, "dokodemo inbound closed");
+        self.ctx.log().info(format!("dokodemo inbound closed tag={}", self.tag));
         Ok(())
     }
 
@@ -191,11 +193,19 @@ impl InboundHandler for DokodemoServer {
 #[cfg(test)]
 mod tests {
 
+    use std::sync::Arc;
+
+    use xray_frame::PluginContext;
     use xray_proto::xray::common::net::{
         IpOrDomain as ProtoIpOrDomain, ip_or_domain::Address as ProtoAddress,
     };
 
     use super::*;
+
+    /// 测试用 L2 句柄：for_plugin 配方（自持 scope + 独享审计环）。
+    fn test_ctx() -> Arc<PluginContext> {
+        Arc::new(PluginContext::for_plugin("dokodemo-door"))
+    }
 
     fn make_ipv4_config(ip: [u8; 4], port: u32) -> Config {
         Config {
@@ -208,7 +218,8 @@ mod tests {
 
     #[test]
     fn build_destination_ipv4() {
-        let server = DokodemoServer::new("test", make_ipv4_config([192, 168, 1, 1], 8080));
+        let server =
+            DokodemoServer::new(test_ctx(), "test", make_ipv4_config([192, 168, 1, 1], 8080));
         let dest = server.build_destination(None).expect("dest should exist");
         assert_eq!(dest.port().value(), 8080);
         match dest.address() {
@@ -227,7 +238,7 @@ mod tests {
             allowed_networks: vec![Network::Tcp],
             ..Default::default()
         };
-        let server = DokodemoServer::new("test", cfg);
+        let server = DokodemoServer::new(test_ctx(), "test", cfg);
         let dest = server.build_destination(None).expect("dest should exist");
         assert_eq!(dest.port().value(), 443);
         match dest.address() {
@@ -238,13 +249,14 @@ mod tests {
 
     #[test]
     fn build_destination_none_when_no_address() {
-        let server = DokodemoServer::new("test", Config::default());
+        let server = DokodemoServer::new(test_ctx(), "test", Config::default());
         assert!(server.build_destination(None).is_none());
     }
 
     #[test]
     fn build_destination_none_when_port_overflow() {
         let server = DokodemoServer::new(
+            test_ctx(),
             "test",
             Config {
                 rewrite_address: Some(ProtoIpOrDomain {
@@ -259,26 +271,27 @@ mod tests {
 
     #[test]
     fn network_allowed_checks_config() {
-        let server = DokodemoServer::new("test", make_ipv4_config([1, 2, 3, 4], 80));
+        let server = DokodemoServer::new(test_ctx(), "test", make_ipv4_config([1, 2, 3, 4], 80));
         assert!(server.is_network_allowed(Network::Tcp));
         assert!(!server.is_network_allowed(Network::Udp));
     }
 
     #[test]
     fn tag_returns_constructor_tag() {
-        let server = DokodemoServer::new("my-tag", Config::default());
+        let server = DokodemoServer::new(test_ctx(), "my-tag", Config::default());
         assert_eq!(server.tag(), "my-tag");
     }
 
     #[test]
     fn port_zero_before_start() {
-        let server = DokodemoServer::new("test", Config::default());
+        let server = DokodemoServer::new(test_ctx(), "test", Config::default());
         assert_eq!(server.port(), 0);
     }
 
     #[test]
     fn ipv6_address_handled() {
         let server = DokodemoServer::new(
+            test_ctx(),
             "test",
             Config {
                 rewrite_address: Some(ProtoIpOrDomain {
@@ -304,6 +317,7 @@ mod tests {
     #[test]
     fn follow_redirect_without_fd_falls_back_to_predefined() {
         let server = DokodemoServer::new(
+            test_ctx(),
             "test",
             Config {
                 follow_redirect: true,
@@ -326,6 +340,7 @@ mod tests {
     #[test]
     fn follow_redirect_with_invalid_fd_falls_back_to_predefined() {
         let server = DokodemoServer::new(
+            test_ctx(),
             "test",
             Config {
                 follow_redirect: true,
@@ -347,7 +362,7 @@ mod tests {
 
     #[test]
     fn build_udp_destination_returns_udp_network() {
-        let server = DokodemoServer::new("test", make_ipv4_config([1, 2, 3, 4], 53));
+        let server = DokodemoServer::new(test_ctx(), "test", make_ipv4_config([1, 2, 3, 4], 53));
         let dest = server.build_udp_destination(None).expect("dest should exist");
         assert!(dest.is_udp());
         assert_eq!(dest.port().value(), 53);
@@ -363,7 +378,7 @@ mod tests {
             port_map: [("80".to_string(), "192.168.99.1:9090".to_string())].into_iter().collect(),
             ..Default::default()
         };
-        let server = DokodemoServer::new("test", cfg);
+        let server = DokodemoServer::new(test_ctx(), "test", cfg);
         let dest = server.build_destination_ex(None, Some(80), false).expect("dest should exist");
         assert_eq!(dest.port().value(), 9090);
         match dest.address() {
@@ -382,7 +397,7 @@ mod tests {
             port_map: [("443".to_string(), "192.168.99.1:9090".to_string())].into_iter().collect(),
             ..Default::default()
         };
-        let server = DokodemoServer::new("test", cfg);
+        let server = DokodemoServer::new(test_ctx(), "test", cfg);
         let dest = server.build_destination_ex(None, Some(80), false).expect("dest should exist");
         // port 80 not in port_map → use predefined
         assert_eq!(dest.port().value(), 80);
@@ -398,7 +413,7 @@ mod tests {
             port_map: [("53".to_string(), ":5353".to_string())].into_iter().collect(),
             ..Default::default()
         };
-        let server = DokodemoServer::new("test", cfg);
+        let server = DokodemoServer::new(test_ctx(), "test", cfg);
         let dest = server.build_udp_destination(Some(53)).expect("dest should exist");
         assert!(dest.is_udp());
         assert_eq!(dest.port().value(), 5353);

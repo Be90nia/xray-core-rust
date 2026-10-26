@@ -135,6 +135,7 @@ pub fn contract_test_context_with(
         Arc::new(StdEnv),
         serde_json::json!({}),
         LogFacade::new(plugin_name, vec![]),
+        Arc::new(crate::audit::AuditHandle::new(crate::audit::DEFAULT_AUDIT_RING_CAP)),
     )
 }
 

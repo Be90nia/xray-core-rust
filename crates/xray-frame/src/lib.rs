@@ -20,6 +20,8 @@
 /// 契约层词汇直呼（继承面 A 类：`use skeleton::`——包名 udf-skeleton 的 lib 名）。
 pub use skeleton::EffectId;
 
+// L2 第⑦柄：插件审计事件流（nn8os 2a，底座 udf memgov::BoundedRegistry 有界环）。
+pub mod audit;
 // P0 骨架七件（2026-10-23 派单）：L1 契约（plugin）+ L5 统一错误（error）+
 // L2 能力句柄（context）+ 装配日志唯一入口（logging）+ 插件注册表（registry）+
 // 生命周期三相编排（lifecycle）+ 装配组合根（assembly）。
@@ -48,6 +50,7 @@ pub mod registry;
 pub mod reload;
 
 pub use assembly::{Framework, FrameworkBuilder, FrameworkOptions};
+pub use audit::{AuditHandle, AuditRecord, DEFAULT_AUDIT_RING_CAP};
 pub use config::{PluginConfig, build_plugins_from_config};
 pub use context::{PluginContext, derive_fingerprint};
 pub use deadline::{DEFAULT_LIMIT, HandshakeDeadline, IdleDeadline, with_deadline};

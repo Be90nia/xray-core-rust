@@ -145,6 +145,7 @@ fn ctx_factory() -> impl Fn(&Arc<dyn Plugin>) -> Result<PluginContext, PluginErr
             Arc::new(MockEnv::new()),
             serde_json::json!({}),
             LogFacade::new(plugin.name(), vec![]),
+            Arc::new(xray_frame::AuditHandle::new(xray_frame::DEFAULT_AUDIT_RING_CAP)),
         ))
     }
 }

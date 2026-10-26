@@ -25,11 +25,17 @@ use xray_buf::{
 };
 use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
 use xray_features::inbound::InboundHandler as _;
+use xray_frame::PluginContext;
 use xray_proto::xray::proxy::blackhole::Config;
 use xray_proxy_blackhole::{BlackholeInboundHandler, ResponseConfig, make_blackhole_handler};
 
 fn make_dest() -> Destination {
     Destination::new(Address::Domain("blackhole.test".into()), Port::new(80), Network::TCP)
+}
+
+/// 测试用 L2 句柄：for_plugin 配方（自持 scope + 独享审计环）。
+fn test_ctx() -> Arc<PluginContext> {
+    Arc::new(PluginContext::for_plugin("blackhole"))
 }
 
 #[tokio::test]
@@ -41,7 +47,7 @@ async fn blackhole_dispatch_returns_http_403_then_drains() {
             custom_response_data: Vec::new(),
         }),
     };
-    let blackhole = make_blackhole_handler("bh-out", cfg).expect("handler");
+    let blackhole = make_blackhole_handler(test_ctx(), "bh-out", cfg).expect("handler");
 
     // 2. 装配 dispatcher（blackhole 为 default handler）
     let ohm = Arc::new(SimpleOhm::new());
@@ -74,7 +80,8 @@ async fn blackhole_dispatch_returns_http_403_then_drains() {
 
 #[tokio::test]
 async fn blackhole_inbound_silently_drops_tcp_connection() {
-    let handler = BlackholeInboundHandler::new("bh-in", ResponseConfig::None, "127.0.0.1:0");
+    let handler =
+        BlackholeInboundHandler::new(test_ctx(), "bh-in", ResponseConfig::None, "127.0.0.1:0");
     handler.start().await.expect("start");
 
     let port = handler.port();

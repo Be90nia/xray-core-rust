@@ -29,6 +29,7 @@ use skeleton_infra::{
 };
 
 use crate::{
+    audit::AuditHandle,
     context::{PluginContext, derive_fingerprint},
     error::PluginError,
     lifecycle::{StartedPlugins, bring_up},
@@ -154,6 +155,8 @@ pub struct FrameworkBuilder {
     /// 全局配置值面（段路由底座；P1-7 加法扩展：`with_config` 注入——缺省
     /// 空对象，真实配置文件接入归 P3-2）。
     config_root: serde_json::Value,
+    /// 装配根审计环（nn8os 2a：全插件事件落同一环，`plugin` 字段标注归属）。
+    audit: Arc<AuditHandle>,
 }
 
 impl FrameworkBuilder {
@@ -169,6 +172,7 @@ impl FrameworkBuilder {
             shutdown_timeout,
             ctxs: HashMap::new(),
             config_root: serde_json::json!({}),
+            audit: Arc::new(AuditHandle::new(crate::audit::DEFAULT_AUDIT_RING_CAP)),
         })
     }
 
@@ -204,6 +208,7 @@ impl FrameworkBuilder {
             ctxs,
             fingerprint: _,
             config_root: _,
+            audit: _,
         } = self;
         Ok(Framework {
             registry,
@@ -226,6 +231,7 @@ impl FrameworkBuilder {
             Arc::new(StdEnv),
             self.config_root.clone(),
             LogFacade::new(plugin_name, vec![]),
+            Arc::clone(&self.audit),
         )
     }
 }

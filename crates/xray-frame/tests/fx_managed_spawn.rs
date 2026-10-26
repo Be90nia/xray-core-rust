@@ -27,6 +27,7 @@ fn ctx_with(fx: Arc<FxScope>) -> PluginContext {
         Arc::new(MockEnv::new()),
         json!({}),
         LogFacade::new("stub", vec![]),
+        Arc::new(xray_frame::AuditHandle::new(xray_frame::DEFAULT_AUDIT_RING_CAP)),
     )
 }
 

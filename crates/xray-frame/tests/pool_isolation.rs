@@ -117,6 +117,7 @@ fn unwired_ctx() -> PluginContext {
         Arc::new(MockEnv::new()),
         serde_json::json!({}),
         LogFacade::new("pool-isolation", vec![]),
+        Arc::new(xray_frame::AuditHandle::new(xray_frame::DEFAULT_AUDIT_RING_CAP)),
     )
 }
 

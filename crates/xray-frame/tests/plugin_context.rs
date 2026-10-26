@@ -28,6 +28,7 @@ fn ctx_at(plugin: &'static str, config: serde_json::Value) -> PluginContext {
         Arc::new(MockEnv::new()),
         config,
         LogFacade::new(plugin, vec![]),
+        Arc::new(xray_frame::AuditHandle::new(xray_frame::DEFAULT_AUDIT_RING_CAP)),
     )
 }
 
@@ -50,6 +51,7 @@ async fn spawn_after_close_is_scope_closed() {
         Arc::new(MockEnv::new()),
         json!({}),
         LogFacade::new("stub", vec![]),
+        Arc::new(xray_frame::AuditHandle::new(xray_frame::DEFAULT_AUDIT_RING_CAP)),
     );
     assert!(matches!(
         ctx.spawn(async {}),
@@ -153,6 +155,7 @@ fn load_config_section_overrides_env_and_env_backfills() {
         env,
         config,
         LogFacade::new("freedom", vec![]),
+        Arc::new(xray_frame::AuditHandle::new(xray_frame::DEFAULT_AUDIT_RING_CAP)),
     );
     let (port, level) = ctx.load_config(TwoKeysPort).expect("combined source");
     assert_eq!(port, "10808", "段值压过 env 值");
@@ -186,6 +189,7 @@ fn conn_id_monotonic_under_mock_clock_and_fixed_fingerprint() {
         Arc::new(MockEnv::new()),
         json!({}),
         LogFacade::new("stub", vec![]),
+        Arc::new(xray_frame::AuditHandle::new(xray_frame::DEFAULT_AUDIT_RING_CAP)),
     );
     let first = ctx.next_conn_id();
     clock.advance(Duration::from_millis(1));

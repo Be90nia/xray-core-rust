@@ -92,9 +92,14 @@ impl DokodemoPlugin {
     }
 
     /// 插件产出：入站 handler（`InboundHandler` 实现与行为不变，
-    /// [`DokodemoServer::new`] 即构建接缝——server.rs 零 diff）。
-    pub fn inbound_handler(&self, tag: &str) -> Result<DokodemoServer, PluginError> {
-        Ok(DokodemoServer::new(tag, self.built_config()?.clone()))
+    /// [`DokodemoServer::new`] 即构建接缝——server.rs 零 diff）。能力句柄随 ctx 注入
+    /// （nn8os 2b：日志只经 ctx）。
+    pub fn inbound_handler(
+        &self,
+        ctx: std::sync::Arc<xray_frame::PluginContext>,
+        tag: &str,
+    ) -> Result<DokodemoServer, PluginError> {
+        Ok(DokodemoServer::new(ctx, tag, self.built_config()?.clone()))
     }
 }
 

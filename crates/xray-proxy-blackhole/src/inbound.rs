@@ -14,9 +14,9 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
-use skeleton_infra::fx::FxScope;
 use tokio::net::TcpListener;
 use xray_features::inbound::{InboundError, InboundHandler};
+use xray_frame::PluginContext;
 
 use crate::response::ResponseConfig;
 
@@ -32,15 +32,17 @@ pub struct BlackholeInboundHandler {
     cached_port: AtomicU16,
     /// 是否已启动。
     started: AtomicBool,
-    /// 组件内自持托管 scope（B6，app 家族同款；不接 close，闸关不可达）。
-    /// accept 循环与每连接任务经此托管（坑约束 5）；scope 随 handler drop
-    /// 兜底 abort 在途任务。
-    fx: Arc<FxScope>,
+    /// L2 能力句柄（nn8os 2b：spawn/log 只经 ctx——坑约束 5/10；原自持
+    /// `Arc<FxScope>` 收编进 ctx）。Arc 形态：accept 循环内层 per-conn spawn
+    /// 需在 'static 任务里再取 ctx.spawn。scope 随 handler drop 兜底 abort
+    /// 在途任务（生命周期与原自持面等价）。
+    ctx: Arc<PluginContext>,
 }
 
 impl BlackholeInboundHandler {
     /// 构造 Blackhole 入站处理器。
     pub fn new(
+        ctx: Arc<PluginContext>,
         tag: impl Into<String>,
         response: ResponseConfig,
         listen_addr: impl Into<String>,
@@ -51,7 +53,7 @@ impl BlackholeInboundHandler {
             listen_addr: listen_addr.into(),
             cached_port: AtomicU16::new(0),
             started: AtomicBool::new(false),
-            fx: Arc::new(FxScope::new()),
+            ctx,
         }
     }
 }
@@ -73,57 +75,68 @@ impl InboundHandler for BlackholeInboundHandler {
         self.cached_port.store(port, Ordering::SeqCst);
         let response = self.response.clone();
         let tag = self.tag.clone();
-        // spawn accept 循环（FxScope 托管，坑约束 5）
-        let fx = Arc::clone(&self.fx);
-        // 预制克隆源：避免 async move 块自捕获 fx 与 spawn 接收者借用冲突（E0505）。
-        let fx_conns = Arc::clone(&fx);
-        fx.spawn(async move {
-            loop {
-                let (stream, _peer) = match listener.accept().await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(tag = %tag, error = %e, "blackhole inbound accept failed");
-                        continue;
-                    },
-                };
-                let response = response.clone();
-                let fx = Arc::clone(&fx_conns);
-                fx.spawn(async move {
-                    match &response {
-                        ResponseConfig::None => {
-                            // 静默关闭：直接 drop 连接
-                            drop(stream);
+        // 任务内日志只持克隆门面（spawn 的 future 不得借用 ctx）。
+        let log = self.ctx.log().clone();
+        // spawn accept 循环（ctx.spawn 托管，坑约束 5）。
+        // 预制克隆源：避免 async move 块自捕获 ctx 与 spawn 接收者借用冲突（E0505）。
+        let ctx_conns = Arc::clone(&self.ctx);
+        self.ctx
+            .spawn(async move {
+                loop {
+                    let (stream, _peer) = match listener.accept().await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log.warn(format!(
+                                "blackhole inbound accept failed tag={tag} error={e}"
+                            ));
+                            continue;
                         },
-                        ResponseConfig::Http403 => {
-                            // 写 HTTP 403 后关闭
-                            use tokio::io::AsyncWriteExt;
-                            let mut stream = stream;
-                            if let Err(e) = stream
-                                .write_all(crate::response::HTTP_403_RESPONSE.as_bytes())
-                                .await
-                            {
-                                tracing::debug!(error = %e, "blackhole inbound write 403 failed");
-                            }
-                            let _ = stream.shutdown().await;
-                        },
-                        ResponseConfig::Custom(data) => {
-                            // Go 01a034be：custom 原样回写后关闭
-                            use tokio::io::AsyncWriteExt;
-                            let mut stream = stream;
-                            if !data.is_empty() {
-                                if let Err(e) = stream.write_all(data).await {
-                                    tracing::debug!(error = %e, "blackhole inbound write custom failed");
+                    };
+                    let response = response.clone();
+                    let ctx = Arc::clone(&ctx_conns);
+                    // future 专持克隆：async move 捕获的绑定不得与 spawn
+                    // 接收者同源（E0505：&self 借用期间不可 move out）。
+                    let fut_ctx = Arc::clone(&ctx);
+                    ctx.spawn(async move {
+                        match &response {
+                            ResponseConfig::None => {
+                                // 静默关闭：直接 drop 连接
+                                drop(stream);
+                            },
+                            ResponseConfig::Http403 => {
+                                // 写 HTTP 403 后关闭
+                                use tokio::io::AsyncWriteExt;
+                                let mut stream = stream;
+                                if let Err(e) = stream
+                                    .write_all(crate::response::HTTP_403_RESPONSE.as_bytes())
+                                    .await
+                                {
+                                    fut_ctx.log().debug(format!(
+                                        "blackhole inbound write 403 failed error={e}"
+                                    ));
                                 }
-                            }
-                            let _ = stream.shutdown().await;
-                        },
-                    }
-                })
-                .expect("internal FxScope is never closed");
-            }
-        })
-        .expect("internal FxScope is never closed");
-        tracing::info!(tag = %self.tag, port = port, "blackhole inbound started");
+                                let _ = stream.shutdown().await;
+                            },
+                            ResponseConfig::Custom(data) => {
+                                // Go 01a034be：custom 原样回写后关闭
+                                use tokio::io::AsyncWriteExt;
+                                let mut stream = stream;
+                                if !data.is_empty() {
+                                    if let Err(e) = stream.write_all(data).await {
+                                        fut_ctx.log().debug(format!(
+                                            "blackhole inbound write custom failed error={e}"
+                                        ));
+                                    }
+                                }
+                                let _ = stream.shutdown().await;
+                            },
+                        }
+                    })
+                    .expect("plugin ctx FxScope is never closed (assembly-owned)");
+                }
+            })
+            .expect("plugin ctx FxScope is never closed (assembly-owned)");
+        self.ctx.log().info(format!("blackhole inbound started tag={} port={port}", self.tag));
         Ok(())
     }
 
@@ -134,7 +147,7 @@ impl InboundHandler for BlackholeInboundHandler {
         // ponytail: accept 循环在独立 task 中运行，close 只设标志位。
         // 真正的优雅关闭需要 CancellationToken，当前设 port=0 即可。
         self.cached_port.store(0, Ordering::SeqCst);
-        tracing::info!(tag = %self.tag, "blackhole inbound closed");
+        self.ctx.log().info(format!("blackhole inbound closed tag={}", self.tag));
         Ok(())
     }
 
@@ -145,13 +158,26 @@ impl InboundHandler for BlackholeInboundHandler {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use tokio::{io::AsyncReadExt, net::TcpStream};
+    use xray_frame::PluginContext;
 
     use super::*;
 
+    /// 测试用 L2 句柄：for_plugin 配方（自持 scope + 独享审计环）。
+    fn test_ctx() -> Arc<PluginContext> {
+        Arc::new(PluginContext::for_plugin("blackhole"))
+    }
+
     #[tokio::test]
     async fn blackhole_inbound_none_response_drops_immediately() {
-        let handler = BlackholeInboundHandler::new("bh-test", ResponseConfig::None, "127.0.0.1:0");
+        let handler = BlackholeInboundHandler::new(
+            test_ctx(),
+            "bh-test",
+            ResponseConfig::None,
+            "127.0.0.1:0",
+        );
         handler.start().await.unwrap();
         let port = handler.port();
         assert!(port > 0);
@@ -170,8 +196,12 @@ mod tests {
 
     #[tokio::test]
     async fn blackhole_inbound_http403_writes_response() {
-        let handler =
-            BlackholeInboundHandler::new("bh-http", ResponseConfig::Http403, "127.0.0.1:0");
+        let handler = BlackholeInboundHandler::new(
+            test_ctx(),
+            "bh-http",
+            ResponseConfig::Http403,
+            "127.0.0.1:0",
+        );
         handler.start().await.unwrap();
         let port = handler.port();
 
@@ -190,13 +220,15 @@ mod tests {
 
     #[test]
     fn port_zero_before_start() {
-        let handler = BlackholeInboundHandler::new("bh", ResponseConfig::None, "127.0.0.1:0");
+        let handler =
+            BlackholeInboundHandler::new(test_ctx(), "bh", ResponseConfig::None, "127.0.0.1:0");
         assert_eq!(handler.port(), 0);
     }
 
     #[tokio::test]
     async fn double_start_returns_error() {
-        let handler = BlackholeInboundHandler::new("bh-dbl", ResponseConfig::None, "127.0.0.1:0");
+        let handler =
+            BlackholeInboundHandler::new(test_ctx(), "bh-dbl", ResponseConfig::None, "127.0.0.1:0");
         handler.start().await.unwrap();
         let result = handler.start().await;
         assert!(result.is_err());

@@ -11,7 +11,8 @@
 //! - **relay（UDP）**：connect 到 BND.ADDR/PORT（`0.0.0.0`/`::` 回落 server 地址， RFC 1928 §7；BND
 //!   为域名时本地解析一次），之后 send/recv 免带地址； connect 语义同时过滤非 relay 来源的数据报。
 //! - [`relay`]：与 freedom `relay_policy` 同形态的双向泵入口 （XUDP 帧流 ↔ SOCKS5 UDP
-//!   数据报），供波 3 接线 xray-core 的 socks outbound UDP 分支选用；本轮仅库层，不接线。
+//!   数据报），xray-core 的 socks outbound UDP 分支已接线（`SocksUdpDispatch`， 响应泵经
+//!   `ctx.spawn` 托管）。
 
 use std::{
     io,
@@ -31,6 +32,7 @@ use xray_buf::{
     multi::MultiBuffer,
 };
 use xray_common::net::{address::Address, destination::Destination, port::Port};
+use xray_frame::PluginContext;
 use xray_transport::link::Link;
 use xray_xudp::packet::{PacketError, PacketReader, PacketWriter};
 
@@ -209,6 +211,13 @@ async fn resolve_first(server_addr: &str) -> Result<IpAddr> {
 /// `FRAG != 0` → 丢弃 + 计数（Go 同样不支持分片）；畸形帧 → 丢弃；
 /// 合法帧 → `Some((source, payload))`。两种丢弃都打 debug 日志，
 /// 不让帧静默消失（分片属预期协议行为，畸形帧值得排查）。
+// nn8os 2b 残余豁免（L3 台账）：逐报文数据面热路径，ctx.log 的 mask_secrets +
+// 手工 callsite 开销不入热路径（坑约束⑫数据面零改动优先）；迁移随 P3 热路径
+// 专项（若该面有按域治理诉求再议）。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "数据面逐报文热路径：tracing! 开销考量见上，ctx.log 迁移归 P3 热路径专项"
+)]
 fn parse_relay_frame<'a>(buf: &'a [u8], frag_dropped: &AtomicU64) -> Option<(SocksAddr, &'a [u8])> {
     if buf.len() < 5 {
         tracing::debug!(len = buf.len(), "socks udp: dropped undersized datagram");
@@ -246,8 +255,10 @@ fn socks_to_destination(addr: SocksAddr) -> Destination {
 /// - **ctrl 断开** → 中止响应泵、关闭 relay 与会话；请求方向结束（link EOF）→ shutdown
 ///   ctrl（服务端收割会话）。
 ///
-/// 供波 3 `xray-core` socks outbound UDP 分支接线（本轮仅库层，不接线）。
+/// 异步托管走 `ctx.spawn`（坑约束 5 唯一口；nn8os 2b 迁移，原裸 spawn 存量债
+/// 已清）。由 xray-core socks outbound UDP 分支接线（`SocksUdpDispatch`）。
 pub async fn relay(
+    ctx: &PluginContext,
     client: SocksUdpClient,
     default_dest: &Destination,
     link: Link,
@@ -258,12 +269,10 @@ pub async fn relay(
     let global_id: [u8; GLOBAL_ID_LEN] = rand::random();
 
     // 响应泵：relay recv → XUDP 帧 → link.writer（FRAG 计数器随任务走）
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-    )]
-    let resp_task =
-        tokio::spawn(pump_response(Arc::clone(&relay), global_id, frag_dropped, writer));
+    // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
+    let resp_task = ctx
+        .spawn(pump_response(Arc::clone(&relay), global_id, frag_dropped, writer))
+        .expect("plugin ctx FxScope is never closed (assembly-owned)");
 
     // 请求泵与 ctrl 监视并发：任一方向结束即终结会话
     let req = pump_request(&relay, default_dest.clone(), &mut reader);

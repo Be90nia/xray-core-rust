@@ -3930,6 +3930,7 @@ pub(crate) async fn spawn_one_inbound(
             addr: &addr,
             settings: &settings,
             api,
+            plugin_ctx: crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str()),
         })
         .await;
     }

@@ -122,7 +122,9 @@ async fn http403_bytes_frozen_through_plugin_chain() {
     assert_eq!(plugin.built_response().expect("built"), &ResponseConfig::Http403);
 
     // ② 插件工厂产出 outbound handler，dispatch 全链写出。
-    let handler = plugin.dispatch_handler("bh-out").expect("dispatch handler");
+    let handler = plugin
+        .dispatch_handler(Arc::new(xray_frame::PluginContext::for_plugin("blackhole")), "bh-out")
+        .expect("dispatch handler");
     assert_eq!(handler.response(), ResponseConfig::Http403);
 
     let captured = Arc::new(Mutex::new(Vec::new()));
@@ -151,7 +153,13 @@ async fn inbound_handler_produced_by_plugin() {
         .build()
         .expect("build");
 
-    let inbound = plugin.inbound_handler("bh-in", "127.0.0.1:0").expect("inbound handler");
+    let inbound = plugin
+        .inbound_handler(
+            Arc::new(xray_frame::PluginContext::for_plugin("blackhole")),
+            "bh-in",
+            "127.0.0.1:0",
+        )
+        .expect("inbound handler");
     assert_eq!(inbound.tag(), "bh-in");
 
     framework.shutdown().await;

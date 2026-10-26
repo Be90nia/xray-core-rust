@@ -109,6 +109,9 @@ pub fn build_plugins_from_config(
                 Arc::new(StdEnv),
                 config_root.clone(),
                 LogFacade::new(plugin.name(), vec![]),
+                // 配置驱动 build 无装配根共享面 → 本次调用共享一份环
+                //（nn8os 2a：同一装配动作的事件落同一审计流）。
+                Arc::new(crate::audit::AuditHandle::new(crate::audit::DEFAULT_AUDIT_RING_CAP)),
             );
             guarded_build(plugin, &mut ctx)?;
             built.push(plugin.name());

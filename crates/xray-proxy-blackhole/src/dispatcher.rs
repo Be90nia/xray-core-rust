@@ -17,6 +17,7 @@ use std::{sync::Arc, time::Duration};
 
 use xray_app_dispatcher::default::{DispatchHandler, PinFuture};
 use xray_common::net::{destination::Destination, network::Network};
+use xray_frame::PluginContext;
 use xray_proto::xray::proxy::blackhole::Config;
 use xray_transport::link::Link;
 
@@ -44,20 +45,31 @@ const TCP_DRAIN_MAX: Duration = Duration::from_secs(300);
 pub struct BlackholeHandler {
     tag: String,
     response: ResponseConfig,
+    /// L2 能力句柄（nn8os 2b：日志只经 ctx——坑约束 10）。Arc 形态随 dispatch
+    /// future 'static 移交（仅克隆日志门面入 future）。
+    ctx: Arc<PluginContext>,
 }
 
 impl BlackholeHandler {
     /// 从 protobuf [`Config`] 构造。
     ///
-    /// 对应 Go `New(ctx, config)`——`ctx` 未使用故省略。
-    pub fn new(tag: impl Into<String>, config: Config) -> Result<Self, BlackholeError> {
-        Ok(Self { tag: tag.into(), response: get_internal_response(&config)? })
+    /// 对应 Go `New(ctx, config)`。
+    pub fn new(
+        ctx: Arc<PluginContext>,
+        tag: impl Into<String>,
+        config: Config,
+    ) -> Result<Self, BlackholeError> {
+        Ok(Self { tag: tag.into(), response: get_internal_response(&config)?, ctx })
     }
 
     /// 用显式 [`ResponseConfig`] 构造（测试 / 上层 adapter 复用）。
     #[must_use]
-    pub fn with_response(tag: impl Into<String>, response: ResponseConfig) -> Self {
-        Self { tag: tag.into(), response }
+    pub fn with_response(
+        ctx: Arc<PluginContext>,
+        tag: impl Into<String>,
+        response: ResponseConfig,
+    ) -> Self {
+        Self { tag: tag.into(), response, ctx }
     }
 
     /// 暴露响应配置（测试用）。
@@ -86,6 +98,8 @@ impl DispatchHandler for BlackholeHandler {
         // 5 分钟上限远超正常 EOF 时间；客户端主动断 / EOF 仍立即返回。
         let drain_timeout = if dest.network() == Network::UDP { UDP_DRAIN } else { TCP_DRAIN_MAX };
         let tag = self.tag.clone();
+        // 任务内日志只持克隆门面（spawn/dispatch 的 future 不得借用 ctx）。
+        let log = self.ctx.log().clone();
         Box::pin(async move {
             let mut writer = link.writer;
             let mut reader = link.reader;
@@ -93,7 +107,7 @@ impl DispatchHandler for BlackholeHandler {
             // 1. 写预置响应（若有）
             if !response.is_empty() {
                 if let Err(e) = response.write_to(&mut writer).await {
-                    tracing::warn!(tag = %tag, "blackhole write response: {e}");
+                    log.warn(format!("blackhole write response tag={tag} error={e}"));
                 }
                 // ponytail: Go sleep 1s 让客户端把响应读走，再开始 drain
                 tokio::time::sleep(RESPONSE_SETTLE).await;
@@ -119,10 +133,11 @@ impl DispatchHandler for BlackholeHandler {
 ///
 /// [`DispatchHandler`]: xray_app_dispatcher::default::DispatchHandler
 pub fn make_blackhole_handler(
+    ctx: Arc<PluginContext>,
     tag: impl Into<String>,
     config: Config,
 ) -> Result<Arc<dyn DispatchHandler>, BlackholeError> {
-    Ok(Arc::new(BlackholeHandler::new(tag, config)?))
+    Ok(Arc::new(BlackholeHandler::new(ctx, tag, config)?))
 }
 
 #[cfg(test)]
@@ -139,6 +154,11 @@ mod tests {
     use xray_common::net::{address::Address, port::Port};
 
     use super::*;
+
+    /// 测试用 L2 句柄：for_plugin 配方（自持 scope + 独享审计环）。
+    fn test_ctx() -> Arc<PluginContext> {
+        Arc::new(PluginContext::for_plugin("blackhole"))
+    }
 
     /// 立即返回错误的 reader（模拟 EOF / 已关闭）。
     struct EofReader;
@@ -169,10 +189,12 @@ mod tests {
         Destination::new(Address::new_domain("example.com"), Port::new(443), Network::TCP)
     }
 
+    // nn8os 2b 残余豁免：测试耗时断言用 std 即时读数（墙钟差），非插件能力面。
+    #[allow(clippy::disallowed_methods, reason = "测试耗时断言配套，非生产时钟取用")]
     #[tokio::test]
     async fn none_response_with_eof_reader_returns_fast() {
         // None response → 不写、不 sleep；EOF reader → drain 立即 break
-        let handler = BlackholeHandler::with_response("bh", ResponseConfig::None);
+        let handler = BlackholeHandler::with_response(test_ctx(), "bh", ResponseConfig::None);
         let link =
             Link::new(Box::new(EofReader), Box::new(CountingWriter(Arc::new(AtomicUsize::new(0)))));
         let start = Instant::now();
@@ -184,10 +206,12 @@ mod tests {
         );
     }
 
+    // nn8os 2b 残余豁免：测试耗时断言用 std 即时读数（墙钟差），非插件能力面。
+    #[allow(clippy::disallowed_methods, reason = "测试耗时断言配套，非生产时钟取用")]
     #[tokio::test]
     async fn http_response_writes_403_and_settles_before_drain() {
         use crate::response::HTTP_403_RESPONSE;
-        let handler = BlackholeHandler::with_response("bh", ResponseConfig::Http403);
+        let handler = BlackholeHandler::with_response(test_ctx(), "bh", ResponseConfig::Http403);
         let counter = Arc::new(AtomicUsize::new(0));
         let link = Link::new(Box::new(EofReader), Box::new(CountingWriter(counter.clone())));
         let start = Instant::now();
@@ -204,10 +228,12 @@ mod tests {
         );
     }
 
+    // nn8os 2b 残余豁免：测试耗时断言用 std 即时读数（墙钟差），非插件能力面。
+    #[allow(clippy::disallowed_methods, reason = "测试耗时断言配套，非生产时钟取用")]
     #[tokio::test]
     async fn udp_dest_eof_reader_still_returns_fast() {
         // UDP dest 用 60s 超时——但 EOF reader 立即 break，不等超时
-        let handler = BlackholeHandler::with_response("bh", ResponseConfig::None);
+        let handler = BlackholeHandler::with_response(test_ctx(), "bh", ResponseConfig::None);
         let dest =
             Destination::new(Address::new_domain("example.com"), Port::new(443), Network::UDP);
         let link =
@@ -223,7 +249,7 @@ mod tests {
     #[test]
     fn new_from_config_accepts_none_response() {
         let config = Config { response: None };
-        let h = BlackholeHandler::new("bh", config).unwrap();
+        let h = BlackholeHandler::new(test_ctx(), "bh", config).unwrap();
         assert_eq!(h.tag(), "bh");
         assert_eq!(h.response(), ResponseConfig::None);
     }
@@ -232,7 +258,7 @@ mod tests {
     fn new_from_config_accepts_empty_type() {
         let config =
             Config { response: Some(crate::response::proto_response(String::new(), Vec::new())) };
-        let h = BlackholeHandler::new("bh", config).unwrap();
+        let h = BlackholeHandler::new(test_ctx(), "bh", config).unwrap();
         assert_eq!(h.response(), ResponseConfig::None);
     }
 
@@ -240,7 +266,7 @@ mod tests {
     fn new_from_config_accepts_http_response_type() {
         let config =
             Config { response: Some(crate::response::proto_response("http".into(), Vec::new())) };
-        let h = BlackholeHandler::new("bh", config).unwrap();
+        let h = BlackholeHandler::new(test_ctx(), "bh", config).unwrap();
         assert_eq!(h.response(), ResponseConfig::Http403);
     }
 
@@ -248,20 +274,20 @@ mod tests {
     fn new_rejects_unknown_response_type() {
         let config =
             Config { response: Some(crate::response::proto_response("bogus".into(), Vec::new())) };
-        let r = BlackholeHandler::new("bh", config);
+        let r = BlackholeHandler::new(test_ctx(), "bh", config);
         assert!(matches!(r, Err(BlackholeError::UnknownResponseType(_))));
     }
 
     #[test]
     fn make_handler_returns_arc_dyn() {
         let config = Config { response: None };
-        let h = make_blackhole_handler("test", config).unwrap();
+        let h = make_blackhole_handler(test_ctx(), "test", config).unwrap();
         assert_eq!(h.tag(), "test");
     }
 
     #[test]
     fn debug_includes_tag_and_response() {
-        let h = BlackholeHandler::with_response("bh", ResponseConfig::Http403);
+        let h = BlackholeHandler::with_response(test_ctx(), "bh", ResponseConfig::Http403);
         let s = format!("{h:?}");
         assert!(s.contains("bh"));
         assert!(s.contains("Http403"));

@@ -150,7 +150,12 @@ async fn inbound_handler_produced_by_plugin() {
         .build()
         .expect("build");
 
-    let inbound = plugin.inbound_handler("dkd-in").expect("inbound handler");
+    let inbound = plugin
+        .inbound_handler(
+            std::sync::Arc::new(xray_frame::PluginContext::for_plugin("dokodemo-door")),
+            "dkd-in",
+        )
+        .expect("inbound handler");
     assert_eq!(inbound.tag(), "dkd-in");
 }
 

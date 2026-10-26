@@ -689,6 +689,7 @@ pub(crate) fn build_protocol_handler(
             proxy_chain_tag,
             target_strategy,
             send_through: send_through.as_ref(),
+            plugin_ctx: crate::arm_builders::arm_plugin_ctx(ob.entry.kind.as_str()),
         });
     }
     Err(BuildError::Unsupported(ob.entry.kind.clone()))
@@ -2752,6 +2753,8 @@ pub(crate) struct SocksUdpDispatch {
     pub(crate) tcp: Arc<DialBridge>,
     /// UDP ASSOCIATE 用配置（server 地址 + 可选认证；与 TCP dial 同源）。
     pub(crate) udp_cfg: xray_proxy_socks::ClientConfig,
+    /// L2 能力句柄（nn8os 2b：UDP 会话响应泵经 `ctx.spawn` 托管——坑约束 5）。
+    pub(crate) ctx: Arc<xray_frame::PluginContext>,
 }
 
 impl std::fmt::Debug for SocksUdpDispatch {
@@ -2768,11 +2771,14 @@ impl DispatchHandler for SocksUdpDispatch {
         if dest.network() == xray_common::net::network::Network::UDP {
             let cfg = self.udp_cfg.clone();
             let tag = self.tag.clone();
+            let ctx = Arc::clone(&self.ctx);
             let dest = dest.clone();
             Box::pin(async move {
                 match xray_proxy_socks::SocksUdpClient::associate(&cfg).await {
                     Ok(client) => {
-                        if let Err(e) = xray_proxy_socks::udp::relay(client, &dest, link).await {
+                        if let Err(e) =
+                            xray_proxy_socks::udp::relay(&ctx, client, &dest, link).await
+                        {
                             tracing::warn!(tag = %tag, "socks udp relay ended: {e}");
                         }
                     },

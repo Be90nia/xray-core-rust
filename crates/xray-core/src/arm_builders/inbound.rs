@@ -642,9 +642,10 @@ pub(crate) async fn build_blackhole_inbound(
     ib: &BuiltInbound,
     shutdown_token: CancellationToken,
     addr: &str,
+    plugin_ctx: Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let response = parse_blackhole_inbound_response(&ib.entry.data);
-    let handler = BlackholeInboundHandler::new(&ib.tag, response, addr);
+    let handler = BlackholeInboundHandler::new(plugin_ctx, &ib.tag, response, addr);
     handler.start().await.map_err(|e| std::io::Error::other(format!("blackhole inbound: {e}")))?;
     // accept 循环在 start() 内部 spawn，此 task 保持 handler 存活并监听 shutdown。
     Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
@@ -942,7 +943,12 @@ pub(crate) fn loopback_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
 }
 
 pub(crate) fn blackhole_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
-    Box::pin(build_blackhole_inbound(ctx.ib, ctx.shutdown_token, ctx.addr))
+    Box::pin(build_blackhole_inbound(
+        ctx.ib,
+        ctx.shutdown_token,
+        ctx.addr,
+        Arc::new(ctx.plugin_ctx),
+    ))
 }
 
 pub(crate) fn freedom_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {

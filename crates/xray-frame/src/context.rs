@@ -15,13 +15,13 @@ use std::{
 };
 
 use skeleton::{
-    clock::Clock,
-    config::{ConfigError, ConfigPort, EnvError, EnvSource},
+    clock::{Clock, SystemClock},
+    config::{ConfigError, ConfigPort, EnvError, EnvSource, StdEnv},
 };
 use skeleton_infra::fx::{CancelToken, FxScope, ScopeClosed, Spawned};
 use std_ext::{hash::stable64, id::IdGen};
 
-use crate::{error::PluginError, logging::LogFacade, pool::BufferPool};
+use crate::{audit::AuditHandle, error::PluginError, logging::LogFacade, pool::BufferPool};
 
 /// 进程指纹派生（PM 拍板 2026-10-23）：有主监听地址 → `stable64(地址串)`；
 /// 无地址 → `stable64(pid-启动时刻纳秒)`。指纹需进程内唯一且可复现
@@ -109,6 +109,10 @@ pub struct PluginContext {
     /// 缓冲池能力句柄（P1-1 Context 扩容件）：装配根经 `set_pool` 接线；
     /// 缺省未接线 → `pool()` fail-visible panic（装配门 L5 语义）。
     pool: Option<Arc<dyn BufferPool>>,
+    /// 审计事件流句柄（L2 第⑦柄，`ctx.audit()`）：底座 = udf `memgov::
+    /// BoundedRegistry` 有界环（`EvictOldest` + 溢出显式计数）。装配根建一份
+    /// 共享，全插件事件落同一环（`plugin` 字段标注归属）。
+    audit: Arc<AuditHandle>,
     /// 擦除登记表（原型 xray-core/src/instance.rs:60 feature_typed）。
     handlers: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
 }
@@ -124,6 +128,7 @@ impl PluginContext {
         env: Arc<dyn EnvSource>,
         config_root: serde_json::Value,
         log: LogFacade,
+        audit: Arc<AuditHandle>,
     ) -> Self {
         Self {
             plugin_name,
@@ -134,8 +139,30 @@ impl PluginContext {
             config_root,
             log,
             pool: None,
+            audit,
             handlers: HashMap::new(),
         }
+    }
+
+    /// 独立装配配方（臂构造/单测用）：自持 scope + 系统钟 + pid-启动时刻指纹
+    /// + `StdEnv` + 空配置根 + 插件域日志门面 + 独享审计环。
+    ///
+    /// 与装配根 [`crate::assembly::FrameworkBuilder`] 的差异：不共享 scope/指纹/
+    /// 审计环（scope close 权随 ctx 所有方——臂构造的 handler 持 ctx，scope 随
+    /// handler drop 兜底 abort，blackhole B6 自持面同款生命周期）。
+    /// `plugin_name` 必须传协议 kind 常量（`'static`）；运行期 kind 串由调用方
+    /// 走 intern 表冻结（上界 = 协议表大小），禁传 per-instance tag。
+    pub fn for_plugin(plugin_name: &'static str) -> Self {
+        Self::new(
+            plugin_name,
+            Arc::new(FxScope::new()),
+            Arc::new(SystemClock),
+            derive_fingerprint(None),
+            Arc::new(StdEnv),
+            serde_json::json!({}),
+            LogFacade::new(plugin_name, vec![]),
+            Arc::new(AuditHandle::new(crate::audit::DEFAULT_AUDIT_RING_CAP)),
+        )
     }
 
     // ── 异步托管（能力①）——唯一合法 spawn 口，透传 FxScope 契约 ──
@@ -178,6 +205,13 @@ impl PluginContext {
     // ── 日志（能力⑤；P0-7 实体）──
     pub fn log(&self) -> &LogFacade {
         &self.log
+    }
+
+    // ── 审计（L2 第⑦柄；模型 §4：禁裸 tracing 事件）──
+    /// 审计事件流句柄：发射 [`AuditHandle::record`]（装配根共享环，`plugin`
+    /// 字段标注归属）；消费面（取证/对账）走 [`AuditHandle::take_events`]。
+    pub fn audit(&self) -> &Arc<AuditHandle> {
+        &self.audit
     }
 
     // ── 配置（能力⑥；坑约束 7 per-plugin 段路由）──
@@ -288,7 +322,10 @@ impl PluginContext {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use skeleton::{clock::SystemClock, config::MockEnv};
+    use skeleton::{
+        clock::{MockClock, SystemClock},
+        config::MockEnv,
+    };
 
     use super::*;
 
@@ -304,6 +341,7 @@ mod tests {
             Arc::new(MockEnv::new()),
             config,
             LogFacade::new(plugin, vec![]),
+            Arc::new(AuditHandle::new(crate::audit::DEFAULT_AUDIT_RING_CAP)),
         )
     }
 
@@ -361,6 +399,7 @@ mod tests {
             Arc::new(env),
             json!({ "inbounds": [{ "protocol": plugin, "settings": settings }] }),
             LogFacade::new(plugin, vec![]),
+            Arc::new(AuditHandle::new(crate::audit::DEFAULT_AUDIT_RING_CAP)),
         )
     }
 
@@ -404,5 +443,44 @@ mod tests {
             Some("7777"),
             "vmess-in + web.port → XRAY_PLUGIN_VMESS_IN_WEB_PORT"
         );
+    }
+
+    /// L2 注入面（nn8os 2a 验收③）：假钟 / 假审计环可注入且经句柄可达——
+    /// 插件侧 `ctx.clock()` / `ctx.audit()` 拿到的就是装配方注入的那份。
+    #[test]
+    fn injected_mock_clock_and_audit_are_visible_via_handles() {
+        let clock = Arc::new(MockClock::new());
+        clock.advance(Duration::from_millis(42));
+        let audit = Arc::new(AuditHandle::new(4));
+
+        let ctx = PluginContext::new(
+            "stub",
+            Arc::new(FxScope::new()),
+            Arc::clone(&clock) as Arc<dyn Clock>,
+            derive_fingerprint(Some(FIXED_ADDR)),
+            Arc::new(MockEnv::new()),
+            json!({}),
+            LogFacade::new("stub", vec![]),
+            Arc::clone(&audit),
+        );
+
+        // 假钟推进对插件可见（同一实例，非各造各的 SystemClock）：
+        // MockClock 挂钟 = UNIX_EPOCH + 虚拟偏移，经 dyn Clock 读数精确可比。
+        let read = |ctx: &PluginContext| {
+            ctx.clock()
+                .now_system()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("MockClock 挂钟恒在纪元后")
+        };
+        assert_eq!(read(&ctx), Duration::from_millis(42));
+        clock.advance(Duration::from_millis(8));
+        assert_eq!(read(&ctx), Duration::from_millis(50));
+
+        // 审计环同址：经 ctx 发射，装配方持有的 handle 可取走同一事件。
+        assert!(Arc::ptr_eq(ctx.audit(), &audit), "audit() 必须返回注入的那份 Arc");
+        ctx.audit().record("stub", "via-ctx");
+        let events = audit.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].message, "via-ctx");
     }
 }

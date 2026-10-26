@@ -61,6 +61,12 @@ impl DokodemoOutboundConfig {
     /// dixo：`network == Unix` 在 outbound 侧无对应 socket 类型，
     /// Rust 端降级为 TCP（与 Go 行为一致）。在构造期记一条 warn，
     /// 避免运维侧 Unix 拨号"配置有效却走 TCP"的静默语义偏差。
+    // nn8os 2b 残余豁免（L3 台账）：Clone 配置值类型不持 ctx（ctx 属
+    // handler/装配面）；warn 属配置解析一次性告警，迁移随 P3 配置链接线。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "Clone 配置值类型不持 ctx：一次性解析告警，迁移归 P3 配置链接线"
+    )]
     #[must_use]
     pub fn new(address: Address, port: Port, network: Network) -> Self {
         if matches!(network, Network::Unix) {

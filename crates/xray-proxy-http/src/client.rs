@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use xray_app_dispatcher::default::DialFn;
 use xray_common::net::{address::Address, destination::Destination, port::Port};
+use xray_frame::PluginContext;
 use xray_transport::{
     connection::Connection,
     dialer::{StreamSettings, dial},
@@ -119,25 +120,28 @@ pub fn parse_http_config(data: &[u8]) -> Result<HttpOutboundConfig, String> {
 }
 /// 构造 HTTP CONNECT 的 DialFn 闭包。
 ///
-/// 闭包捕获 `Arc<HttpOutboundConfig>`，每次调用：
+/// 闭包捕获 `Arc<HttpOutboundConfig>` + 装配注入的 [`PluginContext`]，每次调用：
 /// 1. dial 到 HTTP 代理服务器
 /// 2. 发送 CONNECT 请求（含可选 Proxy-Authorization）
 /// 3. 读响应直到找到空行（`\r\n\r\n`），检查 200 OK
 /// 4. 返回连接（隧道已建立，双向透传）
 ///
 /// 配置 `h2=true` 时整体走 `establish_h2_tunnel`（HTTP/2 CONNECT 隧道）。
+/// 日志/异步托管只经 ctx 句柄（坑约束 5/10；nn8os 2b 迁移，原裸 spawn 存量债已清）。
 ///
 /// # Panics
 ///
 /// 不会 panic；任何错误以 `Err(String)` 返回。
-pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
+pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>, ctx: Arc<PluginContext>) -> DialFn {
     Arc::new(move |dest: &Destination| {
         let config = Arc::clone(&config);
+        let ctx = Arc::clone(&ctx);
         let target_host = dest.address().to_string();
         let target_port = dest.port().value();
         Box::pin(async move {
             if config.h2 {
-                return establish_h2_tunnel(Arc::clone(&config), target_host, target_port).await;
+                return establish_h2_tunnel(&ctx, Arc::clone(&config), target_host, target_port)
+                    .await;
             }
             // 拨号到上游 HTTP 代理
             use xray_common::net::{address::Address, destination::Destination, network::Network};
@@ -192,69 +196,66 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
             // 拒绝 / 写请求失败 / 响应前 EOF·reset。well-formed 非 200 响应属
             // 响应内容性失败，不重试——状态码检查留在重试环外（契约收紧：Go 对
             // 非 200 同样重试，此处按票 cjwc 契约收敛）。
-            let (conn, buf, total) = xray_transport::retry::exponential_backoff(
-                5,
-                100,
-                || async {
-                    let mut conn: Box<dyn Connection> = match &config.stream_settings {
-                        Some(s) => dial(&server_dest, s, &sockopt)
-                            .await
-                            .map_err(|e| format!("http dial proxy ({}): {e}", s.protocol))?,
-                        None => xray_transport::system_dialer::dial_system(&server_dest, &sockopt)
-                            .await
-                            .map_err(|e| format!("http dial proxy (tcp): {e}"))?,
-                    };
-                    // 3. 发送请求
-                    conn.write_all(request.as_bytes())
+            let (conn, buf, total) = xray_transport::retry::exponential_backoff(5, 100, || async {
+                let mut conn: Box<dyn Connection> = match &config.stream_settings {
+                    Some(s) => dial(&server_dest, s, &sockopt)
                         .await
-                        .map_err(|e| format!("http write CONNECT: {e}"))?;
-                    conn.flush().await.map_err(|e| format!("http flush CONNECT: {e}"))?;
+                        .map_err(|e| format!("http dial proxy ({}): {e}", s.protocol))?,
+                    None => xray_transport::system_dialer::dial_system(&server_dest, &sockopt)
+                        .await
+                        .map_err(|e| format!("http dial proxy (tcp): {e}"))?,
+                };
+                // 3. 发送请求
+                conn.write_all(request.as_bytes())
+                    .await
+                    .map_err(|e| format!("http write CONNECT: {e}"))?;
+                conn.flush().await.map_err(|e| format!("http flush CONNECT: {e}"))?;
 
-                    // 4. 读响应头（直到空行 `\r\n\r\n`）
-                    let mut buf = vec![0u8; 4096];
-                    let mut total = 0usize;
-                    let mut found_end = false;
-                    while !found_end && total < buf.len() {
-                        let n = match conn.read(&mut buf[total..]).await {
-                            Ok(n) => n,
-                            // z9n4：读响应头失败的可观测日志。
-                            Err(e) => {
-                                tracing::warn!(
-                                    target: "xray.http.outbound",
-                                    proxy = %format!("{}:{}", server_dest.address(), server_dest.port()),
-                                    target = %host_port,
-                                    error = %e,
-                                    "http CONNECT proxy read response header failed"
-                                );
-                                return Err(format!("http read response: {e}"));
-                            },
-                        };
-                        if n == 0 {
-                            // z9n4：代理在响应前 EOF（连接 reset / 401 challenge 等场景）。
-                            tracing::warn!(
-                                target: "xray.http.outbound",
-                                proxy = %format!("{}:{}", server_dest.address(), server_dest.port()),
-                                target = %host_port,
-                                "http CONNECT proxy closed connection before response"
-                            );
-                            return Err("http proxy closed connection before response".to_string());
-                        }
-                        total += n;
-                        // 检查是否收到完整响应头（`\r\n\r\n`）
-                        for i in 0..total.saturating_sub(3) {
-                            if buf[i] == b'\r'
-                                && buf[i + 1] == b'\n'
-                                && buf[i + 2] == b'\r'
-                                && buf[i + 3] == b'\n'
-                            {
-                                found_end = true;
-                                break;
-                            }
+                // 4. 读响应头（直到空行 `\r\n\r\n`）
+                let mut buf = vec![0u8; 4096];
+                let mut total = 0usize;
+                let mut found_end = false;
+                while !found_end && total < buf.len() {
+                    let n = match conn.read(&mut buf[total..]).await {
+                        Ok(n) => n,
+                        // z9n4：读响应头失败的可观测日志。
+                        Err(e) => {
+                            ctx.log().warn(format!(
+                                "http CONNECT proxy read response header failed \
+                                     proxy={}:{} target={} error={e}",
+                                server_dest.address(),
+                                server_dest.port(),
+                                host_port
+                            ));
+                            return Err(format!("http read response: {e}"));
+                        },
+                    };
+                    if n == 0 {
+                        // z9n4：代理在响应前 EOF（连接 reset / 401 challenge 等场景）。
+                        ctx.log().warn(format!(
+                            "http CONNECT proxy closed connection before response \
+                                 proxy={}:{} target={}",
+                            server_dest.address(),
+                            server_dest.port(),
+                            host_port
+                        ));
+                        return Err("http proxy closed connection before response".to_string());
+                    }
+                    total += n;
+                    // 检查是否收到完整响应头（`\r\n\r\n`）
+                    for i in 0..total.saturating_sub(3) {
+                        if buf[i] == b'\r'
+                            && buf[i + 1] == b'\n'
+                            && buf[i + 2] == b'\r'
+                            && buf[i + 3] == b'\n'
+                        {
+                            found_end = true;
+                            break;
                         }
                     }
-                    Ok((conn, buf, total))
-                },
-            )
+                }
+                Ok((conn, buf, total))
+            })
             .await
             .map_err(|e| format!("http dial proxy: retries exhausted: {e}"))?;
             // 5. 解析响应行（第一行：`HTTP/1.x STATUS_CODE ...`）
@@ -302,6 +303,7 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>) -> DialFn {
 /// Go 还按 destination 缓存 h2 ClientConn（cachedH2Conns）复用连接；此处每次
 /// 拨号新建 h2 连接（池化留待框架层统一处理）。
 async fn establish_h2_tunnel(
+    ctx: &PluginContext,
     config: Arc<HttpOutboundConfig>,
     target_host: String,
     target_port: u16,
@@ -334,19 +336,15 @@ async fn establish_h2_tunnel(
                 .handshake::<Box<dyn Connection>, bytes::Bytes>(conn)
                 .await
                 .map_err(|e| format!("h2 handshake: {e}"))?;
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-            )]
-            tokio::spawn(async move {
+            // 任务内日志只持克隆门面（spawn 的 future 不得借用 ctx）。
+            let driver_log = ctx.log().clone();
+            let driver_task = ctx.spawn(async move {
                 if let Err(e) = conn_driver.await {
-                    tracing::debug!(
-                        target: "xray.http.outbound",
-                        error = %e,
-                        "h2 connection driver ended"
-                    );
+                    driver_log.debug(format!("h2 connection driver ended (error={e})"));
                 }
             });
+            // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
+            driver_task.expect("plugin ctx FxScope is never closed (assembly-owned)");
 
             let mut req_builder =
                 http::Request::builder().method(http::Method::CONNECT).uri(host_port.as_str());
@@ -590,6 +588,11 @@ fn base64_encode(input: &str) -> String {
 mod tests {
     use super::*;
 
+    /// 测试用 L2 句柄：for_plugin 配方（自持 scope + 独享审计环）。
+    fn test_ctx() -> Arc<PluginContext> {
+        Arc::new(PluginContext::for_plugin("http"))
+    }
+
     #[test]
     fn config_construction() {
         let cfg =
@@ -613,7 +616,7 @@ mod tests {
             Address::new_domain("proxy.example.com"),
             Port::new(8080),
         ));
-        let _dial = make_http_dial_fn(Arc::clone(&cfg));
+        let _dial = make_http_dial_fn(Arc::clone(&cfg), test_ctx());
         assert_eq!(Arc::strong_count(&cfg), 2);
     }
 
@@ -707,7 +710,7 @@ mod tests {
             Address::ipv4(std::net::Ipv4Addr::LOCALHOST),
             Port::new(port),
         ));
-        let dial_fn = make_http_dial_fn(cfg);
+        let dial_fn = make_http_dial_fn(cfg, test_ctx());
         let dest = Destination::tcp(Address::new_domain("target.example.com"), Port::new(443));
         let _conn = dial_fn(&dest).await.expect("tunnel established");
         drop(_conn);
@@ -792,7 +795,7 @@ mod tests {
         let mut cfg =
             HttpOutboundConfig::new(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(port));
         cfg.h2 = true;
-        let dial_fn = make_http_dial_fn(Arc::new(cfg));
+        let dial_fn = make_http_dial_fn(Arc::new(cfg), test_ctx());
         let dest = Destination::tcp(Address::new_domain("target.example.com"), Port::new(443));
         let mut conn = dial_fn(&dest).await.expect("h2 CONNECT tunnel must establish");
 
@@ -828,7 +831,7 @@ mod tests {
             Address::ipv4(std::net::Ipv4Addr::LOCALHOST),
             Port::new(port),
         ));
-        let dial_fn = make_http_dial_fn(cfg);
+        let dial_fn = make_http_dial_fn(cfg, test_ctx());
         let dest = Destination::tcp(Address::new_domain("target.example.com"), Port::new(443));
         let err = dial_fn(&dest).await.err().expect("dial must fail after retries");
         // 严格契约「恰好 5 次尝试」由 `xray_transport::retry` 的
@@ -918,7 +921,7 @@ mod tests {
                 .with_header("X-Mixed".to_string(), "a{{ .Target }}b{{.Source}}c".to_string())
                 .with_header("X-Unknown".to_string(), "{{.Foo}} keep".to_string())
                 .with_header("User-Agent".to_string(), "tpl-{{.Target}}".to_string());
-        let dial_fn = make_http_dial_fn(Arc::new(cfg));
+        let dial_fn = make_http_dial_fn(Arc::new(cfg), test_ctx());
         let dest = Destination::tcp(Address::new_domain("target.example.com"), Port::new(443));
         let _conn = dial_fn(&dest).await.expect("tunnel established");
         drop(_conn);
@@ -976,7 +979,7 @@ mod tests {
                 .with_header("X-Target".to_string(), "{{.Target}}".to_string())
                 .with_header("X-Source".to_string(), "{{.Source}}".to_string());
         cfg.h2 = true;
-        let dial_fn = make_http_dial_fn(Arc::new(cfg));
+        let dial_fn = make_http_dial_fn(Arc::new(cfg), test_ctx());
         let dest = Destination::tcp(Address::new_domain("target.example.com"), Port::new(443));
         let _conn = dial_fn(&dest).await.expect("h2 CONNECT tunnel must establish");
         drop(_conn);

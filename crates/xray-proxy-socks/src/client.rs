@@ -287,6 +287,9 @@ mod tests {
     /// （末次失败不再延迟：0+100+200+300=600ms）+ 最终错误（握手从不启动，
     /// 无握手字节重复）。
     #[tokio::test(start_paused = true)]
+    // nn8os 2b 残余豁免：tokio 虚拟钟（start_paused）的 Instant 是测试基建
+    // 配套，非插件能力面（Clock 注入断言归 xray-frame l4 夹具）。
+    #[allow(clippy::disallowed_methods, reason = "start_paused 虚拟钟测试配套，非生产时钟取用")]
     async fn dial_connect_refused_backs_off_five_times() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

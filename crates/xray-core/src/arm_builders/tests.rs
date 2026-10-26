@@ -193,6 +193,7 @@ async fn arm_lookup_inbound_loopback_entry_matches_table_value() {
         addr: "127.0.0.1:1",
         settings: &settings,
         api: None,
+        plugin_ctx: xray_frame::PluginContext::for_plugin("loopback"),
     })
     .await
     .expect("table path spawn");

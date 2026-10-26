@@ -453,6 +453,9 @@ mod tests {
                     proxy_chain_tag: None,
                     target_strategy: None,
                     send_through: None,
+                    plugin_ctx: xray_frame::PluginContext::for_plugin(
+                        crate::arm_builders::intern_protocol_kind(protocol),
+                    ),
                 });
                 let new_view = view_of(&new_result, new_bridges.len());
                 let old_view = view_of(&old_result, old_bridges.len());
@@ -511,6 +514,7 @@ mod tests {
             addr: "127.0.0.1:1",
             settings: &settings,
             api: None,
+            plugin_ctx: xray_frame::PluginContext::for_plugin("loopback"),
         })
         .await
         .expect("registry path spawn");

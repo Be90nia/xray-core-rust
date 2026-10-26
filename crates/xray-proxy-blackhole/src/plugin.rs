@@ -14,7 +14,7 @@
 //! wire 零改动：响应体构造仍走 `response.rs`（`HTTP_403_RESPONSE` 常量与
 //! [`get_internal_response`] 解析语义原样复用），Http403 字节形态逐字节不变。
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use base64::Engine as _;
 use xray_frame::{
@@ -85,18 +85,24 @@ impl BlackholePlugin {
     }
 
     /// 插件产出：出站 handler（[`BlackholeHandler`] 的既有 `DispatchHandler`
-    /// 实现与行为不变，配置改由插件 build 解析注入）。
-    pub fn dispatch_handler(&self, tag: &str) -> Result<BlackholeHandler, PluginError> {
-        Ok(BlackholeHandler::with_response(tag, self.built_response()?.clone()))
+    /// 实现与行为不变，配置改由插件 build 解析注入）。能力句柄随 ctx 注入
+    /// （nn8os 2b：日志/spawn 只经 ctx）。
+    pub fn dispatch_handler(
+        &self,
+        ctx: Arc<PluginContext>,
+        tag: &str,
+    ) -> Result<BlackholeHandler, PluginError> {
+        Ok(BlackholeHandler::with_response(ctx, tag, self.built_response()?.clone()))
     }
 
-    /// 插件产出：入站 handler（`InboundHandler` 实现不变）。
+    /// 插件产出：入站 handler（`InboundHandler` 实现不变）。能力句柄随 ctx 注入。
     pub fn inbound_handler(
         &self,
+        ctx: Arc<PluginContext>,
         tag: &str,
         listen_addr: &str,
     ) -> Result<BlackholeInboundHandler, PluginError> {
-        Ok(BlackholeInboundHandler::new(tag, self.built_response()?.clone(), listen_addr))
+        Ok(BlackholeInboundHandler::new(ctx, tag, self.built_response()?.clone(), listen_addr))
     }
 }
 

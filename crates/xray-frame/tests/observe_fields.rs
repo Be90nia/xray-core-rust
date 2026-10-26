@@ -79,6 +79,7 @@ fn ctx_with(plugin: &'static str, secrets: Vec<Arc<str>>) -> PluginContext {
         Arc::new(MockEnv::new()),
         json!({}),
         LogFacade::new(plugin, secrets),
+        Arc::new(xray_frame::AuditHandle::new(xray_frame::DEFAULT_AUDIT_RING_CAP)),
     )
 }
 
@@ -95,6 +96,7 @@ fn ten_k_concurrent_conn_ids_unique_and_nonzero() {
         Arc::new(MockEnv::new()),
         json!({}),
         LogFacade::new("observe-test", vec![]),
+        Arc::new(xray_frame::AuditHandle::new(xray_frame::DEFAULT_AUDIT_RING_CAP)),
     );
 
     const N: usize = 10_000;

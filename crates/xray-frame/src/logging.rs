@@ -64,6 +64,11 @@ static ANCHOR_METADATA: std::sync::LazyLock<tracing::Metadata<'static>> =
 
 /// 域规范日志门面：target = `xray_frame::<域>`（对齐 udf log-embed 纪律
 /// `skeleton::<域>`）；域 = 插件名或 infra 域（assembly/registry/context）。
+///
+/// 手写 `Clone`（nn8os 2b）：spawn 进 FxScope 的任务持不得引用 ctx——发射前
+/// 克隆门面捕获进 'static future。target/掩码表同源克隆，emit 输出与原门面
+/// 逐字一致；metas 分发缓存不共享（std Mutex 无 Clone）——克隆体持空缓存，
+/// 首次 emit 自行重建（有界：每门面 ≤5 份）。
 pub struct LogFacade {
     /// 构造期钉死并泄漏为 'static（`Metadata<'static>` 的 target 参数要求）；
     /// 每门面一次，量级 = 插件数。
@@ -72,6 +77,17 @@ pub struct LogFacade {
     secrets: Vec<Arc<str>>,
     /// 按 level 缓存的运行期分发元数据（每门面 ≤5 份，有界）。
     metas: Mutex<HashMap<u8, &'static tracing::Metadata<'static>>>,
+}
+
+impl Clone for LogFacade {
+    fn clone(&self) -> Self {
+        Self {
+            target: self.target,
+            secrets: self.secrets.clone(),
+            // 分发缓存不共享（std Mutex 无 Clone）：克隆体空缓存，首 emit 重建。
+            metas: Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 impl LogFacade {

@@ -179,20 +179,24 @@ pub(crate) fn build_trojan_outbound(
 #[allow(clippy::type_complexity)] // 返回三组件装配形态（与 wrap_bridge 同型）
 pub(crate) fn build_blackhole_outbound(
     ob: &BuiltOutbound,
+    plugin_ctx: Arc<xray_frame::PluginContext>,
 ) -> std::result::Result<
     (Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>),
     BuildError,
 > {
     let response = parse_blackhole_response(&ob.entry.data)?;
-    let handler =
-        Arc::new(xray_proxy_blackhole::BlackholeHandler::with_response(ob.tag.clone(), response))
-            as Arc<dyn DispatchHandler>;
+    let handler = Arc::new(xray_proxy_blackhole::BlackholeHandler::with_response(
+        plugin_ctx,
+        ob.tag.clone(),
+        response,
+    )) as Arc<dyn DispatchHandler>;
     Ok((handler, None, None))
 }
 
 #[allow(clippy::type_complexity)] // 返回三组件装配形态（与 wrap_bridge 同型）
 pub(crate) fn build_socks_outbound(
     ob: &BuiltOutbound,
+    plugin_ctx: Arc<xray_frame::PluginContext>,
     proxy_chain_tag: Option<String>,
     target_strategy: Option<DomainStrategy>,
     dns: Option<&Arc<xray_app_dns::DnsService>>,
@@ -224,7 +228,12 @@ pub(crate) fn build_socks_outbound(
         tcp_bridge
             .with_policy(xray_features::policy::PolicyManager::policy_for_level(pm, 0).timeout);
     }
-    let dispatch = SocksUdpDispatch { tag: ob.tag.clone(), tcp: Arc::clone(&tcp_bridge), udp_cfg };
+    let dispatch = SocksUdpDispatch {
+        tag: ob.tag.clone(),
+        tcp: Arc::clone(&tcp_bridge),
+        udp_cfg,
+        ctx: plugin_ctx,
+    };
     let handler = Arc::new(dispatch) as Arc<dyn DispatchHandler>;
     let bridge_ref = if proxy_chain_tag.is_some() { Some(tcp_bridge) } else { None };
     Ok((handler, bridge_ref, proxy_chain_tag))
@@ -592,6 +601,7 @@ pub(crate) fn build_loopback_outbound(
 #[allow(clippy::type_complexity)] // 返回三组件装配形态（与 wrap_bridge 同型）
 pub(crate) fn build_http_outbound(
     ob: &BuiltOutbound,
+    plugin_ctx: Arc<xray_frame::PluginContext>,
     proxy_chain_tag: Option<String>,
     target_strategy: Option<DomainStrategy>,
     dns: Option<&Arc<xray_app_dns::DnsService>>,
@@ -603,7 +613,7 @@ pub(crate) fn build_http_outbound(
 > {
     let config = xray_proxy_http::parse_http_config(&ob.entry.data)?;
     let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
-    let dial_fn = xray_proxy_http::make_http_dial_fn(Arc::new(config));
+    let dial_fn = xray_proxy_http::make_http_dial_fn(Arc::new(config), plugin_ctx);
     wrap_bridge(
         ob.tag.clone(),
         dial_fn,
@@ -730,12 +740,13 @@ pub(crate) fn trojan_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResult {
 }
 
 pub(crate) fn blackhole_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResult {
-    build_blackhole_outbound(ctx.ob)
+    build_blackhole_outbound(ctx.ob, Arc::new(ctx.plugin_ctx))
 }
 
 pub(crate) fn socks_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResult {
     build_socks_outbound(
         ctx.ob,
+        Arc::new(ctx.plugin_ctx),
         ctx.proxy_chain_tag,
         ctx.target_strategy,
         ctx.dns,
@@ -825,6 +836,7 @@ pub(crate) fn loopback_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResult
 pub(crate) fn http_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResult {
     build_http_outbound(
         ctx.ob,
+        Arc::new(ctx.plugin_ctx),
         ctx.proxy_chain_tag,
         ctx.target_strategy,
         ctx.dns,
