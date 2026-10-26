@@ -59,6 +59,7 @@ pub(crate) async fn build_socks_inbound(
     shutdown_token: CancellationToken,
     addr: &str,
     settings: &xray_transport::dialer::StreamSettings,
+    plugin_ctx: std::sync::Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let inbound_sockopts = settings.socket_options();
     let listener = InboundTcpListener::bind(addr, inbound_sockopts.clone())
@@ -75,7 +76,7 @@ pub(crate) async fn build_socks_inbound(
         .unwrap_or(xray_features::policy::TimeoutPolicy::default().connection_idle);
     tracing::info!(tag = %ib.tag, addr = %addr, auth = ?config.auth_type, udp = config.udp_enabled, "socks5 inbound listening");
     Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-        serve_socks5(listener, ohm, config, handshake_timeout, udp_idle).await
+        serve_socks5(listener, ohm, config, handshake_timeout, udp_idle, plugin_ctx).await
     })))
 }
 
@@ -86,6 +87,7 @@ pub(crate) async fn build_mixed_inbound(
     shutdown_token: CancellationToken,
     addr: &str,
     settings: &xray_transport::dialer::StreamSettings,
+    plugin_ctx: std::sync::Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let inbound_sockopts = settings.socket_options();
     // V2RayN / Go xray mixed 协议 = socks + http 复合 listener。
@@ -106,7 +108,16 @@ pub(crate) async fn build_mixed_inbound(
         .with_tcpmask_manager(inbound_tcpmask(settings)?);
     tracing::info!(tag = %ib.tag, addr = %addr, "mixed (socks+http) inbound listening");
     Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-        serve_mixed(listener, ohm, socks_cfg, http_cfg, Some(handshake_timeout), udp_idle).await
+        serve_mixed(
+            listener,
+            ohm,
+            socks_cfg,
+            http_cfg,
+            Some(handshake_timeout),
+            udp_idle,
+            plugin_ctx,
+        )
+        .await
     })))
 }
 
@@ -325,6 +336,7 @@ pub(crate) async fn build_http_inbound(
     shutdown_token: CancellationToken,
     addr: &str,
     settings: &xray_transport::dialer::StreamSettings,
+    plugin_ctx: std::sync::Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let inbound_sockopts = settings.socket_options();
     let config = parse_http_config(&ib.entry.data)?;
@@ -339,7 +351,7 @@ pub(crate) async fn build_http_inbound(
         .with_tcpmask_manager(inbound_tcpmask(settings)?);
     tracing::info!(tag = %ib.tag, addr = %addr, "http inbound listening");
     Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-        serve_http(listener, ohm, Arc::new(config), Some(handshake_timeout)).await
+        serve_http(listener, ohm, Arc::new(config), Some(handshake_timeout), plugin_ctx).await
     })))
 }
 
@@ -349,6 +361,7 @@ pub(crate) async fn build_dokodemo_inbound(
     shutdown_token: CancellationToken,
     addr: &str,
     settings: &xray_transport::dialer::StreamSettings,
+    plugin_ctx: std::sync::Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let inbound_sockopts = settings.socket_options();
     // 先取 finalmask（此处 `settings` 还是 streamSettings，下一行被
@@ -390,10 +403,11 @@ pub(crate) async fn build_dokodemo_inbound(
         // await 持有 JoinHandle，token cancel 时 drop = detach（accept loop 继续跑，
         // RemoveInbound 后端口仍可连）。
         let stop = shutdown_token.clone();
+        let tcp_ctx = Arc::clone(&plugin_ctx);
         handles.push(
             fx.spawn(async move {
                 tokio::select! {
-                    r = serve_dokodemo(listener, ohm_tcp, opts) => {
+                    r = serve_dokodemo(listener, ohm_tcp, opts, tcp_ctx) => {
                         if let Err(e) = r {
                             tracing::error!(error = %e, "dokodemo TCP inbound stopped");
                         }
@@ -429,7 +443,7 @@ pub(crate) async fn build_dokodemo_inbound(
         handles.push(
             fx.spawn(async move {
                 tokio::select! {
-                    r = serve_dokodemo_udp_on(hub, dispatch, dest_udp) => {
+                    r = serve_dokodemo_udp_on(hub, dispatch, dest_udp, Arc::clone(&plugin_ctx)) => {
                         if let Err(e) = r {
                             tracing::error!(error = %e, "dokodemo UDP inbound stopped");
                         }
@@ -464,6 +478,7 @@ pub(crate) async fn build_shadowsocks_inbound(
     shutdown_token: CancellationToken,
     addr: &str,
     api: Option<&InboundRuntime>,
+    plugin_ctx: std::sync::Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let settings =
         xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref());
@@ -495,7 +510,15 @@ pub(crate) async fn build_shadowsocks_inbound(
     let inbound_udp_mask = inbound_udpmask(&settings)?;
     tracing::info!(tag = %ib.tag, addr = %addr, "shadowsocks inbound listening");
     Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-        serve_ss(listener, ohm, inbound, handshake_timeout_for(&policy, 0), inbound_udp_mask).await
+        serve_ss(
+            listener,
+            ohm,
+            inbound,
+            handshake_timeout_for(&policy, 0),
+            inbound_udp_mask,
+            plugin_ctx,
+        )
+        .await
     })))
 }
 
@@ -620,6 +643,7 @@ pub(crate) async fn build_dns_inbound(
     shutdown_token: CancellationToken,
     addr: &str,
     settings: &xray_transport::dialer::StreamSettings,
+    plugin_ctx: std::sync::Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let inbound_sockopts = settings.socket_options();
     // G14（Go dns.go:85）：空闲超时取 policy ConnectionIdle；inbound
@@ -634,7 +658,7 @@ pub(crate) async fn build_dns_inbound(
         .with_tcpmask_manager(inbound_tcpmask(settings)?);
     tracing::info!(tag = %ib.tag, addr = %addr, "dns inbound listening (UDP+TCP)");
     Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-        serve_dns(udp, tcp, inbound).await
+        serve_dns(udp, tcp, inbound, plugin_ctx).await
     })))
 }
 
@@ -881,6 +905,7 @@ pub(crate) fn socks_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
         ctx.shutdown_token,
         ctx.addr,
         ctx.settings,
+        Arc::new(ctx.plugin_ctx),
     ))
 }
 
@@ -892,6 +917,7 @@ pub(crate) fn mixed_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
         ctx.shutdown_token,
         ctx.addr,
         ctx.settings,
+        Arc::new(ctx.plugin_ctx),
     ))
 }
 
@@ -936,11 +962,19 @@ pub(crate) fn http_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
         ctx.shutdown_token,
         ctx.addr,
         ctx.settings,
+        Arc::new(ctx.plugin_ctx),
     ))
 }
 
 pub(crate) fn dokodemo_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
-    Box::pin(build_dokodemo_inbound(ctx.ib, ctx.ohm, ctx.shutdown_token, ctx.addr, ctx.settings))
+    Box::pin(build_dokodemo_inbound(
+        ctx.ib,
+        ctx.ohm,
+        ctx.shutdown_token,
+        ctx.addr,
+        ctx.settings,
+        Arc::new(ctx.plugin_ctx),
+    ))
 }
 
 pub(crate) fn shadowsocks_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
@@ -951,6 +985,7 @@ pub(crate) fn shadowsocks_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> 
         ctx.shutdown_token,
         ctx.addr,
         ctx.api,
+        Arc::new(ctx.plugin_ctx),
     ))
 }
 
@@ -975,7 +1010,14 @@ pub(crate) fn wireguard_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
 }
 
 pub(crate) fn dns_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
-    Box::pin(build_dns_inbound(ctx.ib, ctx.policy, ctx.shutdown_token, ctx.addr, ctx.settings))
+    Box::pin(build_dns_inbound(
+        ctx.ib,
+        ctx.policy,
+        ctx.shutdown_token,
+        ctx.addr,
+        ctx.settings,
+        Arc::new(ctx.plugin_ctx),
+    ))
 }
 
 pub(crate) fn loopback_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
