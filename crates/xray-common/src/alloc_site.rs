@@ -34,10 +34,17 @@ pub const VLESS_ENC_SEAL: u8 = 3;
 /// TLS 记录**读**路径（解密 + 明文交付，票 4y9ns 归因：tcp-tls 客户端 9.24 MB/MB）。
 /// 与 [`TLS_WRITE`] 对称——W0 工具只标了写面，读面（客户端下行主路径）此前无站点。
 pub const TLS_READ: u8 = 4;
+/// 读缓冲分配（票 4y9ns Phase 0：桥层 `read_multi_buffer` 的读缓冲）。
+///
+/// 标记点在**调用侧**（`xray-transport` 桥下行读）而非分配点：
+/// `xray-common` 依赖 `xray-buf`（反向不成立），`xray-buf` 内的分配点引不到
+/// 本模块。站点覆盖一次 `read_multi_buffer`（读缓冲 + MultiBuffer 包装），
+/// 比单标分配行略宽——读缓冲容量远大于包装开销，不干扰判读。
+pub const BUF_READ: u8 = 5;
 
 /// 站点目录（索引 = 站点 id；新站点只能追加，禁重编号——dump 行与归集脚本按名对齐）。
-pub const SITE_NAMES: [&str; 5] =
-    ["(none)", "tls_write", "xhttp_srv_send", "vless_enc_seal", "tls_read"];
+pub const SITE_NAMES: [&str; 6] =
+    ["(none)", "tls_write", "xhttp_srv_send", "vless_enc_seal", "tls_read", "buf_read"];
 
 /// 站点归集开关：xray-cli init() 一次性置位，热路径只读。
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -196,6 +203,7 @@ mod tests {
 
     #[test]
     fn record_accumulates_per_site() {
+        let _serial = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _on = EnabledGuard::set();
         let before = snapshot();
         record(TLS_WRITE, 2, 128);

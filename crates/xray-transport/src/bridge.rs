@@ -295,6 +295,19 @@ fn p7lm_trace() -> bool {
     *P7LM_TRACE
 }
 
+/// 下行读一轮，把这轮分配归到 [`xray_common::alloc_site::BUF_READ`] 站点
+/// （票 4y9ns Phase 0：读缓冲归因）。
+///
+/// 站点只能在调用侧标：`xray-common` 依赖 `xray-buf`，反向不成立，读缓冲的
+/// 分配点（`xray-buf::reader`）引不到 `alloc_site`。守卫覆盖整轮读——读缓冲
+/// 容量远大于 `MultiBuffer` 包装开销，判读不受影响；未启用时 `enter` 直通。
+async fn read_downlink(
+    r: &mut dyn xray_buf::io::Reader,
+) -> xray_buf::io::Result<xray_buf::multi::MultiBuffer> {
+    let _g = xray_common::alloc_site::enter(xray_common::alloc_site::BUF_READ);
+    r.read_multi_buffer().await
+}
+
 /// 双向桥接 dispatcher [`Link`] 与 AsyncRead+AsyncWrite stream。
 ///
 /// 与 [`bridge_link_with_stream`] 区别：两个方向独立运行到都完成，任一方向
@@ -443,7 +456,7 @@ where
             let mb = match window {
                 None => tokio::select! {
                     // 空闲 deadline（Go ConnectionIdle / CancelAfterInactivity）
-                    res = timeout(conn_idle, s_read.read_multi_buffer()) => match res {
+                    res = timeout(conn_idle, read_downlink(&mut s_read)) => match res {
                         Ok(r) => r,
                         Err(_) => break,
                     },
@@ -452,7 +465,7 @@ where
                         continue;
                     }
                 },
-                Some(d) => match timeout(d, s_read.read_multi_buffer()).await {
+                Some(d) => match timeout(d, read_downlink(&mut s_read)).await {
                     Ok(r) => r,
                     Err(_) => break, // downlink_only 窗口内无数据
                 },

@@ -42,14 +42,23 @@ impl Buffer {
     ///
     /// 对应 Go 的 `New()` 构造函数。
     pub fn new() -> Self {
-        let inner = alloc::alloc(alloc::DEFAULT_SIZE);
+        Self::new_pooled(alloc::DEFAULT_SIZE)
+    }
+
+    /// 从分配池取一个可容纳 `size` 的块：按 [`crate::alloc`] 分层**向上取整**
+    /// （64KB 请求 → 128KB 层），Drop / [`Buffer::release`] 归还池。
+    ///
+    /// 与 [`Buffer::with_capacity`] 的区别：那个走裸 `BytesMut::with_capacity`，
+    /// 每次调用都是新鲜分配且容量不落层（释放即弃）；本函数稳态零新鲜分配。
+    pub fn new_pooled(size: usize) -> Self {
+        let inner = alloc::alloc(size);
         Self { inner: Inner::Pooled(inner), start: 0, end: 0, udp: None }
     }
 
     /// 分配指定大小的缓冲区（直接分配，不经过池）。
     ///
     /// 对应 Go 的 `NewWithSize(size)`，创建精确大小的非池化缓冲区。
-    /// 如需池化分配，使用 [`Buffer::new()`]。
+    /// 如需池化分配，使用 [`Buffer::new_pooled()`]。
     pub fn with_capacity(size: usize) -> Self {
         let inner = BytesMut::with_capacity(size);
         Self { inner: Inner::Pooled(inner), start: 0, end: 0, udp: None }
@@ -585,6 +594,24 @@ mod tests {
         assert!(buf.is_empty());
         assert_eq!(buf.len(), 0);
         assert!(buf.capacity() >= alloc::DEFAULT_SIZE);
+    }
+
+    /// 票 4y9ns：`new_pooled` 取层块，Drop 归池后下一次取**复用同一分配**
+    /// （读路径稳态零新鲜分配的直接证据）。
+    #[test]
+    fn test_pooled_buffer_is_reused_after_drop() {
+        init();
+        let mut first = Buffer::new_pooled(64 * 1024);
+        assert_eq!(first.capacity(), 128 * 1024, "64KB 请求向上取 128KB 层");
+        let addr = first.writable_bytes().as_ptr() as usize;
+        drop(first);
+
+        let mut second = Buffer::new_pooled(64 * 1024);
+        assert_eq!(
+            second.writable_bytes().as_ptr() as usize,
+            addr,
+            "同层块必须复用同一分配（池命中），而非新鲜分配"
+        );
     }
 
     #[test]
