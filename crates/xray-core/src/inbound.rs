@@ -1,11 +1,12 @@
-// L3 静态闸存量登记（bd a5r4j/lzzja 切片；batch1 后实盘 2026-10-27）：本文件
-// 72 处（68 tokio::spawn：生产 16 + tests 52；4 std Instant）>20 → 按分层规则挂
-// 文件级。生产 16 = UDP associate（与 cfg(unix) UDS 栈共用）+ mux link 4 +
-// SS 数据面泵 1 + 监控壳 2 + reality vision 2 + tun 1 + UDS 每连接 5；
-// batch1 已迁 13 处生产 spawn → arm PluginContext（bd 39hko）。
+// L3 静态闸存量登记（bd a5r4j/lzzja 切片；batch2 后实盘 2026-10-27）：本文件
+// 67 处（62 tokio::spawn：生产 10 + tests 52；5 std Instant 调用位，另有 5 处
+// Instant 类型位置不计）>20 → 按分层规则挂文件级。生产 10 = mux link 4 +
+// SS 数据面泵 1 + 监控壳 2 + reality vision 2 + tun 1；
+// batch1 已迁 13 处 + batch2 已迁 6 处（UDP associate + UDS 每连接 5）生产
+// spawn → arm PluginContext（bd 39hko）。
 #![allow(
     clippy::disallowed_methods,
-    reason = "inbound.rs 存量 72 处（68 tokio::spawn：生产 16 + tests 52；4 std Instant），>20 处/文件按分层规则挂文件级，迁移收口见 bd 39hko"
+    reason = "inbound.rs 存量 67 处（62 tokio::spawn：生产 10 + tests 52；5 std Instant 调用位），>20 处/文件按分层规则挂文件级，迁移收口见 bd 39hko"
 )]
 //! SOCKS5 inbound listener：接收连接 → SOCKS5 握手 → dispatcher 分发。
 //!
@@ -152,12 +153,20 @@ pub async fn serve_socks5(
         // scope 生命周期锚：连接任务存活期间 arm scope 不 drop（裸 spawn
         // detach 语义等价；SsConnection `_ctx` 自持同款）
         let task_ctx = Arc::clone(&plugin_ctx);
+        let conn_ctx = Arc::clone(&plugin_ctx);
         plugin_ctx
             .spawn(async move {
                 let _ctx = task_ctx;
-                if let Err(e) =
-                    handle_connection(stream, peer, &config, &handler, handshake_timeout, udp_idle)
-                        .await
+                if let Err(e) = handle_connection(
+                    stream,
+                    peer,
+                    &config,
+                    &handler,
+                    handshake_timeout,
+                    udp_idle,
+                    conn_ctx,
+                )
+                .await
                 {
                     // Go proxyman/worker.go:124：连接结束错误统一 LogInfo("connection ends")。
                     tracing::info!(peer = %peer, error = %e, "socks5 connection ended with error");
@@ -364,6 +373,7 @@ async fn handle_connection<S>(
     handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
     handshake_timeout: Option<std::time::Duration>,
     udp_idle: std::time::Duration,
+    plugin_ctx: Arc<PluginContext>,
 ) -> std::io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static + InboundConnMeta,
@@ -393,9 +403,15 @@ where
             // UDP relay：spawn pump，保持 TCP 控制连接直到客户端断开
             // handler 是 &Arc 引用，spawn 的 future 需 'static —— spawn 前 clone
             let udp_handler = Arc::clone(handler);
-            let relay = tokio::spawn(async move {
-                let _ = handle_udp_associate(relay_socket, udp_handler, udp_idle).await;
-            });
+            // scope 生命周期锚：relay 任务存活期间 arm scope 不 drop（裸 spawn
+            // detach 语义等价；Spawned::abort 保持控制连接断开即终止 relay）
+            let relay_ctx = Arc::clone(&plugin_ctx);
+            let relay = plugin_ctx
+                .spawn(async move {
+                    let _ctx = relay_ctx;
+                    let _ = handle_udp_associate(relay_socket, udp_handler, udp_idle).await;
+                })
+                .expect("arm FxScope is never closed");
             // SOCKS5 UDP ASSOCIATE 语义：TCP 控制连接存在期间 relay 有效。
             // 读到 EOF/错误（客户端关闭控制连接）即终止 relay。
             let mut drop_buf = [0u8; 64];
@@ -4224,31 +4240,38 @@ async fn spawn_unix_inbound(
                 Arc::new(move |conn| {
                     let handler = Arc::clone(&handler);
                     let config = Arc::clone(&config);
-                    tokio::spawn(async move {
-                        let peer = conn.remote_addr().ok().flatten().unwrap_or(unspecified);
-                        if let Err(e) = handle_connection(
-                            conn,
-                            peer,
-                            &config,
-                            &handler,
-                            handshake_timeout,
-                            udp_idle,
-                        )
-                        .await
-                        {
-                            tracing::info!(
-                                peer = %peer,
-                                error = %e,
-                                "socks5 (uds) connection ended with error"
-                            );
-                        }
-                    });
+                    // scope 生命周期锚：连接任务存活期间 arm scope 不 drop
+                    let task_ctx = Arc::clone(&plugin_ctx);
+                    let conn_ctx = Arc::clone(&plugin_ctx);
+                    plugin_ctx
+                        .spawn(async move {
+                            let _ctx = task_ctx;
+                            let peer = conn.remote_addr().ok().flatten().unwrap_or(unspecified);
+                            if let Err(e) = handle_connection(
+                                conn,
+                                peer,
+                                &config,
+                                &handler,
+                                handshake_timeout,
+                                udp_idle,
+                                conn_ctx,
+                            )
+                            .await
+                            {
+                                tracing::info!(
+                                    peer = %peer,
+                                    error = %e,
+                                    "socks5 (uds) connection ended with error"
+                                );
+                            }
+                        })
+                        .expect("arm FxScope is never closed");
                 })
             }))
         },
         "vless" => {
             let validator: Arc<dyn VlessValidator> = build_vless_validator(&ib.entry.data)?;
-            let decryption = build_vless_decryption(&ib.entry.data, plugin_ctx)?;
+            let decryption = build_vless_decryption(&ib.entry.data, plugin_ctx.clone())?;
             let options =
                 VlessInboundOptions { decryption: decryption.clone(), ..Default::default() };
             let fallbacks = build_vless_fallbacks(&ib.entry.data)?;
@@ -4264,29 +4287,34 @@ async fn spawn_unix_inbound(
                     let validator = Arc::clone(&validator);
                     let fallbacks = fallbacks.clone();
                     let options = options.clone();
-                    tokio::spawn(async move {
-                        let (peer, local) = transport_conn_addrs(conn.as_ref(), unspecified);
-                        if let Err(e) = xray_proxy_vless::handle_connection_with_fallback(
-                            conn,
-                            &handler,
-                            &validator,
-                            fallbacks,
-                            peer,
-                            local,
-                            String::new(),
-                            String::new(),
-                            Some(options),
-                            None,
-                        )
-                        .await
-                        {
-                            tracing::info!(
-                                peer = %peer,
-                                error = %e,
-                                "vless (uds) connection ended with error"
-                            );
-                        }
-                    });
+                    // scope 生命周期锚：连接任务存活期间 arm scope 不 drop
+                    let task_ctx = Arc::clone(&plugin_ctx);
+                    plugin_ctx
+                        .spawn(async move {
+                            let _ctx = task_ctx;
+                            let (peer, local) = transport_conn_addrs(conn.as_ref(), unspecified);
+                            if let Err(e) = xray_proxy_vless::handle_connection_with_fallback(
+                                conn,
+                                &handler,
+                                &validator,
+                                fallbacks,
+                                peer,
+                                local,
+                                String::new(),
+                                String::new(),
+                                Some(options),
+                                None,
+                            )
+                            .await
+                            {
+                                tracing::info!(
+                                    peer = %peer,
+                                    error = %e,
+                                    "vless (uds) connection ended with error"
+                                );
+                            }
+                        })
+                        .expect("arm FxScope is never closed");
                 })
             }))
         },
@@ -4303,20 +4331,25 @@ async fn spawn_unix_inbound(
                     let handler = Arc::clone(&handler);
                     let validator = Arc::clone(&validator);
                     let history = Arc::clone(&history);
-                    tokio::spawn(async move {
-                        let (peer, _local) = transport_conn_addrs(conn.as_ref(), unspecified);
-                        if let Err(e) = xray_proxy_vmess::handle_vmess_connection(
-                            conn, &handler, &validator, &history, is_drain, hs_timeout,
-                        )
-                        .await
-                        {
-                            tracing::info!(
-                                peer = %peer,
-                                error = %e,
-                                "vmess (uds) connection ended with error"
-                            );
-                        }
-                    });
+                    // scope 生命周期锚：连接任务存活期间 arm scope 不 drop
+                    let task_ctx = Arc::clone(&plugin_ctx);
+                    plugin_ctx
+                        .spawn(async move {
+                            let _ctx = task_ctx;
+                            let (peer, _local) = transport_conn_addrs(conn.as_ref(), unspecified);
+                            if let Err(e) = xray_proxy_vmess::handle_vmess_connection(
+                                conn, &handler, &validator, &history, is_drain, hs_timeout,
+                            )
+                            .await
+                            {
+                                tracing::info!(
+                                    peer = %peer,
+                                    error = %e,
+                                    "vmess (uds) connection ended with error"
+                                );
+                            }
+                        })
+                        .expect("arm FxScope is never closed");
                 })
             }))
         },
@@ -4340,21 +4373,26 @@ async fn spawn_unix_inbound(
                     let handler = Arc::clone(&handler);
                     let validator = Arc::clone(&validator);
                     let fallbacks = fallbacks.clone();
-                    tokio::spawn(async move {
-                        let (peer, local) = transport_conn_addrs(conn.as_ref(), unspecified);
-                        xray_proxy_trojan::serve_trojan_conn(
-                            conn,
-                            validator,
-                            handler,
-                            fallbacks,
-                            peer,
-                            local,
-                            String::new(),
-                            String::new(),
-                            hs_timeout,
-                        )
-                        .await;
-                    });
+                    // scope 生命周期锚：连接任务存活期间 arm scope 不 drop
+                    let task_ctx = Arc::clone(&plugin_ctx);
+                    plugin_ctx
+                        .spawn(async move {
+                            let _ctx = task_ctx;
+                            let (peer, local) = transport_conn_addrs(conn.as_ref(), unspecified);
+                            xray_proxy_trojan::serve_trojan_conn(
+                                conn,
+                                validator,
+                                handler,
+                                fallbacks,
+                                peer,
+                                local,
+                                String::new(),
+                                String::new(),
+                                hs_timeout,
+                            )
+                            .await;
+                        })
+                        .expect("arm FxScope is never closed");
                 })
             }))
         },
@@ -4375,9 +4413,14 @@ async fn spawn_unix_inbound(
                     let handler = Arc::clone(&handler);
                     let inbound = Arc::clone(&inbound);
                     let hs_timeout = handshake_timeout_for(&policy, 0);
-                    tokio::spawn(async move {
-                        ss_legacy_pipeline(inbound, handler, conn, hs_timeout).await;
-                    });
+                    // scope 生命周期锚：连接任务存活期间 arm scope 不 drop
+                    let task_ctx = Arc::clone(&plugin_ctx);
+                    plugin_ctx
+                        .spawn(async move {
+                            let _ctx = task_ctx;
+                            ss_legacy_pipeline(inbound, handler, conn, hs_timeout).await;
+                        })
+                        .expect("arm FxScope is never closed");
                 })
             }))
         },
