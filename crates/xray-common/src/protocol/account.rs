@@ -166,6 +166,9 @@ mod tests {
         let account: Arc<dyn Account> = Arc::new(TestAccount { kind: "test", id: 3 });
         let cloned = Arc::clone(&account);
         assert!(account.equals(cloned.as_ref()));
+        // 豁免理由：本测是同步 `#[test]`（无 tokio runtime），而被守的不变量正是
+        // `Arc<dyn Account>: Send + Sync` 可跨真实 OS 线程——换成托管 spawn 就测不到它。
+        #[allow(clippy::disallowed_methods)]
         std::thread::spawn(move || {
             assert!(cloned.to_proto().value().len() == 4);
         })

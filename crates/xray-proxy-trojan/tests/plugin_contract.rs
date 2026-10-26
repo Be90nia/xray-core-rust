@@ -240,3 +240,59 @@ fn l4_pool_discipline() {
         xray_frame::pool::ManagedBufferPool::new(xray_frame::pool::XrayBufPool::new(8, 8), 8, 8);
     xray_frame::assert_pool_discipline!(pool, 4);
 }
+
+// ── L4 真实实例夹具（bd 2zi1o）──
+// 上面四条 l4_*（含兄弟 crate 的同族 56 条）验的是**框架原语**：ctx/池由夹具自造、
+// work 闭包为空，插件类型从未出场。本条把契约断言接到真实 `TrojanPlugin` 实例上，
+// 并补上既有装配链测试判不出的面——`report.is_clean()` 对**空报告**也返回 true
+// （零组件无可失败），所以「stop 从未注册」同样能绿；只有按插件名逐条核对报告
+// 条目才算条款 6 StopRegistered 的执行面。
+
+/// 真实实例契约夹具：声明面取实例值 → lifecycle 三相经 bring_up 真实编排 → stop
+/// 闭包按插件名注册进 ShutdownCoordinator → build 产物行为可用。
+///
+/// 证伪面（实测）：lifecycle 断（start/stop 返 Err）→ bring_up/report 红；build
+/// 空壳化 → `built_validator()` 返 Err → 红；name 改名 → 报告条目名不匹配红。
+#[tokio::test]
+async fn l4_real_instance_contract_lifecycle_and_stop_registered() {
+    let plugin = Arc::new(TrojanPlugin::default());
+
+    // ① 声明面：实例真实值（deps/contract 都有默认或静态面，单测默认实现判不出接线）。
+    assert_eq!(plugin.name(), "trojan", "插件名 = 段路由 key（坑约束 7）");
+    assert_eq!(plugin.version(), env!("CARGO_PKG_VERSION"), "version 随 crate 版本");
+    assert!(plugin.deps().is_empty(), "trojan 不依赖其他插件");
+    assert_eq!(plugin.contract().clauses.len(), 12, "12 条通用条款全适用");
+
+    // ② lifecycle：init→start 由 bring_up 按真实 lifecycle 对象编排，stop 由
+    //    coordinator 执行（插件级三相直通，连接级 accept 属实例面，见 src/plugin.rs）。
+    let mut framework = Framework::builder(framework_options())
+        .expect("registry cap")
+        .with_config(trojan_section_config(json!({
+            "clients": [{ "password": "test-pass-12345", "email": "alice" }],
+            "fallbacks": [{ "dest": 80 }]
+        })))
+        .register(Arc::clone(&plugin) as Arc<dyn Plugin>)
+        .expect("register")
+        .build()
+        .expect("build phase");
+    framework.bring_up().expect("bring_up: init/start 三相（真实 lifecycle 对象）");
+    assert!(framework.is_running(), "bring_up 后账本必须是运行态");
+
+    // ③ 条款 6 StopRegistered 执行面：报告里必须恰有该插件名的条目。
+    let report = framework.shutdown().await;
+    let stopped: Vec<&str> = report.per_component.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(stopped, ["trojan"], "stop 闭包必须按插件名注册进 ShutdownCoordinator");
+    assert!(report.is_clean(), "健康链必须全 Stopped: {report:?}");
+
+    // ④ 行为：段 → build 产物来自真实实例（空壳插件 build 空转 → 下面全 Err）。
+    let validator = plugin.built_validator().expect("build 产出 validator");
+    assert_eq!(validator.get_count(), 1, "段内 client 进 email 索引");
+    assert_eq!(validator.get_key_count(), 1, "同一 client 进 hex(key) 索引");
+    assert!(validator.get_by_email("alice").is_some(), "段内用户可按 email 取出");
+    assert!(validator.get_by_email("mallory").is_none(), "未配置用户不得通过查找");
+    assert_eq!(
+        plugin.inbound_handler("trojan-in").expect("build 产出入站 handler").tag(),
+        "trojan-in",
+        "handler 由插件按注入 tag 产出"
+    );
+}

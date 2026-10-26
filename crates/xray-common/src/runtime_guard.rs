@@ -182,7 +182,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn multi_thread_runtime_captures_park_and_busy_duration() {
         let before = RuntimeMetricsSnapshot::capture(&Handle::current());
-        let h = tokio::spawn(async {
+        let h = crate::testing::spawn("runtime-park-probe", async {
             sleep(TokioDuration::from_millis(15)).await;
         });
         h.await.unwrap();
@@ -211,7 +211,7 @@ mod tests {
     async fn worker_busy_duration_capture_under_concurrent_task() {
         let captured = Arc::new(AtomicU64::new(0));
         let c2 = captured.clone();
-        let _h = tokio::spawn(async move {
+        let _h = crate::testing::spawn("runtime-busy-capture", async move {
             let snap = RuntimeMetricsSnapshot::capture(&Handle::current());
             c2.store(snap.worker_busy_duration.as_nanos() as u64, Ordering::SeqCst);
         });

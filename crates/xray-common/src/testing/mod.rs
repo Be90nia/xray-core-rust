@@ -8,6 +8,11 @@
 //!
 //! 本模块仅服务测试目标（`tests/*.rs` 与 `#[cfg(test)]` 模块）；生产代码引用
 //! 它等于绕过 L3 闸，视为违规。
+//!
+//! **不加 feature/cfg 门（bd 5t916 评估判定）**：268 处调用横跨 17 个 crate，且集成
+//! 测试编译 lib 时不带 `cfg(test)`——加门须改 17 份 `[dev-dependencies]` 否则全断，
+//! 而收益只是省下产线包里这 5 行；代价面远大于收益，故保留无条件编入，闸门改由
+//! 本 crate `clippy.toml`（禁裸 `tokio::spawn`）+ 本条违规声明共同把守。
 
 use std::future::Future;
 
@@ -17,6 +22,7 @@ use tracing::Instrument as _;
 /// 测试专用 spawn：等价 `tokio::spawn` + 任务名 span。
 ///
 /// `task` 是测试内任务标签（如 `"mock-dns-server"`），出现在 `test_task` span 上。
+#[allow(clippy::disallowed_methods)] // 本模块是 L3 闸唯一的测试面裸 spawn 豁免点（见模块文档）；不要在别处复制
 pub fn spawn<F>(task: &'static str, fut: F) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,

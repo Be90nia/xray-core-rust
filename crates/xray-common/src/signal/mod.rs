@@ -430,7 +430,7 @@ mod tests {
     async fn test_done_wait_then_cancel() {
         let mut done = Done::new();
         let done_clone = done.clone();
-        tokio::spawn(async move {
+        crate::testing::spawn("done-wait-then-cancel", async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             done_clone.cancel();
         });
@@ -458,7 +458,7 @@ mod tests {
     async fn test_notifier_wait_notify() {
         let notifier = Notifier::new();
         let notifier_clone = notifier.clone();
-        tokio::spawn(async move {
+        crate::testing::spawn("notifier-wait-notify", async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             notifier_clone.notify();
         });
@@ -493,7 +493,7 @@ mod tests {
         let timer_ref = ActivityTimer::new(Duration::from_millis(200));
 
         // 在超时前发送活动通知
-        tokio::spawn(async move {
+        crate::testing::spawn("activity-timer-touch", async move {
             tokio::time::sleep(Duration::from_millis(80)).await;
             timer_ref.update_activity();
         });
@@ -509,7 +509,7 @@ mod tests {
         let mut done = timer.done_signal();
 
         // spawn timer run，超时后 done 信号应触发
-        tokio::spawn(async move {
+        crate::testing::spawn("activity-timer-run", async move {
             timer.run().await;
         });
 
@@ -575,7 +575,7 @@ mod tests {
         let _permit = sem.acquire().await;
         assert_eq!(sem.available_permits(), 0);
 
-        let handle = tokio::spawn(async move {
+        let handle = crate::testing::spawn("semaphore-acquire", async move {
             let _p = sem_clone.acquire().await;
         });
 

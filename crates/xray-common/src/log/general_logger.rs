@@ -144,6 +144,10 @@ impl GeneralLogger {
         let creator = Arc::clone(&self.creator);
         let inner = Arc::clone(&self.inner);
         let dropped = Arc::clone(&self.dropped);
+        // 豁免理由：日志 writer 后台任务——本 crate 是 udf logx 通道 sink 的实现层，
+        // 不依赖 xray-frame（禁环），拿不到 PluginContext/FxScope；托管性由
+        // GeneralLoggerGuard 持有 JoinHandle 等价兑现（停机即 abort）。
+        #[allow(clippy::disallowed_methods)]
         let handle = tokio::spawn(async move {
             run_loop(creator, inner, dropped, rx).await;
         });
@@ -351,7 +355,7 @@ mod tests {
         let mut joins = Vec::new();
         for _ in 0..8 {
             let l = Arc::clone(&logger);
-            joins.push(tokio::spawn(async move {
+            joins.push(crate::testing::spawn("general-logger-fanout", async move {
                 for i in 0..10 {
                     l.handle_message(&Message::new(Severity::Info, format!("m{i}")));
                 }
