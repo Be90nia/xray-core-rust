@@ -49,6 +49,10 @@ impl std::fmt::Display for Timestamp {
 ///
 /// 对应 Go 版本的 `NowTime()`。
 #[must_use]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "Go NowTime() 兼容语义取墙钟 Unix 秒；纯函数无 ctx，时钟端口注入待 bd 39hko"
+)]
 pub fn now_time() -> Timestamp {
     Timestamp(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0))
 }
@@ -80,6 +84,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::disallowed_methods, reason = "测试：now_time 墙钟邻近性断言取时")]
     fn test_now_time_near_system_clock() {
         let before = SystemTime::now()
             .duration_since(UNIX_EPOCH)

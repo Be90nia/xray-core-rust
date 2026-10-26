@@ -146,6 +146,7 @@ mod tests {
     /// 进程级 env 变更互斥锁（测试并行时串行化）。
     static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
+    #[allow(clippy::disallowed_methods, reason = "测试：临时目录唯一名（pid+纳秒）")]
     fn unique_dir(label: &str) -> PathBuf {
         let mut d = std::env::temp_dir();
         d.push(format!(

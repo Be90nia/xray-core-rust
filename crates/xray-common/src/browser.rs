@@ -32,6 +32,10 @@ fn get_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str
 }
 
 /// UTC 当天秒数 → epoch 天数（对齐 Go `time.Now().Unix() / 86400`）。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "UA 版本锚定取墙钟日历（Go 对齐）；纯函数无 ctx，时钟端口注入待 bd 39hko"
+)]
 fn today_unix_days() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -134,6 +138,10 @@ pub fn safari_version() -> String {
 fn sample_safari_version() -> String {
     const SAFARI_MINOR_MAP: [i64; 25] =
         [0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5, 5, 5, 6, 6, 6, 6];
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "Safari 版本日界判定取墙钟（Go 对齐）；纯函数无 ctx，时钟端口注入待 bd 39hko"
+    )]
     let now_secs: i64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

@@ -25,6 +25,7 @@ use std::{
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use rand::{Rng, RngCore};
+use skeleton_infra::fx::FxScope;
 use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle};
 
 use super::{UDP_SIZE, UdpIo, Udpmask};
@@ -104,7 +105,10 @@ struct HopShared {
 pub struct UdpHopConn {
     shared: Arc<HopShared>,
     rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>>,
-    hop_task: Option<JoinHandle<()>>,
+    /// hop 周期任务唯一托管口（坑约束 5）。scope 归 conn 独占、无 close 调用；
+    /// Drop 随 conn 释放 abort（与原「存储 JoinHandle + Drop abort」等价收口）。
+    #[allow(dead_code)]
+    fx: Arc<FxScope>,
 }
 
 impl UdpHopConn {
@@ -124,13 +128,11 @@ impl UdpHopConn {
             remote_ports: cfg.remote_ports.clone(),
         });
         // 仅在确有跳变维度时起周期任务；remoteOnce-only 时 Go 的 ticker 空转，此处直接省略。
-        let hop_task = if shared.local || shared.remote {
+        // 闸关不可达：scope 归 UdpHopConn 独占，无 close 调用（Drop 随 conn 释放 abort）。
+        let fx = Arc::new(FxScope::new());
+        if shared.local || shared.remote {
             let s = Arc::clone(&shared);
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "常驻监控任务（UDP hop 周期跳变）；迁 FxScope 待 bd 39hko"
-            )]
-            Some(tokio::spawn(async move {
+            fx.spawn(async move {
                 loop {
                     // Go RandBetween(from>to 时交换)；校验保证 >=5，.max(0) 防 i64 负值转 u64。
                     let (lo, hi) =
@@ -139,11 +141,10 @@ impl UdpHopConn {
                     tokio::time::sleep(Duration::from_secs(secs as u64)).await;
                     hop_once_shared(&s).await;
                 }
-            }))
-        } else {
-            None
-        };
-        Self { shared, rx: tokio::sync::Mutex::new(rx), hop_task }
+            })
+            .expect("internal FxScope is never closed");
+        }
+        Self { shared, rx: tokio::sync::Mutex::new(rx), fx }
     }
 
     /// 执行一次跳变（hop 循环体；仅测试用——确定性驱动单次跳变，不等真实间隔）。
@@ -309,9 +310,8 @@ impl UdpIo for UdpHopConn {
 
 impl Drop for UdpHopConn {
     fn drop(&mut self) {
-        if let Some(t) = self.hop_task.take() {
-            t.abort();
-        }
+        // hop 周期任务由 self.fx（FxScope）随 conn 释放收口；此处 abort 的是
+        // 数据面转发任务（当前跳与上一跳 socket 的 recv pump）。
         let mut core = self.shared.core.lock();
         core.cur.recv_task.abort();
         if let Some(p) = core.prev.take() {

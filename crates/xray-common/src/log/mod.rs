@@ -87,6 +87,10 @@ pub struct Record {
 
 impl Record {
     /// 从消息创建新记录，时间戳为当前时间。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "日志时间戳 = 墙钟语义（Go 对齐）；Record::new 无 ctx 形参，时钟端口注入待 bd 39hko"
+    )]
     pub fn new(message: Message) -> Self {
         Self { message, timestamp: std::time::SystemTime::now() }
     }

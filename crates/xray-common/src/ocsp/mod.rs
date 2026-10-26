@@ -189,6 +189,7 @@ mod tests {
 
     #[test]
     fn test_ocsp_response_revoked() {
+        #[allow(clippy::disallowed_methods, reason = "测试：吊销时刻锚点构造")]
         let now = std::time::SystemTime::now();
         let resp = OcspResponse::revoked(now, 1);
         assert!(!resp.is_good());
