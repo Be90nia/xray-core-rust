@@ -21,6 +21,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use skeleton_infra::fx::Spawned;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use xray_app_dispatcher::default::DialFn;
 use xray_common::{
@@ -30,6 +31,7 @@ use xray_common::{
     uuid::UUID,
 };
 use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead};
+use xray_frame::PluginContext;
 use xray_transport::connection::Connection;
 
 use crate::{
@@ -223,9 +225,10 @@ use std::str::FromStr;
 /// # Panics
 ///
 /// 不会 panic；任何错误以 `Err(String)` 返回。
-pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>) -> DialFn {
+pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>, ctx: Arc<PluginContext>) -> DialFn {
     Arc::new(move |dest: &Destination| {
         let config = Arc::clone(&config);
+        let ctx = Arc::clone(&ctx);
         let target_addr = dest.address().clone();
         let target_port = dest.port();
         let is_udp = dest.is_udp();
@@ -317,6 +320,7 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>) -> DialFn {
             //    pump；响应头在 down pump 内惰性解码）。
             if is_udp {
                 return Ok(Box::new(VmessUdpConn::from_udp_conn(
+                    &ctx,
                     conn,
                     session,
                     req_cipher,
@@ -330,6 +334,7 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>) -> DialFn {
                 )) as Box<dyn Connection>);
             }
             Ok(Box::new(VmessConn::from_conn(
+                &ctx,
                 conn,
                 session,
                 req_cipher,
@@ -356,13 +361,14 @@ const PUMP_BUF: usize = 8192;
 /// `_pump` 字段保证桥接 task 生命周期与连接一致——drop 时自动 abort。
 pub struct VmessConn {
     inner: DuplexStream,
-    _pump: tokio::task::JoinHandle<()>,
+    _pump: Spawned<()>,
 }
 
 impl VmessConn {
     /// 从底层连接构造：spawn 双向 pump（明文 duplex ↔ chunk 密文 wire），返回 duplex 客户端包装。
     #[allow(clippy::too_many_arguments)] // 与 Go dial 参数集一一对应
     fn from_conn(
+        ctx: &PluginContext,
         conn: Box<dyn Connection>,
         session: ClientSession,
         req_cipher: BodyCipher,
@@ -376,28 +382,29 @@ impl VmessConn {
     ) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF);
         let (stream_r, stream_w) = tokio::io::split(conn);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "热路径豁免（B6 t975）：每帧泵——明文 duplex ↔ chunk AEAD wire 双向搬运，热路径零改动（坑约束 12）；托管接线归 P1 插件装配"
-        )]
-        let pump = tokio::spawn(async move {
-            let (server_r, mut server_w) = tokio::io::split(server_io);
-            // up: 明文 duplex → chunk 加密 → wire（请求 body）
-            let up = pump_up(server_r, stream_w, req_cipher, req_iv, req_size_parser, req_padding);
-            // down: 先惰性解码响应头，再 chunk 解密 → 明文 duplex。
-            // 与 up 并发执行：服务端（Go SetFlushNext）把响应头缓冲到首块下行数据，
-            // 上行数据必须先于响应头到达，因此不能在 dial 阶段同步等待响应头。
-            let down = async move {
-                let mut sr = stream_r;
-                if let Err(e) = session.decode_response_header_async(&mut sr).await {
-                    tracing::debug!(error = %e, "vmess decode response header failed");
-                    let _ = server_w.shutdown().await;
-                    return;
-                }
-                pump_down(sr, server_w, resp_cipher, resp_iv, resp_size_parser, resp_padding).await;
-            };
-            tokio::join!(up, down);
-        });
+        // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
+        let pump = ctx
+            .spawn(async move {
+                let (server_r, mut server_w) = tokio::io::split(server_io);
+                // up: 明文 duplex → chunk 加密 → wire（请求 body）
+                let up =
+                    pump_up(server_r, stream_w, req_cipher, req_iv, req_size_parser, req_padding);
+                // down: 先惰性解码响应头，再 chunk 解密 → 明文 duplex。
+                // 与 up 并发执行：服务端（Go SetFlushNext）把响应头缓冲到首块下行数据，
+                // 上行数据必须先于响应头到达，因此不能在 dial 阶段同步等待响应头。
+                let down = async move {
+                    let mut sr = stream_r;
+                    if let Err(e) = session.decode_response_header_async(&mut sr).await {
+                        tracing::debug!(error = %e, "vmess decode response header failed");
+                        let _ = server_w.shutdown().await;
+                        return;
+                    }
+                    pump_down(sr, server_w, resp_cipher, resp_iv, resp_size_parser, resp_padding)
+                        .await;
+                };
+                tokio::join!(up, down);
+            })
+            .expect("plugin ctx FxScope is never closed (assembly-owned)");
         Self { inner: client_io, _pump: pump }
     }
 }
@@ -460,13 +467,14 @@ struct VmessUdpConn {
     up_chunk_cap: usize,
     wpending: Vec<u8>,
     wpos: usize,
-    _down_task: tokio::task::JoinHandle<()>,
+    _down_task: Spawned<()>,
 }
 
 impl VmessUdpConn {
     /// 从底层连接构造 UDP 模式连接（响应头由 down task 惰性解码）。
     #[allow(clippy::too_many_arguments)] // 与 Go dial 参数集一一对应
     fn from_udp_conn(
+        ctx: &PluginContext,
         conn: Box<dyn Connection>,
         session: ClientSession,
         req_cipher: BodyCipher,
@@ -484,45 +492,44 @@ impl VmessUdpConn {
             &req_cipher,
             req_size_parser.as_ref(),
         );
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "热路径豁免（B6 t975）：每帧泵——UDP 模式响应头惰性解码 + chunk 解密下行泵，热路径零改动（坑约束 12）；托管接线归 P1 插件装配"
-        )]
-        let down_task = tokio::spawn(async move {
-            let mut sr = stream_r;
-            // 响应头惰性解码（Go SetFlushNext：首块下行才 flush，dial 阶段同步
-            // 等待会造成双向死锁——与 VmessConn 同语义）。
-            if let Err(e) = session.decode_response_header_async(&mut sr).await {
-                tracing::debug!(error = %e, "vmess udp decode response header failed");
-                let _ = tx
-                    .send(Err(std::io::Error::other(format!("vmess udp response header: {e}"))))
-                    .await;
-                return;
-            }
-            let mut nonce_gen = ChunkNonceAdapter::new(&resp_iv, 12);
-            loop {
-                match crate::encoding::body_chunk::decode_single_chunk_async(
-                    &mut sr,
-                    &resp_cipher,
-                    &mut nonce_gen,
-                    resp_size_parser.as_mut(),
-                    resp_padding,
-                )
-                .await
-                {
-                    Ok(Some(pkt)) => {
-                        if tx.send(Ok(pkt)).await.is_err() {
-                            break; // 读端已 drop
-                        }
-                    },
-                    Ok(None) => break, // 终止 chunk / 干净 EOF = 流结束
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                        break;
-                    },
+        // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
+        let down_task = ctx
+            .spawn(async move {
+                let mut sr = stream_r;
+                // 响应头惰性解码（Go SetFlushNext：首块下行才 flush，dial 阶段同步
+                // 等待会造成双向死锁——与 VmessConn 同语义）。
+                if let Err(e) = session.decode_response_header_async(&mut sr).await {
+                    tracing::debug!(error = %e, "vmess udp decode response header failed");
+                    let _ = tx
+                        .send(Err(std::io::Error::other(format!("vmess udp response header: {e}"))))
+                        .await;
+                    return;
                 }
-            }
-        });
+                let mut nonce_gen = ChunkNonceAdapter::new(&resp_iv, 12);
+                loop {
+                    match crate::encoding::body_chunk::decode_single_chunk_async(
+                        &mut sr,
+                        &resp_cipher,
+                        &mut nonce_gen,
+                        resp_size_parser.as_mut(),
+                        resp_padding,
+                    )
+                    .await
+                    {
+                        Ok(Some(pkt)) => {
+                            if tx.send(Ok(pkt)).await.is_err() {
+                                break; // 读端已 drop
+                            }
+                        },
+                        Ok(None) => break, // 终止 chunk / 干净 EOF = 流结束
+                        Err(e) => {
+                            let _ = tx.send(Err(e)).await;
+                            break;
+                        },
+                    }
+                }
+            })
+            .expect("plugin ctx FxScope is never closed (assembly-owned)");
         Self {
             inner_w: stream_w,
             rx,
@@ -940,6 +947,10 @@ async fn pump_down<C, R, W>(
 mod tests {
     use super::*;
 
+    fn test_ctx() -> Arc<PluginContext> {
+        Arc::new(PluginContext::for_plugin("vmess"))
+    }
+
     /// bd cjwc G6（Go outbound.go:71）：dial 拒绝退避重试 5 次。关闭的 listener
     /// 无 accept 可计数、dial_system 环路带内部定时器（16s connect timeout）污染
     /// 虚拟时钟 → 真实时钟断言 sleep 阶梯下界（末次失败不再延迟：
@@ -956,7 +967,7 @@ mod tests {
             Address::IPv4(std::net::Ipv4Addr::LOCALHOST),
             Port::new(port),
         ));
-        let dial_fn = make_vmess_dial_fn(cfg);
+        let dial_fn = make_vmess_dial_fn(cfg, test_ctx());
         let dest = Destination::tcp(Address::new_domain("example.com"), Port::new(80));
 
         let start = std::time::Instant::now();
@@ -1013,7 +1024,7 @@ mod tests {
             Address::new_domain("example.com"),
             Port::new(443),
         ));
-        let _dial = make_vmess_dial_fn(Arc::clone(&cfg));
+        let _dial = make_vmess_dial_fn(Arc::clone(&cfg), test_ctx());
         assert_eq!(Arc::strong_count(&cfg), 2);
     }
     #[test]
@@ -1172,7 +1183,7 @@ mod tests {
             Address::from_ipv4_bytes([127, 0, 0, 1]),
             Port::new(server_port),
         ));
-        let dial = make_vmess_dial_fn(Arc::clone(&cfg));
+        let dial = make_vmess_dial_fn(Arc::clone(&cfg), test_ctx());
         let dest =
             Destination::new(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(1), Network::TCP);
 
@@ -1207,6 +1218,7 @@ mod tests {
 
         let (client_side, mut server_side) = tokio::io::duplex(16384);
         let mut conn = VmessUdpConn::from_udp_conn(
+            &test_ctx(),
             Box::new(xray_transport::connection::DuplexConnection::new(client_side)),
             ClientSession::new(),
             BodyCipher::Aes(Aes128Gcm::new(&[0x42u8; 16]).expect("cipher")),
@@ -1261,6 +1273,7 @@ mod tests {
 
         let (client_side, _server_side) = tokio::io::duplex(16384);
         let mut conn = VmessUdpConn::from_udp_conn(
+            &test_ctx(),
             Box::new(xray_transport::connection::DuplexConnection::new(client_side)),
             ClientSession::new(),
             BodyCipher::Aes(Aes128Gcm::new(&[0x42u8; 16]).expect("cipher")),

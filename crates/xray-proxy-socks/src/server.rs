@@ -18,8 +18,8 @@ use tokio::{
     net::TcpListener,
     sync::Mutex,
 };
-use tracing::{info, warn};
 use xray_features::inbound::{InboundError, InboundHandler};
+use xray_frame::LogFacade;
 
 use crate::{
     config::{AuthType, ServerConfig},
@@ -62,12 +62,22 @@ pub struct SocksServer {
     slot: Mutex<Option<(Arc<TcpListener>, Spawned<()>)>>,
     /// 组件内自持托管 scope（B6，app 家族同款；不接 close，闸关不可达）。
     fx: Arc<FxScope>,
+    /// 域规范日志门面（nn8os 2b 打回处置：self.fx 的 B6 自持面同构——构造签名
+    /// 零变化 = 零触碰 arm_builders 他人面；target 钉死 `xray_frame::socks` +
+    /// mask_secrets 过 L3）。
+    log: LogFacade,
 }
 
 impl SocksServer {
     /// 构造 SOCKS 服务端。`addr` 是监听地址（如 `"127.0.0.1:1080"`）。
     pub fn new(tag: impl Into<String>, config: ServerConfig) -> Self {
-        Self { tag: tag.into(), config, slot: Mutex::new(None), fx: Arc::new(FxScope::new()) }
+        Self {
+            tag: tag.into(),
+            config,
+            slot: Mutex::new(None),
+            fx: Arc::new(FxScope::new()),
+            log: LogFacade::new("socks", vec![]),
+        }
     }
 
     /// 获取监听端口（start 后有效，否则返回 0）。
@@ -101,13 +111,16 @@ impl InboundHandler for SocksServer {
         let bound = listener
             .local_addr()
             .map_err(|e| InboundError::ListenError(format!("local_addr: {e}")))?;
-        info!(tag = %self.tag, addr = %bound, "SOCKS server started");
+        self.log.info(format!("SOCKS server started tag={} addr={bound}", self.tag));
 
         // spawn accept loop — 持有 Arc<TcpListener> clone，无需访问 Mutex
         let tag = self.tag.clone();
         let config = self.config.clone();
         let listener_clone = Arc::clone(&listener);
         let fx = Arc::clone(&self.fx);
+        // 任务内日志只持克隆门面（spawn 的 future 不得借用 self）；循环体内
+        // 逐连接再克隆——外层 move 捕获的绑定会被首轮内层 spawn 消耗（E0382）。
+        let log = self.log.clone();
         // 预制克隆源：async move 块捕获 fx_conns，避免块自捕获 fx 与 spawn 接收者
         // 借用冲突（E0505）。
         let fx_conns = Arc::clone(&fx);
@@ -119,26 +132,26 @@ impl InboundHandler for SocksServer {
                             let tag = tag.clone();
                             let config = config.clone();
                             let fx = Arc::clone(&fx_conns);
+                            let log = log.clone();
                             fx.spawn(async move {
                                 match socks_handshake(&mut stream, &config).await {
                                     Ok(addr) => {
-                                        info!(
-                                            tag = %tag,
-                                            peer = %peer,
-                                            dest = ?addr,
-                                            "SOCKS5 handshake succeeded"
-                                        );
+                                        log.info(format!(
+                                            "SOCKS5 handshake succeeded tag={tag} peer={peer} dest={addr:?}"
+                                        ));
                                         // 切片3: dispatch to outbound handler
                                     },
                                     Err(e) => {
-                                        warn!(tag = %tag, peer = %peer, error = %e, "handshake failed");
+                                        log.warn(format!(
+                                            "handshake failed tag={tag} peer={peer} error={e}"
+                                        ));
                                     },
                                 }
                             })
                             .expect("internal FxScope is never closed");
                         },
                         Err(e) => {
-                            warn!(tag = %tag, error = %e, "accept failed");
+                            log.warn(format!("accept failed tag={tag} error={e}"));
                             break;
                         },
                     }
@@ -155,7 +168,7 @@ impl InboundHandler for SocksServer {
             // abort 取消阻塞中的 accept()，task 内 Arc<TcpListener> 随 task 结束 drop
             handle.abort();
             // _listener（我们的 Arc clone）在此 drop
-            info!(tag = %self.tag, "SOCKS server closed");
+            self.log.info(format!("SOCKS server closed tag={}", self.tag));
         }
         Ok(())
     }

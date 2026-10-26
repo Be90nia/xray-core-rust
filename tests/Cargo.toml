@@ -99,6 +99,7 @@ path = "integration/fingerprint_matrix_test.rs"
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 xray-common = { path = "../crates/xray-common" }
+xray-frame = { path = "../crates/xray-frame" }
 xray-proxy-vmess = { path = "../crates/xray-proxy-vmess" }
 xray-proxy-vless = { path = "../crates/xray-proxy-vless" }
 xray-proxy-trojan = { path = "../crates/xray-proxy-trojan" }

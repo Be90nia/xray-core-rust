@@ -101,7 +101,10 @@ async fn loopback_echo_works() {
         "test-password",
         make_client_config(&cert_der),
     );
-    let client = AnytlsClient::new(client_config);
+    let client = AnytlsClient::new(
+        client_config,
+        std::sync::Arc::new(xray_frame::PluginContext::for_plugin("anytls")),
+    );
 
     // 5. dial 到 echo server
     let target = SocksAddr::ipv4(std::net::Ipv4Addr::new(127, 0, 0, 1), echo_addr.port());
@@ -138,7 +141,10 @@ async fn loopback_large_payload() {
         "test-password",
         make_client_config(&cert_der),
     );
-    let client = AnytlsClient::new(client_config);
+    let client = AnytlsClient::new(
+        client_config,
+        std::sync::Arc::new(xray_frame::PluginContext::for_plugin("anytls")),
+    );
     let target = SocksAddr::ipv4(std::net::Ipv4Addr::new(127, 0, 0, 1), echo_addr.port());
     let mut conn = tokio::time::timeout(Duration::from_secs(10), client.dial(&target))
         .await

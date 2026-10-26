@@ -801,6 +801,7 @@ impl ServerInstance {
         seconds_from: u32,
         seconds_to: u32,
         padding: &str,
+        ctx: std::sync::Arc<xray_frame::PluginContext>,
     ) -> Result<()> {
         if !self.nfs_skeys.is_empty() {
             return Err(VlessError::Other("ServerInstance already initialized".into()));
@@ -853,11 +854,8 @@ impl ServerInstance {
         // 过期 ticket；`closed` 置位后任务退出（Go Closed bool）。
         if self.seconds_from > 0 || self.seconds_to > 0 {
             let store = std::sync::Arc::clone(&self.sessions);
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-            )]
-            tokio::spawn(async move {
+            // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
+            ctx.spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
                 interval.tick().await; // 首次 tick 立即返回，跳过
                 loop {
@@ -868,7 +866,8 @@ impl ServerInstance {
                     }
                     s.cleanup_expired(unix_minute());
                 }
-            });
+            })
+            .expect("plugin ctx FxScope is never closed (assembly-owned)");
         }
         Ok(())
     }
@@ -1309,6 +1308,9 @@ impl ServerInstance {
 
 #[cfg(test)]
 mod tests {
+    fn test_ctx() -> std::sync::Arc<xray_frame::PluginContext> {
+        std::sync::Arc::new(xray_frame::PluginContext::for_plugin("vless"))
+    }
     use super::*;
 
     // === write_padding_fragments（Go client.go:149-153 / server.go:304-306）===
@@ -1505,7 +1507,7 @@ mod tests {
             let mut client = ClientInstance::new();
             client.init(client_pkeys.to_vec(), xor_mode, 0, "").unwrap();
             let mut server = ServerInstance::new();
-            server.init(server_skeys.to_vec(), xor_mode, 0, 0, "").unwrap();
+            server.init(server_skeys.to_vec(), xor_mode, 0, 0, "", test_ctx()).unwrap();
 
             let (client_io, server_io) = tokio::io::duplex(64 * 1024);
             let client_fut = client.handshake(client_io);
@@ -1634,7 +1636,7 @@ mod tests {
             let mut client = ClientInstance::new();
             client.init(client_pkeys.clone(), 0, 600, "").unwrap();
             let mut server = ServerInstance::new();
-            server.init(server_skeys.clone(), 0, 600, 600, "").unwrap();
+            server.init(server_skeys.clone(), 0, 600, 600, "", test_ctx()).unwrap();
             let (client_io, server_io) = tokio::io::duplex(64 * 1024);
             let (c_res, s_res) =
                 tokio::join!(client.handshake(client_io), server.handshake(server_io));
@@ -1671,7 +1673,7 @@ mod tests {
             let mut client = ClientInstance::new();
             client.init(client_pkeys.clone(), 0, 1, "").unwrap();
             let mut server = ServerInstance::new();
-            server.init(server_skeys.clone(), 0, 1, 1, "").unwrap();
+            server.init(server_skeys.clone(), 0, 1, 1, "", test_ctx()).unwrap();
             let (client_io, server_io) = tokio::io::duplex(64 * 1024);
             let (c_res, s_res) =
                 tokio::join!(client.handshake(client_io), server.handshake(server_io));
@@ -1716,7 +1718,7 @@ mod tests {
                 let mut c = ClientInstance::new();
                 c.init(client_pkeys.clone(), 0, 600, "").unwrap();
                 let mut server = ServerInstance::new();
-                server.init(server_skeys.clone(), 0, 600, 600, "").unwrap();
+                server.init(server_skeys.clone(), 0, 600, 600, "", test_ctx()).unwrap();
                 let (client_io, server_io) = tokio::io::duplex(64 * 1024);
                 let (c_res, s_res) =
                     tokio::join!(c.handshake(client_io), server.handshake(server_io));
@@ -1735,7 +1737,7 @@ mod tests {
         // --- 第二连：0-RTT。client handshake 恒成功（不等响应直接返回）；
         //     手动验收侧 X25519 highest bit ~50% 失败 → 整连重试。 ---
         let mut verify_server = ServerInstance::new();
-        verify_server.init(server_skeys.clone(), 0, 0, 0, "").unwrap();
+        verify_server.init(server_skeys.clone(), 0, 0, 0, "", test_ctx()).unwrap();
         for _ in 0..32 {
             let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
             let hs = tokio::time::timeout(
@@ -1876,7 +1878,7 @@ mod tests {
         let mut client = ClientInstance::new();
         client.init(client_pkeys.clone(), 0, 600, "").unwrap();
         let mut server = ServerInstance::new();
-        server.init(server_skeys.clone(), 0, 600, 600, "").unwrap();
+        server.init(server_skeys.clone(), 0, 600, 600, "", test_ctx()).unwrap();
 
         // 连接 1：1-RTT
         let mut established = false;
@@ -1940,7 +1942,7 @@ mod tests {
         let mut client = ClientInstance::new();
         client.init(client_pkeys.clone(), 0, 600, "").unwrap();
         let mut server = ServerInstance::new();
-        server.init(server_skeys.clone(), 0, 600, 600, "").unwrap();
+        server.init(server_skeys.clone(), 0, 600, 600, "", test_ctx()).unwrap();
 
         // 连接 1：1-RTT 建会话
         let mut established = false;
@@ -1991,7 +1993,7 @@ mod tests {
         let mut client = ClientInstance::new();
         client.init(client_pkeys.clone(), 0, 600, "").unwrap();
         let mut server = ServerInstance::new();
-        server.init(server_skeys.clone(), 0, 600, 600, "").unwrap();
+        server.init(server_skeys.clone(), 0, 600, 600, "", test_ctx()).unwrap();
         // 连接 1：1-RTT 建会话 + client 缓存
         let mut established = false;
         for _ in 0..32 {
@@ -2005,7 +2007,7 @@ mod tests {
         assert!(established, "1-RTT first connection failed after 32 attempts");
         // 全新 server 实例（同密钥、seconds>0、零会话）模拟 server 侧重启/过期
         let mut fresh_server = ServerInstance::new();
-        fresh_server.init(server_skeys.clone(), 0, 600, 600, "").unwrap();
+        fresh_server.init(server_skeys.clone(), 0, 600, 600, "", test_ctx()).unwrap();
 
         // 手动构造 0-RTT 首包（ticket 在 fresh_server 会话库中不存在）
         let cached_ticket = *client.cache.entry.read().ticket.as_ref().expect("ticket cached");
@@ -2052,7 +2054,7 @@ mod tests {
         let mut client = ClientInstance::new();
         client.init(client_pkeys.clone(), 0, 600, "").unwrap();
         let mut server = ServerInstance::new();
-        server.init(server_skeys.clone(), 0, 600, 600, "").unwrap();
+        server.init(server_skeys.clone(), 0, 600, 600, "", test_ctx()).unwrap();
         let mut established = false;
         for _ in 0..32 {
             let (c1, s1) = tokio::io::duplex(64 * 1024);
@@ -2096,7 +2098,7 @@ mod tests {
             expire: Some(Instant::now() + std::time::Duration::from_secs(60)),
         };
         let mut server = ServerInstance::new();
-        server.init(server_skeys.clone(), 0, 0, 0, "").unwrap();
+        server.init(server_skeys.clone(), 0, 0, 0, "", test_ctx()).unwrap();
 
         // 手动构造 0-RTT 首包（seconds=0 的 server 必须拒绝）
         let first_flight = build_zero_rtt_first_flight(&client_pkeys[0], &[0xBB; 16]);
@@ -2179,7 +2181,7 @@ mod tests {
                 let mut c = ClientInstance::new();
                 c.init(client_pkeys.clone(), 0, 600, "").unwrap();
                 let mut server = ServerInstance::new();
-                server.init(server_skeys.clone(), 0, 600, 600, "").unwrap();
+                server.init(server_skeys.clone(), 0, 600, 600, "", test_ctx()).unwrap();
                 let (client_io, server_io) = tokio::io::duplex(64 * 1024);
                 let (c_res, s_res) =
                     tokio::join!(c.handshake(client_io), server.handshake(server_io));

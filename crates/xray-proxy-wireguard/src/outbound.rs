@@ -20,6 +20,7 @@ use std::{
 
 use tokio::sync::Mutex as AsyncMutex;
 use xray_common::net::{address::Address, destination::Destination};
+use xray_frame::PluginContext;
 
 use crate::{
     config::DeviceConfig,
@@ -48,8 +49,9 @@ impl WireguardOutboundHandler {
         tag: impl Into<String>,
         config: &DeviceConfig,
         dns: Option<&Arc<xray_app_dns::DnsService>>,
+        ctx: Arc<PluginContext>,
     ) -> Result<Self> {
-        Self::new_with_dialer(tag, config, dns, None, None).await
+        Self::new_with_dialer(tag, config, dns, None, None, ctx).await
     }
 
     /// 从 DeviceConfig 构造出站 Handler，WG 自身 UDP 可经 system dialer 出站。
@@ -73,6 +75,7 @@ impl WireguardOutboundHandler {
         system_dialer: Option<xray_app_dispatcher::default::DialFn>,
         // c7e569b0：endpoint 域名解析 TTL 缓存（Go Handler.cache）。None = 不缓存。
         dns_cache: Option<Arc<crate::dispatcher::TtlDnsCache>>,
+        ctx: Arc<PluginContext>,
     ) -> Result<Self> {
         let tag = tag.into();
         if config.peers.is_empty() {
@@ -124,7 +127,7 @@ impl WireguardOutboundHandler {
                     },
                     None => Arc::clone(dialer),
                 };
-                WgTransport::Dialed(Arc::new(DialedUdp::new(dialer, dest)))
+                WgTransport::Dialed(Arc::new(DialedUdp::new(ctx, dialer, dest)))
             },
             None => {
                 // 绑定本地 UDP：sendThrough 源地址（与远端同族时）优先，否则通配。
@@ -277,7 +280,13 @@ mod tests {
     async fn new_rejects_config_without_peers() {
         let (sec, _) = make_keypair(0x44);
         let cfg = DeviceConfig { secret_key: sec, ..Default::default() };
-        let result = WireguardOutboundHandler::new("test", &cfg, None).await;
+        let result = WireguardOutboundHandler::new(
+            "test",
+            &cfg,
+            None,
+            std::sync::Arc::new(xray_frame::PluginContext::for_plugin("wireguard")),
+        )
+        .await;
         assert!(result.is_err(), "should reject empty peers");
     }
 
@@ -293,7 +302,13 @@ mod tests {
             }],
             ..Default::default()
         };
-        let result = WireguardOutboundHandler::new("test", &cfg, None).await;
+        let result = WireguardOutboundHandler::new(
+            "test",
+            &cfg,
+            None,
+            std::sync::Arc::new(xray_frame::PluginContext::for_plugin("wireguard")),
+        )
+        .await;
         assert!(result.is_err(), "should reject invalid endpoint");
     }
 }

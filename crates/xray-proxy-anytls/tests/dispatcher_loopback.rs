@@ -106,7 +106,10 @@ async fn dispatcher_e2e_anytls_loopback_echo() {
         "test-password",
         make_client_config(&cert_der),
     );
-    let client = Arc::new(AnytlsClient::new(client_config));
+    let client = Arc::new(AnytlsClient::new(
+        client_config,
+        std::sync::Arc::new(xray_frame::PluginContext::for_plugin("anytls")),
+    ));
 
     // 4. dispatcher + DialBridge(AnytlsClient)
     let ohm = SimpleOhm::new();
@@ -167,7 +170,10 @@ async fn dispatcher_e2e_anytls_loopback_large_payload() {
         "test-password",
         make_client_config(&cert_der),
     );
-    let client = Arc::new(AnytlsClient::new(client_config));
+    let client = Arc::new(AnytlsClient::new(
+        client_config,
+        std::sync::Arc::new(xray_frame::PluginContext::for_plugin("anytls")),
+    ));
 
     let ohm = SimpleOhm::new();
     ohm.set_default(Arc::new(DialBridge::new(

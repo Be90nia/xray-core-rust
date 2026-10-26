@@ -421,11 +421,15 @@ fn freedom_family() -> RegisteredFamily {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push((Arc::clone(&dial_bridge), chain_tag));
             }
-            let handler = FreedomDispatchBridge::from_bridge(dial_bridge)
-                .with_noises(cfg.noises.clone())
-                .with_destination_override(cfg.destination_override.clone())
-                .with_domain_strategy(cfg.domain_strategy)
-                .with_final_rules(final_rules);
+            let handler = FreedomDispatchBridge::from_bridge(
+                // 接缝暂自持 for_plugin ctx（族级单实例）；P3 装配接线时改传装配根 ctx。
+                Arc::new(PluginContext::for_plugin("freedom")),
+                dial_bridge,
+            )
+            .with_noises(cfg.noises.clone())
+            .with_destination_override(cfg.destination_override.clone())
+            .with_domain_strategy(cfg.domain_strategy)
+            .with_final_rules(final_rules);
             Ok(Arc::new(handler) as Arc<dyn DispatchHandler>)
         })),
         plugin,
@@ -502,7 +506,11 @@ fn family_catalog(protocol: &str) -> Option<RegisteredFamily> {
         "freedom" => freedom_family(),
         "vmess" => dial_fn_family::<VmessPlugin, _>("vmess", |p, stream| {
             let config = (**p.built_outbound()?).clone().with_stream_settings(stream);
-            Ok(xray_proxy_vmess::make_vmess_dial_fn(Arc::new(config)))
+            // 接缝暂自持 for_plugin ctx（族级单实例）；P3 装配接线时改传装配根 ctx。
+            Ok(xray_proxy_vmess::make_vmess_dial_fn(
+                Arc::new(config),
+                Arc::new(PluginContext::for_plugin("vmess")),
+            ))
         }),
         "vless" => dial_fn_family::<VlessPlugin, _>("vless", |p, stream| {
             let config = (**p.built_outbound()?).clone().with_stream_settings(stream);
@@ -510,7 +518,10 @@ fn family_catalog(protocol: &str) -> Option<RegisteredFamily> {
         }),
         "shadowsocks" => dial_fn_family::<SsPlugin, _>("shadowsocks", |p, stream| {
             let config = (**p.built_outbound()?).clone().with_stream_settings(stream);
-            Ok(xray_proxy_ss::make_ss_dial_fn(Arc::new(config)))
+            Ok(xray_proxy_ss::make_ss_dial_fn_with_ctx(
+                Arc::new(config),
+                Arc::new(PluginContext::for_plugin("shadowsocks")),
+            ))
         }),
         "blackhole" => blackhole_family(),
         "loopback" => loopback_family(),

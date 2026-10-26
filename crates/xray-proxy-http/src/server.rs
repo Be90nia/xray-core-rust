@@ -16,7 +16,7 @@
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 
@@ -27,9 +27,9 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::Mutex,
 };
-use tracing::{info, warn};
 use xray_common::net::{address::Address, destination::Destination, port::Port};
 use xray_features::inbound::{InboundError, InboundHandler};
+use xray_frame::LogFacade;
 
 use crate::{
     config::ServerConfig,
@@ -170,13 +170,22 @@ pub struct HttpServer {
     slot: Mutex<Option<(Arc<TcpListener>, Spawned<()>)>>,
     /// 组件内自持托管 scope（B6，app 家族同款；不接 close，闸关不可达）。
     fx: Arc<FxScope>,
+    /// 域规范日志门面（nn8os 2b 打回处置，socks SocksServer 同型）：target 钉死
+    /// `xray_frame::http` + mask_secrets 过 L3；spawn 任务只持克隆门面。
+    log: LogFacade,
 }
 
 impl HttpServer {
     /// 构造 HTTP 代理服务端。
     #[must_use]
     pub fn new(tag: impl Into<String>, config: ServerConfig) -> Self {
-        Self { tag: tag.into(), config, slot: Mutex::new(None), fx: Arc::new(FxScope::new()) }
+        Self {
+            tag: tag.into(),
+            config,
+            slot: Mutex::new(None),
+            fx: Arc::new(FxScope::new()),
+            log: LogFacade::new("http", vec![]),
+        }
     }
 
     /// 获取监听端口（start 后有效，否则返回 0）。对齐 `xray-proxy-socks` 同名方法。
@@ -209,7 +218,7 @@ impl InboundHandler for HttpServer {
         let bound = listener
             .local_addr()
             .map_err(|e| InboundError::ListenError(format!("local_addr: {e}")))?;
-        info!(tag = %self.tag, addr = %bound, "HTTP proxy server started");
+        self.log.info(format!("HTTP proxy server started tag={} addr={bound}", self.tag));
 
         let tag = self.tag.clone();
         let config = self.config.clone();
@@ -218,6 +227,8 @@ impl InboundHandler for HttpServer {
         // 预制克隆源：async move 块捕获 fx_conns，避免块自捕获 fx 与 spawn 接收者
         // 借用冲突（E0505）。
         let fx_conns = Arc::clone(&fx);
+        // 任务内日志只持克隆门面（spawn 的 future 不得借用 self；socks 同款）。
+        let log = self.log.clone();
         let handle = fx
             .spawn(async move {
                 loop {
@@ -232,7 +243,7 @@ impl InboundHandler for HttpServer {
                             .expect("internal FxScope is never closed");
                         },
                         Err(e) => {
-                            warn!(tag = %tag, error = %e, "accept failed");
+                            log.warn(format!("accept failed tag={tag} error={e}"));
                             break;
                         },
                     }
@@ -247,7 +258,7 @@ impl InboundHandler for HttpServer {
     async fn close(&self) -> std::result::Result<(), InboundError> {
         if let Some((_listener, handle)) = self.slot.lock().await.take() {
             handle.abort();
-            info!(tag = %self.tag, "HTTP proxy server closed");
+            self.log.info(format!("HTTP proxy server closed tag={}", self.tag));
         }
         Ok(())
     }
@@ -257,6 +268,14 @@ impl InboundHandler for HttpServer {
         0
     }
 }
+
+/// 连接处理路径诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目
+/// 工具链上 `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶
+/// 三形态实测无效），迁移为唯一关红路径。域 = "http"，target 钉死
+/// `xray_frame::http` + mask_secrets。free 函数不持 ctx，模块级门面 = 最小
+/// 涟漪形态（socks RELAY_LOG / dokodemo OUTBOUND_LOG 同款；克隆穿参需改
+/// 3 个私有签名无收益）。
+static CONN_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("http", vec![]));
 
 /// 单连接处理：读头 → 转发（CONNECT 隧道 / plain HTTP），连接终结性对齐 Go。
 ///
@@ -314,22 +333,18 @@ async fn serve_connection(
             tokio::time::timeout(REQUEST_HEADER_TIMEOUT, http_server_handshake(stream, config));
         let mut hs = match handshake.await {
             Err(_) => {
-                info!(
-                    tag = %tag,
-                    peer = %peer,
-                    timeout = ?REQUEST_HEADER_TIMEOUT,
-                    "HTTP proxy connection idle/header timeout, closing"
-                );
+                CONN_LOG.info(format!(
+                    "HTTP proxy connection idle/header timeout, closing tag={tag} \
+                     peer={peer} timeout={REQUEST_HEADER_TIMEOUT:?}"
+                ));
                 return;
             },
             Ok(Err(e)) => {
                 // 400/407 响应已在 handshake 内写回；EOF/解析失败一律关闭
-                warn!(
-                    tag = %tag,
-                    peer = %peer,
-                    error = %e,
-                    "HTTP proxy handshake failed, closing connection"
-                );
+                CONN_LOG.warn(format!(
+                    "HTTP proxy handshake failed, closing connection tag={tag} \
+                     peer={peer} error={e}"
+                ));
                 return;
             },
             Ok(Ok(hs)) => hs,
@@ -343,42 +358,42 @@ async fn serve_connection(
                 Ok(PlainOutcome::WaitAnother) => {},
                 Ok(PlainOutcome::Close) => {},
                 Err(e) => {
-                    warn!(
-                        tag = %tag,
-                        peer = %peer,
-                        method = %hs.method,
-                        error = %e,
-                        "plain HTTP forwarding failed, closing connection"
-                    );
+                    CONN_LOG.warn(format!(
+                        "plain HTTP forwarding failed, closing connection tag={tag} \
+                         peer={peer} method={} error={e}",
+                        hs.method
+                    ));
                 },
             }
             return;
         }
-        info!(tag = %tag, peer = %peer, dest = ?hs.dest, "HTTP proxy CONNECT established");
+        CONN_LOG.info(format!(
+            "HTTP proxy CONNECT established tag={tag} peer={peer} dest={:?}",
+            hs.dest
+        ));
         // CONNECT 终结性（对齐 Go handleConnect → return）：tunnel 成功、dial 失败、
         // 拷贝错误任一结局都关连接——隧道结束后字节流已非 HTTP 边界。
         match dial_destination(&hs.dest).await {
             Err(e) => {
-                warn!(
-                    tag = %tag,
-                    peer = %peer,
-                    dest = ?hs.dest,
-                    error = %e,
-                    "CONNECT dial failed, closing connection"
-                );
+                CONN_LOG.warn(format!(
+                    "CONNECT dial failed, closing connection tag={tag} peer={peer} \
+                     dest={:?} error={e}",
+                    hs.dest
+                ));
             },
             Ok(mut upstream) => {
                 if let Err(e) = tokio::io::copy_bidirectional(stream, &mut upstream).await {
-                    warn!(
-                        tag = %tag,
-                        peer = %peer,
-                        dest = ?hs.dest,
-                        error = %e,
-                        "CONNECT tunnel copy failed, closing connection"
-                    );
+                    CONN_LOG.warn(format!(
+                        "CONNECT tunnel copy failed, closing connection tag={tag} \
+                         peer={peer} dest={:?} error={e}",
+                        hs.dest
+                    ));
                     return;
                 }
-                info!(tag = %tag, dest = ?hs.dest, "CONNECT tunnel finished, closing connection");
+                CONN_LOG.info(format!(
+                    "CONNECT tunnel finished, closing connection tag={tag} dest={:?}",
+                    hs.dest
+                ));
             },
         }
         return;
@@ -430,7 +445,10 @@ async fn handle_plain_http(
     } else if headers_indicate_chunked(&hs.headers) {
         // chunked 请求体明确报错（Go 经 ReadRequest 解码支持；本实现原样透传
         // 无 body 边界解析，静默截断不可接受）
-        warn!(method = %hs.method, "chunked request body not supported by plain HTTP forwarding");
+        CONN_LOG.warn(format!(
+            "chunked request body not supported by plain HTTP forwarding method={}",
+            hs.method
+        ));
         let _ = client.write_all(RESPONSE_BAD_REQUEST).await;
         return Ok(PlainOutcome::Close);
     }

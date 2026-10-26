@@ -274,7 +274,9 @@ async fn handle_conn(
         let dispatch = dispatch.clone();
         let kill_tx = kill_tx_cell.lock().take();
         let fx = Arc::clone(&fx_session);
-        fx.spawn(handle_session(session, dispatch, kill_tx, handshake_deadline))
+        // fx 按 Arc 值移交（'static future；内部再借引用会随闭包局部悬垂）
+        let fx_task = Arc::clone(&fx);
+        fx.spawn(handle_session(fx_task, session, dispatch, kill_tx, handshake_deadline))
             .expect("internal FxScope is never closed");
     });
     let session = Arc::new(
@@ -315,6 +317,7 @@ async fn handle_conn(
 /// SOCKS5 target 首包受 `first_packet_deadline` 限时（与握手段共用的绝对
 /// deadline）：对端认证通过后不发首包，到期发 FIN + shutdown 关闭连接（bd v57c）。
 async fn handle_session(
+    fx: Arc<FxScope>,
     session: Arc<Session>,
     dispatch: Option<Arc<dyn DispatchHandler>>,
     kill_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -358,11 +361,10 @@ async fn handle_session(
         let dest = socks_to_destination(&target);
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
         let (rd_half, wr_half) = tokio::io::split(client_io);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-        )]
-        tokio::spawn(pump_session_to_duplex(session.clone(), server_io));
+        // 组件自持 FxScope 记账（B6，app 家族同款）：session pump 随 handler
+        // drop 兜底 abort；dispatch 关闭 writer 时 pump 亦随 duplex EOF 退出。
+        fx.spawn(pump_session_to_duplex(session.clone(), server_io))
+            .expect("internal FxScope is never closed");
         let reader = new_reader(InitialedReader::new(buf[consumed..n].to_vec(), rd_half));
         let writer = new_writer(wr_half);
         let link = Link::new(reader, writer);
@@ -533,6 +535,9 @@ async fn bridge(session: Arc<Session>, outbound: TcpStream) -> std::io::Result<(
 
 #[cfg(test)]
 mod tests {
+    fn test_ctx() -> std::sync::Arc<xray_frame::PluginContext> {
+        std::sync::Arc::new(xray_frame::PluginContext::for_plugin("anytls"))
+    }
     use std::time::Duration;
 
     /// Go anytls-go 有效上界：sing standard build 首包缓冲 16384 − 34B 认证头。
@@ -613,7 +618,10 @@ mod tests {
         let tls = Arc::new(
             RustlsClientConfig::builder().with_root_certificates(root_store).with_no_client_auth(),
         );
-        AnytlsClient::new(ClientConfig::new(server_addr.to_string(), "localhost", password, tls))
+        AnytlsClient::new(
+            ClientConfig::new(server_addr.to_string(), "localhost", password, tls),
+            test_ctx(),
+        )
     }
 
     /// 对密码：认证通过，端到端 echo 完整走通。
@@ -632,6 +640,37 @@ mod tests {
             .expect("echo read");
         assert_eq!(&buf, b"ping");
         client.close().await.ok();
+        server.stop().await;
+    }
+
+    /// f17zu 验收④（托管实证·端到端）：dial 泵经 `ctx.spawn` 落 client 持有的
+    /// FxScope（`AnytlsClient` 是 `Arc<PluginContext>` 唯一持有方）——drop client
+    /// = scope drop = JoinSet abort → 泵 abort → 其 duplex server 端 drop →
+    /// 存活 conn 读到 EOF。泵阻塞在字节搬运（无 EOF 诱导），scope 收割是唯一
+    /// 退出路径。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dial_pump_collected_when_client_scope_drops() {
+        let echo = start_echo_server().await;
+        let (server, cert_der) = start_server_with_password(None).await;
+        let client = make_client(server.local_addr, "", &cert_der);
+        let mut conn = client.dial(&SocksAddr::from_socket(echo)).await.expect("dial");
+        // 泵活性：echo 往返（迁移后行为不变）
+        conn.write_all(b"ping").await.expect("write");
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), conn.read_exact(&mut buf))
+            .await
+            .expect("read within timeout")
+            .expect("echo read");
+        assert_eq!(&buf, b"ping");
+
+        // scope 关停：drop client（最后 Arc<PluginContext>）→ 泵 abort → conn EOF
+        drop(client);
+        let mut eof = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(5), conn.read(&mut eof))
+            .await
+            .expect("泵未被 FxScope 收掉（读超时挂起）")
+            .expect("read after scope drop");
+        assert_eq!(n, 0, "EOF = dial 泵已被 FxScope 统一收掉");
         server.stop().await;
     }
 

@@ -9,6 +9,8 @@
 //! 3. 调 `AnytlsClient::dial` 建立 TLS 连接 + 写 SOCKS5 目标
 //! 4. 返回 `Ok(())`（与 hysteria 一致，连接对象由 dispatcher 通过 DialBridge 获取）
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use xray_common::{
     net::{destination::Destination, network::Network},
@@ -38,7 +40,11 @@ impl AnytlsOutboundHandler {
     /// - `tag`：handler 标签（路由匹配用）
     /// - `config`：AnyTLS 客户端配置（server_addr / sni / tls_config 等）
     pub fn new(tag: impl Into<String>, config: ClientConfig) -> Self {
-        let client = AnytlsClient::new(config.clone());
+        // 休眠接缝（仅测试消费）：自持 `for_plugin` ctx；P3 装配接线时改注入。
+        let client = AnytlsClient::new(
+            config.clone(),
+            Arc::new(xray_frame::PluginContext::for_plugin("anytls")),
+        );
         Self { tag: tag.into(), config, client }
     }
 

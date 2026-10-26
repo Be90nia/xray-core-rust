@@ -98,6 +98,7 @@ async fn dial_fn_lazy_resolves_domain_server_addr() {
         password.to_string(),
         client_cfg,
         TuicConnectOptions::default(),
+        std::sync::Arc::new(xray_frame::PluginContext::for_plugin("tuic")),
     );
 
     let dest = Destination::new(

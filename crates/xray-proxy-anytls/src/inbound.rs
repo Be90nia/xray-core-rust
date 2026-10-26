@@ -158,6 +158,9 @@ impl InboundHandler for AnytlsInboundHandler {
 
 #[cfg(test)]
 mod tests {
+    fn test_ctx() -> std::sync::Arc<xray_frame::PluginContext> {
+        std::sync::Arc::new(xray_frame::PluginContext::for_plugin("anytls"))
+    }
     use std::sync::{Arc, Once};
 
     use rcgen::{CertificateParams, KeyPair};
@@ -268,7 +271,10 @@ mod tests {
                 .with_root_certificates(root_store)
                 .with_no_client_auth(),
         );
-        AnytlsClient::new(ClientConfig::new(server_addr.to_string(), "localhost", password, tls))
+        AnytlsClient::new(
+            ClientConfig::new(server_addr.to_string(), "localhost", password, tls),
+            test_ctx(),
+        )
     }
 
     /// bd 1zko8：handler 层密码接线——with_password 后 start 走

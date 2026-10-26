@@ -314,7 +314,11 @@ mod tests {
         let driver = WgDriver::with_transport(
             vec![peer],
             vec![vec![]],
-            WgTransport::Dialed(Arc::new(crate::driver::DialedUdp::new(dialer, dest))),
+            WgTransport::Dialed(Arc::new(crate::driver::DialedUdp::new(
+                std::sync::Arc::new(xray_frame::PluginContext::for_plugin("wireguard")),
+                dialer,
+                dest,
+            ))),
             ns,
         );
         Arc::new(ParkMutex::new(Some(Arc::new(driver))))

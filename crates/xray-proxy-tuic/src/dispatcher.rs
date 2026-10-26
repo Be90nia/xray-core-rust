@@ -23,9 +23,11 @@ use std::{
     time::Duration,
 };
 
+use skeleton_infra::fx::Spawned;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use xray_app_dispatcher::default::DialFn;
 use xray_common::net::{address::Address as XrayAddress, destination::Destination};
+use xray_frame::PluginContext;
 use xray_transport::connection::Connection;
 
 use crate::{
@@ -41,7 +43,7 @@ const DUPLEX_BUF_SIZE: usize = 64 * 1024;
 /// `_pump` 字段保证桥接 task 生命周期与连接一致——drop 时自动 abort。
 pub struct TuicConnection {
     inner: DuplexStream,
-    _pump: tokio::task::JoinHandle<()>,
+    _pump: Spawned<()>,
 }
 
 impl AsyncRead for TuicConnection {
@@ -103,10 +105,11 @@ pub fn dest_to_tuic_address(dest: &Destination) -> Result<Address, String> {
 /// # Panics
 ///
 /// 不会 panic；任何错误以 `Err(String)` 返回。
-pub fn make_dial_fn(client: Arc<TuicClient>) -> DialFn {
+pub fn make_dial_fn(client: Arc<TuicClient>, ctx: Arc<PluginContext>) -> DialFn {
     client.start_heartbeat(HEARTBEAT_INTERVAL);
     Arc::new(move |dest: &Destination| {
         let client = Arc::clone(&client);
+        let ctx = Arc::clone(&ctx);
         let addr = match dest_to_tuic_address(dest) {
             Ok(a) => a,
             Err(e) => {
@@ -118,7 +121,7 @@ pub fn make_dial_fn(client: Arc<TuicClient>) -> DialFn {
                 .await
                 .map_err(|_| "tuic dial: timed out".to_string())?
                 .map_err(|e| format!("tuic dial: {e}"))?;
-            Ok(Box::new(TuicConnection::from_conn(conn)) as Box<dyn Connection>)
+            Ok(Box::new(TuicConnection::from_conn(&ctx, conn)) as Box<dyn Connection>)
         })
     })
 }
@@ -140,6 +143,7 @@ pub fn make_dial_fn_lazy(
     password: String,
     rustls_config: Arc<rustls::ClientConfig>,
     options: crate::client::TuicConnectOptions,
+    ctx: Arc<PluginContext>,
 ) -> DialFn {
     use tokio::sync::OnceCell;
     let client: Arc<OnceCell<Arc<TuicClient>>> = Arc::new(OnceCell::new());
@@ -156,6 +160,7 @@ pub fn make_dial_fn_lazy(
         let rustls_config = Arc::clone(&rustls_config);
         let pool = pool.clone();
         let options = options.clone();
+        let ctx = Arc::clone(&ctx);
         let addr = match dest_to_tuic_address(dest) {
             Ok(a) => a,
             Err(e) => {
@@ -197,7 +202,7 @@ pub fn make_dial_fn_lazy(
                         return Err("tuic dial: timed out".to_string());
                     },
                 };
-            Ok(Box::new(TuicConnection::from_conn(conn)) as Box<dyn Connection>)
+            Ok(Box::new(TuicConnection::from_conn(&ctx, conn)) as Box<dyn Connection>)
         })
     })
 }
@@ -207,13 +212,12 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 
 impl TuicConnection {
     /// 从 TuicConn 构造：拆 send/recv，spawn pump，返回 duplex 客户端包装。
-    fn from_conn(conn: TuicConn) -> Self {
+    fn from_conn(ctx: &PluginContext, conn: TuicConn) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "热路径豁免（B6 t975）：每帧泵——QUIC bi stream ↔ duplex 双向搬运，数据面热路径零改动（坑约束 12）；托管接线归 P1 插件装配"
-        )]
-        let pump = tokio::spawn(pump_streams(conn.send, conn.recv, server_io));
+        // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
+        let pump = ctx
+            .spawn(pump_streams(conn.send, conn.recv, server_io))
+            .expect("plugin ctx FxScope is never closed (assembly-owned)");
         Self { inner: client_io, _pump: pump }
     }
 }

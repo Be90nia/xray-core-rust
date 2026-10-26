@@ -9,7 +9,7 @@
 //! [`DialFn`]: xray_app_dispatcher::default::DialFn
 //! [`Connection`]: xray_transport::connection::Connection
 
-use std::{collections::HashMap, net::SocketAddr};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use xray_app_dispatcher::default::DialFn;
 use xray_common::net::destination::Destination;
@@ -141,8 +141,6 @@ async fn write_proxy_protocol_header(
     Ok(conn)
 }
 
-use std::sync::Arc;
-
 use xray_app_dispatcher::{
     DispatchHandler,
     default::{DialBridge, PinFuture},
@@ -182,12 +180,14 @@ pub struct FreedomDispatchBridge {
     /// domainStrategy（proto i32， freedom Config 平行值域）。TCP finalRule
     /// Block 预检解析（#6058）+ UDP 逐帧域名解析（bd czwu）共用。
     domain_strategy: i32,
+    /// 托管句柄（坑约束 5）：UDP 响应泵经 `ctx.spawn` 落 FxScope 记账。
+    ctx: Arc<xray_frame::PluginContext>,
 }
 
 impl FreedomDispatchBridge {
     /// 从已构造的 TCP [`DialBridge`] 包装。保留 `dial_bridge` 的 Arc 以便代理链 Phase 2 注入。
     #[must_use]
-    pub fn from_bridge(dial_bridge: Arc<DialBridge>) -> Self {
+    pub fn from_bridge(ctx: Arc<xray_frame::PluginContext>, dial_bridge: Arc<DialBridge>) -> Self {
         let tag = dial_bridge.tag().to_string();
         Self {
             tag,
@@ -198,6 +198,7 @@ impl FreedomDispatchBridge {
             final_rules: Vec::new(),
             inbound_rules: Arc::new(HashMap::new()),
             domain_strategy: 0,
+            ctx,
         }
     }
 
@@ -309,19 +310,21 @@ impl DispatchHandler for FreedomDispatchBridge {
             let send_through = self.send_through.clone();
             let noises = self.noises.clone();
             let policy = self.udp_policy(default_rule);
+            let ctx = Arc::clone(&self.ctx);
             Box::pin(async move {
                 // bd 7zc：sendThrough → DIAL_SRC scope → relay bind 源地址
                 // （对应 Go DialSystem UDP 分支 src 传递）。
                 let result = match send_through.as_ref().and_then(|s| s.resolve()) {
                     Some(ip) => {
+                        let ctx = Arc::clone(&ctx);
                         xray_transport::system_dialer::DIAL_SRC
                             .scope(
                                 Some(ip),
-                                crate::udp::relay_policy(&dest, link, &noises, &policy),
+                                crate::udp::relay_policy(&ctx, &dest, link, &noises, &policy),
                             )
                             .await
                     },
-                    None => crate::udp::relay_policy(&dest, link, &noises, &policy).await,
+                    None => crate::udp::relay_policy(&ctx, &dest, link, &noises, &policy).await,
                 };
                 if let Err(e) = result {
                     tracing::warn!(tag = %tag, "freedom udp relay ended: {e}");
@@ -417,6 +420,10 @@ impl DispatchHandler for FreedomDispatchBridge {
 mod tests {
     // FAKE_DNS_LOCK 等测试串行锁：guard 有意跨 await 存活（测试进程内互斥），无生产死锁面
     #![allow(clippy::await_holding_lock)]
+
+    fn test_ctx() -> std::sync::Arc<xray_frame::PluginContext> {
+        std::sync::Arc::new(xray_frame::PluginContext::for_plugin("freedom"))
+    }
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -503,7 +510,7 @@ mod tests {
         // 2. dispatcher + FreedomDispatchBridge（TCP DialBridge + UDP relay）
         let tcp_bridge = Arc::new(DialBridge::new("freedom-out", make_dial_fn()));
         let ohm = SimpleOhm::new();
-        ohm.set_default(Arc::new(FreedomDispatchBridge::from_bridge(tcp_bridge)));
+        ohm.set_default(Arc::new(FreedomDispatchBridge::from_bridge(test_ctx(), tcp_bridge)));
         let mut dispatcher = DefaultDispatcher::new();
         dispatcher.ohm = Some(Arc::new(ohm));
 
@@ -581,7 +588,7 @@ mod tests {
         #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
         let send_through: IpAddr = "127.0.0.2".parse().unwrap();
         let tcp_bridge = Arc::new(DialBridge::new("freedom-via", make_dial_fn()));
-        let bridge = FreedomDispatchBridge::from_bridge(tcp_bridge)
+        let bridge = FreedomDispatchBridge::from_bridge(test_ctx(), tcp_bridge)
             .with_send_through(SendThroughSpec::Fixed(send_through));
         let ohm = SimpleOhm::new();
         ohm.set_default(Arc::new(bridge));
@@ -738,10 +745,10 @@ mod tests {
             "action": "block", "ip": ["127.0.0.0/8"], "blockDelay": {"from": 0, "to": 0}
         }))
         .unwrap();
-        let bridge = FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new(
-            "freedom-out",
-            make_dial_fn(),
-        )))
+        let bridge = FreedomDispatchBridge::from_bridge(
+            test_ctx(),
+            Arc::new(DialBridge::new("freedom-out", make_dial_fn())),
+        )
         .with_final_rules(vec![crate::config::FinalRule::build(&rule_cfg).unwrap()]);
 
         let dest = Destination::new(
@@ -803,10 +810,10 @@ mod tests {
         );
 
         let make_bridge = || {
-            FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new(
-                "freedom-out",
-                make_dial_fn(),
-            )))
+            FreedomDispatchBridge::from_bridge(
+                test_ctx(),
+                Arc::new(DialBridge::new("freedom-out", make_dial_fn())),
+            )
             .with_inbound_default_rules(std::collections::HashMap::from([(
                 "vless-in".to_string(),
                 crate::config::DefaultRuleType::BlockPrivate,
@@ -919,10 +926,10 @@ mod tests {
 
         // proxyProtocol=1 进 dial_fn（生产 parse_freedom_config 路径等价）
         let config = Config { proxy_protocol: 1, ..Default::default() };
-        let bridge = FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new(
-            "freedom-out",
-            make_dial_fn_with_config(config),
-        )));
+        let bridge = FreedomDispatchBridge::from_bridge(
+            test_ctx(),
+            Arc::new(DialBridge::new("freedom-out", make_dial_fn_with_config(config))),
+        );
 
         let dest = Destination::new(
             Address::from_ipv4_bytes([127, 0, 0, 1]),
@@ -1048,10 +1055,10 @@ mod tests {
         // 生产装配口径（outbound.rs freedom 分支）：bridge 侧 finalRules（Block
         // 检查）与 domainStrategy 经 builder 注入；dial_fn 侧 config 消费 sockopt。
         let built_rule = crate::config::FinalRule::build(&rule).unwrap();
-        let bridge = FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new(
-            "direct",
-            make_dial_fn_with_config(config),
-        )))
+        let bridge = FreedomDispatchBridge::from_bridge(
+            test_ctx(),
+            Arc::new(DialBridge::new("direct", make_dial_fn_with_config(config))),
+        )
         .with_domain_strategy(crate::config::DomainStrategy::UseIPv4 as i32)
         .with_final_rules(vec![built_rule]);
         let pipe_opt = xray_buf::pipe::PipeOption::default();
@@ -1143,11 +1150,13 @@ mod tests {
             &serde_json::json!({"action": "allow", "port": "53"}),
         )
         .unwrap();
-        let bridge =
-            FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new("freedom-out", dial)))
-                // 策略路径让预检解析走 FakeDns（AsIs 走系统 resolver，FakeDns 不可见）
-                .with_domain_strategy(crate::config::DomainStrategy::UseIP as i32)
-                .with_final_rules(vec![crate::config::FinalRule::build(&rule).unwrap()]);
+        let bridge = FreedomDispatchBridge::from_bridge(
+            test_ctx(),
+            Arc::new(DialBridge::new("freedom-out", dial)),
+        )
+        // 策略路径让预检解析走 FakeDns（AsIs 走系统 resolver，FakeDns 不可见）
+        .with_domain_strategy(crate::config::DomainStrategy::UseIP as i32)
+        .with_final_rules(vec![crate::config::FinalRule::build(&rule).unwrap()]);
 
         let dest =
             Destination::new(Address::Domain("example.test".into()), Port::new(8080), Network::TCP);
@@ -1197,8 +1206,10 @@ mod tests {
             })
         });
         // 无 final_rules、无 inbound_rules → 无预检（Go :294-295）
-        let bridge =
-            FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new("freedom-out", dial)));
+        let bridge = FreedomDispatchBridge::from_bridge(
+            test_ctx(),
+            Arc::new(DialBridge::new("freedom-out", dial)),
+        );
 
         let dest =
             Destination::new(Address::Domain("noregex.test".into()), Port::new(9090), Network::TCP);

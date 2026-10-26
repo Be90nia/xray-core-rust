@@ -157,6 +157,7 @@ async fn rust_trojan_server_go_client() {
             xray_transport::sockopt::SocketOptions::default(),
         );
         let _ = serve_trojan(
+            Arc::new(xray_frame::PluginContext::for_plugin("trojan")),
             listener,
             ohm_clone,
             users,

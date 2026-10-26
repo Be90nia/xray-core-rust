@@ -9,13 +9,21 @@
 //! [`DialBridge`]: xray_app_dispatcher::default::DialBridge
 //! [`DialFn`]: xray_app_dispatcher::default::DialFn
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use xray_app_dispatcher::default::DialFn;
 use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
+use xray_frame::LogFacade;
 use xray_transport::{connection::Connection, sockopt::SocketOptions, system_dialer::dial_system};
 
 use crate::config::{Config, PredefinedAddress};
+
+/// 出站配置解析诊断门面（nn8os 2b 打回处置：tracing 宏 → LogFacade——本项目
+/// 工具链上 `disallowed_macros` 对 proc-macro 不认任何 allow（实测三形态均
+/// 无效）；Clone 值类型不持 ctx，模块级门面 = 最小涟漪形态。域 =
+/// "dokodemo-door"，target `xray_frame::dokodemo-door` + mask_secrets。
+static OUTBOUND_LOG: LazyLock<LogFacade> =
+    LazyLock::new(|| LogFacade::new("dokodemo-door", vec![]));
 
 /// Dokodemo 出站配置（从 Config 提取的拨号目标）。
 ///
@@ -61,18 +69,13 @@ impl DokodemoOutboundConfig {
     /// dixo：`network == Unix` 在 outbound 侧无对应 socket 类型，
     /// Rust 端降级为 TCP（与 Go 行为一致）。在构造期记一条 warn，
     /// 避免运维侧 Unix 拨号"配置有效却走 TCP"的静默语义偏差。
-    // nn8os 2b 残余豁免（L3 台账）：Clone 配置值类型不持 ctx（ctx 属
-    // handler/装配面）；warn 属配置解析一次性告警，迁移随 P3 配置链接线。
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "Clone 配置值类型不持 ctx：一次性解析告警，迁移归 P3 配置链接线"
-    )]
+    /// （tracing 宏豁免见文件顶 inner attr 台账。）
     #[must_use]
     pub fn new(address: Address, port: Port, network: Network) -> Self {
         if matches!(network, Network::Unix) {
-            tracing::warn!(
+            OUTBOUND_LOG.warn(
                 "dokodemo outbound: unix network is unsupported; silently downgraded to tcp \
-                 (Go parity — Unix dial via this outbound is not implemented)"
+                 (Go parity — Unix dial via this outbound is not implemented)",
             );
         }
         Self { address, port, network }

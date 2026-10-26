@@ -10,18 +10,22 @@
 mod tests {
     use crate::{encryption::ServerInstance, error::VlessError};
 
+    fn test_ctx() -> std::sync::Arc<xray_frame::PluginContext> {
+        std::sync::Arc::new(xray_frame::PluginContext::for_plugin("vless"))
+    }
+
     #[test]
     fn server_init_empty_keys_rejected() {
         let mut s = ServerInstance::new();
-        let err = s.init(Vec::new(), 0, 0, 0, "").unwrap_err();
+        let err = s.init(Vec::new(), 0, 0, 0, "", test_ctx()).unwrap_err();
         assert!(matches!(err, VlessError::Other(ref msg) if msg.contains("empty")));
     }
 
     #[test]
     fn server_init_duplicate_rejected() {
         let mut s = ServerInstance::new();
-        s.init(vec![vec![0xABu8; 32]], 0, 0, 0, "").unwrap();
-        let err = s.init(vec![vec![0xCDu8; 32]], 0, 0, 0, "").unwrap_err();
+        s.init(vec![vec![0xABu8; 32]], 0, 0, 0, "", test_ctx()).unwrap();
+        let err = s.init(vec![vec![0xCDu8; 32]], 0, 0, 0, "", test_ctx()).unwrap_err();
         assert!(matches!(err, VlessError::Other(ref msg) if msg.contains("already initialized")));
     }
 }

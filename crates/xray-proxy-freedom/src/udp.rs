@@ -68,7 +68,12 @@ pub async fn relay_with_noises(
     link: Link,
     noises: &[crate::config::Noise],
 ) -> io::Result<()> {
-    relay_policy(dest, link, noises, &UdpPolicy::default()).await
+    // 兼容接缝：自持 `for_plugin` ctx（测试/库层便捷形）。生产装配经
+    // `FreedomDispatchBridge` 注入 `arm_plugin_ctx`。绑定局部变量：scope 必须
+    // 覆盖 relay_policy 全程（含响应泵 join）——临时值语义依赖「同语句存活
+    // 到 await 完」的隐式规则，显式绑定防呆。
+    let ctx = xray_frame::PluginContext::for_plugin("freedom");
+    relay_policy(&ctx, dest, link, noises, &UdpPolicy::default()).await
 }
 
 /// Freedom UDP relay 主入口（携带 override/finalRules/defaultRule 策略）。
@@ -80,6 +85,7 @@ pub async fn relay_with_noises(
 ///   首包前注入，override 端口为 53（DNS）时跳过（:668-674）。
 /// - 响应方向逐包：来源 Block 检查丢包（Go `PacketReader` :515-517）。
 pub async fn relay_policy(
+    ctx: &xray_frame::PluginContext,
     dest: &Destination,
     link: Link,
     noises: &[crate::config::Noise],
@@ -124,13 +130,12 @@ pub async fn relay_policy(
     let resp_sock = Arc::clone(&sock);
     let resp_global_id = global_id;
     let resp_policy = policy.clone();
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-    )]
-    let resp_task = tokio::spawn(async move {
-        pump_response(&resp_sock, resp_global_id, &mut writer, &resp_policy).await
-    });
+    // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
+    let resp_task =
+        ctx.spawn(async move {
+            pump_response(&resp_sock, resp_global_id, &mut writer, &resp_policy).await
+        })
+        .expect("plugin ctx FxScope is never closed (assembly-owned)");
 
     // 5. 请求 pump: link.reader → XUDP 帧 → socket.send_to noises 在首个真实数据报前注入（对齐 Go
     //    NoisePacketWriter 首写触发）
@@ -148,7 +153,7 @@ pub async fn relay_policy(
     .await;
 
     // 请求方向结束（link EOF），等待响应方向也结束
-    let _ = resp_task.await;
+    let _ = resp_task.join().await;
 
     req_result
 }
@@ -524,6 +529,10 @@ fn dest_to_socket_addr(dest: &Destination) -> Option<SocketAddr> {
 mod tests {
     // FAKE_DNS_LOCK 等测试串行锁：guard 有意跨 await 存活（测试进程内互斥），无生产死锁面
     #![allow(clippy::await_holding_lock)]
+
+    fn test_ctx() -> std::sync::Arc<xray_frame::PluginContext> {
+        std::sync::Arc::new(xray_frame::PluginContext::for_plugin("freedom"))
+    }
     use xray_common::net::{address::Address, network::Network, port::Port};
 
     use super::*;
@@ -780,7 +789,8 @@ mod tests {
         let dest = udp_dest("127.0.0.1", a_port);
         let relay_task =
             xray_common::testing::spawn("udp-per-packet-override-rewrites-target", async move {
-                relay_policy(&dest, link, &[], &policy).await
+                let ctx = test_ctx();
+                relay_policy(&ctx, &dest, link, &[], &policy).await
             });
 
         let mut client_writer = Box::new(up_w) as Box<dyn Writer>;
@@ -831,7 +841,8 @@ mod tests {
         let dest = udp_dest("127.0.0.1", echo_port);
         let relay_task =
             xray_common::testing::spawn("udp-request-blocked-by-final-rule-echo", async move {
-                relay_policy(&dest, link, &[], &policy).await
+                let ctx = test_ctx();
+                relay_policy(&ctx, &dest, link, &[], &policy).await
             });
 
         let mut client_writer = Box::new(up_w) as Box<dyn Writer>;
@@ -880,7 +891,8 @@ mod tests {
         let dest = udp_dest("127.0.0.1", 53001);
         let relay_task =
             xray_common::testing::spawn("udp-noise-skipped-when-override-port-53", async move {
-                relay_policy(&dest, link, &noises, &policy).await
+                let ctx = test_ctx();
+                relay_policy(&ctx, &dest, link, &noises, &policy).await
             });
 
         let mut client_writer = Box::new(up_w) as Box<dyn Writer>;
@@ -1046,7 +1058,10 @@ mod tests {
         };
         let relay_task = xray_common::testing::spawn(
             "udp-domain-frames-resolved-per-frame-with-cache",
-            async move { relay_policy(&dest, link, &[], &policy).await },
+            async move {
+                let ctx = test_ctx();
+                relay_policy(&ctx, &dest, link, &[], &policy).await
+            },
         );
 
         // 三帧：a.test / b.test / a.test（第三次应命中缓存，不再查询）
@@ -1084,5 +1099,31 @@ mod tests {
         drop(client_writer);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), relay_task).await;
         uninstall();
+    }
+
+    /// f17zu 验收④（托管实证）：`ctx.spawn`（迁移唯一口）落 FxScope 记账的任务
+    /// 在 scope 关停（最后一个 `Arc<PluginContext>` drop → `FxScope` drop →
+    /// JoinSet abort_all）时被统一收掉。哨兵任务永挂（`pending`），唯一退出
+    /// 路径 = scope abort（future drop → oneshot tx drop → rx Err）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawned_task_collected_when_plugin_scope_drops() {
+        let ctx = test_ctx();
+        let (tx, rx) = tokio::sync::oneshot::channel::<&'static str>();
+        let _sentinel = ctx
+            .spawn(async move {
+                let _tx = tx; // abort → future drop → tx drop → rx 断
+                std::future::pending::<()>().await;
+            })
+            .expect("plugin ctx FxScope is never closed (assembly-owned)");
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(ctx); // 最后一个 Arc<PluginContext>：scope 关停
+        // 任务被收 = future drop → tx drop → rx 在时限内收到 Err(RecvError)
+        // （timeout 返回 Ok(Err(_))）。若超时（Err(Elapsed)）= 任务仍在跑 = 泄漏。
+        let collected = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
+        assert!(
+            matches!(collected, Ok(Err(_))),
+            "scope drop 后哨兵任务必须被 FxScope abort 收掉（rx 断开=被收；{collected:?}=超时即泄漏）"
+        );
     }
 }

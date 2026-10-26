@@ -189,6 +189,7 @@ async fn run_rust_server_go_client(security: SecurityType) {
             xray_transport::sockopt::SocketOptions::default(),
         );
         let _ = serve_vmess(
+            Arc::new(xray_frame::PluginContext::for_plugin("vmess")),
             listener,
             ohm_clone,
             validator_clone,

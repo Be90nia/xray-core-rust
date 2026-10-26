@@ -117,7 +117,10 @@ async fn inbound_dispatches_via_router() {
         "test-password",
         make_client_config(&cert_der),
     );
-    let client = AnytlsClient::new(client_config);
+    let client = AnytlsClient::new(
+        client_config,
+        std::sync::Arc::new(xray_frame::PluginContext::for_plugin("anytls")),
+    );
 
     let target = SocksAddr::ipv4(Ipv4Addr::LOCALHOST, echo_addr.port());
     let mut conn = tokio::time::timeout(Duration::from_secs(10), client.dial(&target))

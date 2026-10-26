@@ -243,9 +243,15 @@ async fn vmess_multichunk_production_roundtrip_e2e() {
     let validator2 = Arc::clone(&validator);
     xray_common::testing::spawn("vmess-server", async move {
         // sm80④：测试装配传短握手超时（与 serve_vmess 其他测试用例一致）。
-        let _ =
-            serve_vmess(vmess_listener, ohm2, validator2, None, std::time::Duration::from_secs(10))
-                .await;
+        let _ = serve_vmess(
+            std::sync::Arc::new(xray_frame::PluginContext::for_plugin("vmess")),
+            vmess_listener,
+            ohm2,
+            validator2,
+            None,
+            std::time::Duration::from_secs(10),
+        )
+        .await;
     });
 
     // 生产 outbound：make_vmess_dial_fn → VmessConn
@@ -254,7 +260,10 @@ async fn vmess_multichunk_production_roundtrip_e2e() {
         Address::from_ipv4_bytes([127, 0, 0, 1]),
         Port::new(vmess_addr.port()),
     ));
-    let dial = make_vmess_dial_fn(cfg);
+    let dial = make_vmess_dial_fn(
+        cfg,
+        std::sync::Arc::new(xray_frame::PluginContext::for_plugin("vmess")),
+    );
     let dest = Destination::new(
         Address::from_ipv4_bytes([127, 0, 0, 1]),
         Port::new(echo_port),

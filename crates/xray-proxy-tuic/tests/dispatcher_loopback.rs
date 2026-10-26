@@ -111,7 +111,13 @@ async fn dispatcher_e2e_tuic_loopback_echo() {
 
     // 4. dispatcher + DialBridge(TuicClient)
     let ohm = SimpleOhm::new();
-    ohm.set_default(Arc::new(DialBridge::new("tuic-out", make_dial_fn(Arc::clone(&client)))));
+    ohm.set_default(Arc::new(DialBridge::new(
+        "tuic-out",
+        make_dial_fn(
+            Arc::clone(&client),
+            std::sync::Arc::new(xray_frame::PluginContext::for_plugin("tuic")),
+        ),
+    )));
     let mut dispatcher = DefaultDispatcher::new();
     dispatcher.ohm = Some(Arc::new(ohm));
 

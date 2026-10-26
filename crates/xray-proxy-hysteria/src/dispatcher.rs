@@ -11,12 +11,14 @@ use std::{
     task::{Context, Poll},
 };
 
+use skeleton_infra::fx::Spawned;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf},
     sync::OnceCell,
 };
 use xray_app_dispatcher::default::DialFn;
 use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
+use xray_frame::PluginContext;
 use xray_transport::connection::Connection;
 use xray_transport_hysteria::{
     conn::{InterConn, InterStreamConn},
@@ -47,7 +49,7 @@ const RECV_BUF_SIZE: usize = 65535;
 /// `_pump` 字段保证桥接 task 生命周期与连接一致——drop 时自动 abort。
 pub struct HysteriaConnection {
     inner: DuplexStream,
-    _pump: tokio::task::JoinHandle<()>,
+    _pump: Spawned<()>,
 }
 
 impl AsyncRead for HysteriaConnection {
@@ -90,26 +92,24 @@ impl Connection for HysteriaConnection {
 
 impl HysteriaConnection {
     /// 从 InterStreamConn 构造：spawn pump 桥接，返回 duplex 客户端包装。
-    fn from_stream(stream: Arc<InterStreamConn>) -> Self {
+    fn from_stream(ctx: &PluginContext, stream: Arc<InterStreamConn>) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-        )]
-        let pump = tokio::spawn(pump_hysteria_stream(stream, server_io));
+        // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
+        let pump = ctx
+            .spawn(pump_hysteria_stream(stream, server_io))
+            .expect("plugin ctx FxScope is never closed (assembly-owned)");
         Self { inner: client_io, _pump: pump }
     }
 }
 
 impl HysteriaConnection {
     /// 从 InterConn（UDP session）构造：spawn XUDP↔UdpMessage 桥接 pump。
-    fn from_udp(conn: Arc<InterConn>, default_dest: Destination) -> Self {
+    fn from_udp(ctx: &PluginContext, conn: Arc<InterConn>, default_dest: Destination) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-        )]
-        let pump = tokio::spawn(pump_hysteria_udp(conn, server_io, default_dest));
+        // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
+        let pump = ctx
+            .spawn(pump_hysteria_udp(conn, server_io, default_dest))
+            .expect("plugin ctx FxScope is never closed (assembly-owned)");
         Self { inner: client_io, _pump: pump }
     }
 }
@@ -382,6 +382,7 @@ pub(crate) fn parse_udp_source(addr: &str) -> Option<Destination> {
 pub fn make_hysteria_dial_fn(
     config: HysteriaConfig,
     transport: Arc<dyn HysteriaTransport>,
+    ctx: Arc<PluginContext>,
 ) -> DialFn {
     let client_manager: Arc<OnceCell<ClientManager>> = Arc::new(OnceCell::new());
     // 闭包外 clone，避免 move 闭包内重复 clone 导致 Copy trait 缺失
@@ -394,6 +395,7 @@ pub fn make_hysteria_dial_fn(
         let config = config_clone.clone();
         let transport = Arc::clone(&transport_clone);
         let client_manager = Arc::clone(&client_manager);
+        let ctx = Arc::clone(&ctx);
 
         Box::pin(async move {
             // lazy init ClientManager（首次 dial 时构造）
@@ -427,7 +429,7 @@ pub fn make_hysteria_dial_fn(
                 Network::TCP => {
                     let result = client.tcp(dest.address(), dest.port()).await;
                     match result {
-                        Ok(stream) => Ok(Box::new(HysteriaConnection::from_stream(stream))
+                        Ok(stream) => Ok(Box::new(HysteriaConnection::from_stream(&ctx, stream))
                             as Box<dyn Connection>),
                         Err(e) => {
                             tracing::warn!(server = %server_addr_str, target = ?dest.address(), "hysteria tcp dial failed: {e}");
@@ -438,7 +440,7 @@ pub fn make_hysteria_dial_fn(
                 Network::UDP => {
                     let result = client.udp().await;
                     match result {
-                        Ok(conn) => Ok(Box::new(HysteriaConnection::from_udp(conn, dest))
+                        Ok(conn) => Ok(Box::new(HysteriaConnection::from_udp(&ctx, conn, dest))
                             as Box<dyn Connection>),
                         Err(e) => {
                             tracing::warn!(server = %server_addr_str, "hysteria udp dial failed: {e}");
@@ -612,6 +614,7 @@ mod tests {
         let dial = make_hysteria_dial_fn(
             HysteriaConfig::new("127.0.0.1:443", "secret"),
             Arc::new(transport),
+            std::sync::Arc::new(xray_frame::PluginContext::for_plugin("hysteria")),
         );
 
         let target =
@@ -710,6 +713,7 @@ mod tests {
         let dial = make_hysteria_dial_fn(
             HysteriaConfig::new("localhost:443", "auth-token").with_server_name("sg.example.top"),
             Arc::new(transport),
+            std::sync::Arc::new(xray_frame::PluginContext::for_plugin("hysteria")),
         );
 
         let dest =

@@ -1236,10 +1236,10 @@ mod tests {
         // 2. serve_vless（freedom UDP 腿 FreedomDispatchBridge，与生产 wiring 一致）
         let ohm = Arc::new(SimpleOhm::new());
         let tcp_bridge = Arc::new(DialBridge::new("freedom", make_freedom_dial_fn()));
-        ohm.set_default(
-            Arc::new(xray_proxy_freedom::FreedomDispatchBridge::from_bridge(tcp_bridge))
-                as Arc<dyn xray_app_dispatcher::DispatchHandler>,
-        );
+        ohm.set_default(Arc::new(xray_proxy_freedom::FreedomDispatchBridge::from_bridge(
+            std::sync::Arc::new(xray_frame::PluginContext::for_plugin("freedom")),
+            tcp_bridge,
+        )) as Arc<dyn xray_app_dispatcher::DispatchHandler>);
         let (uuid, validator) = make_validator_with_user_flow("", &[]);
         let vless_listener = InboundTcpListener::bind(
             "127.0.0.1:0",

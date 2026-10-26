@@ -37,6 +37,11 @@ const SAMPLE_UUID_STR: &str = "66ad4540-b58c-4ad2-9926-ea63445a9b57";
 /// 测试负载。
 const PAYLOAD: &[u8] = b"hello vmess integration test!";
 
+/// 测试范式 ctx（生产注入来自装配根；仅测试面可直接构造）。
+fn test_ctx(kind: &'static str) -> Arc<xray_frame::PluginContext> {
+    Arc::new(xray_frame::PluginContext::for_plugin(kind))
+}
+
 /// 构造含已注册用户的 validator + cmd_key。
 fn make_validator() -> (Arc<TimedUserValidator>, [u8; 16]) {
     let uuid = UUID::parse(SAMPLE_UUID_STR).expect("uuid");
@@ -63,8 +68,10 @@ fn make_ohm() -> Arc<SimpleOhm> {
 fn make_ohm_with_udp() -> Arc<SimpleOhm> {
     let ohm = Arc::new(SimpleOhm::new());
     let tcp_bridge = Arc::new(DialBridge::new("freedom", make_freedom_dial_fn()));
-    let bridge = Arc::new(xray_proxy_freedom::FreedomDispatchBridge::from_bridge(tcp_bridge))
-        as Arc<dyn DispatchHandler>;
+    let bridge = Arc::new(xray_proxy_freedom::FreedomDispatchBridge::from_bridge(
+        test_ctx("freedom"),
+        tcp_bridge,
+    )) as Arc<dyn DispatchHandler>;
     ohm.set_default(bridge);
     ohm
 }
@@ -110,6 +117,7 @@ async fn run_vmess_e2e(security: SecurityType) {
             xray_transport::sockopt::SocketOptions::default(),
         );
         let _ = serve_vmess(
+            test_ctx("vmess"),
             listener,
             ohm_clone,
             validator_clone,
@@ -179,6 +187,7 @@ async fn vmess_rejects_unknown_user() {
             xray_transport::sockopt::SocketOptions::default(),
         );
         let _ = serve_vmess(
+            test_ctx("vmess"),
             listener,
             ohm_clone,
             validator_clone,
@@ -230,6 +239,7 @@ async fn vmess_e2e_aes128gcm_large_payload() {
             xray_transport::sockopt::SocketOptions::default(),
         );
         let _ = serve_vmess(
+            test_ctx("vmess"),
             listener,
             ohm_clone,
             validator_clone,
@@ -297,6 +307,7 @@ async fn vmess_e2e_authenticated_length() {
             xray_transport::sockopt::SocketOptions::default(),
         );
         let _ = serve_vmess(
+            test_ctx("vmess"),
             listener,
             ohm_clone,
             validator_clone,
@@ -370,6 +381,7 @@ async fn vmess_e2e_native_udp() {
             xray_transport::sockopt::SocketOptions::default(),
         );
         let _ = serve_vmess(
+            test_ctx("vmess"),
             listener,
             ohm_clone,
             validator_clone,
@@ -446,6 +458,7 @@ async fn vmess_e2e_authenticated_length_plus_no_termination_signal() {
             xray_transport::sockopt::SocketOptions::default(),
         );
         let _ = serve_vmess(
+            test_ctx("vmess"),
             listener,
             ohm_clone,
             validator_clone,

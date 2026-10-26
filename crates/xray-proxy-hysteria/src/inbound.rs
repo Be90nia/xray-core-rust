@@ -21,7 +21,7 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use async_trait::async_trait;
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::sync::Mutex;
 use tracing::info;
 use xray_features::inbound::{InboundError, InboundHandler};
 use xray_transport_hysteria::{
@@ -100,13 +100,16 @@ pub struct HysteriaInboundHandler {
     udp_dispatcher: Option<Arc<dyn xray_app_dispatcher::DispatchHandler>>,
     /// listener + accept 任务句柄，close 时 abort。
     slot: Mutex<Option<InboundSlot>>,
+    /// 组件自持托管 scope（B6，anytls/wireguard 入站同款）：TCP/UDP 会话任务与
+    /// accept 任务经此记账（坑约束 5），scope 随 handler drop 兜底 abort。
+    fx: Arc<skeleton_infra::fx::FxScope>,
 }
 
 struct InboundSlot {
     /// HysteriaListener 句柄（保持存活；close 时 drop 自动清理）。
     _listener: Arc<HysteriaListener>,
     quic_listener: Arc<dyn HysteriaQuicListener>,
-    _accept_task: JoinHandle<()>,
+    _accept_task: skeleton_infra::fx::Spawned<()>,
 }
 
 impl HysteriaInboundHandler {
@@ -137,6 +140,7 @@ impl HysteriaInboundHandler {
             dispatcher: None,
             udp_dispatcher: None,
             slot: Mutex::new(None),
+            fx: Arc::new(skeleton_infra::fx::FxScope::new()),
         })
     }
 
@@ -200,6 +204,7 @@ impl HysteriaInboundHandler {
             dispatcher,
             udp_dispatcher: None,
             slot: Mutex::new(None),
+            fx: Arc::new(skeleton_infra::fx::FxScope::new()),
         })
     }
 
@@ -269,8 +274,9 @@ impl InboundHandler for HysteriaInboundHandler {
         // on_new_conn 回调：每个新 QUIC stream 触发
         // 若有 dispatcher 则 spawn 异步任务处理 TCP 请求帧，否则仅 log
         let dispatcher = self.dispatcher.clone();
-        let on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync> = Arc::new(
-            move |stream: Arc<InterStreamConn>| {
+        let fx_closures = Arc::clone(&self.fx);
+        let on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync> =
+            Arc::new(move |stream: Arc<InterStreamConn>| {
                 let remote = stream.remote_addr();
                 let local = stream.local_addr();
                 tracing::debug!(
@@ -282,32 +288,33 @@ impl InboundHandler for HysteriaInboundHandler {
                 if let Some(ref disp) = dispatcher {
                     let disp = Arc::clone(disp);
                     let stream_clone = Arc::clone(&stream);
-                    #[allow(
-                        clippy::disallowed_methods,
-                        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-                    )]
-                    tokio::spawn(async move {
+                    let fx = Arc::clone(&fx_closures);
+                    // 组件自持 FxScope 记账（B6）：TCP 会话任务，scope drop 兜底 abort。
+                    fx.spawn(async move {
                         if let Err(e) = handle_tcp_stream(stream_clone, disp).await {
                             tracing::warn!(error = %e, "hysteria inbound tcp stream error");
                         }
-                    });
+                    })
+                    .expect("internal FxScope is never closed");
                 }
-            },
-        );
+            });
 
         // on_new_udp_session 回调：auth 后每个新 UDP session（首包 4B session id）触发。
         // 对应 Go server.go UDP 分支——每个 session 当一条虚拟连接 dispatch。
         let udp_dispatcher = self.udp_dispatcher.clone();
+        let fx_closures = Arc::clone(&self.fx);
         let on_new_udp_session: Option<Arc<dyn Fn(Arc<InterConn>) + Send + Sync>> = udp_dispatcher
             .map(|disp| {
                 Arc::new(move |sess: Arc<InterConn>| {
                     let disp = Arc::clone(&disp);
-                    #[allow(clippy::disallowed_methods, reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）")]
-                    tokio::spawn(async move {
+                    let fx = Arc::clone(&fx_closures);
+                    // 组件自持 FxScope 记账（B6）：UDP 会话任务，scope drop 兜底 abort。
+                    fx.spawn(async move {
                         if let Err(e) = handle_udp_session(sess, disp).await {
                             tracing::warn!(error = %e, "hysteria inbound udp session error");
                         }
-                    });
+                    })
+                    .expect("internal FxScope is never closed");
                 }) as Arc<dyn Fn(Arc<InterConn>) + Send + Sync>
             });
 
@@ -339,14 +346,14 @@ impl InboundHandler for HysteriaInboundHandler {
         let listener_clone = Arc::clone(&listener);
         let quic_clone = Arc::clone(&quic_listener);
         let tag = self.tag.clone();
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-        )]
-        let accept_task = tokio::spawn(async move {
-            listener_clone.start(quic_clone).await;
-            info!(tag = %tag, "hysteria inbound listener started");
-        });
+        let fx = Arc::clone(&self.fx);
+        // 组件自持 FxScope 记账（B6）：accept 任务，close() 仍显式 abort 语义。
+        let accept_task = fx
+            .spawn(async move {
+                listener_clone.start(quic_clone).await;
+                info!(tag = %tag, "hysteria inbound listener started");
+            })
+            .expect("internal FxScope is never closed");
 
         *slot = Some(InboundSlot { _listener: listener, quic_listener, _accept_task: accept_task });
         Ok(())

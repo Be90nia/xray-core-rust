@@ -115,8 +115,14 @@ impl VmessPlugin {
     }
 
     /// 插件产出：出站拨号闭包（[`make_vmess_dial_fn`] 既有构造，wire 不变）。
+    ///
+    /// 本接缝暂自持 `for_plugin` ctx（PluginContext 非 Clone，build(&mut) 无法
+    /// 移交句柄）；P3 装配接线时改传装配根 ctx。
     pub fn dial_fn(&self) -> Result<DialFn, PluginError> {
-        Ok(make_vmess_dial_fn(Arc::clone(self.built_outbound()?)))
+        Ok(make_vmess_dial_fn(
+            Arc::clone(self.built_outbound()?),
+            Arc::new(PluginContext::for_plugin("vmess")),
+        ))
     }
 }
 

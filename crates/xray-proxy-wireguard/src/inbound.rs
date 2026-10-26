@@ -343,11 +343,9 @@ async fn wg_accept_loop(
                 netstack: Arc::clone(&netstack),
                 handle: event.handle,
             };
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "热路径豁免（B6 t975）：数据面泵——smoltcp socket ↔ duplex 字节搬运，热路径零改动（坑约束 12）；托管接线归 P1 插件装配"
-            )]
-            tokio::spawn(relay.run());
+            // spawn 中继 task（smoltcp socket ↔ duplex）——组件自持 FxScope
+            // 记账（B6 t975），scope drop 兜底 abort。
+            fx.spawn(relay.run()).expect("internal FxScope is never closed");
 
             // spawn dispatch（link → outbound），挂 per-user 上下文
             // （Go server.go:352-364：GetUserByAddr(隧道内源) →
@@ -380,7 +378,16 @@ async fn wg_accept_loop(
         // 锁内只做同步 drain（无 await）；会话 spawn/入队均非阻塞。
         let now = nanos_now();
         for (dst, src, payload) in stack.drain_udp(now) {
-            forward_wg_udp_datagram(&udp_sessions, &netstack, &dispatch, dst, src, payload, now);
+            forward_wg_udp_datagram(
+                &fx,
+                &udp_sessions,
+                &netstack,
+                &dispatch,
+                dst,
+                src,
+                payload,
+                now,
+            );
         }
     }
 }
@@ -440,7 +447,17 @@ type WgUdpSessions = Arc<ParkMutex<HashMap<IpEndpoint, WgUdpSession>>>;
 /// 队列满丢包（Go `> queue full` 同语义）；首包目标决定 dispatch 链路，后续包
 /// 各带目标由 XUDP 帧头 per-packet 路由。owner task 已退出时摘除死会话、本包
 /// 丢弃，后续包按新会话重建（Go `connectionFinished` 同语义）。
+///
+/// 8/7 参豁免台账（B6 t975 新增 `fx` 后越线）：①数据面 4 元（dst/src/payload/
+/// now）收包 → `now` 是 accept loop 级共享时钟戳，非 per-报文属性，塞进结构
+/// 是语义谎；②infra 面 4 引用（fx/sessions/netstack/dispatch）收包 →
+/// per-报文构造 = 4 次 Arc clone（UDP 快路新增分配），或借用结构体（构造点
+/// 仍 8 项，纯搬运）。唯一调用方 wg_accept_loop 两组成员各自独立另用，收包
+/// 牵动整个 accept loop 局部布局 → 无语义收益，allow + 台账（仓规：豁免一律
+/// 显式 allow + 理由）。
+#[allow(clippy::too_many_arguments, reason = "8/7 参：收包两种形态均负收益，见上函数 doc 台账")]
 fn forward_wg_udp_datagram(
+    fx: &Arc<FxScope>,
     sessions: &WgUdpSessions,
     netstack: &Arc<AsyncMutex<WgNetStack>>,
     dispatch: &Arc<dyn DispatchHandler>,
@@ -467,18 +484,17 @@ fn forward_wg_udp_datagram(
         return;
     }
     let (cmd_tx, cmd_rx) = mpsc::channel(WG_UDP_QUEUE_CAP);
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "热路径豁免（B6 t975）：UDP 快路——per-源会话任务（首包路径 spawn，Go udp forwarder 语义），热路径零改动（坑约束 12）；托管接线归 P1 插件装配"
-    )]
-    tokio::spawn(run_wg_udp_session(
+    // 组件自持 FxScope 记账（B6 t975）：UDP 快路 per-源会话任务（首包路径 spawn，
+    // Go udp forwarder 语义），scope drop 兜底 abort。
+    fx.spawn(run_wg_udp_session(
         Arc::clone(dispatch),
         cmd_rx,
         Arc::clone(netstack),
         src,
         dest,
         payload,
-    ));
+    ))
+    .expect("internal FxScope is never closed");
     map.insert(src, WgUdpSession { cmd_tx, last_used_nanos: now });
 }
 

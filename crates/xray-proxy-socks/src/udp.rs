@@ -18,7 +18,7 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -32,7 +32,7 @@ use xray_buf::{
     multi::MultiBuffer,
 };
 use xray_common::net::{address::Address, destination::Destination, port::Port};
-use xray_frame::PluginContext;
+use xray_frame::{LogFacade, PluginContext};
 use xray_transport::link::Link;
 use xray_xudp::packet::{PacketError, PacketReader, PacketWriter};
 
@@ -206,32 +206,35 @@ async fn resolve_first(server_addr: &str) -> Result<IpAddr> {
     })
 }
 
+/// relay 丢弃路径诊断门面（nn8os 2b 打回处置：tracing 宏 → LogFacade——
+/// 本项目工具链上 `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/
+/// 文件顶三形态实测无效；仓内 91 处先例豁免的是 macro_rules 的 println），
+/// 迁移为唯一关红路径。域 = "socks"，target `xray_frame::socks` + mask_secrets。
+/// 只在丢弃分支发射（非转发热路径，坑约束⑫不触）。
+static RELAY_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("socks", vec![]));
+
 /// 解析一帧 relay 数据报。
 ///
 /// `FRAG != 0` → 丢弃 + 计数（Go 同样不支持分片）；畸形帧 → 丢弃；
 /// 合法帧 → `Some((source, payload))`。两种丢弃都打 debug 日志，
 /// 不让帧静默消失（分片属预期协议行为，畸形帧值得排查）。
-// nn8os 2b 残余豁免（L3 台账）：逐报文数据面热路径，ctx.log 的 mask_secrets +
-// 手工 callsite 开销不入热路径（坑约束⑫数据面零改动优先）；迁移随 P3 热路径
-// 专项（若该面有按域治理诉求再议）。
-#[allow(
-    clippy::disallowed_methods,
-    reason = "数据面逐报文热路径：tracing! 开销考量见上，ctx.log 迁移归 P3 热路径专项"
-)]
 fn parse_relay_frame<'a>(buf: &'a [u8], frag_dropped: &AtomicU64) -> Option<(SocksAddr, &'a [u8])> {
     if buf.len() < 5 {
-        tracing::debug!(len = buf.len(), "socks udp: dropped undersized datagram");
+        RELAY_LOG.debug(format!("socks udp: dropped undersized datagram len={}", buf.len()));
         return None;
     }
     if buf[2] != 0 {
         let dropped = frag_dropped.fetch_add(1, Ordering::Relaxed) + 1;
-        tracing::debug!(fragment = buf[2], dropped, "socks udp: dropped fragmented datagram");
+        RELAY_LOG.debug(format!(
+            "socks udp: dropped fragmented datagram fragment={} dropped={}",
+            buf[2], dropped
+        ));
         return None;
     }
     match decode_udp_packet(buf) {
         Ok((addr, payload)) => Some((addr, payload)),
         Err(e) => {
-            tracing::debug!(error = %e, "socks udp: dropped malformed datagram");
+            RELAY_LOG.debug(format!("socks udp: dropped malformed datagram error={e}"));
             None
         },
     }

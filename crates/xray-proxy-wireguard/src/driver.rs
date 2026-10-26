@@ -39,6 +39,7 @@ use tokio::{
 };
 use xray_app_dispatcher::default::DialFn;
 use xray_common::net::{address::Address, destination::Destination};
+use xray_frame::PluginContext;
 use xray_transport::connection::Connection;
 use xray_xudp::packet::{PacketReader, PacketWriter};
 
@@ -89,6 +90,8 @@ pub enum WgTransport {
 pub struct DialedUdp {
     /// system dialer（Go `internet.Dialer`，经出站链拨 UDP dest）。
     dialer: DialFn,
+    /// 托管句柄（坑约束 5）：读 task 经 `ctx.spawn` 落 FxScope 记账。
+    ctx: Arc<PluginContext>,
     /// WG peer endpoint（UDP，IP 已解析）。
     dest: Destination,
     /// 当前连接写半边；`None` = 未连接/已死，下次 send 重拨。
@@ -101,9 +104,10 @@ pub struct DialedUdp {
 
 impl DialedUdp {
     /// 构造（拨号发生在首次 send——Go connectTo 惰性语义）。
-    pub fn new(dialer: DialFn, dest: Destination) -> Self {
+    pub fn new(ctx: Arc<PluginContext>, dialer: DialFn, dest: Destination) -> Self {
         Self {
             dialer,
+            ctx,
             dest,
             writer: AsyncMutex::new(None),
             queue_tx: Mutex::new(None),
@@ -126,13 +130,12 @@ impl DialedUdp {
         let conn = (self.dialer)(&self.dest).await?;
         let (read, write) = tokio::io::split(conn);
         let d = Arc::clone(&self);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "热路径豁免（B6 t975）：每包泵——WG 数据报读循环（连接级读 goroutine，Go bind.go:126-166 同构），热路径零改动（坑约束 12）；托管接线归 P1 插件装配"
-        )]
-        tokio::spawn(async move {
-            d.read_loop(read).await;
-        });
+        // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
+        self.ctx
+            .spawn(async move {
+                d.read_loop(read).await;
+            })
+            .expect("plugin ctx FxScope is never closed (assembly-owned)");
         Ok(write)
     }
 
@@ -549,13 +552,13 @@ impl WgDriver {
                 let sock = Arc::clone(sock);
                 let tx = self.queue_tx.clone();
                 let mut shut = shut_rx.clone();
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "热路径豁免（B6 t975）：每包泵——Direct 传输 recv_from 读循环，热路径零改动（坑约束 12）；托管接线归 P1 插件装配"
-                )]
-                tokio::spawn(async move {
-                    direct_read_loop(sock, tx, &mut shut).await;
-                });
+                // driver 自持 FxScope（B6 t975）：主循环内部任务同 scope 记账，
+                // scope drop（driver 释放）兜底 abort。
+                self.fx
+                    .spawn(async move {
+                        direct_read_loop(sock, tx, &mut shut).await;
+                    })
+                    .expect("driver scope is never closed (self-owned)");
             },
             WgTransport::Dialed(d) => d.set_shutdown(shut_rx.clone()),
         }
@@ -565,13 +568,12 @@ impl WgDriver {
             let driver = Arc::clone(&self);
             let rx = Arc::clone(&rx);
             let shut = shut_rx.clone();
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "热路径豁免（B6 t975）：每包泵——readQueue worker 消费循环 ×N（Go Open 返回 N 个 receive func 同构），热路径零改动（坑约束 12）；托管接线归 P1 插件装配"
-            )]
-            tokio::spawn(async move {
-                driver.worker_loop(rx, shut).await;
-            });
+            // driver 自持 FxScope（B6 t975）：worker 池同 scope 记账。
+            self.fx
+                .spawn(async move {
+                    driver.worker_loop(rx, shut).await;
+                })
+                .expect("driver scope is never closed (self-owned)");
         }
 
         let mut timer = interval(TIMER_INTERVAL);
@@ -748,12 +750,17 @@ pub async fn bind_udp_socket(bind_addr: &str) -> Result<Arc<UdpSocket>> {
 #[cfg(test)]
 mod tests {
     use xray_common::net::{network::Network, port::Port};
+    use xray_frame::PluginContext;
 
     use super::*;
     use crate::{
         config::{DeviceConfig, PeerConfig},
         peer::shared_peer,
     };
+
+    fn test_ctx() -> Arc<PluginContext> {
+        Arc::new(PluginContext::for_plugin("wireguard"))
+    }
 
     fn make_keypair(seed: u8) -> (String, String) {
         use boringtun::x25519::{PublicKey, StaticSecret};
@@ -785,7 +792,7 @@ mod tests {
         WgDriver::with_transport(
             peers,
             cidrs,
-            WgTransport::Dialed(Arc::new(DialedUdp::new(dialer, dest))),
+            WgTransport::Dialed(Arc::new(DialedUdp::new(test_ctx(), dialer, dest))),
             ns,
         )
     }
@@ -913,7 +920,7 @@ mod tests {
             Port::new(51820),
             Network::UDP,
         );
-        let dialed = Arc::new(DialedUdp::new(dialer, dest.clone()));
+        let dialed = Arc::new(DialedUdp::new(test_ctx(), dialer, dest.clone()));
         let (tx, mut rx) = mpsc::channel(16);
         dialed.set_queue_tx(tx);
 

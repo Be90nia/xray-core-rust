@@ -21,10 +21,12 @@ use anytls::{
     runtime::DefaultPaddingFactory,
 };
 use sha2::{Digest, Sha256};
+use skeleton_infra::fx::Spawned;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio_rustls::TlsConnector;
 use xray_common::net::{address::Address, destination::Destination, port::Port};
 use xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT;
+use xray_frame::PluginContext;
 use xray_transport::sockopt::SocketOptions;
 
 use crate::{error::Result, socks::SocksAddr};
@@ -138,14 +140,17 @@ impl ClientConfig {
 /// AnyTLS 客户端，复用 TLS 会话池。
 pub struct AnytlsClient {
     inner: AnytlsClientInner,
+    /// 托管句柄（坑约束 5）：per-dial 泵任务经 `ctx.spawn` 落 FxScope 记账。
+    ctx: Arc<PluginContext>,
     /// 握手/首包限时（`ClientConfig::handshake_timeout`；`dial()` 建流兜底用）。
     handshake_timeout: Duration,
 }
 
 impl AnytlsClient {
-    /// 创建客户端。`tls_config` 决定 TLS 验证策略。
+    /// 创建客户端。`tls_config` 决定 TLS 验证策略。`ctx` = 装配注入的
+    /// [`PluginContext`]（坑约束 5 异步托管唯一口）。
     #[must_use]
-    pub fn new(config: ClientConfig) -> Self {
+    pub fn new(config: ClientConfig, ctx: Arc<PluginContext>) -> Self {
         let server_addr = config.server_addr.clone();
         let sni = config.sni.clone();
         let password_sha256: [u8; 32] = Sha256::digest(config.password.as_bytes()).into();
@@ -206,7 +211,7 @@ impl AnytlsClient {
             config.idle_timeout,
             config.min_idle_sessions,
         );
-        Self { inner, handshake_timeout: config.handshake_timeout }
+        Self { inner, ctx, handshake_timeout: config.handshake_timeout }
     }
 
     /// 拨号到目标地址。返回的 `AnytlsConn` 实现 `AsyncRead + AsyncWrite + Unpin`。
@@ -236,11 +241,11 @@ impl AnytlsClient {
         stream.write(&socks_bytes).await?;
 
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-        )]
-        let pump = tokio::spawn(pump_stream(stream, server_io));
+        // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
+        let pump = self
+            .ctx
+            .spawn(pump_stream(stream, server_io))
+            .expect("plugin ctx FxScope is never closed (assembly-owned)");
 
         Ok(AnytlsConn { inner: client_io, _pump: pump })
     }
@@ -258,7 +263,7 @@ impl AnytlsClient {
 /// 连接一致——`AnytlsConn` drop 时 pump task 被 abort（`JoinHandle::drop` 自动 abort）。
 pub struct AnytlsConn {
     inner: DuplexStream,
-    _pump: tokio::task::JoinHandle<()>,
+    _pump: Spawned<()>,
 }
 
 impl AsyncRead for AnytlsConn {
@@ -360,6 +365,9 @@ fn build_auth_frame(password_sha256: &[u8; 32], padding_len: u16) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    fn test_ctx() -> std::sync::Arc<xray_frame::PluginContext> {
+        std::sync::Arc::new(xray_frame::PluginContext::for_plugin("anytls"))
+    }
     use super::*;
 
     /// sha256(b"test-password") 预期值（sha256sum 实算锚定，防算法被误改）。
@@ -442,7 +450,7 @@ mod tests {
         );
         let config = ClientConfig::new(silent_addr.to_string(), "localhost", "pw", tls)
             .with_handshake_timeout(Duration::from_millis(300));
-        let client = AnytlsClient::new(config);
+        let client = AnytlsClient::new(config, test_ctx());
 
         let started = std::time::Instant::now();
         let res = client.dial(&SocksAddr::from_socket("127.0.0.1:9".parse().unwrap())).await;

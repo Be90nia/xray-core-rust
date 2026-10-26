@@ -455,6 +455,7 @@ where
 
 /// Trojan inbound entry point (aligns with `xray_core::inbound::serve_socks5`).
 pub async fn serve_trojan(
+    ctx: std::sync::Arc<xray_frame::PluginContext>,
     listener: InboundTcpListener,
     ohm: Arc<SimpleOhm>,
     users: HashMap<String, MemoryUser>,
@@ -498,11 +499,8 @@ pub async fn serve_trojan(
         let fb_policy = fallbacks.clone();
         let tls = tls.clone();
         let header = header.clone();
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-        )]
-        tokio::spawn(async move {
+        // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
+        ctx.spawn(async move {
             if let Some(acc) = tls {
                 match acc.accept(stream).await {
                     Ok(tls_stream) => {
@@ -559,7 +557,8 @@ pub async fn serve_trojan(
                 )
                 .await;
             }
-        });
+        })
+        .expect("plugin ctx FxScope is never closed (assembly-owned)");
     }
 }
 
@@ -1049,6 +1048,7 @@ mod tests {
         let ohm_clone = Arc::clone(&ohm);
         xray_common::testing::spawn("serve-trojan-dispatches-to-echo-via-freedom", async move {
             let _ = serve_trojan(
+                std::sync::Arc::new(xray_frame::PluginContext::for_plugin("trojan")),
                 trojan_listener,
                 ohm_clone,
                 users,
@@ -1129,10 +1129,10 @@ mod tests {
 
         // 2. dispatcher：freedom（TCP+UDP dispatch）外裹计数器
         let ohm = Arc::new(SimpleOhm::new());
-        let freedom = Arc::new(FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new(
-            "freedom",
-            make_freedom_dial_fn(),
-        ))));
+        let freedom = Arc::new(FreedomDispatchBridge::from_bridge(
+            std::sync::Arc::new(xray_frame::PluginContext::for_plugin("freedom")),
+            Arc::new(DialBridge::new("freedom", make_freedom_dial_fn())),
+        ));
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counting = Arc::new(CountingDispatch { inner: freedom, calls: Arc::clone(&calls) })
             as Arc<dyn DispatchHandler>;
@@ -1153,6 +1153,7 @@ mod tests {
         let ohm_clone = Arc::clone(&ohm);
         xray_common::testing::spawn("serve-trojan-udp-relay-dispatches-via-freedom", async move {
             let _ = serve_trojan(
+                std::sync::Arc::new(xray_frame::PluginContext::for_plugin("trojan")),
                 trojan_listener,
                 ohm_clone,
                 users,

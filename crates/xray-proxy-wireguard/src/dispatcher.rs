@@ -35,6 +35,7 @@ use tokio::{
 use xray_app_dispatcher::default::DialFn;
 use xray_app_dns::DnsService;
 use xray_common::net::{address::Address, destination::Destination, network::Network};
+use xray_frame::PluginContext;
 use xray_transport::connection::Connection;
 use xray_xudp::packet::{PacketReader, PacketWriter};
 
@@ -466,6 +467,7 @@ pub fn make_wireguard_dial_fn(
     config: DeviceConfig,
     dns: Option<Arc<DnsService>>,
     system_dialer: Option<DialFn>,
+    ctx: Arc<PluginContext>,
 ) -> DialFn {
     let handler: Arc<OnceCell<WireguardOutboundHandler>> = Arc::new(OnceCell::new());
     let config_clone = config.clone();
@@ -486,6 +488,7 @@ pub fn make_wireguard_dial_fn(
         let handler_cell = Arc::clone(&handler);
         let dns_cache = Arc::clone(&dns_cache);
         let clock = Arc::clone(&clock);
+        let ctx = Arc::clone(&ctx);
 
         Box::pin(async move {
             // lazy init WireguardOutboundHandler（含 driver task）
@@ -497,6 +500,7 @@ pub fn make_wireguard_dial_fn(
                         dns.as_ref(),
                         system_dialer.as_ref().cloned(),
                         Some(Arc::clone(&dns_cache)),
+                        Arc::clone(&ctx),
                     )
                     .await
                 })
@@ -561,7 +565,7 @@ pub fn make_wireguard_dial_fn(
                         return Err("wireguard outbound: tcp connect timeout or failed".to_string());
                     }
 
-                    spawn_relay(|from_client, to_client| {
+                    spawn_relay(&ctx, |from_client, to_client| {
                         UdpOrTcpRelay::Tcp(TcpRelay {
                             from_client,
                             to_client,
@@ -582,7 +586,7 @@ pub fn make_wireguard_dial_fn(
                         handle
                     };
 
-                    spawn_relay(|from_client, to_client| {
+                    spawn_relay(&ctx, |from_client, to_client| {
                         UdpOrTcpRelay::Udp(UdpRelay {
                             from_client,
                             to_client,
@@ -646,7 +650,7 @@ impl UdpOrTcpRelay {
 
 /// 创建 duplex pair 并 spawn 中继 task，返回 client 侧 Connection。
 #[allow(deprecated)] // 存量清零批次：deprecated
-async fn spawn_relay<F>(make: F) -> Result<Box<dyn Connection>, String>
+async fn spawn_relay<F>(ctx: &PluginContext, make: F) -> Result<Box<dyn Connection>, String>
 where
     F: FnOnce(tokio::io::DuplexStream, tokio::io::DuplexStream) -> UdpOrTcpRelay,
 {
@@ -655,13 +659,11 @@ where
     let (relay_to_client, client_from_relay) = tokio::io::duplex(DUPLEX_BUF);
     let conn = WireguardConnection::new(client_from_relay, client_to_relay);
     let relay = make(relay_from_client, relay_to_client);
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "热路径豁免（B6 t975）：数据面泵——duplex ↔ TCP/UDP 中继字节搬运，热路径零改动（坑约束 12）；托管接线归 P1 插件装配"
-    )]
-    tokio::spawn(async move {
+    // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
+    ctx.spawn(async move {
         relay.run().await;
-    });
+    })
+    .expect("plugin ctx FxScope is never closed (assembly-owned)");
     Ok(Box::new(conn))
 }
 
@@ -1483,7 +1485,12 @@ mod tests {
             ..Default::default()
         };
 
-        let dial_fn = make_wireguard_dial_fn(config, None, Some(dialer));
+        let dial_fn = make_wireguard_dial_fn(
+            config,
+            None,
+            Some(dialer),
+            std::sync::Arc::new(xray_frame::PluginContext::for_plugin("wireguard")),
+        );
         let conn = dial_fn(&udp_dest(53)).await.expect("dial through wireguard");
 
         // 用户 UDP 请求（XUDP 帧）→ UdpRelay → smoltcp → tx → WG 握手 init → dialed

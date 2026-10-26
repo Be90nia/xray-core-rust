@@ -21,13 +21,14 @@ use std::{
     task::{Context, Poll},
 };
 
+use skeleton_infra::fx::Spawned;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf},
     net::UdpSocket,
-    task::JoinHandle,
 };
 use xray_app_dispatcher::default::DialFn;
 use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
+use xray_frame::PluginContext;
 use xray_transport::connection::Connection;
 use xray_xudp::packet::{PacketError, PacketReader, PacketWriter};
 
@@ -53,52 +54,64 @@ const GLOBAL_ID_LEN: usize = 8;
 /// chunk 流与 `tokio::io::duplex` 明文 IO 之间双向搬运。`SsConnection` 自身只
 /// 持有 duplex 客户端半 + pump task 句柄，trait 方法全部委托给 duplex。
 ///
-/// `_pump` 字段保证桥接 task 生命周期与连接一致——drop 时自动 abort。
+/// `_ctx` 字段让连接自持 `Arc<PluginContext>`：泵记在 ctx 的 FxScope 账上，
+/// scope drop（JoinSet drop → abort_all）会杀泵——若连接不持引用，直接构造
+/// 路径（如测试传临时 ctx）会在语句结束即断 scope，泵刚 spawn 就被收。
+/// `_pump` 仅保留 Spawned 句柄，drop 不 abort（契约见 skeleton-infra fx）；
+/// 连接 drop → duplex 对端断 → 泵自然退出，无泄漏。
 pub struct SsConnection {
     inner: DuplexStream,
-    _pump: JoinHandle<()>,
+    _pump: Spawned<()>,
+    _ctx: Arc<PluginContext>,
 }
 
 impl SsConnection {
     /// 从已写完首帧（addr+port）的 `SSStream` 构造。
     /// 首帧由 `Client::dial_target` 写入，本包装只负责 body 加密透传。
     #[must_use]
-    pub fn new(stream: SSStream<Box<dyn Connection>>) -> Self {
+    pub fn new(ctx: &Arc<PluginContext>, stream: SSStream<Box<dyn Connection>>) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "热路径豁免（B6 t975）：每帧泵——duplex ↔ SS 加密 chunk 流双向搬运，热路径零改动（坑约束 12）；托管接线归 P1 插件装配"
-        )]
-        let pump = tokio::spawn(pump_ss_stream(stream, server_io));
-        Self { inner: client_io, _pump: pump }
+        // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
+        let pump = ctx
+            .spawn(pump_ss_stream(stream, server_io))
+            .expect("plugin ctx FxScope is never closed (assembly-owned)");
+        Self { inner: client_io, _pump: pump, _ctx: Arc::clone(ctx) }
     }
 }
 
 impl SsConnection {
     /// UDP 变体：从已 connect 到 SS 服务器 UDP 端口的 socket 构造，
     /// spawn XUDP 帧 ↔ SS UDP 数据报 pump（[`pump_ss_udp`]）。
-    fn new_udp(sock: UdpSocket, account: MemoryAccount, default_dest: Destination) -> Self {
+    fn new_udp(
+        ctx: &Arc<PluginContext>,
+        sock: UdpSocket,
+        account: MemoryAccount,
+        default_dest: Destination,
+    ) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "热路径豁免（B6 t975）：每包泵——XUDP 帧 ↔ SS UDP 数据报双向搬运，热路径零改动（坑约束 12）；托管接线归 P1 插件装配"
-        )]
-        let pump = tokio::spawn(pump_ss_udp(sock, account, server_io, default_dest));
-        Self { inner: client_io, _pump: pump }
+        // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
+        let pump = ctx
+            .spawn(pump_ss_udp(sock, account, server_io, default_dest))
+            .expect("plugin ctx FxScope is never closed (assembly-owned)");
+        Self { inner: client_io, _pump: pump, _ctx: Arc::clone(ctx) }
     }
 }
 
 impl SsConnection {
     /// UDP 变体（SS-2022）：从已 connect 到 SS 服务器 UDP 端口的 socket 构造，
     /// spawn XUDP 帧 ↔ SS-2022 UDP 会话帧 pump（[`pump_ss2022_udp`]）。
-    fn new_udp_2022(sock: UdpSocket, params: Ss2022DialParams, default_dest: Destination) -> Self {
+    fn new_udp_2022(
+        ctx: &Arc<PluginContext>,
+        sock: UdpSocket,
+        params: Ss2022DialParams,
+        default_dest: Destination,
+    ) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "热路径豁免（B6 t975）：每包泵——XUDP 帧 ↔ SS-2022 会话帧双向搬运，热路径零改动（坑约束 12）；托管接线归 P1 插件装配"
-        )]
-        let pump = tokio::spawn(pump_ss2022_udp(sock, params, server_io, default_dest));
-        Self { inner: client_io, _pump: pump }
+        // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
+        let pump = ctx
+            .spawn(pump_ss2022_udp(sock, params, server_io, default_dest))
+            .expect("plugin ctx FxScope is never closed (assembly-owned)");
+        Self { inner: client_io, _pump: pump, _ctx: Arc::clone(ctx) }
     }
 }
 
@@ -426,9 +439,23 @@ pub fn parse_ss_config(data: &[u8]) -> Result<SsOutboundConfig, String> {
 /// # Panics
 ///
 /// 不会 panic；任何错误以 `Err(String)` 返回。
+/// 构造 SS outbound DialFn（自持 ctx 便捷形）。
+///
+/// 兼容接缝：`xray-core` 既有测试（`inbound.rs` tests，非本代理面）与
+/// `xray-cli` framework 族仍以本名构造。生产装配走
+/// [`make_ss_dial_fn_with_ctx`]（`arm_builders` 注入 `arm_plugin_ctx`）。
 pub fn make_ss_dial_fn(config: Arc<SsOutboundConfig>) -> DialFn {
+    make_ss_dial_fn_with_ctx(config, Arc::new(PluginContext::for_plugin("shadowsocks")))
+}
+
+/// 构造 SS outbound DialFn（ctx 注入版；坑约束 5 异步托管唯一口）。
+///
+/// 闭包捕获 `Arc<SsOutboundConfig>` + 装配注入的 [`PluginContext`]，泵任务
+/// 全部经 `ctx.spawn` 托管。
+pub fn make_ss_dial_fn_with_ctx(config: Arc<SsOutboundConfig>, ctx: Arc<PluginContext>) -> DialFn {
     Arc::new(move |dest: &Destination| {
         let config = Arc::clone(&config);
+        let ctx = Arc::clone(&ctx);
         let target_addr = dest.address().clone();
         let target_port = dest.port().value();
         let network = dest.network();
@@ -508,7 +535,7 @@ pub fn make_ss_dial_fn(config: Arc<SsOutboundConfig>) -> DialFn {
                             .await
                             .map_err(|e| format!("ss dial: {e}"))?
                     };
-                    Ok(Box::new(SsConnection::new(stream)) as Box<dyn Connection>)
+                    Ok(Box::new(SsConnection::new(&ctx, stream)) as Box<dyn Connection>)
                 },
                 // UDP：dial SS 服务器的 UDP 端口（Go internet dialer 的 network
                 // 跟随 dest）。legacy：每数据报独立 [salt][AEAD(addr+port+payload)]；
@@ -524,10 +551,17 @@ pub fn make_ss_dial_fn(config: Arc<SsOutboundConfig>) -> DialFn {
                     sock.connect(server).await.map_err(|e| format!("ss udp connect: {e}"))?;
                     let default_dest = Destination::udp(target_addr, Port::new(target_port));
                     if let Some(p) = &config.ss2022 {
-                        Ok(Box::new(SsConnection::new_udp_2022(sock, p.clone(), default_dest))
-                            as Box<dyn Connection>)
+                        Ok(
+                            Box::new(SsConnection::new_udp_2022(
+                                &ctx,
+                                sock,
+                                p.clone(),
+                                default_dest,
+                            )) as Box<dyn Connection>,
+                        )
                     } else {
                         Ok(Box::new(SsConnection::new_udp(
+                            &ctx,
                             sock,
                             config.account.clone(),
                             default_dest,
@@ -1155,7 +1189,13 @@ mod tests {
             )
             .await
             .expect("dial_target_for_proxy_on");
-        let mut conn = SsConnection::new(stream);
+        // 回归钉（f17zu 后波）：构造后立即丢弃调用方侧 Arc——连接必须自持
+        // scope（_ctx 字段）。此前传临时 ctx（`&PluginContext::for_plugin(..)`
+        // 未绑定），语句结束即断 scope，泵刚 spawn 就被 JoinSet abort 收掉，
+        // read_exact 撞 UnexpectedEof。
+        let ctx = std::sync::Arc::new(xray_frame::PluginContext::for_plugin("shadowsocks"));
+        let mut conn = SsConnection::new(&ctx, stream);
+        drop(ctx);
 
         let payload = b"hello ss duplex pump!";
         conn.write_all(payload).await.expect("ss write");

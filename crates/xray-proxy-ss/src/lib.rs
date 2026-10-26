@@ -30,7 +30,8 @@ pub mod validator;
 
 pub use config::{AeadCipher, Cipher, CipherType, InnerAead, MemoryAccount};
 pub use dispatcher::{
-    Ss2022DialParams, SsConnection, SsOutboundConfig, make_ss_dial_fn, parse_ss_config,
+    Ss2022DialParams, SsConnection, SsOutboundConfig, make_ss_dial_fn, make_ss_dial_fn_with_ctx,
+    parse_ss_config,
 };
 pub use error::{Result, SsError};
 pub use inbound::SsInbound;

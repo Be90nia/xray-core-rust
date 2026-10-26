@@ -479,8 +479,17 @@ fn parse_decryption(
     }
     let mut inst = ServerInstance::new();
     let key_count = p.keys.len();
-    inst.init(p.keys, p.xor_mode, p.seconds_from, p.seconds_to, &p.padding)
-        .map_err(|e| PluginError::Other(format!("vless decryption init: {e}").into()))?;
+    inst.init(
+        p.keys,
+        p.xor_mode,
+        p.seconds_from,
+        p.seconds_to,
+        &p.padding,
+        // 自持 for_plugin ctx（PluginContext 非 Clone，build(&mut) 无法移交句柄）；
+        // P3 装配接线时改传装配根 ctx。
+        std::sync::Arc::new(xray_frame::PluginContext::for_plugin("vless")),
+    )
+    .map_err(|e| PluginError::Other(format!("vless decryption init: {e}").into()))?;
     tracing::info!(
         seconds_from = p.seconds_from,
         seconds_to = p.seconds_to,

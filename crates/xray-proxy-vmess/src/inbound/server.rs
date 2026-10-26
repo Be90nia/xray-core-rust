@@ -21,6 +21,7 @@ use xray_common::{
     protocol::{Command, ResponseCommand, ResponseHeader, SecurityType},
 };
 use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead};
+use xray_frame::PluginContext;
 use xray_transport::{link::Link, system_listener::InboundTcpListener};
 
 use crate::{
@@ -144,6 +145,7 @@ const PUMP_BUF: usize = 8192;
 /// 仅支持 `Aes128Gcm` + `Chacha20Poly1305` + `PlainSizeParser`（默认 body 选项）。
 /// `AUTHENTICATED_LENGTH` / `CHUNK_MASKING` 选项 warn 后关闭连接（YAGNI）。
 pub async fn serve_vmess(
+    ctx: std::sync::Arc<PluginContext>,
     listener: InboundTcpListener,
     ohm: Arc<SimpleOhm>,
     validator: Arc<TimedUserValidator>,
@@ -181,11 +183,8 @@ pub async fn serve_vmess(
         let history = Arc::clone(&history);
         let tls = tls.clone();
         let header = header.clone();
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
-        )]
-        tokio::spawn(async move {
+        // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
+        ctx.spawn(async move {
             let result = if let Some(acc) = tls {
                 match acc.accept(stream).await {
                     Ok(tls_stream) => {
@@ -220,7 +219,8 @@ pub async fn serve_vmess(
                 // Go vmess inbound.go:250：拒绝 AtInfo + RemoteAddr。
                 tracing::info!(peer = %peer, error = %e, "vmess connection ended with error");
             }
-        });
+        })
+        .expect("plugin ctx FxScope is never closed (assembly-owned)");
     }
 }
 
@@ -767,6 +767,10 @@ mod tests {
         validator::{MemoryUser, Validator},
     };
 
+    fn test_ctx() -> Arc<PluginContext> {
+        Arc::new(PluginContext::for_plugin("vmess"))
+    }
+
     const SAMPLE_UUID_STR: &str = "66ad4540-b58c-4ad2-9926-ea63445a9b57";
 
     /// 构造测试用 validator（含一个已注册用户）+ 对应 cmd_key。
@@ -807,8 +811,8 @@ mod tests {
         // 与生产 wiring（xray-core/src/outbound.rs）一致：
         // TCP 走 DialBridge，UDP 走 FreedomDispatchBridge → freedom udp::relay。
         let tcp_bridge = Arc::new(DialBridge::new("freedom", make_freedom_dial_fn()));
-        let bridge =
-            Arc::new(FreedomDispatchBridge::from_bridge(tcp_bridge)) as Arc<dyn DispatchHandler>;
+        let bridge = Arc::new(FreedomDispatchBridge::from_bridge(test_ctx(), tcp_bridge))
+            as Arc<dyn DispatchHandler>;
         ohm.set_default(bridge);
         ohm
     }
@@ -834,6 +838,7 @@ mod tests {
         let validator_clone = Arc::clone(&validator);
         xray_common::testing::spawn("run-vmess-e2e", async move {
             let _ = serve_vmess(
+                test_ctx(),
                 vmess_listener,
                 ohm_clone,
                 validator_clone,
@@ -905,6 +910,7 @@ mod tests {
         let validator_clone = Arc::clone(&validator);
         xray_common::testing::spawn("vmess-inbound-rejects-unknown-user", async move {
             let _ = serve_vmess(
+                test_ctx(),
                 vmess_listener,
                 ohm_clone,
                 validator_clone,
@@ -968,6 +974,7 @@ mod tests {
         let vmess_addr = vmess_listener.local_addr().unwrap();
         xray_common::testing::spawn("vmess-outbound-udp-roundtrip-e2e", async move {
             let _ = serve_vmess(
+                test_ctx(),
                 vmess_listener,
                 ohm,
                 validator,
@@ -987,7 +994,7 @@ mod tests {
             )
             .with_security(SecurityType::Aes128Gcm),
         );
-        let dial = make_vmess_dial_fn(cfg);
+        let dial = make_vmess_dial_fn(cfg, test_ctx());
         let dest =
             Destination::udp(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(echo_port));
         let mut conn = timeout(Duration::from_secs(10), dial(&dest))
@@ -1039,6 +1046,7 @@ mod tests {
         let validator_clone = Arc::clone(&validator);
         xray_common::testing::spawn("vmess-inbound-udp-relay-e2e", async move {
             let _ = serve_vmess(
+                test_ctx(),
                 vmess_listener,
                 ohm_clone,
                 validator_clone,
