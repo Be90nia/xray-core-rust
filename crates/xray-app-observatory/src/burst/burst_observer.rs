@@ -114,6 +114,11 @@ impl BurstObserver {
         self
     }
 
+    /// 713x6：时钟句柄（executor 装配共享同一时钟源）。
+    pub fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
+    }
+
     /// 获取归一化后的运行时设置（对应 Go `HealthPing.Settings`）。
     pub fn settings(&self) -> &HealthPingSettings {
         &self.settings

@@ -13,13 +13,7 @@
 //! - 走 Xray routing/dispatcher 出口（直接用 tokio socket）
 //! - 请求去重 singleflight（CacheController 层面已部分缓解）
 
-use std::{
-    future::Future,
-    net::IpAddr,
-    pin::Pin,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{future::Future, net::IpAddr, pin::Pin, sync::Arc, time::Duration};
 
 use hickory_proto::rr::RecordType;
 use skeleton_infra::fx::FxScope;
@@ -176,7 +170,8 @@ impl UdpNameServer {
             let Some(resp) = resp else {
                 return Err(DnsError::WireFormat("udp dial session closed".to_string()));
             };
-            let now = Instant::now();
+            // 713x6：解析时刻取自注入时钟（CacheController P1-12 单钟语义）。
+            let now = self.cache.clock().now_instant();
             let parsed = parse_dns_response(&resp, req_id, record_type, now)?;
             if parsed.truncated {
                 return self.tcp_fallback_query(fqdn, record_type, deadline).await;
@@ -217,7 +212,8 @@ impl UdpNameServer {
             })?
             .map_err(|e| DnsError::WireFormat(format!("udp recv: {e}")))?;
 
-        let now = Instant::now();
+        // 713x6：解析时刻取自注入时钟（CacheController P1-12 单钟语义）。
+        let now = self.cache.clock().now_instant();
         let parsed = parse_dns_response(&buf[..n], req_id, record_type, now)?;
         if parsed.truncated {
             return self.tcp_fallback_query(fqdn, record_type, deadline).await;
@@ -295,7 +291,8 @@ impl UdpNameServer {
             .map_err(|_| DnsError::WireFormat("tcp fallback read response timeout".into()))?
             .map_err(|e| DnsError::WireFormat(format!("tcp fallback read response: {e}")))?;
 
-        let now = Instant::now();
+        // 713x6：解析时刻取自注入时钟（CacheController P1-12 单钟语义）。
+        let now = self.cache.clock().now_instant();
         let parsed = parse_dns_response(&resp_buf, req_id, record_type, now)?;
         // TCP 响应不应有 truncated（如果仍有，说明服务端异常，忽略 TC 标志）。
         Ok(parsed_to_ip_record(&parsed, now))
@@ -313,6 +310,10 @@ impl CachedNameserver for UdpNameServer {
         // bd 2iauj：整条查询只算一次绝对 deadline（Go 语义 = 上层
         // nameserver.go:183 `WithTimeout(ctx, c.timeoutMs)` 一个时刻覆盖整条查询；
         // nameserver_udp.go:161-189 的 dispatch 与响应等待都在该预算内）。
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "713x6 语义判定：tokio 虚拟钟超时预算面（timeout_at 共享绝对 deadline，pause 可推进）——Clock 契约无 tokio 面，std/tokio 禁混换故保持 tokio 取时"
+        )]
         let deadline = tokio::time::Instant::now() + self.query_timeout;
 
         // 顺序发起 A/AAAA。
@@ -370,10 +371,15 @@ pub fn new_classic_name_server(ns: &NameServerConfig) -> Result<Box<dyn Server>,
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::disallowed_methods,
+        reason = "713x6：测试计时不得改语义（契约）——测试取时/等待窗口保持原语义，时钟禁令只约束生产路径"
+    )]
     use std::{
         io,
         net::{Ipv4Addr, SocketAddr},
         str::FromStr,
+        time::Instant,
     };
 
     use hickory_proto::{

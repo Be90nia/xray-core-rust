@@ -26,6 +26,7 @@
 
 use std::{sync::Arc, time::Instant};
 
+use skeleton::clock::{Clock, SystemClock};
 use xray_features::stats::Manager;
 
 // ---------------------------------------------------------------------------
@@ -142,18 +143,26 @@ pub trait SysStatsProvider: Send + Sync {
 /// 默认 SysStatsProvider：只填 uptime（其余字段 0）。
 pub struct DefaultSysStatsProvider {
     start_time: Instant,
+    /// 713x6：uptime 时间源；生产 `SystemClock`，测试可注入 `MockClock`。
+    clock: Arc<dyn Clock>,
 }
 
 impl DefaultSysStatsProvider {
     #[must_use]
     pub fn new() -> Self {
-        Self { start_time: Instant::now() }
+        Self::with_clock(Arc::new(SystemClock))
+    }
+
+    /// 713x6：注入时钟（`new` 缺省 `SystemClock`，行为不变）；起点取自该钟。
+    #[must_use]
+    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
+        Self { start_time: clock.now_instant(), clock }
     }
 
     /// 显式指定起始时刻（测试用）。
     #[must_use]
     pub fn with_start(start_time: Instant) -> Self {
-        Self { start_time }
+        Self { start_time, clock: Arc::new(SystemClock) }
     }
 }
 
@@ -165,7 +174,13 @@ impl Default for DefaultSysStatsProvider {
 
 impl SysStatsProvider for DefaultSysStatsProvider {
     fn snapshot(&self) -> SysStats {
-        let uptime = self.start_time.elapsed().as_secs();
+        // 713x6：uptime 取自注入时钟（std `elapsed()` 同构：逆序饱和为 0）。
+        let uptime = self
+            .clock
+            .now_instant()
+            .checked_duration_since(self.start_time)
+            .unwrap_or_default()
+            .as_secs();
         SysStats {
             uptime_seconds: u32::try_from(uptime).unwrap_or(u32::MAX),
             num_threads: 1, // Rust 程序至少主线程
@@ -188,26 +203,39 @@ impl SysStatsProvider for DefaultSysStatsProvider {
 pub struct StdParallelismSysStatsProvider {
     start_time: Instant,
     logical_cpus: u32,
+    /// 713x6：uptime 时间源；生产 `SystemClock`，测试可注入 `MockClock`。
+    clock: Arc<dyn Clock>,
 }
 
 impl StdParallelismSysStatsProvider {
     /// 新建。`available_parallelism` 失败时 fallback 到 1。
     #[must_use]
     pub fn new() -> Self {
-        let logical_cpus = std::thread::available_parallelism()
-            .map(|n| u32::try_from(n.get()).unwrap_or(u32::MAX))
-            .unwrap_or(1);
-        Self { start_time: Instant::now(), logical_cpus }
+        Self::with_clock(Arc::new(SystemClock))
+    }
+
+    /// 713x6：注入时钟（`new` 缺省 `SystemClock`，行为不变）；起点取自该钟。
+    #[must_use]
+    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
+        Self::with_logical_cpus(clock.now_instant(), clock, detect_logical_cpus())
     }
 
     /// 显式指定起始时刻（测试用）。
     #[must_use]
     pub fn with_start(start_time: Instant) -> Self {
-        let logical_cpus = std::thread::available_parallelism()
-            .map(|n| u32::try_from(n.get()).unwrap_or(u32::MAX))
-            .unwrap_or(1);
-        Self { start_time, logical_cpus }
+        Self::with_logical_cpus(start_time, Arc::new(SystemClock), detect_logical_cpus())
     }
+
+    fn with_logical_cpus(start_time: Instant, clock: Arc<dyn Clock>, logical_cpus: u32) -> Self {
+        Self { start_time, logical_cpus, clock }
+    }
+}
+
+/// `available_parallelism` 失败时 fallback 到 1。
+fn detect_logical_cpus() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| u32::try_from(n.get()).unwrap_or(u32::MAX))
+        .unwrap_or(1)
 }
 
 impl Default for StdParallelismSysStatsProvider {
@@ -218,7 +246,13 @@ impl Default for StdParallelismSysStatsProvider {
 
 impl SysStatsProvider for StdParallelismSysStatsProvider {
     fn snapshot(&self) -> SysStats {
-        let uptime = self.start_time.elapsed().as_secs();
+        // 713x6：uptime 取自注入时钟（std `elapsed()` 同构：逆序饱和为 0）。
+        let uptime = self
+            .clock
+            .now_instant()
+            .checked_duration_since(self.start_time)
+            .unwrap_or_default()
+            .as_secs();
         SysStats {
             uptime_seconds: u32::try_from(uptime).unwrap_or(u32::MAX),
             num_threads: self.logical_cpus,
@@ -453,9 +487,36 @@ impl StatsService for DefaultStatsService {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::disallowed_methods,
+        reason = "713x6：测试计时不得改语义（契约）——with_start 起点取时保持原语义，时钟禁令只约束生产路径"
+    )]
+    use skeleton::clock::MockClock;
     use xray_features::stats::Manager as _;
 
     use super::*;
+
+    /// 713x6 时钟可注入性验收：MockClock 推进 10s → uptime 精确 = 10（零 sleep，
+    /// 行为断言非"不 panic"；SystemClock 下无法精确断言）。
+    #[test]
+    fn mock_clock_advance_drives_uptime_exactly() {
+        let clock = Arc::new(MockClock::new());
+        let p = DefaultSysStatsProvider::with_clock(clock.clone());
+        assert_eq!(p.snapshot().uptime_seconds, 0);
+        clock.advance(std::time::Duration::from_secs(10));
+        assert_eq!(p.snapshot().uptime_seconds, 10);
+        clock.advance(std::time::Duration::from_millis(500));
+        assert_eq!(p.snapshot().uptime_seconds, 10, "半秒推进不得进位");
+    }
+
+    /// 713x6：StdParallelism 同面验收（同一 MockClock 驱动）。
+    #[test]
+    fn mock_clock_advance_drives_std_parallelism_uptime() {
+        let clock = Arc::new(MockClock::new());
+        let p = StdParallelismSysStatsProvider::with_clock(clock.clone());
+        clock.advance(std::time::Duration::from_secs(3));
+        assert_eq!(p.snapshot().uptime_seconds, 3);
+    }
     use crate::manager::Manager; // trait method in scope
 
     fn make_service_with_setup<F: FnOnce(&Manager)>(setup: F) -> DefaultStatsService {

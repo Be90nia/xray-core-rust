@@ -50,6 +50,14 @@ impl OnlineMap {
     }
 
     /// 当前 Unix 秒时间戳（与 Go `time.Now().Unix()` 等价）。
+    ///
+    /// 713x6 语义判定：保留关联函数形态 + 裸挂钟。签名被 cfg(test) 调用方锁定
+    /// （`OnlineMap::now_unix()` 关联调用，契约禁改测试），且 OnlineMap 构造面
+    /// 无 ctx 持有点——时钟注入随 stats 插件化收口，本票按台账制保留。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "713x6：签名锁定于测试调用方 + 无 ctx 持有点；注入随 stats 插件化收口（见上注释）"
+    )]
     fn now_unix() -> i64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

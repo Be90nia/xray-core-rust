@@ -21,7 +21,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use skeleton::clock::SystemClock;
+use skeleton::clock::{Clock, SystemClock};
 use std_ext::scheduler::{Closed, Scheduler as UdfScheduler, TaskHandle, WorkerHandle};
 
 use crate::{
@@ -41,6 +41,8 @@ pub struct CronScheduler {
     worker: Mutex<Option<WorkerHandle>>,
     /// 活跃 cron 链计数：归零 → close 执行面。
     active: Arc<AtomicUsize>,
+    /// 713x6：cron 挂钟时间源（计算下一触发槽）；生产 `SystemClock`。
+    clock: Arc<dyn Clock>,
 }
 
 impl CronScheduler {
@@ -50,6 +52,18 @@ impl CronScheduler {
             inner: Mutex::new(Arc::new(UdfScheduler::new(Arc::new(SystemClock)))),
             worker: Mutex::new(None),
             active: Arc::new(AtomicUsize::new(0)),
+            clock: Arc::new(SystemClock),
+        }
+    }
+
+    /// 713x6：注入时钟（`new` 缺省 `SystemClock`，行为不变）。
+    #[must_use]
+    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
+        Self {
+            inner: Mutex::new(Arc::new(UdfScheduler::new(Arc::clone(&clock)))),
+            worker: Mutex::new(None),
+            active: Arc::new(AtomicUsize::new(0)),
+            clock,
         }
     }
 
@@ -60,7 +74,8 @@ impl CronScheduler {
     /// token 无效。
     pub fn next_fire_in(&self, expr: &str) -> Result<Duration, GeodataError> {
         let sched = parse_cron(expr)?;
-        compute_next_fire(&sched)
+        // 713x6：挂钟取自注入时钟。
+        compute_next_fire_at(&sched, self.clock.now_system())
     }
 
     /// 校验 cron 表达式（只解析，不计算触发时间）。
@@ -88,6 +103,7 @@ impl CronScheduler {
             current: Mutex::new(None),
             ended: AtomicBool::new(false),
             active: Arc::clone(&self.active),
+            clock: Arc::clone(&self.clock),
         });
         match task.arm() {
             Ok(()) => Ok(ScheduleHandle::new(move || task.cancel())),
@@ -160,6 +176,8 @@ struct CronTask {
     ended: AtomicBool,
     /// 共享活跃计数（归零 → close 执行面）。
     active: Arc<AtomicUsize>,
+    /// 713x6：重臂计算下一触发槽的挂钟源（与所属 CronScheduler 同钟）。
+    clock: Arc<dyn Clock>,
 }
 
 impl CronTask {
@@ -168,7 +186,8 @@ impl CronTask {
         if self.gate.load(Ordering::Acquire) {
             return Ok(());
         }
-        let Ok(delay) = compute_next_fire(&self.table) else {
+        // 713x6：下一触发槽计算取自注入时钟。
+        let Ok(delay) = compute_next_fire_at(&self.table, self.clock.now_system()) else {
             // parse 已验证过，实际不可达；防御性终止链（对齐旧线程 `return`）。
             self.end();
             return Ok(());
@@ -258,10 +277,6 @@ fn compute_next_fire_at(sched: &CronSchedule, now: SystemTime) -> Result<Duratio
         t += Duration::from_secs(60);
     }
     Err(GeodataError::InvalidCron("no fire within 1 year".into()))
-}
-
-fn compute_next_fire(sched: &CronSchedule) -> Result<Duration, GeodataError> {
-    compute_next_fire_at(sched, SystemTime::now())
 }
 
 /// days since 1970-01-01 → 公历 `(year, month, day)`。

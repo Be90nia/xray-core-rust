@@ -40,6 +40,10 @@ fn make_geosite_dat() -> Vec<u8> {
     GeoSiteList::new().with_entry(cn).with_entry(us).encode_to_vec()
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "713x6：测试 unique_dir 取时保持原语义（测试计时不得改语义）"
+)]
 fn unique_dir(label: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!(

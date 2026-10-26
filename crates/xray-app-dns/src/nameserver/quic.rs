@@ -17,7 +17,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use hickory_proto::rr::RecordType;
@@ -215,7 +215,8 @@ impl DoqNameServer {
             .map_err(|_| DnsError::WireFormat("doq read payload timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("doq read payload: {e}")))?;
 
-        let now = Instant::now();
+        // 713x6：解析时刻取自注入时钟（CacheController P1-12 单钟语义）。
+        let now = self.cache.clock().now_instant();
         let parsed = parse_dns_response(&buf, req_id, record_type, now)?;
         Ok(parsed_to_ip_record(&parsed, now))
     }
@@ -231,6 +232,10 @@ impl CachedNameserver for DoqNameServer {
 
         // bd 2iauj：整条查询只算一次绝对 deadline（Go nameserver_quic.go:93-98
         // 在 sendQuery 入口算 `deadline`，:119 每个 req 用同一时刻）。
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "713x6 语义判定：tokio 虚拟钟超时预算面（timeout_at 共享绝对 deadline，pause 可推进）——Clock 契约无 tokio 面，std/tokio 禁混换故保持 tokio 取时"
+        )]
         let deadline = tokio::time::Instant::now() + self.query_timeout;
 
         if option.ipv4_enable {
@@ -287,7 +292,11 @@ pub fn new_quic_name_server(
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    #![allow(
+        clippy::disallowed_methods,
+        reason = "713x6：测试计时不得改语义（契约）——测试取时/等待窗口保持原语义，时钟禁令只约束生产路径"
+    )]
+    use std::{net::Ipv4Addr, time::Instant};
 
     use hickory_proto::{
         op::{Message, MessageType, OpCode, Query},

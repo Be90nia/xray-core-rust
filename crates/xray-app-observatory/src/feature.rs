@@ -125,8 +125,11 @@ impl Feature for ObservatoryFeature {
         };
         let selector: Arc<dyn OutboundSelector> =
             Arc::new(RealOutboundSelector::with_selector(backend));
-        let executor: Arc<dyn ProbeExecutor> =
-            Arc::new(HttpProbeExecutor::from_config(self.observer.config()));
+        // 713x6：executor 与 observer 共享同一时钟源（单钟语义）。
+        let executor: Arc<dyn ProbeExecutor> = Arc::new(
+            HttpProbeExecutor::from_config(self.observer.config())
+                .with_clock(Arc::clone(self.observer.clock())),
+        );
         self.set_io(selector, executor);
     }
 }

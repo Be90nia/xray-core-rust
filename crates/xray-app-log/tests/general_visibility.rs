@@ -43,6 +43,10 @@ fn console_sink_shows_scattered_general_message() {
 
 /// ② File 配置：散装 general 消息同样落盘（台面仍保留）。
 #[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "713x6：测试临时目录取时保持原语义（测试计时不得改语义）"
+)]
 fn file_sink_writes_scattered_general_message() {
     let _serial = serial();
     let buf = capture();

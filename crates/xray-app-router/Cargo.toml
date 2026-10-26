@@ -13,6 +13,9 @@ xray-proto = { path = "../xray-proto" }
 # P3-5 互喂：启动期/热更期路由 matcher 构建走 udf PooledThreadPool（pool 默认
 # feature 连带 memgov；发布名 udf-skeleton-infra，lib 名 skeleton_infra）。
 udf-skeleton-infra = { path = "../udf-frame/skeleton-infra" }
+# 713x6：webhook 去重窗口时间源走 udf skeleton::clock 契约（P1-12 同款
+# Arc<dyn Clock> + with_clock）。path 形态同 udf-skeleton-infra。
+udf-skeleton = { path = "../udf-frame/skeleton" }
 
 thiserror = { workspace = true }
 tokio = { workspace = true }

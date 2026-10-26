@@ -21,6 +21,10 @@
 //! 环境变量：`DW_ROUNDS`（默认 3）、`DW_ROUND_MINUTES`（默认 30）、
 //! `DW_CONCURRENCY`（默认 24）。
 #![cfg(feature = "dispatcher-dual-write")]
+// 713x6：测试计时不得改语义（契约）——本文件取时（perf 对照断言计时起点）
+// 保持原语义；时钟禁令只约束生产路径。集成测试为独立 test binary，
+// lib.rs 的 cfg_attr(test) 豁免不覆盖，故文件顶显式豁免。
+#![allow(clippy::disallowed_methods)]
 
 use std::{
     sync::{

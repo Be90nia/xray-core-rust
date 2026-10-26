@@ -15,6 +15,7 @@ use std::{
 };
 
 use parking_lot::{Mutex, RwLock};
+use skeleton::clock::{Clock, SystemClock};
 use skeleton_infra::logx::{Channel, ChannelRegistry, ChannelSink};
 
 use crate::{
@@ -400,6 +401,8 @@ pub struct FileHandler {
     format: LogFormat,
     /// 写失败（open/writeln）累计丢弃行数（P1-10-b 可观测口径）。
     dropped: AtomicU64,
+    /// 713x6：时间戳前缀时间源；生产 `SystemClock`，测试可注入 `MockClock`。
+    clock: Arc<dyn Clock>,
     // inner 及其字段仅在 unix 分支的 write_line() 中读写；Windows 分支走
     // per-write open，不经过该状态，故非 unix 平台下 allow dead_code。
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -418,6 +421,7 @@ impl FileHandler {
             path,
             format: LogFormat::Console,
             dropped: AtomicU64::new(0),
+            clock: Arc::new(SystemClock),
             inner: Mutex::new(FileHandleState { file: None, open_inode: 0 }),
         }
     }
@@ -425,9 +429,19 @@ impl FileHandler {
     /// 组装带前缀的输出行：Console 加 Go 风格时间戳，Json 原样。
     fn timestamped_line(&self, body: &str) -> String {
         match self.format {
-            LogFormat::Console => format!("{}{}", log_timestamp_prefix(), body),
+            // 713x6：挂钟取自注入时钟（原 std 直通语义）。
+            LogFormat::Console => {
+                format!("{}{}", log_timestamp_prefix(self.clock.now_system()), body)
+            },
             LogFormat::Json => body.to_string(),
         }
+    }
+
+    /// 713x6：注入时钟（`new`/`with_format` 缺省 `SystemClock`，行为不变）。
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// 带输出格式构造。
@@ -436,6 +450,7 @@ impl FileHandler {
             path,
             format,
             dropped: AtomicU64::new(0),
+            clock: Arc::new(SystemClock),
             inner: Mutex::new(FileHandleState { file: None, open_inode: 0 }),
         }
     }
@@ -445,8 +460,9 @@ impl FileHandler {
 /// 三处输出均带）：`2006/01/02 15:04:05.000000 `。
 ///
 /// std 无本地时区 API，用 UTC——事件排序/审计用途与 Go 本地时区等价。
-fn log_timestamp_prefix() -> String {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+/// 713x6：挂钟时刻由调用方从注入时钟取（纯函数显式入参，不私接全局钟）。
+fn log_timestamp_prefix(now_system: SystemTime) -> String {
+    let now = now_system.duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = now.as_secs();
     let micros = now.subsec_micros();
     let (h, m, s) = ((secs / 3600) % 24, (secs % 3600) / 60, secs % 60);

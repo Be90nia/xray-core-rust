@@ -22,6 +22,9 @@ use std::{
 
 use ipnet::IpNet;
 use parking_lot::{Mutex, RwLock};
+#[cfg(test)]
+use skeleton::clock::MockClock;
+use skeleton::clock::{Clock, SystemClock};
 use std_ext::cache::LruCache;
 #[cfg(test)]
 use xray_common::net::address::Address;
@@ -73,6 +76,9 @@ pub struct Holder {
     inner: Mutex<HolderInner>,
     ip_range: IpNet,
     config: FakeDnsPool,
+    /// 713x6：fake IP 生成的时间源（Go `time.Now()` 等价面）。
+    /// 生产 `SystemClock`；测试注入 `MockClock` 得确定性 IP（P1-12 同款）。
+    clock: Arc<dyn Clock>,
 }
 
 struct HolderInner {
@@ -94,7 +100,15 @@ impl Holder {
             // 暂填一个占位 range，initialize() 才会真正设置。
             ip_range: "0.0.0.0/32".parse().expect("placeholder CIDR literal is valid"),
             config: conf,
+            clock: Arc::new(SystemClock),
         }
+    }
+
+    /// 713x6：注入时钟（P1-12 同款；`with_config` 缺省 `SystemClock`）。
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// 默认 IPv4 池构造。对应 Go `NewFakeDNSHolder`。
@@ -167,7 +181,8 @@ impl Holder {
         // 时间戳取模折进子网；rooms >= 64（如 fc00::/12 = 116）在 Go 里不取模——
         // Rust 侧 `1u64 << rooms` 在 rooms >= 64 时 debug panic / release 静默错移。
         let rooms = self.rooms();
-        let mut ts = now_millis();
+        // 713x6：时间源取自注入时钟（生产 SystemClock = 原 std 直通语义）。
+        let mut ts = now_millis(self.clock.as_ref());
         if rooms < 64 {
             ts %= 1u64 << rooms;
         }
@@ -356,9 +371,13 @@ fn subnet_rooms(net: &IpNet) -> u32 {
     bits - prefix
 }
 
-fn now_millis() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+/// 713x6：挂钟毫秒取自显式注入的时钟（纯函数不私接全局钟）。
+fn now_millis(clock: &dyn Clock) -> u64 {
+    clock
+        .now_system()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -411,6 +430,28 @@ mod tests {
         let ip1 = h.get_fake_ip_for_domain("a.com");
         let ip2 = h.get_fake_ip_for_domain("b.com");
         assert_ne!(ip1, ip2);
+    }
+
+    /// 713x6 时钟可注入性验收：MockClock 推进改变 fake IP 生成相位（行为断言，
+    /// 非"不 panic"）。/24 池 rooms=8：ts 取模 2^8 落末字节——推进 1ms 即精确移相。
+    #[test]
+    fn mock_clock_advance_shifts_fake_ip_phase() {
+        let clock = Arc::new(MockClock::new());
+        let mut h =
+            Holder::with_config(FakeDnsPool { ip_pool: "10.0.0.0/24".to_string(), lru_size: 100 })
+                .with_clock(clock.clone());
+        h.initialize().unwrap();
+
+        let ip_at_0 = h.get_fake_ip_for_domain("t0.example")[0];
+        clock.advance(std::time::Duration::from_millis(1));
+        let ip_at_1 = h.get_fake_ip_for_domain("t1.example")[0];
+        assert_ne!(ip_at_0, ip_at_1, "时钟推进 1ms 必须改变 fake IP 生成相位");
+        // 同虚拟时刻同域名仍稳定（Go 语义保持）。
+        assert_eq!(
+            ip_at_1,
+            h.get_fake_ip_for_domain("t1.example")[0],
+            "同一虚拟时刻重复请求必须返回同一 fake IP"
+        );
     }
 
     #[test]

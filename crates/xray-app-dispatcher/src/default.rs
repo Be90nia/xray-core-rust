@@ -643,6 +643,14 @@ async fn sniff_connection(
         let mut total_attempt: u32 = 0;
         let mut first_read = true;
         loop {
+            // 713x6 语义判定：保留。嗅探预算实耗测量面——两次取时夹着真实 IO
+            // await（read_first/read_more），耗时必须随真实时间推进；MockClock
+            // 冻结语义会破坏预算递减（与 tokio timeout 预算同面）。Clock 注入
+            // 对本站点无行为收益，随 dispatcher 插件化收口再评估。
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "713x6：IO 实耗测量面（夹真实 await），冻结语义破坏预算递减；见上注释"
+            )]
             let caching_started = std::time::Instant::now();
             let read_fut = async {
                 if first_read { cr.read_first().await.map(|_| true) } else { cr.read_more().await }

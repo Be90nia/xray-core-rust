@@ -21,6 +21,13 @@ use crate::metrics::{ObservationSnapshot, StatsSnapshot, TrafficCount};
 ///
 /// Rust 标准库没有进程启动时间 API；metrics server 是常驻服务，
 /// 服务构造后首个 debug 请求与真实启动的偏差在秒级以下。
+///
+/// 713x6 语义判定：保留。进程启动锚点 = 一次性 LazyLock 初始化常量（非周期
+/// 取时，无注入语义可让渡）；std 无进程启动时间 API，Clock 端口给不出等价物。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "713x6：进程启动锚点常量（一次性初始化，非周期取时），Clock 端口无等价物"
+)]
 static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 fn uptime() -> Duration {
@@ -95,6 +102,13 @@ pub fn expvars_json(stats: &StatsSnapshot, obs: Option<&ObservationSnapshot>) ->
         memstats.push_str(&format!("\"Goroutines\":{threads},"));
     }
     let uptime_secs = uptime().as_secs();
+    // 713x6 语义判定：保留。挂钟展示面（start_unix = now - uptime）落在纯展示
+    // 格式化函数内，pub 签名被 cfg(test) 调用方锁定（契约禁改测试）；时钟注入
+    // 随 metrics handler 结构化改造收口，本票按台账制保留。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "713x6：纯展示格式化函数，签名锁定于测试调用方；注入随 handler 结构化改造收口（见上注释）"
+    )]
     let start_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|n| n.as_secs())

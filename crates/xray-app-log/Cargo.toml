@@ -16,6 +16,8 @@ tracing = { workspace = true }
 # （tracing 依赖），仅为 Level/LevelFilter 类型轴（同 xray-frame B6 口径）。
 log = "0.4"
 udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["log"] }
+# 713x6：日志时间戳前缀走 udf skeleton::clock 契约（P1-12 同款 Arc<dyn Clock>）。
+udf-skeleton = { path = "../udf-frame/skeleton" }
 regex = "1"
 serde_json = { workspace = true }
 

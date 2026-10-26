@@ -436,6 +436,10 @@ impl BalancingStrategy for StubLeastLoadStrategy {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::disallowed_methods,
+        reason = "713x6：测试计时不得改语义（契约）——unique_dir 取时保持原语义，时钟禁令只约束生产路径"
+    )]
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::*;

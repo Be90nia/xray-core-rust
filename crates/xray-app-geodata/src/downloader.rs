@@ -5,6 +5,8 @@
 
 use std::{path::PathBuf, sync::Arc};
 
+use skeleton::clock::{Clock, SystemClock};
+
 use crate::{
     config::GeodataAsset,
     error::GeodataError,
@@ -152,11 +154,25 @@ impl GeodataReloader for NoopReloader {
 pub struct RealAssetDownloader {
     asset_dir: PathBuf,
     timeout: std::time::Duration,
+    /// 713x6：下载 deadline 时间源（P1-12 同款；生产 `SystemClock`，测试可注入
+    /// `MockClock` 冻结时间线）。
+    clock: Arc<dyn Clock>,
 }
 
 impl RealAssetDownloader {
     pub fn new(asset_dir: PathBuf) -> Self {
-        Self { asset_dir, timeout: std::time::Duration::from_secs(30) }
+        Self {
+            asset_dir,
+            timeout: std::time::Duration::from_secs(30),
+            clock: Arc::new(SystemClock),
+        }
+    }
+
+    /// 713x6：注入时钟（`new` 缺省 `SystemClock`，行为不变）。
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// 覆盖默认超时。用于测试或特殊网络环境。
@@ -251,7 +267,7 @@ impl RealAssetDownloader {
     ) -> Result<Option<String>, GeodataError> {
         let parsed = self.parse_url(url)?;
 
-        use std::{io::Write, net::TcpStream, time::Instant};
+        use std::{io::Write, net::TcpStream};
 
         let addr = format!("{}:{}", parsed.host, parsed.port);
         let mut tcp = TcpStream::connect(&addr).map_err(|e| GeodataError::DownloadFailed {
@@ -272,12 +288,8 @@ impl RealAssetDownloader {
             path = parsed.path,
             host = parsed.host,
         );
-        // 2 处 Instant::now（TLS/TCP 两分支的 deadline 起点）：同步阻塞下载冷路径，
-        // Clock 端口注入待 bd 39hko 收口；属性挂语句位（表达式位 E0658）。
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "同步阻塞下载 deadline 起点，Clock 注入待 bd 39hko 收口"
-        )]
+        // 713x6：TLS/TCP 两分支的 deadline 起点取自注入时钟（原 bd 39hko 挂账收口，
+        // 逐点 allow 已撤）。
         let redirect = if parsed.scheme == "https" {
             // pn8e: https 路径。rustls::Stream 仅借用 &mut conn + &mut tcp，故
             // ClientConnection 须在 caller 栈上持有以延长 Stream 借用生命周期；
@@ -302,18 +314,36 @@ impl RealAssetDownloader {
                     "rustls ClientConnection (initial; will be overwritten by https_handshake): {e}"
                 ),
             })?;
-            let mut tls = https_handshake(&mut conn, &mut tcp, &parsed.host, self.timeout)?;
+            let mut tls = https_handshake(
+                &mut conn,
+                &mut tcp,
+                &parsed.host,
+                self.clock.as_ref(),
+                self.timeout,
+            )?;
             tls.write_all(req.as_bytes()).map_err(|e| GeodataError::DownloadFailed {
                 url: url.to_string(),
                 reason: format!("write request (tls): {e}"),
             })?;
-            read_http_body(tls, url, temp_path, Instant::now() + self.timeout)?
+            read_http_body(
+                tls,
+                url,
+                temp_path,
+                self.clock.as_ref(),
+                self.clock.now_instant() + self.timeout,
+            )?
         } else {
             tcp.write_all(req.as_bytes()).map_err(|e| GeodataError::DownloadFailed {
                 url: url.to_string(),
                 reason: format!("write request: {e}"),
             })?;
-            read_http_body(tcp, url, temp_path, Instant::now() + self.timeout)?
+            read_http_body(
+                tcp,
+                url,
+                temp_path,
+                self.clock.as_ref(),
+                self.clock.now_instant() + self.timeout,
+            )?
         };
         match redirect {
             Some(location) => Ok(Some(parsed.resolve_location(url, &location)?)),
@@ -353,6 +383,7 @@ fn read_http_body<R: std::io::Read>(
     mut stream: R,
     url: &str,
     temp_path: &std::path::Path,
+    clock: &dyn Clock,
     deadline: std::time::Instant,
 ) -> Result<Option<String>, GeodataError> {
     use std::io::Write;
@@ -361,11 +392,8 @@ fn read_http_body<R: std::io::Read>(
     let mut header_buf = Vec::with_capacity(512);
     let mut byte = [0u8; 1];
     loop {
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "阻塞读循环 idle 截止检查，Clock 注入待 bd 39hko 收口"
-        )]
-        if std::time::Instant::now() > deadline {
+        // 713x6：idle 截止检查取自注入时钟（原 bd 39hko 挂账收口，allow 已撤）。
+        if clock.now_instant() > deadline {
             return Err(GeodataError::IdleTimeout);
         }
         match stream.read(&mut byte) {
@@ -514,6 +542,7 @@ fn https_handshake<'a>(
     conn: &'a mut rustls::ClientConnection,
     tcp: &'a mut std::net::TcpStream,
     host: &str,
+    clock: &dyn Clock,
     timeout: std::time::Duration,
 ) -> Result<rustls::Stream<'a, rustls::ClientConnection, std::net::TcpStream>, GeodataError> {
     use std::io::Read;
@@ -538,18 +567,11 @@ fn https_handshake<'a>(
         }
     })?;
 
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "TLS 握手墙钟 deadline 起点，Clock 注入待 bd 39hko 收口"
-    )]
-    let deadline = std::time::Instant::now() + timeout;
+    // 713x6：握手墙钟截止取自注入时钟（原 bd 39hko 挂账收口，逐点 allow 已撤）。
+    let deadline = clock.now_instant() + timeout;
     let mut scratch = [0u8; 0];
     while conn.is_handshaking() {
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "TLS 握手循环墙钟截止，Clock 注入待 bd 39hko 收口"
-        )]
-        if std::time::Instant::now() > deadline {
+        if clock.now_instant() > deadline {
             return Err(GeodataError::IdleTimeout);
         }
         // 每次循环短命 Stream 让 borrow checker 通过。
@@ -607,6 +629,10 @@ impl GeodataReloader for ReloadBothRegistries {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::disallowed_methods,
+        reason = "713x6：测试计时不得改语义（契约）——unique_dir 取时保持原语义，时钟禁令只约束生产路径"
+    )]
     use parking_lot::Mutex;
 
     use super::*;

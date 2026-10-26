@@ -9,7 +9,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::{Duration, Instant, UNIX_EPOCH},
+    time::{Duration, UNIX_EPOCH},
 };
 
 use parking_lot::Mutex;
@@ -208,6 +208,11 @@ impl Observer {
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// 713x6：时钟句柄（executor 装配共享同一时钟源）。
+    pub fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
     }
 
     pub fn config(&self) -> &ObservatoryConfig {
@@ -1055,11 +1060,26 @@ pub struct HttpProbeExecutor {
     /// true = 按状态码 200-399 判 alive（healthping 口径）；false = 收到合法
     /// HTTP 响应即 alive（plain observatory 口径，Go observer.go）。
     check_status: bool,
+    /// 713x6：探测 deadline 时间源；生产 `SystemClock`，测试可注入 `MockClock`。
+    clock: Arc<dyn Clock>,
 }
 
 impl HttpProbeExecutor {
     pub fn new(url: impl Into<String>, method: impl Into<String>, timeout_ms: u64) -> Self {
-        Self { url: url.into(), method: method.into(), timeout_ms, check_status: true }
+        Self {
+            url: url.into(),
+            method: method.into(),
+            timeout_ms,
+            check_status: true,
+            clock: Arc::new(SystemClock),
+        }
+    }
+
+    /// 713x6：注入时钟（`new`/`from_config` 缺省 `SystemClock`，行为不变）。
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// 从 ObservatoryConfig 构造（plain observatory 语义）。
@@ -1073,13 +1093,13 @@ impl HttpProbeExecutor {
             method: "GET".to_string(),
             timeout_ms: 5_000,
             check_status: false,
+            clock: Arc::new(SystemClock),
         }
     }
 }
 
 impl ProbeExecutor for HttpProbeExecutor {
     fn probe(&self, outbound_tag: &str) -> ProbeResult {
-        let _start = Instant::now();
         // probe 是同步契约，可能从 async 上下文（background 探测循环）调用；
         // 在当前 runtime 上 block_on 会 panic（Cannot start a runtime from within
         // a runtime）。专用线程 + 独立 runtime 对任何调用上下文安全。
@@ -1112,7 +1132,8 @@ impl HttpProbeExecutor {
 
         let (host, port, use_tls) = parse_url_host_port(url)?;
         let addr = format!("{host}:{port}");
-        let start = Instant::now();
+        // 713x6：探测起点取自注入时钟（经 from_std 桥入 tokio 预算面，语义不变）。
+        let start = self.clock.now_instant();
         // Go http.Client.Timeout 口径：connect+TLS+GET 共享一个总预算。
         let deadline =
             tokio::time::Instant::from_std(start) + Duration::from_millis(self.timeout_ms);
@@ -1422,6 +1443,8 @@ pub struct RealOutboundProbeExecutor {
     method: String,
     /// 全链路（dispatch+TLS+GET）总超时（毫秒，Go Client.Timeout 口径）。
     timeout_ms: u64,
+    /// 713x6：探测 deadline 时间源；生产 `SystemClock`，测试可注入 `MockClock`。
+    clock: Arc<dyn Clock>,
 }
 
 impl std::fmt::Debug for RealOutboundProbeExecutor {
@@ -1443,7 +1466,20 @@ impl RealOutboundProbeExecutor {
         method: impl Into<String>,
         timeout_ms: u64,
     ) -> Self {
-        Self { dispatcher, probe_url: probe_url.into(), method: method.into(), timeout_ms }
+        Self {
+            dispatcher,
+            probe_url: probe_url.into(),
+            method: method.into(),
+            timeout_ms,
+            clock: Arc::new(SystemClock),
+        }
+    }
+
+    /// 713x6：注入时钟（`new` 缺省 `SystemClock`，行为不变）。
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// 从 `ObservatoryConfig` + 生产 dispatcher 构造（plain observatory 语义：
@@ -1503,7 +1539,8 @@ impl ProbeExecutor for RealOutboundProbeExecutor {
                     };
                 };
                 rt.block_on(async move {
-                    let start = Instant::now();
+                    // 713x6：探测起点取自注入时钟（经 from_std 桥入 tokio 预算面，语义不变）。
+                    let start = self.clock.now_instant();
                     let deadline =
                         tokio::time::Instant::from_std(start) + Duration::from_millis(timeout_ms);
                     // dispatch_tagged 是同步入口（内部 spawn handler）：

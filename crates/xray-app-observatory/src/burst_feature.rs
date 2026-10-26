@@ -123,11 +123,11 @@ impl Feature for BurstObservatoryFeature {
         }
         let s = self.observer.settings();
         let timeout_ms = (s.timeout / 1_000_000).max(1) as u64;
-        self.set_io(Arc::new(HttpProbeExecutor::new(
-            s.destination.clone(),
-            s.http_method.clone(),
-            timeout_ms,
-        )));
+        // 713x6：executor 与 observer 共享同一时钟源（单钟语义）。
+        self.set_io(Arc::new(
+            HttpProbeExecutor::new(s.destination.clone(), s.http_method.clone(), timeout_ms)
+                .with_clock(Arc::clone(self.observer.clock())),
+        ));
     }
 }
 

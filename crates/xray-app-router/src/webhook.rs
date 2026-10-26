@@ -19,6 +19,7 @@ use std::{
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use skeleton::clock::{Clock, SystemClock};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::{
@@ -93,6 +94,8 @@ pub struct WebhookNotifier {
     dedup_window: Duration,
     seen: Mutex<Seen>,
     closed: Mutex<bool>,
+    /// 713x6：去重窗口时间源；生产 `SystemClock`，测试可注入 `MockClock`。
+    clock: Arc<dyn Clock>,
 }
 
 struct Seen {
@@ -118,7 +121,15 @@ impl WebhookNotifier {
             dedup_window,
             seen: Mutex::new(Seen { keys: HashSet::new(), timestamps: Vec::new() }),
             closed: Mutex::new(false),
+            clock: Arc::new(SystemClock),
         }
+    }
+
+    /// 713x6：注入时钟（`new` 缺省 `SystemClock`，行为不变）。
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// 返回目标 URL。
@@ -154,7 +165,8 @@ impl WebhookNotifier {
             return true;
         }
         seen.keys.insert(key.clone());
-        seen.timestamps.push((key, Instant::now()));
+        // 713x6：首见时刻取自注入时钟（原 std 直通语义）。
+        seen.timestamps.push((key, self.clock.now_instant()));
         false
     }
 
@@ -263,7 +275,8 @@ impl WebhookNotifier {
         if self.dedup_window.is_zero() {
             return;
         }
-        let now = Instant::now();
+        // 713x6：窗口判定取自注入时钟（原 std 直通语义）。
+        let now = self.clock.now_instant();
         let cutoff = self.dedup_window;
         let mut keep_keys = HashSet::new();
         let mut keep_ts = Vec::new();
@@ -455,6 +468,19 @@ mod tests {
         let ev = WebhookEvent::hit("tag", "rule");
         assert!(!n.is_duplicate(&ev));
         assert!(n.is_duplicate(&ev));
+    }
+
+    /// 713x6 时钟可注入性验收：MockClock 推进越过去重窗口 → 同事件重新放行
+    /// （行为断言，非"不 panic"；SystemClock 下需真等 60s 不可测）。
+    #[test]
+    fn mock_clock_advance_expires_dedup_window() {
+        let clock = Arc::new(skeleton::clock::MockClock::new());
+        let n = WebhookNotifier::new(&cfg("http://x", 60)).with_clock(clock.clone());
+        let ev = WebhookEvent::hit("tag", "rule");
+        assert!(!n.is_duplicate(&ev), "首见非重复");
+        assert!(n.is_duplicate(&ev), "窗口内重复");
+        clock.advance(Duration::from_secs(61));
+        assert!(!n.is_duplicate(&ev), "窗口过期后同事件重新放行");
     }
 
     #[test]

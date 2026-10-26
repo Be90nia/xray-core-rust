@@ -8,6 +8,10 @@ rust-version.workspace = true
 [dependencies]
 xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
+# 713x6：uptime 时间源走 udf skeleton::clock 契约（P1-12 同款 Arc<dyn Clock> +
+# with_clock）。path 形态同 xray-app-dns（udf-frame 仓内工作副本即改即用；CI 由
+# fetch-udf 拉料，不锁 rev）。
+udf-skeleton = { path = "../udf-frame/skeleton" }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }

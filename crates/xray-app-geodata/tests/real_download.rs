@@ -65,6 +65,10 @@ fn spawn_server(body: Vec<u8>) -> OneShotServer {
     OneShotServer { addr, request_log: log }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "713x6：测试 unique_dir 取时保持原语义（测试计时不得改语义）"
+)]
 fn unique_dir(name: &str) -> PathBuf {
     let mut base = std::env::temp_dir();
     base.push(format!(

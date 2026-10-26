@@ -24,6 +24,7 @@ use std::{
 };
 
 use parking_lot::RwLock;
+use skeleton::clock::{Clock, SystemClock};
 use skeleton_infra::fx::{FxScope, Spawned};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -46,6 +47,15 @@ use xray_transport::{
 };
 
 use crate::{config::SniffingRequest, error::ProxymanError};
+
+/// 713x6：Clock 契约取挂钟秒（会话活动时间戳统一入口；observatory 同款助手）。
+fn unix_secs_of(clock: &dyn Clock) -> i64 {
+    clock
+        .now_system()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 // ===== ProxyInbound trait =====
 
@@ -105,6 +115,8 @@ pub trait Worker: Send + Sync {
 #[allow(dead_code)] // uplink/downlink used by proxy implementations
 pub struct UdpSession {
     last_activity: AtomicI64,
+    /// 713x6：活动时间戳时间源（挂钟秒）；生产 `SystemClock`。
+    clock: Arc<dyn Clock>,
     /// 入方向（hub 收到的客户端包）。proxy 经 [`Self::recv`] 消费。
     inbound_tx: mpsc::Sender<Vec<u8>>,
     /// 入方向消费端；`Mutex` 为 `recv(&self)` 提供内部可变性。
@@ -134,15 +146,23 @@ impl UdpSession {
         uplink: Option<Arc<dyn Counter>>,
         downlink: Option<Arc<dyn Counter>>,
     ) -> (Arc<Self>, mpsc::Receiver<Vec<u8>>) {
+        Self::with_clock(source, local, uplink, downlink, Arc::new(SystemClock))
+    }
+
+    /// 713x6：注入时钟（`new` 缺省 `SystemClock`，行为不变）。
+    pub fn with_clock(
+        source: SocketAddr,
+        local: SocketAddr,
+        uplink: Option<Arc<dyn Counter>>,
+        downlink: Option<Arc<dyn Counter>>,
+        clock: Arc<dyn Clock>,
+    ) -> (Arc<Self>, mpsc::Receiver<Vec<u8>>) {
         let (inbound_tx, inbound_rx) = mpsc::channel(256);
         let (outbound_tx, outbound_rx) = mpsc::channel(256);
         let session = Arc::new(Self {
-            last_activity: AtomicI64::new(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0),
-            ),
+            // 713x6：初始活动时刻取自注入时钟（原 std 直通语义）。
+            last_activity: AtomicI64::new(unix_secs_of(clock.as_ref())),
+            clock,
             inbound_tx,
             inbound_rx: tokio::sync::Mutex::new(inbound_rx),
             outbound_tx,
@@ -157,10 +177,8 @@ impl UdpSession {
 
     /// 更新最后活动时间戳。
     pub fn update_activity(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        // 713x6：挂钟秒取自注入时钟（原 std 直通语义）。
+        let now = unix_secs_of(self.clock.as_ref());
         self.last_activity.store(now, Ordering::Relaxed);
     }
 
@@ -521,6 +539,8 @@ pub struct UdpWorker {
     /// B6（bd t975）：recv/cleanup/session/pump 任务唯一托管口（坑约束 5）。
     /// scope 随 worker drop 兜底 abort；协作停机仍走 close_notify。
     fx: Arc<FxScope>,
+    /// 713x6：会话回收/活动时间戳时间源；生产 `SystemClock`，测试可注入 `MockClock`。
+    clock: Arc<dyn Clock>,
 }
 
 impl std::fmt::Debug for UdpWorker {
@@ -573,7 +593,15 @@ impl UdpWorker {
             recv_handle: Mutex::new(None),
             cleanup_handle: Mutex::new(None),
             fx: Arc::new(FxScope::new()),
+            clock: Arc::new(SystemClock),
         }
+    }
+
+    /// 713x6：注入时钟（`new` 缺省 `SystemClock`，行为不变）。
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     fn on_packet(self: &Arc<Self>, packet: &UdpPacket, local_addr: SocketAddr) {
@@ -592,11 +620,13 @@ impl UdpWorker {
 
         // 创建新 session；outbound_rx 交给响应泵（audit ojcy：旧实现
         // `_sender`/`_rx` 双双丢弃，收发两端全断，包进 channel 即消亡）。
-        let (session, outbound_rx) = UdpSession::new(
+        // 713x6：session 与 worker 共享同一时钟源（单钟语义）。
+        let (session, outbound_rx) = UdpSession::with_clock(
             source,
             local_addr,
             self.uplink_counter.clone(),
             self.downlink_counter.clone(),
+            Arc::clone(&self.clock),
         );
 
         // 写入首包
@@ -695,10 +725,8 @@ impl UdpWorker {
     /// 清理空闲超过 120s 的 UDP session（Go `worker.go:393-406 clean()`；
     /// 调度周期 60s 与 Go `task.Periodic{Interval: time.Minute}` 一致，见 `start()`）。
     fn cleanup_inactive(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        // 713x6：挂钟秒取自注入时钟（原 std 直通语义）。
+        let now = unix_secs_of(self.clock.as_ref());
 
         let mut sessions = self.active_sessions.write();
         let removed = Self::reclaim_inactive_sessions(
@@ -828,7 +856,13 @@ impl Worker for UdpWorker {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::disallowed_methods,
+        reason = "713x6：测试计时不得改语义（契约）——测试取时/等待窗口保持原语义，时钟禁令只约束生产路径"
+    )]
     use std::sync::atomic::AtomicUsize;
+
+    use skeleton::clock::MockClock;
 
     use super::*;
 
@@ -925,6 +959,41 @@ mod tests {
         );
         assert_eq!(worker.port(), 1080);
         assert!(!worker.closed.load(Ordering::SeqCst));
+    }
+
+    /// 713x6 时钟可注入性验收：MockClock 推进 121s 驱动空闲 NAT 会话回收
+    /// （行为断言，非"不 panic"；SystemClock 下需真等 120s 不可测）。
+    #[test]
+    fn mock_clock_advance_reclaims_idle_udp_session() {
+        let clock = Arc::new(MockClock::new());
+        let addr: SocketAddr = "127.0.0.1:1080".parse().unwrap();
+        let worker = Arc::new(
+            UdpWorker::new(
+                make_proxy(),
+                addr,
+                1080,
+                "mock-clock",
+                StreamSettings::tcp(),
+                SocketOptions::default(),
+                make_dispatcher(),
+                SniffingRequest::default(),
+                None,
+                None,
+            )
+            .with_clock(clock.clone()),
+        );
+        let source: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let (session, _rx) = UdpSession::with_clock(source, addr, None, None, clock.clone());
+        worker.active_sessions.write().insert(source, session);
+
+        // 虚拟时刻 0s：会话新鲜 → 不回收。
+        worker.cleanup_inactive();
+        assert_eq!(worker.active_sessions.read().len(), 1, "新鲜会话不得回收");
+
+        // 推进 121s > 120s 空闲窗口 → 回收。
+        clock.advance(Duration::from_secs(121));
+        worker.cleanup_inactive();
+        assert!(worker.active_sessions.read().is_empty(), "时钟推进越过空闲窗口后必须回收会话");
     }
 
     #[test]

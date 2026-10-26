@@ -13,14 +13,7 @@
 //! - TLS 包装（DoT 见 follow-up 任务）
 //! - 长连接复用（每次查询都新连接；ponytail：简化代码，连接池可后续加）
 
-use std::{
-    future::Future,
-    io,
-    net::IpAddr,
-    pin::Pin,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{future::Future, io, net::IpAddr, pin::Pin, sync::Arc, time::Duration};
 
 use hickory_proto::rr::RecordType;
 use skeleton_infra::fx::FxScope;
@@ -194,7 +187,8 @@ impl TcpNameServer {
             .map_err(|_| DnsError::WireFormat("tcp read payload timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("tcp read payload: {e}")))?;
 
-        let now = Instant::now();
+        // 713x6：解析时刻取自注入时钟（CacheController P1-12 单钟语义）。
+        let now = self.cache.clock().now_instant();
         let parsed = parse_dns_response(&buf, req_id, record_type, now)?;
         Ok(parsed_to_ip_record(&parsed, now))
     }
@@ -243,6 +237,10 @@ impl TcpNameServer {
             Err(e) => {
                 // 整条查询 deadline 已耗尽（本段超时）→ 重连必然立即失败，且会用
                 // 拨号错误掩盖真正的原因：直接返回首查错误（Go 本无重试）。
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "713x6 语义判定：tokio 虚拟钟预算剩余判定（与 timeout_at 同面，pause 可推进）——Clock 契约无 tokio 面，std/tokio 禁混换故保持 tokio 取时"
+                )]
                 if tokio::time::Instant::now() >= deadline {
                     return Err(e);
                 }
@@ -275,6 +273,10 @@ impl CachedNameserver for TcpNameServer {
         // bd 2iauj：整条查询只算一次绝对 deadline（Go nameserver_tcp.go:124-129
         // 在 sendQuery 入口算 `deadline`，:151 每个 req 用同一时刻）——A/AAAA、
         // 拨号、写、读、重试共享，慢阶段不推出新预算。
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "713x6 语义判定：tokio 虚拟钟超时预算面（timeout_at 共享绝对 deadline，pause 可推进）——Clock 契约无 tokio 面，std/tokio 禁混换故保持 tokio 取时"
+        )]
         let deadline = tokio::time::Instant::now() + self.query_timeout;
 
         if option.ipv4_enable {
@@ -335,7 +337,14 @@ pub fn new_tcp_local_name_server(ns: &NameServerConfig) -> Result<Box<dyn Server
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    #![allow(
+        clippy::disallowed_methods,
+        reason = "713x6：测试计时不得改语义（契约）——测试取时/等待窗口保持原语义，时钟禁令只约束生产路径"
+    )]
+    use std::{
+        net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+        time::Instant,
+    };
 
     use hickory_proto::{
         op::{Message, MessageType, OpCode, Query},
