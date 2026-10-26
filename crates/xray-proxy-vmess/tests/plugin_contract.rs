@@ -97,7 +97,9 @@ async fn vmess_inbound_assembles_bring_up_and_shuts_down_clean() {
     assert!(framework.is_running());
 
     let report = framework.shutdown().await;
-    assert!(report.is_clean(), "健康链停机报告必须干净");
+    let stopped: Vec<&str> = report.per_component.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(stopped, ["vmess"], "stop 闭包必须按插件名注册进 ShutdownCoordinator");
+    assert!(report.is_clean(), "健康链必须全 Stopped: {report:?}");
 
     assert_eq!(Validator::count(&**plugin.built_validator().expect("built")), 1, "clients 灌入");
     assert!(plugin.built_outbound().is_err(), "入站段无出站配置");
@@ -121,7 +123,9 @@ async fn vmess_outbound_assembles_bring_up_and_shuts_down_clean() {
         .expect("build phase");
     framework.bring_up().expect("bring_up: init/start 三相");
     let report = framework.shutdown().await;
-    assert!(report.is_clean(), "健康链停机报告必须干净");
+    let stopped: Vec<&str> = report.per_component.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(stopped, ["vmess"], "stop 闭包必须按插件名注册进 ShutdownCoordinator");
+    assert!(report.is_clean(), "健康链必须全 Stopped: {report:?}");
 
     let outbound = plugin.built_outbound().expect("built");
     assert_eq!(outbound.server_port.value(), 443);

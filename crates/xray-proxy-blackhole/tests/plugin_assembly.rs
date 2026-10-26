@@ -39,7 +39,9 @@ async fn blackhole_assembles_bring_up_and_shuts_down_clean() {
     assert!(framework.is_running());
 
     let report = framework.shutdown().await;
-    assert!(report.is_clean(), "健康链停机报告必须干净");
+    let stopped: Vec<&str> = report.per_component.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(stopped, ["blackhole"], "stop 闭包必须按插件名注册进 ShutdownCoordinator");
+    assert!(report.is_clean(), "健康链必须全 Stopped: {report:?}");
 
     // 停机后插件 build 产物仍在（OnceLock 值语义独立于装配链生命周期）。
     assert_eq!(plugin.built_response().expect("built"), &ResponseConfig::Http403);

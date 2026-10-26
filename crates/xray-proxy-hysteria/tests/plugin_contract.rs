@@ -99,7 +99,9 @@ async fn hysteria_inbound_assembles_bring_up_and_shuts_down_clean() {
     assert!(framework.is_running());
 
     let report = framework.shutdown().await;
-    assert!(report.is_clean(), "健康链停机报告必须干净");
+    let stopped: Vec<&str> = report.per_component.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(stopped, ["hysteria"], "stop 闭包必须按插件名注册进 ShutdownCoordinator");
+    assert!(report.is_clean(), "健康链必须全 Stopped: {report:?}");
 
     let config = plugin.built_inbound().expect("built inbound");
     assert_eq!(config.bind_addr, "127.0.0.1:9443");
@@ -129,7 +131,9 @@ async fn hysteria_outbound_assembles_and_parses_config() {
         .expect("build phase");
     framework.bring_up().expect("bring_up: init/start 三相");
     let report = framework.shutdown().await;
-    assert!(report.is_clean(), "健康链停机报告必须干净");
+    let stopped: Vec<&str> = report.per_component.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(stopped, ["hysteria"], "stop 闭包必须按插件名注册进 ShutdownCoordinator");
+    assert!(report.is_clean(), "健康链必须全 Stopped: {report:?}");
 
     let config = plugin.built_outbound().expect("built outbound");
     assert_eq!(config.server_addr, "us1.example.com:443", "address:port 合成（Go 语义）");
@@ -159,7 +163,9 @@ async fn hysteria_outbound_servers_array_assembles_and_selects_first() {
         .expect("build phase");
     framework.bring_up().expect("bring_up: init/start 三相");
     let report = framework.shutdown().await;
-    assert!(report.is_clean(), "健康链停机报告必须干净");
+    let stopped: Vec<&str> = report.per_component.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(stopped, ["hysteria"], "stop 闭包必须按插件名注册进 ShutdownCoordinator");
+    assert!(report.is_clean(), "健康链必须全 Stopped: {report:?}");
 
     let config = plugin.built_outbound().expect("built outbound");
     assert_eq!(config.server_addr, "a.example.com:443", "servers[0] 选择（生产同序）");

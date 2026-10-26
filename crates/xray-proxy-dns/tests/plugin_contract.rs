@@ -132,7 +132,9 @@ async fn dns_assembles_bring_up_and_shuts_down_clean() {
     assert!(framework.is_running());
 
     let report = framework.shutdown().await;
-    assert!(report.is_clean(), "健康链停机报告必须干净");
+    let stopped: Vec<&str> = report.per_component.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(stopped, ["dns"], "stop 闭包必须按插件名注册进 ShutdownCoordinator");
+    assert!(report.is_clean(), "健康链必须全 Stopped: {report:?}");
 
     let built = plugin.built_config().expect("built");
     assert_eq!(built.user_level, 2);

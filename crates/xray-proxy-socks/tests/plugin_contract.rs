@@ -93,7 +93,9 @@ async fn socks_assembles_bring_up_and_shuts_down_clean() {
     assert!(framework.is_running());
 
     let report = framework.shutdown().await;
-    assert!(report.is_clean(), "健康链停机报告必须干净");
+    let stopped: Vec<&str> = report.per_component.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(stopped, ["socks"], "stop 闭包必须按插件名注册进 ShutdownCoordinator");
+    assert!(report.is_clean(), "健康链必须全 Stopped: {report:?}");
 
     let expected = ServerConfig {
         auth_type: AuthType::Password,
@@ -103,6 +105,33 @@ async fn socks_assembles_bring_up_and_shuts_down_clean() {
         ..ServerConfig::default()
     };
     assert_eq!(plugin.built_config().expect("built"), &expected);
+}
+
+/// 边界钉（bd wkemq Change-3）：空报告（无任何停机注册行）在旧判定 `is_clean()`
+/// 下恒绿——条款 6 曾形同虚设的根因；按名断言必须对空报告判红。未 bring_up 的链
+/// shutdown = 空报告（xray-frame assembly_e2e 用例②同源语义），借它构造空报告面。
+/// 13 个 crate 的条款 6 断言为同一形态文本，本钉即覆盖该形态；断言不炸 = 本测试红。
+#[tokio::test]
+#[should_panic(expected = "stop 闭包必须按插件名注册进 ShutdownCoordinator")]
+async fn clause6_name_assertion_rejects_empty_report() {
+    let framework = Framework::builder(framework_options())
+        .expect("registry cap")
+        .with_config(socks_section_config(json!({
+            "auth": "password",
+            "accounts": [{ "user": "alice", "pass": "p1" }],
+            "udp": true,
+            "userLevel": 2
+        })))
+        .register(Arc::new(SocksPlugin::default()) as Arc<dyn Plugin>)
+        .expect("register")
+        .build()
+        .expect("build phase");
+    // 未 bring_up → 无停机注册 → shutdown = 空报告。
+    let report = framework.shutdown().await;
+    assert!(report.per_component.is_empty(), "未启动链无停机组件行");
+    assert!(report.is_clean(), "空报告 is_clean 恒真——旧判定盲区语义锚");
+    let stopped: Vec<&str> = report.per_component.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(stopped, ["socks"], "stop 闭包必须按插件名注册进 ShutdownCoordinator");
 }
 
 /// L5 装配门负向：缺段 fail-fast（坑约束 7 装配半边），
