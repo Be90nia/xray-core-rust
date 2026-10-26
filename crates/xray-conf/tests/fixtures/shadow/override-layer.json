@@ -1,0 +1,16 @@
+{
+  "routing": { "domainStrategy": "IPIfNonMatch" },
+  "inbounds": [
+    {
+      "protocol": "socks",
+      "listen": "127.0.0.1",
+      "port": 2080,
+      "tag": "shared-in",
+      "settings": { "auth": "password", "accounts": [ { "user": "u", "pass": "p" } ] }
+    }
+  ],
+  "outbounds": [
+    { "protocol": "freedom", "tag": "direct", "settings": { "domainStrategy": "UseIP" } },
+    { "protocol": "dns", "tag": "dns-out" }
+  ]
+}

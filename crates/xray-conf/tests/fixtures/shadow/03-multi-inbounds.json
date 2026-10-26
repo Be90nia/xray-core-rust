@@ -1,0 +1,41 @@
+{
+  "inbounds": [
+    {
+      "protocol": "vmess",
+      "listen": "0.0.0.0",
+      "port": 10086,
+      "tag": "vmess-in",
+      "settings": { "clients": [ { "id": "b831381d-6324-4d53-ad4f-8cda48b30811", "alterId": 0 } ] },
+      "streamSettings": { "network": "ws", "wsSettings": { "path": "/ray" } },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
+    },
+    {
+      "protocol": "trojan",
+      "listen": "0.0.0.0",
+      "port": 443,
+      "tag": "trojan-in",
+      "settings": { "clients": [ { "password": "s3cret" } ] },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "tls",
+        "tlsSettings": { "certificates": [ { "certificateFile": "/etc/ssl/fullchain.pem", "keyFile": "/etc/ssl/privkey.pem" } ] }
+      }
+    },
+    {
+      "protocol": "shadowsocks",
+      "listen": "0.0.0.0",
+      "port": 8388,
+      "tag": "ss-in",
+      "settings": { "method": "2022-blake3-aes-128-gcm", "password": "PSKmVnXDfjRe7tOcJNKwpMnCAXvKXaIHWfrFkLQhqXw=", "network": "tcp,udp" }
+    },
+    {
+      "protocol": "socks",
+      "listen": "127.0.0.1",
+      "port": 1080,
+      "tag": "socks-in",
+      "settings": { "auth": "noauth", "udp": true }
+    },
+    { "protocol": "http", "listen": "127.0.0.1", "port": 1081, "tag": "http-in" }
+  ],
+  "outbounds": [ { "protocol": "freedom", "tag": "direct" } ]
+}

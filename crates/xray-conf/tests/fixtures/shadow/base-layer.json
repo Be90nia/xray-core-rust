@@ -1,0 +1,18 @@
+{
+  "log": { "loglevel": "warning" },
+  "routing": { "domainStrategy": "AsIs" },
+  "inbounds": [
+    {
+      "protocol": "socks",
+      "listen": "127.0.0.1",
+      "port": 1080,
+      "tag": "shared-in",
+      "settings": { "auth": "noauth" }
+    },
+    { "protocol": "http", "listen": "127.0.0.1", "port": 1081, "tag": "http-in" }
+  ],
+  "outbounds": [
+    { "protocol": "freedom", "tag": "direct", "settings": { "finalRules": [ { "action": "allow" } ] } },
+    { "protocol": "blackhole", "tag": "block" }
+  ]
+}

@@ -1,0 +1,9 @@
+// 客户端主配置（注释容忍对照组：Xray 默认容忍 // 与 /* */ 注释）
+{
+  // 日志段
+  "log": { "loglevel": "warning" }, /* 块注释紧随配置行 */
+  "inbounds": [
+    { "protocol": "socks", "listen": "127.0.0.1", "port": 1080, "tag": "socks-in", "settings": { "auth": "noauth" } }
+  ],
+  "outbounds": [ { "protocol": "freedom", "tag": "direct" } ] // 尾注释
+}

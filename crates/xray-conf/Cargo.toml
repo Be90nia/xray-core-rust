@@ -17,3 +17,8 @@ toml = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 udf-std-ext = { path = "../udf-frame/std-ext" }
+
+[dev-dependencies]
+# 3c 影子比对（票 xiuvr）：skeleton_infra::config::ConfigFile 对照旧装载路径。
+# dev-only——生产依赖树零增量（与 udf-std-ext 常驻依赖同形态：path 即仓内工作副本）。
+udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["config-json"] }

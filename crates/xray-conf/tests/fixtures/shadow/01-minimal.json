@@ -1,0 +1,32 @@
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "protocol": "vless",
+      "listen": "127.0.0.1",
+      "port": 443,
+      "tag": "vless-in",
+      "settings": {
+        "clients": [ { "id": "5c1e9d17-ee1e-4b1a-a1c8-7d0fca0a44ee" } ],
+        "decryption": "none"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "vless",
+      "tag": "proxy",
+      "settings": {
+        "vnext": [
+          {
+            "address": "example.com",
+            "port": 443,
+            "users": [ { "id": "5c1e9d17-ee1e-4b1a-a1c8-7d0fca0a44ee", "encryption": "none" } ]
+          }
+        ]
+      },
+      "mux": { "enabled": true, "concurrency": 8 }
+    },
+    { "protocol": "freedom", "tag": "direct", "settings": { "finalRules": [ { "action": "allow" } ] } }
+  ]
+}

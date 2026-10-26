@@ -1,0 +1,42 @@
+{
+  "outbounds": [
+    {
+      "protocol": "vless",
+      "tag": "proxy",
+      "sendThrough": "0.0.0.0",
+      "settings": {
+        "vnext": [
+          {
+            "address": "edge.example.com",
+            "port": 443,
+            "users": [ { "id": "f0d35ff0-6ec6-4a3a-9f3e-71b3c933f9a9", "encryption": "none", "flow": "xtls-rprx-vision" } ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "raw",
+        "security": "reality",
+        "realitySettings": {
+          "serverName": "www.microsoft.com",
+          "fingerprint": "chrome",
+          "publicKey": "pbAKC2lPBRcKFF7m3IgbBbxNKitBBtjxTb3v35uzKGI",
+          "shortId": "6ba85179e30d4fc3",
+          "spiderX": ""
+        }
+      },
+      "proxySettings": { "tag": "socks-out", "transportLayer": true },
+      "mux": { "enabled": false, "concurrency": -1 }
+    },
+    {
+      "protocol": "socks",
+      "tag": "socks-out",
+      "settings": { "servers": [ { "address": "127.0.0.1", "port": 9050 } ] }
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block",
+      "settings": { "response": { "type": "http" } },
+      "targetStrategy": "random"
+    }
+  ]
+}

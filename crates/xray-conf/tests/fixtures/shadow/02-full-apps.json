@@ -1,0 +1,41 @@
+{
+  "log": { "loglevel": "info", "access": "./access.log", "error": "./error.log", "dnsLog": false, "maskAddress": "quarter" },
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      { "type": "field", "domain": ["geosite:cn"], "outboundTag": "direct" },
+      { "type": "field", "ip": ["geoip:private"], "outboundTag": "block" }
+    ],
+    "balancers": [ { "tag": "lb", "selector": ["proxy"] } ]
+  },
+  "dns": {
+    "servers": [
+      "https://1.1.1.1/dns-query",
+      { "address": "114.114.114.114", "domains": ["geosite:cn"] },
+      "localhost"
+    ],
+    "queryStrategy": "UseIPv4",
+    "disableCache": false,
+    "disableFallback": false
+  },
+  "policy": {
+    "levels": { "0": { "handshake": 4, "connIdle": 300, "uplinkOnly": 2, "downlinkOnly": 5, "bufferSize": 512 } },
+    "system": { "statsInboundUplink": true, "statsInboundDownlink": true, "statsOutboundUplink": true, "statsOutboundDownlink": true }
+  },
+  "api": { "tag": "api", "services": ["HandlerService", "LoggerService", "StatsService"] },
+  "metrics": { "tag": "metrics-out" },
+  "stats": {},
+  "fakeDns": { "pools": [ { "name": "fdns", "ipPool": "198.18.0.0/15", "poolSize": 65535 } ] },
+  "observatory": { "subjectSelector": ["proxy"], "probeUrl": "https://www.google.com/generate_204", "probeInterval": "10s" },
+  "burstObservatory": {
+    "subjectSelector": ["proxy"],
+    "pingConfig": { "destination": "https://www.google.com/generate_204", "connectivity": "http://www.google.com/generate_204", "interval": "5m", "sampling": 2, "timeout": "5s" }
+  },
+  "version": { "producer": "goversion", "version": "26.9.9" },
+  "geodata": { "geoloader": "standard" },
+  "env": { "XRAY_ENV_EXAMPLE": "1" },
+  "inbounds": [
+    { "protocol": "dokodemo-door", "listen": "127.0.0.1", "port": 10808, "tag": "api-in", "settings": { "address": "127.0.0.1" } }
+  ],
+  "outbounds": [ { "protocol": "freedom", "tag": "direct" } ]
+}

@@ -4790,6 +4790,8 @@ name = "udf-skeleton-infra"
 version = "0.1.0"
 dependencies = [
  "log",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-log",
@@ -5973,6 +5975,7 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "tracing",
+ "udf-skeleton-infra",
  "udf-std-ext",
  "xray-common",
  "xray-features",
