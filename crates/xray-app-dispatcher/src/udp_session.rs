@@ -452,16 +452,15 @@ mod tests {
             // from_vec = Frozen 语义：非池来源永不回池，无假池污染面
             chunks.iter().map(|c| xray_buf::buffer::Buffer::from_vec(c.to_vec())).collect()
         };
-        let parse_all =
-            |bufs: &[xray_buf::buffer::Buffer]| -> Vec<(Vec<u8>, Option<Destination>)> {
-                let mut cursor = ChainCursor::new(bufs);
-                let mut pr = PacketReader::new(&mut cursor);
-                let mut got = Vec::new();
-                while let Ok(Some(pkt)) = pr.read_packet() {
-                    got.push(pkt.into_parts());
-                }
-                got
-            };
+        let parse_all = |bufs: &[xray_buf::buffer::Buffer]| -> Vec<(Vec<u8>, Option<Destination>)> {
+            let mut cursor = ChainCursor::new(bufs);
+            let mut pr = PacketReader::new(&mut cursor);
+            let mut got = Vec::new();
+            while let Ok(Some(pkt)) = pr.read_packet() {
+                got.push(pkt.into_parts());
+            }
+            got
+        };
 
         let whole = parse_all(&to_bufs(&[&stream]));
         assert_eq!(whole.len(), 2, "两条帧都应解出");
@@ -482,8 +481,10 @@ mod tests {
 
     // ── q1r4q 分配取证：线程归属计数分配器（libtest 并行下他线程分配不串扰）──
 
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::cell::Cell;
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        cell::Cell,
+    };
 
     thread_local! {
         static THREAD_ALLOCS: Cell<usize> = const { Cell::new(0) };
@@ -543,9 +544,8 @@ mod tests {
         let old_allocs = THREAD_ALLOCS.with(|c| c.get()) - before;
 
         // 新路径（改后）：到达帧 = Buffer 移交（窗口外预构造），链上直读
-        let arrived: Vec<_> = (0..PACKETS)
-            .map(|_| xray_buf::buffer::Buffer::from_vec(stream.clone()))
-            .collect();
+        let arrived: Vec<_> =
+            (0..PACKETS).map(|_| xray_buf::buffer::Buffer::from_vec(stream.clone())).collect();
         let mut bufs: Vec<xray_buf::buffer::Buffer> = Vec::new();
         let before = THREAD_ALLOCS.with(|c| c.get());
         for buf in arrived {
