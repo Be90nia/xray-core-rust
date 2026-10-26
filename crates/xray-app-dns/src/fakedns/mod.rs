@@ -1,8 +1,15 @@
 //! Fake DNS：域名为虚拟 IP 池中的地址建立双向映射。对应 Go `app/dns/fakedns/`。
 //!
 //! 业务核心独立可测，依赖：
-//! - `lru` crate 提供 LRU（Go `cache.Lru`）
 //! - `ipnet` crate 提供 CIDR 解析（Go `net.IPNet`）
+//! - LRU 走 udf `std_ext::cache::LruCache`（Go `cache.Lru`）
+//!
+//! §3.5.2 判定（bd b2qdu）：LRU 本体直接用 udf 件（单线程 `&mut self`，由
+//! `HolderInner` 外层 `parking_lot::Mutex` 承载），无本地副本。语义差异两处
+//! 显式吸收：①udf 构造签名强制容量上限（无 unbounded）——`with_config` 占位
+//! 阶段用 cap=1，`initialize` 必重建为配置容量；②udf `insert` 满插淘汰不回传
+//! 被逐者——满插路径先 `pop_lru` 显式摘尾，同步摘除值→键反查索引（对齐 Go
+//! `lru.Put` 双表同临界区维护）。
 //!
 //! **跳过范围**（IO 边界）：`init()` 全局 `RegisterConfig` —— 改由
 //! [`set_shared_multi`] 显式注册共享引擎（见其文档）。
@@ -10,13 +17,12 @@
 use std::{
     collections::HashMap,
     net::IpAddr,
-    num::NonZeroUsize,
     sync::{Arc, LazyLock},
 };
 
 use ipnet::IpNet;
-use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
+use std_ext::cache::LruCache;
 #[cfg(test)]
 use xray_common::net::address::Address;
 
@@ -80,7 +86,9 @@ impl Holder {
     pub fn with_config(conf: FakeDnsPool) -> Self {
         Self {
             inner: Mutex::new(HolderInner {
-                domain_to_ip: LruCache::unbounded(),
+                // 占位 cap=1：udf LruCache 构造强制上限（无 unbounded）；
+                // initialize() 必重建为配置容量（见头注 §3.5.2 差异①）。
+                domain_to_ip: LruCache::new(1),
                 ip_to_domain: HashMap::new(),
             }),
             // 暂填一个占位 range，initialize() 才会真正设置。
@@ -121,9 +129,8 @@ impl Holder {
 
         self.ip_range = ip_range;
         let mut inner = self.inner.lock();
-        // ponytail: lru_size 为 0 时退回 1（Go 行为是 panic）。
-        inner.domain_to_ip =
-            LruCache::new(NonZeroUsize::new(lru_size).unwrap_or(NonZeroUsize::MIN));
+        // ponytail: lru_size 为 0 时退回 1（Go 行为是 panic；udf cap==0 panic 同禁）。
+        inner.domain_to_ip = LruCache::new(lru_size.max(1));
         // 值→键反查索引与主表同步重建（池重建不得残留旧映射）。
         inner.ip_to_domain.clear();
         Ok(())
@@ -149,7 +156,10 @@ impl Holder {
     /// 为域名生成一个 Fake IP（每次同域名返回同 IP）。对应 Go `GetFakeIPForDomain`。
     pub fn get_fake_ip_for_domain(&self, domain: &str) -> Vec<IpAddr> {
         let mut inner = self.inner.lock();
-        if let Some(ip) = inner.domain_to_ip.get(domain) {
+        // udf LruCache 查询面是精确 `&K`（无 lru 0.18 的 Borrow<Q> 泛型借用）——
+        // 键提前物化，hit 查询与 miss 插入共用一次分配。
+        let key = domain.to_string();
+        if let Some(ip) = inner.domain_to_ip.get(&key) {
             return vec![*ip];
         }
 
@@ -165,11 +175,15 @@ impl Holder {
             inner.ip_to_domain.contains_key(&cand)
         });
         // put 前已确认 domain 未占用（上方 get 早退），仅新键路径。
-        // 用 `push` 而非 `put`：lru 0.18 的 put 淘汰时不回传被逐条目，
-        // 拿不到 (k, v) 就无法同步摘除值→键索引（对齐 Go lru.Put 双表同临界区维护）。
-        if let Some((_, evicted_ip)) = inner.domain_to_ip.push(domain.to_string(), ip) {
-            inner.ip_to_domain.remove(&evicted_ip);
+        // udf LruCache::insert 满插淘汰不回传被逐者（头注 §3.5.2 差异②），拿不到
+        // (k, v) 就无法同步摘除值→键索引（对齐 Go lru.Put 双表同临界区维护）——
+        // 满插路径先 pop_lru 显式摘尾对账，再 insert。
+        if inner.domain_to_ip.len() >= inner.domain_to_ip.capacity() {
+            if let Some((_, evicted_ip)) = inner.domain_to_ip.pop_lru() {
+                inner.ip_to_domain.remove(&evicted_ip);
+            }
         }
+        inner.domain_to_ip.insert(key, ip);
         inner.ip_to_domain.insert(ip, domain.to_string());
         vec![ip]
     }

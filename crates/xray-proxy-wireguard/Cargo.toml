@@ -32,6 +32,11 @@ xray-frame = { path = "../xray-frame" }
 # B6（bd t975）：spawn 托管面走 udf skeleton_infra::fx::FxScope（坑约束 5）。
 # path 形态同 xray-app-dns（udf-frame 仓内工作副本即改即用；CI 由 fetch-udf 拉料，不锁 rev）。
 udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio"] }
+# bd 9zxyl：DNS TTL 缓存（udf-std-ext cache::TtlCache）与查询 deadline 时间源
+#（udf-skeleton clock 契约）。path 形态同上（udf-frame 仓内工作副本即改即用；
+# CI 由 fetch-udf 拉料，不锁 rev）。
+udf-skeleton = { path = "../udf-frame/skeleton" }
+udf-std-ext = { path = "../udf-frame/std-ext" }
 # plugin.rs 段路由解析（settings → DeviceConfig，同规 xray-core
 # parse_wireguard_config / parse_wireguard_inbound_config）。
 serde_json = { workspace = true }

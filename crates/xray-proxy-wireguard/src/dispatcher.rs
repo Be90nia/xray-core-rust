@@ -17,7 +17,6 @@
 //! # ponytail: 轮询式桥接，延迟 ~5ms 量级。waker 驱动优化留待吞吐量瓶颈时。
 
 use std::{
-    collections::HashMap,
     io,
     net::SocketAddr,
     pin::Pin,
@@ -26,7 +25,9 @@ use std::{
     time::Duration,
 };
 
+use skeleton::clock::{Clock, SystemClock};
 use smoltcp::socket::tcp;
+use std_ext::cache::TtlCache;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::{Mutex as AsyncMutex, OnceCell},
@@ -472,7 +473,10 @@ pub fn make_wireguard_dial_fn(
     // interface 地址族（Go parseEndpoints 的 hasIPv4/hasIPv6）——约束 DNS 解析族
     let (has_v4, has_v6) = endpoint_families(&config);
     // 域名解析 TTL 缓存（Go Handler.cache，c7e569b0；endpoint 与目标域名共享）。
-    let dns_cache = Arc::new(TtlDnsCache::default());
+    // 时间源契约（P1-12 同 dns cache_controller 先例）：TTL 判定与查询 deadline
+    // 统一走 skeleton::clock——生产 SystemClock，测试注 MockClock 得确定性时间线。
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let dns_cache = Arc::new(TtlDnsCache::new(Arc::clone(&clock)));
 
     Arc::new(move |dest: &Destination| {
         let dest = dest.clone();
@@ -481,6 +485,7 @@ pub fn make_wireguard_dial_fn(
         let system_dialer = system_dialer.clone();
         let handler_cell = Arc::clone(&handler);
         let dns_cache = Arc::clone(&dns_cache);
+        let clock = Arc::clone(&clock);
 
         Box::pin(async move {
             // lazy init WireguardOutboundHandler（含 driver task）
@@ -506,7 +511,13 @@ pub fn make_wireguard_dial_fn(
             let dest = match dest.address() {
                 Address::Domain(domain) => {
                     let ip = resolve_dest_ip_cached(
-                        domain, netstack, has_v4, has_v6, &config, &dns_cache,
+                        domain,
+                        netstack,
+                        has_v4,
+                        has_v6,
+                        &config,
+                        &dns_cache,
+                        clock.as_ref(),
                     )
                     .await?;
                     let addr = match ip {
@@ -599,16 +610,18 @@ async fn resolve_dest_ip_cached(
     has_v6: bool,
     config: &DeviceConfig,
     cache: &TtlDnsCache,
+    clock: &dyn Clock,
 ) -> Result<std::net::IpAddr, String> {
     if let Some(ip) = cache.get(domain) {
         return Ok(ip);
     }
     let (ips, ttl) = match config.resolve_dns() {
         Ok(crate::config::DnsConfig::Default) => {
-            resolve_domain_in_tunnel(netstack, domain, has_v4, has_v6, &TUNNEL_DNS_SERVERS).await?
+            resolve_domain_in_tunnel(netstack, domain, has_v4, has_v6, &TUNNEL_DNS_SERVERS, clock)
+                .await?
         },
         Ok(crate::config::DnsConfig::Servers(servers)) => {
-            resolve_domain_in_tunnel(netstack, domain, has_v4, has_v6, &servers).await?
+            resolve_domain_in_tunnel(netstack, domain, has_v4, has_v6, &servers, clock).await?
         },
         Err(e) => return Err(e.to_string()),
     };
@@ -697,35 +710,43 @@ const TUNNEL_DNS_SERVERS: [std::net::IpAddr; 4] = [
 pub(crate) const DEFAULT_DNS_TTL_SECS: u32 = 300;
 
 /// 域名解析 TTL 缓存（Go `Handler.cache` + `resolveDomain`，client.go:53-56,
-/// 388-446，c7e569b0）。键 = 域名，值 =（策略过滤后的 IP 列表，过期时刻）。
+/// 388-446，c7e569b0）。键 = 域名，值 = 策略过滤后的 IP 列表。
 ///
-/// `ponytail`: 无清理循环——条目惰性删除（get 过期即删），生命周期 = dial_fn
-/// （单出站一个），泄漏上界 = 域名数；Go 侧同为 TODO cache cleanup loop。
-#[derive(Default)]
+/// §3.5.2 判定：TTL 缓存本体直接用 udf `std_ext::cache::TtlCache`（逐条
+/// expire-after-write + 注入 `skeleton::clock` 单调面），无本地副本；本结构
+/// 仅承载 wireguard 特有面——`parking_lot::Mutex` 包单线程件（并发纪律）+
+/// 命中随机取一 IP（Go `dice.Roll`）+ ttl=0 立即过期的 Go 语义吸收。
 pub(crate) struct TtlDnsCache {
-    map: parking_lot::Mutex<HashMap<String, TtlCacheEntry>>,
+    inner: parking_lot::Mutex<TtlCache<String, Vec<std::net::IpAddr>>>,
 }
 
-struct TtlCacheEntry {
-    ips: Vec<std::net::IpAddr>,
-    expires_at: std::time::Instant,
+/// 容量上界。Go 侧 cache 无界（TODO cache cleanup loop，client.go 同债）；udf
+/// TtlCache 构造签名强制上限必填，取实践不可触的宽松值兜底——挤出 = 下次
+/// miss 重查，语义无害。
+const DNS_CACHE_CAP: usize = 1024;
+
+impl Default for TtlDnsCache {
+    fn default() -> Self {
+        Self::new(Arc::new(SystemClock))
+    }
 }
 
 impl TtlDnsCache {
+    /// 注入时间源构造（生产 [`SystemClock`]，测试 [`skeleton::clock::MockClock`]）。
+    pub(crate) fn new(clock: Arc<dyn Clock>) -> Self {
+        Self { inner: parking_lot::Mutex::new(TtlCache::new(clock, DNS_CACHE_CAP)) }
+    }
+
     /// 命中未过期条目 → 随机取一 IP（Go `dice.Roll(len(entry.got))`）；过期条目
-    /// 删除并返回 None（Go client.go:399-406）。
+    /// 惰性回收并返回 None（Go client.go:399-406，TtlCache 触碰即回收）。
     pub(crate) fn get(&self, host: &str) -> Option<std::net::IpAddr> {
         use rand::Rng;
-        let mut map = self.map.lock();
-        if let Some(e) = map.get(host) {
-            if std::time::Instant::now() < e.expires_at {
-                #[allow(deprecated)] // 存量清零批次
-                let idx = rand::thread_rng().gen_range(0..e.ips.len());
-                return Some(e.ips[idx]);
-            }
-            map.remove(host);
-        }
-        None
+        let mut inner = self.inner.lock();
+        // udf TtlCache 查询面是精确 `&K`（同 fakedns 头注差异口径）——键物化。
+        let ips = inner.get(&host.to_string())?;
+        #[allow(deprecated)] // 存量清零批次
+        let idx = rand::thread_rng().gen_range(0..ips.len());
+        Some(ips[idx])
     }
 
     /// 写回缓存（`ttl_secs` 秒有效）；空列表不缓存（Go 只在 len(got)>0 后写）。
@@ -733,13 +754,16 @@ impl TtlDnsCache {
         if ips.is_empty() {
             return;
         }
-        self.map.lock().insert(
-            host.to_string(),
-            TtlCacheEntry {
-                ips,
-                expires_at: std::time::Instant::now() + Duration::from_secs(u64::from(ttl_secs)),
-            },
-        );
+        let ttl = Duration::from_secs(u64::from(ttl_secs));
+        let mut inner = self.inner.lock();
+        if ttl.is_zero() {
+            // udf TtlCache 对 ttl==0 fail-closed panic（恒过期条目=调用方 bug）；
+            // Go 语义 ttl=0 = 写入即时过期条目（既有测试钉住），等价实现为
+            // 摘除旧条目——后续 get 恒 None，可观察行为一致。
+            let _ = inner.remove(&host.to_string());
+            return;
+        }
+        inner.insert(host.to_string(), ips, ttl);
     }
 }
 
@@ -757,6 +781,7 @@ pub(crate) async fn resolve_domain_in_tunnel(
     has_v4: bool,
     has_v6: bool,
     servers: &[std::net::IpAddr],
+    clock: &dyn Clock,
 ) -> Result<(Vec<std::net::IpAddr>, u32), String> {
     use rand::Rng;
     if !has_v4 && !has_v6 {
@@ -807,7 +832,7 @@ pub(crate) async fn resolve_domain_in_tunnel(
                 });
                 stack.poll(smoltcp::time::Instant::now());
             }
-            let deadline = std::time::Instant::now() + DNS_QUERY_TIMEOUT;
+            let deadline = clock.now_instant() + DNS_QUERY_TIMEOUT;
             loop {
                 let received = {
                     let mut stack = netstack.lock().await;
@@ -830,7 +855,7 @@ pub(crate) async fn resolve_domain_in_tunnel(
                         Err(e) => last_err = e,
                     }
                 }
-                if std::time::Instant::now() >= deadline {
+                if clock.now_instant() >= deadline {
                     last_err = format!("wireguard tunnel dns: timeout querying {server}");
                     break;
                 }
@@ -1062,6 +1087,7 @@ mod tests {
                     true,
                     false,
                     &TUNNEL_DNS_SERVERS,
+                    &SystemClock,
                 )
                 .await
             });
@@ -1121,6 +1147,21 @@ mod tests {
         // ttl=0 → 立即过期
         cache.put("h.test", vec![a], 0);
         assert!(cache.get("h.test").is_none(), "过期条目必须被删除");
+    }
+
+    #[test]
+    fn ttl_dns_cache_expiry_boundary_mock_clock() {
+        // 语义钉（bd 9zxyl 换 udf TtlCache）：expire-after-write 边界——
+        // ttl-1s 恒活、恰 ttl 时刻即死（udf `expires > now` 判活），MockClock
+        // 确定性推进零真睡；时间源必须来自注入 Clock（无裸 Instant::now）。
+        let clock = Arc::new(skeleton::clock::MockClock::new());
+        let cache = TtlDnsCache::new(Arc::clone(&clock) as Arc<dyn Clock>);
+        let a = std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4));
+        cache.put("edge.test", vec![a], 60);
+        clock.advance(Duration::from_secs(59));
+        assert_eq!(cache.get("edge.test"), Some(a), "59s < 60s 必须命中");
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(cache.get("edge.test"), None, "恰 60s 过期边界必须死");
     }
 
     /// 复制查询报文改头为 NOERROR 响应，追加一条指针压缩的 A answer。

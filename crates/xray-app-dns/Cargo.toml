@@ -15,7 +15,9 @@ tokio.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
 uuid.workspace = true
-lru = "0.18"
+# bd b2qdu：fakedns LRU 走 udf std_ext::cache::LruCache（外购 lru 已删）。
+# path 形态同 udf-skeleton（udf-frame 仓内工作副本即改即用；CI 由 fetch-udf 拉料，不锁 rev）。
+udf-std-ext = { path = "../udf-frame/std-ext" }
 hickory-proto.workspace = true
 hickory-resolver.workspace = true
 ipnet = "2"

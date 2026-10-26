@@ -1671,9 +1671,6 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
-dependencies = [
- "foldhash 0.2.0",
-]
 
 [[package]]
 name = "heapless"
@@ -2396,15 +2393,6 @@ name = "log"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
-
-[[package]]
-name = "lru"
-version = "0.18.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef9ac18847474e638e3702b76c65d4eb93428471a74778ef0f1be711717f89b5"
-dependencies = [
- "hashbrown 0.17.1",
-]
 
 [[package]]
 name = "lru-slab"
@@ -5666,7 +5654,6 @@ dependencies = [
  "hickory-resolver",
  "http",
  "ipnet",
- "lru",
  "parking_lot",
  "quinn",
  "rcgen 0.13.2",
@@ -5678,6 +5665,7 @@ dependencies = [
  "tracing",
  "udf-skeleton",
  "udf-skeleton-infra",
+ "udf-std-ext",
  "uuid",
  "xray-buf",
  "xray-common",
@@ -6618,7 +6606,9 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "udf-skeleton",
  "udf-skeleton-infra",
+ "udf-std-ext",
  "xray-app-dispatcher",
  "xray-app-dns",
  "xray-app-proxyman",
