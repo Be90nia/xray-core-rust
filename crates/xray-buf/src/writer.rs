@@ -36,6 +36,17 @@ impl SequentialWriter {
     pub fn into_inner(self) -> Box<dyn AsyncWrite + Unpin + Send> {
         self.inner
     }
+
+    /// 写裸字节（非 vectored sink 的聚合交付口）：单次 `write_all`。
+    ///
+    /// 与 [`write_sequential`] 逐块写等价，区别是调用方自持字节缓冲
+    /// （可常驻复用），本层不再包装 [`Buffer`]——聚合写不需要块语义。
+    async fn write_bytes(&mut self, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.inner.write_all(data).await.map_err(|e| io::classify_io_error(e, false))
+    }
 }
 
 impl Writer for SequentialWriter {
@@ -248,6 +259,12 @@ impl Writer for BufferedWriter {
 
 // ========== CoalescingWriter ==========
 
+/// 聚合写常驻缓冲上限：单批字节超过此值时按块分次写出（字节序不变）。
+///
+/// 常规下行批 = readv 聚合读 8×8KB = 64KB（`readv.rs` MAX_READV=8 ×
+/// DEFAULT_SIZE），远低于上限——上限只兜住异常大批，避免常驻缓冲无界增长。
+const MAX_COALESCE: usize = 256 * 1024;
+
 /// 整批聚合写入器（F2 服务端 TLS 写聚合）。
 ///
 /// 底层不支持 vectored（TLS 层 `is_write_vectored()==false`）时，把一次
@@ -257,18 +274,25 @@ impl Writer for BufferedWriter {
 /// 单次 write_multi_buffer 调用：不跨调用积压、零交互延迟增量；单缓冲与
 /// vectored-capable sink（裸 TCP sendmsg）直通内层，零拷贝零行为变化。
 ///
+/// 拼接目标 = **常驻缓冲**（`buf` 字段，跨批复用 clear+extend）：不每批
+/// 新鲜分配 Vec、不走 `Buffer::from_vec`（Frozen 永不回池），下行每字节
+/// 零新增堆分配。批内字节超上限（256KB）时按块分次写出（字节序不变）；
+/// 单块本身超限时直写该块（不拷贝）。
+///
 /// 仅服务端 flow=""（非 vision）装配启用——vision 帧写批边界语义保持原样。
 pub struct CoalescingWriter {
     inner: SequentialWriter,
     /// 构造时快照 sink 能力：vectored-capable（裸 TCP）直通内层 iovec 聚合。
     vectored: bool,
+    /// 常驻聚合缓冲：跨批复用（clear + extend），容量按批高水位增长。
+    buf: Vec<u8>,
 }
 
 impl CoalescingWriter {
     /// 创建新的 CoalescingWriter
     pub fn new(w: impl AsyncWrite + Unpin + Send + 'static) -> Self {
         let vectored = w.is_write_vectored();
-        Self { inner: SequentialWriter::new(w), vectored }
+        Self { inner: SequentialWriter::new(w), vectored, buf: Vec::new() }
     }
 }
 
@@ -282,16 +306,32 @@ impl Writer for CoalescingWriter {
             if self.vectored || buffers.len() <= 1 {
                 return self.inner.write_multi_buffer(MultiBuffer::from_buffers(buffers)).await;
             }
-            let total: usize = buffers.iter().map(|b| b.len()).sum();
-            let mut acc = Vec::with_capacity(total);
-            for buf in &buffers {
-                acc.extend_from_slice(buf.bytes());
-            }
+            // 聚合路径：拼进常驻缓冲（clear + extend），零新鲜分配。
             for mut buf in buffers {
+                if buf.len() > MAX_COALESCE {
+                    // 单块超限：直写该块（不拷贝、不撑常驻缓冲），先前已聚合的
+                    // 部分先刷出，保证字节序。
+                    if !self.buf.is_empty() {
+                        self.inner.write_bytes(&self.buf).await?;
+                        self.buf.clear();
+                    }
+                    self.inner.write_bytes(buf.bytes()).await?;
+                    buf.release();
+                    continue;
+                }
+                if self.buf.len() + buf.len() > MAX_COALESCE {
+                    // 常驻缓冲放不下这一块：先刷出已有部分（字节序不变）。
+                    self.inner.write_bytes(&self.buf).await?;
+                    self.buf.clear();
+                }
+                self.buf.extend_from_slice(buf.bytes());
                 buf.release();
             }
-            let single = MultiBuffer::from_buffer(Buffer::from_vec(acc));
-            self.inner.write_multi_buffer(single).await
+            if !self.buf.is_empty() {
+                self.inner.write_bytes(&self.buf).await?;
+                self.buf.clear();
+            }
+            Ok(())
         })
     }
 
@@ -660,5 +700,58 @@ mod tests {
         use std::sync::atomic::Ordering::Relaxed;
         assert_eq!(*probe.data.lock().unwrap(), b"tail".as_slice(), "收尾前数据必须已落盘");
         assert_eq!(probe.shutdown_calls.load(Relaxed), 1, "shutdown_flush 必须转发到 sink");
+    }
+    /// F2 分配回归（bd ledtg）：第二批不得新分配常驻缓冲——容量不变即证明
+    /// 复用（原先每批 `Vec::with_capacity` + `Buffer::from_vec` 新鲜分配）。
+    #[tokio::test]
+    async fn test_coalescing_writer_reuses_resident_buffer() {
+        let (mock, probe) = NonVectoredMock::new();
+        let mut writer = CoalescingWriter::new(mock);
+
+        let batch = |tag: &[u8]| -> MultiBuffer {
+            let mut mb = MultiBuffer::new();
+            mb.push(Buffer::from_vec(tag.to_vec()));
+            mb.push(Buffer::from_vec(b"second".to_vec()));
+            mb.push(Buffer::from_vec(b"third".to_vec()));
+            mb
+        };
+
+        writer.write_multi_buffer(batch(b"first")).await.expect("write failed");
+        let cap_after_first = writer.buf.capacity();
+        assert!(cap_after_first > 0, "首批必须撑起常驻缓冲");
+
+        writer.write_multi_buffer(batch(b"again")).await.expect("write failed");
+        assert_eq!(
+            writer.buf.capacity(),
+            cap_after_first,
+            "第二批不得新分配常驻缓冲（容量应保持高水位）"
+        );
+
+        assert_eq!(
+            *probe.data.lock().unwrap(),
+            b"firstsecondthirdagainsecondthird".as_slice(),
+            "跨批字节序必须保序"
+        );
+    }
+
+    /// 超大批降级：单块超上限时直写、批内总量超上限时分块写出，字节序不变。
+    #[tokio::test]
+    async fn test_coalescing_writer_large_batch_order_preserved() {
+        let (mock, probe) = NonVectoredMock::new();
+        let mut writer = CoalescingWriter::new(mock);
+
+        // 单块 300KB > MAX_COALESCE(256KB) → 直写不拷贝。
+        let big = vec![0xABu8; 300 * 1024];
+        let mut mb = MultiBuffer::new();
+        mb.push(Buffer::from_vec(b"head".to_vec()));
+        mb.push(Buffer::from_vec(big.clone()));
+        mb.push(Buffer::from_vec(b"tail".to_vec()));
+        writer.write_multi_buffer(mb).await.expect("write failed");
+
+        let data = probe.data.lock().unwrap().clone();
+        assert!(data.starts_with(b"head"), "批首字节必须在最前");
+        assert!(data.ends_with(b"tail"), "批尾字节必须在最后");
+        assert_eq!(data.len(), 4 + big.len() + 4, "字节数必须守恒");
+        assert!(data[4..4 + big.len()].iter().all(|&b| b == 0xAB), "大块内容必须原样");
     }
 }
