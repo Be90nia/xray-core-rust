@@ -555,6 +555,8 @@ mod tests {
     }
 
     /// interval 生效：3 片 × 10ms → 虚拟时钟推进 ≥30ms。
+    // nn8os 2b 残余豁免：测试耗时断言用 tokio 虚拟钟读数（start_paused），非插件能力面。
+    #[allow(clippy::disallowed_methods, reason = "测试耗时断言配套，非生产时钟取用")]
     #[tokio::test(start_paused = true)]
     async fn generic_interval_sleeps_between_pieces() {
         let writes_rec = Arc::new(Mutex::new(Vec::new()));
@@ -647,6 +649,8 @@ mod tests {
     }
 
     /// 部分写 + 片间 sleep：内容不丢不重，片间虚拟时钟推进（4 片 × 10ms）。
+    // nn8os 2b 残余豁免：测试耗时断言用 tokio 虚拟钟读数（start_paused），非插件能力面。
+    #[allow(clippy::disallowed_methods, reason = "测试耗时断言配套，非生产时钟取用")]
     #[tokio::test(start_paused = true)]
     async fn fragment_connection_survives_partial_inner_writes() {
         let writes_rec = Arc::new(Mutex::new(Vec::new()));

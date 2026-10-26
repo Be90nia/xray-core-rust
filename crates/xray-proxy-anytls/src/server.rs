@@ -159,6 +159,13 @@ async fn serve_loop(
     }
 }
 
+// nn8os reaudit 台账（补登，713x6 判定：tokio 一律不迁）：连接级握手 deadline 预算走
+// tokio timer 域——tokio::time::Instant 与 tokio timeout 同钟族，与 std Clock 面禁混换；
+// 数据面热路径不迁（同 tuic udp_assoc_direct 台账形态）。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "tokio 虚拟钟预算面（数据面热路径）：握手 deadline 与 timeout 同钟族，713x6 判定 tokio 一律不迁"
+)]
 async fn handle_conn(
     tcp: TcpStream,
     tls_acceptor: TlsAcceptor,
@@ -706,6 +713,8 @@ mod tests {
 
     /// s9 fd 泄漏回归：client 流结束（写 FIN）后，服务端 session/TLS 必须释放——
     /// echo 计数归零。修复前 terminate() 不发 FIN 不关 socket，计数永不归零。
+    // nn8os 2b 残余豁免：测试耗时断言用 std 即时读数（墙钟差），非插件能力面。
+    #[allow(clippy::disallowed_methods, reason = "测试耗时断言配套，非生产时钟取用")]
     #[tokio::test]
     async fn stream_close_releases_server_connection() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -800,6 +809,8 @@ mod tests {
     /// bd v57c：TLS 握手完成后不发认证帧（静默对端）→ 服务端握手限时到期
     /// 关闭连接，客户端读到 EOF/RST，连接不永久挂起。cfg(test) 下限时收短
     /// 为 100ms（见 handshake_timeout()）。
+    // nn8os 2b 残余豁免：测试耗时断言用 std 即时读数（墙钟差），非插件能力面。
+    #[allow(clippy::disallowed_methods, reason = "测试耗时断言配套，非生产时钟取用")]
     #[tokio::test]
     async fn server_closes_connection_after_first_packet_timeout() {
         let _ = rustls::crypto::ring::default_provider().install_default();

@@ -428,6 +428,8 @@ mod tests {
 
     /// bd v57c：对端 accept 后不回包（TLS ClientHello 无响应）→ dial 在注入的
     /// 短超时内返回显式超时错误（禁静默重试、禁永久挂起）。
+    // nn8os 2b 残余豁免：测试耗时断言用 std 即时读数（墙钟差），非插件能力面。
+    #[allow(clippy::disallowed_methods, reason = "测试耗时断言配套，非生产时钟取用")]
     #[tokio::test]
     async fn dial_timeout_when_server_silent() {
         let _ = rustls::crypto::ring::default_provider().install_default();

@@ -201,6 +201,8 @@ mod tests {
     // ---- G14：handle_conn inactivity 计时（真实时钟） ----
 
     /// 验收①：注入短超时（200ms）→ 静默连接按时被终止。
+    // nn8os 2b 残余豁免：测试耗时断言用 std 即时读数（墙钟差），非插件能力面。
+    #[allow(clippy::disallowed_methods, reason = "测试耗时断言配套，非生产时钟取用")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn handle_conn_idle_timeout_terminates_silent_connection() {
         let inbound = Arc::new(make_inbound_with_timeout(vec![], Duration::from_millis(200)));

@@ -820,6 +820,8 @@ mod tests {
 
     /// 静默客户端（握手半途不发数据）→ 整段握手读 60s 超时终止
     /// （Go SessionDefault().Timeouts.Handshake=60s；start_paused 自动推进挂钟）。
+    // nn8os 2b 残余豁免：测试耗时断言用 std 即时读数（墙钟差），非插件能力面。
+    #[allow(clippy::disallowed_methods, reason = "测试耗时断言配套，非生产时钟取用")]
     #[tokio::test(start_paused = true)]
     async fn handshake_read_timeout_terminates() {
         let validator = make_validator_with_user("password");

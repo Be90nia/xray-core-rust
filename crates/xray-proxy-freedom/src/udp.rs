@@ -679,6 +679,8 @@ mod tests {
     }
 
     /// 多包往返：连续写多个 XUDP 帧，验证都能 echo 回来。
+    // nn8os 2b 残余豁免：测试耗时断言用 std 即时读数（墙钟差），非插件能力面。
+    #[allow(clippy::disallowed_methods, reason = "测试耗时断言配套，非生产时钟取用")]
     #[tokio::test]
     async fn udp_relay_multiple_packets() {
         let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();

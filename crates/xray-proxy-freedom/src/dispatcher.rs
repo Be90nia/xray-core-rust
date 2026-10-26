@@ -553,6 +553,8 @@ mod tests {
     /// bd 7zc：sendThrough → freedom UDP relay 以指定源 IP bind（对齐 Go
     /// system_dialer.go:59-84 UDP ListenPacket 绑 srcAddr）。echo server 记录
     /// recv_from 的 peer，断言源 IP 为 127.0.0.2（loopback /8 内非默认源）。
+    // nn8os 2b 残余豁免：测试耗时断言用 std 即时读数（墙钟差），非插件能力面。
+    #[allow(clippy::disallowed_methods, reason = "测试耗时断言配套，非生产时钟取用")]
     #[tokio::test]
     async fn dispatcher_e2e_freedom_udp_send_through_binds_source() {
         use std::net::IpAddr;
@@ -1105,6 +1107,8 @@ mod tests {
 
     /// bd czwu②：dial 失败走 retry.ExponentialBackoff(5,100)——对已关闭端口
     /// 连续 5 次尝试（线性退避 0+100+200+300ms），总耗时 ≥500ms 而非立即失败。
+    // nn8os 2b 残余豁免：测试耗时断言用 std 即时读数（墙钟差），非插件能力面。
+    #[allow(clippy::disallowed_methods, reason = "测试耗时断言配套，非生产时钟取用")]
     #[tokio::test]
     async fn dial_fn_retries_transient_failures() {
         let dial = make_dial_fn();
