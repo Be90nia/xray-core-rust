@@ -27,7 +27,14 @@ pub struct ReverseConnState {
 
 impl ReverseConnState {
     /// 创建一条活跃连接状态。
+    ///
+    /// 713x6 台账：反向隧道建链时戳；本模块自述「纯逻辑 + 线程安全状态」，
+    /// 无 PluginContext 注入面，迁 Clock 需改 pub 结构契约。
     #[must_use]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "反向隧道建链时戳；纯逻辑模块无 ctx 注入面（713x6 台账：结构性不可达）"
+    )]
     pub fn new() -> Self {
         Self { active: true, established_at: Instant::now() }
     }

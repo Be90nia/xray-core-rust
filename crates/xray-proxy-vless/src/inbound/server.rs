@@ -313,6 +313,12 @@ where
     // 60s) 在 ENC 握手之后、首包读之前设置；deadline 覆盖首包预读 + decode 总
     // 时长，decode 成功或 fallback 时解除）。sm80④：优先用装配层注入的 policy
     // 握手超时；未注入时维持 crate 兜底（同 handshake_timeout_for 无 policy 分支）。
+    // 713x6 台账：tokio 虚拟钟预算面——`timeout_at` 仅收 tokio Instant，与 std
+    // Clock 面禁混换（713x6 判定：tokio 一律不迁）。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "tokio 虚拟钟预算面：timeout_at deadline 与 sleep/timeout 同钟族，禁换 std/Clock（713x6：tokio 一律不迁）"
+    )]
     let handshake_deadline = tokio::time::Instant::now()
         + options.as_ref().and_then(|o| o.handshake_timeout).unwrap_or_else(handshake_timeout);
 
@@ -663,6 +669,11 @@ where
     // select 分支体内 await（select 已定，不会被取消）；`recv_packet` 可取消
     // （半帧累积在 session 内部，见 udp_session.rs）。
     let result = loop {
+        // 713x6 台账：tokio 虚拟钟预算面——与 sleep_until 同钟族（713x6：tokio 一律不迁）。
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "tokio 虚拟钟预算面：sleep_until deadline 与超时同钟族（713x6：tokio 一律不迁）"
+        )]
         let deadline = tokio::time::Instant::now() + idle_timeout;
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => break Ok(()), // 空闲到期拆除
@@ -812,6 +823,12 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
 
     // 握手限时（Go inbound.go:281-284：decode 前 SetReadDeadline(policy 或
     // SessionDefault 60s)，覆盖整个 decode 阶段；sm80④ 起装配层可注入）。
+    // 713x6 台账：tokio 虚拟钟预算面——`timeout_at` 仅收 tokio Instant，与 std
+    // Clock 面禁混换（713x6 判定：tokio 一律不迁）。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "tokio 虚拟钟预算面：timeout_at deadline 与 sleep/timeout 同钟族，禁换 std/Clock（713x6：tokio 一律不迁）"
+    )]
     let handshake_deadline = tokio::time::Instant::now()
         + options.as_ref().and_then(|o| o.handshake_timeout).unwrap_or_else(handshake_timeout);
 

@@ -3,6 +3,9 @@
 #![cfg_attr(test, allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr))]
 // 测试目标统一豁免（print 断言便利）；spawn 走 xray_common::testing（L3
 // 闸不豁免），生产禁令不受影响
+// 713x6 时钟禁令配套：测试耗时断言/夹具用裸时钟读数属测试面（存量不动），
+// 生产站点逐点 allow + 理由登记（台账见 reports/audit-2026-10-26/proxy-clock-sweep.md）
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 #![warn(clippy::print_stdout, clippy::print_stderr)]
 // 库代码禁直写控制台（诊断走 tracing）；豁免面见各文件 allow 与 clippy.toml 注释
 //! Shadowsocks 代理协议（Go→Rust 翻译版）

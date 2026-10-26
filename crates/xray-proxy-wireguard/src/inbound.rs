@@ -679,10 +679,20 @@ impl WgTcpRelay {
     async fn finish(&self) {
         let mut stack = self.netstack.lock().await;
         stack.with_tcp_socket(self.handle, |s| s.close());
+        // 713x6 台账：FIN 排空轮询截止的单调钟读数；`WgTcpRelay` 纯桥接结构
+        // （netstack+handle+to_client）无 ctx/clock 注入面。
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "WgTcpRelay 纯桥接结构无 ctx/clock 注入面；排空截止单调钟（713x6 台账：结构性不可达）"
+        )]
         let deadline = std::time::Instant::now() + FINISH_DRAIN_TIMEOUT;
         loop {
             stack.poll(smoltcp::time::Instant::now());
             let active = stack.with_tcp_socket(self.handle, |s| s.is_active());
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "同上：WgTcpRelay 无 ctx/clock 注入面（713x6 台账）"
+            )]
             if !active || std::time::Instant::now() >= deadline {
                 break;
             }

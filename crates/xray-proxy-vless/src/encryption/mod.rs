@@ -422,6 +422,13 @@ impl ClientInstance {
             if let (Some(pfs_key), Some(ticket), Some(expire)) =
                 (snap.pfs_key, snap.ticket, snap.expire)
             {
+                // 713x6 台账：0-RTT ticket TTL 判定；`ClientInstance` 纯协议
+                // 结构（pub init 从 ClientEncParams 构造）无 ctx 注入面，迁
+                // Clock 需改 pub init 契约 + 测试构造点（测试面不动）。
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "0-RTT ticket TTL 判定；ClientInstance 纯协议结构无 ctx 注入面（713x6 台账：结构性不可达）"
+                )]
                 if Instant::now() < expire && pfs_key.len() == 64 {
                     let iv_and_relays_len = 16 + self.relays_length;
                     let mut pre_write = vec![0u8; iv_and_relays_len + 18 + 32];
@@ -613,11 +620,16 @@ impl ClientInstance {
         peer_aead.open(&mut Vec::new(), None, &encrypted_padding, &[])?;
         // 13. 缓存 0-RTT 凭据（Go client.go:188-194：`seconds > 0 && seconds > 0` ——与 xor_mode
         //     无关；ticket 前 2B 是 server 编码的 seconds）。
+        // 713x6 台账：同上——ticket expire 写入依赖 ClientInstance 注入面。
         let server_seconds = _seconds;
         if self.seconds > 0 && server_seconds > 0 {
             let ticket16: [u8; 16] = ticket_pt[..16]
                 .try_into()
                 .map_err(|_| VlessError::Other("ticket plaintext not 16 bytes".into()))?;
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "0-RTT ticket expire 写入；ClientInstance 纯协议结构无 ctx 注入面（713x6 台账：结构性不可达）"
+            )]
             let expire = Instant::now() + std::time::Duration::from_secs(server_seconds as u64);
             // 单写锁原子更新三字段（原三把写锁各自持放，读者可观察到中间态）
             *self.cache.entry.write() = ZeroRttEntry {
@@ -716,13 +728,22 @@ impl SessionStore {
     }
 }
 
-/// 当前 Unix 分钟（Go `time.Now().Unix()/60`）。
+/// 从给定挂钟读数取 Unix 分钟（Go `time.Now().Unix()/60`）。
+///
+/// 713x6：拆 `unix_minute_of(SystemTime)` 使长驻任务可经 `ctx.clock()` 注入
+/// 时间源（生产 SystemClock 直通，语义零变化）。
+fn unix_minute_of(now: std::time::SystemTime) -> i64 {
+    (now.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) / 60) as i64
+}
+
+/// 当前 Unix 分钟（裸挂钟读数；结构性不可达站点见台账——`ServerInstance`
+/// 不自持 ctx，1-RTT 握手路径无注入面）。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "协议 ticket 过期分钟换算（Go time.Now().Unix()/60 对齐）；ServerInstance 纯协议结构无 ctx 注入面，迁 Clock 需改 pub init/new 契约（713x6 台账）"
+)]
 fn unix_minute() -> i64 {
-    (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-        / 60) as i64
+    unix_minute_of(std::time::SystemTime::now())
 }
 
 /// 服务端加密实例（对应 Go `ServerInstance`）。
@@ -854,6 +875,9 @@ impl ServerInstance {
         // 过期 ticket；`closed` 置位后任务退出（Go Closed bool）。
         if self.seconds_from > 0 || self.seconds_to > 0 {
             let store = std::sync::Arc::clone(&self.sessions);
+            // 713x6：清理任务的分钟读数经 ctx.clock() 注入（生产 SystemClock
+            // 直通语义零变化；测试可 MockClock 冻结时间线）。
+            let clock = std::sync::Arc::clone(ctx.clock());
             // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
             ctx.spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -864,7 +888,7 @@ impl ServerInstance {
                     if s.closed {
                         return;
                     }
-                    s.cleanup_expired(unix_minute());
+                    s.cleanup_expired(unix_minute_of(clock.now_system()));
                 }
             })
             .expect("plugin ctx FxScope is never closed (assembly-owned)");

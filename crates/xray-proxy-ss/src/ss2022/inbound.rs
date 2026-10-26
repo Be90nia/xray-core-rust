@@ -626,6 +626,13 @@ where
 }
 
 /// 验证时间戳：与当前时间差在 tolerance 内。
+///
+/// 713x6 台账：自由函数（纯协议校验，调用链 `read_ss2022_request*` 不持
+/// PluginContext），迁 Clock 需改整条请求解析签名，故留台账。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "SS2022 timestamp ±tolerance 校验 wire 语义；纯函数无 ctx 注入面（713x6 台账：结构性不可达）"
+)]
 fn check_timestamp(timestamp: u64, tolerance: u64) -> Result<()> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

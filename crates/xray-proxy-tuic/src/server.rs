@@ -541,6 +541,15 @@ async fn udp_assoc_task(
 }
 
 /// 直连模式（mock）：assoc 生命周期内单个 UdpSocket（cone 出口）。
+/// direct 模式（mock server / 直连）：每包直接 `udp.send_to`。
+///
+/// 713x6 台账：tokio 虚拟钟预算面——`Sleep::reset` 仅收 tokio Instant（fn 内
+/// 2 处 reset 由本条 fn 级 allow 统一登记），与 std Clock 面禁混换
+/// （713x6 判定：tokio 一律不迁）。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "tokio 虚拟钟预算面：idle 睡眠 reset 与 sleep 同钟族（713x6：tokio 一律不迁）"
+)]
 async fn udp_assoc_direct(assoc_id: u16, mut rx: tokio::sync::mpsc::Receiver<UdpAssocItem>) {
     let udp = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
         Ok(s) => s,
@@ -601,6 +610,13 @@ async fn udp_assoc_direct(assoc_id: u16, mut rx: tokio::sync::mpsc::Receiver<Udp
 }
 
 /// dispatch 模式（生产）：[`UdpDispatchSession`] 路由，域名透传由 outbound 解析。
+///
+/// 713x6 台账：tokio 虚拟钟预算面——同 `udp_assoc_direct`（fn 内 2 处 reset
+/// 由本条 fn 级 allow 统一登记；713x6 判定：tokio 一律不迁）。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "tokio 虚拟钟预算面：idle 睡眠 reset 与 sleep 同钟族（713x6：tokio 一律不迁）"
+)]
 async fn udp_assoc_dispatch(
     assoc_id: u16,
     dispatcher: Arc<dyn DispatchHandler>,

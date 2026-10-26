@@ -233,6 +233,12 @@ async fn pump_ss_stream(mut stream: SSStream<Box<dyn Connection>>, server_io: Du
                     break;
                 }
                 // 兜底只发一次：推远避免反复唤醒（pending 已清，语义等价停表）
+                // 713x6 台账：tokio 虚拟钟预算面——`Sleep::reset` 仅收 tokio Instant，
+                // 与 std Clock 面禁混换（713x6 判定：tokio 一律不迁）。
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "tokio 虚拟钟预算面：Sleep::reset 仅收 tokio::time::Instant，与 std/Clock 面禁混换（713x6：tokio 一律不迁）"
+                )]
                 if let Some(t) = hdr_timer.as_mut() {
                     t.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
                 }

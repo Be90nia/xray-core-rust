@@ -177,6 +177,12 @@ impl Tunnel {
             input = &[];
         }
         // 如果握手完成，更新 last_handshake 时间
+        // 713x6 台账：boringtun 包装层（`WgTunnel`/`Tunnel` 纯协议封装，无 ctx）；
+        // last_handshake 只做 session key 轮换节拍的单调差值。
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "boringtun 包装层无 ctx 注入面；握手节拍单调钟（713x6 台账：结构性不可达）"
+        )]
         if self.tunn.time_since_last_handshake().is_some() {
             self.last_handshake = Some(std::time::Instant::now());
         }

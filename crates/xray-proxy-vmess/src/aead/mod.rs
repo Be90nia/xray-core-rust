@@ -585,6 +585,13 @@ impl AuthIDDecoderHolder {
                 return Err(AuthIDMatchError::NegativeTime);
             }
 
+            // 713x6 台账：VMess AEAD authID ±120s 时间戳校验（Go 对齐）；
+            // `AuthIDDecoderHolder` 纯协议结构（items+replay_filter），构造链
+            // `TimedUserValidator::new()` 无 PluginContext 注入面。
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "VMess 协议时间戳窗校验 wire 语义；纯结构无 ctx 注入面（713x6 台账：结构性不可达）"
+            )]
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)

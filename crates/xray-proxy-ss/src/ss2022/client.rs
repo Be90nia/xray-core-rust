@@ -140,6 +140,12 @@ impl Client2022 {
         let nonce = vec![0u8; 12];
 
         // timestamp
+        // 713x6 台账：SS2022 请求 fixed 头 timestamp 为协议 wire 字段（SIP022）；
+        // `Client2022` 纯配置结构（从 PSK/host/port 构造）无 PluginContext 注入面。
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "SS2022 协议 timestamp wire 字段；Client2022 纯配置结构无 ctx 注入面（713x6 台账：结构性不可达）"
+        )]
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| SsError::GetCipher(e.to_string()))?

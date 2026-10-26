@@ -242,6 +242,13 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             self.write_nonce = vec![0xFFu8; aead.nonce_size()];
             self.write_aead = std::sync::Arc::from(aead);
             let first_len = plaintext.len().min(8192 - self.tag_size - 2);
+            // 713x6 台账：SS2022 响应 fixed 头 epoch 为协议 wire 字段（sing
+            // writeResponse 对齐）；`SSStream` 为纯 codec 结构无 PluginContext，
+            // 迁 Clock 需给 codec 结构加注入面（跨客户端/服务端多构造点），故留台账。
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "SS2022 协议 epoch wire 字段；SSStream 纯 codec 无 ctx 注入面（713x6 台账：结构性不可达）"
+            )]
             let epoch = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|e| SsError::GetCipher(e.to_string()))?
@@ -637,6 +644,10 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
                     }
                     let epoch =
                         u64::from_be_bytes(plain[1..9].try_into().expect("epoch slice is 8 bytes"));
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "SS2022 响应 epoch ±30s 校验 wire 语义；SSStream 纯 codec 无 ctx 注入面（713x6 台账）"
+                    )]
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_err(|e| SsError::GetCipher(e.to_string()))?

@@ -156,6 +156,12 @@ impl ClientSession {
         buffer.extend_from_slice(&auth.to_be_bytes());
 
         // AEAD seal
+        // 713x6 台账：VMess AEAD header seal 时间戳为协议 wire 字段（Go
+        // sealVMessAEADHeader time.Now() 对齐）；encoding 层纯 codec 无 ctx。
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "VMess AEAD seal 时间戳 wire 字段；encoding 纯 codec 无 ctx 注入面（713x6 台账：结构性不可达）"
+        )]
         let now =
             SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         aead::seal_vmess_aead_header(cmd_key, &buffer, now).map_err(|e| match e {

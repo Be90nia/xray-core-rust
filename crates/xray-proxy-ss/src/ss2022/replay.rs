@@ -32,7 +32,15 @@ pub const REPLAY_WINDOW: Duration = Duration::from_secs(60);
 
 impl SaltReplayFilter {
     /// 创建过滤器（生产用 [`REPLAY_WINDOW`]，对齐 Go 60s）。
+    ///
+    /// 713x6 台账：std 单调钟读数——`SaltReplayFilter` 纯结构无 ctx 字段，构造链
+    /// （`Ss2022Inbound`/`MultiUserInbound::new` 配置层）无 PluginContext 注入面，
+    /// 迁 Clock 需改 pub 契约 + 测试构造点（测试面不动），故留台账。
     #[must_use]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "Go MapFilter 双池轮换单调钟；过滤器纯结构无 ctx 注入面（713x6 台账：结构性不可达）"
+    )]
     pub fn new(interval: Duration) -> Self {
         Self {
             interval,
@@ -46,6 +54,10 @@ impl SaltReplayFilter {
 
     /// 检查 salt 是否为新值。`true` = 新（已注册），`false` = 窗口内重放。
     #[must_use]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "同 SaltReplayFilter::new：纯结构无 ctx 注入面，轮换钟随构造台账（713x6）"
+    )]
     pub fn check(&self, salt: &[u8]) -> bool {
         let now = std::time::Instant::now();
         let st = &mut *self.state.lock();

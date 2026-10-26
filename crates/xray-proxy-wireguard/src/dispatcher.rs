@@ -558,7 +558,7 @@ pub fn make_wireguard_dial_fn(
                         handle
                     };
 
-                    let connected = wait_tcp_connected(netstack, handle).await;
+                    let connected = wait_tcp_connected(netstack, handle, clock.as_ref()).await;
                     if !connected {
                         let mut stack = netstack.lock().await;
                         stack.remove_socket(handle);
@@ -981,12 +981,16 @@ fn dns_skip_name(payload: &[u8], pos: &mut usize) -> Result<(), String> {
 }
 
 /// 等待 smoltcp TCP socket 连接建立（轮询，最多 5 秒）。
+///
+/// 713x6：轮询截止走注入 Clock（P1-12 时间源契约——调用方 dial 闭包持
+/// `clock: Arc<dyn Clock>`，生产 SystemClock / 测试 MockClock 可冻结时间线）。
 async fn wait_tcp_connected(
     netstack: &Arc<AsyncMutex<WgNetStack>>,
     handle: smoltcp::iface::SocketHandle,
+    clock: &dyn Clock,
 ) -> bool {
     let timeout = Duration::from_secs(5);
-    let start = std::time::Instant::now();
+    let start = clock.now_instant();
     let poll_interval = Duration::from_millis(RELAY_POLL_MS);
 
     loop {

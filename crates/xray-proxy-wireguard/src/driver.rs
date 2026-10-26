@@ -577,6 +577,12 @@ impl WgDriver {
         }
 
         let mut timer = interval(TIMER_INTERVAL);
+        // 713x6 台账：keepalive 节拍的单调钟读数；`WgDriver` 自持 FxScope（B6
+        // t975）但无 ctx/clock 字段，迁 Clock 需改三处构造器契约。
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "WgDriver 自持 scope 无 ctx/clock 注入面；keepalive 单调钟（713x6 台账：结构性不可达）"
+        )]
         let mut last_keepalive = std::time::Instant::now();
         let keepalive_interval =
             self.peer(0).and_then(|p| p.with_tunnel(|t| t.keepalive_interval()));
@@ -607,6 +613,11 @@ impl WgDriver {
             }
             if !self.is_multi() {
                 if let Some(interval_secs) = keepalive_interval {
+                    // 713x6 台账（覆盖下方 reset 赋值站）：WgDriver 无 ctx/clock 注入面。
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "同上：WgDriver 无 ctx/clock 注入面（713x6 台账）"
+                    )]
                     if last_keepalive.elapsed().as_secs() >= u64::from(interval_secs) {
                         last_keepalive = std::time::Instant::now();
                         let ka_outputs =

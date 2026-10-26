@@ -86,6 +86,13 @@ impl SessionHistory {
         // `RETAIN_THRESHOLD`（10000）时触发一次清理；均摊 O(1)。生产环境真正周期清理
         // 待 `spawn_cleanup` 后台任务上线（依赖字段重构，见 fn 内注释）。
         const RETAIN_THRESHOLD: usize = 10_000;
+        // 713x6 台账：lazy retain 防膨胀的单调钟读数；`SessionHistory` 纯数据结构
+        // 无 ctx 字段（装配点 serve_vmess 有 ctx 但结构无注入面），迁 Clock 需改
+        // pub new/with_ttl 契约 + 全部测试构造点（测试面不动），故留台账。
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "SessionHistory 纯数据结构无 ctx 注入面；过期判定的单调钟读数（713x6 台账：结构性不可达）"
+        )]
         let now = Instant::now();
         if inner.len() >= RETAIN_THRESHOLD {
             inner.retain(|_, expire| *expire > now);

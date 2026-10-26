@@ -69,6 +69,13 @@ const UDP_CHACHA_NONCE_SIZE: usize = 24;
 /// AEAD 最小明文：type(1) + ts(8) + 2/8 + padLen(2) + addr(7) 。
 const MIN_PLAINTEXT: usize = 1 + 8 + 2 + 7;
 
+/// UDP 包会话当前 Unix 秒（Go `packet.go` 同语义）。
+///
+/// 713x6 台账：自由函数（UDP 包 codec 层），无 PluginContext 注入面。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "SS2022 UDP 包会话时间戳 wire 字段；纯函数无 ctx 注入面（713x6 台账：结构性不可达）"
+)]
 fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }

@@ -6550,6 +6550,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "tracing",
+ "udf-skeleton",
  "udf-skeleton-infra",
  "x25519-dalek",
  "xray-app-dispatcher",

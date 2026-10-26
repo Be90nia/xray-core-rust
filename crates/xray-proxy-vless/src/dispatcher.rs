@@ -210,6 +210,13 @@ impl PreConns {
 
     /// 入池：满则阻塞直到消费者腾位（Go worker 空闲时休息在此）。
     /// 消费端已全部下线（handler 释放）时返回 Err，worker 随之退出。
+    // 713x6 台账：tokio 虚拟钟预算面——池条目时戳与 TTL 判定同钟族（pop 侧
+    // `duration_since` 同源），禁换 std/Clock（713x6：tokio 一律不迁）；
+    // `PreConns` 纯结构无 ctx 字段，改注入面需动 pub 通道类型契约。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "tokio 虚拟钟预算面：条目时戳与消费侧 TTL 判定同钟族（713x6：tokio 一律不迁）"
+    )]
     async fn push(
         &self,
         conn: Box<dyn Connection>,
@@ -219,6 +226,10 @@ impl PreConns {
 
     /// 取一条未过期预连接；过期条目丢弃后继续等（Go 消费循环
     /// `<-h.preConns` 同语义）。全部 worker 退出后返回 None → 调用方自拨。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "tokio 虚拟钟预算面：与 push 侧条目时戳同钟族（713x6：tokio 一律不迁）"
+    )]
     async fn pop(&self) -> Option<Box<dyn Connection>> {
         let mut rx = self.rx.lock().await;
         loop {

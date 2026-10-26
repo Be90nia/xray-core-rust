@@ -18,6 +18,9 @@ xray-frame = { path = "../xray-frame" }
 # B6（bd t975）：spawn 托管面走 udf skeleton_infra::fx::FxScope（坑约束 5）。
 # path 形态同 xray-app-dns（udf-frame 仓内工作副本即改即用；CI 由 fetch-udf 拉料，不锁 rev）。
 udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio"] }
+# 713x6：Clock 契约（ctx.clock() 注入面）。path 形态同 wireguard（bd 9zxyl 先例，
+# udf-frame 仓内工作副本即改即用；CI 由 fetch-udf 拉料，不锁 rev）。
+udf-skeleton = { path = "../udf-frame/skeleton" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

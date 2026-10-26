@@ -239,6 +239,12 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
     let mut session = ServerSession::new(validator, history);
     // Go `server.go::Process`：conn.SetReadDeadline(Timeouts.Handshake) 一次性
     // 覆盖 decode 与 drain 总时长（绝对 deadline 语义）。sm80④ 起由装配层注入。
+    // 713x6 台账：tokio 虚拟钟预算面——`timeout_at` 仅收 tokio Instant，与 std
+    // Clock 面禁混换（713x6 判定：tokio 一律不迁）。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "tokio 虚拟钟预算面：timeout_at deadline 与 sleep/timeout 同钟族，禁换 std/Clock（713x6：tokio 一律不迁）"
+    )]
     let handshake_deadline = tokio::time::Instant::now() + handshake_timeout;
     let decoded = match tokio::time::timeout_at(
         handshake_deadline,
