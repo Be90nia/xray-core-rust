@@ -28,7 +28,7 @@ xray-common = { path = "../xray-common" }
 # spawn 托管面（skeleton_infra::fx::FxScope，坑约束 5）为 L3 闸全量收口方向，
 # 代码无条件编译；tokio feature 供 fx 域；default-features = false 延续
 # 「不拖 runtime/pool 默认档」原口径。
-udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", default-features = false, features = ["tokio"] }
+udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", default-features = false, features = ["tokio", "memgov"] }
 # bd 8zs12 停机报告出口（随 shutdown-coordinator feature 门）：报告走 xray-frame
 # LogFacade（tracing 门面）——`xray_common::log` general 出口受 LogInstance::close
 # gate=Off 控制而吞报告（真机实证）；tracing 进程级订阅器不随 feature 关闭。

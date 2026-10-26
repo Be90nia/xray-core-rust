@@ -16,6 +16,7 @@
 // P1-B: vless/trojan inbound 集成
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
+use skeleton_infra::memgov::{BoundedRegistry, Eviction};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite},
     net::{TcpStream, UdpSocket},
@@ -2893,13 +2894,16 @@ fn user_proto(email: &str, level: u32) -> ProtoUser {
 }
 
 struct InboundSlot {
-    tag: String,
     /// proxy_settings 的 type_url（`xray.proxy.{kind}.Config`），ListInbounds 回填。
     proxy_type_url: String,
     /// 单入站取消令牌——shutdown token 的子令牌，RemoveInbound 只停这一个。
     cancel: CancellationToken,
     users: Option<Arc<dyn ApiUserManager>>,
 }
+
+/// 生产注册表容量上界（xiuvr-3a）：配置文件 inbound 数量工程上远小于此；
+/// 超限 `Eviction::Reject` fail-closed（insert Err 显式上抛），不静默淘汰。
+const INBOUND_REGISTRY_CAP: usize = 1024;
 
 /// 生产 inbound 运行时（bd jezb）：gRPC `HandlerService` 的 inbound 域后端。
 ///
@@ -2913,8 +2917,9 @@ pub struct InboundRuntime {
     /// handshake 超时等 per-level 策略）。
     policy: Option<Arc<dyn xray_features::policy::PolicyManager>>,
     shutdown: CancellationToken,
-    /// 已启动入站，保持注册顺序（ListInbounds 顺序稳定）。
-    slots: parking_lot::RwLock<Vec<InboundSlot>>,
+    /// 已启动入站（tag → slot；xiuvr-3a：udf `BoundedRegistry` 承载——BTreeMap
+    /// 确定序 = tag 升序，ListInbounds 顺序稳定；上界 fail-closed 不静默淘汰）。
+    slots: parking_lot::RwLock<BoundedRegistry<String, InboundSlot>>,
 }
 
 impl InboundRuntime {
@@ -2925,7 +2930,16 @@ impl InboundRuntime {
         shutdown: CancellationToken,
     ) -> Self {
         let policy = dispatcher.as_ref().and_then(|d| d.policy_manager.clone());
-        Self { ohm, dispatcher, policy, shutdown, slots: parking_lot::RwLock::new(Vec::new()) }
+        Self {
+            ohm,
+            dispatcher,
+            policy,
+            shutdown,
+            slots: parking_lot::RwLock::new(BoundedRegistry::new(
+                INBOUND_REGISTRY_CAP,
+                Eviction::Reject,
+            )),
+        }
     }
 
     /// 启动一个 inbound 并登记（配置期与 gRPC AddInbound 共用同一路径）。
@@ -2941,17 +2955,21 @@ impl InboundRuntime {
             return Err(std::io::Error::other(format!("existing tag found: {}", ib.tag)));
         }
         let cancel = self.shutdown.child_token();
-        self.slots.write().push(InboundSlot {
-            tag: ib.tag.clone(),
-            proxy_type_url: format!("xray.proxy.{}.Config", ib.entry.kind),
-            cancel: cancel.clone(),
-            users: None,
-        });
+        let type_url = format!("xray.proxy.{}.Config", ib.entry.kind);
+        // 满表 fail-closed：insert Err 显式上抛（上界 INBOUND_REGISTRY_CAP，配置
+        // 面工程上不可达），不静默淘汰（xiuvr-3a D3）。
+        self.slots
+            .write()
+            .insert(
+                ib.tag.clone(),
+                InboundSlot { proxy_type_url: type_url, cancel: cancel.clone(), users: None },
+            )
+            .map_err(|e| std::io::Error::other(format!("inbound registry full: {e}")))?;
         let per_ohm = per_inbound_ohm(&self.ohm, self.dispatcher.as_ref(), ib);
         match spawn_one_inbound(ib, per_ohm, self.policy.clone(), cancel, Some(self)).await {
             Ok(handle) => Ok(handle),
             Err(e) => {
-                self.slots.write().retain(|s| s.tag != ib.tag);
+                self.slots.write().remove(&ib.tag);
                 Err(e)
             },
         }
@@ -2960,7 +2978,7 @@ impl InboundRuntime {
     /// tag 是否已登记（对应 Go `ihm.GetHandler` 的存在性检查）。
     #[must_use]
     pub fn contains(&self, tag: &str) -> bool {
-        self.slots.read().iter().any(|s| s.tag == tag)
+        self.slots.read().get(&tag.to_string()).is_some()
     }
 
     /// 停止并注销一个入站。对应 Go `ihm.RemoveHandler`。
@@ -2969,18 +2987,24 @@ impl InboundRuntime {
     ///
     /// tag 不存在 → [`ProxymanError::HandlerNotFound`]。
     pub fn remove_inbound(&self, tag: &str) -> Result<(), ProxymanError> {
-        let mut slots = self.slots.write();
-        let Some(pos) = slots.iter().position(|s| s.tag == tag) else {
-            return Err(ProxymanError::HandlerNotFound(tag.to_string()));
-        };
-        slots.remove(pos).cancel.cancel();
-        Ok(())
+        let slot = self.slots.write().remove(&tag.to_string());
+        match slot {
+            Some(s) => {
+                s.cancel.cancel();
+                Ok(())
+            },
+            None => Err(ProxymanError::HandlerNotFound(tag.to_string())),
+        }
     }
 
-    /// 已启动入站的 (tag, proxy_settings type_url)，注册顺序。
+    /// 已启动入站的 (tag, proxy_settings type_url)，tag 升序（BTreeMap 确定序）。
     #[must_use]
     pub fn list(&self) -> Vec<(String, String)> {
-        self.slots.read().iter().map(|s| (s.tag.clone(), s.proxy_type_url.clone())).collect()
+        self.slots
+            .read()
+            .iter()
+            .map(|(tag, slot)| (tag.clone(), slot.proxy_type_url.clone()))
+            .collect()
     }
 
     /// 取入站的用户管理器。
@@ -2991,10 +3015,8 @@ impl InboundRuntime {
     /// [`ProxymanError::NotUserManager`]（Go 类型断言失败的等价语义）。
     pub fn user_manager(&self, tag: &str) -> Result<Arc<dyn ApiUserManager>, ProxymanError> {
         let slots = self.slots.read();
-        let slot = slots
-            .iter()
-            .find(|s| s.tag == tag)
-            .ok_or_else(|| ProxymanError::HandlerNotFound(tag.to_string()))?;
+        let slot = slots.get(&tag.to_string());
+        let slot = slot.ok_or_else(|| ProxymanError::HandlerNotFound(tag.to_string()))?;
         slot.users.clone().ok_or(ProxymanError::NotUserManager)
     }
 
@@ -3002,9 +3024,15 @@ impl InboundRuntime {
     ///
     /// 槽位在 spawn 前已插入，缺失说明调用方未登记 tag（编程错误）。
     fn register_user_manager(&self, tag: &str, users: Arc<dyn ApiUserManager>) {
-        match self.slots.write().iter_mut().find(|s| s.tag == tag) {
-            Some(slot) => slot.users = Some(users),
-            None => tracing::warn!(tag = %tag, "user manager registered for unknown inbound"),
+        let mut slots = self.slots.write();
+        let Some(mut slot) = slots.remove(&tag.to_string()) else {
+            tracing::warn!(tag = %tag, "user manager registered for unknown inbound");
+            return;
+        };
+        slot.users = Some(users);
+        // 键刚被 remove，insert 恒成功（不触发淘汰）；Err 仅为理论竞态留痕。
+        if slots.insert(tag.to_string(), slot).is_err() {
+            tracing::error!(tag = %tag, "inbound registry insert failed after remove");
         }
     }
 }
@@ -4026,6 +4054,9 @@ async fn spawn_unix_inbound(
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     use xray_transport::system_listener::listen_unix_system;
 
+    // L2 能力句柄：UDS 分支与 transport 分支同源（arm_plugin_ctx 派发点构造）。
+    let plugin_ctx =
+        std::sync::Arc::new(crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str()));
     let settings =
         xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref());
     if is_transport_listener_protocol(&settings.protocol) {
@@ -4112,7 +4143,7 @@ async fn spawn_unix_inbound(
         },
         "vless" => {
             let validator: Arc<dyn VlessValidator> = build_vless_validator(&ib.entry.data)?;
-            let decryption = build_vless_decryption(&ib.entry.data)?;
+            let decryption = build_vless_decryption(&ib.entry.data, plugin_ctx)?;
             let options =
                 VlessInboundOptions { decryption: decryption.clone(), ..Default::default() };
             let fallbacks = build_vless_fallbacks(&ib.entry.data)?;
@@ -4283,7 +4314,10 @@ async fn spawn_unix_transport_inbound(
     let on_conn = match ib.entry.kind.as_str() {
         "vless" => {
             let validator: Arc<dyn VlessValidator> = build_vless_validator(&ib.entry.data)?;
-            let decryption = build_vless_decryption(&ib.entry.data)?;
+            // L2 能力句柄：与 spawn_unix_inbound 同源（arm_plugin_ctx 派发点构造）。
+            let plugin_ctx =
+                std::sync::Arc::new(crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str()));
+            let decryption = build_vless_decryption(&ib.entry.data, plugin_ctx)?;
             let options = VlessInboundOptions {
                 decryption: decryption.clone(),
                 handshake_timeout: Some(handshake_timeout_for(&policy, 0)),
@@ -4486,6 +4520,7 @@ pub(crate) fn build_vless_validator(
 /// conf 层 Build 同为 error）；ENC 启用时 fallbacks 在场互斥拒启。
 pub(crate) fn build_vless_decryption(
     data: &[u8],
+    plugin_ctx: std::sync::Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<std::sync::Arc<xray_proxy_vless::encryption::ServerInstance>>> {
     use xray_proxy_vless::encryption::{
         ServerInstance as EncServerInstance, parse_server_decryption,
@@ -4517,7 +4552,7 @@ pub(crate) fn build_vless_decryption(
     }
     let mut inst = EncServerInstance::new();
     let key_count = p.keys.len();
-    inst.init(p.keys, p.xor_mode, p.seconds_from, p.seconds_to, &p.padding)
+    inst.init(p.keys, p.xor_mode, p.seconds_from, p.seconds_to, &p.padding, plugin_ctx)
         .map_err(|e| std::io::Error::other(format!("vless decryption init: {e}")))?;
     tracing::info!(
         seconds_from = p.seconds_from,
@@ -5601,6 +5636,11 @@ pub(crate) fn parse_freedom_inbound_dest(data: &[u8]) -> std::io::Result<Destina
 mod tests {
     use std::net::Ipv4Addr;
 
+    /// 测试范式 ctx（生产注入来自装配根；仅测试面可直接构造）。
+    fn test_plugin_ctx(kind: &'static str) -> std::sync::Arc<xray_frame::PluginContext> {
+        std::sync::Arc::new(xray_frame::PluginContext::for_plugin(kind))
+    }
+
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -6523,10 +6563,10 @@ mod tests {
         let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let relay_addr = relay.local_addr().unwrap();
         let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
-            Arc::new(FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new(
-                "freedom",
-                make_freedom_dial_fn(),
-            ))));
+            Arc::new(FreedomDispatchBridge::from_bridge(
+                test_plugin_ctx("freedom"),
+                Arc::new(DialBridge::new("freedom", make_freedom_dial_fn())),
+            ));
         tokio::spawn(serve_ss2022_udp(
             Arc::new(relay),
             CipherKind2022::Aes256Gcm,
@@ -6591,10 +6631,10 @@ mod tests {
         let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let relay_port = relay.local_addr().unwrap().port();
         let echo_handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
-            Arc::new(FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new(
-                "freedom",
-                make_freedom_dial_fn(),
-            ))));
+            Arc::new(FreedomDispatchBridge::from_bridge(
+                test_plugin_ctx("freedom"),
+                Arc::new(DialBridge::new("freedom", make_freedom_dial_fn())),
+            ));
         tokio::spawn(serve_ss2022_udp(
             Arc::new(relay),
             CipherKind2022::Aes256Gcm,
@@ -6696,10 +6736,10 @@ mod tests {
         let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let relay_port = relay.local_addr().unwrap().port();
         let echo_handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
-            Arc::new(FreedomDispatchBridge::from_bridge(Arc::new(DialBridge::new(
-                "freedom",
-                make_freedom_dial_fn(),
-            ))));
+            Arc::new(FreedomDispatchBridge::from_bridge(
+                test_plugin_ctx("freedom"),
+                Arc::new(DialBridge::new("freedom", make_freedom_dial_fn())),
+            ));
         tokio::spawn(serve_ss2022_udp(
             Arc::new(relay),
             xray_proxy_ss::ss2022::key::CipherKind2022::ChaCha20Poly1305,
@@ -9992,7 +10032,9 @@ mod tests {
     #[test]
     fn vless_decryption_missing_or_empty_rejected() {
         for json in [br#"{}"#.as_slice(), br#"{"decryption":""}"#] {
-            let err = super::build_vless_decryption(json).err().expect("must reject");
+            let err = super::build_vless_decryption(json, test_plugin_ctx("vless"))
+                .err()
+                .expect("must reject");
             assert!(
                 err.to_string().contains("please add/set"),
                 "expected empty-decryption hard error, got: {err}"
@@ -10008,18 +10050,20 @@ mod tests {
         let keys = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
         let enc = format!(r#"{{"decryption":"mlkem768x25519plus.native.1000s.{keys}"}}"#);
         // ENC + 无 fallbacks → 合法（初始化成功）。
-        assert!(super::build_vless_decryption(enc.as_bytes()).is_ok());
+        assert!(super::build_vless_decryption(enc.as_bytes(), test_plugin_ctx("vless")).is_ok());
         // ENC + fallbacks 在场 → 拒启。
         let enc_fb =
             format!(r#"{{"decryption":"mlkem768x25519plus.native.1000s.{keys}","fallbacks":[]}}"#);
-        let err = super::build_vless_decryption(enc_fb.as_bytes()).err().expect("must reject");
+        let err = super::build_vless_decryption(enc_fb.as_bytes(), test_plugin_ctx("vless"))
+            .err()
+            .expect("must reject");
         assert!(
             err.to_string().contains("can not be used together"),
             "expected mutual-exclusion hard error, got: {err}"
         );
         // none + fallbacks → 合法。
         let ok = br#"{"decryption":"none","fallbacks":[]}"#;
-        assert!(super::build_vless_decryption(ok).is_ok());
+        assert!(super::build_vless_decryption(ok, test_plugin_ctx("vless")).is_ok());
     }
 
     /// 3hsv②：settings.flow 非法值拒启（Go vless.go:57-66）。
@@ -11320,5 +11364,183 @@ mod tests {
         });
         let joined = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
         assert!(joined.is_ok(), "serve 句柄不应挂死（panic 后必须收敛）");
+    }
+
+    // ── xiuvr-3a 阶段 2：影子注册表双跑对照（零行为改变；阶段 4 删影子）──
+
+    fn xiuvr3a_runtime() -> InboundRuntime {
+        InboundRuntime::new(Arc::new(SimpleOhm::new()), None, CancellationToken::new())
+    }
+
+    fn xiuvr3a_inbound(kind: &str, tag: &str, settings: serde_json::Value) -> BuiltInbound {
+        BuiltInbound {
+            entry: xray_conf::BuiltEntry {
+                kind: kind.to_string(),
+                data: serde_json::to_vec(&settings).expect("settings serialize"),
+            },
+            tag: tag.to_string(),
+            port: Some(0),
+            listen: Some("127.0.0.1".to_string()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        }
+    }
+
+    /// 生命周期全操作回归（xiuvr-3a 切 BoundedRegistry 后）：登记/查询/摘除/
+    /// 回滚的派生不变量（start Ok ⇒ contains=true；Err ⇒ contains=false）。
+    #[tokio::test]
+    async fn xiuvr3a_registry_behaviour_lifecycle() {
+        let rt = xiuvr3a_runtime();
+
+        // 空表：三查询全对照（contains/list/user_manager）
+        assert!(!rt.contains("nope"));
+        assert!(rt.list().is_empty());
+        assert!(matches!(rt.user_manager("nope"), Err(ProxymanError::HandlerNotFound(_))));
+
+        // 未支持 kind：登记成功 + warn skip（Ok(None)）→ 槽位留存（既有行为），
+        // 派生一致性：start 返回 Ok ⇒ contains 必 true。
+        let res = rt
+            .start_inbound(&xiuvr3a_inbound("no-such-proto", "t-unsup", serde_json::json!({})))
+            .await
+            .expect("unsupported kind must warn-skip, not error");
+        assert!(res.is_none(), "unsupported kind must not spawn a serve task");
+        assert!(rt.contains("t-unsup"), "slot stays registered after warn-skip");
+        assert!(matches!(rt.user_manager("t-unsup"), Err(ProxymanError::NotUserManager)));
+
+        // 摘除配对：命中一次后二次摘除 = HandlerNotFound（miss 路径也对照）。
+        rt.remove_inbound("t-unsup").expect("registered tag must remove");
+        assert!(!rt.contains("t-unsup"));
+        assert!(matches!(rt.remove_inbound("t-unsup"), Err(ProxymanError::HandlerNotFound(_))));
+
+        // 畸形 settings（非法 JSON）经 loopback builder：parse_loopback_config
+        // `?` 上抛 → start_inbound Err → 回滚 ⇒ contains 必 false。
+        let bad = BuiltInbound {
+            entry: xray_conf::BuiltEntry {
+                kind: "loopback".to_string(),
+                data: b"not json".to_vec(),
+            },
+            tag: "t-bad".to_string(),
+            port: Some(0),
+            listen: Some("127.0.0.1".to_string()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        };
+        assert!(rt.start_inbound(&bad).await.is_err(), "malformed settings must fail");
+        assert!(!rt.contains("t-bad"), "failed spawn must roll back the slot");
+    }
+
+    /// xiuvr-3a：切 BoundedRegistry 后注册表行为回归——全部 19 键 × 3 配置变体
+    /// （最小 / 带 streamSettings / 畸形）。
+    ///
+    /// 独立硬编码期望（防"两路一起错"）：
+    /// - 畸形（data = 非法 JSON）逐键硬锚：blackhole 的 response 解析吞错取 默认（Go 兼容语义）→ Ok
+    ///   登记；其余 18 键 builder parse `?` 上抛 → Err 回滚。
+    /// - 派生不变量（与成败无关恒成立）：start Ok ⇒ contains=true 且可摘除； Err ⇒ contains=false。
+    /// - D1 落地回归：list() 恒 tag 升序（BTreeMap 确定序）。
+    #[tokio::test]
+    async fn xiuvr3a_registry_behaviour_matrix_19kinds_x3variants() {
+        /// 阶段 1 权威全集（arm_builders INBOUND_CTORS 18 + tun 特殊分支）。
+        const KINDS: [&str; 19] = [
+            "socks",
+            "mixed",
+            "vless",
+            "trojan",
+            "vmess",
+            "http",
+            "dokodemo",
+            "shadowsocks",
+            "hysteria",
+            "hysteria2",
+            "anytls",
+            "tuic",
+            "naive",
+            "wireguard",
+            "dns",
+            "loopback",
+            "blackhole",
+            "freedom",
+            "tun",
+        ];
+        let rt = xiuvr3a_runtime();
+
+        fn minimal_settings(kind: &str) -> serde_json::Value {
+            match kind {
+                "dokodemo" => serde_json::json!({"address": "1.2.3.4", "port": 80}),
+                "loopback" => serde_json::json!({"inboundTag": "in-main"}),
+                _ => serde_json::json!({}),
+            }
+        }
+
+        /// 启动后按派生不变量断言登记状态，Ok 路径清理。
+        async fn assert_start_then_clean(
+            rt: &InboundRuntime,
+            kind: &str,
+            tag: &str,
+            ib: &BuiltInbound,
+        ) {
+            let res = rt.start_inbound(ib).await;
+            match res {
+                Ok(_) => {
+                    assert!(rt.contains(tag), "{kind}: Ok ⇒ slot registered");
+                    if let Err(e) = rt.remove_inbound(tag) {
+                        panic!("{kind}: registered tag must remove, got {e}");
+                    }
+                },
+                Err(_) => {
+                    assert!(!rt.contains(tag), "{kind}: Err ⇒ slot rolled back");
+                },
+            }
+            assert!(!rt.contains(tag), "{kind}: table must be empty after cleanup");
+        }
+
+        // 变体 1：最小配置（成败混合，派生不变量逐键成立）。
+        for kind in KINDS {
+            let tag = format!("t-min-{kind}");
+            let ib = xiuvr3a_inbound(kind, &tag, minimal_settings(kind));
+            assert_start_then_clean(&rt, kind, &tag, &ib).await;
+        }
+        assert!(rt.list().is_empty(), "variant 1 leaves no residue");
+
+        // 变体 2：最小 + streamSettings（registry 语义与协议解析同构对照）。
+        for kind in KINDS {
+            let tag = format!("t-stream-{kind}");
+            let mut ib = xiuvr3a_inbound(kind, &tag, minimal_settings(kind));
+            ib.stream_settings_json = Some(serde_json::json!({"network": "tcp"}));
+            assert_start_then_clean(&rt, kind, &tag, &ib).await;
+        }
+        assert!(rt.list().is_empty(), "variant 2 leaves no residue");
+
+        // 变体 3：畸形（非法 JSON）——逐键硬编码期望。
+        for kind in KINDS {
+            let tag = format!("t-bad-{kind}");
+            let mut ib = xiuvr3a_inbound(kind, &tag, serde_json::json!({}));
+            ib.entry.data = b"not json".to_vec();
+            let res = rt.start_inbound(&ib).await;
+            if kind == "blackhole" {
+                assert!(res.is_ok(), "blackhole swallows parse errors (Go-compat default)");
+                if let Err(e) = rt.remove_inbound(&tag) {
+                    panic!("blackhole: Ok ⇒ registered, remove failed: {e}");
+                }
+            } else {
+                assert!(res.is_err(), "{kind}: illegal JSON must err at parse");
+                assert!(!rt.contains(&tag), "{kind}: Err ⇒ slot rolled back");
+            }
+        }
+        assert!(rt.list().is_empty(), "variant 3 leaves no residue");
+
+        // D1 落地回归——list() 恒 tag 升序（插 zz 再插 aa，输出 aa,zz）。
+        let _ = rt
+            .start_inbound(&xiuvr3a_inbound("blackhole", "zz-order", serde_json::json!({})))
+            .await
+            .expect("blackhole minimal registers");
+        let _ = rt
+            .start_inbound(&xiuvr3a_inbound("blackhole", "aa-order", serde_json::json!({})))
+            .await
+            .expect("blackhole minimal registers");
+        let tags: Vec<String> = rt.list().into_iter().map(|(tag, _)| tag).collect();
+        assert_eq!(tags, vec!["aa-order", "zz-order"], "list() must be tag-ascending (D1)");
+        rt.remove_inbound("aa-order").expect("cleanup");
+        rt.remove_inbound("zz-order").expect("cleanup");
+        assert!(rt.list().is_empty());
     }
 }

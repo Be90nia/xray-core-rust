@@ -27,9 +27,19 @@ use crate::outbound::{
 
 /// freedom 出站构造（T4.2 phase 1 自 inbound.rs/outbound.rs 臂内原样搬迁；
 /// dialerProxy/finalRules/入站默认规则语义见行内注释，行为零变化）。
+// 8/7 参豁免台账（L2 能力句柄注入后越线）：参数 = OutboundCtx 装配面一一映射
+// （Go freedom 装配点同构）——7 个拨号/装配配置（类型与生命周期各异）+ 1 个
+// L2 能力句柄。仅一个 Arc 句柄，无同类项可归组；打包结构体只在唯一调用方
+// freedom_entry 引入零收益间接层（Ctx 本身已是打包形态），且牵动同族 7 个
+// builder 签名。故 allow + 台账（仓规：豁免一律显式 allow + 理由）。
 #[allow(clippy::type_complexity)] // 返回三组件装配形态（与 wrap_bridge 同型）
+#[allow(
+    clippy::too_many_arguments,
+    reason = "8/7 参：装配面参数集无同类项可归组，拆包零收益（见上台账）"
+)]
 pub(crate) fn build_freedom_outbound(
     ob: &BuiltOutbound,
+    plugin_ctx: Arc<xray_frame::PluginContext>,
     proxy_chain_tag: Option<String>,
     target_strategy: Option<DomainStrategy>,
     dns: Option<&Arc<xray_app_dns::DnsService>>,
@@ -108,7 +118,7 @@ pub(crate) fn build_freedom_outbound(
     // 的唯一置 1 点——DialBridge 桥接判定处据此放行 splice 快路径准入。
     tcp_bridge.set_splice_outbound(true);
     let mut bridge =
-        xray_proxy_freedom::FreedomDispatchBridge::from_bridge(Arc::clone(&tcp_bridge))
+        xray_proxy_freedom::FreedomDispatchBridge::from_bridge(plugin_ctx, Arc::clone(&tcp_bridge))
             .with_noises(noises)
             .with_destination_override(destination_override)
             .with_final_rules(final_rules)
@@ -258,6 +268,7 @@ pub(crate) fn build_mux_outbound(
 #[allow(clippy::type_complexity)] // 返回三组件装配形态（与 wrap_bridge 同型）
 pub(crate) fn build_vmess_outbound(
     ob: &BuiltOutbound,
+    plugin_ctx: Arc<xray_frame::PluginContext>,
     proxy_chain_tag: Option<String>,
     target_strategy: Option<DomainStrategy>,
     dns: Option<&Arc<xray_app_dns::DnsService>>,
@@ -269,7 +280,7 @@ pub(crate) fn build_vmess_outbound(
 > {
     let config = xray_proxy_vmess::parse_vmess_config(&ob.entry.data)?;
     let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
-    let dial_fn = xray_proxy_vmess::make_vmess_dial_fn(Arc::new(config));
+    let dial_fn = xray_proxy_vmess::make_vmess_dial_fn(Arc::new(config), plugin_ctx);
     wrap_bridge(
         ob.tag.clone(),
         dial_fn,
@@ -284,6 +295,7 @@ pub(crate) fn build_vmess_outbound(
 #[allow(clippy::type_complexity)] // 返回三组件装配形态（与 wrap_bridge 同型）
 pub(crate) fn build_shadowsocks_outbound(
     ob: &BuiltOutbound,
+    plugin_ctx: Arc<xray_frame::PluginContext>,
     proxy_chain_tag: Option<String>,
     target_strategy: Option<DomainStrategy>,
     dns: Option<&Arc<xray_app_dns::DnsService>>,
@@ -295,7 +307,7 @@ pub(crate) fn build_shadowsocks_outbound(
 > {
     let config = xray_proxy_ss::parse_ss_config(&ob.entry.data)?;
     let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
-    let dial_fn = xray_proxy_ss::make_ss_dial_fn(Arc::new(config));
+    let dial_fn = xray_proxy_ss::make_ss_dial_fn_with_ctx(Arc::new(config), plugin_ctx);
     wrap_bridge(
         ob.tag.clone(),
         dial_fn,
@@ -310,6 +322,7 @@ pub(crate) fn build_shadowsocks_outbound(
 #[allow(clippy::type_complexity)] // 返回三组件装配形态（与 wrap_bridge 同型）
 pub(crate) fn build_hysteria_outbound(
     ob: &BuiltOutbound,
+    plugin_ctx: Arc<xray_frame::PluginContext>,
     proxy_chain_tag: Option<String>,
     target_strategy: Option<DomainStrategy>,
     dns: Option<&Arc<xray_app_dns::DnsService>>,
@@ -368,7 +381,8 @@ pub(crate) fn build_hysteria_outbound(
     // QUIC 端点缓冲：streamSettings.sockopt（缺省 = 8MB 下限语义）。
     .with_sockopt(stream_settings.socket_options())
     .with_obfs(obfs);
-    let dial_fn = xray_proxy_hysteria::make_hysteria_dial_fn(config, Arc::new(transport));
+    let dial_fn =
+        xray_proxy_hysteria::make_hysteria_dial_fn(config, Arc::new(transport), plugin_ctx);
     wrap_bridge(
         ob.tag.clone(),
         dial_fn,
@@ -383,6 +397,7 @@ pub(crate) fn build_hysteria_outbound(
 #[allow(clippy::type_complexity)] // 返回三组件装配形态（与 wrap_bridge 同型）
 pub(crate) fn build_anytls_outbound(
     ob: &BuiltOutbound,
+    plugin_ctx: Arc<xray_frame::PluginContext>,
     proxy_chain_tag: Option<String>,
     target_strategy: Option<DomainStrategy>,
     dns: Option<&Arc<xray_app_dns::DnsService>>,
@@ -399,7 +414,8 @@ pub(crate) fn build_anytls_outbound(
     let sockopt =
         xray_transport::dialer::StreamSettings::from_json(ob.stream_settings_json.as_ref())
             .socket_options();
-    let client = Arc::new(xray_proxy_anytls::AnytlsClient::new(config.with_sockopt(sockopt)));
+    let client =
+        Arc::new(xray_proxy_anytls::AnytlsClient::new(config.with_sockopt(sockopt), plugin_ctx));
     let dial_fn = xray_proxy_anytls::make_anytls_dial_fn(client);
     wrap_bridge(
         ob.tag.clone(),
@@ -415,6 +431,7 @@ pub(crate) fn build_anytls_outbound(
 #[allow(clippy::type_complexity)] // 返回三组件装配形态（与 wrap_bridge 同型）
 pub(crate) fn build_tuic_outbound(
     ob: &BuiltOutbound,
+    plugin_ctx: Arc<xray_frame::PluginContext>,
     proxy_chain_tag: Option<String>,
     target_strategy: Option<DomainStrategy>,
     dns: Option<&Arc<xray_app_dns::DnsService>>,
@@ -469,6 +486,7 @@ pub(crate) fn build_tuic_outbound(
         s.password.clone(),
         Arc::clone(&rustls_config),
         options.clone(),
+        plugin_ctx,
     );
     // TCP 走 DialBridge（targetStrategy/sendThrough 经 dial_fn 包装）；
     // UDP 票 z9gp：XUDP 帧 ↔ TuicUdpAssoc（quic uni-stream / native datagram
@@ -504,6 +522,7 @@ pub(crate) fn build_tuic_outbound(
 #[allow(clippy::type_complexity)] // 返回三组件装配形态（与 wrap_bridge 同型）
 pub(crate) fn build_wireguard_outbound(
     ob: &BuiltOutbound,
+    plugin_ctx: Arc<xray_frame::PluginContext>,
     proxy_chain_tag: Option<String>,
     target_strategy: Option<DomainStrategy>,
     dns: Option<&Arc<xray_app_dns::DnsService>>,
@@ -546,7 +565,12 @@ pub(crate) fn build_wireguard_outbound(
                     >
             }) as xray_app_dispatcher::default::DialFn
         });
-    let dial_fn = xray_proxy_wireguard::make_wireguard_dial_fn(config, dns.cloned(), system_dialer);
+    let dial_fn = xray_proxy_wireguard::make_wireguard_dial_fn(
+        config,
+        dns.cloned(),
+        system_dialer,
+        plugin_ctx,
+    );
     wrap_bridge(
         ob.tag.clone(),
         dial_fn,
@@ -708,6 +732,7 @@ use crate::arm_builders::{OutboundCtx, OutboundResult};
 pub(crate) fn freedom_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResult {
     build_freedom_outbound(
         ctx.ob,
+        Arc::new(ctx.plugin_ctx),
         ctx.proxy_chain_tag,
         ctx.target_strategy,
         ctx.dns,
@@ -762,6 +787,7 @@ pub(crate) fn mux_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResult {
 pub(crate) fn vmess_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResult {
     build_vmess_outbound(
         ctx.ob,
+        Arc::new(ctx.plugin_ctx),
         ctx.proxy_chain_tag,
         ctx.target_strategy,
         ctx.dns,
@@ -773,6 +799,7 @@ pub(crate) fn vmess_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResult {
 pub(crate) fn shadowsocks_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResult {
     build_shadowsocks_outbound(
         ctx.ob,
+        Arc::new(ctx.plugin_ctx),
         ctx.proxy_chain_tag,
         ctx.target_strategy,
         ctx.dns,
@@ -784,6 +811,7 @@ pub(crate) fn shadowsocks_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundRes
 pub(crate) fn hysteria_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResult {
     build_hysteria_outbound(
         ctx.ob,
+        Arc::new(ctx.plugin_ctx),
         ctx.proxy_chain_tag,
         ctx.target_strategy,
         ctx.dns,
@@ -795,6 +823,7 @@ pub(crate) fn hysteria_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResult
 pub(crate) fn anytls_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResult {
     build_anytls_outbound(
         ctx.ob,
+        Arc::new(ctx.plugin_ctx),
         ctx.proxy_chain_tag,
         ctx.target_strategy,
         ctx.dns,
@@ -806,6 +835,7 @@ pub(crate) fn anytls_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResult {
 pub(crate) fn tuic_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResult {
     build_tuic_outbound(
         ctx.ob,
+        Arc::new(ctx.plugin_ctx),
         ctx.proxy_chain_tag,
         ctx.target_strategy,
         ctx.dns,
@@ -817,6 +847,7 @@ pub(crate) fn tuic_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResult {
 pub(crate) fn wireguard_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResult {
     build_wireguard_outbound(
         ctx.ob,
+        Arc::new(ctx.plugin_ctx),
         ctx.proxy_chain_tag,
         ctx.target_strategy,
         ctx.dns,

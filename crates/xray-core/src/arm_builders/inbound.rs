@@ -116,11 +116,12 @@ pub(crate) async fn build_vless_inbound(
     policy: Option<Arc<dyn xray_features::policy::PolicyManager>>,
     shutdown_token: CancellationToken,
     addr: &str,
+    plugin_ctx: std::sync::Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let validator: Arc<dyn VlessValidator> = build_vless_validator(&ib.entry.data)?;
     // ENC decryption（Go inbound.go:104-114 handler.decryption）：settings
     // 级 "mlkem768x25519plus.*" 字符串 → handler 级共享 ServerInstance。
-    let decryption = build_vless_decryption(&ib.entry.data)?;
+    let decryption = build_vless_decryption(&ib.entry.data, plugin_ctx)?;
     let mut options = VlessInboundOptions {
         decryption: decryption.clone(),
         // sm80④：policy Timeouts.Handshake 下传（Go inbound.go:281-284）
@@ -191,6 +192,7 @@ pub(crate) async fn build_trojan_inbound(
     policy: Option<Arc<dyn xray_features::policy::PolicyManager>>,
     shutdown_token: CancellationToken,
     addr: &str,
+    plugin_ctx: std::sync::Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let users = build_trojan_users(&ib.entry.data)?;
     // Trojan fallback：解析 JSON fallbacks 数组构建决策树
@@ -252,8 +254,16 @@ pub(crate) async fn build_trojan_inbound(
             .with_tcpmask_manager(inbound_tcpmask(&settings)?);
         tracing::info!(tag = %ib.tag, addr = %addr, users = users.len(), tls = tls.is_some(), "trojan inbound listening");
         Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-            serve_trojan(listener, ohm, users, fallbacks, tls, handshake_timeout_for(&policy, 0))
-                .await
+            serve_trojan(
+                plugin_ctx,
+                listener,
+                ohm,
+                users,
+                fallbacks,
+                tls,
+                handshake_timeout_for(&policy, 0),
+            )
+            .await
         })))
     }
 }
@@ -264,6 +274,7 @@ pub(crate) async fn build_vmess_inbound(
     policy: Option<Arc<dyn xray_features::policy::PolicyManager>>,
     shutdown_token: CancellationToken,
     addr: &str,
+    plugin_ctx: std::sync::Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let validator = build_vmess_validator(&ib.entry.data)?;
     let settings =
@@ -294,7 +305,15 @@ pub(crate) async fn build_vmess_inbound(
             .with_tcpmask_manager(inbound_tcpmask(&settings)?);
         tracing::info!(tag = %ib.tag, addr = %addr, tls = tls.is_some(), "vmess inbound listening");
         Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-            serve_vmess(listener, ohm, validator, tls, handshake_timeout_for(&policy, 0)).await
+            serve_vmess(
+                plugin_ctx,
+                listener,
+                ohm,
+                validator,
+                tls,
+                handshake_timeout_for(&policy, 0),
+            )
+            .await
         })))
     }
 }
@@ -877,15 +896,36 @@ pub(crate) fn mixed_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
 }
 
 pub(crate) fn vless_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
-    Box::pin(build_vless_inbound(ctx.ib, ctx.ohm, ctx.policy, ctx.shutdown_token, ctx.addr))
+    Box::pin(build_vless_inbound(
+        ctx.ib,
+        ctx.ohm,
+        ctx.policy,
+        ctx.shutdown_token,
+        ctx.addr,
+        Arc::new(ctx.plugin_ctx),
+    ))
 }
 
 pub(crate) fn trojan_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
-    Box::pin(build_trojan_inbound(ctx.ib, ctx.ohm, ctx.policy, ctx.shutdown_token, ctx.addr))
+    Box::pin(build_trojan_inbound(
+        ctx.ib,
+        ctx.ohm,
+        ctx.policy,
+        ctx.shutdown_token,
+        ctx.addr,
+        Arc::new(ctx.plugin_ctx),
+    ))
 }
 
 pub(crate) fn vmess_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
-    Box::pin(build_vmess_inbound(ctx.ib, ctx.ohm, ctx.policy, ctx.shutdown_token, ctx.addr))
+    Box::pin(build_vmess_inbound(
+        ctx.ib,
+        ctx.ohm,
+        ctx.policy,
+        ctx.shutdown_token,
+        ctx.addr,
+        Arc::new(ctx.plugin_ctx),
+    ))
 }
 
 pub(crate) fn http_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
