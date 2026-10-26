@@ -203,10 +203,11 @@ mod tests {
                     Ok(mb) => mb,
                     Err(_) => return,
                 };
-                // XUDP 首帧解析需要连续字节：P1 收口点（UDP 小包 relay bench，oracle §7 Phase 1）
-                #[allow(clippy::disallowed_methods)] // XUDP 首帧需连续字节，P1 收口点登记
-                let bytes = mb.to_vec();
-                let mut cursor = std::io::Cursor::new(&bytes[..]);
+                // q1r4q：首帧直接在 MultiBuffer 片段链上解析——PacketReader 本就
+                // 泛型 over R: Read，ChainCursor 把片段链暴露为流，免 to_vec 摊平
+                //（原 P1 收口点：UDP 小包 relay bench，oracle §7 Phase 1）。
+                let bufs = mb.into_buffers();
+                let mut cursor = ChainCursor::new(&bufs);
                 let mut pr = PacketReader::new(&mut cursor);
                 let pkt = match pr.read_packet() {
                     Ok(Some(p)) => p,
@@ -232,6 +233,43 @@ mod tests {
 
     fn udp_dest(ip: [u8; 4], port: u16) -> Destination {
         Destination::udp(Address::IPv4(Ipv4Addr::from(ip)), Port::new(port))
+    }
+
+    /// q1r4q：把不连续 Buffer 片段链暴露为 `io::Read`，让 `PacketReader`
+    /// （`R: Read` 泛型）跨片段解析，免 to_vec 摊平拷贝。持 `&[Buffer]`
+    /// 单一借用（而非 Vec<&[u8]> scratch）：解析尝试之间会 advance/drain
+    /// `accum`，单借用随解析块结束即失效，不与突变冲突。
+    struct ChainCursor<'a> {
+        bufs: &'a [xray_buf::buffer::Buffer],
+        idx: usize,
+        off: usize,
+        /// 全局已消费字节数（帧累积消费 advance/drain 的依据）。
+        pos: usize,
+    }
+
+    impl<'a> ChainCursor<'a> {
+        fn new(bufs: &'a [xray_buf::buffer::Buffer]) -> Self {
+            Self { bufs, idx: 0, off: 0, pos: 0 }
+        }
+    }
+
+    impl io::Read for ChainCursor<'_> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            // 跳过耗尽的片段（含零长片段）
+            while self.idx < self.bufs.len() && self.off >= self.bufs[self.idx].len() {
+                self.idx += 1;
+                self.off = 0;
+            }
+            if out.is_empty() || self.idx == self.bufs.len() {
+                return Ok(0); // EOF：read_exact 转 UnexpectedEof（半帧语义不变）
+            }
+            let cur = self.bufs[self.idx].bytes();
+            let n = cur.len().saturating_sub(self.off).min(out.len());
+            out[..n].copy_from_slice(&cur[self.off..self.off + n]);
+            self.off += n;
+            self.pos += n;
+            Ok(n)
+        }
     }
 
     #[tokio::test]
@@ -262,22 +300,24 @@ mod tests {
                     use xray_buf::io::{Reader, Writer};
                     let mut reader = link.reader;
                     let mut writer = link.writer;
-                    let mut accum: Vec<u8> = Vec::new();
+                    // q1r4q：Buffer 片段链累积（原 Vec 连续化 + to_vec+extend 双拷贝，
+                    // P1 收口点：udp relay bench 轮次）
+                    let mut accum: Vec<_> = Vec::new();
                     loop {
                         let mb = match reader.read_multi_buffer().await {
                             Ok(mb) => mb,
                             Err(_) => break,
                         };
-                        // XUDP 帧累积解析：P1 收口点（同上，udp relay bench 轮次）
-                        #[allow(clippy::disallowed_methods)] // XUDP 帧累积需连续字节，P1 收口点登记
-                        let flat = mb.to_vec();
-                        accum.extend_from_slice(&flat);
+                        accum.extend(mb.into_buffers());
                         loop {
-                            let mut cursor = std::io::Cursor::new(&accum[..]);
-                            let mut pr = PacketReader::new(&mut cursor);
-                            match pr.read_packet() {
+                            let (r, consumed) = {
+                                let mut cursor = ChainCursor::new(&accum);
+                                let mut pr = PacketReader::new(&mut cursor);
+                                let r = pr.read_packet();
+                                (r, cursor.pos)
+                            };
+                            match r {
                                 Ok(Some(pkt)) => {
-                                    let consumed = cursor.position() as usize;
                                     let (data, target) = pkt.into_parts();
                                     if let Some(t) = target {
                                         captured.lock().push((t, data));
@@ -297,7 +337,21 @@ mod tests {
                                             break;
                                         }
                                     }
-                                    accum.drain(..consumed);
+                                    // 消费已解析前缀：整 Buffer 弹出、半 Buffer advance
+                                    //（指针级前进，免字节级 drain 搬移；qyn8 语义不变）
+                                    let mut left = consumed;
+                                    let mut done = 0;
+                                    while left > 0 {
+                                        let l = accum[done].len();
+                                        if l <= left {
+                                            done += 1;
+                                            left -= l;
+                                        } else {
+                                            accum[done].advance(left);
+                                            left = 0;
+                                        }
+                                    }
+                                    accum.drain(..done);
                                 },
                                 _ => break,
                             }
@@ -376,5 +430,140 @@ mod tests {
             spin.is_err(),
             "recv_packet must block after draining bad frame (busy-spin regression)"
         );
+    }
+
+    /// q1r4q 回归钉：同一 UDP 帧流按不同分段方式（单段/碎片边界任意错位）
+    /// 经片段链重组解析，结果逐字节相同（帧数/载荷/target 全等）。
+    #[test]
+    fn chain_parse_reassembly_is_segmentation_invariant() {
+        let build_frame = |payload: &[u8], ip: [u8; 4]| -> Vec<u8> {
+            let mut f = Vec::new();
+            FrameMetadata::new_udp(udp_dest(ip, 53).address().clone(), Port::new(53), [7u8; 8])
+                .write_to(&mut f)
+                .unwrap();
+            f.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            f.extend_from_slice(payload);
+            f
+        };
+        let mut stream = build_frame(b"first-payload", [8, 8, 8, 8]);
+        stream.extend_from_slice(&build_frame(b"p2", [1, 0, 0, 1]));
+
+        let to_bufs = |chunks: &[&[u8]]| -> Vec<xray_buf::buffer::Buffer> {
+            // from_vec = Frozen 语义：非池来源永不回池，无假池污染面
+            chunks.iter().map(|c| xray_buf::buffer::Buffer::from_vec(c.to_vec())).collect()
+        };
+        let parse_all =
+            |bufs: &[xray_buf::buffer::Buffer]| -> Vec<(Vec<u8>, Option<Destination>)> {
+                let mut cursor = ChainCursor::new(bufs);
+                let mut pr = PacketReader::new(&mut cursor);
+                let mut got = Vec::new();
+                while let Ok(Some(pkt)) = pr.read_packet() {
+                    got.push(pkt.into_parts());
+                }
+                got
+            };
+
+        let whole = parse_all(&to_bufs(&[&stream]));
+        assert_eq!(whole.len(), 2, "两条帧都应解出");
+
+        // 3 字节碎片：片段边界与帧边界错位
+        let frags: Vec<&[u8]> = stream.chunks(3).collect();
+        assert_eq!(parse_all(&to_bufs(&frags)), whole, "3 字节碎片重组必须逐字节一致");
+
+        // 1 字节 + 剩余：切进 2B 长度头内部
+        let head1 = [&stream[..1], &stream[1..]];
+        assert_eq!(parse_all(&to_bufs(&head1)), whole, "1 字节分段重组必须逐字节一致");
+
+        // 对半切
+        let half = stream.len() / 2;
+        let halves = [&stream[..half], &stream[half..]];
+        assert_eq!(parse_all(&to_bufs(&halves)), whole, "对半分段重组必须逐字节一致");
+    }
+
+    // ── q1r4q 分配取证：线程归属计数分配器（libtest 并行下他线程分配不串扰）──
+
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static THREAD_ALLOCS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    struct CountingAlloc;
+
+    unsafe impl GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // try_with：TLS 析构期分配无法归属任何线程，跳过记账（分配器内禁 panic）
+            let _ = THREAD_ALLOCS.try_with(|c| c.set(c.get() + 1));
+            // SAFETY: 透传 System，布局合法性由 GlobalAlloc 契约保证
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: 指针/布局配对由 GlobalAlloc 契约保证
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static Q1R4Q_ALLOC: CountingAlloc = CountingAlloc;
+
+    /// q1r4q 分配取证：同一帧流上旧路径（to_vec 摊平 + Cursor）与新路径
+    /// （片段链直读）的每包堆分配次数对比。数据帧到达本身（池化 Buffer
+    /// 移交）在两路径下都零分配，已在窗口外构造以排除干扰。
+    // lib.rs:8 的 warn(print_stdout) 排在 :7 test 级 allow 之后将其覆盖，
+    // 本测试取证数字须打印——按仓规显式 allow + 理由。
+    #[allow(clippy::print_stdout)]
+    #[test]
+    fn chain_parse_allocs_per_packet_drop() {
+        const PACKETS: usize = 128;
+        let mut stream = Vec::new();
+        for i in 0..PACKETS {
+            let mut f = Vec::new();
+            FrameMetadata::new_udp(
+                udp_dest([10, 0, 0, (i % 254 + 1) as u8], 53).address().clone(),
+                Port::new(53),
+                [i as u8; 8],
+            )
+            .write_to(&mut f)
+            .unwrap();
+            f.extend_from_slice(&16u16.to_be_bytes());
+            f.extend_from_slice(&[0u8; 16]);
+            stream.extend_from_slice(&f);
+        }
+
+        let before = THREAD_ALLOCS.with(|c| c.get());
+        // 旧路径（改前 CaptureHandler 每读一轮）：to_vec 摊平 + Cursor 重扫
+        for _ in 0..PACKETS {
+            let flat = stream.clone(); // ≙ mb.to_vec()：整帧堆分配 + 拷贝
+            let mut cursor = std::io::Cursor::new(&flat[..]);
+            let mut pr = PacketReader::new(&mut cursor);
+            assert!(pr.read_packet().is_ok_and(|o| o.is_some()));
+        }
+        let old_allocs = THREAD_ALLOCS.with(|c| c.get()) - before;
+
+        // 新路径（改后）：到达帧 = Buffer 移交（窗口外预构造），链上直读
+        let arrived: Vec<_> = (0..PACKETS)
+            .map(|_| xray_buf::buffer::Buffer::from_vec(stream.clone()))
+            .collect();
+        let mut bufs: Vec<xray_buf::buffer::Buffer> = Vec::new();
+        let before = THREAD_ALLOCS.with(|c| c.get());
+        for buf in arrived {
+            bufs.clear();
+            bufs.push(buf);
+            let parsed = {
+                let mut cursor = ChainCursor::new(&bufs);
+                let mut pr = PacketReader::new(&mut cursor);
+                pr.read_packet().is_ok_and(|o| o.is_some())
+            };
+            assert!(parsed);
+        }
+        let new_allocs = THREAD_ALLOCS.with(|c| c.get()) - before;
+
+        let old_pp = old_allocs / PACKETS;
+        let new_pp = new_allocs / PACKETS;
+        println!("q1r4q per-packet allocs: old(to_vec+Cursor)={old_pp} new(chain)={new_pp}");
+        assert_eq!(old_pp, 3, "旧路径每包 3 次分配（to_vec + reader scratch + 载荷 Vec）");
+        assert_eq!(new_pp, 2, "新路径每包 2 次分配（摊平分配已删，剩 scratch + 载荷）");
     }
 }
