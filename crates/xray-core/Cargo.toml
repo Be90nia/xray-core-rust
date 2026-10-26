@@ -7,7 +7,9 @@ rust-version.workspace = true
 
 [features]
 # T1.1：Instance::close 停机编排走 udf ShutdownCoordinator（默认开）；关 = 旧逆序
-# close 循环（无超时/无 panic 隔离）。shutdown 域 std-only 零 feature——
+# close 循环（无超时/无 panic 隔离）。W1-1b 起 Instance::start 启动编排
+# （xray-frame assembly::Framework bring_up，失败逆序回滚）随同一门：关 = 旧
+# 注册序循环。shutdown 域 std-only 零 feature——
 # default-features = false 避开 runtime/pool 默认档拖入运行时面。
 default = ["shutdown-coordinator"]
 # W1-1a：xray-frame 转为**必需依赖**——生产构造路径经其 PluginRegistry（见

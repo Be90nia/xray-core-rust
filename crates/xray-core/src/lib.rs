@@ -48,6 +48,10 @@ mod arm_builders;
 pub(crate) mod arm_registry;
 pub mod config;
 pub mod context;
+// W1-1b：Instance::start 启动编排桥（feature 门 `shutdown-coordinator`，默认开；
+// 关=旧注册序循环）。与 shutdown_bridge 同门：框架编排路径的开/关。
+#[cfg(feature = "shutdown-coordinator")]
+mod feature_framework;
 pub mod functions;
 pub mod grpc_server;
 pub mod inbound;

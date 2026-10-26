@@ -270,8 +270,11 @@ impl Instance {
 
     /// 启动实例：标记为运行态，按注册顺序调用所有 feature 的 `start`。
     ///
-    /// 任一 feature 启动失败会立即返回错误，**已启动的 feature 不回滚**
-    /// （与 Go 行为一致，由调用方决定是否 `close` 兜底）。
+    /// 启动编排（feature `shutdown-coordinator`，默认开）交 xray-frame
+    /// `assembly::Framework`：任一 feature 启动失败 → 已启动者**逆序回滚**
+    /// （stop → close）+ `running` 复位，返回错误（框架 P0-4 拍板语义；
+    /// Go 原语义「失败不回滚」废止——半启动实例不外泄）。
+    /// 关 = 旧注册序循环：失败不回滚（与 Go 一致，由调用方决定是否 `close` 兜底）。
     ///
     /// 重复 `start` 不会重新调用 feature.start（仅切换 running 标志）。
     pub fn start(&mut self) -> Result<()> {
@@ -283,8 +286,21 @@ impl Instance {
         // 注意：Go 是先调用 Start 再设 running；这里把 running 设到 start 调用前
         // 是为了让本批 features 的 Start 内部若有 add_feature 也能立即启动。
         self.running = true;
-        for feat in &self.features {
-            feat.start()?;
+        #[cfg(feature = "shutdown-coordinator")]
+        {
+            // W1-1b：启动编排权交 xray-frame（Feature→Plugin 适配壳 + Framework
+            // register→build→bring_up）。失败路径已由框架回滚关停已启动者，
+            // running 复位 false。
+            if let Err(e) = crate::feature_framework::bring_up_features(&self.features) {
+                self.running = false;
+                return Err(e);
+            }
+        }
+        #[cfg(not(feature = "shutdown-coordinator"))]
+        {
+            for feat in &self.features {
+                feat.start()?;
+            }
         }
         // 注意：本方法只启动 feature，inbound listener 由调用方随后绑定
         // （functions.rs::start_full_dispatched → spawn_inbounds）。此日志若写成
