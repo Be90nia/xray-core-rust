@@ -42,6 +42,10 @@ def tracked_configs() -> list[Path]:
         ["git", "ls-files", "*.json"], cwd=REPO, capture_output=True, text=True, check=True
     ).stdout
     paths = [REPO / line for line in out.splitlines() if line]
+    # 排除测试夹具：本门守的是「**随包发布**的配置引用了不存在的资产」（发版拦必然运行期
+    # 故障），`tests/**/fixtures/**` 是不出包的测试输入（其中刻意构造了各种引用形态，
+    # 如 crates/xray-conf/tests/fixtures/shadow/）。改动此边界需同步评估门语义。
+    paths = [p for p in paths if "fixtures" not in p.parts]
     return [p for p in paths if p.is_file()]
 
 
