@@ -17,15 +17,15 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures_util::TryStreamExt;
 use http::{HeaderMap, HeaderValue};
 use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
 use hyper::{Method, Request, Response, StatusCode, body::Frame};
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
-use tokio_util::io::ReaderStream;
-use xray_common::alloc_site;
 
-use super::{HubConnHandler, ServerConn, ServerConnCloseSignal, SessionMap, meta::extract_meta};
+use super::{
+    HubConnHandler, ServerConn, ServerConnCloseSignal, SessionMap, dl_stream::DlStream,
+    meta::extract_meta,
+};
 use crate::{
     config::{
         Config, PLACEMENT_AUTO, PLACEMENT_BODY, PLACEMENT_COOKIE, PLACEMENT_HEADER,
@@ -47,7 +47,7 @@ pub struct HandlerContext {
     pub sc_max_each_post_bytes: usize,
 }
 
-const DUPLEX_BUF: usize = 64 * 1024;
+pub(super) const DUPLEX_BUF: usize = 64 * 1024;
 
 /// packet-up 单请求 liveness 兜底：body 收取 / queue push 卡死时超时回错误状态，
 /// 避免整条 h2 连接静默挂死（r2lq）。
@@ -401,21 +401,12 @@ where
         sid: session_id.to_string(),
         close_signal: Some(close_signal),
     });
-    // with_capacity(64KB)：tokio-util 默认容量 4096B 会把 DATA 帧粒度钉死在
-    // 4KB——高 RTT 路径（CF tunnel）帧数/唤醒数放大 ~16x，是 xhttp 吞吐缺陷主因。
+    // 读块 64 KiB：tokio-util 默认容量 4096B 会把 DATA 帧粒度钉死在 4KB——高
+    // RTT 路径（CF tunnel）帧数/唤醒数放大 ~16x，是 xhttp 吞吐缺陷主因。
     // 对照 Go：dispatcher MultiBuffer 合并写 + httpServerConn.Write 每写即 Flush。
-    let mut dl_stream =
-        ReaderStream::with_capacity(GuardedReader { inner: dl_rx, _guard: guard }, DUPLEX_BUF);
-    // 站点归因（z02z8）：守卫包住逐帧产出段（ReaderStream 每帧 BytesMut 缓冲）；
-    // hyper 自身 DATA 帧缓冲在本守卫动态范围之外，仍归"未标记"。
-    let body = StreamBody::new(
-        futures_util::stream::poll_fn(move |cx| {
-            let _site = alloc_site::enter(alloc_site::XHTTP_SRV_SEND);
-            futures_util::StreamExt::poll_next_unpin(&mut dl_stream, cx)
-        })
-        .map_ok(Frame::data),
-    )
-    .boxed();
+    // 池化读块（票 r1693）：每帧不再新分配 64 KiB 缓冲，站点归因随之收敛。
+    let body =
+        StreamBody::new(DlStream::new(GuardedReader { inner: dl_rx, _guard: guard })).boxed();
 
     // 构造 ServerConn 并交给 dispatcher
     let conn = ServerConn {
@@ -514,7 +505,7 @@ impl Drop for SessionDropGuard {
     }
 }
 
-/// 持有 [`SessionDropGuard`] 的 AsyncRead 包装：ReaderStream 消费完或被 drop 时，
+/// 持有 [`SessionDropGuard`] 的 AsyncRead 包装：body 流消费完或被 drop 时，
 /// guard 随之 drop 并触发会话删除。
 struct GuardedReader<R> {
     inner: R,
@@ -1067,7 +1058,7 @@ mod tests {
         let resp = handle_stream_down(req, "127.0.0.1:2".parse().unwrap(), "sess-ikzy", &ctx).await;
         assert!(ctx.sessions.get("sess-ikzy").await.is_some(), "GET must register session");
 
-        // 模拟 hyper 终结 GET：drop 响应（body → ReaderStream → GuardedReader → guard）
+        // 模拟 hyper 终结 GET：drop 响应（body → DlStream → GuardedReader → guard）
         drop(resp);
         for _ in 0..100 {
             if ctx.sessions.get("sess-ikzy").await.is_none() {

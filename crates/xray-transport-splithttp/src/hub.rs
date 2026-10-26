@@ -22,6 +22,7 @@
 //!   reader=UploadQueue（上行数据），writer=HTTP response body（下行数据）
 //! - **stream-one**：GET `{path}` (无 session) → 类似 stream-down 但无 session
 
+pub mod dl_stream;
 pub mod handler;
 pub mod meta;
 pub mod session;
