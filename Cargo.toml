@@ -224,6 +224,12 @@ foreign-types = "0.5"
 # msgs/handshake.rs + testdata，约 +1400 行）本仓自持；升级路径：新上游 release
 # 解 .crate 后叠 fork diff（SOP 见 reports/fix-gqkk-vendor.md）。
 # 0.23.40→0.23.45 消解 GHSA-2mjx-qc3c-rqvc（TLS1.3 握手消息跨加密级别边界）。
+# 另叠 1 处**本仓自有性能 patch**（与 REALITY 无关，票 bbuh7）：`msgs/deframer/buffers.rs`
+# `prepare_read()` 的缩容条件去掉 `self.used == 0` —— 上游会在每次空闲读把 buffered
+# deframer 缩回 4KB，稳态 bulk 读因此每 record 付一次 shrink+grow realloc（实测 rustls
+# 拓扑 tls_read 4.76→1.00 MB/MB、CPU −17~19%、吞吐 +21.7%，wire 逐字节不变）。代价：
+# 空闲连接常驻 ≤allow_max（16KB/64KB，+12KB/conn）。**升级 upstream 时需重放此 1 行**
+# （若上游已修则删之）；上游贡献候选（0.23.46 该文件未变、无人报过 issue）。
 rustls = { path = "vendor/rustls" }
 # Shadow-TLS V3 会话 ID 生成器：原 Watfaq/tokio-rustls fork 相对上游
 # rustls/tokio-rustls v/0.26.4 仅 1 commit（src/client.rs +71 行

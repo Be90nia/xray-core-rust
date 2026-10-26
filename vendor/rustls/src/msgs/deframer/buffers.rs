@@ -238,12 +238,18 @@ impl DeframerVecBuffer {
         // If we can and need to increase the buffer size to allow a 4k read, do so. After
         // dealing with a large handshake message (exceeding `OutboundOpaqueMessage::MAX_WIRE_SIZE`),
         // make sure to reduce the buffer size again (large messages should be rare).
-        // Also, reduce the buffer size if there are neither full nor partial messages in it,
-        // which usually means that the other side suspended sending data.
+        //
+        // bbuh7 vendor experiment: the original condition also fired on every idle read
+        // (`self.used == 0`), shrinking len+capacity back to 4KB after each record was
+        // consumed. Steady-state bulk reads then paid a shrink+grow realloc pair per
+        // record (~2x payload in allocator churn + copies). Keep the buffer at its
+        // high-water mark instead (len/capacity stay <= allow_max: 16KB+5B for data,
+        // 64KB while joining handshake fragments) and only recover capacity after
+        // oversized handshake buffering.
         let need_capacity = Ord::min(allow_max, self.used + READ_SIZE);
         if need_capacity > self.buf.len() {
             self.buf.resize(need_capacity, 0);
-        } else if self.used == 0 || self.buf.len() > allow_max {
+        } else if self.buf.len() > allow_max {
             self.buf.resize(need_capacity, 0);
             self.buf.shrink_to(need_capacity);
         }
