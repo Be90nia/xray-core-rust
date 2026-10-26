@@ -39,6 +39,7 @@ use tokio_rustls::{
     server::TlsStream as ServerTlsStream,
 };
 use tracing::debug;
+use xray_common::alloc_site;
 use xray_transport::connection::Connection;
 
 use crate::fingerprint::Fingerprint;
@@ -144,6 +145,8 @@ impl<S: Connection + Unpin> AsyncWrite for Conn<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        // 站点归因（z02z8）：rustls 逐写 record 封装分配（4y9ns 嫌疑面）。
+        let _site = alloc_site::enter(alloc_site::TLS_WRITE);
         let n = ready!(Pin::new(&mut self.inner).poll_write(cx, buf))?;
         // tokio-rustls 0.26 是 BufWriter 语义：poll_write Ok(n) 只保证
         // 数据进入 rustls session 缓冲，write_io Pending（底层窗口满）时
@@ -284,6 +287,7 @@ impl<S: Connection + Unpin> AsyncWrite for ServerConn<S> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         // 同 Conn::poll_write：尽力冲净 session 滞留，Pending 记 dirty。
+        let _site = alloc_site::enter(alloc_site::TLS_WRITE);
         let n = ready!(Pin::new(&mut self.inner).poll_write(cx, buf))?;
         match Pin::new(&mut self.inner).poll_flush(cx) {
             Poll::Ready(Ok(())) => self.dirty = false,
@@ -377,6 +381,9 @@ impl<S: Connection + Unpin> AsyncWrite for UConn<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        // 站点归因（z02z8）：Rustls 分支直通 tokio_rustls TlsStream（不经本 crate
+        // Conn 包装），须在此标记才能覆盖 u_client 指纹路径；Btls 分支内层已标记。
+        let _site = alloc_site::enter(alloc_site::TLS_WRITE);
         match &mut self.inner {
             UConnInner::Rustls(c) => Pin::new(c).poll_write(cx, buf),
             UConnInner::Btls(c) => Pin::new(c).poll_write(cx, buf),
@@ -698,11 +705,13 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：uTLS mock accept 泵")]
         tokio::spawn(async move {
             loop {
                 if let Ok((stream, _)) = listener.accept().await {
                     let acceptor = acceptor.clone();
                     let msg = msg;
+                    #[allow(clippy::disallowed_methods, reason = "测试：uTLS mock 每连接应答泵")]
                     tokio::spawn(async move {
                         let tcp = TcpConnection::new(stream);
                         if let Ok(mut tls) = acceptor.accept(tcp).await {

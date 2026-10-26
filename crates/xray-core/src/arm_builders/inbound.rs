@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use skeleton_infra::fx::FxScope;
 use tokio::{net::UdpSocket, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use xray_app_dispatcher::{OutboundHandlerManager, default::SimpleOhm};
@@ -349,6 +350,10 @@ pub(crate) async fn build_dokodemo_inbound(
             "dokodemo followRedirect requires Linux (SO_ORIGINAL_DST / UDP TPROXY); connections without original destination will be rejected"
         );
     }
+    // B6（bd 39hko 切片1）：listener serve 任务唯一托管口（坑约束 5）。scope 归
+    // 底部 serve future 持有：两个 listener task 终局（或 token cancel 时本 future
+    // 被 drop → scope drop abort）即收；协作退出仍走任务内 token select（bd jezb）。
+    let fx = Arc::new(FxScope::new());
     let mut handles = Vec::new();
     if settings.allow_tcp {
         let listener = InboundTcpListener::bind(addr, inbound_sockopts.clone())
@@ -366,17 +371,19 @@ pub(crate) async fn build_dokodemo_inbound(
         // await 持有 JoinHandle，token cancel 时 drop = detach（accept loop 继续跑，
         // RemoveInbound 后端口仍可连）。
         let stop = shutdown_token.clone();
-        #[allow(clippy::disallowed_methods, reason = "数据面 inbound serve 常驻任务（dokodemo TCP listener）；迁 FxScope 待 bd 39hko")]
-        handles.push(tokio::spawn(async move {
-            tokio::select! {
-                r = serve_dokodemo(listener, ohm_tcp, opts) => {
-                    if let Err(e) = r {
-                        tracing::error!(error = %e, "dokodemo TCP inbound stopped");
-                    }
-                },
-                _ = stop.cancelled() => {},
-            }
-        }));
+        handles.push(
+            fx.spawn(async move {
+                tokio::select! {
+                    r = serve_dokodemo(listener, ohm_tcp, opts) => {
+                        if let Err(e) = r {
+                            tracing::error!(error = %e, "dokodemo TCP inbound stopped");
+                        }
+                    },
+                    _ = stop.cancelled() => {},
+                }
+            })
+            .expect("internal FxScope is never closed"),
+        );
     }
     if settings.allow_udp {
         let bind_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
@@ -400,17 +407,19 @@ pub(crate) async fn build_dokodemo_inbound(
             udp_mask,
         )
         .await?;
-        #[allow(clippy::disallowed_methods, reason = "数据面 inbound serve 常驻任务（dokodemo UDP）；迁 FxScope 待 bd 39hko")]
-        handles.push(tokio::spawn(async move {
-            tokio::select! {
-                r = serve_dokodemo_udp_on(hub, dispatch, dest_udp) => {
-                    if let Err(e) = r {
-                        tracing::error!(error = %e, "dokodemo UDP inbound stopped");
-                    }
-                },
-                _ = stop.cancelled() => {},
-            }
-        }));
+        handles.push(
+            fx.spawn(async move {
+                tokio::select! {
+                    r = serve_dokodemo_udp_on(hub, dispatch, dest_udp) => {
+                        if let Err(e) = r {
+                            tracing::error!(error = %e, "dokodemo UDP inbound stopped");
+                        }
+                    },
+                    _ = stop.cancelled() => {},
+                }
+            })
+            .expect("internal FxScope is never closed"),
+        );
     }
     if handles.is_empty() {
         return Err(std::io::Error::new(
@@ -418,11 +427,12 @@ pub(crate) async fn build_dokodemo_inbound(
             "dokodemo: no valid network specified (need tcp and/or udp)",
         ));
     }
-    // 合并所有 listener handle；token cancel 时 combined 被取消（子 handle 被
-    // drop/abort）。
+    // 合并所有 listener handle；token cancel 时 combined 被取消（本 future drop
+    // → scope drop abort 子任务，listener socket 随任务体 drop 释放）。
     Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+        let _scope = fx;
         for h in handles {
-            let _ = h.await;
+            let _ = h.join().await;
         }
         Ok(())
     })))
@@ -691,7 +701,10 @@ pub(crate) fn vless_transport_on_conn(
         let validator = Arc::clone(&validator);
         let fallbacks = fallbacks.clone();
         let options = options.clone();
-        #[allow(clippy::disallowed_methods, reason = "inbound 连接处理任务（vless fallback，每连接）；迁 FxScope 待 bd 39hko")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "inbound 连接处理任务（vless fallback，每连接）；FxScope 完工 JoinSet 条目无收割 API 会无界累积，待 udf 扩 drain 后迁（bd 39hko）"
+        )]
         tokio::spawn(async move {
             let (peer, local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
             // TLS 已在 transport hub 内终结，name/alpn 不可得
@@ -743,7 +756,10 @@ pub(crate) fn trojan_transport_on_conn(
         let validator = Arc::clone(&validator);
         let handler = Arc::clone(&handler);
         let fb_policy = fallbacks.clone();
-        #[allow(clippy::disallowed_methods, reason = "inbound 连接处理任务（trojan fallback，每连接）；迁 FxScope 待 bd 39hko")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "inbound 连接处理任务（trojan fallback，每连接）；FxScope 完工 JoinSet 条目无收割 API 会无界累积，待 udf 扩 drain 后迁（bd 39hko）"
+        )]
         tokio::spawn(async move {
             let (peer, local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
             xray_proxy_trojan::serve_trojan_conn(
@@ -784,7 +800,10 @@ pub(crate) fn vmess_transport_on_conn(
         let handler = Arc::clone(&handler);
         let validator = Arc::clone(&validator);
         let history = Arc::clone(&history);
-        #[allow(clippy::disallowed_methods, reason = "inbound 连接处理任务（vmess，每连接）；迁 FxScope 待 bd 39hko")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "inbound 连接处理任务（vmess，每连接）；FxScope 完工 JoinSet 条目无收割 API 会无界累积，待 udf 扩 drain 后迁（bd 39hko）"
+        )]
         tokio::spawn(async move {
             let (peer, _local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
             if let Err(e) = xray_proxy_vmess::handle_vmess_connection(
@@ -819,7 +838,10 @@ pub(crate) fn ss_transport_on_conn(
     Ok(Arc::new(move |conn| {
         let mode = mode.clone();
         let handler = Arc::clone(&handler);
-        #[allow(clippy::disallowed_methods, reason = "inbound 连接处理任务（ss/ss2022，每连接）；迁 FxScope 待 bd 39hko")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "inbound 连接处理任务（ss/ss2022，每连接）；FxScope 完工 JoinSet 条目无收割 API 会无界累积，待 udf 扩 drain 后迁（bd 39hko）"
+        )]
         tokio::spawn(async move {
             ss_mode_conn_pipeline(mode, handler, conn, hs_timeout).await;
         });

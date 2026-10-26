@@ -27,7 +27,12 @@ pub async fn s1_short_burst(
             // 模拟 HTTP GET 尺寸的请求-响应（echo 语义 = roundtrip 校验）
             let payload: &[u8] =
                 b"GET / HTTP/1.0\r\nHost: stress.local\r\nUser-Agent: xray-stress\r\n\r\n";
+            #[allow(clippy::disallowed_methods, reason = "压测计时循环；Clock 端口注入待 bd 39hko")]
             while Instant::now() < deadline {
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "压测计时循环；Clock 端口注入待 bd 39hko"
+                )]
                 let started = Instant::now();
                 match socks_roundtrip(socks_port, echo_port, payload).await {
                     Ok(_) => {
@@ -96,10 +101,12 @@ async fn s2_one_connection(
     // 每轮重选 chunk 大小（256KB-4MB），确定性伪随机分布（LCG，免 rand 锁竞争）
     let mut lcg = 0x9E37_79B9_7F4A_7C15u64 ^ (seed as u64 + 1);
     let mut chunk = vec![0u8; 4 * 1024 * 1024];
+    #[allow(clippy::disallowed_methods, reason = "压测计时循环；Clock 端口注入待 bd 39hko")]
     while Instant::now() < deadline {
         lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         let size = 256 * 1024 + (lcg % (4 * 1024 * 1024 - 256 * 1024 + 1)) as usize;
         rand::Rng::fill(&mut rand::rng(), &mut chunk[..size]);
+        #[allow(clippy::disallowed_methods, reason = "压测计时循环；Clock 端口注入待 bd 39hko")]
         let started = Instant::now();
         sock.write_all(&chunk[..size]).await?;
         let mut filled = 0;
@@ -125,6 +132,7 @@ pub async fn s4_mixed(
     stats: StatsHandle,
     delay_ms: u64,
 ) {
+    #[allow(clippy::disallowed_methods, reason = "压测：s4 短连接风暴场景任务")]
     let short = tokio::spawn(s1_short_burst(
         kcp_socks_port,
         echo_port,
@@ -133,6 +141,7 @@ pub async fn s4_mixed(
         stats.clone(),
         delay_ms,
     ));
+    #[allow(clippy::disallowed_methods, reason = "压测：s4 长流场景任务")]
     let long = tokio::spawn(s2_long_flow(kcp_socks_port, echo_port, long_conns, deadline, stats));
     let _ = tokio::join!(short, long);
 }

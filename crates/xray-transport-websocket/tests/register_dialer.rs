@@ -45,6 +45,7 @@ async fn e2e_dial_with_settings_ws_roundtrip() {
     // 1. 起 TCP listener + ws echo server。
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    #[allow(clippy::disallowed_methods, reason = "测试：ws echo server 任务")]
     let server = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
@@ -100,6 +101,7 @@ async fn e2e_alias_websocket_protocol_dials() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    #[allow(clippy::disallowed_methods, reason = "测试：ws echo server 任务")]
     let server = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
         let _ws = tokio_tungstenite::accept_async(tcp).await.unwrap();

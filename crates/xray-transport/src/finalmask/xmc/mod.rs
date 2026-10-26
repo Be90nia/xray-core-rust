@@ -77,6 +77,10 @@ impl Tcpmask for Config {
     fn wrap_conn_client(&self, raw: Box<dyn AsyncIo>) -> io::Result<Box<dyn AsyncIo>> {
         let (client, server) = tokio::io::duplex(UDP_SIZE * 2);
         let config = self.clone();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面连接任务（xmc client bridge）；迁 FxScope 待 bd 39hko"
+        )]
         tokio::spawn(conn::tcp_bridge(raw, server, true, config));
         Ok(Box::new(client))
     }
@@ -84,6 +88,10 @@ impl Tcpmask for Config {
     fn wrap_conn_server(&self, raw: Box<dyn AsyncIo>) -> io::Result<Box<dyn AsyncIo>> {
         let (client, server) = tokio::io::duplex(UDP_SIZE * 2);
         let config = self.clone();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面连接任务（xmc server bridge）；迁 FxScope 待 bd 39hko"
+        )]
         tokio::spawn(conn::tcp_bridge(raw, server, false, config));
         Ok(Box::new(client))
     }

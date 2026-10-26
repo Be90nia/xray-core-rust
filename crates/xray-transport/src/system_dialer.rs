@@ -865,6 +865,7 @@ mod tests {
     async fn default_dialer_connects_to_local_tcp_listener() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：accept 任务")]
         let accept_task = tokio::spawn(async move {
             let _ = listener.accept().await;
         });
@@ -886,6 +887,7 @@ mod tests {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap()
         };
+        #[allow(clippy::disallowed_methods, reason = "测试：accept 任务")]
         let accept_task = tokio::spawn(async move { listener.accept().await });
         let conn = dial_first_reachable(None, &[dead, good], &SocketOptions::default())
             .await
@@ -986,6 +988,7 @@ mod tests {
     async fn dial_system_uses_effective_dialer() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：accept 任务")]
         let accept_task = tokio::spawn(async move {
             let _ = listener.accept().await;
         });
@@ -1052,6 +1055,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let peer_ip = Arc::new(parking_lot::Mutex::new(None::<IpAddr>));
         let recorder = Arc::clone(&peer_ip);
+        #[allow(clippy::disallowed_methods, reason = "测试：accept+peer 记录任务")]
         let accept_task = tokio::spawn(async move {
             let (_sock, peer) = listener.accept().await.unwrap();
             *recorder.lock() = Some(peer.ip());
@@ -1085,6 +1089,7 @@ mod tests {
             Err(_) => return,
         };
         let addr = listener.local_addr().unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：accept 任务")]
         let _accept = tokio::spawn(async move {
             let _ = listener.accept().await;
         });
@@ -1432,6 +1437,7 @@ mod tests {
         let _guard = DNS_TEST_LOCK.lock();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：accept 任务")]
         let accept_task = tokio::spawn(async move {
             let _ = listener.accept().await;
         });

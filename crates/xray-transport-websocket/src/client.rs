@@ -313,6 +313,11 @@ impl AsyncRead for DelayDialConn {
 }
 
 impl AsyncWrite for DelayDialConn {
+    // joining 赋值表达式语句位挂属性在本工具链 E0658（无 stmt_expr_attributes），故挂 fn 位。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面连接任务（首写触发拨号 joining）；迁 FxScope 待 bd 39hko"
+    )]
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -512,6 +517,10 @@ mod tests {
         // 再把虚拟时钟推进过 8s deadline。
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "测试：沉默 server 任务（HandshakeTimeout 验证）"
+        )]
         tokio::spawn(async move {
             let (_sock, _) = listener.accept().await.unwrap();
             // 沉默服务端：持有 socket、永不回 101（虚拟 sleep 只为持有）。
@@ -526,6 +535,7 @@ mod tests {
             security_json: None,
             tcpmask: None,
         };
+        #[allow(clippy::disallowed_methods, reason = "测试：dial 任务")]
         let dial_task = tokio::spawn(dial_with_params(params, None));
         for _ in 0..400 {
             tokio::time::advance(std::time::Duration::from_millis(50)).await;
@@ -687,8 +697,10 @@ mod tests {
         // 真实 ws 握手（本地 listener + accept_async），dial 后心跳任务句柄存在。
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：ws mock accept 泵")]
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
+                #[allow(clippy::disallowed_methods, reason = "测试：ws mock 每连接泵")]
                 tokio::spawn(async move {
                     if let Ok(ws) = tokio_tungstenite::accept_async(stream).await {
                         // 保活片刻让客户端完成 dial + 断言。
@@ -767,6 +779,7 @@ mod tests {
     async fn hello_for(fingerprint: Option<&str>, alpn: Option<Vec<&str>>) -> Vec<u8> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let d = dest("127.0.0.1", listener.local_addr().unwrap().port());
+        #[allow(clippy::disallowed_methods, reason = "测试：ClientHello 捕获 server 任务")]
         let server = tokio::spawn(capture_client_hello(listener));
 
         let mut sec = serde_json::json!({});

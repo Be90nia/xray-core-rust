@@ -127,6 +127,10 @@ impl GeckoSocket {
 ///
 /// 所有 `GeckoSocket` clone drop → send_tx 归零 → `recv()` 返回 None → 退出。
 fn spawn_send_driver(conn: Arc<GeckoConn>, mut send_rx: mpsc::Receiver<(Bytes, SocketAddr)>) {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面连接任务（Gecko 发送 driver）；迁 FxScope 待 bd 39hko"
+    )]
     tokio::spawn(async move {
         while let Some((buf, addr)) = send_rx.recv().await {
             // 发送失败（socket 已死）只丢当前包；后续包同样失败，QUIC 按丢包处理
@@ -146,6 +150,10 @@ fn spawn_recv_driver(
     mut closed_rx: watch::Receiver<()>,
     dropped: Arc<AtomicU64>,
 ) {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面连接任务（Gecko 接收 driver）；迁 FxScope 待 bd 39hko"
+    )]
     tokio::spawn(async move {
         let mut buf = vec![0u8; UDP_SIZE];
         loop {

@@ -21,6 +21,7 @@ async fn tcp_http_header_dial_injects_request_header() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
+    #[allow(clippy::disallowed_methods, reason = "测试：echo server 任务")]
     let server = tokio::spawn(async move {
         let (mut sock, _) = listener.accept().await.unwrap();
         let mut raw = Vec::new();

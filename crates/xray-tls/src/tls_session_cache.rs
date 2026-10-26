@@ -105,6 +105,10 @@ pub(crate) fn lookup_for_resume(
 pub(crate) fn store_session(server_name: &str, session: btls::ssl::SslSession) {
     let cache = cache();
     let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "会话缓存存储时刻锚点；Clock 端口注入待 bd 39hko"
+    )]
     guard.insert(server_name.to_string(), CacheEntry { session, stored_at: Instant::now() });
     trace!(
         target: "xray_tls::session_cache",

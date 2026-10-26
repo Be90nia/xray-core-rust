@@ -1112,6 +1112,7 @@ mod tests {
                 .expect("bind 失败");
         let addr = listener.local_addr().expect("local_addr 失败");
 
+        #[allow(clippy::disallowed_methods, reason = "测试：listener server 任务")]
         let server = tokio::spawn(async move {
             let mut conn = listener.accept().await.expect("accept 失败");
             conn.write_all(b"hello").await.expect("write 失败");
@@ -1144,6 +1145,7 @@ mod tests {
             InboundTcpListener::bind("127.0.0.1:0", SocketOptions::default()).await.unwrap();
         let addr = listener.local_addr().unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：listener server 任务")]
         let server = tokio::spawn(async move {
             let (stream, _peer) = listener.accept().await.expect("accept 失败");
             stream
@@ -1162,6 +1164,7 @@ mod tests {
             .expect("listen_system 失败");
         let addr = listener.local_addr().unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：listener server 任务")]
         let server = tokio::spawn(async move {
             let mut conn = listener.accept().await.unwrap();
             conn.write_all(b"ok").await.unwrap();
@@ -1187,6 +1190,7 @@ mod tests {
             DefaultListener::bind("127.0.0.1:0".parse().unwrap(), sockopt).await.unwrap();
         let addr = listener.local_addr().unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：listener server 任务")]
         let server = tokio::spawn(async move {
             let mut conn = listener.accept().await.expect("accept 失败");
             // remote_addr 被 PROXY header 声明源覆盖。
@@ -1216,6 +1220,7 @@ mod tests {
                 .unwrap();
         let addr = listener.local_addr().unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：listener server 任务")]
         let server = tokio::spawn(async move {
             let mut conn = listener.accept().await.expect("accept 失败");
             // remote_addr 是真实 TCP peer（loopback），不是 PROXY 声明源。
@@ -1247,6 +1252,7 @@ mod tests {
             listen_system("127.0.0.1:0".parse().unwrap(), SocketOptions::default()).await.unwrap();
         let addr = listener.local_addr().unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：listener server 任务")]
         let server = tokio::spawn(async move {
             let _ = listener.accept().await;
         });
@@ -1266,6 +1272,7 @@ mod tests {
         );
         let addr = listener.local_addr().unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：listener server 任务")]
         let server = tokio::spawn(async move {
             let mut conn = listener.accept().await.unwrap();
             conn.write_all(b"trait").await.unwrap();
@@ -1288,6 +1295,7 @@ mod tests {
         );
         let addr = listener.local_addr().unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：listener server 任务")]
         let server = tokio::spawn(async move {
             let mut conn = listener.accept().await.unwrap();
             conn.write_all(b"sys").await.unwrap();
@@ -1309,6 +1317,7 @@ mod tests {
                 .unwrap();
         let addr = listener.local_addr().unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：listener server 任务")]
         let server = tokio::spawn(async move {
             for i in 0u8..3 {
                 let mut conn = listener.accept().await.unwrap();
@@ -1338,6 +1347,7 @@ mod tests {
             .await
             .expect("bind 失败");
 
+        #[allow(clippy::disallowed_methods, reason = "测试：listener server 任务")]
         let server = tokio::spawn(async move {
             let mut conn = listener.accept().await.expect("accept 失败");
             conn.write_all(b"hello").await.expect("write 失败");
@@ -1454,6 +1464,7 @@ mod tests {
             .expect("tcp_mptcp=true 时 bind 失败（应回退普通 TCP）");
         let addr = listener.local_addr().unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：listener server 任务")]
         let server = tokio::spawn(async move {
             let mut conn = listener.accept().await.expect("accept 失败");
             conn.write_all(b"mptcp").await.expect("write 失败");
@@ -1489,6 +1500,7 @@ mod tests {
         }));
         let addr = listener.local_addr().unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：listener server 任务")]
         let server = tokio::spawn(async move {
             let _ = listener.accept().await;
         });
@@ -1518,6 +1530,7 @@ mod tests {
         }));
         let addr = listener.local_addr().unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：listener server 任务")]
         let server = tokio::spawn(async move {
             let _ = listener.accept().await;
         });
@@ -1697,6 +1710,7 @@ mod tcpmask_tests {
 
         let data = payload(131_072);
         let expect = data.clone();
+        #[allow(clippy::disallowed_methods, reason = "测试：listener server 任务")]
         let server = tokio::spawn(async move {
             let (mut conn, _peer) = listener.accept_masked().await.expect("accept_masked");
             assert!(conn.plain().is_none(), "配了 finalmask 必须走 Masked");
@@ -1739,6 +1753,7 @@ mod tcpmask_tests {
         assert!(listener.tcpmask_manager().is_none());
         let addr = listener.local_addr().expect("local_addr");
 
+        #[allow(clippy::disallowed_methods, reason = "测试：listener server 任务")]
         let server = tokio::spawn(async move {
             let (mut conn, _peer) = listener.accept_masked().await.expect("accept_masked");
             assert!(conn.plain().is_some(), "未配 finalmask 必须走 Plain");
@@ -1765,6 +1780,7 @@ mod tcpmask_tests {
         let plaintext = b"vless-header!!".to_vec();
         let expect_len = plaintext.len();
         let expect = plaintext.clone();
+        #[allow(clippy::disallowed_methods, reason = "测试：listener server 任务")]
         let server = tokio::spawn(async move {
             let (mut conn, _peer) = listener.accept_masked().await.expect("accept_masked");
             assert!(conn.plain().is_none());

@@ -39,6 +39,7 @@ async fn spawn_echo_server(
     tokio::task::JoinHandle<()>,
 ) {
     let (tx, rx) = oneshot::channel();
+    #[allow(clippy::disallowed_methods, reason = "测试：echo server 任务")]
     let handle = tokio::spawn(async move {
         let listener = WsListener::bind(addr, config).await.expect("bind");
         let bound = listener.local_addr().expect("local_addr");
@@ -135,6 +136,7 @@ async fn early_data_delivered_to_server_first_read() {
     // 服务端：accept 后直接读，验证首批字节是 early data。
     let (tx_bound, rx_bound) = oneshot::channel();
     let server_cfg = cfg.clone();
+    #[allow(clippy::disallowed_methods, reason = "测试：ws server 任务")]
     let server_handle = tokio::spawn(async move {
         let listener = WsListener::bind(bind_addr, server_cfg).await.expect("bind");
         let bound = listener.local_addr().expect("local_addr");
@@ -172,6 +174,7 @@ async fn server_rejects_wrong_path() {
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
     let (tx_bound, rx_bound) = oneshot::channel();
+    #[allow(clippy::disallowed_methods, reason = "测试：ws server 任务")]
     let server_handle = tokio::spawn(async move {
         let listener = WsListener::bind(bind_addr, server_cfg).await.expect("bind");
         let bound = listener.local_addr().expect("local_addr");
@@ -209,6 +212,7 @@ async fn server_validates_custom_host_header() {
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
     let (tx_bound, rx_bound) = oneshot::channel();
+    #[allow(clippy::disallowed_methods, reason = "测试：ws server 任务")]
     let server_handle = tokio::spawn(async move {
         let listener = WsListener::bind(bind_addr, server_cfg).await.expect("bind");
         let bound = listener.local_addr().expect("local_addr");
@@ -252,6 +256,7 @@ async fn server_rejects_mismatched_host() {
     let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
     let (tx_bound, rx_bound) = oneshot::channel();
+    #[allow(clippy::disallowed_methods, reason = "测试：ws server 任务")]
     let server_handle = tokio::spawn(async move {
         let listener = WsListener::bind(bind_addr, server_cfg).await.expect("bind");
         let bound = listener.local_addr().expect("local_addr");

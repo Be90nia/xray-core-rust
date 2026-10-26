@@ -41,6 +41,10 @@ use super::{
 /// `clock.now()` 自洽。
 fn mono_of(then: Instant) -> MonoTime {
     let clock_now = DefaultClock::new().now();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "quinn 桥时间戳换算 lag；时钟统一上浮 skeleton::clock 待 bd 39hko"
+    )]
     let lag = Instant::now().saturating_duration_since(then);
     clock_now.saturating_sub(lag.as_nanos() as u64)
 }
@@ -566,6 +570,7 @@ mod tests {
         let slot = Arc::new(HysteriaCCSlot::new());
         // 模拟 factory build：fallback 变为真 CUBIC。
         let factory: Arc<QuinnCCFactory> = Arc::new(QuinnCCFactory { slot: Arc::clone(&slot) });
+        #[allow(clippy::disallowed_methods, reason = "测试：CC factory build 时刻入参")]
         quinn_proto::congestion::ControllerFactory::build(factory, Instant::now(), 1200);
         let adapter = QuinnCCAdapter { slot };
         // CUBIC 初始窗口 = 14720.clamp(2*1200, 10*1200) = 12000（quinn 语义）。
@@ -582,11 +587,13 @@ mod tests {
 
         let slot = Arc::new(HysteriaCCSlot::new());
         let factory: Arc<QuinnCCFactory> = Arc::new(QuinnCCFactory { slot: Arc::clone(&slot) });
+        #[allow(clippy::disallowed_methods, reason = "测试：CC factory build 时刻入参")]
         quinn_proto::congestion::ControllerFactory::build(factory, Instant::now(), 1200);
         let mut adapter = QuinnCCAdapter { slot: Arc::clone(&slot) };
         apply_brutal(&slot, 1_000_000, false);
 
         // 事件不 panic、swap 后窗口仍为 Brutal 语义。
+        #[allow(clippy::disallowed_methods, reason = "测试：CC 事件时间戳构造")]
         let now = Instant::now();
         adapter.on_sent(now, 1200, 1);
         adapter.on_congestion_event(now, now, false, 600);
@@ -616,6 +623,7 @@ mod tests {
         let slot = Arc::new(HysteriaCCSlot::new());
         apply_bbr(&slot, Profile::Standard);
         let mut adapter = QuinnCCAdapter { slot: Arc::clone(&slot) };
+        #[allow(clippy::disallowed_methods, reason = "测试：CC 事件时间戳构造")]
         let now = Instant::now();
 
         adapter.on_sent(now, 1200, 1);
@@ -642,6 +650,7 @@ mod tests {
         apply_bbr(&slot, Profile::Standard);
         let mut a = QuinnCCAdapter { slot: Arc::clone(&slot) };
         let mut b = QuinnCCAdapter { slot: Arc::clone(&slot) };
+        #[allow(clippy::disallowed_methods, reason = "测试：CC 事件时间戳构造")]
         let now = Instant::now();
 
         a.on_sent(now, 1200, 7);

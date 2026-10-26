@@ -379,6 +379,10 @@ fn spawn_recv_task(
     allowed_src: Arc<[IpAddr]>,
 ) -> (mpsc::Receiver<(Vec<u8>, SocketAddr)>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(RECV_CHANNEL_CAP);
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面泵任务（raw ICMP socket recv 泵）；迁 FxScope 待 bd 39hko"
+    )]
     let task = tokio::spawn(async move {
         loop {
             let (pkt, src) = match raw.recv().await {
@@ -429,12 +433,20 @@ fn spawn_clean_task_with(
     interval: Duration,
     ttl: Duration,
 ) -> JoinHandle<()> {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "常驻监控任务（xicmp 记录 TTL 清理循环）；迁 FxScope 待 bd 39hko"
+    )]
     tokio::spawn(async move {
         // Delay：错过 tick 顺延，不补发（Go time.Ticker 丢错过 tick 同语义）
         let mut tick = tokio::time::interval(interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "TTL 清理墙钟取时；Clock 端口注入待 bd 39hko"
+            )]
             let now = Instant::now();
             state.lock().rec.retain(|_, r| now.duration_since(r.last) <= ttl);
         }
@@ -543,6 +555,11 @@ impl XicmpPassthroughConn {
     }
 
     /// server send_to：用 rec 查 addr → marshal echo reply → raw.send。
+    // 赋值表达式语句位挂属性在本工具链 E0658（无 stmt_expr_attributes），故挂 fn 位。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "ICMP 记录活跃锚点更新；Clock 端口注入待 bd 39hko"
+    )]
     async fn server_send_to(&self, payload: &[u8], addr: &SocketAddr) -> io::Result<usize> {
         let state_arc =
             self.server_state.as_ref().ok_or_else(|| io::Error::other("not a server conn"))?;
@@ -605,6 +622,10 @@ impl XicmpPassthroughConn {
             let vaddr = client_id_to_addr(client_id);
             {
                 let mut s = state_arc.lock();
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "ICMP 记录活跃锚点；Clock 端口注入待 bd 39hko"
+                )]
                 s.rec.insert(
                     vaddr.to_string(),
                     XicmpServerRecord { id, seq, src, last: Instant::now() },
@@ -944,6 +965,7 @@ mod tests {
     /// 等 mock recv 队列长度稳定（50ms 窗口不变）——后台 recv 任务已消费完它能消费的。
     async fn wait_queue_stable(mock: &MockIcmpRawSocket) -> usize {
         let mut prev = usize::MAX;
+        #[allow(clippy::disallowed_methods, reason = "测试：稳定窗 deadline 锚点")]
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
             let cur = mock.recv_queue.lock().len();
@@ -952,6 +974,7 @@ mod tests {
             }
             prev = cur;
             tokio::time::sleep(Duration::from_millis(50)).await;
+            #[allow(clippy::disallowed_methods, reason = "测试：稳定窗 deadline 检查")]
             if std::time::Instant::now() > deadline {
                 return mock.recv_queue.lock().len();
             }

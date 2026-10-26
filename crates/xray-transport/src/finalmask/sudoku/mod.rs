@@ -85,6 +85,10 @@ impl Tcpmask for SudokuConfig {
         let (client, server) = tokio::io::duplex(UDP_SIZE * 2);
         let config = self.clone();
         // Client：pipe→inner 走 pure 编码，inner→pipe 走 packed 解码
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面连接任务（sudoku client bridge）；迁 FxScope 待 bd 39hko"
+        )]
         tokio::spawn(tcp_bridge(raw, server, config, true));
         Ok(Box::new(client))
     }
@@ -93,6 +97,10 @@ impl Tcpmask for SudokuConfig {
         let (client, server) = tokio::io::duplex(UDP_SIZE * 2);
         let config = self.clone();
         // Server：pipe→inner 走 packed 编码，inner→pipe 走 pure 解码
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面连接任务（sudoku server bridge）；迁 FxScope 待 bd 39hko"
+        )]
         tokio::spawn(tcp_bridge(raw, server, config, false));
         Ok(Box::new(client))
     }
@@ -124,6 +132,10 @@ async fn tcp_bridge(
     // 对端不读 pipe 时只有本方向阻塞，不传染写方向（bd hjkf：单 task `select!` +
     // 分支体内 await 会整体饿死写方向）。解码状态只服务本方向，随 task 一起搬走。
     let layouts: Vec<Layout> = tables.iter().map(|t| t.layout.clone()).collect();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面泵任务（inner→pipe 解码方向）；迁 FxScope 待 bd 39hko"
+    )]
     let back = tokio::spawn(async move {
         let mut packed_dec = PackedDecoder::default();
         let mut pure_table_index = 0usize;
@@ -396,6 +408,7 @@ mod tests {
                 config.wrap_conn_server(Box::new(server_raw)).unwrap();
 
             let (mut sr, mut sw) = tokio::io::split(wrapped_server);
+            #[allow(clippy::disallowed_methods, reason = "测试：sudoku echo 任务")]
             let echo = tokio::spawn(async move {
                 let _ = tokio::io::copy(&mut sr, &mut sw).await;
             });

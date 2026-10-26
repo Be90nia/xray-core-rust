@@ -14,7 +14,9 @@
 //!    跪了就写日志"）。
 //! 4. 文本兜底匹配**大小写不敏感**（glibc 是 "Too many open files"，小写匹配 永不命中）。
 
-use std::{io, time::Duration};
+use std::{future::Future, io, time::Duration};
+
+use skeleton_infra::fx::TaskError;
 
 /// 资源/瞬时类退避时长（与 xray-core `accept_fd_backoff` 的 500ms 一致）。
 const BACKOFF: Duration = Duration::from_millis(500);
@@ -65,17 +67,43 @@ pub async fn backoff_if_resource(e: &io::Error) {
     }
 }
 
-/// 循环意外退出监控：await accept 循环的 [`tokio::task::JoinHandle`]，仅在 panic
-/// （非显式 close 的唯一退出途径）时 `error!` 留痕；显式 close（close_notify /
-/// abort → cancelled / endpoint 关闭）不打日志。
+/// accept 循环终局归一：panic 终局给摘要文本，显式 close/取消终局给 `None`。
+/// sealed 面：仅 [`tokio::task::JoinError`] 与 `skeleton_infra::fx::TaskError`
+/// 两种句柄错误实现，勿外增（443 铁律 3 的分类口径住在这里，只留一处）。
+pub trait AcceptLoopExit {
+    fn panic_detail(self) -> Option<String>;
+}
+
+impl AcceptLoopExit for tokio::task::JoinError {
+    fn panic_detail(self) -> Option<String> {
+        if self.is_panic() { Some(panic_brief(self.into_panic())) } else { None }
+    }
+}
+
+impl AcceptLoopExit for TaskError {
+    fn panic_detail(self) -> Option<String> {
+        match self {
+            TaskError::Panicked(detail) => Some(detail),
+            _ => None,
+        }
+    }
+}
+
+/// 循环意外退出监控：await accept 循环句柄的终局，仅在 panic（非显式 close 的
+/// 唯一退出途径）时 `error!` 留痕；显式 close（close_notify / abort → cancelled /
+/// endpoint 关闭）不打日志。句柄两吃：[`tokio::task::JoinHandle`]（JoinError）
+/// 或 FxScope 托管的 `Spawned::join()`（TaskError）——分类见 [`AcceptLoopExit`]。
 ///
-/// 用法：spawn accept 循环后，把循环句柄 move 交给本函数再 spawn 一个监控 task
-/// （`JoinHandle` 不可 Clone——还须向外返回句柄的调用点用「监控包裹」结构，见
-/// `xray-transport/src/tcp/hub.rs` 的 `TcpHubListener::listen`）。
-pub async fn supervise_accept_loop(tag: &str, local: String, handle: tokio::task::JoinHandle<()>) {
-    if let Err(join_err) = handle.await {
-        if join_err.is_panic() {
-            let detail = panic_brief(join_err.into_panic());
+/// 用法：spawn accept 循环后，把循环句柄（或 `spawned.join()`）move 交给本函数
+/// 再 spawn 一个监控 task（句柄不可 Clone——还须向外返回句柄的调用点用「监控
+/// 包裹」结构，见 `xray-transport/src/tcp/hub.rs` 的 `TcpHubListener::listen`）。
+pub async fn supervise_accept_loop<E: AcceptLoopExit>(
+    tag: &str,
+    local: String,
+    handle: impl Future<Output = Result<(), E>>,
+) {
+    if let Err(e) = handle.await {
+        if let Some(detail) = e.panic_detail() {
             crate::LOG.error(format!(
                 "[{tag}] inbound accept loop exited WITHOUT close signal — 监听已停止，该端口不再接受连接 (local: {local}, panic: {detail})"
             ));
@@ -160,6 +188,7 @@ mod tests {
     #[tokio::test]
     async fn backoff_skips_non_resource_errors_immediately() {
         // 非资源类零 sleep 直达返回（时序断言只排除断言里误入 sleep 路径）
+        #[allow(clippy::disallowed_methods, reason = "测试：backoff 零 sleep 时序锚点")]
         let start = std::time::Instant::now();
         backoff_if_resource(&io::Error::from(io::ErrorKind::ConnectionReset)).await;
         assert!(start.elapsed() < Duration::from_millis(100));
@@ -218,6 +247,7 @@ mod tests {
     async fn supervise_logs_error_with_tag_local_and_last_error_on_panic() {
         let logs = Arc::new(Mutex::new(Vec::new()));
         let _guard = tracing::subscriber::set_default(CaptureLogs(Arc::clone(&logs)));
+        #[allow(clippy::disallowed_methods, reason = "测试：panic 任务（supervise 报警验证）")]
         let handle = tokio::spawn(async { panic!("listener fd gone") });
         supervise_accept_loop("test-ws", "127.0.0.1:443".into(), handle).await;
 
@@ -237,6 +267,7 @@ mod tests {
         // 显式 close（循环正常结束 / cancelled）不打日志
         let logs = Arc::new(Mutex::new(Vec::new()));
         let _guard = tracing::subscriber::set_default(CaptureLogs(Arc::clone(&logs)));
+        #[allow(clippy::disallowed_methods, reason = "测试：正常退出任务（supervise 静默验证）")]
         let handle = tokio::spawn(async {});
         supervise_accept_loop("test-ws", "127.0.0.1:443".into(), handle).await;
 

@@ -164,6 +164,10 @@ impl InboundHandler for NaiveInboundHandler {
         let acceptor = self.tls.clone();
         let auth = Arc::clone(&self.auth);
         let dispatch = self.dispatch.clone();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面连接任务（naive accept 泵）；迁 FxScope 待 bd 39hko"
+        )]
         let accept_task = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
@@ -171,6 +175,10 @@ impl InboundHandler for NaiveInboundHandler {
                         let acceptor = acceptor.clone();
                         let auth = Arc::clone(&auth);
                         let dispatch = dispatch.clone();
+                        #[allow(
+                            clippy::disallowed_methods,
+                            reason = "数据面连接任务（每连接 TLS/处理）；迁 FxScope 待 bd 39hko"
+                        )]
                         tokio::spawn(async move {
                             let tls = match acceptor.accept(tcp).await {
                                 Ok(t) => t,
@@ -277,6 +285,10 @@ async fn handle_request(
     );
     match dispatch {
         Some(dispatch) => {
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "数据面连接任务（h2 tunnel dispatch）；迁 FxScope 待 bd 39hko"
+            )]
             tokio::spawn(async move {
                 let upgraded = match upgrade.await {
                     Ok(u) => u,
@@ -294,6 +306,10 @@ async fn handle_request(
             });
         },
         None => {
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "数据面连接任务（无 dispatch 时 mock relay）；迁 FxScope 待 bd 39hko"
+            )]
             tokio::spawn(relay_mock_direct(host.clone(), port, upgrade, padded));
         },
     }
@@ -504,6 +520,7 @@ mod tests {
         let chunks: Vec<Vec<u8>> =
             (0..12usize).map(|i| vec![b'a' + i as u8; 700 + i * 13]).collect();
         let expected: Vec<u8> = chunks.concat();
+        #[allow(clippy::disallowed_methods, reason = "测试：e2e 写任务")]
         let writer_task = tokio::spawn(async move {
             for c in &chunks {
                 wr.write_all(c).await.unwrap();
@@ -546,6 +563,7 @@ mod tests {
             hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
                 .await
                 .unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：h2 conn driver 任务")]
         tokio::spawn(async move {
             let _ = conn.await;
         });

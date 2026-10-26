@@ -45,6 +45,7 @@ async fn tcp_plus_tls_wraps_tls_and_echoes() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server_acceptor = acceptor.clone();
+    #[allow(clippy::disallowed_methods, reason = "测试：TLS echo server 任务")]
     tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
         let mut tls = server_acceptor.accept(tcp).await.unwrap();
@@ -100,6 +101,7 @@ async fn tcp_plus_tls_with_fingerprint_uses_btls() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server_acceptor = acceptor.clone();
+    #[allow(clippy::disallowed_methods, reason = "测试：TLS echo server 任务")]
     tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
         let mut tls = server_acceptor.accept(tcp).await.unwrap();

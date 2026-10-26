@@ -319,6 +319,10 @@ impl GeckoConn {
             if state.reassembly.len() >= GECKO_MAX_REASSEMBLY {
                 evict_oldest(&mut state);
             }
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "重组 deadline 锚点；Clock 端口注入待 bd 39hko"
+            )]
             state.reassembly.insert(
                 key.clone(),
                 ReassemblyEntry {
@@ -469,6 +473,10 @@ fn spawn_gc_task(state: Arc<Mutex<GeckoState>>, scope: &FxScope) -> Spawned<()> 
             loop {
                 interval.tick().await;
                 let mut s = state.lock();
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "GC 过期判定墙钟取时；Clock 端口注入待 bd 39hko"
+                )]
                 let now = Instant::now();
                 let expired: Vec<ReassemblyKey> = s
                     .reassembly

@@ -306,6 +306,10 @@ impl WsListener {
             // spawn 而非内联 await：扫描器 h2 探测常 hard-close，hyper h2 serve
             // 对此最长挂 30s——内联会钉死串行 accept loop（backlog 满转 521，
             // 2026-10-15 生产实锤）。Go goroutine 模型即后台并发处理。
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "数据面连接任务（h2 拒绝服务，防串行 accept 钉死）；迁 FxScope 待 bd 39hko"
+            )]
             tokio::spawn(Self::serve_h2_reject(tls_stream, self.configs.clone()));
             return Err(WsError::HandshakeFailed("http/2 request rejected".into()));
         }
@@ -667,6 +671,7 @@ mod tests {
         let listener = WsListener::bind("127.0.0.1:0".parse().unwrap(), ws_config).await.unwrap();
         let addr = listener.local_addr().unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：accept_tls 任务")]
         let server_handle = tokio::spawn(async move {
             // accept_tls 应成功完成 TLS + WS 握手
             listener.accept_tls(tls_config).await
@@ -734,6 +739,7 @@ mod tests {
         let cfg = Arc::new(Config { path: "/ws".into(), ..Default::default() });
         let listener = WsListener::bind("127.0.0.1:0".parse().unwrap(), cfg).await.unwrap();
         let addr = listener.local_addr().unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：accept_tls 任务")]
         let server =
             tokio::spawn(async move { listener.accept_tls(Arc::new(server_config)).await });
 
@@ -752,6 +758,7 @@ mod tests {
             hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
                 .await
                 .unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：h2 conn driver 任务")]
         let conn_task = tokio::spawn(async move {
             let _ = conn.await;
         });
@@ -803,6 +810,7 @@ mod tests {
 
         // /foo 匹配。
         let l1 = Arc::clone(&listener);
+        #[allow(clippy::disallowed_methods, reason = "测试：路由 accept 任务")]
         let s1 = tokio::spawn(async move { l1.accept().await });
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let req = format!("ws://127.0.0.1:{}/foo", addr.port()).into_client_request().unwrap();
@@ -811,6 +819,7 @@ mod tests {
 
         // /bar 匹配。
         let l2 = Arc::clone(&listener);
+        #[allow(clippy::disallowed_methods, reason = "测试：路由 accept 任务")]
         let s2 = tokio::spawn(async move { l2.accept().await });
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let req = format!("ws://127.0.0.1:{}/bar", addr.port()).into_client_request().unwrap();
@@ -819,6 +828,7 @@ mod tests {
 
         // /baz 不匹配 → 握手失败。
         let l3 = Arc::clone(&listener);
+        #[allow(clippy::disallowed_methods, reason = "测试：路由 accept 任务")]
         let s3 = tokio::spawn(async move { l3.accept().await });
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let req = format!("ws://127.0.0.1:{}/baz", addr.port()).into_client_request().unwrap();
@@ -842,6 +852,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let l = Arc::clone(&listener);
+        #[allow(clippy::disallowed_methods, reason = "测试：XFF accept 任务")]
         let server = tokio::spawn(async move { l.accept().await });
 
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -883,6 +894,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         // 生产同款串行 accept loop（修复点所在语义）：h2 拒绝返回 Err 继续循环
+        #[allow(clippy::disallowed_methods, reason = "测试：串行 accept loop（生产同款语义）")]
         let _accept_loop = tokio::spawn(async move {
             loop {
                 let _ = listener.accept_tls(tls_config.clone()).await;
@@ -909,6 +921,7 @@ mod tests {
             {
                 assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
                 // 持有连接 30s 不关（keep-alive），模拟 hard-close 前的探测驻留
+                #[allow(clippy::disallowed_methods, reason = "测试：h2 keep-alive 驻留任务")]
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     drop(tls);

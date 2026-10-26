@@ -831,6 +831,7 @@ mod tests {
         let (mut client_a, mut client_b, server_a, server_b) = setup_two_pairs().await;
 
         // 启动 bridge
+        #[allow(clippy::disallowed_methods, reason = "测试：桥双向数据流任务")]
         let bridge = tokio::spawn(async move { bridge_connections(server_a, server_b).await });
 
         // client_a → bridge → client_b
@@ -857,6 +858,7 @@ mod tests {
     async fn bridge_returns_on_either_side_eof() {
         let (mut client_a, _client_b, server_a, server_b) = setup_two_pairs().await;
 
+        #[allow(clippy::disallowed_methods, reason = "测试：桥双向数据流任务")]
         let bridge = tokio::spawn(async move { bridge_connections(server_a, server_b).await });
 
         // client_a 发数据后关闭
@@ -873,6 +875,7 @@ mod tests {
     async fn bridge_large_payload_roundtrip() {
         let (mut client_a, mut client_b, server_a, server_b) = setup_two_pairs().await;
 
+        #[allow(clippy::disallowed_methods, reason = "测试：桥 64KB roundtrip 任务")]
         let bridge = tokio::spawn(bridge_connections(server_a, server_b));
 
         // 发送较大 payload (64 KiB)
@@ -895,6 +898,7 @@ mod tests {
     async fn bridge_with_splice_plain_tcp_bidirectional() {
         let (mut client_a, mut client_b, server_a, server_b) = setup_two_pairs().await;
 
+        #[allow(clippy::disallowed_methods, reason = "测试：splice 桥任务")]
         let bridge = tokio::spawn(bridge_connections_with_splice(server_a, server_b, 1, &[1]));
 
         client_a.write_all(b"up-splice").await.unwrap();
@@ -972,6 +976,7 @@ mod tests {
         let bare_b: Box<dyn Connection> =
             Box::new(TcpConnection::new(lsn_b.accept().await.unwrap().0));
 
+        #[allow(clippy::disallowed_methods, reason = "测试：splice 桥任务（wrapped 入口）")]
         let bridge = tokio::spawn(bridge_connections_with_splice(wrapped_a, bare_b, 1, &[1]));
 
         client_a.write_all(b"fallback").await.unwrap();
@@ -1110,6 +1115,7 @@ mod tests {
         let (_t_read, t_write) = tokio::io::split(tunnel);
         let link = Link::new(Box::new(up_r), xray_buf::io::new_writer(t_write));
 
+        #[allow(clippy::disallowed_methods, reason = "测试：stream 桥任务")]
         let bridge = tokio::spawn(bridge_link_with_stream_full_default(link, stream));
         up_w.shutdown(); // 上行立即 EOF，桥仅余下行收尾路径
 
@@ -1221,6 +1227,7 @@ mod tests {
         let link = Link::new(Box::new(up_r), Box::new(dn_w));
         let (mut stream_peer, stream) = tokio::io::duplex(8192);
 
+        #[allow(clippy::disallowed_methods, reason = "测试：stream 桥任务")]
         let bridge = tokio::spawn(bridge_link_with_stream_full_default(
             link,
             Box::new(DuplexConnection::new(stream)) as Box<dyn Connection>,
@@ -1264,6 +1271,7 @@ mod tests {
         // peer 保留不 drop：drop 会让 stream EOF 走正常结束而非超时路径
         let (_stream_peer, stream) = tokio::io::duplex(8192);
 
+        #[allow(clippy::disallowed_methods, reason = "测试：桥断开计时锚点；Clock 注入待 bd 39hko")]
         let start = std::time::Instant::now();
         // 上游立即 EOF（无数据）→ down 只能靠 downlink_only 窗口超时断开
         up_w.shutdown();
@@ -1306,6 +1314,7 @@ mod tests {
             ..TimeoutPolicy::default()
         };
 
+        #[allow(clippy::disallowed_methods, reason = "测试：桥断开计时锚点；Clock 注入待 bd 39hko")]
         let start = std::time::Instant::now();
         // 上行 writer 保留不写、不 shutdown → 双方向均无活动 → conn_idle 触发断开。
         let _keep_up = up_w;
@@ -1359,6 +1368,7 @@ mod tests {
         // peer 保留：只走 up EOF 触发半关闭，不走 stream EOF
         let (_stream_peer, stream) = tokio::io::duplex(8192);
 
+        #[allow(clippy::disallowed_methods, reason = "测试：桥断开计时锚点；Clock 注入待 bd 39hko")]
         let start = std::time::Instant::now();
         up_w.shutdown(); // 上行立即 EOF（Go requestDone 返回）
         let res = bridge_link_with_stream_full(
@@ -1392,6 +1402,7 @@ mod tests {
         let link = Link::new(Box::new(up_r), Box::new(dn_w));
         let (stream_peer, stream) = tokio::io::duplex(8192);
 
+        #[allow(clippy::disallowed_methods, reason = "测试：桥断开计时锚点；Clock 注入待 bd 39hko")]
         let start = std::time::Instant::now();
         drop(stream_peer); // 下行立即 EOF（Go responseDone 返回）
         let res = bridge_link_with_stream_full(
@@ -1438,6 +1449,7 @@ mod tests {
         let server_b = listener_b.accept().await.unwrap().0;
 
         // 启动 bridge(server_a, server_b)
+        #[allow(clippy::disallowed_methods, reason = "测试：桥 8KB 双向任务")]
         let bridge_handle = tokio::spawn(bridge_connections(
             Box::new(TcpConnection::new(server_a)) as Box<dyn Connection>,
             Box::new(TcpConnection::new(server_b)) as Box<dyn Connection>,
@@ -1448,6 +1460,7 @@ mod tests {
         let payload_for_read = payload.clone();
         let mut client_a = TcpConnection::new(client_a);
         let mut client_b = TcpConnection::new(client_b);
+        #[allow(clippy::disallowed_methods, reason = "测试：上行写任务")]
         let writer = tokio::spawn(async move {
             client_a.write_all(&payload).await.unwrap();
             client_a.shutdown().await.ok();
@@ -1482,6 +1495,7 @@ mod tests {
         let link = Link::new(Box::new(up_r), Box::new(dn_w));
         let (_peer, stream) = tokio::io::duplex(8192);
 
+        #[allow(clippy::disallowed_methods, reason = "测试：stream 桥任务")]
         let bridge = tokio::spawn(bridge_link_with_stream_full_default(
             link,
             Box::new(DuplexConnection::new(stream)) as Box<dyn Connection>,
@@ -1571,6 +1585,7 @@ mod tests {
         let link = Link::new(Box::new(up_r), Box::new(dn_w));
         let (mut peer, stream) = tokio::io::duplex(8192);
 
+        #[allow(clippy::disallowed_methods, reason = "测试：stream 桥任务（写错注入）")]
         let bridge = tokio::spawn(bridge_link_with_stream_full_default(
             link,
             Box::new(UpWriteErrConn(stream)) as Box<dyn Connection>,
@@ -1630,6 +1645,7 @@ mod tests {
         let link = Link::new(Box::new(up_r), Box::new(ErrLinkWriter));
         let (mut peer, stream) = tokio::io::duplex(8192);
 
+        #[allow(clippy::disallowed_methods, reason = "测试：stream 桥任务")]
         let bridge = tokio::spawn(bridge_link_with_stream_full_default(
             link,
             Box::new(DuplexConnection::new(stream)) as Box<dyn Connection>,
@@ -1992,6 +2008,7 @@ mod tests {
                     as Box<dyn xray_buf::io::Writer>,
             );
             let policy = TimeoutPolicy::default();
+            #[allow(clippy::disallowed_methods, reason = "测试：stream 桥任务（慢对端回归门）")]
             let bridge =
                 tokio::spawn(
                     async move { bridge_link_with_stream_full(link, stream, &policy).await },

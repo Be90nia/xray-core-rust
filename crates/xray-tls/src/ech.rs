@@ -611,6 +611,8 @@ mod tests {
     // ---- EchConfigRecord / EchConfigCache ----
 
     #[test]
+    // assert! 宏语句位的 allow 不传入宏展开（unused attribute 实证），上移 fn 级。
+    #[allow(clippy::disallowed_methods, reason = "测试：过期判定取时")]
     fn record_default_is_uninitialized_and_expired() {
         let r = EchConfigRecord::default();
         assert!(r.is_uninitialized());
@@ -619,6 +621,7 @@ mod tests {
 
     #[test]
     fn record_with_future_expire_not_expired() {
+        #[allow(clippy::disallowed_methods, reason = "测试：过期判定取时")]
         let now = Instant::now();
         let r =
             EchConfigRecord { config: vec![1, 2, 3], expire: Some(now + Duration::from_secs(60)) };
@@ -629,6 +632,7 @@ mod tests {
     #[test]
     fn cache_store_returns_old_record() {
         let cache = EchConfigCache::new();
+        #[allow(clippy::disallowed_methods, reason = "测试：过期锚点构造")]
         let old = EchConfigRecord {
             config: vec![1],
             expire: Some(Instant::now() + Duration::from_secs(30)),
@@ -636,6 +640,7 @@ mod tests {
         let prev = cache.store(old.clone());
         assert!(prev.is_uninitialized()); // 初始默认记录
 
+        #[allow(clippy::disallowed_methods, reason = "测试：过期锚点构造")]
         let new = EchConfigRecord {
             config: vec![2],
             expire: Some(Instant::now() + Duration::from_secs(60)),
@@ -648,6 +653,7 @@ mod tests {
     #[test]
     fn cache_with_lock_runs_under_mutex() {
         let cache = EchConfigCache::new();
+        #[allow(clippy::disallowed_methods, reason = "测试：过期锚点构造")]
         let result = cache.with_lock(|current| {
             assert!(current.is_uninitialized());
             (

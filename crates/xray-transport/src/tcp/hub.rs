@@ -13,6 +13,7 @@
 
 use std::{io, net::SocketAddr, sync::Arc};
 
+use skeleton_infra::fx::FxScope;
 use tokio::sync::Notify;
 
 use crate::{
@@ -32,6 +33,12 @@ pub struct TcpHubListener {
     /// bind 结果（Go `Listener.Addr()`——socket 已归循环，无法再向内核查询）。
     local: SocketAddr,
     close_notify: Arc<Notify>,
+    /// B6（bd 39hko 切片1）：accept 循环 + 退出监控任务唯一托管口（坑约束 5）。
+    /// 协作停机仍走 close_notify（close/Drop 触发）；scope 随句柄 drop 兜底 abort
+    /// ——socket 归循环所有，任一路径端口都即时释放（Go `Close()` 同形）。
+    /// 只持不读：存活锚（drop=abort 兜底），读回面待需（salamander_gecko 同形）。
+    #[allow(dead_code)]
+    fx: Arc<FxScope>,
 }
 
 impl TcpHubListener {
@@ -57,18 +64,24 @@ impl TcpHubListener {
         let inner = DefaultListener::bind(addr, sockopt.clone()).await?;
         let local = inner.local_addr()?;
         let close_notify = Arc::new(Notify::new());
-        let loop_handle = tokio::spawn(keep_accepting(
-            inner,
-            local,
-            add_conn,
-            auth,
-            tcpmask_manager,
-            Arc::clone(&close_notify),
-        ));
+        // B6（bd 39hko 切片1）：任务托管收口（坑约束 5）；闸关不可达，expect 只防
+        // 编程错误（realm/conn.rs 同形）。
+        let fx = Arc::new(FxScope::new());
+        let loop_task = fx
+            .spawn(keep_accepting(
+                inner,
+                local,
+                add_conn,
+                auth,
+                tcpmask_manager,
+                Arc::clone(&close_notify),
+            ))
+            .expect("internal FxScope is never closed");
         // 意外退出监控：循环只应经 close_notify 分支退出；panic 会静默杀掉
         // 监听（端口不再 listen 而进程存活），error! 兜底发声。
-        tokio::spawn(supervise_accept_loop("tcp", local.to_string(), loop_handle));
-        Ok(Self { local, close_notify })
+        fx.spawn(supervise_accept_loop("tcp", local.to_string(), loop_task.join()))
+            .expect("internal FxScope is never closed");
+        Ok(Self { local, close_notify, fx })
     }
 }
 
@@ -228,6 +241,10 @@ pub fn tcp_listen_fn() -> crate::listener_registry::TransportListenFn {
 #[cfg(unix)]
 pub struct TcpUnixHubListener {
     close_notify: Arc<Notify>,
+    /// B6（bd 39hko 切片1）：accept 循环 + 退出监控唯一托管口（坑约束 5），
+    /// 同 `TcpHubListener` 的 `fx` 字段口径（只持不读存活锚，drop=abort 兜底）。
+    #[allow(dead_code)]
+    fx: Arc<FxScope>,
 }
 
 #[cfg(unix)]
@@ -241,15 +258,19 @@ impl TcpUnixHubListener {
     ) -> io::Result<Self> {
         let inner = crate::system_listener::UnixListener::bind(path, sockopt.clone()).await?;
         let close_notify = Arc::new(Notify::new());
-        let loop_handle = tokio::spawn(keep_accepting_unix(
-            inner,
-            path.to_string(),
-            add_conn,
-            Arc::clone(&close_notify),
-        ));
+        let fx = Arc::new(FxScope::new());
+        let loop_task = fx
+            .spawn(keep_accepting_unix(
+                inner,
+                path.to_string(),
+                add_conn,
+                Arc::clone(&close_notify),
+            ))
+            .expect("internal FxScope is never closed");
         // 意外退出监控（同 tcp 循环）：panic 静默杀监听——error! 兜底发声。
-        tokio::spawn(supervise_accept_loop("tcp-unix", path.to_string(), loop_handle));
-        Ok(Self { close_notify })
+        fx.spawn(supervise_accept_loop("tcp-unix", path.to_string(), loop_task.join()))
+            .expect("internal FxScope is never closed");
+        Ok(Self { close_notify, fx })
     }
 }
 
@@ -401,6 +422,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_hub_listener_bind_and_accept() {
         let handler: ConnHandler = Arc::new(|mut conn| {
+            #[allow(clippy::disallowed_methods, reason = "测试：pong handler 任务")]
             tokio::spawn(async move {
                 conn.write_all(b"pong").await.expect("write 失败");
             });
@@ -437,6 +459,45 @@ mod tests {
         let addr = listener.local_addr().expect("local_addr 失败");
         assert_eq!(addr.ip().to_string(), "127.0.0.1");
         assert_ne!(addr.port(), 0);
+    }
+
+    /// 停机 → 端口释放（bd 39hko 切片1 验收④）：listen → 建连 → drop listener
+    /// （Drop → close_notify → 循环 break；托管 scope 随句柄 drop abort 兜底）→
+    /// 端口不再接受连接。socket 归循环任务所有，任一收口路径都释放。
+    #[tokio::test]
+    async fn tcp_hub_listener_stop_releases_port() {
+        let handler: ConnHandler = Arc::new(|_| {});
+        let listener = TcpHubListener::listen(
+            "127.0.0.1:0".parse().unwrap(),
+            &SocketOptions::default(),
+            handler,
+            None,
+            None,
+        )
+        .await
+        .expect("listen 失败");
+        let addr = listener.local_addr().expect("local_addr 失败");
+
+        // 建连：监听活跃态（连接由 handler 立即 drop，客户端读到 EOF）。
+        let client = TcpStream::connect(addr).await.expect("connect 失败");
+        drop(client);
+
+        // 停机：drop listener。
+        drop(listener);
+
+        // 端口释放证据：connect 由「成功」翻转为「拒绝」。关闭经 runtime 异步
+        // 生效（close_notify 唤醒 / abort 处理），5s 墙钟上限轮询。
+        let wait_release = async {
+            loop {
+                if TcpStream::connect(addr).await.is_err() {
+                    return; // 连接被拒 = 端口已释放
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), wait_release)
+            .await
+            .expect("port still accepting after listener stop");
     }
 
     #[tokio::test]
@@ -517,6 +578,7 @@ mod tests {
         let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<Box<dyn Connection>>(4);
         let handler: ConnHandler = Arc::new(move |mut conn| {
             let conn_tx = conn_tx.clone();
+            #[allow(clippy::disallowed_methods, reason = "测试：echo handler 任务")]
             tokio::spawn(async move {
                 let mut buf = [0u8; 4];
                 if conn.read_exact(&mut buf).await.is_ok() {

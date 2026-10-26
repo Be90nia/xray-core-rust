@@ -1,0 +1,14 @@
+# L3 静态闸（bd a5r4j/lzzja 剩余切片；家族模板 = crates/xray-app-dns/clippy.toml，
+# 三禁令全量范本 = crates/xray-common/clippy.toml）：异步托管唯一口 = FxScope/
+# PluginContext::spawn（坑约束 #5）。
+# 本 crate 无时间源，L3-5 不适用（std Instant::now 不列禁令）。
+# 注：per-crate clippy.toml 会替换 root 配置（xray-frame 探针 2b 覆盖语义实测），
+# root 阈值键在此镜像维护。
+# bd g3cr 镜像（root clippy.toml 同键）：unwrap_used 由测试代码
+#（cfg(test)/tests/）豁免，生产代码零 unwrap。
+allow-unwrap-in-tests = true
+
+disallowed-methods = [
+    { path = "tokio::spawn", reason = "裸 spawn 逃逸 FxScope 生命周期记账（坑约束 #5）：一律走 FxScope/PluginContext::spawn；存量调用按分层登记，迁移收口见 bd 39hko" },
+    { path = "std::thread::spawn", reason = "裸线程逃逸托管与停机编排（坑约束 #5/#6）：确需 OS 线程的场景逐点 #[allow(clippy::disallowed_methods)] + 理由注释登记" },
+]

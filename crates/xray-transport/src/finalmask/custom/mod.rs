@@ -103,6 +103,10 @@ impl Tcpmask for Config {
         let (client, server) = tokio::io::duplex(crate::finalmask::UDP_SIZE * 2);
         let tcp_cfg = self.tcp.clone().unwrap_or_default();
         let state = Arc::new(state::StateStore::new(self.state_ttl));
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面连接任务（tcpmask client bridge）；迁 FxScope 待 bd 39hko"
+        )]
         tokio::spawn(tcp::bridge(raw, server, true, tcp_cfg, state));
         Ok(Box::new(client))
     }
@@ -111,6 +115,10 @@ impl Tcpmask for Config {
         let (client, server) = tokio::io::duplex(crate::finalmask::UDP_SIZE * 2);
         let tcp_cfg = self.tcp.clone().unwrap_or_default();
         let state = Arc::new(state::StateStore::new(self.state_ttl));
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面连接任务（tcpmask server bridge）；迁 FxScope 待 bd 39hko"
+        )]
         tokio::spawn(tcp::bridge(raw, server, false, tcp_cfg, state));
         Ok(Box::new(client))
     }

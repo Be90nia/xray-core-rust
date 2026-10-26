@@ -22,6 +22,7 @@ use std::{
 use foreign_types::{ForeignType as _, ForeignTypeRef as _};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_btls::SslStream as TokioSslStream;
+use xray_common::alloc_site;
 
 /// btls 服务端流：握手完成后的 TLS 连接（`tokio_btls::SslStream` 的
 /// `Pin<Box<..>>` newtype，集成方式与 [`crate::btls_client::BtlsConn`] 一致）。
@@ -74,6 +75,8 @@ impl<S: AsyncRead + AsyncWrite> AsyncWrite for BtlsServerStream<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        // 站点归因（z02z8）：btls 服务端逐写 record 封装分配。
+        let _site = alloc_site::enter(alloc_site::TLS_WRITE);
         self.stream.as_mut().poll_write(cx, buf)
     }
 
@@ -192,6 +195,7 @@ mod tests {
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
 
+        #[allow(clippy::disallowed_methods, reason = "测试：duplex TLS echo server 任务")]
         let server = tokio::spawn(async move {
             let mut tls = accept(server_io, &cert_der, &key_der).await?;
             let mut buf = [0u8; 16];

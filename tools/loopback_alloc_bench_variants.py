@@ -18,6 +18,9 @@
 """
 import argparse, json, os, re, subprocess, sys, time
 
+# 站点归集助手与主脚本单源（z02z8）：解析/快照/报告复用 loopback_alloc_bench。
+from loopback_alloc_bench import last_sites, sites_report
+
 WORK = 'D:/tmp/enc8x'
 CERT = 'D:/tmp/interop_cert.pem'
 KEY = 'D:/tmp/interop_key.pem'
@@ -190,6 +193,7 @@ def main():
     if args.alloc_stats:
         env['XRAY_ALLOC_STATS'] = '1'
         env['XRAY_ALLOC_STATS_INTERVAL_MS'] = '1000'
+        env['XRAY_ALLOC_STATS_SITES'] = '1'
 
     srv_log = os.path.join(WORK, f'srv-{args.tag}.log')
     cli_log = os.path.join(WORK, f'cli-{args.tag}.log')
@@ -211,6 +215,8 @@ def main():
           f'alloc_stats={args.alloc_stats}')
     start_cli = all_stats(cli_log)[-1:] or [None]
     start_srv = all_stats(srv_log)[-1:] or [None] if sp else [None]
+    start_sites = {'srv': last_sites(srv_log) if sp else {},
+                   'cli': last_sites(cli_log)}
     total_bytes = 0
     speeds = []
     try:
@@ -229,6 +235,7 @@ def main():
     mb = total_bytes / 1024 / 1024
     print(f'transferred={total_bytes} bytes ({mb:.1f} MiB)')
 
+    end_sites = {'srv': last_sites(srv_log), 'cli': last_sites(cli_log)}
     for name, log, start in (('srv', srv_log, start_srv[0]),
                              ('cli', cli_log, start_cli[0])):
         if ps is None and name == 'srv':
@@ -243,6 +250,7 @@ def main():
         d_n = end['alloc_n'] - s['alloc_n']
         print(f'alloc/MB[{name}] = {d_bytes / mb / 1e6:.3f} '
               f'(Δalloc_bytes={d_bytes}, Δalloc_n={d_n}, {mb:.1f} MiB)')
+        sites_report(name, start_sites[name], end_sites[name], d_bytes)
         print(f'series[{name}]: ' + ' | '.join(
             f"t{int(x['t'])}:{(x['alloc_bytes'])//2**20}MB/{x['alloc_n']}"
             for x in series))

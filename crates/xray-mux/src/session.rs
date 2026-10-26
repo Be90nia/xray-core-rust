@@ -278,7 +278,10 @@ impl Session {
     /// 返回 `true` 表示本次调用实际关闭了会话，`false` 表示会话已关闭。
     // 本 fn 内 1 处 Instant::now（XUDP Active→Expiring 60s 过期锚点）：
     // 赋值表达式语句位挂属性在本工具链 E0658（无 stmt_expr_attributes），故挂 fn 位。
-    #[allow(clippy::disallowed_methods, reason = "XUDP 过期锚点取时（1 处）；Clock 端口注入待 bd 39hko")]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "XUDP 过期锚点取时（1 处）；Clock 端口注入待 bd 39hko"
+    )]
     pub async fn close(&self) -> bool {
         if self.closed_flag.swap(true, Ordering::AcqRel) {
             return false;
@@ -393,7 +396,10 @@ pub struct XUDP {
 impl XUDP {
     /// 创建新的 XUDP 扩展。
     #[must_use]
-    #[allow(clippy::disallowed_methods, reason = "XUDP 创建时刻 = 过期锚点（结构体尾表达式，属性挂 fn 位）；Clock 注入待 bd 39hko")]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "XUDP 创建时刻 = 过期锚点（结构体尾表达式，属性挂 fn 位）；Clock 注入待 bd 39hko"
+    )]
     pub fn new(global_id: [u8; 8]) -> Self {
         Self { global_id, status: XudpStatus::Initializing, expire: Instant::now(), mux: None }
     }
@@ -695,7 +701,10 @@ impl XUDPManager {
                 let mut interval = tokio::time::interval(Duration::from_secs(60));
                 loop {
                     interval.tick().await;
-                    #[allow(clippy::disallowed_methods, reason = "XUDP 清理循环墙钟取时；Clock 端口注入待 bd 39hko")]
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "XUDP 清理循环墙钟取时；Clock 端口注入待 bd 39hko"
+                    )]
                     let now = Instant::now();
                     // 写锁仅在清理窗口内持锁；xudp.interrupt() 在 spawn 中独立运行，
                     // 不再在持锁状态下跨 .await，避免 multi_thread runtime 下的锁迁移。

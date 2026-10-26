@@ -10,16 +10,19 @@ rust-version.workspace = true
 # close 循环（无超时/无 panic 隔离）。shutdown 域 std-only 零 feature——
 # default-features = false 避开 runtime/pool 默认档拖入运行时面。
 default = ["shutdown-coordinator"]
-shutdown-coordinator = ["dep:udf-skeleton-infra", "dep:xray-frame"]
+shutdown-coordinator = ["dep:xray-frame"]
 # B5 step4：framework 注入点（`start_full_with_outbound_handlers`，出站 handler 由
 # xray-cli framework 桥灌入）——仅门控该函数的存在，default 构建下不可见，行为零变化。
 framework-assembly = []
 
 [dependencies]
 xray-common = { path = "../xray-common" }
-# T1.1 停机编排桥依赖（经 feature 门启用；依赖形态对齐 xray-frame 注释约定：
-# path 指向仓内 crates/udf-frame 唯一形态，不锁 rev）。
-udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", optional = true, default-features = false }
+# T1.1 停机编排桥依赖（依赖形态对齐 xray-frame 注释约定：path 指向仓内
+# crates/udf-frame 唯一形态，不锁 rev）。B6（bd 39hko 切片1）起非 optional：
+# spawn 托管面（skeleton_infra::fx::FxScope，坑约束 5）为 L3 闸全量收口方向，
+# 代码无条件编译；tokio feature 供 fx 域；default-features = false 延续
+# 「不拖 runtime/pool 默认档」原口径。
+udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", default-features = false, features = ["tokio"] }
 # bd 8zs12 停机报告出口（随 shutdown-coordinator feature 门）：报告走 xray-frame
 # LogFacade（tracing 门面）——`xray_common::log` general 出口受 LogInstance::close
 # gate=Off 控制而吞报告（真机实证）；tracing 进程级订阅器不随 feature 关闭。

@@ -80,6 +80,10 @@ impl TokioUpdater {
         }
 
         let this = Arc::clone(self);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "常驻 updater tick 任务（kcp keepalive/update 循环）；迁 FxScope 待 bd 39hko"
+        )]
         tokio::spawn(async move {
             if (this.should_terminate)() {
                 this.running.store(false, Ordering::SeqCst);

@@ -562,6 +562,11 @@ impl std::fmt::Debug for InterConn {
 
 impl InterConn {
     /// 构造（对应 Go `&InterConn{...}`）。
+    // 字段初始化在尾表达式位不可挂语句属性（E0658），allow 上移 fn 级。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "UDP 会话活跃锚点（last_active 初始化）；Clock 端口注入待 bd 39hko"
+    )]
     pub fn new(local: SocketAddr, remote: SocketAddr, id: u32, chan_size: usize) -> Self {
         let (tx, rx) = mpsc::channel(chan_size);
         Self {
@@ -583,6 +588,8 @@ impl InterConn {
     }
 
     /// 标记活跃（对应 Go `Update()`）。
+    // 赋值表达式语句位挂属性在本工具链 E0658（无 stmt_expr_attributes），故挂 fn 位。
+    #[allow(clippy::disallowed_methods, reason = "UDP 会话活跃锚点更新；Clock 端口注入待 bd 39hko")]
     pub fn touch(&self) {
         *self.last_active.lock() = Instant::now();
     }
@@ -763,6 +770,10 @@ impl UdpSessionManager {
             g.udp_idle_timeout
         };
         let clean_inner = Arc::clone(&self.inner);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "常驻监控任务（UDP idle 会话清理循环）；迁 FxScope 待 bd 39hko"
+        )]
         let clean_handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(IDLE_CLEANUP_INTERVAL);
             loop {
@@ -772,6 +783,10 @@ impl UdpSessionManager {
                     if g.closed {
                         return;
                     }
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "UDP idle 清理墙钟取时；Clock 端口注入待 bd 39hko"
+                    )]
                     let now = Instant::now();
                     let mut out = Vec::new();
                     for (id, sess) in &g.sessions {
@@ -797,6 +812,10 @@ impl UdpSessionManager {
         let run_conn = Arc::clone(&conn);
         let run_local = local;
         let run_remote = remote;
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面连接任务（QUIC datagram 接收泵）；迁 FxScope 待 bd 39hko"
+        )]
         let run_handle = tokio::spawn(async move {
             loop {
                 let datagram = match run_conn.receive_datagram().await {

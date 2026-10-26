@@ -302,6 +302,10 @@ pub fn detect_max_useless_records(
             let table_inner = table.inner.clone();
             let dest_c = dest.clone();
             let sni_c = sni.clone();
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "数据面连接任务（REALITY 探测，后台填充探测表）；迁 FxScope 待 bd 39hko"
+            )]
             tokio::spawn(async move {
                 if let Some(tier) = detect_one(&dest_c, &sni_c, alpn).await {
                     table_inner.lock().insert(key, tier);
@@ -430,6 +434,10 @@ pub fn detect_post_handshake_record_lens(
             let table_inner = table.lens.clone();
             let dest_c = dest.clone();
             let sni_c = sni.clone();
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "数据面连接任务（record lens 探测，后台填充）；迁 FxScope 待 bd 39hko"
+            )]
             tokio::spawn(async move {
                 let lens = timeout(
                     RECORD_LENS_TIMEOUT,
@@ -459,6 +467,7 @@ mod tests {
     async fn spawn_alert_after_ccs(bind_addr: &str) -> std::net::SocketAddr {
         let listener = TcpListener::bind(bind_addr).await.unwrap();
         let addr = listener.local_addr().unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：mock target 任务")]
         tokio::spawn(async move {
             if let Ok((mut s, _)) = listener.accept().await {
                 // 静默吞首字节读 —— 等对端 ClientHello + CCS 写入
@@ -487,6 +496,7 @@ mod tests {
     async fn spawn_silent(bind_addr: &str) -> std::net::SocketAddr {
         let listener = TcpListener::bind(bind_addr).await.unwrap();
         let addr = listener.local_addr().unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：mock target 任务")]
         tokio::spawn(async move {
             if let Ok((mut s, _)) = listener.accept().await {
                 let mut buf = [0u8; 4096];

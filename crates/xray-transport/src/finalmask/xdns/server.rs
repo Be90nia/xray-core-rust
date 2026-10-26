@@ -145,8 +145,17 @@ impl XdnsConnServer {
         };
 
         // 数据面泵热路径豁免（约束⑫）：recv/send/dr 三循环不加托管口。
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面泵热路径豁免（坑约束⑫）：xdns recv 泵"
+        )]
         tokio::spawn(recv_loop(state.clone(), closed.clone()));
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面泵热路径豁免（坑约束⑫）：xdns send 泵"
+        )]
         tokio::spawn(send_loop(state.clone(), rec_rx, closed.clone()));
+        #[allow(clippy::disallowed_methods, reason = "数据面泵热路径豁免（坑约束⑫）：xdns dr 泵")]
         tokio::spawn(dr_loop(state.clone(), dr_rx, closed.clone()));
         // 闸关不可达：内部 scope 无 close 调用（分片维护管理任务随 scope 收口）。
         this.fx

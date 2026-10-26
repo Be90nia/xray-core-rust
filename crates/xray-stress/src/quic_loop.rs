@@ -53,6 +53,7 @@ pub async fn start_quic_echo_server() -> Result<SocketAddr> {
     let validator: Option<Arc<dyn AuthValidator>> = Some(Arc::new(StaticValidator));
     let on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync> =
         Arc::new(|stream: Arc<InterStreamConn>| {
+            #[allow(clippy::disallowed_methods, reason = "压测：QUIC echo 连接任务")]
             tokio::spawn(echo_one(stream));
         });
     let mut quic_port = crate::topology::pick_free_port().await;
@@ -153,7 +154,9 @@ pub async fn s3_quic_reconnect_loop(
     let quic_params = Arc::new(xray_proto::xray::transport::internet::QuicParams::default());
     let payload = vec![0xABu8; S3_PAYLOAD_LEN];
 
+    #[allow(clippy::disallowed_methods, reason = "压测计时循环；Clock 端口注入待 bd 39hko")]
     while Instant::now() < deadline {
+        #[allow(clippy::disallowed_methods, reason = "压测计时循环；Clock 端口注入待 bd 39hko")]
         let started = Instant::now();
         let client = HysteriaClient::new(
             dest.clone(),

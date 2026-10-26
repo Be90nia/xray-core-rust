@@ -86,7 +86,10 @@ impl Dispatcher for DispatchHandlerAdapter {
 
         let handler = Arc::clone(&self.handler);
         let dest_clone = dest.clone();
-        #[allow(clippy::disallowed_methods, reason = "数据面连接任务（每连接 dispatch 泵）；迁 FxScope 待 bd 39hko")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面连接任务（每连接 dispatch 泵）；迁 FxScope 待 bd 39hko"
+        )]
         tokio::spawn(async move {
             handler.dispatch(&dest_clone, dispatch_link).await;
         });
@@ -206,7 +209,10 @@ impl ServerWorker {
         let done_rx = self.done_rx.clone();
         let done_tx = self.done_tx.clone();
         let closed = Arc::clone(&self.closed);
-        #[allow(clippy::disallowed_methods, reason = "常驻监控任务（JoinHandle 返回给调用方托管）；迁 FxScope 待 bd 39hko")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "常驻监控任务（JoinHandle 返回给调用方托管）；迁 FxScope 待 bd 39hko"
+        )]
         tokio::spawn(async move {
             // Go time.Ticker 首 tick 在 60s 后；interval_at 对齐
             let mut ticker = tokio::time::interval_at(
@@ -289,7 +295,10 @@ impl ServerWorker {
         };
         let os = session.clone();
         let ow = link_writer.clone();
-        #[allow(clippy::disallowed_methods, reason = "数据面会话输出泵（每连接）；迁 FxScope 待 bd 39hko")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面会话输出泵（每连接）；迁 FxScope 待 bd 39hko"
+        )]
         tokio::spawn(async move {
             Self::handle_session_output(os, ow).await;
         });
@@ -384,7 +393,10 @@ impl ServerWorker {
         xmgr.register(xudp).await;
         let os = session.clone();
         let ow = link_writer.clone();
-        #[allow(clippy::disallowed_methods, reason = "数据面会话输出泵（每连接）；迁 FxScope 待 bd 39hko")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面会话输出泵（每连接）；迁 FxScope 待 bd 39hko"
+        )]
         tokio::spawn(async move {
             Self::handle_session_output(os, ow).await;
         });
@@ -440,7 +452,10 @@ impl ServerWorker {
         self.xudp_manager.register(xudp.clone()).await;
         let os = session.clone();
         let ow = link_writer.clone();
-        #[allow(clippy::disallowed_methods, reason = "数据面会话输出泵（每连接）；迁 FxScope 待 bd 39hko")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面会话输出泵（每连接）；迁 FxScope 待 bd 39hko"
+        )]
         tokio::spawn(async move {
             Self::handle_session_output(os, ow).await;
         });

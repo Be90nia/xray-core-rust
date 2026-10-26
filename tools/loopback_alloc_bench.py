@@ -18,9 +18,15 @@ BIG = os.path.join(WORK, 'big.bin')
 SIZE_MB = 200
 PREFIX = '[xray-alloc-stats]'
 
+SITES_PREFIX = '[xray-alloc-sites]'
+
 STATS_RE = re.compile(
     r't=([\d.]+)s alloc_n=(\d+) alloc_bytes=(\d+) '
     r'dealloc_n=(\d+) dealloc_bytes=(\d+) live_bytes=(-?\d+)')
+
+SITES_RE = re.compile(
+    r't=([\d.]+)s site=(\S+) alloc_n=(\d+) alloc_bytes=(\d+) '
+    r'd_n=(\d+) d_bytes=(\d+)')
 
 
 def read_keys():
@@ -42,6 +48,52 @@ def parse_stats_line(line):
     t, an, ab, dn, db, live = m.groups()
     return dict(t=float(t), alloc_n=int(an), alloc_bytes=int(ab),
                 dealloc_n=int(dn), dealloc_bytes=int(db), live_bytes=int(live))
+
+
+def parse_sites_line(line):
+    m = SITES_RE.search(line)
+    if not m:
+        return None
+    t, site, an, ab, dn, db = m.groups()
+    return dict(t=float(t), site=site, alloc_n=int(an), alloc_bytes=int(ab),
+                d_n=int(dn), d_bytes=int(db))
+
+
+def last_sites(log_path):
+    """每站点最后一条累计快照；空 dict = 站点归集未开启（旧二进制/未设 env）。"""
+    out = {}
+    with open(log_path, 'rb') as f:
+        for raw in f:
+            line = raw.decode(errors='replace')
+            if SITES_PREFIX in line:
+                s = parse_sites_line(line)
+                if s:
+                    out[s['site']] = s
+    return out
+
+
+def sites_report(name, start, end, total_delta_bytes):
+    """窗口差分按站点归集：top-N（Δbytes 降序）+ 字节占比 + 未标记桶。"""
+    if not start and not end:
+        print(f'sites[{name}]=N/A (XRAY_ALLOC_STATS_SITES 未开启)')
+        return
+    rows, sum_bytes = [], 0
+    for site, e in (end or {}).items():
+        s = (start or {}).get(site)
+        d = e['alloc_bytes'] - (s['alloc_bytes'] if s else 0)
+        dn = e['alloc_n'] - (s['alloc_n'] if s else 0)
+        sum_bytes += d
+        rows.append((d, dn, site))
+    rows.sort(reverse=True)
+    print(f'sites[{name}]:')
+    for d, dn, site in rows:
+        share = f' share={d / total_delta_bytes * 100:.1f}%' if total_delta_bytes > 0 else ''
+        print(f'  site={site:<16} d_bytes={d:>12} d_n={dn:>9}{share}')
+    untagged = total_delta_bytes - sum_bytes
+    untagged_name = '(untagged)'
+    share = f' share={untagged / total_delta_bytes * 100:.1f}%' if total_delta_bytes > 0 else ''
+    print(f'  site={untagged_name:<16} d_bytes={untagged:>12}{share}'
+          f'  # 守卫范围外: hyper/tokio/队列/握手等')
 
 
 def last_stats(log_path):
@@ -124,6 +176,7 @@ def main():
     if args.alloc_stats:
         env['XRAY_ALLOC_STATS'] = '1'
         env['XRAY_ALLOC_STATS_INTERVAL_MS'] = '1000'
+        env['XRAY_ALLOC_STATS_SITES'] = '1'  # 站点归集随 --alloc-stats 一并开启
 
     srv_log = os.path.join(WORK, f'srv-{args.tag}.log')
     cli_log = os.path.join(WORK, f'cli-{args.tag}.log')
@@ -139,6 +192,7 @@ def main():
     time.sleep(2.0)
     print(f'tag={args.tag} xray={args.xray} alloc_stats={args.alloc_stats}')
     start_srv, start_cli = last_stats(srv_log), last_stats(cli_log)
+    start_sites = {'srv': last_sites(srv_log), 'cli': last_sites(cli_log)}
     print(f'window_start_srv={json.dumps(start_srv)}')
     print(f'window_start_cli={json.dumps(start_cli)}')
     total_bytes = 0
@@ -156,6 +210,7 @@ def main():
         for p in (pc, ps, httpd):
             p.terminate()
     end_srv, end_cli = last_stats(srv_log), last_stats(cli_log)
+    end_sites = {'srv': last_sites(srv_log), 'cli': last_sites(cli_log)}
     print(f'window_end_srv={json.dumps(end_srv)}')
     print(f'window_end_cli={json.dumps(end_cli)}')
     mb = total_bytes / 1024 / 1024
@@ -169,6 +224,7 @@ def main():
         d_n = end['alloc_n'] - start['alloc_n']
         print(f'alloc/MB[{name}] = {d_bytes / mb:.0f} '
               f'(Δalloc_bytes={d_bytes}, Δalloc_n={d_n}, {mb:.1f} MiB)')
+        sites_report(name, start_sites[name], end_sites[name], d_bytes)
 
     if speeds:
         best = max(speeds) / 1e6

@@ -75,6 +75,7 @@ impl NatPmpStub {
         let peers = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&requests);
         let froms = Arc::clone(&peers);
+        #[allow(clippy::disallowed_methods, reason = "测试：NAT-PMP stub 收包泵")]
         tokio::spawn(async move {
             let mut buf = [0u8; 64];
             while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
@@ -133,6 +134,7 @@ impl HttpStub {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&requests);
         let respond = Arc::new(respond);
+        #[allow(clippy::disallowed_methods, reason = "测试：HTTP stub accept 泵")]
         tokio::spawn(async move {
             loop {
                 let Ok((sock, _peer)) = listener.accept().await else {
@@ -140,6 +142,7 @@ impl HttpStub {
                 };
                 let seen = Arc::clone(&seen);
                 let respond = Arc::clone(&respond);
+                #[allow(clippy::disallowed_methods, reason = "测试：HTTP stub 每连接泵")]
                 tokio::spawn(async move { serve_connection(sock, seen, respond).await });
             }
         });
@@ -240,6 +243,7 @@ impl SsdpStub {
         };
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&requests);
+        #[allow(clippy::disallowed_methods, reason = "测试：SSDP stub 收包泵")]
         tokio::spawn(async move {
             let response = format!(
                 "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=120\r\nEXT:\r\nLOCATION: {location}\r\n\

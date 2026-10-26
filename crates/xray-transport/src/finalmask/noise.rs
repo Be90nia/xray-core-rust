@@ -191,6 +191,10 @@ impl UdpIo for NoiseConn {
         // 判断是否需要注入噪声（对应 Go `t.IsZero() || (ResetMax > 0 && now.After(t))`）
         let need_inject = {
             let mut map = self.last_expire.lock();
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "噪声注入过期判定墙钟取时；Clock 端口注入待 bd 39hko"
+            )]
             let now = Instant::now();
             let expire = map.entry(addr.to_string()).or_insert(now);
             let expired = *expire <= now;

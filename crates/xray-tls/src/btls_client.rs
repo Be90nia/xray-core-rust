@@ -35,6 +35,7 @@ use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_btls::SslStream as TokioSslStream;
 use tracing::debug;
+use xray_common::alloc_site;
 use xray_transport::connection::Connection;
 
 use crate::fingerprint::Fingerprint;
@@ -1503,6 +1504,8 @@ impl<S: Connection + Unpin> AsyncWrite for BtlsConn<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        // 站点归因（z02z8）：btls 逐写 record 封装分配（4y9ns 嫌疑面）。
+        let _site = alloc_site::enter(alloc_site::TLS_WRITE);
         let this = &mut *self;
         loop {
             // Replay 义务优先：先补握手 + 重发被拒字节，再写本次数据。
@@ -1874,6 +1877,7 @@ mod tests {
             }
 
             // ① 首连（无缓存）→ full handshake，不得提供 0-RTT。
+            #[allow(clippy::disallowed_methods, reason = "测试：serve 任务（首连 full handshake）")]
             let s1 = tokio::spawn(serve(lsn.clone(), acceptor_ed.clone()));
             let tcp1 = TcpConnection::new(tokio::net::TcpStream::connect(addr).await.unwrap());
             let mut c1 =
@@ -1891,6 +1895,7 @@ mod tests {
             assert_eq!(&got1, b"PING1");
 
             // ② warm cache 重连（0-RTT 服务端）→ 停窗 → 首写 early data → ACCEPTED。
+            #[allow(clippy::disallowed_methods, reason = "测试：serve 任务（warm cache 0-RTT）")]
             let s2 = tokio::spawn(serve(lsn.clone(), acceptor_ed.clone()));
             let tcp2 = TcpConnection::new(tokio::net::TcpStream::connect(addr).await.unwrap());
             let mut c2 =
@@ -1908,6 +1913,7 @@ mod tests {
             assert!(got2.is_empty(), "accept 场景无重发：后续流不应再有数据");
 
             // ③ 同 SNI 拨无 0-RTT 服务端 → PSK 解不开 → REJECTED → 重发保数据。
+            #[allow(clippy::disallowed_methods, reason = "测试：serve 任务（无 0-RTT 对端）")]
             let s3 = tokio::spawn(serve(lsn, acceptor_plain));
             let tcp3 = TcpConnection::new(tokio::net::TcpStream::connect(addr).await.unwrap());
             let mut c3 =

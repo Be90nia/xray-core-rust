@@ -222,6 +222,10 @@ impl WsConnectionPool {
         };
         let mut guard = self.inner.lock().await;
         let entry = guard.get_mut(key)?;
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "连接池 idle 过期扫描墙钟取时；Clock 端口注入待 bd 39hko"
+        )]
         let now = Instant::now();
         // 从头扫除过期（FIFO：先入先过期）。
         while let Some(front) = entry.front() {
@@ -260,6 +264,10 @@ impl WsConnectionPool {
             // 池满，conn 在此 drop——下个 caller 自拨。
             return;
         }
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "连接池 entry last_used 锚点；Clock 端口注入待 bd 39hko"
+        )]
         entry.push_back(PoolEntry { conn, last_used: Instant::now() });
     }
 
@@ -477,6 +485,7 @@ mod tests {
             max_idle_per_key: 3,
             ..WsPoolConfig::default()
         }));
+        #[allow(clippy::disallowed_methods, reason = "测试：并发 release 任务")]
         let handles: Vec<_> = (0..10)
             .map(|_| {
                 let pool = pool.clone();
@@ -494,6 +503,7 @@ mod tests {
     /// `dial_with_params` 现拨（TCP+TLS+ws 握手），命中即交付——1:1 映射。
     async fn concurrent_take_misses(pool: Arc<WsConnectionPool>, key: PoolKey, n: usize) -> usize {
         let hits = Arc::new(AtomicUsize::new(0));
+        #[allow(clippy::disallowed_methods, reason = "测试：并发 take 任务")]
         let handles: Vec<_> = (0..n)
             .map(|_| {
                 let (pool, hits, key) = (pool.clone(), hits.clone(), key.clone());
@@ -568,6 +578,7 @@ mod tests {
     async fn concurrent_replenish_gate_admits_exactly_capacity() {
         let pool = Arc::new(WsConnectionPool::new(WsPoolConfig::default()));
         let admitted = Arc::new(AtomicUsize::new(0));
+        #[allow(clippy::disallowed_methods, reason = "测试：并发 replenish 任务")]
         let handles: Vec<_> = (0..16)
             .map(|_| {
                 let (pool, admitted) = (pool.clone(), admitted.clone());

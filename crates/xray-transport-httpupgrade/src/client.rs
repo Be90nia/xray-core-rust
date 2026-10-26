@@ -151,6 +151,7 @@ mod tests {
         let (client_io, mut server_io) = duplex(8192);
 
         // 客户端跑握手（在另一任务，因为 duplex 双向）
+        #[allow(clippy::disallowed_methods, reason = "测试：客户端 dial 任务")]
         let handle = tokio::spawn(async move { client.dial_over_io(client_io).await });
 
         // 服务端：读客户端请求
@@ -178,6 +179,7 @@ mod tests {
         let client =
             HttpUpgradeClient::new("h".into(), Config { path: "/".into(), ..Default::default() });
         let (client_io, mut server_io) = duplex(8192);
+        #[allow(clippy::disallowed_methods, reason = "测试：客户端 dial 任务")]
         let handle = tokio::spawn(async move { client.dial_over_io(client_io).await });
 
         // 服务端先读请求再写响应 + payload
@@ -199,6 +201,7 @@ mod tests {
     async fn dial_rejects_non_101_response() {
         let client = HttpUpgradeClient::new("h".into(), Config::default());
         let (client_io, mut server_io) = duplex(8192);
+        #[allow(clippy::disallowed_methods, reason = "测试：客户端 dial 任务")]
         let handle = tokio::spawn(async move { client.dial_over_io(client_io).await });
 
         let mut buf = vec![0u8; 4096];

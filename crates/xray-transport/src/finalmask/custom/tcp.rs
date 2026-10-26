@@ -187,6 +187,10 @@ pub(super) async fn bridge(
     let (mut pipe_r, mut pipe_w) = tokio::io::split(pipe);
     // 两个方向各自跑在自己的 task 里：对端不读 pipe 时只有回程（raw→pipe）阻塞，
     // 不传染写方向（bd hjkf：单 task `select!` + 分支体内 await 会整体饿死写方向）。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面泵任务（raw↔pipe 回程拷贝）；迁 FxScope 待 bd 39hko"
+    )]
     let back = tokio::spawn(async move {
         // 读侧结束/出错 → 关掉 pipe 写侧，让对端读到 EOF（错误按流结束传播）。
         let _ = tokio::io::copy(&mut r, &mut pipe_w).await;
@@ -326,6 +330,7 @@ mod tests {
             };
             let (client_raw, mut peer) = tokio::io::duplex(1 << 20);
             let mut app = cfg.wrap_conn_client(Box::new(client_raw)).unwrap();
+            #[allow(clippy::disallowed_methods, reason = "测试：tcpmask echo 任务")]
             let echo = tokio::spawn(async move {
                 let mut buf = vec![0u8; 16384];
                 loop {

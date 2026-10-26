@@ -92,6 +92,10 @@ pub async fn dial_naive(
         .map_err(|e| format!("naive h2 handshake: {e}"))?;
 
     // h2 连接驱动：hyper 的 conn future 必须被持续 poll（后台任务 1）。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面连接任务（h2 conn driver）；迁 FxScope 待 bd 39hko"
+    )]
     let driver = tokio::spawn(async move {
         if let Err(e) = conn.await {
             crate::LOG.debug(format!("error={e} h2 connection driver ended"));
@@ -118,6 +122,10 @@ pub async fn dial_naive(
 
     // SendRequest 保活到 driver 结束（后台任务 2）：drop 它即通知 hyper
     // 优雅关闭整条 h2 连接（graceful GOAWAY 会终止活跃 CONNECT 流）。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面连接任务（h2 SendRequest 保活）；迁 FxScope 待 bd 39hko"
+    )]
     tokio::spawn(async move {
         let _keep_alive = sender;
         let _ = driver.await;
@@ -454,6 +462,7 @@ mod tests {
             (0..12).map(|i| vec![b'a' + i; 700 + (i as usize) * 13]).collect();
         let expected: Vec<u8> = chunks.concat();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：padding 写任务")]
         let writer_task = tokio::spawn(async move {
             let mut w = PaddingWriter::new(client, true);
             for c in &chunks {

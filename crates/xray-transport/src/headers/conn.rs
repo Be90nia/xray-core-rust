@@ -547,6 +547,7 @@ mod tests {
 
         let junk = vec![b'a'; 9000];
         // 写端 spawn：9000 字节超过 duplex(4096) 容量，单 task 顺序执行会死锁。
+        #[allow(clippy::disallowed_methods, reason = "测试：超长 header 写任务")]
         let writer = tokio::spawn(async move {
             let mut raw_client = raw_client;
             raw_client.write_all(&junk).await.expect("raw write");

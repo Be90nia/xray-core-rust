@@ -103,6 +103,7 @@ async fn run(
     duration: Duration,
     interval: Duration,
 ) -> Result<()> {
+    #[allow(clippy::disallowed_methods, reason = "压测 run 时钟锚点；Clock 端口注入待 bd 39hko")]
     let deadline = Instant::now() + duration;
     let mut stats: Vec<StatsHandle> = Vec::new();
     // 负载 worker 与基础设施（协议链服务实例）分池：drain 观察窗停负载、
@@ -225,6 +226,10 @@ async fn run(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tick.tick().await;
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "压测 run 时钟锚点；Clock 端口注入待 bd 39hko"
+        )]
         let elapsed = duration.as_secs_f64() - (deadline - Instant::now()).as_secs_f64();
         if let Err(e) = sampler.sample_once(elapsed, interval, false) {
             eprintln!("[xray-stress] sampler error: {e}");
@@ -234,6 +239,10 @@ async fn run(
             Ok(false) => {},
             Err(e) => eprintln!("[xray-stress] checkpoint error: {e}"),
         }
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "压测 run 时钟锚点；Clock 端口注入待 bd 39hko"
+        )]
         if Instant::now() >= deadline {
             break;
         }
@@ -256,7 +265,15 @@ async fn run(
             "[xray-stress] drain window: {}s (idle-connection reclaim observation)",
             args.drain_secs
         );
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "压测 drain 观察窗时钟锚点；Clock 端口注入待 bd 39hko"
+        )]
         let drain_end = Instant::now() + Duration::from_secs(args.drain_secs);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "压测 drain 观察窗时钟锚点；Clock 端口注入待 bd 39hko"
+        )]
         let load_end = Instant::now();
         let mut tick = tokio::time::interval(interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -266,6 +283,10 @@ async fn run(
             if let Err(e) = sampler.sample_once(elapsed, interval, true) {
                 eprintln!("[xray-stress] sampler error: {e}");
             }
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "压测 drain 观察窗时钟锚点；Clock 端口注入待 bd 39hko"
+            )]
             if Instant::now() >= drain_end {
                 break;
             }

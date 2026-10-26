@@ -50,6 +50,7 @@ impl RecordingProxy {
         let stop = Arc::new(AtomicBool::new(false));
         let cap = Arc::clone(&captured);
         let st = Arc::clone(&stop);
+        #[allow(clippy::disallowed_methods, reason = "测试：stub UDP echo 线程（同步收包）")]
         thread::spawn(move || {
             let mut buf = [0u8; 2048];
             let mut client: Option<SocketAddr> = None;
@@ -104,6 +105,7 @@ fn mkcp_settings(finalmask: Option<&str>) -> StreamSettings {
 /// echo server handler：读到什么回什么。
 fn echo_handler() -> ConnHandler {
     Arc::new(|conn: Box<dyn Connection>| {
+        #[allow(clippy::disallowed_methods, reason = "测试：echo handler 任务")]
         tokio::spawn(async move {
             let (mut rd, mut wr) = tokio::io::split(conn);
             let mut buf = vec![0u8; 8192];

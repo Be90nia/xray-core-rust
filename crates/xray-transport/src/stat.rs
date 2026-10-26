@@ -127,6 +127,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：计数 server 任务")]
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut conn = CounterConnection::new(TcpConnection::new(stream));
@@ -154,6 +155,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：计数 server 任务")]
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let conn = CounterConnection::new(TcpConnection::new(stream));
@@ -169,6 +171,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：计数 server 任务")]
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
             let conn = CounterConnection::new(TcpConnection::new(stream));

@@ -633,6 +633,10 @@ pub(super) async fn tcp_bridge(
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
     // 唯一写者任务：明文 MC 包字节 → CFB8 加密 → raw（对应 Go cryptoStream 写侧）。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面泵任务（xmc 加密写泵）；迁 FxScope 待 bd 39hko"
+    )]
     tokio::spawn(async move {
         let mut ww = ww;
         while let Some(mut pkt) = rx.recv().await {
@@ -660,6 +664,10 @@ pub(super) async fn tcp_bridge(
     // （对应 Go packetStream.Write）。
     let tx_data = tx.clone();
     let tx_ka = tx.clone();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面泵任务（pipe→raw 分块编码泵）；迁 FxScope 待 bd 39hko"
+    )]
     tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_PACKET_DATA];
         loop {
@@ -685,6 +693,10 @@ pub(super) async fn tcp_bridge(
     // packetStream.Read）；keep alive 客户端回显，其余包吞掉。任务退出（drop
     // pipe_w / tx）即向对端传导断连。
     let tx_read = tx;
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面泵任务（raw→pipe 解密读泵）；迁 FxScope 待 bd 39hko"
+    )]
     tokio::spawn(async move {
         let tx = tx_read;
         loop {
@@ -727,6 +739,10 @@ pub(super) async fn tcp_bridge(
 
     // 服务端 keep alive 循环：每 15s 发递增 id（对应 Go keepAliveLoop，仅 server）。
     if !is_client {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "常驻监控任务（xmc server keepalive 循环）；迁 FxScope 待 bd 39hko"
+        )]
         tokio::spawn(async move {
             let tx = tx_ka;
             let mut id: i64 = 0;
@@ -822,6 +838,7 @@ mod tests {
         };
         // server echo 任务后台跑：io.copy 等待 EOF，而 bridge 读侧任务在连接不断开时
         // 不会退出（与真实 TCP 场景一致——进程退出才拆线），join 它会假死。
+        #[allow(clippy::disallowed_methods, reason = "测试：xmc echo 任务")]
         tokio::spawn(async move {
             let _ = tokio::io::copy(&mut sr, &mut sw).await;
         });
@@ -842,6 +859,7 @@ mod tests {
             let wrapped_client: DynIo = config.wrap_conn_client(Box::new(client_raw)).unwrap();
             let wrapped_server: DynIo = config.wrap_conn_server(Box::new(server_raw)).unwrap();
             let (mut sr, mut sw) = tokio::io::split(wrapped_server);
+            #[allow(clippy::disallowed_methods, reason = "测试：xmc echo 任务（饿死阶梯）")]
             let _echo = tokio::spawn(async move {
                 let _ = tokio::io::copy(&mut sr, &mut sw).await;
             });

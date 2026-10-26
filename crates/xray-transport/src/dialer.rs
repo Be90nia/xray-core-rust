@@ -1172,6 +1172,7 @@ mod transport_cache_tests {
         // TCP 协议走 system_dialer（应能连接本地 listener）。
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：accept 任务")]
         let accept_task = tokio::spawn(async move {
             let _ = listener.accept().await;
         });
@@ -1307,6 +1308,7 @@ mod transport_cache_tests {
         rt.block_on(async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
+            #[allow(clippy::disallowed_methods, reason = "测试：accept 任务")]
             let accept_task = tokio::spawn(async move {
                 let _ = listener.accept().await;
             });

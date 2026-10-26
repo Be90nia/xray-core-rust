@@ -539,6 +539,10 @@ impl PacketIoConn {
         let dropped = Arc::new(AtomicU64::new(0));
         let driver_inner = Arc::clone(&inner);
         let dropped_driver = Arc::clone(&dropped);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面泵任务（PacketIo recv 有界队列泵）；迁 FxScope 待 bd 39hko"
+        )]
         let driver = tokio::spawn(async move {
             let mut buf = vec![0u8; UDP_SIZE];
             while let Ok((n, _src)) = driver_inner.recv_from(&mut buf).await {
@@ -557,6 +561,10 @@ impl PacketIoConn {
             }
         });
         let worker_inner = Arc::clone(&inner);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面泵任务（PacketIo send 泵）；迁 FxScope 待 bd 39hko"
+        )]
         let worker = tokio::spawn(async move {
             while let Some(data) = snd_rx.recv().await {
                 // ponytail: send 失败仅记日志——Connection 写入 UDP 失败无 caller 同步点，

@@ -308,6 +308,10 @@ where
             return;
         }
         let write = Arc::clone(&self.write);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面连接任务（ws 心跳 ping 循环，对齐 Go heartbeatPeriod goroutine）；迁 FxScope 待 bd 39hko"
+        )]
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(period);
             // 跳过首次立即 tick（对齐 Go time.Sleep 先睡后 ping）。
@@ -359,6 +363,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：ws mock server 任务")]
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
             let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
@@ -427,6 +432,7 @@ mod tests {
 
         let len = payload.len();
         let (client_io, server_io) = tokio::io::duplex(4096);
+        #[allow(clippy::disallowed_methods, reason = "测试：ws mock server 任务")]
         let server = tokio::spawn(async move {
             let ws = tokio_tungstenite::accept_async(server_io).await.unwrap();
             let (_sink, mut read) = ws.split(); // 保 sink 存活，别让对端收到 Close

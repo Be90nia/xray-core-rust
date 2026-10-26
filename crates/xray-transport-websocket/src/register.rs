@@ -195,6 +195,10 @@ fn spawn_ws_accept_loop(
     let close_notify = Arc::new(tokio::sync::Notify::new());
     let close_notify_clone = close_notify.clone();
     let log_ident = ident.clone();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面连接任务（ws accept 泵）；迁 FxScope 待 bd 39hko"
+    )]
     let accept_loop_handle = tokio::spawn(async move {
         let ident = log_ident;
         loop {
@@ -238,6 +242,10 @@ fn spawn_ws_accept_loop(
     });
     // 意外退出监控：循环只应经 close_notify 分支退出；panic（如 handler 回调
     // panic 沿任务栈炸掉 accept task）会静默杀掉监听——error! 兜底发声。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "常驻监控任务（accept 循环意外退出监控）；迁 FxScope 待 bd 39hko"
+    )]
     tokio::spawn(supervise_accept_loop(tag, ident, accept_loop_handle));
 
     Box::new(WsTransportListener { local_addr, close_notify })
@@ -386,6 +394,10 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
 fn spawn_replenish(pool: &Arc<WsConnectionPool>, key: &PoolKey, params: DialParams) {
     let pool = pool.clone();
     let key = key.clone();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面连接任务（池预连接补拨）；迁 FxScope 待 bd 39hko"
+    )]
     tokio::spawn(async move {
         if !pool.begin_preconnect(&key).await {
             return;
@@ -962,6 +974,7 @@ mod tests {
 
         // echo handler：读到什么写回什么。
         let handler: ConnHandler = Arc::new(|conn| {
+            #[allow(clippy::disallowed_methods, reason = "测试：echo handler 任务")]
             tokio::spawn(async move {
                 let mut conn = conn;
                 let mut buf = [0u8; 1024];
@@ -1210,6 +1223,7 @@ mod tests {
         let accepted_handler = Arc::clone(&accepted);
         let handler: ConnHandler = Arc::new(move |conn| {
             let id = accepted_handler.fetch_add(1, Ordering::SeqCst) as u8;
+            #[allow(clippy::disallowed_methods, reason = "测试：echo handler 任务")]
             tokio::spawn(async move {
                 let mut conn = conn;
                 let mut buf = [0u8; 512];
@@ -1322,6 +1336,7 @@ mod tests {
             ..Default::default()
         };
         let handler: ConnHandler = Arc::new(|conn| {
+            #[allow(clippy::disallowed_methods, reason = "测试：echo handler 任务")]
             tokio::spawn(async move {
                 let mut conn = conn;
                 let mut buf = [0u8; 512];
@@ -1406,6 +1421,7 @@ mod tests {
             settings.finalmask_json = Some(finalmask);
         }
         let handler: ConnHandler = Arc::new(|conn| {
+            #[allow(clippy::disallowed_methods, reason = "测试：echo handler 任务")]
             tokio::spawn(async move {
                 let mut conn = conn;
                 let mut buf = vec![0u8; 16384];

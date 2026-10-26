@@ -1,5 +1,9 @@
-// L3 静态闸存量登记（bd a5r4j/lzzja 切片）：本文件 31 处（29 tokio::spawn + 2 Instant）>20 → 按分层规则挂文件级；FxScope/Clock 迁移收口 bd 39hko。
-#![allow(clippy::disallowed_methods, reason = "outbound.rs 存量 31 处（29 tokio::spawn + 2 std Instant），>20 处/文件按分层规则挂文件级，迁移收口见 bd 39hko")]
+// L3 静态闸存量登记（bd a5r4j/lzzja 切片）：本文件 31 处（29 tokio::spawn + 2 Instant）>20 →
+// 按分层规则挂文件级；FxScope/Clock 迁移收口 bd 39hko。
+#![allow(
+    clippy::disallowed_methods,
+    reason = "outbound.rs 存量 31 处（29 tokio::spawn + 2 std Instant），>20 处/文件按分层规则挂文件级，迁移收口见 bd 39hko"
+)]
 //! Outbound handler 注册：从 BuiltConfig 构建 DialBridge 注册到 SimpleOhm。
 //!
 //! 对应 Go `core.addOutboundHandlers`：遍历配置中的 outbound 列表，

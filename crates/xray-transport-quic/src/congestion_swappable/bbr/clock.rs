@@ -34,6 +34,11 @@ impl DefaultClock {
 }
 
 impl Clock for DefaultClock {
+    // 尾表达式位不可挂语句属性（E0658），allow 上移 fn 级。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "quinn 桥时钟适配器本体（DefaultClock::now），std Instant 是其实现载体；时钟统一上浮 skeleton::clock 待 bd 39hko"
+    )]
     fn now(&self) -> MonoTime {
         // ponytail: 用全局 Instant 比较返回纳秒。base 在首次调用时锁定。
         // 因 Clock trait 是 &self，无法缓存 base，所以用静态 OnceCell 作基准。
@@ -60,6 +65,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods, reason = "测试：显式 base 构造取时")]
     fn default_clock_with_explicit_base() {
         let base = Instant::now();
         sleep(Duration::from_millis(10));

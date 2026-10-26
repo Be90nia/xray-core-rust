@@ -191,11 +191,14 @@ mod tests {
 
     /// echo 回显 server：每连接循环 accept_bi，读到什么写回什么。
     fn spawn_echo_server(endpoint: quinn::Endpoint) {
+        #[allow(clippy::disallowed_methods, reason = "测试：echo server accept 泵")]
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
+                #[allow(clippy::disallowed_methods, reason = "测试：echo 每连接泵")]
                 tokio::spawn(async move {
                     let Ok(conn) = incoming.await else { return };
                     while let Ok((mut tx, mut rx)) = conn.accept_bi().await {
+                        #[allow(clippy::disallowed_methods, reason = "测试：echo 每 stream 泵")]
                         tokio::spawn(async move {
                             let mut buf = vec![0u8; 16 * 1024];
                             loop {

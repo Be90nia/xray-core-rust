@@ -123,7 +123,15 @@ impl XdnsConnClient {
 
         let closed = Arc::new(AtomicBool::new(false));
 
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面泵任务（xdns client recv 泵）；迁 FxScope 待 bd 39hko"
+        )]
         tokio::spawn(recv_loop(state.clone(), inner.clone(), closed.clone(), read_tx, poll_tx));
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面泵任务（xdns client send 泵）；迁 FxScope 待 bd 39hko"
+        )]
         tokio::spawn(send_loop(state.clone(), inner, closed.clone(), write_rx, poll_rx));
 
         Ok(Self { closed, write_tx, read_rx: Mutex::new(read_rx) })

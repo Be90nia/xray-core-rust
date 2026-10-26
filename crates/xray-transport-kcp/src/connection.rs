@@ -173,6 +173,10 @@ impl Connection {
             mss as usize + DATA_SEGMENT_OVERHEAD,
         );
 
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "连接创建时刻锚点（since 字段）；Clock 端口注入待 bd 39hko"
+        )]
         let inner = Arc::new(ConnectionInner {
             meta,
             state: AtomicI32::new(State::Active as i32),
@@ -1330,6 +1334,7 @@ mod tests {
     async fn g7a_no_deadline_16s_expiry_returns_ok_not_error() {
         let (conn, _) = make_connection(1);
         let inner = Arc::clone(&conn.inner);
+        #[allow(clippy::disallowed_methods, reason = "测试：deadline 等待任务")]
         let waiter = tokio::spawn(async move { wait_for_data_input(&inner).await });
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(15)).await;
@@ -1345,6 +1350,7 @@ mod tests {
         let (conn, _) = make_connection(1);
         conn.set_read_deadline(Some(deadline_after(3))).unwrap();
         let inner = Arc::clone(&conn.inner);
+        #[allow(clippy::disallowed_methods, reason = "测试：deadline 等待任务")]
         let waiter = tokio::spawn(async move { wait_for_data_input(&inner).await });
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(2)).await;
@@ -1371,6 +1377,7 @@ mod tests {
         let (conn, _) = make_connection(1);
         let conn = Arc::new(conn);
         conn.set_read_deadline(Some(deadline_after(60))).unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：数据注入生产者任务")]
         let producer = tokio::spawn({
             let conn = Arc::clone(&conn);
             async move {
@@ -1394,6 +1401,7 @@ mod tests {
         conn.set_read_deadline(Some(deadline_before(60))).unwrap();
         conn.set_read_deadline(None).unwrap();
         let inner = Arc::clone(&conn.inner);
+        #[allow(clippy::disallowed_methods, reason = "测试：deadline 等待任务")]
         let waiter = tokio::spawn(async move { wait_for_data_input(&inner).await });
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(15)).await;
@@ -1421,6 +1429,7 @@ mod tests {
         let (conn, _) = make_connection(1);
         let mut kcp = KcpConn::new(Arc::new(conn));
         kcp.inner().set_read_deadline(Some(deadline_after(2))).unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：读路径任务")]
         let reader = tokio::spawn(async move {
             let mut buf = [0u8; 64];
             kcp.read(&mut buf).await
@@ -1439,6 +1448,7 @@ mod tests {
         let (conn, _) = make_connection(1);
         let conn = Arc::new(conn);
         let mut kcp = KcpConn::new(conn.clone());
+        #[allow(clippy::disallowed_methods, reason = "测试：读路径任务")]
         let reader = tokio::spawn(async move {
             use tokio::io::AsyncReadExt as _;
             let mut buf = [0u8; 16];

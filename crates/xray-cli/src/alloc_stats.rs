@@ -10,6 +10,10 @@
 //! loopback 采集用 terminate() 杀进程（Windows TerminateProcess 不跑 atexit），
 //! 且 relay 空闲期无分配，最后一个周期行即近似终值。
 //!
+//! 站点级归集（bd z02z8）：`XRAY_ALLOC_STATS_SITES=1` 额外启用，每周期追加
+//! `[xray-alloc-sites]` 前缀的按站点行（累计 + 周期增量）。标记机制见
+//! `xray_common::alloc_site`；未启用时标记与记账全零开销。
+//!
 //! 仅 feature `mimalloc`（默认开）下由 bin 接线为全局分配器；
 //! `--no-default-features` 回退系统分配器时计数不可用。
 
@@ -21,6 +25,8 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+use xray_common::alloc_site::{SITE_NAMES, SiteSnap};
 
 /// 计数开关：init() 一次性置位，热路径只读。
 static COUNTING: AtomicBool = AtomicBool::new(false);
@@ -37,6 +43,9 @@ static START: OnceLock<Instant> = OnceLock::new();
 
 /// dump 行前缀，采集脚本按此 grep。
 pub const STATS_PREFIX: &str = "[xray-alloc-stats]";
+
+/// 站点行前缀（仅 XRAY_ALLOC_STATS_SITES 开启时输出），采集脚本按此 grep。
+pub const SITES_PREFIX: &str = "[xray-alloc-sites]";
 
 /// 启用判定独立成纯函数便于单测。
 fn parse_flag(v: Option<&str>) -> bool {
@@ -55,6 +64,13 @@ pub fn init() {
         return;
     }
     COUNTING.store(true, Ordering::Relaxed);
+    // 站点归集是计数器的附加开关：主开关关时整体直通（零开销纪律）。
+    let sites_raw = std::env::var("XRAY_ALLOC_STATS_SITES").ok();
+    xray_common::alloc_site::set_enabled(parse_flag(sites_raw.as_deref()));
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "alloc-stats 诊断启动锚点取时；Clock 端口注入待 bd 39hko"
+    )]
     let _ = START.set(Instant::now());
     let interval_raw = std::env::var("XRAY_ALLOC_STATS_INTERVAL_MS").ok();
     let interval = Duration::from_millis(parse_interval_ms(interval_raw.as_deref()));
@@ -62,15 +78,16 @@ pub fn init() {
     std::thread::Builder::new()
         .name("alloc-stats".into())
         .spawn(move || {
+            let mut prev_sites: Option<[SiteSnap; SITE_NAMES.len()]> = None;
             loop {
                 std::thread::sleep(interval);
-                dump();
+                dump(&mut prev_sites);
             }
         })
         .expect("spawn alloc-stats dumper thread");
 }
 
-fn dump() {
+fn dump(prev_sites: &mut Option<[SiteSnap; SITE_NAMES.len()]>) {
     let a_n = ALLOC_N.load(Ordering::Relaxed);
     let a_b = ALLOC_BYTES.load(Ordering::Relaxed);
     let d_n = DEALLOC_N.load(Ordering::Relaxed);
@@ -81,6 +98,23 @@ fn dump() {
          dealloc_n={d_n} dealloc_bytes={d_b} live_bytes={}",
         a_b.wrapping_sub(d_b)
     );
+    if xray_common::alloc_site::enabled() {
+        let snap = xray_common::alloc_site::snapshot();
+        // 周期增量：dump 线程序列化输出，prev 即上一周期末累计；首周期增量 = 累计
+        // （起点 = 进程零时刻）。累计口径无周期边界误差，站点行供脚本对账。
+        let prev = prev_sites.unwrap_or([SiteSnap { n: 0, bytes: 0 }; SITE_NAMES.len()]);
+        for (i, name) in SITE_NAMES.iter().enumerate().skip(1) {
+            eprintln!(
+                "{SITES_PREFIX} t={t:.3}s site={name} alloc_n={} alloc_bytes={} \
+                 d_n={} d_bytes={}",
+                snap[i].n,
+                snap[i].bytes,
+                snap[i].n - prev[i].n,
+                snap[i].bytes - prev[i].bytes,
+            );
+        }
+        *prev_sites = Some(snap);
+    }
 }
 
 /// 全局分配器 wrapper：内层为 mimalloc（或测试中的任意 GlobalAlloc）。
@@ -96,6 +130,14 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for StatsAlloc<A> {
         if COUNTING.load(Ordering::Relaxed) && !ptr.is_null() {
             ALLOC_N.fetch_add(1, Ordering::Relaxed);
             ALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            // 站点归集（XRAY_ALLOC_STATS_SITES）：附加开关关闭时仅多一次
+            // Relaxed load；current() 是 const-init TLS 访问，无分配不重入。
+            if xray_common::alloc_site::enabled() {
+                let site = xray_common::alloc_site::current();
+                if site != xray_common::alloc_site::NONE {
+                    xray_common::alloc_site::record(site, 1, layout.size() as u64);
+                }
+            }
         }
         ptr
     }
@@ -118,6 +160,10 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for StatsAlloc<A> {
 mod tests {
     use super::*;
 
+    /// 同进程并行测试共享 COUNTING 静态：置位的用例互斥，避免窗口互相污染
+    /// （精确 +1 断言要求窗口内无其他计数源）。
+    static COUNTING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn flag_parsing() {
         assert!(parse_flag(Some("1")));
@@ -138,22 +184,73 @@ mod tests {
 
     #[test]
     fn counters_move_through_wrapper() {
+        let _lock = COUNTING_LOCK.lock().unwrap();
         // 用 System 作为内层分配器直接驱动 wrapper，验证计数路径。
         use std::alloc::System;
         COUNTING.store(true, Ordering::Relaxed);
         let alloc = StatsAlloc(System);
         let before_n = ALLOC_N.load(Ordering::Relaxed);
         let before_b = ALLOC_BYTES.load(Ordering::Relaxed);
+        let before_dn = DEALLOC_N.load(Ordering::Relaxed);
+        let before_db = DEALLOC_BYTES.load(Ordering::Relaxed);
         let layout = Layout::from_size_align(128, 8).unwrap();
         // SAFETY: layout=(128,8) 合法；ptr 所有权归测试并配对 dealloc
         let ptr = unsafe { alloc.alloc(layout) };
         assert!(!ptr.is_null());
-        assert_eq!(ALLOC_N.load(Ordering::Relaxed), before_n + 1);
-        assert_eq!(ALLOC_BYTES.load(Ordering::Relaxed), before_b + 128);
+        // COUNTING=true 时同进程其他 libtest 线程的分配也计入全局计数——精确
+        // 总数（==before+1）在并行进程里不可断言，改相对增量（计数通路仍被钉死：
+        // 至少本线程这一笔必须入账，字节数同理）。
+        assert!(ALLOC_N.load(Ordering::Relaxed) > before_n);
+        assert!(ALLOC_BYTES.load(Ordering::Relaxed) >= before_b + 128);
         // SAFETY: 与上行 alloc 配对，layout 一致且未释放过
         unsafe { alloc.dealloc(ptr, layout) };
-        assert_eq!(DEALLOC_N.load(Ordering::Relaxed), 1);
+        assert!(DEALLOC_N.load(Ordering::Relaxed) > before_dn);
+        assert!(DEALLOC_BYTES.load(Ordering::Relaxed) >= before_db + 128);
         // 还原开关，避免影响并行测试进程内的其他用例（同进程测试共享静态）。
         COUNTING.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn site_scoped_accounting_and_zero_when_disabled() {
+        let _lock = COUNTING_LOCK.lock().unwrap();
+        use std::alloc::System;
+        let alloc = StatsAlloc(System);
+        let layout = Layout::from_size_align(96, 8).unwrap();
+        let site = |id: usize| xray_common::alloc_site::snapshot()[id];
+
+        // 未启用（默认态）：站点计数零增量——零记账验收。
+        let before = site(xray_common::alloc_site::TLS_WRITE as usize);
+        // SAFETY: layout=(96,8) 合法；ptr 所有权归测试并配对 dealloc
+        let ptr = unsafe { alloc.alloc(layout) };
+        assert!(!ptr.is_null());
+        // SAFETY: 与上行 alloc 配对，layout 一致且未释放过
+        unsafe { alloc.dealloc(ptr, layout) };
+        assert_eq!(
+            site(xray_common::alloc_site::TLS_WRITE as usize).n,
+            before.n,
+            "未启用时站点记账必须为零"
+        );
+
+        // 启用：守卫作用域内的 alloc 归集到站点，作用域外不归集。
+        COUNTING.store(true, Ordering::Relaxed);
+        xray_common::alloc_site::set_enabled(true);
+        let before = site(xray_common::alloc_site::TLS_WRITE as usize);
+        let before_none = site(xray_common::alloc_site::NONE as usize);
+        {
+            let _g = xray_common::alloc_site::enter(xray_common::alloc_site::TLS_WRITE);
+            // SAFETY: layout 合法；ptr 配对 dealloc
+            let ptr = unsafe { alloc.alloc(layout) };
+            assert!(!ptr.is_null());
+            // SAFETY: 与上行 alloc 配对
+            unsafe { alloc.dealloc(ptr, layout) };
+        }
+        let after = site(xray_common::alloc_site::TLS_WRITE as usize);
+        assert_eq!(after.n, before.n + 1);
+        assert_eq!(after.bytes, before.bytes + 96);
+        // NONE 位恒不记账。
+        assert_eq!(site(xray_common::alloc_site::NONE as usize).n, before_none.n);
+        // 还原开关，避免影响并行测试进程内的其他用例（同进程测试共享静态）。
+        COUNTING.store(false, Ordering::Relaxed);
+        xray_common::alloc_site::set_enabled(false);
     }
 }

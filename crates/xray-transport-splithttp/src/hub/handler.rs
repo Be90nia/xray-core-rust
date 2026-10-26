@@ -23,6 +23,7 @@ use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
 use hyper::{Method, Request, Response, StatusCode, body::Frame};
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tokio_util::io::ReaderStream;
+use xray_common::alloc_site;
 
 use super::{HubConnHandler, ServerConn, ServerConnCloseSignal, SessionMap, meta::extract_meta};
 use crate::{
@@ -403,9 +404,18 @@ where
     // with_capacity(64KB)：tokio-util 默认容量 4096B 会把 DATA 帧粒度钉死在
     // 4KB——高 RTT 路径（CF tunnel）帧数/唤醒数放大 ~16x，是 xhttp 吞吐缺陷主因。
     // 对照 Go：dispatcher MultiBuffer 合并写 + httpServerConn.Write 每写即 Flush。
-    let dl_stream =
+    let mut dl_stream =
         ReaderStream::with_capacity(GuardedReader { inner: dl_rx, _guard: guard }, DUPLEX_BUF);
-    let body = StreamBody::new(dl_stream.map_ok(Frame::data)).boxed();
+    // 站点归因（z02z8）：守卫包住逐帧产出段（ReaderStream 每帧 BytesMut 缓冲）；
+    // hyper 自身 DATA 帧缓冲在本守卫动态范围之外，仍归"未标记"。
+    let body = StreamBody::new(
+        futures_util::stream::poll_fn(move |cx| {
+            let _site = alloc_site::enter(alloc_site::XHTTP_SRV_SEND);
+            futures_util::StreamExt::poll_next_unpin(&mut dl_stream, cx)
+        })
+        .map_ok(Frame::data),
+    )
+    .boxed();
 
     // 构造 ServerConn 并交给 dispatcher
     let conn = ServerConn {

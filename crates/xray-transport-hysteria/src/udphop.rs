@@ -226,6 +226,10 @@ impl UdpHopPacketConn {
         let recv_tx_clone = recv_tx.clone();
         let conn_for_recv = Arc::clone(&current_conn);
         let pool_for_recv = Arc::clone(&pool);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面连接任务（UDP hop recv 泵）；迁 FxScope 待 bd 39hko"
+        )]
         let recv_handle = tokio::spawn(async move {
             recv_loop(conn_for_recv, recv_tx_clone, pool_for_recv).await;
         });
@@ -234,6 +238,10 @@ impl UdpHopPacketConn {
         let hop_inner = Arc::clone(&inner);
         let hop_recv_tx = recv_tx.clone();
         let pool_for_hop = Arc::clone(&pool);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面连接任务（UDP hop 换口循环）；迁 FxScope 待 bd 39hko"
+        )]
         let hop_handle = tokio::spawn(async move {
             hop_loop(hop_inner, hop_recv_tx, pool_for_hop).await;
         });
@@ -445,6 +453,10 @@ async fn hop_once(
     let tx = recv_tx.clone();
     let conn_for_recv = Arc::clone(&new_conn);
     let pool_for_recv = Arc::clone(pool);
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面连接任务（换口后新 recv 泵）；迁 FxScope 待 bd 39hko"
+    )]
     tokio::spawn(async move {
         recv_loop(conn_for_recv, tx, pool_for_recv).await;
     });

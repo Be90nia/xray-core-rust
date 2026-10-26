@@ -55,6 +55,7 @@ async fn naked_tcp_finalmask_xmc_roundtrip_131072() {
 
         let data = payload();
         let expect = data.clone();
+        #[allow(clippy::disallowed_methods, reason = "测试：mask echo server 任务")]
         let server = tokio::spawn(async move {
             let (mut conn, _peer) = listener.accept_masked().await.expect("accept_masked");
             assert!(conn.plain().is_none(), "服务端必须走 mask 包装");

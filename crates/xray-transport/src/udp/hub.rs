@@ -15,6 +15,7 @@
 
 use std::{io, net::SocketAddr, sync::Arc};
 
+use skeleton_infra::fx::FxScope;
 use tokio::{
     net::UdpSocket,
     sync::{Notify, mpsc},
@@ -95,6 +96,10 @@ pub struct UdpHub {
     rx: Option<mpsc::Receiver<UdpPacket>>,
     close_notify: Arc<Notify>,
     recv_orig_dest: bool,
+    /// B6（bd 39hko 切片1）：recv 循环唯一托管口（坑约束 5）。协作停机仍走
+    /// close_notify；scope 随 hub drop 兜底 abort——socket 归 hub+循环共享，
+    /// 旧形态 drop 不 close = 循环持 socket 永驻（abort 收口为显式行为）。
+    fx: Arc<FxScope>,
 }
 
 impl UdpHub {
@@ -138,17 +143,21 @@ impl UdpHub {
         let (tx, rx) = mpsc::channel::<UdpPacket>(builder.capacity);
         let close_notify = Arc::new(Notify::new());
 
+        // B6（bd 39hko 切片1）：任务托管收口（坑约束 5）；闸关不可达，expect 只防
+        // 编程错误（realm/conn.rs 同形）。
+        let fx = Arc::new(FxScope::new());
         let hub = Self {
             socket: Arc::clone(&socket),
             io: io.clone(),
             rx: Some(rx),
             close_notify: Arc::clone(&close_notify),
             recv_orig_dest: builder.recv_orig_dest,
+            fx: Arc::clone(&fx),
         };
 
         // Spawn recv 循环。
         let recv_orig_dest = hub.recv_orig_dest;
-        tokio::spawn(async move {
+        fx.spawn(async move {
             match io {
                 Some(io) => {
                     start_recv_loop_masked(&io, tx, close_notify).await;
@@ -157,7 +166,8 @@ impl UdpHub {
                     start_recv_loop(&socket, tx, close_notify, recv_orig_dest).await;
                 },
             }
-        });
+        })
+        .expect("internal FxScope is never closed");
 
         Ok(hub)
     }
@@ -170,7 +180,12 @@ impl UdpHub {
     pub fn receive(mut self) -> mpsc::Receiver<UdpPacket> {
         // ponytail: 消费 receiver，让调用方直接 await。
         // 如果需要多次获取，改用 Arc<Mutex<Receiver>> 或 watch channel。
-        self.rx.take().expect("receive() called twice")
+        let rx = self.rx.take().expect("receive() called twice");
+        // hub 被消费后无人能再调 close——recv 循环语义 = detached 永驻（迁移前
+        // 同形）。forget scope 防随 self drop 把循环 abort（JoinSet drop = abort）；
+        // 泄漏面 = 单个 scope 容器，循环任务本身仍受托管记账。
+        std::mem::forget(self.fx);
+        rx
     }
 
     /// 拆分 hub：`(收包 receiver, 共享发送端)`。
@@ -610,6 +625,33 @@ mod tests {
         let addr = hub.local_addr().expect("local_addr 失败");
         assert_eq!(addr.ip().to_string(), "127.0.0.1");
         assert_ne!(addr.port(), 0);
+    }
+
+    /// 停机 → 端口释放（bd 39hko 切片1 验收④）：close → recv 循环退出 →
+    /// drop hub（托管 scope 随之收口，socket 归 hub+循环共享）→ 端口可重绑。
+    #[tokio::test]
+    async fn udp_hub_stop_releases_port() {
+        let hub =
+            UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None).await.expect("listen 失败");
+        let addr = hub.local_addr().expect("local_addr 失败");
+
+        hub.close().expect("close 失败");
+        drop(hub);
+
+        // 端口释放证据：同端口可重新 bind。recv 循环退出经 runtime 异步生效
+        //（close_notify 唤醒 / scope abort），5s 墙钟上限轮询。
+        let wait_release = async {
+            loop {
+                if let Ok(sock) = UdpSocket::bind(addr).await {
+                    drop(sock);
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), wait_release)
+            .await
+            .expect("udp port not released after close");
     }
 
     #[tokio::test]

@@ -503,6 +503,10 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
             // API，用 accept_with 给每个 incoming 配带独立 swappable factory 的
             // transport config）。
             let ep = endpoint.clone();
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "数据面连接任务（hysteria accept 泵）；迁 FxScope 待 bd 39hko"
+            )]
             tokio::spawn(async move {
                 while let Some(incoming) = ep.accept().await {
                     let validator = validator.clone();
@@ -514,6 +518,10 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
                     let (tc, cc_slot) = build_hysteria_transport_config(&qc);
                     let mut server_config = template.clone();
                     server_config.transport_config(Arc::new(tc));
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "数据面连接任务（每 QUIC conn 认证+服务）；迁 FxScope 待 bd 39hko"
+                    )]
                     tokio::spawn(async move {
                         match incoming.accept_with(Arc::new(server_config)) {
                             Ok(connecting) => match connecting.await {
@@ -871,6 +879,10 @@ async fn h3_auth(
                     // ——替代旧 `mem::forget`：h3 状态生命周期 = 连接生命周期，
                     // 连接 churn 不再累积泄漏。
                     let hold_conn = conn.clone();
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "数据面连接任务（h3 状态 detached 持有，替代 mem::forget）；迁 FxScope 待 bd 39hko"
+                    )]
                     tokio::spawn(async move {
                         let _held = h3_server;
                         let _ = hold_conn.closed().await;
@@ -949,6 +961,10 @@ impl HysteriaHttp3Server for QuinnHttp3Server {
                 match h3_conn.accept().await {
                     Ok(Some(resolver)) => {
                         let h = handler.clone();
+                        #[allow(
+                            clippy::disallowed_methods,
+                            reason = "数据面连接任务（h3 请求 resolver 泵）；迁 FxScope 待 bd 39hko"
+                        )]
                         tokio::spawn(async move {
                             let (req, mut stream) = match resolver.resolve_request().await {
                                 Ok(v) => v,
@@ -1247,6 +1263,7 @@ mod tests {
         // ponytail: server_endpoint Arc 必须由调用方持有，否则 task 完成后 endpoint drop
         // → 所有 connection 进入 idle 关闭流程（accept_bi 30s 超时）
         let ep_for_task = std::sync::Arc::clone(&server_endpoint);
+        #[allow(clippy::disallowed_methods, reason = "测试：QUIC server 握手任务")]
         let server_task = tokio::spawn(async move {
             let incoming = ep_for_task.accept().await.unwrap();
             let conn = incoming.await.unwrap();
@@ -1887,6 +1904,7 @@ mod tests {
         let conn = ep.connect(server_addr, "localhost").unwrap().await.unwrap();
         let (mut driver, mut send_req) =
             h3::client::new(h3_quinn::Connection::new(conn)).await.unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：h3 client driver 任务")]
         tokio::spawn(async move {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
@@ -1985,6 +2003,7 @@ mod tests {
         let conn = ep.connect(server_addr, "localhost").unwrap().await.unwrap();
         let (mut driver, mut send_req) =
             h3::client::new(h3_quinn::Connection::new(conn)).await.unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：h3 client driver 任务")]
         tokio::spawn(async move {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
@@ -2011,6 +2030,7 @@ mod tests {
         let conn2 = ep.connect(server_addr, "localhost").unwrap().await.unwrap();
         let (mut driver2, mut send_req2) =
             h3::client::new(h3_quinn::Connection::new(conn2)).await.unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：h3 client driver 任务")]
         tokio::spawn(async move {
             let _ = std::future::poll_fn(|cx| driver2.poll_close(cx)).await;
         });

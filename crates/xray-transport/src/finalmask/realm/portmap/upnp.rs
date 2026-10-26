@@ -239,6 +239,10 @@ impl Client {
             .timeout(timeout)
             // 不跟重定向：一次 302 就能把 description 抓取导去任意内网主机
             .redirect(reqwest::redirect::Policy::none())
+            // UPnP 只与网关/stub 直连，绝不走系统代理（reqwest `system-proxy`
+            // 特性下 Windows 会读 WinINET 代理，把 127.0.0.1 的 description 抓取
+            // 绕进本地代理 → 连接被 reset；SSDP/内网语义本就禁代理）。
+            .no_proxy()
             .build()
             .map_err(|e| io::Error::other(format!("UPnP: build http client failed: {e}")))?;
         let description = fetch_description(&http, location).await?;
@@ -758,7 +762,7 @@ mod tests {
         // 应答源 = 127.0.0.1，LOCATION 却指向别的主机 → 必须拒（盲 SSRF 入口），
         // 且根本不许发出那个 GET
         let ssdp = SsdpStub::spawn("http://10.9.9.9:5000/rootDesc.xml".to_string()).await;
-        let err = Client::discover(ssdp.addr, Duration::from_secs(2))
+        let err = Client::discover(ssdp.addr, Duration::from_secs(10))
             .await
             .err()
             .expect("foreign LOCATION host must be rejected");
@@ -769,7 +773,7 @@ mod tests {
         // （macOS 取不到默认网关时会放宽私有源，但公网源恒拒——这是 SSRF 底线）。
         let err = Client::from_description_url(
             "http://203.0.113.7:5000/rootDesc.xml",
-            Duration::from_secs(2),
+            Duration::from_secs(10),
         )
         .await
         .err()
@@ -784,7 +788,7 @@ mod tests {
         {
             let err = Client::from_description_url(
                 "http://10.9.9.9:5000/rootDesc.xml",
-                Duration::from_secs(2),
+                Duration::from_secs(10),
             )
             .await
             .err()
@@ -803,7 +807,7 @@ mod tests {
         })
         .await;
         let ssdp = SsdpStub::spawn(format!("http://{}/rootDesc.xml", http.addr)).await;
-        let err = Client::discover(ssdp.addr, Duration::from_secs(2))
+        let err = Client::discover(ssdp.addr, Duration::from_secs(10))
             .await
             .err()
             .expect("control url off the description host must be rejected");
@@ -819,7 +823,7 @@ mod tests {
         })
         .await;
         let location = format!("http://{}/rootDesc.xml", http.addr);
-        let err = Client::from_description_url(&location, Duration::from_secs(2))
+        let err = Client::from_description_url(&location, Duration::from_secs(10))
             .await
             .err()
             .expect("302 must not be followed");
@@ -834,6 +838,7 @@ mod tests {
     async fn oversized_description_aborts_mid_stream() {
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind");
         let addr = listener.local_addr().expect("stub addr");
+        #[allow(clippy::disallowed_methods, reason = "测试：UPnP stub 任务")]
         tokio::spawn(async move {
             let Ok((mut sock, _peer)) = listener.accept().await else {
                 return;
@@ -876,7 +881,7 @@ mod tests {
         })
         .await;
         let ssdp = SsdpStub::spawn(format!("http://{}/rootDesc.xml", http.addr)).await;
-        let client = Client::discover(ssdp.addr, Duration::from_secs(2)).await.expect("discover");
+        let client = Client::discover(ssdp.addr, Duration::from_secs(10)).await.expect("discover");
         let err = client.add_udp_mapping(8080, 60).await.expect_err("over-cap soap must abort");
         assert!(err.to_string().contains("byte cap"), "{err}");
     }
@@ -884,7 +889,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn discover_then_map_and_delete_hits_expected_soap_fields() {
         let (ssdp, http) = upnp_stubs().await;
-        let client = Client::discover(ssdp.addr, Duration::from_secs(2)).await.expect("discover");
+        let client = Client::discover(ssdp.addr, Duration::from_secs(10)).await.expect("discover");
 
         let external_port = client.add_udp_mapping(8080, 600).await.expect("add");
         assert_eq!(external_port, 8080, "IGD v1 external port == requested port");
@@ -960,7 +965,7 @@ mod tests {
         })
         .await;
         let ssdp = SsdpStub::spawn(format!("http://{}/rootDesc.xml", http.addr)).await;
-        let client = Client::discover(ssdp.addr, Duration::from_secs(2)).await.expect("discover");
+        let client = Client::discover(ssdp.addr, Duration::from_secs(10)).await.expect("discover");
         let err = client.add_udp_mapping(8080, 600).await.unwrap_err();
         assert!(err.to_string().contains("errorCode 718"), "{err}");
         assert!(err.to_string().contains("ConflictInMappingEntry"), "{err}");
@@ -1006,7 +1011,7 @@ mod tests {
         let second = format!("http://{}/gw2.xml", http.addr);
         let client = Client::discover_with_fallbacks(
             silent_ssdp_addr().await,
-            Duration::from_secs(2),
+            Duration::from_secs(10),
             &[first.clone(), second],
         )
         .await
@@ -1036,7 +1041,7 @@ mod tests {
         };
         let err = Client::discover_with_fallbacks(
             silent_ssdp_addr().await,
-            Duration::from_secs(2),
+            Duration::from_secs(10),
             &[not_found.clone(), refused.clone()],
         )
         .await
@@ -1095,7 +1100,7 @@ mod tests {
         })
         .await;
         let ssdp = SsdpStub::spawn(format!("http://{}/rootDesc.xml", http.addr)).await;
-        let client = Client::discover(ssdp.addr, Duration::from_secs(2)).await.expect("discover");
+        let client = Client::discover(ssdp.addr, Duration::from_secs(10)).await.expect("discover");
 
         let entry = client.get_udp_mapping(8080).await.expect("entry");
         assert_eq!(

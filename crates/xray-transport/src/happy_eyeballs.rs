@@ -275,6 +275,7 @@ mod tests {
     #[tokio::test]
     async fn race_slow_v6_fast_v4_picks_v4() {
         let addrs = [addr(v6(1), 80), addr(v4(1), 80)];
+        #[allow(clippy::disallowed_methods, reason = "测试：竞速时序锚点")]
         let start = StdInstant::now();
         let winner: io::Result<String> =
             race_dial(&addrs, Duration::from_millis(50), 2, |idx: usize| async move {
@@ -325,6 +326,7 @@ mod tests {
     #[tokio::test]
     async fn race_backfills_immediately_after_failure() {
         let addrs = [addr(v6(1), 80), addr(v4(1), 80)];
+        #[allow(clippy::disallowed_methods, reason = "测试：竞速时序锚点")]
         let start = StdInstant::now();
         let winner: io::Result<String> = race_dial(
             &addrs,
@@ -367,6 +369,7 @@ mod tests {
             }
             return;
         }
+        #[allow(clippy::disallowed_methods, reason = "测试：happy-eyeballs echo 任务")]
         let echo = tokio::spawn(async move {
             let (mut c, _) = v4l.accept().await.unwrap();
             let mut b = [0u8; 3];

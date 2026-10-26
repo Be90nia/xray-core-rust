@@ -242,6 +242,7 @@ mod tests {
             transport_json: Some(serde_json::json!({"serviceName":"GunService"})),
             ..StreamSettings::tcp()
         };
+        #[allow(clippy::disallowed_methods, reason = "测试：dial 重试观测任务")]
         let dial_task = tokio::spawn(async move { dial_grpc(&dest, &settings).await });
         // 跨过 ≥2 个首退避周期（500ms×1.2=600ms 上界；1600ms 足够第 2 轮尝试开始）：
         // dial 必须仍在重试，不得返回终态错误。
@@ -470,6 +471,7 @@ mod tests {
         };
 
         let handler: ConnHandler = std::sync::Arc::new(|conn| {
+            #[allow(clippy::disallowed_methods, reason = "测试：echo handler 任务")]
             tokio::spawn(async move {
                 let mut conn = conn;
                 let mut buf = [0u8; 1024];

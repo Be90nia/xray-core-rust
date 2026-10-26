@@ -29,6 +29,10 @@ impl StateStore {
     /// 读取 key 的 vars 副本；过期则清理并返回 None。
     pub fn get(&self, key: &str) -> Option<HashMap<String, Vec<u8>>> {
         let mut entries = self.entries.lock();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "状态 TTL 过期判定；Clock 端口注入待 bd 39hko"
+        )]
         let expired = matches!(entries.get(key), Some(e) if Instant::now() > e.expires_at);
         if expired {
             entries.remove(key);
@@ -40,6 +44,7 @@ impl StateStore {
     /// 写入 key 的 vars（深拷贝，TTL = now + ttl）。
     pub fn set(&self, key: &str, vars: &HashMap<String, Vec<u8>>) {
         let mut entries = self.entries.lock();
+        #[allow(clippy::disallowed_methods, reason = "状态 TTL 锚点；Clock 端口注入待 bd 39hko")]
         entries.insert(
             key.to_string(),
             StateEntry { vars: clone_vars(vars), expires_at: Instant::now() + self.ttl },

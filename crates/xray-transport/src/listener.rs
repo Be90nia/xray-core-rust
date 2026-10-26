@@ -79,6 +79,7 @@ mod tests {
             TcpListenerConn::bind("127.0.0.1:0".parse().unwrap()).await.expect("bind 失败");
         let bound = listener.local_addr().expect("local_addr 失败");
 
+        #[allow(clippy::disallowed_methods, reason = "测试：pong server 任务")]
         let server = tokio::spawn(async move {
             let mut conn = listener.accept().await.expect("accept 失败");
             // pong 回客户端
@@ -111,6 +112,7 @@ mod tests {
             TcpListenerConn::bind("127.0.0.1:0".parse().unwrap()).await.expect("bind 失败");
         let bound = listener.local_addr().expect("local_addr 失败");
 
+        #[allow(clippy::disallowed_methods, reason = "测试：pong server 任务")]
         let server = tokio::spawn(async move {
             let mut conn = listener.accept().await.expect("accept 失败");
             // 读取客户端发来的字节后原样回写

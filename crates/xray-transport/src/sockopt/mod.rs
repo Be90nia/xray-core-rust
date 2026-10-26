@@ -1215,6 +1215,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         // spawn acceptor
+        #[allow(clippy::disallowed_methods, reason = "测试：accept 任务")]
         let accept_task = tokio::spawn(async move {
             let _ = listener.accept().await;
         });
@@ -1270,6 +1271,7 @@ mod tests {
     async fn apply_socket_options_with_tfo_congestion_tproxy() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：accept 任务")]
         let accept_task = tokio::spawn(async move {
             let _ = listener.accept().await;
         });
@@ -1338,6 +1340,7 @@ mod tests {
     async fn apply_tfo_outbound_does_not_panic_on_default_socket() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：accept 任务")]
         let accept_task = tokio::spawn(async move {
             let _ = listener.accept().await;
         });
@@ -1380,6 +1383,7 @@ mod tests {
     async fn apply_tproxy_outbound_returns_err_for_unprivileged() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：accept 任务")]
         let accept_task = tokio::spawn(async move {
             let _ = listener.accept().await;
         });
@@ -1407,6 +1411,7 @@ mod tests {
     async fn keepalive_config_either_field_enables() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：accept 任务")]
         let accept_task = tokio::spawn(async move {
             let _ = listener.accept().await;
         });
@@ -1631,6 +1636,7 @@ mod tests {
     async fn custom_sockopt_int_applies_on_real_socket() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：accept 任务")]
         let accept_task = tokio::spawn(async move {
             let _ = listener.accept().await;
         });
@@ -1662,6 +1668,7 @@ mod tests {
     async fn custom_sockopt_filter_and_error_paths() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：accept 任务")]
         let accept_task = tokio::spawn(async move {
             let _ = listener.accept().await;
         });

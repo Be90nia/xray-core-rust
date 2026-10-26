@@ -559,6 +559,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：TCP server 任务")]
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             TcpConnection::new(stream)
@@ -584,6 +585,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：TCP server 任务")]
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let conn: Box<dyn Connection> = Box::new(TcpConnection::new(stream));
@@ -605,6 +607,7 @@ mod tests {
     async fn tcp_connection_into_inner_recovers_stream() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：TCP server 任务")]
         let server = tokio::spawn(async move {
             let (_s, _) = listener.accept().await.unwrap();
         });

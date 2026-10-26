@@ -292,6 +292,10 @@ async fn authenticate_via_h3(
     // 持续 poll h3 driver：推进 control/QPACK stream（读取服务端 SETTINGS、QPACK encoder 流）。
     // h3 官方测试在 client_fut 中 tokio::join! 同等 driver future；hysteria 用独立 task
     // 保活+推进，直到连接关闭（poll_close 返回）。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面连接任务（h3 driver 保活）；迁 FxScope 待 bd 39hko"
+    )]
     let driver_task = tokio::spawn(async move {
         use std::future::poll_fn;
         let _ = poll_fn(|cx| driver.poll_close(cx)).await;

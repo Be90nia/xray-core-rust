@@ -296,6 +296,10 @@ fn max_blocking_threads() -> usize {
 /// 早期信号）；平水位 debug。run 模式订阅者挂载前（≤30s 窗口）的采样静默丢弃
 /// 属预期——启动基线由 log_runtime_snapshot 覆盖。
 fn spawn_blocking_pool_monitor() {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "常驻监控任务（HC-1 路线 B blocking 池水位采样）；迁 FxScope 待 bd 39hko"
+    )]
     tokio::spawn(async {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

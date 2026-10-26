@@ -1,4 +1,9 @@
 //! gRPC transport: h2 client/server tunnel.
+// L3 存量登记（bd a5r4j/lzzja 剩余切片）：本文件 21 处裸 spawn（生产 6 + 测试 15），
+// 超 20 处/文件分层阈值 → 文件头 inner allow。构成：数据面连接/泵任务（h2 conn
+// driver、grpc accept 泵、duplex 桥 copy 泵等）+ 测试 echo/handshake 任务；
+// 逐点登记属性海不经济。FxScope 迁移统一收口 bd 39hko——迁移完成后本文件应改回逐点登记。
+#![allow(clippy::disallowed_methods)]
 
 use std::{
     io,

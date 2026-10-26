@@ -119,6 +119,10 @@ async fn listen_hysteria(
     // endpoint 永不释放成幽灵 inbound，对齐 Go hub.go Close=listener+tr.Close）。
     let quic_listener = listener.clone();
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面连接任务（hysteria accept 泵）；迁 FxScope 待 bd 39hko"
+    )]
     let accept_task = tokio::spawn(async move {
         use xray_transport::accept_policy::{AcceptErrorKind, backoff_if_resource, classify};
         loop {
@@ -144,6 +148,10 @@ async fn listen_hysteria(
                 },
             };
             let h = handler.clone();
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "数据面连接任务（每 QUIC conn 桥接）；迁 FxScope 待 bd 39hko"
+            )]
             tokio::spawn(async move {
                 accept_hysteria_conn(conn, h).await;
             });
@@ -152,6 +160,10 @@ async fn listen_hysteria(
     let abort = accept_task.abort_handle();
     // 意外退出监控：循环只应经 close() 的 abort 退出；panic 会静默杀掉监听——
     // error! 兜底发声。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "常驻监控任务（accept 循环意外退出监控）；迁 FxScope 待 bd 39hko"
+    )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "hysteria",
         local.to_string(),
@@ -215,6 +227,10 @@ impl TransportListener for HysteriaTransportListener {
         // trait close 是 async（内部 ep.close 同步生效）；TransportListener::close
         // 是同步 fn，spawn 之。调用方均在 runtime 上下文（生产 instance close / 测试）。
         let l = self.listener.clone();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "停机桥接任务（同步 close 桥 async ep.close）；迁 FxScope 待 bd 39hko"
+        )]
         tokio::spawn(async move {
             let _ = l.close().await;
         });

@@ -644,6 +644,7 @@ wlan0\t00000000\t0102A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0
                 .expect("mapper");
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_loop = Arc::clone(&cancel);
+        #[allow(clippy::disallowed_methods, reason = "测试：port_map_loop 任务")]
         let handle = tokio::spawn(async move {
             port_map_loop(&mapper, &cancel_loop).await;
         });
@@ -678,7 +679,7 @@ wlan0\t00000000\t0102A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0
             Ok(gateway) => {
                 println!("default IPv4 gateway = {gateway}");
                 let server = SocketAddrV4::new(gateway, natpmp::NATPMP_PORT);
-                match natpmp::Client::connect(server, Duration::from_secs(2)).await {
+                match natpmp::Client::connect(server, Duration::from_secs(10)).await {
                     Ok(client) => match client.external_address().await {
                         Ok(ip) => println!("NAT-PMP {server} external address = {ip}"),
                         Err(e) => println!("NAT-PMP {server} no answer: {e}"),

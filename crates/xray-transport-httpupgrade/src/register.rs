@@ -215,6 +215,10 @@ async fn listen_httpupgrade(
     server.trusted_x_forwarded_for = sockopt.trusted_x_forwarded_for.clone();
     // accept task 的 abort 句柄：close() 直接取消 task，parked 在 accept() 上的
     // 循环被确定性解除，TcpListener drop 即释放端口（对齐 Go hub.go Close()）。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面连接任务（httpupgrade accept 泵）；迁 FxScope 待 bd 39hko"
+    )]
     let accept_task = tokio::spawn(async move {
         loop {
             // 连接获取 + 传输层包装（PROXY protocol + finalmask，仅 TCP 分支）；
@@ -255,6 +259,10 @@ async fn listen_httpupgrade(
 
     let abort = accept_task.abort_handle();
     // 意外退出监控：循环只应经 close() 的 abort 退出；panic 会静默杀掉监听。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "常驻监控任务（accept 循环意外退出监控）；迁 FxScope 待 bd 39hko"
+    )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "httpupgrade",
         local.to_string(),
@@ -768,6 +776,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：mock HTTPUpgrade server 任务")]
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -813,6 +822,7 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：mock HTTPUpgrade server 任务")]
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut buf = Vec::new();
@@ -882,6 +892,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：mock HTTPUpgrade server 任务")]
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut buf = vec![0u8; 4096];
@@ -972,6 +983,7 @@ mod tests {
         };
 
         let handler: ConnHandler = Arc::new(|conn| {
+            #[allow(clippy::disallowed_methods, reason = "测试：echo handler 任务")]
             tokio::spawn(async move {
                 let mut conn = conn;
                 let mut buf = [0u8; 1024];

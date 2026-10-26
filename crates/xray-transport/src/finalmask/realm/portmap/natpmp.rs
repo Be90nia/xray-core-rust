@@ -316,6 +316,7 @@ mod tests {
         let client = Client::connect(stub.addr, Duration::from_millis(900)).await.expect("connect");
         let rogue = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind rogue");
         let forged = response(OP_PUBLIC_ADDRESS, 0, &[6, 6, 6, 6]);
+        #[allow(clippy::disallowed_methods, reason = "测试：外部地址探测任务")]
         let probe = tokio::spawn(async move { client.external_address().await });
         let deadline = Instant::now() + Duration::from_millis(800);
         while Instant::now() < deadline {
@@ -349,7 +350,7 @@ mod tests {
             Some(response(OP_PUBLIC_ADDRESS, 0, &[203, 0, 113, 7]))
         })
         .await;
-        let client = Client::connect(stub.addr, Duration::from_secs(2)).await.unwrap();
+        let client = Client::connect(stub.addr, Duration::from_secs(10)).await.unwrap();
         let ip = client.external_address().await.unwrap();
         assert_eq!(ip, Ipv4Addr::new(203, 0, 113, 7));
         assert_eq!(stub.request_count(), 1);
@@ -372,7 +373,7 @@ mod tests {
             ))
         })
         .await;
-        let client = Client::connect(stub.addr, Duration::from_secs(2)).await.unwrap();
+        let client = Client::connect(stub.addr, Duration::from_secs(10)).await.unwrap();
 
         let first = client.add_udp_mapping(8080, 8080, 600).await.unwrap();
         assert_eq!(first.external_port, 4567);

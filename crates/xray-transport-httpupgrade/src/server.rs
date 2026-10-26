@@ -150,6 +150,7 @@ mod tests {
         client_io.write_all(req).await.unwrap();
         client_io.flush().await.unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：handshake 任务")]
         let handle = tokio::spawn(async move { server.handshake_io(server_io).await });
 
         // 客户端读响应
@@ -174,6 +175,7 @@ mod tests {
         client_io.write_all(req).await.unwrap();
         client_io.flush().await.unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：handshake 任务")]
         let handle = tokio::spawn(async move { server.handshake_io(server_io).await });
         let mut buf = vec![0u8; 1024];
         let n = client_io.read(&mut buf).await.unwrap();
@@ -193,6 +195,7 @@ mod tests {
         let req = b"GET /ws HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nhello after";
         client_io.write_all(req).await.unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：handshake 任务")]
         let handle = tokio::spawn(async move { server.handshake_io(server_io).await });
 
         // 等服务端读完请求 + 回响应
@@ -213,6 +216,7 @@ mod tests {
         let req = b"GET /ws HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nX-Forwarded-For: 10.0.0.1, 192.168.1.1\r\n\r\n";
         client_io.write_all(req).await.unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：handshake 任务")]
         let handle = tokio::spawn(async move { server.handshake_io(server_io).await });
         let mut buf = vec![0u8; 1024];
         let _ = client_io.read(&mut buf).await;
@@ -231,6 +235,7 @@ mod tests {
         let req = b"GET /ws HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nX-Real-IP: 1.2.3.4\r\nX-Forwarded-For: 10.0.0.1, 192.168.1.1\r\n\r\n";
         client_io.write_all(req).await.unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：handshake 任务")]
         let handle = tokio::spawn(async move { server.handshake_io(server_io).await });
         let mut buf = vec![0u8; 1024];
         let _ = client_io.read(&mut buf).await;
@@ -252,6 +257,7 @@ mod tests {
         let req = b"GET /ws HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nX-Forwarded-For: 10.0.0.1\r\n\r\n";
         client_io.write_all(req).await.unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：handshake 任务")]
         let handle = tokio::spawn(async move { server.handshake_io(server_io).await });
         let mut buf = vec![0u8; 1024];
         let _ = client_io.read(&mut buf).await;
@@ -316,6 +322,7 @@ mod tests {
         client_io.write_all(&padded_request(12 * 1024)).await.unwrap();
         client_io.flush().await.unwrap();
 
+        #[allow(clippy::disallowed_methods, reason = "测试：handshake 任务")]
         let handle = tokio::spawn(async move { server.handshake_io(server_io).await });
         let mut buf = vec![0u8; 1024];
         let n = client_io.read(&mut buf).await.unwrap();

@@ -126,6 +126,10 @@ impl UdpHopConn {
         // 仅在确有跳变维度时起周期任务；remoteOnce-only 时 Go 的 ticker 空转，此处直接省略。
         let hop_task = if shared.local || shared.remote {
             let s = Arc::clone(&shared);
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "常驻监控任务（UDP hop 周期跳变）；迁 FxScope 待 bd 39hko"
+            )]
             Some(tokio::spawn(async move {
                 loop {
                     // Go RandBetween(from>to 时交换)；校验保证 >=5，.max(0) 防 i64 负值转 u64。
@@ -259,6 +263,10 @@ fn spawn_forwarder(
     io: Arc<dyn UdpIo>,
     tx: mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>,
 ) -> JoinHandle<()> {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面泵任务（socket 收包转发）；迁 FxScope 待 bd 39hko"
+    )]
     tokio::spawn(async move {
         let mut buf = vec![0u8; UDP_SIZE];
         while let Ok((n, addr)) = io.recv_from(&mut buf).await {

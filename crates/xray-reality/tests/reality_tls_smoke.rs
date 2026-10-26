@@ -47,6 +47,7 @@ async fn reality_server_tls_with_u_client_handshake_succeeds() {
     let client_conn = xray_transport::connection::DuplexConnection::new(client_side);
 
     // server_tls：verify ClientHello → build_server_config → rustls 握手
+    #[allow(clippy::disallowed_methods, reason = "测试：server_tls 任务")]
     let server_task = tokio::spawn(async move {
         server_tls(server_side, &server_priv, &[short_id], 43200, &[], &[], &[], None).await
     });

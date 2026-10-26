@@ -31,6 +31,7 @@ async fn tcp_plus_reality_handshake_e2e() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let allowed_short_ids = vec![short_id];
+    #[allow(clippy::disallowed_methods, reason = "测试：REALITY echo server 任务")]
     tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
         let outcome = server_tls(

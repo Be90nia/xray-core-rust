@@ -102,12 +102,20 @@ pub async fn query_ech_config(
     let (name, server) = parse_ech_dns_server(config_list, server_name)?;
     let cache_key = crate::ech::ech_cache_key(&server, &name, 0);
     if let Some(rec) = GLOBAL_ECH_CACHE.lock().get(&cache_key) {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "ECH config 缓存过期判定；Clock 端口注入待 bd 39hko"
+        )]
         if !rec.is_expired(Instant::now()) {
             tracing::debug!(target: "xray_tls::ech_doh", name = %name, server = %server, "ECH config cache hit");
             return Ok(rec.config.clone());
         }
     }
     let (config, ttl) = dns_query_doh(&server, &name, tls_config).await?;
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "ECH config 缓存 TTL 锚点；Clock 端口注入待 bd 39hko"
+    )]
     GLOBAL_ECH_CACHE.lock().insert(
         cache_key,
         EchConfigRecord {
@@ -240,6 +248,10 @@ where
         .await
         .map_err(|_| TlsError::EchApply("ECH DoH h2 handshake timeout".to_string()))?
         .map_err(|e| TlsError::EchApply(format!("ECH DoH h2 handshake: {e}")))?;
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面连接任务（DoH h2 conn driver）；迁 FxScope 待 bd 39hko"
+    )]
     tokio::spawn(async move {
         let _ = conn.await;
     });
@@ -397,12 +409,14 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let conn_count = Arc::new(AtomicUsize::new(0));
         let count = conn_count.clone();
+        #[allow(clippy::disallowed_methods, reason = "测试：mock DoH accept 泵")]
         tokio::spawn(async move {
             loop {
                 let Ok((sock, _)) = listener.accept().await else { break };
                 count.fetch_add(1, Ordering::SeqCst);
                 let fqdn = fqdn.clone();
                 let ech = ech.clone();
+                #[allow(clippy::disallowed_methods, reason = "测试：mock DoH 每连接泵")]
                 tokio::spawn(async move {
                     let mut h2_conn = match h2::server::handshake(sock).await {
                         Ok(c) => c,
@@ -516,11 +530,13 @@ mod tests {
         let ech_expected = ech.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：TLS mock accept 泵")]
         tokio::spawn(async move {
             loop {
                 let Ok((sock, _)) = listener.accept().await else { break };
                 let acceptor = acceptor.clone();
                 let ech_inner = ech.clone();
+                #[allow(clippy::disallowed_methods, reason = "测试：TLS mock 每连接泵")]
                 tokio::spawn(async move {
                     let tls = match acceptor.accept(sock).await {
                         Ok(t) => t,

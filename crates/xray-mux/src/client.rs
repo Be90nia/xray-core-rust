@@ -312,7 +312,10 @@ impl ClientWorker {
 
         let w = Arc::clone(&worker);
         // 数据面泵热路径豁免（约束⑫）：carrier 读循环不加托管口。
-        #[allow(clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）：carrier 读循环泵，FxScope 记账会落每 chunk 开销")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面热路径豁免（坑约束⑫）：carrier 读循环泵，FxScope 记账会落每 chunk 开销"
+        )]
         tokio::spawn(async move { w.fetch_output(BufferedReader::new(link.reader)).await });
 
         let w = Arc::clone(&worker);
@@ -449,7 +452,10 @@ impl ClientWorker {
         let s = Arc::clone(&session);
         let writer_slot = Arc::clone(&self.link_writer);
         let target = dest.clone();
-        #[allow(clippy::disallowed_methods, reason = "数据面连接任务（fetch_input 泵）；迁 FxScope 待 bd 39hko")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面连接任务（fetch_input 泵）；迁 FxScope 待 bd 39hko"
+        )]
         tokio::spawn(
             async move { Self::fetch_input(s, target, writer_slot, global_id, inbound).await },
         );

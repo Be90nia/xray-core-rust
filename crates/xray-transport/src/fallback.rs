@@ -181,6 +181,7 @@ mod tests {
 
         let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dest_addr = echo.local_addr().unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：echo server 任务")]
         tokio::spawn(async move {
             let (mut s, _) = echo.accept().await.unwrap();
             let mut buf = [0u8; 1024];
@@ -199,6 +200,7 @@ mod tests {
         let (mut client, mut server_side) = tokio::io::duplex(1024);
         let src: SocketAddr = "127.0.0.1:9999".parse().unwrap();
         let dst: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：fallback_to_dest 任务")]
         let task = tokio::spawn(async move {
             fallback_to_dest(&mut server_side, b"HELLO-FIRST", &dest_addr.to_string(), src, dst, 0)
                 .await

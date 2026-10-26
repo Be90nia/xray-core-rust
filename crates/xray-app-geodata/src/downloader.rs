@@ -274,7 +274,10 @@ impl RealAssetDownloader {
         );
         // 2 处 Instant::now（TLS/TCP 两分支的 deadline 起点）：同步阻塞下载冷路径，
         // Clock 端口注入待 bd 39hko 收口；属性挂语句位（表达式位 E0658）。
-        #[allow(clippy::disallowed_methods, reason = "同步阻塞下载 deadline 起点，Clock 注入待 bd 39hko 收口")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "同步阻塞下载 deadline 起点，Clock 注入待 bd 39hko 收口"
+        )]
         let redirect = if parsed.scheme == "https" {
             // pn8e: https 路径。rustls::Stream 仅借用 &mut conn + &mut tcp，故
             // ClientConnection 须在 caller 栈上持有以延长 Stream 借用生命周期；
@@ -358,7 +361,10 @@ fn read_http_body<R: std::io::Read>(
     let mut header_buf = Vec::with_capacity(512);
     let mut byte = [0u8; 1];
     loop {
-        #[allow(clippy::disallowed_methods, reason = "阻塞读循环 idle 截止检查，Clock 注入待 bd 39hko 收口")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "阻塞读循环 idle 截止检查，Clock 注入待 bd 39hko 收口"
+        )]
         if std::time::Instant::now() > deadline {
             return Err(GeodataError::IdleTimeout);
         }
@@ -532,11 +538,17 @@ fn https_handshake<'a>(
         }
     })?;
 
-    #[allow(clippy::disallowed_methods, reason = "TLS 握手墙钟 deadline 起点，Clock 注入待 bd 39hko 收口")]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "TLS 握手墙钟 deadline 起点，Clock 注入待 bd 39hko 收口"
+    )]
     let deadline = std::time::Instant::now() + timeout;
     let mut scratch = [0u8; 0];
     while conn.is_handshaking() {
-        #[allow(clippy::disallowed_methods, reason = "TLS 握手循环墙钟截止，Clock 注入待 bd 39hko 收口")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "TLS 握手循环墙钟截止，Clock 注入待 bd 39hko 收口"
+        )]
         if std::time::Instant::now() > deadline {
             return Err(GeodataError::IdleTimeout);
         }

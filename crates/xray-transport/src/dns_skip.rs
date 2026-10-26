@@ -176,11 +176,13 @@ mod tests {
         // 并发 task 不串味：带标与不带标两个 task 并行，各自判定互不影响。
         let observed = Arc::new(AtomicU8::new(0));
         let o1 = Arc::clone(&observed);
+        #[allow(clippy::disallowed_methods, reason = "测试：DNS 上游标记 task")]
         let marked = tokio::spawn(scope_dns_upstream_query(async move {
             let marked = is_dns_upstream_query();
             o1.store(u8::from(marked), Ordering::SeqCst);
         }));
         let o2 = Arc::clone(&observed);
+        #[allow(clippy::disallowed_methods, reason = "测试：无标记对照 task")]
         let plain = tokio::spawn(async move {
             assert!(!is_dns_upstream_query());
             o2.fetch_or(2, Ordering::SeqCst);

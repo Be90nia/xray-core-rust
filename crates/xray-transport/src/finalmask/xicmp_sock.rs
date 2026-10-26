@@ -380,6 +380,11 @@ mod sys {
             let (tx, rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(CHANNEL_CAP);
             let stop = Arc::new(AtomicBool::new(false));
             let (t_sock, t_stop, strip) = (sock.clone(), stop.clone(), is_v4);
+            // 确需 OS 线程：raw ICMP socket 为阻塞 recv（无 async 等价），停机经 stop flag。
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "确需 OS 线程（坑约束 #5/#6）：raw ICMP 阻塞 recv 循环，停机经 stop flag"
+            )]
             std::thread::spawn(move || recv_loop(t_sock, t_stop, strip, tx));
             Ok(Self { sock, rx: tokio::sync::Mutex::new(rx), stop })
         }

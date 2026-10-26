@@ -50,6 +50,11 @@ pub struct Sampler {
 }
 
 impl Sampler {
+    // 字段初始化在尾表达式位不可挂语句属性（E0658），allow 上移 fn 级。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "压测 checkpoint 锚点取时；Clock 端口注入待 bd 39hko"
+    )]
     pub fn new(
         run_id: &str,
         out_dir: &Path,
@@ -167,6 +172,11 @@ impl Sampler {
     }
 
     /// checkpoint 到点时覆盖写中间态 summary。
+    // 赋值表达式语句位挂属性在本工具链 E0658（无 stmt_expr_attributes），故挂 fn 位。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "压测 checkpoint 锚点取时；Clock 端口注入待 bd 39hko"
+    )]
     pub fn maybe_checkpoint(
         &mut self,
         duration: Duration,

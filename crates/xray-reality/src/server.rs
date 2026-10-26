@@ -1597,6 +1597,7 @@ mod tests {
         );
 
         let (client, server) = duplex(65536);
+        #[allow(clippy::disallowed_methods, reason = "测试：server_tls 任务")]
         let server_task = tokio::spawn(async move {
             server_tls(server, &[0x11u8; 32], &[[0xaa; 8]], 43200, &[], &[], &[], None).await
         });
@@ -1812,6 +1813,7 @@ mod tests {
         let server_priv = [0x11u8; 32];
         let short_id = [0xaa; 8];
 
+        #[allow(clippy::disallowed_methods, reason = "测试：server_tls 任务")]
         let server_task = tokio::spawn(async move {
             server_tls(server, &server_priv, &[short_id], 43200, &[], &[], &[], None).await
         });
@@ -1847,6 +1849,7 @@ mod tests {
         let server_priv = [0x11u8; 32];
         let whitelist = vec!["other.com".to_string()];
 
+        #[allow(clippy::disallowed_methods, reason = "测试：server_tls 任务")]
         let server_task = tokio::spawn(async move {
             server_tls(server, &server_priv, &[[0xaa; 8]], 43200, &[], &[], &whitelist, None).await
         });
@@ -1878,6 +1881,7 @@ mod tests {
         let server_priv = [0x11u8; 32];
         let whitelist = vec!["example.com".to_string()];
 
+        #[allow(clippy::disallowed_methods, reason = "测试：server_tls 任务")]
         let server_task = tokio::spawn(async move {
             server_tls(server, &server_priv, &[[0xaa; 8]], 43200, &[], &[], &whitelist, None).await
         });
@@ -1939,6 +1943,7 @@ mod tests {
         );
 
         let (mut client, server) = duplex(8192);
+        #[allow(clippy::disallowed_methods, reason = "测试：server_tls 任务")]
         let server_task = tokio::spawn(async move {
             server_tls(server, &server_priv, &[short_id], 43200, &[], &[], &[], None).await
         });
@@ -1997,6 +2002,7 @@ mod tests {
         let client = xray_transport::connection::DuplexConnection::new(client);
 
         // spawn server_tls
+        #[allow(clippy::disallowed_methods, reason = "测试：server_tls 任务")]
         let server_task = tokio::spawn(async move {
             server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[], &[], None).await
         });
@@ -2060,6 +2066,7 @@ mod tests {
         let (client, server) = duplex(65536);
         let client = xray_transport::connection::DuplexConnection::new(client);
 
+        #[allow(clippy::disallowed_methods, reason = "测试：server_tls 任务")]
         let server_task = tokio::spawn(async move {
             server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[], &[], None).await
         });
@@ -2121,6 +2128,7 @@ mod tests {
         let (client, server) = duplex(65536);
         let client = xray_transport::connection::DuplexConnection::new(client);
 
+        #[allow(clippy::disallowed_methods, reason = "测试：server_tls 任务")]
         let server_task = tokio::spawn(async move {
             server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[], &[], None).await
         });
@@ -2413,6 +2421,7 @@ mod tests {
 
         let (client, server) = duplex(65536);
         let client = xray_transport::connection::DuplexConnection::new(client);
+        #[allow(clippy::disallowed_methods, reason = "测试：server_tls 任务")]
         let server_task = tokio::spawn(async move {
             server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[], &[], Some(&ctx))
                 .await
@@ -2464,6 +2473,7 @@ mod tests {
 
         let (client, server) = duplex(65536);
         let client = xray_transport::connection::DuplexConnection::new(client);
+        #[allow(clippy::disallowed_methods, reason = "测试：server_tls 任务")]
         let server_task = tokio::spawn(async move {
             server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[], &[], None).await
         });
@@ -2606,6 +2616,7 @@ mod tests {
             }
         });
 
+        #[allow(clippy::disallowed_methods, reason = "测试：server_tls 任务")]
         let server_task = tokio::spawn(async move {
             server_tls_btls(
                 server,
@@ -2795,6 +2806,7 @@ mod tests {
         let server_priv = [0x11u8; 32];
         let short_id = [0xaa; 8];
 
+        #[allow(clippy::disallowed_methods, reason = "测试：server_tls 任务")]
         let server_task = tokio::spawn(async move {
             server_tls_btls(server, &server_priv, &[short_id], 43200, &[], &[], &[], None).await
         });

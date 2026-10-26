@@ -91,6 +91,10 @@ pub fn fetch_http_content(target: &str) -> Result<Vec<u8>> {
             "unsupported remote source (unix socket target): {target}"
         )));
     }
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "远端配置拉取 deadline 锚点（CLI 冷路径）；Clock 端口注入待 bd 39hko"
+    )]
     let deadline = Instant::now() + FETCH_TIMEOUT;
     let mut current = target.to_string();
     let mut hops = 0;
@@ -140,6 +144,10 @@ pub fn spec_format(spec: &str) -> Option<xray_conf::Format> {
 /// 单跳：GET 一个 URL，返回 (状态码, Location, 响应体)。
 fn fetch_once(url: &str, deadline: Instant) -> Result<(u16, Option<String>, Vec<u8>)> {
     let parsed = parse_url(url)?;
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "单跳剩余时长计算（CLI 冷路径）；Clock 端口注入待 bd 39hko"
+    )]
     let remaining = || -> Result<Duration> {
         deadline.checked_duration_since(Instant::now()).ok_or_else(|| timeout_error(url))
     };
@@ -330,6 +338,11 @@ impl<'a> BodyReader<'a> {
         Self { stream, buf: Vec::new(), pos: 0, eof: false, deadline }
     }
 
+    // 尾表达式位不可挂语句属性（E0658），allow 上移 fn 级。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "响应体读取截止检查（CLI 冷路径）；Clock 端口注入待 bd 39hko"
+    )]
     fn ensure_deadline(&self, url: &str) -> Result<()> {
         if self.deadline > Instant::now() { Ok(()) } else { Err(timeout_error(url)) }
     }
@@ -504,6 +517,7 @@ pub(crate) mod test_support {
     pub(crate) fn spawn(responses: Vec<Vec<u8>>) -> std::net::SocketAddr {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：本地 stub HTTP server 线程")]
         std::thread::spawn(move || {
             for (idx, conn) in listener.incoming().enumerate() {
                 let Ok(mut sock) = conn else { break };
