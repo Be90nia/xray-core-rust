@@ -9,6 +9,7 @@ use aes_gcm::{
     aead::{Aead as AeadCore, AeadInOut, KeyInit, Payload},
 };
 use chacha20poly1305::ChaCha20Poly1305;
+use xray_common::alloc_site;
 
 use crate::error::{Result, VlessError};
 
@@ -102,6 +103,9 @@ impl Aead {
         plaintext: &[u8],
         aad: &[u8],
     ) -> Result<()> {
+        // 站点归因（z02z8）：enc 封装唯一堆分配点（密文 Vec + dst 追加；数据面
+        // 走零分配的 seal_in_place，此处量的是握手/非池路径封装成本）。
+        let _site = alloc_site::enter(alloc_site::VLESS_ENC_SEAL);
         let used: [u8; NONCE_LEN] = match nonce {
             Some(n) => *n,
             None => {
