@@ -84,11 +84,15 @@ impl AuditHandle {
     pub fn record(&self, plugin: &'static str, message: impl std::fmt::Display) -> u64 {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let mut ring = lock_audit(&self.ring);
+        // 逐出判定必须取**插入前**环态：EvictOldest 下只有「插入前已满」的
+        // 插入才逐出；把环从 n-1 填满到 n 的那一插不逐出任何元素（填满 ≠
+        // 逐出——bd 打回 2026-10-26：误把满位信号记在插入后，首填多计 1）。
+        // seq 连续单调 → 插入键恒为最大键，「插入前已满 ⇒ 必逐出最小键（最旧）」精确。
+        let evicted_now = ring.len() == self.capacity;
         // BoundError 仅 Reject 策略产生；EvictOldest 环满自逐，insert 恒 Ok。
         let _: Result<(), BoundError> =
             ring.insert(seq, AuditRecord { seq, plugin, message: message.to_string() });
-        // 环在满位时每插一条恰好逐出一条（seq 连续单调 → 判定精确）。
-        if ring.len() == self.capacity {
+        if evicted_now {
             self.evicted.fetch_add(1, Ordering::Relaxed);
         }
         seq
@@ -164,6 +168,16 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].message, "two", "最旧（one）被逐出");
         assert_eq!(events[1].message, "three");
+        // drain 后重填：从空到满的每一插都不逐出（原回归形态——首填多计）。
+        h.record("p", "four");
+        h.record("p", "five");
+        assert_eq!(h.evicted_count(), 1, "drain 后重填至满位，零逐出");
+        h.record("p", "six");
+        assert_eq!(h.evicted_count(), 2, "重填后的满位插入恢复逐出计数");
+        let events = h.take_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].message, "five");
+        assert_eq!(events[1].message, "six");
     }
 
     #[test]

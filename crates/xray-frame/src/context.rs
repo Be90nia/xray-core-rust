@@ -120,6 +120,15 @@ pub struct PluginContext {
 impl PluginContext {
     /// 装配根构造入口。`fingerprint` 经 [`derive_fingerprint`] 派生；
     /// `log` 域约定 = 插件名（`LogFacade::new(plugin_name, secrets)`）。
+    // nn8os 2a 打回处置（2026-10-26 PM）：8 参 = L2 能力清单一一映射（fx/
+    // clock/env/config_root/log/audit 为装配根**分别持有**的异质能力源，
+    // 非内聚数据结构）——打包成结构体只是参数搬家 + 新增 pub 类型 + 11 处
+    // 构造点改写，零行为收益；构造器逐能力注入是 L2 设计的直接形态，
+    // 故 allow 而非改签名。
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "能力句柄构造器：参数=能力清单（L2 §4 表），异质源由装配根分别持有，打包属参数搬家"
+    )]
     pub fn new(
         plugin_name: &'static str,
         fx: Arc<FxScope>,
