@@ -305,6 +305,10 @@ async fn listen_unix_httpupgrade(
     server.trusted_x_forwarded_for = sockopt.trusted_x_forwarded_for;
     // 日志标识进块（supervise_accept_loop 另需 path 所有权）。
     let log_ident = path.clone();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "待迁 FxScope（39hko/W5）：unix 监听路径（Windows 不编译，本地登记时漏）"
+    )]
     let accept_task = tokio::spawn(async move {
         loop {
             let Some((conn, remote)) =
@@ -330,6 +334,10 @@ async fn listen_unix_httpupgrade(
     });
 
     let abort = accept_task.abort_handle();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "待迁 FxScope（39hko/W5）：unix 监听路径（Windows 不编译，本地登记时漏）"
+    )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "httpupgrade-unix",
         path,
@@ -1058,6 +1066,10 @@ mod tests {
         let _ = std::fs::remove_file(&path_str);
 
         let handler: ConnHandler = Arc::new(|mut conn| {
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "测试：UDS echo handler 任务（unix 门控路径，Windows 不编译）"
+            )]
             tokio::spawn(async move {
                 let mut buf = [0u8; 1024];
                 loop {

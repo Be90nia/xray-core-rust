@@ -1105,6 +1105,10 @@ mod tests {
         // echo 服务端：WsConnection 对 handler 透明为字节流（帧编解码在桥层）；
         // 循环读（单次 read 在桥层缓冲分片下可能拿不全，已验证形态同 tcpmask 测试）。
         let handler: ConnHandler = Arc::new(|mut conn| {
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "测试：echo 服务端任务（unix 门控路径，Windows 不编译）"
+            )]
             tokio::spawn(async move {
                 let mut buf = [0u8; 1024];
                 loop {

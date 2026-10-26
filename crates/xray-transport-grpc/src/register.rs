@@ -278,6 +278,7 @@ mod tests {
         let handler: ConnHandler = Arc::new(|conn| {
             // 服务端 stream 语义对齐 Go Tun：conn 交给 handler 后无人写即挂住
             // 等对端；此处直接持住不 echo（gRPC stream 不是字节 echo 语义）。
+            #[allow(clippy::disallowed_methods, reason = "测试：UDS 端 conn 持有任务")]
             tokio::spawn(async move {
                 let mut conn = conn;
                 let mut buf = [0u8; 64];
@@ -310,6 +311,7 @@ mod tests {
         // 客户端：UDS 建连 → 真实 h2 握手 → 请求注册 path。
         let uds = tokio::net::UnixStream::connect(&path_str).await.expect("UDS connect 失败");
         let (mut client, conn_task) = h2::client::handshake(uds).await.expect("h2 握手失败");
+        #[allow(clippy::disallowed_methods, reason = "测试：h2 连接任务")]
         tokio::spawn(async move {
             let _ = conn_task.await;
         });

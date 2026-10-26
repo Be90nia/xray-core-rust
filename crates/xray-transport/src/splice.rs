@@ -183,6 +183,12 @@ mod tests {
     // 本模块只在 linux/android 编译，CI 的 `-D warnings` 会在此触发
     // clippy::unwrap_used（Windows 本地不编译这段，故本地绿、CI 红）。
     #![allow(clippy::unwrap_used)]
+    // 同理：L3 闸禁 tokio::spawn，本模块的泵/桥测试任务在 unix 门控路径上，
+    // Windows 本地不编译 → 需显式登记豁免（生产面 splice 泵本身无 spawn）。
+    #![allow(
+        clippy::disallowed_methods,
+        reason = "测试：splice 泵/桥测试任务（unix 门控路径，Windows 不编译）"
+    )]
 
     use std::{io, net::SocketAddr};
 
