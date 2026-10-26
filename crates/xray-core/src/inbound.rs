@@ -3918,9 +3918,10 @@ pub(crate) async fn spawn_one_inbound(
     let settings =
         xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref());
 
-    // T4.2 phase 4：构造走表（唯一路径，旧 match 已删）。表值转发 phase 1 同一
-    // 构造函数；表未命中 = 未支持协议，显式 warn 跳过（不静默构造）。
-    if let Some(builder) = crate::arm_builders::lookup_inbound_builder(ib.entry.kind.as_str()) {
+    // T4.2 phase 4 / W1-1a：构造走 xray-frame PluginRegistry（唯一路径，旧 match
+    // 已删）。注册表值转发 phase 1 同一构造函数；未命中 = 未支持协议，显式 warn
+    // 跳过（不静默构造）。
+    if let Some(builder) = crate::arm_registry::lookup_inbound_builder(ib.entry.kind.as_str()) {
         return builder(crate::arm_builders::InboundCtx {
             ib,
             ohm,

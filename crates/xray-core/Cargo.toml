@@ -10,7 +10,11 @@ rust-version.workspace = true
 # close 循环（无超时/无 panic 隔离）。shutdown 域 std-only 零 feature——
 # default-features = false 避开 runtime/pool 默认档拖入运行时面。
 default = ["shutdown-coordinator"]
-shutdown-coordinator = ["dep:xray-frame"]
+# W1-1a：xray-frame 转为**必需依赖**——生产构造路径经其 PluginRegistry（见
+# src/arm_registry.rs）。此前为 optional（仅 shutdown-coordinator 拉起），使
+# --no-default-features 构建下会缺注册表 = 第二条构造路径（两套并存复发）。
+# 停机编排门本身仍是 feature（关 = 旧逆序 close 循环，行为不变）。
+shutdown-coordinator = []
 # B5 step4：framework 注入点（`start_full_with_outbound_handlers`，出站 handler 由
 # xray-cli framework 桥灌入）——仅门控该函数的存在，default 构建下不可见，行为零变化。
 framework-assembly = []
@@ -27,7 +31,9 @@ udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", default-features = 
 # LogFacade（tracing 门面）——`xray_common::log` general 出口受 LogInstance::close
 # gate=Off 控制而吞报告（真机实证）；tracing 进程级订阅器不随 feature 关闭。
 # 依赖方向合规：xray-frame 零 xray-core 依赖（骨架不感知血肉），无环。
-xray-frame = { path = "../xray-frame", optional = true }
+# W1-1a：非 optional——生产构造路径经其 PluginRegistry（src/arm_registry.rs）；
+# optional 会在 --no-default-features 下让注册表消失 = 第二条构造路径。
+xray-frame = { path = "../xray-frame" }
 base64 = "0.22"
 hex = "0.4"
 xray-features = { path = "../xray-features" }
@@ -101,8 +107,8 @@ uuid = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 serde_json = { workspace = true }
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
-# P3-2 对拍测试：插件 build 管线（build_plugins_from_config）vs 旧 core 解析面。
-xray-frame = { path = "../xray-frame" }
+# P3-2 对拍测试（cfg(test)）：插件 build 管线（build_plugins_from_config）vs 旧 core 解析面。
+# xray-frame 已是[dependencies]必需项（W1-1a），此处不再重复声明。
 # TUN 设备代理——仅 Linux/Android/FreeBSD 自动编译
 # macOS 不编译（需 utun 权限）；Windows 已支持（wintun.dll 放 exe 旁即用，bd cv3w/ijn7）
 [target.'cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "windows"))'.dependencies]

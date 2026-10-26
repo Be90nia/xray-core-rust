@@ -4,6 +4,8 @@
 //! `PluginError` 是 L5 装配失败的统一出口。version 兼容语义按 PM 拍板
 //! （2026-10-23）：**仅日志留痕，不做 semver 拒载**——插件集编译期静态。
 
+use std::any::Any;
+
 use crate::{context::PluginContext, error::PluginError};
 
 /// 坑约束条款 id（模型 §2.4 十二条的一一映射；L4 夹具按声明集逐条断言）。
@@ -91,6 +93,16 @@ pub trait Plugin: Send + Sync {
     fn contract(&self) -> &PluginContract;
     fn lifecycle(&self) -> &dyn Lifecycle;
     fn build(&self, ctx: &mut PluginContext) -> Result<(), PluginError>;
+
+    /// 类型擦除载荷（可选）：**构造器**类条目（如 xray-core 的协议臂构造表）把
+    /// 「构造 fn」挂在本实例上，宿主经 `Arc<dyn Plugin>` 取回并调用。
+    ///
+    /// 默认 `None` = 无载荷（协议 crate 的 Plugin 壳不承载构造器——它们的构造
+    /// 面是 `build(ctx)`）。载荷的具体类型由**宿主**定义并自持下转
+    /// （`Any::downcast_ref`），框架只负责承载与传递，不解释其语义。
+    fn payload(&self) -> Option<&(dyn Any + Send + Sync)> {
+        None
+    }
 }
 
 #[cfg(test)]

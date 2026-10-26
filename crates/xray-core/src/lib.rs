@@ -44,6 +44,8 @@
 
 // T4.2 五阶段法 phase 1：协议臂构造函数（inbound/outbound match 臂抽取件）。
 mod arm_builders;
+// W1-1a：生产装配主路的构造器注册表（xray-frame PluginRegistry 承载 arm 构造器）。
+pub(crate) mod arm_registry;
 pub mod config;
 pub mod context;
 pub mod functions;

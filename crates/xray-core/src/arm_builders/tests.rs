@@ -22,8 +22,9 @@ use tokio_util::sync::CancellationToken;
 use xray_app_dispatcher::default::SimpleOhm;
 use xray_conf::{BuiltEntry, BuiltInbound, BuiltOutbound};
 
-use super::{InboundCtx, lookup_inbound_builder, lookup_outbound_builder};
+use super::InboundCtx;
 use crate::{
+    arm_registry::{lookup_inbound_builder, lookup_outbound_builder},
     inbound::spawn_one_inbound,
     outbound::{BuildError, build_protocol_handler},
 };

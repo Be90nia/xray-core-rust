@@ -5,27 +5,27 @@
 //! 的 match 协议臂构造逻辑原样搬迁至此，臂内只留一行调用。入参/出参类型、错误
 //! 变体、日志文案、注册顺序、失败语义与拆分前逐字段一致（行为零变化）。
 //!
-//! phase 4：本模块的**构造表** `(协议名, 方向) → builder fn` 是唯一构造路径——
-//! 入口经表 lookup 命中即构造，未命中即显式失败（inbound warn+skip、outbound
-//! `BuildError::Unsupported`），旧 match 与回退 feature 已删。表值适配器只做
-//! 参数解包，转发到 phase 1 同一构造函数。
+//! phase 4:本模块的**构造器** `(方向:协议名) -> builder fn` 是唯一构造路径——
+//! 入口经 `crate::arm_registry` 的 xray-frame `PluginRegistry` lookup 命中即构造,
+//! 未命中即显式失败(inbound warn+skip、outbound `BuildError::Unsupported`),
+//! 旧 match 与回退 feature 已删。表值适配器只做参数解包,转发到 phase 1 同一
+//! 构造函数。
 //!
-//! ## 表实现选型：BTreeMap + 显式注册（不用 xray-frame PluginRegistry）
+//! ## 表实现选型:xray-frame PluginRegistry(W1 切片 1a 落地)
 //!
-//! `PluginRegistry` 值类型为 `Arc<dyn Plugin>`（name/version/deps/contract/
-//! lifecycle/build 强约束五件套，面向 P2 插件装配编排：容量 fail-closed、
-//! start_order 逆序停机、bring_up 生命周期迁移）。构造表的值是裸 `fn` 指针，
-//! 注册发生在静态 init 一次性完成——用 PluginRegistry 须为 34 个 fn 伪造全套
-//! Plugin 语义，零增益纯形态税；机制与内容分离，机制（注册表模式）留待
-//! P2 装配面用框架件，本表属内容面。键选 `BTreeMap`：静态表无并发写，
-//! 确定性迭代序便于等价性测试枚举。
+//! 原为 `BTreeMap` 裸 fn 表(与生产装配面的框架注册表两套并存)。现改为
+//! **纯数据源** `INBOUND_CTORS` / `OUTBOUND_CTORS`(`&'static` 切片,零分配),
+//! 由 `crate::arm_registry` 装配成 xray-frame `PluginRegistry`:容量 fail-closed、
+//! 重名拒、deps 拓扑序(缺依赖/成环 → 启动前 `Err`)三道门在**生产路径**生效。
+//! 构造 fn 以类型擦除载荷挂在 `Arc<dyn Plugin>` 上,宿主经 `Plugin::payload()`
+//! 下转取回。键取 `<方向>:<协议>`(方向前缀):入/出站同名协议不撞重名,且为
+//! 将来 16 个协议 Plugin(键 = 裸协议名)并入同一注册表留位。
+//!
+//! 协议运行时条款(坑约束 12 条)的真源仍各协议 crate 的 `impl Plugin`
+//! (见 `xray-proxy-*/src/plugin.rs`);本模块只提供**构造器**,不承载协议语义——
+//! 详见 `crate::arm_registry` 的模块文档。
 
-use std::{
-    collections::BTreeMap,
-    future::Future,
-    pin::Pin,
-    sync::{Arc, LazyLock},
-};
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -86,65 +86,57 @@ pub(crate) type OutboundResult = std::result::Result<
 
 pub(crate) type OutboundBuilder = for<'a, 'b> fn(OutboundCtx<'a, 'b>) -> OutboundResult;
 
-static INBOUND_TABLE: LazyLock<BTreeMap<&'static str, InboundBuilder>> = LazyLock::new(|| {
-    let mut m: BTreeMap<&'static str, InboundBuilder> = BTreeMap::new();
-    m.insert("socks", inbound::socks_entry);
-    m.insert("mixed", inbound::mixed_entry);
-    m.insert("vless", inbound::vless_entry);
-    m.insert("trojan", inbound::trojan_entry);
-    m.insert("vmess", inbound::vmess_entry);
-    m.insert("http", inbound::http_entry);
-    m.insert("dokodemo", inbound::dokodemo_entry);
-    m.insert("shadowsocks", inbound::shadowsocks_entry);
-    // 原 match 臂为 `"hysteria" | "hysteria2"` 双键——表同样双键指向同一适配器，
+/// 入站构造器**数据源**（纯数据：只被 `crate::arm_registry` 的注册表构造消费；
+/// 生产查表唯一路径 = `crate::arm_registry::lookup_inbound_builder`）。
+///
+/// 键 = `<方向>:<协议>`：方向前缀使入/出站同名协议不撞注册表重名，并为将来
+/// 16 个协议 Plugin（键 = 裸协议名）并入同一注册表留出键空间。
+pub(crate) static INBOUND_CTORS: &[(&str, InboundBuilder)] = &[
+    ("inbound:socks", inbound::socks_entry),
+    ("inbound:mixed", inbound::mixed_entry),
+    ("inbound:vless", inbound::vless_entry),
+    ("inbound:trojan", inbound::trojan_entry),
+    ("inbound:vmess", inbound::vmess_entry),
+    ("inbound:http", inbound::http_entry),
+    ("inbound:dokodemo", inbound::dokodemo_entry),
+    ("inbound:shadowsocks", inbound::shadowsocks_entry),
+    // 原 match 臂为 `"hysteria" | "hysteria2"` 双键——数据源同样双键指向同一适配器，
     // 否则 hysteria2 配置会漏查落到「未支持协议」分支。
-    m.insert("hysteria", inbound::hysteria_entry);
-    m.insert("hysteria2", inbound::hysteria_entry);
-    m.insert("anytls", inbound::anytls_entry);
-    m.insert("tuic", inbound::tuic_entry);
-    m.insert("naive", inbound::naive_entry);
-    m.insert("wireguard", inbound::wireguard_entry);
-    m.insert("dns", inbound::dns_entry);
-    m.insert("loopback", inbound::loopback_entry);
-    m.insert("blackhole", inbound::blackhole_entry);
-    m.insert("freedom", inbound::freedom_entry);
-    m
-});
+    ("inbound:hysteria", inbound::hysteria_entry),
+    ("inbound:hysteria2", inbound::hysteria_entry),
+    ("inbound:anytls", inbound::anytls_entry),
+    ("inbound:tuic", inbound::tuic_entry),
+    ("inbound:naive", inbound::naive_entry),
+    ("inbound:wireguard", inbound::wireguard_entry),
+    ("inbound:dns", inbound::dns_entry),
+    ("inbound:loopback", inbound::loopback_entry),
+    ("inbound:blackhole", inbound::blackhole_entry),
+    ("inbound:freedom", inbound::freedom_entry),
+];
 
-static OUTBOUND_TABLE: LazyLock<BTreeMap<&'static str, OutboundBuilder>> = LazyLock::new(|| {
-    let mut m: BTreeMap<&'static str, OutboundBuilder> = BTreeMap::new();
-    m.insert("freedom", outbound::freedom_entry);
-    m.insert("vless", outbound::vless_entry);
-    m.insert("trojan", outbound::trojan_entry);
-    m.insert("blackhole", outbound::blackhole_entry);
-    m.insert("socks", outbound::socks_entry);
-    m.insert("mux", outbound::mux_entry);
-    m.insert("vmess", outbound::vmess_entry);
-    m.insert("shadowsocks", outbound::shadowsocks_entry);
-    m.insert("hysteria", outbound::hysteria_entry);
-    m.insert("anytls", outbound::anytls_entry);
-    m.insert("tuic", outbound::tuic_entry);
-    m.insert("wireguard", outbound::wireguard_entry);
-    m.insert("dns", outbound::dns_entry);
-    m.insert("loopback", outbound::loopback_entry);
-    m.insert("http", outbound::http_entry);
-    m.insert("naive", outbound::naive_entry);
-    m.insert("dokodemo", outbound::dokodemo_entry);
+/// 出站构造器**数据源**（纯数据；键格式同 `INBOUND_CTORS`）。
+pub(crate) static OUTBOUND_CTORS: &[(&str, OutboundBuilder)] = &[
+    ("outbound:freedom", outbound::freedom_entry),
+    ("outbound:vless", outbound::vless_entry),
+    ("outbound:trojan", outbound::trojan_entry),
+    ("outbound:blackhole", outbound::blackhole_entry),
+    ("outbound:socks", outbound::socks_entry),
+    ("outbound:mux", outbound::mux_entry),
+    ("outbound:vmess", outbound::vmess_entry),
+    ("outbound:shadowsocks", outbound::shadowsocks_entry),
+    ("outbound:hysteria", outbound::hysteria_entry),
+    ("outbound:anytls", outbound::anytls_entry),
+    ("outbound:tuic", outbound::tuic_entry),
+    ("outbound:wireguard", outbound::wireguard_entry),
+    ("outbound:dns", outbound::dns_entry),
+    ("outbound:loopback", outbound::loopback_entry),
+    ("outbound:http", outbound::http_entry),
+    ("outbound:naive", outbound::naive_entry),
+    ("outbound:dokodemo", outbound::dokodemo_entry),
     // tun 恒有键：非 linux 平台的值是拒绝臂（错误变体/文案与删除前 cfg(not) 臂
     // 逐字一致），与 linux 的构造臂同样经表分派。
-    m.insert("tun", outbound::tun_entry);
-    m
-});
-
-/// inbound 构造入口查表（未命中 = 未支持协议，入口显式 warn+skip）。
-pub(crate) fn lookup_inbound_builder(protocol: &str) -> Option<InboundBuilder> {
-    INBOUND_TABLE.get(protocol).copied()
-}
-
-/// outbound 构造入口查表（未命中 = 未支持协议，入口显式 `Unsupported` 错误）。
-pub(crate) fn lookup_outbound_builder(protocol: &str) -> Option<OutboundBuilder> {
-    OUTBOUND_TABLE.get(protocol).copied()
-}
+    ("outbound:tun", outbound::tun_entry),
+];
 
 #[cfg(test)]
 mod tests;

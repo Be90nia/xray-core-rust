@@ -675,9 +675,10 @@ pub(crate) fn build_protocol_handler(
     xray_transport::dialer::StreamSettings::validate_sockopt_json(ob.stream_settings_json.as_ref())
         .map_err(|e| BuildError::Parse(e.to_string()))?;
 
-    // T4.2 phase 4：构造走表（唯一路径，旧 match 已删）。表值转发 phase 1 同一
-    // 构造函数；表未命中 = 未支持协议，显式 Unsupported（不静默构造）。
-    if let Some(builder) = crate::arm_builders::lookup_outbound_builder(ob.entry.kind.as_str()) {
+    // T4.2 phase 4 / W1-1a：构造走 xray-frame PluginRegistry（唯一路径，旧 match
+    // 已删）。注册表值转发 phase 1 同一构造函数；未命中 = 未支持协议，显式
+    // Unsupported（不静默构造）。
+    if let Some(builder) = crate::arm_registry::lookup_outbound_builder(ob.entry.kind.as_str()) {
         return builder(crate::arm_builders::OutboundCtx {
             ob,
             loopback_sink,
