@@ -22,6 +22,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **accept 面定形**：accept 框架不落 xray-frame（P1-3 裁决作废），统一收口于 `xray-transport::accept_policy`（错误分级 + 退避；网络方向件留主仓）
 - 配置解析收敛：`xray-conf/src/json.rs` 降为 Xray 语义薄壳（实体机制上浮 udf `std_ext::json`，主仓随版受益）；日志分发收敛为 `logx::ChannelRegistry` 单入口（旧 `HANDLERS` 无差别扇出 + tracing 双写删除）
 - 测试面 spawn 纳入 L3 闸：`xray_common::testing::spawn` 单入口，14+ crate `src/**` 测试面裸 spawn 收口（约 159 处）+ 18 个 `tests/*.rs` 60 处迁移
+- **生产裸 `tokio::spawn` 收口（FxScope 托管）**：10 个 `xray-proxy-*` 裸 spawn 清零（余 3 处红线/冻结面登台账）；`xray-transport` 129 处、`xray-core`/`xray-common`/`xray-tls` 时钟面 38 处全量分类（可迁者已迁，其余逐点台账 + `clippy.toml` 禁令）
+- **生产 `Instant::now` 收口（`ctx.clock`）**：`xray-app-*` 26 处迁移（geodata 证书校验时钟口子收紧）；16 个 `xray-proxy-*` 时钟面全量分类（净迁 2 + 台账 35）
+- **inbound 注册表升 `BoundedRegistry`**：`InboundRuntime` 由 `RwLock<Vec>` 线性扫改为 fail-closed 有界注册表（查找 O(n)→O(log n)，删影子双轨）；双写对照 175 次比较差异 0
+
+### Performance
+
+- **vendor/rustls deframer 补丁**（`prepare_read` 缩容条件去 `self.used == 0`）：rustls 拓扑 `tls_read` 分配 **4.76 → 1.00 MB/MB（−79%）**、总分配 −76.7%、客户端 **CPU −17~19%**、吞吐 **341 → 415.5 MB/s（+21.7%）**；TLS wire 逐字节不变（8MB+200MB sha256 双侧 MATCH、tshark record 数精确相等）。代价：空闲连接常驻 ≤allow_max（+12KB/conn）
+- **客户端 TLS 读缓冲池化**：`xray-buf` 读路径每次 `poll_read` 的 64KB 新分配改为池化复用（`Buffer::new_pooled` 走 128KB 层），cli **alloc/MB 9.239 → 5.085（−45%）**
+- **h2/xhttp 服务端下行发送块池化**：`tokio-util::ReaderStream` 每帧 `reserve(64KiB)` 改池化块 + `Bytes::from_owner` 归还，srv **alloc/MB 2.159 → 1.299（−0.86）**；h2 DATA 载荷双向逐字节相等
+- **XUDP 首帧/累积双拷贝清零**：`to_vec` 摊平改 `ChainCursor` 链式喂 `PacketReader`（0 拷贝），每包分配 **3 → 2**
 
 ## [26.10.11] - 2026-10-22
 
