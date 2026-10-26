@@ -1229,6 +1229,7 @@ pub const ENV_QUEUE_CAP: &str = "XRAY_ROUTER_POOL_QUEUE_CAP";
 /// 池参数 env 覆盖项：worker 借缓冲超时（毫秒）。
 pub const ENV_BORROW_TIMEOUT_MS: &str = "XRAY_ROUTER_POOL_BORROW_TIMEOUT_MS";
 
+// udf-promotion-candidate: 提炼条件=零 xray 类型（薄壳编排机制，可上浮 std-ext）
 /// 路由 matcher 构建互喂池：[`PooledThreadPool`] 薄壳（P1-2 `GeodataLoadPool`
 /// 同款形态；壳属消费 crate 本地件，批量上浮 udf 列 P4 提炼候选）。
 ///

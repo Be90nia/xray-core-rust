@@ -15,6 +15,8 @@
 //! `MemoryPool`（缓冲）× `ThreadPool`（worker）+ 借用超时；本 crate 不复制
 //! 任何池逻辑，只做编排（任务构造 / 提交 / 串行收集）。
 
+// udf-promotion-candidate: 提炼条件=零 xray 类型（薄壳编排机制，可上浮 std-ext）
+
 use std::{
     io::Read,
     path::Path,

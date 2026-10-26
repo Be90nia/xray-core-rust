@@ -2021,7 +2021,8 @@ impl DialBridge {
 
 /// 简单的 [`OutboundHandlerManager`]：`RwLock<HashMap>` + default。
 ///
-/// 用于测试和简单场景。生产环境用 `proxyman::OutboundManager`。
+/// 用于测试和简单场景。**生产环境的出站表就是本类型**（`xray-app-proxyman`
+/// 无 `OutboundManager` 类型，grep 0 命中；其 `TcpWorker`/`UdpWorker` 生产零消费）。
 pub struct SimpleOhm {
     default: parking_lot::RwLock<Option<Arc<dyn DispatchHandler>>>,
     tagged: parking_lot::RwLock<std::collections::HashMap<String, Arc<dyn DispatchHandler>>>,

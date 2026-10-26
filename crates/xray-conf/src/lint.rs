@@ -18,6 +18,15 @@
 //! 跨 crate 复用：各 `xray-app-*` crate 可在自己模块顶层 `pub fn init()` 内
 //! 调用 `xray_conf::lint::register_stage(...)`，再由 `xray-core` 启动时
 //! 显式调用 `xray_conf::init::register_builtin_stages()` 把核心阶段串起来。
+//!
+//! ## 归一化裁决（2026-10-26 PM，bd d95us）
+//!
+//! 「端口 + 注册表 + 阶段编排」这一层机制**零 xray 语义**（与 `JournalPort`/
+//! `ConfigPort`/`ShutdownCoordinator` 同族），符合 CLAUDE.md §3.5.3 提炼判据；
+//! 但当前无 P4 提炼窗口，故裁决 = **留仓至 P4 + 补标准标注**，不做「不做」
+//! 终判、不在本窗口上浮。阶段内容（Xray 配置语义）永远留主仓。
+
+// udf-promotion-candidate: 提炼条件=零 xray 类型（编排机制上浮，阶段内容留仓；P4 窗口）
 
 use std::{
     collections::BTreeMap,
