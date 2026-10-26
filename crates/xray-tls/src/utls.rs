@@ -125,9 +125,15 @@ impl<S: Connection + Unpin> AsyncRead for Conn<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // 站点归因（票 4y9ns）：rustls 读路径（record 解密 + 明文交付）。
+        // 客户端下行主路径（srv→cli 的 200MB）全走此面——9.24 MB/MB 的
+        // 嫌疑面此前无站点标记（只标了写面），致 W0 工具误判为「BoringSSL
+        // C 侧堆不可见」。此处标记后可见：plain-TLS 客户端走的是 **rustls**
+        // （无 fingerprint → 标准 rustls 栈），其分配对 Rust 分配器可见。
+        let _site = alloc_site::enter(alloc_site::TLS_READ);
         // dirty 期间借读侧 poll 机会推进滞留：对端通常阻塞在读我们的
         // 尾部数据上（请求没发全它不回响应），duplex/TCP 窗口一旦空出
-        // 即唤醒本任务，此处 flush 得以继续，否则滞留无 poll 机会可推。
+        // 即唤醒本任务，此处 flush 得以推进，否则滞留无 poll 机会可推。
         // flush 的 Pending/Err 不改变 read 结果（底层若断，read 自会报）。
         if self.dirty {
             match Pin::new(&mut self.inner).poll_flush(cx) {
@@ -269,6 +275,8 @@ impl<S: Connection + Unpin> AsyncRead for ServerConn<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // 站点归因（票 4y9ns）：rustls 读路径（服务端下行同面）。
+        let _site = alloc_site::enter(alloc_site::TLS_READ);
         // 同 Conn::poll_read：dirty 期间借读侧 poll 机会推进 write 滞留。
         if self.dirty {
             match Pin::new(&mut self.inner).poll_flush(cx) {
@@ -368,6 +376,9 @@ impl<S: Connection + Unpin> AsyncRead for UConn<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // 站点归因（票 4y9ns）：u_client 指纹路径读面（Rustls 分支直通
+        // tokio_rustls，不经本 crate Conn 包装，须在此标记）。
+        let _site = alloc_site::enter(alloc_site::TLS_READ);
         match &mut self.inner {
             UConnInner::Rustls(c) => Pin::new(c).poll_read(cx, buf),
             UConnInner::Btls(c) => Pin::new(c).poll_read(cx, buf),

@@ -31,9 +31,13 @@ pub const TLS_WRITE: u8 = 1;
 pub const XHTTP_SRV_SEND: u8 = 2;
 /// vless AEAD 封装 seal（审计 §3 #3：mlkem-enc 客户端 +0.60 MB/MB）。
 pub const VLESS_ENC_SEAL: u8 = 3;
+/// TLS 记录**读**路径（解密 + 明文交付，票 4y9ns 归因：tcp-tls 客户端 9.24 MB/MB）。
+/// 与 [`TLS_WRITE`] 对称——W0 工具只标了写面，读面（客户端下行主路径）此前无站点。
+pub const TLS_READ: u8 = 4;
 
 /// 站点目录（索引 = 站点 id；新站点只能追加，禁重编号——dump 行与归集脚本按名对齐）。
-pub const SITE_NAMES: [&str; 4] = ["(none)", "tls_write", "xhttp_srv_send", "vless_enc_seal"];
+pub const SITE_NAMES: [&str; 5] =
+    ["(none)", "tls_write", "xhttp_srv_send", "vless_enc_seal", "tls_read"];
 
 /// 站点归集开关：xray-cli init() 一次性置位，热路径只读。
 static ENABLED: AtomicBool = AtomicBool::new(false);

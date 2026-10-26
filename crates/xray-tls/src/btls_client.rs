@@ -1468,6 +1468,8 @@ impl<S: Connection + Unpin> AsyncRead for BtlsConn<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // 站点归因（票 4y9ns）：btls 读路径（record 解密 + 明文交付）。
+        let _site = alloc_site::enter(alloc_site::TLS_READ);
         let this = &mut *self;
         loop {
             // Replay 义务优先：先补握手 + 重发被拒字节，再谈读。

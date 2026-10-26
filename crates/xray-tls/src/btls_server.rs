@@ -65,6 +65,8 @@ impl<S: AsyncRead + AsyncWrite> AsyncRead for BtlsServerStream<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // 站点归因（票 4y9ns）：btls 读路径（服务端下行同面）。
+        let _site = alloc_site::enter(alloc_site::TLS_READ);
         self.stream.as_mut().poll_read(cx, buf)
     }
 }
