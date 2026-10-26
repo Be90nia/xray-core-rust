@@ -149,4 +149,46 @@
 - 统计剩余裸调用实数，更新票面进度
 
 ---
+
+## 4. 收尾（2026-10-27 07:45）
+
+### 4.1 夜间成果：**8 张票关闭**，open 13 → **7**
+
+| 关闭 | 内容 |
+|---|---|
+| `di8wy` | W1 1a+1b：生产装配走 PluginRegistry + Instance 生命周期（十门全绿） |
+| `4y9ns` | 客户端读缓冲池化：cli alloc/MB **9.239→5.085** |
+| `q1r4q` | XUDP 双拷贝清零：每包 alloc **3→2** |
+| `r1693` | h2/xhttp 服务端发送块池化：srv alloc/MB **2.159→1.299** |
+| `rrpn4` | unix 门控路径纪律（Linux 床 clippy 绿） |
+| `xiuvr` | W3 契约族 3a+3b+3c（inbound 注册表 BoundedRegistry，双写 175/0） |
+| `bbuh7` | **vendor/rustls 补丁**：tls_read **−79%**、CPU **−17~19%**、吞吐 **+21.7%** |
+| `713x6` | W4 Clock 全量收口（净迁 28 + 台账 79，逐点 reason） |
+| `77r0q`/`8wvo9` | 裁决/去重关闭（ConfigFile NO-GO 留档） |
+
+**open 7**：`99ifi`(epic) · `nn8os` · `39hko` · `f17zu` · `aj0n3`(新) · `n539c` · `lbavl`
+
+### 4.2 夜间提交：**20 个**（含 2 个 WIP 快照），全部 push
+
+### 4.3 端到端验收（PM 亲自跑，共 4 轮）
+每轮均 **32/32 PASS + interop 12/12 PASS**；最后一轮针对 inbound spawn 批次，release 重建后自验通过；全量 test **177 target 0 FAILED**
+
+### 4.4 CI
+- `46d4f895` Format 红 → 已修（该轮 Clippy 红是 socks 生产 tracing，已迁）
+- `fe8d5481` Asset Gate 红（我提交的影子夹具引用 geo 资产）→ `76ae443c` 修（门排除 `fixtures`），**该轮 CI 全绿**
+- 末两个提交 CI 在跑（本地四门 + e2e 已绿）
+
+### 4.5 剩余（下一会话入口）
+| 项 | 前置/风险 |
+|---|---|
+| `f17zu` 剩余 16 处 inbound spawn | UDS 6 处需 **Linux 床**（cfg(unix) 本机不可编译，禁止盲改）；mux link 4 处需跨连接 scope 设计裁量；SS 泵/tun/vision 属红线 |
+| `39hko` | 台账总量已定型（90 时钟 + 若干 spawn），剩余同上 |
+| `nn8os` | 12 个协议 crate 的 ctx 迁移（已由 W5Spawn 覆盖大部分，需重新核账） |
+| `aj0n3` | 带指纹配置走 btls 的路径归因 + 契约 bench vs dist 4.4× 回查 |
+| `n539c`/`lbavl` | 已裁决不排期，保持挂账 |
+
+### 4.6 磁盘
+夜间最险时 **92%（40G）**；两次 `rm -rf target/debug/incremental` 共回收 128G。**收尾态 96G 可用 / target/debug ≈149G**（可再删，但下一会话要重建）。
+
+---
 （每波完成后追加：时间 / 代理 / 结果 / 提交 hash / 磁盘 / 决策）
