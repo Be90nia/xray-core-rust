@@ -23,7 +23,7 @@ use std::{
 use hickory_proto::rr::RecordType;
 use quinn::{ClientConfig as QuinnClientConfig, Endpoint, crypto::rustls::QuicClientConfig};
 use skeleton_infra::fx::FxScope;
-use tokio::time::timeout;
+use tokio::time::timeout_at;
 use tokio_rustls::rustls::ClientConfig;
 use xray_common::net::address::Address;
 
@@ -143,7 +143,16 @@ impl DoqNameServer {
         Ok(endpoint)
     }
 
-    async fn query_once(&self, fqdn: &str, record_type: RecordType) -> Result<IpRecord, DnsError> {
+    /// 发送单次 DNS 查询（DoQ），等待响应。
+    ///
+    /// bd 2iauj：连接/开流/写/读全部按调用方传入的整条查询绝对 `deadline` 收场
+    /// （Go nameserver_quic.go:93-98 入口算一次、:119 每个 req 复用同一时刻）。
+    async fn query_once(
+        &self,
+        fqdn: &str,
+        record_type: RecordType,
+        deadline: tokio::time::Instant,
+    ) -> Result<IpRecord, DnsError> {
         let req_id = self.id_gen.next_id();
         let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
 
@@ -163,7 +172,7 @@ impl DoqNameServer {
         let connect_fut = endpoint
             .connect(self.addr, &self.server_name)
             .map_err(|e| DnsError::WireFormat(format!("doq connect initiate: {e}")))?;
-        let conn = timeout(self.query_timeout, connect_fut)
+        let conn = timeout_at(deadline, connect_fut)
             .await
             .map_err(|_| {
                 DnsError::WireFormat(format!("doq connect timeout after {:?}", self.query_timeout))
@@ -171,23 +180,26 @@ impl DoqNameServer {
             .map_err(|e| DnsError::WireFormat(format!("doq connect: {e}")))?;
 
         // open bidirectional stream。
-        let (mut send, mut recv) = timeout(self.query_timeout, conn.open_bi())
+        let (mut send, mut recv) = timeout_at(deadline, conn.open_bi())
             .await
             .map_err(|_| DnsError::WireFormat("doq open_bi timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("doq open_bi: {e}")))?;
 
         // 写 2B 长度前缀 + payload。
-        send.write_all(&len_be)
+        timeout_at(deadline, send.write_all(&len_be))
             .await
+            .map_err(|_| DnsError::WireFormat("doq write len timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("doq write len: {e}")))?;
-        send.write_all(&payload)
+        timeout_at(deadline, send.write_all(&payload))
             .await
+            .map_err(|_| DnsError::WireFormat("doq write payload timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("doq write payload: {e}")))?;
+        // finish() 是同步调用（不等待网络），无需套 deadline。
         send.finish().map_err(|e| DnsError::WireFormat(format!("doq finish send: {e}")))?;
 
         // 读 2 字节长度前缀。
         let mut len_buf = [0u8; 2];
-        timeout(self.query_timeout, recv.read_exact(&mut len_buf))
+        timeout_at(deadline, recv.read_exact(&mut len_buf))
             .await
             .map_err(|_| DnsError::WireFormat("doq read len timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("doq read len: {e:?}")))?;
@@ -198,7 +210,7 @@ impl DoqNameServer {
 
         // 读响应 payload。
         let mut buf = vec![0u8; resp_len];
-        timeout(self.query_timeout, recv.read_exact(&mut buf))
+        timeout_at(deadline, recv.read_exact(&mut buf))
             .await
             .map_err(|_| DnsError::WireFormat("doq read payload timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("doq read payload: {e}")))?;
@@ -217,14 +229,18 @@ impl CachedNameserver for DoqNameServer {
     async fn send_query(&self, fqdn: &str, option: IpOption) -> QueryOutcome {
         let mut outcome = QueryOutcome::default();
 
+        // bd 2iauj：整条查询只算一次绝对 deadline（Go nameserver_quic.go:93-98
+        // 在 sendQuery 入口算 `deadline`，:119 每个 req 用同一时刻）。
+        let deadline = tokio::time::Instant::now() + self.query_timeout;
+
         if option.ipv4_enable {
-            match self.query_once(fqdn, RecordType::A).await {
+            match self.query_once(fqdn, RecordType::A, deadline).await {
                 Ok(rec) => outcome.rec_v4 = Some(rec),
                 Err(e) => outcome.errors.push(e),
             }
         }
         if option.ipv6_enable {
-            match self.query_once(fqdn, RecordType::AAAA).await {
+            match self.query_once(fqdn, RecordType::AAAA, deadline).await {
                 Ok(rec) => outcome.rec_v6 = Some(rec),
                 Err(e) => outcome.errors.push(e),
             }
@@ -309,6 +325,18 @@ mod tests {
         ips: Vec<Ipv4Addr>,
         ttl: u32,
     ) -> (SocketAddr, Arc<ClientConfig>, tokio::task::JoinHandle<()>) {
+        spawn_mock_doq_server_delayed(fqdn, ips, ttl, Duration::ZERO, Duration::ZERO).await
+    }
+
+    /// 同上，但响应拆两段回：先睡 `len_delay` 回 2B 长度前缀，再睡 `payload_delay`
+    /// 回响应体（bd 2iauj：分段预算制下两段读各起一份满额预算）。
+    async fn spawn_mock_doq_server_delayed(
+        fqdn: &str,
+        ips: Vec<Ipv4Addr>,
+        ttl: u32,
+        len_delay: Duration,
+        payload_delay: Duration,
+    ) -> (SocketAddr, Arc<ClientConfig>, tokio::task::JoinHandle<()>) {
         ensure_crypto_provider();
         // rcgen 自签证书（SAN: localhost）。
         let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
@@ -357,7 +385,9 @@ mod tests {
                 let query_msg = Message::from_vec(&buf).unwrap();
                 let resp = make_a_response(query_msg.metadata.id, &fqdn_owned, ips.clone(), ttl);
                 let resp_len = u16::try_from(resp.len()).unwrap().to_be_bytes();
+                tokio::time::sleep(len_delay).await;
                 let _ = send.write_all(&resp_len).await;
+                tokio::time::sleep(payload_delay).await;
                 let _ = send.write_all(&resp).await;
                 let _ = send.finish();
 
@@ -390,7 +420,14 @@ mod tests {
             Vec::new(),
             Duration::from_secs(5),
         );
-        let rec = ns.query_once("example.com.", RecordType::A).await.unwrap();
+        let rec = ns
+            .query_once(
+                "example.com.",
+                RecordType::A,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
         assert_eq!(rec.ips.len(), 1);
         assert_eq!(rec.ips[0], IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         assert!(rec.ttl_seconds(Instant::now()) <= 120);
@@ -453,5 +490,62 @@ mod tests {
             .await;
         assert!(outcome.rec_v4.is_none());
         assert_eq!(outcome.errors.len(), 1);
+    }
+
+    /// 实时跑 `send_query`，返回（墙钟耗时, 结果）。
+    ///
+    /// 不用 tokio 暂停时钟：暂停下真实 socket/QUIC IO 不随 advance 推进（本机实测
+    /// 拨号在 1s mock 预算内始终未完成），只能靠墙钟测「整条查询多久收场」。
+    async fn timed_query(
+        ns: Arc<DoqNameServer>,
+        fqdn: &'static str,
+        option: IpOption,
+    ) -> (Duration, QueryOutcome) {
+        let started = Instant::now();
+        let outcome = ns.send_query(fqdn, option).await;
+        (started.elapsed(), outcome)
+    }
+
+    /// bd 2iauj 回归钉：整条查询 deadline 覆盖**所有阶段**——mock 上游拆两段回
+    /// （长度前缀 700ms、正文再 700ms），1s 预算下第二段必须按入口绝对时刻失败。
+    /// 分段预算制下两段各起 1s（700+700 都在各段预算内），查询 ~1.4s 成功返回，
+    /// 本测试必红。
+    #[tokio::test]
+    async fn doq_total_deadline_covers_slow_response() {
+        let (addr, tls_config, _h) = spawn_mock_doq_server_delayed(
+            "slow.com.",
+            vec![Ipv4Addr::new(10, 0, 0, 5)],
+            60,
+            Duration::from_millis(700),
+            Duration::from_millis(700),
+        )
+        .await;
+        let ns = Arc::new(DoqNameServer::new(
+            addr,
+            "localhost".to_string(),
+            tls_config,
+            Arc::new(CacheController::new("test", true, false, 0, 0)),
+            Vec::new(),
+            Duration::from_secs(1),
+        ));
+
+        let (elapsed, outcome) = timed_query(
+            ns,
+            "slow.com.",
+            IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },
+        )
+        .await;
+
+        // 判别证据：必须死在**第二段读**上（握手/首段失败 = 前提没成立，测试无效）。
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(
+            outcome.errors[0].to_string().contains("doq read payload timeout"),
+            "必须在第二段读上按绝对 deadline 失败，got: {:?}",
+            outcome.errors
+        );
+        assert!(
+            elapsed >= Duration::from_millis(900) && elapsed <= Duration::from_millis(1350),
+            "total query deadline must be 1s, elapsed={elapsed:?}"
+        );
     }
 }

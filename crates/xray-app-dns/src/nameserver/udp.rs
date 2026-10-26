@@ -23,7 +23,7 @@ use std::{
 
 use hickory_proto::rr::RecordType;
 use skeleton_infra::fx::FxScope;
-use tokio::{net::UdpSocket, time::timeout};
+use tokio::{net::UdpSocket, time::timeout_at};
 use xray_common::net::{destination::Destination, port::Port};
 
 use crate::{
@@ -135,7 +135,16 @@ impl UdpNameServer {
     }
 
     /// 发送单次 DNS 查询并等待响应。
-    async fn query_once(&self, fqdn: &str, record_type: RecordType) -> Result<IpRecord, DnsError> {
+    ///
+    /// bd 2iauj：拨号/解析/发送/收包共享调用方传入的整条查询绝对 `deadline`
+    /// （Go nameserver_udp.go:161-189 的 dispatch 与等待都在外层 ctx 预算内，
+    /// 见 nameserver.go:183 `WithTimeout(ctx, c.timeoutMs)`）。
+    async fn query_once(
+        &self,
+        fqdn: &str,
+        record_type: RecordType,
+        deadline: tokio::time::Instant,
+    ) -> Result<IpRecord, DnsError> {
         let req_id = self.id_gen.next_id();
         let wire = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
 
@@ -145,17 +154,17 @@ impl UdpNameServer {
         // dispatcher 语义，防 DNS 查询经路由进 proxy（bd wmdn②）。
         let dialer = if self.force_local { None } else { crate::dial::shared_dialer() };
         if let Some(dialer) = dialer {
-            let mut session = timeout(self.query_timeout, dialer.dial_udp(&self.dest))
+            let mut session = timeout_at(deadline, dialer.dial_udp(&self.dest))
                 .await
                 .map_err(|_| {
                     DnsError::WireFormat(format!("udp dial timeout after {:?}", self.query_timeout))
                 })?
                 .map_err(|e| DnsError::WireFormat(format!("udp dial: {e}")))?;
-            timeout(self.query_timeout, session.send_packet(&self.dest, &wire))
+            timeout_at(deadline, session.send_packet(&self.dest, &wire))
                 .await
                 .map_err(|_| DnsError::WireFormat("udp dial send timeout".to_string()))?
                 .map_err(|e| DnsError::WireFormat(format!("udp dial send: {e}")))?;
-            let resp = timeout(self.query_timeout, session.recv_packet())
+            let resp = timeout_at(deadline, session.recv_packet())
                 .await
                 .map_err(|_| {
                     DnsError::WireFormat(format!(
@@ -170,15 +179,19 @@ impl UdpNameServer {
             let now = Instant::now();
             let parsed = parse_dns_response(&resp, req_id, record_type, now)?;
             if parsed.truncated {
-                return self.tcp_fallback_query(fqdn, record_type).await;
+                return self.tcp_fallback_query(fqdn, record_type, deadline).await;
             }
             return Ok(parsed_to_ip_record(&parsed, now));
         }
 
         // 直连兜底：IP 直发；域名每查询现解析（bd mcpo 运行期解析）。
-        let sock_addr = crate::dial::resolve_dest_addr(&self.dest, self.resolver.as_ref())
-            .await
-            .map_err(|e| DnsError::WireFormat(format!("udp resolve: {e}")))?;
+        let sock_addr = timeout_at(
+            deadline,
+            crate::dial::resolve_dest_addr(&self.dest, self.resolver.as_ref()),
+        )
+        .await
+        .map_err(|_| DnsError::WireFormat("udp resolve timeout".to_string()))?
+        .map_err(|e| DnsError::WireFormat(format!("udp resolve: {e}")))?;
 
         // TUN 接管的 DNS 服务器：Xray 自身上游查询拒拨（Go localdns
         // client.go:99-103 同语义），防查询经 TUN 绕回自身。
@@ -190,13 +203,14 @@ impl UdpNameServer {
         let sock = UdpSocket::bind("0.0.0.0:0")
             .await
             .map_err(|e| DnsError::WireFormat(format!("udp bind: {e}")))?;
-        sock.send_to(&wire, sock_addr)
+        timeout_at(deadline, sock.send_to(&wire, sock_addr))
             .await
+            .map_err(|_| DnsError::WireFormat("udp send timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("udp send: {e}")))?;
 
         // 栈上收包缓冲（4 KiB）：免每查询堆分配（NF-7）。
         let mut buf = [0u8; UDP_RECV_BUF];
-        let n = timeout(self.query_timeout, sock.recv(&mut buf))
+        let n = timeout_at(deadline, sock.recv(&mut buf))
             .await
             .map_err(|_| {
                 DnsError::WireFormat(format!("udp recv timeout after {:?}", self.query_timeout))
@@ -206,7 +220,7 @@ impl UdpNameServer {
         let now = Instant::now();
         let parsed = parse_dns_response(&buf[..n], req_id, record_type, now)?;
         if parsed.truncated {
-            return self.tcp_fallback_query(fqdn, record_type).await;
+            return self.tcp_fallback_query(fqdn, record_type, deadline).await;
         }
         Ok(parsed_to_ip_record(&parsed, now))
     }
@@ -215,10 +229,14 @@ impl UdpNameServer {
     ///
     /// 对应 Go `(*ClassicNameServer).query` TCP fallback 路径。
     /// RFC 7766 §5: 客户端必须支持 TCP 重试。
+    /// bd 2iauj：fallback 共享整条查询的 `deadline`（Go 的 truncated 重试是
+    /// nameserver_udp.go:118-137 的 EDNS0 重发、复用同一 ctx；Rust 走 TCP fallback
+    /// 属既有差异，预算语义对齐：重试不另起满额预算）。
     async fn tcp_fallback_query(
         &self,
         fqdn: &str,
         record_type: RecordType,
+        deadline: tokio::time::Instant,
     ) -> Result<IpRecord, DnsError> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -231,27 +249,36 @@ impl UdpNameServer {
             .to_be_bytes();
 
         // 经路由出站或直连兜底（域名每查询现解析）——与 TCP NS 同一拨号路径。
-        let mut stream = crate::dial::connect_stream(
-            &self.dest,
-            self.resolver.as_ref(),
-            self.query_timeout,
-            "udp-tcp-fallback",
-            self.force_local,
+        let mut stream = timeout_at(
+            deadline,
+            crate::dial::connect_stream(
+                &self.dest,
+                self.resolver.as_ref(),
+                self.query_timeout,
+                "udp-tcp-fallback",
+                self.force_local,
+            ),
         )
-        .await?;
+        .await
+        .map_err(|_| {
+            DnsError::WireFormat(format!(
+                "tcp fallback dial timeout after {:?}",
+                self.query_timeout
+            ))
+        })??;
 
-        timeout(self.query_timeout, stream.write_all(&len_be))
+        timeout_at(deadline, stream.write_all(&len_be))
             .await
             .map_err(|_| DnsError::WireFormat("tcp fallback write len timeout".into()))?
             .map_err(|e| DnsError::WireFormat(format!("tcp fallback write len: {e}")))?;
-        timeout(self.query_timeout, stream.write_all(&payload))
+        timeout_at(deadline, stream.write_all(&payload))
             .await
             .map_err(|_| DnsError::WireFormat("tcp fallback write payload timeout".into()))?
             .map_err(|e| DnsError::WireFormat(format!("tcp fallback write payload: {e}")))?;
 
         // 读 2B 长度前缀。
         let mut len_buf = [0u8; 2];
-        timeout(self.query_timeout, stream.read_exact(&mut len_buf))
+        timeout_at(deadline, stream.read_exact(&mut len_buf))
             .await
             .map_err(|_| DnsError::WireFormat("tcp fallback read len timeout".into()))?
             .map_err(|e| DnsError::WireFormat(format!("tcp fallback read len: {e}")))?;
@@ -263,7 +290,7 @@ impl UdpNameServer {
         }
 
         let mut resp_buf = vec![0u8; resp_len];
-        timeout(self.query_timeout, stream.read_exact(&mut resp_buf))
+        timeout_at(deadline, stream.read_exact(&mut resp_buf))
             .await
             .map_err(|_| DnsError::WireFormat("tcp fallback read response timeout".into()))?
             .map_err(|e| DnsError::WireFormat(format!("tcp fallback read response: {e}")))?;
@@ -283,17 +310,22 @@ impl CachedNameserver for UdpNameServer {
     async fn send_query(&self, fqdn: &str, option: IpOption) -> QueryOutcome {
         let mut outcome = QueryOutcome::default();
 
+        // bd 2iauj：整条查询只算一次绝对 deadline（Go 语义 = 上层
+        // nameserver.go:183 `WithTimeout(ctx, c.timeoutMs)` 一个时刻覆盖整条查询；
+        // nameserver_udp.go:161-189 的 dispatch 与响应等待都在该预算内）。
+        let deadline = tokio::time::Instant::now() + self.query_timeout;
+
         // 顺序发起 A/AAAA。
         // ponytail: 串行 await。真正并行需 tokio::join! 或 JoinSet，业务上串行也能完成
         // （多 1 个 RTT 的延迟换简化代码）。高并发场景可在 query_once 外层 spawn。
         if option.ipv4_enable {
-            match self.query_once(fqdn, RecordType::A).await {
+            match self.query_once(fqdn, RecordType::A, deadline).await {
                 Ok(rec) => outcome.rec_v4 = Some(rec),
                 Err(e) => outcome.errors.push(e),
             }
         }
         if option.ipv6_enable {
-            match self.query_once(fqdn, RecordType::AAAA).await {
+            match self.query_once(fqdn, RecordType::AAAA, deadline).await {
                 Ok(rec) => outcome.rec_v6 = Some(rec),
                 Err(e) => outcome.errors.push(e),
             }
@@ -404,7 +436,14 @@ mod tests {
             Duration::from_secs(2),
             Arc::new(crate::dial::SystemHostResolver),
         );
-        let rec = ns.query_once("example.com.", RecordType::A).await.unwrap();
+        let rec = ns
+            .query_once(
+                "example.com.",
+                RecordType::A,
+                tokio::time::Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
         assert_eq!(rec.ips.len(), 1);
         assert_eq!(rec.ips[0], IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
         assert_eq!(rec.rcode, 0);
@@ -624,7 +663,14 @@ mod tests {
             Arc::new(crate::dial::SystemHostResolver),
         );
 
-        let rec = ns.query_once("routed.com.", RecordType::A).await.unwrap();
+        let rec = ns
+            .query_once(
+                "routed.com.",
+                RecordType::A,
+                tokio::time::Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
         crate::dial::set_shared_dialer(None);
 
         assert_eq!(rec.ips, vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 8))]);
@@ -644,5 +690,82 @@ mod tests {
         };
         let server = UdpNameServer::from_config(&ns).unwrap();
         assert_eq!(server.name(), "UDP:8.8.8.8:53");
+    }
+
+    /// 慢解析器：`resolve` 睡 `delay`（真实时间）后返回固定 IP——模拟域名解析吃掉
+    /// 前段预算（Go 的地址解析同样在查询 ctx 预算内）。
+    struct SlowResolver {
+        delay: Duration,
+        ip: IpAddr,
+    }
+
+    impl crate::dial::HostResolver for SlowResolver {
+        fn resolve(
+            &self,
+            _host: String,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Vec<IpAddr>>> + Send>> {
+            let (delay, ip) = (self.delay, self.ip);
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok(vec![ip])
+            })
+        }
+    }
+
+    /// 实时跑 `send_query`，返回（墙钟耗时, 结果）。
+    ///
+    /// 不用 tokio 暂停时钟：暂停下真实 IO 不随 advance 推进（本机实测拨号在 1s
+    /// mock 预算内始终未完成），只能靠墙钟测「整条查询多久收场」。
+    async fn timed_query(
+        ns: Arc<UdpNameServer>,
+        fqdn: &'static str,
+        option: IpOption,
+    ) -> (Duration, QueryOutcome) {
+        let started = Instant::now();
+        let outcome = ns.send_query(fqdn, option).await;
+        (started.elapsed(), outcome)
+    }
+
+    /// bd 2iauj 回归钉：整条查询 deadline 覆盖解析 + 收包——解析吃掉 700ms 后，
+    /// 收包只剩 300ms 预算，1s 内必须失败。分段预算制下 recv 另起 1s（≈1.7s 收场），
+    /// 本测试必红。
+    ///
+    /// 不注入共享 dialer（那是进程级全局，会污染并行跑的 doh/dot 测试）；改用域名
+    /// NS + 慢解析器走直连路径，同样在「前段吃掉预算」这一判别点上。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
+    async fn udp_total_deadline_covers_slow_resolve() {
+        // 持锁保证查询不会被别的测试并发装上的共享 dialer 截走。
+        let _slot = DIALER_SLOT_LOCK.lock();
+        // 存活的静默上游：端口无监听时 Windows 会用 ICMP 不可达打断 recv，
+        // 只有存活 socket 才走确定性的 recv 超时路径。
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let saddr = silent.local_addr().unwrap();
+        let ns = Arc::new(UdpNameServer::new(
+            Destination::udp(Address::Domain("slow.example".to_string()), Port::new(saddr.port())),
+            Arc::new(CacheController::new("test", true, false, 0, 0)),
+            Vec::new(),
+            Duration::from_secs(1),
+            Arc::new(SlowResolver { delay: Duration::from_millis(700), ip: saddr.ip() }),
+        ));
+
+        let (elapsed, outcome) = timed_query(
+            ns,
+            "slow.com.",
+            IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },
+        )
+        .await;
+
+        // 判别证据：必须死在**收包**上（解析失败 = 前提没成立，测试无效）。
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(
+            outcome.errors[0].to_string().contains("udp recv timeout"),
+            "必须在收包段按绝对 deadline 失败，got: {:?}",
+            outcome.errors
+        );
+        assert!(
+            elapsed >= Duration::from_millis(900) && elapsed <= Duration::from_millis(1350),
+            "total query deadline must be 1s, elapsed={elapsed:?}"
+        );
     }
 }

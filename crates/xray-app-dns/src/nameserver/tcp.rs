@@ -26,7 +26,7 @@ use hickory_proto::rr::RecordType;
 use skeleton_infra::fx::FxScope;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    time::timeout,
+    time::timeout_at,
 };
 use xray_common::net::{destination::Destination, port::Port};
 
@@ -130,18 +130,32 @@ impl TcpNameServer {
 
     /// 建立查询流：共享 dialer 在场经路由出站（Go nameserver_tcp.go:43-47
     /// dispatcher.Dispatch 语义）；缺席直连兜底（域名每查询现解析）。
-    async fn connect(&self) -> Result<crate::dial::DnsStream, DnsError> {
-        crate::dial::connect_stream(
-            &self.dest,
-            self.resolver.as_ref(),
-            self.query_timeout,
-            "tcp",
-            self.force_local,
+    ///
+    /// bd 2iauj：拨号在整条查询的绝对 `deadline` 内完成（Go 把 ctx 一路带到
+    /// `s.dial(dnsCtx)`，nameserver_tcp.go:151/163）——`connect_stream` 内部仍按
+    /// 单次拨号计 `query_timeout`，总量由外层 deadline 封顶。
+    async fn connect(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<crate::dial::DnsStream, DnsError> {
+        timeout_at(
+            deadline,
+            crate::dial::connect_stream(
+                &self.dest,
+                self.resolver.as_ref(),
+                self.query_timeout,
+                "tcp",
+                self.force_local,
+            ),
         )
         .await
+        .map_err(|_| {
+            DnsError::WireFormat(format!("tcp dial timeout after {:?}", self.query_timeout))
+        })?
     }
 
-    /// 在已有连接上执行单次 TCP 查询。
+    /// 在已有连接上执行单次 TCP 查询。写/读/刷新全部按整条查询的 `deadline`
+    /// 收场（bd 2iauj）——分段各套满额预算时慢握手会把读段起点推后。
     async fn try_query(
         &self,
         stream: &mut crate::dial::DnsStream,
@@ -149,19 +163,23 @@ impl TcpNameServer {
         payload: &[u8],
         req_id: u16,
         record_type: RecordType,
+        deadline: tokio::time::Instant,
     ) -> Result<IpRecord, DnsError> {
-        timeout(self.query_timeout, stream.write_all(len_be))
+        timeout_at(deadline, stream.write_all(len_be))
             .await
             .map_err(|_| DnsError::WireFormat("tcp write len timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("tcp write len: {e}")))?;
-        timeout(self.query_timeout, stream.write_all(payload))
+        timeout_at(deadline, stream.write_all(payload))
             .await
             .map_err(|_| DnsError::WireFormat("tcp write payload timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("tcp write payload: {e}")))?;
-        stream.flush().await.map_err(io_to_dns)?;
+        timeout_at(deadline, stream.flush())
+            .await
+            .map_err(|_| DnsError::WireFormat("tcp flush timeout".to_string()))?
+            .map_err(io_to_dns)?;
 
         let mut len_buf = [0u8; 2];
-        timeout(self.query_timeout, stream.read_exact(&mut len_buf))
+        timeout_at(deadline, stream.read_exact(&mut len_buf))
             .await
             .map_err(|_| DnsError::WireFormat("tcp read len timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("tcp read len: {e}")))?;
@@ -171,7 +189,7 @@ impl TcpNameServer {
         }
 
         let mut buf = vec![0u8; resp_len];
-        timeout(self.query_timeout, stream.read_exact(&mut buf))
+        timeout_at(deadline, stream.read_exact(&mut buf))
             .await
             .map_err(|_| DnsError::WireFormat("tcp read payload timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("tcp read payload: {e}")))?;
@@ -181,8 +199,14 @@ impl TcpNameServer {
         Ok(parsed_to_ip_record(&parsed, now))
     }
 
-    /// 发送单次 DNS 查询（TCP），等待响应。连接池复用连接，失败时重试一次。
-    async fn query_once(&self, fqdn: &str, record_type: RecordType) -> Result<IpRecord, DnsError> {
+    /// 发送单次 DNS 查询（TCP），等待响应。连接池复用连接，失败时重试一次
+    /// （bd 2iauj：重试共享调用方传入的同一 `deadline`，不另起预算）。
+    async fn query_once(
+        &self,
+        fqdn: &str,
+        record_type: RecordType,
+        deadline: tokio::time::Instant,
+    ) -> Result<IpRecord, DnsError> {
         let req_id = self.id_gen.next_id();
         let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
         let len_be = u16::try_from(payload.len())
@@ -193,13 +217,15 @@ impl TcpNameServer {
             // 域名 NS（bd mcpo）：每查询新建流——连接池会把旧解析钉死，
             // 地址变更后新查询必须用新 IP。运行期解析在 connect() 内
             // （经路由出站交路由系统；直连兜底每查询现解析）。
-            let mut stream = self.connect().await?;
-            return self.try_query(&mut stream, &len_be, &payload, req_id, record_type).await;
+            let mut stream = self.connect(deadline).await?;
+            return self
+                .try_query(&mut stream, &len_be, &payload, req_id, record_type, deadline)
+                .await;
         }
 
         let mut conn_guard = self.conn.lock().await;
         if conn_guard.is_none() {
-            *conn_guard = Some(self.connect().await?);
+            *conn_guard = Some(self.connect(deadline).await?);
         }
 
         match self
@@ -209,21 +235,28 @@ impl TcpNameServer {
                 &payload,
                 req_id,
                 record_type,
+                deadline,
             )
             .await
         {
             Ok(result) => Ok(result),
             Err(e) => {
+                // 整条查询 deadline 已耗尽（本段超时）→ 重连必然立即失败，且会用
+                // 拨号错误掩盖真正的原因：直接返回首查错误（Go 本无重试）。
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(e);
+                }
                 // 首查失败静默重连不可观测（iq1o）：记录首查错误再重试。
                 tracing::debug!(error = %e, "DNS-over-TCP query on pooled connection failed, reconnecting");
                 *conn_guard = None;
-                *conn_guard = Some(self.connect().await?);
+                *conn_guard = Some(self.connect(deadline).await?);
                 self.try_query(
                     conn_guard.as_mut().expect("reconnected just above"),
                     &len_be,
                     &payload,
                     req_id,
                     record_type,
+                    deadline,
                 )
                 .await
             },
@@ -239,14 +272,19 @@ impl CachedNameserver for TcpNameServer {
     async fn send_query(&self, fqdn: &str, option: IpOption) -> QueryOutcome {
         let mut outcome = QueryOutcome::default();
 
+        // bd 2iauj：整条查询只算一次绝对 deadline（Go nameserver_tcp.go:124-129
+        // 在 sendQuery 入口算 `deadline`，:151 每个 req 用同一时刻）——A/AAAA、
+        // 拨号、写、读、重试共享，慢阶段不推出新预算。
+        let deadline = tokio::time::Instant::now() + self.query_timeout;
+
         if option.ipv4_enable {
-            match self.query_once(fqdn, RecordType::A).await {
+            match self.query_once(fqdn, RecordType::A, deadline).await {
                 Ok(rec) => outcome.rec_v4 = Some(rec),
                 Err(e) => outcome.errors.push(e),
             }
         }
         if option.ipv6_enable {
-            match self.query_once(fqdn, RecordType::AAAA).await {
+            match self.query_once(fqdn, RecordType::AAAA, deadline).await {
                 Ok(rec) => outcome.rec_v6 = Some(rec),
                 Err(e) => outcome.errors.push(e),
             }
@@ -316,6 +354,11 @@ mod tests {
         Destination::tcp(Address::from(addr.ip()), Port::new(addr.port()))
     }
 
+    /// 测试用整条查询 deadline（等价 `send_query` 入口算出的一次性预算）。
+    fn test_deadline(timeout: Duration) -> tokio::time::Instant {
+        tokio::time::Instant::now() + timeout
+    }
+
     fn make_a_response(req_id: u16, fqdn: &str, ips: Vec<Ipv4Addr>, ttl: u32) -> Vec<u8> {
         let name = Name::parse(fqdn, None).unwrap();
         let mut msg = Message::new(req_id, MessageType::Response, OpCode::Query);
@@ -371,7 +414,10 @@ mod tests {
             Duration::from_secs(2),
             Arc::new(crate::dial::SystemHostResolver),
         );
-        let rec = ns.query_once("example.com.", RecordType::A).await.unwrap();
+        let rec = ns
+            .query_once("example.com.", RecordType::A, test_deadline(Duration::from_secs(2)))
+            .await
+            .unwrap();
         assert_eq!(rec.ips.len(), 1);
         assert_eq!(rec.ips[0], IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         assert!(rec.ttl_seconds(Instant::now()) <= 120);
@@ -425,6 +471,151 @@ mod tests {
         // TCP connect 成功（listener 在），但 read 等到 timeout。
         assert!(outcome.rec_v4.is_none());
         assert_eq!(outcome.errors.len(), 1);
+    }
+
+    /// 慢响应 mock TCP server：读到请求后先睡 `len_delay` 回 2B 长度前缀，再睡
+    /// `payload_delay` 才回响应体——两段读在分段预算制下各起一份满额预算。
+    async fn spawn_slow_tcp_server(
+        fqdn: &str,
+        ips: Vec<Ipv4Addr>,
+        ttl: u32,
+        len_delay: Duration,
+        payload_delay: Duration,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let fqdn_owned = fqdn.to_string();
+        let handle = xray_common::testing::spawn("spawn-slow-tcp-server-accept", async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut len_buf = [0u8; 2];
+            use tokio::io::AsyncReadExt;
+            sock.read_exact(&mut len_buf).await.unwrap();
+            let plen = usize::from(u16::from_be_bytes(len_buf));
+            let mut buf = vec![0u8; plen];
+            sock.read_exact(&mut buf).await.unwrap();
+            let query_msg = Message::from_vec(&buf).unwrap();
+            let resp = make_a_response(query_msg.metadata.id, &fqdn_owned, ips, ttl);
+
+            tokio::time::sleep(len_delay).await;
+            sock.write_all(&u16::try_from(resp.len()).unwrap().to_be_bytes()).await.unwrap();
+            tokio::time::sleep(payload_delay).await;
+            sock.write_all(&resp).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        (addr, handle)
+    }
+
+    /// 实时跑 `send_query`，返回（墙钟耗时, 结果）。
+    ///
+    /// 不用 tokio 暂停时钟：暂停下真实 socket IO 不随 advance 推进（本机实测
+    /// 拨号在 1s mock 预算内始终未完成），只能靠墙钟测「整条查询多久收场」。
+    async fn timed_query(
+        ns: Arc<TcpNameServer>,
+        fqdn: &'static str,
+        option: IpOption,
+    ) -> (Duration, QueryOutcome) {
+        let started = Instant::now();
+        let outcome = ns.send_query(fqdn, option).await;
+        (started.elapsed(), outcome)
+    }
+
+    fn v4_only() -> IpOption {
+        IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false }
+    }
+
+    /// bd 2iauj 回归钉：整条查询 deadline 覆盖**所有阶段**——mock 上游把响应拆成
+    /// 两段（长度前缀 700ms、正文再 700ms），1s 预算下第二段必须按入口算出的绝对
+    /// 时刻失败。分段预算制下两段各起 1s（700+700 都在各段预算内），查询在 ~1.4s
+    /// 成功返回，本测试必红。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
+    async fn tcp_total_deadline_covers_slow_response() {
+        let _slot = DIALER_SLOT_LOCK.lock();
+        let (addr, _h) = spawn_slow_tcp_server(
+            "slow.com.",
+            vec![Ipv4Addr::new(10, 0, 0, 7)],
+            60,
+            Duration::from_millis(700),
+            Duration::from_millis(700),
+        )
+        .await;
+        let ns = Arc::new(TcpNameServer::new(
+            ip_dest(addr),
+            Arc::new(CacheController::new("test", true, false, 0, 0)),
+            Vec::new(),
+            Duration::from_secs(1),
+            Arc::new(crate::dial::SystemHostResolver),
+        ));
+
+        let (elapsed, outcome) = timed_query(ns, "slow.com.", v4_only()).await;
+
+        // 判别证据：必须死在**第二段读**上（拨号/首段失败 = 前提没成立，测试无效）。
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(
+            outcome.errors[0].to_string().contains("tcp read payload timeout"),
+            "必须在第二段读上按绝对 deadline 失败，got: {:?}",
+            outcome.errors
+        );
+        assert!(
+            elapsed >= Duration::from_millis(900) && elapsed <= Duration::from_millis(1350),
+            "total query deadline must be 1s, elapsed={elapsed:?}"
+        );
+    }
+
+    /// bd 2iauj：deadline 归属在 `send_query`（不是每条 A/AAAA 各算一次）——
+    /// v4 花掉 700ms 后 v6 只剩 300ms 预算，必须失败。Go
+    /// nameserver_tcp.go:124-129 在 sendQuery 入口算一次、:151 每个 req 复用。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
+    async fn tcp_deadline_shared_by_both_families() {
+        let _slot = DIALER_SLOT_LOCK.lock();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _h = xray_common::testing::spawn("spawn-delayed-tcp-server-accept", async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            use tokio::io::AsyncReadExt;
+            // 同一连接顺序服务 A / AAAA 两次请求，每次延迟 700ms 回包。
+            for ip in [Ipv4Addr::new(10, 0, 0, 4), Ipv4Addr::new(10, 0, 0, 6)] {
+                let mut len_buf = [0u8; 2];
+                if sock.read_exact(&mut len_buf).await.is_err() {
+                    return;
+                }
+                let plen = usize::from(u16::from_be_bytes(len_buf));
+                let mut buf = vec![0u8; plen];
+                if sock.read_exact(&mut buf).await.is_err() {
+                    return;
+                }
+                let query_msg = Message::from_vec(&buf).unwrap();
+                tokio::time::sleep(Duration::from_millis(700)).await;
+                let resp = make_a_response(query_msg.metadata.id, "both.com.", vec![ip], 60);
+                let len = u16::try_from(resp.len()).unwrap().to_be_bytes();
+                if sock.write_all(&len).await.is_err() || sock.write_all(&resp).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let ns = Arc::new(TcpNameServer::new(
+            ip_dest(addr),
+            Arc::new(CacheController::new("test", true, false, 0, 0)),
+            Vec::new(),
+            Duration::from_secs(1),
+            Arc::new(crate::dial::SystemHostResolver),
+        ));
+
+        let (elapsed, outcome) = timed_query(
+            ns,
+            "both.com.",
+            IpOption { ipv4_enable: true, ipv6_enable: true, fake_enable: false },
+        )
+        .await;
+
+        assert!(outcome.rec_v4.is_some(), "v4 在 700ms 内回来，errors={:?}", outcome.errors);
+        assert!(outcome.rec_v6.is_none(), "v6 只剩 300ms 预算，必须失败（deadline 属 send_query）");
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(
+            elapsed >= Duration::from_millis(900) && elapsed <= Duration::from_millis(1350),
+            "整条查询 1s 收场（A 700ms + AAAA 超时），elapsed={elapsed:?}"
+        );
     }
 
     /// 记录拨号目标的 mock dialer：真连 dest（TCP pump），验收"查询经路由出站"。
@@ -481,7 +672,10 @@ mod tests {
             Arc::new(crate::dial::SystemHostResolver),
         );
 
-        let rec = ns.query_once("routed.com.", RecordType::A).await.unwrap();
+        let rec = ns
+            .query_once("routed.com.", RecordType::A, test_deadline(Duration::from_secs(2)))
+            .await
+            .unwrap();
         crate::dial::set_shared_dialer(None);
 
         assert_eq!(rec.ips, vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))]);
@@ -549,14 +743,20 @@ mod tests {
         );
 
         // 第一次查询 → 解析到 A server，回 A 记录。
-        let r1 = ns.query_once("var.com.", RecordType::A).await.unwrap();
+        let r1 = ns
+            .query_once("var.com.", RecordType::A, test_deadline(Duration::from_secs(2)))
+            .await
+            .unwrap();
         assert_eq!(r1.ips, vec![IpAddr::V4(Ipv4Addr::new(10, 9, 0, 1))]);
 
         // 上游地址"变更"。
         resolver.to_b.store(true, std::sync::atomic::Ordering::SeqCst);
 
         // 新查询 → 解析到 B server，回 B 记录（新 IP 生效）。
-        let r2 = ns.query_once("var.com.", RecordType::A).await.unwrap();
+        let r2 = ns
+            .query_once("var.com.", RecordType::A, test_deadline(Duration::from_secs(2)))
+            .await
+            .unwrap();
         assert_eq!(
             r2.ips,
             vec![IpAddr::V4(Ipv4Addr::new(10, 9, 0, 2))],

@@ -27,7 +27,7 @@ use hickory_proto::rr::RecordType;
 use skeleton_infra::fx::FxScope;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    time::timeout,
+    time::timeout_at,
 };
 use tokio_rustls::rustls::ClientConfig;
 use xray_common::net::{destination::Destination, port::Port};
@@ -144,17 +144,30 @@ impl DotNameServer {
     }
 
     /// 建立 DoT TLS 连接：经路由出站或直连兜底（域名每查询现解析）。
-    async fn connect_tls(&self) -> Result<xray_tls::utls::Conn<DotStream>, DnsError> {
-        let stream = crate::dial::connect_stream(
-            &self.dest,
-            self.resolver.as_ref(),
-            self.query_timeout,
-            "dot",
-            self.force_local,
+    ///
+    /// bd 2iauj：拨号 + TLS 握手共享整条查询的绝对 `deadline`（Go 无独立 DoT
+    /// nameserver，语义等同 nameserver_tcp.go:124-129/151 的 ctx deadline）——
+    /// 内部 `connect_stream` 仍按单次拨号计 `query_timeout`，总量由外层封顶。
+    async fn connect_tls(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<xray_tls::utls::Conn<DotStream>, DnsError> {
+        let stream = timeout_at(
+            deadline,
+            crate::dial::connect_stream(
+                &self.dest,
+                self.resolver.as_ref(),
+                self.query_timeout,
+                "dot",
+                self.force_local,
+            ),
         )
-        .await?;
-        let tls = timeout(
-            self.query_timeout,
+        .await
+        .map_err(|_| {
+            DnsError::WireFormat(format!("dot dial timeout after {:?}", self.query_timeout))
+        })??;
+        let tls = timeout_at(
+            deadline,
             tls_client(stream, &self.server_name, Arc::clone(&self.tls_config)),
         )
         .await
@@ -163,7 +176,8 @@ impl DotNameServer {
         Ok(tls)
     }
 
-    /// 在已有连接上执行单次 DoT 查询。
+    /// 在已有连接上执行单次 DoT 查询（bd 2iauj：写/刷新/读全按整条查询的
+    /// `deadline` 收场，慢握手不把读段起点推后）。
     async fn try_query(
         &self,
         stream: &mut xray_tls::utls::Conn<DotStream>,
@@ -171,21 +185,25 @@ impl DotNameServer {
         payload: &[u8],
         req_id: u16,
         record_type: RecordType,
+        deadline: tokio::time::Instant,
     ) -> Result<IpRecord, DnsError> {
         // 写长度前缀 + payload。
-        timeout(self.query_timeout, stream.write_all(len_be))
+        timeout_at(deadline, stream.write_all(len_be))
             .await
             .map_err(|_| DnsError::WireFormat("dot write len timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("dot write len: {e}")))?;
-        timeout(self.query_timeout, stream.write_all(payload))
+        timeout_at(deadline, stream.write_all(payload))
             .await
             .map_err(|_| DnsError::WireFormat("dot write payload timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("dot write payload: {e}")))?;
-        stream.flush().await.map_err(io_to_dns)?;
+        timeout_at(deadline, stream.flush())
+            .await
+            .map_err(|_| DnsError::WireFormat("dot flush timeout".to_string()))?
+            .map_err(io_to_dns)?;
 
         // 读 2 字节长度前缀。
         let mut len_buf = [0u8; 2];
-        timeout(self.query_timeout, stream.read_exact(&mut len_buf))
+        timeout_at(deadline, stream.read_exact(&mut len_buf))
             .await
             .map_err(|_| DnsError::WireFormat("dot read len timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("dot read len: {e}")))?;
@@ -196,7 +214,7 @@ impl DotNameServer {
 
         // 读响应 payload。
         let mut buf = vec![0u8; resp_len];
-        timeout(self.query_timeout, stream.read_exact(&mut buf))
+        timeout_at(deadline, stream.read_exact(&mut buf))
             .await
             .map_err(|_| DnsError::WireFormat("dot read payload timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("dot read payload: {e}")))?;
@@ -206,8 +224,14 @@ impl DotNameServer {
         Ok(parsed_to_ip_record(&parsed, now))
     }
 
-    /// 发送单次 DNS 查询（DoT），等待响应。连接池复用 TLS 连接，失败时重试一次。
-    async fn query_once(&self, fqdn: &str, record_type: RecordType) -> Result<IpRecord, DnsError> {
+    /// 发送单次 DNS 查询（DoT），等待响应。连接池复用 TLS 连接，失败时重试一次
+    /// （bd 2iauj：重试共享调用方传入的同一 `deadline`，不另起预算）。
+    async fn query_once(
+        &self,
+        fqdn: &str,
+        record_type: RecordType,
+        deadline: tokio::time::Instant,
+    ) -> Result<IpRecord, DnsError> {
         let req_id = self.id_gen.next_id();
         let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
         let len_be = u16::try_from(payload.len())
@@ -216,7 +240,7 @@ impl DotNameServer {
 
         let mut conn_guard = self.conn.lock().await;
         if conn_guard.is_none() {
-            *conn_guard = Some(self.connect_tls().await?);
+            *conn_guard = Some(self.connect_tls(deadline).await?);
         }
 
         // 尝试在已有连接上查询，失败则丢弃重连。
@@ -227,21 +251,28 @@ impl DotNameServer {
                 &payload,
                 req_id,
                 record_type,
+                deadline,
             )
             .await
         {
             Ok(result) => Ok(result),
             Err(e) => {
+                // 整条查询 deadline 已耗尽（本段超时）→ 重连必然立即失败，且会用
+                // 拨号/握手错误掩盖真正原因：直接返回首查错误（Go 本无重试）。
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(e);
+                }
                 // 首查失败静默重连不可观测（iq1o）：记录首查错误再重试。
                 tracing::debug!(error = %e, "DoT query on pooled connection failed, reconnecting");
                 *conn_guard = None;
-                *conn_guard = Some(self.connect_tls().await?);
+                *conn_guard = Some(self.connect_tls(deadline).await?);
                 self.try_query(
                     conn_guard.as_mut().expect("reconnected just above"),
                     &len_be,
                     &payload,
                     req_id,
                     record_type,
+                    deadline,
                 )
                 .await
             },
@@ -257,14 +288,19 @@ impl CachedNameserver for DotNameServer {
     async fn send_query(&self, fqdn: &str, option: IpOption) -> QueryOutcome {
         let mut outcome = QueryOutcome::default();
 
+        // bd 2iauj：整条查询只算一次绝对 deadline（Go nameserver_tcp.go:124-129
+        // 入口算一次、:151 每个 req 复用；DoT 走同一 TCP 语义）——A/AAAA、
+        // 拨号、TLS 握手、写、读、重试共享。
+        let deadline = tokio::time::Instant::now() + self.query_timeout;
+
         if option.ipv4_enable {
-            match self.query_once(fqdn, RecordType::A).await {
+            match self.query_once(fqdn, RecordType::A, deadline).await {
                 Ok(rec) => outcome.rec_v4 = Some(rec),
                 Err(e) => outcome.errors.push(e),
             }
         }
         if option.ipv6_enable {
-            match self.query_once(fqdn, RecordType::AAAA).await {
+            match self.query_once(fqdn, RecordType::AAAA, deadline).await {
                 Ok(rec) => outcome.rec_v6 = Some(rec),
                 Err(e) => outcome.errors.push(e),
             }
@@ -359,6 +395,18 @@ mod tests {
         ips: Vec<Ipv4Addr>,
         ttl: u32,
     ) -> (SocketAddr, Arc<ClientConfig>, tokio::task::JoinHandle<()>) {
+        spawn_mock_dot_server_delayed(fqdn, ips, ttl, Duration::ZERO, Duration::ZERO).await
+    }
+
+    /// 同上，但响应拆两段回：先睡 `len_delay` 回 2B 长度前缀，再睡 `payload_delay`
+    /// 回响应体（bd 2iauj：分段预算制下两段读各起一份满额预算）。
+    async fn spawn_mock_dot_server_delayed(
+        fqdn: &str,
+        ips: Vec<Ipv4Addr>,
+        ttl: u32,
+        len_delay: Duration,
+        payload_delay: Duration,
+    ) -> (SocketAddr, Arc<ClientConfig>, tokio::task::JoinHandle<()>) {
         ensure_crypto_provider();
         // rcgen 自签证书（SAN: localhost）。
         let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
@@ -398,9 +446,11 @@ mod tests {
             let query_msg = Message::from_vec(&buf).unwrap();
             let resp = make_a_response(query_msg.metadata.id, &fqdn_owned, ips.clone(), ttl);
 
-            // 回写 2B 长度 + response。
+            // 回写 2B 长度 + response（两段中间可按需延迟）。
             let len = u16::try_from(resp.len()).unwrap().to_be_bytes();
+            tokio::time::sleep(len_delay).await;
             tls.write_all(&len).await.unwrap();
+            tokio::time::sleep(payload_delay).await;
             tls.write_all(&resp).await.unwrap();
             tls.flush().await.unwrap();
         });
@@ -428,7 +478,14 @@ mod tests {
             Vec::new(),
             Duration::from_secs(2),
         );
-        let rec = ns.query_once("example.com.", RecordType::A).await.unwrap();
+        let rec = ns
+            .query_once(
+                "example.com.",
+                RecordType::A,
+                tokio::time::Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
         assert_eq!(rec.ips.len(), 1);
         assert_eq!(rec.ips[0], IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         assert!(rec.ttl_seconds(Instant::now()) <= 120);
@@ -493,5 +550,62 @@ mod tests {
         // TLS 握手失败或超时。
         assert!(outcome.rec_v4.is_none());
         assert_eq!(outcome.errors.len(), 1);
+    }
+
+    /// 实时跑 `send_query`，返回（墙钟耗时, 结果）。
+    ///
+    /// 不用 tokio 暂停时钟：暂停下真实 socket/TLS IO 不随 advance 推进（本机实测
+    /// 拨号在 1s mock 预算内始终未完成），只能靠墙钟测「整条查询多久收场」。
+    async fn timed_query(
+        ns: Arc<DotNameServer>,
+        fqdn: &'static str,
+        option: IpOption,
+    ) -> (Duration, QueryOutcome) {
+        let started = Instant::now();
+        let outcome = ns.send_query(fqdn, option).await;
+        (started.elapsed(), outcome)
+    }
+
+    /// bd 2iauj 回归钉：整条查询 deadline 覆盖**所有阶段**——mock 上游拆两段回
+    /// （长度前缀 700ms、正文再 700ms），1s 预算下第二段必须按入口绝对时刻失败。
+    /// 分段预算制下两段各起 1s（700+700 都在各段预算内），查询 ~1.4s 成功返回，
+    /// 本测试必红。
+    #[tokio::test]
+    async fn dot_total_deadline_covers_slow_response() {
+        let (addr, tls_config, _h) = spawn_mock_dot_server_delayed(
+            "slow.com.",
+            vec![Ipv4Addr::new(10, 0, 0, 3)],
+            60,
+            Duration::from_millis(700),
+            Duration::from_millis(700),
+        )
+        .await;
+        let ns = Arc::new(DotNameServer::new(
+            ip_dest(addr),
+            "localhost".to_string(),
+            tls_config,
+            Arc::new(CacheController::new("test", true, false, 0, 0)),
+            Vec::new(),
+            Duration::from_secs(1),
+        ));
+
+        let (elapsed, outcome) = timed_query(
+            ns,
+            "slow.com.",
+            IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false },
+        )
+        .await;
+
+        // 判别证据：必须死在**第二段读**上（握手/首段失败 = 前提没成立，测试无效）。
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(
+            outcome.errors[0].to_string().contains("dot read payload timeout"),
+            "必须在第二段读上按绝对 deadline 失败，got: {:?}",
+            outcome.errors
+        );
+        assert!(
+            elapsed >= Duration::from_millis(900) && elapsed <= Duration::from_millis(1350),
+            "total query deadline must be 1s, elapsed={elapsed:?}"
+        );
     }
 }
