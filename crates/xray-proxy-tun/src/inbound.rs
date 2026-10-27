@@ -263,7 +263,7 @@ fn configure_outbound_iface(
         .map_err(|e| format!("outbound interface resolution failed: {e}"))?;
     sysroute::set_outbound_iface(Some(index));
     sysroute::ensure_outbound_controller_registered();
-    tracing::info!("[tun] outbound interface: {name} (index {index})");
+    crate::TUN_LOG.info(format!("[tun] outbound interface: {name} (index {index})"));
     Ok(())
 }
 
@@ -369,12 +369,12 @@ impl InboundHandler for TunInboundHandler {
                 match crate::wfp::sys::install(if_index, block_dns, block_ipv4, block_ipv6) {
                     Ok(guard) => {
                         *self.leak_filter.lock() = Some(guard);
-                        tracing::info!(
-                            tag = %self.tag,
-                            block_dns, block_ipv4, block_ipv6,
-                            "[tun] outside the TUN, blocked DNS: {}, blocked IPv4: {}, blocked IPv6: {}",
-                            block_dns, block_ipv4, block_ipv6
-                        );
+                        crate::TUN_LOG.info(format!(
+                            "[tun] outside the TUN, blocked DNS: {block_dns}, blocked IPv4: \
+                             {block_ipv4}, blocked IPv6: {block_ipv6} tag={} block_dns={block_dns} \
+                             block_ipv4={block_ipv4} block_ipv6={block_ipv6}",
+                            self.tag
+                        ));
                     },
                     Err(e) => {
                         self.rollback_start(&device);
@@ -400,7 +400,7 @@ impl InboundHandler for TunInboundHandler {
         });
 
         *self.join.lock() = Some(handle);
-        tracing::info!(tag = %self.tag, "tun inbound started");
+        crate::TUN_LOG.info(format!("tun inbound started tag={}", self.tag));
         Ok(())
     }
 
@@ -425,7 +425,7 @@ impl InboundHandler for TunInboundHandler {
         if let Some(dev) = self.device.lock().take() {
             let _ = dev.close();
         }
-        tracing::info!(tag = %self.tag, "tun inbound closed");
+        crate::TUN_LOG.info(format!("tun inbound closed tag={}", self.tag));
         Ok(())
     }
 
@@ -615,7 +615,7 @@ fn try_enqueue_cmd(tx: &mpsc::Sender<SessionCmd>, cmd: SessionCmd) {
     if let Err(e) = tx.try_send(cmd) {
         UDP_CMD_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
         if let mpsc::error::TrySendError::Full(_) = e {
-            tracing::debug!("tun udp: cmd queue full, packet dropped");
+            crate::TUN_LOG.debug("tun udp: cmd queue full, packet dropped");
         }
     }
 }
@@ -636,7 +636,7 @@ fn try_enqueue_reply(tx: &mpsc::Sender<Vec<u8>>, reply: Vec<u8>) -> ReplyEnqueue
         Ok(()) => ReplyEnqueue::Enqueued,
         Err(mpsc::error::TrySendError::Full(_)) => {
             UDP_REPLY_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!("tun udp: reply queue full, packet dropped");
+            crate::TUN_LOG.debug("tun udp: reply queue full, packet dropped");
             ReplyEnqueue::Dropped
         },
         Err(mpsc::error::TrySendError::Closed(_)) => ReplyEnqueue::Closed,
@@ -659,7 +659,7 @@ async fn tun_driver_loop(
     // 票 ijn7②：relay 失败的目的地址冷却表（防失败目的被立刻重建）。
     let failed_dsts: FailedDsts = Arc::new(ParkMutex::new(HashMap::new()));
 
-    tracing::debug!("tun driver main loop started");
+    crate::TUN_LOG.debug("tun driver main loop started");
 
     loop {
         tokio::select! {
@@ -705,7 +705,7 @@ async fn tun_driver_loop(
                         write_tx_back(&device, tx_pkts).await;
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "tun recv error");
+                        crate::TUN_LOG.error(format!("tun recv error error={e}"));
                         // ponytail: 不退出循环——设备可能临时错误
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
@@ -830,7 +830,10 @@ fn handle_udp_packet(
     // Windows 上以 WSAENOBUFS(10055) 失败 → 会话失败 → 每个新源端口重建 →
     // ~50ms 一轮、1 分钟 1.2MB access log。
     if let Some(reason) = udp_relay_gate(&meta, failed) {
-        tracing::debug!(src = %meta.src, dst = %meta.dst, ?reason, "tun udp: packet dropped before relay");
+        crate::TUN_LOG.debug(format!(
+            "tun udp: packet dropped before relay src={} dst={} reason={:?}",
+            meta.src, meta.dst, reason
+        ));
         return;
     }
 
@@ -869,7 +872,8 @@ fn handle_udp_packet(
     // 非阻塞入队（票 8gr6）：对端不应答使 recv 挂死时，后续包照常入队送达，
     // 不再与 reader 争锁排队。首包由 owner task 懒建 dispatch link。
     let Some(dest) = ip_endpoint_to_udp_destination(&meta.dst) else {
-        tracing::warn!(src = %meta.src, dst = %meta.dst, "udp: invalid destination, dropping");
+        crate::TUN_LOG
+            .warn(format!("udp: invalid destination, dropping src={} dst={}", meta.src, meta.dst));
         return;
     };
     try_enqueue_cmd(
@@ -936,7 +940,7 @@ fn sweep_udp_sessions(sessions: &UdpSessions) {
         }
     }
     if removed > 0 {
-        tracing::debug!(count = removed, "tun udp sessions swept");
+        crate::TUN_LOG.debug(format!("tun udp sessions swept count={removed}"));
     }
 }
 
@@ -1002,7 +1006,7 @@ fn spawn_udp_session_task(
     tokio::spawn(async move {
         while let Some(reply) = reply_rx.recv().await {
             if let Err(e) = device.send(&reply).await {
-                tracing::warn!(error = %e, "udp: write reply to tun failed");
+                crate::TUN_LOG.warn(format!("udp: write reply to tun failed error={e}"));
                 break;
             }
         }
@@ -1033,13 +1037,16 @@ async fn run_udp_session(
             cmd = cmd_rx.recv() => match cmd {
                 Some(SessionCmd::Send { dest, payload }) => {
                     if let Err(e) = session.send_packet(&dest, &payload).await {
-                        tracing::warn!(error = %e, src = %original_src, dst = %original_dst, "udp: session.send_packet failed");
+                        crate::TUN_LOG.warn(format!(
+                            "udp: session.send_packet failed error={e} src={original_src} dst={original_dst}"
+                        ));
                         on_relay_failure(&failed, &sessions, &entry, original_dst);
                         return;
                     }
                 }
                 None => {
-                    tracing::debug!(src = %original_src, dst = %original_dst, "udp: session swept");
+                    crate::TUN_LOG
+                        .debug(format!("udp: session swept src={original_src} dst={original_dst}"));
                     return;
                 }
             },
@@ -1048,7 +1055,8 @@ async fn run_udp_session(
                     // resp_src 是 outbound 视角的来源（= 原 dst），构造 IP+UDP 回包
                     let resp_ip = address_to_smoltcp(resp_src.address());
                     let Some(resp_ip) = resp_ip else {
-                        tracing::warn!("udp: response destination is domain, cannot build IP packet");
+                        crate::TUN_LOG
+                            .warn("udp: response destination is domain, cannot build IP packet");
                         continue;
                     };
                     let Some(reply) = build_udp_response(
@@ -1063,11 +1071,11 @@ async fn run_udp_session(
                         // 返回 error 丢包不 crash（proxy/tun/stack.go:347-351）；
                         // 旧 panic 会杀死 owner task（单 UDP 会话静默死 +
                         // cmd_tx 僵尸到 sweep）。
-                        tracing::warn!(
-                            upstream = %resp_src.address(),
-                            client = %original_src,
-                            "udp: reply IP family mismatch with client session, packet dropped"
-                        );
+                        crate::TUN_LOG.warn(format!(
+                            "udp: reply IP family mismatch with client session, packet dropped upstream={} client={}",
+                            resp_src.address(),
+                            original_src
+                        ));
                         continue;
                     };
                     if matches!(try_enqueue_reply(&reply_tx, reply), ReplyEnqueue::Closed) {
@@ -1075,11 +1083,14 @@ async fn run_udp_session(
                     }
                 }
                 Ok(None) => {
-                    tracing::debug!(src = %original_src, dst = %original_dst, "udp: session closed");
+                    crate::TUN_LOG
+                        .debug(format!("udp: session closed src={original_src} dst={original_dst}"));
                     return;
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, src = %original_src, dst = %original_dst, "udp: session.recv_packet failed");
+                    crate::TUN_LOG.warn(format!(
+                        "udp: session.recv_packet failed error={e} src={original_src} dst={original_dst}"
+                    ));
                     on_relay_failure(&failed, &sessions, &entry, original_dst);
                     return;
                 }
@@ -1108,7 +1119,8 @@ fn drive_stack_batch(
         // 不静默吞掉：error 日志可见。
         if let Some(dst) = parse_tcp_syn_dst(&pkt) {
             if let Err(e) = stack.ensure_tcp_listen(dst) {
-                tracing::error!(error = %e, dst = ?dst, "tcp lazy listen failed, dropping SYN");
+                crate::TUN_LOG
+                    .error(format!("tcp lazy listen failed, dropping SYN error={e} dst={dst:?}"));
             }
         }
         stack.ingest_rx(pkt);
@@ -1143,10 +1155,10 @@ async fn accept_tcp_connection(
     let dest = match ip_endpoint_to_destination(&event.local) {
         Some(d) => d,
         None => {
-            tracing::warn!(
-                remote = %event.remote,
-                "tcp accept: no local endpoint, dropping connection"
-            );
+            crate::TUN_LOG.warn(format!(
+                "tcp accept: no local endpoint, dropping connection remote={}",
+                event.remote
+            ));
             netstack.lock().await.remove_socket(event.handle);
             return;
         },
@@ -1158,12 +1170,10 @@ async fn accept_tcp_connection(
     let (relay_to_client, client_from_relay) = tokio::io::duplex(DUPLEX_BUF);
     let link = Link::new(new_reader(client_from_relay), new_writer(client_to_relay));
 
-    tracing::debug!(
-        handle = ?event.handle,
-        remote = %event.remote,
-        dest = ?dest,
-        "tcp connection accepted → dispatch"
-    );
+    crate::TUN_LOG.debug(format!(
+        "tcp connection accepted → dispatch handle={:?} remote={} dest={:?}",
+        event.handle, event.remote, dest
+    ));
 
     // spawn 中继 task（smoltcp socket ↔ duplex）
     let relay = TunTcpRelay {

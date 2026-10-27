@@ -158,9 +158,9 @@ impl DeviceConfig {
         match self.dns.as_slice() {
             [] => Ok(DnsConfig::Default),
             [s] if s == "local" => {
-                tracing::warn!(
+                crate::WG_LOG.warn(
                     "wireguard outbound: remoteDNS \"local\" is deprecated (removed upstream, \
-                     efc9e6da); falling back to default tunnel DNS"
+                     efc9e6da); falling back to default tunnel DNS",
                 );
                 Ok(DnsConfig::Default)
             },

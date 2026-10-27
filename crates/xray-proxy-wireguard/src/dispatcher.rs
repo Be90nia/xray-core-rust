@@ -321,7 +321,9 @@ pub(crate) async fn pump_client_to_udp(
             None => {
                 // Go dispatchMessage 走 per-frame resolveFunc；此处域名 target
                 // 无法进 smoltcp（仅 IP），静默丢改为可观测告警（bd 7v0k④）。
-                tracing::warn!(dest = %dest, "wg outbound: dropping XUDP frame with domain target");
+                crate::WG_LOG.warn(format!(
+                    "wg outbound: dropping XUDP frame with domain target dest={dest}"
+                ));
             },
         }
         acc.drain(..consumed);

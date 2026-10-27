@@ -6,7 +6,7 @@
 //!   args，不经字符串拆分），`Display` 即完整命令行。 测试与 Recording 走这里——**从不执行**。
 //! - **执行面**（`apply_exec`/`rollback_exec` → trait 默认方法）：逐条 [`Cmd::run`] 真实
 //!   spawn。**全模块唯一执行点**是 [`Cmd::run`]；每条命令 执行前
-//!   `tracing::info!`（program+args），失败 `tracing::error!` 并上抛，
+//!   `TUN_LOG.info`（program+args），失败 `TUN_LOG.error` 并上抛，
 //!   不吞错——调用方（`sysroute::prepare`）把错误传给 TUN 启动流程， 接管失败宁可无 TUN（对齐 Go
 //!   handler.go:196-205）。
 //!
@@ -53,13 +53,14 @@ impl Cmd {
     /// # Errors
     /// spawn 失败（程序不存在/权限不足）或退出码非 0。
     pub fn run(&self) -> std::io::Result<()> {
-        tracing::info!(program = %self.program, args = ?self.args, "tun sysroute exec");
+        crate::TUN_LOG
+            .info(format!("tun sysroute exec program={} args={:?}", self.program, self.args));
         let status = Command::new(&self.program).args(&self.args).status()?;
         if !status.success() {
-            tracing::error!(
-                program = %self.program, args = ?self.args, %status,
-                "tun sysroute command failed"
-            );
+            crate::TUN_LOG.error(format!(
+                "tun sysroute command failed program={} args={:?} status={status}",
+                self.program, self.args
+            ));
             return Err(std::io::Error::other(format!(
                 "command failed ({status}): {} {}",
                 self.program,

@@ -271,9 +271,9 @@ fn parse_device_settings(v: &serde_json::Value) -> std::result::Result<DeviceCon
     // Go efc9e6da 删除 domainStrategy：存量配置警告后忽略（PM 拍板保翻先例）。
     if let Some(s) = wg_get(v, "domainStrategy", "domain_strategy").and_then(|x| x.as_str()) {
         if !s.is_empty() {
-            tracing::warn!(
+            crate::WG_LOG.warn(
                 "wireguard plugin: domainStrategy is deprecated and ignored (removed upstream, \
-                 efc9e6da); domain targets resolve via tunnel DNS"
+                 efc9e6da); domain targets resolve via tunnel DNS",
             );
         }
     }

@@ -160,10 +160,7 @@ pub async fn serve_vmess(
         .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
     let history = Arc::new(SessionHistory::new());
 
-    tracing::info!(
-        addr = %listener.local_addr()?,
-        "vmess inbound listening"
-    );
+    crate::VMESS_LOG.info(format!("vmess inbound listening addr={}", listener.local_addr()?));
 
     // tcpSettings.header 伪装头（Go hub.go:85-95 authConfig；TLS 解包后应用）。
     let header = listener.header_auth().cloned();
@@ -173,7 +170,7 @@ pub async fn serve_vmess(
         let (stream, peer) = match listener.accept_masked().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error = %e, "vmess accept failed");
+                crate::VMESS_LOG.warn(format!("vmess accept failed error={e}"));
                 continue;
             },
         };
@@ -204,7 +201,7 @@ pub async fn serve_vmess(
                         .await
                     },
                     Err(e) => {
-                        tracing::warn!(error = %e, "vmess TLS accept failed");
+                        crate::VMESS_LOG.warn(format!("vmess TLS accept failed error={e}"));
                         return;
                     },
                 }
@@ -217,7 +214,8 @@ pub async fn serve_vmess(
             };
             if let Err(e) = result {
                 // Go vmess inbound.go:250：拒绝 AtInfo + RemoteAddr。
-                tracing::info!(peer = %peer, error = %e, "vmess connection ended with error");
+                crate::VMESS_LOG
+                    .info(format!("vmess connection ended with error peer={peer} error={e}"));
             }
         })
         .expect("plugin ctx FxScope is never closed (assembly-owned)");
@@ -291,7 +289,7 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
 
     // 2. TCP/UDP 走完整数据路径；Mux 暂 warn 跳过（zx7 在 xray-core 层另行处理）。
     if header.command == Command::Mux {
-        tracing::warn!("vmess mux command not yet supported, closing connection");
+        crate::VMESS_LOG.warn("vmess mux command not yet supported, closing connection");
         return Ok(());
     }
 
@@ -462,10 +460,7 @@ async fn pump_request_body<C, R>(
                 }
             },
             Err(e) => {
-                tracing::debug!(
-                    error = %e.to_string(),
-                    "vmess request body chunk open failed"
-                );
+                crate::VMESS_LOG.debug(format!("vmess request body chunk open failed error={e}"));
                 break;
             },
         }
@@ -505,10 +500,8 @@ async fn pump_response_body<C, W>(
                 chunk_buf.clear();
                 chunk_buf.resize(sb, 0);
                 if let Err(e) = cipher.seal_into(nonce, &[], &buf[..n], &mut chunk_buf) {
-                    tracing::debug!(
-                        error = %e.to_string(),
-                        "vmess response body chunk seal failed"
-                    );
+                    crate::VMESS_LOG
+                        .debug(format!("vmess response body chunk seal failed error={e}"));
                     break;
                 }
                 if padding_size > 0 {
@@ -521,10 +514,10 @@ async fn pump_response_body<C, W>(
                 let size_value = match u16::try_from(chunk_buf.len() - sb) {
                     Ok(v) => v,
                     Err(_) => {
-                        tracing::error!(
-                            len = chunk_buf.len() - sb,
-                            "vmess response chunk size exceeds u16; aborting body stream"
-                        );
+                        crate::VMESS_LOG.error(format!(
+                            "vmess response chunk size exceeds u16; aborting body stream len={}",
+                            chunk_buf.len() - sb
+                        ));
                         break;
                     },
                 };
@@ -534,10 +527,8 @@ async fn pump_response_body<C, W>(
                 }
             },
             Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    "vmess response body plaintext read failed"
-                );
+                crate::VMESS_LOG
+                    .debug(format!("vmess response body plaintext read failed error={e}"));
                 break;
             },
         }
@@ -556,10 +547,12 @@ async fn pump_response_body<C, W>(
                     size_parser.encode(v, &mut chunk_buf[..sb]);
                     let _ = stream_w.write_all(&chunk_buf).await;
                 },
-                Err(_) => tracing::error!(
-                    len = chunk_buf.len() - sb,
-                    "vmess termination chunk size exceeds u16; skipping termination"
-                ),
+                Err(_) => {
+                    crate::VMESS_LOG.error(format!(
+                        "vmess termination chunk size exceeds u16; skipping termination len={}",
+                        chunk_buf.len() - sb
+                    ));
+                },
             }
         }
     }

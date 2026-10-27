@@ -287,7 +287,7 @@ impl WgNetStack {
                 true
             },
             Err(e) => {
-                tracing::warn!(error = %e, "wg lazy tcp listen failed");
+                crate::WG_LOG.warn(format!("wg lazy tcp listen failed error={e}"));
                 self.remove_socket(handle);
                 false
             },
@@ -353,7 +353,7 @@ impl WgNetStack {
         match result {
             Ok(()) => self.udp_listens.push((handle, local, nanos_now())),
             Err(e) => {
-                tracing::warn!(error = %e, "wg lazy udp listen failed");
+                crate::WG_LOG.warn(format!("wg lazy udp listen failed error={e}"));
                 self.remove_socket(handle);
             },
         }
@@ -424,7 +424,7 @@ impl WgNetStack {
             }
         }
         if removed > 0 {
-            tracing::debug!(count = removed, "wg udp forwarder listens swept");
+            crate::WG_LOG.debug(format!("wg udp forwarder listens swept count={removed}"));
         }
         removed
     }

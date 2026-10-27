@@ -36,6 +36,10 @@
 //! `dispatcher::make_wireguard_dial_fn` 发）。端到端验收见
 //! `tests/integration/wireguard_dataplane_test.rs`。
 
+use std::sync::LazyLock;
+
+use xray_frame::LogFacade;
+
 pub mod config;
 pub mod dispatcher;
 pub mod driver;
@@ -48,6 +52,17 @@ pub mod plugin;
 pub mod tunnel;
 pub mod users;
 pub mod wireguard;
+
+/// wireguard 域日志门面（nn8os 2b 同型处置：裸 tracing 宏 → LogFacade——本项目
+/// 工具链上 `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三
+/// 形态实测无效），迁移为唯一关红路径）。域 = "wireguard"，target
+/// `xray_frame::wireguard` + mask_secrets。
+///
+/// crate 级单例（域 = 协议名，全 crate 一个 target）：wireguard 面站点分散在
+/// config/dispatcher/driver/inbound/netstack/plugin/tunnel 七个模块，逐模块各建
+/// 一份会重复泄漏 target 字符串且 target 相同——crate 级单份即可。
+pub(crate) static WG_LOG: LazyLock<LogFacade> =
+    LazyLock::new(|| LogFacade::new("wireguard", vec![]));
 
 // 顶层 re-export。
 pub use config::{DeviceConfig, PeerConfig};

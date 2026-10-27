@@ -168,7 +168,7 @@ pub fn kdf_paths(key: &[u8], paths: &[&[u8]]) -> Vec<u8> {
         // VMess 协议最多使用 3 个 KDF 路径段。超过时截断到前 3 段并记录警告，
         // 而非 panic 导致整个进程崩溃。
         n => {
-            tracing::warn!("VMess KDF: truncating {n} path segments to 3");
+            crate::VMESS_LOG.warn(format!("VMess KDF: truncating {n} path segments to 3"));
             l3(paths[0], paths[1], paths[2], key).to_vec()
         },
     }

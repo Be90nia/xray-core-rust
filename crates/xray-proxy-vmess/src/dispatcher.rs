@@ -199,7 +199,8 @@ pub fn parse_vmess_config(data: &[u8]) -> Result<VmessOutboundConfig, String> {
         .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok())))
         .unwrap_or(0);
     if alter_id != 0 {
-        tracing::warn!(alter_id, "vmess outbound: legacy VMess is not supported");
+        crate::VMESS_LOG
+            .warn(format!("vmess outbound: legacy VMess is not supported alter_id={alter_id}"));
         return Err(VmessError::UnsupportedLegacyAlterId(alter_id).to_string());
     }
     Ok(VmessOutboundConfig::new(
@@ -395,7 +396,8 @@ impl VmessConn {
                 let down = async move {
                     let mut sr = stream_r;
                     if let Err(e) = session.decode_response_header_async(&mut sr).await {
-                        tracing::debug!(error = %e, "vmess decode response header failed");
+                        crate::VMESS_LOG
+                            .debug(format!("vmess decode response header failed error={e}"));
                         let _ = server_w.shutdown().await;
                         return;
                     }
@@ -499,7 +501,8 @@ impl VmessUdpConn {
                 // 响应头惰性解码（Go SetFlushNext：首块下行才 flush，dial 阶段同步
                 // 等待会造成双向死锁——与 VmessConn 同语义）。
                 if let Err(e) = session.decode_response_header_async(&mut sr).await {
-                    tracing::debug!(error = %e, "vmess udp decode response header failed");
+                    crate::VMESS_LOG
+                        .debug(format!("vmess udp decode response header failed error={e}"));
                     let _ = tx
                         .send(Err(std::io::Error::other(format!("vmess udp response header: {e}"))))
                         .await;
@@ -812,7 +815,7 @@ async fn pump_up<C, R, W>(
                 }
             },
             Err(e) => {
-                tracing::debug!(error = %e, "vmess up body plaintext read failed");
+                crate::VMESS_LOG.debug(format!("vmess up body plaintext read failed error={e}"));
                 break;
             },
         }
@@ -935,7 +938,7 @@ async fn pump_down<C, R, W>(
                 }
             },
             Err(e) => {
-                tracing::debug!(error = %e.to_string(), "vmess down body chunk open failed");
+                crate::VMESS_LOG.debug(format!("vmess down body chunk open failed error={e}"));
                 break;
             },
         }

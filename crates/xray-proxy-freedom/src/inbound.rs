@@ -97,7 +97,8 @@ impl InboundHandler for FreedomInboundHandler {
                 let (stream, _peer) = match listener.accept().await {
                     Ok(v) => v,
                     Err(e) => {
-                        tracing::warn!(tag = %tag, error = %e, "freedom inbound accept failed");
+                        crate::FREEDOM_LOG
+                            .warn(format!("freedom inbound accept failed tag={tag} error={e}"));
                         continue;
                     },
                 };
@@ -115,7 +116,7 @@ impl InboundHandler for FreedomInboundHandler {
             }
         })
         .expect("internal FxScope is never closed");
-        tracing::info!(tag = %self.tag, port = port, "freedom inbound started");
+        crate::FREEDOM_LOG.info(format!("freedom inbound started tag={} port={port}", self.tag));
         Ok(())
     }
 
@@ -125,7 +126,7 @@ impl InboundHandler for FreedomInboundHandler {
         }
         // ponytail: accept 循环在独立 task 中运行，close 只设标志位。
         self.cached_port.store(0, Ordering::SeqCst);
-        tracing::info!(tag = %self.tag, "freedom inbound closed");
+        crate::FREEDOM_LOG.info(format!("freedom inbound closed tag={}", self.tag));
         Ok(())
     }
 

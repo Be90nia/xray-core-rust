@@ -387,7 +387,9 @@ async fn parse_and_send(
                             Err(e) => {
                                 // 丢帧继续（Go :627-630 b.Release(); continue；
                                 // Force* 失败同样丢帧——Go :625-628 注释）
-                                tracing::debug!(domain = %domain, "freedom: udp frame dropped, resolve failed: {e}");
+                                crate::FREEDOM_LOG.debug(format!(
+                                    "freedom: udp frame dropped, resolve failed: {e} domain={domain}"
+                                ));
                                 return Ok(FrameParse::Progress);
                             },
                         },
@@ -403,7 +405,8 @@ async fn parse_and_send(
                 policy.default_rule.as_ref(),
                 &effective,
             ) {
-                tracing::debug!(dest = %effective, "freedom: udp packet blocked by final rule");
+                crate::FREEDOM_LOG
+                    .debug(format!("freedom: udp packet blocked by final rule dest={effective}"));
                 return Ok(FrameParse::Progress);
             }
             // 首个真实数据报前发送 noises（对齐 Go NoisePacketWriter.WriteMultiBuffer：
@@ -497,7 +500,8 @@ async fn pump_response(
             policy.default_rule.as_ref(),
             &source,
         ) {
-            tracing::debug!(source = %source, "freedom: udp response blocked by final rule");
+            crate::FREEDOM_LOG
+                .debug(format!("freedom: udp response blocked by final rule source={source}"));
             continue;
         }
         // 用同步 PacketWriter 装帧

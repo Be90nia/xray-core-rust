@@ -835,7 +835,9 @@ pub async fn resolve_ips_for_rules(
                 if strategy.force_ip() {
                     Err(e)
                 } else {
-                    tracing::debug!(domain, error = %e, "freedom: LookupForIP failed, skip finalRule pre-check");
+                    crate::FREEDOM_LOG.debug(format!(
+                        "freedom: LookupForIP failed, skip finalRule pre-check domain={domain} error={e}"
+                    ));
                     Ok(Vec::new())
                 }
             },
@@ -845,7 +847,9 @@ pub async fn resolve_ips_for_rules(
     match tokio::net::lookup_host((domain, port)).await {
         Ok(addrs) => Ok(addrs.map(|sa| sa.ip()).collect()),
         Err(e) => {
-            tracing::debug!(domain, error = %e, "freedom: system resolve failed, skip finalRule pre-check");
+            crate::FREEDOM_LOG.debug(format!(
+                "freedom: system resolve failed, skip finalRule pre-check domain={domain} error={e}"
+            ));
             Ok(Vec::new())
         },
     }
@@ -910,11 +914,9 @@ fn ip_or_domain_to_address(iod: &xray_proto::xray::common::net::IpOrDomain) -> O
 /// 对应 Go `Process` blockedDest 分支 :352-366——不拨号，慢速丢弃防探测。
 pub(crate) async fn blackhole_link(link: xray_transport::link::Link, tag: &str, rule: &FinalRule) {
     let delay = block_delay(rule);
-    tracing::info!(
-        tag = %tag,
-        ?delay,
-        "freedom: target blocked by final rule, blackholing connection"
-    );
+    crate::FREEDOM_LOG.info(format!(
+        "freedom: target blocked by final rule, blackholing connection tag={tag} delay={delay:?}"
+    ));
     let xray_transport::link::Link { mut reader, writer } = link;
     // EOF 语义与 udp pump 一致：Err 或 Ok(空 buffer) 都视为对端关闭
     let drain = async {

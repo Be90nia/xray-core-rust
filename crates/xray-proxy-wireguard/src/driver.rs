@@ -404,7 +404,7 @@ impl WgDriver {
             },
             WgTransport::Dialed(d) => {
                 if let Err(e) = Arc::clone(d).send(wg).await {
-                    tracing::warn!(error = %e, "wg dialed send failed");
+                    crate::WG_LOG.warn(format!("wg dialed send failed error={e}"));
                 }
             },
         }
@@ -530,7 +530,7 @@ impl WgDriver {
     pub async fn main_loop(self: Arc<Self>) {
         // 双启动保护：readQueue 消费端只能被取一次。
         let Some(rx) = self.queue_rx.lock().await.take() else {
-            tracing::warn!("wg driver main_loop already started");
+            crate::WG_LOG.warn("wg driver main_loop already started");
             return;
         };
         let (shut_tx, shut_rx) = watch::channel(false);
@@ -541,11 +541,11 @@ impl WgDriver {
             }
         }
         let _shut = ShutGuard(shut_tx);
-        tracing::debug!(
-            peer_count = self.peer_count(),
-            workers = effective_workers(self.num_workers),
-            "wg driver main loop started"
-        );
+        crate::WG_LOG.debug(format!(
+            "wg driver main loop started peer_count={} workers={}",
+            self.peer_count(),
+            effective_workers(self.num_workers)
+        ));
 
         match &self.transport {
             WgTransport::Direct(sock) => {
@@ -671,7 +671,7 @@ impl WgDriver {
                         }
                     },
                     Err(e) => {
-                        tracing::warn!(error = %e, "wg encapsulate failed");
+                        crate::WG_LOG.warn(format!("wg encapsulate failed error={e}"));
                     },
                 }
             }
@@ -733,7 +733,7 @@ async fn direct_read_loop(
         let (n, src) = match r {
             Ok(v) => v,
             Err(e) => {
-                tracing::error!(error = %e, "wg udp recv error");
+                crate::WG_LOG.error(format!("wg udp recv error error={e}"));
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             },

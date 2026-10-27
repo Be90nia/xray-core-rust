@@ -122,15 +122,16 @@ async fn write_proxy_protocol_header(
     let src = PROXY_PROTO_SRC.try_with(|v| *v).ok().flatten();
     let dst = conn.remote_addr().ok().flatten();
     let (Some(src), Some(dst)) = (src, dst) else {
-        tracing::warn!(
-            version,
-            "freedom: proxyProtocol enabled but session has no source info, skipping header"
-        );
+        crate::FREEDOM_LOG.warn(format!(
+            "freedom: proxyProtocol enabled but session has no source info, skipping header version={version}"
+        ));
         return Ok(conn);
     };
     let header = xray_transport::build_proxy_header(version as u8, src, dst);
     if header.is_empty() {
-        tracing::warn!(version, "freedom: invalid PROXY protocol version, skipping header");
+        crate::FREEDOM_LOG.warn(format!(
+            "freedom: invalid PROXY protocol version, skipping header version={version}"
+        ));
         return Ok(conn);
     }
     use tokio::io::AsyncWriteExt;
@@ -327,7 +328,7 @@ impl DispatchHandler for FreedomDispatchBridge {
                     None => crate::udp::relay_policy(&ctx, &dest, link, &noises, &policy).await,
                 };
                 if let Err(e) = result {
-                    tracing::warn!(tag = %tag, "freedom udp relay ended: {e}");
+                    crate::FREEDOM_LOG.warn(format!("freedom udp relay ended: {e} tag={tag}"));
                 }
             })
         } else {
@@ -369,11 +370,9 @@ impl DispatchHandler for FreedomDispatchBridge {
                             }),
                             Err(e) => {
                                 // Go :300-302：仅 ForceIP 解析失败到达此处 → 断链
-                                tracing::warn!(
-                                    tag = %tag,
-                                    domain = %domain,
-                                    "freedom: ForceIP domain resolve failed, aborting: {e}"
-                                );
+                                crate::FREEDOM_LOG.warn(format!(
+                                    "freedom: ForceIP domain resolve failed, aborting: {e} tag={tag} domain={domain}"
+                                ));
                                 link.writer.shutdown();
                                 return;
                             },

@@ -444,11 +444,11 @@ fn verify_dns_plan(
                 .map_err(|e| TunError::InvalidConfig(format!("no DNS path at {dns}:53: {e}")))
         },
         DnsTarget::WindowsAdapterServers { servers } => {
-            tracing::info!(
-                target: "xray_proxy_tun", servers = ?servers,
+            crate::TUN_LOG.info(format!(
                 "tun system dns: adapter servers set; loop verification not applicable on \
-                 this platform (no takeover-into-TUN semantics; loop prevention via dial-point dns skip)"
-            );
+                 this platform (no takeover-into-TUN semantics; loop prevention via dial-point \
+                 dns skip) servers={servers:?}"
+            ));
             Ok(())
         },
     }
@@ -548,10 +548,9 @@ pub(crate) fn apply_adapter_props(interface: &str) {
         std::thread::sleep,
     );
     if !ok {
-        tracing::error!(
-            target: "xray_proxy_tun", interface = %interface,
-            "tun adapter props (routerdiscovery) failed after retries; continuing (non-fatal)"
-        );
+        crate::TUN_LOG.error(format!(
+            "tun adapter props (routerdiscovery) failed after retries; continuing (non-fatal) interface={interface}"
+        ));
     }
 }
 
@@ -665,16 +664,15 @@ pub fn revert_changes_exec(
     Ok(())
 }
 
-/// 关闭侧接线（[`prepare`] 的逆操作）。回滚失败显式 `tracing::error!` 上报
+/// 关闭侧接线（[`prepare`] 的逆操作）。回滚失败显式 `TUN_LOG.error` 上报
 /// （系统状态可能残留），但不阻塞设备关闭——对齐 Go Close 对 unset 错误的
 /// 记日志不中止语义（tun_linux.go:353-367）。
 pub(crate) fn revert(applied: &AppliedSystemChanges) {
     let (routes, dns) = default_executors();
     if let Err(e) = revert_changes_exec(applied, routes.as_deref(), dns.as_deref()) {
-        tracing::error!(
-            target: "xray_proxy_tun", error = %e,
-            "tun system route/dns revert FAILED; system state may remain dirty"
-        );
+        crate::TUN_LOG.error(format!(
+            "tun system route/dns revert FAILED; system state may remain dirty error={e}"
+        ));
     }
     // Go Close 无条件清除 skip 集合（tun_windows.go:360）：DNS 已不再指向 TUN，
     // 上一步 revert 失败也照样清（残留 skip 会让 Xray 的查询永久拒拨该服务器）。

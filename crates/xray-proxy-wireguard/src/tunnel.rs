@@ -197,7 +197,7 @@ impl Tunnel {
         // ——没有会话可轮换，不得断言「已触发轮转」（z7ya 排查时这条噪音误导了定位）。
         if self.last_handshake.is_some_and(|t| t.elapsed() >= self.session_key_rotation_interval) {
             // boringtun 的 update_timers 内部会处理 rekey
-            tracing::debug!("wg session key rotation triggered");
+            crate::WG_LOG.debug("wg session key rotation triggered");
         }
         let result = self.tunn.update_timers(self.send_buf.as_mut_slice());
         match result {

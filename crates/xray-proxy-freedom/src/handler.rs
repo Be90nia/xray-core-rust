@@ -151,11 +151,10 @@ impl OutboundHandler for FreedomHandler {
     ) -> Result<(), OutboundError> {
         // FinalRule 预检：解析仅服务 Block 判定，不改写拨号目标（#6058）。
         if self.check_blocked_resolved(destination, session).await?.is_some() {
-            tracing::info!(
-                tag = %self.tag,
-                dest = ?destination,
-                "freedom: connection blocked by final rule"
-            );
+            crate::FREEDOM_LOG.info(format!(
+                "freedom: connection blocked by final rule tag={} dest={:?}",
+                self.tag, destination
+            ));
             return Err(OutboundError::ConnectionFailed(
                 "freedom: destination blocked by final rule".to_string(),
             ));
@@ -171,7 +170,7 @@ impl OutboundHandler for FreedomHandler {
         let _conn = dial_system(destination, &sockopt)
             .await
             .map_err(|e| OutboundError::ConnectionFailed(format!("dial_system failed: {e}")))?;
-        tracing::debug!(tag = %self.tag, "freedom dial succeeded");
+        crate::FREEDOM_LOG.debug(format!("freedom dial succeeded tag={}", self.tag));
         Ok(())
     }
 
@@ -222,22 +221,24 @@ impl ProxyOutbound for FreedomHandler {
                 if !header.is_empty() {
                     use tokio::io::AsyncWriteExt;
                     if let Err(e) = conn.as_mut().write_all(&header).await {
-                        tracing::warn!(tag = %self.tag, error = %e, "freedom: PROXY protocol write failed");
+                        crate::FREEDOM_LOG.warn(format!(
+                            "freedom: PROXY protocol write failed tag={} error={e}",
+                            self.tag
+                        ));
                         return Err(ProxymanError::OutboundProcessFailed(format!(
                             "PROXY protocol write failed: {e}"
                         )));
                     }
-                    tracing::debug!(
-                        tag = %self.tag,
-                        version = self.config.proxy_protocol,
-                        "freedom: PROXY protocol header written"
-                    );
+                    crate::FREEDOM_LOG.debug(format!(
+                        "freedom: PROXY protocol header written tag={} version={}",
+                        self.tag, self.config.proxy_protocol
+                    ));
                 }
             } else {
-                tracing::debug!(
-                    tag = %self.tag,
-                    "freedom: PROXY protocol enabled but src/dst addr unavailable, skipping"
-                );
+                crate::FREEDOM_LOG.debug(format!(
+                    "freedom: PROXY protocol enabled but src/dst addr unavailable, skipping tag={}",
+                    self.tag
+                ));
             }
         }
         // Fragment 配置存在时 dial 后包 writer（对齐 Go :410-418 FragmentWriter）；

@@ -228,7 +228,9 @@ fn parse_inbound_validator(
                 .and_then(|x| x.as_i64().or_else(|| x.as_str().and_then(|s| s.parse::<i64>().ok())))
                 .unwrap_or(0);
             if alter_id != 0 {
-                tracing::warn!(alter_id, "vmess inbound: legacy VMess is not supported");
+                crate::VMESS_LOG.warn(format!(
+                    "vmess inbound: legacy VMess is not supported alter_id={alter_id}"
+                ));
                 return Err(PluginError::Other(
                     VmessError::UnsupportedLegacyAlterId(alter_id).to_string().into(),
                 ));
@@ -237,7 +239,7 @@ fn parse_inbound_validator(
                 UUID::parse(id).ok_or_else(|| PluginError::Other("vmess invalid uuid".into()))?;
             let user = MemoryUser::new(email, MemoryAccount::new(uuid)).with_level(level);
             if let Err(e) = Validator::add(&validator, user) {
-                tracing::warn!(error = %e, "skip vmess user during validator build");
+                crate::VMESS_LOG.warn(format!("skip vmess user during validator build error={e}"));
             }
         }
     }

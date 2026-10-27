@@ -199,7 +199,8 @@ impl WireguardInboundHandler {
         };
         let handle = self.fx.spawn(main_task).expect("internal FxScope is never closed");
         *self.join.lock() = Some(handle);
-        tracing::info!(tag = %self.tag, port = self.port, "wireguard inbound started");
+        crate::WG_LOG
+            .info(format!("wireguard inbound started tag={} port={}", self.tag, self.port));
         Ok(())
     }
 
@@ -209,7 +210,7 @@ impl WireguardInboundHandler {
         if let Some(handle) = self.join.lock().take() {
             handle.abort();
         }
-        tracing::info!(tag = %self.tag, "wireguard inbound closed");
+        crate::WG_LOG.info(format!("wireguard inbound closed tag={}", self.tag));
         Ok(())
     }
 }
@@ -273,7 +274,7 @@ async fn wg_accept_loop(
     fx: Arc<FxScope>,
 ) {
     let mut timer = interval(Duration::from_millis(ACCEPT_POLL_MS));
-    tracing::debug!("wg accept loop started");
+    crate::WG_LOG.debug("wg accept loop started");
 
     // 内层 UDP 转发（票 z7ya）：per-源会话表 + 空闲清扫（Go udp forwarder 语义，
     // 结构对齐 xray-proxy-tun/src/inbound.rs 的 full-cone 会话模型）
@@ -314,10 +315,10 @@ async fn wg_accept_loop(
             let dest = match ip_endpoint_to_destination(&event.local) {
                 Some(d) => d,
                 None => {
-                    tracing::warn!(
-                        remote = %event.remote,
-                        "wg tcp accept: no local endpoint, dropping connection"
-                    );
+                    crate::WG_LOG.warn(format!(
+                        "wg tcp accept: no local endpoint, dropping connection remote={}",
+                        event.remote
+                    ));
                     stack.remove_socket(event.handle);
                     continue;
                 },
@@ -329,12 +330,10 @@ async fn wg_accept_loop(
             let (relay_to_client, client_from_relay) = tokio::io::duplex(DUPLEX_BUF);
             let link = Link::new(new_reader(client_from_relay), new_writer(client_to_relay));
 
-            tracing::debug!(
-                handle = ?event.handle,
-                remote = %event.remote,
-                dest = ?dest,
-                "wg tcp connection accepted → dispatch"
-            );
+            crate::WG_LOG.debug(format!(
+                "wg tcp connection accepted → dispatch handle={:?} remote={} dest={:?}",
+                event.handle, event.remote, dest
+            ));
 
             // spawn 中继 task（smoltcp socket ↔ duplex）
             let relay = WgTcpRelay {
@@ -473,11 +472,16 @@ fn forward_wg_udp_datagram(
         match entry.cmd_tx.try_send(WgUdpCmd::Send { dest, payload }) {
             Ok(()) => return,
             Err(mpsc::error::TrySendError::Full(_)) => {
-                tracing::debug!(src = %src, dst = ?dst, "wg udp: session queue full, packet dropped");
+                // 逐报文丢弃分支（仅 overload 时触发，非稳态逐包路径）。event! 逃生口
+                // 已随 redline_sites 门关闭（PM 2026-10-27 裁决），一律迁 LogFacade。
+                crate::WG_LOG.debug(format!(
+                    "wg udp: session queue full, packet dropped src={src} dst={dst:?}"
+                ));
                 return;
             },
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                tracing::debug!(src = %src, "wg udp: session closed by outbound, packet dropped");
+                crate::WG_LOG
+                    .debug(format!("wg udp: session closed by outbound, packet dropped src={src}"));
             },
         }
         map.remove(&src);
@@ -521,7 +525,9 @@ async fn run_wg_udp_session(
     // 回包源 = 最近一次请求的原目标（会话换目标时跟随；Go 固定用建会话时的 dst）。
     let mut reply_src = address_to_ip_endpoint(first_dest.address(), first_dest.port().value());
     if let Err(e) = session.send_packet(&first_dest, &first_payload).await {
-        tracing::warn!(error = %e, src = %inner_src, dst = ?first_dest, "wg udp: first send_packet failed");
+        crate::WG_LOG.warn(format!(
+            "wg udp: first send_packet failed error={e} src={inner_src} dst={first_dest:?}"
+        ));
         return;
     }
     loop {
@@ -531,12 +537,14 @@ async fn run_wg_udp_session(
                     reply_src =
                         address_to_ip_endpoint(dest.address(), dest.port().value()).or(reply_src);
                     if let Err(e) = session.send_packet(&dest, &payload).await {
-                        tracing::warn!(error = %e, src = %inner_src, dst = ?dest, "wg udp: send_packet failed");
+                        crate::WG_LOG.warn(format!(
+                            "wg udp: send_packet failed error={e} src={inner_src} dst={dest:?}"
+                        ));
                         return;
                     }
                 },
                 None => {
-                    tracing::debug!(src = %inner_src, "wg udp: session swept");
+                    crate::WG_LOG.debug(format!("wg udp: session swept src={inner_src}"));
                     return;
                 },
             },
@@ -546,22 +554,27 @@ async fn run_wg_udp_session(
                     let Some(reply_src) = reply_src
                         .or_else(|| address_to_ip_endpoint(source.address(), source.port().value()))
                     else {
-                        tracing::warn!(src = %inner_src, resp = %source, "wg udp: reply source unusable, dropped");
+                        crate::WG_LOG.warn(format!(
+                            "wg udp: reply source unusable, dropped src={inner_src} resp={source}"
+                        ));
                         continue;
                     };
                     let mut stack = netstack.lock().await;
                     let sent = stack.udp_send_reply(reply_src, &payload, inner_src, nanos_now());
                     stack.poll(smoltcp::time::Instant::now());
                     if !sent {
-                        tracing::warn!(src = %inner_src, reply_src = ?reply_src, "wg udp: reply dropped (socket unavailable)");
+                        crate::WG_LOG.warn(format!(
+                            "wg udp: reply dropped (socket unavailable) src={inner_src} reply_src={reply_src:?}"
+                        ));
                     }
                 },
                 Ok(None) => {
-                    tracing::debug!(src = %inner_src, "wg udp: outbound closed session");
+                    crate::WG_LOG.debug(format!("wg udp: outbound closed session src={inner_src}"));
                     return;
                 },
                 Err(e) => {
-                    tracing::warn!(error = %e, src = %inner_src, "wg udp: recv_packet failed");
+                    crate::WG_LOG
+                        .warn(format!("wg udp: recv_packet failed error={e} src={inner_src}"));
                     return;
                 },
             },

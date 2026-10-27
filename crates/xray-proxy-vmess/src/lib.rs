@@ -47,6 +47,20 @@ pub mod outbound;
 pub mod plugin;
 pub mod validator;
 
+use std::sync::LazyLock;
+
+use xray_frame::LogFacade;
+
+/// vmess 域日志门面（nn8os 2b 同型处置：裸 tracing 宏 → LogFacade，禁令见
+/// clippy.toml tracing 五宏条目）。域 = "vmess"，target `xray_frame::vmess`
+/// + mask_secrets。
+///
+/// crate 级单例（域 = 协议名，全 crate 一个 target）：站点分散在 dispatcher/
+/// plugin/aead/inbound 四模块，逐模块各建一份会重复泄漏 target 字符串且
+/// target 相同——crate 级单份即可（同 wireguard/tun 先例）。
+pub(crate) static VMESS_LOG: LazyLock<LogFacade> =
+    LazyLock::new(|| LogFacade::new("vmess", vec![]));
+
 pub use account::MemoryAccount;
 pub use dispatcher::{VmessOutboundConfig, make_vmess_dial_fn, parse_vmess_config};
 pub use encoding::server::SessionHistory;

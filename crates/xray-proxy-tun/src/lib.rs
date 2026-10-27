@@ -26,9 +26,13 @@
 //! - [`config::StackOptions`] — netstack 配置
 //! - [`config::Tun`] / [`config::Stack`] trait — 设备与协议栈抽象
 //!
-//! 切片2 待办：`InterfaceUpdater`（网络接口动态查找）+ 平台 TUN 设备实现
-//! （Linux/Windows/macOS/FreeBSD/Android/iOS）+ gVisor/smoltcp netstack 集成 +
-//! TCP/UDP/ICMP 包处理 + UDP fullcone NAT。
+//! - 切片2 待办：`InterfaceUpdater`（网络接口动态查找）+ 平台 TUN 设备实现
+//!   （Linux/Windows/macOS/FreeBSD/Android/iOS）+ gVisor netstack 集成
+//!   + TCP/UDP/ICMP 包处理 + UDP fullcone NAT。
+
+use std::sync::LazyLock;
+
+use xray_frame::LogFacade;
 
 pub mod config;
 pub mod dns_verify;
@@ -49,6 +53,16 @@ pub mod device;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 #[path = "device_stub.rs"]
 pub mod device;
+
+/// tun 域日志门面（nn8os 2b 同型处置：裸 tracing 宏 → LogFacade——本项目工具链上
+/// `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三形态实测
+/// 无效），迁移为唯一关红路径）。域 = "tun"，target `xray_frame::tun` +
+/// mask_secrets。
+///
+/// crate 级单例（域 = 协议名，全 crate 一个 target）：tun 面站点分布在
+/// inbound / sysroute 两处，分模块各建一份会重复泄漏 target 字符串且 target
+/// 相同——crate 级单份即可。
+pub(crate) static TUN_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("tun", vec![]));
 
 // 顶层 re-export。
 pub use config::{Stack, StackOptions, Tun, score};
