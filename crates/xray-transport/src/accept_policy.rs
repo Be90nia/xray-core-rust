@@ -188,8 +188,7 @@ mod tests {
     #[tokio::test]
     async fn backoff_skips_non_resource_errors_immediately() {
         // 非资源类零 sleep 直达返回（时序断言只排除断言里误入 sleep 路径）
-        #[allow(clippy::disallowed_methods, reason = "测试：backoff 零 sleep 时序锚点")]
-        let start = std::time::Instant::now();
+        let start = xray_frame::compat::clock().now_instant();
         backoff_if_resource(&io::Error::from(io::ErrorKind::ConnectionReset)).await;
         assert!(start.elapsed() < Duration::from_millis(100));
     }

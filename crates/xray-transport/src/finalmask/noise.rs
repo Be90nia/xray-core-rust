@@ -7,7 +7,7 @@ use std::{
     io,
     net::SocketAddr,
     sync::atomic::{AtomicU32, Ordering},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -141,8 +141,11 @@ impl NoiseConn {
         match seg.kind {
             NoiseSegmentKind::Bytes => return seg.bytes.clone(),
             NoiseSegmentKind::Timestamp => {
-                let secs =
-                    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                let secs = xray_frame::compat::clock()
+                    .now_system()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
                 return (secs as u32).to_be_bytes().to_vec();
             },
             NoiseSegmentKind::Counter => {
@@ -191,11 +194,7 @@ impl UdpIo for NoiseConn {
         // 判断是否需要注入噪声（对应 Go `t.IsZero() || (ResetMax > 0 && now.After(t))`）
         let need_inject = {
             let mut map = self.last_expire.lock();
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "噪声注入过期判定墙钟取时；Clock 端口注入待 bd 39hko"
-            )]
-            let now = Instant::now();
+            let now = xray_frame::compat::clock().now_instant();
             let expire = map.entry(addr.to_string()).or_insert(now);
             let expired = *expire <= now;
             let ttl_secs = if self.config.reset_max > 0 {
@@ -299,9 +298,11 @@ mod tests {
 
     #[test]
     fn build_segment_timestamp_is_4byte_current_unix() {
-        let before =
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
-                as u32;
+        let before = xray_frame::compat::clock()
+            .now_system()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
         let got = conn().build_segment(&NoiseSegment {
             kind: NoiseSegmentKind::Timestamp,
             ..Default::default()

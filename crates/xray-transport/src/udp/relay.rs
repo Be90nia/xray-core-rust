@@ -92,8 +92,6 @@ impl UdpRelay {
     ///
     /// # Errors
     /// socket bind / connect / send 失败时返回 `io::Error`。
-    // 赋值表达式语句位挂属性在本工具链 E0658（无 stmt_expr_attributes），故挂 fn 位。
-    #[allow(clippy::disallowed_methods, reason = "UDP 会话活跃锚点刷新；Clock 端口注入待 bd 39hko")]
     pub async fn send_to(
         self: &Arc<Self>,
         dest: SocketAddr,
@@ -103,7 +101,7 @@ impl UdpRelay {
         let sock = {
             let mut sessions = self.sessions.lock().await;
             if let Some(s) = sessions.get(&dest) {
-                *s.last_refresh.lock() = Instant::now();
+                *s.last_refresh.lock() = xray_frame::compat::clock().now_instant();
                 Arc::clone(&s.sock)
             } else {
                 // 预留路径对齐 Go：UDP 出站 socket 也过 DialerController（AI7，
@@ -120,11 +118,8 @@ impl UdpRelay {
                 let sock = crate::system_dialer::dial_udp_packet_conn(bind_addr, dest).await?;
                 sock.connect(dest).await?;
                 let sock = Arc::new(sock);
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "UDP 会话活跃锚点初始化；Clock 端口注入待 bd 39hko"
-                )]
-                let last_refresh = Arc::new(parking_lot::Mutex::new(Instant::now()));
+                let last_refresh =
+                    Arc::new(parking_lot::Mutex::new(xray_frame::compat::clock().now_instant()));
                 let (reader, timer) = spawn_session(
                     Arc::clone(&sock),
                     dest,
@@ -197,18 +192,14 @@ fn spawn_session(
     // reader: 持续 recv，recv 出错 → 退出；每次成功 recv 刷新 last_refresh。
     // reader 退出时不主动改 map——交给 timer task 统一回收（避免并发删除）。
     // 数据面泵热路径豁免（约束⑫）：recv→channel 转发循环不加托管口。
-    // 属性同时覆盖任务体内的活跃锚点赋值（let 语句位覆盖整个初始化表达式）。
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "数据面泵热路径豁免（坑约束⑫）：UDP 会话 recv 泵 + 活跃锚点更新（体内赋值位 E0658）"
-    )]
+    #[allow(clippy::disallowed_methods, reason = "数据面泵热路径豁免（坑约束⑫）：UDP 会话 recv 泵")]
     let reader = tokio::spawn(async move {
         let mut buf = vec![0u8; RECV_BUF];
         loop {
             match sock.recv(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    *last_refresh_for_reader.lock() = Instant::now();
+                    *last_refresh_for_reader.lock() = xray_frame::compat::clock().now_instant();
                     if resp_tx.send((dest, buf[..n].to_vec())).is_err() {
                         break; // 调用方已停止接收
                     }

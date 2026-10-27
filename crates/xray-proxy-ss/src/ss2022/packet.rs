@@ -40,7 +40,7 @@
 
 use std::{
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::UNIX_EPOCH,
 };
 
 use parking_lot::Mutex;
@@ -70,14 +70,12 @@ const UDP_CHACHA_NONCE_SIZE: usize = 24;
 const MIN_PLAINTEXT: usize = 1 + 8 + 2 + 7;
 
 /// UDP 包会话当前 Unix 秒（Go `packet.go` 同语义）。
-///
-/// 713x6 台账：自由函数（UDP 包 codec 层），无 PluginContext 注入面。
-#[allow(
-    clippy::disallowed_methods,
-    reason = "SS2022 UDP 包会话时间戳 wire 字段；纯函数无 ctx 注入面（713x6 台账：结构性不可达）"
-)]
 fn now_unix() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+    xray_frame::compat::clock()
+        .now_system()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// chacha + 多 PSK 硬错（Go outbound.go:48-50 / packet.go NewUDPPacketCodec）。

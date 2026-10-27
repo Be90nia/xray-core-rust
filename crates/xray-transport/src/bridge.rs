@@ -1284,8 +1284,7 @@ mod tests {
         // peer 保留不 drop：drop 会让 stream EOF 走正常结束而非超时路径
         let (_stream_peer, stream) = tokio::io::duplex(8192);
 
-        #[allow(clippy::disallowed_methods, reason = "测试：桥断开计时锚点；Clock 注入待 bd 39hko")]
-        let start = std::time::Instant::now();
+        let start = xray_frame::compat::clock().now_instant();
         // 上游立即 EOF（无数据）→ down 只能靠 downlink_only 窗口超时断开
         up_w.shutdown();
         let res = bridge_link_with_stream_full_default(
@@ -1327,8 +1326,7 @@ mod tests {
             ..TimeoutPolicy::default()
         };
 
-        #[allow(clippy::disallowed_methods, reason = "测试：桥断开计时锚点；Clock 注入待 bd 39hko")]
-        let start = std::time::Instant::now();
+        let start = xray_frame::compat::clock().now_instant();
         // 上行 writer 保留不写、不 shutdown → 双方向均无活动 → conn_idle 触发断开。
         let _keep_up = up_w;
         let res = bridge_link_with_stream_full(
@@ -1381,8 +1379,7 @@ mod tests {
         // peer 保留：只走 up EOF 触发半关闭，不走 stream EOF
         let (_stream_peer, stream) = tokio::io::duplex(8192);
 
-        #[allow(clippy::disallowed_methods, reason = "测试：桥断开计时锚点；Clock 注入待 bd 39hko")]
-        let start = std::time::Instant::now();
+        let start = xray_frame::compat::clock().now_instant();
         up_w.shutdown(); // 上行立即 EOF（Go requestDone 返回）
         let res = bridge_link_with_stream_full(
             link,
@@ -1415,8 +1412,7 @@ mod tests {
         let link = Link::new(Box::new(up_r), Box::new(dn_w));
         let (stream_peer, stream) = tokio::io::duplex(8192);
 
-        #[allow(clippy::disallowed_methods, reason = "测试：桥断开计时锚点；Clock 注入待 bd 39hko")]
-        let start = std::time::Instant::now();
+        let start = xray_frame::compat::clock().now_instant();
         drop(stream_peer); // 下行立即 EOF（Go responseDone 返回）
         let res = bridge_link_with_stream_full(
             link,

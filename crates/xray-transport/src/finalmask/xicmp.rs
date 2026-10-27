@@ -443,11 +443,7 @@ fn spawn_clean_task_with(
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "TTL 清理墙钟取时；Clock 端口注入待 bd 39hko"
-            )]
-            let now = Instant::now();
+            let now = xray_frame::compat::clock().now_instant();
             state.lock().rec.retain(|_, r| now.duration_since(r.last) <= ttl);
         }
     })
@@ -555,11 +551,6 @@ impl XicmpPassthroughConn {
     }
 
     /// server send_to：用 rec 查 addr → marshal echo reply → raw.send。
-    // 赋值表达式语句位挂属性在本工具链 E0658（无 stmt_expr_attributes），故挂 fn 位。
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "ICMP 记录活跃锚点更新；Clock 端口注入待 bd 39hko"
-    )]
     async fn server_send_to(&self, payload: &[u8], addr: &SocketAddr) -> io::Result<usize> {
         let state_arc =
             self.server_state.as_ref().ok_or_else(|| io::Error::other("not a server conn"))?;
@@ -574,7 +565,7 @@ impl XicmpPassthroughConn {
             // GC，rec 命中与否只看条目存在性；这里去掉原热路径 O(n) retain。
             match s.rec.get_mut(&key) {
                 Some(r) => {
-                    r.last = Instant::now();
+                    r.last = xray_frame::compat::clock().now_instant();
                     (r.id, r.seq, r.src)
                 },
                 None => return Ok(0), // Go: log + drop
@@ -622,13 +613,14 @@ impl XicmpPassthroughConn {
             let vaddr = client_id_to_addr(client_id);
             {
                 let mut s = state_arc.lock();
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "ICMP 记录活跃锚点；Clock 端口注入待 bd 39hko"
-                )]
                 s.rec.insert(
                     vaddr.to_string(),
-                    XicmpServerRecord { id, seq, src, last: Instant::now() },
+                    XicmpServerRecord {
+                        id,
+                        seq,
+                        src,
+                        last: xray_frame::compat::clock().now_instant(),
+                    },
                 );
             }
             let n = payload.len().min(buf.len());
@@ -965,8 +957,7 @@ mod tests {
     /// 等 mock recv 队列长度稳定（50ms 窗口不变）——后台 recv 任务已消费完它能消费的。
     async fn wait_queue_stable(mock: &MockIcmpRawSocket) -> usize {
         let mut prev = usize::MAX;
-        #[allow(clippy::disallowed_methods, reason = "测试：稳定窗 deadline 锚点")]
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = xray_frame::compat::clock().now_instant() + Duration::from_secs(2);
         loop {
             let cur = mock.recv_queue.lock().len();
             if cur == prev {
@@ -974,8 +965,7 @@ mod tests {
             }
             prev = cur;
             tokio::time::sleep(Duration::from_millis(50)).await;
-            #[allow(clippy::disallowed_methods, reason = "测试：稳定窗 deadline 检查")]
-            if std::time::Instant::now() > deadline {
+            if xray_frame::compat::clock().now_instant() > deadline {
                 return mock.recv_queue.lock().len();
             }
         }

@@ -49,17 +49,13 @@ pub struct ConnEntry {
 }
 
 impl ConnEntry {
-    // 字段初始化在尾表达式位不可挂语句属性（E0658），allow 上移 fn 级。
-    #[allow(clippy::disallowed_methods, reason = "NAT 会话活跃锚点；Clock 端口注入待 bd 39hko")]
     pub fn new(source: SocketAddr, destination: SocketAddr) -> Self {
-        Self { last_activity: Instant::now(), destination, source }
+        Self { last_activity: xray_frame::compat::clock().now_instant(), destination, source }
     }
 
     /// 更新最后活动时间。
-    // 赋值表达式语句位挂属性在本工具链 E0658（无 stmt_expr_attributes），故挂 fn 位。
-    #[allow(clippy::disallowed_methods, reason = "NAT 会话活跃锚点更新；Clock 端口注入待 bd 39hko")]
     pub fn touch(&mut self) {
-        self.last_activity = Instant::now();
+        self.last_activity = xray_frame::compat::clock().now_instant();
     }
 
     /// 是否已过期。
@@ -294,8 +290,6 @@ mod tests {
     }
 
     #[tokio::test]
-    // 赋值表达式语句位挂属性在本工具链 E0658（无 stmt_expr_attributes），故挂 fn 位。
-    #[allow(clippy::disallowed_methods, reason = "测试：过期条目构造（回拨活跃锚点）")]
     async fn expired_entries_cleaned() {
         let dispatcher = UdpDispatcher::new();
         let src: SocketAddr = "127.0.0.1:12345".parse().unwrap();
@@ -306,7 +300,8 @@ mod tests {
             let mut entries = dispatcher.entries.lock().await;
             let mut expired_entry = ConnEntry::new(src, dst);
             // 设置 last_activity 为 2 分钟前（超过 60s 超时）。
-            expired_entry.last_activity = Instant::now() - Duration::from_secs(120);
+            expired_entry.last_activity =
+                xray_frame::compat::clock().now_instant() - Duration::from_secs(120);
             entries.insert((src, dst), expired_entry);
         }
 

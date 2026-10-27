@@ -925,7 +925,7 @@ mod tests {
         let dial_fn = make_ss_dial_fn(cfg);
         let dest = Destination::tcp(Address::new_domain("example.com"), Port::new(80));
 
-        let start = std::time::Instant::now();
+        let start = xray_frame::compat::clock().now_instant();
         let r = dial_fn(&dest).await;
         let elapsed = start.elapsed();
 

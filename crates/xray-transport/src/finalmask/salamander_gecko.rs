@@ -319,17 +319,13 @@ impl GeckoConn {
             if state.reassembly.len() >= GECKO_MAX_REASSEMBLY {
                 evict_oldest(&mut state);
             }
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "重组 deadline 锚点；Clock 端口注入待 bd 39hko"
-            )]
             state.reassembly.insert(
                 key.clone(),
                 ReassemblyEntry {
                     chunks: vec![None; h.total_chunks as usize],
                     received: 0,
                     total: h.total_chunks,
-                    deadline: Instant::now() + GECKO_REASSEMBLY_TTL,
+                    deadline: xray_frame::compat::clock().now_instant() + GECKO_REASSEMBLY_TTL,
                 },
             );
             *state.per_source.entry(key.addr.clone()).or_insert(0) += 1;
@@ -473,11 +469,7 @@ fn spawn_gc_task(state: Arc<Mutex<GeckoState>>, scope: &FxScope) -> Spawned<()> 
             loop {
                 interval.tick().await;
                 let mut s = state.lock();
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "GC 过期判定墙钟取时；Clock 端口注入待 bd 39hko"
-                )]
-                let now = Instant::now();
+                let now = xray_frame::compat::clock().now_instant();
                 let expired: Vec<ReassemblyKey> = s
                     .reassembly
                     .iter()

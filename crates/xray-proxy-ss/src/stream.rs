@@ -242,14 +242,9 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             self.write_nonce = vec![0xFFu8; aead.nonce_size()];
             self.write_aead = std::sync::Arc::from(aead);
             let first_len = plaintext.len().min(8192 - self.tag_size - 2);
-            // 713x6 台账：SS2022 响应 fixed 头 epoch 为协议 wire 字段（sing
-            // writeResponse 对齐）；`SSStream` 为纯 codec 结构无 PluginContext，
-            // 迁 Clock 需给 codec 结构加注入面（跨客户端/服务端多构造点），故留台账。
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "SS2022 协议 epoch wire 字段；SSStream 纯 codec 无 ctx 注入面（713x6 台账：结构性不可达）"
-            )]
-            let epoch = std::time::SystemTime::now()
+            // SS2022 响应 fixed 头 epoch 为协议 wire 字段（sing writeResponse 对齐）。
+            let epoch = xray_frame::compat::clock()
+                .now_system()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|e| SsError::GetCipher(e.to_string()))?
                 .as_secs();
@@ -644,11 +639,8 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
                     }
                     let epoch =
                         u64::from_be_bytes(plain[1..9].try_into().expect("epoch slice is 8 bytes"));
-                    #[allow(
-                        clippy::disallowed_methods,
-                        reason = "SS2022 响应 epoch ±30s 校验 wire 语义；SSStream 纯 codec 无 ctx 注入面（713x6 台账）"
-                    )]
-                    let now = std::time::SystemTime::now()
+                    let now = xray_frame::compat::clock()
+                        .now_system()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_err(|e| SsError::GetCipher(e.to_string()))?
                         .as_secs();
@@ -1203,7 +1195,7 @@ mod tests {
     /// （sing protocol.go:380 `bytes.Compare(echo, request) > 0 → ErrBadRequestSalt`）。
     #[test]
     fn response_rekey_2022_rejects_greater_echo_salt() {
-        use std::time::{SystemTime, UNIX_EPOCH};
+        use std::time::UNIX_EPOCH;
 
         use crate::ss2022::CipherKind2022;
 
@@ -1217,7 +1209,8 @@ mod tests {
         // server 侧构造响应 wire：resp_salt || AEAD(fixed: type=1|ts|echo|len=0)
         let subkey = crate::ss2022::derive_session_subkey(&psk, &resp_salt, kind);
         let server_aead = crate::ss2022::key::build_aead(kind, &subkey).unwrap();
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now =
+            xray_frame::compat::clock().now_system().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let mut fixed_plain = Vec::with_capacity(11 + 16);
         fixed_plain.push(1u8);
         fixed_plain.extend_from_slice(&now.to_be_bytes());
@@ -1244,7 +1237,7 @@ mod tests {
     /// 对照：echo salt **等于** 请求 salt 时 rekey 正常完成（返回 var chunk 消息）。
     #[test]
     fn response_rekey_2022_accepts_equal_echo_salt() {
-        use std::time::{SystemTime, UNIX_EPOCH};
+        use std::time::UNIX_EPOCH;
 
         use crate::ss2022::CipherKind2022;
 
@@ -1255,7 +1248,8 @@ mod tests {
 
         let subkey = crate::ss2022::derive_session_subkey(&psk, &resp_salt, kind);
         let server_aead = crate::ss2022::key::build_aead(kind, &subkey).unwrap();
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now =
+            xray_frame::compat::clock().now_system().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let mut fixed_plain = Vec::with_capacity(11 + 16);
         fixed_plain.push(1u8);
         fixed_plain.extend_from_slice(&now.to_be_bytes());

@@ -304,10 +304,8 @@ pub(crate) struct SendInfo {
 }
 
 impl SendInfo {
-    // 尾表达式位不可挂语句属性（E0658），allow 上移 fn 级。
-    #[allow(clippy::disallowed_methods, reason = "发送 TTL 锚点；Clock 端口注入待 bd 39hko")]
     fn now_deadline() -> Instant {
-        Instant::now() + SEND_TTL
+        xray_frame::compat::clock().now_instant() + SEND_TTL
     }
 
     /// 非阻塞取包：stash 优先（对齐 Go select 优先级）。
@@ -391,11 +389,7 @@ impl SendManager {
     /// TTL 清扫（对应 Go gc），过期 entry 移除并唤醒等待方。
     pub(crate) fn sweep_expired(&self) {
         let mut m = self.m.lock();
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "SendInfo GC 墙钟取时；Clock 端口注入待 bd 39hko"
-        )]
-        let now = Instant::now();
+        let now = xray_frame::compat::clock().now_instant();
         m.retain(|_, info| {
             if info.expired(now) {
                 info.notify.notify_waiters();

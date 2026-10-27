@@ -571,7 +571,11 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "xray-transport-unix-hub-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            xray_frame::compat::clock()
+                .now_system()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let path_str = path.to_str().expect("temp path utf8");
 

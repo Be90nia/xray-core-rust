@@ -54,7 +54,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -882,17 +882,11 @@ fn handle_udp_packet(
     );
 }
 
-/// 当前 wall-clock 纳秒（SystemTime → UNIX_EPOCH 偏移，i64 截断饱和）。用作
+/// 当前 wall-clock 纳秒（UNIX_EPOCH 偏移，i64 截断饱和）。用作
 /// session 最后活跃时间戳（p14e）与 UDP 冷却窗计时。
-///
-/// 713x6 台账：模块级自由函数（调用链 `udp_relay_gate`/`on_relay_failure` 均
-/// 不持 PluginContext），迁 Clock 需改整条 UDP 路径签名，故留台账。
-#[allow(
-    clippy::disallowed_methods,
-    reason = "UDP 冷却窗挂钟读数；自由函数无 ctx 注入面（713x6 台账：结构性不可达）"
-)]
 fn now_nanos() -> i64 {
-    SystemTime::now()
+    xray_frame::compat::clock()
+        .now_system()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
         .unwrap_or(0)

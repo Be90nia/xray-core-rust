@@ -19,11 +19,7 @@
 //!    body 交付）
 //! 7. 构造 SSStream 继续读写 body（下行首写自动发 sing writeResponse 响应头）
 
-use std::{
-    io,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{io, sync::Arc, time::UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use tokio::{io::AsyncReadExt, net::TcpStream};
@@ -626,15 +622,9 @@ where
 }
 
 /// 验证时间戳：与当前时间差在 tolerance 内。
-///
-/// 713x6 台账：自由函数（纯协议校验，调用链 `read_ss2022_request*` 不持
-/// PluginContext），迁 Clock 需改整条请求解析签名，故留台账。
-#[allow(
-    clippy::disallowed_methods,
-    reason = "SS2022 timestamp ±tolerance 校验 wire 语义；纯函数无 ctx 注入面（713x6 台账：结构性不可达）"
-)]
 fn check_timestamp(timestamp: u64, tolerance: u64) -> Result<()> {
-    let now = SystemTime::now()
+    let now = xray_frame::compat::clock()
+        .now_system()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| SsError::Ss2022TimestampCheck(e.to_string()))?
         .as_secs();
@@ -725,7 +715,8 @@ mod tests {
         use crate::ss2022::key::encrypt_identity_header;
         let subkey = derive_session_subkey(upsk, salt, kind);
         let aead = build_aead(kind, &subkey).unwrap();
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let timestamp =
+            xray_frame::compat::clock().now_system().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let padding_len: u16 = 16;
         let addr_port_len = 1 + 1 + 11 + 2; // ATYP + len + "example.com" + port
         let variable_len = addr_port_len + 2 + padding_len as usize + first_payload.len();
@@ -1042,7 +1033,8 @@ mod tests {
                     let kind = CipherKind2022::from_name("2022-blake3-aes-256-gcm").unwrap();
                     let resp_subkey = derive_session_subkey(&dest_psk, &[0u8; 32], kind);
                     let resp_aead = build_aead(kind, &resp_subkey).unwrap();
-                    let epoch = std::time::SystemTime::now()
+                    let epoch = xray_frame::compat::clock()
+                        .now_system()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
                         .as_secs();
@@ -1247,8 +1239,11 @@ mod tests {
         assert_eq!(fixed.len(), 1 + 8 + 16 + 2, "响应 fixed chunk 明文长度");
         assert_eq!(fixed[0], 1, "HeaderTypeServer");
         let epoch = u64::from_be_bytes(fixed[1..9].try_into().unwrap());
-        let now =
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let now = xray_frame::compat::clock()
+            .now_system()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         assert!(now.abs_diff(epoch) <= 30, "epoch within ±30s");
         assert_eq!(&fixed[9..25], &salt, "echo 必须回显请求 salt");
         let payload_len = u16::from_be_bytes([fixed[25], fixed[26]]) as usize;

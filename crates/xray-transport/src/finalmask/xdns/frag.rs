@@ -61,8 +61,7 @@ impl FragManager {
         if g.closed {
             return;
         }
-        #[allow(clippy::disallowed_methods, reason = "TTL 清扫墙钟取时；Clock 端口注入待 bd 39hko")]
-        let now = Instant::now();
+        let now = xray_frame::compat::clock().now_instant();
         let expired: Vec<FragKey> =
             g.m.iter().filter(|(_, e)| now > e.deadline).map(|(k, _)| k.clone()).collect();
         for k in expired {
@@ -119,11 +118,7 @@ impl FragManager {
             return Vec::new();
         }
 
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "分片过期判定墙钟取时；Clock 端口注入待 bd 39hko"
-        )]
-        let now = Instant::now();
+        let now = xray_frame::compat::clock().now_instant();
         let expired = g.m.get(&key).is_some_and(|e| now > e.deadline);
         let missing = !g.m.contains_key(&key);
         if missing || expired {

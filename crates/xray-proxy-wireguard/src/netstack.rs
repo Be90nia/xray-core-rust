@@ -489,15 +489,9 @@ fn sniff_udp_dst(pkt: &[u8]) -> Option<IpEndpoint> {
 }
 
 /// 墙钟纳秒——UDP 转发监听/会话空闲清扫的时间源。
-///
-/// 713x6 台账：模块级自由函数（`WgNetStack` 纯栈包装无 ctx；调用链
-/// `udp_send_reply`/空闲清扫不持 PluginContext），迁 Clock 需改栈 API 签名。
-#[allow(
-    clippy::disallowed_methods,
-    reason = "UDP 转发/清扫挂钟读数；自由函数无 ctx 注入面（713x6 台账：结构性不可达）"
-)]
 pub(crate) fn nanos_now() -> i64 {
-    std::time::SystemTime::now()
+    xray_frame::compat::clock()
+        .now_system()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as i64)
 }

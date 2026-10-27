@@ -222,8 +222,6 @@ pub(crate) fn sort_ips(ips: &[IpAddr], prioritize_ipv6: bool, interleave: u32) -
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant as StdInstant;
-
     use super::*;
 
     fn v4(n: u8) -> IpAddr {
@@ -275,8 +273,7 @@ mod tests {
     #[tokio::test]
     async fn race_slow_v6_fast_v4_picks_v4() {
         let addrs = [addr(v6(1), 80), addr(v4(1), 80)];
-        #[allow(clippy::disallowed_methods, reason = "测试：竞速时序锚点")]
-        let start = StdInstant::now();
+        let start = xray_frame::compat::clock().now_instant();
         let winner: io::Result<String> =
             race_dial(&addrs, Duration::from_millis(50), 2, |idx: usize| async move {
                 if idx == 0 {
@@ -326,8 +323,7 @@ mod tests {
     #[tokio::test]
     async fn race_backfills_immediately_after_failure() {
         let addrs = [addr(v6(1), 80), addr(v4(1), 80)];
-        #[allow(clippy::disallowed_methods, reason = "测试：竞速时序锚点")]
-        let start = StdInstant::now();
+        let start = xray_frame::compat::clock().now_instant();
         let winner: io::Result<String> = race_dial(
             &addrs,
             Duration::from_millis(60_000), // 不补充的话第二个永远不会启动

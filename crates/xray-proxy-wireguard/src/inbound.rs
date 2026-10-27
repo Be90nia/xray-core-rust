@@ -692,21 +692,11 @@ impl WgTcpRelay {
     async fn finish(&self) {
         let mut stack = self.netstack.lock().await;
         stack.with_tcp_socket(self.handle, |s| s.close());
-        // 713x6 台账：FIN 排空轮询截止的单调钟读数；`WgTcpRelay` 纯桥接结构
-        // （netstack+handle+to_client）无 ctx/clock 注入面。
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "WgTcpRelay 纯桥接结构无 ctx/clock 注入面；排空截止单调钟（713x6 台账：结构性不可达）"
-        )]
-        let deadline = std::time::Instant::now() + FINISH_DRAIN_TIMEOUT;
+        let deadline = xray_frame::compat::clock().now_instant() + FINISH_DRAIN_TIMEOUT;
         loop {
             stack.poll(smoltcp::time::Instant::now());
             let active = stack.with_tcp_socket(self.handle, |s| s.is_active());
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "同上：WgTcpRelay 无 ctx/clock 注入面（713x6 台账）"
-            )]
-            if !active || std::time::Instant::now() >= deadline {
+            if !active || xray_frame::compat::clock().now_instant() >= deadline {
                 break;
             }
             // 释放锁让位给 driver 定时器 drain_tx（唯一把 tx 发上线路的 task）
@@ -1020,7 +1010,7 @@ mod tests {
         }
 
         // 无 driver 时 tx_queue 由测试侧 drain——取 SYN-ACK 的 ISN
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = xray_frame::compat::clock().now_instant() + Duration::from_secs(5);
         let server_seq = loop {
             let seq = {
                 let mut stack = netstack.lock().await;
@@ -1029,7 +1019,7 @@ mod tests {
             if let Some(seq) = seq {
                 break seq;
             }
-            assert!(std::time::Instant::now() < deadline, "no SYN-ACK within 5s");
+            assert!(xray_frame::compat::clock().now_instant() < deadline, "no SYN-ACK within 5s");
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
 
@@ -1045,9 +1035,9 @@ mod tests {
             stack.poll(Instant::now());
         }
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = xray_frame::compat::clock().now_instant() + Duration::from_secs(5);
         while calls.load(Ordering::SeqCst) == 0 {
-            assert!(std::time::Instant::now() < deadline, "no dispatch within 5s");
+            assert!(xray_frame::compat::clock().now_instant() < deadline, "no dispatch within 5s");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
@@ -1137,10 +1127,10 @@ mod tests {
         // 驱动 client 侧 TCP：发 ping，收 echo
         let mut sent = false;
         let mut got: Vec<u8> = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let deadline = xray_frame::compat::clock().now_instant() + Duration::from_secs(15);
         while !got.starts_with(b"echo:pong") {
             assert!(
-                std::time::Instant::now() < deadline,
+                xray_frame::compat::clock().now_instant() < deadline,
                 "tcp echo not received in 15s; got={got:?}"
             );
             {
@@ -1160,9 +1150,12 @@ mod tests {
         }
 
         // server 侧记录：destination = 隧道内目标，payload = 请求
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = xray_frame::compat::clock().now_instant() + Duration::from_secs(5);
         while seen.lock().is_empty() {
-            assert!(std::time::Instant::now() < deadline, "dispatch not recorded in 5s");
+            assert!(
+                xray_frame::compat::clock().now_instant() < deadline,
+                "dispatch not recorded in 5s"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
@@ -1283,8 +1276,9 @@ mod tests {
         // 队列永远不满，测试前置条件失效（CI ubuntu/macos 实测）。
         let mut sent = false;
         let mut hit_rx_full = false;
-        let fill_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        while !hit_rx_full && std::time::Instant::now() < fill_deadline {
+        let fill_deadline =
+            xray_frame::compat::clock().now_instant() + std::time::Duration::from_secs(15);
+        while !hit_rx_full && xray_frame::compat::clock().now_instant() < fill_deadline {
             let mut s = client_ns.lock().await;
             s.poll(Instant::now());
             s.with_tcp_socket(handle, |sock| {
@@ -1304,7 +1298,7 @@ mod tests {
 
         // 阶段 B：正常慢读排空（4KB/轮）。
         let mut got: Vec<u8> = Vec::new();
-        let started = std::time::Instant::now();
+        let started = xray_frame::compat::clock().now_instant();
         let mut stall_rounds: u32 = 0;
         while got.len() < PAYLOAD_LEN {
             assert!(
@@ -1447,8 +1441,8 @@ mod tests {
 
         // ① 先把请求发出去触发回灌（握手可能还需重试，轮询到发出为止）
         let mut sent = false;
-        let send_deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !sent && std::time::Instant::now() < send_deadline {
+        let send_deadline = xray_frame::compat::clock().now_instant() + Duration::from_secs(10);
+        while !sent && xray_frame::compat::clock().now_instant() < send_deadline {
             let mut s = client_ns.lock().await;
             s.poll(Instant::now());
             s.with_tcp_socket(handle, |sock| {
@@ -1466,7 +1460,7 @@ mod tests {
 
         // ③ 恢复读：修前尾部已丢（提前 !is_active 或收不满）
         let mut got: Vec<u8> = Vec::new();
-        let started = std::time::Instant::now();
+        let started = xray_frame::compat::clock().now_instant();
         while got.len() < PAYLOAD_LEN {
             assert!(
                 started.elapsed() < Duration::from_secs(30),

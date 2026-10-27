@@ -15,7 +15,7 @@
 //! 9. write_chunk(body) — nonce [4,0,...]+
 //! 10. read_chunk 循环读响应
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 use tokio::net::TcpStream;
 use xray_crypto::aead::{AeadCipher, Aes128Gcm, Aes256Gcm, ChaCha20Poly1305Aead};
@@ -139,14 +139,9 @@ impl Client2022 {
         // 推迟到首写 emit 时进行（stream.rs emit_pending_client_2022）
         let nonce = vec![0u8; 12];
 
-        // timestamp
-        // 713x6 台账：SS2022 请求 fixed 头 timestamp 为协议 wire 字段（SIP022）；
-        // `Client2022` 纯配置结构（从 PSK/host/port 构造）无 PluginContext 注入面。
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "SS2022 协议 timestamp wire 字段；Client2022 纯配置结构无 ctx 注入面（713x6 台账：结构性不可达）"
-        )]
-        let timestamp = SystemTime::now()
+        // timestamp：SS2022 请求 fixed 头 wire 字段（SIP022）
+        let timestamp = xray_frame::compat::clock()
+            .now_system()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| SsError::GetCipher(e.to_string()))?
             .as_secs();

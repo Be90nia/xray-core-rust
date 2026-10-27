@@ -577,13 +577,7 @@ impl WgDriver {
         }
 
         let mut timer = interval(TIMER_INTERVAL);
-        // 713x6 台账：keepalive 节拍的单调钟读数；`WgDriver` 自持 FxScope（B6
-        // t975）但无 ctx/clock 字段，迁 Clock 需改三处构造器契约。
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "WgDriver 自持 scope 无 ctx/clock 注入面；keepalive 单调钟（713x6 台账：结构性不可达）"
-        )]
-        let mut last_keepalive = std::time::Instant::now();
+        let mut last_keepalive = xray_frame::compat::clock().now_instant();
         let keepalive_interval =
             self.peer(0).and_then(|p| p.with_tunnel(|t| t.keepalive_interval()));
 
@@ -613,13 +607,8 @@ impl WgDriver {
             }
             if !self.is_multi() {
                 if let Some(interval_secs) = keepalive_interval {
-                    // 713x6 台账（覆盖下方 reset 赋值站）：WgDriver 无 ctx/clock 注入面。
-                    #[allow(
-                        clippy::disallowed_methods,
-                        reason = "同上：WgDriver 无 ctx/clock 注入面（713x6 台账）"
-                    )]
                     if last_keepalive.elapsed().as_secs() >= u64::from(interval_secs) {
-                        last_keepalive = std::time::Instant::now();
+                        last_keepalive = xray_frame::compat::clock().now_instant();
                         let ka_outputs =
                             self.peer(0).map(|p| p.with_tunnel(|t| t.encapsulate(&[])));
                         if let Some(Ok(outs)) = ka_outputs {
@@ -1035,7 +1024,7 @@ mod tests {
             });
         }
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = xray_frame::compat::clock().now_instant() + Duration::from_secs(10);
         loop {
             if client.peer(0).is_some_and(|p| p.is_online())
                 && server.peer(0).is_some_and(|p| p.is_online())
@@ -1043,7 +1032,7 @@ mod tests {
                 break;
             }
             assert!(
-                std::time::Instant::now() < deadline,
+                xray_frame::compat::clock().now_instant() < deadline,
                 "handshake not completed within 10s (client online: {}, server online: {})",
                 client.peer(0).is_some_and(|p| p.is_online()),
                 server.peer(0).is_some_and(|p| p.is_online())
