@@ -10,6 +10,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **xray-frame 六面派生件落地**（能力收敛 W1，`1679a5a7`）：`compat`（进程级能力入口：一次性 install + 作用域守卫 + 兜底=迁移前行为；**禁 thread_local**——tokio 任务跨线程迁移语义错）/ `redline`（红线受控入口：`RedlineSite` 穷举 + 受控执行 + 源码扫描 CI 门）/ `scope`（ConnScope 两级 scope：arm → connection）/ `deadline::Budget`（双源：Tokio 虚拟钟 advance + Wall 由 `Clock` 判负）/ `logging::HotLog`（栈缓冲零分配热路径门面）/ `config::XrayConfigLayers`（tag 合并 + outbounds prepend + tail）；7 份测试随件进 CI
+- **ADR-1/ADR-2 入宪**（`CLAUDE.md §3.5.5`，`377c712d`）：能力归属三层判定顺序固定（零 Xray 语义 → udf；否则 → xray-frame；仅当逐条举证才留主仓）+ `compat`/`redline` 两条执行约束（登记集合不随迁移增长）
+
+### Changed
+
+- **tracing 收口（proxy 16 crate 生产裸宏 217 → 0）**：批 2a `d3c43a61`（tuic/anytls/trojan/hysteria 109 处）+ 批 2b `96483e8f`（wireguard/tun/freedom/vmess 90 处，含 `event!` 逃生口拆除）；模块级 `LazyLock<LogFacade>` 门面 + per-crate 宏禁令（探针验证真拦截）
+- **L3 台账**（`888c6b8f`）：dispatcher/kcp/splithttp 补 spawn/时钟禁令 + 43 处生产站点逐点 allow 登记（reason 含语义归类）
+- **时钟收敛**：W3a `b085ff97`（common/tls 9 站 → udf `SystemClock`，删 allow 8 处）；W3b `7d71a6c6`（transport/ss/wireguard/tun 64 站 → `compat::clock`，删 allow 40 项）
+- **配置装配切框架件**（W2 `4ec2f28c`）：`merge_configs` 换 `XrayConfigLayers` 折叠（旧 typed 循环删除无 shim）；影子三路对照 = 旧↔新 18 组 0 差异、新↔Go v26.10.17 合并签名域 12/12 全等；未知键保留面由专门测试钉住
+- **tokio 虚拟钟预算点**（W5 `bb7b54eb`）：34 站给出去宿——迁 22（tuic 5/vless 6/vmess 4/transport 7）；例外 12 分四类登记（`Sleep::reset`/`sleep_until` 只收绝对 `tokio::time::Instant` 而 `Budget` 刻意不外露绝对时刻 → 结构不可迁；`bridge.rs` 热路径每读超时 5 处不动）
+- **热路径日志**（W6 `8a200d7b`）：transport 族 40 站 → `HotLog`（栈缓冲、先过滤后格式化）；**40/40 消息逐字保留**；p7lm 调查通道 9 处一字未动（其 trace 税曾把优化实测毒化成伪影约 36% 吞吐）；A′/B 真单变量交错 3 窗口 Δ 在噪声内
+- **红线受控入口接线**（W7 `23769fa0`）：vless vision 数据面错误事件 `tracing::event!` → `redline::event`（结构化 `error` 字段**折叠进 message**，`redline` API 零扩张）；`redline_sites` 四门 4/4（改前 3/1）
+- **任务托管归 scope**（W4 `b46d6058`）：mux carrier 4 处 → arm scope（与 inbound 同寿命）、SS 泵 → 每连接 `ConnScope`；`inbound.rs` 生产裸 `tokio::spawn` 清零。**停机语义有意收紧**：泵/carrier 随 arm scope 关闭被级联取消（原 detached 跑完）
+- **运行期注册表**（C-R1a `554377d7`）：`SimpleOhm` 的两张 tag→handler 表 → udf `BoundedRegistry`（对外 API **逐字不变**，commander/reverse 零改动）；cap 4096 + `Eviction::Reject` + `error!` 留痕（fail-closed，不静默丢 handler）；`--features dispatcher-dual-write` 双表漂移 0
+- **重试编排**（C-R2 `12a3ff2b`）：kcp `RetryableWriter` → udf `std_ext::retry`（固定间隔截平形；`Exhausted.last` 原样回灌）；行为差仅两处严格改善（末次不空睡、零间隔 fail-closed）
+
+### Fixed
+
+- **栈足迹回归**（W5 发现，W4 扩面复核）：`BudgetDeadline::timeout`（**async-fn 形态**）在巨型 future 内加厚栈帧 → `vmess_inbound_udp_relay_e2e` 确定性 `STATUS_STACK_OVERFLOW`（HEAD 版 PASS，三步单变量取证）；改**构造式** `deadline::timeout(fut, remaining())`（具名 `Timeout<F>`，与裸调用同体积）；vmess 3 + vless 5 + core UDP relay 4 处统一。框架结论：**构造式 = 默认正确形态，async-fn = 便利形态有栈代价**
+- **红线门对别名隐形**：受控入口若用 `use ... as` 别名调用，字面量扫描门得到空集合直接放过（整个文件对门不可见）→ 改全路径调用
+- **W6 fmt 漏跑**（`5baf33cd`）：PM 验收漏跑 fmt 门导致已入库文件带 3 处 rustfmt 差异（CI fmt 会红），补修
+- `Cargo.lock` 漏带（`073870b5`）：C-R2 的 kcp 依赖边未随 commit 入库，补齐（干净检出可构建）
+
+### Docs
+
+- **性能门判定纪律定稿**（`docs/benchmarks/baseline.md` 2026-10-27 节，两次自我更正）：绝对吞吐**不可跨窗比较**（并发编译压低约 20%；同一二进制跨窗也可差 ~20%）→ 主判据 = **当场交错的 A/B 相对差**（轮间交错，分块会吃进时段漂移）；测量窗内禁一切 cargo 编译 + 前后进程快照取证；两个测量窗严禁重叠；**A/B 混杂即作废须重跑**
+- **显式豁免（非未完成）**：DNS `cache_controller` 留 `xray-app-dns`（ADR-1 判据③逐条举证：DNS 方向件 + Go 语义逐字对齐 + 热路径并发面，udf `TtlCache` 单线程 `&mut self` 适配必加全局锁）；已登记 `udf-promotion-candidate` + 缺口入 bd `n539c`
 - **框架装配骨架 `crates/xray-frame`**：强约束插件模型五层落地——`Plugin` 必选方法集 + `PluginContract`（`ClauseId` 12 条款）+ `PluginContext` 能力句柄 + 生命周期编排 + 启动期装配门（deps 缺失/成环 fail-visible）；L3 lint 层 = per-crate `clippy.toml` 禁令（现 33 个 crate）
 - **协议插件化**：29 个 crate 接入 `xray-frame`；16 个协议 crate 带 `tests/plugin_contract.rs` 契约测试进 CI（`assert_plugin_contract!` L4 行为夹具）
 - **中央协议臂表化**：`xray-core/src/arm_builders/` BTreeMap 构造表成为唯一构造路径（未命中显式失败；旧巨型 match 删除；unix 变体 4 臂残留待收口）
