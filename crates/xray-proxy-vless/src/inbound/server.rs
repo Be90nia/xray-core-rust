@@ -29,7 +29,7 @@ use tokio::{
 use xray_app_dispatcher::{OutboundHandlerManager, default::SimpleOhm};
 use xray_buf::io::{new_coalescing_writer, new_reader, new_writer};
 use xray_common::net::{destination::Destination, network::Network, port::Port};
-use xray_frame::LogFacade;
+use xray_frame::{LogFacade, deadline::Budget};
 use xray_transport::{link::Link, system_listener::InboundTcpListener};
 
 use crate::{
@@ -324,15 +324,17 @@ where
     // 60s) 在 ENC 握手之后、首包读之前设置；deadline 覆盖首包预读 + decode 总
     // 时长，decode 成功或 fallback 时解除）。sm80④：优先用装配层注入的 policy
     // 握手超时；未注入时维持 crate 兜底（同 handshake_timeout_for 无 policy 分支）。
-    // 713x6 台账：tokio 虚拟钟预算面——`timeout_at` 仅收 tokio Instant，与 std
-    // Clock 面禁混换（713x6 判定：tokio 一律不迁）。
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "tokio 虚拟钟预算面：timeout_at deadline 与 sleep/timeout 同钟族，禁换 std/Clock（713x6：tokio 一律不迁）"
-    )]
-    let handshake_deadline = tokio::time::Instant::now()
-        + options.as_ref().and_then(|o| o.handshake_timeout).unwrap_or_else(handshake_timeout);
-
+    // 面 3 步 3：预算入口统一走 xray-frame deadline（Tokio 源，虚拟钟语义不变；
+    // 713x6「禁换 std/Clock」仍成立——未换时钟实现，只换入口）。
+    //
+    // 形态取构造式 `deadline::timeout(fut, remaining())` 而非
+    // `BudgetDeadline::timeout` 的 async-fn 形态：本 fn 是巨型 future，async-fn
+    // 包装逐站点撑大栈足迹（同款形态在 vmess `handle_connection` 上实测把单测
+    // 线程 2MiB 栈打爆）；构造式返回具名 `Timeout<F>`，与裸
+    // `tokio::time::timeout` 同体积，绝对截止点由 `remaining()` 每次现算承接。
+    let handshake_deadline = Budget::tokio().deadline(
+        options.as_ref().and_then(|o| o.handshake_timeout).unwrap_or_else(handshake_timeout),
+    );
     // 无 fallback 策略：维持原直连路径（不做 first 预读；deadline 由
     // handle_connection 内部建立，语义同上）
     let Some(policy) = fallbacks else {
@@ -345,9 +347,9 @@ where
     let mut first = vec![0u8; 1024];
     let mut n = 0;
     while n == 0 {
-        let read = match tokio::time::timeout_at(
-            handshake_deadline,
+        let read = match xray_frame::deadline::timeout(
             read_half.read(&mut first[n..]),
+            handshake_deadline.remaining(),
         )
         .await
         {
@@ -372,26 +374,27 @@ where
         let mut fb_first: Option<Vec<u8>> = None;
         let decode_fut =
             decode_request_header(false, &mut fb_first, &mut reader, validator.as_ref());
-        let decoded = match tokio::time::timeout_at(handshake_deadline, decode_fut).await {
-            Ok(Ok(decoded)) => decoded,
-            // decode 失败/超时（含握手限时到期）→ fallback（Go inbound.go:314-318
-            // isfb 时清 read deadline 走 fallback；timeout_at 中断未破坏底层流，
-            // 已读字节经 into_parts 不重放，语义同下）
-            _ => {
-                let (_, read_half_back) = reader.into_parts();
-                return do_fallback(
-                    read_half_back,
-                    write_half,
-                    &first,
-                    &policy,
-                    peer,
-                    local,
-                    &tls_name,
-                    &tls_alpn,
-                )
-                .await;
-            },
-        };
+        let decoded =
+            match xray_frame::deadline::timeout(decode_fut, handshake_deadline.remaining()).await {
+                Ok(Ok(decoded)) => decoded,
+                // decode 失败/超时（含握手限时到期）→ fallback（Go inbound.go:314-318
+                // isfb 时清 read deadline 走 fallback；timeout_at 中断未破坏底层流，
+                // 已读字节经 into_parts 不重放，语义同下）
+                _ => {
+                    let (_, read_half_back) = reader.into_parts();
+                    return do_fallback(
+                        read_half_back,
+                        write_half,
+                        &first,
+                        &policy,
+                        peer,
+                        local,
+                        &tls_name,
+                        &tls_alpn,
+                    )
+                    .await;
+                },
+            };
         // per-user stats 上下文（Go inbound.go Process 认证后 ctx 带 user）：
         // from=客户端源地址，email/level=认证用户。local=入站本地地址
         // （Go session.Inbound.Local；txno④ reverse mux portal 写侧随 New
@@ -683,10 +686,12 @@ where
     // select 分支体内 await（select 已定，不会被取消）；`recv_packet` 可取消
     // （半帧累积在 session 内部，见 udp_session.rs）。
     let result = loop {
-        // 713x6 台账：tokio 虚拟钟预算面——与 sleep_until 同钟族（713x6：tokio 一律不迁）。
+        // 面 3 步 3 例外：`sleep_until` 只收 `tokio::time::Instant`，而
+        // `xray_frame::deadline::Budget` 刻意不外露绝对时刻 → 本站留原形态，
+        // 待 Budget 补 timer-arm 面再收。
         #[allow(
             clippy::disallowed_methods,
-            reason = "tokio 虚拟钟预算面：sleep_until deadline 与超时同钟族（713x6：tokio 一律不迁）"
+            reason = "面 3 步 3 例外：Budget 无绝对时刻面，sleep_until 只能收 tokio Instant（待 Budget 补 timer-arm 面）"
         )]
         let deadline = tokio::time::Instant::now() + idle_timeout;
         tokio::select! {
@@ -837,20 +842,17 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
 
     // 握手限时（Go inbound.go:281-284：decode 前 SetReadDeadline(policy 或
     // SessionDefault 60s)，覆盖整个 decode 阶段；sm80④ 起装配层可注入）。
-    // 713x6 台账：tokio 虚拟钟预算面——`timeout_at` 仅收 tokio Instant，与 std
-    // Clock 面禁混换（713x6 判定：tokio 一律不迁）。
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "tokio 虚拟钟预算面：timeout_at deadline 与 sleep/timeout 同钟族，禁换 std/Clock（713x6：tokio 一律不迁）"
-    )]
-    let handshake_deadline = tokio::time::Instant::now()
-        + options.as_ref().and_then(|o| o.handshake_timeout).unwrap_or_else(handshake_timeout);
+    // 面 3 步 3：预算入口统一走 xray-frame deadline（形态与上游 fallback 探测处
+    // 一致：构造式，避免 async-fn 包装撑大本巨型 future 的栈足迹）。
+    let handshake_deadline = Budget::tokio().deadline(
+        options.as_ref().and_then(|o| o.handshake_timeout).unwrap_or_else(handshake_timeout),
+    );
 
     // 1. decode VLESS request header（isfb=false，全部从 stream 读）
     let mut first: Option<Vec<u8>> = None;
-    let decoded = tokio::time::timeout_at(
-        handshake_deadline,
+    let decoded = xray_frame::deadline::timeout(
         decode_request_header(false, &mut first, &mut stream, validator.as_ref()),
+        handshake_deadline.remaining(),
     )
     .await
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "vless handshake read timeout"))?

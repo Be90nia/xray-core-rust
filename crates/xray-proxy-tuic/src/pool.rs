@@ -29,6 +29,7 @@ use std::{
 };
 
 use tokio::{sync::Mutex, time::sleep};
+use xray_frame::deadline::Budget;
 
 use crate::error::{Result, TuicError};
 
@@ -178,12 +179,13 @@ impl QuinnConnectionPool {
         }
 
         // 慢速路径：新建连接（兜底超时——connector 本身无时限时防无限挂起）
-        let conn = tokio::time::timeout(dial_timeout, connector()).await.map_err(|_| {
-            TuicError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "tuic pool dial timeout",
-            ))
-        })??;
+        let conn =
+            Budget::tokio().deadline(dial_timeout).timeout(connector()).await.map_err(|_| {
+                TuicError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "tuic pool dial timeout",
+                ))
+            })??;
         // 713x6 台账：池条目建链时戳；`ConnectionPool` 纯结构（inner+dial_locks），
         // 无 PluginContext 注入面，迁 Clock 需改 pub 池构造契约。
         #[allow(

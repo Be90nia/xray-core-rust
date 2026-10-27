@@ -555,12 +555,12 @@ async fn udp_assoc_task(
 /// 直连模式（mock）：assoc 生命周期内单个 UdpSocket（cone 出口）。
 /// direct 模式（mock server / 直连）：每包直接 `udp.send_to`。
 ///
-/// 713x6 台账：tokio 虚拟钟预算面——`Sleep::reset` 仅收 tokio Instant（fn 内
-/// 2 处 reset 由本条 fn 级 allow 统一登记），与 std Clock 面禁混换
-/// （713x6 判定：tokio 一律不迁）。
+/// 面 3 步 3 例外：`Sleep::reset` 只收 `tokio::time::Instant`，而
+/// `xray_frame::deadline::Budget` 刻意不外露绝对时刻（双源统一入口的构造约束）
+/// → fn 内 2 处 idle reset 留原形态，待 Budget 补 timer-arm 面再收。
 #[allow(
     clippy::disallowed_methods,
-    reason = "tokio 虚拟钟预算面：idle 睡眠 reset 与 sleep 同钟族（713x6：tokio 一律不迁）"
+    reason = "面 3 步 3 例外：Budget 无绝对时刻面，Sleep::reset 只能收 tokio Instant（待 Budget 补 timer-arm 面）"
 )]
 async fn udp_assoc_direct(assoc_id: u16, mut rx: tokio::sync::mpsc::Receiver<UdpAssocItem>) {
     let log = &*SERVER_LOG;
@@ -624,11 +624,11 @@ async fn udp_assoc_direct(assoc_id: u16, mut rx: tokio::sync::mpsc::Receiver<Udp
 
 /// dispatch 模式（生产）：[`UdpDispatchSession`] 路由，域名透传由 outbound 解析。
 ///
-/// 713x6 台账：tokio 虚拟钟预算面——同 `udp_assoc_direct`（fn 内 2 处 reset
-/// 由本条 fn 级 allow 统一登记；713x6 判定：tokio 一律不迁）。
+/// 面 3 步 3 例外：同 `udp_assoc_direct`（fn 内 2 处 idle reset 由本条 fn 级
+/// allow 统一登记）——Budget 不外露绝对时刻，`Sleep::reset` 只能收 tokio Instant。
 #[allow(
     clippy::disallowed_methods,
-    reason = "tokio 虚拟钟预算面：idle 睡眠 reset 与 sleep 同钟族（713x6：tokio 一律不迁）"
+    reason = "面 3 步 3 例外：Budget 无绝对时刻面，Sleep::reset 只能收 tokio Instant（待 Budget 补 timer-arm 面）"
 )]
 async fn udp_assoc_dispatch(
     assoc_id: u16,

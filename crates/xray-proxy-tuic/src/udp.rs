@@ -23,7 +23,7 @@ use std::{
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::time::Duration;
-use xray_frame::LogFacade;
+use xray_frame::{LogFacade, deadline::Budget};
 
 use crate::{
     error::{Result, TuicError},
@@ -129,7 +129,7 @@ impl UniRespRouter {
             let _ = uni.finish();
             rx.await.map_err(|_| TuicError::UnexpectedEof("udp resp router dropped"))
         };
-        match tokio::time::timeout(timeout, recv).await {
+        match Budget::tokio().deadline(timeout).timeout(recv).await {
             // Bytes → Vec：read_payload 产的 VEC-kind Bytes 唯一引用时零拷贝归还
             Ok(Ok(resp)) => Ok(resp.data.into()),
             Ok(Err(e)) => Err(e),
@@ -244,7 +244,9 @@ impl TuicUdpAssoc {
         // 循环收响应 datagram，分片收齐即返回（同一超时窗口）
         let to = timeout.unwrap_or(DEFAULT_UDP_TIMEOUT);
         loop {
-            let resp = tokio::time::timeout(to, self.conn.read_datagram())
+            let resp = Budget::tokio()
+                .deadline(to)
+                .timeout(self.conn.read_datagram())
                 .await
                 .map_err(|_| TuicError::UdpTimeout(to))?
                 .map_err(TuicError::Quinn)?;

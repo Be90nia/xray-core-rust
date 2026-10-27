@@ -97,6 +97,9 @@ where
     let mut winner: Option<T> = None;
     let mut last_err: Option<io::Error> = None;
     // Go timer.NewTimer(0)：第 0 个地址立即启动。
+    // 面 3 步 3 例外（本文件 2 处 reset 取时）：`Sleep::reset` 只收
+    // `tokio::time::Instant`，而 `xray_frame::deadline::Budget` 刻意不外露绝对
+    // 时刻（双源统一入口的构造约束）→ 本站留原形态，待 Budget 补 timer-arm 面再收。
     let mut timer: Pin<Box<Sleep>> = Box::pin(tokio::time::sleep(Duration::ZERO));
 
     loop {

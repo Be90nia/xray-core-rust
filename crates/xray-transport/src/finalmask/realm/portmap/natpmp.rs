@@ -13,10 +13,8 @@ use std::{
     time::Duration,
 };
 
-use tokio::{
-    net::UdpSocket,
-    time::{Instant, timeout_at},
-};
+use tokio::net::UdpSocket;
+use xray_frame::deadline::Budget;
 
 /// NAT-PMP 网关端口（RFC 6886 §3：客户端发往「默认网关」的 5351）。
 pub const NATPMP_PORT: u16 = 5351;
@@ -213,7 +211,9 @@ impl Client {
         request: Vec<u8>,
         parse: fn(&[u8]) -> io::Result<T>,
     ) -> io::Result<T> {
-        let deadline = Instant::now() + self.timeout;
+        // 面 3 步 3：预算入口统一走 xray-frame Budget（Tokio 源 = tokio 虚拟钟，
+        // `timeout_at` 的绝对截止点语义由 `BudgetDeadline` 同构承接）。
+        let deadline = Budget::tokio().deadline(self.timeout);
         let mut backoff = RETRANSMIT_INITIAL;
         let mut attempt: u32 = 0;
         let mut last_error: Option<io::Error> = None;
@@ -221,14 +221,17 @@ impl Client {
         loop {
             self.sock.send(&request).await?;
             attempt += 1;
-            let round_end = (Instant::now() + backoff).min(deadline);
-            match timeout_at(round_end, self.sock.recv(&mut buf)).await {
+            // 本轮窗口 = min(now + backoff, 预算截止点)：取两者剩余时长较小值。
+            // 整体截止点仍由下方 `is_expired()` 兜底，剩余时长现算的纳秒级漂移
+            // 不会越过预算。
+            let round = deadline.remaining().min(backoff);
+            match xray_frame::deadline::timeout(self.sock.recv(&mut buf), round).await {
                 // 超时或 ICMP 不可达（Windows 在网关不监听时报 ECONNRESET）= 本轮无应答
                 Err(_elapsed) => {},
                 Ok(Err(e)) => last_error = Some(e),
                 Ok(Ok(n)) => return parse(&buf[..n]),
             }
-            if attempt >= RETRANSMIT_MAX || Instant::now() >= deadline {
+            if attempt >= RETRANSMIT_MAX || deadline.is_expired() {
                 let detail = match last_error {
                     Some(e) => format!(" (last socket error: {e})"),
                     None => String::new(),
@@ -318,8 +321,8 @@ mod tests {
         let forged = response(OP_PUBLIC_ADDRESS, 0, &[6, 6, 6, 6]);
         #[allow(clippy::disallowed_methods, reason = "测试：外部地址探测任务")]
         let probe = tokio::spawn(async move { client.external_address().await });
-        let deadline = Instant::now() + Duration::from_millis(800);
-        while Instant::now() < deadline {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+        while tokio::time::Instant::now() < deadline {
             for peer in stub.peers() {
                 let _ = rogue.send_to(&forged, peer).await;
             }

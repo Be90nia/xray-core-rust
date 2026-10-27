@@ -27,7 +27,7 @@ use skeleton_infra::fx::Spawned;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use xray_app_dispatcher::default::DialFn;
 use xray_common::net::{address::Address as XrayAddress, destination::Destination};
-use xray_frame::{LogFacade, PluginContext};
+use xray_frame::{LogFacade, PluginContext, deadline::Budget};
 use xray_transport::connection::Connection;
 
 use crate::{
@@ -124,7 +124,9 @@ pub fn make_dial_fn(client: Arc<TuicClient>, ctx: Arc<PluginContext>) -> DialFn 
             },
         };
         Box::pin(async move {
-            let conn = tokio::time::timeout(Duration::from_secs(30), client.dial(addr))
+            let conn = Budget::tokio()
+                .deadline(Duration::from_secs(30))
+                .timeout(client.dial(addr))
                 .await
                 .map_err(|_| "tuic dial: timed out".to_string())?
                 .map_err(|e| format!("tuic dial: {e}"))?;
@@ -198,18 +200,21 @@ pub fn make_dial_fn_lazy(
                     DISPATCH_LOG
                         .warn(format!("tuic client init failed: {e} server={server_addr_log}"))
                 })?;
-            let conn =
-                match tokio::time::timeout(Duration::from_secs(30), c.dial(addr.clone())).await {
-                    Ok(Ok(conn)) => conn,
-                    Ok(Err(e)) => {
-                        DISPATCH_LOG.warn(format!("tuic dial failed: {e} target={addr:?}"));
-                        return Err(format!("tuic dial: {e}"));
-                    },
-                    Err(_) => {
-                        DISPATCH_LOG.warn(format!("tuic dial timed out target={addr:?}"));
-                        return Err("tuic dial: timed out".to_string());
-                    },
-                };
+            let conn = match Budget::tokio()
+                .deadline(Duration::from_secs(30))
+                .timeout(c.dial(addr.clone()))
+                .await
+            {
+                Ok(Ok(conn)) => conn,
+                Ok(Err(e)) => {
+                    DISPATCH_LOG.warn(format!("tuic dial failed: {e} target={addr:?}"));
+                    return Err(format!("tuic dial: {e}"));
+                },
+                Err(_) => {
+                    DISPATCH_LOG.warn(format!("tuic dial timed out target={addr:?}"));
+                    return Err("tuic dial: timed out".to_string());
+                },
+            };
             Ok(Box::new(TuicConnection::from_conn(&ctx, conn)) as Box<dyn Connection>)
         })
     })

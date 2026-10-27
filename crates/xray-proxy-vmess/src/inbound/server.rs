@@ -21,7 +21,7 @@ use xray_common::{
     protocol::{Command, ResponseCommand, ResponseHeader, SecurityType},
 };
 use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead};
-use xray_frame::PluginContext;
+use xray_frame::{PluginContext, deadline::Budget};
 use xray_transport::{link::Link, system_listener::InboundTcpListener};
 
 use crate::{
@@ -237,16 +237,20 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
     let mut session = ServerSession::new(validator, history);
     // Go `server.go::Process`：conn.SetReadDeadline(Timeouts.Handshake) 一次性
     // 覆盖 decode 与 drain 总时长（绝对 deadline 语义）。sm80④ 起由装配层注入。
-    // 713x6 台账：tokio 虚拟钟预算面——`timeout_at` 仅收 tokio Instant，与 std
-    // Clock 面禁混换（713x6 判定：tokio 一律不迁）。
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "tokio 虚拟钟预算面：timeout_at deadline 与 sleep/timeout 同钟族，禁换 std/Clock（713x6：tokio 一律不迁）"
-    )]
-    let handshake_deadline = tokio::time::Instant::now() + handshake_timeout;
-    let decoded = match tokio::time::timeout_at(
-        handshake_deadline,
+    // 面 3 步 3：预算入口统一走 xray-frame deadline（Tokio 源 = tokio 虚拟钟，
+    // `tokio::time::advance` 语义不变；713x6「禁换 std/Clock」仍成立——只换
+    // 入口，未换时钟实现）。
+    //
+    // 形态取构造式 `deadline::timeout(fut, remaining())` 而非
+    // `BudgetDeadline::timeout` 的 async-fn 形态：本 fn 是巨型 future（尾部
+    // `join!(up, relay)`），async-fn 包装逐站点撑大（实测单测线程 2MiB 栈 →
+    // STATUS_STACK_OVERFLOW）；构造式返回具名 `Timeout<F>`，与裸
+    // `tokio::time::timeout` 同体积，绝对截止点由 `remaining()` 每次现算承接
+    // （漂移 = 计算间隙，纳秒级）。
+    let handshake_deadline = Budget::tokio().deadline(handshake_timeout);
+    let decoded = match xray_frame::deadline::timeout(
         session.decode_request_header_async(&mut stream_r),
+        handshake_deadline.remaining(),
     )
     .await
     {
@@ -280,8 +284,11 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
                 }
                 // drain 受同一 handshake deadline 限制（Go SetReadDeadline 覆盖
                 // decode+drain 总时长；原硬编码 4s 偏离 policy 缺省 60s）
-                let _ =
-                    tokio::time::timeout_at(handshake_deadline, drainer.drain(&mut stream_r)).await;
+                let _ = xray_frame::deadline::timeout(
+                    drainer.drain(&mut stream_r),
+                    handshake_deadline.remaining(),
+                )
+                .await;
             }
             return Err(err);
         },
@@ -685,7 +692,9 @@ where
         let mut up_done = false;
         loop {
             let incoming = if up_done {
-                tokio::time::timeout(UP_DONE_IDLE, session.recv_packet()).await.unwrap_or(Ok(None)) // 收尾窗口超时 → 会话结束
+                xray_frame::deadline::timeout(session.recv_packet(), UP_DONE_IDLE)
+                    .await
+                    .unwrap_or(Ok(None)) // 收尾窗口超时 → 会话结束
             } else {
                 tokio::select! {
                     pkt = up_rx.recv() => {

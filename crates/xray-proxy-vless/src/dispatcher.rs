@@ -30,7 +30,7 @@ use xray_common::{
     net::{address::Address, destination::Destination, network::Network, port::Port},
     uuid::UUID,
 };
-use xray_frame::LogFacade;
+use xray_frame::{LogFacade, deadline::Budget};
 use xray_transport::{
     connection::Connection,
     dialer::{StreamSettings, dial},
@@ -474,7 +474,11 @@ async fn establish_conn(
     //     包装原始连接。timeout 包裹全程：服务端黑洞（accept 后不回握手响应）
     //     时本条拨号超时报错，连接不悬挂。
     if let Some(client) = enc_client {
-        let enc_conn = match tokio::time::timeout(handshake_timeout, client.handshake(conn)).await {
+        let enc_conn = match Budget::tokio()
+            .deadline(handshake_timeout)
+            .timeout(client.handshake(conn))
+            .await
+        {
             Ok(Ok(c)) => c,
             Ok(Err(e)) => return Err(format!("vless enc handshake: {e}")),
             Err(_) => {

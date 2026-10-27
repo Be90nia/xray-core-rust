@@ -21,10 +21,8 @@ use std::{
     time::Duration,
 };
 
-use tokio::{
-    net::UdpSocket,
-    time::{Instant, timeout_at},
-};
+use tokio::net::UdpSocket;
+use xray_frame::deadline::Budget;
 
 /// UPnP SSDP 组播地址（UPnP Device Architecture 1.1 §1.2.2 固定值）。
 pub const SSDP_ADDR: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(239, 255, 255, 250), 1900);
@@ -469,10 +467,11 @@ async fn ssdp_location(
         sock.send_to(message.as_bytes(), SocketAddr::V4(search_addr)).await?;
     }
     let gateway = super::default_ipv4_gateway().ok();
-    let deadline = Instant::now() + timeout;
+    // 面 3 步 3：预算入口统一走 xray-frame Budget（Tokio 源 = tokio 虚拟钟）。
+    let deadline = Budget::tokio().deadline(timeout);
     let mut buf = vec![0u8; SSDP_BUF_LEN];
-    while Instant::now() < deadline {
-        match timeout_at(deadline, sock.recv_from(&mut buf)).await {
+    while !deadline.is_expired() {
+        match deadline.timeout(sock.recv_from(&mut buf)).await {
             Err(_) => break,
             Ok(Err(e)) => {
                 // ICMP 不可达（Windows 在无人应答时报 ECONNRESET）= 本轮没有可用响应；
