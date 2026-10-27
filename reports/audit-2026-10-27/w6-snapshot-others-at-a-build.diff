@@ -1,0 +1,622 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 9dde71a5..8b0c4b38 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5672,6 +5672,7 @@ dependencies = [
+  "xray-buf",
+  "xray-common",
+  "xray-features",
++ "xray-frame",
+  "xray-geodata",
+  "xray-tls",
+  "xray-transport",
+diff --git a/crates/xray-app-dns/Cargo.toml b/crates/xray-app-dns/Cargo.toml
+index 3c545171..530cce46 100644
+--- a/crates/xray-app-dns/Cargo.toml
++++ b/crates/xray-app-dns/Cargo.toml
+@@ -30,6 +30,9 @@ udf-skeleton = { path = "../udf-frame/skeleton" }
+ # P1-11：spawn 托管面走 udf skeleton_infra::fx::FxScope（坑约束 5）。path 形态同
+ # udf-skeleton（udf-frame 仓内工作副本即改即用；CI 由 fetch-udf 拉料，不锁 rev）。
+ udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio"] }
++# W4 面 3（能力收敛方案 §2）：tokio 虚拟钟预算统一走 xray_frame::deadline::Budget
++#（Budget::tokio() 保 advance 语义；依赖方向 = 血肉→骨架，xray-frame 零 app 依赖，无环）。
++xray-frame = { path = "../xray-frame" }
+ tokio-rustls.workspace = true
+ h2.workspace = true
+ http.workspace = true
+diff --git a/crates/xray-app-dns/src/nameserver/doh.rs b/crates/xray-app-dns/src/nameserver/doh.rs
+index 1b377053..09ffbb09 100644
+--- a/crates/xray-app-dns/src/nameserver/doh.rs
++++ b/crates/xray-app-dns/src/nameserver/doh.rs
+@@ -22,7 +22,7 @@ use h2::client;
+ use hickory_proto::rr::RecordType;
+ use http::{Method, Request, StatusCode, header::CONTENT_TYPE};
+ use skeleton_infra::fx::{FxScope, ScopeClosed};
+-use tokio::time::timeout_at;
++use xray_frame::deadline::Budget;
+ use tokio_rustls::rustls::ClientConfig;
+ use xray_common::net::{destination::Destination, port::Port};
+ use xray_tls::utls::client as tls_client;
+@@ -219,25 +219,20 @@ impl DohNameServer {
+ 
+         // bd ezrg4：兜底 deadline 在查询入口算一次（Go nameserver_doh.go:167-172
+         // 绝对时刻），dial/TLS/h2/response 共享，慢握手不推出新预算。
+-        #[allow(
+-            clippy::disallowed_methods,
+-            reason = "713x6 语义判定：tokio 虚拟钟超时预算面（timeout_at 共享绝对 deadline，pause 可推进）——Clock 契约无 tokio 面，std/tokio 禁混换故保持 tokio 取时"
+-        )]
+-        let deadline = tokio::time::Instant::now() + self.query_timeout;
++        // W4 面 3：取时统一走 Budget::tokio()（Tokio 源内部 = tokio Instant，
++        // pause/advance 语义不变）。
++        let deadline = Budget::tokio().deadline(self.query_timeout);
+ 
+         // 经路由出站或直连兜底（域名每查询现解析）——Go dohnameserver.go:68
+         // dispatcher.Dispatch 语义。connect_stream 内部仍按单次拨号计预算，
+         // 总量由外层整查询 deadline 封顶。
+-        let stream = timeout_at(
+-            deadline,
+-            crate::dial::connect_stream(
+-                &self.dest,
+-                self.resolver.as_ref(),
+-                self.query_timeout,
+-                "doh",
+-                self.force_local,
+-            ),
+-        )
++        let stream = deadline.timeout(crate::dial::connect_stream(
++            &self.dest,
++            self.resolver.as_ref(),
++            self.query_timeout,
++            "doh",
++            self.force_local,
++        ))
+         .await
+         .map_err(|_| {
+             tracing::debug!(target: "xray.dns.doh", "doh: dial TIMEOUT (query deadline)");
+@@ -247,7 +242,7 @@ impl DohNameServer {
+         // TLS 握手（h2c 明文跳过）+ HTTP/2 handshake。
+         tracing::debug!(target: "xray.dns.doh", "doh: stream connected");
+         let (mut h2, h2_conn): (_, Pin<Box<dyn Future<Output = ()> + Send>>) = if self.plain_h2c {
+-            let (h2, conn) = timeout_at(deadline, client::handshake(stream))
++            let (h2, conn) = deadline.timeout(client::handshake(stream))
+                 .await
+                 .map_err(|_| DnsError::WireFormat("doh h2c handshake timeout".to_string()))?
+                 .map_err(|e| DnsError::WireFormat(format!("doh h2c handshake: {e}")))?;
+@@ -258,10 +253,7 @@ impl DohNameServer {
+                 }),
+             )
+         } else {
+-            let tls_stream = timeout_at(
+-                deadline,
+-                tls_client(stream, &self.server_name, Arc::clone(&self.tls_config)),
+-            )
++            let tls_stream = deadline.timeout(tls_client(stream, &self.server_name, Arc::clone(&self.tls_config)))
+             .await
+             .map_err(|_| {
+                 tracing::debug!(target: "xray.dns.doh", "doh: TLS handshake TIMEOUT");
+@@ -270,7 +262,7 @@ impl DohNameServer {
+             .map_err(|e| DnsError::WireFormat(format!("doh tls handshake: {e}")))?;
+             tracing::debug!(target: "xray.dns.doh", alpn = ?tls_stream.alpn_protocol(),
+                 "doh: tls established");
+-            let (h2, conn) = timeout_at(deadline, client::handshake(tls_stream))
++            let (h2, conn) = deadline.timeout(client::handshake(tls_stream))
+                 .await
+                 .map_err(|_| {
+                     tracing::debug!(target: "xray.dns.doh", "doh: h2 handshake TIMEOUT");
+@@ -293,7 +285,7 @@ impl DohNameServer {
+             .map_err(|_: ScopeClosed| DnsError::WireFormat("doh: fx scope closed".to_string()))?;
+ 
+         // 等待 h2 连接 ready（ready 消费 self 后返回 ready 态的 SendRequest）。
+-        h2 = timeout_at(deadline, h2.ready())
++        h2 = deadline.timeout(h2.ready())
+             .await
+             .map_err(|_| {
+                 tracing::debug!(target: "xray.dns.doh", "doh: h2 ready TIMEOUT");
+@@ -329,7 +321,7 @@ impl DohNameServer {
+         tracing::debug!(target: "xray.dns.doh", "doh: body sent");
+ 
+         // 读 HTTP 响应。
+-        let response = timeout_at(deadline, resp_future)
++        let response = deadline.timeout(resp_future)
+             .await
+             .map_err(|_| {
+                 tracing::debug!(target: "xray.dns.doh", "doh: response TIMEOUT ({}ms)",
+@@ -348,7 +340,7 @@ impl DohNameServer {
+         let mut body = response.into_body();
+         let mut buf = Vec::new();
+         loop {
+-            match timeout_at(deadline, body.data()).await {
++            match deadline.timeout(body.data()).await {
+                 Ok(Some(chunk)) => {
+                     let chunk =
+                         chunk.map_err(|e| DnsError::WireFormat(format!("doh body: {e}")))?;
+diff --git a/crates/xray-app-dns/src/nameserver/dot.rs b/crates/xray-app-dns/src/nameserver/dot.rs
+index 8563a83f..d3ff52fe 100644
+--- a/crates/xray-app-dns/src/nameserver/dot.rs
++++ b/crates/xray-app-dns/src/nameserver/dot.rs
+@@ -18,10 +18,8 @@ use std::{future::Future, io, net::IpAddr, pin::Pin, sync::Arc, time::Duration};
+ 
+ use hickory_proto::rr::RecordType;
+ use skeleton_infra::fx::FxScope;
+-use tokio::{
+-    io::{AsyncReadExt, AsyncWriteExt},
+-    time::timeout_at,
+-};
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use xray_frame::deadline::{Budget, BudgetDeadline};
+ use tokio_rustls::rustls::ClientConfig;
+ use xray_common::net::{destination::Destination, port::Port};
+ use xray_tls::utls::client as tls_client;
+@@ -143,26 +141,20 @@ impl DotNameServer {
+     /// 内部 `connect_stream` 仍按单次拨号计 `query_timeout`，总量由外层封顶。
+     async fn connect_tls(
+         &self,
+-        deadline: tokio::time::Instant,
++        deadline: BudgetDeadline,
+     ) -> Result<xray_tls::utls::Conn<DotStream>, DnsError> {
+-        let stream = timeout_at(
+-            deadline,
+-            crate::dial::connect_stream(
+-                &self.dest,
+-                self.resolver.as_ref(),
+-                self.query_timeout,
+-                "dot",
+-                self.force_local,
+-            ),
+-        )
++        let stream = deadline.timeout(crate::dial::connect_stream(
++            &self.dest,
++            self.resolver.as_ref(),
++            self.query_timeout,
++            "dot",
++            self.force_local,
++        ))
+         .await
+         .map_err(|_| {
+             DnsError::WireFormat(format!("dot dial timeout after {:?}", self.query_timeout))
+         })??;
+-        let tls = timeout_at(
+-            deadline,
+-            tls_client(stream, &self.server_name, Arc::clone(&self.tls_config)),
+-        )
++        let tls = deadline.timeout(tls_client(stream, &self.server_name, Arc::clone(&self.tls_config)))
+         .await
+         .map_err(|_| DnsError::WireFormat("dot tls handshake timeout".to_string()))?
+         .map_err(|e| DnsError::WireFormat(format!("dot tls handshake: {e}")))?;
+@@ -178,25 +170,25 @@ impl DotNameServer {
+         payload: &[u8],
+         req_id: u16,
+         record_type: RecordType,
+-        deadline: tokio::time::Instant,
++        deadline: BudgetDeadline,
+     ) -> Result<IpRecord, DnsError> {
+         // 写长度前缀 + payload。
+-        timeout_at(deadline, stream.write_all(len_be))
++        deadline.timeout(stream.write_all(len_be))
+             .await
+             .map_err(|_| DnsError::WireFormat("dot write len timeout".to_string()))?
+             .map_err(|e| DnsError::WireFormat(format!("dot write len: {e}")))?;
+-        timeout_at(deadline, stream.write_all(payload))
++        deadline.timeout(stream.write_all(payload))
+             .await
+             .map_err(|_| DnsError::WireFormat("dot write payload timeout".to_string()))?
+             .map_err(|e| DnsError::WireFormat(format!("dot write payload: {e}")))?;
+-        timeout_at(deadline, stream.flush())
++        deadline.timeout(stream.flush())
+             .await
+             .map_err(|_| DnsError::WireFormat("dot flush timeout".to_string()))?
+             .map_err(io_to_dns)?;
+ 
+         // 读 2 字节长度前缀。
+         let mut len_buf = [0u8; 2];
+-        timeout_at(deadline, stream.read_exact(&mut len_buf))
++        deadline.timeout(stream.read_exact(&mut len_buf))
+             .await
+             .map_err(|_| DnsError::WireFormat("dot read len timeout".to_string()))?
+             .map_err(|e| DnsError::WireFormat(format!("dot read len: {e}")))?;
+@@ -207,7 +199,7 @@ impl DotNameServer {
+ 
+         // 读响应 payload。
+         let mut buf = vec![0u8; resp_len];
+-        timeout_at(deadline, stream.read_exact(&mut buf))
++        deadline.timeout(stream.read_exact(&mut buf))
+             .await
+             .map_err(|_| DnsError::WireFormat("dot read payload timeout".to_string()))?
+             .map_err(|e| DnsError::WireFormat(format!("dot read payload: {e}")))?;
+@@ -224,7 +216,7 @@ impl DotNameServer {
+         &self,
+         fqdn: &str,
+         record_type: RecordType,
+-        deadline: tokio::time::Instant,
++        deadline: BudgetDeadline,
+     ) -> Result<IpRecord, DnsError> {
+         let req_id = self.id_gen.next_id();
+         let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
+@@ -253,13 +245,7 @@ impl DotNameServer {
+             Err(e) => {
+                 // 整条查询 deadline 已耗尽（本段超时）→ 重连必然立即失败，且会用
+                 // 拨号/握手错误掩盖真正原因：直接返回首查错误（Go 本无重试）。
+-                #[allow(
+-                    clippy::disallowed_methods,
+-                    reason = "713x6 语义判定：tokio 虚拟钟预算剩余判定（与 timeout_at 同面，pause 可推进）——Clock 契约无 tokio 面，std/tokio 禁混换故保持 tokio 取时"
+-                )]
+-                if tokio::time::Instant::now() >= deadline {
+-                    return Err(e);
+-                }
++                if deadline.is_expired() {
+                 // 首查失败静默重连不可观测（iq1o）：记录首查错误再重试。
+                 tracing::debug!(error = %e, "DoT query on pooled connection failed, reconnecting");
+                 *conn_guard = None;
+@@ -289,11 +275,9 @@ impl CachedNameserver for DotNameServer {
+         // bd 2iauj：整条查询只算一次绝对 deadline（Go nameserver_tcp.go:124-129
+         // 入口算一次、:151 每个 req 复用；DoT 走同一 TCP 语义）——A/AAAA、
+         // 拨号、TLS 握手、写、读、重试共享。
+-        #[allow(
+-            clippy::disallowed_methods,
+-            reason = "713x6 语义判定：tokio 虚拟钟超时预算面（timeout_at 共享绝对 deadline，pause 可推进）——Clock 契约无 tokio 面，std/tokio 禁混换故保持 tokio 取时"
+-        )]
+-        let deadline = tokio::time::Instant::now() + self.query_timeout;
++        // W4 面 3：取时统一走 Budget::tokio()（Tokio 源内部 = tokio Instant，
++        // pause/advance 语义不变）。
++        let deadline = Budget::tokio().deadline(self.query_timeout);
+ 
+         if option.ipv4_enable {
+             match self.query_once(fqdn, RecordType::A, deadline).await {
+diff --git a/crates/xray-app-dns/src/nameserver/quic.rs b/crates/xray-app-dns/src/nameserver/quic.rs
+index cadc6374..5f4775aa 100644
+--- a/crates/xray-app-dns/src/nameserver/quic.rs
++++ b/crates/xray-app-dns/src/nameserver/quic.rs
+@@ -23,7 +23,7 @@ use std::{
+ use hickory_proto::rr::RecordType;
+ use quinn::{ClientConfig as QuinnClientConfig, Endpoint, crypto::rustls::QuicClientConfig};
+ use skeleton_infra::fx::FxScope;
+-use tokio::time::timeout_at;
++use xray_frame::deadline::{Budget, BudgetDeadline};
+ use tokio_rustls::rustls::ClientConfig;
+ use xray_common::net::address::Address;
+ 
+@@ -151,7 +151,7 @@ impl DoqNameServer {
+         &self,
+         fqdn: &str,
+         record_type: RecordType,
+-        deadline: tokio::time::Instant,
++        deadline: BudgetDeadline,
+     ) -> Result<IpRecord, DnsError> {
+         let req_id = self.id_gen.next_id();
+         let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
+@@ -172,7 +172,7 @@ impl DoqNameServer {
+         let connect_fut = endpoint
+             .connect(self.addr, &self.server_name)
+             .map_err(|e| DnsError::WireFormat(format!("doq connect initiate: {e}")))?;
+-        let conn = timeout_at(deadline, connect_fut)
++        let conn = deadline.timeout(connect_fut)
+             .await
+             .map_err(|_| {
+                 DnsError::WireFormat(format!("doq connect timeout after {:?}", self.query_timeout))
+@@ -180,17 +180,17 @@ impl DoqNameServer {
+             .map_err(|e| DnsError::WireFormat(format!("doq connect: {e}")))?;
+ 
+         // open bidirectional stream。
+-        let (mut send, mut recv) = timeout_at(deadline, conn.open_bi())
++        let (mut send, mut recv) = deadline.timeout(conn.open_bi())
+             .await
+             .map_err(|_| DnsError::WireFormat("doq open_bi timeout".to_string()))?
+             .map_err(|e| DnsError::WireFormat(format!("doq open_bi: {e}")))?;
+ 
+         // 写 2B 长度前缀 + payload。
+-        timeout_at(deadline, send.write_all(&len_be))
++        deadline.timeout(send.write_all(&len_be))
+             .await
+             .map_err(|_| DnsError::WireFormat("doq write len timeout".to_string()))?
+             .map_err(|e| DnsError::WireFormat(format!("doq write len: {e}")))?;
+-        timeout_at(deadline, send.write_all(&payload))
++        deadline.timeout(send.write_all(&payload))
+             .await
+             .map_err(|_| DnsError::WireFormat("doq write payload timeout".to_string()))?
+             .map_err(|e| DnsError::WireFormat(format!("doq write payload: {e}")))?;
+@@ -199,7 +199,7 @@ impl DoqNameServer {
+ 
+         // 读 2 字节长度前缀。
+         let mut len_buf = [0u8; 2];
+-        timeout_at(deadline, recv.read_exact(&mut len_buf))
++        deadline.timeout(recv.read_exact(&mut len_buf))
+             .await
+             .map_err(|_| DnsError::WireFormat("doq read len timeout".to_string()))?
+             .map_err(|e| DnsError::WireFormat(format!("doq read len: {e:?}")))?;
+@@ -210,7 +210,7 @@ impl DoqNameServer {
+ 
+         // 读响应 payload。
+         let mut buf = vec![0u8; resp_len];
+-        timeout_at(deadline, recv.read_exact(&mut buf))
++        deadline.timeout(recv.read_exact(&mut buf))
+             .await
+             .map_err(|_| DnsError::WireFormat("doq read payload timeout".to_string()))?
+             .map_err(|e| DnsError::WireFormat(format!("doq read payload: {e}")))?;
+@@ -232,11 +232,9 @@ impl CachedNameserver for DoqNameServer {
+ 
+         // bd 2iauj：整条查询只算一次绝对 deadline（Go nameserver_quic.go:93-98
+         // 在 sendQuery 入口算 `deadline`，:119 每个 req 用同一时刻）。
+-        #[allow(
+-            clippy::disallowed_methods,
+-            reason = "713x6 语义判定：tokio 虚拟钟超时预算面（timeout_at 共享绝对 deadline，pause 可推进）——Clock 契约无 tokio 面，std/tokio 禁混换故保持 tokio 取时"
+-        )]
+-        let deadline = tokio::time::Instant::now() + self.query_timeout;
++        // W4 面 3：取时统一走 Budget::tokio()（Tokio 源内部 = tokio Instant，
++        // pause/advance 语义不变）。
++        let deadline = Budget::tokio().deadline(self.query_timeout);
+ 
+         if option.ipv4_enable {
+             match self.query_once(fqdn, RecordType::A, deadline).await {
+diff --git a/crates/xray-app-dns/src/nameserver/tcp.rs b/crates/xray-app-dns/src/nameserver/tcp.rs
+index 415e0ac1..67b9fc6a 100644
+--- a/crates/xray-app-dns/src/nameserver/tcp.rs
++++ b/crates/xray-app-dns/src/nameserver/tcp.rs
+@@ -17,10 +17,8 @@ use std::{future::Future, io, net::IpAddr, pin::Pin, sync::Arc, time::Duration};
+ 
+ use hickory_proto::rr::RecordType;
+ use skeleton_infra::fx::FxScope;
+-use tokio::{
+-    io::{AsyncReadExt, AsyncWriteExt},
+-    time::timeout_at,
+-};
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use xray_frame::deadline::{Budget, BudgetDeadline};
+ use xray_common::net::{destination::Destination, port::Port};
+ 
+ use crate::{
+@@ -129,18 +127,15 @@ impl TcpNameServer {
+     /// 单次拨号计 `query_timeout`，总量由外层 deadline 封顶。
+     async fn connect(
+         &self,
+-        deadline: tokio::time::Instant,
++        deadline: BudgetDeadline,
+     ) -> Result<crate::dial::DnsStream, DnsError> {
+-        timeout_at(
+-            deadline,
+-            crate::dial::connect_stream(
+-                &self.dest,
+-                self.resolver.as_ref(),
+-                self.query_timeout,
+-                "tcp",
+-                self.force_local,
+-            ),
+-        )
++        deadline.timeout(crate::dial::connect_stream(
++            &self.dest,
++            self.resolver.as_ref(),
++            self.query_timeout,
++            "tcp",
++            self.force_local,
++        ))
+         .await
+         .map_err(|_| {
+             DnsError::WireFormat(format!("tcp dial timeout after {:?}", self.query_timeout))
+@@ -156,23 +151,23 @@ impl TcpNameServer {
+         payload: &[u8],
+         req_id: u16,
+         record_type: RecordType,
+-        deadline: tokio::time::Instant,
++        deadline: BudgetDeadline,
+     ) -> Result<IpRecord, DnsError> {
+-        timeout_at(deadline, stream.write_all(len_be))
++        deadline.timeout(stream.write_all(len_be))
+             .await
+             .map_err(|_| DnsError::WireFormat("tcp write len timeout".to_string()))?
+             .map_err(|e| DnsError::WireFormat(format!("tcp write len: {e}")))?;
+-        timeout_at(deadline, stream.write_all(payload))
++        deadline.timeout(stream.write_all(payload))
+             .await
+             .map_err(|_| DnsError::WireFormat("tcp write payload timeout".to_string()))?
+             .map_err(|e| DnsError::WireFormat(format!("tcp write payload: {e}")))?;
+-        timeout_at(deadline, stream.flush())
++        deadline.timeout(stream.flush())
+             .await
+             .map_err(|_| DnsError::WireFormat("tcp flush timeout".to_string()))?
+             .map_err(io_to_dns)?;
+ 
+         let mut len_buf = [0u8; 2];
+-        timeout_at(deadline, stream.read_exact(&mut len_buf))
++        deadline.timeout(stream.read_exact(&mut len_buf))
+             .await
+             .map_err(|_| DnsError::WireFormat("tcp read len timeout".to_string()))?
+             .map_err(|e| DnsError::WireFormat(format!("tcp read len: {e}")))?;
+@@ -182,7 +177,7 @@ impl TcpNameServer {
+         }
+ 
+         let mut buf = vec![0u8; resp_len];
+-        timeout_at(deadline, stream.read_exact(&mut buf))
++        deadline.timeout(stream.read_exact(&mut buf))
+             .await
+             .map_err(|_| DnsError::WireFormat("tcp read payload timeout".to_string()))?
+             .map_err(|e| DnsError::WireFormat(format!("tcp read payload: {e}")))?;
+@@ -199,7 +194,7 @@ impl TcpNameServer {
+         &self,
+         fqdn: &str,
+         record_type: RecordType,
+-        deadline: tokio::time::Instant,
++        deadline: BudgetDeadline,
+     ) -> Result<IpRecord, DnsError> {
+         let req_id = self.id_gen.next_id();
+         let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
+@@ -237,13 +232,7 @@ impl TcpNameServer {
+             Err(e) => {
+                 // 整条查询 deadline 已耗尽（本段超时）→ 重连必然立即失败，且会用
+                 // 拨号错误掩盖真正的原因：直接返回首查错误（Go 本无重试）。
+-                #[allow(
+-                    clippy::disallowed_methods,
+-                    reason = "713x6 语义判定：tokio 虚拟钟预算剩余判定（与 timeout_at 同面，pause 可推进）——Clock 契约无 tokio 面，std/tokio 禁混换故保持 tokio 取时"
+-                )]
+-                if tokio::time::Instant::now() >= deadline {
+-                    return Err(e);
+-                }
++                if deadline.is_expired() {
+                 // 首查失败静默重连不可观测（iq1o）：记录首查错误再重试。
+                 tracing::debug!(error = %e, "DNS-over-TCP query on pooled connection failed, reconnecting");
+                 *conn_guard = None;
+@@ -273,11 +262,9 @@ impl CachedNameserver for TcpNameServer {
+         // bd 2iauj：整条查询只算一次绝对 deadline（Go nameserver_tcp.go:124-129
+         // 在 sendQuery 入口算 `deadline`，:151 每个 req 用同一时刻）——A/AAAA、
+         // 拨号、写、读、重试共享，慢阶段不推出新预算。
+-        #[allow(
+-            clippy::disallowed_methods,
+-            reason = "713x6 语义判定：tokio 虚拟钟超时预算面（timeout_at 共享绝对 deadline，pause 可推进）——Clock 契约无 tokio 面，std/tokio 禁混换故保持 tokio 取时"
+-        )]
+-        let deadline = tokio::time::Instant::now() + self.query_timeout;
++        // W4 面 3：取时统一走 Budget::tokio()（Tokio 源内部 = tokio Instant，
++        // pause/advance 语义不变）。
++        let deadline = Budget::tokio().deadline(self.query_timeout);
+ 
+         if option.ipv4_enable {
+             match self.query_once(fqdn, RecordType::A, deadline).await {
+diff --git a/crates/xray-app-dns/src/nameserver/udp.rs b/crates/xray-app-dns/src/nameserver/udp.rs
+index 8f3cbee3..3284bcdd 100644
+--- a/crates/xray-app-dns/src/nameserver/udp.rs
++++ b/crates/xray-app-dns/src/nameserver/udp.rs
+@@ -17,7 +17,8 @@ use std::{future::Future, net::IpAddr, pin::Pin, sync::Arc, time::Duration};
+ 
+ use hickory_proto::rr::RecordType;
+ use skeleton_infra::fx::FxScope;
+-use tokio::{net::UdpSocket, time::timeout_at};
++use tokio::net::UdpSocket;
++use xray_frame::deadline::{Budget, BudgetDeadline};
+ use xray_common::net::{destination::Destination, port::Port};
+ 
+ use crate::{
+@@ -137,7 +138,7 @@ impl UdpNameServer {
+         &self,
+         fqdn: &str,
+         record_type: RecordType,
+-        deadline: tokio::time::Instant,
++        deadline: BudgetDeadline,
+     ) -> Result<IpRecord, DnsError> {
+         let req_id = self.id_gen.next_id();
+         let wire = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
+@@ -148,17 +149,17 @@ impl UdpNameServer {
+         // dispatcher 语义，防 DNS 查询经路由进 proxy（bd wmdn②）。
+         let dialer = if self.force_local { None } else { crate::dial::shared_dialer() };
+         if let Some(dialer) = dialer {
+-            let mut session = timeout_at(deadline, dialer.dial_udp(&self.dest))
++            let mut session = deadline.timeout(dialer.dial_udp(&self.dest))
+                 .await
+                 .map_err(|_| {
+                     DnsError::WireFormat(format!("udp dial timeout after {:?}", self.query_timeout))
+                 })?
+                 .map_err(|e| DnsError::WireFormat(format!("udp dial: {e}")))?;
+-            timeout_at(deadline, session.send_packet(&self.dest, &wire))
++            deadline.timeout(session.send_packet(&self.dest, &wire))
+                 .await
+                 .map_err(|_| DnsError::WireFormat("udp dial send timeout".to_string()))?
+                 .map_err(|e| DnsError::WireFormat(format!("udp dial send: {e}")))?;
+-            let resp = timeout_at(deadline, session.recv_packet())
++            let resp = deadline.timeout(session.recv_packet())
+                 .await
+                 .map_err(|_| {
+                     DnsError::WireFormat(format!(
+@@ -180,10 +181,7 @@ impl UdpNameServer {
+         }
+ 
+         // 直连兜底：IP 直发；域名每查询现解析（bd mcpo 运行期解析）。
+-        let sock_addr = timeout_at(
+-            deadline,
+-            crate::dial::resolve_dest_addr(&self.dest, self.resolver.as_ref()),
+-        )
++        let sock_addr = deadline.timeout(crate::dial::resolve_dest_addr(&self.dest, self.resolver.as_ref()))
+         .await
+         .map_err(|_| DnsError::WireFormat("udp resolve timeout".to_string()))?
+         .map_err(|e| DnsError::WireFormat(format!("udp resolve: {e}")))?;
+@@ -198,14 +196,14 @@ impl UdpNameServer {
+         let sock = UdpSocket::bind("0.0.0.0:0")
+             .await
+             .map_err(|e| DnsError::WireFormat(format!("udp bind: {e}")))?;
+-        timeout_at(deadline, sock.send_to(&wire, sock_addr))
++        deadline.timeout(sock.send_to(&wire, sock_addr))
+             .await
+             .map_err(|_| DnsError::WireFormat("udp send timeout".to_string()))?
+             .map_err(|e| DnsError::WireFormat(format!("udp send: {e}")))?;
+ 
+         // 栈上收包缓冲（4 KiB）：免每查询堆分配（NF-7）。
+         let mut buf = [0u8; UDP_RECV_BUF];
+-        let n = timeout_at(deadline, sock.recv(&mut buf))
++        let n = deadline.timeout(sock.recv(&mut buf))
+             .await
+             .map_err(|_| {
+                 DnsError::WireFormat(format!("udp recv timeout after {:?}", self.query_timeout))
+@@ -232,7 +230,7 @@ impl UdpNameServer {
+         &self,
+         fqdn: &str,
+         record_type: RecordType,
+-        deadline: tokio::time::Instant,
++        deadline: BudgetDeadline,
+     ) -> Result<IpRecord, DnsError> {
+         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+ 
+@@ -245,16 +243,13 @@ impl UdpNameServer {
+             .to_be_bytes();
+ 
+         // 经路由出站或直连兜底（域名每查询现解析）——与 TCP NS 同一拨号路径。
+-        let mut stream = timeout_at(
+-            deadline,
+-            crate::dial::connect_stream(
+-                &self.dest,
+-                self.resolver.as_ref(),
+-                self.query_timeout,
+-                "udp-tcp-fallback",
+-                self.force_local,
+-            ),
+-        )
++        let mut stream = deadline.timeout(crate::dial::connect_stream(
++            &self.dest,
++            self.resolver.as_ref(),
++            self.query_timeout,
++            "udp-tcp-fallback",
++            self.force_local,
++        ))
+         .await
+         .map_err(|_| {
+             DnsError::WireFormat(format!(
+@@ -263,18 +258,18 @@ impl UdpNameServer {
+             ))
+         })??;
+ 
+-        timeout_at(deadline, stream.write_all(&len_be))
++        deadline.timeout(stream.write_all(&len_be))
+             .await
+             .map_err(|_| DnsError::WireFormat("tcp fallback write len timeout".into()))?
+             .map_err(|e| DnsError::WireFormat(format!("tcp fallback write len: {e}")))?;
+-        timeout_at(deadline, stream.write_all(&payload))
++        deadline.timeout(stream.write_all(&payload))
+             .await
+             .map_err(|_| DnsError::WireFormat("tcp fallback write payload timeout".into()))?
+             .map_err(|e| DnsError::WireFormat(format!("tcp fallback write payload: {e}")))?;
+ 
+         // 读 2B 长度前缀。
+         let mut len_buf = [0u8; 2];
+-        timeout_at(deadline, stream.read_exact(&mut len_buf))
++        deadline.timeout(stream.read_exact(&mut len_buf))
+             .await
+             .map_err(|_| DnsError::WireFormat("tcp fallback read len timeout".into()))?
+             .map_err(|e| DnsError::WireFormat(format!("tcp fallback read len: {e}")))?;
+@@ -286,7 +281,7 @@ impl UdpNameServer {
+         }
+ 
+         let mut resp_buf = vec![0u8; resp_len];
+-        timeout_at(deadline, stream.read_exact(&mut resp_buf))
++        deadline.timeout(stream.read_exact(&mut resp_buf))
+             .await
+             .map_err(|_| DnsError::WireFormat("tcp fallback read response timeout".into()))?
+             .map_err(|e| DnsError::WireFormat(format!("tcp fallback read response: {e}")))?;
+@@ -310,11 +305,9 @@ impl CachedNameserver for UdpNameServer {
+         // bd 2iauj：整条查询只算一次绝对 deadline（Go 语义 = 上层
+         // nameserver.go:183 `WithTimeout(ctx, c.timeoutMs)` 一个时刻覆盖整条查询；
+         // nameserver_udp.go:161-189 的 dispatch 与响应等待都在该预算内）。
+-        #[allow(
+-            clippy::disallowed_methods,
+-            reason = "713x6 语义判定：tokio 虚拟钟超时预算面（timeout_at 共享绝对 deadline，pause 可推进）——Clock 契约无 tokio 面，std/tokio 禁混换故保持 tokio 取时"
+-        )]
+-        let deadline = tokio::time::Instant::now() + self.query_timeout;
++        // W4 面 3：取时统一走 Budget::tokio()（Tokio 源内部 = tokio Instant，
++        // pause/advance 语义不变）。
++        let deadline = Budget::tokio().deadline(self.query_timeout);
+ 
+         // 顺序发起 A/AAAA。
+         // ponytail: 串行 await。真正并行需 tokio::join! 或 JoinSet，业务上串行也能完成

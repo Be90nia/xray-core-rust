@@ -1,0 +1,15 @@
+Exception in thread Thread-5 (_writerthread):
+Traceback (most recent call last):
+  File "D:\Program Files\Python 3.14\Lib\threading.py", line 1082, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "D:\Program Files\Python 3.14\Lib\threading.py", line 1024, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Program Files\Python 3.14\Lib\subprocess.py", line 1619, in _writerthread
+    self._stdin_write(input)
+    ~~~~~~~~~~~~~~~~~^^^^^^^
+  File "D:\Program Files\Python 3.14\Lib\subprocess.py", line 1155, in _stdin_write
+    self.stdin.write(input)
+    ~~~~~~~~~~~~~~~~^^^^^^^
+TypeError: a bytes-like object is required, not 'str'

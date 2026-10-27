@@ -1,0 +1,133 @@
+{
+ "tool": "tools/ab_gate.py",
+ "utc": "20261027T160114Z",
+ "tag": "aa-minvless",
+ "hostname": "DESKTOP-G6MJ6S3",
+ "a": {
+  "path": "D:\\Project\\Xray-core-rust\\target\\release\\xray.exe",
+  "sha256": "d5c5e2f45b135e270915ee8ba351ed105f409db2259fd45d42a218239295f783",
+  "rounds": [
+   293.22,
+   290.7,
+   267.52
+  ],
+  "median": 290.7,
+  "mad": 2.52,
+  "iqr": 12.85,
+  "spread": 0.0884
+ },
+ "b": {
+  "path": "D:\\Project\\Xray-core-rust\\target\\release\\xray.exe",
+  "sha256": "d5c5e2f45b135e270915ee8ba351ed105f409db2259fd45d42a218239295f783",
+  "rounds": [
+   281.62,
+   268.86,
+   287.12
+  ],
+  "median": 281.62,
+  "mad": 5.5,
+  "iqr": 9.13,
+  "spread": 0.0648
+ },
+ "rounds_detail": [
+  {
+   "round": 1,
+   "side": "A",
+   "mbps": 293.22,
+   "wall_s": 6.5,
+   "load": {
+    "ts": "2026-10-27T16:00:38Z",
+    "compilers": {
+     "cargo.exe": 0,
+     "rustc.exe": 0,
+     "cl.exe": 0
+    },
+    "err": []
+   }
+  },
+  {
+   "round": 1,
+   "side": "B",
+   "mbps": 281.62,
+   "wall_s": 6.5,
+   "load": {
+    "ts": "2026-10-27T16:00:45Z",
+    "compilers": {
+     "cargo.exe": 0,
+     "rustc.exe": 0,
+     "cl.exe": 0
+    },
+    "err": []
+   }
+  },
+  {
+   "round": 2,
+   "side": "A",
+   "mbps": 290.7,
+   "wall_s": 6.5,
+   "load": {
+    "ts": "2026-10-27T16:00:52Z",
+    "compilers": {
+     "cargo.exe": 0,
+     "rustc.exe": 0,
+     "cl.exe": 0
+    },
+    "err": []
+   }
+  },
+  {
+   "round": 2,
+   "side": "B",
+   "mbps": 268.86,
+   "wall_s": 6.6,
+   "load": {
+    "ts": "2026-10-27T16:00:59Z",
+    "compilers": {
+     "cargo.exe": 0,
+     "rustc.exe": 0,
+     "cl.exe": 0
+    },
+    "err": []
+   }
+  },
+  {
+   "round": 3,
+   "side": "A",
+   "mbps": 267.52,
+   "wall_s": 6.6,
+   "load": {
+    "ts": "2026-10-27T16:01:06Z",
+    "compilers": {
+     "cargo.exe": 0,
+     "rustc.exe": 0,
+     "cl.exe": 0
+    },
+    "err": []
+   }
+  },
+  {
+   "round": 3,
+   "side": "B",
+   "mbps": 287.12,
+   "wall_s": 6.5,
+   "load": {
+    "ts": "2026-10-27T16:01:14Z",
+    "compilers": {
+     "cargo.exe": 0,
+     "rustc.exe": 0,
+     "cl.exe": 0
+    },
+    "err": []
+   }
+  }
+ ],
+ "ratio_median": 0.9688,
+ "tol": 0.05,
+ "verdict": "PASS",
+ "contaminated": false,
+ "contamination_reason": [],
+ "compilers_seen_during_run": [],
+ "forced": false,
+ "preflight_compilers": [],
+ "scenario": "自建裸 vless+tcp loopback (200MB×2 curl 均值)"
+}

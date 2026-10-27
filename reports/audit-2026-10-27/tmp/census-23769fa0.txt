@@ -1,0 +1,346 @@
+# L3 台账普查  ref=23769fa0  crates/*.rs=821（排除 udf-frame）
+TOTAL 属性数 = 568   生产面 = 207   测试面 = 361
+
+## 形态 × 面别矩阵
+  outer(per-site #[..])      prod= 192  test= 249
+  inner(文件顶 #![..])          prod=  15  test= 112
+  # 口径A（ledger-audit 458 同源）= 仅 outer per-site = 441
+  # 口径B（含文件顶 inner）= 全量 = 568
+
+## 生产面 top crate
+    31  xray-transport
+    28  xray-transport-splithttp
+    21  xray-stress
+    19  xray-transport-hysteria
+    13  xray-cli
+    12  xray-proxy-vless
+    11  xray-core
+    11  xray-mux
+     8  xray-transport-websocket
+     6  xray-proxy-tun
+     6  xray-transport-naive
+     5  xray-app-dispatcher
+     5  xray-transport-quic
+     4  xray-proxy-tuic
+     4  xray-transport-httpupgrade
+     3  xray-common
+     3  xray-proxy-vmess
+     3  xray-transport-kcp
+     2  xray-app-metrics
+     2  xray-app-reverse
+     2  xray-reality
+     1  xray-app-stats
+     1  xray-frame
+     1  xray-geodata
+     1  xray-proto
+     1  xray-proxy-anytls
+     1  xray-proxy-ss
+     1  xray-tls
+     1  xray-transport-grpc
+
+## 测试面 crate（非零）
+    75  xray-transport
+    32  xray-transport-websocket
+    17  xray-app-geodata
+    17  xray-mux
+    17  xray-reality
+    16  xray-tls
+    16  xray-transport-httpupgrade
+    13  xray-transport-kcp
+    11  xray-transport-quic
+     9  xray-app-dns
+     8  xray-proxy-anytls
+     7  xray-proxy-tuic
+     6  xray-proxy-freedom
+     6  xray-proxy-ss
+     6  xray-transport-splithttp
+     6  xray-transport-tcp
+     5  xray-proxy-trojan
+     5  xray-proxy-vmess
+     5  xray-transport-grpc
+     5  xray-transport-hysteria
+     4  xray-app-dispatcher
+     4  xray-app-observatory
+     4  xray-app-router
+     4  xray-app-stats
+     4  xray-common
+     4  xray-core
+     4  xray-proxy-blackhole
+     4  xray-proxy-tun
+     4  xray-proxy-vless
+     4  xray-transport-naive
+     3  xray-app-metrics
+     3  xray-app-proxyman
+     3  xray-proxy-dns
+     3  xray-proxy-socks
+     2  xray-app-commander
+     2  xray-app-log
+     2  xray-app-reverse
+     2  xray-buf
+     2  xray-cli
+     2  xray-proxy-http
+     2  xray-proxy-hysteria
+     2  xray-proxy-wireguard
+     1  xray-app-policy
+     1  xray-app-version
+     1  xray-conf
+     1  xray-crypto
+     1  xray-features
+     1  xray-geodata
+     1  xray-proto
+     1  xray-proxy-dokodemo
+     1  xray-proxy-loopback
+     1  xray-stress
+     1  xray-xudp
+
+## 生产面按禁用项分类
+   128  tokio::spawn
+    46  std::time::Instant::now
+    15  文件级聚合（#![allow]）
+     6  std::time::SystemTime::now
+     6  tokio::time::Instant::now
+     4  to_vec 扁平化
+     1  tracing 宏
+     1  std::thread::spawn
+  # 其中「所属 item 同时命中 >=2 类」的站点 = 39
+
+## 生产面 crate × 禁用项矩阵
+  crate                         tokio::spawn  std::time::I  文件级聚合（#![all  std::time::S  tokio::time:    to_vec 扁平化     tracing 宏  std::thread:  合计
+  xray-transport                          30             0             0             0             0             0             0             1    31
+  xray-transport-splithttp                23             4             0             0             0             1             0             0    28
+  xray-stress                              6            14             1             0             0             0             0             0    21
+  xray-transport-hysteria                 16             3             0             0             0             0             0             0    19
+  xray-cli                                 1             4             8             0             0             0             0             0    13
+  xray-proxy-vless                         2             7             1             1             1             0             0             0    12
+  xray-core                                7             1             2             0             0             0             1             0    11
+  xray-mux                                 7             4             0             0             0             0             0             0    11
+  xray-transport-websocket                 5             2             0             0             0             1             0             0     8
+  xray-proxy-tun                           6             0             0             0             0             0             0             0     6
+  xray-transport-naive                     6             0             0             0             0             0             0             0     6
+  xray-app-dispatcher                      2             1             0             0             0             2             0             0     5
+  xray-transport-quic                      3             2             0             0             0             0             0             0     5
+  xray-proxy-tuic                          1             1             0             0             2             0             0             0     4
+  xray-transport-httpupgrade               4             0             0             0             0             0             0             0     4
+  xray-common                              2             1             0             0             0             0             0             0     3
+  xray-proxy-vmess                         0             1             0             2             0             0             0             0     3
+  xray-transport-kcp                       1             1             0             0             1             0             0             0     3
+  xray-app-metrics                         0             0             0             2             0             0             0             0     2
+  xray-app-reverse                         2             0             0             0             0             0             0             0     2
+  xray-reality                             2             0             0             0             0             0             0             0     2
+  xray-app-stats                           0             0             0             1             0             0             0             0     1
+  xray-frame                               1             0             0             0             0             0             0             0     1
+  xray-geodata                             0             0             1             0             0             0             0             0     1
+  xray-proto                               0             0             1             0             0             0             0             0     1
+  xray-proxy-anytls                        0             0             0             0             1             0             0             0     1
+  xray-proxy-ss                            0             0             0             0             1             0             0             0     1
+  xray-tls                                 1             0             0             0             0             0             0             0     1
+  xray-transport-grpc                      0             0             1             0             0             0             0             0     1
+
+## 逐站清单（生产面）
+  crates/xray-app-dispatcher/src/default.rs:651  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "713x6：IO 实耗测量面（夹真实 await），冻结语义破坏预算递减；见上注释" )
+  crates/xray-app-dispatcher/src/default.rs:878  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "ctx 不可达：dispatcher 生产依赖图无 PluginContext（xray-
+  crates/xray-app-dispatcher/src/default.rs:1652  [to_vec 扁平化]  allow(clippy::disallowed_methods)
+  crates/xray-app-dispatcher/src/sniffer.rs:770  [to_vec 扁平化]  allow(clippy::disallowed_methods)
+  crates/xray-app-dispatcher/src/udp_session.rs:160  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "ctx 不可达：dispatcher 生产依赖图无 PluginContext（xray-
+  crates/xray-app-metrics/src/debug.rs:27  [std::time::SystemTime::now]  allow( clippy::disallowed_methods, reason = "713x6：进程启动锚点常量（一次性初始化，非周期取时），Clock 端口无等价物" )
+  crates/xray-app-metrics/src/debug.rs:108  [std::time::SystemTime::now]  allow( clippy::disallowed_methods, reason = "713x6：纯展示格式化函数，签名锁定于测试调用方；注入随 handler 结构化改造收口
+  crates/xray-app-reverse/src/relay.rs:170  [tokio::spawn (+1类)]  allow( clippy::disallowed_methods, reason = "portal yamux 服务端会话 accept；FxScope 未接线（T3.1b 登
+  crates/xray-app-reverse/src/relay.rs:199  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "portal 子流回调派发（on_stream 回调）；FxScope 未接线（T3.1b
+  crates/xray-app-stats/src/online_map.rs:57  [std::time::SystemTime::now]  allow( clippy::disallowed_methods, reason = "713x6：签名锁定于测试调用方 + 无 ctx 持有点；注入随 stats 插件化收口（
+  crates/xray-cli/src/alloc_stats.rs:1  [文件级聚合（#![allow]）]  !allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)
+  crates/xray-cli/src/alloc_stats.rs:70  [std::time::Instant::now (+1类)]  allow( clippy::disallowed_methods, reason = "alloc-stats 诊断启动锚点取时；Clock 端口注入待 bd 39hko" )
+  crates/xray-cli/src/bin/xray.rs:3  [文件级聚合（#![allow]）]  !allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)
+  crates/xray-cli/src/bin/xray.rs:299  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "常驻监控任务（HC-1 路线 B blocking 池水位采样）；迁 FxScope 待 
+  crates/xray-cli/src/commands/api_exec.rs:1  [文件级聚合（#![allow]）]  !allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)
+  crates/xray-cli/src/commands/base64.rs:1  [文件级聚合（#![allow]）]  !allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)
+  crates/xray-cli/src/commands/keys.rs:1  [文件级聚合（#![allow]）]  !allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)
+  crates/xray-cli/src/commands/remote_config.rs:94  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "远端配置拉取 deadline 锚点（CLI 冷路径）；Clock 端口注入待 bd 39
+  crates/xray-cli/src/commands/remote_config.rs:147  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "单跳剩余时长计算（CLI 冷路径）；Clock 端口注入待 bd 39hko" )
+  crates/xray-cli/src/commands/remote_config.rs:342  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "响应体读取截止检查（CLI 冷路径）；Clock 端口注入待 bd 39hko" )
+  crates/xray-cli/src/commands/tool.rs:1  [文件级聚合（#![allow]）]  !allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)
+  crates/xray-cli/src/run.rs:1  [文件级聚合（#![allow]）]  !allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)
+  crates/xray-cli/src/version.rs:1  [文件级聚合（#![allow]）]  !allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)
+  crates/xray-common/src/antireplay/mod.rs:43  [std::time::Instant::now]  allow(clippy::disallowed_methods)
+  crates/xray-common/src/log/general_logger.rs:150  [tokio::spawn]  allow(clippy::disallowed_methods)
+  crates/xray-common/src/testing/mod.rs:25  [tokio::spawn]  allow(clippy::disallowed_methods)
+  crates/xray-core/src/arm_builders/inbound.rs:776  [tokio::spawn (+1类)]  allow( clippy::disallowed_methods, reason = "inbound 连接处理任务（vless fallback，每连接）；FxScope 完工
+  crates/xray-core/src/arm_builders/inbound.rs:831  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "inbound 连接处理任务（trojan fallback，每连接）；FxScope 完
+  crates/xray-core/src/arm_builders/inbound.rs:875  [tokio::spawn (+1类)]  allow( clippy::disallowed_methods, reason = "inbound 连接处理任务（vmess，每连接）；FxScope 完工 JoinSet 
+  crates/xray-core/src/arm_builders/inbound.rs:918  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "inbound 连接处理任务（ss/ss2022，每连接）；FxScope 完工 Join
+  crates/xray-core/src/functions.rs:3  [文件级聚合（#![allow]）]  !allow( clippy::disallowed_methods, reason = "functions.rs 存量 46 处 tokio::spawn，>20 处/文件按分
+  crates/xray-core/src/grpc_server.rs:58  [tracing 宏 (+1类)]  allow( clippy::disallowed_methods, reason = "常驻基础设施任务（metrics gRPC server，句柄返回调用方托管）；迁 FxS
+  crates/xray-core/src/inbound.rs:2506  [std::time::Instant::now (+1类)]  allow( clippy::disallowed_methods, reason = "std 墙钟取时（ss2022 会话 500s 惰性清扫锚点）：serve_ss2022_
+  crates/xray-core/src/inbound.rs:3307  [tokio::spawn (+1类)]  allow( clippy::disallowed_methods, reason = "监控壳外层：JoinHandle 外返契约（InboundRuntime→function
+  crates/xray-core/src/inbound.rs:4116  [tokio::spawn (+1类)]  allow( clippy::disallowed_methods, reason = "tun inbound serve 对外返回 JoinHandle（公开契约 + 4 平台
+  crates/xray-core/src/outbound.rs:3  [文件级聚合（#![allow]）]  !allow( clippy::disallowed_methods, reason = "outbound.rs 存量 31 处（29 tokio::spawn + 2 std 
+  crates/xray-core/src/wiring.rs:476  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面 mux carrier 连接任务（每 carrier）；迁 FxScope 待 b
+  crates/xray-frame/src/redline.rs:94  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "红线受控逃逸口：站点穷举登记于 SITES（CI 门核对调用集合）；主仓改调本函数即不命中
+  crates/xray-geodata/build.rs:1  [文件级聚合（#![allow]）]  !allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)
+  crates/xray-mux/src/client.rs:315  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）：carrier 读循环泵，FxScope 记账会落每 chu
+  crates/xray-mux/src/client.rs:455  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（fetch_input 泵）；迁 FxScope 待 bd 39hko" 
+  crates/xray-mux/src/session.rs:281  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "XUDP 过期锚点取时（1 处）；Clock 端口注入待 bd 39hko" )
+  crates/xray-mux/src/session.rs:399  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "XUDP 创建时刻 = 过期锚点（结构体尾表达式，属性挂 fn 位）；Clock 注入待 
+  crates/xray-mux/src/session.rs:704  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "XUDP 清理循环墙钟取时；Clock 端口注入待 bd 39hko" )
+  crates/xray-mux/src/session.rs:760  [std::time::Instant::now (+1类)]  allow(clippy::disallowed_methods, reason = "手动清理墙钟取时；Clock 端口注入待 bd 39hko")
+  crates/xray-mux/src/worker.rs:89  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（每连接 dispatch 泵）；迁 FxScope 待 bd 39hko"
+  crates/xray-mux/src/worker.rs:212  [tokio::spawn (+1类)]  allow( clippy::disallowed_methods, reason = "常驻监控任务（JoinHandle 返回给调用方托管）；迁 FxScope 待 bd 39
+  crates/xray-mux/src/worker.rs:303  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面会话输出泵（每连接）；迁 FxScope 待 bd 39hko" )
+  crates/xray-mux/src/worker.rs:401  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面会话输出泵（每连接）；迁 FxScope 待 bd 39hko" )
+  crates/xray-mux/src/worker.rs:460  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面会话输出泵（每连接）；迁 FxScope 待 bd 39hko" )
+  crates/xray-proto/build.rs:1  [文件级聚合（#![allow]）]  !allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)
+  crates/xray-proxy-anytls/src/server.rs:175  [tokio::time::Instant::now]  allow( clippy::disallowed_methods, reason = "tokio 虚拟钟预算面（数据面热路径）：握手 deadline 与 timeout 同钟
+  crates/xray-proxy-ss/src/dispatcher.rs:246  [tokio::time::Instant::now]  allow( clippy::disallowed_methods, reason = "tokio 虚拟钟预算面：Sleep::reset 仅收 tokio::time::Ins
+  crates/xray-proxy-tuic/src/pool.rs:191  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "池条目建链时戳；纯结构无 ctx 注入面（713x6 台账：结构性不可达）" )
+  crates/xray-proxy-tuic/src/server.rs:561  [tokio::time::Instant::now]  allow( clippy::disallowed_methods, reason = "面 3 步 3 例外：Budget 无绝对时刻面，Sleep::reset 只能收 tok
+  crates/xray-proxy-tuic/src/server.rs:629  [tokio::time::Instant::now]  allow( clippy::disallowed_methods, reason = "面 3 步 3 例外：Budget 无绝对时刻面，Sleep::reset 只能收 tok
+  crates/xray-proxy-tuic/src/udp.rs:79  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "热路径豁免（B6 t975）：每帧泵——per-connection uni-stream
+  crates/xray-proxy-tun/src/inbound.rs:394  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1
+  crates/xray-proxy-tun/src/inbound.rs:898  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "存量债：未接 PluginContext 托管句柄（tail 表达式位无法就地登记），接线
+  crates/xray-proxy-tun/src/inbound.rs:982  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1
+  crates/xray-proxy-tun/src/inbound.rs:996  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1
+  crates/xray-proxy-tun/src/inbound.rs:1179  [tokio::spawn (+1类)]  allow( clippy::disallowed_methods, reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1
+  crates/xray-proxy-tun/src/inbound.rs:1187  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1
+  crates/xray-proxy-vless/src/dispatcher.rs:223  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "tokio 虚拟钟预算面：条目时戳与消费侧 TTL 判定同钟族（713x6：tokio 一
+  crates/xray-proxy-vless/src/dispatcher.rs:236  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "tokio 虚拟钟预算面：与 push 侧条目时戳同钟族（713x6：tokio 一律不迁
+  crates/xray-proxy-vless/src/encryption/mod.rs:435  [std::time::Instant::now (+1类)]  allow( clippy::disallowed_methods, reason = "0-RTT ticket TTL 判定；ClientInstance 纯协议结构无 ctx
+  crates/xray-proxy-vless/src/encryption/mod.rs:636  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "0-RTT ticket expire 写入；ClientInstance 纯协议结构无 
+  crates/xray-proxy-vless/src/encryption/mod.rs:747  [std::time::SystemTime::now]  allow( clippy::disallowed_methods, reason = "协议 ticket 过期分钟换算（Go time.Now().Unix()/60 对齐）；
+  crates/xray-proxy-vless/src/encryption/vision_conn.rs:1  [文件级聚合（#![allow]）]  !allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)
+  crates/xray-proxy-vless/src/inbound/server.rs:144  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1
+  crates/xray-proxy-vless/src/inbound/server.rs:671  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1
+  crates/xray-proxy-vless/src/inbound/server.rs:692  [tokio::time::Instant::now]  allow( clippy::disallowed_methods, reason = "面 3 步 3 例外：Budget 无绝对时刻面，sleep_until 只能收 toki
+  crates/xray-proxy-vless/src/outbound/preconnect.rs:36  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "预连接条目建链时戳；纯逻辑模块无 ctx 注入面（713x6 台账：结构性不可达）" )
+  crates/xray-proxy-vless/src/outbound/preconnect.rs:199  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "过期清理的单调钟读数；纯逻辑模块无 ctx 注入面（713x6 台账：结构性不可达）" )
+  crates/xray-proxy-vless/src/outbound/reverse.rs:34  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "反向隧道建链时戳；纯逻辑模块无 ctx 注入面（713x6 台账：结构性不可达）" )
+  crates/xray-proxy-vmess/src/aead/mod.rs:591  [std::time::SystemTime::now]  allow( clippy::disallowed_methods, reason = "VMess 协议时间戳窗校验 wire 语义；纯结构无 ctx 注入面（713x6 台账：
+  crates/xray-proxy-vmess/src/encoding/client.rs:161  [std::time::SystemTime::now]  allow( clippy::disallowed_methods, reason = "VMess AEAD seal 时间戳 wire 字段；encoding 纯 codec 
+  crates/xray-proxy-vmess/src/encoding/server.rs:92  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "SessionHistory 纯数据结构无 ctx 注入面；过期判定的单调钟读数（713x
+  crates/xray-reality/src/probe.rs:305  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（REALITY 探测，后台填充探测表）；迁 FxScope 待 bd 39
+  crates/xray-reality/src/probe.rs:437  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（record lens 探测，后台填充）；迁 FxScope 待 bd 3
+  crates/xray-stress/src/main.rs:3  [文件级聚合（#![allow]）]  !allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)
+  crates/xray-stress/src/main.rs:106  [std::time::Instant::now (+1类)]  allow(clippy::disallowed_methods, reason = "压测 run 时钟锚点；Clock 端口注入待 bd 39hko")
+  crates/xray-stress/src/main.rs:229  [std::time::Instant::now (+1类)]  allow( clippy::disallowed_methods, reason = "压测 run 时钟锚点；Clock 端口注入待 bd 39hko" )
+  crates/xray-stress/src/main.rs:242  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "压测 run 时钟锚点；Clock 端口注入待 bd 39hko" )
+  crates/xray-stress/src/main.rs:268  [std::time::Instant::now (+1类)]  allow( clippy::disallowed_methods, reason = "压测 drain 观察窗时钟锚点；Clock 端口注入待 bd 39hko" )
+  crates/xray-stress/src/main.rs:273  [std::time::Instant::now (+1类)]  allow( clippy::disallowed_methods, reason = "压测 drain 观察窗时钟锚点；Clock 端口注入待 bd 39hko" )
+  crates/xray-stress/src/main.rs:286  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "压测 drain 观察窗时钟锚点；Clock 端口注入待 bd 39hko" )
+  crates/xray-stress/src/quic_loop.rs:56  [tokio::spawn]  allow(clippy::disallowed_methods, reason = "压测：QUIC echo 连接任务")
+  crates/xray-stress/src/quic_loop.rs:157  [std::time::Instant::now]  allow(clippy::disallowed_methods, reason = "压测计时循环；Clock 端口注入待 bd 39hko")
+  crates/xray-stress/src/quic_loop.rs:159  [std::time::Instant::now (+1类)]  allow(clippy::disallowed_methods, reason = "压测计时循环；Clock 端口注入待 bd 39hko")
+  crates/xray-stress/src/sampler.rs:54  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "压测 checkpoint 锚点取时；Clock 端口注入待 bd 39hko" )
+  crates/xray-stress/src/sampler.rs:176  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "压测 checkpoint 锚点取时；Clock 端口注入待 bd 39hko" )
+  crates/xray-stress/src/scenarios.rs:30  [std::time::Instant::now (+1类)]  allow(clippy::disallowed_methods, reason = "压测计时循环；Clock 端口注入待 bd 39hko")
+  crates/xray-stress/src/scenarios.rs:32  [std::time::Instant::now (+1类)]  allow( clippy::disallowed_methods, reason = "压测计时循环；Clock 端口注入待 bd 39hko" )
+  crates/xray-stress/src/scenarios.rs:104  [std::time::Instant::now]  allow(clippy::disallowed_methods, reason = "压测计时循环；Clock 端口注入待 bd 39hko")
+  crates/xray-stress/src/scenarios.rs:109  [std::time::Instant::now]  allow(clippy::disallowed_methods, reason = "压测计时循环；Clock 端口注入待 bd 39hko")
+  crates/xray-stress/src/scenarios.rs:135  [tokio::spawn]  allow(clippy::disallowed_methods, reason = "压测：s4 短连接风暴场景任务")
+  crates/xray-stress/src/scenarios.rs:144  [tokio::spawn]  allow(clippy::disallowed_methods, reason = "压测：s4 长流场景任务")
+  crates/xray-stress/src/topology.rs:52  [tokio::spawn]  allow(clippy::disallowed_methods, reason = "压测：echo server 常驻任务")
+  crates/xray-stress/src/topology.rs:57  [tokio::spawn]  allow(clippy::disallowed_methods, reason = "压测：echo 每连接回显任务")
+  crates/xray-stress/src/topology.rs:572  [tokio::spawn]  allow(clippy::disallowed_methods, reason = "压测：mock server 存活持有任务")
+  crates/xray-tls/src/ech_doh.rs:244  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（DoH h2 conn driver）；迁 FxScope 待 bd 39
+  crates/xray-transport-grpc/src/transport.rs:6  [文件级聚合（#![allow]）]  !allow(clippy::disallowed_methods)
+  crates/xray-transport-httpupgrade/src/register.rs:218  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（httpupgrade accept 泵）；迁 FxScope 待 bd 
+  crates/xray-transport-httpupgrade/src/register.rs:262  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "常驻监控任务（accept 循环意外退出监控）；迁 FxScope 待 bd 39hko"
+  crates/xray-transport-httpupgrade/src/register.rs:308  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "待迁 FxScope（39hko/W5）：unix 监听路径（Windows 不编译，本地
+  crates/xray-transport-httpupgrade/src/register.rs:337  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "待迁 FxScope（39hko/W5）：unix 监听路径（Windows 不编译，本地
+  crates/xray-transport-hysteria/src/conn.rs:566  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "UDP 会话活跃锚点（last_active 初始化）；Clock 端口注入待 bd 39
+  crates/xray-transport-hysteria/src/conn.rs:592  [std::time::Instant::now]  allow(clippy::disallowed_methods, reason = "UDP 会话活跃锚点更新；Clock 端口注入待 bd 39hko")
+  crates/xray-transport-hysteria/src/conn.rs:773  [tokio::spawn (+1类)]  allow( clippy::disallowed_methods, reason = "常驻监控任务（UDP idle 会话清理循环）；迁 FxScope 待 bd 39hko"
+  crates/xray-transport-hysteria/src/conn.rs:786  [std::time::Instant::now (+1类)]  allow( clippy::disallowed_methods, reason = "UDP idle 清理墙钟取时；Clock 端口注入待 bd 39hko" )
+  crates/xray-transport-hysteria/src/conn.rs:815  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（QUIC datagram 接收泵）；迁 FxScope 待 bd 39h
+  crates/xray-transport-hysteria/src/gecko_socket.rs:131  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（Gecko 发送 driver）；迁 FxScope 待 bd 39hko
+  crates/xray-transport-hysteria/src/gecko_socket.rs:154  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（Gecko 接收 driver）；迁 FxScope 待 bd 39hko
+  crates/xray-transport-hysteria/src/hysteria_transport.rs:295  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（h3 driver 保活）；迁 FxScope 待 bd 39hko" )
+  crates/xray-transport-hysteria/src/quinn_adapter.rs:508  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（hysteria accept 泵）；迁 FxScope 待 bd 39h
+  crates/xray-transport-hysteria/src/quinn_adapter.rs:523  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（每 QUIC conn 认证+服务）；迁 FxScope 待 bd 39h
+  crates/xray-transport-hysteria/src/quinn_adapter.rs:884  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（h3 状态 detached 持有，替代 mem::forget）；迁 F
+  crates/xray-transport-hysteria/src/quinn_adapter.rs:966  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（h3 请求 resolver 泵）；迁 FxScope 待 bd 39hk
+  crates/xray-transport-hysteria/src/register.rs:122  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（hysteria accept 泵）；迁 FxScope 待 bd 39h
+  crates/xray-transport-hysteria/src/register.rs:151  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（每 QUIC conn 桥接）；迁 FxScope 待 bd 39hko"
+  crates/xray-transport-hysteria/src/register.rs:163  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "常驻监控任务（accept 循环意外退出监控）；迁 FxScope 待 bd 39hko"
+  crates/xray-transport-hysteria/src/register.rs:230  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "停机桥接任务（同步 close 桥 async ep.close）；迁 FxScope 待
+  crates/xray-transport-hysteria/src/udphop.rs:229  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（UDP hop recv 泵）；迁 FxScope 待 bd 39hko"
+  crates/xray-transport-hysteria/src/udphop.rs:241  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（UDP hop 换口循环）；迁 FxScope 待 bd 39hko" )
+  crates/xray-transport-hysteria/src/udphop.rs:456  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（换口后新 recv 泵）；迁 FxScope 待 bd 39hko" )
+  crates/xray-transport-kcp/src/connection.rs:176  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "连接创建时刻锚点（since 字段）；Clock 端口注入待 bd 39hko" )
+  crates/xray-transport-kcp/src/connection.rs:656  [tokio::time::Instant::now]  allow( clippy::disallowed_methods, reason = "713x6 语义判定保留：tokio 虚拟钟预算面（deadline 判定须与 tokio
+  crates/xray-transport-kcp/src/updater.rs:83  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "常驻 updater tick 任务（kcp keepalive/update 循环）；迁
+  crates/xray-transport-naive/src/dial.rs:95  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（h2 conn driver）；迁 FxScope 待 bd 39hko"
+  crates/xray-transport-naive/src/dial.rs:125  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（h2 SendRequest 保活）；迁 FxScope 待 bd 39h
+  crates/xray-transport-naive/src/inbound.rs:169  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（naive accept 泵）；迁 FxScope 待 bd 39hko"
+  crates/xray-transport-naive/src/inbound.rs:180  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（每连接 TLS/处理）；迁 FxScope 待 bd 39hko" )
+  crates/xray-transport-naive/src/inbound.rs:290  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（h2 tunnel dispatch）；迁 FxScope 待 bd 39
+  crates/xray-transport-naive/src/inbound.rs:311  [tokio::spawn (+1类)]  allow( clippy::disallowed_methods, reason = "数据面连接任务（无 dispatch 时 mock relay）；迁 FxScope 待 
+  crates/xray-transport-quic/src/congestion_swappable/bbr/clock.rs:38  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "quinn 桥时钟适配器本体（DefaultClock::now），std Instant
+  crates/xray-transport-quic/src/congestion_swappable/quinn_bridge.rs:44  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "quinn 桥时间戳换算 lag；时钟统一上浮 skeleton::clock 待 bd 
+  crates/xray-transport-quic/src/transport.rs:156  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（QUIC accept 泵）；迁 FxScope 待 bd 39hko" 
+  crates/xray-transport-quic/src/transport.rs:167  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（每连接 stream 泵）；迁 FxScope 待 bd 39hko" )
+  crates/xray-transport-quic/src/transport.rs:214  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面桥接 copy 泵（quinn↔DuplexStream）；迁 FxScope 待 
+  crates/xray-transport-splithttp/src/client.rs:777  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层
+  crates/xray-transport-splithttp/src/dialer.rs:56  [tokio::spawn (+1类)]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层
+  crates/xray-transport-splithttp/src/dialer.rs:350  [tokio::spawn (+1类)]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层
+  crates/xray-transport-splithttp/src/dialer.rs:592  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层
+  crates/xray-transport-splithttp/src/h3_client.rs:318  [to_vec 扁平化 (+1类)]  allow(clippy::disallowed_methods)
+  crates/xray-transport-splithttp/src/h3_client.rs:364  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层
+  crates/xray-transport-splithttp/src/h3_client.rs:390  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层
+  crates/xray-transport-splithttp/src/h3_client.rs:603  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层
+  crates/xray-transport-splithttp/src/h3_client.rs:697  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层
+  crates/xray-transport-splithttp/src/h3_client.rs:750  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层
+  crates/xray-transport-splithttp/src/hub.rs:209  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层
+  crates/xray-transport-splithttp/src/hub/handler.rs:324  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层
+  crates/xray-transport-splithttp/src/hub/handler.rs:377  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层
+  crates/xray-transport-splithttp/src/hub/handler.rs:387  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层
+  crates/xray-transport-splithttp/src/hub/handler.rs:458  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层
+  crates/xray-transport-splithttp/src/hub/handler.rs:518  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层
+  crates/xray-transport-splithttp/src/hub/session.rs:96  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层
+  crates/xray-transport-splithttp/src/mux.rs:127  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 传输层无 Clock 
+  crates/xray-transport-splithttp/src/mux.rs:199  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 传输层无 Clock 
+  crates/xray-transport-splithttp/src/transport.rs:253  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层
+  crates/xray-transport-splithttp/src/transport.rs:277  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层
+  crates/xray-transport-splithttp/src/transport.rs:352  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层
+  crates/xray-transport-splithttp/src/transport.rs:373  [tokio::spawn (+1类)]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层
+  crates/xray-transport-splithttp/src/transport.rs:423  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 传输层无 Clock 
+  crates/xray-transport-splithttp/src/transport.rs:504  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 传输层无 Clock 
+  crates/xray-transport-splithttp/src/transport.rs:824  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层
+  crates/xray-transport-splithttp/src/transport.rs:854  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层
+  crates/xray-transport-splithttp/src/transport.rs:975  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层
+  crates/xray-transport-websocket/src/client.rs:317  [to_vec 扁平化 (+1类)]  allow( clippy::disallowed_methods, reason = "数据面连接任务（首写触发拨号 joining）；迁 FxScope 待 bd 39hko"
+  crates/xray-transport-websocket/src/pool.rs:225  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "连接池 idle 过期扫描墙钟取时；Clock 端口注入待 bd 39hko" )
+  crates/xray-transport-websocket/src/pool.rs:267  [std::time::Instant::now]  allow( clippy::disallowed_methods, reason = "连接池 entry last_used 锚点；Clock 端口注入待 bd 39hko" 
+  crates/xray-transport-websocket/src/register.rs:198  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（ws accept 泵）；迁 FxScope 待 bd 39hko" )
+  crates/xray-transport-websocket/src/register.rs:245  [tokio::spawn (+1类)]  allow( clippy::disallowed_methods, reason = "常驻监控任务（accept 循环意外退出监控）；迁 FxScope 待 bd 39hko"
+  crates/xray-transport-websocket/src/register.rs:397  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（池预连接补拨）；迁 FxScope 待 bd 39hko" )
+  crates/xray-transport-websocket/src/server.rs:309  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（h2 拒绝服务，防串行 accept 钉死）；迁 FxScope 待 bd
+  crates/xray-transport-websocket/src/ws_bridge.rs:311  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（ws 心跳 ping 循环，对齐 Go heartbeatPeriod g
+  crates/xray-transport/src/finalmask/custom/mod.rs:106  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（tcpmask client bridge）；迁 FxScope 待 bd
+  crates/xray-transport/src/finalmask/custom/mod.rs:118  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（tcpmask server bridge）；迁 FxScope 待 bd
+  crates/xray-transport/src/finalmask/custom/tcp.rs:190  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面泵任务（raw↔pipe 回程拷贝）；迁 FxScope 待 bd 39hko" )
+  crates/xray-transport/src/finalmask/fragment.rs:64  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（fragment client bridge）；迁 FxScope 待 b
+  crates/xray-transport/src/finalmask/fragment.rs:75  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（fragment server bridge）；迁 FxScope 待 b
+  crates/xray-transport/src/finalmask/fragment.rs:98  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面泵任务（inner↔pipe 回程拷贝）；迁 FxScope 待 bd 39hko"
+  crates/xray-transport/src/finalmask/mod.rs:542  [tokio::spawn (+1类)]  allow( clippy::disallowed_methods, reason = "数据面泵任务（PacketIo recv 有界队列泵）；迁 FxScope 待 bd 39
+  crates/xray-transport/src/finalmask/mod.rs:564  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面泵任务（PacketIo send 泵）；迁 FxScope 待 bd 39hko"
+  crates/xray-transport/src/finalmask/realm/portmap/test_support.rs:78  [tokio::spawn (+1类)]  allow(clippy::disallowed_methods, reason = "测试：NAT-PMP stub 收包泵")
+  crates/xray-transport/src/finalmask/realm/portmap/test_support.rs:137  [tokio::spawn]  allow(clippy::disallowed_methods, reason = "测试：HTTP stub accept 泵")
+  crates/xray-transport/src/finalmask/realm/portmap/test_support.rs:145  [tokio::spawn]  allow(clippy::disallowed_methods, reason = "测试：HTTP stub 每连接泵")
+  crates/xray-transport/src/finalmask/realm/portmap/test_support.rs:246  [tokio::spawn]  allow(clippy::disallowed_methods, reason = "测试：SSDP stub 收包泵")
+  crates/xray-transport/src/finalmask/sudoku/mod.rs:88  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（sudoku client bridge）；迁 FxScope 待 bd 
+  crates/xray-transport/src/finalmask/sudoku/mod.rs:100  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面连接任务（sudoku server bridge）；迁 FxScope 待 bd 
+  crates/xray-transport/src/finalmask/sudoku/mod.rs:135  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面泵任务（inner→pipe 解码方向）；迁 FxScope 待 bd 39hko"
+  crates/xray-transport/src/finalmask/udphop.rs:267  [tokio::spawn (+1类)]  allow( clippy::disallowed_methods, reason = "数据面泵任务（socket 收包转发）；迁 FxScope 待 bd 39hko" )
+  crates/xray-transport/src/finalmask/xdns/client.rs:126  [tokio::spawn (+1类)]  allow( clippy::disallowed_methods, reason = "数据面泵任务（xdns client recv 泵）；迁 FxScope 待 bd 39h
+  crates/xray-transport/src/finalmask/xdns/client.rs:131  [tokio::spawn (+1类)]  allow( clippy::disallowed_methods, reason = "数据面泵任务（xdns client send 泵）；迁 FxScope 待 bd 39h
+  crates/xray-transport/src/finalmask/xdns/server.rs:148  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面泵热路径豁免（坑约束⑫）：xdns recv 泵" )
+  crates/xray-transport/src/finalmask/xdns/server.rs:153  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面泵热路径豁免（坑约束⑫）：xdns send 泵" )
+  crates/xray-transport/src/finalmask/xdns/server.rs:158  [tokio::spawn (+1类)]  allow(clippy::disallowed_methods, reason = "数据面泵热路径豁免（坑约束⑫）：xdns dr 泵")
+  crates/xray-transport/src/finalmask/xicmp.rs:382  [tokio::spawn (+1类)]  allow( clippy::disallowed_methods, reason = "数据面泵任务（raw ICMP socket recv 泵）；迁 FxScope 待 bd
+  crates/xray-transport/src/finalmask/xicmp.rs:436  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "常驻监控任务（xicmp 记录 TTL 清理循环）；迁 FxScope 待 bd 39hk
+  crates/xray-transport/src/finalmask/xicmp_sock.rs:384  [std::thread::spawn (+2类)]  allow( clippy::disallowed_methods, reason = "确需 OS 线程（坑约束 #5/#6）：raw ICMP 阻塞 recv 循环，停机经 s
+  crates/xray-transport/src/finalmask/xmc/conn.rs:637  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面泵任务（xmc 加密写泵）；迁 FxScope 待 bd 39hko" )
+  crates/xray-transport/src/finalmask/xmc/conn.rs:668  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面泵任务（pipe→raw 分块编码泵）；迁 FxScope 待 bd 39hko" 
+  crates/xray-transport/src/finalmask/xmc/conn.rs:697  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "数据面泵任务（raw→pipe 解密读泵）；迁 FxScope 待 bd 39hko" )
+  crates/xray-transport/src/finalmask/xmc/conn.rs:743  [tokio::spawn]  allow( clippy::disallowed_methods, reason = "常驻监控任务（xmc server keepalive 循环）；迁 FxScope 待 b
+  crates/xray-transport/src/finalmask/xmc/mod.rs:80  [tokio::spawn (+1类)]  allow( clippy::disallowed_methods, reason = "数据面连接任务（xmc client bridge）；迁 FxScope 待 bd 39h
+  crates/xray-transport/src/finalmask/xmc/mod.rs:91  [tokio::spawn (+1类)]  allow( clippy::disallowed_methods, reason = "数据面连接任务（xmc server bridge）；迁 FxScope 待 bd 39h
+  crates/xray-transport/src/udp/relay.rs:195  [tokio::spawn (+1类)]  allow(clippy::disallowed_methods, reason = "数据面泵热路径豁免（坑约束⑫）：UDP 会话 recv 泵")

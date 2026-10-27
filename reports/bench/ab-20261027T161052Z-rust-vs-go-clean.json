@@ -1,0 +1,199 @@
+{
+ "tool": "tools/ab_gate.py",
+ "utc": "20261027T161052Z",
+ "tag": "rust-vs-go-clean",
+ "hostname": "DESKTOP-G6MJ6S3",
+ "a": {
+  "path": "D:\\Project\\Xray-core-rust\\target\\release\\xray.exe",
+  "sha256": "d5c5e2f45b135e270915ee8ba351ed105f409db2259fd45d42a218239295f783",
+  "rounds": [
+   275.39,
+   285.32,
+   290.95,
+   291.12,
+   281.25
+  ],
+  "median": 285.32,
+  "mad": 5.63,
+  "iqr": 9.7,
+  "spread": 0.0551
+ },
+ "b": {
+  "path": "D:\\Project\\Xray-core\\target\\xray-go.exe",
+  "sha256": "05d866eb561ec3b79d0d85dbf3cc2573376da86c4ba12445db33c69801705540",
+  "rounds": [
+   425.1,
+   468.39,
+   440.39,
+   380.5,
+   375.65
+  ],
+  "median": 425.1,
+  "mad": 43.29,
+  "iqr": 59.89,
+  "spread": 0.2182
+ },
+ "rounds_detail": [
+  {
+   "round": 1,
+   "side": "A",
+   "mbps": 275.39,
+   "wall_s": 6.6,
+   "load": {
+    "ts": "2026-10-27T16:09:51Z",
+    "compilers": {
+     "cargo.exe": 0,
+     "rustc.exe": 0,
+     "cl.exe": 0
+    },
+    "err": []
+   }
+  },
+  {
+   "round": 1,
+   "side": "B",
+   "mbps": 425.1,
+   "wall_s": 6.0,
+   "load": {
+    "ts": "2026-10-27T16:09:58Z",
+    "compilers": {
+     "cargo.exe": 0,
+     "rustc.exe": 0,
+     "cl.exe": 0
+    },
+    "err": []
+   }
+  },
+  {
+   "round": 2,
+   "side": "A",
+   "mbps": 285.32,
+   "wall_s": 6.5,
+   "load": {
+    "ts": "2026-10-27T16:10:05Z",
+    "compilers": {
+     "cargo.exe": 0,
+     "rustc.exe": 0,
+     "cl.exe": 0
+    },
+    "err": []
+   }
+  },
+  {
+   "round": 2,
+   "side": "B",
+   "mbps": 468.39,
+   "wall_s": 6.0,
+   "load": {
+    "ts": "2026-10-27T16:10:11Z",
+    "compilers": {
+     "cargo.exe": 0,
+     "rustc.exe": 0,
+     "cl.exe": 0
+    },
+    "err": []
+   }
+  },
+  {
+   "round": 3,
+   "side": "A",
+   "mbps": 290.95,
+   "wall_s": 6.5,
+   "load": {
+    "ts": "2026-10-27T16:10:18Z",
+    "compilers": {
+     "cargo.exe": 0,
+     "rustc.exe": 0,
+     "cl.exe": 0
+    },
+    "err": []
+   }
+  },
+  {
+   "round": 3,
+   "side": "B",
+   "mbps": 440.39,
+   "wall_s": 6.0,
+   "load": {
+    "ts": "2026-10-27T16:10:25Z",
+    "compilers": {
+     "cargo.exe": 0,
+     "rustc.exe": 0,
+     "cl.exe": 0
+    },
+    "err": []
+   }
+  },
+  {
+   "round": 4,
+   "side": "A",
+   "mbps": 291.12,
+   "wall_s": 6.5,
+   "load": {
+    "ts": "2026-10-27T16:10:32Z",
+    "compilers": {
+     "cargo.exe": 0,
+     "rustc.exe": 0,
+     "cl.exe": 0
+    },
+    "err": []
+   }
+  },
+  {
+   "round": 4,
+   "side": "B",
+   "mbps": 380.5,
+   "wall_s": 6.1,
+   "load": {
+    "ts": "2026-10-27T16:10:38Z",
+    "compilers": {
+     "cargo.exe": 0,
+     "rustc.exe": 0,
+     "cl.exe": 0
+    },
+    "err": []
+   }
+  },
+  {
+   "round": 5,
+   "side": "A",
+   "mbps": 281.25,
+   "wall_s": 6.5,
+   "load": {
+    "ts": "2026-10-27T16:10:45Z",
+    "compilers": {
+     "cargo.exe": 0,
+     "rustc.exe": 0,
+     "cl.exe": 0
+    },
+    "err": []
+   }
+  },
+  {
+   "round": 5,
+   "side": "B",
+   "mbps": 375.65,
+   "wall_s": 6.2,
+   "load": {
+    "ts": "2026-10-27T16:10:52Z",
+    "compilers": {
+     "cargo.exe": 0,
+     "rustc.exe": 0,
+     "cl.exe": 0
+    },
+    "err": []
+   }
+  }
+ ],
+ "ratio_median": 1.4899,
+ "tol": 0.05,
+ "verdict": "PASS",
+ "contaminated": true,
+ "contamination_reason": [
+  "B 侧轮间离散度 21.8% > 15%"
+ ],
+ "compilers_seen_during_run": [],
+ "forced": false,
+ "preflight_compilers": [],
+ "scenario": "自建裸 vless+tcp loopback (200MB×2 curl 均值)"
+}

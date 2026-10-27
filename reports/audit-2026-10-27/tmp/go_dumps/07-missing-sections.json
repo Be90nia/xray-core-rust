@@ -1,0 +1,1 @@
+{"rc": 0, "stdout": "2026/10/27 12:50:23.927215 [Info] infra/conf/serial: Reading config: &{Name:D:\\Project\\Xray-core-rust\\crates\\xray-conf\\tests\\fixtures\\shadow\\07-missing-sections.json Format:json}\n{\n    \"log\": {\n        \"dnsLog\": false,\n        \"loglevel\": \"error\"\n    }\n}\n", "stderr": ""}

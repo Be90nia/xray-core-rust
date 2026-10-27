@@ -1,0 +1,122 @@
+# L3 台账普查  ref=c0deb2e6  crates/*.rs=804（排除 udf-frame）
+TOTAL 属性数 = 209   生产面 = 80   测试面 = 129
+
+## 形态 × 面别矩阵
+  outer(per-site #[..])      prod=  65  test=  43
+  inner(文件顶 #![..])          prod=  15  test=  86
+  # 口径A（ledger-audit 458 同源）= 仅 outer per-site = 108
+  # 口径B（含文件顶 inner）= 全量 = 209
+
+## 生产面 top crate
+    11  xray-core
+    11  xray-mux
+     8  xray-cli
+     6  xray-proxy-tun
+     6  xray-proxy-wireguard
+     5  xray-proxy-hysteria
+     4  xray-app-geodata
+     4  xray-proxy-vless
+     3  xray-common
+     3  xray-proxy-ss
+     3  xray-proxy-vmess
+     2  xray-app-dispatcher
+     2  xray-app-reverse
+     2  xray-proxy-anytls
+     2  xray-proxy-tuic
+     1  xray-geodata
+     1  xray-proto
+     1  xray-proxy-freedom
+     1  xray-proxy-http
+     1  xray-proxy-socks
+     1  xray-proxy-trojan
+     1  xray-stress
+     1  xray-transport-splithttp
+
+## 测试面 crate（非零）
+    17  xray-mux
+    11  xray-app-geodata
+     6  xray-proxy-tuic
+     6  xray-transport-splithttp
+     5  xray-proxy-anytls
+     5  xray-proxy-ss
+     4  xray-app-dispatcher
+     4  xray-app-observatory
+     4  xray-proxy-trojan
+     4  xray-proxy-vmess
+     3  xray-app-metrics
+     3  xray-app-stats
+     3  xray-core
+     3  xray-proxy-tun
+     3  xray-proxy-vless
+     2  xray-app-commander
+     2  xray-app-reverse
+     2  xray-app-router
+     2  xray-buf
+     2  xray-common
+     2  xray-proxy-dns
+     2  xray-proxy-http
+     2  xray-proxy-hysteria
+     2  xray-proxy-socks
+     2  xray-reality
+     1  xray-app-dns
+     1  xray-app-log
+     1  xray-app-policy
+     1  xray-app-proxyman
+     1  xray-app-version
+     1  xray-cli
+     1  xray-conf
+     1  xray-crypto
+     1  xray-features
+     1  xray-geodata
+     1  xray-proto
+     1  xray-proxy-blackhole
+     1  xray-proxy-dokodemo
+     1  xray-proxy-freedom
+     1  xray-proxy-loopback
+     1  xray-proxy-wireguard
+     1  xray-stress
+     1  xray-tls
+     1  xray-transport-grpc
+     1  xray-transport-httpupgrade
+     1  xray-transport-hysteria
+     1  xray-transport-kcp
+     1  xray-transport-naive
+     1  xray-transport-quic
+     1  xray-transport-tcp
+     1  xray-transport-websocket
+     1  xray-transport
+     1  xray-xudp
+
+## 生产面按禁用项分类
+    52  tokio::spawn
+    15  文件级聚合（#![allow]）
+     9  std::time::Instant::now
+     3  to_vec 扁平化
+     1  tracing 宏
+  # 其中「所属 item 同时命中 >=2 类」的站点 = 28
+
+## 生产面 crate × 禁用项矩阵
+  crate                         tokio::spawn  文件级聚合（#![all  std::time::I    to_vec 扁平化     tracing 宏  合计
+  xray-core                                7             3             0             0             1    11
+  xray-mux                                 7             0             4             0             0    11
+  xray-cli                                 0             8             0             0             0     8
+  xray-proxy-tun                           6             0             0             0             0     6
+  xray-proxy-wireguard                     6             0             0             0             0     6
+  xray-proxy-hysteria                      5             0             0             0             0     5
+  xray-app-geodata                         0             0             4             0             0     4
+  xray-proxy-vless                         3             1             0             0             0     4
+  xray-common                              2             0             1             0             0     3
+  xray-proxy-ss                            3             0             0             0             0     3
+  xray-proxy-vmess                         3             0             0             0             0     3
+  xray-app-dispatcher                      0             0             0             2             0     2
+  xray-app-reverse                         2             0             0             0             0     2
+  xray-proxy-anytls                        2             0             0             0             0     2
+  xray-proxy-tuic                          2             0             0             0             0     2
+  xray-geodata                             0             1             0             0             0     1
+  xray-proto                               0             1             0             0             0     1
+  xray-proxy-freedom                       1             0             0             0             0     1
+  xray-proxy-http                          1             0             0             0             0     1
+  xray-proxy-socks                         1             0             0             0             0     1
+  xray-proxy-trojan                        1             0             0             0             0     1
+  xray-stress                              0             1             0             0             0     1
+  xray-transport-splithttp                 0             0             0             1             0     1

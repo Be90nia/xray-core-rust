@@ -10,11 +10,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **REALITY 本地双向 wire 互通**（`e235355f`）：`dist/interop_reality.py`（vless+reality+裸 TCP，Rust client↔Go server / Go client↔Rust server）**2/2 PASS ×2 次**；dest 回退走 Go xray vless+tls 实例（Python HTTPS 版会间歇中止 reality 的 dest steal 握手，属工装 artifact）。既有矩阵（6 协议）未动
+- **A/B 判定工装**（`tools/ab_gate.py`）：把「性能只能同窗交错 A/B」纪律工具化——严格 A,B,A,B 交替 + 编译进程拒跑/轮间离散度标记 CONTAMINATED + 中位数比值判定 + 逐次存档 `reports/bench/ab-*.json`；A/A 干净窗偏差 3.1%（建议 tol=0.05，无法确认干净时 0.08）
 - **xray-frame 六面派生件落地**（能力收敛 W1，`1679a5a7`）：`compat`（进程级能力入口：一次性 install + 作用域守卫 + 兜底=迁移前行为；**禁 thread_local**——tokio 任务跨线程迁移语义错）/ `redline`（红线受控入口：`RedlineSite` 穷举 + 受控执行 + 源码扫描 CI 门）/ `scope`（ConnScope 两级 scope：arm → connection）/ `deadline::Budget`（双源：Tokio 虚拟钟 advance + Wall 由 `Clock` 判负）/ `logging::HotLog`（栈缓冲零分配热路径门面）/ `config::XrayConfigLayers`（tag 合并 + outbounds prepend + tail）；7 份测试随件进 CI
 - **ADR-1/ADR-2 入宪**（`CLAUDE.md §3.5.5`，`377c712d`）：能力归属三层判定顺序固定（零 Xray 语义 → udf；否则 → xray-frame；仅当逐条举证才留主仓）+ `compat`/`redline` 两条执行约束（登记集合不随迁移增长）
 
 ### Changed
 
+- **ConnScope 级联改事件广播**（bd `mzput`）：`ArmScope`（内嵌 udf `FxScope` + `tokio::sync::watch` 关闭广播）承接父→子级联，取代 `child_of` 的 20ms 轮询——**稳态唤醒 50 次/秒/连接 → 0**；选 watch 非 `Notify`：级联是「状态」非脉冲，watch 终值 + 每接收端独立版本账天然覆盖「父先关 / 子后注册」两窗口；udf 父仓零改动；`start_paused` 测试证明无定时器
+- **HotLog 快路径无锁化**（bd `9doy9`）：`enabled()` 每调用加解锁（`metas: Mutex`）→ `AtomicU8` 级别 + `OnceLock` 一次性整表；实测 **18.1 → 5.5 ns/call**（与 `tracing::enabled!` 宏 5.1ns 同级），4 线程竞争聚合吞吐 **13.7 → 550 Mops/s（≈40×）**；API 签名零变化、零新依赖
+- **xicmp/system_listener 裸 tracing 收敛**（bd `pdm1q`，`4065d7d0`）：`336d8430` 引入的 8 处 `tracing::` 直调（晚于台账生成 → 门看不见）改为 `hot_log!`（4 处错误条件臂）/ `crate::LOG`（4 处系统/连接级）；事件文本与 target/level 零改动、无新增 allow
 - **tracing 收口（proxy 16 crate 生产裸宏 217 → 0）**：批 2a `d3c43a61`（tuic/anytls/trojan/hysteria 109 处）+ 批 2b `96483e8f`（wireguard/tun/freedom/vmess 90 处，含 `event!` 逃生口拆除）；模块级 `LazyLock<LogFacade>` 门面 + per-crate 宏禁令（探针验证真拦截）
 - **L3 台账**（`888c6b8f`）：dispatcher/kcp/splithttp 补 spawn/时钟禁令 + 43 处生产站点逐点 allow 登记（reason 含语义归类）
 - **时钟收敛**：W3a `b085ff97`（common/tls 9 站 → udf `SystemClock`，删 allow 8 处）；W3b `7d71a6c6`（transport/ss/wireguard/tun 64 站 → `compat::clock`，删 allow 40 项）
@@ -28,6 +33,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **P1 停机不掐在途连接**（bd `a9xgp`）：`shutdown_token().cancel()` 与 `Instance::close()` 原先只停 accept 层——实测在途长连接在 cancel 后 2s 内仍以 8MB/s 中继 1.29–1.54MB，`close()` 1.3ms 返回后继续回传 1.25MB。根因：`ArmScope::close()` 全仓零调用点 + `child_of` 监视任务持父 Arc 锚 → 级联在停机形态下结构性不可达。修：`xray-frame::ArmScopeRegistry`（装配序 Vec + 逆序 close，登记点收敛到 `spawn_inbound_serve` 唯一漏斗，表属主 `Instance`）+ serve 壳双臂 select（token cancel → `ArmScope::shutdown_timeout(5s)`：广播 → ConnScope 级联 → `abort_all` + 有界排空）。**闸门测试 `shutdown_token_cancel_terminates_inflight_long_connection` 3/3 绿（0.03–0.04s 终止，修复前永不终止）**；过程中修掉一个真竞态（`select!` 双臂随机裁决会跳过级联，join 臂改为 token 已取消时兜底排空）
+- **测试端口探测 TOCTOU**（53 处 `crates/` + 约 55 处 `tests/`）：`bind(:0) → drop → 被测方再绑` 在窗口期被并行测试抢走（全量 `--workspace` 下确定性偶发 `os error 10048`）。统一收口为 `xray_common::testing::{pick_free_ports(n), is_addr_in_use_err}` + 换端口重试；**顺带修掉真 bug——旧 helper 用 `"in use"` 字符串匹配，中文 Windows 错误文本是「只允许使用一次」→ 永不命中**。断言零改动、零新增 sleep
 - **栈足迹回归**（W5 发现，W4 扩面复核）：`BudgetDeadline::timeout`（**async-fn 形态**）在巨型 future 内加厚栈帧 → `vmess_inbound_udp_relay_e2e` 确定性 `STATUS_STACK_OVERFLOW`（HEAD 版 PASS，三步单变量取证）；改**构造式** `deadline::timeout(fut, remaining())`（具名 `Timeout<F>`，与裸调用同体积）；vmess 3 + vless 5 + core UDP relay 4 处统一。框架结论：**构造式 = 默认正确形态，async-fn = 便利形态有栈代价**
 - **红线门对别名隐形**：受控入口若用 `use ... as` 别名调用，字面量扫描门得到空集合直接放过（整个文件对门不可见）→ 改全路径调用
 - **W6 fmt 漏跑**（`5baf33cd`）：PM 验收漏跑 fmt 门导致已入库文件带 3 处 rustfmt 差异（CI fmt 会红），补修
