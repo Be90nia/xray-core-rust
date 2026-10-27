@@ -103,7 +103,10 @@ pub async fn dial_packet_up(
                 .post_packet(&base_uri_for_task, &session_id_for_task, &seq_str, payload)
                 .await
             {
-                crate::hot_log!(DEBUG, "error={e} seq={seq} post_packet failed, terminating upload");
+                crate::hot_log!(
+                    DEBUG,
+                    "error={e} seq={seq} post_packet failed, terminating upload"
+                );
                 break;
             }
 
@@ -392,7 +395,10 @@ pub async fn dial_h3_packet_up(
                 .post_packet(&base_uri_for_task, &session_id_for_task, &seq_str, payload)
                 .await
             {
-                crate::hot_log!(DEBUG, "error={e} seq={seq} h3 post_packet failed, terminating upload");
+                crate::hot_log!(
+                    DEBUG,
+                    "error={e} seq={seq} h3 post_packet failed, terminating upload"
+                );
                 break;
             }
 
@@ -619,7 +625,10 @@ where
     let download_reader: Box<dyn AsyncReadTrait + Send + Unpin> =
         Box::new(StreamReader::new(download_stream));
 
-    crate::hot_log!(DEBUG, "base_uri={base_uri} REALITY stream-one established via direct h2 handshake");
+    crate::hot_log!(
+        DEBUG,
+        "base_uri={base_uri} REALITY stream-one established via direct h2 handshake"
+    );
 
     Ok(SplitConn::new(download_reader, pipe_client, remote_addr, local_addr))
 }
