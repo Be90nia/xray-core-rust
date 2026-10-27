@@ -6858,6 +6858,8 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "udf-skeleton",
+ "udf-std-ext",
  "xray-buf",
  "xray-common",
  "xray-proto",
