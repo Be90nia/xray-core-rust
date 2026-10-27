@@ -54,6 +54,10 @@ pub type PacketUpConn = SplitConn<Box<dyn AsyncReadTrait + Send + Unpin>, Duplex
 /// - `session_id`: uuid 字符串（由调用方生成，对应 Go `uuid.New()`）
 /// - `sc_max_each_post_bytes`: 单 POST body 最大字节数（packet 切片阈值）
 /// - `sc_min_posts_interval_ms`: 两次 POST 最小间隔（毫秒；0 表示不限）
+#[allow(
+    clippy::disallowed_methods,
+    reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，dialer 无 PluginContext 注入面；本 fn 的 3 处为 packet-up 上传泵的 spawn 与 POST 间隔墙钟取时（Go dialer.go:511 `time.Since(lastWrite)` 语义），FxScope 迁移收口见 bd 39hko"
+)]
 pub async fn dial_packet_up(
     client: Arc<DefaultDialerClient>,
     base_uri: String,
@@ -341,6 +345,10 @@ pub async fn dial(
 /// 2. `tokio::io::duplex` 创建上传 pipe
 /// 3. spawn 后台任务：循环读 pipe → `H3Conn::post_packet`
 /// 4. 返回 [`PacketUpConn`]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，dialer 无 PluginContext 注入面；本 fn 的 3 处为 H3 packet-up 上传泵的 spawn 与 POST 间隔墙钟取时（Go dialer.go:511 `time.Since(lastWrite)` 语义），FxScope 迁移收口见 bd 39hko"
+)]
 pub async fn dial_h3_packet_up(
     client: Arc<H3Conn>,
     base_uri: String,
@@ -576,6 +584,10 @@ where
         .await
         .map_err(|e| SplitHttpError::Hyper(format!("h2 handshake: {e}")))?;
     // spawn conn driver（必须，否则 h2 连接不动）
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，dialer 无 PluginContext 注入面；h2 连接驱动任务（缺此 h2 连接不动），FxScope 迁移收口见 bd 39hko"
+    )]
     tokio::spawn(async move {
         if let Err(e) = conn.await {
             debug!(target: "splithttp", error = %e, "h2 connection driver ended");

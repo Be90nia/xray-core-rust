@@ -321,6 +321,10 @@ where
     let queue = Arc::clone(&session.upload_queue);
 
     // 后台任务：把 request body 切片为有序 packet，push 到 UploadQueue
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；stream-up body 切片推送任务，FxScope 迁移收口见 bd 39hko"
+    )]
     tokio::spawn(async move {
         use futures_util::TryStreamExt;
         let mut stream = req.into_body().into_data_stream();
@@ -370,12 +374,20 @@ where
         let queue = Arc::clone(&session.upload_queue);
         let sessions = Arc::clone(&ctx.sessions);
         let sid = session_id.to_string();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；stream-down UploadQueue→上行管道转发任务，FxScope 迁移收口见 bd 39hko"
+        )]
         tokio::spawn(async move {
             forward_queue_to_writer(queue, upload_tx).await;
             sessions.remove(&sid).await; // 兜底（幂等）：forward 正常结束也清
         });
     } else {
         // stream-one: request body → upload_tx
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；stream-one body→上行管道任务，FxScope 迁移收口见 bd 39hko"
+        )]
         tokio::spawn(async move {
             use futures_util::TryStreamExt;
             let mut stream = req.into_body().into_data_stream();
@@ -443,6 +455,10 @@ fn spawn_x_padding_stream(
     let (tx, rx) = tokio::sync::mpsc::channel::<io::Result<Frame<Bytes>>>(4);
     if (has_referer || obfs_padding_accepted) && sc_secs.to > 0 {
         let range = ctx.config.get_normalized_x_padding_bytes();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；X 填充 keepalive 流任务（Go hub.go:219-232），FxScope 迁移收口见 bd 39hko"
+        )]
         tokio::spawn(async move {
             loop {
                 let n = range.rand().max(0) as usize;
@@ -499,6 +515,10 @@ impl Drop for SessionDropGuard {
         }
         let sessions = Arc::clone(&self.sessions);
         let sid = std::mem::take(&mut self.sid);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；SessionMap 是 tokio Mutex 故 Drop 内只能 spawn 异步删除会话，FxScope 迁移收口见 bd 39hko"
+        )]
         tokio::spawn(async move {
             sessions.remove(&sid).await;
         });

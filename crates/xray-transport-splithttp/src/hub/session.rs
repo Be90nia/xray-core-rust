@@ -93,6 +93,10 @@ impl SessionMap {
         let self_clone = Arc::clone(self);
         let sid = session_id.to_string();
         let session_clone = Arc::clone(&session);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；会话 30s 未 GET 即 reap 定时任务（Go hub.go:86-88），FxScope 迁移收口见 bd 39hko"
+        )]
         tokio::spawn(async move {
             tokio::select! {
                 _ = session_clone.wait_fully_connected() => {

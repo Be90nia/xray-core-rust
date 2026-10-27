@@ -649,6 +649,14 @@ impl Connection {
 /// 时间读全部走 tokio 时钟（[`tokio::time::Instant`]）：与 `tokio::time::pause`
 /// 确定性测试对齐；生产（无 pause）下与 std 时钟等价。deadline 在等待开始时读取
 /// 一次（Go 同样不因等待中途改 deadline 而唤醒 waiter）。
+// 713x6 语义判定：保留 tokio 虚拟钟预算面。deadline 判定必须与 tokio::time::pause
+// 确定性测试对齐（std 时钟在 pause 下不推进 → 过期判定不可测），且 duration 最终
+// 喂给 tokio::time::sleep（只收 tokio Instant）——与 std/Clock 面禁混换，故不迁。
+// 尾表达式位不可挂语句属性（E0658），allow 上移 fn 级。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "713x6 语义判定保留：tokio 虚拟钟预算面（deadline 判定须与 tokio::time::pause 确定性对齐，且 duration 喂 tokio::time::sleep 只收 tokio Instant），与 std/Clock 面禁混换故不迁；Clock 端口注入待 bd 39hko"
+)]
 async fn wait_for_data(notify: &Notify, deadline: &Mutex<Option<Instant>>) -> Result<()> {
     // 快速路径：permit 已可用立即返回。自旋期间 permit 迟到也不丢——Notified 已
     // 注册，落到下方 select 分支照样被唤醒。
@@ -1314,6 +1322,10 @@ mod tests {
 
     /// 用 tokio 时钟构造 std deadline：pause 下 std::Instant 不随 advance 走，
     /// tokio 即时值 into_std 保证比较全程在同一时钟域（零偏移、确定性）。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "测试：deadline 构造锚点（tokio 虚拟钟域 → std deadline 换算）"
+    )]
     fn deadline_after(secs: u64) -> std::time::Instant {
         tokio::time::Instant::now()
             .checked_add(Duration::from_secs(secs))
@@ -1321,6 +1333,10 @@ mod tests {
             .into_std()
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "测试：deadline 构造锚点（tokio 虚拟钟域 → std deadline 换算）"
+    )]
     fn deadline_before(secs: u64) -> std::time::Instant {
         tokio::time::Instant::now()
             .checked_sub(Duration::from_secs(secs))
@@ -1361,6 +1377,11 @@ mod tests {
 
     /// G7-c：rd 已过期 → 立即返回 `IoTimeout`，不推进时钟不阻塞。
     #[tokio::test(start_paused = true)]
+    // assert_eq! 是宏调用，属性挂宏语句位被忽略（unused attribute），allow 上移 fn 位。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "测试：过期 deadline 判定锚点（tokio 虚拟钟域，pause 确定性）"
+    )]
     async fn g7c_expired_deadline_returns_immediately_without_waiting() {
         let (conn, _) = make_connection(1);
         conn.set_read_deadline(Some(deadline_before(60))).unwrap();
@@ -1412,6 +1433,11 @@ mod tests {
 
     /// G7 写侧同构：wd 已过期 → 立即 `IoTimeout`（Go waitForDataOutput 对称）。
     #[tokio::test(start_paused = true)]
+    // assert_eq! 是宏调用，属性挂宏语句位被忽略（unused attribute），allow 上移 fn 位。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "测试：过期 write deadline 判定锚点（tokio 虚拟钟域，pause 确定性）"
+    )]
     async fn g7_write_deadline_expiry_returns_io_timeout_immediately() {
         let (conn, _) = make_connection(1);
         conn.set_write_deadline(Some(deadline_before(60))).unwrap();

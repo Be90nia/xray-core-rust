@@ -1,14 +1,26 @@
 # 数据面分配纪律（oracle-framing-arch Phase 0 护栏）：禁热路径扁平化拷贝。
 # 生效范围：本 crate 生产代码；测试代码经 src/lib.rs 顶部 cfg_attr(test, allow)
-# 统一豁免（断言扁平化属测试便利）。CI 宽门 clippy -D warnings 使其成为红线。
+# 统一豁免（断言扁平化属测试便利）。生产代码禁令不受影响。
 # 注：slice 方法路径的 root 段必须是 primitive 关键字 `slice`（clippy
 # find_primitive_impls 机制），写 alloc::slice::/std::slice:: 反而解析不到。
 #
-# 注：per-crate clippy.toml 会替换 root 配置，root 阈值键在此镜像维护。
-cognitive-complexity-threshold = 30
-type-complexity-threshold = 300
+# L3 静态闸（bd a5r4j/lzzja 家族模板 + 本轮补齐，票 txmhr）：异步托管唯一口 =
+# FxScope/PluginContext::spawn（坑约束 #5），时钟唯一源 = skeleton::clock（L3-5）。
+# 本 crate 是 h2/h3 传输层：dialer/transport/handler/hub 的连接级任务全部落在
+# 数据面（坑约束⑫ 热路径零改动），且本 crate 生产依赖图无 PluginContext 注入面
+# （xray-frame 依赖仅用于 LogFacade），ctx 不可达 → 存量调用逐点
+# #[allow(clippy::disallowed_methods)] + 理由注释登记；FxScope 迁移收口见 bd 39hko。
+# 注：`path` 是被禁方法的 def path，不是源码 glob——glob 写进 path 不报 fatal 但
+# 禁令静默无效（xray-frame 探针 1 实测），落地禁用该形态。
+# 注：`tokio::spawn` 与 `tokio::task::spawn` 是同 def-id 的两个路径拼写，探针
+# 实测二者各自单独登记即覆盖两种调用形态（并列登记去重、每站点仅报一次）。
+#
+# 注：per-crate clippy.toml 会替换 root 配置（xray-frame 探针 2b 覆盖语义实测），
+# root 阈值键在此镜像维护。
 # bd g3cr 镜像（root clippy.toml 同键）：unwrap_used 由本 crate Cargo.toml
 # [lints.clippy] deny，测试代码（cfg(test)/tests/）豁免。
+cognitive-complexity-threshold = 30
+type-complexity-threshold = 300
 allow-unwrap-in-tests = true
 
 # 已知未覆盖角落（后续批次补）：
@@ -16,6 +28,12 @@ allow-unwrap-in-tests = true
 # - h2/hyper Bytes 边界的其他拷贝形态（等 Buffer::from_bytes 零拷贝入口）
 # - Vec::new 后逐段 extend（语义上等价 to_vec，静态识别需新 lint）
 disallowed-methods = [
+    { path = "tokio::spawn", reason = "裸 spawn 逃逸 FxScope 生命周期记账（坑约束 #5）：一律走 FxScope/PluginContext::spawn；本 crate 为 h2/h3 传输层，连接级任务全在数据面（坑约束⑫）且无 PluginContext 注入面，存量调用逐点 #[allow(clippy::disallowed_methods)] + 理由注释登记，FxScope 迁移收口见 bd 39hko" },
+    { path = "tokio::task::spawn", reason = "同 tokio::spawn（同 def-id 别名路径拼写，双登记 belt-and-braces；探针实测单独登记即覆盖两种调用形态）" },
+    { path = "std::thread::spawn", reason = "裸线程逃逸托管与停机编排（坑约束 #5/#6）：确需 OS 线程的场景逐点 #[allow(clippy::disallowed_methods)] + 理由注释登记" },
     { path = "slice::to_vec", reason = "数据面禁 to_vec 扁平化堆分配：热路径用池化 Buffer/MultiBuffer 传递；确需扁平化时 #[allow(clippy::disallowed_methods)] + 理由注释登记" },
     { path = "xray_buf::multi::MultiBuffer::to_vec", reason = "数据面禁 MultiBuffer 整链扁平化：确需快照时 #[allow] + 理由注释登记" },
+    { path = "std::time::Instant::now", reason = "713x6 时钟唯一源 = skeleton::clock（L3-5）：裸时钟不可注入，取时走 clock 端口；本 crate 无 Clock 注入面，存量站点逐点 #[allow] + 语义判定理由登记" },
+    { path = "tokio::time::Instant::now", reason = "713x6 时钟唯一源 = skeleton::clock：tokio 虚拟钟预算面与 std 面禁混换，确需保留时逐点 #[allow] + 语义判定理由登记" },
+    { path = "std::time::SystemTime::now", reason = "713x6 时钟唯一源 = skeleton::clock（L3-5）：裸挂钟不可注入，取时走 clock.now_system()；确需保留时逐点 #[allow] + 语义判定理由登记" },
 ]

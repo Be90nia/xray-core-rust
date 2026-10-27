@@ -250,6 +250,10 @@ async fn listen_tcp(
     let ctx = build_context(config, local, handler);
     crate::LOG.info(format!("{local} listening TCP for XHTTP"));
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；本 allow 覆盖 2 处（TCP accept 循环 + 循环内每连接处理任务），FxScope 迁移收口见 bd 39hko"
+    )]
     let accept_task = tokio::spawn(async move {
         loop {
             // 连接获取 + Tcpmask wrap（仅 TCP 分支）；None = 丢弃继续（accept
@@ -269,7 +273,11 @@ async fn listen_tcp(
         }
     });
     let tcp_abort = accept_task.abort_handle();
-    // 意外退出监控：循环只应经 close() 的 abort 退出；panic 会静默杀掉监听。
+    // 意外退出监控：循环只应经 close() 的 abort 句柄退出；panic 会静默杀掉监听。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；accept 循环意外退出监控任务，FxScope 迁移收口见 bd 39hko"
+    )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "splithttp",
         local.to_string(),
@@ -341,6 +349,10 @@ pub async fn listen_unix_splithttp(
     // 恒等 manager 占位（unix 无 finalmask，入口已拒绝非空配置）。
     let tcpmask = Some(Arc::new(xray_transport::finalmask::TcpmaskManager::new(Vec::new())));
     let log_ident = path.clone();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；本 allow 覆盖 2 处（unix accept 循环 + 循环内每连接处理任务），FxScope 迁移收口见 bd 39hko"
+    )]
     let accept_task = tokio::spawn(async move {
         loop {
             let Some((stream, peer)) =
@@ -358,6 +370,10 @@ pub async fn listen_unix_splithttp(
         }
     });
     let abort = accept_task.abort_handle();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；unix accept 循环意外退出监控任务，FxScope 迁移收口见 bd 39hko"
+    )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "splithttp-unix",
         path,
@@ -403,6 +419,11 @@ struct ProgressIo<T> {
 }
 
 impl<T> ProgressIo<T> {
+    // 赋值表达式语句位挂属性在本工具链 E0658（无 stmt_expr_attributes），故挂 fn 位。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 传输层无 Clock 注入面；IO 进展墙钟锚点（空闲兜底判定基准），FxScope/Clock 迁移收口见 bd 39hko"
+    )]
     fn touch(&self) {
         *self.last_progress.lock() = Instant::now();
     }
@@ -480,6 +501,10 @@ where
     use hyper::service::service_fn;
     use hyper_util::rt::{TokioExecutor, TokioIo};
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 传输层无 Clock 注入面；IO 进展墙钟初始锚点（空闲兜底判定基准），FxScope/Clock 迁移收口见 bd 39hko"
+    )]
     let last_progress = Arc::new(ProgressClock::new(Instant::now()));
     let io = TokioIo::new(ProgressIo { inner: stream, last_progress: Arc::clone(&last_progress) });
     let svc = service_fn(move |req| {
@@ -796,6 +821,10 @@ async fn listen_h3(
     crate::LOG.info(format!("{local} listening QUIC for XHTTP/3"));
 
     let listener_endpoint = endpoint.clone();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；本 allow 覆盖 2 处（QUIC accept 循环 + 循环内每连接处理任务），FxScope 迁移收口见 bd 39hko"
+    )]
     let _accept_task = tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let ctx = Arc::clone(&ctx);
@@ -822,6 +851,10 @@ async fn serve_h3_conn(conn: quinn::Connection, ctx: Arc<HandlerContext>) {
         let ctx = Arc::clone(&ctx);
         let conn = conn.clone();
         let peer = conn.remote_address();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；h3 每请求任务（+ 请求体桥接任务 + 连接终结 abort 任务），FxScope 迁移收口见 bd 39hko"
+        )]
         tokio::spawn(async move {
             let Ok((req, stream)) = resolver.resolve_request().await else {
                 return;
@@ -939,6 +972,10 @@ impl HubConnHandler for ConnHandlerAdapter {
         let remote = conn.remote_addr;
         let local = conn.local_addr;
         (self.0)(Box::new(DuplexConn { inner: client, remote: Some(remote), local: Some(local) }));
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；duplex 双向 copy 桥任务（ServerConn ↔ registry handler），FxScope 迁移收口见 bd 39hko"
+        )]
         tokio::spawn(async move {
             let ServerConn { reader: mut up, writer: mut down, .. } = conn;
             let (mut rd, mut wr) = tokio::io::split(server);

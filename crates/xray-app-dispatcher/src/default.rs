@@ -874,6 +874,10 @@ type BackgroundTasks = Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>;
 /// 次 spawn（wfx8-5 登记：周期 reaper 为后续项，暂不新增常驻定时器并发面）。
 fn spawn_tracked(set: &BackgroundTasks, task: impl Future<Output = ()> + Send + 'static) {
     let set = Arc::clone(set);
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "ctx 不可达：dispatcher 生产依赖图无 PluginContext（xray-frame 仅 dev-dependency）；业务 task 由 JoinSet 持有并在宿主 drop 时 abort，FxScope 迁移收口见 bd 39hko"
+    )]
     tokio::spawn(async move {
         let mut set = set.lock().await;
         while set.try_join_next().is_some() {}

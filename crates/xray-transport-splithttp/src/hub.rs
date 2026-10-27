@@ -206,6 +206,10 @@ impl HubListener {
             };
             let io = hyper_util::rt::TokioIo::new(stream);
             let ctx = Arc::clone(&ctx);
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；每 TCP 连接一个 hyper http1/h2 服务任务，FxScope 迁移收口见 bd 39hko"
+            )]
             tokio::spawn(async move {
                 use hyper::service::service_fn;
                 let svc = service_fn(move |req| {

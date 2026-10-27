@@ -124,6 +124,10 @@ impl<C: XmuxConn + 'static> XmuxClient<C> {
             return true;
         }
         if let Some(t) = *self.unreusable_at.lock() {
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 传输层无 Clock 注入面；xmux client 不可复用判定锚点（Go xmux time.Time 墙钟语义），FxScope/Clock 迁移收口见 bd 39hko"
+            )]
             if Instant::now() > t {
                 return true;
             }
@@ -191,6 +195,11 @@ impl<C: XmuxConn + 'static> XmuxManager<C> {
 
         // hMaxReusableSecs: rand > 0 时设置 UnreusableAt = Now + secs
         let x = self.xmux_config.normalized_h_max_reusable_secs().rand();
+        // 赋值表达式语句位挂属性在本工具链 E0658（无 stmt_expr_attributes），allow 上移 if 语句位。
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 传输层无 Clock 注入面；xmux client UnreusableAt = Now + secs 锚点（Go xmux time.Time 墙钟语义），FxScope/Clock 迁移收口见 bd 39hko"
+        )]
         if x > 0 {
             *client.unreusable_at.lock() = Some(Instant::now() + Duration::from_secs(x as u64));
         }

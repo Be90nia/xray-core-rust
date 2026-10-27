@@ -772,6 +772,10 @@ fn spawn_h2_lazy_reader(
         }),
         None => Box::pin(std::future::pending()),
     };
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，client 无 PluginContext 注入面；h2 懒读任务（GET 响应头 + body 流转发），FxScope 迁移收口见 bd 39hko"
+    )]
     tokio::spawn(async move {
         tokio::select! {
             _ = &mut close_fut => (),

@@ -362,6 +362,10 @@ impl H3Conn {
                     // ZeroRttAccepted 是纯观察 future，后台 task 只记日志；server_name
                     // 转 owned 以满足 spawn 的 'static（&str 参数活不过函数体）。
                     let server_name = server_name.to_string();
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；QUIC 0-RTT 结果观察任务（仅记日志），FxScope 迁移收口见 bd 39hko"
+                    )]
                     tokio::spawn(async move {
                         let accepted = accepted.await;
                         debug!(
@@ -386,6 +390,10 @@ impl H3Conn {
             .await
             .map_err(|e| SplitHttpError::Hyper(format!("h3::client::new: {e}")))?;
 
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；h3 连接 driver 关闭任务（驱动 poll_close），FxScope 迁移收口见 bd 39hko"
+        )]
         tokio::spawn(async move {
             let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
@@ -592,6 +600,10 @@ impl H3Conn {
         // spawn 上传任务：循环 read body_stream → send_data → finish → 响应处理
         let this = self.clone();
         let me_for_closed = Arc::downgrade(&this);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；H3 上行 body 发送任务，FxScope 迁移收口见 bd 39hko"
+        )]
         tokio::spawn(async move {
             let mut body_stream = Box::pin(body_stream);
             while let Some(chunk) = body_stream.next().await {
@@ -682,6 +694,10 @@ where
     B: Buf + 'static,
 {
     let (tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(8);
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；H3 下行接收任务（send_data/recv_data 均需 &mut self 故必须单 task），FxScope 迁移收口见 bd 39hko"
+    )]
     tokio::spawn(async move {
         loop {
             match stream.recv_data().await {
@@ -731,6 +747,10 @@ where
         }),
         None => Box::pin(std::future::pending()),
     };
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；H3 懒读任务（收响应头 + 数据循环），FxScope 迁移收口见 bd 39hko"
+    )]
     tokio::spawn(async move {
         tokio::select! {
             _ = &mut close_fut => (),
