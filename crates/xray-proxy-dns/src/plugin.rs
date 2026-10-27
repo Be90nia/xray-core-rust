@@ -22,13 +22,22 @@
 //! 是 Xray 语义方向件——按 CLAUDE.md §3.5.3「带领域方向的件不进 udf-frame」，
 //! 留主仓最近消费方；无提炼候选。
 
-use std::{sync::OnceLock, time::Duration};
+use std::{
+    sync::{LazyLock, OnceLock},
+    time::Duration,
+};
 
 use xray_frame::{
-    ClauseId, Lifecycle, Plugin, PluginContext, PluginContract, PluginDep, PluginError,
+    ClauseId, Lifecycle, LogFacade, Plugin, PluginContext, PluginContract, PluginDep, PluginError,
 };
 
 use crate::{config::Config, handler::Handler, inbound::DnsInbound, outbound::DnsOutbound};
+
+/// 配置解析诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目工具链
+/// 上 `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三形态
+/// 实测无效），迁移为唯一关红路径。域 = "dns"，target `xray_frame::dns` +
+/// mask_secrets。只在配置解析告警分支发射（装配冷路径）。
+static PLUGIN_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("dns", vec![]));
 
 /// 通用条款适用子集（差异表 §2.2 第 16 行 + PM 拍板 2026-10-24：3,4,5,6,7,8,9,10,12；
 /// 1/2/11 走 [`DNS_NOT_APPLICABLE`]——DNS 无认证面、无会话握手、无密钥）。
@@ -218,9 +227,10 @@ fn parse_dns_outbound_settings(v: &serde_json::Value) -> std::result::Result<Con
             return Err("legacy nonIPQuery and blockTypes cannot be mixed with rules".into());
         }
         // Go errors.PrintDeprecatedFeatureWarning（feature_errors.go:15-18）。
-        tracing::warn!(
-            target: "xray_proxy_dns::plugin",
-            "This feature \"nonIPQuery\" and \"blockTypes\" is deprecated, will be removed soon and being migrated to \"rules\". Please update your config(s) according to release note and documentation before removal."
+        PLUGIN_LOG.warn(
+            "This feature \"nonIPQuery\" and \"blockTypes\" is deprecated, will be removed \
+             soon and being migrated to \"rules\". Please update your config(s) according to \
+             release note and documentation before removal.",
         );
         config.rule = build_legacy_dns_policy(non_ip_query, block_types)?;
     }
@@ -326,11 +336,10 @@ fn warn_unknown_dns_outbound_keys(v: &serde_json::Value) {
     let unknown: Vec<&String> =
         map.keys().filter(|k| !DNS_OUTBOUND_KNOWN_KEYS.contains(&k.as_str())).collect();
     if !unknown.is_empty() {
-        tracing::warn!(
-            target: "xray_proxy_dns::plugin",
-            keys = ?unknown,
-            "dns outbound settings: unrecognized keys are ignored (must match Go infra/conf/dns_proxy.go names or the Rust legacy dialect)"
-        );
+        PLUGIN_LOG.warn(format!(
+            "dns outbound settings: unrecognized keys are ignored (must match Go \
+             infra/conf/dns_proxy.go names or the Rust legacy dialect) keys={unknown:?}"
+        ));
     }
 }
 

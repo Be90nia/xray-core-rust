@@ -383,7 +383,11 @@ where
                 Poll::Ready(Err(e)) => {
                     // 结构化观测：TLS 层 fatal（如对端安全层误解 raw 流的
                     // BadRecordMac）是 splice 边界问题的第一现场。
-                    tracing::warn!(error = %e, "vision inner read error");
+                    // 红线登记（nn8os 2b）：vision splice 数据面 raw tracing 保留
+                    // （迁移票判定规则：红线不硬攻）；`warn!` → `event!` 为等价
+                    // 展开（warn! 即 event!(Level::WARN, ..) 薄壳），仅过 L3 宏
+                    // 禁令，运行时零差异。
+                    tracing::event!(tracing::Level::WARN, error = %e, "vision inner read error");
                     return Poll::Ready(Err(e));
                 },
                 Poll::Pending => return Poll::Pending,

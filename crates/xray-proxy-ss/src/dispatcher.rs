@@ -17,7 +17,7 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     task::{Context, Poll},
 };
 
@@ -28,7 +28,7 @@ use tokio::{
 };
 use xray_app_dispatcher::default::DialFn;
 use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
-use xray_frame::PluginContext;
+use xray_frame::{LogFacade, PluginContext};
 use xray_transport::connection::Connection;
 use xray_xudp::packet::{PacketError, PacketReader, PacketWriter};
 
@@ -40,6 +40,13 @@ use crate::{
     stream::SSStream,
     validator::{MemoryUser, Validator},
 };
+
+/// 泵诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目工具链上
+/// `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三形态实测
+/// 无效），迁移为唯一关红路径。域 = "ss"，target `xray_frame::ss` +
+/// mask_secrets。只在 pump 错误分支发射；pump 函数循环外取一次引用（坑约束⑫
+/// 热路径零每包开销）。
+static SS_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("ss", vec![]));
 
 /// SS duplex 缓冲（与 hysteria/tuic 一致：64 KiB）。
 const DUPLEX_BUF_SIZE: usize = 64 * 1024;
@@ -166,6 +173,7 @@ impl Connection for SsConnection {
 /// cancel-safe 的 `AsyncReadExt::read`。连接为 transport 层产物
 /// `Box<dyn Connection>`（ws+tls 包装或裸 TCP），无 TcpStream::readable 可用。
 async fn pump_ss_stream(mut stream: SSStream<Box<dyn Connection>>, server_io: DuplexStream) {
+    let log = &*SS_LOG;
     let (mut rd, mut wr) = tokio::io::split(server_io);
     let mut up_buf = vec![0u8; 8 * 1024];
     let mut down_buf = vec![0u8; 16 * 1024];
@@ -193,7 +201,7 @@ async fn pump_ss_stream(mut stream: SSStream<Box<dyn Connection>>, server_io: Du
                     return;
                 },
                 Err(e) => {
-                    tracing::debug!("ss pump down decode error: {e}");
+                    log.debug(format!("ss pump down decode error: {e}"));
                     return;
                 },
             }
@@ -218,7 +226,7 @@ async fn pump_ss_stream(mut stream: SSStream<Box<dyn Connection>>, server_io: Du
                         }
                     }
                     Err(e) => {
-                        tracing::debug!("ss pump up read error: {e}");
+                        log.debug(format!("ss pump up read error: {e}"));
                         break;
                     }
                 }
@@ -252,7 +260,7 @@ async fn pump_ss_stream(mut stream: SSStream<Box<dyn Connection>>, server_io: Du
                     }
                     Ok(n) => pending.extend_from_slice(&down_buf[..n]),
                     Err(e) => {
-                        tracing::debug!("ss pump down read error: {e}");
+                        log.debug(format!("ss pump down read error: {e}"));
                         break;
                     }
                 }
@@ -607,6 +615,7 @@ async fn pump_ss_udp(
     server_io: DuplexStream,
     default_dest: Destination,
 ) {
+    let log = &*SS_LOG;
     let sock = Arc::new(sock);
     let (mut rd, mut wr) = tokio::io::split(server_io);
     // 回包解码 validator：单用户（出站只有一个 account）
@@ -627,7 +636,7 @@ async fn pump_ss_udp(
                 {
                     Ok(made) => progress = made,
                     Err(e) => {
-                        tracing::debug!("ss udp up forward error: {e}");
+                        log.debug(format!("ss udp up forward error: {e}"));
                         return;
                     },
                 }
@@ -636,7 +645,7 @@ async fn pump_ss_udp(
                 Ok(0) => return, // link EOF
                 Ok(n) => accum.extend_from_slice(&buf[..n]),
                 Err(e) => {
-                    tracing::debug!("ss udp up read error: {e}");
+                    log.debug(format!("ss udp up read error: {e}"));
                     return;
                 },
             }
@@ -654,7 +663,7 @@ async fn pump_ss_udp(
             let n = match sock.recv(&mut rbuf).await {
                 Ok(n) => n,
                 Err(e) => {
-                    tracing::debug!("ss udp down recv error: {e}");
+                    log.debug(format!("ss udp down recv error: {e}"));
                     break;
                 },
             };
@@ -702,6 +711,7 @@ async fn pump_ss2022_udp(
         packet::ClientUdpSession2022,
     };
 
+    let log = &*SS_LOG;
     let kind = CipherKind2022::from_name(&params.method);
     let session = match kind.map_err(|e| e.to_string()).and_then(|kind| {
         // PSK 链（Go ParsePSKList 顺序：iPSK…:uPSK；chacha 多 PSK 已在 parse 硬错）
@@ -714,7 +724,7 @@ async fn pump_ss2022_udp(
     }) {
         Ok(s) => std::sync::Arc::new(s),
         Err(e) => {
-            tracing::debug!("ss2022 udp session init: {e}");
+            log.debug(format!("ss2022 udp session init: {e}"));
             return;
         },
     };
@@ -745,7 +755,7 @@ async fn pump_ss2022_udp(
                 {
                     Ok(made) => progress = made,
                     Err(e) => {
-                        tracing::debug!("ss2022 udp up forward error: {e}");
+                        log.debug(format!("ss2022 udp up forward error: {e}"));
                         return;
                     },
                 }
@@ -754,7 +764,7 @@ async fn pump_ss2022_udp(
                 Ok(0) => return, // link EOF
                 Ok(n) => accum.extend_from_slice(&buf[..n]),
                 Err(e) => {
-                    tracing::debug!("ss2022 udp up read error: {e}");
+                    log.debug(format!("ss2022 udp up read error: {e}"));
                     return;
                 },
             }
@@ -772,7 +782,7 @@ async fn pump_ss2022_udp(
             let n = match sock.recv(&mut rbuf).await {
                 Ok(n) => n,
                 Err(e) => {
-                    tracing::debug!("ss2022 udp down recv error: {e}");
+                    log.debug(format!("ss2022 udp down recv error: {e}"));
                     break;
                 },
             };

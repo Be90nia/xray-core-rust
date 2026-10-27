@@ -34,7 +34,7 @@
 //! CLAUDE.md §3.5.3「带领域方向的件不进 udf-frame」，留主仓最近消费方；
 //! 无提炼候选。
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use xray_app_dispatcher::default::DialFn;
 use xray_common::{
@@ -42,7 +42,7 @@ use xray_common::{
     uuid::UUID,
 };
 use xray_frame::{
-    ClauseId, Lifecycle, Plugin, PluginContext, PluginContract, PluginDep, PluginError,
+    ClauseId, Lifecycle, LogFacade, Plugin, PluginContext, PluginContract, PluginDep, PluginError,
 };
 use xray_proto::xray::proxy::vless::Account as ProtoAccount;
 
@@ -56,6 +56,12 @@ use crate::{
     },
     validator::{MemoryUser, MemoryValidator, Validator},
 };
+
+/// 配置解析诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目工具链
+/// 上 `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三形态
+/// 实测无效），迁移为唯一关红路径。域 = "vless"，target `xray_frame::vless` +
+/// mask_secrets。只在配置解析告警/装配信息分支发射（冷路径）。
+static PLUGIN_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("vless", vec![]));
 
 /// 通用条款适用子集（差异表 §2.2 第 1 行：vless **12 条全适用**——UUID 认证 →
 /// 1/11；请求头握手 → 2；body 长度前缀分帧/缓冲 → 4；其余照常）。
@@ -441,7 +447,8 @@ fn parse_validator(settings: &serde_json::Value) -> Result<MemoryValidator, Plug
                 .map_err(|e| PluginError::Other(format!("vless account parse: {e}").into()))?;
             let user = MemoryUser::new(email, level, account);
             if let Err(e) = Validator::add(&validator, user) {
-                tracing::warn!(error = %e, "skip duplicate vless user during validator build");
+                PLUGIN_LOG
+                    .warn(format!("skip duplicate vless user during validator build error={e}"));
             }
         }
     }
@@ -490,12 +497,10 @@ fn parse_decryption(
         std::sync::Arc::new(xray_frame::PluginContext::for_plugin("vless")),
     )
     .map_err(|e| PluginError::Other(format!("vless decryption init: {e}").into()))?;
-    tracing::info!(
-        seconds_from = p.seconds_from,
-        seconds_to = p.seconds_to,
-        keys = key_count,
-        "vless enc decryption enabled"
-    );
+    PLUGIN_LOG.info(format!(
+        "vless enc decryption enabled seconds_from={} seconds_to={} keys={key_count}",
+        p.seconds_from, p.seconds_to
+    ));
     Ok(Some(Arc::new(inst)))
 }
 

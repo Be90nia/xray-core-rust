@@ -20,7 +20,7 @@
 //! - Rvs：`inbound.go:625-630` → `Reverse.NewMux`（本批次仅注册表查找 + 转发，完整 worker 在其他
 //!   issue）
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -29,6 +29,7 @@ use tokio::{
 use xray_app_dispatcher::{OutboundHandlerManager, default::SimpleOhm};
 use xray_buf::io::{new_coalescing_writer, new_reader, new_writer};
 use xray_common::net::{destination::Destination, network::Network, port::Port};
+use xray_frame::LogFacade;
 use xray_transport::{link::Link, system_listener::InboundTcpListener};
 
 use crate::{
@@ -39,6 +40,15 @@ use crate::{
     encryption::vision_conn::VisionConn,
     validator::Validator,
 };
+
+/// 入站诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目工具链上
+/// `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三形态实测
+/// 无效），迁移为唯一关红路径。域 = "vless"，target `xray_frame::vless` +
+/// mask_secrets。只在 accept/握手/fallback/Reverse 控制面事件发射（连接级，
+/// 非逐包热路径；vision splice 数据面 raw tracing 另行红线登记于
+/// encryption/vision_conn.rs）。
+static INBOUND_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("vless", vec![]));
+
 /// VLESS inbound 协议族接入选项（feature flags）。
 /// 对应 Go `proxy/vless/inbound/inbound.go::Handler` 的可选特性：
 /// - `enable_reverse`：是否由本 inbound 接管 `command=Rvs`（Portal 反向代理）。 `false` 时维持
@@ -105,11 +115,11 @@ pub async fn serve_vless(
         .get_default_handler()
         .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
 
-    tracing::info!(
-        addr = %listener.local_addr()?,
-        reverse = options.as_ref().map(|o| o.enable_reverse).unwrap_or(false),
-        "vless inbound listening"
-    );
+    INBOUND_LOG.info(format!(
+        "vless inbound listening addr={} reverse={}",
+        listener.local_addr()?,
+        options.as_ref().map(|o| o.enable_reverse).unwrap_or(false),
+    ));
 
     // tcpSettings.header 伪装头（Go hub.go:85-95 authConfig；TLS 解包后应用）。
     let header = listener.header_auth().cloned();
@@ -119,7 +129,7 @@ pub async fn serve_vless(
         let (stream, peer) = match listener.accept_masked().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error = %e, "vless accept failed");
+                INBOUND_LOG.warn(format!("vless accept failed error={e}"));
                 continue;
             },
         };
@@ -176,7 +186,7 @@ pub async fn serve_vless(
                         .await
                     },
                     Err(e) => {
-                        tracing::warn!(error = %e, "vless TLS accept failed");
+                        INBOUND_LOG.warn(format!("vless TLS accept failed error={e}"));
                         return;
                     },
                 }
@@ -200,7 +210,8 @@ pub async fn serve_vless(
             };
             if let Err(e) = result {
                 // Go vless inbound.go:522：拒绝 AtInfo + RemoteAddr。
-                tracing::info!(peer = %peer, error = %e, "vless connection ended with error");
+                INBOUND_LOG
+                    .info(format!("vless connection ended with error peer={peer} error={e}"));
             }
         });
     }
@@ -303,7 +314,7 @@ where
     let stream: std::pin::Pin<Box<dyn ErasedConn>> =
         match options.as_ref().and_then(|o| o.decryption.clone()) {
             Some(dec) => Box::pin(dec.handshake(stream).await.map_err(|e| {
-                tracing::info!(error = %e, "vless enc handshake failed");
+                INBOUND_LOG.info(format!("vless enc handshake failed error={e}"));
                 std::io::Error::other(format!("vless enc handshake: {e}"))
             })?),
             None => Box::pin(stream),
@@ -422,7 +433,10 @@ where
     let Some(fb) = policy.find_with_fallback(tls_name, tls_alpn, path) else {
         return Err(std::io::Error::other("vless decode failed and no fallback matched"));
     };
-    tracing::debug!(dest = %fb.dest, xver = fb.xver, name = tls_name, alpn = tls_alpn, path, "vless fallback");
+    INBOUND_LOG.debug(format!(
+        "vless fallback dest={} xver={} name={tls_name} alpn={tls_alpn} path={path}",
+        fb.dest, fb.xver
+    ));
     let mut conn = tokio::io::join(read_half, write_half);
     let _ = xray_transport::fallback::fallback_to_dest(
         &mut conn, first, &fb.dest, peer, local, fb.xver,
@@ -755,10 +769,10 @@ where
     let opts = options;
     let enabled = opts.map(|o| o.enable_reverse).unwrap_or(false);
     if !enabled {
-        tracing::warn!(
-            command = ?decoded.command,
-            "vless Reverse command received but enable_reverse=false, closing"
-        );
+        INBOUND_LOG.warn(format!(
+            "vless Reverse command received but enable_reverse=false, closing command={:?}",
+            decoded.command
+        ));
         return Ok(());
     }
 
@@ -803,11 +817,11 @@ where
         Network::TCP,
     );
     let link = Link::new(new_reader(reader), new_writer(writer));
-    tracing::debug!(
-        user = decoded.user.as_ref().map(|u| u.email.as_str()).unwrap_or("?"),
-        portal_tag = %portal_cfg.tag,
-        "vless Reverse: dispatch to PortalOutbound via ohm"
-    );
+    INBOUND_LOG.debug(format!(
+        "vless Reverse: dispatch to PortalOutbound via ohm user={} portal_tag={}",
+        decoded.user.as_ref().map(|u| u.email.as_str()).unwrap_or("?"),
+        portal_cfg.tag
+    ));
     let _ = portal_handler.dispatch(&dest, link).await;
     Ok(())
 }

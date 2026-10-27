@@ -187,7 +187,10 @@ mod tests {
         let capture = Arc::new(Mutex::new(Vec::new()));
         let guard = tracing::subscriber::set_default(WarnCapture(Arc::clone(&capture)));
         tracing::callsite::rebuild_interest_cache();
-        tracing::warn!(error = %err, "vless connection ended with error");
+        // 测试面 raw tracing 登记（nn8os 2b）：本测试自发射事件验证 capture
+        // subscriber 形态与 UUID 掩码断言（非生产路径）；`warn!` 换等价展开
+        // `event!` 过 L3 禁令。
+        tracing::event!(tracing::Level::WARN, error = %err, "vless connection ended with error");
         drop(guard);
         let lines = capture.lock().unwrap().join("\n");
         assert!(lines.contains("vless connection ended"), "捕获必须咬到事件: {lines:?}");

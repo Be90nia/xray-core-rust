@@ -16,4 +16,9 @@ disallowed-methods = [
 disallowed-macros = [
     { path = "std::println", reason = "禁直印 stdout：日志走 LogFacade（PluginContext::log，P0-7 target 规范）" },
     { path = "std::eprintln", reason = "禁直印 stderr：日志走 LogFacade（PluginContext::log，P0-7 target 规范）" },
+    { path = "tracing::info", reason = "裸 tracing 事件绕过 LogFacade（坑约束 10：logx 门面 + xray_frame::<域> target + mask_secrets）：一律走 PluginContext::log" },
+    { path = "tracing::warn", reason = "裸 tracing 事件绕过 LogFacade（坑约束 10）：一律走 PluginContext::log" },
+    { path = "tracing::error", reason = "裸 tracing 事件绕过 LogFacade（坑约束 10）：一律走 PluginContext::log" },
+    { path = "tracing::debug", reason = "裸 tracing 事件绕过 LogFacade（坑约束 10）：一律走 PluginContext::log" },
+    { path = "tracing::trace", reason = "裸 tracing 事件绕过 LogFacade（坑约束 10）：一律走 PluginContext::log" },
 ]

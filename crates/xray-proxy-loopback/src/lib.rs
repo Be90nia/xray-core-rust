@@ -17,7 +17,12 @@
 //! 这些类型在 Rust 端尚未实现。等 `xray-app-dispatcher` 提供等价 Dispatcher trait
 //! 与 `xray-transport` 提供等价 Link 后，在 [`Loopback`] 之上加一层 adapter 即可接入。
 
-use std::{fmt::Debug, future::Future, pin::Pin, sync::Arc};
+use std::{
+    fmt::Debug,
+    future::Future,
+    pin::Pin,
+    sync::{Arc, LazyLock},
+};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -27,6 +32,7 @@ use xray_features::{
     inbound::{InboundError, InboundHandler},
     outbound::{OutboundError, OutboundHandler},
 };
+use xray_frame::LogFacade;
 use xray_proto::xray::proxy::loopback::Config;
 
 // P1-8 插件化（五层强约束第二个全层试点，骨架复用 blackhole 样板）：
@@ -37,6 +43,12 @@ use xray_proto::xray::proxy::loopback::Config;
 pub mod plugin;
 
 pub use plugin::{LoopbackLifecycle, LoopbackPlugin};
+
+/// 分发诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目工具链上
+/// `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三形态实测
+/// 无效），迁移为唯一关红路径。域 = "loopback"，target `xray_frame::loopback`
+/// + mask_secrets。只在错误分支发射（非数据面热路径，坑约束⑫不触）。
+static LOOPBACK_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("loopback", vec![]));
 
 /// Loopback 错误。
 #[derive(Debug, Error)]
@@ -236,16 +248,18 @@ impl DispatchHandler for LoopbackHandler {
                     if let Err(e) =
                         s.dispatch_loopback(inbound_tag.clone(), dest, sniffing, link).await
                     {
-                        tracing::warn!(inbound_tag = %inbound_tag, error = %e, "loopback dispatch failed");
+                        LOOPBACK_LOG.warn(format!(
+                            "loopback dispatch failed inbound_tag={inbound_tag} error={e}"
+                        ));
                     }
                 },
                 None => {
                     // 装配缺失（生产 xray-core functions.rs 应注入 DispatcherLoopbackSink）；
                     // 连接无处可去，显式 error 防静默黑洞（票 rdcc）。
-                    tracing::error!(
-                        inbound_tag = %inbound_tag,
-                        "loopback outbound dispatched without sink: dropping connection (assembly missing DispatcherLoopbackSink)"
-                    );
+                    LOOPBACK_LOG.error(format!(
+                        "loopback outbound dispatched without sink: dropping connection \
+                         (assembly missing DispatcherLoopbackSink) inbound_tag={inbound_tag}"
+                    ));
                     drop(link);
                 },
             }

@@ -18,7 +18,7 @@ use std::{
     io,
     net::SocketAddr,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -30,6 +30,7 @@ use xray_common::{
     net::{address::Address, destination::Destination, network::Network, port::Port},
     uuid::UUID,
 };
+use xray_frame::LogFacade;
 use xray_transport::{
     connection::Connection,
     dialer::{StreamSettings, dial},
@@ -39,6 +40,12 @@ use crate::{
     encoding::{VERSION, VlessCommand, client::encode_request_header, empty_addons},
     encryption::vision_conn::VisionConn,
 };
+
+/// 预拨号诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目工具链上
+/// `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三形态实测
+/// 无效），迁移为唯一关红路径。域 = "vless"，target `xray_frame::vless` +
+/// mask_secrets。只在拨号失败分支发射（200ms 周期重试路径，非数据面热路径）。
+static PRECONN_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("vless", vec![]));
 
 /// VLESS outbound 配置。
 #[derive(Debug, Clone)]
@@ -264,7 +271,7 @@ fn spawn_preconn_workers(
                             break; // handler 已释放，收摊
                         }
                     },
-                    Err(e) => tracing::debug!(error = %e, "vless pre-connect failed"),
+                    Err(e) => PRECONN_LOG.debug(format!("vless pre-connect failed error={e}")),
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }

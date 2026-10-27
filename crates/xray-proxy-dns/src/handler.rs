@@ -15,16 +15,24 @@
 //! 留切片3）。DNS 代理与其他 inbound 协议不同——它不主动 listen，而是接收
 //! dispatcher 分发的已建立连接。
 
-use std::time::Duration;
+use std::{sync::LazyLock, time::Duration};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 use xray_common::net::destination::Destination;
+use xray_frame::LogFacade;
 
 use crate::{
     config::{Config, DnsRule, RuleAction},
     dns_message::{DnsQuestion, build_dns_response, parse_dns_query},
     error::{DnsProxyError, Result},
 };
+
+/// 规则编译诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目工具链
+/// 上 `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三形态
+/// 实测无效），迁移为唯一关红路径。域 = "dns"，target `xray_frame::dns` +
+/// mask_secrets。只在规则编译失败分支发射（装配冷路径）。
+static HANDLER_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("dns", vec![]));
+
 /// DNS 代理 Handler。对应 Go `proxy/dns/dns.go::Handler` struct。
 #[derive(Debug, Clone)]
 pub struct Handler {
@@ -96,12 +104,11 @@ impl Handler {
             match DnsRule::from_config(rc) {
                 Ok(rule) => rules.push(rule),
                 Err(e) => {
-                    tracing::error!(
-                        target: "xray_proxy_dns::handler",
-                        rule = idx,
-                        error = %e,
-                        "dns rule compile failed; rule disabled (fail-closed, never matches). Use Handler::try_init to refuse startup (Go Handler.Init returns this error)"
-                    );
+                    HANDLER_LOG.error(format!(
+                        "dns rule compile failed; rule disabled (fail-closed, never matches). \
+                         Use Handler::try_init to refuse startup (Go Handler.Init returns this \
+                         error) rule={idx} error={e}"
+                    ));
                     rules.push(DnsRule::inert(rc));
                 },
             }

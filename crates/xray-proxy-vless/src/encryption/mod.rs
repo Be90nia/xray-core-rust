@@ -21,7 +21,7 @@
 //! 再注入实现。
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::Instant,
 };
 
@@ -29,11 +29,18 @@ use ml_kem::KeyExport;
 use parking_lot::RwLock;
 // rand_core trait bounds for build_relaychain RNG
 use rand_core::{CryptoRng, RngCore};
+use xray_frame::LogFacade;
 
 use crate::{
     encryption::xor::CtrXor,
     error::{Result, VlessError},
 };
+
+/// ENC 握手诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目工具链
+/// 上 `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三形态
+/// 实测无效），迁移为唯一关红路径。域 = "vless"，target `xray_frame::vless` +
+/// mask_secrets。只在握手/票据生命周期事件发射（每连接一次，非逐包热路径）。
+static ENC_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("vless", vec![]));
 /// SendOsRng REMOVED (compat harness too fragile).
 /// See handshake body for new pattern.
 pub mod aead;
@@ -458,10 +465,10 @@ impl ClientInstance {
                         .copy_from_slice(&enc_ticket);
                     conn.write_all(&pre_write).await?;
                     conn.flush().await?;
-                    tracing::debug!(
+                    ENC_LOG.debug(format!(
                         "vless enc: 0-RTT fast path engaged (pre_write {}B, cached pfs_key + fresh nfs_key)",
                         pre_write.len()
-                    );
+                    ));
                     let mut united_key = Vec::with_capacity(96);
                     united_key.extend_from_slice(&pfs_key);
                     united_key.extend_from_slice(&nfs_key);
@@ -637,10 +644,9 @@ impl ClientInstance {
                 ticket: Some(ticket16),
                 expire: Some(expire),
             };
-            tracing::debug!(
-                "vless enc: 0-RTT credentials cached (pfs_key 64B + ticket, expires in {}s)",
-                server_seconds
-            );
+            ENC_LOG.debug(format!(
+                "vless enc: 0-RTT credentials cached (pfs_key 64B + ticket, expires in {server_seconds}s)"
+            ));
         }
 
         // 14. 构造加密连接：xor_mode==2 时 XorConn 包在 CommonConn 之下（record 封装
@@ -1127,11 +1133,10 @@ impl ServerInstance {
                     ticket,
                     ServerSession { pfs_key: pfs_key.clone(), nfs_keys: HashSet::new() },
                 );
-                tracing::info!(
-                    sessions = store.sessions.len(),
-                    seconds,
-                    "vless enc: 1-RTT done, session stored (ticket issued)"
-                );
+                ENC_LOG.info(format!(
+                    "vless enc: 1-RTT done, session stored (ticket issued) sessions={} seconds={seconds}",
+                    store.sessions.len()
+                ));
             }
             // 随机 padding（对齐 Go server.go:288 CreatPadding，含 gaps），
             // 钳最小 34B 防 0 长度自定义配置下溢（Go 同配置直接 panic），
@@ -1276,10 +1281,10 @@ impl ServerInstance {
             if !session.nfs_keys.insert(*nfs_key) {
                 return Err(VlessError::Other("replay detected".into()));
             }
-            tracing::info!(
-                nfs_keys = session.nfs_keys.len(),
-                "vless enc: 0-RTT ticket accepted (session hit, replay-guard recorded)"
-            );
+            ENC_LOG.info(format!(
+                "vless enc: 0-RTT ticket accepted (session hit, replay-guard recorded) nfs_keys={}",
+                session.nfs_keys.len()
+            ));
             // Go server.go:226：缓存 pfs_key + 本次新 nfs_key（同 nfsKey 链接上下行，
             // 防 server→client 的另一请求）。
             united_key = {

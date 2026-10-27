@@ -11,14 +11,21 @@
 //! domain 匹配已接 `xray_geodata` matcher（`SimpleMatcherGroup`，就地编译）；
 //! 实际 DNS 转发依赖 `dns::Client` feature + transport::Link。
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
+use xray_frame::LogFacade;
 use xray_geodata::matcher::{
     MatcherGroup,
     domain::{DomainRule as GeoDomainRule, DomainType as GeoDomainType, parse_domain},
 };
 
 use crate::error::{DnsProxyError, Result};
+
+/// geosite 条目解析诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——
+/// 本项目工具链上 `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/
+/// 文件顶三形态实测无效），迁移为唯一关红路径。域 = "dns"，target
+/// `xray_frame::dns` + mask_secrets。只在配置解析错误分支发射（冷路径）。
+static CONFIG_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("dns", vec![]));
 
 /// DNS 规则动作。对应 proto `RuleAction` 枚举。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -207,14 +214,20 @@ impl DnsRule {
                     // Go loadSiteMatchers：dat 内单条目解析失败 → log+skip 该条（非致命）
                     for d in &site.domain {
                         let Some(dt) = proto_domain_type(d.r#type) else {
-                            tracing::warn!(target: "xray_proxy_dns::config", domain_type = d.r#type, file = %file, code = %g.code, "invalid geosite entry type, entry skipped");
+                            CONFIG_LOG.warn(format!(
+                                "invalid geosite entry type, entry skipped domain_type={} file={file} code={}",
+                                d.r#type, g.code
+                            ));
                             continue;
                         };
                         let rule = GeoDomainRule::new(dt, d.value.clone(), (i + 1) as u32);
                         match parse_domain(&rule) {
                             Ok(m) => group.add(m, (i + 1) as u32),
                             Err(e) => {
-                                tracing::warn!(target: "xray_proxy_dns::config", error = %e, file = %file, code = %g.code, value = %d.value, "invalid geosite entry, entry skipped")
+                                CONFIG_LOG.warn(format!(
+                                    "invalid geosite entry, entry skipped error={e} file={file} code={} value={}",
+                                    g.code, d.value
+                                ))
                             },
                         }
                     }
