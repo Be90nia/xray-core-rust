@@ -20,6 +20,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
 };
+use xray_frame::redline::{self, RedlineSite};
 use xray_transport::connection::Connection;
 
 use crate::encryption::{
@@ -383,11 +384,14 @@ where
                 Poll::Ready(Err(e)) => {
                     // 结构化观测：TLS 层 fatal（如对端安全层误解 raw 流的
                     // BadRecordMac）是 splice 边界问题的第一现场。
-                    // 红线登记（nn8os 2b）：vision splice 数据面 raw tracing 保留
-                    // （迁移票判定规则：红线不硬攻）；`warn!` → `event!` 为等价
-                    // 展开（warn! 即 event!(Level::WARN, ..) 薄壳），仅过 L3 宏
-                    // 禁令，运行时零差异。
-                    tracing::event!(tracing::Level::WARN, error = %e, "vision inner read error");
+                    // 面 5 红线受控入口（nn8os 2b → 台账 RedlineSite::VisionSpliceEvent）：
+                    // target/level 由站点钉死（= 原裸 event! 的模块 target → 订阅者过滤串不变）；
+                    // redline::event 只承载单条 message，原结构化字段 error 折叠进 message 尾部。
+                    redline::event(
+                        RedlineSite::VisionSpliceEvent,
+                        tracing::Level::WARN,
+                        format_args!("vision inner read error: error={e}"),
+                    );
                     return Poll::Ready(Err(e));
                 },
                 Poll::Pending => return Poll::Pending,
