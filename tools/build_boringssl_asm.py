@@ -81,6 +81,8 @@ STAGE = REPO / "target" / "boringssl-asm" / "prebuilt"
 NASM_CANDIDATES = [
     Path(r"D:\Project\tools\nasm.exe"),
     Path.home() / "AppData" / "Local" / "bin" / "NASM" / "nasm.exe",
+    Path(r"C:\Program Files\NASM\nasm.exe"),
+    Path(r"C:\ProgramData\chocolatey\bin\nasm.exe"),
 ]
 
 
@@ -97,17 +99,20 @@ def run(cmd: list[str], **kw) -> None:
     subprocess.run(cmd, check=True, **kw)
 
 
-def health() -> int:
+def health(src: Path | None = None, dest: Path | None = None) -> int:
     """体检：源树 / NASM / 缓存里的 NO_ASM 标志。返回退出码。"""
+    src = src or SRC
+    dest = dest or STAGE
+    build = dest.parent / "build"
     problems: list[str] = []
-    if not (SRC / "ssl" / "ssl_lib.cc").is_file():
-        problems.append(f"缺补丁源树 {SRC}（跑 tools/setup_boringssl_reality.py 产出）")
+    if not (src / "ssl" / "ssl_lib.cc").is_file():
+        problems.append(f"缺补丁源树 {src}（跑 tools/setup_boringssl_reality.py 产出）")
     nasm = find_nasm()
     if nasm is None:
         problems.append("找不到 NASM（D:\\Project\\tools\\nasm.exe 或 %LOCALAPPDATA%\\bin\\NASM\\nasm.exe）")
     else:
         print(f"[ok] NASM: {nasm}")
-    cache = BUILD / "CMakeCache.txt"
+    cache = build / "CMakeCache.txt"
     if cache.is_file():
         text = cache.read_text(encoding="utf-8", errors="replace")
         if "OPENSSL_NO_ASM" in text:
@@ -118,7 +123,7 @@ def health() -> int:
             print("[ok] CMAKE_ASM_NASM_COMPILER_WORKS=1")
         else:
             problems.append("CMAKE_ASM_NASM_COMPILER_WORKS != 1")
-    stage = STAGE / "crypto.lib"
+    stage = dest / "crypto.lib"
     if stage.is_file():
         size = stage.stat().st_size
         print(f"[info] 已组装 crypto.lib: {size} B（无汇编约 7,006,776 B）")
@@ -135,44 +140,58 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--check", action="store_true", help="只体检，不编译")
     ap.add_argument("--jobs", type=int, default=14, help="并行编译作业数")
+    ap.add_argument(
+        "--src",
+        default=None,
+        help="已打补丁的 BoringSSL 源树（默认 target/boringssl-patched；"
+        "CI 上由 setup-boringssl action 产出，走 $BORING_BSSL_SOURCE_PATH）",
+    )
+    ap.add_argument(
+        "--dest",
+        default=None,
+        help="预构建库输出目录（默认 target/boringssl-asm/prebuilt）",
+    )
     args = ap.parse_args()
 
+    src = Path(args.src) if args.src else SRC
+    dest = Path(args.dest) if args.dest else STAGE
     if args.check:
-        return health()
+        return health(src, dest)
 
     nasm = find_nasm()
     if nasm is None:
         print("[FAIL] 找不到 NASM，见文档前置", file=sys.stderr)
         return 2
-    if not (SRC / "ssl" / "ssl_lib.cc").is_file():
-        print(f"[FAIL] 缺补丁源树 {SRC}", file=sys.stderr)
+    if not (src / "ssl" / "ssl_lib.cc").is_file():
+        print(f"[FAIL] 缺补丁源树 {src}", file=sys.stderr)
         return 2
 
-    BUILD.parent.mkdir(parents=True, exist_ok=True)
+    build = dest.parent / "build"
+    build.parent.mkdir(parents=True, exist_ok=True)
     run([
-        "cmake", "-S", str(SRC), "-B", str(BUILD),
+        "cmake", "-S", str(src), "-B", str(build),
         "-G", "Visual Studio 17 2022", "-A", "x64",
         f"-DCMAKE_ASM_NASM_COMPILER={nasm}",
     ])
-    run(["cmake", "--build", str(BUILD), "--config", "Release", "--parallel", str(args.jobs)])
+    run(["cmake", "--build", str(build), "--config", "Release", "--parallel", str(args.jobs)])
 
-    STAGE.mkdir(parents=True, exist_ok=True)
+    dest.mkdir(parents=True, exist_ok=True)
     for lib in ("crypto.lib", "ssl.lib"):
-        src = BUILD / "Release" / lib
-        if not src.is_file():
-            print(f"[FAIL] 缺 {src}", file=sys.stderr)
+        src_lib = build / "Release" / lib
+        if not src_lib.is_file():
+            print(f"[FAIL] 缺 {src_lib}", file=sys.stderr)
             return 2
-        shutil.copy2(src, STAGE / lib)
-    inc_dst = STAGE / "include"
+        shutil.copy2(src_lib, dest / lib)
+    inc_dst = dest / "include"
     if inc_dst.exists():
         shutil.rmtree(inc_dst)
-    shutil.copytree(SRC / "include", inc_dst)
+    shutil.copytree(src / "include", inc_dst)
 
-    print("\n[ok] 预构建库已组装：", STAGE)
+    print("\n[ok] 预构建库已组装：", dest)
     print("构建 xray 时带上：")
     print(f"  set BORING_BSSL_ASSUME_PATCHED=1")
-    print(f"  set BORING_BSSL_PATH={STAGE.as_posix()}")
-    return health()
+    print(f"  set BORING_BSSL_PATH={dest.as_posix()}")
+    return health(src, dest)
 
 
 if __name__ == "__main__":

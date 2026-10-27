@@ -123,6 +123,14 @@ jobs:
       # btls-sys bindings 含注入符号（bd mygg/z32z），与 interop/mobile 同源
       # 配方；顺序须在 rust-cache 之后（action 尾部清理恢复的旧 btls-sys 产物）
       - uses: ./.github/actions/setup-boringssl
+      # bd ga42a：Windows 上 btls-sys 无条件 OPENSSL_NO_ASM → BoringSSL 无汇编 →
+      # 带 fingerprint 的客户端吞吐塌到 31.6 MB/s（带汇编 241.2，7.6×）。CI 的
+      # Windows 产物（xray-windows-amd64.exe / artifact）与 release 资产等价，
+      # 不能是慢的那个 → 这里编带汇编的 BoringSSL 供 cargo 走预构建路线。
+      # 仅 Windows（其他平台 btls-sys 不设 NO_ASM）。
+      - name: Prepare ASM boringssl (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: ./.github/actions/setup-boringssl-asm
       - run: cargo build --workspace --release
       - run: cargo build --workspace
       # 常态测试流程：CI 绿后从 artifact 下载对应平台二进制测试（发版需用户同意，

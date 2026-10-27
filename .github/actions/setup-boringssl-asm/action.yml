@@ -1,0 +1,58 @@
+name: 'Build BoringSSL with assembly (Windows)'
+description: >-
+  btls-sys 的 build.rs 在 Windows 分支**无条件**设 OPENSSL_NO_ASM=YES
+  （原文注释：*"not set up for cross-compiling using Visual Studio. Disable
+  assembly support so that it at least builds."*）→ BoringSSL 排除
+  crypto/cpu_intel.cc → **AES-NI/AVX2 探测恒 false** → 密码协商落到 CHACHA20，
+  而 chacha20-poly1305 的汇编同样被排除 → **纯 C 回退** → 每 record CPU ~7-11×。
+
+  实测（vless+tcp+tls + chrome 指纹）：NO_ASM 31.6 MB/s（cli CPU 18.8s）→
+  带汇编 **241.2 MB/s**（cli CPU 2.48s），7.6×。REALITY 组 33.4 → 241.2。
+  即**所有带 fingerprint 的真实节点**（= 走 btls）都在这条慢路径上。
+
+  本 action：用 NASM 编一份**带汇编**的 BoringSSL（源 = setup-boringssl action
+  已打好 REALITY + btls 补丁的树），组装成 btls-sys 的预构建库布局
+  `{crypto.lib, ssl.lib, include/openssl}`，并把 BORING_BSSL_PATH 写进 GITHUB_ENV。
+  后续 cargo build 会走 btls-sys 的**预构建路线**（跳过 cmake → 不触发 NO_ASM）。
+
+  仅 Windows 生效；其他平台 btls-sys 不设 NO_ASM（Linux/macOS 汇编本来就在）。
+  前置：setup-boringssl action 已跑过（BORING_BSSL_SOURCE_PATH 已就绪）。
+runs:
+  using: 'composite'
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        if [ "$RUNNER_OS" != "Windows" ]; then
+          echo "非 Windows：btls-sys 不设 OPENSSL_NO_ASM，跳过"
+          exit 0
+        fi
+        src="${BORING_BSSL_SOURCE_PATH:-}"
+        if [ -z "$src" ]; then
+          echo "::error::BORING_BSSL_SOURCE_PATH 未设置——必须先跑 setup-boringssl action"
+          exit 1
+        fi
+        # NASM：windows runner 镜像自带（ci.yml 既有注释"windows runner 镜像预装 NASM
+        # 自给自足"）；缺失时兜底 choco，再兜底官方 zip（不依赖 choco shim 落盘）。
+        if ! command -v nasm >/dev/null 2>&1 \
+           && [ ! -f "/c/Program Files/NASM/nasm.exe" ] \
+           && [ ! -f "/c/ProgramData/chocolatey/bin/nasm.exe" ]; then
+          echo "::warning::NASM 缺失，尝试 choco 安装"
+          choco install nasm -y --no-progress || true
+        fi
+        if ! command -v nasm >/dev/null 2>&1 \
+           && [ ! -f "/c/Program Files/NASM/nasm.exe" ] \
+           && [ ! -f "/c/ProgramData/chocolatey/bin/nasm.exe" ]; then
+          echo "::error::NASM 仍不可得——汇编构建无法进行（宁红也不发慢二进制）"
+          exit 1
+        fi
+        # 预构建库放 $RUNNER_TEMP（不进工作区，避免污染缓存与 artifact）
+        dest_win="$(cygpath -m "$TEMP/xray-boringssl-asm")"
+        dest_bsh="$TEMP/xray-boringssl-asm"
+        rm -rf "$dest_bsh"
+        mkdir -p "$dest_bsh"
+        # 源树路径给 Python（Windows 风格，避免 MSYS 路径被 Windows 工具链解析失败）
+        src_win="$(cygpath -m "$src")"
+        python3 tools/build_boringssl_asm.py --src "$src_win" --dest "$dest_win"
+        echo "BORING_BSSL_PATH=$dest_win" >> "$GITHUB_ENV"
+        echo "::notice::BoringSSL 汇编预构建库就绪：$dest_win（后续 cargo build 自动消费）"

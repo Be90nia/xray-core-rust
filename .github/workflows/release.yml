@@ -67,6 +67,14 @@ jobs:
           key: ${{ env.UDF_HEAD }}
       - name: Prepare patched boringssl
         uses: ./.github/actions/setup-boringssl
+      # bd ga42a：Windows 上 btls-sys 无条件 OPENSSL_NO_ASM → BoringSSL 无汇编 →
+      # AES-NI 探测恒 false → 协商 CHACHA20 且纯 C 回退 → 带 fingerprint 的客户端
+      # 吞吐塌到 31.6 MB/s（本地带汇编构建 241.2，7.6×）。**发出去的 Windows 产物
+      # 就是慢的那个** → 这里编一份带汇编的 BoringSSL 并让 cargo 走预构建路线。
+      # 仅 Windows（Linux/macOS 的 btls-sys 不设 NO_ASM，汇编本来就在）。
+      - name: Prepare ASM boringssl (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: ./.github/actions/setup-boringssl-asm
       - name: Install protoc
         shell: pwsh
         run: |
